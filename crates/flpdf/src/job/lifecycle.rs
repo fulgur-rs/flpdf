@@ -6,7 +6,8 @@
 //! ordinary page-inspection dispatch are layered on top of this state; write,
 //! page-transform, and remaining inspection consumers are later job slices.
 
-use super::attachments::{AttachmentAddOptions, AttachmentCopyOptions, AttachmentCopySource};
+use super::attachments::AttachmentAddOptions;
+use super::attachments::AttachmentCopyOptions;
 use super::image_optimization::{optimize_images, ImageOptimizationOptions};
 use super::json::{JsonJobError, JsonJobOptions, JsonJobOutput, JsonStreamData};
 use super::overlay::{apply_overlay_specs, OverlayKind, OverlaySpec};
@@ -2831,6 +2832,7 @@ impl QPDFJob {
             for (path, password) in source_paths.iter().zip(source_passwords.iter()) {
                 self.report_page_source_processing(path_description_bytes(path))?;
                 let source = self.open_job_source(path, password)?;
+                self.record_document_warnings(&source);
                 if !keep_files_open {
                     // qpdf calls ClosedFileInputSource::stayOpen(false)
                     // immediately after processInputSource, before opening
@@ -2911,6 +2913,7 @@ impl QPDFJob {
             .chain(configuration.overlays.iter())
         {
             let source = self.open_job_source(&overlay.path, &overlay.password)?;
+            self.record_document_warnings(&source);
             overlay_specs.push(OverlaySpec {
                 source,
                 kind: overlay.kind,
@@ -3027,29 +3030,21 @@ impl QPDFJob {
             .collect::<Vec<_>>();
         self.add_attachments(pdf, &attachments_to_add)?;
 
-        let mut attachment_sources = Vec::with_capacity(configuration.attachments_to_copy.len());
-        for copy in &configuration.attachments_to_copy {
-            let source = self.open_job_source(&copy.path, &copy.password)?;
-            attachment_sources.push((
-                source,
-                AttachmentCopyOptions {
-                    path: copy.path.clone(),
-                    prefix: copy.prefix.clone(),
-                    verbose: configuration.verbose,
-                },
-            ));
-        }
         // qpdf copies from every configured donor in one pass and reports the
         // conflicting keys once after the last donor (`QPDFJob.cc:2089-2135`).
-        let mut copy_sources = attachment_sources
-            .iter_mut()
-            .map(|(source, options)| AttachmentCopySource {
-                source,
-                options: options.clone(),
+        let copy_options = configuration
+            .attachments_to_copy
+            .iter()
+            .map(|copy| AttachmentCopyOptions {
+                path: copy.path.clone(),
+                password: copy.password.clone(),
+                prefix: copy.prefix.clone(),
+                verbose: configuration.verbose,
             })
             .collect::<Vec<_>>();
-        self.copy_attachments_many(pdf, &mut copy_sources)?;
-        drop(copy_sources);
+        self.copy_attachments_with_opener(pdf, &copy_options, |job, option| {
+            job.open_job_source(&option.path, &option.password)
+        })?;
 
         if configuration.check
             || configuration.show_npages
@@ -3063,7 +3058,6 @@ impl QPDFJob {
             || configuration.show_attachment.is_some()
         {
             let status = self.run_configured_inspection(pdf, configuration)?;
-            drop(attachment_sources);
             drop(overlay_specs);
             return Ok(status);
         }
@@ -3075,12 +3069,10 @@ impl QPDFJob {
         {
             let check_result = self.check(pdf);
             let status = self.map_check_result(check_result);
-            drop(attachment_sources);
             drop(overlay_specs);
             return status;
         }
         let status = self.write_qpdf(pdf);
-        drop(attachment_sources);
         drop(overlay_specs);
         status
     }
@@ -3205,7 +3197,7 @@ impl QPDFJob {
         self.logger.info(output.dump)
     }
 
-    fn open_job_source(&mut self, path: &Path, password: &[u8]) -> Result<JobDocument> {
+    fn open_job_source(&self, path: &Path, password: &[u8]) -> Result<JobDocument> {
         let mut options = self.configured_open_options(password.to_vec());
         options.logger = Some(self.logger.clone());
         options.description = path_description_bytes(path);
@@ -3215,13 +3207,13 @@ impl QPDFJob {
         options.suppress_warnings |= self.suppress_warnings;
         let mut pdf = Pdf::<Box<dyn ReadSeek>>::open_file_with_options(path, options)?;
         pdf.root_handle()?;
-        self.record_document_warnings(&pdf);
         Ok(pdf)
     }
 
     fn copy_encryption_source(&mut self, path: &Path) -> Result<crate::CopyEncryptionSource> {
         let password = self.configuration.encryption_file_password.clone();
         let mut donor = self.open_job_source(path, &password)?;
+        self.record_document_warnings(&donor);
         donor.writer_copy_encryption_source()?.ok_or_else(|| {
             Error::Usage(UsageError::new(format!(
                 "copyEncryption donor {} is not encrypted",

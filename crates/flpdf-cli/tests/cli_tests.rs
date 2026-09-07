@@ -8803,6 +8803,140 @@ fn copy_attachments_from_corrupt_donor_recovers_without_explicit_repair_flag() {
         ));
 }
 
+#[test]
+fn copy_attachments_from_opens_each_donor_at_its_verbose_boundary() {
+    let temp = tempfile::tempdir().unwrap();
+    let input = minimal_pdf_temp();
+    let first_seed = minimal_pdf_temp();
+    let second_seed = minimal_pdf_temp();
+
+    let first_payload = temp.path().join("first.txt");
+    std::fs::write(&first_payload, b"first attachment").unwrap();
+    let first_donor = temp.path().join("first-donor.pdf");
+    Command::cargo_bin("flpdf")
+        .unwrap()
+        .args([
+            first_seed.path().to_str().unwrap(),
+            "--add-attachment",
+            first_payload.to_str().unwrap(),
+            "--key=first",
+            "--",
+            first_donor.to_str().unwrap(),
+        ])
+        .assert()
+        .success();
+
+    let second_payload = temp.path().join("second.txt");
+    std::fs::write(&second_payload, b"second attachment").unwrap();
+    let second_donor = temp.path().join("second-donor.pdf");
+    Command::cargo_bin("flpdf")
+        .unwrap()
+        .args([
+            second_seed.path().to_str().unwrap(),
+            "--add-attachment",
+            second_payload.to_str().unwrap(),
+            "--key=second",
+            "--",
+            second_donor.to_str().unwrap(),
+        ])
+        .assert()
+        .success();
+
+    let damaged_donor = temp.path().join("damaged-second-donor.pdf");
+    std::fs::write(
+        &damaged_donor,
+        corrupt_startxref(&std::fs::read(&second_donor).unwrap()),
+    )
+    .unwrap();
+
+    let qpdf = ProcessCommand::new("qpdf")
+        .args([
+            "--static-id",
+            "--compress-streams=n",
+            "--verbose",
+            "--copy-attachments-from",
+        ])
+        .arg(&first_donor)
+        .args(["--", "--copy-attachments-from"])
+        .arg(&damaged_donor)
+        .args(["--"])
+        .arg(input.path())
+        .arg("-")
+        .output()
+        .expect("qpdf two-donor copy should spawn");
+    let flpdf = Command::cargo_bin("flpdf")
+        .unwrap()
+        .env("FLPDF_PROGNAME", "qpdf")
+        .args([
+            "--static-id",
+            "--compress-streams=n",
+            "--verbose",
+            "--copy-attachments-from",
+        ])
+        .arg(&first_donor)
+        .args(["--", "--copy-attachments-from"])
+        .arg(&damaged_donor)
+        .args(["--"])
+        .arg(input.path())
+        .arg("-")
+        .output()
+        .unwrap();
+
+    assert_eq!(qpdf.status.code(), Some(3));
+    assert_eq!(flpdf.status.code(), Some(3));
+    assert_eq!(
+        flpdf.stdout, qpdf.stdout,
+        "per-donor open timing must not change the copied PDF bytes"
+    );
+
+    let copy_first = format!(
+        "qpdf: copying attachments from {}{EOL}",
+        first_donor.display()
+    );
+    let copy_second = format!(
+        "qpdf: copying attachments from {}{EOL}",
+        damaged_donor.display()
+    );
+    let warning = format!("WARNING: {}: file is damaged", damaged_donor.display());
+    let key_first = format!("  first -> first{EOL}");
+    let key_second = format!("  second -> second{EOL}");
+    let positions = |stderr: &[u8]| {
+        [
+            copy_first.as_bytes(),
+            key_first.as_bytes(),
+            copy_second.as_bytes(),
+            warning.as_bytes(),
+            key_second.as_bytes(),
+        ]
+        .map(|needle| {
+            stderr
+                .windows(needle.len())
+                .position(|window| window == needle)
+                .unwrap_or_else(|| {
+                    panic!(
+                        "diagnostic {:?} missing from stderr:\n{}",
+                        String::from_utf8_lossy(needle),
+                        String::from_utf8_lossy(stderr)
+                    )
+                })
+        })
+    };
+    let qpdf_positions = positions(&qpdf.stderr);
+    let flpdf_positions = positions(&flpdf.stderr);
+    assert!(
+        qpdf_positions.windows(2).all(|pair| pair[0] < pair[1]),
+        "qpdf donor diagnostics must be verbose, open warning, then copy: {}",
+        String::from_utf8_lossy(&qpdf.stderr)
+    );
+    assert_eq!(
+        flpdf_positions,
+        qpdf_positions,
+        "flpdf must open each donor at the same per-donor boundary as qpdf\nqpdf: {}\nflpdf: {}",
+        String::from_utf8_lossy(&qpdf.stderr),
+        String::from_utf8_lossy(&flpdf.stderr)
+    );
+}
+
 // ── --no-original-object-ids ────────────────────────────────
 //
 // qpdf `--no-original-object-ids` omits the `%% Original object ID: N M`

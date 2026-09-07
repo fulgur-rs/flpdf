@@ -1,7 +1,8 @@
-//! qpdf correspondence: `QPDFJob::addAttachments`, `QPDFJob::doListAttachments`, and `QPDFJob::doShowAttachment` (`libqpdf/QPDFJob.cc:876-927,2046-2087`).
+//! qpdf correspondence: `QPDFJob::copyAttachments`, `QPDFJob::addAttachments`, `QPDFJob::doListAttachments`, and `QPDFJob::doShowAttachment`.
+//! (`libqpdf/QPDFJob.cc:876-927,2046-2135`).
 
 use super::attachment_list::format_attachment_list_with_sink;
-use super::lifecycle::{JobExitCode, QPDFJob};
+use super::lifecycle::{JobDocument, JobExitCode, QPDFJob};
 use crate::filespec_helper::FileSpec;
 use crate::pipeline::{Pipeline, PipelineHandle, PipelineResult};
 use crate::qpdf_time::default_pdf_date;
@@ -41,17 +42,18 @@ impl Pipeline for PipelineHandleSink {
 
 /// qpdf's per-file configuration for `QPDFJob::copyAttachments`.
 ///
-/// `path` is retained only for the `copying attachments from PATH` verbose
-/// diagnostic and the `file: PATH, key: ...` duplicate-key message; `source`
-/// must already be opened (and authenticated) by the caller before being
-/// passed to [`QPDFJob::copy_attachments`], matching this crate's existing
-/// job boundary where document I/O stays a caller concern
-/// (`QPDFJob::list_attachments`/`show_attachment` accept an already-open
-/// [`Pdf`] the same way).
+/// `path` is retained for the `copying attachments from PATH` verbose
+/// diagnostic and the `file: PATH, key: ...` duplicate-key message. The
+/// password is consumed by [`QPDFJob::copy_attachments_with_opener`]; the
+/// source-backed [`QPDFJob::copy_attachments`] and
+/// [`QPDFJob::copy_attachments_many`] forms intentionally accept already-open
+/// sources for direct library callers.
 #[derive(Debug, Clone)]
 pub struct AttachmentCopyOptions {
     /// Source PDF path, used only for diagnostics.
     pub path: PathBuf,
+    /// Password bytes used when the job opens the donor source.
+    pub password: Vec<u8>,
     /// Prefix prepended to each copied key.
     pub prefix: Vec<u8>,
     /// Emit qpdf's `copying attachments from ...` / `  key -> new_key` diagnostics.
@@ -207,8 +209,8 @@ impl QPDFJob {
         self.add_attachments(pdf, std::slice::from_ref(&options))
     }
 
-    /// Copy every embedded file from `source` into `target` through the
-    /// shared qpdf job lifecycle.
+    /// Copy every embedded file from an already-opened `source` into `target`
+    /// through the shared qpdf copy body.
     ///
     /// This is the Rust translation of `QPDFJob::copyAttachments`:
     /// `QPDFJob.cc:2089-2135`. Page mode is changed before duplicate
@@ -237,14 +239,65 @@ impl QPDFJob {
         self.copy_attachments_many(target, &mut sources)
     }
 
-    /// Copy every embedded file from every donor in `sources` into `target`.
+    /// Copy every embedded file from every configured donor, opening each
+    /// donor inside the qpdf-shaped copy loop.
     ///
-    /// This is the multi-file form of qpdf's `QPDFJob::copyAttachments` loop
-    /// (`QPDFJob.cc:2089-2135`). It changes `/PageMode` once, processes every
-    /// donor in order, and delays the aggregate duplicate-key error until all
-    /// source entries have been visited. This preserves qpdf's behavior when
-    /// a duplicate in an earlier donor must not prevent a later donor's
-    /// non-conflicting entries from being copied.
+    /// The opener is only the document-I/O boundary. This method owns the
+    /// qpdf order of the verbose donor message, opener call, copy operation,
+    /// warning collection, and aggregate duplicate-key error
+    /// (`QPDFJob.cc:2089-2135`). The error type is generic so CLI callers can
+    /// preserve their path-scoped error wrapper while library callers use
+    /// [`crate::Error`] directly.
+    pub fn copy_attachments_with_opener<R1, F, E>(
+        &mut self,
+        target: &mut Pdf<R1>,
+        options: &[AttachmentCopyOptions],
+        mut open_source: F,
+    ) -> std::result::Result<(), E>
+    where
+        R1: Read + Seek + 'static,
+        F: FnMut(&QPDFJob, &AttachmentCopyOptions) -> std::result::Result<JobDocument, E>,
+        E: From<Error>,
+    {
+        if options.is_empty() {
+            return Ok(());
+        }
+        target.set_logger(self.logger());
+        self.set_attachment_page_mode(target).map_err(E::from)?;
+
+        let mut duplicates = Vec::new();
+        for option in options {
+            self.report_copy_attachment_source(option)
+                .map_err(E::from)?;
+            let mut source = open_source(self, option)?;
+            // This opener-owned donor is dropped at the end of the iteration,
+            // before `target` is written. qpdf's copyAttachments also drops
+            // each per-donor `QPDF` (`QPDFJob.cc:2100`), but a copied foreign
+            // stream that stays deferred would dangle once its provider-backed
+            // donor is gone (`pipeStreamData called for non-stream`). Reserve
+            // the copied stream data now via qpdf's immediate-copy contract
+            // (`QPDF::setImmediateCopyFrom`) so the donor can be released.
+            source.set_immediate_copy_from(true);
+            self.copy_attachment_source(target, &mut source, option, &mut duplicates)
+                .map_err(E::from)?;
+            self.record_document_warnings(&source);
+        }
+
+        self.finish_copy_attachment_duplicates(duplicates)
+            .map_err(E::from)
+    }
+
+    /// Copy every embedded file from already-opened donors in `sources` into
+    /// `target`.
+    ///
+    /// This is the source-backed form of qpdf's `QPDFJob::copyAttachments`
+    /// loop (`QPDFJob.cc:2089-2135`). The canonical path-based form is
+    /// [`Self::copy_attachments_with_opener`], which places each donor open at
+    /// the qpdf per-donor boundary. This method changes `/PageMode` once,
+    /// processes every already-opened donor in order, and delays the aggregate
+    /// duplicate-key error until all source entries have been visited. This
+    /// preserves qpdf's behavior when a duplicate in an earlier donor must not
+    /// prevent a later donor's non-conflicting entries from being copied.
     pub fn copy_attachments_many<R1, R2>(
         &mut self,
         target: &mut Pdf<R1>,
@@ -265,53 +318,75 @@ impl QPDFJob {
 
         let mut duplicates: Vec<String> = Vec::new();
         for donor in sources {
-            donor.source.set_logger(self.logger());
-            if donor.options.verbose {
-                let mut message = Vec::new();
-                message.extend_from_slice(self.message_prefix().as_bytes());
-                message.extend_from_slice(b": copying attachments from ");
-                message.extend_from_slice(donor.options.path.display().to_string().as_bytes());
-                message.push(b'\n');
-                self.logger().info(message)?;
-            }
-
-            let other_attachments = donor.source.embedded_files().get_embedded_files()?;
-            for (key, filespec) in other_attachments {
-                let mut new_key = donor.options.prefix.clone();
-                new_key.extend_from_slice(&key);
-
-                let exists = target
-                    .embedded_files()
-                    .get_embedded_file(&new_key)?
-                    .is_some();
-                if exists {
-                    duplicates.push(format!(
-                        "file: {}, key: {}",
-                        donor.options.path.display(),
-                        String::from_utf8_lossy(&new_key)
-                    ));
-                    continue;
-                }
-
-                let copied = target.copy_foreign_object(&filespec)?;
-                target
-                    .embedded_files()
-                    .replace_embedded_file(&new_key, copied)?;
-
-                if donor.options.verbose {
-                    let mut message = Vec::new();
-                    message.extend_from_slice(b"  ");
-                    message.extend_from_slice(&key);
-                    message.extend_from_slice(b" -> ");
-                    message.extend_from_slice(&new_key);
-                    message.push(b'\n');
-                    self.logger().info(message)?;
-                }
-            }
-
+            self.report_copy_attachment_source(&donor.options)?;
+            self.copy_attachment_source(target, donor.source, &donor.options, &mut duplicates)?;
             self.record_document_warnings(donor.source);
         }
 
+        self.finish_copy_attachment_duplicates(duplicates)
+    }
+
+    fn report_copy_attachment_source(&self, options: &AttachmentCopyOptions) -> Result<()> {
+        if !options.verbose {
+            return Ok(());
+        }
+        let mut message = Vec::new();
+        message.extend_from_slice(self.message_prefix().as_bytes());
+        message.extend_from_slice(b": copying attachments from ");
+        message.extend_from_slice(options.path.display().to_string().as_bytes());
+        message.push(b'\n');
+        self.logger().info(message)
+    }
+
+    fn copy_attachment_source<R1, R2>(
+        &self,
+        target: &mut Pdf<R1>,
+        source: &mut Pdf<R2>,
+        options: &AttachmentCopyOptions,
+        duplicates: &mut Vec<String>,
+    ) -> Result<()>
+    where
+        R1: Read + Seek + 'static,
+        R2: Read + Seek + 'static,
+    {
+        source.set_logger(self.logger());
+        let other_attachments = source.embedded_files().get_embedded_files()?;
+        for (key, filespec) in other_attachments {
+            let mut new_key = options.prefix.clone();
+            new_key.extend_from_slice(&key);
+
+            let exists = target
+                .embedded_files()
+                .get_embedded_file(&new_key)?
+                .is_some();
+            if exists {
+                duplicates.push(format!(
+                    "file: {}, key: {}",
+                    options.path.display(),
+                    String::from_utf8_lossy(&new_key)
+                ));
+                continue;
+            }
+
+            let copied = target.copy_foreign_object(&filespec)?;
+            target
+                .embedded_files()
+                .replace_embedded_file(&new_key, copied)?;
+
+            if options.verbose {
+                let mut message = Vec::new();
+                message.extend_from_slice(b"  ");
+                message.extend_from_slice(&key);
+                message.extend_from_slice(b" -> ");
+                message.extend_from_slice(&new_key);
+                message.push(b'\n');
+                self.logger().info(message)?;
+            }
+        }
+        Ok(())
+    }
+
+    fn finish_copy_attachment_duplicates(&self, duplicates: Vec<String>) -> Result<()> {
         if duplicates.is_empty() {
             return Ok(());
         }
@@ -1444,6 +1519,7 @@ mod tests {
     ) -> AttachmentCopyOptions {
         AttachmentCopyOptions {
             path,
+            password: Vec::new(),
             prefix: prefix.to_vec(),
             verbose,
         }
@@ -1496,6 +1572,50 @@ mod tests {
             info.contains("  attachment.txt -> src-attachment.txt\n"),
             "info was: {info:?}"
         );
+    }
+
+    #[test]
+    fn copy_attachments_with_opener_survives_a_dropped_owned_donor() {
+        // The opener owns each donor and drops it at the end of its iteration,
+        // before the target is written -- matching qpdf's copyAttachments,
+        // which drops each per-donor `QPDF` (`QPDFJob.cc:2100`). The copied
+        // attachment must stay readable after the owned in-memory donor is
+        // released; `copy_attachments_with_opener` reserves stream data via
+        // qpdf's immediate-copy contract so a provider-backed donor cannot
+        // leave a dangling deferred stream behind either.
+        let donor_bytes = include_bytes!(concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/../../tests/fixtures/compat/attachment-two-page.pdf"
+        ))
+        .to_vec();
+        let expected = {
+            let mut donor = Pdf::open(Cursor::new(donor_bytes.clone())).expect("open donor");
+            extract_attachment(&mut donor, b"attachment.txt").expect("donor attachment")
+        };
+
+        let mut target =
+            Pdf::open(Cursor::new(minimal_fixture_bytes())).expect("open target fixture");
+        let mut job = QPDFJob::new();
+        job.set_input_name("target.pdf");
+        let options = [copy_options(
+            std::path::PathBuf::from("donor.pdf"),
+            b"a_",
+            false,
+        )];
+
+        job.copy_attachments_with_opener::<_, _, crate::Error>(
+            &mut target,
+            &options,
+            |_job, _option| {
+                let reader: Box<dyn crate::ReadSeek> = Box::new(Cursor::new(donor_bytes.clone()));
+                Pdf::open(reader)
+            },
+        )
+        .expect("copy from an owned in-memory donor succeeds");
+
+        let copied = extract_attachment(&mut target, b"a_attachment.txt")
+            .expect("copied attachment survives the dropped donor");
+        assert_eq!(copied, expected);
     }
 
     #[test]

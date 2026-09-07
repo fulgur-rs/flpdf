@@ -35,7 +35,7 @@
 | `crates/flpdf/src/form_field_object_helper/rendering.rs` | correspondence | \`QPDFFormFieldObjectHelper.cc\` rendering primitives |
 | `crates/flpdf/src/job/acroform_field_prune.rs` | correspondence | QPDFJob.cc removal of unreferenced form fields after page selection |
 | `crates/flpdf/src/job/attachment_list.rs` | correspondence | QPDFJob.cc attachment enumeration and display formatting |
-| `crates/flpdf/src/job/attachments.rs` | correspondence | \`QPDFJob::addAttachments\`, \`QPDFJob::doListAttachments\`, and \`QPDFJob::doShowAttachment\` (\`libqpdf/QPDFJob.cc:876-927,2046-2087\`) |
+| `crates/flpdf/src/job/attachments.rs` | correspondence | \`QPDFJob::copyAttachments\`, \`QPDFJob::addAttachments\`, \`QPDFJob::doListAttachments\`, and \`QPDFJob::doShowAttachment\` |
 | `crates/flpdf/src/job/check.rs` | correspondence | \`QPDFJob::doCheck\` and \`QPDFJob::doInspection\` (\`libqpdf/QPDFJob.cc:745-803,1646-1693\`) |
 | `crates/flpdf/src/job/image_optimization.rs` | correspondence | QPDFJob::ImageOptimizer and Pl_DCT image compression |
 | `crates/flpdf/src/job/inspection.rs` | correspondence | \`QPDFJob::doShowObj\`, \`doShowPages\`, and object/stream inspection helpers (\`libqpdf/QPDFJob.cc:805-874\`) |

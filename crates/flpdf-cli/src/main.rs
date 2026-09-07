@@ -6,10 +6,10 @@ use clap::{ArgGroup, Args as ClapArgs, CommandFactory, Parser, Subcommand, Value
 use flpdf::fix_qdf;
 use flpdf::job::{
     copy_duplicate_page_annotations, flatten_rotation_on_pages,
-    should_remove_unreferenced_resources, AttachmentAddOptions, AttachmentCopyOptions,
-    AttachmentCopySource, CheckError, FlattenAnnotationsMode, ImageOptimizationOptions,
-    JobExitCode, JsonJobError, JsonJobOptions, JsonJobOutput, JsonStreamData, PageSpecInput,
-    PageSpecJobOutput, QPDFJob, RemoveUnreferencedResources, SplitPageOptions,
+    should_remove_unreferenced_resources, AttachmentAddOptions, AttachmentCopyOptions, CheckError,
+    FlattenAnnotationsMode, ImageOptimizationOptions, JobExitCode, JsonJobError, JsonJobOptions,
+    JsonJobOutput, JsonStreamData, PageSpecInput, PageSpecJobOutput, QPDFJob,
+    RemoveUnreferencedResources, SplitPageOptions,
 };
 use flpdf::pipeline::{FlateAction, Pipeline, PipelineHandle, PlFlate, PlStdioFile};
 use flpdf::qutil::same_file as qpdf_same_file;
@@ -8805,46 +8805,35 @@ fn run_copy_attachments_from(
         let _ = AcroFormDocumentHelper::new(&mut pdf)?.disable_digital_signatures()?;
     }
 
-    // Open each source with its own password (independent of the target's).
-    // Retain the command-wide open policy so qpdf's recovery/xref controls
-    // apply to every secondary input exactly as they do to the target. Each
-    // source uses a standalone Pdf rather than job.open_with_description,
-    // since qpdf's doCopyAttachments (`QPDFJob.cc:2100`) opens each donor as
-    // its own local QPDF. Keeping all donors alive lets the canonical job
-    // batch method aggregate duplicate keys across the complete list.
-    let mut donor_sources = Vec::with_capacity(donor_args.len());
-    for args in donor_args {
+    let copy_options = donor_args
+        .into_iter()
+        .map(|args| AttachmentCopyOptions {
+            path: args.file,
+            password: args.password,
+            prefix: args.prefix.unwrap_or_default(),
+            verbose,
+        })
+        .collect::<Vec<_>>();
+    job.copy_attachments_with_opener(&mut pdf, &copy_options, |_, option| {
         let mut source_password = password.clone();
         source_password.password = None;
         source_password.raw_password = None;
         source_password.password_file = None;
         let mut src_options =
-            pdf_open_options_with_password_bytes(repair, &source_password, args.password);
-        configure_document_logger(&mut src_options, &args.file);
+            pdf_open_options_with_password_bytes(repair, &source_password, option.password.clone());
+        configure_document_logger(&mut src_options, &option.path);
         src_options.suppress_warnings |= suppress_warnings;
-        let src_file = File::open(&args.file)
-            .map_err(|error| open_error_with_file(&args.file, error.into()))?;
-        let mut src = Pdf::open_with_options(BufReader::new(src_file), src_options)
-            .map_err(|error| error_with_file(&args.file, actionable_password_error(error)))?;
+        let src_file = File::open(&option.path)
+            .map_err(|error| open_error_with_file(&option.path, error.into()))?;
+        let mut src = Pdf::<Box<dyn flpdf::ReadSeek>>::open_with_options(
+            Box::new(BufReader::new(src_file)),
+            src_options,
+        )
+        .map_err(|error| error_with_file(&option.path, actionable_password_error(error)))?;
         src.root_handle()
-            .map_err(|error| error_with_file(&args.file, actionable_password_error(error)))?;
-        donor_sources.push((
-            src,
-            AttachmentCopyOptions {
-                path: args.file,
-                prefix: args.prefix.unwrap_or_default(),
-                verbose,
-            },
-        ));
-    }
-    let mut sources = donor_sources
-        .iter_mut()
-        .map(|(source, options)| AttachmentCopySource {
-            source,
-            options: options.clone(),
-        })
-        .collect::<Vec<_>>();
-    job.copy_attachments_many(&mut pdf, &mut sources)?;
+            .map_err(|error| error_with_file(&option.path, actionable_password_error(error)))?;
+        Ok::<_, Box<dyn std::error::Error>>(src)
+    })?;
 
     // Content normalization is a writer option in qpdf, but the CLI's shared
     // prepass also owns its diagnostic collection. Run it after attachments
