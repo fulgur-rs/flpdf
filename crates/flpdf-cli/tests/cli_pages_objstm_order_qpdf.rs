@@ -281,3 +281,118 @@ fn qdf_and_normalize_preserve_multi_source_objstm_bytes_like_qpdf() {
         );
     }
 }
+
+/// qpdf drops every source XRef stream from the writer queue in QDF mode
+/// before it is numbered: `enqueueObject` returns early for
+/// `isStreamOfType("/XRef")` so fix-qdf sees exactly one XRef stream, and its
+/// comment names this case — a QDF built from a file with object streams while
+/// preserving unreferenced objects (`QPDFWriter.cc:1085-1093`).
+#[test]
+fn qdf_drops_the_source_xref_stream_like_qpdf() {
+    if skip_if_qpdf_missing() {
+        return;
+    }
+    let temp = tempfile::tempdir().unwrap();
+    let arguments = [
+        "--static-id",
+        "--newline-before-endstream=n",
+        "--qdf",
+        "--preserve-unreferenced",
+        "--object-streams=disable",
+        QDF_PRIMARY,
+    ];
+
+    let qpdf_output = temp.path().join("qpdf.pdf");
+    let qpdf = ProcessCommand::new("qpdf")
+        .args(arguments)
+        .arg(&qpdf_output)
+        .output()
+        .expect("qpdf should spawn");
+    assert!(
+        qpdf.status.success(),
+        "qpdf probe failed: {}",
+        String::from_utf8_lossy(&qpdf.stderr)
+    );
+
+    let flpdf_output = temp.path().join("flpdf.pdf");
+    Command::cargo_bin("flpdf")
+        .unwrap()
+        .args(arguments)
+        .arg(&flpdf_output)
+        .assert()
+        .success();
+
+    for (label, path) in [("qpdf", &qpdf_output), ("flpdf", &flpdf_output)] {
+        let bytes = std::fs::read(path).unwrap();
+        assert_eq!(
+            bytes
+                .windows(b"/Type /XRef".len())
+                .filter(|window| *window == b"/Type /XRef")
+                .count(),
+            0,
+            "{label} must not carry a source XRef stream in QDF output"
+        );
+    }
+}
+
+/// qpdf's ADBE arbitration lives in the generic dictionary path guarded by
+/// `is_root`, not by output mode — its own trace point passes
+/// `m->qdf_mode ? 0 : 1` because the branch runs in both
+/// (`QPDFWriter.cc:1396-1436`). A forced version therefore has to produce the
+/// same `/Extensions /ADBE` under `--qdf` as without it.
+#[test]
+fn qdf_root_keeps_the_adbe_arbitration_like_qpdf() {
+    if skip_if_qpdf_missing() {
+        return;
+    }
+    let temp = tempfile::tempdir().unwrap();
+
+    for object_streams in ["preserve", "generate"] {
+        let arguments = [
+            "--static-id",
+            "--newline-before-endstream=n",
+            "--qdf",
+            "--force-version=1.8.5",
+            &format!("--object-streams={object_streams}"),
+            QDF_PRIMARY,
+        ]
+        .map(String::from);
+
+        let qpdf_output = temp.path().join(format!("qpdf-{object_streams}.pdf"));
+        let qpdf = ProcessCommand::new("qpdf")
+            .args(&arguments)
+            .arg(&qpdf_output)
+            .output()
+            .expect("qpdf should spawn");
+        assert!(
+            qpdf.status.success(),
+            "qpdf probe failed: {}",
+            String::from_utf8_lossy(&qpdf.stderr)
+        );
+
+        let flpdf_output = temp.path().join(format!("flpdf-{object_streams}.pdf"));
+        Command::cargo_bin("flpdf")
+            .unwrap()
+            .args(&arguments)
+            .arg(&flpdf_output)
+            .assert()
+            .success();
+
+        let qpdf_bytes = std::fs::read(&qpdf_output).unwrap();
+        let flpdf_bytes = std::fs::read(&flpdf_output).unwrap();
+        for (label, bytes) in [("qpdf", &qpdf_bytes), ("flpdf", &flpdf_bytes)] {
+            assert!(
+                bytes
+                    .windows(b"/ExtensionLevel 5".len())
+                    .any(|window| window == b"/ExtensionLevel 5"),
+                "{label} must arbitrate /ADBE for a forced extension level \
+                 with --object-streams={object_streams}"
+            );
+        }
+        assert_eq!(
+            flpdf_bytes, qpdf_bytes,
+            "QDF output with a forced extension level must match qpdf byte for byte \
+             with --object-streams={object_streams}"
+        );
+    }
+}
