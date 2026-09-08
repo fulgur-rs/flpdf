@@ -1216,7 +1216,12 @@ under/overlay、transformationsを完了してからdocumentを返し、`writeQP
 writeを選ぶ。flpdfも `QPDFJob::create_qpdf` 内の `prepare_document` /
 `prepare_document_transformations` と `QPDFJob::write_qpdf` にこの境界を集約し、`run` は
 create→write→`get_exit_code` の合成だけを担う。multi-source page selectionのerased target
-とprovider-backed source ownerはcreate stageからwrite stageまで保持する。
+とprovider-backed source ownerはcreate stageからwrite stageまで保持する。2026-09-08
+（`flpdf-8uuw`）では、通常 non-linearized rewrite の direct CLI route も
+`apply_overlay_specs` を image/appearance/annotation transformations より前へ移し、
+qpdf の `handleUnderOverlay` → `handleTransformations` 順を repository-owned inline-image
+probe と qpdf-zlib-compat byte comparison で固定した。linearized overlay は既存の明示拒否、
+page-operation別 route と QPDFJob ownerへの完全統合は残る。
 
 `writeQPDF` は選択した処理の後に文書のopen-time/lazy warningを集約し、warning summaryと
 memory reportを一度だけ出力する。終了コード3の判定は `QPDFJob.cc:534-563`、inspection側の
