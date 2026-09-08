@@ -709,6 +709,58 @@ mod tests {
     }
 
     #[test]
+    fn unfilterable_stream_defers_resolving_an_indirect_null_decode_parameters() {
+        let mut pdf = handle_pdf();
+        let source = ObjectHandle::dictionary(vec![
+            (
+                b"/Filter".to_vec(),
+                ObjectHandle::name(b"UnsupportedFilter".to_vec()),
+            ),
+            (
+                b"/DecodeParms".to_vec(),
+                pdf.get_object_handle(ObjectRef::new(8, 0)),
+            ),
+        ]);
+
+        let resolved = resolve_stream_dictionary_handle(&mut pdf, &source)
+            .expect("resolve unfilterable stream dictionary");
+
+        assert!(!resolved.is_filterable());
+        let decode_parms = resolved.filter_input_handle().get_key(b"/DecodeParms");
+        // resolve_stream_dictionary_handle leaves this handle unresolved when
+        // filterable is false, but it is the same canonical object 8 slot
+        // decode_params_value aliased, not a stale or divergent copy: an
+        // explicit resolve after the fact still reports the correct value.
+        assert!(!decode_parms.is_null());
+        pdf.resolve(&decode_parms).expect("resolve DecodeParms");
+        assert!(decode_parms.is_null());
+    }
+
+    #[test]
+    fn direct_null_filter_defers_resolving_an_indirect_null_decode_parameters() {
+        let mut pdf = handle_pdf();
+        let source = ObjectHandle::dictionary(vec![
+            (b"/Filter".to_vec(), ObjectHandle::null()),
+            (
+                b"/DecodeParms".to_vec(),
+                pdf.get_object_handle(ObjectRef::new(8, 0)),
+            ),
+        ]);
+
+        let resolved = resolve_stream_dictionary_handle(&mut pdf, &source)
+            .expect("resolve stream dictionary with a direct null Filter");
+
+        assert!(resolved.is_filterable());
+        let decode_parms = resolved.filter_input_handle().get_key(b"/DecodeParms");
+        // Same reasoning as above: the /Filter is null so filter_names is
+        // None and resolved_decode_params is never actually resolved, but it
+        // aliases the same canonical slot, so resolving it later is correct.
+        assert!(!decode_parms.is_null());
+        pdf.resolve(&decode_parms).expect("resolve DecodeParms");
+        assert!(decode_parms.is_null());
+    }
+
+    #[test]
     fn an_empty_decode_parameter_array_aligns_as_absent_parameters() {
         let mut pdf = handle_pdf();
         let source = ObjectHandle::dictionary(vec![
