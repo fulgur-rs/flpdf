@@ -312,7 +312,7 @@ caller の数え方（領域 D と同じ規約。全行がこれに従う）: `r
 | B31 | `QPDFLogger`（`p_warn` 既定 null → `getError` へフォールバック、`setOutputStreams` で `p_warn` を null に戻す） | `libqpdf/QPDFLogger.cc:109-116,218-246,248-255` | `crates/flpdf/src/logger.rs::QPDFLogger`（`pub`。`get_warn` フォールバックは `crates/flpdf/src/logger.rs:181-184`） | `get_warn(` prod: 1 (logger.rs) / test: 3 (`crates/flpdf/tests/qpdf_logger_tests.rs:50,163,186`) | canonical | `crates/flpdf/src/logger.rs::QPDFLogger` | 逐語移植で、経路も 1 本。`get_warn` の唯一の production 呼び出し元は `crates/flpdf/src/logger.rs:170`（`QPDFLogger::warn` の中）で、warning の実配送はそこを通る — `route_warning`（B30）は `logger.warn(line)` を呼ぶ（`crates/flpdf/src/reader/resolver.rs:493,516`）ので、`get_warn` へは `QPDFLogger::warn` 経由で 1 本に合流する。`get_warn` の `p_warn` → `get_error` フォールバックと `set_output_streams` の `warn = None`（`crates/flpdf/src/logger.rs:282`）が qpdf（`libqpdf/QPDFLogger.cc:110-116,244`）と 1:1。qpdf 同様 **sink ではない**（`m->warnings` への push には関与しない）ことは B27/B28 の構造で保たれている |
 | B32 | 例外分類: `QPDFExc`（`std::runtime_error` 派生 + `qpdf_error_code_e`）と `std::logic_error` / `std::runtime_error` | `include/qpdf/QPDFExc.hh:29-77`, `libqpdf/QPDF.cc:481,1231`, `libqpdf/QPDFParser.cc:163`, `libqpdf/QPDFTokenizer.cc:241,248,770`, `libqpdf/QPDFLogger.cc:200,252`, `libqpdf/QPDF.cc:1101`（`std::range_error`） | `crates/flpdf/src/error.rs::Error`（`pub` enum。`Internal` / `System` / `Parse` / `Pages` / `Encrypted` / `Missing` / `Unsupported` / `Usage` / `Io` / `FileIo` / `OpenFailure`） | `Error::Internal(` prod: 166 / test: 91（計 257 = 全出現）、`Error::System(` prod: 103 / test: 138（計 241。全出現は 242 で、差の 1 件は `crates/flpdf-qtest-tools/src/driver/test_18_25.rs:171` のコメント行のため上の規約で除外）、`Error::parse(` prod: 161 / test: 10（計 171 = 全出現） | mixed | `crates/flpdf/src/error.rs::Error` | 型は 1 つに集約されているが、**qpdf の 2 軸（例外クラス × `qpdf_error_code_e`）を Rust の 1 軸に畳んでいる**。`Internal` ↔ `std::logic_error` / `System` ↔ `std::runtime_error` は `crates/flpdf/src/error.rs:42-43` の doc が明記する 1:1 対応。一方 `Parse` は qpdf の `QPDFExc(qpdf_e_damaged_pdf, ...)` に相当するが `QPDFExc` の他の error code（`qpdf_e_object` / `qpdf_e_pages` 等）は `Pages` など別 variant に分かれ、`QPDFExc` という 1 つのクラスが flpdf では複数 variant に散る。`Missing` / `Unsupported` / `OpenFailure` は qpdf に対応する例外クラス・error code が無い。`crates/flpdf/src/reader/resolver.rs:1615` は「`Error::Parse` だけが reconstruct の trigger になる」ことを qpdf の `catch (QPDFExc&)`（`libqpdf/QPDF.cc:1614`）と対応づけているので、この振り分けは回復分岐の正しさに直接効く |
 | B33 | `reconstruct_xref` の 3 連 warn（`file is damaged` → 引数 `e` → `Attempting to reconstruct cross-reference table`、順序固定） | `libqpdf/QPDF.cc:528-530` | `crates/flpdf/src/xref.rs::push_repair_diagnostics`（private、open 時） / `crates/flpdf/src/reader/resolver.rs:1626-1636`（resolve 時のインライン 3 連 `push_warning`） | `push_repair_diagnostics(` prod: 2 (xref.rs) / test: 0。resolver 側インラインは 1 箇所 (resolver.rs:1626-1636) | mixed | `crates/flpdf/src/xref.rs::push_repair_diagnostics` | B22 の帰結。2 実装があり、中央の「引数 `e` をそのまま warn する」部分の文言生成が別。`push_repair_diagnostics`（`crates/flpdf/src/xref.rs:2892-2921`）は trigger error のメッセージごとに 5 通りの分岐で `QPDFExc` 相当の文言を再構成するのに対し、resolver 側（`crates/flpdf/src/reader/resolver.rs:1631-1635`）は `"(object N G, offset X): message"` を固定書式で組む。qpdf はどちらも `warn(e)` の 1 行で、文言は `e` が作られた時点の `createWhat` が決めている（B30） |
-| B34 | （qpdf に対応物なし）bounded windowのread-to-end fallback予算 | absent — `libqpdf/QPDF.cc:1541-1697` はlive sourceをseek/parseする | `crates/flpdf/src/pdf.rs:200` の `resolution_fallbacks_remaining` と `crates/flpdf/src/engine.rs:74` の `MAX_RESOLUTION_FALLBACKS = 64` | 減算は `crates/flpdf/src/reader.rs:993,1032,1038` の3箇所 | bridge | absent | A22のqtest metadata/source-stream offset再parseだけが使う。`parse_source_file_object_at` はreader.rs:863から1件、qtest retryはplural metadata APIsから呼ばれ、最終consumerはtest_0_1.rs:260,267,282,343,389。E27/C28のcanonical pipe/logger移行後、両wrapper群と残testを移してcaller-zeroを確認し、window helperと予算を削除する。source stream data offsetとObjectHandle::getParsedOffsetは別の値であり、単純代用しない。 |
+| B34 | （qpdf に対応物なし）bounded windowのread-to-end fallback予算 | absent — `libqpdf/QPDF.cc:1541-1697` はlive sourceをseek/parseする | 削除済み（旧 `pdf.rs` の `resolution_fallbacks_remaining`、`engine.rs` の `MAX_RESOLUTION_FALLBACKS`） | prod: 0 / test: 0 | canonical | absent | A22のqtest metadata/source-stream offset再parseだけが使っていた予算。2026-09-08（`.44`）でE27/A22の外部callerが0になった後、2026-09-08（`.25`）で `resolution_fallbacks_remaining` フィールド・`MAX_RESOLUTION_FALLBACKS` 定数・両初期化箇所・唯一の消費者だった `qtest_read_source_object_with_retry`/`parse_source_file_object_at` ごと撤去した。qpdf に対応物のない独自予算が丸ごと消えたため canonical（absent）に区分し直す。 |
 
 `.27.1` で `error.rs::QpdfExc` / `QpdfErrorCode` を追加した。これはB30/B32の
 structured primitiveだけであり、既存resolverの3 formatter、prefix sniffing、
@@ -343,17 +343,20 @@ qtest exceptionsは変更しない。
 
 | 分類 | 件数 | 行 |
 |---|---|---|
-| canonical | 14 | B1, B3, B5, B6, B15, B16, B17, B18, B19, B21, B23, B24, B28, B31 |
+| canonical | 15 | B1, B3, B5, B6, B15, B16, B17, B18, B19, B21, B23, B24, B28, B31, B34 |
 | mixed | 19 | B2, B4, B7, B8, B9, B10, B11, B12, B13, B14, B20, B22, B25, B26, B27, B29, B30, B32, B33 |
-| bridge | 1 | B34 |
+| bridge | 0 | — |
 | unknown | 0 | — |
 
 合計 34 行。2026-09-06の再確認でB29はdocumentのwarning collectionをownerと確定し、
 未移植drainと既存snapshotが併存するmixedへ更新した。2026-09-07にB5の
 `ResolverHandle::in_parse`primitiveを移植しunknownからcanonicalへ更新した
 （`flpdf-3yn9.48.17`）。`.48.14` でB7のObjStm consumerに
-`next_object_stream_integer`を追加したため、canonical ownerが`absent`なのはB24 / B34の2行。
-B34は逆に **qpdfに無い状態をflpdfが持っている**。B24は
+`next_object_stream_integer`を追加したため、canonical ownerが`absent`なのはB24の1行。
+2026-09-08（`.25`）: B34 が持っていた「qpdfに無い状態をflpdfが持っている」
+fallback-budget（`resolution_fallbacks_remaining`）を削除したため、B34 を bridge から
+canonical へ移し bridge を 0 にした（残る参照は `tests/qpdf_route_hygiene_tests.rs:82` の
+存在しないことを検査する hygiene テストのみ）。B24は
 **両者とも持たないのが正しい**（qpdf 自身が `libqpdf/QPDF.cc:618-622` でやらないと
 明言している処理）ため、absent 同士の一致として canonical に数える。
 

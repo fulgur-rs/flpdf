@@ -25,7 +25,6 @@ fn xref_stream_production_parses_through_the_handle_route_once() {
 fn object_stream_legacy_test_entrypoint_is_removed() {
     let source = include_str!("../src/reader.rs");
     assert!(!source.contains("pub(crate) fn parse_object_stream_entry("));
-    assert!(source.contains("parse_qpdf_file_object_handle_with_diagnostics"));
     assert!(!source.contains("parse_qpdf_file_object("));
     assert!(!source.contains(".materialize("));
 }

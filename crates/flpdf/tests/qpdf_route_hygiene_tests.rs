@@ -54,20 +54,16 @@ fn dead_qpdf_routes_are_removed_and_canonical_owners_remain() {
     for dead in [
         "fn qtest_object_value_source_offset(",
         "fn qtest_array_item_source_offset(",
+        "fn qtest_object_value_source_offsets(",
+        "fn qtest_array_item_source_offsets(",
+        "fn qtest_decode_parms_source_offset(",
+        "fn source_stream_data_offset(",
     ] {
         assert!(
             !reader.contains(dead),
             "dead reader wrapper remains: {dead}"
         );
     }
-    assert!(
-        reader.contains("fn qtest_object_value_source_offsets("),
-        "the canonical batched object-offset route is missing"
-    );
-    assert!(
-        reader.contains("fn qtest_array_item_source_offsets("),
-        "the canonical batched array-offset route is missing"
-    );
 
     let tracked = fs::read_to_string(
         Path::new(env!("CARGO_MANIFEST_DIR"))
@@ -79,6 +75,13 @@ fn dead_qpdf_routes_are_removed_and_canonical_owners_remain() {
         "::decode_stream_data_with_limits",
         "::qtest_object_value_source_offset ",
         "::qtest_array_item_source_offset ",
+        "::qtest_object_value_source_offsets",
+        "::qtest_array_item_source_offsets",
+        "::qtest_decode_parms_source_offset",
+        "::read_window",
+        "::resolution_fallbacks_remaining",
+        "::MAX_RESOLUTION_FALLBACKS",
+        "::parse_source_file_object_at",
     ] {
         assert!(
             !tracked.contains(dead),

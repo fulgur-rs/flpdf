@@ -102,7 +102,6 @@ crates/flpdf/src/reader.rs::Pdf::mark_object_handle_mutated              # A18
 crates/flpdf/src/pdf.rs::dirty_object_refs                               # A18（フィールド）
 crates/flpdf/src/pdf.rs::handle_mutated_object_refs                      # A18（フィールド）
 crates/flpdf/src/xref.rs::BootstrapCache                                 # A20 第 2 の teardown walk
-crates/flpdf/src/reader/resolver.rs::read_window                         # A22
 crates/flpdf/src/object_handle.rs::legacy_dictionary_key                 # A23（parser残caller。writerは.48.35、stream_filterは.48.36でcutover済み）
 crates/flpdf/src/pdf.rs::compressed_member_parents                       # A24（フィールド）
 
@@ -140,9 +139,6 @@ crates/flpdf/src/reader/resolver.rs::reconstruct_xref_and_retry          # B22 r
 crates/flpdf/src/xref.rs::XrefLoadOptions                                # B26 open 時の第 2 表現
 crates/flpdf/src/xref.rs::LoadedXref                                     # B27 staging
 crates/flpdf/src/xref.rs::BootstrapHandleState                           # B27/B12 並行 document 状態
-crates/flpdf/src/pdf.rs::resolution_fallbacks_remaining                  # B34（フィールド）
-crates/flpdf/src/engine.rs::MAX_RESOLUTION_FALLBACKS                     # B34
-crates/flpdf/src/reader.rs::parse_source_file_object_at                  # B34
 
 # --- (b) baseline denominator ---
 crates/flpdf/src/parser.rs::too_many_bad_tokens                          # B4 canonical
@@ -240,9 +236,6 @@ crates/flpdf/src/job/attachment_list.rs::format_attachment_list_with_sink # E-9
 crates/flpdf/src/job/attachment_list.rs::AttachmentInfo                  # E-9
 crates/flpdf/src/job/json.rs::write_json                                 # E-24 free pub, prod caller 0
 crates/flpdf/src/job/acroform_field_prune.rs::prune_acroform_after_subset # E-26（free+method 合流）
-crates/flpdf/src/reader.rs::Pdf::qtest_object_value_source_offsets       # E-27
-crates/flpdf/src/reader.rs::Pdf::qtest_array_item_source_offsets         # E-27
-crates/flpdf/src/reader.rs::Pdf::qtest_decode_parms_source_offset        # E-27
 
 # --- (b) baseline denominator ---
 crates/flpdf/src/job/lifecycle.rs::QPDFJob::run                          # E-1（曖昧 leaf）
