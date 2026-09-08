@@ -269,7 +269,7 @@ fn process(
         stderr,
     );
 
-    let object_refs = pdf.object_refs();
+    let object_refs: Vec<_> = pdf.get_xref_table().keys().copied().collect();
     for obj_ref in object_refs {
         // Page content is already resolved through the canonical handle path
         // above. Reusing that state is important for damaged content streams:

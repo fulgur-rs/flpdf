@@ -80,6 +80,27 @@ fn reader_and_xref_have_no_legacy_replacement_cache() {
 }
 
 #[test]
+fn qpdf_object_cache_is_not_exported_as_a_facade() {
+    let root = source_root();
+    assert!(
+        !root.join("cache.rs").exists(),
+        "the legacy facade cache module must be removed"
+    );
+
+    let lib = source("lib.rs");
+    assert!(!lib.contains("pub mod cache"));
+    assert!(!lib.contains("pub use cache::"));
+
+    for path in ["engine.rs", "pdf.rs", "reader.rs"] {
+        let production = production_source(path);
+        assert!(
+            !production.contains("ObjectCache") && !production.contains("CacheEntry"),
+            "{path} retains the facade cache"
+        );
+    }
+}
+
+#[test]
 fn canonical_writer_and_pdf_surfaces_do_not_import_raw_object_types() {
     for path in [
         "pdf.rs",

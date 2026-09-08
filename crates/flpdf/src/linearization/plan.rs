@@ -973,8 +973,8 @@ impl LinearizationPlan {
         );
         let capture_pre_optimization_objects =
             !matches!(object_stream_mode, crate::writer::ObjectStreamMode::Disable);
-        let pre_optimization_object_refs =
-            capture_pre_optimization_objects.then(|| pdf.live_object_refs().into_iter().collect());
+        let pre_optimization_object_refs = capture_pre_optimization_objects
+            .then(|| pdf.canonical_live_object_refs().into_iter().collect());
         // QPDFWriter::doWriteSetup fixes Generate's eligible object set before
         // writeLinearized calls QPDF::optimize. The latter may mint indirect
         // inherited-attribute objects, which must remain plain in the output.
@@ -1100,7 +1100,7 @@ impl LinearizationPlan {
                 true,
                 &skipped_stream_parameter_streams,
             )?;
-        let object_refs = pdf.object_refs();
+        let object_refs = pdf.canonical_object_refs();
         let mut all_refs: Vec<ObjectRef> = Vec::with_capacity(object_refs.len());
         for r in object_refs {
             if r.number == 0 {
@@ -1133,13 +1133,13 @@ impl LinearizationPlan {
 
         // Resurrect null-resolving references reached via a surviving (array)
         // edge that have NO xref entry (truly missing). Free entries are already
-        // admitted above — they are in `object_refs()` (CacheEntry::Deleted) and
-        // pass the `reachable` filter — so add only the missing ones. qpdf treats
+        // admitted above — they are in the canonical cache and pass the
+        // `reachable` filter — so add only the missing ones. qpdf treats
         // a missing array ref exactly like a free one: a renumbered `null` body
         // object the array points at (verified byte-identical, /ID masked). The
         // set is drop-aware (a null ref reached only as a dict value is omitted),
         // so a dict-only missing ref stays dropped, not resurrected.
-        // `all_refs` is sorted (it filters the sorted `object_refs()` in order),
+        // `all_refs` is sorted (it filters the sorted canonical cache keys in order),
         // so a binary search rejects the already-admitted (free) refs without
         // allocating a temporary set.
         //
@@ -1172,7 +1172,7 @@ impl LinearizationPlan {
             .collect();
         if !resurrected.is_empty() {
             all_refs.append(&mut resurrected);
-            // Keep source-object-number order (object_refs() is already sorted);
+            // Keep source-object-number order (canonical cache keys are already sorted);
             // the resurrected refs slot in at their numeric position.
             all_refs.sort();
         }
@@ -1204,7 +1204,7 @@ impl LinearizationPlan {
         // The live object set is invariant across every page's closure; compute it
         // once so the per-page `compute_closure` calls below do not each re-scan
         // the whole xref table (which would be O(pages × objects)).
-        let live: BTreeSet<ObjectRef> = pdf.live_object_refs().into_iter().collect();
+        let live: BTreeSet<ObjectRef> = pdf.canonical_live_object_refs().into_iter().collect();
         let mut all_referenced_pages: BTreeMap<ObjectRef, BTreeSet<u32>> = BTreeMap::new();
         for (object_ref, _) in optimization.object_users() {
             let pages = optimization.referenced_pages(object_ref);

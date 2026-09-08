@@ -10,11 +10,21 @@
 //! generate-multipage writer / plan / renumber / hint-reconciliation paths.
 
 use flpdf::linearization::{LinearizationPlan, RenumberMap};
-use flpdf::{CompressStreams, DecodeLevel, ObjectStreamMode, Pdf, PdfOpenOptions, PdfWriter};
+use flpdf::{
+    CompressStreams, DecodeLevel, ObjectRef, ObjectStreamMode, Pdf, PdfOpenOptions, PdfWriter,
+};
 use std::cell::RefCell;
-use std::io::Cursor;
+use std::io::{Cursor, Read, Seek};
 use std::path::Path;
 use std::rc::Rc;
+
+fn canonical_object_refs<R: Read + Seek + 'static>(pdf: &mut Pdf<R>) -> Vec<ObjectRef> {
+    pdf.get_all_objects()
+        .expect("enumerate canonical qpdf object cache")
+        .into_iter()
+        .filter_map(|handle| handle.object_ref())
+        .collect()
+}
 
 /// Linearize `fixture` with `--object-streams=generate` via the public API and
 /// return the complete back-patched bytes.
@@ -108,7 +118,7 @@ fn three_page_generate_packs_first_half_container_before_e() {
     // Round-trip: every object resolves (compressed members reachable via the
     // type-2 xref entries that the per-half layout emits).
     let mut pdf = Pdf::open(Cursor::new(bytes.clone())).expect("Pdf::open round-trip");
-    let refs = pdf.object_refs();
+    let refs = canonical_object_refs(&mut pdf);
     assert!(!refs.is_empty(), "round-tripped doc must expose objects");
     for r in refs {
         pdf.resolve_canonical_object(r)
@@ -211,7 +221,7 @@ fn mixed_generate_emits_part6_and_part7_containers_and_round_trips() {
     // Round-trip: every object resolves, including both containers' compressed
     // members (the part7 container's members are page-1 private fonts).
     let mut pdf = Pdf::open(Cursor::new(bytes)).expect("Pdf::open round-trip");
-    let refs = pdf.object_refs();
+    let refs = canonical_object_refs(&mut pdf);
     assert!(!refs.is_empty(), "round-tripped doc must expose objects");
     for r in refs {
         pdf.resolve_canonical_object(r)
@@ -235,7 +245,7 @@ fn threepage_shared_generate_emits_part6_and_part8_containers_and_round_trips() 
     );
 
     let mut pdf = Pdf::open(Cursor::new(bytes)).expect("Pdf::open round-trip");
-    let refs = pdf.object_refs();
+    let refs = canonical_object_refs(&mut pdf);
     assert!(!refs.is_empty(), "round-tripped doc must expose objects");
     for r in refs {
         pdf.resolve_canonical_object(r)
@@ -287,7 +297,7 @@ fn openaction_generate_routes_open_document_container_to_first_half() {
     // members (the open-document container's 82 members + the first-page
     // container's 80 shared fonts).
     let mut pdf = Pdf::open(Cursor::new(bytes)).expect("Pdf::open round-trip");
-    let refs = pdf.object_refs();
+    let refs = canonical_object_refs(&mut pdf);
     assert!(!refs.is_empty(), "round-tripped doc must expose objects");
     for r in refs {
         pdf.resolve_canonical_object(r)
@@ -341,7 +351,7 @@ fn outlines_generate_emits_outline_hint_table_and_o_key() {
 
     // Round-trip: every object resolves (the outline container's members included).
     let mut pdf = Pdf::open(Cursor::new(bytes)).expect("Pdf::open round-trip");
-    let refs = pdf.object_refs();
+    let refs = canonical_object_refs(&mut pdf);
     assert!(!refs.is_empty(), "round-tripped doc must expose objects");
     for r in refs {
         pdf.resolve_canonical_object(r)
@@ -387,7 +397,7 @@ fn outline_od_shared_stream_emits_ineligible_outline_stream_after_container() {
     // then find its physical object header offset.
     let mut rt = Pdf::open(Cursor::new(bytes.clone())).expect("round-trip open");
     let mut js_number = None;
-    for r in rt.object_refs() {
+    for r in canonical_object_refs(&mut rt) {
         if let Ok(stream) = rt.resolve_canonical_object(r) {
             if stream.as_stream_dict().is_some() {
                 if let Ok(decoded) = stream.get_stream_data(DecodeLevel::Generalized) {
@@ -419,7 +429,7 @@ fn outline_od_shared_stream_emits_ineligible_outline_stream_after_container() {
     );
 
     // Round-trip: every object (including the outline container's members) resolves.
-    let refs = rt.object_refs();
+    let refs = canonical_object_refs(&mut rt);
     assert!(!refs.is_empty(), "round-tripped doc must expose objects");
     for r in refs {
         rt.resolve_canonical_object(r)
@@ -464,7 +474,7 @@ fn useoutline_od_shared_stream_emits_ineligible_outline_stream_after_first_half_
     // then find its physical object header offset.
     let mut rt = Pdf::open(Cursor::new(bytes.clone())).expect("round-trip open");
     let mut js_number = None;
-    for r in rt.object_refs() {
+    for r in canonical_object_refs(&mut rt) {
         if let Ok(stream) = rt.resolve_canonical_object(r) {
             if stream.as_stream_dict().is_some() {
                 if let Ok(decoded) = stream.get_stream_data(DecodeLevel::Generalized) {
@@ -504,7 +514,7 @@ fn useoutline_od_shared_stream_emits_ineligible_outline_stream_after_first_half_
     );
 
     // Round-trip: every object (including the outline container's members) resolves.
-    let refs = rt.object_refs();
+    let refs = canonical_object_refs(&mut rt);
     assert!(!refs.is_empty(), "round-tripped doc must expose objects");
     for r in refs {
         rt.resolve_canonical_object(r)
@@ -568,7 +578,7 @@ fn openaction_multi_od_generates_two_od_containers_in_dfs_order() {
     // Round-trip: all objects (including both OD containers' compressed members)
     // must resolve in the back-patched output.
     let mut pdf = Pdf::open(Cursor::new(bytes)).expect("Pdf::open round-trip");
-    let refs = pdf.object_refs();
+    let refs = canonical_object_refs(&mut pdf);
     assert!(!refs.is_empty(), "round-tripped doc must expose objects");
     for r in refs {
         pdf.resolve_canonical_object(r)
@@ -596,7 +606,7 @@ fn disc_part7_part8_generate_round_trips() {
     );
 
     let mut pdf = Pdf::open(Cursor::new(bytes)).expect("Pdf::open round-trip");
-    let refs = pdf.object_refs();
+    let refs = canonical_object_refs(&mut pdf);
     assert!(!refs.is_empty(), "round-tripped doc must expose objects");
     for r in refs {
         pdf.resolve_canonical_object(r)
@@ -623,7 +633,7 @@ fn otherpage_others_two_container_generate_round_trips() {
     );
 
     let mut pdf = Pdf::open(Cursor::new(bytes)).expect("Pdf::open round-trip");
-    let refs = pdf.object_refs();
+    let refs = canonical_object_refs(&mut pdf);
     assert!(!refs.is_empty(), "round-tripped doc must expose objects");
     for r in refs {
         pdf.resolve_canonical_object(r)
@@ -664,7 +674,7 @@ fn objstm_bearing_input_drops_source_structural_containers() {
 
     // The drop must not strand any reference: every object still resolves.
     let mut pdf = Pdf::open(Cursor::new(bytes)).expect("Pdf::open round-trip");
-    for r in pdf.object_refs() {
+    for r in canonical_object_refs(&mut pdf) {
         pdf.resolve_canonical_object(r)
             .unwrap_or_else(|e| panic!("object {r} did not resolve after drop: {e}"));
     }
@@ -680,7 +690,7 @@ fn useoutlines_generate_routes_outlines_to_first_page_and_round_trips() {
 
     // The output must parse as a valid linearized PDF.
     let mut pdf = Pdf::open(Cursor::new(bytes.clone())).expect("Pdf::open round-trip");
-    let refs = pdf.object_refs();
+    let refs = canonical_object_refs(&mut pdf);
     assert!(!refs.is_empty(), "round-tripped doc must expose objects");
     for r in refs {
         pdf.resolve_canonical_object(r)
@@ -964,7 +974,7 @@ fn thumbnail_private_shared_routes_thumbs_to_part9() {
     // Round-trip: every object resolves including the thumbnail image streams.
     let bytes = linearize_generate("objstm-lin-thumbnail-private-shared.pdf");
     let mut pdf_rt = Pdf::open(std::io::Cursor::new(bytes)).expect("Pdf::open round-trip");
-    for r in pdf_rt.object_refs() {
+    for r in canonical_object_refs(&mut pdf_rt) {
         pdf_rt
             .resolve_canonical_object(r)
             .unwrap_or_else(|e| panic!("object {r} did not resolve: {e}"));
@@ -1138,7 +1148,7 @@ fn acroform_widget_page1_page2_od_container_excluded_from_part8_soht() {
 
     // Round-trip sanity.
     let mut pdf = flpdf::Pdf::open(std::io::Cursor::new(bytes)).expect("Pdf::open round-trip");
-    let refs = pdf.object_refs();
+    let refs = canonical_object_refs(&mut pdf);
     assert!(!refs.is_empty(), "round-tripped doc must expose objects");
     for r in refs {
         pdf.resolve_canonical_object(r)
@@ -1233,7 +1243,7 @@ fn linearize_generate_force_version_below_1_5_suppresses_object_and_xref_streams
 
     // The suppressed linearized output still round-trips.
     let mut pdf = Pdf::open(Cursor::new(bytes.clone())).unwrap();
-    let refs = pdf.object_refs();
+    let refs = canonical_object_refs(&mut pdf);
     assert!(
         !refs.is_empty(),
         "suppressed linearized doc must expose objects"

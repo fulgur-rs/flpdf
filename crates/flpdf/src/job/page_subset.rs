@@ -375,7 +375,7 @@ mod tests {
 
     /// True if the given ObjectRef resolves to a non-null live object.
     fn is_live(pdf: &mut Pdf<Cursor<Vec<u8>>>, r: ObjectRef) -> bool {
-        pdf.live_object_refs().contains(&r)
+        pdf.canonical_live_object_refs().contains(&r)
     }
 
     // ── Tests: distinct fonts per page ───────────────────────────────────────

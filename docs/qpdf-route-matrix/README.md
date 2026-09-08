@@ -193,10 +193,6 @@ mixed は「1 つの flpdf 経路が 2 つ以上の qpdf 責務を畳んでい�
 canonical test scaffoldingのD19/D30や削除済みsymbolも履歴追跡のためmanifestに残る。
 
 ```
-crates/flpdf/src/cache.rs::ObjectCache: prod 3 (2 files) / test 4
-    crates/flpdf/src/engine.rs 2, crates/flpdf/src/pdf.rs 1
-crates/flpdf/src/cache.rs::CacheEntry: prod 43 (2 files) / test 13
-    crates/flpdf/src/cache.rs 31, crates/flpdf/src/reader.rs 12
 crates/flpdf/src/object_handle.rs::ObjectHandle::as_dictionary: prod 179 (43 files) / test 207
     crates/flpdf/src/acroform_document_helper.rs 14, crates/flpdf/src/object_handle.rs 13, crates/flpdf/src/page_annotation_flatten.rs 13, crates/flpdf/src/form_field_object_helper.rs 12, crates/flpdf/src/page_object_helper.rs 10, crates/flpdf/src/page_splice.rs 9, crates/flpdf/src/signatures.rs 9, crates/flpdf/src/optimization/inherited_attrs.rs 7, crates/flpdf/src/xref.rs 7, crates/flpdf-qtest-tools/src/driver/test_34_41.rs 6, crates/flpdf-qtest-tools/src/compare.rs 5, crates/flpdf-qtest-tools/src/driver/handle.rs 5, crates/flpdf-qtest-tools/src/driver/test_88_98.rs 5, crates/flpdf/src/job/json_sections.rs 5, crates/flpdf/src/resources.rs 5, crates/flpdf/src/form_field_object_helper/rendering.rs 4, crates/flpdf/src/pages.rs 4, crates/flpdf/src/writer/plain/body.rs 4, crates/flpdf/src/job/acroform_field_prune.rs 3, crates/flpdf/src/object_copy.rs 3, crates/flpdf/src/overlay_appearance_stream.rs 3, crates/flpdf/src/reader.rs 3, crates/flpdf/src/reader/file_object.rs 3, crates/flpdf/src/thread_bead_p.rs 3, crates/flpdf-qtest-tools/src/renumber.rs 2, crates/flpdf/src/annotation_object_helper.rs 2, crates/flpdf/src/filespec_helper/embedded_file_stream.rs 2, crates/flpdf/src/job/resource_pruning.rs 2, crates/flpdf/src/page_document_helper.rs 2, crates/flpdf-qtest-tools/src/clean.rs 1, crates/flpdf-qtest-tools/src/driver/test_0_1.rs 1, crates/flpdf-qtest-tools/src/driver/test_18_25.rs 1, crates/flpdf-qtest-tools/src/driver/test_42_49.rs 1, crates/flpdf-qtest-tools/src/driver/test_80_87.rs 1, crates/flpdf-qtest-tools/src/metadata.rs 1, crates/flpdf/src/document_json.rs 1, crates/flpdf/src/filespec_helper/filespec.rs 1, crates/flpdf/src/job/page_specs.rs 1, crates/flpdf/src/job/rotate.rs 1, crates/flpdf/src/json/input.rs 1, crates/flpdf/src/pages/tree_rebuild.rs 1, crates/flpdf/src/pdf.rs 1, crates/flpdf/src/writer/encrypted_strings.rs 1
 crates/flpdf/src/object_handle.rs::ObjectHandle::as_array: prod 127 (41 files) / test 201
@@ -223,20 +219,12 @@ crates/flpdf/src/object_handle.rs::ObjectHandle::has_key: prod 8 (6 files) / tes
     crates/flpdf-qtest-tools/src/clean.rs 2, crates/flpdf/src/page_object_helper.rs 2, crates/flpdf-qtest-tools/src/tokenizer_runner.rs 1, crates/flpdf/src/embedded_files.rs 1, crates/flpdf/src/optimization/inherited_attrs.rs 1, crates/flpdf/src/pages.rs 1
 crates/flpdf/src/reader.rs::Pdf::get_all_objects: prod 8 (6 files) / test 9
     crates/flpdf/src/document_json.rs 3, crates/flpdf-qtest-tools/src/driver/test_50_55.rs 1, crates/flpdf-qtest-tools/src/metadata.rs 1, crates/flpdf-qtest-tools/src/renumber.rs 1, crates/flpdf/src/reader.rs 1, crates/flpdf/src/writer/rewrite_renumber.rs 1
-crates/flpdf/src/reader.rs::Pdf::object_refs: prod 12 (4 files) / test 44
-    crates/flpdf/src/linearization/plan.rs 4, crates/flpdf/src/reader.rs 4, crates/flpdf-qtest-tools/src/tokenizer_runner.rs 3, crates/flpdf/src/nntree.rs 1
-crates/flpdf/src/reader.rs::Pdf::live_object_refs: prod 7 (5 files) / test 24
-    crates/flpdf-qtest-tools/src/orchestrator.rs 2, crates/flpdf/src/linearization/plan.rs 2, crates/flpdf/src/job/page_merge.rs 1, crates/flpdf/src/writer/object_streams/eligibility.rs 1, crates/flpdf/src/writer/rewrite_renumber.rs 1
-crates/flpdf/src/reader.rs::Pdf::resolved_count: prod 1 (1 files) / test 1
-    crates/flpdf/src/reader.rs 1
+crates/flpdf/src/reader.rs::Pdf::canonical_object_refs: prod 7 (6 files) / test 0
+crates/flpdf/src/reader.rs::Pdf::canonical_live_object_refs: prod 7 (6 files) / test 0
 crates/flpdf/src/reader.rs::Pdf::next_available_object_ref: prod 2 (2 files) / test 2
     crates/flpdf/src/page_annotation_flatten.rs 1, crates/flpdf/src/reader.rs 1
 crates/flpdf/src/reader.rs::Pdf::make_indirect_object_handle: prod 31 (14 files) / test 56
     crates/flpdf/src/acroform_document_helper.rs 6, crates/flpdf-qtest-tools/src/driver/test_10_17.rs 5, crates/flpdf/src/page_splice.rs 4, crates/flpdf-qtest-tools/src/large_file.rs 3, crates/flpdf/src/filespec_helper/filespec.rs 2, crates/flpdf/src/page_document_helper.rs 2, crates/flpdf/src/page_extract.rs 2, crates/flpdf-qtest-tools/src/driver/test_50_55.rs 1, crates/flpdf-qtest-tools/src/driver/test_56_63.rs 1, crates/flpdf-qtest-tools/src/driver/test_72_79.rs 1, crates/flpdf/src/form_field_object_helper/rendering.rs 1, crates/flpdf/src/job/acroform_field_prune.rs 1, crates/flpdf/src/page_annotation_flatten.rs 1, crates/flpdf/src/page_object_helper.rs 1
-crates/flpdf/src/reader.rs::Pdf::synchronize_cache_with_resolver_xref: prod 6 (1 files) / test 2
-    crates/flpdf/src/reader.rs 6
-crates/flpdf/src/pdf.rs::legacy_resolution_state_synced: prod 4 (2 files) / test 0
-    crates/flpdf/src/engine.rs 2, crates/flpdf/src/reader.rs 2
 crates/flpdf/src/reader.rs::Pdf::mark_object_handle_dirty: prod 179 (49 files) / test 69
     crates/flpdf/src/acroform_document_helper.rs 29, crates/flpdf/src/page_object_helper.rs 16, crates/flpdf/src/page_annotation_flatten.rs 14, crates/flpdf/src/job/page_merge.rs 7, crates/flpdf/src/page_splice.rs 7, crates/flpdf/src/pages/tree_rebuild.rs 7, crates/flpdf/src/resources.rs 7, crates/flpdf/src/form_field_object_helper/rendering.rs 6, crates/flpdf/src/job/page_specs.rs 6, crates/flpdf-qtest-tools/src/driver/test_02_09.rs 5, crates/flpdf/src/filespec_helper/embedded_file_stream.rs 5, crates/flpdf/src/job/acroform_field_prune.rs 5, crates/flpdf/src/pages/repair.rs 5, crates/flpdf-qtest-tools/src/driver/test_50_55.rs 4, crates/flpdf/src/overlay_appearance_stream.rs 4, crates/flpdf/src/embedded_files.rs 3, crates/flpdf/src/filespec_helper/filespec.rs 3, crates/flpdf-qtest-tools/src/clean.rs 2, crates/flpdf-qtest-tools/src/document_construction.rs 2, crates/flpdf-qtest-tools/src/driver/test_26_33.rs 2, crates/flpdf/src/form_field_object_helper.rs 2, crates/flpdf/src/job/image_optimization.rs 2, crates/flpdf/src/job/outline_dest_remap.rs 2, crates/flpdf/src/nntree.rs 2, crates/flpdf/src/objr_obj_annot_p.rs 2, crates/flpdf/src/optimization/inherited_attrs.rs 2, crates/flpdf/src/page_extract.rs 2, crates/flpdf/src/page_label_document_helper.rs 2, crates/flpdf/src/reader.rs 2, crates/flpdf/src/signatures.rs 2, crates/flpdf/src/thread_bead_p.rs 2, crates/flpdf-cli/src/main.rs 1, crates/flpdf-qtest-tools/src/driver/test_56_63.rs 1, crates/flpdf-qtest-tools/src/driver/test_72_79.rs 1, crates/flpdf-qtest-tools/src/driver/test_80_87.rs 1, crates/flpdf-qtest-tools/src/large_file.rs 1, crates/flpdf/src/annotation_object_helper.rs 1, crates/flpdf/src/job/attachments.rs 1, crates/flpdf/src/job/lifecycle.rs 1, crates/flpdf/src/job/overlay.rs 1, crates/flpdf/src/job/rotate.rs 1, crates/flpdf/src/json/input.rs 1, crates/flpdf/src/linearization/writer.rs 1, crates/flpdf/src/object_handle.rs 1, crates/flpdf/src/optimization.rs 1, crates/flpdf/src/page_document_helper.rs 1, crates/flpdf/src/pdf.rs 1, crates/flpdf/src/struct_tree_pg.rs 1, crates/flpdf/src/writer.rs 1
 crates/flpdf/src/reader.rs::Pdf::mark_object_dirty: prod 6 (3 files) / test 2
@@ -245,16 +233,12 @@ crates/flpdf/src/reader.rs::Pdf::mark_object_handle_mutated: prod 8 (2 files) / 
     crates/flpdf/src/reader.rs 5, crates/flpdf/src/filespec_helper/embedded_file_stream.rs 3
 crates/flpdf/src/pdf.rs::dirty_object_refs: prod 5 (2 files) / test 8
     crates/flpdf/src/reader.rs 3, crates/flpdf/src/engine.rs 2
-crates/flpdf/src/pdf.rs::handle_mutated_object_refs: prod 4 (2 files) / test 0
-    crates/flpdf/src/engine.rs 2, crates/flpdf/src/reader.rs 2
 crates/flpdf/src/xref.rs::BootstrapCache: prod 2 (1 files) / test 2
     crates/flpdf/src/xref.rs 2
 crates/flpdf/src/reader/resolver.rs::read_window: prod 5 (1 files) / test 0
     crates/flpdf/src/reader.rs 5
 crates/flpdf/src/object_handle.rs::legacy_dictionary_key: prod 3 (2 files) / test 0
     crates/flpdf/src/parser.rs 2, crates/flpdf/src/writer/object.rs 1
-crates/flpdf/src/pdf.rs::compressed_member_parents: prod 3 (2 files) / test 7
-    crates/flpdf/src/engine.rs 2, crates/flpdf/src/reader.rs 1
 crates/flpdf/src/reader/resolver.rs::ResolverCore: prod 5 (1 files) / test 0
     crates/flpdf/src/reader/resolver.rs 5
 crates/flpdf/src/reader/resolver.rs::object_cache: prod 10 (1 files) / test 1
@@ -637,12 +621,10 @@ warning の flush 位置（B27 / E-7）の問題である。
 
 #### 7.2.1 resolver（領域 A）
 
-1. **A2**（`crates/flpdf/src/cache.rs::ObjectCache` / `crates/flpdf/src/cache.rs::CacheEntry` の legacy 二重帳簿）を
-   `crates/flpdf/src/reader/resolver.rs::ResolverCore`（A1）へ畳む。前提: probe A-1（差分列挙）。
-2. **A15 / A24** — A2 の同期層（`crates/flpdf/src/reader.rs::Pdf::synchronize_cache_with_resolver_xref`）と
-   ObjStm メンバー昇格経路。1 が終われば消える。単独では畳めない。
-3. **A9 / A10 / A11** — 列挙 3 本と採番。
-4. **A13 / A14 / A17** — tombstone に触る変異 API。**A14 は `.46` で完了し、
+1. **A2 / A15 / A24** — `.48.22` で `ObjectCache` / `CacheEntry` の legacy 二重帳簿、
+   cache synchronization、ObjStm provenanceをResolverCoreへ畳み、削除済み。
+2. **A9 / A10 / A11** — `.48.22` でcanonical cache列挙と採番へ移行済み。
+3. **A13 / A14 / A17** — tombstone に触る変異 API。**A14 は `.46` で完了し、
    `replaceObject(og, newNull())` に相当する A16 の canonical routeへ統合した。**
 5. **A6 / A8 → A7** — 非解決アクセサ族を `try_*` 族へ寄せてから `crates/flpdf/src/reader.rs::Pdf::resolve` を落とす。
    逆順にはできない。
@@ -1002,3 +984,14 @@ B29 / D31 / E-28はsourceでmixedと判定した。E-28の未照合case/APIは�
 | **X-5** | writer 側 data key が D では canonical、C では mixed | **D17 は `canonical`**（`crates/flpdf/src/writer/encryption_state.rs::WriterEncryptionState` が set / unparse / clear の順序を写す）。**C18 も `canonical`**（`encryption/primitives.rs::compute_data_key` の共有 primitive を呼ぶ） | 順序と鍵計算をそれぞれ qpdf 責務どおり保持し、C-U4 oracle vectors の後に duplicate を削除した |
 | **X-6** | 5 ファイルの caller 数え方の細則が一致していない | **A ファイル**は「D の『モジュール直下の最初の `#[cfg(test)] mod` より前＝prod』という単純化は本領域では使えない」と明記する（`object_handle.rs` は桁 0 の `#[cfg(test)] mod` を 21 個持ち間に production コードが挟まる）。**D ファイル**はその単純化を採用している。B / C / E はさらに別の細則を書いている | `scripts/qpdf-route-callers.py` は A 側の brace 追跡規約を実装している。**以降の再測定は tracker を唯一の規約とする**（§6）。D の行セルが tracker と最も乖離するのはこの差が原因（§6.3） |
 | **X-7** | 行の完了とwriter全体の完了の区別 | A14はreplaceObjectのcanonical routeへ移行済み。D27もsingle/multi-source sweepを撤去済みでcanonical | D27の到達性削除pass撤去は完了だが、D2/D3/D11の採番・emission統合は別責務として追跡する |
+
+### 2026-09-09 A1/A2/A9/A10/A11/A13/A15/A16/A17/A24 canonical cutover
+
+`flpdf-3yn9.48.22` removed the facade `ObjectCache`/`CacheEntry` module and
+its public export, the legacy enumeration methods, recovery synchronization
+state, and compressed-member provenance. Writer and linearization consumers now
+use the canonical ResolverCore cache through private `Pdf` helpers; public
+complete enumeration remains `Pdf::get_all_objects`, matching qpdf's
+`fixDanglingReferences` plus `m->obj_cache` walk. Historical xref-stream
+handles remain in the complete cache view and are excluded from the live view
+by effective-xref/allocation ownership, without a second provenance set.

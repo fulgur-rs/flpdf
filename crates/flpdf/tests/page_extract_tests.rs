@@ -479,7 +479,7 @@ fn shared_resource_pdf() -> Vec<u8> {
 /// Count how many live objects in `doc` carry the given /Subtype name.
 fn count_subtype(doc: &mut Pdf<std::io::Cursor<Vec<u8>>>, subtype: &[u8]) -> usize {
     let mut n = 0;
-    for r in doc.live_object_refs() {
+    for r in common::canonical_live_object_refs(doc) {
         let obj = resolved_handle(doc, r);
         let Some(dict) = obj
             .as_dictionary()
@@ -498,7 +498,7 @@ fn count_subtype(doc: &mut Pdf<std::io::Cursor<Vec<u8>>>, subtype: &[u8]) -> usi
 /// Count how many live objects in `doc` carry the given /Type name.
 fn count_type(doc: &mut Pdf<std::io::Cursor<Vec<u8>>>, type_name: &[u8]) -> usize {
     let mut n = 0;
-    for r in doc.live_object_refs() {
+    for r in common::canonical_live_object_refs(doc) {
         let obj = resolved_handle(doc, r);
         let Some(dict) = obj
             .as_dictionary()
@@ -1731,7 +1731,7 @@ fn three_page_shared_font_pdf() -> Vec<u8> {
 /// Count objects whose dict is `/Type /Font` with the given `/BaseFont`.
 fn count_font_objects(doc: &mut Pdf<std::io::Cursor<Vec<u8>>>, base: &[u8]) -> usize {
     let mut n = 0;
-    for r in doc.object_refs() {
+    for r in common::canonical_object_refs(doc) {
         let obj = resolved_handle(doc, r);
         if obj.as_dictionary().is_some() {
             let type_name = resolved_key(doc, &obj, b"/Type");
@@ -1797,10 +1797,15 @@ fn extract_pages_object_count_sublinear_vs_per_page_extracts() {
 
     let combined = extract_pages(&mut source, &[0, 1])
         .unwrap()
-        .object_refs()
-        .len();
-    let separate = extract_page(&mut source, 0).unwrap().object_refs().len()
-        + extract_page(&mut source, 1).unwrap().object_refs().len();
+        .get_all_objects()
+        .unwrap()
+        .into_iter()
+        .filter_map(|handle| handle.object_ref())
+        .count();
+    let mut page0 = extract_page(&mut source, 0).unwrap();
+    let mut page1 = extract_page(&mut source, 1).unwrap();
+    let separate = common::canonical_object_refs(&mut page0).len()
+        + common::canonical_object_refs(&mut page1).len();
     assert!(
         combined < separate,
         "single-map extract must dedup shared objects: {combined} >= {separate}"

@@ -134,8 +134,9 @@ impl PlainWritePlan {
             None
         };
         let source_had_compressed_objects = source_has_compressed_entries(pdf);
-        let explicitly_removed: BTreeSet<ObjectRef> =
-            pdf.deleted_object_refs().into_iter().collect();
+        // qpdf's removeObject erases the canonical cache slot rather than
+        // retaining a persistent deleted-reference tombstone.
+        let explicitly_removed = BTreeSet::new();
         let normalized_content_refs: BTreeSet<ObjectRef> = if options.content_normalization {
             let pages = PageDocumentHelper::new(pdf).get_all_pages()?;
             let mut refs = BTreeSet::new();

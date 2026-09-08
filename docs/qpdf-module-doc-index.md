@@ -8,7 +8,6 @@
 | `crates/flpdf/src/annotation_object_helper.rs` | correspondence | \`QPDFAnnotationObjectHelper.cc\` |
 | `crates/flpdf/src/bit_stream.rs` | correspondence | BitStream.cc and bits_functions.hh MSB-first bit reading with Rust error values |
 | `crates/flpdf/src/bit_writer.rs` | correspondence | BitWriter.cc and bits_functions.hh MSB-first bit packing into a Pipeline stage |
-| `crates/flpdf/src/cache.rs` | correspondence | QPDF.cc xref-backed object cache represented as a standalone Rust module |
 | `crates/flpdf/src/content_normalizer.rs` | mirror | libqpdf/ContentNormalizer.cc |
 | `crates/flpdf/src/content_stream.rs` | correspondence | \`QPDFObjectHandle::ParserCallbacks\` and \`QPDFParser::warn\` content boundary |
 | `crates/flpdf/src/default_appearance.rs` | correspondence | QPDFFormFieldObjectHelper.cc default-appearance parsing split from the form-field helper |

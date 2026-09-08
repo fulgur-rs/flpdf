@@ -989,7 +989,7 @@ mod tests {
 
         remove_attachment(&mut pdf, b"trans.txt").expect("remove");
 
-        let live = pdf.live_object_refs();
+        let live = pdf.canonical_live_object_refs();
         assert!(
             live.contains(&fs_ref),
             "filespec remains in memory until the writer runs"
@@ -1028,7 +1028,7 @@ mod tests {
             .expect("resolve stream")
             .expect("stream ref");
 
-        assert!(pdf.object_refs().contains(&stream_ref));
+        assert!(pdf.canonical_object_refs().contains(&stream_ref));
     }
 
     // ── Test: removed filespec and stream are dropped by the writer ──────────
@@ -1050,7 +1050,7 @@ mod tests {
         remove_attachment(&mut pdf, b"gc.txt").expect("remove");
 
         // Both objects remain available for the writer's policy decision.
-        let live = pdf.live_object_refs();
+        let live = pdf.canonical_live_object_refs();
         assert!(
             live.contains(&fs_ref),
             "filespec remains in memory before writer output"
@@ -1101,7 +1101,7 @@ mod tests {
         let removed = remove_attachment(&mut pdf, b"idx.txt").expect("remove");
         assert!(removed);
 
-        let live = pdf.live_object_refs();
+        let live = pdf.canonical_live_object_refs();
         assert!(
             live.contains(&fs_ref),
             "null Filespec must remain reachable through the indirect /AF array"
@@ -1185,7 +1185,7 @@ mod tests {
         assert_eq!(af_after[0].object_ref(), Some(fs_ref));
 
         // The null Filespec remains reachable through the shared array.
-        let live = pdf.live_object_refs();
+        let live = pdf.canonical_live_object_refs();
         assert!(
             live.contains(&fs_ref),
             "null Filespec must remain reachable through the shared /AF array"
@@ -1249,7 +1249,7 @@ mod tests {
         let removed = remove_attachment(&mut pdf, b"shared.txt").expect("remove");
         assert!(removed, "existing key must report removed");
 
-        let live = pdf.live_object_refs();
+        let live = pdf.canonical_live_object_refs();
         assert!(
             live.contains(&fs_ref),
             "the null Filespec ref remains reachable through /Dests"
@@ -1321,7 +1321,7 @@ mod tests {
         let removed = remove_attachment(&mut pdf, b"paired.txt").expect("remove");
         assert!(removed);
 
-        let live = pdf.live_object_refs();
+        let live = pdf.canonical_live_object_refs();
         assert!(
             live.contains(&stream_ref),
             "externally-referenced stream remains in memory"
@@ -1375,7 +1375,7 @@ mod tests {
         let removed = remove_attachment(&mut pdf, b"a.txt").expect("remove a");
         assert!(removed);
 
-        let live = pdf.live_object_refs();
+        let live = pdf.canonical_live_object_refs();
         assert!(
             live.contains(&fs_a),
             "removed attachment's nulled filespec remains in memory"
@@ -1439,7 +1439,7 @@ mod tests {
         let removed = remove_attachment(&mut pdf, b"multi.txt").expect("remove");
         assert!(removed);
 
-        let live = pdf.live_object_refs();
+        let live = pdf.canonical_live_object_refs();
         assert!(live.contains(&fs_ref), "filespec remains in memory");
         assert!(live.contains(&stream_f), "primary stream remains in memory");
         assert!(
@@ -1494,7 +1494,7 @@ mod tests {
         let removed = remove_attachment(&mut pdf, b"x.txt").expect("remove");
         assert!(removed);
 
-        let live = pdf.live_object_refs();
+        let live = pdf.canonical_live_object_refs();
         assert!(
             live.contains(&af_array_ref),
             "empty indirect /AF array (target absent) must NOT be deleted"
@@ -1643,7 +1643,7 @@ mod tests {
         assert!(removed);
 
         // The shared stream must still be alive (fs_ref2 still references it).
-        let live = pdf.live_object_refs();
+        let live = pdf.canonical_live_object_refs();
         assert!(
             live.contains(&stream_ref),
             "shared stream must NOT be GC'd while fs_ref2 still references it"

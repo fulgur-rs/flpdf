@@ -172,7 +172,11 @@ fn swap_objects_preserves_a_replaced_null_slot_for_live_object_refs() {
     pdf.replace_object(deleted_ref, ObjectHandle::null())
         .expect("replace the object with qpdf's public null value");
     assert!(
-        pdf.live_object_refs().contains(&deleted_ref),
+        pdf.get_all_objects()
+            .unwrap()
+            .into_iter()
+            .filter_map(|handle| handle.object_ref())
+            .any(|object_ref| object_ref == deleted_ref),
         "replaceObject(og, newNull()) must keep the object ref in the live cache"
     );
 
@@ -183,7 +187,11 @@ fn swap_objects_preserves_a_replaced_null_slot_for_live_object_refs() {
         .expect("swap a live value into a null slot");
 
     assert!(
-        pdf.live_object_refs().contains(&deleted_ref),
+        pdf.get_all_objects()
+            .unwrap()
+            .into_iter()
+            .filter_map(|handle| handle.object_ref())
+            .any(|object_ref| object_ref == deleted_ref),
         "a swap that resolves a live value into a null slot must keep it live"
     );
     assert_eq!(

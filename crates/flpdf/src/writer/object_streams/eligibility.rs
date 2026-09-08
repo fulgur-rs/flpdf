@@ -112,7 +112,7 @@ pub(crate) fn compressible_objgens_qpdf_plan<R: std::io::Read + std::io::Seek>(
     // highest LIVE generation index once so null edges are O(1), and exclude
     // free/deleted generations from superseding a lower live object.
     let mut highest_live_generation: BTreeMap<u32, u16> = BTreeMap::new();
-    for object_ref in pdf.live_object_refs() {
+    for object_ref in pdf.canonical_live_object_refs() {
         highest_live_generation
             .entry(object_ref.number)
             .and_modify(|generation| *generation = (*generation).max(object_ref.generation))

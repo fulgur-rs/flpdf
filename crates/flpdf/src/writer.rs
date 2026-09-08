@@ -3686,7 +3686,7 @@ fn write_pclm<R: Read + Seek, W: Write>(
 
     let mut offsets = BTreeMap::<u32, (u16, usize)>::new();
     let mut emitted_old_to_new = BTreeMap::<ObjectRef, ObjectRef>::new();
-    let removed: BTreeSet<_> = pdf.deleted_object_refs().into_iter().collect();
+    let removed: BTreeSet<_> = BTreeSet::new();
 
     for item in &plan.items {
         match *item {
@@ -4044,7 +4044,7 @@ fn emit_canonical_pdf_inner<R: Read + Seek, W: Write>(
     // positions, while dictionary entries whose values resolve to null are
     // omitted regardless of QDF or encryption mode.
     let suppress_null_values = true;
-    let removed_refs: BTreeSet<ObjectRef> = pdf.deleted_object_refs().into_iter().collect();
+    let removed_refs: BTreeSet<ObjectRef> = BTreeSet::new();
     // QPDFWriter::write calls initializeSpecialStreams() -- which repairs the
     // page tree via QPDF::getAllPages() (promoting a direct /Kids leaf to a
     // fresh indirect object, cloning a duplicate leaf) -- before any object

@@ -111,7 +111,7 @@ fn dangling_pg_dropped_and_page_gced() {
 
     // The /Pg drop leaves the removed page unreferenced. It remains in memory
     // until the writer owns the reachability decision.
-    let live = pdf.live_object_refs();
+    let live = common::canonical_live_object_refs(&mut pdf);
     assert!(
         live.contains(&ObjectRef::new(4, 0)),
         "unreferenced page 2 remains in memory before writing"

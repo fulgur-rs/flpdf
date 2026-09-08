@@ -193,7 +193,7 @@ fn referenced_removed_pages_nulled_unreferenced_absent() {
         resolved_handle(&mut pdf, ObjectRef::new(6, 0)).is_null(),
         "removed page 4 (referenced by dp4) must be null"
     );
-    let live = pdf.live_object_refs();
+    let live = common::canonical_live_object_refs(&mut pdf);
     assert!(
         live.contains(&ObjectRef::new(4, 0)),
         "nulled-but-referenced page 2 stays live"
@@ -345,7 +345,7 @@ fn malformed_dest_to_non_page_object_is_never_nulled() {
         "non-page dest target (signature field) must survive null-out"
     );
     assert!(
-        pdf.live_object_refs().contains(&ObjectRef::new(7, 0)),
+        common::canonical_live_object_refs(&mut pdf).contains(&ObjectRef::new(7, 0)),
         "surviving non-page target stays live"
     );
     // The genuinely removed page (obj 4) IS nulled, matching qpdf.

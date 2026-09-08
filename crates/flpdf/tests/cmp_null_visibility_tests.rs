@@ -5,7 +5,9 @@
 mod common;
 use common::PdfCanonicalTestExt;
 
-use common::{write_linearized_with_settings, write_with_settings, WriterTestSettings};
+use common::{
+    canonical_object_refs, write_linearized_with_settings, write_with_settings, WriterTestSettings,
+};
 use flpdf::{
     CompressStreams, NewlineBeforeEndstream, ObjectHandle, ObjectRef, ObjectStreamMode, Pdf,
     PdfOpenOptions, StreamDataMode,
@@ -815,29 +817,33 @@ fn preserve_empty_qpdf_plan_does_not_repack_signature() {
     let mut reopened = Pdf::open(Cursor::new(output.clone())).unwrap();
 
     assert!(
-        reopened.object_refs().into_iter().all(|object_ref| {
-            let object = reopened.resolve_canonical_object(object_ref).unwrap();
-            !object.as_stream_dict().is_some_and(|stream_dict| {
-                stream_dict
+        canonical_object_refs(&mut reopened)
+            .into_iter()
+            .all(|object_ref| {
+                let object = reopened.resolve_canonical_object(object_ref).unwrap();
+                !object.as_stream_dict().is_some_and(|stream_dict| {
+                    stream_dict
+                        .try_get_key(b"/Type")
+                        .ok()
+                        .and_then(|type_name| type_name.as_name())
+                        .as_deref()
+                        == Some(b"ObjStm".as_slice())
+                })
+            }),
+        "an empty qpdf Preserve plan is authoritative; the writer must not repack /Sig"
+    );
+    assert!(
+        canonical_object_refs(&mut reopened)
+            .into_iter()
+            .any(|object_ref| {
+                let object = reopened.resolve_canonical_object(object_ref).unwrap();
+                object
                     .try_get_key(b"/Type")
                     .ok()
                     .and_then(|type_name| type_name.as_name())
                     .as_deref()
-                    == Some(b"ObjStm".as_slice())
-            })
-        }),
-        "an empty qpdf Preserve plan is authoritative; the writer must not repack /Sig"
-    );
-    assert!(
-        reopened.object_refs().into_iter().any(|object_ref| {
-            let object = reopened.resolve_canonical_object(object_ref).unwrap();
-            object
-                .try_get_key(b"/Type")
-                .ok()
-                .and_then(|type_name| type_name.as_name())
-                .as_deref()
-                == Some(b"Sig".as_slice())
-        }),
+                    == Some(b"Sig".as_slice())
+            }),
         "the reachable signature dictionary must be emitted as a plain object"
     );
 }
@@ -962,7 +968,7 @@ fn preserve_explicit_structural_null_replacement_keeps_source_container_over_100
 
     let mut reopened = Pdf::open(Cursor::new(out)).unwrap();
     let mut member_counts = Vec::new();
-    for object_ref in reopened.object_refs() {
+    for object_ref in canonical_object_refs(&mut reopened) {
         let object = reopened.resolve_canonical_object(object_ref).unwrap();
         if let Some(stream_dict) = object.as_stream_dict() {
             if stream_dict

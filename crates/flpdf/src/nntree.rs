@@ -2420,7 +2420,7 @@ impl ObjectAllocator {
     fn next_number<R: Read + Seek>(&self, pdf: &Pdf<R>) -> u64 {
         self.next.unwrap_or_else(|| {
             let legacy_max = pdf
-                .object_refs()
+                .canonical_object_refs()
                 .into_iter()
                 .map(|object_ref| u64::from(object_ref.number))
                 .max()

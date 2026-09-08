@@ -2,7 +2,6 @@
 //!
 //! Rust splits QPDF.cc construction into `engine.rs` while retaining the single `Pdf<R>` type.
 
-use crate::cache::ObjectCache;
 // Used by the public factory API's intra-doc links.
 #[allow(unused_imports)]
 use crate::error::EncryptedError;
@@ -105,19 +104,13 @@ impl<R: Read + Seek> Pdf<R> {
             trailer: ObjectHandle::uninitialized(),
             last_xref_form: XrefForm::Table,
             first_xref_item_offset: 0,
-            cache: ObjectCache::default(),
             foreign_object_maps: BTreeMap::new(),
             writer_object_order: None,
             foreign_object_visiting: BTreeMap::new(),
             acroform_cache: Rc::new(RefCell::new(None)),
             trailer_handle_memo: None,
             root_handle_memo: None,
-            compressed_member_parents: BTreeMap::new(),
-            legacy_resolution_state_synced: false,
             dirty_object_refs: BTreeSet::new(),
-            handle_mutated_object_refs: BTreeSet::new(),
-            qpdf_dangling_refs: BTreeSet::new(),
-            qpdf_parsed_xref_stream_refs: BTreeSet::new(),
             ever_called_get_all_pages: false,
             ever_pushed_inherited_attributes_to_pages: false,
             page_list_cache: None,
@@ -268,7 +261,6 @@ impl<R: Read + Seek> Pdf<R> {
         let first_xref_item_offset = loaded_state.first_xref_item_offset;
         let loaded = loaded_state.loaded;
         let source_xref_entries = loaded.entries.clone();
-        let cache = ObjectCache::from_offsets(&loaded.entries);
         resolver.set_header_offset(header_offset);
         resolver.install_source_xref_entries(source_xref_entries);
         resolver.set_reconstructed_xref(already_reconstructed);
@@ -300,19 +292,13 @@ impl<R: Read + Seek> Pdf<R> {
             trailer,
             last_xref_form: loaded.last_xref_form,
             first_xref_item_offset,
-            cache,
             foreign_object_maps: BTreeMap::new(),
             writer_object_order: None,
             foreign_object_visiting: BTreeMap::new(),
             acroform_cache: Rc::new(RefCell::new(None)),
             trailer_handle_memo: None,
             root_handle_memo: None,
-            compressed_member_parents: BTreeMap::new(),
-            legacy_resolution_state_synced: already_reconstructed,
             dirty_object_refs: BTreeSet::new(),
-            handle_mutated_object_refs: BTreeSet::new(),
-            qpdf_dangling_refs: BTreeSet::new(),
-            qpdf_parsed_xref_stream_refs: BTreeSet::new(),
             ever_called_get_all_pages: false,
             ever_pushed_inherited_attributes_to_pages: false,
             page_list_cache: None,

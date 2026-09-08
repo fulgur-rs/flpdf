@@ -90,7 +90,6 @@ pub mod acroform_document_helper;
 pub mod annotation_object_helper;
 pub(crate) mod bit_stream;
 pub(crate) mod bit_writer;
-pub mod cache;
 pub mod content_normalizer;
 pub mod content_stream;
 pub mod default_appearance;
@@ -155,7 +154,6 @@ pub use logger::QPDFLogger;
 
 pub use acroform_document_helper::{AcroFormDocumentHelper, AcroFormFieldInfo};
 pub use annotation_object_helper::AnnotationObjectHelper;
-pub use cache::{CacheEntry, ObjectCache};
 pub use content_normalizer::{normalize_content_stream, ContentNormalization};
 pub use content_stream::ObjectHandleParserCallbacks as ObjectParserCallbacks;
 pub use content_stream::{parse_content_operations, ObjectHandleParserCallbacks, ParseControl};

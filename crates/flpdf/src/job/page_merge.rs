@@ -1245,7 +1245,7 @@ pub(crate) fn merge_documents_with_resource_decisions_and_preserve_primary_into<
         // target writer rather than copied as source streams
         // (`QPDFWriter.cc:1093-1103,1955-2003`).
         if is_primary && preserve_primary_unreferenced {
-            for object_ref in input.source.live_object_refs() {
+            for object_ref in input.source.canonical_live_object_refs() {
                 let source_object = input.source.get_object_handle(object_ref);
                 if source_object.try_is_stream_of_type(b"ObjStm", b"")? {
                     continue;

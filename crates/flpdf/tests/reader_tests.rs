@@ -98,11 +98,9 @@ fn opens_pdf_without_resolving_all_objects() {
     let mut pdf = Pdf::open(BufReader::new(file)).unwrap();
 
     assert_eq!(pdf.version(), "1.7");
-    assert_eq!(pdf.resolved_count(), 0);
-    assert_eq!(
-        pdf.trailer().try_get_key(b"/Root").unwrap().object_ref(),
-        Some(ObjectRef::new(1, 0))
-    );
+    let root = pdf.trailer().try_get_key(b"/Root").unwrap();
+    assert_eq!(root.object_ref(), Some(ObjectRef::new(1, 0)));
+    assert!(!root.is_resolved(), "opening must keep object bodies lazy");
 }
 
 #[test]
@@ -3060,7 +3058,8 @@ fn encrypted_fixture_streams_decrypt_correctly_with_indirect_length_path() {
     let mut pdf = Pdf::open_with_options(BufReader::new(file), PdfOpenOptions::default()).unwrap();
     // Resolve every object; none must error and no panic.
     let mut stream_seen = false;
-    for r in pdf.object_refs() {
+    let refs: Vec<_> = pdf.get_xref_table().keys().copied().collect();
+    for r in refs {
         let object = resolved_handle(&mut pdf, r);
         if object.as_stream_dict().is_some() {
             stream_seen = true;

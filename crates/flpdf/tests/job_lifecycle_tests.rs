@@ -1354,7 +1354,11 @@ fn json_job_run_in_place_page_subset_remaps_outline_dests() {
          dangling /Type /Page dict"
     );
     assert!(
-        pdf.live_object_refs().contains(&target_ref),
+        pdf.get_all_objects()
+            .unwrap()
+            .into_iter()
+            .filter_map(|handle| handle.object_ref())
+            .any(|object_ref| object_ref == target_ref),
         "the nulled-but-referenced page must stay live"
     );
 }

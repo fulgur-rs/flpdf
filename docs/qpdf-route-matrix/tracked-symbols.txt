@@ -74,8 +74,6 @@
 # ===========================================================================
 
 # --- (a) deletable route ---
-crates/flpdf/src/cache.rs::ObjectCache                                   # A2
-crates/flpdf/src/cache.rs::CacheEntry                                    # A2
 crates/flpdf/src/object_handle.rs::ObjectHandle::as_dictionary           # A6 非解決族
 crates/flpdf/src/object_handle.rs::ObjectHandle::as_array                # A6
 crates/flpdf/src/object_handle.rs::ObjectHandle::as_integer              # A6
@@ -89,21 +87,16 @@ crates/flpdf/src/reader.rs::Pdf::resolve_handle_ref                      # A7
 crates/flpdf/src/object_handle.rs::ObjectHandle::get_key                 # A8 panic 版
 crates/flpdf/src/object_handle.rs::ObjectHandle::has_key                 # A8
 crates/flpdf/src/reader.rs::Pdf::get_all_objects                         # A9
-crates/flpdf/src/reader.rs::Pdf::object_refs                             # A10
-crates/flpdf/src/reader.rs::Pdf::live_object_refs                        # A10
-crates/flpdf/src/reader.rs::Pdf::resolved_count                          # A10
+crates/flpdf/src/reader.rs::Pdf::canonical_object_refs                   # A10
+crates/flpdf/src/reader.rs::Pdf::canonical_live_object_refs              # A10
 crates/flpdf/src/reader.rs::Pdf::next_available_object_ref               # A11 facade 側
 crates/flpdf/src/reader.rs::Pdf::make_indirect_object_handle             # A12 canonical public factory
-crates/flpdf/src/reader.rs::Pdf::synchronize_cache_with_resolver_xref    # A15
-crates/flpdf/src/pdf.rs::legacy_resolution_state_synced                  # A15（フィールド）
 crates/flpdf/src/reader.rs::Pdf::mark_object_handle_dirty                # A18
 crates/flpdf/src/reader.rs::Pdf::mark_object_dirty                       # A18
 crates/flpdf/src/reader.rs::Pdf::mark_object_handle_mutated              # A18
 crates/flpdf/src/pdf.rs::dirty_object_refs                               # A18（フィールド）
-crates/flpdf/src/pdf.rs::handle_mutated_object_refs                      # A18（フィールド）
 crates/flpdf/src/xref.rs::BootstrapCache                                 # A20 第 2 の teardown walk
 crates/flpdf/src/object_handle.rs::legacy_dictionary_key                 # A23（parser残caller。writerは.48.35、stream_filterは.48.36でcutover済み）
-crates/flpdf/src/pdf.rs::compressed_member_parents                       # A24（フィールド）
 
 # --- (b) baseline denominator ---
 crates/flpdf/src/reader/resolver.rs::ResolverCore                        # A1/A24 canonical

@@ -1,10 +1,12 @@
 //! Route guards for the qpdf-shaped reader/cache behavior.
 
 #[test]
-fn resolved_cache_entries_are_handle_native() {
-    let source = include_str!("../src/cache.rs");
-    assert!(source.contains("Resolved(ObjectHandle)"));
-    assert!(!source.contains("Resolved(Object)"));
+fn facade_cache_module_is_deleted_and_canonical_cache_is_private() {
+    let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("src");
+    assert!(!root.join("cache.rs").exists());
+    let lib = std::fs::read_to_string(root.join("lib.rs")).expect("read lib.rs");
+    assert!(!lib.contains("pub mod cache"));
+    assert!(!lib.contains("pub use cache::"));
 }
 
 #[test]

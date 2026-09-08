@@ -3186,8 +3186,7 @@ fn recover_xref_from_linear_scan(
     }
     // `XrefRegistration` uses a free entry only as the private placeholder
     // left by qpdf's failed unknown-type insertion. The effective reader xref
-    // table never exposes free rows (`ObjectCache::entry_from_xref` owns only
-    // live/uncompressed and compressed inputs), so remove the placeholder at
+    // table never exposes free rows; remove the placeholder at
     // the recovery boundary after candidate re-entry has consumed it.
     entries.retain(|_, entry| !matches!(entry, XrefEntry::Free { .. }));
 
@@ -4738,7 +4737,7 @@ fn parse_xref_stream_with_canonical_owner(
         trailer_references,
         // Keep the stream handle as qpdf obj_cache provenance. The final Pdf
         // constructor skips effective xref rows, but marks historical/free
-        // rows as non-live while retaining them in object_refs().
+        // rows as non-live while retaining them in the complete canonical cache view.
         parsed_xref_streams: BTreeMap::from([(object_ref, handle_object)]),
         bootstrap_cache: None,
         header_offset: 0,
@@ -8072,11 +8071,11 @@ mod final_handle_tests {
         let historical = ObjectRef::new(5, 0);
 
         assert!(
-            pdf.object_refs().contains(&historical),
+            pdf.canonical_object_refs().contains(&historical),
             "qpdf object-cache enumeration retains the historical xref stream"
         );
         assert!(
-            !pdf.live_object_refs().contains(&historical),
+            !pdf.canonical_live_object_refs().contains(&historical),
             "a superseded xref stream must not be treated as an effective live object"
         );
     }

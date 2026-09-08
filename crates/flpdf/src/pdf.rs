@@ -1,7 +1,6 @@
 //! qpdf correspondence: QPDF's central document container, direct document-state accessors, and teardown (`include/qpdf/QPDF.hh:1438-1518`; `libqpdf/QPDF.cc:215-232,2323-2358,2647-2651`).
 
 use crate::acroform_document_helper::AcroFormCache;
-use crate::cache::ObjectCache;
 use crate::encryption::state::{EncryptionInspectionState, EncryptionState};
 use crate::object_handle::DocumentResolver;
 use crate::pages::repair::PreparedPages;
@@ -13,18 +12,6 @@ use std::cell::RefCell;
 use std::collections::{BTreeMap, BTreeSet};
 use std::io::{Read, Seek};
 use std::rc::Rc;
-
-/// Provenance for a legacy object-stream member that has already been
-/// materialized.
-///
-/// `source_stream`/`source_index` preserve the live xref identity so
-/// resolution-time xref reconstruction can distinguish a still-valid
-/// compressed member from a stale mapping.
-#[derive(Debug, Clone, Copy)]
-pub(crate) struct CompressedMemberProvenance {
-    pub(crate) source_stream: u32,
-    pub(crate) source_index: u32,
-}
 
 /// Ordering key for objects that were imported into a fresh writer target.
 ///
@@ -150,7 +137,6 @@ pub struct Pdf<R: Read + Seek + 'static> {
     /// linearization `/T` check; zero preserves qpdf's initialized default
     /// when no parsed xref section contains object 0.
     pub(crate) first_xref_item_offset: u64,
-    pub(crate) cache: ObjectCache,
     // The canonical indirect-object handle registry that used to live here is
     // now `ResolverCore::object_cache`, reached through `self.resolver`. It
     // had to move: `DocumentResolver::resolve_indirect` takes `&self` and
@@ -196,26 +182,7 @@ pub struct Pdf<R: Read + Seek + 'static> {
     pub(crate) trailer_handle_memo: Option<ObjectHandle>,
     /// Canonical `/Root` handle after the first root lookup.
     pub(crate) root_handle_memo: Option<ObjectHandle>,
-    pub(crate) compressed_member_parents: BTreeMap<ObjectRef, CompressedMemberProvenance>,
-    /// Whether the legacy cache and object-boundary snapshot already reflect
-    /// the resolver's reconstructed xref. Open-time recovery initializes all
-    /// three from the same recovered table; resolution-time recovery flips
-    /// this lazily before the next legacy read.
-    pub(crate) legacy_resolution_state_synced: bool,
     pub(crate) dirty_object_refs: BTreeSet<ObjectRef>,
-    /// Dirty objects whose live ObjectHandle graph was changed directly, so
-    /// the legacy object cache may no longer agree with it. `set_object`
-    /// updates both representations and retains the stream zero-copy fast
-    /// path in the raw value cache.
-    pub(crate) handle_mutated_object_refs: BTreeSet<ObjectRef>,
-    /// Valid indirect references discovered while preparing qpdf JSON whose
-    /// exact object generation has no live xref/cache target.
-    pub(crate) qpdf_dangling_refs: BTreeSet<ObjectRef>,
-    /// Historical xref-stream object identities promoted into the canonical
-    /// resolver cache while following the source `/Prev` chain. The parsed
-    /// values themselves live on their [`ObjectHandle`]s; this set only keeps
-    /// the qpdf JSON preparation/mutation boundary aware of cache-only refs.
-    pub(crate) qpdf_parsed_xref_stream_refs: BTreeSet<ObjectRef>,
     /// Monotonic observation matching qpdf's `everCalledGetAllPages()`.
     pub(crate) ever_called_get_all_pages: bool,
     /// Monotonic observation matching qpdf's
