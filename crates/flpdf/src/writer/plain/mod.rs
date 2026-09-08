@@ -5,7 +5,7 @@ use crate::writer::plain::xref::{IdPlan, TrailerPlan};
 use crate::writer::ObjectWriterEmission;
 use crate::writer::WriterOptions;
 use crate::writer::WriterResult;
-use crate::{ObjectRef, ObjectStreamMode, Pdf, XrefForm};
+use crate::{CompressStreams, ObjectRef, ObjectStreamMode, Pdf, XrefForm};
 use std::collections::{BTreeMap, BTreeSet, HashMap};
 
 pub(crate) mod body;
@@ -18,31 +18,28 @@ pub(crate) fn write_plain<R: Read + Seek, W: Write>(
     options: &WriterOptions,
     generated_id: Option<&crate::ObjectHandle>,
 ) -> crate::Result<WriterResult> {
-    // The live Disable queue preserves the mutation/progress timing contract
-    // for the ordinary unnormalized route. QDF and page-content normalization
-    // need the planned writer's second dimension (QDF framing or normalized
-    // stream buffers), so they stay on the plan-based path whichever
-    // object-stream mode is selected.
+    // The live queue preserves the mutation/progress timing contract for the
+    // ordinary unnormalized route. QDF and page-content normalization need the
+    // planned writer's second dimension (QDF framing or normalized stream
+    // buffers), so both keep going through the plan-based path regardless of
+    // object-stream mode.
     //
-    // qpdf's `preserveObjectStreams` returns immediately when the source has
-    // no object streams (`QPDFWriter.cc:1941-1945`):
-    //
-    //     std::map<int, int> omap;
-    //     QPDF::Writer::getObjectStreamData(m->pdf, omap);
-    //     if (omap.empty()) {
-    //         return;
-    //     }
-    //
-    // `object_to_object_stream` then stays empty, so `enqueueObject` never
-    // takes its container branch (`:1097-1106`), no 1.5 floor is applied
-    // (`:2172-2173`), and the file gets a classic cross-reference table
-    // (`:3023-3025`) -- exactly the Disable shape. Route that case through the
-    // same live queue rather than the plan-based path, which exists to place
-    // the source-backed and generated object-stream containers this case does
-    // not have.
-    let is_live_disable_shaped = options.object_streams == ObjectStreamMode::Disable
-        || (options.object_streams == ObjectStreamMode::Preserve
-            && !plan::source_has_compressed_entries(pdf));
+    // qpdf's Preserve mode keeps whatever object streams the source already
+    // has. When there are none, `preserveObjectStreams` returns before it
+    // builds any mapping (`QPDFWriter.cc:1941-1945`), so
+    // `object_to_object_stream` stays empty and the walk is exactly Disable's.
+    // When there are some, `:1955-1966` fills that map and `enqueueObject`
+    // (`:1072-1141`) redirects a member's discovery to its container, numbering
+    // every member the instant the container is first queued
+    // (`assignCompressedObjectNumbers`, `:1057-1069`). Both are the same
+    // `enqueueObject`/`writeStandard` live walk, just with container-aware
+    // numbering in the second case, so Preserve routes through the live queue
+    // either way. Generate does not: it packs fresh containers the live walk
+    // cannot discover incrementally, so it keeps the plan-based path.
+    let is_live_disable_shaped = matches!(
+        options.object_streams,
+        ObjectStreamMode::Disable | ObjectStreamMode::Preserve
+    );
     if is_live_disable_shaped && !options.qdf && !options.content_normalization {
         return write_plain_live_disable(pdf, out, options, generated_id);
     }
@@ -63,7 +60,28 @@ fn write_plain_live_disable<R: Read + Seek, W: Write>(
     } else {
         None
     };
-    let removed_refs: BTreeSet<ObjectRef> = pdf.deleted_object_refs().into_iter().collect();
+    let mut removed_refs: BTreeSet<ObjectRef> = pdf.deleted_object_refs().into_iter().collect();
+    let object_streams = if options.object_streams == ObjectStreamMode::Preserve {
+        let packing =
+            crate::writer::object_streams::plan_qpdf_preserve_object_streams_with_unreferenced(
+                pdf,
+                options.preserve_unreferenced_objects,
+            )?; // cov:ignore: malformed source graph is rejected by the preserve planner
+        removed_refs.extend(packing.removed_refs);
+        packing.groups
+    } else {
+        Vec::new()
+    };
+    // Preserve's source-container groups are filtered by removed refs but not
+    // yet by live reachability (that filter is discovered incrementally by
+    // the queue itself, matching qpdf's own live enqueue -- see
+    // `emit_live_object_stream`'s doc comment). Whether the *source* has any
+    // retained group at all is still the right question for the qpdf 1.5
+    // version floor (`QPDFWriter.cc:1957-1966` builds this membership before
+    // the write pass, unconditional on live reachability), so this hint uses
+    // the pre-reachability group set even though the final xref form below
+    // uses the post-walk ground truth.
+    let has_object_stream_hint = !object_streams.is_empty();
     let source_id0 = plan::live_source_id0(pdf)?;
     let source_version = pdf.version().to_string();
     let source_extension_level = pdf.adobe_extension_level()?.unwrap_or(0);
@@ -72,7 +90,7 @@ fn write_plain_live_disable<R: Read + Seek, W: Write>(
         source_extension_level,
         options,
         false,
-        false,
+        has_object_stream_hint,
     );
     let version = effective_version.to_string();
     crate::writer::configure_progress_for_pdf(pdf, options, 0, false)?;
@@ -83,6 +101,7 @@ fn write_plain_live_disable<R: Read + Seek, W: Write>(
         final_extension_level,
         source_root,
         removed_refs.clone(),
+        &object_streams,
     )?; // cov:ignore: LLVM attributes the live-body call terminator to closure cleanup.
     let old_to_new = body.old_to_new;
     let root = source_root.and_then(|source| old_to_new.get(&source).copied());
@@ -97,7 +116,13 @@ fn write_plain_live_disable<R: Read + Seek, W: Write>(
         .as_ref()
         .map(|root| root.output_root_copy_with_adbe(&version, final_extension_level, false))
         .transpose()?;
-    let max_output = body.layout.uncompressed.keys().copied().max().unwrap_or(0);
+    // `old_to_new` numbers every live object (uncompressed and compressed)
+    // through one counter (`LiveQueue::enqueue_handle`), so it is always a
+    // bijection onto `1..=old_to_new.len()`; a compressed member's output
+    // number can exceed every uncompressed number, so `/Size` cannot be
+    // derived from the uncompressed map alone once Preserve has live
+    // compressed content.
+    let max_output = u32::try_from(old_to_new.len()).unwrap_or(u32::MAX);
     let trailer_size = usize::try_from(max_output)
         .ok()
         .and_then(|size| size.checked_add(1))
@@ -137,14 +162,33 @@ fn write_plain_live_disable<R: Read + Seek, W: Write>(
         }
     };
     let map: HashMap<ObjectRef, ObjectRef> = old_to_new.iter().map(|(&a, &b)| (a, b)).collect();
+    // Object streams require a cross-reference stream: a classic table has
+    // no type-2 row shape (ISO 32000-1 7.5.7), matching the planned writer's
+    // own `has_object_stream` decision (`plan.rs`). Unlike that decision,
+    // this uses the post-walk layout -- the only point this live path
+    // actually knows which containers turned out reachable.
+    let form = if body.layout.compressed.is_empty() {
+        XrefForm::Table
+    } else {
+        XrefForm::Stream
+    };
+    // Mirrors `plan.rs`'s `structural_filtered` derivation: the xref stream's
+    // own `/Filter /FlateDecode` + PNG `/Predictor 12` framing follows the
+    // same effective stream-compression policy as every other stream, not a
+    // hardcoded choice (`QPDFWriter.cc` writes the xref stream through the
+    // same `Pl_Flate` pipeline as any other filtered stream).
+    let structural_filtered = matches!(
+        crate::writer::effective_stream_policy(options),
+        Some(CompressStreams::Yes)
+    );
     let trailer = TrailerPlan {
-        form: XrefForm::Table,
+        form,
         canonical_entries: plan::canonical_trailer_entries(pdf, &map, &removed_refs)?,
         root,
         direct_root: None,
         id,
         encrypt: trailer_handle.try_get_key(b"/Encrypt")?.object_ref(),
-        structural_filtered: false,
+        structural_filtered,
         qdf: false,
     };
     let mut bytes = body.bytes;
