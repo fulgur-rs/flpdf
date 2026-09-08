@@ -214,6 +214,32 @@ fn one_two_three_page_mode_matrix_is_byte_identical_to_qpdf() {
     }
 }
 
+/// Preserve mode on a source with no object streams has nothing to preserve:
+/// `preserveObjectStreams` returns before it builds any mapping
+/// (`QPDFWriter.cc:1941-1945`), so the walk, the version floor and the
+/// cross-reference form all match Disable (`:1097-1106`, `:2172-2173`,
+/// `:3023-3025`).
+///
+/// This states the equivalence directly rather than leaving it implied by the
+/// two separate golden comparisons above. It does not, on its own, pin which
+/// internal route serves the case: both routes match the same golden bytes for
+/// these fixtures, so reverting the routing keeps this test green. Pinning the
+/// route needs a source that has a cross-reference stream but zero type-2
+/// entries, and `tests/fixtures/compat/` has none today (`flpdf-jvud`).
+#[test]
+fn preserve_with_no_source_object_streams_matches_disable_byte_for_byte() {
+    for fixture in ["one-page", "two-page", "three-page"] {
+        let disable =
+            rewrite_qpdf_equivalent_mode(&format!("{fixture}.pdf"), ObjectStreamMode::Disable);
+        let preserve =
+            rewrite_qpdf_equivalent_mode(&format!("{fixture}.pdf"), ObjectStreamMode::Preserve);
+        assert_eq!(
+            disable, preserve,
+            "{fixture}: Preserve-with-no-source-ObjStm diverged from Disable"
+        );
+    }
+}
+
 #[test]
 fn disable_xref_stream_source_downgrades_to_classic_table_byte_identical_to_qpdf() {
     assert_cmp_diff_zero_mode_named(
