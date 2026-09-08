@@ -296,10 +296,11 @@ fn argv_expands_an_argument_file_before_option_parsing() {
     // QPDFArgParser::handleArgFileArguments (QPDFArgParser.cc:232-260) runs
     // one level of `@file` expansion before any option is inspected. CRLF
     // line endings are normalized the same way `QUtil::read_lines_from_file`
-    // does (preserve_eol=false): a trailing `\r` before `\n` is dropped.
+    // does (preserve_eol=false): a trailing `\r` before `\n` is dropped, and
+    // the final line is still kept even without a trailing newline.
     let tempdir = tempfile::tempdir().unwrap();
     let argfile = tempdir.path().join("args");
-    std::fs::write(&argfile, b"--deterministic-id\r\n--progress\r\n").unwrap();
+    std::fs::write(&argfile, b"--deterministic-id\r\n--progress").unwrap();
     let input = Path::new(env!("CARGO_MANIFEST_DIR")).join("../../tests/fixtures/minimal.pdf");
     let output = tempdir.path().join("argfile-output.pdf");
 

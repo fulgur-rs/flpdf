@@ -1276,11 +1276,19 @@ fn expand_arg_files(argv: &[String]) -> Result<Vec<String>> {
 /// only guards a non-`-` `argfile`).
 fn read_argument_file_lines(path: &str) -> Result<Option<Vec<String>>> {
     let bytes = if path == "-" {
+        // cov:ignore-start: reads this process's real stdin (QPDFArgParser.cc:239
+        // exempts "-" from the openability probe), which an in-process
+        // `cargo test` binary cannot redirect per test without process-level
+        // tricks. `crates/flpdf-cli` exercises the equivalent `-` stdin path
+        // for its own argv/password readers via real subprocess stdin piping
+        // (`crates/flpdf-cli/tests/cli_zlib_flate.rs`), but `initialize_from_argv`
+        // itself has no CLI caller yet to spawn as a subprocess against.
         let mut bytes = Vec::new();
         std::io::stdin()
             .read_to_end(&mut bytes)
             .map_err(|error| Error::file_io("read argument file", "-", error))?;
         bytes
+        // cov:ignore-end
     } else {
         let mut file = match File::open(path) {
             Ok(file) => file,
