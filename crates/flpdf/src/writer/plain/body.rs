@@ -33,6 +33,14 @@ struct LiveQueue {
     /// Source ObjGen of an ObjStm container -> its members' source ObjGens,
     /// in qpdf's `std::set<QPDFObjGen>` (ascending) order. Empty for Disable.
     container_to_members: BTreeMap<ObjectRef, Vec<ObjectRef>>,
+    /// Members whose container chain is still being resolved.
+    ///
+    /// qpdf marks the same state by storing the invalid object ID `0` in
+    /// `obj_renumber` before it recurses, and ignores the object when it meets
+    /// that sentinel again (`libqpdf/QPDFWriter.cc:1097-1124`). flpdf derives
+    /// the next output number from `old_to_new.len()`, so a sentinel entry
+    /// there would shift every later number; keep the mark in its own set.
+    resolving_members: BTreeSet<ObjectRef>,
 }
 
 impl LiveQueue {
@@ -43,6 +51,7 @@ impl LiveQueue {
             removed_refs,
             member_to_container: BTreeMap::new(),
             container_to_members: BTreeMap::new(),
+            resolving_members: BTreeSet::new(),
         }
     }
 
@@ -116,10 +125,17 @@ impl LiveQueue {
             // enqueues its container instead, which eagerly numbers every
             // member of that container below
             // (`QPDFWriter::assignCompressedObjectNumbers`,
-            // `libqpdf/QPDFWriter.cc:1057-1069`). By construction a source
-            // ObjStm's own xref entry is type 1, so it can never also appear
-            // as a member of any container (including itself); this
-            // recursion is therefore always exactly one level deep.
+            // `libqpdf/QPDFWriter.cc:1057-1069`).
+            //
+            // A specially constructed file can name a container that is itself
+            // a member, directly or through a chain, so this recursion is not
+            // bounded by construction. qpdf guards it by storing the invalid
+            // object ID `0` before recursing and ignoring the object when it
+            // meets that sentinel again (`:1097-1104,1120-1124`), which drops
+            // the looping object entirely.
+            if !self.resolving_members.insert(source) {
+                return Ok(None);
+            }
             let container_handle = pdf.get_object_handle(container);
             self.enqueue_handle(pdf, container_handle)?;
             return Ok(self.old_to_new.get(&source).copied());

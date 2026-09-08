@@ -72,15 +72,16 @@ fn write_plain_live_disable<R: Read + Seek, W: Write>(
     } else {
         Vec::new()
     };
-    // Preserve's source-container groups are filtered by removed refs but not
-    // yet by live reachability (that filter is discovered incrementally by
-    // the queue itself, matching qpdf's own live enqueue -- see
-    // `emit_live_object_stream`'s doc comment). Whether the *source* has any
-    // retained group at all is still the right question for the qpdf 1.5
-    // version floor (`QPDFWriter.cc:1957-1966` builds this membership before
-    // the write pass, unconditional on live reachability), so this hint uses
-    // the pre-reachability group set even though the final xref form below
-    // uses the post-walk ground truth.
+    // qpdf gates both the 1.5 version floor and the cross-reference form on the
+    // same setup-time map, `object_stream_to_objects`
+    // (`QPDFWriter.cc:2172-2173` and `:3023-3031`), which
+    // `preserveObjectStreams` fills before the write pass
+    // (`:1955-1966`) and which live reachability never revisits. Derive both
+    // from one quantity here too: Preserve's source-container groups after the
+    // removed-ref filter. Splitting them -- floor from this set, form from the
+    // post-walk layout -- lets a container that is registered but never
+    // reached declare 1.5 while emitting a classic table, which qpdf never
+    // does.
     let has_object_stream_hint = !object_streams.is_empty();
     let source_id0 = plan::live_source_id0(pdf)?;
     let source_version = pdf.version().to_string();
@@ -162,15 +163,16 @@ fn write_plain_live_disable<R: Read + Seek, W: Write>(
         }
     };
     let map: HashMap<ObjectRef, ObjectRef> = old_to_new.iter().map(|(&a, &b)| (a, b)).collect();
-    // Object streams require a cross-reference stream: a classic table has
-    // no type-2 row shape (ISO 32000-1 7.5.7), matching the planned writer's
-    // own `has_object_stream` decision (`plan.rs`). Unlike that decision,
-    // this uses the post-walk layout -- the only point this live path
-    // actually knows which containers turned out reachable.
-    let form = if body.layout.compressed.is_empty() {
-        XrefForm::Table
-    } else {
+    // Object streams require a cross-reference stream: a classic table has no
+    // type-2 row shape (ISO 32000-1 7.5.7). qpdf decides this from the same
+    // setup-time membership that set the version floor above
+    // (`QPDFWriter.cc:3023-3031`), not from what the walk turned out to
+    // reach, so a registered-but-unreached container still produces a
+    // cross-reference stream with zero type-2 rows.
+    let form = if has_object_stream_hint {
         XrefForm::Stream
+    } else {
+        XrefForm::Table
     };
     // Mirrors `plan.rs`'s `structural_filtered` derivation: the xref stream's
     // own `/Filter /FlateDecode` + PNG `/Predictor 12` framing follows the

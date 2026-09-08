@@ -214,6 +214,100 @@ fn one_two_three_page_mode_matrix_is_byte_identical_to_qpdf() {
     }
 }
 
+/// `--preserve-unreferenced` with source object streams, compared against the
+/// pinned qpdf 11.9.0 binary rather than a committed golden.
+///
+/// This axis has no golden reference, and it is the axis this cutover actually
+/// changes: with `preserve_unreferenced` the planner skips its eligibility
+/// filter, so every source container survives into the live walk. Run the
+/// oracle at test time for the ObjStm fixtures instead of leaving the axis
+/// unpinned.
+#[test]
+fn preserve_unreferenced_with_source_object_streams_matches_qpdf_11_9() {
+    let Some(oracle) = pinned_qpdf() else {
+        eprintln!("[SKIP cmp_diff_zero_tests] qpdf 11.9.0 is unavailable");
+        return;
+    };
+    let directory = tempfile::tempdir().expect("tempdir");
+    for fixture in [
+        "null-visible-matrix-objstm.pdf",
+        "null-visible-preserve-empty-removed.pdf",
+        "null-visible-stale-generation-objstm.pdf",
+        "null-visible-preserve-signature.pdf",
+        "three-page-objstm.pdf",
+        "shared-stream-objstm.pdf",
+    ] {
+        let input = Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("../../tests/fixtures/compat")
+            .join(fixture);
+        let expected_path = directory.path().join(format!("{fixture}.qpdf"));
+        let status = std::process::Command::new(oracle)
+            .args([
+                "--deterministic-id",
+                "--object-streams=preserve",
+                "--preserve-unreferenced",
+            ])
+            .arg(&input)
+            .arg(&expected_path)
+            .status()
+            .expect("qpdf runs");
+        // Exit 3 is qpdf's "succeeded with warnings"; it still writes the file
+        // and is the expected status for the damaged fixtures here.
+        assert!(
+            matches!(status.code(), Some(0 | 3)),
+            "{fixture}: qpdf --preserve-unreferenced must produce output, got {:?}",
+            status.code()
+        );
+
+        let actual = rewrite_qpdf_equivalent_preserve_unreferenced(fixture);
+        let expected = std::fs::read(&expected_path).expect("qpdf output");
+        if let Some(off) = first_diff(&actual, &expected) {
+            panic!(
+                "{fixture}: --preserve-unreferenced output diverged from qpdf 11.9.0 \
+                 (flpdf={} bytes, qpdf={} bytes, first diff at byte {off})",
+                actual.len(),
+                expected.len(),
+            );
+        }
+    }
+}
+
+/// The pinned qpdf 11.9.0 oracle, or `None` when it is unavailable. Comparing
+/// against a different qpdf is not a parity result, so the version is checked.
+fn pinned_qpdf() -> Option<&'static str> {
+    let output = std::process::Command::new("qpdf").arg("--version").output();
+    output.ok().and_then(|output| {
+        String::from_utf8_lossy(&output.stdout)
+            .lines()
+            .next()
+            .is_some_and(|line| line == "qpdf version 11.9.0")
+            .then_some("qpdf")
+    })
+}
+
+fn rewrite_qpdf_equivalent_preserve_unreferenced(fixture: &str) -> Vec<u8> {
+    let path = Path::new(env!("CARGO_MANIFEST_DIR"))
+        .join("../../tests/fixtures/compat")
+        .join(fixture);
+    let file = std::fs::File::open(&path).unwrap_or_else(|e| panic!("open {path:?}: {e}"));
+    let mut pdf = Pdf::open(std::io::BufReader::new(file)).unwrap();
+
+    let opts = WriterTestSettings {
+        object_streams: ObjectStreamMode::Preserve,
+        // qpdf is invoked with `--deterministic-id`, whose content hash differs
+        // from `--static-id`'s fixed value; setting both here would pick the
+        // static one and diverge in the trailer `/ID` alone.
+        deterministic_id: true,
+        preserve_unreferenced_objects: true,
+        newline_before_endstream: flpdf::NewlineBeforeEndstream::Never,
+        ..WriterTestSettings::default()
+    };
+
+    let mut out = Vec::new();
+    write_with_settings(&mut pdf, &mut out, &opts).unwrap();
+    out
+}
+
 /// Preserve mode on a source with no object streams has nothing to preserve:
 /// `preserveObjectStreams` returns before it builds any mapping
 /// (`QPDFWriter.cc:1941-1945`), so the walk, the version floor and the
@@ -223,9 +317,10 @@ fn one_two_three_page_mode_matrix_is_byte_identical_to_qpdf() {
 /// This states the equivalence directly rather than leaving it implied by the
 /// two separate golden comparisons above. It does not, on its own, pin which
 /// internal route serves the case: both routes match the same golden bytes for
-/// these fixtures, so reverting the routing keeps this test green. Pinning the
-/// route needs a source that has a cross-reference stream but zero type-2
-/// entries, and `tests/fixtures/compat/` has none today (`flpdf-jvud`).
+/// these fixtures, so reverting the routing keeps this test green. The
+/// `--preserve-unreferenced` oracle comparison above does pin the routing --
+/// reverting it makes that test fail -- because that axis skips the planner's
+/// eligibility filter and reaches the live walk with every source container.
 #[test]
 fn preserve_with_no_source_object_streams_matches_disable_byte_for_byte() {
     for fixture in ["one-page", "two-page", "three-page"] {
