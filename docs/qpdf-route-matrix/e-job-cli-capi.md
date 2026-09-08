@@ -233,7 +233,7 @@ mixed へ変更したが、未照合の個別 case/API まで canonical と認�
 | E-14 | `QPDFJob::parseRotationParameter` | `libqpdf/QPDFJob.cc:368-415`, `include/qpdf/QPDFJob.hh:482` | `crates/flpdf/src/job/rotate_spec.rs::parse_rotation_parameter`（pub、`:35`）+ `RotationSpec` | prod: 3（range validation / job JSON / direct CLI） / test: 11 | mixed | `crates/flpdf/src/job/rotate_spec.rs::parse_rotation_parameter` | qpdfのprivate parserを共有Rust primitiveとして公開し、job JSONとCLI direct rotationの両経路が同じraw range・angle・relative契約を使う。rangeは全体文法を先に検査し、invalid parameterは`Error::Usage`でraw bytesを保持する。direct ConfigのNULは保持し、JSON consumerだけ`c_str()`境界で切る。旧`RotateSpec::parse`は削除した。ただしCLIの適用ownerは`QPDFJob::handleRotations`と別経路であり、owner closureは後続consumer移行で扱う。 |
 | E-15 | `QUtil::parse_numrange`（`QPDFJob::parseNumrange` は例外処理を足した薄いラッパー） | `include/qpdf/QUtil.hh:464`, `libqpdf/QUtil.cc:1304-1438`, `libqpdf/QPDFJob.cc:399-425`, `libqpdf/QPDFJob_argv.cc:240-272`, `libqpdf/QPDFJob_config.cc:1055-1074` | `crates/flpdf/src/qutil.rs::parse_numrange`（pub、`:400`） | prod: rotation parser / lifecycle / CLI、test: qpdf contract vectors | mixed | `crates/flpdf/src/qutil.rs::parse_numrange` | signed `max`、max=0 syntax-only、raw bytes、NUL終端、group全体の文法先行検査、exclusion、position-based odd/even、QIntC narrowing/wrappingを共通primitiveへ移植した。rotation consumerで先行利用するが、`PageRange`の他consumerとowner closureは後続issueへ残す。 |
 | E-16 | `QPDFJob::shouldRemoveUnreferencedResources` | `libqpdf/QPDFJob.cc:2250-2339`, `include/qpdf/QPDFJob.hh:515` | `crates/flpdf/src/job/resource_pruning.rs::should_remove_unreferenced_resources`（pub free） | prod: 3 (flpdf/src/job/page_merge.rs:854, flpdf/src/job/page_specs.rs:192, flpdf-cli/src/main.rs:5707) / test: 10 | mixed | `crates/flpdf/src/job/resource_pruning.rs::should_remove_unreferenced_resources` | 実装 1 本に対し呼び出し 3 経路。qpdf 側は `handlePageSpecs` からしか呼ばれない private メソッド。crate ルート `pub`（`crates/flpdf/src/lib.rs:190-193`）は 8 の (A)〜(E) 未記載の**新規 debt 候補** |
-| E-17 | `QPDFJob::initializeFromArgv` / `initializeFromJson`（`QPDFArgParser` 経由の argv 解釈） | `include/qpdf/QPDFJob.hh:75-90`, `libqpdf/QPDFJob_argv.cc` | `crates/flpdf/src/job/lifecycle.rs::QPDFJob::initialize_from_argv`（pub、`crates/flpdf/src/job/lifecycle.rs:1521`） | prod: 3（すべて flpdf-qtest-tools/src/bin/qpdfjob_ctest.rs:147,164,183）/ test: 16 (flpdf/tests/job_lifecycle_tests.rs) | mixed | absent | **flpdf-cli は `initialize_from_argv` を一度も呼ばない** — clap 定義（CLAUDE.md 逸脱分類 (B) の `QPDFArgParser` → clap）で独自に引数を解釈し、`QPDFJob` の setter を個別に叩く（`job.set_input_file` / `job.set_output_file` / `job.set_password` …）。qpdf の CLI は `initializeFromArgv` 1 本しか使わない（`qpdf/qpdf.cc:35`）。argv → 設定が CLI 側と library 側に分かれている。2026-09-06 確認: `lifecycle.rs:1614-1695` の library initializer は限定的な手書きdispatchで `--rotate` などを未実装。CLIをそのまま接続できる canonical prerequisite は完成していない。2026-09-08（`flpdf-3yn9.48.6`）: 全 124 option の対応表を機械測定（本ファイル末尾「E-17/E-21 option correspondence table」）。`initialize_from_argv` は 11/124（9%）、`main.rs` 独自実装は 113/124（91%）で、想定と逆に `main.rs` の方が qpdf 文法（`@argfile`/`--` reset の edge case）まで含めて先行している。CLI 接続は本 issue では見送り、`initialize_from_argv` 自体の `@argfile`/`--` reset 実装が先決 |
+| E-17 | `QPDFJob::initializeFromArgv` / `initializeFromJson`（`QPDFArgParser` 経由の argv 解釈） | `include/qpdf/QPDFJob.hh:75-90`, `libqpdf/QPDFJob_argv.cc` | `crates/flpdf/src/job/lifecycle.rs::QPDFJob::initialize_from_argv`（pub、`crates/flpdf/src/job/lifecycle.rs:1781`） | prod: 3（すべて flpdf-qtest-tools/src/bin/qpdfjob_ctest.rs:147,164,183）/ test: 23 (flpdf/tests/job_lifecycle_tests.rs) | mixed | absent | **flpdf-cli は `initialize_from_argv` を一度も呼ばない** — clap 定義（CLAUDE.md 逸脱分類 (B) の `QPDFArgParser` → clap）で独自に引数を解釈し、`QPDFJob` の setter を個別に叩く（`job.set_input_file` / `job.set_output_file` / `job.set_password` …）。qpdf の CLI は `initializeFromArgv` 1 本しか使わない（`qpdf/qpdf.cc:35`）。argv → 設定が CLI 側と library 側に分かれている。2026-09-06 確認: library initializer は限定的な手書きdispatchで `--rotate` などを未実装。CLIをそのまま接続できる canonical prerequisite は完成していない。2026-09-08（`flpdf-3yn9.48.6`）: 全 124 option の対応表を機械測定（本ファイル末尾「E-17/E-21 option correspondence table」）。`initialize_from_argv` は 11/124（9%）、`main.rs` 独自実装は 113/124（91%）で、想定と逆に `main.rs` の方が qpdf 文法（`@argfile`/`--` reset の edge case）まで含めて先行している。CLI 接続は本 issue では見送り。2026-09-08（`flpdf-q5ok`）: `initialize_from_argv` 自体に `@argfile` 展開（`expand_arg_files`、`lifecycle.rs:1789` の `--` 直後）と qpdf 準拠 `--` main-table reset（`lifecycle.rs:1800`）を実装し、想定していた前提の欠落を解消した。option 数自体（11/124）は変わらない — 未着手なのは個別 option の移植、CLI 接続の判断は依然保留 |
 | E-18 | `QPDFJob::checkConfiguration` | `libqpdf/QPDFJob.cc:566-642`, `include/qpdf/QPDFJob.hh:129-130` | `crates/flpdf/src/job/lifecycle.rs::QPDFJob::check_configuration`（pub、`crates/flpdf/src/job/lifecycle.rs:3230`） | prod: 8 (flpdf/src/job/lifecycle.rs 4, flpdf-qtest-tools/src/driver/test_80_87.rs 4) / test: 0 | canonical | `crates/flpdf/src/job/lifecycle.rs::QPDFJob::check_configuration` | qpdf と同じく `createQPDF` 冒頭（`crates/flpdf/src/job/lifecycle.rs:2383`）から呼ばれ、public としても露出。CLI は使わない（E-17 の帰結）が、それは「別の正本がある」のではなく「CLI が job 設定を組み立てない」ため |
 | E-19 | `QPDFJob::getExitCode` / `hasWarnings` / `createsOutput` | `libqpdf/QPDFJob.cc:522-564` | `crates/flpdf/src/job/lifecycle.rs::QPDFJob::get_exit_code`（pub、`:4032`） + `crates/flpdf/src/job/lifecycle.rs::QPDFJob::complete`（pub、`:4062`） + `has_warnings`（pub）; document warning API は `crates/flpdf/src/reader.rs::Pdf::get_warnings` / `any_warnings` / `num_warnings` | `get_exit_code` leaf tracker prod: 17 / test: 15; `complete` prod: 20 / test: 16; `has_warnings` prod: 12 / test: 7 | mixed | `crates/flpdf/src/job/lifecycle.rs::QPDFJob::get_exit_code` + `drain_document_warnings` | `get_exit_code` は logger/write/drain を行わない純粋な query。`write_qpdf` が `get_warnings` 相当の document drain、warning summary、memory reportを1回の enclosing completionとして実行し、JSON/check/linearizationの既存standalone public APIはその後 `get_exit_code`を返す。CLI direct completionは残るが、旧 `complete` がstatusを兼ねる経路は撤去済み。 |
 | E-20 | `QPDFJob::getLogger` / `setLogger` / `setMessagePrefix` / `getMessagePrefix` / `registerProgressReporter` | `libqpdf/QPDFJob.cc:302-337`, `include/qpdf/QPDFJob.hh:92-123` | `crates/flpdf/src/job/lifecycle.rs::QPDFJob::logger`（pub、`crates/flpdf/src/job/lifecycle.rs:1308`）ほか 4 メソッド | `set_message_prefix` prod: 27 (flpdf/src/job/lifecycle.rs, flpdf-cli/src/main.rs, flpdf-qtest-tools) / test: 6；`QPDFJob::register_progress_reporter` prod: 3 (flpdf-qtest-tools/src/bin/qpdfjob_ctest.rs:143,178, flpdf-qtest-tools/src/driver/test_80_87.rs:336) / test: 2 (flpdf/tests/job_lifecycle_tests.rs:302,1591) | canonical | `crates/flpdf/src/job/lifecycle.rs`（`QPDFJob` の logger/prefix impl） | `logger()` / `message_prefix()` の `get_` 省略は 7 の bare getter 例外に該当し正しい。CLI が `QPDFJob::new` を 25 回作って毎回 logger と prefix を設定し直しているのは E-17 / E-4 の帰結（job インスタンスが lifecycle を持たない）。`crates/flpdf/src/writer.rs:695` の `PdfWriter::register_progress_reporter` は同名の別シンボルで、`crates/flpdf/src/job/lifecycle.rs:1512`（`configure_writer_progress` 内）と `crates/flpdf/tests/linearize_objstm_generate_tests.rs:1403` はそちらの caller — 上の数から除外している |
@@ -559,19 +559,26 @@ qpdf option の実に 91%（113/124）を**独自の clap 実装で**既に持�
 
 **既存 grammar issue の再確認結果**（着手時に再確認、issue 記載通り再利用検討）:
 - `flpdf-wxec`（`@argfile` 内 `--version`/`--copyright` の sole-option 判定）: CLOSED、
-  PR #1588 で `main.rs` 側に実装済み。`initialize_from_argv` には同等の `@argfile` 展開
-  自体が無い。
+  PR #1588 で `main.rs` 側に実装済み。2026-09-08（`flpdf-q5ok`）:
+  `initialize_from_argv` にも同形の `@argfile` 展開（`expand_arg_files`）を実装した。
+  ただし `--version`/`--copyright`/`--help` 自体は `initialize_from_argv` に未実装
+  （sole-option 判定の対象が無い）ため、この issue の sole-option gate 固有の
+  edge case はまだ再現していない。
 - `flpdf-qqp5`（top-level `--` の qpdf 準拠 reset semantics）: CLOSED、PR #1605 で
-  `main.rs` 側に実装済み。`initialize_from_argv` の `--` 処理はこの reset を持たない
-  単純な one-shot フラグ（`crates/flpdf/src/job/lifecycle.rs:1708-1710` 相当）。
+  `main.rs` 側に実装済み。2026-09-08（`flpdf-q5ok`）: `initialize_from_argv` の
+  `--` 処理も one-shot フラグから main-table reset（`lifecycle.rs:1800`、`--`
+  の後ろのオプションも認識される）へ揃え、`main.rs` の
+  `top_level_double_dash_resets_to_main_options_like_qpdf` と同じ形を
+  `argv_top_level_double_dash_resumes_the_main_option_table` で検証した。
 - `flpdf-glm2.1`（`--newline-before-endstream=never` の bare flag 化）: 依然 OPEN、
   `main.rs` 側の別の未解決 issue。本 issue のスコープ外。
 
-**受け入れ基準の残り**: raw argv bytes/@argfile/nested `--`/parameter dispatch/
-jobJsonFile/usage error を同じ Config へ、という統合は、`initialize_from_argv` 自体に
-`@argfile` 展開と qpdf 準拠 `--` reset を先に実装しない限り着手できない
-（`main.rs` の既存実装を「正本」側へ retrofit する形になる）。これは本 issue 単体では
-収まらない規模のため、`flpdf-3yn9.48.6.2`（仮称、未起票）として切り出す。
+**受け入れ基準の残り**: 2026-09-08（`flpdf-q5ok`）で `@argfile` 展開と qpdf 準拠 `--`
+reset の文法基盤は実装済み。残る「raw argv bytes/nested `--`/parameter dispatch/
+jobJsonFile/usage error を同じ Config へ」という統合は、個別 option（113 件、
+`main.rs` の既存実装を `initialize_from_argv` 側へ retrofit する形）の移植が
+主体で、依然として本 issue 単体では収まらない規模。CLI 接続（E-21）の判断は
+その完了後に別途行う。
 未接続の CLI cohort（`.48.7`〜`.48.10`）は元々の記載通り依存 PR で段階移行する。
 
 ### option 別対応表
