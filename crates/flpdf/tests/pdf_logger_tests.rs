@@ -111,6 +111,18 @@ fn indirect_xref_filter_bytes(array_value: bool) -> Vec<u8> {
     .into_bytes()
 }
 
+/// A damaged file (`startxref 0`, matching qpdf's immediate-reconstruction
+/// special case) whose line-scan recovers two objects: object 1's body has
+/// no `endobj` before object 2's own header starts, and object 2 is a valid
+/// `/Type /XRef` stream that reconstruction accepts as its candidate. Object
+/// 1's malformed body is resolved live, through the canonical owner, while
+/// `find_xref_stream_trailer_candidate_canonical` scans every recovered
+/// entry looking for the candidate (`libqpdf/QPDF.cc:585-589`; every entry is
+/// resolved regardless of whether it turns out to be the winning candidate).
+fn candidate_discovery_live_warning_bytes() -> Vec<u8> {
+    b"%PDF-1.4\n1 0 obj\n<< /Foo 1 >>\n2 0 obj\n<< /Type /XRef /W [1 1 1] /Size 1 /Length 3 >>\nstream\n\x01\x00\x00\nendstream\nendobj\nstartxref\n0\n%%EOF\n".to_vec()
+}
+
 fn two_lazy_warning_objects() -> Vec<u8> {
     let mut pdf = b"%PDF-1.4\n".to_vec();
     let mut offsets = Vec::new();
@@ -444,6 +456,39 @@ fn unknown_xref_entry_type_matches_qpdf_after_reconstruction() {
          WARNING: input.pdf: Attempting to reconstruct cross-reference table\n\
          WARNING: input.pdf (xref stream, offset 9): Cross-reference stream data has the wrong size; expected = 2; actual = 4\n\
          WARNING: input.pdf: reported number of objects (1) is not one plus the highest object number (1)\n"
+    );
+}
+
+#[test]
+fn reconstruction_orders_a_live_candidate_discovery_warning_after_the_trio() {
+    let (logger, output) = recording_logger();
+    let mut pdf = Pdf::open_with_options(
+        Cursor::new(candidate_discovery_live_warning_bytes()),
+        PdfOpenOptions {
+            repair: true,
+            logger: Some(logger),
+            description: b"input.pdf".to_vec(),
+            ..PdfOpenOptions::default()
+        },
+    )
+    .expect("qpdf-compatible reconstruction should return the xref-stream candidate");
+
+    let error = pdf
+        .root_handle()
+        .expect_err("the recovered candidate has no /Root dictionary");
+    assert!(matches!(
+        error,
+        Error::QpdfExc(warning) if warning.get_message_detail() == b"unable to find /Root dictionary"
+    ));
+    assert_eq!(
+        output.lock().unwrap().as_slice(),
+        b"WARNING: input.pdf: file is damaged\n\
+         WARNING: input.pdf: can't find startxref\n\
+         WARNING: input.pdf: Attempting to reconstruct cross-reference table\n\
+         WARNING: input.pdf (object 1 0, offset 30): expected endobj\n\
+         WARNING: input.pdf: reported number of objects (1) is not one plus the highest object number (2)\n",
+        "the trio and line-scan diagnostics must print before the live warning \
+         candidate discovery raises while resolving object 1 0"
     );
 }
 
