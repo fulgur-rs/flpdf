@@ -97,29 +97,37 @@ fn image_count(path: &Path) -> usize {
 }
 
 #[test]
-fn direct_rewrite_applies_overlay_before_transformations() {
+fn ordinary_rewrite_uses_the_canonical_job_transform_and_output_routes() {
     let source = production_main_source();
-    let direct_rewrite = source
-        .split_once("// qpdf runs disableDigitalSignatures unconditionally under")
-        .map(|(_, body)| body)
-        .expect("direct rewrite transformation pass");
-    let overlay = direct_rewrite
-        .find("flpdf::apply_overlay_specs(&mut pdf, &mut built)")
-        .expect("direct rewrite overlay route");
-    let image = direct_rewrite
-        .find("apply_image_transformations(&mut pdf, image_options, verbose)?")
-        .expect("direct rewrite image route");
-    let appearances = direct_rewrite
-        .find("if generate_appearances")
-        .expect("direct rewrite appearance route");
-    let annotations = direct_rewrite
-        .find("if let Some(mode) = flatten_annotations_mode")
-        .expect("direct rewrite annotation route");
+    let ordinary_rewrite = source
+        .split_once("fn run_rewrite_opened")
+        .and_then(|(_, tail)| {
+            tail.split_once("// Page operations: ")
+                .map(|(body, _)| body)
+        })
+        .expect("ordinary rewrite route");
 
     assert!(
-        overlay < image && image < appearances && appearances < annotations,
-        "qpdf createQPDF order is overlay -> transformations"
+        ordinary_rewrite.contains("job.apply_transformations("),
+        "ordinary rewrite transformations must be owned by QPDFJob"
     );
+    assert!(
+        ordinary_rewrite.contains("job.write_qpdf("),
+        "ordinary rewrite output must be owned by QPDFJob"
+    );
+    for forbidden in [
+        "apply_image_transformations(",
+        "flpdf::apply_overlay_specs(",
+        "AcroFormDocumentHelper::new",
+        "PageDocumentHelper::new",
+        "PageObjectHelper::new",
+        "write_with_pdf_writer(",
+    ] {
+        assert!(
+            !ordinary_rewrite.contains(forbidden),
+            "ordinary rewrite retains a direct route: {forbidden}"
+        );
+    }
 }
 
 #[test]

@@ -474,6 +474,16 @@ qtest exceptionsとrootは対象外。
 | (D) | qpdf rotation parser (`parse_rotation_parameter` / `RotationSpec`) | **E-14の限定slice完了** — job JSONとdirect CLIの両経路が同じraw range・angle・relative stateを使用するが、CLI適用ownerはmixedとして後続移行に残る |
 | (E) | `overlay_verbose_report` / `apply_overlay_specs` / `collate` | `overlay_verbose_report` / `apply_overlay_specs` は debt のまま（E-11）。**`collate` は消滅** — `fn collate` は workspace に 0 件で、`page_collate.rs` というファイル自体が存在しない（`crates/flpdf/src/job/` の全 22 ファイルを `ls` で確認） |
 
+### 2026-09-08 `.48.7` ordinary/rewrite Job cutover
+
+`flpdf-3yn9.48.7` moved the ordinary/rewrite `run_rewrite_opened` consumer onto
+`QPDFJob::apply_transformations` and `QPDFJob::write_qpdf`. The direct
+`PdfWriter`, overlay, image, appearance, annotation, coalesce, rotation, and
+page-label routes in that cohort are gone; remaining E-4/E-11/E-12 direct
+callers belong to JSON/page-operation/inspection cohorts tracked separately.
+The E-4/E-11/E-12/E-21 rows above retain their original matrix row identity and
+are re-measured against this note during the next full route audit.
+
 ## unknown / probe
 
 | ID | 決められないこと | 必要な source / probe |

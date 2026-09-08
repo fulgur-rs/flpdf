@@ -437,7 +437,7 @@ impl WriterConfiguration {
     }
 }
 
-fn update_minimum_pdf_version(
+pub(crate) fn update_minimum_pdf_version(
     current: &mut Option<(String, i64)>,
     version: String,
     extension_level: i64,
