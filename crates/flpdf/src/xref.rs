@@ -2772,9 +2772,11 @@ fn merge_previous_xref_sections_with_observer(
             canonical_trailer_owner,
         )
     };
+    // cov:ignore-start: no fixture reaches this splice — an indirect `/Prev` target that the line scan can find is already resolved (and warned about) by candidate discovery, so this window captures nothing; the guard exists for structural symmetry with the section-parse splice below
     for diagnostic in previous_offset_diagnostics.entries() {
         loaded.loaded.repair_diagnostics.push(diagnostic.clone());
     }
+    // cov:ignore-end
     let (mut previous_offset, previous_diagnostics, reconstruction_trigger) =
         previous_offset_result?;
     for diagnostic in previous_diagnostics.entries() {
@@ -2866,9 +2868,11 @@ fn merge_previous_xref_sections_with_observer(
                 canonical_trailer_owner,
             )
         };
+        // cov:ignore-start: no fixture reaches this splice — an indirect `/Prev` target that the line scan can find is already resolved (and warned about) by candidate discovery, so this window captures nothing; the guard exists for structural symmetry with the section-parse splice below
         for diagnostic in hop_offset_diagnostics.entries() {
             loaded.loaded.repair_diagnostics.push(diagnostic.clone());
         }
+        // cov:ignore-end
         let (next_previous_offset, previous_diagnostics, reconstruction_trigger) =
             hop_offset_result?;
         for diagnostic in previous_diagnostics.entries() {
