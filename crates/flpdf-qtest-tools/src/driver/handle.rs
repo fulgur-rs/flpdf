@@ -729,11 +729,18 @@ mod tests {
         let decode_parms = resolved.filter_input_handle().get_key(b"/DecodeParms");
         // resolve_stream_dictionary_handle leaves this handle unresolved when
         // filterable is false, but it is the same canonical object 8 slot
-        // decode_params_value aliased, not a stale or divergent copy: an
-        // explicit resolve after the fact still reports the correct value.
+        // decode_params_value aliased, not a stale or divergent copy. Pin the
+        // alias itself: a substituted handle that merely happens to resolve to
+        // null would satisfy the null checks alone.
+        assert_eq!(decode_parms.object_ref(), Some(ObjectRef::new(8, 0)));
         assert!(!decode_parms.is_null());
         pdf.resolve(&decode_parms).expect("resolve DecodeParms");
         assert!(decode_parms.is_null());
+        assert_eq!(
+            decode_parms.object_ref(),
+            pdf.get_object_handle(ObjectRef::new(8, 0)).object_ref(),
+            "the deferred handle must stay the document's own object 8 slot"
+        );
     }
 
     #[test]
@@ -755,9 +762,16 @@ mod tests {
         // Same reasoning as above: the /Filter is null so filter_names is
         // None and resolved_decode_params is never actually resolved, but it
         // aliases the same canonical slot, so resolving it later is correct.
+        // The alias is what makes that true, so assert it directly.
+        assert_eq!(decode_parms.object_ref(), Some(ObjectRef::new(8, 0)));
         assert!(!decode_parms.is_null());
         pdf.resolve(&decode_parms).expect("resolve DecodeParms");
         assert!(decode_parms.is_null());
+        assert_eq!(
+            decode_parms.object_ref(),
+            pdf.get_object_handle(ObjectRef::new(8, 0)).object_ref(),
+            "the deferred handle must stay the document's own object 8 slot"
+        );
     }
 
     #[test]
