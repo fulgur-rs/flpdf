@@ -78,13 +78,6 @@ fn read_initial_source<R: Read + Seek>(reader: &mut R, description: &[u8]) -> Re
 }
 
 static NEXT_PDF_ID: AtomicU64 = AtomicU64::new(1);
-// Upper bound on read-to-end fallbacks during object resolution (see
-// `resolution_fallbacks_remaining`). Each fallback may scan to EOF, so the total
-// fallback work is bounded by this many file scans — O(file size), not the
-// quadratic cost an unbounded read-to-end per object would incur. 64 tolerates a
-// handful of corrupt/overlapping offsets in an otherwise valid file while still
-// defeating a flood of objects whose bodies run to EOF.
-const MAX_RESOLUTION_FALLBACKS: u32 = 64;
 
 impl<R: Read + Seek> Pdf<R> {
     /// Construct qpdf's default, unprocessed document.
@@ -120,9 +113,7 @@ impl<R: Read + Seek> Pdf<R> {
             trailer_handle_memo: None,
             root_handle_memo: None,
             compressed_member_parents: BTreeMap::new(),
-            sorted_object_offsets: Vec::new(),
             legacy_resolution_state_synced: false,
-            resolution_fallbacks_remaining: MAX_RESOLUTION_FALLBACKS,
             dirty_object_refs: BTreeSet::new(),
             handle_mutated_object_refs: BTreeSet::new(),
             qpdf_dangling_refs: BTreeSet::new(),
@@ -295,16 +286,6 @@ impl<R: Read + Seek> Pdf<R> {
         let first_xref_item_offset = loaded_state.first_xref_item_offset;
         let loaded = loaded_state.loaded;
         let source_xref_entries = loaded.entries.clone();
-        let mut sorted_object_offsets: Vec<u64> = loaded
-            .entries
-            .values()
-            .filter_map(|offset| match offset {
-                crate::XrefEntry::Uncompressed { offset } => Some(*offset),
-                _ => None,
-            })
-            .collect();
-        sorted_object_offsets.sort_unstable();
-        sorted_object_offsets.dedup();
         let cache = ObjectCache::from_offsets(&loaded.entries);
         let initial_diagnostics = loaded.repair_diagnostics.clone();
         resolver.set_header_offset(header_offset);
@@ -359,9 +340,7 @@ impl<R: Read + Seek> Pdf<R> {
             trailer_handle_memo: None,
             root_handle_memo: None,
             compressed_member_parents: BTreeMap::new(),
-            sorted_object_offsets,
             legacy_resolution_state_synced: already_reconstructed,
-            resolution_fallbacks_remaining: MAX_RESOLUTION_FALLBACKS,
             dirty_object_refs: BTreeSet::new(),
             handle_mutated_object_refs: BTreeSet::new(),
             qpdf_dangling_refs: BTreeSet::new(),

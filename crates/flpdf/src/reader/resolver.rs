@@ -83,10 +83,6 @@
 //! diagnostics to [`ResolverHandle::read_object_at_offset_with_description`] after it has
 //! released its input adapter, so each source token contributes at most one
 //! document warning.
-//!
-//! `ResolverHandle::read_window` and its `read_to_owned` helper remain a
-//! legacy owned-buffer seam: qpdf reads its live `m->file` source and has no
-//! bounded-window helper.
 
 use crate::encryption::crypt_filters::interpret_cf_from_handle;
 use crate::encryption::state::{EncryptionMode, EncryptionState};
@@ -2632,68 +2628,6 @@ impl<R: Read + Seek> ResolverHandle<R> {
             .collect()
     }
 
-    /// Read `[offset, next)` — or `[offset, EOF)` when `next` is `None` — in
-    /// qpdf-logical coordinates, into an owned buffer.
-    ///
-    /// It lives on [`ResolverHandle`] rather than on [`ResolverCore`] on
-    /// purpose. `ResolverCore`'s method surface is meant to be checkable
-    /// against qpdf line by line — it is `m->file`'s operations and nothing
-    /// else. This bounded owned-window read remains a helper for the legacy
-    /// `Pdf` read paths; hosting it one level out keeps it built *on* the
-    /// primitives instead of adding it to the qpdf-shaped resolver surface.
-    ///
-    /// Do not build on its shape. qpdf streams from `m->file` and brackets the
-    /// one re-entrant seam by saving and restoring the position
-    /// (`QPDF::readStream`, `libqpdf/QPDF.cc:1360-1398`). The design of record
-    /// names generalising this owned-window shape as a wrong turn that would
-    /// entrench a divergence, so `readObjectAtOffset`/`readStream` port that
-    /// save/restore seam rather than reusing this.
-    // Separable at function granularity, so CLAUDE.md's marker policy calls
-    // for #[deprecated] here rather than a block comment marker: qpdf reads
-    // the live `m->file` source and has no bounded owned-window helper
-    // (`InputSource.hh:71-74`; `QPDF.cc:1360-1398`). Callers get
-    // #[allow(deprecated)] locally rather than spreading unchecked.
-    #[deprecated(
-        note = "no qpdf counterpart; qpdf reads m->file live and has no bounded owned-window helper -- do not add new callers"
-    )]
-    pub(crate) fn read_window(&self, offset: u64, next: Option<u64>) -> Result<Vec<u8>> {
-        self.seek(offset)?;
-        #[allow(deprecated)]
-        self.read_to_owned(next.map(|next| next.saturating_sub(offset)))
-    }
-
-    /// Collect `limit` bytes — or everything left when `limit` is `None` —
-    /// from the current position into an owned buffer.
-    ///
-    /// Grows as it goes rather than pre-allocating `limit`. The legacy
-    /// [`Self::read_window`] caller's bound comes from the *next*
-    /// cross-reference offset, which a corrupt table can make arbitrarily
-    /// large on a small file. `std::io::Read::take(n).read_to_end(..)`, which
-    /// this replaces, had the same property.
-    #[deprecated(
-        note = "no qpdf counterpart; only used by the equally legacy read_window -- do not add new callers"
-    )]
-    fn read_to_owned(&self, limit: Option<u64>) -> Result<Vec<u8>> {
-        let mut bytes = Vec::new();
-        loop {
-            let remaining =
-                limit.map_or(u64::MAX, |limit| limit.saturating_sub(bytes.len() as u64));
-            if remaining == 0 {
-                return Ok(bytes);
-            }
-            let filled = bytes.len();
-            let want = remaining.min(BULK_READ_CHUNK as u64) as usize;
-            bytes.resize(filled + want, 0);
-            // `ResolverCore::read` already loops to EOF, so a short answer
-            // here means the input is exhausted.
-            let read = self.read(&mut bytes[filled..])?;
-            bytes.truncate(filled + read);
-            if read < want {
-                return Ok(bytes);
-            }
-        }
-    }
-
     /// qpdf `QPDF::pipeStreamData` (`libqpdf/QPDF.cc:2477-2538`), the only
     /// path by which a stream's original bytes reach a consumer: `QPDF_Stream`
     /// keeps no copy of them, so its `pipeStreamData` reads them here from
@@ -3038,10 +2972,8 @@ impl<R: Read + Seek> ResolverHandle<R> {
     /// token uses this bounded pull adapter.
     ///
     /// Its position remains live and its pull leaves the source after the
-    /// consumed token. [`Self::read_window`]'s bounded-window shape is not
-    /// this helper: it takes its extent from the next xref entry and leaves no
-    /// position behind, so it remains a legacy tenant rather than a
-    /// `ResolverCore` method.
+    /// consumed token, unlike a bounded owned-window read that takes its
+    /// extent from the next xref entry and leaves no position behind.
     ///
     /// `attempt` reports `(value, end)` where `end` is how many bytes it
     /// consumed. A result that consumed the *whole* buffer is treated as
@@ -4508,14 +4440,6 @@ fn inspect_stream_encryption(
         method_source,
     })
 }
-
-/// Bytes pulled per iteration by [`ResolverHandle::read_to_owned`].
-///
-/// Larger than [`INPUT_CHUNK`] because its callers are the legacy tenants,
-/// one of which reads the whole file: the chunked loop replaced a single
-/// `read_to_end`, and this keeps the iteration count in the same order.
-/// It dies with those callers.
-const BULK_READ_CHUNK: usize = 64 * 1024;
 
 /// A live, one-byte-at-a-time parser view over [`ResolverHandle`]'s owned
 /// source. `LiveTokenSource` owns token state; this adapter owns no bytes and

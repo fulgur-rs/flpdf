@@ -2,22 +2,14 @@
 pub(crate) mod file_object;
 pub(crate) mod resolver;
 
-use self::file_object::{
-    parse_file_object_handle_syntax, PendingHandleBody, PendingHandleFileObject,
-};
 use crate::cache::CacheEntry;
 use crate::encryption::password::{password_candidates_for_read, PasswordMode};
 use crate::encryption::permissions::Permissions;
 use crate::encryption::standard::ObjectKeyAlg;
 use crate::encryption::CopyEncryptionSource;
 use crate::error::EncryptedError;
-use crate::object_handle::{DocumentResolver, ObjectValue, NO_PARSED_OFFSET};
-#[cfg(feature = "qtest-driver")]
-use crate::parser::parse_qpdf_file_object_handle_with_diagnostics;
-use crate::parser::HandleResolver;
+use crate::object_handle::{DocumentResolver, ObjectValue};
 use crate::reader::resolver::ResolverHandle;
-#[cfg(feature = "qtest-driver")]
-use crate::tokenizer::Tokenizer;
 use crate::{Diagnostics, Error, ObjectHandle, ObjectRef, QpdfExc, Result, XrefEntry, XrefForm};
 use std::any::Any;
 use std::cell::RefCell;
@@ -901,204 +893,6 @@ impl<R: Read + Seek> Pdf<R> {
         self.resolver.xref_entries()
     }
 
-    /// Return the qpdf-logical byte offset of an indirect stream's encoded data.
-    ///
-    /// This is normally the absolute offset in the original input. When repair
-    /// finds a valid PDF header after leading material, qpdf treats that header
-    /// as logical offset zero, and this method follows that origin.
-    ///
-    /// This uses the source xref entry and the same indirect-object parser as
-    /// normal resolution, so `stream` text inside strings, names, comments, or
-    /// earlier stream payloads cannot be mistaken for the stream marker.
-    pub fn source_stream_data_offset(&mut self, object_ref: ObjectRef) -> Result<Option<u64>> {
-        self.synchronize_cache_with_resolver_xref();
-        let Some(XrefEntry::Uncompressed { offset }) = self.resolver.xref_entry(object_ref) else {
-            return Ok(None);
-        };
-        let pending = self.parse_source_file_object_at(offset)?;
-        let PendingHandleBody::Stream { data_start, .. } = pending.body else {
-            return Ok(None);
-        };
-        Ok(Some(offset.saturating_add(data_start as u64)))
-    }
-
-    /// Return the source offset of the `/DecodeParms` value paired with one
-    /// filter in an indirect stream dictionary.
-    ///
-    /// This compatibility hook is compiled only for `flpdf-test-driver`. It
-    /// preserves qpdf's token-specific warning locations without adding source
-    /// spans to the ordinary object model.
-    #[doc(hidden)]
-    #[cfg(feature = "qtest-driver")]
-    pub fn qtest_decode_parms_source_offset(
-        &mut self,
-        object_ref: ObjectRef,
-        filter_index: usize,
-    ) -> Result<Option<u64>> {
-        self.synchronize_cache_with_resolver_xref();
-        let Some(XrefEntry::Uncompressed { offset }) = self.resolver.xref_entry(object_ref) else {
-            return Ok(None);
-        };
-        let value_offset = self.qtest_read_source_object_with_retry(offset, |bytes| {
-            decode_parms_value_offset_within(bytes, filter_index)
-        })?;
-        Ok(value_offset.map(|value_offset| offset.saturating_add(value_offset as u64)))
-    }
-
-    /// Return source offsets for the direct values of multiple indirect
-    /// objects, reading each distinct source object at most once.
-    ///
-    /// qpdf's `QPDF::resolve` stops at the persistent `obj_cache` entry once
-    /// an object is resolved (`libqpdf/QPDF.cc:1700-1704`). The qtest offset
-    /// surface is a compatibility-only source-position lookup, so it keeps
-    /// the same one-read-per-object property across repeated warning
-    /// attributions instead of charging the global fallback budget once per
-    /// filter index.
-    #[doc(hidden)]
-    #[cfg(feature = "qtest-driver")]
-    pub fn qtest_object_value_source_offsets(
-        &mut self,
-        object_refs: &[ObjectRef],
-    ) -> Result<Vec<Option<u64>>> {
-        self.synchronize_cache_with_resolver_xref();
-        let mut offsets = BTreeMap::new();
-        for &object_ref in object_refs {
-            if offsets.contains_key(&object_ref) {
-                continue;
-            }
-            let value_offset = match self.resolver.xref_entry(object_ref) {
-                Some(XrefEntry::Uncompressed { offset }) => {
-                    let body_start = self.qtest_read_source_object_with_retry(
-                        offset,
-                        Self::object_body_start_within,
-                    )?; // cov:ignore: qtest-driver-only source-read error propagation is covered by feature-gated reader tests, not the workspace coverage profile
-                    Some(offset.saturating_add(body_start as u64))
-                }
-                _ => None,
-            };
-            offsets.insert(object_ref, value_offset);
-        }
-        Ok(object_refs
-            .iter()
-            .map(|object_ref| offsets.get(object_ref).copied().flatten())
-            .collect())
-    }
-
-    /// Return the source offset of the item at `array_index` in an indirect
-    /// object whose own direct value is an array.
-    ///
-    /// This compatibility hook is compiled only for `flpdf-test-driver`. It
-    /// covers a `/DecodeParms` array reached through a reference whose item
-    /// at this position is not itself a reference: qpdf attributes the
-    /// warning to the array's own indirect object, at that item's precise
-    /// (whitespace/comment-skipped) token position — unlike
-    /// [`Self::qtest_object_value_source_offsets`], which reports the
-    /// coarser "right after `obj`" position for a value that is the
-    /// object's entire body.
-    /// Return source offsets for multiple items in one indirect array, using
-    /// one bounded read and at most one full-source retry for the container.
-    /// Duplicate indices therefore cannot consume duplicate fallback budget.
-    #[doc(hidden)]
-    #[cfg(feature = "qtest-driver")]
-    pub fn qtest_array_item_source_offsets(
-        &mut self,
-        object_ref: ObjectRef,
-        array_indices: &[usize],
-    ) -> Result<Vec<Option<u64>>> {
-        self.synchronize_cache_with_resolver_xref();
-        let Some(XrefEntry::Uncompressed { offset }) = self.resolver.xref_entry(object_ref) else {
-            return Ok(vec![None; array_indices.len()]);
-        };
-        let value_offsets = self.qtest_read_source_object_with_retry(offset, |bytes| {
-            let body_start = Self::object_body_start_within(bytes)?;
-            let body = &bytes[body_start..];
-            array_indices
-                .iter()
-                .map(|&array_index| {
-                    let value_offset = array_item_source_offset(body, array_index)?;
-                    Ok(value_offset.map(|value_offset| body_start + value_offset))
-                })
-                .collect::<Result<Vec<_>>>()
-        })?;
-        Ok(value_offsets
-            .into_iter()
-            .map(|value_offset| {
-                value_offset.map(|value_offset| offset.saturating_add(value_offset as u64))
-            })
-            .collect())
-    }
-
-    /// Read an indirect object's bytes bounded by the next recorded object
-    /// offset, retrying with an unbounded read (subject to
-    /// [`Self::resolution_fallbacks_remaining`]) when `parse` fails on the
-    /// bounded window — matching [`Self::parse_source_file_object_at`]'s
-    /// guarded full-object retry for a corrupt or false next-xref offset.
-    #[cfg(feature = "qtest-driver")]
-    #[allow(deprecated)]
-    fn qtest_read_source_object_with_retry<T>(
-        &mut self,
-        offset: u64,
-        parse: impl Fn(&[u8]) -> Result<T>,
-    ) -> Result<T> {
-        let next = self.next_object_offset(offset);
-        let bytes = self.resolver.read_window(offset, next)?;
-
-        match parse(&bytes) {
-            Ok(value) => Ok(value),
-            Err(window_error) if next.is_some() && self.resolution_fallbacks_remaining > 0 => {
-                self.resolution_fallbacks_remaining -= 1;
-                let full = self.resolver.read_window(offset, None)?;
-                parse(&full).or(Err(window_error))
-            }
-            Err(error) => Err(error),
-        }
-    }
-
-    /// Position immediately after `N G obj`, without skipping the
-    /// whitespace/comments that follow. qpdf records an indirect object's
-    /// own "parsed offset" once, at this point, before parsing its value —
-    /// not at the value token's own (later) start.
-    #[cfg(feature = "qtest-driver")]
-    fn object_body_start_within(bytes: &[u8]) -> Result<usize> {
-        let mut tokenizer = Tokenizer::new(bytes);
-        let _ = tokenizer.next_integer()?;
-        let _ = tokenizer.next_integer()?;
-        tokenizer.expect_word(b"obj")?;
-        Ok(tokenizer.position())
-    }
-
-    #[allow(deprecated)]
-    fn parse_source_file_object_at(&mut self, offset: u64) -> Result<PendingHandleFileObject> {
-        let next = self.next_object_offset(offset);
-        let bytes = self.resolver.read_window(offset, next)?;
-
-        match parse_source_file_object_handles(&bytes) {
-            Ok(pending)
-                if next.is_some()
-                    && self.resolution_fallbacks_remaining > 0
-                    && matches!(
-                        &pending.body,
-                        PendingHandleBody::Direct { object, .. } if object.is_null()
-                    ) =>
-            {
-                // A false next-object offset can make the live parser recover
-                // an incomplete dictionary as null even though the source
-                // object is a stream. Retry the complete source span so the
-                // qtest stream-data warning keeps qpdf's data offset.
-                self.resolution_fallbacks_remaining -= 1;
-                let full = self.resolver.read_window(offset, None)?;
-                parse_source_file_object_handles(&full).or(Ok(pending))
-            }
-            Ok(pending) => Ok(pending),
-            Err(window_error) if next.is_some() && self.resolution_fallbacks_remaining > 0 => {
-                self.resolution_fallbacks_remaining -= 1;
-                let full = self.resolver.read_window(offset, None)?;
-                parse_source_file_object_handles(&full).or(Err(window_error))
-            }
-            Err(error) => Err(error),
-        }
-    }
-
     /// Number of objects currently resolved in the cache. Useful when you want to
     /// confirm that lazy resolution actually deferred work.
     pub fn resolved_count(&self) -> usize {
@@ -1933,13 +1727,6 @@ impl<R: Read + Seek> Pdf<R> {
         Ok(Some(ObjectRef::new(number, 0)))
     }
 
-    /// Offset of the first recorded object that starts strictly after `offset`,
-    /// or `None` when `offset` belongs to the last object in the file.
-    fn next_object_offset(&self, offset: u64) -> Option<u64> {
-        let index = self.sorted_object_offsets.partition_point(|&o| o <= offset);
-        self.sorted_object_offsets.get(index).copied()
-    }
-
     /// Bring the legacy cache and bounded-read offsets in line with the
     /// canonical resolver after a resolution-time xref reconstruction.
     pub(crate) fn synchronize_cache_with_resolver_xref(&mut self) {
@@ -1965,15 +1752,6 @@ impl<R: Read + Seek> Pdf<R> {
                             && provenance.source_index == *index
                 )
             });
-        self.sorted_object_offsets = entries
-            .values()
-            .filter_map(|entry| match entry {
-                XrefEntry::Uncompressed { offset } => Some(*offset),
-                _ => None,
-            })
-            .collect();
-        self.sorted_object_offsets.sort_unstable();
-        self.sorted_object_offsets.dedup();
         self.legacy_resolution_state_synced = true;
     }
 }
@@ -2035,97 +1813,6 @@ fn rebind_handle<R: Read + Seek + 'static>(
     Ok(resolver.direct_object_handle(rebind_handle_value(resolver, source)?))
 }
 
-#[cfg(feature = "qtest-driver")]
-fn decode_parms_value_offset_within(bytes: &[u8], filter_index: usize) -> Result<Option<usize>> {
-    let body_start = {
-        let mut tokenizer = Tokenizer::new(bytes);
-        let _ = tokenizer.next_integer()?;
-        let _ = tokenizer.next_integer()?;
-        tokenizer.expect_word(b"obj")?;
-        tokenizer.position()
-    };
-    let object = parse_direct_handle_with_offsets(&bytes[body_start..])?;
-    let Some(entries) = object.as_dictionary() else {
-        // A damaged next-object offset can truncate the dictionary window.
-        // The live parser recovers that truncated input as null with
-        // diagnostics, but qtest's source-offset helper must retry against
-        // the full object span before giving up.
-        return Err(Error::parse(
-            body_start,
-            "source stream dictionary window is incomplete",
-        ));
-    };
-    let Some(decode_parms) = entries.get(b"/DecodeParms".as_slice()) else {
-        return Ok(None);
-    };
-    let value = decode_parms
-        .as_array()
-        .and_then(|items| items.get(filter_index).cloned())
-        .unwrap_or_else(|| decode_parms.clone());
-    let offset = value.get_parsed_offset();
-    Ok((offset >= 0).then_some(usize::try_from(offset).unwrap_or(usize::MAX) + body_start))
-}
-
-#[cfg(feature = "qtest-driver")]
-fn array_item_source_offset(input: &[u8], array_index: usize) -> Result<Option<usize>> {
-    let handle = parse_direct_handle_with_offsets(input)?;
-    Ok(handle
-        .as_array()
-        .and_then(|items| items.get(array_index).cloned())
-        .and_then(|item| {
-            let offset = item.get_parsed_offset();
-            (offset >= 0).then_some(usize::try_from(offset).unwrap_or(usize::MAX))
-        }))
-}
-
-#[cfg(feature = "qtest-driver")]
-fn parse_direct_handle_with_offsets(input: &[u8]) -> Result<ObjectHandle> {
-    let mut resolver = SourceFramingHandles;
-    Ok(parse_qpdf_file_object_handle_with_diagnostics(input, 0, None, &mut resolver)?.value)
-}
-
-/// Parse source framing without attaching the temporary diagnostic lookup to
-/// the document's canonical cache. The stream dictionary is still a canonical
-/// handle graph; unresolved child references are deliberately left lazy.
-fn parse_source_file_object_handles(input: &[u8]) -> Result<PendingHandleFileObject> {
-    let mut resolver = SourceFramingHandles;
-    parse_file_object_handle_syntax(input, &mut resolver)
-}
-
-struct SourceFramingHandles;
-
-impl HandleResolver for SourceFramingHandles {
-    fn indirect_handle(&mut self, object_ref: ObjectRef) -> ObjectHandle {
-        ObjectHandle::new_indirect_unresolved(object_ref, NO_PARSED_OFFSET)
-    }
-
-    fn indirect_handle_at(&mut self, object_ref: ObjectRef, offset: i64) -> ObjectHandle {
-        ObjectHandle::new_indirect_unresolved(object_ref, offset)
-    }
-
-    fn direct_handle(&mut self, value: ObjectValue) -> ObjectHandle {
-        ObjectHandle::from_value(value)
-    }
-}
-
-#[cfg(all(test, feature = "qtest-driver"))]
-mod final_handle_tests {
-    use super::*;
-
-    #[test]
-    fn qtest_decode_parms_offset_reports_absence_and_source_handles_keep_identity() {
-        assert_eq!(
-            decode_parms_value_offset_within(b"1 0 obj\n<< /Length 1 >>\nendobj", 0)
-                .expect("source dictionary parses"),
-            None
-        );
-
-        let mut resolver = SourceFramingHandles;
-        let handle = resolver.indirect_handle(ObjectRef::new(17, 0));
-        assert_eq!(handle.object_ref(), Some(ObjectRef::new(17, 0)));
-    }
-}
-
 #[cfg(test)]
 mod warning_api_tests {
     use super::Pdf;
@@ -2151,54 +1838,6 @@ mod warning_api_tests {
         assert_eq!(second.len(), 1);
         assert_eq!(second.entries()[0].get_message_detail(), b"second warning");
         assert!(!pdf.any_warnings());
-    }
-}
-
-#[cfg(test)]
-mod source_window_tests {
-    use super::Pdf;
-    use crate::ObjectRef;
-
-    #[test]
-    fn source_stream_offset_retries_when_the_next_xref_offset_truncates_the_header() {
-        let mut bytes = b"%PDF-1.4\n".to_vec();
-        let mut offsets = Vec::new();
-        for (number, body) in [
-            (1, b"<< /Type /Catalog /Pages 2 0 R >>".as_slice()),
-            (2, b"<< /Type /Pages /Kids [3 0 R] /Count 1 >>".as_slice()),
-            (
-                3,
-                b"<< /Type /Page /Parent 2 0 R /Contents 4 0 R >>".as_slice(),
-            ),
-        ] {
-            offsets.push((number, bytes.len()));
-            bytes.extend_from_slice(format!("{number} 0 obj\n").as_bytes());
-            bytes.extend_from_slice(body);
-            bytes.extend_from_slice(b"\nendobj\n");
-        }
-        let stream_offset = bytes.len();
-        bytes.extend_from_slice(b"4 0 obj\n<< /Length 5 >>\nstream\nhello\nendstream\nendobj\n");
-        let truncated_header_offset = stream_offset + 4;
-        let xref = bytes.len();
-        bytes.extend_from_slice(b"xref\n0 6\n0000000000 65535 f \n");
-        for (_, offset) in offsets {
-            bytes.extend_from_slice(format!("{offset:010} 00000 n \n").as_bytes());
-        }
-        bytes.extend_from_slice(format!("{stream_offset:010} 00000 n \n").as_bytes());
-        bytes.extend_from_slice(format!("{truncated_header_offset:010} 00000 n \n").as_bytes());
-        bytes.extend_from_slice(
-            format!("trailer\n<< /Size 6 /Root 1 0 R >>\nstartxref\n{xref}\n%%EOF\n").as_bytes(),
-        );
-
-        let mut pdf = Pdf::open_mem_owned(bytes).expect("synthetic source-window PDF opens");
-        let data_offset = pdf
-            .source_stream_data_offset(ObjectRef::new(4, 0))
-            .expect("source stream offset")
-            .expect("stream object has source data");
-        assert_eq!(
-            data_offset,
-            (stream_offset + b"4 0 obj\n<< /Length 5 >>\nstream\n".len()) as u64
-        );
     }
 }
 
