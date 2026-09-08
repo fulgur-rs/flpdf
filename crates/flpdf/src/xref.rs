@@ -1102,6 +1102,31 @@ impl HandleResolver for BootstrapHandleParser<'_> {
 }
 
 impl DocumentResolver for BootstrapHandleDocument {
+    fn input_description(&self) -> Vec<u8> {
+        self.options.description.clone()
+    }
+
+    fn warn(&self, warning: QpdfExc) -> Result<()> {
+        // qpdf's QPDFObjectHandle::objectWarning/typeWarning boundary hands
+        // an already-formed exception to QPDF::warn, which appends it to the
+        // document warning collection (QPDF.cc:487-494). The owner-less
+        // bootstrap has no logger of its own; its state diagnostics are the
+        // standalone equivalent and are replayed by the xref loader.
+        self.push_diagnostic(warning);
+        Ok(())
+    }
+
+    fn warn_stream_data(&self, warning: QpdfExc) -> Result<()> {
+        // QPDF_Stream::warn uses the stream parsed offset and lets QPDF::warn
+        // collect the warning without aborting decoding
+        // (QPDF_Stream.cc:695-698, QPDF.cc:487-494). Keep this separate
+        // trait boundary so ObjectHandle::stream_data_warning can preserve
+        // the input description and offset while retaining the decoded
+        // ObjStm member.
+        self.push_diagnostic(warning);
+        Ok(())
+    }
+
     // qpdf-deviation: qpdf has no stack-growth policy; grow the Rust bootstrap resolver stack instead of imposing an arbitrary depth cap
     fn resolve_indirect(&self, object_ref: ObjectRef, handle: &ObjectHandle) -> Result<()> {
         stacker::maybe_grow(XREF_STACK_RED_ZONE, XREF_STACK_GROWTH_SIZE, || {
@@ -5126,6 +5151,8 @@ fn parse_xref_subsection_u32(token: &Token) -> Result<u32> {
 #[cfg(test)]
 mod final_handle_tests {
     use super::*;
+    use flate2::{write::ZlibEncoder, Compression};
+    use std::io::Write;
     use std::time::{Duration, Instant};
 
     fn malformed_candidate_fixture(count: usize) -> Vec<u8> {
@@ -5309,25 +5336,46 @@ mod final_handle_tests {
         let nested = member
             .try_get_key(b"/Nested")
             .expect("nested direct value is present");
-        let nested_string = nested
-            .try_get_array_item(0)
-            .expect("nested array item is present")
-            .try_get_int_value()
-            .expect_err("a nested string must use the member warning context");
-        let nested_dictionary = nested
-            .try_get_array_item(1)
-            .expect("nested dictionary item is present")
-            .try_get_key(b"/Leaf")
-            .expect("nested dictionary leaf is present")
-            .try_get_int_value()
-            .expect_err("a nested dictionary leaf must use the member context");
-        for error in [nested_string, nested_dictionary] {
-            let message = error.to_string();
-            assert!(
-                message.contains("object 7 0") && message.contains("object stream 4"),
-                "nested warning lost the ObjStm member context: {message}"
-            );
-        }
+        // With the bootstrap document's warning sink in place
+        // (`flpdf-92r5`), a type mismatch behaves as qpdf does: the accessor
+        // warns and returns qpdf's fallback rather than failing
+        // (`QPDF_Stream::warn` -> `QPDF::warn`, which records without
+        // throwing, `libqpdf/QPDF_Stream.cc:695-698` and
+        // `libqpdf/QPDF.cc:487-494`). The member context therefore has to be
+        // checked on the recorded warnings, not on an error value.
+        assert_eq!(
+            nested
+                .try_get_array_item(0)
+                .expect("nested array item is present")
+                .try_get_int_value()
+                .expect("qpdf warns and falls back instead of failing"),
+            0
+        );
+        assert_eq!(
+            nested
+                .try_get_array_item(1)
+                .expect("nested dictionary item is present")
+                .try_get_key(b"/Leaf")
+                .expect("nested dictionary leaf is present")
+                .try_get_int_value()
+                .expect("qpdf warns and falls back instead of failing"),
+            0
+        );
+        let state = document.state.borrow();
+        let contextual = state
+            .diagnostics
+            .entries()
+            .iter()
+            .filter(|warning| {
+                let object = String::from_utf8_lossy(warning.get_object()).to_string();
+                object.contains("object 7 0") && object.contains("object stream 4")
+            })
+            .count();
+        let recorded = format!("{:?}", state.diagnostics);
+        assert!(
+            contextual >= 2,
+            "both nested values must warn with the ObjStm member context: {recorded}"
+        );
     }
 
     fn bootstrap_objstm_document(
@@ -5445,6 +5493,118 @@ mod final_handle_tests {
             .any(|diagnostic| diagnostic
                 .message_string()
                 .contains("empty object treated as null")));
+    }
+
+    #[test]
+    fn bootstrap_objstm_keeps_member_after_a_recoverable_stream_warning() {
+        let member_ref = ObjectRef::new(7, 0);
+        let decoded = b"7 0 << /Value 42 >>";
+        let mut encoder = ZlibEncoder::new(Vec::new(), Compression::default());
+        encoder
+            .write_all(decoded)
+            .expect("the ObjStm payload compresses");
+        let mut compressed = encoder.finish().expect("the zlib stream finishes");
+        compressed.truncate(compressed.len().saturating_sub(4));
+
+        let state = Rc::new(RefCell::new(BootstrapHandleState::default()));
+        let document = BootstrapHandleDocument::new_with_state(
+            None,
+            XrefEntryLookup::Registration(&BTreeMap::from([
+                (ObjectRef::new(4, 0), XrefEntry::Uncompressed { offset: 0 }),
+                (
+                    member_ref,
+                    XrefEntry::Compressed {
+                        stream: 4,
+                        index: 0,
+                    },
+                ),
+            ])),
+            XrefLoadOptions {
+                description: b"bootstrap-truncated.pdf".to_vec(),
+                ..XrefLoadOptions::default()
+            },
+            Rc::clone(&state),
+        );
+        let stream = document.handle_for_reference(ObjectRef::new(4, 0));
+        stream.set_resolved(ObjectValue::Stream {
+            stream_dict: ObjectHandle::dictionary(vec![
+                (b"/Type".to_vec(), ObjectHandle::name(b"ObjStm".to_vec())),
+                (b"/N".to_vec(), ObjectHandle::integer(1)),
+                (b"/First".to_vec(), ObjectHandle::integer(4)),
+                (
+                    b"/Length".to_vec(),
+                    ObjectHandle::integer(i64::try_from(compressed.len()).unwrap()),
+                ),
+                (
+                    b"/Filter".to_vec(),
+                    ObjectHandle::name(b"FlateDecode".to_vec()),
+                ),
+            ]),
+            stream_data: Some(Rc::new(compressed)),
+            stream_provider: None,
+            filter_on_write: true,
+            stream_length: decoded.len(),
+        });
+        stream.set_parsed_offset_if_unset(90);
+
+        document
+            .resolve_objects_in_stream(4)
+            .expect("a recoverable stream warning must not abort ObjStm resolution");
+        assert_eq!(
+            document
+                .handle_for_reference(member_ref)
+                .try_get_key(b"/Value")
+                .expect("the member survives the stream warning")
+                .as_integer(),
+            Some(42)
+        );
+        let state = state.borrow();
+        let warning = state
+            .diagnostics
+            .entries()
+            .iter()
+            .find(|warning| {
+                warning.get_message_detail()
+                    == b"input stream is complete but output may still be valid"
+            })
+            .expect("the recoverable zlib warning is collected");
+        assert_eq!(warning.get_filename(), b"bootstrap-truncated.pdf");
+        assert_eq!(warning.get_object(), b"");
+        assert_eq!(warning.get_file_position(), 90);
+    }
+
+    #[test]
+    fn bootstrap_stream_warning_without_a_parsed_offset_uses_the_object_warning_sink() {
+        let state = Rc::new(RefCell::new(BootstrapHandleState::default()));
+        let document = BootstrapHandleDocument::new_with_state(
+            None,
+            XrefEntryLookup::Registration(&BTreeMap::new()),
+            XrefLoadOptions::default(),
+            Rc::clone(&state),
+        );
+        let stream = document.handle_for_reference(ObjectRef::new(4, 0));
+        stream.set_resolved(ObjectValue::Stream {
+            stream_dict: ObjectHandle::dictionary(vec![(
+                b"/Filter".to_vec(),
+                ObjectHandle::integer(1),
+            )]),
+            stream_data: Some(Rc::new(vec![0])),
+            stream_provider: None,
+            filter_on_write: true,
+            stream_length: 1,
+        });
+
+        let error = stream
+            .get_stream_data(DecodeLevel::Specialized)
+            .expect_err("an unfilterable stream still returns qpdf's terminal error");
+        assert!(matches!(
+            error,
+            Error::QpdfExc(ref warning)
+                if warning.get_message_detail() == b"getStreamData called on unfilterable stream"
+        ));
+        assert!(state.borrow().diagnostics.entries().iter().any(|warning| {
+            warning.get_message_detail() == b"stream filter type is not name or array"
+        }));
     }
 
     #[test]

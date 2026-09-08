@@ -205,6 +205,15 @@ description template はそのレンダリング済み prefix 全体を保持す
 A24の cache/recheck 責務とは独立した description propagation の補正であり、canonical
 ResolverHandle側の object-stream routeや reconstruction-only bounded windowは変更しない。
 
+2026-09-08（`flpdf-92r5`）: owner-less `BootstrapHandleDocument` に
+`DocumentResolver::warn` と `warn_stream_data` を実装し、qpdfの
+`QPDF_Stream::warn` → `QPDF::warn`（`libqpdf/QPDF_Stream.cc:695-698`,
+`libqpdf/QPDF.cc:487-494`）と同じくwarningを収集してdecodeを継続するようにした。
+`ObjectHandle::stream_data_warning`（`crates/flpdf/src/object_handle.rs:6650-6685`）の
+parsed offsetあり／なし両方のboundaryを対象にし、ObjStmのrecoverable codec warningで
+memberを失わないことをRED/GREENテストで確認した。A24のcanonical cache/recheck
+責務、reconstruction-only bounded window、qtest exceptionsは対象外。
+
 ### A6の追加確認: getParsedOffsetもlazy accessor
 
 `.40` の C8/C25 payload-helper cascade cleanupで、A7の旧
