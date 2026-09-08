@@ -844,6 +844,42 @@ fn get_exit_code_is_pure_before_and_after_completion() {
 }
 
 #[test]
+fn a_failed_reopen_clears_the_previous_encryption_status() {
+    // `get_exit_code` is a public, side-effect-free query, so a reused job
+    // must not answer it from the previous document's encryption bits. qpdf
+    // never faces this because an open failure escapes `run()` as an
+    // exception and the CLI exits from its catch without consulting
+    // `getExitCode` (`qpdf/qpdf.cc:39-43`); flpdf converts that failure into
+    // `JobExitCode::Error` instead, so the status has to be cleared up front.
+    let root = Path::new(env!("CARGO_MANIFEST_DIR")).join("../../tests/fixtures");
+    let encrypted = root.join("encrypted/v4-aes-128-r4.pdf");
+
+    let mut job = QPDFJob::new();
+    job.initialize_from_json_partial(
+        &serde_json::json!({"inputFile": encrypted, "isEncrypted": ""}).to_string(),
+    )
+    .unwrap();
+    assert_eq!(job.run().unwrap(), JobExitCode::Success);
+    assert_eq!(job.get_exit_code(), JobExitCode::Success);
+
+    let mut job = job;
+    job.initialize_from_json_partial(
+        &serde_json::json!({
+            "inputFile": root.join("this-file-does-not-exist.pdf"),
+            "isEncrypted": "",
+        })
+        .to_string(),
+    )
+    .unwrap();
+    assert_eq!(job.run().unwrap(), JobExitCode::Error);
+    assert_eq!(
+        job.get_exit_code(),
+        JobExitCode::Error,
+        "a failed open must not leave the previous document's encryption status behind"
+    );
+}
+
+#[test]
 fn encryption_status_exit_codes_match_qpdf_get_exit_code() {
     let root = Path::new(env!("CARGO_MANIFEST_DIR")).join("../../tests/fixtures");
     let encrypted = root.join("encrypted/v4-aes-128-r4.pdf");

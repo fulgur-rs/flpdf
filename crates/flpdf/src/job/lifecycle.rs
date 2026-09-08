@@ -1281,6 +1281,29 @@ impl Default for QPDFJob {
     }
 }
 
+/// How an inspection-stage failure reaches the `write_qpdf` boundary.
+///
+/// qpdf's inspection stage reports nothing itself; every failure escapes as an
+/// exception and the CLI's single catch prints `qpdf: <what()>` once
+/// (`qpdf/qpdf.cc:39-41`). flpdf's check consumer already writes that line for
+/// detected structural errors (`job/check.rs::report_errors_detected`,
+/// mirroring the `std::runtime_error("errors detected")` qpdf throws at
+/// `libqpdf/QPDFJob.cc:793`), so the boundary has to know which failures are
+/// still owed a diagnostic.
+#[derive(Debug)]
+enum InspectionFailure {
+    /// The diagnostic has already been written; the boundary must stay silent.
+    Reported(Error),
+    /// The boundary still owes the caller its one diagnostic line.
+    Unreported(Error),
+}
+
+impl From<Error> for InspectionFailure {
+    fn from(error: Error) -> Self {
+        Self::Unreported(error)
+    }
+}
+
 impl QPDFJob {
     /// Return a fluent proxy for the qpdf job configuration subset used by
     /// direct API consumers.
@@ -2781,8 +2804,14 @@ impl QPDFJob {
             || self.configuration.json_version.is_some();
         if !creates_output {
             let configuration = self.configuration.clone();
-            if let Err(error) = self.run_configured_inspection(pdf, &configuration) {
-                self.report_job_error(&error)?;
+            if let Err(failure) = self.run_configured_inspection(pdf, &configuration) {
+                let error = match failure {
+                    InspectionFailure::Reported(error) => error,
+                    InspectionFailure::Unreported(error) => {
+                        self.report_job_error(&error)?;
+                        error
+                    }
+                };
                 return Err(error);
             }
             self.drain_document_warnings(pdf);
@@ -2937,7 +2966,16 @@ impl QPDFJob {
                     // POSIX/Windows both refuse to rename an open file
                     // reliably (`libqpdf/QPDFJob.cc:3068-3069`).
                     pdf.close_input_source();
-                    self.finish_replace_input()?;
+                    // A rename failure escapes qpdf's `writeOutfile` as an
+                    // exception and its CLI catch still prints one
+                    // `qpdf: <what()>` line (`qpdf/qpdf.cc:39-41`). Report it
+                    // here for the same reason the write-failure arm below
+                    // does: `run()` turns the error into an exit status and
+                    // would otherwise discard the explanation entirely.
+                    if let Err(error) = self.finish_replace_input() {
+                        self.report_job_error(&error)?;
+                        return Err(error);
+                    }
                 }
                 // The drain qpdf performs after `writeOutfile` returns
                 // (`libqpdf/QPDFJob.cc:493-494`).
@@ -2982,13 +3020,20 @@ impl QPDFJob {
 
     fn run_encryption_status(&mut self) -> Result<JobExitCode> {
         self.check_configuration()?;
+        // Clear before the open so a failure below cannot leave the previous
+        // document's bits behind. qpdf sets `m->encryption_status` while
+        // processing each input and lets an open failure escape `run()` as an
+        // exception, so `getExitCode` is never consulted against a stale
+        // status (`QPDFJob.cc:1699-1708`, `qpdf/qpdf.cc:39-43`). flpdf turns
+        // that failure into `JobExitCode::Error` instead of unwinding, and
+        // `get_exit_code` is a public query, so the reset has to be explicit.
+        self.encryption_status = EncryptionStatus::default();
         // qpdf's `createQPDF` still creates an empty document for `--empty`
         // before the encryption-status early return (`QPDFJob.cc:429-456,
         // 1699-1708`). An empty document is necessarily unencrypted, so both
         // `isEncrypted` and `requiresPassword` return EXIT_IS_NOT_ENCRYPTED
         // (2) without attempting to open an input file.
         if self.configuration.empty_input {
-            self.encryption_status = EncryptionStatus::default();
             return Ok(self.get_exit_code());
         }
         let Some(input) = self.configuration.input_file.clone() else {
@@ -3221,7 +3266,7 @@ impl QPDFJob {
         &mut self,
         pdf: &mut Pdf<R>,
         configuration: &JobConfiguration,
-    ) -> Result<()>
+    ) -> std::result::Result<(), InspectionFailure>
     where
         R: Read + Seek + 'static,
     {
@@ -3234,10 +3279,18 @@ impl QPDFJob {
         if configuration.check {
             if let Err(error) = self.run_check_report(pdf) {
                 return match error {
-                    super::check::CheckError::ErrorsDetected => {
-                        Err(Error::Unsupported("errors detected".to_owned()))
+                    // qpdf's `doCheck` throws `std::runtime_error("errors
+                    // detected")` (`libqpdf/QPDFJob.cc:793`) and the CLI's
+                    // catch prints `qpdf: errors detected` exactly once
+                    // (`qpdf/qpdf.cc:39-41`). `run_check_report` has already
+                    // written that line (`job/check.rs::report_errors_detected`),
+                    // so the boundary must not report it a second time.
+                    super::check::CheckError::ErrorsDetected => Err(InspectionFailure::Reported(
+                        Error::Unsupported("errors detected".to_owned()),
+                    )),
+                    super::check::CheckError::Operation(error) => {
+                        Err(InspectionFailure::Unreported(error))
                     }
-                    super::check::CheckError::Operation(error) => Err(error),
                 };
             }
         }
@@ -4440,12 +4493,15 @@ mod tests {
         let mut job = QPDFJob::new();
         let mut configuration = job.configuration.clone();
         configuration.check = true;
-        let error = job
+        let failure = job
             .run_configured_inspection(&mut pdf, &configuration)
             .expect_err("check errors must abort the enclosing inspection");
+        // The check consumer already wrote qpdf's single `errors detected`
+        // line, so the boundary must not report it again.
         assert!(matches!(
-            error,
-            Error::Unsupported(message) if message == "errors detected"
+            failure,
+            InspectionFailure::Reported(Error::Unsupported(ref message))
+                if message == "errors detected"
         ));
     }
 
