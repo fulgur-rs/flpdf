@@ -123,6 +123,52 @@ fn candidate_discovery_live_warning_bytes() -> Vec<u8> {
     b"%PDF-1.4\n1 0 obj\n<< /Foo 1 >>\n2 0 obj\n<< /Type /XRef /W [1 1 1] /Size 1 /Length 3 >>\nstream\n\x01\x00\x00\nendstream\nendobj\nstartxref\n0\n%%EOF\n".to_vec()
 }
 
+/// The sole candidate's own body is missing `endobj` before `startxref`
+/// (mirroring `candidate_discovery_live_warning_bytes`'s object 1, but as
+/// the candidate itself rather than a filler entry read during discovery),
+/// so its *read* warns live ("expected endobj") when re-entered. `/Index [10
+/// 2]` keeps the stream's two decoded entries (object numbers 10 and 11)
+/// from colliding with the line scan's own registration of this object under
+/// its real number (1) -- re-entry seeds `XrefRegistration` from that same
+/// line-scan table, and a colliding object number is silently skipped before
+/// its type is ever checked (`registration.entries.contains_key`, mirroring
+/// qpdf's `try_emplace`, `QPDF.cc:1158-1169`), which would hide the type-97
+/// entry entirely. `/Length 5` (one byte more than the two entries need)
+/// makes `build_xref_stream` push a stream-length diagnostic and continue,
+/// then object 11's decoded type (97) is unrecognized and `build_xref_stream`
+/// fails outright -- both on the *same* re-entry read.
+fn candidate_reentry_build_failure_after_live_warning_bytes() -> Vec<u8> {
+    b"%PDF-1.4\n1 0 obj\n<< /Type /XRef /W [1 0 1] /Index [10 2] /Size 12 /Length 5 >>\nstream\n\x01\x00a\x00X\nendstream\nstartxref\n0\n%%EOF\n".to_vec()
+}
+
+/// Two `/Type /XRef` objects at distinct offsets, deliberately numbered so
+/// the *lower*-offset one (the eventual `/Prev` target) has the *higher*
+/// object number: `find_xref_stream_trailer_candidate_canonical` visits
+/// entries in ascending object-number order and only ever assigns the
+/// winning candidate on the first entry whose offset exceeds every offset
+/// seen so far, so object 1 (the higher-offset, later object) is visited
+/// first and wins; object 2 (the lower-offset `/Prev` target) is visited
+/// second and never displaces it. Object 1's own re-entry is clean (no
+/// warning of its own); its `/Prev` points at object 2, whose body is
+/// missing `endobj` before the next line (mirroring
+/// `candidate_discovery_live_warning_bytes`'s technique), so reading it
+/// during the `/Prev` walk warns live ("expected endobj").
+fn previous_xref_section_live_warning_bytes() -> Vec<u8> {
+    let prefix = b"%PDF-1.4\n".to_vec();
+    let object_2 = b"2 0 obj\n<< /Type /XRef /W [1 1 1] /Size 1 /Length 3 >>\nstream\n\x01\x00\x00\nendstream\n".to_vec();
+    let previous_offset = prefix.len();
+    let mut bytes = prefix;
+    bytes.extend_from_slice(&object_2);
+    bytes.extend_from_slice(
+        format!(
+            "1 0 obj\n<< /Type /XRef /W [1 1 1] /Size 1 /Prev {previous_offset} /Length 3 >>\nstream\n\x01\x00\x00\nendstream\nendobj\n"
+        )
+        .as_bytes(),
+    );
+    bytes.extend_from_slice(b"startxref\n0\n%%EOF\n");
+    bytes
+}
+
 fn two_lazy_warning_objects() -> Vec<u8> {
     let mut pdf = b"%PDF-1.4\n".to_vec();
     let mut offsets = Vec::new();
@@ -672,4 +718,70 @@ fn live_suppression_toggle_only_changes_delivery_not_collection() {
     assert!(output
         .windows(b"object 5 0".len())
         .any(|w| w == b"object 5 0"));
+}
+
+#[test]
+fn candidate_reentry_orders_its_own_read_warning_before_its_build_diagnostic() {
+    let (logger, output) = recording_logger();
+    let error = match Pdf::open_with_options(
+        Cursor::new(candidate_reentry_build_failure_after_live_warning_bytes()),
+        PdfOpenOptions {
+            repair: true,
+            logger: Some(logger),
+            description: b"input.pdf".to_vec(),
+            ..PdfOpenOptions::default()
+        },
+    ) {
+        Ok(_) => panic!("an unrecognized xref stream entry type must fail the candidate re-entry"),
+        Err(error) => error,
+    };
+
+    assert!(error.open_failure().is_some());
+    assert_eq!(
+        output.lock().unwrap().as_slice(),
+        b"WARNING: input.pdf: file is damaged\n\
+         WARNING: input.pdf: can't find startxref\n\
+         WARNING: input.pdf: Attempting to reconstruct cross-reference table\n\
+         WARNING: input.pdf (object 1 0, offset 102): expected endobj\n\
+         WARNING: input.pdf (xref stream: object 1 0, offset 102): expected endobj\n\
+         WARNING: input.pdf (xref stream, offset 9): Cross-reference stream data has the wrong size; expected = 4; actual = 5\n",
+        "the re-entry's own read warning must print before the build diagnostic \
+         parse_xref_stream_with_canonical_owner writes to its sink afterward, \
+         since the read happens first in real call order"
+    );
+}
+
+#[test]
+fn previous_xref_section_defers_a_live_read_warning_through_the_prev_walk() {
+    let (logger, output) = recording_logger();
+    let mut pdf = Pdf::open_with_options(
+        Cursor::new(previous_xref_section_live_warning_bytes()),
+        PdfOpenOptions {
+            repair: true,
+            logger: Some(logger),
+            description: b"input.pdf".to_vec(),
+            ..PdfOpenOptions::default()
+        },
+    )
+    .expect("qpdf-compatible reconstruction should return the candidate trailer");
+
+    let error = pdf
+        .root_handle()
+        .expect_err("the recovered candidate has no /Root dictionary");
+    assert!(matches!(
+        error,
+        Error::QpdfExc(warning) if warning.get_message_detail() == b"unable to find /Root dictionary"
+    ));
+    assert_eq!(
+        output.lock().unwrap().as_slice(),
+        b"WARNING: input.pdf: file is damaged\n\
+         WARNING: input.pdf: can't find startxref\n\
+         WARNING: input.pdf: Attempting to reconstruct cross-reference table\n\
+         WARNING: input.pdf (object 2 0, offset 85): expected endobj\n\
+         WARNING: input.pdf (xref stream: object 2 0, offset 85): expected endobj\n\
+         WARNING: input.pdf: reported number of objects (1) is not one plus the highest object number (2)\n",
+        "the /Prev target's own read warning, raised while merge_previous_xref_sections \
+         follows the candidate's /Prev chain, must print after the trio and after \
+         discovery's own resolution of the same object -- not live, ahead of both"
+    );
 }
