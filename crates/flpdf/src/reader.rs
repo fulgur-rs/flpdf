@@ -1977,6 +1977,18 @@ mod compressible_owner_tests {
     }
 
     #[test]
+    fn parsed_xref_stream_handoff_rejects_an_unresolved_canonical_slot() {
+        let mut pdf = pdf();
+        let object_ref = ObjectRef::new(99, 0);
+        let source = ObjectHandle::new_indirect_unresolved(object_ref, -1);
+        let error = pdf
+            .install_parsed_xref_stream_handles(BTreeMap::from([(object_ref, source)]))
+            .expect_err("canonical xref-stream provenance must already be resolved");
+
+        assert!(matches!(error, Error::Internal(message) if message.contains("99 0")));
+    }
+
+    #[test]
     fn compressible_walk_removes_stale_aliases_without_invalidating_preparation() {
         let mut pdf = Pdf::open(Cursor::new(
             include_bytes!(

@@ -6740,6 +6740,59 @@ mod final_handle_tests {
     }
 
     #[test]
+    fn context_conversion_preserves_reconstruction_inputs_across_owner_routes() {
+        let entries = BTreeMap::new();
+        let reference_offsets: Rc<[u64]> = Rc::from(Vec::<u64>::new().into_boxed_slice());
+        let bootstrap_cache = empty_bootstrap_cache();
+        let source = XrefReadContextSpec::ReconstructionWithCache {
+            line_scan_entries: &entries,
+            reference_offsets: &reference_offsets,
+            bootstrap_cache: &bootstrap_cache,
+        };
+
+        let canonical = context_spec_without_bootstrap_cache(source);
+        assert!(matches!(
+            canonical,
+            XrefReadContextSpec::Reconstruction {
+                line_scan_entries,
+                reference_offsets: offsets,
+            } if std::ptr::eq(line_scan_entries, &entries)
+                && Rc::ptr_eq(offsets, &reference_offsets)
+        ));
+
+        let ownerless = context_spec_with_bootstrap_cache(source, &bootstrap_cache);
+        assert!(matches!(
+            ownerless,
+            XrefReadContextSpec::ReconstructionWithCache {
+                line_scan_entries,
+                reference_offsets: offsets,
+                bootstrap_cache: cache,
+            } if std::ptr::eq(line_scan_entries, &entries)
+                && Rc::ptr_eq(offsets, &reference_offsets)
+                && Rc::ptr_eq(cache, &bootstrap_cache)
+        ));
+    }
+
+    #[test]
+    fn canonical_nonzero_startxref_recovery_keeps_bootstrap_cache_absent() {
+        let bytes = b"%PDF-1.4\n1 0 obj\n<< /Type /Catalog >>\nendobj\ntrailer\n<< /Size 2 /Root 1 0 R >>\nstartxref\n9\n%%EOF\n".to_vec();
+        let resolver = canonical_test_resolver(bytes.clone(), BTreeMap::new(), true, 12);
+        let state = load_xref_state_from_bytes(
+            &bytes,
+            XrefLoadOptions {
+                allow_repair: true,
+                ..XrefLoadOptions::default()
+            },
+            Some(resolver.as_ref()),
+        )
+        .expect("canonical recovery should rebuild a nonzero malformed startxref");
+
+        assert!(state.already_reconstructed);
+        assert!(state.bootstrap_cache.is_none());
+        assert_eq!(state.loaded.trailer.object_ref(), None);
+    }
+
+    #[test]
     fn canonical_owner_skips_the_offset_zero_retry_when_startxref_is_missing() {
         // No `startxref` at all, so `parse_startxref` fails and `startxref`
         // becomes 0. Object 1 sits at logical offset 0 and its body has a
