@@ -554,6 +554,114 @@ fn suppress_recovery_applies_to_an_overlay_source() {
 }
 
 #[test]
+fn verbose_transformations_do_not_consume_standard_output() {
+    // qpdf reserves standard output in `checkConfiguration`, which
+    // `createQPDF` runs before every transformation
+    // (`libqpdf/QPDFJob.cc:428-431,614-626`), so the overlay progress block
+    // goes to standard error and the PDF still owns stdout.
+    let assert = Command::cargo_bin("flpdf")
+        .unwrap()
+        .env("FLPDF_STATIC_ID_QUIET", "1")
+        .args([
+            "rewrite",
+            "--verbose",
+            "--static-id",
+            "--overlay",
+            "../../tests/fixtures/compat/two-page.pdf",
+            "--",
+            "../../tests/fixtures/compat/three-page.pdf",
+            "-",
+        ])
+        .assert()
+        .code(0)
+        .stderr(predicate::str::contains("processing underlay/overlay"));
+    let stdout = &assert.get_output().stdout;
+    assert!(
+        stdout.starts_with(b"%PDF-"),
+        "standard output must carry the PDF, not the verbose block"
+    );
+}
+
+#[test]
+fn an_overlay_source_does_not_inherit_the_command_wide_password() {
+    // `validateUnderOverlay` passes only the segment's own password to
+    // `processFile` (`libqpdf/QPDFJob.cc:1823`); the command-wide
+    // `--password` never reaches an overlay source.
+    let temp = tempfile::tempdir().unwrap();
+    let encrypted = temp.path().join("overlay-encrypted.pdf");
+    let output = temp.path().join("overlay.pdf");
+    Command::cargo_bin("flpdf")
+        .unwrap()
+        .args([
+            "--encrypt",
+            "--user-password=SECRET",
+            "--owner-password=SECRET",
+            "--bits=256",
+            "--",
+            "../../tests/fixtures/compat/two-page.pdf",
+            encrypted.to_str().unwrap(),
+        ])
+        .assert()
+        .code(0);
+
+    Command::cargo_bin("flpdf")
+        .unwrap()
+        .args([
+            "--password=SECRET",
+            "--overlay",
+            encrypted.to_str().unwrap(),
+            "--",
+            "../../tests/fixtures/compat/three-page.pdf",
+            output.to_str().unwrap(),
+        ])
+        .assert()
+        .code(2);
+
+    Command::cargo_bin("flpdf")
+        .unwrap()
+        .args([
+            "--password=SECRET",
+            "--overlay",
+            encrypted.to_str().unwrap(),
+            "--password=SECRET",
+            "--",
+            "../../tests/fixtures/compat/three-page.pdf",
+            output.to_str().unwrap(),
+        ])
+        .assert()
+        .code(0);
+}
+
+#[test]
+fn writer_validation_runs_after_the_document_stage() {
+    // qpdf builds the writer inside `writeQPDF` -> `writeOutfile` ->
+    // `setWriterOptions` (`libqpdf/QPDFJob.cc:484-495,2752-2761`), so a
+    // missing overlay source is reported before the RC4 refusal.
+    let temp = tempfile::tempdir().unwrap();
+    let output = temp.path().join("encrypted.pdf");
+    let missing = temp.path().join("no-such-overlay.pdf");
+
+    Command::cargo_bin("flpdf")
+        .unwrap()
+        .args([
+            "--encrypt",
+            "--user-password=u",
+            "--owner-password=o",
+            "--bits=128",
+            "--",
+            "--overlay",
+            missing.to_str().unwrap(),
+            "--",
+            "../../tests/fixtures/compat/three-page.pdf",
+            output.to_str().unwrap(),
+        ])
+        .assert()
+        .code(2)
+        .stderr(predicate::str::contains("No such file or directory"))
+        .stderr(predicate::str::contains("refusing to write a file with RC4").not());
+}
+
+#[test]
 fn ignore_xref_streams_applies_to_an_overlay_source() {
     let temp = tempfile::tempdir().unwrap();
     let output = temp.path().join("overlay.pdf");

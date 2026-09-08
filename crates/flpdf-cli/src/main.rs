@@ -5266,7 +5266,6 @@ fn configure_rewrite_job(
     verbose: bool,
     no_warn: bool,
     options: &WriterOptions,
-    decrypt: bool,
 ) -> CliResult<QPDFJob> {
     if linearize && !overlay_specs.is_empty() {
         return Err("--overlay/--underlay cannot be combined with --linearize".into());
@@ -5276,19 +5275,15 @@ fn configure_rewrite_job(
     job.set_output_file(output.to_path_buf())?;
     job.set_suppress_recovery(password.recovery.suppress_recovery);
     job.set_ignore_xref_streams(password.recovery.ignore_xref_streams);
+    // `open_job_source` reads these three from the job configuration, so an
+    // overlay/underlay source opened by the job has to see the same
+    // interpretation the primary open used.
+    job.set_password_mode(password.password_mode.into());
+    job.set_password_is_hex_key(password.password_is_hex_key);
+    job.set_suppress_password_recovery(password.suppress_password_recovery);
     job.set_verbose(verbose);
     job.set_progress(options.progress);
     job.set_linearization(linearize, linearize_pass1.map(Path::to_path_buf));
-
-    let mut writer_options = options.clone();
-    if decrypt {
-        writer_options.preserve_encryption = false;
-    }
-    job.set_writer_configuration(writer_configuration(
-        &writer_options,
-        linearize,
-        linearize_pass1,
-    )?);
 
     {
         let mut configuration = job.config();
@@ -5331,7 +5326,6 @@ fn configure_rewrite_job(
                         .as_ref()
                         .map(|password| arg_parser::os_bytes(password.as_os_str()))
                 })
-                .or_else(|| password.password_bytes())
                 .unwrap_or_default();
             let from = match spec.from.as_deref() {
                 None => PageRange::parse("")?,
@@ -5412,7 +5406,6 @@ fn run_rewrite_opened<R: Read + Seek + 'static>(
         verbose,
         no_warn,
         &job_options,
-        _decrypt,
     )?;
     job.apply_transformations(&mut pdf)?;
     if linearize_normalization {
@@ -5426,6 +5419,19 @@ fn run_rewrite_opened<R: Read + Seek + 'static>(
             }
         }
     }
+    // qpdf builds the writer only inside writeQPDF -> writeOutfile ->
+    // setWriterOptions (`QPDFJob.cc:484-495,2752-2761`), so its write-time
+    // validation - the auto-password notices and the RC4 refusal - runs after
+    // the create stage, never before it.
+    let mut writer_options = job_options;
+    if _decrypt {
+        writer_options.preserve_encryption = false;
+    }
+    job.set_writer_configuration(writer_configuration(
+        &writer_options,
+        linearize,
+        linearize_pass1,
+    )?);
     match job.write_qpdf(&mut pdf) {
         Ok(()) => finish_job_exit_status(job.get_exit_code()),
         Err(_) => Err(Box::new(CliExitError {

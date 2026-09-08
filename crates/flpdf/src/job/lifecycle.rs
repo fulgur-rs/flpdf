@@ -1630,6 +1630,21 @@ impl QPDFJob {
         self.configuration.ignore_xref_streams = value;
     }
 
+    /// Set qpdf's `--password-mode` interpretation for job-owned opens.
+    pub fn set_password_mode(&mut self, value: PasswordMode) {
+        self.configuration.password_mode = value;
+    }
+
+    /// Set qpdf's `--password-is-hex-key` policy for job-owned opens.
+    pub fn set_password_is_hex_key(&mut self, value: bool) {
+        self.configuration.password_is_hex_key = value;
+    }
+
+    /// Set qpdf's `--suppress-password-recovery` policy for job-owned opens.
+    pub fn set_suppress_password_recovery(&mut self, value: bool) {
+        self.configuration.suppress_password_recovery = value;
+    }
+
     /// Configure qpdf's linearization writer mode and optional pass-one file.
     pub fn set_linearization(&mut self, value: bool, pass1: Option<PathBuf>) {
         self.configuration.linearize = value;
@@ -3015,33 +3030,13 @@ impl QPDFJob {
         }
 
         let output = self
-            .configuration
-            .output_file
-            .clone()
-            .or_else(|| {
-                self.configuration
-                    .replace_input
-                    .then(|| self.replace_input_path())
-                    .flatten()
-            })
-            .or_else(|| {
-                self.configuration
-                    .json_version
-                    .is_some()
-                    .then(|| PathBuf::from("-"))
-            })
+            .output_destination()
             .expect("creates_output guarantees an output destination");
-        // qpdf's checkConfiguration reserves the save pipeline before
-        // createQPDF and setEncryptionOptions, so auto-password diagnostics
-        // cannot consume stdout that is needed for the PDF output
-        // (`QPDFJob.cc:614-626`). Keep the direct write_qpdf entry point on
-        // the same boundary even when callers bypass run().
-        if output == Path::new("-") {
-            if let Err(error) = self.logger.save_to_standard_output(true) {
-                self.report_job_error(&error)?;
-                return Err(error);
-            }
-        }
+        // Reserving again here is a no-op once `apply_transformations` has
+        // done it, matching qpdf's own second call, which its comment calls
+        // "defensive and harmless" (`QPDFJob.cc:3051-3053`). It still matters
+        // for callers that reach write_qpdf without the create stage.
+        self.reserve_standard_output()?;
         let mut writer_configuration = self.configuration.writer.clone();
         if let Some(path) = self.configuration.copy_encryption.clone() {
             match self.copy_encryption_source(&path) {
@@ -3216,8 +3211,48 @@ impl QPDFJob {
     where
         R: Read + Seek + 'static,
     {
+        // qpdf reserves standard output inside `checkConfiguration`, which
+        // `createQPDF` runs before any transformation
+        // (`libqpdf/QPDFJob.cc:428-431,614-626`). Doing it here keeps verbose
+        // and diagnostic output raised by the transformations on standard
+        // error instead of consuming the stream the PDF itself needs.
+        self.reserve_standard_output()?;
         let configuration = self.configuration.clone();
         self.prepare_document_transformations(pdf, &configuration)
+    }
+
+    /// The destination this job writes to, or `None` when it creates no output.
+    fn output_destination(&self) -> Option<PathBuf> {
+        self.configuration
+            .output_file
+            .clone()
+            .or_else(|| {
+                self.configuration
+                    .replace_input
+                    .then(|| self.replace_input_path())
+                    .flatten()
+            })
+            .or_else(|| {
+                self.configuration
+                    .json_version
+                    .is_some()
+                    .then(|| PathBuf::from("-"))
+            })
+    }
+
+    /// Reserve the save pipeline when this job writes to standard output.
+    ///
+    /// `only_if_not_set` makes repeated calls idempotent, so the create and
+    /// write stages can both reserve without the second one failing.
+    fn reserve_standard_output(&mut self) -> Result<()> {
+        if self.output_destination().as_deref() != Some(Path::new("-")) {
+            return Ok(());
+        }
+        if let Err(error) = self.logger.save_to_standard_output(true) {
+            self.report_job_error(&error)?;
+            return Err(error);
+        }
+        Ok(())
     }
 
     /// Run the configured create/write or check lifecycle.
@@ -5360,6 +5395,57 @@ mod tests {
             error.contains("deterministic") && !error.contains("called setSave"),
             "stdout reservation must precede the diagnostic: {error:?}"
         );
+    }
+
+    #[test]
+    fn apply_transformations_reserves_stdout_before_the_document_stage() {
+        let mut pdf = Pdf::open(Cursor::new(
+            std::fs::read(
+                std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+                    .join("../../tests/fixtures/minimal.pdf"),
+            )
+            .expect("committed minimal fixture"),
+        ))
+        .expect("minimal fixture parses");
+        let logger = QPDFLogger::create();
+        let mut job = QPDFJob::new();
+        job.set_logger(logger.clone());
+        job.set_output_file("-").expect("stdout output is accepted");
+        job.set_verbose(true);
+
+        job.apply_transformations(&mut pdf)
+            .expect("the create stage succeeds for the minimal fixture");
+
+        assert!(
+            logger
+                .get_save()
+                .expect("save pipeline")
+                .is_same(&logger.standard_output()),
+            "qpdf reserves stdout in checkConfiguration, which createQPDF runs \
+             before any transformation (QPDFJob.cc:428-431,614-626)"
+        );
+        assert!(
+            logger
+                .get_info()
+                .expect("info pipeline")
+                .is_same(&logger.standard_error()),
+            "reserving stdout must reroute info output to stderr so verbose \
+             transformations cannot consume the stream the PDF needs"
+        );
+    }
+
+    #[test]
+    fn password_interpretation_setters_reach_job_owned_opens() {
+        let mut job = QPDFJob::new();
+        job.set_password_mode(PasswordMode::HexBytes);
+        job.set_password_is_hex_key(true);
+        job.set_suppress_password_recovery(true);
+
+        let options = job.configured_open_options(b"75".to_vec());
+
+        assert_eq!(options.password_mode, PasswordMode::HexBytes);
+        assert!(options.password_is_hex_key);
+        assert!(options.suppress_password_recovery);
     }
 
     #[test]
