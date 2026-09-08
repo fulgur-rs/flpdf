@@ -186,7 +186,7 @@ pub(crate) fn run_test_4<R: Read + Seek>(
     _diagnostics_written: &mut usize,
 ) -> flpdf::Result<()> {
     let trailer = pdf.trailer();
-    let mut qtest = trailer.get_key(b"/QTest");
+    let mut qtest = trailer.try_get_key(b"/QTest")?;
     qtest.make_direct(false)?;
     qtest.remove_key(b"/Subject");
     qtest.replace_key(
@@ -194,7 +194,7 @@ pub(crate) fn run_test_4<R: Read + Seek>(
         ObjectHandle::string(b"Mr. Potato Head".to_vec()),
     )?;
 
-    let array = qtest.get_key(b"/A");
+    let array = qtest.try_get_key(b"/A")?;
     if array
         .as_array()
         .and_then(|items| items.into_iter().next())
@@ -214,7 +214,7 @@ pub(crate) fn run_test_4<R: Read + Seek>(
         ])?;
     }
 
-    let mut qtest2 = trailer.get_key(b"/QTest2");
+    let mut qtest2 = trailer.try_get_key(b"/QTest2")?;
     if !qtest2.is_null() {
         qtest2.make_direct(true)?;
         trailer.replace_key(b"/QTest2", qtest2)?;
