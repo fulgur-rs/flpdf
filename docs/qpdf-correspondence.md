@@ -1339,6 +1339,16 @@ q2fo は AcroForm について旧 `json_inspect` 経路を削除し、ヘルパ�
 | `doJSONOutlines` | `QPDFOutlineDocumentHelper` | ✅ |
 | `doJSONPageLabels` | `QPDFPageLabelDocumentHelper` | ✅ |
 
+`flpdf-lomd` では、canonical xref stream readの結果にも
+`parsed_xref_streams` provenanceを保持するようにした。qpdfは
+`read_xrefStream`の`readObjectAtOffset`で歴史的streamをobj_cacheへ置き、
+effective xref tableとcache enumerationを別々に扱う
+（`libqpdf/QPDF.cc:951-962,1239-1295,1640-1686`）。flpdfは最終`Pdf`構築時に
+そのhandleを`qpdf_parsed_xref_stream_refs`へ登録し、free/supersededな履歴streamを
+`live_object_refs`から除外する。current effective xref rowがあるObjectRefは
+registrationでshadowされるため、active xref streamの可視性は変えない。
+incremental RED/GREEN fixtureでobject-cache visibilityとlive filteringを確認した。
+
 ### A6/A7/A8 Job/CLI JSON accessor cohort `flpdf-3yn9.48.31` (2026-09-08)
 
 The first bounded Job/CLI cohort keeps the existing `QPDFJob::doJSONPages` and

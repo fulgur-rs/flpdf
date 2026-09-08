@@ -4754,7 +4754,10 @@ fn parse_xref_stream_with_canonical_owner(
         classic_trailer_offset: None,
         pending_reconstruction_trigger: None,
         trailer_references,
-        parsed_xref_streams: BTreeMap::new(),
+        // Keep the stream handle as qpdf obj_cache provenance. The final Pdf
+        // constructor skips effective xref rows, but marks historical/free
+        // rows as non-live while retaining them in object_refs().
+        parsed_xref_streams: BTreeMap::from([(object_ref, handle_object)]),
         bootstrap_cache: empty_bootstrap_cache(),
         header_offset: 0,
         already_reconstructed: false,
@@ -7349,6 +7352,36 @@ mod final_handle_tests {
         bytes
     }
 
+    fn hybrid_xref_with_historical_stream_revision() -> Vec<u8> {
+        let mut bytes = hybrid_xref_with_indirect_filter();
+        let previous_xref = bytes
+            .windows(b"xref\n0 6".len())
+            .position(|window| window == b"xref\n0 6")
+            .expect("the base hybrid fixture has a classic xref section");
+        let object_offsets: Vec<_> = (1..=4)
+            .map(|object| {
+                let marker = format!("{object} 0 obj\n");
+                bytes
+                    .windows(marker.len())
+                    .position(|window| window == marker.as_bytes())
+                    .expect("the base hybrid fixture has the page graph object")
+            })
+            .collect();
+        let current_xref = bytes.len();
+        bytes.extend_from_slice(b"xref\n0 6\n0000000000 65535 f \n");
+        for offset in object_offsets {
+            bytes.extend_from_slice(format!("{offset:010} 00000 n \n").as_bytes());
+        }
+        bytes.extend_from_slice(b"0000000000 00000 f \n");
+        bytes.extend_from_slice(
+            format!(
+                "trailer\n<< /Size 6 /Root 1 0 R /Prev {previous_xref} >>\nstartxref\n{current_xref}\n%%EOF\n"
+            )
+            .as_bytes(),
+        );
+        bytes
+    }
+
     fn canonical_test_resolver(
         bytes: Vec<u8>,
         entries: BTreeMap<ObjectRef, XrefEntry>,
@@ -7836,8 +7869,33 @@ mod final_handle_tests {
             .expect("the later canonical lookup must resolve the xref stream");
         assert!(xref_stream.is_resolved());
         assert!(
-            state.parsed_xref_streams.is_empty(),
-            "canonical xref streams must not need a bootstrap handoff"
+            state
+                .parsed_xref_streams
+                .contains_key(&ObjectRef::new(5, 0)),
+            "canonical xref streams retain provenance for final cache registration"
+        );
+    }
+
+    #[test]
+    fn canonical_historical_xref_stream_is_not_a_live_object() {
+        let bytes = hybrid_xref_with_historical_stream_revision();
+        let pdf = crate::Pdf::open_with_options(
+            std::io::Cursor::new(bytes),
+            crate::PdfOpenOptions {
+                repair: true,
+                ..crate::PdfOpenOptions::default()
+            },
+        )
+        .expect("the incremental historical xref fixture opens");
+        let historical = ObjectRef::new(5, 0);
+
+        assert!(
+            pdf.object_refs().contains(&historical),
+            "qpdf object-cache enumeration retains the historical xref stream"
+        );
+        assert!(
+            !pdf.live_object_refs().contains(&historical),
+            "a superseded xref stream must not be treated as an effective live object"
         );
     }
 
@@ -7886,7 +7944,7 @@ mod final_handle_tests {
         assert!(resolver
             .get_object_handle(ObjectRef::new(4, 0))
             .is_resolved());
-        assert!(parsed_xref_streams.is_empty());
+        assert!(parsed_xref_streams.contains_key(&ObjectRef::new(5, 0)));
     }
 
     #[test]
