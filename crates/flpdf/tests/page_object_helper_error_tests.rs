@@ -367,6 +367,14 @@ fn accessors_reject_non_page_object() {
     assert_unsupported(helper.get_annotations());
 }
 
+#[test]
+fn accessor_rejects_a_non_name_page_type() {
+    let bytes = single_page("<< /Type 42 /Parent 2 0 R /MediaBox [0 0 612 792] >>", &[]);
+    let (mut pdf, page_ref) = helper_for(bytes);
+    let mut helper = PageObjectHelper::new(page_ref, &mut pdf);
+    assert_unsupported(helper.media_box());
+}
+
 // ---------------------------------------------------------------------------
 // XObject image classification
 // ---------------------------------------------------------------------------
