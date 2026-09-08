@@ -4381,7 +4381,11 @@ impl QPDFJob {
         // capture sees `wrote file` first. The raw output bytes are kept
         // because qpdf prints `m->outfilename` itself rather than a lossy
         // rendering of it.
-        if verbose {
+        // The non-JSON writer route gates the same report on
+        // `self.configuration.verbose` (see `write_qpdf`), so a library caller
+        // that turned verbosity on through `set_verbose` / `config().verbose()`
+        // gets the report here too; the argument only adds the CLI's own flag.
+        if verbose || self.configuration.verbose {
             if let Some(filename) = output_filename {
                 let mut message = self.message_prefix.as_bytes().to_vec();
                 message.extend_from_slice(b": wrote file ");

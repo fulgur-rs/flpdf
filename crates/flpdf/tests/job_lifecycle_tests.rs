@@ -2465,6 +2465,57 @@ fn json_create_update_and_write_share_one_job_lifecycle() {
     assert!(String::from_utf8_lossy(&output).contains("\"jsonversion\": 2"));
 }
 
+/// A library caller that turns verbosity on through the job gets the same
+/// `wrote file` report the CLI flag produces.
+///
+/// qpdf gates it on `m->verbose` inside `writeOutfile`
+/// (`libqpdf/QPDFJob.cc:3057-3062`), which `QPDFJob::Config::verbose` sets, so
+/// the JSON route must read the job-owned setting rather than requiring a
+/// separate value.
+#[test]
+fn json_write_reports_the_written_file_for_a_job_verbose_caller() {
+    let (logger, state) = logger_with_info_sink();
+    let directory = tempfile::tempdir().expect("tempdir");
+    let output_path = directory.path().join("out.json");
+    let mut file = std::fs::File::create(&output_path).expect("create output");
+    let mut pdf = Pdf::open(BufReader::new(
+        File::open(
+            std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+                .join("../../tests/fixtures/minimal.pdf"),
+        )
+        .expect("committed minimal fixture"),
+    ))
+    .expect("minimal fixture parses");
+
+    let mut job = QPDFJob::new();
+    job.set_logger(logger);
+    job.set_verbose(true);
+    let status = job
+        .write_json(
+            &mut pdf,
+            JsonJobOptions {
+                decode_level: DecodeLevel::None,
+                stream_data: JsonStreamData::None,
+                stream_prefix: None,
+                keys: &[],
+                objects: &[],
+            },
+            JsonJobOutput::File {
+                filename: &output_path,
+                writer: &mut file,
+            },
+        )
+        .expect("JSON output");
+
+    assert_eq!(status, JobExitCode::Success);
+    let info = String::from_utf8(state.lock().expect("sink state").bytes.clone())
+        .expect("info output is utf-8");
+    assert!(
+        info.contains(&format!("wrote file {}", output_path.display())),
+        "the job-owned verbose setting must reach the JSON report: {info:?}"
+    );
+}
+
 #[test]
 fn json_write_derives_file_completion_suffix_from_output_destination() {
     let (logger, state) = logger_with_warning_sink();
