@@ -99,7 +99,11 @@ struct PageLabelOptions {
 
 impl PageLabelOptions {
     fn is_active(&self) -> bool {
-        self.remove || self.set.is_some()
+        // qpdf guards the label-tree rebuild on a non-empty spec vector
+        // (`if (!m->page_label_specs.empty())`, `libqpdf/QPDFJob.cc:2199`), so
+        // `--set-page-labels --` with no specs leaves `/PageLabels` untouched
+        // rather than installing `<< /Nums [] >>`.
+        self.remove || self.set.as_ref().is_some_and(|specs| !specs.is_empty())
     }
 }
 

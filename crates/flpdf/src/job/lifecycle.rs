@@ -1169,8 +1169,12 @@ fn parse_page_label_spec(spec: &[u8]) -> Result<PageLabelSpec> {
     };
     let start = match parts.next() {
         None | Some(b"") => 1,
-        Some(value) => parse_decimal_bytes(value)
-            .ok_or_else(|| Error::Usage(UsageError::new("starting page number must be >= 1")))?,
+        // qpdf's `start` group is `(\d+)?` inside the spec regex
+        // (`libqpdf/QPDFJob_config.cc:1101-1108`), so a non-numeric start makes
+        // the whole spec fail to match and produces the spec error. Only a
+        // parsed value below 1 reaches `usage("starting page number must be >=
+        // 1")` (`:1141-1144`).
+        Some(value) => parse_decimal_bytes(value).ok_or_else(page_label_spec_error)?,
     };
     if start < 1 {
         return Err(Error::Usage(UsageError::new(
@@ -1205,19 +1209,28 @@ fn parse_job_page_labels(
         };
         if entries.is_empty() {
             if first_page != 1 {
-                return Err(Error::Usage(UsageError::new(
-                    "the first page label specification must start with page 1",
-                )));
+                // qpdf raises these three with `throw std::runtime_error(...)`
+                // (`libqpdf/QPDFJob.cc:2206,2211,2215`), not `QPDFUsage`. Its CLI
+                // catches the two separately (`qpdf/qpdf.cc:37-41`): a usage error
+                // goes through `usageExit` and prints the banner, while a plain
+                // exception prints only `qpdf: <what()>`. Keeping these as usage
+                // errors adds a 9-line banner qpdf never emits here.
+                return Err(Error::SystemBytes(
+                    b"the first page label specification must start with page 1".to_vec(),
+                ));
             }
         } else if first_page <= last_page {
-            return Err(Error::Usage(UsageError::new(
-                "page label specifications must be in order by first page",
-            )));
+            return Err(Error::SystemBytes(
+                b"page label specifications must be in order by first page".to_vec(),
+            ));
         }
         if first_page < 1 || first_page > page_count {
-            return Err(Error::Usage(UsageError::new(format!(
-                "page label spec: page {first_page} is more than the total number of pages ({page_count})"
-            ))));
+            return Err(Error::SystemBytes(
+                format!(
+                    "page label spec: page {first_page} is more than the total number of pages ({page_count})"
+                )
+                .into_bytes(),
+            ));
         }
         entries.push((first_page - 1, spec.clone()));
         last_page = first_page;
@@ -3560,6 +3573,13 @@ impl QPDFJob {
         let Some(specs) = configuration.set_page_labels.as_deref() else {
             return Ok(());
         };
+        // qpdf guards the whole rebuild on a non-empty spec vector
+        // (`if (!m->page_label_specs.empty())`, `libqpdf/QPDFJob.cc:2199`), so
+        // an empty set leaves `/PageLabels` as it is instead of installing
+        // `<< /Nums [] >>`.
+        if specs.is_empty() {
+            return Ok(());
+        }
         let Some(root_ref) = pdf.root_ref() else {
             return Ok(());
         };

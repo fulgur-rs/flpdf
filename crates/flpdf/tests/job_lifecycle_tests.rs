@@ -309,6 +309,89 @@ fn argv_page_label_option_table_accepts_specs_until_its_terminator() {
 }
 
 #[test]
+fn page_label_order_errors_are_not_usage_errors() {
+    // qpdf raises the three order/page-count failures with
+    // `throw std::runtime_error(...)` (`libqpdf/QPDFJob.cc:2206,2211,2215`),
+    // not `QPDFUsage`. Its CLI catches the two separately
+    // (`qpdf/qpdf.cc:37-41`), so only a real usage error prints the banner.
+    // Keeping these as usage errors adds nine lines qpdf never emits.
+    let path =
+        Path::new(env!("CARGO_MANIFEST_DIR")).join("../../tests/fixtures/compat/three-page.pdf");
+    for (specs, expected) in [
+        (
+            vec!["2:D"],
+            "the first page label specification must start with page 1",
+        ),
+        (
+            vec!["1:D", "1:R"],
+            "page label specifications must be in order by first page",
+        ),
+        (
+            vec!["1:D", "9:D"],
+            "page label spec: page 9 is more than the total number of pages (3)",
+        ),
+    ] {
+        let (logger, errors) = logger_with_error_sink();
+        logger.set_info(Some(logger.discard()));
+        logger.set_warn(Some(logger.discard()));
+        logger.set_save(Some(logger.discard()), false).unwrap();
+        let mut job = QPDFJob::new();
+        job.set_logger(logger);
+        job.initialize_from_json_partial(
+            &serde_json::json!({
+                "inputFile": path,
+                "outputFile": "-",
+                "setPageLabels": specs,
+            })
+            .to_string(),
+        )
+        .unwrap();
+        // `run()` reports the failure and turns it into an exit status
+        // (mirroring qpdf's CLI catch), so check what reached the error sink.
+        assert_eq!(job.run().unwrap(), JobExitCode::Error);
+        let reported = String::from_utf8_lossy(&errors.lock().unwrap().bytes).to_string();
+        assert!(
+            reported.contains(expected),
+            "expected qpdf's own wording, got: {reported}"
+        );
+        assert!(
+            !reported.contains("For help:"),
+            "qpdf raises this with a plain runtime error, so no usage banner: {reported}"
+        );
+    }
+}
+
+#[test]
+fn an_empty_page_label_spec_set_leaves_the_catalog_alone() {
+    // qpdf guards the rebuild on a non-empty vector
+    // (`if (!m->page_label_specs.empty())`, `libqpdf/QPDFJob.cc:2199`), so
+    // `--set-page-labels --` with no specs must not install `<< /Nums [] >>`.
+    let path =
+        Path::new(env!("CARGO_MANIFEST_DIR")).join("../../tests/fixtures/compat/three-page.pdf");
+    let tempdir = tempfile::tempdir().unwrap();
+    let output = tempdir.path().join("out.pdf");
+    let mut job = QPDFJob::new();
+    job.initialize_from_json_partial(
+        &serde_json::json!({
+            "inputFile": path,
+            "outputFile": output,
+            "staticId": "",
+            "setPageLabels": Vec::<String>::new(),
+        })
+        .to_string(),
+    )
+    .unwrap();
+    job.run()
+        .expect("an empty spec set is a no-op, not an error");
+
+    let written = std::fs::read(&output).unwrap();
+    assert!(
+        !String::from_utf8_lossy(&written).contains("/PageLabels"),
+        "an empty spec set must leave the catalog untouched"
+    );
+}
+
+#[test]
 fn argv_page_label_config_rejects_invalid_specs_at_initialization() {
     let mut job = QPDFJob::new();
     let error = job
