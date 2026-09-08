@@ -1206,7 +1206,14 @@ qpdf の password-error catch は `createQPDF` から `return nullptr` するた
 
 attachment 系フラグ（`--list-attachments` / `--show-attachment` /
 `--remove-attachment` / `--add-attachment` / `--copy-attachments-from`）との
-併用は qpdf が受理するが flpdf はまだ拒否しており、`flpdf-wz4i` で追跡する。
+併用は `flpdf-wz4i` で受理するようにした。qpdf 側に禁止分岐が無い
+（`QPDFJob_config.cc:443-447` は自分のメンバーしか触らず、`checkConfiguration`
+（`QPDFJob.cc:566-641`）に両フラグを見る分岐が無い）ためで、attachment phase は
+image phase と同じ `handleTransformations` 内で後に走る（`:2151-2177` →
+`:2230-2247`）。`--show-attachment` は qpdf 同様、引数確定の時点で標準出力を
+save pipeline として予約する（`QPDFJob.cc:621-625`）——これにより
+`setSave` が info を標準エラーへ移し（`QPDFLogger.cc:197-200`）、verbose の
+image 診断が payload と混ざらない。
 
 top-level `--flatten-annotations=all|screen|print` も `auto_job_init.hh:117` / `QPDFJob_config.cc:190-200` の choices を `flpdf-cli` の shared `run_rewrite` route に接続し、通常 rewrite と linearize rewrite の両方で `PageDocumentHelper::flatten_annotations` (`QPDFPageDocumentHelper.cc:55-77`) を実行する。`NeedAppearances` 時の `warnIfPossible` と stream filter warning の parsed-offset/suppression 境界も qpdf の warning/status contract に合わせる。
 
