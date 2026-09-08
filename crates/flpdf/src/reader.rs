@@ -8,8 +8,7 @@ use crate::encryption::permissions::Permissions;
 use crate::encryption::standard::ObjectKeyAlg;
 use crate::encryption::CopyEncryptionSource;
 use crate::error::EncryptedError;
-use crate::object_handle::{DocumentResolver, ObjectValue};
-use crate::reader::resolver::ResolverHandle;
+use crate::object_handle::DocumentResolver;
 use crate::{Diagnostics, Error, ObjectHandle, ObjectRef, QpdfExc, Result, XrefEntry, XrefForm};
 use std::any::Any;
 use std::cell::RefCell;
@@ -1580,17 +1579,18 @@ impl<R: Read + Seek> Pdf<R> {
         Ok(())
     }
 
-    /// Promote xref-stream objects parsed from the source `/Prev` chain into
-    /// the canonical resolver cache. qpdf reads each xref stream before it
-    /// merges the next xref section (`QPDF.cc:626-710`, `:1640-1716`), so a
+    /// Record xref-stream objects parsed from the source `/Prev` chain for
+    /// canonical enumeration. qpdf reads each xref stream before it merges
+    /// the next xref section (`QPDF.cc:626-710`, `:1640-1716`), so a
     /// superseded or freed xref-stream object remains observable through
-    /// `m->obj_cache` even when it has no effective xref row. Rebind the
-    /// bootstrap handles into this document's resolver before registering them.
+    /// `m->obj_cache` even when it has no effective xref row. The canonical
+    /// xref loader already reads these handles through this resolver, so this
+    /// handoff must not build a second object graph by rebinding their values.
     pub(crate) fn install_parsed_xref_stream_handles(
         &mut self,
         parsed_xref_streams: BTreeMap<ObjectRef, ObjectHandle>,
     ) -> Result<()> {
-        for (object_ref, source) in parsed_xref_streams {
+        for (object_ref, _source) in parsed_xref_streams {
             if object_ref.number == 0
                 || object_ref.generation == u16::MAX
                 || self.resolver.xref_entry(object_ref).is_some()
@@ -1598,11 +1598,10 @@ impl<R: Read + Seek> Pdf<R> {
                 continue;
             }
             let handle = self.get_object_handle(object_ref);
-            if !handle.is_resolved()
-                || matches!(self.cache.entry(object_ref), Some(CacheEntry::Missing))
-            {
-                let value = rebind_handle_value(&self.resolver, &source)?;
-                handle.set_resolved(value);
+            if !handle.is_resolved() {
+                return Err(Error::Internal(format!(
+                    "canonical xref-stream handle {object_ref} was not resolved"
+                )));
             }
             self.qpdf_parsed_xref_stream_refs.insert(object_ref);
         }
@@ -1754,63 +1753,6 @@ impl<R: Read + Seek> Pdf<R> {
             });
         self.legacy_resolution_state_synced = true;
     }
-}
-
-pub(crate) fn rebind_handle_value<R: Read + Seek + 'static>(
-    resolver: &ResolverHandle<R>,
-    source: &ObjectHandle,
-) -> Result<ObjectValue> {
-    // cov:ignore-start: the bootstrap xref loader passes the direct trailer
-    // value by construction; an indirect handle here is an internal invariant
-    // violation rather than a reachable PDF input shape.
-    if let Some(object_ref) = source.object_ref() {
-        return Err(Error::Internal(format!(
-            "expected a direct bootstrap value, got {object_ref}"
-        )));
-    }
-    // cov:ignore-end
-    source.try_dereference()?;
-    let value = source
-        .with_value(|value| value.cloned())
-        .ok_or_else(|| Error::Internal("bootstrap handle has no value".to_owned()))?;
-    match value {
-        ObjectValue::Array(children) => Ok(ObjectValue::Array(
-            children
-                .iter()
-                .map(|child| rebind_handle(resolver, child))
-                .collect::<Result<Vec<_>>>()?,
-        )),
-        ObjectValue::Dictionary(entries) => Ok(ObjectValue::Dictionary(
-            entries
-                .into_iter()
-                .map(|(key, child)| Ok((key, rebind_handle(resolver, &child)?)))
-                .collect::<Result<BTreeMap<_, _>>>()?,
-        )),
-        ObjectValue::Stream {
-            stream_dict,
-            stream_data,
-            stream_provider,
-            filter_on_write,
-            stream_length,
-        } => Ok(ObjectValue::Stream {
-            stream_dict: rebind_handle(resolver, &stream_dict)?,
-            stream_data,
-            stream_provider,
-            filter_on_write,
-            stream_length,
-        }),
-        other => Ok(other),
-    }
-}
-
-fn rebind_handle<R: Read + Seek + 'static>(
-    resolver: &ResolverHandle<R>,
-    source: &ObjectHandle,
-) -> Result<ObjectHandle> {
-    if let Some(object_ref) = source.object_ref() {
-        return Ok(resolver.get_object_handle(object_ref));
-    }
-    Ok(resolver.direct_object_handle(rebind_handle_value(resolver, source)?))
 }
 
 #[cfg(test)]
@@ -2023,6 +1965,7 @@ mod encryption_state_commit_tests {
 #[cfg(test)]
 mod compressible_owner_tests {
     use super::*;
+    use crate::reader::resolver::ResolverHandle;
     use std::cell::Cell;
     use std::io::Cursor;
 
@@ -2031,6 +1974,18 @@ mod compressible_owner_tests {
             include_bytes!("../../../tests/fixtures/compat/one-page-no-ext.pdf").to_vec(),
         ))
         .unwrap()
+    }
+
+    #[test]
+    fn parsed_xref_stream_handoff_rejects_an_unresolved_canonical_slot() {
+        let mut pdf = pdf();
+        let object_ref = ObjectRef::new(99, 0);
+        let source = ObjectHandle::new_indirect_unresolved(object_ref, -1);
+        let error = pdf
+            .install_parsed_xref_stream_handles(BTreeMap::from([(object_ref, source)]))
+            .expect_err("canonical xref-stream provenance must already be resolved");
+
+        assert!(matches!(error, Error::Internal(message) if message.contains("99 0")));
     }
 
     #[test]

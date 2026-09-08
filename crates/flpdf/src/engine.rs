@@ -276,9 +276,8 @@ impl<R: Read + Seek> Pdf<R> {
         };
         // The production xref loader was given this resolver as its canonical
         // owner, so xref-stream handles and all metadata they resolve are
-        // already in the live cache. The owner-less loader still returns the
-        // temporary bootstrap handoff for its standalone API/tests.
-        let bootstrap_cache = loaded_state.bootstrap_cache;
+        // already in the live cache. The owner-less loader keeps its
+        // temporary bootstrap handoff only for its standalone API/tests.
         let parsed_xref_streams = loaded_state.parsed_xref_streams;
         let trailer_references = loaded_state.trailer_references;
         let header_offset = loaded_state.header_offset;
@@ -295,8 +294,8 @@ impl<R: Read + Seek> Pdf<R> {
         // QPDF's parser registers indirect references while reading every
         // trailer, including historical /Prev sections (QPDFParser.cc:168-175).
         // Canonical xref loading has already minted those handles in this
-        // resolver; retain this idempotent registration for owner-less state
-        // handoffs and trailer references collected during recovery.
+        // resolver; retain this idempotent registration for trailer
+        // references collected during recovery.
         for object_ref in trailer_references {
             if object_ref.number != 0 && object_ref.generation != u16::MAX {
                 resolver.get_object_handle(object_ref);
@@ -306,18 +305,7 @@ impl<R: Read + Seek> Pdf<R> {
         // position before initializeEncryption runs (QPDF.cc:1313-1327).
         resolver.set_last_offset(loaded.startxref);
         resolver.replay_warnings(&initial_diagnostics)?;
-        let trailer = if loaded
-            .trailer
-            .owning_pdf_unique_id()
-            .is_some_and(|owner| owner == unique_id)
-        {
-            loaded.trailer
-        } else {
-            resolver.direct_object_handle(crate::reader::rebind_handle_value(
-                &resolver,
-                &loaded.trailer,
-            )?) // cov:ignore: owner-less standalone xref loading may still return a foreign trailer
-        };
+        let trailer = loaded.trailer;
         // `Pdf::encryption` is the same `Rc<RefCell<..>>` allocation as
         // `ResolverCore::encryption_parameters` (qpdf's `m->encp`), not a
         // separate copy kept in sync.
@@ -352,7 +340,6 @@ impl<R: Read + Seek> Pdf<R> {
             encryption_inspection: Rc::new(RefCell::new(None)),
         };
         pdf.install_parsed_xref_stream_handles(parsed_xref_streams)?;
-        drop(bootstrap_cache);
         if let Err(error) = pdf.initialize_encryption_inspection() {
             // Same diagnostic-wrapping boundary as the authentication
             // failure below: xref recovery may have already recorded repair
