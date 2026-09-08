@@ -241,10 +241,7 @@ pub use writer::{
     write_stream_to_buf, CompressStreams, DecodeLevel, NewlineBeforeEndstream, ObjectStreamMode,
     PdfWriter, StreamDataMode, WriterConfiguration,
 };
-pub use xref::{
-    load_xref_and_trailer, load_xref_and_trailer_best_effort, load_xref_and_trailer_with_repair,
-    LoadedXref, XrefForm,
-};
+pub use xref::XrefForm;
 pub use xref_entry::XrefEntry;
 
 /// Crate version, mirroring `Cargo.toml`'s `[package].version`.

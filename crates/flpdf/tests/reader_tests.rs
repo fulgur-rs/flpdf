@@ -5,8 +5,8 @@ use cbc::Encryptor;
 use flate2::write::ZlibEncoder;
 use flate2::Compression;
 use flpdf::{
-    load_xref_and_trailer, DecodeLevel, EncryptMethod, EncryptParams, EncryptedError, Error,
-    ObjectHandle, ObjectRef, Pdf, PdfOpenOptions, PdfWriter, XrefEntry,
+    DecodeLevel, EncryptMethod, EncryptParams, EncryptedError, Error, ObjectHandle, ObjectRef, Pdf,
+    PdfOpenOptions, PdfWriter, XrefEntry,
 };
 use md5::{Digest, Md5};
 use std::fs::File;
@@ -673,22 +673,6 @@ fn resolve_decrypts_encrypted_strings_after_authentication() {
 #[test]
 fn resolve_decrypts_object_stream_before_filter_decode() {
     let bytes = writer_generated_rc4_reader_fixture(true);
-    let mut xref_reader = std::io::Cursor::new(bytes.clone());
-    let xref = load_xref_and_trailer(&mut xref_reader).expect("load generated xref stream");
-    let info_ref = xref
-        .trailer
-        .try_get_key(b"/Info")
-        .expect("read writer fixture /Info")
-        .object_ref()
-        .expect("writer fixture has /Info");
-    assert!(
-        matches!(
-            xref.entries.get(&info_ref),
-            Some(XrefEntry::Compressed { .. })
-        ),
-        "/Info must be a compressed object-stream member"
-    );
-
     let mut pdf = Pdf::open_with_options(
         std::io::Cursor::new(bytes),
         PdfOpenOptions {
@@ -697,6 +681,17 @@ fn resolve_decrypts_object_stream_before_filter_decode() {
         },
     )
     .unwrap();
+    let info_ref = pdf
+        .trailer()
+        .try_get_key(b"/Info")
+        .expect("read writer fixture /Info")
+        .object_ref()
+        .expect("writer fixture has /Info");
+    let xref = pdf.get_xref_table();
+    assert!(
+        matches!(xref.get(&info_ref), Some(XrefEntry::Compressed { .. })),
+        "/Info must be a compressed object-stream member"
+    );
 
     let info = resolved_handle(&mut pdf, info_ref);
     assert_eq!(

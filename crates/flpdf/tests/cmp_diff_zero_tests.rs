@@ -26,7 +26,7 @@ mod common;
 use common::PdfCanonicalTestExt;
 
 use common::{write_with_settings, WriterTestSettings};
-use flpdf::{load_xref_and_trailer, ObjectRef, ObjectStreamMode, Pdf, StreamDataMode, XrefEntry};
+use flpdf::{ObjectRef, ObjectStreamMode, Pdf, StreamDataMode, XrefEntry};
 use std::io::Cursor;
 use std::path::Path;
 
@@ -256,16 +256,17 @@ fn preserve_nonmonotonic_source_indices_match_qpdf_source_number_order() {
         .join("../../tests/fixtures/compat")
         .join(fixture);
     let source = std::fs::read(path).unwrap();
-    let source_xref = load_xref_and_trailer(&mut Cursor::new(&source)).unwrap();
+    let source_pdf = Pdf::open(Cursor::new(source)).unwrap();
+    let source_xref = source_pdf.get_xref_table();
     assert_eq!(
-        source_xref.entries.get(&ObjectRef::new(3, 0)),
+        source_xref.get(&ObjectRef::new(3, 0)),
         Some(&XrefEntry::Compressed {
             stream: 4,
             index: 0,
         })
     );
     assert_eq!(
-        source_xref.entries.get(&ObjectRef::new(2, 0)),
+        source_xref.get(&ObjectRef::new(2, 0)),
         Some(&XrefEntry::Compressed {
             stream: 4,
             index: 1,
@@ -275,16 +276,17 @@ fn preserve_nonmonotonic_source_indices_match_qpdf_source_number_order() {
     let actual = rewrite_qpdf_equivalent_mode(fixture, ObjectStreamMode::Preserve);
     assert_cmp_diff_zero_named(&actual, "nonmonotonic-objstm-index", "preserve.pdf");
 
-    let output_xref = load_xref_and_trailer(&mut Cursor::new(&actual)).unwrap();
+    let output_pdf = Pdf::open(Cursor::new(actual.clone())).unwrap();
+    let output_xref = output_pdf.get_xref_table();
     assert_eq!(
-        output_xref.entries.get(&ObjectRef::new(3, 0)),
+        output_xref.get(&ObjectRef::new(3, 0)),
         Some(&XrefEntry::Compressed {
             stream: 2,
             index: 0,
         })
     );
     assert_eq!(
-        output_xref.entries.get(&ObjectRef::new(4, 0)),
+        output_xref.get(&ObjectRef::new(4, 0)),
         Some(&XrefEntry::Compressed {
             stream: 2,
             index: 1,
