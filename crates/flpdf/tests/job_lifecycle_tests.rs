@@ -361,6 +361,66 @@ fn page_label_order_errors_are_not_usage_errors() {
     }
 }
 
+fn page_label_fixture(root_body: Option<&str>) -> Vec<u8> {
+    let mut bytes = b"%PDF-1.4\n".to_vec();
+    let mut offsets = Vec::new();
+    let root = root_body.unwrap_or("<< /Type /Catalog /Pages 2 0 R >>");
+    for object in [
+        format!("1 0 obj\n{root}\nendobj\n"),
+        "2 0 obj\n<< /Type /Pages /Kids [3 0 R] /Count 1 >>\nendobj\n".to_string(),
+        "3 0 obj\n<< /Type /Page /Parent 2 0 R /MediaBox [0 0 612 792] >>\nendobj\n".to_string(),
+    ] {
+        offsets.push(bytes.len());
+        bytes.extend_from_slice(object.as_bytes());
+    }
+    let xref = bytes.len();
+    bytes.extend_from_slice(format!("xref\n0 {}\n", offsets.len() + 1).as_bytes());
+    bytes.extend_from_slice(b"0000000000 65535 f \n");
+    for offset in &offsets {
+        bytes.extend_from_slice(format!("{offset:010} 00000 n \n").as_bytes());
+    }
+    bytes.extend_from_slice(
+        format!(
+            "trailer\n<< /Size {} /Root 1 0 R >>\nstartxref\n{xref}\n%%EOF\n",
+            offsets.len() + 1
+        )
+        .as_bytes(),
+    );
+    bytes
+}
+
+#[test]
+fn page_labels_skip_a_catalog_that_is_not_a_dictionary() {
+    // qpdf reaches `pdf.getRoot().replaceKey("/PageLabels", ...)`
+    // (`libqpdf/QPDFJob.cc:2228`) only through a real Catalog; a `/Root` that
+    // resolves to a non-dictionary leaves the label tree alone rather than
+    // failing the job.
+    let tempdir = tempfile::tempdir().unwrap();
+    let input = tempdir.path().join("non-dict-root.pdf");
+    let output = tempdir.path().join("out.pdf");
+    std::fs::write(&input, page_label_fixture(Some("42"))).unwrap();
+
+    let mut job = QPDFJob::new();
+    job.initialize_from_json_partial(
+        &serde_json::json!({
+            "inputFile": input,
+            "outputFile": output,
+            "staticId": "",
+            "setPageLabels": ["1:D"],
+        })
+        .to_string(),
+    )
+    .unwrap();
+    let _ = job.run();
+
+    if let Ok(written) = std::fs::read(&output) {
+        assert!(
+            !String::from_utf8_lossy(&written).contains("/PageLabels"),
+            "a non-dictionary catalog must not receive a label tree"
+        );
+    }
+}
+
 #[test]
 fn an_empty_page_label_spec_set_leaves_the_catalog_alone() {
     // qpdf guards the rebuild on a non-empty vector
