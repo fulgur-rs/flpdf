@@ -236,6 +236,7 @@ struct JobConfiguration {
     linearize_pass1: Option<PathBuf>,
     allow_weak_crypto: bool,
     page_specs: Vec<JobPageConfig>,
+    page_specs_origin: PageSpecsOrigin,
     collate: Option<Vec<usize>>,
     overlays: Vec<JobOverlayConfig>,
     underlays: Vec<JobOverlayConfig>,
@@ -269,6 +270,18 @@ struct JobConfiguration {
     show_attachment: Option<Vec<u8>>,
 }
 
+/// qpdf opens one `Config::pages()` group and then permits multiple
+/// `pageSpec()` calls inside that group. JSON and the fluent Config surface
+/// must therefore share one origin marker rather than using the page-spec
+/// vector's non-empty state as a proxy (`QPDFJob_config.cc:945-969`).
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+enum PageSpecsOrigin {
+    #[default]
+    None,
+    Config,
+    Json,
+}
+
 /// One qpdf `--set-page-labels` specification after the argv/Config parser has
 /// validated its grammar. Relative first-page values retain qpdf's signed
 /// representation (`rN` becomes `-N`, `z` becomes `-1`) until the document
@@ -292,7 +305,10 @@ enum JobObjectSelector {
 #[derive(Debug, Clone)]
 struct JobPageConfig {
     path: PathBuf,
-    password: Vec<u8>,
+    /// `None` is qpdf's null `PageSpec::password`; `Some(Vec::new())` is an
+    /// explicitly supplied empty password. The distinction controls the
+    /// `--encryption-file-password` fallback in `prepare_document`.
+    password: Option<Vec<u8>>,
     range: PageRange,
 }
 
@@ -2033,9 +2049,17 @@ impl QPDFJob {
         // configuration mutation so a schema failure cannot leave a partially
         // initialized job behind.
         validate_job_json_schema(&value)?;
+        // qpdf's initializeFromJson configures the existing QPDFJob rather
+        // than replacing its page group (`QPDFJob_json.cc:611-625`). Preserve
+        // only that page-group state here: this lifecycle entry point has
+        // historically reinitialized the remaining job settings for a new
+        // JSON document, and the one-time page guard does not require a wider
+        // input/output-state migration.
         let mut configuration = JobConfiguration {
             require_output: true,
             json_decode_level: crate::writer::DecodeLevel::Generalized,
+            page_specs: self.configuration.page_specs.clone(),
+            page_specs_origin: self.configuration.page_specs_origin,
             ..JobConfiguration::default()
         };
         self.dispatch_job_json_document(&mut configuration, &value, &mut BTreeSet::new())?;
@@ -2548,7 +2572,7 @@ impl QPDFJob {
         }
 
         if let Some(value) = members.get(b"pages".as_slice()) {
-            if !configuration.page_specs.is_empty() {
+            if configuration.page_specs_origin != PageSpecsOrigin::None {
                 return Err(Error::Usage(UsageError::new(
                     "--pages may only be specified one time",
                 )));
@@ -2559,6 +2583,7 @@ impl QPDFJob {
                     "--pages: no page specifications given",
                 )));
             }
+            configuration.page_specs_origin = PageSpecsOrigin::Json;
             for (index, item) in items.into_iter().enumerate() {
                 let item_members = job_json_members(&item);
                 let file = job_json_string(&item_members, b"file")?.ok_or_else(|| {
@@ -2570,7 +2595,7 @@ impl QPDFJob {
                 )?; // cov:ignore: llvm-cov attributes this successful page range conversion to the opening call lines
                 configuration.page_specs.push(JobPageConfig {
                     path: path_from_qpdf_json_bytes(&file),
-                    password: job_json_string(&item_members, b"password")?.unwrap_or_default(),
+                    password: job_json_string(&item_members, b"password")?,
                     range,
                 }); // cov:ignore: llvm-cov attributes this successful page configuration to its field expressions
             }
@@ -2837,7 +2862,7 @@ impl QPDFJob {
 
         let mut page_sources = vec![primary];
         let mut source_paths: Vec<PathBuf> = Vec::new();
-        let mut source_passwords: Vec<Vec<u8>> = Vec::new();
+        let mut source_passwords: Vec<Option<Vec<u8>>> = Vec::new();
         let mut specs = Vec::with_capacity(configuration.page_specs.len());
         for page in &configuration.page_specs {
             let source_index = if page.path == Path::new(".")
@@ -2848,7 +2873,16 @@ impl QPDFJob {
                 index + 1
             } else {
                 source_paths.push(page.path.clone());
-                source_passwords.push(page.password.clone());
+                let password = page.password.clone().or_else(|| {
+                    // qpdf substitutes the encryption-file password only for
+                    // a null page-spec password and an exact filename match
+                    // (`QPDFJob.cc:2396-2410`). An explicit empty page
+                    // password remains `Some(Vec::new())` and must bypass the
+                    // fallback.
+                    (configuration.copy_encryption.as_deref() == Some(page.path.as_path()))
+                        .then(|| configuration.encryption_file_password.clone())
+                });
+                source_passwords.push(password);
                 source_paths.len()
             };
             specs.push(PageSpecInput::new(source_index, page.range.clone()));
@@ -2857,7 +2891,7 @@ impl QPDFJob {
         self.report_page_spec_selection(&specs)?;
         for (path, password) in source_paths.iter().zip(source_passwords.iter()) {
             self.report_page_source_processing(path_description_bytes(path))?;
-            let source = self.open_job_source(path, password)?;
+            let source = self.open_job_source(path, password.as_deref().unwrap_or_default())?;
             self.record_document_warnings(&source);
             if !keep_files_open {
                 // qpdf calls ClosedFileInputSource::stayOpen(false)
@@ -4681,13 +4715,15 @@ impl QPDFJobConfig<'_> {
     /// Queue one `--pages` file specification for
     /// `QPDFJob::PagesConfig::pageSpec` (`QPDFJob_config.cc:963-969`), which
     /// `QPDFJob::handlePageSpecs` later consumes (`QPDFJob.cc:2359-2440`).
+    /// Multiple calls remain in the same Config pages group; a JSON pages
+    /// group cannot be added before or after them, matching qpdf's
+    /// `Config::pages()` one-time guard (`QPDFJob_config.cc:945-961`).
     ///
-    /// `range` uses flpdf's [`PageRange`] grammar. That grammar is a subset of
-    /// qpdf's `QUtil::parse_numrange` (`QUtil.cc:1304`): it accepts `z`,
-    /// `r<n>`, `:odd`/`:even` and comma-separated entries, but not qpdf's `x`
-    /// exclusion group. An empty string selects every page, matching qpdf's
-    /// `1-z` default (`QPDFJob.cc:2364-2372`). `password` is the source's own
-    /// password; pass an empty slice when the file is not encrypted.
+    /// `range` uses [`PageRange`]'s qpdf `QUtil::parse_numrange` grammar,
+    /// including `x` exclusion groups. An empty string selects every page,
+    /// matching qpdf's `1-z` default (`QPDFJob.cc:2364-2372`). `password` is
+    /// optional so the qpdf null-password state remains distinct from an
+    /// explicitly supplied empty password.
     ///
     /// # Errors
     ///
@@ -4697,13 +4733,19 @@ impl QPDFJobConfig<'_> {
         &mut self,
         file: impl Into<PathBuf>,
         range: &str,
-        password: impl Into<Vec<u8>>,
+        password: Option<Vec<u8>>,
     ) -> Result<&mut Self> {
+        if self.job.configuration.page_specs_origin == PageSpecsOrigin::Json {
+            return Err(Error::Usage(UsageError::new(
+                "--pages may only be specified one time",
+            )));
+        }
         let range = PageRange::parse(range)
             .map_err(|error| Error::Usage(UsageError::new(error.to_string())))?;
+        self.job.configuration.page_specs_origin = PageSpecsOrigin::Config;
         self.job.configuration.page_specs.push(JobPageConfig {
             path: file.into(),
-            password: password.into(),
+            password,
             range,
         });
         Ok(self)

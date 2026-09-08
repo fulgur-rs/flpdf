@@ -698,6 +698,45 @@ fn pages_single_range_matches_qpdf_count() {
 }
 
 #[test]
+fn pages_exclusion_group_matches_qpdf() {
+    // qpdf's `1-3,x2` selects the preceding range except page 2. This also
+    // exercises the argv heuristic: the x-group must be recognized as a
+    // range, not treated as a filename.
+    if !qpdf_available() {
+        return;
+    }
+    let tmp = tempfile::tempdir().unwrap();
+    let src_file = distinct_pages_pdf(3);
+    let src = src_file.path();
+    let q = tmp.path().join("q.pdf");
+    let f = tmp.path().join("f.pdf");
+
+    let (ok, _) = run_qpdf(&[
+        src.to_str().unwrap(),
+        "--pages",
+        ".",
+        "1-3,x2",
+        "--",
+        q.to_str().unwrap(),
+    ]);
+    assert!(ok, "qpdf must accept an x exclusion group");
+    flpdf_ok(&[
+        src.to_str().unwrap(),
+        "--pages",
+        ".",
+        "1-3,x2",
+        "--",
+        f.to_str().unwrap(),
+    ]);
+
+    assert_eq!(media_boxes_of(&q), media_boxes_of(&f));
+    assert_eq!(
+        media_boxes_of(&f),
+        vec!["[ 0 0 100 200 ]".to_string(), "[ 0 0 300 200 ]".to_string(),]
+    );
+}
+
+#[test]
 fn pages_odd_parity_is_position_based_like_qpdf() {
     // Documented divergence #1 (EXPECTED, but qpdf-CORRECT): `:odd` selects by
     // POSITION within the resulting set, not by page number. qpdf 11.9.0:
