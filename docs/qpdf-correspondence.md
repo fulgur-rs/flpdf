@@ -1381,6 +1381,17 @@ remain after the resolving step as the qpdf `getDict` equivalent
 `Result` error propagation are unchanged. Remaining Job/CLI files are tracked
 as later bounded cohorts under `flpdf-3yn9.48.31`.
 
+The page-object-helper residual cohort `flpdf-3yn9.48.23.1` applies the same
+boundary to `PageObjectHelper`'s resource, annotation, rectangle, matrix, and
+inherited-attribute consumers. Its production route has zero explicit
+`Pdf::resolve`/`resolve_handle`/`resolve_handle_ref` or panic `get_key`/
+`has_key` callers. `try_as_*`/`try_is_null` are used for document-owned child
+handles; direct inline-image parser values and post-resolution numeric
+fallbacks retain their non-resolving inspection. The qpdf oracle is
+`libqpdf/QPDFObjectHandle.cc:240-446,965-989,2168-2189`, and the new error-path
+coverage verifies that an unowned indirect page handle propagates the resolver
+error instead of falling through to a fallback.
+
 `flpdf-5snx` では、qpdf の `dereference()` が未初期化 handleで falseを
 返すだけであること（`libqpdf/QPDFObjectHandle.cc:2376-2383`）に合わせ、
 `try_as_dictionary` / `try_as_name` は `Ok(None)`、`try_is_null` は

@@ -285,6 +285,28 @@ qpdfの `getDict`（`QPDFObjectHandle.cc:1257-1262`）に相当する
 `page_merge.rs`、`rotate.rs`、`page_split.rs`、`json_sections.rs`外のJSON/CLI
 caller等）は次の限定sliceで再計測する。
 
+### A6/A7/A8 page-object-helper residual cohort `flpdf-3yn9.48.23.1` (2026-09-08)
+
+The bounded non-qtest `crates/flpdf/src/page_object_helper.rs` cutover now has
+zero production occurrences of `.resolve(`, `resolve_handle`,
+`resolve_handle_ref`, `get_key`, or `has_key` (measured by a production-only
+source contract). Page/Form resource, annotation, rectangle, matrix, and
+inherited-attribute reads use the resolving `try_*` accessors; the resolver
+error path is covered by `page_helper_propagates_unowned_resolution_errors`.
+The remaining direct `as_*` observations in this file are limited to
+programmatically parsed inline-image values, newly constructed writer values,
+or numeric fallback after the handle has already been resolved; they are not
+caller-side resolution bridges. The qpdf order and error boundary remain
+anchored to `libqpdf/QPDFObjectHandle.cc:240-446,965-989,2168-2189`.
+
+Before this cohort, the route-caller audit measured global production residuals
+of `Pdf::resolve` 219, `Pdf::resolve_handle` 154, and
+`Pdf::resolve_handle_ref` 14; after it, 200, 145, and 14 respectively. Panic
+`get_key`/`has_key` residuals changed from 92/8 to 88/6. These are global
+residuals in later cohorts, qtest-tools, and other page/object files, not a
+claim that the parent `.48.23` route is complete. qtest exceptions remain
+outside this cohort.
+
 ## unknown / probe
 
 本領域は 24 行すべてを source と実行済み probe で分類できたため、`unknown` に落ちた行は無い。
