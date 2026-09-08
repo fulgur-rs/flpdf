@@ -414,6 +414,7 @@ enum XrefReadContextSpec<'a> {
 enum XrefObjectDescription {
     Ordinary,
     XrefStream,
+    ObjStmMember { object_ref: ObjectRef },
 }
 
 impl XrefObjectDescription {
@@ -421,6 +422,7 @@ impl XrefObjectDescription {
         match self {
             Self::Ordinary => "",
             Self::XrefStream => "xref stream: ",
+            Self::ObjStmMember { .. } => "",
         }
     }
 }
@@ -943,7 +945,7 @@ impl BootstrapHandleDocument {
             let member_data = decoded.get(diagnostic_start..).unwrap_or_default();
             let mut parser = BootstrapHandleParser {
                 document: self,
-                description: XrefObjectDescription::Ordinary,
+                description: XrefObjectDescription::ObjStmMember { object_ref },
             };
             let (value, parsed_offset, diagnostics) =
                 match parse_qpdf_direct_object_handle_with_diagnostics(
@@ -996,7 +998,7 @@ impl BootstrapHandleDocument {
                 member_handle.set_end_offsets(stream_end_before_space, stream_end_after_space);
                 if parsed_offset >= 0 && !member_handle.is_null() {
                     member_handle.set_description(
-                        self.object_stream_description_template(stream_number, object_ref),
+                        self.object_description_template(object_ref),
                         parsed_offset,
                     );
                 }
@@ -1005,20 +1007,12 @@ impl BootstrapHandleDocument {
         Ok(())
     }
 
-    fn object_stream_description_template(
-        &self,
-        stream_number: u32,
-        object_ref: ObjectRef,
-    ) -> Vec<u8> {
-        let mut description = self.options.description.clone();
-        description.extend_from_slice(
-            format!(
-                " object stream {stream_number}, object {} {} at offset $PO",
-                object_ref.number, object_ref.generation
-            )
-            .as_bytes(),
-        );
-        description
+    fn object_description_template(&self, object_ref: ObjectRef) -> Vec<u8> {
+        // qpdf's `readObjectInStream` passes only `object M 0` as the
+        // QPDFParser description. The `object stream N` context belongs to
+        // the decoded InputSource name, not to QPDFValue::Description
+        // (`QPDF.cc:1451-1459,1793-1805`).
+        format!("object {} {}", object_ref.number, object_ref.generation).into_bytes()
     }
 
     fn handle_integer(&self, dictionary: &ObjectHandle, key: &[u8], label: &str) -> Result<usize> {
@@ -1076,6 +1070,9 @@ impl HandleResolver for BootstrapHandleParser<'_> {
         Some(match self.description {
             XrefObjectDescription::Ordinary => b"object $OG".to_vec(),
             XrefObjectDescription::XrefStream => b"xref stream: object $OG".to_vec(),
+            XrefObjectDescription::ObjStmMember { object_ref } => {
+                self.document.object_description_template(object_ref)
+            }
         })
     }
 }
@@ -5165,10 +5162,7 @@ mod final_handle_tests {
             .expect("ObjStm members resolve through the bootstrap owner");
         let member = document.handle_for_reference(ObjectRef::new(2, 0));
         assert!(member.is_resolved());
-        assert!(member
-            .description()
-            .windows(b"object stream 4".len())
-            .any(|window| window == b"object stream 4"));
+        assert_eq!(member.description(), b"object 2 0");
         let child = member
             .try_get_key(b"/Child")
             .expect("member dictionary child");
@@ -5177,6 +5171,50 @@ mod final_handle_tests {
         let source_stream = document.handle_for_reference(ObjectRef::new(4, 0));
         assert!(source_stream.end_offsets().0 >= 0);
         assert_eq!(member.end_offsets(), source_stream.end_offsets());
+    }
+
+    #[test]
+    fn bootstrap_objstm_propagates_member_description_to_nested_direct_values() {
+        let member_ref = ObjectRef::new(7, 0);
+        let document = bootstrap_objstm_document(
+            1,
+            b"7 0 ",
+            b"<< /Nested [ (text) << /Leaf (text) >> ] >>",
+            BTreeMap::from([(
+                member_ref,
+                XrefEntry::Compressed {
+                    stream: 4,
+                    index: 0,
+                },
+            )]),
+        );
+
+        document
+            .resolve_objects_in_stream(4)
+            .expect("the ObjStm member resolves");
+        let member = document.handle_for_reference(member_ref);
+        let nested = member
+            .try_get_key(b"/Nested")
+            .expect("nested direct value is present");
+        let nested_string = nested
+            .try_get_array_item(0)
+            .expect("nested array item is present")
+            .try_get_int_value()
+            .expect_err("a nested string must use the member warning context");
+        let nested_dictionary = nested
+            .try_get_array_item(1)
+            .expect("nested dictionary item is present")
+            .try_get_key(b"/Leaf")
+            .expect("nested dictionary leaf is present")
+            .try_get_int_value()
+            .expect_err("a nested dictionary leaf must use the member context");
+        for error in [nested_string, nested_dictionary] {
+            let message = error.to_string();
+            assert!(
+                message.contains("object 7 0") && !message.contains("object stream 4"),
+                "nested warning lost the ObjStm member context: {message}"
+            );
+        }
     }
 
     fn bootstrap_objstm_document(

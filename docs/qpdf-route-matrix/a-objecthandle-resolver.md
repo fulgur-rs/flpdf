@@ -193,6 +193,13 @@ notes で個別に `prod: 0` と断る。`fuzz/` は別枠で数える（本領�
 | A23 | （qpdf に対応物なし。dictionary key は `/` 付き decoded name） | `libqpdf/QPDFParser.cc:464`, `libqpdf/QPDF_Name.cc:27-49`、stream-filter ownerは`libqpdf/SF_FlateLzwDecode.cc:22-73` / `libqpdf/QPDF_Stream.cc:33-50` | `crates/flpdf/src/object_handle.rs::legacy_dictionary_key` と `canonical_dictionary_key` | 実呼出 prod: 2 — parser.rs:631,738（いずれも完全修飾呼び出しで import 行は残らない）。writer/object.rsのname emissionは`.48.35`でcanonical keyを直接扱う経路へ移行し、stream_filter.rsのkey判定3 callerは`.48.36`で移行済み / test: 0 | bridge | `crates/flpdf/src/object_handle.rs::canonical_dictionary_key` | 旧 `Object` / `Dictionary` は削除済み。残るhelper責務はparser warningの1群のみ（writer name emissionは`.48.35`で外れた）。stream-filterはqpdf同様slash付きkey比較へcutover済みで、raw slashless keyは正規化せずunknownとして扱う。parser/writerの残callerが0になるまでhelper定義は残す。 |
 | A24 | `QPDF::resolveObjectsInStream`（`resolved_object_streams` で二重展開防止、xref 再チェックで上書き済みメンバーを cache しない） | `libqpdf/QPDF.cc:1756-1833` | canonical 側は `crates/flpdf/src/reader/resolver.rs::ResolverCore` の `resolved_object_streams`（`crates/flpdf/src/reader/resolver.rs:324-327`）。facade 側には `crates/flpdf/src/pdf.rs:136` の `compressed_member_parents` provenance map が残る | `compressed_member_parents` prod: 6 (3 files) / test: 4。A14 専用だった ObjStm 昇格 helper は `.46` で撤去 | mixed | `crates/flpdf/src/reader/resolver.rs::ResolverCore` | canonical 側の ObjStm 展開は qpdf に対応する一方、`compressed_member_parents` は legacy cache synchronization の移行状態を記録する flpdf 側 provenance で、qpdf の `ObjCache` には対応物がない。A2/A15 と同じ legacy cache 列を畳む段階まで保持する。 |
 
+2026-09-08（`flpdf-1f9f`）: owner-less bootstrap の ObjStm member parserも
+`libqpdf/QPDF.cc:1451-1459` の `object M 0` descriptionを使い、member本体と辞書・配列内の
+nested direct valueへ同じ contextを渡すようにした。`object stream N` は qpdfの decoded
+InputSource名に属するため、ObjectDescriptionへ混ぜない（`libqpdf/QPDF.cc:1793-1805`）。これは
+A24の cache/recheck 責務とは独立した description propagation の補正であり、canonical
+ResolverHandle側の object-stream routeや reconstruction-only bounded windowは変更しない。
+
 ### A6の追加確認: getParsedOffsetもlazy accessor
 
 `.40` の C8/C25 payload-helper cascade cleanupで、A7の旧
