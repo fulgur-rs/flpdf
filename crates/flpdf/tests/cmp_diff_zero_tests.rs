@@ -214,6 +214,227 @@ fn one_two_three_page_mode_matrix_is_byte_identical_to_qpdf() {
     }
 }
 
+/// A direct `/Root` survives when Preserve selects a cross-reference stream.
+///
+/// `canonical_trailer_entries` omits `/Root`, and the cross-reference stream
+/// serializer reads it only from the trailer plan, so the live route has to
+/// serialize an inline Catalog itself. Before this cutover the live route was
+/// always classic-table, where the trailer handle carried `/Root`; selecting a
+/// stream without wiring the direct Catalog drops it and makes the output
+/// unreadable.
+#[test]
+fn direct_root_survives_a_preserve_cross_reference_stream() {
+    let Some(oracle) = pinned_qpdf() else {
+        eprintln!("[SKIP cmp_diff_zero_tests] qpdf 11.9.0 is unavailable");
+        return;
+    };
+    let directory = tempfile::tempdir().expect("tempdir");
+    let input = directory.path().join("direct-root-objstm.pdf");
+    std::fs::write(&input, direct_root_object_stream_pdf()).expect("write fixture");
+    let expected_path = directory.path().join("qpdf.pdf");
+
+    let status = std::process::Command::new(oracle)
+        .args(["--deterministic-id", "--object-streams=preserve"])
+        .arg(&input)
+        .arg(&expected_path)
+        .status()
+        .expect("qpdf runs");
+    assert!(
+        status.success(),
+        "qpdf must rewrite the direct-root fixture"
+    );
+
+    let file = std::fs::File::open(&input).expect("open fixture");
+    let mut pdf = Pdf::open(std::io::BufReader::new(file)).expect("fixture parses");
+    let opts = WriterTestSettings {
+        object_streams: ObjectStreamMode::Preserve,
+        deterministic_id: true,
+        newline_before_endstream: flpdf::NewlineBeforeEndstream::Never,
+        ..WriterTestSettings::default()
+    };
+    let mut actual = Vec::new();
+    write_with_settings(&mut pdf, &mut actual, &opts).expect("rewrite succeeds");
+
+    let expected = std::fs::read(&expected_path).expect("qpdf output");
+    if let Some(off) = first_diff(&actual, &expected) {
+        panic!(
+            "direct-root Preserve output diverged from qpdf 11.9.0 \
+             (flpdf={} bytes, qpdf={} bytes, first diff at byte {off})",
+            actual.len(),
+            expected.len(),
+        );
+    }
+}
+
+/// A PDF whose trailer holds an inline Catalog and whose cross-reference stream
+/// marks one object as a member of a source object stream.
+fn direct_root_object_stream_pdf() -> Vec<u8> {
+    fn deflate(data: &[u8]) -> Vec<u8> {
+        use std::io::Write;
+        let mut encoder =
+            flate2::write::ZlibEncoder::new(Vec::new(), flate2::Compression::default());
+        encoder.write_all(data).expect("deflate write");
+        encoder.finish().expect("deflate finish")
+    }
+
+    let member = b"<< /Type /Metadata /Note (in-objstm) >>";
+    let first = b"5 0 ";
+    let mut objstm_data = first.to_vec();
+    objstm_data.extend_from_slice(member);
+    let mut out = b"%PDF-1.5\n%\xe2\xe3\xcf\xd3\n".to_vec();
+    let mut offsets = std::collections::BTreeMap::new();
+    let bodies: [(u32, Vec<u8>); 2] = [
+        (2, b"<< /Type /Pages /Kids [3 0 R] /Count 1 >>".to_vec()),
+        (
+            3,
+            b"<< /Type /Page /Parent 2 0 R /MediaBox [0 0 200 200] /Resources << >> /Meta 5 0 R >>"
+                .to_vec(),
+        ),
+    ];
+    for (number, body) in bodies {
+        offsets.insert(number, out.len());
+        out.extend_from_slice(format!("{number} 0 obj\n").as_bytes());
+        out.extend_from_slice(&body);
+        out.extend_from_slice(b"\nendobj\n");
+    }
+    offsets.insert(4, out.len());
+    out.extend_from_slice(
+        format!(
+            "4 0 obj\n<< /Type /ObjStm /N 1 /First {} /Length {} >>\nstream\n",
+            first.len(),
+            objstm_data.len()
+        )
+        .as_bytes(),
+    );
+    out.extend_from_slice(&objstm_data);
+    out.extend_from_slice(b"\nendstream\nendobj\n");
+
+    let xref_offset = out.len();
+    let mut rows: Vec<[u8; 7]> = Vec::new();
+    let row = |kind: u8, field2: u32, field3: u16| {
+        let mut entry = [0u8; 7];
+        entry[0] = kind;
+        entry[1..5].copy_from_slice(&field2.to_be_bytes());
+        entry[5..7].copy_from_slice(&field3.to_be_bytes());
+        entry
+    };
+    rows.push(row(0, 0, 65535));
+    rows.push(row(0, 0, 65535));
+    for number in [2u32, 3, 4] {
+        rows.push(row(1, offsets[&number] as u32, 0));
+    }
+    rows.push(row(2, 4, 0));
+    rows.push(row(1, xref_offset as u32, 0));
+    let table: Vec<u8> = rows.concat();
+    let compressed = deflate(&table);
+    out.extend_from_slice(
+        format!(
+            "6 0 obj\n<< /Type /XRef /Size 7 /W [1 4 2] \
+             /Root << /Type /Catalog /Pages 2 0 R >> /Filter /FlateDecode /Length {} >>\nstream\n",
+            compressed.len()
+        )
+        .as_bytes(),
+    );
+    out.extend_from_slice(&compressed);
+    out.extend_from_slice(b"\nendstream\nendobj\n");
+    out.extend_from_slice(format!("startxref\n{xref_offset}\n%%EOF\n").as_bytes());
+    out
+}
+
+/// `--preserve-unreferenced` with source object streams, compared against the
+/// pinned qpdf 11.9.0 binary rather than a committed golden.
+///
+/// This axis has no golden reference, and it is the axis this cutover actually
+/// changes: with `preserve_unreferenced` the planner skips its eligibility
+/// filter, so every source container survives into the live walk. Run the
+/// oracle at test time for the ObjStm fixtures instead of leaving the axis
+/// unpinned.
+#[test]
+fn preserve_unreferenced_with_source_object_streams_matches_qpdf_11_9() {
+    let Some(oracle) = pinned_qpdf() else {
+        eprintln!("[SKIP cmp_diff_zero_tests] qpdf 11.9.0 is unavailable");
+        return;
+    };
+    let directory = tempfile::tempdir().expect("tempdir");
+    for fixture in [
+        "null-visible-matrix-objstm.pdf",
+        "null-visible-preserve-empty-removed.pdf",
+        "null-visible-stale-generation-objstm.pdf",
+        "null-visible-preserve-signature.pdf",
+        "three-page-objstm.pdf",
+        "shared-stream-objstm.pdf",
+    ] {
+        let input = Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("../../tests/fixtures/compat")
+            .join(fixture);
+        let expected_path = directory.path().join(format!("{fixture}.qpdf"));
+        let status = std::process::Command::new(oracle)
+            .args([
+                "--deterministic-id",
+                "--object-streams=preserve",
+                "--preserve-unreferenced",
+            ])
+            .arg(&input)
+            .arg(&expected_path)
+            .status()
+            .expect("qpdf runs");
+        // Exit 3 is qpdf's "succeeded with warnings"; it still writes the file
+        // and is the expected status for the damaged fixtures here.
+        assert!(
+            matches!(status.code(), Some(0 | 3)),
+            "{fixture}: qpdf --preserve-unreferenced must produce output, got {:?}",
+            status.code()
+        );
+
+        let actual = rewrite_qpdf_equivalent_preserve_unreferenced(fixture);
+        let expected = std::fs::read(&expected_path).expect("qpdf output");
+        if let Some(off) = first_diff(&actual, &expected) {
+            panic!(
+                "{fixture}: --preserve-unreferenced output diverged from qpdf 11.9.0 \
+                 (flpdf={} bytes, qpdf={} bytes, first diff at byte {off})",
+                actual.len(),
+                expected.len(),
+            );
+        }
+    }
+}
+
+/// The pinned qpdf 11.9.0 oracle, or `None` when it is unavailable. Comparing
+/// against a different qpdf is not a parity result, so the version is checked.
+fn pinned_qpdf() -> Option<&'static str> {
+    let output = std::process::Command::new("qpdf").arg("--version").output();
+    output.ok().and_then(|output| {
+        String::from_utf8_lossy(&output.stdout)
+            .lines()
+            .next()
+            .is_some_and(|line| line == "qpdf version 11.9.0")
+            .then_some("qpdf")
+    })
+}
+
+fn rewrite_qpdf_equivalent_preserve_unreferenced(fixture: &str) -> Vec<u8> {
+    let path = Path::new(env!("CARGO_MANIFEST_DIR"))
+        .join("../../tests/fixtures/compat")
+        .join(fixture);
+    let file = std::fs::File::open(&path).unwrap_or_else(|e| panic!("open {path:?}: {e}"));
+    let mut pdf = Pdf::open(std::io::BufReader::new(file)).unwrap();
+
+    let opts = WriterTestSettings {
+        object_streams: ObjectStreamMode::Preserve,
+        // qpdf is invoked with `--deterministic-id`, whose content hash differs
+        // from `--static-id`'s fixed value; setting both here would pick the
+        // static one and diverge in the trailer `/ID` alone.
+        deterministic_id: true,
+        preserve_unreferenced_objects: true,
+        newline_before_endstream: flpdf::NewlineBeforeEndstream::Never,
+        ..WriterTestSettings::default()
+    };
+
+    let mut out = Vec::new();
+    write_with_settings(&mut pdf, &mut out, &opts).unwrap();
+    out
+}
+
 /// Preserve mode on a source with no object streams has nothing to preserve:
 /// `preserveObjectStreams` returns before it builds any mapping
 /// (`QPDFWriter.cc:1941-1945`), so the walk, the version floor and the
@@ -223,9 +444,10 @@ fn one_two_three_page_mode_matrix_is_byte_identical_to_qpdf() {
 /// This states the equivalence directly rather than leaving it implied by the
 /// two separate golden comparisons above. It does not, on its own, pin which
 /// internal route serves the case: both routes match the same golden bytes for
-/// these fixtures, so reverting the routing keeps this test green. Pinning the
-/// route needs a source that has a cross-reference stream but zero type-2
-/// entries, and `tests/fixtures/compat/` has none today (`flpdf-jvud`).
+/// these fixtures, so reverting the routing keeps this test green. The
+/// `--preserve-unreferenced` oracle comparison above does pin the routing --
+/// reverting it makes that test fail -- because that axis skips the planner's
+/// eligibility filter and reaches the live walk with every source container.
 #[test]
 fn preserve_with_no_source_object_streams_matches_disable_byte_for_byte() {
     for fixture in ["one-page", "two-page", "three-page"] {

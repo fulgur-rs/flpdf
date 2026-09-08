@@ -5,7 +5,7 @@ use crate::writer::plain::xref::{IdPlan, TrailerPlan};
 use crate::writer::ObjectWriterEmission;
 use crate::writer::WriterOptions;
 use crate::writer::WriterResult;
-use crate::{ObjectRef, ObjectStreamMode, Pdf, XrefForm};
+use crate::{CompressStreams, ObjectRef, ObjectStreamMode, Pdf, XrefForm};
 use std::collections::{BTreeMap, BTreeSet, HashMap};
 
 pub(crate) mod body;
@@ -18,31 +18,28 @@ pub(crate) fn write_plain<R: Read + Seek, W: Write>(
     options: &WriterOptions,
     generated_id: Option<&crate::ObjectHandle>,
 ) -> crate::Result<WriterResult> {
-    // The live Disable queue preserves the mutation/progress timing contract
-    // for the ordinary unnormalized route. QDF and page-content normalization
-    // need the planned writer's second dimension (QDF framing or normalized
-    // stream buffers), so they stay on the plan-based path whichever
-    // object-stream mode is selected.
+    // The live queue preserves the mutation/progress timing contract for the
+    // ordinary unnormalized route. QDF and page-content normalization need the
+    // planned writer's second dimension (QDF framing or normalized stream
+    // buffers), so both keep going through the plan-based path regardless of
+    // object-stream mode.
     //
-    // qpdf's `preserveObjectStreams` returns immediately when the source has
-    // no object streams (`QPDFWriter.cc:1941-1945`):
-    //
-    //     std::map<int, int> omap;
-    //     QPDF::Writer::getObjectStreamData(m->pdf, omap);
-    //     if (omap.empty()) {
-    //         return;
-    //     }
-    //
-    // `object_to_object_stream` then stays empty, so `enqueueObject` never
-    // takes its container branch (`:1097-1106`), no 1.5 floor is applied
-    // (`:2172-2173`), and the file gets a classic cross-reference table
-    // (`:3023-3025`) -- exactly the Disable shape. Route that case through the
-    // same live queue rather than the plan-based path, which exists to place
-    // the source-backed and generated object-stream containers this case does
-    // not have.
-    let is_live_disable_shaped = options.object_streams == ObjectStreamMode::Disable
-        || (options.object_streams == ObjectStreamMode::Preserve
-            && !plan::source_has_compressed_entries(pdf));
+    // qpdf's Preserve mode keeps whatever object streams the source already
+    // has. When there are none, `preserveObjectStreams` returns before it
+    // builds any mapping (`QPDFWriter.cc:1941-1945`), so
+    // `object_to_object_stream` stays empty and the walk is exactly Disable's.
+    // When there are some, `:1955-1966` fills that map and `enqueueObject`
+    // (`:1072-1141`) redirects a member's discovery to its container, numbering
+    // every member the instant the container is first queued
+    // (`assignCompressedObjectNumbers`, `:1057-1069`). Both are the same
+    // `enqueueObject`/`writeStandard` live walk, just with container-aware
+    // numbering in the second case, so Preserve routes through the live queue
+    // either way. Generate does not: it packs fresh containers the live walk
+    // cannot discover incrementally, so it keeps the plan-based path.
+    let is_live_disable_shaped = matches!(
+        options.object_streams,
+        ObjectStreamMode::Disable | ObjectStreamMode::Preserve
+    );
     if is_live_disable_shaped && !options.qdf && !options.content_normalization {
         return write_plain_live_disable(pdf, out, options, generated_id);
     }
@@ -63,7 +60,29 @@ fn write_plain_live_disable<R: Read + Seek, W: Write>(
     } else {
         None
     };
-    let removed_refs: BTreeSet<ObjectRef> = pdf.deleted_object_refs().into_iter().collect();
+    let mut removed_refs: BTreeSet<ObjectRef> = pdf.deleted_object_refs().into_iter().collect();
+    let object_streams = if options.object_streams == ObjectStreamMode::Preserve {
+        let packing =
+            crate::writer::object_streams::plan_qpdf_preserve_object_streams_with_unreferenced(
+                pdf,
+                options.preserve_unreferenced_objects,
+            )?; // cov:ignore: malformed source graph is rejected by the preserve planner
+        removed_refs.extend(packing.removed_refs);
+        packing.groups
+    } else {
+        Vec::new()
+    };
+    // qpdf gates both the 1.5 version floor and the cross-reference form on the
+    // same setup-time map, `object_stream_to_objects`
+    // (`QPDFWriter.cc:2172-2173` and `:3023-3031`), which
+    // `preserveObjectStreams` fills before the write pass
+    // (`:1955-1966`) and which live reachability never revisits. Derive both
+    // from one quantity here too: Preserve's source-container groups after the
+    // removed-ref filter. Splitting them -- floor from this set, form from the
+    // post-walk layout -- lets a container that is registered but never
+    // reached declare 1.5 while emitting a classic table, which qpdf never
+    // does.
+    let has_object_stream_hint = !object_streams.is_empty();
     let source_id0 = plan::live_source_id0(pdf)?;
     let source_version = pdf.version().to_string();
     let source_extension_level = pdf.adobe_extension_level()?.unwrap_or(0);
@@ -72,7 +91,7 @@ fn write_plain_live_disable<R: Read + Seek, W: Write>(
         source_extension_level,
         options,
         false,
-        false,
+        has_object_stream_hint,
     );
     let version = effective_version.to_string();
     crate::writer::configure_progress_for_pdf(pdf, options, 0, false)?;
@@ -83,6 +102,7 @@ fn write_plain_live_disable<R: Read + Seek, W: Write>(
         final_extension_level,
         source_root,
         removed_refs.clone(),
+        &object_streams,
     )?; // cov:ignore: LLVM attributes the live-body call terminator to closure cleanup.
     let old_to_new = body.old_to_new;
     let root = source_root.and_then(|source| old_to_new.get(&source).copied());
@@ -97,7 +117,13 @@ fn write_plain_live_disable<R: Read + Seek, W: Write>(
         .as_ref()
         .map(|root| root.output_root_copy_with_adbe(&version, final_extension_level, false))
         .transpose()?;
-    let max_output = body.layout.uncompressed.keys().copied().max().unwrap_or(0);
+    // `old_to_new` numbers every live object (uncompressed and compressed)
+    // through one counter (`LiveQueue::enqueue_handle`), so it is always a
+    // bijection onto `1..=old_to_new.len()`; a compressed member's output
+    // number can exceed every uncompressed number, so `/Size` cannot be
+    // derived from the uncompressed map alone once Preserve has live
+    // compressed content.
+    let max_output = u32::try_from(old_to_new.len()).unwrap_or(u32::MAX);
     let trailer_size = usize::try_from(max_output)
         .ok()
         .and_then(|size| size.checked_add(1))
@@ -137,14 +163,61 @@ fn write_plain_live_disable<R: Read + Seek, W: Write>(
         }
     };
     let map: HashMap<ObjectRef, ObjectRef> = old_to_new.iter().map(|(&a, &b)| (a, b)).collect();
+    // Object streams require a cross-reference stream: a classic table has no
+    // type-2 row shape (ISO 32000-1 7.5.7). qpdf decides this from the same
+    // setup-time membership that set the version floor above
+    // (`QPDFWriter.cc:3023-3031`), not from what the walk turned out to
+    // reach, so a registered-but-unreached container still produces a
+    // cross-reference stream with zero type-2 rows.
+    let form = if has_object_stream_hint {
+        XrefForm::Stream
+    } else {
+        XrefForm::Table
+    };
+    // Mirrors `plan.rs`'s `structural_filtered` derivation: the xref stream's
+    // own `/Filter /FlateDecode` + PNG `/Predictor 12` framing follows the
+    // same effective stream-compression policy as every other stream, not a
+    // hardcoded choice (`QPDFWriter.cc` writes the xref stream through the
+    // same `Pl_Flate` pipeline as any other filtered stream).
+    let structural_filtered = matches!(
+        crate::writer::effective_stream_policy(options),
+        Some(CompressStreams::Yes)
+    );
+    // `canonical_trailer_entries` deliberately omits `/Root`, and the
+    // cross-reference stream serializer reads it only from `root` or
+    // `direct_root`. The live route can now select `XrefForm::Stream`, so a
+    // direct Catalog has to be serialized here too or the output loses its
+    // `/Root` entirely. The classic-table form gets it from the trailer handle
+    // above, which is why this stayed `None` while the route was table-only.
+    let direct_root_bytes = direct_root_output
+        .as_ref()
+        .map(|arbitrated| {
+            let map_ref = |object_ref: ObjectRef| {
+                map.get(&object_ref).copied().ok_or_else(|| {
+                    // cov:ignore-start: the direct Catalog is collected by the
+                    // same walk that fills this map, so a live reference cannot
+                    // be absent at emission.
+                    crate::Error::Unsupported(format!(
+                        "plain live writer: direct /Root reference {} {} R absent from renumber map",
+                        object_ref.number, object_ref.generation
+                    ))
+                    // cov:ignore-end
+                }) // cov:ignore: the direct-root reference map is exercised; LLVM places the successful closure-exit counter on this continuation line.
+            };
+            let mut bytes = Vec::new();
+            arbitrated
+                .write_object_with_ref_map_and_removed(&mut bytes, &map_ref, &removed_refs)
+                .map(|()| bytes)
+        })
+        .transpose()?;
     let trailer = TrailerPlan {
-        form: XrefForm::Table,
+        form,
         canonical_entries: plan::canonical_trailer_entries(pdf, &map, &removed_refs)?,
         root,
-        direct_root: None,
+        direct_root: direct_root_bytes,
         id,
         encrypt: trailer_handle.try_get_key(b"/Encrypt")?.object_ref(),
-        structural_filtered: false,
+        structural_filtered,
         qdf: false,
     };
     let mut bytes = body.bytes;
@@ -157,9 +230,17 @@ fn write_plain_live_disable<R: Read + Seek, W: Write>(
         &removed_refs,
     )?; // cov:ignore: LLVM attributes xref append's call terminator to callback cleanup.
     out.write_all(&bytes)?;
+    // qpdf's `getRenumberedObjGen` returns `obj_renumber[og]` unfiltered
+    // (`QPDFWriter.cc:2215-2219`), and `assignCompressedObjectNumbers`
+    // (`:1057-1069`) writes an entry for every member of a container, so a
+    // type-2 member has a renumbered identity just like an uncompressed
+    // object. Keep both, matching the planned route below.
     let old_to_new = map
         .into_iter()
-        .filter(|(_, output)| body.layout.uncompressed.contains_key(&output.number))
+        .filter(|(_, output)| {
+            body.layout.uncompressed.contains_key(&output.number)
+                || body.layout.compressed.contains_key(&output.number)
+        })
         .collect();
     Ok(WriterResult::new(old_to_new, written_xref))
 }

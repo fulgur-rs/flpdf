@@ -17,14 +17,30 @@ use crate::writer::{
 };
 use crate::{ObjectHandle, ObjectRef, PageDocumentHelper, Pdf};
 
-/// The qpdf standard-writer queue for the bounded plain Disable consumer.
-/// Numbers are assigned when a reference is first observed, and the pending
-/// queue is allowed to grow while an object is being unparsed. This is the
-/// Rust counterpart of `QPDFWriter::enqueueObject` plus `object_queue`.
+/// The qpdf standard-writer queue for the bounded plain Disable consumer, and
+/// (once [`LiveQueue::register_object_streams`] has populated container
+/// membership) for a Preserve source ObjStm group. Numbers are assigned when
+/// a reference is first observed, and the pending queue is allowed to grow
+/// while an object is being unparsed. This is the Rust counterpart of
+/// `QPDFWriter::enqueueObject` plus `object_queue`.
 struct LiveQueue {
     old_to_new: BTreeMap<ObjectRef, ObjectRef>,
     pending: VecDeque<ObjectHandle>,
     removed_refs: BTreeSet<ObjectRef>,
+    /// Source ObjGen of an ObjStm member -> source ObjGen of its container.
+    /// Empty for the plain Disable consumer, which has no compressed members.
+    member_to_container: BTreeMap<ObjectRef, ObjectRef>,
+    /// Source ObjGen of an ObjStm container -> its members' source ObjGens,
+    /// in qpdf's `std::set<QPDFObjGen>` (ascending) order. Empty for Disable.
+    container_to_members: BTreeMap<ObjectRef, Vec<ObjectRef>>,
+    /// Members whose container chain is still being resolved.
+    ///
+    /// qpdf marks the same state by storing the invalid object ID `0` in
+    /// `obj_renumber` before it recurses, and ignores the object when it meets
+    /// that sentinel again (`libqpdf/QPDFWriter.cc:1097-1124`). flpdf derives
+    /// the next output number from `old_to_new.len()`, so a sentinel entry
+    /// there would shift every later number; keep the mark in its own set.
+    resolving_members: BTreeSet<ObjectRef>,
 }
 
 impl LiveQueue {
@@ -33,12 +49,53 @@ impl LiveQueue {
             old_to_new: BTreeMap::new(),
             pending: VecDeque::new(),
             removed_refs,
+            member_to_container: BTreeMap::new(),
+            container_to_members: BTreeMap::new(),
+            resolving_members: BTreeSet::new(),
+        }
+    }
+
+    /// Register Preserve-mode source ObjStm membership so that
+    /// [`Self::enqueue_handle`] redirects a member's discovery to its
+    /// container instead of numbering the member as a plain indirect object,
+    /// matching `QPDFWriter::enqueueObject`'s member branch
+    /// (`libqpdf/QPDFWriter.cc:1071-1132`).
+    fn register_object_streams(
+        &mut self,
+        groups: &[crate::writer::object_streams::ObjectStreamGroup],
+    ) {
+        for group in groups {
+            let crate::writer::object_streams::ObjectStreamGroup::SourceBacked { source, members } =
+                group
+            else {
+                // cov:ignore-start: the live queue only handles Preserve, whose planner returns SourceBacked groups exclusively.
+                continue;
+                // cov:ignore-end
+            };
+            // qpdf excludes a removed/ineligible member from
+            // `object_to_object_stream` before the enqueue walk begins
+            // (`preserveObjectStreams`, `libqpdf/QPDFWriter.cc:1957-1966`),
+            // so it is never treated as a compressed member at all. Mirror
+            // that exclusion here rather than letting a later removed-ref
+            // check race the eager numbering loop in `enqueue_handle`.
+            let retained: Vec<ObjectRef> = members
+                .iter()
+                .copied()
+                .filter(|member| !self.removed_refs.contains(member))
+                .collect();
+            if retained.is_empty() {
+                continue;
+            }
+            for member in &retained {
+                self.member_to_container.insert(*member, *source);
+            }
+            self.container_to_members.insert(*source, retained);
         }
     }
 
     fn enqueue_handle<R: Read + Seek>(
         &mut self,
-        pdf: &Pdf<R>,
+        pdf: &mut Pdf<R>,
         handle: ObjectHandle,
     ) -> crate::Result<Option<ObjectRef>> {
         if handle.owning_pdf_unique_id() != Some(pdf.unique_id()) {
@@ -63,9 +120,37 @@ impl LiveQueue {
         if let Some(output) = self.old_to_new.get(&source).copied() {
             return Ok(Some(output));
         }
+        if let Some(&container) = self.member_to_container.get(&source) {
+            // A member is never queued or numbered on its own; discovering it
+            // enqueues its container instead, which eagerly numbers every
+            // member of that container below
+            // (`QPDFWriter::assignCompressedObjectNumbers`,
+            // `libqpdf/QPDFWriter.cc:1057-1069`).
+            //
+            // A specially constructed file can name a container that is itself
+            // a member, directly or through a chain, so this recursion is not
+            // bounded by construction. qpdf guards it by storing the invalid
+            // object ID `0` before recursing and ignoring the object when it
+            // meets that sentinel again (`:1097-1104,1120-1124`), which drops
+            // the looping object entirely.
+            if !self.resolving_members.insert(source) {
+                return Ok(None);
+            }
+            let container_handle = pdf.get_object_handle(container);
+            self.enqueue_handle(pdf, container_handle)?;
+            return Ok(self.old_to_new.get(&source).copied());
+        }
         let output = ObjectRef::new(self.old_to_new.len() as u32 + 1, 0);
         self.old_to_new.insert(source, output);
         self.pending.push_back(handle);
+        if let Some(members) = self.container_to_members.get(&source).cloned() {
+            for member in members {
+                if !self.old_to_new.contains_key(&member) {
+                    let member_output = ObjectRef::new(self.old_to_new.len() as u32 + 1, 0);
+                    self.old_to_new.insert(member, member_output);
+                }
+            }
+        }
         Ok(Some(output))
     }
 
@@ -139,8 +224,10 @@ pub(crate) fn emit_live_disable<R: Read + Seek + 'static>(
     final_extension_level: i64,
     root_source: Option<ObjectRef>,
     removed_refs: BTreeSet<ObjectRef>,
+    object_streams: &[crate::writer::object_streams::ObjectStreamGroup],
 ) -> crate::Result<LiveBodyOutput> {
     let mut queue = LiveQueue::new(removed_refs.clone());
+    queue.register_object_streams(object_streams);
     if options.preserve_unreferenced_objects {
         for handle in pdf.get_all_objects()? {
             queue.enqueue_handle(pdf, handle)?;
@@ -369,19 +456,23 @@ struct LiveObjectEmitter<'a, R: Read + Seek + 'static> {
 impl<'a, R: Read + Seek + 'static> crate::writer::write_object::WriteObject
     for LiveObjectEmitter<'a, R>
 {
-    type ObjectStreamContainer = ();
+    type ObjectStreamContainer = Vec<ObjectRef>;
 
-    fn object_stream_container(&self, _object: ObjectRef) -> Option<()> {
-        None
+    fn object_stream_container(&self, object: ObjectRef) -> Option<Vec<ObjectRef>> {
+        self.queue
+            .borrow()
+            .container_to_members
+            .get(&object)
+            .cloned()
     }
 
-    // cov:ignore-start: Disable's live owner never exposes an object-stream container.
-    fn write_object_stream(&mut self, _object: &ObjectHandle, (): ()) -> crate::Result<()> {
-        Err(crate::Error::Internal(
-            "plain Disable live queue received an object-stream container".to_string(),
-        ))
+    fn write_object_stream(
+        &mut self,
+        object: &ObjectHandle,
+        container: Vec<ObjectRef>,
+    ) -> crate::Result<()> {
+        self.emit_live_object_stream(object, &container)
     }
-    // cov:ignore-end
 
     fn indicate_progress(&mut self) -> crate::Result<()> {
         crate::writer::report_progress_event(self.options)
@@ -465,6 +556,168 @@ impl<'a, R: Read + Seek + 'static> crate::writer::write_object::WriteObject
             );
         } else {
             object.write_object_with_dynamic_ref_map(self.bytes, &mut map, &self.removed_refs)?;
+        }
+        Ok(())
+    }
+}
+
+impl<'a, R: Read + Seek + 'static> LiveObjectEmitter<'a, R> {
+    /// The live-queue counterpart of `PlainObjectEmitter::emit_planned_object_stream`
+    /// for a Preserve source-backed ObjStm container. The live route never
+    /// runs with `options.qdf` (the dispatch gate in `mod.rs` routes QDF
+    /// output through the planned writer instead), so this omits the QDF
+    /// marker/pair-table framing that method carries: only the plain
+    /// (`libqpdf/QPDFWriter.cc:1665-1710` non-QDF arm) shape is needed here.
+    /// References are resolved through the same dynamic, discovery-time map
+    /// `unparse_object` uses, since a member's own children may not yet be
+    /// queued when its body is serialized
+    /// (`QPDFWriter::writeObjectStream`/`unparseChild`, `libqpdf/QPDFWriter.cc:1690-1697`).
+    fn emit_live_object_stream(
+        &mut self,
+        container: &ObjectHandle,
+        members: &[ObjectRef],
+    ) -> crate::Result<()> {
+        let container_source = container.object_ref().ok_or_else(|| {
+            // cov:ignore-start: qpdf's writeObjectStream also asserts old_og.getGen() == 0 on an indirect handle; the dispatcher only reaches here via a queued (therefore indirect) handle.
+            crate::Error::Internal(
+                "plain live writer: object-stream container has no source identity".to_string(),
+            )
+            // cov:ignore-end
+        })?; // cov:ignore: the dispatcher only reaches this arm for a queued, therefore indirect, handle.
+        let output = self
+            .queue
+            .borrow()
+            .old_to_new
+            .get(&container_source)
+            .copied()
+            // cov:ignore-start: the container's own number is assigned before it is queued, so this is always present.
+            .ok_or_else(|| {
+                crate::Error::Unsupported(format!(
+                    "plain live writer: reference {} {} R absent from queue",
+                    container_source.number, container_source.generation
+                ))
+            })?;
+        // cov:ignore-end
+        let mut handles = Vec::with_capacity(members.len());
+        for &member_source in members {
+            let member_output = self
+                .queue
+                .borrow()
+                .old_to_new
+                .get(&member_source)
+                .copied()
+                // cov:ignore-start: assignCompressedObjectNumbers numbers every member when the container is first queued, above.
+                .ok_or_else(|| {
+                    crate::Error::Unsupported(format!(
+                        "plain live writer: object-stream member {} {} R absent from queue",
+                        member_source.number, member_source.generation
+                    ))
+                })?;
+            // cov:ignore-end
+            let handle = self.pdf.get_object_handle(member_source);
+            handles.push((member_output, handle));
+        }
+        let root_source = self.root_source;
+        let removed_refs = &self.removed_refs;
+        let body_writer = &mut |out: &mut Vec<u8>,
+                                _member_index: u32,
+                                _member_ref: ObjectRef,
+                                handle: &ObjectHandle|
+         -> crate::Result<()> {
+            let mut map = |child: &ObjectHandle| {
+                self.queue
+                    .borrow_mut()
+                    .enqueue_handle(self.pdf, child.clone())?
+                    // cov:ignore-start: dynamic child callbacks run only after the removed/direct filters.
+                    .ok_or_else(|| {
+                        crate::Error::Unsupported(
+                            "plain live writer: child is direct or removed".to_string(),
+                        )
+                    })
+                // cov:ignore-end
+            };
+            let result = if handle.object_ref() == root_source {
+                handle.write_root_object_with_dynamic_ref_map(
+                    out,
+                    &mut map,
+                    removed_refs,
+                    self.version,
+                    self.final_extension_level,
+                    true,
+                )
+            } else {
+                handle.write_object_with_dynamic_ref_map(out, &mut map, removed_refs)
+            };
+            // cov:ignore-start: llvm-cov attributes the uncovered region to
+            // this block's closing brace, the merge point for an exercised
+            // member write failing (the sibling planned-writer copy of this
+            // pattern, `emit_planned_object_stream`, has the same artifact).
+            if result.is_ok() {
+                crate::writer::report_progress_event(self.options)?;
+            }
+            // cov:ignore-end
+            result
+        };
+        let body =
+            object_streams::emit_objstm_body_from_handles_with_writer(&handles, body_writer)?;
+        let extends = {
+            let source_handle = self.pdf.get_object_handle(container_source);
+            source_handle.try_dereference()?;
+            match source_handle.as_stream_dict() {
+                Some(source_dict) => {
+                    let extends_handle = source_dict.try_get_key(b"/Extends")?;
+                    match extends_handle.object_ref() {
+                        // qpdf enqueues /Extends's target the same way as any
+                        // other child reference (`unparseChild`,
+                        // `libqpdf/QPDFWriter.cc:1735`), so an /Extends chain
+                        // to an otherwise-unreferenced predecessor container
+                        // is still discovered and written.
+                        Some(_) => Some(
+                            self.queue
+                                .borrow_mut()
+                                .enqueue_handle(self.pdf, extends_handle)?
+                                // cov:ignore-start: a resolved indirect /Extends always yields a live output number.
+                                .ok_or_else(|| {
+                                    crate::Error::Unsupported(
+                                        "plain live writer: object-stream /Extends is direct or removed"
+                                            .to_string(),
+                                    )
+                                })?,
+                            // cov:ignore-end
+                        ),
+                        None => None,
+                    }
+                }
+                // qpdf permits a null or otherwise non-stream source identity
+                // here as a placeholder for a reconstructed object stream;
+                // the live queue's Preserve source is always the real ObjStm
+                // it was reconstructed from, so this arm mirrors the planned
+                // writer's handling without being reachable from that planner.
+                None => None,
+            }
+        };
+        let offset = self.bytes.len();
+        self.bytes
+            .extend_from_slice(format!("{} {} obj\n", output.number, output.generation).as_bytes());
+        serialize::write_objstm_stream_with_extends(
+            self.bytes,
+            &body,
+            self.options.compress_streams,
+            self.options.newline_before_endstream,
+            extends,
+        )?; // cov:ignore: error arm requires an in-memory zlib encoder failure
+        self.bytes.extend_from_slice(b"\nendobj\n");
+        self.layout
+            .uncompressed
+            .insert(output.number, (output.generation, offset));
+        for (index, (member_output, _)) in handles.iter().enumerate() {
+            self.layout.compressed.insert(
+                member_output.number,
+                CompressedLocation {
+                    container: output.number,
+                    index: u32::try_from(index).unwrap_or(u32::MAX),
+                },
+            );
         }
         Ok(())
     }
@@ -2213,7 +2466,7 @@ mod object_emitter_tests {
             .unwrap();
         let mut queue = LiveQueue::new(BTreeSet::new());
         let error = queue
-            .enqueue_handle(&local_pdf, foreign)
+            .enqueue_handle(&mut local_pdf, foreign)
             .expect_err("foreign live handles must be rejected");
         assert!(error.to_string().contains("different QPDF"));
 
@@ -2223,13 +2476,16 @@ mod object_emitter_tests {
         let child_ref = child.object_ref().unwrap();
         let mut removed_queue = LiveQueue::new([child_ref].into_iter().collect());
         assert_eq!(
-            removed_queue.enqueue_handle(&local_pdf, child.clone())?,
+            removed_queue.enqueue_handle(&mut local_pdf, child.clone())?,
             None
         );
 
-        let output_ref = queue.enqueue_handle(&local_pdf, child.clone())?;
+        let output_ref = queue.enqueue_handle(&mut local_pdf, child.clone())?;
         assert_eq!(output_ref, Some(ObjectRef::new(1, 0)));
-        assert_eq!(queue.enqueue_handle(&local_pdf, child.clone())?, output_ref);
+        assert_eq!(
+            queue.enqueue_handle(&mut local_pdf, child.clone())?,
+            output_ref
+        );
         assert_eq!(
             queue.pop().and_then(|handle| handle.object_ref()),
             Some(child_ref)
@@ -2270,8 +2526,134 @@ mod object_emitter_tests {
             0,
             root_source,
             BTreeSet::new(),
+            &[],
         )?; // cov:ignore: LLVM attributes the live-body test call terminator to callback cleanup.
         assert!(!body.bytes.is_empty());
+        Ok(())
+    }
+
+    #[test]
+    fn enqueue_ignores_an_object_stream_that_contains_itself() -> crate::Result<()> {
+        // A specially constructed file can name a container that is itself a
+        // member. qpdf stores the invalid object ID `0` before recursing and
+        // ignores the object when it meets that sentinel again
+        // (`libqpdf/QPDFWriter.cc:1097-1104,1120-1124`), dropping the looping
+        // object instead of recursing forever.
+        let container = ObjectRef::new(5, 0);
+        let mut pdf = super::object_emitter_tests::pdf();
+        let mut queue = LiveQueue::new(BTreeSet::new());
+        queue.register_object_streams(&[object_streams::ObjectStreamGroup::SourceBacked {
+            source: container,
+            members: vec![container],
+        }]);
+
+        let handle = pdf.get_object_handle(container);
+        assert_eq!(queue.enqueue_handle(&mut pdf, handle)?, None);
+        assert!(queue.old_to_new.is_empty());
+
+        // A two-container cycle takes the same path one level deeper.
+        let other = ObjectRef::new(6, 0);
+        let mut queue = LiveQueue::new(BTreeSet::new());
+        queue.register_object_streams(&[
+            object_streams::ObjectStreamGroup::SourceBacked {
+                source: container,
+                members: vec![other],
+            },
+            object_streams::ObjectStreamGroup::SourceBacked {
+                source: other,
+                members: vec![container],
+            },
+        ]);
+        let handle = pdf.get_object_handle(container);
+        assert_eq!(queue.enqueue_handle(&mut pdf, handle)?, None);
+        assert!(queue.old_to_new.is_empty());
+        Ok(())
+    }
+
+    #[test]
+    fn register_object_streams_skips_a_group_whose_members_are_all_removed() {
+        let source = ObjectRef::new(3, 0);
+        let member = ObjectRef::new(2, 0);
+        let mut queue = LiveQueue::new([member].into_iter().collect());
+        queue.register_object_streams(&[object_streams::ObjectStreamGroup::SourceBacked {
+            source,
+            members: vec![member],
+        }]);
+        assert!(queue.member_to_container.is_empty());
+        assert!(queue.container_to_members.is_empty());
+    }
+
+    #[test]
+    fn live_object_stream_with_a_non_stream_source_omits_extends() -> crate::Result<()> {
+        let mut pdf = super::object_emitter_tests::pdf();
+        let source = pdf.make_indirect_from_object_handle(ObjectHandle::null())?;
+        let source_id = source.object_ref().unwrap();
+        let member = pdf.make_indirect_from_object_handle(ObjectHandle::integer(42))?;
+        let member_id = member.object_ref().unwrap();
+        pdf.root_handle()?.replace_key(b"/Member", member)?;
+        let root_source = pdf.root_ref();
+        let object_streams = [object_streams::ObjectStreamGroup::SourceBacked {
+            source: source_id,
+            members: vec![member_id],
+        }];
+        let body = emit_live_disable(
+            &mut pdf,
+            &WriterOptions::default(),
+            "1.5",
+            0,
+            root_source,
+            BTreeSet::new(),
+            &object_streams,
+        )?; // cov:ignore: LLVM attributes the live-body test call terminator to callback cleanup.
+        assert!(body
+            .bytes
+            .windows(b"/Type /ObjStm".len())
+            .any(|window| window == b"/Type /ObjStm"));
+        assert!(!body
+            .bytes
+            .windows(b"/Extends".len())
+            .any(|window| window == b"/Extends"));
+        Ok(())
+    }
+
+    #[test]
+    fn live_object_stream_extends_an_unreferenced_predecessor_through_live_enqueue(
+    ) -> crate::Result<()> {
+        let mut pdf = super::object_emitter_tests::pdf();
+        let predecessor = pdf.new_stream_with_data(Rc::new(Vec::new()))?;
+        let predecessor_id = predecessor.object_ref().unwrap();
+        let source = pdf.new_stream_with_data(Rc::new(Vec::new()))?;
+        let source_id = source.object_ref().unwrap();
+        source
+            .as_stream_dict()
+            .unwrap()
+            .replace_key(b"/Extends", predecessor)?;
+        let member = pdf.make_indirect_from_object_handle(ObjectHandle::integer(7))?;
+        let member_id = member.object_ref().unwrap();
+        pdf.root_handle()?.replace_key(b"/Member", member)?;
+        let root_source = pdf.root_ref();
+        let object_streams = [object_streams::ObjectStreamGroup::SourceBacked {
+            source: source_id,
+            members: vec![member_id],
+        }];
+        let body = emit_live_disable(
+            &mut pdf,
+            &WriterOptions::default(),
+            "1.5",
+            0,
+            root_source,
+            BTreeSet::new(),
+            &object_streams,
+        )?; // cov:ignore: LLVM attributes the live-body test call terminator to callback cleanup.
+        let predecessor_output = body
+            .old_to_new
+            .get(&predecessor_id)
+            .expect("an unreferenced /Extends predecessor is still discovered and numbered");
+        let expected = format!("/Extends {} 0 R", predecessor_output.number);
+        assert!(body
+            .bytes
+            .windows(expected.len())
+            .any(|window| window == expected.as_bytes()));
         Ok(())
     }
 }
