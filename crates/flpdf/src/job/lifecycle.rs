@@ -190,6 +190,12 @@ struct JobConfiguration {
     password_is_hex_key: bool,
     suppress_password_recovery: bool,
     suppress_recovery: bool,
+    /// qpdf's `max_input_version`: the greatest version among the documents
+    /// this job opened. It lives on the job, not on the writer, because
+    /// `doProcessOnce` accumulates it during the create stage
+    /// (`QPDFJob.cc:1695-1716`) while `setWriterOptions` hands it to the
+    /// writer at write time (`QPDFJob.cc:2913`).
+    max_input_version: Option<(String, i64)>,
     verbose: bool,
     json_input: bool,
     update_from_json: Option<PathBuf>,
@@ -3038,6 +3044,12 @@ impl QPDFJob {
         // for callers that reach write_qpdf without the create stage.
         self.reserve_standard_output()?;
         let mut writer_configuration = self.configuration.writer.clone();
+        // qpdf's setWriterOptions applies the accumulated input floor to the
+        // writer here, in the write stage (`QPDFJob.cc:2913`), so a source
+        // opened during the create stage still raises the output version.
+        if let Some((version, extension_level)) = self.configuration.max_input_version.clone() {
+            writer_configuration.set_minimum_pdf_version(version, extension_level);
+        }
         if let Some(path) = self.configuration.copy_encryption.clone() {
             match self.copy_encryption_source(&path) {
                 Ok(source) => writer_configuration.copy_encryption_parameters(source),
@@ -3716,9 +3728,11 @@ impl QPDFJob {
         // overlay consumer needs the same floor before the final writer runs.
         let version = source.get_version_as_pdf_version()?;
         let (version, extension_level) = version.get_version();
-        self.configuration
-            .writer
-            .set_minimum_pdf_version(version, extension_level);
+        crate::writer::update_minimum_pdf_version(
+            &mut self.configuration.max_input_version,
+            version,
+            extension_level,
+        );
         Ok(())
     }
 
