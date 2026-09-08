@@ -23,7 +23,7 @@ use crate::linearization::{show_linearization_pdf_with_warnings, ShowLinearizati
 use crate::pipeline::{Pipeline, PipelineHandle, PipelineResult};
 use crate::qutil::{qpdf_string_to_int_checked, QpdfIntParse};
 use crate::{
-    AcroFormDocumentHelper, Error, ObjectRef, ObjectStreamMode, PageDocumentHelper,
+    AcroFormDocumentHelper, Error, ObjectHandle, ObjectRef, ObjectStreamMode, PageDocumentHelper,
     PageObjectHelper, Pdf, PdfOpenOptions, PdfWriter, QPDFLogger, ReadSeek, Result, UsageError,
     WriterConfiguration,
 };
@@ -1189,9 +1189,7 @@ fn parse_page_label_spec(spec: &[u8]) -> Result<PageLabelSpec> {
 fn parse_job_page_labels(
     specs: &[PageLabelSpec],
     page_count: usize,
-) -> Result<Vec<(i64, crate::page_label_document_helper::LabelRange)>> {
-    use crate::page_label_document_helper::LabelRange;
-
+) -> Result<Vec<(i64, PageLabelSpec)>> {
     let page_count = i64::try_from(page_count)
         .map_err(|_| Error::Unsupported("page count exceeds qpdf's range".to_owned()))?;
     let mut entries = Vec::with_capacity(specs.len());
@@ -1221,14 +1219,7 @@ fn parse_job_page_labels(
                 "page label spec: page {first_page} is more than the total number of pages ({page_count})"
             ))));
         }
-        entries.push((
-            first_page - 1,
-            LabelRange {
-                style: spec.style,
-                prefix: String::from_utf8_lossy(&spec.prefix).into_owned(),
-                start: spec.start,
-            },
-        ));
+        entries.push((first_page - 1, spec.clone()));
         last_page = first_page;
     }
     Ok(entries)
@@ -3054,6 +3045,21 @@ impl QPDFJob {
         }
     }
 
+    /// Apply the configured qpdf document transformations to an already-open
+    /// primary document.
+    ///
+    /// `QPDFJob::createQPDF` normally owns this stage before `writeQPDF`
+    /// (`libqpdf/QPDFJob.cc:428-481`). The public job boundary lets the CLI
+    /// migrate one existing opened-document consumer at a time without
+    /// reimplementing `handleTransformations` beside the job lifecycle.
+    pub fn apply_transformations<R>(&mut self, pdf: &mut Pdf<R>) -> Result<()>
+    where
+        R: Read + Seek + 'static,
+    {
+        let configuration = self.configuration.clone();
+        self.prepare_document_transformations(pdf, &configuration)
+    }
+
     /// Run the configured create/write or check lifecycle.
     pub fn run(&mut self) -> Result<JobExitCode> {
         if self.configuration.is_encrypted || self.configuration.requires_password {
@@ -3554,11 +3560,32 @@ impl QPDFJob {
         let Some(specs) = configuration.set_page_labels.as_deref() else {
             return Ok(());
         };
+        let Some(root_ref) = pdf.root_ref() else {
+            return Ok(());
+        };
+        let root = pdf.get_object_handle(root_ref);
+        root.try_dereference()?;
+        if root.try_as_dictionary()?.is_none() {
+            return Ok(());
+        }
         let page_count = crate::page_document_helper::PageDocumentHelper::new(pdf)
             .get_all_pages()?
             .len();
         let entries = parse_job_page_labels(specs, page_count)?;
-        pdf.page_labels().write_reconstructed_labels(&entries)
+        let mut nums = Vec::with_capacity(entries.len() * 2);
+        for (index, spec) in entries {
+            nums.push(ObjectHandle::integer(index));
+            nums.push(crate::page_label_document_helper::PageLabelDocumentHelper::<R>::page_label_dict_bytes(
+                spec.style,
+                spec.start,
+                &spec.prefix,
+            ));
+        }
+        root.replace_key(
+            b"/PageLabels",
+            ObjectHandle::dictionary(vec![(b"/Nums".to_vec(), ObjectHandle::array(nums))]),
+        )?; // cov:ignore: a validated direct Catalog replacement cannot fail without an impossible concurrent handle mutation
+        pdf.mark_object_handle_dirty(&root)
     }
 
     fn replace_input_path(&self) -> Option<PathBuf> {
@@ -4205,6 +4232,26 @@ impl QPDFJobConfig<'_> {
         Ok(self)
     }
 
+    /// Configure qpdf's `setPageLabels` option-table result.
+    pub fn set_page_labels<I, S>(&mut self, specs: I) -> Result<&mut Self>
+    where
+        I: IntoIterator<Item = S>,
+        S: AsRef<[u8]>,
+    {
+        let specs = specs
+            .into_iter()
+            .map(|spec| parse_page_label_spec(spec.as_ref()))
+            .collect::<Result<Vec<_>>>()?;
+        self.job.configuration.set_page_labels = Some(specs);
+        Ok(self)
+    }
+
+    /// Configure qpdf's `removePageLabels` bare option.
+    pub fn remove_page_labels(&mut self) -> &mut Self {
+        self.job.configuration.remove_page_labels = true;
+        self
+    }
+
     /// Request qpdf QDF output.
     pub fn qdf(&mut self) -> &mut Self {
         self.job.configuration.writer.set_qdf_mode(true);
@@ -4369,6 +4416,42 @@ mod tests {
                 PdfOpenOptions::default(),
             )
             .is_ok());
+    }
+
+    #[test]
+    fn page_label_transform_noops_when_the_document_has_no_root() {
+        let mut bytes = Vec::new();
+        bytes.extend_from_slice(b"%PDF-1.7\n");
+        let off1 = bytes.len() as u64;
+        bytes.extend_from_slice(b"1 0 obj\n<< /Type /Catalog >>\nendobj\n");
+        let xref = bytes.len() as u64;
+        bytes.extend_from_slice(
+            format!(
+                "xref\n0 2\n0000000000 65535 f \n{off1:010} 00000 n \ntrailer\n<< /Size 2 >>\nstartxref\n{xref}\n%%EOF\n"
+            )
+            .as_bytes(),
+        );
+        let mut pdf = Pdf::open(Cursor::new(bytes)).expect("rootless trailer still opens");
+        let mut job = QPDFJob::new();
+        job.configuration.set_page_labels = Some(Vec::new());
+        let configuration = job.configuration.clone();
+
+        job.apply_page_label_transformations(&mut pdf, &configuration)
+            .expect("missing root is a qpdf-tolerant no-op");
+    }
+
+    #[test]
+    fn page_label_transform_noops_when_the_root_is_not_a_dictionary() {
+        let mut pdf = Pdf::empty().expect("empty PDF has a root");
+        let root_ref = pdf.root_ref().expect("empty PDF has a root");
+        pdf.replace_object(root_ref, ObjectHandle::integer(0))
+            .expect("replace the root with a scalar");
+        let mut job = QPDFJob::new();
+        job.configuration.set_page_labels = Some(Vec::new());
+        let configuration = job.configuration.clone();
+
+        job.apply_page_label_transformations(&mut pdf, &configuration)
+            .expect("non-dictionary root is a qpdf-tolerant no-op");
     }
 
     struct RecordingInfoSink {

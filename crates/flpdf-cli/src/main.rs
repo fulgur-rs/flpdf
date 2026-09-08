@@ -91,6 +91,30 @@ struct WriterOptions {
     allow_weak_crypto: bool,
 }
 
+#[derive(Debug, Clone, Default)]
+struct PageLabelOptions {
+    set: Option<Vec<Vec<u8>>>,
+    remove: bool,
+}
+
+impl PageLabelOptions {
+    fn is_active(&self) -> bool {
+        self.remove || self.set.is_some()
+    }
+}
+
+fn page_label_options(set: Option<&[OsString]>, remove: bool) -> PageLabelOptions {
+    PageLabelOptions {
+        set: set.map(|specs| {
+            specs
+                .iter()
+                .map(|spec| arg_parser::os_bytes(spec.as_os_str()))
+                .collect()
+        }),
+        remove,
+    }
+}
+
 impl Default for WriterOptions {
     fn default() -> Self {
         Self {
@@ -915,6 +939,19 @@ struct Cli {
               "show_encryption",
           ])]
     remove_restrictions: bool,
+    /// Remove explicit page labels from the output (qpdf-compatible).
+    #[arg(long = "remove-page-labels")]
+    remove_page_labels: bool,
+    /// Set page labels using qpdf's option-table grammar. Terminate the
+    /// specification list with `--`.
+    #[arg(
+        long = "set-page-labels",
+        num_args = 0..,
+        value_terminator = "--",
+        allow_hyphen_values = true,
+        value_name = "SPEC..."
+    )]
+    set_page_labels: Option<Vec<OsString>>,
     /// Strip the `/Encrypt` dictionary from the output (top-level alias of
     /// `flpdf rewrite --decrypt`; qpdf `--decrypt` equivalent). On
     /// encrypted input requires `--password` to authenticate; on plaintext
@@ -1703,6 +1740,19 @@ struct RewriteCommand {
     /// See `--decrypt` for the silent qpdf-compatible encryption-removal flag.
     #[arg(long = "remove-restrictions")]
     remove_restrictions: bool,
+    /// Remove explicit page labels from the output (qpdf-compatible).
+    #[arg(long = "remove-page-labels")]
+    remove_page_labels: bool,
+    /// Set page labels using qpdf's option-table grammar. Terminate the
+    /// specification list with `--`.
+    #[arg(
+        long = "set-page-labels",
+        num_args = 0..,
+        value_terminator = "--",
+        allow_hyphen_values = true,
+        value_name = "SPEC..."
+    )]
+    set_page_labels: Option<Vec<OsString>>,
     /// Strip the `/Encrypt` dictionary from the output (qpdf `--decrypt`
     /// equivalent). On encrypted input requires `--password` to
     /// authenticate; on plaintext input it is a no-op pass-through. Silent
@@ -3178,6 +3228,7 @@ fn main() {
             args.optimize_images.then_some(top_level_image_options),
             args.flatten_annotations,
             false, // flatten_rotation (not on top-level surface)
+            page_label_options(args.set_page_labels.as_deref(), args.remove_page_labels),
             &overlay_specs,
             args.verbose,
             args.no_warn,
@@ -3209,6 +3260,7 @@ fn main() {
             args.optimize_images.then_some(top_level_image_options),
             args.flatten_annotations,
             false, // flatten_rotation (not on top-level surface)
+            page_label_options(args.set_page_labels.as_deref(), args.remove_page_labels),
             &overlay_specs,
             args.verbose,
             args.no_warn,
@@ -3378,6 +3430,7 @@ fn main() {
             args.optimize_images.then_some(top_level_image_options),
             args.flatten_annotations,
             false, // flatten_rotation (not on top-level surface)
+            page_label_options(args.set_page_labels.as_deref(), args.remove_page_labels),
             &overlay_specs,
             args.verbose,
             args.no_warn,
@@ -4346,6 +4399,7 @@ fn run_command(command: Commands, overlay_specs: &[OverlaySpec]) -> CliResult<()
                 cmd.optimize_images.then_some(image_options),
                 cmd.flatten_annotations,
                 cmd.flatten_rotation,
+                page_label_options(cmd.set_page_labels.as_deref(), cmd.remove_page_labels),
                 overlay_specs,
                 cmd.verbose,
                 false, // no_warn: the `rewrite` subcommand has no --no-warn flag
@@ -5036,6 +5090,7 @@ fn run_rewrite(
     image_options: Option<ImageOptimizationOptions>,
     flatten_annotations_mode: Option<CliFlattenMode>,
     flatten_rotation: bool,
+    page_labels: PageLabelOptions,
     overlay_specs: &[OverlaySpec],
     verbose: bool,
     no_warn: bool,
@@ -5069,6 +5124,7 @@ fn run_rewrite(
             image_options,
             flatten_annotations_mode,
             flatten_rotation,
+            page_labels,
             overlay_specs,
             verbose,
             no_warn,
@@ -5105,6 +5161,7 @@ fn run_rewrite(
             image_options,
             flatten_annotations_mode,
             flatten_rotation,
+            page_labels,
             overlay_specs,
             verbose,
             no_warn,
@@ -5127,6 +5184,7 @@ fn run_rewrite(
             image_options,
             flatten_annotations_mode,
             flatten_rotation,
+            page_labels,
             overlay_specs,
             verbose,
             no_warn,
@@ -5153,6 +5211,7 @@ fn run_rewrite_opened<R: Read + Seek + 'static>(
     image_options: Option<ImageOptimizationOptions>,
     flatten_annotations_mode: Option<CliFlattenMode>,
     flatten_rotation: bool,
+    page_labels: PageLabelOptions,
     overlay_specs: &[OverlaySpec],
     verbose: bool,
     no_warn: bool,
@@ -5204,6 +5263,7 @@ fn run_rewrite_opened<R: Read + Seek + 'static>(
             let page_refs = pages::page_refs(&mut pdf)?;
             flatten_rotation_on_pages(&mut pdf, &page_refs)?;
         }
+        apply_canonical_page_labels(&mut pdf, &page_labels, verbose, no_warn)?;
         // Apply content normalization before the writer plans and emits the
         // linearized document.
         let normalization_last_bad = if normalize_content {
@@ -5352,6 +5412,8 @@ fn run_rewrite_opened<R: Read + Seek + 'static>(
             None
         };
 
+        apply_canonical_page_labels(&mut pdf, &page_labels, verbose, no_warn)?;
+
         // Step 6: normalize after all page transformations. The stream
         // normalizer consumes the provider-backed coalesced route and writes
         // the normalized bytes through ObjectHandle.
@@ -5387,6 +5449,34 @@ fn run_rewrite_opened<R: Read + Seek + 'static>(
 /// `QPDFAcroFormDocumentHelper::generateAppearancesIfNeeded` boundary.
 fn generate_missing_appearances<R: Read + Seek>(pdf: &mut Pdf<R>) -> CliResult<()> {
     AcroFormDocumentHelper::new(pdf)?.generate_appearances_if_needed()?;
+    Ok(())
+}
+
+/// Apply only the page-label subset of qpdf's canonical Job transformation
+/// stage. The ordinary rewrite route still owns the other migration cohorts;
+/// this bounded consumer deliberately sends labels through `QPDFJob` instead
+/// of repairing the old CLI mutation path in place.
+fn apply_canonical_page_labels<R: Read + Seek + 'static>(
+    pdf: &mut Pdf<R>,
+    options: &PageLabelOptions,
+    verbose: bool,
+    no_warn: bool,
+) -> CliResult<()> {
+    if !options.is_active() {
+        return Ok(());
+    }
+    let mut job = new_cli_job(no_warn);
+    job.set_verbose(verbose);
+    {
+        let mut configuration = job.config();
+        if let Some(specs) = options.set.as_ref() {
+            configuration.set_page_labels(specs.iter().map(Vec::as_slice))?;
+        }
+        if options.remove {
+            configuration.remove_page_labels();
+        }
+    }
+    job.apply_transformations(pdf)?;
     Ok(())
 }
 

@@ -1109,6 +1109,15 @@ show/remove は qpdf の `std::string` key（`QPDFJob_config.cc:507-547`）を
 
 `flattenRotation` も生成 handler (`auto_job_json_init.hh:377-382`)、Config (`QPDFJob_config.cc:204-207`)、変換順序 (`QPDFJob.cc:2190-2194`) に対応し、既存の `flatten_rotation_on_pages` (`QPDFPageObjectHelper.cc:862-991`) を `job/lifecycle.rs` から呼ぶ。`coalesceContents` の直後に配置して、qpdfのページ変換順序を保つ。
 
+`--set-page-labels` / `--remove-page-labels` は、`QPDFJob_argv.cc:375-392` の
+option-table、`QPDFJob_config.cc:1101-1151` の文法・typed Config、
+`QPDFJob.cc:2196-2228` の変換責務を、`flpdf-3yn9.48.6.1` と
+`flpdf-3yn9.48.7.1` で段階的に接続した。argv/JSON は raw prefix bytes を保持する
+`PageLabelSpec` へ集約し、ordinary/native rewrite は `QPDFJob::apply_transformations`
+から `PageLabelDocumentHelper::page_label_dict_bytes` を使うため、qpdf の `/S`・`/P`・
+`/St` 省略規則と `/PageLabels` replacement order を共有する。旧 CLI の他の
+transformation caller はこの bounded cutover の残 caller として後続 `.48.7` cohort に残る。
+
 `generateAppearances` も生成 handler (`auto_job_json_init.hh:383-385`)、Config (`QPDFJob_config.cc:218-221`)、変換順序 (`QPDFJob.cc:2177-2180`) に対応し、既存の `AcroFormDocumentHelper::generate_appearances_if_needed` (`QPDFAcroFormDocumentHelper.cc:393-417`) を `job/lifecycle.rs` から `coalesceContents` の前に呼ぶ。
 
 `checkLinearization` も生成 handler (`auto_job_json_init.hh:217-219`)、Config (`QPDFJob_config.cc:80-85`)、inspection順序 (`QPDFJob.cc:1646-1666`) に対応し、既存の `QPDFJob::check_linearization` を job JSON の `checkLinearization` option から呼ぶ。Config と同じく output file を要求しない inspection-only route とし、linearized check の warning/status は共有 completion へ渡す。
