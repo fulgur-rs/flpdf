@@ -1,4 +1,3 @@
-use std::collections::BTreeMap;
 use std::io::{Read, Seek, Write};
 
 use flpdf::filters::{DecodeLimits, StreamDecodeEvent};
@@ -231,74 +230,31 @@ fn write_object_details<R: Read + Seek>(
             writeln!(stdout, "Uncompressed stream data:")?;
 
             let stream_ref = terminal_ref;
-            // qpdf resolves one object into its persistent cache and then
-            // reuses that parsed value for every DecodeParms warning
-            // (`QPDF.cc:1700-1704`). Keep the qtest-only source-offset
-            // compatibility lookup on the same one-read boundary: a malformed
-            // next-object offset must not consume one global fallback retry
-            // per filter index when several warnings point into one container.
+            // Each warning already carries the offending value's own parsed
+            // offset (`ObjectHandle::try_get_parsed_offset`), captured once
+            // when `resolve_stream_dictionary_handle` first inspected it
+            // (`driver/handle.rs::DecodeParamTypeWarning::offset`). qpdf's own
+            // `QPDFObjectHandle::typeWarning` (`libqpdf/QPDFObjectHandle.cc:
+            // 2168-2187`) reports that same recorded parse position on the
+            // dereferenced offending handle, so no separate source re-read is
+            // needed to attribute a warning to its byte offset.
             let warnings = decode_dictionary.decode_param_type_warnings();
-            let mut object_body_refs = Vec::new();
-            let mut array_item_indices: BTreeMap<ObjectRef, Vec<usize>> = BTreeMap::new();
-            for warning in warnings {
-                match warning.source {
-                    DecodeParmsWarningSource::ObjectBody(object_ref) => {
-                        object_body_refs.push(object_ref);
-                    }
-                    DecodeParmsWarningSource::ArrayItem(object_ref, index) => {
-                        array_item_indices
-                            .entry(object_ref)
-                            .or_default()
-                            .push(index);
-                    }
-                    DecodeParmsWarningSource::StreamDictionary => {}
-                }
-            }
-            object_body_refs.sort_unstable();
-            object_body_refs.dedup();
-            let object_body_offsets = pdf
-                .qtest_object_value_source_offsets(&object_body_refs)?
-                .into_iter()
-                .enumerate()
-                .map(|(index, offset)| (object_body_refs[index], offset))
-                .collect::<BTreeMap<_, _>>();
-            let mut array_item_offsets: BTreeMap<_, BTreeMap<_, _>> = BTreeMap::new();
-            for (object_ref, indices) in array_item_indices {
-                let offsets = pdf.qtest_array_item_source_offsets(object_ref, &indices)?;
-                array_item_offsets.insert(object_ref, indices.into_iter().zip(offsets).collect());
-            }
-
             let decode_param_warnings = warnings
                 .iter()
                 .map(|warning| {
-                    let (object_ref, offset) = match warning.source {
+                    let object_ref = match warning.source {
                         DecodeParmsWarningSource::StreamDictionary => {
-                            let object_ref = stream_ref.ok_or_else(|| {
+                            stream_ref.ok_or_else(|| {
                                 Error::System(
                                     "stream DecodeParms warning has no terminal indirect object"
                                         .to_string(),
                                 )
-                            })?;
-                            let offset = pdf.qtest_decode_parms_source_offset(
-                                object_ref,
-                                warning.filter_index,
-                            )?;
-                            (object_ref, offset)
+                            })?
                         }
-                        DecodeParmsWarningSource::ObjectBody(object_ref) => (
-                            object_ref,
-                            object_body_offsets.get(&object_ref).copied().flatten(),
-                        ),
-                        DecodeParmsWarningSource::ArrayItem(object_ref, index) => (
-                            object_ref,
-                            array_item_offsets
-                                .get(&object_ref)
-                                .and_then(|offsets| offsets.get(&index))
-                                .copied()
-                                .flatten(),
-                        ),
+                        DecodeParmsWarningSource::ObjectBody(object_ref)
+                        | DecodeParmsWarningSource::ArrayItem(object_ref, _) => object_ref,
                     };
-                    Ok((object_ref, warning.object_type, offset))
+                    Ok((object_ref, warning.object_type, warning.offset))
                 })
                 .collect::<flpdf::Result<Vec<_>>>()?;
             for (object_ref, object_type, offset) in &decode_param_warnings {
@@ -339,10 +295,7 @@ fn write_object_details<R: Read + Seek>(
                 },
             ) {
                 Ok(decoded) => {
-                    let offset = terminal_ref
-                        .map(|object_ref| pdf.source_stream_data_offset(object_ref))
-                        .transpose()?
-                        .flatten();
+                    let offset = u64::try_from(chased.try_get_parsed_offset()?).ok();
                     stdout.flush()?;
                     for event in decoded.events {
                         match event {
@@ -399,10 +352,7 @@ fn write_object_details<R: Read + Seek>(
                     if message == "stream filter type is not name or array"
                         || message == "stream /DecodeParms length is inconsistent with filters" =>
                 {
-                    let offset = terminal_ref
-                        .map(|object_ref| pdf.source_stream_data_offset(object_ref))
-                        .transpose()?
-                        .flatten();
+                    let offset = u64::try_from(chased.try_get_parsed_offset()?).ok();
                     let diagnostic = QpdfExc::new(
                         QpdfErrorCode::DamagedPdf,
                         filename,

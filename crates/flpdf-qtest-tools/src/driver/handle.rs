@@ -7,6 +7,16 @@ pub(crate) struct DecodeParamTypeWarning {
     pub(crate) filter_index: usize,
     pub(crate) object_type: &'static str,
     pub(crate) source: DecodeParmsWarningSource,
+    /// The offending value's own parsed offset
+    /// ([`ObjectHandle::try_get_parsed_offset`]), captured at the moment this
+    /// warning is generated rather than re-derived later.
+    ///
+    /// This mirrors qpdf's `QPDFObjectHandle::typeWarning`
+    /// (`libqpdf/QPDFObjectHandle.cc:2168-2187`), which reports the
+    /// dereferenced offending handle's own recorded parse position — the
+    /// same field `getParsedOffset()` exposes — not a separately re-derived
+    /// byte offset.
+    pub(crate) offset: Option<u64>,
 }
 
 /// Where a `/DecodeParms` type-warning's object/offset attribution comes
@@ -174,6 +184,7 @@ pub(crate) fn resolve_stream_dictionary_handle<R: Read + Seek>(
                     && matches!(normalized, b"Crypt" | b"FlateDecode" | b"LZWDecode")
                 {
                     let params = params.as_ref().expect("non-null DecodeParms");
+                    let offset = params.try_get_parsed_offset()?;
                     warnings.push(DecodeParamTypeWarning {
                         filter_index,
                         object_type: params.type_name().unwrap_or("unresolved"),
@@ -181,6 +192,7 @@ pub(crate) fn resolve_stream_dictionary_handle<R: Read + Seek>(
                             .get(filter_index)
                             .copied()
                             .unwrap_or(DecodeParmsWarningSource::StreamDictionary),
+                        offset: u64::try_from(offset).ok(),
                     });
                 }
                 if normalized == b"Crypt"
@@ -814,11 +826,13 @@ mod tests {
                     filter_index: 0,
                     object_type: "integer",
                     source: DecodeParmsWarningSource::StreamDictionary,
+                    offset: None,
                 },
                 DecodeParamTypeWarning {
                     filter_index: 1,
                     object_type: "integer",
                     source: DecodeParmsWarningSource::StreamDictionary,
+                    offset: None,
                 },
             ]
         );
@@ -851,11 +865,18 @@ mod tests {
                     filter_index: 0,
                     object_type: "integer",
                     source: DecodeParmsWarningSource::ArrayItem(ObjectRef::new(5, 0), 0),
+                    // Real token position of the first `9` in `[ 9 9 ]`
+                    // (object 5's body in `handle_pdf`'s synthetic source),
+                    // captured from the value's own parsed offset rather
+                    // than a fixed sentinel, since this fixture is a
+                    // genuinely parsed object.
+                    offset: Some(121),
                 },
                 DecodeParamTypeWarning {
                     filter_index: 1,
                     object_type: "integer",
                     source: DecodeParmsWarningSource::ArrayItem(ObjectRef::new(5, 0), 1),
+                    offset: Some(123),
                 },
             ]
         );
