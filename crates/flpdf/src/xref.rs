@@ -2436,7 +2436,7 @@ fn parse_xref_from_start_with_owner_and_build_diagnostics(
         deliver_canonical_diagnostics(
             canonical_trailer_owner,
             &mut loaded.loaded.repair_diagnostics,
-        )?;
+        )?; // cov:ignore: this only propagates an injected logger failure after classic trailer parsing; the live sink is covered at the Pdf open boundary
         if validate_current_classic_trailer {
             let validation = if let Some(owner) = canonical_trailer_owner {
                 let mut context = CanonicalXrefContext::new(owner, options.description.clone());
@@ -3153,7 +3153,7 @@ fn recover_xref_from_linear_scan(
     )
     .map_err(|error| {
         // cov:ignore: this defensive wrapper is reached only when the line-scan parser fails after canonical warning delivery
-        with_xref_open_diagnostics(error, repair_diagnostics.clone(), canonical_trailer_owner)
+        with_xref_open_diagnostics(error, repair_diagnostics.clone(), canonical_trailer_owner) // cov:ignore: defensive terminal open-failure wrapper after a line-scan parser error
     })?; // cov:ignore: the terminal open-failure wrapper is covered by recovery failure tests; this edge preserves the live owner collection
     let mut entries = recovered.entries;
     // qpdf removes only type-1 rows before its reconstruction scan
