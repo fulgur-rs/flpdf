@@ -329,6 +329,45 @@ fn argv_page_label_config_rejects_invalid_specs_at_initialization() {
 }
 
 #[test]
+fn argv_page_label_option_table_rejects_an_option_before_its_terminator() {
+    let mut job = QPDFJob::new();
+    let error = job
+        .initialize_from_argv(&[
+            "qpdfjob".to_owned(),
+            "input.pdf".to_owned(),
+            "output.pdf".to_owned(),
+            "--set-page-labels".to_owned(),
+            "1:D".to_owned(),
+            "--remove-page-labels".to_owned(),
+        ])
+        .expect_err("page-label specs must reject options before --");
+    assert!(matches!(
+        &error,
+        Error::Usage(usage)
+            if usage.to_string() == "unrecognized argument --remove-page-labels"
+    ));
+}
+
+#[test]
+fn argv_page_label_option_table_requires_a_terminator() {
+    let mut job = QPDFJob::new();
+    let error = job
+        .initialize_from_argv(&[
+            "qpdfjob".to_owned(),
+            "input.pdf".to_owned(),
+            "output.pdf".to_owned(),
+            "--set-page-labels".to_owned(),
+            "1:D".to_owned(),
+        ])
+        .expect_err("page-label specs must be terminated with --");
+    assert!(matches!(
+        &error,
+        Error::Usage(usage)
+            if usage.to_string() == "--set-page-labels must be terminated with --"
+    ));
+}
+
+#[test]
 fn argv_job_run_writes_output_and_reports_progress() {
     let input = Path::new(env!("CARGO_MANIFEST_DIR")).join("../../tests/fixtures/minimal.pdf");
     let tempdir = tempfile::tempdir().unwrap();
