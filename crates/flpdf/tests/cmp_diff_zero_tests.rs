@@ -214,12 +214,18 @@ fn one_two_three_page_mode_matrix_is_byte_identical_to_qpdf() {
     }
 }
 
-/// Preserve mode on a source with no object streams has nothing to preserve,
-/// so qpdf's `enqueueObject`/`writeStandard` walk is the same live-queue walk
-/// as Disable mode (`QPDFWriter.cc:2038-2140`). Pin that equivalence directly
-/// -- not just each mode's separate qpdf golden match above -- so a future
-/// change that reintroduces a second code path for this case is caught even
-/// if it happens to still match the golden bytes.
+/// Preserve mode on a source with no object streams has nothing to preserve:
+/// `preserveObjectStreams` returns before it builds any mapping
+/// (`QPDFWriter.cc:1941-1945`), so the walk, the version floor and the
+/// cross-reference form all match Disable (`:1097-1106`, `:2172-2173`,
+/// `:3023-3025`).
+///
+/// This states the equivalence directly rather than leaving it implied by the
+/// two separate golden comparisons above. It does not, on its own, pin which
+/// internal route serves the case: both routes match the same golden bytes for
+/// these fixtures, so reverting the routing keeps this test green. Pinning the
+/// route needs a source that has a cross-reference stream but zero type-2
+/// entries, and `tests/fixtures/compat/` has none today (`flpdf-jvud`).
 #[test]
 fn preserve_with_no_source_object_streams_matches_disable_byte_for_byte() {
     for fixture in ["one-page", "two-page", "three-page"] {

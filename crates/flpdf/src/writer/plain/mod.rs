@@ -21,16 +21,25 @@ pub(crate) fn write_plain<R: Read + Seek, W: Write>(
     // The live Disable queue preserves the mutation/progress timing contract
     // for the ordinary unnormalized route. QDF and page-content normalization
     // need the planned writer's second dimension (QDF framing or normalized
-    // stream buffers), while the selected object-stream mode remains Disable.
+    // stream buffers), so they stay on the plan-based path whichever
+    // object-stream mode is selected.
     //
-    // qpdf's Preserve mode keeps whatever object streams the source already
-    // has (`QPDFWriter.cc:2038-2140`); when the source has none, there is
-    // nothing to preserve, so `enqueueObject`/`writeStandard` walk the object
-    // graph exactly as they do for Disable -- Preserve and Disable are the
-    // same live-queue walk in that case, not two different algorithms. Route
-    // that case through the same live queue rather than the plan-based path,
-    // which exists to place source-backed and generated object-stream
-    // containers that this case does not have.
+    // qpdf's `preserveObjectStreams` returns immediately when the source has
+    // no object streams (`QPDFWriter.cc:1941-1945`):
+    //
+    //     std::map<int, int> omap;
+    //     QPDF::Writer::getObjectStreamData(m->pdf, omap);
+    //     if (omap.empty()) {
+    //         return;
+    //     }
+    //
+    // `object_to_object_stream` then stays empty, so `enqueueObject` never
+    // takes its container branch (`:1097-1106`), no 1.5 floor is applied
+    // (`:2172-2173`), and the file gets a classic cross-reference table
+    // (`:3023-3025`) -- exactly the Disable shape. Route that case through the
+    // same live queue rather than the plan-based path, which exists to place
+    // the source-backed and generated object-stream containers this case does
+    // not have.
     let is_live_disable_shaped = options.object_streams == ObjectStreamMode::Disable
         || (options.object_streams == ObjectStreamMode::Preserve
             && !plan::source_has_compressed_entries(pdf));
