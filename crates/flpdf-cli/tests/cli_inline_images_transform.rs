@@ -347,6 +347,9 @@ fn assert_page_images_match(qpdf_output: &Path, flpdf_output: &Path) {
 /// CLAUDE.md allows as deviation (A) never reaches the output and this
 /// comparison needs no `qpdf-zlib-compat` feature.
 fn assert_qdf_bytes_match(input: &Path, extra_flags: &[&str], label: &str) {
+    if !qpdf_or_skip() {
+        return;
+    }
     let directory = tempfile::tempdir().expect("tempdir");
     let qpdf_output = directory.path().join("qpdf.pdf");
     let flpdf_output = directory.path().join("flpdf.pdf");
@@ -511,6 +514,19 @@ fn top_level_externalize_inline_images_honors_inclusive_payload_threshold() {
     if qpdf_above_limit_result.is_some() {
         assert_page_images_match(&qpdf_above_limit, &above_limit);
     }
+    // At `--ii-min-bytes=6` the five-byte image stays inline, so no XObject is
+    // produced and both page-image arrays are empty. Compare the whole file so
+    // the retained `BI ... EI` content itself is checked.
+    assert_qdf_bytes_match(
+        &input,
+        &["--externalize-inline-images", "--ii-min-bytes=6"],
+        "above the inclusive threshold",
+    );
+    assert_qdf_bytes_match(
+        &input,
+        &["--externalize-inline-images", "--ii-min-bytes=5"],
+        "at the inclusive threshold",
+    );
 }
 
 #[test]
