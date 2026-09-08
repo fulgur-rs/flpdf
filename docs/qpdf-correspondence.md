@@ -1179,6 +1179,7 @@ rotationのpage countは`QPDFJob::handleRotations` (`QPDFJob.cc:2638`) の`QIntC
 `flpdf-nyzp` では、同じ `QPDFJob::doCheck` の try 境界に属する encryption report と linearization check の失敗も `map_in_try_error` → `finish_check_error` へ通す。これにより qpdf と同じ bare `ERROR: <what()>`、最後の単一 `qpdf: errors detected`、および logger 配送失敗の `Operation` 保持を、既存の extension/page/writer 検査と同じ job boundary で実現する (`QPDFJob.cc:752-794`)。
 
 `optimizeImages` は `QPDFJob.cc:2151-2174` の変換順序に合わせ、inline image の外部化を先に行ったうえで、`PageObjectHelper::for_each_image(true)` が返す page/Form XObject を `job/image_optimization.rs` で走査する。`Pl_DCT.cc:249-295` 相当の JPEG 圧縮結果が元 `/Length` より短い場合だけ、元辞書を shallow-copy した新 stream に `/Filter /DCTDecode` と null `/DecodeParms` を設定し、provider として遅延登録する。qpdf 11.9.0 `image-optimization.test` の24行および最適化JPEG raw bytesを照合済みである。job JSON の生成 handler (`auto_job_json_init.hh:317-322,386-400`) と Config (`QPDFJob_config.cc:176-180,232-235,357-360,422-447`) は `job/lifecycle.rs` の `JobConfiguration` に接続し、`iiMinBytes` / `oiMin*` は qpdf の `QUtil::string_to_uint` と同じ unsigned-prefix parser を通す。`externalizeInlineImages` と `optimizeImages` を併用した場合は、明示 externalize が `keepInlineImages` より優先する qpdf の条件を保ったまま canonical image phase を一度だけ実行する。
+`flpdf-wz4i` では、qpdf の `createQPDF` が image transformation と attachment add/remove/copy を同じ document lifecycle で実行する責務（`QPDFJob.cc:459-480,2046-2140,2147-2247`）に合わせ、top-level image flags を attachment mutation/inspection routesへ渡す。qpdf に対応する conflict は無いため、clap の image/attachment conflict を残さず、既存の canonical image と attachment primitives を順序どおり共有する。
 top-level argvの `--externalize-inline-images` も生成 handler (`auto_job_init.hh:38-55`) と同じbare option責務を `flpdf-cli` の `Cli`/`RewriteCommand` から `ImageTransformOptions` へ接続する。`--ii-min-bytes` は `QPDFJob_config.cc:232-235` の閾値をそのまま共有し、明示externalizeのみなら `PageObjectHelper::externalize_inline_images`、optimize併用なら qpdf順の共有image phaseを一度だけ呼ぶ。qpdf `inline-images.test` の22ケースで、EOF warning/exit status、named colorspace、damaged image、threshold、nested Form、QDF bytesを同一runの `harness.log` と `qtest-results.xml` で照合する。
 flpdf 側の repository-level oracle coverage は `crates/flpdf-cli/tests/cli_inline_images_transform.rs` が qpdf 11.9.0（PATH 上の実行ファイル、`--version` で版を検証）を直接実行し、8通りの externalize/optimize/keep 条件、`--pages`、nested Form、named colorspace、画像なし、damaged inline image、inclusive threshold を比較する。比較は 2 層で、page-image JSON（qpdf 出力・flpdf 出力の両方を qpdf で読む）に加えて、`--pages` / nested Form / damaged の各ケースでは `--qdf --static-id` の **whole-file byte 比較**と stderr・exit code の一致も確認する。JSON だけでは 2 種類の穴が塞げない。(1) nested Form: qpdf の `doJSONPages` は page 直下の XObject しか列挙しない（`QPDFJob.cc:1044` → `QPDFPageObjectHelper.cc:376-384`）のに対し `externalizeInlineImages` は Form XObject の resources へも再帰する（`QPDFPageObjectHelper.cc:430-434`）ため、変換の有無にかかわらず両側とも `[]` になる。inline のまま残る truth table 行と閾値超えのケースも、XObject が生成されないため同じく `[]` になる。(2) `--pages` の選択違い: こちらは配列が空なのではなく、**どちらのページを残しても同一の正規化メタデータ 1 件**になる（object 参照は正規化で落とし、異なる pixel payload は JSON に現れない）ため区別できない。いずれも whole-file byte 比較でのみ検出できる。`--qdf` は stream 圧縮を無効化するので DEFLATE 逸脱 (A) が出力に現れず、この byte 比較に `qpdf-zlib-compat` feature は不要である（qpdf 自身の `inline-images.test:93-94` も whole-file 比較を使う）。fixture は flpdf-authored で、qpdf-qtest の vendor copy や qtest-only shim は追加しない。
 
@@ -1207,7 +1208,14 @@ qpdf の password-error catch は `createQPDF` から `return nullptr` するた
 
 attachment 系フラグ（`--list-attachments` / `--show-attachment` /
 `--remove-attachment` / `--add-attachment` / `--copy-attachments-from`）との
-併用は qpdf が受理するが flpdf はまだ拒否しており、`flpdf-wz4i` で追跡する。
+併用は `flpdf-wz4i` で受理するようにした。qpdf 側に禁止分岐が無い
+（`QPDFJob_config.cc:443-447` は自分のメンバーしか触らず、`checkConfiguration`
+（`QPDFJob.cc:566-641`）に両フラグを見る分岐が無い）ためで、attachment phase は
+image phase と同じ `handleTransformations` 内で後に走る（`:2151-2177` →
+`:2230-2247`）。`--show-attachment` は qpdf 同様、引数確定の時点で標準出力を
+save pipeline として予約する（`QPDFJob.cc:621-625`）——これにより
+`setSave` が info を標準エラーへ移し（`QPDFLogger.cc:197-200`）、verbose の
+image 診断が payload と混ざらない。
 
 top-level `--flatten-annotations=all|screen|print` も `auto_job_init.hh:117` / `QPDFJob_config.cc:190-200` の choices を `flpdf-cli` の shared `run_rewrite` route に接続し、通常 rewrite と linearize rewrite の両方で `PageDocumentHelper::flatten_annotations` (`QPDFPageDocumentHelper.cc:55-77`) を実行する。`NeedAppearances` 時の `warnIfPossible` と stream filter warning の parsed-offset/suppression 境界も qpdf の warning/status contract に合わせる。
 

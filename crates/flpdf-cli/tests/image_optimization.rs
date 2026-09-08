@@ -402,34 +402,33 @@ fn rewrite_subcommand_applies_optimize_images_with_page_selection() {
 
 #[test]
 fn optimize_images_is_accepted_with_check_like_qpdf() {
+    if !qpdf_11_9_available() {
+        return;
+    }
     let tempdir = tempfile::tempdir().expect("tempdir");
     let input = tempdir.path().join("input.pdf");
     std::fs::write(&input, build_raw_grayscale_image_pdf(200, 200)).expect("write input");
 
-    let with_option = Command::cargo_bin("flpdf")
+    // `createQPDF` runs `handleTransformations` before `writeQPDF` picks the
+    // inspection branch (`QPDFJob.cc:473,484-491`), so the check report comes
+    // from the transformed document. Compare against qpdf itself rather than
+    // against flpdf without the flag: the check report never names the
+    // recompressed image, so a flpdf-vs-flpdf equality stays green whether or
+    // not the transformation actually runs.
+    let qpdf = ProcessCommand::new("/usr/bin/qpdf")
+        .args(["--optimize-images", "--check"])
+        .arg(&input)
+        .output()
+        .expect("run qpdf --check");
+    let flpdf = Command::cargo_bin("flpdf")
         .expect("flpdf binary")
         .args(["--optimize-images", "--check"])
         .arg(&input)
-        .assert()
-        .success();
-    let plain = Command::cargo_bin("flpdf")
-        .expect("flpdf binary")
-        .arg("--check")
-        .arg(&input)
-        .assert()
-        .success();
-
-    // flpdf currently accepts the flag on this route and drops it, so the
-    // check report is byte-for-byte the plain one. qpdf instead runs
-    // `handleTransformations` before `writeQPDF` picks the inspection branch
-    // (`QPDFJob.cc:474,484-491`), so its report reflects the transformed
-    // document. Pin the accept-and-drop behaviour here; `flpdf-w2fk` tracks
-    // wiring the transformation into the inspection routes.
-    assert_eq!(
-        with_option.get_output().stdout,
-        plain.get_output().stdout,
-        "the image option is currently dropped on the --check route"
-    );
+        .output()
+        .expect("run flpdf --check");
+    assert_eq!(flpdf.status.code(), qpdf.status.code());
+    assert_eq!(flpdf.stdout, qpdf.stdout);
+    assert_eq!(flpdf.stderr, qpdf.stderr);
 }
 
 #[test]
@@ -447,13 +446,17 @@ fn externalize_inline_images_is_accepted_with_check_like_qpdf() {
 }
 
 #[test]
-fn image_transform_options_are_accepted_with_inspection_modes_like_qpdf() {
+fn image_transform_options_are_applied_to_inspection_modes_like_qpdf() {
+    if !qpdf_11_9_available() {
+        return;
+    }
     let tempdir = tempfile::tempdir().expect("tempdir");
     let input = tempdir.path().join("input.pdf");
     std::fs::write(&input, build_raw_grayscale_image_pdf(200, 200)).expect("write input");
     let inspection_modes = [
         vec!["--show-npages"],
         vec!["--show-pages"],
+        vec!["--show-pages", "--with-images"],
         vec!["--show-xref"],
         vec!["--show-linearization"],
         vec!["--show-encryption"],
@@ -462,48 +465,263 @@ fn image_transform_options_are_accepted_with_inspection_modes_like_qpdf() {
 
     for image_option in ["--optimize-images", "--externalize-inline-images"] {
         for mode in &inspection_modes {
-            let with_option = Command::cargo_bin("flpdf")
+            let qpdf = ProcessCommand::new("/usr/bin/qpdf")
+                .arg(image_option)
+                .args(mode)
+                .arg(&input)
+                .output()
+                .expect("run qpdf inspection");
+            let flpdf = Command::cargo_bin("flpdf")
                 .expect("flpdf binary")
                 .arg(image_option)
                 .args(mode)
                 .arg(&input)
-                .assert()
-                .success();
-            let plain = Command::cargo_bin("flpdf")
-                .expect("flpdf binary")
-                .args(mode)
-                .arg(&input)
-                .assert()
-                .success();
-            // Accept-and-drop: identical inspection output with and without
-            // the image option. qpdf's own report differs because it runs the
-            // transformation first (`QPDFJob.cc:474`); `flpdf-w2fk` tracks
-            // closing that gap.
+                .output()
+                .expect("run flpdf inspection");
             assert_eq!(
-                with_option.get_output().stdout,
-                plain.get_output().stdout,
-                "{image_option} is currently dropped on {mode:?}"
+                flpdf.status.code(),
+                qpdf.status.code(),
+                "{image_option} {mode:?}"
             );
+            assert_eq!(flpdf.stdout, qpdf.stdout, "{image_option} {mode:?}");
+            assert_eq!(flpdf.stderr, qpdf.stderr, "{image_option} {mode:?}");
         }
     }
+
+    // `--show-pages --with-images` is the only inspection report that names the
+    // image objects, so it is the only one that can observe the transformation:
+    // `--optimize-images` installs a fresh stream through `pdf.newStream()`
+    // (`QPDFJob.cc:2156-2177`), moving /Im1 to a new object number. Without
+    // this the loop above would still pass if the wiring regressed, since qpdf
+    // and flpdf would then merely agree on the untransformed report.
+    let plain = Command::cargo_bin("flpdf")
+        .expect("flpdf binary")
+        .args(["--show-pages", "--with-images"])
+        .arg(&input)
+        .output()
+        .expect("run flpdf --show-pages --with-images");
+    let optimized = Command::cargo_bin("flpdf")
+        .expect("flpdf binary")
+        .args(["--optimize-images", "--show-pages", "--with-images"])
+        .arg(&input)
+        .output()
+        .expect("run flpdf --optimize-images --show-pages --with-images");
+    assert_ne!(
+        optimized.stdout, plain.stdout,
+        "--optimize-images must reach the --show-pages --with-images report"
+    );
+}
+
+/// A one-page PDF that carries both an optimizable raw image and an embedded
+/// file, built with the pinned qpdf so the attachment shape is qpdf's own.
+///
+/// `tests/fixtures/compat/attachment-two-page.pdf` has an attachment but no
+/// image, so the image phase is a no-op there and cannot show whether it ran.
+fn image_pdf_with_attachment(directory: &Path) -> std::path::PathBuf {
+    let image = directory.join("image.pdf");
+    let payload = directory.join("payload.txt");
+    let combined = directory.join("image-attachment.pdf");
+    std::fs::write(&image, build_raw_grayscale_image_pdf(200, 200)).expect("write image fixture");
+    std::fs::write(&payload, b"payload\n").expect("write payload");
+
+    let status = ProcessCommand::new("/usr/bin/qpdf")
+        .args(["--static-id", "--compress-streams=n", "--add-attachment"])
+        .arg(&payload)
+        .args(["--key=attachment.txt", "--"])
+        .arg(&image)
+        .arg(&combined)
+        .status()
+        .expect("run qpdf to attach the payload");
+    assert!(status.success(), "building the attachment fixture failed");
+    combined
 }
 
 #[test]
-fn optimize_images_conflicts_with_remove_attachment() {
-    // run_remove_attachment (and the other attachment-mutation dispatch
-    // branches) call their dedicated writers without ever consuming
-    // top_level_image_options, so the same silent-drop risk applies here.
+fn optimize_images_runs_with_remove_attachment_like_qpdf() {
+    if !qpdf_11_9_available() {
+        return;
+    }
     let tempdir = tempfile::tempdir().expect("tempdir");
-    let input = tempdir.path().join("input.pdf");
-    let output = tempdir.path().join("output.pdf");
-    std::fs::write(&input, build_raw_grayscale_image_pdf(200, 200)).expect("write input");
+    let input = image_pdf_with_attachment(tempdir.path());
+    let qpdf_output = tempdir.path().join("qpdf.pdf");
+    let flpdf_output = tempdir.path().join("flpdf.pdf");
 
-    Command::cargo_bin("flpdf")
-        .expect("flpdf binary")
-        .args(["--optimize-images", "--remove-attachment=missing"])
+    let qpdf = ProcessCommand::new("/usr/bin/qpdf")
+        .args(["--optimize-images", "--remove-attachment=attachment.txt"])
         .arg(&input)
-        .arg(&output)
-        .assert()
-        .failure()
-        .code(2);
+        .arg(&qpdf_output)
+        .output()
+        .expect("run qpdf attachment/image combination");
+    assert!(qpdf.status.success(), "qpdf combination failed: {qpdf:?}");
+
+    let flpdf = Command::cargo_bin("flpdf")
+        .expect("flpdf binary")
+        .args(["--optimize-images", "--remove-attachment=attachment.txt"])
+        .arg(&input)
+        .arg(&flpdf_output)
+        .output()
+        .expect("run flpdf attachment/image combination");
+    assert_eq!(flpdf.status.code(), qpdf.status.code());
+
+    let qpdf_list = ProcessCommand::new("/usr/bin/qpdf")
+        .args(["--list-attachments"])
+        .arg(&qpdf_output)
+        .output()
+        .expect("list qpdf attachments");
+    let flpdf_list = Command::cargo_bin("flpdf")
+        .expect("flpdf binary")
+        .args(["--list-attachments"])
+        .arg(&flpdf_output)
+        .output()
+        .expect("list flpdf attachments");
+    assert_eq!(flpdf_list.status.code(), qpdf_list.status.code());
+    assert_eq!(flpdf_list.stdout, qpdf_list.stdout);
+    assert_eq!(flpdf_list.stderr, qpdf_list.stderr);
+
+    // The image phase has to have run: qpdf recompresses this raw image to
+    // DCT, and dropping the transformation would leave the filter list empty.
+    assert_eq!(image_filters(&qpdf_output), vec!["/DCTDecode"]);
+    assert_eq!(image_filters(&flpdf_output), vec!["/DCTDecode"]);
+    // Object identity proves the image phase ran before the attachment phase,
+    // the order `handleTransformations` uses (`QPDFJob.cc:2151-2157` then
+    // `:2229-2245`).
+    assert_eq!(image_object(&flpdf_output), image_object(&qpdf_output));
+}
+
+#[test]
+fn optimize_images_is_accepted_with_attachment_inspection_like_qpdf() {
+    if !qpdf_11_9_available() {
+        return;
+    }
+    let input = Path::new(env!("CARGO_MANIFEST_DIR"))
+        .join("../../tests/fixtures/compat/attachment-two-page.pdf");
+
+    let qpdf_list = ProcessCommand::new("/usr/bin/qpdf")
+        .args(["--optimize-images", "--list-attachments"])
+        .arg(&input)
+        .output()
+        .expect("run qpdf attachment listing");
+    let flpdf_list = Command::cargo_bin("flpdf")
+        .expect("flpdf binary")
+        .args(["--optimize-images", "--list-attachments"])
+        .arg(&input)
+        .output()
+        .expect("run flpdf attachment listing");
+    assert_eq!(flpdf_list.status.code(), qpdf_list.status.code());
+    assert_eq!(flpdf_list.stdout, qpdf_list.stdout);
+    assert_eq!(flpdf_list.stderr, qpdf_list.stderr);
+
+    let qpdf_show = ProcessCommand::new("/usr/bin/qpdf")
+        .args(["--optimize-images", "--show-attachment=attachment.txt"])
+        .arg(&input)
+        .output()
+        .expect("run qpdf attachment show");
+    let flpdf_show = Command::cargo_bin("flpdf")
+        .expect("flpdf binary")
+        .args(["--optimize-images", "--show-attachment=attachment.txt"])
+        .arg(&input)
+        .output()
+        .expect("run flpdf attachment show");
+    assert_eq!(flpdf_show.status.code(), qpdf_show.status.code());
+    assert_eq!(flpdf_show.stdout, qpdf_show.stdout);
+    assert_eq!(flpdf_show.stderr, qpdf_show.stderr);
+}
+
+#[test]
+fn optimize_images_is_accepted_with_empty_attachment_inspection_like_qpdf() {
+    if !qpdf_11_9_available() {
+        return;
+    }
+    let qpdf = ProcessCommand::new("/usr/bin/qpdf")
+        .args(["--empty", "--optimize-images", "--show-attachment=missing"])
+        .output()
+        .expect("run qpdf empty attachment inspection");
+    let flpdf = Command::cargo_bin("flpdf")
+        .expect("flpdf binary")
+        .env("FLPDF_PROGNAME", "qpdf")
+        .args(["--empty", "--optimize-images", "--show-attachment=missing"])
+        .output()
+        .expect("run flpdf empty attachment inspection");
+    assert_eq!(flpdf.status.code(), qpdf.status.code());
+    assert_eq!(flpdf.stdout, qpdf.stdout);
+    assert_eq!(flpdf.stderr, qpdf.stderr);
+}
+
+#[test]
+fn optimize_images_is_accepted_with_add_and_copy_attachment_like_qpdf() {
+    if !qpdf_11_9_available() {
+        return;
+    }
+    let tempdir = tempfile::tempdir().expect("tempdir");
+    let payload = tempdir.path().join("payload.txt");
+    std::fs::write(&payload, b"payload").expect("write payload");
+    let base =
+        Path::new(env!("CARGO_MANIFEST_DIR")).join("../../tests/fixtures/compat/one-page.pdf");
+    let donor = Path::new(env!("CARGO_MANIFEST_DIR"))
+        .join("../../tests/fixtures/compat/attachment-two-page.pdf");
+
+    let qpdf_add = tempdir.path().join("qpdf-add.pdf");
+    let flpdf_add = tempdir.path().join("flpdf-add.pdf");
+    let qpdf = ProcessCommand::new("/usr/bin/qpdf")
+        .args(["--optimize-images", "--add-attachment"])
+        .arg(&payload)
+        .args(["--key=newkey", "--"])
+        .arg(&base)
+        .arg(&qpdf_add)
+        .output()
+        .expect("run qpdf add attachment");
+    assert!(qpdf.status.success(), "qpdf add failed: {qpdf:?}");
+    let flpdf = Command::cargo_bin("flpdf")
+        .expect("flpdf binary")
+        .arg("--optimize-images")
+        .arg(&base)
+        .args(["--add-attachment"])
+        .arg(&payload)
+        .args(["--key=newkey", "--"])
+        .arg(&flpdf_add)
+        .output()
+        .expect("run flpdf add attachment");
+    assert!(flpdf.status.success(), "flpdf add failed: {flpdf:?}");
+
+    let qpdf_copy = tempdir.path().join("qpdf-copy.pdf");
+    let flpdf_copy = tempdir.path().join("flpdf-copy.pdf");
+    let qpdf = ProcessCommand::new("/usr/bin/qpdf")
+        .args(["--optimize-images", "--copy-attachments-from"])
+        .arg(&donor)
+        .args(["--"])
+        .arg(&base)
+        .arg(&qpdf_copy)
+        .output()
+        .expect("run qpdf copy attachments");
+    assert!(qpdf.status.success(), "qpdf copy failed: {qpdf:?}");
+    let flpdf = Command::cargo_bin("flpdf")
+        .expect("flpdf binary")
+        .arg("--optimize-images")
+        .arg(&base)
+        .args(["--copy-attachments-from"])
+        .arg(&donor)
+        .args(["--"])
+        .arg(&flpdf_copy)
+        .output()
+        .expect("run flpdf copy attachments");
+    assert!(flpdf.status.success(), "flpdf copy failed: {flpdf:?}");
+
+    for (qpdf_output, flpdf_output, key) in [
+        (&qpdf_add, &flpdf_add, "newkey"),
+        (&qpdf_copy, &flpdf_copy, "attachment.txt"),
+    ] {
+        let qpdf_list = ProcessCommand::new("/usr/bin/qpdf")
+            .arg("--list-attachments")
+            .arg(qpdf_output)
+            .output()
+            .expect("list qpdf attachment output");
+        let flpdf_list = Command::cargo_bin("flpdf")
+            .expect("flpdf binary")
+            .arg("--list-attachments")
+            .arg(flpdf_output)
+            .output()
+            .expect("list flpdf attachment output");
+        assert!(String::from_utf8_lossy(&qpdf_list.stdout).contains(key));
+        assert!(String::from_utf8_lossy(&flpdf_list.stdout).contains(key));
+    }
 }
