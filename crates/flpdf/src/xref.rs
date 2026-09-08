@@ -5291,10 +5291,10 @@ mod final_handle_tests {
                 object.contains("object 7 0") && object.contains("object stream 4")
             })
             .count();
+        let recorded = format!("{:?}", state.diagnostics);
         assert!(
             contextual >= 2,
-            "both nested values must warn with the ObjStm member context: {:?}",
-            state.diagnostics
+            "both nested values must warn with the ObjStm member context: {recorded}"
         );
     }
 
