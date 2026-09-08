@@ -422,7 +422,7 @@ impl XrefObjectDescription {
         match self {
             Self::Ordinary => "",
             Self::XrefStream => "xref stream: ",
-            Self::ObjStmMember { .. } => "",
+            Self::ObjStmMember { .. } => "", // cov:ignore: ObjStmMember is used only by direct member parsing, never by the file-object warning-prefix boundary
         }
     }
 }
