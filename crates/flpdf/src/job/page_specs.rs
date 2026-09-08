@@ -7,8 +7,8 @@
 //! documents stay alive for the whole operation, matching qpdf's page heap.
 
 use super::page_merge::{
-    merge_documents_with_resource_decisions_and_preserve_primary, source_top_level_field_names,
-    MergeInput,
+    merge_documents_with_resource_decisions_and_preserve_primary_into,
+    source_top_level_field_names, MergeInput,
 };
 use super::page_plan::PagePlan;
 use super::resource_pruning::{
@@ -47,7 +47,8 @@ pub struct PageSpecInput {
 /// existing fresh primary-based merge target because the copied foreign graph
 /// must outlive the source-page operation. The caller must keep the source
 /// documents alive while using either result's returned document.
-pub enum PageSpecJobOutput<'a, R: Read + Seek + 'static> {
+pub enum PageSpecJobOutput<'a, R: Read + Seek + 'static, T: Read + Seek + 'static = Cursor<Vec<u8>>>
+{
     /// The primary document was updated in place by the single-source page
     /// job. `result` is the page-tree rebuild result used by later job stages.
     InPlace {
@@ -59,7 +60,7 @@ pub enum PageSpecJobOutput<'a, R: Read + Seek + 'static> {
         prune_mode: RemoveUnreferencedResources,
     },
     /// A fresh target produced by the multi-source foreign-copy route.
-    Merged(Box<Pdf<std::io::Cursor<Vec<u8>>>>),
+    Merged(Box<Pdf<T>>),
 }
 
 /// Select pages from one already-opened source, retaining source identities.
@@ -334,11 +335,17 @@ impl PageSpecInput {
     }
 }
 
-fn merge_preserving_primary<R: Read + Seek>(
+fn merge_preserving_primary_into<R: Read + Seek, T: Read + Seek>(
     inputs: &mut [MergeInput<'_, R>],
     remove_resources: &[bool],
-) -> Result<Pdf<Cursor<Vec<u8>>>> {
-    merge_documents_with_resource_decisions_and_preserve_primary(inputs, remove_resources, true)
+    target: Pdf<T>,
+) -> Result<Pdf<T>> {
+    merge_documents_with_resource_decisions_and_preserve_primary_into(
+        inputs,
+        remove_resources,
+        true,
+        target,
+    )
 }
 
 /// A selected page represented by its source and its occurrence within the
@@ -349,8 +356,8 @@ type OrderedPage = (usize, usize);
 /// addition to the typed compatibility projection.
 type JobLabelEntry = (i64, LabelRange, bool);
 
-fn collect_primary_fields(
-    merged: &mut Pdf<Cursor<Vec<u8>>>,
+fn collect_primary_fields<T: Read + Seek>(
+    merged: &mut Pdf<T>,
     pages: &[ObjectRef],
 ) -> Result<Vec<ObjectHandle>> {
     let mut field_refs = BTreeSet::new();
@@ -402,8 +409,8 @@ fn collect_primary_fields(
 /// cannot participate in the loop's collision-avoidance check -- a repeated
 /// or foreign field that would collide with that name in qpdf can receive
 /// the wrong `+N` suffix here.
-fn replace_merged_fields(
-    merged: &mut Pdf<Cursor<Vec<u8>>>,
+fn replace_merged_fields<T: Read + Seek>(
+    merged: &mut Pdf<T>,
     fields: Vec<ObjectHandle>,
     had_fields_array: bool,
 ) -> Result<()> {
@@ -435,7 +442,7 @@ fn replace_merged_fields(
 /// intermediate field would make the replay rename the field against itself
 /// (`QPDFJob.cc:2514-2584`). Existing `/DR`, `/DA`, and other AcroForm keys are
 /// intentionally left in place for the replay's lazy initialization boundary.
-fn clear_grouped_foreign_fields_for_replay(merged: &mut Pdf<Cursor<Vec<u8>>>) -> Result<()> {
+fn clear_grouped_foreign_fields_for_replay<T: Read + Seek>(merged: &mut Pdf<T>) -> Result<()> {
     let Some(root_ref) = merged.root_ref() else {
         return Ok(());
     };
@@ -455,8 +462,8 @@ fn clear_grouped_foreign_fields_for_replay(merged: &mut Pdf<Cursor<Vec<u8>>>) ->
 /// Repair grouped-copy annotation `/P` values after the final page order is
 /// restored. qpdf installs this back-pointer at each final page-copy event,
 /// while the structural merge initially copies pages in source-group order.
-fn set_annotation_page_refs(
-    merged: &mut Pdf<Cursor<Vec<u8>>>,
+fn set_annotation_page_refs<T: Read + Seek>(
+    merged: &mut Pdf<T>,
     page_ref: ObjectRef,
     first_output_page: ObjectRef,
 ) -> Result<()> {
@@ -487,8 +494,8 @@ fn set_annotation_page_refs(
 /// occurrence-sensitive copies in `ordered_pages` order. The existing
 /// `PageObjectHelper` facades own the same-document and foreign field-tree
 /// transforms and collision-rename routes.
-fn rebuild_acroform_in_final_page_order<R: Read + Seek + 'static>(
-    merged: &mut Pdf<Cursor<Vec<u8>>>,
+fn rebuild_acroform_in_final_page_order<R: Read + Seek + 'static, T: Read + Seek>(
+    merged: &mut Pdf<T>,
     sources: &mut [Pdf<R>],
     source_page_refs: &[Vec<ObjectRef>],
     grouped_pages: &[Vec<usize>],
@@ -648,6 +655,7 @@ fn merge_job_label_ranges(ranges: Vec<JobLabelEntry>) -> Vec<JobLabelEntry> {
 /// see that method for the parameter contract. Kept as a free function,
 /// rather than inlined into the method, so tests can drive it directly
 /// without spinning up a whole `QPDFJob`.
+#[cfg(test)]
 fn handle_page_specs<R: Read + Seek + 'static>(
     job: &mut super::QPDFJob,
     sources: &mut [Pdf<R>],
@@ -656,6 +664,32 @@ fn handle_page_specs<R: Read + Seek + 'static>(
     resource_mode: RemoveUnreferencedResources,
     preserve_unreferenced: bool,
 ) -> Result<Pdf<Cursor<Vec<u8>>>> {
+    handle_page_specs_into(
+        job,
+        sources,
+        specs,
+        collate,
+        resource_mode,
+        preserve_unreferenced,
+        Pdf::empty()?,
+    )
+}
+
+/// Execute qpdf's page-spec operation using a caller-provided target.
+///
+/// The target is normally qpdf's empty document. `QPDFJob::createQPDF` passes
+/// its erased job document so the complete create boundary can return one
+/// `JobDocument` regardless of whether page selection copied pages across
+/// source documents.
+fn handle_page_specs_into<R: Read + Seek + 'static, T: Read + Seek + 'static>(
+    job: &mut super::QPDFJob,
+    sources: &mut [Pdf<R>],
+    specs: &[PageSpecInput],
+    collate: Option<&[usize]>,
+    resource_mode: RemoveUnreferencedResources,
+    preserve_unreferenced: bool,
+    target: Pdf<T>,
+) -> Result<Pdf<T>> {
     if sources.is_empty() {
         return Err(Error::Unsupported(
             "--pages: a primary source document is required".into(),
@@ -812,12 +846,13 @@ fn handle_page_specs<R: Read + Seek + 'static>(
         })
         .collect();
     let mut merged = if preserve_unreferenced {
-        merge_preserving_primary(&mut merge_inputs, &remove_resources)?
+        merge_preserving_primary_into(&mut merge_inputs, &remove_resources, target)?
     } else {
-        merge_documents_with_resource_decisions_and_preserve_primary(
+        merge_documents_with_resource_decisions_and_preserve_primary_into(
             &mut merge_inputs,
             &remove_resources,
             false,
+            target,
         )? // cov:ignore: llvm-cov attributes this executed multiline merge call to its closing delimiter
     };
     drop(merge_inputs);
@@ -976,6 +1011,35 @@ impl super::QPDFJob {
         resource_mode: RemoveUnreferencedResources,
         preserve_unreferenced: bool,
     ) -> Result<PageSpecJobOutput<'a, R>> {
+        self.handle_page_specs_with_target(
+            sources,
+            specs,
+            collate,
+            resource_mode,
+            preserve_unreferenced,
+            Pdf::empty()?,
+        )
+    }
+
+    /// Execute page selection with a caller-owned target reader type.
+    ///
+    /// This is the job-owned target boundary used by `createQPDF`: the target
+    /// is constructed with the same erased reader type as the primary job
+    /// document, so a multi-source page operation remains inside the
+    /// create/write lifecycle instead of returning a second document type.
+    pub(crate) fn handle_page_specs_with_target<
+        'a,
+        R: Read + Seek + 'static,
+        T: Read + Seek + 'static,
+    >(
+        &mut self,
+        sources: &'a mut [Pdf<R>],
+        specs: &[PageSpecInput],
+        collate: Option<&[usize]>,
+        resource_mode: RemoveUnreferencedResources,
+        preserve_unreferenced: bool,
+        target: Pdf<T>,
+    ) -> Result<PageSpecJobOutput<'a, R, T>> {
         let keep_files_open = self.keep_files_open_for_page_specs(specs);
         // qpdf never replaces the primary input's `InputSource` here, but it
         // selects the secondary-source implementation before page-spec reads
@@ -1002,13 +1066,14 @@ impl super::QPDFJob {
             });
         }
 
-        handle_page_specs(
+        handle_page_specs_into(
             self,
             sources,
             specs,
             collate,
             resource_mode,
             preserve_unreferenced,
+            target,
         )
         .map(|merged| PageSpecJobOutput::Merged(Box::new(merged)))
     }

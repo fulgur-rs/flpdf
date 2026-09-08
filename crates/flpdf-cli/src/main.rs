@@ -6773,7 +6773,8 @@ fn run_page_extraction_after_plan<R: Read + Seek + 'static>(
         if prior_warnings {
             split_job.record_warnings();
         }
-        return finish_job_exit_status(split_job.complete(true)?);
+        split_job.complete(true)?;
+        return finish_job_exit_status(split_job.get_exit_code());
     } else {
         let announce_file = standard_output.is_none();
         write_with_pdf_writer(
@@ -7020,7 +7021,8 @@ fn run_rewrite_with_page_ops_opened<R: Read + Seek + 'static>(
         // Fold source warnings into the split job before completing it, as the
         // ordinary write path does for its source document.
         split_job.record_document_warnings(&pdf);
-        return finish_job_exit_status(split_job.complete(true)?);
+        split_job.complete(true)?;
+        return finish_job_exit_status(split_job.get_exit_code());
     } else {
         let announce_file = standard_output.is_none();
         write_with_pdf_writer(
@@ -7940,7 +7942,8 @@ fn finish_show_encryption<R: Read + Seek>(
 ) -> CliResult<()> {
     job.show_encryption(pdf, password_is_hex_key)?;
     job.record_document_warnings(pdf);
-    finish_job_exit_status(job.complete(false)?)
+    job.complete(false)?;
+    finish_job_exit_status(job.get_exit_code())
 }
 
 /// Lowercase hex encoding (qpdf `--show-encryption-key` format).
@@ -8401,17 +8404,8 @@ fn finish_warning_state(has_warnings: bool, creates_output: bool, no_warn: bool)
         job.record_warnings();
     }
 
-    match job.complete(creates_output)? {
-        JobExitCode::Success => Ok(()),
-        JobExitCode::Error => Err(Box::new(CliExitError {
-            code: ExitCode::Errors,
-            message: String::new(),
-        })),
-        JobExitCode::Warning => Err(Box::new(CliExitError {
-            code: ExitCode::Warnings,
-            message: String::new(),
-        })),
-    }
+    job.complete(creates_output)?;
+    finish_job_exit_status(job.get_exit_code())
 }
 
 fn emit_content_normalization_warnings(
@@ -8839,7 +8833,8 @@ fn run_add_attachment(
         job.record_warnings();
     }
     job.record_document_warnings(&pdf);
-    finish_job_exit_status(job.complete(true)?)
+    job.complete(true)?;
+    finish_job_exit_status(job.get_exit_code())
 }
 
 /// `--remove-attachment KEY [input] [output]`
@@ -9070,7 +9065,8 @@ fn run_copy_attachments_from(
         job.record_warnings();
     }
     job.record_document_warnings(&pdf);
-    finish_job_exit_status(job.complete(true)?)
+    job.complete(true)?;
+    finish_job_exit_status(job.get_exit_code())
 }
 
 #[cfg(test)]

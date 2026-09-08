@@ -1140,18 +1140,21 @@ flpdfも `PdfOpenOptions` のread-side opt-in/error gateを撤去し、`--allow-
 `parse_encrypt_segment` のwriter policyに限定する。これは既存挙動維持の例外ではなく、qpdf
 11.9.0のread/write responsibilityへの収束である。
 
-`QPDFJob::writeQPDF`（`QPDFJob.cc:484-503`）は、出力またはinspectionを完了した後に
-文書のopen-time/lazy warningを集約し、`createsOutput()`（同 `:529-532`）に応じて
-`operation succeeded with warnings` または `operation succeeded with warnings; resulting
-file may have some problems` を一度だけ出力する。終了コード3の判定は同 `:534-563`、
-inspection側のwarning集約は `doInspection`（同 `:1646-1693`）がoracleである。
-flpdfは `job/lifecycle.rs::QPDFJob::write_json` / `QPDFJob::inspect` と、未移行のCLI経路では
-`crates/flpdf-cli/src/main.rs` の `finish_warning_state` / `finish_operation_warnings`
-を共通完了境界とし、rewrite/QDF/page-operation/attachment-write/JSON fileをoutput-producing
-経路、show/list/stream/JSON stdout/encryption inspectionをinspection経路として同じsuffix
-選択を行う。すべての成功出力を先に完了してから終了コード3を返し、fatal errorの途中では
-success summaryを出さない。JSONの `--json-output PATH` はqpdfの出力ファイル相当として
-resulting-file suffixを持ち、stdout JSONはinspection suffixを持つ。
+`QPDFJob::createQPDF`（`QPDFJob.cc:428-481`）は update-JSON、page selection、rotation、
+under/overlay、transformationsを完了してからdocumentを返し、`writeQPDF`
+（同 `:484-503`）は `createsOutput()`（同 `:529-532`）に応じて inspection / split /
+writeを選ぶ。flpdfも `QPDFJob::create_qpdf` 内の `prepare_document` /
+`prepare_document_transformations` と `QPDFJob::write_qpdf` にこの境界を集約し、`run` は
+create→write→`get_exit_code` の合成だけを担う。multi-source page selectionのerased target
+とprovider-backed source ownerはcreate stageからwrite stageまで保持する。
+
+`writeQPDF` は選択した処理の後に文書のopen-time/lazy warningを集約し、warning summaryと
+memory reportを一度だけ出力する。終了コード3の判定は `QPDFJob.cc:534-563`、inspection側の
+warning集約は `doInspection`（同 `:1646-1693`）がoracleである。flpdfでは
+`write_qpdf` が `get_warnings` 相当のdrainとcompletionを行い、`get_exit_code` は logger/
+documentを変更しない純粋なqueryになった。JSON versionに出力先が無い場合はqpdfの暗黙
+stdout outputとして扱い、resulting-file suffixを選ぶ。既存の standalone CLI completion
+consumerは別の段階移行として残る。
 
 `QPDFJob::handleTransformations` の `remove_restrictions` 分岐は
 `QPDFAcroFormDocumentHelper::disableDigitalSignatures` を呼ぶだけで、成功時の独自

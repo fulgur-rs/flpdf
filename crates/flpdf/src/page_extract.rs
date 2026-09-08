@@ -267,8 +267,8 @@ pub fn extract_page<R: Read + Seek>(
 /// New object numbers for clones are allocated by the target's canonical
 /// `make_indirect_object_handle` registry, so repeated calls into a growing
 /// target cannot collide with prior handle allocations.
-pub(crate) fn append_selection_kids(
-    target: &mut Pdf<Cursor<Vec<u8>>>,
+pub(crate) fn append_selection_kids<RT: Read + Seek>(
+    target: &mut Pdf<RT>,
     selected: &[ObjectRef],
     map: &std::collections::BTreeMap<ObjectRef, ObjectRef>,
     used: &mut BTreeSet<ObjectRef>,
@@ -303,7 +303,7 @@ pub(crate) fn append_selection_kids(
 }
 
 /// Resolve the target catalog's `/Pages` root ref.
-pub(crate) fn target_pages_root(target: &mut Pdf<Cursor<Vec<u8>>>) -> Result<ObjectRef> {
+pub(crate) fn target_pages_root<RT: Read + Seek>(target: &mut Pdf<RT>) -> Result<ObjectRef> {
     let catalog = target.root_handle()?;
     catalog
         .try_get_key(b"/Pages")?
@@ -318,8 +318,8 @@ pub(crate) fn target_pages_root(target: &mut Pdf<Cursor<Vec<u8>>>) -> Result<Obj
 /// boundary; this test helper keeps the non-dictionary error classification
 /// covered without reintroducing a raw snapshot route.
 #[cfg(test)]
-fn resolve_dict(
-    target: &mut Pdf<Cursor<Vec<u8>>>,
+fn resolve_dict<RT: Read + Seek>(
+    target: &mut Pdf<RT>,
     r: ObjectRef,
     ctx: &'static str,
 ) -> Result<ObjectHandle> {
