@@ -96,7 +96,22 @@ impl QPDFJob {
                 }
             }
 
-            let decoded = object.get_stream_data(DecodeLevel::All)?;
+            // Mirror emit_show_object's reconciliation: qpdf's getStreamData
+            // decode failure records a typeWarning/decode warning and still
+            // succeeds with empty output (QPDFJob.cc:806-832 pipes without
+            // treating a warned decode failure as a hard error). Without
+            // this check, a filter flpdf attempts to decode (e.g. a
+            // malformed DCTDecode stream) surfaces get_stream_data's Err
+            // directly, producing an extra error and the wrong exit code
+            // instead of qpdf's warn-and-succeed-empty behavior.
+            let warning_count = pdf.repair_diagnostics().entries().len();
+            let decoded = match object.get_stream_data(DecodeLevel::All) {
+                Ok(data) => data,
+                Err(_error) if pdf.repair_diagnostics().entries().len() > warning_count => {
+                    return Ok(());
+                }
+                Err(error) => return Err(error),
+            };
             write_to_standard_output(&logger, decoded.as_ref())
         })
     }
