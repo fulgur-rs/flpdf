@@ -4338,7 +4338,7 @@ impl QPDFJob {
     where
         R: Read + Seek,
     {
-        self.write_json_with_version(pdf, 2, false, false, false, options, output)
+        self.write_json_with_version(pdf, 2, false, false, false, false, options, output)
     }
 
     /// Serialize one already-created document with the requested qpdf JSON
@@ -4351,13 +4351,21 @@ impl QPDFJob {
         test_json_schema: bool,
         json_output: bool,
         show_encryption_key: bool,
+        verbose: bool,
         options: JsonJobOptions<'_>,
         output: JsonJobOutput<'_>,
     ) -> std::result::Result<JobExitCode, JsonJobError>
     where
         R: Read + Seek,
     {
-        let creates_output = matches!(&output, JsonJobOutput::File { .. });
+        // qpdf keeps the output name for its own verbose report;
+        // `m->outfilename` is already null for `-` (`QPDFJob.cc:3036-3040`),
+        // which the caller mirrors by selecting `JsonJobOutput::Stdout`.
+        let output_filename = match &output {
+            JsonJobOutput::File { filename, .. } => Some((*filename).to_path_buf()),
+            JsonJobOutput::Stdout(_) => None,
+        };
+        let creates_output = output_filename.is_some();
         self.write_json_without_completion(
             pdf,
             version,
@@ -4367,6 +4375,21 @@ impl QPDFJob {
             options,
             output,
         )?;
+        // qpdf reports the written file from inside `writeOutfile`, after
+        // `writeJSON` closed the file pipeline and before `writeQPDF` emits the
+        // warning summary (`QPDFJob.cc:3042-3062` then `:493-503`), so a merged
+        // capture sees `wrote file` first. The raw output bytes are kept
+        // because qpdf prints `m->outfilename` itself rather than a lossy
+        // rendering of it.
+        if verbose {
+            if let Some(filename) = output_filename {
+                let mut message = self.message_prefix.as_bytes().to_vec();
+                message.extend_from_slice(b": wrote file ");
+                message.extend_from_slice(&path_description_bytes(&filename));
+                message.push(b'\n');
+                self.logger.info(message)?;
+            }
+        }
         self.drain_document_warnings(pdf);
         self.complete(creates_output)?;
         Ok(self.get_exit_code())

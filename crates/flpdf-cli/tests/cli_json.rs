@@ -415,6 +415,126 @@ fn json_output_file_verbose_reports_wrote_file_like_qpdf() {
 }
 
 #[test]
+fn json_output_file_verbose_orders_wrote_file_before_warning_summary() {
+    if skip_unless_qpdf_11_9() {
+        return;
+    }
+    // qpdf writes `wrote file` from inside `writeOutfile`
+    // (`QPDFJob.cc:3042-3062`) and the warning summary afterwards, from
+    // `writeQPDF` (`:493-503`). Capturing the streams separately loses the
+    // interleaving, so give both programs one shared descriptor.
+    let input = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+        .join("../../tests/fixtures/compat/missing-trailer-info.pdf");
+    let temp = tempfile::tempdir().unwrap();
+
+    let run = |program: &str, json: &std::path::Path, merged: &std::path::Path| {
+        let sink = std::fs::File::create(merged).unwrap();
+        let errors = sink.try_clone().unwrap();
+        let status = if program == "qpdf" {
+            ShellCommand::new("qpdf")
+                .args(["--verbose", "--json=2"])
+                .arg(&input)
+                .arg(json)
+                .stdout(sink)
+                .stderr(errors)
+                .status()
+                .unwrap()
+        } else {
+            std::process::Command::new(assert_cmd::cargo::cargo_bin("flpdf"))
+                .env("FLPDF_PROGNAME", "qpdf")
+                .args(["--verbose", "--json=2"])
+                .arg(&input)
+                .arg(json)
+                .stdout(sink)
+                .stderr(errors)
+                .status()
+                .unwrap()
+        };
+        let text = std::fs::read_to_string(merged).unwrap();
+        (
+            status.code(),
+            text.replace(&json.display().to_string(), "OUT"),
+        )
+    };
+
+    let (qpdf_code, qpdf_merged) = run(
+        "qpdf",
+        &temp.path().join("q.json"),
+        &temp.path().join("q.log"),
+    );
+    let (flpdf_code, flpdf_merged) = run(
+        "flpdf",
+        &temp.path().join("f.json"),
+        &temp.path().join("f.log"),
+    );
+
+    let wrote = qpdf_merged
+        .find("wrote file")
+        .expect("qpdf reports the file");
+    let summary = qpdf_merged
+        .find("operation succeeded with warnings")
+        .expect("qpdf reports the warning summary");
+    assert!(
+        wrote < summary,
+        "qpdf reports the written file before the summary: {qpdf_merged:?}"
+    );
+    assert_eq!(flpdf_code, qpdf_code);
+    assert_eq!(flpdf_merged, qpdf_merged);
+}
+
+#[cfg(unix)]
+#[test]
+fn json_output_file_verbose_preserves_non_utf8_output_name() {
+    if skip_unless_qpdf_11_9() {
+        return;
+    }
+    // qpdf streams `m->outfilename` straight through
+    // (`QPDFJob.cc:3059-3061`), so a non-UTF-8 name reaches the report byte
+    // for byte. `Path::display()` would substitute U+FFFD instead.
+    use std::os::unix::ffi::OsStrExt;
+    let input = write_temp_pdf(&one_page_pdf_with_stream());
+    let temp = tempfile::tempdir().unwrap();
+    let mut qpdf_name = temp.path().as_os_str().as_bytes().to_vec();
+    qpdf_name.extend_from_slice(b"/bad\xffq.json");
+    let mut flpdf_name = temp.path().as_os_str().as_bytes().to_vec();
+    flpdf_name.extend_from_slice(b"/bad\xfff.json");
+    let qpdf_output = std::ffi::OsStr::from_bytes(&qpdf_name);
+    let flpdf_output = std::ffi::OsStr::from_bytes(&flpdf_name);
+
+    let qpdf = ShellCommand::new("qpdf")
+        .args(["--verbose", "--json=2"])
+        .arg(input.path())
+        .arg(qpdf_output)
+        .output()
+        .unwrap();
+    let flpdf = Command::cargo_bin("flpdf")
+        .unwrap()
+        .env("FLPDF_PROGNAME", "qpdf")
+        .args(["--verbose", "--json=2"])
+        .arg(input.path())
+        .arg(flpdf_output)
+        .output()
+        .unwrap();
+
+    let normalize = |bytes: &[u8], name: &[u8]| {
+        let mut out = Vec::new();
+        let mut rest = bytes;
+        while let Some(at) = rest.windows(name.len()).position(|window| window == name) {
+            out.extend_from_slice(&rest[..at]);
+            out.extend_from_slice(b"OUT");
+            rest = &rest[at + name.len()..];
+        }
+        out.extend_from_slice(rest);
+        out
+    };
+    assert_eq!(
+        normalize(&flpdf.stdout, &flpdf_name),
+        normalize(&qpdf.stdout, &qpdf_name),
+        "the report must carry the raw output name, not a lossy rendering"
+    );
+}
+
+#[test]
 fn json_stdout_verbose_does_not_report_wrote_file() {
     let input = write_temp_pdf(&one_page_pdf_with_stream());
     let output = Command::cargo_bin("flpdf")

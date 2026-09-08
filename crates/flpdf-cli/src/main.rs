@@ -4161,6 +4161,7 @@ fn run_json_document<R: Read + Seek>(
             test_json_schema,
             json_output_mode,
             show_encryption_key,
+            cli.verbose,
             options,
             JsonJobOutput::File {
                 filename: path,
@@ -4181,6 +4182,7 @@ fn run_json_document<R: Read + Seek>(
             test_json_schema,
             json_output_mode,
             show_encryption_key,
+            cli.verbose,
             options,
             JsonJobOutput::Stdout(
                 runtime
@@ -4190,9 +4192,8 @@ fn run_json_document<R: Read + Seek>(
             ),
         )
     };
-    let output_file = output_path;
     match json_result {
-        Ok(JobExitCode::Success) => report_json_output_file(cli, runtime.job, output_file)?,
+        Ok(JobExitCode::Success) => {}
         Ok(JobExitCode::Error) => {
             return Err(Box::new(CliExitError {
                 code: ExitCode::Errors,
@@ -4200,7 +4201,6 @@ fn run_json_document<R: Read + Seek>(
             }))
         }
         Ok(JobExitCode::Warning) => {
-            report_json_output_file(cli, runtime.job, output_file)?;
             return Err(Box::new(CliExitError {
                 code: ExitCode::Warnings,
                 message: String::new(),
@@ -4209,19 +4209,6 @@ fn run_json_document<R: Read + Seek>(
         Err(JsonJobError::Output(error)) => return Err(Box::new(Error::from(error))),
         Err(JsonJobError::Usage(error)) => return Err(Box::new(error)),
         Err(JsonJobError::Completion(error)) => return Err(Box::new(error)),
-    }
-    Ok(())
-}
-
-fn report_json_output_file(cli: &Cli, job: &QPDFJob, output_path: Option<&Path>) -> CliResult<()> {
-    if cli.verbose {
-        if let Some(output_path) = output_path {
-            job.logger().info(format!(
-                "{}: wrote file {}\n",
-                job.message_prefix(),
-                output_path.display()
-            ))?;
-        }
     }
     Ok(())
 }

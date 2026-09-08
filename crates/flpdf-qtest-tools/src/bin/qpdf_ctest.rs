@@ -559,6 +559,7 @@ fn write_json_test_output<R: Read + Seek>(
             false,
             true,
             false,
+            false,
             options,
             JsonJobOutput::File {
                 filename: &output,
