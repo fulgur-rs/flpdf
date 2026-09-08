@@ -2533,6 +2533,44 @@ mod object_emitter_tests {
     }
 
     #[test]
+    fn enqueue_ignores_an_object_stream_that_contains_itself() -> crate::Result<()> {
+        // A specially constructed file can name a container that is itself a
+        // member. qpdf stores the invalid object ID `0` before recursing and
+        // ignores the object when it meets that sentinel again
+        // (`libqpdf/QPDFWriter.cc:1097-1104,1120-1124`), dropping the looping
+        // object instead of recursing forever.
+        let container = ObjectRef::new(5, 0);
+        let mut pdf = super::object_emitter_tests::pdf();
+        let mut queue = LiveQueue::new(BTreeSet::new());
+        queue.register_object_streams(&[object_streams::ObjectStreamGroup::SourceBacked {
+            source: container,
+            members: vec![container],
+        }]);
+
+        let handle = pdf.get_object_handle(container);
+        assert_eq!(queue.enqueue_handle(&mut pdf, handle)?, None);
+        assert!(queue.old_to_new.is_empty());
+
+        // A two-container cycle takes the same path one level deeper.
+        let other = ObjectRef::new(6, 0);
+        let mut queue = LiveQueue::new(BTreeSet::new());
+        queue.register_object_streams(&[
+            object_streams::ObjectStreamGroup::SourceBacked {
+                source: container,
+                members: vec![other],
+            },
+            object_streams::ObjectStreamGroup::SourceBacked {
+                source: other,
+                members: vec![container],
+            },
+        ]);
+        let handle = pdf.get_object_handle(container);
+        assert_eq!(queue.enqueue_handle(&mut pdf, handle)?, None);
+        assert!(queue.old_to_new.is_empty());
+        Ok(())
+    }
+
+    #[test]
     fn register_object_streams_skips_a_group_whose_members_are_all_removed() {
         let source = ObjectRef::new(3, 0);
         let member = ObjectRef::new(2, 0);
