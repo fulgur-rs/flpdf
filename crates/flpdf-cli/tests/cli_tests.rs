@@ -6368,15 +6368,31 @@ fn top_level_coalesce_contents_conflicts_with_empty() {
 }
 
 #[test]
-fn top_level_generate_appearances_conflicts_with_check() {
-    // Silent-shadow guard: --check's inspection dispatch never reaches the
-    // rewrite path that reads `args.generate_appearances`.
-    Command::cargo_bin("flpdf")
+fn top_level_generate_appearances_accepts_check_like_qpdf() {
+    let input = "../../tests/fixtures/compat/form-fields-and-annotations.pdf";
+    let qpdf = ProcessCommand::new("qpdf")
+        .args(["--generate-appearances", "--check", input])
+        .output()
+        .expect("qpdf 11.9.0 must be available");
+    let flpdf = Command::cargo_bin("flpdf")
         .unwrap()
-        .args(["--generate-appearances", "--check", "in.pdf"])
-        .assert()
-        .failure()
-        .code(2);
+        .args(["--generate-appearances", "--check", input])
+        .output()
+        .unwrap();
+
+    assert_eq!(
+        flpdf.status.code(),
+        qpdf.status.code(),
+        "top-level generate-appearances + check must preserve qpdf's exit status"
+    );
+    assert_eq!(
+        flpdf.stdout, qpdf.stdout,
+        "top-level generate-appearances + check must preserve qpdf's report"
+    );
+    assert_eq!(
+        flpdf.stderr, qpdf.stderr,
+        "top-level generate-appearances + check must preserve qpdf diagnostics"
+    );
 }
 
 #[test]

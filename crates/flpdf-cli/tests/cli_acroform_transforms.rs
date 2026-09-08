@@ -31,6 +31,7 @@ use flpdf::{AnnotationObjectHelper, DecodeLevel, Pdf};
 use std::fs::File;
 use std::io::BufReader;
 use std::path::Path;
+use std::process::Command as ProcessCommand;
 
 mod common;
 use common::PdfCanonicalTestExt;
@@ -382,6 +383,50 @@ fn top_level_generate_appearances_routes_to_canonical_writer() {
     assert!(
         appearance.windows(2).any(|window| window == b"Tj"),
         "top-level --generate-appearances must render the field value"
+    );
+}
+
+/// qpdf applies generateAppearances before its read-only object inspection.
+/// The top-level CLI must expose the same transformed widget, not merely
+/// accept and discard the flag.
+#[test]
+fn top_level_generate_appearances_runs_before_show_object_like_qpdf() {
+    let temp = tempfile::tempdir().unwrap();
+    let input = temp.path().join("inspection-tx.pdf");
+    std::fs::write(&input, tx_widget_without_ap_needing_appearances()).unwrap();
+
+    let qpdf = ProcessCommand::new("qpdf")
+        .args(["--show-object=4", "--generate-appearances"])
+        .arg(&input)
+        .output()
+        .expect("qpdf 11.9.0 must be available");
+    assert!(qpdf.status.success(), "qpdf show-object failed: {qpdf:?}");
+    assert!(
+        qpdf.stdout
+            .windows(b"/AP".len())
+            .any(|window| window == b"/AP"),
+        "qpdf must expose the generated normal appearance: {}",
+        String::from_utf8_lossy(&qpdf.stdout)
+    );
+
+    let flpdf = Command::cargo_bin("flpdf")
+        .unwrap()
+        .args(["--show-object=4", "--generate-appearances"])
+        .arg(&input)
+        .output()
+        .unwrap();
+    assert_eq!(
+        flpdf.status.code(),
+        qpdf.status.code(),
+        "flpdf must accept the same inspection combination as qpdf"
+    );
+    assert!(
+        flpdf
+            .stdout
+            .windows(b"/AP".len())
+            .any(|window| window == b"/AP"),
+        "flpdf must inspect the transformed widget: {}",
+        String::from_utf8_lossy(&flpdf.stdout)
     );
 }
 
