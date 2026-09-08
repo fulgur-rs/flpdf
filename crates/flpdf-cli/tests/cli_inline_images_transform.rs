@@ -369,10 +369,74 @@ fn assert_qdf_bytes_match(input: &Path, extra_flags: &[&str], label: &str) {
         String::from_utf8_lossy(&flpdf.stderr).replace("flpdf:", ""),
         "{label}: diagnostics must match qpdf 11.9.0 apart from the program name"
     );
+    // Writing progress, diagnostics or PDF data to stdout is an observable CLI
+    // regression for any caller that pipes it, and neither the exit status nor
+    // the output file would show it.
+    assert_eq!(
+        String::from_utf8_lossy(&qpdf.stdout).replace("qpdf:", ""),
+        String::from_utf8_lossy(&flpdf.stdout).replace("flpdf:", ""),
+        "{label}: standard output must match qpdf 11.9.0 apart from the program name"
+    );
     assert_eq!(
         std::fs::read(&qpdf_output).expect("qpdf output"),
         std::fs::read(&flpdf_output).expect("flpdf output"),
         "{label}: --qdf output must be byte-identical to qpdf 11.9.0"
+    );
+}
+
+/// Whole-file `--qdf` comparison for the page-selection invocation.
+///
+/// [`assert_qdf_bytes_match`] takes its flags as a flat list, which cannot
+/// reproduce `--pages <file> 1 --` with the primary input placed before the
+/// segment. Run the same shape the metadata comparison uses so both checks
+/// exercise one parsing path.
+fn assert_page_selection_qdf_bytes_match(input: &Path) {
+    if !qpdf_or_skip() {
+        return;
+    }
+    let directory = tempfile::tempdir().expect("tempdir");
+    let qpdf_output = directory.path().join("qpdf-qdf.pdf");
+    let flpdf_output = directory.path().join("flpdf-qdf.pdf");
+
+    let qpdf = ProcessCommand::new("qpdf")
+        .args([
+            "--qdf",
+            "--externalize-inline-images",
+            "--ii-min-bytes=0",
+            "--static-id",
+        ])
+        .arg(input)
+        .args(["--pages"])
+        .arg(input)
+        .args(["1", "--"])
+        .arg(&qpdf_output)
+        .output()
+        .expect("qpdf 11.9.0 is available");
+    let flpdf = Command::cargo_bin("flpdf")
+        .expect("flpdf binary")
+        .args([
+            "--qdf",
+            "--externalize-inline-images",
+            "--ii-min-bytes=0",
+            "--static-id",
+        ])
+        .arg(input)
+        .args(["--pages"])
+        .arg(input)
+        .args(["1", "--"])
+        .arg(&flpdf_output)
+        .output()
+        .expect("run flpdf page selection");
+
+    assert_eq!(
+        qpdf.status.code(),
+        flpdf.status.code(),
+        "page selection: exit status must match qpdf 11.9.0"
+    );
+    assert_eq!(
+        std::fs::read(&qpdf_output).expect("qpdf output"),
+        std::fs::read(&flpdf_output).expect("flpdf output"),
+        "page selection: --qdf output must be byte-identical to qpdf 11.9.0"
     );
 }
 
@@ -700,18 +764,7 @@ fn page_selection_with_externalization_matches_qpdf() {
     assert_page_images_match(&qpdf_output, &flpdf_output);
     // The page-image JSON is identical for either selected page, so it cannot
     // tell them apart; the whole-file comparison can.
-    assert_qdf_bytes_match(
-        &input,
-        &[
-            "--externalize-inline-images",
-            "--ii-min-bytes=0",
-            "--pages",
-            ".",
-            "1",
-            "--",
-        ],
-        "page selection",
-    );
+    assert_page_selection_qdf_bytes_match(&input);
 }
 
 #[test]
