@@ -20,30 +20,28 @@ use crate::output::write_bytes;
 // `QPDFObjectHandle` methods, by contrast, all call `dereference()` on
 // entry (`libqpdf/QPDFObjectHandle.cc`'s accessor bodies), so a chain like
 // `trailer.getKey("/Info").getKey("/CreationDate")` transparently
-// dereferences at every hop. `resolve_handle`/`dict_key` below restore that
-// behavior explicitly: `dict_key` resolves its `handle` argument (the
-// receiver) before reading `key` off it, mirroring qpdf's implicit
-// dereference-before-use. `resolve_handle` alone is `dict_key`'s
-// leaf-position twin, for a handle whose *own* value (not a further child)
-// is about to be read or mutated.
+// dereferences at every hop. `ObjectHandle::try_get_key` (`pub`) already
+// resolves its own receiver before reading `key` off it, so dictionary-key
+// chases below call it directly instead of through a local wrapper.
+//
+// The resolving `try_as_*`/`try_is_*` family that mirrors this for a
+// handle's own *value* (as opposed to a further child) is `pub(crate)`-only
+// in `flpdf::object_handle` and, for several of the types this file reads
+// (`as_string`, `as_real`), has no resolving counterpart at all -- so it is
+// unreachable from this crate regardless. `resolve_handle` below restores
+// qpdf's implicit dereference-before-use for that case: resolve the handle
+// explicitly, then read its value with the plain, non-warning accessor and
+// its own documented default (`as_string` -> empty on mismatch) with no
+// stderr warning text. See this file's top-level caveats.
 //
 // `Pdf::resolve`'s underlying `ObjectHandle::try_dereference`
 // is a documented no-op for an already-direct or already-resolved handle,
-// so calling either helper on a handle that happens to be resolved already
+// so calling `resolve_handle` on one that happens to be resolved already
 // (for example, one returned by `PageDocumentHelper::get_all_pages`, whose
 // own repair walk may have already touched it) costs nothing.
 
 fn resolve_handle<R: Read + Seek>(pdf: &mut Pdf<R>, handle: &ObjectHandle) -> flpdf::Result<()> {
     pdf.resolve(handle)
-}
-
-fn dict_key<R: Read + Seek>(
-    pdf: &mut Pdf<R>,
-    handle: &ObjectHandle,
-    key: &[u8],
-) -> flpdf::Result<ObjectHandle> {
-    resolve_handle(pdf, handle)?;
-    Ok(handle.get_key(key))
 }
 
 /// qpdf source: `qpdf/test_driver.cc:286-308` (`test_2`).
@@ -68,30 +66,30 @@ pub(crate) fn run_test_2<R: Read + Seek>(
 ) -> flpdf::Result<()> {
     let trailer = pdf.trailer();
 
-    let info = dict_key(pdf, &trailer, b"/Info")?;
-    let creation_date = dict_key(pdf, &info, b"/CreationDate")?;
+    let info = trailer.try_get_key(b"/Info")?;
+    let creation_date = info.try_get_key(b"/CreationDate")?;
     resolve_handle(pdf, &creation_date)?;
     write_bytes(stdout, &creation_date.as_string().unwrap_or_default())?;
     writeln!(stdout)?;
 
-    let producer = dict_key(pdf, &info, b"/Producer")?;
+    let producer = info.try_get_key(b"/Producer")?;
     resolve_handle(pdf, &producer)?;
     write_bytes(stdout, &producer.as_string().unwrap_or_default())?;
     writeln!(stdout)?;
 
-    let encrypt = dict_key(pdf, &trailer, b"/Encrypt")?;
-    let o = dict_key(pdf, &encrypt, b"/O")?;
+    let encrypt = trailer.try_get_key(b"/Encrypt")?;
+    let o = encrypt.try_get_key(b"/O")?;
     resolve_handle(pdf, &o)?;
     write_bytes(stdout, &o.unparse())?;
     writeln!(stdout)?;
-    let u = dict_key(pdf, &encrypt, b"/U")?;
+    let u = encrypt.try_get_key(b"/U")?;
     resolve_handle(pdf, &u)?;
     write_bytes(stdout, &u.unparse())?;
     writeln!(stdout)?;
 
-    let root = dict_key(pdf, &trailer, b"/Root")?;
-    let pages = dict_key(pdf, &root, b"/Pages")?;
-    let kids = dict_key(pdf, &pages, b"/Kids")?;
+    let root = trailer.try_get_key(b"/Root")?;
+    let pages = root.try_get_key(b"/Pages")?;
+    let kids = pages.try_get_key(b"/Kids")?;
     resolve_handle(pdf, &kids)?;
     // qpdf's `getArrayItem(1)` warns and returns null on an out-of-range
     // index (`libqpdf/QPDFObjectHandle.cc:762-777`); `.get(1)` below
@@ -102,7 +100,7 @@ pub(crate) fn run_test_2<R: Read + Seek>(
         .as_array()
         .and_then(|items| items.get(1).cloned())
         .unwrap_or_else(ObjectHandle::null);
-    let contents = dict_key(pdf, &page, b"/Contents")?;
+    let contents = page.try_get_key(b"/Contents")?;
     resolve_handle(pdf, &contents)?;
     let data = contents.get_stream_data(DecodeLevel::Generalized)?;
     write_bytes(stdout, &data)?;
@@ -127,7 +125,7 @@ pub(crate) fn run_test_3<R: Read + Seek>(
     diagnostics_written: &mut usize,
 ) -> flpdf::Result<()> {
     let trailer = pdf.trailer();
-    let streams = dict_key(pdf, &trailer, b"/QStreams")?;
+    let streams = trailer.try_get_key(b"/QStreams")?;
     resolve_handle(pdf, &streams)?;
     let items = streams.as_array().unwrap_or_default();
     for (index, stream) in items.iter().enumerate() {
@@ -188,7 +186,7 @@ pub(crate) fn run_test_4<R: Read + Seek>(
     _diagnostics_written: &mut usize,
 ) -> flpdf::Result<()> {
     let trailer = pdf.trailer();
-    let mut qtest = trailer.get_key(b"/QTest");
+    let mut qtest = trailer.try_get_key(b"/QTest")?;
     qtest.make_direct(false)?;
     qtest.remove_key(b"/Subject");
     qtest.replace_key(
@@ -196,7 +194,7 @@ pub(crate) fn run_test_4<R: Read + Seek>(
         ObjectHandle::string(b"Mr. Potato Head".to_vec()),
     )?;
 
-    let array = qtest.get_key(b"/A");
+    let array = qtest.try_get_key(b"/A")?;
     if array
         .as_array()
         .and_then(|items| items.into_iter().next())
@@ -216,7 +214,7 @@ pub(crate) fn run_test_4<R: Read + Seek>(
         ])?;
     }
 
-    let mut qtest2 = trailer.get_key(b"/QTest2");
+    let mut qtest2 = trailer.try_get_key(b"/QTest2")?;
     if !qtest2.is_null() {
         qtest2.make_direct(true)?;
         trailer.replace_key(b"/QTest2", qtest2)?;
@@ -293,9 +291,9 @@ pub(crate) fn run_test_5<R: Read + Seek>(
     }
 
     let trailer = pdf.trailer();
-    let root = dict_key(pdf, &trailer, b"/Root")?;
+    let root = trailer.try_get_key(b"/Root")?;
 
-    let qstrings = dict_key(pdf, &root, b"/QStrings")?;
+    let qstrings = root.try_get_key(b"/QStrings")?;
     resolve_handle(pdf, &qstrings)?;
     if let Some(items) = qstrings.as_array() {
         writeln!(stdout, "QStrings:")?;
@@ -310,7 +308,7 @@ pub(crate) fn run_test_5<R: Read + Seek>(
         }
     }
 
-    let qnumbers = dict_key(pdf, &root, b"/QNumbers")?;
+    let qnumbers = root.try_get_key(b"/QNumbers")?;
     resolve_handle(pdf, &qnumbers)?;
     if let Some(items) = qnumbers.as_array() {
         writeln!(stdout, "QNumbers:")?;
@@ -392,8 +390,8 @@ pub(crate) fn run_test_6<R: Read + Seek>(
     _diagnostics_written: &mut usize,
 ) -> flpdf::Result<()> {
     let trailer = pdf.trailer();
-    let root = dict_key(pdf, &trailer, b"/Root")?;
-    let metadata = dict_key(pdf, &root, b"/Metadata")?;
+    let root = trailer.try_get_key(b"/Root")?;
+    let metadata = root.try_get_key(b"/Metadata")?;
     resolve_handle(pdf, &metadata)?;
     if metadata.type_code()? != 10 {
         return Err(Error::Internal(
@@ -441,8 +439,8 @@ pub(crate) fn run_test_7<R: Read + Seek>(
     _diagnostics_written: &mut usize,
 ) -> flpdf::Result<()> {
     let trailer = pdf.trailer();
-    let root = dict_key(pdf, &trailer, b"/Root")?;
-    let qstream = dict_key(pdf, &root, b"/QStream")?;
+    let root = trailer.try_get_key(b"/Root")?;
+    let qstream = root.try_get_key(b"/QStream")?;
     resolve_handle(pdf, &qstream)?;
     if qstream.type_code()? != 10 {
         return Err(Error::Internal(
@@ -517,8 +515,8 @@ pub(crate) fn run_test_8<R: Read + Seek>(
     _diagnostics_written: &mut usize,
 ) -> flpdf::Result<()> {
     let trailer = pdf.trailer();
-    let root = dict_key(pdf, &trailer, b"/Root")?;
-    let qstream = dict_key(pdf, &root, b"/QStream")?;
+    let root = trailer.try_get_key(b"/Root")?;
+    let qstream = root.try_get_key(b"/QStream")?;
     resolve_handle(pdf, &qstream)?;
     if qstream.type_code()? != 10 {
         return Err(Error::Internal(
@@ -571,7 +569,7 @@ pub(crate) fn run_test_9<R: Read + Seek>(
     _diagnostics_written: &mut usize,
 ) -> flpdf::Result<()> {
     let trailer = pdf.trailer();
-    let root = dict_key(pdf, &trailer, b"/Root")?;
+    let root = trailer.try_get_key(b"/Root")?;
     resolve_handle(pdf, &root)?;
 
     let qstream = pdf.new_stream_with_data(Rc::new(b"data for new stream\n".to_vec()))?;
