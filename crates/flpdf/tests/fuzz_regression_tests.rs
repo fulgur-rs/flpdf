@@ -48,11 +48,20 @@ fn roundtrip(data: &[u8]) {
 /// fails the test; `Err` results are the expected outcome for malformed input
 /// and are ignored.
 fn xref(data: &[u8]) {
-    let mut strict = Cursor::new(data);
-    let _ = flpdf::load_xref_and_trailer(&mut strict);
-
-    let mut repair = Cursor::new(data);
-    let _ = flpdf::load_xref_and_trailer_with_repair(&mut repair, true);
+    let _ = flpdf::Pdf::open_with_options(
+        Cursor::new(data.to_vec()),
+        PdfOpenOptions {
+            repair: false,
+            ..PdfOpenOptions::default()
+        },
+    );
+    let _ = flpdf::Pdf::open_with_options(
+        Cursor::new(data.to_vec()),
+        PdfOpenOptions {
+            repair: true,
+            ..PdfOpenOptions::default()
+        },
+    );
 }
 
 fn regressions_dir() -> PathBuf {

@@ -12,43 +12,19 @@ fn read_source(path: impl AsRef<Path>) -> String {
 #[test]
 fn dead_qpdf_routes_are_removed_and_canonical_owners_remain() {
     let keys = read_source("encryption/keys.rs");
-    assert!(
-        !keys.contains("fn per_object_key("),
-        "the dead per-object-key implementation remains"
-    );
-    assert!(
-        !keys.contains("#![allow(dead_code)]"),
-        "keys.rs still hides dead code"
-    );
+    assert!(!keys.contains("fn per_object_key("));
+    assert!(!keys.contains("#![allow(dead_code)]"));
 
     let standard = read_source("encryption/standard.rs");
-    assert!(
-        !standard.contains("keys::per_object_key"),
-        "standard encryption docs still point at the removed route"
-    );
+    assert!(!standard.contains("keys::per_object_key"));
     let primitives = read_source("encryption/primitives.rs");
-    assert!(
-        primitives.contains("fn compute_data_key("),
-        "the canonical shared data-key primitive is missing"
-    );
-    assert!(
-        !read_source("encryption/state.rs").contains("fn compute_data_key("),
-        "reader state still owns a duplicate data-key implementation"
-    );
-    assert!(
-        !read_source("writer/encryption_state.rs").contains("fn compute_data_key("),
-        "writer state still owns a duplicate data-key implementation"
-    );
+    assert!(primitives.contains("fn compute_data_key("));
+    assert!(!read_source("encryption/state.rs").contains("fn compute_data_key("));
+    assert!(!read_source("writer/encryption_state.rs").contains("fn compute_data_key("));
 
     let filters = read_source("filters.rs");
-    assert!(
-        !filters.contains("fn decode_stream_data_with_limits("),
-        "the dead whole-buffer limits wrapper remains"
-    );
-    assert!(
-        filters.contains("fn decode_stream_data_from_handle("),
-        "the canonical ObjectHandle decode route is missing"
-    );
+    assert!(!filters.contains("fn decode_stream_data_with_limits("));
+    assert!(filters.contains("fn decode_stream_data_from_handle("));
 
     let reader = read_source("reader.rs");
     for dead in [
@@ -59,10 +35,7 @@ fn dead_qpdf_routes_are_removed_and_canonical_owners_remain() {
         "fn qtest_decode_parms_source_offset(",
         "fn source_stream_data_offset(",
     ] {
-        assert!(
-            !reader.contains(dead),
-            "dead reader wrapper remains: {dead}"
-        );
+        assert!(!reader.contains(dead), "dead reader wrapper remains: {dead}");
     }
 
     let tracked = fs::read_to_string(
@@ -83,42 +56,40 @@ fn dead_qpdf_routes_are_removed_and_canonical_owners_remain() {
         "::MAX_RESOLUTION_FALLBACKS",
         "::parse_source_file_object_at",
     ] {
-        assert!(
-            !tracked.contains(dead),
-            "dead route remains tracked: {dead}"
-        );
+        assert!(!tracked.contains(dead), "dead route remains tracked: {dead}");
     }
 }
 
 #[test]
 fn canonical_xref_warnings_do_not_use_replay_or_deferred_bridges() {
     let engine = read_source("engine.rs");
-    assert!(
-        !engine.contains("replay_warnings("),
-        "canonical Pdf::open still replays xref warnings after parsing"
-    );
-    assert!(
-        !engine.contains("install_repair_diagnostics("),
-        "canonical Pdf::open still installs a second buffered warning channel"
-    );
+    assert!(!engine.contains("replay_warnings("));
+    assert!(!engine.contains("install_repair_diagnostics("));
 
     let resolver = read_source("reader/resolver.rs");
-    assert!(
-        !resolver.contains("replay_warnings("),
-        "ResolverHandle still exposes a warning replay route"
-    );
-    assert!(
-        !resolver.contains("defer_live_repair_diagnostics"),
-        "ResolverCore still carries the qpdf-less warning deferral state"
-    );
-    assert!(
-        !resolver.contains("begin_deferred_repair_diagnostics"),
-        "ResolverHandle still exposes the qpdf-less deferral API"
-    );
+    assert!(!resolver.contains("replay_warnings("));
+    assert!(!resolver.contains("defer_live_repair_diagnostics"));
+    assert!(!resolver.contains("begin_deferred_repair_diagnostics"));
 
     let xref = read_source("xref.rs");
-    assert!(
-        !xref.contains("DeferredDiagnosticsGuard"),
-        "xref recovery still reconciles two warning channels with a guard"
-    );
+    assert!(!xref.contains("DeferredDiagnosticsGuard"));
+}
+
+#[test]
+fn ownerless_xref_api_is_removed_in_favor_of_the_canonical_pdf_route() {
+    let lib = read_source("lib.rs");
+    assert!(!lib.contains("load_xref_and_trailer"));
+    assert!(!lib.contains("LoadedXref"));
+
+    let xref = read_source("xref.rs");
+    assert!(!xref.contains("load_xref_and_trailer"));
+    assert!(xref.contains("#[cfg(test)]\npub(crate) fn load_xref_state_with_options"));
+    for dead in [
+        "pub fn load_xref_and_trailer(",
+        "pub fn load_xref_and_trailer_with_repair(",
+        "pub fn load_xref_and_trailer_best_effort(",
+        "pub struct LoadedXref",
+    ] {
+        assert!(!xref.contains(dead), "owner-less xref surface remains: {dead}");
+    }
 }

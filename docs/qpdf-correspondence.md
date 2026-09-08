@@ -439,6 +439,13 @@ document-wide の独自 aggregate route ではなく、保持された各 leaf �
 
 `.48.73` では、canonical `Pdf::open` の xref/recovery warningを `ResolverHandle::push_qpdf_warning`へ qpdfのcall orderで直接配送し、engineのinstall/replayと`DeferredDiagnosticsGuard`を撤去した。owner-less standalone loaderのBootstrapHandleState、bounded reconstruction window、public loaderの第2 document stateは`.48.72`の残範囲である。
 
+`flpdf-3yn9.48.72` では、owner-less public `load_xref_and_trailer*`/`LoadedXref`
+surfaceを削除し、in-tree inspection callersを `Pdf::open` + `get_xref_table` /
+`trailer`へ移行した。qpdfに対応する独立 xref loaderは無く、read_xrefはprivate
+である（`include/qpdf/QPDF.hh:77-97,306-315,1000-1013`）。Bootstrap cache/
+detachは owner-less test scaffolding として残る bounded reconstruction testsを除き、
+production caller 0 を確認した。canonical warning sinkの責務は `.48.73` で完了済み。
+
 `flpdf-1f9f` では、owner-less bootstrap の ObjStm member parser にも member の description
 context を渡すようにした。そのため member 本体だけでなく、辞書・配列内の nested direct value も
 同じ `ObjectDescription::Template` を持つ。qpdf は member の警告を 3 つの断片から組み立てる —

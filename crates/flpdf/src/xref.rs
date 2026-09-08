@@ -45,7 +45,9 @@ use crate::{
 };
 use std::cell::{OnceCell, RefCell};
 use std::collections::{BTreeMap, BTreeSet, HashSet};
-use std::io::{Read, Seek, SeekFrom};
+#[cfg(test)]
+use std::io::SeekFrom;
+use std::io::{Read, Seek};
 use std::rc::{Rc, Weak};
 
 // The bootstrap resolver can re-enter once per indirect reference in a
@@ -55,7 +57,7 @@ const XREF_STACK_RED_ZONE: usize = 128 * 1024;
 const XREF_STACK_GROWTH_SIZE: usize = 1024 * 1024;
 
 #[derive(Debug, Clone)]
-pub struct LoadedXref {
+pub(crate) struct LoadedXref {
     pub version: String,
     pub startxref: u64,
     pub entries: BTreeMap<ObjectRef, XrefEntry>,
@@ -1707,70 +1709,7 @@ impl XrefObjectContext for CanonicalXrefContext<'_> {
     }
 }
 
-/// Load the cross-reference table and trailer dictionary from `reader`, with
-/// the qpdf-style recovery pass disabled (strict parse).
-///
-/// # Errors
-///
-/// Calls [`load_xref_and_trailer_with_repair`] with repair disabled, so it
-/// propagates the same errors that function raises when `allow_repair` is
-/// `false`:
-///
-/// - [`Error::Io`] when reading the input fails.
-/// - [`Error::Parse`] when the PDF header, `startxref`, or a cross-reference
-///   section is malformed (including a `startxref`/`/Prev` offset that does not
-///   fit `usize` and a circular `/Prev` chain), or when qpdf's classic trailer
-///   validation rejects `/Size` or `/Prev`.
-/// - [`Error::Missing`] when a required cross-reference stream entry (such as
-///   `/Size` or `/W`) is absent.
-/// - [`Error::Unsupported`] when a cross-reference stream uses an unsupported
-///   object or entry type.
-pub fn load_xref_and_trailer<R: Read + Seek>(reader: &mut R) -> Result<LoadedXref> {
-    load_xref_and_trailer_with_repair(reader, false)
-}
-
-/// Load the cross-reference table and trailer dictionary from `reader`, running
-/// the qpdf-style recovery pass when `allow_repair` is `true`.
-///
-/// # Errors
-///
-/// - [`Error::Io`] when seeking or reading the input fails.
-/// - [`Error::Parse`] when `allow_repair` is `false` and the PDF header is
-///   missing or its version is not UTF-8, or when `startxref`, a
-///   cross-reference table or stream, or a `/Prev` chain is malformed
-///   (including offsets that do not fit `usize` and a circular `/Prev` chain),
-///   or when a classic trailer fails qpdf's `/Size` or `/Prev` validation.
-/// - [`Error::OpenFailure`] when `allow_repair` is `true`, repair diagnostics
-///   were accumulated, and the linear scan still cannot recover a trailer.
-///   [`Error::open_failure`] exposes both the terminal source error and the
-///   preceding diagnostics.
-/// - [`Error::Missing`] when a required cross-reference stream entry (such as
-///   `/Size` or `/W`) is absent and `allow_repair` is `false`.
-/// - [`Error::Unsupported`] when a cross-reference stream uses an unsupported
-///   object or entry type and `allow_repair` is `false`.
-pub fn load_xref_and_trailer_with_repair<R: Read + Seek>(
-    reader: &mut R,
-    allow_repair: bool,
-) -> Result<LoadedXref> {
-    load_xref_state_with_options(
-        reader,
-        XrefLoadOptions {
-            allow_repair,
-            ..XrefLoadOptions::default()
-        },
-    )
-    .and_then(|mut state| {
-        // The bootstrap resolver is intentionally temporary: callers receive
-        // the xref/trailer snapshot, not a live Pdf. Preserve the trailer's
-        // observable indirect references as detached handles before the
-        // temporary cache's cycle-breaking Drop runs.
-        let bootstrap_cache = state.bootstrap_cache;
-        state.loaded.trailer = detach_bootstrap_handle(&state.loaded.trailer)?;
-        drop(bootstrap_cache);
-        Ok(state.loaded)
-    })
-}
-
+#[cfg(test)]
 fn detach_bootstrap_handle(source: &ObjectHandle) -> Result<ObjectHandle> {
     if let Some(object_ref) = source.object_ref() {
         return Ok(ObjectHandle::new_indirect_unresolved(
@@ -1814,6 +1753,7 @@ fn detach_bootstrap_handle(source: &ObjectHandle) -> Result<ObjectHandle> {
     Ok(ObjectHandle::from_value(value))
 }
 
+#[cfg(test)]
 pub(crate) fn load_xref_state_with_options<R: Read + Seek>(
     reader: &mut R,
     options: XrefLoadOptions,
@@ -3338,25 +3278,6 @@ fn merge_recovered_qpdf_state(
         &accumulated.bootstrap_cache,
     );
     recovered
-}
-
-/// Load the cross-reference table and trailer dictionary from `reader`, with the
-/// qpdf-style recovery pass always enabled (best-effort).
-///
-/// # Errors
-///
-/// Calls [`load_xref_and_trailer_with_repair`] with repair enabled, so
-/// malformed cross-reference data is recovered rather than reported. A missing
-/// header or invalid header version records qpdf's warning and uses version
-/// 1.2. It still fails with:
-///
-/// - [`Error::Io`] when seeking or reading the input fails.
-/// - [`Error::OpenFailure`] when repair diagnostics were accumulated but the
-///   linear scan cannot recover a trailer.
-///   [`Error::open_failure`] exposes both the terminal source error and the
-///   preceding diagnostics.
-pub fn load_xref_and_trailer_best_effort<R: Read + Seek>(reader: &mut R) -> Result<LoadedXref> {
-    load_xref_and_trailer_with_repair(reader, true)
 }
 
 /// Recover uncompressed object offsets and, when requested, the first valid
@@ -5248,6 +5169,21 @@ mod final_handle_tests {
     use std::io::Write;
     use std::time::{Duration, Instant};
 
+    fn load_xref_snapshot<R: Read + Seek>(
+        reader: &mut R,
+        allow_repair: bool,
+    ) -> Result<LoadedXref> {
+        let mut state = load_xref_state_with_options(
+            reader,
+            XrefLoadOptions {
+                allow_repair,
+                ..XrefLoadOptions::default()
+            },
+        )?;
+        state.loaded.trailer = detach_bootstrap_handle(&state.loaded.trailer)?;
+        Ok(state.loaded)
+    }
+
     fn malformed_candidate_fixture(count: usize) -> Vec<u8> {
         let mut bytes = b"%PDF-1.5\n".to_vec();
         for index in 1..=count {
@@ -5919,7 +5855,7 @@ mod final_handle_tests {
     fn timed_malformed_candidate_recovery(count: usize) -> Duration {
         let bytes = malformed_candidate_fixture(count);
         let started = Instant::now();
-        let error = load_xref_and_trailer_with_repair(&mut std::io::Cursor::new(&bytes), true)
+        let error = load_xref_snapshot(&mut std::io::Cursor::new(&bytes), true)
             .expect_err("the fixture has no trailer dictionary");
         assert!(error
             .to_string()
@@ -6774,7 +6710,7 @@ mod final_handle_tests {
     #[test]
     fn reconstructed_read_trailer_attributes_empty_candidate_to_trailer() {
         let bytes = b"%PDF-1.4\n1 0 obj\n<< /Type /Catalog >>\nendobj\ntrailer\nendobj\ntrailer\n<< /Size 2 /Root 1 0 R >>\nstartxref\n0\n%%EOF\n";
-        let loaded = load_xref_and_trailer_with_repair(&mut std::io::Cursor::new(bytes), true)
+        let loaded = load_xref_snapshot(&mut std::io::Cursor::new(bytes), true)
             .expect("the later dictionary candidate is recoverable");
         let warning = loaded
             .repair_diagnostics
@@ -6796,7 +6732,7 @@ mod final_handle_tests {
             )
             .as_bytes(),
         );
-        let loaded = load_xref_and_trailer_with_repair(&mut std::io::Cursor::new(bytes), true)
+        let loaded = load_xref_snapshot(&mut std::io::Cursor::new(bytes), true)
             .expect("repair mode keeps the parsed trailer after reporting the loop");
         assert_eq!(
             loaded
@@ -6935,7 +6871,7 @@ mod final_handle_tests {
         let (bytes, _) = classic_xref_with_trailer(trailer);
         let offset = trailer_value_offset(&bytes);
         let mut reader = std::io::Cursor::new(bytes);
-        let error = load_xref_and_trailer(&mut reader)
+        let error = load_xref_snapshot(&mut reader, false)
             .expect_err("strict classic trailer validation must reject the fixture");
 
         assert!(matches!(
@@ -7043,7 +6979,7 @@ mod final_handle_tests {
     #[test]
     fn candidate_xref_stream_wrong_size_warning_survives_later_decode_failure() {
         let bytes = b"%PDF-1.4\n1 0 obj\n<< /Type /XRef /W [1 0 1] /Size 1 /Length 4 >>\nstream\nabcd\nendstream\nendobj\n%%EOF\n";
-        let error = load_xref_and_trailer_with_repair(&mut std::io::Cursor::new(bytes), true)
+        let error = load_xref_snapshot(&mut std::io::Cursor::new(bytes), true)
             .expect_err("the malformed candidate must fail after warning");
         let (_, diagnostics) = error
             .open_failure()
@@ -7067,7 +7003,7 @@ mod final_handle_tests {
     #[test]
     fn nonzero_xref_stream_decode_warning_is_kept_before_recovery() {
         let bytes = b"%PDF-1.4\n1 0 obj\n<< /Type /XRef /W [1 0 1] /Size 1 /Length 4 >>\nstream\nabcd\nendstream\nendobj\nstartxref\n9\n%%EOF\n";
-        let loaded = load_xref_and_trailer_with_repair(&mut std::io::Cursor::new(bytes), true)
+        let loaded = load_xref_snapshot(&mut std::io::Cursor::new(bytes), true)
             .expect("the reconstruction re-entry must skip the already-registered entry");
         let messages: Vec<_> = loaded
             .repair_diagnostics
@@ -7449,7 +7385,7 @@ mod final_handle_tests {
     fn strict_classic_xref_rejects_non_integer_previous_offset() {
         let (bytes, offset) = classic_xref_with_malformed_previous();
         let mut reader = std::io::Cursor::new(bytes);
-        let error = load_xref_and_trailer(&mut reader)
+        let error = load_xref_snapshot(&mut reader, false)
             .expect_err("strict xref chain validation must reject malformed /Prev");
 
         assert!(matches!(
@@ -7466,7 +7402,7 @@ mod final_handle_tests {
     fn repair_mode_reports_classic_trailer_validation_before_recovery() {
         let (bytes, _) = classic_xref_with_trailer("<< /Root 1 0 R >>");
         let mut reader = std::io::Cursor::new(bytes);
-        let loaded = load_xref_and_trailer_with_repair(&mut reader, true)
+        let loaded = load_xref_snapshot(&mut reader, true)
             .expect("repair mode must recover a trailer missing /Size");
         let messages: Vec<_> = loaded
             .repair_diagnostics

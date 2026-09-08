@@ -372,6 +372,14 @@ engineの `install_repair_diagnostics` / `replay_warnings` と
 `XrefReadContext` → `LoadedXref` staging と第2 document stateのみで、
 `flpdf-3yn9.48.72` が担当する。
 
+### 2026-09-08 owner-less public xref cutover
+
+`flpdf-3yn9.48.72` で public `load_xref_and_trailer*`/`LoadedXref` exportと
+in-tree callerを撤去し、`Pdf::open` の canonical `get_xref_table`/`trailer`
+routeへ移行した。`load_xref_state_with_options` と BootstrapHandle stateは
+bounded reconstruction unit tests用にのみ残り、production callerは0である。
+canonical warning live sinkは sibling `.48.73` で完了済み。
+
 | probe | 対象行 | 必要な確認 |
 |---|---|---|
 | P1 | B14 | **解消（2026-09-08、`flpdf-3yn9.48.18`）**: `/Prev` が初段 startxref を指す classic PDFを qpdf 11.9.0 と flpdfで比較した。両方とも `file is damaged` / `loop detected following xref tables` / `Attempting to reconstruct cross-reference table` の3行・同順・exit 3で、既存の三連warningは一度だけ。追加した stream-token fixtureでは qpdf/flpdfとも `stream keyword found in trailer` が一度だけで、`merge_previous_xref_sections_with_observer` の seeded visitorが初段を再parseしないことを回帰テストで固定した。二重warningをbugとして扱わない。 |
@@ -394,7 +402,7 @@ engineの `install_repair_diagnostics` / `replay_warnings` と
 | `B27` | `flpdf-3yn9.48.12` | QPDF document stateをparse前から所有しclassic trailerを同じcacheへ生成する |
 | `B7` / `B8` / `B9` / `B10` / `B11` | `flpdf-3yn9.48.13` | bootstrap object readerをQPDF::readObjectAtOffset/readObject/readStreamへ移行する |
 | `B7` / `B12` | `flpdf-3yn9.48.14` | bootstrap ObjStm展開をcanonical resolveObjectsInStreamへ移行する |
-| `B27` | `flpdf-3yn9.48.15`（child `.48.72` / `.48.73`） | owner-less bootstrap API/第2 teardownを`.48.72`、canonical warning live sinkとreplay/deferral撤去を`.48.73`で実施する |
+| `B27` | `flpdf-3yn9.48.15`（child `.48.72` / `.48.73`） | owner-less public xref API/production bootstrap routeを`.48.72`、canonical warning live sinkとreplay/deferral撤去を`.48.73`で実施する |
 | `B2` / `B4` | `flpdf-3yn9.48.16` | content parserをQPDFParserのcontent_stream modeへ統合する |
 | `B5` | `flpdf-3yn9.48.17` | QPDF::inParse/ParseGuardのdocument再入契約を移植する |
 | `B7` / `B13` / `B14` | `flpdf-3yn9.48.18` | QPDF::read_xref/readTrailerの初段・Prev共通経路を移植する |
