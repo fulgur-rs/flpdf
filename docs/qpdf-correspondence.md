@@ -261,9 +261,10 @@ bounded-read/retry する設計だった。`flpdf-3yn9.48.44` で `test_0_1` の
 DecodeParms warning attribution を値自身の `try_get_parsed_offset` へ移したため、
 これら 3 つの source-reread API（`qtest_decode_parms_source_offset` を含む）は
 production caller 0 になった（残る参照は `tests/qpdf_route_hygiene_tests.rs` の
-存在チェックのみ）。API 自体の削除は `.25` に委ねる。qpdf に存在しない flpdf の
-`resolution_fallbacks_remaining` を filter index ごとに消費する再読は増やさず、
-既存の qtest-only offset boundary に閉じ込める。
+存在チェックのみ）。2026-09-08（`.25`）: その 3 本と `Pdf::source_stream_data_offset`、
+および qpdf に存在しない `resolution_fallbacks_remaining` の fallback budget を削除した。
+残る参照は `crates/flpdf/tests/qpdf_route_hygiene_tests.rs` がこれらの不在を検査する
+hygiene テストだけで、qtest-only の offset boundary 自体が無くなった。
 
 ### qtest renumber consumer (2026-08-31)
 

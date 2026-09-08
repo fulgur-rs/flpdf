@@ -343,17 +343,20 @@ qtest exceptionsは変更しない。
 
 | 分類 | 件数 | 行 |
 |---|---|---|
-| canonical | 14 | B1, B3, B5, B6, B15, B16, B17, B18, B19, B21, B23, B24, B28, B31 |
+| canonical | 15 | B1, B3, B5, B6, B15, B16, B17, B18, B19, B21, B23, B24, B28, B31, B34 |
 | mixed | 19 | B2, B4, B7, B8, B9, B10, B11, B12, B13, B14, B20, B22, B25, B26, B27, B29, B30, B32, B33 |
-| bridge | 1 | B34 |
+| bridge | 0 | — |
 | unknown | 0 | — |
 
 合計 34 行。2026-09-06の再確認でB29はdocumentのwarning collectionをownerと確定し、
 未移植drainと既存snapshotが併存するmixedへ更新した。2026-09-07にB5の
 `ResolverHandle::in_parse`primitiveを移植しunknownからcanonicalへ更新した
 （`flpdf-3yn9.48.17`）。`.48.14` でB7のObjStm consumerに
-`next_object_stream_integer`を追加したため、canonical ownerが`absent`なのはB24 / B34の2行。
-B34は逆に **qpdfに無い状態をflpdfが持っている**。B24は
+`next_object_stream_integer`を追加したため、canonical ownerが`absent`なのはB24の1行。
+2026-09-08（`.25`）: B34 が持っていた「qpdfに無い状態をflpdfが持っている」
+fallback-budget（`resolution_fallbacks_remaining`）を削除したため、B34 を bridge から
+canonical へ移し bridge を 0 にした（残る参照は `tests/qpdf_route_hygiene_tests.rs:82` の
+存在しないことを検査する hygiene テストのみ）。B24は
 **両者とも持たないのが正しい**（qpdf 自身が `libqpdf/QPDF.cc:618-622` でやらないと
 明言している処理）ため、absent 同士の一致として canonical に数える。
 
