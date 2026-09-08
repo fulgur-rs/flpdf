@@ -450,12 +450,9 @@ crates/flpdf/src/job/json.rs::write_json: prod 10 (3 files) / test 19
     crates/flpdf/src/document_json.rs 6, crates/flpdf/src/object_handle.rs 3, crates/flpdf-qtest-tools/src/driver/test_88_98.rs 1
 crates/flpdf/src/job/acroform_field_prune.rs::prune_acroform_after_subset: prod 2 (1 files) / test 17
     crates/flpdf/src/job/page_specs.rs 2
-crates/flpdf/src/reader.rs::Pdf::qtest_object_value_source_offsets: prod 1 (1 files) / test 0
-    crates/flpdf-qtest-tools/src/driver/test_0_1.rs 1
-crates/flpdf/src/reader.rs::Pdf::qtest_array_item_source_offsets: prod 1 (1 files) / test 0
-    crates/flpdf-qtest-tools/src/driver/test_0_1.rs 1
-crates/flpdf/src/reader.rs::Pdf::qtest_decode_parms_source_offset: prod 1 (1 files) / test 0
-    crates/flpdf-qtest-tools/src/driver/test_0_1.rs 1
+crates/flpdf/src/reader.rs::Pdf::qtest_object_value_source_offsets: prod 0 (0 files) / test 0
+crates/flpdf/src/reader.rs::Pdf::qtest_array_item_source_offsets: prod 0 (0 files) / test 0
+crates/flpdf/src/reader.rs::Pdf::qtest_decode_parms_source_offset: prod 0 (0 files) / test 0
 crates/flpdf/src/job/lifecycle.rs::QPDFJob::run: prod 17 (11 files) / test 224
     crates/flpdf-qtest-tools/src/driver/test_80_87.rs 4, crates/flpdf-qtest-tools/src/bin/qpdfjob_ctest.rs 3, crates/flpdf-qtest-tools/src/character_encoding.rs 2, crates/flpdf-cli/src/main.rs 1, crates/flpdf-qtest-tools/src/bin/driver.rs 1, crates/flpdf-qtest-tools/src/bin/qpdf_ctest.rs 1, crates/flpdf-qtest-tools/src/bin/test_large_file.rs 1, crates/flpdf-qtest-tools/src/bin/test_renumber.rs 1, crates/flpdf-qtest-tools/src/bin/tokenizer.rs 1, crates/flpdf-qtest-tools/src/main.rs 1, crates/flpdf/src/object_copy.rs 1
 crates/flpdf/src/job/lifecycle.rs::QPDFJob::create_qpdf: prod 3 (2 files) / test 7

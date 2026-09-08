@@ -257,8 +257,11 @@ paths and Windows directory-open failures for both metadata helpers.
 (`libqpdf/QPDF.cc:1700-1704`) を qtest の parsed-offset warning attribution にも
 適用する。`Pdf::qtest_object_value_source_offsets` と
 `qtest_array_item_source_offsets` は同一 ObjectBody/array container を一度だけ
-bounded-read/retry し、`test_0_1` は DecodeParms warning を source ref ごとに batch
-してから元の warning 順序で出力する。qpdf に存在しない flpdf の
+bounded-read/retry する設計だった。`flpdf-3yn9.48.44` で `test_0_1` の
+DecodeParms warning attribution を値自身の `try_get_parsed_offset` へ移したため、
+これら 3 つの source-reread API（`qtest_decode_parms_source_offset` を含む）は
+production caller 0 になった（残る参照は `tests/qpdf_route_hygiene_tests.rs` の
+存在チェックのみ）。API 自体の削除は `.25` に委ねる。qpdf に存在しない flpdf の
 `resolution_fallbacks_remaining` を filter index ごとに消費する再読は増やさず、
 既存の qtest-only offset boundary に閉じ込める。
 
