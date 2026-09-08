@@ -320,7 +320,15 @@ fn check_document_with_suppression<R: Read + Seek + 'static>(
     // block for the standalone `--show-encryption` mode
     // (`QPDFJob.cc:428-448`), a path `--check` never reaches. Always
     // suppress it here.
-    emit_encryption_report(pdf, logger, true, show_encryption_key)?;
+    let encryption_diagnostics_seen = diagnostic_count(pdf);
+    if let Err(error) = emit_encryption_report(pdf, logger, true, show_encryption_key) {
+        return Err(map_check_phase_error(
+            logger,
+            message_prefix,
+            error,
+            logger_failure_since(pdf, encryption_diagnostics_seen),
+        ));
+    }
 
     let linearized_diagnostics_seen = diagnostic_count(pdf);
     let linearized = match pdf.is_linearized() {
@@ -339,12 +347,22 @@ fn check_document_with_suppression<R: Read + Seek + 'static>(
     };
     if linearized {
         logger.info("File is linearized\n")?;
-        warnings |= emit_linearization_check_for_document_with_suppression(
+        match emit_linearization_check_for_document_with_suppression(
             pdf,
             logger,
             input_name,
             suppress_warnings,
-        )?; // cov:ignore: closing line of a multi-line suppress_warnings call/block; llvm-cov misattributes the hit count to the previous line, not an untested branch
+        ) {
+            Ok(new_warnings) => warnings |= new_warnings,
+            Err(error) => {
+                return Err(map_check_phase_error(
+                    logger,
+                    message_prefix,
+                    error,
+                    logger_failure_since(pdf, linearized_diagnostics_seen),
+                ));
+            }
+        }
     } else {
         logger.info("File is not linearized\n")?;
     }
@@ -798,6 +816,19 @@ fn map_in_try_error(logger: &QPDFLogger, error: crate::Error, logger_failure: bo
     }
 }
 
+fn map_check_phase_error(
+    logger: &QPDFLogger,
+    message_prefix: &str,
+    error: crate::Error,
+    logger_failure: bool,
+) -> CheckError {
+    finish_check_error(
+        logger,
+        message_prefix,
+        map_in_try_error(logger, error, logger_failure),
+    )
+}
+
 /// Complete the qpdf `doCheck` catch boundary after an error has been
 /// rendered. qpdf continues to its single final `errors detected` throw after
 /// the outer check catch (`QPDFJob.cc:788-793`); do not return the intermediate
@@ -1226,6 +1257,24 @@ mod tests {
         assert_eq!(
             output.lock().expect("capture output").as_slice(),
             b"ERROR: pages-loop.pdf (object 3 0): Loop detected in /Pages structure (getAllPages)\n"
+        );
+    }
+
+    #[test]
+    fn check_phase_operation_errors_use_do_check_catch_framing() {
+        let output = Arc::new(Mutex::new(Vec::new()));
+        let logger = logger_with_capture(Arc::clone(&output));
+        let result = map_check_phase_error(
+            &logger,
+            "qpdf",
+            Error::Internal("encrypted PDF has no encryption revision".to_owned()),
+            false,
+        );
+
+        assert!(matches!(result, CheckError::ErrorsDetected));
+        assert_eq!(
+            output.lock().expect("capture output").as_slice(),
+            b"ERROR: encrypted PDF has no encryption revision\nqpdf: errors detected\n"
         );
     }
 
@@ -2684,6 +2733,37 @@ mod tests {
             )
             .as_bytes()
         );
+    }
+
+    #[test]
+    fn encrypted_document_check_propagates_encryption_report_logger_failure() {
+        let logger = QPDFLogger::create();
+        logger.set_output_streams(
+            Some(PipelineHandle::new(
+                crate::pipeline::test_support::NthWriteFailure::new(3),
+            )),
+            None,
+        );
+        let mut job = QPDFJob::new();
+        job.set_logger(logger);
+        let mut pdf = job
+            .open(
+                Cursor::new(include_bytes!(concat!(
+                    env!("CARGO_MANIFEST_DIR"),
+                    "/../../tests/fixtures/encrypted/v2-rc4-128-r3.pdf"
+                ))),
+                "encrypted.pdf",
+                PdfOpenOptions {
+                    password: b"user-v2".to_vec(),
+                    ..PdfOpenOptions::default()
+                },
+            )
+            .expect("encrypted fixture should open");
+
+        assert!(matches!(
+            job.check(&mut pdf),
+            Err(CheckError::ErrorsDetected)
+        ));
     }
 
     #[test]
