@@ -305,10 +305,62 @@ fn normalized_page_images(value: &Value) -> Vec<Vec<Value>> {
 }
 
 fn assert_page_images_match(qpdf_output: &Path, flpdf_output: &Path) {
+    let oracle = normalized_page_images(&qpdf_pages_json(qpdf_output));
     assert_eq!(
-        normalized_page_images(&qpdf_pages_json(qpdf_output)),
+        oracle,
         normalized_page_images(&flpdf_pages_json(flpdf_output)),
         "flpdf inline-image page metadata must match qpdf 11.9.0"
+    );
+    // Reading flpdf's own output with flpdf moves the writer and the JSON
+    // reader together, so a matching pair of errors stays green. Read the same
+    // file with qpdf as well to pin the written document, not the round trip.
+    assert_eq!(
+        oracle,
+        normalized_page_images(&qpdf_pages_json(flpdf_output)),
+        "qpdf 11.9.0 must see the same inline-image metadata in flpdf's output"
+    );
+}
+
+/// Compare the whole `--qdf` output, plus stderr and exit status, against
+/// qpdf 11.9.0's own.
+///
+/// qpdf's `inline-images.test` compares whole files rather than metadata
+/// (`qpdf/qtest/inline-images.test:93-94`), which is what makes it catch a
+/// transform that lands in the wrong place. The page-image JSON cannot: qpdf's
+/// `doJSONPages` lists only the images a page owns directly
+/// (`libqpdf/QPDFJob.cc:1044` -> `QPDFPageObjectHelper::getImages`,
+/// `libqpdf/QPDFPageObjectHelper.cc:376-384`), while `externalizeInlineImages`
+/// also recurses into Form XObject resources
+/// (`libqpdf/QPDFPageObjectHelper.cc:430-434`), so a nested-form or
+/// content-only difference shows up as `[] == []`.
+///
+/// `--qdf` disables stream compression, so the DEFLATE backend difference that
+/// CLAUDE.md allows as deviation (A) never reaches the output and this
+/// comparison needs no `qpdf-zlib-compat` feature.
+fn assert_qdf_bytes_match(input: &Path, extra_flags: &[&str], label: &str) {
+    let directory = tempfile::tempdir().expect("tempdir");
+    let qpdf_output = directory.path().join("qpdf.pdf");
+    let flpdf_output = directory.path().join("flpdf.pdf");
+    let mut flags = vec!["--qdf".to_owned(), "--static-id".to_owned()];
+    flags.extend(extra_flags.iter().map(|flag| (*flag).to_owned()));
+
+    let qpdf = run_qpdf_rewrite(&flags, input, &qpdf_output);
+    let flpdf = run_flpdf_rewrite(&flags, input, &flpdf_output);
+
+    assert_eq!(
+        qpdf.status.code(),
+        flpdf.status.code(),
+        "{label}: exit status must match qpdf 11.9.0"
+    );
+    assert_eq!(
+        String::from_utf8_lossy(&qpdf.stderr).replace("qpdf:", ""),
+        String::from_utf8_lossy(&flpdf.stderr).replace("flpdf:", ""),
+        "{label}: diagnostics must match qpdf 11.9.0 apart from the program name"
+    );
+    assert_eq!(
+        std::fs::read(&qpdf_output).expect("qpdf output"),
+        std::fs::read(&flpdf_output).expect("flpdf output"),
+        "{label}: --qdf output must be byte-identical to qpdf 11.9.0"
     );
 }
 
@@ -600,6 +652,20 @@ fn page_selection_with_externalization_matches_qpdf() {
         String::from_utf8_lossy(&flpdf.stderr)
     );
     assert_page_images_match(&qpdf_output, &flpdf_output);
+    // The page-image JSON is identical for either selected page, so it cannot
+    // tell them apart; the whole-file comparison can.
+    assert_qdf_bytes_match(
+        &input,
+        &[
+            "--externalize-inline-images",
+            "--ii-min-bytes=0",
+            "--pages",
+            ".",
+            "1",
+            "--",
+        ],
+        "page selection",
+    );
 }
 
 #[test]
@@ -637,6 +703,11 @@ fn nested_forms_named_colorspaces_and_empty_pages_match_qpdf() {
             String::from_utf8_lossy(&flpdf.stderr)
         );
         assert_page_images_match(&qpdf_output, &flpdf_output);
+        assert_qdf_bytes_match(
+            &input,
+            &["--externalize-inline-images", "--ii-min-bytes=0"],
+            name,
+        );
     }
 }
 
@@ -669,4 +740,9 @@ fn damaged_inline_image_recovery_matches_qpdf() {
         String::from_utf8_lossy(&flpdf.stderr)
     );
     assert_page_images_match(&qpdf_output, &flpdf_output);
+    assert_qdf_bytes_match(
+        &input,
+        &["--externalize-inline-images", "--ii-min-bytes=0"],
+        "damaged inline image",
+    );
 }
