@@ -214,6 +214,26 @@ fn one_two_three_page_mode_matrix_is_byte_identical_to_qpdf() {
     }
 }
 
+/// Preserve mode on a source with no object streams has nothing to preserve,
+/// so qpdf's `enqueueObject`/`writeStandard` walk is the same live-queue walk
+/// as Disable mode (`QPDFWriter.cc:2038-2140`). Pin that equivalence directly
+/// -- not just each mode's separate qpdf golden match above -- so a future
+/// change that reintroduces a second code path for this case is caught even
+/// if it happens to still match the golden bytes.
+#[test]
+fn preserve_with_no_source_object_streams_matches_disable_byte_for_byte() {
+    for fixture in ["one-page", "two-page", "three-page"] {
+        let disable =
+            rewrite_qpdf_equivalent_mode(&format!("{fixture}.pdf"), ObjectStreamMode::Disable);
+        let preserve =
+            rewrite_qpdf_equivalent_mode(&format!("{fixture}.pdf"), ObjectStreamMode::Preserve);
+        assert_eq!(
+            disable, preserve,
+            "{fixture}: Preserve-with-no-source-ObjStm diverged from Disable"
+        );
+    }
+}
+
 #[test]
 fn disable_xref_stream_source_downgrades_to_classic_table_byte_identical_to_qpdf() {
     assert_cmp_diff_zero_mode_named(
