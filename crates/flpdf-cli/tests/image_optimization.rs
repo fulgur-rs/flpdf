@@ -488,14 +488,37 @@ fn image_transform_options_are_accepted_with_inspection_modes_like_qpdf() {
     }
 }
 
+/// A one-page PDF that carries both an optimizable raw image and an embedded
+/// file, built with the pinned qpdf so the attachment shape is qpdf's own.
+///
+/// `tests/fixtures/compat/attachment-two-page.pdf` has an attachment but no
+/// image, so the image phase is a no-op there and cannot show whether it ran.
+fn image_pdf_with_attachment(directory: &Path) -> std::path::PathBuf {
+    let image = directory.join("image.pdf");
+    let payload = directory.join("payload.txt");
+    let combined = directory.join("image-attachment.pdf");
+    std::fs::write(&image, build_raw_grayscale_image_pdf(200, 200)).expect("write image fixture");
+    std::fs::write(&payload, b"payload\n").expect("write payload");
+
+    let status = ProcessCommand::new("/usr/bin/qpdf")
+        .args(["--static-id", "--compress-streams=n", "--add-attachment"])
+        .arg(&payload)
+        .args(["--key=attachment.txt", "--"])
+        .arg(&image)
+        .arg(&combined)
+        .status()
+        .expect("run qpdf to attach the payload");
+    assert!(status.success(), "building the attachment fixture failed");
+    combined
+}
+
 #[test]
 fn optimize_images_runs_with_remove_attachment_like_qpdf() {
     if !qpdf_11_9_available() {
         return;
     }
     let tempdir = tempfile::tempdir().expect("tempdir");
-    let input = Path::new(env!("CARGO_MANIFEST_DIR"))
-        .join("../../tests/fixtures/compat/attachment-two-page.pdf");
+    let input = image_pdf_with_attachment(tempdir.path());
     let qpdf_output = tempdir.path().join("qpdf.pdf");
     let flpdf_output = tempdir.path().join("flpdf.pdf");
 
@@ -530,6 +553,15 @@ fn optimize_images_runs_with_remove_attachment_like_qpdf() {
     assert_eq!(flpdf_list.status.code(), qpdf_list.status.code());
     assert_eq!(flpdf_list.stdout, qpdf_list.stdout);
     assert_eq!(flpdf_list.stderr, qpdf_list.stderr);
+
+    // The image phase has to have run: qpdf recompresses this raw image to
+    // DCT, and dropping the transformation would leave the filter list empty.
+    assert_eq!(image_filters(&qpdf_output), vec!["/DCTDecode"]);
+    assert_eq!(image_filters(&flpdf_output), vec!["/DCTDecode"]);
+    // Object identity proves the image phase ran before the attachment phase,
+    // the order `handleTransformations` uses (`QPDFJob.cc:2151-2157` then
+    // `:2229-2245`).
+    assert_eq!(image_object(&flpdf_output), image_object(&qpdf_output));
 }
 
 #[test]

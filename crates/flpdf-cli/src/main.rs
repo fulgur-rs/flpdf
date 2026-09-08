@@ -1224,18 +1224,16 @@ struct Cli {
     generate_appearances: bool,
 
     /// Recompress eligible non-JPEG images as DCT/JPEG (qpdf
-    /// `--optimize-images`). Inspection modes may be combined with this flag
-    /// like qpdf, which rejects neither combination. qpdf still performs the
-    /// image transformation for them -- `createQPDF` runs
-    /// `handleTransformations` before `writeQPDF` picks the inspection branch
-    /// (`QPDFJob.cc:473,484-491`) -- so its inspection output reflects the
-    /// transformed document. The top-level inspection routes thread the same
-    /// image options through their open/transform boundary. The attachment flags
-    /// remain conflicts here: qpdf accepts them alongside the image options --
-    /// `--list-attachments` and `--show-attachment` are inspection modes it
-    /// dispatches from `doInspection` (`QPDFJob.cc:1684-1689`), and the
-    /// mutating ones run in the same create stage -- but flpdf's dispatch
-    /// branches do not consume the image options yet (`flpdf-wz4i`).
+    /// `--optimize-images`). Inspection and attachment modes may be combined
+    /// with this flag like qpdf, which rejects neither combination: the image
+    /// flags only set their own members (`QPDFJob_config.cc:443-447`) and
+    /// `checkConfiguration` (`QPDFJob.cc:566-641`) has no branch that reads
+    /// them. qpdf runs the transformation for those modes too -- `createQPDF`
+    /// calls `handleTransformations` before `writeQPDF` picks the inspection
+    /// branch (`QPDFJob.cc:473,484-491`), and the attachment phases run inside
+    /// the same `handleTransformations` after the image phase (`:2151-2157`,
+    /// `:2229-2245`). The top-level inspection and attachment routes both
+    /// thread the image options through their own open/transform boundary.
     /// `--pages`/`--rotate`/`--split-pages`/`--empty`/`--json`/
     /// `--json-output` are intentionally absent: all of those routes are
     /// already threaded through (see `top_level_image_options` at each call
@@ -1246,11 +1244,11 @@ struct Cli {
     /// (qpdf `--externalize-inline-images`). This is a distinct transform
     /// from `--optimize-images`; when both are selected the shared image phase
     /// externalizes first and then optimizes reachable Image XObjects.
-    /// Inspection modes may be combined with this flag like qpdf. As with
-    /// `--optimize-images`, the top-level inspection routes run the
-    /// transformation before their report (`QPDFJob.cc:473,2151-2155`), and the
-    /// attachment routes run it in the same `handleTransformations` before the
-    /// attachment phases (`:2229-2245`).
+    /// Inspection and attachment modes may be combined with this flag like
+    /// qpdf. As with `--optimize-images`, the top-level inspection routes run
+    /// the transformation before their report (`QPDFJob.cc:473,2151-2155`), and
+    /// the attachment routes run it in the same `handleTransformations` before
+    /// the attachment phases (`:2229-2245`).
     #[arg(long = "externalize-inline-images")]
     externalize_inline_images: bool,
     /// Exclude inline images from the optimization pass.
@@ -9111,6 +9109,16 @@ fn run_list_attachments(
 
 /// `--show-attachment KEY [-o PATH] input`
 #[allow(clippy::too_many_arguments)]
+/// Reserve standard output for the attachment payload.
+///
+/// Mirrors the `!m->attachment_to_show.empty()` arm of qpdf's
+/// `checkConfiguration` (`libqpdf/QPDFJob.cc:621-625`), which runs before the
+/// document is opened.
+fn reserve_show_attachment_output() -> CliResult<()> {
+    cli_logger().save_to_standard_output(true)?;
+    Ok(())
+}
+
 fn run_show_attachment(
     input: Option<PathBuf>,
     repair: bool,
@@ -9121,6 +9129,15 @@ fn run_show_attachment(
     empty: bool,
     image_options: ImageTransformOptions,
 ) -> CliResult<()> {
+    // qpdf latches standard output for `--show-attachment` in
+    // `checkConfiguration` (`QPDFJob.cc:621-625`), before it opens the document
+    // and long before `handleTransformations`. The latch has a second effect:
+    // `setSave` moves the info stream to standard error when it takes over
+    // standard output (`QPDFLogger.cc:197-200`), so the verbose image
+    // diagnostics land on stderr instead of colliding with the attachment
+    // payload. Reserving it here rather than inside the attachment writer keeps
+    // both effects in qpdf's order.
+    reserve_show_attachment_output()?;
     if empty {
         reject_empty_inspection_output(input.as_deref())?;
         let mut job = new_cli_job(suppress_warnings);
