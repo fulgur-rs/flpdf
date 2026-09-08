@@ -229,6 +229,12 @@ pub(crate) fn run_test_4<R: Read + Seek>(
     // regardless of what it actually resolves to (`ObjectHandle::is_null`'s
     // own doc).
     resolve_handle(pdf, &qtest2)?;
+    // A lazy resolution here can raise a recoverable repair warning. qpdf
+    // delivers it the instant `warn()` records it (`libqpdf/QPDF.cc:487-494`),
+    // so drain before the next output rather than letting it surface after a
+    // later accessor's drain -- or, for `run_test_4`, never.
+    emit_new_diagnostics(pdf, diagnostics_written, filename, stdout, stderr)
+        .map_err(Error::from)?;
     if !qtest2.is_null() {
         qtest2.make_direct(true)?;
         trailer.replace_key(b"/QTest2", qtest2)?;
@@ -283,24 +289,34 @@ pub(crate) fn run_test_5<R: Read + Seek>(
         let pageno = index + 1;
         writeln!(stdout, "page {pageno}:")?;
         writeln!(stdout, "  images:")?;
-        let mut page_helper = PageObjectHelper::new(*page_ref, pdf);
-        for (name, image) in page_helper.get_images()? {
-            let image_dict = image
-                .as_stream_dict()
-                .expect("get_images only returns image stream handles");
-            let width = image_dict.try_get_key(b"/Width")?.try_get_int_value()?;
-            let height = image_dict.try_get_key(b"/Height")?.try_get_int_value()?;
-            // Diagnostics from `try_get_int_value` above cannot drain here:
-            // `page_helper` (`PageObjectHelper::new`) holds `pdf` mutably for
-            // this whole loop, and draining needs `&Pdf`. This is a
-            // pre-existing gap (this call predates this file's
-            // `resolve_handle`+`as_x` audit) tracked in the audit's
-            // follow-up, not introduced by it.
+        // Read the dimensions while the helper holds `pdf`, then release that
+        // borrow before writing so the type warnings `try_get_int_value` can
+        // raise are drained ahead of their own line. qpdf delivers a warning
+        // the instant `warn()` records it (`libqpdf/QPDF.cc:487-494`), so a
+        // deferred drain would print it after the line it belongs to -- or
+        // after a later section's output entirely.
+        let dimensions = {
+            let mut page_helper = PageObjectHelper::new(*page_ref, pdf);
+            let mut dimensions = Vec::new();
+            for (name, image) in page_helper.get_images()? {
+                let image_dict = image
+                    .as_stream_dict()
+                    .expect("get_images only returns image stream handles");
+                let width = image_dict.try_get_key(b"/Width")?.try_get_int_value()?;
+                let height = image_dict.try_get_key(b"/Height")?.try_get_int_value()?;
+                dimensions.push((name, width, height));
+            }
+            dimensions
+        };
+        emit_new_diagnostics(pdf, diagnostics_written, filename, stdout, stderr)
+            .map_err(Error::from)?;
+        for (name, width, height) in dimensions {
             write!(stdout, "    ")?;
             write_bytes(stdout, &name)?;
             writeln!(stdout, ": {width} x {height}")?;
         }
         writeln!(stdout, "  content:")?;
+        let mut page_helper = PageObjectHelper::new(*page_ref, pdf);
         let content = page_helper.get_page_contents()?;
         for item in &content {
             write!(stdout, "    ")?;
