@@ -6488,12 +6488,8 @@ impl ObjectHandle {
                         crate::Error::Internal(message) => PipelineError::logic(message),
                         other => PipelineError::runtime(other.to_string()),
                     })?;
-                if succeeded {
-                    Ok(())
-                } else {
-                    Err(PipelineError::runtime("error getting decoded stream data"))
-                    // cov:ignore: retry-failure provider test exercises this branch
-                }
+                let _ = succeeded;
+                Ok(())
             });
             result
                 .add_dictionary_member(b"data", blob)

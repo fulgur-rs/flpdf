@@ -175,7 +175,7 @@ fn get_stream_json_file_writes_payload_to_the_supplied_pipeline() {
 }
 
 #[test]
-fn get_stream_json_inline_surfaces_a_deferred_provider_failure() {
+fn get_stream_json_inline_ignores_a_false_provider_result_like_qpdf() {
     let pdf = Pdf::empty().unwrap();
     let stream = pdf.new_stream().unwrap();
     stream
@@ -190,12 +190,9 @@ fn get_stream_json_inline_surfaces_a_deferred_provider_failure() {
     let json = stream
         .get_stream_json(2, QpdfStreamJsonData::Inline, DecodeLevel::None, None, "")
         .unwrap();
-    let error = json
-        .unparse()
-        .expect_err("deferred provider failure must surface");
-    assert!(error
-        .message()
-        .contains("error getting decoded stream data"));
+    let text = String::from_utf8(json.unparse().expect("false provider result is ignored"))
+        .expect("JSON is UTF-8");
+    assert!(text.contains("\"data\": \"\""), "unexpected JSON: {text}");
 }
 
 /// qpdf's `StreamBlobProvider` forwards whatever `pipeStreamData` throws
