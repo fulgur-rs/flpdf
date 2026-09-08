@@ -137,8 +137,8 @@ crates/flpdf/src/xref.rs::resolve_objects_in_stream                      # B12 b
 crates/flpdf/src/xref.rs::parse_xref_from_start                          # B14 初段の直呼び
 crates/flpdf/src/reader/resolver.rs::reconstruct_xref_and_retry          # B22 resolve 側
 crates/flpdf/src/xref.rs::XrefLoadOptions                                # B26 open 時の第 2 表現
-crates/flpdf/src/xref.rs::LoadedXref                                     # B27 staging
-crates/flpdf/src/xref.rs::BootstrapHandleState                           # B27/B12 並行 document 状態
+crates/flpdf/src/xref.rs::LoadedXref                                     # B27 internal load state; no public export
+crates/flpdf/src/xref.rs::BootstrapHandleState                           # B27/B12 test-only bounded reconstruction scaffolding
 
 # --- (b) baseline denominator ---
 crates/flpdf/src/parser.rs::too_many_bad_tokens                          # B4 canonical

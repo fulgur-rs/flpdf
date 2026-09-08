@@ -35,7 +35,10 @@ fn dead_qpdf_routes_are_removed_and_canonical_owners_remain() {
         "fn qtest_decode_parms_source_offset(",
         "fn source_stream_data_offset(",
     ] {
-        assert!(!reader.contains(dead), "dead reader wrapper remains: {dead}");
+        assert!(
+            !reader.contains(dead),
+            "dead reader wrapper remains: {dead}"
+        );
     }
 
     let tracked = fs::read_to_string(
@@ -56,7 +59,10 @@ fn dead_qpdf_routes_are_removed_and_canonical_owners_remain() {
         "::MAX_RESOLUTION_FALLBACKS",
         "::parse_source_file_object_at",
     ] {
-        assert!(!tracked.contains(dead), "dead route remains tracked: {dead}");
+        assert!(
+            !tracked.contains(dead),
+            "dead route remains tracked: {dead}"
+        );
     }
 }
 
@@ -90,6 +96,9 @@ fn ownerless_xref_api_is_removed_in_favor_of_the_canonical_pdf_route() {
         "pub fn load_xref_and_trailer_best_effort(",
         "pub struct LoadedXref",
     ] {
-        assert!(!xref.contains(dead), "owner-less xref surface remains: {dead}");
+        assert!(
+            !xref.contains(dead),
+            "owner-less xref surface remains: {dead}"
+        );
     }
 }
