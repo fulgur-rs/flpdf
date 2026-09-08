@@ -431,6 +431,25 @@ pub(crate) struct ResolverCore<R: Read + Seek + 'static> {
     /// each of those takes and drops its own borrow, so nothing is held when
     /// the push happens.
     repair_diagnostics: Diagnostics,
+    /// No qpdf counterpart -- qpdf has one `m->warnings` deque and delivers
+    /// every warning to the logger the instant `warn()` records it
+    /// (`libqpdf/QPDF.cc:487-494`). flpdf's canonical-owner reconstruction
+    /// path has two channels instead: this document's own live delivery via
+    /// [`ResolverHandle::push_qpdf_warning`], and the xref reader's locally
+    /// buffered trio/line-scan diagnostics (`crates/flpdf/src/xref.rs`),
+    /// which only reach the document once the whole open succeeds or fails.
+    /// Because the live channel prints immediately while the buffered one is
+    /// deferred, a canonical-owner reconstruction that also resolves real
+    /// objects (candidate discovery, a candidate's own re-entry read) would
+    /// otherwise print those live warnings *before* the trio/line-scan
+    /// diagnostics that call order actually places first. While this flag is
+    /// set, [`ResolverHandle::push_qpdf_warning`] keeps recording into
+    /// `repair_diagnostics` as always but skips the immediate logger write;
+    /// [`ResolverHandle::end_deferred_repair_diagnostics`] hands the caller
+    /// exactly what was recorded during the window so it can be spliced into
+    /// the buffered diagnostics at the correct point in call order instead,
+    /// restoring qpdf's single-channel, in-call-order delivery.
+    defer_live_repair_diagnostics: bool,
     /// qpdf `m->logger`, shared with callers and replaceable on the live
     /// document.
     logger: crate::QPDFLogger,
@@ -936,6 +955,7 @@ impl<R: Read + Seek> ResolverHandle<R> {
                 reconstructed_xref: already_reconstructed,
                 fixed_dangling_refs: false,
                 repair_diagnostics,
+                defer_live_repair_diagnostics: false,
                 logger,
                 suppress_warnings,
                 description,
@@ -977,6 +997,7 @@ impl<R: Read + Seek> ResolverHandle<R> {
                 reconstructed_xref: false,
                 fixed_dangling_refs: false,
                 repair_diagnostics: Diagnostics::default(),
+                defer_live_repair_diagnostics: false,
                 logger,
                 suppress_warnings,
                 description,
@@ -1863,19 +1884,63 @@ impl<R: Read + Seek> ResolverHandle<R> {
     /// Borrow discipline: the `borrow_mut()` is taken and dropped inside this
     /// expression, so it composes with a nested resolution — but it must not
     /// be called while a borrow of the core is already held.
+    ///
+    /// While [`Self::begin_deferred_repair_diagnostics`] is active, this
+    /// still records into `repair_diagnostics` but withholds the logger
+    /// write regardless of `suppress_warnings`; see that method's doc.
     pub(crate) fn push_qpdf_warning(&self, warning: QpdfExc) -> Result<()> {
-        let (logger, suppress_warnings) = {
+        let (logger, deliver) = {
             let mut core = self.core.borrow_mut();
             core.repair_diagnostics.push(warning.clone());
-            (core.logger.clone(), core.suppress_warnings)
+            (
+                core.logger.clone(),
+                !core.suppress_warnings && !core.defer_live_repair_diagnostics,
+            )
         };
-        if suppress_warnings {
+        if !deliver {
             return Ok(());
         }
         let mut line = b"WARNING: ".to_vec();
         line.extend_from_slice(warning.what_bytes());
         line.push(b'\n');
         logger.warn(line)
+    }
+
+    /// Start withholding this document's live warning delivery, returning a
+    /// mark for [`Self::end_deferred_repair_diagnostics`].
+    ///
+    /// No qpdf counterpart: see `defer_live_repair_diagnostics`'s doc on
+    /// [`ResolverCore`] for why flpdf's canonical-owner reconstruction path
+    /// needs this reconciliation and qpdf's single warnings deque does not.
+    /// Callers must pair this with exactly one
+    /// [`Self::end_deferred_repair_diagnostics`] call before returning —
+    /// typically via an RAII guard, since [`Diagnostics`] passed to
+    /// [`crate::Error::with_open_diagnostics`] on a failure path still needs
+    /// this window's captured warnings.
+    pub(crate) fn begin_deferred_repair_diagnostics(&self) -> usize {
+        let mut core = self.core.borrow_mut();
+        debug_assert!(
+            !core.defer_live_repair_diagnostics,
+            "nested deferred-repair-diagnostics window"
+        );
+        core.defer_live_repair_diagnostics = true;
+        core.repair_diagnostics.len()
+    }
+
+    /// Stop withholding live warning delivery and return exactly the
+    /// warnings recorded since `start` (the mark
+    /// [`Self::begin_deferred_repair_diagnostics`] returned), removing them
+    /// from this document's own collection.
+    ///
+    /// The caller is expected to splice the result into its own, separately
+    /// buffered diagnostics at the point in call order where this window
+    /// occurred, then let the existing single flush point (installing onto
+    /// the document on success, or [`crate::Error::with_open_diagnostics`]
+    /// on failure) deliver everything once, in order.
+    pub(crate) fn end_deferred_repair_diagnostics(&self, start: usize) -> Diagnostics {
+        let mut core = self.core.borrow_mut();
+        core.defer_live_repair_diagnostics = false;
+        core.repair_diagnostics.split_off(start)
     }
 
     pub(crate) fn push_warning(&self, message: impl Into<String>) -> Result<()> {

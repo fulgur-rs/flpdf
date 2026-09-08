@@ -48,6 +48,19 @@ impl Diagnostics {
     pub(crate) fn drain(&mut self) -> Self {
         std::mem::take(self)
     }
+
+    /// Move every warning from `at` onward out of this collection, leaving
+    /// the `[0, at)` prefix in place.
+    ///
+    /// Used to hand a bounded window's captured warnings to its caller
+    /// (e.g. reconciling a canonical document's live warning delivery with a
+    /// reconstruction pass's own locally-buffered diagnostics) while any
+    /// earlier accumulation on the same collection is left untouched.
+    pub(crate) fn split_off(&mut self, at: usize) -> Self {
+        Self {
+            entries: self.entries.split_off(at),
+        }
+    }
 }
 
 #[cfg(test)]
