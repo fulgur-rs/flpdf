@@ -292,6 +292,79 @@ fn argv_keep_files_open_rejects_an_unknown_choice() {
 }
 
 #[test]
+fn argv_expands_an_argument_file_before_option_parsing() {
+    // QPDFArgParser::handleArgFileArguments (QPDFArgParser.cc:232-260) runs
+    // one level of `@file` expansion before any option is inspected. CRLF
+    // line endings are normalized the same way `QUtil::read_lines_from_file`
+    // does (preserve_eol=false): a trailing `\r` before `\n` is dropped.
+    let tempdir = tempfile::tempdir().unwrap();
+    let argfile = tempdir.path().join("args");
+    std::fs::write(&argfile, b"--deterministic-id\r\n--progress\r\n").unwrap();
+    let input = Path::new(env!("CARGO_MANIFEST_DIR")).join("../../tests/fixtures/minimal.pdf");
+    let output = tempdir.path().join("argfile-output.pdf");
+
+    let mut job = QPDFJob::new();
+    job.initialize_from_argv(&[
+        "qpdfjob".to_owned(),
+        input.to_string_lossy().into_owned(),
+        output.to_string_lossy().into_owned(),
+        format!("@{}", argfile.display()),
+    ])
+    .expect("an argument file's options should expand before parsing");
+
+    assert_eq!(job.run().unwrap(), JobExitCode::Success);
+    assert!(output.exists());
+}
+
+#[test]
+fn argv_treats_an_unopenable_argument_file_token_as_a_literal_positional() {
+    // qpdf treats an `@path` it cannot open as an ordinary argv token rather
+    // than an error (QPDFArgParser.cc:238-243): parsing continues and the
+    // token is later rejected as an unrecognized positional/extra argument
+    // by whatever consumes it, not by the `@file` expansion step itself.
+    let tempdir = tempfile::tempdir().unwrap();
+    let missing = format!("@{}", tempdir.path().join("missing-args").display());
+
+    let mut job = QPDFJob::new();
+    let error = job
+        .initialize_from_argv(&[
+            "qpdfjob".to_owned(),
+            "input.pdf".to_owned(),
+            "output.pdf".to_owned(),
+            missing.clone(),
+        ])
+        .unwrap_err();
+    assert!(matches!(
+        &error,
+        Error::Usage(usage) if usage.to_string() == format!("unknown argument {missing}")
+    ));
+}
+
+#[test]
+fn argv_top_level_double_dash_resumes_the_main_option_table() {
+    // qpdf's top-level `--` resets to the main option table rather than
+    // ending option parsing (QPDFArgParser.cc:447-451,543): an option
+    // spelled after it is still recognized, unlike a conventional
+    // end-of-options terminator.
+    let input = Path::new(env!("CARGO_MANIFEST_DIR")).join("../../tests/fixtures/minimal.pdf");
+    let tempdir = tempfile::tempdir().unwrap();
+    let output = tempdir.path().join("reset-output.pdf");
+
+    let mut job = QPDFJob::new();
+    job.initialize_from_argv(&[
+        "qpdfjob".to_owned(),
+        "--".to_owned(),
+        "--deterministic-id".to_owned(),
+        input.to_string_lossy().into_owned(),
+        output.to_string_lossy().into_owned(),
+    ])
+    .expect("an option spelled after a top-level -- should still be recognized");
+
+    assert_eq!(job.run().unwrap(), JobExitCode::Success);
+    assert!(output.exists());
+}
+
+#[test]
 fn argv_page_label_option_table_accepts_specs_until_its_terminator() {
     let mut job = QPDFJob::new();
     job.initialize_from_argv(&[
