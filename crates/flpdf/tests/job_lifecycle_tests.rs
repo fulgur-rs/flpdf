@@ -3411,6 +3411,36 @@ fn config_add_page_spec_matches_the_json_configured_path_single_source() {
         std::fs::read(&via_json).unwrap(),
         "the Config builder and the JSON path must produce byte-identical output"
     );
+
+    // The two routes push the same `JobPageConfig` and then merge, so their
+    // agreement alone cannot catch a shared downstream error. Anchor the
+    // result against the selection qpdf's `1-z`-style range actually means:
+    // `2-3,1` must emit the source's pages 2, 3, 1 in that order.
+    let source_order = {
+        let mut source = Pdf::open(BufReader::new(File::open(&input).unwrap()))
+            .expect("three-page fixture opens");
+        let refs = flpdf::pages::page_refs(&mut source).expect("source pages resolve");
+        assert_eq!(refs.len(), 3, "the fixture has three pages");
+        [refs[1], refs[2], refs[0]]
+            .into_iter()
+            .map(|page| {
+                flpdf::pages::page_content_bytes(&mut source, page)
+                    .expect("source page content decodes")
+            })
+            .collect::<Vec<_>>()
+    };
+    let mut selected =
+        Pdf::open(BufReader::new(File::open(&via_config).unwrap())).expect("selected output opens");
+    let selected_refs = flpdf::pages::page_refs(&mut selected).expect("selected pages resolve");
+    assert_eq!(selected_refs.len(), 3, "`2-3,1` selects three pages");
+    for (index, page) in selected_refs.into_iter().enumerate() {
+        assert_eq!(
+            flpdf::pages::page_content_bytes(&mut selected, page)
+                .expect("selected page content decodes"),
+            source_order[index],
+            "selected page {index} must be the source page `2-3,1` names"
+        );
+    }
 }
 
 /// An out-of-range page range must surface qpdf's page-range parse error
@@ -3424,7 +3454,11 @@ fn config_add_page_spec_rejects_an_invalid_range() {
         .add_page_spec(".", "0", Vec::new())
         .err()
         .expect("an out-of-range page range must be rejected");
-    assert!(matches!(error, Error::Parse { .. }), "got {error:?}");
+    // qpdf's own `PagesConfig::pageSpec` never fails; it validates the range at
+    // run time (`QPDFJob.cc:261-271`). flpdf validates eagerly, so keep the two
+    // flpdf routes symmetric: the job-JSON handler wraps this same failure in
+    // `Error::Usage`, and the builder must do the same.
+    assert!(matches!(error, Error::Usage(_)), "got {error:?}");
 }
 
 /// `Config::addAttachment` (`QPDFJob_config.cc:894-936`) and the JSON
