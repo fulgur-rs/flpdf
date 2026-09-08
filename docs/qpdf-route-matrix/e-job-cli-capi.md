@@ -413,6 +413,16 @@ RED/GREENテストで各resolver/controllerのclose状態を確認する。E-4�
 責務を補正し、`flpdf-pr6b` の広いP3追跡と重複するself-overlay/page-merge原因は
 このP2 sliceで同じclose境界に統合した。CLI、qtest exceptions、rootは変更しない。
 
+2026-09-08（`flpdf-waly`）: qpdfのclassic xref tableは`readTrailer`後に
+optional `/XRefStm`を読み、xref stream objectのread warningを出してから
+`processXRefStream`のrecoverable builder warningを出す
+（`libqpdf/QPDF.cc:876-927,951-962,1038-1065`）。flpdfはhybrid builder診断を
+`previous.loaded.repair_diagnostics`へ先に混ぜていたため、canonical live read warning
+と順序が逆転した。classic parserからhybrid build診断を別sinkへ分離し、
+`DeferredDiagnosticsGuard`のread診断を先にspliceするRED/GREEN fixtureで
+`trailer → expected endobj → wrong size`を固定した。E-4/既存buy0のbounded修正で、
+qtest exceptionsとrootは対象外。
+
 ### 分類別件数
 
 | 分類 | 件数 | 行 |

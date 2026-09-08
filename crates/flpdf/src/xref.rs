@@ -2250,11 +2250,42 @@ fn parse_xref_from_start_with_owner(
     version: &str,
     options: XrefLoadOptions,
     registration: &mut XrefRegistration,
+    error_diagnostics_sink: Option<&mut Diagnostics>,
+    context_spec: XrefReadContextSpec<'_>,
+    first_xref_item_offset_sink: Option<&mut Option<u64>>,
+    validate_current_classic_trailer: bool,
+    canonical_trailer_owner: Option<&dyn CanonicalTrailerOwner>,
+) -> Result<LoadedXrefState> {
+    parse_xref_from_start_with_owner_and_build_diagnostics(
+        bytes,
+        xref_pos,
+        startxref,
+        version,
+        options,
+        registration,
+        error_diagnostics_sink,
+        context_spec,
+        first_xref_item_offset_sink,
+        validate_current_classic_trailer,
+        canonical_trailer_owner,
+        None,
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
+fn parse_xref_from_start_with_owner_and_build_diagnostics(
+    bytes: &[u8],
+    xref_pos: usize,
+    startxref: u64,
+    version: &str,
+    options: XrefLoadOptions,
+    registration: &mut XrefRegistration,
     mut error_diagnostics_sink: Option<&mut Diagnostics>,
     context_spec: XrefReadContextSpec<'_>,
     first_xref_item_offset_sink: Option<&mut Option<u64>>,
     validate_current_classic_trailer: bool,
     canonical_trailer_owner: Option<&dyn CanonicalTrailerOwner>,
+    hybrid_build_diagnostics_sink: Option<&mut Diagnostics>,
 ) -> Result<LoadedXrefState> {
     if bytes
         .get(xref_pos..)
@@ -2395,7 +2426,7 @@ fn parse_xref_from_start_with_owner(
                 }
             }
         }
-        merge_xref_stream_from_classic_trailer(
+        merge_xref_stream_from_classic_trailer_with_build_diagnostics(
             bytes,
             xref_pos,
             &mut loaded,
@@ -2404,6 +2435,7 @@ fn parse_xref_from_start_with_owner(
             error_diagnostics_sink,
             context_spec,
             canonical_trailer_owner,
+            hybrid_build_diagnostics_sink,
         )?;
         for object_ref in deferred_free {
             registration.insert_free_xref_entry(object_ref);
@@ -2538,7 +2570,32 @@ fn merge_bootstrap_cache_prefer_source(
 /// it reads the stream before the table's deferred free entries and deliberately
 /// discards the stream trailer's `/Prev` continuation.
 #[allow(clippy::too_many_arguments)]
+#[cfg(test)]
 fn merge_xref_stream_from_classic_trailer(
+    bytes: &[u8],
+    classic_xref_pos: usize,
+    loaded: &mut LoadedXrefState,
+    options: XrefLoadOptions,
+    registration: &mut XrefRegistration,
+    error_diagnostics_sink: Option<&mut Diagnostics>,
+    context_spec: XrefReadContextSpec<'_>,
+    canonical_trailer_owner: Option<&dyn CanonicalTrailerOwner>,
+) -> Result<()> {
+    merge_xref_stream_from_classic_trailer_with_build_diagnostics(
+        bytes,
+        classic_xref_pos,
+        loaded,
+        options,
+        registration,
+        error_diagnostics_sink,
+        context_spec,
+        canonical_trailer_owner,
+        None,
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
+fn merge_xref_stream_from_classic_trailer_with_build_diagnostics(
     bytes: &[u8],
     classic_xref_pos: usize,
     loaded: &mut LoadedXrefState,
@@ -2547,6 +2604,7 @@ fn merge_xref_stream_from_classic_trailer(
     mut error_diagnostics_sink: Option<&mut Diagnostics>,
     context_spec: XrefReadContextSpec<'_>,
     canonical_trailer_owner: Option<&dyn CanonicalTrailerOwner>,
+    hybrid_build_diagnostics_sink: Option<&mut Diagnostics>,
 ) -> Result<()> {
     let has_xref_stream_key = loaded
         .loaded
@@ -2671,8 +2729,14 @@ fn merge_xref_stream_from_classic_trailer(
             return Err(error);
         }
     };
-    for diagnostic in hybrid.loaded.repair_diagnostics.entries() {
-        loaded.loaded.repair_diagnostics.push(diagnostic.clone());
+    if let Some(sink) = hybrid_build_diagnostics_sink {
+        for diagnostic in hybrid.loaded.repair_diagnostics.entries() {
+            sink.push(diagnostic.clone());
+        }
+    } else {
+        for diagnostic in hybrid.loaded.repair_diagnostics.entries() {
+            loaded.loaded.repair_diagnostics.push(diagnostic.clone());
+        }
     }
     if hybrid.first_xref_item_offset != 0 {
         loaded.first_xref_item_offset = hybrid.first_xref_item_offset;
@@ -2817,10 +2881,11 @@ fn merge_previous_xref_sections_with_observer(
         // owner hop and spliced at the call-order boundary.
         let mut deferred_diagnostics = Diagnostics::default();
         let mut previous_error_diagnostics = Diagnostics::default();
+        let mut previous_build_diagnostics = Diagnostics::default();
         let previous_result = {
             let _guard = canonical_trailer_owner
                 .map(|owner| DeferredDiagnosticsGuard::new(owner, &mut deferred_diagnostics));
-            parse_xref_from_start_with_owner(
+            parse_xref_from_start_with_owner_and_build_diagnostics(
                 bytes,
                 previous_pos,
                 offset,
@@ -2832,6 +2897,7 @@ fn merge_previous_xref_sections_with_observer(
                 first_xref_item_offset_sink.as_deref_mut(),
                 false,
                 canonical_trailer_owner,
+                Some(&mut previous_build_diagnostics),
             )
         };
         // qpdf classic read calls readTrailer before its optional hybrid
@@ -2847,6 +2913,9 @@ fn merge_previous_xref_sections_with_observer(
                         loaded.loaded.repair_diagnostics.push(diagnostic.clone());
                     }
                     for diagnostic in deferred_diagnostics.entries() {
+                        loaded.loaded.repair_diagnostics.push(diagnostic.clone());
+                    }
+                    for diagnostic in previous_build_diagnostics.entries() {
                         loaded.loaded.repair_diagnostics.push(diagnostic.clone());
                     }
                 } else {
@@ -6723,6 +6792,35 @@ mod final_handle_tests {
         bytes
     }
 
+    fn hybrid_xref_with_classic_live_and_builder_warning() -> Vec<u8> {
+        let mut bytes = hybrid_xref_with_classic_and_live_warning();
+        let length_marker = b"/Length ";
+        let length_start = bytes
+            .windows(length_marker.len())
+            .position(|window| window == length_marker)
+            .expect("the hybrid xref stream has a declared length");
+        let digits_start = length_start + length_marker.len();
+        let digits_end = digits_start
+            + bytes[digits_start..]
+                .iter()
+                .position(u8::is_ascii_whitespace)
+                .expect("the hybrid xref length ends before the dictionary close");
+        let declared_length = std::str::from_utf8(&bytes[digits_start..digits_end])
+            .expect("the hybrid xref length is decimal")
+            .parse::<usize>()
+            .expect("the hybrid xref length fits usize");
+        bytes.splice(
+            digits_start..digits_end,
+            (declared_length + 2).to_string().bytes(),
+        );
+        let endstream_start = bytes
+            .windows(b">\nendstream\n".len())
+            .position(|window| window == b">\nendstream\n")
+            .expect("the hybrid xref stream has an endstream marker");
+        bytes.splice(endstream_start..endstream_start, b"00".iter().copied());
+        bytes
+    }
+
     fn classic_xref_with_malformed_previous() -> (Vec<u8>, usize) {
         let mut bytes = b"%PDF-1.4\n".to_vec();
         let object_offset = bytes.len();
@@ -7079,6 +7177,60 @@ mod final_handle_tests {
         assert!(
             trailer_warning < live_warning,
             "classic trailer diagnostics must precede hybrid live diagnostics: {messages:?}"
+        );
+    }
+
+    #[test]
+    fn previous_xref_merge_orders_hybrid_read_before_builder_diagnostics() {
+        let bytes = hybrid_xref_with_classic_live_and_builder_warning();
+        let previous_xref = bytes
+            .windows(b"xref\n0 6".len())
+            .position(|window| window == b"xref\n0 6")
+            .expect("the hybrid fixture has a classic xref section");
+        let mut loaded = loaded_state_with_trailer(ObjectHandle::dictionary(vec![(
+            b"/Prev".to_vec(),
+            ObjectHandle::integer(i64::try_from(previous_xref).unwrap()),
+        )]));
+        let resolver = canonical_test_resolver(bytes.clone(), BTreeMap::new(), true, 102);
+        let mut registration = XrefRegistration::default();
+
+        merge_previous_xref_sections(
+            &bytes,
+            "1.5",
+            &mut loaded,
+            XrefLoadOptions {
+                allow_repair: true,
+                ..XrefLoadOptions::default()
+            },
+            &mut registration,
+            None,
+            XrefReadContextSpec::ActiveSection,
+            Some(resolver.as_ref()),
+        )
+        .expect("the warning-bearing hybrid /Prev section should merge");
+
+        let messages: Vec<_> = loaded
+            .loaded
+            .repair_diagnostics
+            .entries()
+            .iter()
+            .map(|diagnostic| diagnostic.message_string())
+            .collect();
+        let trailer_warning = messages
+            .iter()
+            .position(|message| message == "stream keyword found in trailer")
+            .expect("the classic trailer warning is retained");
+        let live_warning = messages
+            .iter()
+            .position(|message| message == "expected endobj")
+            .expect("the hybrid read warning is retained");
+        let builder_warning = messages
+            .iter()
+            .position(|message| message.contains("Cross-reference stream data has the wrong size"))
+            .unwrap_or_else(|| panic!("the hybrid builder warning is retained: {messages:?}"));
+        assert!(
+            trailer_warning < live_warning && live_warning < builder_warning,
+            "qpdf call order must be trailer, read, builder: {messages:?}"
         );
     }
 
@@ -7830,6 +7982,63 @@ mod final_handle_tests {
             !state.already_reconstructed,
             "a valid indirect /Filter on the /XRefStm stream must not force \
              cross-reference reconstruction"
+        );
+    }
+
+    #[test]
+    fn ownerless_hybrid_xref_stream_keeps_builder_diagnostics() {
+        let bytes = hybrid_xref_with_classic_live_and_builder_warning();
+        let xref_stream_pos = bytes
+            .windows(b"5 0 obj\n".len())
+            .position(|window| window == b"5 0 obj\n")
+            .expect("the hybrid fixture has its xref stream object");
+        let filter_pos = bytes
+            .windows(b"4 0 obj\n".len())
+            .position(|window| window == b"4 0 obj\n")
+            .expect("the hybrid fixture has its indirect filter object");
+        let mut loaded = loaded_state_with_trailer(ObjectHandle::dictionary(vec![(
+            b"/XRefStm".to_vec(),
+            ObjectHandle::integer(i64::try_from(xref_stream_pos).unwrap()),
+        )]));
+        let mut registration = XrefRegistration::default();
+        registration.insert_xref_entry(
+            ObjectRef::new(4, 0),
+            XrefEntry::Uncompressed {
+                offset: filter_pos as u64,
+            },
+        );
+        registration.insert_xref_entry(
+            ObjectRef::new(5, 0),
+            XrefEntry::Uncompressed {
+                offset: xref_stream_pos as u64,
+            },
+        );
+        merge_xref_stream_from_classic_trailer(
+            &bytes,
+            0,
+            &mut loaded,
+            XrefLoadOptions {
+                allow_repair: true,
+                ..XrefLoadOptions::default()
+            },
+            &mut registration,
+            None,
+            XrefReadContextSpec::ActiveSection,
+            None,
+        )
+        .expect("the ownerless hybrid xref stream should remain recoverable");
+        let messages: Vec<_> = loaded
+            .loaded
+            .repair_diagnostics
+            .entries()
+            .iter()
+            .map(|diagnostic| diagnostic.message_string())
+            .collect();
+        assert!(
+            messages
+                .iter()
+                .any(|message| message.contains("Cross-reference stream data has the wrong size")),
+            "builder diagnostics: {messages:?}"
         );
     }
 

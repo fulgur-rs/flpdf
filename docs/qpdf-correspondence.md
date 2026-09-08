@@ -1123,6 +1123,14 @@ primary、page donor、overlay/underlay donorの全resolverをcloseし、multi-s
 self-overlayのcontroller状態を回帰テストで固定した。これはE-4のclose-before-rename
 責務であり、qtest exceptionsとCLI/rootの経路は対象外である。
 
+`flpdf-waly` では、classic xrefの`readTrailer` → hybrid `/XRefStm` object read →
+`processXRefStream` builderというqpdfの呼出順
+（`libqpdf/QPDF.cc:876-927,951-962,1038-1065`）を、flpdfの二つの診断channel間でも
+保持した。`parse_xref_from_start_with_owner`のclassic hybrid段からbuilder診断を
+別sinkへ分離し、`DeferredDiagnosticsGuard`のcanonical live read warningをその前へ
+spliceする。合成fixtureで`stream keyword found in trailer` → `expected endobj` →
+`Cross-reference stream data has the wrong size`の順序をRED/GREENで固定した。
+
 `coalesceContents` も生成 handler (`auto_job_json_init.hh:311-313`)、Config (`QPDFJob_config.cc:88-91`)、変換順序 (`QPDFJob.cc:2185-2188`) に対応し、既存の provider-backed `ObjectHandle::coalesce_content_streams` を `job/lifecycle.rs` から呼ぶ。
 
 `flattenRotation` も生成 handler (`auto_job_json_init.hh:377-382`)、Config (`QPDFJob_config.cc:204-207`)、変換順序 (`QPDFJob.cc:2190-2194`) に対応し、既存の `flatten_rotation_on_pages` (`QPDFPageObjectHelper.cc:862-991`) を `job/lifecycle.rs` から呼ぶ。`coalesceContents` の直後に配置して、qpdfのページ変換順序を保つ。
