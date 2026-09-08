@@ -402,34 +402,33 @@ fn rewrite_subcommand_applies_optimize_images_with_page_selection() {
 
 #[test]
 fn optimize_images_is_accepted_with_check_like_qpdf() {
+    if !qpdf_11_9_available() {
+        return;
+    }
     let tempdir = tempfile::tempdir().expect("tempdir");
     let input = tempdir.path().join("input.pdf");
     std::fs::write(&input, build_raw_grayscale_image_pdf(200, 200)).expect("write input");
 
-    let with_option = Command::cargo_bin("flpdf")
+    // `createQPDF` runs `handleTransformations` before `writeQPDF` picks the
+    // inspection branch (`QPDFJob.cc:473,484-491`), so the check report comes
+    // from the transformed document. Compare against qpdf itself rather than
+    // against flpdf without the flag: the check report never names the
+    // recompressed image, so a flpdf-vs-flpdf equality stays green whether or
+    // not the transformation actually runs.
+    let qpdf = ProcessCommand::new("/usr/bin/qpdf")
+        .args(["--optimize-images", "--check"])
+        .arg(&input)
+        .output()
+        .expect("run qpdf --check");
+    let flpdf = Command::cargo_bin("flpdf")
         .expect("flpdf binary")
         .args(["--optimize-images", "--check"])
         .arg(&input)
-        .assert()
-        .success();
-    let plain = Command::cargo_bin("flpdf")
-        .expect("flpdf binary")
-        .arg("--check")
-        .arg(&input)
-        .assert()
-        .success();
-
-    // flpdf currently accepts the flag on this route and drops it, so the
-    // check report is byte-for-byte the plain one. qpdf instead runs
-    // `handleTransformations` before `writeQPDF` picks the inspection branch
-    // (`QPDFJob.cc:474,484-491`), so its report reflects the transformed
-    // document. Pin the accept-and-drop behaviour here; `flpdf-w2fk` tracks
-    // wiring the transformation into the inspection routes.
-    assert_eq!(
-        with_option.get_output().stdout,
-        plain.get_output().stdout,
-        "the image option is currently dropped on the --check route"
-    );
+        .output()
+        .expect("run flpdf --check");
+    assert_eq!(flpdf.status.code(), qpdf.status.code());
+    assert_eq!(flpdf.stdout, qpdf.stdout);
+    assert_eq!(flpdf.stderr, qpdf.stderr);
 }
 
 #[test]
@@ -447,13 +446,17 @@ fn externalize_inline_images_is_accepted_with_check_like_qpdf() {
 }
 
 #[test]
-fn image_transform_options_are_accepted_with_inspection_modes_like_qpdf() {
+fn image_transform_options_are_applied_to_inspection_modes_like_qpdf() {
+    if !qpdf_11_9_available() {
+        return;
+    }
     let tempdir = tempfile::tempdir().expect("tempdir");
     let input = tempdir.path().join("input.pdf");
     std::fs::write(&input, build_raw_grayscale_image_pdf(200, 200)).expect("write input");
     let inspection_modes = [
         vec!["--show-npages"],
         vec!["--show-pages"],
+        vec!["--show-pages", "--with-images"],
         vec!["--show-xref"],
         vec!["--show-linearization"],
         vec!["--show-encryption"],
@@ -462,30 +465,51 @@ fn image_transform_options_are_accepted_with_inspection_modes_like_qpdf() {
 
     for image_option in ["--optimize-images", "--externalize-inline-images"] {
         for mode in &inspection_modes {
-            let with_option = Command::cargo_bin("flpdf")
+            let qpdf = ProcessCommand::new("/usr/bin/qpdf")
+                .arg(image_option)
+                .args(mode)
+                .arg(&input)
+                .output()
+                .expect("run qpdf inspection");
+            let flpdf = Command::cargo_bin("flpdf")
                 .expect("flpdf binary")
                 .arg(image_option)
                 .args(mode)
                 .arg(&input)
-                .assert()
-                .success();
-            let plain = Command::cargo_bin("flpdf")
-                .expect("flpdf binary")
-                .args(mode)
-                .arg(&input)
-                .assert()
-                .success();
-            // Accept-and-drop: identical inspection output with and without
-            // the image option. qpdf's own report differs because it runs the
-            // transformation first (`QPDFJob.cc:474`); `flpdf-w2fk` tracks
-            // closing that gap.
+                .output()
+                .expect("run flpdf inspection");
             assert_eq!(
-                with_option.get_output().stdout,
-                plain.get_output().stdout,
-                "{image_option} is currently dropped on {mode:?}"
+                flpdf.status.code(),
+                qpdf.status.code(),
+                "{image_option} {mode:?}"
             );
+            assert_eq!(flpdf.stdout, qpdf.stdout, "{image_option} {mode:?}");
+            assert_eq!(flpdf.stderr, qpdf.stderr, "{image_option} {mode:?}");
         }
     }
+
+    // `--show-pages --with-images` is the only inspection report that names the
+    // image objects, so it is the only one that can observe the transformation:
+    // `--optimize-images` installs a fresh stream through `pdf.newStream()`
+    // (`QPDFJob.cc:2156-2177`), moving /Im1 to a new object number. Without
+    // this the loop above would still pass if the wiring regressed, since qpdf
+    // and flpdf would then merely agree on the untransformed report.
+    let plain = Command::cargo_bin("flpdf")
+        .expect("flpdf binary")
+        .args(["--show-pages", "--with-images"])
+        .arg(&input)
+        .output()
+        .expect("run flpdf --show-pages --with-images");
+    let optimized = Command::cargo_bin("flpdf")
+        .expect("flpdf binary")
+        .args(["--optimize-images", "--show-pages", "--with-images"])
+        .arg(&input)
+        .output()
+        .expect("run flpdf --optimize-images --show-pages --with-images");
+    assert_ne!(
+        optimized.stdout, plain.stdout,
+        "--optimize-images must reach the --show-pages --with-images report"
+    );
 }
 
 /// A one-page PDF that carries both an optimizable raw image and an embedded

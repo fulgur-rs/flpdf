@@ -1231,8 +1231,8 @@ struct Cli {
     /// them. qpdf runs the transformation for those modes too -- `createQPDF`
     /// calls `handleTransformations` before `writeQPDF` picks the inspection
     /// branch (`QPDFJob.cc:473,484-491`), and the attachment phases run inside
-    /// the same `handleTransformations` after the image phase (`:2151-2157`,
-    /// `:2229-2245`). The top-level inspection and attachment routes both
+    /// the same `handleTransformations` after the image phase (`:2151-2177`,
+    /// `:2230-2247`). The top-level inspection and attachment routes both
     /// thread the image options through their own open/transform boundary.
     /// `--pages`/`--rotate`/`--split-pages`/`--empty`/`--json`/
     /// `--json-output` are intentionally absent: all of those routes are
@@ -1248,7 +1248,7 @@ struct Cli {
     /// qpdf. As with `--optimize-images`, the top-level inspection routes run
     /// the transformation before their report (`QPDFJob.cc:473,2151-2155`), and
     /// the attachment routes run it in the same `handleTransformations` before
-    /// the attachment phases (`:2229-2245`).
+    /// the attachment phases (`:2230-2247`).
     #[arg(long = "externalize-inline-images")]
     externalize_inline_images: bool,
     /// Exclude inline images from the optimization pass.
@@ -9107,8 +9107,6 @@ fn run_list_attachments(
     finish_job_exit_status(status)
 }
 
-/// `--show-attachment KEY [-o PATH] input`
-#[allow(clippy::too_many_arguments)]
 /// Reserve standard output for the attachment payload.
 ///
 /// Mirrors the `!m->attachment_to_show.empty()` arm of qpdf's
@@ -9119,6 +9117,7 @@ fn reserve_show_attachment_output() -> CliResult<()> {
     Ok(())
 }
 
+/// `--show-attachment KEY [-o PATH] input`
 #[allow(clippy::too_many_arguments)]
 fn run_show_attachment(
     input: Option<PathBuf>,
