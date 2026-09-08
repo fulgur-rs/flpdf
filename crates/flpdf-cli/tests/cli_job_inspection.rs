@@ -74,6 +74,91 @@ fn one_page_with_image_pdf() -> Vec<u8> {
     bytes
 }
 
+fn assemble_pdf(objects: &[(u32, Vec<u8>)]) -> Vec<u8> {
+    let mut bytes = b"%PDF-1.4\n".to_vec();
+    let mut offsets = vec![0_usize; objects.len() + 1];
+    for (number, body) in objects {
+        offsets[*number as usize] = bytes.len();
+        bytes.extend_from_slice(format!("{number} 0 obj\n").as_bytes());
+        bytes.extend_from_slice(body);
+        bytes.extend_from_slice(b"\nendobj\n");
+    }
+    let xref_offset = bytes.len();
+    bytes.extend_from_slice(format!("xref\n0 {}\n", objects.len() + 1).as_bytes());
+    bytes.extend_from_slice(b"0000000000 65535 f \n");
+    for offset in offsets.into_iter().skip(1) {
+        bytes.extend_from_slice(format!("{offset:010} 00000 n \n").as_bytes());
+    }
+    bytes.extend_from_slice(
+        format!(
+            "trailer\n<< /Size {} /Root 1 0 R >>\nstartxref\n{xref_offset}\n%%EOF\n",
+            objects.len() + 1
+        )
+        .as_bytes(),
+    );
+    bytes
+}
+
+fn stream_object(dictionary: &[u8], data: &[u8]) -> Vec<u8> {
+    let mut object = dictionary.to_vec();
+    object.extend_from_slice(b"\nstream\n");
+    object.extend_from_slice(data);
+    object.extend_from_slice(b"\nendstream");
+    object
+}
+
+fn large_raw_image_pdf() -> Vec<u8> {
+    let image_data = vec![0_u8; 200 * 200 * 3];
+    let content = b"q 200 0 0 200 0 0 cm /Im1 Do Q\n";
+    assemble_pdf(&[
+        (1, b"<< /Type /Catalog /Pages 2 0 R >>".to_vec()),
+        (2, b"<< /Type /Pages /Kids [3 0 R] /Count 1 >>".to_vec()),
+        (
+            3,
+            b"<< /Type /Page /Parent 2 0 R /MediaBox [0 0 200 200] /Resources << /XObject << /Im1 4 0 R >> >> /Contents 5 0 R >>".to_vec(),
+        ),
+        (
+            4,
+            stream_object(
+                format!(
+                    "<< /Type /XObject /Subtype /Image /Width 200 /Height 200 /ColorSpace /DeviceRGB /BitsPerComponent 8 /Length {} >>",
+                    image_data.len()
+                )
+                .as_bytes(),
+                &image_data,
+            ),
+        ),
+        (
+            5,
+            stream_object(format!("<< /Length {} >>", content.len()).as_bytes(), content),
+        ),
+    ])
+}
+
+fn damaged_content_pdf() -> Vec<u8> {
+    assemble_pdf(&[
+        (1, b"<< /Type /Catalog /Pages 2 0 R >>".to_vec()),
+        (2, b"<< /Type /Pages /Kids [3 0 R] /Count 1 >>".to_vec()),
+        (
+            3,
+            b"<< /Type /Page /Parent 2 0 R /MediaBox [0 0 200 200] /Resources << >> /Contents 4 0 R >>".to_vec(),
+        ),
+        (
+            4,
+            // Flate-compressed bytes mislabelled as LZW, the shape qpdf's own
+            // `qtest/qpdf/bad-data.pdf` uses. A single 0xff decodes cleanly
+            // enough that qpdf raises no warning at all, so it cannot tell an
+            // applied transformation from a dropped one.
+            stream_object(
+                b"<< /Length 48 /Filter /LZWDecode >>",
+                b"\x78\x9c\x73\x0a\xe1\x52\x50\xd0\x77\x33\x54\x30\x32\x51\x08\x49\
+                  \x03\xb2\xcd\x8d\x80\xc8\x40\x21\x24\x05\xc8\xd6\x08\xc8\x2f\x49\
+                  \x2c\xc9\xd7\x54\x08\xc9\xe2\x72\x0d\xe1\x02\x00\xcb\x01\x09\xc8",
+            ),
+        ),
+    ])
+}
+
 #[test]
 fn ordinary_show_npages_matches_qpdf_11_9() {
     if skip_if_qpdf_missing() {
@@ -178,6 +263,105 @@ fn ordinary_show_pages_with_images_matches_qpdf_11_9() {
         .unwrap()
         .env("FLPDF_PROGNAME", "qpdf")
         .args(["--show-pages", "--with-images"])
+        .arg(&input)
+        .output()
+        .unwrap();
+
+    assert_eq!(flpdf.status.code(), qpdf.status.code());
+    assert_eq!(
+        normalize_newlines(&flpdf.stdout),
+        normalize_newlines(&qpdf.stdout)
+    );
+    assert_eq!(
+        normalize_newlines(&flpdf.stderr),
+        normalize_newlines(&qpdf.stderr)
+    );
+}
+
+#[test]
+fn ordinary_show_pages_with_images_and_optimize_matches_qpdf_11_9() {
+    if skip_if_qpdf_missing() {
+        return;
+    }
+    let directory = tempfile::tempdir().unwrap();
+    let input = PathBuf::from(directory.path()).join("input.pdf");
+    fs::write(&input, large_raw_image_pdf()).unwrap();
+
+    let qpdf = ShellCommand::new("qpdf")
+        .args(["--show-pages", "--with-images", "--optimize-images"])
+        .arg(&input)
+        .output()
+        .unwrap();
+    let flpdf = Command::cargo_bin("flpdf")
+        .unwrap()
+        .env("FLPDF_PROGNAME", "qpdf")
+        .args(["--show-pages", "--with-images", "--optimize-images"])
+        .arg(&input)
+        .output()
+        .unwrap();
+
+    assert_eq!(flpdf.status.code(), qpdf.status.code());
+    assert_eq!(
+        normalize_newlines(&flpdf.stdout),
+        normalize_newlines(&qpdf.stdout)
+    );
+    assert_eq!(
+        normalize_newlines(&flpdf.stderr),
+        normalize_newlines(&qpdf.stderr)
+    );
+}
+
+#[test]
+fn ordinary_check_with_optimize_images_matches_qpdf_11_9() {
+    if skip_if_qpdf_missing() {
+        return;
+    }
+    let directory = tempfile::tempdir().unwrap();
+    let input = PathBuf::from(directory.path()).join("input.pdf");
+    fs::write(&input, large_raw_image_pdf()).unwrap();
+
+    let qpdf = ShellCommand::new("qpdf")
+        .args(["--check", "--optimize-images", "--verbose"])
+        .arg(&input)
+        .output()
+        .unwrap();
+    let flpdf = Command::cargo_bin("flpdf")
+        .unwrap()
+        .env("FLPDF_PROGNAME", "qpdf")
+        .args(["--check", "--optimize-images", "--verbose"])
+        .arg(&input)
+        .output()
+        .unwrap();
+
+    assert_eq!(flpdf.status.code(), qpdf.status.code());
+    assert_eq!(
+        normalize_newlines(&flpdf.stdout),
+        normalize_newlines(&qpdf.stdout)
+    );
+    assert_eq!(
+        normalize_newlines(&flpdf.stderr),
+        normalize_newlines(&qpdf.stderr)
+    );
+}
+
+#[test]
+fn ordinary_show_npages_with_optimize_images_matches_qpdf_warning_status() {
+    if skip_if_qpdf_missing() {
+        return;
+    }
+    let directory = tempfile::tempdir().unwrap();
+    let input = PathBuf::from(directory.path()).join("damaged.pdf");
+    fs::write(&input, damaged_content_pdf()).unwrap();
+
+    let qpdf = ShellCommand::new("qpdf")
+        .args(["--show-npages", "--optimize-images"])
+        .arg(&input)
+        .output()
+        .unwrap();
+    let flpdf = Command::cargo_bin("flpdf")
+        .unwrap()
+        .env("FLPDF_PROGNAME", "qpdf")
+        .args(["--show-npages", "--optimize-images"])
         .arg(&input)
         .output()
         .unwrap();

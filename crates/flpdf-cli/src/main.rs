@@ -1192,11 +1192,14 @@ struct Cli {
     /// like qpdf, which rejects neither combination. qpdf still performs the
     /// image transformation for them -- `createQPDF` runs
     /// `handleTransformations` before `writeQPDF` picks the inspection branch
-    /// (`QPDFJob.cc:474,484-491`) -- so its inspection output reflects the
-    /// transformed document. flpdf currently accepts the flag and drops it on
-    /// those routes; wiring the transformation into them is tracked
-    /// separately. Attachment mutation modes remain conflicts because those
-    /// dispatch branches do not consume the image options.
+    /// (`QPDFJob.cc:473,484-491`) -- so its inspection output reflects the
+    /// transformed document. The top-level inspection routes thread the same
+    /// image options through their open/transform boundary. The attachment flags
+    /// remain conflicts here: qpdf accepts them alongside the image options --
+    /// `--list-attachments` and `--show-attachment` are inspection modes it
+    /// dispatches from `doInspection` (`QPDFJob.cc:1684-1689`), and the
+    /// mutating ones run in the same create stage -- but flpdf's dispatch
+    /// branches do not consume the image options yet (`flpdf-wz4i`).
     /// `--pages`/`--rotate`/`--split-pages`/`--empty`/`--json`/
     /// `--json-output` are intentionally absent: all of those routes are
     /// already threaded through (see `top_level_image_options` at each call
@@ -1212,8 +1215,8 @@ struct Cli {
     /// from `--optimize-images`; when both are selected the shared image phase
     /// externalizes first and then optimizes reachable Image XObjects.
     /// Inspection modes may be combined with this flag like qpdf. As with
-    /// `--optimize-images`, qpdf runs the transformation even on those routes
-    /// (`QPDFJob.cc:474,2151-2156`) while flpdf currently drops it.
+    /// `--optimize-images`, the top-level inspection routes run the
+    /// transformation before their report (`QPDFJob.cc:473,2151-2156`).
     #[arg(long = "externalize-inline-images",
           conflicts_with_all = [
               "list_attachments", "show_attachment", "remove_attachment",
@@ -3089,7 +3092,7 @@ fn main() {
             args.no_warn,
         )
     } else if json_input_inspection {
-        run_json_input_inspection(&args)
+        run_json_input_inspection(&args, top_level_image_transform_options)
     } else if args.json.is_some() || args.json_output.is_some() {
         run_json(
             &args,
@@ -3128,6 +3131,8 @@ fn main() {
             args.filtered_stream_data,
             args.no_warn,
             args.page_ops.empty,
+            top_level_image_transform_options,
+            args.verbose,
         )
     } else if args.show_npages {
         run_show_npages(
@@ -3136,6 +3141,8 @@ fn main() {
             &args.password,
             args.no_warn,
             args.page_ops.empty,
+            top_level_image_transform_options,
+            args.verbose,
         )
     } else if args.show_pages {
         run_show_pages(
@@ -3145,6 +3152,8 @@ fn main() {
             args.with_images,
             args.no_warn,
             args.page_ops.empty,
+            top_level_image_transform_options,
+            args.verbose,
         )
     } else if args.show_xref {
         run_show_xref(
@@ -3153,6 +3162,8 @@ fn main() {
             &args.password,
             args.no_warn,
             args.page_ops.empty,
+            top_level_image_transform_options,
+            args.verbose,
         )
     } else if args.check_linearization {
         run_check_linearization(
@@ -3161,6 +3172,8 @@ fn main() {
             &args.password,
             args.no_warn,
             args.page_ops.empty,
+            top_level_image_transform_options,
+            args.verbose,
         )
     } else if args.show_linearization {
         run_show_linearization(
@@ -3169,6 +3182,8 @@ fn main() {
             &args.password,
             args.no_warn,
             args.page_ops.empty,
+            top_level_image_transform_options,
+            args.verbose,
         )
     } else if args.show_encryption {
         run_show_encryption(
@@ -3178,6 +3193,8 @@ fn main() {
             args.no_warn,
             args.show_encryption_key,
             args.page_ops.empty,
+            top_level_image_transform_options,
+            args.verbose,
         )
     } else if args.check {
         run_check(
@@ -3187,6 +3204,8 @@ fn main() {
             args.no_warn,
             args.show_encryption_key,
             args.page_ops.empty,
+            top_level_image_transform_options,
+            args.verbose,
         )
     } else if args.list_attachments {
         run_list_attachments(
@@ -3980,12 +3999,12 @@ fn apply_json_page_specs<R: Read + Seek + 'static>(
     }
 }
 
-fn run_json_input_inspection(cli: &Cli) -> CliResult<()> {
+fn run_json_input_inspection(cli: &Cli, image_options: ImageTransformOptions) -> CliResult<()> {
     if cli.page_ops.empty {
         reject_empty_inspection_output(cli.input.as_deref())?;
         let mut job = new_cli_job(cli.no_warn);
         let mut pdf = create_empty_primary_document(&mut job, cli.update_from_json.as_deref())?;
-        return run_job_inspection_on_pdf(cli, &mut job, &mut pdf);
+        return run_job_inspection_on_pdf(cli, &mut job, &mut pdf, image_options);
     }
     let input = cli.input.as_ref().ok_or_else(missing_input_usage_error)?;
     let mut job = QPDFJob::new();
@@ -4006,7 +4025,7 @@ fn run_json_input_inspection(cli: &Cli) -> CliResult<()> {
             .create_from_json_document(file, path_description(input))
             .map_err(|error| json_error_with_file(input, Box::new(error)))?;
         apply_json_update_with_job(&mut job, &mut pdf, cli.update_from_json.as_deref())?;
-        return run_job_inspection_on_pdf(cli, &mut job, &mut pdf);
+        return run_job_inspection_on_pdf(cli, &mut job, &mut pdf, image_options);
     }
 
     let mut options = pdf_open_options(cli.repair, &cli.password)?;
@@ -4032,14 +4051,16 @@ fn run_json_input_inspection(cli: &Cli) -> CliResult<()> {
             }
         };
     apply_json_update_with_job(&mut job, &mut pdf, cli.update_from_json.as_deref())?;
-    run_job_inspection_on_pdf(cli, &mut job, &mut pdf)
+    run_job_inspection_on_pdf(cli, &mut job, &mut pdf, image_options)
 }
 
 fn run_job_inspection_on_pdf<R: Read + Seek + 'static>(
     cli: &Cli,
     job: &mut QPDFJob,
     pdf: &mut Pdf<R>,
+    image_options: ImageTransformOptions,
 ) -> CliResult<()> {
+    apply_image_transformations(pdf, image_options, cli.verbose)?;
     job.set_with_images(cli.with_images);
     if cli.check {
         job.set_show_encryption_key(cli.show_encryption_key);
@@ -4163,12 +4184,16 @@ fn run_command(command: Commands, overlay_specs: &[OverlaySpec]) -> CliResult<()
             false,
             false,
             false,
+            ImageTransformOptions::default(),
+            false,
         ),
         Commands::CheckLinearization(cmd) => run_check_linearization(
             Some(cmd.input),
             false,
             &PasswordArgs::default(),
             false,
+            false,
+            ImageTransformOptions::default(),
             false,
         ),
         Commands::DumpObject(cmd) => run_dump_object(
@@ -4180,7 +4205,15 @@ fn run_command(command: Commands, overlay_specs: &[OverlaySpec]) -> CliResult<()
         ),
         Commands::Pages(cmd) => {
             if cmd.show_npages {
-                run_show_npages(Some(cmd.input), cmd.repair, &cmd.password, false, false)
+                run_show_npages(
+                    Some(cmd.input),
+                    cmd.repair,
+                    &cmd.password,
+                    false,
+                    false,
+                    ImageTransformOptions::default(),
+                    false,
+                )
             } else {
                 run_show_pages(
                     Some(cmd.input),
@@ -4188,6 +4221,8 @@ fn run_command(command: Commands, overlay_specs: &[OverlaySpec]) -> CliResult<()
                     &cmd.password,
                     false,
                     false,
+                    false,
+                    ImageTransformOptions::default(),
                     false,
                 )
             }
@@ -4217,6 +4252,8 @@ fn run_command(command: Commands, overlay_specs: &[OverlaySpec]) -> CliResult<()
                 &cmd.password,
                 false,
                 false,
+                false,
+                ImageTransformOptions::default(),
                 false,
             )
         }
@@ -4467,6 +4504,7 @@ fn run_command(command: Commands, overlay_specs: &[OverlaySpec]) -> CliResult<()
     }
 }
 
+#[allow(clippy::too_many_arguments)]
 fn run_check(
     input: Option<PathBuf>,
     repair: bool,
@@ -4474,12 +4512,15 @@ fn run_check(
     no_warn: bool,
     show_encryption_key: bool,
     empty: bool,
+    image_options: ImageTransformOptions,
+    verbose: bool,
 ) -> CliResult<()> {
     if empty {
         reject_empty_inspection_output(input.as_deref())?;
         let mut job = new_cli_job(no_warn);
         job.set_show_encryption_key(show_encryption_key);
         let mut pdf = create_empty_primary_document(&mut job, None)?;
+        apply_image_transformations(&mut pdf, image_options, verbose)?;
         return finish_check_job(job.check(&mut pdf));
     }
     let input = input.ok_or_else(missing_input_usage_error)?;
@@ -4499,6 +4540,7 @@ fn run_check(
                 return Err(error_with_file(&input, actionable_password_error(error)));
             }
         };
+    apply_image_transformations(&mut pdf, image_options, verbose)?;
     finish_check_job(job.check(&mut pdf))
 }
 
@@ -4508,11 +4550,14 @@ fn run_check_linearization(
     password: &PasswordArgs,
     no_warn: bool,
     empty: bool,
+    image_options: ImageTransformOptions,
+    verbose: bool,
 ) -> CliResult<()> {
     if empty {
         reject_empty_inspection_output(input.as_deref())?;
         let mut job = new_cli_job(no_warn);
         let mut pdf = create_empty_primary_document(&mut job, None)?;
+        apply_image_transformations(&mut pdf, image_options, verbose)?;
         return finish_job_exit_status(job.show_linearization(&mut pdf)?);
     }
     let input = input.ok_or_else(missing_input_usage_error)?;
@@ -4522,6 +4567,7 @@ fn run_check_linearization(
     let mut pdf = job
         .open_with_description(BufReader::new(file), path_description(&input), options)
         .map_err(|error| error_with_file(&input, actionable_password_error(error)))?;
+    apply_image_transformations(&mut pdf, image_options, verbose)?;
     finish_job_exit_status(job.check_linearization(&mut pdf)?)
 }
 
@@ -7595,6 +7641,8 @@ fn run_show_object(
     filtered_stream_data: bool,
     suppress_warnings: bool,
     empty: bool,
+    image_options: ImageTransformOptions,
+    verbose: bool,
 ) -> CliResult<()> {
     // qpdf's Config::showObject callback parses the selector during argv
     // parsing, before QPDFJob::run() ever opens the input file, so a usage
@@ -7604,6 +7652,7 @@ fn run_show_object(
         reject_empty_inspection_output(input.as_deref())?;
         let mut job = new_cli_job(suppress_warnings);
         let mut pdf = create_empty_primary_document(&mut job, None)?;
+        apply_image_transformations(&mut pdf, image_options, verbose)?;
         let object = match selector {
             ShowObjectSelector::Trailer => pdf.trailer(),
             ShowObjectSelector::Object(object_ref) => pdf.get_object_handle(object_ref),
@@ -7629,6 +7678,7 @@ fn run_show_object(
     let input = input.ok_or_else(missing_input_usage_error)?;
     let mut pdf = open_pdf_with_suppression(&input, repair, password, suppress_warnings)?;
     let mut job = new_cli_job(suppress_warnings);
+    apply_image_transformations(&mut pdf, image_options, verbose)?;
     let object = match selector {
         ShowObjectSelector::Trailer => pdf.trailer(),
         ShowObjectSelector::Object(object_ref) => pdf.get_object_handle(object_ref),
@@ -7667,19 +7717,24 @@ fn run_show_npages(
     password: &PasswordArgs,
     suppress_warnings: bool,
     empty: bool,
+    image_options: ImageTransformOptions,
+    verbose: bool,
 ) -> CliResult<()> {
     if empty {
         reject_empty_inspection_output(input.as_deref())?;
         let mut job = new_cli_job(suppress_warnings);
         let mut pdf = create_empty_primary_document(&mut job, None)?;
+        apply_image_transformations(&mut pdf, image_options, verbose)?;
         return finish_job_exit_status(job.show_npages(&mut pdf)?);
     }
     let input = input.ok_or_else(missing_input_usage_error)?;
     let mut pdf = open_pdf_with_suppression(&input, repair, password, suppress_warnings)?;
     let mut job = new_cli_job(suppress_warnings);
+    apply_image_transformations(&mut pdf, image_options, verbose)?;
     finish_job_exit_status(job.show_npages(&mut pdf)?)
 }
 
+#[allow(clippy::too_many_arguments)]
 fn run_show_pages(
     input: Option<PathBuf>,
     repair: bool,
@@ -7687,18 +7742,22 @@ fn run_show_pages(
     with_images: bool,
     suppress_warnings: bool,
     empty: bool,
+    image_options: ImageTransformOptions,
+    verbose: bool,
 ) -> CliResult<()> {
     if empty {
         reject_empty_inspection_output(input.as_deref())?;
         let mut job = new_cli_job(suppress_warnings);
         job.set_with_images(with_images);
         let mut pdf = create_empty_primary_document(&mut job, None)?;
+        apply_image_transformations(&mut pdf, image_options, verbose)?;
         return finish_job_exit_status(job.show_pages(&mut pdf)?);
     }
     let input = input.ok_or_else(missing_input_usage_error)?;
     let mut pdf = open_pdf_with_suppression(&input, repair, password, suppress_warnings)?;
     let mut job = new_cli_job(suppress_warnings);
     job.set_with_images(with_images);
+    apply_image_transformations(&mut pdf, image_options, verbose)?;
     finish_job_exit_status(job.show_pages(&mut pdf)?)
 }
 
@@ -7708,16 +7767,20 @@ fn run_show_xref(
     password: &PasswordArgs,
     suppress_warnings: bool,
     empty: bool,
+    image_options: ImageTransformOptions,
+    verbose: bool,
 ) -> CliResult<()> {
     if empty {
         reject_empty_inspection_output(input.as_deref())?;
         let mut job = new_cli_job(suppress_warnings);
         let mut pdf = create_empty_primary_document(&mut job, None)?;
+        apply_image_transformations(&mut pdf, image_options, verbose)?;
         return finish_job_exit_status(job.show_xref(&mut pdf)?);
     }
     let input = input.ok_or_else(missing_input_usage_error)?;
     let mut pdf = open_pdf_with_suppression(&input, repair, password, suppress_warnings)?;
     let mut job = new_cli_job(suppress_warnings);
+    apply_image_transformations(&mut pdf, image_options, verbose)?;
     finish_job_exit_status(job.show_xref(&mut pdf)?)
 }
 
@@ -7727,11 +7790,14 @@ fn run_show_linearization(
     password: &PasswordArgs,
     no_warn: bool,
     empty: bool,
+    image_options: ImageTransformOptions,
+    verbose: bool,
 ) -> CliResult<()> {
     if empty {
         reject_empty_inspection_output(input.as_deref())?;
         let mut job = new_cli_job(no_warn);
         let mut pdf = create_empty_primary_document(&mut job, None)?;
+        apply_image_transformations(&mut pdf, image_options, verbose)?;
         return finish_job_exit_status(job.show_linearization(&mut pdf)?);
     }
     let input = input.ok_or_else(missing_input_usage_error)?;
@@ -7744,6 +7810,7 @@ fn run_show_linearization(
             Ok(pdf) => pdf,
             Err(error) => return Err(error_with_file(&input, actionable_password_error(error))),
         };
+    apply_image_transformations(&mut pdf, image_options, verbose)?;
     finish_job_exit_status(job.show_linearization(&mut pdf)?)
 }
 
@@ -7941,6 +8008,7 @@ fn run_show_encryption_key(
 /// [`open_pdf_for_inspection`] helper) so `--no-warn` reaches
 /// `QPDFJob::set_suppress_warnings`, matching `run_check`/
 /// `run_check_linearization`'s pattern.
+#[allow(clippy::too_many_arguments)]
 fn run_show_encryption(
     input: Option<PathBuf>,
     repair: bool,
@@ -7948,12 +8016,15 @@ fn run_show_encryption(
     no_warn: bool,
     show_encryption_key: bool,
     empty: bool,
+    image_options: ImageTransformOptions,
+    verbose: bool,
 ) -> CliResult<()> {
     if empty {
         reject_empty_inspection_output(input.as_deref())?;
         let mut job = new_cli_job(no_warn);
         job.set_show_encryption_key(show_encryption_key);
         let mut pdf = create_empty_primary_document(&mut job, None)?;
+        apply_image_transformations(&mut pdf, image_options, verbose)?;
         return finish_show_encryption(&mut job, &mut pdf, password.password_is_hex_key);
     }
     let input = input.ok_or_else(missing_input_usage_error)?;
@@ -7977,6 +8048,15 @@ fn run_show_encryption(
             options,
         )
         .map_err(|error| error_with_file(&input, actionable_password_error(error)))?;
+    // qpdf's password-error catch returns from `createQPDF` before it reaches
+    // `handleTransformations` (`QPDFJob.cc:437-448,473`), so `--show-encryption`
+    // on a file whose password did not authenticate prints the report and stops
+    // -- it never walks the still-encrypted streams. Running the image phase
+    // here instead would raise decode warnings qpdf does not raise and turn the
+    // exit status into 3.
+    if !(pdf.is_encrypted() && pdf.encryption_file_key().is_none()) {
+        apply_image_transformations(&mut pdf, image_options, verbose)?;
+    }
     finish_show_encryption(&mut job, &mut pdf, password.password_is_hex_key)
 }
 
@@ -10951,6 +11031,8 @@ mod tests {
             false,
             false,
             false,
+            false,
+            ImageTransformOptions::default(),
             false,
         )
         .expect_err("overflow selector with no input file");
