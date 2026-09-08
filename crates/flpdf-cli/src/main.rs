@@ -7,11 +7,10 @@ use clap::{
 };
 use flpdf::fix_qdf;
 use flpdf::job::{
-    copy_duplicate_page_annotations, flatten_rotation_on_pages,
-    should_remove_unreferenced_resources, AttachmentAddOptions, AttachmentCopyOptions, CheckError,
-    FlattenAnnotationsMode, ImageOptimizationOptions, JobExitCode, JsonJobError, JsonJobOptions,
-    JsonJobOutput, JsonStreamData, PageSpecInput, PageSpecJobOutput, QPDFJob,
-    RemoveUnreferencedResources, SplitPageOptions,
+    copy_duplicate_page_annotations, should_remove_unreferenced_resources, AttachmentAddOptions,
+    AttachmentCopyOptions, CheckError, FlattenAnnotationsMode, ImageOptimizationOptions,
+    JobExitCode, JsonJobError, JsonJobOptions, JsonJobOutput, JsonStreamData, PageSpecInput,
+    PageSpecJobOutput, QPDFJob, RemoveUnreferencedResources, SplitPageOptions,
 };
 use flpdf::pipeline::{FlateAction, Pipeline, PipelineHandle, PlFlate, PlStdioFile};
 use flpdf::qutil::same_file as qpdf_same_file;
@@ -95,16 +94,6 @@ struct WriterOptions {
 struct PageLabelOptions {
     set: Option<Vec<Vec<u8>>>,
     remove: bool,
-}
-
-impl PageLabelOptions {
-    fn is_active(&self) -> bool {
-        // qpdf guards the label-tree rebuild on a non-empty spec vector
-        // (`if (!m->page_label_specs.empty())`, `libqpdf/QPDFJob.cc:2199`), so
-        // `--set-page-labels --` with no specs leaves `/PageLabels` untouched
-        // rather than installing `<< /Nums [] >>`.
-        self.remove || self.set.as_ref().is_some_and(|specs| !specs.is_empty())
-    }
 }
 
 /// The qpdf job keeps explicit inline-image externalization separate from the
@@ -2271,6 +2260,7 @@ enum CliFlattenMode {
 
 impl CliFlattenMode {
     /// Delegate qpdf's mode-to-mask mapping to the canonical job boundary.
+    #[cfg(test)]
     fn flags(self) -> (i64, i64) {
         FlattenAnnotationsMode::from(self).qpdf_flags()
     }
@@ -5259,16 +5249,128 @@ fn run_rewrite(
 }
 
 #[allow(clippy::too_many_arguments)]
-fn run_rewrite_opened<R: Read + Seek + 'static>(
-    mut pdf: Pdf<R>,
+fn configure_rewrite_job(
     input: &Path,
     output: &Path,
-    repair: bool,
     password: &PasswordArgs,
     linearize: bool,
     linearize_pass1: Option<&Path>,
     remove_restrictions: bool,
+    image_options: ImageTransformOptions,
+    generate_appearances: bool,
+    flatten_annotations_mode: Option<CliFlattenMode>,
+    coalesce_contents: bool,
+    flatten_rotation: bool,
+    page_labels: &PageLabelOptions,
+    overlay_specs: &[OverlaySpec],
+    verbose: bool,
+    no_warn: bool,
+    options: &WriterOptions,
     decrypt: bool,
+) -> CliResult<QPDFJob> {
+    if linearize && !overlay_specs.is_empty() {
+        return Err("--overlay/--underlay cannot be combined with --linearize".into());
+    }
+    let mut job = new_cli_job(no_warn);
+    job.set_input_name_bytes(path_description(input));
+    job.set_output_file(output.to_path_buf())?;
+    job.set_suppress_recovery(password.recovery.suppress_recovery);
+    job.set_ignore_xref_streams(password.recovery.ignore_xref_streams);
+    job.set_verbose(verbose);
+    job.set_progress(options.progress);
+    job.set_linearization(linearize, linearize_pass1.map(Path::to_path_buf));
+
+    let mut writer_options = options.clone();
+    if decrypt {
+        writer_options.preserve_encryption = false;
+    }
+    job.set_writer_configuration(writer_configuration(
+        &writer_options,
+        linearize,
+        linearize_pass1,
+    )?);
+
+    {
+        let mut configuration = job.config();
+        if remove_restrictions {
+            configuration.remove_restrictions();
+        }
+        if image_options.optimize_images {
+            let mut optimization = image_options.image_options;
+            if image_options.externalize_inline_images {
+                optimization.keep_inline_images = false;
+            }
+            configuration.optimize_images(optimization);
+        } else if image_options.externalize_inline_images {
+            configuration.externalize_inline_images(image_options.image_options.inline_min_bytes);
+        }
+        if generate_appearances {
+            configuration.generate_appearances();
+        }
+        if let Some(mode) = flatten_annotations_mode {
+            configuration.flatten_annotations(FlattenAnnotationsMode::from(mode));
+        }
+        if coalesce_contents {
+            configuration.coalesce_contents();
+        }
+        if flatten_rotation {
+            configuration.flatten_rotation();
+        }
+        if let Some(specs) = page_labels.set.as_ref().filter(|specs| !specs.is_empty()) {
+            configuration.set_page_labels(specs.iter().map(Vec::as_slice))?;
+        }
+        if page_labels.remove {
+            configuration.remove_page_labels();
+        }
+        for spec in overlay_specs {
+            let password = spec
+                .raw_password
+                .clone()
+                .or_else(|| {
+                    spec.password
+                        .as_ref()
+                        .map(|password| arg_parser::os_bytes(password.as_os_str()))
+                })
+                .or_else(|| password.password_bytes())
+                .unwrap_or_default();
+            let from = match spec.from.as_deref() {
+                None => PageRange::parse("")?,
+                Some("") => PageRange::empty(),
+                Some(range) => PageRange::parse(range)?,
+            };
+            let to = match spec.to.as_deref() {
+                None => PageRange::parse("")?,
+                Some("") => PageRange::empty(),
+                Some(range) => PageRange::parse(range)?,
+            };
+            let repeat = match spec.repeat.as_deref() {
+                None | Some("") => None,
+                Some(range) => Some(PageRange::parse(range)?),
+            };
+            match spec.kind {
+                OverlayKind::Overlay => {
+                    configuration.overlay(PathBuf::from(&spec.file), password, from, to, repeat)
+                }
+                OverlayKind::Underlay => {
+                    configuration.underlay(PathBuf::from(&spec.file), password, from, to, repeat)
+                }
+            };
+        }
+    }
+    Ok(job)
+}
+
+#[allow(clippy::too_many_arguments)]
+fn run_rewrite_opened<R: Read + Seek + 'static>(
+    mut pdf: Pdf<R>,
+    input: &Path,
+    output: &Path,
+    _repair: bool,
+    _password: &PasswordArgs,
+    linearize: bool,
+    linearize_pass1: Option<&Path>,
+    remove_restrictions: bool,
+    _decrypt: bool,
     normalize_content: bool,
     coalesce_contents: bool,
     _remove_unref: CliRemoveUnreferencedResources,
@@ -5282,254 +5384,55 @@ fn run_rewrite_opened<R: Read + Seek + 'static>(
     no_warn: bool,
     options: WriterOptions,
 ) -> CliResult<()> {
-    // qpdf's `--no-warn` suppresses warning delivery for the entire job,
-    // including warnings raised by transformations applied after the
-    // document opens (e.g. --flatten-annotations's /NeedAppearances
-    // warning), not only open-time diagnostics. Without this, a warning
-    // raised mid-rewrite would still print live despite --no-warn.
-    pdf.set_suppress_warnings(no_warn);
-    let mut standard_output = prepare_pdf_standard_output(output)?;
-
-    // Overlay/underlay stacking mutates page dictionaries and adds objects
-    // before the canonical writer plans the output. The linearized path has a
-    // separate qpdf ordering contract, so the combination is rejected upfront.
-    if linearize && !overlay_specs.is_empty() {
-        return Err("--overlay/--underlay cannot be combined with --linearize".into());
+    // The linearized writer has pass-one and final emission phases. qpdf's
+    // normalization warning is produced once before those phases, so perform
+    // the existing canonical content pass here and keep it disabled in both
+    // writer passes. Ordinary rewrites leave normalization on the writer,
+    // which owns the single non-linearized pass.
+    let linearize_normalization =
+        linearize && normalize_content && options.content_normalization_set;
+    let mut job_options = options.clone();
+    if linearize_normalization {
+        job_options.content_normalization = false;
     }
-
-    if linearize {
-        // --remove-restrictions must strip signatures before the linearization
-        // plan is computed: removing signature objects changes the reachable
-        // first-page graph. qpdf applies this transformation before planning.
-        if remove_restrictions {
-            let _ = AcroFormDocumentHelper::new(&mut pdf)?.disable_digital_signatures()?;
-        }
-        let mut options = options;
-        if decrypt {
-            options.preserve_encryption = false;
-        }
-        apply_image_transformations(&mut pdf, image_options, verbose)?;
-        if generate_appearances {
-            generate_missing_appearances(&mut pdf)?;
-        }
-        if let Some(mode) = flatten_annotations_mode {
-            let (required_flags, forbidden_flags) = mode.flags();
-            PageDocumentHelper::new(&mut pdf)
-                .flatten_annotations(required_flags, forbidden_flags)?;
-        }
-        // qpdf applies --flatten-rotation after annotation flattening and
-        // before the writer plans the linearized output
-        // (`QPDFJob.cc:2183-2194`). Keep the transformed page graph visible
-        // to the linearization planner rather than silently dropping the
-        // option on this branch.
-        if flatten_rotation {
-            let page_refs = pages::page_refs(&mut pdf)?;
-            flatten_rotation_on_pages(&mut pdf, &page_refs)?;
-        }
-        apply_canonical_page_labels(&mut pdf, &page_labels, verbose, no_warn)?;
-        // Apply content normalization before the writer plans and emits the
-        // linearized document.
-        let normalization_last_bad = if normalize_content {
-            normalize_page_contents(&mut pdf)?
-        } else {
-            Vec::new()
-        };
-        let announce_file = standard_output.is_none();
-        write_with_pdf_writer(
-            &mut pdf,
-            output,
-            &mut standard_output,
-            &options,
-            true,
-            linearize_pass1,
-        )?;
-        if verbose && announce_file {
-            logger_info(wrote_file_message(&progname(), output))?;
-        }
-        // On an encrypted input, `--decrypt` has already disabled
-        // source-encryption preservation above.
-        finish_rewrite_warnings(input, &pdf, &normalization_last_bad, announce_file, no_warn)?;
-    } else {
-        // qpdf runs disableDigitalSignatures unconditionally under
-        // --remove-restrictions: remove catalog /Perms, zero /AcroForm
-        // /SigFlags, strip /FT /V /SV /Lock from /Sig form fields, and erase them
-        // from the top-level /Fields array (a field still reachable from a page
-        // /Annots survives as a plain annotation; orphaned signature dicts are
-        // dropped by the canonical rewrite GC). The qpdf mutation itself is
-        // silent; normal document warnings continue through completion.
-        if remove_restrictions {
-            let _ = AcroFormDocumentHelper::new(&mut pdf)?.disable_digital_signatures()?;
-        }
-        let mut options = options;
-        if decrypt {
-            options.preserve_encryption = false;
-        }
-        // qpdf's createQPDF applies underlay/overlay before entering
-        // handleTransformations (`QPDFJob.cc:472-473`). Import the forms first
-        // so the following image and annotation passes can see overlay-owned
-        // Form XObjects, matching the canonical QPDFJob lifecycle route.
-        // qpdf keeps a provider-backed source QPDF alive when
-        // `copyForeignObject` copies a Form XObject whose data comes from a
-        // `StreamDataProvider` (`libqpdf/QPDF.cc:2248-2257`). Retain the
-        // opened source documents through the destination writer as well.
-        let _built_overlay_specs = if !overlay_specs.is_empty() {
-            let mut built =
-                build_overlay_specs_with_suppression(overlay_specs, repair, password, no_warn)?;
-
-            // Propagate qpdf's max input version and Adobe extension level to
-            // the writer (QPDFJob.cc:1714 and :2913), while leaving the
-            // explicit raw --min-version for the writer's later setter.
-            update_input_version_floor(&mut options.input_version_floor, &mut pdf)?;
-            for spec in built.iter_mut() {
-                update_input_version_floor(&mut options.input_version_floor, &mut spec.source)?;
-            }
-
-            if verbose {
-                let report = flpdf::overlay_verbose_report(&mut pdf, &mut built)?;
-                logger_info(overlay_verbose_message(&report, overlay_specs))?;
-            }
-
-            flpdf::apply_overlay_specs(&mut pdf, &mut built)?;
-            Some(built)
-        } else {
-            None
-        };
-
-        apply_image_transformations(&mut pdf, image_options, verbose)?;
-        // ── Content mutation pass ─────────────────────────────────────────────
-        //
-        // The mutations below operate on the in-memory Pdf model (via set_object).
-        // They are all visible in the canonical writer output.
-        //
-        // Application order follows QPDFJob::createQPDF and
-        // QPDFJob::handleTransformations:
-        //   1. overlay/underlay page stacking;
-        //   2. externalize/optimize images;
-        //   3. generate appearances;
-        //   4. flatten annotations;
-        //   5. coalesce page contents;
-        //   6. flatten rotation;
-        //   7. normalize content immediately before the writer consumes it.
-        // The coalesce operation is the provider-backed PageObjectHelper
-        // route; it must not materialize a legacy page byte buffer.
-        //
-        // NOTE: a plain `rewrite` does NOT prune unreferenced /Resources entries.
-        // qpdf only prunes resource-dict entries during page-copy operations
-        // (`--pages`/`--split-pages`) — a plain `qpdf IN OUT`, even with
-        // `--remove-unreferenced-resources=yes`, keeps every /Resources entry
-        // (verified against qpdf 11.9.0). flpdf mirrors this: resource-entry
-        // pruning lives in `run_page_extraction` (the --pages path), not here.
-        // Pruning on a plain rewrite would incorrectly drop an unreferenced
-        // image XObject. Resource-entry pruning is distinct from unreferenced-
-        // object GC: renumbering drops unreachable objects on every canonical
-        // rewrite, while /Resources-entry pruning is limited to page operations.
-        //
-        // qpdf always creates a fresh document and defaults to
-        // `--compress-streams=y`; the canonical writer applies those defaults
-        // for every rewrite. Version setters therefore always affect the
-        // emitted header, including with `--remove-unreferenced-resources=no`.
-        // (No resource-entry pruning on the plain rewrite path — see the
-        // "Content mutation pass" note above. qpdf prunes /Resources entries only
-        // during page operations, which flpdf handles in run_page_extraction.)
-
-        // Step 3: generate missing form-field appearance streams
-        // (--generate-appearances). MUST run before --flatten-annotations so
-        // value-only fields (e.g. a filled text field with no /AP) are baked
-        // into page content instead of being dropped (acceptance ordering:
-        // generate first, flatten second).
-        if generate_appearances {
-            generate_missing_appearances(&mut pdf)?;
-        }
-
-        // Step 4: flatten annotations into page content (--flatten-annotations).
-        if let Some(mode) = flatten_annotations_mode {
-            let (required_flags, forbidden_flags) = mode.flags();
-            PageDocumentHelper::new(&mut pdf)
-                .flatten_annotations(required_flags, forbidden_flags)?;
-        }
-
-        // Step 5: coalesce per-page /Contents arrays into provider-backed
-        // streams. This intentionally follows annotation flattening, matching
-        // QPDFJob.cc:2183-2187 for the combined flags.
-        if coalesce_contents {
-            let page_refs = pages::page_refs(&mut pdf)?;
-            for page_ref in page_refs {
-                PageObjectHelper::new(page_ref, &mut pdf).coalesce_content_streams()?;
+    let mut job = configure_rewrite_job(
+        input,
+        output,
+        _password,
+        linearize,
+        linearize_pass1,
+        remove_restrictions,
+        image_options,
+        generate_appearances,
+        flatten_annotations_mode,
+        coalesce_contents,
+        flatten_rotation,
+        &page_labels,
+        overlay_specs,
+        verbose,
+        no_warn,
+        &job_options,
+        _decrypt,
+    )?;
+    job.apply_transformations(&mut pdf)?;
+    if linearize_normalization {
+        let warnings = normalize_page_contents(&mut pdf)?;
+        if !warnings.is_empty() {
+            job.record_warnings();
+            if !no_warn {
+                for warning in warnings {
+                    emit_content_normalization_warnings(input, warning)?;
+                }
             }
         }
-
-        // Step 6: flatten page rotation into content (--flatten-rotation).
-        if flatten_rotation {
-            let page_refs = pages::page_refs(&mut pdf)?;
-            flatten_rotation_on_pages(&mut pdf, &page_refs)?;
-        }
-
-        apply_canonical_page_labels(&mut pdf, &page_labels, verbose, no_warn)?;
-
-        // Step 7: normalize after all page transformations. The stream
-        // normalizer consumes the provider-backed coalesced route and writes
-        // the normalized bytes through ObjectHandle.
-        let normalization_last_bad = if normalize_content {
-            normalize_page_contents(&mut pdf)?
-        } else {
-            Vec::new()
-        };
-
-        let announce_file = standard_output.is_none();
-        write_with_pdf_writer(
-            &mut pdf,
-            output,
-            &mut standard_output,
-            &options,
-            false,
-            None,
-        )?;
-
-        if verbose && announce_file {
-            logger_info(wrote_file_message(&progname(), output))?;
-        }
-        // Unencrypted input + --remove-restrictions is a no-op rewrite
-        // (exit 0, valid output, no diagnostic) — nothing was restricted,
-        // matching qpdf's lenient handling of --remove-restrictions on
-        // unencrypted files.
-        finish_rewrite_warnings(input, &pdf, &normalization_last_bad, announce_file, no_warn)?;
     }
-    Ok(())
-}
-
-/// Route `--generate-appearances` through qpdf's
-/// `QPDFAcroFormDocumentHelper::generateAppearancesIfNeeded` boundary.
-fn generate_missing_appearances<R: Read + Seek>(pdf: &mut Pdf<R>) -> CliResult<()> {
-    AcroFormDocumentHelper::new(pdf)?.generate_appearances_if_needed()?;
-    Ok(())
-}
-
-/// Apply only the page-label subset of qpdf's canonical Job transformation
-/// stage. The ordinary rewrite route still owns the other migration cohorts;
-/// this bounded consumer deliberately sends labels through `QPDFJob` instead
-/// of repairing the old CLI mutation path in place.
-fn apply_canonical_page_labels<R: Read + Seek + 'static>(
-    pdf: &mut Pdf<R>,
-    options: &PageLabelOptions,
-    verbose: bool,
-    no_warn: bool,
-) -> CliResult<()> {
-    if !options.is_active() {
-        return Ok(());
+    match job.write_qpdf(&mut pdf) {
+        Ok(()) => finish_job_exit_status(job.get_exit_code()),
+        Err(_) => Err(Box::new(CliExitError {
+            code: ExitCode::Errors,
+            message: String::new(),
+        })),
     }
-    let mut job = new_cli_job(no_warn);
-    job.set_verbose(verbose);
-    {
-        let mut configuration = job.config();
-        if let Some(specs) = options.set.as_ref() {
-            configuration.set_page_labels(specs.iter().map(Vec::as_slice))?;
-        }
-        if options.remove {
-            configuration.remove_page_labels();
-        }
-    }
-    job.apply_transformations(pdf)?;
-    Ok(())
 }
 
 // ===========================================================================

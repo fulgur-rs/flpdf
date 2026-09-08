@@ -1241,6 +1241,12 @@ documentを変更しない純粋なqueryになった。JSON versionに出力先�
 stdout outputとして扱い、resulting-file suffixを選ぶ。既存の standalone CLI completion
 consumerは別の段階移行として残る。
 
+`.48.7` では、ordinary/rewrite の `run_rewrite_opened` を `QPDFJob` の
+configuration → `apply_transformations` → `write_qpdf` 境界へ移し、qpdf の
+underlay/overlay → image → appearance → annotation → coalesce → rotation →
+page-label/output 順序を一つの Job owner へ集約した。残る direct CLI callers は
+JSON/page-operation/inspection cohort であり、`.48.8`〜`.48.10` の後続範囲である。
+
 `QPDFJob::handleTransformations` の `remove_restrictions` 分岐は
 `QPDFAcroFormDocumentHelper::disableDigitalSignatures` を呼ぶだけで、成功時の独自
 メッセージを出さない（`QPDFJob.cc:2137-2150`、`QPDFAcroFormDocumentHelper.cc:419-439`）。

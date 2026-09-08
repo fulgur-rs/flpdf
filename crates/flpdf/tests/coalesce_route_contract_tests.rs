@@ -10,43 +10,43 @@ fn page_module_has_no_eager_legacy_coalesce_route() {
 fn production_consumers_call_the_canonical_coalesce_owner() {
     let cli = include_str!("../../flpdf-cli/src/main.rs");
     let flatten = include_str!("../src/page_annotation_flatten.rs");
+    let lifecycle = include_str!("../src/job/lifecycle.rs");
 
     assert!(!cli.contains("coalesce_page_contents"));
     assert!(!flatten.contains("coalesce_page_contents"));
-    assert!(cli.contains("PageObjectHelper::new(page_ref, &mut pdf).coalesce_content_streams()?"));
+    assert!(cli.contains("job.apply_transformations(&mut pdf)?"));
+    assert!(cli.contains("job.write_qpdf(&mut pdf)"));
+    assert!(lifecycle.contains("PageObjectHelper::new(page_ref, pdf).coalesce_content_streams()?"));
     assert!(flatten.contains("PageObjectHelper::new(page_ref, pdf).coalesce_content_streams()?"));
 }
 
 #[test]
 fn cli_transformation_order_matches_qpdf_job() {
-    let source = include_str!("../../flpdf-cli/src/main.rs");
-    let generate = source
-        .find("if generate_appearances {")
+    let source = include_str!("../src/job/lifecycle.rs");
+    let transformations = source
+        .split_once("fn prepare_document_transformations")
+        .map(|(_, body)| body)
+        .expect("canonical job transformation route");
+    let generate = transformations
+        .find("if configuration.generate_appearances {")
         .expect("appearance generation route");
-    // The linearize rewrite path flattens before handing the document to the
-    // linearization writer and has no appearance-generation step.  Check the
-    // ordinary rewrite pipeline here, where qpdf's combined transformation
-    // order is represented by the later flatten call.
-    let flatten = source
-        .rfind(".flatten_annotations(required_flags, forbidden_flags)?")
+    let flatten = transformations
+        .find("if let Some(mode) = configuration.flatten_annotations {")
         .expect("annotation flatten route");
-    let coalesce = source
-        .find("PageObjectHelper::new(page_ref, &mut pdf).coalesce_content_streams()?")
+    let coalesce = transformations
+        .find("PageObjectHelper::new(page_ref, pdf).coalesce_content_streams()?")
         .expect("coalesce route");
-    // The linearized rewrite path has its own earlier flatten-rotation call;
-    // select the ordinary rewrite pipeline below, whose order this contract
-    // is checking.
-    let rotation = source
-        .rfind("flatten_rotation_on_pages(&mut pdf, &page_refs)?")
+    let rotation = transformations
+        .find("flatten_rotation_on_pages(pdf, &page_refs)?")
         .expect("rotation route");
-    let normalize = source
-        .rfind("normalize_page_contents(&mut pdf)?")
-        .expect("plain rewrite normalization route");
+    let labels = transformations
+        .find("self.apply_page_label_transformations(pdf, configuration)?")
+        .expect("page-label route");
 
     assert!(generate < flatten);
     assert!(flatten < coalesce);
     assert!(coalesce < rotation);
-    assert!(rotation < normalize);
+    assert!(rotation < labels);
 }
 
 #[test]

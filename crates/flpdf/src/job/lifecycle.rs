@@ -10,7 +10,9 @@ use super::attachments::AttachmentAddOptions;
 use super::attachments::AttachmentCopyOptions;
 use super::image_optimization::{optimize_images, ImageOptimizationOptions};
 use super::json::{JsonJobError, JsonJobOptions, JsonJobOutput, JsonStreamData};
-use super::overlay::{apply_overlay_specs, OverlayKind, OverlaySpec};
+use super::overlay::{
+    apply_overlay_specs, overlay_verbose_report, OverlayKind, OverlaySpec, OverlayVerbosePage,
+};
 use super::page_range::PageRange;
 use super::page_specs::{PageSpecInput, PageSpecJobOutput};
 use super::page_split::SplitPageOptions;
@@ -1608,6 +1610,32 @@ impl QPDFJob {
         self.configuration.verbose = value;
     }
 
+    /// Replace the writer settings carried by this job's qpdf configuration.
+    ///
+    /// The CLI and job-JSON paths use the same `WriterConfiguration` shape;
+    /// keeping the assignment on `QPDFJob` lets the later `write_qpdf` stage
+    /// remain the sole writer owner (`QPDFJob.cc:2846-2937`).
+    pub fn set_writer_configuration(&mut self, configuration: WriterConfiguration) {
+        self.configuration.writer = configuration;
+    }
+
+    /// Set qpdf's recovery policy for documents opened by this job.
+    pub fn set_suppress_recovery(&mut self, value: bool) {
+        self.configuration.suppress_recovery = value;
+    }
+
+    /// Set qpdf's document-wide `ignoreXRefStreams` policy for job-owned
+    /// primary and secondary sources.
+    pub fn set_ignore_xref_streams(&mut self, value: bool) {
+        self.configuration.ignore_xref_streams = value;
+    }
+
+    /// Configure qpdf's linearization writer mode and optional pass-one file.
+    pub fn set_linearization(&mut self, value: bool, pass1: Option<PathBuf>) {
+        self.configuration.linearize = value;
+        self.configuration.linearize_pass1 = pass1;
+    }
+
     /// Set qpdf's explicit secondary-source file lifetime policy.
     ///
     /// `false` selects the close-and-reopen source path used by qpdf when a
@@ -3113,8 +3141,10 @@ impl QPDFJob {
                     self.record_warnings();
                 }
                 if self.configuration.verbose && output != Path::new("-") && !splitting {
-                    let message =
-                        format!("{}: wrote file {}\n", self.message_prefix, output.display());
+                    let mut message = self.message_prefix.as_bytes().to_vec();
+                    message.extend_from_slice(b": wrote file ");
+                    message.extend_from_slice(&path_description_bytes(&output));
+                    message.push(b'\n');
                     self.logger.info(message)?;
                 }
                 // qpdf's `writeOutfile` performs the replace-input rename
@@ -3321,8 +3351,8 @@ impl QPDFJob {
             .iter()
             .chain(configuration.overlays.iter())
         {
-            let source = self.open_job_source(&overlay.path, &overlay.password)?;
-            self.record_document_warnings(&source);
+            let mut source = self.open_job_source(&overlay.path, &overlay.password)?;
+            self.update_writer_version_floor(&mut source)?;
             overlay_specs.push(OverlaySpec {
                 source,
                 kind: overlay.kind,
@@ -3330,6 +3360,10 @@ impl QPDFJob {
                 to: overlay.to.clone(),
                 repeat: overlay.repeat.clone(),
             });
+        }
+        if configuration.verbose && !overlay_specs.is_empty() {
+            let report = overlay_verbose_report(pdf, &mut overlay_specs)?;
+            self.report_overlay_progress(&report, configuration)?;
         }
         apply_overlay_specs(pdf, &mut overlay_specs)?;
         self.overlay_sources = overlay_specs;
@@ -3457,6 +3491,42 @@ impl QPDFJob {
         })?;
 
         Ok(())
+    }
+
+    fn report_overlay_progress(
+        &self,
+        report: &[OverlayVerbosePage],
+        configuration: &JobConfiguration,
+    ) -> Result<()> {
+        let paths: Vec<&Path> = configuration
+            .underlays
+            .iter()
+            .chain(configuration.overlays.iter())
+            .map(|overlay| overlay.path.as_path())
+            .collect();
+        let mut message = self.message_prefix.as_bytes().to_vec();
+        message.extend_from_slice(b": processing underlay/overlay\n");
+        for page in report {
+            message.extend_from_slice(b"  page ");
+            message.extend_from_slice(page.dest_page.to_string().as_bytes());
+            message.push(b'\n');
+            for source in &page.sources {
+                let path = paths.get(source.spec_index).ok_or_else(|| {
+                    Error::Internal("overlay verbose source index out of range".into())
+                })?;
+                message.extend_from_slice(b"    ");
+                message.extend_from_slice(&path_description_bytes(path));
+                message.push(b' ');
+                message.extend_from_slice(match source.kind {
+                    OverlayKind::Underlay => b"underlay" as &[u8],
+                    OverlayKind::Overlay => b"overlay" as &[u8],
+                });
+                message.push(b' ');
+                message.extend_from_slice(source.src_page.to_string().as_bytes());
+                message.push(b'\n');
+            }
+        }
+        self.logger.info(message)
     }
 
     fn run_configured_inspection<R>(
@@ -3603,6 +3673,18 @@ impl QPDFJob {
         let mut pdf = Pdf::<Box<dyn ReadSeek>>::open_file_with_options(path, options)?;
         pdf.root_handle()?;
         Ok(pdf)
+    }
+
+    fn update_writer_version_floor(&mut self, source: &mut JobDocument) -> Result<()> {
+        // qpdf's doProcessOnce updates max_input_version for every source
+        // document used by the job (`QPDFJob.cc:1695-1716`). The ordinary
+        // overlay consumer needs the same floor before the final writer runs.
+        let version = source.get_version_as_pdf_version()?;
+        let (version, extension_level) = version.get_version();
+        self.configuration
+            .writer
+            .set_minimum_pdf_version(version, extension_level);
+        Ok(())
     }
 
     fn copy_encryption_source(&mut self, path: &Path) -> Result<crate::CopyEncryptionSource> {
@@ -4391,6 +4473,96 @@ impl QPDFJobConfig<'_> {
     /// Configure qpdf's `removePageLabels` bare option.
     pub fn remove_page_labels(&mut self) -> &mut Self {
         self.job.configuration.remove_page_labels = true;
+        self
+    }
+
+    /// Route qpdf's document transformations through the canonical job stage.
+    pub fn remove_restrictions(&mut self) -> &mut Self {
+        self.job.configuration.remove_restrictions = true;
+        self
+    }
+
+    /// Enable qpdf's provider-backed page-content coalescing.
+    pub fn coalesce_contents(&mut self) -> &mut Self {
+        self.job.configuration.coalesce_contents = true;
+        self
+    }
+
+    /// Enable qpdf's form-appearance generation phase.
+    pub fn generate_appearances(&mut self) -> &mut Self {
+        self.job.configuration.generate_appearances = true;
+        self
+    }
+
+    /// Enable qpdf's annotation flattening mode.
+    pub fn flatten_annotations(&mut self, mode: FlattenAnnotationsMode) -> &mut Self {
+        self.job.configuration.flatten_annotations = Some(mode);
+        self
+    }
+
+    /// Enable qpdf's page-rotation flattening phase.
+    pub fn flatten_rotation(&mut self) -> &mut Self {
+        self.job.configuration.flatten_rotation = true;
+        self
+    }
+
+    /// Configure qpdf's inline-image externalization phase.
+    pub fn externalize_inline_images(&mut self, min_bytes: usize) -> &mut Self {
+        self.job.configuration.externalize_inline_images = true;
+        self.job.configuration.image_options.inline_min_bytes = min_bytes;
+        self
+    }
+
+    /// Configure qpdf's image optimization phase and its thresholds.
+    pub fn optimize_images(&mut self, options: ImageOptimizationOptions) -> &mut Self {
+        self.job.configuration.optimize_images = true;
+        self.job.configuration.image_options = options;
+        self
+    }
+
+    /// Queue an overlay source for qpdf's create-stage underlay/overlay pass.
+    pub fn overlay(
+        &mut self,
+        path: impl Into<PathBuf>,
+        password: impl Into<Vec<u8>>,
+        from: PageRange,
+        to: PageRange,
+        repeat: Option<PageRange>,
+    ) -> &mut Self {
+        self.job.configuration.overlays.push(JobOverlayConfig {
+            path: path.into(),
+            password: password.into(),
+            from,
+            to,
+            repeat,
+            kind: OverlayKind::Overlay,
+        });
+        self
+    }
+
+    /// Queue an underlay source for qpdf's create-stage underlay/overlay pass.
+    pub fn underlay(
+        &mut self,
+        path: impl Into<PathBuf>,
+        password: impl Into<Vec<u8>>,
+        from: PageRange,
+        to: PageRange,
+        repeat: Option<PageRange>,
+    ) -> &mut Self {
+        self.job.configuration.underlays.push(JobOverlayConfig {
+            path: path.into(),
+            password: password.into(),
+            from,
+            to,
+            repeat,
+            kind: OverlayKind::Underlay,
+        });
+        self
+    }
+
+    /// Apply the canonical writer settings used by `write_qpdf`.
+    pub fn writer_configuration(&mut self, configuration: WriterConfiguration) -> &mut Self {
+        self.job.configuration.writer = configuration;
         self
     }
 

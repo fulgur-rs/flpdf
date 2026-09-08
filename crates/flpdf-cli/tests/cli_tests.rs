@@ -5841,7 +5841,7 @@ fn rewrite_normalize_content_skips_null_array_entries_like_qpdf() {
 }
 
 #[test]
-fn rewrite_normalize_content_propagates_indirect_stream_decode_error() {
+fn rewrite_normalize_content_retries_an_indirect_stream_decode_error_like_qpdf() {
     let temp = tempfile::tempdir().unwrap();
     let input = temp.path().join("indirect-array-corrupt-flate.pdf");
     let output = temp.path().join("normalized.pdf");
@@ -5857,12 +5857,18 @@ fn rewrite_normalize_content_propagates_indirect_stream_decode_error() {
         .arg(&input)
         .arg(&output)
         .assert()
-        .code(2)
-        .stderr(predicate::str::contains("inflate"));
+        .code(3)
+        .stderr(predicate::str::contains("inflate"))
+        .stderr(predicate::str::contains(
+            "stream will be re-processed without filtering to avoid data loss",
+        ))
+        .stderr(predicate::str::contains(
+            "operation succeeded with warnings; resulting file may have some problems",
+        ));
 
     assert!(
-        !output.exists(),
-        "decode failure must abort before creating output"
+        output.exists(),
+        "qpdf's unfiltered retry must still create the output"
     );
 }
 
