@@ -235,7 +235,7 @@ struct JobConfiguration {
     attachments_to_copy: Vec<JobCopyAttachmentsConfig>,
     attachments_to_remove: Vec<Vec<u8>>,
     remove_unreferenced_resources: RemoveUnreferencedResources,
-    set_page_labels: Option<Vec<String>>,
+    set_page_labels: Option<Vec<PageLabelSpec>>,
     remove_page_labels: bool,
     json_version: Option<i32>,
     json_output: bool,
@@ -259,6 +259,18 @@ struct JobConfiguration {
     show_filtered_stream_data: bool,
     list_attachments: bool,
     show_attachment: Option<Vec<u8>>,
+}
+
+/// One qpdf `--set-page-labels` specification after the argv/Config parser has
+/// validated its grammar. Relative first-page values retain qpdf's signed
+/// representation (`rN` becomes `-N`, `z` becomes `-1`) until the document
+/// page count is known in `handleTransformations`.
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct PageLabelSpec {
+    first_page: i64,
+    style: crate::page_label_document_helper::LabelStyle,
+    start: i64,
+    prefix: Vec<u8>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -1110,37 +1122,88 @@ fn parse_job_overlay_specs(
     Ok(())
 }
 
+const PAGE_LABEL_SPEC_ERROR: &str = "page label spec must be n:[D|a|A|r|R][/start[/prefix]]";
+
+fn page_label_spec_error() -> Error {
+    Error::Usage(UsageError::new(PAGE_LABEL_SPEC_ERROR))
+}
+
+fn parse_decimal_bytes(value: &[u8]) -> Option<i64> {
+    if value.is_empty() || !value.iter().all(u8::is_ascii_digit) {
+        return None;
+    }
+    value.iter().try_fold(0i64, |value, digit| {
+        value
+            .checked_mul(10)
+            .and_then(|value| value.checked_add(i64::from(digit - b'0')))
+    })
+}
+
+/// Parse qpdf's `Config::setPageLabels` grammar before a document is opened.
+/// Page-count/order checks remain in [`parse_job_page_labels`], matching
+/// `QPDFJob_config.cc:1101-1151` and `QPDFJob.cc:2199-2224`.
+fn parse_page_label_spec(spec: &[u8]) -> Result<PageLabelSpec> {
+    let Some(colon) = spec.iter().position(|byte| *byte == b':') else {
+        return Err(page_label_spec_error());
+    };
+    let first_page = &spec[..colon];
+    let label_spec = &spec[colon + 1..];
+    let first_page = if first_page == b"z" {
+        -1
+    } else if let Some(value) = first_page.strip_prefix(b"r") {
+        let value = parse_decimal_bytes(value).ok_or_else(page_label_spec_error)?;
+        value.checked_neg().ok_or_else(page_label_spec_error)?
+    } else {
+        parse_decimal_bytes(first_page).ok_or_else(page_label_spec_error)?
+    };
+
+    let mut parts = label_spec.splitn(3, |byte| *byte == b'/');
+    let style = match parts.next().unwrap_or_default() {
+        b"" => crate::page_label_document_helper::LabelStyle::None,
+        b"D" => crate::page_label_document_helper::LabelStyle::Decimal,
+        b"a" => crate::page_label_document_helper::LabelStyle::AlphaLower,
+        b"A" => crate::page_label_document_helper::LabelStyle::AlphaUpper,
+        b"r" => crate::page_label_document_helper::LabelStyle::RomanLower,
+        b"R" => crate::page_label_document_helper::LabelStyle::RomanUpper,
+        _ => return Err(page_label_spec_error()),
+    };
+    let start = match parts.next() {
+        None | Some(b"") => 1,
+        Some(value) => parse_decimal_bytes(value)
+            .ok_or_else(|| Error::Usage(UsageError::new("starting page number must be >= 1")))?,
+    };
+    if start < 1 {
+        return Err(Error::Usage(UsageError::new(
+            "starting page number must be >= 1",
+        )));
+    }
+    let prefix = parts.next().map_or_else(Vec::new, ToOwned::to_owned);
+    Ok(PageLabelSpec {
+        first_page,
+        style,
+        start,
+        prefix,
+    })
+}
+
 fn parse_job_page_labels(
-    specs: &[String],
+    specs: &[PageLabelSpec],
     page_count: usize,
 ) -> Result<Vec<(i64, crate::page_label_document_helper::LabelRange)>> {
-    use crate::page_label_document_helper::{LabelRange, LabelStyle};
+    use crate::page_label_document_helper::LabelRange;
 
     let page_count = i64::try_from(page_count)
         .map_err(|_| Error::Unsupported("page count exceeds qpdf's range".to_owned()))?;
     let mut entries = Vec::with_capacity(specs.len());
     let mut last_page = 0i64;
     for spec in specs {
-        let (first_page, label_spec) = spec.split_once(':').ok_or_else(|| {
-            Error::Usage(UsageError::new(
-                "page label spec must be n:[D|a|A|r|R][/start[/prefix]]",
-            ))
-        })?;
-        let first_page = if first_page == "z" {
+        let first_page = if spec.first_page < 0 {
             page_count
-        } else if let Some(value) = first_page.strip_prefix('r') {
-            let value = value.parse::<i64>().map_err(|_| {
-                Error::Usage(UsageError::new(
-                    "page label spec must be n:[D|a|A|r|R][/start[/prefix]]",
-                ))
-            })?;
-            page_count + 1 - value
+                .checked_add(1)
+                .and_then(|value| value.checked_add(spec.first_page))
+                .ok_or_else(|| Error::Unsupported("page label page overflow".to_owned()))?
         } else {
-            first_page.parse::<i64>().map_err(|_| {
-                Error::Usage(UsageError::new(
-                    "page label spec must be n:[D|a|A|r|R][/start[/prefix]]",
-                ))
-            })?
+            spec.first_page
         };
         if entries.is_empty() {
             if first_page != 1 {
@@ -1158,39 +1221,12 @@ fn parse_job_page_labels(
                 "page label spec: page {first_page} is more than the total number of pages ({page_count})"
             ))));
         }
-
-        let mut parts = label_spec.splitn(3, '/');
-        let style = match parts.next().unwrap_or_default() {
-            "" => LabelStyle::None,
-            "D" => LabelStyle::Decimal,
-            "a" => LabelStyle::AlphaLower,
-            "A" => LabelStyle::AlphaUpper,
-            "r" => LabelStyle::RomanLower,
-            "R" => LabelStyle::RomanUpper,
-            _ => {
-                return Err(Error::Usage(UsageError::new(
-                    "page label spec must be n:[D|a|A|r|R][/start[/prefix]]",
-                )))
-            }
-        };
-        let start = match parts.next() {
-            None | Some("") => 1,
-            Some(value) => value
-                .parse::<i64>()
-                .map_err(|_| Error::Usage(UsageError::new("starting page number must be >= 1")))?,
-        };
-        if start < 1 {
-            return Err(Error::Usage(UsageError::new(
-                "starting page number must be >= 1",
-            )));
-        }
-        let prefix = parts.next().unwrap_or_default().to_owned();
         entries.push((
             first_page - 1,
             LabelRange {
-                style,
-                prefix,
-                start,
+                style: spec.style,
+                prefix: String::from_utf8_lossy(&spec.prefix).into_owned(),
+                start: spec.start,
             },
         ));
         last_page = first_page;
@@ -1650,14 +1686,29 @@ impl QPDFJob {
         let mut configuration = JobConfiguration::default();
         let mut positionals = Vec::new();
         let mut parse_options = true;
+        let mut page_label_specs: Option<Vec<PageLabelSpec>> = None;
 
         for argument in argv.iter().skip(1) {
+            if let Some(specs) = page_label_specs.as_mut() {
+                if argument == "--" {
+                    configuration.set_page_labels = Some(std::mem::take(specs));
+                    page_label_specs = None;
+                    continue;
+                }
+                if argument.starts_with('-') {
+                    return Err(UsageError::new(format!("unrecognized argument {argument}")).into());
+                }
+                specs.push(parse_page_label_spec(argument.as_bytes())?);
+                continue;
+            }
             if parse_options && argument == "--" {
                 parse_options = false;
                 continue;
             }
             if parse_options && argument.starts_with("--") {
                 match argument.as_str() {
+                    "--remove-page-labels" => configuration.remove_page_labels = true,
+                    "--set-page-labels" => page_label_specs = Some(Vec::new()),
                     "--deterministic-id" => configuration.writer.set_deterministic_id(true),
                     "--static-id" => configuration.writer.set_static_id(true),
                     "--decrypt" => {
@@ -1702,6 +1753,10 @@ impl QPDFJob {
             } else {
                 positionals.push(argument.clone());
             }
+        }
+
+        if page_label_specs.is_some() {
+            return Err(UsageError::new("--set-page-labels must be terminated with --").into());
         }
 
         if positionals.len() > 2 {
@@ -2402,7 +2457,7 @@ impl QPDFJob {
                 let label = item.get_string().ok_or_else(|| {
                     Error::Usage(UsageError::new(".setPageLabels: value must be a string"))
                 })?;
-                labels.push(String::from_utf8_lossy(&label).into_owned());
+                labels.push(parse_page_label_spec(&label)?);
             }
             configuration.set_page_labels = Some(labels);
         }
@@ -5124,37 +5179,26 @@ mod tests {
 
     #[test]
     fn job_json_page_label_parser_covers_styles_and_failures() {
-        let entries = parse_job_page_labels(
-            &[
-                "1:D".to_owned(),
-                "2:a".to_owned(),
-                "3:A".to_owned(),
-                "4:r".to_owned(),
-                "5:R".to_owned(),
-                "6:".to_owned(),
-            ],
-            6,
-        )
-        .unwrap();
+        let parse = |specs: &[&str]| {
+            specs
+                .iter()
+                .map(|spec| parse_page_label_spec(spec.as_bytes()).unwrap())
+                .collect::<Vec<_>>()
+        };
+        let entries =
+            parse_job_page_labels(&parse(&["1:D", "2:a", "3:A", "4:r", "5:R", "6:"]), 6).unwrap();
         assert_eq!(entries.len(), 6);
-        assert!(parse_job_page_labels(&["bad".to_owned()], 6).is_err());
-        assert!(parse_job_page_labels(&["q:D".to_owned()], 6).is_err());
-        assert!(parse_job_page_labels(&["2:D".to_owned()], 6).is_err());
-        assert!(parse_job_page_labels(&["1:D".to_owned(), "1:a".to_owned()], 6).is_err());
-        assert!(parse_job_page_labels(&["7:D".to_owned()], 6).is_err());
-        assert!(parse_job_page_labels(&["1:X".to_owned()], 6).is_err());
-        assert!(parse_job_page_labels(&["1:D/foo".to_owned()], 6).is_err());
-        assert!(parse_job_page_labels(&["1:D/0".to_owned()], 6).is_err());
-        assert!(parse_job_page_labels(&["rx:D".to_owned()], 6).is_err());
-        let relative = parse_job_page_labels(
-            &[
-                "1:D".to_owned(),
-                "r2:a/2/prefix".to_owned(),
-                "z:R//end".to_owned(),
-            ],
-            6,
-        )
-        .unwrap();
+        assert!(parse_page_label_spec(b"bad").is_err());
+        assert!(parse_page_label_spec(b"q:D").is_err());
+        assert!(parse_job_page_labels(&parse(&["2:D"]), 6).is_err());
+        assert!(parse_job_page_labels(&parse(&["1:D", "1:a"]), 6).is_err());
+        assert!(parse_job_page_labels(&parse(&["7:D"]), 6).is_err());
+        assert!(parse_page_label_spec(b"1:X").is_err());
+        assert!(parse_page_label_spec(b"1:D/foo").is_err());
+        assert!(parse_page_label_spec(b"1:D/0").is_err());
+        assert!(parse_page_label_spec(b"rx:D").is_err());
+        let relative =
+            parse_job_page_labels(&parse(&["1:D", "r2:a/2/prefix", "z:R//end"]), 6).unwrap();
         assert_eq!(relative[1].0, 4);
         assert_eq!(relative[2].0, 5);
     }

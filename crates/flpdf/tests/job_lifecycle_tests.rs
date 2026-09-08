@@ -292,6 +292,43 @@ fn argv_keep_files_open_rejects_an_unknown_choice() {
 }
 
 #[test]
+fn argv_page_label_option_table_accepts_specs_until_its_terminator() {
+    let mut job = QPDFJob::new();
+    job.initialize_from_argv(&[
+        "qpdfjob".to_owned(),
+        "input.pdf".to_owned(),
+        "output.pdf".to_owned(),
+        "--remove-page-labels".to_owned(),
+        "--set-page-labels".to_owned(),
+        "1:a".to_owned(),
+        "r2:R/2/prefix".to_owned(),
+        "z://end".to_owned(),
+        "--".to_owned(),
+    ])
+    .expect("qpdf page-label option table should consume its positional specs");
+}
+
+#[test]
+fn argv_page_label_config_rejects_invalid_specs_at_initialization() {
+    let mut job = QPDFJob::new();
+    let error = job
+        .initialize_from_argv(&[
+            "qpdfjob".to_owned(),
+            "input.pdf".to_owned(),
+            "output.pdf".to_owned(),
+            "--set-page-labels".to_owned(),
+            "quack".to_owned(),
+            "--".to_owned(),
+        ])
+        .expect_err("invalid page-label specs must fail in the Config boundary");
+    assert!(matches!(
+        &error,
+        Error::Usage(usage)
+            if usage.to_string() == "page label spec must be n:[D|a|A|r|R][/start[/prefix]]"
+    ));
+}
+
+#[test]
 fn argv_job_run_writes_output_and_reports_progress() {
     let input = Path::new(env!("CARGO_MANIFEST_DIR")).join("../../tests/fixtures/minimal.pdf");
     let tempdir = tempfile::tempdir().unwrap();
