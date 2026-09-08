@@ -190,6 +190,7 @@ enum SegmentKind {
     AddAttachment,
     CopyAttachments,
     Overlay,
+    PageLabels,
 }
 
 impl SegmentKind {
@@ -200,6 +201,7 @@ impl SegmentKind {
             "add-attachment" => Some(Self::AddAttachment),
             "copy-attachments-from" => Some(Self::CopyAttachments),
             "overlay" | "underlay" => Some(Self::Overlay),
+            "set-page-labels" => Some(Self::PageLabels),
             _ => None,
         }
     }
@@ -234,6 +236,7 @@ impl SegmentKind {
             ),
             Self::CopyAttachments => matches!(name, "password" | "prefix"),
             Self::Overlay => matches!(name, "file" | "password" | "to" | "from" | "repeat"),
+            Self::PageLabels => false,
         }
     }
 
@@ -241,7 +244,7 @@ impl SegmentKind {
         match self {
             Self::Overlay => false,
             Self::AddAttachment => first_add_attachment,
-            Self::Encrypt | Self::Pages | Self::CopyAttachments => true,
+            Self::Encrypt | Self::Pages | Self::CopyAttachments | Self::PageLabels => true,
         }
     }
 }

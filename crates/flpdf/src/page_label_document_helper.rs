@@ -311,6 +311,14 @@ impl<'a, R: Read + Seek> PageLabelDocumentHelper<'a, R> {
     /// Build qpdf's direct label dictionary for a numbering style, starting
     /// value, and optional prefix (`pageLabelDict`).
     pub fn page_label_dict(style: LabelStyle, start_num: i64, prefix: &str) -> ObjectHandle {
+        Self::page_label_dict_bytes(style, start_num, prefix.as_bytes())
+    }
+
+    /// Build qpdf's direct label dictionary from the original byte prefix.
+    /// qpdf's `newUnicodeString(std::string_view)` receives the option/Config
+    /// bytes without a UTF-8 projection, so the Job transformation path uses
+    /// this byte-preserving form for `/P`.
+    pub fn page_label_dict_bytes(style: LabelStyle, start_num: i64, prefix: &[u8]) -> ObjectHandle {
         let result = ObjectHandle::dictionary(Vec::new());
         if let Some(name) = style.to_name() {
             result
@@ -318,7 +326,7 @@ impl<'a, R: Read + Seek> PageLabelDocumentHelper<'a, R> {
                 .expect("new direct page-label dictionary is unowned");
         }
         if !prefix.is_empty() {
-            let bytes = crate::pdf_string::new_unicode_string(prefix.as_bytes());
+            let bytes = crate::pdf_string::new_unicode_string(prefix);
             result
                 .replace_key(b"/P", ObjectHandle::string(bytes))
                 .expect("new direct page-label dictionary is unowned");
