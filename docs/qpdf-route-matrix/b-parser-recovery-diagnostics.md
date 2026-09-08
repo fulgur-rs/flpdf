@@ -329,6 +329,16 @@ objectが空・offsetが負値なら `filename (): message` を生成する。`.
 
 2026-09-08に `.48.68` の回帰を qpdf 11.9.0 と照合した。`startxref` が欠落・不正、または値 `0` の場合、qpdf は `QPDF.cc:450-452` で `read_xref` を呼ばず、`QPDF.cc:516-575` の `reconstruct_xref` へ直接進む。flpdf も `load_xref_state_from_bytes` で同じ分岐にし、logical offset 0 の speculative read が先頭の旧 object を canonical cache に登録することを止めた。これにより同一 generation を再利用する Catalog の後発 `/PageLabels` number tree が writer traversal に残り、qpdf の `append-page-content-damaged.pdf` に対する `--static-id -qdf --no-original-object-ids` 出力と 16484 bytes で byte-identical になった。flpdf-authored の `tests/fixtures/compat/recovered-catalog-pagelabels.pdf` と `reader_tests.rs` の `/PageLabels`/`/Nums` 回帰も追加した。
 
+2026-09-08（`flpdf-buy0`）: /Prev hop内のwarning順序をqpdfへ合わせた。
+qpdfは `m->warnings` 単一sinkへ呼出時点でpushする
+（`libqpdf/QPDF.cc:487-494`）ため、classic trailerのparser warningが
+hybrid `/XRefStm` read warningより先になる。flpdfではcanonical ownerの
+deferred diagnosticsをclassic sectionのbuffered diagnosticsより前に一括spliceしていたため、
+hop内に分割した順序調整と合成RED/GREEN fixtureを追加し、
+`stream keyword found in trailer` → `stream filter type is not name or array`
+をqpdf CLIと照合した。`flpdf-5tt9` の外側deferral window、root route、
+qtest exceptionsは変更しない。
+
 ### 分類集計
 
 | 分類 | 件数 | 行 |

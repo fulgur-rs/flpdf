@@ -2741,14 +2741,6 @@ fn merge_previous_xref_sections_with_observer(
     if loaded.loaded.startxref != 0 {
         visited.insert(loaded.loaded.startxref);
     }
-    // The deferral window only makes sense while the reconstruction path is
-    // buffering the trio and line-scan diagnostics; the active-section reader
-    // has a single channel already.
-    let is_reconstruction = matches!(
-        context_spec,
-        XrefReadContextSpec::Reconstruction { .. }
-            | XrefReadContextSpec::ReconstructionWithCache { .. }
-    );
     let chain_bootstrap_cache = match context_spec {
         XrefReadContextSpec::ActiveSection | XrefReadContextSpec::Reconstruction { .. } => {
             Rc::clone(&loaded.bootstrap_cache)
@@ -2781,11 +2773,10 @@ fn merge_previous_xref_sections_with_observer(
     // Resolving `/Prev` can dereference an indirect target, and that read
     // warns live through the owner just like the section parse below. Keep it
     // inside the same window so a repair warning raised here cannot overtake
-    // the still-buffered reconstruction trio.
+    // the section diagnostics buffered by the xref reader.
     let mut previous_offset_diagnostics = Diagnostics::default();
     let previous_offset_result = {
         let _guard = canonical_trailer_owner
-            .filter(|_| is_reconstruction)
             .map(|owner| DeferredDiagnosticsGuard::new(owner, &mut previous_offset_diagnostics));
         resolve_previous_xref_offset(
             bytes,
@@ -2819,19 +2810,15 @@ fn merge_previous_xref_sections_with_observer(
             return Err(Error::parse(0, "loop detected following xref tables"));
         }
 
-        // A reconstructed candidate's `/Prev` chain can itself resolve an
-        // older xref stream through the live canonical owner (same
-        // `read_xref_stream_at_offset` path as the candidate re-entry
-        // above), which warns immediately unless withheld. Only the two
-        // reconstruction context-spec variants ever have a caller-side
-        // local buffer to reconcile into -- the ordinary active-section
-        // load (`ActiveSection`/`ActiveSectionWithCache`) has no such
-        // buffer and its warnings are meant to print live, so this window
-        // is scoped to the reconstruction case only.
+        // A /Prev hop can resolve an older xref stream through the live
+        // canonical owner, which warns immediately unless withheld. The
+        // section parser buffers its own diagnostics even on the active
+        // route, so the live channel is deferred for every canonical
+        // owner hop and spliced at the call-order boundary.
         let mut deferred_diagnostics = Diagnostics::default();
+        let mut previous_error_diagnostics = Diagnostics::default();
         let previous_result = {
             let _guard = canonical_trailer_owner
-                .filter(|_| is_reconstruction)
                 .map(|owner| DeferredDiagnosticsGuard::new(owner, &mut deferred_diagnostics));
             parse_xref_from_start_with_owner(
                 bytes,
@@ -2840,24 +2827,65 @@ fn merge_previous_xref_sections_with_observer(
                 version,
                 options.clone(),
                 registration,
-                error_diagnostics_sink.as_deref_mut(),
+                Some(&mut previous_error_diagnostics),
                 section_context_spec,
                 first_xref_item_offset_sink.as_deref_mut(),
                 false,
                 canonical_trailer_owner,
             )
         };
-        // Append the reconciled read warning before whatever this call
-        // itself computed, mirroring the candidate re-entry's own ordering
-        // fix -- and do this before propagating an error, so a live warning
-        // that preceded a later build failure on this hop is not dropped.
-        for diagnostic in deferred_diagnostics.entries() {
-            loaded.loaded.repair_diagnostics.push(diagnostic.clone());
-        }
-        let previous = previous_result?;
-        for diagnostic in previous.loaded.repair_diagnostics.entries() {
-            loaded.loaded.repair_diagnostics.push(diagnostic.clone());
-        }
+        // qpdf classic read calls readTrailer before its optional hybrid
+        // read (QPDF.cc:876-927), so buffered trailer diagnostics must
+        // precede the hybrid owner's deferred live warnings. An xref-stream
+        // hop has no classic trailer stage and retains the candidate
+        // re-entry ordering: deferred object-read warnings precede its build
+        // diagnostics.
+        let previous = match previous_result {
+            Ok(previous) => {
+                if previous.classic_trailer_offset.is_some() {
+                    for diagnostic in previous.loaded.repair_diagnostics.entries() {
+                        loaded.loaded.repair_diagnostics.push(diagnostic.clone());
+                    }
+                    for diagnostic in deferred_diagnostics.entries() {
+                        loaded.loaded.repair_diagnostics.push(diagnostic.clone());
+                    }
+                } else {
+                    for diagnostic in deferred_diagnostics.entries() {
+                        loaded.loaded.repair_diagnostics.push(diagnostic.clone());
+                    }
+                    for diagnostic in previous.loaded.repair_diagnostics.entries() {
+                        loaded.loaded.repair_diagnostics.push(diagnostic.clone());
+                    }
+                }
+                previous
+            }
+            Err(error) => {
+                let classic_section = bytes
+                    .get(previous_pos..)
+                    .is_some_and(|tail| tail.starts_with(b"xref"));
+                let append_ordered = |target: &mut Diagnostics| {
+                    if classic_section {
+                        for diagnostic in previous_error_diagnostics.entries() {
+                            target.push(diagnostic.clone());
+                        }
+                    }
+                    for diagnostic in deferred_diagnostics.entries() {
+                        target.push(diagnostic.clone());
+                    }
+                    if !classic_section {
+                        for diagnostic in previous_error_diagnostics.entries() {
+                            target.push(diagnostic.clone());
+                        }
+                    }
+                };
+                if let Some(sink) = error_diagnostics_sink.as_deref_mut() {
+                    append_ordered(sink);
+                } else {
+                    append_ordered(&mut loaded.loaded.repair_diagnostics);
+                }
+                return Err(error);
+            }
+        };
         if previous.first_xref_item_offset != 0 {
             loaded.first_xref_item_offset = previous.first_xref_item_offset;
         }
@@ -2881,7 +2909,6 @@ fn merge_previous_xref_sections_with_observer(
         let mut hop_offset_diagnostics = Diagnostics::default();
         let hop_offset_result = {
             let _guard = canonical_trailer_owner
-                .filter(|_| is_reconstruction)
                 .map(|owner| DeferredDiagnosticsGuard::new(owner, &mut hop_offset_diagnostics));
             resolve_previous_xref_offset(
                 bytes,
@@ -6671,6 +6698,28 @@ mod final_handle_tests {
         }
     }
 
+    fn hybrid_xref_with_classic_and_live_warning() -> Vec<u8> {
+        let mut bytes = hybrid_xref_with_indirect_filter();
+        let endstream = b"endstream\nendobj";
+        let endstream_start = bytes
+            .windows(endstream.len())
+            .position(|window| window == endstream)
+            .expect("the hybrid xref stream has an endobj boundary");
+        bytes.splice(
+            endstream_start..endstream_start + endstream.len(),
+            b"endstream\njunk\nendobj".iter().copied(),
+        );
+        let trailer_start = bytes
+            .windows(b">>\nstartxref\n".len())
+            .rposition(|window| window == b">>\nstartxref\n")
+            .expect("the hybrid classic trailer has a startxref marker");
+        bytes.splice(
+            trailer_start..trailer_start + b">>\nstartxref\n".len(),
+            b">> stream\nstartxref\n".iter().copied(),
+        );
+        bytes
+    }
+
     fn classic_xref_with_malformed_previous() -> (Vec<u8>, usize) {
         let mut bytes = b"%PDF-1.4\n".to_vec();
         let object_offset = bytes.len();
@@ -6978,6 +7027,134 @@ mod final_handle_tests {
         )
         .expect_err("an indirect /Prev with a stale xref row must propagate its trigger");
         assert!(matches!(error, Error::Parse { message, .. } if message == "expected 2 0 obj"));
+    }
+
+    #[test]
+    fn previous_xref_merge_orders_successful_classic_diagnostics_before_live_warnings() {
+        let bytes = hybrid_xref_with_classic_and_live_warning();
+        let previous_xref = bytes
+            .windows(b"xref\n0 6".len())
+            .position(|window| window == b"xref\n0 6")
+            .expect("the hybrid fixture has a classic xref section");
+        let mut loaded = loaded_state_with_trailer(ObjectHandle::dictionary(vec![(
+            b"/Prev".to_vec(),
+            ObjectHandle::integer(i64::try_from(previous_xref).unwrap()),
+        )]));
+        let resolver = canonical_test_resolver(bytes.clone(), BTreeMap::new(), true, 101);
+        let mut registration = XrefRegistration::default();
+
+        merge_previous_xref_sections(
+            &bytes,
+            "1.5",
+            &mut loaded,
+            XrefLoadOptions {
+                allow_repair: true,
+                ..XrefLoadOptions::default()
+            },
+            &mut registration,
+            None,
+            XrefReadContextSpec::ActiveSection,
+            Some(resolver.as_ref()),
+        )
+        .expect("the valid hybrid /Prev section should merge");
+
+        let messages: Vec<_> = loaded
+            .loaded
+            .repair_diagnostics
+            .entries()
+            .iter()
+            .map(|diagnostic| diagnostic.message_string())
+            .collect();
+        let trailer_warning = messages
+            .iter()
+            .position(|message| message == "stream keyword found in trailer")
+            .expect("the classic trailer warning is retained");
+        let live_warning = messages
+            .iter()
+            .position(|message| message == "expected endobj")
+            .expect("the hybrid xref stream warning is retained");
+        assert!(
+            trailer_warning < live_warning,
+            "classic trailer diagnostics must precede hybrid live diagnostics: {messages:?}"
+        );
+    }
+
+    #[test]
+    fn previous_xref_merge_keeps_successful_xref_stream_diagnostics() {
+        let previous_xref = 5usize;
+        let mut bytes = b"%pad\n".to_vec();
+        bytes.extend_from_slice(
+            b"1 0 obj\n<< /Type /XRef /W [1 0 1] /Size 1 /Length 3 >>\nstream\n\0\0\0\nendstream\nendobj\n%tail\n",
+        );
+        let mut loaded = loaded_state_with_trailer(ObjectHandle::dictionary(vec![(
+            b"/Prev".to_vec(),
+            ObjectHandle::integer(i64::try_from(previous_xref).unwrap()),
+        )]));
+        let mut registration = XrefRegistration::default();
+
+        merge_previous_xref_sections(
+            &bytes,
+            "1.4",
+            &mut loaded,
+            XrefLoadOptions {
+                allow_repair: true,
+                ..XrefLoadOptions::default()
+            },
+            &mut registration,
+            None,
+            XrefReadContextSpec::ActiveSection,
+            None,
+        )
+        .expect("the warning-bearing previous xref stream should merge");
+        assert!(loaded
+            .loaded
+            .repair_diagnostics
+            .entries()
+            .iter()
+            .any(|diagnostic| diagnostic
+                .message_string()
+                .contains("Cross-reference stream data has the wrong size")));
+    }
+
+    #[test]
+    fn previous_xref_merge_orders_nonclassic_error_diagnostics_without_a_sink() {
+        let previous_xref = 5usize;
+        let mut bytes = b"%pad\n".to_vec();
+        bytes.extend_from_slice(
+            b"1 0 obj\n<< /Type /XRef /W [1 0 1] /Size 1 /Length 4 >>\nstream\nabcd\nendstream\nendobj\n%tail\n",
+        );
+        let mut loaded = loaded_state_with_trailer(ObjectHandle::dictionary(vec![(
+            b"/Prev".to_vec(),
+            ObjectHandle::integer(i64::try_from(previous_xref).unwrap()),
+        )]));
+        let mut registration = XrefRegistration::default();
+
+        let error = merge_previous_xref_sections(
+            &bytes,
+            "1.4",
+            &mut loaded,
+            XrefLoadOptions {
+                allow_repair: true,
+                ..XrefLoadOptions::default()
+            },
+            &mut registration,
+            None,
+            XrefReadContextSpec::ActiveSection,
+            None,
+        )
+        .expect_err("the malformed previous xref stream must fail");
+        assert!(
+            matches!(&error, Error::Parse { .. }),
+            "unexpected error: {error:?}"
+        );
+        assert!(loaded
+            .loaded
+            .repair_diagnostics
+            .entries()
+            .iter()
+            .any(|diagnostic| diagnostic
+                .message_string()
+                .contains("Cross-reference stream data has the wrong size")));
     }
 
     #[test]

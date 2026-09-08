@@ -169,6 +169,32 @@ fn previous_xref_section_live_warning_bytes() -> Vec<u8> {
     bytes
 }
 
+fn previous_classic_trailer_then_hybrid_live_warning_bytes() -> Vec<u8> {
+    let mut bytes = b"%PDF-1.4\n".to_vec();
+    let hybrid_offset = bytes.len() + b"junk ".len();
+    bytes.extend_from_slice(
+        b"junk 3 0 obj\n<< /Type /XRef /W [1 1 1] /Size 1 /Filter 1 /Length 3 >>\nstream\n",
+    );
+    bytes.extend_from_slice(b"\x01\x00\x00\nendstream\nendobj\n");
+
+    let previous_offset = bytes.len();
+    bytes.extend_from_slice(
+        format!(
+            "xref\n0 4\n0000000000 65535 f \n0000000000 65535 f \n0000000000 65535 f \n{hybrid_offset:010} 00000 n \ntrailer\n<< /Size 4 /XRefStm {hybrid_offset} >> stream\n"
+        )
+        .as_bytes(),
+    );
+    let candidate_offset = bytes.len();
+    bytes.extend_from_slice(
+        format!(
+            "1 0 obj\n<< /Type /XRef /W [1 1 1] /Size 1 /Prev {previous_offset} /Length 3 >>\nstream\n\x01\x00\x00\nendstream\nendobj\n"
+        )
+        .as_bytes(),
+    );
+    bytes.extend_from_slice(format!("startxref\n{candidate_offset}\n%%EOF\n").as_bytes());
+    bytes
+}
+
 fn indirect_previous_offset_live_warning_bytes() -> Vec<u8> {
     // The candidate's `/Prev` is an indirect reference, so resolving the
     // previous section's offset dereferences object 3 0 -- a read that warns
@@ -803,6 +829,42 @@ fn previous_xref_section_defers_a_live_read_warning_through_the_prev_walk() {
         "the /Prev target's own read warning, raised while merge_previous_xref_sections \
          follows the candidate's /Prev chain, must print after the trio and after \
          discovery's own resolution of the same object -- not live, ahead of both"
+    );
+}
+
+#[test]
+fn previous_trailer_warning_precedes_a_hybrid_live_warning_within_one_hop() {
+    let (logger, output) = recording_logger();
+    let bytes = previous_classic_trailer_then_hybrid_live_warning_bytes();
+    let _pdf = Pdf::open_with_options(
+        Cursor::new(bytes),
+        PdfOpenOptions {
+            repair: true,
+            logger: Some(logger),
+            description: b"input.pdf".to_vec(),
+            ..PdfOpenOptions::default()
+        },
+    )
+    .expect("the synthetic classic and hybrid xref chain is recoverable");
+
+    let output = output.lock().unwrap().clone();
+    let trailer_warning = output
+        .windows(b"stream keyword found in trailer".len())
+        .position(|window| window == b"stream keyword found in trailer")
+        .expect("the previous trailer warning is emitted");
+    let hybrid_warning = output
+        .windows(b"stream filter type is not name or array".len())
+        .position(|window| window == b"stream filter type is not name or array")
+        .unwrap_or_else(|| {
+            panic!(
+                "the hybrid stream warning is emitted:\n{}",
+                String::from_utf8_lossy(&output)
+            )
+        });
+    assert!(
+        trailer_warning < hybrid_warning,
+        "qpdf emits the trailer warning before the hybrid read warning:\n{}",
+        String::from_utf8_lossy(&output)
     );
 }
 
