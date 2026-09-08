@@ -14066,6 +14066,16 @@ mod tests {
 
     #[test]
     fn reconstruct_xref_and_retry_treats_a_post_reconstruction_compressed_entry_as_not_found() {
+        // Reachability note: the production path cannot currently produce this
+        // state. `resolve_indirect` reaches `reconstruct_xref_and_retry` only
+        // from its `Uncompressed` arm, `install_source_xref_entries` (:2890)
+        // replaces the table wholesale, and `recover_xref_entries`
+        // (`crates/flpdf/src/xref.rs:3111`) inserts only `Uncompressed` rows.
+        // qpdf's own compressed side is defensive for the same reason: an
+        // objgen holds one entry, so deleting the type-1 row cannot leave a
+        // type-2 row behind (`libqpdf/QPDF.cc:531-540`). This test therefore
+        // injects the row directly to pin the branch's shape against
+        // `getType() == 1` (`QPDF.cc:1618`); it is not an end-to-end proof.
         // qpdf's readObjectAtOffset retry condition is `getType() == 1`
         // exactly (QPDF.cc:1618): when the reconstructed table instead holds
         // a compressed (type 2) entry for the requested objgen, qpdf takes
