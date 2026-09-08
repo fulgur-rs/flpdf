@@ -1842,9 +1842,9 @@ impl QPDFJob {
     /// Initialize the qpdf-compatible argument set supported by this job.
     ///
     /// This mirrors `QPDFJob::initializeFromArgv` for one input, one output,
-    /// deterministic/static IDs, object-stream mode, password, decrypt,
-    /// check, progress reporting, and the `--keep-files-open` options. Other
-    /// command-line options are handled by the CLI.
+    /// replace-input, deterministic/static IDs, object-stream mode, password,
+    /// decrypt, check, progress reporting, and the `--keep-files-open`
+    /// options. Other command-line options are handled by the CLI.
     ///
     /// The argv grammar foundation matches `QPDFArgParser::parseArgs`
     /// (`QPDFArgParser.cc:429-560`): a one-level `@file` expansion runs
@@ -1891,6 +1891,7 @@ impl QPDFJob {
                     "--set-page-labels" => page_label_specs = Some(Vec::new()),
                     "--deterministic-id" => configuration.writer.set_deterministic_id(true),
                     "--static-id" => configuration.writer.set_static_id(true),
+                    "--replace-input" => configuration.replace_input = true,
                     "--decrypt" => {
                         configuration.writer.set_preserve_encryption(false);
                     }
@@ -1944,6 +1945,12 @@ impl QPDFJob {
         }
         configuration.input_file = positionals.first().map(PathBuf::from);
         configuration.output_file = positionals.get(1).map(PathBuf::from);
+        if configuration.replace_input && configuration.output_file.is_some() {
+            return Err(UsageError::new(
+                "replace-input can't be used since output file has already been given",
+            )
+            .into());
+        }
         if configuration.input_file.is_none() && !configuration.check {
             return Err(UsageError::new("an input file name is required").into());
         }
@@ -3773,17 +3780,30 @@ impl QPDFJob {
         self.logger.info(output.dump)
     }
 
-    fn open_job_source(&self, path: &Path, password: &[u8]) -> Result<JobDocument> {
+    fn open_job_source(&mut self, path: &Path, password: &[u8]) -> Result<JobDocument> {
+        let input_name = path_description_bytes(path);
         let mut options = self.configured_open_options(password.to_vec());
         options.logger = Some(self.logger.clone());
-        options.description = path_description_bytes(path);
+        options.description = input_name.clone();
         // `open_file_with_options` installs the qpdf-shaped reopenable source;
         // keep the job's warning policy on this secondary document exactly as
         // `open_document` does for the primary.
         options.suppress_warnings |= self.suppress_warnings;
-        let mut pdf = Pdf::<Box<dyn ReadSeek>>::open_file_with_options(path, options)?;
-        pdf.root_handle()?;
-        Ok(pdf)
+        let result = (|| {
+            let mut pdf = Pdf::<Box<dyn ReadSeek>>::open_file_with_options(path, options)?;
+            pdf.root_handle()?;
+            Ok(pdf)
+        })();
+        if result.is_err() {
+            // qpdf reports an opening failure against the source that failed,
+            // even though the job's primary input name remains unchanged
+            // after a successful donor open. Retain the source name only on
+            // this error path so the job-level reporter can render the same
+            // path-scoped diagnostic without contaminating later primary
+            // errors or duplicate-attachment messages.
+            self.set_input_name_bytes(&input_name);
+        }
+        result
     }
 
     fn update_writer_version_floor(&mut self, source: &mut JobDocument) -> Result<()> {
@@ -4153,9 +4173,45 @@ impl QPDFJob {
             .map_err(Error::from)?;
         pipeline.write(b": ").map_err(Error::from)?;
         pipeline
-            .write(&Self::job_error_message(error))
+            .write(&self.job_error_message_with_input(error))
             .map_err(Error::from)?;
         pipeline.write(b"\n").map_err(Error::from)
+    }
+
+    fn job_error_message_with_input(&self, error: &Error) -> Vec<u8> {
+        if let Some(message) = error.raw_message() {
+            return message.to_vec();
+        }
+        match error {
+            Error::OpenFailure { source, .. } => self.job_error_message_with_input(source),
+            Error::Encrypted(crate::EncryptedError::BadPassword)
+                if !self.input_name_bytes.is_empty() =>
+            {
+                let mut rendered = self.input_name_bytes.clone();
+                rendered.extend_from_slice(b": invalid password");
+                rendered
+            }
+            Error::Parse { offset, message } if !self.input_name_bytes.is_empty() => {
+                let mut rendered = self.input_name_bytes.clone();
+                rendered.extend_from_slice(b": ");
+                if message == "unable to find trailer dictionary while recovering damaged file" {
+                    // qpdf's reconstruction terminal error already is a
+                    // complete QPDFExc detail (`QPDF.cc:604`); do not add the
+                    // Rust parser prefix around that qpdf-shaped message.
+                    rendered.extend_from_slice(message.as_bytes());
+                } else {
+                    // Other parser failures retain flpdf's established CLI
+                    // source diagnostic (`error_with_file`), including the
+                    // explicit byte offset. They have not crossed the
+                    // QPDFExc normalization boundary yet.
+                    rendered.extend_from_slice(
+                        format!("parse error at byte {offset}: {message}").as_bytes(),
+                    );
+                }
+                rendered
+            }
+            _ => Self::job_error_message(error),
+        }
     }
 
     fn job_error_message(error: &Error) -> Vec<u8> {
@@ -4171,6 +4227,7 @@ impl QPDFJob {
                 let source = qpdf_file_io_source_message(source);
                 format!("{operation} {}: {source}", path.display()).into_bytes()
             }
+            Error::Encrypted(crate::EncryptedError::BadPassword) => b"invalid password".to_vec(),
             _ => error.to_string().into_bytes(),
         }
     }
@@ -4610,6 +4667,29 @@ impl QPDFJobConfig<'_> {
     pub fn output_file(&mut self, output_file: impl Into<PathBuf>) -> Result<&mut Self> {
         self.job.set_output_file(output_file)?;
         Ok(self)
+    }
+
+    /// Configure qpdf's `replaceInput` output mode.
+    pub fn replace_input(&mut self) -> Result<&mut Self> {
+        if self.job.configuration.output_file.is_some() || self.job.configuration.replace_input {
+            return Err(Error::Usage(UsageError::new(
+                "replace-input can't be used since output file has already been given",
+            )));
+        }
+        self.job.configuration.replace_input = true;
+        Ok(self)
+    }
+
+    /// Configure qpdf's `jsonInput` source mode.
+    pub fn json_input(&mut self) -> &mut Self {
+        self.job.configuration.json_input = true;
+        self
+    }
+
+    /// Configure qpdf's `updateFromJson` create-stage input.
+    pub fn update_from_json(&mut self, path: impl Into<PathBuf>) -> &mut Self {
+        self.job.configuration.update_from_json = Some(path.into());
+        self
     }
 
     /// Configure qpdf's `setPageLabels` option-table result.

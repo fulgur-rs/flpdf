@@ -220,6 +220,47 @@ fn qpdfjob_error_report_matches_the_qpdf_c_wrapper_boundary() {
 }
 
 #[test]
+fn qpdfjob_error_report_includes_the_input_name_for_terminal_parse_failure() {
+    let (logger, state) = logger_with_error_sink();
+    let mut job = QPDFJob::new();
+    job.set_logger(logger);
+    job.set_input_name_bytes(b"bad.pdf");
+
+    job.report_job_error(&Error::parse(
+        0,
+        "unable to find trailer dictionary while recovering damaged file",
+    ))
+    .unwrap();
+
+    assert_eq!(
+        state.lock().unwrap().bytes,
+        b"qpdf: bad.pdf: unable to find trailer dictionary while recovering damaged file\n"
+    );
+}
+
+#[test]
+fn qpdfjob_error_report_uses_qpdf_invalid_password_wording() {
+    let (logger, state) = logger_with_error_sink();
+    let mut job = QPDFJob::new();
+    job.set_logger(logger);
+    job.set_input_name("encrypted.pdf");
+
+    job.report_job_error(&Error::Encrypted(flpdf::EncryptedError::BadPassword))
+        .unwrap();
+
+    assert_eq!(
+        state.lock().unwrap().bytes,
+        b"qpdf: encrypted.pdf: invalid password\n"
+    );
+
+    state.lock().unwrap().bytes.clear();
+    job.set_input_name_bytes(b"");
+    job.report_job_error(&Error::Encrypted(flpdf::EncryptedError::BadPassword))
+        .unwrap();
+    assert_eq!(state.lock().unwrap().bytes, b"qpdf: invalid password\n");
+}
+
+#[test]
 fn keep_files_open_policy_counts_distinct_page_sources_and_honors_overrides() {
     let range = PageRange::parse("1").unwrap();
     let one_source = [
@@ -1724,6 +1765,84 @@ fn create_qpdf_and_write_qpdf_are_separate_job_boundaries() {
     job.write_qpdf(&mut pdf).unwrap();
     assert_eq!(job.get_exit_code(), JobExitCode::Success);
     assert!(output.exists());
+}
+
+#[test]
+fn argv_replace_input_uses_the_canonical_write_boundary() {
+    let fixture =
+        Path::new(env!("CARGO_MANIFEST_DIR")).join("../../tests/fixtures/compat/one-page.pdf");
+    let tempdir = tempfile::tempdir().unwrap();
+    let input = tempdir.path().join("入力.pdf");
+    std::fs::copy(&fixture, &input).unwrap();
+    let original = std::fs::read(&input).unwrap();
+    let args = vec![
+        "qpdfjob".to_owned(),
+        input.to_string_lossy().into_owned(),
+        "--deterministic-id".to_owned(),
+        "--object-streams=generate".to_owned(),
+        "--replace-input".to_owned(),
+    ];
+
+    let mut job = QPDFJob::new();
+    job.initialize_from_argv(&args).unwrap();
+    let mut pdf = job.create_qpdf().unwrap().expect("input should open");
+
+    job.write_qpdf(&mut pdf).unwrap();
+    assert_eq!(job.get_exit_code(), JobExitCode::Success);
+    assert_ne!(std::fs::read(&input).unwrap(), original);
+    assert!(input.is_file());
+    assert!(!input.with_extension("pdf.~qpdf-orig").exists());
+    assert!(!input.with_file_name("入力.pdf.~qpdf-orig#").exists());
+    assert!(!input.with_file_name("入力.pdf.~qpdf-temp#").exists());
+}
+
+#[test]
+fn argv_replace_input_rejects_an_output_file() {
+    let tempdir = tempfile::tempdir().unwrap();
+    let input = tempdir.path().join("input.pdf");
+    let output = tempdir.path().join("output.pdf");
+    let args = vec![
+        "qpdfjob".to_owned(),
+        input.to_string_lossy().into_owned(),
+        output.to_string_lossy().into_owned(),
+        "--replace-input".to_owned(),
+    ];
+
+    let mut job = QPDFJob::new();
+    let error = job.initialize_from_argv(&args).unwrap_err();
+    assert!(matches!(
+        error,
+        Error::Usage(usage)
+            if usage.to_string() == "replace-input can't be used since output file has already been given"
+    ));
+}
+
+#[test]
+fn config_replace_input_rejects_existing_output_and_duplicate_configuration() {
+    let output = Path::new("output.pdf");
+    let mut with_output = QPDFJob::new();
+    with_output.set_output_file(output).unwrap();
+    let output_error = match with_output.config().replace_input() {
+        Ok(_) => panic!("replace-input must reject an existing output file"),
+        Err(error) => error,
+    };
+    assert!(matches!(
+        output_error,
+        Error::Usage(usage)
+            if usage.to_string() == "replace-input can't be used since output file has already been given"
+    ));
+
+    let mut duplicate = QPDFJob::new();
+    duplicate.config().replace_input().unwrap();
+    let duplicate_error = match duplicate.config().replace_input() {
+        Ok(_) => panic!("replace-input must reject duplicate configuration"),
+        Err(error) => error,
+    };
+    assert!(matches!(
+        duplicate_error,
+        Error::Usage(usage)
+            if usage.to_string() == "replace-input can't be used since output file has already been given"
+    ));
 }
 
 #[test]

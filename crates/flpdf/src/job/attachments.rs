@@ -257,7 +257,7 @@ impl QPDFJob {
     ) -> std::result::Result<(), E>
     where
         R1: Read + Seek + 'static,
-        F: FnMut(&QPDFJob, &AttachmentCopyOptions) -> std::result::Result<JobDocument, E>,
+        F: FnMut(&mut QPDFJob, &AttachmentCopyOptions) -> std::result::Result<JobDocument, E>,
         E: From<Error>,
     {
         if options.is_empty() {
