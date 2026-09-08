@@ -15,6 +15,7 @@ const QPDF_BARE_LONG_OPTIONS: &[&str] = &[
     "copy-attachments-from",
     "decrypt",
     "deterministic-id",
+    "externalize-inline-images",
     "filtered-stream-data",
     "flatten-rotation",
     "generate-appearances",
