@@ -1016,6 +1016,12 @@ inline の `no_data_key`、`pipeStreamData` の最大二回試行と raw fallbac
 - inline `no_data_key` は payload を discard しつつ effective decode level を保持。
 - pipeline / filename の不正組み合わせは qpdf の `writeStreamJSON` 文言で拒否。
 
+`flpdf-gd1q` では inline JSON blob の遅延 provider も qpdf の
+`StreamBlobProvider::operator()` (`QPDF_Stream.cc:96-107`) と同じく
+`pipeStreamData` の false 戻り値を独自の runtime error に変換しない。provider が
+throw した `Error::Internal` / runtime error はそのまま JSON blob serialization の
+失敗として伝播するが、false のみの場合は qpdf と同じく blob writer を成功扱いにする。
+
 主な検証:
 
 ```text
