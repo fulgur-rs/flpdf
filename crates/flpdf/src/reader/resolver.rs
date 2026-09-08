@@ -427,26 +427,6 @@ pub(crate) struct ResolverCore<R: Read + Seek + 'static> {
     /// each of those takes and drops its own borrow, so nothing is held when
     /// the push happens.
     repair_diagnostics: Diagnostics,
-    /// No qpdf counterpart -- qpdf has one `m->warnings` deque and delivers
-    /// every warning to the logger the instant `warn()` records it
-    /// (`libqpdf/QPDF.cc:487-494`). flpdf's canonical-owner reconstruction
-    /// path has two channels instead: this document's own live delivery via
-    /// [`ResolverHandle::push_qpdf_warning`], and the xref reader's locally
-    /// buffered trio/line-scan diagnostics (`crates/flpdf/src/xref.rs`),
-    /// which only reach the document once the whole open succeeds or fails.
-    /// Because the live channel prints immediately while the buffered one is
-    /// deferred, a canonical-owner reconstruction that also resolves real
-    /// objects (candidate discovery, a candidate's own re-entry read) would
-    /// otherwise print those live warnings *before* the trio/line-scan
-    /// diagnostics that call order actually places first. While this flag is
-    /// set, [`ResolverHandle::push_qpdf_warning`] keeps recording into
-    /// `repair_diagnostics` as always but skips the immediate logger write;
-    /// [`ResolverHandle::end_deferred_repair_diagnostics`] hands the caller
-    /// exactly what was recorded during the window so it can be spliced into
-    /// the buffered diagnostics at the correct point in call order instead,
-    /// restoring qpdf's single-channel, in-call-order delivery.
-    // qpdf-deviation: no qpdf counterpart; qpdf has one m->warnings deque delivered in call order, so this deferral window exists only to reconcile flpdf's two diagnostic channels and should disappear once they are unified
-    defer_live_repair_diagnostics: bool,
     /// qpdf `m->logger`, shared with callers and replaceable on the live
     /// document.
     logger: crate::QPDFLogger,
@@ -526,19 +506,6 @@ impl ResolverWarningOptions {
             suppress_warnings,
             description,
         }
-    }
-
-    pub(crate) fn replay_warnings(&self, diagnostics: &Diagnostics) -> Result<()> {
-        if self.suppress_warnings {
-            return Ok(());
-        }
-        for warning in diagnostics.entries() {
-            let mut line = b"WARNING: ".to_vec();
-            line.extend_from_slice(warning.what_bytes());
-            line.push(b'\n');
-            self.logger.warn(line)?;
-        }
-        Ok(())
     }
 }
 
@@ -952,7 +919,6 @@ impl<R: Read + Seek> ResolverHandle<R> {
                 reconstructed_xref: already_reconstructed,
                 fixed_dangling_refs: false,
                 repair_diagnostics,
-                defer_live_repair_diagnostics: false,
                 logger,
                 suppress_warnings,
                 description,
@@ -994,7 +960,6 @@ impl<R: Read + Seek> ResolverHandle<R> {
                 reconstructed_xref: false,
                 fixed_dangling_refs: false,
                 repair_diagnostics: Diagnostics::default(),
-                defer_live_repair_diagnostics: false,
                 logger,
                 suppress_warnings,
                 description,
@@ -1887,17 +1852,11 @@ impl<R: Read + Seek> ResolverHandle<R> {
     /// expression, so it composes with a nested resolution — but it must not
     /// be called while a borrow of the core is already held.
     ///
-    /// While [`Self::begin_deferred_repair_diagnostics`] is active, this
-    /// still records into `repair_diagnostics` but withholds the logger
-    /// write regardless of `suppress_warnings`; see that method's doc.
     pub(crate) fn push_qpdf_warning(&self, warning: QpdfExc) -> Result<()> {
         let (logger, deliver) = {
             let mut core = self.core.borrow_mut();
             core.repair_diagnostics.push(warning.clone());
-            (
-                core.logger.clone(),
-                !core.suppress_warnings && !core.defer_live_repair_diagnostics,
-            )
+            (core.logger.clone(), !core.suppress_warnings)
         };
         if !deliver {
             return Ok(());
@@ -1906,43 +1865,6 @@ impl<R: Read + Seek> ResolverHandle<R> {
         line.extend_from_slice(warning.what_bytes());
         line.push(b'\n');
         logger.warn(line)
-    }
-
-    /// Start withholding this document's live warning delivery, returning a
-    /// mark for [`Self::end_deferred_repair_diagnostics`].
-    ///
-    /// No qpdf counterpart: see `defer_live_repair_diagnostics`'s doc on
-    /// [`ResolverCore`] for why flpdf's canonical-owner reconstruction path
-    /// needs this reconciliation and qpdf's single warnings deque does not.
-    /// Callers must pair this with exactly one
-    /// [`Self::end_deferred_repair_diagnostics`] call before returning —
-    /// typically via an RAII guard, since [`Diagnostics`] passed to
-    /// [`crate::Error::with_open_diagnostics`] on a failure path still needs
-    /// this window's captured warnings.
-    pub(crate) fn begin_deferred_repair_diagnostics(&self) -> usize {
-        let mut core = self.core.borrow_mut();
-        debug_assert!(
-            !core.defer_live_repair_diagnostics,
-            "nested deferred-repair-diagnostics window"
-        );
-        core.defer_live_repair_diagnostics = true;
-        core.repair_diagnostics.len()
-    }
-
-    /// Stop withholding live warning delivery and return exactly the
-    /// warnings recorded since `start` (the mark
-    /// [`Self::begin_deferred_repair_diagnostics`] returned), removing them
-    /// from this document's own collection.
-    ///
-    /// The caller is expected to splice the result into its own, separately
-    /// buffered diagnostics at the point in call order where this window
-    /// occurred, then let the existing single flush point (installing onto
-    /// the document on success, or [`crate::Error::with_open_diagnostics`]
-    /// on failure) deliver everything once, in order.
-    pub(crate) fn end_deferred_repair_diagnostics(&self, start: usize) -> Diagnostics {
-        let mut core = self.core.borrow_mut();
-        core.defer_live_repair_diagnostics = false;
-        core.repair_diagnostics.split_off(start)
     }
 
     pub(crate) fn push_warning(&self, message: impl Into<String>) -> Result<()> {
@@ -1988,7 +1910,7 @@ impl<R: Read + Seek> ResolverHandle<R> {
     /// `/ID` (`libqpdf/QPDF.cc:1313-1327`;
     /// `libqpdf/QPDF_encryption.cc:718-751`). The trailer location is already
     /// part of the exception text, so the generic input warning formatter must
-    /// not add a second `(offset ...)` wrapper when this warning is replayed.
+    /// not add a second `(offset ...)` wrapper when this warning is emitted.
     pub(crate) fn push_trailer_warning_at(
         &self,
         offset: u64,
@@ -2074,23 +1996,6 @@ impl<R: Read + Seek> ResolverHandle<R> {
         self.push_qpdf_warning(warning)
     }
 
-    pub(crate) fn replay_warnings(&self, diagnostics: &Diagnostics) -> Result<()> {
-        let (logger, suppress_warnings) = {
-            let core = self.core.borrow();
-            (core.logger.clone(), core.suppress_warnings)
-        };
-        if suppress_warnings {
-            return Ok(());
-        }
-        for warning in diagnostics.entries() {
-            let mut line = b"WARNING: ".to_vec();
-            line.extend_from_slice(warning.what_bytes());
-            line.push(b'\n');
-            logger.warn(line)?;
-        }
-        Ok(())
-    }
-
     /// A snapshot of every warning raised on this document so far.
     ///
     /// Returns an owned clone because the collection lives behind a
@@ -2109,7 +2014,7 @@ impl<R: Read + Seek> ResolverHandle<R> {
         self.core.borrow().repair_diagnostics.clone()
     }
 
-    /// Drain the document warning collection without replaying logger output.
+    /// Drain the document warning collection without re-emitting logger output.
     ///
     /// This is qpdf's `QPDF::getWarnings` (`include/qpdf/QPDF.hh:261-266`):
     /// the warning sink has already delivered each entry when it was emitted,
@@ -2917,25 +2822,6 @@ impl<R: Read + Seek> ResolverHandle<R> {
         // must not reopen that door.
         let mut core = self.core.borrow_mut();
         core.reconstructed_xref |= value;
-    }
-
-    /// Install diagnostics collected by the xref reader without replaying
-    /// them to the logger.  The document warning collection remains the single
-    /// source after the pre-parse handoff.
-    pub(crate) fn install_repair_diagnostics(&self, diagnostics: Diagnostics) {
-        let mut core = self.core.borrow_mut();
-        if core.repair_diagnostics.is_empty() {
-            core.repair_diagnostics = diagnostics;
-            return;
-        }
-        // Warnings the document already recorded during the trailer resolution
-        // come first, matching the order they reached the logger; the loader's
-        // own set is appended rather than replacing them, since qpdf
-        // accumulates every warning on one document
-        // (`QPDF::warn` pushes onto `m->warnings`, `QPDF.cc:1250-1258`).
-        for warning in diagnostics.entries() {
-            core.repair_diagnostics.push(warning.clone());
-        }
     }
 
     /// Return the logical source bytes while restoring the resolver's current
@@ -3821,8 +3707,8 @@ impl<R: Read + Seek> ResolverHandle<R> {
     /// object description. qpdf stores the complete `QPDFExc::what()` in its
     /// warning list and writes that same value to the logger
     /// (`libqpdf/QPDF.cc:488-504`, `QPDFExc.cc:19-50`). Keeping the complete
-    /// bytes as an object-origin diagnostic makes live delivery and deferred
-    /// job replay identical, including arbitrary input-description bytes.
+    /// bytes as an object-origin diagnostic keeps live delivery identical to
+    /// later diagnostic inspection, including arbitrary input-description bytes.
     fn push_stream_warning_with_description(
         &self,
         object_ref: ObjectRef,
@@ -6140,26 +6026,6 @@ mod tests {
             output.lock().unwrap().as_slice(),
             b"WARNING: input.pdf: from the document\n\
               WARNING: from the object\n"
-        );
-    }
-
-    #[test]
-    fn replaying_an_object_warning_preserves_raw_message_bytes() {
-        let (resolver, output) = named_resolver_with_captured_warnings();
-        let mut diagnostics = Diagnostics::default();
-        diagnostics.push(QpdfExc::new(
-            QpdfErrorCode::DamagedPdf,
-            b"object-warning-\xff.pdf",
-            b"",
-            0,
-            b"malformed object",
-        ));
-
-        resolver.replay_warnings(&diagnostics).unwrap();
-
-        assert_eq!(
-            output.lock().unwrap().as_slice(),
-            b"WARNING: object-warning-\xff.pdf: malformed object\n"
         );
     }
 

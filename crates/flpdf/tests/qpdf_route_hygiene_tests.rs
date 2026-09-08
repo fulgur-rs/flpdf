@@ -89,3 +89,36 @@ fn dead_qpdf_routes_are_removed_and_canonical_owners_remain() {
         );
     }
 }
+
+#[test]
+fn canonical_xref_warnings_do_not_use_replay_or_deferred_bridges() {
+    let engine = read_source("engine.rs");
+    assert!(
+        !engine.contains("replay_warnings("),
+        "canonical Pdf::open still replays xref warnings after parsing"
+    );
+    assert!(
+        !engine.contains("install_repair_diagnostics("),
+        "canonical Pdf::open still installs a second buffered warning channel"
+    );
+
+    let resolver = read_source("reader/resolver.rs");
+    assert!(
+        !resolver.contains("replay_warnings("),
+        "ResolverHandle still exposes a warning replay route"
+    );
+    assert!(
+        !resolver.contains("defer_live_repair_diagnostics"),
+        "ResolverCore still carries the qpdf-less warning deferral state"
+    );
+    assert!(
+        !resolver.contains("begin_deferred_repair_diagnostics"),
+        "ResolverHandle still exposes the qpdf-less deferral API"
+    );
+
+    let xref = read_source("xref.rs");
+    assert!(
+        !xref.contains("DeferredDiagnosticsGuard"),
+        "xref recovery still reconciles two warning channels with a guard"
+    );
+}

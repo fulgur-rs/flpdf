@@ -435,7 +435,9 @@ document-wide の独自 aggregate route ではなく、保持された各 leaf �
 継承 `/Resources`、非対象 resource category、重複ページの差分回帰は
 `crates/flpdf-cli/tests/cli_tests.rs` が qpdf 11.9.0 と比較する。
 
-| `QPDF::resolve` / `QPDF::resolveObjectsInStream`（xref object-read/cache boundary） | `QPDF.cc:1700-1857`; `QPDF.cc:1541-1697` | `engine.rs` が parse 前に作る `ResolverHandle` を `xref.rs::CanonicalTrailerOwner` として渡し、active xref stream、hybrid `/XRefStm`、`/Prev` chain、reconstruction candidate の object read を `ResolverHandle::resolve_at_offset_with_optional_description`（live `readObjectAtOffset` → `readObject` → `readStream`）へ統一する。`/Type`/`/W`/`/Index`/`/Size`/filter は `XrefObjectContext` から同じ canonical handle/cache と warning snapshot を参照する。owner-less standalone xref loaderのbootstrap ObjStmは `.48.14` で `resolveObjectsInStream` の specialized decode、direct parser、effective xref/default-free、親extent、descriptionの順序を同じqpdf責務へ揃えたが、bounded reconstruction windowとBootstrapHandleStateは別ownerとして残る。`.48.15.1` で canonical recovery candidateも live ownerから直接 trailer/object handleを生成し、`LoadedXrefState` handoff後のrebind/second teardownを無くした。 | 🔀 `.48.13` / `.48.15.1` で canonical production xref-stream/recovery readとcanonical handoffの二重 ownerを除去。owner-less public loaderの第2 state、bootstrap rebind、warning replay/live deliveryは `.48.15` の残範囲 |
+| `QPDF::resolve` / `QPDF::resolveObjectsInStream`（xref object-read/cache boundary） | `QPDF.cc:1700-1857`; `QPDF.cc:1541-1697` | `engine.rs` が parse 前に作る `ResolverHandle` を `xref.rs::CanonicalTrailerOwner` として渡し、active xref stream、hybrid `/XRefStm`、`/Prev` chain、reconstruction candidate の object read を `ResolverHandle::resolve_at_offset_with_optional_description`（live `readObjectAtOffset` → `readObject` → `readStream`）へ統一する。`/Type`/`/W`/`/Index`/`/Size`/filter は `XrefObjectContext` から同じ canonical handle/cache と warning snapshot を参照する。owner-less standalone xref loaderのbootstrap ObjStmは `.48.14` で `resolveObjectsInStream` の specialized decode、direct parser、effective xref/default-free、親extent、descriptionの順序を同じqpdf責務へ揃えたが、bounded reconstruction windowとBootstrapHandleStateは別ownerとして残る。`.48.15.1` で canonical recovery candidateも live ownerから直接 trailer/object handleを生成し、`LoadedXrefState` handoff後のrebind/second teardownを無くした。 | 🔀 `.48.13` / `.48.15.1` / `.48.73` で canonical production xref-stream/read, canonical handoff, warning live deliveryの二重 ownerを除去。owner-less public loaderの第2 state、bootstrap rebind/teardownは `.48.72` の残範囲 |
+
+`.48.73` では、canonical `Pdf::open` の xref/recovery warningを `ResolverHandle::push_qpdf_warning`へ qpdfのcall orderで直接配送し、engineのinstall/replayと`DeferredDiagnosticsGuard`を撤去した。owner-less standalone loaderのBootstrapHandleState、bounded reconstruction window、public loaderの第2 document stateは`.48.72`の残範囲である。
 
 `flpdf-1f9f` では、owner-less bootstrap の ObjStm member parser にも member の description
 context を渡すようにした。そのため member 本体だけでなく、辞書・配列内の nested direct value も
@@ -1127,9 +1129,10 @@ self-overlayのcontroller状態を回帰テストで固定した。これはE-4�
 `processXRefStream` builderというqpdfの呼出順
 （`libqpdf/QPDF.cc:876-927,951-962,1038-1065`）を、flpdfの二つの診断channel間でも
 保持した。`parse_xref_from_start_with_owner`のclassic hybrid段からbuilder診断を
-別sinkへ分離し、`DeferredDiagnosticsGuard`のcanonical live read warningをその前へ
-spliceする。合成fixtureで`stream keyword found in trailer` → `expected endobj` →
+別sinkへ分離し、合成fixtureで`stream keyword found in trailer` → `expected endobj` →
 `Cross-reference stream data has the wrong size`の順序をRED/GREENで固定した。
+`.48.73` ではその後、canonical ownerのlive warning sinkへ各局所診断をqpdfの
+呼出境界で直接配送し、`DeferredDiagnosticsGuard`による二チャネル補正を撤去した。
 
 `coalesceContents` も生成 handler (`auto_job_json_init.hh:311-313`)、Config (`QPDFJob_config.cc:88-91`)、変換順序 (`QPDFJob.cc:2185-2188`) に対応し、既存の provider-backed `ObjectHandle::coalesce_content_streams` を `job/lifecycle.rs` から呼ぶ。
 

@@ -348,7 +348,7 @@ fn object_warning_preserves_a_non_utf8_file_description() {
 }
 
 #[test]
-fn warning_replays_initial_repair_diagnostics_once_in_original_order() {
+fn warning_delivers_initial_repair_diagnostics_once_in_original_order() {
     let (logger, output) = recording_logger();
     let (bytes, xref_start) = warnings_only_corrupt_xref_bytes();
     let pdf = Pdf::open_with_options(
@@ -406,7 +406,7 @@ fn warning_suppression_keeps_initial_repair_diagnostics() {
 }
 
 #[test]
-fn warning_initial_replay_failure_is_returned_by_open() {
+fn warning_delivery_failure_is_returned_by_open() {
     let logger = QPDFLogger::create();
     logger.set_warn(Some(PipelineHandle::new(FailingSink)));
     let (bytes, _) = warnings_only_corrupt_xref_bytes();

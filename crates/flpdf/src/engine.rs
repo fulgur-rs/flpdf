@@ -236,16 +236,7 @@ impl<R: Read + Seek> Pdf<R> {
         // by the document resolver.  The document itself is constructed before
         // xref parsing below; only this byte snapshot is a scan aid for the
         // existing xref/recovery code.
-        let source_bytes = match read_initial_source(&mut reader, &options.description) {
-            Ok(bytes) => bytes,
-            Err(error) => {
-                if let Some((_, diagnostics)) = error.open_failure() {
-                    // cov:ignore: read_initial_source only returns source transport errors, never an OpenFailure
-                    warning_options.replay_warnings(diagnostics)?; // cov:ignore: read_initial_source only returns source transport errors, never an OpenFailure
-                }
-                return Err(error);
-            }
-        };
+        let source_bytes = read_initial_source(&mut reader, &options.description)?;
         let unique_id = unique_id.unwrap_or_else(|| NEXT_PDF_ID.fetch_add(1, Ordering::Relaxed));
         let resolver = ResolverHandle::new_shared(
             reader,
@@ -257,7 +248,7 @@ impl<R: Read + Seek> Pdf<R> {
             warning_options.clone(),
             unique_id,
         );
-        let loaded_state = match load_xref_state_from_bytes(
+        let loaded_state = load_xref_state_from_bytes(
             &source_bytes,
             XrefLoadOptions {
                 allow_repair: options.repair,
@@ -265,15 +256,7 @@ impl<R: Read + Seek> Pdf<R> {
                 description: options.description.clone(),
             },
             Some(resolver.as_ref()),
-        ) {
-            Ok(state) => state,
-            Err(error) => {
-                if let Some((_, diagnostics)) = error.open_failure() {
-                    warning_options.replay_warnings(diagnostics)?;
-                }
-                return Err(error);
-            }
-        };
+        )?;
         // The production xref loader was given this resolver as its canonical
         // owner, so xref-stream handles and all metadata they resolve are
         // already in the live cache. The owner-less loader keeps its
@@ -286,11 +269,9 @@ impl<R: Read + Seek> Pdf<R> {
         let loaded = loaded_state.loaded;
         let source_xref_entries = loaded.entries.clone();
         let cache = ObjectCache::from_offsets(&loaded.entries);
-        let initial_diagnostics = loaded.repair_diagnostics.clone();
         resolver.set_header_offset(header_offset);
         resolver.install_source_xref_entries(source_xref_entries);
         resolver.set_reconstructed_xref(already_reconstructed);
-        resolver.install_repair_diagnostics(loaded.repair_diagnostics.clone());
         // QPDF's parser registers indirect references while reading every
         // trailer, including historical /Prev sections (QPDFParser.cc:168-175).
         // Canonical xref loading has already minted those handles in this
@@ -304,7 +285,6 @@ impl<R: Read + Seek> Pdf<R> {
         // qpdf's readTrailer resets InputSource::last_offset to the xref read
         // position before initializeEncryption runs (QPDF.cc:1313-1327).
         resolver.set_last_offset(loaded.startxref);
-        resolver.replay_warnings(&initial_diagnostics)?;
         let trailer = loaded.trailer;
         // `Pdf::encryption` is the same `Rc<RefCell<..>>` allocation as
         // `ResolverCore::encryption_parameters` (qpdf's `m->encp`), not a
