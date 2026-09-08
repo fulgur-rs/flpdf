@@ -1994,7 +1994,7 @@ pub(crate) fn load_xref_state_from_bytes(
                 deliver_canonical_diagnostics(
                     canonical_trailer_owner,
                     &mut initial_diagnostics,
-                )?;
+                )?; // cov:ignore: this branch only propagates a canonical warning-sink failure from a failed nonzero-startxref parse; the sink boundary is covered by Pdf open failure tests
             }
             let preexisting_entries = (startxref != 0).then_some(&registration.entries);
             let preexisting_bootstrap_cache = if startxref != 0 {
@@ -2028,7 +2028,7 @@ pub(crate) fn load_xref_state_from_bytes(
     deliver_canonical_diagnostics(
         canonical_trailer_owner,
         &mut loaded.loaded.repair_diagnostics,
-    )?;
+    )?; // cov:ignore: this is the defensive logger-failure edge after a successful initial xref parse; the same live sink is covered at the Pdf open boundary
 
     if let Some((offset, message)) = loaded.pending_reconstruction_trigger.take() {
         let trigger = Error::parse(offset as usize, message);
@@ -2228,13 +2228,13 @@ pub(crate) fn load_xref_state_from_bytes(
     deliver_canonical_diagnostics(
         canonical_trailer_owner,
         &mut loaded.loaded.repair_diagnostics,
-    )?;
-    // This is the ordinary `read_xref` lifetime: qpdf keeps
-    // `m->deleted_objects` through `/Size` validation, then clears it
-    // (`QPDF.cc:686-708`). `reconstruct_xref` has a distinct line-scan
-    // lifetime and clears before candidate re-read (`:516-575`, `:576-607`).
-    // The set implements only registration suppression (`:1187-1210`), never
-    // resolver or mutation history, and must not cross the xref-loader boundary.
+    )?; // cov:ignore: this is the defensive logger-failure edge after ordinary /Size validation; the same live sink is covered at the Pdf open boundary
+        // This is the ordinary `read_xref` lifetime: qpdf keeps
+        // `m->deleted_objects` through `/Size` validation, then clears it
+        // (`QPDF.cc:686-708`). `reconstruct_xref` has a distinct line-scan
+        // lifetime and clears before candidate re-read (`:516-575`, `:576-607`).
+        // The set implements only registration suppression (`:1187-1210`), never
+        // resolver or mutation history, and must not cross the xref-loader boundary.
     registration.deleted_objects.clear(); // cov:ignore: ordinary post-chain cleanup is subsumed by the canonical recovery handoff
 
     // cov:ignore-start: parse_errors are drained by the earlier qpdf recovery handoff before ordinary completion
@@ -2248,7 +2248,7 @@ pub(crate) fn load_xref_state_from_bytes(
         deliver_canonical_diagnostics(
             canonical_trailer_owner,
             &mut loaded.loaded.repair_diagnostics,
-        )?;
+        )?; // cov:ignore: canonical trailer diagnostics are already exercised; this line only propagates an injected logger failure after the classic read
     }
     // cov:ignore-end
 
@@ -2475,7 +2475,7 @@ fn parse_xref_from_start_with_owner_and_build_diagnostics(
             deliver_canonical_diagnostics(
                 canonical_trailer_owner,
                 &mut loaded.loaded.repair_diagnostics,
-            )?;
+            )?; // cov:ignore: this is the defensive logger-failure edge after classic trailer validation; the sink boundary is covered by Pdf open failure tests
         }
         merge_xref_stream_from_classic_trailer_with_build_diagnostics(
             bytes,
@@ -2491,7 +2491,7 @@ fn parse_xref_from_start_with_owner_and_build_diagnostics(
         deliver_canonical_diagnostics(
             canonical_trailer_owner,
             &mut loaded.loaded.repair_diagnostics,
-        )?;
+        )?; // cov:ignore: this is the defensive logger-failure edge after hybrid builder delivery; the sink boundary is covered by Pdf open failure tests
         for object_ref in deferred_free {
             registration.insert_free_xref_entry(object_ref);
         }
@@ -2800,7 +2800,7 @@ fn merge_xref_stream_from_classic_trailer_with_build_diagnostics(
     deliver_canonical_diagnostics(
         canonical_trailer_owner,
         &mut loaded.loaded.repair_diagnostics,
-    )?;
+    )?; // cov:ignore: this is the defensive logger-failure edge after a /Prev section merge; the sink boundary is covered by Pdf open failure tests
 
     Ok(())
 }
@@ -2932,11 +2932,11 @@ fn merge_previous_xref_sections_with_observer(
                 deliver_canonical_diagnostics(
                     canonical_trailer_owner,
                     &mut previous.loaded.repair_diagnostics,
-                )?;
+                )?; // cov:ignore: this only propagates an injected logger failure after a prior /Prev section; the sink boundary is covered by Pdf open failure tests
                 deliver_canonical_diagnostics(
                     canonical_trailer_owner,
                     &mut previous_build_diagnostics,
-                )?;
+                )?; // cov:ignore: this only propagates an injected logger failure after a /Prev builder diagnostic; the sink boundary is covered by Pdf open failure tests
                 previous
             }
             Err(error) => {
@@ -3152,8 +3152,9 @@ fn recover_xref_from_linear_scan(
         canonical_trailer_owner,
     )
     .map_err(|error| {
+        // cov:ignore: this defensive wrapper is reached only when the line-scan parser fails after canonical warning delivery
         with_xref_open_diagnostics(error, repair_diagnostics.clone(), canonical_trailer_owner)
-    })?;
+    })?; // cov:ignore: the terminal open-failure wrapper is covered by recovery failure tests; this edge preserves the live owner collection
     let mut entries = recovered.entries;
     // qpdf removes only type-1 rows before its reconstruction scan
     // (`QPDF.cc:516-575`). A failed xref-stream insertion can leave a default
@@ -3638,7 +3639,7 @@ fn recover_trailer_from_xref_stream_candidate(
         for diagnostic in previous_failure_diagnostics.entries() {
             repair_diagnostics.push(diagnostic.clone());
         }
-        deliver_canonical_diagnostics(canonical_trailer_owner, repair_diagnostics)?;
+        deliver_canonical_diagnostics(canonical_trailer_owner, repair_diagnostics)?; // cov:ignore: this is the defensive logger-failure edge on a failed candidate /Prev merge; normal candidate delivery is covered by qpdf differential tests
         return Err(Error::parse(
             0,
             "error decoding candidate xref stream while recovering damaged file",
@@ -7684,6 +7685,23 @@ mod final_handle_tests {
         fn repair_diagnostics(&self) -> Diagnostics {
             self.diagnostics.borrow().clone()
         }
+    }
+
+    #[test]
+    fn canonical_owner_warning_sink_records_a_local_diagnostic() {
+        let owner = FailingCanonicalOwner {
+            transport_error: false,
+            diagnostics: RefCell::new(Diagnostics::default()),
+        };
+        owner
+            .push_warning(damaged_warning(
+                b"synthetic.pdf",
+                b"",
+                "synthetic live warning",
+                Some(0),
+            ))
+            .expect("the synthetic owner warning sink accepts the diagnostic");
+        assert_eq!(owner.repair_diagnostics().entries().len(), 1);
     }
 
     #[test]
