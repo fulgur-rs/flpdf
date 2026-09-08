@@ -6775,7 +6775,7 @@ mod final_handle_tests {
 
     #[test]
     fn canonical_nonzero_startxref_recovery_keeps_bootstrap_cache_absent() {
-        let bytes = b"%PDF-1.4\n1 0 obj\n<< /Type /Catalog >>\nendobj\ntrailer\n<< /Size 2 /Root 1 0 R >>\nstartxref\n9\n%%EOF\n".to_vec();
+        let bytes = b"%PDF-1.4\n1 0 obj\n<< /Type /Catalog >>\nendobj\ntrailer\n<< /Size 2 /Root 1 0 R >>\nstartxref\n999\n%%EOF\n".to_vec();
         let resolver = canonical_test_resolver(bytes.clone(), BTreeMap::new(), true, 12);
         let state = load_xref_state_from_bytes(
             &bytes,
