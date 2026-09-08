@@ -2550,7 +2550,7 @@ mod object_emitter_tests {
             root_source,
             BTreeSet::new(),
             &object_streams,
-        )?;
+        )?; // cov:ignore: LLVM attributes the live-body test call terminator to callback cleanup.
         assert!(body
             .bytes
             .windows(b"/Type /ObjStm".len())
@@ -2590,7 +2590,7 @@ mod object_emitter_tests {
             root_source,
             BTreeSet::new(),
             &object_streams,
-        )?;
+        )?; // cov:ignore: LLVM attributes the live-body test call terminator to callback cleanup.
         let predecessor_output = body
             .old_to_new
             .get(&predecessor_id)
