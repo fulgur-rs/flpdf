@@ -80,7 +80,8 @@ impl QPDFJob {
     ) -> Result<JobExitCode> {
         self.check_linearization_report(pdf)?;
         self.drain_document_warnings(pdf);
-        self.complete(false)
+        self.complete(false)?;
+        Ok(self.get_exit_code())
     }
 
     /// Emit the linearization report without completing the enclosing job.
@@ -151,7 +152,8 @@ impl QPDFJob {
     ) -> std::result::Result<JobExitCode, CheckError> {
         self.run_check_report(pdf)?;
         self.drain_document_warnings(pdf);
-        Ok(self.complete(false)?)
+        self.complete(false)?;
+        Ok(self.get_exit_code())
     }
 
     /// Run the full check report without completing the enclosing job.

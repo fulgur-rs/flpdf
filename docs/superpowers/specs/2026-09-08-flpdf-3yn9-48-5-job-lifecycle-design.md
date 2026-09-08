@@ -23,12 +23,11 @@ the fixed order at `libqpdf/QPDFJob.cc:1645-1693`.
 
 ## Current gap
 
-flpdf's `create_qpdf` currently prepares only the ordinary update-JSON and
-rotation path. `run_document_erased` and `run_document_stages` still perform
-page selection, overlay, transformations, inspection selection, JSON output,
-and file output together. `write_qpdf` requires an output path and returns a
-status after doing output-specific completion. `complete` combines the warning
-summary and status query, so direct stage calls can complete more than once.
+flpdf's `create_qpdf` previously prepared only the ordinary update-JSON and
+rotation path. The current implementation prepares page selection, overlay,
+and transformations before returning; `write_qpdf` owns inspection, JSON,
+split, and ordinary output dispatch. `complete` emits the summary while the
+new `get_exit_code` query returns status without logging or draining.
 
 ## Chosen design
 

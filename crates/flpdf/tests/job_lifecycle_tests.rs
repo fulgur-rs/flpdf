@@ -3,7 +3,7 @@ use flpdf::job::{
 };
 use flpdf::json_inspect::DecodeLevel;
 use flpdf::pipeline::{Pipeline, PipelineError, PipelineHandle, PipelineResult};
-use flpdf::{Error, PageRange, Pdf, PdfOpenOptions, PdfWriter, QPDFLogger};
+use flpdf::{Error, ObjectHandle, PageRange, Pdf, PdfOpenOptions, PdfWriter, QPDFLogger};
 use std::fs::File;
 use std::io::{BufReader, Cursor};
 use std::path::Path;
@@ -163,7 +163,8 @@ fn new_job_matches_qpdf_defaults() {
     assert_eq!(job.message_prefix(), "qpdf");
     assert_eq!(job.logger(), QPDFLogger::default_logger());
     assert!(!job.has_warnings());
-    assert_eq!(job.complete(false).unwrap(), JobExitCode::Success);
+    job.complete(false).unwrap();
+    assert_eq!(job.get_exit_code(), JobExitCode::Success);
     assert_eq!(JobExitCode::Error.as_i32(), 2);
     assert_eq!(JobExitCode::Success.as_i32(), 0);
     assert_eq!(JobExitCode::Warning.as_i32(), 3);
@@ -667,6 +668,194 @@ fn create_qpdf_returns_the_primary_after_rotation_transformation() {
     let page = pdf.get_object_handle(page_ref);
     pdf.resolve(&page).unwrap();
     assert_eq!(page.try_get_key(b"/Rotate").unwrap().as_integer(), Some(90));
+}
+
+#[test]
+fn create_qpdf_applies_page_selection_before_returning() {
+    let fixture = Path::new(env!("CARGO_MANIFEST_DIR"))
+        .join("../../tests/fixtures/compat/attachment-two-page.pdf");
+    let tempdir = tempfile::tempdir().unwrap();
+    let json = serde_json::json!({
+        "inputFile": fixture,
+        "outputFile": tempdir.path().join("selected.pdf"),
+        "pages": [{"file": ".", "range": "1"}]
+    })
+    .to_string();
+
+    let mut job = QPDFJob::new();
+    job.initialize_from_json(&json).unwrap();
+    let mut pdf = job
+        .create_qpdf()
+        .unwrap()
+        .expect("createQPDF should return the page-selected document");
+
+    assert_eq!(
+        flpdf::pages::page_refs(&mut pdf).unwrap().len(),
+        1,
+        "qpdf createQPDF returns after handlePageSpecs, before writeQPDF"
+    );
+}
+
+#[test]
+fn create_qpdf_write_qpdf_preserves_a_between_stage_mutation() {
+    let input =
+        Path::new(env!("CARGO_MANIFEST_DIR")).join("../../tests/fixtures/compat/one-page.pdf");
+    let tempdir = tempfile::tempdir().unwrap();
+    let output = tempdir.path().join("between-stage.pdf");
+    let json = serde_json::json!({
+        "inputFile": input,
+        "outputFile": output,
+        "rotate": "+90"
+    })
+    .to_string();
+
+    let mut job = QPDFJob::new();
+    job.initialize_from_json(&json).unwrap();
+    let mut pdf = job
+        .create_qpdf()
+        .unwrap()
+        .expect("createQPDF should return the prepared document");
+
+    let root = pdf.root_handle().unwrap();
+    assert_eq!(
+        flpdf::pages::page_refs(&mut pdf).unwrap().len(),
+        1,
+        "the create stage must have prepared the primary before returning"
+    );
+    root.replace_key(b"/BetweenStages", ObjectHandle::boolean(true))
+        .unwrap();
+    pdf.mark_object_handle_dirty(&root).unwrap();
+
+    job.write_qpdf(&mut pdf).unwrap();
+    assert_eq!(job.get_exit_code(), JobExitCode::Success);
+
+    let mut written = Pdf::open(BufReader::new(File::open(output).unwrap())).unwrap();
+    let written_root = written.root_handle().unwrap();
+    assert_eq!(
+        written_root
+            .try_get_key(b"/BetweenStages")
+            .unwrap()
+            .as_boolean(),
+        Some(true),
+        "writeQPDF must consume the document returned by createQPDF"
+    );
+}
+
+#[test]
+fn create_qpdf_returns_an_erased_multi_source_document_for_later_write() {
+    let primary =
+        Path::new(env!("CARGO_MANIFEST_DIR")).join("../../tests/fixtures/compat/one-page.pdf");
+    let secondary = Path::new(env!("CARGO_MANIFEST_DIR"))
+        .join("../../tests/fixtures/compat/attachment-two-page.pdf");
+    let tempdir = tempfile::tempdir().unwrap();
+    let output = tempdir.path().join("multi-source.pdf");
+    let json = serde_json::json!({
+        "inputFile": primary,
+        "outputFile": output,
+        "pages": [
+            {"file": ".", "range": "1"},
+            {"file": secondary, "range": "1"}
+        ]
+    })
+    .to_string();
+
+    let mut job = QPDFJob::new();
+    job.initialize_from_json(&json).unwrap();
+    let mut pdf = job
+        .create_qpdf()
+        .unwrap()
+        .expect("createQPDF should return an erased merged document");
+    assert_eq!(flpdf::pages::page_refs(&mut pdf).unwrap().len(), 2);
+
+    job.write_qpdf(&mut pdf).unwrap();
+    assert_eq!(job.get_exit_code(), JobExitCode::Success);
+    let mut written = Pdf::open(BufReader::new(File::open(output).unwrap())).unwrap();
+    assert_eq!(flpdf::pages::page_refs(&mut written).unwrap().len(), 2);
+}
+
+#[test]
+fn combined_inspection_completes_once_after_all_reports() {
+    let input = Path::new(env!("CARGO_MANIFEST_DIR"))
+        .join("../../tests/fixtures/test_driver/repairable_input.pdf");
+    let (logger, warnings) = logger_with_warning_sink();
+    let mut job = QPDFJob::new();
+    job.set_logger(logger);
+    job.initialize_from_json_partial(
+        &serde_json::json!({
+            "inputFile": input,
+            "showNpages": "",
+            "showXref": "",
+            "showPages": ""
+        })
+        .to_string(),
+    )
+    .unwrap();
+
+    assert_eq!(job.run().unwrap(), JobExitCode::Warning);
+    let summary = b"qpdfjob json: operation succeeded with warnings\n";
+    let bytes = warnings.lock().unwrap().bytes.clone();
+    assert_eq!(
+        bytes
+            .windows(summary.len())
+            .filter(|window| *window == summary)
+            .count(),
+        1,
+        "combined doInspection branches must share one completion summary"
+    );
+}
+
+#[test]
+fn get_exit_code_is_pure_before_and_after_completion() {
+    let (logger, warnings) = logger_with_warning_sink();
+    let mut job = QPDFJob::new();
+    job.set_logger(logger);
+    job.record_warnings();
+
+    assert_eq!(job.get_exit_code(), JobExitCode::Warning);
+    assert_eq!(job.get_exit_code(), JobExitCode::Warning);
+    assert!(warnings.lock().unwrap().bytes.is_empty());
+
+    job.complete(false).unwrap();
+    let completed_bytes = warnings.lock().unwrap().bytes.clone();
+    assert_eq!(job.get_exit_code(), JobExitCode::Warning);
+    assert_eq!(warnings.lock().unwrap().bytes, completed_bytes);
+}
+
+#[test]
+fn encryption_status_exit_codes_match_qpdf_get_exit_code() {
+    let root = Path::new(env!("CARGO_MANIFEST_DIR")).join("../../tests/fixtures");
+    let encrypted = root.join("encrypted/v4-aes-128-r4.pdf");
+    let plaintext = root.join("minimal.pdf");
+
+    let cases = [
+        (
+            serde_json::json!({"inputFile": encrypted, "requiresPassword": ""}),
+            JobExitCode::Success,
+        ),
+        (
+            serde_json::json!({
+                "inputFile": encrypted,
+                "password": "user-v4-aes",
+                "requiresPassword": ""
+            }),
+            JobExitCode::Warning,
+        ),
+        (
+            serde_json::json!({"inputFile": encrypted, "isEncrypted": ""}),
+            JobExitCode::Success,
+        ),
+        (
+            serde_json::json!({"inputFile": plaintext, "isEncrypted": ""}),
+            JobExitCode::Error,
+        ),
+    ];
+    for (value, expected) in cases {
+        let mut job = QPDFJob::new();
+        job.initialize_from_json_partial(&value.to_string())
+            .unwrap();
+        assert_eq!(job.run().unwrap(), expected);
+        assert_eq!(job.get_exit_code(), expected);
+    }
 }
 
 /// qpdf keys its opened-source cache by filename alone
@@ -1174,12 +1363,13 @@ fn create_qpdf_and_write_qpdf_are_separate_job_boundaries() {
     job.initialize_from_argv(&args).unwrap();
     let mut pdf = job.create_qpdf().unwrap().expect("input should open");
 
-    assert_eq!(job.write_qpdf(&mut pdf).unwrap(), JobExitCode::Success);
+    job.write_qpdf(&mut pdf).unwrap();
+    assert_eq!(job.get_exit_code(), JobExitCode::Success);
     assert!(output.exists());
 }
 
 #[test]
-fn write_qpdf_failure_returns_qpdf_error_status() {
+fn write_qpdf_failure_returns_an_error() {
     let input = Path::new(env!("CARGO_MANIFEST_DIR")).join("../../tests/fixtures/minimal.pdf");
     let tempdir = tempfile::tempdir().unwrap();
     let args = vec![
@@ -1191,18 +1381,19 @@ fn write_qpdf_failure_returns_qpdf_error_status() {
     job.initialize_from_argv(&args).unwrap();
     let mut pdf = job.create_qpdf().unwrap().expect("input should open");
 
-    assert_eq!(job.write_qpdf(&mut pdf).unwrap(), JobExitCode::Error);
+    assert!(job.write_qpdf(&mut pdf).is_err());
 }
 
 #[test]
-fn write_qpdf_without_an_output_returns_qpdf_error_status() {
+fn write_qpdf_without_an_output_runs_inspection() {
     let input = Path::new(env!("CARGO_MANIFEST_DIR")).join("../../tests/fixtures/minimal.pdf");
     let args = vec!["qpdfjob".to_owned(), input.to_string_lossy().into_owned()];
     let mut job = QPDFJob::new();
     job.initialize_from_argv(&args).unwrap();
     let mut pdf = job.create_qpdf().unwrap().expect("input should open");
 
-    assert_eq!(job.write_qpdf(&mut pdf).unwrap(), JobExitCode::Error);
+    job.write_qpdf(&mut pdf).unwrap();
+    assert_eq!(job.get_exit_code(), JobExitCode::Success);
 }
 
 #[test]
@@ -1446,8 +1637,9 @@ fn completion_emits_one_qpdf_warning_summary_and_warning_status() {
     job.set_message_prefix("flpdf");
     job.record_warnings();
 
+    job.complete(true).unwrap();
     assert_eq!(
-        job.complete(true).unwrap(),
+        job.get_exit_code(),
         JobExitCode::Warning,
         "qpdf uses status 3 for recoverable warnings"
     );
@@ -1465,7 +1657,8 @@ fn warning_suppression_keeps_warning_status_but_suppresses_summary() {
     job.set_suppress_warnings(true);
     job.record_warnings();
 
-    assert_eq!(job.complete(false).unwrap(), JobExitCode::Warning);
+    job.complete(false).unwrap();
+    assert_eq!(job.get_exit_code(), JobExitCode::Warning);
     assert!(state.lock().unwrap().bytes.is_empty());
 }
 
@@ -1477,7 +1670,8 @@ fn warnings_exit_zero_changes_only_the_exit_status() {
     job.set_warnings_exit_zero(true);
     job.record_warnings();
 
-    assert_eq!(job.complete(false).unwrap(), JobExitCode::Success);
+    job.complete(false).unwrap();
+    assert_eq!(job.get_exit_code(), JobExitCode::Success);
     assert_eq!(
         state.lock().unwrap().bytes,
         b"qpdf: operation succeeded with warnings\n"
@@ -2640,7 +2834,8 @@ fn write_qpdf_completes_replace_input_without_run() {
     // `create_qpdf()`/`write_qpdf()` two-stage contract directly must see
     // the same completed rename `run()` would have produced.
     let mut pdf = job.create_qpdf().unwrap().expect("input should open");
-    assert_eq!(job.write_qpdf(&mut pdf).unwrap(), JobExitCode::Success);
+    job.write_qpdf(&mut pdf).unwrap();
+    assert_eq!(job.get_exit_code(), JobExitCode::Success);
 
     assert!(
         input.exists(),

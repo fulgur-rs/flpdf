@@ -45,7 +45,7 @@ fn in_place_page_specs_share_the_qpdf_completion_boundary() {
 
     let lifecycle_source = include_str!("../src/job/lifecycle.rs");
     let lifecycle_start = lifecycle_source
-        .find("fn run_document_erased")
+        .find("fn prepare_document(")
         .expect("shared page completion caller must have a named job function");
     let lifecycle_body = &lifecycle_source[lifecycle_start..];
     let lifecycle_completion = lifecycle_body

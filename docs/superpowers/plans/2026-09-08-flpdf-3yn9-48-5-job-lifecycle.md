@@ -43,12 +43,12 @@ cargo test -p flpdf --test job_lifecycle_tests combined_inspection --exact
 cargo test -p flpdf --test job_lifecycle_tests get_exit_code --exact
 ```
 
-Expected: the new lifecycle assertions fail because `create_qpdf` leaves configured stages for `run_document_erased`, `write_qpdf` rejects inspection without output, and no pure `get_exit_code` method exists.
+Expected: the lifecycle assertions fail because `create_qpdf` leaves configured stages for the old run-only route, `write_qpdf` rejects inspection without output, and no pure `get_exit_code` method exists.
 
 ### Task 2: Separate create-stage preparation from operation dispatch
 
 **Files:**
-- Modify: `crates/flpdf/src/job/lifecycle.rs` around `create_qpdf`, `run_document_erased`, `run_document_stages`, and `write_qpdf`.
+- Modify: `crates/flpdf/src/job/lifecycle.rs` around `create_qpdf`, `prepare_document`, `prepare_document_transformations`, and `write_qpdf`.
 - Test: `crates/flpdf/tests/job_lifecycle_tests.rs` and the lifecycle unit tests in `crates/flpdf/src/job/lifecycle.rs`.
 
 **Interfaces:**
@@ -81,7 +81,7 @@ Expected: direct create/write and combined inspection tests pass, with no duplic
 
 **Interfaces:**
 - Consumes: `warnings`, `suppress_warnings`, `warnings_exit_zero`, encryption status state, and `Pdf::any_warnings`/`get_warnings` from `.48.26`.
-- Produces: `pub fn get_exit_code(&self) -> JobExitCode`, a private completion helper `fn complete(&self, creates_output: bool) -> Result<()>`, and callers that observe status without re-emitting the summary.
+- Produces: `pub fn get_exit_code(&self) -> JobExitCode`, a completion helper `pub fn complete(&self, creates_output: bool) -> Result<()>` retained for existing standalone CLI consumers, and callers that observe status without re-emitting the summary.
 
 - [ ] **Step 1: Add RED assertions for warning/no-warn/warnings-exit-0 and encryption status.** Cover status queries before and after completion, repeated queries, suppression retaining warning state, and the qpdf encrypted/password status values.
 

@@ -674,9 +674,9 @@ fn widget_page_ref<R: Read + Seek>(
 /// Bounded by `DEFAULT_MAX_ACROFORM_DEPTH` and a `visited` cycle guard (review
 /// rule 4): a hostile field tree cannot drive unbounded recursion.
 #[allow(clippy::too_many_arguments)]
-fn trim_field_kids<R: Read + Seek>(
+fn trim_field_kids<R: Read + Seek, T: Read + Seek>(
     source: &mut Pdf<R>,
-    target: &mut Pdf<Cursor<Vec<u8>>>,
+    target: &mut Pdf<T>,
     field_ref: ObjectRef,
     surviving_pages: &BTreeSet<ObjectRef>,
     retained_widgets: &BTreeSet<ObjectRef>,
@@ -956,6 +956,30 @@ pub(crate) fn merge_documents_with_resource_decisions_and_preserve_primary<R: Re
     remove_resources: &[bool],
     preserve_primary_unreferenced: bool,
 ) -> Result<Pdf<Cursor<Vec<u8>>>> {
+    let target = Pdf::empty()?;
+    merge_documents_with_resource_decisions_and_preserve_primary_into(
+        inputs,
+        remove_resources,
+        preserve_primary_unreferenced,
+        target,
+    )
+}
+
+/// Merge selected pages into a caller-provided target document.
+///
+/// The public library primitive uses qpdf's canonical in-memory empty target,
+/// while `QPDFJob::createQPDF` supplies its erased job document here. Keeping
+/// the copy and page-rebuild body shared is important: the target reader type
+/// is an ownership detail, not a second page-selection implementation.
+pub(crate) fn merge_documents_with_resource_decisions_and_preserve_primary_into<
+    R: Read + Seek,
+    T: Read + Seek,
+>(
+    inputs: &mut [MergeInput<'_, R>],
+    remove_resources: &[bool],
+    preserve_primary_unreferenced: bool,
+    mut target: Pdf<T>,
+) -> Result<Pdf<T>> {
     if inputs.is_empty() {
         return Err(Error::Unsupported(
             "merge requires at least one input".to_string(),
@@ -986,7 +1010,6 @@ pub(crate) fn merge_documents_with_resource_decisions_and_preserve_primary<R: Re
         })
         .collect::<Result<_>>()?;
 
-    let mut target = Pdf::empty()?;
     let pages_root_ref = target_pages_root(&mut target)?;
     let mut writer_object_order: BTreeMap<ObjectRef, WriterObjectOrderKey> = BTreeMap::new();
     // qpdf keeps the primary QPDF object-number allocator alive while it

@@ -148,11 +148,8 @@ fn run_tests() -> Result<()> {
     let mut pdf = job
         .create_qpdf()?
         .ok_or_else(|| Error::Internal("qpdfjob createQPDF returned no document".to_owned()))?;
-    expect_status(
-        job.write_qpdf(&mut pdf)?,
-        JobExitCode::Success,
-        "create/write",
-    )?;
+    job.write_qpdf(&mut pdf)?;
+    expect_status(job.get_exit_code(), JobExitCode::Success, "create/write")?;
 
     let missing_argv = vec![
         "qpdfjob".to_owned(),

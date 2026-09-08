@@ -1212,6 +1212,17 @@ pub enum JobExitCode {
     Warning = 3,
 }
 
+/// Encryption bits retained by qpdf between `createQPDF` and `getExitCode`.
+///
+/// qpdf records these independently from the ordinary warning state because
+/// `--is-encrypted` and `--requires-password` return their status without
+/// running the normal output/inspection operation.
+#[derive(Debug, Clone, Copy, Default)]
+struct EncryptionStatus {
+    encrypted: bool,
+    password_incorrect: bool,
+}
+
 impl JobExitCode {
     /// Return the process status value used by qpdf.
     #[must_use]
@@ -1236,6 +1247,15 @@ pub struct QPDFJob {
     warnings_exit_zero: bool,
     progress_handler: Option<SharedProgressHandler>,
     configuration: JobConfiguration,
+    /// Source documents retained by the create-stage page merge. The copied
+    /// document may contain provider-backed streams that are intentionally
+    /// read only when the later write stage consumes them.
+    page_source_documents: Vec<JobDocument>,
+    /// Overlay and underlay donors retained through the write boundary for
+    /// the same deferred foreign-stream contract.
+    overlay_sources: Vec<OverlaySpec<Box<dyn ReadSeek>>>,
+    /// qpdf's status bits consumed by the side-effect-free exit-code query.
+    encryption_status: EncryptionStatus,
     /// Whether this job created its primary document through
     /// [`QPDFJob::create_empty_document`]. qpdf's `Config::emptyInput` keys the
     /// page-spec source map with the empty string while `QPDF::emptyPDF`
@@ -1311,6 +1331,9 @@ impl QPDFJob {
             warnings_exit_zero: false,
             progress_handler: None,
             configuration: JobConfiguration::default(),
+            page_source_documents: Vec::new(),
+            overlay_sources: Vec::new(),
+            encryption_status: EncryptionStatus::default(),
             empty_primary_created: false,
         }
     }
@@ -2512,12 +2535,21 @@ impl QPDFJob {
         Ok(pdf)
     }
 
-    /// Finish qpdf's creation boundary for a single primary document.
+    /// Finish qpdf's creation boundary for one primary document.
     ///
-    /// qpdf applies `updateFromJSON` and `handleRotations` before
-    /// `createQPDF` returns. Page-spec jobs retain their source-owned route
-    /// until the page-source cutover can return the merged erased document.
+    /// qpdf performs every document mutation before `createQPDF` returns:
+    /// update-JSON, page selection, rotations, underlay/overlay, and the
+    /// configured transformations. The later write stage only chooses how to
+    /// consume this already-prepared document
+    /// (`libqpdf/QPDFJob.cc:428-481`).
     fn finish_created_document(&mut self, mut pdf: JobDocument) -> Result<JobDocument> {
+        self.page_source_documents.clear();
+        self.overlay_sources.clear();
+        self.encryption_status = EncryptionStatus {
+            encrypted: pdf.is_encrypted(),
+            password_incorrect: false,
+        };
+
         let configuration = self.configuration.clone();
         // qpdf leaves createQPDF before any stage when the job only reports
         // encryption status: `if (m->check_is_encrypted ||
@@ -2527,9 +2559,6 @@ impl QPDFJob {
         // a status-only job fail on a missing update file and would mutate a
         // document that exists solely to be inspected.
         if configuration.is_encrypted || configuration.requires_password {
-            return Ok(pdf);
-        }
-        if !configuration.page_specs.is_empty() {
             return Ok(pdf);
         }
         if let Some(update_path) = configuration.update_from_json.as_deref() {
@@ -2542,8 +2571,129 @@ impl QPDFJob {
                 path_description_bytes(update_path),
             )?; // cov:ignore: llvm-cov attributes the successful update continuation to the parser call's opening expressions
         }
-        self.apply_configured_rotations(&mut pdf, &configuration)?;
-        Ok(pdf)
+        self.prepare_document(pdf, &configuration)
+    }
+
+    /// Apply qpdf's create-stage page operation and document transformations.
+    ///
+    /// Multi-source page selection returns a fresh target, while the
+    /// one-source case keeps qpdf's in-place page identity. Secondary page
+    /// documents and overlay donors are retained on `self` because flpdf's
+    /// canonical foreign copier may defer provider-backed stream reads until
+    /// the later `write_qpdf` call.
+    fn prepare_document(
+        &mut self,
+        primary: JobDocument,
+        configuration: &JobConfiguration,
+    ) -> Result<JobDocument> {
+        if configuration.page_specs.is_empty() {
+            let mut primary = primary;
+            self.apply_configured_rotations(&mut primary, configuration)?;
+            self.prepare_document_transformations(&mut primary, configuration)?;
+            return Ok(primary);
+        }
+
+        let mut page_sources = vec![primary];
+        let mut source_paths: Vec<PathBuf> = Vec::new();
+        let mut source_passwords: Vec<Vec<u8>> = Vec::new();
+        let mut specs = Vec::with_capacity(configuration.page_specs.len());
+        for page in &configuration.page_specs {
+            let source_index = if page.path == Path::new(".")
+                || self.configuration.input_file.as_deref() == Some(page.path.as_path())
+            {
+                0
+            } else if let Some(index) = source_paths.iter().position(|path| *path == page.path) {
+                index + 1
+            } else {
+                source_paths.push(page.path.clone());
+                source_passwords.push(page.password.clone());
+                source_paths.len()
+            };
+            specs.push(PageSpecInput::new(source_index, page.range.clone()));
+        }
+        let keep_files_open = self.keep_files_open_for_page_specs(&specs);
+        self.report_page_spec_selection(&specs)?;
+        for (path, password) in source_paths.iter().zip(source_passwords.iter()) {
+            self.report_page_source_processing(path_description_bytes(path))?;
+            let source = self.open_job_source(path, password)?;
+            self.record_document_warnings(&source);
+            if !keep_files_open {
+                // qpdf calls ClosedFileInputSource::stayOpen(false)
+                // immediately after processInputSource, before opening the
+                // next distinct page source (`QPDFJob.cc:2414-2432`).
+                source.set_input_source_stay_open(false);
+            }
+            page_sources.push(source);
+        }
+
+        if page_sources.len() == 1 && specs.iter().all(|spec| spec.source_index == 0) {
+            {
+                let page_output = self.handle_page_specs(
+                    &mut page_sources,
+                    &specs,
+                    configuration.collate.as_deref(),
+                    configuration.remove_unreferenced_resources,
+                    configuration.writer.preserves_unreferenced_objects(),
+                )?; // cov:ignore: this successful in-place page selection continuation is covered by the public lifecycle tests
+                match page_output {
+                    PageSpecJobOutput::InPlace {
+                        pdf,
+                        result,
+                        prune_mode,
+                    } => {
+                        QPDFJob::complete_in_place_page_selection(pdf, &result, prune_mode)?;
+                    }
+                    PageSpecJobOutput::Merged(_) => {
+                        return Err(Error::Internal(
+                            "single-source page selection returned a merged target".to_owned(),
+                        ));
+                    }
+                }
+            }
+            let mut primary = page_sources
+                .pop()
+                .ok_or_else(|| Error::Internal("page selection lost its primary".to_owned()))?;
+            self.apply_configured_rotations(&mut primary, configuration)?;
+            self.prepare_document_transformations(&mut primary, configuration)?;
+            return Ok(primary);
+        }
+
+        let target = self.create_page_selection_target()?;
+        let page_output = self.handle_page_specs_with_target(
+            &mut page_sources,
+            &specs,
+            configuration.collate.as_deref(),
+            configuration.remove_unreferenced_resources,
+            configuration.writer.preserves_unreferenced_objects(),
+            target,
+        )?;
+        let mut primary = match page_output {
+            PageSpecJobOutput::Merged(merged) => {
+                // The page-output enum no longer borrows `page_sources` in
+                // this variant, so the source owners can be transferred to
+                // the job before the merged document is returned.
+                self.page_source_documents = page_sources;
+                *merged
+            }
+            PageSpecJobOutput::InPlace { .. } => {
+                return Err(Error::Internal(
+                    "multi-source page selection returned an in-place target".to_owned(),
+                ));
+            }
+        };
+        self.apply_configured_rotations(&mut primary, configuration)?;
+        self.prepare_document_transformations(&mut primary, configuration)?;
+        Ok(primary)
+    }
+
+    /// Create the empty target used by qpdf's multi-source page merge without
+    /// changing the job's configured primary input state.
+    fn create_page_selection_target(&self) -> Result<JobDocument> {
+        let mut options = self.configured_open_options(Vec::new());
+        options.logger = Some(self.logger.clone());
+        options.suppress_warnings = self.suppress_warnings;
+        options.description = b"empty PDF".to_vec();
+        crate::engine::open_empty_with_options_erased(options)
     }
 
     /// Create the configured input document, returning `None` after qpdf-style
@@ -2616,18 +2766,44 @@ impl QPDFJob {
 
     /// Write a created document through the configured qpdf writer and
     /// complete the shared warning/status boundary.
-    pub fn write_qpdf<R>(&mut self, pdf: &mut Pdf<R>) -> Result<JobExitCode>
+    pub fn write_qpdf<R>(&mut self, pdf: &mut Pdf<R>) -> Result<()>
     where
         R: Read + Seek + 'static,
     {
-        let Some(output) = self.configuration.output_file.clone().or_else(|| {
-            self.configuration
-                .replace_input
-                .then(|| self.replace_input_path())
-                .flatten()
-        }) else {
-            return Ok(JobExitCode::Error);
-        };
+        let creates_output = self.configuration.output_file.is_some()
+            || self.configuration.replace_input
+            || self.configuration.json_version.is_some();
+        if !creates_output {
+            let configuration = self.configuration.clone();
+            if let Err(error) = self.run_configured_inspection(pdf, &configuration) {
+                self.report_job_error(&error)?;
+                return Err(error);
+            }
+            self.drain_document_warnings(pdf);
+            self.complete(false)?;
+            if self.configuration.report_memory_usage {
+                self.report_memory_usage()?;
+            }
+            return Ok(());
+        }
+
+        let output = self
+            .configuration
+            .output_file
+            .clone()
+            .or_else(|| {
+                self.configuration
+                    .replace_input
+                    .then(|| self.replace_input_path())
+                    .flatten()
+            })
+            .or_else(|| {
+                self.configuration
+                    .json_version
+                    .is_some()
+                    .then(|| PathBuf::from("-"))
+            })
+            .expect("creates_output guarantees an output destination");
         // qpdf's checkConfiguration reserves the save pipeline before
         // createQPDF and setEncryptionOptions, so auto-password diagnostics
         // cannot consume stdout that is needed for the PDF output
@@ -2636,7 +2812,7 @@ impl QPDFJob {
         if output == Path::new("-") {
             if let Err(error) = self.logger.save_to_standard_output(true) {
                 self.report_job_error(&error)?;
-                return Ok(JobExitCode::Error);
+                return Err(error);
             }
         }
         let mut writer_configuration = self.configuration.writer.clone();
@@ -2645,7 +2821,7 @@ impl QPDFJob {
                 Ok(source) => writer_configuration.copy_encryption_parameters(source),
                 Err(error) => {
                     self.report_job_error(&error)?;
-                    return Ok(JobExitCode::Error);
+                    return Err(error);
                 }
             }
         }
@@ -2655,7 +2831,7 @@ impl QPDFJob {
             Ok(notices) => notices,
             Err(error) => {
                 self.report_job_error(&error)?;
-                return Ok(JobExitCode::Error);
+                return Err(error);
             }
         };
         for notice in auto_password_notices {
@@ -2704,6 +2880,9 @@ impl QPDFJob {
                 // and stays correct even if a later chunk fails after earlier
                 // chunks already reported success.
                 self.split_pages(pdf, split_options).map(|_| ())
+            } else if self.configuration.json_version.is_some() {
+                let configuration = self.configuration.clone();
+                self.write_configured_json(pdf, &configuration)
             } else {
                 (|| {
                     let mut writer = PdfWriter::new(pdf);
@@ -2757,11 +2936,15 @@ impl QPDFJob {
                 // The drain qpdf performs after `writeOutfile` returns
                 // (`libqpdf/QPDFJob.cc:493-494`).
                 self.drain_document_warnings(pdf);
-                self.complete(true)
+                self.complete(true)?;
+                if self.configuration.report_memory_usage {
+                    self.report_memory_usage()?;
+                }
+                Ok(())
             }
             Err(error) => {
                 self.report_job_error(&error)?;
-                Ok(JobExitCode::Error)
+                Err(error)
             }
         }
     }
@@ -2771,27 +2954,16 @@ impl QPDFJob {
         if self.configuration.is_encrypted || self.configuration.requires_password {
             return self.run_encryption_status();
         }
-        let Some(pdf) = self.create_qpdf()? else {
+        let Some(mut pdf) = self.create_qpdf()? else {
             return Ok(JobExitCode::Error);
         };
 
-        let configuration = self.configuration.clone();
-        let status = match self.run_document_erased(pdf, &configuration) {
-            Ok(status) => status,
-            Err(error) => {
-                self.report_job_error(&error)?;
-                JobExitCode::Error
-            }
+        let status = match self.write_qpdf(&mut pdf) {
+            Ok(()) => self.get_exit_code(),
+            Err(_error) => JobExitCode::Error,
         };
-        if configuration.report_memory_usage && status != JobExitCode::Error {
-            self.report_memory_usage()?;
-        }
-        // The replace-input rename is `write_qpdf`'s own responsibility now
-        // (mirroring qpdf's `writeOutfile`, `libqpdf/QPDFJob.cc:3057-3086`):
-        // every `run_document_stages` path with `replace_input` set is
-        // required by `check_configuration` to end at `write_qpdf`, so it has
-        // already run by the time `status` is available here. Do not repeat
-        // it -- the source file has already moved.
+        // The replace-input rename is `write_qpdf`'s own responsibility
+        // (mirroring qpdf's `writeOutfile`, `libqpdf/QPDFJob.cc:3057-3086`).
         Ok(status)
     }
 
@@ -2810,7 +2982,8 @@ impl QPDFJob {
         // `isEncrypted` and `requiresPassword` return EXIT_IS_NOT_ENCRYPTED
         // (2) without attempting to open an input file.
         if self.configuration.empty_input {
-            return Ok(JobExitCode::Error);
+            self.encryption_status = EncryptionStatus::default();
+            return Ok(self.get_exit_code());
         }
         let Some(input) = self.configuration.input_file.clone() else {
             // cov:ignore-start: with `empty_input` handled above,
@@ -2840,12 +3013,12 @@ impl QPDFJob {
             }
         };
         let encrypted = pdf.is_encrypted();
+        self.encryption_status = EncryptionStatus {
+            encrypted,
+            password_incorrect: encrypted && pdf.encryption_file_key().is_none(),
+        };
         if self.configuration.is_encrypted {
-            return Ok(if encrypted {
-                JobExitCode::Success
-            } else {
-                JobExitCode::Error
-            });
+            return Ok(self.get_exit_code());
         }
 
         // qpdf's `requiresPassword` uses exit 3 when authentication succeeds,
@@ -2854,100 +3027,9 @@ impl QPDFJob {
         // `QPDFJob.cc:535-557`). `encryption_file_key` also covers the raw
         // `passwordIsHexKey` path, where user/owner match flags stay false.
         if !encrypted {
-            return Ok(JobExitCode::Error);
+            return Ok(self.get_exit_code());
         }
-        Ok(if pdf.encryption_file_key().is_some() {
-            JobExitCode::Warning
-        } else {
-            JobExitCode::Success
-        })
-    }
-
-    fn run_document_erased(
-        &mut self,
-        mut primary: JobDocument,
-        configuration: &JobConfiguration,
-    ) -> Result<JobExitCode> {
-        if configuration.page_specs.is_empty() {
-            self.run_document_stages(&mut primary, configuration)
-        } else {
-            if let Some(update_path) = configuration.update_from_json.as_deref() {
-                let update_file = File::open(update_path).map_err(|error| {
-                    Error::file_io("open update JSON", update_path.to_path_buf(), error)
-                })?;
-                self.update_from_json(
-                    &mut primary,
-                    BufReader::new(update_file),
-                    path_description_bytes(update_path),
-                )?; // cov:ignore: llvm-cov attributes this successful update continuation to its opening call lines
-            }
-            let mut page_sources = vec![primary];
-            // qpdf keys its opened-source cache by filename alone
-            // (`page_spec_qpdfs.count(page_spec.filename) == 0`,
-            // `QPDFJob.cc:2389-2427`), reusing the existing QPDF for a
-            // repeated literal path rather than reopening it. `source_paths`
-            // mirrors that cache for the secondary sources opened here (the
-            // primary's own aliases are already handled by the check above).
-            let mut source_paths: Vec<PathBuf> = Vec::new();
-            let mut source_passwords: Vec<Vec<u8>> = Vec::new();
-            let mut specs = Vec::with_capacity(configuration.page_specs.len());
-            for page in &configuration.page_specs {
-                let source_index = if page.path == Path::new(".")
-                    || self.configuration.input_file.as_deref() == Some(page.path.as_path())
-                {
-                    0
-                } else if let Some(index) = source_paths.iter().position(|path| *path == page.path)
-                {
-                    index + 1
-                } else {
-                    source_paths.push(page.path.clone());
-                    source_passwords.push(page.password.clone());
-                    source_paths.len()
-                };
-                specs.push(PageSpecInput::new(source_index, page.range.clone()));
-            }
-            let keep_files_open = self.keep_files_open_for_page_specs(&specs);
-            self.report_page_spec_selection(&specs)?;
-            for (path, password) in source_paths.iter().zip(source_passwords.iter()) {
-                self.report_page_source_processing(path_description_bytes(path))?;
-                let source = self.open_job_source(path, password)?;
-                self.record_document_warnings(&source);
-                if !keep_files_open {
-                    // qpdf calls ClosedFileInputSource::stayOpen(false)
-                    // immediately after processInputSource, before opening
-                    // the next distinct page source (`QPDFJob.cc:2414-2432`).
-                    source.set_input_source_stay_open(false);
-                }
-                page_sources.push(source);
-            }
-            let page_output = self.handle_page_specs(
-                &mut page_sources,
-                &specs,
-                configuration.collate.as_deref(),
-                configuration.remove_unreferenced_resources,
-                configuration.writer.preserves_unreferenced_objects(),
-            )?; // cov:ignore: llvm-cov attributes this successful page merge continuation to its opening call lines
-            match page_output {
-                PageSpecJobOutput::InPlace {
-                    pdf,
-                    result,
-                    prune_mode,
-                } => {
-                    QPDFJob::complete_in_place_page_selection(pdf, &result, prune_mode)?;
-                    self.apply_configured_rotations(pdf, configuration)?;
-                    self.run_document_stages(pdf, configuration)
-                }
-                PageSpecJobOutput::Merged(mut merged) => {
-                    self.apply_configured_rotations(&mut merged, configuration)?;
-                    let status = self.run_document_stages(&mut merged, configuration);
-                    // `merged` may retain provider-backed objects from
-                    // page_sources; both are deliberately alive until every
-                    // output byte is written.
-                    drop(merged);
-                    status
-                }
-            }
-        }
+        Ok(self.get_exit_code())
     }
 
     fn apply_configured_rotations<R>(
@@ -2976,11 +3058,11 @@ impl QPDFJob {
         Ok(())
     }
 
-    fn run_document_stages<R>(
+    fn prepare_document_transformations<R>(
         &mut self,
         pdf: &mut Pdf<R>,
         configuration: &JobConfiguration,
-    ) -> Result<JobExitCode>
+    ) -> Result<()>
     where
         R: Read + Seek + 'static,
     {
@@ -3002,6 +3084,7 @@ impl QPDFJob {
             });
         }
         apply_overlay_specs(pdf, &mut overlay_specs)?;
+        self.overlay_sources = overlay_specs;
 
         // qpdf's `handleTransformations` applies `removeRestrictions` after
         // underlay/overlay handling and delegates the mutation to
@@ -3125,42 +3208,14 @@ impl QPDFJob {
             job.open_job_source(&option.path, &option.password)
         })?;
 
-        if configuration.check
-            || configuration.show_npages
-            || configuration.show_pages
-            || configuration.show_encryption
-            || configuration.check_linearization
-            || configuration.show_xref
-            || configuration.show_linearization
-            || configuration.show_object.is_some()
-            || configuration.list_attachments
-            || configuration.show_attachment.is_some()
-        {
-            let status = self.run_configured_inspection(pdf, configuration)?;
-            drop(overlay_specs);
-            return Ok(status);
-        }
-        if configuration.json_version.is_some() {
-            return self.write_configured_json(pdf, configuration);
-        }
-        if configuration.check
-            || (configuration.output_file.is_none() && !configuration.replace_input)
-        {
-            let check_result = self.check(pdf);
-            let status = self.map_check_result(check_result);
-            drop(overlay_specs);
-            return status;
-        }
-        let status = self.write_qpdf(pdf);
-        drop(overlay_specs);
-        status
+        Ok(())
     }
 
     fn run_configured_inspection<R>(
         &mut self,
         pdf: &mut Pdf<R>,
         configuration: &JobConfiguration,
-    ) -> Result<JobExitCode>
+    ) -> Result<()>
     where
         R: Read + Seek + 'static,
     {
@@ -3172,7 +3227,12 @@ impl QPDFJob {
         pdf.set_logger(self.logger.clone());
         if configuration.check {
             if let Err(error) = self.run_check_report(pdf) {
-                return self.map_check_result(Err(error));
+                return match error {
+                    super::check::CheckError::ErrorsDetected => {
+                        Err(Error::Unsupported("errors detected".to_owned()))
+                    }
+                    super::check::CheckError::Operation(error) => Err(error),
+                };
             }
         }
         if configuration.show_npages {
@@ -3231,8 +3291,7 @@ impl QPDFJob {
         {
             self.show_attachment_report(pdf, key)?;
         }
-        self.drain_document_warnings(pdf);
-        self.complete(false)
+        Ok(())
     }
 
     /// Run qpdf's standalone `--show-linearization` inspection on an already
@@ -3246,7 +3305,8 @@ impl QPDFJob {
     pub fn show_linearization<R: Read + Seek>(&mut self, pdf: &mut Pdf<R>) -> Result<JobExitCode> {
         self.show_linearization_report(pdf)?;
         self.drain_document_warnings(pdf);
-        self.complete(false)
+        self.complete(false)?;
+        Ok(self.get_exit_code())
     }
 
     fn show_linearization_report<R: Read + Seek>(&mut self, pdf: &mut Pdf<R>) -> Result<()> {
@@ -3305,7 +3365,7 @@ impl QPDFJob {
         &mut self,
         pdf: &mut Pdf<R>,
         configuration: &JobConfiguration,
-    ) -> Result<JobExitCode>
+    ) -> Result<()>
     where
         R: Read + Seek + 'static,
     {
@@ -3327,7 +3387,7 @@ impl QPDFJob {
             let mut file = File::create(path)
                 .map_err(|error| Error::file_io("open JSON output", path.to_path_buf(), error))?;
             return self
-                .write_json_with_version(
+                .write_json_without_completion(
                     pdf,
                     version,
                     configuration.test_json_schema,
@@ -3344,7 +3404,7 @@ impl QPDFJob {
 
         self.logger.save_to_standard_output(true)?;
         let mut output = JobOutputWriter(self.logger.get_save()?);
-        self.write_json_with_version(
+        self.write_json_without_completion(
             pdf,
             version,
             configuration.test_json_schema,
@@ -3445,20 +3505,6 @@ impl QPDFJob {
             // cov:ignore-end
         }
         Ok(())
-    }
-
-    fn map_check_result(
-        &self,
-        result: std::result::Result<JobExitCode, super::check::CheckError>,
-    ) -> Result<JobExitCode> {
-        match result {
-            Ok(status) => Ok(status),
-            Err(super::check::CheckError::ErrorsDetected) => Ok(JobExitCode::Error),
-            Err(super::check::CheckError::Operation(error)) => {
-                self.report_job_error(&error)?;
-                Ok(JobExitCode::Error)
-            }
-        }
     }
 
     /// Apply qpdf's pre-open output destination and file-identity checks.
@@ -3827,7 +3873,8 @@ impl QPDFJob {
         pdf.set_logger(self.logger.clone());
         inspection(pdf)?;
         self.drain_document_warnings(pdf);
-        Ok(self.complete(false)?)
+        self.complete(false)?;
+        Ok(self.get_exit_code())
     }
 
     /// Serialize one already-created document and then complete the shared
@@ -3867,6 +3914,37 @@ impl QPDFJob {
         R: Read + Seek,
     {
         let creates_output = matches!(&output, JsonJobOutput::File { .. });
+        self.write_json_without_completion(
+            pdf,
+            version,
+            test_json_schema,
+            json_output,
+            show_encryption_key,
+            options,
+            output,
+        )?;
+        self.drain_document_warnings(pdf);
+        self.complete(creates_output)?;
+        Ok(self.get_exit_code())
+    }
+
+    /// Serialize JSON without draining warnings or emitting the enclosing
+    /// job's completion summary. `writeQPDF` uses this report-independent
+    /// operation body before its single shared completion boundary.
+    #[allow(clippy::too_many_arguments)]
+    fn write_json_without_completion<R>(
+        &mut self,
+        pdf: &mut Pdf<R>,
+        version: i32,
+        test_json_schema: bool,
+        json_output: bool,
+        show_encryption_key: bool,
+        options: JsonJobOptions<'_>,
+        output: JsonJobOutput<'_>,
+    ) -> std::result::Result<(), JsonJobError>
+    where
+        R: Read + Seek,
+    {
         pdf.set_logger(self.logger.clone());
         super::json::write_json_with_version_with_logger(
             pdf,
@@ -3878,8 +3956,7 @@ impl QPDFJob {
             output,
             &self.logger,
         )?;
-        self.drain_document_warnings(pdf);
-        Ok(self.complete(creates_output)?)
+        Ok(())
     }
 
     /// Record that a stage observed one or more qpdf warnings.
@@ -3934,13 +4011,44 @@ impl QPDFJob {
         self.warnings_exit_zero = value;
     }
 
+    /// Return qpdf's status for the current job state without logging or
+    /// draining any document warnings.
+    ///
+    /// This is the side-effect-free `QPDFJob::getExitCode` query
+    /// (`libqpdf/QPDFJob.cc:535-564`). Encryption-status jobs take precedence
+    /// over ordinary warning status, exactly as qpdf does.
+    #[must_use]
+    pub fn get_exit_code(&self) -> JobExitCode {
+        if self.configuration.is_encrypted {
+            return if self.encryption_status.encrypted {
+                JobExitCode::Success
+            } else {
+                JobExitCode::Error
+            };
+        }
+        if self.configuration.requires_password {
+            return if !self.encryption_status.encrypted {
+                JobExitCode::Error
+            } else if self.encryption_status.password_incorrect {
+                JobExitCode::Success
+            } else {
+                JobExitCode::Warning
+            };
+        }
+        if self.warnings && !self.warnings_exit_zero {
+            JobExitCode::Warning
+        } else {
+            JobExitCode::Success
+        }
+    }
+
     /// Complete the shared warning boundary after output or inspection.
     ///
-    /// This mirrors `QPDFJob::writeQPDF` and `getExitCode`: all operation
-    /// output must be completed by the caller before this method is invoked;
-    /// this method emits at most the one qpdf-shaped summary and returns the
-    /// corresponding status (`QPDFJob.cc:484-563`).
-    pub fn complete(&self, creates_output: bool) -> Result<JobExitCode> {
+    /// All operation output must be completed by the caller before this
+    /// method is invoked. It emits at most the one qpdf-shaped summary; status
+    /// is queried separately through [`Self::get_exit_code`]
+    /// (`QPDFJob.cc:484-563`).
+    pub fn complete(&self, creates_output: bool) -> Result<()> {
         if self.warnings && !self.suppress_warnings {
             let suffix = if creates_output {
                 "; resulting file may have some problems"
@@ -3953,11 +4061,7 @@ impl QPDFJob {
             ))?;
         }
 
-        if self.warnings && !self.warnings_exit_zero {
-            Ok(JobExitCode::Warning)
-        } else {
-            Ok(JobExitCode::Success)
-        }
+        Ok(())
     }
 }
 
@@ -4282,27 +4386,6 @@ mod tests {
     }
 
     #[test]
-    fn check_result_mapping_preserves_success_and_maps_both_errors() {
-        let job = QPDFJob::new();
-        assert_eq!(
-            job.map_check_result(Ok(JobExitCode::Success)).unwrap(),
-            JobExitCode::Success
-        );
-        assert_eq!(
-            job.map_check_result(Err(super::super::check::CheckError::ErrorsDetected))
-                .unwrap(),
-            JobExitCode::Error
-        );
-        assert_eq!(
-            job.map_check_result(Err(super::super::check::CheckError::Operation(
-                Error::Internal("operation failed".to_owned()),
-            )))
-            .unwrap(),
-            JobExitCode::Error
-        );
-    }
-
-    #[test]
     fn show_linearization_mapping_preserves_core_errors() {
         let error =
             ShowLinearizationError::Io(Box::new(Error::System("sink write failure 1".to_owned())));
@@ -4375,10 +4458,8 @@ mod tests {
             ));
 
         let mut input = input;
-        assert_eq!(
-            job.write_qpdf(&mut input).expect("job write succeeds"),
-            JobExitCode::Success
-        );
+        job.write_qpdf(&mut input).expect("job write succeeds");
+        assert_eq!(job.get_exit_code(), JobExitCode::Success);
         assert!(output.is_file());
         assert!(
             bytes.lock().unwrap().windows(
@@ -4422,10 +4503,8 @@ mod tests {
                 "café".as_bytes().to_vec(),
             ));
 
-        assert_eq!(
-            job.write_qpdf(&mut input).expect("job write succeeds"),
-            JobExitCode::Success
-        );
+        job.write_qpdf(&mut input).expect("job write succeeds");
+        assert_eq!(job.get_exit_code(), JobExitCode::Success);
         let output = bytes.lock().unwrap();
         let warning = b"qpdf: WARNING: supplied password looks like a Unicode password with characters not allowed in passwords for 40-bit and 128-bit encryption; most readers will not be able to open this file with the supplied password. (Use --password-mode=bytes to suppress this warning and use the password anyway.)\n";
         let info = b"qpdf: automatically converting Unicode password to single-byte encoding as required for 40-bit or 128-bit encryption\n";
@@ -4507,11 +4586,10 @@ mod tests {
                 b"owner".to_vec(),
             ));
 
-        assert_eq!(
-            job.write_qpdf(&mut input)
-                .expect("writer preflight error must be reported as a job error"),
-            JobExitCode::Error
-        );
+        let error = job
+            .write_qpdf(&mut input)
+            .expect_err("writer preflight error must be returned to the caller");
+        assert!(!error.to_string().is_empty());
         let error = String::from_utf8_lossy(&errors.lock().unwrap()).into_owned();
         assert!(
             error.contains("deterministic") && !error.contains("called setSave"),
@@ -4546,11 +4624,10 @@ mod tests {
         job.set_logger(logger);
         job.set_output_file("-").expect("stdout output is accepted");
 
-        assert_eq!(
-            job.write_qpdf(&mut input)
-                .expect("stdout reservation failure is a job error"),
-            JobExitCode::Error
-        );
+        let error = job
+            .write_qpdf(&mut input)
+            .expect_err("stdout reservation failure must be returned to the caller");
+        assert!(!error.to_string().is_empty());
         let error = String::from_utf8_lossy(&errors.lock().unwrap()).into_owned();
         assert!(
             error.contains(
