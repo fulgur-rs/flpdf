@@ -1196,9 +1196,15 @@ code）は変換結果を反映する。実測でも
 `qpdf --show-npages --optimize-images qtest/qpdf/bad-data.pdf` は変換由来の
 warning を出して exit 3 になる（変換なしなら exit 0）。
 
-flpdf は現時点で **受理はするが image option を inspection route へ渡さない**
-（accept-and-drop）。dispatch の `run_check` / `run_show_*` は image option 引数を
-そもそも受け取らない。この差は `flpdf-w2fk` で追跡する。
+`flpdf-w2fk` で、top-level の inspection route（`run_check` / `run_show_*` /
+`--json` 経路）へ image option を配線し、report の前に変換を実行するようにした。
+ただし `--show-encryption` は例外で、認証に失敗した入力では変換を行わない —
+qpdf の password-error catch は `createQPDF` から `return nullptr` するため
+`handleTransformations`（`QPDFJob.cc:473`）に到達しない（`:437-448`）。
+
+attachment 系フラグ（`--list-attachments` / `--show-attachment` /
+`--remove-attachment` / `--add-attachment` / `--copy-attachments-from`）との
+併用は qpdf が受理するが flpdf はまだ拒否しており、`flpdf-wz4i` で追跡する。
 
 top-level `--flatten-annotations=all|screen|print` も `auto_job_init.hh:117` / `QPDFJob_config.cc:190-200` の choices を `flpdf-cli` の shared `run_rewrite` route に接続し、通常 rewrite と linearize rewrite の両方で `PageDocumentHelper::flatten_annotations` (`QPDFPageDocumentHelper.cc:55-77`) を実行する。`NeedAppearances` 時の `warnIfPossible` と stream filter warning の parsed-offset/suppression 境界も qpdf の warning/status contract に合わせる。
 

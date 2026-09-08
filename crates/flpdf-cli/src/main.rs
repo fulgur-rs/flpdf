@@ -1192,11 +1192,14 @@ struct Cli {
     /// like qpdf, which rejects neither combination. qpdf still performs the
     /// image transformation for them -- `createQPDF` runs
     /// `handleTransformations` before `writeQPDF` picks the inspection branch
-    /// (`QPDFJob.cc:474,484-491`) -- so its inspection output reflects the
+    /// (`QPDFJob.cc:473,484-491`) -- so its inspection output reflects the
     /// transformed document. The top-level inspection routes thread the same
-    /// image options through their open/transform boundary. Attachment
-    /// mutation modes remain conflicts because those dispatch branches do not
-    /// consume the image options.
+    /// image options through their open/transform boundary. The attachment flags
+    /// remain conflicts here: qpdf accepts them alongside the image options --
+    /// `--list-attachments` and `--show-attachment` are inspection modes it
+    /// dispatches from `doInspection` (`QPDFJob.cc:1684-1689`), and the
+    /// mutating ones run in the same create stage -- but flpdf's dispatch
+    /// branches do not consume the image options yet (`flpdf-wz4i`).
     /// `--pages`/`--rotate`/`--split-pages`/`--empty`/`--json`/
     /// `--json-output` are intentionally absent: all of those routes are
     /// already threaded through (see `top_level_image_options` at each call
@@ -1213,7 +1216,7 @@ struct Cli {
     /// externalizes first and then optimizes reachable Image XObjects.
     /// Inspection modes may be combined with this flag like qpdf. As with
     /// `--optimize-images`, the top-level inspection routes run the
-    /// transformation before their report (`QPDFJob.cc:474,2151-2156`).
+    /// transformation before their report (`QPDFJob.cc:473,2151-2156`).
     #[arg(long = "externalize-inline-images",
           conflicts_with_all = [
               "list_attachments", "show_attachment", "remove_attachment",
@@ -8045,7 +8048,15 @@ fn run_show_encryption(
             options,
         )
         .map_err(|error| error_with_file(&input, actionable_password_error(error)))?;
-    apply_image_transformations(&mut pdf, image_options, verbose)?;
+    // qpdf's password-error catch returns from `createQPDF` before it reaches
+    // `handleTransformations` (`QPDFJob.cc:437-448,473`), so `--show-encryption`
+    // on a file whose password did not authenticate prints the report and stops
+    // -- it never walks the still-encrypted streams. Running the image phase
+    // here instead would raise decode warnings qpdf does not raise and turn the
+    // exit status into 3.
+    if !(pdf.is_encrypted() && pdf.encryption_file_key().is_none()) {
+        apply_image_transformations(&mut pdf, image_options, verbose)?;
+    }
     finish_show_encryption(&mut job, &mut pdf, password.password_is_hex_key)
 }
 

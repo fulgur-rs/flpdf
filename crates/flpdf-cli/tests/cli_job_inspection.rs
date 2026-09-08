@@ -145,7 +145,16 @@ fn damaged_content_pdf() -> Vec<u8> {
         ),
         (
             4,
-            stream_object(b"<< /Length 1 /Filter /LZWDecode >>", &[0xff]),
+            // Flate-compressed bytes mislabelled as LZW, the shape qpdf's own
+            // `qtest/qpdf/bad-data.pdf` uses. A single 0xff decodes cleanly
+            // enough that qpdf raises no warning at all, so it cannot tell an
+            // applied transformation from a dropped one.
+            stream_object(
+                b"<< /Length 48 /Filter /LZWDecode >>",
+                b"\x78\x9c\x73\x0a\xe1\x52\x50\xd0\x77\x33\x54\x30\x32\x51\x08\x49\
+                  \x03\xb2\xcd\x8d\x80\xc8\x40\x21\x24\x05\xc8\xd6\x08\xc8\x2f\x49\
+                  \x2c\xc9\xd7\x54\x08\xc9\xe2\x72\x0d\xe1\x02\x00\xcb\x01\x09\xc8",
+            ),
         ),
     ])
 }
