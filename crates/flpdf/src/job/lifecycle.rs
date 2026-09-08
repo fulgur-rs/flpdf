@@ -4674,6 +4674,7 @@ fn parse_object_stream_mode(value: &str) -> Result<ObjectStreamMode> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::job::overlay::OverlayVerboseSource;
     use crate::{Error, ObjectHandle, PdfOpenOptions};
     use std::io::Cursor;
 
@@ -4683,6 +4684,57 @@ mod tests {
         job.config().verbose();
 
         assert!(job.verbose());
+    }
+
+    #[test]
+    fn config_writer_configuration_reaches_the_job_writer() {
+        let tempdir = tempfile::tempdir().expect("temporary output directory");
+        let output = tempdir.path().join("static-id.pdf");
+        let mut pdf = Pdf::open(Cursor::new(
+            std::fs::read(
+                std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+                    .join("../../tests/fixtures/compat/one-page.pdf"),
+            )
+            .expect("committed one-page fixture"),
+        ))
+        .expect("one-page fixture parses");
+        let mut job = QPDFJob::new();
+        job.set_output_file(&output)
+            .expect("output path is accepted");
+        let mut writer = WriterConfiguration::default();
+        writer.set_static_id(true);
+        job.config().writer_configuration(writer);
+
+        job.write_qpdf(&mut pdf).expect("job write succeeds");
+        let bytes = std::fs::read(&output).expect("static-id output exists");
+        assert!(
+            bytes
+                .windows(b"<31415926535897932384626433832795>".len())
+                .any(|window| window == b"<31415926535897932384626433832795>"),
+            "writer configuration must reach the canonical writer"
+        );
+    }
+
+    #[test]
+    fn overlay_verbose_progress_rejects_an_invalid_source_index() {
+        let job = QPDFJob::new();
+        let report = [OverlayVerbosePage {
+            dest_page: 1,
+            sources: vec![OverlayVerboseSource {
+                spec_index: 0,
+                kind: OverlayKind::Overlay,
+                src_page: 1,
+            }],
+        }];
+        let configuration = job.configuration.clone();
+
+        let error = job
+            .report_overlay_progress(&report, &configuration)
+            .expect_err("an unpaired verbose source must be rejected");
+        assert!(matches!(
+            error,
+            Error::Internal(message) if message == "overlay verbose source index out of range"
+        ));
     }
 
     /// `QPDF::emptyPDF` is a document factory that leaves the job
