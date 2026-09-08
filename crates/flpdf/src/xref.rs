@@ -2276,12 +2276,8 @@ fn parse_xref_from_start_with_owner_and_build_diagnostics(
         .is_some_and(|tail| tail.starts_with(b"xref"))
     {
         let mut cursor = ByteCursor::new(bytes, xref_pos + 4);
-        let (entries, trailer_start, table_diagnostics, first_xref_item_offset) = parse_xref_table(
-            &mut cursor,
-            bytes,
-            error_diagnostics_sink.as_deref_mut(),
-            first_xref_item_offset_sink,
-        )?;
+        let (entries, trailer_start, table_diagnostics, first_xref_item_offset) =
+            parse_xref_table(&mut cursor, bytes, first_xref_item_offset_sink)?;
         let mut deferred_free = Vec::new();
         for entry in entries {
             match entry {
@@ -4262,7 +4258,6 @@ fn scan_object_header_after_first_token(
 fn parse_xref_table(
     cursor: &mut ByteCursor<'_>,
     bytes: &[u8],
-    _error_diagnostics_sink: Option<&mut Diagnostics>,
     mut first_xref_item_offset_sink: Option<&mut Option<u64>>,
 ) -> Result<(Vec<ParsedXrefEntry>, usize, Vec<QpdfExc>, u64)> {
     let mut entries = Vec::new();
@@ -4340,7 +4335,6 @@ fn parse_xref_stream(
             version,
             options,
             registration,
-            error_diagnostics_sink,
             owner,
         );
     }
@@ -4663,7 +4657,6 @@ fn parse_xref_stream_with_canonical_owner(
     version: String,
     options: XrefLoadOptions,
     registration: &mut XrefRegistration,
-    _error_diagnostics_sink: Option<&mut Diagnostics>,
     owner: &dyn CanonicalTrailerOwner,
 ) -> Result<LoadedXrefState> {
     owner.install_xref_entries(registration.snapshot());
@@ -7725,7 +7718,6 @@ mod final_handle_tests {
                 ..XrefLoadOptions::default()
             },
             &mut registration,
-            None,
             resolver.as_ref(),
         )
         .expect("a recovered canonical xref stream should still parse its one free entry");
@@ -7809,14 +7801,12 @@ mod final_handle_tests {
                 .read_object_at_offset(0, ObjectRef::new(1, 0), None)
                 .is_err());
             let mut registration = XrefRegistration::default();
-            let mut sink = Diagnostics::default();
             let error = parse_xref_stream_with_canonical_owner(
                 0,
                 0,
                 "1.4".to_owned(),
                 XrefLoadOptions::default(),
                 &mut registration,
-                Some(&mut sink),
                 &owner,
             )
             .expect_err("synthetic owner read must fail");
@@ -7828,14 +7818,11 @@ mod final_handle_tests {
                     Error::Parse { message, .. } if message == "xref not found"
                 ));
             }
-            // The warning stays on the owner rather than being copied into the
-            // loader's sink: for a real document `push_qpdf_warning` both logs
-            // it and records it, and `engine.rs` installs this sink onto that
-            // same document afterwards, so copying would deliver one repair
-            // twice — qpdf delivers it once, reconstructing at most once per
-            // document (`libqpdf/QPDF.cc:518-522`).
+            // The warning stays on the owner: for a real document
+            // `push_qpdf_warning` both logs it and records it, and `engine.rs`
+            // installs the owner sink onto that same document. This delivers
+            // one repair warning, matching qpdf (`QPDF.cc:518-522`).
             assert_eq!(owner.repair_diagnostics().entries().len(), 1);
-            assert_eq!(sink.entries().len(), 0);
         }
     }
 
@@ -7847,14 +7834,12 @@ mod final_handle_tests {
         bytes.extend_from_slice(b"\nendstream\nendobj\n%tail\n");
         let resolver = canonical_test_resolver(bytes, BTreeMap::new(), false, 7);
         let mut registration = XrefRegistration::default();
-        let mut sink = Diagnostics::default();
         let error = parse_xref_stream_with_canonical_owner(
             0,
             0,
             "1.4".to_owned(),
             XrefLoadOptions::default(),
             &mut registration,
-            Some(&mut sink),
             resolver.as_ref(),
         )
         .expect_err("an unknown xref entry type must fail the canonical build");
@@ -7863,7 +7848,6 @@ mod final_handle_tests {
             error,
             Error::Parse { message, .. } if message == "unknown xref stream entry type 9"
         ));
-        assert!(sink.is_empty());
         let owner_diagnostics = resolver.repair_diagnostics();
         assert_eq!(owner_diagnostics.entries().len(), 1);
         assert!(owner_diagnostics.entries()[0]
