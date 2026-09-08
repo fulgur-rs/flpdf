@@ -358,6 +358,11 @@ impl WriterConfiguration {
         self.settings.copy_encryption = None;
     }
 
+    /// The configured explicit output encryption parameters, if any.
+    pub(crate) fn encryption_parameters(&self) -> Option<&EncryptParams> {
+        self.settings.encryption_parameters.as_ref()
+    }
+
     /// Apply qpdf's `QPDFJob::maybeFixWritePassword` policy to configured
     /// encryption passwords before a writer emits its encryption dictionary.
     ///

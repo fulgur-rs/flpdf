@@ -377,6 +377,29 @@ fn writer_configuration(
     linearize: bool,
     linearize_pass1: Option<&Path>,
 ) -> CliResult<WriterConfiguration> {
+    let mut configuration = writer_configuration_unnormalized(options, linearize, linearize_pass1)?;
+    normalize_and_check_writer_configuration(&mut configuration, options)?;
+    Ok(configuration)
+}
+
+/// Builds a [`WriterConfiguration`] without normalizing encryption passwords
+/// or checking for weak crypto (qpdf's `maybeFixWritePassword` and the
+/// weak-crypto refusal that follows it in `QPDFJob::setEncryptionOptions`,
+/// `QPDFJob.cc:2655-2723,2748-2761`).
+///
+/// Callers that pass the result to [`QPDFJob::write_qpdf`] must use this
+/// instead of [`writer_configuration`]: `write_qpdf`'s own write stage
+/// already performs qpdf's write-time password normalization, notice
+/// emission, and weak-crypto refusal in that order (mirroring
+/// `setEncryptionOptions`), so calling both would normalize the same
+/// password bytes twice — the second pass would reject the already-
+/// transcoded bytes from the first as invalid UTF-8 — and would also check
+/// weak crypto before normalization instead of after.
+fn writer_configuration_unnormalized(
+    options: &WriterOptions,
+    linearize: bool,
+    linearize_pass1: Option<&Path>,
+) -> CliResult<WriterConfiguration> {
     let mut configuration = WriterConfiguration::default();
     configuration.set_object_stream_mode(options.object_streams);
     if let Some(mode) = options.stream_data {
@@ -426,6 +449,19 @@ fn writer_configuration(
     if let Some(source) = options.copy_encryption.clone() {
         configuration.copy_encryption_parameters(source);
     }
+    Ok(configuration)
+}
+
+/// Normalizes encryption passwords and enforces the weak-crypto refusal on
+/// an already-built [`WriterConfiguration`], in qpdf's order (`maybeFixWritePassword`
+/// then the RC4 refusal, `QPDFJob::setEncryptionOptions`, `QPDFJob.cc:2748-2761`).
+///
+/// Only for callers that write through a bare [`PdfWriter`] rather than
+/// [`QPDFJob::write_qpdf`]; the latter performs this same sequence itself.
+fn normalize_and_check_writer_configuration(
+    configuration: &mut WriterConfiguration,
+    options: &WriterOptions,
+) -> CliResult<()> {
     let notices = configuration.normalize_encryption_passwords(options.password_mode)?;
     let prefix = progname();
     emit_password_write_notices(&cli_logger(), &prefix, notices, options.verbose)?;
@@ -444,7 +480,7 @@ fn writer_configuration(
         ));
         return Err("refusing to write a file with weak crypto".into());
     }
-    Ok(configuration)
+    Ok(())
 }
 
 /// Emit qpdf's per-password write diagnostics in the order returned by
@@ -5283,6 +5319,7 @@ fn configure_rewrite_job(
     job.set_password_mode(password.password_mode.into());
     job.set_password_is_hex_key(password.password_is_hex_key);
     job.set_suppress_password_recovery(password.suppress_password_recovery);
+    job.set_allow_weak_crypto(options.allow_weak_crypto);
     job.set_verbose(verbose);
     job.set_progress(options.progress);
     job.set_linearization(linearize, linearize_pass1.map(Path::to_path_buf));
@@ -5424,12 +5461,14 @@ fn run_rewrite_opened<R: Read + Seek + 'static>(
     // qpdf builds the writer only inside writeQPDF -> writeOutfile ->
     // setWriterOptions (`QPDFJob.cc:484-495,2752-2761`), so its write-time
     // validation - the auto-password notices and the RC4 refusal - runs after
-    // the create stage, never before it.
+    // the create stage, never before it. write_qpdf's own write stage
+    // performs that validation, so this configuration must stay unnormalized
+    // here or the password bytes get normalized twice.
     let mut writer_options = job_options;
     if _decrypt {
         writer_options.preserve_encryption = false;
     }
-    job.set_writer_configuration(writer_configuration(
+    job.set_writer_configuration(writer_configuration_unnormalized(
         &writer_options,
         linearize,
         linearize_pass1,

@@ -169,6 +169,56 @@ fn top_level_encrypt_unicode_mode_rejects_invalid_utf8_password() {
 }
 
 #[test]
+fn top_level_encrypt_unicode_mode_round_trips_transcodable_non_ascii_password() {
+    // Regression test for the CLI's ordinary/rewrite write path
+    // double-normalizing encryption passwords: `main.rs`'s
+    // `writer_configuration` helper transcoded "café" to single-byte PDFDoc
+    // bytes once, then `QPDFJob::write_qpdf`'s own write stage transcoded
+    // the (already single-byte, non-UTF-8) result a second time and
+    // rejected it as invalid UTF-8, so `--encrypt` failed for any password
+    // requiring real transcoding (an all-ASCII password never exercised the
+    // bug, since transcoding is then a no-op and idempotent). Verified
+    // byte-identical against `qpdf --password-mode=unicode
+    // --allow-weak-crypto --encrypt café owner 128` (qpdf 11.9.0).
+    let temp = tempfile::tempdir().unwrap();
+    let input = Path::new(env!("CARGO_MANIFEST_DIR")).join("../../tests/fixtures/minimal.pdf");
+    let output = temp.path().join("encrypted.pdf");
+
+    Command::cargo_bin("flpdf")
+        .unwrap()
+        .args([
+            "--password-mode=unicode",
+            "--allow-weak-crypto",
+            "--encrypt",
+            "café",
+            "owner",
+            "128",
+            "--",
+        ])
+        .arg(&input)
+        .arg(&output)
+        .assert()
+        .success()
+        .stderr("");
+
+    let show = Command::cargo_bin("flpdf")
+        .unwrap()
+        .args([
+            "--show-encryption",
+            "--verbose",
+            "--password=café",
+            "--password-mode=unicode",
+        ])
+        .arg(&output)
+        .output()
+        .unwrap();
+
+    assert_eq!(show.status.code(), Some(0));
+    let stdout = String::from_utf8_lossy(&show.stdout);
+    assert!(stdout.contains("Supplied password is user password"));
+}
+
+#[test]
 fn auto_password_warning_precedes_weak_crypto_refusal() {
     let temp = tempfile::tempdir().unwrap();
     let input = Path::new(env!("CARGO_MANIFEST_DIR")).join("../../tests/fixtures/minimal.pdf");

@@ -1651,6 +1651,12 @@ impl QPDFJob {
         self.configuration.suppress_password_recovery = value;
     }
 
+    /// Set qpdf's `--allow-weak-crypto` policy for the write-time RC4
+    /// refusal check (`QPDFJob::setEncryptionOptions`, `QPDFJob.cc:2752-2761`).
+    pub fn set_allow_weak_crypto(&mut self, value: bool) {
+        self.configuration.allow_weak_crypto = value;
+    }
+
     /// Configure qpdf's linearization writer mode and optional pass-one file.
     pub fn set_linearization(&mut self, value: bool, pass1: Option<PathBuf>) {
         self.configuration.linearize = value;
@@ -3085,6 +3091,20 @@ impl QPDFJob {
                 crate::encryption::PasswordWriteNotice::None
                 | crate::encryption::PasswordWriteNotice::Info => {}
             }
+        }
+        if !self.configuration.allow_weak_crypto
+            && writer_configuration
+                .encryption_parameters()
+                .is_some_and(EncryptParams::is_weak_rc4)
+        {
+            let message = format!(
+                "{}: refusing to write a file with RC4, a weak cryptographic algorithm\nPlease use 256-bit keys for better security.\nPass --allow-weak-crypto to enable writing insecure files.\nSee also https://qpdf.readthedocs.io/en/stable/weak-crypto.html\n",
+                self.message_prefix
+            );
+            self.logger.error(message)?;
+            let error = Error::System("refusing to write a file with weak crypto".to_string());
+            self.report_job_error(&error)?;
+            return Err(error);
         }
         writer_configuration.set_linearization(self.configuration.linearize);
         if let Some(path) = self.configuration.linearize_pass1.as_deref() {
