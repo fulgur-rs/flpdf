@@ -2371,6 +2371,50 @@ mod tests {
     }
 
     #[test]
+    fn document_check_reports_an_extension_level_failure_through_the_catch() {
+        // `getExtensionLevel` is the first statement inside qpdf's doCheck try
+        // block (`QPDFJob.cc:752-753`), so its failure takes the bare
+        // `ERROR: what()` catch line (`:788-791`) and the single trailing
+        // `errors detected` (`:792-794`). The fixture keeps `/Extensions`
+        // indirect so the walk still has to reach the reader after the
+        // Catalog itself has resolved.
+        let failure = Arc::new(AtomicBool::new(false));
+        let mut pdf = Pdf::open(ToggleReader {
+            reader: Cursor::new(
+                include_bytes!(concat!(
+                    env!("CARGO_MANIFEST_DIR"),
+                    "/../../tests/fixtures/compat/one-page-ext-indirect.pdf"
+                ))
+                .to_vec(),
+            ),
+            fail: Arc::clone(&failure),
+        })
+        .expect("indirect-extensions fixture should open");
+        pdf.root_handle()
+            .expect("Catalog should resolve before failure");
+        failure.store(true, Ordering::Relaxed);
+
+        let output = Arc::new(Mutex::new(Vec::new()));
+        let logger = logger_with_capture(Arc::clone(&output));
+        let result = check_document(&mut pdf, &logger, "qpdf", "extension-failure.pdf");
+
+        assert!(matches!(result, Err(CheckError::ErrorsDetected)));
+        let output = String::from_utf8(output.lock().expect("capture output").clone()).unwrap();
+        assert!(
+            output.contains("ERROR: I/O error: test reader failure"),
+            "in-try extension-level failure uses qpdf's catch framing: {output:?}"
+        );
+        assert!(
+            output.contains("qpdf: errors detected"),
+            "qpdf ends the check with one errors-detected line: {output:?}"
+        );
+        assert!(
+            !output.contains("extension-failure.pdf: I/O error:"),
+            "the pre-try wrapper must not appear for an in-try failure: {output:?}"
+        );
+    }
+
+    #[test]
     fn document_check_reports_a_linearization_probe_operation_failure() {
         let failure = Arc::new(AtomicBool::new(false));
         let mut pdf = Pdf::open(ToggleReader {
