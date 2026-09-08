@@ -5256,25 +5256,46 @@ mod final_handle_tests {
         let nested = member
             .try_get_key(b"/Nested")
             .expect("nested direct value is present");
-        let nested_string = nested
-            .try_get_array_item(0)
-            .expect("nested array item is present")
-            .try_get_int_value()
-            .expect_err("a nested string must use the member warning context");
-        let nested_dictionary = nested
-            .try_get_array_item(1)
-            .expect("nested dictionary item is present")
-            .try_get_key(b"/Leaf")
-            .expect("nested dictionary leaf is present")
-            .try_get_int_value()
-            .expect_err("a nested dictionary leaf must use the member context");
-        for error in [nested_string, nested_dictionary] {
-            let message = error.to_string();
-            assert!(
-                message.contains("object 7 0") && message.contains("object stream 4"),
-                "nested warning lost the ObjStm member context: {message}"
-            );
-        }
+        // With the bootstrap document's warning sink in place
+        // (`flpdf-92r5`), a type mismatch behaves as qpdf does: the accessor
+        // warns and returns qpdf's fallback rather than failing
+        // (`QPDF_Stream::warn` -> `QPDF::warn`, which records without
+        // throwing, `libqpdf/QPDF_Stream.cc:695-698` and
+        // `libqpdf/QPDF.cc:487-494`). The member context therefore has to be
+        // checked on the recorded warnings, not on an error value.
+        assert_eq!(
+            nested
+                .try_get_array_item(0)
+                .expect("nested array item is present")
+                .try_get_int_value()
+                .expect("qpdf warns and falls back instead of failing"),
+            0
+        );
+        assert_eq!(
+            nested
+                .try_get_array_item(1)
+                .expect("nested dictionary item is present")
+                .try_get_key(b"/Leaf")
+                .expect("nested dictionary leaf is present")
+                .try_get_int_value()
+                .expect("qpdf warns and falls back instead of failing"),
+            0
+        );
+        let state = document.state.borrow();
+        let contextual = state
+            .diagnostics
+            .entries()
+            .iter()
+            .filter(|warning| {
+                let object = String::from_utf8_lossy(warning.get_object()).to_string();
+                object.contains("object 7 0") && object.contains("object stream 4")
+            })
+            .count();
+        assert!(
+            contextual >= 2,
+            "both nested values must warn with the ObjStm member context: {:?}",
+            state.diagnostics
+        );
     }
 
     fn bootstrap_objstm_document(
