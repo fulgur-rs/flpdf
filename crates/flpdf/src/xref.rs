@@ -3152,10 +3152,10 @@ fn recover_xref_from_linear_scan(
         canonical_trailer_owner,
     )
     .map_err(|error| {
-        // cov:ignore: this defensive wrapper is reached only when the line-scan parser fails after canonical warning delivery
+        // cov:ignore-start: defensive open-failure wrapper after a line-scan parser error; the live sink boundary is covered by Pdf open failure tests
         with_xref_open_diagnostics(error, repair_diagnostics.clone(), canonical_trailer_owner)
-        // cov:ignore: defensive terminal open-failure wrapper after a line-scan parser error
-    })?; // cov:ignore: the terminal open-failure wrapper is covered by recovery failure tests; this edge preserves the live owner collection
+        // cov:ignore-end
+    })?;
     let mut entries = recovered.entries;
     // qpdf removes only type-1 rows before its reconstruction scan
     // (`QPDF.cc:516-575`). A failed xref-stream insertion can leave a default
