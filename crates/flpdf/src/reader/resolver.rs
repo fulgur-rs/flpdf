@@ -1839,20 +1839,19 @@ impl<R: Read + Seek> ResolverHandle<R> {
                 // qpdf QPDF.cc:1622-1628: the retry call has try_recovery=false, so
                 // any parse failure propagates as an exception (Err here).
                 self.read_object_at_offset_with_description(
-                    new_offset,
-                    object_ref,
-                    true,
-                    false,
-                    None,
+                    new_offset, object_ref, true, false, None,
                 )
-                    .map(Some)
-                    .map_err(ReadObjectAtOffsetError::into_error)
+                .map(Some)
+                .map_err(ReadObjectAtOffsetError::into_error)
             }
-            Some(XrefEntry::Compressed { .. }) => Err(Error::Unsupported(format!(
-                "canonical resolver cannot yet resolve object {} {}: only uncompressed cross-reference entries are implemented",
-                object_ref.number, object_ref.generation
-            ))),
-            Some(XrefEntry::Free { .. }) | None => Ok(None),
+            // qpdf's retry condition is `getType() == 1` exactly
+            // (`QPDF.cc:1618`): a reconstructed entry of any other shape --
+            // compressed, free, or absent -- takes the same "not found"
+            // branch below, which warns and resolves to null without
+            // attempting `resolveObjectsInStream` (`QPDF.cc:1628-1633`).
+            // `readObjectAtOffset`'s retry only re-reads an uncompressed
+            // object at a new offset; it has no inline ObjStm decode path.
+            Some(XrefEntry::Compressed { .. } | XrefEntry::Free { .. }) | None => Ok(None),
         }
     }
 
@@ -5001,23 +5000,6 @@ impl<R: Read + Seek> ResolverHandle<R> {
                                 handle.set_resolved(ObjectValue::Null);
                                 Ok(())
                             }
-                            // cov:ignore-start: resolution-time reconstruct_xref records only type-1 entries; type-2 retry handoff belongs to xref-stream recovery before resolution
-                            Err(err) if matches!(&err, Error::Unsupported(_)) => {
-                                // Reconstruction can replace the
-                                // requested type-1 entry with a
-                                // type-2 entry. qpdf's retry then
-                                // enters `resolveObjectsInStream`
-                                // rather than treating the source
-                                // class as unsupported.
-                                if let Some(XrefEntry::Compressed { stream, .. }) =
-                                    self.xref_entry(object_ref)
-                                {
-                                    self.resolve_object_stream_or_null(stream, handle)
-                                } else {
-                                    Err(err)
-                                }
-                            }
-                            // cov:ignore-end
                             Err(err) => Err(err),
                         }
                     }
@@ -14079,6 +14061,33 @@ mod tests {
         assert!(
             matches!(res, Err(Error::FileIo { .. })),
             "non-parse error must propagate unchanged: {res:?}"
+        );
+    }
+
+    #[test]
+    fn reconstruct_xref_and_retry_treats_a_post_reconstruction_compressed_entry_as_not_found() {
+        // qpdf's readObjectAtOffset retry condition is `getType() == 1`
+        // exactly (QPDF.cc:1618): when the reconstructed table instead holds
+        // a compressed (type 2) entry for the requested objgen, qpdf takes
+        // the same "not found ... regenerating" warn-and-null branch it uses
+        // for a free or absent entry (QPDF.cc:1628-1633) -- it does not
+        // attempt to decode the object from its object stream.
+        let pdf = Pdf::open_mem_owned(minimal_pdf_bytes()).expect("open");
+        let object_ref = ObjectRef::new(5, 0);
+        pdf.resolver.insert_xref_entry(
+            object_ref,
+            XrefEntry::Compressed {
+                stream: 9,
+                index: 0,
+            },
+        );
+
+        let err = Error::parse(0, "expected 5 0 obj");
+        let result = pdf.resolver.reconstruct_xref_and_retry(err, object_ref);
+
+        assert!(
+            matches!(result, Ok(None)),
+            "a compressed post-reconstruction entry must resolve like a free/absent one: {result:?}"
         );
     }
 
