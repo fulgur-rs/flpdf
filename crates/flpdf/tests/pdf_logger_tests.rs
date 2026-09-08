@@ -169,6 +169,26 @@ fn previous_xref_section_live_warning_bytes() -> Vec<u8> {
     bytes
 }
 
+fn indirect_previous_offset_live_warning_bytes() -> Vec<u8> {
+    // The candidate's `/Prev` is an indirect reference, so resolving the
+    // previous section's offset dereferences object 3 0 -- a read that warns
+    // live through the owner, outside the section parse the deferral window
+    // used to cover.
+    let prefix = b"%PDF-1.4\n".to_vec();
+    let object_2 = b"2 0 obj\n<< /Type /XRef /W [1 1 1] /Size 1 /Length 3 >>\nstream\n\x01\x00\x00\nendstream\n".to_vec();
+    let previous_offset = prefix.len();
+    let mut bytes = prefix;
+    bytes.extend_from_slice(&object_2);
+    // Object 3 0 is missing its `endobj`, so dereferencing it raises the same
+    // `expected endobj` repair warning the section-parse test relies on.
+    bytes.extend_from_slice(format!("3 1 obj\n{previous_offset}\n").as_bytes());
+    bytes.extend_from_slice(
+        b"1 0 obj\n<< /Type /XRef /W [1 1 1] /Size 1 /Prev 3 1 R /Length 3 >>\nstream\n\x01\x00\x00\nendstream\nendobj\n",
+    );
+    bytes.extend_from_slice(b"startxref\n0\n%%EOF\n");
+    bytes
+}
+
 fn two_lazy_warning_objects() -> Vec<u8> {
     let mut pdf = b"%PDF-1.4\n".to_vec();
     let mut offsets = Vec::new();
@@ -784,4 +804,49 @@ fn previous_xref_section_defers_a_live_read_warning_through_the_prev_walk() {
          follows the candidate's /Prev chain, must print after the trio and after \
          discovery's own resolution of the same object -- not live, ahead of both"
     );
+}
+
+#[test]
+fn indirect_previous_offset_keeps_the_trio_first() {
+    // Invariant guard for the `/Prev` *offset resolution* (as opposed to the
+    // previous section's parse, covered by the test above). Resolving an
+    // indirect `/Prev` dereferences its target, and that read can warn live
+    // through the owner; qpdf has one warnings deque delivered strictly in
+    // call order (`libqpdf/QPDF.cc:487-494`), so the reconstruction trio must
+    // still come first.
+    //
+    // This fixture does not by itself demonstrate an inversion: object 3 is
+    // already reached by the line scan, so discovery resolves (and warns
+    // about) it before the `/Prev` walk runs, and the order is correct with
+    // or without the surrounding deferral. The test pins the invariant so a
+    // later change to either path cannot silently reorder these lines.
+    let (logger, output) = recording_logger();
+    let _ = Pdf::open_with_options(
+        Cursor::new(indirect_previous_offset_live_warning_bytes()),
+        PdfOpenOptions {
+            repair: true,
+            logger: Some(logger),
+            description: b"input.pdf".to_vec(),
+            ..PdfOpenOptions::default()
+        },
+    );
+    let recorded = output.lock().unwrap().clone();
+    let text = String::from_utf8_lossy(&recorded).to_string();
+    let trio_end = text
+        .find("Attempting to reconstruct cross-reference table")
+        .expect("the reconstruction trio is emitted");
+    assert!(
+        text.contains("expected endobj"),
+        "the fixture must actually raise the live read warning, otherwise this \
+         test is vacuous:\n{text}"
+    );
+    for live in ["expected endobj"] {
+        if let Some(position) = text.find(live) {
+            assert!(
+                position > trio_end,
+                "a live read warning raised while resolving an indirect /Prev must not \
+                 precede the buffered reconstruction trio:\n{text}"
+            );
+        }
+    }
 }

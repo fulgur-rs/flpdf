@@ -2716,6 +2716,14 @@ fn merge_previous_xref_sections_with_observer(
     if loaded.loaded.startxref != 0 {
         visited.insert(loaded.loaded.startxref);
     }
+    // The deferral window only makes sense while the reconstruction path is
+    // buffering the trio and line-scan diagnostics; the active-section reader
+    // has a single channel already.
+    let is_reconstruction = matches!(
+        context_spec,
+        XrefReadContextSpec::Reconstruction { .. }
+            | XrefReadContextSpec::ReconstructionWithCache { .. }
+    );
     let chain_bootstrap_cache = match context_spec {
         XrefReadContextSpec::ActiveSection | XrefReadContextSpec::Reconstruction { .. } => {
             Rc::clone(&loaded.bootstrap_cache)
@@ -2745,7 +2753,15 @@ fn merge_previous_xref_sections_with_observer(
             bootstrap_cache: &chain_bootstrap_cache,
         },
     };
-    let (mut previous_offset, previous_diagnostics, reconstruction_trigger) =
+    // Resolving `/Prev` can dereference an indirect target, and that read
+    // warns live through the owner just like the section parse below. Keep it
+    // inside the same window so a repair warning raised here cannot overtake
+    // the still-buffered reconstruction trio.
+    let mut previous_offset_diagnostics = Diagnostics::default();
+    let previous_offset_result = {
+        let _guard = canonical_trailer_owner
+            .filter(|_| is_reconstruction)
+            .map(|owner| DeferredDiagnosticsGuard::new(owner, &mut previous_offset_diagnostics));
         resolve_previous_xref_offset(
             bytes,
             options.clone(),
@@ -2754,7 +2770,13 @@ fn merge_previous_xref_sections_with_observer(
             &loaded.loaded.trailer,
             loaded.classic_trailer_offset,
             canonical_trailer_owner,
-        )?;
+        )
+    };
+    for diagnostic in previous_offset_diagnostics.entries() {
+        loaded.loaded.repair_diagnostics.push(diagnostic.clone());
+    }
+    let (mut previous_offset, previous_diagnostics, reconstruction_trigger) =
+        previous_offset_result?;
     for diagnostic in previous_diagnostics.entries() {
         loaded.loaded.repair_diagnostics.push(diagnostic.clone());
     }
@@ -2779,11 +2801,6 @@ fn merge_previous_xref_sections_with_observer(
         // load (`ActiveSection`/`ActiveSectionWithCache`) has no such
         // buffer and its warnings are meant to print live, so this window
         // is scoped to the reconstruction case only.
-        let is_reconstruction = matches!(
-            context_spec,
-            XrefReadContextSpec::Reconstruction { .. }
-                | XrefReadContextSpec::ReconstructionWithCache { .. }
-        );
         let mut deferred_diagnostics = Diagnostics::default();
         let previous_result = {
             let _guard = canonical_trailer_owner
@@ -2832,7 +2849,13 @@ fn merge_previous_xref_sections_with_observer(
                     .or_insert(object);
             }
         }
-        let (next_previous_offset, previous_diagnostics, reconstruction_trigger) =
+        // Same window as the initial resolution above: this hop's `/Prev`
+        // can also dereference an indirect target that warns live.
+        let mut hop_offset_diagnostics = Diagnostics::default();
+        let hop_offset_result = {
+            let _guard = canonical_trailer_owner
+                .filter(|_| is_reconstruction)
+                .map(|owner| DeferredDiagnosticsGuard::new(owner, &mut hop_offset_diagnostics));
             resolve_previous_xref_offset(
                 bytes,
                 options.clone(),
@@ -2841,7 +2864,13 @@ fn merge_previous_xref_sections_with_observer(
                 &previous.loaded.trailer,
                 previous.classic_trailer_offset,
                 canonical_trailer_owner,
-            )?;
+            )
+        };
+        for diagnostic in hop_offset_diagnostics.entries() {
+            loaded.loaded.repair_diagnostics.push(diagnostic.clone());
+        }
+        let (next_previous_offset, previous_diagnostics, reconstruction_trigger) =
+            hop_offset_result?;
         for diagnostic in previous_diagnostics.entries() {
             loaded.loaded.repair_diagnostics.push(diagnostic.clone());
         }
