@@ -2285,7 +2285,7 @@ fn parse_xref_from_start_with_owner_and_build_diagnostics(
     first_xref_item_offset_sink: Option<&mut Option<u64>>,
     validate_current_classic_trailer: bool,
     canonical_trailer_owner: Option<&dyn CanonicalTrailerOwner>,
-    mut hybrid_build_diagnostics_sink: Option<&mut Diagnostics>,
+    hybrid_build_diagnostics_sink: Option<&mut Diagnostics>,
 ) -> Result<LoadedXrefState> {
     if bytes
         .get(xref_pos..)
@@ -2435,7 +2435,7 @@ fn parse_xref_from_start_with_owner_and_build_diagnostics(
             error_diagnostics_sink,
             context_spec,
             canonical_trailer_owner,
-            hybrid_build_diagnostics_sink.as_deref_mut(),
+            hybrid_build_diagnostics_sink,
         )?;
         for object_ref in deferred_free {
             registration.insert_free_xref_entry(object_ref);
@@ -2604,7 +2604,7 @@ fn merge_xref_stream_from_classic_trailer_with_build_diagnostics(
     mut error_diagnostics_sink: Option<&mut Diagnostics>,
     context_spec: XrefReadContextSpec<'_>,
     canonical_trailer_owner: Option<&dyn CanonicalTrailerOwner>,
-    mut hybrid_build_diagnostics_sink: Option<&mut Diagnostics>,
+    hybrid_build_diagnostics_sink: Option<&mut Diagnostics>,
 ) -> Result<()> {
     let has_xref_stream_key = loaded
         .loaded
@@ -2729,7 +2729,7 @@ fn merge_xref_stream_from_classic_trailer_with_build_diagnostics(
             return Err(error);
         }
     };
-    if let Some(sink) = hybrid_build_diagnostics_sink.as_deref_mut() {
+    if let Some(sink) = hybrid_build_diagnostics_sink {
         for diagnostic in hybrid.loaded.repair_diagnostics.entries() {
             sink.push(diagnostic.clone());
         }
