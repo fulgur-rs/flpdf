@@ -986,21 +986,16 @@ impl LinearizationPlan {
         // this order. It must run before object-ref capture because those
         // preparations may mint indirect objects.
         //
-        // Warm the canonical qpdf object cache before the Optimization
-        // compatibility consumer runs. qpdf has one object cache: if the
-        // malformed stream framing below is first parsed through the
-        // ObjectHandle route, Optimization observes that same cached value
-        // instead of reparsing the source and duplicating its recovery
-        // diagnostics. The producer must not use a resolve/materialize bridge
-        // in the other direction.
-        if pdf.root_ref().is_some() {
-            crate::writer::rewrite_renumber::CanonicalCatalogFirstRenumber::build_qpdf_with_stream_policy(
-                pdf,
-                true,
-                false,
-                &BTreeSet::new(),
-                None)?;
-        }
+        // qpdf's writeLinearized goes straight from doWriteSetup into
+        // QPDF::optimize with no separate object-cache warmup pass
+        // (QPDFWriter.cc:2536-2554) - the sole object cache participates in
+        // every consumer that touches it, so there is nothing to warm.
+        // Optimization::optimize's own traversal already resolves every
+        // reachable object (including stream framing/length recovery for a
+        // malformed stream) through the canonical ObjectHandle route in one
+        // pass; a prior CanonicalCatalogFirstRenumber pre-pass here was
+        // redundant with that traversal rather than compensating for a real
+        // gap in it.
         let content_normalize_refs = linearization_content_normalize_refs(pdf, options)?;
         let mut skipped_stream_parameter_streams = BTreeSet::new();
         let mut optimization = crate::optimization::Optimization::optimize(
