@@ -293,12 +293,14 @@ fn check_document_with_suppression<R: Read + Seek + 'static>(
     let extension_level = match pdf.adobe_extension_level() {
         Ok(level) => level,
         Err(error) => {
-            return Err(map_check_error(
+            return Err(finish_check_error(
                 logger,
                 message_prefix,
-                input_name,
-                error,
-                logger_failure_since(pdf, extension_diagnostics_seen),
+                map_in_try_error(
+                    logger,
+                    error,
+                    logger_failure_since(pdf, extension_diagnostics_seen),
+                ),
             ));
         }
     };
@@ -326,12 +328,14 @@ fn check_document_with_suppression<R: Read + Seek + 'static>(
     let linearized = match pdf.is_linearized() {
         Ok(value) => value,
         Err(error) => {
-            return Err(map_check_error(
+            return Err(finish_check_error(
                 logger,
                 message_prefix,
-                input_name,
-                error,
-                logger_failure_since(pdf, linearized_diagnostics_seen),
+                map_in_try_error(
+                    logger,
+                    error,
+                    logger_failure_since(pdf, linearized_diagnostics_seen),
+                ),
             ));
         }
     };
@@ -373,10 +377,8 @@ fn check_document_with_suppression<R: Read + Seek + 'static>(
         return Err(finish_check_error(
             logger,
             message_prefix,
-            map_check_error(
+            map_in_try_error(
                 logger,
-                message_prefix,
-                input_name,
                 error,
                 logger_failure_since(pdf, writer_diagnostics_seen),
             ),
@@ -410,10 +412,8 @@ fn check_document_with_suppression<R: Read + Seek + 'static>(
             return Err(finish_check_error(
                 logger,
                 message_prefix,
-                map_page_tree_error(
+                map_in_try_error(
                     logger,
-                    message_prefix,
-                    input_name,
                     error,
                     logger_failure_since(pdf, page_tree_diagnostics_seen),
                 ),
@@ -783,17 +783,17 @@ fn emit_linearization_check_warnings<R: Read + Seek + 'static>(
     }
 }
 
-fn map_page_tree_error(
-    logger: &QPDFLogger,
-    _message_prefix: &str,
-    _input_name: &[u8],
-    error: crate::Error,
-    logger_failure: bool,
-) -> CheckError {
+/// Map a failure raised inside qpdf's `doCheck` try block.
+///
+/// qpdf catches every such failure with one indiscriminate
+/// `catch (std::exception& e)` and writes `ERROR: ` followed by `e.what()`
+/// (`libqpdf/QPDFJob.cc:788-791`). It inspects neither the exception type nor
+/// a `QPDFExc` error code, so this boundary must not branch on either.
+fn map_in_try_error(logger: &QPDFLogger, error: crate::Error, logger_failure: bool) -> CheckError {
     if logger_failure && is_logger_error(&error) {
         CheckError::Operation(error)
     } else {
-        match emit_page_tree_error(logger, &error) {
+        match emit_check_catch_error(logger, &error) {
             Ok(()) => CheckError::ErrorsDetected,
             Err(delivery_error) => CheckError::Operation(delivery_error),
         }
@@ -837,6 +837,12 @@ fn take_logger_failure<R: Read + Seek>(
     (logger_failure_since(pdf, diagnostics_seen) && is_logger_error(&error)).then_some(*error)
 }
 
+/// Map a failure raised before qpdf's `doCheck` try block opens.
+///
+/// qpdf reaches `doCheck` only after `doProcess` has produced a `QPDF`, so an
+/// open-time failure never sees the `ERROR: ` catch; the CLI reports it with
+/// its own `whoami: ` framing (`qpdf/qpdf.cc:37-41`). Keep that wrapper here
+/// and use [`map_in_try_error`] for everything the try block covers.
 fn map_check_error(
     logger: &QPDFLogger,
     message_prefix: &str,
@@ -847,33 +853,20 @@ fn map_check_error(
     if logger_failure && is_logger_error(&error) {
         CheckError::Operation(error)
     } else {
-        let delivery = if is_qpdf_pages_exception(&error) {
-            emit_page_tree_error(logger, &error)
-        } else {
-            emit_error(logger, message_prefix, input_name, &error)
-        };
-        match delivery {
+        match emit_error(logger, message_prefix, input_name, &error) {
             Ok(()) => CheckError::ErrorsDetected,
             Err(delivery_error) => CheckError::Operation(delivery_error),
         }
     }
 }
 
-fn is_qpdf_pages_exception(error: &crate::Error) -> bool {
-    match error {
-        crate::Error::QpdfExc(exception) => exception.get_error_code() == QpdfErrorCode::Pages,
-        crate::Error::OpenFailure { source, .. } => is_qpdf_pages_exception(source),
-        _ => false,
-    }
-}
-
-/// Emit a page-tree failure using qpdf's `QPDFJob::doCheck` catch boundary.
+/// Emit a failure through qpdf's `QPDFJob::doCheck` catch boundary.
 ///
 /// qpdf writes `ERROR: ` followed directly by `std::exception::what()`
-/// (`libqpdf/QPDFJob.cc:745-793`). A `QPDFExc` already contains its source
-/// filename, so adding the generic `message_prefix: input_name: ` wrapper here
-/// would duplicate that context and diverge from qpdf's output.
-fn emit_page_tree_error(logger: &QPDFLogger, error: &crate::Error) -> Result<()> {
+/// (`libqpdf/QPDFJob.cc:788-791`) for every exception the try block raises.
+/// A `QPDFExc` already carries its source filename, so the generic
+/// `message_prefix: input_name: ` wrapper would duplicate that context.
+fn emit_check_catch_error(logger: &QPDFLogger, error: &crate::Error) -> Result<()> {
     let mut line = b"ERROR: ".to_vec();
     match error {
         // cov:ignore: LLVM assigns the covered match dispatch to a zero-hit region; all message arms are exercised below.
@@ -1185,7 +1178,7 @@ mod tests {
         ));
 
         assert!(matches!(
-            map_page_tree_error(&logger, "qpdf", b"pages-loop.pdf", error, false),
+            map_in_try_error(&logger, error, false),
             CheckError::ErrorsDetected
         ));
         assert_eq!(
@@ -1207,7 +1200,7 @@ mod tests {
         ));
 
         assert!(matches!(
-            map_check_error(&logger, "qpdf", b"pages-loop.pdf", error, false),
+            map_in_try_error(&logger, error, false),
             CheckError::ErrorsDetected
         ));
         assert_eq!(
@@ -1229,7 +1222,7 @@ mod tests {
             diagnostics: Diagnostics::default(),
         };
         assert!(matches!(
-            map_check_error(&logger, "qpdf", b"pages-loop.pdf", open_failure, false),
+            map_in_try_error(&logger, open_failure, false),
             CheckError::ErrorsDetected
         ));
         assert_eq!(
@@ -1239,7 +1232,7 @@ mod tests {
     }
 
     #[test]
-    fn page_tree_qpdf_exception_propagates_logger_failure() {
+    fn page_tree_qpdf_exception_propagates_delivery_failure() {
         let logger = QPDFLogger::create();
         logger.set_output_streams(None, Some(PipelineHandle::new(FailingCapture)));
         let error = Error::QpdfExc(QpdfExc::new(
@@ -1251,7 +1244,7 @@ mod tests {
         ));
 
         assert!(matches!(
-            map_page_tree_error(&logger, "qpdf", b"pages-loop.pdf", error, false),
+            map_in_try_error(&logger, error, false),
             CheckError::Operation(Error::System(message)) if message == "logger failure"
         ));
     }
@@ -2214,20 +2207,31 @@ mod tests {
         let output = String::from_utf8(output.lock().expect("capture output").clone()).unwrap();
         assert!(output.contains("ERROR: page 1:"));
 
-        let mapped = map_page_tree_error(
-            &logger,
-            "qpdf",
-            b"page-tree-failure.pdf",
+        let capture = Arc::new(Mutex::new(Vec::new()));
+        let capture_logger = logger_with_capture(Arc::clone(&capture));
+        let mapped = map_in_try_error(
+            &capture_logger,
             Error::Internal("page tree failure".to_owned()),
             false,
         );
         assert!(matches!(mapped, CheckError::ErrorsDetected));
+        // qpdf's catch is indiscriminate: a non-QPDFExc failure inside the try
+        // block gets the same bare `ERROR: what()` line, with no
+        // `message_prefix: input_name: ` wrapper (`QPDFJob.cc:788-791`).
+        let mapped_output = String::from_utf8(capture.lock().expect("capture output").clone())
+            .expect("captured output is utf-8");
+        assert!(
+            mapped_output.contains("ERROR: page tree failure"),
+            "in-try failures use qpdf's bare catch framing: {mapped_output:?}"
+        );
+        assert!(
+            !mapped_output.contains("qpdf: page-tree-failure.pdf:"),
+            "the pre-try wrapper must not appear for an in-try failure: {mapped_output:?}"
+        );
         let failing_logger = QPDFLogger::create();
         failing_logger.set_output_streams(None, Some(PipelineHandle::new(FailingCapture)));
-        let mapped = map_page_tree_error(
+        let mapped = map_in_try_error(
             &failing_logger,
-            "qpdf",
-            b"page-tree-failure.pdf",
             Error::Internal("page tree failure".to_owned()),
             true,
         );
@@ -2390,7 +2394,22 @@ mod tests {
 
         assert!(matches!(result, Err(CheckError::ErrorsDetected)));
         let output = String::from_utf8(output.lock().expect("capture output").clone()).unwrap();
-        assert!(output.contains("probe-failure.pdf: I/O error: test reader failure"));
+        // `isLinearized` runs inside qpdf's doCheck try block
+        // (`QPDFJob.cc:759`), so its failure takes the bare `ERROR: what()`
+        // catch line (`:788-791`) and the single trailing `errors detected`
+        // (`:792-794`), not the pre-try `whoami: file: ` wrapper.
+        assert!(
+            output.contains("ERROR: I/O error: test reader failure"),
+            "in-try probe failure uses qpdf's catch framing: {output:?}"
+        );
+        assert!(
+            output.contains("qpdf: errors detected"),
+            "qpdf ends the check with one errors-detected line: {output:?}"
+        );
+        assert!(
+            !output.contains("probe-failure.pdf: I/O error:"),
+            "the pre-try wrapper must not appear for an in-try failure: {output:?}"
+        );
     }
 
     #[test]

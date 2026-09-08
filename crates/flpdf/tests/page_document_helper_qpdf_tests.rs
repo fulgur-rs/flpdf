@@ -74,6 +74,57 @@ fn removing_an_already_removed_page_preserves_qpdf_exception_context() {
 }
 
 #[test]
+fn page_tree_cycle_description_follows_the_last_parsed_kid_not_the_first() {
+    // A single-page cycle cannot tell the two candidate semantics apart: the
+    // last parsed kid and the first kid are the same object. qpdf reports
+    // `m->last_object_description`, which `setLastObjectDescription` updates
+    // only while parsing (`QPDF.cc:1298-1310`), so a second page must move the
+    // description to `object 4 0`. Real qpdf 11.9.0 prints
+    // `ERROR: pages-loop-two.pdf (object 4 0): Loop detected in /Pages
+    // structure (getAllPages)` for this shape.
+    let bytes = build_pdf(
+        &[
+            (1, "<< /Type /Catalog /Pages 2 0 R >>".to_owned()),
+            (
+                2,
+                "<< /Type /Pages /Count 2 /Kids [3 0 R 4 0 R 2 0 R] >>".to_owned(),
+            ),
+            (
+                3,
+                "<< /Type /Page /Parent 2 0 R /MediaBox [0 0 612 792] >>".to_owned(),
+            ),
+            (
+                4,
+                "<< /Type /Page /Parent 2 0 R /MediaBox [0 0 612 792] >>".to_owned(),
+            ),
+        ],
+        1,
+    );
+    let mut pdf = Pdf::open_with_options(
+        Cursor::new(bytes),
+        PdfOpenOptions {
+            description: b"pages-loop-two.pdf".to_vec(),
+            suppress_warnings: true,
+            ..PdfOpenOptions::default()
+        },
+    )
+    .expect("cyclic page-tree fixture should open");
+
+    let error = PageDocumentHelper::new(&mut pdf)
+        .get_all_pages()
+        .expect_err("a repeated /Pages node must raise qpdf_e_pages");
+    let Error::QpdfExc(exception) = error else {
+        panic!("expected structured QPDFExc, got {error:?}");
+    };
+
+    assert_eq!(exception.get_object(), b"object 4 0");
+    assert_eq!(
+        exception.what_bytes(),
+        b"pages-loop-two.pdf (object 4 0): Loop detected in /Pages structure (getAllPages)"
+    );
+}
+
+#[test]
 fn page_tree_cycle_raises_qpdf_pages_exception_with_last_object_description() {
     let bytes = build_pdf(
         &[
