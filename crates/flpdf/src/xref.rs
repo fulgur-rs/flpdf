@@ -3154,8 +3154,8 @@ fn recover_xref_from_linear_scan(
     .map_err(|error| {
         // cov:ignore-start: defensive open-failure wrapper after a line-scan parser error; the live sink boundary is covered by Pdf open failure tests
         with_xref_open_diagnostics(error, repair_diagnostics.clone(), canonical_trailer_owner)
-        // cov:ignore-end
     })?;
+    // cov:ignore-end
     let mut entries = recovered.entries;
     // qpdf removes only type-1 rows before its reconstruction scan
     // (`QPDF.cc:516-575`). A failed xref-stream insertion can leave a default
