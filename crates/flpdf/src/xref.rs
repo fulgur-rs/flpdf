@@ -414,7 +414,10 @@ enum XrefReadContextSpec<'a> {
 enum XrefObjectDescription {
     Ordinary,
     XrefStream,
-    ObjStmMember { object_ref: ObjectRef },
+    ObjStmMember {
+        stream_number: u32,
+        object_ref: ObjectRef,
+    },
 }
 
 impl XrefObjectDescription {
@@ -945,7 +948,10 @@ impl BootstrapHandleDocument {
             let member_data = decoded.get(diagnostic_start..).unwrap_or_default();
             let mut parser = BootstrapHandleParser {
                 document: self,
-                description: XrefObjectDescription::ObjStmMember { object_ref },
+                description: XrefObjectDescription::ObjStmMember {
+                    stream_number,
+                    object_ref,
+                },
             };
             let (value, parsed_offset, diagnostics) =
                 match parse_qpdf_direct_object_handle_with_diagnostics(
@@ -998,7 +1004,7 @@ impl BootstrapHandleDocument {
                 member_handle.set_end_offsets(stream_end_before_space, stream_end_after_space);
                 if parsed_offset >= 0 && !member_handle.is_null() {
                     member_handle.set_description(
-                        self.object_description_template(object_ref),
+                        self.object_description_template(stream_number, object_ref),
                         parsed_offset,
                     );
                 }
@@ -1007,12 +1013,27 @@ impl BootstrapHandleDocument {
         Ok(())
     }
 
-    fn object_description_template(&self, object_ref: ObjectRef) -> Vec<u8> {
-        // qpdf's `readObjectInStream` passes only `object M 0` as the
-        // QPDFParser description. The `object stream N` context belongs to
-        // the decoded InputSource name, not to QPDFValue::Description
-        // (`QPDF.cc:1451-1459,1793-1805`).
-        format!("object {} {}", object_ref.number, object_ref.generation).into_bytes()
+    fn object_description_template(&self, stream_number: u32, object_ref: ObjectRef) -> Vec<u8> {
+        // qpdf renders an ObjStm member's warning from three pieces: the
+        // decoded InputSource name (`<file> object stream N`, built at
+        // `libqpdf/QPDF.cc:1796`), the parser's own description string
+        // (`object M 0`, `QPDF.cc:1451-1459`) and the parsed offset --
+        // `QPDFParser::warn` passes all three into `QPDFExc`
+        // (`libqpdf/QPDFParser.cc:509-513`). flpdf's description template
+        // carries that whole rendered prefix, with `$PO` standing in for the
+        // offset (`crates/flpdf/src/object_handle.rs:940`), so it has to keep
+        // the input description and the stream number. This is the same shape
+        // the canonical reader produces
+        // (`reader/resolver.rs::object_stream_description_template`).
+        let mut description = self.options.description.clone();
+        description.extend_from_slice(
+            format!(
+                " object stream {stream_number}, object {} {} at offset $PO",
+                object_ref.number, object_ref.generation
+            )
+            .as_bytes(),
+        );
+        description
     }
 
     fn handle_integer(&self, dictionary: &ObjectHandle, key: &[u8], label: &str) -> Result<usize> {
@@ -1070,9 +1091,12 @@ impl HandleResolver for BootstrapHandleParser<'_> {
         Some(match self.description {
             XrefObjectDescription::Ordinary => b"object $OG".to_vec(),
             XrefObjectDescription::XrefStream => b"xref stream: object $OG".to_vec(),
-            XrefObjectDescription::ObjStmMember { object_ref } => {
-                self.document.object_description_template(object_ref)
-            }
+            XrefObjectDescription::ObjStmMember {
+                stream_number,
+                object_ref,
+            } => self
+                .document
+                .object_description_template(stream_number, object_ref),
         })
     }
 }
@@ -5162,7 +5186,16 @@ mod final_handle_tests {
             .expect("ObjStm members resolve through the bootstrap owner");
         let member = document.handle_for_reference(ObjectRef::new(2, 0));
         assert!(member.is_resolved());
-        assert_eq!(member.description(), b"object 2 0");
+        // qpdf renders the member warning from the decoded InputSource name
+        // (`<file> object stream N`, `libqpdf/QPDF.cc:1796`), the parser's
+        // `object M 0` description (`:1451-1459`) and the parsed offset,
+        // combined by `QPDFParser::warn` (`libqpdf/QPDFParser.cc:509-513`).
+        // flpdf's template carries that whole prefix, so the stream number and
+        // the input description stay in it.
+        assert_eq!(
+            member.description(),
+            b" object stream 4, object 2 0 at offset 6"
+        );
         let child = member
             .try_get_key(b"/Child")
             .expect("member dictionary child");
@@ -5211,7 +5244,7 @@ mod final_handle_tests {
         for error in [nested_string, nested_dictionary] {
             let message = error.to_string();
             assert!(
-                message.contains("object 7 0") && !message.contains("object stream 4"),
+                message.contains("object 7 0") && message.contains("object stream 4"),
                 "nested warning lost the ObjStm member context: {message}"
             );
         }

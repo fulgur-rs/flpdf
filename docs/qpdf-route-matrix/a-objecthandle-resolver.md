@@ -194,9 +194,14 @@ notes で個別に `prod: 0` と断る。`fuzz/` は別枠で数える（本領�
 | A24 | `QPDF::resolveObjectsInStream`（`resolved_object_streams` で二重展開防止、xref 再チェックで上書き済みメンバーを cache しない） | `libqpdf/QPDF.cc:1756-1833` | canonical 側は `crates/flpdf/src/reader/resolver.rs::ResolverCore` の `resolved_object_streams`（`crates/flpdf/src/reader/resolver.rs:324-327`）。facade 側には `crates/flpdf/src/pdf.rs:136` の `compressed_member_parents` provenance map が残る | `compressed_member_parents` prod: 6 (3 files) / test: 4。A14 専用だった ObjStm 昇格 helper は `.46` で撤去 | mixed | `crates/flpdf/src/reader/resolver.rs::ResolverCore` | canonical 側の ObjStm 展開は qpdf に対応する一方、`compressed_member_parents` は legacy cache synchronization の移行状態を記録する flpdf 側 provenance で、qpdf の `ObjCache` には対応物がない。A2/A15 と同じ legacy cache 列を畳む段階まで保持する。 |
 
 2026-09-08（`flpdf-1f9f`）: owner-less bootstrap の ObjStm member parserも
-`libqpdf/QPDF.cc:1451-1459` の `object M 0` descriptionを使い、member本体と辞書・配列内の
-nested direct valueへ同じ contextを渡すようにした。`object stream N` は qpdfの decoded
-InputSource名に属するため、ObjectDescriptionへ混ぜない（`libqpdf/QPDF.cc:1793-1805`）。これは
+member本体と辞書・配列内の nested direct valueへ同じ description contextを渡すようにした。
+qpdf は member の警告を decoded InputSource 名（`<file> object stream N`、
+`libqpdf/QPDF.cc:1793-1805`）・parser へ渡す `object M 0`（`:1451-1459`）・parsed offset の
+3 つから `QPDFParser::warn` で組み立てる（`libqpdf/QPDFParser.cc:509-513`）。flpdf の
+description template はそのレンダリング済み prefix 全体を保持する（`$PO` が offset の
+プレースホルダ、`crates/flpdf/src/object_handle.rs:940`）ので、入力 description と
+`object stream N` を template に含める — canonical reader の
+`object_stream_description_template` と同形。これは
 A24の cache/recheck 責務とは独立した description propagation の補正であり、canonical
 ResolverHandle側の object-stream routeや reconstruction-only bounded windowは変更しない。
 

@@ -433,11 +433,16 @@ document-wide の独自 aggregate route ではなく、保持された各 leaf �
 
 | `QPDF::resolve` / `QPDF::resolveObjectsInStream`（xref object-read/cache boundary） | `QPDF.cc:1700-1857`; `QPDF.cc:1541-1697` | `engine.rs` が parse 前に作る `ResolverHandle` を `xref.rs::CanonicalTrailerOwner` として渡し、active xref stream、hybrid `/XRefStm`、`/Prev` chain、reconstruction candidate の object read を `ResolverHandle::resolve_at_offset_with_optional_description`（live `readObjectAtOffset` → `readObject` → `readStream`）へ統一する。`/Type`/`/W`/`/Index`/`/Size`/filter は `XrefObjectContext` から同じ canonical handle/cache と warning snapshot を参照する。owner-less standalone xref loaderのbootstrap ObjStmは `.48.14` で `resolveObjectsInStream` の specialized decode、direct parser、effective xref/default-free、親extent、descriptionの順序を同じqpdf責務へ揃えたが、bounded reconstruction windowとBootstrapHandleStateは別ownerとして残る。 | 🔀 `.48.13` で production xref-stream/recovery read の二重 owner と LoadedXref の parsed-stream rebind を除去。owner-less public loaderの第2 state統合とObjStm rebind/replayは `.48.15` の範囲 |
 
-`flpdf-1f9f` では、qpdf の `readObjectInStream` が parser に渡す `object M 0` description
-（`libqpdf/QPDF.cc:1451-1459`）を owner-less bootstrap の ObjStm member parserにも渡すようにした。
-そのため member本体だけでなく、辞書・配列内の nested direct valueも同じ
-`ObjectDescription::Template`を持つ。`object stream N`はqpdfと同じくdescription objectへ
-混ぜず、decoded InputSource側の文脈（`libqpdf/QPDF.cc:1793-1805`）として扱う。対象はdescriptionの
+`flpdf-1f9f` では、owner-less bootstrap の ObjStm member parser にも member の description
+context を渡すようにした。そのため member 本体だけでなく、辞書・配列内の nested direct value も
+同じ `ObjectDescription::Template` を持つ。qpdf は member の警告を 3 つの断片から組み立てる —
+decoded InputSource 名（`<file> object stream N`、`libqpdf/QPDF.cc:1793-1805`）、parser に渡す
+`object M 0` description（`:1451-1459`）、parsed offset — を `QPDFParser::warn` が
+`QPDFExc` に束ねる（`libqpdf/QPDFParser.cc:509-513`）。flpdf の description template は
+その**レンダリング済み prefix 全体**を保持し、`$PO` が offset のプレースホルダになる
+（`crates/flpdf/src/object_handle.rs:940`）ため、template には入力 description と
+`object stream N` を含める。これは canonical reader の
+`reader/resolver.rs::object_stream_description_template` と同形。対象はdescriptionの
 伝播だけで、specialized decode、header map、effective xref、bounded reconstruction ownerは
 `.48.14`の責務を変更しない。
 
