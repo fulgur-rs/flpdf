@@ -141,6 +141,16 @@ xref 全 og を resolve する。**`resolveXRefTable` が xref reconstruction �
   `libqpdf/QPDFObject.cc:13-17`）。これは相互参照する `shared_ptr` の循環を切るための処理で、
   「QPDF が生きている間は絶対にやってはいけない」とコメントが明記する。
 
+2026-09-08（`flpdf-lomd`）: qpdfの `read_xrefStream` は各xref stream objectを
+`readObjectAtOffset` でobj_cacheへ読み込んだ後に `processXRefStream` を実行する
+（`libqpdf/QPDF.cc:951-962,1640-1686`）。後続revisionがそのObjectRefをfreeまたは
+supersedeしても、`getAllObjects` はcache上の履歴objectを保持し、effective xrefの
+live viewとは分離される（`QPDF.cc:1239-1295`）。flpdfのcanonical xref parserも
+`LoadedXrefState::parsed_xref_streams`へstream handleを渡し、`Pdf`構築後に
+`qpdf_parsed_xref_stream_refs`で`live_object_refs`から除外する経路を固定した。
+incremental fixtureでは、object 5の履歴xref streamが`object_refs`には残り、最新revision
+でfreeになった後の`live_object_refs`からは消えることをRED/GREENで確認する。
+
 ## route matrix
 
 **caller の数え方（本ファイル共通、領域 B/D と同じ規約）**: `rg -n --glob '*.rs' '<pattern>' crates` の
