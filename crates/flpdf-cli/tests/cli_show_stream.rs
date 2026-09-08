@@ -122,7 +122,13 @@ fn show_stream_dct_decodes_valid_jpeg() {
 }
 
 /// Invalid `/DCTDecode` bytes must surface a decode error, not fall back to
-/// the passthrough marker used for genuinely undecodable codecs.
+/// the passthrough marker used for genuinely undecodable codecs. qpdf's own
+/// `getStreamData` decode failure records a warning and still succeeds with
+/// empty output (`libqpdf/QPDFJob.cc:806-832`, verified against real qpdf
+/// 11.9.0's `--show-object --filtered-stream-data` for this exact case:
+/// empty stdout, one warning, exit 3) -- this is qpdf's
+/// warn-and-succeed-with-warnings exit code, not a hard failure, and must
+/// not regress to a harder failure exit code or a second, spurious error.
 #[test]
 fn show_stream_dct_invalid_bytes_report_decode_error() {
     let fake_jpeg: &[u8] = &[0x77, 0x77];
@@ -135,11 +141,13 @@ fn show_stream_dct_invalid_bytes_report_decode_error() {
     cmd.args(["show-stream", "3 0"])
         .arg(temp.path())
         .assert()
-        .failure()
+        .code(3)
+        .stdout(predicate::eq(b"".as_slice()))
         .stderr(predicate::str::contains(
             "Not a JPEG file: starts with 0x77 0x77",
         ))
-        .stderr(predicate::str::contains("DCT decode:").not());
+        .stderr(predicate::str::contains("DCT decode:").not())
+        .stderr(predicate::str::contains("unfilterable stream").not());
 }
 
 /// For a JBIG2Decode stream, show-stream (without --raw-stream-data) must print the marker.
