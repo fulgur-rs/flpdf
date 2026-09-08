@@ -660,9 +660,20 @@ impl BootstrapHandleDocument {
             }
         };
         let (end_before_space, end_after_space) = completed.object.end_offsets();
+        let end_before_space = rebase(end_before_space);
+        let end_after_space = if end_before_space < 0 {
+            rebase(end_after_space)
+        } else {
+            let scan_start = usize::try_from(end_before_space).unwrap_or(usize::MAX);
+            let tail = source_bytes.get(scan_start..).unwrap_or_default();
+            match tail.iter().position(|byte| !byte.is_ascii_whitespace()) {
+                Some(index) => i64::try_from(scan_start.saturating_add(index)).unwrap_or(i64::MAX),
+                None => return Err(Error::parse(source_bytes.len(), "EOF after endobj")),
+            }
+        };
         completed
             .object
-            .set_end_offsets(rebase(end_before_space), rebase(end_after_space));
+            .set_end_offsets(end_before_space, end_after_space);
         let _ = description;
         Ok(completed)
     }
@@ -5449,7 +5460,7 @@ mod final_handle_tests {
         let mut bytes = b"1 0 obj\n<< /Length 27 >>\nstream\n".to_vec();
         bytes.extend_from_slice(b"aaaa\n2 0 obj\nbbbbbbbbbbbbb\n");
         let stream_length = b"aaaa\n2 0 obj\nbbbbbbbbbbbbb\n".len();
-        bytes.extend_from_slice(b"endstream\nendobj\n");
+        bytes.extend_from_slice(b"endstream\nendobj\n%%EOF\n");
         assert_eq!(stream_length, 27);
 
         let first_ref = ObjectRef::new(1, 0);
@@ -5680,7 +5691,7 @@ mod final_handle_tests {
         payload.resize(40, b'B');
         assert_eq!(payload.len(), 40);
         bytes.extend_from_slice(&payload);
-        bytes.extend_from_slice(b"\nendstream\nendobj\n");
+        bytes.extend_from_slice(b"\nendstream\nendobj\n%%EOF\n");
 
         let first_ref = ObjectRef::new(1, 0);
         let second_ref = ObjectRef::new(2, 0);
@@ -5739,13 +5750,71 @@ mod final_handle_tests {
     }
 
     #[test]
+    fn bootstrap_read_refuses_to_invent_an_end_offset_at_eof() {
+        // qpdf scans the real file for the first non-space byte after
+        // `endobj` and raises `EOF after endobj` when the source runs out
+        // first (`libqpdf/QPDF.cc:1651-1663`); the canonical reader mirrors
+        // that in `ResolverHandle::object_end_offsets`. The bootstrap parser
+        // only sees an object-relative window, so without the source-side
+        // rescan the window's own end would masquerade as the first
+        // following byte and be cached as this object's extent -- and then
+        // propagated to every member of an object stream.
+        let bytes = b"1 0 obj\n<< /Size 1 >>\nendobj\n \n".to_vec();
+        let object_ref = ObjectRef::new(1, 0);
+        let mut context = XrefReadContext::new(
+            &bytes,
+            XrefReadContextSpec::ActiveSection,
+            &XrefRegistration::default(),
+            XrefLoadOptions::default(),
+        );
+        context.document.ensure_source_bytes(&bytes);
+
+        let error = context
+            .document
+            .read_uncompressed_object(object_ref, 0)
+            .expect_err("only whitespace follows endobj, so qpdf raises EOF after endobj");
+        assert!(
+            error.to_string().contains("EOF after endobj"),
+            "expected qpdf's own EOF after endobj wording, got {error}"
+        );
+    }
+
+    #[test]
+    fn bootstrap_read_reports_the_first_byte_after_the_terminator() {
+        // The counterpart of the case above: with a trailer following the
+        // object, the recorded `end_after_space` is the trailer's own offset
+        // rather than the read window's end.
+        let mut bytes = b"1 0 obj\n<< /Size 1 >>\nendobj\n\n".to_vec();
+        let trailer_offset = bytes.len();
+        bytes.extend_from_slice(b"%%EOF\n");
+        let object_ref = ObjectRef::new(1, 0);
+        let mut context = XrefReadContext::new(
+            &bytes,
+            XrefReadContextSpec::ActiveSection,
+            &XrefRegistration::default(),
+            XrefLoadOptions::default(),
+        );
+        context.document.ensure_source_bytes(&bytes);
+
+        let (_, _, end_before_space, end_after_space) = context
+            .document
+            .read_uncompressed_object(object_ref, 0)
+            .expect("the object is well formed and a trailer follows it");
+        assert_eq!(
+            end_before_space,
+            i64::try_from(b"1 0 obj\n<< /Size 1 >>\nendobj".len()).unwrap()
+        );
+        assert_eq!(end_after_space, i64::try_from(trailer_offset).unwrap());
+    }
+
+    #[test]
     fn read_uncompressed_object_pushes_the_accepted_read_s_own_diagnostics() {
         // No `/Length` at all, so recovery is unavoidable even without any
         // window truncation (`ActiveSection` never bounds the window, so
         // there is nothing to retry here) -- this attempt's diagnostics are
         // the only ones that can ever exist, and they must still reach the
         // shared diagnostics list once accepted.
-        let bytes = b"1 0 obj\n<< >>\nstream\nhello\nendstream\nendobj\n".to_vec();
+        let bytes = b"1 0 obj\n<< >>\nstream\nhello\nendstream\nendobj\n%%EOF\n".to_vec();
         let object_ref = ObjectRef::new(1, 0);
         let mut entries = BTreeMap::new();
         entries.insert(object_ref, XrefEntry::Uncompressed { offset: 0 });
@@ -5797,7 +5866,7 @@ mod final_handle_tests {
         context.sync_handle_diagnostics();
         assert!(context.diagnostics.entries().is_empty());
 
-        let input = b"1 0 obj\n<< /Root 2 0 R >>\nendobj\n";
+        let input = b"1 0 obj\n<< /Root 2 0 R >>\nendobj\n%%EOF\n";
         let mut context = XrefReadContext::new(
             input,
             XrefReadContextSpec::ActiveSection,
@@ -5818,7 +5887,7 @@ mod final_handle_tests {
 
     #[test]
     fn indirect_bootstrap_resolution_initializes_the_source_snapshot_once() {
-        let bytes = b"\n1 0 obj\n7\nendobj\n";
+        let bytes = b"\n1 0 obj\n7\nendobj\n%%EOF\n";
         let object_ref = ObjectRef::new(1, 0);
         let mut registration = XrefRegistration::default();
         registration.insert_xref_entry(object_ref, XrefEntry::Uncompressed { offset: 1 });
@@ -5870,7 +5939,7 @@ mod final_handle_tests {
     fn indirect_stream_length_initializes_the_source_snapshot_before_resolution() {
         let mut bytes = b"1 0 obj\n<< /Length 2 0 R >>\nstream\nabc\nendstream\nendobj\n".to_vec();
         let object_two_offset = bytes.len();
-        bytes.extend_from_slice(b"2 0 obj\n3\nendobj\n");
+        bytes.extend_from_slice(b"2 0 obj\n3\nendobj\n%%EOF\n");
         let object_one = ObjectRef::new(1, 0);
         let object_two = ObjectRef::new(2, 0);
         let mut entries = BTreeMap::new();
