@@ -22,10 +22,19 @@ pub(crate) fn write_plain<R: Read + Seek, W: Write>(
     // for the ordinary unnormalized route. QDF and page-content normalization
     // need the planned writer's second dimension (QDF framing or normalized
     // stream buffers), while the selected object-stream mode remains Disable.
-    if options.object_streams == ObjectStreamMode::Disable
-        && !options.qdf
-        && !options.content_normalization
-    {
+    //
+    // qpdf's Preserve mode keeps whatever object streams the source already
+    // has (`QPDFWriter.cc:2038-2140`); when the source has none, there is
+    // nothing to preserve, so `enqueueObject`/`writeStandard` walk the object
+    // graph exactly as they do for Disable -- Preserve and Disable are the
+    // same live-queue walk in that case, not two different algorithms. Route
+    // that case through the same live queue rather than the plan-based path,
+    // which exists to place source-backed and generated object-stream
+    // containers that this case does not have.
+    let is_live_disable_shaped = options.object_streams == ObjectStreamMode::Disable
+        || (options.object_streams == ObjectStreamMode::Preserve
+            && !plan::source_has_compressed_entries(pdf));
+    if is_live_disable_shaped && !options.qdf && !options.content_normalization {
         return write_plain_live_disable(pdf, out, options, generated_id);
     }
     let plan = plan::PlainWritePlan::build_with_generated_id(pdf, options, generated_id)?;
