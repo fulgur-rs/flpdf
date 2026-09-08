@@ -2737,12 +2737,15 @@ mod tests {
 
     #[test]
     fn encrypted_document_check_propagates_encryption_report_logger_failure() {
+        let errors = Arc::new(Mutex::new(Vec::new()));
         let logger = QPDFLogger::create();
         logger.set_output_streams(
             Some(PipelineHandle::new(
                 crate::pipeline::test_support::NthWriteFailure::new(3),
             )),
-            None,
+            Some(PipelineHandle::new(Capture {
+                bytes: Arc::clone(&errors),
+            })),
         );
         let mut job = QPDFJob::new();
         job.set_logger(logger);
@@ -2764,6 +2767,75 @@ mod tests {
             job.check(&mut pdf),
             Err(CheckError::ErrorsDetected)
         ));
+        // qpdf's doCheck catch writes the bare `ERROR: <what>` and its single
+        // trailing `errors detected` (`QPDFJob.cc:788-794`); the pre-try
+        // `whoami: file: ` wrapper must not appear for an in-try failure.
+        assert_eq!(
+            String::from_utf8(errors.lock().unwrap().clone()).unwrap(),
+            "ERROR: sink write failure 3\nqpdf: errors detected\n"
+        );
+    }
+
+    /// A failing warning sink inside `checkLinearization` takes the same
+    /// `doCheck` catch boundary.
+    ///
+    /// qpdf reaches this shape too: `QPDF::checkLinearization`
+    /// (`libqpdf/QPDF_linearization.cc:69-81`) turns a read failure into
+    /// `linearizationWarning`, which calls `QPDF::warn`
+    /// (`libqpdf/QPDF.cc:487-493`). That function writes to `getWarn()`
+    /// outside any try, and it is already running inside
+    /// `checkLinearization`'s own `catch`, so a sink failure escapes to
+    /// `doCheck`'s indiscriminate catch (`QPDFJob.cc:788-794`) -- `ERROR:` plus
+    /// one `errors detected`, not a propagated operation error.
+    #[test]
+    fn linearization_check_warning_sink_failure_uses_do_check_catch_framing() {
+        let armed = Arc::new(AtomicBool::new(false));
+        let snapshot = Arc::new(AtomicBool::new(false));
+        let start_zero_seeks = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let mut pdf = Pdf::open(SnapshotFailReader {
+            reader: Cursor::new(
+                include_bytes!(concat!(
+                    env!("CARGO_MANIFEST_DIR"),
+                    "/../../tests/fixtures/compat/linearized-one-page.pdf"
+                ))
+                .to_vec(),
+            ),
+            armed: Arc::clone(&armed),
+            snapshot: Arc::clone(&snapshot),
+            start_zero_seeks: Arc::clone(&start_zero_seeks),
+        })
+        .expect("linearized fixture should open");
+        pdf.root_handle().expect("Catalog should resolve");
+
+        armed.store(true, Ordering::Relaxed);
+
+        let output = Arc::new(Mutex::new(Vec::new()));
+        let logger = logger_with_capture(Arc::clone(&output));
+        // The linearization warning is delivered through the report logger's
+        // warn stream, which is where qpdf's `QPDF::warn` writes
+        // (`libqpdf/QPDF.cc:487-493`). Fail that write.
+        logger.set_warn(Some(PipelineHandle::new(
+            crate::pipeline::test_support::NthWriteFailure::new(1),
+        )));
+        let result = check_document(&mut pdf, &logger, "qpdf", "snapshot-failure.pdf");
+
+        let report = String::from_utf8(output.lock().unwrap().clone()).unwrap();
+        assert!(
+            matches!(&result, Err(CheckError::ErrorsDetected)),
+            "unexpected outcome with report {report:?}"
+        );
+        assert!(
+            report.contains("ERROR: sink write failure 1"),
+            "the in-try failure takes qpdf's bare catch framing: {report:?}"
+        );
+        assert!(
+            report.contains("qpdf: errors detected"),
+            "qpdf ends the check with one errors-detected line: {report:?}"
+        );
+        assert!(
+            !report.contains("snapshot-failure.pdf: sink write failure"),
+            "the pre-try wrapper must not appear: {report:?}"
+        );
     }
 
     #[test]
