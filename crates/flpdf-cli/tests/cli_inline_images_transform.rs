@@ -223,6 +223,15 @@ fn run_flpdf_rewrite(flags: &[String], input: &Path, output: &Path) -> Output {
         .expect("run flpdf")
 }
 
+/// Run qpdf when the pinned 11.9.0 oracle is present.
+///
+/// The flpdf-only assertions in the pre-existing tests below do not need the
+/// oracle, so gate only the comparison rather than returning early and
+/// skipping the whole test on a machine without qpdf.
+fn run_qpdf_rewrite_if_available(flags: &[String], input: &Path, output: &Path) -> Option<Output> {
+    qpdf_or_skip().then(|| run_qpdf_rewrite(flags, input, output))
+}
+
 fn run_qpdf_page_selection(input: &Path, output: &Path) -> Output {
     ProcessCommand::new("qpdf")
         .args([
@@ -383,16 +392,13 @@ fn image_transform_flags(externalize: bool, optimize: bool, keep_inline: bool) -
 
 #[test]
 fn top_level_externalize_inline_images_converts_inline_image_to_xobject() {
-    if !qpdf_or_skip() {
-        return;
-    }
     let directory = tempfile::tempdir().expect("tempdir");
     let input = directory.path().join("input.pdf");
     let qpdf_output = directory.path().join("qpdf.pdf");
     let output = directory.path().join("output.pdf");
     std::fs::write(&input, inline_image_pdf()).expect("write input");
 
-    let qpdf = run_qpdf_rewrite(
+    let qpdf = run_qpdf_rewrite_if_available(
         &[
             "--externalize-inline-images".to_owned(),
             "--ii-min-bytes=0".to_owned(),
@@ -401,11 +407,13 @@ fn top_level_externalize_inline_images_converts_inline_image_to_xobject() {
         &input,
         &qpdf_output,
     );
-    assert!(
-        qpdf.status.success(),
-        "qpdf externalization failed: {}",
-        String::from_utf8_lossy(&qpdf.stderr)
-    );
+    if let Some(qpdf) = &qpdf {
+        assert!(
+            qpdf.status.success(),
+            "qpdf externalization failed: {}",
+            String::from_utf8_lossy(&qpdf.stderr)
+        );
+    }
 
     Command::cargo_bin("flpdf")
         .expect("flpdf binary")
@@ -419,7 +427,9 @@ fn top_level_externalize_inline_images_converts_inline_image_to_xobject() {
         .assert()
         .success();
 
-    assert_page_images_match(&qpdf_output, &output);
+    if qpdf.is_some() {
+        assert_page_images_match(&qpdf_output, &output);
+    }
     let image = &flpdf_pages_json(&output)["pages"][0]["images"][0];
     assert_eq!(image["name"], "/IIm1");
     assert_eq!(image["width"], 2);
@@ -428,9 +438,6 @@ fn top_level_externalize_inline_images_converts_inline_image_to_xobject() {
 
 #[test]
 fn top_level_externalize_inline_images_honors_inclusive_payload_threshold() {
-    if !qpdf_or_skip() {
-        return;
-    }
     let directory = tempfile::tempdir().expect("tempdir");
     let input = directory.path().join("input.pdf");
     let qpdf_at_limit = directory.path().join("qpdf-at-limit.pdf");
@@ -439,7 +446,7 @@ fn top_level_externalize_inline_images_honors_inclusive_payload_threshold() {
     let above_limit = directory.path().join("above-limit.pdf");
     std::fs::write(&input, inline_image_pdf()).expect("write input");
 
-    let qpdf_at_limit_result = run_qpdf_rewrite(
+    let qpdf_at_limit_result = run_qpdf_rewrite_if_available(
         &[
             "--externalize-inline-images".to_owned(),
             "--ii-min-bytes=5".to_owned(),
@@ -448,8 +455,10 @@ fn top_level_externalize_inline_images_honors_inclusive_payload_threshold() {
         &input,
         &qpdf_at_limit,
     );
-    assert!(qpdf_at_limit_result.status.success());
-    let qpdf_above_limit_result = run_qpdf_rewrite(
+    if let Some(result) = &qpdf_at_limit_result {
+        assert!(result.status.success());
+    }
+    let qpdf_above_limit_result = run_qpdf_rewrite_if_available(
         &[
             "--externalize-inline-images".to_owned(),
             "--ii-min-bytes=6".to_owned(),
@@ -458,7 +467,9 @@ fn top_level_externalize_inline_images_honors_inclusive_payload_threshold() {
         &input,
         &qpdf_above_limit,
     );
-    assert!(qpdf_above_limit_result.status.success());
+    if let Some(result) = &qpdf_above_limit_result {
+        assert!(result.status.success());
+    }
 
     Command::cargo_bin("flpdf")
         .expect("flpdf binary")
@@ -478,7 +489,9 @@ fn top_level_externalize_inline_images_honors_inclusive_payload_threshold() {
             .len(),
         1
     );
-    assert_page_images_match(&qpdf_at_limit, &at_limit);
+    if qpdf_at_limit_result.is_some() {
+        assert_page_images_match(&qpdf_at_limit, &at_limit);
+    }
 
     Command::cargo_bin("flpdf")
         .expect("flpdf binary")
@@ -495,21 +508,20 @@ fn top_level_externalize_inline_images_honors_inclusive_payload_threshold() {
         .as_array()
         .expect("image array")
         .is_empty());
-    assert_page_images_match(&qpdf_above_limit, &above_limit);
+    if qpdf_above_limit_result.is_some() {
+        assert_page_images_match(&qpdf_above_limit, &above_limit);
+    }
 }
 
 #[test]
 fn explicit_externalization_overrides_keep_inline_images() {
-    if !qpdf_or_skip() {
-        return;
-    }
     let directory = tempfile::tempdir().expect("tempdir");
     let input = directory.path().join("input.pdf");
     let qpdf_output = directory.path().join("qpdf.pdf");
     let output = directory.path().join("output.pdf");
     std::fs::write(&input, inline_image_pdf()).expect("write input");
 
-    let qpdf = run_qpdf_rewrite(
+    let qpdf = run_qpdf_rewrite_if_available(
         &[
             "--externalize-inline-images".to_owned(),
             "--keep-inline-images".to_owned(),
@@ -519,7 +531,9 @@ fn explicit_externalization_overrides_keep_inline_images() {
         &input,
         &qpdf_output,
     );
-    assert!(qpdf.status.success());
+    if let Some(qpdf) = &qpdf {
+        assert!(qpdf.status.success());
+    }
 
     Command::cargo_bin("flpdf")
         .expect("flpdf binary")
@@ -541,21 +555,20 @@ fn explicit_externalization_overrides_keep_inline_images() {
             .len(),
         1
     );
-    assert_page_images_match(&qpdf_output, &output);
+    if qpdf.is_some() {
+        assert_page_images_match(&qpdf_output, &output);
+    }
 }
 
 #[test]
 fn rewrite_subcommand_accepts_externalize_inline_images() {
-    if !qpdf_or_skip() {
-        return;
-    }
     let directory = tempfile::tempdir().expect("tempdir");
     let input = directory.path().join("input.pdf");
     let qpdf_output = directory.path().join("qpdf.pdf");
     let output = directory.path().join("output.pdf");
     std::fs::write(&input, inline_image_pdf()).expect("write input");
 
-    let qpdf = run_qpdf_rewrite(
+    let qpdf = run_qpdf_rewrite_if_available(
         &[
             "--externalize-inline-images".to_owned(),
             "--ii-min-bytes=0".to_owned(),
@@ -564,7 +577,9 @@ fn rewrite_subcommand_accepts_externalize_inline_images() {
         &input,
         &qpdf_output,
     );
-    assert!(qpdf.status.success());
+    if let Some(qpdf) = &qpdf {
+        assert!(qpdf.status.success());
+    }
 
     Command::cargo_bin("flpdf")
         .expect("flpdf binary")
@@ -586,7 +601,9 @@ fn rewrite_subcommand_accepts_externalize_inline_images() {
             .len(),
         1
     );
-    assert_page_images_match(&qpdf_output, &output);
+    if qpdf.is_some() {
+        assert_page_images_match(&qpdf_output, &output);
+    }
 }
 
 #[test]
@@ -625,6 +642,19 @@ fn externalize_and_optimize_flags_match_qpdf_truth_table() {
             String::from_utf8_lossy(&flpdf.stderr)
         );
         assert_page_images_match(&qpdf_output, &flpdf_output);
+        // Rows where qpdf keeps the image inline produce no XObject at all, so
+        // the page-image JSON is `[] == []` for them. The whole-file
+        // comparison sees the retained `BI ... EI` content itself.
+        let extra: Vec<&str> = flags
+            .iter()
+            .filter(|flag| flag.as_str() != "--static-id")
+            .map(String::as_str)
+            .collect();
+        assert_qdf_bytes_match(
+            &input,
+            &extra,
+            &format!("truth table ({externalize}, {optimize}, {keep_inline})"),
+        );
     }
 }
 
