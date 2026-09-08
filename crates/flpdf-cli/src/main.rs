@@ -1200,9 +1200,14 @@ struct Cli {
 
     /// Recompress eligible non-JPEG images as DCT/JPEG (qpdf
     /// `--optimize-images`). Inspection modes may be combined with this flag
-    /// like qpdf; they produce no output file, so the image mutation is not
-    /// observable there. Attachment mutation modes remain conflicts because
-    /// those dispatch branches do not consume the image options.
+    /// like qpdf, which rejects neither combination. qpdf still performs the
+    /// image transformation for them -- `createQPDF` runs
+    /// `handleTransformations` before `writeQPDF` picks the inspection branch
+    /// (`QPDFJob.cc:474,484-491`) -- so its inspection output reflects the
+    /// transformed document. flpdf currently accepts the flag and drops it on
+    /// those routes; wiring the transformation into them is tracked
+    /// separately. Attachment mutation modes remain conflicts because those
+    /// dispatch branches do not consume the image options.
     /// `--pages`/`--rotate`/`--split-pages`/`--empty`/`--json`/
     /// `--json-output` are intentionally absent: all of those routes are
     /// already threaded through (see `top_level_image_options` at each call
@@ -1217,8 +1222,9 @@ struct Cli {
     /// (qpdf `--externalize-inline-images`). This is a distinct transform
     /// from `--optimize-images`; when both are selected the shared image phase
     /// externalizes first and then optimizes reachable Image XObjects.
-    /// Inspection modes may be combined with this flag like qpdf; they do not
-    /// produce an output file, so the mutation is not observable there.
+    /// Inspection modes may be combined with this flag like qpdf. As with
+    /// `--optimize-images`, qpdf runs the transformation even on those routes
+    /// (`QPDFJob.cc:474,2151-2156`) while flpdf currently drops it.
     #[arg(long = "externalize-inline-images",
           conflicts_with_all = [
               "list_attachments", "show_attachment", "remove_attachment",

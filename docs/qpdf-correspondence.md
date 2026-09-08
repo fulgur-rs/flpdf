@@ -1181,10 +1181,22 @@ top-level argvの `--externalize-inline-images` も生成 handler (`auto_job_ini
 
 `flpdf-42xx` では、top-level の `--check` / `--show-*` と
 `--optimize-images` / `--externalize-inline-images` の組み合わせを qpdf 11.9.0
-と同じく受理する。qpdf は create stage の transformation設定を保持したまま、
-出力先が無い `writeQPDF` で inspectionへ分岐するため、CLIのclap conflictを
-置かず、inspectionのexit/statusと診断だけを観測する（`QPDFJob_config.cc:72-76`,
-`QPDFJob.cc:484-503,529-532`）。
+と同じく受理する。`optimizeImages` / `externalizeInlineImages` は自分のフラグ
+だけを立てて `require_outfile` に触れず（`QPDFJob_config.cc:174-180,443-447`）、
+`checkConfiguration` にも両フラグを見る分岐が 1 つも無い
+（`QPDFJob.cc:566-641`）ため、qpdf 側に禁止分岐が存在しない。
+
+ただし qpdf は **inspection でも画像変換を実際に実行する**。`createQPDF` は
+`handleTransformations` を無条件に呼び（`QPDFJob.cc:474`）、`writeQPDF` の
+`createsOutput()` 分岐（`:484-491`）はその変換済みドキュメントに対して
+inspection を走らせる。したがって inspection の観測面（stdout・stderr・exit
+code）は変換結果を反映する。実測でも
+`qpdf --show-npages --optimize-images qtest/qpdf/bad-data.pdf` は変換由来の
+warning を出して exit 3 になる（変換なしなら exit 0）。
+
+flpdf は現時点で **受理はするが image option を inspection route へ渡さない**
+（accept-and-drop）。dispatch の `run_check` / `run_show_*` は image option 引数を
+そもそも受け取らない。この差は `flpdf-w2fk` で追跡する。
 
 top-level `--flatten-annotations=all|screen|print` も `auto_job_init.hh:117` / `QPDFJob_config.cc:190-200` の choices を `flpdf-cli` の shared `run_rewrite` route に接続し、通常 rewrite と linearize rewrite の両方で `PageDocumentHelper::flatten_annotations` (`QPDFPageDocumentHelper.cc:55-77`) を実行する。`NeedAppearances` 時の `warnIfPossible` と stream filter warning の parsed-offset/suppression 境界も qpdf の warning/status contract に合わせる。
 

@@ -584,7 +584,12 @@ jobJsonFile/usage error を同じ Config へ」という統合は、個別 optio
 `flpdf-42xx` は E-12 の image option parser boundary にある inspection conflict を
 qpdf 11.9.0 と同じ受理 semanticsへ揃える。`--check` / `--show-*` と
 `--optimize-images` / `--externalize-inline-images` は usage conflictにせず、
-output無しの inspection routeへ進む。画像変換のwriter outputを新たに作る変更ではない。
+output無しの inspection routeへ進む。writer output を新たに作る変更ではない。
+
+なお qpdf は inspection route でも変換自体は実行する（`createQPDF` の
+`handleTransformations`、`QPDFJob.cc:474` が `writeQPDF` の `createsOutput()`
+分岐 `:484-491` より前）。本 slice は受理境界のみを揃えたもので、image option を
+inspection route へ配線するのは `flpdf-w2fk` の範囲である。
 
 ### option 別対応表
 

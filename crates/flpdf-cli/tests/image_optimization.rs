@@ -406,12 +406,30 @@ fn optimize_images_is_accepted_with_check_like_qpdf() {
     let input = tempdir.path().join("input.pdf");
     std::fs::write(&input, build_raw_grayscale_image_pdf(200, 200)).expect("write input");
 
-    Command::cargo_bin("flpdf")
+    let with_option = Command::cargo_bin("flpdf")
         .expect("flpdf binary")
         .args(["--optimize-images", "--check"])
         .arg(&input)
         .assert()
         .success();
+    let plain = Command::cargo_bin("flpdf")
+        .expect("flpdf binary")
+        .arg("--check")
+        .arg(&input)
+        .assert()
+        .success();
+
+    // flpdf currently accepts the flag on this route and drops it, so the
+    // check report is byte-for-byte the plain one. qpdf instead runs
+    // `handleTransformations` before `writeQPDF` picks the inspection branch
+    // (`QPDFJob.cc:474,484-491`), so its report reflects the transformed
+    // document. Pin the accept-and-drop behaviour here; `flpdf-w2fk` tracks
+    // wiring the transformation into the inspection routes.
+    assert_eq!(
+        with_option.get_output().stdout,
+        plain.get_output().stdout,
+        "the image option is currently dropped on the --check route"
+    );
 }
 
 #[test]
@@ -444,13 +462,28 @@ fn image_transform_options_are_accepted_with_inspection_modes_like_qpdf() {
 
     for image_option in ["--optimize-images", "--externalize-inline-images"] {
         for mode in &inspection_modes {
-            Command::cargo_bin("flpdf")
+            let with_option = Command::cargo_bin("flpdf")
                 .expect("flpdf binary")
                 .arg(image_option)
                 .args(mode)
                 .arg(&input)
                 .assert()
                 .success();
+            let plain = Command::cargo_bin("flpdf")
+                .expect("flpdf binary")
+                .args(mode)
+                .arg(&input)
+                .assert()
+                .success();
+            // Accept-and-drop: identical inspection output with and without
+            // the image option. qpdf's own report differs because it runs the
+            // transformation first (`QPDFJob.cc:474`); `flpdf-w2fk` tracks
+            // closing that gap.
+            assert_eq!(
+                with_option.get_output().stdout,
+                plain.get_output().stdout,
+                "{image_option} is currently dropped on {mode:?}"
+            );
         }
     }
 }
