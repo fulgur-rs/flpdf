@@ -1240,11 +1240,7 @@ struct Cli {
     /// `--json-output` are intentionally absent: all of those routes are
     /// already threaded through (see `top_level_image_options` at each call
     /// site).
-    #[arg(long = "optimize-images",
-          conflicts_with_all = [
-              "list_attachments", "show_attachment", "remove_attachment",
-              "add_attachment", "copy_attachments_from",
-          ])]
+    #[arg(long = "optimize-images")]
     optimize_images: bool,
     /// Convert inline images into ordinary Image XObjects
     /// (qpdf `--externalize-inline-images`). This is a distinct transform
@@ -1252,12 +1248,10 @@ struct Cli {
     /// externalizes first and then optimizes reachable Image XObjects.
     /// Inspection modes may be combined with this flag like qpdf. As with
     /// `--optimize-images`, the top-level inspection routes run the
-    /// transformation before their report (`QPDFJob.cc:473,2151-2156`).
-    #[arg(long = "externalize-inline-images",
-          conflicts_with_all = [
-              "list_attachments", "show_attachment", "remove_attachment",
-              "add_attachment", "copy_attachments_from",
-          ])]
+    /// transformation before their report (`QPDFJob.cc:473,2151-2155`), and the
+    /// attachment routes run it in the same `handleTransformations` before the
+    /// attachment phases (`:2229-2245`).
+    #[arg(long = "externalize-inline-images")]
     externalize_inline_images: bool,
     /// Exclude inline images from the optimization pass.
     #[arg(long = "keep-inline-images")]
@@ -3251,6 +3245,7 @@ fn main() {
             args.verbose,
             args.no_warn,
             args.page_ops.empty,
+            top_level_image_transform_options,
         )
     } else if let Some(key) = args.show_attachment {
         run_show_attachment(
@@ -3258,8 +3253,10 @@ fn main() {
             args.repair,
             &args.password,
             &key,
+            args.verbose,
             args.no_warn,
             args.page_ops.empty,
+            top_level_image_transform_options,
         )
     } else if !args.remove_attachment.is_empty() {
         let options = top_level_writer_options(
@@ -3280,6 +3277,7 @@ fn main() {
             args.linearize,
             args.linearize_pass1.as_deref(),
             options,
+            top_level_image_transform_options,
         )
     } else if !attachment_segments.is_empty() {
         let options = top_level_writer_options(
@@ -3300,6 +3298,7 @@ fn main() {
             args.linearize,
             args.linearize_pass1.as_deref(),
             options,
+            top_level_image_transform_options,
         )
     } else if !args.copy_attachments_from.is_empty() {
         let copy_groups = args
@@ -3324,6 +3323,7 @@ fn main() {
             args.linearize,
             args.linearize_pass1.as_deref(),
             options,
+            top_level_image_transform_options,
         )
     } else if args.page_ops.empty
         && args.page_ops.pages.is_empty()
@@ -8927,6 +8927,7 @@ fn run_add_attachment(
     linearize: bool,
     linearize_pass1: Option<&Path>,
     writer_options: WriterOptions,
+    image_options: ImageTransformOptions,
 ) -> CliResult<()> {
     let input = input.ok_or_else(missing_input_usage_error)?;
     let output = output.ok_or_else(missing_output_usage_error)?;
@@ -8970,6 +8971,7 @@ fn run_add_attachment(
     if remove_restrictions {
         AcroFormDocumentHelper::new(&mut pdf)?.disable_digital_signatures()?;
     }
+    apply_image_transformations(&mut pdf, image_options, verbose)?;
     job.add_attachments(&mut pdf, &attachment_options)?;
 
     // qpdf's writer applies content normalization after all transformations
@@ -9019,6 +9021,7 @@ fn run_remove_attachment(
     linearize: bool,
     linearize_pass1: Option<&Path>,
     writer_options: WriterOptions,
+    image_options: ImageTransformOptions,
 ) -> CliResult<()> {
     let input = input.ok_or_else(missing_input_usage_error)?;
     let output = output.ok_or_else(missing_output_usage_error)?;
@@ -9035,6 +9038,7 @@ fn run_remove_attachment(
     if remove_restrictions {
         AcroFormDocumentHelper::new(&mut pdf)?.disable_digital_signatures()?;
     }
+    apply_image_transformations(&mut pdf, image_options, verbose)?;
     for key in keys {
         let key = arg_parser::os_bytes(key);
         let found = pdf.embedded_files().remove_embedded_file(&key)?;
@@ -9086,35 +9090,42 @@ fn run_list_attachments(
     verbose: bool,
     suppress_warnings: bool,
     empty: bool,
+    image_options: ImageTransformOptions,
 ) -> CliResult<()> {
     if empty {
         reject_empty_inspection_output(input.as_deref())?;
         let mut job = new_cli_job(suppress_warnings);
         let mut pdf = create_empty_primary_document(&mut job, None)?;
+        apply_image_transformations(&mut pdf, image_options, verbose)?;
         let status = job.list_attachments(&mut pdf, verbose)?;
         return finish_job_exit_status(status);
     }
     let input = input.ok_or_else(missing_input_usage_error)?;
     let mut pdf = open_pdf_with_suppression(&input, repair, password, suppress_warnings)?;
     let mut job = new_cli_job(suppress_warnings);
+    apply_image_transformations(&mut pdf, image_options, verbose)?;
     job.set_input_name_bytes(path_description(&input));
     let status = job.list_attachments(&mut pdf, verbose)?;
     finish_job_exit_status(status)
 }
 
 /// `--show-attachment KEY [-o PATH] input`
+#[allow(clippy::too_many_arguments)]
 fn run_show_attachment(
     input: Option<PathBuf>,
     repair: bool,
     password: &PasswordArgs,
     key: &OsStr,
+    verbose: bool,
     suppress_warnings: bool,
     empty: bool,
+    image_options: ImageTransformOptions,
 ) -> CliResult<()> {
     if empty {
         reject_empty_inspection_output(input.as_deref())?;
         let mut job = new_cli_job(suppress_warnings);
         let mut pdf = create_empty_primary_document(&mut job, None)?;
+        apply_image_transformations(&mut pdf, image_options, verbose)?;
         let key = arg_parser::os_bytes(key);
         let status = job.show_attachment(&mut pdf, &key)?;
         return finish_job_exit_status(status);
@@ -9122,6 +9133,7 @@ fn run_show_attachment(
     let input = input.ok_or_else(missing_input_usage_error)?;
     let mut pdf = open_pdf_with_suppression(&input, repair, password, suppress_warnings)?;
     let mut job = new_cli_job(suppress_warnings);
+    apply_image_transformations(&mut pdf, image_options, verbose)?;
     job.set_input_name_bytes(path_description(&input));
     let key = arg_parser::os_bytes(key);
     let status = job.show_attachment(&mut pdf, &key)?;
@@ -9144,6 +9156,7 @@ fn run_copy_attachments_from(
     linearize: bool,
     linearize_pass1: Option<&Path>,
     writer_options: WriterOptions,
+    image_options: ImageTransformOptions,
 ) -> CliResult<()> {
     let input = input.ok_or_else(missing_input_usage_error)?;
     let output = output.ok_or_else(missing_output_usage_error)?;
@@ -9170,6 +9183,7 @@ fn run_copy_attachments_from(
     if remove_restrictions {
         let _ = AcroFormDocumentHelper::new(&mut pdf)?.disable_digital_signatures()?;
     }
+    apply_image_transformations(&mut pdf, image_options, verbose)?;
 
     let copy_options = donor_args
         .into_iter()
