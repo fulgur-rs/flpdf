@@ -736,10 +736,10 @@ mod tests {
         assert!(!decode_parms.is_null());
         pdf.resolve(&decode_parms).expect("resolve DecodeParms");
         assert!(decode_parms.is_null());
-        assert_eq!(
-            decode_parms.object_ref(),
-            pdf.get_object_handle(ObjectRef::new(8, 0)).object_ref(),
-            "the deferred handle must stay the document's own object 8 slot"
+        assert!(
+            decode_parms.is_same_object_as(&pdf.get_object_handle(ObjectRef::new(8, 0))),
+            "the deferred handle must be the document's own object 8 slot, not a \
+             separate handle that merely carries the same reference"
         );
     }
 
@@ -767,10 +767,10 @@ mod tests {
         assert!(!decode_parms.is_null());
         pdf.resolve(&decode_parms).expect("resolve DecodeParms");
         assert!(decode_parms.is_null());
-        assert_eq!(
-            decode_parms.object_ref(),
-            pdf.get_object_handle(ObjectRef::new(8, 0)).object_ref(),
-            "the deferred handle must stay the document's own object 8 slot"
+        assert!(
+            decode_parms.is_same_object_as(&pdf.get_object_handle(ObjectRef::new(8, 0))),
+            "the deferred handle must be the document's own object 8 slot, not a \
+             separate handle that merely carries the same reference"
         );
     }
 
