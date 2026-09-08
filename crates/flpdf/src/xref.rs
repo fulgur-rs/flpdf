@@ -1092,7 +1092,13 @@ impl BootstrapHandleDocument {
             return Ok(());
         }
 
-        let result = match self.entry_lookup.borrow().get(&object_ref).copied() {
+        // Snapshot the row before the `match`: a temporary `Ref` produced in
+        // a scrutinee lives for the whole match expression, and the compressed
+        // arm below reaches `resolve_objects_in_stream`, which inserts qpdf's
+        // default free row for a header member absent from the table
+        // (`QPDF.cc:1821-1828`) through `entry_lookup.borrow_mut()`.
+        let entry = self.entry_lookup.borrow().get(&object_ref).copied();
+        let result = match entry {
             Some(XrefEntry::Uncompressed { offset }) if offset != 0 => {
                 self.read_uncompressed_object(object_ref, offset)
             }
@@ -5278,6 +5284,68 @@ mod final_handle_tests {
             document.entry_lookup.borrow().get(&absent_ref),
             Some(&XrefEntry::Free { next: 0 }),
             "an absent header member receives qpdf's default free xref row"
+        );
+    }
+
+    #[test]
+    fn bootstrap_compressed_resolution_records_absent_headers_without_panicking() {
+        // Same shape as the test above, but reached through
+        // `resolve_indirect_inner` instead of calling
+        // `resolve_objects_in_stream` directly: the compressed member is
+        // resolved lazily, so the absent-header row is inserted while the
+        // caller is still inside the `match` that read the entry table.
+        let member_body = b"<< /Value 1 >>";
+        let header = b"7 0 9 0 ";
+        let mut objstm_data = header.to_vec();
+        objstm_data.extend_from_slice(member_body);
+        let mut bytes = b"%PDF-1.5\n".to_vec();
+        let stream_offset = bytes.len() as u64;
+        let stream_header = format!(
+            "4 0 obj\n<< /Type /ObjStm /N 2 /First {} /Length {} >>\nstream\n",
+            header.len(),
+            objstm_data.len()
+        );
+        bytes.extend_from_slice(stream_header.as_bytes());
+        bytes.extend_from_slice(&objstm_data);
+        bytes.extend_from_slice(b"\nendstream\nendobj\n%tail\n");
+
+        let stream_ref = ObjectRef::new(4, 0);
+        let active_ref = ObjectRef::new(7, 0);
+        let absent_ref = ObjectRef::new(9, 0);
+        let entries = BTreeMap::from([
+            (
+                stream_ref,
+                XrefEntry::Uncompressed {
+                    offset: stream_offset,
+                },
+            ),
+            (
+                active_ref,
+                XrefEntry::Compressed {
+                    stream: stream_ref.number,
+                    index: 0,
+                },
+            ),
+        ]);
+        let document = BootstrapHandleDocument::new_with_state(
+            Some(&bytes),
+            XrefEntryLookup::Registration(&entries),
+            XrefLoadOptions::default(),
+            Rc::new(RefCell::new(BootstrapHandleState::default())),
+        );
+
+        assert_eq!(
+            document
+                .handle_for_reference(active_ref)
+                .try_get_key(b"/Value")
+                .expect("the compressed member resolves lazily")
+                .as_integer(),
+            Some(1)
+        );
+        assert_eq!(
+            document.entry_lookup.borrow().get(&absent_ref),
+            Some(&XrefEntry::Free { next: 0 }),
+            "an absent header member still receives qpdf's default free xref row"
         );
     }
 
