@@ -1199,19 +1199,16 @@ struct Cli {
     generate_appearances: bool,
 
     /// Recompress eligible non-JPEG images as DCT/JPEG (qpdf
-    /// `--optimize-images`). Rejected against inspection and attachment
-    /// modes: those dispatch branches call their dedicated writers without
-    /// ever consuming the computed image options, so without these
-    /// conflicts an accepted `--optimize-images` would be silently dropped.
+    /// `--optimize-images`). Inspection modes may be combined with this flag
+    /// like qpdf; they produce no output file, so the image mutation is not
+    /// observable there. Attachment mutation modes remain conflicts because
+    /// those dispatch branches do not consume the image options.
     /// `--pages`/`--rotate`/`--split-pages`/`--empty`/`--json`/
     /// `--json-output` are intentionally absent: all of those routes are
     /// already threaded through (see `top_level_image_options` at each call
     /// site).
     #[arg(long = "optimize-images",
           conflicts_with_all = [
-              "check", "show_object",
-              "show_npages", "show_pages", "show_xref", "show_linearization",
-              "show_encryption",
               "list_attachments", "show_attachment", "remove_attachment",
               "add_attachment", "copy_attachments_from",
           ])]
@@ -1220,11 +1217,10 @@ struct Cli {
     /// (qpdf `--externalize-inline-images`). This is a distinct transform
     /// from `--optimize-images`; when both are selected the shared image phase
     /// externalizes first and then optimizes reachable Image XObjects.
+    /// Inspection modes may be combined with this flag like qpdf; they do not
+    /// produce an output file, so the mutation is not observable there.
     #[arg(long = "externalize-inline-images",
           conflicts_with_all = [
-              "check", "show_object",
-              "show_npages", "show_pages", "show_xref", "show_linearization",
-              "show_encryption",
               "list_attachments", "show_attachment", "remove_attachment",
               "add_attachment", "copy_attachments_from",
           ])]

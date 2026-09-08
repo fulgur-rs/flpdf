@@ -401,10 +401,7 @@ fn rewrite_subcommand_applies_optimize_images_with_page_selection() {
 }
 
 #[test]
-fn optimize_images_conflicts_with_check() {
-    // --check's inspection dispatch never reaches a rewrite path that
-    // consumes the computed image options, so without this clap-level
-    // conflict the flag would be silently accepted and dropped.
+fn optimize_images_is_accepted_with_check_like_qpdf() {
     let tempdir = tempfile::tempdir().expect("tempdir");
     let input = tempdir.path().join("input.pdf");
     std::fs::write(&input, build_raw_grayscale_image_pdf(200, 200)).expect("write input");
@@ -414,8 +411,48 @@ fn optimize_images_conflicts_with_check() {
         .args(["--optimize-images", "--check"])
         .arg(&input)
         .assert()
-        .failure()
-        .code(2);
+        .success();
+}
+
+#[test]
+fn externalize_inline_images_is_accepted_with_check_like_qpdf() {
+    let tempdir = tempfile::tempdir().expect("tempdir");
+    let input = tempdir.path().join("input.pdf");
+    std::fs::write(&input, build_raw_grayscale_image_pdf(200, 200)).expect("write input");
+
+    Command::cargo_bin("flpdf")
+        .expect("flpdf binary")
+        .args(["--externalize-inline-images", "--check"])
+        .arg(&input)
+        .assert()
+        .success();
+}
+
+#[test]
+fn image_transform_options_are_accepted_with_inspection_modes_like_qpdf() {
+    let tempdir = tempfile::tempdir().expect("tempdir");
+    let input = tempdir.path().join("input.pdf");
+    std::fs::write(&input, build_raw_grayscale_image_pdf(200, 200)).expect("write input");
+    let inspection_modes = [
+        vec!["--show-npages"],
+        vec!["--show-pages"],
+        vec!["--show-xref"],
+        vec!["--show-linearization"],
+        vec!["--show-encryption"],
+        vec!["--show-object=trailer"],
+    ];
+
+    for image_option in ["--optimize-images", "--externalize-inline-images"] {
+        for mode in &inspection_modes {
+            Command::cargo_bin("flpdf")
+                .expect("flpdf binary")
+                .arg(image_option)
+                .args(mode)
+                .arg(&input)
+                .assert()
+                .success();
+        }
+    }
 }
 
 #[test]

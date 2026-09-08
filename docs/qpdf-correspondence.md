@@ -1179,6 +1179,13 @@ rotationのpage countは`QPDFJob::handleRotations` (`QPDFJob.cc:2638`) の`QIntC
 `optimizeImages` は `QPDFJob.cc:2151-2174` の変換順序に合わせ、inline image の外部化を先に行ったうえで、`PageObjectHelper::for_each_image(true)` が返す page/Form XObject を `job/image_optimization.rs` で走査する。`Pl_DCT.cc:249-295` 相当の JPEG 圧縮結果が元 `/Length` より短い場合だけ、元辞書を shallow-copy した新 stream に `/Filter /DCTDecode` と null `/DecodeParms` を設定し、provider として遅延登録する。qpdf 11.9.0 `image-optimization.test` の24行および最適化JPEG raw bytesを照合済みである。job JSON の生成 handler (`auto_job_json_init.hh:317-322,386-400`) と Config (`QPDFJob_config.cc:176-180,232-235,357-360,422-447`) は `job/lifecycle.rs` の `JobConfiguration` に接続し、`iiMinBytes` / `oiMin*` は qpdf の `QUtil::string_to_uint` と同じ unsigned-prefix parser を通す。`externalizeInlineImages` と `optimizeImages` を併用した場合は、明示 externalize が `keepInlineImages` より優先する qpdf の条件を保ったまま canonical image phase を一度だけ実行する。
 top-level argvの `--externalize-inline-images` も生成 handler (`auto_job_init.hh:38-55`) と同じbare option責務を `flpdf-cli` の `Cli`/`RewriteCommand` から `ImageTransformOptions` へ接続する。`--ii-min-bytes` は `QPDFJob_config.cc:232-235` の閾値をそのまま共有し、明示externalizeのみなら `PageObjectHelper::externalize_inline_images`、optimize併用なら qpdf順の共有image phaseを一度だけ呼ぶ。qpdf `inline-images.test` の22ケースで、EOF warning/exit status、named colorspace、damaged image、threshold、nested Form、QDF bytesを同一runの `harness.log` と `qtest-results.xml` で照合する。
 
+`flpdf-42xx` では、top-level の `--check` / `--show-*` と
+`--optimize-images` / `--externalize-inline-images` の組み合わせを qpdf 11.9.0
+と同じく受理する。qpdf は create stage の transformation設定を保持したまま、
+出力先が無い `writeQPDF` で inspectionへ分岐するため、CLIのclap conflictを
+置かず、inspectionのexit/statusと診断だけを観測する（`QPDFJob_config.cc:72-76`,
+`QPDFJob.cc:484-503,529-532`）。
+
 top-level `--flatten-annotations=all|screen|print` も `auto_job_init.hh:117` / `QPDFJob_config.cc:190-200` の choices を `flpdf-cli` の shared `run_rewrite` route に接続し、通常 rewrite と linearize rewrite の両方で `PageDocumentHelper::flatten_annotations` (`QPDFPageDocumentHelper.cc:55-77`) を実行する。`NeedAppearances` 時の `warnIfPossible` と stream filter warning の parsed-offset/suppression 境界も qpdf の warning/status contract に合わせる。
 
 CLI の page-operation route も同じ順序を保つ。qpdf は `createQPDF` で
