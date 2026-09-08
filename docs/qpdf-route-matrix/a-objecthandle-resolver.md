@@ -352,7 +352,7 @@ outside this cohort.
 | 対象行 | Beads issue | 責務 / 移行 slice |
 |---|---|---|
 | `A1` / `A9` / `A20` | `flpdf-3yn9.48.12` | QPDF document stateをparse前から所有しclassic trailerを同じcacheへ生成する |
-| `A1` / `A20` | `flpdf-3yn9.48.15` | bootstrap rebind・warning replay・第二teardownを撤去する |
+| `A1` / `A20` | `flpdf-3yn9.48.15`（child `.48.72` / `.48.73`） | owner-less bootstrap API/第2 teardownを`.48.72`、canonical warning live sinkとreplay/deferral撤去を`.48.73`で実施する |
 | `A11` / `A12` | `flpdf-3yn9.48.20` | makeIndirectObjectのclone allocatorをcanonical identity promotionへ移行する |
 | `A9` / `A13` / `A16` / `A17` | `flpdf-3yn9.48.21` | 書込み元が消えたqpdf_removed_refs空集合フィルタを撤去する |
 | `A1` / `A2` / `A9` / `A10` / `A11` / `A13` / `A15` / `A16` / `A17` / `A24` | `flpdf-3yn9.48.22` | 最後のconsumer移行後にfacade ObjectCache・同期・provenanceを撤去する |
