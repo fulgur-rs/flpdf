@@ -3153,7 +3153,8 @@ fn recover_xref_from_linear_scan(
     )
     .map_err(|error| {
         // cov:ignore: this defensive wrapper is reached only when the line-scan parser fails after canonical warning delivery
-        with_xref_open_diagnostics(error, repair_diagnostics.clone(), canonical_trailer_owner) // cov:ignore: defensive terminal open-failure wrapper after a line-scan parser error
+        with_xref_open_diagnostics(error, repair_diagnostics.clone(), canonical_trailer_owner)
+        // cov:ignore: defensive terminal open-failure wrapper after a line-scan parser error
     })?; // cov:ignore: the terminal open-failure wrapper is covered by recovery failure tests; this edge preserves the live owner collection
     let mut entries = recovered.entries;
     // qpdf removes only type-1 rows before its reconstruction scan
