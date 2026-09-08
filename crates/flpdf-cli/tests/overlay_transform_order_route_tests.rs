@@ -1,0 +1,183 @@
+use assert_cmd::Command;
+use serde_json::Value;
+use std::fs;
+use std::path::{Path, PathBuf};
+use std::process::Command as ProcessCommand;
+
+fn production_main_source() -> String {
+    fs::read_to_string(
+        PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+            .join("src")
+            .join("main.rs"),
+    )
+    .expect("read flpdf-cli main source")
+}
+
+fn assemble_pdf(objects: &[(u32, Vec<u8>)]) -> Vec<u8> {
+    let mut bytes = b"%PDF-1.4\n".to_vec();
+    let mut offsets = vec![0usize; objects.len() + 1];
+    for (number, body) in objects {
+        offsets[*number as usize] = bytes.len();
+        bytes.extend_from_slice(format!("{number} 0 obj\n").as_bytes());
+        bytes.extend_from_slice(body);
+        bytes.extend_from_slice(b"\nendobj\n");
+    }
+    let xref_offset = bytes.len();
+    bytes.extend_from_slice(format!("xref\n0 {}\n", objects.len() + 1).as_bytes());
+    bytes.extend_from_slice(b"0000000000 65535 f \n");
+    for offset in offsets.into_iter().skip(1) {
+        bytes.extend_from_slice(format!("{offset:010} 00000 n \n").as_bytes());
+    }
+    bytes.extend_from_slice(
+        format!(
+            "trailer\n<< /Size {} /Root 1 0 R >>\nstartxref\n{xref_offset}\n%%EOF\n",
+            objects.len() + 1
+        )
+        .as_bytes(),
+    );
+    bytes
+}
+
+fn inline_image_pdf(width: usize, height: usize) -> Vec<u8> {
+    // qpdf's inline-image reader consumes the separator byte before EI as part
+    // of the raw buffer, so leave one byte for that delimiter.
+    let pixels = vec![128u8; width * height - 1];
+    let mut content =
+        format!("q 200 0 0 200 0 0 cm BI /W {width} /H {height} /CS /G /BPC 8 ID\n").into_bytes();
+    content.extend_from_slice(&pixels);
+    content.extend_from_slice(b" EI Q\n");
+    assemble_pdf(&[
+        (1, b"<< /Type /Catalog /Pages 2 0 R >>".to_vec()),
+        (2, b"<< /Type /Pages /Kids [3 0 R] /Count 1 >>".to_vec()),
+        (
+            3,
+            b"<< /Type /Page /Parent 2 0 R /MediaBox [0 0 200 200] /Resources << >> /Contents 4 0 R >>".to_vec(),
+        ),
+        (
+            4,
+            {
+                let mut object = format!("<< /Length {} >>\nstream\n", content.len()).into_bytes();
+                object.extend_from_slice(&content);
+                object.extend_from_slice(b"endstream");
+                object
+            },
+        ),
+    ])
+}
+
+fn qpdf_available() -> bool {
+    ProcessCommand::new("/usr/bin/qpdf")
+        .arg("--version")
+        .output()
+        .is_ok_and(|output| output.status.success())
+}
+
+fn image_count(path: &Path) -> usize {
+    let output = ProcessCommand::new("/usr/bin/qpdf")
+        .args(["--json=2"])
+        .arg(path)
+        .output()
+        .expect("run qpdf JSON");
+    assert!(output.status.success(), "qpdf JSON failed: {output:?}");
+    let json: Value = serde_json::from_slice(&output.stdout).expect("valid qpdf JSON");
+    fn count(value: &Value) -> usize {
+        match value {
+            Value::Object(entries) => entries
+                .iter()
+                .map(|(key, value)| {
+                    usize::from(key == "/Subtype" && value.as_str() == Some("/Image"))
+                        + count(value)
+                })
+                .sum(),
+            Value::Array(values) => values.iter().map(count).sum(),
+            Value::Null | Value::Bool(_) | Value::Number(_) | Value::String(_) => 0,
+        }
+    }
+    count(&json)
+}
+
+#[test]
+fn direct_rewrite_applies_overlay_before_transformations() {
+    let source = production_main_source();
+    let direct_rewrite = source
+        .split_once("// qpdf runs disableDigitalSignatures unconditionally under")
+        .map(|(_, body)| body)
+        .expect("direct rewrite transformation pass");
+    let overlay = direct_rewrite
+        .find("flpdf::apply_overlay_specs(&mut pdf, &mut built)")
+        .expect("direct rewrite overlay route");
+    let image = direct_rewrite
+        .find("apply_image_transformations(&mut pdf, image_options, verbose)?")
+        .expect("direct rewrite image route");
+    let appearances = direct_rewrite
+        .find("if generate_appearances")
+        .expect("direct rewrite appearance route");
+    let annotations = direct_rewrite
+        .find("if let Some(mode) = flatten_annotations_mode")
+        .expect("direct rewrite annotation route");
+
+    assert!(
+        overlay < image && image < appearances && appearances < annotations,
+        "qpdf createQPDF order is overlay -> transformations"
+    );
+}
+
+#[test]
+fn direct_rewrite_overlay_images_match_qpdf_after_externalization() {
+    if !qpdf_available() {
+        return;
+    }
+    let directory = tempfile::tempdir().expect("temporary directory");
+    let primary = directory.path().join("primary.pdf");
+    let overlay = directory.path().join("overlay.pdf");
+    let flpdf_output = directory.path().join("flpdf-output.pdf");
+    let qpdf_output = directory.path().join("qpdf-output.pdf");
+    let input = inline_image_pdf(200, 200);
+    fs::write(&primary, &input).expect("write primary");
+    fs::write(&overlay, &input).expect("write overlay");
+
+    let qpdf = ProcessCommand::new("/usr/bin/qpdf")
+        .args([
+            "--static-id",
+            "--optimize-images",
+            "--ii-min-bytes=0",
+            "--overlay",
+        ])
+        .arg(&overlay)
+        .arg("--")
+        .arg(&primary)
+        .arg(&qpdf_output)
+        .output()
+        .expect("run qpdf overlay image transformation");
+    assert!(qpdf.status.success(), "qpdf failed: {qpdf:?}");
+
+    Command::cargo_bin("flpdf")
+        .expect("flpdf binary")
+        .args([
+            "--static-id",
+            "--optimize-images",
+            "--ii-min-bytes=0",
+            "--overlay",
+        ])
+        .arg(&overlay)
+        .arg("--")
+        .arg(&primary)
+        .arg(&flpdf_output)
+        .assert()
+        .success();
+
+    let qpdf_images = image_count(&qpdf_output);
+    let flpdf_images = image_count(&flpdf_output);
+    assert!(qpdf_images > 0, "probe must contain externalized images");
+    assert_eq!(
+        flpdf_images, qpdf_images,
+        "overlay image traversal diverged"
+    );
+
+    #[cfg(feature = "qpdf-zlib-compat")]
+    assert_eq!(
+        fs::read(&flpdf_output).expect("read flpdf output"),
+        fs::read(&qpdf_output).expect("read qpdf output"),
+        "qpdf-zlib-compat overlay image rewrite must be byte-identical"
+    );
+}

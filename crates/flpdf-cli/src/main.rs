@@ -5364,25 +5364,52 @@ fn run_rewrite_opened<R: Read + Seek + 'static>(
         if decrypt {
             options.preserve_encryption = false;
         }
-        // qpdf applies the image passes inside `handleTransformations`
-        // (`libqpdf/QPDFJob.cc:2151`), before `generate_appearances` (`:2178`)
-        // and `flatten_annotations` (`:2182`). This route runs the overlay
-        // import later than qpdf does, so overlay-introduced Form XObjects are
-        // not visited here; that gap is tracked separately rather than moved
-        // past the annotation passes, which would change their inputs.
-        apply_image_transformations(&mut pdf, image_options, verbose)?;
+        // qpdf's createQPDF applies underlay/overlay before entering
+        // handleTransformations (`QPDFJob.cc:472-473`). Import the forms first
+        // so the following image and annotation passes can see overlay-owned
+        // Form XObjects, matching the canonical QPDFJob lifecycle route.
+        // qpdf keeps a provider-backed source QPDF alive when
+        // `copyForeignObject` copies a Form XObject whose data comes from a
+        // `StreamDataProvider` (`libqpdf/QPDF.cc:2248-2257`). Retain the
+        // opened source documents through the destination writer as well.
+        let _built_overlay_specs = if !overlay_specs.is_empty() {
+            let mut built =
+                build_overlay_specs_with_suppression(overlay_specs, repair, password, no_warn)?;
 
+            // Propagate qpdf's max input version and Adobe extension level to
+            // the writer (QPDFJob.cc:1714 and :2913), while leaving the
+            // explicit raw --min-version for the writer's later setter.
+            update_input_version_floor(&mut options.input_version_floor, &mut pdf)?;
+            for spec in built.iter_mut() {
+                update_input_version_floor(&mut options.input_version_floor, &mut spec.source)?;
+            }
+
+            if verbose {
+                let report = flpdf::overlay_verbose_report(&mut pdf, &mut built)?;
+                logger_info(overlay_verbose_message(&report, overlay_specs))?;
+            }
+
+            flpdf::apply_overlay_specs(&mut pdf, &mut built)?;
+            Some(built)
+        } else {
+            None
+        };
+
+        apply_image_transformations(&mut pdf, image_options, verbose)?;
         // ── Content mutation pass ─────────────────────────────────────────────
         //
         // The mutations below operate on the in-memory Pdf model (via set_object).
         // They are all visible in the canonical writer output.
         //
-        // Application order follows QPDFJob::handleTransformations:
-        //   1. generate appearances;
-        //   2. flatten annotations;
-        //   3. coalesce page contents;
-        //   4. flatten rotation and apply page stacking;
-        //   5. normalize content immediately before the writer consumes it.
+        // Application order follows QPDFJob::createQPDF and
+        // QPDFJob::handleTransformations:
+        //   1. overlay/underlay page stacking;
+        //   2. externalize/optimize images;
+        //   3. generate appearances;
+        //   4. flatten annotations;
+        //   5. coalesce page contents;
+        //   6. flatten rotation;
+        //   7. normalize content immediately before the writer consumes it.
         // The coalesce operation is the provider-backed PageObjectHelper
         // route; it must not materialize a legacy page byte buffer.
         //
@@ -5405,7 +5432,7 @@ fn run_rewrite_opened<R: Read + Seek + 'static>(
         // "Content mutation pass" note above. qpdf prunes /Resources entries only
         // during page operations, which flpdf handles in run_page_extraction.)
 
-        // Step 1: generate missing form-field appearance streams
+        // Step 3: generate missing form-field appearance streams
         // (--generate-appearances). MUST run before --flatten-annotations so
         // value-only fields (e.g. a filled text field with no /AP) are baked
         // into page content instead of being dropped (acceptance ordering:
@@ -5414,14 +5441,14 @@ fn run_rewrite_opened<R: Read + Seek + 'static>(
             generate_missing_appearances(&mut pdf)?;
         }
 
-        // Step 2: flatten annotations into page content (--flatten-annotations).
+        // Step 4: flatten annotations into page content (--flatten-annotations).
         if let Some(mode) = flatten_annotations_mode {
             let (required_flags, forbidden_flags) = mode.flags();
             PageDocumentHelper::new(&mut pdf)
                 .flatten_annotations(required_flags, forbidden_flags)?;
         }
 
-        // Step 3: coalesce per-page /Contents arrays into provider-backed
+        // Step 5: coalesce per-page /Contents arrays into provider-backed
         // streams. This intentionally follows annotation flattening, matching
         // QPDFJob.cc:2183-2187 for the combined flags.
         if coalesce_contents {
@@ -5431,58 +5458,15 @@ fn run_rewrite_opened<R: Read + Seek + 'static>(
             }
         }
 
-        // Step 4: flatten page rotation into content (--flatten-rotation).
+        // Step 6: flatten page rotation into content (--flatten-rotation).
         if flatten_rotation {
             let page_refs = pages::page_refs(&mut pdf)?;
             flatten_rotation_on_pages(&mut pdf, &page_refs)?;
         }
 
-        // Step 5: overlay/underlay page stacking (--overlay / --underlay).
-        // qpdf applies this as its page-stacking step, after page selection and
-        // the other content transforms and before writing; mirror that ordering
-        // so the output graph (and thus the bytes) matches qpdf. Each source is
-        // opened (with its --password) and imported into the in-memory document
-        // here; the new objects are part of the canonical writer graph.
-        // qpdf keeps a provider-backed source QPDF alive when
-        // `copyForeignObject` copies a Form XObject whose data comes from a
-        // `StreamDataProvider` (`libqpdf/QPDF.cc:2248-2257`). The canonical
-        // overlay route has the same lifetime contract: retain the opened
-        // source documents until after the destination writer has consumed
-        // every copied Form stream, not just until page stacking returns.
-        let _built_overlay_specs = if !overlay_specs.is_empty() {
-            let mut built =
-                build_overlay_specs_with_suppression(overlay_specs, repair, password, no_warn)?;
-
-            // Propagate qpdf's max input version and Adobe
-            // extension level to the writer (QPDFJob.cc:1714 and :2913),
-            // while leaving the explicit raw --min-version for the writer's
-            // later setter.
-            update_input_version_floor(&mut options.input_version_floor, &mut pdf)?;
-            for spec in built.iter_mut() {
-                update_input_version_floor(&mut options.input_version_floor, &mut spec.source)?;
-            }
-
-            // --verbose: emit the per-destination-page overlay/underlay plan
-            // to stderr before painting, matching qpdf's --verbose output
-            // ("processing underlay/overlay" header + `  page N` +
-            // `    <file> overlay|underlay <src>`). The report is computed
-            // via the flpdf::overlay_verbose_report inspection API so the
-            // ordering (underlays first, then overlays, in declaration
-            // order across specs) is source-shared with apply_overlay_specs.
-            if verbose {
-                let report = flpdf::overlay_verbose_report(&mut pdf, &mut built)?;
-                logger_info(overlay_verbose_message(&report, overlay_specs))?;
-            }
-
-            flpdf::apply_overlay_specs(&mut pdf, &mut built)?;
-            Some(built)
-        } else {
-            None
-        };
-
         apply_canonical_page_labels(&mut pdf, &page_labels, verbose, no_warn)?;
 
-        // Step 6: normalize after all page transformations. The stream
+        // Step 7: normalize after all page transformations. The stream
         // normalizer consumes the provider-backed coalesced route and writes
         // the normalized bytes through ObjectHandle.
         let normalization_last_bad = if normalize_content {
