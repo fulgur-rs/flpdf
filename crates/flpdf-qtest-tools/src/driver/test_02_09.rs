@@ -91,10 +91,17 @@ pub(crate) fn run_test_2<R: Read + Seek>(
     let encrypt = trailer.try_get_key(b"/Encrypt")?;
     let o = encrypt.try_get_key(b"/O")?;
     resolve_handle(pdf, &o)?;
+    // qpdf delivers a lazy-resolution warning the instant `warn()` records it
+    // (`libqpdf/QPDF.cc:487-494`), so it belongs before this value's own line
+    // rather than after both encrypted-string lines.
+    emit_new_diagnostics(pdf, diagnostics_written, filename, stdout, stderr)
+        .map_err(Error::from)?;
     write_bytes(stdout, &o.unparse())?;
     writeln!(stdout)?;
     let u = encrypt.try_get_key(b"/U")?;
     resolve_handle(pdf, &u)?;
+    emit_new_diagnostics(pdf, diagnostics_written, filename, stdout, stderr)
+        .map_err(Error::from)?;
     write_bytes(stdout, &u.unparse())?;
     writeln!(stdout)?;
 
@@ -295,22 +302,21 @@ pub(crate) fn run_test_5<R: Read + Seek>(
         // the instant `warn()` records it (`libqpdf/QPDF.cc:487-494`), so a
         // deferred drain would print it after the line it belongs to -- or
         // after a later section's output entirely.
-        let dimensions = {
-            let mut page_helper = PageObjectHelper::new(*page_ref, pdf);
-            let mut dimensions = Vec::new();
-            for (name, image) in page_helper.get_images()? {
-                let image_dict = image
-                    .as_stream_dict()
-                    .expect("get_images only returns image stream handles");
-                let width = image_dict.try_get_key(b"/Width")?.try_get_int_value()?;
-                let height = image_dict.try_get_key(b"/Height")?.try_get_int_value()?;
-                dimensions.push((name, width, height));
-            }
-            dimensions
-        };
-        emit_new_diagnostics(pdf, diagnostics_written, filename, stdout, stderr)
-            .map_err(Error::from)?;
-        for (name, width, height) in dimensions {
+        // Collect the handles while the helper holds `pdf`, then release that
+        // borrow so each image's own type warnings can drain immediately
+        // before its line. qpdf processes the entries sequentially and
+        // delivers a warning the instant `warn()` records it
+        // (`libqpdf/QPDF.cc:487-494`), so a later image's warning must follow
+        // the earlier images' lines, not precede all of them.
+        let images = PageObjectHelper::new(*page_ref, pdf).get_images()?;
+        for (name, image) in images {
+            let image_dict = image
+                .as_stream_dict()
+                .expect("get_images only returns image stream handles");
+            let width = image_dict.try_get_key(b"/Width")?.try_get_int_value()?;
+            let height = image_dict.try_get_key(b"/Height")?.try_get_int_value()?;
+            emit_new_diagnostics(pdf, diagnostics_written, filename, stdout, stderr)
+                .map_err(Error::from)?;
             write!(stdout, "    ")?;
             write_bytes(stdout, &name)?;
             writeln!(stdout, ": {width} x {height}")?;
@@ -331,6 +337,11 @@ pub(crate) fn run_test_5<R: Read + Seek>(
 
     let qstrings = root.try_get_key(b"/QStrings")?;
     resolve_handle(pdf, &qstrings)?;
+    // The container's own resolution can warn; qpdf raises it during the
+    // array check, before the section header, and it must still appear
+    // when the array turns out to be empty.
+    emit_new_diagnostics(pdf, diagnostics_written, filename, stdout, stderr)
+        .map_err(Error::from)?;
     if let Some(items) = qstrings.as_array() {
         writeln!(stdout, "QStrings:")?;
         for item in items {
@@ -344,6 +355,11 @@ pub(crate) fn run_test_5<R: Read + Seek>(
 
     let qnumbers = root.try_get_key(b"/QNumbers")?;
     resolve_handle(pdf, &qnumbers)?;
+    // The container's own resolution can warn; qpdf raises it during the
+    // array check, before the section header, and it must still appear
+    // when the array turns out to be empty.
+    emit_new_diagnostics(pdf, diagnostics_written, filename, stdout, stderr)
+        .map_err(Error::from)?;
     if let Some(items) = qnumbers.as_array() {
         writeln!(stdout, "QNumbers:")?;
         for item in items {
