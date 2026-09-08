@@ -5364,6 +5364,14 @@ fn run_rewrite_opened<R: Read + Seek + 'static>(
         if decrypt {
             options.preserve_encryption = false;
         }
+        // qpdf applies the image passes inside `handleTransformations`
+        // (`libqpdf/QPDFJob.cc:2151`), before `generate_appearances` (`:2178`)
+        // and `flatten_annotations` (`:2182`). This route runs the overlay
+        // import later than qpdf does, so overlay-introduced Form XObjects are
+        // not visited here; that gap is tracked separately rather than moved
+        // past the annotation passes, which would change their inputs.
+        apply_image_transformations(&mut pdf, image_options, verbose)?;
+
         // ── Content mutation pass ─────────────────────────────────────────────
         //
         // The mutations below operate on the in-memory Pdf model (via set_object).
@@ -5471,12 +5479,6 @@ fn run_rewrite_opened<R: Read + Seek + 'static>(
         } else {
             None
         };
-
-        // qpdf runs `handleUnderOverlay` before `handleTransformations`
-        // (`libqpdf/QPDFJob.cc:472-473`), so the image passes must see the Form
-        // XObjects the overlay/underlay import just added: inline images inside
-        // them are externalized too.
-        apply_image_transformations(&mut pdf, image_options, verbose)?;
 
         apply_canonical_page_labels(&mut pdf, &page_labels, verbose, no_warn)?;
 
