@@ -3364,6 +3364,69 @@ fn job_json_replace_input_preserves_non_utf8_derived_backup_path() {
     assert!(PathBuf::from(backup).exists());
 }
 
+/// `Config::pages().pageSpec()` (`QPDFJob_config.cc`'s pages sub-config) and
+/// the JSON `pages` array both populate the same `page_specs` queue consumed
+/// by `QPDFJob::handlePageSpecs` (`QPDFJob.cc:2359-2434`). Confirm
+/// `QPDFJobConfig::add_page_spec` reaches identical byte output to the
+/// already-covered JSON path for a single-source in-place page selection, so
+/// a CLI consumer can build a job through the programmatic Config surface
+/// instead of encoding an argv/JSON string.
+#[test]
+fn config_add_page_spec_matches_the_json_configured_path_single_source() {
+    let input =
+        Path::new(env!("CARGO_MANIFEST_DIR")).join("../../tests/fixtures/compat/three-page.pdf");
+    let tempdir = tempfile::tempdir().unwrap();
+    let via_config = tempdir.path().join("via-config.pdf");
+    let via_json = tempdir.path().join("via-json.pdf");
+
+    let mut config_job = QPDFJob::new();
+    config_job
+        .config()
+        .input_file(&input)
+        .unwrap()
+        .output_file(&via_config)
+        .unwrap()
+        .deterministic_id()
+        .add_page_spec(".", "2-3,1", Vec::new())
+        .unwrap();
+    assert_eq!(config_job.run().unwrap(), JobExitCode::Success);
+
+    // Both jobs must use qpdf's `/ID` -> deterministic mode
+    // (`--deterministic-id`, `QPDFWriter.cc`'s hash-of-content ID instead of
+    // random bytes) since two independently run jobs otherwise differ only
+    // in the random trailer `/ID`, which is not what this test checks.
+    let mut json_job = QPDFJob::new();
+    let json = serde_json::json!({
+        "inputFile": input,
+        "outputFile": via_json,
+        "deterministicId": "",
+        "pages": [{"file": ".", "range": "2-3,1"}],
+    })
+    .to_string();
+    json_job.initialize_from_json(&json).unwrap();
+    assert_eq!(json_job.run().unwrap(), JobExitCode::Success);
+
+    assert_eq!(
+        std::fs::read(&via_config).unwrap(),
+        std::fs::read(&via_json).unwrap(),
+        "the Config builder and the JSON path must produce byte-identical output"
+    );
+}
+
+/// An out-of-range page range must surface qpdf's page-range parse error
+/// through `QPDFJobConfig::add_page_spec`'s `Result`, not a panic or a
+/// silently-accepted spec.
+#[test]
+fn config_add_page_spec_rejects_an_invalid_range() {
+    let mut job = QPDFJob::new();
+    let error = job
+        .config()
+        .add_page_spec(".", "0", Vec::new())
+        .err()
+        .expect("an out-of-range page range must be rejected");
+    assert!(matches!(error, Error::Parse { .. }), "got {error:?}");
+}
+
 /// `Config::addAttachment` (`QPDFJob_config.cc:894-936`) and the JSON
 /// `addAttachment` array both populate the same `attachments_to_add` queue
 /// consumed by `QPDFJob::addAttachments` (`QPDFJob.cc:2044-2083`). Confirm

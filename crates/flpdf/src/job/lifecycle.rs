@@ -4631,6 +4631,37 @@ impl QPDFJobConfig<'_> {
         self
     }
 
+    /// Queue one `--pages` file specification for
+    /// `QPDFJob::PagesConfig::pageSpec` (`QPDFJob_config.cc:963-969`), which
+    /// `QPDFJob::handlePageSpecs` later consumes (`QPDFJob.cc:2359-2440`).
+    ///
+    /// `range` uses flpdf's [`PageRange`] grammar. That grammar is a subset of
+    /// qpdf's `QUtil::parse_numrange` (`QUtil.cc:1304`): it accepts `z`,
+    /// `r<n>`, `:odd`/`:even` and comma-separated entries, but not qpdf's `x`
+    /// exclusion group. An empty string selects every page, matching qpdf's
+    /// `1-z` default (`QPDFJob.cc:2364-2372`). `password` is the source's own
+    /// password; pass an empty slice when the file is not encrypted.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`Error::Usage`] when `range` does not parse, matching the
+    /// job-JSON path for the same field.
+    pub fn add_page_spec(
+        &mut self,
+        file: impl Into<PathBuf>,
+        range: &str,
+        password: impl Into<Vec<u8>>,
+    ) -> Result<&mut Self> {
+        let range = PageRange::parse(range)
+            .map_err(|error| Error::Usage(UsageError::new(error.to_string())))?;
+        self.job.configuration.page_specs.push(JobPageConfig {
+            path: file.into(),
+            password: password.into(),
+            range,
+        });
+        Ok(self)
+    }
+
     /// Queue one `--add-attachment` file for `QPDFJob::addAttachments`
     /// (`QPDFJob.cc:2044-2083`).
     pub fn add_attachment(&mut self, options: AttachmentAddOptions) -> &mut Self {
