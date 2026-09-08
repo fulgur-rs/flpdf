@@ -1854,12 +1854,18 @@ impl<R: Read + Seek> ResolverHandle<R> {
     /// Sever every canonical handle's value, breaking the reference cycles a
     /// resolved object graph forms.
     ///
-    /// qpdf `QPDF::~QPDF` walks `m->obj_cache` and replaces each object with
-    /// `QPDF_Destroyed` for the same reason. Both `Pdf::drop` and the resolver's
-    /// own Drop implementation use this idempotent operation; the latter is
+    /// qpdf `QPDF::~QPDF` first clears `m->xref_table`, then walks
+    /// `m->obj_cache` and replaces each object with `QPDF_Destroyed`
+    /// (`libqpdf/QPDF.cc:215-236`). Both `Pdf::drop` and the resolver's own
+    /// Drop implementation use this idempotent operation; the latter is
     /// required when opening fails before a `Pdf` exists.
     pub(crate) fn disconnect_all(&self) {
-        for handle in self.core.borrow().object_cache.values() {
+        let handles: Vec<_> = {
+            let mut core = self.core.borrow_mut();
+            core.source_xref_entries.clear();
+            core.object_cache.values().cloned().collect()
+        };
+        for handle in handles {
             handle.disconnect_and_destroy();
         }
     }
@@ -8604,6 +8610,19 @@ mod tests {
             "qpdf ot_destroyed"
         );
         assert!(!handle.is_null());
+    }
+
+    #[test]
+    fn disconnect_all_clears_xref_before_destroying_canonical_handles() {
+        let mut pdf = Pdf::open_mem_owned(minimal_pdf_bytes()).expect("open");
+        let handle = pdf.get_object_handle(ObjectRef::new(1, 0));
+        pdf.resolve(&handle).expect("resolve catalog");
+        assert!(!pdf.resolver.source_xref_entries().is_empty());
+
+        pdf.resolver.disconnect_all();
+
+        assert!(pdf.resolver.source_xref_entries().is_empty());
+        assert_eq!(handle.type_code().expect("destroyed type code"), 14);
     }
 
     /// The resolver cannot outlive the document that owns it, observed through

@@ -248,9 +248,11 @@ pub(crate) struct LoadedXrefState {
     pub(crate) pending_reconstruction_trigger: Option<(u64, String)>,
     pub(crate) trailer_references: BTreeSet<ObjectRef>,
     pub(crate) parsed_xref_streams: BTreeMap<ObjectRef, ObjectHandle>,
-    /// Objects resolved while reading xref streams stay available to the
-    /// post-chain trailer validation, matching qpdf's shared object cache.
-    pub(crate) bootstrap_cache: SharedBootstrapCache,
+    /// Owner-less objects resolved while reading xref streams stay available
+    /// to post-chain trailer validation, matching the standalone loader's
+    /// temporary cache. Canonical-owner loading leaves this `None` because
+    /// qpdf keeps those objects in the document's one object cache.
+    pub(crate) bootstrap_cache: Option<SharedBootstrapCache>,
     pub(crate) header_offset: usize,
     /// True when open-time xref recovery via linear scan already ran.
     ///
@@ -404,6 +406,52 @@ enum XrefReadContextSpec<'a> {
         reference_offsets: &'a Rc<[u64]>,
         bootstrap_cache: &'a SharedBootstrapCache,
     },
+}
+
+fn context_spec_without_bootstrap_cache<'a>(
+    context_spec: XrefReadContextSpec<'a>,
+) -> XrefReadContextSpec<'a> {
+    match context_spec {
+        XrefReadContextSpec::ActiveSection | XrefReadContextSpec::ActiveSectionWithCache { .. } => {
+            XrefReadContextSpec::ActiveSection
+        }
+        XrefReadContextSpec::Reconstruction {
+            line_scan_entries,
+            reference_offsets,
+        }
+        | XrefReadContextSpec::ReconstructionWithCache {
+            line_scan_entries,
+            reference_offsets,
+            ..
+        } => XrefReadContextSpec::Reconstruction {
+            line_scan_entries,
+            reference_offsets,
+        },
+    }
+}
+
+fn context_spec_with_bootstrap_cache<'a>(
+    context_spec: XrefReadContextSpec<'a>,
+    bootstrap_cache: &'a SharedBootstrapCache,
+) -> XrefReadContextSpec<'a> {
+    match context_spec {
+        XrefReadContextSpec::ActiveSection | XrefReadContextSpec::ActiveSectionWithCache { .. } => {
+            XrefReadContextSpec::ActiveSectionWithCache { bootstrap_cache }
+        }
+        XrefReadContextSpec::Reconstruction {
+            line_scan_entries,
+            reference_offsets,
+        }
+        | XrefReadContextSpec::ReconstructionWithCache {
+            line_scan_entries,
+            reference_offsets,
+            ..
+        } => XrefReadContextSpec::ReconstructionWithCache {
+            line_scan_entries,
+            reference_offsets,
+            bootstrap_cache,
+        },
+    }
 }
 
 /// The qpdf description passed to `readObjectAtOffset` for a bootstrap object.
@@ -1917,7 +1965,9 @@ pub(crate) fn load_xref_state_from_bytes(
     let mut registration = XrefRegistration::default();
     let mut initial_parse_diagnostics = Diagnostics::default();
     let mut observed_first_xref_item_offset = None;
-    let initial_bootstrap_cache = empty_bootstrap_cache();
+    let initial_bootstrap_cache = canonical_trailer_owner
+        .is_none()
+        .then(empty_bootstrap_cache);
     // Unlike the owner-less bootstrap path this retry otherwise shares, a
     // canonical owner cannot safely attempt it at all --
     // `CanonicalTrailerOwner::indirect_handle`/`read_xref_stream_at_offset`
@@ -1934,6 +1984,11 @@ pub(crate) fn load_xref_state_from_bytes(
     // Err-from-parse_startxref arm above returns immediately when
     // `!allow_repair`); that narrower case is unverified against qpdf and
     // left to the unfixed bootstrap-shaped retry below.
+    let initial_context_spec = initial_bootstrap_cache
+        .as_ref()
+        .map_or(XrefReadContextSpec::ActiveSection, |bootstrap_cache| {
+            XrefReadContextSpec::ActiveSectionWithCache { bootstrap_cache }
+        });
     let initial_parse_result =
         if allow_repair && startxref == 0 && canonical_trailer_owner.is_some() {
             Err(Error::parse(0, "xref not found"))
@@ -1946,9 +2001,7 @@ pub(crate) fn load_xref_state_from_bytes(
                 options.clone(),
                 &mut registration,
                 Some(&mut initial_parse_diagnostics),
-                XrefReadContextSpec::ActiveSectionWithCache {
-                    bootstrap_cache: &initial_bootstrap_cache,
-                },
+                initial_context_spec,
                 Some(&mut observed_first_xref_item_offset),
                 true,
                 canonical_trailer_owner,
@@ -1979,7 +2032,11 @@ pub(crate) fn load_xref_state_from_bytes(
                 }
             }
             let preexisting_entries = (startxref != 0).then_some(&registration.entries);
-            let preexisting_bootstrap_cache = (startxref != 0).then_some(&initial_bootstrap_cache);
+            let preexisting_bootstrap_cache = if startxref != 0 {
+                initial_bootstrap_cache.as_ref()
+            } else {
+                None
+            };
             let mut recovered = recover_xref_from_linear_scan(
                 bytes,
                 version,
@@ -2014,7 +2071,7 @@ pub(crate) fn load_xref_state_from_bytes(
             trigger,
             Some(&loaded.loaded.trailer),
             Some(&registration.entries),
-            Some(&loaded.bootstrap_cache),
+            loaded.bootstrap_cache.as_ref(),
             options.clone(),
             diagnostics,
             Some(loaded.first_xref_item_offset),
@@ -2049,7 +2106,7 @@ pub(crate) fn load_xref_state_from_bytes(
                 trigger,
                 Some(&loaded.loaded.trailer),
                 Some(&registration.entries),
-                Some(&loaded.bootstrap_cache),
+                loaded.bootstrap_cache.as_ref(),
                 options.clone(),
                 previous_parse_diagnostics,
                 observed_first_xref_item_offset,
@@ -2086,7 +2143,10 @@ pub(crate) fn load_xref_state_from_bytes(
         let mut context = XrefReadContext::new(
             bytes,
             XrefReadContextSpec::ActiveSectionWithCache {
-                bootstrap_cache: &loaded.bootstrap_cache,
+                bootstrap_cache: loaded
+                    .bootstrap_cache
+                    .as_ref()
+                    .expect("owner-less xref state has a bootstrap cache"),
             },
             &registration,
             options.clone(),
@@ -2119,7 +2179,7 @@ pub(crate) fn load_xref_state_from_bytes(
             error,
             Some(&loaded.loaded.trailer),
             None, // cov:ignore: an existing fallback trailer suppresses candidate re-entry, so no prior candidate state is consumed here
-            Some(&loaded.bootstrap_cache), // cov:ignore: the post-chain /Size trigger is superseded by the canonical classic-trailer validation handoff before this defensive path
+            loaded.bootstrap_cache.as_ref(), // cov:ignore: the post-chain /Size trigger is superseded by the canonical classic-trailer validation handoff before this defensive path
             options.clone(),
             diagnostics,
             None,
@@ -2154,7 +2214,10 @@ pub(crate) fn load_xref_state_from_bytes(
                     XrefReadContextSpec::ReconstructionWithCache {
                         line_scan_entries: &recovered.loaded.entries,
                         reference_offsets: &recovered_reference_offsets,
-                        bootstrap_cache: &recovered.bootstrap_cache,
+                        bootstrap_cache: recovered
+                            .bootstrap_cache
+                            .as_ref()
+                            .expect("owner-less recovered xref state has a bootstrap cache"),
                     },
                     &reconstruction_registration,
                     options.clone(),
@@ -2360,8 +2423,7 @@ fn parse_xref_from_start_with_owner_and_build_diagnostics(
         // cov:ignore-end
         let bootstrap_cache = trailer_context
             .as_ref()
-            .map(|context| context.cache.shared())
-            .unwrap_or_else(empty_bootstrap_cache);
+            .map(|context| context.cache.shared());
         let trailer_references = collect_trailer_references(&trailer);
         let mut loaded = LoadedXrefState {
             loaded: LoadedXref {
@@ -2538,9 +2600,15 @@ fn merge_bootstrap_handle_state_prefer_source(
 }
 
 fn merge_bootstrap_cache_prefer_source(
-    destination: &SharedBootstrapCache,
-    source: &SharedBootstrapCache,
+    destination: &mut Option<SharedBootstrapCache>,
+    source: &Option<SharedBootstrapCache>,
 ) {
+    let (Some(destination), Some(source)) = (destination.as_ref(), source.as_ref()) else {
+        if destination.is_none() {
+            *destination = source.as_ref().map(Rc::clone);
+        }
+        return;
+    };
     if Rc::ptr_eq(destination, source) {
         return;
     }
@@ -2622,34 +2690,20 @@ fn merge_xref_stream_from_classic_trailer_with_build_diagnostics(
         return Ok(());
     }
 
-    let hybrid_bootstrap_cache = match context_spec {
-        XrefReadContextSpec::ActiveSection | XrefReadContextSpec::Reconstruction { .. } => {
-            &loaded.bootstrap_cache
-        }
-        XrefReadContextSpec::ActiveSectionWithCache { bootstrap_cache }
-        | XrefReadContextSpec::ReconstructionWithCache {
-            bootstrap_cache, ..
-        } => bootstrap_cache,
-    };
-    let hybrid_context_spec = match context_spec {
-        XrefReadContextSpec::ActiveSection | XrefReadContextSpec::ActiveSectionWithCache { .. } => {
-            XrefReadContextSpec::ActiveSectionWithCache {
-                bootstrap_cache: hybrid_bootstrap_cache,
+    let hybrid_context_spec = if canonical_trailer_owner.is_some() {
+        context_spec_without_bootstrap_cache(context_spec)
+    } else {
+        match context_spec {
+            XrefReadContextSpec::ActiveSection | XrefReadContextSpec::Reconstruction { .. } => {
+                let bootstrap_cache = loaded
+                    .bootstrap_cache
+                    .as_ref()
+                    .expect("owner-less xref state has a bootstrap cache");
+                context_spec_with_bootstrap_cache(context_spec, bootstrap_cache)
             }
+            XrefReadContextSpec::ActiveSectionWithCache { .. }
+            | XrefReadContextSpec::ReconstructionWithCache { .. } => context_spec,
         }
-        XrefReadContextSpec::Reconstruction {
-            line_scan_entries,
-            reference_offsets,
-        }
-        | XrefReadContextSpec::ReconstructionWithCache {
-            line_scan_entries,
-            reference_offsets,
-            ..
-        } => XrefReadContextSpec::ReconstructionWithCache {
-            line_scan_entries,
-            reference_offsets,
-            bootstrap_cache: hybrid_bootstrap_cache,
-        },
     };
     let xref_stream_value = if let Some(owner) = canonical_trailer_owner {
         let mut context = CanonicalXrefContext::new(owner, options.description.clone());
@@ -2747,7 +2801,7 @@ fn merge_xref_stream_from_classic_trailer_with_build_diagnostics(
     loaded
         .parsed_xref_streams
         .extend(hybrid.parsed_xref_streams);
-    merge_bootstrap_cache_prefer_source(&loaded.bootstrap_cache, &hybrid.bootstrap_cache);
+    merge_bootstrap_cache_prefer_source(&mut loaded.bootstrap_cache, &hybrid.bootstrap_cache);
 
     loaded.loaded.entries = registration.snapshot();
 
@@ -2805,34 +2859,20 @@ fn merge_previous_xref_sections_with_observer(
     if loaded.loaded.startxref != 0 {
         visited.insert(loaded.loaded.startxref);
     }
-    let chain_bootstrap_cache = match context_spec {
-        XrefReadContextSpec::ActiveSection | XrefReadContextSpec::Reconstruction { .. } => {
-            Rc::clone(&loaded.bootstrap_cache)
-        }
-        XrefReadContextSpec::ActiveSectionWithCache { bootstrap_cache }
-        | XrefReadContextSpec::ReconstructionWithCache {
-            bootstrap_cache, ..
-        } => Rc::clone(bootstrap_cache),
-    };
-    let section_context_spec = match context_spec {
-        XrefReadContextSpec::ActiveSection | XrefReadContextSpec::ActiveSectionWithCache { .. } => {
-            XrefReadContextSpec::ActiveSectionWithCache {
-                bootstrap_cache: &chain_bootstrap_cache,
+    let section_context_spec = if canonical_trailer_owner.is_some() {
+        context_spec_without_bootstrap_cache(context_spec)
+    } else {
+        match context_spec {
+            XrefReadContextSpec::ActiveSection | XrefReadContextSpec::Reconstruction { .. } => {
+                let bootstrap_cache = loaded
+                    .bootstrap_cache
+                    .as_ref()
+                    .expect("owner-less xref state has a bootstrap cache");
+                context_spec_with_bootstrap_cache(context_spec, bootstrap_cache)
             }
+            XrefReadContextSpec::ActiveSectionWithCache { .. }
+            | XrefReadContextSpec::ReconstructionWithCache { .. } => context_spec,
         }
-        XrefReadContextSpec::Reconstruction {
-            line_scan_entries,
-            reference_offsets,
-        }
-        | XrefReadContextSpec::ReconstructionWithCache {
-            line_scan_entries,
-            reference_offsets,
-            ..
-        } => XrefReadContextSpec::ReconstructionWithCache {
-            line_scan_entries,
-            reference_offsets,
-            bootstrap_cache: &chain_bootstrap_cache,
-        },
     };
     // Resolving `/Prev` can dereference an indirect target, and that read
     // warns live through the owner just like the section parse below. Keep it
@@ -3146,9 +3186,13 @@ fn recover_xref_from_linear_scan(
         &options.description,
     );
 
-    let recovered =
-        recover_xref_entries(bytes, fallback_trailer.is_none(), &options.description)
-            .map_err(|error| Error::with_open_diagnostics(error, repair_diagnostics.clone()))?;
+    let recovered = recover_xref_entries_with_owner(
+        bytes,
+        fallback_trailer.is_none(),
+        &options.description,
+        canonical_trailer_owner,
+    )
+    .map_err(|error| Error::with_open_diagnostics(error, repair_diagnostics.clone()))?;
     let mut entries = recovered.entries;
     // qpdf removes only type-1 rows before its reconstruction scan
     // (`QPDF.cc:516-575`). A failed xref-stream insertion can leave a default
@@ -3167,9 +3211,11 @@ fn recover_xref_from_linear_scan(
     }
     let mut parsed_xref_streams = BTreeMap::new();
     let mut extra_trailer_references = BTreeSet::new();
-    let mut bootstrap_cache = preexisting_bootstrap_cache
-        .map(Rc::clone)
-        .unwrap_or_else(empty_bootstrap_cache);
+    let mut bootstrap_cache = preexisting_bootstrap_cache.map(Rc::clone).or_else(|| {
+        canonical_trailer_owner
+            .is_none()
+            .then(empty_bootstrap_cache)
+    });
 
     // qpdf's `reconstruct_xref` (`QPDF.cc:564-616`) gates BOTH its `trailer`
     // keyword scan (`!m->trailer.isInitialized() && t1.isWord("trailer")`)
@@ -3320,7 +3366,10 @@ fn merge_recovered_qpdf_state(
         .append(&mut accumulated.parsed_xref_streams);
     // The accumulated state is the newer parsed xref prefix, so its shared
     // bootstrap objects supersede any same-reference value from recovery.
-    merge_bootstrap_cache_prefer_source(&recovered.bootstrap_cache, &accumulated.bootstrap_cache);
+    merge_bootstrap_cache_prefer_source(
+        &mut recovered.bootstrap_cache,
+        &accumulated.bootstrap_cache,
+    );
     recovered
 }
 
@@ -3371,6 +3420,15 @@ pub(crate) fn recover_xref_entries(
     capture_trailer: bool,
     filename: &[u8],
 ) -> Result<RecoveredXref> {
+    recover_xref_entries_with_owner(bytes, capture_trailer, filename, None)
+}
+
+fn recover_xref_entries_with_owner(
+    bytes: &[u8],
+    capture_trailer: bool,
+    filename: &[u8],
+    canonical_trailer_owner: Option<&dyn CanonicalTrailerOwner>,
+) -> Result<RecoveredXref> {
     let mut entries = BTreeMap::new();
     let mut trailer = None;
     let mut trailer_diagnostics = Vec::new();
@@ -3379,8 +3437,12 @@ pub(crate) fn recover_xref_entries(
         let next_line_start = next_line_start(bytes, line_start);
         if let Some(first_token) = read_scan_token(bytes, line_start, next_line_start) {
             if capture_trailer && trailer.is_none() && first_token.is_word_value(b"trailer") {
-                let (candidate, diagnostics) =
-                    parse_trailer_candidate(bytes, first_token.end, filename);
+                let (candidate, diagnostics) = parse_trailer_candidate(
+                    bytes,
+                    first_token.end,
+                    filename,
+                    canonical_trailer_owner,
+                );
                 trailer = candidate;
                 trailer_diagnostics.extend(diagnostics);
             } else if let Some((object_ref, offset)) =
@@ -3432,6 +3494,15 @@ const XREF_RECONSTRUCTION_FALLBACK_SPAN: usize = 64;
 /// line-scan filter was already cleared at `:575`. The returned filter is
 /// consumed only by this immediate candidate merge; it is never resolver or
 /// mutation state.
+type RecoveredXrefStream = (
+    ObjectHandle,
+    u64,
+    XrefForm,
+    BTreeSet<u32>,
+    u64,
+    Option<SharedBootstrapCache>,
+);
+
 #[allow(clippy::too_many_arguments)]
 fn recover_trailer_from_xref_stream_candidate(
     bytes: &[u8],
@@ -3443,14 +3514,7 @@ fn recover_trailer_from_xref_stream_candidate(
     trailer_references: &mut BTreeSet<ObjectRef>,
     preexisting_bootstrap_cache: Option<&SharedBootstrapCache>,
     canonical_trailer_owner: Option<&dyn CanonicalTrailerOwner>,
-) -> Result<(
-    ObjectHandle,
-    u64,
-    XrefForm,
-    BTreeSet<u32>,
-    u64,
-    SharedBootstrapCache,
-)> {
+) -> Result<RecoveredXrefStream> {
     // All bootstrap contexts below resolve against this same line-scan map
     // until the candidate chain has been merged. Build the sorted offset
     // index once and pass cheap Rc clones through each context instead of
@@ -3536,6 +3600,21 @@ fn recover_trailer_from_xref_stream_candidate(
     // itself. Route it to a scratch buffer instead and append it after the
     // reconciled read warning, in real call order.
     let mut reentry_error_diagnostics = Diagnostics::default();
+    let candidate_context_spec = if canonical_trailer_owner.is_some() {
+        XrefReadContextSpec::Reconstruction {
+            line_scan_entries: entries,
+            reference_offsets: &reference_offsets,
+        }
+    } else {
+        XrefReadContextSpec::ReconstructionWithCache {
+            line_scan_entries: entries,
+            reference_offsets: &reference_offsets,
+            bootstrap_cache: candidate
+                .bootstrap_cache
+                .as_ref()
+                .expect("owner-less candidate has a bootstrap cache"),
+        }
+    };
     let reentry_result = parse_xref_from_start_with_owner(
         bytes,
         max_offset as usize,
@@ -3544,11 +3623,7 @@ fn recover_trailer_from_xref_stream_candidate(
         options.clone(),
         &mut reentry_registration,
         Some(&mut reentry_error_diagnostics),
-        XrefReadContextSpec::ReconstructionWithCache {
-            line_scan_entries: entries,
-            reference_offsets: &reference_offsets,
-            bootstrap_cache: &candidate.bootstrap_cache,
-        },
+        candidate_context_spec,
         None,
         false,
         canonical_trailer_owner,
@@ -3608,11 +3683,7 @@ fn recover_trailer_from_xref_stream_candidate(
         options.clone(),
         &mut reentry_registration,
         Some(&mut previous_failure_diagnostics),
-        XrefReadContextSpec::ReconstructionWithCache {
-            line_scan_entries: entries,
-            reference_offsets: &reference_offsets,
-            bootstrap_cache: &candidate.bootstrap_cache,
-        },
+        candidate_context_spec,
         canonical_trailer_owner,
     )
     .is_err()
@@ -3688,7 +3759,10 @@ fn recover_trailer_from_xref_stream_candidate(
             XrefReadContextSpec::ReconstructionWithCache {
                 line_scan_entries: entries,
                 reference_offsets: &merged_reference_offsets,
-                bootstrap_cache: &candidate.bootstrap_cache,
+                bootstrap_cache: candidate
+                    .bootstrap_cache
+                    .as_ref()
+                    .expect("owner-less candidate has a bootstrap cache"),
             },
             &reentry_registration,
             options.clone(),
@@ -3723,10 +3797,12 @@ fn recover_trailer_from_xref_stream_candidate(
 struct XrefStreamCandidate {
     trailer: ObjectHandle,
     max_offset: u64,
-    /// qpdf's reconstruction pass resolves and caches every type-1 object
-    /// while discovering candidates. Reuse that cache for the later
-    /// post-chain `/Size` lookup so a repair warning is not emitted again.
-    bootstrap_cache: SharedBootstrapCache,
+    /// The owner-less reconstruction pass resolves and caches every type-1
+    /// object while discovering candidates. Reuse that cache for the later
+    /// post-chain `/Size` lookup so a repair warning is not emitted again;
+    /// canonical-owner discovery uses the document cache and leaves this
+    /// field `None`.
+    bootstrap_cache: Option<SharedBootstrapCache>,
 }
 
 /// Find the trailer dictionary and re-entry offset for
@@ -3872,7 +3948,7 @@ fn find_xref_stream_trailer_candidate(
     let candidate = trailer.map(|dict| XrefStreamCandidate {
         trailer: dict,
         max_offset,
-        bootstrap_cache: context.cache.shared(),
+        bootstrap_cache: Some(context.cache.shared()),
     });
     append_new_context_diagnostics(
         &context,
@@ -3927,7 +4003,7 @@ fn find_xref_stream_trailer_candidate_canonical(
     let candidate = trailer.map(|trailer| XrefStreamCandidate {
         trailer,
         max_offset,
-        bootstrap_cache: empty_bootstrap_cache(),
+        bootstrap_cache: None,
     });
     (candidate, diagnostics)
 }
@@ -4180,18 +4256,24 @@ fn parse_trailer_candidate(
     bytes: &[u8],
     start: usize,
     filename: &[u8],
+    canonical_trailer_owner: Option<&dyn CanonicalTrailerOwner>,
 ) -> (Option<ObjectHandle>, Vec<QpdfExc>) {
     if bytes.get(start..).is_none() {
         return (None, Vec::new());
     }
-    let mut resolver = XrefDetachedHandles;
     // qpdf's reconstruct_xref calls readTrailer() unconditionally and only
     // rejects a non-dictionary result afterward ("Oh well.  It was worth a
     // try.", `QPDF.cc:566-568`); any warning the parser already raised while
     // building that rejected candidate still reaches `m->warnings`. Extract
     // diagnostics regardless of whether the parse ultimately produced a
     // dictionary, a different object, or an error.
-    let result = read_trailer(bytes, start, filename, &mut resolver);
+    let result = if let Some(owner) = canonical_trailer_owner {
+        let mut resolver = CanonicalTrailerParser { owner };
+        read_trailer(bytes, start, filename, &mut resolver)
+    } else {
+        let mut resolver = XrefDetachedHandles;
+        read_trailer(bytes, start, filename, &mut resolver)
+    };
     let (trailer, diagnostics) = match result {
         Ok((handle, diagnostics)) => (
             handle
@@ -4550,7 +4632,7 @@ fn parse_xref_stream(
         pending_reconstruction_trigger: None,
         trailer_references,
         parsed_xref_streams,
-        bootstrap_cache,
+        bootstrap_cache: Some(bootstrap_cache),
         header_offset: 0,
         already_reconstructed: false,
     };
@@ -4827,7 +4909,7 @@ fn parse_xref_stream_with_canonical_owner(
         // constructor skips effective xref rows, but marks historical/free
         // rows as non-live while retaining them in object_refs().
         parsed_xref_streams: BTreeMap::from([(object_ref, handle_object)]),
-        bootstrap_cache: empty_bootstrap_cache(),
+        bootstrap_cache: None,
         header_offset: 0,
         already_reconstructed: false,
     };
@@ -6635,6 +6717,29 @@ mod final_handle_tests {
     }
 
     #[test]
+    fn canonical_xref_handoff_does_not_retain_a_bootstrap_cache() {
+        let (bytes, _) = classic_xref_with_trailer("<< /Size 1 >>");
+        let resolver = canonical_test_resolver(bytes.clone(), BTreeMap::new(), false, 11);
+        let canonical =
+            load_xref_state_from_bytes(&bytes, XrefLoadOptions::default(), Some(resolver.as_ref()))
+                .expect("canonical xref loading succeeds");
+        assert!(
+            canonical.bootstrap_cache.is_none(),
+            "canonical state must leave cache ownership on ResolverHandle"
+        );
+
+        let ownerless = load_xref_state_with_options(
+            &mut std::io::Cursor::new(bytes),
+            XrefLoadOptions::default(),
+        )
+        .expect("owner-less xref loading succeeds");
+        assert!(
+            ownerless.bootstrap_cache.is_some(),
+            "standalone xref loading must retain its temporary cache"
+        );
+    }
+
+    #[test]
     fn canonical_owner_skips_the_offset_zero_retry_when_startxref_is_missing() {
         // No `startxref` at all, so `parse_startxref` fails and `startxref`
         // becomes 0. Object 1 sits at logical offset 0 and its body has a
@@ -6764,7 +6869,7 @@ mod final_handle_tests {
             pending_reconstruction_trigger: None,
             trailer_references: BTreeSet::new(),
             parsed_xref_streams: BTreeMap::new(),
-            bootstrap_cache: empty_bootstrap_cache(),
+            bootstrap_cache: Some(empty_bootstrap_cache()),
             header_offset: 0,
             already_reconstructed: false,
         }
@@ -7062,7 +7167,7 @@ mod final_handle_tests {
             pending_reconstruction_trigger: None,
             trailer_references: BTreeSet::new(),
             parsed_xref_streams: BTreeMap::new(),
-            bootstrap_cache: empty_bootstrap_cache(),
+            bootstrap_cache: Some(empty_bootstrap_cache()),
             header_offset: 0,
             already_reconstructed: false,
         };
@@ -7425,7 +7530,10 @@ mod final_handle_tests {
         let mut reader = std::io::Cursor::new(bytes);
         let state = load_xref_state_with_options(&mut reader, XrefLoadOptions::default())
             .expect("ordinary classic xref should load");
-        let cache = state.bootstrap_cache.borrow();
+        let bootstrap_cache = state
+            .bootstrap_cache
+            .expect("owner-less xref state has a bootstrap cache");
+        let cache = bootstrap_cache.borrow();
         let document = cache
             .handle_document
             .as_ref()
@@ -8447,7 +8555,7 @@ mod final_handle_tests {
         assert!(!context.diagnostics.entries().is_empty());
 
         let malformed = vec![b'['; crate::parser::MAX_PARSE_DEPTH + 1];
-        let (trailer, diagnostics) = parse_trailer_candidate(&malformed, 0, b"");
+        let (trailer, diagnostics) = parse_trailer_candidate(&malformed, 0, b"", None);
         assert!(trailer.is_none());
         assert!(!diagnostics.is_empty());
     }
