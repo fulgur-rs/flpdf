@@ -114,7 +114,13 @@ impl LiveQueue {
             return Ok(None);
         }
         // cov:ignore-end
-        if self.removed_refs.contains(&source) {
+        // qpdf has no removed-reference guard in enqueueObject: a source
+        // ObjStm container is still enqueued after a member redirects to it,
+        // so assignCompressedObjectNumbers can reserve every retained member
+        // (`QPDFWriter.cc:1057-1124`). The planner removes members before
+        // registration; preserve the local removal filter only for ordinary
+        // objects and unregistered removed members.
+        if self.removed_refs.contains(&source) && !self.container_to_members.contains_key(&source) {
             return Ok(None);
         }
         if let Some(output) = self.old_to_new.get(&source).copied() {
@@ -2581,6 +2587,30 @@ mod object_emitter_tests {
         }]);
         assert!(queue.member_to_container.is_empty());
         assert!(queue.container_to_members.is_empty());
+    }
+
+    #[test]
+    fn removed_source_container_still_numbers_retained_members() -> crate::Result<()> {
+        let container = ObjectRef::new(3, 0);
+        let member = ObjectRef::new(2, 0);
+        let mut pdf = super::object_emitter_tests::pdf();
+        let mut queue = LiveQueue::new([container].into_iter().collect());
+        queue.register_object_streams(&[object_streams::ObjectStreamGroup::SourceBacked {
+            source: container,
+            members: vec![member],
+        }]);
+
+        let handle = pdf.get_object_handle(container);
+        let output = queue
+            .enqueue_handle(&mut pdf, handle)?
+            .expect("qpdf enqueues a removed ObjStm container");
+        assert_eq!(output, ObjectRef::new(1, 0));
+        assert_eq!(
+            queue.old_to_new.get(&container),
+            Some(&ObjectRef::new(1, 0))
+        );
+        assert_eq!(queue.old_to_new.get(&member), Some(&ObjectRef::new(2, 0)));
+        Ok(())
     }
 
     #[test]
