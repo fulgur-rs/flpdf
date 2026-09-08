@@ -433,6 +433,19 @@ document-wide の独自 aggregate route ではなく、保持された各 leaf �
 
 | `QPDF::resolve` / `QPDF::resolveObjectsInStream`（xref object-read/cache boundary） | `QPDF.cc:1700-1857`; `QPDF.cc:1541-1697` | `engine.rs` が parse 前に作る `ResolverHandle` を `xref.rs::CanonicalTrailerOwner` として渡し、active xref stream、hybrid `/XRefStm`、`/Prev` chain、reconstruction candidate の object read を `ResolverHandle::resolve_at_offset_with_optional_description`（live `readObjectAtOffset` → `readObject` → `readStream`）へ統一する。`/Type`/`/W`/`/Index`/`/Size`/filter は `XrefObjectContext` から同じ canonical handle/cache と warning snapshot を参照する。owner-less standalone xref loaderのbootstrap ObjStmは `.48.14` で `resolveObjectsInStream` の specialized decode、direct parser、effective xref/default-free、親extent、descriptionの順序を同じqpdf責務へ揃えたが、bounded reconstruction windowとBootstrapHandleStateは別ownerとして残る。 | 🔀 `.48.13` で production xref-stream/recovery read の二重 owner と LoadedXref の parsed-stream rebind を除去。owner-less public loaderの第2 state統合とObjStm rebind/replayは `.48.15` の範囲 |
 
+`flpdf-1f9f` では、owner-less bootstrap の ObjStm member parser にも member の description
+context を渡すようにした。そのため member 本体だけでなく、辞書・配列内の nested direct value も
+同じ `ObjectDescription::Template` を持つ。qpdf は member の警告を 3 つの断片から組み立てる —
+decoded InputSource 名（`<file> object stream N`、`libqpdf/QPDF.cc:1793-1805`）、parser に渡す
+`object M 0` description（`:1451-1459`）、parsed offset — を `QPDFParser::warn` が
+`QPDFExc` に束ねる（`libqpdf/QPDFParser.cc:509-513`）。flpdf の description template は
+その**レンダリング済み prefix 全体**を保持し、`$PO` が offset のプレースホルダになる
+（`crates/flpdf/src/object_handle.rs:940`）ため、template には入力 description と
+`object stream N` を含める。これは canonical reader の
+`reader/resolver.rs::object_stream_description_template` と同形。対象はdescriptionの
+伝播だけで、specialized decode、header map、effective xref、bounded reconstruction ownerは
+`.48.14`の責務を変更しない。
+
 `flpdf-qwh0` では、qpdf 11.9.0 が `reconstruct_xref` の候補ごとに参照 object を offset から EOF まで読む (`QPDF.cc:585-589,1542-1697`) のに対し、flpdf の reconstruction bootstrap contextだけは line-scan で既知になった次の uncompressed offsetまで参照先 readを制限する。候補自身の隣接 windowと同じ64 offset-position fallbackで、実在 objectが候補境界にまたがる場合だけ再試行する。これはqpdfに対応物のないflpdf固有の malformed-input 性能/DoS hardeningであり、`xref.rs` の `qpdf-deviation` markerに記録する。通常のactive xref sectionはqpdfと同じunbounded source viewを維持する。
 
 `flpdf-ag95` では、qpdf 11.9.0 の `QPDF::resolve` が `m->resolving` による cycle 検出だけを行い、indirect-reference chain の深さ上限を持たない (`QPDF.cc:1699-1753`) ことに合わせ、bootstrap の recursive hub を `stacker::maybe_grow` で実行する。qpdfに対応物のないRust側stack policyであり、任意のdepth capやnull化によってqpdfが処理できるchainを拒否しない。stream `/Length` の再入前にも同じstack-growth boundaryを置き、既存のxref lookup・cycle/null fallback・diagnostic順序は維持する。`xref.rs` の `qpdf-deviation` markerに記録する。
