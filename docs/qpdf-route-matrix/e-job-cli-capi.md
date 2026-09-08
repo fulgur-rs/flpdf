@@ -402,6 +402,17 @@ D1 `writer.write()` の両方を呼ぶ）は、逸脱の重い側である `brid
 止めるRED/GREENテストを追加し、write stageへの誤到達を防ぐ。E-18の
 canonical checkConfiguration責務だけを補正し、qtest exceptionsは対象外。
 
+2026-09-08（`flpdf-kt4z`）: qpdf `writeOutfile` は成功write後、rename前に
+`pdf.closeInputSource()` を行う（`libqpdf/QPDFJob.cc:3068-3086`）。qpdfの
+`createQPDF` ではpage donorの `page_heap` がcreate stageのローカル寿命で
+消える一方、flpdfはprovider-backed foreign streamのため
+`page_source_documents` と `overlay_sources` をwrite境界まで保持する。
+`QPDFJob::write_qpdf` のreplace-input境界でprimaryだけでなく両方の保持donorを
+`Pdf::close_input_source()` し、multi-source page selectionとself-overlayの
+RED/GREENテストで各resolver/controllerのclose状態を確認する。E-4の出力寿命
+責務を補正し、`flpdf-pr6b` の広いP3追跡と重複するself-overlay/page-merge原因は
+このP2 sliceで同じclose境界に統合した。CLI、qtest exceptions、rootは変更しない。
+
 ### 分類別件数
 
 | 分類 | 件数 | 行 |

@@ -1105,6 +1105,15 @@ show/remove は qpdf の `std::string` key（`QPDFJob_config.cc:507-547`）を
 実効stdoutとして扱うようにした。これにより `json=2` と非zero
 `splitPages` の組合せをwrite stageまで進めず、qpdfと同じusage errorにする。
 
+`flpdf-kt4z` では、qpdfの `QPDFJob::writeOutfile` が成功write後・replace-input
+rename前に `pdf.closeInputSource()` を呼ぶ（`libqpdf/QPDFJob.cc:3068-3086`）ことを、
+flpdfの保持donorまで拡張した。qpdfの `page_heap` は `createQPDF` のローカル寿命だが、
+flpdfは遅延foreign stream providerのため `page_source_documents` と
+`overlay_sources` をwriteまで保持する。`QPDFJob::write_qpdf` のreplace-input境界で
+primary、page donor、overlay/underlay donorの全resolverをcloseし、multi-sourceと
+self-overlayのcontroller状態を回帰テストで固定した。これはE-4のclose-before-rename
+責務であり、qtest exceptionsとCLI/rootの経路は対象外である。
+
 `coalesceContents` も生成 handler (`auto_job_json_init.hh:311-313`)、Config (`QPDFJob_config.cc:88-91`)、変換順序 (`QPDFJob.cc:2185-2188`) に対応し、既存の provider-backed `ObjectHandle::coalesce_content_streams` を `job/lifecycle.rs` から呼ぶ。
 
 `flattenRotation` も生成 handler (`auto_job_json_init.hh:377-382`)、Config (`QPDFJob_config.cc:204-207`)、変換順序 (`QPDFJob.cc:2190-2194`) に対応し、既存の `flatten_rotation_on_pages` (`QPDFPageObjectHelper.cc:862-991`) を `job/lifecycle.rs` から呼ぶ。`coalesceContents` の直後に配置して、qpdfのページ変換順序を保つ。
