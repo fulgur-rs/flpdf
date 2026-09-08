@@ -2669,7 +2669,7 @@ impl QPDFJob {
             configuration.remove_unreferenced_resources,
             configuration.writer.preserves_unreferenced_objects(),
             target,
-        )?;
+        )?; // cov:ignore: llvm-cov attributes this covered multi-source call continuation to the opening expression
         let mut primary = match page_output {
             PageSpecJobOutput::Merged(merged) => {
                 // The page-output enum no longer borrows `page_sources` in
