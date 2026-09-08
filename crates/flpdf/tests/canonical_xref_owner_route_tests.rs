@@ -44,6 +44,21 @@ fn pdf_teardown_has_one_canonical_disconnect_owner() {
         "Pdf teardown must use exactly one ResolverHandle disconnect walk"
     );
     let resolver = production_source("reader/resolver.rs");
+    // The order check below uses the first occurrence of each marker, so it is
+    // only meaningful while each appears exactly once in production code. Pin
+    // that precondition explicitly: without it, a second `object_cache.values()`
+    // added earlier in the file would silently satisfy `clear < walk` and the
+    // ordering contract would stop being tested.
+    assert_eq!(
+        resolver.matches("core.source_xref_entries.clear()").count(),
+        1,
+        "the xref-table clear must stay a single production site"
+    );
+    assert_eq!(
+        resolver.matches("core.object_cache.values()").count(),
+        1,
+        "the object-cache walk must stay a single production site"
+    );
     let clear = resolver
         .find("core.source_xref_entries.clear()")
         .expect("teardown clears the canonical xref table");
