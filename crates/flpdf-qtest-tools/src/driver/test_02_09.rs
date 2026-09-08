@@ -24,15 +24,24 @@ use crate::output::write_bytes;
 // resolves its own receiver before reading `key` off it, so dictionary-key
 // chases below call it directly instead of through a local wrapper.
 //
-// The resolving `try_as_*`/`try_is_*` family that mirrors this for a
-// handle's own *value* (as opposed to a further child) is `pub(crate)`-only
-// in `flpdf::object_handle` and, for several of the types this file reads
-// (`as_string`, `as_real`), has no resolving counterpart at all -- so it is
-// unreachable from this crate regardless. `resolve_handle` below restores
-// qpdf's implicit dereference-before-use for that case: resolve the handle
-// explicitly, then read its value with the plain, non-warning accessor and
-// its own documented default (`as_string` -> empty on mismatch) with no
-// stderr warning text. See this file's top-level caveats.
+// qpdf's own type accessors for a handle's *value* split into two publicly
+// reachable families: a silent, non-throwing "as" family used only from
+// C++-internal call sites (`asInteger`/`asDictionary`/`asArray`/`asName`/
+// `asReal`/`asString`; all `private` in `include/qpdf/QPDFObjectHandle.hh`,
+// directly under its `private:` label) and a warning-emitting "get value"
+// family that IS public and is what qpdf's own `test_driver.cc` actually
+// calls (`getStringValue`/`getUTF8Value`/`getIntValue`/`getNumericValue`/
+// `getArrayItem`/`getArrayNItems`, `libqpdf/QPDFObjectHandle.cc`). The
+// second family's flpdf port -- `try_get_string_value`/`try_get_utf8_value`/
+// `try_get_int_value`/`try_get_numeric_value`/`try_get_array_item`/
+// `try_get_array_as_vector` (`crates/flpdf/src/object_handle.rs`) -- is
+// already `pub` and already resolves its own receiver, so this file calls
+// those directly wherever qpdf's test driver calls their qpdf counterpart.
+// `resolve_handle` below is still needed for the handful of sites that read
+// a handle through an accessor with no warning-emitting counterpart at all
+// (`unparse`, `type_code`, `pipe_stream_data`) or that merely gate on a
+// non-throwing `isX()`-shaped check (`is_null`), where qpdf's own
+// dereference-before-use has no separate warning to reproduce.
 //
 // `Pdf::resolve`'s underlying `ObjectHandle::try_dereference`
 // is a documented no-op for an already-direct or already-resolved handle,
@@ -50,31 +59,33 @@ fn resolve_handle<R: Read + Seek>(pdf: &mut Pdf<R>, handle: &ObjectHandle) -> fl
 /// (qpdf's own comment) -- every key read below is assumed present with the
 /// expected type, matching that guarantee. A real type mismatch would hit
 /// qpdf's `typeWarning` + documented-default fallback
-/// (`libqpdf/QPDFObjectHandle.cc:2169-2189`); flpdf's equivalent `try_*`
-/// accessor family that ports it (`type_warning`, `try_get_key`, ...) is
-/// `pub(crate)`-only and unreachable from this crate, so this file uses the
-/// plain, non-warning accessors and their own documented defaults
-/// (`as_string` -> empty on mismatch) with no stderr warning text. See this
-/// file's top-level caveats.
+/// (`libqpdf/QPDFObjectHandle.cc:2169-2189`), which the `try_get_*_value`/
+/// `try_get_array_item` calls below reproduce directly (see this file's
+/// top-level caveats for the two sites, `/O` and `/U`, that call `unparse`
+/// instead and so have no warning-emitting counterpart to reach).
 pub(crate) fn run_test_2<R: Read + Seek>(
     pdf: &mut Pdf<R>,
-    _filename: &[u8],
+    filename: &[u8],
     _arg2: Option<&std::ffi::OsStr>,
     stdout: &mut dyn Write,
-    _stderr: &mut dyn Write,
-    _diagnostics_written: &mut usize,
+    stderr: &mut dyn Write,
+    diagnostics_written: &mut usize,
 ) -> flpdf::Result<()> {
     let trailer = pdf.trailer();
 
     let info = trailer.try_get_key(b"/Info")?;
     let creation_date = info.try_get_key(b"/CreationDate")?;
-    resolve_handle(pdf, &creation_date)?;
-    write_bytes(stdout, &creation_date.as_string().unwrap_or_default())?;
+    let creation_date_value = creation_date.try_get_string_value()?;
+    emit_new_diagnostics(pdf, diagnostics_written, filename, stdout, stderr)
+        .map_err(Error::from)?;
+    write_bytes(stdout, &creation_date_value)?;
     writeln!(stdout)?;
 
     let producer = info.try_get_key(b"/Producer")?;
-    resolve_handle(pdf, &producer)?;
-    write_bytes(stdout, &producer.as_string().unwrap_or_default())?;
+    let producer_value = producer.try_get_string_value()?;
+    emit_new_diagnostics(pdf, diagnostics_written, filename, stdout, stderr)
+        .map_err(Error::from)?;
+    write_bytes(stdout, &producer_value)?;
     writeln!(stdout)?;
 
     let encrypt = trailer.try_get_key(b"/Encrypt")?;
@@ -90,16 +101,9 @@ pub(crate) fn run_test_2<R: Read + Seek>(
     let root = trailer.try_get_key(b"/Root")?;
     let pages = root.try_get_key(b"/Pages")?;
     let kids = pages.try_get_key(b"/Kids")?;
-    resolve_handle(pdf, &kids)?;
-    // qpdf's `getArrayItem(1)` warns and returns null on an out-of-range
-    // index (`libqpdf/QPDFObjectHandle.cc:762-777`); `.get(1)` below
-    // silently defaults to a null handle for the same case, matching the
-    // "returns null" half without the stderr warning (see this file's
-    // top-level caveats).
-    let page = kids
-        .as_array()
-        .and_then(|items| items.get(1).cloned())
-        .unwrap_or_else(ObjectHandle::null);
+    let page = kids.try_get_array_item(1)?;
+    emit_new_diagnostics(pdf, diagnostics_written, filename, stdout, stderr)
+        .map_err(Error::from)?;
     let contents = page.try_get_key(b"/Contents")?;
     resolve_handle(pdf, &contents)?;
     let data = contents.get_stream_data(DecodeLevel::Generalized)?;
@@ -126,8 +130,12 @@ pub(crate) fn run_test_3<R: Read + Seek>(
 ) -> flpdf::Result<()> {
     let trailer = pdf.trailer();
     let streams = trailer.try_get_key(b"/QStreams")?;
-    resolve_handle(pdf, &streams)?;
-    let items = streams.as_array().unwrap_or_default();
+    let items = streams.try_get_array_as_vector()?;
+    // qpdf's `getArrayNItems()` (`libqpdf/QPDFObjectHandle.cc:758-767`) warns
+    // for a non-array receiver before any stream output, matching this
+    // drain's position ahead of the per-stream loop below.
+    emit_new_diagnostics(pdf, diagnostics_written, filename, stdout, stderr)
+        .map_err(Error::from)?;
     for (index, stream) in items.iter().enumerate() {
         writeln!(stdout, "-- stream {index} --")?;
         stdout.flush()?;
@@ -179,11 +187,11 @@ impl Pipeline for StdoutPipeline<'_> {
 /// in the core ObjectHandle/Pdf APIs.
 pub(crate) fn run_test_4<R: Read + Seek>(
     pdf: &mut Pdf<R>,
-    _filename: &[u8],
+    filename: &[u8],
     _arg2: Option<&std::ffi::OsStr>,
     stdout: &mut dyn Write,
-    _stderr: &mut dyn Write,
-    _diagnostics_written: &mut usize,
+    stderr: &mut dyn Write,
+    diagnostics_written: &mut usize,
 ) -> flpdf::Result<()> {
     let trailer = pdf.trailer();
     let mut qtest = trailer.try_get_key(b"/QTest")?;
@@ -195,11 +203,10 @@ pub(crate) fn run_test_4<R: Read + Seek>(
     )?;
 
     let array = qtest.try_get_key(b"/A")?;
-    if array
-        .as_array()
-        .and_then(|items| items.into_iter().next())
-        .is_some_and(|item| item.as_integer() == Some(1))
-    {
+    let first_item = array.try_get_array_item(0)?.try_get_int_value()?;
+    emit_new_diagnostics(pdf, diagnostics_written, filename, stdout, stderr)
+        .map_err(Error::from)?;
+    if first_item == 1 {
         array.set_array_item(1, ObjectHandle::integer(5))?;
         array.insert_array_item(2, ObjectHandle::integer(10))?;
         array.append_array_item(ObjectHandle::integer(12))?;
@@ -215,6 +222,13 @@ pub(crate) fn run_test_4<R: Read + Seek>(
     }
 
     let mut qtest2 = trailer.try_get_key(b"/QTest2")?;
+    // qpdf's `isNull()` dereferences before checking
+    // (`libqpdf/QPDFObjectHandle.cc:240-249`); `try_get_key` above resolves
+    // only its receiver, so `qtest2` itself is resolved explicitly here --
+    // otherwise an unresolved indirect `/QTest2` would read as non-null
+    // regardless of what it actually resolves to (`ObjectHandle::is_null`'s
+    // own doc).
+    resolve_handle(pdf, &qtest2)?;
     if !qtest2.is_null() {
         qtest2.make_direct(true)?;
         trailer.replace_key(b"/QTest2", qtest2)?;
@@ -254,11 +268,11 @@ fn double_to_string_3(value: f64) -> String {
 /// qpdf `getDict().getKey(...).getIntValue()` sequence.
 pub(crate) fn run_test_5<R: Read + Seek>(
     pdf: &mut Pdf<R>,
-    _filename: &[u8],
+    filename: &[u8],
     _arg2: Option<&std::ffi::OsStr>,
     stdout: &mut dyn Write,
-    _stderr: &mut dyn Write,
-    _diagnostics_written: &mut usize,
+    stderr: &mut dyn Write,
+    diagnostics_written: &mut usize,
 ) -> flpdf::Result<()> {
     let page_refs = {
         let mut helper = PageDocumentHelper::new(pdf);
@@ -276,6 +290,12 @@ pub(crate) fn run_test_5<R: Read + Seek>(
                 .expect("get_images only returns image stream handles");
             let width = image_dict.try_get_key(b"/Width")?.try_get_int_value()?;
             let height = image_dict.try_get_key(b"/Height")?.try_get_int_value()?;
+            // Diagnostics from `try_get_int_value` above cannot drain here:
+            // `page_helper` (`PageObjectHelper::new`) holds `pdf` mutably for
+            // this whole loop, and draining needs `&Pdf`. This is a
+            // pre-existing gap (this call predates this file's
+            // `resolve_handle`+`as_x` audit) tracked in the audit's
+            // follow-up, not introduced by it.
             write!(stdout, "    ")?;
             write_bytes(stdout, &name)?;
             writeln!(stdout, ": {width} x {height}")?;
@@ -298,11 +318,9 @@ pub(crate) fn run_test_5<R: Read + Seek>(
     if let Some(items) = qstrings.as_array() {
         writeln!(stdout, "QStrings:")?;
         for item in items {
-            resolve_handle(pdf, &item)?;
-            let utf8 = item
-                .as_string()
-                .map(|value| flpdf::pdf_string::utf8_value(&value))
-                .unwrap_or_default();
+            let utf8 = item.try_get_utf8_value()?;
+            emit_new_diagnostics(pdf, diagnostics_written, filename, stdout, stderr)
+                .map_err(Error::from)?;
             write_bytes(stdout, &utf8)?;
             writeln!(stdout)?;
         }
@@ -313,16 +331,9 @@ pub(crate) fn run_test_5<R: Read + Seek>(
     if let Some(items) = qnumbers.as_array() {
         writeln!(stdout, "QNumbers:")?;
         for item in items {
-            resolve_handle(pdf, &item)?;
-            // qpdf's `getNumericValue()` handles integer and real values and
-            // falls back to `0.0` (with a `typeWarning`) for anything else
-            // (`libqpdf/QPDFObjectHandle.cc:377-389`); see this file's
-            // top-level caveats for the missing warning text.
-            let value = item
-                .as_integer()
-                .map(|value| value as f64)
-                .or_else(|| item.as_real())
-                .unwrap_or(0.0);
+            let value = item.try_get_numeric_value()?;
+            emit_new_diagnostics(pdf, diagnostics_written, filename, stdout, stderr)
+                .map_err(Error::from)?;
             writeln!(stdout, "{}", double_to_string_3(value))?;
         }
     }
@@ -686,6 +697,68 @@ mod tests {
         )
         .is_err());
         assert!(stdout.flush().is_ok());
+    }
+
+    /// A minimal valid PDF (empty catalog/pages tree) whose trailer carries
+    /// `/QStreams 5` -- a direct, non-array value -- so opening it through
+    /// the ordinary `Pdf::open_mem_owned` path gives the resulting handle a
+    /// real document/logger context, matching how a genuine qpdf warning
+    /// reaches its output stream (a bare `Pdf::empty()` trailer key has no
+    /// such context and reports a contextless warning as an error instead).
+    fn pdf_with_non_array_qstreams() -> Vec<u8> {
+        let mut bytes = b"%PDF-1.7\n".to_vec();
+        let mut offsets = BTreeMap::new();
+        let objects = [
+            (1, b"<< /Type /Catalog /Pages 2 0 R >>".as_slice()),
+            (2, b"<< /Type /Pages /Kids [] /Count 0 >>".as_slice()),
+        ];
+        for (number, body) in objects {
+            offsets.insert(number, bytes.len());
+            bytes.extend_from_slice(format!("{number} 0 obj\n").as_bytes());
+            bytes.extend_from_slice(body);
+            bytes.extend_from_slice(b"\nendobj\n");
+        }
+        let xref_offset = bytes.len();
+        bytes.extend_from_slice(b"xref\n0 3\n0000000000 65535 f \n");
+        for number in 1..=2 {
+            bytes.extend_from_slice(format!("{:010} 00000 n \n", offsets[&number]).as_bytes());
+        }
+        bytes.extend_from_slice(
+            format!(
+                "trailer\n<< /Size 3 /Root 1 0 R /QStreams 5 >>\nstartxref\n{xref_offset}\n%%EOF\n"
+            )
+            .as_bytes(),
+        );
+        bytes
+    }
+
+    #[test]
+    fn test_3_warns_and_treats_a_non_array_qstreams_as_empty() {
+        // qpdf's unguarded `getArrayNItems()` call at the top of `test_3`
+        // (`qpdf/test_driver.cc:311`) warns and yields `0` for a non-array
+        // receiver (`libqpdf/QPDFObjectHandle.cc:758-767`), producing zero
+        // loop iterations rather than a crash or silent divergence.
+        let mut pdf =
+            Pdf::open_mem_owned(pdf_with_non_array_qstreams()).expect("open non-array fixture");
+
+        let mut stdout = Vec::new();
+        let mut stderr = Vec::new();
+        let mut diagnostics_written = 0;
+        run_test_3(
+            &mut pdf,
+            b"fixture.pdf",
+            None,
+            &mut stdout,
+            &mut stderr,
+            &mut diagnostics_written,
+        )
+        .expect("a non-array QStreams warns rather than failing");
+
+        assert!(stdout.is_empty());
+        assert_eq!(
+            stderr,
+            b"WARNING: operation for array attempted on object of type integer: treating as empty\n"
+        );
     }
 
     #[test]
