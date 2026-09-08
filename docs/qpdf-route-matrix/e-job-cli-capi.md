@@ -591,6 +591,16 @@ jobJsonFile/usage error を同じ Config へ」という統合は、個別 optio
 その完了後に別途行う。
 未接続の CLI cohort（`.48.7`〜`.48.10`）は元々の記載通り依存 PR で段階移行する。
 
+`flpdf-42xx` は E-12 の image option parser boundary にある inspection conflict を
+qpdf 11.9.0 と同じ受理 semanticsへ揃える。`--check` / `--show-*` と
+`--optimize-images` / `--externalize-inline-images` は usage conflictにせず、
+output無しの inspection routeへ進む。writer output を新たに作る変更ではない。
+
+なお qpdf は inspection route でも変換自体は実行する（`createQPDF` の
+`handleTransformations`、`QPDFJob.cc:474` が `writeQPDF` の `createsOutput()`
+分岐 `:484-491` より前）。本 slice は受理境界のみを揃えたもので、image option を
+inspection route へ配線するのは `flpdf-w2fk` の範囲である。
+
 ### option 別対応表
 
 `yes` は該当箇所に実装ありと確認済み、空欄は未確認/未実装。`main.rs` 列の性質は上記の
