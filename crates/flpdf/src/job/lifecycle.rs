@@ -1783,9 +1783,10 @@ impl QPDFJob {
     ///
     /// # Errors
     ///
-    /// Propagates [`Error::Io`] when an `@file` argument opens successfully
-    /// but cannot be read to completion, and the same [`Error::Usage`] arms
-    /// this function already raises for its other qpdf-compatible options.
+    /// Propagates [`Error::FileIo`] when an `@file` argument (or `@-` reading
+    /// stdin) opens successfully but cannot be read to completion, and the
+    /// same [`Error::Usage`] arms this function already raises for its other
+    /// qpdf-compatible options.
     pub fn initialize_from_argv(&mut self, argv: &[String]) -> Result<()> {
         let argv = expand_arg_files(argv)?;
         let mut configuration = JobConfiguration::default();
