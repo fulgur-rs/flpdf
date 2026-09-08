@@ -6,7 +6,11 @@ fn source_root() -> std::path::PathBuf {
 }
 
 fn read_source(path: impl AsRef<Path>) -> String {
-    fs::read_to_string(source_root().join(path)).expect("read source")
+    // Git's default autocrlf=true checkout converts source files to CRLF on
+    // Windows; keep structural route guards independent of checkout EOLs.
+    fs::read_to_string(source_root().join(path))
+        .expect("read source")
+        .replace("\r\n", "\n")
 }
 
 #[test]
