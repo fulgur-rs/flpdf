@@ -1,5 +1,6 @@
 use flpdf::job::{
-    JobDocument, JobExitCode, JsonJobOptions, JsonJobOutput, JsonStreamData, PageSpecInput, QPDFJob,
+    AttachmentAddOptions, JobDocument, JobExitCode, JsonJobOptions, JsonJobOutput, JsonStreamData,
+    PageSpecInput, QPDFJob,
 };
 use flpdf::json_inspect::DecodeLevel;
 use flpdf::pipeline::{Pipeline, PipelineError, PipelineHandle, PipelineResult};
@@ -3361,4 +3362,155 @@ fn job_json_replace_input_preserves_non_utf8_derived_backup_path() {
     let mut backup = input.as_os_str().to_os_string();
     backup.push(".~qpdf-orig");
     assert!(PathBuf::from(backup).exists());
+}
+
+/// `Config::addAttachment` (`QPDFJob_config.cc:894-936`) and the JSON
+/// `addAttachment` array both populate the same `attachments_to_add` queue
+/// consumed by `QPDFJob::addAttachments` (`QPDFJob.cc:2044-2083`). Confirm
+/// `QPDFJobConfig::add_attachment` reaches the identical byte output as the
+/// already-covered JSON path, so a CLI consumer can build a job through the
+/// programmatic Config surface instead of encoding an argv/JSON string.
+#[test]
+fn config_add_attachment_matches_the_json_configured_path() {
+    let input =
+        Path::new(env!("CARGO_MANIFEST_DIR")).join("../../tests/fixtures/compat/one-page.pdf");
+    let attachment = Path::new(env!("CARGO_MANIFEST_DIR"))
+        .join("../../tests/fixtures/compat/attachment-two-page.pdf");
+    let tempdir = tempfile::tempdir().unwrap();
+    let via_config = tempdir.path().join("via-config.pdf");
+    let via_json = tempdir.path().join("via-json.pdf");
+
+    let mut config_job = QPDFJob::new();
+    config_job
+        .config()
+        .input_file(&input)
+        .unwrap()
+        .output_file(&via_config)
+        .unwrap()
+        .deterministic_id()
+        .add_attachment(AttachmentAddOptions {
+            path: attachment.clone(),
+            key: b"a.pdf".to_vec(),
+            filename: b"a.pdf".to_vec(),
+            mimetype: None,
+            description: None,
+            creation_date: None,
+            modification_date: None,
+            replace: false,
+            verbose: false,
+        });
+    assert_eq!(config_job.run().unwrap(), JobExitCode::Success);
+
+    // Both jobs must use qpdf's `/ID` -> deterministic mode
+    // (`--deterministic-id`, `QPDFWriter.cc`'s hash-of-content ID instead of
+    // random bytes) since two independently run jobs otherwise differ only
+    // in the random trailer `/ID`, which is not what this test checks.
+    let mut json_job = QPDFJob::new();
+    let json = serde_json::json!({
+        "inputFile": input,
+        "outputFile": via_json,
+        "deterministicId": "",
+        "addAttachment": [{"file": attachment, "key": "a.pdf", "filename": "a.pdf"}],
+    })
+    .to_string();
+    json_job.initialize_from_json(&json).unwrap();
+    assert_eq!(json_job.run().unwrap(), JobExitCode::Success);
+
+    assert_eq!(
+        std::fs::read(&via_config).unwrap(),
+        std::fs::read(&via_json).unwrap(),
+        "the Config builder and the JSON path must produce byte-identical output"
+    );
+}
+
+/// `Config::removeAttachment` (`QPDFJob_config.cc:938-947`) queues the same
+/// key removal `QPDFJob::handleTransformations` applies for the JSON
+/// `removeAttachment` array (`QPDFJob.cc:2223-2233`).
+#[test]
+fn config_remove_attachment_matches_the_json_configured_path() {
+    let input = Path::new(env!("CARGO_MANIFEST_DIR"))
+        .join("../../tests/fixtures/compat/attachment-two-page.pdf");
+    let tempdir = tempfile::tempdir().unwrap();
+    let via_config = tempdir.path().join("via-config.pdf");
+    let via_json = tempdir.path().join("via-json.pdf");
+
+    let key = {
+        let file = File::open(&input).unwrap();
+        let mut pdf = Pdf::open(BufReader::new(file)).unwrap();
+        let names = pdf.embedded_files().get_embedded_files().unwrap();
+        names
+            .into_keys()
+            .next()
+            .expect("fixture must have at least one attachment")
+    };
+
+    let mut config_job = QPDFJob::new();
+    config_job
+        .config()
+        .input_file(&input)
+        .unwrap()
+        .output_file(&via_config)
+        .unwrap()
+        .deterministic_id()
+        .remove_attachment(key.clone());
+    assert_eq!(config_job.run().unwrap(), JobExitCode::Success);
+
+    let mut json_job = QPDFJob::new();
+    let json = serde_json::json!({
+        "inputFile": input,
+        "outputFile": via_json,
+        "deterministicId": "",
+        "removeAttachment": [String::from_utf8_lossy(&key)],
+    })
+    .to_string();
+    json_job.initialize_from_json(&json).unwrap();
+    assert_eq!(json_job.run().unwrap(), JobExitCode::Success);
+
+    assert_eq!(
+        std::fs::read(&via_config).unwrap(),
+        std::fs::read(&via_json).unwrap(),
+        "the Config builder and the JSON path must produce byte-identical output"
+    );
+}
+
+/// `Config::copyAttachmentsFrom` (`QPDFJob_config.cc:948-967`) queues the
+/// same donor `QPDFJob::copyAttachments` copies for the JSON
+/// `copyAttachmentsFrom` array (`QPDFJob.cc:2089-2135`).
+#[test]
+fn config_copy_attachments_from_matches_the_json_configured_path() {
+    let input =
+        Path::new(env!("CARGO_MANIFEST_DIR")).join("../../tests/fixtures/compat/one-page.pdf");
+    let donor = Path::new(env!("CARGO_MANIFEST_DIR"))
+        .join("../../tests/fixtures/compat/attachment-two-page.pdf");
+    let tempdir = tempfile::tempdir().unwrap();
+    let via_config = tempdir.path().join("via-config.pdf");
+    let via_json = tempdir.path().join("via-json.pdf");
+
+    let mut config_job = QPDFJob::new();
+    config_job
+        .config()
+        .input_file(&input)
+        .unwrap()
+        .output_file(&via_config)
+        .unwrap()
+        .deterministic_id()
+        .copy_attachments_from(donor.clone(), Vec::new(), b"donor-".to_vec());
+    assert_eq!(config_job.run().unwrap(), JobExitCode::Success);
+
+    let mut json_job = QPDFJob::new();
+    let json = serde_json::json!({
+        "inputFile": input,
+        "outputFile": via_json,
+        "deterministicId": "",
+        "copyAttachmentsFrom": [{"file": donor, "prefix": "donor-"}],
+    })
+    .to_string();
+    json_job.initialize_from_json(&json).unwrap();
+    assert_eq!(json_job.run().unwrap(), JobExitCode::Success);
+
+    assert_eq!(
+        std::fs::read(&via_config).unwrap(),
+        std::fs::read(&via_json).unwrap(),
+        "the Config builder and the JSON path must produce byte-identical output"
+    );
 }

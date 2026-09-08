@@ -4394,6 +4394,42 @@ impl QPDFJobConfig<'_> {
         self
     }
 
+    /// Queue one `--add-attachment` file for `QPDFJob::addAttachments`
+    /// (`QPDFJob.cc:2044-2083`).
+    pub fn add_attachment(&mut self, options: AttachmentAddOptions) -> &mut Self {
+        self.job.configuration.attachments_to_add.push(options);
+        self
+    }
+
+    /// Queue one `--remove-attachment` key for the removal pass in
+    /// `QPDFJob::handleTransformations` (`QPDFJob.cc:2223-2233`).
+    pub fn remove_attachment(&mut self, key: impl Into<Vec<u8>>) -> &mut Self {
+        self.job
+            .configuration
+            .attachments_to_remove
+            .push(key.into());
+        self
+    }
+
+    /// Queue one `--copy-attachments-from` donor for
+    /// `QPDFJob::copyAttachments` (`QPDFJob.cc:2089-2135`).
+    pub fn copy_attachments_from(
+        &mut self,
+        path: impl Into<PathBuf>,
+        password: impl Into<Vec<u8>>,
+        prefix: impl Into<Vec<u8>>,
+    ) -> &mut Self {
+        self.job
+            .configuration
+            .attachments_to_copy
+            .push(JobCopyAttachmentsConfig {
+                path: path.into(),
+                password: password.into(),
+                prefix: prefix.into(),
+            });
+        self
+    }
+
     /// Request qpdf QDF output.
     pub fn qdf(&mut self) -> &mut Self {
         self.job.configuration.writer.set_qdf_mode(true);
