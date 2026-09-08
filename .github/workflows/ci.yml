@@ -328,6 +328,11 @@ jobs:
           # goldens end-to-end (raw-argv pre-split -> WriteOptions -> write path).
           # Gated behind qpdf-zlib-compat; must be run explicitly here.
           cargo test -p flpdf-cli --features qpdf-zlib-compat --test cli_byte_identical_overlay
+          # Pins the overlay -> transformations ordering against qpdf's
+          # createQPDF (handleUnderOverlay then handleTransformations,
+          # QPDFJob.cc:472-473). The byte assertion is gated behind
+          # qpdf-zlib-compat; must be run explicitly here.
+          cargo test -p flpdf-cli --features qpdf-zlib-compat --test overlay_transform_order_route_tests
           # Pins AES-128 (V=4/AESV2) --encrypt output byte-identity vs qpdf,
           # both non-linearized (encrypted_document_is_byte_identical_to_qpdf)
           # and linearized (cli_linearize_encrypt_aes128_byte_identical_to_qpdf,
