@@ -1316,6 +1316,15 @@ remain after the resolving step as the qpdf `getDict` equivalent
 `Result` error propagation are unchanged. Remaining Job/CLI files are tracked
 as later bounded cohorts under `flpdf-3yn9.48.31`.
 
+`flpdf-5snx` では、qpdf の `dereference()` が未初期化 handleで falseを
+返すだけであること（`libqpdf/QPDFObjectHandle.cc:2376-2383`）に合わせ、
+`try_as_dictionary` / `try_as_name` は `Ok(None)`、`try_is_null` は
+`Ok(false)`へ短絡するようにした。これは qpdf の `asDictionary` /
+`asName`（同 `:265-268,283-286`）と `isNull`（同 `:353-356`）の
+責務に対応し、unparseResolved / getJSONのような値要求経路のInternal errorや
+initialized handleのresolver errorは変更しない。既存のA6/A7 consumer移行、
+canonical owner、qtest exceptionsは対象外である。
+
 ### `qpdfjob-c` wrapper のエラー境界
 
 qpdf の `wrap_qpdfjob`（`libqpdf/qpdfjob-c.cc:32-40`）は、

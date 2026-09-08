@@ -2853,12 +2853,24 @@ impl ObjectHandle {
     }
 
     /// qpdf-compatible null inspection with lazy dereference.
+    ///
+    /// An uninitialized handle returns `Ok(false)` without entering the
+    /// value-demanding error boundary, matching `isNull`'s
+    /// `dereference() && ...` implementation
+    /// (`libqpdf/QPDFObjectHandle.cc:353-356`).
     pub(crate) fn try_is_null(&self) -> Result<bool> {
+        if !self.is_initialized() {
+            return Ok(false);
+        }
         self.try_dereference()?;
         Ok(self.is_null())
     }
 
     /// qpdf-compatible dictionary inspection with lazy dereference.
+    ///
+    /// An uninitialized handle returns `Ok(None)`, matching
+    /// `asDictionary`'s `dereference() ? ... : nullptr` branch
+    /// (`libqpdf/QPDFObjectHandle.cc:265-268`).
     ///
     /// Ports `QPDFObjectHandle::asDictionary`, the silent internal helper the
     /// dictionary accessors branch on. It raises no warning of its own; the
@@ -2867,6 +2879,9 @@ impl ObjectHandle {
     pub(crate) fn try_as_dictionary(
         &self,
     ) -> Result<Option<std::collections::BTreeMap<Vec<u8>, ObjectHandle>>> {
+        if !self.is_initialized() {
+            return Ok(None);
+        }
         self.try_dereference()?;
         Ok(self.as_dictionary())
     }
@@ -2903,7 +2918,14 @@ impl ObjectHandle {
     }
 
     /// qpdf-compatible name inspection with lazy dereference.
+    ///
+    /// An uninitialized handle returns `Ok(None)`, matching
+    /// `asName`'s `dereference() ? ... : nullptr` branch
+    /// (`libqpdf/QPDFObjectHandle.cc:283-286`).
     pub(crate) fn try_as_name(&self) -> Result<Option<Vec<u8>>> {
+        if !self.is_initialized() {
+            return Ok(None);
+        }
         self.try_dereference()?;
         Ok(self.as_name())
     }
@@ -18268,6 +18290,9 @@ pub(crate) mod warning_emission_tests {
         assert!(!handle.try_is_array().unwrap());
         assert!(!handle.try_is_dictionary().unwrap());
         assert!(!handle.try_is_name().unwrap());
+        assert!(handle.try_as_dictionary().unwrap().is_none());
+        assert!(handle.try_as_name().unwrap().is_none());
+        assert!(!handle.try_is_null().unwrap());
         assert!(!handle.try_is_scalar().unwrap());
         assert!(!handle.try_is_number().unwrap());
         assert_eq!(handle.type_code().unwrap(), 0);

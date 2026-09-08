@@ -204,6 +204,12 @@ description template はそのレンダリング済み prefix 全体を保持す
 `object_stream_description_template` と同形。これは
 A24の cache/recheck 責務とは独立した description propagation の補正であり、canonical
 ResolverHandle側の object-stream routeや reconstruction-only bounded windowは変更しない。
+2026-09-08（`flpdf-5snx`）: qpdf の未初期化 handle 契約を
+`try_as_dictionary` / `try_as_name` / `try_is_null`へ反映した。
+`dereference()` は falseを返し、前二者は `Ok(None)`、後者は `Ok(false)`
+となる（`libqpdf/QPDFObjectHandle.cc:2376-2383,265-268,283-286,353-356`）。
+値要求経路の `try_dereference` Internal errorと、initialized handleの
+resolver error伝播は保持する。A6/A7のconsumer移行とqtest exceptionsは対象外。
 
 ### A6の追加確認: getParsedOffsetもlazy accessor
 
