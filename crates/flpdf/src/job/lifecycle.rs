@@ -4055,10 +4055,7 @@ impl QPDFJob {
                 path,
                 source,
             } => {
-                let source = source.to_string();
-                let source = source
-                    .split_once(" (os error ")
-                    .map_or(source.as_str(), |(message, _)| message);
+                let source = qpdf_file_io_source_message(source);
                 format!("{operation} {}: {source}", path.display()).into_bytes()
             }
             _ => error.to_string().into_bytes(),
@@ -4443,6 +4440,25 @@ impl QPDFJob {
     }
 }
 
+/// Render a filesystem error at qpdf's `QPDFSystemError::createWhat` boundary.
+///
+/// qpdf uses its portable C-runtime spelling for a missing path even on
+/// Windows (`QPDFSystemError.cc:13-29`); Rust's Windows `io::Error` display
+/// otherwise exposes the native `The system cannot find...` text. Keep the
+/// existing native fallback for error kinds that qpdf does not normalize here,
+/// while removing Rust's numeric suffix from both forms.
+fn qpdf_file_io_source_message(source: &std::io::Error) -> String {
+    if source.kind() == std::io::ErrorKind::NotFound {
+        return "No such file or directory".to_owned();
+    }
+    let rendered = source.to_string();
+    source
+        .raw_os_error()
+        .and_then(|code| rendered.strip_suffix(&format!(" (os error {code})")))
+        .unwrap_or(&rendered)
+        .to_owned()
+}
+
 impl QPDFJobConfig<'_> {
     /// Set the primary input filename, rejecting duplicate input selection.
     pub fn input_file(&mut self, input_file: impl Into<PathBuf>) -> Result<&mut Self> {
@@ -4684,6 +4700,29 @@ mod tests {
         job.config().verbose();
 
         assert!(job.verbose());
+    }
+
+    #[test]
+    fn job_error_message_uses_qpdf_portable_not_found_text() {
+        let missing = Error::file_io(
+            "open",
+            "missing-parent/output.pdf",
+            std::io::Error::from(std::io::ErrorKind::NotFound),
+        );
+        assert_eq!(
+            QPDFJob::job_error_message(&missing),
+            b"open missing-parent/output.pdf: No such file or directory"
+        );
+
+        let fallback = Error::file_io(
+            "open",
+            "output.pdf",
+            std::io::Error::other("native fallback"),
+        );
+        assert_eq!(
+            QPDFJob::job_error_message(&fallback),
+            b"open output.pdf: native fallback"
+        );
     }
 
     #[test]
