@@ -233,7 +233,7 @@ mixed へ変更したが、未照合の個別 case/API まで canonical と認�
 | E-14 | `QPDFJob::parseRotationParameter` | `libqpdf/QPDFJob.cc:368-415`, `include/qpdf/QPDFJob.hh:482` | `crates/flpdf/src/job/rotate_spec.rs::parse_rotation_parameter`（pub、`:35`）+ `RotationSpec` | prod: 3（range validation / job JSON / direct CLI） / test: 11 | mixed | `crates/flpdf/src/job/rotate_spec.rs::parse_rotation_parameter` | qpdfのprivate parserを共有Rust primitiveとして公開し、job JSONとCLI direct rotationの両経路が同じraw range・angle・relative契約を使う。rangeは全体文法を先に検査し、invalid parameterは`Error::Usage`でraw bytesを保持する。direct ConfigのNULは保持し、JSON consumerだけ`c_str()`境界で切る。旧`RotateSpec::parse`は削除した。ただしCLIの適用ownerは`QPDFJob::handleRotations`と別経路であり、owner closureは後続consumer移行で扱う。 |
 | E-15 | `QUtil::parse_numrange`（`QPDFJob::parseNumrange` は例外処理を足した薄いラッパー） | `include/qpdf/QUtil.hh:464`, `libqpdf/QUtil.cc:1304-1438`, `libqpdf/QPDFJob.cc:399-425`, `libqpdf/QPDFJob_argv.cc:240-272`, `libqpdf/QPDFJob_config.cc:1055-1074` | `crates/flpdf/src/qutil.rs::parse_numrange`（pub、`:400`） | prod: rotation parser / lifecycle / CLI、test: qpdf contract vectors | mixed | `crates/flpdf/src/qutil.rs::parse_numrange` | signed `max`、max=0 syntax-only、raw bytes、NUL終端、group全体の文法先行検査、exclusion、position-based odd/even、QIntC narrowing/wrappingを共通primitiveへ移植した。rotation consumerで先行利用するが、`PageRange`の他consumerとowner closureは後続issueへ残す。 |
 | E-16 | `QPDFJob::shouldRemoveUnreferencedResources` | `libqpdf/QPDFJob.cc:2250-2339`, `include/qpdf/QPDFJob.hh:515` | `crates/flpdf/src/job/resource_pruning.rs::should_remove_unreferenced_resources`（pub free） | prod: 3 (flpdf/src/job/page_merge.rs:854, flpdf/src/job/page_specs.rs:192, flpdf-cli/src/main.rs:5707) / test: 10 | mixed | `crates/flpdf/src/job/resource_pruning.rs::should_remove_unreferenced_resources` | 実装 1 本に対し呼び出し 3 経路。qpdf 側は `handlePageSpecs` からしか呼ばれない private メソッド。crate ルート `pub`（`crates/flpdf/src/lib.rs:190-193`）は 8 の (A)〜(E) 未記載の**新規 debt 候補** |
-| E-17 | `QPDFJob::initializeFromArgv` / `initializeFromJson`（`QPDFArgParser` 経由の argv 解釈） | `include/qpdf/QPDFJob.hh:75-90`, `libqpdf/QPDFJob_argv.cc` | `crates/flpdf/src/job/lifecycle.rs::QPDFJob::initialize_from_argv`（pub、`crates/flpdf/src/job/lifecycle.rs:1521`） | prod: 3（すべて flpdf-qtest-tools/src/bin/qpdfjob_ctest.rs:147,164,183）/ test: 16 (flpdf/tests/job_lifecycle_tests.rs) | mixed | absent | **flpdf-cli は `initialize_from_argv` を一度も呼ばない** — clap 定義（CLAUDE.md 逸脱分類 (B) の `QPDFArgParser` → clap）で独自に引数を解釈し、`QPDFJob` の setter を個別に叩く（`job.set_input_file` / `job.set_output_file` / `job.set_password` …）。qpdf の CLI は `initializeFromArgv` 1 本しか使わない（`qpdf/qpdf.cc:35`）。argv → 設定が CLI 側と library 側に分かれている。2026-09-06 確認: `lifecycle.rs:1614-1695` の library initializer は限定的な手書きdispatchで `--rotate` などを未実装。CLIをそのまま接続できる canonical prerequisite は完成していない |
+| E-17 | `QPDFJob::initializeFromArgv` / `initializeFromJson`（`QPDFArgParser` 経由の argv 解釈） | `include/qpdf/QPDFJob.hh:75-90`, `libqpdf/QPDFJob_argv.cc` | `crates/flpdf/src/job/lifecycle.rs::QPDFJob::initialize_from_argv`（pub、`crates/flpdf/src/job/lifecycle.rs:1521`） | prod: 3（すべて flpdf-qtest-tools/src/bin/qpdfjob_ctest.rs:147,164,183）/ test: 16 (flpdf/tests/job_lifecycle_tests.rs) | mixed | absent | **flpdf-cli は `initialize_from_argv` を一度も呼ばない** — clap 定義（CLAUDE.md 逸脱分類 (B) の `QPDFArgParser` → clap）で独自に引数を解釈し、`QPDFJob` の setter を個別に叩く（`job.set_input_file` / `job.set_output_file` / `job.set_password` …）。qpdf の CLI は `initializeFromArgv` 1 本しか使わない（`qpdf/qpdf.cc:35`）。argv → 設定が CLI 側と library 側に分かれている。2026-09-06 確認: `lifecycle.rs:1614-1695` の library initializer は限定的な手書きdispatchで `--rotate` などを未実装。CLIをそのまま接続できる canonical prerequisite は完成していない。2026-09-08（`flpdf-3yn9.48.6`）: 全 124 option の対応表を機械測定（本ファイル末尾「E-17/E-21 option correspondence table」）。`initialize_from_argv` は 11/124（9%）、`main.rs` 独自実装は 113/124（91%）で、想定と逆に `main.rs` の方が qpdf 文法（`@argfile`/`--` reset の edge case）まで含めて先行している。CLI 接続は本 issue では見送り、`initialize_from_argv` 自体の `@argfile`/`--` reset 実装が先決 |
 | E-18 | `QPDFJob::checkConfiguration` | `libqpdf/QPDFJob.cc:566-642`, `include/qpdf/QPDFJob.hh:129-130` | `crates/flpdf/src/job/lifecycle.rs::QPDFJob::check_configuration`（pub、`crates/flpdf/src/job/lifecycle.rs:3230`） | prod: 8 (flpdf/src/job/lifecycle.rs 4, flpdf-qtest-tools/src/driver/test_80_87.rs 4) / test: 0 | canonical | `crates/flpdf/src/job/lifecycle.rs::QPDFJob::check_configuration` | qpdf と同じく `createQPDF` 冒頭（`crates/flpdf/src/job/lifecycle.rs:2383`）から呼ばれ、public としても露出。CLI は使わない（E-17 の帰結）が、それは「別の正本がある」のではなく「CLI が job 設定を組み立てない」ため |
 | E-19 | `QPDFJob::getExitCode` / `hasWarnings` / `createsOutput` | `libqpdf/QPDFJob.cc:522-564` | `crates/flpdf/src/job/lifecycle.rs::QPDFJob::get_exit_code`（pub、`:4032`） + `crates/flpdf/src/job/lifecycle.rs::QPDFJob::complete`（pub、`:4062`） + `has_warnings`（pub）; document warning API は `crates/flpdf/src/reader.rs::Pdf::get_warnings` / `any_warnings` / `num_warnings` | `get_exit_code` leaf tracker prod: 17 / test: 15; `complete` prod: 20 / test: 16; `has_warnings` prod: 12 / test: 7 | mixed | `crates/flpdf/src/job/lifecycle.rs::QPDFJob::get_exit_code` + `drain_document_warnings` | `get_exit_code` は logger/write/drain を行わない純粋な query。`write_qpdf` が `get_warnings` 相当の document drain、warning summary、memory reportを1回の enclosing completionとして実行し、JSON/check/linearizationの既存standalone public APIはその後 `get_exit_code`を返す。CLI direct completionは残るが、旧 `complete` がstatusを兼ねる経路は撤去済み。 |
 | E-20 | `QPDFJob::getLogger` / `setLogger` / `setMessagePrefix` / `getMessagePrefix` / `registerProgressReporter` | `libqpdf/QPDFJob.cc:302-337`, `include/qpdf/QPDFJob.hh:92-123` | `crates/flpdf/src/job/lifecycle.rs::QPDFJob::logger`（pub、`crates/flpdf/src/job/lifecycle.rs:1308`）ほか 4 メソッド | `set_message_prefix` prod: 27 (flpdf/src/job/lifecycle.rs, flpdf-cli/src/main.rs, flpdf-qtest-tools) / test: 6；`QPDFJob::register_progress_reporter` prod: 3 (flpdf-qtest-tools/src/bin/qpdfjob_ctest.rs:143,178, flpdf-qtest-tools/src/driver/test_80_87.rs:336) / test: 2 (flpdf/tests/job_lifecycle_tests.rs:302,1591) | canonical | `crates/flpdf/src/job/lifecycle.rs`（`QPDFJob` の logger/prefix impl） | `logger()` / `message_prefix()` の `get_` 省略は 7 の bare getter 例外に該当し正しい。CLI が `QPDFJob::new` を 25 回作って毎回 logger と prefix を設定し直しているのは E-17 / E-4 の帰結（job インスタンスが lifecycle を持たない）。`crates/flpdf/src/writer.rs:695` の `PdfWriter::register_progress_reporter` は同名の別シンボルで、`crates/flpdf/src/job/lifecycle.rs:1512`（`configure_writer_progress` 内）と `crates/flpdf/tests/linearize_objstm_generate_tests.rs:1403` はそちらの caller — 上の数から除外している |
@@ -515,3 +515,210 @@ qtest exceptionsとrootは対象外。
 | `E-9` / `E-29` | `flpdf-44hb` | copyAttachments のdonor open・verbose・warning順 |
 | `E-9` / `E-24` / `E-26` / `E-14` / `E-16` | `flpdf-xsq1` | 残る公開surfaceとtest consumerの段階整理 |
 | `E-14` / `E-15` | `flpdf-ei0h` | qpdf命名対応（max=0先行検証の誤記は訂正） |
+
+## E-17/E-21 option correspondence table（2026-09-08、`flpdf-3yn9.48.6` 監査）
+
+`libqpdf/qpdf/auto_job_init.hh`（generate_auto_job が生成する qpdf の実 argv option table。
+`libqpdf/QPDFJob_argv.cc` はこれを include するだけで option 一覧自体はここにある）から
+機械的に抽出した qpdf 側の全 option 名（help/main/pages/encryption/40・128・256-bit
+encryption/underlay-overlay/attachment/copy attachment/set page labels の 11 テーブル、
+重複名込み 141 エントリ、ユニーク名で 124）を、(a) `crates/flpdf/src/job/lifecycle.rs::
+initialize_from_argv` の現在の literal 分岐、(b) `crates/flpdf-cli/src/main.rs` の clap 定義
+（`long = "..."` の明示指定 + 暗黙 kebab-case フィールド名の両方を機械検索）と突き合わせた。
+
+**見出し数値**:
+- qpdf option 総数（ユニーク名）: 124
+- `initialize_from_argv` 対応済み: **11**（`check`/`decrypt`/`deterministic-id`/
+  `keep-files-open`/`keep-files-open-threshold`/`object-streams`/`password`/`progress`/
+  `remove-page-labels`/`set-page-labels`/`static-id`）
+- `main.rs` 独自 clap parser 対応済み（明示+暗黙, ヒューリスティック検索）: **113**
+- 上記 11 は全て `main.rs` 側にも独立実装がある（`initialize_from_argv` 側だけの
+  option は 0 件）
+- 手法上「未確認」（`main.rs` 側にヒューリスティックで見つからなかった）: 11 —
+  `externalize-inline-images`/`force-R5`/`force-V4`/`job-json-help`/`json-help`/
+  `modify-other`/`preserve-unreferenced-resources`/`replace-input`/
+  `report-memory-usage`/`show-crypto`/`warning-exit-0`。**これは「未実装の証明」ではない**
+  — 検索は完全な名前一致（明示 `long=` 文字列 or snake_case フィールド名の grep）のみで、
+  `--replace-input` のように help 文言にしか現れず実装が別名フィールド／別メカニズム
+  （PR #1678 `flpdf-kt4z` は `crates/flpdf` 側の `replace_input` Config API 自体を修正して
+  おり、`main.rs` が同じ機能を別経路で提供している可能性が高い）を持つケースを
+  取りこぼす。11 件は個別に手動確認が必要な残タスクとして記録するに留める。
+
+**この監査が確定させた、本 issue の当初診断を訂正する発見**: 「`initialize_from_argv`
+を完成させてから `main.rs` をそこへ繋ぐ」という issue の想定作業順序は、実態と逆転している。
+`initialize_from_argv` は qpdf option の 9%（11/124）しか実装していない一方、`main.rs` は
+qpdf option の実に 91%（113/124）を**独自の clap 実装で**既に持っており、しかも
+`flpdf-wxec`/`flpdf-qqp5`（本 issue 着手時に再確認、いずれも CLOSED/merged — 下記参照）の
+ように `main.rs` 側は qpdf の argv 文法（`--` reset、`@argfile` 展開後の sole-option 判定）の
+細かい edge case まで実測・修正済みで、`initialize_from_argv` にはその文法（`@argfile`
+展開、qpdf 準拠の `--` reset semantics）が一切無い。**`main.rs` を今
+`initialize_from_argv` 経由へ繋ぎ変えると、`main.rs` が既に持つ 100+ option の
+実装・qpdf 文法の edge case fix をすべて失う regression になる** —
+これが「通常CLIエントリポイントを接続する」作業を本 issue で見送った理由（詳細は
+`flpdf-3yn9.48.6` の bd notes）。
+
+**既存 grammar issue の再確認結果**（着手時に再確認、issue 記載通り再利用検討）:
+- `flpdf-wxec`（`@argfile` 内 `--version`/`--copyright` の sole-option 判定）: CLOSED、
+  PR #1588 で `main.rs` 側に実装済み。`initialize_from_argv` には同等の `@argfile` 展開
+  自体が無い。
+- `flpdf-qqp5`（top-level `--` の qpdf 準拠 reset semantics）: CLOSED、PR #1605 で
+  `main.rs` 側に実装済み。`initialize_from_argv` の `--` 処理はこの reset を持たない
+  単純な one-shot フラグ（`crates/flpdf/src/job/lifecycle.rs:1708-1710` 相当）。
+- `flpdf-glm2.1`（`--newline-before-endstream=never` の bare flag 化）: 依然 OPEN、
+  `main.rs` 側の別の未解決 issue。本 issue のスコープ外。
+
+**受け入れ基準の残り**: raw argv bytes/@argfile/nested `--`/parameter dispatch/
+jobJsonFile/usage error を同じ Config へ、という統合は、`initialize_from_argv` 自体に
+`@argfile` 展開と qpdf 準拠 `--` reset を先に実装しない限り着手できない
+（`main.rs` の既存実装を「正本」側へ retrofit する形になる）。これは本 issue 単体では
+収まらない規模のため、`flpdf-3yn9.48.6.2`（仮称、未起票）として切り出す。
+未接続の CLI cohort（`.48.7`〜`.48.10`）は元々の記載通り依存 PR で段階移行する。
+
+### option 別対応表
+
+`yes` は該当箇所に実装ありと確認済み、空欄は未確認/未実装。`main.rs` 列の性質は上記の
+ヒューリスティック検索の限界を参照。
+
+| qpdf table | option | initialize_from_argv | main.rs (flpdf-cli) |
+|---|---|---|---|
+| help | copyright |  | yes |
+| help | job-json-help |  |  |
+| help | json-help |  |  |
+| help | show-crypto |  |  |
+| help | version |  | yes |
+| main | add-attachment |  | yes |
+| main | allow-weak-crypto |  | yes |
+| main | check | yes | yes |
+| main | check-linearization |  | yes |
+| main | coalesce-contents |  | yes |
+| main | collate |  | yes |
+| main | compress-streams |  | yes |
+| main | compression-level |  | yes |
+| main | copy-attachments-from |  | yes |
+| main | copy-encryption |  | yes |
+| main | decode-level |  | yes |
+| main | decrypt | yes | yes |
+| main | deterministic-id | yes | yes |
+| main | empty |  | yes |
+| main | encrypt |  | yes |
+| main | encryption-file-password |  | yes |
+| main | externalize-inline-images |  |  |
+| main | filtered-stream-data |  | yes |
+| main | flatten-annotations |  | yes |
+| main | flatten-rotation |  | yes |
+| main | force-version |  | yes |
+| main | generate-appearances |  | yes |
+| main | ignore-xref-streams |  | yes |
+| main | ii-min-bytes |  | yes |
+| main | is-encrypted |  | yes |
+| main | job-json-file |  | yes |
+| main | json |  | yes |
+| main | json-input |  | yes |
+| main | json-key |  | yes |
+| main | json-object |  | yes |
+| main | json-output |  | yes |
+| main | json-stream-data |  | yes |
+| main | json-stream-prefix |  | yes |
+| main | keep-files-open | yes | yes |
+| main | keep-files-open-threshold | yes | yes |
+| main | keep-inline-images |  | yes |
+| main | linearize |  | yes |
+| main | linearize-pass1 |  | yes |
+| main | list-attachments |  | yes |
+| main | min-version |  | yes |
+| main | newline-before-endstream |  | yes |
+| main | no-original-object-ids |  | yes |
+| main | no-warn |  | yes |
+| main | normalize-content |  | yes |
+| main | object-streams | yes | yes |
+| main | oi-min-area |  | yes |
+| main | oi-min-height |  | yes |
+| main | oi-min-width |  | yes |
+| main | optimize-images |  | yes |
+| main | overlay |  | yes |
+| main | pages |  | yes |
+| main | password | yes | yes |
+| main | password-file |  | yes |
+| main | password-is-hex-key |  | yes |
+| main | password-mode |  | yes |
+| main | preserve-unreferenced |  | yes |
+| main | preserve-unreferenced-resources |  |  |
+| main | progress | yes | yes |
+| main | qdf |  | yes |
+| main | raw-stream-data |  | yes |
+| main | recompress-flate |  | yes |
+| main | remove-attachment |  | yes |
+| main | remove-page-labels | yes | yes |
+| main | remove-restrictions |  | yes |
+| main | remove-unreferenced-resources |  | yes |
+| main | replace-input |  |  |
+| main | report-memory-usage |  |  |
+| main | requires-password |  | yes |
+| main | rotate |  | yes |
+| main | set-page-labels | yes | yes |
+| main | show-attachment |  | yes |
+| main | show-encryption |  | yes |
+| main | show-encryption-key |  | yes |
+| main | show-linearization |  | yes |
+| main | show-npages |  | yes |
+| main | show-object |  | yes |
+| main | show-pages |  | yes |
+| main | show-xref |  | yes |
+| main | split-pages |  | yes |
+| main | static-aes-iv |  | yes |
+| main | static-id | yes | yes |
+| main | stream-data |  | yes |
+| main | suppress-password-recovery |  | yes |
+| main | suppress-recovery |  | yes |
+| main | test-json-schema |  | yes |
+| main | underlay |  | yes |
+| main | update-from-json |  | yes |
+| main | verbose |  | yes |
+| main | warning-exit-0 |  |  |
+| main | with-images |  | yes |
+| pages | file |  | yes |
+| pages | password | yes | yes |
+| pages | range |  | yes |
+| encryption | bits |  | yes |
+| encryption | owner-password |  | yes |
+| encryption | user-password |  | yes |
+| 40-bit encryption | annotate |  | yes |
+| 40-bit encryption | extract |  | yes |
+| 40-bit encryption | modify |  | yes |
+| 40-bit encryption | print |  | yes |
+| 128-bit encryption | accessibility |  | yes |
+| 128-bit encryption | annotate |  | yes |
+| 128-bit encryption | assemble |  | yes |
+| 128-bit encryption | cleartext-metadata |  | yes |
+| 128-bit encryption | extract |  | yes |
+| 128-bit encryption | force-V4 |  |  |
+| 128-bit encryption | form |  | yes |
+| 128-bit encryption | modify |  | yes |
+| 128-bit encryption | modify-other |  |  |
+| 128-bit encryption | print |  | yes |
+| 128-bit encryption | use-aes |  | yes |
+| 256-bit encryption | accessibility |  | yes |
+| 256-bit encryption | allow-insecure |  | yes |
+| 256-bit encryption | annotate |  | yes |
+| 256-bit encryption | assemble |  | yes |
+| 256-bit encryption | cleartext-metadata |  | yes |
+| 256-bit encryption | extract |  | yes |
+| 256-bit encryption | force-R5 |  |  |
+| 256-bit encryption | form |  | yes |
+| 256-bit encryption | modify |  | yes |
+| 256-bit encryption | modify-other |  |  |
+| 256-bit encryption | print |  | yes |
+| underlay/overlay | file |  | yes |
+| underlay/overlay | from |  | yes |
+| underlay/overlay | password | yes | yes |
+| underlay/overlay | repeat |  | yes |
+| underlay/overlay | to |  | yes |
+| attachment | creationdate |  | yes |
+| attachment | description |  | yes |
+| attachment | filename |  | yes |
+| attachment | key |  | yes |
+| attachment | mimetype |  | yes |
+| attachment | moddate |  | yes |
+| attachment | replace |  | yes |
+| copy attachment | password | yes | yes |
+| copy attachment | prefix |  | yes |
