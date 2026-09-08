@@ -1,5 +1,8 @@
-use flpdf::{ObjectRef, PageDocumentHelper, Pdf, PdfOpenOptions};
+use flpdf::{Error, ObjectRef, PageDocumentHelper, Pdf, PdfOpenOptions, QpdfErrorCode};
 use std::io::Cursor;
+
+mod common;
+use common::build_pdf;
 
 fn one_page_nested_tree_with_unknown_key() -> Vec<u8> {
     let objects: [&[u8]; 4] = [
@@ -67,5 +70,52 @@ fn removing_an_already_removed_page_preserves_qpdf_exception_context() {
     assert_eq!(
         error.to_string(),
         "page_api_1.pdf (page object: object 4 0): page object not referenced in /Pages tree"
+    );
+}
+
+#[test]
+fn page_tree_cycle_raises_qpdf_pages_exception_with_last_object_description() {
+    let bytes = build_pdf(
+        &[
+            (1, "<< /Type /Catalog /Pages 2 0 R >>".to_owned()),
+            (
+                2,
+                "<< /Type /Pages /Count 1 /Kids [3 0 R 2 0 R] >>".to_owned(),
+            ),
+            (
+                3,
+                "<< /Type /Page /Parent 2 0 R /MediaBox [0 0 612 792] >>".to_owned(),
+            ),
+        ],
+        1,
+    );
+    let mut pdf = Pdf::open_with_options(
+        Cursor::new(bytes),
+        PdfOpenOptions {
+            description: b"pages-loop.pdf".to_vec(),
+            suppress_warnings: true,
+            ..PdfOpenOptions::default()
+        },
+    )
+    .expect("cyclic page-tree fixture should open");
+
+    let error = PageDocumentHelper::new(&mut pdf)
+        .get_all_pages()
+        .expect_err("a repeated /Pages node must raise qpdf_e_pages");
+    let Error::QpdfExc(exception) = error else {
+        panic!("expected structured QPDFExc, got {error:?}");
+    };
+
+    assert_eq!(exception.get_error_code(), QpdfErrorCode::Pages);
+    assert_eq!(exception.get_filename(), b"pages-loop.pdf");
+    assert_eq!(exception.get_object(), b"object 3 0");
+    assert_eq!(exception.get_file_position(), 0);
+    assert_eq!(
+        exception.get_message_detail(),
+        b"Loop detected in /Pages structure (getAllPages)"
+    );
+    assert_eq!(
+        exception.what_bytes(),
+        b"pages-loop.pdf (object 3 0): Loop detected in /Pages structure (getAllPages)"
     );
 }

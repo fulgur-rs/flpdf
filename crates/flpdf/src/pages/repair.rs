@@ -7,7 +7,7 @@ use std::io::{Read, Seek};
 
 use crate::object_handle::{ObjectHandle, ObjectHandleIdentity};
 use crate::ObjectRef;
-use crate::{Error, Pdf, Result};
+use crate::{Error, Pdf, QpdfErrorCode, QpdfExc, Result};
 
 /// The effective `/Pages` root and leaf order after qpdf-compatible repair.
 ///
@@ -212,14 +212,10 @@ fn repair_page_tree_handle<R: Read + Seek>(
     }
     if let Some(object_ref) = node.object_ref() {
         if !state.visited.insert(object_ref) {
-            return Err(Error::Unsupported(format!(
-                "page tree cycle detected at {object_ref}"
-            )));
+            return Err(page_tree_cycle_error(pdf));
         }
     } else if !state.visited_direct.insert(node.identity_key()) {
-        return Err(Error::Unsupported(
-            "page tree cycle detected at direct /Pages node".to_owned(),
-        ));
+        return Err(page_tree_cycle_error(pdf));
     }
 
     node.try_dereference()?;
@@ -319,6 +315,20 @@ fn repair_page_tree_handle<R: Read + Seek>(
         state.pages.push(page_ref);
     }
     Ok(())
+}
+
+/// Construct qpdf's `QPDFExc(qpdf_e_pages, ...)` for a repeated page-tree
+/// node. qpdf uses the document's current `m->last_object_description`, not
+/// the repeated node's object number, so preserve that state independently
+/// from the rendered `what()` string (`QPDF_pages.cc:81-87`).
+fn page_tree_cycle_error<R: Read + Seek + 'static>(pdf: &Pdf<R>) -> Error {
+    Error::QpdfExc(QpdfExc::new(
+        QpdfErrorCode::Pages,
+        pdf.input_source_description(),
+        pdf.resolver.last_object_description(),
+        0,
+        b"Loop detected in /Pages structure (getAllPages)",
+    ))
 }
 
 fn promote_page_handle<R: Read + Seek>(

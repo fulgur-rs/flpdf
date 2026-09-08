@@ -4715,6 +4715,13 @@ impl<R: Read + Seek> DocumentResolver for ResolverHandle<R> {
 }
 
 impl<R: Read + Seek> ResolverHandle<R> {
+    /// Return qpdf's current `m->last_object_description` for a document-owned
+    /// failure raised after an already-resolved object has established the
+    /// context (`QPDF.hh:1457`, `QPDF_pages.cc:81-87`).
+    pub(crate) fn last_object_description(&self) -> Vec<u8> {
+        self.core.borrow().last_object_description_bytes.clone()
+    }
+
     /// Keep the resolve-time catch and null fallback out of the recursive
     /// dispatch frame. The `/Length` resolver can re-enter this frame once
     /// per indirect link, so even a small local-layout change compounds on

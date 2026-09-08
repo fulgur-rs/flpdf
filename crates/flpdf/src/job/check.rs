@@ -370,12 +370,16 @@ fn check_document_with_suppression<R: Read + Seek + 'static>(
         writer.write()
     })();
     if let Err(error) = writer_result {
-        return Err(map_check_error(
+        return Err(finish_check_error(
             logger,
             message_prefix,
-            input_name,
-            error,
-            logger_failure_since(pdf, writer_diagnostics_seen),
+            map_check_error(
+                logger,
+                message_prefix,
+                input_name,
+                error,
+                logger_failure_since(pdf, writer_diagnostics_seen),
+            ),
         ));
     }
 
@@ -403,12 +407,16 @@ fn check_document_with_suppression<R: Read + Seek + 'static>(
         // page-list read; a failure in this defensive repeat is therefore
         // unreachable for a live document state.
         Err(error) => {
-            return Err(map_page_tree_error(
+            return Err(finish_check_error(
                 logger,
                 message_prefix,
-                input_name,
-                error,
-                logger_failure_since(pdf, page_tree_diagnostics_seen),
+                map_page_tree_error(
+                    logger,
+                    message_prefix,
+                    input_name,
+                    error,
+                    logger_failure_since(pdf, page_tree_diagnostics_seen),
+                ),
             ));
         } // cov:ignore-end
     };
@@ -777,12 +785,30 @@ fn emit_linearization_check_warnings<R: Read + Seek + 'static>(
 
 fn map_page_tree_error(
     logger: &QPDFLogger,
-    message_prefix: &str,
-    input_name: &[u8],
+    _message_prefix: &str,
+    _input_name: &[u8],
     error: crate::Error,
     logger_failure: bool,
 ) -> CheckError {
-    map_check_error(logger, message_prefix, input_name, error, logger_failure)
+    if logger_failure && is_logger_error(&error) {
+        CheckError::Operation(error)
+    } else {
+        match emit_page_tree_error(logger, &error) {
+            Ok(()) => CheckError::ErrorsDetected,
+            Err(delivery_error) => CheckError::Operation(delivery_error),
+        }
+    }
+}
+
+/// Complete the qpdf `doCheck` catch boundary after an error has been
+/// rendered. qpdf continues to its single final `errors detected` throw after
+/// the outer check catch (`QPDFJob.cc:788-793`); do not return the intermediate
+/// status before that line has been emitted.
+fn finish_check_error(logger: &QPDFLogger, message_prefix: &str, result: CheckError) -> CheckError {
+    match result {
+        CheckError::ErrorsDetected => report_errors_detected(logger, message_prefix),
+        other => other,
+    }
 }
 
 fn is_logger_error(error: &crate::Error) -> bool {
@@ -821,11 +847,47 @@ fn map_check_error(
     if logger_failure && is_logger_error(&error) {
         CheckError::Operation(error)
     } else {
-        match emit_error(logger, message_prefix, input_name, &error) {
+        let delivery = if is_qpdf_pages_exception(&error) {
+            emit_page_tree_error(logger, &error)
+        } else {
+            emit_error(logger, message_prefix, input_name, &error)
+        };
+        match delivery {
             Ok(()) => CheckError::ErrorsDetected,
             Err(delivery_error) => CheckError::Operation(delivery_error),
         }
     }
+}
+
+fn is_qpdf_pages_exception(error: &crate::Error) -> bool {
+    match error {
+        crate::Error::QpdfExc(exception) => exception.get_error_code() == QpdfErrorCode::Pages,
+        crate::Error::OpenFailure { source, .. } => is_qpdf_pages_exception(source),
+        _ => false,
+    }
+}
+
+/// Emit a page-tree failure using qpdf's `QPDFJob::doCheck` catch boundary.
+///
+/// qpdf writes `ERROR: ` followed directly by `std::exception::what()`
+/// (`libqpdf/QPDFJob.cc:745-793`). A `QPDFExc` already contains its source
+/// filename, so adding the generic `message_prefix: input_name: ` wrapper here
+/// would duplicate that context and diverge from qpdf's output.
+fn emit_page_tree_error(logger: &QPDFLogger, error: &crate::Error) -> Result<()> {
+    let mut line = b"ERROR: ".to_vec();
+    match error {
+        crate::Error::QpdfExc(exception) => line.extend_from_slice(exception.what_bytes()),
+        crate::Error::OpenFailure { source, .. }
+            if matches!(source.as_ref(), crate::Error::QpdfExc(_)) =>
+        {
+            if let crate::Error::QpdfExc(exception) = source.as_ref() {
+                line.extend_from_slice(exception.what_bytes());
+            }
+        }
+        other => line.extend_from_slice(other.to_string().as_bytes()),
+    }
+    line.push(b'\n');
+    logger.error(line)
 }
 
 /// Render the check-layer equivalent of qpdf's `QPDFExc::what()` for content
@@ -1110,6 +1172,50 @@ mod tests {
     }
 
     #[test]
+    fn page_tree_qpdf_exception_uses_do_check_error_framing() {
+        let output = Arc::new(Mutex::new(Vec::new()));
+        let logger = logger_with_capture(Arc::clone(&output));
+        let error = Error::QpdfExc(QpdfExc::new(
+            QpdfErrorCode::Pages,
+            b"pages-loop.pdf",
+            b"object 3 0",
+            0,
+            b"Loop detected in /Pages structure (getAllPages)",
+        ));
+
+        assert!(matches!(
+            map_page_tree_error(&logger, "qpdf", b"pages-loop.pdf", error, false),
+            CheckError::ErrorsDetected
+        ));
+        assert_eq!(
+            output.lock().expect("capture output").as_slice(),
+            b"ERROR: pages-loop.pdf (object 3 0): Loop detected in /Pages structure (getAllPages)\n"
+        );
+    }
+
+    #[test]
+    fn check_qpdf_pages_exception_uses_do_check_error_framing() {
+        let output = Arc::new(Mutex::new(Vec::new()));
+        let logger = logger_with_capture(Arc::clone(&output));
+        let error = Error::QpdfExc(QpdfExc::new(
+            QpdfErrorCode::Pages,
+            b"pages-loop.pdf",
+            b"object 3 0",
+            0,
+            b"Loop detected in /Pages structure (getAllPages)",
+        ));
+
+        assert!(matches!(
+            map_check_error(&logger, "qpdf", b"pages-loop.pdf", error, false),
+            CheckError::ErrorsDetected
+        ));
+        assert_eq!(
+            output.lock().expect("capture output").as_slice(),
+            b"ERROR: pages-loop.pdf (object 3 0): Loop detected in /Pages structure (getAllPages)\n"
+        );
+    }
+
+    #[test]
     fn report_errors_detected_preserves_logger_failures() {
         let logger = QPDFLogger::create();
         logger.set_output_streams(None, Some(PipelineHandle::new(FailingCapture)));
@@ -1195,6 +1301,32 @@ mod tests {
         );
         let off3 = pdf.len();
         pdf.extend_from_slice(b"3 0 obj\n<< /Type /Pages /Kids [] /Count 0 >>\nendobj\n");
+        let xref_start = pdf.len();
+        pdf.extend_from_slice(
+            format!(
+                "xref\n0 4\n0000000000 65535 f \n{off1:010} 00000 n \n{off2:010} 00000 n \n{off3:010} 00000 n \n"
+            )
+            .as_bytes(),
+        );
+        pdf.extend_from_slice(
+            format!("trailer\n<< /Size 4 /Root 1 0 R >>\nstartxref\n{xref_start}\n%%EOF\n")
+                .as_bytes(),
+        );
+        pdf
+    }
+
+    fn page_tree_cycle_pdf_bytes() -> Vec<u8> {
+        let mut pdf = b"%PDF-1.3\n".to_vec();
+        let off1 = pdf.len();
+        pdf.extend_from_slice(b"1 0 obj\n<< /Type /Catalog /Pages 2 0 R >>\nendobj\n");
+        let off2 = pdf.len();
+        pdf.extend_from_slice(
+            b"2 0 obj\n<< /Type /Pages /Count 1 /Kids [3 0 R 2 0 R] >>\nendobj\n",
+        );
+        let off3 = pdf.len();
+        pdf.extend_from_slice(
+            b"3 0 obj\n<< /Type /Page /Parent 2 0 R /MediaBox [0 0 612 792] >>\nendobj\n",
+        );
         let xref_start = pdf.len();
         pdf.extend_from_slice(
             format!(
@@ -1433,6 +1565,33 @@ mod tests {
         assert_eq!(
             output,
             "qpdf: rootless.pdf: unable to find /Root dictionary\n"
+        );
+    }
+
+    #[test]
+    fn document_check_reports_page_tree_exception_then_final_error() {
+        let output = Arc::new(Mutex::new(Vec::new()));
+        let logger = logger_with_capture(Arc::clone(&output));
+        let mut pdf = Pdf::open_with_options(
+            Cursor::new(page_tree_cycle_pdf_bytes()),
+            PdfOpenOptions {
+                description: b"pages-loop.pdf".to_vec(),
+                ..PdfOpenOptions::default()
+            },
+        )
+        .expect("cyclic page-tree fixture should open");
+
+        let result = check_document(&mut pdf, &logger, "qpdf", "pages-loop.pdf");
+
+        assert!(matches!(result, Err(CheckError::ErrorsDetected)));
+        assert_eq!(
+            output.lock().expect("capture output").as_slice(),
+            b"checking pages-loop.pdf\n\
+              PDF Version: 1.3\n\
+              File is not encrypted\n\
+              File is not linearized\n\
+              ERROR: pages-loop.pdf (object 3 0): Loop detected in /Pages structure (getAllPages)\n\
+              qpdf: errors detected\n"
         );
     }
 
