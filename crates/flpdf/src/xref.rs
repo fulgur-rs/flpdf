@@ -95,6 +95,13 @@ pub(crate) trait CanonicalTrailerOwner {
         description: Option<Vec<u8>>,
     ) -> Result<(ObjectHandle, Option<u64>)>;
     fn repair_diagnostics(&self) -> Diagnostics;
+    /// Start withholding this document's live warning delivery; see
+    /// [`ResolverHandle::begin_deferred_repair_diagnostics`].
+    fn begin_deferred_diagnostics(&self) -> usize;
+    /// Stop withholding live warning delivery and return exactly the
+    /// warnings recorded since `start`; see
+    /// [`ResolverHandle::end_deferred_repair_diagnostics`].
+    fn end_deferred_diagnostics(&self, start: usize) -> Diagnostics;
 }
 
 impl<R: Read + Seek + 'static> CanonicalTrailerOwner for ResolverHandle<R> {
@@ -143,6 +150,14 @@ impl<R: Read + Seek + 'static> CanonicalTrailerOwner for ResolverHandle<R> {
 
     fn repair_diagnostics(&self) -> Diagnostics {
         ResolverHandle::repair_diagnostics(self)
+    }
+
+    fn begin_deferred_diagnostics(&self) -> usize {
+        self.begin_deferred_repair_diagnostics()
+    }
+
+    fn end_deferred_diagnostics(&self, start: usize) -> Diagnostics {
+        self.end_deferred_repair_diagnostics(start)
     }
 }
 
@@ -1474,6 +1489,58 @@ impl XrefObjectContext for XrefReadContext<'_> {
     }
 }
 
+/// Reconciles a canonical owner's immediate warning delivery with a
+/// reconstruction pass's own locally buffered diagnostics.
+///
+/// No qpdf counterpart: qpdf has one warnings deque and prints each entry the
+/// instant `warn()` records it (`libqpdf/QPDF.cc:487-494`), so its
+/// reconstruction warnings and the per-object warnings its candidate search
+/// and re-entry reads raise are already in one strictly call-ordered stream.
+/// flpdf's canonical-owner reconstruction has two channels instead: the
+/// document's own live delivery (used whenever candidate discovery or a
+/// candidate's re-entry actually resolves an object through the owner) and
+/// this module's trio/line-scan diagnostics, which stay in a local buffer
+/// until the whole open call succeeds or fails. Without reconciliation, the
+/// live channel's warnings print immediately while the buffered ones are
+/// deferred to that single later point, so the buffered warnings always
+/// print *after* live per-object warnings from the same reconstruction
+/// attempt — backwards from qpdf's real call order.
+///
+/// For the scope of this guard, the owner withholds its live delivery
+/// (still recording into its own collection, so nothing is lost) and, on
+/// drop — including when the guarded scope exits early via `?` — hands back
+/// exactly what it recorded during that window, which this guard splices
+/// into `target` in call order. `target` is the caller's own locally
+/// buffered `Diagnostics`, so once reconciled, the existing single flush
+/// point (installing onto the document on success, or
+/// [`Error::with_open_diagnostics`] on failure) delivers everything once, in
+/// the order qpdf would have produced it.
+struct DeferredDiagnosticsGuard<'a> {
+    owner: &'a dyn CanonicalTrailerOwner,
+    start: usize,
+    target: &'a mut Diagnostics,
+}
+
+impl<'a> DeferredDiagnosticsGuard<'a> {
+    fn new(owner: &'a dyn CanonicalTrailerOwner, target: &'a mut Diagnostics) -> Self {
+        let start = owner.begin_deferred_diagnostics();
+        Self {
+            owner,
+            start,
+            target,
+        }
+    }
+}
+
+impl Drop for DeferredDiagnosticsGuard<'_> {
+    fn drop(&mut self) {
+        let captured = self.owner.end_deferred_diagnostics(self.start);
+        for diagnostic in captured.entries() {
+            self.target.push(diagnostic.clone());
+        }
+    }
+}
+
 struct CanonicalXrefContext<'owner> {
     owner: &'owner dyn CanonicalTrailerOwner,
     description: Vec<u8>,
@@ -1500,10 +1567,14 @@ impl<'owner> CanonicalXrefContext<'owner> {
     /// The document is the single emitter for its own warnings:
     /// `push_qpdf_warning` logs them and records them on the document, and
     /// `engine.rs` installs this context's collection onto that same
-    /// document afterwards. Mirroring them here would deliver one repair
-    /// twice, where qpdf delivers it once because it reconstructs once per
-    /// document (`libqpdf/QPDF.cc:518-522`). The counter is still advanced so
-    /// a future consumer can tell what the owner added during this read.
+    /// document afterwards. Mirroring them here unconditionally would
+    /// deliver one repair twice, where qpdf delivers it once because it
+    /// reconstructs once per document (`libqpdf/QPDF.cc:518-522`). The
+    /// counter is still advanced so a future consumer can tell what the
+    /// owner added during this read. A caller wrapping this context's use in
+    /// a [`DeferredDiagnosticsGuard`] window reconciles the *same* owner
+    /// diagnostics separately, by capture-and-splice rather than through
+    /// this context, so the two mechanisms do not double-count each other.
     fn sync_owner_diagnostics(&mut self) {
         self.owner_diagnostics_synced = self
             .owner
@@ -1554,12 +1625,16 @@ impl XrefObjectContext for CanonicalXrefContext<'_> {
     }
 
     fn append_diagnostics_to(&mut self, diagnostics: &mut Diagnostics) {
-        // Only this context's own diagnostics. The owner's are already on the
-        // document — `push_qpdf_warning` both logs them and records them — and
+        // Only this context's own diagnostics. The owner's stay live-only by
+        // default — `push_qpdf_warning` both logs them and records them, and
         // `engine.rs` installs this collection onto that same document, so
-        // mirroring them here would report one repair twice. qpdf warns once
-        // per reconstruction because it reconstructs once per document
-        // (`libqpdf/QPDF.cc:518-522`).
+        // mirroring them here unconditionally would report one repair twice.
+        // qpdf warns once per reconstruction because it reconstructs once
+        // per document (`libqpdf/QPDF.cc:518-522`). A caller that needs the
+        // owner's diagnostics too (xref reconstruction, to fix their
+        // print-order relative to this buffer) wraps this context's use in a
+        // `DeferredDiagnosticsGuard` and splices its captured window in
+        // separately, rather than through this method.
         for diagnostic in self.diagnostics.entries() {
             diagnostics.push(diagnostic.clone());
         }
@@ -3235,7 +3310,18 @@ fn recover_trailer_from_xref_stream_candidate(
         entries: entries.clone(),
         ..XrefRegistration::default()
     };
-    let mut reentry = match parse_xref_from_start_with_owner(
+    // The re-entry's own read (`owner.read_xref_stream_at_offset`, reached
+    // through `parse_xref_stream_with_canonical_owner` when a canonical
+    // owner is present) resolves the candidate object live, warning
+    // immediately just like discovery above. Reconcile that the same way:
+    // the captured window is appended to `repair_diagnostics` immediately
+    // below, before `reentry.loaded.repair_diagnostics` is appended,
+    // matching qpdf's own call order (`readObjectAtOffset` runs before
+    // `processXRefStream`'s own diagnostics can occur, `QPDF.cc:956-960`).
+    // No guard is needed here: the call below cannot exit early through
+    // `?`, so an explicit begin/end pair is sufficient.
+    let deferred_start = canonical_trailer_owner.map(|owner| owner.begin_deferred_diagnostics());
+    let reentry_result = parse_xref_from_start_with_owner(
         bytes,
         max_offset as usize,
         max_offset,
@@ -3251,7 +3337,25 @@ fn recover_trailer_from_xref_stream_candidate(
         None,
         false,
         canonical_trailer_owner,
-    ) {
+    );
+    if let (Some(owner), Some(start)) = (canonical_trailer_owner, deferred_start) {
+        // cov:ignore-start: ResolverHandle::resolve_xref_stream_at_offset
+        // (the only production `read_xref_stream_at_offset` implementation)
+        // hard-codes `try_recovery: false` for this offset read, so it
+        // cannot itself raise a live, recoverable warning through
+        // `push_qpdf_warning` -- a header/framing problem here surfaces as
+        // an `Err` (handled below), not a warning captured in this window.
+        // The reconciliation stays for the same reason the discovery-side
+        // guard exists (structural symmetry with qpdf's single warnings
+        // deque, verified by `candidate_discovery_defers_and_restores_owner_live_diagnostics`
+        // and the discovery-side integration test), and to stay correct if
+        // that recovery restriction is ever lifted.
+        for diagnostic in owner.end_deferred_diagnostics(start).entries() {
+            repair_diagnostics.push(diagnostic.clone());
+        }
+        // cov:ignore-end
+    }
+    let mut reentry = match reentry_result {
         Ok(reentry) => reentry,
         Err(_) => {
             // qpdf's message is exactly this, with no nested detail appended
@@ -3565,29 +3669,38 @@ fn find_xref_stream_trailer_candidate_canonical(
     let mut context = CanonicalXrefContext::new(owner, options.description);
     let mut max_offset = 0u64;
     let mut trailer = None;
-    for (&object_ref, entry) in entries {
-        let XrefEntry::Uncompressed { offset } = *entry else {
-            continue;
-        };
-        let object = owner.indirect_handle(object_ref);
-        let _ = object.try_dereference();
-        context.sync_handle_diagnostics();
-        let Some(stream_dict) = object.as_stream_dict() else {
-            continue;
-        };
-        if !is_xref_stream_dict(&mut context, &stream_dict) {
-            continue;
+    // qpdf's candidate search resolves every type-1 entry unconditionally,
+    // warning immediately as each is read (`QPDF.cc:585-589`); reconcile
+    // that live delivery with this reconstruction's own buffered
+    // diagnostics so the caller sees them in true call order instead of
+    // after everything buffered elsewhere (see `DeferredDiagnosticsGuard`).
+    let mut live_diagnostics = Diagnostics::default();
+    {
+        let _guard = DeferredDiagnosticsGuard::new(owner, &mut live_diagnostics);
+        for (&object_ref, entry) in entries {
+            let XrefEntry::Uncompressed { offset } = *entry else {
+                continue;
+            };
+            let object = owner.indirect_handle(object_ref);
+            let _ = object.try_dereference();
+            context.sync_handle_diagnostics();
+            let Some(stream_dict) = object.as_stream_dict() else {
+                continue;
+            };
+            if !is_xref_stream_dict(&mut context, &stream_dict) {
+                continue;
+            }
+            context.sync_handle_diagnostics();
+            if offset > max_offset {
+                max_offset = offset;
+                if trailer.is_none() {
+                    trailer = Some(stream_dict);
+                }
+            } // cov:ignore: LLVM maps the covered canonical candidate offset branch to its closing brace
         }
         context.sync_handle_diagnostics();
-        if offset > max_offset {
-            max_offset = offset;
-            if trailer.is_none() {
-                trailer = Some(stream_dict);
-            }
-        } // cov:ignore: LLVM maps the covered canonical candidate offset branch to its closing brace
     }
-    context.sync_handle_diagnostics();
-    let mut diagnostics = Diagnostics::default();
+    let mut diagnostics = live_diagnostics;
     context.append_diagnostics_to(&mut diagnostics);
     let candidate = trailer.map(|trailer| XrefStreamCandidate {
         trailer,
@@ -6826,6 +6939,14 @@ mod final_handle_tests {
         fn repair_diagnostics(&self) -> Diagnostics {
             self.diagnostics.borrow().clone()
         }
+
+        fn begin_deferred_diagnostics(&self) -> usize {
+            self.diagnostics.borrow().entries().len()
+        }
+
+        fn end_deferred_diagnostics(&self, start: usize) -> Diagnostics {
+            self.diagnostics.borrow_mut().split_off(start)
+        }
     }
 
     #[test]
@@ -7025,6 +7146,39 @@ mod final_handle_tests {
             assert_eq!(owner.repair_diagnostics().entries().len(), 1);
             assert_eq!(sink.entries().len(), 0);
         }
+    }
+
+    #[test]
+    fn candidate_discovery_defers_and_restores_owner_live_diagnostics() {
+        let owner = FailingCanonicalOwner {
+            transport_error: false,
+            diagnostics: RefCell::new(Diagnostics::default()),
+        };
+        let mut entries = BTreeMap::new();
+        entries.insert(ObjectRef::new(1, 0), XrefEntry::Uncompressed { offset: 0 });
+        let start = owner.begin_deferred_diagnostics();
+        assert_eq!(start, 0);
+        owner.diagnostics.borrow_mut().push(damaged_warning(
+            b"synthetic.pdf",
+            b"",
+            "synthetic live warning",
+            Some(0),
+        ));
+        let captured = owner.end_deferred_diagnostics(start);
+        assert_eq!(captured.entries().len(), 1);
+        assert!(owner.repair_diagnostics().is_empty());
+
+        // `find_xref_stream_trailer_candidate_canonical` wraps its own scan
+        // in exactly this begin/end pair regardless of what it finds, so a
+        // mock owner with an uninitialized handle for every entry (never a
+        // real `/Type /XRef` candidate) still exercises the round trip.
+        let (candidate, diagnostics) = find_xref_stream_trailer_candidate_canonical(
+            &entries,
+            XrefLoadOptions::default(),
+            &owner,
+        );
+        assert!(candidate.is_none());
+        assert!(diagnostics.is_empty());
     }
 
     #[test]
