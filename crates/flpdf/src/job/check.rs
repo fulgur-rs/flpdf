@@ -320,7 +320,15 @@ fn check_document_with_suppression<R: Read + Seek + 'static>(
     // block for the standalone `--show-encryption` mode
     // (`QPDFJob.cc:428-448`), a path `--check` never reaches. Always
     // suppress it here.
-    emit_encryption_report(pdf, logger, true, show_encryption_key)?;
+    let encryption_diagnostics_seen = diagnostic_count(pdf);
+    if let Err(error) = emit_encryption_report(pdf, logger, true, show_encryption_key) {
+        return Err(map_check_phase_error(
+            logger,
+            message_prefix,
+            error,
+            logger_failure_since(pdf, encryption_diagnostics_seen),
+        ));
+    }
 
     let linearized_diagnostics_seen = diagnostic_count(pdf);
     let linearized = match pdf.is_linearized() {
@@ -339,12 +347,22 @@ fn check_document_with_suppression<R: Read + Seek + 'static>(
     };
     if linearized {
         logger.info("File is linearized\n")?;
-        warnings |= emit_linearization_check_for_document_with_suppression(
+        match emit_linearization_check_for_document_with_suppression(
             pdf,
             logger,
             input_name,
             suppress_warnings,
-        )?; // cov:ignore: closing line of a multi-line suppress_warnings call/block; llvm-cov misattributes the hit count to the previous line, not an untested branch
+        ) {
+            Ok(new_warnings) => warnings |= new_warnings,
+            Err(error) => {
+                return Err(map_check_phase_error(
+                    logger,
+                    message_prefix,
+                    error,
+                    logger_failure_since(pdf, linearized_diagnostics_seen),
+                ));
+            }
+        }
     } else {
         logger.info("File is not linearized\n")?;
     }
@@ -798,6 +816,19 @@ fn map_in_try_error(logger: &QPDFLogger, error: crate::Error, logger_failure: bo
     }
 }
 
+fn map_check_phase_error(
+    logger: &QPDFLogger,
+    message_prefix: &str,
+    error: crate::Error,
+    logger_failure: bool,
+) -> CheckError {
+    finish_check_error(
+        logger,
+        message_prefix,
+        map_in_try_error(logger, error, logger_failure),
+    )
+}
+
 /// Complete the qpdf `doCheck` catch boundary after an error has been
 /// rendered. qpdf continues to its single final `errors detected` throw after
 /// the outer check catch (`QPDFJob.cc:788-793`); do not return the intermediate
@@ -1226,6 +1257,24 @@ mod tests {
         assert_eq!(
             output.lock().expect("capture output").as_slice(),
             b"ERROR: pages-loop.pdf (object 3 0): Loop detected in /Pages structure (getAllPages)\n"
+        );
+    }
+
+    #[test]
+    fn check_phase_operation_errors_use_do_check_catch_framing() {
+        let output = Arc::new(Mutex::new(Vec::new()));
+        let logger = logger_with_capture(Arc::clone(&output));
+        let result = map_check_phase_error(
+            &logger,
+            "qpdf",
+            Error::Internal("encrypted PDF has no encryption revision".to_owned()),
+            false,
+        );
+
+        assert!(matches!(result, CheckError::ErrorsDetected));
+        assert_eq!(
+            output.lock().expect("capture output").as_slice(),
+            b"ERROR: encrypted PDF has no encryption revision\nqpdf: errors detected\n"
         );
     }
 
@@ -2683,6 +2732,109 @@ mod tests {
                 "errors that qpdf cannot detect\n",
             )
             .as_bytes()
+        );
+    }
+
+    #[test]
+    fn encrypted_document_check_propagates_encryption_report_logger_failure() {
+        let errors = Arc::new(Mutex::new(Vec::new()));
+        let logger = QPDFLogger::create();
+        logger.set_output_streams(
+            Some(PipelineHandle::new(
+                crate::pipeline::test_support::NthWriteFailure::new(3),
+            )),
+            Some(PipelineHandle::new(Capture {
+                bytes: Arc::clone(&errors),
+            })),
+        );
+        let mut job = QPDFJob::new();
+        job.set_logger(logger);
+        let mut pdf = job
+            .open(
+                Cursor::new(include_bytes!(concat!(
+                    env!("CARGO_MANIFEST_DIR"),
+                    "/../../tests/fixtures/encrypted/v2-rc4-128-r3.pdf"
+                ))),
+                "encrypted.pdf",
+                PdfOpenOptions {
+                    password: b"user-v2".to_vec(),
+                    ..PdfOpenOptions::default()
+                },
+            )
+            .expect("encrypted fixture should open");
+
+        assert!(matches!(
+            job.check(&mut pdf),
+            Err(CheckError::ErrorsDetected)
+        ));
+        // qpdf's doCheck catch writes the bare `ERROR: <what>` and its single
+        // trailing `errors detected` (`QPDFJob.cc:788-794`); the pre-try
+        // `whoami: file: ` wrapper must not appear for an in-try failure.
+        assert_eq!(
+            String::from_utf8(errors.lock().unwrap().clone()).unwrap(),
+            "ERROR: sink write failure 3\nqpdf: errors detected\n"
+        );
+    }
+
+    /// A failing warning sink inside `checkLinearization` takes the same
+    /// `doCheck` catch boundary.
+    ///
+    /// qpdf reaches this shape too: `QPDF::checkLinearization`
+    /// (`libqpdf/QPDF_linearization.cc:69-81`) turns a read failure into
+    /// `linearizationWarning`, which calls `QPDF::warn`
+    /// (`libqpdf/QPDF.cc:487-493`). That function writes to `getWarn()`
+    /// outside any try, and it is already running inside
+    /// `checkLinearization`'s own `catch`, so a sink failure escapes to
+    /// `doCheck`'s indiscriminate catch (`QPDFJob.cc:788-794`) -- `ERROR:` plus
+    /// one `errors detected`, not a propagated operation error.
+    #[test]
+    fn linearization_check_warning_sink_failure_uses_do_check_catch_framing() {
+        let armed = Arc::new(AtomicBool::new(false));
+        let snapshot = Arc::new(AtomicBool::new(false));
+        let start_zero_seeks = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let mut pdf = Pdf::open(SnapshotFailReader {
+            reader: Cursor::new(
+                include_bytes!(concat!(
+                    env!("CARGO_MANIFEST_DIR"),
+                    "/../../tests/fixtures/compat/linearized-one-page.pdf"
+                ))
+                .to_vec(),
+            ),
+            armed: Arc::clone(&armed),
+            snapshot: Arc::clone(&snapshot),
+            start_zero_seeks: Arc::clone(&start_zero_seeks),
+        })
+        .expect("linearized fixture should open");
+        pdf.root_handle().expect("Catalog should resolve");
+
+        armed.store(true, Ordering::Relaxed);
+
+        let output = Arc::new(Mutex::new(Vec::new()));
+        let logger = logger_with_capture(Arc::clone(&output));
+        // The linearization warning is delivered through the report logger's
+        // warn stream, which is where qpdf's `QPDF::warn` writes
+        // (`libqpdf/QPDF.cc:487-493`). Fail that write.
+        logger.set_warn(Some(PipelineHandle::new(
+            crate::pipeline::test_support::NthWriteFailure::new(1),
+        )));
+        let result = check_document(&mut pdf, &logger, "qpdf", "snapshot-failure.pdf");
+
+        let report = String::from_utf8(output.lock().unwrap().clone()).unwrap();
+        assert!(
+            matches!(&result, Err(CheckError::ErrorsDetected)),
+            "unexpected outcome with report {report:?}"
+        );
+        assert!(
+            report.contains("ERROR: sink write failure 1"),
+            "the in-try failure takes qpdf's bare catch framing: {report:?}"
+        );
+        assert!(
+            report.contains("qpdf: errors detected"),
+            "qpdf ends the check with one errors-detected line: {report:?}"
+        );
+        assert!(
+            !report.contains("snapshot-failure.pdf: sink write failure"),
+            "the pre-try wrapper must not appear: {report:?}"
         );
     }
 
