@@ -876,6 +876,7 @@ fn is_qpdf_pages_exception(error: &crate::Error) -> bool {
 fn emit_page_tree_error(logger: &QPDFLogger, error: &crate::Error) -> Result<()> {
     let mut line = b"ERROR: ".to_vec();
     match error {
+        // cov:ignore: LLVM assigns the covered match dispatch to a zero-hit region; all message arms are exercised below.
         crate::Error::QpdfExc(exception) => line.extend_from_slice(exception.what_bytes()),
         crate::Error::OpenFailure { source, .. }
             if matches!(source.as_ref(), crate::Error::QpdfExc(_)) =>
@@ -1213,6 +1214,46 @@ mod tests {
             output.lock().expect("capture output").as_slice(),
             b"ERROR: pages-loop.pdf (object 3 0): Loop detected in /Pages structure (getAllPages)\n"
         );
+
+        let output = Arc::new(Mutex::new(Vec::new()));
+        let logger = logger_with_capture(Arc::clone(&output));
+        let source = Error::QpdfExc(QpdfExc::new(
+            QpdfErrorCode::Pages,
+            b"pages-loop.pdf",
+            b"object 3 0",
+            0,
+            b"Loop detected in /Pages structure (getAllPages)",
+        ));
+        let open_failure = Error::OpenFailure {
+            source: Box::new(source),
+            diagnostics: Diagnostics::default(),
+        };
+        assert!(matches!(
+            map_check_error(&logger, "qpdf", b"pages-loop.pdf", open_failure, false),
+            CheckError::ErrorsDetected
+        ));
+        assert_eq!(
+            output.lock().expect("capture output").as_slice(),
+            b"ERROR: pages-loop.pdf (object 3 0): Loop detected in /Pages structure (getAllPages)\n"
+        );
+    }
+
+    #[test]
+    fn page_tree_qpdf_exception_propagates_logger_failure() {
+        let logger = QPDFLogger::create();
+        logger.set_output_streams(None, Some(PipelineHandle::new(FailingCapture)));
+        let error = Error::QpdfExc(QpdfExc::new(
+            QpdfErrorCode::Pages,
+            b"pages-loop.pdf",
+            b"object 3 0",
+            0,
+            b"Loop detected in /Pages structure (getAllPages)",
+        ));
+
+        assert!(matches!(
+            map_page_tree_error(&logger, "qpdf", b"pages-loop.pdf", error, false),
+            CheckError::Operation(Error::System(message)) if message == "logger failure"
+        ));
     }
 
     #[test]

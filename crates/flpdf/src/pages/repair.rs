@@ -215,7 +215,7 @@ fn repair_page_tree_handle<R: Read + Seek>(
             return Err(page_tree_cycle_error(pdf));
         }
     } else if !state.visited_direct.insert(node.identity_key()) {
-        return Err(page_tree_cycle_error(pdf));
+        return Err(page_tree_cycle_error(pdf)); // cov:ignore: parsed PDF /Pages nodes are indirect; retain this defensive direct-handle cycle guard for canonical ObjectHandle callers.
     }
 
     node.try_dereference()?;
