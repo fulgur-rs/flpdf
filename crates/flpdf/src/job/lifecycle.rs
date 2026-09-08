@@ -3025,6 +3025,18 @@ impl QPDFJob {
                     // POSIX/Windows both refuse to rename an open file
                     // reliably (`libqpdf/QPDFJob.cc:3068-3069`).
                     pdf.close_input_source();
+                    // qpdf's page_heap donors die when createQPDF returns;
+                    // flpdf keeps these documents through write so deferred
+                    // foreign streams can still read their providers. Close
+                    // every retained donor at the same replace-input boundary
+                    // before the original path is renamed, including a donor
+                    // that aliases the primary input.
+                    for source in &self.page_source_documents {
+                        source.close_input_source();
+                    }
+                    for spec in &self.overlay_sources {
+                        spec.source.close_input_source();
+                    }
                     // A rename failure escapes qpdf's `writeOutfile` as an
                     // exception and its CLI catch still prints one
                     // `qpdf: <what()>` line (`qpdf/qpdf.cc:39-41`). Report it
@@ -4737,6 +4749,85 @@ mod tests {
             ).any(|window| window == b"qpdf: automatically converting Unicode password to single-byte encoding as required for 40-bit or 128-bit encryption\n"),
             "verbose writer output must include qpdf's auto-conversion info"
         );
+    }
+
+    #[test]
+    fn write_qpdf_closes_retained_page_sources_before_replace_input() {
+        let primary_fixture = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("../../tests/fixtures/compat/one-page.pdf");
+        let secondary = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("../../tests/fixtures/compat/attachment-two-page.pdf");
+        let tempdir = tempfile::tempdir().expect("temporary replace-input directory");
+        let primary = tempdir.path().join("primary.pdf");
+        std::fs::copy(&primary_fixture, &primary).expect("copy primary fixture");
+        let json = serde_json::json!({
+            "inputFile": primary,
+            "replaceInput": "",
+            "pages": [
+                {"file": ".", "range": "1"},
+                {"file": secondary, "range": "1"}
+            ]
+        })
+        .to_string();
+
+        let mut job = QPDFJob::new();
+        job.initialize_from_json(&json)
+            .expect("multi-source replace-input configuration");
+        let mut pdf = job
+            .create_qpdf()
+            .expect("create qpdf")
+            .expect("primary document");
+        assert_eq!(job.page_source_documents.len(), 2);
+        assert!(job
+            .page_source_documents
+            .iter()
+            .all(|source| !source.resolver.input_source_closed()));
+
+        job.write_qpdf(&mut pdf)
+            .expect("replace-input write succeeds");
+        assert!(job.page_source_documents.iter().all(|source| {
+            source.resolver.input_source_closed()
+                && source
+                    .input_source_control
+                    .as_ref()
+                    .is_none_or(|control| control.is_closed_for_test())
+        }));
+        assert!(primary.is_file(), "replace-input keeps the input path");
+    }
+
+    #[test]
+    fn write_qpdf_closes_retained_overlay_sources_before_replace_input() {
+        let primary_fixture = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("../../tests/fixtures/compat/one-page.pdf");
+        let tempdir = tempfile::tempdir().expect("temporary replace-input directory");
+        let primary = tempdir.path().join("primary.pdf");
+        std::fs::copy(&primary_fixture, &primary).expect("copy primary fixture");
+        let json = serde_json::json!({
+            "inputFile": primary,
+            "replaceInput": "",
+            "overlay": {"file": primary, "from": "1", "to": "1"}
+        })
+        .to_string();
+
+        let mut job = QPDFJob::new();
+        job.initialize_from_json(&json)
+            .expect("self-overlay replace-input configuration");
+        let mut pdf = job
+            .create_qpdf()
+            .expect("create qpdf")
+            .expect("primary document");
+        assert_eq!(job.overlay_sources.len(), 1);
+        assert!(!job.overlay_sources[0].source.resolver.input_source_closed());
+
+        job.write_qpdf(&mut pdf)
+            .expect("replace-input write succeeds");
+        let overlay = &job.overlay_sources[0].source;
+        assert!(overlay.resolver.input_source_closed());
+        assert!(overlay
+            .input_source_control
+            .as_ref()
+            .is_none_or(|control| control.is_closed_for_test()));
+        assert!(primary.is_file(), "replace-input keeps the input path");
     }
 
     #[test]
