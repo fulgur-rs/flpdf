@@ -202,7 +202,7 @@ fn write_plain_live_disable<R: Read + Seek, W: Write>(
                         object_ref.number, object_ref.generation
                     ))
                     // cov:ignore-end
-                })
+                }) // cov:ignore: the direct-root reference map is exercised; LLVM places the successful closure-exit counter on this continuation line.
             };
             let mut bytes = Vec::new();
             arbitrated
