@@ -892,6 +892,26 @@ impl<'a> Tokenizer<'a> {
             .ok_or_else(|| Error::parse(token.start, "integer is out of range"))
     }
 
+    /// Read one integer using qpdf's `QPDF::readToken` contract. The qpdf
+    /// wrapper always calls the tokenizer with `allow_bad = true`, then its
+    /// caller checks the returned token type (`QPDF.cc:1535-1539,1801-1814`)
+    /// instead of letting the tokenizer throw first. Keep this as a separate
+    /// consumer so the ordinary `next_integer` callers retain their stricter
+    /// `allow_bad = false` behavior.
+    pub(crate) fn next_object_stream_integer(&mut self) -> Result<i64> {
+        let token = self.read_token(true, 0)?;
+        if !token.is_integer() {
+            return Err(Error::parse(
+                token.start,
+                "expected integer in object stream header",
+            ));
+        }
+        std::str::from_utf8(&token.value)
+            .ok()
+            .and_then(|value| value.parse::<i64>().ok())
+            .ok_or_else(|| Error::parse(token.start, "integer is out of range"))
+    }
+
     pub(crate) fn expect_word(&mut self, expected: &[u8]) -> Result<()> {
         let token = self.read_token(false, 0)?;
         if token.is_word_value(expected) {
@@ -1005,5 +1025,24 @@ fn token_description(token: &Token) -> String {
             token.token_type,
             String::from_utf8_lossy(&token.raw)
         )
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::Tokenizer;
+    use crate::Error;
+
+    #[test]
+    fn object_stream_integer_checks_a_bad_token_after_reading_it() {
+        let mut tokenizer = Tokenizer::new(b"(");
+        let error = tokenizer
+            .next_object_stream_integer()
+            .expect_err("a malformed token is not an object-stream integer");
+        assert!(matches!(
+            error,
+            Error::Parse { message, .. }
+                if message == "expected integer in object stream header"
+        ));
     }
 }

@@ -1926,7 +1926,6 @@ pub(crate) fn parse_qpdf_direct_object_handle_with_diagnostics(
 #[derive(Debug)]
 pub(crate) struct ParsedFileObjectHandle {
     pub(crate) value: ObjectHandle,
-    pub(crate) parsed_offset: i64,
     pub(crate) next_offset: usize,
     pub(crate) empty_offset: Option<usize>,
     pub(crate) diagnostics: Vec<ParserDiagnostic>,
@@ -1945,10 +1944,8 @@ pub(crate) fn parse_qpdf_file_object_handle_with_diagnostics(
         top_level_offset,
     };
     let parsed = parse_live_file_object(&mut input_source, &mut rebasing_resolver)?;
-    let parsed_offset = parsed.value.get_parsed_offset();
     Ok(ParsedFileObjectHandle {
         value: parsed.value,
-        parsed_offset,
         next_offset: input_source.position(),
         empty_offset: parsed
             .empty

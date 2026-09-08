@@ -2268,9 +2268,9 @@ impl<R: Read + Seek> ResolverHandle<R> {
         let mut tokenizer = Tokenizer::new(&decoded_stream_data);
         let mut members = BTreeMap::new();
         for _ in 0..object_count {
-            let object_number = u32::try_from(tokenizer.next_integer()?)
+            let object_number = u32::try_from(tokenizer.next_object_stream_integer()?)
                 .map_err(|_| Error::parse(0, "object stream object number is invalid"))?;
-            let object_offset = usize::try_from(tokenizer.next_integer()?)
+            let object_offset = usize::try_from(tokenizer.next_object_stream_integer()?)
                 .map_err(|_| Error::parse(0, "object stream object offset is invalid"))?;
             // qpdf stores the header in std::map<int, int>, so an object
             // number repeated in the header keeps the last offset and the

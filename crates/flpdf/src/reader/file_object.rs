@@ -244,7 +244,8 @@ pub(crate) fn finish_file_object_handle(
             object,
             next_offset,
         } => {
-            check_endobj(input, next_offset, &mut diagnostics)?;
+            let end_before_space = check_endobj(input, next_offset, &mut diagnostics)?;
+            set_end_offsets(&object, input, end_before_space);
             Ok(HandleFileObjectRead {
                 object_ref,
                 object,
@@ -284,7 +285,9 @@ fn finish_handle_stream(
         policy,
         diagnostics,
     )?;
-    check_endobj(input, completed.after_endstream, &mut completed.diagnostics)?;
+    let end_before_space =
+        check_endobj(input, completed.after_endstream, &mut completed.diagnostics)?;
+    set_end_offsets(&completed.object, input, end_before_space);
     Ok(HandleFileObjectRead {
         object_ref,
         object: completed.object,
@@ -417,15 +420,32 @@ fn check_endobj(
     input: &[u8],
     after_body: usize,
     diagnostics: &mut Vec<FileObjectDiagnostic>,
-) -> Result<()> {
+) -> Result<Option<usize>> {
     let expected = skip_pdf_ignorable(input, after_body)?;
-    if keyword_token_end(input, expected, b"endobj").is_none() {
+    let end_before_space = keyword_token_end(input, expected, b"endobj");
+    if end_before_space.is_none() {
         diagnostics.push(FileObjectDiagnostic {
             kind: FileObjectDiagnosticKind::ExpectedEndobj,
             relative_offset: expected,
         });
     }
-    Ok(())
+    Ok(end_before_space)
+}
+
+/// Record the source extent that qpdf's `readObjectAtOffset` stores alongside
+/// a cache value (`libqpdf/QPDF.cc:1651-1663`). The file-object parser works
+/// on an object-relative slice, so `read_file_object` rebases these positions
+/// to the source offset before the handle leaves this module.
+fn set_end_offsets(object: &ObjectHandle, input: &[u8], end_before_space: Option<usize>) {
+    let Some(end_before_space) = end_before_space else {
+        object.set_end_offsets(-1, -1);
+        return;
+    };
+    let end_after_space = skip_pdf_ws(input, end_before_space);
+    object.set_end_offsets(
+        i64::try_from(end_before_space).unwrap_or(i64::MAX),
+        i64::try_from(end_after_space).unwrap_or(i64::MAX),
+    );
 }
 
 fn recover_stream_boundary(
