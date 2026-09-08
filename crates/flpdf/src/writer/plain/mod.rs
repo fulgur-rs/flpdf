@@ -183,11 +183,38 @@ fn write_plain_live_disable<R: Read + Seek, W: Write>(
         crate::writer::effective_stream_policy(options),
         Some(CompressStreams::Yes)
     );
+    // `canonical_trailer_entries` deliberately omits `/Root`, and the
+    // cross-reference stream serializer reads it only from `root` or
+    // `direct_root`. The live route can now select `XrefForm::Stream`, so a
+    // direct Catalog has to be serialized here too or the output loses its
+    // `/Root` entirely. The classic-table form gets it from the trailer handle
+    // above, which is why this stayed `None` while the route was table-only.
+    let direct_root_bytes = direct_root_output
+        .as_ref()
+        .map(|arbitrated| {
+            let map_ref = |object_ref: ObjectRef| {
+                map.get(&object_ref).copied().ok_or_else(|| {
+                    // cov:ignore-start: the direct Catalog is collected by the
+                    // same walk that fills this map, so a live reference cannot
+                    // be absent at emission.
+                    crate::Error::Unsupported(format!(
+                        "plain live writer: direct /Root reference {} {} R absent from renumber map",
+                        object_ref.number, object_ref.generation
+                    ))
+                    // cov:ignore-end
+                })
+            };
+            let mut bytes = Vec::new();
+            arbitrated
+                .write_object_with_ref_map_and_removed(&mut bytes, &map_ref, &removed_refs)
+                .map(|()| bytes)
+        })
+        .transpose()?;
     let trailer = TrailerPlan {
         form,
         canonical_entries: plan::canonical_trailer_entries(pdf, &map, &removed_refs)?,
         root,
-        direct_root: None,
+        direct_root: direct_root_bytes,
         id,
         encrypt: trailer_handle.try_get_key(b"/Encrypt")?.object_ref(),
         structural_filtered,
@@ -203,9 +230,17 @@ fn write_plain_live_disable<R: Read + Seek, W: Write>(
         &removed_refs,
     )?; // cov:ignore: LLVM attributes xref append's call terminator to callback cleanup.
     out.write_all(&bytes)?;
+    // qpdf's `getRenumberedObjGen` returns `obj_renumber[og]` unfiltered
+    // (`QPDFWriter.cc:2215-2219`), and `assignCompressedObjectNumbers`
+    // (`:1057-1069`) writes an entry for every member of a container, so a
+    // type-2 member has a renumbered identity just like an uncompressed
+    // object. Keep both, matching the planned route below.
     let old_to_new = map
         .into_iter()
-        .filter(|(_, output)| body.layout.uncompressed.contains_key(&output.number))
+        .filter(|(_, output)| {
+            body.layout.uncompressed.contains_key(&output.number)
+                || body.layout.compressed.contains_key(&output.number)
+        })
         .collect();
     Ok(WriterResult::new(old_to_new, written_xref))
 }
