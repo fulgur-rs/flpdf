@@ -449,6 +449,7 @@ pub(crate) struct ResolverCore<R: Read + Seek + 'static> {
     /// exactly what was recorded during the window so it can be spliced into
     /// the buffered diagnostics at the correct point in call order instead,
     /// restoring qpdf's single-channel, in-call-order delivery.
+    // qpdf-deviation: no qpdf counterpart; qpdf has one m->warnings deque delivered in call order, so this deferral window exists only to reconcile flpdf's two diagnostic channels and should disappear once they are unified
     defer_live_repair_diagnostics: bool,
     /// qpdf `m->logger`, shared with callers and replaceable on the live
     /// document.
