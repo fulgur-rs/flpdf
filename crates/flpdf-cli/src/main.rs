@@ -4161,6 +4161,7 @@ fn run_json_document<R: Read + Seek>(
             test_json_schema,
             json_output_mode,
             show_encryption_key,
+            cli.verbose,
             options,
             JsonJobOutput::File {
                 filename: path,
@@ -4181,6 +4182,7 @@ fn run_json_document<R: Read + Seek>(
             test_json_schema,
             json_output_mode,
             show_encryption_key,
+            cli.verbose,
             options,
             JsonJobOutput::Stdout(
                 runtime
@@ -4202,7 +4204,7 @@ fn run_json_document<R: Read + Seek>(
             return Err(Box::new(CliExitError {
                 code: ExitCode::Warnings,
                 message: String::new(),
-            }))
+            }));
         }
         Err(JsonJobError::Output(error)) => return Err(Box::new(Error::from(error))),
         Err(JsonJobError::Usage(error)) => return Err(Box::new(error)),

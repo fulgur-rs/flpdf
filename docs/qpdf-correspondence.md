@@ -1324,6 +1324,16 @@ qpdf は成功した removal を `doIfVerbose` で報告し、`writeOutfile` の
 （`QPDFJob.cc:2230-2241,3030-3062`）。flpdf は remove route に `verbose` を渡し、key の
 raw bytes を保持した info/error message と同じ completion order を使う。
 
+`flpdf-7l5e` では、名前付き JSON output も同じ completion boundary を使う。
+`QPDFJob::writeOutfile` は `writeJSON` が file pipeline を閉じた直後、かつ
+`writeQPDF` の warning summary より前に、明示 output path がある場合の
+`doIfVerbose` `wrote file` info を出す（`QPDFJob.cc:3042-3062` の後に `:493-503`）。
+flpdf は `QPDFJob::write_json_with_version` の中で、serialize 後・`complete` の
+手前に同じ message を出す。出力名は `m->outfilename` と同じ raw path bytes で
+書く（`Path::display()` は非 UTF-8 バイトを U+FFFD に置換してしまう）。JSON を
+stdout に流す場合は qpdf 側で `m->outfilename` が null になる
+（`QPDFJob.cc:3036-3040`）のと同じく output path が無いため抑止する。
+
 `flpdf-25kg.5.5` では、top-level `--show-linearization` も `QPDFJob::open` が
 設定した同じ `Pdf` を `QPDFJob::show_linearization` に渡す。これは qpdf の
 `setQPDFOptions` による logger/suppression 設定（`QPDFJob.cc:650-665`）、同じ
