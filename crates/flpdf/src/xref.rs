@@ -3339,9 +3339,21 @@ fn recover_trailer_from_xref_stream_candidate(
         canonical_trailer_owner,
     );
     if let (Some(owner), Some(start)) = (canonical_trailer_owner, deferred_start) {
+        // cov:ignore-start: ResolverHandle::resolve_xref_stream_at_offset
+        // (the only production `read_xref_stream_at_offset` implementation)
+        // hard-codes `try_recovery: false` for this offset read, so it
+        // cannot itself raise a live, recoverable warning through
+        // `push_qpdf_warning` -- a header/framing problem here surfaces as
+        // an `Err` (handled below), not a warning captured in this window.
+        // The reconciliation stays for the same reason the discovery-side
+        // guard exists (structural symmetry with qpdf's single warnings
+        // deque, verified by `candidate_discovery_defers_and_restores_owner_live_diagnostics`
+        // and the discovery-side integration test), and to stay correct if
+        // that recovery restriction is ever lifted.
         for diagnostic in owner.end_deferred_diagnostics(start).entries() {
             repair_diagnostics.push(diagnostic.clone());
         }
+        // cov:ignore-end
     }
     let mut reentry = match reentry_result {
         Ok(reentry) => reentry,
@@ -7134,6 +7146,39 @@ mod final_handle_tests {
             assert_eq!(owner.repair_diagnostics().entries().len(), 1);
             assert_eq!(sink.entries().len(), 0);
         }
+    }
+
+    #[test]
+    fn candidate_discovery_defers_and_restores_owner_live_diagnostics() {
+        let owner = FailingCanonicalOwner {
+            transport_error: false,
+            diagnostics: RefCell::new(Diagnostics::default()),
+        };
+        let mut entries = BTreeMap::new();
+        entries.insert(ObjectRef::new(1, 0), XrefEntry::Uncompressed { offset: 0 });
+        let start = owner.begin_deferred_diagnostics();
+        assert_eq!(start, 0);
+        owner.diagnostics.borrow_mut().push(damaged_warning(
+            b"synthetic.pdf",
+            b"",
+            "synthetic live warning",
+            Some(0),
+        ));
+        let captured = owner.end_deferred_diagnostics(start);
+        assert_eq!(captured.entries().len(), 1);
+        assert!(owner.repair_diagnostics().is_empty());
+
+        // `find_xref_stream_trailer_candidate_canonical` wraps its own scan
+        // in exactly this begin/end pair regardless of what it finds, so a
+        // mock owner with an uninitialized handle for every entry (never a
+        // real `/Type /XRef` candidate) still exercises the round trip.
+        let (candidate, diagnostics) = find_xref_stream_trailer_candidate_canonical(
+            &entries,
+            XrefLoadOptions::default(),
+            &owner,
+        );
+        assert!(candidate.is_none());
+        assert!(diagnostics.is_empty());
     }
 
     #[test]
