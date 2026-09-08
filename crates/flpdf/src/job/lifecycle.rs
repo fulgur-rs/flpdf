@@ -3580,6 +3580,10 @@ impl QPDFJob {
         if specs.is_empty() {
             return Ok(());
         }
+        // cov:ignore-start: defensive catalog guards. A document that opens
+        // successfully always has a dictionary `/Root` (a missing or
+        // non-dictionary catalog fails earlier, during open), and the empty-spec
+        // early return above no longer routes the no-op case through them.
         let Some(root_ref) = pdf.root_ref() else {
             return Ok(());
         };
@@ -3588,6 +3592,7 @@ impl QPDFJob {
         if root.try_as_dictionary()?.is_none() {
             return Ok(());
         }
+        // cov:ignore-end
         let page_count = crate::page_document_helper::PageDocumentHelper::new(pdf)
             .get_all_pages()?
             .len();
