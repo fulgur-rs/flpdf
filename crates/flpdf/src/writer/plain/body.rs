@@ -632,9 +632,14 @@ impl<'a, R: Read + Seek + 'static> LiveObjectEmitter<'a, R> {
             } else {
                 handle.write_object_with_dynamic_ref_map(out, &mut map, removed_refs)
             };
+            // cov:ignore-start: llvm-cov attributes the uncovered region to
+            // this block's closing brace, the merge point for an exercised
+            // member write failing (the sibling planned-writer copy of this
+            // pattern, `emit_planned_object_stream`, has the same artifact).
             if result.is_ok() {
                 crate::writer::report_progress_event(self.options)?;
             }
+            // cov:ignore-end
             result
         };
         let body =
@@ -2508,6 +2513,93 @@ mod object_emitter_tests {
             &[],
         )?; // cov:ignore: LLVM attributes the live-body test call terminator to callback cleanup.
         assert!(!body.bytes.is_empty());
+        Ok(())
+    }
+
+    #[test]
+    fn register_object_streams_skips_a_group_whose_members_are_all_removed() {
+        let source = ObjectRef::new(3, 0);
+        let member = ObjectRef::new(2, 0);
+        let mut queue = LiveQueue::new([member].into_iter().collect());
+        queue.register_object_streams(&[object_streams::ObjectStreamGroup::SourceBacked {
+            source,
+            members: vec![member],
+        }]);
+        assert!(queue.member_to_container.is_empty());
+        assert!(queue.container_to_members.is_empty());
+    }
+
+    #[test]
+    fn live_object_stream_with_a_non_stream_source_omits_extends() -> crate::Result<()> {
+        let mut pdf = super::object_emitter_tests::pdf();
+        let source = pdf.make_indirect_from_object_handle(ObjectHandle::null())?;
+        let source_id = source.object_ref().unwrap();
+        let member = pdf.make_indirect_from_object_handle(ObjectHandle::integer(42))?;
+        let member_id = member.object_ref().unwrap();
+        pdf.root_handle()?.replace_key(b"/Member", member)?;
+        let root_source = pdf.root_ref();
+        let object_streams = [object_streams::ObjectStreamGroup::SourceBacked {
+            source: source_id,
+            members: vec![member_id],
+        }];
+        let body = emit_live_disable(
+            &mut pdf,
+            &WriterOptions::default(),
+            "1.5",
+            0,
+            root_source,
+            BTreeSet::new(),
+            &object_streams,
+        )?;
+        assert!(body
+            .bytes
+            .windows(b"/Type /ObjStm".len())
+            .any(|window| window == b"/Type /ObjStm"));
+        assert!(!body
+            .bytes
+            .windows(b"/Extends".len())
+            .any(|window| window == b"/Extends"));
+        Ok(())
+    }
+
+    #[test]
+    fn live_object_stream_extends_an_unreferenced_predecessor_through_live_enqueue(
+    ) -> crate::Result<()> {
+        let mut pdf = super::object_emitter_tests::pdf();
+        let predecessor = pdf.new_stream_with_data(Rc::new(Vec::new()))?;
+        let predecessor_id = predecessor.object_ref().unwrap();
+        let source = pdf.new_stream_with_data(Rc::new(Vec::new()))?;
+        let source_id = source.object_ref().unwrap();
+        source
+            .as_stream_dict()
+            .unwrap()
+            .replace_key(b"/Extends", predecessor)?;
+        let member = pdf.make_indirect_from_object_handle(ObjectHandle::integer(7))?;
+        let member_id = member.object_ref().unwrap();
+        pdf.root_handle()?.replace_key(b"/Member", member)?;
+        let root_source = pdf.root_ref();
+        let object_streams = [object_streams::ObjectStreamGroup::SourceBacked {
+            source: source_id,
+            members: vec![member_id],
+        }];
+        let body = emit_live_disable(
+            &mut pdf,
+            &WriterOptions::default(),
+            "1.5",
+            0,
+            root_source,
+            BTreeSet::new(),
+            &object_streams,
+        )?;
+        let predecessor_output = body
+            .old_to_new
+            .get(&predecessor_id)
+            .expect("an unreferenced /Extends predecessor is still discovered and numbered");
+        let expected = format!("/Extends {} 0 R", predecessor_output.number);
+        assert!(body
+            .bytes
+            .windows(expected.len())
+            .any(|window| window == expected.as_bytes()));
         Ok(())
     }
 }
