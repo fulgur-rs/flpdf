@@ -1095,6 +1095,13 @@ show/remove は qpdf の `std::string` key（`QPDFJob_config.cc:507-547`）を
 
 `splitPages` の値は qpdf の `int` と同じく signed のまま job configuration に保持する。したがって負の非ゼロ値は `checkConfiguration` の truthy split branch を通過し、`doSplitPages` の `QIntC::to_size(m->split_pages)` (`QPDFJob.cc:2970`, `QIntC.hh:112-216`) で初めて `integer out of range converting ...` を返す。flpdf も同じ page-split boundary まで値を保持し、parser の独自 early usage error に変換しない（`QPDFJob_config.cc:597-609`, `QPDFJob.cc:567-631`; `flpdf-sp4g`）。 |
 
+`flpdf-thb2` では、qpdf が `checkConfiguration` の途中で JSON の暗黙出力先を
+`-` に確定してからsplit/stdout conflictを検査する順序
+（`libqpdf/QPDFJob.cc:572-591`）に合わせ、flpdfの
+`QPDFJob::check_configuration` でも `json_version` と出力ファイル未指定を
+実効stdoutとして扱うようにした。これにより `json=2` と非zero
+`splitPages` の組合せをwrite stageまで進めず、qpdfと同じusage errorにする。
+
 `coalesceContents` も生成 handler (`auto_job_json_init.hh:311-313`)、Config (`QPDFJob_config.cc:88-91`)、変換順序 (`QPDFJob.cc:2185-2188`) に対応し、既存の provider-backed `ObjectHandle::coalesce_content_streams` を `job/lifecycle.rs` から呼ぶ。
 
 `flattenRotation` も生成 handler (`auto_job_json_init.hh:377-382`)、Config (`QPDFJob_config.cc:204-207`)、変換順序 (`QPDFJob.cc:2190-2194`) に対応し、既存の `flatten_rotation_on_pages` (`QPDFPageObjectHelper.cc:862-991`) を `job/lifecycle.rs` から呼ぶ。`coalesceContents` の直後に配置して、qpdfのページ変換順序を保つ。

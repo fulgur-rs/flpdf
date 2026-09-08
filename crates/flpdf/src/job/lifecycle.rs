@@ -3579,6 +3579,12 @@ impl QPDFJob {
     /// opened, and `QUtil::same_file` rejects destructive aliases before the
     /// writer can truncate them.
     pub fn check_configuration(&self) -> Result<()> {
+        // qpdf assigns the implicit JSON destination before checking
+        // split-pages/output conflicts (QPDFJob.cc:578-591). Keep that
+        // effective destination visible here even though the Rust
+        // configuration remains an immutable snapshot.
+        let implicit_json_stdout =
+            self.configuration.json_version.is_some() && self.configuration.output_file.is_none();
         if self.configuration.input_file.is_none()
             && !self.configuration.empty_input
             && (self.configuration.require_output
@@ -3654,7 +3660,8 @@ impl QPDFJob {
             )
             .into());
         }
-        if self.configuration.output_file.as_deref() == Some(Path::new("-")) {
+        if self.configuration.output_file.as_deref() == Some(Path::new("-")) || implicit_json_stdout
+        {
             if self.configuration.split_pages.is_some_and(|size| size != 0) {
                 return Err(UsageError::new(
                     "--split-pages may not be used when writing to standard output",
@@ -4909,6 +4916,23 @@ mod tests {
         assert_eq!(
             error.to_string(),
             ".splitPages: invalid page count 2147483648"
+        );
+    }
+
+    #[test]
+    fn job_json_implicit_stdout_rejects_split_pages_before_writing() {
+        let mut job = QPDFJob::new();
+        job.initialize_from_json_partial(
+            r#"{"inputFile":"input.pdf","json":"2","splitPages":"1"}"#,
+        )
+        .unwrap();
+
+        let error = job
+            .check_configuration()
+            .expect_err("implicit JSON stdout must be visible to split validation");
+        assert_eq!(
+            error.to_string(),
+            "--split-pages may not be used when writing to standard output"
         );
     }
 

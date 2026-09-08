@@ -395,6 +395,13 @@ D1 `writer.write()` の両方を呼ぶ）は、逸脱の重い側である `brid
 
 本監査で issue 化したギャップ 6 件（2026-09-07 の再検証で、うち 5 件は当初「API 不在」としていた前提が誤りで、実際には driver 側の未移行だと判明。各行を修正済み）: `flpdf-83jc`（case 16, updateAllPagesCache）、`flpdf-wd2e`（case 34, getExtensionLevel/getVersionAsPDFVersion）、`flpdf-jzj1`（case 86, utf8_to_ascii/utf8_to_pdf_doc）、`flpdf-6f6h`（case 92, getOwningQPDF）、`flpdf-cm84`（case 97, getArrayItem 単一 index）、`flpdf-wkju`（case 98, write_json/get_json/write_stream_json が pub(crate) 限定で全体が未実行 stub）。case 51（`FIELD_MUST_BE_INDIRECT`、現行 fixture 非顕在化）と case 78（trailer mutation 後の `mark_object_handle_dirty` 欠落、cov:ignore 済み）は新規 issue 化せず本表に注記のみ残した — いずれも fixture 上は無害で、実装cutoverの緊急性は無いと判断した。
 
+2026-09-08（`flpdf-thb2`）: qpdfの `checkConfiguration` が JSON の暗黙stdout
+出力先を先に `-` として確定する順序（`libqpdf/QPDFJob.cc:572-591`）を、
+`QPDFJob::check_configuration` のsplit/stdout validationへ反映した。
+`json=2`、`splitPages=1`、`outputFile`省略の組合せをqpdfと同じusage errorで
+止めるRED/GREENテストを追加し、write stageへの誤到達を防ぐ。E-18の
+canonical checkConfiguration責務だけを補正し、qtest exceptionsは対象外。
+
 ### 分類別件数
 
 | 分類 | 件数 | 行 |
