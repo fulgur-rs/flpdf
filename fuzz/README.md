@@ -17,20 +17,25 @@ it.
   libFuzzer lends its input only for the duration of the closure, and `Pdf<R>`
   requires `R: 'static`, so the target copies the input into one `Arc<[u8]>`
   and shares it across both opens — one copy per iteration, not two.
-- **`xref`** — xref/trailer safety harness that sends each input through both
-  `load_xref_and_trailer` (strict) and
-  `load_xref_and_trailer_with_repair(..., true)` (qpdf-style recovery), using a
-  fresh cursor for each call. Parse errors are expected; a panic, abort,
-  sanitizer failure, or timeout is the defect under test.
+- **`xref`** — xref/trailer safety harness that sends each input through the
+  canonical reader twice: `Pdf::open_mem_with_options` with `repair: false`
+  (strict) and with `repair: true` (qpdf-style recovery). Both passes set
+  `suppress_warnings: true` so recovery diagnostics stay off the default
+  logger's stderr. The input is shared as one `Arc<[u8]>` because `Pdf::open`
+  requires `R: 'static`. Parse errors are expected; a panic, abort, sanitizer
+  failure, or timeout is the defect under test.
 
 The `xref` target follows qpdf 11.9.0's fuzzing boundary rather than
 reimplementing qpdf output checks: qpdf lists its whole-document and focused
 fuzzers in `fuzz/CMakeLists.txt:4-14`, and defines the arbitrary-input safety
-contract in `fuzz/qpdf_fuzzer.cc:184-209`. The flpdf entry points and their
-strict/repair responsibility are documented in
-`crates/flpdf/src/xref.rs:657-708`. There is therefore no byte-level
-differential assertion in this harness; qpdf's `qpdf_fuzzer` is the safety
-oracle, while qpdf `--check` and the flpdf loaders are probed independently.
+contract in `fuzz/qpdf_fuzzer.cc:184-209`. The strict/repair split is the
+canonical reader's `PdfOpenOptions::repair` flag; the standalone
+`load_xref_and_trailer*` loaders this target used to call were removed with the
+second document owner they constructed, matching qpdf, where one `QPDF` owns
+the xref table and object cache (`include/qpdf/QPDF.hh:1465,1467`). There is
+therefore no byte-level differential assertion in this harness; qpdf's
+`qpdf_fuzzer` is the safety oracle, while qpdf `--check` and the flpdf reader
+are probed independently.
 The repair boundary follows qpdf's `QPDF::reconstruct_xref` recovery and
 terminal missing-trailer path (`libqpdf/QPDF.cc:516-623`).
 For xref streams, qpdf 11.9.0 rejects each `/W` value greater than

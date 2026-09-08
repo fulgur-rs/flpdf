@@ -30,12 +30,28 @@ fuzz_target!(|data: &[u8]| {
     // bytes -- the same shape `fuzz/fuzz_targets/roundtrip.rs` uses.
     let shared: Arc<[u8]> = Arc::from(data);
 
-    let _ = flpdf::Pdf::open_mem(Arc::clone(&shared));
+    // `PdfOpenOptions::default()` sets `repair: true`, so the strict pass has
+    // to disable it explicitly; otherwise both passes would take the
+    // recovery-enabled route and inputs that only fail with recovery
+    // suppressed would stop being fuzzed.
+    let _ = flpdf::Pdf::open_mem_with_options(
+        Arc::clone(&shared),
+        PdfOpenOptions {
+            repair: false,
+            suppress_warnings: true,
+            ..PdfOpenOptions::default()
+        },
+    );
 
+    // `suppress_warnings` keeps the recovery warnings off the default logger's
+    // stderr: most arbitrary inputs raise missing-header/missing-xref/
+    // reconstruction warnings, and the removed standalone loader only
+    // accumulated diagnostics rather than writing them out.
     let _ = flpdf::Pdf::open_mem_with_options(
         Arc::clone(&shared),
         PdfOpenOptions {
             repair: true,
+            suppress_warnings: true,
             ..PdfOpenOptions::default()
         },
     );
