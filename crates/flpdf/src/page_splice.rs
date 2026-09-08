@@ -255,9 +255,7 @@ fn collect_page_refs<R: Read + Seek>(
         pdf.mark_object_handle_dirty(&node)?;
     }
     if !visited.insert(node.identity_key()) {
-        return Err(Error::Unsupported(format!(
-            "Loop detected in /Pages structure at {node_label}"
-        )));
+        return Err(crate::pages::repair::page_tree_cycle_error(pdf));
     }
 
     let kids_value = node.try_get_key(b"/Kids")?;
@@ -1196,11 +1194,14 @@ mod tests {
     fn shared_intermediate_page_tree_is_rejected_as_a_loop() {
         let mut pdf = open(build_pages_with_shared_intermediate_pdf());
         let err = splice_pages(&mut pdf, 0..0, &[ObjectRef::new(5, 0)]).unwrap_err();
-        assert!(
-            matches!(err, Error::Unsupported(ref message) if message.contains("Loop detected")
-                && message.contains("3 0 R")),
-            "got {err:?}"
+        let is_qpdf_pages_exception = matches!(
+            &err,
+            Error::QpdfExc(exception)
+                if exception.get_error_code() == crate::QpdfErrorCode::Pages
+                    && exception.get_message_detail()
+                        == b"Loop detected in /Pages structure (getAllPages)"
         );
+        assert!(is_qpdf_pages_exception, "got {err:?}");
     }
 
     #[test]
