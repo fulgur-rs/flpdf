@@ -376,6 +376,59 @@ fn json_flag_outputs_json_to_stdout() {
         .stderr(predicate::str::is_empty());
 }
 
+#[test]
+fn json_output_file_verbose_reports_wrote_file_like_qpdf() {
+    if skip_unless_qpdf_11_9() {
+        return;
+    }
+    let input = write_temp_pdf(&one_page_pdf_with_stream());
+    let temp = tempfile::tempdir().unwrap();
+    let qpdf_output = temp.path().join("qpdf.json");
+    let flpdf_output = temp.path().join("flpdf.json");
+
+    let qpdf = ShellCommand::new("qpdf")
+        .args(["--verbose", "--json=2"])
+        .arg(input.path())
+        .arg(&qpdf_output)
+        .output()
+        .unwrap();
+    let flpdf = Command::cargo_bin("flpdf")
+        .unwrap()
+        .args(["--verbose", "--json=2"])
+        .arg(input.path())
+        .arg(&flpdf_output)
+        .output()
+        .unwrap();
+
+    assert!(qpdf.status.success(), "qpdf failed: {qpdf:?}");
+    assert!(flpdf.status.success(), "flpdf failed: {flpdf:?}");
+    assert!(qpdf.stderr.is_empty());
+    assert!(flpdf.stderr.is_empty());
+    assert_eq!(
+        String::from_utf8_lossy(&qpdf.stdout),
+        format!("qpdf: wrote file {}{}", qpdf_output.display(), EOL)
+    );
+    assert_eq!(
+        String::from_utf8_lossy(&flpdf.stdout),
+        format!("flpdf: wrote file {}{}", flpdf_output.display(), EOL)
+    );
+}
+
+#[test]
+fn json_stdout_verbose_does_not_report_wrote_file() {
+    let input = write_temp_pdf(&one_page_pdf_with_stream());
+    let output = Command::cargo_bin("flpdf")
+        .unwrap()
+        .args(["--verbose", "--json=2"])
+        .arg(input.path())
+        .output()
+        .unwrap();
+
+    assert!(output.status.success(), "flpdf failed: {output:?}");
+    assert!(output.stderr.is_empty());
+    assert!(!String::from_utf8_lossy(&output.stdout).contains("wrote file"));
+}
+
 #[cfg(target_os = "linux")]
 #[test]
 fn json_stdout_to_dev_full_matches_qpdf_success() {
