@@ -9119,6 +9119,7 @@ fn reserve_show_attachment_output() -> CliResult<()> {
     Ok(())
 }
 
+#[allow(clippy::too_many_arguments)]
 fn run_show_attachment(
     input: Option<PathBuf>,
     repair: bool,
