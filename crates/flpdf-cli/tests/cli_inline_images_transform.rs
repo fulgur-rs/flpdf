@@ -359,6 +359,21 @@ fn assert_qdf_bytes_match(input: &Path, extra_flags: &[&str], label: &str) {
     let qpdf = run_qpdf_rewrite(&flags, input, &qpdf_output);
     let flpdf = run_flpdf_rewrite(&flags, input, &flpdf_output);
 
+    assert_streams_and_status_match(&qpdf, &flpdf, label);
+    assert_eq!(
+        std::fs::read(&qpdf_output).expect("qpdf output"),
+        std::fs::read(&flpdf_output).expect("flpdf output"),
+        "{label}: --qdf output must be byte-identical to qpdf 11.9.0"
+    );
+}
+
+/// Compare exit status and both captured streams against qpdf 11.9.0.
+///
+/// Writing progress, diagnostics or PDF data to stdout is an observable CLI
+/// regression for any caller that pipes it, and neither the exit status nor
+/// the output file would show it; an unexpected warning on stderr is the same
+/// kind of hole. Only the program-name prefix is normalized away.
+fn assert_streams_and_status_match(qpdf: &Output, flpdf: &Output, label: &str) {
     assert_eq!(
         qpdf.status.code(),
         flpdf.status.code(),
@@ -369,18 +384,10 @@ fn assert_qdf_bytes_match(input: &Path, extra_flags: &[&str], label: &str) {
         String::from_utf8_lossy(&flpdf.stderr).replace("flpdf:", ""),
         "{label}: diagnostics must match qpdf 11.9.0 apart from the program name"
     );
-    // Writing progress, diagnostics or PDF data to stdout is an observable CLI
-    // regression for any caller that pipes it, and neither the exit status nor
-    // the output file would show it.
     assert_eq!(
         String::from_utf8_lossy(&qpdf.stdout).replace("qpdf:", ""),
         String::from_utf8_lossy(&flpdf.stdout).replace("flpdf:", ""),
         "{label}: standard output must match qpdf 11.9.0 apart from the program name"
-    );
-    assert_eq!(
-        std::fs::read(&qpdf_output).expect("qpdf output"),
-        std::fs::read(&flpdf_output).expect("flpdf output"),
-        "{label}: --qdf output must be byte-identical to qpdf 11.9.0"
     );
 }
 
@@ -428,11 +435,7 @@ fn assert_page_selection_qdf_bytes_match(input: &Path) {
         .output()
         .expect("run flpdf page selection");
 
-    assert_eq!(
-        qpdf.status.code(),
-        flpdf.status.code(),
-        "page selection: exit status must match qpdf 11.9.0"
-    );
+    assert_streams_and_status_match(&qpdf, &flpdf, "page selection");
     assert_eq!(
         std::fs::read(&qpdf_output).expect("qpdf output"),
         std::fs::read(&flpdf_output).expect("flpdf output"),
