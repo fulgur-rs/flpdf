@@ -311,7 +311,7 @@ fn direct_root_object_stream_pdf() -> Vec<u8> {
 
     let xref_offset = out.len();
     let mut rows: Vec<[u8; 7]> = Vec::new();
-    let mut row = |kind: u8, field2: u32, field3: u16| {
+    let row = |kind: u8, field2: u32, field3: u16| {
         let mut entry = [0u8; 7];
         entry[0] = kind;
         entry[1..5].copy_from_slice(&field2.to_be_bytes());
