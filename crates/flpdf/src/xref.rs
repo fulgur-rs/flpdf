@@ -2716,6 +2716,14 @@ fn merge_previous_xref_sections_with_observer(
     if loaded.loaded.startxref != 0 {
         visited.insert(loaded.loaded.startxref);
     }
+    // The deferral window only makes sense while the reconstruction path is
+    // buffering the trio and line-scan diagnostics; the active-section reader
+    // has a single channel already.
+    let is_reconstruction = matches!(
+        context_spec,
+        XrefReadContextSpec::Reconstruction { .. }
+            | XrefReadContextSpec::ReconstructionWithCache { .. }
+    );
     let chain_bootstrap_cache = match context_spec {
         XrefReadContextSpec::ActiveSection | XrefReadContextSpec::Reconstruction { .. } => {
             Rc::clone(&loaded.bootstrap_cache)
@@ -2745,7 +2753,15 @@ fn merge_previous_xref_sections_with_observer(
             bootstrap_cache: &chain_bootstrap_cache,
         },
     };
-    let (mut previous_offset, previous_diagnostics, reconstruction_trigger) =
+    // Resolving `/Prev` can dereference an indirect target, and that read
+    // warns live through the owner just like the section parse below. Keep it
+    // inside the same window so a repair warning raised here cannot overtake
+    // the still-buffered reconstruction trio.
+    let mut previous_offset_diagnostics = Diagnostics::default();
+    let previous_offset_result = {
+        let _guard = canonical_trailer_owner
+            .filter(|_| is_reconstruction)
+            .map(|owner| DeferredDiagnosticsGuard::new(owner, &mut previous_offset_diagnostics));
         resolve_previous_xref_offset(
             bytes,
             options.clone(),
@@ -2754,7 +2770,15 @@ fn merge_previous_xref_sections_with_observer(
             &loaded.loaded.trailer,
             loaded.classic_trailer_offset,
             canonical_trailer_owner,
-        )?;
+        )
+    };
+    // cov:ignore-start: no fixture reaches this splice — an indirect `/Prev` target that the line scan can find is already resolved (and warned about) by candidate discovery, so this window captures nothing; the guard exists for structural symmetry with the section-parse splice below
+    for diagnostic in previous_offset_diagnostics.entries() {
+        loaded.loaded.repair_diagnostics.push(diagnostic.clone());
+    }
+    // cov:ignore-end
+    let (mut previous_offset, previous_diagnostics, reconstruction_trigger) =
+        previous_offset_result?;
     for diagnostic in previous_diagnostics.entries() {
         loaded.loaded.repair_diagnostics.push(diagnostic.clone());
     }
@@ -2770,19 +2794,42 @@ fn merge_previous_xref_sections_with_observer(
             return Err(Error::parse(0, "loop detected following xref tables"));
         }
 
-        let previous = parse_xref_from_start_with_owner(
-            bytes,
-            previous_pos,
-            offset,
-            version,
-            options.clone(),
-            registration,
-            error_diagnostics_sink.as_deref_mut(),
-            section_context_spec,
-            first_xref_item_offset_sink.as_deref_mut(),
-            false,
-            canonical_trailer_owner,
-        )?;
+        // A reconstructed candidate's `/Prev` chain can itself resolve an
+        // older xref stream through the live canonical owner (same
+        // `read_xref_stream_at_offset` path as the candidate re-entry
+        // above), which warns immediately unless withheld. Only the two
+        // reconstruction context-spec variants ever have a caller-side
+        // local buffer to reconcile into -- the ordinary active-section
+        // load (`ActiveSection`/`ActiveSectionWithCache`) has no such
+        // buffer and its warnings are meant to print live, so this window
+        // is scoped to the reconstruction case only.
+        let mut deferred_diagnostics = Diagnostics::default();
+        let previous_result = {
+            let _guard = canonical_trailer_owner
+                .filter(|_| is_reconstruction)
+                .map(|owner| DeferredDiagnosticsGuard::new(owner, &mut deferred_diagnostics));
+            parse_xref_from_start_with_owner(
+                bytes,
+                previous_pos,
+                offset,
+                version,
+                options.clone(),
+                registration,
+                error_diagnostics_sink.as_deref_mut(),
+                section_context_spec,
+                first_xref_item_offset_sink.as_deref_mut(),
+                false,
+                canonical_trailer_owner,
+            )
+        };
+        // Append the reconciled read warning before whatever this call
+        // itself computed, mirroring the candidate re-entry's own ordering
+        // fix -- and do this before propagating an error, so a live warning
+        // that preceded a later build failure on this hop is not dropped.
+        for diagnostic in deferred_diagnostics.entries() {
+            loaded.loaded.repair_diagnostics.push(diagnostic.clone());
+        }
+        let previous = previous_result?;
         for diagnostic in previous.loaded.repair_diagnostics.entries() {
             loaded.loaded.repair_diagnostics.push(diagnostic.clone());
         }
@@ -2804,7 +2851,13 @@ fn merge_previous_xref_sections_with_observer(
                     .or_insert(object);
             }
         }
-        let (next_previous_offset, previous_diagnostics, reconstruction_trigger) =
+        // Same window as the initial resolution above: this hop's `/Prev`
+        // can also dereference an indirect target that warns live.
+        let mut hop_offset_diagnostics = Diagnostics::default();
+        let hop_offset_result = {
+            let _guard = canonical_trailer_owner
+                .filter(|_| is_reconstruction)
+                .map(|owner| DeferredDiagnosticsGuard::new(owner, &mut hop_offset_diagnostics));
             resolve_previous_xref_offset(
                 bytes,
                 options.clone(),
@@ -2813,7 +2866,15 @@ fn merge_previous_xref_sections_with_observer(
                 &previous.loaded.trailer,
                 previous.classic_trailer_offset,
                 canonical_trailer_owner,
-            )?;
+            )
+        };
+        // cov:ignore-start: no fixture reaches this splice — an indirect `/Prev` target that the line scan can find is already resolved (and warned about) by candidate discovery, so this window captures nothing; the guard exists for structural symmetry with the section-parse splice below
+        for diagnostic in hop_offset_diagnostics.entries() {
+            loaded.loaded.repair_diagnostics.push(diagnostic.clone());
+        }
+        // cov:ignore-end
+        let (next_previous_offset, previous_diagnostics, reconstruction_trigger) =
+            hop_offset_result?;
         for diagnostic in previous_diagnostics.entries() {
             loaded.loaded.repair_diagnostics.push(diagnostic.clone());
         }
@@ -3316,9 +3377,14 @@ fn recover_trailer_from_xref_stream_candidate(
     // independent of whatever exception `processXRefStream` throws next;
     // empirically confirmed against qpdf 11.9.0 with a malformed-`/W`
     // candidate: its "recovered stream length" warning still precedes the
-    // terminal "error decoding candidate xref stream..." message).
-    // `error_diagnostics_sink` recovers that same warning here: written only
-    // when `parse_xref_stream` itself fails after already computing it.
+    // terminal "error decoding candidate xref stream..." message). The
+    // `DeferredDiagnosticsGuard` reconciliation below recovers that same
+    // read warning; `reentry_error_diagnostics` is a *separate* sink for
+    // `parse_xref_stream_with_canonical_owner`'s own build diagnostic (e.g.
+    // "wrong size" for a malformed `/W`), written only when the build fails
+    // after the read already succeeded. Appending the reconciled read
+    // warning before that sink's contents (rather than sharing one sink)
+    // keeps both in this real order.
     //
     // The candidate's own re-entry gets a fresh `XrefRegistration`, scoped to
     // just this call and its `/Prev` chain -- qpdf's `insertXrefEntry`/
@@ -3342,6 +3408,13 @@ fn recover_trailer_from_xref_stream_candidate(
     // No guard is needed here: the call below cannot exit early through
     // `?`, so an explicit begin/end pair is sufficient.
     let deferred_start = canonical_trailer_owner.map(|owner| owner.begin_deferred_diagnostics());
+    // A build failure inside `parse_xref_stream_with_canonical_owner` (e.g.
+    // a malformed `/W`) writes its own diagnostic straight into whatever
+    // sink is passed here, before returning -- which would land ahead of
+    // the read warning reconciled below if this sink were `repair_diagnostics`
+    // itself. Route it to a scratch buffer instead and append it after the
+    // reconciled read warning, in real call order.
+    let mut reentry_error_diagnostics = Diagnostics::default();
     let reentry_result = parse_xref_from_start_with_owner(
         bytes,
         max_offset as usize,
@@ -3349,7 +3422,7 @@ fn recover_trailer_from_xref_stream_candidate(
         version,
         options.clone(),
         &mut reentry_registration,
-        Some(&mut *repair_diagnostics),
+        Some(&mut reentry_error_diagnostics),
         XrefReadContextSpec::ReconstructionWithCache {
             line_scan_entries: entries,
             reference_offsets: &reference_offsets,
@@ -3375,6 +3448,13 @@ fn recover_trailer_from_xref_stream_candidate(
             repair_diagnostics.push(diagnostic.clone());
         }
         // cov:ignore-end
+    }
+    // Append second: this is only non-empty when the build step itself
+    // fails after the (already-reconciled) read succeeded, and that build
+    // failure happens strictly after the read in qpdf's own call order
+    // (`QPDF.cc:956` before `:960-1128`).
+    for diagnostic in reentry_error_diagnostics.entries() {
+        repair_diagnostics.push(diagnostic.clone());
     }
     let mut reentry = match reentry_result {
         Ok(reentry) => reentry,
