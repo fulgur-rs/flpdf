@@ -1751,6 +1751,103 @@ fn warning_sink_errors_are_returned_to_the_caller() {
 }
 
 #[test]
+fn a_check_failure_is_not_reported_twice_at_the_write_boundary() {
+    // qpdf's `doCheck` throws `std::runtime_error("errors detected")`
+    // (`libqpdf/QPDFJob.cc:793`) and its CLI catch prints
+    // `qpdf: errors detected` exactly once (`qpdf/qpdf.cc:39-41`). flpdf's
+    // check consumer writes that line itself, so the write boundary must not
+    // repeat it.
+    let tempdir = tempfile::tempdir().unwrap();
+    let path = tempdir.path().join("bad-stream.pdf");
+    // A page whose content stream declares /FlateDecode but holds raw bytes:
+    // qpdf reports `ERROR: page 1: content stream ...` and then the single
+    // `errors detected` line.
+    let mut bytes = b"%PDF-1.4\n".to_vec();
+    let mut offsets = Vec::new();
+    for object in [
+        b"1 0 obj\n<< /Type /Catalog /Pages 2 0 R >>\nendobj\n".to_vec(),
+        b"2 0 obj\n<< /Type /Pages /Kids [3 0 R] /Count 1 >>\nendobj\n".to_vec(),
+        b"3 0 obj\n<< /Type /Page /Parent 2 0 R /MediaBox [0 0 612 792] /Contents 4 0 R >>\nendobj\n"
+            .to_vec(),
+        b"4 0 obj\n<< /Length 16 /Filter /FlateDecode >>\nstream\nNOT-DEFLATE-DATA\nendstream\nendobj\n"
+            .to_vec(),
+    ] {
+        offsets.push(bytes.len());
+        bytes.extend_from_slice(&object);
+    }
+    let xref = bytes.len();
+    bytes.extend_from_slice(format!("xref\n0 {}\n", offsets.len() + 1).as_bytes());
+    bytes.extend_from_slice(b"0000000000 65535 f \n");
+    for offset in &offsets {
+        bytes.extend_from_slice(format!("{offset:010} 00000 n \n").as_bytes());
+    }
+    bytes.extend_from_slice(
+        format!(
+            "trailer\n<< /Size {} /Root 1 0 R >>\nstartxref\n{xref}\n%%EOF\n",
+            offsets.len() + 1
+        )
+        .as_bytes(),
+    );
+    std::fs::write(&path, &bytes).unwrap();
+
+    let (logger, errors) = logger_with_error_sink();
+    logger.set_info(Some(logger.discard()));
+    logger.set_warn(Some(logger.discard()));
+
+    let mut job = QPDFJob::new();
+    job.set_logger(logger);
+    job.initialize_from_json_partial(
+        &serde_json::json!({"inputFile": path, "check": ""}).to_string(),
+    )
+    .unwrap();
+
+    assert_eq!(job.run().unwrap(), JobExitCode::Error);
+    let reported = String::from_utf8_lossy(&errors.lock().unwrap().bytes).to_string();
+    assert_eq!(
+        reported.matches("errors detected").count(),
+        1,
+        "the check consumer already wrote qpdf's single line: {reported}"
+    );
+    assert!(
+        !reported.contains("unsupported PDF feature"),
+        "qpdf never prefixes this diagnostic: {reported}"
+    );
+}
+
+#[test]
+fn an_unreported_inspection_failure_is_reported_once_at_the_write_boundary() {
+    // The counterpart of the check case: a failure that no inspection step has
+    // already announced must still get qpdf's single `qpdf: <what()>` line,
+    // which qpdf's CLI prints from its catch (`qpdf/qpdf.cc:39-41`). Here the
+    // info sink fails while `--show-npages` writes, so `write_qpdf` owes the
+    // diagnostic.
+    let path = Path::new(env!("CARGO_MANIFEST_DIR"))
+        .join("../../tests/fixtures/compat/linearized-one-page.pdf");
+    let (logger, errors) = logger_with_error_sink();
+    logger.set_info(Some(PipelineHandle::new(FailingSink)));
+    logger.set_warn(Some(logger.discard()));
+
+    let mut job = QPDFJob::new();
+    job.set_logger(logger);
+    job.initialize_from_json_partial(
+        &serde_json::json!({"inputFile": path, "showNpages": ""}).to_string(),
+    )
+    .unwrap();
+
+    assert_eq!(job.run().unwrap(), JobExitCode::Error);
+    let reported = String::from_utf8_lossy(&errors.lock().unwrap().bytes).to_string();
+    assert!(
+        reported.contains("warning sink failed"),
+        "the boundary must report a failure no inspection step announced: {reported}"
+    );
+    assert_eq!(
+        reported.matches("warning sink failed").count(),
+        1,
+        "qpdf prints exactly one line for it: {reported}"
+    );
+}
+
+#[test]
 fn show_linearization_propagates_custom_info_sink_failure() {
     let path = Path::new(env!("CARGO_MANIFEST_DIR"))
         .join("../../tests/fixtures/compat/linearized-one-page.pdf");

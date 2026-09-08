@@ -2972,10 +2972,16 @@ impl QPDFJob {
                     // here for the same reason the write-failure arm below
                     // does: `run()` turns the error into an exit status and
                     // would otherwise discard the explanation entirely.
+                    // cov:ignore-start: reaching this arm needs the rename
+                    // itself to fail after a successful write, which requires
+                    // a filesystem-level failure (permissions revoked between
+                    // write and rename, or a still-open handle on Windows)
+                    // that cannot be induced in-process on Linux CI
                     if let Err(error) = self.finish_replace_input() {
                         self.report_job_error(&error)?;
                         return Err(error);
                     }
+                    // cov:ignore-end
                 }
                 // The drain qpdf performs after `writeOutfile` returns
                 // (`libqpdf/QPDFJob.cc:493-494`).
