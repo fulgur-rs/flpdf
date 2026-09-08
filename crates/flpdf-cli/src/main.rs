@@ -107,6 +107,32 @@ impl PageLabelOptions {
     }
 }
 
+/// The qpdf job keeps explicit inline-image externalization separate from the
+/// `optimizeImages` option. Preserve that distinction at the CLI boundary so
+/// an explicit request can externalize without invoking JPEG optimization, and
+/// can override `keepInlineImages` when both transformations are selected
+/// (`libqpdf/QPDFJob.cc:2151-2174`).
+#[derive(Debug, Clone, Copy, Default)]
+struct ImageTransformOptions {
+    externalize_inline_images: bool,
+    optimize_images: bool,
+    image_options: ImageOptimizationOptions,
+}
+
+impl ImageTransformOptions {
+    fn new(
+        externalize_inline_images: bool,
+        optimize_images: bool,
+        image_options: ImageOptimizationOptions,
+    ) -> Self {
+        Self {
+            externalize_inline_images,
+            optimize_images,
+            image_options,
+        }
+    }
+}
+
 fn page_label_options(set: Option<&[OsString]>, remove: bool) -> PageLabelOptions {
     PageLabelOptions {
         set: set.map(|specs| {
@@ -326,6 +352,33 @@ fn image_optimization_options(
     }
     options.keep_inline_images = keep_inline_images;
     Ok(options)
+}
+
+/// Apply qpdf's image transformation phase at the shared CLI/job boundary.
+/// Explicit inline-image externalization is kept distinct from the optimizer,
+/// but qpdf runs it first and gives the explicit request precedence over
+/// `keepInlineImages` when both are enabled
+/// (`libqpdf/QPDFJob.cc:2151-2174`).
+fn apply_image_transformations<R: Read + Seek + 'static>(
+    pdf: &mut Pdf<R>,
+    options: ImageTransformOptions,
+    verbose: bool,
+) -> CliResult<()> {
+    let mut image_options = options.image_options;
+    if options.externalize_inline_images {
+        image_options.keep_inline_images = false;
+    }
+
+    if options.optimize_images {
+        flpdf::optimize_images(pdf, &cli_logger(), &progname(), verbose, image_options)?;
+    } else if options.externalize_inline_images {
+        let page_refs = PageDocumentHelper::new(pdf).get_all_pages()?;
+        for page_ref in page_refs {
+            PageObjectHelper::new(page_ref, pdf)
+                .externalize_inline_images(image_options.inline_min_bytes, false)?;
+        }
+    }
+    Ok(())
 }
 
 /// Translate the CLI's effective writer options into the reusable library
@@ -1163,6 +1216,19 @@ struct Cli {
               "add_attachment", "copy_attachments_from",
           ])]
     optimize_images: bool,
+    /// Convert inline images into ordinary Image XObjects
+    /// (qpdf `--externalize-inline-images`). This is a distinct transform
+    /// from `--optimize-images`; when both are selected the shared image phase
+    /// externalizes first and then optimizes reachable Image XObjects.
+    #[arg(long = "externalize-inline-images",
+          conflicts_with_all = [
+              "check", "show_object",
+              "show_npages", "show_pages", "show_xref", "show_linearization",
+              "show_encryption",
+              "list_attachments", "show_attachment", "remove_attachment",
+              "add_attachment", "copy_attachments_from",
+          ])]
+    externalize_inline_images: bool,
     /// Exclude inline images from the optimization pass.
     #[arg(long = "keep-inline-images")]
     keep_inline_images: bool,
@@ -2020,6 +2086,10 @@ struct RewriteCommand {
     /// `--optimize-images`).
     #[arg(long = "optimize-images")]
     optimize_images: bool,
+    /// Convert inline images into ordinary Image XObjects before later image
+    /// transformations (qpdf `--externalize-inline-images`).
+    #[arg(long = "externalize-inline-images")]
+    externalize_inline_images: bool,
     /// Exclude inline images from the optimization pass.
     #[arg(long = "keep-inline-images")]
     keep_inline_images: bool,
@@ -2943,6 +3013,11 @@ fn main() {
             std::process::exit(2);
         }
     };
+    let top_level_image_transform_options = ImageTransformOptions::new(
+        args.externalize_inline_images,
+        args.optimize_images,
+        top_level_image_options,
+    );
     // QPDFWriter::doWriteSetup clears QDF before deriving QDF's implicit
     // normalization defaults for linearized output (`QPDFWriter.cc:2068-2080`).
     // Keep an explicit --normalize-content value, but do not synthesize the
@@ -3024,7 +3099,11 @@ fn main() {
     } else if json_input_inspection {
         run_json_input_inspection(&args)
     } else if args.json.is_some() || args.json_output.is_some() {
-        run_json(&args, top_level_image_options, args.page_ops.empty)
+        run_json(
+            &args,
+            top_level_image_transform_options,
+            args.page_ops.empty,
+        )
     } else if let Some(command) = args.command {
         run_command(command, &overlay_specs)
     } else if args.is_encrypted {
@@ -3229,7 +3308,7 @@ fn main() {
             args.coalesce_contents,
             args.remove_unreferenced_resources,
             args.generate_appearances,
-            args.optimize_images.then_some(top_level_image_options),
+            top_level_image_transform_options,
             args.flatten_annotations,
             false, // flatten_rotation (not on top-level surface)
             page_label_options(args.set_page_labels.as_deref(), args.remove_page_labels),
@@ -3261,7 +3340,7 @@ fn main() {
             args.coalesce_contents,
             args.remove_unreferenced_resources,
             args.generate_appearances,
-            args.optimize_images.then_some(top_level_image_options),
+            top_level_image_transform_options,
             args.flatten_annotations,
             false, // flatten_rotation (not on top-level surface)
             page_label_options(args.set_page_labels.as_deref(), args.remove_page_labels),
@@ -3351,7 +3430,7 @@ fn main() {
                     options,
                     args.linearize,
                     args.linearize_pass1.as_deref(),
-                    args.optimize_images.then_some(top_level_image_options),
+                    top_level_image_transform_options,
                     args.verbose,
                     args.no_warn,
                 ),
@@ -3373,7 +3452,7 @@ fn main() {
                         options.clone(),
                         args.linearize,
                         args.linearize_pass1.as_deref(),
-                        args.optimize_images.then_some(top_level_image_options),
+                        top_level_image_transform_options,
                         args.verbose,
                         args.no_warn,
                     )
@@ -3398,7 +3477,7 @@ fn main() {
                         options.clone(),
                         args.linearize,
                         args.linearize_pass1.as_deref(),
-                        args.optimize_images.then_some(top_level_image_options),
+                        top_level_image_transform_options,
                         args.verbose,
                         args.no_warn,
                     )
@@ -3431,7 +3510,7 @@ fn main() {
             args.coalesce_contents,
             args.remove_unreferenced_resources,
             args.generate_appearances,
-            args.optimize_images.then_some(top_level_image_options),
+            top_level_image_transform_options,
             args.flatten_annotations,
             false, // flatten_rotation (not on top-level surface)
             page_label_options(args.set_page_labels.as_deref(), args.remove_page_labels),
@@ -3635,7 +3714,7 @@ fn format_job_json_error(path: &Path, error: impl std::fmt::Display) -> String {
     )
 }
 
-fn run_json(cli: &Cli, image_options: ImageOptimizationOptions, empty: bool) -> CliResult<()> {
+fn run_json(cli: &Cli, image_options: ImageTransformOptions, empty: bool) -> CliResult<()> {
     const QPDF_JSON_KEY_NAMES: &[&str] = &[
         "acroform",
         "attachments",
@@ -3772,15 +3851,7 @@ fn run_json(cli: &Cli, image_options: ImageOptimizationOptions, empty: bool) -> 
 
     if empty {
         let mut pdf = create_empty_primary_document(&mut job, cli.update_from_json.as_deref())?;
-        if cli.optimize_images {
-            flpdf::optimize_images(
-                &mut pdf,
-                &cli_logger(),
-                &progname(),
-                cli.verbose,
-                image_options,
-            )?;
-        }
+        apply_image_transformations(&mut pdf, image_options, cli.verbose)?;
         let mut runtime = JsonJobRuntime {
             input_identity: None,
             output_path,
@@ -3822,15 +3893,7 @@ fn run_json(cli: &Cli, image_options: ImageOptimizationOptions, empty: bool) -> 
             .create_from_json_document(input_file, path_description(input))
             .map_err(|error| json_error_with_file(input, Box::new(error)))?;
         apply_json_update_with_job(&mut job, &mut pdf, cli.update_from_json.as_deref())?;
-        if cli.optimize_images {
-            flpdf::optimize_images(
-                &mut pdf,
-                &cli_logger(),
-                &progname(),
-                cli.verbose,
-                image_options,
-            )?;
-        }
+        apply_image_transformations(&mut pdf, image_options, cli.verbose)?;
         let mut runtime = JsonJobRuntime {
             input_identity: Some(&input_identity),
             output_path,
@@ -3855,15 +3918,7 @@ fn run_json(cli: &Cli, image_options: ImageOptimizationOptions, empty: bool) -> 
         job.record_document_warnings(&pdf);
         apply_json_update_with_job(&mut job, &mut pdf, cli.update_from_json.as_deref())?;
         apply_json_page_specs(&mut job, &mut pdf, input, &cli.page_ops)?;
-        if cli.optimize_images {
-            flpdf::optimize_images(
-                &mut pdf,
-                &cli_logger(),
-                &progname(),
-                cli.verbose,
-                image_options,
-            )?;
-        }
+        apply_image_transformations(&mut pdf, image_options, cli.verbose)?;
         let mut runtime = JsonJobRuntime {
             input_identity: Some(&input_identity),
             output_path,
@@ -4255,6 +4310,11 @@ fn run_command(command: Commands, overlay_specs: &[OverlaySpec]) -> CliResult<()
                 cmd.oi_min_area.as_deref(),
                 cmd.ii_min_bytes.as_deref(),
             )?;
+            let image_transform_options = ImageTransformOptions::new(
+                cmd.externalize_inline_images,
+                cmd.optimize_images,
+                image_options,
+            );
 
             // Page-operation dispatch. When --pages is set
             // the extraction pipeline owns the write; otherwise --rotate /
@@ -4286,11 +4346,12 @@ fn run_command(command: Commands, overlay_specs: &[OverlaySpec]) -> CliResult<()
                 // rejecting upfront surfaces the unsupported combination
                 // instead of leaving the user wondering whether decryption
                 // happened.
-                // --optimize-images is NOT in this list: unlike the other
+                // --optimize-images and --externalize-inline-images are NOT in
+                // this list: unlike the other
                 // rewrite-only mutation passes above, the page-operation
                 // functions below (run_page_extraction /
                 // run_rewrite_with_page_ops) already accept and apply it via
-                // `cmd.optimize_images.then_some(image_options)`, mirroring
+                // `image_transform_options`, mirroring
                 // the top-level --pages/--rotate/--split-pages routes.
                 if coalesce_contents
                     || cmd.remove_restrictions
@@ -4343,7 +4404,7 @@ fn run_command(command: Commands, overlay_specs: &[OverlaySpec]) -> CliResult<()
                         options,
                         cmd.linearize,
                         None,
-                        cmd.optimize_images.then_some(image_options),
+                        image_transform_options,
                         cmd.verbose,
                         false,
                     )
@@ -4361,7 +4422,7 @@ fn run_command(command: Commands, overlay_specs: &[OverlaySpec]) -> CliResult<()
                         options,
                         cmd.linearize,
                         None,
-                        cmd.optimize_images.then_some(image_options),
+                        image_transform_options,
                         cmd.verbose,
                         false,
                     )
@@ -4378,7 +4439,7 @@ fn run_command(command: Commands, overlay_specs: &[OverlaySpec]) -> CliResult<()
                         options,
                         cmd.linearize,
                         None,
-                        cmd.optimize_images.then_some(image_options),
+                        image_transform_options,
                         cmd.verbose,
                         false,
                     )
@@ -4400,7 +4461,7 @@ fn run_command(command: Commands, overlay_specs: &[OverlaySpec]) -> CliResult<()
                 coalesce_contents,
                 remove_unref,
                 cmd.generate_appearances,
-                cmd.optimize_images.then_some(image_options),
+                image_transform_options,
                 cmd.flatten_annotations,
                 cmd.flatten_rotation,
                 page_label_options(cmd.set_page_labels.as_deref(), cmd.remove_page_labels),
@@ -5091,7 +5152,7 @@ fn run_rewrite(
     coalesce_contents: bool,
     _remove_unref: CliRemoveUnreferencedResources,
     generate_appearances: bool,
-    image_options: Option<ImageOptimizationOptions>,
+    image_options: ImageTransformOptions,
     flatten_annotations_mode: Option<CliFlattenMode>,
     flatten_rotation: bool,
     page_labels: PageLabelOptions,
@@ -5212,7 +5273,7 @@ fn run_rewrite_opened<R: Read + Seek + 'static>(
     coalesce_contents: bool,
     _remove_unref: CliRemoveUnreferencedResources,
     generate_appearances: bool,
-    image_options: Option<ImageOptimizationOptions>,
+    image_options: ImageTransformOptions,
     flatten_annotations_mode: Option<CliFlattenMode>,
     flatten_rotation: bool,
     page_labels: PageLabelOptions,
@@ -5247,9 +5308,7 @@ fn run_rewrite_opened<R: Read + Seek + 'static>(
         if decrypt {
             options.preserve_encryption = false;
         }
-        if let Some(image_options) = image_options {
-            flpdf::optimize_images(&mut pdf, &cli_logger(), &progname(), verbose, image_options)?;
-        }
+        apply_image_transformations(&mut pdf, image_options, verbose)?;
         if generate_appearances {
             generate_missing_appearances(&mut pdf)?;
         }
@@ -5305,9 +5364,7 @@ fn run_rewrite_opened<R: Read + Seek + 'static>(
         if decrypt {
             options.preserve_encryption = false;
         }
-        if let Some(image_options) = image_options {
-            flpdf::optimize_images(&mut pdf, &cli_logger(), &progname(), verbose, image_options)?;
-        }
+        apply_image_transformations(&mut pdf, image_options, verbose)?;
         // ── Content mutation pass ─────────────────────────────────────────────
         //
         // The mutations below operate on the in-memory Pdf model (via set_object).
@@ -6078,7 +6135,7 @@ fn run_page_extraction(
     options: WriterOptions,
     linearize: bool,
     linearize_pass1: Option<&Path>,
-    image_options: Option<ImageOptimizationOptions>,
+    image_options: ImageTransformOptions,
     verbose: bool,
     no_warn: bool,
 ) -> CliResult<()> {
@@ -6277,7 +6334,7 @@ fn run_empty_page_extraction(
     options: WriterOptions,
     linearize: bool,
     linearize_pass1: Option<&Path>,
-    image_options: Option<ImageOptimizationOptions>,
+    image_options: ImageTransformOptions,
     verbose: bool,
     no_warn: bool,
 ) -> CliResult<()> {
@@ -6423,7 +6480,7 @@ fn run_page_extraction_from_multiple_sources(
     options: WriterOptions,
     linearize: bool,
     linearize_pass1: Option<&Path>,
-    image_options: Option<ImageOptimizationOptions>,
+    image_options: ImageTransformOptions,
     verbose: bool,
     no_warn: bool,
     standard_output: Option<PipelineWriter>,
@@ -6596,7 +6653,7 @@ fn run_page_extraction_from_single_source<R: Read + Seek + 'static>(
     options: WriterOptions,
     linearize: bool,
     linearize_pass1: Option<&Path>,
-    image_options: Option<ImageOptimizationOptions>,
+    image_options: ImageTransformOptions,
     verbose: bool,
     standard_output: Option<PipelineWriter>,
     creates_output: bool,
@@ -6744,7 +6801,7 @@ fn run_page_extraction_after_plan<R: Read + Seek + 'static>(
     prior_warnings: bool,
     page_job_result: Option<(RebuildResult, RemoveUnreferencedResources)>,
     combined_pages: Vec<CombinedPage>,
-    image_options: Option<ImageOptimizationOptions>,
+    image_options: ImageTransformOptions,
     no_warn: bool,
 ) -> CliResult<()> {
     pdf.set_suppress_warnings(no_warn);
@@ -6777,9 +6834,7 @@ fn run_page_extraction_after_plan<R: Read + Seek + 'static>(
     // before the final writer (`QPDFJob.cc:2151-2174`). Keep the same order so
     // selected pages, including copied pages from secondary sources, are the
     // only images considered by this job.
-    if let Some(image_options) = image_options {
-        flpdf::optimize_images(pdf, &cli_logger(), &progname(), verbose, image_options)?;
-    }
+    apply_image_transformations(pdf, image_options, verbose)?;
 
     let mut options = options;
     let split_pages = page_ops
@@ -7006,7 +7061,7 @@ fn run_rewrite_with_page_ops(
     options: WriterOptions,
     linearize: bool,
     linearize_pass1: Option<&Path>,
-    image_options: Option<ImageOptimizationOptions>,
+    image_options: ImageTransformOptions,
     verbose: bool,
     no_warn: bool,
 ) -> CliResult<()> {
@@ -7057,7 +7112,7 @@ fn run_rewrite_with_page_ops_opened<R: Read + Seek + 'static>(
     options: WriterOptions,
     linearize: bool,
     linearize_pass1: Option<&Path>,
-    image_options: Option<ImageOptimizationOptions>,
+    image_options: ImageTransformOptions,
     verbose: bool,
 ) -> CliResult<()> {
     let mut standard_output = prepare_page_operation_standard_output(output, page_ops)?;
@@ -7073,9 +7128,7 @@ fn run_rewrite_with_page_ops_opened<R: Read + Seek + 'static>(
         let page_refs = pages::page_refs(&mut pdf)?;
         apply_rotate_specs(&mut pdf, &page_ops.rotate, &page_refs)?;
     }
-    if let Some(image_options) = image_options {
-        flpdf::optimize_images(&mut pdf, &cli_logger(), &progname(), verbose, image_options)?;
-    }
+    apply_image_transformations(&mut pdf, image_options, verbose)?;
 
     // Page operations emit a fresh document and preserve encryption only when
     // the primary input itself was encrypted, matching qpdf's page copier.
