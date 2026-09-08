@@ -2644,9 +2644,12 @@ impl QPDFJob {
                         QPDFJob::complete_in_place_page_selection(pdf, &result, prune_mode)?;
                     }
                     PageSpecJobOutput::Merged(_) => {
+                        // cov:ignore-start: the method's single-source
+                        // predicate guarantees the in-place variant.
                         return Err(Error::Internal(
                             "single-source page selection returned a merged target".to_owned(),
                         ));
+                        // cov:ignore-end
                     }
                 }
             }
@@ -2676,9 +2679,12 @@ impl QPDFJob {
                 *merged
             }
             PageSpecJobOutput::InPlace { .. } => {
+                // cov:ignore-start: a multi-source request always selects the
+                // caller-provided merged target.
                 return Err(Error::Internal(
                     "multi-source page selection returned an in-place target".to_owned(),
                 ));
+                // cov:ignore-end
             }
         };
         self.apply_configured_rotations(&mut primary, configuration)?;
@@ -4150,7 +4156,7 @@ fn parse_object_stream_mode(value: &str) -> Result<ObjectStreamMode> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::{Error, PdfOpenOptions};
+    use crate::{Error, ObjectHandle, PdfOpenOptions};
     use std::io::Cursor;
 
     #[test]
@@ -4408,6 +4414,38 @@ mod tests {
         assert!(matches!(
             map_show_linearization_error(error),
             Error::System(message) if message == "malformed linearization data: bad hint table"
+        ));
+    }
+
+    #[test]
+    fn configured_inspection_maps_detected_check_errors_to_an_operation_error() {
+        let mut pdf = Pdf::open(Cursor::new(
+            include_bytes!(concat!(
+                env!("CARGO_MANIFEST_DIR"),
+                "/../../tests/fixtures/compat/one-page.pdf"
+            ))
+            .to_vec(),
+        ))
+        .expect("one-page fixture parses");
+        let page_ref = PageDocumentHelper::new(&mut pdf)
+            .get_all_pages()
+            .expect("page tree resolves")[0];
+        let page = pdf.get_object_handle(page_ref);
+        page.try_dereference().expect("page resolves");
+        page.replace_key(b"/Contents", ObjectHandle::integer(42))
+            .expect("page remains mutable");
+        pdf.mark_object_handle_dirty(&page)
+            .expect("page mutation is tracked");
+
+        let mut job = QPDFJob::new();
+        let mut configuration = job.configuration.clone();
+        configuration.check = true;
+        let error = job
+            .run_configured_inspection(&mut pdf, &configuration)
+            .expect_err("check errors must abort the enclosing inspection");
+        assert!(matches!(
+            error,
+            Error::Unsupported(message) if message == "errors detected"
         ));
     }
 

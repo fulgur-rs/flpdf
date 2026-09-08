@@ -805,6 +805,28 @@ fn combined_inspection_completes_once_after_all_reports() {
 }
 
 #[test]
+fn no_output_write_reports_memory_usage_after_inspection() {
+    let input = Path::new(env!("CARGO_MANIFEST_DIR")).join("../../tests/fixtures/minimal.pdf");
+    let (logger, warnings) = logger_with_warning_sink();
+    let mut job = QPDFJob::new();
+    job.set_logger(logger);
+    job.initialize_from_json_partial(
+        &serde_json::json!({
+            "inputFile": input,
+            "showNpages": "",
+            "reportMemoryUsage": ""
+        })
+        .to_string(),
+    )
+    .unwrap();
+
+    assert_eq!(job.run().unwrap(), JobExitCode::Success);
+    assert!(
+        String::from_utf8_lossy(&warnings.lock().unwrap().bytes).contains("qpdf-max-memory-usage ")
+    );
+}
+
+#[test]
 fn get_exit_code_is_pure_before_and_after_completion() {
     let (logger, warnings) = logger_with_warning_sink();
     let mut job = QPDFJob::new();
