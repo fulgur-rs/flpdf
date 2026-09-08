@@ -119,7 +119,7 @@ fn stream_is_xref<R: Read + Seek>(
     stream_dict: &ObjectHandle,
     pdf: &mut Pdf<R>,
 ) -> flpdf::Result<bool> {
-    let type_handle = stream_dict.get_key(b"/Type");
+    let type_handle = stream_dict.try_get_key(b"/Type")?;
     pdf.resolve(&type_handle)?;
     Ok(type_handle.as_name().is_some_and(|name| name == b"XRef"))
 }
@@ -142,7 +142,7 @@ fn resolved_filter_names_exact<R: Read + Seek>(
     stream_dict: &ObjectHandle,
     pdf: &mut Pdf<R>,
 ) -> flpdf::Result<ResolvedFilterNames> {
-    let filter = stream_dict.get_key(b"/Filter");
+    let filter = stream_dict.try_get_key(b"/Filter")?;
     pdf.resolve(&filter)?;
     if let Some(name) = filter.as_name() {
         return Ok(ResolvedFilterNames { names: vec![name] });
@@ -178,7 +178,7 @@ fn remove_consumed_crypt_stages<R: Read + Seek>(
     dict: &ObjectHandle,
     pdf: &mut Pdf<R>,
 ) -> flpdf::Result<()> {
-    let filter = dict.get_key(b"/Filter");
+    let filter = dict.try_get_key(b"/Filter")?;
     pdf.resolve(&filter)?;
     if let Some(name) = filter.as_name() {
         if normalize_filter_name(&name) == b"Crypt" {
