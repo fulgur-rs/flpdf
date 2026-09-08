@@ -5761,7 +5761,7 @@ mod final_handle_tests {
         // propagated to every member of an object stream.
         let bytes = b"1 0 obj\n<< /Size 1 >>\nendobj\n \n".to_vec();
         let object_ref = ObjectRef::new(1, 0);
-        let mut context = XrefReadContext::new(
+        let context = XrefReadContext::new(
             &bytes,
             XrefReadContextSpec::ActiveSection,
             &XrefRegistration::default(),
@@ -5788,7 +5788,7 @@ mod final_handle_tests {
         let trailer_offset = bytes.len();
         bytes.extend_from_slice(b"%%EOF\n");
         let object_ref = ObjectRef::new(1, 0);
-        let mut context = XrefReadContext::new(
+        let context = XrefReadContext::new(
             &bytes,
             XrefReadContextSpec::ActiveSection,
             &XrefRegistration::default(),
