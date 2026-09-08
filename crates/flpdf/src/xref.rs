@@ -2035,7 +2035,7 @@ pub(crate) fn load_xref_state_from_bytes(
             let preexisting_bootstrap_cache = if startxref != 0 {
                 initial_bootstrap_cache.as_ref()
             } else {
-                None
+                None // cov:ignore: startxref == 0 returns through the reconstruction handoff above
             };
             let mut recovered = recover_xref_from_linear_scan(
                 bytes,
