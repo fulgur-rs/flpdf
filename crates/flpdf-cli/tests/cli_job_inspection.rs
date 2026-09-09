@@ -345,6 +345,38 @@ fn ordinary_check_with_optimize_images_matches_qpdf_11_9() {
 }
 
 #[test]
+fn optimize_images_does_not_touch_a_page_without_resources() {
+    if skip_if_qpdf_missing() {
+        return;
+    }
+    let input = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+        .join("../../tests/fixtures/compat/direct-root-one-page.pdf");
+
+    let qpdf = ShellCommand::new("qpdf")
+        .args(["--check", "--optimize-images"])
+        .arg(&input)
+        .output()
+        .unwrap();
+    let flpdf = Command::cargo_bin("flpdf")
+        .unwrap()
+        .env("FLPDF_PROGNAME", "qpdf")
+        .args(["--check", "--optimize-images"])
+        .arg(&input)
+        .output()
+        .unwrap();
+
+    assert_eq!(flpdf.status.code(), qpdf.status.code());
+    assert_eq!(
+        normalize_newlines(&flpdf.stdout),
+        normalize_newlines(&qpdf.stdout)
+    );
+    assert_eq!(
+        normalize_newlines(&flpdf.stderr),
+        normalize_newlines(&qpdf.stderr)
+    );
+}
+
+#[test]
 fn ordinary_show_npages_with_optimize_images_matches_qpdf_warning_status() {
     if skip_if_qpdf_missing() {
         return;

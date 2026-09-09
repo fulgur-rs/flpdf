@@ -175,8 +175,11 @@ struct ExternalizedInlineImage {
 
 struct InlineImageExternalizer {
     min_size: usize,
+    resources: ObjectHandle,
     color_spaces: Option<ObjectHandle>,
+    color_spaces_loaded: bool,
     resource_names: std::collections::BTreeSet<Vec<u8>>,
+    resource_names_loaded: bool,
     min_suffix: usize,
     bi_bytes: Vec<u8>,
     dict_bytes: Vec<u8>,
@@ -186,15 +189,14 @@ struct InlineImageExternalizer {
 }
 
 impl InlineImageExternalizer {
-    fn new(
-        min_size: usize,
-        color_spaces: Option<ObjectHandle>,
-        resource_names: std::collections::BTreeSet<Vec<u8>>,
-    ) -> Self {
+    fn new(min_size: usize, resources: ObjectHandle) -> Self {
         Self {
             min_size,
-            color_spaces,
-            resource_names,
+            resources,
+            color_spaces: None,
+            color_spaces_loaded: false,
+            resource_names: std::collections::BTreeSet::new(),
+            resource_names_loaded: false,
             min_suffix: 1,
             bi_bytes: Vec::new(),
             dict_bytes: Vec::new(),
@@ -202,6 +204,24 @@ impl InlineImageExternalizer {
             images: Vec::new(),
             unresolved_color_spaces: Vec::new(),
         }
+    }
+
+    fn ensure_resource_names(&mut self) -> std::result::Result<(), PipelineError> {
+        if !self.resource_names_loaded {
+            self.resource_names = collect_resource_names(&self.resources)
+                .map_err(|error| PipelineError::runtime(error.to_string()))?;
+            self.resource_names_loaded = true;
+        }
+        Ok(())
+    }
+
+    fn ensure_color_spaces(&mut self) -> std::result::Result<(), PipelineError> {
+        if !self.color_spaces_loaded {
+            self.color_spaces = resolve_resource_dictionary(&self.resources, b"/ColorSpace")
+                .map_err(|error| PipelineError::runtime(error.to_string()))?;
+            self.color_spaces_loaded = true;
+        }
+        Ok(())
     }
 
     fn convert_inline_image_dictionary(
@@ -275,6 +295,7 @@ impl InlineImageExternalizer {
         if let Some(name) = builtin {
             return Ok(ObjectHandle::name(name.to_vec()));
         }
+        self.ensure_color_spaces()?;
         if let Some(color_spaces) = &self.color_spaces {
             let mut key = b"/".to_vec();
             key.extend_from_slice(name);
@@ -326,13 +347,14 @@ impl InlineImageExternalizer {
             .unwrap_or(value)
     }
 
-    fn next_name(&mut self) -> Vec<u8> {
+    fn next_name(&mut self) -> std::result::Result<Vec<u8>, PipelineError> {
+        self.ensure_resource_names()?;
         loop {
             let mut name = b"/IIm".to_vec();
             name.extend_from_slice(self.min_suffix.to_string().as_bytes());
             self.min_suffix += 1;
             if self.resource_names.insert(name.clone()) {
-                return name;
+                return Ok(name);
             }
         }
     }
@@ -350,7 +372,7 @@ impl TokenFilter for InlineImageExternalizer {
                     let dict_bytes = self.dict_bytes.clone();
                     let dictionary =
                         self.convert_inline_image_dictionary(&dict_bytes, token.value.len())?;
-                    let name = self.next_name();
+                    let name = self.next_name()?;
                     self.images.push(ExternalizedInlineImage {
                         name: name.clone(),
                         dictionary,
@@ -1870,10 +1892,7 @@ impl<'a, R: Read + Seek> PageObjectHelper<'a, R> {
 // Private free functions
 // ---------------------------------------------------------------------------
 
-fn collect_resource_names<R: Read + Seek>(
-    _pdf: &mut Pdf<R>,
-    resources: &ObjectHandle,
-) -> Result<std::collections::BTreeSet<Vec<u8>>> {
+fn collect_resource_names(resources: &ObjectHandle) -> Result<std::collections::BTreeSet<Vec<u8>>> {
     let mut result = std::collections::BTreeSet::new();
     let Some(entries) = resources.try_as_dictionary()? else {
         return Ok(result);
@@ -1886,8 +1905,7 @@ fn collect_resource_names<R: Read + Seek>(
     Ok(result)
 }
 
-fn resolve_resource_dictionary<R: Read + Seek>(
-    _pdf: &mut Pdf<R>,
+fn resolve_resource_dictionary(
     resources: &ObjectHandle,
     key: &[u8],
 ) -> Result<Option<ObjectHandle>> {
@@ -1916,9 +1934,7 @@ fn externalize_inline_images_for_target<R: Read + Seek>(
     resources.merge_resources(&seed, None)?;
     pdf.mark_object_handle_dirty(&resources)?;
 
-    let resource_names = collect_resource_names(pdf, &resources)?;
-    let color_spaces = resolve_resource_dictionary(pdf, &resources, b"/ColorSpace")?;
-    let mut filter = InlineImageExternalizer::new(min_size, color_spaces, resource_names);
+    let mut filter = InlineImageExternalizer::new(min_size, resources.clone());
     let mut rewritten = Vec::new();
     {
         let mut helper = PageObjectHelper::from_object_handle(target.clone(), pdf);
@@ -2332,7 +2348,6 @@ fn current_description(current: &ObjectHandle) -> String {
 
 #[cfg(test)]
 mod tests {
-    use std::collections::BTreeSet;
     use std::io::Cursor;
 
     use super::*;
@@ -2464,9 +2479,7 @@ mod tests {
 
     #[test]
     fn resource_lookup_helpers_cover_missing_and_non_dictionary_values() {
-        let mut pdf = Pdf::<Cursor<Vec<u8>>>::empty().expect("empty PDF should be available");
-
-        assert!(collect_resource_names(&mut pdf, &ObjectHandle::integer(1))
+        assert!(collect_resource_names(&ObjectHandle::integer(1))
             .expect("non-dictionary resources have no names")
             .is_empty());
 
@@ -2474,24 +2487,20 @@ mod tests {
             b"/Font".to_vec(),
             ObjectHandle::dictionary(vec![(b"/F1".to_vec(), ObjectHandle::integer(1))]),
         )]);
-        assert!(collect_resource_names(&mut pdf, &nested)
+        assert!(collect_resource_names(&nested)
             .expect("nested resource dictionaries have names")
             .contains(b"/F1".as_slice()));
 
         let missing = ObjectHandle::dictionary(Vec::new());
-        assert!(
-            resolve_resource_dictionary(&mut pdf, &missing, b"/ColorSpace")
-                .expect("missing resource category is allowed")
-                .is_none()
-        );
+        assert!(resolve_resource_dictionary(&missing, b"/ColorSpace")
+            .expect("missing resource category is allowed")
+            .is_none());
 
         let non_dictionary =
             ObjectHandle::dictionary(vec![(b"/ColorSpace".to_vec(), ObjectHandle::integer(1))]);
-        assert!(
-            resolve_resource_dictionary(&mut pdf, &non_dictionary, b"/ColorSpace")
-                .expect("non-dictionary resource category is ignored")
-                .is_none()
-        );
+        assert!(resolve_resource_dictionary(&non_dictionary, b"/ColorSpace")
+            .expect("non-dictionary resource category is ignored")
+            .is_none());
 
         let dictionary = ObjectHandle::dictionary(vec![(
             b"/ColorSpace".to_vec(),
@@ -2500,11 +2509,9 @@ mod tests {
                 ObjectHandle::name(b"Separation".to_vec()),
             )]),
         )]);
-        assert!(
-            resolve_resource_dictionary(&mut pdf, &dictionary, b"/ColorSpace")
-                .expect("dictionary resource category should resolve")
-                .is_some()
-        );
+        assert!(resolve_resource_dictionary(&dictionary, b"/ColorSpace")
+            .expect("dictionary resource category should resolve")
+            .is_some());
     }
 
     #[test]
@@ -2759,14 +2766,8 @@ mod tests {
 
     #[test]
     fn inline_image_dictionary_expands_qpdf_abbreviations() {
-        let mut externalizer = InlineImageExternalizer::new(
-            0,
-            Some(ObjectHandle::dictionary(vec![(
-                b"/Spot".to_vec(),
-                ObjectHandle::name(b"Separation".to_vec()),
-            )])),
-            BTreeSet::from([b"/IIm1".to_vec()]),
-        );
+        let mut externalizer =
+            InlineImageExternalizer::new(0, ObjectHandle::dictionary(Vec::new()));
 
         let image = externalizer
             .convert_inline_image_dictionary(
@@ -2803,11 +2804,19 @@ mod tests {
     fn inline_image_externalizer_covers_colorspace_filters_and_name_conflicts() {
         let mut externalizer = InlineImageExternalizer::new(
             0,
-            Some(ObjectHandle::dictionary(vec![(
-                b"/Custom".to_vec(),
-                ObjectHandle::name(b"Resolved".to_vec()),
-            )])),
-            BTreeSet::from([b"/IIm1".to_vec()]),
+            ObjectHandle::dictionary(vec![
+                (
+                    b"/ColorSpace".to_vec(),
+                    ObjectHandle::dictionary(vec![(
+                        b"/Custom".to_vec(),
+                        ObjectHandle::name(b"Resolved".to_vec()),
+                    )]),
+                ),
+                (
+                    b"/XObject".to_vec(),
+                    ObjectHandle::dictionary(vec![(b"/IIm1".to_vec(), ObjectHandle::null())]),
+                ),
+            ]),
         );
 
         for (short, expanded) in [
@@ -2888,8 +2897,8 @@ mod tests {
             Some(4)
         );
 
-        assert_eq!(externalizer.next_name(), b"/IIm2".to_vec());
-        assert_eq!(externalizer.next_name(), b"/IIm3".to_vec());
+        assert_eq!(externalizer.next_name().unwrap(), b"/IIm2".to_vec());
+        assert_eq!(externalizer.next_name().unwrap(), b"/IIm3".to_vec());
     }
 
     #[test]
