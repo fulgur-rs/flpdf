@@ -102,8 +102,7 @@ use std::io::{Read, Seek};
 ///
 /// # Errors
 ///
-/// Any error propagated from [`Pdf::resolve`] or
-/// the canonical resolver while resolving the catalog, the
+/// Any error propagated from the canonical resolver while resolving the catalog, the
 /// `/Threads` array, the threads, the surviving pages, or the beads.
 pub fn drop_thread_bead_dangling_p<R: Read + Seek>(
     pdf: &mut Pdf<R>,
@@ -122,18 +121,17 @@ pub fn drop_thread_bead_dangling_p<R: Read + Seek>(
     seed_from_threads(pdf, &mut queue)?;
     seed_from_surviving_pages(pdf, result, &mut queue)?;
 
-    // Walk the ring(s). Pdf::resolve_handle_ref keeps the visited key and
-    // the write-back target at the terminal bead ref (never an intermediate
-    // reference holder).
+    // Walk the ring(s). Capture the handle's indirect identity before the
+    // canonical dereference, matching the old helper's visited-key contract.
     let mut visited: BTreeSet<ObjectRef> = BTreeSet::new();
     while let Some(start_ref) = queue.pop() {
         let start = pdf.get_object_handle(start_ref);
-        let (concrete, terminal) = pdf.resolve_handle_ref(&start)?;
-        let bead_ref = terminal.unwrap_or(start_ref);
+        let bead_ref = start.object_ref().unwrap_or(start_ref);
+        start.try_dereference()?;
         if !visited.insert(bead_ref) {
             continue;
         }
-        let Some(bead) = concrete.as_dictionary() else {
+        let Some(bead) = start.try_as_dictionary()? else {
             continue;
         };
         // Enqueue ring neighbours before any mutation; they are chain-resolved
@@ -143,7 +141,7 @@ pub fn drop_thread_bead_dangling_p<R: Read + Seek>(
                 queue.push(value);
             }
         }
-        remap_or_drop_bead_p(pdf, &concrete, &surviving, removed_pages)?;
+        remap_or_drop_bead_p(pdf, &start, &surviving, removed_pages)?;
     }
     Ok(())
 }
@@ -159,18 +157,16 @@ fn seed_from_threads<R: Read + Seek>(pdf: &mut Pdf<R>, queue: &mut Vec<ObjectRef
         return Ok(()); // No catalog.
     };
     let catalog = pdf.get_object_handle(catalog_ref);
-    pdf.resolve(&catalog)?;
     if !catalog.try_has_key(b"/Threads")? {
         return Ok(()); // No article threads.
     }
     let threads_val = catalog.try_get_key(b"/Threads")?;
     // /Threads may be an indirect (possibly multi-hop) reference to the array.
-    let (threads_concrete, _) = pdf.resolve_handle_ref(&threads_val)?;
-    let Some(threads) = threads_concrete.as_array() else {
+    let Some(threads) = threads_val.try_as_array()? else {
         return Ok(());
     };
     for thread in threads {
-        if let Some(first_bead) = thread_first_bead(pdf, &thread)? {
+        if let Some(first_bead) = thread_first_bead(&thread)? {
             queue.push(first_bead);
         }
     }
@@ -182,18 +178,15 @@ fn seed_from_threads<R: Read + Seek>(pdf: &mut Pdf<R>, queue: &mut Vec<ObjectRef
 ///
 /// The entry may be an indirect reference (chain) to a thread dictionary or a
 /// direct (inline) dictionary; `/F` may itself be a reference chain.
-fn thread_first_bead<R: Read + Seek>(
-    pdf: &mut Pdf<R>,
-    thread: &ObjectHandle,
-) -> Result<Option<ObjectRef>> {
-    let (concrete, _) = pdf.resolve_handle_ref(thread)?;
-    let Some(dict) = concrete.as_dictionary() else {
+fn thread_first_bead(thread: &ObjectHandle) -> Result<Option<ObjectRef>> {
+    let Some(dict) = thread.try_as_dictionary()? else {
         return Ok(None);
     };
     let Some(f_val) = dict.get(b"/F".as_slice()) else {
         return Ok(None);
     };
-    let (_, terminal) = pdf.resolve_handle_ref(f_val)?;
+    let terminal = f_val.object_ref();
+    f_val.try_dereference()?;
     Ok(terminal)
 }
 
@@ -214,13 +207,11 @@ fn seed_from_surviving_pages<R: Read + Seek>(
             continue;
         }
         let page = pdf.get_object_handle(page_ref);
-        pdf.resolve(&page)?;
         if !page.try_has_key(b"/B")? {
             continue;
         }
         let b_val = page.try_get_key(b"/B")?;
-        let (b_concrete, _) = pdf.resolve_handle_ref(&b_val)?;
-        if let Some(beads) = b_concrete.as_array() {
+        if let Some(beads) = b_val.try_as_array()? {
             for bead in beads {
                 if let Some(r) = handle_reference(&bead) {
                     queue.push(r);
@@ -245,12 +236,13 @@ fn remap_or_drop_bead_p<R: Read + Seek>(
     removed_pages: &BTreeSet<ObjectRef>,
 ) -> Result<()> {
     let Some(p_val) = bead
-        .as_dictionary()
+        .try_as_dictionary()?
         .and_then(|dictionary| dictionary.get(b"/P".as_slice()).cloned())
     else {
         return Ok(());
     };
-    let (_, p_terminal) = pdf.resolve_handle_ref(&p_val)?;
+    let p_terminal = p_val.object_ref();
+    p_val.try_dereference()?;
     let Some(page_ref) = p_terminal else {
         return Ok(()); // Non-reference /P: malformed, left unchanged.
     };

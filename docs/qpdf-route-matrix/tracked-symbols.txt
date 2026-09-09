@@ -83,7 +83,6 @@ crates/flpdf/src/object_handle.rs::ObjectHandle::as_real                 # A6
 crates/flpdf/src/object_handle.rs::ObjectHandle::is_null                 # A6
 crates/flpdf/src/reader.rs::Pdf::resolve                                 # A7（曖昧 leaf）
 crates/flpdf/src/reader.rs::Pdf::resolve_handle                          # A7
-crates/flpdf/src/reader.rs::Pdf::resolve_handle_ref                      # A7
 crates/flpdf/src/object_handle.rs::ObjectHandle::get_key                 # A8 panic 版
 crates/flpdf/src/object_handle.rs::ObjectHandle::has_key                 # A8
 crates/flpdf/src/reader.rs::Pdf::get_all_objects                         # A9
