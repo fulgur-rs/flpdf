@@ -469,7 +469,7 @@ fn is_pure_widget(dict: &BTreeMap<Vec<u8>, ObjectHandle>) -> Result<bool> {
             if !value.try_is_null()? {
                 has_field_entries = true;
                 break;
-            }
+            } // cov:ignore: LLVM maps the covered field-entry branch terminator separately
         }
     }
 
@@ -524,7 +524,7 @@ fn certificate_entry(dict: &BTreeMap<Vec<u8>, ObjectHandle>) -> Result<Option<Ve
                     value.try_dereference()?;
                     if let Some(bytes) = value.as_string() {
                         return Ok(Some(bytes));
-                    }
+                    } // cov:ignore: LLVM maps the covered certificate-array branch terminator separately
                 }
                 Ok(None)
             } else {
