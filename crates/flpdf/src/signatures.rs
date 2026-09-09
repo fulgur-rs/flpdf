@@ -81,21 +81,23 @@ pub fn signatures_with_max_depth<R: Read + Seek>(
         return Ok(Vec::new());
     };
     let catalog_handle = pdf.get_object_handle(catalog_ref);
-    let catalog = resolve_handle(pdf, &catalog_handle)?;
-    if catalog.as_dictionary().is_none() {
+    catalog_handle.try_dereference()?;
+    let catalog = catalog_handle;
+    if catalog.try_as_dictionary()?.is_none() {
         return Ok(Vec::new());
     }
     let acroform_value = catalog.try_get_key(b"/AcroForm")?;
-    let acroform = resolve_handle(pdf, &acroform_value)?;
-    if acroform_value.is_null() || acroform.as_dictionary().is_none() {
+    acroform_value.try_dereference()?;
+    let acroform = acroform_value;
+    if acroform.try_is_null()? || acroform.try_as_dictionary()?.is_none() {
         return Ok(Vec::new());
     }
 
     let fields_obj = acroform.try_get_key(b"/Fields")?;
-    if fields_obj.is_null() {
+    if fields_obj.try_is_null()? {
         return Ok(Vec::new());
     }
-    let fields = resolve_array(pdf, fields_obj)?;
+    let fields = resolve_array(fields_obj)?;
     let mut output = Vec::new();
     let mut seen = BTreeSet::new();
     for field in fields {
@@ -110,7 +112,7 @@ pub fn signatures_with_max_depth<R: Read + Seek>(
 ///
 /// Returns `None` when there is no `/AcroForm`, no `/SigFlags`, or the value is
 /// not a non-negative integer that fits in `u32`. An indirect `/SigFlags`
-/// reference (vanishingly rare for a scalar flag) is treated as absent.
+/// reference is dereferenced before applying the same integer check.
 ///
 /// # Errors
 ///
@@ -164,13 +166,13 @@ pub fn strip_signature_values<R: Read + Seek>(pdf: &mut Pdf<R>) -> Result<bool> 
         return Ok(false);
     };
     let fields_obj = acroform.try_get_key(b"/Fields")?;
-    if fields_obj.is_null() {
+    if fields_obj.try_is_null()? {
         return Ok(false);
     }
 
     let mut changed = false;
     let mut seen = BTreeSet::new();
-    for field in resolve_array(pdf, fields_obj)? {
+    for field in resolve_array(fields_obj)? {
         let Some(field_ref) = field.object_ref() else {
             continue;
         };
@@ -191,13 +193,14 @@ fn resolve_catalog_acroform<R: Read + Seek>(pdf: &mut Pdf<R>) -> Result<Option<O
         return Ok(None);
     };
     let catalog_handle = pdf.get_object_handle(root_ref);
-    let catalog = resolve_handle(pdf, &catalog_handle)?;
-    if catalog.as_dictionary().is_none() {
+    catalog_handle.try_dereference()?;
+    let catalog = catalog_handle;
+    if catalog.try_as_dictionary()?.is_none() {
         return Ok(None);
     }
     let acroform_value = catalog.try_get_key(b"/AcroForm")?;
-    let acroform = resolve_handle(pdf, &acroform_value)?;
-    Ok(acroform.as_dictionary().map(|_| acroform))
+    acroform_value.try_dereference()?;
+    Ok(acroform_value.try_as_dictionary()?.map(|_| acroform_value))
 }
 
 /// Extract `/SigFlags` as a `u32` bitfield from an already-resolved `/AcroForm`
@@ -205,7 +208,7 @@ fn resolve_catalog_acroform<R: Read + Seek>(pdf: &mut Pdf<R>) -> Result<Option<O
 fn sig_flags_from_acroform(acroform: &ObjectHandle) -> Result<Option<u32>> {
     Ok(acroform
         .try_get_key(b"/SigFlags")?
-        .as_integer()
+        .try_as_integer()?
         .and_then(|n| u32::try_from(n).ok()))
 }
 
@@ -236,8 +239,9 @@ fn strip_signature_values_from_field<R: Read + Seek>(
     }
 
     let field_handle = pdf.get_object_handle(field_ref);
-    let field = resolve_handle(pdf, &field_handle)?;
-    let Some(entries) = field.as_dictionary() else {
+    field_handle.try_dereference()?;
+    let field = field_handle;
+    let Some(_entries) = field.try_as_dictionary()? else {
         return Ok(());
     };
 
@@ -245,12 +249,14 @@ fn strip_signature_values_from_field<R: Read + Seek>(
         .field_type()?
         .map(|name| name.strip_prefix(b"/").unwrap_or(&name).to_vec())
         .or(inherited_type);
-    let kids_obj = entries
-        .get(b"/Kids".as_slice())
-        .cloned()
-        .unwrap_or_else(ObjectHandle::null);
+    let kids_obj = field.try_get_key(b"/Kids")?;
 
-    let has_signature_value = entries.contains_key(b"/V".as_slice());
+    // qpdf's removeKey erases a raw `/V` entry even when its stored value is
+    // null. `try_has_key` intentionally treats null values as absent, so use
+    // the resolved dictionary snapshot for this mutation decision.
+    let has_signature_value = field
+        .as_dictionary()
+        .is_some_and(|entries| entries.contains_key(b"/V".as_slice()));
 
     if field_type.as_deref() == Some(b"Sig") && has_signature_value {
         field.remove_key(b"/V");
@@ -259,7 +265,7 @@ fn strip_signature_values_from_field<R: Read + Seek>(
             return Ok(());
         }
 
-        if kids_obj.is_null() {
+        if kids_obj.try_is_null()? {
             return Ok(());
         }
         return strip_signature_values_from_kids(pdf, kids_obj, field_type, depth, seen, changed);
@@ -269,7 +275,7 @@ fn strip_signature_values_from_field<R: Read + Seek>(
         return Ok(());
     }
 
-    if kids_obj.is_null() {
+    if kids_obj.try_is_null()? {
         return Ok(());
     }
     strip_signature_values_from_kids(pdf, kids_obj, field_type, depth, seen, changed)
@@ -283,15 +289,15 @@ fn strip_signature_values_from_kids<R: Read + Seek>(
     seen: &mut BTreeSet<ObjectRef>,
     changed: &mut bool,
 ) -> Result<()> {
-    for kid in resolve_array(pdf, kids_obj)? {
+    for kid in resolve_array(kids_obj)? {
         let Some(kid_ref) = kid.object_ref() else {
             continue;
         };
-        let kid_obj = resolve_handle(pdf, &kid)?;
-        let Some(kid_dict) = kid_obj.as_dictionary() else {
+        kid.try_dereference()?;
+        let Some(kid_dict) = kid.try_as_dictionary()? else {
             continue;
         };
-        if is_pure_widget(&kid_dict) {
+        if is_pure_widget(&kid_dict)? {
             continue;
         }
         strip_signature_values_from_field(
@@ -321,8 +327,9 @@ fn walk_signature_field<R: Read + Seek>(
     }
 
     let field_handle = pdf.get_object_handle(field_ref);
-    let field_obj = resolve_handle(pdf, &field_handle)?;
-    let Some(field_dict) = field_obj.as_dictionary() else {
+    field_handle.try_dereference()?;
+    let field_obj = field_handle;
+    let Some(_field_dict) = field_obj.try_as_dictionary()? else {
         return Ok(());
     };
 
@@ -344,18 +351,19 @@ fn walk_signature_field<R: Read + Seek>(
         return Ok(());
     }
 
-    let Some(kids_obj) = field_dict.get(b"/Kids".as_slice()).cloned() else {
+    let kids_obj = field_obj.try_get_key(b"/Kids")?;
+    if kids_obj.try_is_null()? {
         return Ok(());
-    };
-    for kid in resolve_array(pdf, kids_obj)? {
+    }
+    for kid in resolve_array(kids_obj)? {
         let Some(kid_ref) = kid.object_ref() else {
             continue;
         };
-        let kid_obj = resolve_handle(pdf, &kid)?;
-        let Some(kid_dict) = kid_obj.as_dictionary() else {
+        kid.try_dereference()?;
+        let Some(kid_dict) = kid.try_as_dictionary()? else {
             continue;
         };
-        if is_pure_widget(&kid_dict) {
+        if is_pure_widget(&kid_dict)? {
             continue;
         }
         walk_signature_field(
@@ -381,54 +389,46 @@ fn signature_info_for_field<R: Read + Seek>(
         return Ok(None);
     };
     let signature_ref = value.object_ref();
-    let value = resolve_handle(pdf, &value)?;
-    let Some(signature_dict) = value.as_dictionary() else {
+    value.try_dereference()?;
+    let Some(signature_dict) = value.try_as_dictionary()? else {
         return Ok(None);
     };
-    let Some(byte_range_obj) = signature_dict.get(b"/ByteRange".as_slice()).cloned() else {
+    if !signature_dict.contains_key(b"/ByteRange".as_slice()) {
         return Ok(None);
-    };
-    let byte_range = parse_byte_range(pdf, byte_range_obj)?;
+    }
+    let byte_range_obj = value.try_get_key(b"/ByteRange")?;
+    let byte_range = parse_byte_range(byte_range_obj)?;
 
     Ok(Some(SignatureInfo {
         field_ref,
         signature_ref,
         field_name: field_name.to_string(),
         byte_range,
-        sub_filter: name_entry(pdf, &signature_dict, b"/SubFilter")?,
-        signer_name: text_entry(pdf, &signature_dict, b"/Name")?,
-        signing_time: text_entry(pdf, &signature_dict, b"/M")?,
-        reason: text_entry(pdf, &signature_dict, b"/Reason")?,
-        location: text_entry(pdf, &signature_dict, b"/Location")?,
-        contact_info: text_entry(pdf, &signature_dict, b"/ContactInfo")?,
-        certificate: certificate_entry(pdf, &signature_dict)?,
+        sub_filter: name_entry(&signature_dict, b"/SubFilter")?,
+        signer_name: text_entry(&signature_dict, b"/Name")?,
+        signing_time: text_entry(&signature_dict, b"/M")?,
+        reason: text_entry(&signature_dict, b"/Reason")?,
+        location: text_entry(&signature_dict, b"/Location")?,
+        contact_info: text_entry(&signature_dict, b"/ContactInfo")?,
+        certificate: certificate_entry(&signature_dict)?,
     }))
 }
 
-fn resolve_handle<R: Read + Seek>(pdf: &mut Pdf<R>, handle: &ObjectHandle) -> Result<ObjectHandle> {
-    pdf.resolve(handle)?;
-    Ok(handle.clone())
+fn resolve_array(value: ObjectHandle) -> Result<Vec<ObjectHandle>> {
+    Ok(value.try_as_array()?.unwrap_or_default())
 }
 
-fn resolve_array<R: Read + Seek>(
-    pdf: &mut Pdf<R>,
-    value: ObjectHandle,
-) -> Result<Vec<ObjectHandle>> {
-    Ok(resolve_handle(pdf, &value)?.as_array().unwrap_or_default())
-}
-
-fn parse_byte_range<R: Read + Seek>(pdf: &mut Pdf<R>, value: ObjectHandle) -> Result<[u64; 4]> {
-    let values = resolve_handle(pdf, &value)?
-        .as_array()
-        .ok_or_else(|| invalid_byte_range("must be an array"))?;
+fn parse_byte_range(value: ObjectHandle) -> Result<[u64; 4]> {
+    let Some(values) = value.try_as_array()? else {
+        return Err(invalid_byte_range("must be an array"));
+    };
     if values.len() != 4 {
         return Err(invalid_byte_range("must contain exactly four integers"));
     }
 
     let mut out = [0; 4];
     for (idx, value) in values.iter().enumerate() {
-        let value = resolve_handle(pdf, value)?;
-        let Some(n) = value.as_integer() else {
+        let Some(n) = value.try_as_integer()? else {
             return Err(invalid_byte_range("must contain only integers"));
         };
         out[idx] = u64::try_from(n)
@@ -452,12 +452,15 @@ fn join_field_name(parent_name: &str, local_name: Option<String>) -> String {
     }
 }
 
-fn is_pure_widget(dict: &BTreeMap<Vec<u8>, ObjectHandle>) -> bool {
+fn is_pure_widget(dict: &BTreeMap<Vec<u8>, ObjectHandle>) -> Result<bool> {
     let is_widget = dict
         .get(b"/Subtype".as_slice())
-        .and_then(ObjectHandle::as_name)
+        .map(|value| value.try_as_name())
+        .transpose()?
+        .flatten()
         .is_some_and(|name| name == b"Widget");
-    let has_field_entries = [
+    let mut has_field_entries = false;
+    for key in [
         b"/T".as_slice(),
         b"/FT".as_slice(),
         b"/Kids".as_slice(),
@@ -466,65 +469,72 @@ fn is_pure_widget(dict: &BTreeMap<Vec<u8>, ObjectHandle>) -> bool {
         b"/Ff".as_slice(),
         b"/TU".as_slice(),
         b"/TM".as_slice(),
-    ]
-    .into_iter()
-    .any(|key| dict.contains_key(key));
+    ] {
+        if let Some(value) = dict.get(key) {
+            if !value.try_is_null()? {
+                has_field_entries = true;
+                break;
+            } // cov:ignore: LLVM maps the covered field-entry branch terminator separately
+        }
+    }
 
-    is_widget && !has_field_entries
+    Ok(is_widget && !has_field_entries)
 }
 
-fn resolve_entry<R: Read + Seek>(
-    pdf: &mut Pdf<R>,
+fn resolve_entry(
     dict: &BTreeMap<Vec<u8>, ObjectHandle>,
     key: &[u8],
 ) -> Result<Option<ObjectHandle>> {
     dict.get(key)
         .cloned()
-        .map(|value| resolve_handle(pdf, &value))
+        .map(|value| {
+            value.try_dereference()?;
+            Ok(value)
+        })
         .transpose()
 }
 
-fn name_entry<R: Read + Seek>(
-    pdf: &mut Pdf<R>,
-    dict: &BTreeMap<Vec<u8>, ObjectHandle>,
-    key: &[u8],
-) -> Result<Option<String>> {
-    match resolve_entry(pdf, dict, key)? {
+fn name_entry(dict: &BTreeMap<Vec<u8>, ObjectHandle>, key: &[u8]) -> Result<Option<String>> {
+    match resolve_entry(dict, key)? {
         Some(value) => Ok(value
-            .as_name()
+            .try_as_name()?
             .map(|name| String::from_utf8_lossy(&name).into_owned())),
         _ => Ok(None),
     }
 }
 
-fn text_entry<R: Read + Seek>(
-    pdf: &mut Pdf<R>,
-    dict: &BTreeMap<Vec<u8>, ObjectHandle>,
-    key: &[u8],
-) -> Result<Option<String>> {
-    match resolve_entry(pdf, dict, key)? {
-        Some(value) => Ok(value.as_string().map(|bytes| {
-            decode_pdf_text_string(&bytes).unwrap_or_else(|| String::from_utf8_lossy(&bytes).into())
-        })),
+fn text_entry(dict: &BTreeMap<Vec<u8>, ObjectHandle>, key: &[u8]) -> Result<Option<String>> {
+    match resolve_entry(dict, key)? {
+        Some(value) => {
+            value.try_dereference()?;
+            Ok(value.as_string().map(|bytes| {
+                decode_pdf_text_string(&bytes)
+                    .unwrap_or_else(|| String::from_utf8_lossy(&bytes).into())
+            }))
+        }
         _ => Ok(None),
     }
 }
 
-fn certificate_entry<R: Read + Seek>(
-    pdf: &mut Pdf<R>,
-    dict: &BTreeMap<Vec<u8>, ObjectHandle>,
-) -> Result<Option<Vec<u8>>> {
-    match resolve_entry(pdf, dict, b"/Cert")? {
-        Some(value) if value.as_string().is_some() => Ok(value.as_string()),
-        Some(value) if value.as_array().is_some() => {
-            let values = value.as_array().unwrap_or_default();
-            for value in values {
-                let value = resolve_handle(pdf, &value)?;
-                if let Some(bytes) = value.as_string() {
-                    return Ok(Some(bytes));
-                }
+fn certificate_entry(dict: &BTreeMap<Vec<u8>, ObjectHandle>) -> Result<Option<Vec<u8>>> {
+    match resolve_entry(dict, b"/Cert")? {
+        Some(value) => {
+            value.try_dereference()?;
+            if value.as_string().is_some() {
+                return Ok(value.as_string());
             }
-            Ok(None)
+            if value.try_as_array()?.is_some() {
+                let values = value.try_as_array()?.unwrap_or_default();
+                for value in values {
+                    value.try_dereference()?;
+                    if let Some(bytes) = value.as_string() {
+                        return Ok(Some(bytes));
+                    } // cov:ignore: LLVM maps the covered certificate-array branch terminator separately
+                }
+                Ok(None)
+            } else {
+                Ok(None)
+            }
         }
         _ => Ok(None),
     }
@@ -534,3 +544,33 @@ fn certificate_entry<R: Read + Seek>(
 // their unit tests moved to `acroform_document_helper.rs` alongside the
 // shared `analyze()` port those functions became
 // (`AcroFormDocumentHelper::annotation_to_field_map`/`get_field_for_annotation`).
+
+#[cfg(test)]
+mod tests {
+    use super::{certificate_entry, is_pure_widget};
+    use crate::ObjectHandle;
+    use std::collections::BTreeMap;
+
+    #[test]
+    fn field_entry_makes_a_widget_non_pure() {
+        let dictionary = BTreeMap::from([
+            (b"/Subtype".to_vec(), ObjectHandle::name(b"Widget".to_vec())),
+            (b"/T".to_vec(), ObjectHandle::string(b"field".to_vec())),
+        ]);
+
+        assert!(!is_pure_widget(&dictionary).expect("widget classification"));
+    }
+
+    #[test]
+    fn certificate_array_returns_the_first_string_entry() {
+        let dictionary = BTreeMap::from([(
+            b"/Cert".to_vec(),
+            ObjectHandle::array(vec![ObjectHandle::string(b"certificate".to_vec())]),
+        )]);
+
+        assert_eq!(
+            certificate_entry(&dictionary).expect("certificate entry"),
+            Some(b"certificate".to_vec())
+        );
+    }
+}

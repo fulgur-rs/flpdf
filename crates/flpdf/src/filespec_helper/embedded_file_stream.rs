@@ -29,6 +29,7 @@ pub struct EmbeddedFileStream<'a, R: Read + Seek + 'static> {
     stream: ObjectHandle,
     // The wrapper still owns the document's exclusive borrow. RefCell only
     // permits qpdf-shaped read accessors to perform explicit resolution.
+    #[allow(dead_code)]
     pdf: RefCell<&'a mut Pdf<R>>,
 }
 
@@ -193,16 +194,9 @@ impl<'a, R: Read + Seek> EmbeddedFileStream<'a, R> {
         // (libqpdf/QPDFEFStreamObjectHelper.cc:20-28), whose
         // asStreamWithAssert/assertType path raises this runtime error for a
         // non-stream object (libqpdf/QPDFObjectHandle.cc:319-324, 2215-2223).
-        let (stream, terminal_ref) = self.pdf.borrow_mut().resolve_handle_ref(&self.stream)?;
-        let stream = match terminal_ref {
-            Some(object_ref) => {
-                let mut pdf = self.pdf.borrow_mut();
-                let stream = pdf.get_object_handle(object_ref);
-                pdf.resolve(&stream)?;
-                stream
-            }
-            None => stream,
-        };
+        let terminal_ref = self.stream.object_ref();
+        self.stream.try_dereference()?;
+        let stream = self.stream.clone();
         if let Some(dictionary) = stream.as_stream_dict() {
             return Ok(Some((stream, dictionary, terminal_ref)));
         }
@@ -218,8 +212,7 @@ impl<'a, R: Read + Seek> EmbeddedFileStream<'a, R> {
 
     fn resolved_key(&self, dictionary: &ObjectHandle, key: &[u8]) -> Result<ObjectHandle> {
         let key = canonical_dictionary_key(key);
-        let value = dictionary.get_key(&key);
-        self.pdf.borrow_mut().resolve_handle(&value)
+        dictionary.try_get_key(&key)
     }
 
     fn param_value(&self, key: &[u8]) -> Result<ObjectHandle> {
@@ -227,7 +220,7 @@ impl<'a, R: Read + Seek> EmbeddedFileStream<'a, R> {
             return Ok(ObjectHandle::null());
         };
         let params = self.resolved_key(&stream_dict, b"Params")?;
-        if params.as_dictionary().is_none() {
+        if params.try_as_dictionary()?.is_none() {
             return Ok(ObjectHandle::null());
         }
         self.resolved_key(&params, key)
@@ -324,7 +317,7 @@ impl<'a, R: Read + Seek> EmbeddedFileStream<'a, R> {
         let Some((_, stream_dict, _)) = self.resolved_stream()? else {
             return Ok(None);
         };
-        Ok(self.resolved_key(&stream_dict, b"Subtype")?.as_name())
+        self.resolved_key(&stream_dict, b"Subtype")?.try_as_name()
     }
 
     /// Return `/Params /CreationDate` as a raw PDF date byte sequence.
@@ -336,7 +329,9 @@ impl<'a, R: Read + Seek> EmbeddedFileStream<'a, R> {
     ///
     /// Returns `Ok(None)` for all missing/wrong-type cases.
     pub fn creation_date(&self) -> Result<Option<Vec<u8>>> {
-        Ok(self.param_value(b"CreationDate")?.as_string())
+        let value = self.param_value(b"CreationDate")?;
+        value.try_dereference()?;
+        Ok(value.as_string())
     }
 
     /// Return `/Params /ModDate` as a raw PDF date byte sequence.
@@ -345,7 +340,9 @@ impl<'a, R: Read + Seek> EmbeddedFileStream<'a, R> {
     ///
     /// Returns `Ok(None)` for all missing/wrong-type cases.
     pub fn modification_date(&self) -> Result<Option<Vec<u8>>> {
-        Ok(self.param_value(b"ModDate")?.as_string())
+        let value = self.param_value(b"ModDate")?;
+        value.try_dereference()?;
+        Ok(value.as_string())
     }
 
     /// Return `/Params /CheckSum` as raw bytes (typically a 16-byte MD5 hash).
@@ -354,7 +351,9 @@ impl<'a, R: Read + Seek> EmbeddedFileStream<'a, R> {
     ///
     /// Returns `Ok(None)` for all missing/wrong-type cases.
     pub fn checksum(&self) -> Result<Option<Vec<u8>>> {
-        Ok(self.param_value(b"CheckSum")?.as_string())
+        let value = self.param_value(b"CheckSum")?;
+        value.try_dereference()?;
+        Ok(value.as_string())
     }
 
     /// Return `/Params /Size` — the uncompressed file size in bytes.
@@ -363,7 +362,7 @@ impl<'a, R: Read + Seek> EmbeddedFileStream<'a, R> {
     ///
     /// Returns `Ok(None)` for all missing/wrong-type cases.
     pub fn size(&self) -> Result<Option<i64>> {
-        Ok(self.param_value(b"Size")?.as_integer())
+        self.param_value(b"Size")?.try_as_integer()
     }
 
     /// Return `/Params /CreationDate` through qpdf's UTF-8 string view.
@@ -414,18 +413,9 @@ impl<'a, R: Read + Seek> EmbeddedFileStream<'a, R> {
         let Some((_, stream_dict, _stream_ref)) = self.resolved_stream()? else {
             return Ok(());
         };
-        let params = stream_dict.get_key(b"/Params");
-        let (resolved, terminal_ref) = self.pdf.borrow_mut().resolve_handle_ref(&params)?;
-        if resolved.as_dictionary().is_some() {
-            let target = match terminal_ref {
-                Some(object_ref) => {
-                    let mut pdf = self.pdf.borrow_mut();
-                    let target = pdf.get_object_handle(object_ref);
-                    pdf.resolve(&target)?;
-                    target
-                }
-                None => resolved,
-            };
+        let params = stream_dict.try_get_key(b"/Params")?;
+        if params.try_as_dictionary()?.is_some() {
+            let target = params;
             let key = canonical_dictionary_key(key.as_bytes());
             target.replace_key(&key, ObjectHandle::string(value))?;
             return Ok(());

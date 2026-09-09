@@ -102,7 +102,7 @@ fn embedded_files_tree_with_options<R: Read + Seek>(
     };
     // cov:ignore-end
     let catalog = pdf.get_object_handle(catalog_ref);
-    pdf.resolve(&catalog)?;
+    catalog.try_dereference()?;
     if catalog.try_as_dictionary()?.is_none() {
         return Ok(None);
     }
@@ -112,12 +112,14 @@ fn embedded_files_tree_with_options<R: Read + Seek>(
     // move name-tree repair diagnostics before the tree walker sees the
     // malformed child.
     let names_seed = catalog.try_get_key(b"/Names")?;
-    let names = pdf.resolve_handle(&names_seed)?;
+    names_seed.try_dereference()?;
+    let names = names_seed;
     if names.try_as_dictionary()?.is_none() {
         return Ok(None);
     }
     let root_seed = names.try_get_key(b"/EmbeddedFiles")?;
-    let root = pdf.resolve_handle(&root_seed)?;
+    root_seed.try_dereference()?;
+    let root = root_seed;
     if root.try_as_dictionary()?.is_none() {
         return Ok(None);
     }
@@ -150,14 +152,15 @@ impl<'a, R: Read + Seek> EmbeddedFileDocumentHelper<'a, R> {
         };
         // cov:ignore-end
         let catalog = self.pdf.get_object_handle(catalog_ref);
-        self.pdf.resolve(&catalog)?;
+        catalog.try_dereference()?;
         if catalog.try_as_dictionary()?.is_none() {
             return Ok(None);
         }
 
-        let names = if catalog.has_key(b"/Names") {
-            let candidate = catalog.get_key(b"/Names");
-            let names = self.pdf.resolve_handle(&candidate)?;
+        let names = if catalog.try_has_key(b"/Names")? {
+            let candidate = catalog.try_get_key(b"/Names")?;
+            candidate.try_dereference()?;
+            let names = candidate;
             if names.try_as_dictionary()?.is_some() {
                 names
             } else {
