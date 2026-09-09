@@ -6985,19 +6985,17 @@ mod final_handle_tests {
     fn the_space_and_delimiter_sets_match_qpdf() {
         // `QUtil::is_space` (`include/qpdf/QUtil.hh:497-501`) and the
         // tokenizer's `is_delimiter` (`libqpdf/QPDFTokenizer.cc:16-23`).
-        for byte in [b'\t', b'\n', 0x0b, 0x0c, b'\r', b' '] {
+        for byte in *b"\t\n\x0b\x0c\r " {
             assert!(is_pdf_space(byte), "{byte:#04x} is a qpdf space");
             assert!(is_pdf_delimiter(byte), "{byte:#04x} ends a keyword");
         }
         // `parse_xrefEntry` relies on `is_space('\0')` being false to stop at
         // its buffer end (`QPDF.cc:775-782`), but NUL still ends a keyword.
         assert!(!is_pdf_space(0));
-        for byte in [
-            b'/', b'(', b')', b'{', b'}', b'<', b'>', b'[', b']', b'%', 0,
-        ] {
+        for byte in *b"/(){}<>[]%\0" {
             assert!(is_pdf_delimiter(byte), "{byte:#04x} ends a keyword");
         }
-        for byte in [b'a', b'0', b'-', b'+', b'.', b'#'] {
+        for byte in *b"a0-+.#" {
             assert!(!is_pdf_delimiter(byte), "{byte:#04x} continues a keyword");
         }
     }
