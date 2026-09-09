@@ -1515,7 +1515,7 @@ impl<R: Read + Seek> ResolverHandle<R> {
     fn resolve_raw_xref_entry(&self, object_gen: QpdfObjGen, offset: u64) -> Result<()> {
         if offset == 0 {
             self.set_last_qpdf_obj_gen_description(object_gen, None);
-            self.push_warning_at(0, "object has offset 0")?;
+            self.push_warning_at_with_last_object_description(0, "object has offset 0")?;
             return Ok(());
         }
         let attempt_recovery = self.attempt_recovery();
@@ -2022,6 +2022,33 @@ impl<R: Read + Seek> ResolverHandle<R> {
                 QpdfErrorCode::DamagedPdf,
                 core.description.clone(),
                 b"",
+                i64::try_from(offset).unwrap_or(i64::MAX),
+                message.into().into_bytes(),
+            )
+        };
+        self.push_qpdf_warning(warning)
+    }
+
+    /// Append qpdf's `damagedPDF(offset, message)` warning using the current
+    /// `m->last_object_description` state.
+    ///
+    /// Unlike the explicit filename-only [`Self::push_warning_at`] form,
+    /// qpdf's overload without an object argument uses the description most
+    /// recently installed by `readObjectAtOffset`. This is what gives the
+    /// zero-offset warning its `object N G` context while still omitting
+    /// `offset 0` from the rendered location (`QPDF.cc:1561-1574`; qpdf's
+    /// formatter is `QPDFExc.cc:19-49`).
+    fn push_warning_at_with_last_object_description(
+        &self,
+        offset: u64,
+        message: impl Into<String>,
+    ) -> Result<()> {
+        let warning = {
+            let core = self.core.borrow();
+            QpdfExc::new(
+                QpdfErrorCode::DamagedPdf,
+                core.description.clone(),
+                core.last_object_description_bytes.clone(),
                 i64::try_from(offset).unwrap_or(i64::MAX),
                 message.into().into_bytes(),
             )
@@ -4973,7 +5000,8 @@ impl<R: Read + Seek> ResolverHandle<R> {
                 // particular, it must not turn this known sentinel
                 // into a resolution-time xref-recovery trigger.
                 if offset == 0 {
-                    self.push_warning_at(0, "object has offset 0")?;
+                    self.set_last_object_description(object_ref, None)?;
+                    self.push_warning_at_with_last_object_description(0, "object has offset 0")?;
                     handle.set_resolved(ObjectValue::Null);
                     return Ok(());
                 }
@@ -14035,6 +14063,17 @@ mod tests {
                     && diagnostic.message_string() == "object has offset 0"
             }),
             "offset-zero resolution must emit qpdf's warning"
+        );
+        let diagnostics = pdf.repair_diagnostics();
+        let warning = diagnostics
+            .entries()
+            .iter()
+            .find(|diagnostic| diagnostic.message_string() == "object has offset 0")
+            .expect("the offset-zero warning must be retained");
+        assert_eq!(
+            warning.get_object(),
+            b"object 1 0",
+            "qpdf's damagedPDF(offset, message) keeps the requested object context"
         );
     }
 
