@@ -37,6 +37,26 @@ mod common;
 use common::PdfCanonicalTestExt;
 use common::{first_widget_ref, page_annotation_handles};
 
+const EXPECTED_QPDF_VERSION: &str = "qpdf version 11.9.0";
+
+/// `true` when the pinned qpdf oracle is runnable, mirroring the optional
+/// oracle gate the other differential suites use. The version is pinned
+/// because a differential assertion against a different qpdf is not a parity
+/// result.
+fn qpdf_available() -> bool {
+    ProcessCommand::new("qpdf")
+        .arg("--version")
+        .output()
+        .map(|output| {
+            output.status.success()
+                && String::from_utf8_lossy(&output.stdout)
+                    .lines()
+                    .next()
+                    .is_some_and(|line| line.trim() == EXPECTED_QPDF_VERSION)
+        })
+        .unwrap_or(false)
+}
+
 // ── Fixture helpers ───────────────────────────────────────────────────────────
 
 /// Build a minimal PDF from a flat list of object bodies (1-indexed from 1).
@@ -391,6 +411,13 @@ fn top_level_generate_appearances_routes_to_canonical_writer() {
 /// accept and discard the flag.
 #[test]
 fn top_level_generate_appearances_runs_before_show_object_like_qpdf() {
+    if !qpdf_available() {
+        if std::env::var_os("CI").is_some() {
+            panic!("{EXPECTED_QPDF_VERSION} is required for this parity test on CI");
+        }
+        eprintln!("skipping: {EXPECTED_QPDF_VERSION} is not available");
+        return;
+    }
     let temp = tempfile::tempdir().unwrap();
     let input = temp.path().join("inspection-tx.pdf");
     std::fs::write(&input, tx_widget_without_ap_needing_appearances()).unwrap();

@@ -6400,6 +6400,13 @@ fn top_level_generate_appearances_accepts_check_like_qpdf() {
 /// never looks at `generate_appearances`, so qpdf accepts the pair.
 #[test]
 fn top_level_generate_appearances_accepts_check_linearization_like_qpdf() {
+    if !qpdf_available() {
+        if std::env::var_os("CI").is_some() {
+            panic!("{EXPECTED_QPDF_VERSION} is required for this parity test on CI");
+        }
+        eprintln!("skipping: {EXPECTED_QPDF_VERSION} is not available");
+        return;
+    }
     let input = "../../tests/fixtures/compat/form-fields-and-annotations.pdf";
     let args = ["--generate-appearances", "--check-linearization", input];
     let qpdf = ProcessCommand::new("qpdf")
@@ -6421,6 +6428,13 @@ fn top_level_generate_appearances_accepts_check_linearization_like_qpdf() {
 /// disqualify a transformation either.
 #[test]
 fn top_level_generate_appearances_accepts_empty_input_like_qpdf() {
+    if !qpdf_available() {
+        if std::env::var_os("CI").is_some() {
+            panic!("{EXPECTED_QPDF_VERSION} is required for this parity test on CI");
+        }
+        eprintln!("skipping: {EXPECTED_QPDF_VERSION} is not available");
+        return;
+    }
     let args = ["--empty", "--show-npages", "--generate-appearances"];
     let qpdf = ProcessCommand::new("qpdf")
         .args(args)
