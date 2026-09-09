@@ -713,6 +713,7 @@ impl std::error::Error for CliPathError {
 #[derive(Debug, Parser)]
 #[command(name = "flpdf")]
 #[command(about = "Pure Rust qpdf-style PDF tool")]
+#[command(args_override_self = true)]
 // Top-level option flags (--json, --check, --linearize, …) are mutually
 // exclusive with subcommands. Without this, `flpdf --json rewrite in out`
 // would parse as the rewrite subcommand while silently keeping --json,
