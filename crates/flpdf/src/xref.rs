@@ -340,9 +340,13 @@ impl XrefRegistration {
         if self.deleted_objects.contains(&object_number) {
             return;
         }
-        if self.raw_entries.insert(key, entry).is_some() {
-            return;
-        }
+        // qpdf uses `try_emplace` and returns when the row already exists
+        // (`QPDF.cc:1164-1168`), so the first section read wins the value as
+        // well as the key.
+        match self.raw_entries.entry(key) {
+            std::collections::btree_map::Entry::Occupied(_) => return,
+            std::collections::btree_map::Entry::Vacant(slot) => slot.insert(entry),
+        };
         if let Some(object_ref) = key.to_object_ref() {
             self.entries.entry(object_ref).or_insert(entry);
         }
@@ -361,6 +365,16 @@ impl XrefRegistration {
         if !self.raw_entries.contains_key(&key) {
             self.deleted_objects.insert(object_number);
         }
+    }
+
+    /// The highest object number in the raw table, which is what qpdf's
+    /// `/Size` check reads (`QPDF.cc:691-693`).
+    fn highest_raw_object_number(&self) -> i64 {
+        self.raw_entries
+            .keys()
+            .map(|key| i64::from(key.get_obj()))
+            .max()
+            .unwrap_or(0)
     }
 
     fn contains_raw_key(&self, key: QpdfObjGen) -> bool {
@@ -2186,7 +2200,7 @@ pub(crate) fn load_xref_state_from_bytes(
         }
         append_xref_size_warning_for(
             recovered_size.as_ref(),
-            &recovered.loaded.entries,
+            highest_object_number(recovered.loaded.entries.keys().map(|key| key.number)),
             &BTreeSet::new(),
             &options.description,
             &mut recovered.loaded.repair_diagnostics,
@@ -2205,7 +2219,7 @@ pub(crate) fn load_xref_state_from_bytes(
 
     append_xref_size_warning_for(
         resolved_size.as_ref(),
-        &loaded.loaded.entries,
+        registration.highest_raw_object_number(),
         &registration.deleted_objects,
         &options.description,
         &mut loaded.loaded.repair_diagnostics,
@@ -3068,9 +3082,16 @@ fn collect_trailer_references(trailer: &ObjectHandle) -> BTreeSet<ObjectRef> {
     references
 }
 
+/// `max_live` is the highest object number in qpdf's **raw** `m->xref_table`
+/// (`QPDF.cc:691-693` reads `rbegin()->first.getObj()`), so a live row whose
+/// generation cannot cross the valid `ObjectRef` boundary still counts here.
+fn highest_object_number(numbers: impl Iterator<Item = u32>) -> i64 {
+    numbers.map(i64::from).max().unwrap_or(0)
+}
+
 fn append_xref_size_warning_for(
     size: Option<&ObjectHandle>,
-    entries: &BTreeMap<ObjectRef, XrefEntry>,
+    max_live: i64,
     deleted_objects: &BTreeSet<u32>,
     filename: &[u8],
     repair_diagnostics: &mut Diagnostics,
@@ -3078,15 +3099,10 @@ fn append_xref_size_warning_for(
     let Some(size) = size.and_then(|value| value.try_as_integer().ok().flatten()) else {
         return;
     };
-    let max_live = entries
-        .keys()
-        .map(|object_ref| object_ref.number)
-        .max()
-        .unwrap_or(0);
-    let max_deleted = deleted_objects.iter().copied().max().unwrap_or(0);
+    let max_deleted = i64::from(deleted_objects.iter().copied().max().unwrap_or(0));
     let max_object = max_live.max(max_deleted);
 
-    if size < 1 || size - 1 != i64::from(max_object) {
+    if size < 1 || size - 1 != max_object {
         repair_diagnostics.push(damaged_warning(
             filename,
             b"",
@@ -3679,7 +3695,7 @@ fn recover_trailer_from_xref_stream_candidate(
     };
     append_xref_size_warning_for(
         resolved_size.as_ref(),
-        entries,
+        highest_object_number(entries.keys().map(|key| key.number)),
         &deleted_objects,
         &options.description,
         repair_diagnostics,
