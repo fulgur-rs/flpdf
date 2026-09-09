@@ -9,6 +9,37 @@ on:
 permissions:
   contents: read
 
+# Collapse superseded runs for one pull request.  Restacking a stacked-PR
+# chain force-pushes every branch in it, so without this a single rebase
+# leaves several full runs racing per branch -- 8 jobs each (quality, 4 test
+# cells, release, coverage, fuzz) against this account's 20-job concurrency
+# allowance, which starves the survivors into a long queue.
+#
+# Only pull_request runs share a key.  A push keys on its own commit, so main
+# never contends with itself: runs in a group are handled in an arbitrary
+# order
+# (https://docs.github.com/en/actions/how-tos/write-workflows/choose-when-workflows-run/control-workflow-concurrency),
+# so putting two merge commits in one group could leave the older one as the
+# survivor and the tip untested.  Merges are serial here, so nothing is
+# gained by collapsing them anyway.
+#
+# A re-run also stays out: it keeps the original run's ref and SHA
+# (https://docs.github.com/en/actions/how-tos/manage-workflow-runs/re-run-workflows-and-jobs),
+# and queueing into a group cancels whatever is *pending* there as well --
+# which `cancel-in-progress` does not govern -- so a stale re-run could
+# displace the run testing the tip.  Keying every attempt after the first to
+# its own run id leaves a re-run able to supersede only earlier attempts of
+# the same run.
+#
+# What remains is a pull request whose own runs are collapsed in an
+# unspecified order.  That cannot report a stale result as a fresh one: a
+# check run belongs to the commit it ran for, so a cancelled newer run leaves
+# its commit without a conclusion rather than inheriting the older one, and
+# the `main` ruleset requires only `release-pr-approval`.
+concurrency:
+  group: ${{ github.workflow }}-${{ github.event.pull_request.number || github.sha }}-${{ github.run_attempt == 1 && 'tip' || github.run_id }}
+  cancel-in-progress: true
+
 env:
   CARGO_TERM_COLOR: always
   RUST_BACKTRACE: 1
