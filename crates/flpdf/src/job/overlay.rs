@@ -937,6 +937,10 @@ mod byte_gate {
         PageRange::parse(input).unwrap_or_else(|e| panic!("parse {input:?}: {e}"))
     }
 
+    // cov:ignore-start: every line but the equal-inputs early return belongs to
+    // the mismatch report, which only runs when a gate fails — a red build
+    // rather than a covered line. llvm-cov attributes the `if a == b` guard to
+    // the same region as the walk below it, so the whole function is excluded.
     fn first_diff(a: &[u8], b: &[u8]) -> Option<usize> {
         if a == b {
             return None;
@@ -944,12 +948,15 @@ mod byte_gate {
         let common = a.len().min(b.len());
         (0..common).find(|&i| a[i] != b[i]).or(Some(common))
     }
+    // cov:ignore-end
 
     /// Assert `actual` is byte-identical to the golden named `golden_name`,
     /// reporting the first diff offset and surrounding bytes on mismatch.
     fn assert_byte_identical(actual: &[u8], golden_name: &str) {
         let expected = golden(golden_name);
         if let Some(off) = first_diff(actual, &expected) {
+            // cov:ignore-start: the mismatch report only runs when a gate
+            // fails, which is a red build rather than a covered line.
             let lo = off.saturating_sub(24);
             let g = expected.get(off).copied().unwrap_or(0);
             let f = actual.get(off).copied().unwrap_or(0);
@@ -963,6 +970,7 @@ mod byte_gate {
                 String::from_utf8_lossy(&expected[lo..(off + 24).min(expected.len())]),
                 String::from_utf8_lossy(&actual[lo..(off + 24).min(actual.len())]),
             );
+            // cov:ignore-end
         }
     }
 
