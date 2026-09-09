@@ -91,20 +91,23 @@ pub(crate) fn write_json_v1_objectinfo_key<R: Read + Seek>(
         }
 
         let resolved = handle.clone();
-        pdf.resolve(&resolved).map_err(ConvertError::from)?;
-        let (is_stream, filter, length) = if let Some(stream_dict) = resolved
-            .as_stream_dict()
-            .and_then(|dict| dict.as_dictionary())
-        {
-            let filter = stream_dict
-                .get(b"/Filter".as_slice())
-                .cloned()
-                .unwrap_or_else(ObjectHandle::null);
-            let length = stream_dict
-                .get(b"/Length".as_slice())
-                .cloned()
-                .unwrap_or_else(ObjectHandle::null);
-            (true, filter, length)
+        resolved.try_dereference().map_err(ConvertError::from)?;
+        let (is_stream, filter, length) = if let Some(stream_dict) = resolved.as_stream_dict() {
+            if stream_dict
+                .try_as_dictionary()
+                .map_err(ConvertError::from)?
+                .is_some()
+            {
+                let filter = stream_dict
+                    .try_get_key(b"/Filter")
+                    .map_err(ConvertError::from)?;
+                let length = stream_dict
+                    .try_get_key(b"/Length")
+                    .map_err(ConvertError::from)?;
+                (true, filter, length)
+            } else {
+                (false, ObjectHandle::null(), ObjectHandle::null()) // cov:ignore: qpdf stream values always carry a dictionary
+            }
         } else {
             (false, ObjectHandle::null(), ObjectHandle::null())
         };
@@ -265,7 +268,6 @@ pub fn write_json_key<R: Read + Seek>(
         }
         let result = match stream_mode {
             StreamDataMode::None => write_non_file_mode_object_entry(
-                pdf,
                 &handle,
                 decode_level,
                 QpdfStreamJsonData::None,
@@ -273,21 +275,15 @@ pub fn write_json_key<R: Read + Seek>(
                 &mut objects_first,
             ),
             StreamDataMode::Inline => write_non_file_mode_object_entry(
-                pdf,
                 &handle,
                 decode_level,
                 QpdfStreamJsonData::Inline,
                 out,
                 &mut objects_first,
             ),
-            StreamDataMode::File { prefix } => write_file_mode_object_entry(
-                pdf,
-                &handle,
-                decode_level,
-                prefix,
-                out,
-                &mut objects_first,
-            ),
+            StreamDataMode::File { prefix } => {
+                write_file_mode_object_entry(&handle, decode_level, prefix, out, &mut objects_first)
+            }
         };
         result?;
     }
@@ -341,8 +337,7 @@ fn stream_decode_level(level: DecodeLevel) -> crate::writer::DecodeLevel {
     }
 }
 
-fn write_non_file_mode_object_entry<R: Read + Seek>(
-    pdf: &mut Pdf<R>,
+fn write_non_file_mode_object_entry(
     handle: &ObjectHandle,
     decode_level: DecodeLevel,
     stream_mode: QpdfStreamJsonData,
@@ -357,7 +352,8 @@ fn write_non_file_mode_object_entry<R: Read + Seek>(
     // Resolve the canonical object before dispatching by value. The object-map
     // entry itself remains keyed by its original indirect identity, while the
     // resolved handle supplies the live dictionary or stream value.
-    let handle = pdf.resolve_handle(handle).map_err(ConvertError::from)?;
+    let handle = handle.clone();
+    handle.try_dereference().map_err(ConvertError::from)?;
     if handle.type_code().map_err(ConvertError::from)? == 10 {
         // The former split consumer resolved and converted the complete
         // stream value before it wrote the object key. Keep that established
@@ -390,8 +386,7 @@ fn write_non_file_mode_object_entry<R: Read + Seek>(
     Ok(())
 }
 
-fn write_file_mode_object_entry<R: Read + Seek>(
-    pdf: &mut Pdf<R>,
+fn write_file_mode_object_entry(
     handle: &ObjectHandle,
     decode_level: DecodeLevel,
     prefix: &[u8],
@@ -405,7 +400,8 @@ fn write_file_mode_object_entry<R: Read + Seek>(
 
     // Resolve the canonical object before dispatching by value, keeping the
     // original indirect identity for the JSON object key.
-    let handle = pdf.resolve_handle(handle).map_err(ConvertError::from)?;
+    let handle = handle.clone();
+    handle.try_dereference().map_err(ConvertError::from)?;
     if handle.type_code().map_err(ConvertError::from)? == 10 {
         Json::write_dictionary_key(out, objects_first, key.as_bytes(), 3)?;
         let mut object_first = true;

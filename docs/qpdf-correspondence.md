@@ -1588,6 +1588,27 @@ error instead of falling through to a fallback.
 initialized handleのresolver errorは変更しない。既存のA6/A7 consumer移行、
 canonical owner、qtest exceptionsは対象外である。
 
+### A6/A7/A8 Job/page/resource/JSON consumer slice `flpdf-3yn9.48.23.8` (2026-09-10)
+
+The remaining production consumers in the Job page-selection, page-tree,
+resource-pruning, overlay-appearance, and document-JSON modules now use the
+canonical resolving ObjectHandle accessors. This matches qpdf's
+`QPDFObjectHandle` entry resolution (`libqpdf/QPDFObjectHandle.cc:240-446,
+759-785,965-989`) and its warning/error boundary (`:2168-2189`) without adding
+a consumer-local resolver facade. Job/page ordering and resource ownership stay
+anchored to `QPDFJob.cc:2251-2632`, `QPDF_pages.cc:39-150`, and
+`QPDFPageObjectHelper.cc:224-263,318-399,486-649`; JSON object identity and
+section ordering stay anchored to `QPDFJob.cc:958-1620,3094-3116` and
+`QPDF_json.cc:852-905`.
+
+The production route contract is zero for `Pdf::resolve`, `resolve_handle`,
+`resolve_handle_ref`, non-resolving key accessors, and non-resolving dictionary,
+array, integer, name, and null inspection across the eight scoped files.
+`as_stream_dict` and the silent post-resolution string/real type observations
+remain only where no resolving Rust counterpart exists. The focused route test
+and `pages` unresolved-child regression cover caller-zero and `Result`
+propagation. qtest and qtest-exceptions routes are not part of this row.
+
 ### `qpdfjob-c` wrapper のエラー境界
 
 qpdf の `wrap_qpdfjob`（`libqpdf/qpdfjob-c.cc:32-40`）は、

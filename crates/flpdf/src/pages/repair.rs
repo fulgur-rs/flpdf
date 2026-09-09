@@ -84,13 +84,14 @@ fn prepare_for_optimization_canonical<R: Read + Seek>(
     pdf.mark_get_all_pages_called();
 
     let root_candidate = pdf.trailer_key_handle(b"Root");
-    if root_candidate.is_null() {
+    if root_candidate.try_is_null()? {
         return Ok(None);
     }
-    let catalog = pdf.resolve_handle(&root_candidate)?;
-    if catalog.try_as_dictionary()?.is_none() {
+    root_candidate.try_dereference()?;
+    if root_candidate.try_as_dictionary()?.is_none() {
         return Ok(None);
     }
+    let catalog = root_candidate;
     let mut pages = catalog.try_get_key(b"/Pages")?;
 
     // qpdf corrects a catalog that points into the tree by following
@@ -127,7 +128,7 @@ fn prepare_for_optimization_canonical<R: Read + Seek>(
             break;
         }
         let parent = pages.try_get_key(b"/Parent")?;
-        if parent.is_null() {
+        if parent.try_is_null()? {
             break; // cov:ignore: qpdf-compatible try_has_key hides direct and indirect null values first
         }
         if !warned {

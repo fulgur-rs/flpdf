@@ -422,8 +422,9 @@ fn replace_merged_fields<T: Read + Seek>(
         return Ok(());
     };
     let root = merged.get_object_handle(root_ref);
-    let acroform = merged.resolve_handle(&root.try_get_key(b"/AcroForm")?)?;
-    let Some(_) = acroform.as_dictionary() else {
+    let acroform = root.try_get_key(b"/AcroForm")?;
+    acroform.try_dereference()?;
+    let Some(_) = acroform.try_as_dictionary()? else {
         return Ok(());
     };
     if fields.is_empty() {
@@ -446,11 +447,13 @@ fn clear_grouped_foreign_fields_for_replay<T: Read + Seek>(merged: &mut Pdf<T>) 
         return Ok(());
     };
     let root = merged.get_object_handle(root_ref);
-    let acroform = merged.resolve_handle(&root.try_get_key(b"/AcroForm")?)?;
+    let acroform = root.try_get_key(b"/AcroForm")?;
+    acroform.try_dereference()?;
     if acroform.try_as_dictionary()?.is_none() {
         return Ok(());
     }
-    let fields = merged.resolve_handle(&acroform.try_get_key(b"/Fields")?)?;
+    let fields = acroform.try_get_key(b"/Fields")?;
+    fields.try_dereference()?;
     if fields.try_as_array()?.is_none() {
         return Ok(());
     }
