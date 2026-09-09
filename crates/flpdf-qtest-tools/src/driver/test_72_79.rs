@@ -814,7 +814,6 @@ pub(crate) fn run_test_79<R: Read + Seek>(
         copies.append_array_item(copy)?;
     }
 
-    pdf.mark_object_handle_dirty(&trailer)?;
     let mut writer = PdfWriter::new(pdf);
     writer.set_output_file("a.pdf")?;
     writer.set_static_id(true);

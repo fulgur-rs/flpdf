@@ -168,9 +168,9 @@ struct ResolvedArray {
 }
 
 impl ResolvedArray {
-    fn store<R: Read + Seek>(&self, pdf: &mut Pdf<R>) -> Result<()> {
+    fn store<R: Read + Seek>(&self, _pdf: &mut Pdf<R>) -> Result<()> {
         self.handle.set_array_items(self.values.clone())?;
-        pdf.mark_object_handle_dirty(&self.handle)
+        Ok(())
     }
 }
 
@@ -287,10 +287,6 @@ impl LiveDictionary {
     fn contains(&self, key: &str) -> Result<bool> {
         let key = self.actual_key(key);
         self.handle.try_has_key(&key)
-    }
-
-    fn mark_dirty<R: Read + Seek>(&self, pdf: &mut Pdf<R>) -> Result<()> {
-        pdf.mark_object_handle_dirty(&self.handle)
     }
 }
 
@@ -1476,7 +1472,6 @@ impl<K: TreeKey> NNTree<K> {
         if let Some(items) = replacement.get(K::ITEMS_KEY)? {
             current.insert(K::ITEMS_KEY, items)?;
         }
-        current.mark_dirty(pdf)?;
         Ok(())
     }
 
@@ -1529,8 +1524,6 @@ impl<K: TreeKey> NNTree<K> {
             root.remove("Limits");
             root.remove(K::ITEMS_KEY);
             root.insert("Kids", ObjectHandle::array(vec![first_handle.handle()]))?; // cov:ignore: split allocates the replacement node in this same PDF
-            root.mark_dirty(pdf)?;
-
             if is_leaf {
                 cursor.leaf = Some(first_handle.clone());
             } else if let Some(first_path) = cursor.path.first_mut() {
@@ -1632,7 +1625,6 @@ impl<K: TreeKey> NNTree<K> {
             let dictionary = self.load_node(pdf, &node)?;
             let Some(index) = parent_index else {
                 dictionary.remove("Limits");
-                dictionary.mark_dirty(pdf)?;
                 return Ok(());
             };
 
@@ -1666,7 +1658,6 @@ impl<K: TreeKey> NNTree<K> {
                         false
                     } else {
                         dictionary.insert("Limits", ObjectHandle::array(vec![first, last]))?;
-                        dictionary.mark_dirty(pdf)?;
                         true
                     }
                 }
@@ -1784,7 +1775,6 @@ impl<K: TreeKey> NNTree<K> {
                 let root = self.load_node(pdf, &parent_handle)?;
                 root.remove("Kids");
                 root.insert(K::ITEMS_KEY, ObjectHandle::array(Vec::new()))?;
-                root.mark_dirty(pdf)?;
                 cursor.path.clear();
                 cursor.clear_position();
                 return Ok(());

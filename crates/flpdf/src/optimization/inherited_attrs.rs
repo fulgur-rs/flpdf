@@ -192,9 +192,6 @@ fn push_node_attributes<R: Read + Seek>(
         key_ancestors.entry(key).or_default().push(value);
         own_keys.push(key);
     }
-    if !own_keys.is_empty() {
-        pdf.mark_object_handle_dirty(dict)?;
-    }
     Ok(own_keys)
 }
 
@@ -250,7 +247,6 @@ fn push_child_reference<R: Read + Seek>(
         if !present {
             if let Some(value) = values.last() {
                 child.replace_key(key, value.clone())?;
-                pdf.mark_object_handle_dirty(&child)?;
             }
         }
     }

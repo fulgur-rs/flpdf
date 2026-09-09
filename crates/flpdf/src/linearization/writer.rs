@@ -3042,7 +3042,7 @@ pub(crate) fn write_linearized_for_pdf_writer<R: Read + Seek>(
     // output-only ADBE mutation. PdfWriter::write performs qpdf's permanent
     // prepareFileForWrite boundary before choosing this route, so restoration
     // cannot undo graph preparation.
-    let mut catalog_snapshot = crate::writer::snapshot_catalog_extensions(pdf)?;
+    let catalog_snapshot = crate::writer::snapshot_catalog_extensions(pdf)?;
 
     let plan_result = (|| {
         let mode = if crate::writer::force_version_below_1_5(options) {
@@ -3074,16 +3074,6 @@ pub(crate) fn write_linearized_for_pdf_writer<R: Read + Seek>(
         let renumber = RenumberMap::from_plan(&plan);
         Ok((plan, renumber))
     })();
-
-    // Refresh the dirty baseline exactly once, right after planning/setup
-    // above finishes, whether it succeeded or failed partway through (for
-    // example a malformed page tree discovered after `LinearizationPlan`
-    // has already run `Optimization::prepare_pdf`, which can make a direct
-    // `/Outlines` indirect). This is strictly before `write_linearized_impl`
-    // below, whose own output-only mutations (such as injecting a fresh
-    // `/Extensions /ADBE`) must NOT be folded into the baseline, since
-    // `restore_catalog_extensions` exists specifically to undo those.
-    crate::writer::record_catalog_snapshot_dirty_baseline(pdf, &mut catalog_snapshot);
 
     let result = plan_result.and_then(|(plan, renumber)| {
         write_linearized_impl(&plan, &renumber, pdf, options, pass1_path, setup)
@@ -4419,15 +4409,13 @@ mod tests {
     }
 
     #[test]
-    fn linearized_writer_keeps_catalog_dirty_after_canonical_planning_mutation_and_progress_failure(
-    ) {
+    fn linearized_writer_keeps_catalog_planning_mutation_after_progress_failure() {
         // The canonical optimization pass promotes direct /Outlines before
         // writing. A later qpdf progress-reporter failure must not let
         // restoration clear that permanent change.
         let mut pdf =
             Pdf::open(Cursor::new(one_page_pdf_with_direct_outlines())).expect("source parses");
         let root_ref = pdf.root_ref().expect("Catalog present");
-        assert!(!pdf.is_dirty(root_ref), "fresh source must start clean");
 
         let options = WriterOptions {
             progress_reporter: Some(ProgressReporter::new(Box::new(|_| {
@@ -4450,10 +4438,6 @@ mod tests {
                 .expect("Outlines lookup")
                 .is_indirect(),
             "planning must keep qpdf's direct /Outlines promotion"
-        );
-        assert!(
-            pdf.is_dirty(root_ref),
-            "a permanent planning mutation must keep the Catalog dirty after failure"
         );
     }
 }

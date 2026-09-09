@@ -151,14 +151,12 @@ fn remap_or_drop_annot_p<R: Read + Seek>(
         Some(&new) => {
             if new != page_ref {
                 annot.replace_key(b"/P", pdf.get_object_handle(new))?;
-                pdf.mark_object_handle_dirty(annot)?;
                 return Ok(true);
             }
             Ok(false)
         }
         None => {
             annot.remove_key(b"/P");
-            pdf.mark_object_handle_dirty(annot)?;
             Ok(true)
         }
     }

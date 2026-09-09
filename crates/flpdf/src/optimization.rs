@@ -138,7 +138,6 @@ impl Optimization {
                 // (libqpdf/QPDF_optimization.cc:73-77).
                 let outlines = pdf.make_indirect_from_object_handle(outlines)?;
                 root.replace_key(b"/Outlines", outlines)?;
-                pdf.mark_object_handle_dirty(&root)?;
             }
         }
 

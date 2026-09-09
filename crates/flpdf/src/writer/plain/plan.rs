@@ -1217,7 +1217,6 @@ mod tests {
                     .add_token_filter(Rc::new(RefCell::new(PassThroughTokenFilter)))
                     .unwrap();
             }
-            pdf.mark_object_handle_dirty(&page).unwrap();
 
             let plan =
                 PlainWritePlan::build(&mut pdf, &write_options(ObjectStreamMode::Disable)).unwrap();

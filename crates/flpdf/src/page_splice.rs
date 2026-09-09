@@ -147,7 +147,6 @@ fn pages_ref<R: Read + Seek>(pdf: &mut Pdf<R>) -> Result<ObjectRef> {
         .object_ref()
         .ok_or_else(|| Error::Internal("direct /Pages promotion lost its identity".to_owned()))?;
     catalog.replace_key(b"/Pages", indirect)?;
-    pdf.mark_object_dirty(catalog_ref);
     Ok(pages_ref)
 }
 
@@ -238,7 +237,6 @@ fn collect_page_refs<R: Read + Seek>(
     if !has_kids {
         if node_type.try_as_name()?.as_deref() != Some(b"Page") {
             node.replace_key(b"/Type", ObjectHandle::name(b"Page".to_vec()))?;
-            pdf.mark_object_handle_dirty(&node)?;
         }
         let page_ref = node
             .object_ref()
@@ -248,7 +246,6 @@ fn collect_page_refs<R: Read + Seek>(
     }
     if node_type.try_as_name()?.as_deref() != Some(b"Pages") {
         node.replace_key(b"/Type", ObjectHandle::name(b"Pages".to_vec()))?;
-        pdf.mark_object_handle_dirty(&node)?;
     }
     if !visited.insert(node.identity_key()) {
         return Err(crate::pages::repair::page_tree_cycle_error(pdf));
@@ -271,7 +268,6 @@ fn collect_page_refs<R: Read + Seek>(
                 .as_ref()
                 .expect("array handle exists when promoting a direct child");
             kids_handle.set_array_item(index, indirect.clone())?;
-            pdf.mark_object_handle_dirty(kids_handle)?;
             child = indirect;
         }
 
@@ -288,7 +284,6 @@ fn collect_page_refs<R: Read + Seek>(
                     .as_ref()
                     .expect("array handle exists when copying a duplicate page");
                 kids_handle.set_array_item(index, indirect.clone())?;
-                pdf.mark_object_handle_dirty(kids_handle)?;
                 child = indirect;
             }
         }
@@ -308,10 +303,6 @@ fn collect_page_refs<R: Read + Seek>(
         })?;
         // cov:ignore-end
     }
-    if let Some(kids_handle) = kids_handle {
-        pdf.mark_object_handle_dirty(&kids_handle)?;
-    }
-
     let count_value = node.try_get_key(b"/Count")?;
     let declared_count = match count_value.try_as_integer()? {
         Some(n) if n >= 0 => n as usize,
@@ -427,7 +418,6 @@ fn set_page_parent_for_node<R: Read + Seek>(
     }
     if let Some(parent_ref) = parent.object_ref() {
         page.replace_key(b"/Parent", pdf.get_object_handle(parent_ref))?;
-        pdf.mark_object_dirty(page_ref);
     }
     Ok(())
 }
@@ -583,11 +573,9 @@ fn splice_subtree<R: Read + Seek>(
     node.replace_key(b"/Count", ObjectHandle::integer(new_count))?;
     if let Some(kids_handle) = kids_handle {
         kids_handle.set_array_items(new_kids)?;
-        pdf.mark_object_handle_dirty(&kids_handle)?;
     } else {
         node.replace_key(b"/Kids", ObjectHandle::array(new_kids))?;
     } // cov:ignore: all array children come from this Pdf, so ownership failure is invariant-impossible
-    pdf.mark_object_handle_dirty(&node)?;
 
     Ok(net_delta)
 }
@@ -1218,14 +1206,10 @@ mod tests {
     }
 
     #[test]
-    fn direct_kid_promotion_is_dirty_before_later_preflight_error() {
+    fn direct_kid_promotion_remains_visible_after_later_preflight_error() {
         let mut pdf = open(build_pages_with_direct_kid_before_invalid_kid_pdf());
         let err = splice_pages(&mut pdf, 0..1, &[]).unwrap_err();
         assert!(matches!(err, Error::Unsupported(_)), "got {err:?}");
-        assert!(
-            pdf.is_dirty(ObjectRef::new(2, 0)),
-            "the live /Kids owner must stay dirty after partial preflight mutation"
-        );
 
         let output = crate::writer::write_qpdf_to_memory(&mut pdf, |_| {}).unwrap();
         let mut round_trip = open(output);

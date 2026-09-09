@@ -141,20 +141,15 @@ fn promote_inherited_value<R: Read + Seek>(
         return Ok(value);
     }
     // Promotion changes how every containing indirect dictionary serializes
-    // this shared value. Capture and dirty those owners while the value is
-    // still direct; after promotion mark the newly allocated object itself,
-    // matching the qpdf-native page-repair helper.
-    if value.belongs_to_pdf(pdf.unique_id) {
-        pdf.mark_object_handle_dirty(&value)?;
-    }
+    // this shared value. Keep the same live allocation through the canonical
+    // qpdf-style promotion helper.
     let indirect = pdf.make_indirect_from_object_handle(value)?;
-    pdf.mark_object_handle_dirty(&indirect)?;
     Ok(indirect)
 }
 
 /// Replace a missing/null leaf key with the live inherited handle.
 fn install_inherited_value<R: Read + Seek>(
-    pdf: &mut Pdf<R>,
+    _pdf: &mut Pdf<R>,
     page: &ObjectHandle,
     key: &[u8],
     value: Option<&ObjectHandle>,
@@ -166,7 +161,7 @@ fn install_inherited_value<R: Read + Seek>(
         return Ok(());
     };
     page.replace_key(key, value.clone())?;
-    pdf.mark_object_handle_dirty(page)
+    Ok(())
 }
 
 /// Resolve and prepare an inherited value only when the page has no visible
@@ -344,7 +339,6 @@ fn remove_inheritable_keys_from_page_tree<R: Read + Seek>(
         for key in inheritable_keys {
             node.remove_key(key);
         }
-        pdf.mark_object_handle_dirty(node)?;
     }
     Ok(())
 }
@@ -506,9 +500,7 @@ fn rebuild_page_tree_canonical<R: Read + Seek>(
             // live page and allocate only the page dictionary. Indirect child
             // handles (`/Contents`, `/Resources`, ...) remain shared.
             let copy = page.shallow_copy()?;
-            let promoted = pdf.make_indirect_from_object_handle(copy)?;
-            pdf.mark_object_handle_dirty(&promoted)?;
-            promoted
+            pdf.make_indirect_from_object_handle(copy)?
         };
         let target_ref = target
             .object_ref()
@@ -550,14 +542,12 @@ fn rebuild_page_tree_canonical<R: Read + Seek>(
     // subject to that same cleanup.
     remove_inheritable_keys_from_page_tree(pdf, &page_tree_nodes)?;
     root.remove_key(b"/Parent");
-    pdf.mark_object_handle_dirty(&root)?;
 
     // Reparent every retained page through the same live root handle. This is
     // qpdf's `flattenPagesTree` `replaceKey("/Parent", pages)` operation, and
     // direct roots therefore retain one shared direct-dictionary identity.
     for leaf in pending_leaves {
         leaf.replace_key(b"/Parent", root.clone())?;
-        pdf.mark_object_handle_dirty(&leaf)?;
     }
 
     // A removed page is an original leaf that no selection kept (absent from
@@ -943,8 +933,6 @@ mod tests {
         catalog
             .replace_key(b"/Pages", direct_root)
             .expect("catalog /Pages replacement");
-        pdf.mark_object_handle_dirty(&catalog)
-            .expect("catalog mutation must be dirty");
 
         let result =
             rebuild_page_tree(&mut pdf, &[ObjectRef::new(4, 0), ObjectRef::new(4, 0)]).unwrap();
@@ -1026,8 +1014,6 @@ mod tests {
                 (b"/Parent".to_vec(), pages.clone()),
             ]))
             .expect("page object allocation");
-        pdf.mark_object_handle_dirty(&page)
-            .expect("page allocation must be dirty");
         let page_ref = page.object_ref().expect("page object reference");
 
         catalog
@@ -1042,10 +1028,6 @@ mod tests {
         pages
             .replace_key(b"/Count", ObjectHandle::integer(1))
             .expect("Pages count insertion");
-        pdf.mark_object_handle_dirty(&catalog)
-            .expect("Catalog mutation must be dirty");
-        pdf.mark_object_handle_dirty(&pages)
-            .expect("Pages mutation must be dirty");
 
         rebuild_page_tree(&mut pdf, &[page_ref]).expect("page-selection rebuild");
 
@@ -1138,7 +1120,6 @@ mod tests {
             .unwrap();
         root.replace_key(b"/Rotate", ObjectHandle::integer(180))
             .unwrap();
-        pdf.mark_object_handle_dirty(&root).unwrap();
 
         rebuild_page_tree(&mut pdf, &[ObjectRef::new(6, 0)])
             .expect("flat page rebuild must succeed");
@@ -1210,13 +1191,11 @@ mod tests {
         let root = handle_of(&mut pdf, ObjectRef::new(2, 0));
         root.replace_key(b"/UserUnit", ObjectHandle::integer(1))
             .unwrap();
-        pdf.mark_object_handle_dirty(&root).unwrap();
 
         let intermediate = handle_of(&mut pdf, ObjectRef::new(3, 0));
         intermediate
             .replace_key(b"/UserUnit", ObjectHandle::integer(2))
             .unwrap();
-        pdf.mark_object_handle_dirty(&intermediate).unwrap();
 
         rebuild_page_tree(&mut pdf, &[ObjectRef::new(4, 0)])
             .expect("page-tree rebuild must preserve qpdf warning behavior");
@@ -1249,7 +1228,6 @@ mod tests {
         intermediate
             .replace_key(b"/UserUnit", ObjectHandle::integer(2))
             .unwrap();
-        pdf.mark_object_handle_dirty(&intermediate).unwrap();
 
         let logger = crate::QPDFLogger::create();
         logger.set_warn(Some(PipelineHandle::new(NthWriteFailure::new(1))));
@@ -1447,7 +1425,6 @@ mod tests {
             .unwrap();
         root.replace_key(b"/Count", ObjectHandle::integer(1))
             .unwrap();
-        pdf.mark_object_handle_dirty(&root).unwrap();
 
         let first = ObjectHandle::dictionary(vec![
             (b"/Type".to_vec(), ObjectHandle::name(b"Pages".to_vec())),
@@ -1495,7 +1472,6 @@ mod tests {
             ]),
         )
         .unwrap();
-        pdf.mark_object_handle_dirty(&leaf).unwrap();
 
         let before_root = handle_of(&mut pdf, ObjectRef::new(2, 0)).unparse_resolved();
         let before_second = handle_of(&mut pdf, ObjectRef::new(11, 0)).unparse_resolved();

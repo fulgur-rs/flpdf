@@ -173,7 +173,6 @@ pub fn copy_duplicate_page_annotations<R: Read + Seek>(
         let source_page = pdf.get_object_handle(source_page_ref);
         let destination_page = pdf.get_object_handle(new_page);
         destination_page.remove_key(b"/Annots");
-        pdf.mark_object_handle_dirty(&destination_page)?;
         PageObjectHelper::new(new_page, pdf).copy_annotations(source_page, Matrix::default())?;
     }
     Ok(())
@@ -423,10 +422,8 @@ fn replace_merged_fields<T: Read + Seek>(
     };
     if fields.is_empty() {
         root.remove_key(b"/AcroForm");
-        merged.mark_object_handle_dirty(&root)?;
     } else {
         acroform.replace_key(b"/Fields", ObjectHandle::array(fields))?;
-        merged.mark_object_handle_dirty(&acroform)?;
     }
     Ok(())
 }
@@ -452,7 +449,7 @@ fn clear_grouped_foreign_fields_for_replay<T: Read + Seek>(merged: &mut Pdf<T>) 
         return Ok(());
     }
     acroform.replace_key(b"/Fields", ObjectHandle::array(Vec::new()))?;
-    merged.mark_object_handle_dirty(&acroform)
+    Ok(())
 }
 
 /// Repair grouped-copy annotation `/P` values after the final page order is
@@ -468,7 +465,6 @@ fn set_annotation_page_refs<T: Read + Seek>(
     for annotation in annotations {
         if annotation.try_has_key(b"/P")? {
             annotation.replace_key(b"/P", page.clone())?;
-            merged.mark_object_handle_dirty(&annotation)?;
         }
     }
     Ok(())
@@ -597,7 +593,6 @@ fn rebuild_acroform_in_final_page_order<R: Read + Seek + 'static, T: Read + Seek
 
         let destination_page = merged.get_object_handle(final_refs[output_index]);
         destination_page.remove_key(b"/Annots");
-        merged.mark_object_handle_dirty(&destination_page)?;
 
         if source_index == 0 {
             // A repeated primary page is a same-document transform: it must
@@ -1422,7 +1417,6 @@ mod tests {
         ]);
         page.replace_key(b"/Annots", ObjectHandle::array(vec![widget]))
             .unwrap();
-        merged.mark_object_handle_dirty(&page).unwrap();
 
         assert!(
             collect_primary_fields(&mut merged, &[page_ref])

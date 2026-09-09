@@ -163,13 +163,11 @@ impl<'a, R: Read + Seek> EmbeddedFileDocumentHelper<'a, R> {
             } else {
                 let names = ObjectHandle::dictionary(Vec::new());
                 catalog.replace_key(b"/Names", names.clone())?;
-                self.pdf.mark_object_handle_dirty(&catalog)?;
                 names
             }
         } else {
             let names = ObjectHandle::dictionary(Vec::new());
             catalog.replace_key(b"/Names", names.clone())?;
-            self.pdf.mark_object_handle_dirty(&catalog)?;
             names
         };
 
@@ -186,7 +184,6 @@ impl<'a, R: Read + Seek> EmbeddedFileDocumentHelper<'a, R> {
                 ObjectHandle::array(Vec::new()),
             )]))?;
         names.replace_key(b"/EmbeddedFiles", root.clone())?;
-        self.pdf.mark_object_handle_dirty(names)?;
         Ok(root)
     }
 
@@ -569,8 +566,6 @@ mod tests {
         catalog
             .replace_key(key, value)
             .expect("replace catalog key");
-        pdf.mark_object_handle_dirty(&catalog)
-            .expect("mark catalog dirty");
     }
 
     fn indirect_names_pdf_bytes() -> Vec<u8> {
@@ -634,10 +629,8 @@ mod tests {
     }
 
     #[test]
-    fn helper_reads_do_not_dirty_an_unchanged_indirect_names_dictionary() {
+    fn helper_reads_preserve_an_unchanged_indirect_names_dictionary() {
         let mut pdf = Pdf::open(std::io::Cursor::new(indirect_names_pdf_bytes())).expect("open");
-        let names_ref = ObjectRef::new(4, 0);
-        assert!(!pdf.is_dirty(names_ref));
 
         assert_eq!(
             pdf.embedded_files()
@@ -646,31 +639,22 @@ mod tests {
                 .len(),
             1
         );
-        assert!(!pdf.is_dirty(names_ref));
 
         assert!(pdf
             .embedded_files()
             .get_embedded_file(b"entry")
             .expect("lookup")
             .is_some());
-        assert!(!pdf.is_dirty(names_ref));
     }
 
     #[test]
-    fn helper_absent_removal_does_not_dirty_an_unchanged_indirect_names_dictionary() {
+    fn helper_absent_removal_preserves_an_unchanged_indirect_names_dictionary() {
         let mut pdf = Pdf::open(std::io::Cursor::new(indirect_names_pdf_bytes())).expect("open");
-        let names_ref = ObjectRef::new(4, 0);
-        assert!(!pdf.is_dirty(names_ref));
 
         assert!(!pdf
             .embedded_files()
             .remove_embedded_file(b"missing")
             .expect("absent removal"));
-
-        assert!(
-            !pdf.is_dirty(names_ref),
-            "an absent removal must not rewrite the unchanged /Names dictionary"
-        );
     }
 
     #[test]
@@ -711,8 +695,6 @@ mod tests {
         catalog
             .replace_key(b"/AF", af_handle.clone())
             .expect("replace catalog /AF");
-        pdf.mark_object_handle_dirty(&catalog)
-            .expect("mark catalog dirty");
         let page_ref = crate::pages::page_refs(&mut pdf)
             .expect("page refs")
             .into_iter()
@@ -721,8 +703,6 @@ mod tests {
         let page = resolved_handle(&mut pdf, page_ref);
         page.replace_key(b"/AF", af_handle)
             .expect("replace page /AF");
-        pdf.mark_object_handle_dirty(&page)
-            .expect("mark page dirty");
 
         let retained_af = pdf.get_object_handle(af_ref);
         pdf.resolve(&retained_af).expect("resolve AF array");
@@ -983,8 +963,6 @@ mod tests {
         filespec
             .replace_key(b"/CI", pdf.get_object_handle(sidecar_ref))
             .expect("add side-car reference");
-        pdf.mark_object_handle_dirty(&filespec)
-            .expect("mark filespec dirty");
         insert_embedded_file(&mut pdf, b"trans.txt", fs_ref).expect("insert");
 
         remove_attachment(&mut pdf, b"trans.txt").expect("remove");
@@ -1021,8 +999,6 @@ mod tests {
         filespec
             .replace_key(b"/EF", pdf.get_object_handle(ef_ref))
             .expect("replace /EF with indirect dictionary");
-        pdf.mark_object_handle_dirty(&filespec)
-            .expect("mark filespec dirty");
 
         let stream_ref = embedded_file_stream_ref(&mut pdf, fs_ref)
             .expect("resolve stream")
@@ -1095,8 +1071,6 @@ mod tests {
         catalog
             .replace_key(b"/AF", pdf.get_object_handle(af_array_ref))
             .expect("replace catalog /AF");
-        pdf.mark_object_handle_dirty(&catalog)
-            .expect("mark catalog dirty");
 
         let removed = remove_attachment(&mut pdf, b"idx.txt").expect("remove");
         assert!(removed);
@@ -1155,8 +1129,6 @@ mod tests {
         catalog
             .replace_key(b"/AF", pdf.get_object_handle(af_array_ref))
             .expect("replace catalog /AF");
-        pdf.mark_object_handle_dirty(&catalog)
-            .expect("mark catalog dirty");
 
         let page_refs = crate::pages::page_refs(&mut pdf).expect("page_refs");
         assert_eq!(page_refs.len(), 1, "fixture has one page");
@@ -1164,8 +1136,6 @@ mod tests {
         let page = resolved_handle(&mut pdf, page_ref);
         page.replace_key(b"/AF", pdf.get_object_handle(af_array_ref))
             .expect("replace page /AF");
-        pdf.mark_object_handle_dirty(&page)
-            .expect("mark page dirty");
 
         // Removal walks catalog then every page, calling the helper once per
         // parent against the SAME shared array object.
@@ -1241,8 +1211,6 @@ mod tests {
         catalog
             .replace_key(b"/Dests", pdf.get_object_handle(dests_leaf_ref))
             .expect("replace catalog /Dests");
-        pdf.mark_object_handle_dirty(&catalog)
-            .expect("mark catalog dirty");
 
         // Remove the embedded-files attachment. qpdf nulls the Filespec
         // object even when another name tree still references its object ref.
@@ -1308,15 +1276,11 @@ mod tests {
         stream_dict
             .replace_key(b"/RelatedFS", pdf.get_object_handle(fs_ref))
             .expect("add stream back-reference");
-        pdf.mark_object_handle_dirty(&stream)
-            .expect("mark stream dirty");
 
         let catalog = catalog_handle(&mut pdf);
         catalog
             .replace_key(b"/ExtraStreamRef", pdf.get_object_handle(stream_ref))
             .expect("replace catalog stream reference");
-        pdf.mark_object_handle_dirty(&catalog)
-            .expect("mark catalog dirty");
 
         let removed = remove_attachment(&mut pdf, b"paired.txt").expect("remove");
         assert!(removed);
@@ -1431,8 +1395,6 @@ mod tests {
         set_test_object(&mut pdf, stream_uf, stream);
         ef.replace_key(b"/UF", pdf.get_object_handle(stream_uf))
             .expect("replace /EF /UF");
-        pdf.mark_object_handle_dirty(&filespec)
-            .expect("mark filespec dirty");
 
         insert_embedded_file(&mut pdf, b"multi.txt", fs_ref).expect("insert");
 
@@ -1481,8 +1443,6 @@ mod tests {
         catalog
             .replace_key(b"/Sharer", pdf.get_object_handle(sharer_ref))
             .expect("replace catalog /Sharer");
-        pdf.mark_object_handle_dirty(&catalog)
-            .expect("mark catalog dirty");
 
         // Add and remove an unrelated attachment.  Its filespec is NOT in the
         // empty indirect /AF array, so the array and parent key must survive.
@@ -1542,8 +1502,6 @@ mod tests {
         catalog
             .replace_key(b"/AF", handle_array(vec![pdf.get_object_handle(fs_ref)]))
             .expect("replace catalog /AF");
-        pdf.mark_object_handle_dirty(&catalog)
-            .expect("mark catalog dirty");
 
         // Add /AF to the single page as well.
         let page_refs = crate::pages::page_refs(&mut pdf).expect("page_refs");
@@ -1552,8 +1510,6 @@ mod tests {
         let page = resolved_handle(&mut pdf, page_ref);
         page.replace_key(b"/AF", handle_array(vec![pdf.get_object_handle(fs_ref)]))
             .expect("replace page /AF");
-        pdf.mark_object_handle_dirty(&page)
-            .expect("mark page dirty");
 
         // Remove the attachment.
         let removed = remove_attachment(&mut pdf, b"af-test.txt").expect("remove");
@@ -1758,8 +1714,6 @@ mod tests {
         catalog
             .replace_key(b"/Names", pdf.get_object_handle(terminal_ref))
             .expect("install indirect Names");
-        pdf.mark_object_handle_dirty(&catalog)
-            .expect("mark catalog dirty");
 
         // Remove the last (only) embedded file → empty rebuild with a surviving
         // /Dests sibling.
@@ -1850,8 +1804,6 @@ mod tests {
         catalog
             .replace_key(b"/Names", names)
             .expect("install direct Names");
-        pdf.mark_object_handle_dirty(&catalog)
-            .expect("mark catalog dirty");
 
         // Remove the only attachment → empty rebuild over the direct /Names dict.
         let removed = remove_attachment(&mut pdf, b"only2.txt").expect("remove only2");

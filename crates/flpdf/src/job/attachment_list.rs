@@ -754,8 +754,6 @@ mod tests {
         catalog
             .replace_key(b"/Names", names.into_handle())
             .expect("install empty EmbeddedFiles tree");
-        pdf.mark_object_handle_dirty(&catalog)
-            .expect("mark catalog dirty");
 
         assert_eq!(
             listing(&mut pdf, true),
@@ -780,8 +778,6 @@ mod tests {
         catalog
             .replace_key(b"/Names", names.into_handle())
             .expect("install raw EmbeddedFiles tree fixture");
-        pdf.mark_object_handle_dirty(&catalog)
-            .expect("mark catalog dirty");
     }
 
     // ── Name-tree value shapes ────────────────────────────────────────────────

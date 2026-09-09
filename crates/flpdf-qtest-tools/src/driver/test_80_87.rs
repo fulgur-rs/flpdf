@@ -115,7 +115,6 @@ pub(crate) fn run_test_80<R: Read + Seek>(
         }
         acroform.add_and_rename_form_fields(transformed.new_fields.clone())?;
     }
-    pdf.mark_object_handle_dirty(&old_annots)?;
     emit_new_diagnostics(pdf, diagnostics_written, filename, stdout, stderr)?;
 
     let secondary_filename = os_str_diagnostic_bytes(arg2).into_owned();

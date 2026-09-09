@@ -189,7 +189,7 @@ mod tests {
     }
 
     #[test]
-    fn filespec_helper_marks_an_indirect_owner_of_a_direct_dictionary_dirty() {
+    fn filespec_helper_mutates_an_indirect_owner_of_a_direct_dictionary() {
         let mut pdf = open_minimal();
         let owner_ref = ObjectRef::new(5, 0);
         let filespec = ObjectHandle::dictionary(vec![(
@@ -201,13 +201,14 @@ mod tests {
         let owner = pdf.get_object_handle(owner_ref);
         pdf.resolve(&owner).unwrap();
         let direct_filespec = owner.get_key(b"/FS");
-        pdf.clear_dirty(owner_ref);
 
         let mut helper = FileSpec::new(direct_filespec, &mut pdf).unwrap();
         helper.set_description("persisted through owner").unwrap();
         drop(helper);
-
-        assert!(pdf.is_dirty(owner_ref));
+        assert_eq!(
+            owner.get_key(b"/FS").get_key(b"/Desc").as_string(),
+            Some(b"persisted through owner".to_vec())
+        );
     }
 
     #[test]

@@ -976,7 +976,7 @@ struct ObjectSlot {
     end_after_space: i64,
     // Separable at field granularity, so CLAUDE.md's marker policy calls for
     // #[deprecated] here rather than a comment marker: qpdf has no per-object
-    // document-id set. This set supports flpdf's ownership/dirty-propagation
+    // document-id set. This set supports flpdf's ownership-history
     // bookkeeping, but it is not a live containment index:
     // `associate_pdf_identity` inserts an id that `detach_child_from_parent`
     // never removes, so a value's prior document ids remain here as history
@@ -1278,6 +1278,7 @@ fn canonicalize_object_value(value: ObjectValue) -> ObjectValue {
     }
 }
 
+#[cfg(test)]
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
 struct ContainmentOwner {
     pdf_unique_id: Option<u64>,
@@ -1626,7 +1627,7 @@ impl ObjectHandle {
     /// [`Self::try_dereference`] upgrades and calls; the identity is what
     /// [`Self::belongs_to_pdf`] answers on. [`Self::set_resolved`] propagates
     /// that identity separately from the live immediate-parent edges used by
-    /// [`Self::containing_object_refs_for_pdf`].
+    /// test-only containment inspection helpers.
     ///
     /// `pdf_unique_id` itself ports qpdf's document-level unique id:
     /// `QPDF::getUniqueId` (`include/qpdf/QPDF.hh:283`,
@@ -1739,14 +1740,12 @@ impl ObjectHandle {
     /// but initially without active document metadata. The resolver link is
     /// weak so a surviving handle cannot keep its document alive.
     ///
-    /// Its resolved direct children keep only weak immediate-parent links.
-    /// [`Self::containing_object_refs_for_pdf`] follows those live links at
-    /// query time and reads the reached indirect slot's *current* object
-    /// reference and active document identity. It neither copies Root
-    /// metadata to children nor records a permanent `None` root. Until this
-    /// slot is promoted, it has no active identity, so
-    /// [`Self::belongs_to_pdf`] is false and owner lookup is empty for every
-    /// document. That makes this the narrower test constructor, not the
+    /// Its resolved direct children keep only weak immediate-parent links for
+    /// test-only containment inspection. It neither copies Root metadata to
+    /// children nor records a permanent `None` root. Until this slot is
+    /// promoted, it has no active identity, so [`Self::belongs_to_pdf`] is
+    /// false for every document. That makes this the narrower test
+    /// constructor, not the
     /// qpdf-native shape: upstream one `QPDF*` carries both identity and the
     /// resolver, while [`Self::new_indirect_for_pdf_with_resolver`] is what a
     /// handle vended by a `Pdf` needs.
@@ -2329,6 +2328,7 @@ impl ObjectHandle {
             .collect()
     }
 
+    #[cfg(test)]
     pub(crate) fn containing_object_refs_for_pdf(&self, pdf_unique_id: u64) -> Vec<ObjectRef> {
         self.containment_roots()
             .into_iter()
@@ -4018,13 +4018,8 @@ impl ObjectHandle {
     /// canonical resolve observes that value; it does not rebuild a separate
     /// raw snapshot.
     ///
-    /// This also has no path to inform the owning [`crate::Pdf`] that
-    /// `self`'s value changed. After mutating a handle, call
-    /// [`crate::Pdf::mark_object_handle_dirty`] with `self`. That marks the
-    /// handle itself when it is an indirect object, or its containing indirect
-    /// owner(s) when it is a direct child. For an already-registered indirect
-    /// handle, [`crate::Pdf::mark_object_dirty`] with the same ref remains the
-    /// equivalent lower-level operation.
+    /// The mutation updates the shared canonical handle graph in place, so the
+    /// writer observes the new value through its normal live-cache traversal.
     ///
     /// # Errors
     ///
@@ -4190,13 +4185,8 @@ impl ObjectHandle {
     /// indirect array through its parent dictionary or copy it into a separate
     /// value model.
     ///
-    /// As with [`Self::replace_key`], this mutates the live handle graph but
-    /// cannot notify the owning [`crate::Pdf`]. After mutating, call
-    /// [`crate::Pdf::mark_object_handle_dirty`] with this handle so the
-    /// canonical writer observes the change. For an indirect array this
-    /// marks its own object reference; for a direct child array it marks the
-    /// containing indirect owner(s). [`crate::Pdf::mark_object_dirty`] with
-    /// an indirect array's reference is the equivalent lower-level operation.
+    /// This mutates the shared live handle graph directly, and the canonical
+    /// writer observes the same allocation without a separate notification.
     pub fn set_array_item(&self, index: usize, value: ObjectHandle) -> Result<()> {
         if !self.prepare_array_mutation("ignoring attempt to set item")? {
             return Ok(());
@@ -4236,10 +4226,7 @@ impl ObjectHandle {
     /// A direct replacement that would make the array graph cyclic returns
     /// [`Error::Internal`] as the flpdf process-safety boundary; qpdf's
     /// `setFromVector` itself checks ownership only.
-    /// As with [`Self::replace_key`], call
-    /// [`crate::Pdf::mark_object_handle_dirty`] with this handle after the
-    /// mutation. The helper marks this array when it is indirect, or its
-    /// containing indirect owner(s) when it is a direct child.
+    /// The canonical writer observes this live mutation directly.
     pub fn set_array_items(&self, items: Vec<ObjectHandle>) -> Result<()> {
         if !self.prepare_array_mutation("ignoring attempt to replace items")? {
             return Ok(());
@@ -4291,10 +4278,7 @@ impl ObjectHandle {
     /// already reach this array returns [`Error::Internal`] to keep recursive
     /// live-handle walkers terminating; qpdf's `insert` does not perform this
     /// cycle check.
-    /// As with [`Self::replace_key`], call
-    /// [`crate::Pdf::mark_object_handle_dirty`] with this handle after the
-    /// mutation. The helper marks this array when it is indirect, or its
-    /// containing indirect owner(s) when it is a direct child.
+    /// The canonical writer observes this live mutation directly.
     pub fn insert_array_item(&self, index: usize, value: ObjectHandle) -> Result<()> {
         if !self.prepare_array_mutation("ignoring attempt to insert item")? {
             return Ok(());
@@ -4349,10 +4333,7 @@ impl ObjectHandle {
     /// [`Error::Internal`] to keep recursive live-handle walkers terminating;
     /// qpdf's `push_back` checks ownership but does not perform this cycle
     /// check.
-    /// As with [`Self::replace_key`], call
-    /// [`crate::Pdf::mark_object_handle_dirty`] with this handle after the
-    /// mutation. The helper marks this array when it is indirect, or its
-    /// containing indirect owner(s) when it is a direct child.
+    /// The canonical writer observes this live mutation directly.
     pub fn append_array_item(&self, value: ObjectHandle) -> Result<()> {
         if !self.prepare_array_mutation("ignoring attempt to append item")? {
             return Ok(());
@@ -4387,10 +4368,7 @@ impl ObjectHandle {
 
     /// Erase one live array item, porting qpdf's `eraseItem`
     /// (`libqpdf/QPDFObjectHandle.cc:934-946`).
-    /// As with [`Self::replace_key`], call
-    /// [`crate::Pdf::mark_object_handle_dirty`] with this handle after the
-    /// mutation. The helper marks this array when it is indirect, or its
-    /// containing indirect owner(s) when it is a direct child.
+    /// The canonical writer observes this live mutation directly.
     pub fn erase_array_item(&self, index: usize) -> Result<()> {
         self.erase_array_item_and_get_old(index).map(|_| ())
     }
@@ -4401,10 +4379,7 @@ impl ObjectHandle {
     /// emitting the corresponding qpdf warning when the handle has document
     /// warning context. A direct/contextless handle cannot route that warning
     /// and therefore returns the existing `Error::System` boundary instead.
-    /// As with [`Self::replace_key`], call
-    /// [`crate::Pdf::mark_object_handle_dirty`] with this handle after the
-    /// mutation. The helper marks this array when it is indirect, or its
-    /// containing indirect owner(s) when it is a direct child.
+    /// The canonical writer observes this live mutation directly.
     pub fn erase_array_item_and_get_old(&self, index: usize) -> Result<ObjectHandle> {
         if !self.prepare_array_mutation("ignoring attempt to erase item")? {
             return Ok(ObjectHandle::null());
@@ -4575,9 +4550,9 @@ impl ObjectHandle {
     /// containment inside another document's object graph does not confer
     /// ownership. This deliberately does not consult
     /// [`Self::belongs_exclusively_to_pdf`] or the `pdf_unique_ids` history
-    /// set that field reads from: that bookkeeping supports dirty-marking
-    /// ([`Self::containing_object_refs_for_pdf`]) but is not a live
-    /// containment index -- it keeps a value's prior document id after it is
+    /// set that field reads from: that bookkeeping records document identity
+    /// history but is not a live containment index -- it keeps a value's prior
+    /// document id after it is
     /// no longer reachable there, which is not qpdf's ownership semantics
     /// and would reject a direct value (a null or any other scalar) that
     /// merely passed through a different document's object graph at some
@@ -4840,6 +4815,7 @@ impl ObjectHandle {
         }
     }
 
+    #[cfg(test)]
     fn containment_roots(&self) -> BTreeSet<ContainmentOwner> {
         if self.is_indirect() {
             return BTreeSet::new();
@@ -4888,8 +4864,7 @@ impl ObjectHandle {
     /// does not normalize slashless input. Never performs resolution itself.
     ///
     /// See [`Self::replace_key`]'s doc comment for the same canonical
-    /// resolution behavior and the
-    /// [`crate::Pdf::mark_object_dirty`] requirement — both apply here too.
+    /// resolution behavior.
     pub fn remove_key(&self, key: &[u8]) {
         let removed = self.with_value_mut(|v| {
             if let Some(ObjectValue::Dictionary(entries)) = v {
@@ -5209,9 +5184,8 @@ impl ObjectHandle {
     /// keys.
     ///
     /// See [`Self::replace_key`]'s doc comment for the same canonical
-    /// resolution behavior and the
-    /// [`crate::Pdf::mark_object_dirty`] requirement — both apply here too,
-    /// since this method installs and rebinds entries via `replace_key`.
+    /// resolution behavior, since this method installs and rebinds entries
+    /// via `replace_key`.
     ///
     /// # Errors
     ///
@@ -5273,10 +5247,9 @@ impl ObjectHandle {
     /// shallow or materialized clone.
     ///
     /// `owning_pdf` is mutable because promotion updates its canonical object
-    /// registry and the live dictionary mutation must be reported to its
-    /// writer dirty-set. This corresponds to qpdf's
-    /// `init_dr_map` call order, which performs this normalization before
-    /// `mergeResources` (`libqpdf/QPDFAcroFormDocumentHelper.cc:775-800`).
+    /// registry. This corresponds to qpdf's `init_dr_map` call order, which
+    /// performs this normalization before `mergeResources`
+    /// (`libqpdf/QPDFAcroFormDocumentHelper.cc:775-800`).
     pub fn make_resources_indirect<R: std::io::Read + std::io::Seek + 'static>(
         &self,
         owning_pdf: &mut crate::Pdf<R>,
@@ -5289,19 +5262,13 @@ impl ObjectHandle {
             let Some(category_entries) = category.try_as_dictionary()? else {
                 continue;
             };
-            let mut changed = false;
             for (name, value) in category_entries {
                 if value.is_indirect() {
                     continue;
                 }
                 let indirect = owning_pdf.make_indirect_from_object_handle(value)?;
                 category.replace_key(&name, indirect)?;
-                changed = true;
             }
-            if changed {
-                let dirty_result = owning_pdf.mark_object_handle_dirty(&category);
-                dirty_result?; // cov:ignore: successful ? continuation has no llvm-cov region; call is covered on the prior line
-            } // cov:ignore: branch closing brace has no llvm-cov region after successful ? continuation
         }
         Ok(())
     }
@@ -5836,10 +5803,9 @@ impl ObjectHandle {
     /// (`libqpdf/QPDF.cc:2240,2256-2258`).
     ///
     /// See [`Self::replace_key`]'s doc comment for the same canonical
-    /// resolution behavior and the
-    /// [`crate::Pdf::mark_object_dirty`] requirement — both apply here too,
-    /// since this method mutates the stream data in place and updates its
-    /// dictionary through qpdf's lower-level stream-internal path.
+    /// resolution behavior, since this method mutates the stream data in
+    /// place and updates its dictionary through qpdf's lower-level
+    /// stream-internal path.
     pub fn replace_stream_data(
         &self,
         data: Rc<Vec<u8>>,
@@ -5877,11 +5843,8 @@ impl ObjectHandle {
     /// registration time rather than being accepted and failing later at the
     /// pipe boundary.
     ///
-    /// This mutates the live stream and dictionary in place. As with
-    /// [`Self::replace_stream_data`] and [`Self::replace_key`], callers that
-    /// mutate a document-owned handle must call
-    /// [`crate::Pdf::mark_object_handle_dirty`] (or the corresponding
-    /// [`crate::Pdf::mark_object_dirty`]) before writing the document.
+    /// This mutates the live stream and dictionary in place; the canonical
+    /// writer observes the same live allocation before writing the document.
     pub fn replace_stream_data_provider(
         &self,
         provider: Rc<dyn StreamDataProvider>,
@@ -5959,8 +5922,7 @@ impl ObjectHandle {
     /// (`libqpdf/QPDF_Stream.cc:688-693`), used by
     /// `QPDF::JSONReactor::dictionaryItem` for `stream.dict`
     /// (`libqpdf/QPDF_json.cc:629-637`). The replacement is attached through
-    /// the same containment bookkeeping as ordinary dictionary mutations; the
-    /// caller owns the document dirty-mark decision.
+    /// the same containment bookkeeping as ordinary dictionary mutations.
     pub(crate) fn replace_stream_dict(&self, dictionary: ObjectHandle) -> Result<()> {
         self.try_dereference()?;
         dictionary.try_dereference()?;
@@ -6039,9 +6001,9 @@ impl ObjectHandle {
     /// must not decode, normalize, or recompress the stream, even when the
     /// stream is modified or the writer requests a non-none decode level.
     /// The setting belongs to the canonical stream value, so cloned handles
-    /// observe the same state. It is not serialized and does not mark the
-    /// PDF object dirty; the mutation generation is advanced so a writer
-    /// cache made before this call cannot reuse an obsolete filtering result.
+    /// observe the same state. It is not serialized; the mutation generation
+    /// is advanced so a writer cache made before this call cannot reuse an
+    /// obsolete filtering result.
     pub fn set_filter_on_write(&self, value: bool) -> Result<()> {
         self.try_dereference()?;
         let is_stream = self.with_value_mut(|state| match state {
@@ -9056,8 +9018,8 @@ pub(crate) mod identity_tests {
     /// [`ObjectHandle::belongs_to_pdf`], while those edges drive
     /// [`ObjectHandle::containing_object_refs_for_pdf`] — respectively the
     /// foreign-object rejection and current owner lookup in
-    /// `Pdf::mark_object_handle_dirty`, `filespec_helper`, and
-    /// `embedded_files`. Measured against the current tree, not predicted:
+    /// `filespec_helper` and `embedded_files`. Measured against the current
+    /// tree, not predicted:
     /// this is now the constructor `Pdf::get_object_handle` uses — the
     /// identity-only `new_indirect_unresolved_for_pdf` was deleted when it
     /// switched over — and patching it to discard its `pdf_unique_id`
@@ -15575,26 +15537,6 @@ mod mutation_tests {
     }
 
     #[test]
-    fn loaded_clean_array_mutation_requires_explicit_dirty_mark() {
-        let mut pdf = crate::Pdf::open_mem_owned(
-            include_bytes!("../../../tests/fixtures/minimal.pdf").to_vec(),
-        )
-        .expect("open minimal PDF");
-        let pages_ref = ObjectRef::new(2, 0);
-        let pages = pdf.get_object_handle(pages_ref);
-        pdf.resolve(&pages).expect("resolve loaded Pages object");
-        let kids = pages.get_key(b"/Kids");
-
-        assert!(pdf.dirty_object_refs().is_empty());
-        kids.append_array_item(ObjectHandle::integer(4))
-            .expect("mutate the loaded array");
-        assert!(pdf.dirty_object_refs().is_empty());
-
-        pdf.mark_object_dirty(pages_ref);
-        assert_eq!(pdf.dirty_object_refs(), vec![pages_ref]);
-    }
-
-    #[test]
     fn insert_array_item_at_size_uses_qpdfs_append_position() {
         let array = ObjectHandle::array(vec![ObjectHandle::integer(1)]);
         let appended_at_size = ObjectHandle::integer(2);
@@ -15758,7 +15700,7 @@ mod mutation_tests {
         // A direct null handle that was earlier a
         // descendant of a PDF-A indirect object picks up PDF A's id in its
         // `pdf_unique_ids` history bookkeeping (`promote_to_indirect` ->
-        // `associate_pdf_identity`). That bookkeeping supports dirty-marking,
+        // `associate_pdf_identity`). That bookkeeping records identity history,
         // not qpdf's notion of ownership
         // (`getOwningQPDF()`, set only by `setObjGen`/indirect promotion --
         // see `replace_key_accepts_a_foreign_descendant_nested_in_a_direct_

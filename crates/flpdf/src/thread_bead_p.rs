@@ -260,13 +260,11 @@ fn remap_or_drop_bead_p<R: Read + Seek>(
     match surviving.get(&page_ref) {
         Some(&new) if new != page_ref => {
             bead.replace_key(b"/P", pdf.get_object_handle(new))?;
-            pdf.mark_object_handle_dirty(bead)?;
             Ok(())
         }
         Some(_) => Ok(()), // Surviving under the same ref: nothing to change.
         None => {
             bead.remove_key(b"/P");
-            pdf.mark_object_handle_dirty(bead)?;
             Ok(())
         }
     }

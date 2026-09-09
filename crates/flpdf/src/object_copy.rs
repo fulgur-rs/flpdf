@@ -275,7 +275,6 @@ impl<R: Read + Seek + 'static> ForeignObjectCopier<'_, R> {
                 self.target
                     .resolver
                     .replace_object(target_ref, replacement)?;
-                self.target.mark_object_dirty(target_ref);
             }
         }
 
@@ -362,13 +361,11 @@ impl<R: Read + Seek + 'static> ForeignObjectCopier<'_, R> {
                 return Ok(());
             }
 
-            let target_ref;
             if let Some(&existing_target_ref) = self.object_map.get(&source_ref) {
                 let mapped = self.target.get_object_handle(existing_target_ref);
                 if !(top && is_page && mapped.is_null()) {
                     return Ok(());
                 }
-                target_ref = existing_target_ref;
             } else {
                 let mapped = if is_stream {
                     self.target.new_stream()?
@@ -381,7 +378,7 @@ impl<R: Read + Seek + 'static> ForeignObjectCopier<'_, R> {
                 };
                 // cov:ignore-start: every reservation branch above returns an indirect handle;
                 // this protects the canonical map invariant if a future allocator changes.
-                target_ref = mapped.object_ref().ok_or_else(|| {
+                let target_ref = mapped.object_ref().ok_or_else(|| {
                     Error::Internal("foreign copier created a direct reservation".to_owned())
                 })?;
                 // cov:ignore-end
@@ -393,15 +390,9 @@ impl<R: Read + Seek + 'static> ForeignObjectCopier<'_, R> {
                 // A nested `/Page` reservation never enters `to_copy` (qpdf's
                 // own `reserveObjects` returns without queuing it too,
                 // `QPDF.cc:2124-2132`), so `run()`'s replace loop -- the only
-                // other call site that dirty-marks a freshly reserved
-                // object -- never reaches it. Left unmarked, this indirect
-                // null placeholder is registered in the handle registry and
-                // referenced by the copied ancestor, yet never scheduled for
-                // canonical writer output: a full rewrite would emit the
-                // reference but not the placeholder object itself, leaving it
-                // dangling (see `make_indirect_from_object_handle`'s own doc
-                // on this exact failure mode).
-                self.target.mark_object_dirty(target_ref);
+                // other call site that schedules a freshly reserved object --
+                // never reaches it. The canonical live writer still discovers
+                // this indirect null placeholder through the copied ancestor.
                 self.visiting.remove(&source_ref);
                 return Ok(());
             }
@@ -557,7 +548,6 @@ impl<R: Read + Seek + 'static> ForeignObjectCopier<'_, R> {
             self.target
                 .resolver
                 .copy_stream_data(&destination, &foreign)?;
-            self.target.mark_object_dirty(target_ref);
             return Ok(destination);
         }
 
@@ -1234,19 +1224,17 @@ mod tests {
 
     #[test]
     fn copy_foreign_object_dirty_marks_a_nested_page_null_reservation() {
-        // A nested `/Page` reservation created while copying some
-        // other, unrelated root
-        // returns before ever entering `to_copy` (`QPDF.cc:2124-2132`
-        // mirrors this early return). Without an explicit dirty mark, that
-        // fresh indirect null placeholder -- now referenced by the copied
-        // ancestor -- would be dropped from a full rewrite, leaving the
-        // reference dangling in the written output.
+        // A nested `/Page` reservation created while copying some other,
+        // unrelated root returns before ever entering `to_copy`
+        // (`QPDF.cc:2124-2132` mirrors this early return). The fresh indirect
+        // null placeholder remains in the canonical cache and is now
+        // referenced by the copied ancestor, so the live writer discovers it.
         //
         // The holder is an *array* member, not a dictionary key: qpdf's own
         // `QPDF_Dictionary::getKeys()` hides any key whose value currently
         // resolves to null (`QPDF_Dictionary.cc:118-127`), so a dict-keyed
         // reference to a still-null placeholder self-heals by disappearing
-        // from serialization entirely, regardless of dirty state. Arrays
+        // from serialization entirely. Arrays
         // have no such elision (`QPDF_Array` keeps every position), so an
         // array-held nested-page reference is the shape that actually
         // exercises the dangling-reference failure.
@@ -1272,11 +1260,6 @@ mod tests {
             .object_ref()
             .expect("nested page reservation is indirect");
 
-        assert!(
-            target.dirty_object_refs().contains(&boundary_ref),
-            "nested /Page reservation must be scheduled for writer output"
-        );
-
         // Link the copied root into the target's reachable graph (a floating
         // handle proves nothing about a full rewrite: the canonical writer
         // discovers objects by walking from `/Root`, so the copied root
@@ -1287,7 +1270,6 @@ mod tests {
         catalog
             .replace_key(b"/CopiedRoot", copied_root.clone())
             .expect("copy_foreign_object mints a target-owned handle, same document as catalog");
-        target.mark_object_dirty(catalog_ref);
 
         let mut writer = PdfWriter::new(&mut target);
         writer.set_object_stream_mode(ObjectStreamMode::Disable);

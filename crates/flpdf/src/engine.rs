@@ -12,7 +12,7 @@ use crate::xref::{load_xref_state_from_bytes, XrefLoadOptions};
 use crate::{Error, ObjectHandle, XrefForm};
 use crate::{Pdf, Result};
 use std::cell::RefCell;
-use std::collections::{BTreeMap, BTreeSet};
+use std::collections::BTreeMap;
 use std::io::{Cursor, Read, Seek};
 use std::path::Path;
 use std::rc::Rc;
@@ -110,7 +110,6 @@ impl<R: Read + Seek> Pdf<R> {
             acroform_cache: Rc::new(RefCell::new(None)),
             trailer_handle_memo: None,
             root_handle_memo: None,
-            dirty_object_refs: BTreeSet::new(),
             ever_called_get_all_pages: false,
             ever_pushed_inherited_attributes_to_pages: false,
             page_list_cache: None,
@@ -298,7 +297,6 @@ impl<R: Read + Seek> Pdf<R> {
             acroform_cache: Rc::new(RefCell::new(None)),
             trailer_handle_memo: None,
             root_handle_memo: None,
-            dirty_object_refs: BTreeSet::new(),
             ever_called_get_all_pages: false,
             ever_pushed_inherited_attributes_to_pages: false,
             page_list_cache: None,

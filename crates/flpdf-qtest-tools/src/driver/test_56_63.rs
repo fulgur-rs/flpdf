@@ -367,7 +367,6 @@ pub(crate) fn run_test_60<R: Read + Seek + 'static>(
     trailer.replace_key(b"/QTest1", r1)?;
     trailer.replace_key(b"/QTest2", r2)?;
     trailer.replace_key(b"/QTest3", r3)?;
-    pdf.mark_object_handle_dirty(&trailer)?;
 
     let mut writer = PdfWriter::new(pdf);
     writer.set_output_file("a.pdf")?;

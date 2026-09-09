@@ -1095,7 +1095,6 @@ fn create_qpdf_write_qpdf_preserves_a_between_stage_mutation() {
     );
     root.replace_key(b"/BetweenStages", ObjectHandle::boolean(true))
         .unwrap();
-    pdf.mark_object_handle_dirty(&root).unwrap();
 
     job.write_qpdf(&mut pdf).unwrap();
     assert_eq!(job.get_exit_code(), JobExitCode::Success);

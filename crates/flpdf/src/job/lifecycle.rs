@@ -3942,7 +3942,6 @@ impl QPDFJob {
             if let Some(root_ref) = pdf.root_ref() {
                 let root = pdf.get_object_handle(root_ref);
                 root.remove_key(b"/PageLabels");
-                pdf.mark_object_handle_dirty(&root)?;
             } // cov:ignore: llvm-cov attributes this successful page-label removal continuation to its root mutation expressions
         }
         let Some(specs) = configuration.set_page_labels.as_deref() else {
@@ -3985,7 +3984,7 @@ impl QPDFJob {
             b"/PageLabels",
             ObjectHandle::dictionary(vec![(b"/Nums".to_vec(), ObjectHandle::array(nums))]),
         )?; // cov:ignore: a validated direct Catalog replacement cannot fail without an impossible concurrent handle mutation
-        pdf.mark_object_handle_dirty(&root)
+        Ok(())
     }
 
     fn replace_input_path(&self) -> Option<PathBuf> {
@@ -5472,8 +5471,6 @@ mod tests {
         page.try_dereference().expect("page resolves");
         page.replace_key(b"/Contents", ObjectHandle::integer(42))
             .expect("page remains mutable");
-        pdf.mark_object_handle_dirty(&page)
-            .expect("page mutation is tracked");
 
         let mut job = QPDFJob::new();
         let mut configuration = job.configuration.clone();

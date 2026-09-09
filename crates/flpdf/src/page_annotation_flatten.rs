@@ -284,7 +284,6 @@ fn flatten_annotations_on_page<R: Read + Seek>(
     } else {
         let replacement = ObjectHandle::dictionary(Vec::new());
         page.replace_key(b"/Resources", replacement.clone())?;
-        pdf.mark_object_handle_dirty(&page)?;
         replacement
     };
 
@@ -344,10 +343,8 @@ fn flatten_annotations_on_page<R: Read + Seek>(
             b"/XObject".to_vec(),
             ObjectHandle::dictionary(Vec::new()),
         )]);
-        // Mark dirty before the fallible merge, matching the DR-merge call
-        // site's own convention above: a partially-applied merge must still
-        // be reflected in the dirty set.
-        pdf.mark_object_handle_dirty(&resources)?;
+        // The live merge is intentionally allowed to partially apply before
+        // a later category reports an error, matching qpdf's call boundary.
         resources.merge_resources(&empty_xobject_placeholder, None)?;
         let xobj_dict = resources.try_get_key(b"/XObject")?;
 
@@ -357,7 +354,6 @@ fn flatten_annotations_on_page<R: Read + Seek>(
             pdf.make_indirect_object_handle(data.appearance.clone())?
         };
         xobj_dict.replace_key(format!("/{xobj_name}").as_bytes(), xobject)?;
-        pdf.mark_object_handle_dirty(&xobj_dict)?;
         append_bytes.extend_from_slice(&content);
         flattened_count += 1;
         if !qpdf_flag_contract {
@@ -402,8 +398,6 @@ fn flatten_annotations_on_page<R: Read + Seek>(
         page.replace_key(b"/Contents", stream)?;
     }
 
-    pdf.mark_object_handle_dirty(&page)?;
-
     // ── Step 8: Remove flattened annotations from /Annots ─────────────────
     replace_pruned_annots(pdf, page_ref, &to_remove, qpdf_flag_contract)?; // cov:ignore: llvm-cov maps this covered multiline call terminator to a zero-hit line
 
@@ -421,17 +415,14 @@ fn replace_pruned_annots<R: Read + Seek>(
     let new_annots = build_pruned_annots_array(pdf, page_ref, to_remove)?;
     if new_annots.as_array().is_some_and(|items| items.is_empty()) {
         page.remove_key(b"/Annots");
-        pdf.mark_object_handle_dirty(&page)?;
     } else if preserve_indirect_holder {
         if let Some(array_ref) = old_annots.object_ref() {
             pdf.replace_object(array_ref, new_annots)?;
         } else {
             page.replace_key(b"/Annots", new_annots)?;
-            pdf.mark_object_handle_dirty(&page)?;
         }
     } else {
         page.replace_key(b"/Annots", new_annots)?;
-        pdf.mark_object_handle_dirty(&page)?;
     }
     Ok(())
 }
@@ -455,7 +446,6 @@ fn add_qpdf_flatten_contents<R: Read + Seek>(
     }
     contents.push(after);
     page.replace_key(b"/Contents", ObjectHandle::array(contents))?;
-    pdf.mark_object_handle_dirty(page)?;
     Ok(())
 }
 
@@ -587,7 +577,6 @@ fn materialize_page_resources<R: Read + Seek>(pdf: &mut Pdf<R>, page_ref: Object
     }
     // cov:ignore-end
     page.replace_key(b"/Resources", resources)?;
-    pdf.mark_object_handle_dirty(&page)?;
     Ok(())
 }
 
@@ -650,10 +639,9 @@ fn acroform_default_resources<R: Read + Seek>(pdf: &mut Pdf<R>) -> Result<Option
 /// dedup/append, instead of being recognized as already present (or
 /// carried across) by value.
 fn resolve_array_item_handles<R: Read + Seek>(
-    pdf: &mut Pdf<R>,
+    _pdf: &mut Pdf<R>,
     array: &ObjectHandle,
 ) -> Result<()> {
-    let mut changed = false;
     let Some(items) = array.try_as_array()? else {
         return Ok(());
     };
@@ -662,11 +650,7 @@ fn resolve_array_item_handles<R: Read + Seek>(
         terminal.try_dereference()?;
         if !terminal.is_same_object_as(&item) {
             array.set_array_item(index, terminal)?;
-            changed = true;
         }
-    }
-    if changed {
-        pdf.mark_object_handle_dirty(array)?;
     }
     Ok(())
 }
@@ -693,24 +677,17 @@ fn resolve_array_item_handles<R: Read + Seek>(
 /// (for example a destination `/ColorSpace` when DR has only `/Font`)
 /// that qpdf itself never touches.
 ///
-/// Returns the destination's own indirect array-shaped matched
-/// categories, so the caller can mark them dirty *before* calling
-/// [`ObjectHandle::merge_resources`]: qpdf's array branch, unlike its
-/// dictionary branch, mutates a shared indirect array in place rather
-/// than privatizing it first (`QPDFObjectHandle.cc:1130-1147` has no
-/// `isIndirect()`/`shallowCopy()` step the way the dictionary branch does
-/// at `:1093`), and [`ObjectHandle::merge_resources`] correctly mirrors
-/// that. Because a later category can still fail after an earlier
-/// array-shaped category was already mutated (entries merged before the
-/// failing one stay installed, per that method's own `# Errors` doc), the
-/// caller must mark every returned array dirty regardless of whether the
-/// merge call that follows ultimately succeeds.
+/// qpdf's array branch, unlike its dictionary branch, mutates a shared
+/// indirect array in place rather than privatizing it first
+/// (`QPDFObjectHandle.cc:1130-1147` has no `isIndirect()`/`shallowCopy()` step
+/// the way the dictionary branch does at `:1093`). A later category can still
+/// fail after an earlier array-shaped category was already mutated; entries
+/// merged before the failing one stay installed.
 fn resolve_matched_category_handles<R: Read + Seek>(
-    pdf: &mut Pdf<R>,
+    _pdf: &mut Pdf<R>,
     resources: &ObjectHandle,
     default_resources: &ObjectHandle,
-) -> Result<Vec<ObjectHandle>> {
-    let mut dirty_arrays = Vec::new();
+) -> Result<()> {
     let dest_entries = resources.try_as_dictionary()?.unwrap_or_default();
     let source_entries = default_resources.try_as_dictionary()?.unwrap_or_default();
     for (category, source_value) in source_entries {
@@ -722,21 +699,17 @@ fn resolve_matched_category_handles<R: Read + Seek>(
         let Some(dest_value) = dest_entries.get(&category) else {
             continue;
         };
-        let dest_was_indirect = dest_value.is_indirect();
         let dest_terminal = dest_value.clone();
         dest_terminal.try_dereference()?;
         if !dest_terminal.is_same_object_as(dest_value) {
             resources.replace_key(&category, dest_terminal.clone())?;
         }
         if dest_terminal.try_as_array()?.is_some() && source_terminal.try_as_array()?.is_some() {
-            resolve_array_item_handles(pdf, &dest_terminal)?;
-            resolve_array_item_handles(pdf, &source_terminal)?;
-            if dest_was_indirect {
-                dirty_arrays.push(dest_terminal);
-            }
+            resolve_array_item_handles(_pdf, &dest_terminal)?;
+            resolve_array_item_handles(_pdf, &source_terminal)?;
         }
     }
-    Ok(dirty_arrays)
+    Ok(())
 }
 
 /// Return the live Widget identities that qpdf's AcroForm analysis associates
@@ -833,11 +806,6 @@ fn merge_widget_default_resources_on_page_with_associations<R: Read + Seek>(
         let resources = if was_indirect {
             let privatized = resources.shallow_copy()?;
             appearance_dict.replace_key(b"/Resources", privatized.clone())?;
-            // Mark the owning appearance stream dirty immediately: a
-            // malformed (non-dictionary) privatized value still falls
-            // through to the `continue` below, and the /Resources rewrite
-            // must persist even on that path.
-            pdf.mark_object_handle_dirty(&appearance)?;
             privatized
         } else {
             resources
@@ -854,17 +822,7 @@ fn merge_widget_default_resources_on_page_with_associations<R: Read + Seek>(
         // See resolve_matched_category_handles's doc for why this resolves
         // source and matching-destination categories interleaved, one DR
         // category at a time, rather than in two whole-dictionary passes.
-        let dirty_arrays = resolve_matched_category_handles(pdf, &resources, default_resources)?;
-        // Mark every handle the upcoming merge will touch dirty *before*
-        // calling it: entries merged before a later category's failure
-        // stay installed in the live handle graph (matching qpdf's own
-        // partial-mutation-on-exception behavior, documented on
-        // merge_resources's `# Errors`), so the dirty marks must already be
-        // in place before that fallible call, not only after it returns.
-        pdf.mark_object_handle_dirty(&resources)?;
-        for array in &dirty_arrays {
-            pdf.mark_object_handle_dirty(array)?;
-        }
+        resolve_matched_category_handles(pdf, &resources, default_resources)?;
         resources.merge_resources(default_resources, None)?;
     }
     Ok(())
@@ -883,7 +841,6 @@ fn remove_acroform<R: Read + Seek>(pdf: &mut Pdf<R>) -> Result<()> {
         return Ok(()); // cov:ignore: a parsed Pdf always has a resolvable root
     };
     root.remove_key(b"/AcroForm");
-    pdf.mark_object_handle_dirty(&root)?;
     // qpdf's own `flattenAnnotations` (`QPDFPageDocumentHelper.cc:56-77`)
     // analyzes through a scope-local `QPDFAcroFormDocumentHelper` that goes
     // out of scope on return, so a later step (e.g. `flattenRotation`'s
@@ -1039,8 +996,6 @@ mod tests {
         let rotate = pdf.get_object_handle(ObjectRef::new(4, 0));
         page.replace_key(b"/Rotate", rotate)
             .expect("page must be mutable");
-        pdf.mark_object_handle_dirty(&page)
-            .expect("page mutation must be dirty");
         pdf.replace_object(ObjectRef::new(4, 0), ObjectHandle::integer(270))
             .expect("indirect rotate value must be replaceable");
 
@@ -1061,7 +1016,6 @@ mod tests {
             )]),
         )
         .unwrap();
-        pdf.mark_object_handle_dirty(&root).unwrap();
 
         assert!(acroform_need_appearances(&mut pdf).unwrap());
 
@@ -1088,7 +1042,6 @@ mod tests {
         pdf.resolve(&root).unwrap();
         root.replace_key(b"/AcroForm", pdf.get_object_handle(acroform_ref))
             .unwrap();
-        pdf.mark_object_handle_dirty(&root).unwrap();
 
         let logger = crate::QPDFLogger::create();
         logger.set_warn(Some(PipelineHandle::new(
@@ -1109,7 +1062,6 @@ mod tests {
         pdf.resolve(&page).unwrap();
         page.replace_key(b"/Annots", ObjectHandle::integer(7))
             .unwrap();
-        pdf.mark_object_handle_dirty(&page).unwrap();
 
         let pruned = build_pruned_annots_array(&mut pdf, ObjectRef::new(3, 0), &[]).unwrap();
         assert!(pruned.as_array().unwrap().is_empty());
@@ -1125,7 +1077,6 @@ mod tests {
             ObjectHandle::dictionary(vec![(b"/Fields".to_vec(), ObjectHandle::array(Vec::new()))]),
         )
         .unwrap();
-        pdf.mark_object_handle_dirty(&root).unwrap();
 
         pdf.replace_object(ObjectRef::new(7, 0), ObjectHandle::dictionary(Vec::new()))
             .unwrap();
@@ -1235,7 +1186,6 @@ mod tests {
                 )]),
             )
             .unwrap();
-        pdf.mark_object_handle_dirty(&catalog).unwrap();
 
         merge_widget_default_resources_on_page(&mut pdf, ObjectRef::new(3, 0), &default_resources)
             .unwrap();
@@ -1330,7 +1280,6 @@ mod tests {
         let catalog = pdf.get_object_handle(ObjectRef::new(1, 0));
         pdf.resolve(&catalog).unwrap();
         catalog.replace_key(b"/AcroForm", acroform).unwrap();
-        pdf.mark_object_handle_dirty(&catalog).unwrap();
 
         let error = flatten_annotations_qpdf(&mut pdf, &[ObjectRef::new(3, 0)], 0, 0x3)
             .expect_err("production flatten must propagate the DR merge failure");
@@ -1574,11 +1523,11 @@ mod tests {
     }
 
     #[test]
-    fn qpdf_flatten_marks_an_indirect_array_category_dirty_after_merge() {
+    fn qpdf_flatten_keeps_an_indirect_array_category_live_after_merge() {
         // qpdf's array branch (QPDFObjectHandle.cc:1130-1147) mutates a
         // shared indirect destination array in place, unlike its dictionary
-        // branch. The mutated array's own indirect owner must be marked
-        // dirty explicitly so the writer observes the merged content.
+        // branch. The shared owner must remain live so the writer observes
+        // the merged content.
         let mut pdf = Pdf::open(Cursor::new(build_pdf("/Annots [4 0 R]", &[]))).unwrap();
         register_acroform_fields(&mut pdf, &[]);
         pdf.replace_object(
@@ -1613,19 +1562,8 @@ mod tests {
             ObjectHandle::array(vec![ObjectHandle::name(b"Text".to_vec())]),
         )]);
 
-        // Setup's replace_object calls already left object 9 dirty;
-        // clear that so the post-merge dirty assertion below can only pass
-        // because the merge itself marks the mutated array's indirect owner
-        // dirty, not because it was already dirty from construction.
-        pdf.clear_dirty(ObjectRef::new(9, 0));
-
         merge_widget_default_resources_on_page(&mut pdf, ObjectRef::new(3, 0), &default_resources)
             .unwrap();
-
-        assert!(
-            pdf.is_dirty(ObjectRef::new(9, 0)),
-            "the mutated indirect array's owner must be marked dirty after the merge"
-        );
 
         // Reach /ProcSet through the appearance's own resource dictionary,
         // not by looking object 9 up directly, so a regression that rebinds
@@ -1663,7 +1601,7 @@ mod tests {
     }
 
     #[test]
-    fn qpdf_flatten_keeps_an_earlier_indirect_array_merge_dirty_after_a_later_category_fails() {
+    fn qpdf_flatten_keeps_an_earlier_indirect_array_merge_after_a_later_category_fails() {
         // merge_resources documents that entries merged before a later
         // category's failure stay installed in the live handle graph,
         // matching an exception unwinding out of qpdf's own loop. DR's
@@ -1674,8 +1612,8 @@ mod tests {
         //
         // ObjectHandle reads are always live off the shared canonical
         // handle graph, so a stale-content check alone cannot tell whether
-        // the /ProcSet merge's dirty mark survived the later failure --
-        // that must be asserted directly via pdf.is_dirty.
+        // the /ProcSet merge survived the later failure -- that is asserted
+        // directly through the live handle below.
         let mut pdf = Pdf::open(Cursor::new(build_pdf("/Annots [4 0 R]", &[]))).unwrap();
         register_acroform_fields(&mut pdf, &[]);
         pdf.replace_object(
@@ -1725,13 +1663,6 @@ mod tests {
         assert_eq!(proc_set_before_items.len(), 1);
         assert_eq!(proc_set_before_items[0].as_name(), Some(b"PDF".to_vec()));
 
-        // Setup's replace_object calls already left object 9 dirty;
-        // clear that so the post-merge dirty assertion below can only pass
-        // because the /ProcSet merge itself marks object 9 dirty (and that
-        // mark survives the later /XObject failure), not because it was
-        // already dirty from construction.
-        pdf.clear_dirty(ObjectRef::new(9, 0));
-
         let error = merge_widget_default_resources_on_page(
             &mut pdf,
             ObjectRef::new(3, 0),
@@ -1743,17 +1674,8 @@ mod tests {
             Error::System(message) if message == "stream objects cannot be cloned"
         ));
 
-        // qpdf's merge_resources documents that entries merged before a
-        // later category's failure stay installed and dirty in the live
-        // handle graph. ObjectHandle reads are always live regardless of
-        // dirty state (dirty only controls what the writer emits), so the
-        // dirty mark itself must be asserted directly rather than inferred
-        // from content still being visible through resolve.
-        assert!(
-            pdf.is_dirty(ObjectRef::new(9, 0)),
-            "the /ProcSet merge that ran before the /XObject failure must leave its \
-             indirect array owner dirty, not roll the dirty mark back"
-        );
+        // qpdf's merge_resources leaves entries merged before a later
+        // category failure installed in the live handle graph.
 
         // Reach /ProcSet through the appearance's own resource dictionary,
         // not by looking object 9 up directly, so a regression that rebinds
@@ -2070,7 +1992,6 @@ mod tests {
         pdf.resolve(&page).unwrap();
         page.replace_key(b"/Annots", ObjectHandle::array(vec![widget]))
             .unwrap();
-        pdf.mark_object_handle_dirty(&page).unwrap();
 
         let default_resources = ObjectHandle::dictionary(Vec::new());
         merge_widget_default_resources_on_page(&mut pdf, page_ref, &default_resources).unwrap();
@@ -2154,7 +2075,6 @@ mod tests {
         annotation
             .replace_key(b"/AP", ObjectHandle::dictionary(Vec::new()))
             .unwrap();
-        pdf.mark_object_handle_dirty(&annotation).unwrap();
 
         flatten_annotations_qpdf(&mut pdf, &[ObjectRef::new(3, 0)], 0, 0x3).unwrap();
 
@@ -2271,7 +2191,6 @@ mod tests {
         pdf.resolve(&root).unwrap();
         let acroform_handle = pdf.get_object_handle(acroform_ref);
         root.replace_key(b"/AcroForm", acroform_handle).unwrap();
-        pdf.mark_object_handle_dirty(&root).unwrap();
 
         flatten_annotations_qpdf(&mut pdf, &[ObjectRef::new(3, 0)], 0, 0x3).unwrap();
         let appearance = pdf.get_object_handle(appearance_ref);
@@ -2405,7 +2324,6 @@ mod tests {
             .unwrap();
         root.replace_key(b"/AcroForm", pdf.get_object_handle(acroform_ref))
             .unwrap();
-        pdf.mark_object_handle_dirty(&root).unwrap();
     }
 
     /// Build a minimal Form XObject stream with given /BBox.
@@ -2589,7 +2507,6 @@ mod tests {
                 )]),
             )
             .unwrap();
-        pdf.mark_object_handle_dirty(&annotation).unwrap();
 
         assert_eq!(
             flatten_annotations_on_page(&mut pdf, ObjectRef::new(3, 0), FlattenMode::All).unwrap(),

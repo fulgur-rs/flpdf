@@ -49,7 +49,6 @@ pub fn run_from_scratch(test_number: i32) -> flpdf::Result<()> {
     page.replace_key(b"/MediaBox", ObjectHandle::parse(b"[0 0 612 792]")?)?;
     page.replace_key(b"/Contents", contents)?;
     page.replace_key(b"/Resources", resources)?;
-    pdf.mark_object_handle_dirty(&page)?;
 
     let page_ref = page
         .object_ref()
@@ -98,7 +97,6 @@ fn build_many_nulls_document(
         b"<< /Type /Page /MediaBox [0 0 612 792] >>",
     )?)?;
     kids.append_array_item(page)?;
-    pdf.mark_object_handle_dirty(&kids)?;
 
     Ok(pdf)
 }

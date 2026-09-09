@@ -3089,8 +3089,6 @@ mod tests {
         stream
             .add_token_filter(Rc::new(std::cell::RefCell::new(PassThroughTokenFilter)))
             .expect("register token filter");
-        pdf.mark_object_handle_dirty(&stream)
-            .expect("mark modified content");
 
         let options = WriterOptions {
             object_streams: ObjectStreamMode::Disable,

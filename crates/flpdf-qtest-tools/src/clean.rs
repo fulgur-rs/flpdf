@@ -32,9 +32,6 @@ pub fn clean_trailer_handle<R: Read + Seek>(
     if both_equal {
         id.set_array_item(0, ObjectHandle::string(Vec::new()))?;
     }
-    if id.object_ref().is_some() {
-        pdf.mark_object_handle_dirty(&id)?;
-    }
     Ok(())
 }
 
@@ -54,9 +51,6 @@ pub fn clean_encryption_handle<R: Read + Seek>(
     }
     for key in [b"/O".as_ref(), b"/OE", b"/U", b"/UE", b"/Perms"] {
         encrypt.remove_key(key);
-    }
-    if encrypt.object_ref().is_some() {
-        pdf.mark_object_handle_dirty(&encrypt)?;
     }
     Ok(())
 }

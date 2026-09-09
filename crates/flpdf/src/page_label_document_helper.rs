@@ -734,7 +734,6 @@ impl<'a, R: Read + Seek> PageLabelDocumentHelper<'a, R> {
         let page_labels =
             ObjectHandle::dictionary(vec![(b"/Nums".to_vec(), ObjectHandle::array(nums))]);
         catalog.replace_key(b"/PageLabels", page_labels)?;
-        self.pdf.mark_object_handle_dirty(&catalog)?;
         Ok(())
     }
 
@@ -762,7 +761,6 @@ impl<'a, R: Read + Seek> PageLabelDocumentHelper<'a, R> {
         let page_labels =
             ObjectHandle::dictionary(vec![(b"/Nums".to_vec(), ObjectHandle::array(nums))]);
         catalog.replace_key(b"/PageLabels", page_labels)?;
-        self.pdf.mark_object_handle_dirty(&catalog)?;
         Ok(())
     }
 }
@@ -849,8 +847,6 @@ mod tests {
         catalog
             .replace_key(b"/PageLabels", value)
             .expect("install catalog page labels");
-        pdf.mark_object_handle_dirty(&catalog)
-            .expect("mark catalog dirty");
     }
 
     fn pdf_with_pagelabels(nums: Vec<ObjectHandle>) -> Pdf<Cursor<Vec<u8>>> {
@@ -908,19 +904,14 @@ mod tests {
     }
 
     #[test]
-    fn ranges_does_not_dirty_a_valid_indirect_tree() {
+    fn ranges_reads_a_valid_indirect_tree() {
         let mut pdf = pdf_with_pagelabels(vec![
             ObjectHandle::integer(0),
             label_dict("D", Some(1), None),
         ]);
-        for object_ref in pdf.dirty_object_refs() {
-            pdf.clear_dirty(object_ref);
-        }
-
         let ranges = pdf.page_labels().ranges().expect("read ranges");
 
         assert_eq!(ranges.len(), 1);
-        assert!(pdf.dirty_object_refs().is_empty());
     }
 
     #[test]

@@ -51,7 +51,6 @@ pub(crate) fn run_test_50<R: Read + Seek>(
     emit_new_diagnostics(pdf, diagnostics_written, filename, stdout, stderr)?;
 
     d1.merge_resources(&d2, None)?;
-    pdf.mark_object_handle_dirty(&d1)?;
 
     // `d1.getJSON(JSON::LATEST)` uses qpdf's default
     // `dereference_indirect = false` (`include/qpdf/QPDFObjectHandle.hh`):
@@ -80,7 +79,6 @@ pub(crate) fn run_test_50<R: Read + Seek>(
     let d2_k1 = d2_k1_handle.clone();
     emit_new_diagnostics(pdf, diagnostics_written, filename, stdout, stderr)?;
     d1.merge_resources(&d2_k1, None)?;
-    pdf.mark_object_handle_dirty(&d1)?;
 
     // qpdf iterates `d1`'s top-level keys whose already-merged value is itself
     // a dictionary, printing the sorted names returned by
@@ -367,7 +365,6 @@ pub(crate) fn run_test_53<R: Read + Seek>(
     stdout.write_all(b"\n")?;
 
     root.replace_key(b"/Q1", new_object)?;
-    pdf.mark_object_handle_dirty(&root)?;
 
     writeln!(stdout, "all objects")?;
     for object in pdf.get_all_objects()? {
@@ -460,7 +457,6 @@ pub(crate) fn run_test_55<R: Read + Seek>(
     // writer (`qpdf/test_driver.cc:2065`).
     let trailer = pdf.trailer();
     trailer.replace_key(b"/QTest", qtest)?;
-    pdf.mark_object_handle_dirty(&trailer)?;
 
     let mut writer = PdfWriter::new(pdf);
     writer.set_output_file("a.pdf")?;
@@ -589,8 +585,6 @@ mod tests {
         for kid in [&radio_kid1, &radio_kid2] {
             kid.replace_key(b"/Parent", radio2.clone())
                 .expect("link radio widget to parent");
-            pdf.mark_object_handle_dirty(kid)
-                .expect("mark radio widget dirty");
         }
         let acroform = ObjectHandle::dictionary(vec![(
             b"/Fields".to_vec(),
@@ -599,8 +593,6 @@ mod tests {
         let root = pdf.root_handle().expect("root");
         root.replace_key(b"/AcroForm", acroform)
             .expect("install AcroForm");
-        pdf.mark_object_handle_dirty(&root)
-            .expect("mark catalog dirty");
         pdf
     }
 

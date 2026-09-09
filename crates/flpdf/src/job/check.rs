@@ -2296,8 +2296,6 @@ mod tests {
         page.try_dereference().expect("page should resolve");
         page.replace_key(b"/Contents", ObjectHandle::integer(42))
             .expect("page should be mutable");
-        pdf.mark_object_handle_dirty(&page)
-            .expect("page mutation should be tracked");
 
         let output = Arc::new(Mutex::new(Vec::new()));
         let logger = logger_with_capture(Arc::clone(&output));
@@ -2319,8 +2317,6 @@ mod tests {
         page.try_dereference().expect("page should resolve");
         page.replace_key(b"/Contents", ObjectHandle::integer(42))
             .expect("page should be mutable");
-        pdf.mark_object_handle_dirty(&page)
-            .expect("page mutation should be tracked");
 
         let logger = QPDFLogger::create();
         logger.set_output_streams(None, Some(PipelineHandle::new(FailingCapture)));
@@ -2467,8 +2463,6 @@ mod tests {
         page.try_dereference().expect("page should resolve");
         page.replace_key(b"/Contents", ObjectHandle::integer(42))
             .expect("page should be mutable");
-        pdf.mark_object_handle_dirty(&page)
-            .expect("page mutation should be tracked");
         let document_logger = QPDFLogger::create();
         document_logger.set_warn(Some(PipelineHandle::new(
             crate::pipeline::test_support::NthWriteFailure::new(1),

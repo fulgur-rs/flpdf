@@ -86,8 +86,6 @@ fn replace_catalog_key(pdf: &mut Pdf<Cursor<Vec<u8>>>, key: &[u8], value: Object
     catalog
         .replace_key(key, value)
         .expect("replace catalog key");
-    pdf.mark_object_handle_dirty(&catalog)
-        .expect("mark catalog dirty");
 }
 
 fn make_indirect(pdf: &Pdf<Cursor<Vec<u8>>>, value: ObjectHandle) -> ObjectHandle {
@@ -465,8 +463,6 @@ fn insert_does_not_allocate_for_direct_names_dictionary() {
     catalog
         .replace_key(b"/Names", names.shallow_copy().expect("copy Names"))
         .expect("make Names direct");
-    pdf.mark_object_handle_dirty(&catalog)
-        .expect("mark catalog dirty");
     // Register the highest possible identity so any accidental allocation
     // still fails, without using the legacy Object cache setter.
     let _max_handle = pdf.get_object_handle(ObjectRef::new(u32::MAX, 0));
@@ -1418,8 +1414,6 @@ fn helper_replace_keeps_direct_names_dictionary_direct() {
     catalog
         .replace_key(b"/Names", names)
         .expect("install direct Names");
-    pdf.mark_object_handle_dirty(&catalog)
-        .expect("mark catalog dirty");
 
     pdf.embedded_files()
         .replace_embedded_file(b"direct", filespec)

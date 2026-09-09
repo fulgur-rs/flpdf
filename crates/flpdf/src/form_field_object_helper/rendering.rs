@@ -361,8 +361,7 @@ fn add_default_font_to_existing_appearance<R: Read + Seek>(
     resources
         .get_key(b"/Font")
         .replace_key(&resource_key(&font.resource_name), font.font.clone())?;
-    pdf.mark_object_handle_dirty(&resources)?;
-    pdf.mark_object_handle_dirty(&stream_dict)
+    Ok(())
 }
 
 fn install_normal_appearance_canonical_handles<R: Read + Seek>(
@@ -387,11 +386,6 @@ fn install_normal_appearance_canonical_handles<R: Read + Seek>(
             add_default_font_to_existing_appearance(pdf, &normal, font)?;
         }
         normal.add_token_filter(Rc::new(RefCell::new(AppearanceTokenFilter::new(&content))))?;
-        pdf.mark_object_handle_dirty(
-            &normal
-                .as_stream_dict()
-                .expect("stream checked immediately above"),
-        )?; // cov:ignore: llvm-cov maps the successful continuation to a zero-count region
         return normal
             .object_ref()
             .ok_or_else(|| {
@@ -429,12 +423,10 @@ fn install_normal_appearance_canonical_handles<R: Read + Seek>(
         )?; // cov:ignore: llvm-cov maps the successful resource insertion continuation to a zero-count region
     }
     stream_dict.replace_key(b"/Resources", resources)?;
-    pdf.mark_object_handle_dirty(&stream_dict)?;
 
     let ap = if ap.is_null() {
         let ap = ObjectHandle::dictionary(Vec::new());
         widget.replace_key(b"/AP", ap.clone())?;
-        pdf.mark_object_handle_dirty(&widget)?;
         ap
     } else {
         ap
@@ -443,7 +435,6 @@ fn install_normal_appearance_canonical_handles<R: Read + Seek>(
     // qpdf's replaceKey is a no-op for a non-dictionary /AP value.
     if ap.as_dictionary().is_some() {
         ap.replace_key(b"/N", stream.clone())?;
-        pdf.mark_object_handle_dirty(&ap)?;
     } else {
         return Ok(None);
     }
