@@ -31,10 +31,31 @@ use flpdf::{AnnotationObjectHelper, DecodeLevel, Pdf};
 use std::fs::File;
 use std::io::BufReader;
 use std::path::Path;
+use std::process::Command as ProcessCommand;
 
 mod common;
 use common::PdfCanonicalTestExt;
 use common::{first_widget_ref, page_annotation_handles};
+
+const EXPECTED_QPDF_VERSION: &str = "qpdf version 11.9.0";
+
+/// `true` when the pinned qpdf oracle is runnable, mirroring the optional
+/// oracle gate the other differential suites use. The version is pinned
+/// because a differential assertion against a different qpdf is not a parity
+/// result.
+fn qpdf_available() -> bool {
+    ProcessCommand::new("qpdf")
+        .arg("--version")
+        .output()
+        .map(|output| {
+            output.status.success()
+                && String::from_utf8_lossy(&output.stdout)
+                    .lines()
+                    .next()
+                    .is_some_and(|line| line.trim() == EXPECTED_QPDF_VERSION)
+        })
+        .unwrap_or(false)
+}
 
 // ── Fixture helpers ───────────────────────────────────────────────────────────
 
@@ -382,6 +403,59 @@ fn top_level_generate_appearances_routes_to_canonical_writer() {
     assert!(
         appearance.windows(2).any(|window| window == b"Tj"),
         "top-level --generate-appearances must render the field value"
+    );
+}
+
+/// qpdf applies generateAppearances before its read-only object inspection.
+/// The top-level CLI must expose the same transformed widget, not merely
+/// accept and discard the flag.
+#[test]
+fn top_level_generate_appearances_runs_before_show_object_like_qpdf() {
+    if !qpdf_available() {
+        if std::env::var_os("CI").is_some() {
+            panic!("{EXPECTED_QPDF_VERSION} is required for this parity test on CI");
+        }
+        eprintln!("skipping: {EXPECTED_QPDF_VERSION} is not available");
+        return;
+    }
+    let temp = tempfile::tempdir().unwrap();
+    let input = temp.path().join("inspection-tx.pdf");
+    std::fs::write(&input, tx_widget_without_ap_needing_appearances()).unwrap();
+
+    let qpdf = ProcessCommand::new("qpdf")
+        .args(["--show-object=4", "--generate-appearances"])
+        .arg(&input)
+        .output()
+        .expect("qpdf 11.9.0 must be available");
+    assert!(qpdf.status.success(), "qpdf show-object failed: {qpdf:?}");
+    assert!(
+        qpdf.stdout
+            .windows(b"/AP".len())
+            .any(|window| window == b"/AP"),
+        "qpdf must expose the generated normal appearance: {}",
+        String::from_utf8_lossy(&qpdf.stdout)
+    );
+
+    let flpdf = Command::cargo_bin("flpdf")
+        .unwrap()
+        .args(["--show-object=4", "--generate-appearances"])
+        .arg(&input)
+        .output()
+        .unwrap();
+    assert_eq!(
+        flpdf.status.code(),
+        qpdf.status.code(),
+        "flpdf must accept the same inspection combination as qpdf"
+    );
+    assert_eq!(
+        flpdf.stdout,
+        qpdf.stdout,
+        "flpdf must render the transformed widget exactly like qpdf: {}",
+        String::from_utf8_lossy(&flpdf.stdout)
+    );
+    assert_eq!(
+        flpdf.stderr, qpdf.stderr,
+        "flpdf must preserve qpdf diagnostics for the transformed inspection"
     );
 }
 

@@ -6368,15 +6368,87 @@ fn top_level_coalesce_contents_conflicts_with_empty() {
 }
 
 #[test]
-fn top_level_generate_appearances_conflicts_with_check() {
-    // Silent-shadow guard: --check's inspection dispatch never reaches the
-    // rewrite path that reads `args.generate_appearances`.
-    Command::cargo_bin("flpdf")
+fn top_level_generate_appearances_accepts_check_like_qpdf() {
+    let input = "../../tests/fixtures/compat/form-fields-and-annotations.pdf";
+    let qpdf = ProcessCommand::new("qpdf")
+        .args(["--generate-appearances", "--check", input])
+        .output()
+        .expect("qpdf 11.9.0 must be available");
+    let flpdf = Command::cargo_bin("flpdf")
         .unwrap()
-        .args(["--generate-appearances", "--check", "in.pdf"])
-        .assert()
-        .failure()
-        .code(2);
+        .args(["--generate-appearances", "--check", input])
+        .output()
+        .unwrap();
+
+    assert_eq!(
+        flpdf.status.code(),
+        qpdf.status.code(),
+        "top-level generate-appearances + check must preserve qpdf's exit status"
+    );
+    assert_eq!(
+        flpdf.stdout, qpdf.stdout,
+        "top-level generate-appearances + check must preserve qpdf's report"
+    );
+    assert_eq!(
+        flpdf.stderr, qpdf.stderr,
+        "top-level generate-appearances + check must preserve qpdf diagnostics"
+    );
+}
+
+/// `--check-linearization` is one of `doInspection`'s modes
+/// (`QPDFJob.cc:1653-1661`), and `checkConfiguration` (`QPDFJob.cc:566-641`)
+/// never looks at `generate_appearances`, so qpdf accepts the pair.
+#[test]
+fn top_level_generate_appearances_accepts_check_linearization_like_qpdf() {
+    if !qpdf_available() {
+        if std::env::var_os("CI").is_some() {
+            panic!("{EXPECTED_QPDF_VERSION} is required for this parity test on CI");
+        }
+        eprintln!("skipping: {EXPECTED_QPDF_VERSION} is not available");
+        return;
+    }
+    let input = "../../tests/fixtures/compat/form-fields-and-annotations.pdf";
+    let args = ["--generate-appearances", "--check-linearization", input];
+    let qpdf = ProcessCommand::new("qpdf")
+        .args(args)
+        .output()
+        .expect("qpdf 11.9.0 must be available");
+    let flpdf = Command::cargo_bin("flpdf")
+        .unwrap()
+        .args(args)
+        .output()
+        .unwrap();
+
+    assert_eq!(flpdf.status.code(), qpdf.status.code());
+    assert_eq!(flpdf.stdout, qpdf.stdout);
+    assert_eq!(flpdf.stderr, qpdf.stderr);
+}
+
+/// `--empty` only chooses the input (`QPDFJob.cc:1716-1723`), so it does not
+/// disqualify a transformation either.
+#[test]
+fn top_level_generate_appearances_accepts_empty_input_like_qpdf() {
+    if !qpdf_available() {
+        if std::env::var_os("CI").is_some() {
+            panic!("{EXPECTED_QPDF_VERSION} is required for this parity test on CI");
+        }
+        eprintln!("skipping: {EXPECTED_QPDF_VERSION} is not available");
+        return;
+    }
+    let args = ["--empty", "--show-npages", "--generate-appearances"];
+    let qpdf = ProcessCommand::new("qpdf")
+        .args(args)
+        .output()
+        .expect("qpdf 11.9.0 must be available");
+    let flpdf = Command::cargo_bin("flpdf")
+        .unwrap()
+        .args(args)
+        .output()
+        .unwrap();
+
+    assert_eq!(flpdf.status.code(), qpdf.status.code());
+    assert_eq!(flpdf.stdout, qpdf.stdout);
+    assert_eq!(flpdf.stderr, qpdf.stderr);
 }
 
 #[test]
