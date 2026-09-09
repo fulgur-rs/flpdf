@@ -1418,6 +1418,11 @@ pub struct QPDFJob {
     /// `libqpdf/QPDF.cc:290-293`); track the factory outcome separately so a
     /// reused job can still receive an input file afterwards.
     empty_primary_created: bool,
+    /// Whether the current pre-run JSON initialization sequence has already
+    /// populated the configuration. qpdf applies repeated `jobJsonFile`
+    /// occurrences to the same Config object; flpdf also keeps its existing
+    /// reusable-job boundary by starting a fresh partial sequence after run.
+    partial_json_initialized: bool,
 }
 
 /// Fluent configuration proxy for the qpdf `QPDFJob::Config` surface.
@@ -1513,6 +1518,7 @@ impl QPDFJob {
             overlay_sources: Vec::new(),
             encryption_status: EncryptionStatus::default(),
             empty_primary_created: false,
+            partial_json_initialized: false,
         }
     }
 
@@ -2092,21 +2098,25 @@ impl QPDFJob {
         // initialized job behind.
         validate_job_json_schema(&value)?;
         // qpdf's initializeFromJson configures the existing QPDFJob rather
-        // than replacing its page group (`QPDFJob_json.cc:611-625`). Preserve
-        // only that page-group state here: this lifecycle entry point has
-        // historically reinitialized the remaining job settings for a new
-        // JSON document, and the one-time page guard does not require a wider
-        // input/output-state migration.
-        let mut configuration = JobConfiguration {
-            require_output: true,
-            json_decode_level: crate::writer::DecodeLevel::Generalized,
-            page_specs: self.configuration.page_specs.clone(),
-            page_specs_origin: self.configuration.page_specs_origin,
-            ..JobConfiguration::default()
+        // than replacing its state (`QPDFJob_json.cc:611-625`). Partial
+        // job-json-file occurrences therefore continue from the same mutable
+        // configuration, while the first partial document and a standalone
+        // full initialization keep the historical fresh-job boundary.
+        let mut configuration = if partial && self.partial_json_initialized {
+            self.configuration.clone()
+        } else {
+            JobConfiguration {
+                require_output: true,
+                json_decode_level: crate::writer::DecodeLevel::Generalized,
+                page_specs: self.configuration.page_specs.clone(),
+                page_specs_origin: self.configuration.page_specs_origin,
+                ..JobConfiguration::default()
+            }
         };
         self.dispatch_job_json_document(&mut configuration, &value, &mut BTreeSet::new())?;
 
         self.configuration = configuration;
+        self.partial_json_initialized = partial;
         let input_name = self
             .configuration
             .input_file
@@ -3383,6 +3393,13 @@ impl QPDFJob {
 
     /// Run the configured create/write or check lifecycle.
     pub fn run(&mut self) -> Result<JobExitCode> {
+        // A completed run is the boundary for flpdf's reusable in-process job
+        // lifecycle. qpdf's CLI applies every --job-json-file occurrence
+        // before its single run() call (`QPDFJob.cc:514-520`); clearing this
+        // marker here preserves the existing ability to configure a reused
+        // QPDFJob without weakening the repeated-occurrence contract within
+        // one command.
+        self.partial_json_initialized = false;
         if self.configuration.is_encrypted || self.configuration.requires_password {
             return self.run_encryption_status();
         }

@@ -1106,6 +1106,13 @@ top-level token loop で 2 回目を検出し、qpdf と同じ文言・同じ ex
 qpdf は argv 順で最初に問題のあるトークンで失敗するため、この診断は即座に返さず
 保留し、より前の unknown option があればそちらを優先し、より後ろの prescan 失敗
 （missing parameter・invalid choice）にはこちらを渡す。
+
+`flpdf-1qhb` では `--job-json-file` を clap の self-override 対象にせず
+`ArgAction::Append` で occurrence を保持し、`QPDFJob::initialize_from_json_partial_bytes`
+を argv 順に同じjobへ適用する。これは qpdf の `Config::jobJsonFile` が各 occurrenceで
+`initializeFromJson(..., true)`を呼ぶ契約（`QPDFJob_config.cc:774-784`）に対応し、
+input/outputなど非加算設定の重複は後勝ちではなくqpdfのusage errorとして残す。
+
 | `QPDFLogger.cc` | 255 | `logger.rs`（private stdout tracker、shared info/warn/error/save routes、standard stdout/stderr/discard、reset/following、save collision、custom sink ownership）+ `reader/resolver.rs` / `reader.rs`（文書 warning の append-then-route、suppression、live logger replacement）+ `flpdf-cli/src/main.rs`（下記 qpdf-equivalent consumers） | ✅ `QPDFLogger.cc:9-40,43-51,80-254`。`diagnostics.rs` は logger ではなく collection-only value store として維持する |
 
 `QPDFArgParser` の help-table 境界は、`flpdf-cli/src/arg_parser.rs` の raw/canonical 二重 argv と
