@@ -170,3 +170,78 @@ fn show_object_unfilterable_stream_reports_qpdf_warning_and_object_error() {
         "internal getStreamData error leaked: {stderr}"
     );
 }
+
+/// `doShowObj` reads `m->normalize`, and only `Config::normalizeContent` sets
+/// it (`QPDFJob_config.cc:412-418`). QDF derives its implicit normalization
+/// during writer setup instead, behind `if (m->normalize_set)`
+/// (`QPDFJob.cc:2861-2863`), so `--qdf` alone must not normalize the shown
+/// stream. Probed with qpdf 11.9.0 on this fixture's object 6: the bytes with
+/// `--qdf` alone match the plain run, and differ from `--normalize-content=y`.
+#[test]
+fn show_object_filtered_stream_ignores_qdf_implicit_normalization() {
+    let plain = flpdf(&[
+        "--show-object=6",
+        "--filtered-stream-data",
+        NULL_LENGTH_FRAMING,
+    ]);
+    let with_qdf = flpdf(&[
+        "--show-object=6",
+        "--filtered-stream-data",
+        "--qdf",
+        NULL_LENGTH_FRAMING,
+    ]);
+    let normalized = flpdf(&[
+        "--show-object=6",
+        "--filtered-stream-data",
+        "--normalize-content=y",
+        NULL_LENGTH_FRAMING,
+    ]);
+
+    // The fixture recovers a missing `/Length`, so every run warns and exits 3
+    // — qpdf does the same.
+    assert_eq!(plain.status.code(), Some(3), "stderr: {:?}", plain.stderr);
+    assert_eq!(with_qdf.status.code(), plain.status.code());
+    assert_eq!(
+        with_qdf.stdout, plain.stdout,
+        "--qdf must not normalize the shown stream"
+    );
+    assert_ne!(
+        normalized.stdout, plain.stdout,
+        "the fixture must actually change under normalization, or this pins nothing"
+    );
+}
+
+/// An explicit `--normalize-content=y` still normalizes when `--qdf` is also
+/// given, and `=n` still suppresses it — the explicit setting is what
+/// `doShowObj` reads.
+#[test]
+fn show_object_filtered_stream_honors_explicit_normalization_under_qdf() {
+    let plain = flpdf(&[
+        "--show-object=6",
+        "--filtered-stream-data",
+        NULL_LENGTH_FRAMING,
+    ]);
+    let qdf_yes = flpdf(&[
+        "--show-object=6",
+        "--filtered-stream-data",
+        "--qdf",
+        "--normalize-content=y",
+        NULL_LENGTH_FRAMING,
+    ]);
+    let qdf_no = flpdf(&[
+        "--show-object=6",
+        "--filtered-stream-data",
+        "--qdf",
+        "--normalize-content=n",
+        NULL_LENGTH_FRAMING,
+    ]);
+
+    assert_ne!(
+        qdf_yes.stdout, plain.stdout,
+        "an explicit =y must normalize even under --qdf"
+    );
+    assert_eq!(
+        qdf_no.stdout, plain.stdout,
+        "an explicit =n must suppress normalization under --qdf"
+    );
+}

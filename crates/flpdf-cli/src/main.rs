@@ -3253,7 +3253,14 @@ fn main() {
             object_ref,
             args.raw_stream_data,
             args.filtered_stream_data,
-            normalize_content,
+            // `doShowObj` reads `m->normalize`, which only
+            // `Config::normalizeContent` ever sets
+            // (`QPDFJob_config.cc:412-418`); QDF derives its implicit
+            // normalization during writer setup instead, behind
+            // `if (m->normalize_set)` (`QPDFJob.cc:2861-2863`). So the
+            // inspection route must see the explicit setting alone, not the
+            // writer-facing fold of QDF's default.
+            matches!(args.normalize_content, Some(CliYesNo::Yes)),
             args.no_warn,
             args.page_ops.empty,
             top_level_inspection_transform_options,
