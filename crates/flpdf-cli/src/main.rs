@@ -413,13 +413,34 @@ fn apply_inspection_transformations<R: Read + Seek + 'static>(
     options: InspectionTransformOptions,
     verbose: bool,
 ) -> CliResult<()> {
-    if options.is_empty() {
+    apply_top_level_inspection_transformations(job, pdf, options, verbose, false, false)
+}
+
+/// Apply every create-stage transformation that can accompany a top-level
+/// inspection. qpdf performs these mutations before `doInspection`, even
+/// though the inspection branch creates no output (`QPDFJob.cc:459-489,
+/// 2138-2248`).
+fn apply_top_level_inspection_transformations<R: Read + Seek + 'static>(
+    job: &mut QPDFJob,
+    pdf: &mut Pdf<R>,
+    options: InspectionTransformOptions,
+    verbose: bool,
+    remove_restrictions: bool,
+    coalesce_contents: bool,
+) -> CliResult<()> {
+    if options.is_empty() && !remove_restrictions && !coalesce_contents {
         return Ok(());
     }
 
     job.set_verbose(verbose);
     {
         let mut configuration = job.config();
+        if remove_restrictions {
+            configuration.remove_restrictions();
+        }
+        if coalesce_contents {
+            configuration.coalesce_contents();
+        }
         if options.generate_appearances {
             configuration.generate_appearances();
         }
@@ -766,13 +787,6 @@ struct Cli {
     #[arg(
         long = "check-linearization",
         conflicts_with_all = [
-            "check",
-            "show_object",
-            "show_npages",
-            "show_pages",
-            "show_xref",
-            "show_linearization",
-            "show_encryption",
             "job_json_file",
             "json",
             "json_input",
@@ -782,25 +796,13 @@ struct Cli {
             "json_object",
             "json_stream_data",
             "json_stream_prefix",
-            "linearize",
-            "static_id",
-            "deterministic_id",
-            "static_aes_iv",
-            "remove_restrictions",
-            "decrypt",
-            "qdf",
-            "preserve_unreferenced",
-            "coalesce_contents",
             "pages",
             "rotate",
             "split_pages",
-            "collate",
             "overlay",
             "underlay",
             "add_attachment",
             "remove_attachment",
-            "list_attachments",
-            "show_attachment",
             "copy_attachments_from",
             "encrypt",
             "copy_encryption",
@@ -3302,6 +3304,8 @@ fn main() {
                 None => Err(missing_input_usage_error().into()),
             }
         }
+    } else if top_level_inspection_combination_requested(&args) {
+        run_combined_top_level_inspection(&args, top_level_inspection_transform_options)
     } else if let Some(object_ref) = args.show_object.as_deref() {
         run_show_object(
             args.input,
@@ -3340,17 +3344,6 @@ fn main() {
             &args.password,
             args.with_images,
             args.no_warn,
-            args.page_ops.empty,
-            top_level_inspection_transform_options,
-            args.verbose,
-        )
-    } else if args.check && args.show_xref {
-        run_check_show_xref(
-            args.input,
-            args.repair,
-            &args.password,
-            args.no_warn,
-            args.show_encryption_key,
             args.page_ops.empty,
             top_level_inspection_transform_options,
             args.verbose,
@@ -3865,6 +3858,158 @@ fn new_cli_job(suppress_warnings: bool) -> QPDFJob {
     job.set_suppress_warnings(suppress_warnings);
     job.set_warnings_exit_zero(cli_warning_exit_zero());
     job
+}
+
+fn top_level_inspection_combination_requested(args: &Cli) -> bool {
+    let inspection_count = [
+        args.check,
+        args.show_object.is_some(),
+        args.show_npages,
+        args.show_pages,
+        args.show_xref,
+        args.check_linearization,
+        args.show_linearization,
+        args.show_encryption,
+        args.list_attachments,
+        args.show_attachment.is_some(),
+    ]
+    .into_iter()
+    .filter(|selected| *selected)
+    .count();
+
+    if inspection_count > 1 {
+        return true;
+    }
+
+    // These qpdf settings are accepted together with --check-linearization.
+    // The writer-only settings have no effect when doInspection is selected,
+    // while remove-restrictions/coalesce-contents are applied by the
+    // create-stage transformation boundary below.
+    args.check_linearization
+        && (args.linearize
+            || args.static_id
+            || args.deterministic_id
+            || args.static_aes_iv
+            || args.preserve_unreferenced
+            || args.decrypt
+            || args.qdf
+            || args.coalesce_contents
+            || args.remove_restrictions
+            || !args.page_ops.collate.is_empty())
+}
+
+fn configure_top_level_inspection_job(job: &mut QPDFJob, args: &Cli) -> CliResult<()> {
+    job.set_password_is_hex_key(args.password.password_is_hex_key);
+    job.set_show_encryption_key(args.show_encryption_key);
+    job.set_with_images(args.with_images);
+    job.set_verbose(args.verbose);
+    if args.normalize_content.is_some() {
+        job.set_content_normalization(matches!(args.normalize_content, Some(CliYesNo::Yes)));
+    }
+
+    let mut configuration = job.config();
+    if args.check {
+        configuration.check();
+    }
+    if args.show_npages {
+        configuration.show_npages();
+    }
+    if args.show_encryption {
+        configuration.show_encryption();
+    }
+    if args.check_linearization {
+        configuration.check_linearization();
+    }
+    if args.show_linearization {
+        configuration.show_linearization();
+    }
+    if args.show_xref {
+        configuration.show_xref();
+    }
+    if let Some(selector) = args.show_object.as_deref() {
+        configuration.show_object(selector)?;
+        if args.raw_stream_data {
+            configuration.raw_stream_data();
+        }
+        if args.filtered_stream_data {
+            configuration.filtered_stream_data();
+        }
+    }
+    if args.show_pages {
+        configuration.show_pages();
+    }
+    if args.list_attachments {
+        configuration.list_attachments();
+    }
+    if let Some(key) = args.show_attachment.as_ref() {
+        configuration.show_attachment(arg_parser::os_bytes(key.as_os_str()).to_vec());
+    }
+    Ok(())
+}
+
+fn run_combined_top_level_inspection(
+    args: &Cli,
+    transform_options: InspectionTransformOptions,
+) -> CliResult<()> {
+    let mut job = new_cli_job(args.no_warn);
+    configure_top_level_inspection_job(&mut job, args)?;
+    if args.show_attachment.is_some() {
+        // qpdf reserves the save pipeline during checkConfiguration, before
+        // doInspection emits any info output (`QPDFJob.cc:614-626`). The
+        // attachment report itself repeats the idempotent reservation, but
+        // it must not be the first call after an earlier info report.
+        job.logger().save_to_standard_output(true)?;
+    }
+
+    if args.page_ops.empty {
+        reject_empty_inspection_output(args.input.as_deref())?;
+        let mut pdf = create_empty_primary_document(&mut job, None)?;
+        apply_top_level_inspection_transformations(
+            &mut job,
+            &mut pdf,
+            transform_options,
+            args.verbose,
+            args.remove_restrictions,
+            args.coalesce_contents,
+        )?;
+        return finish_check_job(job.inspect_configured(&mut pdf));
+    }
+
+    let input = args.input.as_ref().ok_or_else(missing_input_usage_error)?;
+    let file = File::open(input).map_err(|error| open_error_with_file(input, error.into()))?;
+    let mut options = pdf_open_options(args.repair, &args.password)?;
+    options.suppress_warnings = args.no_warn;
+    let mut pdf = if args.show_encryption {
+        job.open_for_encryption_inspection_with_description(
+            BufReader::new(file),
+            path_description(input),
+            options,
+        )
+    } else {
+        job.open_with_description(BufReader::new(file), path_description(input), options)
+    }
+    .map_err(|error| error_with_file(input, actionable_password_error(error)))?;
+
+    // qpdf's createQPDF catches a password error for --show-encryption,
+    // emits that report, and returns before handleTransformations or
+    // doInspection (`QPDFJob.cc:437-448`). Preserve that early boundary when
+    // this flag is combined with other inspection selectors.
+    if args.show_encryption && pdf.is_encrypted() && pdf.encryption_file_key().is_none() {
+        job.show_encryption(&mut pdf, args.password.password_is_hex_key)?;
+        job.record_document_warnings(&pdf);
+        job.complete(false)?;
+        return finish_job_exit_status(job.get_exit_code());
+    }
+
+    apply_top_level_inspection_transformations(
+        &mut job,
+        &mut pdf,
+        transform_options,
+        args.verbose,
+        args.remove_restrictions,
+        args.coalesce_contents,
+    )?;
+    finish_check_job(job.inspect_configured(&mut pdf))
 }
 
 fn create_empty_primary_document(
@@ -4774,42 +4919,6 @@ fn run_check(
         };
     apply_inspection_transformations(&mut job, &mut pdf, transform_options, verbose)?;
     finish_check_job(job.check(&mut pdf))
-}
-
-#[allow(clippy::too_many_arguments)]
-fn run_check_show_xref(
-    input: Option<PathBuf>,
-    repair: bool,
-    password: &PasswordArgs,
-    no_warn: bool,
-    show_encryption_key: bool,
-    empty: bool,
-    transform_options: InspectionTransformOptions,
-    verbose: bool,
-) -> CliResult<()> {
-    if empty {
-        reject_empty_inspection_output(input.as_deref())?;
-        let mut job = new_cli_job(no_warn);
-        job.set_show_encryption_key(show_encryption_key);
-        let mut pdf = create_empty_primary_document(&mut job, None)?;
-        apply_inspection_transformations(&mut job, &mut pdf, transform_options, verbose)?;
-        return finish_check_job(job.check_and_show_xref(&mut pdf));
-    }
-    let input = input.ok_or_else(missing_input_usage_error)?;
-    let file = File::open(&input).map_err(|error| open_error_with_file(&input, error.into()))?;
-    let mut job = new_cli_job(no_warn);
-    job.set_show_encryption_key(show_encryption_key);
-    let mut options = pdf_open_options(repair, password)?;
-    options.suppress_warnings = no_warn;
-    let mut pdf =
-        match job.open_with_description(BufReader::new(file), path_description(&input), options) {
-            Ok(pdf) => pdf,
-            Err(error) => {
-                return Err(error_with_file(&input, actionable_password_error(error)));
-            }
-        };
-    apply_inspection_transformations(&mut job, &mut pdf, transform_options, verbose)?;
-    finish_check_job(job.check_and_show_xref(&mut pdf))
 }
 
 fn run_check_linearization(

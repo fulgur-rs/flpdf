@@ -3468,20 +3468,33 @@ fn cli_linearize_encrypt_aes128_byte_identical_to_qpdf() {
 // surface (dispatch conflicts, --no-warn threading, --update-from-json
 // routing). Verified against qpdf 11.9.0 directly (see comments below).
 
-/// `--check-linearization` must reject `--show-encryption`: without this
-/// clap conflict, `check_linearization` wins the dispatch chain in `main()`
-/// and `--show-encryption` is silently dropped rather than surfaced as a
-/// usage error.
+/// `--check-linearization` and `--show-encryption` are independent qpdf
+/// `doInspection` branches and must produce both reports in qpdf order.
 #[test]
-fn top_level_check_linearization_conflicts_with_show_encryption() {
-    Command::cargo_bin("flpdf")
-        .unwrap()
+fn top_level_check_linearization_combines_with_show_encryption_like_qpdf() {
+    let input = fixture(UNENCRYPTED_FIXTURE);
+    let qpdf = ShellCommand::new("qpdf")
         .args(["--check-linearization", "--show-encryption"])
-        .arg(fixture(UNENCRYPTED_FIXTURE))
-        .assert()
-        .failure()
-        .code(2)
-        .stderr(predicate::str::contains("cannot be used with"));
+        .arg(&input)
+        .output()
+        .unwrap();
+    let flpdf = Command::cargo_bin("flpdf")
+        .unwrap()
+        .env("FLPDF_PROGNAME", "qpdf")
+        .args(["--check-linearization", "--show-encryption"])
+        .arg(&input)
+        .output()
+        .unwrap();
+
+    assert_eq!(flpdf.status.code(), qpdf.status.code());
+    assert_eq!(
+        normalize_text_newlines(&flpdf.stdout),
+        normalize_text_newlines(&qpdf.stdout)
+    );
+    assert_eq!(
+        normalize_text_newlines(&flpdf.stderr),
+        normalize_text_newlines(&qpdf.stderr)
+    );
 }
 
 /// `--json` must reject `--show-encryption` for the same reason: `run_json`

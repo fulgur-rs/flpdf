@@ -3416,6 +3416,39 @@ impl QPDFJob {
         Ok(status)
     }
 
+    /// Run the configured qpdf inspection column on one already-open document.
+    ///
+    /// This is the report-only form of `write_qpdf`'s no-output branch. It
+    /// keeps `run_configured_inspection` as the single owner of qpdf's
+    /// independent `doInspection` ordering and emits the warning completion
+    /// exactly once after every selected report (`QPDFJob.cc:483-511,
+    /// 1646-1693`).
+    pub fn inspect_configured<R>(
+        &mut self,
+        pdf: &mut Pdf<R>,
+    ) -> std::result::Result<JobExitCode, super::check::CheckError>
+    where
+        R: Read + Seek + 'static,
+    {
+        let configuration = self.configuration.clone();
+        match self.run_configured_inspection(pdf, &configuration) {
+            Ok(()) => {
+                self.drain_document_warnings(pdf);
+                self.complete(false)?;
+                if self.configuration.report_memory_usage {
+                    self.report_memory_usage()?;
+                }
+                Ok(self.get_exit_code())
+            }
+            Err(InspectionFailure::Reported(_error)) => {
+                Err(super::check::CheckError::ErrorsDetected)
+            }
+            Err(InspectionFailure::Unreported(error)) => {
+                Err(super::check::CheckError::Operation(error))
+            }
+        }
+    }
+
     fn report_memory_usage(&self) -> Result<()> {
         self.logger.warn(format!(
             "qpdf-max-memory-usage {}\n",
@@ -4803,6 +4836,81 @@ impl QPDFJobConfig<'_> {
         self
     }
 
+    /// Select qpdf's `doInspection` document-check branch.
+    pub fn check(&mut self) -> &mut Self {
+        self.job.configuration.check = true;
+        self.job.configuration.require_output = false;
+        self
+    }
+
+    /// Select qpdf's linearization-check inspection branch.
+    pub fn check_linearization(&mut self) -> &mut Self {
+        self.job.configuration.check_linearization = true;
+        self.job.configuration.require_output = false;
+        self
+    }
+
+    /// Select qpdf's raw page-count inspection branch.
+    pub fn show_npages(&mut self) -> &mut Self {
+        self.job.configuration.show_npages = true;
+        self.job.configuration.require_output = false;
+        self
+    }
+
+    /// Select qpdf's page-list inspection branch.
+    pub fn show_pages(&mut self) -> &mut Self {
+        self.job.configuration.show_pages = true;
+        self.job.configuration.require_output = false;
+        self
+    }
+
+    /// Select qpdf's cross-reference inspection branch.
+    pub fn show_xref(&mut self) -> &mut Self {
+        self.job.configuration.show_xref = true;
+        self.job.configuration.require_output = false;
+        self
+    }
+
+    /// Select qpdf's linearization-data inspection branch.
+    pub fn show_linearization(&mut self) -> &mut Self {
+        self.job.configuration.show_linearization = true;
+        self.job.configuration.require_output = false;
+        self
+    }
+
+    /// Select qpdf's encryption-parameters inspection branch.
+    pub fn show_encryption(&mut self) -> &mut Self {
+        self.job.configuration.show_encryption = true;
+        self.job.configuration.require_output = false;
+        self
+    }
+
+    /// Select qpdf's embedded-file listing inspection branch.
+    pub fn list_attachments(&mut self) -> &mut Self {
+        self.job.configuration.list_attachments = true;
+        self.job.configuration.require_output = false;
+        self
+    }
+
+    /// Select qpdf's embedded-file extraction inspection branch.
+    pub fn show_attachment(&mut self, key: impl Into<Vec<u8>>) -> &mut Self {
+        self.job.configuration.show_attachment = Some(key.into());
+        self.job.configuration.require_output = false;
+        self
+    }
+
+    /// Select raw stream output for qpdf's object inspection branch.
+    pub fn raw_stream_data(&mut self) -> &mut Self {
+        self.job.configuration.show_raw_stream_data = true;
+        self
+    }
+
+    /// Select filtered stream output for qpdf's object inspection branch.
+    pub fn filtered_stream_data(&mut self) -> &mut Self {
+        self.job.configuration.show_filtered_stream_data = true;
+        self
+    }
+
     /// Configure qpdf's job-level `normalizeContent` setting.
     pub fn normalize_content(&mut self, value: bool) -> &mut Self {
         self.job.set_content_normalization(value);
@@ -5494,18 +5602,37 @@ mod tests {
             .expect("page remains mutable");
 
         let mut job = QPDFJob::new();
-        let mut configuration = job.configuration.clone();
-        configuration.check = true;
+        job.config().check();
         let failure = job
-            .run_configured_inspection(&mut pdf, &configuration)
+            .inspect_configured(&mut pdf)
             .expect_err("check errors must abort the enclosing inspection");
         // The check consumer already wrote qpdf's single `errors detected`
         // line, so the boundary must not report it again.
-        assert!(matches!(
-            failure,
-            InspectionFailure::Reported(Error::Unsupported(ref message))
-                if message == "errors detected"
-        ));
+        assert!(matches!(failure, crate::job::CheckError::ErrorsDetected));
+    }
+
+    #[test]
+    fn inspect_configured_completes_and_reports_memory_usage() {
+        let mut pdf = Pdf::open(Cursor::new(
+            include_bytes!(concat!(
+                env!("CARGO_MANIFEST_DIR"),
+                "/../../tests/fixtures/minimal.pdf"
+            ))
+            .to_vec(),
+        ))
+        .expect("minimal fixture parses");
+        let logger = QPDFLogger::create();
+        logger.set_warn(Some(PipelineHandle::new(crate::pipeline::Discard)));
+        let mut job = QPDFJob::new();
+        job.set_logger(logger);
+        job.config().show_npages();
+        job.configuration.report_memory_usage = true;
+
+        assert_eq!(
+            job.inspect_configured(&mut pdf)
+                .expect("configured inspection succeeds"),
+            JobExitCode::Success
+        );
     }
 
     #[test]
