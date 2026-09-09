@@ -3077,6 +3077,70 @@ qpdf --static-id --qdf --no-original-object-ids --warning-exit-0 \
     "$REF/overlay/overlay-destination-existing-annotation.pdf"
 echo "overlay/overlay-destination-existing-annotation.pdf"
 
+# ---- copy-annotations family -----------------------------------------------
+#
+# These back the `job::overlay::byte_gate` copy-annotations tests. Every one
+# repeats a form-bearing source across the 16-page fxo-red destination (or a
+# variant of it), so the +N rename path in qpdf's `addAndRenameFormFields`
+# (`QPDFAcroFormDocumentHelper.cc:105-108`) fires from placement 2 onward.
+
+# QDF: qtest copy-annotations.test lines 19-28. Source has 5 widget annots over
+# 3 top-level fields including a radio group; dest has no /AcroForm.
+qpdf --static-id --qdf --no-original-object-ids --warning-exit-0 \
+    "$FIX/fxo-red.pdf" --overlay "$FIX/form-fields-and-annotations.pdf" --repeat=1 -- \
+    "$REF/overlay/overlay-copy-annotations.pdf"
+echo "overlay/overlay-copy-annotations.pdf"
+
+# QDF: two --overlay specs from the same source onto one destination page. This
+# is what separates per-placement from per-page finalization: the second
+# placement's fields rename to "Text Box 1+1" because the trailing addFormField
+# walk refreshed the qualified-name cache between placements.
+qpdf --static-id --qdf --no-original-object-ids --warning-exit-0 \
+    "$FIX/fxo-red.pdf" --overlay "$FIX/form-fields-and-annotations.pdf" --to=1 -- \
+    --overlay "$FIX/form-fields-and-annotations.pdf" --to=1 -- \
+    "$REF/overlay/overlay-copy-annotations-two-specs-same-page.pdf"
+echo "overlay/overlay-copy-annotations-two-specs-same-page.pdf"
+
+# QDF: source annots carry /P back-references and an inline image.
+qpdf --static-id --qdf --no-original-object-ids --warning-exit-0 \
+    "$FIX/fxo-red.pdf" --overlay "$FIX/form-fields-and-annotations-p-and-inline.pdf" --repeat=1 -- \
+    "$REF/overlay/overlay-source-p-and-inline.pdf"
+echo "overlay/overlay-source-p-and-inline.pdf"
+
+# QDF: source has annotations but no /AcroForm, so copyAnnotations runs without
+# any field renaming.
+qpdf --static-id --qdf --no-original-object-ids --warning-exit-0 \
+    "$FIX/fxo-red.pdf" --overlay "$FIX/link-annot-no-acroform.pdf" --repeat=1 -- \
+    "$REF/overlay/overlay-link-annot-no-acroform.pdf"
+echo "overlay/overlay-link-annot-no-acroform.pdf"
+
+# QDF: destination /AcroForm/Fields is an indirect reference rather than a
+# direct array, so the append updates the array object in place.
+qpdf --static-id --qdf --no-original-object-ids --warning-exit-0 \
+    "$FIX/fxo-red-indirect-fields.pdf" --overlay "$FIX/form-fields-and-annotations.pdf" --repeat=1 -- \
+    "$REF/overlay/overlay-onto-indirect-fields.pdf"
+echo "overlay/overlay-onto-indirect-fields.pdf"
+
+# QDF: source /AcroForm/DR is a direct dictionary.
+qpdf --static-id --qdf --no-original-object-ids --warning-exit-0 \
+    "$FIX/fxo-red.pdf" --overlay "$FIX/form-fields-and-annotations-direct-dr.pdf" --repeat=1 -- \
+    "$REF/overlay/overlay-source-direct-dr.pdf"
+echo "overlay/overlay-source-direct-dr.pdf"
+
+# QDF: destination already has an /AcroForm, so the copied fields merge into it.
+qpdf --static-id --qdf --no-original-object-ids --warning-exit-0 \
+    "$FIX/fxo-red-with-existing-acroform.pdf" --overlay "$FIX/form-fields-and-annotations.pdf" --repeat=1 -- \
+    "$REF/overlay/overlay-onto-existing-acroform.pdf"
+echo "overlay/overlay-onto-existing-acroform.pdf"
+
+# QDF: destination /AcroForm already has a /DR whose /Font names collide with
+# the source's, so the merge mints /F1_1 and rewrites every copied /DA and
+# appearance stream to match.
+qpdf --static-id --qdf --no-original-object-ids --warning-exit-0 \
+    "$FIX/fxo-red-with-existing-acroform-dr.pdf" --overlay "$FIX/form-fields-and-annotations.pdf" --repeat=1 -- \
+    "$REF/overlay/overlay-onto-existing-acroform-dr.pdf"
+echo "overlay/overlay-onto-existing-acroform-dr.pdf"
+
 # QDF: same page carries both overlay + underlay (order-preservation test).
 qpdf --static-id --qdf --no-original-object-ids --warning-exit-0 \
     "$FIX/three-page.pdf" --overlay "$FIX/one-page.pdf" -- \
