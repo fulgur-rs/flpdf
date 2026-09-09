@@ -125,6 +125,41 @@ fn signatures_resolves_indirect_field_and_signature_entries() {
 }
 
 #[test]
+fn signatures_handles_certificate_shapes_and_widget_field_entries() {
+    let mut pdf = open(build_pdf(&[
+        (1, b"<< /Type /Catalog /Pages 2 0 R /AcroForm 4 0 R >>"),
+        (2, b"<< /Type /Pages /Kids [3 0 R] /Count 1 >>"),
+        (
+            3,
+            b"<< /Type /Page /Parent 2 0 R /MediaBox [0 0 612 792] >>",
+        ),
+        (4, b"<< /Fields [5 0 R 8 0 R 10 0 R] >>"),
+        (
+            5,
+            b"<< /FT /Sig /T (Widget field) /V 6 0 R /Kids [7 0 R] >>",
+        ),
+        (6, b"<< /Type /Sig /ByteRange [0 1 2 3] /Cert [12 0 R] >>"),
+        (7, b"<< /Subtype /Widget /T (Widget entry) /Parent 5 0 R >>"),
+        (8, b"<< /FT /Sig /T (Empty certificate) /V 9 0 R >>"),
+        (9, b"<< /Type /Sig /ByteRange [0 1 2 3] /Cert [] >>"),
+        (10, b"<< /FT /Sig /T (Scalar certificate) /V 11 0 R >>"),
+        (11, b"<< /Type /Sig /ByteRange [0 1 2 3] /Cert 42 >>"),
+        (12, b"(chain certificate)"),
+    ]));
+
+    let signatures = pdf.signatures().expect("signature scan should succeed");
+    assert!(signatures.iter().any(|signature| {
+        signature.certificate.as_deref() == Some(b"chain certificate".as_slice())
+    }));
+    assert!(signatures.iter().any(|signature| {
+        signature.field_name == "Empty certificate" && signature.certificate.is_none()
+    }));
+    assert!(signatures.iter().any(|signature| {
+        signature.field_name == "Scalar certificate" && signature.certificate.is_none()
+    }));
+}
+
+#[test]
 fn signatures_returns_empty_for_missing_or_malformed_acroform_shapes() {
     let cases = [
         build_pdf(&[
@@ -313,4 +348,24 @@ fn strip_signature_values_removes_the_indirect_signature_value() {
             .is_some(),
         "stripping a field's /V must not delete the signature dictionary"
     );
+}
+
+#[test]
+fn strip_signature_values_ignores_a_non_signature_leaf_without_kids() {
+    let mut pdf = open(build_pdf(&[
+        (1, b"<< /Type /Catalog /Pages 2 0 R /AcroForm 4 0 R >>"),
+        (2, b"<< /Type /Pages /Kids [3 0 R] /Count 1 >>"),
+        (
+            3,
+            b"<< /Type /Page /Parent 2 0 R /MediaBox [0 0 612 792] >>",
+        ),
+        (4, b"<< /Fields [5 0 R 8 0 R] >>"),
+        (5, b"<< /FT /Sig /T (Approval) /V 6 0 R /Kids [7 0 R] >>"),
+        (6, b"<< /Type /Sig /ByteRange [0 1 2 3] >>"),
+        (7, b"<< /Subtype /Widget /Parent 5 0 R >>"),
+        (8, b"<< /FT /Tx /T (Text field) >>"),
+    ]));
+
+    assert!(flpdf::signatures::strip_signature_values(&mut pdf)
+        .expect("strip signature values should succeed"));
 }

@@ -975,6 +975,14 @@ mod tests {
             .build(&mut pdf)
             .expect("build");
         insert_embedded_file(&mut pdf, b"full.txt", fs_ref).expect("insert");
+        {
+            let mut filespec =
+                FileSpec::new(pdf.get_object_handle(fs_ref), &mut pdf).expect("wrap filespec");
+            assert_eq!(
+                filespec.af_relationship().expect("AFRelationship"),
+                Some(b"Data".to_vec())
+            );
+        }
 
         // The listing renders the same document through qpdf's layout.
         let formatted = as_text(&listing(&mut pdf, true));

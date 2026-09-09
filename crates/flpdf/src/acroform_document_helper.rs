@@ -2549,6 +2549,52 @@ mod final_handle_tests {
     }
 
     #[test]
+    fn inherited_handle_routes_dereference_parent_values() {
+        let mut pdf = fixture("form-fields-and-annotations-with-defaults.pdf");
+        let parent = pdf
+            .make_indirect_object_handle(ObjectHandle::dictionary(vec![
+                (
+                    b"/DA".to_vec(),
+                    ObjectHandle::string(b"/Helv 9 Tf".to_vec()),
+                ),
+                (b"/Q".to_vec(), ObjectHandle::integer(2)),
+                (b"/T".to_vec(), ObjectHandle::string(b"Parent".to_vec())),
+                (b"/FT".to_vec(), ObjectHandle::name(b"Tx".to_vec())),
+            ]))
+            .expect("parent field handle");
+        let child = ObjectHandle::dictionary(vec![
+            (b"/DA".to_vec(), ObjectHandle::null()),
+            (b"/Q".to_vec(), ObjectHandle::null()),
+            (b"/T".to_vec(), ObjectHandle::string(b"Child".to_vec())),
+            (b"/Parent".to_vec(), parent),
+        ]);
+
+        let mut helper = AcroFormDocumentHelper::new(&mut pdf).expect("AcroForm helper");
+        assert_eq!(
+            helper
+                .effective_field_appearance(&child)
+                .expect("inherited appearance"),
+            b"/Helv 9 Tf"
+        );
+        assert_eq!(
+            helper
+                .effective_field_quadding(&child)
+                .expect("inherited quadding"),
+            2
+        );
+        assert_eq!(
+            helper
+                .canonical_fully_qualified_name(child.clone())
+                .expect("qualified name"),
+            "Parent.Child"
+        );
+        assert_eq!(
+            super::inherited_name(helper.pdf, &child, b"/FT").expect("missing inherited name"),
+            None
+        );
+    }
+
+    #[test]
     fn field_info_walk_skips_a_pure_widget_child() {
         let mut pdf = fixture("acroform-sig-parent-pure-widget-kid.pdf");
         let mut helper = AcroFormDocumentHelper::new(&mut pdf).expect("AcroForm helper");
