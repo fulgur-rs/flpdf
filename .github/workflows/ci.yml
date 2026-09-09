@@ -9,33 +9,35 @@ on:
 permissions:
   contents: read
 
-# Collapse superseded runs to one per PR (and one for main).  Restacking a
-# stacked-PR chain force-pushes every branch in it, so without this a single
-# rebase leaves several full runs racing per branch -- 8 jobs each (quality,
-# 4 test cells, release, coverage, fuzz) against this account's 20-job
-# concurrency allowance, which starves the survivors into a long queue.
+# Collapse superseded runs for one pull request.  Restacking a stacked-PR
+# chain force-pushes every branch in it, so without this a single rebase
+# leaves several full runs racing per branch -- 8 jobs each (quality, 4 test
+# cells, release, coverage, fuzz) against this account's 20-job concurrency
+# allowance, which starves the survivors into a long queue.
 #
-# cancel-in-progress covers pushes to main as well, not just pull_request.
-# For a push, the newest run in a group is the one holding the newest commit,
-# so the tip stays tested and a breakage is still detected; what back-to-back
-# merges give up is only the per-commit attribution of which merge broke it.
-# No gate consumes main's CI conclusion (there are no workflow_run triggers,
-# the `main` ruleset requires only `release-pr-approval`, and release-plz
-# carries its own job-level groups with cancel-in-progress disabled).
+# Only pull_request runs share a key.  A push keys on its own commit, so main
+# never contends with itself: runs in a group are handled in an arbitrary
+# order
+# (https://docs.github.com/en/actions/how-tos/write-workflows/choose-when-workflows-run/control-workflow-concurrency),
+# so putting two merge commits in one group could leave the older one as the
+# survivor and the tip untested.  Merges are serial here, so nothing is
+# gained by collapsing them anyway.
 #
-# A re-run has to stay out of that group entirely.  It keeps the original
-# run's ref and SHA
+# A re-run also stays out: it keeps the original run's ref and SHA
 # (https://docs.github.com/en/actions/how-tos/manage-workflow-runs/re-run-workflows-and-jobs),
-# so a stale re-run joining this group would displace the run testing the
-# tip -- and not only by cancelling it: queueing into a group also cancels
-# whatever is *pending* there, which `cancel-in-progress: false` does not
-# protect
-# (https://docs.github.com/en/actions/how-tos/write-workflows/choose-when-workflows-run/control-workflow-concurrency).
-# Keying attempt 1 to a shared name and every later attempt to its own run id
-# leaves force-pushes collapsing as before while a re-run can only ever
-# supersede earlier attempts of the same run.
+# and queueing into a group cancels whatever is *pending* there as well --
+# which `cancel-in-progress` does not govern -- so a stale re-run could
+# displace the run testing the tip.  Keying every attempt after the first to
+# its own run id leaves a re-run able to supersede only earlier attempts of
+# the same run.
+#
+# What remains is a pull request whose own runs are collapsed in an
+# unspecified order.  That cannot report a stale result as a fresh one: a
+# check run belongs to the commit it ran for, so a cancelled newer run leaves
+# its commit without a conclusion rather than inheriting the older one, and
+# the `main` ruleset requires only `release-pr-approval`.
 concurrency:
-  group: ${{ github.workflow }}-${{ github.event.pull_request.number || github.ref }}-${{ github.run_attempt == 1 && 'tip' || github.run_id }}
+  group: ${{ github.workflow }}-${{ github.event.pull_request.number || github.sha }}-${{ github.run_attempt == 1 && 'tip' || github.run_id }}
   cancel-in-progress: true
 
 env:
