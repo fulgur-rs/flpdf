@@ -14192,6 +14192,33 @@ mod tests {
     }
 
     #[test]
+    fn raw_resolution_missing_warning_delivery_failure_propagates() {
+        let logger = crate::QPDFLogger::create();
+        logger.set_warn(Some(crate::pipeline::PipelineHandle::new(
+            crate::pipeline::test_support::NthWriteFailure::new(4),
+        )));
+        let resolver = ResolverHandle::new_shared(
+            Cursor::new(synthetic_mismatch_pdf(false)),
+            0,
+            BTreeMap::<ObjectRef, XrefEntry>::new(),
+            true,
+            false,
+            Diagnostics::default(),
+            ResolverWarningOptions::new(logger, false, Vec::new()),
+            0,
+        );
+        resolver.install_raw_xref_entries(BTreeMap::from([(
+            QpdfObjGen::new(1, 0),
+            XrefEntry::Uncompressed { offset: 9 },
+        )]));
+
+        assert!(matches!(
+            resolver.resolve_raw_xref_entry(QpdfObjGen::new(1, 0), 9),
+            Err(Error::System(message)) if message == "sink write failure 4"
+        ));
+    }
+
+    #[test]
     fn raw_resolution_recovery_read_failure_is_caught_as_a_warning() {
         let mut bytes = b"%PDF-1.7\n".to_vec();
         let false_offset = bytes.len();
