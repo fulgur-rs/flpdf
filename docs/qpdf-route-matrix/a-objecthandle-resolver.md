@@ -540,6 +540,29 @@ outside this accessor slice.
    （`ResolverHandle` を外部で `Rc` 保持する経路が生じると A20 の「窓は生じない」論拠が崩れるため）。
 
 
+### 2026-09-10 current caller audit: optimization bounded cutover
+
+`flpdf-3yn9.48.23.11` migrated the non-qtest production callers in
+`crates/flpdf/src/optimization.rs` and
+`crates/flpdf/src/optimization/inherited_attrs.rs`. Before the cutover the
+fresh tracker measured `optimization.rs` `Pdf::resolve: 2` and
+`optimization/inherited_attrs.rs` `Pdf::resolve: 3`, `resolve_handle: 2`,
+`get_key: 3`, and `has_key: 1`; after the cutover each of those scoped
+production counts is zero. The route contract is
+`crates/flpdf/tests/optimization_accessor_route_contract_tests.rs`.
+
+The qpdf source boundary is `libqpdf/QPDF_optimization.cc:70-78,117-187,190-245`:
+qpdf resolves the live root before its `/Outlines` test, enumerates the four
+inheritable keys in the page walk, resolves each value for the null-as-absent
+decision, and uses the same ordered walk for direct and indirect descendants.
+The handle-level authority is
+`libqpdf/QPDFObjectHandle.cc:240-446,965-989,2168-2189`; flpdf now reaches it
+through `try_dereference`, `try_get_key`, `try_has_key`,
+`try_as_dictionary`, `try_as_array`, and `try_is_dictionary_of_type` rather
+than through a caller-side `Pdf::resolve` or panic accessor. The remaining
+qtest exception and unrelated writer/CLI/stream caller counts are intentionally
+not included in this bounded slice.
+
 ## 2026-09-06 再監査の issue 対応
 
 親 epic は `flpdf-3yn9.48`。下表は責務と実装 issue の対応であり、完了状態は `bd show <id>` で確認する。
