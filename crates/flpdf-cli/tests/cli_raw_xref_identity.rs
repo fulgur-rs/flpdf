@@ -98,6 +98,22 @@ fn run_flpdf(path: &std::path::Path) -> Output {
         .expect("flpdf should spawn")
 }
 
+fn run_qpdf_check(path: &std::path::Path) -> Output {
+    ProcessCommand::new("qpdf")
+        .args(["--check", path.to_str().unwrap()])
+        .output()
+        .expect("qpdf should spawn")
+}
+
+fn run_flpdf_check(path: &std::path::Path) -> Output {
+    Command::cargo_bin("flpdf")
+        .expect("flpdf should build")
+        .env("FLPDF_PROGNAME", "qpdf")
+        .args(["--check", path.to_str().unwrap()])
+        .output()
+        .expect("flpdf should spawn")
+}
+
 #[test]
 fn show_xref_preserves_in_use_generation_outside_object_ref_range() {
     if !qpdf_available() {
@@ -123,6 +139,28 @@ fn show_xref_preserves_in_use_generation_outside_object_ref_range() {
         .stdout
         .windows(b"5/65536: uncompressed".len())
         .any(|window| { window == b"5/65536: uncompressed" }));
+}
+
+#[test]
+fn check_resolves_raw_in_use_generation_like_qpdf() {
+    if !qpdf_available() {
+        if std::env::var_os("CI").is_some() {
+            panic!("{EXPECTED_QPDF_VERSION} is required for this parity test on CI");
+        }
+        eprintln!("skipping: {EXPECTED_QPDF_VERSION} is not available");
+        return;
+    }
+
+    let temp = tempfile::tempdir().expect("temporary directory");
+    let input = temp.path().join("in-use-generation-65536.pdf");
+    std::fs::write(&input, in_use_generation_65536_pdf()).expect("write fixture");
+
+    let qpdf = run_qpdf_check(&input);
+    let flpdf = run_flpdf_check(&input);
+
+    assert_eq!(flpdf.status.code(), qpdf.status.code());
+    assert_eq!(flpdf.stdout, qpdf.stdout);
+    assert_eq!(flpdf.stderr, qpdf.stderr);
 }
 
 #[test]

@@ -466,6 +466,15 @@ document-wide の独自 aggregate route ではなく、保持された各 leaf �
 
 | `QPDF::resolve` / `QPDF::resolveObjectsInStream`（xref object-read/cache boundary） | `QPDF.cc:1700-1857`; `QPDF.cc:1541-1697` | `engine.rs` が parse 前に作る `ResolverHandle` を `xref.rs::CanonicalTrailerOwner` として渡し、active xref stream、hybrid `/XRefStm`、`/Prev` chain、reconstruction candidate の object read を `ResolverHandle::resolve_at_offset_with_optional_description`（live `readObjectAtOffset` → `readObject` → `readStream`）へ統一する。`/Type`/`/W`/`/Index`/`/Size`/filter は `XrefObjectContext` から同じ canonical handle/cache と warning snapshot を参照する。`.48.14`でbootstrap ObjStmの specialized decode順序をqpdf責務へ揃え、`.48.15.1`でcanonical recovery candidateも live ownerから直接 trailer/object handleを生成して `LoadedXrefState` handoff後のrebind/second teardownを無くした。`.48.72`でowner-less public loader/exportとproduction callerを撤去し、残るBootstrapHandleState/bounded reconstruction windowはtest-only scaffoldingとして隔離した。 | 🔀 `.48.13` / `.48.15.1` / `.48.72` / `.48.73` で canonical production xref-stream/read, canonical handoff, public route撤去, warning live deliveryを完了。残るtest-only bootstrap reconstructionはqpdfのproduction document ownerを迂回しない |
 
+`flpdf-na1b` では、qpdf の raw `m->xref_table` walk (`QPDF.cc:1239-1254`) を
+valid `ObjectRef` view と分けたまま canonical `ResolverCore` の解決境界へ接続する。
+`QpdfObjGen` を expected identity として `readObjectAtOffset` 相当へ渡すため、
+generation 65536 の in-use row も実体との mismatch、reconstruction、missing-after-
+recovery warning の qpdf 順序を保持する。valid ObjGen は既存 canonical handle/cacheへ
+変換し、範囲外の raw row は ObjectRef を捏造せず raw resolution boundary で消費する。
+これにより `--check` の raw generation 診断を qpdf と一致させる
+(`QPDF.cc:1580-1632`)。
+
 `.48.73` では、canonical `Pdf::open` の xref/recovery warningを `ResolverHandle::push_qpdf_warning`へ qpdfのcall orderで直接配送し、engineのinstall/replayと`DeferredDiagnosticsGuard`を撤去した。`.48.72`でpublic owner-less loaderとproduction callerを撤去したため、残るBootstrapHandleState、bounded reconstruction window、detach/drop helperはtest-only bounded reconstruction scaffoldingである。
 
 `flpdf-3yn9.48.72` では、owner-less public `load_xref_and_trailer*`/`LoadedXref`
