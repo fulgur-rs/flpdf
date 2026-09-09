@@ -3253,6 +3253,14 @@ fn main() {
             object_ref,
             args.raw_stream_data,
             args.filtered_stream_data,
+            // `doShowObj` reads `m->normalize`, which only
+            // `Config::normalizeContent` ever sets
+            // (`QPDFJob_config.cc:412-418`); QDF derives its implicit
+            // normalization during writer setup instead, behind
+            // `if (m->normalize_set)` (`QPDFJob.cc:2861-2863`). So the
+            // inspection route must see the explicit setting alone, not the
+            // writer-facing fold of QDF's default.
+            matches!(args.normalize_content, Some(CliYesNo::Yes)),
             args.no_warn,
             args.page_ops.empty,
             top_level_inspection_transform_options,
@@ -7900,6 +7908,7 @@ fn run_show_object(
     selector: &str,
     raw_stream_data: bool,
     filtered_stream_data: bool,
+    normalize_content: bool,
     suppress_warnings: bool,
     empty: bool,
     transform_options: InspectionTransformOptions,
@@ -7912,6 +7921,7 @@ fn run_show_object(
     if empty {
         reject_empty_inspection_output(input.as_deref())?;
         let mut job = new_cli_job(suppress_warnings);
+        job.set_content_normalization(normalize_content);
         let mut pdf = create_empty_primary_document(&mut job, None)?;
         apply_inspection_transformations(&mut job, &mut pdf, transform_options, verbose)?;
         let object = match selector {
@@ -7939,6 +7949,7 @@ fn run_show_object(
     let input = input.ok_or_else(missing_input_usage_error)?;
     let mut pdf = open_pdf_with_suppression(&input, repair, password, suppress_warnings)?;
     let mut job = new_cli_job(suppress_warnings);
+    job.set_content_normalization(normalize_content);
     apply_inspection_transformations(&mut job, &mut pdf, transform_options, verbose)?;
     let object = match selector {
         ShowObjectSelector::Trailer => pdf.trailer(),
@@ -11322,6 +11333,7 @@ mod tests {
             false,
             &PasswordArgs::default(),
             "2147483648",
+            false,
             false,
             false,
             false,

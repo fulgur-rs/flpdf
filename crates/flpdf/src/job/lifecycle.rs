@@ -231,6 +231,9 @@ struct JobConfiguration {
     flatten_annotations: Option<FlattenAnnotationsMode>,
     flatten_rotation: bool,
     generate_appearances: bool,
+    /// qpdf's `QPDFJob::Members::normalize` flag used by `doShowObj` and
+    /// propagated to the writer by `setWriterOptions`.
+    normalize_content: Option<bool>,
     writer: WriterConfiguration,
     linearize: bool,
     linearize_pass1: Option<PathBuf>,
@@ -1641,6 +1644,21 @@ impl QPDFJob {
         self.configuration.writer = configuration;
     }
 
+    /// Set qpdf's job-level content-normalization flag.
+    ///
+    /// `QPDFJob::Config::normalizeContent` stores this separately from the
+    /// writer object. `doShowObj` consumes it while selecting its output pipe,
+    /// and `setWriterOptions` later copies the same flag into a writer
+    /// (`libqpdf/QPDFJob_config.cc:414-418`, `libqpdf/QPDFJob.cc:2862`).
+    pub fn set_content_normalization(&mut self, value: bool) {
+        self.configuration.normalize_content = Some(value);
+    }
+
+    /// Return the job-level content-normalization flag used by inspection.
+    pub(crate) fn content_normalization_enabled(&self) -> bool {
+        self.configuration.normalize_content.unwrap_or(false)
+    }
+
     /// Set qpdf's recovery policy for documents opened by this job.
     pub fn set_suppress_recovery(&mut self, value: bool) {
         self.configuration.suppress_recovery = value;
@@ -2268,7 +2286,7 @@ impl QPDFJob {
             configuration.writer.set_newline_before_endstream(true);
         }
         if let Some(value) = job_json_choice(&members, b"normalizeContent", &["y", "n"], true)? {
-            configuration.writer.set_content_normalization(value == "y");
+            configuration.normalize_content = Some(value == "y");
         }
         if let Some(value) = job_json_choice(
             &members,
@@ -3118,6 +3136,14 @@ impl QPDFJob {
         // for callers that reach write_qpdf without the create stage.
         self.reserve_standard_output()?;
         let mut writer_configuration = self.configuration.writer.clone();
+        // qpdf keeps `normalizeContent` on the job and reapplies it from
+        // `setWriterOptions` after the writer configuration has been
+        // assembled. Preserve that ownership even when a caller replaces the
+        // portable writer configuration after setting the job option
+        // (`QPDFJob.cc:2847-2863`).
+        if let Some(value) = self.configuration.normalize_content {
+            writer_configuration.set_content_normalization(value);
+        }
         // qpdf's setWriterOptions applies the accumulated input floor to the
         // writer here, in the write stage (`QPDFJob.cc:2913`), so a source
         // opened during the create stage still raises the output version.
@@ -4757,6 +4783,12 @@ impl QPDFJobConfig<'_> {
         self
     }
 
+    /// Configure qpdf's job-level `normalizeContent` setting.
+    pub fn normalize_content(&mut self, value: bool) -> &mut Self {
+        self.job.set_content_normalization(value);
+        self
+    }
+
     /// Enable qpdf's form-appearance generation phase.
     pub fn generate_appearances(&mut self) -> &mut Self {
         self.job.configuration.generate_appearances = true;
@@ -4983,7 +5015,7 @@ fn parse_object_stream_mode(value: &str) -> Result<ObjectStreamMode> {
 mod tests {
     use super::*;
     use crate::job::overlay::OverlayVerboseSource;
-    use crate::{Error, ObjectHandle, PdfOpenOptions};
+    use crate::{Error, ObjectHandle, PageDocumentHelper, PageInput, PdfOpenOptions};
     use std::io::Cursor;
 
     #[test]
@@ -4992,6 +5024,75 @@ mod tests {
         job.config().verbose();
 
         assert!(job.verbose());
+    }
+
+    #[test]
+    fn config_normalize_content_enables_the_job_inspection_setting() {
+        let mut job = QPDFJob::new();
+        job.config().normalize_content(true);
+
+        assert!(job.content_normalization_enabled());
+    }
+
+    #[test]
+    fn explicit_normalize_content_survives_a_later_writer_configuration_replacement() {
+        let mut pdf = Pdf::empty().expect("empty PDF");
+        let contents = pdf
+            .new_stream_with_data(Rc::new(b"q\rQ".to_vec()))
+            .expect("content stream");
+        let page = ObjectHandle::dictionary(vec![
+            (b"/Type".to_vec(), ObjectHandle::name(b"Page".to_vec())),
+            (
+                b"/MediaBox".to_vec(),
+                ObjectHandle::array(vec![
+                    ObjectHandle::integer(0),
+                    ObjectHandle::integer(0),
+                    ObjectHandle::integer(100),
+                    ObjectHandle::integer(100),
+                ]),
+            ),
+            (b"/Contents".to_vec(), contents),
+        ]);
+        PageDocumentHelper::new(&mut pdf)
+            .add_page(PageInput::direct(page), false)
+            .expect("page insertion");
+
+        let tempdir = tempfile::tempdir().expect("temporary directory");
+        let output_path = tempdir.path().join("normalized.pdf");
+        let mut job = QPDFJob::new();
+        job.set_output_file(&output_path).expect("output path");
+        job.set_content_normalization(true);
+        job.config()
+            .writer_configuration(WriterConfiguration::default());
+
+        job.write_qpdf(&mut pdf)
+            .expect("normalized document should be written");
+        let mut written = Pdf::open(Cursor::new(
+            std::fs::read(&output_path).expect("written PDF bytes"),
+        ))
+        .expect("written PDF should reopen");
+        let page_ref = PageDocumentHelper::new(&mut written)
+            .get_all_pages()
+            .expect("written page list")
+            .into_iter()
+            .next()
+            .expect("written page");
+        let page = written.get_object_handle(page_ref);
+        written.resolve(&page).expect("written page resolves");
+        let contents = page
+            .try_get_key(b"/Contents")
+            .expect("written contents key")
+            .object_ref()
+            .expect("written contents reference");
+        let stream = written.get_object_handle(contents);
+
+        assert_eq!(
+            stream
+                .get_stream_data(crate::writer::DecodeLevel::All)
+                .expect("written stream data")
+                .as_ref(),
+            b"q\nQ"
+        );
     }
 
     #[test]
