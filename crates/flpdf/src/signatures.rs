@@ -539,3 +539,33 @@ fn certificate_entry(dict: &BTreeMap<Vec<u8>, ObjectHandle>) -> Result<Option<Ve
 // their unit tests moved to `acroform_document_helper.rs` alongside the
 // shared `analyze()` port those functions became
 // (`AcroFormDocumentHelper::annotation_to_field_map`/`get_field_for_annotation`).
+
+#[cfg(test)]
+mod tests {
+    use super::{certificate_entry, is_pure_widget};
+    use crate::ObjectHandle;
+    use std::collections::BTreeMap;
+
+    #[test]
+    fn field_entry_makes_a_widget_non_pure() {
+        let dictionary = BTreeMap::from([
+            (b"/Subtype".to_vec(), ObjectHandle::name(b"Widget".to_vec())),
+            (b"/T".to_vec(), ObjectHandle::string(b"field".to_vec())),
+        ]);
+
+        assert!(!is_pure_widget(&dictionary).expect("widget classification"));
+    }
+
+    #[test]
+    fn certificate_array_returns_the_first_string_entry() {
+        let dictionary = BTreeMap::from([(
+            b"/Cert".to_vec(),
+            ObjectHandle::array(vec![ObjectHandle::string(b"certificate".to_vec())]),
+        )]);
+
+        assert_eq!(
+            certificate_entry(&dictionary).expect("certificate entry"),
+            Some(b"certificate".to_vec())
+        );
+    }
+}
