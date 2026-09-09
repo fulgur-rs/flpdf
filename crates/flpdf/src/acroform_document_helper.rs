@@ -1609,6 +1609,7 @@ impl<'a, R: Read + Seek> AcroFormDocumentHelper<'a, R> {
             return Ok(AcroFormDefaults::default());
         };
         let appearance = acroform.try_get_key(b"/DA")?;
+        appearance.try_dereference()?;
         let quadding = acroform.try_get_key(b"/Q")?;
         let resources = acroform.try_get_key(b"/DR")?;
         let need_appearances = acroform.try_get_key(b"/NeedAppearances")?;
@@ -2591,6 +2592,31 @@ mod final_handle_tests {
         assert_eq!(
             super::inherited_name(helper.pdf, &child, b"/FT").expect("missing inherited name"),
             None
+        );
+    }
+
+    #[test]
+    fn acroform_defaults_resolve_an_indirect_default_appearance() {
+        let mut pdf = fixture("form-fields-and-annotations-with-defaults.pdf");
+        let mut helper = AcroFormDocumentHelper::new(&mut pdf).expect("AcroForm helper");
+        let acroform = helper
+            .canonical_acroform()
+            .expect("canonical AcroForm lookup")
+            .expect("AcroForm dictionary");
+        let appearance = helper
+            .pdf
+            .make_indirect_object_handle(ObjectHandle::string(b"/Helv 11 Tf".to_vec()))
+            .expect("indirect appearance");
+        acroform
+            .replace_key(b"/DA", appearance)
+            .expect("replace AcroForm appearance");
+
+        assert_eq!(
+            helper
+                .canonical_acroform_defaults()
+                .expect("AcroForm defaults")
+                .default_appearance,
+            b"/Helv 11 Tf"
         );
     }
 

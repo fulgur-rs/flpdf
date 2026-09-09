@@ -160,6 +160,30 @@ fn signatures_handles_certificate_shapes_and_widget_field_entries() {
 }
 
 #[test]
+fn sig_flags_resolve_an_indirect_integer() {
+    let mut pdf = open(build_pdf(&[
+        (1, b"<< /Type /Catalog /Pages 2 0 R /AcroForm 4 0 R >>"),
+        (2, b"<< /Type /Pages /Kids [3 0 R] /Count 1 >>"),
+        (
+            3,
+            b"<< /Type /Page /Parent 2 0 R /MediaBox [0 0 612 792] >>",
+        ),
+        (4, b"<< /Fields [] /SigFlags 5 0 R >>"),
+        (5, b"3"),
+    ]));
+
+    assert_eq!(
+        flpdf::signatures::acroform_sig_flags(&mut pdf).expect("read SigFlags"),
+        Some(3)
+    );
+    assert!(flpdf::signatures::clear_sig_flags(&mut pdf).expect("clear SigFlags"));
+    assert_eq!(
+        flpdf::signatures::acroform_sig_flags(&mut pdf).expect("read cleared SigFlags"),
+        Some(0)
+    );
+}
+
+#[test]
 fn signatures_returns_empty_for_missing_or_malformed_acroform_shapes() {
     let cases = [
         build_pdf(&[
@@ -368,4 +392,27 @@ fn strip_signature_values_ignores_a_non_signature_leaf_without_kids() {
 
     assert!(flpdf::signatures::strip_signature_values(&mut pdf)
         .expect("strip signature values should succeed"));
+}
+
+#[test]
+fn strip_signature_values_removes_a_null_signature_value_key() {
+    let mut pdf = open(build_pdf(&[
+        (1, b"<< /Type /Catalog /Pages 2 0 R /AcroForm 4 0 R >>"),
+        (2, b"<< /Type /Pages /Kids [3 0 R] /Count 1 >>"),
+        (
+            3,
+            b"<< /Type /Page /Parent 2 0 R /MediaBox [0 0 612 792] >>",
+        ),
+        (4, b"<< /Fields [5 0 R] >>"),
+        (5, b"<< /FT /Sig /T (Null value) /V null >>"),
+    ]));
+
+    assert!(flpdf::signatures::strip_signature_values(&mut pdf)
+        .expect("strip null signature value should succeed"));
+    let field = pdf.get_object_handle(ObjectRef::new(5, 0));
+    pdf.resolve(&field).expect("field resolves");
+    assert!(!field
+        .as_dictionary()
+        .expect("field dictionary")
+        .contains_key(b"/V".as_slice()));
 }

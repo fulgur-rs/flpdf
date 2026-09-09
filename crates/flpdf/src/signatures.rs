@@ -112,7 +112,7 @@ pub fn signatures_with_max_depth<R: Read + Seek>(
 ///
 /// Returns `None` when there is no `/AcroForm`, no `/SigFlags`, or the value is
 /// not a non-negative integer that fits in `u32`. An indirect `/SigFlags`
-/// reference (vanishingly rare for a scalar flag) is treated as absent.
+/// reference is dereferenced before applying the same integer check.
 ///
 /// # Errors
 ///
@@ -251,7 +251,12 @@ fn strip_signature_values_from_field<R: Read + Seek>(
         .or(inherited_type);
     let kids_obj = field.try_get_key(b"/Kids")?;
 
-    let has_signature_value = field.try_has_key(b"/V")?;
+    // qpdf's removeKey erases a raw `/V` entry even when its stored value is
+    // null. `try_has_key` intentionally treats null values as absent, so use
+    // the resolved dictionary snapshot for this mutation decision.
+    let has_signature_value = field
+        .as_dictionary()
+        .is_some_and(|entries| entries.contains_key(b"/V".as_slice()));
 
     if field_type.as_deref() == Some(b"Sig") && has_signature_value {
         field.remove_key(b"/V");
