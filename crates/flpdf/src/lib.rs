@@ -134,6 +134,7 @@ mod pdf_syntax;
 pub mod pdf_version;
 pub mod pipeline;
 pub mod qdf_fix;
+pub(crate) mod qpdf_obj_gen;
 mod qpdf_time;
 pub mod qutil;
 pub mod reader;
