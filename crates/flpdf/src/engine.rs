@@ -9,7 +9,7 @@ use crate::reader::resolver::{ResolverHandle, ResolverWarningOptions};
 use crate::reader::{PdfOpenOptions, ReopenableFile};
 use crate::xref::{load_xref_state_from_bytes, XrefLoadOptions};
 #[allow(unused_imports)]
-use crate::{Error, ObjectHandle, XrefForm};
+use crate::{Error, ObjectHandle, QpdfErrorCode, QpdfExc, XrefForm};
 use crate::{Pdf, Result};
 use std::cell::RefCell;
 use std::collections::BTreeMap;
@@ -61,6 +61,32 @@ fn qpdf_initial_read_error(description: &[u8], read_attempted: bool, error: Erro
     let mut message = description.to_vec();
     message.extend_from_slice(b": read 1024 bytes");
     Error::SystemBytes(message)
+}
+
+/// Convert a terminal canonical open parse failure into qpdf's public
+/// `QPDFExc` shape before attaching the warnings collected by `QPDF::warn`.
+/// qpdf keeps the source filename and the signed offset on the exception, so
+/// callers such as the qtest C-API adapter do not have to reconstruct them
+/// from a rendered Rust parse string.
+fn qpdf_open_parse_error(description: &[u8], error: Error) -> Error {
+    let Error::Parse { offset, message } = error else {
+        return error;
+    };
+    let object = match message.as_str() {
+        "trailer dictionary lacks /Size key"
+        | "/Size key in trailer dictionary is not an integer"
+        | "/Prev key in trailer dictionary is not an integer" => b"trailer".as_slice(),
+        "xref syntax invalid" => b"xref table".as_slice(),
+        message if message.starts_with("invalid xref entry") => b"xref table".as_slice(),
+        _ => b"".as_slice(),
+    };
+    Error::QpdfExc(QpdfExc::new(
+        QpdfErrorCode::DamagedPdf,
+        description,
+        object,
+        i64::try_from(offset).unwrap_or(i64::MAX),
+        message.into_bytes(),
+    ))
 }
 
 fn read_initial_source<R: Read + Seek>(reader: &mut R, description: &[u8]) -> Result<Vec<u8>> {
@@ -240,7 +266,7 @@ impl<R: Read + Seek> Pdf<R> {
             warning_options.clone(),
             unique_id,
         );
-        let loaded_state = load_xref_state_from_bytes(
+        let loaded_state = match load_xref_state_from_bytes(
             &source_bytes,
             XrefLoadOptions {
                 allow_repair: options.repair,
@@ -248,7 +274,23 @@ impl<R: Read + Seek> Pdf<R> {
                 description: options.description.clone(),
             },
             Some(resolver.as_ref()),
-        )?;
+        ) {
+            Ok(state) => state,
+            Err(error @ Error::Parse { .. }) => {
+                let error = qpdf_open_parse_error(&options.description, error);
+                return Err(Error::with_open_diagnostics(
+                    error,
+                    resolver.repair_diagnostics(),
+                ));
+            }
+            Err(error @ Error::QpdfExc(_)) => {
+                return Err(Error::with_open_diagnostics(
+                    error,
+                    resolver.repair_diagnostics(),
+                ));
+            }
+            Err(error) => return Err(error),
+        };
         // The production xref loader was given this resolver as its canonical
         // owner, so xref-stream handles and all metadata they resolve are
         // already in the live cache. The owner-less loader keeps its
