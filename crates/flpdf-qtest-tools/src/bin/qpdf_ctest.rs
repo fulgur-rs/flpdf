@@ -177,7 +177,8 @@ fn report_invalid_password(input: &std::path::Path) -> Result<()> {
 }
 
 /// Print qpdf-ctest's portable error object projection. This is the Rust
-/// process equivalent of qpdf-ctest.c:30-68: C API callers observe the
+/// process equivalent of qpdf-ctest.c:35-68 (`print_error` at `:35-43`,
+/// `report_errors` at `:45-68`): C API callers observe the
 /// structured QPDFExc fields after qpdf has already collected the warning
 /// objects. The C ABI itself remains outside this crate.
 fn write_c_api_error(output: &mut impl Write, label: &[u8], error: &QpdfExc) -> Result<()> {
@@ -214,8 +215,20 @@ fn qpdf_exception_from_error(input: &Path, error: &Error) -> QpdfExc {
             0,
             b"invalid password",
         ),
-        Error::Encrypted(error) => QpdfExc::new(
-            QpdfErrorCode::Password,
+        // qpdf throws `QPDFExc(qpdf_e_unsupported, ...)` for an unsupported
+        // `/Filter` and for an unsupported `/R`//`/V` pair, and
+        // `damagedPDF` (`qpdf_e_damaged_pdf`) for a malformed `/Encrypt`
+        // dictionary (`QPDF_encryption.cc:748-794`). Only a rejected password
+        // is `qpdf_e_password`.
+        Error::Encrypted(error @ EncryptedError::UnsupportedHandler { .. }) => QpdfExc::new(
+            QpdfErrorCode::Unsupported,
+            path_description(input),
+            b"",
+            0,
+            error.to_string().as_bytes(),
+        ),
+        Error::Encrypted(error @ EncryptedError::Malformed { .. }) => QpdfExc::new(
+            QpdfErrorCode::DamagedPdf,
             path_description(input),
             b"",
             0,
@@ -235,8 +248,18 @@ fn qpdf_exception_from_error(input: &Path, error: &Error) -> QpdfExc {
             0,
             message,
         ),
-        Error::System(message) | Error::Internal(message) => QpdfExc::new(
+        Error::System(message) => QpdfExc::new(
             QpdfErrorCode::System,
+            path_description(input),
+            b"",
+            0,
+            message.as_bytes(),
+        ),
+        // `Error::Internal` is qpdf's `std::logic_error` family, which the C
+        // API's `catch (std::exception&)` arm reports as `qpdf_e_internal`
+        // rather than `qpdf_e_system` (`qpdf-c.cc:74-83`).
+        Error::Internal(message) => QpdfExc::new(
+            QpdfErrorCode::Internal,
             path_description(input),
             b"",
             0,
