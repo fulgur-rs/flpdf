@@ -498,6 +498,15 @@ impl ArgParser {
         };
         if let Some(rest) = arg_str.strip_prefix("--") {
             let name = rest.split('=').next().unwrap_or(rest);
+            if name == "preserve-unreferenced-resources" {
+                // qpdf registers this as a bare argv synonym, not as a
+                // distinct Config value (`auto_job_init.hh:65-66`); its
+                // callback selects `removeUnreferencedResources("no")`
+                // (`QPDFJob_config.cc:471-474`). Normalize before clap so
+                // option order and repeated later overrides retain qpdf's
+                // last-setting semantics without a second Rust field.
+                return RawArg::from_bytes(b"--remove-unreferenced-resources=no".to_vec());
+            }
             if self.bare_long_options.contains(name) && should_discard_bare_value(name, arg_str) {
                 return RawArg::from_bytes(format!("--{name}").into_bytes());
             }
@@ -1082,6 +1091,31 @@ mod tests {
             .expect("bare option should accept qpdf's attached value form");
 
         assert_eq!(parsed.residual_args, ["flpdf", "--check-linearization"]);
+    }
+
+    #[test]
+    fn parser_maps_preserve_unreferenced_resources_to_the_qpdf_no_policy() {
+        let command = clap::Command::new("flpdf").arg(
+            clap::Arg::new("remove-unreferenced-resources")
+                .long("remove-unreferenced-resources")
+                .require_equals(true),
+        );
+        let parsed = ArgParser::from_command(command)
+            .parse(vec![
+                "flpdf".into(),
+                "--preserve-unreferenced-resources=ignored".into(),
+                "--remove-unreferenced-resources=yes".into(),
+            ])
+            .expect("qpdf resource synonym should reach the value option");
+
+        assert_eq!(
+            parsed.residual_args,
+            [
+                "flpdf",
+                "--remove-unreferenced-resources=no",
+                "--remove-unreferenced-resources=yes"
+            ]
+        );
     }
 
     #[test]

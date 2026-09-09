@@ -1676,6 +1676,14 @@ message prefix/logger へ渡し、`get_all_pages` と resource mutation より�
 `cli_top_level_remove_unreferenced_resources.rs` が qpdf 11.9.0 の stdout と
 生成 bytes を比較する。
 
+`flpdf-2wby` では、qpdf の `auto_job_init.hh:65-66` が登録する
+`--preserve-unreferenced-resources` synonym も同じ境界へ接続した。qpdf の
+callback は `QPDFJob_config.cc:471-474` で `removeUnreferencedResources("no")`
+と等価な `re_no` を選ぶため、flpdf の argv preprocessor は clap 前に
+`--remove-unreferenced-resources=no` へ正規化する。これにより、後続の明示的な
+`--remove-unreferenced-resources=yes|auto` が qpdf と同じく後勝ちになり、重複した
+policy field や CLI-only adapter は増やさない。
+
 ### C. qpdf に機能そのものが無いもの
 
 | flpdf | 行 | 備考 |
