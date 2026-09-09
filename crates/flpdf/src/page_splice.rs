@@ -132,16 +132,14 @@ pub fn splice_pages_with_max_depth<R: Read + Seek>(
 fn pages_ref<R: Read + Seek>(pdf: &mut Pdf<R>) -> Result<ObjectRef> {
     let catalog_ref = pdf.root_ref().ok_or(Error::Missing("/Root"))?;
     let catalog = pdf.get_object_handle(catalog_ref);
-    pdf.resolve(&catalog)?;
-    if catalog.as_dictionary().is_none() {
+    if catalog.try_as_dictionary()?.is_none() {
         return Err(Error::Missing("/Catalog dict"));
     }
     let pages = catalog.try_get_key(b"/Pages")?;
     if let Some(pages_ref) = pages.object_ref() {
         return Ok(pages_ref);
     }
-    pdf.resolve(&pages)?;
-    if pages.as_dictionary().is_none() {
+    if pages.try_as_dictionary()?.is_none() {
         return Err(Error::Missing("/Pages"));
     }
     let indirect = pdf.make_indirect_object_handle(pages)?;
@@ -171,7 +169,7 @@ fn node_label(node: &ObjectHandle) -> String {
 ///
 /// A direct intermediate `/Pages` node stays direct here, matching
 /// `QPDF::getAllPagesInternal` (`QPDF_pages.cc:99-114`): only a kid lacking
-/// `/Kids` is promoted. The live `ObjectHandle` returned by `as_array` keeps
+/// `/Kids` is promoted. The live `ObjectHandle` returned by `try_as_array` keeps
 /// the direct node attached to its containing `/Kids` array while its direct
 /// leaves are promoted in place. The visited set is keyed on handle identity
 /// rather than an indirect object reference, so distinct direct `/Pages`
@@ -229,18 +227,16 @@ fn collect_page_refs<R: Read + Seek>(
         )));
     }
 
-    pdf.resolve(&node)?;
-    if node.as_dictionary().is_none() {
+    if node.try_as_dictionary()?.is_none() {
         return Err(Error::Unsupported(format!(
             "node {node_label} is not a dictionary"
         )));
     }
 
     let node_type = node.try_get_key(b"/Type")?;
-    pdf.resolve(&node_type)?;
     let has_kids = is_root || node.try_has_key(b"/Kids")?;
     if !has_kids {
-        if node_type.as_name().as_deref() != Some(b"Page") {
+        if node_type.try_as_name()?.as_deref() != Some(b"Page") {
             node.replace_key(b"/Type", ObjectHandle::name(b"Page".to_vec()))?;
             pdf.mark_object_handle_dirty(&node)?;
         }
@@ -250,7 +246,7 @@ fn collect_page_refs<R: Read + Seek>(
         pages.push(page_ref);
         return Ok(1);
     }
-    if node_type.as_name().as_deref() != Some(b"Pages") {
+    if node_type.try_as_name()?.as_deref() != Some(b"Pages") {
         node.replace_key(b"/Type", ObjectHandle::name(b"Pages".to_vec()))?;
         pdf.mark_object_handle_dirty(&node)?;
     }
@@ -259,26 +255,16 @@ fn collect_page_refs<R: Read + Seek>(
     }
 
     let kids_value = node.try_get_key(b"/Kids")?;
-    pdf.resolve(&kids_value)?;
-    let kids_handle = if kids_value.as_array().is_some() {
-        Some(kids_value.clone())
-    } else {
-        None
-    };
+    let kids = kids_value.try_as_array()?;
+    let kids_handle = kids.as_ref().map(|_| kids_value.clone());
     // qpdf recurses into an intermediate `/Pages` kid inside the same loop
     // iteration that resolved it (`QPDF_pages.cc:100-107`). Collecting every
     // kid first and recursing afterwards would let a later sibling's read
     // overwrite `m->last_object_description`, so the reused cycle exception
     // (`QPDF_pages.cc:77-87`) would name a different object than qpdf does.
     let mut actual_count = 0usize;
-    for (index, mut child) in kids_value
-        .as_array()
-        .unwrap_or_default()
-        .into_iter()
-        .enumerate()
-    {
-        pdf.resolve(&child)?;
-        let child_is_pages = child.as_dictionary().is_some() && child.try_has_key(b"/Kids")?;
+    for (index, mut child) in kids.unwrap_or_default().into_iter().enumerate() {
+        let child_is_pages = child.try_as_dictionary()?.is_some() && child.try_has_key(b"/Kids")?;
         if !child_is_pages && child.is_direct() {
             let indirect = pdf.make_indirect_object_handle(child)?;
             let kids_handle = kids_handle
@@ -327,8 +313,7 @@ fn collect_page_refs<R: Read + Seek>(
     }
 
     let count_value = node.try_get_key(b"/Count")?;
-    pdf.resolve(&count_value)?;
-    let declared_count = match count_value.as_integer() {
+    let declared_count = match count_value.try_as_integer()? {
         Some(n) if n >= 0 => n as usize,
         Some(n) => {
             return Err(Error::Unsupported(format!(
@@ -378,7 +363,10 @@ fn normalize_insert_pages<R: Read + Seek>(
         }
 
         let page = pdf.get_object_handle(page_ref);
-        pdf.resolve(&page)?;
+        // qpdf's shallowCopy dereferences before copying
+        // (QPDFObjectHandle.cc:2073-2079). Rust's shallow_copy intentionally
+        // remains non-resolving, so use the canonical handle resolver here.
+        page.try_dereference()?;
         let copy = page.shallow_copy()?;
         let indirect = pdf.make_indirect_object_handle(copy)?;
         // cov:ignore-start: make_indirect_object_handle guarantees a fresh indirect identity
@@ -395,10 +383,9 @@ fn normalize_insert_pages<R: Read + Seek>(
 /// Returns the leaf-page count contributed by `node`.
 /// - a dictionary with `/Kids` → its `/Count` value
 /// - another dictionary type → 1
-fn leaf_count_of<R: Read + Seek>(pdf: &mut Pdf<R>, node: &ObjectHandle) -> Result<usize> {
+fn leaf_count_of(node: &ObjectHandle) -> Result<usize> {
     let node_label = node_label(node);
-    pdf.resolve(node)?;
-    if node.as_dictionary().is_none() {
+    if node.try_as_dictionary()?.is_none() {
         return Err(Error::Unsupported(format!(
             "node {node_label} is not a dictionary"
         )));
@@ -409,8 +396,7 @@ fn leaf_count_of<R: Read + Seek>(pdf: &mut Pdf<R>, node: &ObjectHandle) -> Resul
     }
 
     let count = node.try_get_key(b"/Count")?;
-    pdf.resolve(&count)?;
-    match count.as_integer() {
+    match count.try_as_integer()? {
         Some(n) if n >= 0 => Ok(n as usize),
         Some(n) => Err(Error::Unsupported(format!(
             "/Pages node {node_label} has negative /Count {n}"
@@ -434,8 +420,7 @@ fn set_page_parent_for_node<R: Read + Seek>(
     parent: &ObjectHandle,
 ) -> Result<()> {
     let page = pdf.get_object_handle(page_ref);
-    pdf.resolve(&page)?;
-    if page.as_dictionary().is_none() {
+    if page.try_as_dictionary()?.is_none() {
         return Err(Error::Unsupported(format!(
             "page {page_ref} is not a dictionary"
         )));
@@ -476,35 +461,28 @@ fn splice_subtree<R: Read + Seek>(
     // Snapshot the node's kids and count *before* any mutation so that the
     // canonical node handle remains stable while we recurse.
     let (kids, old_count, kids_handle) = {
-        pdf.resolve(&node)?;
-        if node.as_dictionary().is_none() {
+        if node.try_as_dictionary()?.is_none() {
             return Err(Error::Unsupported(format!(
                 "{node_label} is not a /Pages dictionary"
             )));
         }
 
         let kids_value = node.try_get_key(b"/Kids")?;
-        pdf.resolve(&kids_value)?;
-        let kids = kids_value.as_array().unwrap_or_default();
+        let kids = kids_value.try_as_array()?;
+        let kids_handle = kids.as_ref().map(|_| kids_value.clone());
+        let kids = kids.unwrap_or_default();
         for child in &kids {
-            pdf.resolve(child)?;
-            let child_is_pages = child.as_dictionary().is_some() && child.try_has_key(b"/Kids")?;
+            let child_is_pages =
+                child.try_as_dictionary()?.is_some() && child.try_has_key(b"/Kids")?;
             if child.is_direct() && !child_is_pages {
                 return Err(Error::Unsupported(format!(
                     "child of /Pages node {node_label} is not an indirect object"
                 )));
             }
         }
-        let kids_handle = if kids_value.as_array().is_some() {
-            Some(kids_value.clone())
-        } else {
-            None
-        };
-
         let count_value = node.try_get_key(b"/Count")?;
-        pdf.resolve(&count_value)?;
         let old_count_raw = count_value
-            .as_integer()
+            .try_as_integer()?
             .ok_or_else(|| Error::Unsupported(format!("/Pages node {node_label} has no /Count")))?;
         if old_count_raw < 0 {
             return Err(Error::Unsupported(format!(
@@ -517,7 +495,7 @@ fn splice_subtree<R: Read + Seek>(
     };
 
     let actual_count = kids.iter().try_fold(0usize, |total, child| {
-        let child_count = leaf_count_of(pdf, child)?;
+        let child_count = leaf_count_of(child)?;
         // cov:ignore-start: usize page-count overflow cannot be constructed by a finite PDF object tree
         total.checked_add(child_count).ok_or_else(|| {
             Error::Unsupported(format!("page count overflow at /Pages node {node_label}"))
@@ -535,7 +513,7 @@ fn splice_subtree<R: Read + Seek>(
     let mut offset = base;
 
     for kid in kids {
-        let kid_leaf_count = leaf_count_of(pdf, &kid)?;
+        let kid_leaf_count = leaf_count_of(&kid)?;
         let kid_start = offset;
         let kid_end = offset + kid_leaf_count;
 
@@ -552,8 +530,7 @@ fn splice_subtree<R: Read + Seek>(
         let overlaps_remove = kid_end > remove.start && kid_start < remove.end;
         if overlaps_remove {
             // Determine kid type (Page vs Pages) through the live child handle.
-            pdf.resolve(&kid)?;
-            let kid_is_pages = kid.as_dictionary().is_some() && kid.try_has_key(b"/Kids")?;
+            let kid_is_pages = kid.try_as_dictionary()?.is_some() && kid.try_has_key(b"/Kids")?;
 
             if kid_is_pages {
                 let sub_delta = splice_subtree(
@@ -1464,7 +1441,7 @@ mod tests {
     fn leaf_count_of_rejects_a_non_dictionary_node() {
         let mut pdf = open(build_pages_not_dictionary_pdf());
         let pages = pdf.get_object_handle(ObjectRef::new(2, 0));
-        let err = leaf_count_of(&mut pdf, &pages).unwrap_err();
+        let err = leaf_count_of(&pages).unwrap_err();
         assert!(matches!(err, Error::Unsupported(_)), "got {err:?}");
     }
 
@@ -1474,13 +1451,26 @@ mod tests {
             "<< /Type /Pages /Kids [] /Count -1 >>",
         ));
         let negative_pages = negative.get_object_handle(ObjectRef::new(2, 0));
-        let negative_err = leaf_count_of(&mut negative, &negative_pages).unwrap_err();
+        let negative_err = leaf_count_of(&negative_pages).unwrap_err();
         assert!(matches!(negative_err, Error::Unsupported(_)));
 
         let mut missing = open(build_pages_with_count_pdf("<< /Type /Pages /Kids [] >>"));
         let missing_pages = missing.get_object_handle(ObjectRef::new(2, 0));
-        let missing_err = leaf_count_of(&mut missing, &missing_pages).unwrap_err();
+        let missing_err = leaf_count_of(&missing_pages).unwrap_err();
         assert!(matches!(missing_err, Error::Unsupported(_)));
+    }
+
+    #[test]
+    fn leaf_count_of_propagates_an_unresolved_child_resolution_error() {
+        let page = ObjectHandle::new_indirect_unresolved(ObjectRef::new(99, 0), -1);
+        let error = leaf_count_of(&page).unwrap_err();
+        assert!(
+            matches!(
+                error,
+                Error::Internal(ref message) if message == "object 99 0 belongs to a dropped PDF"
+            ),
+            "got {error:?}"
+        );
     }
 
     #[test]

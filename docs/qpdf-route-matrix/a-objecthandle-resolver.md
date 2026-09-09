@@ -332,6 +332,28 @@ are the private `Pdf::canonical_object_refs` and
 `Pdf::get_all_objects`. The route checker remains structural; this note is the
 semantic owner record for the cutover until the next full matrix recount.
 
+### A6/A7 page-splice accessor slice `flpdf-3yn9.48.23.2` (2026-09-09)
+
+The production path in `crates/flpdf/src/page_splice.rs` had 16 explicit
+`Pdf::resolve` calls paired with non-resolving dictionary, name, array, or
+integer inspection. The bounded slice replaces those pairs with
+`try_as_dictionary`, `try_as_name`, `try_as_array`, and
+`try_as_integer`; the production source contract now measures zero
+`.resolve(`, `resolve_handle`, or `resolve_handle_ref` callers in this
+module. Page ordering, direct-leaf promotion, duplicate-page copying,
+cycle/count validation, and mutation order are unchanged.
+
+qpdf's `shallowCopy` dereferences before copying
+(`QPDFObjectHandle.cc:2073-2079`). flpdf's `shallow_copy` is intentionally
+non-resolving, so the duplicate-page copy site in `normalize_insert_pages`
+retains the canonical `ObjectHandle::try_dereference` prerequisite rather than
+reintroducing `Pdf::resolve`; the copy inside `collect_page_refs` is already
+covered by the `try_as_dictionary` that classified the kid. The unresolved-child test
+`leaf_count_of_propagates_an_unresolved_child_resolution_error` verifies
+fallible resolver propagation, and the route-contract integration test fixes
+the caller-zero boundary. The separate default page-tree depth policy remains
+outside this accessor slice.
+
 ## unknown / probe
 
 本領域は 24 行すべてを source と実行済み probe で分類できたため、`unknown` に落ちた行は無い。
