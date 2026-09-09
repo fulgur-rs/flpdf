@@ -4776,6 +4776,7 @@ fn run_check(
     finish_check_job(job.check(&mut pdf))
 }
 
+#[allow(clippy::too_many_arguments)]
 fn run_check_show_xref(
     input: Option<PathBuf>,
     repair: bool,
