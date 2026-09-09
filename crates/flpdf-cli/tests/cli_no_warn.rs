@@ -142,6 +142,36 @@ fn show_npages_no_warn_matches_qpdf_before_open_diagnostics_are_delivered() {
 }
 
 #[test]
+fn warning_exit_zero_keeps_no_warn_output_silent_and_changes_only_status() {
+    if !qpdf_or_skip() {
+        return;
+    }
+
+    let input = repairable_fixture();
+    let temp = tempfile::tempdir().expect("tempdir");
+    let qpdf_output = temp.path().join("qpdf-warning-exit-0.pdf");
+    let flpdf_output = temp.path().join("flpdf-warning-exit-0.pdf");
+    let input = input.to_str().expect("fixture path is UTF-8");
+    let qpdf_output_str = qpdf_output.to_str().expect("output path is UTF-8");
+
+    let qpdf = run_qpdf(&["--no-warn", "--warning-exit-0", input, qpdf_output_str]);
+    let flpdf = Command::cargo_bin("flpdf")
+        .expect("flpdf binary")
+        .args(["--no-warn", "--warning-exit-0", input])
+        .arg(&flpdf_output)
+        .output()
+        .expect("flpdf invocation");
+
+    assert_eq!(qpdf.status.code(), Some(0));
+    assert!(qpdf.stderr.is_empty());
+    assert_eq!(flpdf.status.code(), qpdf.status.code());
+    assert_eq!(flpdf.stdout, qpdf.stdout);
+    assert_eq!(flpdf.stderr, qpdf.stderr);
+    assert!(qpdf_output.exists());
+    assert!(flpdf_output.exists());
+}
+
+#[test]
 fn is_encrypted_no_warn_matches_qpdf_before_open_diagnostics_are_delivered() {
     if !qpdf_or_skip() {
         return;
@@ -590,4 +620,124 @@ fn attachment_copy_no_warn_suppresses_normalization_warnings_like_qpdf() {
     assert_eq!(flpdf.stdout, qpdf.stdout);
     assert_eq!(flpdf.stderr, qpdf.stderr);
     assert!(flpdf_output.exists());
+}
+
+/// qpdf derives the exit status once, from the single job's
+/// `warnings_exit_zero` (`QPDFJob.cc:560-563`). flpdf builds a job per route,
+/// so every route that can decide the status has to carry the policy -- the
+/// `--json` route did not, and exited 3 where `--show-npages` exited 0.
+#[test]
+fn warning_exit_zero_applies_to_every_inspection_route() {
+    if !qpdf_or_skip() {
+        return;
+    }
+
+    let input = repairable_fixture();
+    let input = input.to_str().expect("input path is UTF-8");
+
+    for route in [
+        "--json",
+        "--json=2",
+        "--check",
+        "--show-npages",
+        "--show-pages",
+        "--show-xref",
+        "--list-attachments",
+    ] {
+        let with_flag = ["--no-warn", "--warning-exit-0", route, input];
+        let qpdf = run_qpdf(&with_flag);
+        let flpdf = Command::cargo_bin("flpdf")
+            .expect("flpdf binary")
+            .args(with_flag)
+            .output()
+            .expect("flpdf invocation");
+        assert_eq!(qpdf.status.code(), Some(0), "{route}: qpdf");
+        assert_eq!(
+            flpdf.status.code(),
+            qpdf.status.code(),
+            "{route}: with flag"
+        );
+
+        let without_flag = ["--no-warn", route, input];
+        let qpdf = run_qpdf(&without_flag);
+        let flpdf = Command::cargo_bin("flpdf")
+            .expect("flpdf binary")
+            .args(without_flag)
+            .output()
+            .expect("flpdf invocation");
+        assert_eq!(qpdf.status.code(), Some(3), "{route}: qpdf without flag");
+        assert_eq!(
+            flpdf.status.code(),
+            qpdf.status.code(),
+            "{route}: without flag"
+        );
+    }
+}
+
+/// The output-producing routes decide the status from their own `QPDFJob`
+/// too. qpdf reaches `QPDFJob.cc:560-563` once, with `m->warnings_exit_zero`
+/// already set by `--warning-exit-0` (`QPDFJob_config.cc:649`), so
+/// `--split-pages`, `--add-attachment`, and `--copy-attachments-from` all
+/// exit 0 on a repair warning; flpdf builds a job per route, so each of them
+/// has to carry the policy explicitly.
+#[test]
+fn warning_exit_zero_applies_to_every_output_route() {
+    if !qpdf_or_skip() {
+        return;
+    }
+
+    let temp = tempfile::tempdir().expect("tempdir");
+    let input = write_corrupt_xref_with_page(temp.path(), "damaged.pdf");
+    let input = input.to_str().expect("input path is UTF-8").to_string();
+    let attachment = Path::new(env!("CARGO_MANIFEST_DIR")).join("Cargo.toml");
+    let attachment = attachment
+        .to_str()
+        .expect("attachment path is UTF-8")
+        .to_string();
+
+    for (route, expected_status_with_flag) in [("split", 0), ("add", 0), ("copy", 0)] {
+        for (flag, expected) in [
+            (Some("--warning-exit-0"), expected_status_with_flag),
+            (None, 3),
+        ] {
+            let output = temp
+                .path()
+                .join(format!("{route}-{}.pdf", flag.unwrap_or("plain")));
+            let output = output.to_str().expect("output path is UTF-8").to_string();
+            let mut args = vec!["--no-warn".to_string()];
+            args.extend(flag.map(str::to_string));
+            match route {
+                "split" => {
+                    args.extend(["--split-pages".to_string(), input.clone(), output.clone()]);
+                }
+                "add" => args.extend([
+                    "--add-attachment".to_string(),
+                    attachment.clone(),
+                    "--".to_string(),
+                    input.clone(),
+                    output.clone(),
+                ]),
+                _ => args.extend([
+                    "--copy-attachments-from".to_string(),
+                    input.clone(),
+                    "--".to_string(),
+                    input.clone(),
+                    output.clone(),
+                ]),
+            }
+
+            let borrowed = args.iter().map(String::as_str).collect::<Vec<_>>();
+            let qpdf = run_qpdf(&borrowed);
+            let flpdf = Command::cargo_bin("flpdf")
+                .expect("flpdf binary")
+                .args(&borrowed)
+                .output()
+                .expect("flpdf invocation");
+
+            let label = format!("{route}/{flag:?}");
+            assert_eq!(qpdf.status.code(), Some(expected), "{label}: qpdf");
+            assert_eq!(flpdf.status.code(), qpdf.status.code(), "{label}: flpdf");
+            assert_eq!(flpdf.stderr, qpdf.stderr, "{label}: stderr");
+        }
+    }
 }

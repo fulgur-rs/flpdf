@@ -758,6 +758,9 @@ struct Cli {
     /// Suppress warning delivery while retaining qpdf's warning exit status.
     #[arg(long)]
     no_warn: bool,
+    /// Exit 0 when the job has warnings (`QPDFJob::Config::warningExitZero`).
+    #[arg(long = "warning-exit-0")]
+    warning_exit_zero: bool,
     /// Check whether the input's linearization hint tables are correct
     /// (qpdf --check-linearization).
     #[arg(
@@ -3108,6 +3111,7 @@ fn main() {
     } = preprocessed;
     let mut args = cli_parse_from_mode(residual_args, native_subcommand_mode);
     apply_raw_overrides(&mut args, raw_overrides);
+    let _ = CLI_WARNING_EXIT_ZERO.set(args.warning_exit_zero);
     // qpdf keeps --verbose on QPDFJob rather than on the password parser, but
     // the reader owns the authentication retry boundary in flpdf. Carry the
     // job policy through the existing PasswordArgs copy used by every open
@@ -3848,6 +3852,7 @@ fn new_cli_job(suppress_warnings: bool) -> QPDFJob {
     job.set_logger(cli_logger());
     job.set_message_prefix(progname());
     job.set_suppress_warnings(suppress_warnings);
+    job.set_warnings_exit_zero(cli_warning_exit_zero());
     job
 }
 
@@ -3869,6 +3874,7 @@ fn run_job_json_files(
     suppress_warnings: bool,
 ) -> CliResult<()> {
     let mut job = QPDFJob::new();
+    job.set_warnings_exit_zero(cli_warning_exit_zero());
     job.set_logger(cli_logger());
     job.set_suppress_warnings(suppress_warnings);
 
@@ -4063,6 +4069,7 @@ fn run_json(cli: &Cli, image_options: ImageTransformOptions, empty: bool) -> Cli
     };
 
     let mut job = QPDFJob::new();
+    job.set_warnings_exit_zero(cli_warning_exit_zero());
     job.set_logger(cli_logger());
     job.set_message_prefix(progname());
     job.set_suppress_warnings(cli.no_warn);
@@ -4218,6 +4225,7 @@ fn run_json_input_inspection(
     }
     let input = cli.input.as_ref().ok_or_else(missing_input_usage_error)?;
     let mut job = QPDFJob::new();
+    job.set_warnings_exit_zero(cli_warning_exit_zero());
     job.set_logger(cli_logger());
     job.set_message_prefix(progname());
     job.set_suppress_warnings(cli.no_warn);
@@ -6640,6 +6648,7 @@ fn run_empty_page_extraction(
     }
 
     let mut job = QPDFJob::new();
+    job.set_warnings_exit_zero(cli_warning_exit_zero());
     job.set_logger(cli_logger());
     job.set_message_prefix(progname());
     job.set_verbose(verbose);
@@ -6796,6 +6805,7 @@ fn run_page_extraction_from_multiple_sources(
 
     let mut sources = Vec::with_capacity(source_paths.len());
     let mut job = QPDFJob::new();
+    job.set_warnings_exit_zero(cli_warning_exit_zero());
     job.set_logger(cli_logger());
     job.set_message_prefix(progname());
     job.set_verbose(verbose);
@@ -6941,6 +6951,7 @@ fn run_page_extraction_from_single_source<R: Read + Seek + 'static>(
         .map(|input| PageSpecInput::new(0, input.range.clone()))
         .collect();
     let mut job = QPDFJob::new();
+    job.set_warnings_exit_zero(cli_warning_exit_zero());
     job.set_logger(cli_logger());
     job.set_message_prefix(progname());
     job.set_verbose(verbose);
@@ -7300,8 +7311,13 @@ fn split_pdf<R: Read + Seek + 'static>(
     // used everywhere else. flpdf's split path uses a fresh `QPDFJob`
     // instead, so that job's own suppression must be set explicitly, and
     // before `split_pages` runs so warnings raised during the split itself
-    // are suppressed too, not only the final summary line.
+    // are suppressed too, not only the final summary line. The same reasoning
+    // applies to `--warning-exit-0`: qpdf's single job reaches
+    // `QPDFJob.cc:560` with `m->warnings_exit_zero` already set, so this
+    // fresh job must carry the same policy or `--split-pages` would still
+    // exit 3 on a repair warning.
     job.set_suppress_warnings(suppress_warnings);
+    job.set_warnings_exit_zero(cli_warning_exit_zero());
     if progress {
         job.set_progress(true);
         job.set_output_file(output.to_path_buf())?;
@@ -8703,6 +8719,21 @@ fn cli_logger() -> QPDFLogger {
     LOGGER.get_or_init(QPDFLogger::create).clone()
 }
 
+/// The qpdf CLI creates one QPDFJob for an invocation, but flpdf's top-level
+/// dispatch creates that same job at several route-specific boundaries. Keep
+/// the argv-owned warning-exit policy in one process-local slot so every
+/// canonical QPDFJob created by this invocation receives the same
+/// `Config::warningExitZero` state.
+///
+/// Every route that can decide the process exit status has to read it: qpdf
+/// derives that status once, from the single job's `warnings_exit_zero`
+/// (`QPDFJob.cc:560-563`).
+static CLI_WARNING_EXIT_ZERO: OnceLock<bool> = OnceLock::new();
+
+fn cli_warning_exit_zero() -> bool {
+    CLI_WARNING_EXIT_ZERO.get().copied().unwrap_or(false)
+}
+
 fn standard_save_writer() -> CliResult<PipelineWriter> {
     standard_save_writer_for(&cli_logger())
 }
@@ -8853,6 +8884,7 @@ fn finish_check_job(result: std::result::Result<JobExitCode, CheckError>) -> Cli
 
 fn finish_warning_state(has_warnings: bool, creates_output: bool, no_warn: bool) -> CliResult<()> {
     let mut job = QPDFJob::new();
+    job.set_warnings_exit_zero(cli_warning_exit_zero());
     job.set_logger(cli_logger());
     job.set_message_prefix(progname());
     job.set_suppress_warnings(no_warn);
@@ -9251,6 +9283,7 @@ fn run_add_attachment(
     job.set_logger(cli_logger());
     job.set_message_prefix(progname());
     job.set_suppress_warnings(suppress_warnings);
+    job.set_warnings_exit_zero(cli_warning_exit_zero());
     let mut pdf = job
         .open_with_description(BufReader::new(file), path_description(&input), options)
         .map_err(|error| error_with_file(&input, actionable_password_error(error)))?;
@@ -9485,6 +9518,7 @@ fn run_copy_attachments_from(
     job.set_logger(cli_logger());
     job.set_message_prefix(progname());
     job.set_suppress_warnings(suppress_warnings);
+    job.set_warnings_exit_zero(cli_warning_exit_zero());
     let mut pdf = job
         .open_with_description(BufReader::new(file), path_description(&input), options)
         .map_err(|error| error_with_file(&input, actionable_password_error(error)))?;
