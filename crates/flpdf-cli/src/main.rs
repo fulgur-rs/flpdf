@@ -122,26 +122,34 @@ impl ImageTransformOptions {
     }
 }
 
-/// Transformations that qpdf applies before a top-level read-only inspection.
-/// Keep this separate from the writer/attachment image options so the CLI
-/// cannot accept a transform and then silently drop it before `doInspection`
-/// (`libqpdf/QPDFJob.cc:473,484-491`).
+/// Transformations that qpdf applies before a top-level inspection or
+/// attachment operation. Keeping this carrier at the job boundary prevents
+/// the CLI from accepting a transform and then silently dropping it before
+/// `doInspection` or attachment mutation (`libqpdf/QPDFJob.cc:473,484-491,
+/// 2046-2247`).
 #[derive(Debug, Clone, Copy)]
 struct InspectionTransformOptions {
     image: ImageTransformOptions,
     generate_appearances: bool,
+    flatten_annotations: Option<CliFlattenMode>,
 }
 
 impl InspectionTransformOptions {
-    fn new(image: ImageTransformOptions, generate_appearances: bool) -> Self {
+    fn new(
+        image: ImageTransformOptions,
+        generate_appearances: bool,
+        flatten_annotations: Option<CliFlattenMode>,
+    ) -> Self {
         Self {
             image,
             generate_appearances,
+            flatten_annotations,
         }
     }
 
     fn is_empty(self) -> bool {
         !self.generate_appearances
+            && self.flatten_annotations.is_none()
             && !self.image.externalize_inline_images
             && !self.image.optimize_images
     }
@@ -396,8 +404,8 @@ fn apply_image_transformations<R: Read + Seek + 'static>(
 }
 
 /// Apply qpdf's canonical create-stage transformations before a top-level
-/// inspection consumer. The job owns the ordering: image transforms run
-/// before `generateAppearancesIfNeeded`, matching
+/// inspection or attachment consumer. The job owns the ordering: image
+/// transforms run before `generateAppearancesIfNeeded`, matching
 /// `QPDFJob::handleTransformations` (`QPDFJob.cc:2138-2194`).
 fn apply_inspection_transformations<R: Read + Seek + 'static>(
     job: &mut QPDFJob,
@@ -414,6 +422,9 @@ fn apply_inspection_transformations<R: Read + Seek + 'static>(
         let mut configuration = job.config();
         if options.generate_appearances {
             configuration.generate_appearances();
+        }
+        if let Some(mode) = options.flatten_annotations {
+            configuration.flatten_annotations(mode.into());
         }
         if options.image.externalize_inline_images {
             configuration.externalize_inline_images(options.image.image_options.inline_min_bytes);
@@ -791,7 +802,6 @@ struct Cli {
             "encrypt",
             "copy_encryption",
             "encryption_file_password",
-            "flatten_annotations",
             "output",
         ]
     )]
@@ -1281,8 +1291,6 @@ struct Cli {
             "check", "show_object",
             "show_npages", "show_pages", "show_xref", "show_linearization",
             "show_encryption",
-            "list_attachments", "show_attachment", "remove_attachment",
-            "add_attachment", "copy_attachments_from",
             "pages", "rotate", "split_pages", "empty",
             "json_output",
         ],
@@ -1297,15 +1305,13 @@ struct Cli {
     /// dispatches to `doInspection` (`QPDFJob.cc:473,484-491,2178-2180`), and
     /// `checkConfiguration` (`QPDFJob.cc:566-641`) rejects no combination, so
     /// the read-only inspection modes accept this flag and observe the
-    /// transformed document. It stays rejected against the attachment and
-    /// page-operation modes, whose dispatch never reads
-    /// `args.generate_appearances` and would silently drop it. Combining with
-    /// `--linearize` is supported (threaded through the linearize branch of
-    /// `run_rewrite`), so it is intentionally absent from this list.
+    /// transformed document. It stays rejected against page-operation modes,
+    /// whose dispatch still does not consume this transformation. Attachment
+    /// inspection and rewrite routes use the same canonical job phase. Combining
+    /// with `--linearize` is supported (threaded through the linearize branch
+    /// of `run_rewrite`), so it is intentionally absent from this list.
     #[arg(long = "generate-appearances",
           conflicts_with_all = [
-              "list_attachments", "show_attachment", "remove_attachment",
-              "add_attachment", "copy_attachments_from",
               "pages", "rotate", "split_pages", "json_output",
           ])]
     generate_appearances: bool,
@@ -3151,6 +3157,7 @@ fn main() {
     let top_level_inspection_transform_options = InspectionTransformOptions::new(
         top_level_image_transform_options,
         args.generate_appearances,
+        args.flatten_annotations,
     );
     // QPDFWriter::doWriteSetup clears QDF before deriving QDF's implicit
     // normalization defaults for linearized output (`QPDFWriter.cc:2068-2080`).
@@ -3393,7 +3400,7 @@ fn main() {
             args.verbose,
             args.no_warn,
             args.page_ops.empty,
-            top_level_image_transform_options,
+            top_level_inspection_transform_options,
         )
     } else if let Some(key) = args.show_attachment {
         run_show_attachment(
@@ -3404,7 +3411,7 @@ fn main() {
             args.verbose,
             args.no_warn,
             args.page_ops.empty,
-            top_level_image_transform_options,
+            top_level_inspection_transform_options,
         )
     } else if !args.remove_attachment.is_empty() {
         let options = top_level_writer_options(
@@ -3425,7 +3432,7 @@ fn main() {
             args.linearize,
             args.linearize_pass1.as_deref(),
             options,
-            top_level_image_transform_options,
+            top_level_inspection_transform_options,
         )
     } else if !attachment_segments.is_empty() {
         let options = top_level_writer_options(
@@ -3446,7 +3453,7 @@ fn main() {
             args.linearize,
             args.linearize_pass1.as_deref(),
             options,
-            top_level_image_transform_options,
+            top_level_inspection_transform_options,
         )
     } else if !args.copy_attachments_from.is_empty() {
         let copy_groups = args
@@ -3471,7 +3478,7 @@ fn main() {
             args.linearize,
             args.linearize_pass1.as_deref(),
             options,
-            top_level_image_transform_options,
+            top_level_inspection_transform_options,
         )
     } else if args.page_ops.empty
         && args.page_ops.pages.is_empty()
@@ -4389,7 +4396,7 @@ fn run_command(command: Commands, overlay_specs: &[OverlaySpec]) -> CliResult<()
             false,
             false,
             false,
-            InspectionTransformOptions::new(ImageTransformOptions::default(), false),
+            InspectionTransformOptions::new(ImageTransformOptions::default(), false, None),
             false,
         ),
         Commands::CheckLinearization(cmd) => run_check_linearization(
@@ -4398,7 +4405,7 @@ fn run_command(command: Commands, overlay_specs: &[OverlaySpec]) -> CliResult<()
             &PasswordArgs::default(),
             false,
             false,
-            InspectionTransformOptions::new(ImageTransformOptions::default(), false),
+            InspectionTransformOptions::new(ImageTransformOptions::default(), false, None),
             false,
         ),
         Commands::DumpObject(cmd) => run_dump_object(
@@ -4416,7 +4423,7 @@ fn run_command(command: Commands, overlay_specs: &[OverlaySpec]) -> CliResult<()
                     &cmd.password,
                     false,
                     false,
-                    InspectionTransformOptions::new(ImageTransformOptions::default(), false),
+                    InspectionTransformOptions::new(ImageTransformOptions::default(), false, None),
                     false,
                 )
             } else {
@@ -4427,7 +4434,7 @@ fn run_command(command: Commands, overlay_specs: &[OverlaySpec]) -> CliResult<()
                     false,
                     false,
                     false,
-                    InspectionTransformOptions::new(ImageTransformOptions::default(), false),
+                    InspectionTransformOptions::new(ImageTransformOptions::default(), false, None),
                     false,
                 )
             }
@@ -4458,7 +4465,7 @@ fn run_command(command: Commands, overlay_specs: &[OverlaySpec]) -> CliResult<()
                 false,
                 false,
                 false,
-                InspectionTransformOptions::new(ImageTransformOptions::default(), false),
+                InspectionTransformOptions::new(ImageTransformOptions::default(), false, None),
                 false,
             )
         }
@@ -9208,7 +9215,7 @@ fn run_add_attachment(
     linearize: bool,
     linearize_pass1: Option<&Path>,
     writer_options: WriterOptions,
-    image_options: ImageTransformOptions,
+    transform_options: InspectionTransformOptions,
 ) -> CliResult<()> {
     let input = input.ok_or_else(missing_input_usage_error)?;
     let output = output.ok_or_else(missing_output_usage_error)?;
@@ -9252,7 +9259,7 @@ fn run_add_attachment(
     if remove_restrictions {
         AcroFormDocumentHelper::new(&mut pdf)?.disable_digital_signatures()?;
     }
-    apply_image_transformations(&mut pdf, image_options, verbose)?;
+    apply_inspection_transformations(&mut job, &mut pdf, transform_options, verbose)?;
     job.add_attachments(&mut pdf, &attachment_options)?;
 
     // qpdf's writer applies content normalization after all transformations
@@ -9302,7 +9309,7 @@ fn run_remove_attachment(
     linearize: bool,
     linearize_pass1: Option<&Path>,
     writer_options: WriterOptions,
-    image_options: ImageTransformOptions,
+    transform_options: InspectionTransformOptions,
 ) -> CliResult<()> {
     let input = input.ok_or_else(missing_input_usage_error)?;
     let output = output.ok_or_else(missing_output_usage_error)?;
@@ -9314,12 +9321,14 @@ fn run_remove_attachment(
     let mut standard_output = prepare_pdf_standard_output(&output)?;
     let creates_output = standard_output.is_none();
 
+    let mut job = new_cli_job(suppress_warnings);
     let mut pdf = open_pdf_with_suppression(&input, repair, password, suppress_warnings)?;
+    job.set_input_name_bytes(path_description(&input));
 
     if remove_restrictions {
         AcroFormDocumentHelper::new(&mut pdf)?.disable_digital_signatures()?;
     }
-    apply_image_transformations(&mut pdf, image_options, verbose)?;
+    apply_inspection_transformations(&mut job, &mut pdf, transform_options, verbose)?;
     for key in keys {
         let key = arg_parser::os_bytes(key);
         let found = pdf.embedded_files().remove_embedded_file(&key)?;
@@ -9371,21 +9380,21 @@ fn run_list_attachments(
     verbose: bool,
     suppress_warnings: bool,
     empty: bool,
-    image_options: ImageTransformOptions,
+    transform_options: InspectionTransformOptions,
 ) -> CliResult<()> {
     if empty {
         reject_empty_inspection_output(input.as_deref())?;
         let mut job = new_cli_job(suppress_warnings);
         let mut pdf = create_empty_primary_document(&mut job, None)?;
-        apply_image_transformations(&mut pdf, image_options, verbose)?;
+        apply_inspection_transformations(&mut job, &mut pdf, transform_options, verbose)?;
         let status = job.list_attachments(&mut pdf, verbose)?;
         return finish_job_exit_status(status);
     }
     let input = input.ok_or_else(missing_input_usage_error)?;
-    let mut pdf = open_pdf_with_suppression(&input, repair, password, suppress_warnings)?;
     let mut job = new_cli_job(suppress_warnings);
-    apply_image_transformations(&mut pdf, image_options, verbose)?;
+    let mut pdf = open_pdf_with_suppression(&input, repair, password, suppress_warnings)?;
     job.set_input_name_bytes(path_description(&input));
+    apply_inspection_transformations(&mut job, &mut pdf, transform_options, verbose)?;
     let status = job.list_attachments(&mut pdf, verbose)?;
     finish_job_exit_status(status)
 }
@@ -9410,7 +9419,7 @@ fn run_show_attachment(
     verbose: bool,
     suppress_warnings: bool,
     empty: bool,
-    image_options: ImageTransformOptions,
+    transform_options: InspectionTransformOptions,
 ) -> CliResult<()> {
     // qpdf latches standard output for `--show-attachment` in
     // `checkConfiguration` (`QPDFJob.cc:621-625`), before it opens the document
@@ -9425,16 +9434,16 @@ fn run_show_attachment(
         reject_empty_inspection_output(input.as_deref())?;
         let mut job = new_cli_job(suppress_warnings);
         let mut pdf = create_empty_primary_document(&mut job, None)?;
-        apply_image_transformations(&mut pdf, image_options, verbose)?;
+        apply_inspection_transformations(&mut job, &mut pdf, transform_options, verbose)?;
         let key = arg_parser::os_bytes(key);
         let status = job.show_attachment(&mut pdf, &key)?;
         return finish_job_exit_status(status);
     }
     let input = input.ok_or_else(missing_input_usage_error)?;
-    let mut pdf = open_pdf_with_suppression(&input, repair, password, suppress_warnings)?;
     let mut job = new_cli_job(suppress_warnings);
-    apply_image_transformations(&mut pdf, image_options, verbose)?;
+    let mut pdf = open_pdf_with_suppression(&input, repair, password, suppress_warnings)?;
     job.set_input_name_bytes(path_description(&input));
+    apply_inspection_transformations(&mut job, &mut pdf, transform_options, verbose)?;
     let key = arg_parser::os_bytes(key);
     let status = job.show_attachment(&mut pdf, &key)?;
     finish_job_exit_status(status)
@@ -9456,7 +9465,7 @@ fn run_copy_attachments_from(
     linearize: bool,
     linearize_pass1: Option<&Path>,
     writer_options: WriterOptions,
-    image_options: ImageTransformOptions,
+    transform_options: InspectionTransformOptions,
 ) -> CliResult<()> {
     let input = input.ok_or_else(missing_input_usage_error)?;
     let output = output.ok_or_else(missing_output_usage_error)?;
@@ -9483,7 +9492,7 @@ fn run_copy_attachments_from(
     if remove_restrictions {
         let _ = AcroFormDocumentHelper::new(&mut pdf)?.disable_digital_signatures()?;
     }
-    apply_image_transformations(&mut pdf, image_options, verbose)?;
+    apply_inspection_transformations(&mut job, &mut pdf, transform_options, verbose)?;
 
     let copy_options = donor_args
         .into_iter()
@@ -11386,7 +11395,7 @@ mod tests {
             false,
             false,
             false,
-            InspectionTransformOptions::new(ImageTransformOptions::default(), false),
+            InspectionTransformOptions::new(ImageTransformOptions::default(), false, None),
             false,
         )
         .expect_err("overflow selector with no input file");

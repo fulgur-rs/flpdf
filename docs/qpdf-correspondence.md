@@ -1292,6 +1292,18 @@ save pipeline として予約する（`QPDFJob.cc:621-625`）——これによ�
 `setSave` が info を標準エラーへ移し（`QPDFLogger.cc:197-200`）、verbose の
 image 診断が payload と混ざらない。
 
+`flpdf-osf9` ではこの同じ job transformation boundary を
+`--generate-appearances` / `--flatten-annotations` にも拡張した。qpdf は
+`handleTransformations` (`QPDFJob.cc:2138-2194`) を attachment inspection・
+attachment mutation・linearization inspection より前に無条件で走らせ、
+`checkConfiguration` (`QPDFJob.cc:566-641`) にはこれらの組み合わせを拒否する
+分岐が無い。flpdf は `InspectionTransformOptions` から
+`QPDFJob::apply_transformations` を通し、`AcroFormDocumentHelper` と
+`PageDocumentHelper` の canonical primitive を同じ順序で再利用する。
+`crates/flpdf-cli/tests/cli_inspection_transform_combinations.rs` は qpdf
+11.9.0 の list/show/add/copy/remove/linearization 組み合わせの exit・stdout・
+stderr parity を固定する。
+
 top-level `--flatten-annotations=all|screen|print` も `auto_job_init.hh:117` / `QPDFJob_config.cc:190-200` の choices を `flpdf-cli` の shared `run_rewrite` route に接続し、通常 rewrite と linearize rewrite の両方で `PageDocumentHelper::flatten_annotations` (`QPDFPageDocumentHelper.cc:55-77`) を実行する。`NeedAppearances` 時の `warnIfPossible` と stream filter warning の parsed-offset/suppression 境界も qpdf の warning/status contract に合わせる。
 
 CLI の page-operation route も同じ順序を保つ。qpdf は `createQPDF` で
