@@ -17,7 +17,6 @@ use crate::{Error, Pdf, Result};
 use crate::{ObjectHandle, ObjectRef};
 
 const INHERITABLE_KEYS: [&[u8]; 4] = [b"/CropBox", b"/MediaBox", b"/Resources", b"/Rotate"];
-const MAX_DEPTH: usize = crate::pages::DEFAULT_MAX_PAGE_TREE_DEPTH;
 
 pub(crate) fn push<R: Read + Seek>(
     pdf: &mut Pdf<R>,
@@ -35,7 +34,6 @@ pub(crate) fn push<R: Read + Seek>(
             &mut visited,
             allow_changes,
             warn_skipped_keys,
-            0,
         )?,
         PageTreeRoot::Direct { catalog } => {
             let catalog = pdf.get_object_handle(catalog);
@@ -89,7 +87,6 @@ fn push_direct_root<R: Read + Seek>(
         visited,
         allow_changes,
         warn_skipped_keys,
-        0,
     )?;
     Ok(())
 }
@@ -101,18 +98,10 @@ fn push_direct_node<R: Read + Seek>(
     visited: &mut BTreeSet<ObjectRef>,
     allow_changes: bool,
     warn_skipped_keys: bool,
-    depth: usize,
 ) -> Result<()> {
-    // cov:ignore-start: prepare_for_optimization traverses the same direct tree with this depth bound first
-    if depth >= MAX_DEPTH {
-        return Err(Error::Unsupported(format!(
-            "page tree depth exceeds maximum of {MAX_DEPTH} in direct /Pages node"
-        )));
-    }
     if !is_pages_dictionary(dict) {
         return Ok(());
     }
-    // cov:ignore-end
 
     // cov:ignore-start: all production callers pass warn_skipped_keys=false
     if warn_skipped_keys && dict.try_has_key(b"/Parent")? {
@@ -151,7 +140,6 @@ fn push_direct_node<R: Read + Seek>(
                     visited,
                     allow_changes,
                     warn_skipped_keys,
-                    depth,
                 )?; // cov:ignore: direct-root integration test exercises this branch; LLVM attributes the counter to push_child_reference
             } else if kid.as_dictionary().is_some() && kid.has_key(b"/Kids") {
                 push_direct_node(
@@ -161,7 +149,6 @@ fn push_direct_node<R: Read + Seek>(
                     visited,
                     allow_changes,
                     warn_skipped_keys,
-                    depth + 1,
                 )?; // cov:ignore: direct-descendant integration test exercises this branch; LLVM attributes the counter to push_direct_node
             } // cov:ignore: direct-descendant integration test exercises the branch; LLVM attributes the counter to the recursive callee
         }
@@ -233,7 +220,6 @@ fn push_child_reference<R: Read + Seek>(
     visited: &mut BTreeSet<ObjectRef>,
     allow_changes: bool,
     warn_skipped_keys: bool,
-    depth: usize,
 ) -> Result<()> {
     let child = pdf.get_object_handle(kid_ref);
     pdf.resolve(&child)?;
@@ -246,7 +232,6 @@ fn push_child_reference<R: Read + Seek>(
             visited,
             allow_changes,
             warn_skipped_keys,
-            depth + 1,
         );
     }
 
@@ -279,13 +264,7 @@ fn push_internal<R: Read + Seek>(
     visited: &mut BTreeSet<ObjectRef>,
     allow_changes: bool,
     warn_skipped_keys: bool,
-    depth: usize,
 ) -> Result<()> {
-    if depth >= MAX_DEPTH {
-        return Err(Error::Unsupported(format!(
-            "page tree depth exceeds maximum of {MAX_DEPTH} at {node_ref}"
-        )));
-    }
     if !visited.insert(node_ref) {
         return Ok(()); // cov:ignore: page-tree repair rejects cycles before inherited-attribute push
     }
@@ -338,7 +317,6 @@ fn push_internal<R: Read + Seek>(
                 visited,
                 allow_changes,
                 warn_skipped_keys,
-                depth,
             )?;
         }
     }
@@ -542,13 +520,14 @@ mod tests {
     }
 
     #[test]
-    fn excessive_depth_error_propagates_from_a_child_pages_node() {
+    fn deep_page_tree_push_has_no_arbitrary_depth_cap() {
         let mut pdf = Pdf::open_mem_owned(pdf_bytes(&[
             (1, b"<< /Type /Catalog /Pages 2 0 R >>"),
             (2, b"<< /Type /Pages /Kids [] /Count 0 >>"),
         ]))
         .unwrap();
-        for depth in 0..MAX_DEPTH {
+        let depth = 120;
+        for depth in 0..depth {
             let number = 2 + depth as u32;
             let child = number + 1;
             let node = ObjectHandle::dictionary(vec![
@@ -566,17 +545,15 @@ mod tests {
             (b"/Kids".to_vec(), ObjectHandle::array(Vec::new())),
             (b"/Count".to_vec(), ObjectHandle::integer(0)),
         ]);
-        pdf.replace_object(ObjectRef::new(2 + MAX_DEPTH as u32, 0), boundary)
+        pdf.replace_object(ObjectRef::new(2 + depth as u32, 0), boundary)
             .unwrap();
         let prepared = PreparedPages {
             root: PageTreeRoot::Indirect(ObjectRef::new(2, 0)),
             pages: Vec::new(),
         };
 
-        let error = push(&mut pdf, &prepared, true, false).unwrap_err();
-
-        assert!(matches!(error, Error::Unsupported(ref message)
-                if message.contains("page tree depth exceeds maximum")));
+        push(&mut pdf, &prepared, true, false)
+            .expect("qpdf's inherited-attribute push has no arbitrary depth cap");
     }
 
     /// `direct-root-adbe.pdf`'s trailer `/Root` is an inline Catalog dict

@@ -44,10 +44,10 @@ pub enum PageTreeRoot {
 /// # Errors
 ///
 /// Propagates any [`Error`] from resolving an object while walking the tree, and
-/// returns [`Error::Unsupported`] if the tree exceeds
-/// [`DEFAULT_MAX_PAGE_TREE_DEPTH`](crate::pages::DEFAULT_MAX_PAGE_TREE_DEPTH).
+/// follows qpdf's unbounded default page-tree walk and returns
+/// [`Error::Unsupported`] only for other traversal failures.
 pub fn prepare_for_optimization<R: Read + Seek>(pdf: &mut Pdf<R>) -> Result<Option<PreparedPages>> {
-    prepare_for_optimization_with_max_depth(pdf, crate::pages::DEFAULT_MAX_PAGE_TREE_DEPTH)
+    prepare_for_optimization_canonical(pdf, None)
 }
 
 /// Like [`prepare_for_optimization`], but uses the caller's page-tree depth
@@ -56,7 +56,7 @@ pub(crate) fn prepare_for_optimization_with_max_depth<R: Read + Seek>(
     pdf: &mut Pdf<R>,
     max_depth: usize,
 ) -> Result<Option<PreparedPages>> {
-    prepare_for_optimization_canonical(pdf, max_depth)
+    prepare_for_optimization_canonical(pdf, Some(max_depth))
 }
 
 /// Canonical qpdf-style page-tree preparation.
@@ -68,9 +68,9 @@ pub(crate) fn prepare_for_optimization_with_max_depth<R: Read + Seek>(
 /// repair mutates them.
 fn prepare_for_optimization_canonical<R: Read + Seek>(
     pdf: &mut Pdf<R>,
-    max_depth: usize,
+    max_depth: Option<usize>,
 ) -> Result<Option<PreparedPages>> {
-    if max_depth == crate::pages::DEFAULT_MAX_PAGE_TREE_DEPTH {
+    if max_depth.is_none() {
         if let Some(cached) = pdf.cached_page_list() {
             pdf.mark_get_all_pages_called();
             return Ok(Some(cached));
@@ -175,7 +175,7 @@ fn prepare_for_optimization_canonical<R: Read + Seek>(
         root,
         pages: state.pages,
     };
-    if max_depth == crate::pages::DEFAULT_MAX_PAGE_TREE_DEPTH {
+    if max_depth.is_none() {
         pdf.cache_page_list(&prepared);
     }
     Ok(Some(prepared))
@@ -200,14 +200,15 @@ fn repair_page_tree_handle<R: Read + Seek>(
     state: &mut CanonicalRepairState,
     depth: usize,
     inherited_media_box: bool,
-    max_depth: usize,
+    max_depth: Option<usize>,
 ) -> Result<()> {
-    if depth >= max_depth {
+    if max_depth.is_some_and(|max_depth| depth >= max_depth) {
         let location = node
             .object_ref()
             .map_or_else(|| "direct /Pages node".to_owned(), |r| r.to_string());
         return Err(Error::Unsupported(format!(
-            "page tree depth exceeds maximum of {max_depth} at {location}"
+            "page tree depth exceeds maximum of {} at {location}",
+            max_depth.expect("checked above")
         )));
     }
     if let Some(object_ref) = node.object_ref() {
