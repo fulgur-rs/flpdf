@@ -212,6 +212,7 @@ pub fn extract_pages<R: Read + Seek>(
                 .map(|(index, label)| RawPageLabelEntry {
                     index,
                     source_id,
+                    source_is_primary: true,
                     label,
                 })
                 .collect();

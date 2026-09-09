@@ -363,6 +363,27 @@ The number-tree depth/error policy, raw `/S`/`/P`/`/St` presence, and
 Result-propagation boundaries. The rendering-only qpdf deviation and test-only
 fixtures remain outside this slice.
 
+### A6/A7 page-label provenance and foreign-owner follow-up `flpdf-hrgj` (2026-09-10)
+
+The raw label consumer boundary now distinguishes qpdf's primary-owner path
+from foreign/destroyed-source paths. Primary raw label copies register every
+entry in the persistent foreign-object map as
+`WriterObjectOrderKey::primary`, so QDF `%% Original object ID` comments use
+the source ObjGen for indirect `/S` and `/P` descendants. Foreign label
+dictionaries use `shallow_copy`: direct scalar values become destination-safe
+copies while indirect descendants remain foreign and reach the canonical
+writer ownership check. This matches qpdf's `handlePageSpecs` primary handle
+handoff (`libqpdf/QPDFJob.cc:2511-2593`), split-pages handoff
+(`libqpdf/QPDFJob.cc:2960-3010`), `QPDFWriter::enqueueObject`
+(`libqpdf/QPDFWriter.cc:1072-1082`), and QDF provenance emission
+(`libqpdf/QPDFWriter.cc:1774-1787`).
+
+Pinned qpdf 11.9.0 probes cover valid indirect `/S` and `/P` labels: primary+
+secondary `--pages` preserves the qpdf original-object comments; split-pages
+and `--empty --pages` return qpdf's foreign/destroyed-QPDF failures instead of
+silently copying the handles. The existing raw label dictionary semantics and
+the rendering-only deviation remain unchanged.
+
 ### A6/A7 page-document final-tree slice `flpdf-3yn9.48.23.5` (2026-09-09)
 
 The final-page clear path in

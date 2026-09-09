@@ -253,6 +253,18 @@ impl<R: Read + Seek> Pdf<R> {
             .unwrap_or(object_ref)
     }
 
+    /// Retain source object identities for raw primary page-label copies that
+    /// are reconstructed after the page-copy map has been finalized.
+    pub(crate) fn record_primary_writer_object_refs(&mut self, source_id: u64) {
+        let mappings = self.foreign_object_map_snapshot(source_id);
+        let order = self.writer_object_order.get_or_insert_with(BTreeMap::new);
+        for (source_ref, target_ref) in mappings {
+            order
+                .entry(target_ref)
+                .or_insert_with(|| WriterObjectOrderKey::primary(source_ref));
+        }
+    }
+
     /// Close the current qpdf input source while retaining the document's
     /// already-parsed object graph.
     ///

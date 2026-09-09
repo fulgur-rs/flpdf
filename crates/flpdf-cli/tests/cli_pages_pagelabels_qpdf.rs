@@ -103,6 +103,37 @@ fn prefixed_two_page_pdf() -> Vec<u8> {
     out
 }
 
+/// Two pages whose reconstructed label keeps indirect `/S` and `/P` children.
+/// The source object numbers are intentionally outside the page-tree range so
+/// QDF provenance cannot accidentally match a destination allocation.
+fn indirect_style_and_prefix_two_page_pdf() -> Vec<u8> {
+    let objects: &[(u32, &str)] = &[
+        (1, "<< /Type /Catalog /Pages 2 0 R /PageLabels 5 0 R >>"),
+        (2, "<< /Type /Pages /Kids [3 0 R 4 0 R] /Count 2 >>"),
+        (3, "<< /Type /Page /Parent 2 0 R /MediaBox [0 0 612 792] >>"),
+        (4, "<< /Type /Page /Parent 2 0 R /MediaBox [0 0 612 792] >>"),
+        (5, "<< /Nums [0 6 0 R] >>"),
+        (6, "<< /S 7 0 R /P 8 0 R /St 1 >>"),
+        (7, "/D"),
+        (8, "(prefix)"),
+    ];
+    let mut out = b"%PDF-1.7\n".to_vec();
+    let mut offsets = BTreeMap::new();
+    for (number, body) in objects {
+        offsets.insert(*number, out.len() as u64);
+        out.extend_from_slice(format!("{number} 0 obj\n{body}\nendobj\n").as_bytes());
+    }
+    let xref_start = out.len() as u64;
+    out.extend_from_slice(b"xref\n0 9\n0000000000 65535 f \n");
+    for number in 1..=8 {
+        out.extend_from_slice(format!("{:010} 00000 n \n", offsets[&number]).as_bytes());
+    }
+    out.extend_from_slice(
+        format!("trailer\n<< /Size 9 /Root 1 0 R >>\nstartxref\n{xref_start}\n%%EOF\n").as_bytes(),
+    );
+    out
+}
+
 fn non_string_prefix_two_page_pdf(prefix: &str) -> Vec<u8> {
     let objects: &[(u32, String)] = &[
         (
@@ -415,6 +446,162 @@ fn cli_pages_subset_reconstructs_labels_like_qpdf() {
                 }
             ),
         ]
+    );
+}
+
+#[test]
+fn cli_pages_preserves_indirect_label_qdf_original_object_ids_like_qpdf() {
+    if !qpdf_available() {
+        eprintln!(
+            "[SKIP cli_pages_pagelabels_qpdf] {} 11.9.0 not on PATH",
+            QPDF
+        );
+        return;
+    }
+
+    let tmp = tempfile::tempdir().expect("tempdir");
+    let source = tmp.path().join("indirect-labels.pdf");
+    std::fs::write(&source, indirect_style_and_prefix_two_page_pdf()).unwrap();
+    let secondary =
+        Path::new(env!("CARGO_MANIFEST_DIR")).join("../../tests/fixtures/compat/one-page.pdf");
+    let qpdf_output = tmp.path().join("qpdf.pdf");
+    Shell::new(QPDF)
+        .args([
+            "--qdf",
+            "--static-id",
+            source.to_str().unwrap(),
+            "--pages",
+            ".",
+            "1-2",
+            secondary.to_str().unwrap(),
+            "1",
+            "--",
+            qpdf_output.to_str().unwrap(),
+        ])
+        .status()
+        .expect("qpdf should spawn")
+        .success()
+        .then_some(())
+        .expect("qpdf --pages should succeed");
+
+    let flpdf_output = tmp.path().join("flpdf.pdf");
+    Command::cargo_bin("flpdf")
+        .unwrap()
+        .args(["--qdf", "--static-id"])
+        .arg(&source)
+        .args(["--pages", ".", "1-2"])
+        .arg(&secondary)
+        .args(["1", "--"])
+        .arg(&flpdf_output)
+        .assert()
+        .success();
+
+    assert_eq!(
+        std::fs::read(&flpdf_output).unwrap(),
+        std::fs::read(&qpdf_output).unwrap(),
+        "indirect page-label children must retain qpdf QDF original object IDs"
+    );
+}
+
+#[test]
+fn cli_split_pages_rejects_indirect_label_handles_like_qpdf() {
+    if !qpdf_available() {
+        eprintln!(
+            "[SKIP cli_pages_pagelabels_qpdf] {} 11.9.0 not on PATH",
+            QPDF
+        );
+        return;
+    }
+
+    let tmp = tempfile::tempdir().expect("tempdir");
+    let source = tmp.path().join("indirect-labels.pdf");
+    std::fs::write(&source, indirect_style_and_prefix_two_page_pdf()).unwrap();
+    let qpdf_output = tmp.path().join("qpdf-%d.pdf");
+    let qpdf = Shell::new(QPDF)
+        .args([
+            "--qdf",
+            "--static-id",
+            "--split-pages=1",
+            source.to_str().unwrap(),
+            qpdf_output.to_str().unwrap(),
+        ])
+        .output()
+        .expect("qpdf should spawn");
+    assert_eq!(qpdf.status.code(), Some(2));
+    assert!(
+        String::from_utf8_lossy(&qpdf.stderr).contains("from different QPDF"),
+        "qpdf error should preserve the foreign-handle ownership boundary: {}",
+        String::from_utf8_lossy(&qpdf.stderr)
+    );
+
+    let flpdf_output = tmp.path().join("flpdf-%d.pdf");
+    Command::cargo_bin("flpdf")
+        .unwrap()
+        .args(["--qdf", "--static-id", "--split-pages=1"])
+        .arg(&source)
+        .arg(&flpdf_output)
+        .assert()
+        .failure();
+}
+
+#[test]
+fn cli_empty_pages_rejects_destroyed_indirect_label_handles_like_qpdf() {
+    if !qpdf_available() {
+        eprintln!(
+            "[SKIP cli_pages_pagelabels_qpdf] {} 11.9.0 not on PATH",
+            QPDF
+        );
+        return;
+    }
+
+    let tmp = tempfile::tempdir().expect("tempdir");
+    let source = tmp.path().join("indirect-labels.pdf");
+    std::fs::write(&source, indirect_style_and_prefix_two_page_pdf()).unwrap();
+    let qpdf_output = tmp.path().join("qpdf.pdf");
+    let qpdf = Shell::new(QPDF)
+        .args([
+            "--qdf",
+            "--static-id",
+            "--empty",
+            "--pages",
+            source.to_str().unwrap(),
+            "1-2",
+            "--",
+            qpdf_output.to_str().unwrap(),
+        ])
+        .output()
+        .expect("qpdf should spawn");
+    assert_eq!(qpdf.status.code(), Some(2));
+    assert!(
+        String::from_utf8_lossy(&qpdf.stderr).contains("destroyed QPDF"),
+        "qpdf error should preserve the destroyed-source boundary: {}",
+        String::from_utf8_lossy(&qpdf.stderr)
+    );
+
+    let flpdf_output = tmp.path().join("flpdf.pdf");
+    // flpdf reaches the same ownership boundary and the same exit status, but
+    // through the foreign-owner check rather than a destroyed-owner one: its
+    // secondary `Pdf` is still alive at write time because `prepare_document`
+    // moves every page source into `page_source_documents`. Pin the current
+    // text rather than settling for `.failure()`, so the remaining wording gap
+    // is visible here instead of silently passing.
+    let flpdf = Command::cargo_bin("flpdf")
+        .unwrap()
+        .args(["--qdf", "--static-id", "--empty", "--pages"])
+        .arg(&source)
+        .args(["1-2", "--"])
+        .arg(&flpdf_output)
+        .output()
+        .expect("flpdf invocation");
+    assert_eq!(flpdf.status.code(), qpdf.status.code());
+    let flpdf_stderr = String::from_utf8_lossy(&flpdf.stderr).into_owned();
+    assert!(
+        flpdf_stderr.contains("from different QPDF"),
+        "flpdf should reject the foreign label handle: {flpdf_stderr}"
+    );
+    assert!(
+        !flpdf_stderr.contains("destroyed QPDF"),
+        "known gap: flpdf does not yet release the secondary document before          writing, so it cannot report qpdf's destroyed-owner wording. Update          this assertion together with that fix: {flpdf_stderr}"
     );
 }
 
