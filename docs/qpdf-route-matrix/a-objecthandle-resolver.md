@@ -540,6 +540,23 @@ outside this accessor slice.
    （`ResolverHandle` を外部で `Rc` 保持する経路が生じると A20 の「窓は生じない」論拠が崩れるため）。
 
 
+### 2026-09-10 current caller audit: outline/destination remap bounded cutover
+
+`flpdf-3yn9.48.23.13` migrated the non-qtest production callers in
+`crates/flpdf/src/job/outline_dest_remap.rs`. Before the cutover the fresh
+tracker measured 2 `Pdf::resolve` callers in that file; after the cutover the
+scoped production counts are zero for `resolve`, `resolve_handle`, and
+`resolve_handle_ref`, while the existing `try_*` destination/accessor routes
+remain in place. The route contract is
+`crates/flpdf/tests/outline_dest_remap_route_contract_tests.rs`.
+
+The qpdf source boundary is `libqpdf/QPDFJob.cc:2469-2470,2585-2608`:
+original page-tree membership drives null-out, and surviving destination
+references are remapped without dropping navigation entries. The handle-level
+authority is `libqpdf/QPDFObjectHandle.cc:240-446,965-989,2168-2189`. The
+remaining qtest exception and unrelated struct-tree/thread-bead, writer/CLI,
+and stream caller counts are intentionally not included in this bounded slice.
+
 ### 2026-09-10 current caller audit: optimization bounded cutover
 
 `flpdf-3yn9.48.23.11` migrated the non-qtest production callers in
