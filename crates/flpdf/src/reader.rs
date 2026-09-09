@@ -2,7 +2,6 @@
 pub(crate) mod file_object;
 pub(crate) mod resolver;
 
-use crate::cache::CacheEntry;
 use crate::encryption::password::{password_candidates_for_read, PasswordMode};
 use crate::encryption::permissions::Permissions;
 use crate::encryption::standard::ObjectKeyAlg;
@@ -892,16 +891,6 @@ impl<R: Read + Seek> Pdf<R> {
         self.resolver.xref_entries()
     }
 
-    /// Number of objects currently resolved in the cache. Useful when you want to
-    /// confirm that lazy resolution actually deferred work.
-    pub fn resolved_count(&self) -> usize {
-        self.cache.resolved_count()
-    }
-
-    pub(crate) fn deleted_object_refs(&self) -> Vec<ObjectRef> {
-        self.cache.deleted_refs()
-    }
-
     #[cfg(test)]
     pub(crate) fn dirty_object_refs(&self) -> Vec<ObjectRef> {
         self.dirty_object_refs.iter().copied().collect()
@@ -925,105 +914,69 @@ impl<R: Read + Seek> Pdf<R> {
         self.dirty_object_refs.remove(&object_ref);
     }
 
-    /// Every object reference known from the cross-reference table or the
-    /// canonical handle registry, including objects that have not yet been
-    /// parsed. The registry half is needed for qpdf-shaped allocations made
-    /// from an existing [`ObjectHandle`].
-    pub fn object_refs(&self) -> Vec<ObjectRef> {
-        let mut refs: BTreeSet<ObjectRef> = if self.resolver.reconstructed_xref() {
-            self.cache
-                .refs_after_xref_recovery(&self.resolver.source_xref_entries(), false)
-                .into_iter()
-                .collect()
-        } else {
-            self.cache
-                .entries()
-                .iter()
-                .filter_map(|(object_ref, entry)| {
-                    (!matches!(entry, CacheEntry::Missing)).then_some(*object_ref)
-                })
-                .collect()
-        };
-
-        refs.extend(self.canonical_object_refs(false));
-        refs.into_iter().collect()
+    /// Return object references from qpdf's one canonical object cache without
+    /// forcing resolution. This is the internal counterpart of the writer's
+    /// cache-key walks; unlike the removed facade enumeration, it reads only
+    /// `ResolverCore::object_cache`.
+    pub(crate) fn canonical_object_refs(&self) -> Vec<ObjectRef> {
+        self.canonical_object_ref_set(false).into_iter().collect()
     }
 
-    /// Object refs that the cross-reference table marks as live.
-    ///
-    /// Excludes:
-    /// - `Deleted` — legacy test-only cache tombstones,
-    /// - `Missing` — referenced but never present in any xref,
-    /// - `Reserved` — forward-reference placeholders that
-    ///   the canonical handle returns as null (no real indirect
-    ///   object behind them).
-    ///
-    /// A `live_object_refs()` entry may still resolve to null; that
-    /// is a real null indirect object (e.g. `1 0 obj null endobj`), not an
-    /// absent one.
-    pub fn live_object_refs(&self) -> Vec<ObjectRef> {
-        let mut refs: BTreeSet<ObjectRef> = if self.resolver.reconstructed_xref() {
-            self.cache
-                .refs_after_xref_recovery(&self.resolver.source_xref_entries(), true)
-                .into_iter()
-                .collect()
-        } else {
-            self.cache
-                .entries()
-                .iter()
-                .filter_map(|(object_ref, entry)| match entry {
-                    crate::cache::CacheEntry::Deleted
-                    | crate::cache::CacheEntry::Missing
-                    | crate::cache::CacheEntry::Reserved => None,
-                    _ => Some(*object_ref),
-                })
-                .collect()
-        };
-
-        refs.extend(self.canonical_object_refs(true));
-        refs.into_iter().collect()
+    /// Return source-backed or qpdf-shaped allocated object references from the
+    /// canonical cache. Historical xref-stream cache entries and unresolved
+    /// dangling references are intentionally omitted from this live view.
+    pub(crate) fn canonical_live_object_refs(&self) -> Vec<ObjectRef> {
+        self.canonical_object_ref_set(true).into_iter().collect()
     }
 
-    fn canonical_object_refs(&self, live_only: bool) -> BTreeSet<ObjectRef> {
-        self.resolver
-            .all_object_handles()
+    fn canonical_object_ref_set(&self, live_only: bool) -> BTreeSet<ObjectRef> {
+        let mut refs: BTreeSet<_> = self
+            .resolver
+            .xref_refs()
             .into_iter()
-            .filter_map(|handle| {
-                let object_ref = handle.object_ref()?;
-                let cache_entry = self.cache.entry(object_ref);
-                if matches!(cache_entry, Some(CacheEntry::Missing)) {
-                    return None;
-                }
-                if self.resolver.xref_entry(object_ref).is_none()
-                    && cache_entry.is_none()
-                    && handle.is_null()
-                    && !self.resolver.is_allocated_object(object_ref)
-                    && !self.handle_mutated_object_refs.contains(&object_ref)
-                {
-                    // A canonical handle can resolve an absent reference to
-                    // null without creating a legacy Missing entry. qpdf's
-                    // source/cache provenance still distinguishes that
-                    // dangling cache value from an allocated indirect object.
-                    return None;
-                }
-                if live_only && self.qpdf_parsed_xref_stream_refs.contains(&object_ref) {
-                    // A historical xref stream is in qpdf's object cache but
-                    // its effective xref row is free/superseded. It belongs
-                    // to getAllObjects/JSON cache visibility, not the
-                    // effective live-xref view.
-                    return None;
-                }
-                if live_only
-                    && (matches!(
-                        cache_entry,
-                        Some(CacheEntry::Deleted | CacheEntry::Missing | CacheEntry::Reserved)
-                    ) || (cache_entry.is_none() && !handle.is_resolved()))
-                {
-                    return None;
-                }
-                Some(object_ref)
-            })
-            .collect()
+            .filter(|object_ref| object_ref.number != 0 && object_ref.generation != u16::MAX)
+            .collect();
+        refs.extend(
+            self.resolver
+                .all_object_handles()
+                .into_iter()
+                .filter_map(|handle| {
+                    let object_ref = handle.object_ref()?;
+                    if object_ref.number == 0 || object_ref.generation == u16::MAX {
+                        return None;
+                    }
+                    if self.resolver.xref_entry(object_ref).is_none()
+                        && handle.is_null()
+                        && !self.resolver.is_allocated_object(object_ref)
+                    {
+                        // A canonical handle can resolve an absent reference to
+                        // null without an xref/cache source. It is not an object
+                        // in qpdf's cache enumeration unless it was allocated by
+                        // the document itself.
+                        return None;
+                    }
+                    if live_only
+                        && self.resolver.xref_entry(object_ref).is_none()
+                        && !self.resolver.is_allocated_object(object_ref)
+                    {
+                        // A historical xref stream and a dangling unresolved
+                        // handle remain in qpdf's complete cache, but neither is
+                        // an effective live source object. A reserved sentinel
+                        // is document-allocated, so it stays visible here and
+                        // reaches `QPDF_Reserved::unparse`'s error like qpdf's
+                        // `getAllObjects()`-seeded preserve-unreferenced walk
+                        // (`libqpdf/QPDFWriter.cc:2909-2915`).
+                        return None;
+                    }
+                    Some(object_ref)
+                })
+                .filter(|object_ref| {
+                    !live_only
+                        || self.resolver.xref_entry(*object_ref).is_some()
+                        || self.resolver.is_allocated_object(*object_ref)
+                }),
+        );
+        refs
     }
 
     /// Returns the canonical [`ObjectHandle`] for `object_ref`, creating and
@@ -1096,8 +1049,9 @@ impl<R: Read + Seek> Pdf<R> {
     /// Collect qpdf's compressible objects together with the stale generations
     /// removed by the same live walk. The writer must carry this operation-
     /// specific removal set into any later preserve-unreferenced seed pass:
-    /// `QPDF::removeObject` erases the resolver cache entry, while flpdf's
-    /// compatibility cache remains a separate enumeration source.
+    /// `QPDF::removeObject` erases the resolver cache entry; the returned
+    /// operation-specific removal set lets a writer keep its own traversal
+    /// bookkeeping without adding a second document cache.
     pub(crate) fn get_compressible_objgens_with_removed(
         &mut self,
     ) -> Result<(Vec<ObjectRef>, BTreeSet<ObjectRef>)> {
@@ -1123,12 +1077,6 @@ impl<R: Read + Seek> Pdf<R> {
                 if self.resolver.has_newer_cached_generation(og) {
                     removed.insert(og);
                     self.resolver.remove_object(og)?;
-                    // Keep the compatibility enumeration in the same
-                    // post-remove state on later writer passes. qpdf's
-                    // removeObject erases its only cache entry; flpdf keeps a
-                    // separate legacy cache, so record the persistent tombstone
-                    // there as well.
-                    self.cache.set_deleted(og);
                     continue;
                 }
                 visited[index / 64] |= bit;
@@ -1167,7 +1115,7 @@ impl<R: Read + Seek> Pdf<R> {
 
     /// Return the next qpdf-shaped generation-zero object identity from the
     /// prepared canonical cache. Allocation itself belongs to the document's
-    /// resolver so legacy cache values cannot silently become object-number
+    /// resolver so non-canonical values cannot silently become object-number
     /// inputs (`libqpdf/QPDF.cc:1271-1283,1872-1880`).
     pub(crate) fn next_obj_gen(&self) -> Result<ObjectRef> {
         self.resolver.next_obj_gen()
@@ -1327,22 +1275,8 @@ impl<R: Read + Seek> Pdf<R> {
         replacement: ObjectHandle,
     ) -> Result<ObjectHandle> {
         // Like `set_object`, this is canonical cache replacement only. Keep it
-        // separate from parser-owned xref recovery state: normal `read_xref`
-        // clears after `/Size` (`QPDF.cc:686-708`), while `reconstruct_xref`
-        // clears its line-scan filter at `:575` before a candidate re-read
-        // (`:516-607`). Exact resolver removal remains `removeObject`
-        // (`QPDF.cc:1996-2005`); only a compatibility tombstone is cleared
-        // below when this replacement re-registers the same object reference.
-        //
-        // Refresh the compatibility-cache metadata before replacing the
-        // canonical value. This keeps recovery-derived xref metadata aligned
-        // without changing any other object-cache cell.
-        self.synchronize_cache_with_resolver_xref();
         let target = self.resolver.replace_object(object_ref, replacement)?;
-        self.cache.clear_deleted(object_ref);
-        self.qpdf_parsed_xref_stream_refs.remove(&object_ref);
-        self.qpdf_dangling_refs.remove(&object_ref);
-        self.mark_object_handle_mutated(object_ref);
+        self.mark_object_dirty(object_ref);
         Ok(target)
     }
 
@@ -1361,27 +1295,9 @@ impl<R: Read + Seek> Pdf<R> {
     /// Propagates source resolution, recovery, and warning-delivery failures
     /// from either object.
     pub fn swap_objects(&mut self, first: ObjectRef, second: ObjectRef) -> Result<()> {
-        self.synchronize_cache_with_resolver_xref();
         self.resolver.swap_objects(first, second)?;
         for object_ref in [first, second] {
-            self.qpdf_parsed_xref_stream_refs.remove(&object_ref);
-            self.qpdf_dangling_refs.remove(&object_ref);
-            self.mark_object_handle_mutated(object_ref);
-            // qpdf's `removeObject` erases the object cache cell outright
-            // (`QPDF.cc:1996-2005`); qpdf has no persistent "deleted" or
-            // "missing" tombstone that a later resolve must clear. flpdf's
-            // legacy `CacheEntry::Deleted`/`Missing` sentinel is scaffolding
-            // this facade owns alone, so a swap that resolves a non-null
-            // value into a previously deleted/missing/reserved slot must
-            // clear that sentinel itself, or `live_object_refs()` keeps
-            // filtering out a ref that the canonical handle now resolves.
-            if matches!(
-                self.cache.entry(object_ref),
-                Some(CacheEntry::Deleted | CacheEntry::Missing | CacheEntry::Reserved)
-            ) {
-                let handle = self.get_object_handle(object_ref);
-                self.cache.set_resolved(object_ref, handle);
-            }
+            self.mark_object_dirty(object_ref);
         }
         Ok(())
     }
@@ -1394,16 +1310,10 @@ impl<R: Read + Seek> Pdf<R> {
     /// (`QPDF.cc:686-708`, `:1187-1210`).
     #[cfg(test)]
     pub(crate) fn remove_object_handle(&mut self, object_ref: ObjectRef) -> Result<()> {
-        // Refresh the legacy cache before removing the canonical value, or an
-        // old object-stream entry can incorrectly retain provenance (mirrors
-        // `replace_object`'s identical precondition above).
-        self.synchronize_cache_with_resolver_xref();
         // qpdf's removeObject changes only the requested cache slot; already
         // resolved members of an ObjStm remain live in their own cache slots.
         self.resolver.remove_object(object_ref)?;
-        self.qpdf_parsed_xref_stream_refs.remove(&object_ref);
-        self.qpdf_dangling_refs.remove(&object_ref);
-        self.mark_object_handle_mutated(object_ref);
+        self.mark_object_dirty(object_ref);
         Ok(())
     }
 
@@ -1434,25 +1344,11 @@ impl<R: Read + Seek> Pdf<R> {
 
     /// Return an unused generation-zero object reference.
     ///
-    /// Both the legacy object cache and the canonical handle registry own
-    /// object numbers. The enumeration includes both sources, and the
-    /// resolver maximum is retained here so an unmaterialized handle cannot
-    /// be skipped between the scan and allocation.
+    /// Delegate allocation to qpdf's canonical object cache. The resolver
+    /// prepares dangling references and selects the next generation-zero
+    /// identity from the same map used by every other document operation.
     pub(crate) fn next_available_object_ref(&self) -> Result<ObjectRef> {
-        let max_number = self
-            .object_refs()
-            .iter()
-            .map(|r| r.number)
-            .chain(self.resolver.max_object_number())
-            .max()
-            .unwrap_or(0);
-        if max_number >= i32::MAX as u32 {
-            return Err(Error::Unsupported(
-                "max object id is too high to create new objects".to_string(),
-            ));
-        }
-        let next_number = max_number + 1;
-        Ok(ObjectRef::new(next_number, 0))
+        self.resolver.next_obj_gen()
     }
 
     /// This document's stable per-instance identity.
@@ -1526,7 +1422,6 @@ impl<R: Read + Seek> Pdf<R> {
     }
 
     pub(crate) fn mark_object_handle_mutated(&mut self, object_ref: ObjectRef) {
-        self.handle_mutated_object_refs.insert(object_ref);
         self.dirty_object_refs.insert(object_ref);
     }
 
@@ -1579,13 +1474,11 @@ impl<R: Read + Seek> Pdf<R> {
         Ok(())
     }
 
-    /// Record xref-stream objects parsed from the source `/Prev` chain for
-    /// canonical enumeration. qpdf reads each xref stream before it merges
-    /// the next xref section (`QPDF.cc:626-710`, `:1640-1716`), so a
-    /// superseded or freed xref-stream object remains observable through
-    /// `m->obj_cache` even when it has no effective xref row. The canonical
-    /// xref loader already reads these handles through this resolver, so this
-    /// handoff must not build a second object graph by rebinding their values.
+    /// Validate that historical xref-stream handles collected during bootstrap
+    /// are already present in the canonical resolver cache. qpdf reads each
+    /// xref stream before merging the next xref section and keeps the same
+    /// object cache for those historical objects (`QPDF.cc:626-710,1640-1716`);
+    /// this handoff must not create a second graph or provenance map.
     pub(crate) fn install_parsed_xref_stream_handles(
         &mut self,
         parsed_xref_streams: BTreeMap<ObjectRef, ObjectHandle>,
@@ -1603,7 +1496,6 @@ impl<R: Read + Seek> Pdf<R> {
                     "canonical xref-stream handle {object_ref} was not resolved"
                 )));
             }
-            self.qpdf_parsed_xref_stream_refs.insert(object_ref);
         }
         Ok(())
     }
@@ -1724,34 +1616,6 @@ impl<R: Read + Seek> Pdf<R> {
             return Ok(None);
         }
         Ok(Some(ObjectRef::new(number, 0)))
-    }
-
-    /// Bring the legacy cache and bounded-read offsets in line with the
-    /// canonical resolver after a resolution-time xref reconstruction.
-    pub(crate) fn synchronize_cache_with_resolver_xref(&mut self) {
-        if self.legacy_resolution_state_synced || !self.resolver.reconstructed_xref() {
-            return;
-        }
-
-        let entries = self.resolver.source_xref_entries();
-        self.cache.synchronize_with_xref(&entries);
-        // Keep the direct object-stream provenance for a still-identical
-        // compressed xref entry, but never let a mapping survive a rebuilt
-        // type-1 entry or a changed object-stream/index pair. qpdf's live
-        // xref table is the authority after reconstruction
-        // (`libqpdf/QPDF.cc:532-562`); the source identity stored with each
-        // compressed member prevents the legacy writer from treating a
-        // formerly compressed object as an object-stream member.
-        self.compressed_member_parents
-            .retain(|object_ref, provenance| {
-                matches!(
-                    entries.get(object_ref),
-                    Some(XrefEntry::Compressed { stream, index })
-                        if provenance.source_stream == *stream
-                            && provenance.source_index == *index
-                )
-            });
-        self.legacy_resolution_state_synced = true;
     }
 }
 
@@ -1977,6 +1841,26 @@ mod compressible_owner_tests {
     }
 
     #[test]
+    fn canonical_ref_views_ignore_non_indirect_object_generations() {
+        let mut pdf = pdf();
+        let zero = pdf.get_object_handle(ObjectRef::new(0, 0));
+        let max_generation = pdf.get_object_handle(ObjectRef::new(1, u16::MAX));
+
+        assert!(!pdf
+            .canonical_object_refs()
+            .contains(&zero.object_ref().unwrap()));
+        assert!(!pdf
+            .canonical_object_refs()
+            .contains(&max_generation.object_ref().unwrap()));
+        assert!(!pdf
+            .canonical_live_object_refs()
+            .contains(&zero.object_ref().unwrap()));
+        assert!(!pdf
+            .canonical_live_object_refs()
+            .contains(&max_generation.object_ref().unwrap()));
+    }
+
+    #[test]
     fn parsed_xref_stream_handoff_rejects_an_unresolved_canonical_slot() {
         let mut pdf = pdf();
         let object_ref = ObjectRef::new(99, 0);
@@ -2023,7 +1907,7 @@ mod compressible_owner_tests {
     }
 
     #[test]
-    fn compressible_removal_tombstone_is_cleared_by_replacement() {
+    fn compressible_removal_erases_the_canonical_slot_before_replacement() {
         let mut pdf = Pdf::open(Cursor::new(
             include_bytes!("../../../tests/fixtures/compat/one-page.pdf").to_vec(),
         ))
@@ -2045,12 +1929,11 @@ mod compressible_owner_tests {
             .get_compressible_objgens_with_removed()
             .expect("compressible walk succeeds");
         assert!(removed.contains(&old_ref));
-        assert!(pdf.deleted_object_refs().contains(&old_ref));
+        assert!(!pdf.canonical_object_refs().contains(&old_ref));
 
         pdf.replace_object(old_ref, ObjectHandle::integer(99))
             .expect("qpdf-style replacement re-registers the removed generation");
-        assert!(!pdf.deleted_object_refs().contains(&old_ref));
-        assert!(pdf.live_object_refs().contains(&old_ref));
+        assert!(pdf.canonical_live_object_refs().contains(&old_ref));
     }
 
     #[test]

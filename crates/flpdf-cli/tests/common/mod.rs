@@ -22,6 +22,17 @@ impl<R: std::io::Read + std::io::Seek + 'static> PdfCanonicalTestExt for Pdf<R> 
     }
 }
 
+/// Enumerate the canonical qpdf object cache for integration assertions.
+pub fn canonical_object_refs<R: std::io::Read + std::io::Seek + 'static>(
+    pdf: &mut Pdf<R>,
+) -> Vec<ObjectRef> {
+    pdf.get_all_objects()
+        .expect("enumerate canonical qpdf object cache")
+        .into_iter()
+        .filter_map(|handle| handle.object_ref())
+        .collect()
+}
+
 /// Return the canonical annotation handles listed by a page.
 pub fn page_annotation_handles<R: std::io::Read + std::io::Seek>(
     pdf: &mut Pdf<R>,

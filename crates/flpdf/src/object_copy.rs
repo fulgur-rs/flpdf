@@ -792,7 +792,7 @@ mod tests {
     fn copy_foreign_object_omits_indirect_null_dictionary_keys_like_qpdf_get_keys() {
         let mut source = minimal_pdf();
         let mut target = minimal_pdf();
-        let target_refs_before = target.object_refs();
+        let target_refs_before = target.canonical_object_refs();
         let indirect_null = source
             .make_indirect_object_handle(ObjectHandle::null())
             .expect("indirect null");
@@ -808,7 +808,7 @@ mod tests {
 
         assert!(!copied.has_key(b"/IndirectNull"));
         assert_eq!(
-            target.object_refs().len(),
+            target.canonical_object_refs().len(),
             target_refs_before.len() + 1,
             "qpdf getKeys excludes the null child before reservation"
         );
@@ -818,7 +818,7 @@ mod tests {
     fn copy_foreign_stream_omits_indirect_null_dictionary_keys_like_qpdf_get_keys() {
         let mut source = minimal_pdf();
         let mut target = minimal_pdf();
-        let target_refs_before = target.object_refs();
+        let target_refs_before = target.canonical_object_refs();
         let indirect_null = source
             .make_indirect_object_handle(ObjectHandle::null())
             .expect("indirect null");
@@ -838,7 +838,7 @@ mod tests {
             .expect("copied stream dictionary")
             .has_key(b"/IndirectNull"));
         assert_eq!(
-            target.object_refs().len(),
+            target.canonical_object_refs().len(),
             target_refs_before.len() + 1,
             "qpdf getKeys excludes the null stream-dictionary child before reservation"
         );
@@ -905,14 +905,14 @@ mod tests {
         let reserved = source
             .new_reserved()
             .expect("source reserved construction sentinel");
-        let target_refs_before = target.object_refs();
+        let target_refs_before = target.canonical_object_refs();
 
         let error = target
             .copy_foreign_object(&reserved)
             .expect_err("qpdf rejects a foreign reserved object during reservation");
         assert!(matches!(error, Error::System(message)
             if message == "QPDF: attempting to copy a foreign reserved object"));
-        assert_eq!(target.object_refs(), target_refs_before);
+        assert_eq!(target.canonical_object_refs(), target_refs_before);
     }
 
     #[allow(deprecated)]
@@ -1197,7 +1197,7 @@ mod tests {
         assert!(copied_page.is_null());
         assert!(copied_page.object_ref().is_some());
         assert!(!target
-            .object_refs()
+            .canonical_object_refs()
             .iter()
             .any(|object_ref| *object_ref != ObjectRef::new(1, 0)
                 && target.get_object_handle(*object_ref).as_integer() == Some(99)));
@@ -1303,7 +1303,7 @@ mod tests {
         let out = writer.get_buffer().expect("take full-rewrite output");
 
         let mut reopened = Pdf::open(Cursor::new(out)).expect("reopen written output");
-        assert!(reopened.object_refs().contains(&written_ref));
+        assert!(reopened.canonical_object_refs().contains(&written_ref));
         let written_handle = reopened.get_object_handle(written_ref);
         reopened
             .resolve(&written_handle)

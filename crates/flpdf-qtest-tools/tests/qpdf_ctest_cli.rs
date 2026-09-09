@@ -715,7 +715,8 @@ fn qpdf_ctest_20_writes_with_specialized_decode_level() {
     assert!(output.is_file(), "test20 must write its output PDF");
     let mut pdf = Pdf::open(Cursor::new(fs::read(&output).expect("read output PDF")))
         .expect("open test20 output PDF");
-    let has_dct_stream = pdf.object_refs().into_iter().any(|object_ref| {
+    let object_refs: Vec<_> = pdf.get_xref_table().keys().copied().collect();
+    let has_dct_stream = object_refs.into_iter().any(|object_ref| {
         let object = pdf.get_object_handle(object_ref);
         pdf.resolve(&object).is_ok()
             && object

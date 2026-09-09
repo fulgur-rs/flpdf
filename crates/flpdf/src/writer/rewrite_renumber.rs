@@ -751,7 +751,7 @@ impl ObjectStreamRenumber {
             None
         };
         let mut seeds: Vec<ObjectRef> = if preserve_unreferenced_objects {
-            pdf.live_object_refs()
+            pdf.canonical_live_object_refs()
                 .into_iter()
                 .filter(|object_ref| {
                     !removed_refs.contains(object_ref)

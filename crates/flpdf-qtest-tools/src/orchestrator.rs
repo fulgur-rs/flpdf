@@ -3,9 +3,9 @@
 //!
 //! Loads both files with [`Pdf::open_mem_owned_with_options`], cleans the
 //! trailer (mask `/Length` and `/ID`), compares the trailers, cleans the
-//! encryption dict (strip `/O /OE /U /UE /Perms`), then walks the live
-//! object refs in ascending `(number, generation)` order and delegates each
-//! pair to [`compare_objects`].
+//! encryption dict (strip `/O /OE /U /UE /Perms`), then walks all objects in
+//! ascending `(number, generation)` order and delegates each pair to
+//! [`compare_objects`].
 //!
 //! Oracle: qpdf 11.9.0 `compare-for-test/qpdf-test-compare.cc:148-181`.
 
@@ -73,8 +73,16 @@ pub fn compare_files(
     clean_encryption_handle(&mut actual, &act_trailer)?;
     clean_encryption_handle(&mut expected, &exp_trailer)?;
 
-    let a_refs = actual.live_object_refs();
-    let e_refs = expected.live_object_refs();
+    let a_refs: Vec<_> = actual
+        .get_all_objects()?
+        .into_iter()
+        .filter_map(|handle| handle.object_ref())
+        .collect();
+    let e_refs: Vec<_> = expected
+        .get_all_objects()?
+        .into_iter()
+        .filter_map(|handle| handle.object_ref())
+        .collect();
     if a_refs.len() != e_refs.len() {
         return Ok(Some("different number of objects".to_string()));
     }

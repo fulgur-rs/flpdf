@@ -23,7 +23,7 @@
 //! exercise Part-4 (rest-of-document) ObjStm packing, which is qpdf-clean.
 
 mod common;
-use common::PdfCanonicalTestExt;
+use common::{canonical_object_refs, PdfCanonicalTestExt};
 
 #[path = "support/eol.rs"]
 mod eol;
@@ -90,7 +90,7 @@ fn qpdf_check_linearization(path: &std::path::Path) -> (bool, String) {
 
 fn count_objstm_containers(bytes: &[u8]) -> usize {
     let mut pdf = Pdf::open(Cursor::new(bytes.to_vec())).expect("reopen");
-    let refs = pdf.object_refs();
+    let refs = canonical_object_refs(&mut pdf);
     let mut n = 0;
     for r in refs {
         if let Ok(stream) = pdf.resolve_canonical_object(r) {
@@ -160,7 +160,7 @@ fn linearize_generate_emits_objstm_and_roundtrips() {
 
     // Round-trip: every object (including ObjStm-compressed members) resolves.
     let mut pdf = Pdf::open(Cursor::new(bytes.clone())).expect("Pdf::open round-trip");
-    let refs = pdf.object_refs();
+    let refs = canonical_object_refs(&mut pdf);
     assert!(!refs.is_empty(), "round-tripped doc must expose objects");
     for r in refs {
         pdf.resolve_canonical_object(r)
@@ -475,7 +475,7 @@ fn assert_acceptance_invariants(mode: &str, out: &Path, input_page_count: usize)
 
     // --- (d) round-trip: all objects resolve, page count preserved ---
     let mut pdf = Pdf::open(Cursor::new(bytes.clone())).expect("Pdf::open round-trip");
-    let refs = pdf.object_refs();
+    let refs = canonical_object_refs(&mut pdf);
     assert!(
         !refs.is_empty(),
         "mode={mode}: round-tripped doc exposes objects"

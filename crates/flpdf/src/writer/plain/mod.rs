@@ -60,7 +60,10 @@ fn write_plain_live_disable<R: Read + Seek, W: Write>(
     } else {
         None
     };
-    let mut removed_refs: BTreeSet<ObjectRef> = pdf.deleted_object_refs().into_iter().collect();
+    // qpdf's removeObject erases the only document cache slot and turns
+    // retained aliases into direct null; it does not leave a tombstone for a
+    // later writer pass. Keep the writer's operation-local set empty here.
+    let mut removed_refs: BTreeSet<ObjectRef> = BTreeSet::new();
     let object_streams = if options.object_streams == ObjectStreamMode::Preserve {
         let packing =
             crate::writer::object_streams::plan_qpdf_preserve_object_streams_with_unreferenced(

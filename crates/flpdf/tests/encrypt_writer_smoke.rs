@@ -1017,7 +1017,7 @@ fn v4_aes128_preserve_drops_orphan_length_holder() {
     // with the orphan holder dropped, plus the /Encrypt dictionary object = 7.
     // (Pre-fix: 8, the stale holder still live.)
     assert_eq!(
-        pdf.live_object_refs().len(),
+        common::canonical_object_refs(&mut pdf).len(),
         7,
         "preserve + encrypt must drop the orphaned indirect /Length holder \
          (6 logical objects + /Encrypt = 7; the stale holder is gone)"
@@ -1053,5 +1053,6 @@ mod common;
 use common::PdfCanonicalTestExt;
 #[allow(unused_imports)]
 use common::{
-    write_default, write_linearized_with_settings, write_with_settings, WriterTestSettings,
+    canonical_object_refs, write_default, write_linearized_with_settings, write_with_settings,
+    WriterTestSettings,
 };

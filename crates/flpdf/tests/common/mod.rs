@@ -28,6 +28,16 @@ impl<R: Read + Seek + 'static> PdfCanonicalTestExt for Pdf<R> {
     }
 }
 
+/// Enumerate the document's canonical qpdf object cache for integration
+/// assertions. The old facade `object_refs` API was intentionally removed.
+pub fn canonical_object_refs<R: Read + Seek + 'static>(pdf: &mut Pdf<R>) -> Vec<ObjectRef> {
+    pdf.get_all_objects()
+        .expect("enumerate canonical qpdf object cache")
+        .into_iter()
+        .filter_map(|handle| handle.object_ref())
+        .collect()
+}
+
 /// Result shape used by integration tests that only need to assert that the
 /// canonical qpdf job check accepted an emitted PDF.
 #[derive(Debug)]

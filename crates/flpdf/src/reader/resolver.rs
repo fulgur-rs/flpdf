@@ -1627,6 +1627,20 @@ impl<R: Read + Seek> ResolverHandle<R> {
             self.resolve_indirect(second, &second_handle)?;
         }
         first_handle.swap_value_state_with(&second_handle);
+        // `QPDF::swapObjects` resolves both identities before the swap
+        // (`libqpdf/QPDF.cc:2284-2291`), so a generation that had no xref row
+        // now owns a cache cell that `getAllObjects` enumerates
+        // (`libqpdf/QPDF.cc:1286-1294`). Record the same document-owned
+        // provenance `replace_object` records, or the writer's live view drops
+        // the value that was just swapped in.
+        for object_ref in [first, second] {
+            if self.xref_entry(object_ref).is_none() {
+                self.core
+                    .borrow_mut()
+                    .allocated_object_refs
+                    .insert(object_ref);
+            }
+        }
         Ok(())
     }
 
@@ -13963,161 +13977,6 @@ mod tests {
     }
 
     #[test]
-    fn reconstruction_reconciles_compressed_member_provenance() {
-        let mut pdf = Pdf::open_mem_owned(minimal_pdf_bytes()).expect("open");
-        let changed_type = ObjectRef::new(1, 0);
-        let changed_parent = ObjectRef::new(2, 0);
-        let unchanged = ObjectRef::new(3, 0);
-
-        pdf.compressed_member_parents.insert(
-            changed_type,
-            crate::pdf::CompressedMemberProvenance {
-                source_stream: 9,
-                source_index: 1,
-            },
-        );
-        pdf.compressed_member_parents.insert(
-            changed_parent,
-            crate::pdf::CompressedMemberProvenance {
-                source_stream: 9,
-                source_index: 1,
-            },
-        );
-        pdf.compressed_member_parents.insert(
-            unchanged,
-            crate::pdf::CompressedMemberProvenance {
-                source_stream: 9,
-                source_index: 3,
-            },
-        );
-        pdf.resolver
-            .insert_xref_entry(changed_type, XrefEntry::Uncompressed { offset: 10 });
-        pdf.resolver.insert_xref_entry(
-            changed_parent,
-            XrefEntry::Compressed {
-                stream: 9,
-                index: 2,
-            },
-        );
-        pdf.resolver.insert_xref_entry(
-            unchanged,
-            XrefEntry::Compressed {
-                stream: 9,
-                index: 3,
-            },
-        );
-        pdf.resolver.core.borrow_mut().reconstructed_xref = true;
-
-        pdf.synchronize_cache_with_resolver_xref();
-
-        assert!(!pdf.compressed_member_parents.contains_key(&changed_type));
-        assert!(!pdf.compressed_member_parents.contains_key(&changed_parent));
-        assert_eq!(
-            pdf.compressed_member_parents
-                .get(&unchanged)
-                .map(|provenance| (provenance.source_stream, provenance.source_index)),
-            Some((9, 3))
-        );
-    }
-
-    #[test]
-    fn reconstruction_synchronizes_before_replace_object() {
-        let mut pdf = Pdf::open_mem_owned(minimal_pdf_bytes()).expect("open");
-        let object_ref = ObjectRef::new(1, 0);
-        pdf.cache = crate::cache::test_support::stale_deleted_entry(object_ref);
-        pdf.resolver
-            .insert_xref_entry(object_ref, XrefEntry::Uncompressed { offset: 10 });
-        pdf.resolver.core.borrow_mut().reconstructed_xref = true;
-
-        pdf.replace_object(object_ref, ObjectHandle::null())
-            .expect("replace the reconstructed object with null");
-
-        assert!(matches!(
-            pdf.cache.entry(object_ref),
-            Some(crate::cache::CacheEntry::Unresolved { .. })
-        ));
-        assert!(
-            pdf.dirty_object_refs.contains(&object_ref),
-            "replace_object must record the mutation after reconstruction refreshes a stale entry"
-        );
-    }
-
-    #[test]
-    fn full_rewrite_synchronizes_recovered_compressed_parent_provenance() {
-        let object_ref = ObjectRef::new(7, 0);
-        let stream_ref = ObjectRef::new(5, 0);
-        let mut pdf = Pdf::open_mem_owned(recovered_objstm_member_pdf()).expect("open fixture");
-        let stream_offset = match pdf.resolver.xref_entry(stream_ref) {
-            Some(XrefEntry::Uncompressed { offset }) => offset,
-            other => panic!("object stream must have a type-1 xref entry, got {other:?}"), // cov:ignore: fixture invariant is asserted by this test
-        };
-        let root_ref = pdf.root_ref().expect("catalog ref");
-        pdf.resolver.insert_xref_entry(
-            object_ref,
-            XrefEntry::Compressed {
-                stream: stream_ref.number,
-                index: 0,
-            },
-        );
-        pdf.cache.set_compressed(object_ref, stream_ref.number, 0);
-        let recovered = pdf.get_object_handle(object_ref);
-        pdf.resolve(&recovered)
-            .expect("resolve compressed member canonically");
-        // The canonical resolver carries this relationship in the type-2 xref
-        // entry. Seed the legacy compatibility projection explicitly so this
-        // test can continue to exercise its later reconstruction cleanup
-        // without re-entering the legacy `set_object` route.
-        pdf.compressed_member_parents.insert(
-            object_ref,
-            crate::pdf::CompressedMemberProvenance {
-                source_stream: stream_ref.number,
-                source_index: 0,
-            },
-        );
-        let root = pdf.get_object_handle(root_ref);
-        pdf.resolve(&root).expect("catalog");
-        root.replace_key(b"/Recovered", recovered).unwrap();
-        pdf.mark_object_handle_dirty(&root).unwrap();
-
-        // This is the state immediately after editing a member that was
-        // originally in an object stream: the canonical replacement records
-        // the dirty value and its old compressed-member provenance.
-        pdf.replace_object(object_ref, ObjectHandle::integer(42))
-            .unwrap();
-
-        // A later canonical recovery discovers that the same object is a
-        // standalone type-1 object. The writer must observe this live xref
-        // before classifying the dirty ref.
-        pdf.resolver.insert_xref_entry(
-            object_ref,
-            XrefEntry::Uncompressed {
-                offset: stream_offset,
-            },
-        );
-        pdf.resolver.core.borrow_mut().reconstructed_xref = true;
-
-        let mut writer = crate::PdfWriter::new(&mut pdf);
-        writer.set_output_memory().expect("configure memory output");
-        writer.write().expect("full rewrite");
-        let emitted_ref = writer
-            .get_renumbered_obj_gen(object_ref)
-            .expect("query recovered object mapping")
-            .expect("reachable recovered object must be emitted");
-        let output = writer.get_buffer().expect("take full-rewrite output");
-
-        let mut reopened = Pdf::open_mem_owned(output).expect("reopen full-rewrite output");
-        let emitted: ObjectHandle = reopened.get_object_handle(emitted_ref);
-        reopened
-            .resolve(&emitted)
-            .expect("resolve rewritten object");
-        assert_eq!(
-            emitted.as_integer(),
-            Some(42),
-            "a recovered standalone object must be emitted outside the obsolete ObjStm"
-        );
-    }
-
-    #[test]
     fn handle_recovery_updates_public_object_enumeration() {
         let mut pdf = Pdf::open_mem_owned_with_options(
             synthetic_mismatch_discovers_unindexed_object_pdf(),
@@ -14130,8 +13989,8 @@ mod tests {
         let recovered_ref = ObjectRef::new(1, 0);
         let discovered_ref = ObjectRef::new(3, 0);
 
-        assert!(!pdf.object_refs().contains(&discovered_ref));
-        assert!(!pdf.live_object_refs().contains(&discovered_ref));
+        assert!(!pdf.canonical_object_refs().contains(&discovered_ref));
+        assert!(!pdf.canonical_live_object_refs().contains(&discovered_ref));
 
         let recovered: ObjectHandle = pdf.get_object_handle(recovered_ref);
         pdf.resolve(&recovered)
@@ -14139,12 +13998,12 @@ mod tests {
 
         assert!(pdf.reconstructed_xref());
         assert!(
-            pdf.object_refs().contains(&discovered_ref),
-            "object_refs must include objects discovered by handle-driven recovery"
+            pdf.canonical_object_refs().contains(&discovered_ref),
+            "canonical enumeration must include objects discovered by handle-driven recovery"
         );
         assert!(
-            pdf.live_object_refs().contains(&discovered_ref),
-            "live_object_refs must follow the reconstructed live xref"
+            pdf.canonical_live_object_refs().contains(&discovered_ref),
+            "canonical live enumeration must follow the reconstructed live xref"
         );
     }
 

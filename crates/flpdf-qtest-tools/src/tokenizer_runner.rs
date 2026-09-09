@@ -269,7 +269,14 @@ fn process(
         stderr,
     );
 
-    let object_refs = pdf.object_refs();
+    // qpdf's test_tokenizer.cc:208 walks `qpdf.getAllObjects()`, not the
+    // effective cross-reference table.
+    let object_refs: Vec<_> = pdf
+        .get_all_objects()
+        .map_err(|e| e.to_string())?
+        .into_iter()
+        .filter_map(|handle| handle.object_ref())
+        .collect();
     for obj_ref in object_refs {
         // Page content is already resolved through the canonical handle path
         // above. Reusing that state is important for damaged content streams:

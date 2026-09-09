@@ -305,7 +305,7 @@ eight-case qpdf 11.9.0 helper differential.
 | `QPDF_Array/Dictionary/Stream/String/Name/Real/Integer/Bool/Null/InlineImage/Operator/Reserved/Unresolved/Destroyed.cc` | 1814 | `object.rs` の `Object` enum に統合 | 🔀 |
 | `QPDFObject.cc` / `QPDFValue.cc` | 79 | `object.rs` の `Object` + `object_handle.rs` の `ObjectHandle` / `ObjectValue`（共有 identity・qpdf 互換 parsed offset・`ObjectValue` に統合された unresolved/reserved/destroyed value・Pdf identity provenance） | 🔀 `object.rs` の `Object` は静的な値表現のみ。`QPDFValue` 相当の共有 identity・parsed offset・遅延解決状態は `object_handle.rs` が担う。`flpdf-25kg.10`/`.11`/`.13` で qpdf の value-layer state を `ObjectValue` に統合し、`ObjectState` の冗長 wrapper を削除した。Pdf identity provenance は live containment から分離して detach 後も保持する。旧 raw `Object` route の最終削除は `flpdf-egzr.3.2.8`（open）待ち。 |
 | `QPDFObjGen.cc` | 68 | `object.rs` の `ObjectRef` | ✅ |
-| `QPDFXRefEntry.cc` | 51 | `xref_entry.rs`（`XrefEntry` = free / uncompressed / compressed の 3 variant）。consumer は `xref.rs` / `reader.rs` / `cache.rs` / `writer.rs` / `writer/{object_streams,plain/plan}.rs` / `linearization/{writer,plan}.rs` | ✅ `flpdf-qxba.9.2` で完全 cutover（`XrefOffset` 削除）。`xref.rs` 側に型定義は残っていない |
+| `QPDFXRefEntry.cc` | 51 | `xref_entry.rs`（`XrefEntry` = free / uncompressed / compressed の 3 variant）。consumer は `xref.rs` / `reader.rs` / `writer.rs` / `writer/{object_streams,plain/plan}.rs` / `linearization/{writer,plan}.rs` | ✅ `flpdf-qxba.9.2` で完全 cutover（`XrefOffset` 削除）。`xref.rs` 側に型定義は残っていない |
 | `PDFVersion.cc` | 68 | `pdf_version.rs` の `PdfVersion` | ✅ |
 | `QPDFMatrix.cc` | 140 | `matrix.rs` の `Matrix` / `Rectangle` | ✅ |
 | `QPDFObjectHandle::mergeResources` / `shallowCopy` | `QPDFObjectHandle.cc:431-434,1063-1153,2072-2079` | `object_handle.rs:5070` + `page_annotation_flatten.rs:666-740`（widget appearance の既定リソース consumer） | ✅ live `ObjectHandle::merge_resources` を使用し、receiver・other・各top-level resource categoryをqpdfの`isDictionary`/`isArray`相当で自己解決してから分岐する。missing category は top-level が direct の shallow copy になり、nested indirect child は handle を保持する。array の `isScalar` 判定と unique-name pool の second-level dictionary 判定は qpdf と同じく各 nested handle を解決し、解決エラーを伝播する。`acroform_document_helper.rs` の `DrMap` と `overlay_appearance_stream.rs` が name-conflict overlay merge を担う |
@@ -328,7 +328,7 @@ traversal・allocation・trailer snapshotは追加していない。
 
 `flpdf-tcfj` では、qpdf 11.9.0 の `QPDF::resolve` が `isUnresolved` を確認して永続 `m->obj_cache` を一度だけ更新する責務（`QPDF.cc:1700-1753`）に合わせ、xref bootstrap の raw object view と handle-native view を `SharedBootstrapCache` の同一状態へ束ねる。`BootstrapHandleDocument`、再帰ガード、ObjStm の解決済み集合、診断、reconstruction trigger は xref-loading operation 全体で共有し、`read_uncompressed_object` の `FileObjectDiagnostic` は一度だけ転送する。raw view が先に materialize した値は handle slot へ seed し、handle view が先に解決した値は raw lookup から再利用するため、同じ bootstrap object の再パースと警告の二重出力を避ける。
 
-`flpdf-uwn0` では qpdf の `makeIndirectFromQPDFObject` (`QPDF.cc:1882-1894`) / `replaceObject` (`QPDF.cc:1986-1993`) が source xref と別に `m->obj_cache` へ登録する allocation と、参照解決で同じ cache に入る dangling null を object-ref view で区別する。qpdf の `getAllObjects` は `fixDanglingReferences` 後の `m->obj_cache` 全体 (`QPDF.cc:1258-1294`) を列挙し、live probe でも `newIndirectNull()` は列挙される。flpdf の `ResolverCore::allocated_object_refs` はこの provenance だけを canonical allocation 境界で記録し、`object_refs()` / `live_object_refs()` が allocated indirect null を落とさないようにする。legacy cache/memo の互換 bridge や qpdf-deviation marker は追加しない。
+`flpdf-uwn0` では qpdf の `makeIndirectFromQPDFObject` (`QPDF.cc:1882-1894`) / `replaceObject` (`QPDF.cc:1986-1993`) が source xref と別に `m->obj_cache` へ登録する allocation と、参照解決で同じ cache に入る dangling null を object-ref view で区別する。qpdf の `getAllObjects` は `fixDanglingReferences` 後の `m->obj_cache` 全体 (`QPDF.cc:1258-1294`) を列挙し、live probe でも `newIndirectNull()` は列挙される。flpdf の `ResolverCore::allocated_object_refs` はこの provenance だけを canonical allocation 境界で記録し、canonical object-ref views が allocated indirect null を落とさないようにする。legacy cache/memo の互換 bridge や qpdf-deviation marker は追加しない。
 
 `flpdf-25kg.2.5.12` では、qpdf の `makeIndirectObject` が `nextObjGen` → `getObjectCount` → `fixDanglingReferences` の順で新規番号を決める契約 (`QPDF.cc:1239-1294,1872-1901`) を `Pdf::make_indirect_object_handle` の allocation boundary に適用した。repairで再構築されるobjectがある場合も、canonical resolverを先に準備してから既存の番号走査を行うため、recovered objectとの番号衝突を起こさない。
 
@@ -2163,3 +2163,14 @@ alias/indirect/reserved/destroyed/未解決/最大ID/writer反映を検証する
 履歴trailer参照は`QPDFParser.cc:168-175`のcache登録副作用に合わせ、既存bootstrapの
 参照集合をopen時にcanonical cacheへ未解決登録する。getAllObjects時のlate登録・強制解決と
 Pdf側の永続集合は撤去した。過去trailerにだけ99があるfixtureでも列挙前のfactoryが100を採番する。
+
+`flpdf-3yn9.48.22`（2026-09-09）で、qpdfの `m->obj_cache` を二重化していた
+`crates/flpdf/src/cache.rs` の `ObjectCache` / `CacheEntry` と公開exportを削除した。
+`Pdf::get_all_objects` は `ResolverCore::object_cache` の `getAllObjects` 対応を維持し、
+writer/linearizationの遅延key走査はsource xrefとcanonical cacheのunionを使うprivate
+`canonical_object_refs` / `canonical_live_object_refs`へ移行した。`removeObject`後に
+残すtombstoneや `synchronize_cache_with_resolver_xref` / `compressed_member_parents` は
+追加せず、stale-generationのremoved setはcompressible walk単位で返す。これは
+`QPDF.hh:868-889,1467`、`QPDF.cc:1239-1295,1756-1833,1985-2005,2284-2291`
+の責務と一致し、qpdf absent の facade cache/synchronization/provenanceをcanonical
+document stateへ混ぜない。
