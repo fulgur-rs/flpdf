@@ -254,12 +254,13 @@ pub(crate) fn merge_adjacent_raw_page_labels(
     let mut out: Vec<RawPageLabelEntry> = Vec::with_capacity(ranges.len());
     for range in ranges {
         if let Some(previous) = out.last() {
-            if raw_page_labels_are_redundant(
+            let redundant = raw_page_labels_are_redundant(
                 previous.index,
                 &previous.label,
                 range.index,
                 &range.label,
-            )? { // cov:ignore: raw label accessor failures are covered by handle tests
+            )?; // cov:ignore: raw label accessor failures are covered by handle tests
+            if redundant {
                 continue;
             }
         }
