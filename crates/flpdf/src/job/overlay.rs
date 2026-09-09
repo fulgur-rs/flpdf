@@ -863,3 +863,485 @@ fn overlay_page_handle<R: Read + Seek>(
 // copy families remain library-only for now), catching CLI-layer wiring
 // divergences (argv parsing, PdfWriter setting assembly, defaults) that
 // library-only gates cannot see.
+
+// Feature-gated byte-identity gate for overlay copy-annotations parity.
+//
+// A single overlay applied to a destination page, written through the
+// `--static-id --qdf --no-original-object-ids` full-rewrite path, must be
+// byte-identical to qpdf 11.9.0's output. Gated on `qpdf-zlib-compat` because
+// byte-identity requires flpdf's deflate output to match qpdf's classic libz
+// output (see CLAUDE.md's DEFLATE carve-out). It lives inside the crate, not in
+// `tests/`, because `apply_overlay_specs` reaches page internals that the
+// integration-test crate cannot.
+//
+// The overlay/underlay placement families (rotation, /UserUnit, swapped boxes,
+// multi-stream sources) are covered end to end by
+// `crates/flpdf-cli/tests/cli_byte_identical_overlay.rs`. The copy-annotations
+// family below has no CLI counterpart: `--overlay` with form fields exercises
+// `addAndRenameFormFields` (`QPDFAcroFormDocumentHelper.cc:105-108`) and
+// `copyAnnotations` (`QPDFPageObjectHelper.cc:1030`), whose per-placement
+// qualified-name cache behaviour only shows up in the written bytes.
+//
+// Goldens live in `tests/golden/references/overlay/`; the recipes that produced
+// them are in `tests/golden/regenerate.sh`.
+#[cfg(all(test, feature = "qpdf-zlib-compat"))]
+mod byte_gate {
+    use super::{apply_overlay_specs, OverlayKind, OverlaySpec};
+    use crate::pages::page_refs;
+    use crate::PageRange;
+    use crate::{ObjectHandle, Pdf, PdfWriter};
+    use std::io::{Read, Seek};
+    use std::path::Path;
+
+    fn fixture(name: &str) -> Pdf<std::io::BufReader<std::fs::File>> {
+        let path = Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("../../tests/fixtures/compat")
+            .join(name);
+        let file = std::fs::File::open(&path).unwrap_or_else(|e| panic!("open {path:?}: {e}"));
+        Pdf::open(std::io::BufReader::new(file)).unwrap()
+    }
+
+    fn write_qpdf<R, F>(dest: &mut Pdf<R>, configure: F) -> Vec<u8>
+    where
+        R: Read + Seek + 'static,
+        F: FnOnce(&mut PdfWriter<'_, R>),
+    {
+        let mut writer = PdfWriter::new(dest);
+        configure(&mut writer);
+        writer.set_output_memory().unwrap();
+        writer.write().unwrap();
+        writer.get_buffer().unwrap()
+    }
+
+    /// Write `dest` through the `flpdf rewrite --static-id --qdf
+    /// --no-original-object-ids` recipe. QDF applies qpdf's conditional
+    /// `last_char != '\n'` framing rule so `endstream` stays line-anchored, so
+    /// `newline_before_endstream` stays at its default (`Never`).
+    fn write_qdf_nooid<R: Read + Seek + 'static>(dest: &mut Pdf<R>) -> Vec<u8> {
+        write_qpdf(dest, |writer| {
+            writer.set_static_id(true);
+            writer.set_qdf_mode(true);
+            writer.set_suppress_original_object_ids(true);
+        })
+    }
+
+    fn golden(name: &str) -> Vec<u8> {
+        let path = Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("../../tests/golden/references/overlay")
+            .join(name);
+        std::fs::read(&path).unwrap_or_else(|e| panic!("read golden {path:?}: {e}"))
+    }
+
+    /// Parse a page-range string, panicking with context on error.
+    fn pr(input: &str) -> PageRange {
+        PageRange::parse(input).unwrap_or_else(|e| panic!("parse {input:?}: {e}"))
+    }
+
+    fn first_diff(a: &[u8], b: &[u8]) -> Option<usize> {
+        if a == b {
+            return None;
+        }
+        let common = a.len().min(b.len());
+        (0..common).find(|&i| a[i] != b[i]).or(Some(common))
+    }
+
+    /// Assert `actual` is byte-identical to the golden named `golden_name`,
+    /// reporting the first diff offset and surrounding bytes on mismatch.
+    fn assert_byte_identical(actual: &[u8], golden_name: &str) {
+        let expected = golden(golden_name);
+        if let Some(off) = first_diff(actual, &expected) {
+            let lo = off.saturating_sub(24);
+            let g = expected.get(off).copied().unwrap_or(0);
+            let f = actual.get(off).copied().unwrap_or(0);
+            panic!(
+                "overlay output not byte-identical to qpdf golden {golden_name} \
+                 (flpdf={} bytes, golden={} bytes)\n\
+                 first diff at offset {off} (golden=0x{g:02x} flpdf=0x{f:02x})\n\
+                 golden[{lo}..]: {:?}\nflpdf [{lo}..]: {:?}",
+                actual.len(),
+                expected.len(),
+                String::from_utf8_lossy(&expected[lo..(off + 24).min(expected.len())]),
+                String::from_utf8_lossy(&actual[lo..(off + 24).min(actual.len())]),
+            );
+        }
+    }
+
+    /// Return `(max_pdf_version, max_extension_level)` over two open PDFs using
+    /// qpdf's pairwise rule: the higher version wins outright, and a higher
+    /// version RESETS the extension level (only equal versions merge via `max`).
+    /// Mirrors what `flpdf rewrite` accumulates across dest plus every source.
+    fn accumulate_max<R1: Read + Seek, R2: Read + Seek>(
+        a: &mut Pdf<R1>,
+        b: &mut Pdf<R2>,
+    ) -> crate::PdfVersion {
+        let a_version =
+            crate::parse_pdf_version(a.version()).unwrap_or(crate::PdfVersion::new(1, 0, 0));
+        let b_version =
+            crate::parse_pdf_version(b.version()).unwrap_or(crate::PdfVersion::new(1, 0, 0));
+        let mut best = crate::PdfVersion::new(
+            a_version.major(),
+            a_version.minor(),
+            a.adobe_extension_level().unwrap_or(None).unwrap_or(0),
+        );
+        best.update_if_greater(crate::PdfVersion::new(
+            b_version.major(),
+            b_version.minor(),
+            b.adobe_extension_level().unwrap_or(None).unwrap_or(0),
+        ));
+        best
+    }
+
+    /// Return a page's `/Annots` entries as canonical handles, or `None` when
+    /// the page has no annotation array.
+    fn page_annots<R: Read + Seek>(
+        pdf: &mut Pdf<R>,
+        page_ref: crate::ObjectRef,
+    ) -> Option<Vec<ObjectHandle>> {
+        let page = pdf.get_object_handle(page_ref);
+        page.try_dereference().unwrap();
+        page.try_get_key(b"/Annots")
+            .unwrap()
+            .try_as_array()
+            .unwrap()
+    }
+    #[test]
+    fn overlay_copy_annotations_fxo_red_repeat1_is_byte_identical_qdf() {
+        let mut dest = fixture("fxo-red.pdf");
+        let mut src = fixture("form-fields-and-annotations.pdf");
+        // qpdf floors the output at max(dest, all sources) — form-fields-and-
+        // annotations.pdf is PDF 1.6, fxo-red.pdf is PDF 1.3, so the output
+        // header must be 1.6.
+        let (version, max_ext) = accumulate_max(&mut dest, &mut src).get_version();
+        let mut specs = vec![OverlaySpec {
+            source: src,
+            kind: OverlayKind::Overlay,
+            from: pr(""),
+            to: pr(""),
+            repeat: Some(pr("1")),
+        }];
+        apply_overlay_specs(&mut dest, &mut specs).unwrap();
+        let actual = write_qpdf(&mut dest, |writer| {
+            writer.set_static_id(true);
+            writer.set_qdf_mode(true);
+            writer.set_suppress_original_object_ids(true);
+            writer.set_minimum_pdf_version(version, max_ext);
+        });
+        assert_byte_identical(&actual, "overlay-copy-annotations.pdf");
+    }
+
+    /// Two `--overlay` specs from the same source, both targeting
+    /// destination page 1 — the distinguishing shape between per-placement
+    /// and per-page finalization of `addAndRenameFormFields`. The qpdf
+    /// 11.9.0 real-CLI probe `qpdf fxo-red.pdf --overlay
+    /// form-fields-and-annotations.pdf --to=1 -- --overlay
+    /// form-fields-and-annotations.pdf --to=1 -- --qdf --static-id
+    /// --no-original-object-ids out.pdf` renames the second placement's
+    /// fields "Text Box 1+1"/"Text Box 2+1"/"r1+1": qpdf's `copyAnnotations`
+    /// (`QPDFPageObjectHelper.cc:1030`) calls `addAndRenameFormFields` once
+    /// per placement, and the trailing `addFormField` walk
+    /// (`QPDFAcroFormDocumentHelper.cc:105-108`) updates the qualified-name
+    /// cache before the second placement's BFS rename pass reads it. The
+    /// sibling `..._fxo_red_repeat1_...` test above repeats one placement
+    /// across 16 distinct destination pages and does not exercise this: each
+    /// page gets its own fresh `AcroFormDocumentHelper::new(dest).analyze()`
+    /// regardless of whether finalization is per-placement or per-page, so
+    /// only two placements landing on the *same* page tell them apart.
+    #[test]
+    fn overlay_copy_annotations_two_specs_same_page_is_byte_identical_qdf() {
+        let mut dest = fixture("fxo-red.pdf");
+        let mut src1 = fixture("form-fields-and-annotations.pdf");
+        let src2 = fixture("form-fields-and-annotations.pdf");
+        let (version, max_ext) = accumulate_max(&mut dest, &mut src1).get_version();
+        let mut specs = vec![
+            OverlaySpec {
+                source: src1,
+                kind: OverlayKind::Overlay,
+                from: pr(""),
+                to: pr("1"),
+                repeat: None,
+            },
+            OverlaySpec {
+                source: src2,
+                kind: OverlayKind::Overlay,
+                from: pr(""),
+                to: pr("1"),
+                repeat: None,
+            },
+        ];
+        apply_overlay_specs(&mut dest, &mut specs).unwrap();
+        let actual = write_qpdf(&mut dest, |writer| {
+            writer.set_static_id(true);
+            writer.set_qdf_mode(true);
+            writer.set_suppress_original_object_ids(true);
+            writer.set_minimum_pdf_version(version, max_ext);
+        });
+        assert_byte_identical(&actual, "overlay-copy-annotations-two-specs-same-page.pdf");
+    }
+
+    /// Overlay a source that mixes two edge shapes into its page's
+    /// `/Annots` array:
+    /// - one widget (obj 3, "Text Box 1") carries an explicit `/P`
+    ///   pointing at the source page — after copy that ref goes stale
+    ///   and gets Null'd by canonical foreign-object replacement, so the
+    ///   `PageObjectHelper::copy_annotations_from` path must repoint it at
+    ///   dest_page_ref;
+    /// - one entry is a DIRECT annot dictionary (an inline
+    ///   `<< /Subtype /FreeText ... >>` where an indirect ref would
+    ///   normally live) — the canonical AcroForm transform path must preserve
+    ///   it as a fresh source-doc indirect object (qpdf
+    ///   transformAnnotations line 954-956).
+    ///
+    /// Fixture: `form-fields-and-annotations-p-and-inline.pdf` is the
+    /// primary source with `/P 17 0 R` added to Text Box 1 and one
+    /// FreeText annot inlined into the page's `/Annots`.
+    #[test]
+    fn overlay_copy_annotations_source_p_and_inline_is_byte_identical_qdf() {
+        let mut dest = fixture("fxo-red.pdf");
+        let mut src = fixture("form-fields-and-annotations-p-and-inline.pdf");
+        let (version, max_ext) = accumulate_max(&mut dest, &mut src).get_version();
+        let mut specs = vec![OverlaySpec {
+            source: src,
+            kind: OverlayKind::Overlay,
+            from: pr(""),
+            to: pr(""),
+            repeat: Some(pr("1")),
+        }];
+        apply_overlay_specs(&mut dest, &mut specs).unwrap();
+        let actual = write_qpdf(&mut dest, |writer| {
+            writer.set_static_id(true);
+            writer.set_qdf_mode(true);
+            writer.set_suppress_original_object_ids(true);
+            writer.set_minimum_pdf_version(version, max_ext);
+        });
+        assert_byte_identical(&actual, "overlay-source-p-and-inline.pdf");
+    }
+
+    /// Overlay a source that has annotations (a `/Link` annot) but NO
+    /// `/AcroForm` on the catalog — a valid, common shape (only widget
+    /// annots require an /AcroForm; link, stamp, freetext, ... do not).
+    /// Exercises the "no /AcroForm" branch of
+    /// `read_source_acroform_defaults` (`source_dr`, `source_default_da`,
+    /// `source_default_q` all return None) that the primary target does
+    /// not hit because its source PDF carries an /AcroForm.
+    #[test]
+    fn overlay_copy_annotations_source_no_acroform_is_byte_identical_qdf() {
+        let mut dest = fixture("fxo-red.pdf");
+        let mut src = fixture("link-annot-no-acroform.pdf");
+        let (version, max_ext) = accumulate_max(&mut dest, &mut src).get_version();
+        let mut specs = vec![OverlaySpec {
+            source: src,
+            kind: OverlayKind::Overlay,
+            from: pr(""),
+            to: pr(""),
+            repeat: Some(pr("1")),
+        }];
+        apply_overlay_specs(&mut dest, &mut specs).unwrap();
+        let actual = write_qpdf(&mut dest, |writer| {
+            writer.set_static_id(true);
+            writer.set_qdf_mode(true);
+            writer.set_suppress_original_object_ids(true);
+            writer.set_minimum_pdf_version(version, max_ext);
+        });
+        assert_byte_identical(&actual, "overlay-link-annot-no-acroform.pdf");
+    }
+
+    /// The destination already carries a `/Annots` array with a link
+    /// annotation and has no `/AcroForm`. qpdf's overlay appends the imported
+    /// Form XObject to the page contents without disturbing the existing
+    /// annotations (`copyAnnotations` only runs for the source's own annots),
+    /// so the destination array must come out unchanged.
+    #[test]
+    fn overlay_destination_existing_annotation_is_byte_identical_qdf() {
+        let mut dest = fixture("link-annot-no-acroform.pdf");
+        let source = fixture("one-page.pdf");
+        let dest_page = page_refs(&mut dest).unwrap()[0];
+        let before = page_annots(&mut dest, dest_page)
+            .expect("destination fixture must have an annotation array");
+
+        let mut specs = vec![OverlaySpec {
+            source,
+            kind: OverlayKind::Overlay,
+            from: pr(""),
+            to: pr("1"),
+            repeat: None,
+        }];
+        apply_overlay_specs(&mut dest, &mut specs).unwrap();
+
+        let after = page_annots(&mut dest, dest_page)
+            .expect("destination annotations must survive the overlay rewrite");
+        assert_eq!(
+            after.len(),
+            before.len(),
+            "overlay must preserve destination annotations"
+        );
+        for (a, b) in after.iter().zip(before.iter()) {
+            assert!(
+                a.is_same_object_as(b),
+                "overlay must not rebind a destination annotation handle"
+            );
+        }
+
+        let actual = write_qdf_nooid(&mut dest);
+        assert_byte_identical(&actual, "overlay-destination-existing-annotation.pdf");
+    }
+
+    /// Overlay onto a dest whose `/AcroForm/Fields` is stored as an
+    /// indirect reference (`/Fields 5 0 R`) instead of a direct array —
+    /// a valid PDF shape. Exercises
+    /// the canonical helper's indirect `/Fields` append (updates the array
+    /// object in place rather than storing a new direct array on the
+    /// AcroForm).
+    ///
+    /// Fixture: `fxo-red-indirect-fields.pdf` is fxo-red with a hand-added
+    /// `/AcroForm { /Fields <ref> }` whose Fields ref points at a
+    /// standalone array object containing one widget "Text Box 1"; the
+    /// source's Text Box 1 must therefore rename to +N on every placement.
+    #[test]
+    fn overlay_copy_annotations_onto_indirect_fields_is_byte_identical_qdf() {
+        let mut dest = fixture("fxo-red-indirect-fields.pdf");
+        let mut src = fixture("form-fields-and-annotations.pdf");
+        let (version, max_ext) = accumulate_max(&mut dest, &mut src).get_version();
+        let mut specs = vec![OverlaySpec {
+            source: src,
+            kind: OverlayKind::Overlay,
+            from: pr(""),
+            to: pr(""),
+            repeat: Some(pr("1")),
+        }];
+        apply_overlay_specs(&mut dest, &mut specs).unwrap();
+        let actual = write_qpdf(&mut dest, |writer| {
+            writer.set_static_id(true);
+            writer.set_qdf_mode(true);
+            writer.set_suppress_original_object_ids(true);
+            writer.set_minimum_pdf_version(version, max_ext);
+        });
+        assert_byte_identical(&actual, "overlay-onto-indirect-fields.pdf");
+    }
+
+    /// Overlay a source whose `/AcroForm/DR` is stored inline as a direct
+    /// dictionary (rather than the usual indirect ref). Exercises
+    /// `read_source_acroform_defaults`' direct-`/DR` materialize path
+    /// (allocate a fresh source-doc indirect object, register the direct
+    /// dict on it, and return that ref for downstream copy).
+    #[test]
+    fn overlay_copy_annotations_source_direct_dr_is_byte_identical_qdf() {
+        let mut dest = fixture("fxo-red.pdf");
+        let mut src = fixture("form-fields-and-annotations-direct-dr.pdf");
+        let (version, max_ext) = accumulate_max(&mut dest, &mut src).get_version();
+        let mut specs = vec![OverlaySpec {
+            source: src,
+            kind: OverlayKind::Overlay,
+            from: pr(""),
+            to: pr(""),
+            repeat: Some(pr("1")),
+        }];
+        apply_overlay_specs(&mut dest, &mut specs).unwrap();
+        let actual = write_qpdf(&mut dest, |writer| {
+            writer.set_static_id(true);
+            writer.set_qdf_mode(true);
+            writer.set_suppress_original_object_ids(true);
+            writer.set_minimum_pdf_version(version, max_ext);
+        });
+        assert_byte_identical(&actual, "overlay-source-direct-dr.pdf");
+    }
+
+    /// Overlay `form-fields-and-annotations.pdf` onto a dest that already
+    /// carries an `/AcroForm` with a pre-existing `/Fields` entry named
+    /// "Text Box 1" — the same partial name as one of the source's
+    /// top-level fields, so the +N collision rename must fire once for
+    /// every placement (the source page is repeated onto all 16 dest
+    /// pages, so the rename runs 16 times: "Text Box 1+1", "Text Box 1+2",
+    /// ...). Also exercises `ensure_dest_acroform_dr`'s existing-`/DR`
+    /// short-circuit, the canonical helper's reference-`/AcroForm` and
+    /// reference-`/Fields` paths over the pre-existing field, and the tail of
+    /// `duplicate_field_tree` that
+    /// leaves an existing dest `/DR` untouched.
+    ///
+    /// Fixture: `fxo-red-with-existing-acroform.pdf` is fxo-red with a
+    /// small hand-added `/AcroForm { /DR ... /Fields [<field>] }` whose
+    /// field has `/T (Text Box 1)`.
+    #[test]
+    fn overlay_copy_annotations_onto_existing_acroform_is_byte_identical_qdf() {
+        let mut dest = fixture("fxo-red-with-existing-acroform.pdf");
+        let mut src = fixture("form-fields-and-annotations.pdf");
+        let (version, max_ext) = accumulate_max(&mut dest, &mut src).get_version();
+        let mut specs = vec![OverlaySpec {
+            source: src,
+            kind: OverlayKind::Overlay,
+            from: pr(""),
+            to: pr(""),
+            repeat: Some(pr("1")),
+        }];
+        apply_overlay_specs(&mut dest, &mut specs).unwrap();
+        let actual = write_qpdf(&mut dest, |writer| {
+            writer.set_static_id(true);
+            writer.set_qdf_mode(true);
+            writer.set_suppress_original_object_ids(true);
+            writer.set_minimum_pdf_version(version, max_ext);
+        });
+        assert_byte_identical(&actual, "overlay-onto-existing-acroform.pdf");
+    }
+
+    /// Overlay onto a dest whose `/AcroForm/DR` is already populated with a
+    /// `/Font /F1` that collides with the source's own `/DR/Font/F1` (dest
+    /// `/F1` is Helvetica, source `/F1` is Courier — different refs).
+    /// Exercises four qpdf helpers not reached by
+    /// `overlay_copy_annotations_onto_existing_acroform_is_byte_identical_qdf`
+    /// (whose dest `/AcroForm` has no `/DR` at all):
+    ///   1. `QPDFObjectHandle::mergeResources` — rename source `/F1` to
+    ///      `/F1_1` on merge into the existing dest `/DR/Font`.
+    ///   2. `init_dr_map` — populate `dr_map = {Font: {F1: F1_1}}`.
+    ///   3. `adjustDefaultAppearances` — rewrite each copied field's `/DA`
+    ///      to reference `/F1_1` instead of `/F1`.
+    ///   4. `adjustAppearanceStream` (`ResourceReplacer`) — rewrite the
+    ///      `/F1` operand inside each copied field's AP stream content to
+    ///      `/F1_1`.
+    ///
+    /// Fixture: `fxo-red-with-existing-acroform-dr.pdf` is
+    /// `fxo-red-with-existing-acroform.pdf` with an indirect `/AcroForm/DR`
+    /// added (`/Font << /F1 <ref-to-Helvetica> >>`).
+    ///
+    /// Golden generated with (qpdf 11.9.0):
+    /// ```text
+    /// qpdf --qdf --static-id --no-original-object-ids --min-version=1.6 \
+    ///   tests/fixtures/compat/fxo-red-with-existing-acroform-dr.pdf \
+    ///   --overlay tests/fixtures/compat/form-fields-and-annotations.pdf --repeat=1 \
+    ///   -- tests/golden/references/overlay/overlay-onto-existing-acroform-dr.pdf
+    /// ```
+    ///
+    /// Golden inspection confirms all three of:
+    ///   - dest `/AcroForm/DR/Font` has both `/F1 -> Helvetica` and
+    ///     `/F1_1 -> Courier`.
+    ///   - every copied field `/DA` string reads `/F1_1 ... Tf`.
+    ///   - at least one copied AP stream content is
+    ///     `/Tx BMC q BT /F1_1 18 Tf ... ET Q EMC` with its own
+    ///     `/Resources/Font/F1_1` pointing at the Courier font — proving
+    ///     `ResourceReplacer` fired on the stream, not just the `/DA` string.
+    // cov:ignore-start: the test body is instrumented by llvm-cov but never
+    // executes on this branch because it is `#[ignore]`d until Layer 4 wires
+    // up `adjust_appearance_stream`. The body IS exercised (and byte-identical
+    // against the qpdf 11.9.0 golden) on the top of the stack; keeping it
+    // here means the golden and its test doc-comment land alongside the
+    // fixture that defines them, rather than being deferred to a later PR.
+    #[test]
+    fn overlay_copy_annotations_onto_existing_acroform_dr_is_byte_identical_qdf() {
+        let mut dest = fixture("fxo-red-with-existing-acroform-dr.pdf");
+        let mut src = fixture("form-fields-and-annotations.pdf");
+        let (version, max_ext) = accumulate_max(&mut dest, &mut src).get_version();
+        let mut specs = vec![OverlaySpec {
+            source: src,
+            kind: OverlayKind::Overlay,
+            from: pr(""),
+            to: pr(""),
+            repeat: Some(pr("1")),
+        }];
+        apply_overlay_specs(&mut dest, &mut specs).unwrap();
+        let actual = write_qpdf(&mut dest, |writer| {
+            writer.set_static_id(true);
+            writer.set_qdf_mode(true);
+            writer.set_suppress_original_object_ids(true);
+            writer.set_minimum_pdf_version(version, max_ext);
+        });
+        assert_byte_identical(&actual, "overlay-onto-existing-acroform-dr.pdf");
+    }
+}

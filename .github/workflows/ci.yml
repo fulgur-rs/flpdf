@@ -311,9 +311,11 @@ jobs:
           # (structural + strict, incl. the in_open_document openaction oracles
           # and the multi-container OD ordering discriminator flpdf-699x).
           cargo test -p flpdf --features qpdf-zlib-compat --test cmp_linearize_objstm_tests
-          # Pins overlay/underlay output byte-identity vs committed qpdf goldens.
-          # These gates live in lib unit tests (job::overlay::byte_gate) behind the
-          # qpdf-zlib-compat cfg, so they must be run explicitly with --lib.
+          # Pins overlay copy-annotations output byte-identity vs committed qpdf
+          # goldens. The placement families run through the CLI gate below; this
+          # family has no CLI counterpart and lives in lib unit tests
+          # (job::overlay::byte_gate) behind the qpdf-zlib-compat cfg, so it must
+          # be run explicitly with --lib.
           cargo test -p flpdf --features qpdf-zlib-compat --lib job::overlay::byte_gate
           # Pins the CLI binary's linearized output byte-identity vs qpdf goldens
           # end-to-end (argument parsing -> WriteOptions -> write path -> framing).
