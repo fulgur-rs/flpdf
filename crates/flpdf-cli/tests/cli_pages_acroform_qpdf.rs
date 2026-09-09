@@ -702,6 +702,31 @@ fn acroform_secondary_bad_appearance_pdf() -> Vec<u8> {
     ])
 }
 
+/// Single-page foreign source with a valid appearance stream whose local
+/// `/Resources/Font/F1` collides with the primary AcroForm `/DR`. This drives
+/// qpdf's normal `adjustAppearanceStream` ResourceReplacer path without a
+/// parser-warning fallback.
+fn acroform_secondary_appearance_pdf() -> Vec<u8> {
+    assemble_pdf(&[
+        b"1 0 obj\n<< /Type /Catalog /Pages 2 0 R /AcroForm 5 0 R >>\nendobj\n".to_vec(),
+        b"2 0 obj\n<< /Type /Pages /Count 1 /Kids [3 0 R] >>\nendobj\n".to_vec(),
+        b"3 0 obj\n<< /Type /Page /Parent 2 0 R /MediaBox [0 0 612 792] \
+          /Annots [4 0 R] >>\nendobj\n"
+            .to_vec(),
+        b"4 0 obj\n<< /Type /Annot /Subtype /Widget /FT /Tx \
+          /T (ForeignAppearance) /DA (/F1 18 Tf) /DR 6 0 R \
+          /AP << /N 8 0 R >> /Rect [0 0 10 10] /P 3 0 R >>\nendobj\n"
+            .to_vec(),
+        b"5 0 obj\n<< /Fields [4 0 R] /DR 6 0 R >>\nendobj\n".to_vec(),
+        b"6 0 obj\n<< /Font << /F1 7 0 R >> >>\nendobj\n".to_vec(),
+        b"7 0 obj\n<< /Type /Font /Subtype /Type1 /BaseFont /Helvetica >>\nendobj\n".to_vec(),
+        b"8 0 obj\n<< /Type /XObject /Subtype /Form /BBox [0 0 10 10] \
+          /Resources 6 0 R /Length 9 0 R >>\nstream\n/F1 18 Tf\nendstream\nendobj\n"
+            .to_vec(),
+        b"9 0 obj\n10\nendobj\n".to_vec(),
+    ])
+}
+
 /// One-page AcroForm source used to compare qpdf's lazy foreign-field setup
 /// when the primary input is `--empty`.
 fn acroform_need_appearances_source_pdf() -> Vec<u8> {
@@ -1125,6 +1150,89 @@ fn malformed_foreign_appearance_parser_warning_matches_qpdf() {
         std::fs::read(&flpdf_output).expect("flpdf output"),
         std::fs::read(&qpdf_output).expect("qpdf output"),
         "qpdf and flpdf must preserve the same malformed appearance output",
+    );
+}
+
+#[test]
+fn foreign_appearance_resource_replacer_matches_qpdf() {
+    if !qpdf_available() {
+        eprintln!("[SKIP cli_pages_acroform_qpdf] qpdf 11.9.0 is unavailable");
+        return;
+    }
+
+    let temp = tempfile::tempdir().expect("temporary directory");
+    let primary = temp.path().join("primary.pdf");
+    std::fs::write(&primary, acroform_primary_with_dr_pdf()).expect("write primary");
+    let secondary = temp.path().join("appearance-source.pdf");
+    std::fs::write(&secondary, acroform_secondary_appearance_pdf())
+        .expect("write appearance source");
+
+    let cases: &[(&str, &[&str])] = &[
+        ("normal", &["--static-id", "--stream-data=uncompress"]),
+        (
+            "qdf",
+            &[
+                "--static-id",
+                "--qdf",
+                "--object-streams=disable",
+                "--stream-data=uncompress",
+            ],
+        ),
+    ];
+    for (label, options) in cases {
+        let qpdf_output = temp.path().join(format!("qpdf-{label}.pdf"));
+        Shell::new(QPDF)
+            .arg(&primary)
+            .arg("--overlay")
+            .arg(&secondary)
+            .arg("--to=1")
+            .arg("--")
+            .args(*options)
+            .arg(&qpdf_output)
+            .assert()
+            .success();
+
+        let flpdf_output = temp.path().join(format!("flpdf-{label}.pdf"));
+        Command::cargo_bin("flpdf")
+            .unwrap()
+            .arg(&primary)
+            .arg("--overlay")
+            .arg(&secondary)
+            .arg("--to=1")
+            .arg("--")
+            .args(*options)
+            .arg(&flpdf_output)
+            .assert()
+            .success();
+
+        assert_eq!(
+            std::fs::read(&flpdf_output).expect("flpdf output"),
+            std::fs::read(&qpdf_output).expect("qpdf output"),
+            "valid foreign appearance resource replacement must be byte-identical to qpdf in {label} mode"
+        );
+    }
+
+    let qpdf_linearized = temp.path().join("qpdf-linearized.pdf");
+    Shell::new(QPDF)
+        .args(["--static-id", "--stream-data=uncompress", "--linearize"])
+        .arg(temp.path().join("qpdf-normal.pdf"))
+        .arg(&qpdf_linearized)
+        .assert()
+        .success();
+
+    let flpdf_linearized = temp.path().join("flpdf-linearized.pdf");
+    Command::cargo_bin("flpdf")
+        .unwrap()
+        .args(["--static-id", "--stream-data=uncompress", "--linearize"])
+        .arg(temp.path().join("flpdf-normal.pdf"))
+        .arg(&flpdf_linearized)
+        .assert()
+        .success();
+
+    assert_eq!(
+        std::fs::read(&flpdf_linearized).expect("flpdf linearized output"),
+        std::fs::read(&qpdf_linearized).expect("qpdf linearized output"),
+        "linearizing the qpdf-matched appearance output must remain byte-identical"
     );
 }
 

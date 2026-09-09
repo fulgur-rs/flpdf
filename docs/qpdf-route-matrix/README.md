@@ -343,8 +343,8 @@ crates/flpdf/src/filters.rs::decode_stream_data_recovering: prod 0 (0 files) / t
 crates/flpdf/src/filters.rs::decode_stream_data_recovering_with_limits: prod 2 (2 files) / test 2
     crates/flpdf-qtest-tools/src/driver/test_0_1.rs 1, crates/flpdf/src/filters.rs 1
 crates/flpdf/src/filters.rs::encode_stream_data: prod 0 (0 files) / test 3
-crates/flpdf/src/filters.rs::encode_stream_data_from_handle: prod 4 (3 files) / test 0
-    crates/flpdf/src/overlay_appearance_stream.rs 2, crates/flpdf/src/filters.rs 1, crates/flpdf/src/writer/object_streams/emission.rs 1
+crates/flpdf/src/filters.rs::encode_stream_data_from_handle: prod 2 (2 files) / test 0
+crates/flpdf/src/filters.rs 1, crates/flpdf/src/writer/object_streams/emission.rs 1
 crates/flpdf/src/filters.rs::is_decoded_filter: prod 1 (1 files) / test 0
     crates/flpdf/src/job/inspection.rs 1
 crates/flpdf/src/filters.rs::passthrough_codec_label: prod 3 (3 files) / test 0
