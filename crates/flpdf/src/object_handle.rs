@@ -15132,6 +15132,18 @@ mod mutation_tests {
     }
 
     #[test]
+    fn stream_data_filterability_probe_rejects_a_non_stream_handle() {
+        let error = ObjectHandle::integer(7)
+            .stream_data_filterable(DecodeLevel::All)
+            .expect_err("filterability probe requires a stream handle");
+
+        assert!(matches!(
+            error,
+            crate::Error::Internal(message) if message == "pipeStreamData called for non-stream"
+        ));
+    }
+
+    #[test]
     fn object_value_clone_preserves_scalar_content() {
         let value = ObjectValue::Integer(42);
         let cloned = value.clone();

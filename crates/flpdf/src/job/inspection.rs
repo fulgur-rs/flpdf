@@ -252,7 +252,7 @@ fn emit_show_object<R: Read + Seek>(
                         DecodeLevel::All,
                         false,
                         false,
-                    )?;
+                    )?; // cov:ignore: multiline call terminator has no executable coverage region
                     Ok(std::rc::Rc::new(output.take_buffer()?))
                 } else {
                     object.get_stream_data(DecodeLevel::All)
