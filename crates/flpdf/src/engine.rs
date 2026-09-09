@@ -686,7 +686,7 @@ impl Pdf<Cursor<Vec<u8>>> {
 
 #[cfg(test)]
 mod tests {
-    use super::{Pdf, EMPTY_PDF_BYTES};
+    use super::{qpdf_open_parse_error, Pdf, EMPTY_PDF_BYTES};
     use crate::reader::resolver::{ResolverHandle, ResolverWarningOptions};
     use crate::xref::{load_xref_state_from_bytes, XrefLoadOptions};
     use crate::{Error, ObjectRef, PdfOpenOptions, QPDFLogger};
@@ -753,6 +753,50 @@ mod tests {
             .expect("the initial seek failure must abort opening");
 
         assert!(matches!(error, Error::Io(error) if error.to_string() == "initial seek failed"));
+    }
+
+    #[test]
+    fn qpdf_open_parse_error_leaves_non_parse_errors_untouched() {
+        let error = Error::Internal("already canonical".to_owned());
+
+        assert!(matches!(
+            qpdf_open_parse_error(b"input.pdf", error),
+            Error::Internal(message) if message == "already canonical"
+        ));
+    }
+
+    #[test]
+    fn strict_open_wraps_a_canonical_qpdf_exception() {
+        let mut bytes = b"%PDF-1.4\n1 0 obj\n<< /Type /Catalog >>\nendobj\n".to_vec();
+        let xref = bytes.len();
+        bytes.extend_from_slice(b"xref\n0 2\n0000000000 65535 f \n000000000x 00000 n \n");
+        bytes.extend_from_slice(
+            format!("trailer\n<< /Size 2 /Root 1 0 R >>\nstartxref\n{xref}\n%%EOF\n").as_bytes(),
+        );
+
+        let error = match Pdf::open_with_options(
+            Cursor::new(bytes),
+            PdfOpenOptions {
+                repair: false,
+                description: b"bad5.pdf".to_vec(),
+                ..PdfOpenOptions::default()
+            },
+        ) {
+            Ok(_) => panic!("strict open must reject a malformed classic xref entry"),
+            Err(error) => error,
+        };
+        let source = match error.open_failure() {
+            Some((source, _)) => source,
+            None => &error,
+        };
+
+        assert!(matches!(
+            source,
+            Error::QpdfExc(exception)
+                if exception.get_filename() == b"bad5.pdf"
+                    && exception.get_object() == b"xref table"
+                    && exception.get_message_detail() == b"invalid xref entry (obj=1)"
+        ));
     }
 
     #[test]

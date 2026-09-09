@@ -4417,6 +4417,9 @@ fn parse_xref_table(
                     Some(entry_offset as u64),
                 ));
             }
+            // cov:ignore-start: object numbers are narrowed to i32 immediately
+            // below, so a u32 addition overflow cannot be reached by a valid
+            // parsed xref row.
             let object_number = first.checked_add(index).ok_or_else(|| {
                 Error::QpdfExc(QpdfExc::new(
                     QpdfErrorCode::DamagedPdf,
@@ -4426,6 +4429,7 @@ fn parse_xref_table(
                     b"invalid xref entry",
                 ))
             })?;
+            // cov:ignore-end
             let object_ref = QpdfObjGen::new(
                 i32::try_from(object_number)
                     .map_err(|_| Error::parse(0, "object number does not fit i32"))?,
@@ -4442,6 +4446,8 @@ fn parse_xref_table(
                         entry: XrefEntry::Uncompressed { offset },
                     });
                 }
+                // cov:ignore-start: parse_xref_entry_line accepts only the
+                // two in-use markers handled above.
                 _ => {
                     return Err(Error::QpdfExc(QpdfExc::new(
                         QpdfErrorCode::DamagedPdf,
@@ -4450,7 +4456,7 @@ fn parse_xref_table(
                         i64::try_from(entry_offset).unwrap_or(i64::MAX),
                         format!("invalid xref entry (obj={object_number})").into_bytes(),
                     )))
-                }
+                } // cov:ignore-end
             }
         }
     }
@@ -6926,6 +6932,81 @@ mod final_handle_tests {
                     && exception.get_file_position() == invalid_entry as i64
                     && exception.get_message_detail() == b"invalid xref entry (obj=1)"
         ));
+    }
+
+    #[test]
+    fn classic_xref_leniency_covers_whitespace_and_diagnostic_boundaries() {
+        assert_eq!(parse_xref_first_line(b"  0 1\n"), Some((0, 1)));
+        let (_, _, _, invalid) = parse_xref_entry_line(b" 0000000000  65535  f \n")
+            .expect("qpdf accepts a parseable but non-fixed-width xref row");
+        assert!(invalid);
+        assert!(parse_xref_entry_line(b"0000000000 00000 x\n").is_none());
+
+        let mut bytes = b"%PDF-1.4\n".to_vec();
+        let xref = bytes.len();
+        bytes.extend_from_slice(b"  xref\n0 1\n 0000000000  65535  f \ntrailer\n42\n");
+        let mut registration = XrefRegistration::default();
+        let mut diagnostics = Diagnostics::default();
+        let error = parse_xref_from_start(
+            &bytes,
+            xref,
+            xref as u64,
+            "1.4",
+            XrefLoadOptions {
+                description: b"bad-spacing.pdf".to_vec(),
+                ..XrefLoadOptions::default()
+            },
+            &mut registration,
+            Some(&mut diagnostics),
+            XrefReadContextSpec::ActiveSection,
+            None,
+            false,
+        )
+        .expect_err("a non-dictionary trailer must retain parser diagnostics");
+
+        assert!(matches!(
+            error,
+            Error::QpdfExc(exception)
+                if exception.get_message_detail() == b"expected trailer dictionary"
+        ));
+        let messages: Vec<_> = diagnostics
+            .entries()
+            .iter()
+            .map(|diagnostic| diagnostic.get_message_detail())
+            .collect();
+        assert!(messages.contains(&b"extraneous whitespace seen before xref".as_slice()));
+        assert!(messages.contains(&b"accepting invalid xref table entry".as_slice()));
+
+        let resolver = canonical_test_resolver(bytes.clone(), BTreeMap::new(), false, 11);
+        let mut registration = XrefRegistration::default();
+        let error = parse_xref_from_start_with_owner(
+            &bytes,
+            xref,
+            xref as u64,
+            "1.4",
+            XrefLoadOptions {
+                description: b"bad-spacing.pdf".to_vec(),
+                ..XrefLoadOptions::default()
+            },
+            &mut registration,
+            None,
+            XrefReadContextSpec::ActiveSection,
+            None,
+            false,
+            Some(resolver.as_ref()),
+        )
+        .expect_err("the canonical owner must retain the same trailer diagnostics");
+        assert!(matches!(
+            error,
+            Error::QpdfExc(exception)
+                if exception.get_message_detail() == b"expected trailer dictionary"
+        ));
+        assert!(resolver
+            .repair_diagnostics()
+            .entries()
+            .iter()
+            .any(|diagnostic| diagnostic.get_message_detail()
+                == b"extraneous whitespace seen before xref"));
     }
 
     #[test]
