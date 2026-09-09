@@ -1645,6 +1645,23 @@ documented container-only deviation from qpdf's recursive call stack. qtest
 exceptions and the active CLI, writer, and stream routes remain outside this
 bounded row.
 
+### A6/A7 AcroForm field-prune accessor slice `flpdf-3yn9.48.23.12` (2026-09-10)
+
+The page-subset AcroForm field-prune consumer now uses live
+`ObjectHandle` resolution at each dictionary, array, and scalar observation.
+This follows qpdf's `handlePageSpecs` page-null/field-retention boundary
+(`libqpdf/QPDFJob.cc:2585-2645`) and the field/widget traversal rules in
+`libqpdf/QPDFAcroFormDocumentHelper.cc:235-365`, with the common lazy accessor
+contract from `libqpdf/QPDFObjectHandle.cc:240-446,965-989,2168-2189`.
+
+The scoped production route has zero explicit `Pdf::resolve` or
+`resolve_handle*` calls and no non-resolving dictionary/array/name/null
+observations or panic key accessors. Indirect `/Fields`, `/Kids`, `/Subtype`,
+and widget `/P` values are resolved through the same fallible handle path;
+direct field entries remain ignored and the existing field identity, depth,
+cycle, and mutation order are unchanged. qtest exceptions and the separate
+merge/drop-family behavior remain outside this bounded row.
+
 ### QPDFJob `doInspection` combined top-level consumer `flpdf-giz3` (2026-09-10)
 
 The top-level CLI now routes combined inspection selections through the
