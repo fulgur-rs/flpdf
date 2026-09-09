@@ -7311,8 +7311,13 @@ fn split_pdf<R: Read + Seek + 'static>(
     // used everywhere else. flpdf's split path uses a fresh `QPDFJob`
     // instead, so that job's own suppression must be set explicitly, and
     // before `split_pages` runs so warnings raised during the split itself
-    // are suppressed too, not only the final summary line.
+    // are suppressed too, not only the final summary line. The same reasoning
+    // applies to `--warning-exit-0`: qpdf's single job reaches
+    // `QPDFJob.cc:560` with `m->warnings_exit_zero` already set, so this
+    // fresh job must carry the same policy or `--split-pages` would still
+    // exit 3 on a repair warning.
     job.set_suppress_warnings(suppress_warnings);
+    job.set_warnings_exit_zero(cli_warning_exit_zero());
     if progress {
         job.set_progress(true);
         job.set_output_file(output.to_path_buf())?;
@@ -9278,6 +9283,7 @@ fn run_add_attachment(
     job.set_logger(cli_logger());
     job.set_message_prefix(progname());
     job.set_suppress_warnings(suppress_warnings);
+    job.set_warnings_exit_zero(cli_warning_exit_zero());
     let mut pdf = job
         .open_with_description(BufReader::new(file), path_description(&input), options)
         .map_err(|error| error_with_file(&input, actionable_password_error(error)))?;
@@ -9512,6 +9518,7 @@ fn run_copy_attachments_from(
     job.set_logger(cli_logger());
     job.set_message_prefix(progname());
     job.set_suppress_warnings(suppress_warnings);
+    job.set_warnings_exit_zero(cli_warning_exit_zero());
     let mut pdf = job
         .open_with_description(BufReader::new(file), path_description(&input), options)
         .map_err(|error| error_with_file(&input, actionable_password_error(error)))?;
