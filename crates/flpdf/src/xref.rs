@@ -8328,6 +8328,29 @@ mod final_handle_tests {
     }
 
     #[test]
+    fn recovered_state_merge_retains_accumulated_non_type_one_raw_rows() {
+        let mut recovered = loaded_state_with_trailer(ObjectHandle::dictionary(Vec::new()));
+        let mut accumulated = loaded_state_with_trailer(ObjectHandle::dictionary(Vec::new()));
+        accumulated.raw_entries.insert(
+            QpdfObjGen::new(6, 0),
+            XrefEntry::Compressed {
+                stream: 9,
+                index: 0,
+            },
+        );
+
+        recovered = merge_recovered_qpdf_state(recovered, accumulated, &BTreeSet::new());
+
+        assert_eq!(
+            recovered.raw_entries.get(&QpdfObjGen::new(6, 0)),
+            Some(&XrefEntry::Compressed {
+                stream: 9,
+                index: 0,
+            })
+        );
+    }
+
+    #[test]
     fn reconstructed_size_revalidation_uses_the_recovery_offset_index() {
         let mut bytes = b"%PDF-1.4\n".to_vec();
         let object_offset = bytes.len();
