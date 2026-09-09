@@ -14038,6 +14038,84 @@ mod tests {
     }
 
     #[test]
+    fn raw_invalid_generation_free_row_is_not_read() {
+        let resolver = bare_resolver();
+        resolver.install_raw_xref_entries(BTreeMap::from([(
+            QpdfObjGen::new(5, 65_536),
+            XrefEntry::Free { next: 0 },
+        )]));
+
+        resolver
+            .fix_dangling_references()
+            .expect("raw free rows do not require object reads");
+        assert!(resolver.repair_diagnostics().entries().is_empty());
+    }
+
+    #[test]
+    fn raw_invalid_generation_zero_offset_warns() {
+        let resolver = bare_resolver();
+        resolver.install_raw_xref_entries(BTreeMap::from([(
+            QpdfObjGen::new(5, 65_536),
+            XrefEntry::Uncompressed { offset: 0 },
+        )]));
+
+        resolver
+            .fix_dangling_references()
+            .expect("raw zero-offset row should resolve with a warning");
+        assert!(resolver
+            .repair_diagnostics()
+            .entries()
+            .iter()
+            .any(|entry| entry.message_string() == "object has offset 0"));
+    }
+
+    #[test]
+    fn raw_invalid_generation_uses_the_common_reader_without_recovery() {
+        let resolver = bare_resolver();
+        resolver.install_raw_xref_entries(BTreeMap::from([(
+            QpdfObjGen::new(5, 65_536),
+            XrefEntry::Uncompressed { offset: 9 },
+        )]));
+        resolver.set_attempt_recovery(false);
+
+        resolver
+            .fix_dangling_references()
+            .expect("raw row should use the shared object reader");
+        assert!(resolver
+            .registered_handle(ObjectRef::new(1, 0))
+            .is_some_and(|handle| handle.is_resolved()));
+    }
+
+    #[test]
+    fn raw_invalid_generation_header_range_failure_uses_qpdf_warning_boundary() {
+        let mut bytes = b"%PDF-1.4\n".to_vec();
+        let offset = bytes.len();
+        bytes.extend_from_slice(b"5 65536 obj\n45\nendobj\n%tail\n");
+        let resolver = ResolverHandle::new_shared(
+            Cursor::new(bytes),
+            0,
+            BTreeMap::<ObjectRef, XrefEntry>::new(),
+            false,
+            false,
+            Diagnostics::default(),
+            ResolverWarningOptions::new(crate::QPDFLogger::create(), true, Vec::new()),
+            0,
+        );
+        resolver.set_attempt_recovery(false);
+        resolver.install_raw_xref_entries(BTreeMap::from([(
+            QpdfObjGen::new(5, 65_536),
+            XrefEntry::Uncompressed {
+                offset: offset as u64,
+            },
+        )]));
+
+        resolver
+            .fix_dangling_references()
+            .expect("range failure is caught as a qpdf warning");
+        assert!(!resolver.repair_diagnostics().entries().is_empty());
+    }
+
+    #[test]
     fn second_reconstruction_attempt_rethrows_error_to_prevent_infinite_loop() {
         let bytes = synthetic_mismatch_pdf(false);
         let options = crate::PdfOpenOptions {
