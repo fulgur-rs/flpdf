@@ -313,7 +313,7 @@ impl<'a, R: Read + Seek> AcroFormDocumentHelper<'a, R> {
         let Some(acroform) = self.acroform_dict()? else {
             return Ok(Vec::new());
         };
-        let Some(fields) = resolve_array_value(self.pdf, acroform.try_get_key(b"/Fields")?)? else {
+        let Some(fields) = resolve_array_value(acroform.try_get_key(b"/Fields")?)? else {
             return Ok(Vec::new());
         };
 
@@ -344,7 +344,7 @@ impl<'a, R: Read + Seek> AcroFormDocumentHelper<'a, R> {
         let Some(acroform) = self.acroform_dict()? else {
             return Ok(Vec::new());
         };
-        let Some(fields) = resolve_array_value(self.pdf, acroform.try_get_key(b"/Fields")?)? else {
+        let Some(fields) = resolve_array_value(acroform.try_get_key(b"/Fields")?)? else {
             return Ok(Vec::new());
         };
 
@@ -2023,7 +2023,7 @@ impl<'a, R: Read + Seek> AcroFormDocumentHelper<'a, R> {
         out.push(field_ref);
 
         let field = self.resolve_field_dict(field_ref)?;
-        let Some(kids) = resolve_array_value(self.pdf, field.try_get_key(b"/Kids")?)? else {
+        let Some(kids) = resolve_array_value(field.try_get_key(b"/Kids")?)? else {
             return Ok(());
         };
         for kid in kids {
@@ -2074,7 +2074,7 @@ impl<'a, R: Read + Seek> AcroFormDocumentHelper<'a, R> {
             max_len: current.max_len,
         });
 
-        let Some(kids) = resolve_array_value(self.pdf, field.try_get_key(b"/Kids")?)? else {
+        let Some(kids) = resolve_array_value(field.try_get_key(b"/Kids")?)? else {
             return Ok(());
         };
         for kid in kids {
@@ -2389,7 +2389,7 @@ impl<'a, R: Read + Seek> AcroFormDocumentHelper<'a, R> {
         let Some(acroform) = self.acroform_dict()? else {
             return Ok(Vec::new());
         };
-        let Some(fields) = resolve_array_value(self.pdf, acroform.try_get_key(b"/Fields")?)? else {
+        let Some(fields) = resolve_array_value(acroform.try_get_key(b"/Fields")?)? else {
             return Ok(Vec::new());
         };
         Ok(fields
@@ -2410,17 +2410,16 @@ impl<'a, R: Read + Seek> AcroFormDocumentHelper<'a, R> {
         let Some(acroform) = self.acroform_dict()? else {
             return Ok(false);
         };
-        Ok(resolve_array_value(self.pdf, acroform.try_get_key(b"/Fields")?)?.is_some())
+        Ok(resolve_array_value(acroform.try_get_key(b"/Fields")?)?.is_some())
     }
 }
 
-fn resolve_array_value<R: Read + Seek>(
-    _pdf: &mut Pdf<R>,
-    value: ObjectHandle,
-) -> Result<Option<Vec<ObjectHandle>>> {
-    // The array carrier itself may be a holder chain (`/Fields 20 0 R →
-    // 21 0 R → [..]`); follow it to the terminal so a doubled-indirect
-    // carrier yields its array instead of being dropped as a non-array.
+fn resolve_array_value(value: ObjectHandle) -> Result<Option<Vec<ObjectHandle>>> {
+    // One hop only, like qpdf: `QPDFObjectHandle::isArray` resolves a single
+    // indirect reference (`libqpdf/QPDFObjectHandle.cc` `dereference()`), so a
+    // doubled-indirect carrier (`/Fields 20 0 R → 21 0 R → [..]`) is *not*
+    // followed to its terminal. Live qpdf 11.9.0 agrees, warning
+    // "/Fields key of /AcroForm dictionary is not an array; ignoring".
     value.try_as_array()
 }
 

@@ -159,6 +159,73 @@ fn signatures_handles_certificate_shapes_and_widget_field_entries() {
     }));
 }
 
+/// A widget kid whose only field-shaped key carries a null value is a *pure*
+/// widget, so the parent signature is reported once rather than twice.
+///
+/// qpdf's `QPDF_Dictionary::hasKey` is false for a null value
+/// (`libqpdf/QPDF_Dictionary.cc:98-101`, and `isNull()` dereferences —
+/// `libqpdf/QPDFObjectHandle.cc:352-356`), and `traverseField` uses exactly
+/// that predicate to separate a field from a bare annotation
+/// (`libqpdf/QPDFAcroFormDocumentHelper.cc:331-336`). A direct null and an
+/// indirect reference to a null object are both null under that rule.
+#[test]
+fn widget_kids_with_null_field_entries_do_not_duplicate_the_parent_signature() {
+    for kid in [
+        b"<< /Subtype /Widget /Rect [0 0 1 1] /Parent 5 0 R /T null >>".as_slice(),
+        b"<< /Subtype /Widget /Rect [0 0 1 1] /Parent 5 0 R /T 8 0 R >>".as_slice(),
+    ] {
+        let mut pdf = open(build_pdf(&[
+            (1, b"<< /Type /Catalog /Pages 2 0 R /AcroForm 4 0 R >>"),
+            (2, b"<< /Type /Pages /Kids [3 0 R] /Count 1 >>"),
+            (
+                3,
+                b"<< /Type /Page /Parent 2 0 R /MediaBox [0 0 612 792] >>",
+            ),
+            (4, b"<< /Fields [5 0 R] >>"),
+            (5, b"<< /FT /Sig /T (sigfield) /V 6 0 R /Kids [7 0 R] >>"),
+            (6, b"<< /Type /Sig /ByteRange [0 1 2 3] /Name (Signer) >>"),
+            (7, kid),
+            (8, b"null"),
+        ]));
+
+        let signatures = pdf.signatures().expect("signature scan should succeed");
+        let names: Vec<&str> = signatures
+            .iter()
+            .map(|signature| signature.field_name.as_str())
+            .collect();
+        assert_eq!(
+            names,
+            vec!["sigfield"],
+            "kid = {}",
+            String::from_utf8_lossy(kid)
+        );
+    }
+}
+
+/// The same widget kid with a *non-null* `/T` is a field in its own right, so
+/// qpdf's `hasKey` is true and the signature is reported for both nodes.
+#[test]
+fn widget_kids_with_real_field_entries_still_report_separately() {
+    let mut pdf = open(build_pdf(&[
+        (1, b"<< /Type /Catalog /Pages 2 0 R /AcroForm 4 0 R >>"),
+        (2, b"<< /Type /Pages /Kids [3 0 R] /Count 1 >>"),
+        (
+            3,
+            b"<< /Type /Page /Parent 2 0 R /MediaBox [0 0 612 792] >>",
+        ),
+        (4, b"<< /Fields [5 0 R] >>"),
+        (5, b"<< /FT /Sig /T (sigfield) /V 6 0 R /Kids [7 0 R] >>"),
+        (6, b"<< /Type /Sig /ByteRange [0 1 2 3] /Name (Signer) >>"),
+        (
+            7,
+            b"<< /Subtype /Widget /Rect [0 0 1 1] /Parent 5 0 R /T (kid) >>",
+        ),
+    ]));
+
+    let signatures = pdf.signatures().expect("signature scan should succeed");
+    assert_eq!(signatures.len(), 2, "{signatures:?}");
+}
+
 #[test]
 fn sig_flags_resolve_an_indirect_integer() {
     let mut pdf = open(build_pdf(&[
