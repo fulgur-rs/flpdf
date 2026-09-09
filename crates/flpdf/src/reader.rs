@@ -956,14 +956,16 @@ impl<R: Read + Seek> Pdf<R> {
                         return None;
                     }
                     if live_only
-                        && (handle.is_reserved()
-                            || (self.resolver.xref_entry(object_ref).is_none()
-                                && !self.resolver.is_allocated_object(object_ref)))
+                        && self.resolver.xref_entry(object_ref).is_none()
+                        && !self.resolver.is_allocated_object(object_ref)
                     {
                         // A historical xref stream and a dangling unresolved
                         // handle remain in qpdf's complete cache, but neither is
-                        // an effective live source object. Reserved construction
-                        // sentinels are likewise not writer-visible objects.
+                        // an effective live source object. A reserved sentinel
+                        // is document-allocated, so it stays visible here and
+                        // reaches `QPDF_Reserved::unparse`'s error like qpdf's
+                        // `getAllObjects()`-seeded preserve-unreferenced walk
+                        // (`libqpdf/QPDFWriter.cc:2909-2915`).
                         return None;
                     }
                     Some(object_ref)

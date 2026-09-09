@@ -1627,6 +1627,20 @@ impl<R: Read + Seek> ResolverHandle<R> {
             self.resolve_indirect(second, &second_handle)?;
         }
         first_handle.swap_value_state_with(&second_handle);
+        // `QPDF::swapObjects` resolves both identities before the swap
+        // (`libqpdf/QPDF.cc:2284-2291`), so a generation that had no xref row
+        // now owns a cache cell that `getAllObjects` enumerates
+        // (`libqpdf/QPDF.cc:1286-1294`). Record the same document-owned
+        // provenance `replace_object` records, or the writer's live view drops
+        // the value that was just swapped in.
+        for object_ref in [first, second] {
+            if self.xref_entry(object_ref).is_none() {
+                self.core
+                    .borrow_mut()
+                    .allocated_object_refs
+                    .insert(object_ref);
+            }
+        }
         Ok(())
     }
 
