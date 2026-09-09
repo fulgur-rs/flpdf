@@ -198,6 +198,57 @@ fn collect_page_tree_nodes(
     depth: usize,
     max_depth: usize,
 ) -> Result<()> {
+    let Some(frame) = collect_page_tree_frame(node, nodes, seen, depth, max_depth)? else {
+        return Ok(());
+    };
+    let mut frames = vec![frame];
+
+    while let Some(frame) = frames.last_mut() {
+        if frame.next_kid >= frame.kid_count {
+            frames.pop();
+            continue;
+        }
+
+        let index = frame.next_kid;
+        frame.next_kid += 1;
+        let kids = frame.kids.clone();
+        let child_depth = frame.depth + 1;
+        let Some(kid) = kids.try_array_item(index)? else {
+            continue; // cov:ignore: canonical array handles return Some for every in-range item
+        };
+        if kid.try_has_key(b"/Kids")? {
+            if let Some(child) = collect_page_tree_frame(kid, nodes, seen, child_depth, max_depth)?
+            {
+                frames.push(child);
+            }
+        }
+    }
+    Ok(())
+}
+
+/// One suspended page-tree collection frame.
+///
+/// qpdf walks the same tree with the native call stack in
+/// `getAllPagesInternal` (`QPDF_pages.cc:77-138`). Only the container moves to
+/// the heap; the pre-order node visit and the child-array order are unchanged.
+struct PageTreeCollectFrame {
+    kids: ObjectHandle,
+    next_kid: usize,
+    kid_count: usize,
+    depth: usize,
+}
+
+#[allow(
+    clippy::mutable_key_type,
+    reason = "ObjectHandleIdentity intentionally keys the canonical live allocation"
+)]
+fn collect_page_tree_frame(
+    node: ObjectHandle,
+    nodes: &mut Vec<ObjectHandle>,
+    seen: &mut HashSet<ObjectHandleIdentity>,
+    depth: usize,
+    max_depth: usize,
+) -> Result<Option<PageTreeCollectFrame>> {
     if depth >= max_depth {
         let location = node
             .object_ref()
@@ -207,28 +258,25 @@ fn collect_page_tree_nodes(
         )));
     }
     if !seen.insert(node.identity_key()) {
-        return Ok(());
+        return Ok(None);
     }
 
     node.try_dereference()?;
     if !node.try_is_dictionary_of_type(b"Pages", b"")? {
-        return Ok(());
+        return Ok(None);
     }
     nodes.push(node.clone());
 
     let kids = node.try_get_key(b"/Kids")?;
     let Some(kid_count) = kids.try_array_len()? else {
-        return Ok(());
+        return Ok(None);
     };
-    for index in 0..kid_count {
-        let Some(kid) = kids.try_array_item(index)? else {
-            continue; // cov:ignore: canonical array handles return Some for every in-range item
-        };
-        if kid.try_has_key(b"/Kids")? {
-            collect_page_tree_nodes(kid, nodes, seen, depth + 1, max_depth)?;
-        }
-    }
-    Ok(())
+    Ok(Some(PageTreeCollectFrame {
+        kids,
+        next_kid: 0,
+        kid_count,
+        depth,
+    }))
 }
 
 /// Materialize direct non-scalar inheritable values on every `/Pages` node
