@@ -1626,6 +1626,25 @@ cutover. Silent real/string observations without a resolving `try_as_*`
 counterpart, writer emission, and qtest exception attribution remain outside
 this bounded row.
 
+### A6/A7 optimization accessor slice `flpdf-3yn9.48.23.11` (2026-09-10)
+
+The optimization orchestration and inherited-page-attribute walk now use the
+canonical resolving `ObjectHandle` accessors. This follows qpdf's direct
+`/Outlines` normalization and ordered inherited-key push in
+`libqpdf/QPDF_optimization.cc:70-78,117-187,190-245`, together with the
+entry-resolution and key/null fallback contract in
+`libqpdf/QPDFObjectHandle.cc:240-446,965-989,2168-2189`.
+
+The production route contract is zero for `Pdf::resolve`, `resolve_handle`,
+`resolve_handle_ref`, and panic `get_key`/`has_key` in
+`optimization.rs` and `optimization/inherited_attrs.rs`. Inheritable keys are
+looked up on the live dictionary, indirect values are resolved before the
+qpdf null-as-absent test, and direct/indirect page-tree traversal keeps its
+existing order and mutation boundary. The heap-backed traversal remains the
+documented container-only deviation from qpdf's recursive call stack. qtest
+exceptions and the active CLI, writer, and stream routes remain outside this
+bounded row.
+
 ### QPDFJob `doInspection` combined top-level consumer `flpdf-giz3` (2026-09-10)
 
 The top-level CLI now routes combined inspection selections through the

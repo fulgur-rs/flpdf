@@ -1,12 +1,10 @@
 //! qpdf correspondence: QPDF_optimization.cc inherited-page-attribute push.
 //!
-//! Deviation: null checks on an inheritable key's value use the canonical
-//! handle resolver before inspecting the value. This keeps lazy indirect
-//! values aligned with qpdf's accessors without introducing a second value
-//! snapshot route. See `pages.rs`'s
-//! `resolve_inherited_handle_with_max_depth` for the corresponding
-//! compensation in the sibling bottom-up attribute climb, and the inline
-//! deviation-marker comments below for the exact call sites.
+//! Inheritable values are inspected through the canonical resolving handle
+//! accessors, so indirect values follow qpdf's lazy resolution and null-as-
+//! absent behavior without introducing a second value snapshot route. See
+//! `pages.rs`'s `resolve_inherited_handle_with_max_depth` for the corresponding
+//! compensation in the sibling bottom-up attribute climb.
 //!
 //! Deviation: the descendant walk holds its suspended frames on the heap
 //! instead of the native call stack. qpdf recurses in
@@ -82,9 +80,8 @@ fn push_direct_root<R: Read + Seek>(
     warn_skipped_keys: bool,
 ) -> Result<()> {
     // cov:ignore-start: PreparedPages::Direct is created and consumed without an intervening public mutation
-    pdf.resolve(&catalog)?;
-    let pages = catalog.get_key(b"/Pages");
-    if pages.as_dictionary().is_none() {
+    let pages = catalog.try_get_key(b"/Pages")?;
+    if pages.try_as_dictionary()?.is_none() {
         return Ok(());
     }
     // cov:ignore-end
@@ -138,13 +135,13 @@ fn push_node_attributes<R: Read + Seek>(
     let mut own_keys = Vec::new();
     for &key in &INHERITABLE_KEYS {
         let Some(value) = dict
-            .as_dictionary()
+            .try_as_dictionary()?
             .and_then(|entries| entries.get(key).cloned())
         else {
             continue;
         };
         // Resolve the live value before applying qpdf's null-as-absent rule.
-        if pdf.resolve_handle(&value)?.is_null() {
+        if value.try_is_null()? {
             continue;
         }
         if !allow_changes {
@@ -242,12 +239,15 @@ fn enter_direct_frame<R: Read + Seek>(
     allow_changes: bool,
     warn_skipped_keys: bool,
 ) -> Result<Option<InheritedFrame>> {
-    if !is_pages_dictionary(&dict) {
+    if !is_pages_dictionary(&dict)? {
         return Ok(None);
     }
     warn_skipped_pages_keys(pdf, &dict, warn_skipped_keys, dict.object_ref())?;
     let own_keys = push_node_attributes(pdf, &dict, key_ancestors, allow_changes)?;
-    let kids = dict.get_key(b"/Kids").as_array().unwrap_or_default();
+    let kids = dict
+        .try_get_key(b"/Kids")?
+        .try_as_array()?
+        .unwrap_or_default();
     Ok(Some(InheritedFrame {
         kind: InheritedFrameKind::Direct,
         kids,
@@ -268,13 +268,15 @@ fn enter_indirect_frame<R: Read + Seek>(
         return Ok(None); // cov:ignore: page-tree repair rejects cycles before inherited-attribute push
     }
     let dict = pdf.get_object_handle(node_ref);
-    pdf.resolve(&dict)?;
-    if dict.as_dictionary().is_none() || !is_pages_dictionary(&dict) {
+    if !is_pages_dictionary(&dict)? {
         return Ok(None);
     }
     warn_skipped_pages_keys(pdf, &dict, warn_skipped_keys, Some(node_ref))?;
     let own_keys = push_node_attributes(pdf, &dict, key_ancestors, allow_changes)?;
-    let kids = dict.get_key(b"/Kids").as_array().unwrap_or_default();
+    let kids = dict
+        .try_get_key(b"/Kids")?
+        .try_as_array()?
+        .unwrap_or_default();
     Ok(Some(InheritedFrame {
         kind: InheritedFrameKind::Indirect,
         kids,
@@ -314,7 +316,7 @@ fn walk_inherited_frames<R: Read + Seek>(
                     )? {
                         frames.push(child);
                     }
-                } else if kid.as_dictionary().is_some() && kid.has_key(b"/Kids") {
+                } else if kid.try_is_dictionary()? && kid.try_has_key(b"/Kids")? {
                     if let Some(child) = enter_direct_frame(
                         pdf,
                         kid,
@@ -354,8 +356,7 @@ fn push_child_reference<R: Read + Seek>(
     warn_skipped_keys: bool,
 ) -> Result<Option<InheritedFrame>> {
     let child = pdf.get_object_handle(kid_ref);
-    pdf.resolve(&child)?;
-    if is_pages_dictionary(&child) {
+    if is_pages_dictionary(&child)? {
         return enter_indirect_frame(
             pdf,
             kid_ref,
@@ -366,18 +367,11 @@ fn push_child_reference<R: Read + Seek>(
         );
     }
 
-    if child.as_dictionary().is_none() {
+    if !child.try_is_dictionary()? {
         return Ok(None); // cov:ignore: page-tree repair guarantees indirect children are dictionaries
     }
     for (&key, values) in key_ancestors.iter() {
-        let present = match child
-            .as_dictionary()
-            .and_then(|entries| entries.get(key).cloned())
-        {
-            None => false,
-            // Resolve the live value before applying qpdf's null-as-absent rule.
-            Some(value) => !pdf.resolve_handle(&value)?.is_null(),
-        };
+        let present = child.try_has_key(key)?;
         if !present {
             if let Some(value) = values.last() {
                 child.replace_key(key, value.clone())?;
@@ -416,12 +410,8 @@ fn push_internal<R: Read + Seek>(
     )
 }
 
-fn is_pages_dictionary(handle: &ObjectHandle) -> bool {
-    handle
-        .as_dictionary()
-        .and_then(|entries| entries.get(b"/Type".as_slice()).cloned())
-        .and_then(|value| value.as_name())
-        .is_some_and(|name| name == b"Pages")
+fn is_pages_dictionary(handle: &ObjectHandle) -> Result<bool> {
+    handle.try_is_dictionary_of_type(b"Pages", b"")
 }
 
 fn handle_reference(handle: &ObjectHandle) -> Option<ObjectRef> {
@@ -468,6 +458,21 @@ mod tests {
                 3,
                 b"<< /Type /Page /Parent 2 0 R /MediaBox [0 0 612 792] >>",
             ),
+        ])
+    }
+
+    fn pdf_with_indirect_inherited_scalar_rotate() -> Vec<u8> {
+        pdf_bytes(&[
+            (1, b"<< /Type /Catalog /Pages 2 0 R >>"),
+            (
+                2,
+                b"<< /Type /Pages /Kids [3 0 R] /Count 1 /Rotate 5 0 R >>",
+            ),
+            (
+                3,
+                b"<< /Type /Page /Parent 2 0 R /MediaBox [0 0 612 792] >>",
+            ),
+            (5, b"90"),
         ])
     }
 
@@ -541,6 +546,26 @@ mod tests {
             pdf.get_object_handle(leaf_ref).end_offsets(),
             before,
             "inheriting a key must not clear the leaf's source extent"
+        );
+    }
+
+    #[test]
+    fn pushing_an_indirect_inherited_key_resolves_before_null_testing() {
+        let mut pdf = Pdf::open_mem_owned(pdf_with_indirect_inherited_scalar_rotate()).unwrap();
+        let prepared = crate::pages::repair::prepare_for_optimization(&mut pdf)
+            .unwrap()
+            .unwrap();
+
+        push(&mut pdf, &prepared, true, false).expect("push indirect inherited key");
+
+        let leaf = pdf.get_object_handle(ObjectRef::new(3, 0));
+        assert_eq!(
+            leaf.try_get_key(b"/Rotate")
+                .unwrap()
+                .try_as_integer()
+                .unwrap(),
+            Some(90),
+            "an indirect inherited value must not be mistaken for null"
         );
     }
 

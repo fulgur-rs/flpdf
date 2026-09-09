@@ -130,7 +130,6 @@ impl Optimization {
     ) -> crate::Result<Option<crate::pages::repair::PreparedPages>> {
         if let Some(root_ref) = pdf.root_ref() {
             let root = pdf.get_object_handle(root_ref);
-            pdf.resolve(&root)?;
             let outlines = root.try_get_key(b"/Outlines")?;
             if outlines.try_as_dictionary()?.is_some() && outlines.is_direct() {
                 // qpdf's optimize makes a direct /Outlines dictionary indirect
@@ -216,7 +215,6 @@ impl Optimization {
 
         if let Some(root_ref) = pdf.root_ref() {
             let root = pdf.get_object_handle(root_ref);
-            pdf.resolve(&root)?;
             for key in root.try_get_keys()? {
                 let user_key = key.strip_prefix(b"/").unwrap_or(&key).to_vec();
                 maps.update_object_maps(
