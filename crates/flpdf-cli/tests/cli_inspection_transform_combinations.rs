@@ -17,7 +17,7 @@ fn root_fixture(name: &str) -> PathBuf {
 }
 
 fn qpdf_available() -> bool {
-    ProcessCommand::new("/usr/bin/qpdf")
+    ProcessCommand::new("qpdf")
         .arg("--version")
         .output()
         .map(|output| {
@@ -31,7 +31,7 @@ fn qpdf_available() -> bool {
 }
 
 fn run_qpdf(args: &[String]) -> Output {
-    ProcessCommand::new("/usr/bin/qpdf")
+    ProcessCommand::new("qpdf")
         .args(args)
         .output()
         .expect("qpdf 11.9.0 should spawn")
