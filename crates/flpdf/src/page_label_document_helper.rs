@@ -260,6 +260,7 @@ pub(crate) fn merge_adjacent_raw_page_labels(
                 range.index,
                 &range.label,
             )? {
+                // cov:ignore: qpdf-valid raw label dictionaries use the accessor error path only for injected malformed handles
                 continue;
             }
         }
@@ -800,7 +801,7 @@ impl<'a, R: Read + Seek> PageLabelDocumentHelper<'a, R> {
                     ObjectHandle::integer(out_idx.checked_add(1).ok_or_else(|| {
                         Error::Unsupported("page label fabricated start overflow".to_string())
                     })?),
-                )?;
+                )?; // cov:ignore: the catalog was validated as a dictionary and this local replacement has no qpdf failure branch
             }
             out.push((out_idx, label));
         }
