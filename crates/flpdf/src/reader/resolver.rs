@@ -95,6 +95,7 @@ use crate::parser::{
 use crate::pipeline::aes::PlAesPdf;
 use crate::pipeline::rc4::PlRc4;
 use crate::pipeline::Pipeline;
+use crate::qpdf_obj_gen::QpdfObjGen;
 use crate::tokenizer::{Token, TokenType, Tokenizer};
 use crate::{
     Diagnostics, Error, ObjectHandle, ObjectRef, QpdfErrorCode, QpdfExc, Result, XrefEntry,
@@ -320,6 +321,10 @@ pub(crate) struct ResolverCore<R: Read + Seek + 'static> {
     header_offset: usize,
     /// qpdf `m->xref_table` (`QPDF.hh:1465`).
     source_xref_entries: BTreeMap<ObjectRef, XrefEntry>,
+    /// The same qpdf xref table before the valid `ObjectRef` boundary is
+    /// applied. Inspection uses this raw identity, including generations
+    /// outside `0..65535` (`QPDF.cc:1149-1184,1212-1236`).
+    raw_source_xref_entries: BTreeMap<QpdfObjGen, XrefEntry>,
     /// qpdf `m->obj_cache` (`QPDF.hh:1467`), and the document's *only*
     /// canonical [`ObjectRef`] → [`ObjectHandle`] map.
     ///
@@ -902,6 +907,7 @@ impl<R: Read + Seek> ResolverHandle<R> {
                 input: RefCell::new(Rc::new(StreamInput::new(reader, header_offset))),
                 header_offset,
                 source_xref_entries,
+                raw_source_xref_entries: BTreeMap::new(),
                 object_cache: BTreeMap::new(),
                 last_object_description: String::new(),
                 last_object_description_bytes: Vec::new(),
@@ -948,6 +954,7 @@ impl<R: Read + Seek> ResolverHandle<R> {
                 input: RefCell::new(Rc::new(StreamInput::invalid())),
                 header_offset: 0,
                 source_xref_entries: BTreeMap::new(),
+                raw_source_xref_entries: BTreeMap::new(),
                 object_cache: BTreeMap::new(),
                 last_object_description: String::new(),
                 last_object_description_bytes: Vec::new(),
@@ -1666,6 +1673,10 @@ impl<R: Read + Seek> ResolverHandle<R> {
         let cached = {
             let mut core = self.core.borrow_mut();
             core.source_xref_entries.remove(&object_ref);
+            if let Ok(key) = QpdfObjGen::try_from_object_ref(object_ref) {
+                // `QPDF::removeObject` erases the one row every consumer reads.
+                core.raw_source_xref_entries.remove(&key);
+            }
             core.default_xref_entries.remove(&object_ref);
             core.object_cache.get(&object_ref).cloned()
         };
@@ -1799,12 +1810,19 @@ impl<R: Read + Seek> ResolverHandle<R> {
         let filename = self.core.borrow().description.clone();
         let new_entries =
             crate::xref::recover_xref_entries(logical_bytes, false, &filename)?.entries;
+        let new_raw_entries = new_entries
+            .iter()
+            .map(|(object_ref, entry)| Ok((QpdfObjGen::try_from_object_ref(*object_ref)?, *entry)))
+            .collect::<Result<BTreeMap<_, _>>>()?;
 
         {
             let mut core = self.core.borrow_mut();
             core.source_xref_entries
                 .retain(|_, entry| !matches!(entry, XrefEntry::Uncompressed { .. }));
             core.source_xref_entries.extend(new_entries);
+            core.raw_source_xref_entries
+                .retain(|_, entry| !matches!(entry, XrefEntry::Uncompressed { .. }));
+            core.raw_source_xref_entries.extend(new_raw_entries);
         }
 
         // Lookup object_ref in reconstructed xref table
@@ -1842,6 +1860,7 @@ impl<R: Read + Seek> ResolverHandle<R> {
         let handles: Vec<_> = {
             let mut core = self.core.borrow_mut();
             core.source_xref_entries.clear();
+            core.raw_source_xref_entries.clear();
             core.object_cache.values().cloned().collect()
         };
         for handle in handles {
@@ -2184,6 +2203,22 @@ impl<R: Read + Seek> ResolverHandle<R> {
             entries
                 .entry(*object_ref)
                 .or_insert(XrefEntry::Free { next: 0 });
+        }
+        entries
+    }
+
+    /// Return qpdf's raw cross-reference table without applying the parsed
+    /// indirect-reference boundary. This is the table `showXRefTable` walks,
+    /// so a signed generation such as 65536 remains visible.
+    pub(crate) fn raw_xref_entries(&self) -> BTreeMap<QpdfObjGen, XrefEntry> {
+        let core = self.core.borrow();
+        let mut entries = core.raw_source_xref_entries.clone();
+        for object_ref in &core.default_xref_entries {
+            if let Ok(object_ref) = QpdfObjGen::try_from_object_ref(*object_ref) {
+                entries
+                    .entry(object_ref)
+                    .or_insert(XrefEntry::Free { next: 0 });
+            }
         }
         entries
     }
@@ -2637,6 +2672,13 @@ impl<R: Read + Seek> ResolverHandle<R> {
     pub(crate) fn insert_source_xref_entry(&self, object_ref: ObjectRef, entry: XrefEntry) {
         let mut core = self.core.borrow_mut();
         core.source_xref_entries.insert(object_ref, entry);
+        // qpdf keeps one table, so a row added after open is the same row
+        // `showXRefTable` walks (`QPDF.cc:1149-1184,1213-1236`). Mirror it into
+        // the raw view, which only the parsed-boundary split makes separate
+        // here.
+        if let Ok(key) = QpdfObjGen::try_from_object_ref(object_ref) {
+            core.raw_source_xref_entries.insert(key, entry);
+        }
     }
 
     /// Test-only: install a cross-reference entry the source did not declare,
@@ -2825,6 +2867,22 @@ impl<R: Read + Seek> ResolverHandle<R> {
         }
         core.source_xref_entries = entries;
         core.fixed_dangling_refs = false;
+    }
+
+    /// Install the raw xref identity retained by the loader. The valid
+    /// `ObjectRef` table remains the resolution view; this parallel table is
+    /// qpdf's exact `QPDFObjGen` view used by inspection.
+    pub(crate) fn install_raw_xref_entries(&self, entries: BTreeMap<QpdfObjGen, XrefEntry>) {
+        let mut core = self.core.borrow_mut();
+        if core.reconstructed_xref {
+            // Same handoff as `install_source_xref_entries`: the document
+            // repaired both views in place while the loader was still
+            // resolving the trailer, so the loader's table is the stale one.
+            // qpdf rewrites `m->xref_table` in situ and resumes against it
+            // (`QPDF.cc:518-620`).
+            return;
+        }
+        core.raw_source_xref_entries = entries;
     }
 
     /// Carry the open-time reconstruction bit into the resolver that owned

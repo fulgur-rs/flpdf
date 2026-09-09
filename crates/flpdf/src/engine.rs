@@ -258,10 +258,12 @@ impl<R: Read + Seek> Pdf<R> {
         let header_offset = loaded_state.header_offset;
         let already_reconstructed = loaded_state.already_reconstructed;
         let first_xref_item_offset = loaded_state.first_xref_item_offset;
+        let raw_xref_entries = loaded_state.raw_entries.clone();
         let loaded = loaded_state.loaded;
         let source_xref_entries = loaded.entries.clone();
         resolver.set_header_offset(header_offset);
         resolver.install_source_xref_entries(source_xref_entries);
+        resolver.install_raw_xref_entries(raw_xref_entries);
         resolver.set_reconstructed_xref(already_reconstructed);
         // QPDF's parser registers indirect references while reading every
         // trailer, including historical /Prev sections (QPDFParser.cc:168-175).

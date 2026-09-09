@@ -157,11 +157,10 @@ impl QPDFJob {
         emit_npages(pdf, &logger)
     }
 
-    /// Show the effective cross-reference table through qpdf's inspection
-    /// lifecycle (`QPDF::showXRefTable`, `libqpdf/QPDF.cc:1213-1240`). The
-    /// reader-owned snapshot is the same table qpdf exposes through
-    /// `QPDF::getXRefTable` (`QPDF.cc:2370-2377`), so this consumer does not
-    /// inspect raw xref-stream bytes or reconstruct a second table.
+    /// Show qpdf's raw cross-reference table through the inspection lifecycle
+    /// (`QPDF::showXRefTable`, `libqpdf/QPDF.cc:1213-1240`). The reader-owned
+    /// raw snapshot preserves `QPDFObjGen` identity before the stricter
+    /// `ObjectRef` parser boundary.
     pub fn show_xref<R: Read + Seek>(&mut self, pdf: &mut Pdf<R>) -> Result<JobExitCode> {
         let logger = self.logger();
         self.inspect(pdf, |pdf| emit_xref(pdf, &logger))
@@ -201,7 +200,7 @@ impl QPDFJob {
 }
 
 fn emit_xref<R: Read + Seek>(pdf: &mut Pdf<R>, logger: &crate::QPDFLogger) -> Result<()> {
-    for (object_ref, entry) in pdf.get_xref_table() {
+    for (object_ref, entry) in pdf.get_raw_xref_table() {
         let line = match entry {
             XrefEntry::Free { .. } => {
                 return Err(Error::Internal(
@@ -210,11 +209,13 @@ fn emit_xref<R: Read + Seek>(pdf: &mut Pdf<R>, logger: &crate::QPDFLogger) -> Re
             }
             XrefEntry::Uncompressed { offset } => format!(
                 "{}/{}: uncompressed; offset = {offset}\n",
-                object_ref.number, object_ref.generation
+                object_ref.get_obj(),
+                object_ref.get_gen()
             ),
             XrefEntry::Compressed { stream, index } => format!(
                 "{}/{}: compressed; stream = {stream}, index = {index}\n",
-                object_ref.number, object_ref.generation
+                object_ref.get_obj(),
+                object_ref.get_gen()
             ),
         };
         logger.info(line)?;

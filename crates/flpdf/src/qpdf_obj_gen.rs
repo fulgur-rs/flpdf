@@ -21,6 +21,18 @@ impl QpdfObjGen {
         Self { object, generation }
     }
 
+    /// Convert a Rust object reference through qpdf's checked `int` boundary
+    /// (`QIntC::to_int`, `include/qpdf/QPDF.hh:1429-1444`).
+    pub(crate) fn try_from_object_ref(object_ref: ObjectRef) -> crate::Result<Self> {
+        let object = i32::try_from(object_ref.number).map_err(|_| {
+            crate::Error::System(format!(
+                "integer out of range converting {} from a 4-byte unsigned type to a 4-byte signed type",
+                object_ref.number
+            ))
+        })?;
+        Ok(Self::new(object, i32::from(object_ref.generation)))
+    }
+
     /// Match `QPDFObjGen::isIndirect`: only object number zero is non-indirect.
     pub(crate) const fn is_indirect(self) -> bool {
         self.object != 0
@@ -52,12 +64,6 @@ impl QpdfObjGen {
     }
 }
 
-impl From<ObjectRef> for QpdfObjGen {
-    fn from(object_ref: ObjectRef) -> Self {
-        Self::new(object_ref.number as i32, object_ref.generation as i32)
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use super::QpdfObjGen;
@@ -85,5 +91,17 @@ mod tests {
     fn qpdf_obj_gen_orders_object_number_before_generation() {
         assert!(QpdfObjGen::new(7, 99) < QpdfObjGen::new(8, 0));
         assert!(QpdfObjGen::new(7, 0) < QpdfObjGen::new(7, 1));
+    }
+
+    #[test]
+    fn object_ref_conversion_rejects_qpdf_signed_integer_overflow() {
+        let error = QpdfObjGen::try_from_object_ref(ObjectRef::new(
+            u32::try_from(i64::from(i32::MAX) + 1).unwrap(),
+            0,
+        ))
+        .expect_err("qpdf QIntC::to_int must reject object numbers above INT_MAX");
+        assert!(error
+            .to_string()
+            .contains("integer out of range converting"));
     }
 }
