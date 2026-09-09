@@ -1400,6 +1400,8 @@ mod tests {
         let mut pdf = bare_one_page_pdf();
         let labels = pdf.page_labels().labels_for_selection(&[0], 0).unwrap();
         assert_eq!(labels, vec![(0, none_range(1))]);
+        let raw = pdf.page_labels().labels_for_selection_raw(&[0], 0).unwrap();
+        assert_eq!(raw[0].1.try_get_key(b"/St").unwrap().as_integer(), Some(1));
     }
 
     #[test]
@@ -1453,6 +1455,13 @@ mod tests {
         ];
         let merged = merge_adjacent_raw_labels(ranges).expect("raw merge");
         assert_eq!(merged.len(), 2);
+
+        let kept = merge_adjacent_raw_labels(vec![
+            (0, label(ObjectHandle::integer(42), 1)),
+            (1, ObjectHandle::dictionary(Vec::new())),
+        ])
+        .expect("raw merge must keep a label without /St");
+        assert_eq!(kept.len(), 2);
 
         let ranges = vec![
             RawPageLabelEntry {
