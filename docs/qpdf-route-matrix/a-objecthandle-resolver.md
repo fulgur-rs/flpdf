@@ -363,6 +363,23 @@ The number-tree depth/error policy, raw `/S`/`/P`/`/St` presence, and
 Result-propagation boundaries. The rendering-only qpdf deviation and test-only
 fixtures remain outside this slice.
 
+### A6/A7 page-document final-tree slice `flpdf-3yn9.48.23.5` (2026-09-09)
+
+The final-page clear path in
+`crates/flpdf/src/page_document_helper.rs` no longer uses the explicit
+`Pdf::resolve` followed by non-resolving `as_dictionary` inspection. The
+existing canonical page-tree/root gates remain unchanged; only the
+`/Pages` root validation at the final empty-tree mutation now uses
+`try_as_dictionary`, preserving lazy resolver errors and the live root
+identity.
+
+The qpdf mutation order remains anchored to
+`QPDFPageDocumentHelper.cc:37-52` and
+`QPDF_pages.cc:253-266,304-316`. The production route contract and
+`page_document_helper_qpdf_tests` cover caller-zero, cycle/error context,
+and final-page empty-tree behavior. No qtest or qtest-exceptions route is
+included.
+
 ### 2026-09-09 canonical cache cutover supersession
 
 The A1/A2/A9/A10/A11/A13/A15/A16/A17/A24 rows above were authored before
