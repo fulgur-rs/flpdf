@@ -456,50 +456,38 @@ fn value_as_int_i64(handle: &ObjectHandle, out: &mut i64) -> bool {
     }
 }
 
-// getValueAsInt(int&) (`libqpdf/QPDFObjectHandle.cc:545-553`), which defers
-// to getIntValueAsInt's clamp (`:526-543`): success requires only
-// `isInteger()`; an out-of-range value is *clamped*, not rejected, so the
-// call still reports success with the saturated value.
-fn value_as_int_i32(handle: &ObjectHandle, out: &mut i32) -> bool {
-    let Some(value) = handle.as_integer() else {
-        return false;
-    };
-    *out = if value < i64::from(i32::MIN) {
-        i32::MIN
-    } else if value > i64::from(i32::MAX) {
-        i32::MAX
-    } else {
-        value as i32
-    };
-    true
+// getValueAsInt(int&) (`libqpdf/QPDFObjectHandle.cc:545-553`) defers to
+// getIntValueAsInt's clamp (`:526-543`). Use the canonical ObjectHandle
+// accessor so qpdf's contextless clamp warnings reach the default logger.
+fn value_as_int_i32(handle: &ObjectHandle, out: &mut i32) -> flpdf::Result<bool> {
+    if handle.as_integer().is_none() {
+        return Ok(false);
+    }
+    *out = handle.try_get_int_value_as_int()?;
+    Ok(true)
 }
 
 // getValueAsUInt(unsigned long long&) (`libqpdf/QPDFObjectHandle.cc:569-577`),
-// deferring to getUIntValue (`:555-567`): a negative integer clamps to 0;
-// there is no upper clamp at this width.
-fn value_as_uint_u64(handle: &ObjectHandle, out: &mut u64) -> bool {
-    let Some(value) = handle.as_integer() else {
-        return false;
-    };
-    *out = if value < 0 { 0 } else { value as u64 };
-    true
+// deferring to getUIntValue (`:555-567`). Use the canonical accessor so the
+// negative-to-zero warning is emitted by ObjectHandle::warn_if_possible.
+fn value_as_uint_u64(handle: &ObjectHandle, out: &mut u64) -> flpdf::Result<bool> {
+    if handle.as_integer().is_none() {
+        return Ok(false);
+    }
+    *out = handle.try_get_uint_value()?;
+    Ok(true)
 }
 
 // getValueAsUInt(unsigned int&) (`libqpdf/QPDFObjectHandle.cc:598-606`),
 // deferring to getUIntValueAsUInt's clamp (`:579-596`): a negative integer
-// clamps to 0, and a value above `UINT_MAX` clamps to `UINT_MAX`.
-fn value_as_uint_u32(handle: &ObjectHandle, out: &mut u32) -> bool {
-    let Some(value) = handle.as_integer() else {
-        return false;
-    };
-    *out = if value < 0 {
-        0
-    } else if value > i64::from(u32::MAX) {
-        u32::MAX
-    } else {
-        value as u32
-    };
-    true
+// clamps to 0, and a value above `UINT_MAX` clamps to `UINT_MAX`. Use the
+// canonical accessor so both clamp warnings retain qpdf's call order.
+fn value_as_uint_u32(handle: &ObjectHandle, out: &mut u32) -> flpdf::Result<bool> {
+    if handle.as_integer().is_none() {
+        return Ok(false);
+    }
+    *out = handle.try_get_uint_value_as_uint()?;
+    Ok(true)
 }
 
 // getValueAsReal (`libqpdf/QPDFObjectHandle.cc:622-630`): only a real value
@@ -633,31 +621,31 @@ pub(crate) fn run_test_85<R: Read + Seek>(
     assert_eq!(li, 1);
 
     let mut i: i32 = 0;
-    assert!(value_as_int_i32(&oh_i, &mut i));
+    assert!(value_as_int_i32(&oh_i, &mut i)?);
     assert_eq!(i, 1);
-    assert!(!value_as_int_i32(&oh_b, &mut i));
+    assert!(!value_as_int_i32(&oh_b, &mut i)?);
     assert_eq!(i, 1);
-    assert!(value_as_int_i32(&oh_i_maxplus, &mut i));
+    assert!(value_as_int_i32(&oh_i_maxplus, &mut i)?);
     assert_eq!(i, i32::MAX);
-    assert!(value_as_int_i32(&oh_i_minminus, &mut i));
+    assert!(value_as_int_i32(&oh_i_minminus, &mut i)?);
     assert_eq!(i, i32::MIN);
 
     let mut uli: u64 = 0;
-    assert!(value_as_uint_u64(&oh_i, &mut uli));
+    assert!(value_as_uint_u64(&oh_i, &mut uli)?);
     assert_eq!(uli, 1);
-    assert!(!value_as_uint_u64(&oh_b, &mut uli));
+    assert!(!value_as_uint_u64(&oh_b, &mut uli)?);
     assert_eq!(uli, 1);
-    assert!(value_as_uint_u64(&oh_i_neg, &mut uli));
+    assert!(value_as_uint_u64(&oh_i_neg, &mut uli)?);
     assert_eq!(uli, 0);
 
     let mut ui: u32 = 0;
-    assert!(value_as_uint_u32(&oh_i, &mut ui));
+    assert!(value_as_uint_u32(&oh_i, &mut ui)?);
     assert_eq!(ui, 1);
-    assert!(!value_as_uint_u32(&oh_b, &mut ui));
+    assert!(!value_as_uint_u32(&oh_b, &mut ui)?);
     assert_eq!(ui, 1);
-    assert!(value_as_uint_u32(&oh_i_neg, &mut ui));
+    assert!(value_as_uint_u32(&oh_i_neg, &mut ui)?);
     assert_eq!(ui, 0);
-    assert!(value_as_uint_u32(&oh_i_umaxplus, &mut ui));
+    assert!(value_as_uint_u32(&oh_i_umaxplus, &mut ui)?);
     assert_eq!(ui, u32::MAX);
 
     let mut s: Vec<u8> = b"0".to_vec();

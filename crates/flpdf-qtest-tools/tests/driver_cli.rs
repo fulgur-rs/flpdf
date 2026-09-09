@@ -15,6 +15,22 @@ fn usage_for(command: &Command) -> String {
     format!("Usage: {whoami} n filename1 [arg2]\n")
 }
 
+#[test]
+fn test_85_uses_canonical_integer_accessors_and_emits_qpdf_clamp_warnings() {
+    driver()
+        .args(["85", "-"])
+        .assert()
+        .code(0)
+        .stdout("test 85 done\n")
+        .stderr(concat!(
+            "requested value of integer is too big; returning INT_MAX\n",
+            "requested value of integer is too small; returning INT_MIN\n",
+            "unsigned value request for negative number; returning 0\n",
+            "unsigned integer value request for negative number; returning 0\n",
+            "requested value of unsigned integer is too big; returning UINT_MAX\n",
+        ));
+}
+
 fn minimal_pdf() -> &'static str {
     concat!(
         env!("CARGO_MANIFEST_DIR"),
