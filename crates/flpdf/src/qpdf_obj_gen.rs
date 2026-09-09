@@ -1,4 +1,4 @@
-//! qpdf's raw `QPDFObjGen` identity used while loading cross-reference data.
+//! qpdf correspondence: QPDFObjGen.hh/QPDF.cc raw xref identity and valid indirect-reference boundary.
 //!
 //! This is intentionally separate from [`crate::ObjectRef`]. qpdf keeps the
 //! signed integer object/generation pair while reading xref rows

@@ -131,6 +131,7 @@
 | `crates/flpdf/src/pipeline/test_support.rs` | correspondence | flpdf-only test instrumentation for observable Pipeline downstream calls and failures |
 | `crates/flpdf/src/pipeline/tiff_predictor.rs` | correspondence | \`Pl_TIFFPredictor.cc\` incremental TIFF predictor |
 | `crates/flpdf/src/qdf_fix.rs` | correspondence | qpdf/fix-qdf.cc tool behavior outside libqpdf |
+| `crates/flpdf/src/qpdf_obj_gen.rs` | correspondence | QPDFObjGen.hh/QPDF.cc raw xref identity and valid indirect-reference boundary |
 | `crates/flpdf/src/qpdf_time.rs` | correspondence | \`QUtil::QPDFTime\`, \`get_current_qpdf_time\`, and \`qpdf_time_to_pdf_time\` |
 | `crates/flpdf/src/qutil.rs` | correspondence | \`QUtil.cc\` integer conversion, filesystem identity, and UTF-8 single-byte encoding primitives |
 | `crates/flpdf/src/reader.rs` | correspondence | QPDF.cc object resolution, recovery, diagnostics, and authentication responsibilities |
