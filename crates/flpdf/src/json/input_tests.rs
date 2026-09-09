@@ -1143,7 +1143,7 @@ fn json_reactor_reports_a_lazy_source_object_resolution_error() {
 }
 
 #[test]
-fn json_reactor_propagates_page_observation_failures() {
+fn json_reactor_accepts_deep_page_observation_like_qpdf() {
     for flag in ["calledgetallpages", "pushedinheritedpageresources"] {
         let mut pdf =
             Pdf::open(Cursor::new(excessive_page_tree_pdf_bytes())).expect("deep page-tree PDF");
@@ -1151,9 +1151,11 @@ fn json_reactor_propagates_page_observation_failures() {
         let source = Rc::new(RefCell::new(Cursor::new(json.into_bytes())));
         let mut reactor = JsonReactor::new(&mut pdf, Rc::clone(&source), "pages.json", false);
         parse_reader(&mut *source.borrow_mut(), Some(&mut reactor)).expect("JSON update");
-        assert!(reactor
-            .fatal_error()
-            .is_some_and(|message| message.contains("page tree depth exceeds")));
+        assert!(
+            reactor.fatal_error().is_none(),
+            "{flag}: qpdf's unbounded page observation must accept a deep tree; got {:?}",
+            reactor.fatal_error()
+        );
     }
 }
 

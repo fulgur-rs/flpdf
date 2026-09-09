@@ -3,8 +3,9 @@
 //!
 //! Iterates the document's `/Pages` tree in the order described by ISO 32000-1 §7.7.3.2
 //! and yields the `ObjectRef` of every leaf `Page` node. The walker tolerates broken
-//! cycles (each node is visited at most once) and bounds its recursion via a configurable
-//! depth limit, since malformed PDFs occasionally embed self-referential page trees.
+//! cycles (each node is visited at most once). An explicit depth limit remains
+//! available for callers that request a bounded walk; the default qpdf-shaped
+//! walk has no arbitrary depth cap.
 
 #[cfg(not(feature = "qtest-driver"))]
 pub(crate) mod repair;
@@ -176,13 +177,12 @@ pub(crate) fn resolve_inherited_handle_with_max_depth<R: Read + Seek>(
     resolve_inherited_handle_from_node_with_max_depth(pdf, page, key, max_depth)
 }
 
-/// Return every `Page` object in document order using [`DEFAULT_MAX_PAGE_TREE_DEPTH`].
+/// Return every `Page` object in document order using qpdf's unbounded default walk.
 ///
 /// # Errors
 ///
 /// - [`Error::Missing`] when the catalog (`/Root`) or its `/Pages` entry is absent.
-/// - [`Error::Unsupported`] when the catalog is not a dictionary, or when the page
-///   tree exceeds [`DEFAULT_MAX_PAGE_TREE_DEPTH`].
+/// - [`Error::Unsupported`] when the catalog is not a dictionary.
 /// - Any [`Error`] propagated from [`Pdf::resolve`] while walking the tree.
 ///
 /// # Examples
@@ -198,7 +198,8 @@ pub(crate) fn resolve_inherited_handle_with_max_depth<R: Read + Seek>(
 /// # Ok::<(), Box<dyn std::error::Error>>(())
 /// ```
 pub fn page_refs<R: Read + Seek>(pdf: &mut Pdf<R>) -> Result<Vec<ObjectRef>> {
-    page_refs_with_max_depth(pdf, DEFAULT_MAX_PAGE_TREE_DEPTH)
+    pdf.mark_get_all_pages_called();
+    PageWalk::new(pdf)?.collect()
 }
 
 /// Like [`page_refs`] but with a caller-supplied recursion limit.
@@ -374,13 +375,13 @@ pub struct PageWalk<'a, R: Read + Seek + 'static> {
         reason = "direct page-tree cycle detection keys on canonical handle identity"
     )]
     seen_direct: HashSet<ObjectHandleIdentity>,
-    max_depth: usize,
+    max_depth: Option<usize>,
     /// Set to `true` after yielding `Err`; causes all subsequent calls to return `None`.
     done: bool,
 }
 
 impl<'a, R: Read + Seek> PageWalk<'a, R> {
-    /// Create a `PageWalk` using [`DEFAULT_MAX_PAGE_TREE_DEPTH`].
+    /// Create an unbounded qpdf-shaped `PageWalk`.
     ///
     /// # Errors
     ///
@@ -388,7 +389,24 @@ impl<'a, R: Read + Seek> PageWalk<'a, R> {
     /// - [`Error::Unsupported`] when the catalog is not a dictionary.
     /// - Any [`Error`] propagated from [`Pdf::resolve`] while resolving the catalog.
     pub fn new(pdf: &'a mut Pdf<R>) -> Result<Self> {
-        Self::with_max_depth(pdf, DEFAULT_MAX_PAGE_TREE_DEPTH)
+        let root = pdf.trailer_key_handle(b"Root");
+        if root.is_null() {
+            return Err(Error::Missing("/Root"));
+        }
+        let catalog = pdf.root_handle()?;
+        let pages = catalog.try_get_key(b"/Pages")?;
+        if pages.is_null() {
+            return Err(Error::Missing("/Pages"));
+        }
+        let pages = PageNode::from_handle(pages);
+        Ok(PageWalk {
+            pdf,
+            stack: vec![(pages, 0)],
+            seen: BTreeSet::new(),
+            seen_direct: HashSet::new(),
+            max_depth: None,
+            done: false,
+        })
     }
 
     /// Create a `PageWalk` with a caller-supplied recursion limit.
@@ -414,7 +432,7 @@ impl<'a, R: Read + Seek> PageWalk<'a, R> {
             stack: vec![(pages, 0)],
             seen: BTreeSet::new(),
             seen_direct: HashSet::new(),
-            max_depth,
+            max_depth: Some(max_depth),
             done: false,
         })
     }
@@ -465,11 +483,11 @@ impl<'a, R: Read + Seek> Iterator for PageWalk<'a, R> {
         loop {
             let (node, depth) = self.stack.pop()?;
 
-            if depth >= self.max_depth {
+            if self.max_depth.is_some_and(|max_depth| depth >= max_depth) {
                 self.done = true;
                 return Some(Err(Error::Unsupported(format!(
                     "page tree depth exceeds maximum of {} at {}",
-                    self.max_depth,
+                    self.max_depth.expect("checked above"),
                     node.label()
                 ))));
             }
@@ -491,5 +509,41 @@ impl<'a, R: Read + Seek> Iterator for PageWalk<'a, R> {
                 }
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn unbounded_page_walk_reports_a_missing_root() {
+        let mut pdf = Pdf::<std::io::Cursor<Vec<u8>>>::uninitialized();
+        assert!(matches!(
+            PageWalk::new(&mut pdf),
+            Err(Error::Missing("/Root"))
+        ));
+    }
+
+    #[test]
+    fn unbounded_page_walk_reports_a_missing_pages_entry() {
+        let mut pdf = Pdf::empty().expect("empty PDF");
+        let catalog = pdf.root_handle().expect("empty catalog");
+        catalog.remove_key(b"/Pages");
+        assert!(matches!(
+            PageWalk::new(&mut pdf),
+            Err(Error::Missing("/Pages"))
+        ));
+    }
+
+    #[test]
+    fn explicit_page_walk_limit_remains_available() {
+        let mut pdf = Pdf::empty().expect("empty PDF");
+        let mut walk = PageWalk::with_max_depth(&mut pdf, 0).expect("empty pages root");
+        let error = walk
+            .next()
+            .expect("bounded walk must report an error")
+            .unwrap_err();
+        assert!(error.to_string().contains("depth exceeds maximum of 0"));
     }
 }

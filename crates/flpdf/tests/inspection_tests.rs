@@ -1,6 +1,7 @@
 use flpdf::{pages, Error, ObjectRef, Pdf};
 use std::io::Cursor;
 use std::io::Write;
+use std::process::Command;
 
 #[test]
 fn page_refs_returns_pages_in_document_order() {
@@ -8,6 +9,27 @@ fn page_refs_returns_pages_in_document_order() {
     let mut pdf = Pdf::open(Cursor::new(pdf)).unwrap();
     let pages = pages::page_refs(&mut pdf).unwrap();
     assert_eq!(pages, vec![ObjectRef::new(3, 0), ObjectRef::new(6, 0)]);
+}
+
+#[test]
+fn page_refs_accepts_a_120_level_tree_like_qpdf() {
+    let bytes = deep_nested_pages_pdf(120);
+    let temp = tempfile::tempdir().unwrap();
+    let input = temp.path().join("deep-pages.pdf");
+    std::fs::write(&input, &bytes).unwrap();
+    let qpdf = Command::new("qpdf")
+        .args(["--check"])
+        .arg(&input)
+        .output()
+        .expect("qpdf 11.9.0 must be available");
+    assert!(
+        qpdf.status.success(),
+        "qpdf rejected deep page tree: {qpdf:?}"
+    );
+
+    let mut pdf = Pdf::open(Cursor::new(bytes)).unwrap();
+    let pages = pages::page_refs(&mut pdf).unwrap();
+    assert_eq!(pages, vec![ObjectRef::new(122, 0)]);
 }
 
 #[test]
@@ -167,6 +189,33 @@ fn nested_pages_pdf() -> Vec<u8> {
         object6.to_vec(),
         object7.to_vec(),
     ])
+}
+
+fn deep_nested_pages_pdf(depth: usize) -> Vec<u8> {
+    assert!(depth > 0);
+    let mut objects = vec![b"1 0 obj\n<< /Type /Catalog /Pages 2 0 R >>\nendobj\n".to_vec()];
+    for level in 0..depth {
+        let object_number = 2 + level;
+        let child_number = if level + 1 == depth {
+            depth + 2
+        } else {
+            object_number + 1
+        };
+        objects.push(
+            format!(
+                "{object_number} 0 obj\n<< /Type /Pages /Count 1 /Kids [{child_number} 0 R] >>\nendobj\n"
+            )
+            .into_bytes(),
+        );
+    }
+    objects.push(
+        format!(
+            "{} 0 obj\n<< /Type /Page /MediaBox [0 0 612 792] >>\nendobj\n",
+            depth + 2
+        )
+        .into_bytes(),
+    );
+    finalize_pdf(&objects)
 }
 
 fn pdf_with_metadata_outline_and_fonts() -> Vec<u8> {
