@@ -1022,6 +1022,12 @@ struct Cli {
     #[arg(long)]
     linearize: bool,
 
+    /// Replace the input file with the rewritten output (qpdf
+    /// `--replace-input`). The canonical QPDFJob owns the temporary output,
+    /// source close, backup, rename, and warning lifecycle.
+    #[arg(long = "replace-input")]
+    replace_input: bool,
+
     /// Set a minimum PDF version for the output header. An optional third
     /// component is qpdf's Adobe extension level, e.g. `1.7.3`.
     #[arg(long = "min-version", require_equals = true)]
@@ -3157,6 +3163,34 @@ fn main() {
         }
     }
 
+    // qpdf rejects a non-zero split size with --replace-input before opening
+    // the input (`QPDFJob.cc:572-579`). The page-operation dispatch below
+    // requires an explicit output path, so enforce the canonical job
+    // boundary here instead of falling through to its unrelated arity error.
+    if args.replace_input && split_pages_active(args.page_ops.split_pages.as_deref()) {
+        usage_exit(&UsageError::new(
+            "--split-pages may not be used with --replace-input",
+        ));
+    }
+    if args.replace_input
+        && (args.check
+            || args.check_linearization
+            || args.show_object.is_some()
+            || args.show_npages
+            || args.show_pages
+            || args.show_xref
+            || args.show_linearization
+            || args.show_encryption
+            || args.is_encrypted
+            || args.requires_password
+            || args.list_attachments
+            || args.show_attachment.is_some())
+    {
+        usage_exit(&UsageError::new(
+            "no output file may be given for this option",
+        ));
+    }
+
     let json_input_inspection = (args.json_input || args.update_from_json.is_some())
         && (args.check
             || args.show_npages
@@ -3170,11 +3204,14 @@ fn main() {
     // such as --check and --show-pages on that same object.
     // For ordinary JSON output, the separate --json branch remains first among
     // the non-inspection modes and retains its existing validation boundary.
-    let result = if let Some(path) = args.job_json_file.as_deref() {
+    let result = if args.replace_input && (args.json.is_some() || args.json_output.is_some()) {
+        Err(UsageError::new("--json may not be used with --replace-input").into())
+    } else if let Some(path) = args.job_json_file.as_deref() {
         run_job_json_file(
             path,
             args.input.as_deref(),
             args.output.as_deref(),
+            args.replace_input,
             &args.password,
             args.no_warn,
         )
@@ -3400,6 +3437,7 @@ fn main() {
         run_rewrite(
             args.input,
             args.output,
+            args.replace_input,
             args.repair,
             &args.password,
             args.json_input,
@@ -3432,6 +3470,7 @@ fn main() {
         let result = run_rewrite(
             args.input,
             args.output.clone(),
+            args.replace_input,
             args.repair,
             &args.password,
             args.json_input,
@@ -3602,6 +3641,7 @@ fn main() {
         run_rewrite(
             args.input,
             args.output,
+            args.replace_input,
             args.repair,
             &args.password,
             args.json_input,
@@ -3763,6 +3803,7 @@ fn run_job_json_file(
     path: &Path,
     input: Option<&Path>,
     output: Option<&Path>,
+    replace_input: bool,
     password: &PasswordArgs,
     suppress_warnings: bool,
 ) -> CliResult<()> {
@@ -3789,6 +3830,14 @@ fn run_job_json_file(
     }
     if let Some(output) = output {
         job.set_output_file(output.to_path_buf()).map_err(|error| {
+            Box::new(CliExitError {
+                code: ExitCode::Errors,
+                message: format_job_json_error(path, error),
+            }) as Box<dyn std::error::Error>
+        })?;
+    }
+    if replace_input {
+        job.config().replace_input().map_err(|error| {
             Box::new(CliExitError {
                 code: ExitCode::Errors,
                 message: format_job_json_error(path, error),
@@ -4576,6 +4625,7 @@ fn run_command(command: Commands, overlay_specs: &[OverlaySpec]) -> CliResult<()
             run_rewrite(
                 Some(cmd.input),
                 Some(cmd.output),
+                false,
                 cmd.repair,
                 &cmd.password,
                 false,
@@ -5276,6 +5326,7 @@ fn parse_encrypt_key_len(value: &str) -> CliResult<u32> {
 fn run_rewrite(
     input: Option<PathBuf>,
     output: Option<PathBuf>,
+    replace_input: bool,
     repair: bool,
     password: &PasswordArgs,
     json_input: bool,
@@ -5299,6 +5350,15 @@ fn run_rewrite(
     empty: bool,
 ) -> CliResult<()> {
     if empty {
+        if replace_input && (input.is_some() || output.is_some()) {
+            return Err(UsageError::new(
+                "replace-input can't be used since output file has already been given",
+            )
+            .into());
+        }
+        if replace_input {
+            return Err(UsageError::new("--replace-input may not be used with --empty").into());
+        }
         let output = match (input, output) {
             (Some(output), None) | (None, Some(output)) => output,
             (Some(_), Some(extra)) => {
@@ -5312,6 +5372,7 @@ fn run_rewrite(
             pdf,
             Path::new("empty PDF"),
             &output,
+            false,
             repair,
             password,
             linearize,
@@ -5333,64 +5394,155 @@ fn run_rewrite(
         );
     }
     let input = input.ok_or_else(missing_input_usage_error)?;
-    let output = output.ok_or_else(missing_output_usage_error)?;
-    reject_same_job_output(&input, &output)?;
-    let opened = open_job_pdf(
+    if replace_input && output.is_some() {
+        return Err(UsageError::new(
+            "replace-input can't be used since output file has already been given",
+        )
+        .into());
+    }
+    let output = if replace_input {
+        input.clone()
+    } else {
+        output.ok_or_else(missing_output_usage_error)?
+    };
+    if !replace_input {
+        reject_same_job_output(&input, &output)?;
+    }
+    run_rewrite_with_qpdf_job(
         &input,
+        &output,
+        replace_input,
         repair,
         password,
         json_input,
         update_from_json,
-        false,
+        linearize,
+        linearize_pass1,
+        remove_restrictions,
+        decrypt,
+        normalize_content,
+        coalesce_contents,
+        generate_appearances,
+        image_options,
+        flatten_annotations_mode,
+        flatten_rotation,
+        page_labels,
+        overlay_specs,
+        verbose,
         no_warn,
+        options,
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
+fn run_rewrite_with_qpdf_job(
+    input: &Path,
+    output: &Path,
+    replace_input: bool,
+    repair: bool,
+    password: &PasswordArgs,
+    json_input: bool,
+    update_from_json: Option<&Path>,
+    linearize: bool,
+    linearize_pass1: Option<&Path>,
+    remove_restrictions: bool,
+    decrypt: bool,
+    normalize_content: bool,
+    coalesce_contents: bool,
+    generate_appearances: bool,
+    image_options: ImageTransformOptions,
+    flatten_annotations_mode: Option<CliFlattenMode>,
+    flatten_rotation: bool,
+    page_labels: PageLabelOptions,
+    overlay_specs: &[OverlaySpec],
+    verbose: bool,
+    no_warn: bool,
+    options: WriterOptions,
+) -> CliResult<()> {
+    // qpdf's createQPDF owns input creation and all document transformations;
+    // only writer configuration is deferred until writeQPDF. Keep the
+    // linearized normalization exception in the same position as the former
+    // staged caller, after createQPDF and before writeQPDF.
+    let linearize_normalization =
+        linearize && normalize_content && options.content_normalization_set;
+    let mut job_options = options.clone();
+    if linearize_normalization {
+        job_options.content_normalization = false;
+    }
+
+    let mut job = configure_rewrite_job(
+        input,
+        output,
+        replace_input,
+        password,
+        linearize,
+        linearize_pass1,
+        remove_restrictions,
+        image_options,
+        generate_appearances,
+        flatten_annotations_mode,
+        coalesce_contents,
+        flatten_rotation,
+        &page_labels,
+        overlay_specs,
+        verbose,
+        no_warn,
+        &job_options,
     )?;
-    match opened {
-        JobPdf::File(pdf) => run_rewrite_opened(
-            pdf,
-            &input,
-            &output,
-            repair,
-            password,
-            linearize,
-            linearize_pass1,
-            remove_restrictions,
-            decrypt,
-            normalize_content,
-            coalesce_contents,
-            _remove_unref,
-            generate_appearances,
-            image_options,
-            flatten_annotations_mode,
-            flatten_rotation,
-            page_labels,
-            overlay_specs,
-            verbose,
-            no_warn,
-            options,
-        ),
-        JobPdf::Json(pdf) => run_rewrite_opened(
-            pdf,
-            &input,
-            &output,
-            repair,
-            password,
-            linearize,
-            linearize_pass1,
-            remove_restrictions,
-            decrypt,
-            normalize_content,
-            coalesce_contents,
-            _remove_unref,
-            generate_appearances,
-            image_options,
-            flatten_annotations_mode,
-            flatten_rotation,
-            page_labels,
-            overlay_specs,
-            verbose,
-            no_warn,
-            options,
-        ),
+    if !replace_input {
+        job.set_input_file(input.to_path_buf())?;
+    }
+    let input_options = pdf_open_options(repair, password)?;
+    job.set_password(input_options.password);
+    {
+        let mut configuration = job.config();
+        if json_input {
+            configuration.json_input();
+        }
+        if let Some(path) = update_from_json {
+            configuration.update_from_json(path.to_path_buf());
+        }
+    }
+
+    let mut pdf = match job.create_qpdf()? {
+        Some(pdf) => pdf,
+        None => {
+            return Err(Box::new(CliExitError {
+                code: ExitCode::Errors,
+                message: String::new(),
+            }))
+        }
+    };
+    if linearize_normalization {
+        let warnings = normalize_page_contents(&mut pdf)?;
+        if !warnings.is_empty() {
+            job.record_warnings();
+            if !no_warn {
+                for warning in warnings {
+                    emit_content_normalization_warnings(input, warning)?;
+                }
+            }
+        }
+    }
+
+    // qpdf constructs writer options inside writeOutfile, after createQPDF;
+    // keep password normalization and weak-crypto validation at that same
+    // boundary rather than exposing them during input creation.
+    let mut writer_options = job_options;
+    if decrypt {
+        writer_options.preserve_encryption = false;
+    }
+    job.set_writer_configuration(writer_configuration_unnormalized(
+        &writer_options,
+        linearize,
+        linearize_pass1,
+    )?);
+    match job.write_qpdf(&mut pdf) {
+        Ok(()) => finish_job_exit_status(job.get_exit_code()),
+        Err(_) => Err(Box::new(CliExitError {
+            code: ExitCode::Errors,
+            message: String::new(),
+        })),
     }
 }
 
@@ -5398,6 +5550,7 @@ fn run_rewrite(
 fn configure_rewrite_job(
     input: &Path,
     output: &Path,
+    replace_input: bool,
     password: &PasswordArgs,
     linearize: bool,
     linearize_pass1: Option<&Path>,
@@ -5418,7 +5571,12 @@ fn configure_rewrite_job(
     }
     let mut job = new_cli_job(no_warn);
     job.set_input_name_bytes(path_description(input));
-    job.set_output_file(output.to_path_buf())?;
+    if replace_input {
+        job.set_input_file(input.to_path_buf())?;
+        job.config().replace_input()?;
+    } else {
+        job.set_output_file(output.to_path_buf())?;
+    }
     job.set_suppress_recovery(password.recovery.suppress_recovery);
     job.set_ignore_xref_streams(password.recovery.ignore_xref_streams);
     // `open_job_source` reads these three from the job configuration, so an
@@ -5506,6 +5664,7 @@ fn run_rewrite_opened<R: Read + Seek + 'static>(
     mut pdf: Pdf<R>,
     input: &Path,
     output: &Path,
+    replace_input: bool,
     _repair: bool,
     _password: &PasswordArgs,
     linearize: bool,
@@ -5539,6 +5698,7 @@ fn run_rewrite_opened<R: Read + Seek + 'static>(
     let mut job = configure_rewrite_job(
         input,
         output,
+        replace_input,
         _password,
         linearize,
         linearize_pass1,

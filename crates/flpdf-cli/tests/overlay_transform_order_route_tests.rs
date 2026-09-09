@@ -100,7 +100,7 @@ fn image_count(path: &Path) -> usize {
 fn ordinary_rewrite_uses_the_canonical_job_transform_and_output_routes() {
     let source = production_main_source();
     let ordinary_rewrite = source
-        .split_once("fn run_rewrite_opened")
+        .split_once("fn run_rewrite_with_qpdf_job")
         .and_then(|(_, tail)| {
             tail.split_once("// Page operations: ")
                 .map(|(body, _)| body)
@@ -108,8 +108,8 @@ fn ordinary_rewrite_uses_the_canonical_job_transform_and_output_routes() {
         .expect("ordinary rewrite route");
 
     assert!(
-        ordinary_rewrite.contains("job.apply_transformations("),
-        "ordinary rewrite transformations must be owned by QPDFJob"
+        ordinary_rewrite.contains("job.create_qpdf()"),
+        "ordinary rewrite input creation and transformations must be owned by QPDFJob"
     );
     assert!(
         ordinary_rewrite.contains("job.write_qpdf("),
