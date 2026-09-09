@@ -349,7 +349,10 @@ fn run_test2(
 
 /// Run qpdf-ctest.c:test10. The raw C API disables recovery before reading,
 /// then reports the resulting error object and returns success from the
-/// helper process (`qpdf-ctest.c:250-256`).
+/// helper process (`qpdf-ctest.c:259-265`). Unlike `test02`, `test10` never
+/// calls `qpdf_set_suppress_warnings` (its only use is `qpdf-ctest.c:163`),
+/// so any warning raised before the terminal error reaches both the live
+/// logger and the replayed report.
 fn run_test10(
     input_arg: &std::ffi::OsStr,
     password_arg: &std::ffi::OsStr,
