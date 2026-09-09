@@ -320,6 +320,26 @@ residuals in later cohorts, qtest-tools, and other page/object files, not a
 claim that the parent `.48.23` route is complete. qtest exceptions remain
 outside this cohort.
 
+### A6/A7 page-annotation-flatten slice `flpdf-3yn9.48.23.3` (2026-09-09)
+
+The production path in
+`crates/flpdf/src/page_annotation_flatten.rs` now has zero explicit
+`Pdf::resolve`, `resolve_handle`, or `resolve_handle_ref` bridge callers.
+Dictionary, null, integer, and array observations use the resolving
+`try_*` accessors. Stream-dictionary inspection retains an explicit
+`ObjectHandle::try_dereference` immediately before the non-resolving
+`as_stream_dict`, because that is the qpdf `getDict`/stream accessor
+boundary and no resolving Rust counterpart exists.
+
+The slice preserves qpdf's
+`QPDFPageDocumentHelper.cc:56-138` order: appearance and flag gates precede
+resource/XObject mutation, page-content wrappers, and annotation removal.
+The production source contract fixes the caller-zero boundary, while
+`resolve_array_item_handles_propagates_an_unresolved_child_error` verifies
+that a resolver failure remains a `Result`. Test-only legacy flatten modes and
+the separate `AnnotationObjectHelper` residual helper boundary remain
+outside this slice.
+
 ### 2026-09-09 canonical cache cutover supersession
 
 The A1/A2/A9/A10/A11/A13/A15/A16/A17/A24 rows above were authored before
