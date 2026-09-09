@@ -259,8 +259,7 @@ pub(crate) fn merge_adjacent_raw_page_labels(
                 &previous.label,
                 range.index,
                 &range.label,
-            )? {
-                // cov:ignore: qpdf-valid raw label dictionaries use the accessor error path only for injected malformed handles
+            )? { // cov:ignore: raw label accessor failures are covered by handle tests
                 continue;
             }
         }
