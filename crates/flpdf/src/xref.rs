@@ -1863,14 +1863,9 @@ pub(crate) fn load_xref_state_from_bytes(
     // below (a missing/malformed startxref) both leave `startxref == 0`
     // here. Below, the canonical-owner + repair-mode combination now skips
     // the retry entirely (matching qpdf exactly, see the comment there); the
-    // remaining deviation is the owner-less bootstrap path, which still runs
-    // a real retry attempt at logical (header-relative) offset 0 in `bytes`
-    // before recovery -- qpdf has no such detour, so a failure from that
-    // attempt (as opposed to the recorded "can't find startxref" trigger)
-    // has no qpdf counterpart. The same retry also still runs, unfixed, for
-    // a canonical owner outside repair mode (an explicit `startxref 0` with
-    // `allow_repair == false`), which is unverified against qpdf and out of
-    // scope here.
+    // remaining owner-less recovery path is entered only after this qpdf
+    // guard has classified the zero offset as the `can't find startxref`
+    // trigger; no route reads a speculative xref at logical offset zero.
     let startxref = match parse_startxref(bytes) {
         Ok(offset) => offset,
         Err(error) if allow_repair => {
@@ -1891,7 +1886,10 @@ pub(crate) fn load_xref_state_from_bytes(
         Err(_) => return Err(Error::parse(0, "startxref does not fit usize")), // cov:ignore: the same u64-to-usize overflow is unrepresentable on the supported target
     };
 
-    if allow_repair && startxref == 0 {
+    if startxref == 0 {
+        if !allow_repair {
+            return Err(Error::parse(0, "can't find startxref"));
+        }
         let trigger = parse_errors
             .into_iter()
             .next()
