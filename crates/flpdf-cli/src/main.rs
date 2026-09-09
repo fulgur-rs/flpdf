@@ -3344,6 +3344,17 @@ fn main() {
             top_level_inspection_transform_options,
             args.verbose,
         )
+    } else if args.check && args.show_xref {
+        run_check_show_xref(
+            args.input,
+            args.repair,
+            &args.password,
+            args.no_warn,
+            args.show_encryption_key,
+            args.page_ops.empty,
+            top_level_inspection_transform_options,
+            args.verbose,
+        )
     } else if args.show_xref {
         run_show_xref(
             args.input,
@@ -4763,6 +4774,41 @@ fn run_check(
         };
     apply_inspection_transformations(&mut job, &mut pdf, transform_options, verbose)?;
     finish_check_job(job.check(&mut pdf))
+}
+
+fn run_check_show_xref(
+    input: Option<PathBuf>,
+    repair: bool,
+    password: &PasswordArgs,
+    no_warn: bool,
+    show_encryption_key: bool,
+    empty: bool,
+    transform_options: InspectionTransformOptions,
+    verbose: bool,
+) -> CliResult<()> {
+    if empty {
+        reject_empty_inspection_output(input.as_deref())?;
+        let mut job = new_cli_job(no_warn);
+        job.set_show_encryption_key(show_encryption_key);
+        let mut pdf = create_empty_primary_document(&mut job, None)?;
+        apply_inspection_transformations(&mut job, &mut pdf, transform_options, verbose)?;
+        return finish_check_job(job.check_and_show_xref(&mut pdf));
+    }
+    let input = input.ok_or_else(missing_input_usage_error)?;
+    let file = File::open(&input).map_err(|error| open_error_with_file(&input, error.into()))?;
+    let mut job = new_cli_job(no_warn);
+    job.set_show_encryption_key(show_encryption_key);
+    let mut options = pdf_open_options(repair, password)?;
+    options.suppress_warnings = no_warn;
+    let mut pdf =
+        match job.open_with_description(BufReader::new(file), path_description(&input), options) {
+            Ok(pdf) => pdf,
+            Err(error) => {
+                return Err(error_with_file(&input, actionable_password_error(error)));
+            }
+        };
+    apply_inspection_transformations(&mut job, &mut pdf, transform_options, verbose)?;
+    finish_check_job(job.check_and_show_xref(&mut pdf))
 }
 
 fn run_check_linearization(
