@@ -1494,16 +1494,6 @@ impl<R: Read + Seek> Pdf<R> {
         Ok(handle.clone())
     }
 
-    /// Resolve one canonical handle and retain its own indirect identity.
-    pub(crate) fn resolve_handle_ref(
-        &mut self,
-        handle: &ObjectHandle,
-    ) -> Result<(ObjectHandle, Option<ObjectRef>)> {
-        let object_ref = handle.object_ref();
-        self.resolve(handle)?;
-        Ok((handle.clone(), object_ref))
-    }
-
     /// Read a linearization hint object and retain qpdf's source position for
     /// a following `damagedPDF` warning. The resolver distinguishes an already
     /// cached object from a newly parsed one, matching qpdf's

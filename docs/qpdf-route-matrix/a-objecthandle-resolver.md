@@ -556,6 +556,21 @@ references are remapped without dropping navigation entries. The handle-level
 authority is `libqpdf/QPDFObjectHandle.cc:240-446,965-989,2168-2189`. The
 remaining qtest exception and unrelated struct-tree/thread-bead, writer/CLI,
 and stream caller counts are intentionally not included in this bounded slice.
+### 2026-09-10 current caller audit: thread-bead bounded cutover
+
+`flpdf-3yn9.48.23.14` migrated the non-qtest production callers in
+`crates/flpdf/src/thread_bead_p.rs`: the fresh pre-cutover census was
+`resolve_handle_ref: 6` and `Pdf::resolve: 2`. The post-cutover scoped counts
+are zero, and the now-unused `Pdf::resolve_handle_ref` facade was removed from
+`crates/flpdf/src/reader.rs`. The route contract is
+`crates/flpdf/tests/thread_bead_route_contract_tests.rs`.
+
+The qpdf boundary is `libqpdf/QPDFJob.cc:2469-2470,2599-2608` for page-driven
+null-out and `libqpdf/QPDFWriter.cc:1110-1160` for dictionary null visibility;
+the handle-level resolution/error behavior is
+`libqpdf/QPDFObjectHandle.cc:2375-2383,240-446,965-989,2168-2189`. The
+remaining qtest exception and unrelated struct-tree, writer/CLI, and stream
+caller counts are intentionally not included in this bounded slice.
 
 ### 2026-09-10 current caller audit: optimization bounded cutover
 

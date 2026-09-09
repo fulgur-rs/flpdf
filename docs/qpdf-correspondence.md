@@ -1678,6 +1678,23 @@ panic key accessors. Existing raw destination-array handling, visited sets,
 direct/indirect annotation support, and page-driven null-out ordering are
 unchanged. Struct-tree/thread-bead drop-family behavior, qtest exceptions,
 and unrelated writer/CLI/stream routes remain outside this bounded row.
+### A6/A7 thread-bead accessor slice `flpdf-3yn9.48.23.14` (2026-09-10)
+
+The article-thread bead `/P` cleanup now traverses the live bead ring through
+canonical `ObjectHandle` resolution. qpdf has no standalone bead resolver;
+the observed page-subset behavior is the composition of page-driven null-out
+(`libqpdf/QPDFJob.cc:2469-2470,2599-2608`) and dictionary null visibility
+(`libqpdf/QPDFWriter.cc:1110-1160`). The common lazy handle and
+warning/error contract follows `libqpdf/QPDFObjectHandle.cc:2375-2383,
+240-446,965-989,2168-2189`.
+
+The scoped production route has zero `Pdf::resolve` and
+`resolve_handle_ref` callers. The helper's former `resolve_handle_ref` facade
+was deleted after its only production caller closed; indirect identities are
+captured directly from the canonical handle before `try_dereference`, while
+ring order, visited-cycle handling, direct/indirect entries, and `/P`
+remap/drop semantics remain unchanged. qtest exceptions and the separate
+merge/drop semantic issue remain outside this bounded row.
 
 ### QPDFJob `doInspection` combined top-level consumer `flpdf-giz3` (2026-09-10)
 
