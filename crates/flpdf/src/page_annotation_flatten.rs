@@ -631,7 +631,13 @@ fn acroform_default_resources<R: Read + Seek>(pdf: &mut Pdf<R>) -> Result<Option
         return Ok(None);
     }
     let resources = acroform.try_get_key(b"/DR")?;
-    Ok((!resources.try_is_null()?).then_some(resources))
+    // Presence only: qpdf reads `/DR` inside the per-annotation loop, after
+    // the `/NeedAppearances` widget skip and the `as.isStream()` gate
+    // (`QPDFPageDocumentHelper.cc:100-115`, `getDefaultResources` ->
+    // `getFieldFromAcroForm("/DR")` at `QPDFFormFieldObjectHelper.cc:190-194`).
+    // A resolving check here would dereference `/DR` for documents where qpdf
+    // never touches it. The caller dereferences before merging.
+    Ok((!resources.is_null()).then_some(resources))
 }
 
 /// Resolve every item of an array-shaped resource category, matching
@@ -945,6 +951,58 @@ mod tests {
     use crate::writer::write_qpdf_to_memory;
     use crate::{ObjectRef, Pdf};
     use std::io::Cursor;
+
+    /// `acroform_default_resources` reports presence only. qpdf reaches `/DR`
+    /// through `ff.getDefaultResources()` (`QPDFFormFieldObjectHelper.cc:190-194`,
+    /// a bare `getKey("/DR")`), and that call sits inside
+    /// `flattenAnnotationsForPage`'s per-annotation loop
+    /// (`QPDFPageDocumentHelper.cc:108,115`) behind the `process` and
+    /// `as.isStream()` gates, so a document whose widgets are all skipped never
+    /// dereferences it. Probed with qpdf 11.9.0 on a `/NeedAppearances true`
+    /// file whose `/DR` points at an unparseable object: `--flatten-annotations=all`
+    /// emits the stream-recovery warnings for the appearance object first, while
+    /// a resolving check here moves `/DR`'s diagnostics ahead of them.
+    #[test]
+    fn acroform_default_resources_does_not_dereference_an_indirect_dr() {
+        let mut bytes = Vec::new();
+        bytes.extend_from_slice(b"%PDF-1.6\n");
+        let mut offsets: Vec<(u32, u64)> = Vec::new();
+        for (num, body) in [
+            (
+                1u32,
+                b"<< /Type /Catalog /Pages 2 0 R /AcroForm << /DR 4 0 R >> >>".to_vec(),
+            ),
+            (2, b"<< /Type /Pages /Kids [3 0 R] /Count 1 >>".to_vec()),
+            (
+                3,
+                b"<< /Type /Page /Parent 2 0 R /MediaBox [0 0 612 792] >>".to_vec(),
+            ),
+            (4, b"<< /Font << /F1 5 0 R >> >>".to_vec()),
+        ] {
+            offsets.push((num, bytes.len() as u64));
+            bytes.extend_from_slice(format!("{num} 0 obj\n").as_bytes());
+            bytes.extend_from_slice(&body);
+            bytes.extend_from_slice(b"\nendobj\n");
+        }
+        let startxref = bytes.len();
+        bytes.extend_from_slice(b"xref\n0 5\n0000000000 65535 f \n");
+        for (_, off) in &offsets {
+            bytes.extend_from_slice(format!("{off:010} 00000 n \n").as_bytes());
+        }
+        bytes.extend_from_slice(
+            format!("trailer\n<< /Size 5 /Root 1 0 R >>\nstartxref\n{startxref}\n%%EOF\n")
+                .as_bytes(),
+        );
+
+        let mut pdf = Pdf::open(Cursor::new(bytes)).expect("open the /DR fixture");
+        let resources = acroform_default_resources(&mut pdf)
+            .expect("presence check succeeds")
+            .expect("/DR is present");
+        assert!(
+            !resources.is_resolved(),
+            "the presence check must leave an indirect /DR unresolved"
+        );
+    }
 
     #[test]
     fn resolve_array_item_handles_propagates_an_unresolved_child_error() {
