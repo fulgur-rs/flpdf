@@ -16,7 +16,12 @@ use super::resource_pruning::{
     RemoveUnreferencedResources,
 };
 use crate::form_field_object_helper::FormFieldObjectHelper;
+#[cfg(test)]
 use crate::page_label_document_helper::LabelRange;
+use crate::page_label_document_helper::{
+    copy_raw_page_label_entries, merge_adjacent_raw_labels, merge_adjacent_raw_page_labels,
+    RawPageLabelEntry,
+};
 use crate::pages::tree_rebuild::RebuildResult;
 use crate::{
     AcroFormDocumentHelper, Error, Matrix, ObjectHandle, ObjectRef, PageObjectHelper, PageRange,
@@ -311,9 +316,9 @@ fn handle_single_source_page_specs<R: Read + Seek>(
             .iter()
             .map(|page| i64::from(page.index_1based) - 1)
             .collect();
-        let entries = labels.labels_for_selection_with_prefix_presence(&src_indices, 0)?;
-        let folded = crate::merge_adjacent_ranges_with_prefix_presence(entries);
-        labels.write_reconstructed_labels_with_prefix_presence(&folded)?;
+        let entries = labels.labels_for_selection_raw(&src_indices, 0)?;
+        let folded = merge_adjacent_raw_labels(entries)?;
+        labels.write_reconstructed_labels_raw(&folded)?;
     }
     job.record_document_warnings(source);
     Ok((result, prune_mode))
@@ -347,8 +352,9 @@ fn merge_preserving_primary_into<R: Read + Seek, T: Read + Seek>(
 /// source's grouped merge input.
 type OrderedPage = (usize, usize);
 
-/// One qpdf-style reconstructed label, retaining raw `/P` presence in
-/// addition to the typed compatibility projection.
+/// One qpdf-style reconstructed label in the test-only typed compatibility
+/// projection. Production page selection uses raw label handles instead.
+#[cfg(test)]
 type JobLabelEntry = (i64, LabelRange, bool);
 
 fn collect_primary_fields<T: Read + Seek>(
@@ -620,6 +626,7 @@ fn rebuild_acroform_in_final_page_order<R: Read + Seek + 'static, T: Read + Seek
     Ok(())
 }
 
+#[cfg(test)]
 fn merge_job_label_ranges(ranges: Vec<JobLabelEntry>) -> Vec<JobLabelEntry> {
     let mut out: Vec<JobLabelEntry> = Vec::with_capacity(ranges.len());
     for (idx, range, prefix_present) in ranges {
@@ -776,23 +783,25 @@ fn handle_page_specs_into<R: Read + Seek + 'static, T: Read + Seek + 'static>(
         any_page_labels |= source.page_labels().has_page_labels()?;
     }
 
-    let mut label_entries = Vec::new();
+    let mut label_entries: Vec<RawPageLabelEntry> = Vec::new();
     if any_page_labels {
         label_entries.reserve(ordered_pages.len());
         for (output_index, &(source_index, group_index)) in ordered_pages.iter().enumerate() {
             let source_page_index = grouped_pages[source_index][group_index];
             let source = &mut sources[source_index];
+            let source_id = source.unique_id();
             let entries = source
                 .page_labels()
-                .labels_for_selection(&[source_page_index as i64], output_index as i64)?;
-            let prefix_present = source
-                .page_labels()
-                .label_prefix_is_present(source_page_index as i64)?;
-            // labels_for_selection always emits one entry for one selected
+                .labels_for_selection_raw(&[source_page_index as i64], output_index as i64)?;
+            // labels_for_selection_raw always emits one entry for one selected
             // page; keep the defensive branch for malformed number-tree
             // implementations without panicking.
-            if let Some(entry) = entries.into_iter().next() {
-                label_entries.push((entry.0, entry.1, prefix_present));
+            if let Some((index, label)) = entries.into_iter().next() {
+                label_entries.push(RawPageLabelEntry {
+                    index,
+                    source_id,
+                    label,
+                });
             }
         }
     }
@@ -878,10 +887,11 @@ fn handle_page_specs_into<R: Read + Seek + 'static, T: Read + Seek + 'static>(
     )?; // cov:ignore: public page selection supplies validated refs; the fallible continuation is covered by the direct helper error test
 
     if any_page_labels {
-        let folded = merge_job_label_ranges(label_entries);
+        let folded = merge_adjacent_raw_page_labels(label_entries)?;
+        let copied = copy_raw_page_label_entries(&mut merged, &folded)?;
         merged
             .page_labels()
-            .write_reconstructed_labels_with_prefix_presence(&folded)?;
+            .write_reconstructed_labels_raw(&copied)?;
     }
 
     for source in sources.iter() {

@@ -51,7 +51,9 @@
 //! placeholder, matching qpdf's page-selection behavior without interpreting
 //! the carrier's semantics.
 
-use crate::page_label_document_helper::merge_adjacent_ranges;
+use crate::page_label_document_helper::{
+    copy_raw_page_label_entries, merge_adjacent_raw_page_labels, RawPageLabelEntry,
+};
 use crate::pages::page_refs;
 use crate::pdf::WriterObjectOrderKey;
 use crate::{Error, ObjectHandle, ObjectRef, PageDocumentHelper, Pdf, Result};
@@ -200,12 +202,24 @@ pub fn extract_pages<R: Read + Seek>(
     // source with no `/PageLabels` at all leaves the fresh target untouched
     // (it never gains one), matching qpdf's `emptyPDF()`-based output.
     {
+        let source_id = source.unique_id();
         let mut source_labels = source.page_labels();
         if source_labels.has_page_labels()? {
             let src_indices: Vec<i64> = page_indices.iter().map(|&i| i as i64).collect();
-            let entries = source_labels.labels_for_selection(&src_indices, 0)?;
-            let folded = merge_adjacent_ranges(entries);
-            target.page_labels().write_reconstructed_labels(&folded)?;
+            let entries = source_labels
+                .labels_for_selection_raw(&src_indices, 0)?
+                .into_iter()
+                .map(|(index, label)| RawPageLabelEntry {
+                    index,
+                    source_id,
+                    label,
+                })
+                .collect();
+            let folded = merge_adjacent_raw_page_labels(entries)?;
+            let copied = copy_raw_page_label_entries(&mut target, &folded)?;
+            target
+                .page_labels()
+                .write_reconstructed_labels_raw(&copied)?;
         }
     }
 

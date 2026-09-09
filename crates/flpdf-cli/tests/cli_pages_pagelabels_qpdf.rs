@@ -13,6 +13,7 @@
 
 use assert_cmd::Command;
 use flpdf::Pdf;
+use std::collections::BTreeMap;
 use std::path::Path;
 use std::process::Command as Shell;
 
@@ -98,6 +99,43 @@ fn prefixed_two_page_pdf() -> Vec<u8> {
     out.extend_from_slice(
         format!("trailer\n<< /Size {size} /Root 1 0 R >>\nstartxref\n{xref_start}\n%%EOF\n")
             .as_bytes(),
+    );
+    out
+}
+
+fn non_string_prefix_two_page_pdf(prefix: &str) -> Vec<u8> {
+    let objects: &[(u32, String)] = &[
+        (
+            1,
+            format!("<< /Type /Catalog /Pages 2 0 R /PageLabels << /Nums [0 5 0 R] >> >>"),
+        ),
+        (
+            2,
+            "<< /Type /Pages /Kids [3 0 R 4 0 R] /Count 2 >>".to_owned(),
+        ),
+        (
+            3,
+            "<< /Type /Page /Parent 2 0 R /MediaBox [0 0 612 792] >>".to_owned(),
+        ),
+        (
+            4,
+            "<< /Type /Page /Parent 2 0 R /MediaBox [0 0 612 792] >>".to_owned(),
+        ),
+        (5, format!("<< /S /D /P {prefix} /St 1 >>")),
+    ];
+    let mut out = b"%PDF-1.7\n".to_vec();
+    let mut offsets = BTreeMap::new();
+    for (number, body) in objects {
+        offsets.insert(*number, out.len() as u64);
+        out.extend_from_slice(format!("{number} 0 obj\n{body}\nendobj\n").as_bytes());
+    }
+    let xref_start = out.len() as u64;
+    out.extend_from_slice(b"xref\n0 6\n0000000000 65535 f \n");
+    for number in 1..=5 {
+        out.extend_from_slice(format!("{:010} 00000 n \n", offsets[&number]).as_bytes());
+    }
+    out.extend_from_slice(
+        format!("trailer\n<< /Size 6 /Root 1 0 R >>\nstartxref\n{xref_start}\n%%EOF\n").as_bytes(),
     );
     out
 }
@@ -265,6 +303,54 @@ fn cli_pages_preserves_explicit_empty_nonempty_and_absent_prefix() {
         flpdf_json, qpdf_json,
         "single-document --pages must preserve a non-empty /P"
     );
+}
+
+#[test]
+fn cli_pages_preserves_non_string_prefix_values_like_qpdf() {
+    if !qpdf_available() {
+        eprintln!(
+            "[SKIP cli_pages_pagelabels_qpdf] {} 11.9.0 not on PATH — set QPDF env or install to run",
+            QPDF
+        );
+        return;
+    }
+
+    let tmp = tempfile::tempdir().expect("tempdir");
+    for (name, prefix) in [("integer", "42"), ("name", "/Foo"), ("array", "[1 2]")] {
+        let source = tmp.path().join(format!("{name}.pdf"));
+        std::fs::write(&source, non_string_prefix_two_page_pdf(prefix)).unwrap();
+        let qpdf_output = tmp.path().join(format!("qpdf-{name}.pdf"));
+        let qpdf_status = Shell::new(QPDF)
+            .args([
+                "--qdf",
+                "--static-id",
+                source.to_str().unwrap(),
+                "--pages",
+                ".",
+                "1-2",
+                "--",
+                qpdf_output.to_str().unwrap(),
+            ])
+            .status()
+            .expect("qpdf should spawn");
+        assert!(qpdf_status.success(), "qpdf --pages failed for {name}");
+
+        let flpdf_output = tmp.path().join(format!("flpdf-{name}.pdf"));
+        Command::cargo_bin("flpdf")
+            .unwrap()
+            .args(["--qdf", "--static-id"])
+            .arg(&source)
+            .args(["--pages", ".", "1-2", "--"])
+            .arg(&flpdf_output)
+            .assert()
+            .success();
+
+        assert_eq!(
+            std::fs::read(&flpdf_output).unwrap(),
+            std::fs::read(&qpdf_output).unwrap(),
+            "qpdf/flpdf --pages output differs for non-string /P={prefix}"
+        );
+    }
 }
 
 #[test]
