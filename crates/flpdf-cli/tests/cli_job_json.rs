@@ -272,6 +272,39 @@ fn job_json_file_show_object_stream_modes_match_qpdf() {
 }
 
 #[test]
+fn job_json_file_show_object_normalization_matches_qpdf() {
+    if !qpdf_available() {
+        return;
+    }
+    let directory = tempfile::tempdir().unwrap();
+    let fixture = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+        .join("../../tests/fixtures/compat/null-length-framing-matrix.pdf");
+    fs::copy(&fixture, directory.path().join("input.pdf")).unwrap();
+    fs::write(
+        directory.path().join("job.json"),
+        br#"{"inputFile":"input.pdf","showObject":"6","filteredStreamData":"","normalizeContent":"y"}"#,
+    )
+    .unwrap();
+
+    let qpdf = ProcessCommand::new("/usr/bin/qpdf")
+        .current_dir(directory.path())
+        .arg("--job-json-file=job.json")
+        .output()
+        .unwrap();
+    let flpdf = Command::cargo_bin("flpdf")
+        .unwrap()
+        .current_dir(directory.path())
+        .env("FLPDF_PROGNAME", "qpdf")
+        .arg("--job-json-file=job.json")
+        .output()
+        .unwrap();
+
+    assert_eq!(flpdf.status.code(), qpdf.status.code());
+    assert_eq!(flpdf.stdout, qpdf.stdout);
+    assert_eq!(flpdf.stderr, qpdf.stderr);
+}
+
+#[test]
 fn job_json_file_list_attachments_matches_qpdf_without_output_file() {
     if !qpdf_available() {
         return;
