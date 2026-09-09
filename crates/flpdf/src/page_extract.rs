@@ -153,6 +153,10 @@ pub fn extract_pages<R: Read + Seek>(
             .ok_or(Error::Missing("extracted page missing from copy map"))?;
         page_map.insert(source_page_ref, copied_page_ref);
     }
+    let mut writer_object_order = BTreeMap::new();
+    for (source_ref, target_ref) in target.foreign_object_map_snapshot(source.unique_id()) {
+        writer_object_order.insert(target_ref, WriterObjectOrderKey::primary(source_ref));
+    }
 
     // qpdf::insertPage replaces the copied page's `/Parent` through the live
     // destination handle, before it inserts that page into `/Kids`.
@@ -178,9 +182,11 @@ pub fn extract_pages<R: Read + Seek>(
         } else {
             let page = target.get_object_handle(copied_page_ref);
             let clone = target.make_indirect_object_handle(page.shallow_copy()?)?;
-            clone.object_ref().ok_or(Error::Missing(
+            let clone_ref = clone.object_ref().ok_or(Error::Missing(
                 "duplicate extracted page missing from target",
-            ))?
+            ))?;
+            writer_object_order.insert(clone_ref, WriterObjectOrderKey::foreign(clone_ref));
+            clone_ref
         };
         kids.push(kid);
     }
@@ -195,6 +201,7 @@ pub fn extract_pages<R: Read + Seek>(
         ),
     )?; // cov:ignore: Pdf::empty creates a dictionary /Pages root, so this defensive replace_key error is unreachable
     root.replace_key(b"/Count", ObjectHandle::integer(kids.len() as i64))?;
+    target.set_writer_object_order(writer_object_order);
 
     // /PageLabels (qpdf `addPage`-based reconstruction parity — the same
     // per-page accumulation `QPDFJob::handlePageSpecs` performs while adding
@@ -212,6 +219,7 @@ pub fn extract_pages<R: Read + Seek>(
                 .map(|(index, label)| RawPageLabelEntry {
                     index,
                     source_id,
+                    source_is_primary: true,
                     label,
                 })
                 .collect();

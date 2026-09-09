@@ -1121,6 +1121,7 @@ pub(crate) fn merge_documents_with_resource_decisions_and_preserve_primary_into<
                     .map(|(index, label)| RawPageLabelEntry {
                         index,
                         source_id,
+                        source_is_primary: is_primary,
                         label,
                     }),
             );
@@ -1434,6 +1435,7 @@ pub(crate) fn merge_documents_with_resource_decisions_and_preserve_primary_into<
     // `getLabelsForPageRange` redundancy check). A no-op when no input ever
     // carried real page labels — the target then keeps its fresh, label-less
     // catalog, matching qpdf's `emptyPDF()`-based output.
+    target.set_writer_object_order(writer_object_order);
     if any_page_labels {
         let folded = merge_adjacent_raw_page_labels(label_entries)?;
         let copied = copy_raw_page_label_entries(&mut target, &folded)?;
@@ -1441,8 +1443,6 @@ pub(crate) fn merge_documents_with_resource_decisions_and_preserve_primary_into<
             .page_labels()
             .write_reconstructed_labels_raw(&copied)?;
     }
-
-    target.set_writer_object_order(writer_object_order);
 
     Ok(target)
 }

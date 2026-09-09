@@ -70,6 +70,10 @@ pub struct LabelRange {
 pub(crate) struct RawPageLabelEntry {
     pub(crate) index: i64,
     pub(crate) source_id: u64,
+    /// True when qpdf keeps the source QPDF as the page-selection owner.
+    /// Foreign source labels remain raw so the destination writer can report
+    /// qpdf's ownership error instead of silently copying them.
+    pub(crate) source_is_primary: bool,
     pub(crate) label: ObjectHandle,
 }
 
@@ -278,10 +282,17 @@ pub(crate) fn copy_raw_page_label_entries<R: Read + Seek>(
     ranges
         .iter()
         .map(|range| {
-            Ok((
-                range.index,
-                target.copy_foreign_value(range.source_id, &range.label)?,
-            ))
+            let label = if range.source_is_primary {
+                let copied = target.copy_foreign_value(range.source_id, &range.label)?;
+                target.record_primary_writer_object_refs(range.source_id);
+                copied
+            } else {
+                // qpdf builds a new direct label dictionary: direct scalar
+                // values are independent, while indirect /S or /P handles
+                // remain foreign and are rejected by the destination writer.
+                range.label.shallow_copy()?
+            };
+            Ok((range.index, label))
         })
         .collect()
 }
@@ -1468,11 +1479,13 @@ mod tests {
             RawPageLabelEntry {
                 index: 0,
                 source_id: 1,
+                source_is_primary: true,
                 label: label(ObjectHandle::integer(42), 1),
             },
             RawPageLabelEntry {
                 index: 1,
                 source_id: 1,
+                source_is_primary: true,
                 label: label(ObjectHandle::integer(42), 2),
             },
         ];

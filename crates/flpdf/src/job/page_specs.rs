@@ -800,6 +800,7 @@ fn handle_page_specs_into<R: Read + Seek + 'static, T: Read + Seek + 'static>(
                 label_entries.push(RawPageLabelEntry {
                     index,
                     source_id,
+                    source_is_primary: source_index == 0,
                     label,
                 });
             }

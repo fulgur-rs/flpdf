@@ -316,6 +316,7 @@ impl QPDFJob {
                         Ok(RawPageLabelEntry {
                             index: output_index,
                             source_id,
+                            source_is_primary: false,
                             label,
                         })
                     })
