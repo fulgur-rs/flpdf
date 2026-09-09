@@ -16,15 +16,21 @@ permissions:
 # concurrency allowance, which starves the survivors into a long queue.
 #
 # cancel-in-progress covers pushes to main as well, not just pull_request.
-# A group's newest run is never the one cancelled, so the tip of main is
-# always tested and a breakage is still detected; what back-to-back merges
-# give up is only the per-commit attribution of which merge broke it.  No
-# gate consumes main's CI conclusion (there are no workflow_run triggers,
-# main is unprotected, and release-plz keys off `push: main` / `tags: v*` in
-# its own workflow, which `github.workflow` keeps out of this group).
+# For a push, the newest run in a group is the one holding the newest commit,
+# so the tip stays tested and a breakage is still detected; what back-to-back
+# merges give up is only the per-commit attribution of which merge broke it.
+# No gate consumes main's CI conclusion (there are no workflow_run triggers,
+# the `main` ruleset requires only `release-pr-approval`, and release-plz
+# carries its own job-level groups with cancel-in-progress disabled).
+#
+# A re-run is the exception: it keeps the original run's ref and SHA
+# (https://docs.github.com/en/actions/how-tos/manage-workflow-runs/re-run-workflows-and-jobs),
+# so re-running an older run would join this group and cancel whatever is
+# testing the tip, leaving the tip untested while a stale SHA reports.  Only
+# a first attempt cancels, which is exactly the force-push case this is for.
 concurrency:
   group: ${{ github.workflow }}-${{ github.event.pull_request.number || github.ref }}
-  cancel-in-progress: true
+  cancel-in-progress: ${{ github.run_attempt == 1 }}
 
 env:
   CARGO_TERM_COLOR: always
