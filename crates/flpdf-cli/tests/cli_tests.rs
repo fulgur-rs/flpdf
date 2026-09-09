@@ -9711,6 +9711,45 @@ fn rewrite_generate_appearances_adds_ap_n() {
     );
 }
 
+/// A newly created appearance stream must use qpdf's whole-dictionary
+/// replacement boundary, which drops the provisional `/Length` installed by
+/// `newStream(data)` before inspection.
+#[test]
+fn generate_appearances_new_stream_dictionary_matches_qpdf() {
+    if !qpdf_available() {
+        if std::env::var_os("CI").is_some() {
+            panic!("{EXPECTED_QPDF_VERSION} is required for this parity test on CI");
+        }
+        eprintln!("skipping: {EXPECTED_QPDF_VERSION} is not available");
+        return;
+    }
+
+    let temp = tempfile::tempdir().unwrap();
+    let input = temp.path().join("form.pdf");
+    std::fs::write(&input, tx_form_pdf_without_ap()).unwrap();
+    let input = input.to_str().unwrap();
+    let args = ["--generate-appearances", "--show-object=6", input];
+
+    let qpdf = ProcessCommand::new("qpdf")
+        .args(args)
+        .output()
+        .expect("qpdf should spawn");
+    let flpdf = Command::cargo_bin("flpdf")
+        .unwrap()
+        .args(args)
+        .output()
+        .unwrap();
+
+    assert_eq!(qpdf.status.code(), Some(0));
+    assert_eq!(flpdf.status.code(), qpdf.status.code());
+    assert_eq!(flpdf.stdout, qpdf.stdout);
+    assert_eq!(flpdf.stderr, qpdf.stderr);
+    assert!(!qpdf
+        .stdout
+        .windows(b"/Length".len())
+        .any(|window| window == b"/Length"));
+}
+
 /// `--flatten-annotations=all` bakes a widget that already has an `/AP` `/N`
 /// into page content and drops it from `/Annots`.
 #[test]

@@ -6,6 +6,9 @@
 //! part of the production path: qpdf's
 //! `QPDFFormFieldObjectHelper::generateAppearance` dispatches only `/Tx` and
 //! `/Ch` (`QPDFFormFieldObjectHelper.cc:472-478`).
+//! New streams install an independently built dictionary through
+//! `ObjectHandle::replace_stream_dict`, mirroring qpdf's `replaceDict`
+//! (`QPDFFormFieldObjectHelper.cc:773-778`, `QPDF_Stream.cc:688-692`).
 //!
 //! The production route follows qpdf's limited generator rather than adding a
 //! font-metrics layout engine: quadding is ignored, and text is encoded as
@@ -396,18 +399,12 @@ fn install_normal_appearance_canonical_handles<R: Read + Seek>(
 
     let ap = resolve_canonical(pdf, widget.get_key(b"/AP"))?;
     let stream = pdf.new_stream_with_data(Rc::new(content))?;
-    let stream_dict = stream
-        .as_stream_dict()
-        .ok_or_else(|| Error::Unsupported("new appearance stream has no dictionary".to_string()))?;
-    stream_dict.replace_key(b"/Type", ObjectHandle::name(b"XObject".to_vec()))?;
-    stream_dict.replace_key(b"/Subtype", ObjectHandle::name(b"Form".to_vec()))?;
     let bbox = ObjectHandle::array(vec![
         ObjectHandle::real(0.0),
         ObjectHandle::real(0.0),
         ObjectHandle::real(qpdf_real_value(bbox_w)),
         ObjectHandle::real(qpdf_real_value(bbox_h)),
     ]);
-    stream_dict.replace_key(b"/BBox", bbox)?;
 
     let resources = ObjectHandle::dictionary(vec![(
         b"/ProcSet".to_vec(),
@@ -422,7 +419,13 @@ fn install_normal_appearance_canonical_handles<R: Read + Seek>(
             ObjectHandle::dictionary(vec![(resource_key(&font.resource_name), font.font)]),
         )?; // cov:ignore: llvm-cov maps the successful resource insertion continuation to a zero-count region
     }
-    stream_dict.replace_key(b"/Resources", resources)?;
+    let stream_dict = ObjectHandle::dictionary(vec![
+        (b"/BBox".to_vec(), bbox),
+        (b"/Resources".to_vec(), resources),
+        (b"/Subtype".to_vec(), ObjectHandle::name(b"Form".to_vec())),
+        (b"/Type".to_vec(), ObjectHandle::name(b"XObject".to_vec())),
+    ]);
+    stream.replace_stream_dict(stream_dict)?;
 
     let ap = if ap.is_null() {
         let ap = ObjectHandle::dictionary(Vec::new());

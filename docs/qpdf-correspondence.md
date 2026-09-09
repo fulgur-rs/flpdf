@@ -916,6 +916,8 @@ destination 解決や既存の synthetic `Pdf::set_object` bridge の挙動を
 | `QPDFAcroFormDocumentHelper.cc` anonymous `ResourceReplacer` | — | `resource_replacer.rs`（`ResourceFinder` の name offsets を exact-byte 置換）。production consumer は `acroform_document_helper.rs` の `/DA` と `overlay_appearance_stream.rs` の AP streams | ✅ |
 | `QPDFDocumentHelper.cc` / `QPDFObjectHelper.cc` | 12 | 基底トレイトが無い | ⚪ |
 
+新規 Tx/Ch appearance の Form XObject は、qpdf と同じく payload を先に持つ streamへ独立した辞書を構築し、`replaceDict` で丸ごと差し替える。qpdf の `QPDFFormFieldObjectHelper.cc:773-778` と `QPDF_Stream.cc:688-692` に対応し、flpdf は `form_field_object_helper/rendering.rs` から `ObjectHandle::replace_stream_dict`（`object_handle.rs:5918-5950`）を呼ぶ。これにより `newStream(data)` が一時的に設定した `/Length` は生成辞書に持ち越されない。`crates/flpdf-cli/tests/cli_tests.rs::generate_appearances_new_stream_dictionary_matches_qpdf` が pinned qpdf 11.9.0 の `--generate-appearances --show-object` stdout/stderr/status を直接比較する。
+
 `qpdf/test_driver.cc:2073-2137` の `test_56`–`test_59` と `:2303-2364` の
 `test_64`–`test_67` は、`PageObjectHelper::get_form_xobject_for_page`、
 `Pdf::copy_foreign_object`、`PageObjectHelper::get_resources`/
