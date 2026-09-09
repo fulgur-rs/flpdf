@@ -32,6 +32,7 @@ use crate::parser::{
     parse_qpdf_direct_object_handle_with_diagnostics,
     parse_qpdf_file_object_handle_with_diagnostics, HandleResolver, ParserDiagnostic,
 };
+use crate::qpdf_obj_gen::QpdfObjGen;
 use crate::reader::file_object::{
     finish_file_object_handle, parse_file_object_handle_syntax, parse_file_object_header,
     FileObjectDiagnostic, FileObjectDiagnosticKind, HandleFileObjectRead, RecoveryPolicy,
@@ -295,16 +296,23 @@ pub enum XrefForm {
 #[derive(Debug, Clone, Copy)]
 enum ParsedXrefEntry {
     Live {
-        object_ref: ObjectRef,
+        object_ref: QpdfObjGen,
         entry: XrefEntry,
     },
     Free {
-        object_ref: ObjectRef,
+        object_ref: QpdfObjGen,
     },
 }
 
 #[derive(Debug, Default)]
 struct XrefRegistration {
+    /// qpdf's raw `m->xref_table`, retained through registration so an invalid
+    /// generation still participates in exact-key/free-row precedence before
+    /// the valid indirect-reference boundary is applied.
+    raw_entries: BTreeMap<QpdfObjGen, XrefEntry>,
+    /// Effective live rows after the qpdf raw identity has crossed the parsed
+    /// indirect-reference boundary. Existing resolver consumers intentionally
+    /// remain on this valid `ObjectRef` view.
     entries: BTreeMap<ObjectRef, XrefEntry>,
     /// A construction-only, object-number-wide free-row filter. A normal
     /// qpdf `read_xref` registration retains it through `/Size` validation,
@@ -321,19 +329,50 @@ impl XrefRegistration {
     /// qpdf `insertXrefEntry`: a deleted object number suppresses every later
     /// live registration, while an exact object-generation collision is
     /// first-wins because sections are read newest to oldest.
-    fn insert_xref_entry(&mut self, object_ref: ObjectRef, entry: XrefEntry) {
-        if self.deleted_objects.contains(&object_ref.number) {
+    fn insert_xref_entry<K>(&mut self, key: K, entry: XrefEntry)
+    where
+        K: Into<QpdfObjGen>,
+    {
+        let key = key.into();
+        let Some(object_number) = u32::try_from(key.get_obj()).ok() else {
+            return;
+        };
+        if self.deleted_objects.contains(&object_number) {
             return;
         }
-        self.entries.entry(object_ref).or_insert(entry);
+        if self.raw_entries.insert(key, entry).is_some() {
+            return;
+        }
+        if let Some(object_ref) = key.to_object_ref() {
+            self.entries.entry(object_ref).or_insert(entry);
+        }
     }
 
     /// qpdf `insertFreeXrefEntry`: free rows are represented only by the
     /// object-number tombstone, and a matching exact live generation wins.
-    fn insert_free_xref_entry(&mut self, object_ref: ObjectRef) {
-        if !self.entries.contains_key(&object_ref) {
-            self.deleted_objects.insert(object_ref.number);
+    fn insert_free_xref_entry<K>(&mut self, key: K)
+    where
+        K: Into<QpdfObjGen>,
+    {
+        let key = key.into();
+        let Some(object_number) = u32::try_from(key.get_obj()).ok() else {
+            return;
+        };
+        if !self.raw_entries.contains_key(&key) {
+            self.deleted_objects.insert(object_number);
         }
+    }
+
+    fn contains_raw_key(&self, key: QpdfObjGen) -> bool {
+        self.raw_entries.contains_key(&key)
+    }
+
+    fn replace_effective_entries(&mut self, entries: BTreeMap<ObjectRef, XrefEntry>) {
+        self.raw_entries = entries
+            .iter()
+            .map(|(object_ref, entry)| (QpdfObjGen::from(*object_ref), *entry))
+            .collect();
+        self.entries = entries;
     }
 
     fn snapshot(&self) -> BTreeMap<ObjectRef, XrefEntry> {
@@ -1850,6 +1889,7 @@ pub(crate) fn load_xref_state_from_bytes(
             None,
             None,
             None,
+            None,
             options.clone(),
             initial_diagnostics,
             None,
@@ -1937,6 +1977,7 @@ pub(crate) fn load_xref_state_from_bytes(
                 )?; // cov:ignore: this branch only propagates a canonical warning-sink failure from a failed nonzero-startxref parse; the sink boundary is covered by Pdf open failure tests
             }
             let preexisting_entries = (startxref != 0).then_some(&registration.entries);
+            let preexisting_raw_entries = (startxref != 0).then_some(&registration.raw_entries);
             let preexisting_bootstrap_cache = if startxref != 0 {
                 initial_bootstrap_cache.as_ref()
             } else {
@@ -1949,6 +1990,7 @@ pub(crate) fn load_xref_state_from_bytes(
                 trigger,
                 None,
                 preexisting_entries,
+                preexisting_raw_entries,
                 preexisting_bootstrap_cache,
                 options.clone(),
                 initial_diagnostics,
@@ -1980,6 +2022,7 @@ pub(crate) fn load_xref_state_from_bytes(
             trigger,
             Some(&loaded.loaded.trailer),
             Some(&registration.entries),
+            Some(&registration.raw_entries),
             loaded.bootstrap_cache.as_ref(),
             options.clone(),
             diagnostics,
@@ -1988,7 +2031,7 @@ pub(crate) fn load_xref_state_from_bytes(
         )?; // cov:ignore: a pending trigger always carries a parsed fallback trailer
         let deleted_objects = std::mem::take(&mut registration.deleted_objects);
         loaded = merge_recovered_qpdf_state(recovered, loaded, &deleted_objects);
-        registration.entries = loaded.loaded.entries.clone();
+        registration.replace_effective_entries(loaded.loaded.entries.clone());
         registration.deleted_objects.clear();
     }
 
@@ -2015,6 +2058,7 @@ pub(crate) fn load_xref_state_from_bytes(
                 trigger,
                 Some(&loaded.loaded.trailer),
                 Some(&registration.entries),
+                Some(&registration.raw_entries),
                 loaded.bootstrap_cache.as_ref(),
                 options.clone(),
                 previous_parse_diagnostics,
@@ -2088,6 +2132,7 @@ pub(crate) fn load_xref_state_from_bytes(
             error,
             Some(&loaded.loaded.trailer),
             None, // cov:ignore: an existing fallback trailer suppresses candidate re-entry, so no prior candidate state is consumed here
+            None, // cov:ignore: no prior raw registration is consumed here
             loaded.bootstrap_cache.as_ref(), // cov:ignore: the post-chain /Size trigger is superseded by the canonical classic-trailer validation handoff before this defensive path
             options.clone(),
             diagnostics,
@@ -3061,6 +3106,7 @@ fn recover_xref_from_linear_scan(
     trigger_error: Error,
     fallback_trailer: Option<&ObjectHandle>,
     preexisting_entries: Option<&BTreeMap<ObjectRef, XrefEntry>>,
+    preexisting_raw_entries: Option<&BTreeMap<QpdfObjGen, XrefEntry>>,
     preexisting_bootstrap_cache: Option<&SharedBootstrapCache>,
     options: XrefLoadOptions,
     mut repair_diagnostics: Diagnostics,
@@ -3149,6 +3195,7 @@ fn recover_xref_from_linear_scan(
                     &mut parsed_xref_streams,
                     &mut repair_diagnostics,
                     &mut extra_trailer_references,
+                    preexisting_raw_entries,
                     preexisting_bootstrap_cache,
                     canonical_trailer_owner,
                 ) {
@@ -3395,6 +3442,7 @@ fn recover_trailer_from_xref_stream_candidate(
     parsed_xref_streams: &mut BTreeMap<ObjectRef, ObjectHandle>,
     repair_diagnostics: &mut Diagnostics,
     trailer_references: &mut BTreeSet<ObjectRef>,
+    preexisting_raw_entries: Option<&BTreeMap<QpdfObjGen, XrefEntry>>,
     preexisting_bootstrap_cache: Option<&SharedBootstrapCache>,
     canonical_trailer_owner: Option<&dyn CanonicalTrailerOwner>,
 ) -> Result<RecoveredXrefStream> {
@@ -3460,10 +3508,11 @@ fn recover_trailer_from_xref_stream_candidate(
     // qpdf re-enters `read_xref` against the xref table produced by the
     // reconstruction scan. Seed registration with that table so an entry
     // already present there is skipped before its type is validated.
-    let mut reentry_registration = XrefRegistration {
-        entries: entries.clone(),
-        ..XrefRegistration::default()
-    };
+    let mut reentry_registration = XrefRegistration::default();
+    reentry_registration.replace_effective_entries(entries.clone());
+    if let Some(raw_entries) = preexisting_raw_entries {
+        reentry_registration.raw_entries = raw_entries.clone();
+    }
     // A build failure inside `parse_xref_stream_with_canonical_owner` (e.g.
     // a malformed `/W`) writes its own diagnostic to a scratch buffer. The
     // canonical owner has already delivered any warning raised while reading
@@ -4280,20 +4329,23 @@ fn parse_xref_table(
             cursor.skip_ws();
             let offset = cursor.read_fixed_u64(10)?;
             cursor.skip_ws();
-            let generation = cursor.read_fixed_u16(5)?;
+            let generation = cursor.read_fixed_i32(5)?;
             cursor.skip_ws();
             let in_use = cursor.read_byte()?;
             cursor.skip_line();
+            let object_ref = QpdfObjGen::new(
+                i32::try_from(first + index)
+                    .map_err(|_| Error::parse(0, "object number does not fit i32"))?,
+                generation,
+            );
             match in_use {
                 b'f' => {
                     let _next = offset;
-                    entries.push(ParsedXrefEntry::Free {
-                        object_ref: ObjectRef::new(first + index, generation),
-                    });
+                    entries.push(ParsedXrefEntry::Free { object_ref });
                 }
                 b'n' => {
                     entries.push(ParsedXrefEntry::Live {
-                        object_ref: ObjectRef::new(first + index, generation),
+                        object_ref,
                         entry: XrefEntry::Uncompressed { offset },
                     });
                 }
@@ -4897,21 +4949,22 @@ fn parse_xref_entries(
             let field2 = if w2 == 0 { 0 } else { cursor.read_be_u64(w2)? };
 
             let object_number = (start + index) as u32;
-            let object_ref = match object_type {
-                0 | 2 => ObjectRef::new(object_number, 0),
-                _ => ObjectRef::new(
-                    object_number,
-                    u16::try_from(field2)
-                        .map_err(|_| Error::parse(0, "generation does not fit u16"))?,
-                ),
-            };
+            let object_ref = QpdfObjGen::new(
+                i32::try_from(object_number)
+                    .map_err(|_| Error::parse(0, "object number does not fit i32"))?,
+                match object_type {
+                    0 | 2 => 0,
+                    _ => i32::try_from(field2)
+                        .map_err(|_| Error::parse(0, "generation does not fit i32"))?,
+                },
+            );
             // qpdf's insertXrefEntry checks deleted object numbers and the
             // exact object-generation slot before it switches on the entry
             // type (`QPDF.cc:1158-1169`). This matters on a failed first
             // pass: try_emplace leaves a default type-0 slot behind, so the
             // reconstruction re-entry skips the same malformed entry.
             if registration.deleted_objects.contains(&object_number)
-                || registration.entries.contains_key(&object_ref)
+                || registration.contains_raw_key(object_ref)
             {
                 continue;
             }
@@ -4941,9 +4994,7 @@ fn parse_xref_entries(
                     // qpdf's `try_emplace` has already inserted its default
                     // type-0 entry before the unknown-type exception. Keep
                     // the same partial registration for reconstruction.
-                    registration
-                        .entries
-                        .insert(object_ref, XrefEntry::Free { next: 0 });
+                    registration.insert_xref_entry(object_ref, XrefEntry::Free { next: 0 });
                     // qpdf reports this through `damagedPDF("xref stream",
                     // ...)`, which uses the input's last read offset
                     // (`QPDF.cc:2625-2628`): `pipeStreamData` reads the whole
@@ -5123,10 +5174,10 @@ impl<'a> ByteCursor<'a> {
         Ok(value)
     }
 
-    fn read_fixed_u16(&mut self, width: usize) -> Result<u16> {
+    fn read_fixed_i32(&mut self, width: usize) -> Result<i32> {
         self.read_fixed(width)?
-            .parse::<u16>()
-            .map_err(|_| Error::parse(self.pos, "invalid fixed-width u16"))
+            .parse::<i32>()
+            .map_err(|_| Error::parse(self.pos, "invalid fixed-width i32"))
     }
 
     fn read_fixed(&mut self, width: usize) -> Result<&str> {
@@ -8115,6 +8166,7 @@ mod final_handle_tests {
             &mut repair_diagnostics,
             &mut trailer_references,
             None,
+            None,
             Some(resolver.as_ref()),
         )
         .expect("the canonical reconstruction candidate must be recoverable");
@@ -8148,6 +8200,7 @@ mod final_handle_tests {
             &mut parsed_xref_streams,
             &mut repair_diagnostics,
             &mut trailer_references,
+            None,
             None,
             None,
         )

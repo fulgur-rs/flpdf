@@ -42,13 +42,19 @@ impl QpdfObjGen {
     /// `0..65535` when it sees an indirect `N G R` reference. Raw xref rows are
     /// allowed to exist outside that boundary until this conversion point.
     pub(crate) fn to_object_ref(self) -> Option<ObjectRef> {
-        if self.object < 1 || !(0..65_535).contains(&self.generation) {
+        if !self.is_indirect() || self.get_obj() < 1 || !(0..65_535).contains(&self.get_gen()) {
             return None;
         }
         Some(ObjectRef::new(
             u32::try_from(self.object).ok()?,
             u16::try_from(self.generation).ok()?,
         ))
+    }
+}
+
+impl From<ObjectRef> for QpdfObjGen {
+    fn from(object_ref: ObjectRef) -> Self {
+        Self::new(object_ref.number as i32, object_ref.generation as i32)
     }
 }
 
