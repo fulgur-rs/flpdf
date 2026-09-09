@@ -327,8 +327,9 @@ impl ArgParser {
         // job sees either one.
         let mut selected_empty_input = false;
         let mut selected_replace_input = false;
-        // qpdf fails at the first offending token in argv order, so hold this
-        // error until the scan has seen whether an unknown option came first.
+        // qpdf fails at the first offending token in argv order. Hold this
+        // error so an unknown option earlier in argv still wins, and hand it
+        // to any later in-loop failure that would otherwise leapfrog it.
         let mut repeated_selector: Option<(usize, &'static str)> = None;
 
         while let Some(arg) = iter.next() {
@@ -392,14 +393,17 @@ impl ArgParser {
                     // blank-line + `For help:` usage block, not a bare
                     // `<prog>: <msg>` line. Route it through the shared
                     // `UsageError` boundary that `usage_exit` formats.
-                    return Err(flpdf::UsageError::new(format!(
-                        "--{option} must be given as --{option}={parameter_name}"
+                    return Err(flpdf::UsageError::new(repeated_selector.map_or_else(
+                        || format!("--{option} must be given as --{option}={parameter_name}"),
+                        |(_, message)| message.to_owned(),
                     ))
                     .into());
                 }
                 if let Some(message) =
                     invalid_required_choice_message(&option, canonical.as_bytes(), parameter_name)
                 {
+                    let message =
+                        repeated_selector.map_or(message, |(_, deferred)| deferred.to_owned());
                     return Err(flpdf::UsageError::new(message).into());
                 }
             }

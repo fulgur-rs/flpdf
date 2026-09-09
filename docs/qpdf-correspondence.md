@@ -1061,11 +1061,16 @@ cargo test -p flpdf-cli --test cli_json --quiet
 
 `flpdf-749p` では、qpdf の `addChoices` value callbacks（`auto_job_init.hh:100-104`）と
 `QPDFJob_config.cc:701-747,751-763` の setter が argv 順に状態を上書きする契約を、clap の
-self-override へ接続した。適用先は **choice 値の option に限る**（`--stream-data`、
+self-override へ接続した。適用先は **値がその occurrence の時点で検証済みになる
+option に限る** — clap の `value_enum` か、`arg_parser.rs` の
+`QPDF_REQUIRED_PARAMETER_OPTIONS` に `{...}` の choice として登録され
+`invalid_required_choice_message` が occurrence ごとに検証するもの（`--stream-data`、
 `--object-streams`、`--decode-level`、`--compress-streams`、`--normalize-content`、
 `--newline-before-endstream`、`--flatten-annotations`、`--keep-files-open`、
-`--password-mode`、`--password-file`、resource policy）。`--pages`/`--add-attachment`/
-`--copy-attachments-from` の segment accumulation は既存の `ArgParser` 境界に残す。
+`--password-mode`、`--password-file`、`--json-stream-data`、resource policy）。
+`--json-key` は qpdf 自身が repeatable と明記しているため対象外。
+`--pages`/`--add-attachment`/`--copy-attachments-from` の segment accumulation は
+既存の `ArgParser` 境界に残す。
 
 command 全体へ `args_override_self` を掛けない理由は 2 つある。第一に、値の検証を
 clap の後で行う option では、上書きされた occurrence の検証が丸ごと飛ぶ。qpdf は
@@ -1081,6 +1086,9 @@ parse 時点で検証を終えているため、この 2 つの問題がない�
 setter に届く（`QPDFJob_argv.cc:91-96`）ため、この判定は argv 層に置く必要がある
 （clap の self-override は job に届く前に重複を畳んでしまう）。`arg_parser.rs` の
 top-level token loop で 2 回目を検出し、qpdf と同じ文言・同じ exit code で返す。
+qpdf は argv 順で最初に問題のあるトークンで失敗するため、この診断は即座に返さず
+保留し、より前の unknown option があればそちらを優先し、より後ろの prescan 失敗
+（missing parameter・invalid choice）にはこちらを渡す。
 | `QPDFLogger.cc` | 255 | `logger.rs`（private stdout tracker、shared info/warn/error/save routes、standard stdout/stderr/discard、reset/following、save collision、custom sink ownership）+ `reader/resolver.rs` / `reader.rs`（文書 warning の append-then-route、suppression、live logger replacement）+ `flpdf-cli/src/main.rs`（下記 qpdf-equivalent consumers） | ✅ `QPDFLogger.cc:9-40,43-51,80-254`。`diagnostics.rs` は logger ではなく collection-only value store として維持する |
 
 `QPDFArgParser` の help-table 境界は、`flpdf-cli/src/arg_parser.rs` の raw/canonical 二重 argv と

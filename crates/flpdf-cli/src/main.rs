@@ -990,6 +990,7 @@ struct Cli {
         long = "json-stream-data",
         value_name = "MODE",
         require_equals = true,
+        overrides_with = "json_stream_data",
         help = "When used with --json, this option controls whether streams \
                 in json output should be omitted, written inline \
                 (base64-encoded), or written to a file. If \"file\" is \
@@ -1118,7 +1119,11 @@ struct Cli {
     /// `qpdf --compress-streams=y|n` compatibility flag.  Accepted but
     /// currently a no-op: flpdf does not re-encode stream contents on
     /// rewrite.  Provided so qtest commands parse cleanly.
-    #[arg(long = "compress-streams", require_equals = true)]
+    #[arg(
+        long = "compress-streams",
+        require_equals = true,
+        overrides_with = "compress_streams"
+    )]
     compress_streams: Option<String>,
     /// Re-encode streams that are already a lone `/FlateDecode` (qpdf
     /// `--recompress-flate`).
@@ -1266,6 +1271,7 @@ struct Cli {
         value_enum,
         value_name = "MODE",
         require_equals = true,
+        overrides_with = "flatten_annotations",
         conflicts_with_all = [
             "check", "show_object",
             "show_npages", "show_pages", "show_xref", "show_linearization",

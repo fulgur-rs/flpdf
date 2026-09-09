@@ -166,7 +166,7 @@ fn the_first_usage_failure_in_argv_order_is_reported() {
 
     let temp = tempfile::tempdir().expect("temporary directory");
     let output = temp.path().join("out.pdf");
-    let cases: [Vec<OsString>; 2] = [
+    let cases: [Vec<OsString>; 4] = [
         vec![
             OsString::from("--definitely-unknown"),
             OsString::from("--empty"),
@@ -177,6 +177,20 @@ fn the_first_usage_failure_in_argv_order_is_reported() {
             OsString::from("--empty"),
             OsString::from("--empty"),
             OsString::from("--definitely-unknown"),
+            output.as_os_str().to_owned(),
+        ],
+        // A later prescan failure must not leapfrog the earlier selector
+        // either: qpdf stops at the second `--empty` callback.
+        vec![
+            OsString::from("--empty"),
+            OsString::from("--empty"),
+            OsString::from("--compression-level"),
+            output.as_os_str().to_owned(),
+        ],
+        vec![
+            OsString::from("--empty"),
+            OsString::from("--empty"),
+            OsString::from("--stream-data=bogus"),
             output.as_os_str().to_owned(),
         ],
     ];
@@ -220,4 +234,56 @@ fn an_overridden_value_is_still_validated() {
     assert_eq!(qpdf.status.code(), Some(2), "qpdf rejects the first value");
     assert_eq!(flpdf.status.code(), qpdf.status.code());
     assert!(!output.exists(), "a rejected job must not write");
+}
+
+/// Every option whose value the argv layer validates at each occurrence can
+/// take the last setting, including the ones clap types as plain strings.
+#[test]
+fn choice_options_validated_per_occurrence_take_the_last_value() {
+    if !qpdf_available() {
+        if std::env::var_os("CI").is_some() {
+            panic!("qpdf 11.9.0 is required for this parity test on CI");
+        }
+        eprintln!("skipping: qpdf 11.9.0 is not available");
+        return;
+    }
+
+    let temp = tempfile::tempdir().expect("temporary directory");
+    for (first, second) in [
+        ("--compress-streams=y", "--compress-streams=n"),
+        ("--flatten-annotations=screen", "--flatten-annotations=all"),
+    ] {
+        let qpdf_output = temp.path().join(format!("qpdf-{first}-{second}.pdf"));
+        let flpdf_output = temp.path().join(format!("flpdf-{first}-{second}.pdf"));
+        let build = |output: &Path| {
+            let mut args = vec![OsString::from("--static-id")];
+            if !first.starts_with("--compress-streams") {
+                // Keep DEFLATE out of the comparison: the default backend is
+                // miniz_oxide, whose bytes may differ from qpdf's zlib. The
+                // `--compress-streams` case already ends uncompressed.
+                args.push(OsString::from("--stream-data=uncompress"));
+            }
+            args.extend([
+                OsString::from(first),
+                OsString::from(second),
+                fixture().into_os_string(),
+                output.as_os_str().to_owned(),
+            ]);
+            args
+        };
+
+        let qpdf = run_qpdf(&build(&qpdf_output));
+        let flpdf = run_flpdf(&build(&flpdf_output));
+        assert!(
+            qpdf.status.success(),
+            "qpdf failed: {}",
+            String::from_utf8_lossy(&qpdf.stderr)
+        );
+        assert_eq!(flpdf.status.code(), qpdf.status.code(), "{first} {second}");
+        assert_eq!(
+            fs::read(&flpdf_output).expect("flpdf output"),
+            fs::read(&qpdf_output).expect("qpdf output"),
+            "last value must win for {first} then {second}"
+        );
+    }
 }
