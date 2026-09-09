@@ -241,40 +241,33 @@ fn qpdf_exception_from_error(input: &Path, error: &Error) -> QpdfExc {
             0,
             message.as_bytes(),
         ),
-        Error::SystemBytes(message) => QpdfExc::new(
-            QpdfErrorCode::System,
-            path_description(input),
-            b"",
-            0,
-            message,
-        ),
-        Error::System(message) => QpdfExc::new(
-            QpdfErrorCode::System,
-            path_description(input),
-            b"",
-            0,
-            message.as_bytes(),
-        ),
+        // The remaining arms are the ones qpdf never raises as a `QPDFExc`.
+        // `trap_errors` rebuilds them from a caught `std::runtime_error` or
+        // `std::exception` as `QPDFExc(code, "", "", 0, e.what())`
+        // (`qpdf-c.cc:77-82`), so the location fields stay **empty** and the
+        // whole `what()` becomes the detail. `QPDFSystemError::what()` already
+        // carries the filename, so repeating it here would print the path
+        // twice and report a filename qpdf leaves blank.
+        Error::SystemBytes(message) => QpdfExc::new(QpdfErrorCode::System, b"", b"", 0, message),
+        Error::System(message) => {
+            QpdfExc::new(QpdfErrorCode::System, b"", b"", 0, message.as_bytes())
+        }
         // `Error::Internal` is qpdf's `std::logic_error` family, which the C
         // API's `catch (std::exception&)` arm reports as `qpdf_e_internal`
-        // rather than `qpdf_e_system` (`qpdf-c.cc:74-83`).
-        Error::Internal(message) => QpdfExc::new(
-            QpdfErrorCode::Internal,
-            path_description(input),
-            b"",
-            0,
-            message.as_bytes(),
-        ),
+        // rather than `qpdf_e_system` (`qpdf-c.cc:80-82`).
+        Error::Internal(message) => {
+            QpdfExc::new(QpdfErrorCode::Internal, b"", b"", 0, message.as_bytes())
+        }
         Error::Io(error) => QpdfExc::new(
             QpdfErrorCode::System,
-            path_description(input),
+            b"",
             b"",
             0,
             error.to_string().as_bytes(),
         ),
         other => QpdfExc::new(
             QpdfErrorCode::System,
-            path_description(input),
+            b"",
             b"",
             0,
             other.to_string().as_bytes(),

@@ -864,3 +864,38 @@ fn unsupported_encryption_filter_pdf() -> Vec<u8> {
     );
     bytes
 }
+
+/// qpdf's C API rebuilds a caught `std::runtime_error` as
+/// `QPDFExc(qpdf_e_system, "", "", 0, e.what())` (`qpdf-c.cc:77-79`), so the
+/// location fields stay empty and the whole `what()` — which already carries
+/// the filename for `QPDFSystemError` — becomes the detail. Reading a
+/// directory is the smallest input that reaches that arm after the file
+/// itself opens.
+#[cfg(unix)]
+#[test]
+fn qpdf_ctest_2_reports_a_trapped_system_error_without_location_fields() {
+    let directory = tempfile::tempdir().expect("temporary directory");
+    let input = directory.path().join("input-is-a-directory");
+    let output = directory.path().join("unused-output.pdf");
+    fs::create_dir(&input).expect("create directory input");
+    let input_name = input.to_str().expect("input path is UTF-8");
+
+    let result = Command::cargo_bin("qpdf-ctest")
+        .expect("qpdf-ctest binary")
+        .args(["2", input_name, "", output.to_str().unwrap()])
+        .output()
+        .expect("qpdf-ctest should spawn");
+
+    assert!(result.status.success());
+    let stdout = String::from_utf8_lossy(&result.stdout);
+    assert!(stdout.contains("code: 2"), "{stdout}");
+    assert!(stdout.contains("\n  file: \n"), "{stdout}");
+    assert!(stdout.contains("\n  pos: 0\n"), "{stdout}");
+    // The path appears once, in the detail, not again as the filename.
+    assert_eq!(
+        stdout.matches(input_name).count(),
+        2,
+        "path must appear only in the `error:` line and the detail: {stdout}"
+    );
+    assert!(stdout.ends_with("C test 2 done\n"), "{stdout}");
+}
