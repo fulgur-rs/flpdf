@@ -9,7 +9,7 @@ use crate::reader::resolver::{ResolverHandle, ResolverWarningOptions};
 use crate::reader::{PdfOpenOptions, ReopenableFile};
 use crate::xref::{load_xref_state_from_bytes, XrefLoadOptions};
 #[allow(unused_imports)]
-use crate::{Error, ObjectHandle, XrefForm};
+use crate::{Error, ObjectHandle, QpdfErrorCode, QpdfExc, XrefForm};
 use crate::{Pdf, Result};
 use std::cell::RefCell;
 use std::collections::BTreeMap;
@@ -61,6 +61,32 @@ fn qpdf_initial_read_error(description: &[u8], read_attempted: bool, error: Erro
     let mut message = description.to_vec();
     message.extend_from_slice(b": read 1024 bytes");
     Error::SystemBytes(message)
+}
+
+/// Convert a terminal canonical open parse failure into qpdf's public
+/// `QPDFExc` shape before attaching the warnings collected by `QPDF::warn`.
+/// qpdf keeps the source filename and the signed offset on the exception, so
+/// callers such as the qtest C-API adapter do not have to reconstruct them
+/// from a rendered Rust parse string.
+fn qpdf_open_parse_error(description: &[u8], error: Error) -> Error {
+    let Error::Parse { offset, message } = error else {
+        return error;
+    };
+    let object = match message.as_str() {
+        "trailer dictionary lacks /Size key"
+        | "/Size key in trailer dictionary is not an integer"
+        | "/Prev key in trailer dictionary is not an integer" => b"trailer".as_slice(),
+        "xref syntax invalid" => b"xref table".as_slice(),
+        message if message.starts_with("invalid xref entry") => b"xref table".as_slice(),
+        _ => b"".as_slice(),
+    };
+    Error::QpdfExc(QpdfExc::new(
+        QpdfErrorCode::DamagedPdf,
+        description,
+        object,
+        i64::try_from(offset).unwrap_or(i64::MAX),
+        message.into_bytes(),
+    ))
 }
 
 fn read_initial_source<R: Read + Seek>(reader: &mut R, description: &[u8]) -> Result<Vec<u8>> {
@@ -167,11 +193,17 @@ impl<R: Read + Seek> Pdf<R> {
     ///
     /// # Errors
     ///
-    /// - [`Error::Io`] / [`Error::Parse`] / [`Error::Missing`] when loading the
-    ///   cross-reference table and trailer fails (e.g. an unreadable stream, a
-    ///   malformed xref, or a cross-reference stream missing its `/Size` or `/W`
-    ///   entry). With `options.repair` set, the qpdf-style recovery pass runs
-    ///   first and only its residual failures surface.
+    /// - [`Error::QpdfExc`] when the cross-reference table or trailer is
+    ///   malformed. The exception carries qpdf's filename, object description,
+    ///   offset and message.
+    /// - [`Error::Io`] / [`Error::Missing`] for the remaining load failures
+    ///   (an unreadable stream, or a cross-reference stream missing its
+    ///   `/Size` or `/W` entry).
+    /// - [`Error::OpenFailure`] wrapping any of the above when diagnostics
+    ///   were collected before the failure, including with `repair` unset.
+    ///   Use [`Error::open_failure`] to reach both the terminal error and
+    ///   those diagnostics. With `options.repair` set, the qpdf-style recovery
+    ///   pass runs first and only its residual failures surface.
     /// - [`Error::Unsupported`] when a cross-reference stream uses an unsupported
     ///   entry type or `/W` field-width layout.
     /// - [`Error::Encrypted`] when the document carries an `/Encrypt` dictionary
@@ -240,7 +272,7 @@ impl<R: Read + Seek> Pdf<R> {
             warning_options.clone(),
             unique_id,
         );
-        let loaded_state = load_xref_state_from_bytes(
+        let loaded_state = match load_xref_state_from_bytes(
             &source_bytes,
             XrefLoadOptions {
                 allow_repair: options.repair,
@@ -248,7 +280,23 @@ impl<R: Read + Seek> Pdf<R> {
                 description: options.description.clone(),
             },
             Some(resolver.as_ref()),
-        )?;
+        ) {
+            Ok(state) => state,
+            Err(error @ Error::Parse { .. }) => {
+                let error = qpdf_open_parse_error(&options.description, error);
+                return Err(Error::with_open_diagnostics(
+                    error,
+                    resolver.repair_diagnostics(),
+                ));
+            }
+            Err(error @ Error::QpdfExc(_)) => {
+                return Err(Error::with_open_diagnostics(
+                    error,
+                    resolver.repair_diagnostics(),
+                ));
+            }
+            Err(error) => return Err(error),
+        };
         // The production xref loader was given this resolver as its canonical
         // owner, so xref-stream handles and all metadata they resolve are
         // already in the live cache. The owner-less loader keeps its
@@ -646,7 +694,7 @@ impl Pdf<Cursor<Vec<u8>>> {
 
 #[cfg(test)]
 mod tests {
-    use super::{Pdf, EMPTY_PDF_BYTES};
+    use super::{qpdf_open_parse_error, Pdf, EMPTY_PDF_BYTES};
     use crate::reader::resolver::{ResolverHandle, ResolverWarningOptions};
     use crate::xref::{load_xref_state_from_bytes, XrefLoadOptions};
     use crate::{Error, ObjectRef, PdfOpenOptions, QPDFLogger};
@@ -716,6 +764,44 @@ mod tests {
     }
 
     #[test]
+    fn qpdf_open_parse_error_leaves_non_parse_errors_untouched() {
+        let error = Error::Internal("already canonical".to_owned());
+
+        assert!(matches!(
+            qpdf_open_parse_error(b"input.pdf", error),
+            Error::Internal(message) if message == "already canonical"
+        ));
+    }
+
+    #[test]
+    fn strict_open_wraps_a_canonical_qpdf_exception() {
+        let mut bytes = b"%PDF-1.4\n1 0 obj\n<< /Type /Catalog >>\nendobj\n".to_vec();
+        let xref = bytes.len();
+        bytes.extend_from_slice(b"xref\n0 2\n0000000000 65535 f \n000000000x 00000 n \n");
+        bytes.extend_from_slice(
+            format!("trailer\n<< /Size 2 /Root 1 0 R >>\nstartxref\n{xref}\n%%EOF\n").as_bytes(),
+        );
+
+        let error = Pdf::open_with_options(
+            Cursor::new(bytes),
+            PdfOpenOptions {
+                repair: false,
+                description: b"bad5.pdf".to_vec(),
+                ..PdfOpenOptions::default()
+            },
+        )
+        .err()
+        .expect("strict open must reject a malformed classic xref entry");
+        assert!(matches!(
+            error,
+            Error::QpdfExc(exception)
+                if exception.get_filename() == b"bad5.pdf"
+                    && exception.get_object() == b"xref table"
+                    && exception.get_message_detail() == b"invalid xref entry (obj=1)"
+        ));
+    }
+
+    #[test]
     fn uninitialized_memory_processing_honors_strict_recovery_policy() {
         let mut pdf = Pdf::uninitialized();
         pdf.set_attempt_recovery(false);
@@ -726,7 +812,19 @@ mod tests {
             .expect_err("an empty strict input must fail at the qpdf parse boundary");
 
         assert!(!pdf.resolver.attempt_recovery());
-        assert!(matches!(error, Error::Parse { .. }));
+        let (source, diagnostics) = error
+            .open_failure()
+            .expect("strict qpdf parse must retain the header warning");
+        assert!(matches!(
+            source,
+            Error::QpdfExc(exception)
+                if exception.get_message_detail() == b"can't find startxref"
+        ));
+        assert_eq!(diagnostics.entries().len(), 1);
+        assert_eq!(
+            diagnostics.entries()[0].get_message_detail(),
+            b"can't find PDF header"
+        );
         assert!(pdf.suppress_warnings());
     }
 

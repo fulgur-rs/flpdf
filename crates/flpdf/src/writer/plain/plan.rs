@@ -1397,8 +1397,8 @@ mod tests {
     #[test]
     fn disable_xref_stream_source_does_not_apply_stream_version_repair() {
         let mut bytes = std::fs::read(fixture_path("three-page-objstm.pdf")).unwrap();
-        bytes[5] = b'x';
-        bytes[7] = b'y';
+        bytes[5] = b'9';
+        bytes[7] = b'9';
         let mut pdf = Pdf::open_mem_owned_with_options(
             bytes,
             crate::PdfOpenOptions {
@@ -1407,12 +1407,12 @@ mod tests {
             },
         )
         .unwrap();
-        assert_eq!(pdf.version(), "x.y");
+        assert_eq!(pdf.version(), "9.9");
 
         let plan =
             PlainWritePlan::build(&mut pdf, &write_options(ObjectStreamMode::Disable)).unwrap();
 
-        assert_eq!(plan.version, "x.y");
+        assert_eq!(plan.version, "9.9");
         assert_eq!(plan.trailer.form, XrefForm::Table);
         plan.validate().unwrap();
     }

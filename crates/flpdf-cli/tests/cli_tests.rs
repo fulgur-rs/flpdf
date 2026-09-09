@@ -511,7 +511,7 @@ fn suppress_recovery_matches_qpdf_on_a_recoverable_xref_error() {
         ])
         .assert()
         .code(2)
-        .stderr(predicate::str::contains("parse error"))
+        .stderr(predicate::str::contains("can't find startxref"))
         .stderr(predicate::str::contains("Attempting to reconstruct").not());
 }
 
@@ -549,7 +549,7 @@ fn suppress_recovery_applies_to_an_overlay_source() {
         ])
         .assert()
         .code(2)
-        .stderr(predicate::str::contains("parse error"))
+        .stderr(predicate::str::contains("xref not found"))
         .stderr(predicate::str::contains("Attempting to reconstruct").not());
 }
 
@@ -737,7 +737,7 @@ fn suppress_recovery_applies_to_a_copy_attachments_donor() {
         ])
         .assert()
         .code(2)
-        .stderr(predicate::str::contains("parse error"))
+        .stderr(predicate::str::contains("can't find startxref"))
         .stderr(predicate::str::contains("Attempting to reconstruct").not());
 }
 
@@ -765,7 +765,7 @@ fn suppress_recovery_applies_to_a_copy_encryption_donor() {
         ])
         .assert()
         .code(2)
-        .stderr(predicate::str::contains("parse error"))
+        .stderr(predicate::str::contains("can't find startxref"))
         .stderr(predicate::str::contains("Attempting to reconstruct").not());
 }
 
@@ -780,7 +780,7 @@ fn is_encrypted_applies_suppressed_recovery() {
         ])
         .assert()
         .code(2)
-        .stderr(predicate::str::contains("parse error"))
+        .stderr(predicate::str::contains("can't find startxref"))
         .stderr(predicate::str::contains("Attempting to reconstruct").not());
 }
 

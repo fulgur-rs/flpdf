@@ -222,8 +222,10 @@ impl std::error::Error for QpdfExc {}
 /// [`Error::SystemBytes`] is the byte-preserving counterpart for qpdf runtime
 /// messages whose source description may contain non-UTF-8 bytes.
 /// [`Error::OpenFailure`] preserves the terminal source error and accumulated
-/// repair diagnostics from a failed permissive open; callers can retrieve both
-/// through [`Error::open_failure`].
+/// repair diagnostics from a failed open; callers can retrieve both through
+/// [`Error::open_failure`]. A strict open wraps its failure the same way once
+/// any diagnostic has been collected, so the wrapper is not exclusive to
+/// permissive opens.
 #[derive(Debug, Error)]
 pub enum Error {
     #[error("I/O error: {0}")]

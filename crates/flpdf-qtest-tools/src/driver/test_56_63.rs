@@ -405,12 +405,16 @@ pub(crate) fn run_test_61(
 ) -> flpdf::Result<()> {
     let _ = (filename, arg2, stderr, diagnostics_written);
 
-    // qpdf test_driver.cc:2221-2225. The strict parse raises the Rust
-    // Error::Parse counterpart of QPDFExc before any warning is delivered.
+    // qpdf test_driver.cc:2221-2225. The strict parse raises the canonical
+    // structured QPDFExc, with any preceding header warning retained in the
+    // open-failure collection just as QPDF::warn does before throwing.
     pdf.set_attempt_recovery(false);
     pdf.set_suppress_warnings(true);
     match pdf.process_memory_file(b"empty", Vec::new()) {
-        Err(Error::Parse { .. }) => writeln!(stdout, "Caught QPDFExc as expected")?,
+        Err(Error::QpdfExc(_)) => writeln!(stdout, "Caught QPDFExc as expected")?,
+        Err(Error::OpenFailure { source, .. }) if matches!(source.as_ref(), Error::QpdfExc(_)) => {
+            writeln!(stdout, "Caught QPDFExc as expected")?
+        }
         Err(error) => return Err(error),
         Ok(()) => {
             return Err(Error::Internal(

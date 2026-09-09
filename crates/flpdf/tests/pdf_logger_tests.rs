@@ -520,6 +520,37 @@ fn terminal_open_failure_returns_warning_delivery_failure() {
 }
 
 #[test]
+fn strict_open_retains_qpdf_header_warning_before_startxref_error() {
+    let (logger, output) = recording_logger();
+    let error = match Pdf::open_with_options(
+        Cursor::new(b"oops\n".to_vec()),
+        PdfOpenOptions {
+            repair: false,
+            logger: Some(logger),
+            description: b"bad1.pdf".to_vec(),
+            ..PdfOpenOptions::default()
+        },
+    ) {
+        Ok(_) => panic!("a non-PDF input must fail after qpdf records its header warning"),
+        Err(error) => error,
+    };
+
+    assert_eq!(
+        output.lock().unwrap().as_slice(),
+        b"WARNING: bad1.pdf: can't find PDF header\n"
+    );
+    let (source, diagnostics) = error
+        .open_failure()
+        .expect("strict open must retain the warning collection");
+    assert_eq!(source.to_string(), "bad1.pdf: can't find startxref");
+    assert_eq!(diagnostics.entries().len(), 1);
+    assert_eq!(
+        diagnostics.entries()[0].what_bytes(),
+        b"bad1.pdf: can't find PDF header"
+    );
+}
+
+#[test]
 fn unknown_xref_entry_type_matches_qpdf_after_reconstruction() {
     let (logger, output) = recording_logger();
     let mut pdf = Pdf::open_with_options(

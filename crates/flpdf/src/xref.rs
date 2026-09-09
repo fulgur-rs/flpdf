@@ -1855,21 +1855,22 @@ pub(crate) fn load_xref_state_from_bytes(
     let allow_repair = options.allow_repair;
 
     let mut initial_diagnostics = Diagnostics::default();
-    let (version, header_offset) = if allow_repair {
-        match find_qpdf_header(source_bytes) {
-            Some((offset, version)) => (version, offset),
-            None => {
-                initial_diagnostics.push(damaged_warning(
-                    &options.description,
-                    b"",
-                    "can't find PDF header",
-                    None,
-                ));
-                ("1.2".to_string(), 0)
-            }
+    // qpdf's QPDF::parse always calls findHeader before it considers
+    // attempt_recovery (`QPDF.cc:429-438`). A missing or malformed header is a
+    // warning, not a strict-open terminal parse error; qpdf falls back to PDF
+    // 1.2 and continues to find/read startxref. Keep that warning in the same
+    // document collection for both repair modes.
+    let (version, header_offset) = match find_qpdf_header(source_bytes) {
+        Some((offset, version)) => (version, offset),
+        None => {
+            initial_diagnostics.push(damaged_warning(
+                &options.description,
+                b"",
+                "can't find PDF header",
+                None,
+            ));
+            ("1.2".to_string(), 0)
         }
-    } else {
-        (parse_header(source_bytes)?, 0)
     };
     if let Some(owner) = canonical_trailer_owner {
         owner.set_header_offset(header_offset);
@@ -1886,14 +1887,9 @@ pub(crate) fn load_xref_state_from_bytes(
     // below (a missing/malformed startxref) both leave `startxref == 0`
     // here. Below, the canonical-owner + repair-mode combination now skips
     // the retry entirely (matching qpdf exactly, see the comment there); the
-    // remaining deviation is the owner-less bootstrap path, which still runs
-    // a real retry attempt at logical (header-relative) offset 0 in `bytes`
-    // before recovery -- qpdf has no such detour, so a failure from that
-    // attempt (as opposed to the recorded "can't find startxref" trigger)
-    // has no qpdf counterpart. The same retry also still runs, unfixed, for
-    // a canonical owner outside repair mode (an explicit `startxref 0` with
-    // `allow_repair == false`), which is unverified against qpdf and out of
-    // scope here.
+    // remaining owner-less recovery path is entered only after this qpdf
+    // guard has classified the zero offset as the `can't find startxref`
+    // trigger; no route reads a speculative xref at logical offset zero.
     let startxref = match parse_startxref(bytes) {
         Ok(offset) => offset,
         Err(error) if allow_repair => {
@@ -1914,7 +1910,10 @@ pub(crate) fn load_xref_state_from_bytes(
         Err(_) => return Err(Error::parse(0, "startxref does not fit usize")), // cov:ignore: the same u64-to-usize overflow is unrepresentable on the supported target
     };
 
-    if allow_repair && startxref == 0 {
+    if startxref == 0 {
+        if !allow_repair {
+            return Err(Error::parse(0, "can't find startxref"));
+        }
         let trigger = parse_errors
             .into_iter()
             .next()
@@ -2363,13 +2362,71 @@ fn parse_xref_from_start_with_owner_and_build_diagnostics(
     canonical_trailer_owner: Option<&dyn CanonicalTrailerOwner>,
     hybrid_build_diagnostics_sink: Option<&mut Diagnostics>,
 ) -> Result<LoadedXrefState> {
-    if bytes
-        .get(xref_pos..)
-        .is_some_and(|tail| tail.starts_with(b"xref"))
+    let mut classic_xref_pos = xref_pos;
+    while bytes
+        .get(classic_xref_pos)
+        .is_some_and(|byte| is_pdf_space(*byte))
     {
-        let mut cursor = ByteCursor::new(bytes, xref_pos + 4);
-        let (entries, trailer_start, table_diagnostics, first_xref_item_offset) =
-            parse_xref_table(&mut cursor, bytes, first_xref_item_offset_sink)?;
+        classic_xref_pos += 1;
+    }
+    let is_classic_xref = bytes.get(classic_xref_pos..).is_some_and(|tail| {
+        tail.starts_with(b"xref") && tail.get(4).is_some_and(|byte| is_pdf_space(*byte))
+    });
+    if is_classic_xref {
+        // qpdf counts `skip` from the keyword it just read but adds it to the
+        // *original* offset: `read_xrefTable(xref_offset + skip)`
+        // (`QPDF.cc:670-676`). Any whitespace it skipped first is therefore
+        // counted twice, and the table read starts that many bytes early --
+        // inside the keyword -- which is why qpdf reports `xref syntax
+        // invalid` and reconstructs instead of reading such a file. Starting
+        // after the keyword would silently accept what qpdf rejects.
+        let mut skip = 4;
+        while bytes
+            .get(classic_xref_pos + skip)
+            .is_some_and(|byte| is_pdf_space(*byte))
+        {
+            skip += 1;
+        }
+        // qpdf warns before it reads the table (`QPDF.cc:663-665`), so the
+        // warning has to survive a table read that then fails -- which the
+        // offset above makes likely for exactly these files.
+        let whitespace_warning = (classic_xref_pos != xref_pos).then(|| {
+            damaged_warning(
+                &options.description,
+                b"",
+                "extraneous whitespace seen before xref",
+                None,
+            )
+        });
+        let mut cursor = ByteCursor::new(bytes, xref_pos + skip);
+        let table = parse_xref_table(
+            &mut cursor,
+            bytes,
+            first_xref_item_offset_sink,
+            &options.description,
+        );
+        let (entries, trailer_start, mut table_diagnostics, first_xref_item_offset) = match table {
+            Ok(table) => table,
+            Err(error) => {
+                if let (Some(warning), Some(sink)) = (
+                    whitespace_warning.clone(),
+                    error_diagnostics_sink.as_deref_mut(),
+                ) {
+                    sink.push(warning);
+                }
+                // The canonical owner keeps its diagnostics through
+                // `push_warning`, not through the caller's sink.
+                if let Some(warning) = whitespace_warning {
+                    let mut pending = Diagnostics::default();
+                    pending.push(warning);
+                    deliver_canonical_diagnostics(canonical_trailer_owner, &mut pending)?;
+                }
+                return Err(error);
+            }
+        };
+        if let Some(warning) = whitespace_warning {
+            table_diagnostics.insert(0, warning);
+        }
         let mut deferred_free = Vec::new();
         for entry in entries {
             match entry {
@@ -2412,11 +2469,30 @@ fn parse_xref_from_start_with_owner_and_build_diagnostics(
                 &mut trailer_parser,
             )?
         };
-        if !trailer.try_is_dictionary()? {
-            return Err(Error::parse(trailer_start, "trailer is not a dictionary"));
-        }
         let mut trailer_diags = table_diagnostics;
         trailer_diags.extend(trailer_parser_diagnostics);
+        if !trailer.try_is_dictionary()? {
+            // qpdf delivers parser warnings even when readTrailer returns a
+            // non-dictionary, then throws the terminal exception
+            // (`QPDF.cc:565-568,894-905`). Do not let this early return skip
+            // the warning batch.
+            if let Some(owner) = canonical_trailer_owner {
+                for diagnostic in &trailer_diags {
+                    owner.push_warning(diagnostic.clone())?;
+                }
+            } else if let Some(sink) = error_diagnostics_sink.as_deref_mut() {
+                for diagnostic in &trailer_diags {
+                    sink.push(diagnostic.clone());
+                }
+            }
+            return Err(Error::QpdfExc(QpdfExc::new(
+                QpdfErrorCode::DamagedPdf,
+                &options.description,
+                b"",
+                i64::try_from(trailer_start).unwrap_or(i64::MAX),
+                b"expected trailer dictionary",
+            )));
+        }
         let mut bootstrap_diagnostics = Diagnostics::default();
         if let Some(context) = trailer_context.as_mut() {
             context.append_diagnostics_to(&mut bootstrap_diagnostics);
@@ -4372,34 +4448,70 @@ fn parse_xref_table(
     cursor: &mut ByteCursor<'_>,
     bytes: &[u8],
     mut first_xref_item_offset_sink: Option<&mut Option<u64>>,
+    filename: &[u8],
 ) -> Result<(Vec<ParsedXrefEntry>, usize, Vec<QpdfExc>, u64)> {
     let mut entries = Vec::new();
     let mut first_xref_item_offset = 0;
+    let mut table_diagnostics = Vec::new();
     loop {
-        let first_token = cursor.read_token()?;
-        if first_token.is_word_value(b"trailer") {
+        cursor.skip_ws();
+        let section_start = cursor.pos;
+        if cursor.peek_word(b"trailer") {
+            let _ = cursor.read_token()?;
             break;
         }
-
-        let first = parse_xref_subsection_u32(&first_token)?;
-        let count = cursor.read_u32()?;
+        let header = cursor.read_line(50);
+        let (first, count) = parse_xref_first_line(&header).ok_or_else(|| {
+            Error::QpdfExc(QpdfExc::new(
+                QpdfErrorCode::DamagedPdf,
+                filename,
+                b"xref table",
+                i64::try_from(section_start).unwrap_or(i64::MAX),
+                b"xref syntax invalid",
+            ))
+        })?;
         if first == 0 && count > 0 {
-            cursor.skip_ws();
             first_xref_item_offset = cursor.pos as u64;
             if let Some(sink) = first_xref_item_offset_sink.as_deref_mut() {
                 *sink = Some(first_xref_item_offset);
             }
         }
         for index in 0..count {
-            cursor.skip_ws();
-            let offset = cursor.read_fixed_u64(10)?;
-            cursor.skip_ws();
-            let generation = cursor.read_fixed_i32(5)?;
-            cursor.skip_ws();
-            let in_use = cursor.read_byte()?;
-            cursor.skip_line();
+            let entry_offset = cursor.pos;
+            let line = cursor.read_line(30);
+            let (offset, generation, in_use, invalid) =
+                parse_xref_entry_line(&line).ok_or_else(|| {
+                    Error::QpdfExc(QpdfExc::new(
+                        QpdfErrorCode::DamagedPdf,
+                        filename,
+                        b"xref table",
+                        i64::try_from(entry_offset).unwrap_or(i64::MAX),
+                        format!("invalid xref entry (obj={})", first + index).into_bytes(),
+                    ))
+                })?;
+            if invalid {
+                table_diagnostics.push(damaged_warning(
+                    filename,
+                    b"xref table",
+                    "accepting invalid xref table entry",
+                    Some(entry_offset as u64),
+                ));
+            }
+            // cov:ignore-start: object numbers are narrowed to i32 immediately
+            // below, so a u32 addition overflow cannot be reached by a valid
+            // parsed xref row.
+            let object_number = first.checked_add(index).ok_or_else(|| {
+                Error::QpdfExc(QpdfExc::new(
+                    QpdfErrorCode::DamagedPdf,
+                    filename,
+                    b"xref table",
+                    i64::try_from(entry_offset).unwrap_or(i64::MAX),
+                    b"invalid xref entry",
+                ))
+            })?;
+            // cov:ignore-end
             let object_ref = QpdfObjGen::new(
-                i32::try_from(first + index)
+                i32::try_from(object_number)
                     .map_err(|_| Error::parse(0, "object number does not fit i32"))?,
                 generation,
             );
@@ -4414,14 +4526,131 @@ fn parse_xref_table(
                         entry: XrefEntry::Uncompressed { offset },
                     });
                 }
-                _ => return Err(Error::parse(0, "xref table entry status is not f or n")),
+                // cov:ignore-start: parse_xref_entry_line accepts only the
+                // two in-use markers handled above.
+                _ => {
+                    return Err(Error::QpdfExc(QpdfExc::new(
+                        QpdfErrorCode::DamagedPdf,
+                        filename,
+                        b"xref table",
+                        i64::try_from(entry_offset).unwrap_or(i64::MAX),
+                        format!("invalid xref entry (obj={object_number})").into_bytes(),
+                    )))
+                } // cov:ignore-end
             }
         }
     }
 
     let trailer_start = cursor.pos;
     let _ = bytes;
-    Ok((entries, trailer_start, Vec::new(), first_xref_item_offset))
+    Ok((
+        entries,
+        trailer_start,
+        table_diagnostics,
+        first_xref_item_offset,
+    ))
+}
+
+/// `QUtil::is_space` (`include/qpdf/QUtil.hh:497-501`). NUL is deliberately
+/// absent: `parse_xrefEntry` relies on `is_space('\0')` being false to stop at
+/// the end of its buffer (`QPDF.cc:775-782`).
+fn is_pdf_space(byte: u8) -> bool {
+    matches!(byte, b'\t' | b'\n' | b'\x0b' | b'\x0c' | b'\r' | b' ')
+}
+
+/// The tokenizer's `is_delimiter` (`libqpdf/QPDFTokenizer.cc:16-23`), which is
+/// what ends a keyword. `readToken(...).isWord("trailer")` (`QPDF.cc:889`)
+/// therefore accepts `trailer<<` as readily as `trailer\n<<`.
+fn is_pdf_delimiter(byte: u8) -> bool {
+    is_pdf_space(byte)
+        || matches!(
+            byte,
+            b'/' | b'(' | b')' | b'{' | b'}' | b'<' | b'>' | b'[' | b']' | b'%' | b'\0'
+        )
+}
+
+fn parse_xref_first_line(line: &[u8]) -> Option<(u32, u32)> {
+    let mut pos = 0;
+    while line.get(pos).copied().is_some_and(is_pdf_space) {
+        pos += 1;
+    }
+    let first_start = pos;
+    while line.get(pos).is_some_and(u8::is_ascii_digit) {
+        pos += 1;
+    }
+    if pos == first_start || !line.get(pos).copied().is_some_and(is_pdf_space) {
+        return None;
+    }
+    let first_end = pos;
+    while line.get(pos).copied().is_some_and(is_pdf_space) {
+        pos += 1;
+    }
+    let count_start = pos;
+    while line.get(pos).is_some_and(u8::is_ascii_digit) {
+        pos += 1;
+    }
+    if pos == count_start {
+        return None;
+    }
+    let first = std::str::from_utf8(&line[first_start..first_end])
+        .ok()?
+        .parse::<u64>()
+        .ok()?;
+    let count = std::str::from_utf8(&line[count_start..pos])
+        .ok()?
+        .parse::<u64>()
+        .ok()?;
+    Some((u32::try_from(first).ok()?, u32::try_from(count).ok()?))
+}
+
+fn parse_xref_entry_line(line: &[u8]) -> Option<(u64, i32, u8, bool)> {
+    let mut pos = 0;
+    let mut invalid = false;
+    while line.get(pos).copied().is_some_and(is_pdf_space) {
+        invalid = true;
+        pos += 1;
+    }
+    let first_start = pos;
+    while line.get(pos).is_some_and(u8::is_ascii_digit) {
+        pos += 1;
+    }
+    if pos == first_start || !line.get(pos).copied().is_some_and(is_pdf_space) {
+        return None;
+    }
+    if line.get(pos + 1).copied().is_some_and(is_pdf_space) {
+        invalid = true;
+    }
+    while line.get(pos).copied().is_some_and(is_pdf_space) {
+        pos += 1;
+    }
+    let second_start = pos;
+    while line.get(pos).is_some_and(u8::is_ascii_digit) {
+        pos += 1;
+    }
+    if pos == second_start || !line.get(pos).copied().is_some_and(is_pdf_space) {
+        return None;
+    }
+    if line.get(pos + 1).copied().is_some_and(is_pdf_space) {
+        invalid = true;
+    }
+    while line.get(pos).copied().is_some_and(is_pdf_space) {
+        pos += 1;
+    }
+    let in_use = *line.get(pos)?;
+    if !matches!(in_use, b'f' | b'n') {
+        return None;
+    }
+    let first_text = std::str::from_utf8(&line[first_start..second_start])
+        .ok()?
+        .trim();
+    let second_text = std::str::from_utf8(&line[second_start..pos]).ok()?.trim();
+    invalid |= first_text.len() != 10 || second_text.len() != 5;
+    Some((
+        first_text.parse::<u64>().ok()?,
+        second_text.parse::<i32>().ok()?,
+        in_use,
+        invalid,
+    ))
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -5085,20 +5314,6 @@ fn parse_usize(value: u64, name: &str) -> Result<usize> {
     usize::try_from(value).map_err(|_| Error::parse(0, format!("{name} does not fit usize")))
 }
 
-fn parse_header(bytes: &[u8]) -> Result<String> {
-    if !bytes.starts_with(b"%PDF-") {
-        return Err(Error::parse(0, "missing PDF header"));
-    }
-
-    let end = bytes
-        .iter()
-        .position(|byte| *byte == b'\n' || *byte == b'\r')
-        .unwrap_or(bytes.len());
-    let header = std::str::from_utf8(&bytes[5..end])
-        .map_err(|_| Error::parse(5, "PDF version is not utf-8"))?;
-    Ok(header.to_string())
-}
-
 fn find_qpdf_header(bytes: &[u8]) -> Option<(usize, String)> {
     let search_end = bytes.len().min(1024);
     (0..search_end).find_map(|offset| {
@@ -5183,34 +5398,9 @@ impl<'a> ByteCursor<'a> {
     }
 
     fn skip_ws(&mut self) {
-        while matches!(
-            self.bytes.get(self.pos),
-            Some(b'\0' | b'\t' | b'\n' | b'\x0c' | b'\r' | b' ')
-        ) {
+        while self.bytes.get(self.pos).copied().is_some_and(is_pdf_space) {
             self.pos += 1;
         }
-    }
-
-    fn skip_line(&mut self) {
-        while !matches!(self.bytes.get(self.pos), None | Some(b'\n' | b'\r')) {
-            self.pos += 1;
-        }
-        while matches!(self.bytes.get(self.pos), Some(b'\n' | b'\r')) {
-            self.pos += 1;
-        }
-    }
-
-    fn read_byte(&mut self) -> Result<u8> {
-        let Some(byte) = self.bytes.get(self.pos).copied() else {
-            return Err(Error::parse(self.pos, "unexpected end of input"));
-        };
-        self.pos += 1;
-        Ok(byte)
-    }
-
-    fn read_u32(&mut self) -> Result<u32> {
-        let token = self.read_token()?;
-        parse_xref_subsection_u32(&token)
     }
 
     fn read_token(&mut self) -> Result<Token> {
@@ -5222,10 +5412,14 @@ impl<'a> ByteCursor<'a> {
         Ok(token)
     }
 
-    fn read_fixed_u64(&mut self, width: usize) -> Result<u64> {
-        self.read_fixed(width)?
-            .parse::<u64>()
-            .map_err(|_| Error::parse(self.pos, "invalid fixed-width u64"))
+    fn peek_word(&self, word: &[u8]) -> bool {
+        self.bytes
+            .get(self.pos..)
+            .is_some_and(|tail| tail.starts_with(word))
+            && self
+                .bytes
+                .get(self.pos + word.len())
+                .is_none_or(|byte| is_pdf_delimiter(*byte))
     }
 
     fn read_be_u64(&mut self, width: usize) -> Result<u64> {
@@ -5241,44 +5435,24 @@ impl<'a> ByteCursor<'a> {
         Ok(value)
     }
 
-    fn read_fixed_i32(&mut self, width: usize) -> Result<i32> {
-        // qpdf's `parse_xrefEntry` only ever gathers `QUtil::is_digit`
-        // characters and fails the entry otherwise (`QPDF.cc:783-810`), so a
-        // signed literal such as `-0001` is not a generation qpdf would
-        // accept. `str::parse` would take it, which would silently keep an
-        // entry qpdf rejects with `invalid xref entry`
-        // (`QPDF.cc:877-880`).
-        let text = self.read_fixed(width)?;
-        if !text.bytes().all(|byte| byte.is_ascii_digit()) {
-            return Err(Error::parse(self.pos, "invalid fixed-width i32"));
+    fn read_line(&mut self, max_len: usize) -> Vec<u8> {
+        let start = self.pos;
+        let mut end = start;
+        while end < self.bytes.len() && !matches!(self.bytes[end], b'\n' | b'\r') {
+            end += 1;
         }
-        text.parse::<i32>()
-            .map_err(|_| Error::parse(self.pos, "invalid fixed-width i32"))
-    }
-
-    fn read_fixed(&mut self, width: usize) -> Result<&str> {
-        if self.pos + width > self.bytes.len() {
-            return Err(Error::parse(
-                self.pos,
-                "unexpected end of fixed-width field",
-            ));
+        let line_end = (start + max_len).min(end);
+        let line = self.bytes[start..line_end].to_vec();
+        self.pos = end;
+        while self
+            .bytes
+            .get(self.pos)
+            .is_some_and(|byte| matches!(byte, b'\n' | b'\r'))
+        {
+            self.pos += 1;
         }
-        let text = std::str::from_utf8(&self.bytes[self.pos..self.pos + width])
-            .map_err(|_| Error::parse(self.pos, "field is not utf-8"))?;
-        self.pos += width;
-        Ok(text)
+        line
     }
-}
-
-fn parse_xref_subsection_u32(token: &Token) -> Result<u32> {
-    if !token.is_integer() || !token.value.iter().all(u8::is_ascii_digit) {
-        return Err(Error::parse(token.start, "expected unsigned integer"));
-    }
-    let value = std::str::from_utf8(&token.value)
-        .map_err(|_| Error::parse(token.start, "number is not utf-8"))?
-        .parse::<u64>()
-        .map_err(|_| Error::parse(token.start, "invalid unsigned integer"))?;
-    u32::try_from(value).map_err(|_| Error::parse(token.start, "number does not fit u32"))
 }
 
 #[cfg(test)]
@@ -6827,6 +7001,361 @@ mod final_handle_tests {
             load_xref_state_from_bytes(&bytes, XrefLoadOptions::default(), Some(resolver.as_ref()))
                 .expect_err("an overflowing trailer integer must fail the canonical parser");
         assert!(matches!(error, Error::Parse { message, .. } if message == "invalid integer"));
+    }
+
+    #[test]
+    fn one_space_before_xref_still_reads_the_table() {
+        // qpdf's double-counted `skip` moves the read one byte early per
+        // skipped space, so a single space lands on the newline after the
+        // keyword and the table still parses -- with the warning. Measured
+        // with qpdf 11.9.0: one warning, no reconstruction.
+        let mut bytes = b"%PDF-1.7\n1 0 obj\n<< /Type /Catalog >>\nendobj\n".to_vec();
+        let xref = bytes.len();
+        bytes.extend_from_slice(b" xref\n0 2\n0000000000 65535 f \n0000000009 00000 n \n");
+        bytes.extend_from_slice(b"trailer\n<< /Size 2 /Root 1 0 R >>\n");
+        let state = load_xref_state_with_options(
+            &mut std::io::Cursor::new({
+                let mut bytes = bytes.clone();
+                bytes.extend_from_slice(format!("startxref\n{xref}\n%%EOF\n").as_bytes());
+                bytes
+            }),
+            XrefLoadOptions::default(),
+        )
+        .expect("one space still leaves the table readable");
+        let messages: Vec<_> = state
+            .loaded
+            .repair_diagnostics
+            .entries()
+            .iter()
+            .map(|diagnostic| diagnostic.get_message_detail().to_vec())
+            .collect();
+        assert_eq!(
+            messages,
+            vec![b"extraneous whitespace seen before xref".to_vec()],
+            "{messages:?}"
+        );
+    }
+
+    #[test]
+    fn a_non_dictionary_trailer_delivers_its_warnings_on_both_owner_routes() {
+        // qpdf delivers the parser warnings and then throws
+        // (`QPDF.cc:565-568,894-905`). Without leading whitespace the table
+        // parses far enough to reach the trailer, which is where that split
+        // matters.
+        let mut bytes = b"%PDF-1.7\n1 0 obj\n<< /Type /Catalog >>\nendobj\n".to_vec();
+        let xref = bytes.len();
+        bytes.extend_from_slice(b"xref\n0 2\n0000000000 65535 f \n 0000000009  00000  n \n");
+        bytes.extend_from_slice(b"trailer\n42\n");
+
+        let mut registration = XrefRegistration::default();
+        let mut diagnostics = Diagnostics::default();
+        let error = parse_xref_from_start(
+            &bytes,
+            xref,
+            xref as u64,
+            "1.7",
+            XrefLoadOptions::default(),
+            &mut registration,
+            Some(&mut diagnostics),
+            XrefReadContextSpec::ActiveSection,
+            None,
+            false,
+        )
+        .expect_err("a non-dictionary trailer is terminal");
+        assert!(matches!(
+            error,
+            Error::QpdfExc(exception)
+                if exception.get_message_detail() == b"expected trailer dictionary"
+        ));
+        assert!(diagnostics
+            .entries()
+            .iter()
+            .any(|diagnostic| diagnostic.get_message_detail()
+                == b"accepting invalid xref table entry"));
+
+        let resolver = canonical_test_resolver(bytes.clone(), BTreeMap::new(), false, 3);
+        let mut registration = XrefRegistration::default();
+        parse_xref_from_start_with_owner(
+            &bytes,
+            xref,
+            xref as u64,
+            "1.7",
+            XrefLoadOptions::default(),
+            &mut registration,
+            None,
+            XrefReadContextSpec::ActiveSection,
+            None,
+            false,
+            Some(resolver.as_ref()),
+        )
+        .expect_err("the canonical owner sees the same terminal error");
+        assert!(resolver
+            .repair_diagnostics()
+            .entries()
+            .iter()
+            .any(|diagnostic| diagnostic.get_message_detail()
+                == b"accepting invalid xref table entry"));
+    }
+
+    #[test]
+    fn reconstruction_skips_headers_its_guards_reject() {
+        // `insertReconstructedXrefEntry` drops `obj <= 0` and a generation
+        // outside `0..65535` without a warning (`QPDF.cc:1195-1198`). Measured
+        // with qpdf 11.9.0 on a file of this shape: the scan reports only
+        // 1/0, 2/0 and 3/0.
+        let mut bytes = b"%PDF-1.7\n%\xe2\xe3\xcf\xd3\n".to_vec();
+        bytes.extend_from_slice(b"0 0 obj\n<< /Skipped (obj 0) >>\nendobj\n");
+        bytes.extend_from_slice(b"5 65535 obj\n<< /Skipped (gen 65535) >>\nendobj\n");
+        for (number, body) in [
+            (1u32, "<< /Type /Catalog /Pages 2 0 R >>"),
+            (2, "<< /Type /Pages /Kids [3 0 R] /Count 1 >>"),
+            (3, "<< /Type /Page /Parent 2 0 R /MediaBox [0 0 612 792] >>"),
+        ] {
+            bytes.extend_from_slice(format!("{number} 0 obj\n{body}\nendobj\n").as_bytes());
+        }
+        // A startxref past the end forces the line-scan reconstruction.
+        bytes.extend_from_slice(b"trailer\n<< /Size 6 /Root 1 0 R >>\nstartxref\n999999\n%%EOF\n");
+
+        let state = load_xref_state_with_options(
+            &mut std::io::Cursor::new(bytes),
+            XrefLoadOptions {
+                allow_repair: true,
+                ..XrefLoadOptions::default()
+            },
+        )
+        .expect("reconstruction recovers the well-formed objects");
+        let recovered: Vec<_> = state
+            .loaded
+            .entries
+            .keys()
+            .map(|object_ref| (object_ref.number, object_ref.generation))
+            .collect();
+        assert_eq!(recovered, vec![(1, 0), (2, 0), (3, 0)], "{recovered:?}");
+    }
+
+    #[test]
+    fn a_trailer_keyword_ends_at_any_delimiter() {
+        // `readToken(m->file).isWord("trailer")` (`QPDF.cc:889`) ends the
+        // keyword at any delimiter (`QPDFTokenizer.cc:16-23`), so `trailer<<`
+        // is as valid as `trailer\n<<`. Requiring whitespace here sent the
+        // line to the section-header parser instead, and qpdf reads
+        // `resurrect-missing-page-arr.pdf` -- which is written that way --
+        // without a single warning.
+        for separator in ["", " ", "\n", "\r\n", "\t"] {
+            let mut bytes = b"%PDF-1.4\n1 0 obj\n<< /Type /Catalog >>\nendobj\n".to_vec();
+            let xref = bytes.len();
+            bytes.extend_from_slice(b"xref\n0 2\n0000000000 65535 f \n0000000009 00000 n \n");
+            bytes.extend_from_slice(
+                format!("trailer{separator}<< /Size 2 /Root 1 0 R >>\nstartxref\n{xref}\n%%EOF\n")
+                    .as_bytes(),
+            );
+
+            let state = load_xref_state_with_options(
+                &mut std::io::Cursor::new(bytes),
+                XrefLoadOptions::default(),
+            )
+            .unwrap_or_else(|error| panic!("separator {separator:?} must parse: {error:?}"));
+            let diagnostics = state.loaded.repair_diagnostics.entries().to_vec();
+            assert!(
+                diagnostics.is_empty(),
+                "separator {separator:?} must not trigger recovery: {diagnostics:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn a_vertical_tab_separates_classic_xref_fields() {
+        // `QUtil::is_space` counts `\v` (`include/qpdf/QUtil.hh:497-501`), and
+        // `parse_xrefEntry` skips fields with it like any other space.
+        let mut bytes = b"%PDF-1.4\n1 0 obj\n<< /Type /Catalog >>\nendobj\n".to_vec();
+        let xref = bytes.len();
+        bytes.extend_from_slice(b"xref\n0 2\n0000000000\x0b65535\x0bf \n0000000009 00000 n \n");
+        bytes.extend_from_slice(
+            format!("trailer\n<< /Size 2 /Root 1 0 R >>\nstartxref\n{xref}\n%%EOF\n").as_bytes(),
+        );
+
+        let state = load_xref_state_with_options(
+            &mut std::io::Cursor::new(bytes),
+            XrefLoadOptions::default(),
+        )
+        .expect("a vertical tab is a space to qpdf");
+        let diagnostics = state.loaded.repair_diagnostics.entries().to_vec();
+        assert!(diagnostics.is_empty(), "{diagnostics:?}");
+    }
+
+    #[test]
+    fn a_section_header_needs_a_space_after_its_first_number() {
+        // `parse_xrefFirst` gathers digits and then requires a space
+        // (`QPDF.cc:735-745`). Until `trailer<<` stopped being mistaken for a
+        // section header, that rejection was only ever reached by the mistake.
+        assert_eq!(parse_xref_first_line(b"0 2"), Some((0, 2)));
+        assert_eq!(parse_xref_first_line(b"0x 2"), None);
+        assert_eq!(parse_xref_first_line(b"x 2"), None);
+        // qpdf requires no space after the second number: it skips whatever
+        // spaces follow and reports the bytes it consumed (`QPDF.cc:754-767`).
+        assert_eq!(parse_xref_first_line(b"0 2x"), Some((0, 2)));
+    }
+
+    #[test]
+    fn the_space_and_delimiter_sets_match_qpdf() {
+        // `QUtil::is_space` (`include/qpdf/QUtil.hh:497-501`) and the
+        // tokenizer's `is_delimiter` (`libqpdf/QPDFTokenizer.cc:16-23`).
+        for byte in *b"\t\n\x0b\x0c\r " {
+            assert!(is_pdf_space(byte), "{byte:#04x} is a qpdf space");
+            assert!(is_pdf_delimiter(byte), "{byte:#04x} ends a keyword");
+        }
+        // `parse_xrefEntry` relies on `is_space('\0')` being false to stop at
+        // its buffer end (`QPDF.cc:775-782`), but NUL still ends a keyword.
+        assert!(!is_pdf_space(0));
+        for byte in *b"/(){}<>[]%\0" {
+            assert!(is_pdf_delimiter(byte), "{byte:#04x} ends a keyword");
+        }
+        for byte in *b"a0-+.#" {
+            assert!(!is_pdf_delimiter(byte), "{byte:#04x} continues a keyword");
+        }
+    }
+
+    #[test]
+    fn strict_classic_xref_invalid_entry_uses_qpdf_error_context() {
+        let mut bytes = b"%PDF-1.4\n1 0 obj\n<< /Type /Catalog >>\nendobj\n".to_vec();
+        let xref = bytes.len();
+        bytes.extend_from_slice(b"xref\n0 2\n0000000000 65535 f \n");
+        let invalid_entry = bytes.len();
+        bytes.extend_from_slice(b"000000000x 00000 n \n");
+        bytes.extend_from_slice(
+            format!("trailer\n<< /Size 2 /Root 1 0 R >>\nstartxref\n{xref}\n%%EOF\n").as_bytes(),
+        );
+
+        let error = load_xref_state_with_options(
+            &mut std::io::Cursor::new(bytes),
+            XrefLoadOptions {
+                description: b"bad5.pdf".to_vec(),
+                ..XrefLoadOptions::default()
+            },
+        )
+        .expect_err("qpdf rejects the malformed classic xref entry in strict mode");
+
+        assert!(matches!(
+            error,
+            Error::QpdfExc(exception)
+                if exception.get_filename() == b"bad5.pdf"
+                    && exception.get_object() == b"xref table"
+                    && exception.get_file_position() == invalid_entry as i64
+                    && exception.get_message_detail() == b"invalid xref entry (obj=1)"
+        ));
+    }
+
+    #[test]
+    fn classic_xref_leniency_covers_whitespace_and_diagnostic_boundaries() {
+        assert_eq!(parse_xref_first_line(b"  0 1\n"), Some((0, 1)));
+        let (_, _, _, invalid) = parse_xref_entry_line(b" 0000000000  65535  f \n")
+            .expect("qpdf accepts a parseable but non-fixed-width xref row");
+        assert!(invalid);
+        assert!(parse_xref_entry_line(b"0000000000 00000 x\n").is_none());
+
+        // Two spaces before the keyword: qpdf adds its `skip` to the offset it
+        // started from, so the table read begins inside `xref` and fails
+        // (`QPDF.cc:670-676`). Measured with qpdf 11.9.0 on a file of this
+        // shape: `extraneous whitespace seen before xref`, then `file is
+        // damaged`, `xref syntax invalid`, and reconstruction -- not a trailer
+        // diagnostic.
+        let mut bytes = b"%PDF-1.4\n".to_vec();
+        let xref = bytes.len();
+        bytes.extend_from_slice(b"  xref\n0 1\n 0000000000  65535  f \ntrailer\n42\n");
+        let mut registration = XrefRegistration::default();
+        let mut diagnostics = Diagnostics::default();
+        let error = parse_xref_from_start(
+            &bytes,
+            xref,
+            xref as u64,
+            "1.4",
+            XrefLoadOptions {
+                description: b"bad-spacing.pdf".to_vec(),
+                ..XrefLoadOptions::default()
+            },
+            &mut registration,
+            Some(&mut diagnostics),
+            XrefReadContextSpec::ActiveSection,
+            None,
+            false,
+        )
+        .expect_err("a non-dictionary trailer must retain parser diagnostics");
+
+        assert!(matches!(
+            error,
+            Error::QpdfExc(exception)
+                if exception.get_message_detail() == b"xref syntax invalid"
+        ));
+        let messages: Vec<_> = diagnostics
+            .entries()
+            .iter()
+            .map(|diagnostic| diagnostic.get_message_detail())
+            .collect();
+        assert!(messages.contains(&b"extraneous whitespace seen before xref".as_slice()));
+        // The lenient row is never reached here -- qpdf does not report it for
+        // this file either. Its own coverage is the direct
+        // `parse_xref_entry_line` assertion above and the whitespace-free
+        // table below.
+        assert!(!messages.contains(&b"accepting invalid xref table entry".as_slice()));
+
+        let mut lenient = b"%PDF-1.4\n1 0 obj\n<< /Type /Catalog >>\nendobj\n".to_vec();
+        let lenient_xref = lenient.len();
+        lenient.extend_from_slice(
+            b"xref\n0 2\n 0000000000  65535  f \n0000000009 00000 n \ntrailer\n<< /Size 2 /Root 1 0 R >>\n",
+        );
+        let state = load_xref_state_with_options(
+            &mut std::io::Cursor::new({
+                let mut bytes = lenient.clone();
+                bytes.extend_from_slice(format!("startxref\n{lenient_xref}\n%%EOF\n").as_bytes());
+                bytes
+            }),
+            XrefLoadOptions::default(),
+        )
+        .expect("qpdf accepts the lenient row and keeps reading");
+        let lenient_messages: Vec<_> = state
+            .loaded
+            .repair_diagnostics
+            .entries()
+            .iter()
+            .map(|diagnostic| diagnostic.get_message_detail().to_vec())
+            .collect();
+        assert!(
+            lenient_messages
+                .iter()
+                .any(|message| message == b"accepting invalid xref table entry"),
+            "{lenient_messages:?}"
+        );
+
+        let resolver = canonical_test_resolver(bytes.clone(), BTreeMap::new(), false, 11);
+        let mut registration = XrefRegistration::default();
+        let error = parse_xref_from_start_with_owner(
+            &bytes,
+            xref,
+            xref as u64,
+            "1.4",
+            XrefLoadOptions {
+                description: b"bad-spacing.pdf".to_vec(),
+                ..XrefLoadOptions::default()
+            },
+            &mut registration,
+            None,
+            XrefReadContextSpec::ActiveSection,
+            None,
+            false,
+            Some(resolver.as_ref()),
+        )
+        .expect_err("the canonical owner must retain the same diagnostics");
+        assert!(matches!(
+            error,
+            Error::QpdfExc(exception)
+                if exception.get_message_detail() == b"xref syntax invalid"
+        ));
+        assert!(resolver
+            .repair_diagnostics()
+            .entries()
+            .iter()
+            .any(|diagnostic| diagnostic.get_message_detail()
+                == b"extraneous whitespace seen before xref"));
     }
 
     #[test]
@@ -8530,7 +9059,11 @@ mod final_handle_tests {
             true,
         )
         .expect_err("classic trailer must be a dictionary");
-        assert!(error.to_string().contains("trailer is not a dictionary"));
+        assert!(matches!(
+            error,
+            Error::QpdfExc(exception)
+                if exception.get_message_detail() == b"expected trailer dictionary"
+        ));
 
         let (bytes, xref) = classic_xref_with_trailer("<< /Size 1 /XRefStm (bad) >>");
         let mut registration = XrefRegistration::default();
