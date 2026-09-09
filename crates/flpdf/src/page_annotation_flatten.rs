@@ -638,10 +638,7 @@ fn acroform_default_resources<R: Read + Seek>(pdf: &mut Pdf<R>) -> Result<Option
 /// non-resolving `is_scalar` check and silently dropped from
 /// dedup/append, instead of being recognized as already present (or
 /// carried across) by value.
-fn resolve_array_item_handles<R: Read + Seek>(
-    _pdf: &mut Pdf<R>,
-    array: &ObjectHandle,
-) -> Result<()> {
+fn resolve_array_item_handles(array: &ObjectHandle) -> Result<()> {
     let Some(items) = array.try_as_array()? else {
         return Ok(());
     };
@@ -683,8 +680,7 @@ fn resolve_array_item_handles<R: Read + Seek>(
 /// the way the dictionary branch does at `:1093`). A later category can still
 /// fail after an earlier array-shaped category was already mutated; entries
 /// merged before the failing one stay installed.
-fn resolve_matched_category_handles<R: Read + Seek>(
-    _pdf: &mut Pdf<R>,
+fn resolve_matched_category_handles(
     resources: &ObjectHandle,
     default_resources: &ObjectHandle,
 ) -> Result<()> {
@@ -705,8 +701,8 @@ fn resolve_matched_category_handles<R: Read + Seek>(
             resources.replace_key(&category, dest_terminal.clone())?;
         }
         if dest_terminal.try_as_array()?.is_some() && source_terminal.try_as_array()?.is_some() {
-            resolve_array_item_handles(_pdf, &dest_terminal)?;
-            resolve_array_item_handles(_pdf, &source_terminal)?;
+            resolve_array_item_handles(&dest_terminal)?;
+            resolve_array_item_handles(&source_terminal)?;
         }
     }
     Ok(())
@@ -822,7 +818,7 @@ fn merge_widget_default_resources_on_page_with_associations<R: Read + Seek>(
         // See resolve_matched_category_handles's doc for why this resolves
         // source and matching-destination categories interleaved, one DR
         // category at a time, rather than in two whole-dictionary passes.
-        resolve_matched_category_handles(pdf, &resources, default_resources)?;
+        resolve_matched_category_handles(&resources, default_resources)?;
         resources.merge_resources(default_resources, None)?;
     }
     Ok(())
@@ -963,13 +959,12 @@ mod tests {
 
     #[test]
     fn resolve_array_item_handles_propagates_an_unresolved_child_error() {
-        let mut pdf = Pdf::open(Cursor::new(build_pdf("", &[]))).unwrap();
-        resolve_array_item_handles(&mut pdf, &ObjectHandle::integer(1)).unwrap();
+        resolve_array_item_handles(&ObjectHandle::integer(1)).unwrap();
         let array = ObjectHandle::array(vec![ObjectHandle::new_indirect_unresolved(
             ObjectRef::new(99, 0),
             -1,
         )]);
-        let error = resolve_array_item_handles(&mut pdf, &array).unwrap_err();
+        let error = resolve_array_item_handles(&array).unwrap_err();
         assert!(matches!(
             error,
             Error::Internal(ref message) if message == "object 99 0 belongs to a dropped PDF"

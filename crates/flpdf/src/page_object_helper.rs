@@ -608,7 +608,7 @@ impl<'a, R: Read + Seek> PageObjectHelper<'a, R> {
         let group = self.get_attribute(b"/Group", false)?.shallow_copy()?;
         dict.replace_key(b"/Group", group)?;
         let bbox = self.get_trim_box(false, false)?.shallow_copy()?;
-        if rectangle_from_handle(self.pdf, &bbox)?.is_none() {
+        if rectangle_from_handle(&bbox)?.is_none() {
             self.object.warn_if_possible(
                 "bounding box is invalid; form XObject created from page will not work",
             )?; // cov:ignore: qpdf warning emission is infallible for a live page handle; only the defensive logger error edge is excluded
@@ -711,11 +711,11 @@ impl<'a, R: Read + Seek> PageObjectHelper<'a, R> {
             return Ok(None);
         };
         let bbox = form_dict.try_get_key(b"/BBox")?;
-        let Some(bbox) = rectangle_from_handle(self.pdf, &bbox)? else {
+        let Some(bbox) = rectangle_from_handle(&bbox)? else {
             return Ok(None);
         };
         let form_matrix = form_dict.try_get_key(b"/Matrix")?;
-        let form_matrix = matrix_from_handle(self.pdf, &form_matrix)?.unwrap_or_default();
+        let form_matrix = matrix_from_handle(&form_matrix)?.unwrap_or_default();
         let transform = if invert_transformations {
             self.get_matrix_for_transformations(true)?
         } else {
@@ -939,7 +939,7 @@ impl<'a, R: Read + Seek> PageObjectHelper<'a, R> {
         }
 
         let media = page.try_get_key(b"/MediaBox")?;
-        let Some(media) = rectangle_from_handle(self.pdf, &media)? else {
+        let Some(media) = rectangle_from_handle(&media)? else {
             return Ok(());
         };
         let matrix = flatten_rotation_matrix(rotate, media);
@@ -952,7 +952,7 @@ impl<'a, R: Read + Seek> PageObjectHelper<'a, R> {
             b"/ArtBox",
         ] {
             let value = page.try_get_key(key)?;
-            let Some(rectangle) = rectangle_from_handle(self.pdf, &value)? else {
+            let Some(rectangle) = rectangle_from_handle(&value)? else {
                 continue;
             };
             page.replace_key(
@@ -1059,7 +1059,7 @@ impl<'a, R: Read + Seek> PageObjectHelper<'a, R> {
             )?; // cov:ignore: malformed field-copy errors are covered by AcroForm transform tests.
             transformed
         };
-        append_annotation_handles(self.pdf, &destination, transformed.new_annotations)?;
+        append_annotation_handles(&destination, transformed.new_annotations)?;
         Ok(())
     }
 
@@ -1192,7 +1192,7 @@ impl<'a, R: Read + Seek> PageObjectHelper<'a, R> {
             };
             (transformed, invalidate_cache)
         };
-        append_annotation_handles(self.pdf, &destination, transformed.new_annotations)?;
+        append_annotation_handles(&destination, transformed.new_annotations)?;
         if invalidate_cache {
             // qpdf's QPDFAcroFormDocumentHelper contract requires
             // invalidateCache after manually changing a page's annotation
@@ -2002,10 +2002,7 @@ fn object_handle_description(object: &ObjectHandle) -> String {
         .unwrap_or_else(|| "direct object".to_owned())
 }
 
-pub(crate) fn rectangle_from_handle<R: Read + Seek>(
-    _pdf: &mut Pdf<R>,
-    handle: &ObjectHandle,
-) -> Result<Option<Rectangle>> {
+pub(crate) fn rectangle_from_handle(handle: &ObjectHandle) -> Result<Option<Rectangle>> {
     let Some(items) = handle.try_as_array()? else {
         return Ok(None);
     };
@@ -2092,11 +2089,7 @@ fn rectangle_to_handle(rectangle: Rectangle) -> ObjectHandle {
     ])
 }
 
-fn append_annotation_handles<R: Read + Seek>(
-    _pdf: &mut Pdf<R>,
-    page: &ObjectHandle,
-    annotations: Vec<ObjectHandle>,
-) -> Result<()> {
+fn append_annotation_handles(page: &ObjectHandle, annotations: Vec<ObjectHandle>) -> Result<()> {
     let existing = page.try_get_key(b"/Annots")?;
     let annots = if existing.try_as_array()?.is_some() {
         existing
@@ -2156,10 +2149,7 @@ fn validate_foreign_page_handle<RS: Read + Seek, RD: Read + Seek>(
     Ok(())
 }
 
-fn matrix_from_handle<R: Read + Seek>(
-    _pdf: &mut Pdf<R>,
-    handle: &ObjectHandle,
-) -> Result<Option<Matrix>> {
+fn matrix_from_handle(handle: &ObjectHandle) -> Result<Option<Matrix>> {
     let Some(items) = handle.try_as_array()? else {
         return Ok(None);
     };

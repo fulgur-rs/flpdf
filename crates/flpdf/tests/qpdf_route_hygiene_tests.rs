@@ -106,3 +106,25 @@ fn ownerless_xref_api_is_removed_in_favor_of_the_canonical_pdf_route() {
         );
     }
 }
+
+#[test]
+fn handle_only_helpers_do_not_carry_dead_pdf_parameters() {
+    for path in [
+        "filespec_helper/embedded_file_stream.rs",
+        "nntree.rs",
+        "page_annotation_flatten.rs",
+        "page_object_helper.rs",
+        "pages/repair.rs",
+        "pages/tree_rebuild.rs",
+        "resources.rs",
+        // The CLI reaches the same handle-only routes, and the dirty bridge
+        // left a dead parameter here too.
+        "../../flpdf-cli/src/main.rs",
+    ] {
+        let source = read_source(path);
+        assert!(
+            !source.contains("_pdf: &mut Pdf"),
+            "handle-only helper in {path} still carries a dead Pdf parameter"
+        );
+    }
+}

@@ -318,7 +318,7 @@ fn remove_unreferenced_resources_in_form_xobjects<R: Read + Seek>(
             } else {
                 resources.clone()
             };
-            prune_font_and_xobject_dictionaries(pdf, &resources, &used)?;
+            prune_font_and_xobject_dictionaries(&resources, &used)?;
         }
 
         pending.extend(child_forms);
@@ -396,11 +396,7 @@ fn form_xobjects_in_resources<R: Read + Seek>(
 /// Shallow-copy qpdf's mutable resource categories then remove names not used
 /// by the directly parsed content stream. Empty category dictionaries remain
 /// present, matching qpdf's `removeKey` loop on the category contents.
-fn prune_font_and_xobject_dictionaries<R: Read + Seek>(
-    _pdf: &mut Pdf<R>,
-    resources: &ObjectHandle,
-    used: &UsedNames,
-) -> Result<()> {
+fn prune_font_and_xobject_dictionaries(resources: &ObjectHandle, used: &UsedNames) -> Result<()> {
     for category in [b"Font".as_slice(), b"XObject".as_slice()] {
         let mut key = Vec::with_capacity(category.len() + 1);
         key.push(b'/');

@@ -7477,7 +7477,7 @@ fn apply_normalize_content<R: std::io::Read + std::io::Seek>(
     }
 
     for (stream_ref, stream) in streams {
-        if let Some(last_bad) = normalize_and_store_stream_handle(pdf, stream_ref, stream, seen)? {
+        if let Some(last_bad) = normalize_and_store_stream_handle(stream_ref, stream, seen)? {
             warnings.push(last_bad);
         }
     }
@@ -7489,8 +7489,7 @@ fn apply_normalize_content<R: std::io::Read + std::io::Seek>(
 /// stream in place. Keeping the stream handle live is important for malformed
 /// content holders: the writer must observe one canonical resolution and not
 /// parse the legacy raw Object a second time.
-fn normalize_and_store_stream_handle<R: std::io::Read + std::io::Seek>(
-    _pdf: &mut Pdf<R>,
+fn normalize_and_store_stream_handle(
     stream_ref: ObjectRef,
     stream: ObjectHandle,
     seen: &mut HashSet<ObjectRef>,

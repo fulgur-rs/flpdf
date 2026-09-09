@@ -722,7 +722,7 @@ fn page_box_or_err<R: Read + Seek>(
     // qpdf's getArrayAsRectangle returns the zero rectangle for a present but
     // malformed value; the destination Form-XObject conversion owns the
     // warning that makes the overlay operation observable as repaired.
-    let rectangle = rectangle_from_handle(pdf, &value)?.unwrap_or_default();
+    let rectangle = rectangle_from_handle(&value)?.unwrap_or_default();
     Ok(PageBox::new(
         rectangle.llx,
         rectangle.lly,

@@ -256,7 +256,6 @@ fn repair_page_tree_handle<R: Read + Seek>(
                     .as_str(),
             )?; // cov:ignore: warning-sink failure is not injectable through the qpdf success oracle
             replace_handle_key(
-                pdf,
                 &kid,
                 b"/MediaBox",
                 ObjectHandle::array(vec![
@@ -298,7 +297,7 @@ fn repair_page_tree_handle<R: Read + Seek>(
 
         if !kid.try_is_dictionary_of_type(b"Page", b"")? {
             kid.warn_if_possible("/Type key should be /Page but is not; overriding")?;
-            replace_handle_key(pdf, &kid, b"/Type", ObjectHandle::name(b"Page".to_vec()))?;
+            replace_handle_key(&kid, b"/Type", ObjectHandle::name(b"Page".to_vec()))?;
         }
         let page_ref = kid
             .object_ref()
@@ -340,7 +339,7 @@ fn repair_page_tree_frame<R: Read + Seek>(
 
     if !node.try_is_dictionary_of_type(b"Pages", b"")? {
         node.warn_if_possible("/Type key should be /Pages but is not; overriding")?;
-        replace_handle_key(pdf, &node, b"/Type", ObjectHandle::name(b"Pages".to_vec()))?;
+        replace_handle_key(&node, b"/Type", ObjectHandle::name(b"Pages".to_vec()))?;
     }
 
     let media_box = if inherited_media_box {
@@ -394,12 +393,7 @@ fn promote_page_handle<R: Read + Seek>(
     Ok(promoted)
 }
 
-fn replace_handle_key<R: Read + Seek>(
-    _pdf: &mut Pdf<R>,
-    holder: &ObjectHandle,
-    key: &[u8],
-    value: ObjectHandle,
-) -> Result<()> {
+fn replace_handle_key(holder: &ObjectHandle, key: &[u8], value: ObjectHandle) -> Result<()> {
     holder.replace_key(key, value)?;
     Ok(())
 }
