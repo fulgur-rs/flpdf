@@ -275,7 +275,7 @@ impl Pipeline for FlateBuffer {
 /// `pipeStreamData` and supplies a bare codec, so the stream's own filter
 /// dictionary and decode parameters are not consulted. This helper keeps that
 /// raw `write`/`finish` pipeline boundary instead of constructing a synthetic
-/// dictionary for the whole-buffer decoder.
+/// dictionary for a whole-buffer compatibility decoder.
 fn inflate_with_pipeline(raw: &[u8]) -> flpdf::Result<Vec<u8>> {
     let mut sink = FlateBuffer::default();
     {

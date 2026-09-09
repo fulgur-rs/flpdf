@@ -12,6 +12,7 @@ use crate::bit_writer::BitWriter;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) enum TiffPredictorAction {
+    #[cfg(test)]
     Encode,
     Decode,
 }
@@ -148,6 +149,7 @@ impl<'a> TiffPredictor<'a> {
                         .get_bits_signed(self.bits_per_sample as usize)
                         .map_err(map_bit_stream_error)?;
                     let new_sample = match self.action {
+                        #[cfg(test)]
                         TiffPredictorAction::Encode => {
                             let new_sample = sample - *previous;
                             *previous = sample;
@@ -173,6 +175,7 @@ impl<'a> TiffPredictor<'a> {
                     }
                     let sample = i64::from(self.cur_row[next]);
                     let new_sample = match self.action {
+                        #[cfg(test)]
                         TiffPredictorAction::Encode => {
                             let new_sample = sample - *previous;
                             *previous = sample;

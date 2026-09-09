@@ -7,7 +7,8 @@
 //! encoded bytes while preserving the decoded content.
 
 use assert_cmd::Command;
-use flpdf::{filters, ObjectHandle};
+use flpdf::pipeline::{FlateAction, PlFlate};
+use flpdf::Pipeline;
 use predicates::prelude::*;
 use std::path::{Path, PathBuf};
 #[cfg(feature = "qpdf-zlib-compat")]
@@ -79,12 +80,35 @@ fn run_native_rewrite(level: &str) -> Vec<u8> {
     std::fs::read(output).unwrap()
 }
 
+struct VecSink(Vec<u8>);
+
+impl Pipeline for VecSink {
+    fn identifier(&self) -> &str {
+        "cli compression test sink"
+    }
+
+    fn write(&mut self, data: &[u8]) -> flpdf::PipelineResult<()> {
+        self.0.extend_from_slice(data);
+        Ok(())
+    }
+
+    fn finish(&mut self) -> flpdf::PipelineResult<()> {
+        Ok(())
+    }
+}
+
+fn flate(payload: &[u8], action: FlateAction) -> Vec<u8> {
+    let mut sink = VecSink(Vec::new());
+    {
+        let mut stage = PlFlate::new("cli compression test flate", &mut sink, action).unwrap();
+        stage.write(payload).unwrap();
+        stage.finish().unwrap();
+    }
+    sink.0
+}
+
 fn decode(payload: &[u8]) -> Vec<u8> {
-    let dictionary = ObjectHandle::dictionary(vec![(
-        b"/Filter".to_vec(),
-        ObjectHandle::name(b"FlateDecode".to_vec()),
-    )]);
-    filters::decode_stream_data(&dictionary, payload).expect("valid Flate stream")
+    flate(payload, FlateAction::Inflate)
 }
 
 #[test]

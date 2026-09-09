@@ -1,9 +1,12 @@
 //! qpdf correspondence: Pl_RunLength.cc incremental encode and decode state, output, error, and finish semantics.
 
-use super::{Pipeline, PipelineError, PipelineRef, PipelineResult};
+#[cfg(test)]
+use super::PipelineError;
+use super::{Pipeline, PipelineRef, PipelineResult};
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) enum RunLengthAction {
+    #[cfg(test)]
     Encode,
     Decode,
 }
@@ -21,6 +24,7 @@ pub(crate) struct RunLength<'a> {
     action: RunLengthAction,
     state: State,
     length: usize,
+    #[cfg(test)]
     buf: [u8; 128],
 }
 
@@ -36,10 +40,12 @@ impl<'a> RunLength<'a> {
             action,
             state: State::Top,
             length: 0,
+            #[cfg(test)]
             buf: [0; 128],
         }
     }
 
+    #[cfg(test)]
     fn encode(&mut self, data: &[u8]) -> PipelineResult<()> {
         for &byte in data {
             if matches!(self.state, State::Top) != (self.length <= 1) {
@@ -104,6 +110,7 @@ impl<'a> RunLength<'a> {
         Ok(())
     }
 
+    #[cfg(test)]
     fn flush_encode(&mut self) -> PipelineResult<()> {
         if matches!(self.state, State::Run) {
             if !(2..=128).contains(&self.length) {
@@ -132,6 +139,7 @@ impl Pipeline for RunLength<'_> {
 
     fn write(&mut self, data: &[u8]) -> PipelineResult<()> {
         match self.action {
+            #[cfg(test)]
             RunLengthAction::Encode => self.encode(data),
             RunLengthAction::Decode => self.decode(data),
         }
@@ -139,6 +147,7 @@ impl Pipeline for RunLength<'_> {
 
     fn finish(&mut self) -> PipelineResult<()> {
         match self.action {
+            #[cfg(test)]
             RunLengthAction::Encode => {
                 self.flush_encode()?;
                 self.next.write(&[128])?;

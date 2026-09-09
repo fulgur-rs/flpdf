@@ -148,10 +148,10 @@ pub trait Pipeline {
 /// order, stage count, and output bytes are unchanged; only the owner moves.
 /// CLAUDE.md deviation class (B).
 ///
-/// The production write path runs through this slot —
-/// `filters::encode_stream_data` reaches `stream_filter.rs`'s `encode_flate`,
-/// whose `Flate` deflates into a borrowed sink — so the deflate bytes crossing
-/// it are pinned against qpdf goldens by `cmp_generate_objstm_tests` under the
+/// The production write path runs through this slot for ordinary streams, while
+/// the qpdf `writeObjectStream` direct-Flate boundary calls
+/// `stream_filter::encode_flate` directly. Both deflate byte paths are pinned
+/// against qpdf goldens by `cmp_generate_objstm_tests` under the
 /// `qpdf-zlib-compat` feature.
 pub(crate) enum PipelineRef<'a> {
     Borrowed(&'a mut dyn Pipeline),

@@ -333,18 +333,15 @@ crates/flpdf/src/xref.rs::push_repair_diagnostics: prod 2 (1 files) / test 0
     crates/flpdf/src/xref.rs 2
 crates/flpdf/src/object_handle.rs::pipe_stream_data_for_object_stream: prod 1 (1 files) / test 0
     crates/flpdf/src/reader/resolver.rs 1
-crates/flpdf/src/stream_filter.rs::decode_filter_specs_from_handle: prod 3 (1 files) / test 0
-    crates/flpdf/src/filters.rs 3
-crates/flpdf/src/filters.rs::decode_stream_data: prod 2 (1 file) / test 1
-    crates/flpdf-qtest-tools/src/compare.rs 2
-crates/flpdf/src/filters.rs::decode_stream_data_from_handle: prod 4 (3 files) / test 0
-    crates/flpdf/src/xref.rs 2, crates/flpdf/src/filespec_helper/embedded_file_stream.rs 1, crates/flpdf/src/resources.rs 1
+crates/flpdf/src/stream_filter.rs::decode_filter_specs_from_handle: prod 1 (1 files) / test 4
+    crates/flpdf/src/filters.rs 1; stream_filter.rs unit coverage 4
+crates/flpdf/src/filters.rs::decode_stream_data: removed by flpdf-3yn9.48.49; prod 0 / test 0
+crates/flpdf/src/filters.rs::decode_stream_data_from_handle: removed by flpdf-3yn9.48.49; prod 0 / test 0
 crates/flpdf/src/filters.rs::decode_stream_data_recovering: prod 0 (0 files) / test 1
 crates/flpdf/src/filters.rs::decode_stream_data_recovering_with_limits: prod 2 (2 files) / test 2
     crates/flpdf-qtest-tools/src/driver/test_0_1.rs 1, crates/flpdf/src/filters.rs 1
-crates/flpdf/src/filters.rs::encode_stream_data: prod 0 (0 files) / test 3
-crates/flpdf/src/filters.rs::encode_stream_data_from_handle: prod 2 (2 files) / test 0
-crates/flpdf/src/filters.rs 1, crates/flpdf/src/writer/object_streams/emission.rs 1
+crates/flpdf/src/filters.rs::encode_stream_data: removed by flpdf-3yn9.48.49; prod 0 / test 0
+crates/flpdf/src/filters.rs::encode_stream_data_from_handle: removed by flpdf-3yn9.48.49; prod 0 / test 0
 crates/flpdf/src/filters.rs::is_decoded_filter: prod 1 (1 files) / test 0
     crates/flpdf/src/job/inspection.rs 1
 crates/flpdf/src/filters.rs::passthrough_codec_label: prod 3 (3 files) / test 0
@@ -503,8 +500,8 @@ crates/flpdf/src/job/lifecycle.rs::QPDFJob::open: prod 63 (28 files) / test 1283
 | B26 | `attempt_recovery` | 1 | 10 | 同上（`attempt_recovery(` で数えた行 vs フィールド参照も含む tracker） | tracker |
 | B27 | `repair_diagnostics` | 20 | 97 | 行は公開ドア `.repair_diagnostics()` の呼び出しだけ。tracker は同名フィールドへのアクセスも数える | tracker（ただし B27 の主張「構築後の sink は 1 本」は呼び出しドアの数に依存しないので影響しない） |
 | C17 + C18 | `compute_data_key` | 共有1 | 2（prod、2 consumer）+ 1 test | `crates/flpdf/src/encryption/primitives.rs::compute_data_key` が qpdf static primitive の単一正本。reader `key_for_object` と writer `set_data_key` が利用し、旧 state-local duplicate は削除 | tracker（共有 primitive の caller と oracle vectors） |
-| C28 | `decode_stream_data_recovering` | 1 | 0 | 行は 2 symbol をまとめて「prod 1（`test_0_1.rs:332`）」と書いたが、その呼び出しは実際には `decode_stream_data_recovering_with_limits`（tracker prod 2） | tracker（行の粒度が粗かった） |
-| C29 | `encode_stream_data_from_handle` | 3 | 4 | 4 件目は `crates/flpdf/src/filters.rs:350` — 同じ C29 の対である `encode_stream_data` からの内部委譲で、行は外部 caller だけを挙げていた | tracker |
+| C28 | `decode_stream_data_recovering` | 0 | 0 | `.48.49` では qtest exception session を除外し、公開 recovering wrapper は test 0/1 のため残す | tracker（qtest exception scopeを別管理） |
+| C29 | `encode_stream_data_from_handle` | 0 | 0 | `.48.49` で generic encoder と全callerを撤去。ObjStm は C31 direct `encode_flate`、ordinary stream は canonical `pipe_stream_data` | tracker |
 | D6 / D8 | `plan_qpdf_preserve_object_streams_with_unreferenced` / `get_compressible_objgens` / `compressible_objgens_qpdf_plan` | 2 / 3 / 9 | 1 / 2 / 7 | 行は `writer/object_streams/mod.rs` の `pub use` 再輸出行を prod に数えている。tracker は `use` 行（複数行の継続を含む）を除外する | tracker |
 | D9 | `source_xref_entries` | 10 | 32 | 行は「writer / linearization 系のみ。reader 内部の 5 箇所は除く」と **手で範囲を絞った**。tracker は全 crate を数える（reader 側 16、engine 2 を含む） | tracker（行の 10 は「writer 側の再実装が何箇所あるか」を示す別の数で、cutover の分母ではない） |
 | D16 | `EncryptionContext` | 22 | 21 | 合計だけでなくファイル別内訳も一致しない（`writer.rs` 13→12、`linearization/writer.rs` 6→7、`writer/encrypted_strings.rs` 3→2）。除外規則（宣言行 / `use` 行 / `impl` ヘッダ）の適用差 | tracker |
@@ -540,7 +537,8 @@ A ファイルがその単純化は `object_handle.rs`（桁 0 の `#[cfg(test)]
 **2026-09-06 の再監査:** D27 の single-source / multi-source sweep はともに撤去済み。
 旧C19/C28/E-27のdead wrapperは `.42`、C23/E-9の選定済みtest-only routeは `.43` で削除済み。
 残る C28 `decode_stream_data_recovering_with_limits` は driver test 0/1 の移行が必要であり、
-C28 行全体を削除済みとは扱わない。E-24 / E-26 は別途 public consumer と test を移行する。
+C28 行全体を削除済みとは扱わない。これは qtest exception session の別スコープである。
+`.48.49` では C26/C27/C29 の legacy whole-buffer caller と public wrapperを撤去した。
 
 D19 / D30 は canonical implementation に委譲するbyte-neutral test scaffoldingで、削除対象ではない。
 特に D19 は back-patch 前の観測点を保持する。CLI の同名 `write_qpdf_to_memory` は別関数なので
@@ -973,7 +971,7 @@ B29 / D31 / E-28はsourceでmixedと判定した。E-28の未照合case/APIは�
 | **X-1** | `crates/flpdf/src/reader/resolver.rs::recover_stream_length` の実装本数 | **B11 は `mixed`** — 「2 実装」。もう 1 本は `crates/flpdf/src/reader/file_object.rs::recover_stream_boundary` で、qpdf の `attempt_recovery` 1 bit（`libqpdf/QPDF.cc:1391`）を `RecoveryPolicy`（`RequireEndstream` / `Bounded`）という 2 値の別概念に置き換えている。C42 の pipe-side EOL subtraction は `flpdf-zvjf` で削除済み | B11 は recovery boundary の実装数、C42 は recovered length を pipe する責務として読む。残る `RecoveredStreamEol` は `dump-object` 再シリアライズの framing metadata であり、pipe length や show-stream payload の補正ではない |
 | **X-2** | C42 が要求した領域跨ぎの確認が B 側で行われていない | C-U1 は `flpdf-zvjf` と `flpdf-hj7v` で解決済み。B11 の `recover_stream_boundary` は xref bootstrap の raw stream framing、C42 の `recover_stream_length` は canonical resolver の source length を担い、show-stream はその payload を無加工で出す。暗号化 canonical pipe はどちらも caller の length を変更しない | C-U1 の qpdf AESv2 probe・unencrypted show-stream probe・canonical/foreign/writer tests で、recovery metadata が pipe-side subtraction や show-stream trim に戻らないことを確認する |
 | **X-3** | `QPDF::readStream` の分類が領域で逆 | **C41 は `canonical`**（`/Length` 検証 + `endstream` 確認を `crates/flpdf/src/reader/resolver.rs::read_stream` 1 本が持つ）。**B10 は `mixed`**（`validateStreamLineEnd` の 3 warning が `crates/flpdf/src/reader/resolver.rs::validate_stream_line_end` と `crates/flpdf/src/reader/file_object.rs::finish_file_object_handle` の 2 実装にある） | 粒度違いで両立する（同じ qpdf 関数の別部分を見ている）。ただし **C41 だけを読むと `readStream` が完全に片付いて見える**。cutover 時は B10 の 2 実装を先に畳む |
-| **X-4** | xref stream の読み出しが 2 領域で別分類 | **B17 は `canonical`**（`crates/flpdf/src/xref.rs::parse_xref_stream` 1 本）。**C27 は `mixed`** で、残る production caller は `crates/flpdf/src/xref.rs:1432` の bootstrap-context decode（whole-buffer の `decode_stream_data_from_handle` 経由）。ObjStm側の同じ呼び出しは `.48.14` で `ObjectHandle::get_stream_data` へ移行済み。qpdf側は両責務とも `libqpdf/QPDF.cc:1051,1792` の `getStreamData(qpdf_dl_specialized)` に対応する | 「xref stream を parse する経路」は 1 本でも、「その payload を decode する経路」は canonical な `pipe_stream_data` を通っていない。C27 の残る bootstrap xref-stream caller は `.48.49` の後続範囲で、B17の判定は変わらない |
+| **X-4** | xref stream の読み出しが 2 領域で別分類 | **B17 は `canonical`**（`crates/flpdf/src/xref.rs::parse_xref_stream` 1 本）。**C27 も `.48.49` で `canonical` 化**し、bootstrap-context decode は `ObjectHandle::get_stream_data(DecodeLevel::Specialized)` へ移行した。ObjStm側は `.48.14` で同じ accessorへ移行済み。qpdf側は両責務とも `libqpdf/QPDF.cc:1051,1792` の `getStreamData(qpdf_dl_specialized)` に対応する | xref stream payloadもbootstrap/通常resolverで同じ canonical pipeを使う。owner-less bootstrapのbounded source-read policyは残るが、whole-buffer compatibility decoderは残らない |
 | **X-5** | writer 側 data key が D では canonical、C では mixed | **D17 は `canonical`**（`crates/flpdf/src/writer/encryption_state.rs::WriterEncryptionState` が set / unparse / clear の順序を写す）。**C18 も `canonical`**（`encryption/primitives.rs::compute_data_key` の共有 primitive を呼ぶ） | 順序と鍵計算をそれぞれ qpdf 責務どおり保持し、C-U4 oracle vectors の後に duplicate を削除した |
 | **X-6** | 5 ファイルの caller 数え方の細則が一致していない | **A ファイル**は「D の『モジュール直下の最初の `#[cfg(test)] mod` より前＝prod』という単純化は本領域では使えない」と明記する（`object_handle.rs` は桁 0 の `#[cfg(test)] mod` を 21 個持ち間に production コードが挟まる）。**D ファイル**はその単純化を採用している。B / C / E はさらに別の細則を書いている | `scripts/qpdf-route-callers.py` は A 側の brace 追跡規約を実装している。**以降の再測定は tracker を唯一の規約とする**（§6）。D の行セルが tracker と最も乖離するのはこの差が原因（§6.3） |
 | **X-7** | 行の完了とwriter全体の完了の区別 | A14はreplaceObjectのcanonical routeへ移行済み。D27もsingle/multi-source sweepを撤去済みでcanonical | D27の到達性削除pass撤去は完了だが、D2/D3/D11の採番・emission統合は別責務として追跡する |

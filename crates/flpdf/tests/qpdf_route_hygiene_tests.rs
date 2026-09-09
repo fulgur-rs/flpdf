@@ -28,7 +28,8 @@ fn dead_qpdf_routes_are_removed_and_canonical_owners_remain() {
 
     let filters = read_source("filters.rs");
     assert!(!filters.contains("fn decode_stream_data_with_limits("));
-    assert!(filters.contains("fn decode_stream_data_from_handle("));
+    assert!(!filters.contains("fn decode_stream_data_from_handle("));
+    assert!(read_source("object_handle.rs").contains("pub fn get_stream_data("));
 
     let reader = read_source("reader.rs");
     for dead in [
@@ -68,6 +69,42 @@ fn dead_qpdf_routes_are_removed_and_canonical_owners_remain() {
             "dead route remains tracked: {dead}"
         );
     }
+}
+
+#[test]
+fn stream_whole_buffer_bridges_are_removed_after_canonical_cutover() {
+    let filters = read_source("filters.rs");
+    for dead in [
+        "pub fn decode_stream_data(",
+        "pub fn encode_stream_data(",
+        "fn decode_stream_data_from_handle(",
+        "fn encode_stream_data_from_handle(",
+        "fn encode_stream_data_from_specs(",
+        "fn apply_encode_params(",
+        "fn apply_single_filter_encode(",
+    ] {
+        assert!(
+            !filters.contains(dead),
+            "legacy materialized stream bridge remains: {dead}"
+        );
+    }
+
+    let xref = read_source("xref.rs");
+    assert!(
+        !xref.contains("decode_stream_data_from_handle("),
+        "xref stream decoding still enters the materialized compatibility route"
+    );
+
+    let emission = read_source("writer/object_streams/emission.rs");
+    assert!(
+        !emission.contains("filters::encode_stream_data_from_handle("),
+        "ObjStm emission still enters the generic whole-buffer encoder"
+    );
+    assert!(
+        emission.contains("use crate::stream_filter::encode_flate;")
+            && emission.contains("encode_flate(&body.bytes)"),
+        "ObjStm emission must retain qpdf's direct Flate stage"
+    );
 }
 
 #[test]

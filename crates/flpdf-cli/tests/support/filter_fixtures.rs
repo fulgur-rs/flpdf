@@ -1,8 +1,9 @@
 //! Shared fixtures for stream-filter CLI tests.
 //!
-//! These helpers build minimal PDFs whose stream data is supplied **pre-encoded**,
-//! bypassing `filters::encode_stream_data` — required for codecs flpdf cannot
-//! encode (LZW and the image/binary passthrough codecs DCT/JBIG2/JPX/CCITT).
+//! These helpers build minimal PDFs whose stream data is supplied **pre-encoded**;
+//! this keeps fixture construction independent of flpdf's decode-only filter
+//! surface for codecs flpdf cannot encode (LZW and the image/binary passthrough
+//! codecs DCT/JBIG2/JPX/CCITT).
 //!
 //! Used by both `cli_multi_filter_chain.rs` and `cli_stream_data.rs` via
 //! `#[path = "support/mod.rs"] mod support;` + `support::filter_fixtures::*`.
@@ -19,7 +20,7 @@ pub const LZW_ABABABABABABAB_EC1: &[u8] = &[
 pub const LZW_ABABABABABABAB_PLAIN: &[u8] = b"ABABABABABABAB";
 
 /// Build a minimal PDF whose obj-4 stream data is supplied pre-encoded (no
-/// `encode_stream_data`).
+/// the removed generic encoder boundary).
 ///
 /// Object layout:
 ///   1 0 obj  /Catalog  -> /Pages 2 0 R

@@ -5,7 +5,8 @@
 ///   --json-key invalid / --json-object invalid /
 ///   --json-stream-data inline / --json-stream-data file side files.
 use assert_cmd::Command;
-use flpdf::{filters, ObjectHandle};
+use flpdf::pipeline::{FlateAction, PlFlate};
+use flpdf::Pipeline;
 use predicates::prelude::*;
 use std::collections::BTreeMap;
 use std::io::Write;
@@ -29,6 +30,43 @@ fn is_qpdf_available() -> bool {
 
 const EXPECTED_QPDF_ORACLE_VERSION: &str = "11.9.0";
 const QPDF_ORACLE_SKIP_CHILD: &str = "FLPDF_QPDF_ORACLE_SKIP_CHILD";
+
+struct VecSink(Vec<u8>);
+
+impl Pipeline for VecSink {
+    fn identifier(&self) -> &str {
+        "json test sink"
+    }
+
+    fn write(&mut self, data: &[u8]) -> flpdf::PipelineResult<()> {
+        self.0.extend_from_slice(data);
+        Ok(())
+    }
+
+    fn finish(&mut self) -> flpdf::PipelineResult<()> {
+        Ok(())
+    }
+}
+
+fn flate_encode(data: &[u8]) -> Vec<u8> {
+    let mut sink = VecSink(Vec::new());
+    {
+        let mut stage = PlFlate::new("json test flate", &mut sink, FlateAction::Deflate).unwrap();
+        stage.write(data).unwrap();
+        stage.finish().unwrap();
+    }
+    sink.0
+}
+
+fn run_length_encode(data: &[u8]) -> Vec<u8> {
+    let mut encoded = Vec::with_capacity(data.len() + data.len() / 128 + 1);
+    for chunk in data.chunks(128) {
+        encoded.push((chunk.len() - 1) as u8);
+        encoded.extend_from_slice(chunk);
+    }
+    encoded.push(128);
+    encoded
+}
 
 #[derive(Debug, PartialEq, Eq)]
 enum QpdfOracleAction {
@@ -1647,11 +1685,7 @@ fn json_output_conflicts_with_the_json_exclusive_flag_set() {
 
 /// One-page PDF whose content stream (object `4 0 R`) is FlateDecode-wrapped.
 fn one_page_pdf_with_flate_stream(content: &[u8]) -> Vec<u8> {
-    let d = ObjectHandle::dictionary(vec![(
-        b"/Filter".to_vec(),
-        ObjectHandle::name(b"FlateDecode".to_vec()),
-    )]);
-    let encoded = filters::encode_stream_data(&d, content).expect("encode FlateDecode stream");
+    let encoded = flate_encode(content);
 
     let mut pdf = b"%PDF-1.4\n".to_vec();
     let off1 = pdf.len();
@@ -1693,11 +1727,7 @@ fn one_page_pdf_with_flate_stream(content: &[u8]) -> Vec<u8> {
 /// the default generalized JSON decode level must keep the raw bytes and
 /// original filter dictionary.
 fn one_page_pdf_with_run_length_stream(content: &[u8]) -> Vec<u8> {
-    let d = ObjectHandle::dictionary(vec![(
-        b"/Filter".to_vec(),
-        ObjectHandle::name(b"RunLengthDecode".to_vec()),
-    )]);
-    let encoded = filters::encode_stream_data(&d, content).expect("encode RunLength stream");
+    let encoded = run_length_encode(content);
 
     let mut pdf = b"%PDF-1.4\n".to_vec();
     let off1 = pdf.len();
