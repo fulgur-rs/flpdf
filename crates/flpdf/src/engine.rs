@@ -766,7 +766,19 @@ mod tests {
             .expect_err("an empty strict input must fail at the qpdf parse boundary");
 
         assert!(!pdf.resolver.attempt_recovery());
-        assert!(matches!(error, Error::Parse { .. }));
+        let (source, diagnostics) = error
+            .open_failure()
+            .expect("strict qpdf parse must retain the header warning");
+        assert!(matches!(
+            source,
+            Error::QpdfExc(exception)
+                if exception.get_message_detail() == b"can't find startxref"
+        ));
+        assert_eq!(diagnostics.entries().len(), 1);
+        assert_eq!(
+            diagnostics.entries()[0].get_message_detail(),
+            b"can't find PDF header"
+        );
         assert!(pdf.suppress_warnings());
     }
 
