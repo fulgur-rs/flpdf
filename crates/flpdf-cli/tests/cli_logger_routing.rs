@@ -370,6 +370,25 @@ fn qpdf_differential_matches_file_write_error_swallowing() {
     );
 }
 
+#[cfg(target_os = "linux")]
+#[test]
+fn large_file_write_error_does_not_name_the_input_path() {
+    if !Path::new("/dev/full").exists() {
+        eprintln!("skipping /dev/full output-sink regression");
+        return;
+    }
+
+    let output = flpdf()
+        .args([LARGE_LINEARIZED, "/dev/full"])
+        .output()
+        .unwrap();
+    assert_eq!(output.status.code(), Some(2));
+    assert!(output.stdout.is_empty());
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(stderr.contains("No space left on device"), "{stderr}");
+    assert!(!stderr.contains(LARGE_LINEARIZED), "{stderr}");
+}
+
 #[test]
 fn binary_qdf_dash_uses_the_same_save_route() {
     let output = flpdf().args(["qdf", MINIMAL, "-"]).output().unwrap();

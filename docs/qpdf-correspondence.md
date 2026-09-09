@@ -1291,6 +1291,14 @@ underlay/overlay → image → appearance → annotation → coalesce → rotati
 page-label/output 順序を一つの Job owner へ集約した。残る direct CLI callers は
 JSON/page-operation/inspection cohort であり、`.48.8`〜`.48.10` の後続範囲である。
 
+`flpdf-ddk1` では、qpdf の named-output sink が `Pl_StdioFile("qpdf output", ...)`
+（`QPDFWriter.cc:101-110`、`Pl_StdioFile.cc:25-37`）として入力ファイル名とは独立した
+責務を持つことに合わせ、`QPDFJob::write_qpdf` の出力段階で発生した bare
+`Error::Io` だけを portable な `SystemBytes` message へ正規化する。これにより
+`job_error_message_with_input` は bare `Error::Io` を入力 failure として扱わず、
+`/dev/full` 相当の sink failure は入力名を誤って報告しない。open/read/parse failure と
+`BadPassword` の入力名・文言は従来どおり保持する。
+
 `QPDFJob::handleTransformations` の `remove_restrictions` 分岐は
 `QPDFAcroFormDocumentHelper::disableDigitalSignatures` を呼ぶだけで、成功時の独自
 メッセージを出さない（`QPDFJob.cc:2137-2150`、`QPDFAcroFormDocumentHelper.cc:419-439`）。

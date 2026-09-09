@@ -259,10 +259,7 @@ fn qpdfjob_error_report_uses_qpdf_invalid_password_wording() {
         std::io::ErrorKind::PermissionDenied,
     )))
     .unwrap();
-    assert_eq!(
-        state.lock().unwrap().bytes,
-        b"qpdf: input.pdf: Permission denied\n"
-    );
+    assert_eq!(state.lock().unwrap().bytes, b"qpdf: Permission denied\n");
 
     for (kind, expected) in [
         (std::io::ErrorKind::AlreadyExists, "File exists"),
@@ -276,7 +273,7 @@ fn qpdfjob_error_report_uses_qpdf_invalid_password_wording() {
             .unwrap();
         assert_eq!(
             state.lock().unwrap().bytes,
-            format!("qpdf: input.pdf: {expected}\n").as_bytes()
+            format!("qpdf: {expected}\n").as_bytes()
         );
     }
 
@@ -1917,6 +1914,35 @@ fn write_qpdf_failure_returns_an_error() {
     let mut pdf = job.create_qpdf().unwrap().expect("input should open");
 
     assert!(job.write_qpdf(&mut pdf).is_err());
+}
+
+#[cfg(target_os = "linux")]
+#[test]
+fn write_qpdf_output_sink_error_does_not_prefix_the_input_name() {
+    let input = Path::new(env!("CARGO_MANIFEST_DIR"))
+        .join("../../tests/fixtures/compat/objstm-lin-outlines-80-200.pdf");
+    let args = vec![
+        "qpdfjob".to_owned(),
+        input.to_string_lossy().into_owned(),
+        "/dev/full".to_owned(),
+    ];
+    let (logger, state) = logger_with_error_sink();
+    let mut job = QPDFJob::new();
+    job.set_logger(logger);
+    job.initialize_from_argv(&args).unwrap();
+    let mut pdf = job.create_qpdf().unwrap().expect("input should open");
+
+    let error = job
+        .write_qpdf(&mut pdf)
+        .expect_err("/dev/full must reject the sufficiently large output");
+    assert!(matches!(
+        &error,
+        Error::SystemBytes(message) if message == b"No space left on device"
+    ));
+    assert_eq!(
+        state.lock().unwrap().bytes,
+        b"qpdf: No space left on device\n"
+    );
 }
 
 #[test]
