@@ -340,6 +340,29 @@ that a resolver failure remains a `Result`. Test-only legacy flatten modes and
 the separate `AnnotationObjectHelper` residual helper boundary remain
 outside this slice.
 
+### A6/A7 page-label helper slice `flpdf-3yn9.48.23.4` (2026-09-09)
+
+The production path in
+`crates/flpdf/src/page_label_document_helper.rs` now has zero explicit
+`Pdf::resolve`, `resolve_handle`, or `resolve_handle_ref` bridge callers.
+The live label dictionary, catalog root, effective label, and prefix paths use
+`try_dereference`, `try_as_dictionary`, `try_as_name`, `try_as_integer`, and
+`try_is_null` at the qpdf accessor boundary. `/P` is the exception: it is
+dereferenced through the canonical handle and then read with the silent
+`as_string`, falling back to an empty prefix for any other type.
+`getLabelForPage` copies `/P` verbatim without inspecting its type
+(`QPDFPageLabelDocumentHelper.cc:38,48` — only `/St` gets an `isInteger()`
+check at `:41`), so the warning-emitting `try_get_string_value` port must not
+read it; doing so raised qpdf's string typeWarning and turned a
+non-string-prefix run into exit 3.
+
+The number-tree depth/error policy, raw `/S`/`/P`/`/St` presence, and
+`/St` offset reconstruction remain unchanged and are anchored to
+`QPDFPageLabelDocumentHelper.cc:1-96,104-133`. The route contract and
+`label_range_propagates_an_unresolved_handle_error` cover the caller-zero and
+Result-propagation boundaries. The rendering-only qpdf deviation and test-only
+fixtures remain outside this slice.
+
 ### 2026-09-09 canonical cache cutover supersession
 
 The A1/A2/A9/A10/A11/A13/A15/A16/A17/A24 rows above were authored before

@@ -69,27 +69,27 @@ impl LabelRange {
     /// an independent value snapshot. Unknown `/S` names remain unknown to the
     /// handle, while this typed compatibility view retains the historical
     /// `LabelStyle::None` mapping.
-    fn from_handle<R: Read + Seek>(
-        pdf: &mut Pdf<R>,
-        handle: &ObjectHandle,
-    ) -> Result<Option<Self>> {
-        let handle = pdf.resolve_handle(handle)?;
+    fn from_handle(handle: &ObjectHandle) -> Result<Option<Self>> {
+        let handle = handle.clone();
+        handle.try_dereference()?;
         if handle.try_as_dictionary()?.is_none() {
             return Ok(None);
         }
-        let style = pdf
-            .resolve_handle(&handle.try_get_key(b"/S")?)?
+        let style = handle
+            .try_get_key(b"/S")?
             .try_as_name()?
             .map(|name| LabelStyle::from_name(&name))
             .unwrap_or(LabelStyle::None);
-        let prefix = pdf
-            .resolve_handle(&handle.try_get_key(b"/P")?)?
-            .as_string()
-            .map(|bytes| {
-                crate::json_inspect::decode_pdf_text_string(&bytes)
-                    .unwrap_or_else(|| String::from_utf8_lossy(&bytes).into_owned())
-            })
-            .unwrap_or_default();
+        // `QPDFPageLabelDocumentHelper::getLabelForPage` copies `/P` verbatim
+        // without inspecting its type (`QPDFPageLabelDocumentHelper.cc:38,48`),
+        // so a non-string prefix must not raise qpdf's string typeWarning here.
+        // `try_get_string_value` would; this stays on the silent accessor and
+        // falls back to an empty prefix like the pre-cutover code did.
+        let prefix_handle = handle.try_get_key(b"/P")?;
+        prefix_handle.try_dereference()?;
+        let prefix_bytes = prefix_handle.as_string().unwrap_or_default();
+        let prefix = crate::json_inspect::decode_pdf_text_string(&prefix_bytes)
+            .unwrap_or_else(|| String::from_utf8_lossy(&prefix_bytes).into_owned());
         let start = handle.try_get_key(b"/St")?.try_as_integer()?.unwrap_or(1);
         Ok(Some(Self {
             style,
@@ -278,7 +278,7 @@ impl<'a, R: Read + Seek> PageLabelDocumentHelper<'a, R> {
             return Ok(None);
         };
         let catalog = self.pdf.get_object_handle(catalog_ref);
-        let catalog = self.pdf.resolve_handle(&catalog)?;
+        catalog.try_dereference()?;
         if catalog.try_as_dictionary()?.is_none() {
             return Ok(None);
         }
@@ -366,7 +366,7 @@ impl<'a, R: Read + Seek> PageLabelDocumentHelper<'a, R> {
         let raw_entries = tree.as_map(self.pdf)?;
         let mut entries = Vec::with_capacity(raw_entries.len());
         for (index, value) in raw_entries {
-            if let Some(range) = LabelRange::from_handle(self.pdf, &value)? {
+            if let Some(range) = LabelRange::from_handle(&value)? {
                 entries.push((index, range));
             }
         }
@@ -387,7 +387,7 @@ impl<'a, R: Read + Seek> PageLabelDocumentHelper<'a, R> {
         let Some(label) = self.get_label_for_page(page_idx)? else {
             return Ok(None);
         };
-        LabelRange::from_handle(self.pdf, &label)
+        LabelRange::from_handle(&label)
     }
 
     /// Return qpdf's raw reconstructed label dictionary for a 0-based page
@@ -505,7 +505,7 @@ impl<'a, R: Read + Seek> PageLabelDocumentHelper<'a, R> {
         let Some((label, offset)) = tree.find_object_at_or_below(self.pdf, page_idx)? else {
             return Ok(None);
         };
-        let label = self.pdf.resolve_handle(&label)?;
+        label.try_dereference()?;
         if label.try_as_dictionary()?.is_none() {
             return Ok(None);
         }
@@ -591,7 +591,7 @@ impl<'a, R: Read + Seek> PageLabelDocumentHelper<'a, R> {
         raw_labels
             .into_iter()
             .map(|(index, label)| {
-                LabelRange::from_handle(self.pdf, &label)?
+                LabelRange::from_handle(&label)?
                     .map(|label| (index, label))
                     .ok_or_else(|| {
                         // cov:ignore-start: get_labels_for_page_range only stores direct dictionary handles in raw_labels.
@@ -661,7 +661,7 @@ impl<'a, R: Read + Seek> PageLabelDocumentHelper<'a, R> {
             let (label, prefix_present) = match label {
                 Some(label) => {
                     let prefix_present = label.try_has_key(b"/P")?;
-                    let label = LabelRange::from_handle(self.pdf, &label)?.ok_or_else(|| {
+                    let label = LabelRange::from_handle(&label)?.ok_or_else(|| {
                         // cov:ignore-start: get_label_for_page_from_tree returns Some only for a dictionary handle.
                         Error::Unsupported("page label range is not a dictionary".to_string())
                     })?; // cov:ignore-end
@@ -695,7 +695,6 @@ impl<'a, R: Read + Seek> PageLabelDocumentHelper<'a, R> {
         let Some(label) = self.get_label_for_page_from_tree(&mut tree, page_idx)? else {
             return Ok(false);
         };
-        let label = self.pdf.resolve_handle(&label)?;
         label.try_has_key(b"/P")
     }
 
@@ -780,7 +779,44 @@ impl<R: Read + Seek> Pdf<R> {
 mod tests {
     use super::*;
     use crate::json::Json;
+    use crate::ObjectRef;
     use std::io::Cursor;
+
+    #[test]
+    fn label_range_propagates_an_unresolved_handle_error() {
+        let handle = ObjectHandle::new_indirect_unresolved(ObjectRef::new(99, 0), -1);
+        let error = LabelRange::from_handle(&handle).unwrap_err();
+        assert!(matches!(
+            error,
+            Error::Internal(ref message) if message == "object 99 0 belongs to a dropped PDF"
+        ));
+    }
+
+    /// `QPDFPageLabelDocumentHelper::getLabelForPage` reads `/P` with a plain
+    /// `label.getKey("/P")` and copies it into the result untouched
+    /// (`QPDFPageLabelDocumentHelper.cc:38,48`), so a non-string prefix raises
+    /// no diagnostic. Probed with qpdf 11.9.0 on `/P 42`, `/P /Foo` and
+    /// `/P [1 2]`: `--pages . 1-2 --` exits 0 with empty stderr for all three.
+    /// Reading through `try_get_string_value` instead would emit qpdf's
+    /// "operation for string attempted on object of type integer" warning and
+    /// turn the run into exit 3.
+    #[test]
+    fn non_string_prefix_decodes_to_empty_without_a_type_warning() {
+        for prefix in [
+            ObjectHandle::integer(42),
+            ObjectHandle::name(b"Foo".to_vec()),
+            ObjectHandle::array(vec![ObjectHandle::integer(1)]),
+        ] {
+            let label = ObjectHandle::dictionary(vec![
+                (b"/S".to_vec(), ObjectHandle::name(b"D".to_vec())),
+                (b"/P".to_vec(), prefix),
+            ]);
+            let range = LabelRange::from_handle(&label)
+                .expect("a non-string prefix must not raise a type warning")
+                .expect("the label is a dictionary");
+            assert_eq!(range.prefix, "");
+        }
+    }
 
     /// A minimal one-page PDF with no `/PageLabels` key at all (as opposed to
     /// [`pdf_with_pagelabels`], whose catalog always carries `/PageLabels`,
