@@ -1311,14 +1311,10 @@ mod tests {
     }
 
     #[test]
-    fn parser_leaves_a_single_dash_attached_value_unchanged_for_a_bare_option_not_registered_with_clap(
-    ) {
-        // "warning-exit-0" is in QPDF_BARE_LONG_OPTIONS but is not registered
-        // as a clap long flag anywhere in the real CLI, so it is absent from
-        // `known_long_options`: the single-dash abbreviation is never
-        // promoted to `--warning-exit-0`, and `option_name` on the
-        // unpromoted single-dash argument returns None, so
-        // canonical_top_level_option returns the argument untouched.
+    fn parser_leaves_a_single_dash_attached_value_unchanged_when_not_registered_with_clap() {
+        // A bare option that is not registered in the supplied clap command
+        // remains untouched; the real CLI registers warning-exit-0 on its
+        // top-level `Cli` surface.
         let command = clap::Command::new("flpdf");
         let parsed = ArgParser::from_command(command)
             .parse(vec!["flpdf".into(), "-warning-exit-0=1".into()])
@@ -1329,12 +1325,10 @@ mod tests {
 
     #[cfg(unix)]
     #[test]
-    fn parser_matches_the_ascii_path_for_a_non_utf8_attached_value_on_a_bare_option_not_registered_with_clap(
-    ) {
+    fn parser_matches_the_ascii_path_for_a_non_utf8_attached_value_when_not_registered_with_clap() {
         use std::os::unix::ffi::OsStringExt;
 
-        // Same option as
-        // parser_leaves_a_single_dash_attached_value_unchanged_for_a_bare_option_not_registered_with_clap,
+        // Same option as the unregistered bare-option case above,
         // but with a non-UTF-8 attached value so the raw-byte
         // canonical_top_level_non_utf8_option path runs instead of
         // canonical_top_level_option. Before this fix, that path applied the

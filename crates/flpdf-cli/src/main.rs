@@ -758,6 +758,9 @@ struct Cli {
     /// Suppress warning delivery while retaining qpdf's warning exit status.
     #[arg(long)]
     no_warn: bool,
+    /// Exit 0 when the job has warnings (`QPDFJob::Config::warningExitZero`).
+    #[arg(long = "warning-exit-0")]
+    warning_exit_zero: bool,
     /// Check whether the input's linearization hint tables are correct
     /// (qpdf --check-linearization).
     #[arg(
@@ -3108,6 +3111,7 @@ fn main() {
     } = preprocessed;
     let mut args = cli_parse_from_mode(residual_args, native_subcommand_mode);
     apply_raw_overrides(&mut args, raw_overrides);
+    let _ = CLI_WARNING_EXIT_ZERO.set(args.warning_exit_zero);
     // qpdf keeps --verbose on QPDFJob rather than on the password parser, but
     // the reader owns the authentication retry boundary in flpdf. Carry the
     // job policy through the existing PasswordArgs copy used by every open
@@ -3848,6 +3852,7 @@ fn new_cli_job(suppress_warnings: bool) -> QPDFJob {
     job.set_logger(cli_logger());
     job.set_message_prefix(progname());
     job.set_suppress_warnings(suppress_warnings);
+    job.set_warnings_exit_zero(cli_warning_exit_zero());
     job
 }
 
@@ -8701,6 +8706,17 @@ fn pdf_open_options_with_password_bytes(
 fn cli_logger() -> QPDFLogger {
     static LOGGER: OnceLock<QPDFLogger> = OnceLock::new();
     LOGGER.get_or_init(QPDFLogger::create).clone()
+}
+
+/// The qpdf CLI creates one QPDFJob for an invocation, but flpdf's top-level
+/// dispatch creates that same job at several route-specific boundaries. Keep
+/// the argv-owned warning-exit policy in one process-local slot so every
+/// canonical QPDFJob created by this invocation receives the same
+/// `Config::warningExitZero` state.
+static CLI_WARNING_EXIT_ZERO: OnceLock<bool> = OnceLock::new();
+
+fn cli_warning_exit_zero() -> bool {
+    CLI_WARNING_EXIT_ZERO.get().copied().unwrap_or(false)
 }
 
 fn standard_save_writer() -> CliResult<PipelineWriter> {

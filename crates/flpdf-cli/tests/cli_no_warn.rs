@@ -142,6 +142,36 @@ fn show_npages_no_warn_matches_qpdf_before_open_diagnostics_are_delivered() {
 }
 
 #[test]
+fn warning_exit_zero_keeps_no_warn_output_silent_and_changes_only_status() {
+    if !qpdf_or_skip() {
+        return;
+    }
+
+    let input = repairable_fixture();
+    let temp = tempfile::tempdir().expect("tempdir");
+    let qpdf_output = temp.path().join("qpdf-warning-exit-0.pdf");
+    let flpdf_output = temp.path().join("flpdf-warning-exit-0.pdf");
+    let input = input.to_str().expect("fixture path is UTF-8");
+    let qpdf_output_str = qpdf_output.to_str().expect("output path is UTF-8");
+
+    let qpdf = run_qpdf(&["--no-warn", "--warning-exit-0", input, qpdf_output_str]);
+    let flpdf = Command::cargo_bin("flpdf")
+        .expect("flpdf binary")
+        .args(["--no-warn", "--warning-exit-0", input])
+        .arg(&flpdf_output)
+        .output()
+        .expect("flpdf invocation");
+
+    assert_eq!(qpdf.status.code(), Some(0));
+    assert!(qpdf.stderr.is_empty());
+    assert_eq!(flpdf.status.code(), qpdf.status.code());
+    assert_eq!(flpdf.stdout, qpdf.stdout);
+    assert_eq!(flpdf.stderr, qpdf.stderr);
+    assert!(qpdf_output.exists());
+    assert!(flpdf_output.exists());
+}
+
+#[test]
 fn is_encrypted_no_warn_matches_qpdf_before_open_diagnostics_are_delivered() {
     if !qpdf_or_skip() {
         return;
