@@ -1492,6 +1492,17 @@ impl<R: Read + Seek> Pdf<R> {
             }
             let handle = self.get_object_handle(object_ref);
             if !handle.is_resolved() {
+                // Not a qpdf-modelled state, so this stays an internal error
+                // rather than a null resolution. `read_xrefStream` reads the
+                // stream through `readObjectAtOffset(..., skip_cache_if_in_xref
+                // = true)` (`QPDF.cc:956`), and that skip applies only while
+                // the object still has an effective xref row (`QPDF.cc:1664`).
+                // A superseded or freed row therefore takes the
+                // `updateCache(og, oh.getObj(), ...)` branch (`QPDF.cc:1691`)
+                // and caches the real /XRef stream, and `QPDF::resolve` returns
+                // immediately for anything already resolved
+                // (`QPDF.cc:1700-1704`). Installing a null here would put a
+                // null where qpdf holds the parsed stream.
                 return Err(Error::Internal(format!(
                     "canonical xref-stream handle {object_ref} was not resolved"
                 )));
@@ -1864,6 +1875,17 @@ mod compressible_owner_tests {
     fn parsed_xref_stream_handoff_rejects_an_unresolved_canonical_slot() {
         let mut pdf = pdf();
         let object_ref = ObjectRef::new(99, 0);
+        // qpdf never observes this state. `read_xrefStream` reads the stream
+        // through `readObjectAtOffset(..., skip_cache_if_in_xref = true)`
+        // (`QPDF.cc:956`), and that skip only applies when the object still has
+        // an effective xref row (`QPDF.cc:1664`); an absent or superseded row
+        // therefore takes the `updateCache(og, oh.getObj(), ...)` branch
+        // (`QPDF.cc:1691`) and caches the real /XRef stream. `QPDF::resolve`
+        // returns immediately for anything already resolved
+        // (`QPDF.cc:1700-1704`), so its absent-entry null path is unreachable
+        // for a parsed xref stream. An unresolved canonical slot here means the
+        // loader built a second object graph, which is a flpdf invariant
+        // violation rather than a qpdf-modelled document state.
         let source = ObjectHandle::new_indirect_unresolved(object_ref, -1);
         let error = pdf
             .install_parsed_xref_stream_handles(BTreeMap::from([(object_ref, source)]))
