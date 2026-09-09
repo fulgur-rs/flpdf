@@ -367,6 +367,17 @@ canonical へ移し bridge を 0 にした（残る参照は `tests/qpdf_route_h
 `flpdf-3yn9.48.73` で canonical `Pdf::open` の file/trailer/candidate recovery
 diagnosticsを `ResolverHandle::push_qpdf_warning`へ qpdfの呼出順で直接配送した。
 engineの `install_repair_diagnostics` / `replay_warnings` と
+### 2026-09-09 `flpdf-k4tn` correction
+
+`discard_lower_generations` は qpdf `read_xref` の post-chain cleanup であり、
+`reconstruct_xref` の line-scan return には適用しない。`flpdf-k4tn` では初段
+parse failure、`/Prev` failure、pending reconstruction、startxref recovery の
+各 return からこの呼び出しを撤去し、reconstructionで発見した複数generationを
+保持する。candidate xref-streamの再入だけは qpdfが内部で再び `read_xref` を
+呼ぶため、その境界でcleanupを行う。B21のproduction call countは通常経路と
+candidate再入の2箇所となる。B20に残る`deleted_objects`の経路差は別probeとして
+継続し、このissueでは変更していない。
+
 `DeferredDiagnosticsGuard`/defer-live stateは caller-zero で撤去済みである。
 `B27` の残差は owner-less public loader の `BootstrapHandleState` →
 `XrefReadContext` → `LoadedXref` staging と第2 document stateのみで、

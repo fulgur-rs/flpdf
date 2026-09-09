@@ -195,6 +195,34 @@ fn show_xref_discards_lower_raw_generation_after_prev_chain() {
     );
 }
 
+#[test]
+fn show_xref_preserves_generations_found_during_reconstruction() {
+    if !qpdf_available() {
+        if std::env::var_os("CI").is_some() {
+            panic!("{EXPECTED_QPDF_VERSION} is required for this parity test on CI");
+        }
+        eprintln!("skipping: {EXPECTED_QPDF_VERSION} is not available");
+        return;
+    }
+
+    let input =
+        std::path::Path::new("../../tests/fixtures/compat/recovered-catalog-pagelabels.pdf");
+    let qpdf = run_qpdf(input);
+    let flpdf = run_flpdf(input);
+
+    assert_eq!(flpdf.status.code(), qpdf.status.code());
+    assert_eq!(flpdf.stdout, qpdf.stdout);
+    assert_eq!(flpdf.stderr, qpdf.stderr);
+    assert!(qpdf
+        .stdout
+        .windows(b"5/0: uncompressed".len())
+        .any(|window| window == b"5/0: uncompressed"));
+    assert!(qpdf
+        .stdout
+        .windows(b"5/1: uncompressed".len())
+        .any(|window| window == b"5/1: uncompressed"));
+}
+
 /// A document that repairs its own table while the loader is still resolving
 /// the trailer keeps the repaired offsets in both views. qpdf rewrites
 /// `m->xref_table` in situ and resumes against it (`QPDF.cc:518-620`), so the

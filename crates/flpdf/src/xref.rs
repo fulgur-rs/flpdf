@@ -1933,11 +1933,6 @@ pub(crate) fn load_xref_state_from_bytes(
             None,
             canonical_trailer_owner,
         )?;
-        discard_lower_generations(
-            &mut recovered.raw_entries,
-            &mut recovered.loaded.entries,
-            &mut recovered.parsed_xref_streams,
-        );
         recovered.header_offset = header_offset;
         return Ok(recovered);
     }
@@ -2036,11 +2031,6 @@ pub(crate) fn load_xref_state_from_bytes(
                 observed_first_xref_item_offset,
                 canonical_trailer_owner,
             )?;
-            discard_lower_generations(
-                &mut recovered.raw_entries,
-                &mut recovered.loaded.entries,
-                &mut recovered.parsed_xref_streams,
-            );
             recovered.header_offset = header_offset;
             return Ok(recovered);
         }
@@ -2106,11 +2096,6 @@ pub(crate) fn load_xref_state_from_bytes(
                 canonical_trailer_owner,
             )?;
             let mut recovered = merge_recovered_qpdf_state(recovered, loaded, &deleted_objects);
-            discard_lower_generations(
-                &mut recovered.raw_entries,
-                &mut recovered.loaded.entries,
-                &mut recovered.parsed_xref_streams,
-            );
             recovered.header_offset = header_offset;
             return Ok(recovered);
             // cov:ignore-end
@@ -2237,11 +2222,6 @@ pub(crate) fn load_xref_state_from_bytes(
             canonical_trailer_owner,
             &mut recovered.loaded.repair_diagnostics,
         )?;
-        discard_lower_generations(
-            &mut recovered.raw_entries,
-            &mut recovered.loaded.entries,
-            &mut recovered.parsed_xref_streams,
-        );
         return Ok(recovered);
     }
     // cov:ignore-end
@@ -3234,6 +3214,7 @@ fn recover_xref_from_linear_scan(
     // caller (`load_xref_state_with_options`) always overwrites it via
     // `merge_recovered_qpdf_state` with the already-successfully-parsed
     // revision's own real form once this returns.
+    let mut candidate_xref_reentered = false;
     let (trailer, recovered_startxref, recovered_form, recovered_first_xref_item_offset) =
         if let Some(trailer) = fallback_trailer {
             (trailer.clone(), startxref, XrefForm::Table, 0)
@@ -3263,6 +3244,7 @@ fn recover_xref_from_linear_scan(
                         // Candidate re-entry has already consumed its local
                         // tombstones while filtering `entries`; never retain
                         // them past this recovery operation.
+                        candidate_xref_reentered = true;
                         bootstrap_cache = candidate_bootstrap_cache;
                         (trailer, max_offset, form, first_xref_item_offset)
                     }
@@ -3292,10 +3274,19 @@ fn recover_xref_from_linear_scan(
 
     deliver_canonical_diagnostics(canonical_trailer_owner, &mut repair_diagnostics)?;
 
-    let raw_entries = entries
+    let mut raw_entries = entries
         .iter()
         .map(|(object_ref, entry)| Ok((QpdfObjGen::try_from_object_ref(*object_ref)?, *entry)))
         .collect::<Result<BTreeMap<_, _>>>()?;
+    // qpdf's candidate path re-enters read_xref(max_offset) after the
+    // reconstruction line scan (QPDF.cc:576-607). That nested read_xref
+    // performs its own post-chain generation pruning (QPDF.cc:710-718),
+    // whereas a plain reconstruct_xref return preserves every valid
+    // line-scan generation. Keep this call scoped to the candidate re-entry
+    // rather than applying normal read_xref cleanup to all recovery results.
+    if candidate_xref_reentered {
+        discard_lower_generations(&mut raw_entries, &mut entries, &mut parsed_xref_streams);
+    }
     Ok(LoadedXrefState {
         loaded: LoadedXref {
             version,
