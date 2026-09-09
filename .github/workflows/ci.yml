@@ -328,6 +328,11 @@ jobs:
           # goldens end-to-end (raw-argv pre-split -> WriteOptions -> write path).
           # Gated behind qpdf-zlib-compat; must be run explicitly here.
           cargo test -p flpdf-cli --features qpdf-zlib-compat --test cli_byte_identical_overlay
+          # Pins --replace-input output byte-identity against qpdf end to end
+          # (temp file -> backup rename -> replaced input). The assertion is
+          # gated on qpdf-zlib-compat, so the plain workspace run above cfgs it
+          # out and this is its only execution.
+          cargo test -p flpdf-cli --features qpdf-zlib-compat --test cli_replace_input
           # Pins the overlay -> transformations ordering against qpdf's
           # createQPDF (handleUnderOverlay then handleTransformations,
           # QPDFJob.cc:472-473). The byte assertion is gated behind

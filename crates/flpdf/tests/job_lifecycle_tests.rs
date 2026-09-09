@@ -1851,6 +1851,31 @@ fn argv_replace_input_rejects_an_output_file() {
     ));
 }
 
+/// `ArgParser::argReplaceInput` calls `Config::replaceInput` for every
+/// occurrence of the flag (`libqpdf/QPDFJob_argv.cc:91-96`), and that setter
+/// treats an already-set `replace_input` as an output that has been given
+/// (`libqpdf/QPDFJob_config.cc:53-61`). Probed with qpdf 11.9.0:
+/// `qpdf --replace-input --replace-input in.pdf` exits 2 with
+/// `replace-input can't be used since output file has already been given`.
+#[test]
+fn argv_replace_input_rejects_a_duplicate_flag() {
+    let args = vec![
+        "qpdfjob".to_owned(),
+        "input.pdf".to_owned(),
+        "--replace-input".to_owned(),
+        "--replace-input".to_owned(),
+    ];
+    let mut job = QPDFJob::new();
+    let error = job
+        .initialize_from_argv(&args)
+        .expect_err("a repeated --replace-input is a usage error");
+    assert!(matches!(
+        error,
+        Error::Usage(usage)
+            if usage.to_string() == "replace-input can't be used since output file has already been given"
+    ));
+}
+
 #[test]
 fn config_replace_input_rejects_existing_output_and_duplicate_configuration() {
     let output = Path::new("output.pdf");

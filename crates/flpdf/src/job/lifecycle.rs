@@ -1817,11 +1817,14 @@ impl QPDFJob {
             None if self.configuration.progress => {
                 let logger = self.logger.clone();
                 let prefix = self.message_prefix.clone();
+                // `writeOutfile` swaps `m->outfilename` to the `.~qpdf-temp#`
+                // replacement target before `setWriterOptions` builds this
+                // reporter (`libqpdf/QPDFJob.cc:3033-3037` then `:2926-2935`),
+                // so the label is the effective destination, not the output
+                // slot the caller filled in.
                 let output_name = self
-                    .configuration
-                    .output_file
-                    .as_deref()
-                    .filter(|path| *path != Path::new("-"))
+                    .output_destination()
+                    .filter(|path| path.as_path() != Path::new("-"))
                     .map_or_else(
                         || "standard output".to_owned(),
                         |path| path.display().to_string(),
@@ -1891,7 +1894,21 @@ impl QPDFJob {
                     "--set-page-labels" => page_label_specs = Some(Vec::new()),
                     "--deterministic-id" => configuration.writer.set_deterministic_id(true),
                     "--static-id" => configuration.writer.set_static_id(true),
-                    "--replace-input" => configuration.replace_input = true,
+                    "--replace-input" => {
+                        // `ArgParser::argReplaceInput` reaches
+                        // `Config::replaceInput` for every occurrence of the
+                        // flag (`libqpdf/QPDFJob_argv.cc:91-96`), and that
+                        // setter rejects a second output selection —
+                        // `replace_input` being already set counts
+                        // (`libqpdf/QPDFJob_config.cc:53-61`).
+                        if configuration.replace_input {
+                            return Err(UsageError::new(
+                                "replace-input can't be used since output file has already been given",
+                            )
+                            .into());
+                        }
+                        configuration.replace_input = true;
+                    }
                     "--decrypt" => {
                         configuration.writer.set_preserve_encryption(false);
                     }
