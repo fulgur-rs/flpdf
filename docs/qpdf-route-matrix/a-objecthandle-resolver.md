@@ -449,6 +449,26 @@ the production caller-zero boundary, and
 resolver failure remains a `Result`. qtest and qtest-exceptions consumers remain
 outside this slice.
 
+### A6/A7/A8 linearization check/show accessor slice `flpdf-3yn9.48.23.9` (2026-09-10)
+
+The bounded linearization consumer slice in
+`crates/flpdf/src/linearization/check.rs` and `show.rs` now uses the resolving
+`try_as_integer`, `try_as_array`, `try_as_name`, and `try_is_null` accessors for
+qpdf's `/Linearized`, `/L`, `/N`, `/O`, `/P`, `/H`, `/S`, `/T`, and `/PageMode`
+observations. The production route contract reports zero non-resolving
+dictionary, array, integer, name, null, key, or `Pdf::resolve*` bridge calls in
+these two modules. Silent `as_real`/`as_string` observations remain only where
+there is no resolving Rust counterpart; qtest exception attribution and writer
+emission routes are outside this slice.
+
+The qpdf source boundary is `QPDFObjectHandle.cc:240-446,759-785,965-989,
+2168-2189`, with the linearization owner at `QPDF_linearization.cc:84-230,
+419-470`. Existing qpdf differential tests for `check-linearization`,
+`show-linearization`, page-operation linearization, and deep linearization
+remain the behavioral RED/GREEN evidence. The CRLF-normalized
+`linearization_accessor_route_contract_tests` guards the production caller-zero
+boundary on Windows as well as Unix.
+
 ### 2026-09-09 canonical cache cutover supersession
 
 The A1/A2/A9/A10/A11/A13/A15/A16/A17/A24 rows above were authored before

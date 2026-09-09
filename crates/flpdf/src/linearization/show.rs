@@ -570,10 +570,10 @@ fn param_u64(dict: &ObjectHandle, key: &'static str) -> ShowResult<u64> {
 /// handle. This is used for array items such as qpdf's `/H` fields, where a
 /// second dictionary lookup would be a type error.
 fn integer_u64(value: &ObjectHandle, _key: &str) -> ShowResult<u64> {
-    value
-        .try_dereference()
-        .map_err(ShowLinearizationError::from)?;
-    match value.as_integer() {
+    match value
+        .try_as_integer()
+        .map_err(ShowLinearizationError::from)?
+    {
         Some(n) if n >= 0 => Ok(n as u64),
         _ => Err(malformed!(
             "some keys in linearization dictionary are of the wrong type"
@@ -607,10 +607,10 @@ fn is_linearized(dict: &ObjectHandle, file_size: u64) -> ShowResult<bool> {
     let length = dict
         .try_get_key(b"/L")
         .map_err(ShowLinearizationError::from)?;
-    length
-        .try_dereference()
-        .map_err(ShowLinearizationError::from)?;
-    if let Some(l) = length.as_integer() {
+    if let Some(l) = length
+        .try_as_integer()
+        .map_err(ShowLinearizationError::from)?
+    {
         if l < 0 || l as u64 != file_size {
             return Ok(false);
         }
@@ -635,23 +635,22 @@ fn read_lin_parameters(dict: &ObjectHandle, file_size: u64) -> ShowResult<LinPar
     let p = dict
         .try_get_key(b"/P")
         .map_err(ShowLinearizationError::from)?;
-    p.try_dereference().map_err(ShowLinearizationError::from)?;
-    let first_page: i64 = if let Some(n) = p.as_integer() {
-        n
-    } else if p.is_null() {
-        0
-    } else {
-        return Err(malformed!(
-            "some keys in linearization dictionary are of the wrong type"
-        ));
-    };
+    let first_page: i64 =
+        if let Some(n) = p.try_as_integer().map_err(ShowLinearizationError::from)? {
+            n
+        } else if p.try_is_null().map_err(ShowLinearizationError::from)? {
+            0
+        } else {
+            return Err(malformed!(
+                "some keys in linearization dictionary are of the wrong type"
+            ));
+        };
     // /H is [offset length] or [offset length offset length] for an overflow
     // table. qpdf rejects every other cardinality before reading the items.
     let h = dict
         .try_get_key(b"/H")
         .map_err(ShowLinearizationError::from)?;
-    h.try_dereference().map_err(ShowLinearizationError::from)?;
-    let Some(h_items) = h.as_array() else {
+    let Some(h_items) = h.try_as_array().map_err(ShowLinearizationError::from)? else {
         return Err(malformed!(
             "some keys in linearization dictionary are of the wrong type"
         ));
@@ -724,10 +723,10 @@ pub(crate) fn read_hint_offsets(hint_dict: &ObjectHandle) -> ShowResult<(usize, 
     let outline = hint_dict
         .try_get_key(b"/O")
         .map_err(ShowLinearizationError::from)?;
-    outline
-        .try_dereference()
-        .map_err(ShowLinearizationError::from)?;
-    let outline_offset = if let Some(value) = outline.as_integer() {
+    let outline_offset = if let Some(value) = outline
+        .try_as_integer()
+        .map_err(ShowLinearizationError::from)?
+    {
         if value < 0 {
             return Err(malformed!("hint stream /O offset is negative"));
         }
