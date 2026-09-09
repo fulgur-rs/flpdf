@@ -781,13 +781,14 @@ impl<'a, R: Read + Seek> PageLabelDocumentHelper<'a, R> {
         let mut tree = self.pagelabels_tree()?;
         let mut out = Vec::with_capacity(src_indices.len());
         for (i, &src_idx) in src_indices.iter().enumerate() {
-            let out_idx = out_start_idx
-                .checked_add(i64::try_from(i).map_err(|_| {
-                    Error::Unsupported("page label selection index overflow".to_string())
-                })?)
-                .ok_or_else(|| {
-                    Error::Unsupported("page label output index overflow".to_string())
-                })?;
+            let i = i64::try_from(i).map_err(|_| {
+                // cov:ignore-start: supported targets cannot allocate more than i64::MAX items.
+                Error::Unsupported("page label selection index overflow".to_string())
+                // cov:ignore-end
+            })?; // cov:ignore: the same allocation bound is unrepresentable on supported targets
+            let out_idx = out_start_idx.checked_add(i).ok_or_else(|| {
+                Error::Unsupported("page label output index overflow".to_string())
+            })?;
             let label = match tree.as_mut() {
                 Some(tree) => self.get_label_for_page_from_tree(tree, src_idx)?,
                 None => None,
@@ -1410,6 +1411,14 @@ mod tests {
             .labels_for_selection(&[0, 1], i64::MAX)
             .expect_err("selection output index must use checked arithmetic");
         assert!(error.to_string().contains("output index overflow"));
+
+        let error = pdf
+            .page_labels()
+            .labels_for_selection_raw(&[0, 1], i64::MAX)
+            .expect_err("raw selection output index must use checked arithmetic");
+        assert!(error
+            .to_string()
+            .contains("page label output index overflow"));
     }
 
     #[test]
@@ -1420,6 +1429,49 @@ mod tests {
             .labels_for_selection(&[0], i64::MAX)
             .expect_err("fabricated selection /St must use checked arithmetic");
         assert!(error.to_string().contains("fabricated start overflow"));
+
+        let error = pdf
+            .page_labels()
+            .labels_for_selection_raw(&[0], i64::MAX)
+            .expect_err("raw fabricated selection /St must use checked arithmetic");
+        assert!(error.to_string().contains("fabricated start overflow"));
+    }
+
+    #[test]
+    fn raw_label_merges_compare_qpdf_values_and_keep_nonredundant_entries() {
+        let label = |prefix: ObjectHandle, start| {
+            ObjectHandle::dictionary(vec![
+                (b"/S".to_vec(), ObjectHandle::name(b"D".to_vec())),
+                (b"/P".to_vec(), prefix),
+                (b"/St".to_vec(), ObjectHandle::integer(start)),
+            ])
+        };
+        let ranges = vec![
+            (0, label(ObjectHandle::integer(42), 1)),
+            (1, label(ObjectHandle::integer(42), 2)),
+            (2, label(ObjectHandle::name(b"Foo".to_vec()), 3)),
+        ];
+        let merged = merge_adjacent_raw_labels(ranges).expect("raw merge");
+        assert_eq!(merged.len(), 2);
+
+        let ranges = vec![
+            RawPageLabelEntry {
+                index: 0,
+                source_id: 1,
+                label: label(ObjectHandle::integer(42), 1),
+            },
+            RawPageLabelEntry {
+                index: 1,
+                source_id: 1,
+                label: label(ObjectHandle::integer(42), 2),
+            },
+        ];
+        assert_eq!(
+            merge_adjacent_raw_page_labels(ranges)
+                .expect("raw foreign merge")
+                .len(),
+            1
+        );
     }
 
     #[test]
@@ -1962,6 +2014,8 @@ mod tests {
         h.write_reconstructed_labels(&[(0, none_range(1))]).unwrap();
         h.write_reconstructed_labels_with_prefix_presence(&[(0, none_range(1), false)])
             .unwrap();
+        h.write_reconstructed_labels_raw(&[(0, ObjectHandle::dictionary(Vec::new()))])
+            .unwrap();
     }
 
     #[test]
@@ -1973,6 +2027,8 @@ mod tests {
         let mut h = pdf.page_labels();
         h.write_reconstructed_labels(&[(0, none_range(1))]).unwrap();
         h.write_reconstructed_labels_with_prefix_presence(&[(0, none_range(1), false)])
+            .unwrap();
+        h.write_reconstructed_labels_raw(&[(0, ObjectHandle::dictionary(Vec::new()))])
             .unwrap();
     }
 

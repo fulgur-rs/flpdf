@@ -107,7 +107,7 @@ fn non_string_prefix_two_page_pdf(prefix: &str) -> Vec<u8> {
     let objects: &[(u32, String)] = &[
         (
             1,
-            format!("<< /Type /Catalog /Pages 2 0 R /PageLabels << /Nums [0 5 0 R] >> >>"),
+            "<< /Type /Catalog /Pages 2 0 R /PageLabels << /Nums [0 5 0 R] >> >>".to_owned(),
         ),
         (
             2,
