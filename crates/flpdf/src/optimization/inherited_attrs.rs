@@ -99,62 +99,26 @@ fn push_direct_node<R: Read + Seek>(
     allow_changes: bool,
     warn_skipped_keys: bool,
 ) -> Result<()> {
-    if !is_pages_dictionary(dict) {
-        return Ok(());
-    }
-
-    // cov:ignore-start: all production callers pass warn_skipped_keys=false
-    if warn_skipped_keys && dict.try_has_key(b"/Parent")? {
-        for key in dict.try_get_keys()? {
-            if !INHERITABLE_KEYS.contains(&key.as_slice())
-                && ![b"/Type".as_slice(), b"/Parent", b"/Kids", b"/Count"].contains(&key.as_slice())
-            {
-                let object = dict
-                    .object_ref()
-                    .map(|r| format!("Pages object: object {} {}", r.number, r.generation))
-                    .unwrap_or_else(|| "Pages object".to_owned());
-                pdf.push_qpdf_warning(crate::QpdfExc::new(
-                    crate::QpdfErrorCode::DamagedPdf,
-                    pdf.input_description(),
-                    object,
-                    0,
-                    format!(
-                        "Unknown key /{} in /Pages object is being discarded as a result of flattening the /Pages tree",
-                        String::from_utf8_lossy(key.strip_prefix(b"/").unwrap_or(&key)),
-                    ),
-                ))?;
-            }
-        }
-    }
+    // cov:ignore-start: LLVM maps this covered frame-construction call to an untracked terminator
+    let Some(frame) = enter_direct_frame(
+        pdf,
+        dict.clone(),
+        key_ancestors,
+        allow_changes,
+        warn_skipped_keys,
+    )?
     // cov:ignore-end
-
-    let own_keys = push_node_attributes(pdf, dict, key_ancestors, allow_changes)?;
-    let kids = dict.get_key(b"/Kids");
-    if let Some(kids) = kids.as_array() {
-        for kid in kids {
-            if let Some(kid_ref) = handle_reference(&kid) {
-                push_child_reference(
-                    pdf,
-                    kid_ref,
-                    key_ancestors,
-                    visited,
-                    allow_changes,
-                    warn_skipped_keys,
-                )?; // cov:ignore: direct-root integration test exercises this branch; LLVM attributes the counter to push_child_reference
-            } else if kid.as_dictionary().is_some() && kid.has_key(b"/Kids") {
-                push_direct_node(
-                    pdf,
-                    &kid,
-                    key_ancestors,
-                    visited,
-                    allow_changes,
-                    warn_skipped_keys,
-                )?; // cov:ignore: direct-descendant integration test exercises this branch; LLVM attributes the counter to push_direct_node
-            } // cov:ignore: direct-descendant integration test exercises the branch; LLVM attributes the counter to the recursive callee
-        }
-    }
-    pop_node_attributes(key_ancestors, own_keys);
-    Ok(())
+    else {
+        return Ok(());
+    };
+    walk_inherited_frames(
+        pdf,
+        vec![frame],
+        key_ancestors,
+        visited,
+        allow_changes,
+        warn_skipped_keys,
+    )
 }
 
 fn push_node_attributes<R: Read + Seek>(
@@ -210,6 +174,170 @@ fn pop_node_attributes(
     }
 }
 
+#[derive(Clone, Copy)]
+enum InheritedFrameKind {
+    Direct,
+    Indirect,
+}
+
+struct InheritedFrame {
+    kind: InheritedFrameKind,
+    kids: Vec<ObjectHandle>,
+    next_kid: usize,
+    own_keys: Vec<&'static [u8]>,
+}
+
+fn warn_skipped_pages_keys<R: Read + Seek>(
+    pdf: &mut Pdf<R>,
+    dict: &ObjectHandle,
+    warn_skipped_keys: bool,
+    object: String,
+) -> Result<()> {
+    // cov:ignore-start: all production callers pass warn_skipped_keys=false
+    if warn_skipped_keys && dict.try_has_key(b"/Parent")? {
+        for key in dict.try_get_keys()? {
+            if !INHERITABLE_KEYS.contains(&key.as_slice())
+                && ![b"/Type".as_slice(), b"/Parent", b"/Kids", b"/Count"].contains(&key.as_slice())
+            {
+                pdf.push_qpdf_warning(crate::QpdfExc::new(
+                    crate::QpdfErrorCode::DamagedPdf,
+                    pdf.input_description(),
+                    object.clone(),
+                    0,
+                    format!(
+                        "Unknown key /{} in /Pages object is being discarded as a result of flattening the /Pages tree",
+                        String::from_utf8_lossy(key.strip_prefix(b"/").unwrap_or(&key)),
+                    ),
+                ))?;
+            }
+        }
+    }
+    // cov:ignore-end
+    Ok(())
+}
+
+fn enter_direct_frame<R: Read + Seek>(
+    pdf: &mut Pdf<R>,
+    dict: ObjectHandle,
+    key_ancestors: &mut BTreeMap<&'static [u8], Vec<ObjectHandle>>,
+    allow_changes: bool,
+    warn_skipped_keys: bool,
+) -> Result<Option<InheritedFrame>> {
+    if !is_pages_dictionary(&dict) {
+        return Ok(None);
+    }
+    let object = dict
+        .object_ref()
+        .map(|r| format!("Pages object: object {} {}", r.number, r.generation))
+        .unwrap_or_else(|| "Pages object".to_owned());
+    warn_skipped_pages_keys(pdf, &dict, warn_skipped_keys, object)?;
+    let own_keys = push_node_attributes(pdf, &dict, key_ancestors, allow_changes)?;
+    let kids = dict.get_key(b"/Kids").as_array().unwrap_or_default();
+    Ok(Some(InheritedFrame {
+        kind: InheritedFrameKind::Direct,
+        kids,
+        next_kid: 0,
+        own_keys,
+    }))
+}
+
+fn enter_indirect_frame<R: Read + Seek>(
+    pdf: &mut Pdf<R>,
+    node_ref: ObjectRef,
+    key_ancestors: &mut BTreeMap<&'static [u8], Vec<ObjectHandle>>,
+    visited: &mut BTreeSet<ObjectRef>,
+    allow_changes: bool,
+    warn_skipped_keys: bool,
+) -> Result<Option<InheritedFrame>> {
+    if !visited.insert(node_ref) {
+        return Ok(None); // cov:ignore: page-tree repair rejects cycles before inherited-attribute push
+    }
+    let dict = pdf.get_object_handle(node_ref);
+    pdf.resolve(&dict)?;
+    if dict.as_dictionary().is_none() || !is_pages_dictionary(&dict) {
+        return Ok(None);
+    }
+    warn_skipped_pages_keys(
+        pdf,
+        &dict,
+        warn_skipped_keys,
+        format!(
+            "Pages object: object {} {}",
+            node_ref.number, node_ref.generation
+        ),
+    )?;
+    let own_keys = push_node_attributes(pdf, &dict, key_ancestors, allow_changes)?;
+    let kids = dict.get_key(b"/Kids").as_array().unwrap_or_default();
+    Ok(Some(InheritedFrame {
+        kind: InheritedFrameKind::Indirect,
+        kids,
+        next_kid: 0,
+        own_keys,
+    }))
+}
+
+fn walk_inherited_frames<R: Read + Seek>(
+    pdf: &mut Pdf<R>,
+    initial: Vec<InheritedFrame>,
+    key_ancestors: &mut BTreeMap<&'static [u8], Vec<ObjectHandle>>,
+    visited: &mut BTreeSet<ObjectRef>,
+    allow_changes: bool,
+    warn_skipped_keys: bool,
+) -> Result<()> {
+    let mut frames = initial;
+    while let Some(frame) = frames.last_mut() {
+        if frame.next_kid >= frame.kids.len() {
+            let finished = frames.pop().expect("frame exists");
+            pop_node_attributes(key_ancestors, finished.own_keys);
+            continue;
+        }
+
+        let kid = frame.kids[frame.next_kid].clone();
+        frame.next_kid += 1;
+        match frame.kind {
+            InheritedFrameKind::Direct => {
+                if let Some(kid_ref) = handle_reference(&kid) {
+                    if let Some(child) = push_child_reference(
+                        pdf,
+                        kid_ref,
+                        key_ancestors,
+                        visited,
+                        allow_changes,
+                        warn_skipped_keys,
+                    )? {
+                        frames.push(child);
+                    }
+                } else if kid.as_dictionary().is_some() && kid.has_key(b"/Kids") {
+                    if let Some(child) = enter_direct_frame(
+                        pdf,
+                        kid,
+                        key_ancestors,
+                        allow_changes,
+                        warn_skipped_keys,
+                    )? {
+                        frames.push(child);
+                    }
+                } // cov:ignore: LLVM maps the covered direct-reference frame branch terminator separately
+            }
+            InheritedFrameKind::Indirect => {
+                if let Some(kid_ref) = handle_reference(&kid) {
+                    if let Some(child) = push_child_reference(
+                        pdf,
+                        kid_ref,
+                        key_ancestors,
+                        visited,
+                        allow_changes,
+                        warn_skipped_keys,
+                    )? {
+                        frames.push(child);
+                    }
+                } // cov:ignore: LLVM maps the covered indirect-reference frame branch terminator separately
+            }
+        }
+    }
+    Ok(())
+}
+
 fn push_child_reference<R: Read + Seek>(
     pdf: &mut Pdf<R>,
     kid_ref: ObjectRef,
@@ -217,12 +345,11 @@ fn push_child_reference<R: Read + Seek>(
     visited: &mut BTreeSet<ObjectRef>,
     allow_changes: bool,
     warn_skipped_keys: bool,
-) -> Result<()> {
+) -> Result<Option<InheritedFrame>> {
     let child = pdf.get_object_handle(kid_ref);
     pdf.resolve(&child)?;
-    let is_pages_node = is_pages_dictionary(&child);
-    if is_pages_node {
-        return push_internal(
+    if is_pages_dictionary(&child) {
+        return enter_indirect_frame(
             pdf,
             kid_ref,
             key_ancestors,
@@ -233,7 +360,7 @@ fn push_child_reference<R: Read + Seek>(
     }
 
     if child.as_dictionary().is_none() {
-        return Ok(()); // cov:ignore: page-tree repair guarantees indirect children are dictionaries
+        return Ok(None); // cov:ignore: page-tree repair guarantees indirect children are dictionaries
     }
     for (&key, values) in key_ancestors.iter() {
         let present = match child
@@ -250,7 +377,7 @@ fn push_child_reference<R: Read + Seek>(
             }
         }
     }
-    Ok(())
+    Ok(None)
 }
 
 fn push_internal<R: Read + Seek>(
@@ -261,64 +388,25 @@ fn push_internal<R: Read + Seek>(
     allow_changes: bool,
     warn_skipped_keys: bool,
 ) -> Result<()> {
-    if !visited.insert(node_ref) {
-        return Ok(()); // cov:ignore: page-tree repair rejects cycles before inherited-attribute push
-    }
-
-    let dict = pdf.get_object_handle(node_ref);
-    pdf.resolve(&dict)?;
-    if dict.as_dictionary().is_none() {
+    let Some(frame) = enter_indirect_frame(
+        pdf,
+        node_ref,
+        key_ancestors,
+        visited,
+        allow_changes,
+        warn_skipped_keys,
+    )?
+    else {
         return Ok(());
-    }
-    if !is_pages_dictionary(&dict) {
-        return Ok(());
-    }
-
-    if warn_skipped_keys && dict.try_has_key(b"/Parent")? {
-        for key in dict.try_get_keys()? {
-            if !INHERITABLE_KEYS.contains(&key.as_slice())
-                && ![b"/Type".as_slice(), b"/Parent", b"/Kids", b"/Count"].contains(&key.as_slice())
-            {
-                let object = format!(
-                    "Pages object: object {} {}",
-                    node_ref.number, node_ref.generation
-                );
-                pdf.push_qpdf_warning(crate::QpdfExc::new(
-                    crate::QpdfErrorCode::DamagedPdf,
-                    pdf.input_description(),
-                    object,
-                    0,
-                    format!(
-                        "Unknown key /{} in /Pages object is being discarded as a result of flattening the /Pages tree",
-                        String::from_utf8_lossy(key.strip_prefix(b"/").unwrap_or(&key)),
-                    ),
-                ))?;
-            }
-        }
-    }
-
-    let own_keys = push_node_attributes(pdf, &dict, key_ancestors, allow_changes)?;
-
-    let kids = dict.get_key(b"/Kids").as_array();
-
-    if let Some(kids) = kids {
-        for kid in kids {
-            let Some(kid_ref) = handle_reference(&kid) else {
-                continue;
-            };
-            push_child_reference(
-                pdf,
-                kid_ref,
-                key_ancestors,
-                visited,
-                allow_changes,
-                warn_skipped_keys,
-            )?;
-        }
-    }
-
-    pop_node_attributes(key_ancestors, own_keys);
-    Ok(())
+    };
+    walk_inherited_frames(
+        pdf,
+        vec![frame],
+        key_ancestors,
+        visited,
+        allow_changes,
+        warn_skipped_keys,
+    )
 }
 
 fn is_pages_dictionary(handle: &ObjectHandle) -> bool {
@@ -573,5 +661,77 @@ mod tests {
         );
 
         push(&mut pdf, &prepared, true, false).expect("push over a direct Catalog root");
+    }
+
+    #[test]
+    fn explicit_frames_cover_direct_indirect_and_non_pages_entries() {
+        let mut pdf = Pdf::open_mem_owned(pdf_bytes(&[
+            (1, b"<< /Type /Catalog /Pages 2 0 R >>"),
+            (2, b"<< /Type /Pages /Kids [3 0 R] /Count 1 >>"),
+            (3, b"<< /Type /Pages /Kids [4 0 R] /Count 1 >>"),
+            (4, b"<< /Type /Page /MediaBox [0 0 612 792] >>"),
+        ]))
+        .unwrap();
+        let mut key_ancestors = BTreeMap::new();
+        let mut visited = BTreeSet::new();
+        push_internal(
+            &mut pdf,
+            ObjectRef::new(2, 0),
+            &mut key_ancestors,
+            &mut visited,
+            true,
+            false,
+        )
+        .expect("indirect child Pages frame");
+
+        let direct_root = ObjectHandle::dictionary(vec![
+            (b"/Type".to_vec(), ObjectHandle::name(b"Pages".to_vec())),
+            (
+                b"/Kids".to_vec(),
+                ObjectHandle::array(vec![
+                    pdf.get_object_handle(ObjectRef::new(3, 0)),
+                    ObjectHandle::dictionary(vec![
+                        (b"/Type".to_vec(), ObjectHandle::name(b"Pages".to_vec())),
+                        (
+                            b"/Kids".to_vec(),
+                            ObjectHandle::array(vec![pdf.get_object_handle(ObjectRef::new(4, 0))]),
+                        ),
+                    ]),
+                ]),
+            ),
+        ]);
+        let mut key_ancestors = BTreeMap::new();
+        let mut visited = BTreeSet::new();
+        push_direct_node(
+            &mut pdf,
+            &direct_root,
+            &mut key_ancestors,
+            &mut visited,
+            true,
+            false,
+        )
+        .expect("direct child Pages frame");
+
+        let scalar = ObjectHandle::integer(7);
+        let mut key_ancestors = BTreeMap::new();
+        let mut visited = BTreeSet::new();
+        push_direct_node(
+            &mut pdf,
+            &scalar,
+            &mut key_ancestors,
+            &mut visited,
+            true,
+            false,
+        )
+        .expect("non-Pages direct node is skipped");
+        push_internal(
+            &mut pdf,
+            ObjectRef::new(1, 0),
+            &mut key_ancestors,
+            &mut visited,
+            true,
+            false,
+        )
+        .expect("non-Pages indirect node is skipped");
     }
 }

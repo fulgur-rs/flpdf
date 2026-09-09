@@ -187,6 +187,20 @@ struct CanonicalRepairState {
     pages: Vec<ObjectRef>,
 }
 
+/// One suspended `getAllPagesInternal` frame.
+///
+/// qpdf uses the native call stack for this walk. Keep the same parent-before-
+/// child and child-array order while moving the Rust stack frames to the heap,
+/// so deeply nested valid trees do not hit the debug thread-stack limit.
+struct RepairFrame {
+    node: ObjectHandle,
+    kids: ObjectHandle,
+    next_kid: usize,
+    kid_count: usize,
+    depth: usize,
+    inherited_media_box: bool,
+}
+
 /// Canonical `QPDF::getAllPagesInternal` walk (`QPDF_pages.cc:77-138`).
 ///
 /// The holder and every child remain live handles throughout this function.
@@ -201,59 +215,35 @@ fn repair_page_tree_handle<R: Read + Seek>(
     inherited_media_box: bool,
     max_depth: Option<usize>,
 ) -> Result<()> {
-    if max_depth.is_some_and(|max_depth| depth >= max_depth) {
-        let location = node
-            .object_ref()
-            .map_or_else(|| "direct /Pages node".to_owned(), |r| r.to_string());
-        return Err(Error::Unsupported(format!(
-            "page tree depth exceeds maximum of {} at {location}",
-            max_depth.expect("checked above")
-        )));
-    }
-    if let Some(object_ref) = node.object_ref() {
-        if !state.visited.insert(object_ref) {
-            return Err(page_tree_cycle_error(pdf));
-        }
-    } else if !state.visited_direct.insert(node.identity_key()) {
-        return Err(page_tree_cycle_error(pdf)); // cov:ignore: parsed PDF /Pages nodes are indirect; retain this defensive direct-handle cycle guard for canonical ObjectHandle callers.
-    }
-
-    node.try_dereference()?;
-    if node.try_as_dictionary()?.is_none() || !node.try_has_key(b"/Kids")? {
-        return Ok(()); // cov:ignore: callers recurse only after observing a dictionary /Kids key
-    }
-
-    if !node.try_is_dictionary_of_type(b"Pages", b"")? {
-        node.warn_if_possible("/Type key should be /Pages but is not; overriding")?;
-        replace_handle_key(pdf, &node, b"/Type", ObjectHandle::name(b"Pages".to_vec()))?;
-    }
-
-    let media_box = if inherited_media_box {
-        true
-    } else {
-        is_rectangle_handle(&node.try_get_key(b"/MediaBox")?)?
-    };
-    let kids = node.try_get_key(b"/Kids")?;
-    let Some(kid_count) = kids.try_array_len()? else {
-        // QPDFObjectHandle::getArrayNItems warns and treats a non-array as
-        // empty (`QPDFObjectHandle.cc:758-768`).
-        let type_name = kids.type_name()?;
-        kids.warn_if_possible(
-            format!(
-                "operation for array attempted on object of type {}: treating as empty",
-                type_name
-            )
-            .as_str(),
-        )?; // cov:ignore: warning-sink failure is not injectable through the qpdf success oracle
+    let Some(frame) =
+        repair_page_tree_frame(pdf, node, state, depth, inherited_media_box, max_depth)?
+    else {
         return Ok(());
     };
+    let mut frames = vec![frame];
 
-    for index in 0..kid_count {
+    while let Some(frame) = frames.last_mut() {
+        if frame.next_kid >= frame.kid_count {
+            frames.pop();
+            continue;
+        }
+
+        let index = frame.next_kid;
+        frame.next_kid += 1;
+        let parent = frame.node.clone();
+        let kids = frame.kids.clone();
+        let frame_depth = frame.depth;
+        let media_box = frame.inherited_media_box;
         let Some(mut kid) = kids.try_array_item(index)? else {
             continue;
         };
+
         if kid.try_has_key(b"/Kids")? {
-            repair_page_tree_handle(pdf, kid, state, depth + 1, media_box, max_depth)?;
+            if let Some(child) =
+                repair_page_tree_frame(pdf, kid, state, frame_depth + 1, media_box, max_depth)?
+            {
+                frames.push(child);
+            }
             continue;
         }
 
@@ -279,7 +269,7 @@ fn repair_page_tree_handle<R: Read + Seek>(
         }
 
         if kid.is_direct() {
-            node.warn_if_possible(
+            parent.warn_if_possible(
                 format!("kid {index} (from 0) is direct; converting to indirect").as_str(),
             )?; // cov:ignore: warning-sink failure is not injectable through the qpdf success oracle
             kid = promote_page_handle(pdf, kid)?;
@@ -290,9 +280,12 @@ fn repair_page_tree_handle<R: Read + Seek>(
             kids.set_array_item(index, kid.clone())?;
         } else if let Some(object_ref) = kid.object_ref() {
             if !state.seen.insert(object_ref) {
-                node.warn_if_possible(format!(
-                    "kid {index} (from 0) appears more than once in the pages tree; creating a new page object as a copy"
-                ).as_str())?;
+                parent.warn_if_possible(
+                    format!(
+                        "kid {index} (from 0) appears more than once in the pages tree; creating a new page object as a copy"
+                    )
+                    .as_str(),
+                )?; // cov:ignore: LLVM maps this covered duplicate-repair warning terminator separately
                 let copied = kid.shallow_copy()?;
                 kid = promote_page_handle(pdf, copied)?;
                 let copied_ref = kid
@@ -313,6 +306,70 @@ fn repair_page_tree_handle<R: Read + Seek>(
         state.pages.push(page_ref);
     }
     Ok(())
+}
+
+fn repair_page_tree_frame<R: Read + Seek>(
+    pdf: &mut Pdf<R>,
+    node: ObjectHandle,
+    state: &mut CanonicalRepairState,
+    depth: usize,
+    inherited_media_box: bool,
+    max_depth: Option<usize>,
+) -> Result<Option<RepairFrame>> {
+    if max_depth.is_some_and(|max_depth| depth >= max_depth) {
+        let location = node
+            .object_ref()
+            .map_or_else(|| "direct /Pages node".to_owned(), |r| r.to_string());
+        return Err(Error::Unsupported(format!(
+            "page tree depth exceeds maximum of {} at {location}",
+            max_depth.expect("checked above")
+        )));
+    }
+    if let Some(object_ref) = node.object_ref() {
+        if !state.visited.insert(object_ref) {
+            return Err(page_tree_cycle_error(pdf));
+        }
+    } else if !state.visited_direct.insert(node.identity_key()) {
+        return Err(page_tree_cycle_error(pdf)); // cov:ignore: parsed PDF /Pages nodes are indirect; retain this defensive direct-handle cycle guard for canonical ObjectHandle callers.
+    }
+
+    node.try_dereference()?;
+    if node.try_as_dictionary()?.is_none() || !node.try_has_key(b"/Kids")? {
+        return Ok(None); // cov:ignore: callers recurse only after observing a dictionary /Kids key
+    }
+
+    if !node.try_is_dictionary_of_type(b"Pages", b"")? {
+        node.warn_if_possible("/Type key should be /Pages but is not; overriding")?;
+        replace_handle_key(pdf, &node, b"/Type", ObjectHandle::name(b"Pages".to_vec()))?;
+    }
+
+    let media_box = if inherited_media_box {
+        true
+    } else {
+        is_rectangle_handle(&node.try_get_key(b"/MediaBox")?)?
+    };
+    let kids = node.try_get_key(b"/Kids")?;
+    let Some(kid_count) = kids.try_array_len()? else {
+        // QPDFObjectHandle::getArrayNItems warns and treats a non-array as
+        // empty (`QPDFObjectHandle.cc:758-768`).
+        let type_name = kids.type_name()?;
+        kids.warn_if_possible(
+            format!(
+                "operation for array attempted on object of type {}: treating as empty",
+                type_name
+            )
+            .as_str(),
+        )?; // cov:ignore: warning-sink failure is not injectable through the qpdf success oracle
+        return Ok(None);
+    };
+    Ok(Some(RepairFrame {
+        node,
+        kids,
+        next_kid: 0,
+        kid_count,
+        depth,
+        inherited_media_box: media_box,
+    }))
 }
 
 /// Construct qpdf's `QPDFExc(qpdf_e_pages, ...)` for a repeated page-tree
