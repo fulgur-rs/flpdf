@@ -11,6 +11,12 @@ fn minimal_pdf() -> std::path::PathBuf {
         .join("tests/fixtures/minimal.pdf")
 }
 
+fn repairable_input_fixture() -> std::path::PathBuf {
+    std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+        .join("../..")
+        .join("tests/fixtures/test_driver/repairable_input.pdf")
+}
+
 fn stream_pdf_without_trailing_payload_newline() -> Vec<u8> {
     let mut pdf = b"%PDF-1.3\n".to_vec();
     let mut offsets = vec![0usize];
@@ -623,6 +629,50 @@ fn qpdf_ctest_1_reports_plaintext_metadata_and_ignores_outfile() {
 }
 
 #[test]
+fn qpdf_ctest_1_reports_retained_repair_errors_after_metadata() {
+    let directory = tempfile::tempdir().expect("temporary directory");
+    let output = directory.path().join("unused-output.pdf");
+    let input = repairable_input_fixture();
+    let input_name = input.to_str().expect("input path is UTF-8");
+
+    let result = Command::cargo_bin("qpdf-ctest")
+        .expect("qpdf-ctest binary")
+        .args(["1", input_name, "", output.to_str().unwrap()])
+        .output()
+        .expect("qpdf-ctest should spawn");
+
+    assert!(result.status.success());
+    assert!(String::from_utf8_lossy(&result.stdout).contains("warning: "));
+    assert!(String::from_utf8_lossy(&result.stdout).contains("code: 5"));
+    assert!(String::from_utf8_lossy(&result.stdout).contains("text: can't find startxref"));
+    assert!(String::from_utf8_lossy(&result.stdout).ends_with("C test 1 done\n"));
+    assert!(String::from_utf8_lossy(&result.stderr).contains("WARNING:"));
+}
+
+#[test]
+fn qpdf_ctest_2_reports_open_warnings_and_error_as_successful_c_api_output() {
+    let directory = tempfile::tempdir().expect("temporary directory");
+    let input = directory.path().join("bad1.pdf");
+    let output = directory.path().join("unused-output.pdf");
+    fs::write(&input, b"oops\n").expect("write malformed input");
+    let input_name = input.to_str().expect("input path is UTF-8");
+
+    let result = Command::cargo_bin("qpdf-ctest")
+        .expect("qpdf-ctest binary")
+        .args(["2", input_name, "", output.to_str().unwrap()])
+        .output()
+        .expect("qpdf-ctest should spawn");
+
+    assert!(result.status.success());
+    let stdout = String::from_utf8_lossy(&result.stdout);
+    assert!(stdout.contains("warning: "));
+    assert!(stdout.contains("error: "));
+    assert!(stdout.contains("code: 5"));
+    assert!(stdout.ends_with("C test 2 done\n"));
+    assert!(result.stderr.is_empty());
+}
+
+#[test]
 fn qpdf_ctest_1_reports_linearized_metadata() {
     let directory = tempfile::tempdir().expect("temporary directory");
     let output = directory.path().join("unused-output.pdf");
@@ -758,4 +808,94 @@ fn qpdf_ctest_22_writes_newline_before_endstream() {
             .any(|window| { window == b"payload\nendstream" }),
         "test22 must insert a newline between the payload and endstream"
     );
+}
+
+#[test]
+fn qpdf_ctest_2_classifies_an_unsupported_encryption_handler_as_unsupported() {
+    let directory = tempfile::tempdir().expect("temporary directory");
+    let input = directory.path().join("unsupported-filter.pdf");
+    let output = directory.path().join("unused-output.pdf");
+    fs::write(&input, unsupported_encryption_filter_pdf()).expect("write input");
+    let input_name = input.to_str().expect("input path is UTF-8");
+
+    let result = Command::cargo_bin("qpdf-ctest")
+        .expect("qpdf-ctest binary")
+        .args(["2", input_name, "", output.to_str().unwrap()])
+        .output()
+        .expect("qpdf-ctest should spawn");
+
+    // qpdf throws `QPDFExc(qpdf_e_unsupported, ...)` for an unrecognised
+    // `/Filter` (`QPDF_encryption.cc:753-761`), so the C API error object
+    // carries code 3, not the password code 4.
+    assert!(result.status.success());
+    let stdout = String::from_utf8_lossy(&result.stdout);
+    assert!(stdout.contains("error: "), "{stdout}");
+    assert!(stdout.contains("code: 3"), "{stdout}");
+    assert!(stdout.ends_with("C test 2 done\n"), "{stdout}");
+}
+
+/// A PDF whose `/Encrypt` dictionary names a security handler qpdf does not
+/// implement. qpdf rejects this before authentication, so it never becomes a
+/// password failure.
+fn unsupported_encryption_filter_pdf() -> Vec<u8> {
+    let objects = [
+        b"1 0 obj\n<< /Type /Catalog /Pages 2 0 R >>\nendobj\n".as_slice(),
+        b"2 0 obj\n<< /Type /Pages /Count 0 /Kids [] >>\nendobj\n".as_slice(),
+        b"3 0 obj\n<< /Filter /NotStandard /V 1 /R 2 /O (01234567890123456789012345678901) /U (01234567890123456789012345678901) /P -1 >>\nendobj\n".as_slice(),
+    ];
+    let mut bytes = b"%PDF-1.4\n".to_vec();
+    let mut offsets = Vec::new();
+    for object in objects {
+        offsets.push(bytes.len());
+        bytes.extend_from_slice(object);
+    }
+    let xref_start = bytes.len();
+    bytes.extend_from_slice(format!("xref\n0 {}\n", offsets.len() + 1).as_bytes());
+    bytes.extend_from_slice(b"0000000000 65535 f \n");
+    for offset in offsets {
+        bytes.extend_from_slice(format!("{offset:010} 00000 n \n").as_bytes());
+    }
+    bytes.extend_from_slice(
+        format!(
+            "trailer\n<< /Size {} /Root 1 0 R /Encrypt 3 0 R /ID [<00> <00>] >>\nstartxref\n{xref_start}\n%%EOF\n",
+            objects.len() + 1
+        )
+        .as_bytes(),
+    );
+    bytes
+}
+
+/// qpdf's C API rebuilds a caught `std::runtime_error` as
+/// `QPDFExc(qpdf_e_system, "", "", 0, e.what())` (`qpdf-c.cc:77-79`), so the
+/// location fields stay empty and the whole `what()` — which already carries
+/// the filename for `QPDFSystemError` — becomes the detail. Reading a
+/// directory is the smallest input that reaches that arm after the file
+/// itself opens.
+#[cfg(unix)]
+#[test]
+fn qpdf_ctest_2_reports_a_trapped_system_error_without_location_fields() {
+    let directory = tempfile::tempdir().expect("temporary directory");
+    let input = directory.path().join("input-is-a-directory");
+    let output = directory.path().join("unused-output.pdf");
+    fs::create_dir(&input).expect("create directory input");
+    let input_name = input.to_str().expect("input path is UTF-8");
+
+    let result = Command::cargo_bin("qpdf-ctest")
+        .expect("qpdf-ctest binary")
+        .args(["2", input_name, "", output.to_str().unwrap()])
+        .output()
+        .expect("qpdf-ctest should spawn");
+
+    assert!(result.status.success());
+    let stdout = String::from_utf8_lossy(&result.stdout);
+    assert!(stdout.contains("code: 2"), "{stdout}");
+    assert!(stdout.contains("\n  file: \n"), "{stdout}");
+    assert!(stdout.contains("\n  pos: 0\n"), "{stdout}");
+    // The path appears once, in the detail, not again as the filename.
+    assert_eq!(
+        stdout.matches(input_name).count(),
+        2,
+        "path must appear only in the `error:` line and the detail: {stdout}"
+    );
+    assert!(stdout.ends_with("C test 2 done\n"), "{stdout}");
 }

@@ -11,7 +11,8 @@ use flpdf::job::{JsonJobOptions, JsonJobOutput, JsonStreamData, QPDFJob};
 use flpdf::json_inspect::{DecodeLevel as JsonDecodeLevel, JsonKey, JsonObjectSelector};
 use flpdf::{
     DecodeLevel, EncryptMethod, EncryptParams, EncryptedError, Error, Pdf, PdfOpenOptions,
-    PdfWriter, Permissions, PermissionsConfig, PrintPermission, R2PermissionsConfig, Result,
+    PdfWriter, Permissions, PermissionsConfig, PrintPermission, QpdfErrorCode, QpdfExc,
+    R2PermissionsConfig, Result,
 };
 use std::env;
 use std::fs::File;
@@ -175,6 +176,126 @@ fn report_invalid_password(input: &std::path::Path) -> Result<()> {
     Ok(())
 }
 
+/// Print qpdf-ctest's portable error object projection. This is the Rust
+/// process equivalent of qpdf-ctest.c:35-68 (`print_error` at `:35-43`,
+/// `report_errors` at `:45-68`): C API callers observe the
+/// structured QPDFExc fields after qpdf has already collected the warning
+/// objects. The C ABI itself remains outside this crate.
+fn write_c_api_error(output: &mut impl Write, label: &[u8], error: &QpdfExc) -> Result<()> {
+    output.write_all(label)?;
+    output.write_all(b": ")?;
+    output.write_all(error.what_bytes())?;
+    output.write_all(b"\n  code: ")?;
+    write!(output, "{}", error.get_error_code() as i32)?;
+    output.write_all(b"\n  file: ")?;
+    output.write_all(error.get_filename())?;
+    output.write_all(b"\n  pos: ")?;
+    write!(output, "{}", error.get_file_position())?;
+    output.write_all(b"\n  text: ")?;
+    output.write_all(error.get_message_detail())?;
+    output.write_all(b"\n")?;
+    Ok(())
+}
+
+fn qpdf_exception_from_error(input: &Path, error: &Error) -> QpdfExc {
+    match error {
+        Error::QpdfExc(error) => error.clone(),
+        Error::OpenFailure { source, .. } => qpdf_exception_from_error(input, source),
+        Error::Parse { offset, message } => QpdfExc::new(
+            QpdfErrorCode::DamagedPdf,
+            path_description(input),
+            b"",
+            i64::try_from(*offset).unwrap_or(i64::MAX),
+            message.as_bytes(),
+        ),
+        Error::Encrypted(EncryptedError::BadPassword) => QpdfExc::new(
+            QpdfErrorCode::Password,
+            path_description(input),
+            b"",
+            0,
+            b"invalid password",
+        ),
+        // qpdf throws `QPDFExc(qpdf_e_unsupported, ...)` for an unsupported
+        // `/Filter` and for an unsupported `/R`//`/V` pair, and
+        // `damagedPDF` (`qpdf_e_damaged_pdf`) for a malformed `/Encrypt`
+        // dictionary (`QPDF_encryption.cc:748-794`). Only a rejected password
+        // is `qpdf_e_password`.
+        Error::Encrypted(error @ EncryptedError::UnsupportedHandler { .. }) => QpdfExc::new(
+            QpdfErrorCode::Unsupported,
+            path_description(input),
+            b"",
+            0,
+            error.to_string().as_bytes(),
+        ),
+        Error::Encrypted(error @ EncryptedError::Malformed { .. }) => QpdfExc::new(
+            QpdfErrorCode::DamagedPdf,
+            path_description(input),
+            b"",
+            0,
+            error.to_string().as_bytes(),
+        ),
+        Error::Unsupported(message) => QpdfExc::new(
+            QpdfErrorCode::Unsupported,
+            path_description(input),
+            b"",
+            0,
+            message.as_bytes(),
+        ),
+        // The remaining arms are the ones qpdf never raises as a `QPDFExc`.
+        // `trap_errors` rebuilds them from a caught `std::runtime_error` or
+        // `std::exception` as `QPDFExc(code, "", "", 0, e.what())`
+        // (`qpdf-c.cc:77-82`), so the location fields stay **empty** and the
+        // whole `what()` becomes the detail. `QPDFSystemError::what()` already
+        // carries the filename, so repeating it here would print the path
+        // twice and report a filename qpdf leaves blank.
+        Error::SystemBytes(message) => QpdfExc::new(QpdfErrorCode::System, b"", b"", 0, message),
+        Error::System(message) => {
+            QpdfExc::new(QpdfErrorCode::System, b"", b"", 0, message.as_bytes())
+        }
+        // `Error::Internal` is qpdf's `std::logic_error` family, which the C
+        // API's `catch (std::exception&)` arm reports as `qpdf_e_internal`
+        // rather than `qpdf_e_system` (`qpdf-c.cc:80-82`).
+        Error::Internal(message) => {
+            QpdfExc::new(QpdfErrorCode::Internal, b"", b"", 0, message.as_bytes())
+        }
+        Error::Io(error) => QpdfExc::new(
+            QpdfErrorCode::System,
+            b"",
+            b"",
+            0,
+            error.to_string().as_bytes(),
+        ),
+        other => QpdfExc::new(
+            QpdfErrorCode::System,
+            b"",
+            b"",
+            0,
+            other.to_string().as_bytes(),
+        ),
+    }
+}
+
+fn write_pdf_diagnostics<R: Read + Seek>(pdf: &Pdf<R>, output: &mut impl Write) -> Result<()> {
+    for warning in pdf.repair_diagnostics().entries() {
+        write_c_api_error(output, b"warning", warning)?;
+    }
+    Ok(())
+}
+
+fn write_open_error_report(input: &Path, error: &Error, output: &mut impl Write) -> Result<()> {
+    if let Some((source, diagnostics)) = error.open_failure() {
+        for warning in diagnostics.entries() {
+            write_c_api_error(output, b"warning", warning)?;
+        }
+        let terminal = qpdf_exception_from_error(input, source);
+        write_c_api_error(output, b"error", &terminal)?;
+    } else {
+        let terminal = qpdf_exception_from_error(input, error);
+        write_c_api_error(output, b"error", &terminal)?;
+    }
+    Ok(())
+}
+
 /// Run qpdf's C API authentication/error case (`qpdf-ctest.c:test02`).
 ///
 /// The C API reports a failed read through its error object and still returns
@@ -203,6 +324,10 @@ fn run_test2(
             writer.set_output_file(PathBuf::from(output_arg))?;
             writer.set_static_id(true);
             writer.write()?;
+            drop(writer);
+            let stdout = std::io::stdout();
+            let mut stdout = stdout.lock();
+            write_pdf_diagnostics(&pdf, &mut stdout)?;
             println!("C test 2 done");
             Ok(())
         }
@@ -211,7 +336,13 @@ fn run_test2(
             println!("C test 2 done");
             Ok(())
         }
-        Err(error) => Err(error),
+        Err(error) => {
+            let stdout = std::io::stdout();
+            let mut stdout = stdout.lock();
+            write_open_error_report(&input, &error, &mut stdout)?;
+            println!("C test 2 done");
+            Ok(())
+        }
     }
 }
 
@@ -434,6 +565,7 @@ fn run_test1(input_arg: &std::ffi::OsStr, password_arg: &std::ffi::OsStr) -> Res
     {
         write_encrypted_observations(&mut stdout, revision, &user_password, &permissions)?;
     }
+    write_pdf_diagnostics(&pdf, &mut stdout)?;
     writeln!(stdout, "C test 1 done")?;
     Ok(())
 }
