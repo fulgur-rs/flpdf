@@ -23,14 +23,20 @@ permissions:
 # the `main` ruleset requires only `release-pr-approval`, and release-plz
 # carries its own job-level groups with cancel-in-progress disabled).
 #
-# A re-run is the exception: it keeps the original run's ref and SHA
+# A re-run has to stay out of that group entirely.  It keeps the original
+# run's ref and SHA
 # (https://docs.github.com/en/actions/how-tos/manage-workflow-runs/re-run-workflows-and-jobs),
-# so re-running an older run would join this group and cancel whatever is
-# testing the tip, leaving the tip untested while a stale SHA reports.  Only
-# a first attempt cancels, which is exactly the force-push case this is for.
+# so a stale re-run joining this group would displace the run testing the
+# tip -- and not only by cancelling it: queueing into a group also cancels
+# whatever is *pending* there, which `cancel-in-progress: false` does not
+# protect
+# (https://docs.github.com/en/actions/how-tos/write-workflows/choose-when-workflows-run/control-workflow-concurrency).
+# Keying attempt 1 to a shared name and every later attempt to its own run id
+# leaves force-pushes collapsing as before while a re-run can only ever
+# supersede earlier attempts of the same run.
 concurrency:
-  group: ${{ github.workflow }}-${{ github.event.pull_request.number || github.ref }}
-  cancel-in-progress: ${{ github.run_attempt == 1 }}
+  group: ${{ github.workflow }}-${{ github.event.pull_request.number || github.ref }}-${{ github.run_attempt == 1 && 'tip' || github.run_id }}
+  cancel-in-progress: true
 
 env:
   CARGO_TERM_COLOR: always
