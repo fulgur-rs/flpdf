@@ -72,6 +72,7 @@ fn run(args: &[std::ffi::OsString]) -> Result<()> {
     match args[1].to_str() {
         Some("1") => run_test1(&args[2], &args[3]),
         Some("2") => run_test2(&args[2], &args[3], &args[4]),
+        Some("10") => run_test10(&args[2], &args[3], &args[4]),
         Some("11") => run_test11(&args[2], &args[3], &args[4]),
         Some("12") => run_test12(&args[2], &args[3], &args[4]),
         Some("13") => run_test13(&args[2], &args[3], &args[4]),
@@ -344,6 +345,36 @@ fn run_test2(
             Ok(())
         }
     }
+}
+
+/// Run qpdf-ctest.c:test10. The raw C API disables recovery before reading,
+/// then reports the resulting error object and returns success from the
+/// helper process (`qpdf-ctest.c:250-256`).
+fn run_test10(
+    input_arg: &std::ffi::OsStr,
+    password_arg: &std::ffi::OsStr,
+    _output_arg: &std::ffi::OsStr,
+) -> Result<()> {
+    let input = PathBuf::from(input_arg);
+    let password = password_bytes(password_arg);
+    let result = Pdf::open_with_options(
+        File::open(&input)?,
+        PdfOpenOptions {
+            repair: false,
+            password,
+            suppress_password_recovery: true,
+            description: path_description(&input),
+            ..PdfOpenOptions::default()
+        },
+    );
+    let stdout = std::io::stdout();
+    let mut stdout = stdout.lock();
+    match result {
+        Ok(pdf) => write_pdf_diagnostics(&pdf, &mut stdout)?,
+        Err(error) => write_open_error_report(&input, &error, &mut stdout)?,
+    }
+    writeln!(stdout, "C test 10 done")?;
+    Ok(())
 }
 
 fn low_print_permissions() -> PermissionsConfig {

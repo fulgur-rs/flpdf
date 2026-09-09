@@ -673,6 +673,28 @@ fn qpdf_ctest_2_reports_open_warnings_and_error_as_successful_c_api_output() {
 }
 
 #[test]
+fn qpdf_ctest_10_reports_a_no_recovery_xref_error_through_the_c_api_surface() {
+    let directory = tempfile::tempdir().expect("temporary directory");
+    let input = directory.path().join("bad-xref.pdf");
+    let output = directory.path().join("unused-output.pdf");
+    fs::write(&input, b"%PDF-1.4\nstartxref\n999\n%%EOF\n").expect("write malformed xref input");
+
+    let result = Command::cargo_bin("qpdf-ctest")
+        .expect("qpdf-ctest binary")
+        .args(["10", input.to_str().unwrap(), "", output.to_str().unwrap()])
+        .output()
+        .expect("qpdf-ctest should spawn");
+
+    assert!(result.status.success());
+    let stdout = String::from_utf8_lossy(&result.stdout);
+    assert!(stdout.contains("error: "));
+    assert!(stdout.contains("code: 5"));
+    assert!(stdout.contains("text: xref not found"));
+    assert!(stdout.ends_with("C test 10 done\n"));
+    assert!(result.stderr.is_empty());
+}
+
+#[test]
 fn qpdf_ctest_1_reports_linearized_metadata() {
     let directory = tempfile::tempdir().expect("temporary directory");
     let output = directory.path().join("unused-output.pdf");
