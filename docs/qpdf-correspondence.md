@@ -1609,6 +1609,23 @@ remain only where no resolving Rust counterpart exists. The focused route test
 and `pages` unresolved-child regression cover caller-zero and `Result`
 propagation. qtest and qtest-exceptions routes are not part of this row.
 
+### A6/A7/A8 linearization check/show accessor slice `flpdf-3yn9.48.23.9` (2026-09-10)
+
+The bounded linearization read-side consumers now use qpdf-shaped resolving
+accessors for parameter and hint-table values. This follows qpdf's
+`QPDFObjectHandle` entry-resolution contract (`libqpdf/QPDFObjectHandle.cc:
+240-446,759-785,965-989,2168-2189`) and the linearization data loading/check
+boundaries (`libqpdf/QPDF_linearization.cc:84-230,419-470`). The production
+route contract is zero for removable non-resolving key, dictionary, array,
+integer, name, null, and explicit resolve bridge calls in
+`linearization/check.rs` and `linearization/show.rs`.
+
+The existing `check-linearization`, `show-linearization`, page-operation, and
+deep-linearization qpdf comparisons cover the byte/status/warning-neutral
+cutover. Silent real/string observations without a resolving `try_as_*`
+counterpart, writer emission, and qtest exception attribution remain outside
+this bounded row.
+
 ### `qpdfjob-c` wrapper のエラー境界
 
 qpdf の `wrap_qpdfjob`（`libqpdf/qpdfjob-c.cc:32-40`）は、

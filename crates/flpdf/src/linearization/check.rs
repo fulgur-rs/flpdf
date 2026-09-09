@@ -130,11 +130,11 @@ impl<R: Read + Seek> Pdf<R> {
             return Ok(false);
         };
         linearized.try_dereference()?;
-        let Some(value) = linearized
-            .as_integer()
-            .map(|value| value as f64)
-            .or_else(|| linearized.as_real())
-        else {
+        let value = if let Some(value) = linearized.try_as_integer()? {
+            value as f64
+        } else if let Some(value) = linearized.as_real() {
+            value
+        } else {
             return Ok(false);
         };
         if !value.is_finite() || value.floor() != 1.0 {
@@ -143,7 +143,7 @@ impl<R: Read + Seek> Pdf<R> {
 
         if let Some(l_value) = dictionary.get(&b"/L"[..]) {
             l_value.try_dereference()?;
-            if let Some(l_value) = l_value.as_integer() {
+            if let Some(l_value) = l_value.try_as_integer()? {
                 let file_size = self.resolver.source_length()?;
                 if l_value < 0 || l_value as u64 != file_size {
                     return Ok(false);
@@ -208,7 +208,7 @@ pub(crate) fn check_linearization_parameters<R: Read + Seek>(
     let t_is_integer = resolved_is_integer(&t)?;
     let p_is_valid = {
         p.try_dereference()?;
-        p.try_is_null()? || p.as_integer().is_some()
+        p.try_is_null()? || p.try_as_integer()?.is_some()
     };
     if !(h_is_array && o_is_integer && e_is_integer && n_is_integer && t_is_integer && p_is_valid) {
         return Ok(LinearizationParameterCheck::Error {
@@ -219,8 +219,7 @@ pub(crate) fn check_linearization_parameters<R: Read + Seek>(
 
     let pages = PageDocumentHelper::new(pdf).get_all_pages()?;
     let page_count = pages.len() as i64;
-    n.try_dereference()?;
-    if n.as_integer() != Some(page_count) {
+    if n.try_as_integer()? != Some(page_count) {
         return Ok(LinearizationParameterCheck::Error {
             object: "linearization hint table",
             message: "/N does not match number of pages",
@@ -230,7 +229,7 @@ pub(crate) fn check_linearization_parameters<R: Read + Seek>(
     let Some(first_page) = pages.first() else {
         return Ok(LinearizationParameterCheck::Clean);
     };
-    if o.as_integer() != Some(first_page.number as i64) {
+    if o.try_as_integer()? != Some(first_page.number as i64) {
         return Ok(LinearizationParameterCheck::Warning(
             "first page object (/O) mismatch",
         ));
@@ -240,13 +239,11 @@ pub(crate) fn check_linearization_parameters<R: Read + Seek>(
 }
 
 fn resolved_is_array(handle: &ObjectHandle) -> Result<bool> {
-    handle.try_dereference()?;
-    Ok(handle.as_array().is_some())
+    Ok(handle.try_as_array()?.is_some())
 }
 
 fn resolved_is_integer(handle: &ObjectHandle) -> Result<bool> {
-    handle.try_dereference()?;
-    Ok(handle.as_integer().is_some())
+    Ok(handle.try_as_integer()?.is_some())
 }
 
 // ---------------------------------------------------------------------------
@@ -269,9 +266,10 @@ macro_rules! fail {
 /// real here: that would make malformed linearization dictionaries pass the
 /// consumer route even though qpdf rejects them.
 fn as_u64(obj: &ObjectHandle, key: &str) -> std::result::Result<u64, LinearizationCheckError> {
-    obj.try_dereference()
-        .map_err(LinearizationCheckError::from)?;
-    match obj.as_integer() {
+    match obj
+        .try_as_integer()
+        .map_err(LinearizationCheckError::from)?
+    {
         Some(n) if n >= 0 => Ok(n as u64),
         _ => {
             let type_name = obj.type_name().map_err(LinearizationCheckError::from)?;
@@ -357,8 +355,7 @@ fn first_page_source_extent<R: Read + Seek>(pdf: &mut Pdf<R>) -> Result<(i64, i6
             if let Some(root_dict) = root.try_as_dictionary()? {
                 let page_mode = root_dict.get(b"/PageMode" as &[u8]).cloned();
                 let use_outlines = if let Some(page_mode) = page_mode {
-                    page_mode.try_dereference()?;
-                    page_mode.as_name().as_deref() == Some(b"UseOutlines")
+                    page_mode.try_as_name()?.as_deref() == Some(b"UseOutlines")
                 } else {
                     false
                 };
@@ -461,7 +458,7 @@ fn outlines_in_first_page<R: Read + Seek>(pdf: &mut Pdf<R>) -> Result<bool> {
     let outlines = root.try_get_key(b"/Outlines")?;
     outlines.try_dereference()?;
     let has_outlines = !outlines.try_is_null()?;
-    Ok(page_mode.as_name().as_deref() == Some(b"UseOutlines") && has_outlines)
+    Ok(page_mode.try_as_name()?.as_deref() == Some(b"UseOutlines") && has_outlines)
 }
 
 /// Reproduce the ordering and page/shared membership inputs that qpdf creates
@@ -1210,7 +1207,10 @@ fn check_linearization_inner<R: Read + Seek>(
         type_obj
             .try_dereference()
             .map_err(LinearizationCheckError::from)?;
-        if let Some(type_name) = type_obj.as_name() {
+        if let Some(type_name) = type_obj
+            .try_as_name()
+            .map_err(LinearizationCheckError::from)?
+        {
             if type_name != b"Page" {
                 fail!(
                     "/O ({o_num}) points to an object with /Type /{} instead of /Page",
@@ -1268,7 +1268,11 @@ fn check_linearization_inner<R: Read + Seek>(
     p_obj
         .try_dereference()
         .map_err(LinearizationCheckError::from)?;
-    if !p_obj.try_is_null().map_err(LinearizationCheckError::from)? && p_obj.as_integer().is_none()
+    if !p_obj.try_is_null().map_err(LinearizationCheckError::from)?
+        && p_obj
+            .try_as_integer()
+            .map_err(LinearizationCheckError::from)?
+            .is_none()
     {
         fail!("/P is present but is neither an integer nor null");
     }
@@ -1282,7 +1286,10 @@ fn check_linearization_inner<R: Read + Seek>(
     h_obj
         .try_dereference()
         .map_err(LinearizationCheckError::from)?;
-    let Some(h_items) = h_obj.as_array() else {
+    let Some(h_items) = h_obj
+        .try_as_array()
+        .map_err(LinearizationCheckError::from)?
+    else {
         fail!("/H is missing or has unexpected format (expected [offset length])");
     };
     if !matches!(h_items.len(), 2 | 4) {
@@ -1588,7 +1595,7 @@ pub(crate) fn load_hint_stream_with_damage<R: Read + Seek>(
     // seam as a defensive fallback for recovered empty objects without a
     // trailing token.
     let Some(hint_dict) = hint_obj.as_stream_dict() else {
-        if hint_obj.is_null() {
+        if hint_obj.try_is_null()? {
             return Err(HintStreamLoadError::Damage(HintStreamDamage::new(
                 "linearization dictionary",
                 // cov:ignore: recovered empty objects without a trailing token are a defensive resolver fallback
@@ -1934,6 +1941,28 @@ mod tests {
             load_hint_stream_with_damage(&mut pdf, file_bytes, 601, 118),
             Err(super::HintStreamLoadError::Core(_))
         ));
+    }
+
+    #[test]
+    fn is_linearized_accepts_a_real_linearized_marker() {
+        let mut file_bytes = include_bytes!(concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/../../tests/fixtures/compat/linearized-one-page.pdf"
+        ))
+        .to_vec();
+        let original_length = file_bytes.len();
+        let old = format!("/Linearized 1 /L {original_length}");
+        let new = format!("/Linearized 1.0 /L {}", original_length + 2);
+        let offset = file_bytes
+            .windows(old.len())
+            .position(|window| window == old.as_bytes())
+            .expect("fixture must contain its linearization marker");
+        file_bytes.splice(offset..offset + old.len(), new.bytes());
+
+        let mut pdf = Pdf::open(Cursor::new(file_bytes)).expect("fixture should open");
+        assert!(pdf
+            .is_linearized()
+            .expect("real-valued /Linearized should be accepted"));
     }
 
     #[test]
