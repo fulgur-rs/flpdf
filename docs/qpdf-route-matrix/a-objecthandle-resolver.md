@@ -380,6 +380,23 @@ The qpdf mutation order remains anchored to
 and final-page empty-tree behavior. No qtest or qtest-exceptions route is
 included.
 
+### A6/A7/A8 outline-helper slice `flpdf-3yn9.48.23.6` (2026-09-09)
+
+The production outline document/object helper cohort now has zero explicit
+`Pdf::resolve`, `resolve_handle`, or `resolve_handle_ref` bridge callers
+in the migrated accessors. Outline item title/count/destination reads use the
+live handle resolver at the qpdf accessor boundary, while raw destination
+array page operands remain un-resolved as required by qpdf's
+`getDestPage` contract. Catalog/outlines and named-destination traversal
+retain the existing live cache and sibling seen-set order.
+
+The source and error boundaries are anchored to
+`QPDFOutlineDocumentHelper.cc:16-21,47-90` and
+`QPDFOutlineObjectHelper.cc:47-98`. The production route contract and
+`resolve_value_handle_propagates_an_unresolved_handle_error` cover
+caller-zero and Result propagation. Rendering-only deviations and qtest
+exceptions remain outside this slice.
+
 ### 2026-09-09 canonical cache cutover supersession
 
 The A1/A2/A9/A10/A11/A13/A15/A16/A17/A24 rows above were authored before
