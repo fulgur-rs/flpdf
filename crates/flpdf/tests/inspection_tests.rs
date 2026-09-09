@@ -11,6 +11,20 @@ fn page_refs_returns_pages_in_document_order() {
     assert_eq!(pages, vec![ObjectRef::new(3, 0), ObjectRef::new(6, 0)]);
 }
 
+#[test]
+fn page_content_bytes_rejects_a_non_name_page_type() {
+    let pdf = finalize_pdf(&[
+        b"1 0 obj\n<< /Type /Catalog /Pages 2 0 R >>\nendobj\n".to_vec(),
+        b"2 0 obj\n<< /Type /Pages /Count 1 /Kids [3 0 R] >>\nendobj\n".to_vec(),
+        b"3 0 obj\n<< /Type 7 /Parent 2 0 R /MediaBox [0 0 100 100] /Contents 4 0 R >>\nendobj\n"
+            .to_vec(),
+        b"4 0 obj\n<< /Length 0 >>\nstream\n\nendstream\nendobj\n".to_vec(),
+    ]);
+    let mut pdf = Pdf::open(Cursor::new(pdf)).unwrap();
+    let error = pages::page_content_bytes(&mut pdf, ObjectRef::new(3, 0)).unwrap_err();
+    assert!(error.to_string().contains("has a non-name /Type entry"));
+}
+
 const EXPECTED_QPDF_VERSION: &str = "qpdf version 11.9.0";
 
 /// `true` when the pinned qpdf oracle is runnable, mirroring

@@ -66,13 +66,12 @@ impl fmt::Display for PageParentCursor {
 /// returns null on a non-dictionary receiver rather than silently skipping
 /// the access. [`ObjectHandle::try_get_key`] carries that same behavior, so
 /// short-circuiting here would drop the diagnostic.
-pub(crate) fn page_parent_entries<R: Read + Seek>(
-    pdf: &mut Pdf<R>,
+pub(crate) fn page_parent_entries(
     cursor: &PageParentCursor,
     key: &[u8],
 ) -> Result<Option<(ObjectHandle, ObjectHandle)>> {
     let dict = cursor.handle();
-    pdf.resolve(&dict)?;
+    dict.try_dereference()?;
     Ok(Some((
         dict.try_get_key(key)?,
         dict.try_get_key(b"/Parent")?,
@@ -81,7 +80,7 @@ pub(crate) fn page_parent_entries<R: Read + Seek>(
 
 /// Advance a page-tree parent cursor when `/Parent` is a dictionary handle.
 pub(crate) fn next_page_parent(parent: ObjectHandle) -> Result<Option<PageParentCursor>> {
-    if parent.is_null() {
+    if parent.try_is_null()? {
         return Ok(None);
     }
     // Keep only a genuinely unresolved indirect parent as a cursor, so the
@@ -95,7 +94,7 @@ pub(crate) fn next_page_parent(parent: ObjectHandle) -> Result<Option<PageParent
     if parent.is_indirect() && !parent.is_resolved() {
         return Ok(Some(PageParentCursor::from_handle(parent)));
     }
-    if parent.as_dictionary().is_none() {
+    if parent.try_as_dictionary()?.is_none() {
         return Ok(None);
     }
     Ok(Some(PageParentCursor::from_handle(parent)))
@@ -116,7 +115,7 @@ pub(crate) fn is_inheritable_page_attribute(key: &[u8]) -> bool {
 /// consumers and [`crate::PageObjectHelper`]. The caller supplies the starting
 /// node so Form XObjects can keep qpdf's non-inheriting `getAttribute` path.
 pub(crate) fn resolve_inherited_handle_from_node_with_max_depth<R: Read + Seek>(
-    pdf: &mut Pdf<R>,
+    _pdf: &mut Pdf<R>,
     node: ObjectHandle,
     key: &[u8],
     max_depth: usize,
@@ -141,12 +140,13 @@ pub(crate) fn resolve_inherited_handle_from_node_with_max_depth<R: Read + Seek>(
         }
         seen.push(current_handle);
 
-        let Some((value, parent)) = page_parent_entries(pdf, &current, key)? else {
+        let Some((value, parent)) = page_parent_entries(&current, key)? else {
             return Ok(None);
         };
         // Resolve the live value before classifying it under qpdf's
         // null-as-absent inheritance rule.
-        let terminal = pdf.resolve_handle(&value)?;
+        let terminal = value.clone();
+        terminal.try_dereference()?;
         if !terminal.try_is_null()? {
             return Ok(Some(value));
         }
@@ -256,8 +256,8 @@ pub fn page_content_bytes<R: Read + Seek>(
     page_ref: ObjectRef,
 ) -> Result<Vec<u8>> {
     let page = pdf.get_object_handle(page_ref);
-    pdf.resolve(&page)?;
-    if page.as_dictionary().is_none() {
+    page.try_dereference()?;
+    if page.try_as_dictionary()?.is_none() {
         return Err(Error::Unsupported(format!(
             "object {page_ref} is not a dictionary, cannot extract /Contents"
         )));
@@ -273,7 +273,7 @@ pub fn page_content_bytes<R: Read + Seek>(
                 String::from_utf8_lossy(&name)
             )));
         }
-        None if page.has_key(b"/Type") => {
+        None if page.try_has_key(b"/Type")? => {
             return Err(Error::Unsupported(format!(
                 "object {page_ref} has a non-name /Type entry"
             )));
@@ -390,12 +390,12 @@ impl<'a, R: Read + Seek> PageWalk<'a, R> {
     /// - Any [`Error`] propagated from [`Pdf::resolve`] while resolving the catalog.
     pub fn new(pdf: &'a mut Pdf<R>) -> Result<Self> {
         let root = pdf.trailer_key_handle(b"Root");
-        if root.is_null() {
+        if root.try_is_null()? {
             return Err(Error::Missing("/Root"));
         }
         let catalog = pdf.root_handle()?;
         let pages = catalog.try_get_key(b"/Pages")?;
-        if pages.is_null() {
+        if pages.try_is_null()? {
             return Err(Error::Missing("/Pages"));
         }
         let pages = PageNode::from_handle(pages);
@@ -418,12 +418,12 @@ impl<'a, R: Read + Seek> PageWalk<'a, R> {
     /// - Any [`Error`] propagated from [`Pdf::resolve`] while resolving the catalog.
     pub fn with_max_depth(pdf: &'a mut Pdf<R>, max_depth: usize) -> Result<Self> {
         let root = pdf.trailer_key_handle(b"Root");
-        if root.is_null() {
+        if root.try_is_null()? {
             return Err(Error::Missing("/Root"));
         }
         let catalog = pdf.root_handle()?;
         let pages = catalog.try_get_key(b"/Pages")?;
-        if pages.is_null() {
+        if pages.try_is_null()? {
             return Err(Error::Missing("/Pages"));
         }
         let pages = PageNode::from_handle(pages);
@@ -439,24 +439,22 @@ impl<'a, R: Read + Seek> PageWalk<'a, R> {
 
     fn visit_node(&mut self, node: &PageNode, depth: usize) -> Result<Option<ObjectRef>> {
         let node_obj = node.handle(self.pdf);
-        self.pdf.resolve(&node_obj)?;
+        node_obj.try_dereference()?;
 
-        if node_obj.as_dictionary().is_none() {
+        if node_obj.try_as_dictionary()?.is_none() {
             return Ok(None); // non-dictionary: skip silently
         }
 
         let node_type = node_obj.try_get_key(b"/Type")?;
-        self.pdf.resolve(&node_type)?;
 
-        if node_type.as_name().as_deref() == Some(b"Pages") {
+        if node_type.try_as_name()?.as_deref() == Some(b"Pages") {
             let kids = node_obj.try_get_key(b"/Kids")?;
-            self.pdf.resolve(&kids)?;
-            if let Some(kids) = kids.as_array() {
+            if let Some(kids) = kids.try_as_array()? {
                 // Push in reverse order so that the first kid is popped first.
                 for kid in kids.iter().rev() {
                     if let Some(r) = kid.object_ref() {
                         self.stack.push((PageNode::Indirect(r), depth + 1));
-                    } else if kid.as_dictionary().is_some() {
+                    } else if kid.try_as_dictionary()?.is_some() {
                         self.stack.push((PageNode::Direct(kid.clone()), depth + 1));
                     }
                 }
@@ -464,7 +462,7 @@ impl<'a, R: Read + Seek> PageWalk<'a, R> {
             return Ok(None);
         }
 
-        if node_type.as_name().as_deref() == Some(b"Page") {
+        if node_type.try_as_name()?.as_deref() == Some(b"Page") {
             return Ok(node.object_ref());
         }
 
@@ -545,5 +543,23 @@ mod tests {
             .expect("bounded walk must report an error")
             .unwrap_err();
         assert!(error.to_string().contains("depth exceeds maximum of 0"));
+    }
+
+    #[test]
+    fn inherited_attribute_walk_propagates_an_unresolved_parent_child_error() {
+        let mut pdf = Pdf::empty().expect("empty PDF supplies a resolver owner");
+        let node = ObjectHandle::dictionary(vec![
+            (b"/MediaBox".to_vec(), ObjectHandle::null()),
+            (
+                b"/Parent".to_vec(),
+                ObjectHandle::new_indirect_unresolved(ObjectRef::new(99, 0), -1),
+            ),
+        ]);
+        let error =
+            resolve_inherited_handle_from_node_with_max_depth(&mut pdf, node, b"/MediaBox", 4)
+                .unwrap_err();
+        assert!(error
+            .to_string()
+            .contains("object 99 0 belongs to a dropped PDF"));
     }
 }

@@ -88,7 +88,8 @@ fn wire_primary_catalog<RS: Read + Seek, RT: Read + Seek>(
         return Ok(()); // cov:ignore: page selection already requires a readable catalog
     };
     let source_catalog_handle = source.get_object_handle(source_catalog_ref);
-    let source_catalog = source.resolve_handle(&source_catalog_handle)?;
+    source_catalog_handle.try_dereference()?;
+    let source_catalog = source_catalog_handle;
     if source_catalog.try_as_dictionary()?.is_none() {
         return Ok(()); // cov:ignore: page selection already requires a dictionary catalog
     }
@@ -96,7 +97,8 @@ fn wire_primary_catalog<RS: Read + Seek, RT: Read + Seek>(
         return Ok(()); // cov:ignore: Pdf::empty always supplies a target catalog
     };
     let target_catalog_handle = target.get_object_handle(target_catalog_ref);
-    let target_catalog = target.resolve_handle(&target_catalog_handle)?;
+    target_catalog_handle.try_dereference()?;
+    let target_catalog = target_catalog_handle;
     if target_catalog.try_as_dictionary()?.is_none() {
         return Ok(()); // cov:ignore: Pdf::empty always supplies a dictionary catalog
     }
@@ -228,7 +230,7 @@ fn ensure_object_stream_container<RS: Read + Seek, RT: Read + Seek>(
         chain.push(container);
         current = {
             let source_stream = source.get_object_handle(container);
-            source.resolve(&source_stream)?;
+            source_stream.try_dereference()?;
             source_stream
                 .as_stream_dict()
                 .map(|dictionary| dictionary.try_get_key(b"/Extends"))
@@ -248,7 +250,7 @@ fn ensure_object_stream_container<RS: Read + Seek, RT: Read + Seek>(
     // `--normalize-content`) with a stream that has no data to pipe.
     for &container in chain.iter().rev() {
         let source_stream = source.get_object_handle(container);
-        source.resolve(&source_stream)?;
+        source_stream.try_dereference()?;
         let target_stream = copy_foreign_object_for_preserve(target, &source_stream)?;
         let target_container = target_stream.object_ref().ok_or(Error::Internal(
             "copied ObjStm container lost its object identity".to_owned(),
@@ -341,14 +343,18 @@ fn discover_primary_acroform<R: Read + Seek>(source: &mut Pdf<R>) -> Result<Prim
         return Ok(out); // cov:ignore: page selection already requires a readable catalog
     };
     let root_handle = source.get_object_handle(root_ref);
-    let root = source.resolve_handle(&root_handle)?;
+    root_handle.try_dereference()?;
+    let root = root_handle;
     if root.try_as_dictionary()?.is_none() {
         return Ok(out); // cov:ignore: page selection already requires a dictionary catalog
     }
-    let acroform = source.resolve_handle(&root.try_get_key(b"/AcroForm")?)?;
+    let acroform = root.try_get_key(b"/AcroForm")?;
+    acroform.try_dereference()?;
     if acroform.try_as_dictionary()?.is_some() {
-        out.has_dr = !acroform.try_get_key(b"/DR")?.is_null();
-        out.has_da = !acroform.try_get_key(b"/DA")?.is_null();
+        let dr = acroform.try_get_key(b"/DR")?;
+        let da = acroform.try_get_key(b"/DA")?;
+        out.has_dr = !dr.try_is_null()?;
+        out.has_da = !da.try_is_null()?;
     }
     Ok(out)
 }
@@ -392,10 +398,8 @@ fn source_top_level_field_names_from_refs<R: Read + Seek>(
         // the holder ref misses and the field is dropped from the merged form. The
         // terminal also feeds the `/T` lookup so a name behind a holder is read.
         let field_handle = source.get_object_handle(field_ref);
-        let terminal = source
-            .resolve_handle_ref(&field_handle)?
-            .1
-            .unwrap_or(field_ref);
+        let terminal = field_handle.object_ref().unwrap_or(field_ref);
+        field_handle.try_dereference()?;
         let name = resolve_field_partial_name(source, terminal)?;
         out.push((terminal, name));
     }
@@ -419,18 +423,20 @@ fn resolve_field_partial_name<R: Read + Seek>(
     field_ref: ObjectRef,
 ) -> Result<Option<Vec<u8>>> {
     let field_handle = source.get_object_handle(field_ref);
-    let field = source.resolve_handle(&field_handle)?;
+    field_handle.try_dereference()?;
+    let field = field_handle;
     if field.try_as_dictionary()?.is_none() {
         return Ok(None);
     }
     let t_value = field.try_get_key(b"/T")?;
-    if t_value.is_null() {
+    if t_value.try_is_null()? {
         return Ok(None);
     }
     // `/T` may be stored through more than one indirect hop; follow the whole
     // chain (not a one-hop resolve) so a multi-hop name string is read and
     // used for collision renaming rather than yielding `None`.
-    let resolved = source.resolve_handle(&t_value)?;
+    let resolved = t_value.clone();
+    resolved.try_dereference()?;
     Ok(resolved.as_string().map(|raw| utf8_value(&raw)))
 }
 
@@ -446,7 +452,8 @@ fn remove_target_acroform<R: Read + Seek>(target: &mut Pdf<R>) -> Result<()> {
         return Ok(()); // cov:ignore: the seed target always has a /Root catalog
     };
     let catalog_handle = target.get_object_handle(catalog_ref);
-    let catalog = target.resolve_handle(&catalog_handle)?;
+    catalog_handle.try_dereference()?;
+    let catalog = catalog_handle;
     if catalog.try_as_dictionary()?.is_none() {
         return Ok(()); // cov:ignore: the seed catalog is always a dict
     }
@@ -534,7 +541,8 @@ fn rename_field<R: Read + Seek>(
     name: Vec<u8>,
 ) -> Result<()> {
     let field_handle = target.get_object_handle(field_ref);
-    let field = target.resolve_handle(&field_handle)?;
+    field_handle.try_dereference()?;
+    let field = field_handle;
     if field.try_as_dictionary()?.is_none() {
         return Ok(()); // cov:ignore: a copied field ref always resolves to a dictionary
     }
@@ -551,21 +559,24 @@ fn field_kid_refs<R: Read + Seek>(
     field_ref: ObjectRef,
 ) -> Result<Option<Vec<ObjectRef>>> {
     let field_handle = source.get_object_handle(field_ref);
-    let field = source.resolve_handle(&field_handle)?;
+    field_handle.try_dereference()?;
+    let field = field_handle;
     if field.try_as_dictionary()?.is_none() {
         return Ok(None);
     }
     let kids_value = field.try_get_key(b"/Kids")?;
-    if kids_value.is_null() {
+    if kids_value.try_is_null()? {
         return Ok(None);
     }
-    let resolved = source.resolve_handle(&kids_value)?;
+    let resolved = kids_value.clone();
+    resolved.try_dereference()?;
     let Some(items) = resolved.try_as_array()? else {
         return Ok(Some(Vec::new())); // cov:ignore: a /Kids value resolves to an array in practice
     };
     let mut refs = Vec::with_capacity(items.len());
     for item in items {
-        let (_, terminal_ref) = source.resolve_handle_ref(&item)?;
+        let terminal_ref = item.object_ref();
+        item.try_dereference()?;
         if let Some(r) = terminal_ref {
             // A `/Kids` element may be a reference to a reference to the field/
             // widget; resolve the holder chain to the terminal ref so trimming
@@ -586,8 +597,8 @@ fn field_kid_refs<R: Read + Seek>(
 /// `/Annots` may be an inline array or an indirect reference to one; each element
 /// is an indirect reference to (or an inline) annotation dict. Only the direct
 /// annotation refs are recorded — that is what extract uses to decide a widget
-/// survives. Reference-holder traversal is bounded by the canonical
-/// `resolve_handle_ref` primitive.
+/// survives. Reference-holder traversal keeps each source identity before
+/// resolving its canonical handle.
 fn collect_retained_widget_refs<R: Read + Seek>(
     source: &mut Pdf<R>,
     selected_pages: &BTreeSet<ObjectRef>,
@@ -595,21 +606,24 @@ fn collect_retained_widget_refs<R: Read + Seek>(
 ) -> Result<()> {
     for &page_ref in selected_pages {
         let page_handle = source.get_object_handle(page_ref);
-        let page = source.resolve_handle(&page_handle)?;
+        page_handle.try_dereference()?;
+        let page = page_handle;
         if page.try_as_dictionary()?.is_none() {
             continue; // cov:ignore: a selected page ref always resolves to a dictionary
         }
         let annots_val = page.try_get_key(b"/Annots")?;
-        if annots_val.is_null() {
+        if annots_val.try_is_null()? {
             continue;
         }
         // /Annots: an inline array or an indirect reference to one.
-        let concrete = source.resolve_handle(&annots_val)?;
+        let concrete = annots_val.clone();
+        concrete.try_dereference()?;
         let Some(elems) = concrete.try_as_array()? else {
             continue; // cov:ignore: a non-array /Annots is malformed
         };
         for elem in elems {
-            let (_, terminal_ref) = source.resolve_handle_ref(&elem)?;
+            let terminal_ref = elem.object_ref();
+            elem.try_dereference()?;
             if let Some(r) = terminal_ref {
                 // An `/Annots` element may be a reference to a reference to the
                 // widget; resolve the holder chain to the terminal widget ref so it
@@ -629,18 +643,20 @@ fn widget_page_ref<R: Read + Seek>(
     widget_ref: ObjectRef,
 ) -> Result<Option<ObjectRef>> {
     let widget_handle = source.get_object_handle(widget_ref);
-    let widget = source.resolve_handle(&widget_handle)?;
+    widget_handle.try_dereference()?;
+    let widget = widget_handle;
     if widget.try_as_dictionary()?.is_none() {
         return Ok(None);
     }
     let p_value = widget.try_get_key(b"/P")?;
-    if p_value.is_null() {
+    if p_value.try_is_null()? {
         // `/P` is optional (ISO 32000-2 §12.5.2): a widget may omit it. Such
         // a widget's survival is decided by retained-`/Annots` membership in
         // trim_field_kids, not by this back-pointer.
         return Ok(None);
     }
-    let (_, last_ref) = source.resolve_handle_ref(&p_value)?;
+    let last_ref = p_value.object_ref();
+    p_value.try_dereference()?;
     Ok(last_ref)
 }
 
@@ -761,7 +777,8 @@ fn rewrite_field_kids<R: Read + Seek>(
         return Ok(()); // cov:ignore: a survivor's parent field is always in the copy map
     };
     let field_handle = target.get_object_handle(target_field_ref);
-    let field = target.resolve_handle(&field_handle)?;
+    field_handle.try_dereference()?;
+    let field = field_handle;
     if field.try_as_dictionary()?.is_none() {
         return Ok(()); // cov:ignore: a copied field ref always resolves to a dictionary
     }
@@ -1214,7 +1231,8 @@ pub(crate) fn merge_documents_with_resource_decisions_and_preserve_primary_into<
                 .root_ref()
                 .expect("Pdf::empty always populates a root catalog");
             let primary_catalog_handle = input.source.get_object_handle(primary_catalog_ref);
-            let primary_catalog = input.source.resolve_handle(&primary_catalog_handle)?;
+            primary_catalog_handle.try_dereference()?;
+            let primary_catalog = primary_catalog_handle;
             let primary_pages_ref = primary_catalog
                 .try_get_key(b"/Pages")?
                 .object_ref()
@@ -1323,7 +1341,7 @@ pub(crate) fn merge_documents_with_resource_decisions_and_preserve_primary_into<
                 .get(&src_ref)
                 .ok_or(Error::Missing("merged page missing from copy map"))?;
             let page = target.get_object_handle(copied_page_ref);
-            target.resolve(&page)?;
+            page.try_dereference()?;
             page.replace_key(b"/Parent", pages_handle.clone())?;
         }
 
@@ -1409,7 +1427,7 @@ pub(crate) fn merge_documents_with_resource_decisions_and_preserve_primary_into<
     // Build the fresh single-level /Pages root over the accumulated kids
     // through the canonical live-handle mutation boundary.
     let root = target.get_object_handle(pages_root_ref);
-    target.resolve(&root)?;
+    root.try_dereference()?;
     // cov:ignore-start: Pdf::empty() owns the target /Pages dictionary and no
     // merge operation replaces that slot with another value before this point.
     if root.try_as_dictionary()?.is_none() {

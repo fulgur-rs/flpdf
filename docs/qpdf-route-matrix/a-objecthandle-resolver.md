@@ -418,6 +418,37 @@ The source and error boundaries are anchored to
 caller-zero and Result propagation. Rendering-only deviations and qtest
 exceptions remain outside this slice.
 
+### A6/A7/A8 Job/page/resource/JSON consumer slice `flpdf-3yn9.48.23.8` (2026-09-10)
+
+The remaining non-qtest production consumers in
+`job/page_merge.rs`, `job/page_specs.rs`, `job/resource_pruning.rs`, `pages.rs`,
+`pages/repair.rs`, `resources.rs`, `overlay_appearance_stream.rs`, and
+`document_json.rs` now have zero explicit `Pdf::resolve`, `resolve_handle`, or
+`resolve_handle_ref` calls and zero non-resolving `get_key`, `has_key`,
+`as_dictionary`, `as_array`, `as_integer`, `as_name`, or `is_null` bridge
+callers. The cutover uses the existing `ObjectHandle::try_dereference`,
+`try_get_*`, `try_as_*`, and `try_is_*` boundary, preserving `Result` error
+propagation and qpdf's accessor order.
+
+The qpdf owner boundaries are `QPDFObjectHandle.cc:240-446,759-785,965-989`
+for typed/key accessors and `:2168-2189` for warning/error delivery;
+`QPDFPageObjectHelper.cc:224-263,318-399,486-649` for inherited attributes,
+XObject traversal, parsing, and resource pruning; `QPDF_pages.cc:39-150` for
+page-tree repair/enumeration; `QPDFJob.cc:2251-2632` for shared-resource policy
+and page selection; and `QPDFJob.cc:958-1620,3094-3116` plus
+`QPDF_json.cc:852-905` for JSON section order and document serialization.
+
+Two silent post-resolution inspections remain intentionally explicit because
+there is no resolving `try_as_string`/`try_as_real` counterpart: AcroForm `/T`
+name decoding in `job/page_merge.rs` and rectangle real-number fallback in
+`pages/repair.rs`. Stream-dictionary views likewise remain after the canonical
+resolution step. These are qpdf-shaped direct type observations, not caller-side
+resolution bridges. The new `job_page_resource_json_route_contract_tests` fixes
+the production caller-zero boundary, and
+`inherited_attribute_walk_propagates_an_unresolved_parent_child_error` verifies that a
+resolver failure remains a `Result`. qtest and qtest-exceptions consumers remain
+outside this slice.
+
 ### 2026-09-09 canonical cache cutover supersession
 
 The A1/A2/A9/A10/A11/A13/A15/A16/A17/A24 rows above were authored before

@@ -111,8 +111,9 @@ pub(crate) fn should_remove_unreferenced_resources_with_report<
         return Ok(false);
     };
     let catalog = pdf.get_object_handle(root_ref);
-    let pages = pdf.resolve_handle(&catalog.try_get_key(b"/Pages")?)?;
-    if pages.is_null() {
+    let pages = catalog.try_get_key(b"/Pages")?;
+    pages.try_dereference()?;
+    if pages.try_is_null()? {
         return Ok(false);
     }
 
@@ -125,13 +126,13 @@ pub(crate) fn should_remove_unreferenced_resources_with_report<
     let mut indirect_resources_seen: BTreeSet<ObjectRef> = BTreeSet::new();
 
     while let Some(node) = queue.pop_front() {
-        let node = pdf.resolve_handle(&node)?;
+        node.try_dereference()?;
         if !nodes_seen.insert(node.identity_key()) {
             continue;
         }
 
         let dict = node.as_stream_dict().unwrap_or_else(|| node.clone());
-        let kids = pdf.resolve_handle(&dict.try_get_key(b"/Kids")?)?;
+        let kids = dict.try_get_key(b"/Kids")?;
         if let Some(kids) = kids.try_as_array()? {
             // qpdf returns true for any non-leaf page node that owns a
             // /Resources key, even if only one descendant page is selected.
@@ -156,14 +157,12 @@ pub(crate) fn should_remove_unreferenced_resources_with_report<
             }
         }
 
-        let resources = pdf.resolve_handle(&resources)?;
-        let Some(resources_dict) = resources.as_dictionary() else {
+        resources.try_dereference()?;
+        if resources.try_as_dictionary()?.is_none() {
             continue;
-        };
-        let xobject = resources_dict
-            .get(b"/XObject".as_slice())
-            .cloned()
-            .unwrap_or_else(crate::ObjectHandle::null);
+        }
+        let resources_dict = resources;
+        let xobject = resources_dict.try_get_key(b"/XObject")?;
         if let Some(xobject_ref) = xobject.object_ref() {
             if !indirect_resources_seen.insert(xobject_ref) {
                 report(SharedResourceFinding::XObject {
@@ -174,12 +173,12 @@ pub(crate) fn should_remove_unreferenced_resources_with_report<
             }
         }
 
-        let xobject = pdf.resolve_handle(&xobject)?;
-        let Some(entries) = xobject.as_dictionary() else {
+        xobject.try_dereference()?;
+        let Some(entries) = xobject.try_as_dictionary()? else {
             continue;
         };
         for object in entries.into_values() {
-            let object = pdf.resolve_handle(&object)?;
+            object.try_dereference()?;
             if object.is_form_xobject()? {
                 queue.push_back(object);
             }
