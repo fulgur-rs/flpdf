@@ -321,7 +321,7 @@ fn repair_page_tree_handle<R: Read + Seek>(
 /// node. qpdf uses the document's current `m->last_object_description`, not
 /// the repeated node's object number, so preserve that state independently
 /// from the rendered `what()` string (`QPDF_pages.cc:81-87`).
-fn page_tree_cycle_error<R: Read + Seek + 'static>(pdf: &Pdf<R>) -> Error {
+pub(crate) fn page_tree_cycle_error<R: Read + Seek>(pdf: &Pdf<R>) -> Error {
     Error::QpdfExc(QpdfExc::new(
         QpdfErrorCode::Pages,
         pdf.input_source_description(),

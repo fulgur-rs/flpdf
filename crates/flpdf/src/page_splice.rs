@@ -255,9 +255,7 @@ fn collect_page_refs<R: Read + Seek>(
         pdf.mark_object_handle_dirty(&node)?;
     }
     if !visited.insert(node.identity_key()) {
-        return Err(Error::Unsupported(format!(
-            "Loop detected in /Pages structure at {node_label}"
-        )));
+        return Err(crate::pages::repair::page_tree_cycle_error(pdf));
     }
 
     let kids_value = node.try_get_key(b"/Kids")?;
@@ -267,7 +265,12 @@ fn collect_page_refs<R: Read + Seek>(
     } else {
         None
     };
-    let mut children = Vec::new();
+    // qpdf recurses into an intermediate `/Pages` kid inside the same loop
+    // iteration that resolved it (`QPDF_pages.cc:100-107`). Collecting every
+    // kid first and recursing afterwards would let a later sibling's read
+    // overwrite `m->last_object_description`, so the reused cycle exception
+    // (`QPDF_pages.cc:77-87`) would name a different object than qpdf does.
+    let mut actual_count = 0usize;
     for (index, mut child) in kids_value
         .as_array()
         .unwrap_or_default()
@@ -303,7 +306,21 @@ fn collect_page_refs<R: Read + Seek>(
                 child = indirect;
             }
         }
-        children.push(child);
+        let child_count = collect_page_refs(
+            pdf,
+            child,
+            depth + 1,
+            max_depth,
+            false,
+            pages,
+            seen,
+            visited,
+        )?;
+        // cov:ignore-start: usize page-count overflow cannot be constructed by a finite PDF object tree
+        actual_count = actual_count.checked_add(child_count).ok_or_else(|| {
+            Error::Unsupported(format!("page count overflow at /Pages node {node_label}"))
+        })?;
+        // cov:ignore-end
     }
     if let Some(kids_handle) = kids_handle {
         pdf.mark_object_handle_dirty(&kids_handle)?;
@@ -325,24 +342,6 @@ fn collect_page_refs<R: Read + Seek>(
         }
     };
 
-    let mut actual_count = 0usize;
-    for child in children {
-        let child_count = collect_page_refs(
-            pdf,
-            child,
-            depth + 1,
-            max_depth,
-            false,
-            pages,
-            seen,
-            visited,
-        )?;
-        // cov:ignore-start: usize page-count overflow cannot be constructed by a finite PDF object tree
-        actual_count = actual_count.checked_add(child_count).ok_or_else(|| {
-            Error::Unsupported(format!("page count overflow at /Pages node {node_label}"))
-        })?;
-        // cov:ignore-end
-    }
     if declared_count != actual_count {
         return Err(Error::Unsupported(format!(
             "/Pages node {node_label} has /Count {declared_count}, but /Kids contain {actual_count} pages"
@@ -1196,11 +1195,49 @@ mod tests {
     fn shared_intermediate_page_tree_is_rejected_as_a_loop() {
         let mut pdf = open(build_pages_with_shared_intermediate_pdf());
         let err = splice_pages(&mut pdf, 0..0, &[ObjectRef::new(5, 0)]).unwrap_err();
-        assert!(
-            matches!(err, Error::Unsupported(ref message) if message.contains("Loop detected")
-                && message.contains("3 0 R")),
-            "got {err:?}"
+        // qpdf names the object it read most recently, which for this shape is
+        // the leaf reached through the first visit of the repeated intermediate
+        // node: `getAllPagesInternal` recurses inside the `/Kids` loop
+        // (`QPDF_pages.cc:100-107`) and only then revisits `3 0 R`. Probed with
+        // qpdf 11.9.0 on this exact tree:
+        // `qpdf: in.pdf (object 4 0): Loop detected in /Pages structure
+        // (getAllPages)`.
+        let is_qpdf_pages_exception = matches!(
+            &err,
+            Error::QpdfExc(exception)
+                if exception.get_error_code() == crate::QpdfErrorCode::Pages
+                    && exception.get_message_detail()
+                        == b"Loop detected in /Pages structure (getAllPages)"
+                    && exception.get_object() == b"object 4 0"
         );
+        assert!(is_qpdf_pages_exception, "got {err:?}");
+    }
+
+    #[test]
+    fn shared_empty_intermediate_names_the_repeated_node_like_qpdf() {
+        let mut pdf = open(build_pdf(&[
+            (1, "<< /Type /Catalog /Pages 2 0 R >>"),
+            (2, "<< /Type /Pages /Kids [3 0 R 3 0 R 6 0 R] /Count 2 >>"),
+            (3, "<< /Type /Pages /Parent 2 0 R /Kids [] /Count 0 >>"),
+            (6, "<< /Type /Page /Parent 2 0 R /MediaBox [0 0 612 792] >>"),
+            (5, "<< /Type /Page /MediaBox [0 0 612 792] >>"),
+        ]));
+        let err = splice_pages(&mut pdf, 0..0, &[ObjectRef::new(5, 0)]).unwrap_err();
+        // The repeated node has no kids, so nothing is read between the two
+        // visits and qpdf still names `3 0 R` itself. Reading every kid up
+        // front instead would let `6 0 R` overwrite the description and name
+        // the wrong object. Probed with qpdf 11.9.0 on this exact tree:
+        // `qpdf: in.pdf (object 3 0): Loop detected in /Pages structure
+        // (getAllPages)`.
+        let is_qpdf_pages_exception = matches!(
+            &err,
+            Error::QpdfExc(exception)
+                if exception.get_error_code() == crate::QpdfErrorCode::Pages
+                    && exception.get_message_detail()
+                        == b"Loop detected in /Pages structure (getAllPages)"
+                    && exception.get_object() == b"object 3 0"
+        );
+        assert!(is_qpdf_pages_exception, "got {err:?}");
     }
 
     #[test]
