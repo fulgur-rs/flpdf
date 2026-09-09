@@ -151,3 +151,73 @@ fn repeated_input_and_output_selectors_stay_usage_errors() {
         assert!(!output.exists(), "{args:?}: a rejected job must not write");
     }
 }
+
+/// qpdf fails at the first offending token in argv order, so an unknown option
+/// ahead of a repeated selector wins and one behind it does not.
+#[test]
+fn the_first_usage_failure_in_argv_order_is_reported() {
+    if !qpdf_available() {
+        if std::env::var_os("CI").is_some() {
+            panic!("qpdf 11.9.0 is required for this parity test on CI");
+        }
+        eprintln!("skipping: qpdf 11.9.0 is not available");
+        return;
+    }
+
+    let temp = tempfile::tempdir().expect("temporary directory");
+    let output = temp.path().join("out.pdf");
+    let cases: [Vec<OsString>; 2] = [
+        vec![
+            OsString::from("--definitely-unknown"),
+            OsString::from("--empty"),
+            OsString::from("--empty"),
+            output.as_os_str().to_owned(),
+        ],
+        vec![
+            OsString::from("--empty"),
+            OsString::from("--empty"),
+            OsString::from("--definitely-unknown"),
+            output.as_os_str().to_owned(),
+        ],
+    ];
+
+    for args in cases {
+        let qpdf = run_qpdf(&args);
+        let flpdf = run_flpdf(&args);
+        assert_eq!(qpdf.status.code(), Some(2), "qpdf should reject {args:?}");
+        assert_eq!(flpdf.status.code(), qpdf.status.code(), "{args:?}: status");
+        assert_eq!(flpdf.stderr, qpdf.stderr, "{args:?}: stderr");
+    }
+}
+
+/// A value that fails its own conversion is qpdf's error even when a later
+/// occurrence would have been valid: `Config::compressionLevel` runs
+/// `QUtil::string_to_int` for every argv occurrence
+/// (`QPDFJob_config.cc:135-139`). Self-override is therefore limited to the
+/// choice-valued options clap validates as it parses.
+#[test]
+fn an_overridden_value_is_still_validated() {
+    if !qpdf_available() {
+        if std::env::var_os("CI").is_some() {
+            panic!("qpdf 11.9.0 is required for this parity test on CI");
+        }
+        eprintln!("skipping: qpdf 11.9.0 is not available");
+        return;
+    }
+
+    let temp = tempfile::tempdir().expect("temporary directory");
+    let output = temp.path().join("out.pdf");
+    let args = vec![
+        OsString::from("--static-id"),
+        OsString::from("--compression-level=999999999999999999999999999999999999"),
+        OsString::from("--compression-level=9"),
+        fixture().into_os_string(),
+        output.as_os_str().to_owned(),
+    ];
+
+    let qpdf = run_qpdf(&args);
+    let flpdf = run_flpdf(&args);
+    assert_eq!(qpdf.status.code(), Some(2), "qpdf rejects the first value");
+    assert_eq!(flpdf.status.code(), qpdf.status.code());
+    assert!(!output.exists(), "a rejected job must not write");
+}

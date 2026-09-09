@@ -1060,12 +1060,20 @@ cargo test -p flpdf-cli --test cli_json --quiet
 | `QPDFJob_config` / `_argv` / `_json` / `QPDFArgParser` | 3164 | `flpdf-cli/src/arg_parser.rs` + clap | ⚪。QPDFJobの使用エラー分類は [`UsageError`](../crates/flpdf/src/error.rs) + `Error::Usage` として job lifecycle から CLI の `usage_exit` へ伝播し、`QPDFUsage` の別catch経路（`qpdf/qpdf.cc:10-23,34-39`）を再現する。CLI の入口は `std::env::args_os()` とし、qpdf argv grammar の residual/segment tokens、`--pages`/`--overlay`/attachment の path、`QPDFJob` の input description を `OsString`/raw bytes のまま保持する。UTF-8 が必要な selector・range・日付などだけを各 option parser の境界で検証し、非UTF-8 argv を `std::env::args()` の unwrap で失わない。`flpdf-v1xw` では argv token を raw bytes と `OsString` 投影の二重キャリア `RawArg` で運び、clap の parse 後に `raw_option_value` / `apply_raw_overrides` が byte-oriented な値（password 系）を raw 側で上書きする。qpdf は argv を 1 度しか走査しない（`QPDFArgParser.cc:433-494`）ので、この 2 度目の走査は clap を介在させるための (B) の入れ物の差であり、受理するコマンドラインと出力は qpdf と同じ。 |
 
 `flpdf-749p` では、qpdf の `addChoices` value callbacks（`auto_job_init.hh:100-104`）と
-`QPDFJob_config.cc:701-747,751-763` の setter が argv 順に状態を上書きする契約を、clap
-の `args_override_self(true)` へ接続した。これは `ArgAction::Set` の repeated value
-option（`--stream-data`、`--object-streams`、`--decode-level`、resource policy 等）だけを
-後勝ちにし、`--pages`/`--add-attachment`/`--copy-attachments-from` の segment accumulation
-は既存の `ArgParser` 境界に残す。qpdf の `Config::pages()` 自体が再指定を usage error にする
-（`QPDFJob_config.cc:945-950`）ため、全 option を無条件に override する実装にはしない。
+`QPDFJob_config.cc:701-747,751-763` の setter が argv 順に状態を上書きする契約を、clap の
+self-override へ接続した。適用先は **choice 値の option に限る**（`--stream-data`、
+`--object-streams`、`--decode-level`、`--compress-streams`、`--normalize-content`、
+`--newline-before-endstream`、`--flatten-annotations`、`--keep-files-open`、
+`--password-mode`、`--password-file`、resource policy）。`--pages`/`--add-attachment`/
+`--copy-attachments-from` の segment accumulation は既存の `ArgParser` 境界に残す。
+
+command 全体へ `args_override_self` を掛けない理由は 2 つある。第一に、値の検証を
+clap の後で行う option では、上書きされた occurrence の検証が丸ごと飛ぶ。qpdf は
+`Config::compressionLevel` を argv occurrence ごとに呼び、`QUtil::string_to_int`
+（`QPDFJob_config.cc:135-139`）が最初の値の overflow を先に弾く。第二に、
+`--job-json-file` のように qpdf が occurrence ごとに partial initialize を走らせる
+option は、後勝ちにすると設定そのものが失われる。choice 値の option は clap が
+parse 時点で検証を終えているため、この 2 つの問題がない。
 
 入力・出力 selector も例外で、`Config::emptyInput` / `Config::replaceInput`
 （`QPDFJob_config.cc:27-39,54-62`）は 2 回目の指定を usage error にする。qpdf では

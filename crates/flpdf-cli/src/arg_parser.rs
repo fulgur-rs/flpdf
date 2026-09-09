@@ -327,6 +327,9 @@ impl ArgParser {
         // job sees either one.
         let mut selected_empty_input = false;
         let mut selected_replace_input = false;
+        // qpdf fails at the first offending token in argv order, so hold this
+        // error until the scan has seen whether an unknown option came first.
+        let mut repeated_selector: Option<(usize, &'static str)> = None;
 
         while let Some(arg) = iter.next() {
             if arg.as_bytes() == b"--" {
@@ -363,20 +366,20 @@ impl ArgParser {
             };
             match option.as_str() {
                 "empty" => {
-                    if selected_empty_input {
-                        return Err(flpdf::UsageError::new(
+                    if selected_empty_input && repeated_selector.is_none() {
+                        repeated_selector = Some((
+                            residual_args.len(),
                             "empty input can't be used since input file has already been given",
-                        )
-                        .into());
+                        ));
                     }
                     selected_empty_input = true;
                 }
                 "replace-input" => {
-                    if selected_replace_input {
-                        return Err(flpdf::UsageError::new(
+                    if selected_replace_input && repeated_selector.is_none() {
+                        repeated_selector = Some((
+                            residual_args.len(),
                             "replace-input can't be used since output file has already been given",
-                        )
-                        .into());
+                        ));
                     }
                     selected_replace_input = true;
                 }
@@ -473,6 +476,16 @@ impl ArgParser {
                     .collect(),
             })
             .collect();
+        if let Some((index, message)) = repeated_selector {
+            // An unknown option earlier in argv is qpdf's first failure, and
+            // the usage boundary reports it with the original spelling.
+            let unknown_first = first_unknown_option
+                .as_ref()
+                .is_some_and(|(unknown_index, _)| *unknown_index < index);
+            if !unknown_first {
+                return Err(flpdf::UsageError::new(message).into());
+            }
+        }
         Ok(ParsedArgs {
             residual_args,
             raw_residual_args,
