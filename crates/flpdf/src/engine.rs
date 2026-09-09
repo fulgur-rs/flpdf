@@ -774,24 +774,18 @@ mod tests {
             format!("trailer\n<< /Size 2 /Root 1 0 R >>\nstartxref\n{xref}\n%%EOF\n").as_bytes(),
         );
 
-        let error = match Pdf::open_with_options(
+        let error = Pdf::open_with_options(
             Cursor::new(bytes),
             PdfOpenOptions {
                 repair: false,
                 description: b"bad5.pdf".to_vec(),
                 ..PdfOpenOptions::default()
             },
-        ) {
-            Ok(_) => panic!("strict open must reject a malformed classic xref entry"),
-            Err(error) => error,
-        };
-        let source = match error.open_failure() {
-            Some((source, _)) => source,
-            None => &error,
-        };
-
+        )
+        .err()
+        .expect("strict open must reject a malformed classic xref entry");
         assert!(matches!(
-            source,
+            error,
             Error::QpdfExc(exception)
                 if exception.get_filename() == b"bad5.pdf"
                     && exception.get_object() == b"xref table"
