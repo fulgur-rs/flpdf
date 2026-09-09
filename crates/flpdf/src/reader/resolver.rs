@@ -5066,6 +5066,7 @@ mod tests {
     use super::pipe_stream_data_from_input;
     use super::ChildHandles;
     use super::ObjectStreamResolutionError;
+    use super::ReadObjectAtOffsetError;
     use super::ResolveMark;
     use super::ResolverHandle;
     use super::ResolverWarningOptions;
@@ -14113,6 +14114,151 @@ mod tests {
             .fix_dangling_references()
             .expect("range failure is caught as a qpdf warning");
         assert!(!resolver.repair_diagnostics().entries().is_empty());
+    }
+
+    #[test]
+    fn raw_invalid_generation_body_failure_is_caught_as_a_warning() {
+        let mut bytes = b"%PDF-1.4\n".to_vec();
+        let offset = bytes.len();
+        bytes.extend_from_slice(b"5 65536 obj\n[ 2147483648 0 R ]\nendobj\n");
+        let resolver = ResolverHandle::new_shared(
+            Cursor::new(bytes),
+            0,
+            BTreeMap::<ObjectRef, XrefEntry>::new(),
+            false,
+            false,
+            Diagnostics::default(),
+            ResolverWarningOptions::new(crate::QPDFLogger::create(), true, Vec::new()),
+            0,
+        );
+        resolver.set_attempt_recovery(false);
+        resolver.install_raw_xref_entries(BTreeMap::from([(
+            QpdfObjGen::new(5, 65_536),
+            XrefEntry::Uncompressed {
+                offset: offset as u64,
+            },
+        )]));
+
+        resolver
+            .fix_dangling_references()
+            .expect("body failure is caught as a qpdf warning");
+        assert!(resolver
+            .repair_diagnostics()
+            .entries()
+            .iter()
+            .any(|entry| entry.message_string().contains("integer out of range")));
+    }
+
+    #[test]
+    fn raw_resolution_recovery_can_cache_the_rebuilt_object() {
+        let pdf = Pdf::open_mem_owned_with_options(
+            synthetic_mismatch_pdf(true),
+            crate::PdfOpenOptions {
+                repair: true,
+                ..Default::default()
+            },
+        )
+        .expect("open recovery fixture");
+
+        pdf.resolver
+            .resolve_raw_xref_entry(QpdfObjGen::new(1, 0), 9)
+            .expect("raw resolution should retry the rebuilt object");
+        assert!(pdf.reconstructed_xref());
+        assert!(pdf
+            .resolver
+            .registered_handle(ObjectRef::new(1, 0))
+            .is_some_and(|handle| handle.is_resolved()));
+    }
+
+    #[test]
+    fn raw_resolution_recovery_warns_when_the_rebuilt_object_is_absent() {
+        let pdf = Pdf::open_mem_owned_with_options(
+            synthetic_mismatch_pdf(false),
+            crate::PdfOpenOptions {
+                repair: true,
+                ..Default::default()
+            },
+        )
+        .expect("open absent recovery fixture");
+
+        pdf.resolver
+            .resolve_raw_xref_entry(QpdfObjGen::new(1, 0), 9)
+            .expect("absent raw object should become a warning");
+        assert!(pdf.repair_diagnostics().entries().iter().any(|entry| {
+            entry
+                .message_string()
+                .contains("object 1 0 not found in file after regenerating cross reference table")
+        }));
+    }
+
+    #[test]
+    fn raw_resolution_recovery_read_failure_is_caught_as_a_warning() {
+        let mut bytes = b"%PDF-1.7\n".to_vec();
+        let false_offset = bytes.len();
+        bytes.extend_from_slice(b"2 0 obj\ntrue\nendobj\n");
+        let object_one_offset = bytes.len();
+        bytes.extend_from_slice(b"1 0 obj\n[ 2147483648 0 R ]\nendobj\n");
+        let xref_offset = bytes.len();
+        bytes.extend_from_slice(
+            format!(
+                "xref\n0 3\n0000000000 65535 f \n{false_offset:010} 00000 n \n{false_offset:010} 00000 n \n"
+            )
+            .as_bytes(),
+        );
+        bytes.extend_from_slice(
+            format!("trailer\n<< /Size 3 /Root 1 0 R >>\nstartxref\n{xref_offset}\n%%EOF\n")
+                .as_bytes(),
+        );
+        let pdf = Pdf::open_mem_owned_with_options(
+            bytes,
+            crate::PdfOpenOptions {
+                repair: true,
+                ..Default::default()
+            },
+        )
+        .expect("open malformed recovery fixture");
+
+        pdf.resolver
+            .resolve_raw_xref_entry(QpdfObjGen::new(1, 0), false_offset as u64)
+            .expect("retry read failure should become a warning");
+        assert!(pdf.repair_diagnostics().entries().iter().any(|entry| {
+            entry
+                .message_string()
+                .contains("integer out of range converting 2147483648")
+        }));
+        assert!(object_one_offset < xref_offset);
+    }
+
+    #[test]
+    fn invalid_raw_generation_with_a_description_reports_range_failure() {
+        let mut bytes = b"%PDF-1.4\n".to_vec();
+        let offset = bytes.len();
+        bytes.extend_from_slice(b"5 65536 obj\n45\nendobj\n");
+        let resolver = ResolverHandle::new_shared(
+            Cursor::new(bytes),
+            0,
+            BTreeMap::<ObjectRef, XrefEntry>::new(),
+            false,
+            false,
+            Diagnostics::default(),
+            ResolverWarningOptions::new(crate::QPDFLogger::create(), true, Vec::new()),
+            0,
+        );
+
+        let error = resolver
+            .read_object_at_offset_with_description(
+                offset as u64,
+                QpdfObjGen::new(5, 65_536),
+                true,
+                false,
+                Some(b"described read".to_vec()),
+            )
+            .expect_err("invalid raw generation cannot become an ObjectRef");
+        assert!(matches!(
+            error,
+            ReadObjectAtOffsetError::Header(Error::Parse { message, .. })
+                if message == "object reference is out of range"
+        ));
     }
 
     #[test]
