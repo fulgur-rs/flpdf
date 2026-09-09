@@ -100,12 +100,24 @@ fn deep_page_tree_survives_check_json_and_page_selection_like_qpdf() {
     let input = input.to_str().expect("UTF-8 temporary path").to_owned();
 
     let check_args = vec!["--check".to_owned(), input.clone()];
-    assert_success(&run_qpdf(&check_args), "qpdf --check");
-    assert_success(&run_flpdf(&check_args), "flpdf --check");
+    let qpdf_check = run_qpdf(&check_args);
+    let flpdf_check = run_flpdf(&check_args);
+    assert_success(&qpdf_check, "qpdf --check");
+    assert_success(&flpdf_check, "flpdf --check");
+    assert_eq!(
+        flpdf_check.stdout, qpdf_check.stdout,
+        "deep --check report must remain byte-identical to qpdf"
+    );
 
     let json_args = vec!["--json=2".to_owned(), input.clone()];
-    assert_success(&run_qpdf(&json_args), "qpdf --json=2");
-    assert_success(&run_flpdf(&json_args), "flpdf --json=2");
+    let qpdf_json = run_qpdf(&json_args);
+    let flpdf_json = run_flpdf(&json_args);
+    assert_success(&qpdf_json, "qpdf --json=2");
+    assert_success(&flpdf_json, "flpdf --json=2");
+    assert_eq!(
+        flpdf_json.stdout, qpdf_json.stdout,
+        "deep --json=2 output must remain byte-identical to qpdf"
+    );
 
     let qpdf_output = temp.path().join("qpdf-pages.pdf");
     let flpdf_output = temp.path().join("flpdf-pages.pdf");

@@ -7,6 +7,14 @@
 //! `resolve_inherited_handle_with_max_depth` for the corresponding
 //! compensation in the sibling bottom-up attribute climb, and the inline
 //! deviation-marker comments below for the exact call sites.
+//!
+//! Deviation: the descendant walk holds its suspended frames on the heap
+//! instead of the native call stack. qpdf recurses in
+//! `pushInheritedAttributesToPageInternal` (`QPDF_optimization.cc:159-245`);
+//! only the container changes here. The push/pop order, the post-order pop
+//! that runs after every kid of a node has been processed, and the
+//! `key_ancestors` erase-when-empty invariant are unchanged, so the output
+//! bytes are the same for every tree qpdf itself can walk.
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::io::{Read, Seek};
@@ -180,6 +188,11 @@ enum InheritedFrameKind {
     Indirect,
 }
 
+/// One suspended `pushInheritedAttributesToPageInternal` frame.
+///
+/// qpdf uses the native call stack for this walk. Keep the same kid order and
+/// the same post-order attribute pop while moving the Rust stack frames to the
+/// heap, so deeply nested valid trees do not hit the thread-stack limit.
 struct InheritedFrame {
     kind: InheritedFrameKind,
     kids: Vec<ObjectHandle>,
@@ -191,10 +204,16 @@ fn warn_skipped_pages_keys<R: Read + Seek>(
     pdf: &mut Pdf<R>,
     dict: &ObjectHandle,
     warn_skipped_keys: bool,
-    object: String,
+    node_ref: Option<ObjectRef>,
 ) -> Result<()> {
     // cov:ignore-start: all production callers pass warn_skipped_keys=false
     if warn_skipped_keys && dict.try_has_key(b"/Parent")? {
+        // qpdf builds this description inside the same branch, through
+        // `setLastObjectDescription` (`QPDF_optimization.cc:209`).
+        let object = node_ref.map_or_else(
+            || "Pages object".to_owned(),
+            |r| format!("Pages object: object {} {}", r.number, r.generation),
+        );
         for key in dict.try_get_keys()? {
             if !INHERITABLE_KEYS.contains(&key.as_slice())
                 && ![b"/Type".as_slice(), b"/Parent", b"/Kids", b"/Count"].contains(&key.as_slice())
@@ -226,11 +245,7 @@ fn enter_direct_frame<R: Read + Seek>(
     if !is_pages_dictionary(&dict) {
         return Ok(None);
     }
-    let object = dict
-        .object_ref()
-        .map(|r| format!("Pages object: object {} {}", r.number, r.generation))
-        .unwrap_or_else(|| "Pages object".to_owned());
-    warn_skipped_pages_keys(pdf, &dict, warn_skipped_keys, object)?;
+    warn_skipped_pages_keys(pdf, &dict, warn_skipped_keys, dict.object_ref())?;
     let own_keys = push_node_attributes(pdf, &dict, key_ancestors, allow_changes)?;
     let kids = dict.get_key(b"/Kids").as_array().unwrap_or_default();
     Ok(Some(InheritedFrame {
@@ -257,15 +272,7 @@ fn enter_indirect_frame<R: Read + Seek>(
     if dict.as_dictionary().is_none() || !is_pages_dictionary(&dict) {
         return Ok(None);
     }
-    warn_skipped_pages_keys(
-        pdf,
-        &dict,
-        warn_skipped_keys,
-        format!(
-            "Pages object: object {} {}",
-            node_ref.number, node_ref.generation
-        ),
-    )?;
+    warn_skipped_pages_keys(pdf, &dict, warn_skipped_keys, Some(node_ref))?;
     let own_keys = push_node_attributes(pdf, &dict, key_ancestors, allow_changes)?;
     let kids = dict.get_key(b"/Kids").as_array().unwrap_or_default();
     Ok(Some(InheritedFrame {

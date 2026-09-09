@@ -226,6 +226,11 @@ fn collect_page_tree_nodes(
     Ok(())
 }
 
+/// One suspended page-tree collection frame.
+///
+/// qpdf walks the same tree with the native call stack in
+/// `getAllPagesInternal` (`QPDF_pages.cc:77-138`). Only the container moves to
+/// the heap; the pre-order node visit and the child-array order are unchanged.
 struct PageTreeCollectFrame {
     kids: ObjectHandle,
     next_kid: usize,

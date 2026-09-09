@@ -391,8 +391,15 @@ ownership 実装であり、PDF bytes、warning、xref/cache identity は変更�
 and tree-rebuild walks with explicit heap frames. This is category (B): qpdf's
 child order, global visited/seen behavior, repair/mutation order, inherited-key
 stack push/pop, and existing explicit max-depth API are unchanged; only the
-Rust call-stack container changes. The deep-tree regression covers qpdf 11.9.0
-`--check`, `--json=2`, and `--pages . 1-z --` success paths.
+Rust call-stack container changes. The deep-tree regression asserts that qpdf
+11.9.0 and flpdf produce identical `--check` and `--json=2` stdout and identical
+`--pages . 1-z --` bytes on a 2000-level tree.
+
+The byte-identical claim holds for every tree qpdf itself can walk. Past that
+depth qpdf has no observable output to match: measured with 11.9.0, a linear
+2000-level tree succeeds for both, while a 50000-level tree makes qpdf itself
+die of a stack overflow (SIGSEGV) where the heap-frame walk still completes.
+Memory then grows linearly with depth instead of exhausting the thread stack.
 
 | `QPDFExc.cc` / `QPDFSystemError.cc` | 123 | `error.rs`(125) | ✅ |
 
