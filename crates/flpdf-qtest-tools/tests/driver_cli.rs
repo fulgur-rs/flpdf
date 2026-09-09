@@ -2,6 +2,10 @@ use assert_cmd::Command;
 use flpdf::{PageDocumentHelper, Pdf, PdfOpenOptions};
 use std::{ffi::CStr, fs};
 
+#[path = "../../flpdf-cli/tests/support/eol.rs"]
+mod eol;
+use eol::EOL;
+
 #[cfg(unix)]
 use std::os::unix::ffi::OsStringExt;
 
@@ -13,6 +17,23 @@ fn usage_for(command: &Command) -> String {
     let program = command.get_program().to_string_lossy();
     let whoami = program.rsplit('/').next().unwrap_or(&program);
     format!("Usage: {whoami} n filename1 [arg2]\n")
+}
+
+#[test]
+fn test_85_uses_canonical_integer_accessors_and_emits_qpdf_clamp_warnings() {
+    let assertion = driver()
+        .args(["85", "-"])
+        .assert()
+        .code(0)
+        .stdout("test 85 done\n");
+    let expected = format!(
+        "requested value of integer is too big; returning INT_MAX{EOL}\
+         requested value of integer is too small; returning INT_MIN{EOL}\
+         unsigned value request for negative number; returning 0{EOL}\
+         unsigned integer value request for negative number; returning 0{EOL}\
+         requested value of unsigned integer is too big; returning UINT_MAX{EOL}"
+    );
+    assert_eq!(assertion.get_output().stderr, expected.as_bytes());
 }
 
 fn minimal_pdf() -> &'static str {

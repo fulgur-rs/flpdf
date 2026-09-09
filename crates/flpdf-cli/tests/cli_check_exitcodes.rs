@@ -777,6 +777,36 @@ fn check_warnings_only_pdf_exits_3() {
 }
 
 #[test]
+fn check_and_show_xref_run_in_qpdf_do_inspection_order() {
+    if !qpdf_available() {
+        return;
+    }
+
+    let mut input = tempfile::NamedTempFile::new().unwrap();
+    input
+        .write_all(&warnings_only_corrupt_xref_bytes())
+        .unwrap();
+    let path = input.path().to_str().unwrap();
+
+    let qpdf = ProcessCommand::new("qpdf")
+        .args(["--check", "--show-xref", path])
+        .output()
+        .unwrap();
+    let flpdf = ProcessCommand::new(assert_cmd::cargo_bin!("flpdf"))
+        .env("FLPDF_PROGNAME", "qpdf")
+        .args(["--check", "--show-xref", path])
+        .output()
+        .unwrap();
+
+    assert_eq!(qpdf.status.code(), Some(3));
+    assert_eq!(flpdf.status.code(), qpdf.status.code());
+    assert_eq!(flpdf.stdout, qpdf.stdout);
+    assert_eq!(flpdf.stderr, qpdf.stderr);
+    assert!(String::from_utf8_lossy(&qpdf.stdout).contains("checking "));
+    assert!(String::from_utf8_lossy(&qpdf.stdout).contains("1/0: uncompressed"));
+}
+
+#[test]
 fn check_no_warn_suppresses_warning_delivery_but_keeps_exit_3() {
     let mut f = tempfile::NamedTempFile::new().unwrap();
     f.write_all(&warnings_only_corrupt_xref_bytes()).unwrap();

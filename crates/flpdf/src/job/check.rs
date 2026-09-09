@@ -156,6 +156,22 @@ impl QPDFJob {
         Ok(self.get_exit_code())
     }
 
+    /// Run qpdf's combined `--check --show-xref` inspection sequence on one
+    /// document. `QPDFJob::doInspection` calls `doCheck` first and
+    /// `showXRefTable` afterwards (`QPDFJob.cc:1646-1680`); keeping both
+    /// report-only consumers behind one completion boundary prevents the CLI
+    /// dispatch from selecting one branch and silently dropping the other.
+    pub fn check_and_show_xref<R: Read + Seek + 'static>(
+        &mut self,
+        pdf: &mut Pdf<R>,
+    ) -> std::result::Result<JobExitCode, CheckError> {
+        self.run_check_report(pdf)?;
+        self.show_xref_report(pdf)?;
+        self.drain_document_warnings(pdf);
+        self.complete(false)?;
+        Ok(self.get_exit_code())
+    }
+
     /// Run the full check report without completing the enclosing job.
     ///
     /// qpdf's `doCheck` may be followed by other `doInspection` consumers on
