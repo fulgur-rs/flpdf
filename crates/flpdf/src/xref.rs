@@ -5175,8 +5175,17 @@ impl<'a> ByteCursor<'a> {
     }
 
     fn read_fixed_i32(&mut self, width: usize) -> Result<i32> {
-        self.read_fixed(width)?
-            .parse::<i32>()
+        // qpdf's `parse_xrefEntry` only ever gathers `QUtil::is_digit`
+        // characters and fails the entry otherwise (`QPDF.cc:783-810`), so a
+        // signed literal such as `-0001` is not a generation qpdf would
+        // accept. `str::parse` would take it, which would silently keep an
+        // entry qpdf rejects with `invalid xref entry`
+        // (`QPDF.cc:877-880`).
+        let text = self.read_fixed(width)?;
+        if !text.bytes().all(|byte| byte.is_ascii_digit()) {
+            return Err(Error::parse(self.pos, "invalid fixed-width i32"));
+        }
+        text.parse::<i32>()
             .map_err(|_| Error::parse(self.pos, "invalid fixed-width i32"))
     }
 
