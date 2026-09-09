@@ -19,6 +19,14 @@ const STREAM_FLATE_ERROR: &str = concat!(
     env!("CARGO_MANIFEST_DIR"),
     "/../../tests/fixtures/test_driver/stream_flate_error.pdf"
 );
+const STREAM_UNFILTERABLE: &str = concat!(
+    env!("CARGO_MANIFEST_DIR"),
+    "/../../tests/fixtures/test_driver/stream_unfilterable.pdf"
+);
+const NULL_LENGTH_FRAMING: &str = concat!(
+    env!("CARGO_MANIFEST_DIR"),
+    "/../../tests/fixtures/compat/null-length-framing-matrix.pdf"
+);
 
 fn flpdf(args: &[&str]) -> Output {
     Command::cargo_bin("flpdf")
@@ -123,4 +131,42 @@ fn show_object_filtered_stream_failure_is_a_qpdf_warning() {
     assert_eq!(output.status.code(), Some(3), "stderr: {:?}", output.stderr);
     assert!(output.stdout.is_empty());
     assert!(String::from_utf8_lossy(&output.stderr).contains("error decoding stream data"));
+}
+
+#[test]
+fn show_object_filtered_stream_applies_requested_content_normalization() {
+    let output = flpdf(&[
+        "--show-object=6",
+        "--filtered-stream-data",
+        "--normalize-content=y",
+        NULL_LENGTH_FRAMING,
+    ]);
+
+    assert_eq!(output.status.code(), Some(3), "stderr: {:?}", output.stderr);
+    assert_eq!(output.stdout, b"missing-cr\n");
+}
+
+#[test]
+fn show_object_unfilterable_stream_reports_qpdf_warning_and_object_error() {
+    let output = flpdf(&[
+        "--show-object=6",
+        "--filtered-stream-data",
+        STREAM_UNFILTERABLE,
+    ]);
+
+    assert_eq!(output.status.code(), Some(2), "stderr: {:?}", output.stderr);
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        stderr.contains("WARNING:")
+            && stderr.contains("stream object 6 0: unable to filter stream data"),
+        "missing qpdf warning: {stderr}"
+    );
+    assert!(
+        stderr.contains("unable to get object 6,0"),
+        "missing qpdf object error: {stderr}"
+    );
+    assert!(
+        !stderr.contains("getStreamData called on unfilterable stream"),
+        "internal getStreamData error leaked: {stderr}"
+    );
 }

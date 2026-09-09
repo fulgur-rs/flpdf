@@ -231,6 +231,9 @@ struct JobConfiguration {
     flatten_annotations: Option<FlattenAnnotationsMode>,
     flatten_rotation: bool,
     generate_appearances: bool,
+    /// qpdf's `QPDFJob::Members::normalize` flag used by `doShowObj` and
+    /// propagated to the writer by `setWriterOptions`.
+    normalize_content: bool,
     writer: WriterConfiguration,
     linearize: bool,
     linearize_pass1: Option<PathBuf>,
@@ -1641,6 +1644,22 @@ impl QPDFJob {
         self.configuration.writer = configuration;
     }
 
+    /// Set qpdf's job-level content-normalization flag.
+    ///
+    /// `QPDFJob::Config::normalizeContent` stores this separately from the
+    /// writer object. `doShowObj` consumes it while selecting its output pipe,
+    /// and `setWriterOptions` later copies the same flag into a writer
+    /// (`libqpdf/QPDFJob_config.cc:414-418`, `libqpdf/QPDFJob.cc:2862`).
+    pub fn set_content_normalization(&mut self, value: bool) {
+        self.configuration.normalize_content = value;
+        self.configuration.writer.set_content_normalization(value);
+    }
+
+    /// Return the job-level content-normalization flag used by inspection.
+    pub(crate) fn content_normalization_enabled(&self) -> bool {
+        self.configuration.normalize_content
+    }
+
     /// Set qpdf's recovery policy for documents opened by this job.
     pub fn set_suppress_recovery(&mut self, value: bool) {
         self.configuration.suppress_recovery = value;
@@ -2268,6 +2287,7 @@ impl QPDFJob {
             configuration.writer.set_newline_before_endstream(true);
         }
         if let Some(value) = job_json_choice(&members, b"normalizeContent", &["y", "n"], true)? {
+            configuration.normalize_content = value == "y";
             configuration.writer.set_content_normalization(value == "y");
         }
         if let Some(value) = job_json_choice(
@@ -4757,6 +4777,12 @@ impl QPDFJobConfig<'_> {
         self
     }
 
+    /// Configure qpdf's job-level `normalizeContent` setting.
+    pub fn normalize_content(&mut self, value: bool) -> &mut Self {
+        self.job.set_content_normalization(value);
+        self
+    }
+
     /// Enable qpdf's form-appearance generation phase.
     pub fn generate_appearances(&mut self) -> &mut Self {
         self.job.configuration.generate_appearances = true;
@@ -4992,6 +5018,14 @@ mod tests {
         job.config().verbose();
 
         assert!(job.verbose());
+    }
+
+    #[test]
+    fn config_normalize_content_enables_the_job_inspection_setting() {
+        let mut job = QPDFJob::new();
+        job.config().normalize_content(true);
+
+        assert!(job.content_normalization_enabled());
     }
 
     #[test]

@@ -38,8 +38,16 @@ impl QPDFJob {
         filtered_stream_data: bool,
     ) -> Result<JobExitCode> {
         let logger = self.logger();
+        let normalize_content = self.content_normalization_enabled();
         self.inspect(pdf, |pdf| {
-            emit_show_object(pdf, &logger, &object, raw_stream_data, filtered_stream_data)
+            emit_show_object(
+                pdf,
+                &logger,
+                &object,
+                raw_stream_data,
+                filtered_stream_data,
+                normalize_content,
+            )
         })
     }
 
@@ -52,7 +60,15 @@ impl QPDFJob {
         filtered_stream_data: bool,
     ) -> Result<()> {
         let logger = self.logger();
-        emit_show_object(pdf, &logger, object, raw_stream_data, filtered_stream_data)
+        let normalize_content = self.content_normalization_enabled();
+        emit_show_object(
+            pdf,
+            &logger,
+            object,
+            raw_stream_data,
+            filtered_stream_data,
+            normalize_content,
+        )
     }
 
     /// Show one stream's raw or filtered data through qpdf's stream handle.
@@ -212,13 +228,35 @@ fn emit_show_object<R: Read + Seek>(
     object: &ObjectHandle,
     raw_stream_data: bool,
     filtered_stream_data: bool,
+    normalize_content: bool,
 ) -> Result<()> {
     object.type_code()?;
     if object.as_stream_dict().is_some() {
         if raw_stream_data || filtered_stream_data {
             let warning_count = pdf.repair_diagnostics().entries().len();
             let data_result = if filtered_stream_data {
-                object.get_stream_data(DecodeLevel::All)
+                if !object.stream_data_filterable(DecodeLevel::All)? {
+                    object.warn_if_possible("unable to filter stream data")?;
+                    return Err(Error::System(format!(
+                        "unable to get object {}",
+                        show_object_generation(object)
+                    )));
+                }
+                if normalize_content {
+                    let mut output = crate::pipeline::buffer::Buffer::new("stream data", None);
+                    let mut _filtering_attempted = false;
+                    let _stream_data_succeeded = object.pipe_stream_data(
+                        &mut output,
+                        &mut _filtering_attempted,
+                        crate::object_handle::STREAM_ENCODE_NORMALIZE,
+                        DecodeLevel::All,
+                        false,
+                        false,
+                    )?;
+                    Ok(std::rc::Rc::new(output.take_buffer()?))
+                } else {
+                    object.get_stream_data(DecodeLevel::All)
+                }
             } else {
                 object.get_raw_stream_data()
             };
@@ -244,6 +282,13 @@ fn emit_show_object<R: Read + Seek>(
         output.push(b'\n');
         logger.info(output)
     }
+}
+
+fn show_object_generation(object: &ObjectHandle) -> String {
+    object
+        .object_ref()
+        .map(|object_ref| format!("{},{}", object_ref.number, object_ref.generation))
+        .unwrap_or_else(|| "0,0".to_owned())
 }
 
 fn emit_npages<R: Read + Seek>(pdf: &mut Pdf<R>, logger: &crate::QPDFLogger) -> Result<()> {
@@ -388,6 +433,7 @@ mod tests {
     fn quiet_job() -> QPDFJob {
         let logger = crate::QPDFLogger::create();
         logger.set_info(Some(logger.discard()));
+        logger.set_warn(Some(logger.discard()));
         let mut job = QPDFJob::new();
         job.set_logger(logger);
         job
@@ -457,24 +503,27 @@ mod tests {
     }
 
     #[test]
-    fn show_object_returns_unwarned_filter_errors() {
+    fn show_object_reports_unfilterable_stream_before_object_error() {
         let mut pdf = Pdf::open_mem_owned(
-            include_bytes!("../../../../tests/fixtures/compat/one-page.pdf").to_vec(),
+            include_bytes!("../../../../tests/fixtures/test_driver/stream_unfilterable.pdf")
+                .to_vec(),
         )
         .unwrap();
-        let stream = ObjectHandle::stream(
-            ObjectHandle::dictionary(vec![(
-                b"/Filter".to_vec(),
-                ObjectHandle::name(b"UnknownFilter".to_vec()),
-            )]),
-            std::rc::Rc::new(b"encoded".to_vec()),
-        );
+        let stream = pdf.get_object_handle(ObjectRef::new(6, 0));
         let error = quiet_job()
             .show_object(&mut pdf, stream, false, true)
-            .expect_err("an unknown filter must remain an operation error");
-        assert!(error
-            .to_string()
-            .contains("getStreamData called on unfilterable stream"));
+            .expect_err("an unfilterable filter must remain an operation error");
+        assert!(matches!(
+            error,
+            Error::System(message) if message == "unable to get object 6,0"
+        ));
+        assert!(pdf.repair_diagnostics().entries().iter().any(|warning| {
+            warning.get_message_detail() == b"unable to filter stream data"
+                && warning
+                    .get_object()
+                    .windows(b"stream object 6 0".len())
+                    .any(|window| window == b"stream object 6 0")
+        }));
     }
 
     #[test]

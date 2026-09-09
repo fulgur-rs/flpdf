@@ -6274,6 +6274,34 @@ impl ObjectHandle {
         Ok(Rc::new(buffer.take_buffer()?))
     }
 
+    /// Probe whether qpdf can construct a filtering pipe for this stream.
+    ///
+    /// This is the overload of `QPDFObjectHandle::pipeStreamData` that calls
+    /// `QPDF_Stream::pipeStreamData` with a null pipeline and returns only its
+    /// `filtering_attempted` result (`libqpdf/QPDFObjectHandle.cc:1300-1317`,
+    /// `libqpdf/QPDF_Stream.cc:488-512`). The probe validates filters and
+    /// decode parameters but never reads source bytes, matching qpdf's
+    /// `QPDFJob::doShowObj` preflight.
+    pub(crate) fn stream_data_filterable(&self, decode_level: DecodeLevel) -> Result<bool> {
+        self.try_dereference()?;
+        let Some(stream_dict) = self.with_value(|value| match value {
+            Some(ObjectValue::Stream { stream_dict, .. }) => Some(stream_dict.clone()),
+            _ => None,
+        }) else {
+            return Err(Error::Internal(
+                "pipeStreamData called for non-stream".to_owned(),
+            ));
+        };
+
+        let Some(plan) = self.prepare_stream_filter_plan(&stream_dict)? else {
+            return Ok(false);
+        };
+        Ok(
+            !((plan.lossy_compression && decode_level < DecodeLevel::All)
+                || (plan.specialized_compression && decode_level < DecodeLevel::Specialized)),
+        )
+    }
+
     /// Write qpdf's extended stream JSON representation.
     ///
     /// This is `QPDF_Stream::writeStreamJSON`
@@ -15086,6 +15114,21 @@ mod mutation_tests {
         .unwrap();
         assert!(filtering_attempted);
         assert_eq!(decoded, b"q\nQ");
+    }
+
+    #[test]
+    fn stream_data_filterability_probe_rejects_an_unknown_filter_without_piping_source() {
+        let stream = ObjectHandle::stream(
+            ObjectHandle::dictionary(vec![(
+                b"Filter".to_vec(),
+                ObjectHandle::name(b"BogusDecode".to_vec()),
+            )]),
+            Rc::new(b"encoded".to_vec()),
+        );
+
+        assert!(!stream
+            .stream_data_filterable(DecodeLevel::All)
+            .expect("filterability probe should not read source data"));
     }
 
     #[test]
