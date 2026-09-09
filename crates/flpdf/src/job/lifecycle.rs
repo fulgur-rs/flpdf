@@ -4191,6 +4191,12 @@ impl QPDFJob {
                 rendered.extend_from_slice(b": invalid password");
                 rendered
             }
+            Error::Io(error) if !self.input_name_bytes.is_empty() => {
+                let mut rendered = self.input_name_bytes.clone();
+                rendered.extend_from_slice(b": ");
+                rendered.extend_from_slice(qpdf_file_io_source_message(error).as_bytes());
+                rendered
+            }
             Error::Parse { offset, message } if !self.input_name_bytes.is_empty() => {
                 let mut rendered = self.input_name_bytes.clone();
                 rendered.extend_from_slice(b": ");
@@ -4227,6 +4233,7 @@ impl QPDFJob {
                 let source = qpdf_file_io_source_message(source);
                 format!("{operation} {}: {source}", path.display()).into_bytes()
             }
+            Error::Io(error) => qpdf_file_io_source_message(error).into_bytes(),
             Error::Encrypted(crate::EncryptedError::BadPassword) => b"invalid password".to_vec(),
             _ => error.to_string().into_bytes(),
         }
@@ -4645,8 +4652,17 @@ impl QPDFJob {
 /// existing native fallback for error kinds that qpdf does not normalize here,
 /// while removing Rust's numeric suffix from both forms.
 fn qpdf_file_io_source_message(source: &std::io::Error) -> String {
-    if source.kind() == std::io::ErrorKind::NotFound {
-        return "No such file or directory".to_owned();
+    let message = match source.kind() {
+        std::io::ErrorKind::NotFound => Some("No such file or directory"),
+        std::io::ErrorKind::PermissionDenied => Some("Permission denied"),
+        std::io::ErrorKind::AlreadyExists => Some("File exists"),
+        std::io::ErrorKind::InvalidInput => Some("Invalid argument"),
+        std::io::ErrorKind::IsADirectory => Some("Is a directory"),
+        std::io::ErrorKind::NotADirectory => Some("Not a directory"),
+        _ => None,
+    };
+    if let Some(message) = message {
+        return message.to_owned();
     }
     let rendered = source.to_string();
     source

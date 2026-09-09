@@ -254,7 +254,41 @@ fn qpdfjob_error_report_uses_qpdf_invalid_password_wording() {
     );
 
     state.lock().unwrap().bytes.clear();
+    job.set_input_name("input.pdf");
+    job.report_job_error(&Error::Io(std::io::Error::from(
+        std::io::ErrorKind::PermissionDenied,
+    )))
+    .unwrap();
+    assert_eq!(
+        state.lock().unwrap().bytes,
+        b"qpdf: input.pdf: Permission denied\n"
+    );
+
+    for (kind, expected) in [
+        (std::io::ErrorKind::AlreadyExists, "File exists"),
+        (std::io::ErrorKind::InvalidInput, "Invalid argument"),
+        (std::io::ErrorKind::IsADirectory, "Is a directory"),
+        (std::io::ErrorKind::NotADirectory, "Not a directory"),
+    ] {
+        state.lock().unwrap().bytes.clear();
+        job.set_input_name("input.pdf");
+        job.report_job_error(&Error::Io(std::io::Error::from(kind)))
+            .unwrap();
+        assert_eq!(
+            state.lock().unwrap().bytes,
+            format!("qpdf: input.pdf: {expected}\n").as_bytes()
+        );
+    }
+
+    state.lock().unwrap().bytes.clear();
     job.set_input_name_bytes(b"");
+    job.report_job_error(&Error::Io(std::io::Error::from(
+        std::io::ErrorKind::PermissionDenied,
+    )))
+    .unwrap();
+    assert_eq!(state.lock().unwrap().bytes, b"qpdf: Permission denied\n");
+
+    state.lock().unwrap().bytes.clear();
     job.report_job_error(&Error::Encrypted(flpdf::EncryptedError::BadPassword))
         .unwrap();
     assert_eq!(state.lock().unwrap().bytes, b"qpdf: invalid password\n");

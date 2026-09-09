@@ -5532,7 +5532,7 @@ fn run_rewrite_with_qpdf_job(
     if decrypt {
         writer_options.preserve_encryption = false;
     }
-    job.set_writer_configuration(writer_configuration(
+    job.set_writer_configuration(writer_configuration_unnormalized(
         &writer_options,
         linearize,
         linearize_pass1,
