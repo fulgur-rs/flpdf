@@ -117,6 +117,9 @@ fn handle_only_helpers_do_not_carry_dead_pdf_parameters() {
         "pages/repair.rs",
         "pages/tree_rebuild.rs",
         "resources.rs",
+        // The CLI reaches the same handle-only routes, and the dirty bridge
+        // left a dead parameter here too.
+        "../../flpdf-cli/src/main.rs",
     ] {
         let source = read_source(path);
         assert!(
