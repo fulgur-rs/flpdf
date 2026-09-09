@@ -311,6 +311,15 @@ eight-case qpdf 11.9.0 helper differential.
 | `QPDFObjectHandle::mergeResources` / `shallowCopy` | `QPDFObjectHandle.cc:431-434,1063-1153,2072-2079` | `object_handle.rs:5070` + `page_annotation_flatten.rs:666-740`（widget appearance の既定リソース consumer） | ✅ live `ObjectHandle::merge_resources` を使用し、receiver・other・各top-level resource categoryをqpdfの`isDictionary`/`isArray`相当で自己解決してから分岐する。missing category は top-level が direct の shallow copy になり、nested indirect child は handle を保持する。array の `isScalar` 判定と unique-name pool の second-level dictionary 判定は qpdf と同じく各 nested handle を解決し、解決エラーを伝播する。`acroform_document_helper.rs` の `DrMap` と `overlay_appearance_stream.rs` が name-conflict overlay merge を担う |
 | `QPDFObjectHandle::getResourceNames` | `QPDFObjectHandle.hh:831-835`; `QPDFObjectHandle.cc:1156-1170` | `object_handle.rs::ObjectHandle::get_resource_names` + `try_get_resource_names` | ✅ second-level keys from every dictionary-valued resource category are collected through the canonical handle resolver; the public facade is available to `flpdf-qtest-tools`, and resolver failures remain a `Result` at the Rust boundary. |
 
+`flpdf-y88w` では、dirty-tracking bridge 撤去後に残った13個の `_pdf: &mut Pdf`
+parameters を qpdf の責務境界ごとに再監査した。`QPDFEFStreamObjectHelper::newFromStream`
+（`QPDFEFStreamObjectHelper.hh:93`）、`QPDFPageObjectHelper` の handle-only helper
+（`QPDFPageObjectHelper.cc:212-215,539-651`）、NNTree の live array/key mutation
+（`QPDFObjectHandle.cc:869-955`）、および page repair/inherited-child の
+`replaceKey`（`QPDF_optimization.cc:229-235`）は document を受け取らないため、flpdf
+の対応 helper からも引数を削除した。実際の resolver、allocation、warning ownership を
+必要とする上位 caller の `&mut Pdf` は維持しており、これは bridge を別 API へ移した変更ではない。
+
 `QPDFValue` の object description は qpdf の `std::string` 相当なので、flpdf の
 `ObjectDescription` と parser/resolver template も `Vec<u8>` を正本として保持する。
 `ObjectHandle` の object warning は `Diagnostic::raw_message` / `message_bytes()` と

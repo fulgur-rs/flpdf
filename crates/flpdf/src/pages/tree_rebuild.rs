@@ -148,8 +148,7 @@ fn promote_inherited_value<R: Read + Seek>(
 }
 
 /// Replace a missing/null leaf key with the live inherited handle.
-fn install_inherited_value<R: Read + Seek>(
-    _pdf: &mut Pdf<R>,
+fn install_inherited_value(
     page: &ObjectHandle,
     key: &[u8],
     value: Option<&ObjectHandle>,
@@ -538,10 +537,10 @@ fn rebuild_page_tree_canonical<R: Read + Seek>(
             // qpdf's inherited attribute push leaves an absent key absent;
             // explicit null is treated as absent only when a real ancestor
             // value is available. Inherited handles retain their identity.
-            install_inherited_value(pdf, &page, b"/CropBox", inherited_cropbox.as_ref())?;
-            install_inherited_value(pdf, &page, b"/MediaBox", inherited_mediabox.as_ref())?;
-            install_inherited_value(pdf, &page, b"/Resources", inherited_resources.as_ref())?;
-            install_inherited_value(pdf, &page, b"/Rotate", inherited_rotate.as_ref())?;
+            install_inherited_value(&page, b"/CropBox", inherited_cropbox.as_ref())?;
+            install_inherited_value(&page, b"/MediaBox", inherited_mediabox.as_ref())?;
+            install_inherited_value(&page, b"/Resources", inherited_resources.as_ref())?;
+            install_inherited_value(&page, b"/Rotate", inherited_rotate.as_ref())?;
             page.clone()
         } else {
             // Duplicate occurrence: shallow-copy the post-materialization

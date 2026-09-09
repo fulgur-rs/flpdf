@@ -45,7 +45,7 @@ impl<'a, R: Read + Seek> EmbeddedFileStream<'a, R> {
             Some(ObjectHandle::null()),
             Some(ObjectHandle::null()),
         );
-        Self::new_from_stream(pdf, stream)
+        Self::new_from_stream(stream)
     }
 
     /// Create an indirect `/EmbeddedFile` stream from a deferred qpdf-style
@@ -66,7 +66,7 @@ impl<'a, R: Read + Seek> EmbeddedFileStream<'a, R> {
             Some(ObjectHandle::null()),
             Some(ObjectHandle::null()),
         )?; // cov:ignore: exercised by create_ef_stream_from_provider_finalizes_the_deferred_payload; llvm-cov attributes the successful multiline call to its argument lines, not this terminator
-        Self::new_from_stream(pdf, stream)
+        Self::new_from_stream(stream)
     }
 
     /// Apply qpdf's shared `newFromStream` EmbeddedFile finalization.
@@ -76,7 +76,7 @@ impl<'a, R: Read + Seek> EmbeddedFileStream<'a, R> {
     /// is populated only after a successful pipe; a failed provider/filter
     /// path gets qpdf's warning and never falls back to a materialized length
     /// or a second digest computation.
-    pub(super) fn new_from_stream(_pdf: &mut Pdf<R>, stream: ObjectHandle) -> Result<ObjectHandle> {
+    pub(super) fn new_from_stream(stream: ObjectHandle) -> Result<ObjectHandle> {
         let stream_dict = stream.as_stream_dict().ok_or_else(|| {
             Error::System("EmbeddedFile factory received a non-stream object".to_string())
         })?;
@@ -168,7 +168,7 @@ impl<'a, R: Read + Seek> EmbeddedFileStream<'a, R> {
             Some(ObjectHandle::null()),
             Some(ObjectHandle::null()),
         )?; // cov:ignore: Pdf::new_stream guarantees a stream handle here
-        Self::new_from_stream(pdf, stream)
+        Self::new_from_stream(stream)
     }
 
     /// Construct a wrapper for a direct or indirect `/EmbeddedFile` stream

@@ -151,8 +151,7 @@ mod tests {
 
     #[test]
     fn embedded_file_finalizer_rejects_a_non_stream_handle() {
-        let mut pdf = open_minimal();
-        let error = EmbeddedFileStream::new_from_stream(&mut pdf, ObjectHandle::null())
+        let error = EmbeddedFileStream::<Cursor<Vec<u8>>>::new_from_stream(ObjectHandle::null())
             .expect_err("the shared finalizer requires a stream handle");
 
         assert_eq!(
