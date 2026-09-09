@@ -6,6 +6,10 @@ use std::path::Path;
 
 use super::CliResult;
 
+/// qpdf's argv-only synonym for `--remove-unreferenced-resources=no`
+/// (`auto_job_init.hh:65-66`).
+const PRESERVE_UNREFERENCED_RESOURCES: &str = "preserve-unreferenced-resources";
+
 const QPDF_BARE_LONG_OPTIONS: &[&str] = &[
     "add-attachment",
     "allow-weak-crypto",
@@ -496,17 +500,23 @@ impl ArgParser {
                 arg,
             );
         };
-        if let Some(rest) = arg_str.strip_prefix("--") {
-            let name = rest.split('=').next().unwrap_or(rest);
-            if name == "preserve-unreferenced-resources" {
-                // qpdf registers this as a bare argv synonym, not as a
-                // distinct Config value (`auto_job_init.hh:65-66`); its
-                // callback selects `removeUnreferencedResources("no")`
-                // (`QPDFJob_config.cc:471-474`). Normalize before clap so
-                // option order and repeated later overrides retain qpdf's
-                // last-setting semantics without a second Rust field.
+        // qpdf registers this as a bare argv synonym rather than a distinct
+        // Config value (`auto_job_init.hh:65-66`); its callback selects
+        // `removeUnreferencedResources("no")` (`QPDFJob_config.cc:471-474`).
+        // Map it to that option here, before the spelling-specific branches
+        // below, because qpdf's grammar accepts `-option` as well as
+        // `--option` and this synonym has no clap option of its own to reach
+        // through the single-dash path.
+        if let Some(rest) = arg_str
+            .strip_prefix("--")
+            .or_else(|| arg_str.strip_prefix('-'))
+        {
+            if rest.split('=').next().unwrap_or(rest) == PRESERVE_UNREFERENCED_RESOURCES {
                 return RawArg::from_bytes(b"--remove-unreferenced-resources=no".to_vec());
             }
+        }
+        if let Some(rest) = arg_str.strip_prefix("--") {
+            let name = rest.split('=').next().unwrap_or(rest);
             if self.bare_long_options.contains(name) && should_discard_bare_value(name, arg_str) {
                 return RawArg::from_bytes(format!("--{name}").into_bytes());
             }
@@ -1095,27 +1105,28 @@ mod tests {
 
     #[test]
     fn parser_maps_preserve_unreferenced_resources_to_the_qpdf_no_policy() {
-        let command = clap::Command::new("flpdf").arg(
-            clap::Arg::new("remove-unreferenced-resources")
-                .long("remove-unreferenced-resources")
-                .require_equals(true),
-        );
-        let parsed = ArgParser::from_command(command)
-            .parse(vec![
-                "flpdf".into(),
-                "--preserve-unreferenced-resources=ignored".into(),
-                "--remove-unreferenced-resources=yes".into(),
-            ])
-            .expect("qpdf resource synonym should reach the value option");
+        // qpdf accepts `-option` as well as `--option`, and the synonym takes
+        // no value of its own, so all three spellings land on the same option.
+        for spelling in [
+            "--preserve-unreferenced-resources",
+            "-preserve-unreferenced-resources",
+            "--preserve-unreferenced-resources=ignored",
+        ] {
+            let command = clap::Command::new("flpdf").arg(
+                clap::Arg::new("remove-unreferenced-resources")
+                    .long("remove-unreferenced-resources")
+                    .require_equals(true),
+            );
+            let parsed = ArgParser::from_command(command)
+                .parse(vec!["flpdf".into(), spelling.into()])
+                .expect("qpdf resource synonym should reach the value option");
 
-        assert_eq!(
-            parsed.residual_args,
-            [
-                "flpdf",
-                "--remove-unreferenced-resources=no",
-                "--remove-unreferenced-resources=yes"
-            ]
-        );
+            assert_eq!(
+                parsed.residual_args,
+                ["flpdf", "--remove-unreferenced-resources=no"],
+                "{spelling}"
+            );
+        }
     }
 
     #[test]

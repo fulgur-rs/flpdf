@@ -208,40 +208,47 @@ fn top_level_preserve_unreferenced_resources_synonym_matches_qpdf_for_pages() {
     let temp = tempfile::tempdir().expect("temporary directory");
     let input = fixture("inherited-resources-one-page.pdf");
     let output = temp.path().join("output.pdf");
-    let args = vec![
-        OsString::from("--static-id"),
-        OsString::from("--stream-data=uncompress"),
-        OsString::from("--newline-before-endstream=y"),
-        OsString::from("--preserve-unreferenced-resources"),
-        input.as_os_str().to_owned(),
-        OsString::from("--pages"),
-        OsString::from("."),
-        OsString::from("1"),
-        OsString::from("--"),
-        output.as_os_str().to_owned(),
-    ];
+    // qpdf's argument grammar accepts a single leading dash for any long
+    // option, and this synonym is no exception.
+    for spelling in [
+        "--preserve-unreferenced-resources",
+        "-preserve-unreferenced-resources",
+    ] {
+        let args = vec![
+            OsString::from("--static-id"),
+            OsString::from("--stream-data=uncompress"),
+            OsString::from("--newline-before-endstream=y"),
+            OsString::from(spelling),
+            input.as_os_str().to_owned(),
+            OsString::from("--pages"),
+            OsString::from("."),
+            OsString::from("1"),
+            OsString::from("--"),
+            output.as_os_str().to_owned(),
+        ];
 
-    let qpdf = run_qpdf(&args);
-    assert_success(&qpdf, "qpdf preserve-unreferenced-resources synonym");
-    let qpdf_bytes = fs::read(&output).expect("read qpdf pages output");
+        let qpdf = run_qpdf(&args);
+        assert_success(&qpdf, spelling);
+        let qpdf_bytes = fs::read(&output).expect("read qpdf pages output");
 
-    let flpdf = run_flpdf(&args);
-    assert_success(&flpdf, "flpdf preserve-unreferenced-resources synonym");
-    assert_eq!(
-        normalize_text_newlines(&flpdf.stdout),
-        normalize_text_newlines(&qpdf.stdout),
-        "synonym stdout must match qpdf"
-    );
-    assert_eq!(
-        normalize_text_newlines(&flpdf.stderr),
-        normalize_text_newlines(&qpdf.stderr),
-        "synonym stderr must match qpdf"
-    );
-    assert_eq!(
-        fs::read(&output).expect("read flpdf pages output"),
-        qpdf_bytes,
-        "synonym output bytes must match qpdf's --remove-unreferenced-resources=no"
-    );
+        let flpdf = run_flpdf(&args);
+        assert_success(&flpdf, spelling);
+        assert_eq!(
+            normalize_text_newlines(&flpdf.stdout),
+            normalize_text_newlines(&qpdf.stdout),
+            "{spelling}: stdout must match qpdf"
+        );
+        assert_eq!(
+            normalize_text_newlines(&flpdf.stderr),
+            normalize_text_newlines(&qpdf.stderr),
+            "{spelling}: stderr must match qpdf"
+        );
+        assert_eq!(
+            fs::read(&output).expect("read flpdf pages output"),
+            qpdf_bytes,
+            "{spelling}: output bytes must match qpdf's --remove-unreferenced-resources=no"
+        );
+    }
 }
 
 /// qpdf's `shouldRemoveUnreferencedResources` returns before any verbose

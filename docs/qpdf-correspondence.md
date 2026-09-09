@@ -1680,9 +1680,15 @@ message prefix/logger へ渡し、`get_all_pages` と resource mutation より�
 `--preserve-unreferenced-resources` synonym も同じ境界へ接続した。qpdf の
 callback は `QPDFJob_config.cc:471-474` で `removeUnreferencedResources("no")`
 と等価な `re_no` を選ぶため、flpdf の argv preprocessor は clap 前に
-`--remove-unreferenced-resources=no` へ正規化する。これにより、後続の明示的な
-`--remove-unreferenced-resources=yes|auto` が qpdf と同じく後勝ちになり、重複した
-policy field や CLI-only adapter は増やさない。
+`--remove-unreferenced-resources=no` へ正規化する。重複した policy field や
+CLI-only adapter は増やさない。qpdf の argv 文法は long option に単一ダッシュ
+綴りも許すため、この synonym は clap option を持たない（単一ダッシュ経路の
+`known_long_options` 変換に乗らない）ことを踏まえ、綴り別分岐より前で
+両方をまとめて正規化する。
+
+同じ value option を 2 回以上指定したときの last-setting 挙動は、この
+synonym に限らず flpdf 全体でまだ qpdf と一致していない（clap が
+`cannot be used multiple times` で先に失敗する）。`flpdf-749p` で追跡する。
 
 ### C. qpdf に機能そのものが無いもの
 
