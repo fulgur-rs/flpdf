@@ -281,15 +281,14 @@ fn check_document_with_suppression<R: Read + Seek + 'static>(
     let mut warnings = false;
     let mut diagnostics_seen = 0;
 
-    // qpdf's `JobSetter::setCheckMode` is applied before the first
-    // `QPDF::getRoot` in `doCheck` (`QPDFJob.cc:745-752`). Keep the flag on
-    // the document so the root accessor repairs an invalid Catalog type for
-    // every subsequent inspection branch on this same document.
-    pdf.set_check_mode(true);
-
-    // qpdf's QPDF::getRoot reads trailer /Root through getKey and accepts
-    // either a direct or indirect Catalog, rejecting only a missing,
-    // dangling, or non-dictionary value (libqpdf/QPDF.cc:2329-2367).
+    // qpdf's createQPDF obtains the input PDF version before doInspection;
+    // getVersionAsPDFVersion calls getRoot with check mode still disabled
+    // (`QPDFJob.cc:1695-1715`; `QPDF.cc:2305-2345`). Keep this preflight
+    // before the check banner so a missing/dangling /Root remains a document
+    // initialization error, while an invalid Catalog /Type does not warn yet.
+    // QPDF::getRoot accepts either a direct or indirect Catalog, rejecting
+    // only a missing, dangling, or non-dictionary value
+    // (`QPDF.cc:2329-2367`).
     let root_diagnostics_seen = diagnostic_count(pdf);
     if let Err(error) = pdf.root_handle() {
         return Err(map_check_error(
@@ -305,6 +304,12 @@ fn check_document_with_suppression<R: Read + Seek + 'static>(
     checking_line.extend_from_slice(input_name);
     checking_line.push(b'\n');
     logger.info(checking_line)?;
+
+    // qpdf's doCheck enables check mode immediately after the checking line;
+    // the following getExtensionLevel call then reaches getRoot and emits the
+    // Catalog /Type warning in the correct position (`QPDFJob.cc:745-754`).
+    pdf.set_check_mode(true);
+
     let extension_diagnostics_seen = diagnostic_count(pdf);
     let extension_level = match pdf.adobe_extension_level() {
         Ok(level) => level,
@@ -1753,6 +1758,48 @@ mod tests {
                 .matches("catalog /Type entry missing or invalid")
                 .count(),
             1
+        );
+    }
+
+    #[test]
+    fn job_check_emits_catalog_warning_after_the_checking_banner() {
+        let mut bytes = include_bytes!(concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/../../tests/fixtures/compat/one-page.pdf"
+        ))
+        .to_vec();
+        let marker = b"/Type /Catalog";
+        let start = bytes
+            .windows(marker.len())
+            .position(|window| window == marker)
+            .expect("one-page fixture has a Catalog type");
+        bytes[start..start + marker.len()].copy_from_slice(b"/Type /Catxxxx");
+
+        let output = Arc::new(Mutex::new(Vec::new()));
+        let logger = logger_with_capture(Arc::clone(&output));
+        let mut job = QPDFJob::new();
+        job.set_logger(logger);
+        let mut pdf = job
+            .open(
+                Cursor::new(bytes),
+                "invalid-catalog.pdf",
+                PdfOpenOptions::default(),
+            )
+            .expect("invalid Catalog type should open before check mode");
+
+        assert_eq!(
+            job.check(&mut pdf)
+                .expect("invalid Catalog type is a warning"),
+            JobExitCode::Warning
+        );
+        assert_eq!(
+            output.lock().expect("capture output").as_slice(),
+            b"checking invalid-catalog.pdf\n\
+              WARNING: invalid-catalog.pdf: catalog /Type entry missing or invalid\n\
+              PDF Version: 1.3\n\
+              File is not encrypted\n\
+              File is not linearized\n\
+              qpdf: operation succeeded with warnings\n"
         );
     }
 
