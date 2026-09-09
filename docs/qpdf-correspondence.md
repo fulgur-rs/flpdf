@@ -1626,6 +1626,29 @@ cutover. Silent real/string observations without a resolving `try_as_*`
 counterpart, writer emission, and qtest exception attribution remain outside
 this bounded row.
 
+### QPDFJob `doInspection` combined top-level consumer `flpdf-giz3` (2026-09-10)
+
+The top-level CLI now routes combined inspection selections through the
+qpdf-shaped `QPDFJob` inspection configuration. `QPDFJob::Config`-equivalent
+inspection setters select the existing report-only owners, and
+`QPDFJob::inspect_configured` runs the existing independent branch column and
+one warning/completion boundary. This follows qpdf's
+`QPDFJob::doInspection` order (`libqpdf/QPDFJob.cc:1646-1693`) and its
+no-output `writeQPDF` branch (`libqpdf/QPDFJob.cc:483-511,528-564`), rather
+than adding a combination-specific CLI shim.
+
+The `--check-linearization` conflicts that qpdf accepts were removed for the
+literal 15 combinations tracked by `flpdf-giz3`; writer-only flags remain
+no-ops when qpdf selects inspection, while create-stage
+`--remove-restrictions` and `--coalesce-contents` use the existing job
+transformation order. Attachment extraction reserves the save pipeline before
+the first info report, matching `QPDFJob.cc:614-626`. The focused differential
+matrix covers all 15 combinations plus representative multi-inspection orders;
+`--with-images` and an explicit `--normalize-content` value are copied into the
+same Job configuration for the `show-pages` and `show-object` consumers
+(`QPDFJob_config.cc:414-417,654-656`; `QPDFJob.cc:816-829`). qtest exceptions
+and unrelated transformation/page-operation routes remain outside this row.
+
 ### `qpdfjob-c` wrapper のエラー境界
 
 qpdf の `wrap_qpdfjob`（`libqpdf/qpdfjob-c.cc:32-40`）は、
