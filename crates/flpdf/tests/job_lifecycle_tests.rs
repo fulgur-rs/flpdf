@@ -259,7 +259,10 @@ fn qpdfjob_error_report_uses_qpdf_invalid_password_wording() {
         std::io::ErrorKind::PermissionDenied,
     )))
     .unwrap();
-    assert_eq!(state.lock().unwrap().bytes, b"qpdf: Permission denied\n");
+    assert_eq!(
+        state.lock().unwrap().bytes,
+        b"qpdf: input.pdf: Permission denied\n"
+    );
 
     for (kind, expected) in [
         (std::io::ErrorKind::AlreadyExists, "File exists"),
@@ -273,7 +276,7 @@ fn qpdfjob_error_report_uses_qpdf_invalid_password_wording() {
             .unwrap();
         assert_eq!(
             state.lock().unwrap().bytes,
-            format!("qpdf: {expected}\n").as_bytes()
+            format!("qpdf: input.pdf: {expected}\n").as_bytes()
         );
     }
 
@@ -1935,13 +1938,19 @@ fn write_qpdf_output_sink_error_does_not_prefix_the_input_name() {
     let error = job
         .write_qpdf(&mut pdf)
         .expect_err("/dev/full must reject the sufficiently large output");
-    assert!(matches!(
-        &error,
-        Error::SystemBytes(message) if message == b"No space left on device"
-    ));
+    // qpdf 11.9.0 prints exactly this for the same input and output:
+    // `qpdf: qpdf output: Pl_StdioFile::write: No space left on device`.
+    assert!(
+        matches!(
+            &error,
+            Error::SystemBytes(message)
+                if message == b"qpdf output: Pl_StdioFile::write: No space left on device"
+        ),
+        "{error:?}"
+    );
     assert_eq!(
         state.lock().unwrap().bytes,
-        b"qpdf: No space left on device\n"
+        b"qpdf: qpdf output: Pl_StdioFile::write: No space left on device\n"
     );
 }
 

@@ -1291,13 +1291,17 @@ underlay/overlay → image → appearance → annotation → coalesce → rotati
 page-label/output 順序を一つの Job owner へ集約した。残る direct CLI callers は
 JSON/page-operation/inspection cohort であり、`.48.8`〜`.48.10` の後続範囲である。
 
-`flpdf-ddk1` では、qpdf の named-output sink が `Pl_StdioFile("qpdf output", ...)`
-（`QPDFWriter.cc:101-110`、`Pl_StdioFile.cc:25-37`）として入力ファイル名とは独立した
-責務を持つことに合わせ、`QPDFJob::write_qpdf` の出力段階で発生した bare
-`Error::Io` だけを portable な `SystemBytes` message へ正規化する。これにより
-`job_error_message_with_input` は bare `Error::Io` を入力 failure として扱わず、
-`/dev/full` 相当の sink failure は入力名を誤って報告しない。open/read/parse failure と
-`BadPassword` の入力名・文言は従来どおり保持する。
+`flpdf-ddk1` では、qpdf の output sink が `Pl_StdioFile("qpdf output", ...)`
+（`QPDFWriter.cc:101-110`。named file でも standard output でも identifier は同じ）
+として入力ファイル名とは独立した責務を持つことに合わせ、`PdfWriter` の file sink 自身が
+失敗時に `qpdf output: Pl_StdioFile::write: <system message>` を組み立てる
+（`Pl_StdioFile.cc:25-37`）。qpdf 非対応の sink（`set_output_writer` 等）は identifier を
+持たず bare `Error::Io` のまま返す。失敗の shape を sink 側で決めるため、`write_qpdf` の
+error path で I/O error を一括変換する必要がなく、writer 内部の lazy input read が返す
+bare `Error::Io` の分類も壊れない。`job_error_message_with_input` の入力名装飾は
+open/read/parse failure と `BadPassword` に対して従来どおり保持する。
+`/dev/full` への実測で qpdf 11.9.0 と CLI 出力が一致することを
+`cli_logger_routing` の differential で検証する。
 
 `QPDFJob::handleTransformations` の `remove_restrictions` 分岐は
 `QPDFAcroFormDocumentHelper::disableDigitalSignatures` を呼ぶだけで、成功時の独自
