@@ -2340,28 +2340,59 @@ fn parse_xref_from_start_with_owner_and_build_diagnostics(
         tail.starts_with(b"xref") && tail.get(4).is_some_and(|byte| is_pdf_space(*byte))
     });
     if is_classic_xref {
-        let mut cursor = ByteCursor::new(bytes, classic_xref_pos + 4);
-        let (entries, trailer_start, mut table_diagnostics, first_xref_item_offset) =
-            parse_xref_table(
-                &mut cursor,
-                bytes,
-                first_xref_item_offset_sink,
+        // qpdf counts `skip` from the keyword it just read but adds it to the
+        // *original* offset: `read_xrefTable(xref_offset + skip)`
+        // (`QPDF.cc:670-676`). Any whitespace it skipped first is therefore
+        // counted twice, and the table read starts that many bytes early --
+        // inside the keyword -- which is why qpdf reports `xref syntax
+        // invalid` and reconstructs instead of reading such a file. Starting
+        // after the keyword would silently accept what qpdf rejects.
+        let mut skip = 4;
+        while bytes
+            .get(classic_xref_pos + skip)
+            .is_some_and(|byte| is_pdf_space(*byte))
+        {
+            skip += 1;
+        }
+        // qpdf warns before it reads the table (`QPDF.cc:663-665`), so the
+        // warning has to survive a table read that then fails -- which the
+        // offset above makes likely for exactly these files.
+        let whitespace_warning = (classic_xref_pos != xref_pos).then(|| {
+            damaged_warning(
                 &options.description,
-            )?;
-        if classic_xref_pos != xref_pos {
-            // QPDF::read_xref skips whitespace before inspecting the xref
-            // marker and records this as a warning with no object/offset
-            // (`QPDF.cc:634-653`). The original xref offset remains the
-            // error location for a non-classic fallback.
-            table_diagnostics.insert(
-                0,
-                damaged_warning(
-                    &options.description,
-                    b"",
-                    "extraneous whitespace seen before xref",
-                    None,
-                ),
-            );
+                b"",
+                "extraneous whitespace seen before xref",
+                None,
+            )
+        });
+        let mut cursor = ByteCursor::new(bytes, xref_pos + skip);
+        let table = parse_xref_table(
+            &mut cursor,
+            bytes,
+            first_xref_item_offset_sink,
+            &options.description,
+        );
+        let (entries, trailer_start, mut table_diagnostics, first_xref_item_offset) = match table {
+            Ok(table) => table,
+            Err(error) => {
+                if let (Some(warning), Some(sink)) = (
+                    whitespace_warning.clone(),
+                    error_diagnostics_sink.as_deref_mut(),
+                ) {
+                    sink.push(warning);
+                }
+                // The canonical owner keeps its diagnostics through
+                // `push_warning`, not through the caller's sink.
+                if let Some(warning) = whitespace_warning {
+                    let mut pending = Diagnostics::default();
+                    pending.push(warning);
+                    deliver_canonical_diagnostics(canonical_trailer_owner, &mut pending)?;
+                }
+                return Err(error);
+            }
+        };
+        if let Some(warning) = whitespace_warning {
+            table_diagnostics.insert(0, warning);
         }
         let mut deferred_free = Vec::new();
         for entry in entries {
@@ -6919,6 +6950,42 @@ mod final_handle_tests {
     }
 
     #[test]
+    fn reconstruction_skips_headers_its_guards_reject() {
+        // `insertReconstructedXrefEntry` drops `obj <= 0` and a generation
+        // outside `0..65535` without a warning (`QPDF.cc:1195-1198`). Measured
+        // with qpdf 11.9.0 on a file of this shape: the scan reports only
+        // 1/0, 2/0 and 3/0.
+        let mut bytes = b"%PDF-1.7\n%\xe2\xe3\xcf\xd3\n".to_vec();
+        bytes.extend_from_slice(b"0 0 obj\n<< /Skipped (obj 0) >>\nendobj\n");
+        bytes.extend_from_slice(b"5 65535 obj\n<< /Skipped (gen 65535) >>\nendobj\n");
+        for (number, body) in [
+            (1u32, "<< /Type /Catalog /Pages 2 0 R >>"),
+            (2, "<< /Type /Pages /Kids [3 0 R] /Count 1 >>"),
+            (3, "<< /Type /Page /Parent 2 0 R /MediaBox [0 0 612 792] >>"),
+        ] {
+            bytes.extend_from_slice(format!("{number} 0 obj\n{body}\nendobj\n").as_bytes());
+        }
+        // A startxref past the end forces the line-scan reconstruction.
+        bytes.extend_from_slice(b"trailer\n<< /Size 6 /Root 1 0 R >>\nstartxref\n999999\n%%EOF\n");
+
+        let state = load_xref_state_with_options(
+            &mut std::io::Cursor::new(bytes),
+            XrefLoadOptions {
+                allow_repair: true,
+                ..XrefLoadOptions::default()
+            },
+        )
+        .expect("reconstruction recovers the well-formed objects");
+        let recovered: Vec<_> = state
+            .loaded
+            .entries
+            .keys()
+            .map(|object_ref| (object_ref.number, object_ref.generation))
+            .collect();
+        assert_eq!(recovered, vec![(1, 0), (2, 0), (3, 0)], "{recovered:?}");
+    }
+
+    #[test]
     fn a_trailer_keyword_ends_at_any_delimiter() {
         // `readToken(m->file).isWord("trailer")` (`QPDF.cc:889`) ends the
         // keyword at any delimiter (`QPDFTokenizer.cc:16-23`), so `trailer<<`
@@ -7038,6 +7105,12 @@ mod final_handle_tests {
         assert!(invalid);
         assert!(parse_xref_entry_line(b"0000000000 00000 x\n").is_none());
 
+        // Two spaces before the keyword: qpdf adds its `skip` to the offset it
+        // started from, so the table read begins inside `xref` and fails
+        // (`QPDF.cc:670-676`). Measured with qpdf 11.9.0 on a file of this
+        // shape: `extraneous whitespace seen before xref`, then `file is
+        // damaged`, `xref syntax invalid`, and reconstruction -- not a trailer
+        // diagnostic.
         let mut bytes = b"%PDF-1.4\n".to_vec();
         let xref = bytes.len();
         bytes.extend_from_slice(b"  xref\n0 1\n 0000000000  65535  f \ntrailer\n42\n");
@@ -7063,7 +7136,7 @@ mod final_handle_tests {
         assert!(matches!(
             error,
             Error::QpdfExc(exception)
-                if exception.get_message_detail() == b"expected trailer dictionary"
+                if exception.get_message_detail() == b"xref syntax invalid"
         ));
         let messages: Vec<_> = diagnostics
             .entries()
@@ -7071,7 +7144,39 @@ mod final_handle_tests {
             .map(|diagnostic| diagnostic.get_message_detail())
             .collect();
         assert!(messages.contains(&b"extraneous whitespace seen before xref".as_slice()));
-        assert!(messages.contains(&b"accepting invalid xref table entry".as_slice()));
+        // The lenient row is never reached here -- qpdf does not report it for
+        // this file either. Its own coverage is the direct
+        // `parse_xref_entry_line` assertion above and the whitespace-free
+        // table below.
+        assert!(!messages.contains(&b"accepting invalid xref table entry".as_slice()));
+
+        let mut lenient = b"%PDF-1.4\n1 0 obj\n<< /Type /Catalog >>\nendobj\n".to_vec();
+        let lenient_xref = lenient.len();
+        lenient.extend_from_slice(
+            b"xref\n0 2\n 0000000000  65535  f \n0000000009 00000 n \ntrailer\n<< /Size 2 /Root 1 0 R >>\n",
+        );
+        let state = load_xref_state_with_options(
+            &mut std::io::Cursor::new({
+                let mut bytes = lenient.clone();
+                bytes.extend_from_slice(format!("startxref\n{lenient_xref}\n%%EOF\n").as_bytes());
+                bytes
+            }),
+            XrefLoadOptions::default(),
+        )
+        .expect("qpdf accepts the lenient row and keeps reading");
+        let lenient_messages: Vec<_> = state
+            .loaded
+            .repair_diagnostics
+            .entries()
+            .iter()
+            .map(|diagnostic| diagnostic.get_message_detail().to_vec())
+            .collect();
+        assert!(
+            lenient_messages
+                .iter()
+                .any(|message| message == b"accepting invalid xref table entry"),
+            "{lenient_messages:?}"
+        );
 
         let resolver = canonical_test_resolver(bytes.clone(), BTreeMap::new(), false, 11);
         let mut registration = XrefRegistration::default();
@@ -7091,11 +7196,11 @@ mod final_handle_tests {
             false,
             Some(resolver.as_ref()),
         )
-        .expect_err("the canonical owner must retain the same trailer diagnostics");
+        .expect_err("the canonical owner must retain the same diagnostics");
         assert!(matches!(
             error,
             Error::QpdfExc(exception)
-                if exception.get_message_detail() == b"expected trailer dictionary"
+                if exception.get_message_detail() == b"xref syntax invalid"
         ));
         assert!(resolver
             .repair_diagnostics()
