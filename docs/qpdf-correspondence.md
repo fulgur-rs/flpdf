@@ -1066,6 +1066,13 @@ option（`--stream-data`、`--object-streams`、`--decode-level`、resource poli
 後勝ちにし、`--pages`/`--add-attachment`/`--copy-attachments-from` の segment accumulation
 は既存の `ArgParser` 境界に残す。qpdf の `Config::pages()` 自体が再指定を usage error にする
 （`QPDFJob_config.cc:945-950`）ため、全 option を無条件に override する実装にはしない。
+
+入力・出力 selector も例外で、`Config::emptyInput` / `Config::replaceInput`
+（`QPDFJob_config.cc:27-39,54-62`）は 2 回目の指定を usage error にする。qpdf では
+どの occurrence も自分の `ArgParser::argEmpty` / `argReplaceInput` callback を通って
+setter に届く（`QPDFJob_argv.cc:91-96`）ため、この判定は argv 層に置く必要がある
+（clap の self-override は job に届く前に重複を畳んでしまう）。`arg_parser.rs` の
+top-level token loop で 2 回目を検出し、qpdf と同じ文言・同じ exit code で返す。
 | `QPDFLogger.cc` | 255 | `logger.rs`（private stdout tracker、shared info/warn/error/save routes、standard stdout/stderr/discard、reset/following、save collision、custom sink ownership）+ `reader/resolver.rs` / `reader.rs`（文書 warning の append-then-route、suppression、live logger replacement）+ `flpdf-cli/src/main.rs`（下記 qpdf-equivalent consumers） | ✅ `QPDFLogger.cc:9-40,43-51,80-254`。`diagnostics.rs` は logger ではなく collection-only value store として維持する |
 
 `QPDFArgParser` の help-table 境界は、`flpdf-cli/src/arg_parser.rs` の raw/canonical 二重 argv と

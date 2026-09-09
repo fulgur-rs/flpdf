@@ -105,3 +105,49 @@ fn repeated_value_options_follow_qpdf_last_setting_order() {
         );
     }
 }
+
+/// qpdf's input and output selectors are the exception to last-setting order:
+/// each occurrence reaches its own setter, and the setter rejects the second
+/// one because the first already chose the input or output
+/// (`QPDFJob_config.cc:27-39,54-62`).
+#[test]
+fn repeated_input_and_output_selectors_stay_usage_errors() {
+    if !qpdf_available() {
+        if std::env::var_os("CI").is_some() {
+            panic!("qpdf 11.9.0 is required for this parity test on CI");
+        }
+        eprintln!("skipping: qpdf 11.9.0 is not available");
+        return;
+    }
+
+    let temp = tempfile::tempdir().expect("temporary directory");
+    let output = temp.path().join("out.pdf");
+    let cases: [Vec<OsString>; 2] = [
+        vec![
+            OsString::from("--static-id"),
+            OsString::from("--empty"),
+            OsString::from("--empty"),
+            output.as_os_str().to_owned(),
+        ],
+        vec![
+            OsString::from("--static-id"),
+            fixture().into_os_string(),
+            OsString::from("--replace-input"),
+            OsString::from("--replace-input"),
+        ],
+    ];
+
+    for args in cases {
+        let qpdf = run_qpdf(&args);
+        let flpdf = run_flpdf(&args);
+        assert_eq!(
+            qpdf.status.code(),
+            Some(2),
+            "qpdf should reject {args:?}: {}",
+            String::from_utf8_lossy(&qpdf.stderr)
+        );
+        assert_eq!(flpdf.status.code(), qpdf.status.code(), "{args:?}: status");
+        assert_eq!(flpdf.stderr, qpdf.stderr, "{args:?}: stderr");
+        assert!(!output.exists(), "{args:?}: a rejected job must not write");
+    }
+}

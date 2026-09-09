@@ -318,6 +318,15 @@ impl ArgParser {
         let mut named_segments = Vec::new();
         let mut first_add_attachment = true;
         let mut first_unknown_option = None;
+        // qpdf's input and output selectors reject a second occurrence: the
+        // first one already chose the input or output
+        // (`QPDFJob_config.cc:27-39,54-62`). Every occurrence reaches the
+        // setter through its own `ArgParser::argEmpty` / `argReplaceInput`
+        // callback (`QPDFJob_argv.cc:91-96`), so the repeat has to be caught
+        // in this argv layer -- clap's self-override collapses it before the
+        // job sees either one.
+        let mut selected_empty_input = false;
+        let mut selected_replace_input = false;
 
         while let Some(arg) = iter.next() {
             if arg.as_bytes() == b"--" {
@@ -352,6 +361,27 @@ impl ArgParser {
                 residual_args.push(canonical);
                 continue;
             };
+            match option.as_str() {
+                "empty" => {
+                    if selected_empty_input {
+                        return Err(flpdf::UsageError::new(
+                            "empty input can't be used since input file has already been given",
+                        )
+                        .into());
+                    }
+                    selected_empty_input = true;
+                }
+                "replace-input" => {
+                    if selected_replace_input {
+                        return Err(flpdf::UsageError::new(
+                            "replace-input can't be used since output file has already been given",
+                        )
+                        .into());
+                    }
+                    selected_replace_input = true;
+                }
+                _ => {}
+            }
             if let Some(parameter_name) = required_parameter_name(&option) {
                 if !has_attached_parameter(canonical.as_bytes()) {
                     // qpdf raises this through `QPDFArgParser::usage`
