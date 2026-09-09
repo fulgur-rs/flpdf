@@ -322,6 +322,19 @@ impl ArgParser {
         let mut named_segments = Vec::new();
         let mut first_add_attachment = true;
         let mut first_unknown_option = None;
+        // qpdf's input and output selectors reject a second occurrence: the
+        // first one already chose the input or output
+        // (`QPDFJob_config.cc:27-39,54-62`). Every occurrence reaches the
+        // setter through its own `ArgParser::argEmpty` / `argReplaceInput`
+        // callback (`QPDFJob_argv.cc:91-96`), so the repeat has to be caught
+        // in this argv layer -- clap's self-override collapses it before the
+        // job sees either one.
+        let mut selected_empty_input = false;
+        let mut selected_replace_input = false;
+        // qpdf fails at the first offending token in argv order. Hold this
+        // error so an unknown option earlier in argv still wins, and hand it
+        // to any later in-loop failure that would otherwise leapfrog it.
+        let mut repeated_selector: Option<(usize, &'static str)> = None;
 
         while let Some(arg) = iter.next() {
             if arg.as_bytes() == b"--" {
@@ -356,6 +369,27 @@ impl ArgParser {
                 residual_args.push(canonical);
                 continue;
             };
+            match option.as_str() {
+                "empty" => {
+                    if selected_empty_input && repeated_selector.is_none() {
+                        repeated_selector = Some((
+                            residual_args.len(),
+                            "empty input can't be used since input file has already been given",
+                        ));
+                    }
+                    selected_empty_input = true;
+                }
+                "replace-input" => {
+                    if selected_replace_input && repeated_selector.is_none() {
+                        repeated_selector = Some((
+                            residual_args.len(),
+                            "replace-input can't be used since output file has already been given",
+                        ));
+                    }
+                    selected_replace_input = true;
+                }
+                _ => {}
+            }
             if let Some(parameter_name) = required_parameter_name(&option) {
                 if !has_attached_parameter(canonical.as_bytes()) {
                     // qpdf raises this through `QPDFArgParser::usage`
@@ -363,14 +397,17 @@ impl ArgParser {
                     // blank-line + `For help:` usage block, not a bare
                     // `<prog>: <msg>` line. Route it through the shared
                     // `UsageError` boundary that `usage_exit` formats.
-                    return Err(flpdf::UsageError::new(format!(
-                        "--{option} must be given as --{option}={parameter_name}"
+                    return Err(flpdf::UsageError::new(repeated_selector.map_or_else(
+                        || format!("--{option} must be given as --{option}={parameter_name}"),
+                        |(_, message)| message.to_owned(),
                     ))
                     .into());
                 }
                 if let Some(message) =
                     invalid_required_choice_message(&option, canonical.as_bytes(), parameter_name)
                 {
+                    let message =
+                        repeated_selector.map_or(message, |(_, deferred)| deferred.to_owned());
                     return Err(flpdf::UsageError::new(message).into());
                 }
             }
@@ -447,6 +484,16 @@ impl ArgParser {
                     .collect(),
             })
             .collect();
+        if let Some((index, message)) = repeated_selector {
+            // An unknown option earlier in argv is qpdf's first failure, and
+            // the usage boundary reports it with the original spelling.
+            let unknown_first = first_unknown_option
+                .as_ref()
+                .is_some_and(|(unknown_index, _)| *unknown_index < index);
+            if !unknown_first {
+                return Err(flpdf::UsageError::new(message).into());
+            }
+        }
         Ok(ParsedArgs {
             residual_args,
             raw_residual_args,

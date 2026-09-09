@@ -990,6 +990,7 @@ struct Cli {
         long = "json-stream-data",
         value_name = "MODE",
         require_equals = true,
+        overrides_with = "json_stream_data",
         help = "When used with --json, this option controls whether streams \
                 in json output should be omitted, written inline \
                 (base64-encoded), or written to a file. If \"file\" is \
@@ -1118,7 +1119,11 @@ struct Cli {
     /// `qpdf --compress-streams=y|n` compatibility flag.  Accepted but
     /// currently a no-op: flpdf does not re-encode stream contents on
     /// rewrite.  Provided so qtest commands parse cleanly.
-    #[arg(long = "compress-streams", require_equals = true)]
+    #[arg(
+        long = "compress-streams",
+        require_equals = true,
+        overrides_with = "compress_streams"
+    )]
     compress_streams: Option<String>,
     /// Re-encode streams that are already a lone `/FlateDecode` (qpdf
     /// `--recompress-flate`).
@@ -1135,7 +1140,12 @@ struct Cli {
     /// Control which qpdf stream filters are decoded during rewrite.
     /// Values are ordered from least to most decoding: none, generalized,
     /// specialized, and all.
-    #[arg(long = "decode-level", value_enum, require_equals = true)]
+    #[arg(
+        long = "decode-level",
+        value_enum,
+        require_equals = true,
+        overrides_with = "decode_level"
+    )]
     decode_level: Option<CliDecodeLevel>,
     /// Control what qpdf does regarding object streams. `preserve` preserves
     /// original object streams (the default), `disable` creates output with no
@@ -1145,21 +1155,28 @@ struct Cli {
         long = "object-streams",
         value_enum,
         require_equals = true,
-        default_value_t = CliObjectStreamMode::Preserve
+        default_value_t = CliObjectStreamMode::Preserve,
+        overrides_with = "object_streams"
     )]
     object_streams: CliObjectStreamMode,
     /// Control how streams are compressed in the output. `compress` is the
     /// same as `--compress-streams=y --decode-level=generalized`, `preserve`
     /// is the same as `--compress-streams=n --decode-level=none`, and
     /// `uncompress` is the same as `--compress-streams=n --decode-level=generalized`.
-    #[arg(long = "stream-data", value_enum, require_equals = true)]
+    #[arg(
+        long = "stream-data",
+        value_enum,
+        require_equals = true,
+        overrides_with = "stream_data"
+    )]
     stream_data: Option<CliStreamDataMode>,
     /// Insert a newline before each `endstream` keyword (qpdf
     /// `--newline-before-endstream`). The `y` and `n` spellings both select
     /// qpdf's enabled boolean setting; `never` retains the default framing.
     #[arg(long = "newline-before-endstream", value_enum, num_args = 0..=1,
           require_equals = true, default_missing_value = "y",
-          default_value_t = CliNewlineBeforeEndstream::Never)]
+          default_value_t = CliNewlineBeforeEndstream::Never,
+          overrides_with = "newline_before_endstream")]
     newline_before_endstream: CliNewlineBeforeEndstream,
     /// `qpdf --linearize-pass1=PATH` compatibility flag. Writes the
     /// linearization writer's distinct pass-1 intermediate file.
@@ -1201,7 +1218,8 @@ struct Cli {
         value_enum,
         require_equals = true,
         default_value_t = CliRemoveUnreferencedResources::Auto,
-        help = "Remove unreferenced page resources (qpdf default: auto)"
+        help = "Remove unreferenced page resources (qpdf default: auto)",
+        overrides_with = "remove_unreferenced_resources"
     )]
     remove_unreferenced_resources: CliRemoveUnreferencedResources,
 
@@ -1214,7 +1232,8 @@ struct Cli {
         long = "normalize-content",
         value_enum,
         require_equals = true,
-        help = "Normalize page content streams (qpdf default: n; --qdf default: y)"
+        help = "Normalize page content streams (qpdf default: n; --qdf default: y)",
+        overrides_with = "normalize_content"
     )]
     normalize_content: Option<CliYesNo>,
 
@@ -1252,6 +1271,7 @@ struct Cli {
         value_enum,
         value_name = "MODE",
         require_equals = true,
+        overrides_with = "flatten_annotations",
         conflicts_with_all = [
             "check", "show_object",
             "show_npages", "show_pages", "show_xref", "show_linearization",
@@ -1261,7 +1281,8 @@ struct Cli {
             "pages", "rotate", "split_pages", "empty",
             "json_output",
         ],
-        help = "Flatten annotations into page content; MODE is all, screen, or print"
+        help = "Flatten annotations into page content; MODE is all, screen, or print",
+        overrides_with = "flatten_annotations"
     )]
     flatten_annotations: Option<CliFlattenMode>,
 
@@ -1562,7 +1583,12 @@ struct PageOpArgs {
     /// Manage whether qpdf keeps secondary `--pages` input files open
     /// (`--keep-files-open=y|n`). When omitted, qpdf selects the value from
     /// the distinct page-spec source count and [`Self::keep_files_open_threshold`].
-    #[arg(long = "keep-files-open", value_enum, require_equals = true)]
+    #[arg(
+        long = "keep-files-open",
+        value_enum,
+        require_equals = true,
+        overrides_with = "keep_files_open"
+    )]
     keep_files_open: Option<CliYesNo>,
 
     /// Distinct page-spec source count at which qpdf automatically switches
@@ -2018,7 +2044,7 @@ struct RewriteCommand {
     ///   containers.
     ///
     /// Applies to the canonical qpdf writer output.
-    #[arg(long = "object-streams", value_enum, require_equals = true, default_value_t = CliObjectStreamMode::Preserve)]
+    #[arg(long = "object-streams", value_enum, require_equals = true, default_value_t = CliObjectStreamMode::Preserve, overrides_with = "object_streams")]
     object_streams: CliObjectStreamMode,
 
     /// Apply FlateDecode compression to output streams (qpdf --compress-streams=y|n).
@@ -2032,12 +2058,18 @@ struct RewriteCommand {
         long = "compress-streams",
         value_enum,
         require_equals = true,
-        help = "Compress output streams with FlateDecode (qpdf default: y)"
+        help = "Compress output streams with FlateDecode (qpdf default: y)",
+        overrides_with = "compress_streams"
     )]
     compress_streams: Option<CliYesNo>,
 
     /// Control which qpdf stream filters are decoded during rewrite.
-    #[arg(long = "decode-level", value_enum, require_equals = true)]
+    #[arg(
+        long = "decode-level",
+        value_enum,
+        require_equals = true,
+        overrides_with = "decode_level"
+    )]
     decode_level: Option<CliDecodeLevel>,
 
     /// Normalize PDF content streams (qpdf --normalize-content=y|n).
@@ -2052,7 +2084,8 @@ struct RewriteCommand {
         long = "normalize-content",
         value_enum,
         require_equals = true,
-        help = "Normalize page content streams (qpdf default: n)"
+        help = "Normalize page content streams (qpdf default: n)",
+        overrides_with = "normalize_content"
     )]
     normalize_content: Option<CliYesNo>,
 
@@ -2081,7 +2114,8 @@ struct RewriteCommand {
     /// Requires a full rewrite when set to `yes` or `auto`.
     #[arg(long = "remove-unreferenced-resources", value_enum, require_equals = true,
           default_value_t = CliRemoveUnreferencedResources::Auto,
-          help = "Remove unreferenced /Resources entries (qpdf default: auto)")]
+          help = "Remove unreferenced /Resources entries (qpdf default: auto)",
+          overrides_with = "remove_unreferenced_resources")]
     remove_unreferenced_resources: CliRemoveUnreferencedResources,
 
     /// Insert a newline before each `endstream` keyword
@@ -2100,7 +2134,8 @@ struct RewriteCommand {
     #[arg(long = "newline-before-endstream", value_enum, num_args = 0..=1,
           require_equals = true, default_missing_value = "y",
           default_value_t = CliNewlineBeforeEndstream::Never,
-          help = "Insert newline before endstream keyword (qpdf default: never)")]
+          help = "Insert newline before endstream keyword (qpdf default: never)",
+          overrides_with = "newline_before_endstream")]
     newline_before_endstream: CliNewlineBeforeEndstream,
 
     /// Stream data mode (qpdf --stream-data={preserve,uncompress,compress}).
@@ -2114,7 +2149,12 @@ struct RewriteCommand {
     /// Default: not set (falls back to --compress-streams).
     /// When both are supplied explicitly, --compress-streams wins.
     /// Only affects the full-rewrite path.
-    #[arg(long = "stream-data", value_enum, require_equals = true)]
+    #[arg(
+        long = "stream-data",
+        value_enum,
+        require_equals = true,
+        overrides_with = "stream_data"
+    )]
     stream_data: Option<CliStreamDataMode>,
 
     /// Re-encode streams that are already a lone /FlateDecode (default: preserve
@@ -2146,7 +2186,8 @@ struct RewriteCommand {
         value_enum,
         value_name = "MODE",
         require_equals = true,
-        help = "Flatten annotations into page content; MODE is all, screen, or print"
+        help = "Flatten annotations into page content; MODE is all, screen, or print",
+        overrides_with = "flatten_annotations"
     )]
     flatten_annotations: Option<CliFlattenMode>,
 
@@ -2470,7 +2511,7 @@ struct PasswordArgs {
     /// How qpdf-style password modes interpret --password bytes. On read
     /// paths, only `hex-bytes` transforms the bytes; `auto`, `bytes`, and
     /// `unicode` pass them through unchanged. Mirrors qpdf's flag.
-    #[arg(long = "password-mode", value_enum, require_equals = true, default_value_t = CliPasswordMode::Auto)]
+    #[arg(long = "password-mode", value_enum, require_equals = true, default_value_t = CliPasswordMode::Auto, overrides_with = "password_mode")]
     password_mode: CliPasswordMode,
     /// Permit creating deprecated RC4-backed handlers and revision 5
     /// encryption. Reading existing weakly encrypted PDFs does not require it.

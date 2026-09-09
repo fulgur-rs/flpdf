@@ -1067,6 +1067,37 @@ cargo test -p flpdf-cli --test cli_json --quiet
 | `QPDFJob.cc` `createQPDF` / `doInspection` + `QPDFJob_config.cc` `jsonInput` / `updateFromJson` / `jobJsonFile` | `459-516,1646-1714; 305-309,328-332,774-784` | `job/lifecycle.rs` のJSON create/update/open/inspect/partial-init（`flpdf-25kg.5.2.1/.2`）+ `flpdf-cli/src/main.rs` の `run_json_input_inspection`、`job/check.rs::QPDFJob::check` + retained `open_job_pdf` for other routes | 🔀 `--json-input` / `--update-from-json` のJSON outputとread-only `--show-npages`/`--show-pages`はQPDFJobの一つのdocument/logger lifecycleへ移行済み。`--job-json-file` は qpdf の partial initialize 境界を `initialize_from_json_partial` で保持し、missing-output の最終診断を run/checkConfiguration 側へ委譲する。`--check`は専用のqpdf-shaped report rendererを保ち、generic summaryの二重出力を避ける。通常rewrite・rotate・page-tree選択・その他inspectionは後続Job sliceで同じ状態へ接続する。JSON主入力の `--pages` は一時PDFを経由せず、同じ文書のObjectHandle/xrefを `QPDFJob::handle_page_specs` で計画化する。qpdf 11.9.0のupdate-before-inspection順序を `cli_json_input.rs` で固定する。 |
 | `QPDFJob::Config::showEncryption` / `QPDFJob::showEncryption` | `QPDFJob_config.cc:551-555`; `QPDFJob.cc:442-445,700-742,1646-1658` | `job/lifecycle.rs::open_for_encryption_inspection` + `flpdf-cli/src/main.rs::run_show_encryption` + `job/check.rs::QPDFJob::show_encryption`（top-level `--show-encryption` と native subcommandが共有） + `encryption/state.rs::EncryptionInspectionState` | 🔀 qpdfの認証前parsed encryption stateを保持し、wrong-passwordでもR/P/password/match/permission/method reportを完了する。暗号化されたdocumentのdecryption state (`EncryptionState`) は認証成功時だけ有効にし、qpdfの `User password` recovery は V<5 の owner-password pathだけで行う。 |
 | `QPDFJob_config` / `_argv` / `_json` / `QPDFArgParser` | 3164 | `flpdf-cli/src/arg_parser.rs` + clap | ⚪。QPDFJobの使用エラー分類は [`UsageError`](../crates/flpdf/src/error.rs) + `Error::Usage` として job lifecycle から CLI の `usage_exit` へ伝播し、`QPDFUsage` の別catch経路（`qpdf/qpdf.cc:10-23,34-39`）を再現する。CLI の入口は `std::env::args_os()` とし、qpdf argv grammar の residual/segment tokens、`--pages`/`--overlay`/attachment の path、`QPDFJob` の input description を `OsString`/raw bytes のまま保持する。UTF-8 が必要な selector・range・日付などだけを各 option parser の境界で検証し、非UTF-8 argv を `std::env::args()` の unwrap で失わない。`flpdf-v1xw` では argv token を raw bytes と `OsString` 投影の二重キャリア `RawArg` で運び、clap の parse 後に `raw_option_value` / `apply_raw_overrides` が byte-oriented な値（password 系）を raw 側で上書きする。qpdf は argv を 1 度しか走査しない（`QPDFArgParser.cc:433-494`）ので、この 2 度目の走査は clap を介在させるための (B) の入れ物の差であり、受理するコマンドラインと出力は qpdf と同じ。 |
+
+`flpdf-749p` では、qpdf の `addChoices` value callbacks（`auto_job_init.hh:100-104`）と
+`QPDFJob_config.cc:701-747,751-763` の setter が argv 順に状態を上書きする契約を、clap の
+self-override へ接続した。適用先は **値がその occurrence の時点で検証済みになる
+option に限る** — clap の `value_enum` か、`arg_parser.rs` の
+`QPDF_REQUIRED_PARAMETER_OPTIONS` に `{...}` の choice として登録され
+`invalid_required_choice_message` が occurrence ごとに検証するもの（`--stream-data`、
+`--object-streams`、`--decode-level`、`--compress-streams`、`--normalize-content`、
+`--newline-before-endstream`、`--flatten-annotations`、`--keep-files-open`、
+`--password-mode`、`--password-file`、`--json-stream-data`、resource policy）。
+`--json-key` は qpdf 自身が repeatable と明記しているため対象外。
+`--pages`/`--add-attachment`/`--copy-attachments-from` の segment accumulation は
+既存の `ArgParser` 境界に残す。
+
+command 全体へ `args_override_self` を掛けない理由は 2 つある。第一に、値の検証を
+clap の後で行う option では、上書きされた occurrence の検証が丸ごと飛ぶ。qpdf は
+`Config::compressionLevel` を argv occurrence ごとに呼び、`QUtil::string_to_int`
+（`QPDFJob_config.cc:135-139`）が最初の値の overflow を先に弾く。第二に、
+`--job-json-file` のように qpdf が occurrence ごとに partial initialize を走らせる
+option は、後勝ちにすると設定そのものが失われる。choice 値の option は clap が
+parse 時点で検証を終えているため、この 2 つの問題がない。
+
+入力・出力 selector も例外で、`Config::emptyInput` / `Config::replaceInput`
+（`QPDFJob_config.cc:27-39,54-62`）は 2 回目の指定を usage error にする。qpdf では
+どの occurrence も自分の `ArgParser::argEmpty` / `argReplaceInput` callback を通って
+setter に届く（`QPDFJob_argv.cc:91-96`）ため、この判定は argv 層に置く必要がある
+（clap の self-override は job に届く前に重複を畳んでしまう）。`arg_parser.rs` の
+top-level token loop で 2 回目を検出し、qpdf と同じ文言・同じ exit code で返す。
+qpdf は argv 順で最初に問題のあるトークンで失敗するため、この診断は即座に返さず
+保留し、より前の unknown option があればそちらを優先し、より後ろの prescan 失敗
+（missing parameter・invalid choice）にはこちらを渡す。
 | `QPDFLogger.cc` | 255 | `logger.rs`（private stdout tracker、shared info/warn/error/save routes、standard stdout/stderr/discard、reset/following、save collision、custom sink ownership）+ `reader/resolver.rs` / `reader.rs`（文書 warning の append-then-route、suppression、live logger replacement）+ `flpdf-cli/src/main.rs`（下記 qpdf-equivalent consumers） | ✅ `QPDFLogger.cc:9-40,43-51,80-254`。`diagnostics.rs` は logger ではなく collection-only value store として維持する |
 
 `QPDFArgParser` の help-table 境界は、`flpdf-cli/src/arg_parser.rs` の raw/canonical 二重 argv と
