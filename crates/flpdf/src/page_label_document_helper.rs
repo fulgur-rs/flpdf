@@ -8,6 +8,7 @@
 
 use crate::nntree::DEFAULT_MAX_TREE_DEPTH;
 use crate::{Error, ObjectHandle, Pdf, Result};
+use std::collections::BTreeSet;
 use std::io::{Read, Seek};
 
 /// Page-label numbering style (ISO 32000-1 §12.4.2 `/S`).
@@ -275,6 +276,10 @@ pub(crate) fn merge_adjacent_raw_page_labels(
 
 /// Copy raw label dictionaries into the destination document through its
 /// qpdf-shaped persistent foreign-object map.
+///
+/// Provenance registration is deliberately *not* done here — see
+/// [`record_primary_label_provenance`], which the page-selection callers run
+/// once after this loop.
 pub(crate) fn copy_raw_page_label_entries<R: Read + Seek>(
     target: &mut Pdf<R>,
     ranges: &[RawPageLabelEntry],
@@ -283,9 +288,7 @@ pub(crate) fn copy_raw_page_label_entries<R: Read + Seek>(
         .iter()
         .map(|range| {
             let label = if range.source_is_primary {
-                let copied = target.copy_foreign_value(range.source_id, &range.label)?;
-                target.record_primary_writer_object_refs(range.source_id);
-                copied
+                target.copy_foreign_value(range.source_id, &range.label)?
             } else {
                 // qpdf builds a new direct label dictionary: direct scalar
                 // values are independent, while indirect /S or /P handles
@@ -295,6 +298,31 @@ pub(crate) fn copy_raw_page_label_entries<R: Read + Seek>(
             Ok((range.index, label))
         })
         .collect()
+}
+
+/// Register the primary source's foreign-object map for QDF provenance, once
+/// per distinct primary source.
+///
+/// qpdf's `--pages .` form keeps the primary `QPDF` itself as the destination
+/// (`libqpdf/QPDFJob.cc:2511-2593`), so `QPDFWriter` emits the source ObjGen
+/// in `%% Original object ID` (`libqpdf/QPDFWriter.cc:1786`). Only callers on
+/// that primary-owner path may register it; a caller that models
+/// `emptyPDF()` plus foreign `addPage` must not, because there qpdf writes the
+/// destination ObjGen instead.
+///
+/// Runs after the whole copy loop rather than inside it: each call walks the
+/// entire persistent foreign-object map, so per-range registration would be
+/// quadratic in `label_count x copied_object_count`.
+pub(crate) fn record_primary_label_provenance<R: Read + Seek>(
+    target: &mut Pdf<R>,
+    ranges: &[RawPageLabelEntry],
+) {
+    let mut recorded = BTreeSet::new();
+    for range in ranges.iter().filter(|range| range.source_is_primary) {
+        if recorded.insert(range.source_id) {
+            target.record_primary_writer_object_refs(range.source_id);
+        }
+    }
 }
 
 // qpdf-deviation-start: page-label rendering (this const and the two

@@ -20,7 +20,7 @@ use crate::form_field_object_helper::FormFieldObjectHelper;
 use crate::page_label_document_helper::LabelRange;
 use crate::page_label_document_helper::{
     copy_raw_page_label_entries, merge_adjacent_raw_labels, merge_adjacent_raw_page_labels,
-    RawPageLabelEntry,
+    record_primary_label_provenance, RawPageLabelEntry,
 };
 use crate::pages::tree_rebuild::RebuildResult;
 use crate::{
@@ -890,6 +890,7 @@ fn handle_page_specs_into<R: Read + Seek + 'static, T: Read + Seek + 'static>(
     if any_page_labels {
         let folded = merge_adjacent_raw_page_labels(label_entries)?;
         let copied = copy_raw_page_label_entries(&mut merged, &folded)?;
+        record_primary_label_provenance(&mut merged, &folded);
         merged
             .page_labels()
             .write_reconstructed_labels_raw(&copied)?;

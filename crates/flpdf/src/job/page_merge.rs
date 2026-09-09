@@ -40,7 +40,8 @@ use super::resource_pruning::{should_remove_unreferenced_resources, RemoveUnrefe
 use crate::object_copy::copy_foreign_object_for_preserve;
 use crate::page_extract::{append_selection_kids, null_copied_removed_pages, target_pages_root};
 use crate::page_label_document_helper::{
-    copy_raw_page_label_entries, merge_adjacent_raw_page_labels, RawPageLabelEntry,
+    copy_raw_page_label_entries, merge_adjacent_raw_page_labels, record_primary_label_provenance,
+    RawPageLabelEntry,
 };
 use crate::pages::page_refs;
 use crate::pdf::WriterObjectOrderKey;
@@ -1439,6 +1440,7 @@ pub(crate) fn merge_documents_with_resource_decisions_and_preserve_primary_into<
     if any_page_labels {
         let folded = merge_adjacent_raw_page_labels(label_entries)?;
         let copied = copy_raw_page_label_entries(&mut target, &folded)?;
+        record_primary_label_provenance(&mut target, &folded);
         target
             .page_labels()
             .write_reconstructed_labels_raw(&copied)?;
