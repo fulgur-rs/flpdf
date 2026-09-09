@@ -11,6 +11,12 @@ fn minimal_pdf() -> std::path::PathBuf {
         .join("tests/fixtures/minimal.pdf")
 }
 
+fn repairable_input_fixture() -> std::path::PathBuf {
+    std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+        .join("../..")
+        .join("tests/fixtures/test_driver/repairable_input.pdf")
+}
+
 fn stream_pdf_without_trailing_payload_newline() -> Vec<u8> {
     let mut pdf = b"%PDF-1.3\n".to_vec();
     let mut offsets = vec![0usize];
@@ -620,6 +626,50 @@ fn qpdf_ctest_1_reports_plaintext_metadata_and_ignores_outfile() {
         !output.exists(),
         "test01 must not write its outfile argument"
     );
+}
+
+#[test]
+fn qpdf_ctest_1_reports_retained_repair_errors_after_metadata() {
+    let directory = tempfile::tempdir().expect("temporary directory");
+    let output = directory.path().join("unused-output.pdf");
+    let input = repairable_input_fixture();
+    let input_name = input.to_str().expect("input path is UTF-8");
+
+    let result = Command::cargo_bin("qpdf-ctest")
+        .expect("qpdf-ctest binary")
+        .args(["1", input_name, "", output.to_str().unwrap()])
+        .output()
+        .expect("qpdf-ctest should spawn");
+
+    assert!(result.status.success());
+    assert!(String::from_utf8_lossy(&result.stdout).contains("warning: "));
+    assert!(String::from_utf8_lossy(&result.stdout).contains("code: 5"));
+    assert!(String::from_utf8_lossy(&result.stdout).contains("text: can't find startxref"));
+    assert!(String::from_utf8_lossy(&result.stdout).ends_with("C test 1 done\n"));
+    assert!(String::from_utf8_lossy(&result.stderr).contains("WARNING:"));
+}
+
+#[test]
+fn qpdf_ctest_2_reports_open_warnings_and_error_as_successful_c_api_output() {
+    let directory = tempfile::tempdir().expect("temporary directory");
+    let input = directory.path().join("bad1.pdf");
+    let output = directory.path().join("unused-output.pdf");
+    fs::write(&input, b"oops\n").expect("write malformed input");
+    let input_name = input.to_str().expect("input path is UTF-8");
+
+    let result = Command::cargo_bin("qpdf-ctest")
+        .expect("qpdf-ctest binary")
+        .args(["2", input_name, "", output.to_str().unwrap()])
+        .output()
+        .expect("qpdf-ctest should spawn");
+
+    assert!(result.status.success());
+    let stdout = String::from_utf8_lossy(&result.stdout);
+    assert!(stdout.contains("warning: "));
+    assert!(stdout.contains("error: "));
+    assert!(stdout.contains("code: 5"));
+    assert!(stdout.ends_with("C test 2 done\n"));
+    assert!(result.stderr.is_empty());
 }
 
 #[test]
