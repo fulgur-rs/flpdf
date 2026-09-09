@@ -80,7 +80,13 @@ pub(crate) fn page_parent_entries(
 
 /// Advance a page-tree parent cursor when `/Parent` is a dictionary handle.
 pub(crate) fn next_page_parent(parent: ObjectHandle) -> Result<Option<PageParentCursor>> {
-    if parent.try_is_null()? {
+    // Only a *direct* null terminates here. Resolving an indirect parent at
+    // this point would parse one node past the caller's depth guard, so the
+    // deferral below has to see it still unresolved. qpdf has no depth bound
+    // in `getAttribute` at all — it terminates on its `QPDFObjGen::set seen`
+    // (`libqpdf/QPDFPageObjectHelper.cc:236-247`) — so this budget is a
+    // flpdf-only guard whose strength depends on not resolving early.
+    if !parent.is_indirect() && parent.try_is_null()? {
         return Ok(None);
     }
     // Keep only a genuinely unresolved indirect parent as a cursor, so the
@@ -91,13 +97,6 @@ pub(crate) fn next_page_parent(parent: ObjectHandle) -> Result<Option<PageParent
     // here rather than deferred — deferring it would let a malformed
     // chain surface as a depth-limit error instead of terminating cleanly,
     // and whether that happens would depend on incidental cache state.
-    //
-    // The `try_is_null` above already dereferenced an *initialized* handle,
-    // so for those this branch cannot be taken. It still guards the
-    // uninitialized case: `try_is_null` returns `Ok(false)` without
-    // dereferencing when `is_initialized()` is false (matching `isNull`'s
-    // `dereference() && ...` short circuit), and such a handle can still
-    // carry an object reference and an `Unresolved` slot.
     if parent.is_indirect() && !parent.is_resolved() {
         return Ok(Some(PageParentCursor::from_handle(parent)));
     }
@@ -396,13 +395,24 @@ impl<'a, R: Read + Seek> PageWalk<'a, R> {
     /// - [`Error::Unsupported`] when the catalog is not a dictionary.
     /// - Any [`Error`] propagated from [`Pdf::resolve`] while resolving the catalog.
     pub fn new(pdf: &'a mut Pdf<R>) -> Result<Self> {
+        // Only a *directly* absent `/Root` is `Missing` here. A present
+        // `/Root` that resolves to a non-dictionary — including an indirect
+        // reference to a free or missing object — is `QPDF::getRoot`'s
+        // responsibility, which throws `unable to find /Root dictionary`
+        // (`libqpdf/QPDF.cc:2354-2360`); resolving it here would preempt that
+        // qpdf-shaped error with a `Missing`. `root_handle` implements
+        // `getRoot`.
         let root = pdf.trailer_key_handle(b"Root");
-        if root.try_is_null()? {
+        if !root.is_indirect() && root.try_is_null()? {
             return Err(Error::Missing("/Root"));
         }
         let catalog = pdf.root_handle()?;
+        // Likewise for `/Pages`: qpdf's `getAllPages` reads it without a null
+        // check and simply enumerates nothing when it carries no `/Kids`
+        // (`libqpdf/QPDF_pages.cc:46,68-72`), so an indirect `/Pages`
+        // resolving to null yields zero pages rather than an error.
         let pages = catalog.try_get_key(b"/Pages")?;
-        if pages.try_is_null()? {
+        if !pages.is_indirect() && pages.try_is_null()? {
             return Err(Error::Missing("/Pages"));
         }
         let pages = PageNode::from_handle(pages);
@@ -424,13 +434,24 @@ impl<'a, R: Read + Seek> PageWalk<'a, R> {
     /// - [`Error::Unsupported`] when the catalog is not a dictionary.
     /// - Any [`Error`] propagated from [`Pdf::resolve`] while resolving the catalog.
     pub fn with_max_depth(pdf: &'a mut Pdf<R>, max_depth: usize) -> Result<Self> {
+        // Only a *directly* absent `/Root` is `Missing` here. A present
+        // `/Root` that resolves to a non-dictionary — including an indirect
+        // reference to a free or missing object — is `QPDF::getRoot`'s
+        // responsibility, which throws `unable to find /Root dictionary`
+        // (`libqpdf/QPDF.cc:2354-2360`); resolving it here would preempt that
+        // qpdf-shaped error with a `Missing`. `root_handle` implements
+        // `getRoot`.
         let root = pdf.trailer_key_handle(b"Root");
-        if root.try_is_null()? {
+        if !root.is_indirect() && root.try_is_null()? {
             return Err(Error::Missing("/Root"));
         }
         let catalog = pdf.root_handle()?;
+        // Likewise for `/Pages`: qpdf's `getAllPages` reads it without a null
+        // check and simply enumerates nothing when it carries no `/Kids`
+        // (`libqpdf/QPDF_pages.cc:46,68-72`), so an indirect `/Pages`
+        // resolving to null yields zero pages rather than an error.
         let pages = catalog.try_get_key(b"/Pages")?;
-        if pages.try_is_null()? {
+        if !pages.is_indirect() && pages.try_is_null()? {
             return Err(Error::Missing("/Pages"));
         }
         let pages = PageNode::from_handle(pages);
