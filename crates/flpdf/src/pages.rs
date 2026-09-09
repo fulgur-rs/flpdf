@@ -91,6 +91,13 @@ pub(crate) fn next_page_parent(parent: ObjectHandle) -> Result<Option<PageParent
     // here rather than deferred — deferring it would let a malformed
     // chain surface as a depth-limit error instead of terminating cleanly,
     // and whether that happens would depend on incidental cache state.
+    //
+    // The `try_is_null` above already dereferenced an *initialized* handle,
+    // so for those this branch cannot be taken. It still guards the
+    // uninitialized case: `try_is_null` returns `Ok(false)` without
+    // dereferencing when `is_initialized()` is false (matching `isNull`'s
+    // `dereference() && ...` short circuit), and such a handle can still
+    // carry an object reference and an `Unresolved` slot.
     if parent.is_indirect() && !parent.is_resolved() {
         return Ok(Some(PageParentCursor::from_handle(parent)));
     }

@@ -287,3 +287,97 @@ fn top_level_pages_verbose_preflight_lines_only_appear_in_auto_mode() {
         );
     }
 }
+
+/// A resource dictionary whose entry resolves to null.
+///
+/// `QPDF_Dictionary::getKeys` omits null-valued keys
+/// (`libqpdf/QPDF_Dictionary.cc:117-127`), and
+/// `removeUnreferencedResourcesHelper` builds both `known_names` and its
+/// removal candidate set from `dict.getKeys()`
+/// (`libqpdf/QPDFPageObjectHelper.cc:581-583,590-593`). A null-valued
+/// `/Font` entry is therefore never a removal candidate on either side, and
+/// the content stream's reference to it never counts as resolved.
+///
+/// No compat fixture carries this shape, so this is the only coverage for
+/// that boundary.
+fn null_valued_font_entry_pdf() -> Vec<u8> {
+    let objects: &[(u32, &str)] = &[
+        (1, "<< /Type /Catalog /Pages 2 0 R >>"),
+        (2, "<< /Type /Pages /Kids [3 0 R] /Count 1 >>"),
+        (
+            3,
+            "<< /Type /Page /Parent 2 0 R /MediaBox [0 0 612 792] /Contents 4 0 R \
+             /Resources << /Font << /F1 null /F2 5 0 R /F3 6 0 R >> >> >>",
+        ),
+        (
+            4,
+            "<< /Length 33 >>\nstream\nBT /F1 12 Tf 10 10 Td (hi) Tj ET\nendstream",
+        ),
+        (5, "<< /Type /Font /Subtype /Type1 /BaseFont /Helvetica >>"),
+        (6, "<< /Type /Font /Subtype /Type1 /BaseFont /Courier >>"),
+    ];
+    let mut out = b"%PDF-1.7\n".to_vec();
+    let mut offsets = std::collections::BTreeMap::new();
+    for (number, body) in objects {
+        offsets.insert(*number, out.len());
+        out.extend_from_slice(format!("{number} 0 obj\n{body}\nendobj\n").as_bytes());
+    }
+    let xref_start = out.len();
+    out.extend_from_slice(b"xref\n0 7\n0000000000 65535 f \n");
+    for offset in offsets.values() {
+        out.extend_from_slice(format!("{offset:010} 00000 n \n").as_bytes());
+    }
+    out.extend_from_slice(
+        format!("trailer\n<< /Size 7 /Root 1 0 R >>\nstartxref\n{xref_start}\n%%EOF\n").as_bytes(),
+    );
+    out
+}
+
+#[test]
+fn remove_unreferenced_resources_matches_qpdf_for_a_null_valued_entry() {
+    if !qpdf_available() {
+        if std::env::var_os("CI").is_some() {
+            panic!("qpdf 11.9.0 is required for this parity test on CI");
+        }
+        eprintln!("skipping: qpdf 11.9.0 is not available");
+        return;
+    }
+
+    for mode in ["auto", "no", "yes"] {
+        let temp = tempfile::tempdir().expect("temporary directory");
+        let input = temp.path().join("null-font-entry.pdf");
+        fs::write(&input, null_valued_font_entry_pdf()).expect("write input");
+
+        let qpdf_output = temp.path().join("qpdf.pdf");
+        let mut args = common_flags(mode);
+        args.extend([
+            input.as_os_str().to_owned(),
+            qpdf_output.as_os_str().to_owned(),
+        ]);
+        let qpdf = run_qpdf(&args);
+
+        let flpdf_output = temp.path().join("flpdf.pdf");
+        let mut args = common_flags(mode);
+        args.extend([
+            input.as_os_str().to_owned(),
+            flpdf_output.as_os_str().to_owned(),
+        ]);
+        let flpdf = run_flpdf(&args);
+
+        assert_eq!(
+            flpdf.status.code(),
+            qpdf.status.code(),
+            "exit status must match qpdf for --remove-unreferenced-resources={mode}"
+        );
+        assert_eq!(
+            normalize_text_newlines(&flpdf.stderr),
+            normalize_text_newlines(&qpdf.stderr),
+            "stderr must match qpdf for --remove-unreferenced-resources={mode}"
+        );
+        assert_eq!(
+            fs::read(&flpdf_output).expect("flpdf output"),
+            fs::read(&qpdf_output).expect("qpdf output"),
+            "output must match qpdf for --remove-unreferenced-resources={mode}"
+        );
+    }
+}
