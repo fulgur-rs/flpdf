@@ -80,12 +80,14 @@ impl LabelRange {
             .try_as_name()?
             .map(|name| LabelStyle::from_name(&name))
             .unwrap_or(LabelStyle::None);
+        // `QPDFPageLabelDocumentHelper::getLabelForPage` copies `/P` verbatim
+        // without inspecting its type (`QPDFPageLabelDocumentHelper.cc:38,48`),
+        // so a non-string prefix must not raise qpdf's string typeWarning here.
+        // `try_get_string_value` would; this stays on the silent accessor and
+        // falls back to an empty prefix like the pre-cutover code did.
         let prefix_handle = handle.try_get_key(b"/P")?;
-        let prefix_bytes = if prefix_handle.try_is_null()? {
-            Vec::new()
-        } else {
-            prefix_handle.try_get_string_value()?
-        };
+        prefix_handle.try_dereference()?;
+        let prefix_bytes = prefix_handle.as_string().unwrap_or_default();
         let prefix = crate::json_inspect::decode_pdf_text_string(&prefix_bytes)
             .unwrap_or_else(|| String::from_utf8_lossy(&prefix_bytes).into_owned());
         let start = handle.try_get_key(b"/St")?.try_as_integer()?.unwrap_or(1);
@@ -788,6 +790,32 @@ mod tests {
             error,
             Error::Internal(ref message) if message == "object 99 0 belongs to a dropped PDF"
         ));
+    }
+
+    /// `QPDFPageLabelDocumentHelper::getLabelForPage` reads `/P` with a plain
+    /// `label.getKey("/P")` and copies it into the result untouched
+    /// (`QPDFPageLabelDocumentHelper.cc:38,48`), so a non-string prefix raises
+    /// no diagnostic. Probed with qpdf 11.9.0 on `/P 42`, `/P /Foo` and
+    /// `/P [1 2]`: `--pages . 1-2 --` exits 0 with empty stderr for all three.
+    /// Reading through `try_get_string_value` instead would emit qpdf's
+    /// "operation for string attempted on object of type integer" warning and
+    /// turn the run into exit 3.
+    #[test]
+    fn non_string_prefix_decodes_to_empty_without_a_type_warning() {
+        for prefix in [
+            ObjectHandle::integer(42),
+            ObjectHandle::name(b"Foo".to_vec()),
+            ObjectHandle::array(vec![ObjectHandle::integer(1)]),
+        ] {
+            let label = ObjectHandle::dictionary(vec![
+                (b"/S".to_vec(), ObjectHandle::name(b"D".to_vec())),
+                (b"/P".to_vec(), prefix),
+            ]);
+            let range = LabelRange::from_handle(&label)
+                .expect("a non-string prefix must not raise a type warning")
+                .expect("the label is a dictionary");
+            assert_eq!(range.prefix, "");
+        }
     }
 
     /// A minimal one-page PDF with no `/PageLabels` key at all (as opposed to
