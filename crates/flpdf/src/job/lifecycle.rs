@@ -2879,8 +2879,18 @@ impl QPDFJob {
                     // (`QPDFJob.cc:2396-2410`). An explicit empty page
                     // password remains `Some(Vec::new())` and must bypass the
                     // fallback.
-                    (configuration.copy_encryption.as_deref() == Some(page.path.as_path()))
-                        .then(|| configuration.encryption_file_password.clone())
+                    // qpdf compares the raw filename strings and never a
+                    // normalized path — `page_spec.filename` and
+                    // `m->encryption_file` are both `std::string`, and
+                    // `QPDFJob.cc:2397` says "Do not canonicalize the file
+                    // name." `Path` equality folds away `.` components and
+                    // repeated separators, so compare the `OsStr` bytes.
+                    (configuration
+                        .copy_encryption
+                        .as_deref()
+                        .map(Path::as_os_str)
+                        == Some(page.path.as_os_str()))
+                    .then(|| configuration.encryption_file_password.clone())
                 });
                 source_passwords.push(password);
                 source_paths.len()

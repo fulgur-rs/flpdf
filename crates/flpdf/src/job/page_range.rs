@@ -103,6 +103,16 @@ impl PageRange {
             });
         }
         let (range, parity) = split_parity_suffix(input)?;
+        // qpdf truncates the input at the parity suffix (`range_end = p`,
+        // `QUtil.cc:1356`) and then runs `while (p != range_end)`
+        // (`QUtil.cc:1367`) zero times, returning an empty result without an
+        // error. So ":odd" and ":even" are valid and select nothing.
+        if range.is_empty() {
+            return Ok(Self {
+                entries: Some(Vec::new()),
+                parity,
+            });
+        }
         let mut entries = parse_entries(range)?;
         if let Some(parity) = parity {
             if let Some(entry) = entries.last_mut() {
@@ -335,7 +345,10 @@ impl<'a> RangeParser<'a> {
 }
 
 fn split_parity_suffix(input: &str) -> Result<(&str, Option<Parity>)> {
-    let Some(index) = input.rfind(':') else {
+    // qpdf takes the FIRST colon (`std::find`, `QUtil.cc:1348`) and then
+    // requires the remainder to be exactly ":odd" or ":even" (`strcmp`,
+    // `QUtil.cc:1350-1356`).
+    let Some(index) = input.find(':') else {
         return Ok((input, None));
     };
     let (range, suffix) = input.split_at(index);
@@ -560,9 +573,14 @@ mod tests {
     }
 
     #[test]
-    fn bare_colon_is_invalid() {
-        let msg = parse_err(":odd");
-        assert!(!msg.is_empty());
+    fn bare_parity_suffix_selects_nothing_like_qpdf() {
+        // qpdf truncates at the suffix (`QUtil.cc:1356`) and then never enters
+        // the group loop (`QUtil.cc:1367`), returning an empty result without
+        // an error. Probed with qpdf 11.9.0 on a 10-page file:
+        // `--pages . :odd --` and `--pages . :even --` both exit 0 and write a
+        // 0-page document.
+        assert_eq!(resolve(":odd", 10), Vec::<u32>::new());
+        assert_eq!(resolve(":even", 10), Vec::<u32>::new());
     }
 
     #[test]
@@ -658,6 +676,23 @@ mod tests {
     fn even_parity_resolve() {
         // '1-9:even' → positions 2,4,6,8 of [1..9] = [2,4,6,8]
         assert_eq!(resolve("1-9:even", 9), vec![2, 4, 6, 8]);
+    }
+
+    #[test]
+    fn parity_applies_to_the_whole_selection_not_each_group() {
+        // qpdf strips the suffix once and filters the concatenated result
+        // (`QUtil.cc:1348-1360` then `:1400-1414`), so the parity positions run
+        // across group boundaries. Probed with qpdf 11.9.0 on a 10-page file
+        // (`--pages . <range> --`, page identified by its /MediaBox width):
+        // `1-3,5-7:odd` -> 1 3 6, `1-3,5-7:even` -> 2 5 7.
+        assert_eq!(resolve("1-3,5-7:odd", 10), vec![1, 3, 6]);
+        assert_eq!(resolve("1-3,5-7:even", 10), vec![2, 5, 7]);
+    }
+
+    #[test]
+    fn parity_is_applied_after_exclusion_groups() {
+        // qpdf 11.9.0 on the same 10-page file: `1-6,x3:odd` -> 1 4 6.
+        assert_eq!(resolve("1-6,x3:odd", 10), vec![1, 4, 6]);
     }
 
     #[test]
