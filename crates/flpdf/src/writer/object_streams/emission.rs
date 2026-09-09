@@ -4,6 +4,7 @@
 
 use std::collections::HashSet;
 
+use crate::stream_filter::encode_flate;
 use crate::ObjectHandle;
 use crate::ObjectRef;
 // ── ObjStm body emitter ───────────────────────────────────────────────────────
@@ -162,16 +163,7 @@ pub(crate) fn wrap_objstm_body_as_handle(
     extends: Option<crate::ObjectRef>,
 ) -> crate::Result<(ObjectHandle, Vec<u8>)> {
     let (data, filter) = match compress {
-        crate::writer::CompressStreams::Yes => {
-            let encode_dict = ObjectHandle::dictionary(vec![(
-                b"Filter".to_vec(),
-                ObjectHandle::name(b"FlateDecode".to_vec()),
-            )]);
-            (
-                crate::filters::encode_stream_data_from_handle(&encode_dict, &body.bytes)?,
-                true,
-            )
-        }
+        crate::writer::CompressStreams::Yes => (encode_flate(&body.bytes)?, true),
         crate::writer::CompressStreams::No => (body.bytes.clone(), false),
     };
 

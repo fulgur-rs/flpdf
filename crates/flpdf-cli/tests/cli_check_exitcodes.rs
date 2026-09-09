@@ -15,7 +15,8 @@
 //!   3. corrupt/error PDF    → exit 2
 
 use assert_cmd::Command;
-use flpdf::ObjectHandle;
+use flpdf::pipeline::{FlateAction, PlFlate};
+use flpdf::Pipeline;
 use predicates::prelude::*;
 use std::io::Write;
 use std::process::Command as ProcessCommand;
@@ -26,6 +27,38 @@ use eol::EOL;
 
 /// Expected qpdf version for the differential `--check` comparisons below.
 const EXPECTED_QPDF_VERSION: &str = "qpdf version 11.9.0";
+
+struct VecSink(Vec<u8>);
+
+impl Pipeline for VecSink {
+    fn identifier(&self) -> &str {
+        "check exit-code test sink"
+    }
+
+    fn write(&mut self, data: &[u8]) -> flpdf::PipelineResult<()> {
+        self.0.extend_from_slice(data);
+        Ok(())
+    }
+
+    fn finish(&mut self) -> flpdf::PipelineResult<()> {
+        Ok(())
+    }
+}
+
+fn flate_encode(data: &[u8]) -> Vec<u8> {
+    let mut sink = VecSink(Vec::new());
+    {
+        let mut stage = PlFlate::new(
+            "check exit-code test flate",
+            &mut sink,
+            FlateAction::Deflate,
+        )
+        .unwrap();
+        stage.write(data).unwrap();
+        stage.finish().unwrap();
+    }
+    sink.0
+}
 
 /// Reports whether the pinned `qpdf` 11.9.0 executable is available for
 /// differential comparison. Mirrors the guard used by the other qpdf-dependent
@@ -316,11 +349,7 @@ fn recovered_content_stream_pdf_bytes() -> Vec<u8> {
 /// compressed, large inflated). The stream is intact, so `--check` reports
 /// it clean regardless of size (default unlimited, matching qpdf).
 fn bomb_content_stream_pdf_bytes(decoded_len: usize) -> Vec<u8> {
-    let flate_dict = ObjectHandle::dictionary(vec![(
-        b"/Filter".to_vec(),
-        ObjectHandle::name(b"FlateDecode".to_vec()),
-    )]);
-    let encoded = flpdf::filters::encode_stream_data(&flate_dict, &vec![0u8; decoded_len]).unwrap();
+    let encoded = flate_encode(&vec![0u8; decoded_len]);
 
     let mut pdf = Vec::new();
     pdf.extend_from_slice(b"%PDF-1.4\n");

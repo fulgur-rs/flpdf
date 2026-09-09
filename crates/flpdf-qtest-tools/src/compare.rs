@@ -8,7 +8,7 @@
 use std::io::{Read, Seek};
 use std::rc::Rc;
 
-use flpdf::{ObjectHandle, Pdf};
+use flpdf::{DecodeLevel, ObjectHandle, Pdf};
 
 /// Compare two canonical [`ObjectHandle`]s the way qpdf's
 /// `qpdf-test-compare` does.
@@ -80,13 +80,8 @@ where
         return Ok(String::new());
     }
     if stream_uses_flatedecode(&act_dict, actual_pdf)? {
-        let act_data = raw_stream_data(act)?;
-        remove_consumed_crypt_stages(&act_dict, actual_pdf)?;
-        let decoded_act = flpdf::filters::decode_stream_data(&act_dict, act_data.as_ref())?;
-
-        let exp_data = raw_stream_data(exp)?;
-        remove_consumed_crypt_stages(&exp_dict, expected_pdf)?;
-        let decoded_exp = flpdf::filters::decode_stream_data(&exp_dict, exp_data.as_ref())?;
+        let decoded_act = act.get_stream_data(DecodeLevel::Generalized)?;
+        let decoded_exp = exp.get_stream_data(DecodeLevel::Generalized)?;
         return Ok(compare_stream_bytes(label, &decoded_act, &decoded_exp));
     }
 
@@ -156,98 +151,6 @@ fn resolved_filter_names_exact<R: Read + Seek>(
         names.push(item.as_name().unwrap_or_default());
     }
     Ok(ResolvedFilterNames { names })
-}
-
-fn normalize_filter_name(name: &[u8]) -> &[u8] {
-    match name {
-        b"Fl" => b"FlateDecode",
-        b"LZW" => b"LZWDecode",
-        b"A85" => b"ASCII85Decode",
-        b"AHx" => b"ASCIIHexDecode",
-        b"RL" => b"RunLengthDecode",
-        b"CCF" => b"CCITTFaxDecode",
-        b"DCT" => b"DCTDecode",
-        name => name,
-    }
-}
-
-/// Remove Crypt stages already consumed by the document's canonical
-/// source/decrypter. The filter and DecodeParms values remain live handles;
-/// positional validation happens before paired entries are removed.
-fn remove_consumed_crypt_stages<R: Read + Seek>(
-    dict: &ObjectHandle,
-    pdf: &mut Pdf<R>,
-) -> flpdf::Result<()> {
-    let filter = dict.try_get_key(b"/Filter")?;
-    pdf.resolve(&filter)?;
-    if let Some(name) = filter.as_name() {
-        if normalize_filter_name(&name) == b"Crypt" {
-            dict.remove_key(b"/Filter");
-            dict.remove_key(b"/DecodeParms");
-        }
-        return Ok(());
-    }
-    let Some(items) = filter.as_array() else {
-        return Ok(());
-    };
-
-    let mut resolved_items = Vec::with_capacity(items.len());
-    let mut crypt_indices = Vec::new();
-    for (index, item) in items.into_iter().enumerate() {
-        pdf.resolve(&item)?;
-        if item
-            .as_name()
-            .is_some_and(|name| normalize_filter_name(&name) == b"Crypt")
-        {
-            crypt_indices.push(index);
-        }
-        resolved_items.push(item);
-    }
-    if crypt_indices.is_empty() {
-        return Ok(());
-    }
-
-    let params = dict
-        .as_dictionary()
-        .and_then(|entries| entries.get(b"/DecodeParms".as_slice()).cloned());
-    if let Some(params) = params {
-        pdf.resolve(&params)?;
-        if let Some(params) = params.as_array() {
-            if !params.is_empty() && params.len() != resolved_items.len() {
-                return Ok(());
-            }
-        }
-    }
-
-    let remaining = resolved_items
-        .into_iter()
-        .enumerate()
-        .filter_map(|(index, item)| (!crypt_indices.contains(&index)).then_some(item))
-        .collect::<Vec<_>>();
-    if remaining.is_empty() {
-        dict.remove_key(b"/Filter");
-        dict.remove_key(b"/DecodeParms");
-        return Ok(());
-    }
-    dict.replace_key(b"/Filter", ObjectHandle::array(remaining.clone()))?;
-
-    if let Some(params) = dict
-        .as_dictionary()
-        .and_then(|entries| entries.get(b"/DecodeParms".as_slice()).cloned())
-    {
-        pdf.resolve(&params)?;
-        if let Some(params) = params.as_array() {
-            if params.len() == crypt_indices.len() + remaining.len() {
-                let params = params
-                    .into_iter()
-                    .enumerate()
-                    .filter_map(|(index, value)| (!crypt_indices.contains(&index)).then_some(value))
-                    .collect();
-                dict.replace_key(b"/DecodeParms", ObjectHandle::array(params))?;
-            }
-        }
-    }
-    Ok(())
 }
 
 fn resolve_compare_children<R: Read + Seek>(
@@ -532,34 +435,6 @@ mod tests {
     }
 
     #[test]
-    fn consumed_crypt_stages_keep_decode_params_aligned() {
-        let dict = ObjectHandle::dictionary(vec![
-            (
-                b"/Filter".to_vec(),
-                ObjectHandle::array(vec![
-                    ObjectHandle::name(b"Crypt".to_vec()),
-                    ObjectHandle::name(b"FlateDecode".to_vec()),
-                    ObjectHandle::name(b"Crypt".to_vec()),
-                ]),
-            ),
-            (
-                b"/DecodeParms".to_vec(),
-                ObjectHandle::array(vec![
-                    ObjectHandle::dictionary(Vec::new()),
-                    ObjectHandle::dictionary(Vec::new()),
-                    ObjectHandle::dictionary(Vec::new()),
-                ]),
-            ),
-        ]);
-        let mut pdf = dummy_pdf();
-        remove_consumed_crypt_stages(&dict, &mut pdf).unwrap();
-        let filter = dict.get_key(b"/Filter").as_array().unwrap();
-        assert_eq!(filter.len(), 1);
-        assert_eq!(filter[0].as_name(), Some(b"FlateDecode".to_vec()));
-        assert_eq!(dict.get_key(b"/DecodeParms").as_array().unwrap().len(), 1);
-    }
-
-    #[test]
     fn filter_name_resolution_preserves_array_positions_and_rejects_scalars() {
         let mut pdf = dummy_pdf();
         let array = ObjectHandle::dictionary(vec![(
@@ -579,66 +454,5 @@ mod tests {
             .expect("inspect scalar filter")
             .names
             .is_empty());
-    }
-
-    #[test]
-    fn crypt_cleanup_handles_single_non_array_and_non_crypt_filters() {
-        let mut pdf = dummy_pdf();
-        let single = ObjectHandle::dictionary(vec![
-            (b"/Filter".to_vec(), ObjectHandle::name(b"Crypt".to_vec())),
-            (
-                b"/DecodeParms".to_vec(),
-                ObjectHandle::dictionary(Vec::new()),
-            ),
-        ]);
-        remove_consumed_crypt_stages(&single, &mut pdf).expect("remove single Crypt stage");
-        assert!(!single.has_key(b"/Filter"));
-        assert!(!single.has_key(b"/DecodeParms"));
-
-        let scalar =
-            ObjectHandle::dictionary(vec![(b"/Filter".to_vec(), ObjectHandle::integer(7))]);
-        remove_consumed_crypt_stages(&scalar, &mut pdf).expect("ignore scalar filter");
-
-        let non_crypt = ObjectHandle::dictionary(vec![(
-            b"/Filter".to_vec(),
-            ObjectHandle::array(vec![ObjectHandle::name(b"FlateDecode".to_vec())]),
-        )]);
-        remove_consumed_crypt_stages(&non_crypt, &mut pdf).expect("ignore non-Crypt filter");
-        assert!(non_crypt.has_key(b"/Filter"));
-    }
-
-    #[test]
-    fn crypt_cleanup_preserves_mismatched_decode_parameters_and_removes_all_crypt_stages() {
-        let mut pdf = dummy_pdf();
-        let mismatched = ObjectHandle::dictionary(vec![
-            (
-                b"/Filter".to_vec(),
-                ObjectHandle::array(vec![
-                    ObjectHandle::name(b"Crypt".to_vec()),
-                    ObjectHandle::name(b"FlateDecode".to_vec()),
-                ]),
-            ),
-            (
-                b"/DecodeParms".to_vec(),
-                ObjectHandle::array(vec![ObjectHandle::dictionary(Vec::new())]),
-            ),
-        ]);
-        remove_consumed_crypt_stages(&mismatched, &mut pdf)
-            .expect("inspect mismatched Crypt parameters");
-        assert!(mismatched.has_key(b"/Filter"));
-
-        let all_crypt = ObjectHandle::dictionary(vec![
-            (
-                b"/Filter".to_vec(),
-                ObjectHandle::array(vec![ObjectHandle::name(b"Crypt".to_vec())]),
-            ),
-            (
-                b"/DecodeParms".to_vec(),
-                ObjectHandle::array(vec![ObjectHandle::dictionary(Vec::new())]),
-            ),
-        ]);
-        remove_consumed_crypt_stages(&all_crypt, &mut pdf).expect("remove the only Crypt stage");
-        assert!(!all_crypt.has_key(b"/Filter"));
-        assert!(!all_crypt.has_key(b"/DecodeParms"));
     }
 }

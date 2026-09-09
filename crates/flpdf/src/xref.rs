@@ -42,7 +42,7 @@ use crate::reader::resolver::ResolverHandle;
 use crate::tokenizer::{Token, TokenType, Tokenizer};
 use crate::writer::DecodeLevel;
 use crate::{
-    filters, Diagnostics, Error, ObjectHandle, ObjectRef, QpdfErrorCode, QpdfExc, Result, XrefEntry,
+    Diagnostics, Error, ObjectHandle, ObjectRef, QpdfErrorCode, QpdfExc, Result, XrefEntry,
 };
 use std::cell::{OnceCell, RefCell};
 use std::collections::{BTreeMap, BTreeSet, HashSet};
@@ -1609,13 +1609,10 @@ trait XrefObjectContext {
     ///
     /// qpdf reads this in one call, `xref_obj.getStreamData(qpdf_dl_specialized)`
     /// (`libqpdf/QPDF.cc:1051`), over `QPDFObjectHandle::getStreamData`
-    /// (`QPDFObjectHandle.cc:1289-1292`). The bootstrap context has no
-    /// persistent resolver to replay that canonical pipe against later, so it
-    /// keeps its own materialize-then-decode path; the canonical-owner
-    /// context has a real resolver-backed handle and calls the same
-    /// `get_stream_data` other already-migrated consumers use
-    /// (`page_object_helper.rs`, `overlay_appearance_stream.rs`,
-    /// `json_inspect.rs`).
+    /// (`QPDFObjectHandle.cc:1289-1292`). Both the bootstrap and
+    /// canonical-owner contexts use the resolver-backed handle's canonical
+    /// `get_stream_data` pipe; bootstrap retains its bounded source-read
+    /// policy in the resolver rather than a second materialized decoder.
     fn decoded_xref_stream_data(
         &mut self,
         object_ref: ObjectRef,
@@ -1646,18 +1643,12 @@ impl XrefObjectContext for XrefReadContext<'_> {
     fn decoded_xref_stream_data(
         &mut self,
         _object_ref: ObjectRef,
-        stream_dict: &ObjectHandle,
+        _stream_dict: &ObjectHandle,
         object: &ObjectHandle,
-        xref_pos: usize,
+        _xref_pos: usize,
     ) -> Result<Vec<u8>> {
-        let stream_data = object
-            .as_stream_data()
-            .ok_or_else(|| Error::parse(xref_pos, "xref stream has no data"))?;
-        filters::decode_stream_data_from_handle(
-            stream_dict,
-            &stream_data,
-            filters::DecodeLimits::default(),
-        )
+        let data = object.get_stream_data(DecodeLevel::Specialized)?;
+        Ok((*data).clone())
     }
 
     fn sync_handle_diagnostics(&mut self) {
@@ -8092,9 +8083,9 @@ mod final_handle_tests {
     /// rather than a direct `/Filter` name in the stream's own dictionary.
     /// This is a legal but unusual construction (confirmed accepted by live
     /// qpdf 11.9.0 `--check`, exit 0, no reconstruction) that exercises
-    /// `decode_stream_data_from_handle`'s internal `/Filter` dereference
-    /// (`filters.rs:466-468`) at a point where this context's deferred
-    /// source snapshot may not yet be populated.
+    /// canonical `ObjectHandle::get_stream_data` `/Filter` dereference at a
+    /// point where this context's deferred source snapshot may not yet be
+    /// populated.
     fn hybrid_xref_with_indirect_filter() -> Vec<u8> {
         fn entry(kind: u8, offset: u16, gen: u8) -> [u8; 4] {
             let [hi, lo] = offset.to_be_bytes();

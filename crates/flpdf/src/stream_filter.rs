@@ -403,8 +403,9 @@ fn map_stage_error(error: StagePipelineError) -> FilterDecodeError {
 /// Rust equivalent of qpdf's `QPDFStreamFilter` extension boundary.
 ///
 /// `pipe_decode_recovering` owns construction and completion of the filter's
-/// decode pipeline. A whole-buffer result keeps the legacy decode helpers
-/// stable while the individual codecs use incremental `Pipeline` stages.
+/// decode pipeline for the explicit qtest exception boundary. The result is
+/// assembled from incremental `Pipeline` stages; ordinary stream consumers use
+/// `ObjectHandle::pipe_stream_data` directly.
 pub(crate) trait StreamFilter {
     /// Port of `QPDFStreamFilter::setDecodeParms`
     /// (`libqpdf/QPDFStreamFilter.cc:3-7`), whose whole body is
@@ -501,6 +502,7 @@ struct PredictorGeometry {
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum PredictorAction {
+    #[cfg(test)]
     Encode,
     Decode,
 }
@@ -711,7 +713,8 @@ impl FlateLzwStreamFilter {
         .transpose()
     }
 
-    /// Run the codec stage of the whole-buffer route over `data`.
+    /// Run the codec stage of the recovering materialized qtest route over
+    /// `data`.
     ///
     /// **Recorded deviation:** the `Pl_Flate` warn callback is installed here,
     /// on the stage this function constructs, where qpdf installs it at the
@@ -768,6 +771,7 @@ fn make_predictor_pipeline<'a>(
 ) -> Result<PipelineRef<'a>> {
     let next = next.into();
     let pipeline = match (geometry.kind, action) {
+        #[cfg(test)]
         (PredictorKind::Png, PredictorAction::Encode) => Box::new(
             PngFilter::new(
                 "png encode",
@@ -790,6 +794,7 @@ fn make_predictor_pipeline<'a>(
             )
             .map_err(map_pipeline_error)?,
         ) as Box<dyn Pipeline + 'a>,
+        #[cfg(test)]
         (PredictorKind::Tiff, PredictorAction::Encode) => Box::new(
             TiffPredictor::new_with_memory_limit(
                 "tiff encode",
@@ -1060,7 +1065,8 @@ impl StreamFilter for CryptStreamFilter {
 ///
 /// The container and qpdf's registered production codecs are represented here;
 /// the DCT stage itself is the qpdf-shaped streaming primitive, and the
-/// whole-buffer adapter below drives that same stage for legacy callers.
+/// recovering qtest adapter below drives that same stage only at its explicit
+/// compatibility boundary.
 pub(crate) fn stream_filter_for(filter_name: &[u8]) -> Option<Box<dyn StreamFilter>> {
     match filter_name {
         b"Crypt" => Some(Box::new(CryptStreamFilter)),
@@ -1143,6 +1149,7 @@ pub(crate) fn encode_flate(data: &[u8]) -> Result<Vec<u8>> {
 /// Returns `Ok(None)` when the parameters select no predictor. The
 /// parameters are validated through the same `SF_FlateLzwDecode` state the
 /// decode path uses, so both directions accept exactly the same dictionaries.
+#[cfg(test)]
 fn predictor_encode_geometry(
     filter_name: &[u8],
     decode_params: &ObjectHandle,
@@ -1177,6 +1184,7 @@ fn predictor_encode_geometry(
 }
 
 /// Apply the predictor selected by `/DecodeParms` before a codec's encode step.
+#[cfg(test)]
 pub(crate) fn encode_predictor(
     data: &[u8],
     filter_name: &[u8],
@@ -1188,6 +1196,7 @@ pub(crate) fn encode_predictor(
     encode_predictor_stage(data, geometry)
 }
 
+#[cfg(test)]
 fn encode_predictor_stage(data: &[u8], geometry: PredictorGeometry) -> Result<Vec<u8>> {
     let mut sink = Buffer::new("stream data buffer", None);
     {
@@ -1195,16 +1204,6 @@ fn encode_predictor_stage(data: &[u8], geometry: PredictorGeometry) -> Result<Ve
             make_predictor_pipeline(geometry, &mut sink, PredictorAction::Encode, None)?;
         predictor.write(data).map_err(map_pipeline_error)?;
         predictor.finish().map_err(map_pipeline_error)?;
-    }
-    sink.take_buffer().map_err(map_pipeline_error)
-}
-
-pub(crate) fn encode_run_length(data: &[u8]) -> Result<Vec<u8>> {
-    let mut sink = Buffer::new("stream data buffer", None);
-    {
-        let mut stage = RunLength::new("compress stream", &mut sink, RunLengthAction::Encode);
-        stage.write(data).map_err(map_pipeline_error)?;
-        stage.finish().map_err(map_pipeline_error)?;
     }
     sink.take_buffer().map_err(map_pipeline_error)
 }
