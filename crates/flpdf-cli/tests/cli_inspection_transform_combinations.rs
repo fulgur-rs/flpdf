@@ -216,6 +216,10 @@ fn attachment_rewrite_routes_accept_generate_appearances_like_qpdf() {
         "--add-attachment".to_owned(),
         payload.display().to_string(),
         "--key=added".to_owned(),
+        // qpdf stamps the attachment with the current time, so pin both dates
+        // or two invocations that straddle a second disagree.
+        "--creationdate=D:20260101000000Z".to_owned(),
+        "--moddate=D:20260101000000Z".to_owned(),
         "--".to_owned(),
         input.display().to_string(),
         add_qpdf.display().to_string(),
@@ -293,6 +297,10 @@ fn generate_appearances_reaches_the_attachment_rewrite_route() {
             "--add-attachment".to_owned(),
             payload.display().to_string(),
             "--key=added".to_owned(),
+            // qpdf stamps the attachment with the current time, so pin both
+            // dates or two invocations that straddle a second disagree.
+            "--creationdate=D:20260101000000Z".to_owned(),
+            "--moddate=D:20260101000000Z".to_owned(),
             "--".to_owned(),
             input.display().to_string(),
             output.display().to_string(),
