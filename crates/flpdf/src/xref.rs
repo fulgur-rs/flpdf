@@ -6940,10 +6940,10 @@ mod final_handle_tests {
                 XrefLoadOptions::default(),
             )
             .unwrap_or_else(|error| panic!("separator {separator:?} must parse: {error:?}"));
+            let diagnostics = state.loaded.repair_diagnostics.entries().to_vec();
             assert!(
-                state.loaded.repair_diagnostics.entries().is_empty(),
-                "separator {separator:?} must not trigger recovery: {:?}",
-                state.loaded.repair_diagnostics.entries()
+                diagnostics.is_empty(),
+                "separator {separator:?} must not trigger recovery: {diagnostics:?}"
             );
         }
     }
@@ -6964,11 +6964,42 @@ mod final_handle_tests {
             XrefLoadOptions::default(),
         )
         .expect("a vertical tab is a space to qpdf");
-        assert!(
-            state.loaded.repair_diagnostics.entries().is_empty(),
-            "{:?}",
-            state.loaded.repair_diagnostics.entries()
-        );
+        let diagnostics = state.loaded.repair_diagnostics.entries().to_vec();
+        assert!(diagnostics.is_empty(), "{diagnostics:?}");
+    }
+
+    #[test]
+    fn a_section_header_needs_a_space_after_its_first_number() {
+        // `parse_xrefFirst` gathers digits and then requires a space
+        // (`QPDF.cc:735-745`). Until `trailer<<` stopped being mistaken for a
+        // section header, that rejection was only ever reached by the mistake.
+        assert_eq!(parse_xref_first_line(b"0 2"), Some((0, 2)));
+        assert_eq!(parse_xref_first_line(b"0x 2"), None);
+        assert_eq!(parse_xref_first_line(b"x 2"), None);
+        // qpdf requires no space after the second number: it skips whatever
+        // spaces follow and reports the bytes it consumed (`QPDF.cc:754-767`).
+        assert_eq!(parse_xref_first_line(b"0 2x"), Some((0, 2)));
+    }
+
+    #[test]
+    fn the_space_and_delimiter_sets_match_qpdf() {
+        // `QUtil::is_space` (`include/qpdf/QUtil.hh:497-501`) and the
+        // tokenizer's `is_delimiter` (`libqpdf/QPDFTokenizer.cc:16-23`).
+        for byte in [b'\t', b'\n', 0x0b, 0x0c, b'\r', b' '] {
+            assert!(is_pdf_space(byte), "{byte:#04x} is a qpdf space");
+            assert!(is_pdf_delimiter(byte), "{byte:#04x} ends a keyword");
+        }
+        // `parse_xrefEntry` relies on `is_space('\0')` being false to stop at
+        // its buffer end (`QPDF.cc:775-782`), but NUL still ends a keyword.
+        assert!(!is_pdf_space(0));
+        for byte in [
+            b'/', b'(', b')', b'{', b'}', b'<', b'>', b'[', b']', b'%', 0,
+        ] {
+            assert!(is_pdf_delimiter(byte), "{byte:#04x} ends a keyword");
+        }
+        for byte in [b'a', b'0', b'-', b'+', b'.', b'#'] {
+            assert!(!is_pdf_delimiter(byte), "{byte:#04x} continues a keyword");
+        }
     }
 
     #[test]
