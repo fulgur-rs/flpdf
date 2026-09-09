@@ -4935,6 +4935,48 @@ impl QPDFJobConfig<'_> {
         self
     }
 
+    /// Queue one qpdf `--rotate` parameter for the create-stage rotation map.
+    ///
+    /// qpdf's public `QPDFJob::Config::rotate` delegates to the private
+    /// `parseRotationParameter` helper and stores the result keyed by its raw
+    /// page-range string (`QPDFJob_config.cc:786-790`, `QPDFJob.cc:369-415`).
+    /// Keep the byte-preserving parameter at this Config boundary so direct
+    /// argv and job-JSON callers share the same parser and last-write-wins
+    /// map semantics.
+    pub fn rotate(&mut self, parameter: impl AsRef<[u8]>) -> Result<&mut Self> {
+        let parameter = parse_rotation_parameter(parameter.as_ref())?;
+        self.job
+            .configuration
+            .rotations
+            .insert(parameter.range, parameter.spec);
+        Ok(self)
+    }
+
+    /// Configure qpdf's `splitPages` writer-stage dispatch.
+    ///
+    /// qpdf's Config stores the signed `int` produced by `string_to_int` and
+    /// leaves the later `split-pages` conversion to the write path
+    /// (`QPDFJob_config.cc:597-609`, `QPDFJob.cc:3218-3240`). Reuse the job
+    /// parser here rather than narrowing the CLI value before the canonical
+    /// writer sees it.
+    pub fn split_pages(&mut self, parameter: impl AsRef<[u8]>) -> Result<&mut Self> {
+        self.job.configuration.split_pages = Some(parse_job_split_pages(parameter.as_ref())?);
+        Ok(self)
+    }
+
+    /// Configure qpdf's resource-pruning policy for split-page output.
+    ///
+    /// Plain rewrites do not consume this field; qpdf's `doSplitPages` path
+    /// does, after create-stage transformations have completed
+    /// (`QPDFJob.cc:2939-3027`).
+    pub fn remove_unreferenced_resources(
+        &mut self,
+        mode: RemoveUnreferencedResources,
+    ) -> &mut Self {
+        self.job.configuration.remove_unreferenced_resources = mode;
+        self
+    }
+
     /// Configure qpdf's inline-image externalization phase.
     pub fn externalize_inline_images(&mut self, min_bytes: usize) -> &mut Self {
         self.job.configuration.externalize_inline_images = true;
@@ -6584,6 +6626,25 @@ mod tests {
             .configuration
             .rotations
             .contains_key(b"1\0junk".as_slice()));
+    }
+
+    #[test]
+    fn config_rotation_and_split_pages_store_qpdf_values() {
+        let mut job = QPDFJob::new();
+        {
+            let mut configuration = job.config();
+            configuration
+                .rotate(b"+90:1")
+                .expect("qpdf rotation parameter should parse");
+            configuration
+                .split_pages(b"2")
+                .expect("qpdf split-pages parameter should parse");
+        }
+
+        let rotation = &job.configuration.rotations[b"1".as_slice()];
+        assert_eq!(rotation.angle, 90);
+        assert!(rotation.relative);
+        assert_eq!(job.configuration.split_pages, Some(2));
     }
 
     #[test]

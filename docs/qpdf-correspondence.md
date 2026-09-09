@@ -1237,6 +1237,15 @@ self-overlayのcontroller状態を回帰テストで固定した。これはE-4�
 
 `flattenRotation` も生成 handler (`auto_job_json_init.hh:377-382`)、Config (`QPDFJob_config.cc:204-207`)、変換順序 (`QPDFJob.cc:2190-2194`) に対応し、既存の `flatten_rotation_on_pages` (`QPDFPageObjectHelper.cc:862-991`) を `job/lifecycle.rs` から呼ぶ。`coalesceContents` の直後に配置して、qpdfのページ変換順序を保つ。
 
+2026-09-10（`flpdf-v7vr`）では、top-level の no-`--pages` `--rotate`/`--split-pages`
+consumerも `QPDFJobConfig::rotate` / `split_pages` へ raw parameterを渡し、
+`create_qpdf` の rotation → `prepare_document_transformations` → `write_qpdf` の
+canonical境界へ接続した。これにより `--rotate` と `--flatten-rotation` は qpdf の
+`handleRotations` → `handleTransformations` 順で同じ live documentへ適用される。
+旧 `run_rewrite_with_page_ops_opened` の direct `PdfWriter` routeはcaller closure後に
+削除した。`--pages` extractionのpost-plan rotate consumerは別の残存mixed routeとして
+維持し、今回のbounded cutoverへ混ぜていない。
+
 `--set-page-labels` / `--remove-page-labels` は、`QPDFJob_argv.cc:375-392` の
 option-table、`QPDFJob_config.cc:1101-1151` の文法・typed Config、
 `QPDFJob.cc:2196-2228` の変換責務を、`flpdf-3yn9.48.6.1` と
