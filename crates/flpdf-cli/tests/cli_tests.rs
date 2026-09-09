@@ -6395,6 +6395,48 @@ fn top_level_generate_appearances_accepts_check_like_qpdf() {
     );
 }
 
+/// `--check-linearization` is one of `doInspection`'s modes
+/// (`QPDFJob.cc:1653-1661`), and `checkConfiguration` (`QPDFJob.cc:566-641`)
+/// never looks at `generate_appearances`, so qpdf accepts the pair.
+#[test]
+fn top_level_generate_appearances_accepts_check_linearization_like_qpdf() {
+    let input = "../../tests/fixtures/compat/form-fields-and-annotations.pdf";
+    let args = ["--generate-appearances", "--check-linearization", input];
+    let qpdf = ProcessCommand::new("qpdf")
+        .args(args)
+        .output()
+        .expect("qpdf 11.9.0 must be available");
+    let flpdf = Command::cargo_bin("flpdf")
+        .unwrap()
+        .args(args)
+        .output()
+        .unwrap();
+
+    assert_eq!(flpdf.status.code(), qpdf.status.code());
+    assert_eq!(flpdf.stdout, qpdf.stdout);
+    assert_eq!(flpdf.stderr, qpdf.stderr);
+}
+
+/// `--empty` only chooses the input (`QPDFJob.cc:1716-1723`), so it does not
+/// disqualify a transformation either.
+#[test]
+fn top_level_generate_appearances_accepts_empty_input_like_qpdf() {
+    let args = ["--empty", "--show-npages", "--generate-appearances"];
+    let qpdf = ProcessCommand::new("qpdf")
+        .args(args)
+        .output()
+        .expect("qpdf 11.9.0 must be available");
+    let flpdf = Command::cargo_bin("flpdf")
+        .unwrap()
+        .args(args)
+        .output()
+        .unwrap();
+
+    assert_eq!(flpdf.status.code(), qpdf.status.code());
+    assert_eq!(flpdf.stdout, qpdf.stdout);
+    assert_eq!(flpdf.stderr, qpdf.stderr);
+}
+
 #[test]
 fn top_level_generate_appearances_conflicts_with_pages() {
     // Silent-shadow guard: the page-op dispatch branch owns the write via

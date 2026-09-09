@@ -420,13 +420,15 @@ fn top_level_generate_appearances_runs_before_show_object_like_qpdf() {
         qpdf.status.code(),
         "flpdf must accept the same inspection combination as qpdf"
     );
-    assert!(
-        flpdf
-            .stdout
-            .windows(b"/AP".len())
-            .any(|window| window == b"/AP"),
-        "flpdf must inspect the transformed widget: {}",
+    assert_eq!(
+        flpdf.stdout,
+        qpdf.stdout,
+        "flpdf must render the transformed widget exactly like qpdf: {}",
         String::from_utf8_lossy(&flpdf.stdout)
+    );
+    assert_eq!(
+        flpdf.stderr, qpdf.stderr,
+        "flpdf must preserve qpdf diagnostics for the transformed inspection"
     );
 }
 
