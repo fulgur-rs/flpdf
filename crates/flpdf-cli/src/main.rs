@@ -859,8 +859,13 @@ struct Cli {
 
     /// Run a complete qpdf job JSON file through the production QPDFJob
     /// lifecycle (qpdf `--job-json-file`).
-    #[arg(long = "job-json-file", value_name = "PATH", require_equals = true)]
-    job_json_file: Option<PathBuf>,
+    #[arg(
+        long = "job-json-file",
+        action = clap::ArgAction::Append,
+        value_name = "PATH",
+        require_equals = true
+    )]
+    job_json_file: Vec<PathBuf>,
 
     // ── JSON inspection flags ─────────────────────────────────────────────
     // These mirror qpdf's --json / --json-output / --json-key / --json-object
@@ -3247,9 +3252,9 @@ fn main() {
     // the non-inspection modes and retains its existing validation boundary.
     let result = if args.replace_input && (args.json.is_some() || args.json_output.is_some()) {
         Err(UsageError::new("--json may not be used with --replace-input").into())
-    } else if let Some(path) = args.job_json_file.as_deref() {
-        run_job_json_file(
-            path,
+    } else if !args.job_json_file.is_empty() {
+        run_job_json_files(
+            &args.job_json_file,
             args.input.as_deref(),
             args.output.as_deref(),
             args.replace_input,
@@ -3848,32 +3853,36 @@ fn create_empty_primary_document(
     Ok(pdf)
 }
 
-fn run_job_json_file(
-    path: &Path,
+fn run_job_json_files(
+    paths: &[PathBuf],
     input: Option<&Path>,
     output: Option<&Path>,
     replace_input: bool,
     password: &PasswordArgs,
     suppress_warnings: bool,
 ) -> CliResult<()> {
-    let json = std::fs::read(path)
-        .map_err(|error| error_with_file(path, Box::new(error) as Box<dyn std::error::Error>))?;
     let mut job = QPDFJob::new();
     job.set_logger(cli_logger());
     job.set_suppress_warnings(suppress_warnings);
 
-    job.initialize_from_json_partial_bytes(&json)
-        .map_err(|error| {
-            Box::new(CliExitError {
-                code: ExitCode::Errors,
-                message: format_job_json_error(path, error),
-            }) as Box<dyn std::error::Error>
+    for path in paths {
+        let json = std::fs::read(path).map_err(|error| {
+            error_with_file(path, Box::new(error) as Box<dyn std::error::Error>)
         })?;
+        job.initialize_from_json_partial_bytes(&json)
+            .map_err(|error| {
+                Box::new(CliExitError {
+                    code: ExitCode::Errors,
+                    message: format_job_json_error(path, error),
+                }) as Box<dyn std::error::Error>
+            })?;
+    }
+    let error_path = paths.last().expect("job-json-file list is non-empty");
     if let Some(input) = input {
         job.set_input_file(input.to_path_buf()).map_err(|error| {
             Box::new(CliExitError {
                 code: ExitCode::Errors,
-                message: format_job_json_error(path, error),
+                message: format_job_json_error(error_path, error),
             }) as Box<dyn std::error::Error>
         })?;
     }
@@ -3881,7 +3890,7 @@ fn run_job_json_file(
         job.set_output_file(output.to_path_buf()).map_err(|error| {
             Box::new(CliExitError {
                 code: ExitCode::Errors,
-                message: format_job_json_error(path, error),
+                message: format_job_json_error(error_path, error),
             }) as Box<dyn std::error::Error>
         })?;
     }
@@ -3889,7 +3898,7 @@ fn run_job_json_file(
         job.config().replace_input().map_err(|error| {
             Box::new(CliExitError {
                 code: ExitCode::Errors,
-                message: format_job_json_error(path, error),
+                message: format_job_json_error(error_path, error),
             }) as Box<dyn std::error::Error>
         })?;
     }
