@@ -1673,6 +1673,10 @@ impl<R: Read + Seek> ResolverHandle<R> {
         let cached = {
             let mut core = self.core.borrow_mut();
             core.source_xref_entries.remove(&object_ref);
+            if let Ok(key) = QpdfObjGen::try_from_object_ref(object_ref) {
+                // `QPDF::removeObject` erases the one row every consumer reads.
+                core.raw_source_xref_entries.remove(&key);
+            }
             core.default_xref_entries.remove(&object_ref);
             core.object_cache.get(&object_ref).cloned()
         };
@@ -2668,6 +2672,13 @@ impl<R: Read + Seek> ResolverHandle<R> {
     pub(crate) fn insert_source_xref_entry(&self, object_ref: ObjectRef, entry: XrefEntry) {
         let mut core = self.core.borrow_mut();
         core.source_xref_entries.insert(object_ref, entry);
+        // qpdf keeps one table, so a row added after open is the same row
+        // `showXRefTable` walks (`QPDF.cc:1149-1184,1213-1236`). Mirror it into
+        // the raw view, which only the parsed-boundary split makes separate
+        // here.
+        if let Ok(key) = QpdfObjGen::try_from_object_ref(object_ref) {
+            core.raw_source_xref_entries.insert(key, entry);
+        }
     }
 
     /// Test-only: install a cross-reference entry the source did not declare,
@@ -2862,7 +2873,16 @@ impl<R: Read + Seek> ResolverHandle<R> {
     /// `ObjectRef` table remains the resolution view; this parallel table is
     /// qpdf's exact `QPDFObjGen` view used by inspection.
     pub(crate) fn install_raw_xref_entries(&self, entries: BTreeMap<QpdfObjGen, XrefEntry>) {
-        self.core.borrow_mut().raw_source_xref_entries = entries;
+        let mut core = self.core.borrow_mut();
+        if core.reconstructed_xref {
+            // Same handoff as `install_source_xref_entries`: the document
+            // repaired both views in place while the loader was still
+            // resolving the trailer, so the loader's table is the stale one.
+            // qpdf rewrites `m->xref_table` in situ and resumes against it
+            // (`QPDF.cc:518-620`).
+            return;
+        }
+        core.raw_source_xref_entries = entries;
     }
 
     /// Carry the open-time reconstruction bit into the resolver that owned
