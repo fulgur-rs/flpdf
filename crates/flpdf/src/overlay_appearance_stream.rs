@@ -17,20 +17,21 @@
 //! the matching name tokens in the stream's own content so both stay
 //! internally consistent.
 //!
-//! [`crate::resource_replacer`] owns the shared content-stream token scan;
-//! this module applies its result to decoded appearance stream bytes and
-//! retains qpdf's catch-and-re-warn boundary when the document-owned scan
-//! fails.
+//! [`crate::resource_replacer`] owns the shared content-stream token scan and
+//! live token filter; this module retains qpdf's catch-and-re-warn boundary
+//! when the document-owned scan fails.
 
+use std::cell::RefCell;
 use std::io::{Read, Seek};
 use std::rc::Rc;
 
 use crate::acroform_document_helper::DrMap;
 use crate::object_handle::{ObjectHandle, ResourceConflicts};
 use crate::resource_finder::ResourceFinder;
-use crate::resource_replacer::filter_resource_names;
+use crate::resource_replacer::ResourceReplacer;
 #[cfg(test)]
-use crate::resource_replacer::replace_resource_names_with_context;
+use crate::resource_replacer::{filter_resource_names, replace_resource_names_with_context};
+#[cfg(test)]
 use crate::writer::DecodeLevel;
 use crate::{Pdf, Result};
 
@@ -42,6 +43,7 @@ fn rewrite_appearance_content(decoded: &[u8], dr_map: &DrMap) -> Vec<u8> {
     }
 }
 
+#[cfg(test)]
 fn rewrite_appearance_content_with_context(
     decoded: &[u8],
     dr_map: &DrMap,
@@ -62,39 +64,12 @@ fn rewrite_appearance_content_with_context(
     match filter_resource_names(decoded, dr_map.renames(), finder.names_by_resource_type()) {
         Ok(bytes) => Ok(bytes),
         Err(error) => {
-            // Filtering is still best effort at the existing eager
-            // decode/re-encode boundary; retain qpdf's catch-and-re-warn
-            // behavior for failures after the successful parse.
+            // The detached test-only byte helper is still best effort; retain
+            // qpdf's catch-and-re-warn behavior for failures after parsing.
             stream.warn_if_possible(&format!("Unable to parse appearance stream: {error}"))?;
             Ok(decoded.to_vec())
         }
     }
-}
-
-/// Return decoded appearance bytes only when qpdf's filter pipeline was
-/// actually installed. `pipeStreamData` writes raw bytes and reports
-/// `filtering_attempted = false` for unsupported or decode-level-gated
-/// filters; treating those bytes as decoded would make a later re-encode
-/// corrupt an image/binary appearance stream.
-fn filterable_stream_data(
-    stream: &ObjectHandle,
-    decode_level: DecodeLevel,
-) -> Result<Option<Rc<Vec<u8>>>> {
-    let mut bytes = Vec::new();
-    let mut pipeline = crate::pipeline::PlString::new("appearance stream data", None, &mut bytes);
-    let mut filtering_attempted = false;
-    let succeeded = stream.pipe_stream_data(
-        &mut pipeline,
-        &mut filtering_attempted,
-        0,
-        decode_level,
-        false,
-        false,
-    )?;
-    if !succeeded || !filtering_attempted {
-        return Ok(None);
-    }
-    Ok(Some(Rc::new(bytes)))
 }
 
 /// Privatize and rewrite an appearance stream through the canonical
@@ -198,39 +173,21 @@ pub(crate) fn adjust_appearance_stream_handle<R: Read + Seek>(
         }
     }
 
-    // The resource mutations above are already part of the document, exactly
-    // as qpdf's in-place handle edits are before its parse step. Record them
-    // before the fallible token-filter step so an escaping warning-sink
-    // failure leaves the writer with the same retained state qpdf keeps.
-
-    // qpdf's token-filter installation is best effort. Resource mutations are
-    // intentionally not rolled back when the stream cannot be decoded.
-    if let Ok(Some(decoded)) = filterable_stream_data(stream, DecodeLevel::Generalized) {
-        let rewritten = rewrite_appearance_content_with_context(&decoded, &local_dr_map, stream)?;
-        if let Ok(encoded) =
-            crate::filters::encode_stream_data_from_handle(&stream_dict, &rewritten)
-        {
-            stream.replace_stream_data(Rc::new(encoded), None, None);
-        } else {
-            // qpdf has no LZW/ASCII85/ASCIIHex encoder; its token-filtered
-            // stream is emitted under the writer's ordinary Flate route.
-            let flate_dict = ObjectHandle::dictionary(vec![(
-                b"/Filter".to_vec(),
-                ObjectHandle::name(b"FlateDecode".to_vec()),
-            )]);
-            if let Ok(encoded) =
-                crate::filters::encode_stream_data_from_handle(&flate_dict, &rewritten)
-            {
-                stream.replace_stream_data(
-                    Rc::new(encoded),
-                    Some(ObjectHandle::name(b"FlateDecode".to_vec())),
-                    Some(ObjectHandle::null()),
-                );
-            }
-        }
+    // qpdf parses the already-mutated live stream and attaches a stateful
+    // ResourceReplacer; it does not eagerly decode and re-encode appearance
+    // bytes. Warnings from parsing or filter registration are caught and
+    // re-issued through the same appearance stream.
+    let mut finder = ResourceFinder::default();
+    if let Err(error) = stream.parse_as_contents(&mut finder) {
+        stream.warn_if_possible(&format!("Unable to parse appearance stream: {error}"))?;
+        return Ok(());
     }
-
-    // The replaced stream data is the only mutation after the early marking.
+    let replacer = ResourceReplacer::new(local_dr_map.renames(), finder.names_by_resource_type());
+    if let Err(error) = stream.add_token_filter(Rc::new(RefCell::new(replacer))) {
+        // cov:ignore-start: parse success leaves a resolved stream, so qpdf's addTokenFilter failure boundary is unreachable
+        stream.warn_if_possible(&format!("Unable to parse appearance stream: {error}"))?;
+        // cov:ignore-end
+    }
     Ok(())
 }
 
@@ -261,6 +218,7 @@ mod tests {
     use crate::pipeline::{Pipeline, PipelineError, PipelineResult};
     use crate::PdfOpenOptions;
     use crate::{ObjectHandle, ObjectRef, QPDFLogger};
+    use crate::{PageDocumentHelper, PageInput, PdfWriter};
     use std::io::Cursor;
     use std::rc::Rc;
     use std::sync::{Arc, Mutex};
@@ -457,6 +415,14 @@ mod tests {
             .clone()
     }
 
+    fn filtered_stream_bytes(stream: &ObjectHandle) -> Vec<u8> {
+        stream
+            .get_stream_data(crate::writer::DecodeLevel::All)
+            .expect("appearance token filter must produce stream data")
+            .as_ref()
+            .clone()
+    }
+
     struct FailingWarningSink;
 
     impl Pipeline for FailingWarningSink {
@@ -585,7 +551,7 @@ mod tests {
         adjust_appearance_stream_via_handle(&mut pdf, ap_ref, &dr_map).unwrap();
 
         let stream = stream_handle(&mut pdf, ap_ref);
-        assert_eq!(stream_bytes(&stream), b"/F1_1 18 Tf");
+        assert_eq!(filtered_stream_bytes(&stream), b"/F1_1 18 Tf");
         let new_resources_ref = stream_dict(&stream)
             .get_ref("Resources")
             .expect("Resources should stay an indirect reference");
@@ -664,6 +630,73 @@ mod tests {
             .try_get_key(b"/F1")
             .unwrap();
         assert_eq!(original_font.object_ref(), Some(font_ref));
+    }
+
+    #[test]
+    fn canonical_adjust_appearance_stream_reaches_the_linearized_writer_filter_route() {
+        let mut pdf = Pdf::empty().expect("empty PDF should parse");
+        let stream = pdf
+            .new_stream_with_data(Rc::new(b"/F1 18 Tf".to_vec()))
+            .expect("create appearance stream");
+        stream
+            .as_stream_dict()
+            .expect("stream dictionary")
+            .replace_key(
+                b"/Resources",
+                HandleFixture::dictionary({
+                    let mut resources = HandleDictionary::new();
+                    resources.insert(
+                        "Font",
+                        HandleFixture::dictionary({
+                            let mut fonts = HandleDictionary::new();
+                            fonts.insert("F1", HandleFixture::integer(1));
+                            fonts
+                        }),
+                    );
+                    resources
+                }),
+            )
+            .expect("install appearance resources");
+        let page = HandleFixture::dictionary({
+            let mut page = HandleDictionary::new();
+            page.insert("Type", HandleFixture::name(b"Page".to_vec()));
+            page.insert(
+                "MediaBox",
+                ObjectHandle::array(vec![
+                    HandleFixture::integer(0),
+                    HandleFixture::integer(0),
+                    HandleFixture::integer(10),
+                    HandleFixture::integer(10),
+                ]),
+            );
+            page.insert("Contents", stream.clone());
+            page
+        });
+        PageDocumentHelper::new(&mut pdf)
+            .add_page(PageInput::direct(page), false)
+            .expect("add a page for linearization");
+
+        super::adjust_appearance_stream_handle(
+            &mut pdf,
+            &stream,
+            &dr_map_with(b"Font", b"F1", b"F1_1"),
+        )
+        .expect("attach the live ResourceReplacer");
+
+        let mut writer = PdfWriter::new(&mut pdf);
+        writer.set_linearization(true);
+        writer.set_compress_streams(false);
+        writer.set_decode_level(crate::writer::DecodeLevel::Generalized);
+        writer.set_static_id(true);
+        writer.set_output_memory().expect("configure memory output");
+        writer.write().expect("linearized writer should succeed");
+        let output = writer.get_buffer().expect("take linearized output");
+        assert!(
+            output
+                .windows(b"/F1 18 Tfendstream".len())
+                .any(|window| window == b"/F1 18 Tfendstream"),
+            "linearized output must preserve qpdf's stateful-filter result"
+        );
     }
 
     #[test]
@@ -881,7 +914,7 @@ mod tests {
         .expect("a successful re-warning keeps the appearance adjustment non-fatal");
 
         assert_eq!(
-            stream_bytes(&stream_handle(&mut pdf, ap_ref)),
+            filtered_stream_bytes(&stream_handle(&mut pdf, ap_ref)),
             b"/F1_1 18 Tf ["
         );
         let warning_bytes = warnings.lock().expect("appearance warning trace lock");
@@ -989,40 +1022,6 @@ mod tests {
     }
 
     #[test]
-    fn canonical_adjust_appearance_stream_falls_back_from_lzw_to_flate() {
-        let mut pdf = open_minimal();
-        let mut font_dict = HandleDictionary::new();
-        font_dict.insert("F1", HandleFixture::integer(1));
-        let mut resources = HandleDictionary::new();
-        resources.insert("Font", HandleFixture::dictionary(font_dict));
-        let ap_ref = set_stream(
-            &mut pdf,
-            4,
-            &[
-                ("Resources", HandleFixture::dictionary(resources)),
-                ("Filter", HandleFixture::name(b"LZWDecode".to_vec())),
-            ],
-            &pack_lzw_9bit_literal(b"/F1 18 Tf"),
-        );
-        let dr_map = dr_map_with(b"Font", b"F1", b"F1_1");
-        let ap = pdf.get_object_handle(ap_ref);
-        pdf.resolve(&ap).unwrap();
-
-        super::adjust_appearance_stream_handle(&mut pdf, &ap, &dr_map).unwrap();
-
-        let stream_dict = ap.as_stream_dict().unwrap();
-        assert_eq!(
-            stream_dict.try_get_key(b"/Filter").unwrap().as_name(),
-            Some(b"FlateDecode".to_vec())
-        );
-        assert!(stream_dict.try_get_key(b"/DecodeParms").unwrap().is_null());
-        let decoded = ap
-            .get_stream_data(crate::writer::DecodeLevel::Generalized)
-            .unwrap();
-        assert_eq!(decoded.as_slice(), b"/F1_1 18 Tf");
-    }
-
-    #[test]
     fn adjust_appearance_stream_incomplete_inline_image_keeps_resources_and_prefix_consistent() {
         let mut pdf = open_minimal();
         let font_ref = ObjectRef::new(5, 0);
@@ -1043,7 +1042,7 @@ mod tests {
         adjust_appearance_stream_via_handle(&mut pdf, ap_ref, &dr_map).unwrap();
 
         let stream = stream_handle(&mut pdf, ap_ref);
-        assert_eq!(stream_bytes(&stream), b"/F1_1 12 Tf BI ID ");
+        assert_eq!(filtered_stream_bytes(&stream), b"/F1_1 12 Tf BI ID ");
         let font = stream_dict(&stream)
             .get("Resources")
             .and_then(handle_dictionary)
@@ -1075,7 +1074,7 @@ mod tests {
         adjust_appearance_stream_via_handle(&mut pdf, ap_ref, &dr_map).unwrap();
 
         let stream = stream_handle(&mut pdf, ap_ref);
-        assert_eq!(stream_bytes(&stream), b"/F1_1 18 Tf");
+        assert_eq!(filtered_stream_bytes(&stream), b"/F1_1 18 Tf");
         let resources = stream_dict(&stream)
             .get("Resources")
             .and_then(handle_dictionary)
@@ -1155,7 +1154,7 @@ mod tests {
         adjust_appearance_stream_via_handle(&mut pdf, ap_ref, &dr_map).unwrap();
 
         let stream = stream_handle(&mut pdf, ap_ref);
-        assert_eq!(stream_bytes(&stream), b"/F1_1 18 Tf");
+        assert_eq!(filtered_stream_bytes(&stream), b"/F1_1 18 Tf");
         let resources = stream_dict(&stream)
             .get("Resources")
             .and_then(handle_dictionary)
@@ -1207,7 +1206,7 @@ mod tests {
         adjust_appearance_stream_via_handle(&mut pdf, ap_ref, &dr_map).unwrap();
 
         let stream = stream_handle(&mut pdf, ap_ref);
-        assert_eq!(stream_bytes(&stream), b"/F1_1 18 Tf /F1_1_1 18 Tf");
+        assert_eq!(filtered_stream_bytes(&stream), b"/F1_1 18 Tf /F1_1_1 18 Tf");
         let resources = stream_dict(&stream)
             .get("Resources")
             .and_then(handle_dictionary)
@@ -1260,7 +1259,7 @@ mod tests {
 
         let stream = stream_handle(&mut pdf, ap_ref);
         assert_eq!(
-            stream_bytes(&stream),
+            filtered_stream_bytes(&stream),
             b"/F1_1 18 Tf /F1_1_1 18 Tf /F2_1 18 Tf /F2_1_1 18 Tf"
         );
         let resources = stream_dict(&stream)
@@ -1306,7 +1305,7 @@ mod tests {
         // `/F1` is renamed to `/F1_1`; the second `/F1_1` token is untouched
         // (no local rename was ever recorded for it), so both tokens end up
         // saying `/F1_1`.
-        assert_eq!(stream_bytes(&stream), b"/F1_1 18 Tf /F1_1 18 Tf");
+        assert_eq!(filtered_stream_bytes(&stream), b"/F1_1 18 Tf /F1_1 18 Tf");
         let resources = stream_dict(&stream)
             .get("Resources")
             .and_then(handle_dictionary)
@@ -1451,7 +1450,7 @@ mod tests {
         // they were decoded content would corrupt the image. This is
         // distinct from the CCITTFaxDecode tests above, which exercise
         // is_specialized_compression only; DCTDecode's is_lossy_compression
-        // flag is the specific signal filterable_stream_data must also
+        // flag is the specific signal qpdf's filterability gate must also
         // honor (crate::object_handle's pipe_stream_data_inner gates lossy
         // filters at `decode_level < DecodeLevel::All`, a stricter bound
         // than specialized filters' `< DecodeLevel::Specialized`).
@@ -1557,7 +1556,7 @@ mod tests {
         adjust_appearance_stream_via_handle(&mut pdf, ap_ref, &dr_map).unwrap();
 
         let stream = stream_handle(&mut pdf, ap_ref);
-        assert_eq!(stream_bytes(&stream), b"/F1_1 18 Tf /F1_1_1 18 Tf");
+        assert_eq!(filtered_stream_bytes(&stream), b"/F1_1 18 Tf /F1_1_1 18 Tf");
         let resources = stream_dict(&stream)
             .get("Resources")
             .and_then(handle_dictionary)
@@ -1620,7 +1619,7 @@ mod tests {
 
         let stream = stream_handle(&mut pdf, ap_ref);
         assert_eq!(
-            stream_bytes(&stream),
+            filtered_stream_bytes(&stream),
             b"/F2 18 Tf /F1 18 Tf",
             "F3 (now under F2) rewrites to /F2; the original /F2 token must \
              follow its displaced value to wherever it actually ended up (F1), \
@@ -1664,7 +1663,7 @@ mod tests {
         // `..._double_conflict_mints_fresh_local_name`, still mints two
         // separate aliases for two conflicts that are BOTH genuine — that
         // qpdf behavior is unchanged by this fix). This test isolates the
-        // one case the eager snapshot missed: reuse sourced from an
+        // one case the earlier decoded snapshot missed: reuse sourced from an
         // in-loop verbatim reinstate.
         //
         // Chain (three rename entries under Font, sorted by old_key so
@@ -1683,7 +1682,7 @@ mod tests {
         // The second pass processes merge_with in key order: "F1_1" < "F4".
         //   F1_1: vacated (subdict has no F1_1) -> reinstated verbatim,
         //         subdict["F1_1"] = shared_ref. THIS is the in-loop
-        //         mutation the eager snapshot could not see.
+        //         mutation the earlier decoded snapshot could not see.
         //   F4:   occupied (by other_ref) -> genuine conflict, the FIRST
         //         one this loop hits. The lazily-built snapshot now
         //         includes the just-reinstated F1_1 -> shared_ref, so F4's
@@ -1726,7 +1725,7 @@ mod tests {
 
         let stream = stream_handle(&mut pdf, ap_ref);
         assert_eq!(
-            stream_bytes(&stream),
+            filtered_stream_bytes(&stream),
             b"/F1_1 12 Tf",
             "the /F4 token must follow shared_ref to wherever it actually \
              ended up (F1_1, reused from the in-loop reinstate), not a \
@@ -1807,7 +1806,7 @@ mod tests {
 
         let stream = stream_handle(&mut pdf, ap_ref);
         assert_eq!(
-            stream_bytes(&stream),
+            filtered_stream_bytes(&stream),
             b"/C_1 12 Tf",
             "the later fresh conflict must use the pool captured by the first conflict"
         );
@@ -1888,7 +1887,7 @@ mod tests {
 
         let stream = stream_handle(&mut pdf, ap_ref);
         assert_eq!(
-            stream_bytes(&stream),
+            filtered_stream_bytes(&stream),
             b"/F1_1 18 Tf",
             "the rename must actually apply to the stream content"
         );
@@ -1945,7 +1944,7 @@ mod tests {
         .unwrap();
 
         let stream = stream_handle(&mut pdf, ap_ref);
-        assert_eq!(stream_bytes(&stream), b"/F1_1 18 Tf");
+        assert_eq!(filtered_stream_bytes(&stream), b"/F1_1 18 Tf");
         let resources = stream_dict(&stream)
             .get("Resources")
             .and_then(handle_dictionary)
@@ -1988,15 +1987,10 @@ mod tests {
     }
 
     #[test]
-    fn adjust_appearance_stream_lzw_reencode_failure_falls_back_to_flate() {
-        // `/LZWDecode` is the one filter flpdf can decode but not re-encode;
-        // unlike the CCITT test above, this stream's own
-        // /Resources/Font DOES have "F1", so dr_map's F1->F1_1 rename is a
-        // REAL rename, not a no-op. Before this fix, the /Resources rename
-        // still applied but the content-rewrite step silently discarded the
-        // token-replaced bytes on re-encode failure, leaving the content on
-        // the stale "/F1" name while /Resources only had "F1_1" — an
-        // inconsistent stream. This asserts the two stay consistent.
+    fn adjust_appearance_stream_lzw_keeps_the_source_filter_and_attaches_a_filter() {
+        // qpdf attaches ResourceReplacer to the live LZW stream. The source
+        // filter and encoded bytes remain untouched; when a full decode pipe
+        // is requested, the attached token filter rewrites the decoded name.
         let mut pdf = open_minimal();
         let mut font_dict = HandleDictionary::new();
         font_dict.insert("F1", HandleFixture::integer(1));
@@ -2031,34 +2025,32 @@ mod tests {
         );
         assert!(font.get("F1").is_none());
 
-        // The content must agree: re-encoded as FlateDecode (flpdf cannot
-        // re-encode LZW), with the resource token renamed to match.
         assert_eq!(
             stream_dict(&stream)
                 .get("Filter")
                 .and_then(|value| value.as_name()),
-            Some(b"FlateDecode".to_vec()),
-            "un-re-encodable /LZWDecode must fall back to /FlateDecode"
+            Some(b"LZWDecode".to_vec()),
+            "qpdf keeps the source filter when only a token filter is attached"
         );
         assert!(
             stream_dict(&stream).get("DecodeParms").is_none(),
-            "stale LZW /DecodeParms must not survive the filter swap"
+            "the source stream's absent DecodeParms entry must remain absent"
         );
+        assert_eq!(stream_bytes(&stream), lzw_bytes);
         let decoded_content = stream
-            .get_stream_data(crate::writer::DecodeLevel::Generalized)
+            .get_stream_data(crate::writer::DecodeLevel::All)
             .unwrap();
         assert_eq!(
             decoded_content.as_slice(),
             b"/F1_1 18 Tf",
             "content must reference the RENAMED name, consistent with /Resources"
         );
-        let expected_length = i64::try_from(stream_bytes(&stream).len()).unwrap();
         assert_eq!(
             stream_dict(&stream)
                 .get("Length")
                 .and_then(|value| value.as_integer()),
-            Some(expected_length),
-            "/Length must match the newly re-encoded bytes"
+            None,
+            "/Length must remain absent until the writer emits the filtered stream"
         );
     }
 }

@@ -16,8 +16,11 @@ use crate::content_stream::{
 use crate::object_handle::DocumentResolver;
 use crate::object_handle::ObjectHandle;
 use crate::pipeline::buffer::Buffer;
+#[cfg(test)]
 use crate::pipeline::qpdf_tokenizer::QpdfTokenizer;
-use crate::pipeline::{Pipeline, PipelineError, PipelineResult};
+#[cfg(test)]
+use crate::pipeline::Pipeline;
+use crate::pipeline::{PipelineError, PipelineResult};
 #[cfg(test)]
 use crate::resource_finder::ResourceFinder;
 use crate::resource_finder::ResourceNamesByType;
@@ -168,6 +171,7 @@ pub(crate) fn filter_resource_names_from_stream(
 /// Parsing and warning delivery are intentionally separate: callers that own
 /// a qpdf stream parse it first, then use the decoded bytes here when their
 /// surrounding filter pipeline needs a different decode level.
+#[cfg(test)]
 pub(crate) fn filter_resource_names(
     input: &[u8],
     renames: &ResourceRenames,
