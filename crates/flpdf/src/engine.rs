@@ -193,11 +193,17 @@ impl<R: Read + Seek> Pdf<R> {
     ///
     /// # Errors
     ///
-    /// - [`Error::Io`] / [`Error::Parse`] / [`Error::Missing`] when loading the
-    ///   cross-reference table and trailer fails (e.g. an unreadable stream, a
-    ///   malformed xref, or a cross-reference stream missing its `/Size` or `/W`
-    ///   entry). With `options.repair` set, the qpdf-style recovery pass runs
-    ///   first and only its residual failures surface.
+    /// - [`Error::QpdfExc`] when the cross-reference table or trailer is
+    ///   malformed. The exception carries qpdf's filename, object description,
+    ///   offset and message.
+    /// - [`Error::Io`] / [`Error::Missing`] for the remaining load failures
+    ///   (an unreadable stream, or a cross-reference stream missing its
+    ///   `/Size` or `/W` entry).
+    /// - [`Error::OpenFailure`] wrapping any of the above when diagnostics
+    ///   were collected before the failure, including with `repair` unset.
+    ///   Use [`Error::open_failure`] to reach both the terminal error and
+    ///   those diagnostics. With `options.repair` set, the qpdf-style recovery
+    ///   pass runs first and only its residual failures surface.
     /// - [`Error::Unsupported`] when a cross-reference stream uses an unsupported
     ///   entry type or `/W` field-width layout.
     /// - [`Error::Encrypted`] when the document carries an `/Encrypt` dictionary
