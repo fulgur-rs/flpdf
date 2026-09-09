@@ -8,6 +8,7 @@ use crate::encryption::standard::ObjectKeyAlg;
 use crate::encryption::CopyEncryptionSource;
 use crate::error::EncryptedError;
 use crate::object_handle::DocumentResolver;
+use crate::qpdf_obj_gen::QpdfObjGen;
 use crate::{Diagnostics, Error, ObjectHandle, ObjectRef, QpdfExc, Result, XrefEntry, XrefForm};
 use std::any::Any;
 use std::cell::RefCell;
@@ -887,6 +888,12 @@ impl<R: Read + Seek> Pdf<R> {
     /// expose that source row.
     pub fn get_xref_table(&self) -> BTreeMap<ObjectRef, XrefEntry> {
         self.resolver.xref_entries()
+    }
+
+    /// Return qpdf's raw cross-reference table, preserving signed
+    /// object/generation identity before the valid `ObjectRef` boundary.
+    pub(crate) fn get_raw_xref_table(&self) -> BTreeMap<QpdfObjGen, XrefEntry> {
+        self.resolver.raw_xref_entries()
     }
 
     /// Return object references from qpdf's one canonical object cache without
