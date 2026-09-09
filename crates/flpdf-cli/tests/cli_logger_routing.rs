@@ -370,6 +370,30 @@ fn qpdf_differential_matches_file_write_error_swallowing() {
     );
 }
 
+#[cfg(target_os = "linux")]
+#[test]
+fn large_file_write_error_does_not_name_the_input_path() {
+    if !Path::new("/dev/full").exists() || !qpdf_available() {
+        eprintln!("skipping /dev/full output-sink differential");
+        return;
+    }
+
+    // qpdf names the sink pipeline rather than any file:
+    // `QPDFWriter::setOutputFile` wraps the handle in
+    // `Pl_StdioFile("qpdf output", file)` (`QPDFWriter.cc:101-110`), and the
+    // failure carries that identifier (`Pl_StdioFile.cc:25-37`). Compare the
+    // whole observable against the real binary instead of pinning the wording.
+    let args = [LARGE_LINEARIZED, "/dev/full"];
+    let qpdf = run_qpdf(&args);
+    let flpdf = run_flpdf(&args);
+    assert_eq!(qpdf.status.code(), Some(2), "qpdf status");
+    assert_observables_equal("linearized file output", &qpdf, &flpdf, true);
+    assert!(
+        !String::from_utf8_lossy(&flpdf.stderr).contains(LARGE_LINEARIZED),
+        "the input path must not appear in an output-sink failure"
+    );
+}
+
 #[test]
 fn binary_qdf_dash_uses_the_same_save_route() {
     let output = flpdf().args(["qdf", MINIMAL, "-"]).output().unwrap();

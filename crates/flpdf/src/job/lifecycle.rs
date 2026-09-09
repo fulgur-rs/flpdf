@@ -4233,6 +4233,10 @@ impl QPDFJob {
                 rendered.extend_from_slice(b": invalid password");
                 rendered
             }
+            // An output-sink failure never reaches this arm: the writer's file
+            // sink reports itself as qpdf's `qpdf output` pipeline
+            // (`QPDFWriter.cc:101-110`), so a bare `Error::Io` here comes from
+            // the input side and keeps the input name qpdf prints for it.
             Error::Io(error) if !self.input_name_bytes.is_empty() => {
                 let mut rendered = self.input_name_bytes.clone();
                 rendered.extend_from_slice(b": ");
@@ -4693,7 +4697,7 @@ impl QPDFJob {
 /// otherwise exposes the native `The system cannot find...` text. Keep the
 /// existing native fallback for error kinds that qpdf does not normalize here,
 /// while removing Rust's numeric suffix from both forms.
-fn qpdf_file_io_source_message(source: &std::io::Error) -> String {
+pub(crate) fn qpdf_file_io_source_message(source: &std::io::Error) -> String {
     let message = match source.kind() {
         std::io::ErrorKind::NotFound => Some("No such file or directory"),
         std::io::ErrorKind::PermissionDenied => Some("Permission denied"),

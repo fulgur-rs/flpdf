@@ -64,6 +64,10 @@ use std::rc::Rc;
 /// result (`QPDFWriter.cc:2187-2212`). Keep the 4096-byte boundary and the
 /// final non-EBADF error swallowing for the owned file-output route while
 /// leaving arbitrary caller-provided writers strict.
+/// The pipeline name qpdf gives every output file sink
+/// (`QPDFWriter.cc:101-110`).
+const QPDF_OUTPUT_PIPELINE: &str = "qpdf output";
+
 struct QpdfFileWriter {
     output: BufWriter<File>,
 }
@@ -97,8 +101,33 @@ impl Write for QpdfFileWriter {
 
 enum WriterOutput {
     Memory(Option<Vec<u8>>),
-    Writer(Box<dyn Write>),
+    /// A `Write` sink, optionally carrying the pipeline identifier qpdf gives
+    /// its own file output.
+    ///
+    /// `QPDFWriter::setOutputFile` wraps the `FILE*` in
+    /// `Pl_StdioFile("qpdf output", file)` (`QPDFWriter.cc:101-110`) for both
+    /// a named file and standard output, so a failed write reports that
+    /// pipeline rather than any filename (`Pl_StdioFile.cc:25-37`). Sinks with
+    /// no qpdf counterpart carry `None` and keep the bare I/O error.
+    Writer {
+        identifier: Option<&'static str>,
+        writer: Box<dyn Write>,
+    },
     Pipeline(Box<dyn Pipeline>),
+}
+
+/// Build the failure qpdf's `Pl_StdioFile` raises for a sink write
+/// (`Pl_StdioFile.cc:25-37`), or `None` for a sink qpdf does not name.
+fn stdio_sink_failure(identifier: Option<&'static str>, source: &io::Error) -> Option<Error> {
+    identifier.map(|identifier| {
+        Error::SystemBytes(
+            format!(
+                "{identifier}: Pl_StdioFile::write: {}",
+                crate::job::qpdf_file_io_source_message(source)
+            )
+            .into_bytes(),
+        )
+    })
 }
 
 struct WriterOutputSink<'a> {
@@ -117,7 +146,7 @@ impl<'a> WriterOutputSink<'a> {
     fn finish_output(&mut self) -> Result<()> {
         self.flush()?;
         match self.output {
-            WriterOutput::Memory(_) | WriterOutput::Writer(_) => Ok(()),
+            WriterOutput::Memory(_) | WriterOutput::Writer { .. } => Ok(()),
             WriterOutput::Pipeline(pipeline) => {
                 pipeline.finish()?;
                 Ok(())
@@ -137,7 +166,13 @@ impl Write for WriterOutputSink<'_> {
                 buffer.get_or_insert_with(Vec::new).extend_from_slice(bytes);
                 Ok(bytes.len())
             }
-            WriterOutput::Writer(writer) => writer.write(bytes),
+            WriterOutput::Writer { identifier, writer } => match writer.write(bytes) {
+                Ok(count) => Ok(count),
+                Err(error) => {
+                    self.failure = stdio_sink_failure(*identifier, &error);
+                    Err(error)
+                }
+            },
             WriterOutput::Pipeline(pipeline) => match pipeline.write(bytes) {
                 Ok(()) => Ok(bytes.len()),
                 Err(error) => {
@@ -153,7 +188,13 @@ impl Write for WriterOutputSink<'_> {
     fn flush(&mut self) -> std::io::Result<()> {
         match self.output {
             WriterOutput::Memory(_) | WriterOutput::Pipeline(_) => Ok(()),
-            WriterOutput::Writer(writer) => writer.flush(),
+            WriterOutput::Writer { identifier, writer } => match writer.flush() {
+                Ok(()) => Ok(()),
+                Err(error) => {
+                    self.failure = stdio_sink_failure(*identifier, &error);
+                    Err(error)
+                }
+            },
         }
     }
 }
@@ -165,10 +206,17 @@ impl WriterOutput {
                 *buffer = Some(bytes);
                 Ok(())
             }
-            Self::Writer(writer) => {
-                writer.write_all(&bytes)?;
-                writer.flush()?;
-                Ok(())
+            Self::Writer { identifier, writer } => {
+                let mut written = writer.write_all(&bytes);
+                if written.is_ok() {
+                    written = writer.flush();
+                }
+                match written {
+                    Ok(()) => Ok(()),
+                    Err(error) => {
+                        Err(stdio_sink_failure(*identifier, &error).unwrap_or(Error::Io(error)))
+                    }
+                }
             }
             Self::Pipeline(pipeline) => {
                 pipeline.write(&bytes)?;
@@ -183,7 +231,7 @@ impl WriterOutput {
             Self::Memory(buffer) => buffer.take().ok_or_else(|| {
                 Error::Unsupported("get_buffer is only available once after a memory write".into())
             }),
-            Self::Writer(_) | Self::Pipeline(_) => Err(Error::Unsupported(
+            Self::Writer { .. } | Self::Pipeline(_) => Err(Error::Unsupported(
                 "get_buffer requires a successful memory output".into(),
             )),
         }
@@ -512,14 +560,20 @@ impl<'pdf, R: Read + Seek + 'static> PdfWriter<'pdf, R> {
             .truncate(true)
             .open(path)
             .map_err(|error| Error::file_io("open", path.to_path_buf(), error))?;
-        self.output = Some(WriterOutput::Writer(Box::new(QpdfFileWriter::new(file))));
+        self.output = Some(WriterOutput::Writer {
+            identifier: Some(QPDF_OUTPUT_PIPELINE),
+            writer: Box::new(QpdfFileWriter::new(file)),
+        });
         Ok(())
     }
 
     /// Configure an owned arbitrary writer sink.
     pub fn set_output_writer<W: Write + 'static>(&mut self, writer: W) -> Result<()> {
         self.ensure_output_unconfigured()?;
-        self.output = Some(WriterOutput::Writer(Box::new(writer)));
+        self.output = Some(WriterOutput::Writer {
+            identifier: None,
+            writer: Box::new(writer),
+        });
         Ok(())
     }
 
@@ -809,7 +863,9 @@ impl<'pdf, R: Read + Seek + 'static> PdfWriter<'pdf, R> {
                 setup,
             ) {
                 Ok(result) => {
-                    sink.finish_output()?;
+                    if let Err(error) = sink.finish_output() {
+                        return Err(sink.take_failure().unwrap_or(error));
+                    }
                     result
                 }
                 Err(error) => return Err(sink.take_failure().unwrap_or(error)),
