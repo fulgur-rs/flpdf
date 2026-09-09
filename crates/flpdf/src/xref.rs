@@ -4471,8 +4471,22 @@ fn parse_xref_table(
     ))
 }
 
+/// `QUtil::is_space` (`include/qpdf/QUtil.hh:497-501`). NUL is deliberately
+/// absent: `parse_xrefEntry` relies on `is_space('\0')` being false to stop at
+/// the end of its buffer (`QPDF.cc:775-782`).
 fn is_pdf_space(byte: u8) -> bool {
-    matches!(byte, b'\0' | b'\t' | b'\n' | b'\x0c' | b'\r' | b' ')
+    matches!(byte, b'\t' | b'\n' | b'\x0b' | b'\x0c' | b'\r' | b' ')
+}
+
+/// The tokenizer's `is_delimiter` (`libqpdf/QPDFTokenizer.cc:16-23`), which is
+/// what ends a keyword. `readToken(...).isWord("trailer")` (`QPDF.cc:889`)
+/// therefore accepts `trailer<<` as readily as `trailer\n<<`.
+fn is_pdf_delimiter(byte: u8) -> bool {
+    is_pdf_space(byte)
+        || matches!(
+            byte,
+            b'/' | b'(' | b')' | b'{' | b'}' | b'<' | b'>' | b'[' | b']' | b'%' | b'\0'
+        )
 }
 
 fn parse_xref_first_line(line: &[u8]) -> Option<(u32, u32)> {
@@ -5323,7 +5337,7 @@ impl<'a> ByteCursor<'a> {
             && self
                 .bytes
                 .get(self.pos + word.len())
-                .is_none_or(|byte| is_pdf_space(*byte))
+                .is_none_or(|byte| is_pdf_delimiter(*byte))
     }
 
     fn read_be_u64(&mut self, width: usize) -> Result<u64> {
@@ -6902,6 +6916,59 @@ mod final_handle_tests {
             load_xref_state_from_bytes(&bytes, XrefLoadOptions::default(), Some(resolver.as_ref()))
                 .expect_err("an overflowing trailer integer must fail the canonical parser");
         assert!(matches!(error, Error::Parse { message, .. } if message == "invalid integer"));
+    }
+
+    #[test]
+    fn a_trailer_keyword_ends_at_any_delimiter() {
+        // `readToken(m->file).isWord("trailer")` (`QPDF.cc:889`) ends the
+        // keyword at any delimiter (`QPDFTokenizer.cc:16-23`), so `trailer<<`
+        // is as valid as `trailer\n<<`. Requiring whitespace here sent the
+        // line to the section-header parser instead, and qpdf reads
+        // `resurrect-missing-page-arr.pdf` -- which is written that way --
+        // without a single warning.
+        for separator in ["", " ", "\n", "\r\n", "\t"] {
+            let mut bytes = b"%PDF-1.4\n1 0 obj\n<< /Type /Catalog >>\nendobj\n".to_vec();
+            let xref = bytes.len();
+            bytes.extend_from_slice(b"xref\n0 2\n0000000000 65535 f \n0000000009 00000 n \n");
+            bytes.extend_from_slice(
+                format!("trailer{separator}<< /Size 2 /Root 1 0 R >>\nstartxref\n{xref}\n%%EOF\n")
+                    .as_bytes(),
+            );
+
+            let state = load_xref_state_with_options(
+                &mut std::io::Cursor::new(bytes),
+                XrefLoadOptions::default(),
+            )
+            .unwrap_or_else(|error| panic!("separator {separator:?} must parse: {error:?}"));
+            assert!(
+                state.loaded.repair_diagnostics.entries().is_empty(),
+                "separator {separator:?} must not trigger recovery: {:?}",
+                state.loaded.repair_diagnostics.entries()
+            );
+        }
+    }
+
+    #[test]
+    fn a_vertical_tab_separates_classic_xref_fields() {
+        // `QUtil::is_space` counts `\v` (`include/qpdf/QUtil.hh:497-501`), and
+        // `parse_xrefEntry` skips fields with it like any other space.
+        let mut bytes = b"%PDF-1.4\n1 0 obj\n<< /Type /Catalog >>\nendobj\n".to_vec();
+        let xref = bytes.len();
+        bytes.extend_from_slice(b"xref\n0 2\n0000000000\x0b65535\x0bf \n0000000009 00000 n \n");
+        bytes.extend_from_slice(
+            format!("trailer\n<< /Size 2 /Root 1 0 R >>\nstartxref\n{xref}\n%%EOF\n").as_bytes(),
+        );
+
+        let state = load_xref_state_with_options(
+            &mut std::io::Cursor::new(bytes),
+            XrefLoadOptions::default(),
+        )
+        .expect("a vertical tab is a space to qpdf");
+        assert!(
+            state.loaded.repair_diagnostics.entries().is_empty(),
+            "{:?}",
+            state.loaded.repair_diagnostics.entries()
+        );
     }
 
     #[test]
