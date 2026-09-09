@@ -460,7 +460,10 @@ fn value_as_int_i64(handle: &ObjectHandle, out: &mut i64) -> bool {
 // getIntValueAsInt's clamp (`:526-543`). Use the canonical ObjectHandle
 // accessor so qpdf's contextless clamp warnings reach the default logger.
 fn value_as_int_i32(handle: &ObjectHandle, out: &mut i32) -> flpdf::Result<bool> {
-    if handle.as_integer().is_none() {
+    // qpdf's guard is `isInteger()`, which dereferences
+    // (`libqpdf/QPDFObjectHandle.cc:359-362` via `dereference()`), so an
+    // indirect integer succeeds and clamps rather than reporting failure.
+    if !handle.try_is_integer()? {
         return Ok(false);
     }
     *out = handle.try_get_int_value_as_int()?;
@@ -471,7 +474,10 @@ fn value_as_int_i32(handle: &ObjectHandle, out: &mut i32) -> flpdf::Result<bool>
 // deferring to getUIntValue (`:555-567`). Use the canonical accessor so the
 // negative-to-zero warning is emitted by ObjectHandle::warn_if_possible.
 fn value_as_uint_u64(handle: &ObjectHandle, out: &mut u64) -> flpdf::Result<bool> {
-    if handle.as_integer().is_none() {
+    // qpdf's guard is `isInteger()`, which dereferences
+    // (`libqpdf/QPDFObjectHandle.cc:359-362` via `dereference()`), so an
+    // indirect integer succeeds and clamps rather than reporting failure.
+    if !handle.try_is_integer()? {
         return Ok(false);
     }
     *out = handle.try_get_uint_value()?;
@@ -483,7 +489,10 @@ fn value_as_uint_u64(handle: &ObjectHandle, out: &mut u64) -> flpdf::Result<bool
 // clamps to 0, and a value above `UINT_MAX` clamps to `UINT_MAX`. Use the
 // canonical accessor so both clamp warnings retain qpdf's call order.
 fn value_as_uint_u32(handle: &ObjectHandle, out: &mut u32) -> flpdf::Result<bool> {
-    if handle.as_integer().is_none() {
+    // qpdf's guard is `isInteger()`, which dereferences
+    // (`libqpdf/QPDFObjectHandle.cc:359-362` via `dereference()`), so an
+    // indirect integer succeeds and clamps rather than reporting failure.
+    if !handle.try_is_integer()? {
         return Ok(false);
     }
     *out = handle.try_get_uint_value_as_uint()?;
