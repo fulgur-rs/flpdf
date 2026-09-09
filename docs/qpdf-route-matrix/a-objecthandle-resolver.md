@@ -562,6 +562,24 @@ through `try_dereference`, `try_get_key`, `try_has_key`,
 than through a caller-side `Pdf::resolve` or panic accessor. The remaining
 qtest exception and unrelated writer/CLI/stream caller counts are intentionally
 not included in this bounded slice.
+### 2026-09-10 current caller audit: AcroForm field-prune bounded cutover
+
+`flpdf-3yn9.48.23.12` migrated the non-qtest production callers in
+`crates/flpdf/src/job/acroform_field_prune.rs`. Before the cutover the fresh
+tracker measured 12 `Pdf::resolve` callers in that file; after the cutover the
+scoped production counts are zero for `resolve`, `resolve_handle`,
+`resolve_handle_ref`, non-resolving `as_dictionary`/`as_array`/`as_name`/
+`is_null`, and panic `get_key`/`has_key`. The route contract is
+`crates/flpdf/tests/acroform_field_prune_route_contract_tests.rs`.
+
+The qpdf source boundary is `libqpdf/QPDFJob.cc:2585-2645` and
+`libqpdf/QPDFAcroFormDocumentHelper.cc:235-365`: page selection snapshots
+original page membership, retains fields associated with selected widgets, and
+resolves field-tree children through qpdf's handle accessors. The common lazy
+and warning/error boundary is
+`libqpdf/QPDFObjectHandle.cc:240-446,965-989,2168-2189`. The remaining qtest
+exception and unrelated writer/CLI/stream caller counts are intentionally not
+included in this bounded slice.
 
 ## 2026-09-06 再監査の issue 対応
 
