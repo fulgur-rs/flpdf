@@ -11,21 +11,47 @@ fn page_refs_returns_pages_in_document_order() {
     assert_eq!(pages, vec![ObjectRef::new(3, 0), ObjectRef::new(6, 0)]);
 }
 
+const EXPECTED_QPDF_VERSION: &str = "qpdf version 11.9.0";
+
+/// `true` when the pinned qpdf oracle is runnable, mirroring
+/// `tests/linearization_deep_nesting_tests.rs`: the live oracle is required on
+/// CI but optional on a developer or packaging host.
+fn qpdf_available() -> bool {
+    Command::new("qpdf")
+        .arg("--version")
+        .output()
+        .map(|output| {
+            output.status.success()
+                && String::from_utf8_lossy(&output.stdout)
+                    .lines()
+                    .next()
+                    .is_some_and(|line| line.trim() == EXPECTED_QPDF_VERSION)
+        })
+        .unwrap_or(false)
+}
+
 #[test]
 fn page_refs_accepts_a_120_level_tree_like_qpdf() {
     let bytes = deep_nested_pages_pdf(120);
-    let temp = tempfile::tempdir().unwrap();
-    let input = temp.path().join("deep-pages.pdf");
-    std::fs::write(&input, &bytes).unwrap();
-    let qpdf = Command::new("qpdf")
-        .args(["--check"])
-        .arg(&input)
-        .output()
-        .expect("qpdf 11.9.0 must be available");
-    assert!(
-        qpdf.status.success(),
-        "qpdf rejected deep page tree: {qpdf:?}"
-    );
+    if !qpdf_available() {
+        if std::env::var_os("CI").is_some() {
+            panic!("{EXPECTED_QPDF_VERSION} is required for this parity test on CI");
+        }
+        eprintln!("skipping oracle comparison: {EXPECTED_QPDF_VERSION} is not available");
+    } else {
+        let temp = tempfile::tempdir().unwrap();
+        let input = temp.path().join("deep-pages.pdf");
+        std::fs::write(&input, &bytes).unwrap();
+        let qpdf = Command::new("qpdf")
+            .args(["--check"])
+            .arg(&input)
+            .output()
+            .expect("invoking qpdf");
+        assert!(
+            qpdf.status.success(),
+            "qpdf rejected deep page tree: {qpdf:?}"
+        );
+    }
 
     let mut pdf = Pdf::open(Cursor::new(bytes)).unwrap();
     let pages = pages::page_refs(&mut pdf).unwrap();

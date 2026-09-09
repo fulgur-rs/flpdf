@@ -75,8 +75,8 @@
 
 use crate::object_handle::ObjectHandleIdentity;
 use crate::pages::{
-    repair::{prepare_for_optimization_with_max_depth, PageTreeRoot},
-    resolve_inherited_handle_with_max_depth, DEFAULT_MAX_PAGE_TREE_DEPTH,
+    repair::{prepare_for_optimization, prepare_for_optimization_with_max_depth, PageTreeRoot},
+    resolve_inherited_handle_with_max_depth,
 };
 use crate::{Error, ObjectHandle, ObjectRef, Pdf, Result};
 use std::collections::{BTreeMap, BTreeSet, HashSet};
@@ -383,7 +383,10 @@ pub fn rebuild_page_tree<R: Read + Seek>(
     pdf: &mut Pdf<R>,
     selected: &[ObjectRef],
 ) -> Result<RebuildResult> {
-    rebuild_page_tree_with_max_depth(pdf, selected, DEFAULT_MAX_PAGE_TREE_DEPTH)
+    // qpdf's `getAllPagesInternal` recurses with no depth cap and detects
+    // cycles with `visited` alone (`QPDF_pages.cc:76-137`), so the default
+    // rebuild must not impose one either.
+    rebuild_page_tree_canonical(pdf, selected, None)
 }
 
 /// Like [`rebuild_page_tree`] but with a caller-supplied inheritance-walk
@@ -408,6 +411,21 @@ pub fn rebuild_page_tree_with_max_depth<R: Read + Seek>(
     selected: &[ObjectRef],
     max_depth: usize,
 ) -> Result<RebuildResult> {
+    rebuild_page_tree_canonical(pdf, selected, Some(max_depth))
+}
+
+/// Rebuild the page tree, optionally bounding the inheritance walk.
+///
+/// `None` is qpdf's own contract: `getAllPagesInternal` has no depth cap and
+/// relies on its `visited` set for cycle detection (`QPDF_pages.cc:76-137`).
+/// The parent walk this drives is iterative with its own `seen` list, so an
+/// unbounded run cannot exhaust the stack.
+fn rebuild_page_tree_canonical<R: Read + Seek>(
+    pdf: &mut Pdf<R>,
+    selected: &[ObjectRef],
+    max_depth: Option<usize>,
+) -> Result<RebuildResult> {
+    let inherited_depth = max_depth.unwrap_or(usize::MAX);
     // qpdf obtains the effective /Pages handle through getAllPages before
     // flattening it. That handle can be either an indirect root or a direct
     // dictionary embedded in the catalog. Keep the ownership boundary through
@@ -417,8 +435,11 @@ pub fn rebuild_page_tree_with_max_depth<R: Read + Seek>(
         return Err(Error::Missing("/Root"));
     }
     pdf.root_handle()?;
-    let prepared =
-        prepare_for_optimization_with_max_depth(pdf, max_depth)?.ok_or(Error::Missing("/Pages"))?;
+    let prepared = match max_depth {
+        Some(depth) => prepare_for_optimization_with_max_depth(pdf, depth)?,
+        None => prepare_for_optimization(pdf)?,
+    }
+    .ok_or(Error::Missing("/Pages"))?;
     let page_root = prepared.root;
     // qpdf's page mutation APIs update `m->all_pages` in place. This rebuild
     // replaces the page tree wholesale, so invalidate the cached prepared
@@ -431,7 +452,7 @@ pub fn rebuild_page_tree_with_max_depth<R: Read + Seek>(
         &mut page_tree_nodes,
         &mut HashSet::new(),
         0,
-        max_depth,
+        inherited_depth,
     )?; // cov:ignore: LLVM attributes this multiline canonical traversal terminator separately
 
     // qpdf promotes direct non-scalar values on every original /Pages node
@@ -464,13 +485,13 @@ pub fn rebuild_page_tree_with_max_depth<R: Read + Seek>(
             // qpdf's key order so direct non-scalar promotions have the same
             // deterministic allocation order as QPDF_optimization.cc.
             let inherited_cropbox =
-                resolve_inherited_for_page(pdf, src, &page, b"/CropBox", max_depth)?; // cov:ignore: LLVM maps this covered multiline call terminator to the call setup
+                resolve_inherited_for_page(pdf, src, &page, b"/CropBox", inherited_depth)?; // cov:ignore: LLVM maps this covered multiline call terminator to the call setup
             let inherited_mediabox =
-                resolve_inherited_for_page(pdf, src, &page, b"/MediaBox", max_depth)?; // cov:ignore: LLVM maps this covered multiline call terminator to the call setup
+                resolve_inherited_for_page(pdf, src, &page, b"/MediaBox", inherited_depth)?; // cov:ignore: LLVM maps this covered multiline call terminator to the call setup
             let inherited_resources =
-                resolve_inherited_for_page(pdf, src, &page, b"/Resources", max_depth)?; // cov:ignore: LLVM maps this covered multiline call terminator to the call setup
+                resolve_inherited_for_page(pdf, src, &page, b"/Resources", inherited_depth)?; // cov:ignore: LLVM maps this covered multiline call terminator to the call setup
             let inherited_rotate =
-                resolve_inherited_handle_with_max_depth(pdf, src, b"/Rotate", max_depth)?;
+                resolve_inherited_handle_with_max_depth(pdf, src, b"/Rotate", inherited_depth)?;
 
             // qpdf's inherited attribute push leaves an absent key absent;
             // explicit null is treated as absent only when a real ancestor
