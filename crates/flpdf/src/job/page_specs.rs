@@ -122,15 +122,11 @@ fn select_single_source_pages<R: Read + Seek>(
         selected.extend(plans.iter().flat_map(|plan| plan.pages().iter().cloned()));
     }
 
-    let allows_empty_selection = plans.len() > 1
-        && collate_values
-            .as_ref()
-            .is_some_and(|values| values.iter().all(|&value| value == 0));
-    if selected.is_empty() && !allows_empty_selection {
-        return Err(Error::Unsupported(
-            "--pages: page selection is empty".into(),
-        ));
-    }
+    // qpdf's `handlePageSpecs` (`QPDFJob.cc:2360-2632`) has no empty-selection
+    // guard, and `QUtil::parse_numrange` returns an empty vector for a range
+    // whose exclusions cancel it out, such as `1,x1` (`QUtil.cc:1385-1400`).
+    // qpdf writes a valid 0-page document in that case, so flpdf must not
+    // reject it.
     Ok(selected)
 }
 
@@ -773,16 +769,7 @@ fn handle_page_specs_into<R: Read + Seek + 'static, T: Read + Seek + 'static>(
         }
     }
 
-    let allows_empty_selection = plans.len() > 1
-        && collate_values
-            .as_ref()
-            .is_some_and(|values| values.iter().all(|&value| value == 0));
-    if ordered_pages.is_empty() && !allows_empty_selection {
-        return Err(Error::Unsupported(
-            "--pages: page selection is empty".into(),
-        ));
-    }
-
+    // See the sibling guard removal above: qpdf has no empty-selection check.
     let remove_resources = report_page_spec_diagnostics(job, sources, specs, resource_mode)?;
 
     // qpdf's label accumulator is populated in final output order, not in
@@ -1757,10 +1744,18 @@ mod tests {
             false,
         )
         .is_err());
+    }
 
+    /// qpdf's `handlePageSpecs` (`QPDFJob.cc:2360-2632`) has no empty-selection
+    /// guard and `QUtil::parse_numrange` returns an empty vector when the
+    /// exclusions cancel a group out (`QUtil.cc:1385-1400`). Probed with qpdf
+    /// 11.9.0: `--pages . 1,x1 --` and `--pages . :odd --` both exit 0 and
+    /// write a valid 0-page document, and flpdf's output is byte-identical.
+    #[test]
+    fn handle_page_specs_accepts_an_empty_selection_like_qpdf() {
         let mut sources = vec![three_page_pdf()];
         let empty = [PageSpecInput::new(0, PageRange::empty())];
-        assert!(handle_page_specs(
+        let mut merged = handle_page_specs(
             &mut QPDFJob::new(),
             &mut sources,
             &empty,
@@ -1768,7 +1763,9 @@ mod tests {
             RemoveUnreferencedResources::Auto,
             false,
         )
-        .is_err());
+        .expect("an empty page selection writes a 0-page document");
+        let page_refs = crate::pages::page_refs(&mut merged).expect("read the page tree");
+        assert!(page_refs.is_empty(), "got {page_refs:?}");
     }
 
     #[test]

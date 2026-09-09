@@ -4,7 +4,9 @@ use flpdf::job::{
 };
 use flpdf::json_inspect::DecodeLevel;
 use flpdf::pipeline::{Pipeline, PipelineError, PipelineHandle, PipelineResult};
-use flpdf::{Error, ObjectHandle, PageRange, Pdf, PdfOpenOptions, PdfWriter, QPDFLogger};
+use flpdf::{
+    EncryptParams, Error, ObjectHandle, PageRange, Pdf, PdfOpenOptions, PdfWriter, QPDFLogger,
+};
 use std::fs::File;
 use std::io::{BufReader, Cursor};
 use std::path::Path;
@@ -3442,7 +3444,7 @@ fn config_add_page_spec_matches_the_json_configured_path_single_source() {
         .output_file(&via_config)
         .unwrap()
         .deterministic_id()
-        .add_page_spec(".", "2-3,1", Vec::new())
+        .add_page_spec(".", "2-3,1", None)
         .unwrap();
     assert_eq!(config_job.run().unwrap(), JobExitCode::Success);
 
@@ -3506,7 +3508,7 @@ fn config_add_page_spec_rejects_an_invalid_range() {
     let mut job = QPDFJob::new();
     let error = job
         .config()
-        .add_page_spec(".", "0", Vec::new())
+        .add_page_spec(".", "0", None)
         .err()
         .expect("an out-of-range page range must be rejected");
     // qpdf's own `PagesConfig::pageSpec` never fails; it validates the range at
@@ -3514,6 +3516,95 @@ fn config_add_page_spec_rejects_an_invalid_range() {
     // flpdf routes symmetric: the job-JSON handler wraps this same failure in
     // `Error::Usage`, and the builder must do the same.
     assert!(matches!(error, Error::Usage(_)), "got {error:?}");
+}
+
+#[test]
+fn config_page_specs_reject_a_json_pages_group_after_config_pages() {
+    let mut job = QPDFJob::new();
+    job.config()
+        .add_page_spec("first.pdf", "1", None)
+        .expect("the first Config page group is accepted");
+
+    let error = job
+        .initialize_from_json_partial(r#"{"pages":[{"file":"second.pdf"}]}"#)
+        .expect_err("qpdf's Config::pages() guard must reject a second pages group");
+    assert!(matches!(
+        error,
+        Error::Usage(usage) if usage.to_string() == "--pages may only be specified one time"
+    ));
+}
+
+#[test]
+fn json_page_specs_reject_a_config_pages_group_after_json_pages() {
+    let mut job = QPDFJob::new();
+    job.initialize_from_json_partial(r#"{"pages":[{"file":"first.pdf"}]}"#)
+        .expect("the first JSON page group is accepted");
+
+    let error = match job.config().add_page_spec("second.pdf", "1", None) {
+        Ok(_) => panic!("qpdf's Config::pages() guard must reject a second pages group"),
+        Err(error) => error,
+    };
+    assert!(matches!(
+        error,
+        Error::Usage(usage) if usage.to_string() == "--pages may only be specified one time"
+    ));
+}
+
+#[test]
+fn json_page_spec_uses_copy_encryption_password_when_page_password_is_unspecified() {
+    let tempdir = tempfile::tempdir().unwrap();
+    let plaintext =
+        Path::new(env!("CARGO_MANIFEST_DIR")).join("../../tests/fixtures/compat/three-page.pdf");
+    let encrypted = tempdir.path().join("encrypted-three-page.pdf");
+    let mut source = Pdf::open(BufReader::new(File::open(&plaintext).unwrap())).unwrap();
+    let mut writer = PdfWriter::new(&mut source);
+    writer.set_static_id(true);
+    writer.set_encryption_parameters(EncryptParams::v4_aes128(
+        b"user-v4-aes".to_vec(),
+        b"owner-v4-aes".to_vec(),
+    ));
+    writer.set_output_file(&encrypted).unwrap();
+    writer.write().unwrap();
+
+    let output = tempdir.path().join("pages-from-encryption-file.pdf");
+    let json = serde_json::json!({
+        "empty": "",
+        "outputFile": output,
+        "copyEncryption": encrypted,
+        "encryptionFilePassword": "user-v4-aes",
+        "pages": [{"file": encrypted, "range": "1"}],
+        "staticId": ""
+    })
+    .to_string();
+
+    let mut job = QPDFJob::new();
+    job.initialize_from_json(&json).unwrap();
+    assert_eq!(
+        job.run().unwrap(),
+        JobExitCode::Success,
+        "an omitted page password must fall back to --encryption-file-password"
+    );
+    assert!(output.is_file());
+
+    let explicit_empty_output = tempdir.path().join("explicit-empty-password.pdf");
+    let explicit_empty_json = serde_json::json!({
+        "empty": "",
+        "outputFile": explicit_empty_output,
+        "copyEncryption": encrypted,
+        "encryptionFilePassword": "user-v4-aes",
+        "pages": [{"file": encrypted, "password": "", "range": "1"}],
+        "staticId": ""
+    })
+    .to_string();
+    let mut explicit_empty_job = QPDFJob::new();
+    explicit_empty_job
+        .initialize_from_json(&explicit_empty_json)
+        .unwrap();
+    assert_eq!(
+        explicit_empty_job.run().unwrap(),
+        JobExitCode::Error,
+        "an explicit empty page password must bypass the encryption-file fallback"
+    );
 }
 
 /// `Config::addAttachment` (`QPDFJob_config.cc:894-936`) and the JSON

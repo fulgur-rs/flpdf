@@ -4,23 +4,22 @@
 //! # Syntax
 //!
 //! ```text
-//! range        ::= "" | entry ("," entry)*
-//! entry        ::= endpoint ("-" endpoint)? (":odd" | ":even")?
+//! range        ::= "" | group ("," group)* (":odd" | ":even")?
+//! group        ::= "x"? endpoint ("-" endpoint)?
 //! endpoint     ::= "z" | "r" digit+ | digit+
 //! ```
 //!
 //! - `z` — the last page (equivalent to `r1`).
 //! - `rN` — N-th page from the end; `r1` is the last page, `r2` is the second-to-last, …
 //! - Ranges may be ascending (`1-5`) or descending (`5-1`); both are inclusive.
-//! - `:odd` / `:even` filter the *positions* within the expanded entry sequence:
-//!   `:odd` keeps positions 1, 3, 5, … (1-based); `:even` keeps positions 2, 4, 6, …
-//!   They operate on the entry's own expansion, not the whole expression.
-//!   Example: `2-8:even` → pages at positions 2, 4, 6 of `[2,3,4,5,6,7,8]` → `[3,5,7]`.
-//!   This is intentionally position-based, matching qpdf: its `--help=page-ranges`
-//!   states `:odd`/`:even` select "odd and even pages from the resulting set, not
-//!   based on the original page numbers" (verified against qpdf 11.9.0: `2-8:even`
-//!   yields 3 pages, not the 4 a page-number reading would give). Do not "fix"
-//!   this to filter by `p % 2` — that would diverge from qpdf.
+//! - `x` prepends an exclusion group. It removes the group's pages from the
+//!   immediately preceding positive group, matching qpdf's
+//!   `QUtil::parse_numrange` (`QUtil.cc:1304-1415`). The first group may not be
+//!   an exclusion.
+//! - `:odd` / `:even` filter the *positions* in the final expanded selection:
+//!   `:odd` keeps positions 1, 3, 5, … (1-based); `:even` keeps positions 2,
+//!   4, 6, …. They are not based on the original page numbers. Example:
+//!   `2-8:even` → `[3,5,7]`.
 //! - An empty string means "all pages" and is resolved to `1..=page_count`.
 //! - Multiple entries are concatenated; the final resolved list preserves
 //!   duplicates in declaration order (qpdf-parity: `1,3,1` yields `[1,3,1]`,
@@ -28,6 +27,7 @@
 //!   that want a deduplicated set can build one from the returned vector.
 
 use crate::{Error, Result};
+use std::collections::BTreeSet;
 
 // ---------------------------------------------------------------------------
 // Public types
@@ -49,7 +49,7 @@ pub enum Endpoint {
     FromEnd(u32),
 }
 
-/// Which positions to keep within a single entry's expanded page sequence.
+/// Which positions to keep within the final expanded page selection.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Parity {
     /// Keep positions 1, 3, 5, … (`:odd`).
@@ -61,11 +61,13 @@ pub enum Parity {
 /// A single parsed entry in a page-range expression.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct PageRangeEntry {
+    /// Whether this group excludes pages from the preceding positive group.
+    pub exclude: bool,
     /// Start of the range (or the single page).
     pub start: Endpoint,
     /// End of the range, if this is a range rather than a single page.
     pub end: Option<Endpoint>,
-    /// Optional parity filter for this entry.
+    /// Optional final parity suffix retained on the last entry.
     pub parity: Option<Parity>,
 }
 
@@ -76,6 +78,8 @@ pub struct PageRangeEntry {
 pub struct PageRange {
     /// `None` means "all pages" (empty string input).
     pub(crate) entries: Option<Vec<PageRangeEntry>>,
+    /// Optional final-position parity filter.
+    parity: Option<Parity>,
 }
 
 impl PageRange {
@@ -93,11 +97,33 @@ impl PageRange {
     ///   unexpected character).
     pub fn parse(input: &str) -> Result<Self> {
         if input.is_empty() {
-            return Ok(Self { entries: None });
+            return Ok(Self {
+                entries: None,
+                parity: None,
+            });
         }
-        let entries = parse_entries(input)?;
+        let (range, parity) = split_parity_suffix(input)?;
+        // qpdf truncates the input at the parity suffix (`range_end = p`,
+        // `QUtil.cc:1356`) and then runs `while (p != range_end)`
+        // (`QUtil.cc:1367`) zero times, returning an empty result without an
+        // error. So ":odd" and ":even" are valid and select nothing.
+        if range.is_empty() {
+            return Ok(Self {
+                entries: Some(Vec::new()),
+                parity,
+            });
+        }
+        let mut entries = parse_entries(range)?;
+        if let Some(parity) = parity {
+            if let Some(entry) = entries.last_mut() {
+                // Keep the suffix visible through the existing public entry
+                // shape while applying it to the final result in `resolve`.
+                entry.parity = Some(parity);
+            }
+        }
         Ok(Self {
             entries: Some(entries),
+            parity,
         })
     }
 
@@ -111,6 +137,7 @@ impl PageRange {
     pub fn empty() -> Self {
         Self {
             entries: Some(Vec::new()),
+            parity: None,
         }
     }
 
@@ -138,8 +165,25 @@ impl PageRange {
         };
 
         let mut result: Vec<u32> = Vec::new();
+        let mut last_group: Vec<u32> = Vec::new();
         for entry in entries {
-            result.extend(resolve_entry(entry, page_count)?);
+            let group = resolve_entry(entry, page_count)?;
+            if entry.exclude {
+                let exclusions = group.into_iter().collect::<BTreeSet<_>>();
+                last_group.retain(|page| !exclusions.contains(page));
+            } else {
+                result.extend(last_group);
+                last_group = group;
+            }
+        }
+        result.extend(last_group);
+
+        if let Some(parity) = self.parity {
+            let start = match parity {
+                Parity::Odd => 0,
+                Parity::Even => 1,
+            };
+            result = result.into_iter().skip(start).step_by(2).collect();
         }
         Ok(result)
     }
@@ -187,23 +231,7 @@ fn resolve_entry(entry: &PageRangeEntry, page_count: u32) -> Result<Vec<u32>> {
         (end..=start).rev().collect()
     };
 
-    // Apply parity filter (position is 1-based within this entry's sequence).
-    let filtered = match entry.parity {
-        None => seq,
-        Some(Parity::Odd) => seq
-            .into_iter()
-            .enumerate()
-            .filter(|(i, _)| i % 2 == 0)
-            .map(|(_, p)| p)
-            .collect(),
-        Some(Parity::Even) => seq
-            .into_iter()
-            .enumerate()
-            .filter(|(i, _)| i % 2 == 1)
-            .map(|(_, p)| p)
-            .collect(),
-    };
-    Ok(filtered)
+    Ok(seq)
 }
 
 // ---------------------------------------------------------------------------
@@ -290,8 +318,14 @@ impl<'a> RangeParser<'a> {
         }
     }
 
-    /// Parse one entry: `endpoint ("-" endpoint)? (":odd"|":even")?`
+    /// Parse one group: `[x]endpoint ("-" endpoint)?`.
     fn parse_entry(&mut self) -> Result<PageRangeEntry> {
+        let exclude = if self.peek() == Some('x') {
+            self.advance(1);
+            true
+        } else {
+            false
+        };
         let start = self.parse_endpoint()?;
 
         let end = if self.remaining().starts_with('-') {
@@ -301,31 +335,36 @@ impl<'a> RangeParser<'a> {
             None
         };
 
-        let parity = if self.remaining().starts_with(':') {
-            self.advance(1); // consume ':'
-            if self.remaining().starts_with("odd") {
-                self.advance(3);
-                Some(Parity::Odd)
-            } else if self.remaining().starts_with("even") {
-                self.advance(4);
-                Some(Parity::Even)
-            } else {
-                let token: String = self
-                    .remaining()
-                    .chars()
-                    .take_while(|c| c.is_alphanumeric())
-                    .collect();
-                return Err(self.err(format!(
-                    "unknown parity suffix ':{token}' at position {}; expected ':odd' or ':even'",
-                    self.pos
-                )));
-            }
-        } else {
-            None
-        };
-
-        Ok(PageRangeEntry { start, end, parity })
+        Ok(PageRangeEntry {
+            exclude,
+            start,
+            end,
+            parity: None,
+        })
     }
+}
+
+fn split_parity_suffix(input: &str) -> Result<(&str, Option<Parity>)> {
+    // qpdf takes the FIRST colon (`std::find`, `QUtil.cc:1348`) and then
+    // requires the remainder to be exactly ":odd" or ":even" (`strcmp`,
+    // `QUtil.cc:1350-1356`).
+    let Some(index) = input.find(':') else {
+        return Ok((input, None));
+    };
+    let (range, suffix) = input.split_at(index);
+    let parity = match suffix {
+        ":odd" => Parity::Odd,
+        ":even" => Parity::Even,
+        _ => {
+            return Err(Error::parse(
+                index,
+                format!(
+                "unknown parity suffix '{suffix}' at position {index}; expected ':odd' or ':even'"
+            ),
+            ))
+        }
+    };
+    Ok((range, Some(parity)))
 }
 
 fn parse_entries(input: &str) -> Result<Vec<PageRangeEntry>> {
@@ -345,6 +384,9 @@ fn parse_entries(input: &str) -> Result<Vec<PageRangeEntry>> {
             _ => {}
         }
 
+        if entries.is_empty() && p.peek() == Some('x') {
+            return Err(p.err("first range group may not be an exclusion"));
+        }
         entries.push(p.parse_entry()?);
 
         match p.peek() {
@@ -531,9 +573,14 @@ mod tests {
     }
 
     #[test]
-    fn bare_colon_is_invalid() {
-        let msg = parse_err(":odd");
-        assert!(!msg.is_empty());
+    fn bare_parity_suffix_selects_nothing_like_qpdf() {
+        // qpdf truncates at the suffix (`QUtil.cc:1356`) and then never enters
+        // the group loop (`QUtil.cc:1367`), returning an empty result without
+        // an error. Probed with qpdf 11.9.0 on a 10-page file:
+        // `--pages . :odd --` and `--pages . :even --` both exit 0 and write a
+        // 0-page document.
+        assert_eq!(resolve(":odd", 10), Vec::<u32>::new());
+        assert_eq!(resolve(":even", 10), Vec::<u32>::new());
     }
 
     #[test]
@@ -632,6 +679,23 @@ mod tests {
     }
 
     #[test]
+    fn parity_applies_to_the_whole_selection_not_each_group() {
+        // qpdf strips the suffix once and filters the concatenated result
+        // (`QUtil.cc:1348-1360` then `:1400-1414`), so the parity positions run
+        // across group boundaries. Probed with qpdf 11.9.0 on a 10-page file
+        // (`--pages . <range> --`, page identified by its /MediaBox width):
+        // `1-3,5-7:odd` -> 1 3 6, `1-3,5-7:even` -> 2 5 7.
+        assert_eq!(resolve("1-3,5-7:odd", 10), vec![1, 3, 6]);
+        assert_eq!(resolve("1-3,5-7:even", 10), vec![2, 5, 7]);
+    }
+
+    #[test]
+    fn parity_is_applied_after_exclusion_groups() {
+        // qpdf 11.9.0 on the same 10-page file: `1-6,x3:odd` -> 1 4 6.
+        assert_eq!(resolve("1-6,x3:odd", 10), vec![1, 4, 6]);
+    }
+
+    #[test]
     fn even_parity_offset_range() {
         // '2-8:even' → positions 2,4,6 of [2,3,4,5,6,7,8] = [3,5,7]
         assert_eq!(resolve("2-8:even", 10), vec![3, 5, 7]);
@@ -666,6 +730,23 @@ mod tests {
         let result = resolve("1,3,5-9,15-12", 20);
         let expected = vec![1, 3, 5, 6, 7, 8, 9, 15, 14, 13, 12];
         assert_eq!(result, expected);
+    }
+
+    #[test]
+    fn exclusion_group_removes_pages_from_the_previous_group() {
+        // qpdf's `1-3,x2` keeps the first and third pages. The `x` group is
+        // applied to the immediately preceding positive group, not parsed as
+        // a filename or as a second independent selection.
+        assert_eq!(resolve("1-3,x2", 3), vec![1, 3]);
+    }
+
+    #[test]
+    fn exclusion_group_may_not_be_the_first_group() {
+        let message = parse_err("x2");
+        assert!(
+            message.contains("first") || message.contains("exclusion"),
+            "got: {message}"
+        );
     }
 
     #[test]
