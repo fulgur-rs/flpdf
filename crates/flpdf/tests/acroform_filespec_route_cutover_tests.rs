@@ -92,5 +92,11 @@ fn acroform_filespec_embedded_and_signature_production_routes_are_handle_native(
                 "{path} still contains the legacy resolver/accessor bridge {forbidden}"
             );
         }
+        if path == "signatures.rs" {
+            assert!(
+                !source.contains(".is_null("),
+                "{path} still contains a non-resolving null observation"
+            );
+        }
     }
 }

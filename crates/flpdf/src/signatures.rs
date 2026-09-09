@@ -94,7 +94,7 @@ pub fn signatures_with_max_depth<R: Read + Seek>(
     }
 
     let fields_obj = acroform.try_get_key(b"/Fields")?;
-    if fields_obj.is_null() {
+    if fields_obj.try_is_null()? {
         return Ok(Vec::new());
     }
     let fields = resolve_array(fields_obj)?;
@@ -166,7 +166,7 @@ pub fn strip_signature_values<R: Read + Seek>(pdf: &mut Pdf<R>) -> Result<bool> 
         return Ok(false);
     };
     let fields_obj = acroform.try_get_key(b"/Fields")?;
-    if fields_obj.is_null() {
+    if fields_obj.try_is_null()? {
         return Ok(false);
     }
 
