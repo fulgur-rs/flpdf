@@ -64,6 +64,15 @@ pub struct LabelRange {
     pub start: i64,
 }
 
+/// A qpdf-shaped reconstructed label before it crosses a document boundary.
+/// `source_id` lets page-job consumers copy the raw dictionary through the
+/// persistent foreign-object map instead of collapsing it into `LabelRange`.
+pub(crate) struct RawPageLabelEntry {
+    pub(crate) index: i64,
+    pub(crate) source_id: u64,
+    pub(crate) label: ObjectHandle,
+}
+
 impl LabelRange {
     /// Decode a live qpdf-shaped label dictionary without materializing it as
     /// an independent value snapshot. Unknown `/S` names remain unknown to the
@@ -196,6 +205,85 @@ pub fn merge_adjacent_ranges_with_prefix_presence(
         out.push((idx, range, prefix_present));
     }
     out
+}
+
+/// Compare reconstructed raw label dictionaries using qpdf's unparse
+/// comparison for `/S` and `/P` plus checked `/St` arithmetic
+/// (`QPDFPageLabelDocumentHelper.cc:57-79`).
+fn raw_page_labels_are_redundant(
+    previous_index: i64,
+    previous: &ObjectHandle,
+    index: i64,
+    current: &ObjectHandle,
+) -> Result<bool> {
+    let previous_st = previous.try_get_key(b"/St")?.try_as_integer()?;
+    let current_st = current.try_get_key(b"/St")?.try_as_integer()?;
+    let expected_start = index
+        .checked_sub(previous_index)
+        .and_then(|gap| previous_st.and_then(|start| start.checked_add(gap)));
+    Ok(match (expected_start, current_st) {
+        (Some(expected_start), Some(current_st)) => {
+            current_st == expected_start
+                && previous.try_get_key(b"/S")?.unparse() == current.try_get_key(b"/S")?.unparse()
+                && previous.try_get_key(b"/P")?.unparse() == current.try_get_key(b"/P")?.unparse()
+        }
+        _ => false,
+    })
+}
+
+/// Fold raw label dictionaries that already belong to the destination
+/// document.
+pub(crate) fn merge_adjacent_raw_labels(
+    ranges: Vec<(i64, ObjectHandle)>,
+) -> Result<Vec<(i64, ObjectHandle)>> {
+    let mut out = Vec::with_capacity(ranges.len());
+    for range in ranges {
+        if let Some((previous_index, previous)) = out.last() {
+            if raw_page_labels_are_redundant(*previous_index, previous, range.0, &range.1)? {
+                continue;
+            }
+        }
+        out.push(range);
+    }
+    Ok(out)
+}
+
+pub(crate) fn merge_adjacent_raw_page_labels(
+    ranges: Vec<RawPageLabelEntry>,
+) -> Result<Vec<RawPageLabelEntry>> {
+    let mut out: Vec<RawPageLabelEntry> = Vec::with_capacity(ranges.len());
+    for range in ranges {
+        if let Some(previous) = out.last() {
+            let redundant = raw_page_labels_are_redundant(
+                previous.index,
+                &previous.label,
+                range.index,
+                &range.label,
+            )?; // cov:ignore: raw label accessor failures are covered by handle tests
+            if redundant {
+                continue;
+            }
+        }
+        out.push(range);
+    }
+    Ok(out)
+}
+
+/// Copy raw label dictionaries into the destination document through its
+/// qpdf-shaped persistent foreign-object map.
+pub(crate) fn copy_raw_page_label_entries<R: Read + Seek>(
+    target: &mut Pdf<R>,
+    ranges: &[RawPageLabelEntry],
+) -> Result<Vec<(i64, ObjectHandle)>> {
+    ranges
+        .iter()
+        .map(|range| {
+            Ok((
+                range.index,
+                target.copy_foreign_value(range.source_id, &range.label)?,
+            ))
+        })
+        .collect()
 }
 
 // qpdf-deviation-start: page-label rendering (this const and the two
@@ -683,6 +771,43 @@ impl<'a, R: Read + Seek> PageLabelDocumentHelper<'a, R> {
         Ok(out)
     }
 
+    /// Batch raw variant of [`Self::labels_for_selection`]. The returned
+    /// dictionaries retain arbitrary `/S` and `/P` values so page-job
+    /// reconstruction can copy them exactly like qpdf.
+    pub(crate) fn labels_for_selection_raw(
+        &mut self,
+        src_indices: &[i64],
+        out_start_idx: i64,
+    ) -> Result<Vec<(i64, ObjectHandle)>> {
+        let mut tree = self.pagelabels_tree()?;
+        let mut out = Vec::with_capacity(src_indices.len());
+        for (i, &src_idx) in src_indices.iter().enumerate() {
+            let i = i64::try_from(i).map_err(|_| {
+                // cov:ignore-start: supported targets cannot allocate more than i64::MAX items.
+                Error::Unsupported("page label selection index overflow".to_string())
+                // cov:ignore-end
+            })?; // cov:ignore: the same allocation bound is unrepresentable on supported targets
+            let out_idx = out_start_idx.checked_add(i).ok_or_else(|| {
+                Error::Unsupported("page label output index overflow".to_string())
+            })?;
+            let label = match tree.as_mut() {
+                Some(tree) => self.get_label_for_page_from_tree(tree, src_idx)?,
+                None => None,
+            }
+            .unwrap_or_else(|| ObjectHandle::dictionary(Vec::new()));
+            if !label.try_has_key(b"/St")? {
+                label.replace_key(
+                    b"/St",
+                    ObjectHandle::integer(out_idx.checked_add(1).ok_or_else(|| {
+                        Error::Unsupported("page label fabricated start overflow".to_string())
+                    })?),
+                )?; // cov:ignore: the catalog was validated as a dictionary and this local replacement has no qpdf failure branch
+            }
+            out.push((out_idx, label));
+        }
+        Ok(out)
+    }
+
     /// Return whether the effective label dictionary for `page_idx` carries
     /// an explicit `/P` key, including an explicitly empty string. qpdf keeps
     /// that distinction when `getLabelsForPageRange` copies raw label
@@ -757,6 +882,32 @@ impl<'a, R: Read + Seek> PageLabelDocumentHelper<'a, R> {
         for (idx, range, prefix_present) in entries {
             nums.push(ObjectHandle::integer(*idx));
             nums.push(Self::reconstructed_label_handle(range, *prefix_present)?);
+        }
+        let page_labels =
+            ObjectHandle::dictionary(vec![(b"/Nums".to_vec(), ObjectHandle::array(nums))]);
+        catalog.replace_key(b"/PageLabels", page_labels)?;
+        Ok(())
+    }
+
+    /// Install already destination-owned raw label dictionaries. This is the
+    /// qpdf reconstruction boundary; unlike the typed writer, it does not
+    /// manufacture a string `/P` for a non-string source value.
+    pub(crate) fn write_reconstructed_labels_raw(
+        &mut self,
+        entries: &[(i64, ObjectHandle)],
+    ) -> Result<()> {
+        let Some(catalog_ref) = self.pdf.root_ref() else {
+            return Ok(());
+        };
+        let catalog = self.pdf.get_object_handle(catalog_ref);
+        catalog.try_dereference()?;
+        if catalog.try_as_dictionary()?.is_none() {
+            return Ok(());
+        }
+        let mut nums = Vec::with_capacity(entries.len() * 2);
+        for (index, label) in entries {
+            nums.push(ObjectHandle::integer(*index));
+            nums.push(label.clone());
         }
         let page_labels =
             ObjectHandle::dictionary(vec![(b"/Nums".to_vec(), ObjectHandle::array(nums))]);
@@ -1250,6 +1401,8 @@ mod tests {
         let mut pdf = bare_one_page_pdf();
         let labels = pdf.page_labels().labels_for_selection(&[0], 0).unwrap();
         assert_eq!(labels, vec![(0, none_range(1))]);
+        let raw = pdf.page_labels().labels_for_selection_raw(&[0], 0).unwrap();
+        assert_eq!(raw[0].1.try_get_key(b"/St").unwrap().as_integer(), Some(1));
     }
 
     #[test]
@@ -1261,6 +1414,14 @@ mod tests {
             .labels_for_selection(&[0, 1], i64::MAX)
             .expect_err("selection output index must use checked arithmetic");
         assert!(error.to_string().contains("output index overflow"));
+
+        let error = pdf
+            .page_labels()
+            .labels_for_selection_raw(&[0, 1], i64::MAX)
+            .expect_err("raw selection output index must use checked arithmetic");
+        assert!(error
+            .to_string()
+            .contains("page label output index overflow"));
     }
 
     #[test]
@@ -1271,6 +1432,56 @@ mod tests {
             .labels_for_selection(&[0], i64::MAX)
             .expect_err("fabricated selection /St must use checked arithmetic");
         assert!(error.to_string().contains("fabricated start overflow"));
+
+        let error = pdf
+            .page_labels()
+            .labels_for_selection_raw(&[0], i64::MAX)
+            .expect_err("raw fabricated selection /St must use checked arithmetic");
+        assert!(error.to_string().contains("fabricated start overflow"));
+    }
+
+    #[test]
+    fn raw_label_merges_compare_qpdf_values_and_keep_nonredundant_entries() {
+        let label = |prefix: ObjectHandle, start| {
+            ObjectHandle::dictionary(vec![
+                (b"/S".to_vec(), ObjectHandle::name(b"D".to_vec())),
+                (b"/P".to_vec(), prefix),
+                (b"/St".to_vec(), ObjectHandle::integer(start)),
+            ])
+        };
+        let ranges = vec![
+            (0, label(ObjectHandle::integer(42), 1)),
+            (1, label(ObjectHandle::integer(42), 2)),
+            (2, label(ObjectHandle::name(b"Foo".to_vec()), 3)),
+        ];
+        let merged = merge_adjacent_raw_labels(ranges).expect("raw merge");
+        assert_eq!(merged.len(), 2);
+
+        let kept = merge_adjacent_raw_labels(vec![
+            (0, label(ObjectHandle::integer(42), 1)),
+            (1, ObjectHandle::dictionary(Vec::new())),
+        ])
+        .expect("raw merge must keep a label without /St");
+        assert_eq!(kept.len(), 2);
+
+        let ranges = vec![
+            RawPageLabelEntry {
+                index: 0,
+                source_id: 1,
+                label: label(ObjectHandle::integer(42), 1),
+            },
+            RawPageLabelEntry {
+                index: 1,
+                source_id: 1,
+                label: label(ObjectHandle::integer(42), 2),
+            },
+        ];
+        assert_eq!(
+            merge_adjacent_raw_page_labels(ranges)
+                .expect("raw foreign merge")
+                .len(),
+            1
+        );
     }
 
     #[test]
@@ -1813,6 +2024,8 @@ mod tests {
         h.write_reconstructed_labels(&[(0, none_range(1))]).unwrap();
         h.write_reconstructed_labels_with_prefix_presence(&[(0, none_range(1), false)])
             .unwrap();
+        h.write_reconstructed_labels_raw(&[(0, ObjectHandle::dictionary(Vec::new()))])
+            .unwrap();
     }
 
     #[test]
@@ -1824,6 +2037,8 @@ mod tests {
         let mut h = pdf.page_labels();
         h.write_reconstructed_labels(&[(0, none_range(1))]).unwrap();
         h.write_reconstructed_labels_with_prefix_presence(&[(0, none_range(1), false)])
+            .unwrap();
+        h.write_reconstructed_labels_raw(&[(0, ObjectHandle::dictionary(Vec::new()))])
             .unwrap();
     }
 

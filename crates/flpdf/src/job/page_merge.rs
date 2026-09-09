@@ -39,7 +39,9 @@ use super::acroform_field_prune::DEFAULT_MAX_ACROFORM_DEPTH;
 use super::resource_pruning::{should_remove_unreferenced_resources, RemoveUnreferencedResources};
 use crate::object_copy::copy_foreign_object_for_preserve;
 use crate::page_extract::{append_selection_kids, null_copied_removed_pages, target_pages_root};
-use crate::page_label_document_helper::{merge_adjacent_ranges, LabelRange};
+use crate::page_label_document_helper::{
+    copy_raw_page_label_entries, merge_adjacent_raw_page_labels, RawPageLabelEntry,
+};
 use crate::pages::page_refs;
 use crate::pdf::WriterObjectOrderKey;
 use crate::pdf_string::{new_unicode_string, utf8_value};
@@ -1050,7 +1052,7 @@ pub(crate) fn merge_documents_with_resource_decisions_and_preserve_primary_into<
     // total selection count; pre-allocate to avoid repeated regrowth on
     // large merges.
     let total_selected: usize = inputs.iter().map(|i| i.pages.len()).sum();
-    let mut label_entries: Vec<(i64, LabelRange)> = Vec::with_capacity(total_selected);
+    let mut label_entries: Vec<RawPageLabelEntry> = Vec::with_capacity(total_selected);
     let mut any_page_labels = false;
     let mut out_pageno: i64 = 0;
 
@@ -1106,12 +1108,22 @@ pub(crate) fn merge_documents_with_resource_decisions_and_preserve_primary_into<
         // every later input's pages) even though none of its own pages are
         // in the output.
         if !input.pages.is_empty() {
+            let source_id = input.source.unique_id();
             let mut src_labels = input.source.page_labels();
             if src_labels.has_page_labels()? {
                 any_page_labels = true;
             }
             let src_indices: Vec<i64> = input.pages.iter().map(|&i| i as i64).collect();
-            label_entries.extend(src_labels.labels_for_selection(&src_indices, out_pageno)?);
+            label_entries.extend(
+                src_labels
+                    .labels_for_selection_raw(&src_indices, out_pageno)?
+                    .into_iter()
+                    .map(|(index, label)| RawPageLabelEntry {
+                        index,
+                        source_id,
+                        label,
+                    }),
+            );
             out_pageno = out_pageno.saturating_add(input.pages.len() as i64);
         }
 
@@ -1423,8 +1435,11 @@ pub(crate) fn merge_documents_with_resource_decisions_and_preserve_primary_into<
     // carried real page labels — the target then keeps its fresh, label-less
     // catalog, matching qpdf's `emptyPDF()`-based output.
     if any_page_labels {
-        let folded = merge_adjacent_ranges(label_entries);
-        target.page_labels().write_reconstructed_labels(&folded)?;
+        let folded = merge_adjacent_raw_page_labels(label_entries)?;
+        let copied = copy_raw_page_label_entries(&mut target, &folded)?;
+        target
+            .page_labels()
+            .write_reconstructed_labels_raw(&copied)?;
     }
 
     target.set_writer_object_order(writer_object_order);

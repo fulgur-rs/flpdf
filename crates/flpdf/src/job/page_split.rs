@@ -46,6 +46,7 @@ use super::resource_pruning::{
     RemoveUnreferencedResources,
 };
 use super::QPDFJob;
+use crate::page_label_document_helper::{copy_raw_page_label_entries, RawPageLabelEntry};
 use crate::{
     Error, PageDocumentHelper, PageInput, PageObjectHelper, Pdf, PdfWriter, Result,
     WriterConfiguration,
@@ -304,25 +305,25 @@ impl QPDFJob {
                     Error::Unsupported("split_pages: label end exceeds i64".to_owned())
                 })?;
                 // cov:ignore-end
-                let entries = source
+                let source_id = source.unique_id();
+                let mut raw_entries = Vec::new();
+                source
                     .page_labels()
-                    .labels_for_page_range(start, end, 0)?
+                    .get_labels_for_page_range(start, end, 0, &mut raw_entries)?;
+                let entries = raw_entries
                     .into_iter()
                     .map(|(output_index, label)| {
-                        // cov:ignore-start: labels_for_page_range returns only
-                        // indices within the requested non-negative range.
-                        let source_index = start.checked_add(output_index).ok_or_else(|| {
-                            Error::Unsupported("split_pages: label index overflow".to_owned())
-                        })?;
-                        // cov:ignore-end
-                        let prefix_present =
-                            source.page_labels().label_prefix_is_present(source_index)?;
-                        Ok((output_index, label, prefix_present))
+                        Ok(RawPageLabelEntry {
+                            index: output_index,
+                            source_id,
+                            label,
+                        })
                     })
                     .collect::<Result<Vec<_>>>()?;
+                let entries = copy_raw_page_label_entries(&mut output, &entries)?;
                 output
                     .page_labels()
-                    .write_reconstructed_labels_with_prefix_presence(&entries)?;
+                    .write_reconstructed_labels_raw(&entries)?;
             }
 
             let mut writer = PdfWriter::new(&mut output);
