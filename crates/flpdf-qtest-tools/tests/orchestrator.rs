@@ -95,8 +95,8 @@ startxref
 /// `/Size 4` — matches the trailer of `THREE_OBJECT_PDF_SIZE4` so the
 /// trailer compare passes, leaving the count-mismatch branch to fire.
 ///
-/// The free-list entry `0000000000 00001 f` marks slot 3 as free, which
-/// `live_object_refs()` filters out (`CacheEntry::Deleted`).
+/// The free-list entry `0000000000 00001 f` marks slot 3 as free, so the
+/// canonical cache never gains an entry for it.
 const TWO_OBJECT_PDF_SIZE4_PADDED_FREE: &[u8] = b"\
 %PDF-1.7
 1 0 obj

@@ -3,9 +3,9 @@
 //!
 //! Loads both files with [`Pdf::open_mem_owned_with_options`], cleans the
 //! trailer (mask `/Length` and `/ID`), compares the trailers, cleans the
-//! encryption dict (strip `/O /OE /U /UE /Perms`), then walks the live
-//! object refs in ascending `(number, generation)` order and delegates each
-//! pair to [`compare_objects`].
+//! encryption dict (strip `/O /OE /U /UE /Perms`), then walks all objects in
+//! ascending `(number, generation)` order and delegates each pair to
+//! [`compare_objects`].
 //!
 //! Oracle: qpdf 11.9.0 `compare-for-test/qpdf-test-compare.cc:148-181`.
 

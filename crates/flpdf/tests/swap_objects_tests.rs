@@ -165,7 +165,7 @@ fn swapping_two_slots_with_one_shared_value_is_a_noop() {
 }
 
 #[test]
-fn swap_objects_preserves_a_replaced_null_slot_for_live_object_refs() {
+fn swap_objects_preserves_a_replaced_null_slot_in_the_canonical_cache() {
     let mut pdf = Pdf::empty().expect("empty PDF");
     let deleted = indirect_marker(&pdf, 1);
     let deleted_ref = deleted.object_ref().expect("indirect marker has a ref");
@@ -177,7 +177,7 @@ fn swap_objects_preserves_a_replaced_null_slot_for_live_object_refs() {
             .into_iter()
             .filter_map(|handle| handle.object_ref())
             .any(|object_ref| object_ref == deleted_ref),
-        "replaceObject(og, newNull()) must keep the object ref in the live cache"
+        "replaceObject(og, newNull()) must keep the object ref in the canonical cache"
     );
 
     let source = indirect_marker(&pdf, 9);

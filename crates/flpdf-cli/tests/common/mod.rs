@@ -33,14 +33,6 @@ pub fn canonical_object_refs<R: std::io::Read + std::io::Seek + 'static>(
         .collect()
 }
 
-/// Compatibility name for tests that previously used the removed facade live
-/// enumeration. The completed qpdf cache is the public integration boundary.
-pub fn canonical_live_object_refs<R: std::io::Read + std::io::Seek + 'static>(
-    pdf: &mut Pdf<R>,
-) -> Vec<ObjectRef> {
-    canonical_object_refs(pdf)
-}
-
 /// Return the canonical annotation handles listed by a page.
 pub fn page_annotation_handles<R: std::io::Read + std::io::Seek>(
     pdf: &mut Pdf<R>,

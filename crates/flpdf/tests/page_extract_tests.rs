@@ -479,7 +479,7 @@ fn shared_resource_pdf() -> Vec<u8> {
 /// Count how many live objects in `doc` carry the given /Subtype name.
 fn count_subtype(doc: &mut Pdf<std::io::Cursor<Vec<u8>>>, subtype: &[u8]) -> usize {
     let mut n = 0;
-    for r in common::canonical_live_object_refs(doc) {
+    for r in common::canonical_object_refs(doc) {
         let obj = resolved_handle(doc, r);
         let Some(dict) = obj
             .as_dictionary()
@@ -498,7 +498,7 @@ fn count_subtype(doc: &mut Pdf<std::io::Cursor<Vec<u8>>>, subtype: &[u8]) -> usi
 /// Count how many live objects in `doc` carry the given /Type name.
 fn count_type(doc: &mut Pdf<std::io::Cursor<Vec<u8>>>, type_name: &[u8]) -> usize {
     let mut n = 0;
-    for r in common::canonical_live_object_refs(doc) {
+    for r in common::canonical_object_refs(doc) {
         let obj = resolved_handle(doc, r);
         let Some(dict) = obj
             .as_dictionary()

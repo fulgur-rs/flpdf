@@ -38,13 +38,6 @@ pub fn canonical_object_refs<R: Read + Seek + 'static>(pdf: &mut Pdf<R>) -> Vec<
         .collect()
 }
 
-/// Return the canonical objects used by tests that previously asked for the
-/// facade's live view. The writer-facing live filter is private; integration
-/// assertions only need the qpdf cache objects after a completed write.
-pub fn canonical_live_object_refs<R: Read + Seek + 'static>(pdf: &mut Pdf<R>) -> Vec<ObjectRef> {
-    canonical_object_refs(pdf)
-}
-
 /// Result shape used by integration tests that only need to assert that the
 /// canonical qpdf job check accepted an emitted PDF.
 #[derive(Debug)]

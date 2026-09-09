@@ -216,7 +216,7 @@ fn dangling_bead_p_dropped_and_page_gced() {
 
     // The /P drop leaves the removed page unreferenced. It remains in memory
     // until the writer owns the reachability decision.
-    let live = common::canonical_live_object_refs(&mut pdf);
+    let live = common::canonical_object_refs(&mut pdf);
     assert!(
         live.contains(&ObjectRef::new(4, 0)),
         "unreferenced page 2 remains in memory before writing"
@@ -304,7 +304,7 @@ fn dangling_bead_p_dropped_and_page_gced_via_b_array_without_threads() {
         "bead 12 /P (removed page) must be dropped via /B seeding"
     );
 
-    let live = common::canonical_live_object_refs(&mut pdf);
+    let live = common::canonical_object_refs(&mut pdf);
     assert!(
         live.contains(&ObjectRef::new(4, 0)),
         "unreferenced page 2 remains in memory before writing"
