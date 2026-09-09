@@ -149,7 +149,7 @@ fn indirect_child(parent: &ObjectHandle, key: &[u8]) -> Result<Option<ObjectHand
 ///
 /// # Errors
 ///
-/// - Any error propagated from [`Pdf::resolve`].
+/// - Any error propagated from the canonical [`ObjectHandle`] resolver.
 /// - [`Error::Unsupported`] when the outline depth limit (100) is exceeded or
 ///   an unexpected object type is encountered in the outline tree.
 pub fn remap_outline_and_dests<R: Read + Seek>(
@@ -163,7 +163,7 @@ pub fn remap_outline_and_dests<R: Read + Seek>(
 ///
 /// # Errors
 ///
-/// - Any error propagated from [`Pdf::resolve`].
+/// - Any error propagated from the canonical [`ObjectHandle`] resolver.
 /// - [`Error::Unsupported`] when the name-tree or outline-tree depth exceeds
 ///   `max_depth` while remapping.
 pub fn remap_outline_and_dests_with_max_depth<R: Read + Seek>(
@@ -193,8 +193,7 @@ pub fn remap_outline_and_dests_with_max_depth<R: Read + Seek>(
         None => return Ok(()), // No catalog, nothing to do.
     };
     let catalog = pdf.get_object_handle(catalog_ref);
-    pdf.resolve(&catalog)?;
-    if catalog.try_as_dictionary()?.is_none() {
+    if !catalog.try_is_dictionary()? {
         return Ok(());
     }
 
@@ -289,7 +288,6 @@ fn remap_annot_dests<R: Read + Seek>(
         // /Annots may be an inline array (stored in the page dict) or an
         // indirect reference to an array object.
         let page = pdf.get_object_handle(page_ref);
-        pdf.resolve(&page)?;
         let Some(annots) = child_if_present(&page, b"/Annots")? else {
             continue;
         };

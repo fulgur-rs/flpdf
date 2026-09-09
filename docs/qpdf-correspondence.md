@@ -1662,6 +1662,23 @@ direct field entries remain ignored and the existing field identity, depth,
 cycle, and mutation order are unchanged. qtest exceptions and the separate
 merge/drop-family behavior remain outside this bounded row.
 
+### A6/A7 outline/destination remap accessor slice `flpdf-3yn9.48.23.13` (2026-09-10)
+
+The page-subset outline, named-destination, link-annotation, and
+`/OpenAction` remap consumer now resolves its catalog and surviving-page
+handles through the canonical `ObjectHandle` accessors. The page-driven
+removed-page null-out and surviving-destination remap remain owned by the
+same qpdf job boundary (`libqpdf/QPDFJob.cc:2469-2470,2585-2608`), while the
+lazy type/key and warning/error behavior follows
+`libqpdf/QPDFObjectHandle.cc:240-446,965-989,2168-2189`.
+
+The scoped production route has zero explicit `Pdf::resolve` or
+`resolve_handle*` calls and no non-resolving dictionary/array/name/null or
+panic key accessors. Existing raw destination-array handling, visited sets,
+direct/indirect annotation support, and page-driven null-out ordering are
+unchanged. Struct-tree/thread-bead drop-family behavior, qtest exceptions,
+and unrelated writer/CLI/stream routes remain outside this bounded row.
+
 ### QPDFJob `doInspection` combined top-level consumer `flpdf-giz3` (2026-09-10)
 
 The top-level CLI now routes combined inspection selections through the
