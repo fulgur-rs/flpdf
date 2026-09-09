@@ -345,12 +345,16 @@ outside this slice.
 The production path in
 `crates/flpdf/src/page_label_document_helper.rs` now has zero explicit
 `Pdf::resolve`, `resolve_handle`, or `resolve_handle_ref` bridge callers.
-The live label dictionary, catalog root, effective label, and prefix-presence
-paths use `try_dereference`, `try_as_dictionary`, `try_as_name`,
-`try_as_integer`, `try_is_null`, and `try_get_string_value` at the qpdf
-accessor boundary. A missing or null `/P` is checked before the string value
-accessor, preserving qpdf's absent-prefix behavior while non-null values retain
-fallible string conversion.
+The live label dictionary, catalog root, effective label, and prefix paths use
+`try_dereference`, `try_as_dictionary`, `try_as_name`, `try_as_integer`, and
+`try_is_null` at the qpdf accessor boundary. `/P` is the exception: it is
+dereferenced through the canonical handle and then read with the silent
+`as_string`, falling back to an empty prefix for any other type.
+`getLabelForPage` copies `/P` verbatim without inspecting its type
+(`QPDFPageLabelDocumentHelper.cc:38,48` — only `/St` gets an `isInteger()`
+check at `:41`), so the warning-emitting `try_get_string_value` port must not
+read it; doing so raised qpdf's string typeWarning and turned a
+non-string-prefix run into exit 3.
 
 The number-tree depth/error policy, raw `/S`/`/P`/`/St` presence, and
 `/St` offset reconstruction remain unchanged and are anchored to
