@@ -1315,23 +1315,37 @@ impl<R: Read + Seek> ResolverHandle<R> {
     /// `setLastObjectDescription(description, og)` (`QPDF.cc:1298-1310`):
     /// the caller's description is part of the state, not only a formatter
     /// argument at the eventual warning site.
-    fn set_last_object_description(&self, object_ref: ObjectRef, description: Option<&[u8]>) {
+    fn set_last_qpdf_obj_gen_description(
+        &self,
+        object_ref: QpdfObjGen,
+        description: Option<&[u8]>,
+    ) {
         let mut rendered = Vec::new();
         if let Some(description) = description.filter(|description| !description.is_empty()) {
             rendered.extend_from_slice(description);
-            if object_ref.number != 0 {
+            if object_ref.is_indirect() {
                 rendered.extend_from_slice(b": ");
             }
         }
-        if object_ref.number != 0 {
+        if object_ref.is_indirect() {
             rendered.extend_from_slice(
-                format!("object {} {}", object_ref.number, object_ref.generation).as_bytes(),
+                format!("object {} {}", object_ref.get_obj(), object_ref.get_gen()).as_bytes(),
             );
         }
 
         let mut core = self.core.borrow_mut();
         core.last_object_description = String::from_utf8_lossy(&rendered).into_owned();
         core.last_object_description_bytes = rendered;
+    }
+
+    fn set_last_object_description(
+        &self,
+        object_ref: ObjectRef,
+        description: Option<&[u8]>,
+    ) -> Result<()> {
+        let object_gen = QpdfObjGen::try_from_object_ref(object_ref)?;
+        self.set_last_qpdf_obj_gen_description(object_gen, description);
+        Ok(())
     }
 
     /// Append a generic damaged-PDF warning with the current object
@@ -1474,7 +1488,75 @@ impl<R: Read + Seek> ResolverHandle<R> {
                 return Ok(false);
             }
         }
+        // qpdf walks the raw xref table, not only the parsed indirect-reference
+        // projection. Rows such as object 5 generation 65536 cannot mint an
+        // ObjectRef, but they still must reach the same offset/header/recovery
+        // boundary so qpdf's expected-generation diagnostics are preserved.
+        for (object_gen, entry) in self.raw_xref_entries() {
+            if object_gen.to_object_ref().is_some() || !object_gen.is_indirect() {
+                continue;
+            }
+            let XrefEntry::Uncompressed { offset } = entry else {
+                continue;
+            };
+            self.resolve_raw_xref_entry(object_gen, offset)?;
+            if may_change && self.reconstructed_xref() {
+                return Ok(false);
+            }
+        }
         Ok(true)
+    }
+
+    /// Resolve a raw xref row whose generation cannot cross the PDF parser's
+    /// valid `ObjectRef` boundary. qpdf still reads the physical offset with
+    /// the signed `QPDFObjGen` as the expected identity, so a header mismatch
+    /// enters the ordinary reconstruction/retry path and keeps the raw
+    /// generation in its warning text (`QPDF.cc:1239-1254,1580-1632`).
+    fn resolve_raw_xref_entry(&self, object_gen: QpdfObjGen, offset: u64) -> Result<()> {
+        if offset == 0 {
+            self.set_last_qpdf_obj_gen_description(object_gen, None);
+            self.push_warning_at(0, "object has offset 0")?;
+            return Ok(());
+        }
+        let attempt_recovery = self.attempt_recovery();
+        let result = match self.read_object_at_offset_with_description(
+            offset,
+            object_gen,
+            true,
+            attempt_recovery,
+            None,
+        ) {
+            Ok(parsed) => {
+                self.cache_parsed_object(parsed);
+                Ok(())
+            }
+            Err(ReadObjectAtOffsetError::Body(error)) => Err(error),
+            Err(ReadObjectAtOffsetError::Header(error)) if attempt_recovery => {
+                match self.reconstruct_xref_and_retry(error, object_gen) {
+                    Ok(Some(parsed)) => {
+                        self.cache_parsed_object(parsed);
+                        Ok(())
+                    }
+                    Ok(None) => {
+                        self.push_warning_at(
+                            0,
+                            format!(
+                                "object {} {} not found in file after regenerating cross reference table",
+                                object_gen.get_obj(),
+                                object_gen.get_gen()
+                            ),
+                        )?;
+                        Ok(())
+                    }
+                    Err(error) => Err(error),
+                }
+            }
+            Err(ReadObjectAtOffsetError::Header(error)) => Err(error),
+        };
+        if let Err(error) = result {
+            self.push_caught_resolution_warning(error, object_gen)?;
+        }
+        Ok(())
     }
 
     /// Ensure every effective xref object and every parser-discovered
@@ -1745,7 +1827,7 @@ impl<R: Read + Seek> ResolverHandle<R> {
     fn reconstruct_xref_and_retry(
         &self,
         trigger_error: Error,
-        object_ref: ObjectRef,
+        expected: QpdfObjGen,
     ) -> Result<Option<ParsedObjectAtOffset>> {
         if self.core.borrow().reconstructed_xref {
             // Avoid xref reconstruction infinite loops (QPDF.cc:518-522).
@@ -1781,7 +1863,7 @@ impl<R: Read + Seek> ResolverHandle<R> {
                 self.push_qpdf_warning(QpdfExc::new(
                     QpdfErrorCode::DamagedPdf,
                     filename,
-                    format!("object {} {}", object_ref.number, object_ref.generation),
+                    format!("object {} {}", expected.get_obj(), expected.get_gen()),
                     i64::try_from(offset).unwrap_or(i64::MAX),
                     message.into_bytes(),
                 ))?; // cov:ignore: parser recovery always supplies a qpdf exception or parse error in this route
@@ -1825,17 +1907,28 @@ impl<R: Read + Seek> ResolverHandle<R> {
             core.raw_source_xref_entries.extend(new_raw_entries);
         }
 
-        // Lookup object_ref in reconstructed xref table
-        let retry_entry = self.xref_entry(object_ref);
+        // Lookup the same raw object/generation in the reconstructed xref
+        // table. qpdf's one table keeps invalid generations visible here;
+        // the valid ObjectRef projection is only a fallback for tests that
+        // inject effective entries directly.
+        let retry_entry = self
+            .core
+            .borrow()
+            .raw_source_xref_entries
+            .get(&expected)
+            .copied()
+            .or_else(|| {
+                expected
+                    .to_object_ref()
+                    .and_then(|object_ref| self.xref_entry(object_ref))
+            });
         match retry_entry {
             Some(XrefEntry::Uncompressed { offset: new_offset }) => {
                 // qpdf QPDF.cc:1622-1628: the retry call has try_recovery=false, so
                 // any parse failure propagates as an exception (Err here).
-                self.read_object_at_offset_with_description(
-                    new_offset, object_ref, true, false, None,
-                )
-                .map(Some)
-                .map_err(ReadObjectAtOffsetError::into_error)
+                self.read_object_at_offset_with_description(new_offset, expected, true, false, None)
+                    .map(Some)
+                    .map_err(ReadObjectAtOffsetError::into_error)
             }
             // qpdf's retry condition is `getType() == 1` exactly
             // (`QPDF.cc:1618`): a reconstructed entry of any other shape --
@@ -2334,7 +2427,7 @@ impl<R: Read + Seek> ResolverHandle<R> {
                 .map_err(|_| Error::parse(0, "object stream member offset is too large"))?;
             let description_template =
                 self.object_stream_description_template(stream_number, object_ref);
-            self.set_last_object_description(object_ref, None);
+            self.set_last_object_description(object_ref, None)?;
             let mut handles = ChildHandles {
                 resolver: self,
                 description_template: description_template.clone(),
@@ -2435,7 +2528,7 @@ impl<R: Read + Seek> ResolverHandle<R> {
     /// so the diagnostic keeps the exception offset rather than rendering it
     /// into the message text. Offsetless failures retain the existing text
     /// path.
-    fn push_caught_resolution_warning(&self, error: Error, object_ref: ObjectRef) -> Result<()> {
+    fn push_caught_resolution_warning(&self, error: Error, object_gen: QpdfObjGen) -> Result<()> {
         match error {
             Error::QpdfExc(warning) => self.push_qpdf_warning(warning),
             Error::Parse { offset, message } => {
@@ -2452,7 +2545,8 @@ impl<R: Read + Seek> ResolverHandle<R> {
             Error::Internal(message) => {
                 let message = format!(
                     "object {}/{}: error reading object: {message}",
-                    object_ref.number, object_ref.generation
+                    object_gen.get_obj(),
+                    object_gen.get_gen()
                 );
                 let filename = if self.input_source_closed() {
                     CLOSED_INPUT_SOURCE_NAME.as_bytes().to_vec()
@@ -2487,7 +2581,8 @@ impl<R: Read + Seek> ResolverHandle<R> {
                 let detail = message.split(|byte| *byte == 0).next().unwrap_or_default();
                 let mut qpdf_message = format!(
                     "object {}/{}: error reading object: ",
-                    object_ref.number, object_ref.generation
+                    object_gen.get_obj(),
+                    object_gen.get_gen()
                 )
                 .into_bytes();
                 qpdf_message.extend_from_slice(detail);
@@ -2504,7 +2599,8 @@ impl<R: Read + Seek> ResolverHandle<R> {
                 let detail = message.split('\0').next().unwrap_or_default();
                 let qpdf_message = format!(
                     "object {}/{}: error reading object: {detail}",
-                    object_ref.number, object_ref.generation
+                    object_gen.get_obj(),
+                    object_gen.get_gen()
                 );
                 let filename = self.core.borrow().description.clone();
                 self.push_qpdf_warning(QpdfExc::new(
@@ -2518,7 +2614,8 @@ impl<R: Read + Seek> ResolverHandle<R> {
             Error::Io(error) => {
                 let mut qpdf_message = format!(
                     "object {}/{}: error reading object: ",
-                    object_ref.number, object_ref.generation
+                    object_gen.get_obj(),
+                    object_gen.get_gen()
                 )
                 .into_bytes();
                 qpdf_message.extend_from_slice(error.to_string().as_bytes());
@@ -2537,7 +2634,7 @@ impl<R: Read + Seek> ResolverHandle<R> {
                 self.push_qpdf_warning(QpdfExc::new(
                     QpdfErrorCode::DamagedPdf,
                     filename,
-                    format!("object {}/{}", object_ref.number, object_ref.generation),
+                    format!("object {}/{}", object_gen.get_obj(), object_gen.get_gen()),
                     0,
                     error.to_string().into_bytes(),
                 ))
@@ -3072,7 +3169,13 @@ impl<R: Read + Seek> ResolverHandle<R> {
         expected: ObjectRef,
     ) -> Result<(ObjectValue, i64)> {
         let parsed = self
-            .read_object_at_offset_with_description(offset, expected, false, false, None)
+            .read_object_at_offset_with_description(
+                offset,
+                QpdfObjGen::try_from_object_ref(expected)?,
+                false,
+                false,
+                None,
+            )
             .map_err(ReadObjectAtOffsetError::into_error)?;
         Ok((parsed.value, parsed.parsed_offset))
     }
@@ -3116,7 +3219,13 @@ impl<R: Read + Seek> ResolverHandle<R> {
         description: Option<Vec<u8>>,
     ) -> Result<(ObjectHandle, Option<u64>)> {
         let parsed = self
-            .read_object_at_offset_with_description(offset, expected, true, false, description)
+            .read_object_at_offset_with_description(
+                offset,
+                QpdfObjGen::try_from_object_ref(expected)?,
+                true,
+                false,
+                description,
+            )
             .map_err(ReadObjectAtOffsetError::into_error)?;
         let damage_offset = parsed
             .trailing_start
@@ -3144,7 +3253,7 @@ impl<R: Read + Seek> ResolverHandle<R> {
         let parsed = self
             .read_object_at_offset_with_description(
                 offset,
-                ObjectRef::new(0, 0),
+                QpdfObjGen::new(0, 0),
                 true,
                 false,
                 description,
@@ -3192,19 +3301,19 @@ impl<R: Read + Seek> ResolverHandle<R> {
     fn read_object_at_offset_with_description(
         &self,
         offset: u64,
-        expected: ObjectRef,
+        expected: QpdfObjGen,
         capture_end_offsets: bool,
         try_recovery: bool,
         read_description: Option<Vec<u8>>,
     ) -> std::result::Result<ParsedObjectAtOffset, ReadObjectAtOffsetError> {
-        let expected_description = if expected.number != 0 {
-            self.set_last_object_description(expected, read_description.as_deref());
+        let expected_description = if expected.is_indirect() {
+            self.set_last_qpdf_obj_gen_description(expected, read_description.as_deref());
             self.core.borrow().last_object_description_bytes.clone()
         } else {
             Vec::new()
         };
         self.seek(offset).map_err(ReadObjectAtOffsetError::Body)?;
-        let (found, parsed, trailing, trailing_start, object_header_offset) = {
+        let (found_raw, found, parsed, trailing, trailing_start, object_header_offset) = {
             let mut input = self.live_input();
             let mut tokenizer = LiveTokenSource::new(&mut input);
             let number_token = tokenizer
@@ -3239,24 +3348,40 @@ impl<R: Read + Seek> ResolverHandle<R> {
             drop(tokenizer);
             let object_header_offset = input.tell().map_err(ReadObjectAtOffsetError::Header)?;
 
-            let found = u32::try_from(number)
-                .ok()
-                .zip(u16::try_from(generation).ok())
-                .map(|(number, generation)| ObjectRef::new(number, generation));
-            if try_recovery && found != Some(expected) {
+            let found_raw = match (i32::try_from(number), i32::try_from(generation)) {
+                (Ok(number), Ok(generation)) => QpdfObjGen::new(number, generation),
+                _ => {
+                    return Err(ReadObjectAtOffsetError::Header(Error::parse(
+                        offset as usize,
+                        "object reference is out of range",
+                    )));
+                }
+            };
+            if try_recovery && found_raw != expected {
                 return Err(ReadObjectAtOffsetError::Header(Error::parse(
                     offset as usize,
-                    format!("expected {} {} obj", expected.number, expected.generation),
+                    format!("expected {} {} obj", expected.get_obj(), expected.get_gen()),
                 )));
             }
+            if found_raw.get_obj() == 0 {
+                return Err(ReadObjectAtOffsetError::Header(Error::parse(
+                    offset as usize,
+                    "object with ID 0",
+                )));
+            }
+            let found = found_raw.to_object_ref();
             let mut minter = ChildHandles {
                 resolver: self,
                 description_template: match read_description.as_deref() {
                     Some(description) => self.parser_description_template_for_read(
-                        found.unwrap_or(expected),
+                        found.unwrap_or_else(|| {
+                            expected.to_object_ref().unwrap_or(ObjectRef::new(0, 0))
+                        }),
                         description,
                     ),
-                    None => self.parser_description_template(found.unwrap_or(expected)),
+                    None => self.parser_description_template(found.unwrap_or_else(|| {
+                        expected.to_object_ref().unwrap_or(ObjectRef::new(0, 0))
+                    })),
                 },
             };
             let encryption_parameters = self.encryption_parameters();
@@ -3305,6 +3430,7 @@ impl<R: Read + Seek> ResolverHandle<R> {
                 .and_then(|token| u64::try_from(token.start).ok());
             input.finish().map_err(ReadObjectAtOffsetError::Body)?;
             (
+                found_raw,
                 found,
                 parsed,
                 trailing,
@@ -3327,15 +3453,15 @@ impl<R: Read + Seek> ResolverHandle<R> {
             )));
         }
         let found = found.expect("the range check above establishes the header object reference");
-        self.set_last_object_description(found, read_description.as_deref());
+        self.set_last_qpdf_obj_gen_description(found_raw, read_description.as_deref());
         let warning_filename = self.core.borrow().description.clone();
-        if expected.number != 0 && found != expected {
+        if expected.is_indirect() && found_raw != expected {
             self.push_qpdf_warning(QpdfExc::new(
                 QpdfErrorCode::DamagedPdf,
                 &warning_filename,
                 expected_description,
                 i64::try_from(offset).unwrap_or(i64::MAX),
-                format!("expected {} {} obj", expected.number, expected.generation).into_bytes(),
+                format!("expected {} {} obj", expected.get_obj(), expected.get_gen()).into_bytes(),
             ))
             .map_err(ReadObjectAtOffsetError::Body)?;
         }
@@ -4854,7 +4980,7 @@ impl<R: Read + Seek> ResolverHandle<R> {
                 let attempt_recovery = self.attempt_recovery();
                 match self.read_object_at_offset_with_description(
                     offset,
-                    object_ref,
+                    QpdfObjGen::try_from_object_ref(object_ref)?,
                     true,
                     attempt_recovery,
                     None,
@@ -4872,7 +4998,10 @@ impl<R: Read + Seek> ResolverHandle<R> {
                     }
                     Err(ReadObjectAtOffsetError::Body(error)) => Err(error),
                     Err(ReadObjectAtOffsetError::Header(error)) if attempt_recovery => {
-                        match self.reconstruct_xref_and_retry(error, object_ref) {
+                        match self.reconstruct_xref_and_retry(
+                            error,
+                            QpdfObjGen::try_from_object_ref(object_ref)?,
+                        ) {
                             Ok(Some(parsed)) => {
                                 let parsed_ref = parsed.object_ref;
                                 self.cache_parsed_object(parsed);
@@ -4919,7 +5048,10 @@ impl<R: Read + Seek> ResolverHandle<R> {
         match result {
             Ok(()) => Ok(()),
             Err(error) => {
-                self.push_caught_resolution_warning(error, object_ref)?;
+                self.push_caught_resolution_warning(
+                    error,
+                    QpdfObjGen::try_from_object_ref(object_ref)?,
+                )?;
                 if !handle.is_resolved() {
                     handle.set_resolved(ObjectValue::Null);
                 }
@@ -4941,6 +5073,7 @@ mod tests {
     use super::REENTRANT_PARSE_ERROR;
     use crate::encryption::state::{EncryptionMode, EncryptionState};
     use crate::object_handle::{DocumentResolver, ObjectValue, NO_PARSED_OFFSET};
+    use crate::qpdf_obj_gen::QpdfObjGen;
     use crate::{
         Diagnostics, Error, ObjectHandle, ObjectRef, Pdf, QpdfErrorCode, QpdfExc, XrefEntry,
     };
@@ -11573,7 +11706,7 @@ mod tests {
         resolver
             .push_caught_resolution_warning(
                 Error::Unsupported("unfilterable object stream".to_owned()),
-                ObjectRef::new(1, 0),
+                QpdfObjGen::try_from_object_ref(ObjectRef::new(1, 0)).unwrap(),
             )
             .expect("the offsetless warning should reach the document sink");
 
@@ -11601,7 +11734,10 @@ mod tests {
         for error in errors {
             let resolver = bare_resolver();
             resolver
-                .push_caught_resolution_warning(error, ObjectRef::new(7, 0))
+                .push_caught_resolution_warning(
+                    error,
+                    QpdfObjGen::try_from_object_ref(ObjectRef::new(7, 0)).unwrap(),
+                )
                 .expect("caught resolution diagnostics should be emitted");
             assert_eq!(resolver.repair_diagnostics().len(), 1);
         }
@@ -13917,9 +14053,10 @@ mod tests {
 
         // Simulate a second recovery trigger by invoking reconstruct_xref_and_retry directly
         let err = Error::parse(10, "expected 2 0 obj");
-        let result = pdf
-            .resolver
-            .reconstruct_xref_and_retry(err, ObjectRef::new(2, 0)); // cov:ignore: executed reconstruction retry continuation has no LLVM counter.
+        let result = pdf.resolver.reconstruct_xref_and_retry(
+            err,
+            QpdfObjGen::try_from_object_ref(ObjectRef::new(2, 0)).unwrap(),
+        ); // cov:ignore: executed reconstruction retry continuation has no LLVM counter.
 
         assert!(
             matches!(&result, Err(Error::Parse { message, .. }) if message == "expected 2 0 obj"),
@@ -13943,9 +14080,10 @@ mod tests {
         );
         // qpdf only triggers reconstruction on QPDFExc (parse errors).
         // A non-parse trigger propagates unchanged without touching the guard.
-        let res = pdf
-            .resolver
-            .reconstruct_xref_and_retry(err, ObjectRef::new(1, 0));
+        let res = pdf.resolver.reconstruct_xref_and_retry(
+            err,
+            QpdfObjGen::try_from_object_ref(ObjectRef::new(1, 0)).unwrap(),
+        );
         assert!(
             matches!(res, Err(Error::FileIo { .. })),
             "non-parse error must propagate unchanged: {res:?}"
@@ -13981,7 +14119,9 @@ mod tests {
         );
 
         let err = Error::parse(0, "expected 5 0 obj");
-        let result = pdf.resolver.reconstruct_xref_and_retry(err, object_ref);
+        let result = pdf
+            .resolver
+            .reconstruct_xref_and_retry(err, QpdfObjGen::try_from_object_ref(object_ref).unwrap());
 
         assert!(
             matches!(result, Ok(None)),
