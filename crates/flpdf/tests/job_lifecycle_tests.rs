@@ -1954,6 +1954,46 @@ fn write_qpdf_output_sink_error_does_not_prefix_the_input_name() {
     );
 }
 
+#[cfg(target_os = "linux")]
+#[test]
+fn linearized_output_sink_error_reports_the_qpdf_output_pipeline() {
+    // The linearized route hands the finished document to the sink in one
+    // piece, so it carries the failure through a different call than the
+    // streaming route above. qpdf 11.9.0 prints the same line for both:
+    // `qpdf --linearize <input> /dev/full`.
+    let input = Path::new(env!("CARGO_MANIFEST_DIR"))
+        .join("../../tests/fixtures/compat/objstm-lin-outlines-80-200.pdf");
+    let json = serde_json::json!({
+        "inputFile": input,
+        "outputFile": "/dev/full",
+        "linearize": ""
+    })
+    .to_string();
+    let (logger, state) = logger_with_error_sink();
+    let mut job = QPDFJob::new();
+    job.set_logger(logger);
+    job.initialize_from_json(&json).unwrap();
+    let mut pdf = job.create_qpdf().unwrap().expect("input should open");
+
+    let error = job
+        .write_qpdf(&mut pdf)
+        .expect_err("/dev/full must reject the linearized output");
+    assert!(
+        matches!(
+            &error,
+            Error::SystemBytes(message)
+                if message == b"qpdf output: Pl_StdioFile::write: No space left on device"
+        ),
+        "{error:?}"
+    );
+    // The JSON entry point carries qpdf's own `qpdfjob json` message prefix
+    // (`qpdfjob-c.cc:82`); only the prefix differs from the argv route.
+    assert_eq!(
+        state.lock().unwrap().bytes,
+        b"qpdfjob json: qpdf output: Pl_StdioFile::write: No space left on device\n"
+    );
+}
+
 #[test]
 fn write_qpdf_without_an_output_runs_inspection() {
     let input = Path::new(env!("CARGO_MANIFEST_DIR")).join("../../tests/fixtures/minimal.pdf");
