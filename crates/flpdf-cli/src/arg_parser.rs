@@ -804,6 +804,12 @@ fn canonical_top_level_non_utf8_option(
         return arg;
     };
     let name = name.to_owned();
+    if name == PRESERVE_UNREFERENCED_RESOURCES {
+        // The option name itself is ASCII even when the attached value is
+        // not, and qpdf's synonym takes no value, so map it here for the same
+        // reason the UTF-8 path does.
+        return RawArg::from_bytes(b"--remove-unreferenced-resources=no".to_vec());
+    }
     // A single-dash abbreviation only reaches the qpdf-shaped `--name`
     // grammar when the ASCII path (`canonical_top_level_option`) would
     // also promote it: either the argument was already `--name` form, or
@@ -1178,6 +1184,38 @@ mod tests {
             .expect("raw argv should remain a residual positional");
 
         assert_eq!(parsed.residual_args[1], input);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn parser_maps_the_resource_synonym_with_a_non_utf8_value() {
+        use std::os::unix::ffi::OsStringExt;
+
+        // The option name stays ASCII even when an attached value is not, and
+        // qpdf accepts both spellings with such a value (exit 0), so the
+        // raw-byte path has to reach the same option as the UTF-8 path.
+        for spelling in [
+            b"--preserve-unreferenced-resources=\xff\xfe".to_vec(),
+            b"-preserve-unreferenced-resources=\xff\xfe".to_vec(),
+        ] {
+            let command = clap::Command::new("flpdf").arg(
+                clap::Arg::new("remove-unreferenced-resources")
+                    .long("remove-unreferenced-resources")
+                    .require_equals(true),
+            );
+            let parsed = ArgParser::from_command(command)
+                .parse_os(vec![
+                    OsString::from("flpdf"),
+                    OsString::from_vec(spelling.clone()),
+                ])
+                .expect("the raw-byte synonym should reach the value option");
+
+            assert_eq!(
+                parsed.residual_args,
+                ["flpdf", "--remove-unreferenced-resources=no"],
+                "{spelling:?}"
+            );
+        }
     }
 
     #[cfg(unix)]
