@@ -8546,4 +8546,17 @@ mod final_handle_tests {
             Some(0)
         );
     }
+
+    #[test]
+    fn xref_registration_ignores_negative_raw_object_numbers() {
+        let mut registration = XrefRegistration::default();
+        let key = QpdfObjGen::new(-1, 0);
+
+        registration.insert_xref_entry(key, XrefEntry::Uncompressed { offset: 1 });
+        registration.insert_free_xref_entry(key);
+
+        assert!(registration.raw_entries.is_empty());
+        assert!(registration.entries.is_empty());
+        assert!(registration.deleted_objects.is_empty());
+    }
 }
