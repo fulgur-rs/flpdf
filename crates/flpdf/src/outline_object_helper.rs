@@ -132,7 +132,7 @@ impl OutlineItem {
         let Some(value) = outline_dict_key(&self.object, b"/Title")? else {
             return Ok(String::new());
         };
-        helper.resolve_handle(&value)?;
+        value.try_dereference()?;
         title_from_handle(&value)
     }
 
@@ -152,7 +152,7 @@ impl OutlineItem {
         let Some(value) = outline_dict_key(&self.object, b"/Count")? else {
             return Ok(0);
         };
-        helper.resolve_handle(&value)?;
+        value.try_dereference()?;
         count_from_handle(&value)
     }
 
@@ -192,7 +192,7 @@ impl OutlineItem {
         } else {
             candidate
         };
-        helper.resolve_handle(&dest)?;
+        dest.try_dereference()?;
         Ok(dest)
     }
 

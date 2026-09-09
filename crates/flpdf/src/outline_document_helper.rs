@@ -156,7 +156,7 @@ impl<'a, R: Read + Seek> OutlineDocumentHelper<'a, R> {
         let Some(outlines) = self.catalog_outlines()? else {
             return Ok(false);
         };
-        self.pdf.resolve(&outlines)?;
+        outlines.try_dereference()?;
         if outlines.try_as_dictionary()?.is_none() {
             return Ok(false);
         }
@@ -174,10 +174,6 @@ impl<'a, R: Read + Seek> OutlineDocumentHelper<'a, R> {
     /// [`OutlineItem::get_count`], which each resolve one level of
     /// indirection off an already-obtained `/Title`/`/Count` value the same
     /// way qpdf's `QPDFObjectHandle` transparently dereferences on access.
-    pub(crate) fn resolve_handle(&mut self, handle: &ObjectHandle) -> Result<()> {
-        self.pdf.resolve(handle)
-    }
-
     pub(crate) fn ensure_handle_belongs_to_pdf(&self, handle: &ObjectHandle) -> Result<()> {
         if handle.belongs_to_pdf(self.pdf.unique_id()) {
             return Ok(());
@@ -190,7 +186,8 @@ impl<'a, R: Read + Seek> OutlineDocumentHelper<'a, R> {
     /// Resolve one child handle through the owning document while preserving
     /// the canonical handle identity used by the outline walk.
     pub(crate) fn resolve_value_handle(&mut self, handle: ObjectHandle) -> Result<ObjectHandle> {
-        self.pdf.resolve_handle(&handle)
+        handle.try_dereference()?;
+        Ok(handle)
     }
 
     /// Chase `cursor` to its terminal target (see [`Self::resolve_value_handle`])
@@ -231,7 +228,7 @@ impl<'a, R: Read + Seek> OutlineDocumentHelper<'a, R> {
             return Ok(None);
         };
         let catalog = self.pdf.get_object_handle(catalog_ref);
-        self.resolve_handle(&catalog)?;
+        catalog.try_dereference()?;
         if catalog.try_as_dictionary()?.is_none() {
             return Ok(None);
         }
@@ -258,7 +255,7 @@ impl<'a, R: Read + Seek> OutlineDocumentHelper<'a, R> {
         let Some(outlines) = self.catalog_outlines()? else {
             return Ok(tree);
         };
-        self.resolve_handle(&outlines)?;
+        outlines.try_dereference()?;
         if outlines.try_as_dictionary()?.is_none() {
             return Ok(tree);
         }
@@ -536,6 +533,32 @@ mod tests {
     use super::mark_direct_sibling_seen;
     use crate::{ObjectHandle, ObjectRef, Pdf};
     use std::io::Cursor;
+
+    #[test]
+    fn resolve_value_handle_propagates_an_unresolved_handle_error() {
+        let mut pdf = Pdf::open(Cursor::new(minimal_pdf_bytes())).unwrap();
+        let mut helper = pdf.outline();
+        let handle = ObjectHandle::new_indirect_unresolved(ObjectRef::new(99, 0), -1);
+        let error = helper.resolve_value_handle(handle).unwrap_err();
+        assert!(matches!(
+            error,
+            crate::Error::Internal(ref message)
+                if message == "object 99 0 belongs to a dropped PDF"
+        ));
+    }
+
+    #[test]
+    fn has_outlines_resolves_a_live_outlines_handle() {
+        let mut pdf = Pdf::open(Cursor::new(minimal_pdf_bytes())).unwrap();
+        let catalog = pdf.root_handle().unwrap();
+        catalog
+            .replace_key(
+                b"/Outlines",
+                ObjectHandle::dictionary(vec![(b"/First".to_vec(), ObjectHandle::integer(1))]),
+            )
+            .unwrap();
+        assert!(pdf.outline().has_outlines().unwrap());
+    }
 
     fn minimal_pdf_bytes() -> Vec<u8> {
         let mut pdf = Vec::new();
