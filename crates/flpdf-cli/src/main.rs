@@ -3874,6 +3874,7 @@ fn run_job_json_files(
     suppress_warnings: bool,
 ) -> CliResult<()> {
     let mut job = QPDFJob::new();
+    job.set_warnings_exit_zero(cli_warning_exit_zero());
     job.set_logger(cli_logger());
     job.set_suppress_warnings(suppress_warnings);
 
@@ -4068,6 +4069,7 @@ fn run_json(cli: &Cli, image_options: ImageTransformOptions, empty: bool) -> Cli
     };
 
     let mut job = QPDFJob::new();
+    job.set_warnings_exit_zero(cli_warning_exit_zero());
     job.set_logger(cli_logger());
     job.set_message_prefix(progname());
     job.set_suppress_warnings(cli.no_warn);
@@ -4223,6 +4225,7 @@ fn run_json_input_inspection(
     }
     let input = cli.input.as_ref().ok_or_else(missing_input_usage_error)?;
     let mut job = QPDFJob::new();
+    job.set_warnings_exit_zero(cli_warning_exit_zero());
     job.set_logger(cli_logger());
     job.set_message_prefix(progname());
     job.set_suppress_warnings(cli.no_warn);
@@ -6645,6 +6648,7 @@ fn run_empty_page_extraction(
     }
 
     let mut job = QPDFJob::new();
+    job.set_warnings_exit_zero(cli_warning_exit_zero());
     job.set_logger(cli_logger());
     job.set_message_prefix(progname());
     job.set_verbose(verbose);
@@ -6801,6 +6805,7 @@ fn run_page_extraction_from_multiple_sources(
 
     let mut sources = Vec::with_capacity(source_paths.len());
     let mut job = QPDFJob::new();
+    job.set_warnings_exit_zero(cli_warning_exit_zero());
     job.set_logger(cli_logger());
     job.set_message_prefix(progname());
     job.set_verbose(verbose);
@@ -6946,6 +6951,7 @@ fn run_page_extraction_from_single_source<R: Read + Seek + 'static>(
         .map(|input| PageSpecInput::new(0, input.range.clone()))
         .collect();
     let mut job = QPDFJob::new();
+    job.set_warnings_exit_zero(cli_warning_exit_zero());
     job.set_logger(cli_logger());
     job.set_message_prefix(progname());
     job.set_verbose(verbose);
@@ -8713,6 +8719,10 @@ fn cli_logger() -> QPDFLogger {
 /// the argv-owned warning-exit policy in one process-local slot so every
 /// canonical QPDFJob created by this invocation receives the same
 /// `Config::warningExitZero` state.
+///
+/// Every route that can decide the process exit status has to read it: qpdf
+/// derives that status once, from the single job's `warnings_exit_zero`
+/// (`QPDFJob.cc:560-563`).
 static CLI_WARNING_EXIT_ZERO: OnceLock<bool> = OnceLock::new();
 
 fn cli_warning_exit_zero() -> bool {
@@ -8869,6 +8879,7 @@ fn finish_check_job(result: std::result::Result<JobExitCode, CheckError>) -> Cli
 
 fn finish_warning_state(has_warnings: bool, creates_output: bool, no_warn: bool) -> CliResult<()> {
     let mut job = QPDFJob::new();
+    job.set_warnings_exit_zero(cli_warning_exit_zero());
     job.set_logger(cli_logger());
     job.set_message_prefix(progname());
     job.set_suppress_warnings(no_warn);

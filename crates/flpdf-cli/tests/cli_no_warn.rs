@@ -621,3 +621,55 @@ fn attachment_copy_no_warn_suppresses_normalization_warnings_like_qpdf() {
     assert_eq!(flpdf.stderr, qpdf.stderr);
     assert!(flpdf_output.exists());
 }
+
+/// qpdf derives the exit status once, from the single job's
+/// `warnings_exit_zero` (`QPDFJob.cc:560-563`). flpdf builds a job per route,
+/// so every route that can decide the status has to carry the policy -- the
+/// `--json` route did not, and exited 3 where `--show-npages` exited 0.
+#[test]
+fn warning_exit_zero_applies_to_every_inspection_route() {
+    if !qpdf_or_skip() {
+        return;
+    }
+
+    let input = repairable_fixture();
+    let input = input.to_str().expect("input path is UTF-8");
+
+    for route in [
+        "--json",
+        "--json=2",
+        "--check",
+        "--show-npages",
+        "--show-pages",
+        "--show-xref",
+        "--list-attachments",
+    ] {
+        let with_flag = ["--no-warn", "--warning-exit-0", route, input];
+        let qpdf = run_qpdf(&with_flag);
+        let flpdf = Command::cargo_bin("flpdf")
+            .expect("flpdf binary")
+            .args(with_flag)
+            .output()
+            .expect("flpdf invocation");
+        assert_eq!(qpdf.status.code(), Some(0), "{route}: qpdf");
+        assert_eq!(
+            flpdf.status.code(),
+            qpdf.status.code(),
+            "{route}: with flag"
+        );
+
+        let without_flag = ["--no-warn", route, input];
+        let qpdf = run_qpdf(&without_flag);
+        let flpdf = Command::cargo_bin("flpdf")
+            .expect("flpdf binary")
+            .args(without_flag)
+            .output()
+            .expect("flpdf invocation");
+        assert_eq!(qpdf.status.code(), Some(3), "{route}: qpdf without flag");
+        assert_eq!(
+            flpdf.status.code(),
+            qpdf.status.code(),
+            "{route}: without flag"
+        );
+    }
+}
