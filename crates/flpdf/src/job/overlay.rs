@@ -1317,12 +1317,6 @@ mod byte_gate {
     ///     `/Tx BMC q BT /F1_1 18 Tf ... ET Q EMC` with its own
     ///     `/Resources/Font/F1_1` pointing at the Courier font — proving
     ///     `ResourceReplacer` fired on the stream, not just the `/DA` string.
-    // cov:ignore-start: the test body is instrumented by llvm-cov but never
-    // executes on this branch because it is `#[ignore]`d until Layer 4 wires
-    // up `adjust_appearance_stream`. The body IS exercised (and byte-identical
-    // against the qpdf 11.9.0 golden) on the top of the stack; keeping it
-    // here means the golden and its test doc-comment land alongside the
-    // fixture that defines them, rather than being deferred to a later PR.
     #[test]
     fn overlay_copy_annotations_onto_existing_acroform_dr_is_byte_identical_qdf() {
         let mut dest = fixture("fxo-red-with-existing-acroform-dr.pdf");
