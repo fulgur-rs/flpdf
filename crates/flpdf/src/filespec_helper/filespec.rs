@@ -135,7 +135,6 @@ impl<'a, R: Read + Seek> FileSpec<'a, R> {
         let Some(dict) = self.filespec_dict()? else {
             return Ok(self);
         };
-        self.pdf.mark_object_handle_dirty(&dict)?;
         dict.replace_key(
             b"/Desc",
             ObjectHandle::string(new_unicode_string(description.as_ref())),
@@ -156,7 +155,6 @@ impl<'a, R: Read + Seek> FileSpec<'a, R> {
         let Some(dict) = self.filespec_dict()? else {
             return Ok(self);
         };
-        self.pdf.mark_object_handle_dirty(&dict)?;
         let unicode_name = new_unicode_string(unicode_name.as_ref());
         dict.replace_key(b"/UF", ObjectHandle::string(unicode_name.clone()))?;
         let compatibility_name = compatibility_name
@@ -535,7 +533,6 @@ impl FileSpecBuilder {
         }
 
         if let Some(relationship) = self.af_relationship {
-            pdf.mark_object_handle_dirty(&filespec_handle)?;
             filespec_handle.replace_key(b"/AFRelationship", ObjectHandle::name(relationship))?;
         }
 

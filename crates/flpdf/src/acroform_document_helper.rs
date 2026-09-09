@@ -789,7 +789,6 @@ impl<'a, R: Read + Seek> AcroFormDocumentHelper<'a, R> {
                 }
             }
             if field_changed {
-                self.pdf.mark_object_handle_dirty(&field)?;
                 changed = true;
             }
         }
@@ -861,8 +860,8 @@ impl<'a, R: Read + Seek> AcroFormDocumentHelper<'a, R> {
     /// (`libqpdf/QPDFAcroFormDocumentHelper.cc:112-151`).
     ///
     /// The array handle is mutated in place. This preserves an indirect
-    /// `/Fields` holder and lets owner-aware dirty marking handle a direct
-    /// array nested in an indirect `/AcroForm` object.
+    /// `/Fields` holder and keeps a direct array nested in an indirect
+    /// `/AcroForm` object live.
     pub(crate) fn remove_form_fields(&mut self, to_remove: &BTreeSet<ObjectRef>) -> Result<bool> {
         let Some(acroform) = self.canonical_acroform()? else {
             return Ok(false);
@@ -891,7 +890,6 @@ impl<'a, R: Read + Seek> AcroFormDocumentHelper<'a, R> {
         for index in indexes.iter().rev().copied() {
             fields.erase_array_item(index)?;
         }
-        self.pdf.mark_object_handle_dirty(&fields)?;
         Ok(true)
     }
 
@@ -947,7 +945,6 @@ impl<'a, R: Read + Seek> AcroFormDocumentHelper<'a, R> {
             copy_and_transform_appearance_streams(self.pdf, &copied, cm)?;
             let rect = transformed_annotation_rectangle(self.pdf, &copied, cm)?;
             copied.replace_key(b"/Rect", rect)?;
-            self.pdf.mark_object_handle_dirty(&copied)?;
             transformed.new_annotations.push(copied);
         }
 
@@ -1089,7 +1086,6 @@ impl<'a, R: Read + Seek> AcroFormDocumentHelper<'a, R> {
             )?; // cov:ignore: LLVM maps this multiline appearance-transform call to a defensive continuation edge
             let rect = transformed_annotation_rectangle(self.pdf, &copied, cm)?;
             copied.replace_key(b"/Rect", rect)?;
-            self.pdf.mark_object_handle_dirty(&copied)?;
             transformed.new_annotations.push(copied);
         }
 
@@ -1189,7 +1185,6 @@ impl<'a, R: Read + Seek> AcroFormDocumentHelper<'a, R> {
             if !parent.is_null() {
                 if let Some(parent_copy) = orig_to_copy.get(&parent.identity_key()) {
                     copied.replace_key(b"/Parent", parent_copy.clone())?;
-                    self.pdf.mark_object_handle_dirty(&copied)?;
                 } else {
                     parent.warn_if_possible(
                         "while traversing an AcroForm field, found a parent that had not been seen",
@@ -1209,7 +1204,6 @@ impl<'a, R: Read + Seek> AcroFormDocumentHelper<'a, R> {
                         continue; // cov:ignore: defensive compatibility arm; stream copies now propagate qpdf's clone error
                     };
                     kids_holder.set_array_item(index, copied_kid.clone())?;
-                    self.pdf.mark_object_handle_dirty(&kids_holder)?;
                     queue.push_back((kid, copied_kid));
                 }
             }
@@ -1232,7 +1226,6 @@ impl<'a, R: Read + Seek> AcroFormDocumentHelper<'a, R> {
     ) -> Result<()> {
         if field.try_has_key(b"/DR")? {
             field.replace_key(b"/DR", resources.destination_resources.clone())?;
-            self.pdf.mark_object_handle_dirty(field)?;
         }
         let default_appearance = self.pdf.resolve_handle(&field.try_get_key(b"/DA")?)?;
         let Some(default_appearance) = default_appearance.as_string() else {
@@ -1281,7 +1274,6 @@ impl<'a, R: Read + Seek> AcroFormDocumentHelper<'a, R> {
         };
         if rewritten != default_appearance {
             field.replace_key(b"/DA", ObjectHandle::string(rewritten))?;
-            self.pdf.mark_object_handle_dirty(field)?;
         } // cov:ignore: LLVM maps this replacement-branch closing edge separately
         Ok(())
     }
@@ -1306,14 +1298,12 @@ impl<'a, R: Read + Seek> AcroFormDocumentHelper<'a, R> {
                     )),
                 )?;
                 // cov:ignore-end
-                self.pdf.mark_object_handle_dirty(field)?;
             } // cov:ignore: default-appearance branch join is an llvm-cov region artifact
         } // cov:ignore: default-appearance branch join is an llvm-cov region artifact
         if overrides.override_q && !self.field_has_explicit_value(field, b"/Q")? {
             let current = self.effective_field_quadding(field)?;
             if current != overrides.source_default_q {
                 field.replace_key(b"/Q", ObjectHandle::integer(overrides.source_default_q))?;
-                self.pdf.mark_object_handle_dirty(field)?;
             } // cov:ignore: quadding branch join is an llvm-cov region artifact
         } // cov:ignore: quadding branch join is an llvm-cov region artifact
         Ok(())
@@ -1464,7 +1454,6 @@ impl<'a, R: Read + Seek> AcroFormDocumentHelper<'a, R> {
                     ObjectHandle::string(crate::pdf_string::new_unicode_string(&partial)),
                 )?;
                 // cov:ignore-end
-                self.pdf.mark_object_handle_dirty(&field)?;
             }
         }
 
@@ -1477,14 +1466,11 @@ impl<'a, R: Read + Seek> AcroFormDocumentHelper<'a, R> {
         } else {
             let replacement = ObjectHandle::array(Vec::new());
             acroform.replace_key(b"/Fields", replacement.clone())?;
-            self.pdf.mark_object_handle_dirty(&acroform)?;
             replacement
         };
         for field in &fields {
             fields_array.append_array_item(field.clone())?;
         }
-        self.pdf.mark_object_handle_dirty(&fields_array)?;
-        self.pdf.mark_object_handle_dirty(&acroform)?;
         for field in fields {
             self.update_cached_field(field)?;
         }
@@ -1523,14 +1509,11 @@ impl<'a, R: Read + Seek> AcroFormDocumentHelper<'a, R> {
         } else {
             let replacement = ObjectHandle::array(Vec::new());
             acroform.replace_key(b"/Fields", replacement.clone())?;
-            self.pdf.mark_object_handle_dirty(&acroform)?;
             replacement
         };
         for field in &fields {
             fields_array.append_array_item(field.clone())?;
         }
-        self.pdf.mark_object_handle_dirty(&fields_array)?;
-        self.pdf.mark_object_handle_dirty(&acroform)?;
         for field in fields {
             self.update_cached_field(field)?;
         }
@@ -1565,7 +1548,6 @@ impl<'a, R: Read + Seek> AcroFormDocumentHelper<'a, R> {
                 ObjectHandle::array(Vec::new()),
             )]))?;
         root.replace_key(b"/AcroForm", created.clone())?;
-        self.pdf.mark_object_handle_dirty(&root)?;
         Ok(created)
     }
 
@@ -1587,7 +1569,6 @@ impl<'a, R: Read + Seek> AcroFormDocumentHelper<'a, R> {
         if source_need_appearances {
             self.set_need_appearances(true)?;
         }
-        self.pdf.mark_object_handle_dirty(&destination_resources)?;
         Ok(ForeignResourcePlan {
             destination_resources,
             renames: resource_renames_from_conflicts(&conflicts),
@@ -1606,7 +1587,6 @@ impl<'a, R: Read + Seek> AcroFormDocumentHelper<'a, R> {
                 .pdf
                 .make_indirect_object_handle(resources.shallow_copy()?)?;
             acroform.replace_key(b"/DR", indirect.clone())?;
-            self.pdf.mark_object_handle_dirty(&acroform)?;
             return Ok(indirect);
         }
 
@@ -1614,7 +1594,6 @@ impl<'a, R: Read + Seek> AcroFormDocumentHelper<'a, R> {
             .pdf
             .make_indirect_object_handle(ObjectHandle::dictionary(Vec::new()))?;
         acroform.replace_key(b"/DR", created.clone())?;
-        self.pdf.mark_object_handle_dirty(&acroform)?;
         Ok(created)
     }
 
@@ -1858,26 +1837,17 @@ impl<'a, R: Read + Seek> AcroFormDocumentHelper<'a, R> {
     /// # Errors
     ///
     /// Propagates errors while resolving the catalog and AcroForm handles, or
-    /// while marking a live handle dirty after mutation.
+    /// after mutating a live handle.
     pub fn set_need_appearances(&mut self, value: bool) -> Result<()> {
         let Some(acroform) = self.canonical_acroform()? else {
             return Ok(());
         };
         if value {
             acroform.replace_key(b"/NeedAppearances", ObjectHandle::boolean(true))?;
-            self.pdf.mark_object_handle_dirty(&acroform)
+            Ok(())
         } else {
-            let present = acroform.as_dictionary().is_some_and(|entries| {
-                entries
-                    .keys()
-                    .any(|key| key.as_slice() == b"/NeedAppearances")
-            });
             acroform.remove_key(b"/NeedAppearances");
-            if present {
-                self.pdf.mark_object_handle_dirty(&acroform)
-            } else {
-                Ok(())
-            }
+            Ok(())
         }
     }
 
@@ -1952,7 +1922,6 @@ impl<'a, R: Read + Seek> AcroFormDocumentHelper<'a, R> {
         let acroform_ref = self.ensure_acroform_ref()?;
         let acroform = self.resolve_dict(acroform_ref, "AcroForm")?;
         acroform.replace_key(b"/DA", ObjectHandle::string(appearance))?;
-        self.pdf.mark_object_handle_dirty(&acroform)?;
         Ok(())
     }
 
@@ -1998,7 +1967,6 @@ impl<'a, R: Read + Seek> AcroFormDocumentHelper<'a, R> {
             .object_ref()
             .expect("make_indirect_object_handle returns an indirect handle");
         catalog.replace_key(b"/AcroForm", new_acroform)?;
-        self.pdf.mark_object_handle_dirty(&catalog)?;
         self.invalidate_cache();
         Ok(new_ref)
     }
@@ -2175,10 +2143,8 @@ fn copy_and_transform_appearance_streams_with_renames<R: Read + Seek>(
         if entry.as_stream_dict().is_some() {
             let copied = entry.copy_stream()?;
             transform_appearance_stream_matrix(&copied, cm)?;
-            pdf.mark_object_handle_dirty(&copied)?;
             adjust_copied_appearance_resources(pdf, &copied, renames)?;
             appearance.replace_key(&key, copied)?;
-            pdf.mark_object_handle_dirty(&appearance)?;
             continue;
         }
         if entry.as_dictionary().is_none() {
@@ -2190,10 +2156,8 @@ fn copy_and_transform_appearance_streams_with_renames<R: Read + Seek>(
             if stream.as_stream_dict().is_some() {
                 let copied = stream.copy_stream()?;
                 transform_appearance_stream_matrix(&copied, cm)?;
-                pdf.mark_object_handle_dirty(&copied)?;
                 adjust_copied_appearance_resources(pdf, &copied, renames)?;
                 entry.replace_key(&state, copied)?;
-                pdf.mark_object_handle_dirty(&entry)?;
             }
         }
     }
@@ -2597,8 +2561,6 @@ mod final_handle_tests {
             field
                 .replace_key(b"/T", ObjectHandle::string(b"same".to_vec()))
                 .expect("set initial shared field name");
-            pdf.mark_object_handle_dirty(&field)
-                .expect("mark field name dirty");
         }
 
         let mut helper = AcroFormDocumentHelper::new(&mut pdf).expect("AcroForm helper");

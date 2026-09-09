@@ -488,7 +488,6 @@ fn remap_name_pairs<R: Read + Seek>(
     if items.len() % 2 != 0 {
         items.pop();
         pairs.set_array_items(items.clone())?;
-        pdf.mark_object_handle_dirty(pairs)?;
     }
     for dest in items.iter().skip(1).step_by(2) {
         remap_dest(pdf, dest, surviving)?;
@@ -532,7 +531,6 @@ fn remap_dest_depth<R: Read + Seek>(
             return Ok(false);
         }
         dest.set_array_item(0, pdf.get_object_handle(new_ref))?;
-        pdf.mark_object_handle_dirty(dest)?;
         return Ok(true);
     }
     if dest.try_as_dictionary()?.is_some() {

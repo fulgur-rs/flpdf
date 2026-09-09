@@ -1448,8 +1448,6 @@ mod tests {
         catalog
             .replace_key(b"/Outlines", outlines)
             .expect("install outlines");
-        pdf.mark_object_handle_dirty(&catalog)
-            .expect("mark catalog dirty");
 
         let pages = build_pages_section_with_options(&mut pdf, 2, DecodeLevel::Generalized)
             .expect("pages with outline");

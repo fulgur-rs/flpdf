@@ -7490,7 +7490,7 @@ fn apply_normalize_content<R: std::io::Read + std::io::Seek>(
 /// content holders: the writer must observe one canonical resolution and not
 /// parse the legacy raw Object a second time.
 fn normalize_and_store_stream_handle<R: std::io::Read + std::io::Seek>(
-    pdf: &mut Pdf<R>,
+    _pdf: &mut Pdf<R>,
     stream_ref: ObjectRef,
     stream: ObjectHandle,
     seen: &mut HashSet<ObjectRef>,
@@ -7516,7 +7516,7 @@ fn normalize_and_store_stream_handle<R: std::io::Read + std::io::Seek>(
 
     // Remove filter / encode-form keys and install the fresh direct length;
     // the normalized payload is raw. This is qpdf's in-place stream mutation
-    // boundary, so mark the canonical indirect owner dirty for the writer.
+    // boundary, so the canonical live writer observes the updated stream.
     let normalized = std::rc::Rc::new(normalized);
     stream.replace_stream_data(
         std::rc::Rc::clone(&normalized),
@@ -7530,7 +7530,6 @@ fn normalize_and_store_stream_handle<R: std::io::Read + std::io::Seek>(
         )?;
     }
     stream.mark_content_normalization_applied();
-    pdf.mark_object_handle_dirty(&stream)?;
     Ok(warning)
 }
 

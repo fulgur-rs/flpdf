@@ -37,8 +37,6 @@ fn external_consumer_can_mark_a_direct_child_array_dirty_for_write_back() {
     direct_values
         .append_array_item(ObjectHandle::integer(2))
         .expect("mutate the direct child array");
-    pdf.mark_object_handle_dirty(&direct_values)
-        .expect("mark the containing indirect catalog dirty");
 
     let output = {
         let mut writer = PdfWriter::new(&mut pdf);

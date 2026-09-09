@@ -426,7 +426,6 @@ impl<'a, R: Read + Seek> AnnotationObjectHelper<'a, R> {
         }
 
         appearance_dict.replace_key(b"/Subtype", ObjectHandle::name(b"Form".to_vec()))?;
-        self.pdf.mark_object_handle_dirty(&appearance_dict)?;
 
         Ok(format!("q\n{} cm\n{} Do\nQ\n", placement.unparse(), name).into_bytes())
     }

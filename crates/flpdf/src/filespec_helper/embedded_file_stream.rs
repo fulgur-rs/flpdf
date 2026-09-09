@@ -76,12 +76,11 @@ impl<'a, R: Read + Seek> EmbeddedFileStream<'a, R> {
     /// is populated only after a successful pipe; a failed provider/filter
     /// path gets qpdf's warning and never falls back to a materialized length
     /// or a second digest computation.
-    pub(super) fn new_from_stream(pdf: &mut Pdf<R>, stream: ObjectHandle) -> Result<ObjectHandle> {
+    pub(super) fn new_from_stream(_pdf: &mut Pdf<R>, stream: ObjectHandle) -> Result<ObjectHandle> {
         let stream_dict = stream.as_stream_dict().ok_or_else(|| {
             Error::System("EmbeddedFile factory received a non-stream object".to_string())
         })?;
         stream_dict.replace_key(b"/Type", ObjectHandle::name(b"EmbeddedFile".to_vec()))?;
-        pdf.mark_object_handle_dirty(&stream)?;
 
         let mut discard = Discard;
         let mut md5 = PlMd5::new("EF md5", &mut discard);
@@ -129,7 +128,6 @@ impl<'a, R: Read + Seek> EmbeddedFileStream<'a, R> {
                     (b"/CheckSum".to_vec(), ObjectHandle::string(checksum)),
                 ]),
             )?; // cov:ignore: factory-created stream and parameter values share this PDF
-            pdf.mark_object_handle_dirty(&stream)?;
         } else {
             stream.warn_if_possible("unable to get stream data for new embedded file stream")?;
         }
@@ -413,7 +411,7 @@ impl<'a, R: Read + Seek> EmbeddedFileStream<'a, R> {
     }
 
     fn set_param(&mut self, key: &str, value: Vec<u8>) -> Result<()> {
-        let Some((_, stream_dict, stream_ref)) = self.resolved_stream()? else {
+        let Some((_, stream_dict, _stream_ref)) = self.resolved_stream()? else {
             return Ok(());
         };
         let params = stream_dict.get_key(b"/Params");
@@ -428,27 +426,11 @@ impl<'a, R: Read + Seek> EmbeddedFileStream<'a, R> {
                 }
                 None => resolved,
             };
-            {
-                let mut pdf = self.pdf.borrow_mut();
-                if let Some(object_ref) = terminal_ref.or(stream_ref) {
-                    pdf.mark_object_handle_mutated(object_ref);
-                } else {
-                    pdf.mark_object_handle_dirty(&target)?;
-                }
-            }
             let key = canonical_dictionary_key(key.as_bytes());
             target.replace_key(&key, ObjectHandle::string(value))?;
             return Ok(());
         }
 
-        {
-            let mut pdf = self.pdf.borrow_mut();
-            if let Some(object_ref) = stream_ref {
-                pdf.mark_object_handle_mutated(object_ref);
-            } else {
-                pdf.mark_object_handle_dirty(&stream_dict)?;
-            }
-        }
         stream_dict.replace_key(
             b"/Params",
             ObjectHandle::dictionary(vec![(
@@ -473,17 +455,9 @@ impl<'a, R: Read + Seek> EmbeddedFileStream<'a, R> {
 
     /// Set `/Subtype` to a MIME type represented as logical PDF Name bytes.
     pub fn set_subtype(&mut self, value: impl AsRef<[u8]>) -> Result<&mut Self> {
-        let Some((_, stream_dict, stream_ref)) = self.resolved_stream()? else {
+        let Some((_, stream_dict, _stream_ref)) = self.resolved_stream()? else {
             return Ok(self);
         };
-        {
-            let mut pdf = self.pdf.borrow_mut();
-            if let Some(object_ref) = stream_ref {
-                pdf.mark_object_handle_mutated(object_ref);
-            } else {
-                pdf.mark_object_handle_dirty(&stream_dict)?;
-            }
-        }
         stream_dict.replace_key(b"/Subtype", ObjectHandle::name(value.as_ref().to_vec()))?;
         Ok(self)
     }

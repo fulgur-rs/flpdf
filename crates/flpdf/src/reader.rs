@@ -680,7 +680,6 @@ impl<R: Read + Seek> Pdf<R> {
             .is_some_and(|entries| entries.keys().any(|key| key == b"/Perms"))
         {
             catalog.remove_key(b"/Perms");
-            self.mark_object_handle_dirty(&catalog)?;
             changed = true;
         }
 
@@ -698,7 +697,6 @@ impl<R: Read + Seek> Pdf<R> {
                 previous.object_ref().is_none() && previous.try_as_integer()? == Some(0);
             // qpdf-deviation-end
             acroform.replace_key(b"/SigFlags", ObjectHandle::integer(0))?;
-            self.mark_object_handle_dirty(&acroform)?;
             if !already_zero {
                 changed = true;
             }
@@ -889,29 +887,6 @@ impl<R: Read + Seek> Pdf<R> {
     /// expose that source row.
     pub fn get_xref_table(&self) -> BTreeMap<ObjectRef, XrefEntry> {
         self.resolver.xref_entries()
-    }
-
-    #[cfg(test)]
-    pub(crate) fn dirty_object_refs(&self) -> Vec<ObjectRef> {
-        self.dirty_object_refs.iter().copied().collect()
-    }
-
-    /// `true` when `object_ref` is currently marked dirty (i.e. has been
-    /// mutated via [`Self::replace_object`] since the
-    /// Pdf was opened). Used by the full-rewrite writer to detect whether a
-    /// pre-existing dirty flag existed before an output-only Catalog mutation
-    /// so the flag can be preserved through a restore.
-    pub(crate) fn is_dirty(&self, object_ref: ObjectRef) -> bool {
-        self.dirty_object_refs.contains(&object_ref)
-    }
-
-    /// Remove `object_ref` from the dirty set without touching the cache
-    /// value. Used by the full-rewrite writer to undo a spurious dirty flag
-    /// after restoring the pre-write Catalog snapshot: `Self::replace_object`
-    /// unconditionally marks its target dirty, so the restore path calls
-    /// `clear_dirty` when the caller's Pdf was clean prior to the write.
-    pub(crate) fn clear_dirty(&mut self, object_ref: ObjectRef) {
-        self.dirty_object_refs.remove(&object_ref);
     }
 
     /// Return object references from qpdf's one canonical object cache without
@@ -1264,20 +1239,15 @@ impl<R: Read + Seek> Pdf<R> {
     /// `libqpdf/qpdf/QPDFObject_private.hh:117-120`), so outstanding handles
     /// observe the replacement.
     ///
-    /// qpdf records the shared value transition itself rather than exposing a
-    /// separate dirty bit. flpdf's writer still tracks dirty object
-    /// references, so every successful replacement marks the target
-    /// mutated; callers that temporarily restore a previously clean value
-    /// must explicitly clear the target's dirty state after the restore.
+    /// qpdf records the shared value transition in the canonical object cache;
+    /// the writer observes that same live value without a separate dirty bit.
     pub fn replace_object(
         &mut self,
         object_ref: ObjectRef,
         replacement: ObjectHandle,
     ) -> Result<ObjectHandle> {
-        // Like `set_object`, this is canonical cache replacement only. Keep it
-        let target = self.resolver.replace_object(object_ref, replacement)?;
-        self.mark_object_dirty(object_ref);
-        Ok(target)
+        // Like `set_object`, this is canonical cache replacement only.
+        self.resolver.replace_object(object_ref, replacement)
     }
 
     /// Swap the live values of two object generations while preserving each
@@ -1295,11 +1265,7 @@ impl<R: Read + Seek> Pdf<R> {
     /// Propagates source resolution, recovery, and warning-delivery failures
     /// from either object.
     pub fn swap_objects(&mut self, first: ObjectRef, second: ObjectRef) -> Result<()> {
-        self.resolver.swap_objects(first, second)?;
-        for object_ref in [first, second] {
-            self.mark_object_dirty(object_ref);
-        }
-        Ok(())
+        self.resolver.swap_objects(first, second)
     }
 
     /// Remove a canonical object from the resolver's xref/cache view and
@@ -1313,7 +1279,6 @@ impl<R: Read + Seek> Pdf<R> {
         // qpdf's removeObject changes only the requested cache slot; already
         // resolved members of an ObjStm remain live in their own cache slots.
         self.resolver.remove_object(object_ref)?;
-        self.mark_object_dirty(object_ref);
         Ok(())
     }
 
@@ -1408,70 +1373,6 @@ impl<R: Read + Seek> Pdf<R> {
         visiting: BTreeSet<ObjectRef>,
     ) {
         self.foreign_object_visiting.insert(source_id, visiting);
-    }
-
-    /// Mark `object_ref` dirty so canonical writer preparation and other live
-    /// document consumers observe an in-place handle mutation.
-    ///
-    /// [`Self::replace_object`] already does this
-    /// internally. Calling this after an in-place [`ObjectHandle`] mutation
-    /// invalidates any materialized snapshot before scheduling the canonical
-    /// live handle for writing, matching qpdf's single shared object state.
-    pub fn mark_object_dirty(&mut self, object_ref: ObjectRef) {
-        self.mark_object_handle_mutated(object_ref);
-    }
-
-    pub(crate) fn mark_object_handle_mutated(&mut self, object_ref: ObjectRef) {
-        self.dirty_object_refs.insert(object_ref);
-    }
-
-    /// Mark the canonical indirect owner or owners of `handle` dirty after an
-    /// in-place [`ObjectHandle`] mutation.
-    ///
-    /// This is the owner-aware dirty operation for qpdf-shaped live-handle
-    /// mutations. An indirect array or dictionary has its own [`ObjectRef`],
-    /// so passing that handle is equivalent to calling
-    /// [`Self::mark_object_dirty`] with its reference. A direct array or
-    /// dictionary nested inside an indirect object has no reference of its
-    /// own; passing that direct child marks every containing indirect owner
-    /// tracked by the handle graph. This is the form callers need after
-    /// mutating a direct child array, for example with
-    /// [`ObjectHandle::append_array_item`].
-    ///
-    /// Direct-child containment is recorded when the child is resolved from
-    /// or inserted into a live indirect object. A detached direct child has no
-    /// writer owner and therefore marks nothing. This method never resolves
-    /// unrelated objects merely to rediscover an owner.
-    ///
-    /// Like qpdf's `QPDFObjectHandle` ownership checks, a handle from another
-    /// [`Pdf`] is rejected rather than treating an equal-numbered object in
-    /// this document as its owner.
-    ///
-    /// # Errors
-    ///
-    /// Returns [`Error::Unsupported`] when `handle` belongs to another
-    /// document or is otherwise not a canonical handle owned by this
-    /// document.
-    pub fn mark_object_handle_dirty(&mut self, handle: &ObjectHandle) -> Result<()> {
-        if let Some(object_ref) = handle.object_ref() {
-            if !self.is_canonical_object_handle(handle) {
-                return Err(Error::Unsupported(
-                    "ObjectHandle belongs to another Pdf".to_string(),
-                ));
-            }
-            self.mark_object_handle_mutated(object_ref);
-            return Ok(());
-        }
-
-        if !handle.belongs_to_pdf(self.unique_id) {
-            return Err(Error::Unsupported(
-                "ObjectHandle belongs to another Pdf".to_string(),
-            ));
-        }
-        for object_ref in handle.containing_object_refs_for_pdf(self.unique_id) {
-            self.mark_object_handle_mutated(object_ref);
-        }
-        Ok(())
     }
 
     /// Validate that historical xref-stream handles collected during bootstrap

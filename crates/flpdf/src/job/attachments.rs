@@ -408,7 +408,6 @@ impl QPDFJob {
         pdf.resolve(&root)?;
         if root.try_get_key(b"/PageMode")?.try_is_null()? {
             root.replace_key(b"/PageMode", ObjectHandle::name(b"UseAttachments".to_vec()))?;
-            pdf.mark_object_handle_dirty(&root)?;
         }
         Ok(())
     }
@@ -1039,8 +1038,6 @@ mod tests {
         let filespec = pdf.get_object_handle(filespec_ref);
         pdf.resolve(&filespec).expect("resolve filespec");
         filespec.remove_key(b"/EF");
-        pdf.mark_object_handle_dirty(&filespec)
-            .expect("mark Filespec dirty");
 
         let error = job
             .show_attachment(&mut pdf, b"attachment.txt")
@@ -1194,8 +1191,6 @@ mod tests {
         pdf.resolve(&root).expect("resolve catalog");
         root.replace_key(b"/PageMode", crate::ObjectHandle::name(b"UseNone".to_vec()))
             .expect("set existing page mode");
-        pdf.mark_object_handle_dirty(&root)
-            .expect("mark catalog dirty");
 
         let mut options = add_options(attachment, b"payload-key");
         options.creation_date = None;

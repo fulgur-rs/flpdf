@@ -266,7 +266,6 @@ fn apply_overlays_to_page_with_sources<R: Read + Seek, RS: Read + Seek>(
     )]);
     overlay_page.replace_key(b"/Resources", resources)?;
     overlay_page.replace_key(b"/Contents", contents_stream)?;
-    dest.mark_object_handle_dirty(&overlay_page)?;
 
     Ok(())
 }

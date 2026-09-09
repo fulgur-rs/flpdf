@@ -127,7 +127,7 @@ pub fn acroform_sig_flags<R: Read + Seek>(pdf: &mut Pdf<R>) -> Result<Option<u32
 ///
 /// Masks off [`SIG_FLAGS_SIGNATURES_EXIST`] and [`SIG_FLAGS_APPEND_ONLY`] and
 /// writes the masked integer back (e.g. `/SigFlags 3` becomes `/SigFlags 0`),
-/// marking the containing object dirty. Returns `true` when a bit was actually
+/// updating the live containing object. Returns `true` when a bit was actually
 /// cleared. Used by the opt-in signature-stripping path; it does not by itself
 /// remove signature fields or `/V` dictionaries.
 ///
@@ -142,7 +142,6 @@ pub fn clear_sig_flags<R: Read + Seek>(pdf: &mut Pdf<R>) -> Result<bool> {
     if !clear_sig_flags_in_handle(&acroform)? {
         return Ok(false);
     }
-    pdf.mark_object_handle_dirty(&acroform)?;
     Ok(true)
 }
 
@@ -181,8 +180,8 @@ pub fn strip_signature_values<R: Read + Seek>(pdf: &mut Pdf<R>) -> Result<bool> 
 }
 
 // The returned `ObjectHandle` from `resolve_catalog_acroform` is live, so
-// callers mutate it in place and mark the handle dirty. No copied dictionary
-// or raw-object write-back boundary is needed.
+// callers mutate it in place. No copied dictionary or raw-object write-back
+// boundary is needed.
 
 /// Resolve the catalog `/AcroForm` to its dictionary plus where it lives,
 /// following one indirect reference. Returns `None` when there is no `/Root`
@@ -255,7 +254,6 @@ fn strip_signature_values_from_field<R: Read + Seek>(
 
     if field_type.as_deref() == Some(b"Sig") && has_signature_value {
         field.remove_key(b"/V");
-        pdf.mark_object_handle_dirty(&field)?;
         *changed = true;
         if depth == DEFAULT_MAX_SIGNATURE_FIELD_DEPTH {
             return Ok(());

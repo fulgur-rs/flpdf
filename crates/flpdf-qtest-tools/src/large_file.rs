@@ -218,7 +218,6 @@ fn create_pdf(path: &Path, large: bool, output: &Output) -> flpdf::Result<()> {
             Some(ObjectHandle::null()),
             Some(ObjectHandle::null()),
         )?;
-        pdf.mark_object_handle_dirty(&image)?;
 
         let xobject = ObjectHandle::dictionary(vec![(b"Im1".to_vec(), image)]);
         let resources = ObjectHandle::dictionary(vec![

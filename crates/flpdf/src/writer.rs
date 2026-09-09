@@ -1701,11 +1701,9 @@ pub(crate) fn prepare_file_for_write<R: Read + Seek>(pdf: &mut Pdf<R>) -> Result
         return Ok(());
     }
 
-    let mut changed = false;
     let extensions = if extensions.is_indirect() {
         let direct = extensions.shallow_copy()?;
         root.replace_key(b"/Extensions", direct.clone())?;
-        changed = true;
         direct
     } else {
         extensions
@@ -1716,13 +1714,9 @@ pub(crate) fn prepare_file_for_write<R: Read + Seek>(pdf: &mut Pdf<R>) -> Result
         if adbe.is_indirect() {
             adbe.make_direct(false)?;
             extensions.replace_key(b"/ADBE", adbe)?;
-            changed = true;
         }
     }
 
-    if changed {
-        pdf.mark_object_handle_dirty(&root)?;
-    }
     Ok(())
 }
 
@@ -2232,11 +2226,11 @@ fn replace_writer_catalog<R: Read + Seek>(
     }
     let root = pdf.root_handle()?;
     root.assign_value_state(&catalog);
-    pdf.mark_object_handle_dirty(&root)
+    Ok(())
 }
 
-/// Capture the output-only `/Extensions` value and dirty state of the live
-/// Catalog before a specialized writer mutates it for emission.
+/// Capture the output-only `/Extensions` value of the live Catalog before a
+/// specialized writer mutates it for emission.
 ///
 /// qpdf's writer may replace `/Extensions /ADBE` while preparing an output
 /// object, but the canonical flpdf `PdfWriter` keeps the source `Pdf` attached
@@ -2245,22 +2239,6 @@ fn replace_writer_catalog<R: Read + Seek>(
 pub(crate) struct CatalogExtensionsSnapshot {
     root_ref: ObjectRef,
     extensions: Option<ObjectHandle>,
-    was_dirty: bool,
-}
-
-/// Record the Catalog dirty state after permanent writer planning has run.
-///
-/// The linearization route captures the original extension handle before
-/// qpdf-shaped pre-plan directization, but planning may also perform permanent
-/// Catalog repairs. Those repairs must remain dirty after the output-only
-/// extension mutation is restored.
-pub(crate) fn record_catalog_snapshot_dirty_baseline<R: Read + Seek + 'static>(
-    pdf: &Pdf<R>,
-    snapshot: &mut Option<CatalogExtensionsSnapshot>,
-) {
-    if let Some(snapshot) = snapshot {
-        snapshot.was_dirty |= pdf.is_dirty(snapshot.root_ref);
-    }
 }
 
 /// Snapshot the live Catalog's output-only extension state.
@@ -2271,7 +2249,6 @@ pub(crate) fn snapshot_catalog_extensions<R: Read + Seek>(
     let Some(root_ref) = catalog.object_ref() else {
         return Ok(None);
     };
-    let was_dirty = pdf.is_dirty(root_ref);
     // Raw dictionary membership, not `try_has_key`'s qpdf-semantic hasKey:
     // an explicit `/Extensions null` entry is a present key whose restored
     // shape must survive, even though qpdf's own `hasKey`/`getKeys` treat a
@@ -2282,7 +2259,6 @@ pub(crate) fn snapshot_catalog_extensions<R: Read + Seek>(
     Ok(Some(CatalogExtensionsSnapshot {
         root_ref,
         extensions,
-        was_dirty,
     }))
 }
 
@@ -2311,7 +2287,7 @@ pub(crate) fn restore_catalog_extensions<R: Read + Seek>(
         (Some(before), Some(after)) => !before.is_same_object_as(after),
         _ => true,
     };
-    if extensions_changed || (!snapshot.was_dirty && pdf.is_dirty(snapshot.root_ref)) {
+    if extensions_changed {
         match snapshot.extensions {
             // `restore_key_raw`, not `replace_key`: this restores the exact
             // pre-write raw entry, including a literal direct null, rather
@@ -2323,9 +2299,6 @@ pub(crate) fn restore_catalog_extensions<R: Read + Seek>(
             None => catalog.remove_key(b"/Extensions"),
         }
         pdf.replace_object(snapshot.root_ref, catalog)?;
-    }
-    if !snapshot.was_dirty {
-        pdf.clear_dirty(snapshot.root_ref);
     }
     Ok(())
 }
@@ -7009,8 +6982,6 @@ mod final_handle_writer_tests {
                 eof_calls: Rc::clone(&eof_calls),
             })))
             .expect("register token filter");
-        pdf.mark_object_handle_dirty(&content)
-            .expect("mark modified content");
 
         let mut writer = PdfWriter::new(&mut pdf);
         writer.set_qdf_mode(true);

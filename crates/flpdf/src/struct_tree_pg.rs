@@ -228,8 +228,6 @@ fn process_elem_dict<R: Read + Seek>(
     max_depth: usize,
     state: &mut WalkState,
 ) -> Result<()> {
-    let mut changed = false;
-
     // /Pg is by spec an indirect reference to a page object; any other form is
     // malformed and left unchanged. A surviving target is remapped to its new
     // ref; only an original page-tree leaf in removed_pages is dropped.
@@ -238,11 +236,9 @@ fn process_elem_dict<R: Read + Seek>(
             match surviving.get(&pg_ref) {
                 Some(&new) if new != pg_ref => {
                     dict.replace_key(b"/Pg", pdf.get_object_handle(new))?;
-                    changed = true;
                 }
                 None if removed_pages.contains(&pg_ref) => {
                     dict.remove_key(b"/Pg");
-                    changed = true;
                 }
                 _ => {}
             }
@@ -284,9 +280,6 @@ fn process_elem_dict<R: Read + Seek>(
         }
     }
 
-    if changed {
-        pdf.mark_object_handle_dirty(dict)?;
-    }
     Ok(())
 }
 

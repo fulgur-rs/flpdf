@@ -88,8 +88,6 @@ fn swapped_values_are_visible_to_the_writer() {
     trailer
         .replace_key(b"/Second", second.clone())
         .expect("reference second object");
-    pdf.mark_object_handle_dirty(&trailer)
-        .expect("mark trailer dirty");
 
     pdf.swap_objects(first_ref, second_ref)
         .expect("swap object bodies");

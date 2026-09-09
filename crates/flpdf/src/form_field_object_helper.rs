@@ -540,7 +540,7 @@ impl<'a, R: Read + Seek> FormFieldObjectHelper<'a, R> {
             return Ok(());
         }
         acroform.remove_key(b"/NeedAppearances");
-        pdf.mark_object_handle_dirty(&acroform)
+        Ok(())
     }
 
     fn set_need_appearances(&mut self) -> Result<()> {
@@ -732,7 +732,7 @@ impl<'a, R: Read + Seek> FormFieldObjectHelper<'a, R> {
         };
         let key = crate::object_handle::canonical_dictionary_key(key);
         dictionary.replace_key(&key, value)?;
-        self.pdf.mark_object_handle_dirty(&dictionary)
+        Ok(())
     }
 
     fn dictionary_handle_for(&mut self, handle: ObjectHandle) -> Result<Option<ObjectHandle>> {

@@ -598,12 +598,6 @@ where
         Some(object)
     }
 
-    fn mark_dirty(&mut self, handle: &ObjectHandle) {
-        if let Err(error) = self.pdf.mark_object_handle_dirty(handle) {
-            self.fatal(error.to_string()); // cov:ignore: all parser-created handles are owned by this Pdf
-        }
-    }
-
     fn set_object_description(&self, handle: &ObjectHandle, value: &Json) {
         handle.set_description_json(
             self.input_name.clone(),
@@ -982,8 +976,6 @@ where
                             // cov:ignore-start: make_object and replace_stream_dict share this Pdf-owned dictionary
                             if let Err(error) = current.replace_stream_dict(dictionary) {
                                 self.fatal(error.to_string());
-                            } else {
-                                self.mark_dirty(&current);
                             }
                             // cov:ignore-end
                         }
@@ -993,7 +985,6 @@ where
                         if value.get_string().is_none() {
                             self.error(value.start(), "\"stream.data\" must be a string");
                             current.replace_stream_data(Rc::new(Vec::new()), None, None);
-                            self.mark_dirty(&current);
                         } else {
                             match inline_stream_data_provider(
                                 self.source.clone(),
@@ -1006,8 +997,6 @@ where
                                         current.replace_stream_data_provider(provider, None, None)
                                     {
                                         self.fatal(error.to_string());
-                                    } else {
-                                        self.mark_dirty(&current);
                                     }
                                     // cov:ignore-end
                                 }
@@ -1023,7 +1012,6 @@ where
                                 "\"stream.datafile\" must be a string containing a file name",
                             );
                             current.replace_stream_data(Rc::new(Vec::new()), None, None);
-                            self.mark_dirty(&current);
                             return;
                         };
                         let provider = datafile_stream_data_provider(PathBuf::from(
@@ -1034,8 +1022,6 @@ where
                             current.replace_stream_data_provider(provider, None, None)
                         {
                             self.fatal(error.to_string());
-                        } else {
-                            self.mark_dirty(&current);
                         }
                         // cov:ignore-end
                     }
@@ -1067,8 +1053,6 @@ where
                 let value = self.make_object(value);
                 if let Err(error) = dictionary.replace_key(&key, value) {
                     self.fatal(error.to_string()); // cov:ignore: key values are made by this Pdf and ownership is checked at construction
-                } else {
-                    self.mark_dirty(&dictionary);
                 }
             }
             ReactorState::Qpdf => {} // cov:ignore: JSON array callbacks select qpdf metadata or objects before dictionary events
@@ -1101,8 +1085,6 @@ where
                 let item = self.make_object(value);
                 if let Err(error) = current.append_array_item(item) {
                     self.fatal(error.to_string()); // cov:ignore: make_object installs an array before array callbacks
-                } else {
-                    self.mark_dirty(&current);
                 }
             }
             _ => {}

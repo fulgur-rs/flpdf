@@ -147,7 +147,6 @@ pub(crate) fn run_test_26<R: Read + Seek>(
         let trailer = pdf.trailer();
         let copied_qtest = pdf.copy_foreign_object(&qtest)?;
         trailer.replace_key(b"/QTest", copied_qtest)?;
-        pdf.mark_object_handle_dirty(&trailer)?;
     }
 
     let mut writer = PdfWriter::new(pdf);
@@ -257,7 +256,6 @@ pub(crate) fn run_test_27<R: Read + Seek>(
         for stream in [&s1, &s2, &s3] {
             qtest2.append_array_item(pdf.copy_foreign_object(stream)?)?;
         }
-        pdf.mark_object_handle_dirty(&trailer)?;
     }
 
     // qpdf writes only after the transient source documents above leave

@@ -249,7 +249,6 @@ pub(crate) fn run_test_4<R: Read + Seek>(
 
     let info = pdf.make_indirect_from_object_handle(qtest)?;
     trailer.replace_key(b"/Info", info.clone())?;
-    pdf.mark_object_handle_dirty(&info)?;
 
     let mut writer = PdfWriter::new(pdf);
     writer.set_qdf_mode(true);
@@ -495,7 +494,6 @@ pub(crate) fn run_test_7<R: Read + Seek>(
         Some(ObjectHandle::null()),
         Some(ObjectHandle::null()),
     );
-    pdf.mark_object_handle_dirty(&qstream)?;
 
     let mut writer = PdfWriter::new(pdf);
     writer.set_output_file("a.pdf")?;
@@ -578,7 +576,6 @@ pub(crate) fn run_test_8<R: Read + Seek>(
         Some(ObjectHandle::null()),
     )?;
     provider.set_bad_length(false);
-    pdf.mark_object_handle_dirty(&qstream)?;
 
     let mut writer = PdfWriter::new(pdf);
     writer.set_output_file("a.pdf")?;
@@ -628,11 +625,9 @@ pub(crate) fn run_test_9<R: Read + Seek>(
         Some(ObjectHandle::null()),
         Some(ObjectHandle::null()),
     );
-    pdf.mark_object_handle_dirty(&rstream)?;
 
     root.replace_key(b"/QStream", qstream)?;
     root.replace_key(b"/RStream", rstream)?;
-    pdf.mark_object_handle_dirty(&root)?;
 
     let mut writer = PdfWriter::new(pdf);
     writer.set_output_file("a.pdf")?;

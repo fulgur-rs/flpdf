@@ -143,8 +143,6 @@ pub fn optimize_images<R: Read + Seek + 'static>(
 
         for (xobjects, key, new_image) in replacements {
             xobjects.replace_key(&key, new_image.clone())?;
-            pdf.mark_object_handle_dirty(&new_image)?;
-            pdf.mark_object_handle_dirty(&xobjects)?;
         }
     }
     Ok(())

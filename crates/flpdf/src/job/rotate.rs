@@ -116,7 +116,6 @@ pub fn apply_rotate_to_pages<R: Read + Seek>(
         // `relative` selects qpdf's inherited-parent walk; both modes make
         // the result explicit even when it is zero.
         page.rotate_page(op.degrees, matches!(op.mode, RotateMode::Add))?;
-        pdf.mark_object_handle_dirty(&page)?;
     }
     Ok(())
 }
@@ -363,8 +362,6 @@ mod tests {
         parent
             .replace_key(b"/Parent", page)
             .expect("parent must be mutable");
-        pdf.mark_object_handle_dirty(&parent)
-            .expect("parent mutation must be dirty");
 
         assert_eq!(
             resolve_inherited_rotate(&mut pdf, ObjectRef::new(3, 0)).unwrap(),
@@ -380,8 +377,6 @@ mod tests {
         pdf.resolve(&page).unwrap();
         page.replace_key(b"/Parent", ObjectHandle::integer(42))
             .expect("page must be mutable");
-        pdf.mark_object_handle_dirty(&page)
-            .expect("page mutation must be dirty");
 
         assert_eq!(
             resolve_inherited_rotate(&mut pdf, ObjectRef::new(3, 0)).unwrap(),
@@ -410,8 +405,6 @@ mod tests {
             ObjectHandle::dictionary(vec![(b"/Rotate".to_vec(), ObjectHandle::integer(90))]);
         page.replace_key(b"/Parent", parent)
             .expect("page must be mutable");
-        pdf.mark_object_handle_dirty(&page)
-            .expect("page mutation must be dirty");
 
         let error = resolve_inherited_rotate_with_max_depth(&mut pdf, page_ref, 1).unwrap_err();
         assert!(matches!(
@@ -431,8 +424,6 @@ mod tests {
         pdf.resolve(&page).unwrap();
         page.replace_key(b"/Rotate", ObjectHandle::name(b"Bad".to_vec()))
             .expect("page must be mutable");
-        pdf.mark_object_handle_dirty(&page)
-            .expect("page mutation must be dirty");
 
         let error = resolve_inherited_rotate(&mut pdf, page_ref).unwrap_err();
         assert!(matches!(
@@ -544,8 +535,6 @@ mod tests {
         pdf.resolve(&page).unwrap();
         page.replace_key(b"/Rotate", ObjectHandle::integer(2_147_483_700))
             .expect("page must be mutable");
-        pdf.mark_object_handle_dirty(&page)
-            .expect("page mutation must be dirty");
 
         let op = RotateOp {
             mode: RotateMode::Add,
@@ -571,8 +560,6 @@ mod tests {
         pdf.resolve(&page).unwrap();
         page.replace_key(b"/Rotate", ObjectHandle::integer(-2_147_483_700))
             .expect("page must be mutable");
-        pdf.mark_object_handle_dirty(&page)
-            .expect("page mutation must be dirty");
 
         let op = RotateOp {
             mode: RotateMode::Add,
@@ -598,8 +585,6 @@ mod tests {
         pdf.resolve(&page).unwrap();
         page.replace_key(b"/Rotate", ObjectHandle::integer(9_223_372_036_854_775_800))
             .expect("page must be mutable");
-        pdf.mark_object_handle_dirty(&page)
-            .expect("page mutation must be dirty");
 
         let op = RotateOp {
             mode: RotateMode::Add,

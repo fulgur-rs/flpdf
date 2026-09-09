@@ -182,7 +182,6 @@ pub struct Pdf<R: Read + Seek + 'static> {
     pub(crate) trailer_handle_memo: Option<ObjectHandle>,
     /// Canonical `/Root` handle after the first root lookup.
     pub(crate) root_handle_memo: Option<ObjectHandle>,
-    pub(crate) dirty_object_refs: BTreeSet<ObjectRef>,
     /// Monotonic observation matching qpdf's `everCalledGetAllPages()`.
     pub(crate) ever_called_get_all_pages: bool,
     /// Monotonic observation matching qpdf's
@@ -565,7 +564,6 @@ impl<R: Read + Seek> Pdf<R> {
                 b"catalog /Type entry missing or invalid",
             ))?;
             root.replace_key(b"/Type", ObjectHandle::name(b"Catalog".to_vec()))?;
-            self.mark_object_handle_dirty(&root)?;
         }
         Ok(root)
     }

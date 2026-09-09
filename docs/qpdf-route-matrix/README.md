@@ -33,7 +33,7 @@ container-above-max だった — `flpdf-hi08` / PR #1486）。本表は残る m
 
 | canonical | bridge | mixed | unknown | 合計 |
 |---|---|---|---|---|
-| 66 | 11 | 82 | 1 | 160 |
+| 67 | 10 | 82 | 1 | 160 |
 
 再現コマンド（`\|` でエスケープされたセル内パイプを先に潰してから7列目を読む）:
 
@@ -225,14 +225,7 @@ crates/flpdf/src/reader.rs::Pdf::next_available_object_ref: prod 2 (2 files) / t
     crates/flpdf/src/page_annotation_flatten.rs 1, crates/flpdf/src/reader.rs 1
 crates/flpdf/src/reader.rs::Pdf::make_indirect_object_handle: prod 31 (14 files) / test 56
     crates/flpdf/src/acroform_document_helper.rs 6, crates/flpdf-qtest-tools/src/driver/test_10_17.rs 5, crates/flpdf/src/page_splice.rs 4, crates/flpdf-qtest-tools/src/large_file.rs 3, crates/flpdf/src/filespec_helper/filespec.rs 2, crates/flpdf/src/page_document_helper.rs 2, crates/flpdf/src/page_extract.rs 2, crates/flpdf-qtest-tools/src/driver/test_50_55.rs 1, crates/flpdf-qtest-tools/src/driver/test_56_63.rs 1, crates/flpdf-qtest-tools/src/driver/test_72_79.rs 1, crates/flpdf/src/form_field_object_helper/rendering.rs 1, crates/flpdf/src/job/acroform_field_prune.rs 1, crates/flpdf/src/page_annotation_flatten.rs 1, crates/flpdf/src/page_object_helper.rs 1
-crates/flpdf/src/reader.rs::Pdf::mark_object_handle_dirty: prod 179 (49 files) / test 69
-    crates/flpdf/src/acroform_document_helper.rs 29, crates/flpdf/src/page_object_helper.rs 16, crates/flpdf/src/page_annotation_flatten.rs 14, crates/flpdf/src/job/page_merge.rs 7, crates/flpdf/src/page_splice.rs 7, crates/flpdf/src/pages/tree_rebuild.rs 7, crates/flpdf/src/resources.rs 7, crates/flpdf/src/form_field_object_helper/rendering.rs 6, crates/flpdf/src/job/page_specs.rs 6, crates/flpdf-qtest-tools/src/driver/test_02_09.rs 5, crates/flpdf/src/filespec_helper/embedded_file_stream.rs 5, crates/flpdf/src/job/acroform_field_prune.rs 5, crates/flpdf/src/pages/repair.rs 5, crates/flpdf-qtest-tools/src/driver/test_50_55.rs 4, crates/flpdf/src/overlay_appearance_stream.rs 4, crates/flpdf/src/embedded_files.rs 3, crates/flpdf/src/filespec_helper/filespec.rs 3, crates/flpdf-qtest-tools/src/clean.rs 2, crates/flpdf-qtest-tools/src/document_construction.rs 2, crates/flpdf-qtest-tools/src/driver/test_26_33.rs 2, crates/flpdf/src/form_field_object_helper.rs 2, crates/flpdf/src/job/image_optimization.rs 2, crates/flpdf/src/job/outline_dest_remap.rs 2, crates/flpdf/src/nntree.rs 2, crates/flpdf/src/objr_obj_annot_p.rs 2, crates/flpdf/src/optimization/inherited_attrs.rs 2, crates/flpdf/src/page_extract.rs 2, crates/flpdf/src/page_label_document_helper.rs 2, crates/flpdf/src/reader.rs 2, crates/flpdf/src/signatures.rs 2, crates/flpdf/src/thread_bead_p.rs 2, crates/flpdf-cli/src/main.rs 1, crates/flpdf-qtest-tools/src/driver/test_56_63.rs 1, crates/flpdf-qtest-tools/src/driver/test_72_79.rs 1, crates/flpdf-qtest-tools/src/driver/test_80_87.rs 1, crates/flpdf-qtest-tools/src/large_file.rs 1, crates/flpdf/src/annotation_object_helper.rs 1, crates/flpdf/src/job/attachments.rs 1, crates/flpdf/src/job/lifecycle.rs 1, crates/flpdf/src/job/overlay.rs 1, crates/flpdf/src/job/rotate.rs 1, crates/flpdf/src/json/input.rs 1, crates/flpdf/src/linearization/writer.rs 1, crates/flpdf/src/object_handle.rs 1, crates/flpdf/src/optimization.rs 1, crates/flpdf/src/page_document_helper.rs 1, crates/flpdf/src/pdf.rs 1, crates/flpdf/src/struct_tree_pg.rs 1, crates/flpdf/src/writer.rs 1
-crates/flpdf/src/reader.rs::Pdf::mark_object_dirty: prod 6 (3 files) / test 2
-    crates/flpdf/src/object_copy.rs 3, crates/flpdf/src/page_splice.rs 2, crates/flpdf/src/reader.rs 1
-crates/flpdf/src/reader.rs::Pdf::mark_object_handle_mutated: prod 8 (2 files) / test 1
-    crates/flpdf/src/reader.rs 5, crates/flpdf/src/filespec_helper/embedded_file_stream.rs 3
-crates/flpdf/src/pdf.rs::dirty_object_refs: prod 5 (2 files) / test 8
-    crates/flpdf/src/reader.rs 3, crates/flpdf/src/engine.rs 2
+dirty tracking symbols (A18): prod 0 / test 0 after `flpdf-3yn9.48.24`; mutations are observed from the canonical live handle graph.
 crates/flpdf/src/xref.rs::BootstrapCache: prod 2 (1 files) / test 2
     crates/flpdf/src/xref.rs 2
 crates/flpdf/src/reader/resolver.rs::read_window: prod 5 (1 files) / test 0

@@ -118,7 +118,7 @@ const REENTRANT_PARSE_ERROR: &str = "QPDF: re-entrant parsing detected. This is 
 /// (`include/qpdf/QPDF.hh`) restricted to what `QPDF::resolve`,
 /// `QPDF::readObjectAtOffset`, and `QPDF::resolveObjectsInStream` touch.
 /// Everything else a document owns — `version`, `trailer`, `startxref`,
-/// `foreign_object_maps`, dirty tracking, and every legacy field already
+/// `foreign_object_maps`, and every legacy field already
 /// carrying a `qpdf-cutover-delete` marker — stays on `Pdf`.
 ///
 /// One member is present for a consumer this slice does not yet have: the

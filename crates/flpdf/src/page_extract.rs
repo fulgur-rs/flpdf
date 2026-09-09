@@ -159,7 +159,6 @@ pub fn extract_pages<R: Read + Seek>(
         let page = target.get_object_handle(copied_page_ref);
         target.resolve(&page)?;
         page.replace_key(b"/Parent", pages_handle.clone())?;
-        target.mark_object_handle_dirty(&page)?;
     }
 
     // Build `/Kids` in selection order. Repeated selections reuse the copied
@@ -194,7 +193,6 @@ pub fn extract_pages<R: Read + Seek>(
         ),
     )?; // cov:ignore: Pdf::empty creates a dictionary /Pages root, so this defensive replace_key error is unreachable
     root.replace_key(b"/Count", ObjectHandle::integer(kids.len() as i64))?;
-    target.mark_object_handle_dirty(&root)?;
 
     // /PageLabels (qpdf `addPage`-based reconstruction parity — the same
     // per-page accumulation `QPDFJob::handlePageSpecs` performs while adding

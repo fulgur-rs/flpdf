@@ -103,10 +103,9 @@ pub(crate) fn remove_unreferenced_resources_on_page<R: Read + Seek>(
         for name in remove {
             dictionary.remove_key(&name);
         }
-        pdf.mark_object_handle_dirty(&dictionary)?;
     }
 
-    pdf.mark_object_handle_dirty(&resources)
+    Ok(())
 }
 
 /// qpdf's Form-XObject target route for
@@ -202,7 +201,6 @@ fn prune_canonical_resource_target<R: Read + Seek>(
         .cloned()
         .collect::<BTreeSet<_>>();
     if !local_unresolved.is_empty() && resources.as_dictionary().is_some() {
-        pdf.mark_object_handle_dirty(&resources)?;
         return Ok(());
     }
 
@@ -223,10 +221,9 @@ fn prune_canonical_resource_target<R: Read + Seek>(
         for key in remove {
             dictionary.remove_key(&key);
         }
-        pdf.mark_object_handle_dirty(&dictionary)?;
     }
 
-    pdf.mark_object_handle_dirty(&resources)
+    Ok(())
 }
 
 /// Mirror qpdf's `forEachFormXObject(true, ...)` pre-pass for a page-resource
@@ -317,7 +314,6 @@ fn remove_unreferenced_resources_in_form_xobjects<R: Read + Seek>(
             let resources = if resources.is_indirect() {
                 let copy = resources.shallow_copy()?;
                 stream_dict.replace_key(b"/Resources", copy.clone())?;
-                pdf.mark_object_handle_dirty(&stream_dict)?;
                 copy
             } else {
                 resources.clone()
@@ -401,7 +397,7 @@ fn form_xobjects_in_resources<R: Read + Seek>(
 /// by the directly parsed content stream. Empty category dictionaries remain
 /// present, matching qpdf's `removeKey` loop on the category contents.
 fn prune_font_and_xobject_dictionaries<R: Read + Seek>(
-    pdf: &mut Pdf<R>,
+    _pdf: &mut Pdf<R>,
     resources: &ObjectHandle,
     used: &UsedNames,
 ) -> Result<()> {
@@ -432,7 +428,6 @@ fn prune_font_and_xobject_dictionaries<R: Read + Seek>(
         for name in remove {
             dictionary.remove_key(&name);
         }
-        pdf.mark_object_handle_dirty(&dictionary)?;
     }
     Ok(())
 }

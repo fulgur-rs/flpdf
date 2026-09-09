@@ -237,7 +237,6 @@ pub fn prune_acroform_after_subset_with_max_depth<R: Read + Seek>(
         // All fields dropped → remove /AcroForm from catalog entirely,
         // matching qpdf's observed behaviour.
         catalog.remove_key(b"/AcroForm");
-        pdf.mark_object_handle_dirty(&catalog)?;
     } else {
         // qpdf creates a fresh array for an indirect /Fields holder and
         // replaces the key on the live AcroForm handle. A direct holder
@@ -249,7 +248,6 @@ pub fn prune_acroform_after_subset_with_max_depth<R: Read + Seek>(
             replacement
         };
         acroform.replace_key(b"/Fields", replacement)?;
-        pdf.mark_object_handle_dirty(&acroform)?;
     }
 
     // Step 6 changes both the AcroForm field tree and widget page links.
@@ -397,7 +395,6 @@ fn remove_stale_widget_page_ref<R: Read + Seek>(
     }
     if removed_pages.contains(&existing_ref) {
         widget.remove_key(b"/P");
-        pdf.mark_object_handle_dirty(widget)?;
         return Ok(());
     }
     pdf.resolve(&existing)?;
@@ -405,7 +402,6 @@ fn remove_stale_widget_page_ref<R: Read + Seek>(
         return Ok(());
     }
     widget.remove_key(b"/P");
-    pdf.mark_object_handle_dirty(widget)?;
     Ok(())
 }
 
@@ -461,7 +457,6 @@ fn strip_dropped_widget_p_refs<R: Read + Seek>(
             if !widget_to_page.contains_key(&kid.identity_key()) {
                 // Widget on a dropped page — remove stale /P.
                 kid.remove_key(b"/P");
-                pdf.mark_object_handle_dirty(&kid)?;
             }
             // Pure widget kids do not have /Kids of their own (spec: a widget
             // annotation is a leaf); no need to recurse.
@@ -762,7 +757,6 @@ mod tests {
         let widget = pdf.get_object_handle(ObjectRef::new(7, 0));
         pdf.resolve(&widget).unwrap();
         widget.replace_key(b"/P", ObjectHandle::integer(7)).unwrap();
-        pdf.mark_object_handle_dirty(&widget).unwrap();
 
         let result = rebuild_page_tree(&mut pdf, &[ObjectRef::new(3, 0)]).unwrap();
         prune_acroform_after_subset(&mut pdf, &result).unwrap();
@@ -783,7 +777,6 @@ mod tests {
         pdf.resolve(&widget).unwrap();
         let non_page_ref = pdf.get_object_handle(ObjectRef::new(6, 0));
         widget.replace_key(b"/P", non_page_ref).unwrap();
-        pdf.mark_object_handle_dirty(&widget).unwrap();
 
         let result = rebuild_page_tree(&mut pdf, &[ObjectRef::new(3, 0)]).unwrap();
         prune_acroform_after_subset(&mut pdf, &result).unwrap();
@@ -875,7 +868,6 @@ mod tests {
             let widget = pdf.get_object_handle(r);
             pdf.resolve(&widget).unwrap();
             widget.remove_key(b"/P");
-            pdf.mark_object_handle_dirty(&widget).unwrap();
         }
 
         // Extract pages 1 and 2 (objects 3 and 4).

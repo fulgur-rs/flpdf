@@ -648,7 +648,6 @@ impl<'a, R: Read + Seek> PageObjectHelper<'a, R> {
             )?; // cov:ignore: canonical Matrix construction and dictionary replacement cannot fail after new_stream allocation
         }
 
-        self.pdf.mark_object_handle_dirty(&form)?;
         Ok(form)
     }
 
@@ -835,7 +834,6 @@ impl<'a, R: Read + Seek> PageObjectHelper<'a, R> {
         };
         let copy = fallback.shallow_copy()?;
         page.replace_key(key, copy.clone())?;
-        self.pdf.mark_object_handle_dirty(&page)?;
         Ok(copy)
     }
 
@@ -908,7 +906,7 @@ impl<'a, R: Read + Seek> PageObjectHelper<'a, R> {
     pub fn add_page_contents(&mut self, contents: ObjectHandle, first: bool) -> Result<()> {
         let (target, _) = self.resolved_attribute_target()?;
         target.add_page_contents(contents, first)?;
-        self.pdf.mark_object_handle_dirty(&target)
+        Ok(())
     }
 
     /// Rotate the page in the live object graph.
@@ -918,7 +916,7 @@ impl<'a, R: Read + Seek> PageObjectHelper<'a, R> {
     pub fn rotate_page(&mut self, angle: i32, relative: bool) -> Result<()> {
         let (target, _) = self.resolved_attribute_target()?;
         target.rotate_page(angle, relative)?;
-        self.pdf.mark_object_handle_dirty(&target)
+        Ok(())
     }
 
     /// Bake the page's direct qpdf `/Rotate` value into its boxes, contents,
@@ -978,7 +976,6 @@ impl<'a, R: Read + Seek> PageObjectHelper<'a, R> {
         if !inherited_rotate.try_is_null()? {
             page.replace_key(b"/Rotate", ObjectHandle::integer(0))?;
         }
-        self.pdf.mark_object_handle_dirty(&page)?;
 
         let old_annots = page.try_get_key(b"/Annots")?;
         if old_annots.try_as_array()?.is_some() {
@@ -990,7 +987,6 @@ impl<'a, R: Read + Seek> PageObjectHelper<'a, R> {
                 transformed
             };
             page.replace_key(b"/Annots", ObjectHandle::array(transformed.new_annotations))?;
-            self.pdf.mark_object_handle_dirty(&page)?;
         }
 
         Ok(())
@@ -1121,7 +1117,6 @@ impl<'a, R: Read + Seek> PageObjectHelper<'a, R> {
             transformed
         };
         destination.replace_key(b"/Annots", ObjectHandle::array(transformed.new_annotations))?;
-        self.pdf.mark_object_handle_dirty(&destination)?;
         Ok(())
     }
 
@@ -1214,7 +1209,7 @@ impl<'a, R: Read + Seek> PageObjectHelper<'a, R> {
     pub fn coalesce_content_streams(&mut self) -> Result<()> {
         let (target, _) = self.resolved_attribute_target()?;
         target.coalesce_content_streams()?;
-        self.pdf.mark_object_handle_dirty(&target)
+        Ok(())
     }
 
     /// Return a new indirect page whose dictionary is a qpdf-style shallow
@@ -1312,11 +1307,9 @@ impl<'a, R: Read + Seek> PageObjectHelper<'a, R> {
     pub fn add_content_token_filter(&mut self, filter: Rc<RefCell<dyn TokenFilter>>) -> Result<()> {
         let (target, is_form) = self.resolved_attribute_target()?;
         if is_form {
-            target.add_token_filter(filter)?;
-        } else {
-            target.add_content_token_filter(filter)?;
+            return target.add_token_filter(filter);
         }
-        self.pdf.mark_object_handle_dirty(&target)
+        target.add_content_token_filter(filter)
     }
 
     /// Remove unused `/Font` and `/XObject` entries from this page or Form's
@@ -1932,7 +1925,6 @@ fn externalize_inline_images_for_target<R: Read + Seek>(
     let empty_xobjects = ObjectHandle::dictionary(Vec::new());
     let seed = ObjectHandle::dictionary(vec![(b"/XObject".to_vec(), empty_xobjects)]);
     resources.merge_resources(&seed, None)?;
-    pdf.mark_object_handle_dirty(&resources)?;
 
     let mut filter = InlineImageExternalizer::new(min_size, resources.clone());
     let mut rewritten = Vec::new();
@@ -1986,10 +1978,8 @@ fn externalize_inline_images_for_target<R: Read + Seek>(
                     stream_dict.replace_key(&key, value)?;
                 }
             }
-            pdf.mark_object_handle_dirty(&stream)?;
             xobjects.replace_key(&image.name, stream)?;
         }
-        pdf.mark_object_handle_dirty(&xobjects)?;
     }
 
     if is_form {
@@ -2002,7 +1992,7 @@ fn externalize_inline_images_for_target<R: Read + Seek>(
         let contents = pdf.new_stream_with_data(Rc::new(rewritten))?;
         target.replace_key(b"/Contents", contents)?;
     }
-    pdf.mark_object_handle_dirty(&target)
+    Ok(())
 }
 
 fn object_handle_description(object: &ObjectHandle) -> String {
@@ -2103,7 +2093,7 @@ fn rectangle_to_handle(rectangle: Rectangle) -> ObjectHandle {
 }
 
 fn append_annotation_handles<R: Read + Seek>(
-    pdf: &mut Pdf<R>,
+    _pdf: &mut Pdf<R>,
     page: &ObjectHandle,
     annotations: Vec<ObjectHandle>,
 ) -> Result<()> {
@@ -2118,8 +2108,6 @@ fn append_annotation_handles<R: Read + Seek>(
     for annotation in annotations {
         annots.append_array_item(annotation)?;
     }
-    pdf.mark_object_handle_dirty(&annots)?;
-    pdf.mark_object_handle_dirty(page)?;
     Ok(())
 }
 
@@ -2278,7 +2266,6 @@ fn get_attribute_for_target<R: Read + Seek>(
     if copy_if_shared && (inherited || result.is_indirect()) {
         let copy = result.shallow_copy()?;
         dict.replace_key(key, copy.clone())?;
-        pdf.mark_object_handle_dirty(&dict)?;
         result = copy;
     }
     Ok(result)
@@ -2351,6 +2338,18 @@ mod tests {
     use std::io::Cursor;
 
     use super::*;
+
+    struct NoopTokenFilter;
+
+    impl TokenFilter for NoopTokenFilter {
+        fn handle_token(
+            &mut self,
+            token: &Token,
+            output: &mut crate::TokenFilterOutput<'_>,
+        ) -> crate::PipelineResult<()> {
+            output.write_token(token)
+        }
+    }
 
     /// Build a minimal valid PDF from a contiguous run of `1..=objects.len()`
     /// objects, in `(object_number, body_literal)` order. `catalog_ref` is
@@ -2437,6 +2436,54 @@ mod tests {
             error.to_string().contains("belongs to a dropped PDF"),
             "unexpected resolver error: {error}"
         );
+    }
+
+    #[test]
+    fn add_content_token_filter_uses_the_live_page_and_form_routes() {
+        let bytes = pdf_from_objects(
+            1,
+            &[
+                (1, "<< /Type /Catalog /Pages 2 0 R >>".to_owned()),
+                (2, "<< /Type /Pages /Kids [3 0 R] /Count 1 >>".to_owned()),
+                (
+                    3,
+                    "<< /Type /Page /Parent 2 0 R /MediaBox [0 0 10 10] /Contents 4 0 R >>"
+                        .to_owned(),
+                ),
+                (4, "<< /Length 1 >>\nstream\nq\nendstream".to_owned()),
+            ],
+        );
+        let mut pdf = Pdf::open(Cursor::new(bytes)).expect("PDF should parse");
+        PageObjectHelper::new(ObjectRef::new(3, 0), &mut pdf)
+            .add_content_token_filter(Rc::new(RefCell::new(NoopTokenFilter)))
+            .expect("page content filter should use the page route");
+        pdf.get_object_handle(ObjectRef::new(4, 0))
+            .get_stream_data(DecodeLevel::Specialized)
+            .expect("page filter should remain executable through the live stream");
+
+        let form = ObjectHandle::stream(
+            ObjectHandle::dictionary(vec![
+                (b"/Type".to_vec(), ObjectHandle::name(b"XObject".to_vec())),
+                (b"/Subtype".to_vec(), ObjectHandle::name(b"Form".to_vec())),
+                (
+                    b"/BBox".to_vec(),
+                    ObjectHandle::array(vec![
+                        ObjectHandle::integer(0),
+                        ObjectHandle::integer(0),
+                        ObjectHandle::integer(10),
+                        ObjectHandle::integer(10),
+                    ]),
+                ),
+            ]),
+            Rc::new(b"q".to_vec()),
+        );
+        let form_for_read = form.clone();
+        PageObjectHelper::from_object_handle(form, &mut pdf)
+            .add_content_token_filter(Rc::new(RefCell::new(NoopTokenFilter)))
+            .expect("Form XObject filter should use the stream route");
+        form_for_read
+            .get_stream_data(DecodeLevel::Specialized)
+            .expect("Form filter should remain executable through the live stream");
     }
 
     #[test]

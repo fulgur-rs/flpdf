@@ -141,7 +141,6 @@ fn prepare_for_optimization_canonical<R: Read + Seek>(
     }
     if changed_pages {
         catalog.replace_key(b"/Pages", pages.clone())?;
-        pdf.mark_object_handle_dirty(&catalog)?;
     }
 
     // qpdf's getAllPages asks the final node for /Kids even when it is not a
@@ -276,7 +275,7 @@ fn repair_page_tree_handle<R: Read + Seek>(
                     ObjectHandle::integer(612),
                     ObjectHandle::integer(792),
                 ]),
-            )?; // cov:ignore: canonical page owners make dirty tracking infallible here
+            )?; // cov:ignore: canonical page owners make this replacement infallible here
         }
 
         if kid.is_direct() {
@@ -289,7 +288,6 @@ fn repair_page_tree_handle<R: Read + Seek>(
                 .expect("promote_page_handle returns an indirect handle");
             state.seen.insert(promoted_ref);
             kids.set_array_item(index, kid.clone())?;
-            pdf.mark_object_handle_dirty(&kids)?;
         } else if let Some(object_ref) = kid.object_ref() {
             if !state.seen.insert(object_ref) {
                 node.warn_if_possible(format!(
@@ -302,7 +300,6 @@ fn repair_page_tree_handle<R: Read + Seek>(
                     .expect("promote_page_handle returns an indirect handle");
                 state.seen.insert(copied_ref);
                 kids.set_array_item(index, kid.clone())?;
-                pdf.mark_object_handle_dirty(&kids)?;
             }
         }
 
@@ -337,18 +334,17 @@ fn promote_page_handle<R: Read + Seek>(
     handle: ObjectHandle,
 ) -> Result<ObjectHandle> {
     let promoted = pdf.make_indirect_from_object_handle(handle)?;
-    pdf.mark_object_handle_dirty(&promoted)?;
     Ok(promoted)
 }
 
 fn replace_handle_key<R: Read + Seek>(
-    pdf: &mut Pdf<R>,
+    _pdf: &mut Pdf<R>,
     holder: &ObjectHandle,
     key: &[u8],
     value: ObjectHandle,
 ) -> Result<()> {
     holder.replace_key(key, value)?;
-    pdf.mark_object_handle_dirty(holder)
+    Ok(())
 }
 
 fn is_rectangle_handle(value: &ObjectHandle) -> Result<bool> {

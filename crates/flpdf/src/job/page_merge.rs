@@ -106,7 +106,6 @@ fn wire_primary_catalog<RS: Read + Seek, RT: Read + Seek>(
         let copied = target.copy_foreign_value(source_id, &value)?;
         target_catalog.replace_key(&key, copied)?;
     }
-    target.mark_object_handle_dirty(&target_catalog)?;
     Ok(())
 }
 
@@ -449,7 +448,6 @@ fn remove_target_acroform<R: Read + Seek>(target: &mut Pdf<R>) -> Result<()> {
         return Ok(()); // cov:ignore: the seed catalog is always a dict
     }
     catalog.remove_key(b"/AcroForm");
-    target.mark_object_handle_dirty(&catalog)?;
     Ok(())
 }
 
@@ -520,7 +518,6 @@ fn build_merged_acroform<R: Read + Seek>(
     }
     acroform.replace_key(b"/Fields", ObjectHandle::array(fields))?;
 
-    target.mark_object_handle_dirty(&acroform)?;
     Ok(())
 }
 
@@ -539,7 +536,6 @@ fn rename_field<R: Read + Seek>(
         return Ok(()); // cov:ignore: a copied field ref always resolves to a dictionary
     }
     field.replace_key(b"/T", ObjectHandle::string(new_unicode_string(&name)))?;
-    target.mark_object_handle_dirty(&field)?;
     Ok(())
 }
 
@@ -773,7 +769,6 @@ fn rewrite_field_kids<R: Read + Seek>(
         }
     }
     field.replace_key(b"/Kids", ObjectHandle::array(kids))?;
-    target.mark_object_handle_dirty(&field)?;
     Ok(())
 }
 
@@ -1316,7 +1311,6 @@ pub(crate) fn merge_documents_with_resource_decisions_and_preserve_primary_into<
             let page = target.get_object_handle(copied_page_ref);
             target.resolve(&page)?;
             page.replace_key(b"/Parent", pages_handle.clone())?;
-            target.mark_object_handle_dirty(&page)?;
         }
 
         // Record this input's kept top-level fields (those whose source ref was
@@ -1416,7 +1410,6 @@ pub(crate) fn merge_documents_with_resource_decisions_and_preserve_primary_into<
         .collect();
     root.replace_key(b"/Kids", ObjectHandle::array(kid_handles))?;
     root.replace_key(b"/Count", ObjectHandle::integer(kids.len() as i64))?;
-    target.mark_object_handle_dirty(&root)?;
 
     // Build the merged `/AcroForm`: the primary's `/DR` / `/DA` base plus every
     // kept top-level field, with later inputs' colliding `/T` names renamed by
