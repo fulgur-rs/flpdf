@@ -144,6 +144,23 @@ fn named_colorspace_inline_image_pdf() -> Vec<u8> {
     ])
 }
 
+fn malformed_resource_containers_inline_images_pdf() -> Vec<u8> {
+    let mut content = inline_image_content(b"/Foo", &[0, 64, 128, 255], true);
+    content.extend_from_slice(&inline_image_content(b"/Bar", &[255, 128, 64, 0], true));
+    assemble_pdf(&[
+        (1, b"<< /Type /Catalog /Pages 2 0 R >>".to_vec()),
+        (2, b"<< /Type /Pages /Kids [3 0 R] /Count 1 >>".to_vec()),
+        (
+            3,
+            b"<< /Type /Page /Parent 2 0 R /MediaBox [0 0 200 200] /Resources << /XObject 5 /ColorSpace 6 >> /Contents 4 0 R >>".to_vec(),
+        ),
+        (
+            4,
+            stream_object(format!("<< /Length {} >>", content.len()).as_bytes(), &content),
+        ),
+    ])
+}
+
 fn no_inline_image_pdf() -> Vec<u8> {
     let content = b"q Q\n";
     assemble_pdf(&[
@@ -811,6 +828,19 @@ fn nested_forms_named_colorspaces_and_empty_pages_match_qpdf() {
             name,
         );
     }
+}
+
+#[test]
+fn malformed_resource_containers_match_qpdf_for_each_inline_image() {
+    let directory = tempfile::tempdir().expect("tempdir");
+    let input = directory.path().join("malformed-resources-input.pdf");
+    std::fs::write(&input, malformed_resource_containers_inline_images_pdf()).expect("write input");
+
+    assert_qdf_bytes_match(
+        &input,
+        &["--externalize-inline-images", "--ii-min-bytes=0"],
+        "malformed resource containers",
+    );
 }
 
 #[test]
