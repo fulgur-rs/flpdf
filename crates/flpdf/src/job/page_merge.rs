@@ -1161,15 +1161,13 @@ fn merge_documents_with_resource_decisions_and_preserve_primary_into_impl<
         // removed from, so they take the ordinary `copyForeignObject`-
         // preparation path instead.
         let all = original_page_refs[input_index].clone();
-        if !is_primary {
-            // qpdf's `QPDF::insertPage` prepares every foreign source through
-            // `pushInheritedAttributesToPage` before `copyForeignObject`.
-            // This promotes shared non-scalar inherited values (such as a
-            // direct `/MediaBox` on `/Pages`) once, and only writes a leaf key
-            // when an ancestor actually supplies it. In particular, an absent
-            // `/Rotate` must stay absent rather than becoming `/Rotate 0`.
-            PageDocumentHelper::new(input.source).push_inherited_attributes_to_pages()?;
-        }
+        // qpdf's page-copy boundary prepares every source through
+        // `pushInheritedAttributesToPage` before the selected pages are
+        // copied. This promotes shared non-scalar inherited values (such as a
+        // direct `/MediaBox` on `/Pages`) once, and only writes a leaf key when
+        // an ancestor actually supplies it. In particular, an absent
+        // `/Rotate` must stay absent rather than becoming `/Rotate 0`.
+        PageDocumentHelper::new(input.source).push_inherited_attributes_to_pages()?;
 
         // Reconstruct this input's page-label contribution, one entry per
         // selected page (in selection order, duplicates included), before any
