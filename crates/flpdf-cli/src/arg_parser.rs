@@ -1,4 +1,5 @@
 use clap::Command;
+use flpdf::job::QPDFJob;
 use std::collections::HashSet;
 use std::ffi::{OsStr, OsString};
 use std::io::Read;
@@ -423,6 +424,13 @@ impl ArgParser {
                 continue;
             };
 
+            let segment_start_index = residual_args.len();
+            let earlier_usage_error = first_unknown_option
+                .as_ref()
+                .is_some_and(|(index, _)| *index < segment_start_index)
+                || repeated_selector
+                    .as_ref()
+                    .is_some_and(|(index, _)| *index < segment_start_index);
             let mut tokens: Vec<RawArg> = Vec::new();
             let mut terminated = false;
             for token in iter.by_ref() {
@@ -430,15 +438,43 @@ impl ArgParser {
                     terminated = true;
                     break;
                 }
+                if kind == SegmentKind::PageLabels
+                    && !earlier_usage_error
+                    && token.as_bytes().len() > 1
+                    && token.as_bytes()[0] == b'-'
+                {
+                    let mut message = b"unrecognized argument ".to_vec();
+                    message.extend_from_slice(token.as_bytes());
+                    message.extend_from_slice(
+                        b" (set page labels options must be terminated with --)",
+                    );
+                    return Err(flpdf::UsageError::new(message).into());
+                }
                 tokens.push(self.canonical_segment_option(kind, token));
             }
-            if !terminated {
+            if !terminated && !(kind == SegmentKind::PageLabels && earlier_usage_error) {
+                if kind == SegmentKind::PageLabels {
+                    return Err(flpdf::UsageError::new(
+                        "missing -- at end of set page labels options",
+                    )
+                    .into());
+                }
                 let message = if kind == SegmentKind::AddAttachment {
                     format!("--{option}: missing -- terminator")
                 } else {
                     format!("--{option}: segment must be terminated by a `--` token")
                 };
                 return Err(message.into());
+            }
+            if kind == SegmentKind::PageLabels && !earlier_usage_error {
+                // QPDFArgParser commits Config::setPageLabels at this exact
+                // terminator before resuming the main option table. Reuse
+                // the canonical Job Config parser here so an invalid spec
+                // wins over any later clap positional or option error.
+                let mut validation_job = QPDFJob::new();
+                validation_job
+                    .config()
+                    .set_page_labels(tokens.iter().map(|token| token.as_bytes()))?;
             }
 
             let segment = RawNamedSegment { option, tokens };
@@ -1201,6 +1237,63 @@ mod tests {
         );
         assert_eq!(parsed.named_segments[0].option, "pages");
         assert_eq!(parsed.named_segments[0].tokens, ["source.pdf"]);
+    }
+
+    #[test]
+    fn parser_reports_page_label_missing_terminator_like_qpdf() {
+        let error = ArgParser::from_command(clap::Command::new("flpdf"))
+            .parse(vec![
+                "flpdf".into(),
+                "--set-page-labels".into(),
+                "1:D".into(),
+            ])
+            .expect_err("page-label option tables must be terminated");
+
+        assert_eq!(
+            error.to_string(),
+            "missing -- at end of set page labels options"
+        );
+    }
+
+    #[test]
+    fn parser_reports_page_label_options_with_qpdf_table_context() {
+        for option in ["--verbose", "--remove-page-labels", "-1:D"] {
+            let error = ArgParser::from_command(clap::Command::new("flpdf"))
+                .parse(vec![
+                    "flpdf".into(),
+                    "--set-page-labels".into(),
+                    "1:D".into(),
+                    option.into(),
+                    "--".into(),
+                ])
+                .expect_err("a page-label option table must reject option tokens");
+
+            assert_eq!(
+                error.to_string(),
+                format!(
+                    "unrecognized argument {option} (set page labels options must be terminated with --)"
+                ),
+                "{option}"
+            );
+        }
+    }
+
+    #[test]
+    fn parser_preserves_an_earlier_repeated_selector_error_over_page_labels() {
+        let error = ArgParser::from_command(clap::Command::new("flpdf"))
+            .parse(vec![
+                "flpdf".into(),
+                "--empty".into(),
+                "--empty".into(),
+                "--set-page-labels".into(),
+                "1:D".into(),
+            ])
+            .expect_err("the earlier repeated selector must win");
+
+        assert_eq!(
+            error.to_string(),
+            "empty input can't be used since input file has already been given"
+        );
     }
 
     #[test]

@@ -625,22 +625,27 @@ fn argv_page_label_config_rejects_invalid_specs_at_initialization() {
 
 #[test]
 fn argv_page_label_option_table_rejects_an_option_before_its_terminator() {
-    let mut job = QPDFJob::new();
-    let error = job
-        .initialize_from_argv(&[
-            "qpdfjob".to_owned(),
-            "input.pdf".to_owned(),
-            "output.pdf".to_owned(),
-            "--set-page-labels".to_owned(),
-            "1:D".to_owned(),
-            "--remove-page-labels".to_owned(),
-        ])
-        .expect_err("page-label specs must reject options before --");
-    assert!(matches!(
-        &error,
-        Error::Usage(usage)
-            if usage.to_string() == "unrecognized argument --remove-page-labels"
-    ));
+    for option in ["--remove-page-labels", "-1:D"] {
+        let mut job = QPDFJob::new();
+        let error = job
+            .initialize_from_argv(&[
+                "qpdfjob".to_owned(),
+                "input.pdf".to_owned(),
+                "output.pdf".to_owned(),
+                "--set-page-labels".to_owned(),
+                "1:D".to_owned(),
+                option.to_owned(),
+            ])
+            .expect_err("page-label specs must reject options before --");
+        assert!(matches!(
+            &error,
+            Error::Usage(usage)
+                if usage.to_string()
+                    == format!(
+                        "unrecognized argument {option} (set page labels options must be terminated with --)"
+                    )
+        ));
+    }
 }
 
 #[test]
@@ -658,7 +663,26 @@ fn argv_page_label_option_table_requires_a_terminator() {
     assert!(matches!(
         &error,
         Error::Usage(usage)
-            if usage.to_string() == "--set-page-labels must be terminated with --"
+            if usage.to_string() == "missing -- at end of set page labels options"
+    ));
+}
+
+#[test]
+fn argv_page_label_invalid_spec_without_terminator_reports_missing_terminator() {
+    let mut job = QPDFJob::new();
+    let error = job
+        .initialize_from_argv(&[
+            "qpdfjob".to_owned(),
+            "--set-page-labels".to_owned(),
+            "quack".to_owned(),
+            "input.pdf".to_owned(),
+            "output.pdf".to_owned(),
+        ])
+        .expect_err("missing terminator must win over deferred spec validation");
+    assert!(matches!(
+        &error,
+        Error::Usage(usage)
+            if usage.to_string() == "missing -- at end of set page labels options"
     ));
 }
 

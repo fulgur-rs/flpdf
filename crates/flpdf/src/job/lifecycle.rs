@@ -1926,19 +1926,26 @@ impl QPDFJob {
         let argv = expand_arg_files(argv)?;
         let mut configuration = JobConfiguration::default();
         let mut positionals = Vec::new();
-        let mut page_label_specs: Option<Vec<PageLabelSpec>> = None;
+        let mut page_label_specs: Option<Vec<String>> = None;
 
         for argument in argv.iter().skip(1) {
             if let Some(specs) = page_label_specs.as_mut() {
                 if argument == "--" {
-                    configuration.set_page_labels = Some(std::mem::take(specs));
+                    let parsed = std::mem::take(specs)
+                        .into_iter()
+                        .map(|spec| parse_page_label_spec(spec.as_bytes()))
+                        .collect::<Result<Vec<_>>>()?;
+                    configuration.set_page_labels = Some(parsed);
                     page_label_specs = None;
                     continue;
                 }
-                if argument.starts_with('-') {
-                    return Err(UsageError::new(format!("unrecognized argument {argument}")).into());
+                if argument.len() > 1 && argument.starts_with('-') {
+                    return Err(UsageError::new(format!(
+                        "unrecognized argument {argument} (set page labels options must be terminated with --)"
+                    ))
+                    .into());
                 }
-                specs.push(parse_page_label_spec(argument.as_bytes())?);
+                specs.push(argument.clone());
                 continue;
             }
             if argument == "--" {
@@ -2015,7 +2022,7 @@ impl QPDFJob {
         }
 
         if page_label_specs.is_some() {
-            return Err(UsageError::new("--set-page-labels must be terminated with --").into());
+            return Err(UsageError::new("missing -- at end of set page labels options").into());
         }
 
         if positionals.len() > 2 {
