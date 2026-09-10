@@ -497,6 +497,106 @@ fn split_pages_no_warn_matches_qpdf_for_a_warning_bearing_source() {
     assert!(flpdf_dir.join("out1.pdf").exists());
 }
 
+#[test]
+fn split_pages_resource_pruning_reports_qpdf_bad_token_warning() {
+    if !qpdf_or_skip() {
+        return;
+    }
+
+    let temp = tempfile::tempdir().expect("tempdir");
+    let input_path = temp.path().join("bad-content.pdf");
+    std::fs::write(&input_path, bad_content_pdf()).expect("write bad-content PDF");
+    let input = input_path.to_str().expect("input path is UTF-8");
+    let qpdf_dir = temp.path().join("qpdf-resource-split");
+    let flpdf_dir = temp.path().join("flpdf-resource-split");
+    std::fs::create_dir(&qpdf_dir).expect("qpdf split dir");
+    std::fs::create_dir(&flpdf_dir).expect("flpdf split dir");
+    let qpdf_template = qpdf_dir.join("out.pdf");
+    let flpdf_template = flpdf_dir.join("out.pdf");
+
+    let qpdf = run_qpdf(&[
+        "--qdf",
+        "--static-id",
+        "--split-pages=1",
+        "--remove-unreferenced-resources=yes",
+        input,
+        qpdf_template.to_str().expect("qpdf template is UTF-8"),
+    ]);
+    let flpdf = Command::cargo_bin("flpdf")
+        .expect("flpdf binary")
+        .args([
+            "--qdf",
+            "--static-id",
+            "--split-pages=1",
+            "--remove-unreferenced-resources=yes",
+            input,
+        ])
+        .arg(&flpdf_template)
+        .output()
+        .expect("flpdf invocation");
+
+    assert_eq!(qpdf.status.code(), Some(3));
+    assert_eq!(flpdf.status.code(), qpdf.status.code());
+    assert!(String::from_utf8_lossy(&qpdf.stderr)
+        .contains("Bad token found while scanning content stream"));
+    assert!(String::from_utf8_lossy(&flpdf.stderr)
+        .contains("Bad token found while scanning content stream"));
+    assert!(qpdf_dir.join("out-1.pdf").exists());
+    assert!(flpdf_dir.join("out-1.pdf").exists());
+}
+
+#[test]
+fn split_pages_no_warn_suppresses_chunk_normalization_warnings_like_qpdf() {
+    if !qpdf_or_skip() {
+        return;
+    }
+
+    let temp = tempfile::tempdir().expect("tempdir");
+    let input_path = temp.path().join("bad-content.pdf");
+    std::fs::write(&input_path, bad_content_pdf()).expect("write bad-content PDF");
+    let input = input_path.to_str().expect("input path is UTF-8");
+    let qpdf_dir = temp.path().join("qpdf-no-warn-split");
+    let flpdf_dir = temp.path().join("flpdf-no-warn-split");
+    std::fs::create_dir(&qpdf_dir).expect("qpdf split dir");
+    std::fs::create_dir(&flpdf_dir).expect("flpdf split dir");
+    let qpdf_template = qpdf_dir.join("out.pdf");
+    let flpdf_template = flpdf_dir.join("out.pdf");
+
+    let qpdf = run_qpdf(&[
+        "--qdf",
+        "--static-id",
+        "--no-warn",
+        "--split-pages=1",
+        "--remove-unreferenced-resources=yes",
+        input,
+        qpdf_template.to_str().expect("qpdf template is UTF-8"),
+    ]);
+    let flpdf = Command::cargo_bin("flpdf")
+        .expect("flpdf binary")
+        .args([
+            "--qdf",
+            "--static-id",
+            "--no-warn",
+            "--split-pages=1",
+            "--remove-unreferenced-resources=yes",
+            input,
+        ])
+        .arg(&flpdf_template)
+        .output()
+        .expect("flpdf invocation");
+
+    assert_eq!(qpdf.status.code(), Some(3));
+    assert!(qpdf.stdout.is_empty());
+    assert!(qpdf.stderr.is_empty());
+    assert_eq!(flpdf.status.code(), qpdf.status.code());
+    assert_eq!(flpdf.stdout, qpdf.stdout);
+    assert_eq!(flpdf.stderr, qpdf.stderr);
+    assert_eq!(
+        std::fs::read(qpdf_dir.join("out-1.pdf")).expect("qpdf chunk"),
+        std::fs::read(flpdf_dir.join("out-1.pdf")).expect("flpdf chunk")
+    );
+}
+
 /// One page whose content stream starts with a bad token (`\r<0g`), so
 /// `--normalize-content=y` records qpdf's "content normalization encountered
 /// bad tokens" warning family.

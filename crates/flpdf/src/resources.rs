@@ -29,6 +29,24 @@ fn diagnostic_count<R: Read + Seek>(pdf: &Pdf<R>) -> usize {
     pdf.num_warnings()
 }
 
+const BAD_TOKEN_WARNING: &str =
+    "Bad token found while scanning content stream; not attempting to remove unreferenced objects from this object";
+
+/// Report the same warning that qpdf's `removeUnreferencedResourcesHelper`
+/// emits for a parse exception or a parser warning. The distinction matters:
+/// qpdf uses the exception text for the former and the fixed bad-token text
+/// for the latter (`QPDFPageObjectHelper.cc:539-564`).
+fn warn_resource_parse_failure(handle: &ObjectHandle, parse_error: Option<&str>) -> Result<()> {
+    if let Some(parse_error) = parse_error {
+        let warning = format!(
+            "Unable to parse content stream: {parse_error}; not attempting to remove unreferenced objects from this object"
+        );
+        handle.warn_if_possible(&warning)
+    } else {
+        handle.warn_if_possible(BAD_TOKEN_WARNING)
+    }
+}
+
 /// qpdf `QPDFPageObjectHelper::removeUnreferencedResources` for one page.
 ///
 /// qpdf first copies an inherited or indirect `/Resources` dictionary onto the
@@ -50,14 +68,24 @@ pub(crate) fn remove_unreferenced_resources_on_page<R: Read + Seek>(
     // above remains separate because qpdf runs it before the page action and
     // uses its unresolved-name accumulator to protect page resources.
     let diagnostics_before = diagnostic_count(pdf);
-    let (finder, parse_ok) = {
+    let (finder, parse_error, pending_operands) = {
         let mut helper = PageObjectHelper::new(page_ref, pdf);
         let mut finder = ResourceFinder::default();
-        let parse_ok = helper.parse_contents(&mut finder).is_ok() && !finder.has_pending_operands();
-        (finder, parse_ok)
+        let parse_error = helper
+            .parse_contents(&mut finder)
+            .err()
+            .map(|error| error.to_string());
+        let pending_operands = finder.has_pending_operands();
+        (finder, parse_error, pending_operands)
     };
 
-    if !parse_ok || diagnostic_count(pdf) > diagnostics_before {
+    let page_handle = pdf.get_object_handle(page_ref);
+    if let Some(parse_error) = parse_error {
+        warn_resource_parse_failure(&page_handle, Some(&parse_error))?;
+        return Ok(());
+    }
+    if pending_operands || diagnostic_count(pdf) > diagnostics_before {
+        warn_resource_parse_failure(&page_handle, None)?;
         return Ok(());
     }
 
@@ -142,14 +170,23 @@ fn prune_canonical_resource_target<R: Read + Seek>(
     target: ObjectHandle,
 ) -> Result<()> {
     let diagnostics_before = diagnostic_count(pdf);
-    let (finder, parse_ok) = {
+    let (finder, parse_error, pending_operands) = {
         let mut helper = PageObjectHelper::from_object_handle(target.clone(), pdf);
         let mut finder = ResourceFinder::default();
-        let parse_ok = helper.parse_contents(&mut finder).is_ok() && !finder.has_pending_operands();
-        (finder, parse_ok)
+        let parse_error = helper
+            .parse_contents(&mut finder)
+            .err()
+            .map(|error| error.to_string());
+        let pending_operands = finder.has_pending_operands();
+        (finder, parse_error, pending_operands)
     };
 
-    if !parse_ok || diagnostic_count(pdf) > diagnostics_before {
+    if let Some(parse_error) = parse_error {
+        warn_resource_parse_failure(&target, Some(&parse_error))?;
+        return Ok(());
+    }
+    if pending_operands || diagnostic_count(pdf) > diagnostics_before {
+        warn_resource_parse_failure(&target, None)?;
         return Ok(());
     }
 
@@ -267,14 +304,26 @@ fn remove_unreferenced_resources_in_form_xobjects<R: Read + Seek>(
         // parsing failed or emitted a new warning, matching the page-level
         // block in remove_unreferenced_resources_on_page above.
         let diagnostics_before = diagnostic_count(pdf);
-        let (finder, parse_ok) = {
+        let (finder, parse_error, pending_operands) = {
             let mut helper = PageObjectHelper::from_object_handle(form_handle.clone(), pdf);
             let mut finder = ResourceFinder::default();
-            let parse_ok =
-                helper.parse_contents(&mut finder).is_ok() && !finder.has_pending_operands();
-            (finder, parse_ok)
+            let parse_error = helper
+                .parse_contents(&mut finder)
+                .err()
+                .map(|error| error.to_string());
+            let pending_operands = finder.has_pending_operands();
+            (finder, parse_error, pending_operands)
         };
-        if !parse_ok || diagnostic_count(pdf) > diagnostics_before {
+        if let Some(parse_error) = parse_error {
+            warn_resource_parse_failure(&form_handle, Some(&parse_error))?;
+            any_failures = true;
+            if let Some(resources) = resources.as_ref() {
+                pending.extend(form_xobjects_in_resources(resources)?);
+            } // cov:ignore: llvm-cov maps the covered child-Form continuation to this closing brace
+            continue;
+        }
+        if pending_operands || diagnostic_count(pdf) > diagnostics_before {
+            warn_resource_parse_failure(&form_handle, None)?;
             any_failures = true;
             if let Some(resources) = resources.as_ref() {
                 pending.extend(form_xobjects_in_resources(resources)?);

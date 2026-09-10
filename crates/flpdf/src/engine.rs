@@ -688,7 +688,15 @@ impl Pdf<Cursor<Vec<u8>>> {
     /// # Ok::<(), Box<dyn std::error::Error>>(())
     /// ```
     pub fn empty() -> crate::Result<Self> {
-        Self::open_mem_owned(EMPTY_PDF_BYTES.to_vec())
+        // qpdf's QPDF::emptyPDF() reads the canonical bytes through
+        // processMemoryFile("empty PDF", ...), so warnings raised by this
+        // document carry the same source description
+        // (`libqpdf/QPDF.cc:290-293`).
+        let options = PdfOpenOptions {
+            description: b"empty PDF".to_vec(),
+            ..PdfOpenOptions::default()
+        };
+        Self::open_mem_owned_with_options(EMPTY_PDF_BYTES.to_vec(), options)
     }
 }
 
