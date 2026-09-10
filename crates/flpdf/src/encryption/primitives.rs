@@ -63,16 +63,38 @@ pub(crate) fn compute_data_key(
     use_aes: bool,
     encryption_v: i64,
 ) -> Vec<u8> {
+    compute_data_key_qpdf_obj_gen(
+        encryption_key,
+        i64::from(object_number),
+        i64::from(generation),
+        use_aes,
+        encryption_v,
+    )
+}
+
+/// Raw qpdf object/generation form of `QPDF::compute_data_key`. qpdf keeps
+/// both fields as signed integers until the algorithm appends their low-order
+/// bytes; the valid `ObjectRef` projection is therefore too narrow for a
+/// parsed header such as generation 65536.
+pub(crate) fn compute_data_key_qpdf_obj_gen(
+    encryption_key: &[u8],
+    object_number: i64,
+    generation: i64,
+    use_aes: bool,
+    encryption_v: i64,
+) -> Vec<u8> {
     let mut input = encryption_key.to_vec();
     if encryption_v >= 5 {
         return input;
     }
 
+    let object_number = object_number as u64;
+    let generation = generation as u64;
     input.push((object_number & 0xff) as u8);
     input.push(((object_number >> 8) & 0xff) as u8);
     input.push(((object_number >> 16) & 0xff) as u8);
-    input.push((u32::from(generation) & 0xff) as u8);
-    input.push((u32::from(generation) >> 8) as u8);
+    input.push((generation & 0xff) as u8);
+    input.push(((generation >> 8) & 0xff) as u8);
     if use_aes {
         input.extend_from_slice(b"sAlT");
     }

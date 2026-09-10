@@ -374,6 +374,26 @@ consumerへは必要な場合だけ valid viewを射影する。`QPDF.cc:689-718
 に対応し、raw viewの
 `/Prev`後処理・reconstruction seed・canonical handoffは `flpdf-lsue` で固定する。
 
+### `flpdf-r3vn` raw-identity consumer cutover (2026-09-11)
+
+The raw identity must remain raw after the resolver boundary. qpdf's
+`QPDF::readObject` binds `StringDecrypter` to the `QPDFObjGen` read from the
+object header (`libqpdf/QPDF.cc:1330-1345`), and `QPDF::pipeStreamData` carries
+the same identity through original/foreign stream delivery
+(`libqpdf/QPDF.cc:120-180,2477-2538`). The object-key algorithm appends the low
+two generation bytes without applying the parser's `N G R` gate
+(`libqpdf/QPDF_encryption.cc:325-357,954-968`).
+
+flpdf's resolver now carries that raw key through original stream piping,
+parse-time string decryption, and xref-stream cache protection. `unparse`
+also emits raw `N G R` syntax from `ObjectHandle::qpdf_obj_gen()` when the
+projection to `ObjectRef` is unavailable (`libqpdf/QPDFObjectHandle.cc:1574-1593`).
+The effective xref snapshot retains projectionless default entries, while JSON
+and CLI object selectors accept qpdf's signed generation surface. Writer
+preserve-unreferenced seeds copy a raw-generation orphan into a fresh
+generation-zero output identity because no valid in-file `N G R` edge can name
+the source header; the output graph and qpdf-visible orphan value are retained.
+
 | qpdf | 行 | flpdf | 状態 |
 |---|---|---|---|
 | `QPDF.cc` | 2667 | `reader.rs::get_compressible_objgens` は `QPDF.cc:2393-2474` のLIFO walk、object-number単位のpacked visited bitmap、live cacheのupper_bound判定、stale generationのremoveObject副作用を所有する。`reader/resolver.rs::remove_object` はxref削除→alias null化/objgen解除→cache削除の順とfixed-dangling状態の維持を再現（`QPDF.cc:1996-2005`）。C++ vector<bool> はRustのu64 bitmapで同じbit-index契約を保つ。plain Generateが最初のconsumerで、旧writer eligibility/Preserve/linearizedは残移行対象。`reader.rs::get_object_stream_data` → `reader/resolver.rs::get_object_stream_data` が `QPDF::getObjectStreamData`（`QPDF.cc:2381-2390`）の document-owned type-2 mapping を所有する。既存 caller map の保持/上書き、object-number と container-number、解決を伴わない current xref 読み取りを維持し、plain Preserve は compressible walk の前に取得する（`QPDFWriter.cc:1941-1967`）。reader xref API全体と残 specialized/linearized lookup は維持する。`engine.rs`(475: `Pdf::empty`、ほか8つの public factory — `Pdf::open` / `open_with_repair` / `open_best_effort` / `open_with_options` / `open_mem` / `open_mem_with_options` / `open_mem_owned` / `open_mem_owned_with_options` —、`open_with_repair_mode`、`NEXT_PDF_ID`。`emptyPDF` / `processFile` / `processMemoryFile` の construction path) + `pdf.rs`(297: `Pdf<R>` container、`Drop` = `QPDF::~QPDF`、version/trailer/root/extension/page-enumeration-state accessors。`QPDF.hh:1438-1518`; `QPDF.cc:215-232,2323-2358,2647-2651`) + `reader.rs`(8185: object resolution, recovery, diagnostics, authentication, and `Pdf::get_xref_table` / `Pdf::get_all_objects`) + `reader/resolver.rs`(2367: canonical resolver。`QPDF::resolve` が触る `QPDF::Members` — `m->file` / `m->xref_table` / `m->obj_cache` / `m->resolving` / `m->resolved_object_streams` / `m->attempt_recovery` / `m->encp` — を `ResolverCore` に集約し、`Rc<RefCell<..>>` 経由で `ObjectHandle` の `Weak<dyn DocumentResolver>` から到達可能にする。`m->obj_cache` は canonical handle registry そのもので、`Pdf::get_object_handle`（= `QPDF::getObject`, `QPDF.cc:1952-1959`）と `Pdf::drop`（= `~QPDF`）の両方がここを見る。`Pdf::get_xref_table` は `QPDF::getXRefTable`（`QPDF.cc:2370-2377`）の effective source table snapshot、`Pdf::get_all_objects` は `fixDanglingReferences` と `m->obj_cache` enumeration（`QPDF.cc:1258-1294`）を canonical handle 上で実行する。`m->encp`（`flpdf-25kg.3.11`）は `Pdf::encryption` と同一の `Rc<RefCell<Option<EncryptionState>>>` を共有し、qpdf の `shared_ptr<EncryptionParameters>` を複数の owner が保持する形を再現する。`pipe_stream_data` は `QPDF::pipeStreamData` と同じく source read 前に `QPDF::decryptStream` 相当を呼び、同じ cell の method state / object-key cache を更新して AES/RC4 stage を前置する。`flpdf-25kg.3.5`/`.3.5.1`（ともに close 済み）で `readObjectAtOffset`/`readObject`/`readStream` の全 xref 形式（uncompressed type 1・ObjStm・canonical type-1 stream framing recovery を含む）が canonical resolver へ移植済み。`reader.rs`/`xref.rs` 自身の filter 呼び出し箇所の consumer cutover も `flpdf-egzr.3.2.10`（子 `.3.2.10.1`/`.3.2.10.2` close 済み、PR #859 merged）で完了し、`.48.49` で production 経路の `decode_stream_data`/`encode_stream_data` legacy wrapper と非qtest callerを撤去した。qtest exception の recovering API は別セッションの残スコープである。resolve 時文字列復号と pipe 時ストリーム復号 primitive は移植済み。残る raw `Object` route（`resolve_borrowed` と repair/recovery 経路）の削除は `flpdf-egzr.3.2.8`（close済み）) + `reader/file_object.rs`(1405) + `xref.rs`(1220) + `object_copy.rs`(342: `copyForeignObject`) + `cache.rs`(112: xref 由来の `ObjectCache` / `CacheEntry`。消費者は `reader.rs`) + `writer/object_streams/eligibility.rs`(263: qpdfの `getCompressibleObjGens` eligibility traversal) + `reader.rs`(491: `Pdf::remove_security_restrictions`) + `acroform_document_helper.rs`(649: `AcroFormDocumentHelper::disable_digital_signatures`) + `signatures.rs`(read-only inspection and flpdf-only SigFlags/value helpers) | 🔀 |

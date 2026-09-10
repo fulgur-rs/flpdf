@@ -202,6 +202,24 @@ pub trait StreamDataProvider {
         ))
     }
 
+    /// Raw qpdf object/generation form of the provider callback. Existing
+    /// providers that only implement the narrower numeric form retain their
+    /// behavior for projectable identities; providers that need the full qpdf
+    /// range can override this method directly.
+    fn provide_stream_data_by_qpdf_obj_gen(
+        &self,
+        object_number: i64,
+        generation: i64,
+        pipeline: &mut dyn Pipeline,
+    ) -> Result<()> {
+        if let (Ok(number), Ok(generation)) =
+            (u32::try_from(object_number), u16::try_from(generation))
+        {
+            return self.provide_stream_data(ObjectRef::new(number, generation), pipeline);
+        }
+        self.provide_stream_data_by_id(object_number as u32, generation as u16, pipeline)
+    }
+
     /// Retry-aware provider form receiving the complete stream identity.
     fn provide_stream_data_with_retry(
         &self,
@@ -231,6 +249,34 @@ pub trait StreamDataProvider {
         Err(Error::Internal(
             STREAM_DATA_PROVIDER_DEFAULT_ERROR.to_owned(),
         ))
+    }
+
+    /// Retry-aware raw qpdf object/generation form of the provider callback.
+    fn provide_stream_data_with_retry_by_qpdf_obj_gen(
+        &self,
+        object_number: i64,
+        generation: i64,
+        pipeline: &mut dyn Pipeline,
+        suppress_warnings: bool,
+        will_retry: bool,
+    ) -> Result<bool> {
+        if let (Ok(number), Ok(generation)) =
+            (u32::try_from(object_number), u16::try_from(generation))
+        {
+            return self.provide_stream_data_with_retry(
+                ObjectRef::new(number, generation),
+                pipeline,
+                suppress_warnings,
+                will_retry,
+            );
+        }
+        self.provide_stream_data_with_retry_by_id(
+            object_number as u32,
+            generation as u16,
+            pipeline,
+            suppress_warnings,
+            will_retry,
+        )
     }
 }
 
@@ -515,6 +561,37 @@ pub(crate) trait DocumentResolver {
         Err(Error::Internal(
             "stream data requested from a resolver without a stream source".to_owned(),
         ))
+    }
+
+    /// Raw qpdf object identity form used by original streams whose header
+    /// generation is outside the parser's `N G R` projection range.
+    #[allow(clippy::too_many_arguments)]
+    fn pipe_stream_data_qpdf_obj_gen(
+        &self,
+        object_gen: QpdfObjGen,
+        offset: i64,
+        length: usize,
+        stream_dict: &ObjectHandle,
+        pipeline: &mut dyn crate::pipeline::Pipeline,
+        suppress_warnings: bool,
+        will_retry: bool,
+    ) -> Result<bool> {
+        let object_ref = object_gen.to_object_ref().ok_or_else(|| {
+            Error::Internal(format!(
+                "object {} {} is not a valid indirect reference",
+                object_gen.get_obj(),
+                object_gen.get_gen()
+            ))
+        })?;
+        self.pipe_stream_data(
+            object_ref,
+            offset,
+            length,
+            stream_dict,
+            pipeline,
+            suppress_warnings,
+            will_retry,
+        )
     }
 }
 
@@ -7000,21 +7077,29 @@ impl ObjectHandle {
         // incremental write and measures the bytes that actually reached the
         // decoder/output pipeline (`libqpdf/QPDF_Stream.cc:575-604`).
         if let Some(provider) = stream_provider {
-            let object_ref = self.object_ref().ok_or_else(|| {
-                Error::Internal(
-                    "pipeStreamData called for provider-backed direct stream".to_owned(),
-                )
-            })?;
+            let object_gen = self
+                .qpdf_obj_gen()
+                .filter(|object_gen| object_gen.is_indirect())
+                .ok_or_else(|| {
+                    Error::Internal(
+                        "pipeStreamData called for provider-backed direct stream".to_owned(),
+                    )
+                })?;
             let mut count = Count::new("stream provider count", pipeline);
             let success = if provider.supports_retry() {
-                provider.provide_stream_data_with_retry(
-                    object_ref,
+                provider.provide_stream_data_with_retry_by_qpdf_obj_gen(
+                    object_gen.get_obj(),
+                    object_gen.get_gen(),
                     &mut count,
                     suppress_warnings,
                     will_retry,
                 )?
             } else {
-                provider.provide_stream_data(object_ref, &mut count)?;
+                provider.provide_stream_data_by_qpdf_obj_gen(
+                    object_gen.get_obj(),
+                    object_gen.get_gen(),
+                    &mut count,
+                )?;
                 true
             };
             if !success {
@@ -7031,7 +7116,10 @@ impl ObjectHandle {
                 if actual_length != desired_length {
                     return Err(Error::System(format!(
                         "stream data provider for {} {} provided {} bytes instead of expected {} bytes",
-                        object_ref.number, object_ref.generation, actual_length, desired_length
+                        object_gen.get_obj(),
+                        object_gen.get_gen(),
+                        actual_length,
+                        desired_length
                     )));
                 }
             } else {
@@ -7047,23 +7135,27 @@ impl ObjectHandle {
             ));
         }
 
-        let (object_ref, resolver) = {
+        let (object_gen, resolver) = {
             let slot = self.0.borrow();
-            let Some(object_ref) = slot.object_ref() else {
+            let Some(object_gen) = slot
+                .qpdf_obj_gen()
+                .filter(|object_gen| object_gen.is_indirect())
+            else {
                 return Err(Error::Internal(
                     "pipeStreamData called for original direct stream".to_owned(),
                 ));
             };
-            (object_ref, slot.resolver())
+            (object_gen, slot.resolver())
         };
         let Some(resolver) = resolver.and_then(|resolver| resolver.upgrade()) else {
             return Err(Error::Internal(format!(
                 "object {} {} belongs to a dropped PDF",
-                object_ref.number, object_ref.generation
+                object_gen.get_obj(),
+                object_gen.get_gen()
             )));
         };
-        resolver.pipe_stream_data(
-            object_ref,
+        resolver.pipe_stream_data_qpdf_obj_gen(
+            object_gen,
             parsed_offset,
             stream_length,
             stream_dict,
@@ -7249,6 +7341,12 @@ impl ObjectHandle {
     /// unparses to its own `"N G R"`, regardless of resolution state; a
     /// direct handle delegates to [`Self::unparse_resolved`].
     pub fn unparse(&self) -> Vec<u8> {
+        if let Some(object_gen) = self
+            .qpdf_obj_gen()
+            .filter(|object_gen| object_gen.is_indirect())
+        {
+            return format!("{} {} R", object_gen.get_obj(), object_gen.get_gen()).into_bytes();
+        }
         match self.object_ref() {
             Some(object_ref) => object_ref.to_string().into_bytes(),
             None => self.unparse_resolved(),
@@ -11928,6 +12026,19 @@ mod unparse_object_tests {
         });
 
         assert_eq!(handle.try_unparse_resolved().unwrap(), b"5 65536 R");
+    }
+
+    #[test]
+    fn unparse_emits_a_raw_qpdf_object_reference_for_unprojectable_generation() {
+        let handle = ObjectHandle::new_indirect_unresolved_qpdf_obj_gen_with_identity(
+            QpdfObjGen::new(5, 65_536),
+            NO_PARSED_OFFSET,
+            None,
+            None,
+        );
+        handle.set_resolved(ObjectValue::Integer(45));
+
+        assert_eq!(handle.unparse(), b"5 65536 R");
     }
 
     #[test]

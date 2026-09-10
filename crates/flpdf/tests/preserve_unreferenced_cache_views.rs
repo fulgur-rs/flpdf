@@ -14,6 +14,23 @@ fn one_page() -> Vec<u8> {
     .expect("read one-page fixture")
 }
 
+fn matching_raw_generation_orphan_pdf() -> Vec<u8> {
+    let mut bytes = b"%PDF-1.4\n".to_vec();
+    let catalog_offset = bytes.len();
+    bytes.extend_from_slice(b"1 0 obj\n<< /Type /Catalog >>\nendobj\n");
+    let orphan_offset = bytes.len();
+    bytes.extend_from_slice(b"5 65536 obj\n45\nendobj\n");
+    let xref_offset = bytes.len();
+    bytes.extend_from_slice(b"xref\n0 6\n0000000000 65535 f \n");
+    bytes.extend_from_slice(format!("{catalog_offset:010} 00000 n \n").as_bytes());
+    bytes.extend_from_slice(b"0000000000 00000 f \n0000000000 00000 f \n0000000000 00000 f \n");
+    bytes.extend_from_slice(format!("{orphan_offset:010} 65536 n \n").as_bytes());
+    bytes.extend_from_slice(
+        format!("trailer\n<< /Size 6 /Root 1 0 R >>\nstartxref\n{xref_offset}\n%%EOF\n").as_bytes(),
+    );
+    bytes
+}
+
 fn write_preserve_unreferenced(
     pdf: &mut Pdf<Cursor<Vec<u8>>>,
     mode: ObjectStreamMode,
@@ -70,6 +87,32 @@ fn value_swapped_into_an_unknown_generation_survives_preserve_unreferenced() {
         assert!(
             renumbered.is_some(),
             "{mode:?} must emit the value swapped into {unknown}"
+        );
+    }
+}
+
+#[test]
+fn raw_generation_orphan_survives_preserve_unreferenced() {
+    for mode in [ObjectStreamMode::Disable, ObjectStreamMode::Generate] {
+        let mut pdf =
+            Pdf::open(Cursor::new(matching_raw_generation_orphan_pdf())).expect("open PDF");
+        let mut writer = PdfWriter::new(&mut pdf);
+        writer.set_static_id(true);
+        writer.set_object_stream_mode(mode);
+        writer.set_preserve_unreferenced_objects(true);
+        writer.set_output_memory().expect("configure memory output");
+        writer
+            .write()
+            .expect("preserve-unreferenced write succeeds");
+
+        let output = writer.get_buffer().expect("writer output");
+        let value_count = output
+            .windows(b"\n45\n".len())
+            .filter(|window| *window == b"\n45\n")
+            .count();
+        assert!(
+            value_count == 1,
+            "raw-generation orphan must be emitted once in {mode:?} mode, got {value_count}"
         );
     }
 }

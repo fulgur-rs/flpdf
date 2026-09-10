@@ -35,6 +35,7 @@ use crate::object_ref::ObjectRef;
 use crate::parser::MAX_PARSE_DEPTH;
 use crate::writer::object_streams::ObjectStreamGroup;
 use crate::Error;
+use crate::ObjectHandle;
 use crate::Pdf;
 use crate::XrefEntry;
 
@@ -76,6 +77,33 @@ fn qpdf_source_objstm_containers<R: Read + Seek>(pdf: &Pdf<R>) -> BTreeSet<Objec
             XrefEntry::Free { .. } | XrefEntry::Uncompressed { .. } => None,
         })
         .collect()
+}
+
+/// Give a writer-owned preserve seed a generation-zero output identity when
+/// its source header carries a raw qpdf generation that cannot be represented
+/// by `ObjectRef`. Such a header cannot be named by an in-file `N G R` edge, so
+/// qpdf's preserve walk only exposes its value as an orphan output object; the
+/// writer may copy that value into its ordinary fresh-output identity without
+/// changing any reachable reference.
+fn preserve_seed_object_ref<R: Read + Seek>(
+    pdf: &mut Pdf<R>,
+    handle: ObjectHandle,
+) -> crate::Result<Option<ObjectRef>> {
+    if let Some(object_ref) = handle.object_ref() {
+        return Ok(Some(object_ref));
+    }
+    if !handle
+        .qpdf_obj_gen()
+        .is_some_and(crate::qpdf_obj_gen::QpdfObjGen::is_indirect)
+    {
+        return Ok(None);
+    }
+    let copied = if handle.as_stream_dict().is_some() {
+        handle.copy_stream()?
+    } else {
+        pdf.make_indirect_object_handle(handle.shallow_copy()?)?
+    };
+    Ok(copied.object_ref())
 }
 
 /// Catalog-first numbering over the live [`crate::ObjectHandle`] graph.
@@ -136,11 +164,10 @@ impl CanonicalCatalogFirstRenumber {
         let mut seeds = if preserve_unreferenced_objects {
             let mut seeds = Vec::new();
             let source_objstm_containers = qpdf_source_objstm_containers(pdf);
-            for object_ref in pdf
-                .get_all_objects()?
-                .into_iter()
-                .filter_map(|handle| handle.object_ref())
-            {
+            for handle in pdf.get_all_objects()? {
+                let Some(object_ref) = preserve_seed_object_ref(pdf, handle)? else {
+                    continue;
+                };
                 if object_ref.number == 0
                     || removed_refs.contains(&object_ref)
                     || source_objstm_containers.contains(&object_ref)

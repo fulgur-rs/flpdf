@@ -29,6 +29,25 @@ impl QPDFJob {
         })
     }
 
+    /// Dump one object selected by qpdf's raw signed object/generation pair.
+    /// This is the inspection counterpart for headers whose generation cannot
+    /// cross the public `ObjectRef` projection boundary.
+    pub fn dump_object_by_raw_identity<R: Read + Seek>(
+        &mut self,
+        pdf: &mut Pdf<R>,
+        object_number: i32,
+        generation: i32,
+    ) -> Result<JobExitCode> {
+        let logger = self.logger();
+        self.inspect(pdf, |pdf| {
+            let object = pdf.get_object_handle_by_raw_identity(object_number, generation);
+            object.type_code()?;
+            let mut output = object.unparse_resolved();
+            output.push(b'\n');
+            logger.info(output)
+        })
+    }
+
     /// Show one object through the canonical qpdf object/stream boundary.
     pub fn show_object<R: Read + Seek>(
         &mut self,

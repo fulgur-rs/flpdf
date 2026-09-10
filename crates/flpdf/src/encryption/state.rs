@@ -14,6 +14,7 @@ use super::standard::{
 use crate::encryption::standard::{decrypt_cipher_bytes, StringCipher};
 use crate::error::{EncryptedError, Result};
 use crate::pipeline::aes::PlAesPdf;
+use crate::qpdf_obj_gen::QpdfObjGen;
 use crate::{ObjectHandle, ObjectRef};
 use std::collections::BTreeMap;
 
@@ -53,7 +54,7 @@ pub(crate) struct EncryptionState {
     /// qpdf `cached_object_encryption_key` / `cached_key_og`
     /// (`include/qpdf/QPDF.hh:918-919`).
     pub(crate) cached_object_encryption_key: Vec<u8>,
-    pub(crate) cached_key_og: Option<ObjectRef>,
+    pub(crate) cached_key_og: Option<QpdfObjGen>,
 }
 
 /// What qpdf's crypt-filter switch decided: whether AES is used, whether the
@@ -97,16 +98,38 @@ impl EncryptionState {
     }
 
     /// qpdf `QPDF::decryptString` cipher operation for one literal string.
+    #[allow(dead_code)]
     pub(crate) fn decrypt_object_string(
         &mut self,
         object_ref: ObjectRef,
         bytes: &mut Vec<u8>,
         use_aes: Option<bool>,
     ) -> Result<()> {
+        self.decrypt_object_string_qpdf_obj_gen(
+            QpdfObjGen::from_object_ref(object_ref),
+            bytes,
+            use_aes,
+        )
+    }
+
+    pub(crate) fn decrypt_object_string_qpdf_obj_gen(
+        &mut self,
+        object_gen: QpdfObjGen,
+        bytes: &mut Vec<u8>,
+        use_aes: Option<bool>,
+    ) -> Result<()> {
         if let Some(use_aes) = use_aes {
-            self.with_object_cipher(object_ref, use_aes, |cipher| {
-                decrypt_cipher_bytes(bytes, cipher)
-            })?;
+            let key = self.key_for_qpdf_obj_gen(object_gen, use_aes).to_vec();
+            if !use_aes {
+                decrypt_cipher_bytes(bytes, StringCipher::Rc4 { key: &key })?;
+            } else if let Ok(key) = <&[u8; 32]>::try_from(key.as_slice()) {
+                decrypt_cipher_bytes(bytes, StringCipher::Aes256 { key })?;
+            } else if let Ok(key) = aes192_object_key(&key) {
+                decrypt_cipher_bytes(bytes, StringCipher::Aes192 { key: &key })?;
+            } else {
+                let key = aes128_object_key(&key)?;
+                decrypt_cipher_bytes(bytes, StringCipher::Aes128 { key: &key })?;
+            }
         }
         Ok(())
     }
@@ -134,37 +157,23 @@ impl EncryptionState {
         self.encryption_v < 4 || !matches!(method, EncryptionMode::Identity)
     }
 
-    pub(crate) fn with_object_cipher<T>(
-        &mut self,
-        og: ObjectRef,
-        use_aes: bool,
-        apply: impl FnOnce(StringCipher<'_>) -> Result<T>,
-    ) -> Result<T> {
-        let key = self.key_for_object(og, use_aes).to_vec();
-        if !use_aes {
-            return apply(StringCipher::Rc4 { key: &key });
-        }
-        if let Ok(key) = <&[u8; 32]>::try_from(key.as_slice()) {
-            return apply(StringCipher::Aes256 { key });
-        }
-        if let Ok(key) = aes192_object_key(&key) {
-            return apply(StringCipher::Aes192 { key: &key });
-        }
-        let key = aes128_object_key(&key)?;
-        apply(StringCipher::Aes128 { key: &key })
-    }
-
     /// qpdf `QPDF::getKeyForObject` cache semantics. The cache key is only the
     /// object/generation pair; `use_aes` is intentionally omitted.
+    #[allow(dead_code)]
     pub(crate) fn key_for_object(&mut self, og: ObjectRef, use_aes: bool) -> &[u8] {
+        self.key_for_qpdf_obj_gen(QpdfObjGen::from_object_ref(og), use_aes)
+    }
+
+    pub(crate) fn key_for_qpdf_obj_gen(&mut self, og: QpdfObjGen, use_aes: bool) -> &[u8] {
         if self.cached_key_og != Some(og) {
-            self.cached_object_encryption_key = crate::encryption::primitives::compute_data_key(
-                &self.file_key,
-                og.number,
-                og.generation,
-                use_aes,
-                self.encryption_v,
-            );
+            self.cached_object_encryption_key =
+                crate::encryption::primitives::compute_data_key_qpdf_obj_gen(
+                    &self.file_key,
+                    og.get_obj(),
+                    og.get_gen(),
+                    use_aes,
+                    self.encryption_v,
+                );
             self.cached_key_og = Some(og);
         }
         &self.cached_object_encryption_key

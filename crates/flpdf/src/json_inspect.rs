@@ -221,7 +221,7 @@ impl JsonKey {
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum JsonObjectSelector {
     /// A specific indirect object identified by (number, generation).
-    Object { number: u32, generation: u16 },
+    Object { number: u32, generation: i32 },
     /// The trailer dictionary entry in the objects map.
     Trailer,
 }
@@ -252,7 +252,7 @@ impl JsonObjectSelector {
         let reference_parts: Vec<&str> = s.split_whitespace().collect();
         if reference_parts.len() == 3 && reference_parts[2] == "R" {
             let number = reference_parts[0].parse::<u32>().ok()?;
-            let generation = reference_parts[1].parse::<u16>().ok()?;
+            let generation = reference_parts[1].parse::<i32>().ok()?;
             return Some(JsonObjectSelector::Object { number, generation });
         }
         let parts: Vec<&str> = s.splitn(3, ',').collect();
@@ -266,7 +266,7 @@ impl JsonObjectSelector {
         }
         let number: u32 = num_str.parse().ok()?;
 
-        let generation: u16 = if parts.len() == 2 {
+        let generation: i32 = if parts.len() == 2 {
             let gen_str = parts[1];
             if gen_str.is_empty() || !gen_str.bytes().all(|b| b.is_ascii_digit()) {
                 return None;

@@ -4,6 +4,7 @@ use std::collections::{BTreeMap, BTreeSet, VecDeque};
 use std::io::{Read, Seek};
 use std::rc::Rc;
 
+use crate::qpdf_obj_gen::QpdfObjGen;
 use crate::writer::object_streams;
 use crate::writer::plain::plan::{
     stream_cache_fingerprint, PlainWritePlan, PlannedIndirectObject, PlannedMember,
@@ -25,6 +26,7 @@ use crate::{ObjectHandle, ObjectRef, PageDocumentHelper, Pdf};
 /// `QPDFWriter::enqueueObject` plus `object_queue`.
 struct LiveQueue {
     old_to_new: BTreeMap<ObjectRef, ObjectRef>,
+    raw_old_to_new: BTreeMap<QpdfObjGen, ObjectRef>,
     pending: VecDeque<ObjectHandle>,
     removed_refs: BTreeSet<ObjectRef>,
     /// Source ObjGen of an ObjStm member -> source ObjGen of its container.
@@ -47,6 +49,7 @@ impl LiveQueue {
     fn new(removed_refs: BTreeSet<ObjectRef>) -> Self {
         Self {
             old_to_new: BTreeMap::new(),
+            raw_old_to_new: BTreeMap::new(),
             pending: VecDeque::new(),
             removed_refs,
             member_to_container: BTreeMap::new(),
@@ -106,7 +109,22 @@ impl LiveQueue {
         }
         // cov:ignore-start: only indirect handles are enqueued by qpdf's object queue.
         let Some(source) = handle.object_ref() else {
-            return Ok(None);
+            let Some(raw_source) = handle
+                .qpdf_obj_gen()
+                .filter(|object_gen| object_gen.is_indirect())
+            else {
+                return Ok(None);
+            };
+            if let Some(output) = self.raw_old_to_new.get(&raw_source).copied() {
+                return Ok(Some(output));
+            }
+            let output = ObjectRef::new(
+                (self.old_to_new.len() + self.raw_old_to_new.len() + 1) as u32,
+                0,
+            );
+            self.raw_old_to_new.insert(raw_source, output);
+            self.pending.push_back(handle);
+            return Ok(Some(output));
         };
         // cov:ignore-end
         // cov:ignore-start: qpdf never registers object number zero as a live object.
@@ -171,6 +189,7 @@ pub(crate) struct LiveBodyOutput {
     pub(crate) bytes: Vec<u8>,
     pub(crate) layout: BodyLayout,
     pub(crate) old_to_new: BTreeMap<ObjectRef, ObjectRef>,
+    pub(crate) object_count: usize,
 }
 
 fn collect_live_seed_handles(
@@ -300,17 +319,30 @@ pub(crate) fn emit_live_disable<R: Read + Seek + 'static>(
             0,
             0,
         ),
+        current_raw_output: None,
     };
     loop {
         let source = emitter.queue.borrow_mut().pop();
         let Some(handle) = source else { break };
+        emitter.current_raw_output = handle.qpdf_obj_gen().and_then(|object_gen| {
+            emitter
+                .queue
+                .borrow()
+                .raw_old_to_new
+                .get(&object_gen)
+                .copied()
+        });
         emitter.write_object(&handle, None)?;
+        emitter.current_raw_output = None;
     }
-    let old_to_new = emitter.queue.into_inner().old_to_new;
+    let queue = emitter.queue.into_inner();
+    let old_to_new = queue.old_to_new;
+    let object_count = old_to_new.len() + queue.raw_old_to_new.len();
     Ok(LiveBodyOutput {
         bytes,
         layout,
         old_to_new,
+        object_count,
     })
 }
 
@@ -457,6 +489,7 @@ struct LiveObjectEmitter<'a, R: Read + Seek + 'static> {
     removed_refs: BTreeSet<ObjectRef>,
     lengths: BTreeMap<u32, usize>,
     encryption: crate::writer::encryption_state::WriterEncryptionState,
+    current_raw_output: Option<ObjectRef>,
 }
 
 impl<'a, R: Read + Seek + 'static> crate::writer::write_object::WriteObject
@@ -485,6 +518,11 @@ impl<'a, R: Read + Seek + 'static> crate::writer::write_object::WriteObject
     }
 
     fn output_number(&self, object: ObjectRef) -> crate::Result<u32> {
+        if object == ObjectRef::new(0, 0) {
+            if let Some(output) = self.current_raw_output {
+                return Ok(output.number);
+            }
+        }
         self.queue
             .borrow()
             .old_to_new
