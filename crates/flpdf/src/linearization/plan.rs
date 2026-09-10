@@ -462,7 +462,6 @@ fn compute_closure_with_stream_parameters<R: Read + Seek>(
         order.push(current);
 
         let current_handle = pdf.get_object_handle(current);
-        pdf.resolve(&current_handle)?;
 
         // Determine whether this is a Pages node (intermediate page-tree node)
         // or a Page leaf node.
@@ -522,7 +521,6 @@ fn compute_closure_with_stream_parameters<R: Read + Seek>(
                                 continue;
                             }
                             let child_handle = pdf.get_object_handle(r);
-                            pdf.resolve(&child_handle)?;
                             // Stop at a page-tree boundary BEFORE adding `r` to
                             // the closure: a resource that malformedly cross-links
                             // to a sibling `/Page` or the `/Pages` node must be
@@ -603,9 +601,8 @@ fn compute_closure_with_stream_parameters<R: Read + Seek>(
                             // Resolve the parent. Genuine resolve failures
                             // (I/O or parse errors) propagate via `?` instead
                             // of silently degrading the closure — mirroring
-                            // the main BFS loop's `pdf.resolve(&parent_handle)?`.
+                            // the main BFS loop's canonical parent-handle resolution.
                             let parent_handle = pdf.get_object_handle(parent_ref);
-                            pdf.resolve(&parent_handle)?;
                             // `parent_handle` is the canonical object for
                             // `parent_ref`; its `object_ref()` is identity,
                             // not a stored reference value. Inspect the live
@@ -1114,7 +1111,6 @@ impl LinearizationPlan {
                 continue;
             }
             let object_handle = pdf.get_object_handle(r);
-            pdf.resolve(&object_handle)?;
             // Both `/Type /XRef` and `/Type /ObjStm` objects are required to
             // carry stream data (ISO 32000-1 §7.5.7/§7.5.8), so the genuine
             // article is always `ObjectValue::Stream`, never a plain
@@ -1185,7 +1181,6 @@ impl LinearizationPlan {
             .or_else(|| info_handle.object_ref());
         let pages_tree_ref = if let Some(root_ref) = root_ref {
             let root_handle = pdf.get_object_handle(root_ref);
-            pdf.resolve(&root_handle)?;
             let pages_handle = root_handle.try_get_key(b"/Pages")?;
             pages_handle
                 .object_ref()
@@ -1687,7 +1682,6 @@ impl LinearizationPlan {
         // compute_outline_hint_info's first_object).
         let outline_root_ref: Option<ObjectRef> = if let Some(root_ref) = pdf.root_ref() {
             let root_handle = pdf.get_object_handle(root_ref);
-            pdf.resolve(&root_handle)?;
             let outlines = root_handle.try_get_key(b"/Outlines")?;
             outlines.object_ref()
         } else {
@@ -2831,7 +2825,6 @@ fn outlines_in_first_page_predicate<R: Read + Seek>(pdf: &mut Pdf<R>) -> crate::
         return Ok(false); // cov:ignore: root_ref None ⇒ from_pdf fails earlier via catalog()?
     };
     let root_handle = pdf.get_object_handle(root);
-    pdf.resolve(&root_handle)?;
     if !root_handle.try_has_key(b"/Outlines")? {
         return Ok(false);
     }
@@ -2956,7 +2949,7 @@ mod tests {
     use crate::object_handle::ObjectHandle;
     use crate::parser::MAX_PARSE_DEPTH;
     use crate::writer::{ObjectStreamMode, WriterOptions};
-    use crate::Pdf;
+    use crate::{Error, ObjectRef, Pdf};
     use flate2::write::ZlibEncoder;
     use flate2::Compression;
     use std::cell::Cell;
@@ -3131,5 +3124,16 @@ mod tests {
         )
         .expect_err("the stream-policy reference walk has a parser-depth guard");
         assert!(error.to_string().contains("maximum of 500"));
+    }
+
+    #[test]
+    fn page_tree_classification_propagates_resolution_errors() {
+        let unresolved = ObjectHandle::new_indirect_unresolved(ObjectRef::new(91, 0), -1);
+        let error = super::is_page_tree_handle(&unresolved)
+            .expect_err("page-tree classification must propagate resolution errors");
+        assert!(matches!(
+            error,
+            Error::Internal(message) if message == "object 91 0 belongs to a dropped PDF"
+        ));
     }
 }

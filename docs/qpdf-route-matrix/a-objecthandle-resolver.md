@@ -602,7 +602,7 @@ installation, Tx generation, and Ch generation. The post-cutover scoped
 production count is zero. The route contract is
 `crates/flpdf/tests/form_field_rendering_route_contract_tests.rs`.
 
-The qpdf boundary is `libqpdf/QPDFFormFieldObjectHelper.cc:766-860` for
+The qpdf boundary is `libqpdf/QPDFFormFieldObjectHelper.cc:766-852` for
 appearance selection, rectangle/font lookup, and `ValueSetter` installation;
 `libqpdf/QPDFAcroFormDocumentHelper.cc:393-415` owns Tx/Ch dispatch; and
 `libqpdf/QPDFObjectHandle.cc:240-446,789-824,965-989` owns resolving typed/key
@@ -646,7 +646,7 @@ the resulting breadth-first queue (`libqpdf/QPDFWriter.cc:1072-1141,2907-3044`).
 `/Extends` handling (`libqpdf/QPDFWriter.cc:1606-1758`). Every qpdf typed/null
 observation dereferences at entry (`libqpdf/QPDFObjectHandle.cc:240-446,
 857-866,965-1015`); `isIndirect` remains an identity predicate that does not
-resolve (`include/qpdf/QPDFObjectHandle.hh:353,1630-1645`).
+resolve (`include/qpdf/QPDFObjectHandle.hh:353,1630-1641`).
 
 The fresh scoped census had seven `Pdf::resolve` sites and three
 non-resolving `is_null` sites. The post-cutover production census is zero for
@@ -661,6 +661,34 @@ contract is extended in `crates/flpdf/tests/rewrite_renumber_module_route_tests.
 and `canonical_children_propagate_resolution_errors` verifies fallible child
 resolution. qtest and qtest-exceptions routes, active `.48.7/.48.10/.48.49`
 sessions, and shared writer emission ownership remain outside this slice.
+### A6/A7/A8 linearization plan accessor slice `flpdf-3yn9.48.23.19` (2026-09-10)
+
+The production linearization planning walk now follows qpdf's canonical handle
+resolution at every remaining page/resource closure, inherited-parent,
+reachable-object, root/page, and outline boundary. `QPDF::optimize` owns the
+ordered live page and inherited-attribute traversal
+(`libqpdf/QPDF_optimization.cc:57-118`), while
+`QPDF::calculateLinearizationData` owns object-user categorization
+(`libqpdf/QPDF_linearization.cc:963-1140`) and the subsequent part ordering
+(`libqpdf/QPDF_linearization.cc:1147-1265`). qpdf typed/key/null
+accessors dereference at entry (`libqpdf/QPDFObjectHandle.cc:240-446,965-1015,
+2375-2383`), and `writeLinearized` does not perform an extra cache warmup
+before optimization (`libqpdf/QPDFWriter.cc:2536-2554`).
+
+The fresh scoped census had seven `Pdf::resolve` sites in
+`linearization/plan.rs`; the post-cutover production route has zero explicit
+`Pdf::resolve`, `resolve_handle`, or `resolve_handle_ref` calls and no removable
+non-resolving accessor bridge. Existing `try_is_dictionary_of_type`,
+`try_as_dictionary`, `try_get_key`, `try_has_key`, and `try_is_stream_of_type`
+now own the equivalent boundaries. Resource-first DFS, `/Parent` ancestry,
+page-tree boundary exclusion, resurrectable-null edge context, object-stream
+reachability, outline routing, ordering, and Result/error propagation are
+unchanged. The route contract is extended in
+`crates/flpdf/tests/linearization_accessor_route_contract_tests.rs`, and
+`page_tree_classification_propagates_resolution_errors` covers a fallible
+classification boundary. qtest and qtest-exceptions routes, active
+`.48.7/.48.10/.48.49` sessions, linearization emission, and separate Part 2/3
+semantic issues remain outside this slice.
 
 ### 2026-09-10 current caller audit: optimization bounded cutover
 
