@@ -928,7 +928,7 @@ destination 解決や既存の synthetic `Pdf::set_object` bridge の挙動を
 `test_driver.cc:1551-1609`/`:1611-1629` の AcroForm consumerも、`get_form_fields`（terminal fieldのみを `field_to_annotations` の ObjectRef順で返す。direct orphanはqpdfの`QPDFObjGen(0,0)`に合わせてnull handleを1件返す）、`get_annotations_for_field`、`get_widget_annotations_for_page`、`get_field_for_annotation_handle` という同じlive cacheの公開handle経路へ接続した。`run_test_43` は qpdf のfield metadata・親chain・page Widget・appearance選択を、`run_test_44` は `setV` 相当のlive mutationとQDF writerをそれぞれ呼び出す。旧 `fields()` のraw `/Fields` preorderをconsumerで代用していない。 |
 `qpdf/test_driver.cc:2761-2805` の test 80 は、`run_test_80` が `PageDocumentHelper::get_all_pages`、`AcroFormDocumentHelper::transform_annotations`、live `/Annots` append、`add_and_rename_form_fields`、foreign `PageObjectHelper::copy_annotations_from`、`PdfWriter` の QDF/static-ID 出力へ順に接続する。pinned qpdf 11.9.0 の fixture `flpdf-qtest/vendor/qpdf-qtest/qpdf/{appearances-1.pdf,appearances-1-rotated.pdf,minimal.pdf}` と golden `test80{a,b}{1,2}.pdf` に対し、stdout は `test 80 done\n`、stderr は空、exit は 0、a/b の4出力は byte-identical。foreign `/DR` の eager `copyForeignObject` と field clone 先行も qpdf の allocation order（`QPDFAcroFormDocumentHelper.cc:729-737,811-823,914-917`）に合わせ、QDF の `%% Original object ID` まで一致させる。
 | `QPDFPageObjectHelper.cc` | 1039 | `page_object_helper.rs`(766) + `pages.rs`(98: inherited `/MediaBox`/`/CropBox`/`/Resources`/`/Rotate` lookup) + `page_form_xobject.rs`(637) + `resources.rs`(1229: `ResourceFinder` を使う resource pruning consumer) + `page_annotation_flatten.rs`(596-612: field-associated Widget のみ `/DR` を appearance resources に merge) + `job/overlay.rs`(2228: `placeFormXObject`) | 🔀 `pages.rs` の terminal chase は parsed qpdf child reference の意味ではなく、一時的な `Pdf::set_object` bare-reference bridge の互換境界だけをカバーする。qpdf の `QPDF::replaceObject` は indirect replacement を拒否する（`QPDF.cc:1986-1991`）ため、その bridge cycle の synthetic-null fallback を qpdf の null-as-absent inheritance と解釈しない。⚪ `resources.rs` の `form_xobjects_in_resources`/`remove_unreferenced_resources_in_form_xobjects` も同じ理由で `/XObject` category の Form 判定を `Pdf::resolve_to_terminal` で終端まで辿る（対応物なし、`optimization/inherited_attrs.rs` の同種補償と同じ形）。|
-| `QPDFFormFieldObjectHelper.cc` | 852 | `form_field_object_helper.rs` + `form_field_object_helper/rendering.rs` + `default_appearance.rs`（field lookup/mutation と Tx/Ch appearance generation。`QPDFFormFieldObjectHelper.cc:472-478` に従い Btn appearance は production dispatch から除外）。既存 `/AP/N` は qpdf の `ValueSetter` 相当を同じ streamに登録する `AppearanceTokenFilter`（qpdf `QPDFFormFieldObjectHelper.cc:766-860`）で更新し、state dictionaryの`/AS`選択も`AnnotationObjectHelper`へ委譲する。新規APはqpdfどおり`/ProcSet`だけを初期Resourcesに置き、fontは既存AP `/Resources`→`/AcroForm /DR`で実際に見つかった場合だけ同じhandleを追加する（qpdf `:779-849`）；見つからないFont合成・`/FormType`追加は行わない。encodingはqpdf `QUtil`のASCII/WinAnsi/MacRomanを選ぶ。CLI の `generate_missing_appearances` は non-`/Btn` を `/AP/N` の有無で skip せず canonical helper へ渡す（qpdf `QPDFAcroFormDocumentHelper.cc:393-415`）。`crates/flpdf-cli/tests/cli_acroform_transforms.rs::generate_appearances_tx_reuses_existing_ap` は `/NeedAppearances true` の既存 stream を `--compress-streams=y` で再書き込み、`DecodeLevel::Generalized` 後の `/Tx BMC`/`Tf` と no-wrapper source preservation を確認する。qpdf 11.9.0 pinned source と `/usr/bin/qpdf` の live probe でも同じ入力の既存AP、無`/DR`、MacRoman入力を確認済み。token-filter primitive自体の変更は本 issueのscope外 | 🔀 |
+| `QPDFFormFieldObjectHelper.cc` | 852 | `form_field_object_helper.rs` + `form_field_object_helper/rendering.rs` + `default_appearance.rs`（field lookup/mutation と Tx/Ch appearance generation。`QPDFFormFieldObjectHelper.cc:472-478` に従い Btn appearance は production dispatch から除外）。既存 `/AP/N` は qpdf の `ValueSetter` 相当を同じ streamに登録する `AppearanceTokenFilter`（qpdf `QPDFFormFieldObjectHelper.cc:766-852`）で更新し、state dictionaryの`/AS`選択も`AnnotationObjectHelper`へ委譲する。新規APはqpdfどおり`/ProcSet`だけを初期Resourcesに置き、fontは既存AP `/Resources`→`/AcroForm /DR`で実際に見つかった場合だけ同じhandleを追加する（qpdf `:779-849`）；見つからないFont合成・`/FormType`追加は行わない。encodingはqpdf `QUtil`のASCII/WinAnsi/MacRomanを選ぶ。CLI の `generate_missing_appearances` は non-`/Btn` を `/AP/N` の有無で skip せず canonical helper へ渡す（qpdf `QPDFAcroFormDocumentHelper.cc:393-415`）。`crates/flpdf-cli/tests/cli_acroform_transforms.rs::generate_appearances_tx_reuses_existing_ap` は `/NeedAppearances true` の既存 stream を `--compress-streams=y` で再書き込み、`DecodeLevel::Generalized` 後の `/Tx BMC`/`Tf` と no-wrapper source preservation を確認する。qpdf 11.9.0 pinned source と `/usr/bin/qpdf` の live probe でも同じ入力の既存AP、無`/DR`、MacRoman入力を確認済み。token-filter primitive自体の変更は本 issueのscope外 | 🔀 |
 | `QPDFPageDocumentHelper.cc` | 158 | `page_document_helper.rs`(`get_all_pages` + page mutation APIs) + `page_extract.rs`(`extract_pages`/`extract_page`) + `job/page_merge.rs`(`merge_documents`)。`job/overlay.rs` の source/destination page snapshot も `get_all_pages()` を通り、`QPDF_pages.cc:39-138` 相当の repair（欠落 `/MediaBox` の Letter fallback と warning）を Form 化・placement 前に適用する。両モジュールとも `Pdf::empty()` へ委譲（`emptyPDF()` + `addPage()` の library-level 経路、doc に明記）。`Pdf::uninitialized()` は qpdf の `QPDF()` の未処理状態、`Pdf::close_input_source()` は `closeInputSource()` の入力ソース差し替えをそれぞれ canonical な resolver state として公開する |
 | `QPDFAnnotationObjectHelper.cc` | 226 | `annotation_object_helper.rs` + `page_annotation_flatten.rs` | 🔀 `page_annotation_flatten.rs` の `AppearanceTarget::Bridge`/`has_bare_reference_redirect` は flpdf の一時的な `Pdf::set_object` bare-reference bridge のみをカバーする代替経路で、parsed qpdf object は one-hop/live のまま `AnnotationObjectHelper` が qpdf の `getPageContentForAppearance`（`:78-226`）を忠実に実装する。同種の bridge パターンは `QPDFOutlineDocumentHelper` 行（本表 §7、`outline_document_helper.rs`）を参照。 |
 | `QPDFOutlineDocumentHelper` / `QPDFOutlineObjectHelper` | 198 | `outline_document_helper.rs`(576) + `outline_object_helper.rs`(381) | ✅ live `ObjectHandle` route: `OutlineItem.object` retains canonical identity; `OutlineItem::get_title`/`get_count`/`get_dest`/`get_dest_page` (in `outline_object_helper.rs`, implementing `QPDFOutlineObjectHelper.cc` directly) recompute fresh from the live object on every call (no caching), matching qpdf's `getTitle`/`getCount`/`getDest`/`getDestPage` (`QPDFOutlineObjectHelper.cc:47-98`), while `parent`/`kids` are captured once at construction, matching qpdf's cached `getParent`/`getKids`. `/Dest` and `/A /GoTo /D` use qpdf-shaped handle accessors; the name/string branch delegates to `OutlineDocumentHelper::resolve_named_dest` (in `outline_document_helper.rs`, implementing `resolveNamedDest`), which uses the handle-native `NameTree`, cached per session in `OutlineDocumentHelper::dest_dict`/`names_dest` (`QPDFOutlineDocumentHelper.cc:60-90`) — the same split as qpdf's `getDest()` calling `m->dh.resolveNamedDest()`; JSON consumes the handles directly. `OutlineItem` holds no `&mut Pdf<R>` (an arena entry, not a live qpdf-style object helper), so its accessors take `helper: &mut OutlineDocumentHelper<'_, R>` in place of qpdf's `QPDFOutlineObjectHelper::m->dh` reference; tree construction (`get_tree`/`build_item`) stays on `OutlineDocumentHelper` since it needs sequential `&mut Pdf<R>` access across both qpdf constructors (document-level top-level walk and per-node recursive constructor), which the arena flattens into one pass — `OutlineTree::get_outlines_for_page`'s `by_page` cache stays on the arena-lifetime `OutlineTree` rather than moving to `OutlineDocumentHelper::initialize_by_page`, since `Pdf::outline()` mints a fresh `OutlineDocumentHelper` per call and a cache there would never hit. The narrow terminal-handle chase only covers flpdf's temporary `Pdf::set_object` bare-reference bridge; parsed qpdf objects stay one-hop/live. |
@@ -1731,7 +1731,7 @@ through canonical `ObjectHandle` accessors. qpdf's
 `QPDFFormFieldObjectHelper::generateTextAppearance` selects the existing or
 new `/AP/N`, validates its rectangle, resolves font resources, and installs the
 `ValueSetter` token filter in that order
-(`libqpdf/QPDFFormFieldObjectHelper.cc:766-860`). The underlying qpdf
+(`libqpdf/QPDFFormFieldObjectHelper.cc:766-852`). The underlying qpdf
 `QPDFObjectHandle` key and typed accessors resolve their receiver at entry
 (`libqpdf/QPDFObjectHandle.cc:240-446,789-824,965-989`), and
 `generateAppearancesIfNeeded` owns the Tx/Ch dispatch
@@ -1786,7 +1786,7 @@ use the two-pass `writeObjectStream` path and inspect `/Extends` through the
 same handle semantics (`libqpdf/QPDFWriter.cc:1606-1758`). The qpdf accessors
 resolve before type/null observation (`libqpdf/QPDFObjectHandle.cc:240-446,
 857-866,965-1015`), while indirect identity itself remains non-resolving
-(`include/qpdf/QPDFObjectHandle.hh:353,1630-1645`).
+(`include/qpdf/QPDFObjectHandle.hh:353,1630-1641`).
 
 The scoped production route removed seven explicit `Pdf::resolve` calls and
 three non-resolving `is_null` observations. Direct array/dictionary/null
@@ -1800,6 +1800,31 @@ guards this production slice, and `canonical_children_propagate_resolution_error
 keeps resolver failures as `Result` errors. qtest and qtest-exceptions routes,
 active `.48.7/.48.10/.48.49` sessions, and shared writer emission ownership
 remain outside this bounded row.
+### A6/A7/A8 linearization plan accessor slice `flpdf-3yn9.48.23.19` (2026-09-10)
+
+The remaining linearization planning walk in
+`crates/flpdf/src/linearization/plan.rs` now uses live canonical handles at
+each page/resource closure, inherited-parent, reachable-object, root/page, and
+outline observation. qpdf's `QPDF::optimize` owns the ordered live page and
+inherited-attribute traversal (`libqpdf/QPDF_optimization.cc:57-118`), and
+`QPDF::calculateLinearizationData` owns object-user categorization
+(`libqpdf/QPDF_linearization.cc:963-1140`) and the subsequent part ordering
+(`libqpdf/QPDF_linearization.cc:1147-1265`). Its handle operations
+resolve at the accessor boundary (`libqpdf/QPDFObjectHandle.cc:240-446,
+965-1015,2375-2383`), while writer setup does not add a separate cache-warmup
+walk (`libqpdf/QPDFWriter.cc:2536-2554`).
+
+The scoped production route removed seven explicit `Pdf::resolve` calls. The
+existing `try_is_dictionary_of_type`, `try_as_dictionary`, `try_get_key`,
+`try_has_key`, and `try_is_stream_of_type` operations now own those resolution
+boundaries, preserving resource-first DFS, `/Parent` ancestry, page-tree
+boundary exclusion, resurrectable-null edge context, object-stream reachability,
+outline routing, and Result/error propagation. The production route contract
+now includes `linearization/plan.rs`, and
+`page_tree_classification_propagates_resolution_errors` keeps resolver failures
+fallible. qtest and qtest-exceptions routes, active `.48.7/.48.10/.48.49`
+sessions, linearization emission, and separate Part 2/3 semantic issues remain
+outside this bounded row.
 
 ### QPDFJob `doInspection` combined top-level consumer `flpdf-giz3` (2026-09-10)
 

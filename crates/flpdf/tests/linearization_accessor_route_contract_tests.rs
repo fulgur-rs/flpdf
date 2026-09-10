@@ -1,4 +1,4 @@
-//! Route contracts for the bounded linearization check/show accessor cutover.
+//! Route contracts for the bounded linearization accessor cutovers.
 
 use std::fs;
 use std::path::PathBuf;
@@ -76,14 +76,21 @@ fn strip_cfg_test_items(source: &str) -> String {
 }
 
 #[test]
-fn linearization_check_and_show_use_resolving_accessor_routes() {
-    for file in ["src/linearization/check.rs", "src/linearization/show.rs"] {
+fn linearization_production_consumers_use_resolving_accessor_routes() {
+    for file in [
+        "src/linearization/check.rs",
+        "src/linearization/show.rs",
+        "src/linearization/plan.rs",
+    ] {
         let source = production_source(file);
         assert!(
             source.contains(".try_"),
             "{file} must use canonical fallible accessors"
         );
         for forbidden in [
+            ".resolve(",
+            ".resolve_handle(",
+            ".resolve_handle_ref(",
             ".get_key(",
             ".has_key(",
             ".as_dictionary(",
