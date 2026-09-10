@@ -873,6 +873,21 @@ fn openaction_multi_od_objstm_byte_identical_to_qpdf() {
     );
 }
 
+// openaction-preserve-bearing: a qpdf-generated source ObjStm contains the
+// Catalog's /OpenAction dictionary while the referenced JavaScript stream is
+// ineligible for ObjStm packing. qpdf Preserve keeps that source container in
+// the first-half part4 region before the plain open-document stream. The
+// linearization check alone cannot detect the ordering drift, so pin complete
+// bytes against qpdf's preserve output.
+#[test]
+fn openaction_preserve_objstm_byte_identical_to_qpdf() {
+    let fixture = "objstm-lin-openaction-preserve-bearing.pdf";
+    let stem = "objstm-lin-openaction-preserve-bearing";
+    let actual = flpdf_linearized_objstm_preserve(fixture);
+    let expected = golden_preserve(stem);
+    report(fixture, &actual, &expected, "preserve strict");
+}
+
 // acroform-widget-page0-5-10: AcroForm widgets in both
 // /AcroForm /Fields (in_open_document) and page 0 /Annots (in_first_page).
 // qpdf's in_open_document > in_first_page precedence means widgets go to the

@@ -2247,16 +2247,23 @@ fn do_write_pass<R: Read + Seek>(
         catalog_emitted_early = true;
     }
 
-    // Open-document plain objects (qpdf part4 = lc_open_document).
-    // In disable/preserve mode this is every open-document object (/OpenAction,
-    // /AcroForm, … subtrees); in generate mode it is only the ObjStm-ineligible
-    // subset (e.g. /AP /N appearance streams, which cannot be ObjStm members).
-    // qpdf emits them as plain indirect objects in the pre-/O region, between the
-    // Catalog and the OD ObjStm containers (or the hint stream in disable mode),
-    // giving them object numbers immediately after the Catalog.  Oracle: qpdf
-    // --object-streams=generate on a page-0 widget with /AP /N places the Form
-    // XObject before the OD ObjStm at a lower object number (e.g. obj 7 before obj
-    // 8 ObjStm); --object-streams=disable places the whole AcroForm subtree here.
+    // Open-document plain objects and ObjStm containers (qpdf part4). qpdf's
+    // enqueueObject emits the object or its source container at the point its
+    // assigned object number is encountered (QPDFWriter.cc:1097-1132). That
+    // matters for Preserve: a source container can have a lower object number
+    // than an ineligible plain stream in the same open-document region. Merge
+    // both output kinds and emit by assigned number so the physical order and
+    // the hint/xref offsets follow qpdf. Generate containers have no source
+    // number and are assigned after the plain objects, so the same ordering
+    // also preserves that route.
+    enum OpenDocumentEmit<'a> {
+        Plain {
+            original: ObjectRef,
+            new_ref: ObjectRef,
+        },
+        Container(&'a ObjStmContainer),
+    }
+    let mut open_document_emits: Vec<(u32, OpenDocumentEmit<'_>)> = Vec::new();
     for original_ref in &plan.part4_open_document_plain {
         // Preserve mode starts from qpdf's source member-to-container map. The
         // linearization plan is built before the resolved ObjStm layout, so an
@@ -2280,52 +2287,64 @@ fn do_write_pass<R: Read + Seek>(
             ));
         };
         // cov:ignore-end
-        let offset = append_body_object_for_ref(
-            &mut bytes,
-            pdf,
-            new_ref,
-            *original_ref,
-            options,
-            encrypt_ctx,
-            encrypted_string_emitter.as_deref_mut(),
-            renumber,
-            &plan.removed_refs,
-            &plan.content_normalize_refs,
-        )?; // cov:ignore: planner-produced open-document references are valid by construction.
-        xref_offsets.insert(new_ref.number, offset);
-        report_progress_event(options)?;
+        open_document_emits.push((
+            new_ref.number,
+            OpenDocumentEmit::Plain {
+                original: *original_ref,
+                new_ref,
+            },
+        ));
     }
-
-    // Open-document ObjStm containers (qpdf part4).  qpdf places the
-    // open-document objects (`/OpenAction`, `/AcroForm`, … subtrees) in part4,
-    // physically right after the Catalog and BEFORE the primary hint stream —
-    // their object numbers (`part4_first_obj …`) sit between the catalog and the
-    // hint id (QPDFWriter.cc:2606-2612).  The container itself is a plain
-    // indirect object; its compressed members are emitted nowhere else (skipped
-    // in every plain loop via `member_to_container`).
     for container in &objstm_layout.open_document {
-        let offset = append_objstm_container_object(
-            &mut bytes,
-            container,
-            renumber,
-            pdf,
-            &plan.removed_refs,
-            options,
-            encrypt_ctx,
-        )?; // cov:ignore: error requires an internal planner/renumber inconsistency.
-        xref_offsets.insert(container.container_new_num, offset);
-        for _ in &container.members {
-            if pass1_digest {
-                decrement_progress_event(options)?;
-            }
-            report_progress_event(options)?;
-            if pass1_digest {
-                // qpdf's writeObjectStream performs an offset-measuring pass
-                // followed by the payload pass inside each outer linearization
-                // pass. The first outer pass therefore reports each member
-                // twice after the decrement, while the final pass's net effect
-                // is one event (QPDFWriter.cc:1639-1707).
+        open_document_emits.push((
+            container.container_new_num,
+            OpenDocumentEmit::Container(container),
+        ));
+    }
+    open_document_emits.sort_by_key(|(number, _)| *number);
+    for (_, emit) in open_document_emits {
+        match emit {
+            OpenDocumentEmit::Plain { original, new_ref } => {
+                let offset = append_body_object_for_ref(
+                    &mut bytes,
+                    pdf,
+                    new_ref,
+                    original,
+                    options,
+                    encrypt_ctx,
+                    encrypted_string_emitter.as_deref_mut(),
+                    renumber,
+                    &plan.removed_refs,
+                    &plan.content_normalize_refs,
+                )?; // cov:ignore: planner-produced open-document references are valid by construction.
+                xref_offsets.insert(new_ref.number, offset);
                 report_progress_event(options)?;
+            }
+            OpenDocumentEmit::Container(container) => {
+                let offset = append_objstm_container_object(
+                    &mut bytes,
+                    container,
+                    renumber,
+                    pdf,
+                    &plan.removed_refs,
+                    options,
+                    encrypt_ctx,
+                )?; // cov:ignore: error requires an internal planner/renumber inconsistency.
+                xref_offsets.insert(container.container_new_num, offset);
+                for _ in &container.members {
+                    if pass1_digest {
+                        decrement_progress_event(options)?;
+                    }
+                    report_progress_event(options)?;
+                    if pass1_digest {
+                        // qpdf's writeObjectStream performs an offset-measuring pass
+                        // followed by the payload pass inside each outer linearization
+                        // pass. The first outer pass therefore reports each member
+                        // twice after the decrement, while the final pass's net effect
+                        // is one event (QPDFWriter.cc:1639-1707).
+                        report_progress_event(options)?;
+                    }
+                }
             }
         }
     }

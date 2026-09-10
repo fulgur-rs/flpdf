@@ -284,6 +284,15 @@ output identity. This mirrors `QPDFWriter::preserveObjectStreams` and
 `enqueueObject` (`QPDFWriter.cc:1072-1125,1939-1966`) and is covered by the
 eight-case qpdf 11.9.0 helper differential.
 
+2026-09-10（`flpdf-oq7g`）: Preserve linearization の pre-/O emission は、plain
+open-document object と source ObjStm container を assigned object number 順に
+一つの列として出力する。qpdf の `enqueuePart(part4)` が ObjStm member を初めて
+見た位置で container を出力する責務（`QPDFWriter.cc:2543-2561,2606-2624,2636-2651`）を、
+flpdf の `linearization/writer.rs` に反映した。`objstm-lin-openaction-preserve-bearing.pdf`
+（`/OpenAction` action dict を source ObjStm に保持し、JS stream は plain）を
+`cmp_linearize_objstm_tests.rs::openaction_preserve_objstm_byte_identical_to_qpdf` で
+qpdf 11.9.0 と full-byte 比較し、container-before-plain の part4 順序を固定する。
+
 ## 1. オブジェクトモデル
 
 | qpdf | 行 | flpdf | 状態 |
