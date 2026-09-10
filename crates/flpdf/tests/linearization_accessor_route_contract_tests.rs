@@ -30,6 +30,65 @@ fn remove_test_fn(source: &str, test_name: &str, next_production_fn: &str) -> St
     format!("{}{}", &source[..start], &remainder[next_offset..])
 }
 
+fn function_body<'a>(source: &'a str, function_name: &str) -> &'a str {
+    let signature = format!("fn {function_name}");
+    let start = source
+        .find(&signature)
+        .unwrap_or_else(|| panic!("{function_name} must be present in production source"));
+    let after_signature = &source[start..];
+    let brace_start = after_signature
+        .find('{')
+        .unwrap_or_else(|| panic!("{function_name} must have a body"));
+    let body = &after_signature[brace_start..];
+    let end = cfg_test_item_body_end(body)
+        .unwrap_or_else(|| panic!("{function_name} must have balanced braces"));
+    &body[..end]
+}
+
+fn cfg_test_item_body_end(body: &str) -> Option<usize> {
+    #[derive(PartialEq)]
+    enum State {
+        Code,
+        LineComment,
+        StringLiteral,
+    }
+
+    let mut state = State::Code;
+    let mut depth = 0usize;
+    let mut chars = body.char_indices().peekable();
+    while let Some((index, character)) = chars.next() {
+        match state {
+            State::Code => match character {
+                '/' if chars.peek().map(|&(_, next)| next) == Some('/') => {
+                    state = State::LineComment;
+                }
+                '"' => state = State::StringLiteral,
+                '{' => depth += 1,
+                '}' => {
+                    depth = depth.checked_sub(1)?;
+                    if depth == 0 {
+                        return Some(index + character.len_utf8());
+                    }
+                }
+                _ => {}
+            },
+            State::LineComment => {
+                if character == '\n' {
+                    state = State::Code;
+                }
+            }
+            State::StringLiteral => match character {
+                '\\' => {
+                    chars.next();
+                }
+                '"' => state = State::Code,
+                _ => {}
+            },
+        }
+    }
+    None
+}
+
 fn strip_cfg_test_items(source: &str) -> String {
     let lines: Vec<&str> = source.lines().collect();
     let mut output = String::new();
@@ -104,5 +163,56 @@ fn linearization_production_consumers_use_resolving_accessor_routes() {
                 "{file} production retains non-canonical route {forbidden}"
             );
         }
+    }
+}
+
+#[test]
+fn linearization_writer_target_consumers_use_resolving_accessor_routes() {
+    let source = production_source("src/linearization/writer.rs");
+    let target_functions = [
+        "append_objstm_container_object",
+        "append_body_object",
+        "append_body_object_for_ref",
+        "compute_outline_hint_info",
+        "resolve_catalog_adbe_status",
+    ];
+    let target = target_functions
+        .iter()
+        .map(|name| function_body(&source, name))
+        .collect::<Vec<_>>()
+        .join("\n");
+
+    for forbidden in [
+        ".resolve(",
+        ".resolve_handle(",
+        ".resolve_handle_ref(",
+        ".get_key(",
+        ".has_key(",
+        ".as_dictionary(",
+        ".as_array(",
+        ".as_integer(",
+        ".as_name(",
+        ".is_null(",
+    ] {
+        assert!(
+            !target.contains(forbidden),
+            "linearization writer target retains non-canonical route {forbidden}"
+        );
+    }
+    assert!(
+        target.contains("try_dereference") && target.contains("try_get_key"),
+        "linearization writer target must use canonical resolving accessors"
+    );
+
+    for function_name in ["append_objstm_container_object", "append_body_object"] {
+        let body = function_body(&source, function_name);
+        let stream_offset = body
+            .find("as_stream_dict(")
+            .unwrap_or_else(|| panic!("{function_name} must retain a stream dictionary boundary"));
+        let prefix = &body[..stream_offset];
+        assert!(
+            prefix.contains("try_dereference("),
+            "{function_name} must resolve before observing a stream dictionary"
+        );
     }
 }

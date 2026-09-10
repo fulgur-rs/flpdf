@@ -1835,6 +1835,32 @@ fallible. qtest and qtest-exceptions routes, active `.48.7/.48.10/.48.49`
 sessions, linearization emission, and separate Part 2/3 semantic issues remain
 outside this bounded row.
 
+### A6/A7/A8 linearization writer accessor slice `flpdf-3yn9.48.23.20` (2026-09-10)
+
+The remaining linearized writer consumers in
+`crates/flpdf/src/linearization/writer.rs` now use qpdf-shaped live-handle
+resolution. qpdf's `writeObjectStream` detects stream members and writes the
+two-pass container through the same `writeObject`/`unparseObject` boundary
+(`libqpdf/QPDFWriter.cc:1606-1810`); those object-handle operations resolve at
+entry and preserve qpdf's key/error fallback semantics
+(`libqpdf/QPDFObjectHandle.cc:240-446,965-1015,1257-1262,1575-1593`). The
+linearized writer reaches this preparation after the common setup ordering
+(`libqpdf/QPDFWriter.cc:2536-2561`).
+
+The scoped production route removed four explicit `Pdf::resolve` calls and
+five panic `get_key` calls. ObjStm member classification now uses canonical
+`try_dereference` before the necessary silent `as_stream_dict` observation;
+the body, outline, and Catalog paths rely on canonical `try_*`/writer
+serialization boundaries, and fixed Type/Length/Filter/N/First key order is
+unchanged. Source/member ordering, `/Extends`, encryption/newline behavior,
+outline hint ownership, ADBE status, direct/indirect identity, and Result
+propagation remain unchanged. The production route contract covers only the
+target functions and checks stream-observation ordering, while
+`body_object_append_propagates_member_resolution_errors` covers fallible
+emission. qtest and qtest-exceptions routes, active `.48.7/.48.10/.48.49`
+sessions, linearization planning/check/show, shared emission redesign, and
+unrelated hint/Part 2/3 semantics remain outside this bounded row.
+
 ### QPDFJob `doInspection` combined top-level consumer `flpdf-giz3` (2026-09-10)
 
 The top-level CLI now routes combined inspection selections through the
