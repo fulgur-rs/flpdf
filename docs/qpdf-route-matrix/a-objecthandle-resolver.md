@@ -690,6 +690,31 @@ classification boundary. qtest and qtest-exceptions routes, active
 `.48.7/.48.10/.48.49` sessions, linearization emission, and separate Part 2/3
 semantic issues remain outside this slice.
 
+### A6/A7/A8 linearization writer accessor slice `flpdf-3yn9.48.23.20` (2026-09-10)
+
+The production target functions in `linearization/writer.rs` now follow qpdf's
+writer-owned handle boundary. `QPDFWriter::writeObjectStream` detects stream
+members and emits the two-pass ObjStm through `writeObject`/
+`unparseObject` (`libqpdf/QPDFWriter.cc:1606-1810`), whose ObjectHandle
+operations resolve before type/key/unparse observation
+(`libqpdf/QPDFObjectHandle.cc:240-446,965-1015,1257-1262,1575-1593`). The
+linearized path reaches this work after the common setup order
+(`libqpdf/QPDFWriter.cc:2536-2561`).
+
+The fresh scoped census had four `Pdf::resolve` sites and five panic
+`get_key` sites. The post-cutover target-function route has zero removable
+`Pdf::resolve`, `resolve_handle`, `resolve_handle_ref`, `get_key`, `has_key`,
+or non-resolving type accessor calls. ObjStm stream classification resolves
+with `try_dereference` before `as_stream_dict`, body/outline/Catalog reads use
+canonical `try_*` or writer serialization, and Type/Length/Filter/N/First
+emission order is preserved. Source/member order, `/Extends`,
+encryption/newline, outline hint ownership, ADBE status, identity, and Result
+propagation remain unchanged. The route contract targets only these functions
+and guards stream-observation order; `body_object_append_propagates_member_resolution_errors`
+covers fallible emission. qtest and qtest-exceptions routes, active
+`.48.7/.48.10/.48.49` sessions, plan/check/show, shared emission redesign, and
+unrelated hint/Part 2/3 semantics remain outside this slice.
+
 ### 2026-09-10 current caller audit: optimization bounded cutover
 
 `flpdf-3yn9.48.23.11` migrated the non-qtest production callers in

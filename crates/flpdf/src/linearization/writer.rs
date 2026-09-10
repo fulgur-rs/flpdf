@@ -315,7 +315,7 @@ fn append_objstm_container_object<R: Read + Seek>(
     let mut members: Vec<(ObjectRef, ObjectHandle)> = Vec::with_capacity(container.members.len());
     for &(orig, new_ref) in &container.members {
         let handle = pdf.get_object_handle(orig);
-        pdf.resolve(&handle)?;
+        handle.try_dereference()?;
         // qpdf warns and writes null when a malformed source stream is routed
         // into an object stream (`QPDFWriter.cc:1714-1721`). Keep that edge at
         // the canonical handle boundary rather than materializing a legacy
@@ -366,17 +366,17 @@ fn append_objstm_container_object<R: Read + Seek>(
     let offset = bytes.len();
     bytes.extend_from_slice(format!("{} 0 obj\n", container.container_new_num).as_bytes());
     bytes.extend_from_slice(b"<< /Type ");
-    stream_dict.get_key(b"/Type").write_object(bytes)?;
+    stream_dict.try_get_key(b"/Type")?.write_object(bytes)?;
     bytes.extend_from_slice(b" /Length ");
-    stream_dict.get_key(b"/Length").write_object(bytes)?;
+    stream_dict.try_get_key(b"/Length")?.write_object(bytes)?;
     if filtered {
         bytes.extend_from_slice(b" /Filter ");
-        stream_dict.get_key(b"/Filter").write_object(bytes)?;
+        stream_dict.try_get_key(b"/Filter")?.write_object(bytes)?;
     }
     bytes.extend_from_slice(b" /N ");
-    stream_dict.get_key(b"/N").write_object(bytes)?;
+    stream_dict.try_get_key(b"/N")?.write_object(bytes)?;
     bytes.extend_from_slice(b" /First ");
-    stream_dict.get_key(b"/First").write_object(bytes)?;
+    stream_dict.try_get_key(b"/First")?.write_object(bytes)?;
     bytes.extend_from_slice(b" >>");
     if let Some(ctx) = encrypt_ctx {
         crate::writer::write_stream_payload_with_pipeline(
@@ -542,6 +542,7 @@ fn append_body_object(
     removed_refs: &BTreeSet<ObjectRef>,
     content_normalize_refs: &BTreeSet<ObjectRef>,
 ) -> Result<usize> {
+    object.try_dereference()?;
     let map = |object_ref| {
         renumber.new_for_original(object_ref).ok_or_else(|| {
             crate::Error::Unsupported(format!(
@@ -647,7 +648,6 @@ fn append_body_object_for_ref<R: Read + Seek>(
     content_normalize_refs: &BTreeSet<ObjectRef>,
 ) -> Result<usize> {
     let object = pdf.get_object_handle(original_ref);
-    pdf.resolve(&object)?;
     append_body_object(
         bytes,
         new_ref,
@@ -1881,7 +1881,6 @@ fn compute_outline_hint_info<R: Read + Seek>(
     // so the catalog is always a resolvable dictionary here.
     let outlines_ref = if let Some(root_ref) = pdf.root_ref() {
         let root = pdf.get_object_handle(root_ref);
-        pdf.resolve(&root)?;
         if root.try_as_dictionary()?.is_none() {
             None // cov:ignore: catalog is always a dict when outlines exist
         } else {
@@ -2943,7 +2942,6 @@ fn resolve_catalog_adbe_status<R: Read + Seek>(pdf: &mut Pdf<R>) -> Result<Catal
     // cov:ignore-end
 
     let catalog = pdf.get_object_handle(root_ref);
-    pdf.resolve(&catalog)?;
     if catalog.try_as_dictionary()?.is_none() {
         return Ok(NONE);
     }
@@ -4439,5 +4437,29 @@ mod tests {
                 .is_indirect(),
             "planning must keep qpdf's direct /Outlines promotion"
         );
+    }
+
+    #[test]
+    fn body_object_append_propagates_member_resolution_errors() {
+        let unresolved = ObjectHandle::new_indirect_unresolved(ObjectRef::new(91, 0), -1);
+        let plan = LinearizationPlan::default();
+        let renumber = RenumberMap::from_plan(&plan);
+        let error = append_body_object(
+            &mut Vec::new(),
+            ObjectRef::new(1, 0),
+            ObjectRef::new(91, 0),
+            &unresolved,
+            &WriterOptions::default(),
+            None,
+            None,
+            &renumber,
+            &BTreeSet::new(),
+            &BTreeSet::new(),
+        )
+        .expect_err("body-object emission must propagate member resolution errors");
+        assert!(matches!(
+            error,
+            crate::Error::Internal(message) if message == "object 91 0 belongs to a dropped PDF"
+        ));
     }
 }
