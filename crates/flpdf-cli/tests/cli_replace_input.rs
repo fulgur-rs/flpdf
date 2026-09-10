@@ -395,3 +395,146 @@ fn top_level_replace_input_empty_output_conflict_matches_qpdf_order() {
         String::from_utf8_lossy(&qpdf.stderr).replace("qpdf", "flpdf")
     );
 }
+
+/// `--replace-input` takes the output slot, so a second positional path is an
+/// argument the command cannot honour. Selecting replacement mode without
+/// checking for it would silently discard that path and overwrite the input --
+/// the one outcome the user cannot undo. qpdf refuses the combination, and so
+/// must the attachment routes.
+#[test]
+fn attachment_replace_input_with_an_output_path_is_rejected() {
+    let directory = tempfile::tempdir().expect("temporary directory");
+    let fixture = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+        .join("../../tests/fixtures/compat/one-page.pdf");
+    let attachment = directory.path().join("attachment.txt");
+    fs::write(&attachment, b"payload\n").expect("write attachment");
+
+    let with_attachment = directory.path().join("base.pdf");
+    Command::cargo_bin("flpdf")
+        .expect("flpdf binary")
+        .args(["--static-id"])
+        .arg(&fixture)
+        .arg("--add-attachment")
+        .arg(&attachment)
+        .args(["--"])
+        .arg(&with_attachment)
+        .assert()
+        .success();
+
+    for operation in [
+        vec!["--remove-attachment=attachment.txt".to_string()],
+        vec![
+            "--add-attachment".to_string(),
+            attachment.to_str().unwrap().to_string(),
+            "--".to_string(),
+        ],
+    ] {
+        let input = directory.path().join("in.pdf");
+        let output = directory.path().join("out.pdf");
+        let _ = fs::remove_file(&output);
+        fs::copy(&with_attachment, &input).expect("copy input");
+        let before = fs::read(&input).expect("read input");
+
+        Command::cargo_bin("flpdf")
+            .expect("flpdf binary")
+            .arg("--replace-input")
+            .args(&operation)
+            .arg(&input)
+            .arg(&output)
+            .assert()
+            .failure()
+            .code(2);
+
+        assert_eq!(
+            fs::read(&input).expect("read input"),
+            before,
+            "a rejected command must leave the input untouched for {operation:?}"
+        );
+        assert!(
+            !output.exists(),
+            "a rejected command must not create the output for {operation:?}"
+        );
+    }
+}
+
+/// Attachment keys and input paths are arbitrary bytes, not UTF-8. Routing
+/// these through a lossy conversion would print U+FFFD where qpdf prints the
+/// original byte, which breaks scripts that match on the name.
+#[test]
+#[cfg(unix)]
+fn attachment_diagnostics_preserve_non_utf8_bytes() {
+    use std::os::unix::ffi::OsStringExt;
+
+    if !qpdf_available() {
+        eprintln!("skipping: qpdf 11.9.0 is unavailable");
+        return;
+    }
+
+    let directory = tempfile::tempdir().expect("temporary directory");
+    let fixture = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+        .join("../../tests/fixtures/compat/one-page.pdf");
+
+    let key = std::path::PathBuf::from(std::ffi::OsString::from_vec(b"key-\xff".to_vec()));
+    let key_path = directory.path().join(&key);
+    fs::write(&key_path, b"payload\n").expect("write attachment");
+
+    let with_attachment = directory.path().join("base.pdf");
+    Command::cargo_bin("flpdf")
+        .expect("flpdf binary")
+        .current_dir(directory.path())
+        .args(["--static-id"])
+        .arg(&fixture)
+        .arg("--add-attachment")
+        .arg(&key)
+        .args(["--"])
+        .arg(&with_attachment)
+        .assert()
+        .success();
+
+    // Verbose removal must echo the stored key byte for byte.
+    let output = Command::cargo_bin("flpdf")
+        .expect("flpdf binary")
+        .current_dir(directory.path())
+        .env("FLPDF_PROGNAME", "qpdf")
+        .args(["--static-id", "--verbose"])
+        .arg({
+            let mut arg = std::ffi::OsString::from("--remove-attachment=");
+            arg.push(key.as_os_str());
+            arg
+        })
+        .arg(&with_attachment)
+        .arg(directory.path().join("removed.pdf"))
+        .output()
+        .expect("flpdf runs");
+    assert!(output.status.success());
+    let combined = [output.stdout.as_slice(), output.stderr.as_slice()].concat();
+    assert!(
+        combined
+            .windows(8)
+            .any(|window| window == b"key-\xff\n" || window.starts_with(b"key-\xff")),
+        "verbose removal must echo the raw key bytes, got {:?}",
+        String::from_utf8_lossy(&combined)
+    );
+
+    // A failed open must report the path byte for byte.
+    let missing =
+        std::path::PathBuf::from(std::ffi::OsString::from_vec(b"missing-\xff.pdf".to_vec()));
+    let output = Command::cargo_bin("flpdf")
+        .expect("flpdf binary")
+        .current_dir(directory.path())
+        .env("FLPDF_PROGNAME", "qpdf")
+        .args(["--remove-attachment=whatever"])
+        .arg(&missing)
+        .arg(directory.path().join("unused.pdf"))
+        .output()
+        .expect("flpdf runs");
+    assert!(!output.status.success());
+    assert!(
+        output
+            .stderr
+            .windows(16)
+            .any(|window| window.starts_with(b"missing-\xff.pdf")),
+        "a failed open must report the raw path bytes, got {:?}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+}

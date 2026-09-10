@@ -9547,6 +9547,17 @@ fn configure_attachment_job(
     let mut job = new_cli_job(suppress_warnings);
     job.set_input_file(input.to_path_buf())?;
     if replace_input {
+        // Selecting replacement mode without looking at `output` would discard
+        // a second positional path and overwrite the input instead, which is
+        // the one outcome the user cannot undo. qpdf refuses the combination
+        // (`QPDFJob_config.cc:59`), and so do the other replace-input routes
+        // in this binary.
+        if output.is_some() {
+            return Err(UsageError::new(
+                "replace-input can't be used since output file has already been given",
+            )
+            .into());
+        }
         job.config().replace_input()?;
     } else {
         job.set_output_file(output.ok_or_else(missing_output_usage_error)?.to_path_buf())?;
