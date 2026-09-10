@@ -389,7 +389,12 @@ fn install_normal_appearance_canonical_handles<R: Read + Seek>(
     }
 
     let ap = widget.try_get_key(b"/AP")?;
-    let stream = pdf.new_stream_with_data(Rc::new(content))?;
+    // qpdf creates a fresh appearance stream with the empty `/Tx BMC ... EMC`
+    // buffer first, then installs ValueSetter as a lazy token filter
+    // (`QPDFFormFieldObjectHelper.cc:778-782, 851`). Keep the same split-copy
+    // boundary: direct writes run the filter, while qpdf's doSplitPages copy
+    // carries the original buffer without the filter state.
+    let stream = pdf.new_stream_with_data(Rc::new(b"/Tx BMC\nEMC\n".to_vec()))?;
     let bbox = ObjectHandle::array(vec![
         ObjectHandle::real(0.0),
         ObjectHandle::real(0.0),
@@ -429,6 +434,7 @@ fn install_normal_appearance_canonical_handles<R: Read + Seek>(
     // qpdf's replaceKey is a no-op for a non-dictionary /AP value.
     if ap.try_is_dictionary()? {
         ap.replace_key(b"/N", stream.clone())?;
+        stream.add_token_filter(Rc::new(RefCell::new(AppearanceTokenFilter::new(&content))))?;
     } else {
         return Ok(None);
     }
@@ -1086,7 +1092,9 @@ mod tests {
                 .expect("generate")
                 .expect("Tx handled");
         let stream = generated_stream(&mut pdf, reference);
-        let data = stream.as_stream_data().expect("appearance data");
+        let data = stream
+            .get_stream_data(crate::DecodeLevel::Generalized)
+            .expect("filtered appearance data");
         assert!(data.windows(b"<8e>".len()).any(|window| window == b"<8e>"));
     }
 

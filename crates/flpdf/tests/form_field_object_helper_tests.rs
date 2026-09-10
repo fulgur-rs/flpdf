@@ -1,7 +1,7 @@
 //! Integration coverage for the public qpdf-shaped form-field helper.
 
 use flpdf::form_field_object_helper::FormFieldObjectHelper;
-use flpdf::{Error, ObjectHandle, ObjectRef, Pdf};
+use flpdf::{DecodeLevel, Error, ObjectHandle, ObjectRef, Pdf};
 use std::io::Cursor;
 
 mod common;
@@ -1380,8 +1380,8 @@ fn generates_a_field_value_on_its_separate_widget() {
         "normal appearance must be a stream"
     );
     let appearance_data = appearance
-        .get_raw_stream_data()
-        .expect("appearance data")
+        .get_stream_data(DecodeLevel::Generalized)
+        .expect("filtered appearance data")
         .to_vec();
     assert!(appearance_data
         .windows(b"(value)".len())
