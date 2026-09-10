@@ -18302,6 +18302,8 @@ mod stream_provider_contract_tests {
 
     struct RawDefaultResolver;
 
+    // cov:ignore-start: this resolver only installs a value for the following
+    // test; the test intentionally exercises the default raw-identity route.
     impl DocumentResolver for RawDefaultResolver {
         fn resolve_indirect(&self, _object_ref: ObjectRef, handle: &ObjectHandle) -> Result<()> {
             handle.set_resolved(ObjectValue::Stream {
@@ -18314,6 +18316,7 @@ mod stream_provider_contract_tests {
             Ok(())
         }
     }
+    // cov:ignore-end
 
     #[test]
     fn raw_resolver_default_rejects_an_unprojectable_stream_identity() {

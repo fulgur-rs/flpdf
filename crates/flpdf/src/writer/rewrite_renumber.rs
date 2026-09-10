@@ -166,8 +166,10 @@ impl CanonicalCatalogFirstRenumber {
             let source_objstm_containers = qpdf_source_objstm_containers(pdf);
             for handle in pdf.get_all_objects()? {
                 let Some(object_ref) = preserve_seed_object_ref(pdf, handle)? else {
-                    // cov:ignore: qpdf's complete object cache yields indirect handles only.
+                    // cov:ignore-start: qpdf's complete object cache yields
+                    // indirect handles only.
                     continue;
+                    // cov:ignore-end
                 };
                 if object_ref.number == 0
                     || removed_refs.contains(&object_ref)
