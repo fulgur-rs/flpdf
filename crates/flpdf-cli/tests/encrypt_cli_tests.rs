@@ -1554,6 +1554,12 @@ fn encrypt_succeeds_when_combined_with_pages_top_level() {
         .arg(&output)
         .assert()
         .success();
+    // The write itself is asserted above, so only the qpdf cross-check needs
+    // the oracle; skip just that part where qpdf is absent, as the rest of
+    // this file does.
+    if !ensure_qpdf_or_skip() {
+        return;
+    }
     let check = ShellCommand::new("qpdf")
         .args(["--password=u", "--show-encryption"])
         .arg(&output)
@@ -1586,6 +1592,12 @@ fn encrypt_succeeds_when_combined_with_pages_subcommand() {
         .arg(&output)
         .assert()
         .success();
+    // The write itself is asserted above, so only the qpdf cross-check needs
+    // the oracle; skip just that part where qpdf is absent, as the rest of
+    // this file does.
+    if !ensure_qpdf_or_skip() {
+        return;
+    }
     let check = ShellCommand::new("qpdf")
         .args(["--password=u", "--show-encryption"])
         .arg(&output)
