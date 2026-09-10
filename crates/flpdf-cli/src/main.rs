@@ -1581,9 +1581,9 @@ struct Cli {
     /// output encryption (qpdf --copy-encryption equivalent).
     ///
     /// Supply the donor's password via `--encryption-file-password` (empty
-    /// string if the donor has no user password).  Only V=4 AES-128 donors are
-    /// supported; other schemes are rejected
-    /// with a "not yet supported" diagnostic.
+    /// string if the donor has no user password).  The writer accepts the
+    /// Standard handler schemes that qpdf's `copyEncryptionParameters` emits:
+    /// V=1/V=2 RC4, V=4 canonicalized to AESV2, and V=5 AESV3.
     ///
     /// Mutually exclusive with `--encrypt`. `--linearize` may be combined with
     /// this option; qpdf supports copying encryption into a linearized output.
@@ -2023,9 +2023,9 @@ struct RewriteCommand {
     /// output encryption (qpdf --copy-encryption equivalent).
     ///
     /// Supply the donor's password via `--encryption-file-password` (empty
-    /// string if the donor has no user password).  Only V=4 AES-128 donors are
-    /// supported; other schemes are rejected
-    /// with a "not yet supported" diagnostic.
+    /// string if the donor has no user password).  The writer accepts the
+    /// Standard handler schemes that qpdf's `copyEncryptionParameters` emits:
+    /// V=1/V=2 RC4, V=4 canonicalized to AESV2, and V=5 AESV3.
     ///
     /// Mutually exclusive with `--encrypt`. `--linearize` may be combined with
     /// this option; qpdf supports copying encryption into a linearized output.
@@ -3614,14 +3614,6 @@ fn main() {
         // `flpdf in.pdf --pages . 1-3 -- out.pdf`). Mirrors the `rewrite`
         // subcommand's page-op dispatch below.
         //
-        if args.copy_encryption.is_some() {
-            emit_logger_error(
-                "flpdf: --copy-encryption is not applied in the \
-                 --pages/--rotate/--split-pages/--collate pipeline; \
-                 rerun without --copy-encryption or without the page operation\n",
-            );
-            std::process::exit(1);
-        }
         let mut options = WriterOptions {
             static_id: args.static_id,
             deterministic_id: args.deterministic_id,
@@ -3662,94 +3654,24 @@ fn main() {
                 }
             }
         }
+        // `--copy-encryption` is a QPDFJob writer setting, not a page-source
+        // parser setting. Leave donor opening to `write_qpdf`, which also
+        // gives the create-stage page resolver access to qpdf's
+        // encryption-file-password fallback.
         apply_encryption_options(
             &mut options,
             args.raw_encrypt.as_deref(),
-            args.copy_encryption.as_deref(),
+            None,
             args.raw_encryption_file_password.as_deref(),
             &args.password,
             args.no_warn,
         );
-        if args.page_ops.empty && !args.page_ops.pages.is_empty() && args.output.is_none() {
-            match args.input.clone() {
-                Some(output) => run_empty_page_extraction(
-                    &output,
-                    args.repair,
-                    &args.password,
-                    args.update_from_json.as_deref(),
-                    &args.page_ops,
-                    &overlay_specs,
-                    args.remove_unreferenced_resources,
-                    options,
-                    args.linearize,
-                    args.linearize_pass1.as_deref(),
-                    top_level_image_transform_options,
-                    args.generate_appearances,
-                    args.flatten_annotations,
-                    args.flatten_rotation,
-                    args.verbose,
-                    args.no_warn,
-                ),
-                None => Err("--empty page operations require an output file".into()),
-            }
-        } else {
-            let dispatch = |input: PathBuf, output: PathBuf| -> CliResult<()> {
-                if !args.page_ops.pages.is_empty() {
-                    run_page_extraction(
-                        &input,
-                        &output,
-                        args.repair,
-                        &args.password,
-                        args.json_input,
-                        args.update_from_json.as_deref(),
-                        &args.page_ops,
-                        &overlay_specs,
-                        args.remove_unreferenced_resources,
-                        options.clone(),
-                        args.linearize,
-                        args.linearize_pass1.as_deref(),
-                        top_level_image_transform_options,
-                        args.generate_appearances,
-                        args.flatten_annotations,
-                        args.flatten_rotation,
-                        args.verbose,
-                        args.no_warn,
-                    )
-                } else {
-                    if !overlay_specs.is_empty() {
-                        emit_logger_error(
-                            "flpdf: --overlay/--underlay is not applied with \
-                             --rotate/--split-pages alone (no --pages); \
-                             rerun with --pages or without the overlay\n",
-                        );
-                        std::process::exit(1);
-                    }
-                    run_rewrite_with_page_ops(
-                        &input,
-                        &output,
-                        args.repair,
-                        &args.password,
-                        args.json_input,
-                        args.update_from_json.as_deref(),
-                        &args.page_ops,
-                        args.remove_unreferenced_resources,
-                        options.clone(),
-                        args.linearize,
-                        args.linearize_pass1.as_deref(),
-                        top_level_image_transform_options,
-                        args.generate_appearances,
-                        args.flatten_annotations,
-                        args.flatten_rotation,
-                        args.verbose,
-                        args.no_warn,
-                    )
-                }
-            };
-            match (args.input.clone(), args.output.clone()) {
-                (Some(i), Some(o)) => dispatch(i, o),
-                _ => Err("page operations require both an input and an output file".into()),
-            }
-        }
+        run_page_operations_with_qpdf_job(
+            &args,
+            options,
+            top_level_image_transform_options,
+            &overlay_specs,
+        )
     } else {
         let options = top_level_writer_options(
             &args,
@@ -5129,8 +5051,8 @@ fn apply_encryption_options<T: RawCliArg>(
 /// [`WriterOptions::copy_encryption`] or an error string suitable for printing
 /// to stderr before `exit(2)`.
 ///
-/// Only V=4 AES-128 donors are accepted.  Other encryption schemes are
-/// rejected with a "not yet supported" message.
+/// The accepted Standard-handler matrix is V=1/V=2 RC4, V=4 canonicalized to
+/// AESV2, and V=5 AESV3, matching qpdf's `copyEncryptionParameters` path.
 fn build_copy_encryption_source(
     path: &std::path::Path,
     password: Option<&[u8]>,
@@ -5168,22 +5090,29 @@ fn build_copy_encryption_source(
             path
         )
     })?;
-    let (stream_method, string_method, _) = donor.encryption_methods().ok_or_else(|| {
+    let revision = donor.encryption_revision().ok_or_else(|| {
         format!(
-            "--copy-encryption: donor {:?} has no crypt-filter methods",
+            "--copy-encryption: donor {:?} has no encryption revision",
             path
         )
     })?;
 
-    // Walking-skeleton scope: only V=4 AES-128 (StmF=AESV2 / StrF=AESV2).
-    // The method accessors use qpdf's spelling "AESv2" (lowercase v).
-    let is_v4_aes128 =
-        version == 4 && length_bits == 128 && stream_method == "AESv2" && string_method == "AESv2";
-    if !is_v4_aes128 {
+    // qpdf's QPDFWriter::copyEncryptionParameters reads V, R, and /Length,
+    // then lets setEncryptionParametersInternal choose RC4 for V<4 and AES
+    // for V>=4. Keep this validation at the donor boundary so the writer
+    // receives a complete, authenticated qpdf-shaped source rather than a
+    // compatibility sentinel or a guessed crypt-filter method.
+    let supported = match (version, revision) {
+        (1, 2) => length_bits == 40,
+        (2, 2 | 3) => (40..=128).contains(&length_bits) && length_bits % 8 == 0,
+        (4, 4) => length_bits == 128,
+        (5, 5 | 6) => length_bits == 256,
+        _ => false,
+    };
+    if !supported {
         return Err(format!(
-            "--copy-encryption: donor {:?} uses V={} length={} \
-             stream={} string={} — only V=4 AES-128 donors are accepted",
-            path, version, length_bits, stream_method, string_method,
+            "--copy-encryption: donor {:?} uses unsupported Standard handler V={} R={} length={}",
+            path, version, revision, length_bits,
         )
         .into());
     }
@@ -5205,7 +5134,11 @@ fn build_copy_encryption_source(
         .writer_copy_encryption_source()?
         .ok_or_else(|| format!("--copy-encryption: donor {:?} is not encrypted", path))?;
     source.file_key = file_key;
-    source.object_key_alg = ObjectKeyAlg::Aes;
+    source.object_key_alg = if version >= 4 {
+        ObjectKeyAlg::Aes
+    } else {
+        ObjectKeyAlg::Rc4
+    };
     Ok(source)
 }
 
@@ -5787,6 +5720,220 @@ fn run_rewrite(
         None,
         _remove_unref.into(),
     )
+}
+
+/// Execute top-level page operations through qpdf's one-job create/write
+/// lifecycle.
+///
+/// qpdf parses page specifications during `createQPDF`, applies rotations and
+/// all document transformations to that same primary, and only then lets
+/// `writeQPDF` select ordinary or split output and configure encryption
+/// (`QPDFJob.cc:428-520`). Keeping this route on [`QPDFJob`] is observable for
+/// `--copy-encryption`: `handlePageSpecs` reuses the encryption-file password
+/// for an unqualified page source whose raw filename is the donor filename
+/// (`QPDFJob.cc:2405-2410`), while `writeQPDF` opens that donor at its own
+/// writer boundary (`QPDFJob.cc:2891-2899`).
+#[allow(clippy::too_many_arguments)]
+fn run_page_operations_with_qpdf_job(
+    args: &Cli,
+    options: WriterOptions,
+    image_options: ImageTransformOptions,
+    overlay_specs: &[OverlaySpec],
+) -> CliResult<()> {
+    let (input, output) = if args.page_ops.empty {
+        if args.replace_input && (args.input.is_some() || args.output.is_some()) {
+            return Err(UsageError::new(
+                "replace-input can't be used since output file has already been given",
+            )
+            .into());
+        }
+        match (args.input.clone(), args.output.clone()) {
+            (Some(output), None) | (None, Some(output)) => (None, output),
+            (Some(_), Some(_)) => {
+                return Err(UsageError::new(
+                    "empty input can't be used since input file has already been given",
+                )
+                .into())
+            }
+            (None, None) => return Err(missing_output_usage_error().into()),
+        }
+    } else {
+        let input = args.input.clone().ok_or_else(missing_input_usage_error)?;
+        let output = args.output.clone().ok_or_else(missing_output_usage_error)?;
+        // qpdf exempts a split run from the same-file check
+        // (`QPDFJob.cc:627`: `if ((!m->split_pages) && QUtil::same_file(...))`).
+        // A split never opens the output path itself -- it is a template that
+        // derives `input-1.pdf` and so on -- so naming the input there is not
+        // the overwrite this check exists to prevent.
+        if args.page_ops.split_pages.is_none() {
+            reject_same_job_output(&input, &output)?;
+        }
+        (Some(input), output)
+    };
+
+    let input_name = input.clone().unwrap_or_else(|| PathBuf::from("empty PDF"));
+    let page_labels = page_label_options(args.set_page_labels.as_deref(), args.remove_page_labels);
+    let linearize_normalization =
+        args.linearize && options.content_normalization_set && options.content_normalization;
+    let mut job_options = options;
+    if linearize_normalization {
+        // qpdf's linearized writer clears its implicit writer-side normalization
+        // before the two-pass route; the explicit normalization pass remains
+        // between createQPDF and writeQPDF.
+        job_options.content_normalization = false;
+    }
+
+    let mut job = configure_rewrite_job(
+        &input_name,
+        &output,
+        false,
+        &args.password,
+        args.linearize,
+        args.linearize_pass1.as_deref(),
+        args.remove_restrictions,
+        image_options,
+        args.generate_appearances,
+        args.flatten_annotations,
+        args.coalesce_contents,
+        args.flatten_rotation,
+        &page_labels,
+        overlay_specs,
+        args.verbose,
+        args.no_warn,
+        &job_options,
+    )?;
+
+    if let Some(input) = input {
+        job.set_input_file(input)?;
+    } else {
+        job.config().empty_input()?;
+    }
+
+    {
+        let mut configuration = job.config();
+        if args.json_input {
+            configuration.json_input();
+        }
+        if let Some(update_from_json) = args.update_from_json.as_ref() {
+            configuration.update_from_json(update_from_json.clone());
+        }
+    }
+
+    let input_options = pdf_open_options(args.repair, &args.password)?;
+    job.set_password(input_options.password);
+    configure_keep_files_open(&mut job, &args.page_ops)?;
+
+    let raw_specs = if args.page_ops.pages.is_empty() {
+        Vec::new()
+    } else {
+        parse_pages_segment(&raw_page_tokens(&args.page_ops))?
+    };
+    if (args.json_input || args.update_from_json.is_some()) && !args.page_ops.empty {
+        // The JSON-input/update page consumer historically accepts only page
+        // specs that resolve to the already-created primary. Preserve that
+        // command-boundary contract while the actual create-stage work is
+        // owned by QPDFJob; a distinct source would require a JSON-aware
+        // source factory rather than silently substituting the primary.
+        let primary = args.input.as_ref().ok_or_else(missing_input_usage_error)?;
+        let primary_canonical = std::fs::canonicalize(primary).unwrap_or_else(|_| primary.clone());
+        let has_external_source = raw_specs.iter().any(|spec| {
+            if spec.file_token == OsStr::new(".") {
+                return false;
+            }
+            let path = PathBuf::from(&spec.file_token);
+            let canonical = std::fs::canonicalize(&path).unwrap_or(path);
+            canonical != primary_canonical
+        });
+        if has_external_source {
+            return Err(
+                "--pages: cross-document page merge is not supported at this layer \
+                 (an explicit --pages source differs from the --json-input/\
+                 --update-from-json primary input). Single-document extraction \
+                 ('.' or the primary input's own path) is supported; cross-doc \
+                 merge with a JSON-created/updated primary is tracked in a \
+                 separate issue."
+                    .into(),
+            );
+        }
+    }
+    if args.page_ops.empty
+        && raw_specs
+            .iter()
+            .any(|spec| spec.file_token == OsStr::new("."))
+    {
+        return Err("--pages: '.' cannot refer to a primary input with --empty".into());
+    }
+
+    {
+        let mut configuration = job.config();
+        if let Some(path) = args.copy_encryption.as_ref() {
+            let password = args
+                .raw_encryption_file_password
+                .clone()
+                .or_else(|| {
+                    args.encryption_file_password
+                        .as_ref()
+                        .map(|password| arg_parser::os_bytes(password))
+                })
+                .unwrap_or_default();
+            configuration.copy_encryption(path.clone(), password);
+        }
+        for spec in raw_specs {
+            let password = spec.raw_password.or_else(|| {
+                spec.password
+                    .as_ref()
+                    .map(|password| arg_parser::os_bytes(password))
+            });
+            configuration.add_page_spec(PathBuf::from(spec.file_token), &spec.range, password)?;
+        }
+        for parameter in &args.page_ops.rotate {
+            configuration.rotate(arg_parser::os_bytes(parameter.as_os_str()))?;
+        }
+        for parameter in &args.page_ops.collate {
+            configuration.collate(parameter.as_bytes())?;
+        }
+        if let Some(parameter) = args.page_ops.split_pages.as_deref() {
+            configuration.split_pages(parameter.as_bytes())?;
+        }
+        configuration.remove_unreferenced_resources(args.remove_unreferenced_resources.into());
+    }
+
+    let writer_configuration = writer_configuration_unnormalized(
+        &job_options,
+        args.linearize,
+        args.linearize_pass1.as_deref(),
+        args.generate_appearances,
+    )?;
+    job.set_writer_configuration(writer_configuration);
+
+    let mut pdf = match job.create_qpdf()? {
+        Some(pdf) => pdf,
+        None => {
+            return Err(Box::new(CliExitError {
+                code: ExitCode::Errors,
+                message: String::new(),
+            }))
+        }
+    };
+    if linearize_normalization {
+        let warnings = normalize_page_contents(&mut pdf)?;
+        if !warnings.is_empty() {
+            job.record_warnings();
+            if !args.no_warn {
+                for warning in warnings {
+                    emit_content_normalization_warnings(&input_name, warning)?;
+                }
+            }
+        }
+    }
+
+    match job.write_qpdf(&mut pdf) {
+        Ok(()) => finish_job_exit_status(job.get_exit_code()),
+        Err(_) => Err(Box::new(CliExitError {
+            code: ExitCode::Errors,
+            message: String::new(),
+        })),
+    }
 }
 
 #[allow(clippy::too_many_arguments)]

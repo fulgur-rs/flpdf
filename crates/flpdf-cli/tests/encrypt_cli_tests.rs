@@ -2523,11 +2523,14 @@ fn copy_encryption_unencrypted_donor_is_rejected() {
         .stderr(predicates::str::contains("not encrypted"));
 }
 
-/// `--copy-encryption` accepts V=4 AES-128 donors only. An encrypted
-/// donor outside that shape (here V=5 AES-256) is rejected with a message
-/// naming the accepted shape rather than failing silently.
+/// `--copy-encryption` accepts qpdf's V=5 AES-256 Standard-handler donor.
+/// The copied output keeps the donor's revision and accepts the donor user
+/// password through qpdf's independent reader.
 #[test]
-fn copy_encryption_non_v4_aes128_donor_is_rejected() {
+fn copy_encryption_v5_aes256_donor_succeeds() {
+    if !ensure_qpdf_or_skip() {
+        return;
+    }
     let tmp = tempfile::tempdir().unwrap();
     let donor = tmp.path().join("donor256.pdf");
     Command::cargo_bin("flpdf")
@@ -2553,10 +2556,24 @@ fn copy_encryption_non_v4_aes128_donor_is_rejected() {
         .arg(fixture(UNENCRYPTED_FIXTURE))
         .arg(&out)
         .assert()
-        .failure()
-        .stderr(predicates::str::contains(
-            "only V=4 AES-128 donors are accepted",
-        ));
+        .success();
+
+    let check = ShellCommand::new("qpdf")
+        .arg("--password=donoruser")
+        .arg("--show-encryption")
+        .arg(&out)
+        .output()
+        .unwrap();
+    assert!(
+        check.status.success(),
+        "qpdf must accept the V=5 copied output: {}",
+        String::from_utf8_lossy(&check.stderr)
+    );
+    let stdout = String::from_utf8_lossy(&check.stdout);
+    assert!(
+        stdout.contains("R = 6") && stdout.contains("Supplied password is user password"),
+        "qpdf must report the copied V=5/R=6 handler and user password: {stdout}"
+    );
 }
 
 /// `--copy-encryption` with a wrong password is rejected with an error
