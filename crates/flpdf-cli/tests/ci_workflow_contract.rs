@@ -1,5 +1,6 @@
 use std::fs;
 use std::path::Path;
+use std::process::Command;
 use yaml_rust2::{Yaml, YamlLoader};
 
 const CI_WORKFLOW: &str = include_str!("../../../.github/workflows/ci.yml");
@@ -15,6 +16,13 @@ const RELEASE_JOB_NAME: &str = "release";
 const RELEASE_JOB_RUNS_ON: &str = "ubuntu-latest";
 const RELEASE_TEST_COMMAND: &str = "cargo test --workspace --profile release-ci";
 const LIBJPEG_COMPAT_TEST_CONDITION: &str = "${{ runner.os == 'Linux' && matrix.arch == 'amd64' }}";
+/// Filtered commands whose step installs a system library on an earlier line of
+/// its own `run:` block. The workspace test run happens before that install, so
+/// cargo cannot build them from there. ci.yml re-runs this contract inside that
+/// step, where the library is present and the filter is resolved for real, so
+/// the entry buys a skip in one place and never a skip everywhere.
+const SYSTEM_LIBRARY_FILTERED_COMMANDS: [&str; 1] =
+    ["cargo test -p flpdf --features qpdf-libjpeg-compat --lib pipeline::dct"];
 const BASH_CONTROL_FLOW_KEYWORDS: [&str; 11] = [
     "if", "then", "else", "fi", "case", "esac", "for", "while", "until", "do", "done",
 ];
@@ -438,6 +446,359 @@ fn test_job_contains_test_command(workflow: &str, command: &str) -> ContractResu
     Ok(total_raw_command_occurrences == 1
         && total_exact_command_lines == 1
         && executable_command_lines == 1)
+}
+
+fn listed_test_count(output: &str) -> usize {
+    output
+        .lines()
+        .map(str::trim)
+        .filter(|line| line.ends_with(": test"))
+        .count()
+}
+
+/// Split a command line into words the way the workflow shell does, so a quoted
+/// argument reaches cargo without its quotes. Only quote removal and backslash
+/// escaping are modelled; no ci.yml command needs expansion, and a command that
+/// did would be replayed literally rather than guessed at.
+fn shell_words(command: &str) -> Vec<String> {
+    let mut words = Vec::new();
+    let mut current = String::new();
+    let mut in_word = false;
+    let mut characters = command.chars();
+    while let Some(character) = characters.next() {
+        match character {
+            character if character.is_whitespace() => {
+                if in_word {
+                    words.push(std::mem::take(&mut current));
+                    in_word = false;
+                }
+            }
+            '\'' => {
+                in_word = true;
+                for character in characters.by_ref() {
+                    if character == '\'' {
+                        break;
+                    }
+                    current.push(character);
+                }
+            }
+            '"' => {
+                in_word = true;
+                while let Some(character) = characters.next() {
+                    match character {
+                        '"' => break,
+                        '\\' => current.extend(characters.next()),
+                        character => current.push(character),
+                    }
+                }
+            }
+            '\\' => {
+                in_word = true;
+                current.extend(characters.next());
+            }
+            character => {
+                in_word = true;
+                current.push(character);
+            }
+        }
+    }
+    if in_word {
+        words.push(current);
+    }
+    words
+}
+
+/// The words of a `cargo test` command line, or `None` for anything else.
+fn cargo_test_command_words(command: &str) -> Option<Vec<String>> {
+    let words = shell_words(command);
+    let is_cargo_test = words.first().map(String::as_str) == Some("cargo")
+        && words.get(1).map(String::as_str) == Some("test");
+    is_cargo_test.then_some(words)
+}
+
+/// Cargo's own usage is `cargo test [OPTIONS] [TESTNAME] [-- [args...]]`, and
+/// libtest's is `[OPTIONS] [FILTERS...]`, so a filter is a positional argument
+/// on either side of the separator and does not have to follow a target
+/// selector. Scan both sides for a positional, skipping the flags that take a
+/// value, rather than only looking next to `--lib` and `--test` or stopping at
+/// `--`.
+fn cargo_test_command_has_filter(command: &str) -> bool {
+    let Some(words) = cargo_test_command_words(command) else {
+        return false;
+    };
+
+    let mut index = 2;
+    while let Some(word) = words.get(index).map(String::as_str) {
+        if word == "--" {
+            index += 1;
+            break;
+        }
+        if CARGO_TEST_VALUE_FLAGS.contains(&word) {
+            index += 2;
+            continue;
+        }
+        if word.starts_with('-') {
+            index += 1;
+            continue;
+        }
+        return true;
+    }
+
+    while let Some(word) = words.get(index).map(String::as_str) {
+        if LIBTEST_VALUE_FLAGS.contains(&word) {
+            index += 2;
+            continue;
+        }
+        if word.starts_with('-') {
+            index += 1;
+            continue;
+        }
+        return true;
+    }
+
+    false
+}
+
+/// `cargo test` flags whose value is a separate word, so the word after them is
+/// not a test-name filter. `--features=x` and friends carry their value inline
+/// and need no entry here.
+const CARGO_TEST_VALUE_FLAGS: &[&str] = &[
+    "-p",
+    "--package",
+    "--test",
+    "--bin",
+    "--bench",
+    "--example",
+    "--features",
+    "-F",
+    "--target",
+    "--target-dir",
+    "--manifest-path",
+    "--profile",
+    "--jobs",
+    "-j",
+    "--exclude",
+    "--color",
+    "--message-format",
+    "--config",
+    "-Z",
+];
+
+/// libtest options whose value is a separate word. `cargo test <cargo args> --
+/// <harness args>` accepts filters here too (`-- --exact some::test`), so the
+/// scan continues past the separator rather than stopping at it.
+const LIBTEST_VALUE_FLAGS: &[&str] = &[
+    "--skip",
+    "--test-threads",
+    "--logfile",
+    "--format",
+    "--color",
+    "--shuffle-seed",
+];
+
+/// A filtered `cargo test` command together with the `if:` condition of the step
+/// that runs it.
+struct FilteredCommand {
+    command: String,
+    condition: Option<String>,
+}
+
+/// Whether the host running this contract satisfies a step's `if:` condition.
+///
+/// Only conditions listed here are evaluated; anything else is an error rather
+/// than a skip, so a new gate cannot silently switch the check off.
+fn host_satisfies_step_condition(condition: Option<&str>) -> ContractResult<bool> {
+    match condition {
+        None => Ok(true),
+        Some(LIBJPEG_COMPAT_TEST_CONDITION) => {
+            Ok(cfg!(target_os = "linux") && cfg!(target_arch = "x86_64"))
+        }
+        Some(condition) => Err(format!(
+            "filtered cargo test command runs under an unrecognised step condition `{condition}`; \
+             teach host_satisfies_step_condition how to evaluate it"
+        )),
+    }
+}
+
+fn workflow_filtered_cargo_test_commands(workflow: &str) -> ContractResult<Vec<FilteredCommand>> {
+    let workflow = parse_workflow(workflow)?;
+    let jobs =
+        mapping_get(&workflow, "jobs").ok_or_else(|| "ci workflow must define jobs".to_owned())?;
+    let jobs = require_mapping(jobs, "workflow.jobs")?
+        .as_hash()
+        .expect("required mapping must remain a mapping");
+    let mut commands = Vec::new();
+
+    for job in jobs.values() {
+        let Some(steps) = mapping_get(job, "steps") else {
+            continue;
+        };
+        let steps = steps
+            .as_vec()
+            .ok_or_else(|| "job.steps must be a sequence".to_owned())?;
+        for step in steps {
+            // Conditional steps are included. Every filtered command in this
+            // workflow today sits behind an `if`, so skipping them would leave
+            // nothing to check and the contract would pass while a renamed test
+            // silently stopped running -- the exact regression it exists to
+            // catch. The condition is carried along instead, so the probe runs
+            // only where the step itself would.
+            let Some(run) = mapping_get(step, "run").and_then(Yaml::as_str) else {
+                continue;
+            };
+            let condition = mapping_get(step, "if")
+                .and_then(Yaml::as_str)
+                .map(str::to_owned);
+            for line in shell_script_without_comments(run).lines() {
+                let command = line.trim();
+                if cargo_test_command_has_filter(command) {
+                    commands.push(FilteredCommand {
+                        command: command.to_owned(),
+                        condition: condition.clone(),
+                    });
+                }
+            }
+        }
+    }
+
+    Ok(commands)
+}
+
+fn assert_filtered_cargo_tests_are_nonempty(workflow: &str) -> ContractResult<()> {
+    let workspace = Path::new(env!("CARGO_MANIFEST_DIR")).join("../..");
+    for FilteredCommand { command, condition } in workflow_filtered_cargo_test_commands(workflow)? {
+        if !host_satisfies_step_condition(condition.as_deref())? {
+            continue;
+        }
+
+        // Replay the command as the workflow shell would run it, harness
+        // arguments included: a filter can live after the separator, and
+        // dropping `--exact` or `--skip` would resolve a different set of tests
+        // than CI does.
+        let words =
+            cargo_test_command_words(&command).expect("filtered command must be cargo test");
+        let mut args = words[1..].to_vec();
+        if !args.iter().any(|word| word == "--") {
+            args.push("--".to_owned());
+        }
+        args.push("--list".to_owned());
+        // The parent `cargo test` holds the lock on the workspace artifact
+        // directory for the whole run, so a child cargo sharing it blocks
+        // until the parent exits -- which never happens. Give the child its
+        // own target directory.
+        let target_dir = workspace.join("target/ci-workflow-contract");
+        let output = Command::new("cargo")
+            .args(&args)
+            .current_dir(&workspace)
+            .env("CARGO_TARGET_DIR", &target_dir)
+            .output()
+            .map_err(|error| format!("failed to list tests for `{command}`: {error}"))?;
+        if !output.status.success() {
+            // A build failure is only forgiven for a command declared as needing
+            // a system library its own step installs; every other one is a real
+            // failure. Forgiving all of them would hide a stale filter behind
+            // any unrelated build break.
+            if SYSTEM_LIBRARY_FILTERED_COMMANDS.contains(&command.as_str()) {
+                continue;
+            }
+            return Err(format!(
+                "failed to list tests for `{command}`: cargo exited with {}\n{}",
+                output.status,
+                String::from_utf8_lossy(&output.stderr)
+            ));
+        }
+        let stdout = String::from_utf8_lossy(&output.stdout);
+        let count = listed_test_count(&stdout);
+        if count == 0 {
+            return Err(format!(
+                "filtered workflow command matched zero tests: `{command}`"
+            ));
+        }
+    }
+    Ok(())
+}
+
+#[test]
+fn shell_words_removes_the_quoting_the_workflow_shell_removes() {
+    assert_eq!(
+        shell_words("cargo test -p flpdf --lib \"pipeline::dct\""),
+        ["cargo", "test", "-p", "flpdf", "--lib", "pipeline::dct"]
+    );
+    assert_eq!(
+        shell_words("cargo test 'a b' c\\ d"),
+        ["cargo", "test", "a b", "c d"]
+    );
+    assert_eq!(shell_words("  "), Vec::<String>::new());
+    assert_eq!(shell_words("\"\\\"\""), ["\""]);
+}
+
+#[test]
+fn filter_scan_sees_quoted_and_post_separator_filters() {
+    assert!(cargo_test_command_has_filter(
+        "cargo test -p flpdf --lib \"pipeline::dct\""
+    ));
+    assert!(cargo_test_command_has_filter(
+        "cargo test -p flpdf --lib -- --exact pipeline::dct"
+    ));
+    assert!(!cargo_test_command_has_filter(
+        "cargo test -p flpdf --test api -- --nocapture"
+    ));
+    assert!(!cargo_test_command_has_filter(
+        "cargo test -p flpdf --test api -- --skip pipeline::dct"
+    ));
+    assert!(!cargo_test_command_has_filter(
+        "cargo test -p flpdf --test api -- --test-threads 1"
+    ));
+}
+
+#[test]
+fn filter_scan_consumes_the_short_features_flag_value() {
+    assert!(!cargo_test_command_has_filter(
+        "cargo test -p flpdf -F qpdf-zlib-compat --test zlib_compat_tests"
+    ));
+    assert!(cargo_test_command_has_filter(
+        "cargo test -p flpdf -F qpdf-zlib-compat --lib job::overlay::byte_gate"
+    ));
+}
+
+#[test]
+fn unrecognised_step_conditions_fail_instead_of_skipping() {
+    assert!(host_satisfies_step_condition(None).expect("an unconditional step always runs"));
+    host_satisfies_step_condition(Some(LIBJPEG_COMPAT_TEST_CONDITION))
+        .expect("the libjpeg condition is evaluated against the host");
+    host_satisfies_step_condition(Some("${{ runner.os == 'Windows' }}"))
+        .expect_err("an unrecognised condition must not be treated as a skip");
+}
+
+#[test]
+fn declared_system_library_commands_still_exist_in_the_workflow() {
+    let commands = workflow_filtered_cargo_test_commands(CI_WORKFLOW)
+        .expect("ci workflow must be valid")
+        .into_iter()
+        .map(|filtered| filtered.command)
+        .collect::<Vec<_>>();
+    for declared in SYSTEM_LIBRARY_FILTERED_COMMANDS {
+        assert!(
+            commands.iter().any(|command| command == declared),
+            "declared system-library command is no longer a filtered ci.yml command: `{declared}`"
+        );
+    }
+}
+
+#[test]
+fn listed_test_count_distinguishes_a_real_filter_from_zero_matches() {
+    assert_eq!(listed_test_count("running 0 tests\n"), 0);
+    assert_eq!(listed_test_count("test one_case: test\n"), 1);
+    assert_eq!(
+        listed_test_count("test one_case: test\ntest two_case: test\n"),
+        2
+    );
+}
+
+#[test]
+fn workflow_filtered_cargo_tests_match_at_least_one_test() {
+    assert_filtered_cargo_tests_are_nonempty(CI_WORKFLOW)
+        .expect("every filtered cargo test command in CI must list a test");
 }
 
 fn test_job_contains_conditional_commands(
