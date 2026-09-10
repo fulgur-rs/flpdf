@@ -166,6 +166,7 @@ impl CanonicalCatalogFirstRenumber {
             let source_objstm_containers = qpdf_source_objstm_containers(pdf);
             for handle in pdf.get_all_objects()? {
                 let Some(object_ref) = preserve_seed_object_ref(pdf, handle)? else {
+                    // cov:ignore: qpdf's complete object cache yields indirect handles only.
                     continue;
                 };
                 if object_ref.number == 0
@@ -993,12 +994,57 @@ fn enqueue(
 #[cfg(test)]
 mod tests {
     use super::{
-        collect_canonical_children, ensure_canonical_owner, walk_resurrectable_handle,
-        ResurrectableWalkState,
+        collect_canonical_children, ensure_canonical_owner, preserve_seed_object_ref,
+        walk_resurrectable_handle, ResurrectableWalkState,
     };
     use crate::parser::MAX_PARSE_DEPTH;
+    use crate::qpdf_obj_gen::QpdfObjGen;
     use crate::{Error, ObjectHandle, ObjectRef, Pdf};
     use std::collections::BTreeSet;
+    use std::io::Cursor;
+
+    fn raw_stream_pdf() -> Vec<u8> {
+        let mut bytes = b"%PDF-1.4\n".to_vec();
+        let catalog_offset = bytes.len();
+        bytes.extend_from_slice(b"1 0 obj\n<< /Type /Catalog >>\nendobj\n");
+        let stream_offset = bytes.len();
+        bytes.extend_from_slice(
+            b"5 65536 obj\n<< /Length 3 >>\nstream\nabc\nendstream\nendobj\n%tail\n",
+        );
+        let xref_offset = bytes.len();
+        bytes.extend_from_slice(b"xref\n0 6\n0000000000 65535 f \n");
+        bytes.extend_from_slice(format!("{catalog_offset:010} 00000 n \n").as_bytes());
+        bytes.extend_from_slice(b"0000000000 00000 f \n0000000000 00000 f \n0000000000 00000 f \n");
+        bytes.extend_from_slice(format!("{stream_offset:010} 65536 n \n").as_bytes());
+        bytes.extend_from_slice(
+            format!("trailer\n<< /Size 6 /Root 1 0 R >>\nstartxref\n{xref_offset}\n%%EOF\n")
+                .as_bytes(),
+        );
+        bytes
+    }
+
+    #[test]
+    fn preserve_seed_helper_ignores_direct_values() {
+        let mut pdf = Pdf::empty().expect("create a document");
+        assert_eq!(
+            preserve_seed_object_ref(&mut pdf, ObjectHandle::integer(1)).unwrap(),
+            None
+        );
+    }
+
+    #[test]
+    fn preserve_seed_helper_copies_a_raw_generation_stream() {
+        let mut pdf = Pdf::open(Cursor::new(raw_stream_pdf())).expect("open raw stream PDF");
+        let handle = pdf
+            .get_all_objects()
+            .unwrap()
+            .into_iter()
+            .find(|handle| handle.qpdf_obj_gen() == Some(QpdfObjGen::new(5, 65_536)))
+            .expect("raw stream cache entry");
+        assert!(preserve_seed_object_ref(&mut pdf, handle)
+            .unwrap()
+            .is_some());
+    }
 
     #[test]
     fn writer_foreign_owner_is_a_qpdf_logic_error() {

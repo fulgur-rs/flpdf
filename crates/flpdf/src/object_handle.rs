@@ -18235,6 +18235,18 @@ mod stream_provider_contract_tests {
 
         assert_eq!(provider.calls.get(), 1);
         assert_eq!(*provider.identities.borrow(), vec![(17, 4)]);
+
+        provider
+            .provide_stream_data_by_qpdf_obj_gen(17, 4, &mut sink)
+            .expect("projectable raw provider");
+        provider
+            .provide_stream_data_by_qpdf_obj_gen(17, 65_536, &mut sink)
+            .expect("unprojectable raw provider fallback");
+        assert_eq!(provider.calls.get(), 3);
+        assert_eq!(
+            *provider.identities.borrow(),
+            vec![(17, 4), (17, 4), (17, 0)]
+        );
     }
 
     #[test]
@@ -18248,6 +18260,18 @@ mod stream_provider_contract_tests {
         assert!(provider.supports_retry());
         assert_eq!(provider.calls.get(), 1);
         assert_eq!(*provider.flags.borrow(), vec![(true, false)]);
+
+        assert!(provider
+            .provide_stream_data_with_retry_by_qpdf_obj_gen(23, 2, &mut sink, true, false)
+            .expect("projectable raw retry provider"));
+        assert!(provider
+            .provide_stream_data_with_retry_by_qpdf_obj_gen(23, 65_536, &mut sink, false, true)
+            .expect("unprojectable raw retry provider fallback"));
+        assert_eq!(provider.calls.get(), 3);
+        assert_eq!(
+            *provider.flags.borrow(),
+            vec![(true, false), (true, false), (false, true)]
+        );
     }
 
     #[test]
@@ -18273,6 +18297,73 @@ mod stream_provider_contract_tests {
             error,
             Error::Internal(message)
                 if message == "you must override provideStreamData -- see QPDFObjectHandle.hh"
+        ));
+    }
+
+    struct RawDefaultResolver;
+
+    impl DocumentResolver for RawDefaultResolver {
+        fn resolve_indirect(&self, _object_ref: ObjectRef, handle: &ObjectHandle) -> Result<()> {
+            handle.set_resolved(ObjectValue::Stream {
+                stream_dict: ObjectHandle::dictionary(vec![]),
+                stream_data: None,
+                stream_provider: None,
+                filter_on_write: true,
+                stream_length: 0,
+            });
+            Ok(())
+        }
+    }
+
+    #[test]
+    fn raw_resolver_default_rejects_an_unprojectable_stream_identity() {
+        let resolver: Rc<dyn DocumentResolver> = Rc::new(RawDefaultResolver);
+        let stream = ObjectHandle::new_indirect_for_qpdf_obj_gen_with_resolver(
+            QpdfObjGen::new(5, 65_536),
+            -1,
+            0,
+            Rc::downgrade(&resolver),
+        );
+        stream.set_resolved(ObjectValue::Stream {
+            stream_dict: ObjectHandle::dictionary(vec![]),
+            stream_data: None,
+            stream_provider: None,
+            filter_on_write: true,
+            stream_length: 0,
+        });
+
+        let error = stream
+            .get_raw_stream_data()
+            .expect_err("a resolver without a raw stream route must reject the identity");
+        assert!(matches!(
+            error,
+            Error::Internal(message)
+                if message == "object 5 65536 is not a valid indirect reference"
+        ));
+    }
+
+    #[test]
+    fn provider_backed_direct_stream_rejects_missing_qpdf_identity() {
+        let stream = ObjectHandle::stream(ObjectHandle::dictionary(vec![]), Rc::new(Vec::new()));
+        stream.with_value_mut(|value| {
+            if let Some(ObjectValue::Stream {
+                stream_data,
+                stream_provider,
+                ..
+            }) = value
+            {
+                *stream_data = None;
+                *stream_provider = Some(Rc::new(LegacyProvider::default()));
+            }
+        });
+
+        let error = stream
+            .get_raw_stream_data()
+            .expect_err("a provider-backed direct stream has no qpdf identity");
+        assert!(matches!(
+            error,
+            Error::Internal(message)
+                if message == "pipeStreamData called for provider-backed direct stream"
         ));
     }
 
