@@ -1514,20 +1514,22 @@ fn merge_documents_with_resource_decisions_and_preserve_primary_into_impl<
             // unreachable and therefore omitted by the ordinary writer, but
             // they preserve qpdf's diagnostic object identities and allocator
             // ordering for the subsequent foreign copy.
-            let mut target_max = target
+            let target_max = target
                 .canonical_live_object_refs()
                 .into_iter()
                 .map(|object| object.number)
                 .max()
                 .unwrap_or(0);
-            // `make_indirect_object_handle` allocates at `target_max + 1`, so
-            // the padding is complete once the target maximum has reached the
-            // primary maximum: running on equality too would leave it at
-            // `primary_max_object + 1` and push the first foreign copy to
-            // `primary_max_object + 2`.
-            while target_max < primary_max_object {
-                target.make_indirect_object_handle(ObjectHandle::null())?;
-                target_max += 1;
+            // Raising the ceiling is what matters here, not owning every slot
+            // below it: the next allocation is `max + 1` either way, and the
+            // reserved slots are unreachable and never written. Claim only the
+            // top slot instead of one object per gap -- the gap is attacker
+            // controlled (a single dangling `100000000 0 R` in a 351-byte file
+            // reaches `get_object_count`), so filling it would let a tiny input
+            // allocate unboundedly.
+            if target_max < primary_max_object {
+                target
+                    .replace_object(ObjectRef::new(primary_max_object, 0), ObjectHandle::null())?;
             }
         }
     }

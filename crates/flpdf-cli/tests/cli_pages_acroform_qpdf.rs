@@ -2363,3 +2363,83 @@ fn foreign_source_allocator_identities_match_qpdf() {
         );
     }
 }
+
+/// The primary's object-number ceiling is reserved so that foreign copies start
+/// above it, but the number that ceiling comes from is attacker controlled: a
+/// dangling reference in the body reaches the object cache, so a tiny malformed
+/// file can name an arbitrarily high object. Reserving the range one slot at a
+/// time would let that file drive an unbounded number of allocations, so this
+/// pins that a 350-byte input with a dangling `100000000 0 R` still completes
+/// and still agrees with qpdf.
+#[test]
+fn a_dangling_high_object_number_does_not_drive_allocation() {
+    if !qpdf_available() {
+        eprintln!("[SKIP cli_pages_acroform_qpdf] qpdf 11.9.0 is unavailable");
+        return;
+    }
+
+    let temp = tempfile::tempdir().expect("temporary directory");
+    let primary = temp.path().join("dangling.pdf");
+    let mut bytes = b"%PDF-1.4\n".to_vec();
+    let objects = [
+        b"1 0 obj\n<< /Type /Catalog /Pages 2 0 R /Dangling 100000000 0 R >>\nendobj\n".to_vec(),
+        b"2 0 obj\n<< /Type /Pages /Kids [3 0 R] /Count 1 >>\nendobj\n".to_vec(),
+        b"3 0 obj\n<< /Type /Page /Parent 2 0 R /MediaBox [0 0 200 200] >>\nendobj\n".to_vec(),
+    ];
+    let mut offsets = Vec::with_capacity(objects.len());
+    for object in &objects {
+        offsets.push(bytes.len());
+        bytes.extend_from_slice(object);
+    }
+    let xref_offset = bytes.len();
+    bytes.extend_from_slice(b"xref\n0 4\n0000000000 65535 f \n");
+    for offset in &offsets {
+        bytes.extend_from_slice(format!("{offset:010} 00000 n \n").as_bytes());
+    }
+    bytes.extend_from_slice(
+        format!("trailer\n<< /Size 4 /Root 1 0 R >>\nstartxref\n{xref_offset}\n%%EOF\n").as_bytes(),
+    );
+    std::fs::write(&primary, &bytes).expect("write fixture");
+
+    let foreign = Path::new(env!("CARGO_MANIFEST_DIR")).join(FIXTURE);
+
+    let qpdf_output = temp.path().join("qpdf.pdf");
+    let qpdf_status = Shell::new(QPDF)
+        .args(["--static-id", "--qdf"])
+        .arg(&primary)
+        .arg("--pages")
+        .arg(".")
+        .arg("1")
+        .arg(&foreign)
+        .arg("1")
+        .arg("--")
+        .arg(&qpdf_output)
+        .status()
+        .expect("qpdf should spawn");
+    assert!(
+        qpdf_status.success(),
+        "qpdf should merge the dangling fixture"
+    );
+
+    let flpdf_output = temp.path().join("flpdf.pdf");
+    Command::cargo_bin("flpdf")
+        .unwrap()
+        .env("FLPDF_STATIC_ID_QUIET", "1")
+        .args(["--static-id", "--qdf"])
+        .arg(&primary)
+        .arg("--pages")
+        .arg(".")
+        .arg("1")
+        .arg(&foreign)
+        .arg("1")
+        .arg("--")
+        .arg(&flpdf_output)
+        .assert()
+        .success();
+
+    assert_eq!(
+        std::fs::read(&flpdf_output).expect("read flpdf output"),
+        std::fs::read(&qpdf_output).expect("read qpdf output"),
+        "merged output must match qpdf byte for byte"
+    );
+}
