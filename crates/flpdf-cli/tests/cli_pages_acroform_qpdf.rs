@@ -121,6 +121,65 @@ fn page_object_refs(path: &Path) -> Vec<String> {
         .collect()
 }
 
+fn page_annotation_object_refs(path: &Path) -> Vec<Vec<String>> {
+    let text = qdf(path);
+    let mut pages: Vec<Vec<String>> = Vec::new();
+    let mut reading_annots = false;
+
+    for line in text.lines() {
+        if line.starts_with("%% Page ") {
+            pages.push(Vec::new());
+            reading_annots = false;
+            continue;
+        }
+        if pages.is_empty() {
+            continue;
+        }
+        if line.trim_start().starts_with("/Annots [") {
+            reading_annots = true;
+            continue;
+        }
+        if !reading_annots {
+            continue;
+        }
+        if line.trim() == "]" {
+            reading_annots = false;
+            continue;
+        }
+        let parts: Vec<_> = line.split_whitespace().collect();
+        if parts.len() == 3 && parts[2] == "R" {
+            pages
+                .last_mut()
+                .expect("annotation list belongs to a page")
+                .push(parts[..2].join(" "));
+        }
+    }
+
+    pages
+}
+
+fn page_resource_shapes(path: &Path) -> Vec<String> {
+    let text = qdf(path);
+    let mut shapes = Vec::new();
+    let mut in_page = false;
+
+    for line in text.lines() {
+        if line.starts_with("%% Page ") {
+            in_page = true;
+            continue;
+        }
+        if in_page && line.trim() == "endobj" {
+            in_page = false;
+            continue;
+        }
+        if in_page && line.trim_start().starts_with("/Resources ") {
+            shapes.push(line.trim().to_owned());
+        }
+    }
+
+    shapes
+}
+
 fn widget_page_position(path: &Path, partial_name: &str) -> usize {
     let text = qdf(path);
     let marker = format!("/T ({partial_name})");
@@ -373,6 +432,188 @@ fn repeated_single_source_acroform_copies_each_page_occurrence() {
 }
 
 #[test]
+fn repeated_primary_then_foreign_pages_rename_fields_per_occurrence() {
+    if !qpdf_available() {
+        eprintln!("[SKIP cli_pages_acroform_qpdf] qpdf 11.9.0 is unavailable");
+        return;
+    }
+
+    let temp = tempfile::tempdir().expect("temporary directory");
+    let fixture = Path::new(env!("CARGO_MANIFEST_DIR"))
+        .join("../../tests/fixtures/compat/form-fields-and-annotations.pdf");
+    let primary = temp.path().join("primary.pdf");
+    let foreign = temp.path().join("foreign.pdf");
+    std::fs::copy(&fixture, &primary).expect("copy primary");
+    std::fs::copy(&fixture, &foreign).expect("copy foreign");
+
+    let qpdf_output = temp.path().join("qpdf.pdf");
+    Shell::new(QPDF)
+        .arg(&primary)
+        .args(["--pages"])
+        .arg(&primary)
+        .arg("1,1")
+        .arg(&foreign)
+        .arg("1,1")
+        .args(["--"])
+        .arg(&qpdf_output)
+        .assert()
+        .success();
+
+    let flpdf_output = temp.path().join("flpdf.pdf");
+    Command::cargo_bin("flpdf")
+        .unwrap()
+        .arg(&primary)
+        .args(["--pages"])
+        .arg(&primary)
+        .arg("1,1")
+        .arg(&foreign)
+        .arg("1,1")
+        .args(["--"])
+        .arg(&flpdf_output)
+        .assert()
+        .success();
+
+    assert_eq!(
+        observable_fields(&acroform_json(&flpdf_output)),
+        observable_fields(&qpdf_acroform_json(&qpdf_output)),
+        "field names must be resolved in qpdf's final page-occurrence order"
+    );
+}
+
+#[test]
+fn multi_source_pages_do_not_reapply_auto_resource_pruning_after_copy() {
+    if !qpdf_available() {
+        eprintln!("[SKIP cli_pages_acroform_qpdf] qpdf 11.9.0 is unavailable");
+        return;
+    }
+
+    let temp = tempfile::tempdir().expect("temporary directory");
+    let fixture = Path::new(env!("CARGO_MANIFEST_DIR"))
+        .join("../../tests/fixtures/compat/form-fields-and-annotations.pdf");
+    let primary = temp.path().join("primary.pdf");
+    let foreign = temp.path().join("foreign.pdf");
+    std::fs::copy(&fixture, &primary).expect("copy primary");
+    std::fs::copy(&fixture, &foreign).expect("copy foreign");
+
+    let qpdf_output = temp.path().join("qpdf.pdf");
+    Shell::new(QPDF)
+        .arg(&primary)
+        .args(["--pages"])
+        .arg(&primary)
+        .arg("1,1")
+        .arg(&foreign)
+        .arg("1,1")
+        .args(["--", "--qdf", "--static-id", "--no-original-object-ids"])
+        .arg(&qpdf_output)
+        .assert()
+        .success();
+
+    let flpdf_output = temp.path().join("flpdf.pdf");
+    Command::cargo_bin("flpdf")
+        .unwrap()
+        .arg(&primary)
+        .args(["--pages"])
+        .arg(&primary)
+        .arg("1,1")
+        .arg(&foreign)
+        .arg("1,1")
+        .args(["--", "--qdf", "--static-id", "--no-original-object-ids"])
+        .arg(&flpdf_output)
+        .assert()
+        .success();
+
+    assert_eq!(
+        page_resource_shapes(&flpdf_output),
+        page_resource_shapes(&qpdf_output),
+        "multi-source page jobs must use the source preflight resource decision once"
+    );
+}
+
+#[test]
+fn pages_apply_generate_appearances_after_selection() {
+    if !qpdf_available() {
+        eprintln!("[SKIP cli_pages_acroform_qpdf] qpdf 11.9.0 is unavailable");
+        return;
+    }
+
+    let temp = tempfile::tempdir().expect("temporary directory");
+    let input = temp.path().join("input.pdf");
+    std::fs::write(&input, acroform_existing_nonzero_bbox_appearance_pdf()).expect("write input");
+
+    let qpdf_output = temp.path().join("qpdf.pdf");
+    Shell::new(QPDF)
+        .arg(&input)
+        .args([
+            "--pages",
+            ".",
+            "1",
+            "--",
+            "--generate-appearances",
+            "--qdf",
+            "--static-id",
+            "--no-original-object-ids",
+        ])
+        .arg(&qpdf_output)
+        .assert()
+        .success();
+
+    let flpdf_output = temp.path().join("flpdf.pdf");
+    Command::cargo_bin("flpdf")
+        .unwrap()
+        .arg(&input)
+        .args([
+            "--pages",
+            ".",
+            "1",
+            "--",
+            "--generate-appearances",
+            "--qdf",
+            "--static-id",
+            "--no-original-object-ids",
+        ])
+        .arg(&flpdf_output)
+        .assert()
+        .success();
+
+    assert_eq!(
+        std::fs::read(&flpdf_output).expect("flpdf generated output"),
+        std::fs::read(&qpdf_output).expect("qpdf generated output"),
+        "generated appearance content must preserve qpdf's existing /BBox origin"
+    );
+}
+
+#[test]
+fn pages_apply_flatten_annotations_after_selection() {
+    if !qpdf_available() {
+        eprintln!("[SKIP cli_pages_acroform_qpdf] qpdf 11.9.0 is unavailable");
+        return;
+    }
+
+    let temp = tempfile::tempdir().expect("temporary directory");
+    let fixture = Path::new(env!("CARGO_MANIFEST_DIR"))
+        .join("../../tests/fixtures/compat/form-fields-and-annotations.pdf");
+    let input = temp.path().join("input.pdf");
+    std::fs::copy(&fixture, &input).expect("copy input");
+
+    let qpdf_output = temp.path().join("qpdf.pdf");
+    Shell::new(QPDF)
+        .arg(&input)
+        .args(["--pages", ".", "1", "--", "--flatten-annotations=all"])
+        .arg(&qpdf_output)
+        .assert()
+        .success();
+
+    let flpdf_output = temp.path().join("flpdf.pdf");
+    Command::cargo_bin("flpdf")
+        .unwrap()
+        .arg(&input)
+        .args(["--pages", ".", "1", "--", "--flatten-annotations=all"])
+        .arg(&flpdf_output)
+        .assert()
+        .success();
+}
+
+#[test]
 fn out_of_order_duplicate_selection_renames_fields_in_final_page_order() {
     if !qpdf_available() {
         eprintln!("[SKIP cli_pages_acroform_qpdf] qpdf 11.9.0 is unavailable");
@@ -490,6 +731,60 @@ fn foreign_page_without_acroform_does_not_create_destination_dr() {
     assert!(
         !acroform_has_dr(&flpdf_output),
         "flpdf must not create destination /DR for a no-AcroForm source"
+    );
+}
+
+#[test]
+fn repeated_foreign_no_acroform_pages_clone_each_annotation_occurrence() {
+    if !qpdf_available() {
+        eprintln!("[SKIP cli_pages_acroform_qpdf] qpdf 11.9.0 is unavailable");
+        return;
+    }
+
+    let temp = tempfile::tempdir().expect("temporary directory");
+    let primary = temp.path().join("primary.pdf");
+    let source_fixture = Path::new(env!("CARGO_MANIFEST_DIR")).join(NO_ACROFORM_FIXTURE);
+    let source = temp.path().join("source.pdf");
+    std::fs::copy(
+        Path::new(env!("CARGO_MANIFEST_DIR")).join("../../tests/fixtures/minimal.pdf"),
+        &primary,
+    )
+    .expect("copy primary");
+    std::fs::copy(&source_fixture, &source).expect("copy no-AcroForm source");
+
+    let qpdf_output = temp.path().join("qpdf.pdf");
+    Shell::new(QPDF)
+        .arg(&primary)
+        .args(["--pages"])
+        .arg(&source)
+        .arg("1,1")
+        .args(["--", "--qdf", "--static-id"])
+        .arg(&qpdf_output)
+        .assert()
+        .success();
+
+    let flpdf_output = temp.path().join("flpdf.pdf");
+    Command::cargo_bin("flpdf")
+        .unwrap()
+        .arg(&primary)
+        .args(["--pages"])
+        .arg(&source)
+        .arg("1,1")
+        .args(["--", "--qdf", "--static-id"])
+        .arg(&flpdf_output)
+        .assert()
+        .success();
+
+    let qpdf_annots = page_annotation_object_refs(&qpdf_output);
+    let flpdf_annots = page_annotation_object_refs(&flpdf_output);
+    assert_eq!(qpdf_annots.len(), 2, "qpdf must emit both selected pages");
+    assert_eq!(
+        qpdf_annots, flpdf_annots,
+        "foreign page annotation copies must match qpdf"
+    );
+    assert_ne!(
+        qpdf_annots[0], qpdf_annots[1],
+        "qpdf gives each repeated foreign page occurrence independent annotations"
     );
 }
 
@@ -830,6 +1125,113 @@ fn acroform_inline_primary_pdf() -> Vec<u8> {
     ])
 }
 
+/// Inline primary AcroForm with a document-level resource dictionary. The
+/// selected page comes only from the foreign spelling of the same file, so
+/// qpdf must retain this direct primary AcroForm as the base while replacing
+/// its final `/Fields` array with the copied foreign field.
+fn acroform_inline_primary_with_dr_pdf() -> Vec<u8> {
+    assemble_pdf(&[
+        b"1 0 obj\n<< /Type /Catalog /Pages 2 0 R /AcroForm << /Fields [4 0 R] /DR 5 0 R /NeedAppearances true >> >>\nendobj\n".to_vec(),
+        b"2 0 obj\n<< /Type /Pages /Count 1 /Kids [3 0 R] >>\nendobj\n".to_vec(),
+        b"3 0 obj\n<< /Type /Page /Parent 2 0 R /MediaBox [0 0 612 792] /Annots [4 0 R] >>\nendobj\n".to_vec(),
+        b"4 0 obj\n<< /Type /Annot /Subtype /Widget /FT /Tx /T (ForeignOnly) /DA (/F1 12 Tf) /Rect [0 0 100 20] /P 3 0 R >>\nendobj\n".to_vec(),
+        b"5 0 obj\n<< /Font << /F1 6 0 R >> >>\nendobj\n".to_vec(),
+        b"6 0 obj\n<< /Type /Font /Subtype /Type1 /BaseFont /Helvetica >>\nendobj\n".to_vec(),
+    ])
+}
+
+/// A text widget whose existing normal appearance has a non-zero lower-left
+/// `/BBox`. qpdf lays out generated text in that coordinate system instead of
+/// silently treating the box as `[0 0 width height]`.
+fn acroform_existing_nonzero_bbox_appearance_pdf() -> Vec<u8> {
+    assemble_pdf(&[
+        b"1 0 obj\n<< /Type /Catalog /Pages 2 0 R /AcroForm << /Fields [4 0 R] /NeedAppearances true /DR 5 0 R >> >>\nendobj\n".to_vec(),
+        b"2 0 obj\n<< /Type /Pages /Count 1 /Kids [3 0 R] >>\nendobj\n".to_vec(),
+        b"3 0 obj\n<< /Type /Page /Parent 2 0 R /MediaBox [0 0 612 792] /Annots [4 0 R] >>\nendobj\n".to_vec(),
+        b"4 0 obj\n<< /Type /Annot /Subtype /Widget /FT /Tx /T (NonzeroBBox) /V (Value) /DA (/F1 18 Tf) /AP << /N 7 0 R >> /Rect [0 0 118.8 14.148] /P 3 0 R >>\nendobj\n".to_vec(),
+        b"5 0 obj\n<< /Font << /F1 6 0 R >> >>\nendobj\n".to_vec(),
+        b"6 0 obj\n<< /Type /Font /Subtype /Type1 /BaseFont /Helvetica >>\nendobj\n".to_vec(),
+        b"7 0 obj\n<< /Type /XObject /Subtype /Form /BBox [0 -2.826 118.8 11.322] /Resources 5 0 R /Length 8 0 R >>\nstream\n/Tx BMC\nq Q\nEMC\nendstream\nendobj\n".to_vec(),
+        b"8 0 obj\n16\nendobj\n".to_vec(),
+    ])
+}
+
+/// Primary AcroForm with `/DR` but without `/Fields`. qpdf leaves that
+/// dictionary shape unchanged when no field is added by the page selection.
+fn acroform_without_fields_array_with_dr_pdf() -> Vec<u8> {
+    assemble_pdf(&[
+        b"1 0 obj\n<< /Type /Catalog /Pages 2 0 R /AcroForm << /DR 5 0 R /NeedAppearances true >> >>\nendobj\n".to_vec(),
+        b"2 0 obj\n<< /Type /Pages /Count 1 /Kids [3 0 R] >>\nendobj\n".to_vec(),
+        b"3 0 obj\n<< /Type /Page /Parent 2 0 R /MediaBox [0 0 612 792] >>\nendobj\n".to_vec(),
+        b"4 0 obj\n<<>>\nendobj\n".to_vec(),
+        b"5 0 obj\n<< /Font << /F1 6 0 R >> >>\nendobj\n".to_vec(),
+        b"6 0 obj\n<< /Type /Font /Subtype /Type1 /BaseFont /Helvetica >>\nendobj\n".to_vec(),
+    ])
+}
+
+/// Primary AcroForm whose original `/Fields` array is indirect. qpdf creates
+/// the filtered replacement array with the same indirect representation.
+fn acroform_with_indirect_fields_array_pdf() -> Vec<u8> {
+    assemble_pdf(&[
+        b"1 0 obj\n<< /Type /Catalog /Pages 2 0 R /AcroForm << /Fields 5 0 R >> >>\nendobj\n".to_vec(),
+        b"2 0 obj\n<< /Type /Pages /Count 1 /Kids [3 0 R] >>\nendobj\n".to_vec(),
+        b"3 0 obj\n<< /Type /Page /Parent 2 0 R /MediaBox [0 0 612 792] /Annots [4 0 R] >>\nendobj\n".to_vec(),
+        b"4 0 obj\n<< /Type /Annot /Subtype /Widget /FT /Tx /T (IndirectFields) /Rect [0 0 10 10] /P 3 0 R >>\nendobj\n".to_vec(),
+        b"5 0 obj\n[4 0 R]\nendobj\n".to_vec(),
+    ])
+}
+
+/// qpdf keeps the primary Catalog's direct AcroForm and its `/DR` base alive
+/// until after every foreign `fixCopiedAnnotations` event, even when no page
+/// from the primary itself was selected (`QPDFJob.cc:2462-2632`).
+#[test]
+fn foreign_only_page_selection_keeps_primary_inline_acroform_base() {
+    if !qpdf_available() {
+        eprintln!("[SKIP cli_pages_acroform_qpdf] qpdf 11.9.0 is unavailable");
+        return;
+    }
+
+    let temp = tempfile::tempdir().expect("temporary directory");
+    let primary = temp.path().join("primary.pdf");
+    let foreign = temp.path().join("foreign.pdf");
+    std::fs::write(&primary, acroform_inline_primary_with_dr_pdf()).expect("write primary");
+    std::fs::write(&foreign, acroform_inline_primary_with_dr_pdf()).expect("write foreign");
+
+    let qpdf_output = temp.path().join("qpdf.pdf");
+    Shell::new(QPDF)
+        .arg(&primary)
+        .args(["--pages"])
+        .arg(&foreign)
+        .arg("1")
+        .args(["--", "--qdf", "--static-id", "--no-original-object-ids"])
+        .arg(&qpdf_output)
+        .assert()
+        .success();
+
+    let flpdf_output = temp.path().join("flpdf.pdf");
+    Command::cargo_bin("flpdf")
+        .unwrap()
+        .arg(&primary)
+        .args(["--pages"])
+        .arg(&foreign)
+        .arg("1")
+        .args(["--", "--qdf", "--static-id", "--no-original-object-ids"])
+        .arg(&flpdf_output)
+        .assert()
+        .success();
+
+    assert!(acroform_is_direct(&qpdf_output));
+    assert!(
+        acroform_is_direct(&flpdf_output),
+        "foreign replay must mutate the direct primary AcroForm instead of creating a new indirect one"
+    );
+    assert_eq!(
+        observable_fields(&acroform_json(&flpdf_output)),
+        observable_fields(&qpdf_acroform_json(&qpdf_output)),
+        "foreign field replay must use the primary AcroForm field/resource base"
+    );
+}
+
 /// One-page primary whose original indirect widget is attached to page 1 but
 /// carries a dangling `/P`. qpdf does not run `fixCopiedAnnotations` for the
 /// first primary occurrence (`QPDFJob.cc:2517-2585`), so the dangling page
@@ -852,6 +1254,38 @@ fn acroform_is_direct(path: &Path) -> bool {
     text[marker_at + "/AcroForm".len()..]
         .trim_start()
         .starts_with("<<")
+}
+
+fn acroform_object(path: &Path) -> String {
+    let text = qdf(path);
+    let marker_at = text.find("/AcroForm").expect("catalog AcroForm");
+    let after_marker = text[marker_at + "/AcroForm".len()..].trim_start();
+    let object_start = if after_marker.starts_with("<<") {
+        marker_at
+    } else {
+        let mut parts = after_marker.split_whitespace();
+        let number = parts.next().expect("AcroForm object number");
+        let generation = parts.next().expect("AcroForm generation");
+        text.find(&format!("\n{number} {generation} obj"))
+            .expect("AcroForm object")
+    };
+    let end = text[object_start..]
+        .find("endobj")
+        .map(|offset| object_start + offset)
+        .expect("AcroForm object end");
+    text[object_start..end].to_owned()
+}
+
+fn acroform_has_fields_key(path: &Path) -> bool {
+    acroform_object(path).contains("/Fields")
+}
+
+fn acroform_fields_are_direct(path: &Path) -> bool {
+    let object = acroform_object(path);
+    let marker_at = object.find("/Fields").expect("AcroForm Fields");
+    object[marker_at + "/Fields".len()..]
+        .trim_start()
+        .starts_with('[')
 }
 
 /// qpdf only rebuilds `/AcroForm /Fields` when the primary's *original*
@@ -913,6 +1347,113 @@ fn acroform_without_fields_array_survives_a_multi_source_merge() {
     assert_eq!(
         flpdf_json["acroform"]["needappearances"], qpdf_json["acroform"]["needappearances"],
         "/NeedAppearances must survive alongside the rest of the AcroForm dict"
+    );
+}
+
+/// qpdf does not synthesize `/Fields []` merely because the primary AcroForm
+/// carries `/DR`; the final field-array gate is based on the original key.
+#[test]
+fn acroform_without_fields_array_does_not_gain_an_empty_fields_key() {
+    if !qpdf_available() {
+        eprintln!("[SKIP cli_pages_acroform_qpdf] qpdf 11.9.0 is unavailable");
+        return;
+    }
+
+    let temp = tempfile::tempdir().expect("temporary directory");
+    let primary = temp.path().join("primary.pdf");
+    let secondary = temp.path().join("secondary.pdf");
+    std::fs::write(&primary, acroform_without_fields_array_with_dr_pdf()).expect("write primary");
+    std::fs::write(&secondary, plain_page_pdf()).expect("write secondary");
+
+    let qpdf_output = temp.path().join("qpdf.pdf");
+    Shell::new(QPDF)
+        .arg(&primary)
+        .args(["--pages"])
+        .arg(&primary)
+        .arg("1")
+        .arg(&secondary)
+        .arg("1")
+        .args(["--", "--qdf", "--static-id", "--no-original-object-ids"])
+        .arg(&qpdf_output)
+        .assert()
+        .success();
+
+    let flpdf_output = temp.path().join("flpdf.pdf");
+    Command::cargo_bin("flpdf")
+        .unwrap()
+        .arg(&primary)
+        .args(["--pages"])
+        .arg(&primary)
+        .arg("1")
+        .arg(&secondary)
+        .arg("1")
+        .args(["--", "--qdf", "--static-id", "--no-original-object-ids"])
+        .arg(&flpdf_output)
+        .assert()
+        .success();
+
+    let qpdf_json = qpdf_acroform_json(&qpdf_output);
+    let flpdf_json = acroform_json(&flpdf_output);
+    assert_eq!(qpdf_json["acroform"]["hasacroform"], true);
+    assert_eq!(
+        flpdf_json["acroform"]["hasacroform"], qpdf_json["acroform"]["hasacroform"],
+        "flpdf must retain the primary AcroForm when qpdf leaves it present"
+    );
+    assert!(!acroform_has_fields_key(&qpdf_output));
+    assert_eq!(
+        acroform_has_fields_key(&flpdf_output),
+        acroform_has_fields_key(&qpdf_output),
+        "flpdf must not add an empty /Fields key when qpdf leaves it absent"
+    );
+}
+
+/// qpdf preserves an indirect original `/Fields` container when it installs
+/// the filtered field array (`QPDFJob.cc:2615-2618`).
+#[test]
+fn acroform_indirect_fields_array_stays_indirect_after_page_selection() {
+    if !qpdf_available() {
+        eprintln!("[SKIP cli_pages_acroform_qpdf] qpdf 11.9.0 is unavailable");
+        return;
+    }
+
+    let temp = tempfile::tempdir().expect("temporary directory");
+    let primary = temp.path().join("primary.pdf");
+    let secondary = temp.path().join("secondary.pdf");
+    std::fs::write(&primary, acroform_with_indirect_fields_array_pdf()).expect("write primary");
+    std::fs::write(&secondary, plain_page_pdf()).expect("write secondary");
+
+    let qpdf_output = temp.path().join("qpdf.pdf");
+    Shell::new(QPDF)
+        .arg(&primary)
+        .args(["--pages"])
+        .arg(&primary)
+        .arg("1")
+        .arg(&secondary)
+        .arg("1")
+        .args(["--", "--qdf", "--static-id", "--no-original-object-ids"])
+        .arg(&qpdf_output)
+        .assert()
+        .success();
+
+    let flpdf_output = temp.path().join("flpdf.pdf");
+    Command::cargo_bin("flpdf")
+        .unwrap()
+        .arg(&primary)
+        .args(["--pages"])
+        .arg(&primary)
+        .arg("1")
+        .arg(&secondary)
+        .arg("1")
+        .args(["--", "--qdf", "--static-id", "--no-original-object-ids"])
+        .arg(&flpdf_output)
+        .assert()
+        .success();
+
+    assert!(!acroform_fields_are_direct(&qpdf_output));
+    assert_eq!(
+        acroform_fields_are_direct(&flpdf_output),
+        acroform_fields_are_direct(&qpdf_output),
+        "flpdf must preserve qpdf's indirect /Fields replacement"
     );
 }
 
@@ -1666,4 +2207,71 @@ fn original_direct_widget_dropped_sibling_page_is_not_repaired() {
         None,
         "flpdf must not repair a direct widget's /P to its current owner"
     );
+}
+
+/// qpdf keeps the primary document's whole object-number space reserved while
+/// it imports the next page source, so the first object a foreign `ObjCopier`
+/// allocates lands at `primary_max + 1`. The QDF `%% Original object ID`
+/// comments are the visible record of that allocator ordering, so compare the
+/// full `--qdf` output rather than passing `--no-original-object-ids`, which is
+/// what the qpdf `copy-annotations` suite does and which would hide an
+/// allocator that starts one slot too high.
+#[test]
+fn foreign_source_allocator_identities_match_qpdf() {
+    if !qpdf_available() {
+        eprintln!("[SKIP cli_pages_acroform_qpdf] qpdf 11.9.0 is unavailable");
+        return;
+    }
+
+    let temp = tempfile::tempdir().expect("temporary directory");
+    let manifest = Path::new(env!("CARGO_MANIFEST_DIR"));
+    let primary = manifest.join("../../tests/fixtures/compat/three-page.pdf");
+
+    for foreign in [
+        FIXTURE,
+        NO_ACROFORM_FIXTURE,
+        "../../tests/fixtures/compat/form-fields-and-annotations.pdf",
+    ] {
+        let foreign = manifest.join(foreign);
+
+        let qpdf_output = temp.path().join("qpdf.pdf");
+        let qpdf_status = Shell::new(QPDF)
+            .args(["--static-id", "--qdf"])
+            .arg(&primary)
+            .arg("--pages")
+            .arg(".")
+            .arg(&foreign)
+            .arg("--")
+            .arg(&qpdf_output)
+            .status()
+            .expect("qpdf should spawn");
+        assert!(
+            qpdf_status.success(),
+            "qpdf --pages should succeed for {}",
+            foreign.display()
+        );
+
+        let flpdf_output = temp.path().join("flpdf.pdf");
+        Command::cargo_bin("flpdf")
+            .unwrap()
+            .env("FLPDF_STATIC_ID_QUIET", "1")
+            .args(["--static-id", "--qdf"])
+            .arg(&primary)
+            .arg("--pages")
+            .arg(".")
+            .arg(&foreign)
+            .arg("--")
+            .arg(&flpdf_output)
+            .assert()
+            .success();
+
+        let expected = std::fs::read(&qpdf_output).expect("read qpdf output");
+        let actual = std::fs::read(&flpdf_output).expect("read flpdf output");
+        assert_eq!(
+            actual,
+            expected,
+            "merged output must match qpdf byte for byte for {}",
+            foreign.display()
+        );
+    }
 }

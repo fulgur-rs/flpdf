@@ -76,6 +76,9 @@ fn resolve_rect_canonical(widget: &ObjectHandle) -> Result<Option<PageBox>> {
 /// `/BBox` is not a valid four-number rectangle, qpdf warns and aborts
 /// appearance generation entirely rather than falling back to `/Rect`
 /// (`QPDFFormFieldObjectHelper.cc:788-791`).
+/// A fresh stream's `/BBox` is `[0 0 rect_width rect_height]`, so the fallback
+/// below returns that normalized coordinate system rather than the Widget's
+/// absolute `/Rect` origin (`QPDFFormFieldObjectHelper.cc:778-782`).
 ///
 /// Verified against a real `qpdf 11.9.0 --generate-appearances` run: a
 /// widget with an existing `/AP/N` `/BBox [0 0 190 20]` and an enlarged
@@ -91,7 +94,15 @@ fn resolve_appearance_bbox_canonical<R: Read + Seek>(
     if let Some(stream_dict) = normal.as_stream_dict() {
         return resolve_rectangle_canonical(&stream_dict, b"/BBox");
     }
-    resolve_rect_canonical(widget)
+    let Some(rect) = resolve_rect_canonical(widget)? else {
+        return Ok(None);
+    };
+    Ok(Some(PageBox::new(
+        0.0,
+        0.0,
+        rect.urx - rect.llx,
+        rect.ury - rect.lly,
+    )))
 }
 
 /// Select `/AP/N`, including qpdf's `/AS` lookup when `/N` is a state
@@ -459,8 +470,8 @@ pub(crate) fn render_text_field_canonical_handles<R: Read + Seek>(
     let Some(rect) = resolve_appearance_bbox_canonical(pdf, &widget)? else {
         return Ok(None);
     };
-    let bbox_w = (rect.urx - rect.llx).abs();
-    let bbox_h = (rect.ury - rect.lly).abs();
+    let bbox_w = rect.urx - rect.llx;
+    let bbox_h = rect.ury - rect.lly;
     // qpdf's QPDFObjectHandle::isRectangle validates only that all four
     // entries are numbers (`QPDFObjectHandle.cc:788-800`). It does not impose
     // a positive or minimum width/height before generateTextAppearance builds
@@ -492,8 +503,7 @@ pub(crate) fn render_text_field_canonical_handles<R: Read + Seek>(
         default_appearance.as_bytes(),
         &encode_appearance_text(&value, encoding),
         &[],
-        bbox_w,
-        bbox_h,
+        rect,
         font_size,
         true,
     );
@@ -515,8 +525,8 @@ pub(crate) fn render_choice_field_canonical_handles<R: Read + Seek>(
     let Some(rect) = resolve_appearance_bbox_canonical(pdf, &widget)? else {
         return Ok(None);
     };
-    let bbox_w = (rect.urx - rect.llx).abs();
-    let bbox_h = (rect.ury - rect.lly).abs();
+    let bbox_w = rect.urx - rect.llx;
+    let bbox_h = rect.ury - rect.lly;
     // Keep qpdf's numeric-rectangle contract: a finite subunit or zero-sized
     // rectangle still reaches the ValueSetter/content builder.
     if !bbox_w.is_finite() || !bbox_h.is_finite() {
@@ -572,8 +582,7 @@ pub(crate) fn render_choice_field_canonical_handles<R: Read + Seek>(
             .iter()
             .map(|option| encode_appearance_text(option, encoding))
             .collect::<Vec<_>>(),
-        bbox_w,
-        bbox_h,
+        rect,
         font_size,
         flags & 0x20000 != 0,
     );
@@ -672,12 +681,13 @@ fn build_qpdf_choice_appearance_content(
     default_appearance: &[u8],
     value: &[u8],
     options: &[Vec<u8>],
-    bbox_w: f64,
-    bbox_h: f64,
+    bbox: PageBox,
     font_size: f64,
     is_combo: bool,
 ) -> Vec<u8> {
     let tfh = 1.2 * font_size;
+    let bbox_w = bbox.urx - bbox.llx;
+    let bbox_h = bbox.ury - bbox.lly;
     // `bbox_h` and `font_size` are attacker-controlled (`/Rect`, `/DA`): for
     // a small font_size and/or a huge bbox_h, `bbox_h / tfh` can exceed
     // `usize::MAX` as an f64, and `as usize` saturates rather than
@@ -723,11 +733,17 @@ fn build_qpdf_choice_appearance_content(
     let mut out = Vec::new();
     out.extend_from_slice(b"/Tx BMC\n");
     let line_count = lines.len() as f64;
-    let mut y = bbox_h - ((bbox_h - (line_count * tfh)) / 2.0);
+    // Keep qpdf's absolute coordinate system for existing appearance streams:
+    // `ValueSetter` centers against `/BBox`'s `ury` and `lly`, then adds `lly`
+    // to the rectangle/text placement (`QPDFFormFieldObjectHelper.cc:623-647`).
+    let mut y = bbox.ury - ((bbox_h - (line_count * tfh)) / 2.0);
     if highlight {
         out.extend_from_slice(b"q\n0.85 0.85 0.85 rg\n");
-        out.extend_from_slice(b"0 ");
-        out.extend_from_slice(fmt_f64(y - tfh * (highlight_index as f64 + 1.0)).as_bytes());
+        out.extend_from_slice(fmt_f64(bbox.llx).as_bytes());
+        out.push(b' ');
+        out.extend_from_slice(
+            fmt_f64(bbox.lly + y - tfh * (highlight_index as f64 + 1.0)).as_bytes(),
+        );
         out.push(b' ');
         out.extend_from_slice(fmt_f64(bbox_w).as_bytes());
         out.push(b' ');
@@ -740,8 +756,9 @@ fn build_qpdf_choice_appearance_content(
     out.push(b'\n');
     for (index, line) in lines.iter().enumerate() {
         if index == 0 {
-            out.extend_from_slice(b"1 ");
-            out.extend_from_slice(fmt_f64(y).as_bytes());
+            out.extend_from_slice(fmt_f64(bbox.llx + 1.0).as_bytes());
+            out.push(b' ');
+            out.extend_from_slice(fmt_f64(bbox.lly + y).as_bytes());
             out.extend_from_slice(b" Td\n");
         } else {
             out.extend_from_slice(b"0 ");
@@ -821,6 +838,15 @@ mod tests {
             "<< /Type /Pages /Kids [3 0 R] /Count 1 >>".to_string(),
             "<< /Type /Page /Parent 2 0 R /MediaBox [0 0 612 792] /Annots [4 0 R] >>".to_string(),
             "<< /Type /Annot /Subtype /Widget /FT /Tx /V (Hello) /Rect [10 10 200 30] >>".to_string(),
+        ])
+    }
+
+    fn tx_without_rect_pdf() -> Vec<u8> {
+        pdf_with_objects(&[
+            "<< /Type /Catalog /Pages 2 0 R /AcroForm << /Fields [4 0 R] /DR <<>> /DA (/Helv 12 Tf 0 g) >> >>".to_string(),
+            "<< /Type /Pages /Kids [3 0 R] /Count 1 >>".to_string(),
+            "<< /Type /Page /Parent 2 0 R /MediaBox [0 0 612 792] /Annots [4 0 R] >>".to_string(),
+            "<< /Type /Annot /Subtype /Widget /FT /Tx /V (Hello) >>".to_string(),
         ])
     }
 
@@ -1028,6 +1054,16 @@ mod tests {
         assert_eq!(reference, ObjectRef::new(5, 0));
     }
 
+    #[test]
+    fn canonical_tx_without_rect_skips_appearance_generation() {
+        let mut pdf = Pdf::open(Cursor::new(tx_without_rect_pdf())).expect("parse missing Rect");
+        assert!(
+            render_text_field_canonical(&mut pdf, ObjectRef::new(4, 0), ObjectRef::new(4, 0))
+                .expect("generation with missing Rect")
+                .is_none()
+        );
+    }
+
     fn state_appearance_pdf() -> Vec<u8> {
         pdf_with_objects(&[
             "<< /Type /Catalog /Pages 2 0 R /AcroForm << /Fields [4 0 R] /DR <<>> /DA (/Helv 12 Tf 0 g) >> >>".to_string(),
@@ -1060,8 +1096,7 @@ mod tests {
             b"/Helv 10 Tf 0 g",
             b"B",
             &[b"A".to_vec(), b"B".to_vec(), b"C".to_vec()],
-            100.0,
-            36.0,
+            PageBox::new(0.0, 0.0, 100.0, 36.0),
             10.0,
             false,
         );
