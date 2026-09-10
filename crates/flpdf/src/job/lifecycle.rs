@@ -1439,6 +1439,12 @@ pub struct QPDFJob {
     /// Overlay and underlay donors retained through the write boundary for
     /// the same deferred foreign-stream contract.
     overlay_sources: Vec<OverlaySpec<Box<dyn ReadSeek>>>,
+    /// Encryption captured from an encrypted primary before a multi-source
+    /// page merge replaces it with a fresh target. qpdf's writer preserves
+    /// that primary encryption after `createQPDF` has built the merged
+    /// document, so keep the authenticated snapshot on the job until
+    /// `write_qpdf` (`QPDFJob.cc:2891-2920`).
+    primary_copy_encryption: Option<crate::CopyEncryptionSource>,
     /// qpdf's status bits consumed by the side-effect-free exit-code query.
     encryption_status: EncryptionStatus,
     /// Whether this job created its primary document through
@@ -1546,6 +1552,7 @@ impl QPDFJob {
             configuration: qpdf_default_job_configuration(),
             page_source_documents: Vec::new(),
             overlay_sources: Vec::new(),
+            primary_copy_encryption: None,
             encryption_status: EncryptionStatus::default(),
             empty_primary_created: false,
             partial_json_initialized: false,
@@ -2805,6 +2812,7 @@ impl QPDFJob {
         // document's version/extension state before operation dispatch
         // (`QPDFJob.cc:429-480,1696-1716`).
         pdf.root_handle()?;
+        self.update_writer_version_floor(&mut pdf)?;
         self.record_document_warnings(&pdf);
         Ok(pdf)
     }
@@ -2893,6 +2901,7 @@ impl QPDFJob {
     fn finish_created_document(&mut self, mut pdf: JobDocument) -> Result<JobDocument> {
         self.page_source_documents.clear();
         self.overlay_sources.clear();
+        self.primary_copy_encryption = None;
         self.encryption_status = EncryptionStatus {
             encrypted: pdf.is_encrypted(),
             password_incorrect: false,
@@ -2982,7 +2991,13 @@ impl QPDFJob {
         self.report_page_spec_selection(&specs)?;
         for (path, password) in source_paths.iter().zip(source_passwords.iter()) {
             self.report_page_source_processing(path_description_bytes(path))?;
-            let source = self.open_job_source(path, password.as_deref().unwrap_or_default())?;
+            let mut source = self.open_job_source(path, password.as_deref().unwrap_or_default())?;
+            // qpdf's doProcess marks every page source as an input document,
+            // so its version contributes to max_input_version before the
+            // writer stage. The copy-encryption donor is opened separately
+            // with used_for_input=false and is intentionally not updated here
+            // (`QPDFJob.cc:2396-2428,2891-2899`).
+            self.update_writer_version_floor(&mut source)?;
             self.record_document_warnings(&source);
             if !keep_files_open {
                 // qpdf calls ClosedFileInputSource::stayOpen(false)
@@ -2992,6 +3007,18 @@ impl QPDFJob {
             }
             page_sources.push(source);
         }
+
+        // qpdf's page-operation target is fresh when more than one distinct
+        // source participates. In that case the target no longer carries the
+        // primary's `/Encrypt` state, but `writeQPDF` still preserves the
+        // authenticated primary encryption unless a writer option disables
+        // it. Snapshot the source while the primary document is still live;
+        // the later writer stage owns the precedence decision.
+        let primary_copy_encryption = if page_sources.len() > 1 {
+            page_sources[0].writer_copy_encryption_source()?
+        } else {
+            None
+        };
 
         if page_sources.len() == 1 && specs.iter().all(|spec| spec.source_index == 0) {
             {
@@ -3043,6 +3070,7 @@ impl QPDFJob {
                 // this variant, so the source owners can be transferred to
                 // the job before the merged document is returned.
                 self.page_source_documents = page_sources;
+                self.primary_copy_encryption = primary_copy_encryption;
                 *merged
             }
             PageSpecJobOutput::InPlace { .. } => {
@@ -3198,6 +3226,19 @@ impl QPDFJob {
                 }
             }
         }
+        let splitting = self.configuration.split_pages.is_some_and(|size| size != 0);
+        if self.configuration.copy_encryption.is_none()
+            && !pdf.is_encrypted()
+            && !splitting
+            && writer_configuration.can_preserve_encryption()
+        {
+            if let Some(source) = self.primary_copy_encryption.take() {
+                // The explicit donor above wins when configured. This branch
+                // is qpdf's implicit primary-encryption preservation for a
+                // fresh multi-source page-operation target.
+                writer_configuration.copy_encryption_parameters(source);
+            }
+        }
         let auto_password_notices = match writer_configuration
             .normalize_encryption_passwords(self.configuration.password_mode)
         {
@@ -3244,7 +3285,6 @@ impl QPDFJob {
             writer_configuration.set_linearization_pass1_filename(path.to_path_buf());
         }
         let progress_requested = self.configuration.progress;
-        let splitting = self.configuration.split_pages.is_some_and(|size| size != 0);
         let write_result: Result<()> =
             if let Some(split_pages) = self.configuration.split_pages.filter(|size| *size != 0) {
                 // Keep the signed qpdf value until the split implementation has
@@ -4823,6 +4863,26 @@ pub(crate) fn qpdf_file_io_source_message(source: &std::io::Error) -> String {
 }
 
 impl QPDFJobConfig<'_> {
+    /// Configure qpdf's copy-encryption donor and the password used when it
+    /// is opened during the write stage.
+    ///
+    /// `QPDFJob::Config::copyEncryption` stores the donor filename and clears
+    /// explicit encryption/decryption state; `writeQPDF` opens the donor only
+    /// after `createQPDF` has completed (`QPDFJob.cc:2891-2899`). Keeping the
+    /// filename on the job is also required by `handlePageSpecs`, which reuses
+    /// `encryptionFilePassword` for a page specification with the same raw
+    /// filename and no explicit password (`QPDFJob.cc:2405-2410`).
+    pub fn copy_encryption(
+        &mut self,
+        path: impl Into<PathBuf>,
+        password: impl Into<Vec<u8>>,
+    ) -> &mut Self {
+        self.job.configuration.copy_encryption = Some(path.into());
+        self.job.configuration.encryption_file_password = password.into();
+        self.job.configuration.writer.clear_encryption_parameters();
+        self
+    }
+
     /// Set the primary input filename, rejecting duplicate input selection.
     pub fn input_file(&mut self, input_file: impl Into<PathBuf>) -> Result<&mut Self> {
         self.job.set_input_file(input_file)?;

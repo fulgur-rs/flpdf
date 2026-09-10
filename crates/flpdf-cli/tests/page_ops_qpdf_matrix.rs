@@ -3583,3 +3583,101 @@ fn pages_allow_weak_crypto_permits_rc4_like_qpdf() {
         .success();
     assert_qpdf_encrypted_output(&flpdf_output, "user");
 }
+
+/// qpdf applies a V=2/R=3 RC4 donor after the page-selection pipeline. The
+/// merge-and-split qtest uses this exact donor shape (`20-pages.pdf`), so the
+/// page-operation route must not reject or silently discard the copied
+/// encryption parameters.
+#[test]
+fn pages_copy_encryption_v2_donor_matches_qpdf() {
+    if !qpdf_available() {
+        eprintln!("[SKIP page_ops_qpdf_matrix] qpdf 11.9.0 is unavailable");
+        return;
+    }
+
+    let temp = tempfile::tempdir().expect("temporary directory");
+    let source = fixture_abs(THREE_PAGE);
+    let donor = temp.path().join("donor-v2.pdf");
+    let donor_result = Shell::new(QPDF)
+        .args([
+            "--static-id",
+            "--allow-weak-crypto",
+            "--encrypt",
+            "user",
+            "owner",
+            "128",
+            "--",
+            source.to_str().unwrap(),
+            donor.to_str().unwrap(),
+        ])
+        .output()
+        .expect("qpdf should spawn");
+    assert!(
+        donor_result.status.success(),
+        "qpdf should create the V=2 donor: {}",
+        String::from_utf8_lossy(&donor_result.stderr)
+    );
+
+    let copy_option = format!("--copy-encryption={}", donor.display());
+    let qpdf_output = temp.path().join("qpdf.pdf");
+    let qpdf = Shell::new(QPDF)
+        .args([
+            "--empty",
+            qpdf_output.to_str().unwrap(),
+            copy_option.as_str(),
+            "--allow-weak-crypto",
+            "--encryption-file-password=user",
+            "--pages",
+            donor.to_str().unwrap(),
+            "1,z",
+            "--",
+            "--static-id",
+        ])
+        .output()
+        .expect("qpdf should spawn");
+    assert!(
+        qpdf.status.success(),
+        "qpdf should copy V=2 encryption after --pages: {}",
+        String::from_utf8_lossy(&qpdf.stderr)
+    );
+
+    let flpdf_output = temp.path().join("flpdf.pdf");
+    let flpdf = Command::cargo_bin("flpdf")
+        .unwrap()
+        .args([
+            "--empty",
+            flpdf_output.to_str().unwrap(),
+            copy_option.as_str(),
+            "--allow-weak-crypto",
+            "--encryption-file-password=user",
+            "--pages",
+            donor.to_str().unwrap(),
+            "1,z",
+            "--",
+            "--static-id",
+        ])
+        .output()
+        .expect("flpdf should spawn");
+    assert_eq!(
+        flpdf.status.code(),
+        Some(0),
+        "flpdf should copy V=2 encryption after --pages: {}",
+        String::from_utf8_lossy(&flpdf.stderr)
+    );
+    assert_qpdf_encrypted_output(&flpdf_output, "user");
+
+    let qpdf_encryption = Shell::new(QPDF)
+        .args([
+            "--password=user",
+            "--show-encryption",
+            qpdf_output.to_str().unwrap(),
+        ])
+        .output()
+        .expect("qpdf should inspect the copied output");
+    assert!(qpdf_encryption.status.success());
+    assert!(
+        String::from_utf8_lossy(&qpdf_encryption.stdout).contains("R = 3"),
+        "qpdf donor output must remain V=2/R=3: {}",
+        String::from_utf8_lossy(&qpdf_encryption.stdout)
+    );
+}

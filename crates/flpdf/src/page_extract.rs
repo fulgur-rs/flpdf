@@ -286,6 +286,7 @@ pub(crate) fn append_selection_kids<RT: Read + Seek>(
     used: &mut BTreeSet<ObjectRef>,
     kids: &mut Vec<ObjectRef>,
     writer_object_order: &mut BTreeMap<ObjectRef, WriterObjectOrderKey>,
+    next_foreign_original: &mut u32,
 ) -> Result<()> {
     for &src_ref in selected {
         let copied_page_ref = *map
@@ -306,7 +307,14 @@ pub(crate) fn append_selection_kids<RT: Read + Seek>(
             // copyForeignObject allocations. It therefore belongs to the
             // same destination-order group as those imported objects, not the
             // fresh-object fallback after them.
-            writer_object_order.insert(clone_ref, WriterObjectOrderKey::foreign(clone_ref));
+            let original_ref = ObjectRef::new(*next_foreign_original, 0);
+            *next_foreign_original = next_foreign_original.checked_add(1).ok_or_else(|| {
+                Error::Unsupported("foreign QDF object identity overflows u32".to_owned())
+            })?;
+            writer_object_order.insert(
+                clone_ref,
+                WriterObjectOrderKey::foreign_with_original(clone_ref, original_ref),
+            );
             clone_ref
         };
         kids.push(kid);

@@ -1489,6 +1489,7 @@ fn merge_documents_with_resource_decisions_and_preserve_primary_into_impl<
             &mut used,
             &mut kids,
             &mut writer_object_order,
+            &mut next_foreign_original,
         )?; // cov:ignore: malformed page-copy map errors propagate at this boundary
 
         // QPDF::copyForeignObject keeps the per-source ObjCopier alive after

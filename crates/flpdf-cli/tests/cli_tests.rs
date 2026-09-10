@@ -7824,7 +7824,7 @@ fn pages_cross_document_merge_is_supported() {
 }
 
 #[test]
-fn empty_flag_is_rejected_actionably() {
+fn empty_flag_rejects_a_second_input_like_qpdf() {
     let temp = tempfile::tempdir().unwrap();
     let output = temp.path().join("out.pdf");
 
@@ -7836,8 +7836,9 @@ fn empty_flag_is_rejected_actionably() {
         .arg(&output)
         .assert()
         .failure()
-        .stderr(predicate::str::contains("--empty"))
-        .stderr(predicate::str::contains("not implemented"));
+        .stderr(predicate::str::contains(
+            "empty input can't be used since input file has already been given",
+        ));
 }
 
 #[test]

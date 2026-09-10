@@ -411,6 +411,31 @@ impl WriterConfiguration {
         self.settings.encryption_parameters.as_ref()
     }
 
+    /// Whether qpdf can preserve source encryption at the writer boundary.
+    ///
+    /// This is the setting-only half of `QPDFWriter::doWriteSetup`: the
+    /// attached document is checked separately by the writer, while qdf,
+    /// content normalization, decoding, PCLm, and explicit encryption all
+    /// disable implicit source preservation (`QPDFWriter.cc:1980-2048`). A
+    /// `QPDFJob` uses this predicate when a multi-source page operation has
+    /// replaced the encrypted primary with a fresh target and must carry the
+    /// primary's encryption snapshot to `writeQPDF`.
+    pub(crate) fn can_preserve_encryption(&self) -> bool {
+        let mut options = self.settings.to_write_options();
+        if self.settings.linearization {
+            // qpdf clears QDF before selecting its linearized writer
+            // (`QPDFWriter.cc:2036-2038`).
+            options.qdf = false;
+        }
+        self.settings.preserve_encryption
+            && self.settings.encryption_parameters.is_none()
+            && self.settings.copy_encryption.is_none()
+            && !options.qdf
+            && !options.content_normalization
+            && options.decode_level == DecodeLevel::None
+            && !self.settings.pclm
+    }
+
     /// Apply qpdf's `QPDFJob::maybeFixWritePassword` policy to configured
     /// encryption passwords before a writer emits its encryption dictionary.
     ///
@@ -4887,13 +4912,17 @@ fn emit_canonical_pdf_inner<R: Read + Seek, W: Write>(
         // 11.9.0 --qdf output.  Suppressed when no_original_object_ids=true.
         // The xref offset below is recorded AFTER the comment so it still
         // points at the "N G obj" line, not at the comment.
-        // The comment records the ORIGINAL object id (qpdf prints the pre-
-        // renumber number here), so use `old_ref`.
+        // The comment records the object identity held by qpdf before writer
+        // renumbering. Fresh merge targets keep that identity in the
+        // qpdf-shaped writer-order map: source objects use their source
+        // ObjGen, while shallow page clones and foreign copies use the
+        // destination allocator's identity (`QPDFWriter.cc:1761-1788`).
         if options.qdf && !options.no_original_object_ids {
+            let original_ref = pdf.writer_original_object_ref(*old_ref);
             bytes.extend_from_slice(
                 format!(
                     "%% Original object ID: {} {}\n",
-                    old_ref.number, old_ref.generation
+                    original_ref.number, original_ref.generation
                 )
                 .as_bytes(),
             );

@@ -117,6 +117,61 @@ fn top_level_remove_page_labels_removes_catalog_key() {
 }
 
 #[test]
+fn pages_remove_page_labels_runs_after_page_selection() {
+    if !qpdf_available() {
+        eprintln!("[SKIP cli_page_labels_transform] qpdf 11.9.0 is unavailable");
+        return;
+    }
+    let tempdir = tempfile::tempdir().expect("temporary directory");
+    let input = fixture("compat/one-page.pdf");
+    let labeled = tempdir.path().join("labeled.pdf");
+    let qpdf_output = tempdir.path().join("qpdf-pages.pdf");
+    let flpdf_output = tempdir.path().join("flpdf-pages.pdf");
+
+    let qpdf = run_qpdf(&[
+        &input,
+        &labeled,
+        Path::new("--set-page-labels"),
+        Path::new("1:a"),
+        Path::new("--"),
+    ]);
+    assert!(qpdf.status.success());
+
+    let qpdf = run_qpdf(&[
+        &labeled,
+        Path::new("--remove-page-labels"),
+        Path::new("--pages"),
+        Path::new("."),
+        Path::new("1"),
+        Path::new("--"),
+        &qpdf_output,
+    ]);
+    assert!(
+        qpdf.status.success(),
+        "qpdf page selection with label removal failed: {}",
+        String::from_utf8_lossy(&qpdf.stderr)
+    );
+
+    let flpdf = Command::cargo_bin("flpdf")
+        .expect("flpdf binary")
+        .arg(&labeled)
+        .arg("--remove-page-labels")
+        .args(["--pages", ".", "1", "--"])
+        .arg(&flpdf_output)
+        .output()
+        .expect("run flpdf");
+    assert_eq!(
+        flpdf.status.code(),
+        Some(0),
+        "flpdf page selection with label removal failed: {}",
+        String::from_utf8_lossy(&flpdf.stderr)
+    );
+
+    assert!(!show_catalog(&qpdf_output).contains("/PageLabels"));
+    assert!(!show_catalog(&flpdf_output).contains("/PageLabels"));
+}
+
+#[test]
 fn native_rewrite_uses_the_same_canonical_page_label_consumer() {
     if !qpdf_available() {
         eprintln!("[SKIP cli_page_labels_transform] qpdf 11.9.0 is unavailable");

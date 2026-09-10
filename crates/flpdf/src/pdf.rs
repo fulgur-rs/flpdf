@@ -36,6 +36,7 @@ impl WriterObjectOrderKey {
         }
     }
 
+    #[cfg(test)]
     pub(crate) const fn foreign(object_ref: ObjectRef) -> Self {
         Self {
             group: 1,
