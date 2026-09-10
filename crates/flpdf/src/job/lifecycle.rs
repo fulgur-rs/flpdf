@@ -11,7 +11,7 @@ use super::attachments::AttachmentCopyOptions;
 use super::image_optimization::{optimize_images, ImageOptimizationOptions};
 use super::json::{JsonJobError, JsonJobOptions, JsonJobOutput, JsonStreamData};
 use super::overlay::{
-    apply_overlay_specs, overlay_verbose_report, OverlayKind, OverlaySpec, OverlayVerbosePage,
+    handle_under_overlay, overlay_verbose_report, OverlayKind, OverlaySpec, OverlayVerbosePage,
 };
 use super::page_range::PageRange;
 use super::page_specs::{PageSpecInput, PageSpecJobOutput};
@@ -704,7 +704,7 @@ fn job_json_range_with_empty_default(
         });
     }
     let value = String::from_utf8_lossy(&bytes);
-    PageRange::parse(&value)
+    PageRange::parse_numrange(&value)
         .map_err(|error| Error::Usage(UsageError::new(format!("{path}: {error}"))))
 }
 
@@ -3593,7 +3593,7 @@ impl QPDFJob {
             let report = overlay_verbose_report(pdf, &mut overlay_specs)?;
             self.report_overlay_progress(&report, configuration)?;
         }
-        apply_overlay_specs(pdf, &mut overlay_specs)?;
+        handle_under_overlay(pdf, &mut overlay_specs)?;
         self.overlay_sources = overlay_specs;
 
         // qpdf's `handleTransformations` applies `removeRestrictions` after
@@ -5121,7 +5121,7 @@ impl QPDFJobConfig<'_> {
         let range = if range.is_empty() {
             PageRange::all()
         } else {
-            PageRange::parse(range)
+            PageRange::parse_numrange(range)
                 .map_err(|error| Error::Usage(UsageError::new(error.to_string())))?
         };
         self.job.configuration.page_specs_origin = PageSpecsOrigin::Config;

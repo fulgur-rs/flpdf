@@ -180,14 +180,13 @@ pub use filespec_helper::{
 pub use form_field_object_helper::FormFieldObjectHelper;
 #[allow(deprecated)]
 pub use job::{
-    add_attachment_from_path, apply_overlay_specs, ascii_filename_fallback,
-    copy_duplicate_page_annotations, extract_attachment, extract_attachment_to_path,
-    format_attachment_list_with_sink, merge_documents, overlay_verbose_report,
-    parse_rotation_parameter, prune_acroform_after_subset,
-    prune_acroform_after_subset_with_max_depth, write_attachment, AttachmentInfo, CombinedPage,
-    CombinedPlan, Endpoint, InputSpec, MergeInput, OverlayKind, OverlaySpec, OverlayVerbosePage,
-    OverlayVerboseSource, PagePlan, PageRange, PageRangeEntry, PageSpecJobOutput, Parity,
-    RotateMode, RotateOp, RotationParameter, RotationSpec, SelectedPage,
+    add_attachment_from_path, ascii_filename_fallback, copy_duplicate_page_annotations,
+    extract_attachment, extract_attachment_to_path, format_attachment_list_with_sink,
+    handle_under_overlay, merge_documents, overlay_verbose_report, parse_rotation_parameter,
+    prune_acroform_after_subset, prune_acroform_after_subset_with_max_depth, write_attachment,
+    AttachmentInfo, CombinedPage, CombinedPlan, Endpoint, InputSpec, MergeInput, OverlayKind,
+    OverlaySpec, OverlayVerbosePage, OverlayVerboseSource, PagePlan, PageRange, PageRangeEntry,
+    PageSpecJobOutput, Parity, RotateMode, RotateOp, RotationParameter, RotationSpec, SelectedPage,
     DEFAULT_MAX_ACROFORM_DEPTH,
 };
 pub use job::{

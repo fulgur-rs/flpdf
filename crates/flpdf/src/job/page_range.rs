@@ -20,7 +20,7 @@
 //!   `:odd` keeps positions 1, 3, 5, … (1-based); `:even` keeps positions 2,
 //!   4, 6, …. They are not based on the original page numbers. Example:
 //!   `2-8:even` → `[3,5,7]`.
-//! - `PageRange::parse` validates syntax with qpdf's `max == 0` mode; an empty
+//! - `PageRange::parse_numrange` validates syntax with qpdf's `max == 0` mode; an empty
 //!   expression therefore selects no pages.
 //! - `PageRange::all` represents qpdf's page-spec default `1-z`.
 //! - Multiple entries are concatenated; the final resolved list preserves
@@ -72,7 +72,7 @@ pub struct PageRangeEntry {
 
 /// A qpdf page-range expression, ready to be resolved against a page count.
 ///
-/// Constructed via [`PageRange::parse`].
+/// Constructed via [`PageRange::parse_numrange`].
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct PageRange {
     /// The original qpdf range expression, retained so parse and resolve both
@@ -91,7 +91,7 @@ impl PageRange {
     ///
     /// - The qpdf-compatible range error returned by
     ///   [`crate::qutil::parse_numrange`] when syntax is invalid.
-    pub fn parse(input: &str) -> Result<Self> {
+    pub fn parse_numrange(input: &str) -> Result<Self> {
         crate::qutil::parse_numrange(input.as_bytes(), 0)?;
         Ok(Self {
             raw: input.as_bytes().to_vec(),
@@ -113,7 +113,7 @@ impl PageRange {
     /// Construct a range that selects **no** pages.
     ///
     /// This corresponds to an explicitly empty overlay/underlay range. It is
-    /// equivalent to [`PageRange::parse`] with an empty string; qpdf's omitted
+    /// equivalent to [`PageRange::parse_numrange`] with an empty string; qpdf's omitted
     /// page-spec default is represented separately by [`PageRange::all`].
     pub fn empty() -> Self {
         Self { raw: Vec::new() }
@@ -160,17 +160,17 @@ mod tests {
     fn parse_accepts_qpdf_syntax_only_values() {
         // QPDFJob validates a page range with QUtil::parse_numrange(..., 0),
         // so numeric bounds are intentionally deferred until resolve.
-        assert!(PageRange::parse("0").is_ok());
-        assert!(PageRange::parse("r0").is_ok());
-        assert!(PageRange::parse("99").is_ok());
-        assert!(PageRange::parse(":odd").is_ok());
+        assert!(PageRange::parse_numrange("0").is_ok());
+        assert!(PageRange::parse_numrange("r0").is_ok());
+        assert!(PageRange::parse_numrange("99").is_ok());
+        assert!(PageRange::parse_numrange(":odd").is_ok());
     }
 
     #[test]
     fn parse_rejects_only_qpdf_invalid_syntax() {
         for input in ["1-", "-1", "1,,2", "1,2,", "1-9:foo", "abc", "r"] {
             assert!(
-                PageRange::parse(input).is_err(),
+                PageRange::parse_numrange(input).is_err(),
                 "{input:?} must be invalid"
             );
         }
@@ -178,7 +178,7 @@ mod tests {
 
     #[test]
     fn resolve_preserves_qpdf_numeric_range_error_bytes() {
-        let range = PageRange::parse("0").expect("qpdf syntax-only parse accepts zero");
+        let range = PageRange::parse_numrange("0").expect("qpdf syntax-only parse accepts zero");
         let error = range
             .resolve(3)
             .expect_err("zero is out of range for three pages");
@@ -187,7 +187,7 @@ mod tests {
             Some(b"error at * in numeric range *0: number 0 out of range".as_slice())
         );
 
-        let range = PageRange::parse("r0").expect("qpdf syntax-only parse accepts r0");
+        let range = PageRange::parse_numrange("r0").expect("qpdf syntax-only parse accepts r0");
         let error = range
             .resolve(3)
             .expect_err("r0 resolves beyond the last page");
@@ -199,7 +199,7 @@ mod tests {
 
     #[test]
     fn parse_empty_is_the_qpdf_empty_selection() {
-        let range = PageRange::parse("").expect("empty qpdf range is valid syntax");
+        let range = PageRange::parse_numrange("").expect("empty qpdf range is valid syntax");
         assert_eq!(range.resolve(3).unwrap(), Vec::<u32>::new());
     }
 
@@ -208,7 +208,7 @@ mod tests {
     // -----------------------------------------------------------------------
 
     fn resolve(input: &str, page_count: u32) -> Vec<u32> {
-        PageRange::parse(input)
+        PageRange::parse_numrange(input)
             .and_then(|pr| pr.resolve(page_count))
             .unwrap_or_else(|e| {
                 panic!("expected Ok for {input:?} with {page_count} pages, got: {e}")
@@ -216,7 +216,7 @@ mod tests {
     }
 
     fn resolve_err(input: &str, page_count: u32) -> String {
-        let pr = PageRange::parse(input).expect("parse should succeed");
+        let pr = PageRange::parse_numrange(input).expect("parse should succeed");
         pr.resolve(page_count)
             .err()
             .unwrap_or_else(|| panic!("expected Err for {input:?} with {page_count} pages"))
@@ -234,7 +234,7 @@ mod tests {
         // omitted page-spec default is represented by `PageRange::all()`.
         let none = PageRange::empty();
         assert_eq!(none.resolve(5).unwrap(), Vec::<u32>::new());
-        assert_eq!(none, PageRange::parse("").unwrap());
+        assert_eq!(none, PageRange::parse_numrange("").unwrap());
         assert_ne!(none, PageRange::all());
     }
 
@@ -350,7 +350,7 @@ mod tests {
 
     #[test]
     fn exclusion_group_may_not_be_the_first_group() {
-        let message = PageRange::parse("x2").unwrap_err().to_string();
+        let message = PageRange::parse_numrange("x2").unwrap_err().to_string();
         assert!(
             message.contains("first") || message.contains("exclusion"),
             "got: {message}"
@@ -371,7 +371,7 @@ mod tests {
 
     #[test]
     fn page_count_zero_is_error() {
-        let pr = PageRange::parse("1").unwrap();
+        let pr = PageRange::parse_numrange("1").unwrap();
         let err = pr.resolve(0).unwrap_err().to_string();
         assert!(err.contains("page_count must be at least 1"), "got: {err}");
     }

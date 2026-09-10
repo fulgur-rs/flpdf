@@ -36,7 +36,7 @@
 //!
 //! let mut a = Pdf::open(BufReader::new(File::open("a.pdf")?))?;
 //! let mut b = Pdf::open(BufReader::new(File::open("b.pdf")?))?;
-//! let range_a = PageRange::parse("1-5")?;
+//! let range_a = PageRange::parse_numrange("1-5")?;
 //! let range_b = PageRange::all();
 //!
 //! let plan = CombinedPlan::build(vec![
@@ -374,8 +374,8 @@ mod tests {
         let mut pdf_a = open(build_n_page_pdf(3)); // pages: obj 3,4,5
         let mut pdf_b = open(build_n_page_pdf(2)); // pages: obj 3,4
 
-        let range_a = PageRange::parse("1-3").unwrap();
-        let range_b = PageRange::parse("1-2").unwrap();
+        let range_a = PageRange::parse_numrange("1-3").unwrap();
+        let range_b = PageRange::parse_numrange("1-2").unwrap();
         let plan = CombinedPlan::build(vec![(&mut pdf_a, range_a), (&mut pdf_b, range_b)]).unwrap();
 
         assert_eq!(plan.input_count(), 2);
@@ -396,7 +396,7 @@ mod tests {
         let mut pdf_a = open(build_n_page_pdf(4));
         let mut pdf_b = open(build_n_page_pdf(2));
 
-        let range_a = PageRange::parse("2,4").unwrap();
+        let range_a = PageRange::parse_numrange("2,4").unwrap();
         let range_b = PageRange::all();
         let plan = CombinedPlan::build(vec![(&mut pdf_a, range_a), (&mut pdf_b, range_b)]).unwrap();
 
@@ -424,7 +424,7 @@ mod tests {
     fn single_input_with_range_subset() {
         // Input has 5 pages, range selects "2,4"
         let mut pdf = open(build_n_page_pdf(5));
-        let range = PageRange::parse("2,4").unwrap();
+        let range = PageRange::parse_numrange("2,4").unwrap();
         let plan = CombinedPlan::build(vec![(&mut pdf, range)]).unwrap();
 
         assert_eq!(plan.total_page_count(), 2);
@@ -444,7 +444,7 @@ mod tests {
 
         let plan = CombinedPlan::build(vec![
             (&mut pdf_a, PageRange::all()),
-            (&mut pdf_b, PageRange::parse("1,3").unwrap()),
+            (&mut pdf_b, PageRange::parse_numrange("1,3").unwrap()),
             (&mut pdf_c, PageRange::all()),
         ])
         .unwrap();
@@ -471,8 +471,8 @@ mod tests {
         let mut pdf_b = open(build_n_page_pdf(2));
 
         let plan = CombinedPlan::build(vec![
-            (&mut pdf_a, PageRange::parse("1,3").unwrap()),
-            (&mut pdf_b, PageRange::parse("2").unwrap()),
+            (&mut pdf_a, PageRange::parse_numrange("1,3").unwrap()),
+            (&mut pdf_b, PageRange::parse_numrange("2").unwrap()),
         ])
         .unwrap();
 
@@ -508,8 +508,8 @@ mod tests {
         let mut pdf_b = open(build_n_page_pdf(2));
 
         let err = CombinedPlan::build(vec![
-            (&mut pdf_a, PageRange::parse("1").unwrap()),
-            (&mut pdf_b, PageRange::parse("5").unwrap()), // 5 > 2
+            (&mut pdf_a, PageRange::parse_numrange("1").unwrap()),
+            (&mut pdf_b, PageRange::parse_numrange("5").unwrap()), // 5 > 2
         ])
         .unwrap_err();
 
@@ -529,7 +529,7 @@ mod tests {
         let mut pdf_a = open(build_n_page_pdf(2));
 
         let err = CombinedPlan::build(vec![
-            (&mut pdf_a, PageRange::parse("10").unwrap()), // 10 > 2
+            (&mut pdf_a, PageRange::parse_numrange("10").unwrap()), // 10 > 2
         ])
         .unwrap_err();
 
@@ -665,7 +665,7 @@ mod tests {
             .unwrap();
 
         let specs = vec![
-            InputSpec::new(&path_a, None, PageRange::parse("1,3").unwrap()),
+            InputSpec::new(&path_a, None, PageRange::parse_numrange("1,3").unwrap()),
             InputSpec::new(&path_b, None, PageRange::all()),
         ];
         let plan = CombinedPlan::from_specs(specs).unwrap();

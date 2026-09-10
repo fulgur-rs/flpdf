@@ -1185,7 +1185,7 @@ mod tests {
         let inherited = inherited_resources_pdf();
         let mut duplicate_identity = three_page_pdf();
         duplicate_identity.unique_id = inherited.unique_id;
-        let range = PageRange::parse("1").expect("one-page range");
+        let range = PageRange::parse_numrange("1").expect("one-page range");
         let specs = [
             PageSpecInput::new(0, range.clone()),
             PageSpecInput::new(1, range),
@@ -1223,7 +1223,7 @@ mod tests {
         let mut source = three_page_pdf();
         let specs = [PageSpecInput::new(
             1,
-            PageRange::parse("1").expect("one-page range"),
+            PageRange::parse_numrange("1").expect("one-page range"),
         )];
 
         assert!(matches!(
@@ -1253,7 +1253,7 @@ mod tests {
     fn page_spec_job_uses_the_non_preserving_merge_decision_route() {
         let primary = three_page_pdf();
         let secondary = inherited_resources_pdf();
-        let range = PageRange::parse("1").expect("one-page range");
+        let range = PageRange::parse_numrange("1").expect("one-page range");
         let specs = [
             PageSpecInput::new(0, range.clone()),
             PageSpecInput::new(1, range),
@@ -1481,7 +1481,10 @@ mod tests {
     #[test]
     fn handle_page_specs_default_materializes_inherited_resources_like_qpdf() {
         let mut sources = vec![inherited_resources_pdf()];
-        let specs = [PageSpecInput::new(0, PageRange::parse("1,1").unwrap())];
+        let specs = [PageSpecInput::new(
+            0,
+            PageRange::parse_numrange("1,1").unwrap(),
+        )];
 
         let mut merged = handle_page_specs(
             &mut QPDFJob::new(),
@@ -1506,7 +1509,10 @@ mod tests {
     #[test]
     fn handle_page_specs_skips_an_unused_secondary_source() {
         let mut sources = vec![three_page_pdf(), pdf_without_root()];
-        let specs = [PageSpecInput::new(0, PageRange::parse("1").unwrap())];
+        let specs = [PageSpecInput::new(
+            0,
+            PageRange::parse_numrange("1").unwrap(),
+        )];
 
         let mut merged = handle_page_specs(
             &mut QPDFJob::new(),
@@ -1524,7 +1530,10 @@ mod tests {
     #[test]
     fn qpdf_job_keeps_a_single_source_page_job_in_place() {
         let mut sources = vec![three_page_pdf()];
-        let specs = [PageSpecInput::new(0, PageRange::parse("2").unwrap())];
+        let specs = [PageSpecInput::new(
+            0,
+            PageRange::parse_numrange("2").unwrap(),
+        )];
         let mut job = QPDFJob::new();
 
         let output = job
@@ -1557,8 +1566,8 @@ mod tests {
     fn qpdf_job_in_place_page_job_copies_repeated_page_annotations() {
         let mut sources = vec![acroform_pdf()];
         let specs = [
-            PageSpecInput::new(0, PageRange::parse("1").unwrap()),
-            PageSpecInput::new(0, PageRange::parse("1").unwrap()),
+            PageSpecInput::new(0, PageRange::parse_numrange("1").unwrap()),
+            PageSpecInput::new(0, PageRange::parse_numrange("1").unwrap()),
         ];
         let mut job = QPDFJob::new();
 
@@ -1584,19 +1593,28 @@ mod tests {
         assert!(select_single_source_pages(&mut source, &[], None).is_err());
         assert!(select_single_source_pages(
             &mut source,
-            &[PageSpecInput::new(0, PageRange::parse("1").unwrap())],
+            &[PageSpecInput::new(
+                0,
+                PageRange::parse_numrange("1").unwrap()
+            )],
             Some(&[1, 2]),
         )
         .is_err());
         assert!(select_single_source_pages(
             &mut source,
-            &[PageSpecInput::new(1, PageRange::parse("1").unwrap())],
+            &[PageSpecInput::new(
+                1,
+                PageRange::parse_numrange("1").unwrap()
+            )],
             None,
         )
         .is_err());
         assert!(select_single_source_pages(
             &mut source,
-            &[PageSpecInput::new(0, PageRange::parse("999").unwrap())],
+            &[PageSpecInput::new(
+                0,
+                PageRange::parse_numrange("999").unwrap()
+            )],
             None,
         )
         .is_err());
@@ -1620,8 +1638,8 @@ mod tests {
     #[test]
     fn single_source_page_planner_applies_qpdf_collate_values_per_spec() {
         let specs = [
-            PageSpecInput::new(0, PageRange::parse("1-3").unwrap()),
-            PageSpecInput::new(0, PageRange::parse("1-3").unwrap()),
+            PageSpecInput::new(0, PageRange::parse_numrange("1-3").unwrap()),
+            PageSpecInput::new(0, PageRange::parse_numrange("1-3").unwrap()),
         ];
 
         let mut source = three_page_pdf();
@@ -1646,7 +1664,10 @@ mod tests {
         );
 
         let mut source = three_page_pdf();
-        let single_spec = [PageSpecInput::new(0, PageRange::parse("1").unwrap())];
+        let single_spec = [PageSpecInput::new(
+            0,
+            PageRange::parse_numrange("1").unwrap(),
+        )];
         assert_eq!(
             selected_indices(&mut source, &single_spec, Some(&[0])),
             vec![1]
@@ -1660,8 +1681,8 @@ mod tests {
     fn handle_page_specs_preserves_an_acroform_with_no_fields_array_across_sources() {
         let mut sources = vec![acroform_no_fields_array_pdf(), three_page_pdf()];
         let specs = [
-            PageSpecInput::new(0, PageRange::parse("1").unwrap()),
-            PageSpecInput::new(1, PageRange::parse("1").unwrap()),
+            PageSpecInput::new(0, PageRange::parse_numrange("1").unwrap()),
+            PageSpecInput::new(1, PageRange::parse_numrange("1").unwrap()),
         ];
 
         let mut merged = handle_page_specs(
@@ -1691,8 +1712,8 @@ mod tests {
         let mut sources = vec![acroform_all_fields_on_page_two_pdf(), three_page_pdf()];
         let specs = [
             // Only page 1 (no widgets); page 2's "Orphan" field is dropped.
-            PageSpecInput::new(0, PageRange::parse("1").unwrap()),
-            PageSpecInput::new(1, PageRange::parse("1").unwrap()),
+            PageSpecInput::new(0, PageRange::parse_numrange("1").unwrap()),
+            PageSpecInput::new(1, PageRange::parse_numrange("1").unwrap()),
         ];
 
         let mut merged = handle_page_specs(
@@ -1734,18 +1755,21 @@ mod tests {
 
     #[test]
     fn page_spec_input_constructor_keeps_source_and_range() {
-        let range = PageRange::parse("1-2").unwrap();
+        let range = PageRange::parse_numrange("1-2").unwrap();
         assert_eq!(PageSpecInput::new(3, range.clone()).source_index, 3);
         assert_eq!(
             PageSpecInput::new(3, range).range,
-            PageRange::parse("1-2").unwrap()
+            PageRange::parse_numrange("1-2").unwrap()
         );
     }
 
     #[test]
     fn handle_page_specs_rejects_invalid_job_inputs_and_selections() {
         let mut no_sources: Vec<Pdf<Cursor<Vec<u8>>>> = Vec::new();
-        let spec = [PageSpecInput::new(0, PageRange::parse("1").unwrap())];
+        let spec = [PageSpecInput::new(
+            0,
+            PageRange::parse_numrange("1").unwrap(),
+        )];
         assert!(handle_page_specs(
             &mut QPDFJob::new(),
             &mut no_sources,
@@ -1768,7 +1792,10 @@ mod tests {
         .is_err());
 
         let mut sources = vec![three_page_pdf()];
-        let missing = [PageSpecInput::new(1, PageRange::parse("1").unwrap())];
+        let missing = [PageSpecInput::new(
+            1,
+            PageRange::parse_numrange("1").unwrap(),
+        )];
         assert!(handle_page_specs(
             &mut QPDFJob::new(),
             &mut sources,
@@ -1780,7 +1807,10 @@ mod tests {
         .is_err());
 
         let mut sources = vec![three_page_pdf()];
-        let out_of_range = [PageSpecInput::new(0, PageRange::parse("99").unwrap())];
+        let out_of_range = [PageSpecInput::new(
+            0,
+            PageRange::parse_numrange("99").unwrap(),
+        )];
         assert!(handle_page_specs(
             &mut QPDFJob::new(),
             &mut sources,
@@ -1818,8 +1848,8 @@ mod tests {
     fn handle_page_specs_restores_cross_source_order_and_collates() {
         let mut sources = vec![three_page_pdf(), three_page_pdf()];
         let reversed = [
-            PageSpecInput::new(1, PageRange::parse("1").unwrap()),
-            PageSpecInput::new(0, PageRange::parse("1").unwrap()),
+            PageSpecInput::new(1, PageRange::parse_numrange("1").unwrap()),
+            PageSpecInput::new(0, PageRange::parse_numrange("1").unwrap()),
         ];
         let mut reversed_output = handle_page_specs(
             &mut QPDFJob::new(),
@@ -1834,8 +1864,8 @@ mod tests {
 
         let mut sources = vec![three_page_pdf(), three_page_pdf()];
         let collated = [
-            PageSpecInput::new(0, PageRange::parse("1-2").unwrap()),
-            PageSpecInput::new(1, PageRange::parse("1-2").unwrap()),
+            PageSpecInput::new(0, PageRange::parse_numrange("1-2").unwrap()),
+            PageSpecInput::new(1, PageRange::parse_numrange("1-2").unwrap()),
         ];
         let mut collated_output = handle_page_specs(
             &mut QPDFJob::new(),
@@ -1852,8 +1882,8 @@ mod tests {
     #[test]
     fn handle_page_specs_accepts_per_spec_and_zero_collate_values() {
         let specs = [
-            PageSpecInput::new(0, PageRange::parse("1-3").unwrap()),
-            PageSpecInput::new(1, PageRange::parse("1-3").unwrap()),
+            PageSpecInput::new(0, PageRange::parse_numrange("1-3").unwrap()),
+            PageSpecInput::new(1, PageRange::parse_numrange("1-3").unwrap()),
         ];
 
         let mut sources = vec![three_page_pdf(), three_page_pdf()];
@@ -1896,7 +1926,10 @@ mod tests {
     #[test]
     fn handle_page_specs_reconstructs_qpdf_page_labels_with_empty_prefix() {
         let mut sources = vec![labelled_pdf()];
-        let specs = [PageSpecInput::new(0, PageRange::parse("1-2").unwrap())];
+        let specs = [PageSpecInput::new(
+            0,
+            PageRange::parse_numrange("1-2").unwrap(),
+        )];
         let mut output = handle_page_specs(
             &mut QPDFJob::new(),
             &mut sources,

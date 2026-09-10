@@ -56,7 +56,7 @@ pub(crate) use json_sections::checksum_to_hex;
 pub use lifecycle::{FlattenAnnotationsMode, JobDocument, JobExitCode, QPDFJob, QPDFJobConfig};
 pub use outline_dest_remap::{remap_outline_and_dests, remap_outline_and_dests_with_max_depth};
 pub use overlay::{
-    apply_overlay_specs, overlay_verbose_report, OverlayKind, OverlaySpec, OverlayVerbosePage,
+    handle_under_overlay, overlay_verbose_report, OverlayKind, OverlaySpec, OverlayVerbosePage,
     OverlayVerboseSource,
 };
 pub use page_combine::{CombinedPage, CombinedPlan, InputSpec};

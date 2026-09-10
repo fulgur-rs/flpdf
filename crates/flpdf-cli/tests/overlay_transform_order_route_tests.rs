@@ -117,7 +117,7 @@ fn ordinary_rewrite_uses_the_canonical_job_transform_and_output_routes() {
     );
     for forbidden in [
         "apply_image_transformations(",
-        "flpdf::apply_overlay_specs(",
+        "flpdf::handle_under_overlay(",
         "AcroFormDocumentHelper::new",
         "PageDocumentHelper::new",
         "PageObjectHelper::new",

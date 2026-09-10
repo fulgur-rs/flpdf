@@ -5985,16 +5985,16 @@ fn configure_rewrite_job(
             let from = match spec.from.as_deref() {
                 None => PageRange::all(),
                 Some("") => PageRange::empty(),
-                Some(range) => PageRange::parse(range)?,
+                Some(range) => PageRange::parse_numrange(range)?,
             };
             let to = match spec.to.as_deref() {
                 None => PageRange::all(),
                 Some("") => PageRange::empty(),
-                Some(range) => PageRange::parse(range)?,
+                Some(range) => PageRange::parse_numrange(range)?,
             };
             let repeat = match spec.repeat.as_deref() {
                 None | Some("") => None,
-                Some(range) => Some(PageRange::parse(range)?),
+                Some(range) => Some(PageRange::parse_numrange(range)?),
             };
             match spec.kind {
                 OverlayKind::Overlay => {
@@ -6283,10 +6283,10 @@ fn resolve_page_specs(
         let range = if s.range.is_empty() {
             PageRange::all()
         } else {
-            PageRange::parse(&s.range).map_err(|e| {
+            PageRange::parse_numrange(&s.range).map_err(|e| {
                 let message = e
                     .raw_message()
-                    .expect("PageRange::parse delegates to qutil raw range errors");
+                    .expect("PageRange::parse_numrange delegates to qutil raw range errors");
                 let mut what = b"parsing numeric range for ".to_vec();
                 what.extend_from_slice(&path_description(&path));
                 what.extend_from_slice(b": ");
@@ -6382,7 +6382,7 @@ struct RawCliOverrides {
 ///
 /// - `FILE` is mandatory (exactly one, either via `--file=PATH` or bare).
 /// - `--password=`, `--to=`, `--from=`, `--repeat=` are each optional; duplicates error.
-/// - Range values are validated via [`PageRange::parse`] (syntax only; defaults not applied).
+/// - Range values are validated via [`PageRange::parse_numrange`] (syntax only; defaults not applied).
 /// - Unknown `--xxx` tokens, duplicate files, or an empty token list all produce an error.
 ///
 /// # Errors
@@ -6429,7 +6429,7 @@ fn parse_overlay_segment<T: RawCliArg>(kind: OverlayKind, tokens: &[T]) -> CliRe
             }
             let r =
                 String::from_utf8(r.to_vec()).map_err(|_| "overlay --to must be valid UTF-8")?;
-            PageRange::parse(&r)
+            PageRange::parse_numrange(&r)
                 .map_err(|e| format!("{flag}: invalid --to= page range {r:?}: {e}"))?;
             to = Some(r);
             continue;
@@ -6440,7 +6440,7 @@ fn parse_overlay_segment<T: RawCliArg>(kind: OverlayKind, tokens: &[T]) -> CliRe
             }
             let r =
                 String::from_utf8(r.to_vec()).map_err(|_| "overlay --from must be valid UTF-8")?;
-            PageRange::parse(&r)
+            PageRange::parse_numrange(&r)
                 .map_err(|e| format!("{flag}: invalid --from= page range {r:?}: {e}"))?;
             from = Some(r);
             continue;
@@ -6451,7 +6451,7 @@ fn parse_overlay_segment<T: RawCliArg>(kind: OverlayKind, tokens: &[T]) -> CliRe
             }
             let r = String::from_utf8(r.to_vec())
                 .map_err(|_| "overlay --repeat must be valid UTF-8")?;
-            PageRange::parse(&r)
+            PageRange::parse_numrange(&r)
                 .map_err(|e| format!("{flag}: invalid --repeat= page range {r:?}: {e}"))?;
             repeat = Some(r);
             continue;
@@ -6650,7 +6650,7 @@ fn build_overlay_specs_with_suppression(
         let from = match spec.from.as_deref() {
             None => PageRange::all(),
             Some("") => PageRange::empty(),
-            Some(r) => PageRange::parse(r)?,
+            Some(r) => PageRange::parse_numrange(r)?,
         };
         // Distinguish an absent `--to` (default: all destination pages) from an
         // explicit empty `--to=` (empty destination set). qpdf treats the latter
@@ -6659,7 +6659,7 @@ fn build_overlay_specs_with_suppression(
         let to = match spec.to.as_deref() {
             None => PageRange::all(),
             Some("") => PageRange::empty(),
-            Some(r) => PageRange::parse(r)?,
+            Some(r) => PageRange::parse_numrange(r)?,
         };
         // An explicit empty `--repeat=` means "no repeat", identical to an absent
         // `--repeat` (qpdf-observed: byte-identical to the default overlay). Both
@@ -6668,7 +6668,7 @@ fn build_overlay_specs_with_suppression(
         // `spec_page_sources`, so `None` is preferred.
         let repeat = match spec.repeat.as_deref() {
             None | Some("") => None,
-            Some(r) => Some(PageRange::parse(r)?),
+            Some(r) => Some(PageRange::parse_numrange(r)?),
         };
         built.push(flpdf::OverlaySpec {
             source,
@@ -7523,7 +7523,7 @@ fn run_page_extraction_after_plan<R: Read + Seek + 'static>(
             logger_info(overlay_verbose_message(&report, overlay_specs))?;
         }
 
-        flpdf::apply_overlay_specs(pdf, &mut built)?;
+        flpdf::handle_under_overlay(pdf, &mut built)?;
         Some(built)
     } else {
         None

@@ -4,7 +4,7 @@ fn page_range_uses_qutil_as_the_single_parse_and_resolve_owner() {
 
     assert!(
         source.contains("crate::qutil::parse_numrange(input.as_bytes(), 0)?;"),
-        "PageRange::parse must delegate syntax validation to qutil::parse_numrange"
+        "PageRange::parse_numrange must delegate syntax validation to qutil::parse_numrange"
     );
     assert!(
         source.contains("crate::qutil::parse_numrange(&self.raw, max)?"),
