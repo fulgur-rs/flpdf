@@ -3786,6 +3786,58 @@ fn config_page_specs_reject_a_json_pages_group_after_config_pages() {
     ));
 }
 
+/// `Config::emptyInput` selects the empty primary before qpdf's create/write
+/// lifecycle runs, so a caller must be able to configure it without encoding
+/// an equivalent job-JSON document.
+#[test]
+fn config_empty_input_runs_the_canonical_inspection_lifecycle() {
+    let mut job = QPDFJob::new();
+    job.config()
+        .empty_input()
+        .expect("empty input should be a valid primary selector")
+        .show_pages();
+
+    assert_eq!(job.run().unwrap(), JobExitCode::Success);
+}
+
+#[test]
+fn config_empty_input_rejects_a_preselected_input() {
+    let mut job = QPDFJob::new();
+    job.config()
+        .input_file("input.pdf")
+        .expect("the first input selector should be accepted");
+
+    let error = job
+        .config()
+        .empty_input()
+        .err()
+        .expect("qpdf rejects empty input after an input file");
+    assert!(matches!(
+        error,
+        Error::Usage(usage)
+            if usage.to_string() == "empty input can't be used since input file has already been given"
+    ));
+}
+
+#[test]
+fn config_empty_input_rejects_a_duplicate_empty_selector() {
+    let mut job = QPDFJob::new();
+    job.config()
+        .empty_input()
+        .expect("the first empty selector should be accepted");
+
+    let error = job
+        .config()
+        .empty_input()
+        .err()
+        .expect("qpdf rejects a duplicate empty selector");
+    assert!(matches!(
+        error,
+        Error::Usage(usage)
+            if usage.to_string() == "empty input can't be used since input file has already been given"
+    ));
+}
+
 #[test]
 fn json_page_specs_reject_a_config_pages_group_after_json_pages() {
     let mut job = QPDFJob::new();
