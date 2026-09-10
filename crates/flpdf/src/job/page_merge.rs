@@ -1302,6 +1302,11 @@ fn merge_documents_with_resource_decisions_and_preserve_primary_into_impl<
             copy_seed.insert(primary_pages_ref, pages_root_ref);
         }
         target.set_foreign_object_map(source_id, copy_seed);
+        // Target references already attributed to an earlier page of this
+        // source. Carrying the delta across the loop keeps the per-page work
+        // proportional to the map rather than cloning the whole cumulative map
+        // twice for every page.
+        let mut recorded_copies: BTreeSet<ObjectRef> = BTreeSet::new();
         for &page_ref in &unique {
             let source_page = input.source.get_object_handle(page_ref);
             let copied_page = target.copy_foreign_object(&source_page)?;
@@ -1312,6 +1317,22 @@ fn merge_documents_with_resource_decisions_and_preserve_primary_into_impl<
                 return Err(Error::Missing("merged page missing from foreign copy map"));
             }
             // cov:ignore-end
+            if !is_primary {
+                let mut new_objects: Vec<ObjectRef> = target
+                    .foreign_object_maps
+                    .get(&source_id)
+                    .into_iter()
+                    .flat_map(|copies| copies.values().copied())
+                    .filter(|target_ref| !recorded_copies.contains(target_ref))
+                    .collect();
+                new_objects.sort_unstable();
+                recorded_copies.extend(new_objects.iter().copied());
+                target
+                    .foreign_page_copy_orders
+                    .entry(source_id)
+                    .or_default()
+                    .push((page_ref, new_objects));
+            }
         }
         let page_copy_map = target.foreign_object_map_snapshot(source_id);
         // qpdf keeps the primary Catalog and trailer in the same QPDF while

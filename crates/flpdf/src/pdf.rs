@@ -152,6 +152,10 @@ pub struct Pdf<R: Read + Seek + 'static> {
     // thread-safe for concurrent access to one document.
     /// qpdf's `m->object_copiers[source unique_id].object_map` equivalent.
     pub(crate) foreign_object_maps: BTreeMap<u64, BTreeMap<ObjectRef, ObjectRef>>,
+    /// Source-page copy groups in the order qpdf allocates them. The grouped
+    /// page merge keeps one copier per source, but page-spec provenance must
+    /// still interleave each unique page graph at its occurrence boundary.
+    pub(crate) foreign_page_copy_orders: BTreeMap<u64, Vec<(ObjectRef, Vec<ObjectRef>)>>,
     /// qpdf's original-object order for objects copied while building a
     /// multi-source page-selection target. `None` means this is an ordinary
     /// parsed document, for which the live object reference is already the
