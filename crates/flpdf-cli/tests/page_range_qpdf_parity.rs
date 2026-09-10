@@ -108,6 +108,32 @@ fn pages_named_range_then_positional_range_matches_qpdf_duplicate_error() {
 }
 
 #[test]
+fn pages_duplicate_password_matches_qpdf_usage_error_and_does_not_write_output() {
+    let temp = tempfile::tempdir().unwrap();
+    let output = temp.path().join("out.pdf");
+
+    Command::cargo_bin("flpdf")
+        .unwrap()
+        .args([
+            "rewrite",
+            "../../tests/fixtures/compat/three-page.pdf",
+            output.to_str().unwrap(),
+            "--pages",
+            ".",
+            "--password=x",
+            "--password=y",
+            "--",
+        ])
+        .assert()
+        .code(2)
+        .stderr(predicate::str::contains(
+            "--password already specified for this file",
+        ));
+
+    assert!(!output.exists(), "usage errors must not create the output file");
+}
+
+#[test]
 fn pages_named_file_keeps_the_next_positional_token_as_a_file() {
     let temp = tempfile::tempdir().unwrap();
     let input = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
