@@ -814,3 +814,16 @@ included in this bounded slice.
 | `A23` | `flpdf-3yn9.48.36` | legacy_dictionary_keyのstream-filter key判定 consumerをcanonical nameへ移行する |
 | `A22` | `flpdf-3yn9.48.44` | qtest test0/1をcanonical pipe/loggerへ移し手製stream診断を撤去する |
 | `A9` / `A11` | `flpdf-3sbf` | ObjGen object 0 の不変条件 |
+
+### Raw `QpdfObjGen` consumer boundary — `flpdf-r3vn` (2026-09-11)
+
+The `.48.78` primitive is now consumed outside the resolver cache. The
+remaining ObjectHandle, stream, encryption, writer, xref, JSON, and CLI
+surfaces must use the raw `QpdfObjGen` identity before attempting the valid
+`ObjectRef` projection. qpdf's source boundaries are
+`libqpdf/QPDF.cc:120-180,1330-1345,1540-1755`,
+`libqpdf/QPDF_encryption.cc:325-357,954-968`, and
+`libqpdf/QPDFObjectHandle.cc:1574-1593`. The qpdf parser's generation limit
+belongs only to `N G R` parsing (`libqpdf/QPDFParser.cc:157-178`); it does not
+apply to object headers, encryption keys, stream providers, cache keys, or
+unparse identity.

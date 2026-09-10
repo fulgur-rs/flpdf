@@ -8363,20 +8363,37 @@ fn run_dump_object(
     suppress_warnings: bool,
 ) -> CliResult<()> {
     let input = input.ok_or_else(missing_input_usage_error)?;
-    let object_ref = ObjectRef::parse(object_ref)?;
 
     let mut pdf = open_pdf_with_suppression(&input, repair, password, suppress_warnings)?;
     let mut job = QPDFJob::new();
     job.set_logger(cli_logger());
     job.set_message_prefix(progname());
     job.set_suppress_warnings(suppress_warnings);
+    if let Some((number, generation)) = parse_raw_dump_object_selector(object_ref)
+        .filter(|(_, generation)| *generation > i32::from(u16::MAX))
+    {
+        return finish_job_exit_status(
+            job.dump_object_by_raw_identity(&mut pdf, number, generation)?,
+        );
+    }
+    let object_ref = ObjectRef::parse(object_ref)?;
     finish_job_exit_status(job.dump_object(&mut pdf, object_ref)?)
+}
+
+fn parse_raw_dump_object_selector(value: &str) -> Option<(i32, i32)> {
+    let parts: Vec<_> = value.split_whitespace().collect();
+    if parts.len() != 2 && !(parts.len() == 3 && parts[2] == "R") {
+        return None;
+    }
+    let number = parts[0].parse::<i32>().ok()?;
+    let generation = parts[1].parse::<i32>().ok()?;
+    (number > 0 && generation >= 0).then_some((number, generation))
 }
 
 #[derive(Debug, Clone, Copy)]
 enum ShowObjectSelector {
     Trailer,
-    Object(ObjectRef),
+    Object { number: i32, generation: i32 },
     Null,
     NoObject,
 }
@@ -8398,13 +8415,10 @@ fn parse_show_object_selector(value: &str) -> CliResult<ShowObjectSelector> {
     if number <= 0 {
         return Ok(ShowObjectSelector::NoObject);
     }
-    if !(0..=i32::from(u16::MAX)).contains(&generation) {
+    if generation < 0 {
         return Ok(ShowObjectSelector::Null);
     }
-    Ok(ShowObjectSelector::Object(ObjectRef::new(
-        u32::try_from(number).expect("positive i32 fits u32"),
-        u16::try_from(generation).expect("validated u16 generation"),
-    )))
+    Ok(ShowObjectSelector::Object { number, generation })
 }
 
 /// qpdf's `QUtil::string_to_int` uses `strtoll`: it accepts a signed decimal
@@ -8475,7 +8489,9 @@ fn run_show_object(
         apply_inspection_transformations(&mut job, &mut pdf, transform_options, verbose)?;
         let object = match selector {
             ShowObjectSelector::Trailer => pdf.trailer(),
-            ShowObjectSelector::Object(object_ref) => pdf.get_object_handle(object_ref),
+            ShowObjectSelector::Object { number, generation } => {
+                pdf.get_object_handle_by_raw_identity(number, generation)
+            }
             ShowObjectSelector::NoObject => {
                 return finish_job_exit_status(
                     job.inspect(&mut pdf, |_pdf| Ok::<(), flpdf::Error>(()))?,
@@ -8502,7 +8518,9 @@ fn run_show_object(
     apply_inspection_transformations(&mut job, &mut pdf, transform_options, verbose)?;
     let object = match selector {
         ShowObjectSelector::Trailer => pdf.trailer(),
-        ShowObjectSelector::Object(object_ref) => pdf.get_object_handle(object_ref),
+        ShowObjectSelector::Object { number, generation } => {
+            pdf.get_object_handle_by_raw_identity(number, generation)
+        }
         ShowObjectSelector::NoObject => {
             return finish_job_exit_status(
                 job.inspect(&mut pdf, |_pdf| Ok::<(), flpdf::Error>(()))?,
@@ -11821,17 +11839,17 @@ mod tests {
     fn show_object_selector_defaults_generation_like_qpdf() {
         assert!(matches!(
             parse_show_object_selector("1"),
-            Ok(ShowObjectSelector::Object(ObjectRef {
+            Ok(ShowObjectSelector::Object {
                 number: 1,
                 generation: 0,
-            }))
+            })
         ));
         assert!(matches!(
             parse_show_object_selector("1,"),
-            Ok(ShowObjectSelector::Object(ObjectRef {
+            Ok(ShowObjectSelector::Object {
                 number: 1,
                 generation: 0,
-            }))
+            })
         ));
     }
 

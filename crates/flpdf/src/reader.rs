@@ -983,6 +983,19 @@ impl<R: Read + Seek> Pdf<R> {
         self.resolver.get_object_handle(object_ref)
     }
 
+    /// Return the canonical handle for qpdf's raw signed object/generation
+    /// identity. Unlike [`Self::get_object_handle`], this preserves an object
+    /// header generation that cannot be represented by a PDF `N G R`
+    /// reference, such as `5 65536 obj`.
+    pub fn get_object_handle_by_raw_identity(
+        &mut self,
+        object_number: i32,
+        generation: i32,
+    ) -> ObjectHandle {
+        self.resolver
+            .get_object_handle_qpdf_obj_gen(QpdfObjGen::new(object_number, generation))
+    }
+
     /// Whether this document holds the only strong reference to its resolver.
     ///
     /// Test-only: lets the resolver's own teardown regression assert that

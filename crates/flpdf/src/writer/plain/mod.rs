@@ -126,7 +126,7 @@ fn write_plain_live_disable<R: Read + Seek, W: Write>(
     // number can exceed every uncompressed number, so `/Size` cannot be
     // derived from the uncompressed map alone once Preserve has live
     // compressed content.
-    let max_output = u32::try_from(old_to_new.len()).unwrap_or(u32::MAX);
+    let max_output = u32::try_from(body.object_count).unwrap_or(u32::MAX);
     let trailer_size = usize::try_from(max_output)
         .ok()
         .and_then(|size| size.checked_add(1))
