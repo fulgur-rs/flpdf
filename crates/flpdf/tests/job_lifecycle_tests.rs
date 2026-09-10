@@ -3752,22 +3752,14 @@ fn config_add_page_spec_matches_the_json_configured_path_single_source() {
     }
 }
 
-/// An out-of-range page range must surface qpdf's page-range parse error
-/// through `QPDFJobConfig::add_page_spec`'s `Result`, not a panic or a
-/// silently-accepted spec.
+/// qpdf's Config pageSpec accepts range syntax and defers page-count bounds
+/// until the page job resolves the source document.
 #[test]
-fn config_add_page_spec_rejects_an_invalid_range() {
+fn config_add_page_spec_defers_range_bounds_like_qpdf() {
     let mut job = QPDFJob::new();
-    let error = job
-        .config()
+    job.config()
         .add_page_spec(".", "0", None)
-        .err()
-        .expect("an out-of-range page range must be rejected");
-    // qpdf's own `PagesConfig::pageSpec` never fails; it validates the range at
-    // run time (`QPDFJob.cc:261-271`). flpdf validates eagerly, so keep the two
-    // flpdf routes symmetric: the job-JSON handler wraps this same failure in
-    // `Error::Usage`, and the builder must do the same.
-    assert!(matches!(error, Error::Usage(_)), "got {error:?}");
+        .expect("qpdf's PagesConfig::pageSpec accepts syntax-only range bounds");
 }
 
 #[test]

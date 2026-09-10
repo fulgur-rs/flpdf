@@ -5983,12 +5983,12 @@ fn configure_rewrite_job(
                 })
                 .unwrap_or_default();
             let from = match spec.from.as_deref() {
-                None => PageRange::parse("")?,
+                None => PageRange::all(),
                 Some("") => PageRange::empty(),
                 Some(range) => PageRange::parse(range)?,
             };
             let to = match spec.to.as_deref() {
-                None => PageRange::parse("")?,
+                None => PageRange::all(),
                 Some("") => PageRange::empty(),
                 Some(range) => PageRange::parse(range)?,
             };
@@ -6143,6 +6143,8 @@ struct PageSegmentSpec {
 /// Bounded, non-recursive single pass over `tokens`; no panics.
 fn parse_pages_segment<T: RawCliArg>(tokens: &[T]) -> CliResult<Vec<PageSegmentSpec>> {
     let mut specs: Vec<PageSegmentSpec> = Vec::new();
+    let mut called_pages_file = false;
+    let mut called_pages_range = false;
 
     for tok in tokens {
         let token_bytes = tok.raw_bytes();
@@ -6181,24 +6183,68 @@ fn parse_pages_segment<T: RawCliArg>(tokens: &[T]) -> CliResult<Vec<PageSegmentS
             )
             .into());
         }
-        // Positional token: either a NEW file, or the page-range for the
-        // current file. qpdf's heuristic: the token is a page-range iff a
-        // file is already open and that file has no range yet AND the token
-        // parses as a page-range. Otherwise it starts a new file.
-        let range = std::str::from_utf8(&token_bytes)
-            .ok()
-            .filter(|range| PageRange::parse(range).is_ok())
-            .map(str::to_owned);
-        match (specs.last_mut(), range) {
-            (Some(cur), Some(range)) if cur.range.is_empty() => {
-                cur.range = range;
-            }
-            _ => specs.push(PageSegmentSpec {
+        // This is qpdf's ArgParser::argPagesPositional state machine
+        // (QPDFJob_argv.cc:243-272): the first positional is always a file;
+        // after a positional range, the next positional is always a file;
+        // otherwise the token is tested as range first and falls back to an
+        // openable file only when range syntax fails.
+        if !called_pages_file {
+            specs.push(PageSegmentSpec {
                 file_token: tok.os_string(),
                 password: None,
                 raw_password: None,
                 range: String::new(),
-            }),
+            });
+            called_pages_file = true;
+            continue;
+        }
+        if called_pages_range {
+            specs.push(PageSegmentSpec {
+                file_token: tok.os_string(),
+                password: None,
+                raw_password: None,
+                range: String::new(),
+            });
+            called_pages_range = false;
+            continue;
+        }
+
+        match parse_numrange(&token_bytes, 0) {
+            Ok(_) => {
+                let range_bytes = token_bytes
+                    .split(|byte| *byte == 0)
+                    .next()
+                    .unwrap_or(&token_bytes);
+                let range = String::from_utf8_lossy(range_bytes).into_owned();
+                let cur = specs
+                    .last_mut()
+                    .expect("qpdf page range requires a preceding file");
+                if !cur.range.is_empty() {
+                    return Err(Box::new(UsageError::new(
+                        "--range already specified for this file",
+                    )));
+                }
+                cur.range = range;
+                called_pages_range = true;
+            }
+            Err(error) => {
+                let is_file = token_bytes == b"."
+                    || File::open(arg_parser::os_string_from_bytes(&token_bytes)).is_ok();
+                if is_file {
+                    specs.push(PageSegmentSpec {
+                        file_token: tok.os_string(),
+                        password: None,
+                        raw_password: None,
+                        range: String::new(),
+                    });
+                    called_pages_range = false;
+                } else {
+                    let message = error
+                        .raw_message()
+                        .map_or_else(|| error.to_string().into_bytes(), ToOwned::to_owned);
+                    return Err(Box::new(UsageError::new(message)));
+                }
+            }
         }
     }
 
@@ -6229,12 +6275,20 @@ fn resolve_page_specs(
         } else {
             PathBuf::from(&s.file_token)
         };
-        let range = PageRange::parse(&s.range).map_err(|e| {
-            Box::<dyn std::error::Error>::from(format!(
-                "--pages: invalid page range {:?}: {e}",
-                s.range
-            ))
-        })?;
+        let range = if s.range.is_empty() {
+            PageRange::all()
+        } else {
+            PageRange::parse(&s.range).map_err(|e| {
+                let message = e
+                    .raw_message()
+                    .expect("PageRange::parse delegates to qutil raw range errors");
+                let mut what = b"parsing numeric range for ".to_vec();
+                what.extend_from_slice(&path_description(&path));
+                what.extend_from_slice(b": ");
+                what.extend_from_slice(message);
+                Box::new(Error::SystemBytes(what)) as Box<dyn std::error::Error>
+            })?
+        };
         out.push(InputSpec::new(
             path,
             s.raw_password.clone().or_else(|| {
@@ -6589,7 +6643,7 @@ fn build_overlay_specs_with_suppression(
         // explicit empty `--from=` (empty source set). qpdf treats the latter as
         // "no from pages", so `--repeat` cycles from the first destination page.
         let from = match spec.from.as_deref() {
-            None => PageRange::parse("")?,
+            None => PageRange::all(),
             Some("") => PageRange::empty(),
             Some(r) => PageRange::parse(r)?,
         };
@@ -6598,7 +6652,7 @@ fn build_overlay_specs_with_suppression(
         // as selecting no destination pages, so the overlay is a no-op (observed:
         // byte-identical to a plain rewrite of the destination).
         let to = match spec.to.as_deref() {
-            None => PageRange::parse("")?,
+            None => PageRange::all(),
             Some("") => PageRange::empty(),
             Some(r) => PageRange::parse(r)?,
         };
@@ -10119,6 +10173,17 @@ mod tests {
         ])
         .expect("copy-attachments segment should parse");
         assert_eq!(copy.password, b"copy-\xff".to_vec());
+    }
+
+    #[test]
+    fn pages_empty_range_can_be_replaced_before_a_nonempty_range() {
+        let pages = parse_pages_segment(&[
+            b"source.pdf".to_vec(),
+            b"--range=".to_vec(),
+            b"--range=1".to_vec(),
+        ])
+        .expect("qpdf permits an empty range sentinel before a replacement");
+        assert_eq!(pages[0].range, "1");
     }
 
     #[test]

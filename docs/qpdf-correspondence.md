@@ -1261,7 +1261,24 @@ transformation caller はこの bounded cutover の残 caller として後続 `.
 
 `flpdf-egzr.8.10` では、残る generated job-JSON handlers も同じ lifecycleへ接続した。`showLinearization`、`showXref`、`showObject`、`filteredStreamData`、`rawStreamData`、`listAttachments`、`showAttachment` は `QPDFJob::doInspection` の順序 (`QPDFJob.cc:1646-1689`) で既存の inspection/attachment primitiveへ委譲する。`copyEncryption` / `encryptionFilePassword` は認証済み donor の `writer_copy_encryption_source` を `PdfWriter`へ渡し、`compressionLevel` は `QPDFJob.cc:2847-2851` と同じ writer 開始境界で適用する。`passwordMode`、`passwordIsHexKey`、`ignoreXrefStreams`、`suppressPasswordRecovery`、`suppressRecovery` は全 job-owned input source の `PdfOpenOptions`へ伝播し、`allowInsecure` は256-bit encryptionの nested handlerで検査する。`isEncrypted` / `requiresPassword` は `QPDFJob.cc:535-557` の0/2/3を job statusへ写像し、`reportMemoryUsage` は `QUtil::get_max_memory_usage` (`QUtil.cc:1941-2002`) 相当を completion 後に stderrへ出力する。`jobJsonFile` は同じ `JobConfiguration` へ `partial=true` の再帰 dispatch を行い、各 JSON dictionary を qpdf と同じキー順で適用する。したがって添付・collate・overlay などの追記型設定は両方の文書から残り、`pages` の重複指定や入力・出力設定の重複は qpdf と同じ usage error になる。include cycle はスタック枯渇を避ける既存のRust側防御として拒否する。
 
-`.48.2` では `QUtil::parse_numrange` (`QUtil.cc:1304-1438`) を raw-byte `qutil::parse_numrange` として先行移植し、`parseRotationParameter` (`QPDFJob.cc:369-415`) の angle/relative/raw-range stateを job JSON と direct CLI rotationで共有する。これは rotation consumerの限定sliceであり、CLIの独立適用ownerと、pages/overlay/page-plan/combine/specsの既存`PageRange` consumerは後続移行として残る。
+`.48.2` では `QUtil::parse_numrange` (`QUtil.cc:1304-1429`) を raw-byte `qutil::parse_numrange` として先行移植し、`parseRotationParameter` (`QPDFJob.cc:369-415`) の angle/relative/raw-range stateを job JSON と direct CLI rotationで共有する。これは rotation consumerの限定sliceであり、CLIの独立適用ownerと、pages/overlay/page-plan/combine/specsの既存`PageRange` consumerは後続移行として残る。
+
+2026-09-10（`flpdf-iym2`）では、`job/page_range.rs::PageRange` の重複 parser と
+resolver を削除し、`QUtil::parse_numrange` を parse (`max=0`) と resolve
+（正の page count）の唯一の実装 ownerにした（`QUtil.cc:1304-1429`、
+`QUtil.hh:464`）。`PageRange::all` は qpdf の `handlePageSpecs` が omitted
+range を `1-z` に置換する既定値を表し、`PageRange::parse("")` / `empty` は
+explicit empty selectionとして別状態に保つ。`--pages` の raw positional
+heuristicも `QPDFJob_argv.cc:253-272` と同じく、range parse → file open fallback
+→元の numeric-range usage error の順へ揃えた。named `--file=` は qpdf の
+`called_pages_file` / `called_pages_range` stateを変えないため、まだ positional
+file が無い場合または直前に positional range を消費済みの場合だけ次の
+positional tokenをfileとして扱い、positional file済み・range未消費なら通常の
+range heuristicへ入る（`auto_job_init.hh:128-132`, `QPDFJob_argv.cc:243-251`）。
+range errors は
+`QPDFJob.cc:259-270` の source-name framingに対応する下流で保持する。
+`Endpoint` / `PageRangeEntry` / `Parity` の public visibility debt、qtest
+exceptions、overlay 全体の owner cutoverはこの限定sliceの対象外である。
 
 rotationのpage countは`QPDFJob::handleRotations` (`QPDFJob.cc:2638`) の`QIntC::to_int(size_t)`に合わせ、共有`qutil::qpdf_size_to_int`でchecked narrowingする。empty documentでも`parse_numrange(range, 0)`とsigned `pageno` filterを通過させ、先行empty guardや飽和値は置かない。
 

@@ -549,7 +549,7 @@ pub fn qpdf_size_to_int(value: usize) -> crate::Result<i32> {
 /// Parse qpdf's numeric page-range language.
 ///
 /// This is the byte-oriented counterpart of `QUtil::parse_numrange`
-/// (`libqpdf/QUtil.cc:1304-1438`, `include/qpdf/QUtil.hh:464`). qpdf receives a
+/// (`libqpdf/QUtil.cc:1304-1429`, `include/qpdf/QUtil.hh:464`). qpdf receives a
 /// NUL-terminated `char const*`, so the input is truncated at the first NUL;
 /// retaining bytes here also keeps qpdf's runtime diagnostic payload intact at
 /// the job/CLI boundary. `max == 0` performs syntax-only validation, while a
