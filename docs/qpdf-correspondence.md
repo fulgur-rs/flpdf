@@ -1774,6 +1774,33 @@ inherited lookup order, checkbox/radio/pushbutton mutation order, and
 `NeedAppearances` removal remain unchanged. qtest exceptions and the separate
 merge/drop semantic issue remain outside this bounded row.
 
+### A6/A7/A8 writer rewrite-renumber accessor slice `flpdf-3yn9.48.23.18` (2026-09-10)
+
+The Catalog-first and object-stream renumber walks in
+`crates/flpdf/src/writer/rewrite_renumber.rs` now use the canonical live-handle
+accessor boundary. qpdf's `QPDFWriter::enqueueObject` first distinguishes
+indirect identity, then recursively inspects direct arrays and dictionaries;
+the same queue is consumed by standard writing
+(`libqpdf/QPDFWriter.cc:1072-1141,2907-3044`). Source-backed object streams
+use the two-pass `writeObjectStream` path and inspect `/Extends` through the
+same handle semantics (`libqpdf/QPDFWriter.cc:1606-1758`). The qpdf accessors
+resolve before type/null observation (`libqpdf/QPDFObjectHandle.cc:240-446,
+857-866,965-1015`), while indirect identity itself remains non-resolving
+(`include/qpdf/QPDFObjectHandle.hh:353,1630-1645`).
+
+The scoped production route removed seven explicit `Pdf::resolve` calls and
+three non-resolving `is_null` observations. Direct array/dictionary/null
+boundaries now use `try_as_array`, `try_as_dictionary`, and `try_is_null`;
+stream dictionaries retain the silent `as_stream_dict` observation only after
+the preceding canonical accessor has resolved the stream. Catalog-first BFS,
+array-versus-dictionary null visibility, stream-parameter exclusions,
+removed-reference filtering, source-backed `/Extends` traversal, and depth/
+cycle/error behavior are unchanged. The existing module route contract now
+guards this production slice, and `canonical_children_propagate_resolution_errors`
+keeps resolver failures as `Result` errors. qtest and qtest-exceptions routes,
+active `.48.7/.48.10/.48.49` sessions, and shared writer emission ownership
+remain outside this bounded row.
+
 ### QPDFJob `doInspection` combined top-level consumer `flpdf-giz3` (2026-09-10)
 
 The top-level CLI now routes combined inspection selections through the
