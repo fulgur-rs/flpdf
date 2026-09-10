@@ -613,6 +613,28 @@ resolving accessor exists. Existing rendering layout and malformed-input
 warning behavior are covered by the focused FormField and CLI qpdf tests;
 qtest exceptions and unrelated AcroForm/FileSpec/signature routes remain out
 of scope.
+### 2026-09-10 current caller audit: FormField field-tree bounded cutover
+
+`flpdf-3yn9.48.23.17` migrated the non-qtest production resolver/accessor
+sites in `crates/flpdf/src/form_field_object_helper.rs`. The fresh census had
+four explicit `Pdf::resolve` sites (the shared `resolved` helper plus
+`clear_need_appearances_after_generation`) and residual non-resolving
+key/dictionary/array/name/integer/null observations. The post-cutover
+production route has zero `Pdf::resolve`, `resolve_handle`,
+`resolve_handle_ref`, and legacy `resolved` callers. The route contract is
+`crates/flpdf/tests/form_field_route_contract_tests.rs`.
+
+The qpdf boundary is `libqpdf/QPDFFormFieldObjectHelper.cc:30-236` for
+parent-chain, inherited values, names, values, and flags,
+`libqpdf/QPDFFormFieldObjectHelper.cc:267-285` for choices, and
+`libqpdf/QPDFFormFieldObjectHelper.cc:300-469` for button/value mutation;
+`libqpdf/QPDFObjectHandle.cc:240-446,965-989,2168-2189` for resolving typed and
+key access; and `libqpdf/QPDFAcroFormDocumentHelper.cc:365-415` for
+`NeedAppearances`. Direct-parent cycle guards and qpdf mutation order remain
+in place. String/boolean observations without a silent resolving `try_as_*`
+counterpart are performed only after `try_dereference`, rather than using a
+warning-producing fallback. qtest exceptions and unrelated rendering,
+writer/CLI, and stream routes remain outside this bounded slice.
 
 ### 2026-09-10 current caller audit: optimization bounded cutover
 
