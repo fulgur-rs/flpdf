@@ -399,6 +399,50 @@ fn preserve_unreferenced_with_source_object_streams_matches_qpdf_11_9() {
     }
 }
 
+/// qpdf's `QPDF_Stream::pipeStreamData` reads the parsed in-body payload even
+/// when the stream dictionary also carries the external-file keys `/F`,
+/// `/FFilter`, and `/FDecodeParms`; `QPDFWriter::unparseObject` preserves those
+/// keys while replacing `/Length` with the emitted payload length
+/// (`QPDF_Stream.cc:605-620`, `QPDFWriter.cc:1239-1314,1440-1455`). Keep this
+/// preserve-mode edge compared against the live qpdf 11.9.0 oracle.
+#[test]
+fn preserve_external_file_stream_matches_qpdf_11_9() {
+    let Some(oracle) = pinned_qpdf() else {
+        eprintln!("[SKIP cmp_diff_zero_tests] qpdf 11.9.0 is unavailable");
+        return;
+    };
+    let input = Path::new(env!("CARGO_MANIFEST_DIR"))
+        .join("../../tests/fixtures/compat/external-file-stream.pdf");
+    let directory = tempfile::tempdir().expect("tempdir");
+    let expected_path = directory.path().join("qpdf.pdf");
+    let status = std::process::Command::new(oracle)
+        .args(["--static-id", "--stream-data=preserve"])
+        .arg(&input)
+        .arg(&expected_path)
+        .status()
+        .expect("qpdf runs");
+    assert!(
+        matches!(status.code(), Some(0 | 3)),
+        "qpdf preserve rewrite must produce output, got {:?}",
+        status.code()
+    );
+
+    let actual = rewrite_preserve_qpdf_equivalent("external-file-stream.pdf");
+    let expected = std::fs::read(&expected_path).expect("qpdf output");
+    if let Some(off) = first_diff(&actual, &expected) {
+        let lo = off.saturating_sub(16);
+        panic!(
+            "external-file stream preserve output diverged from qpdf 11.9.0 \
+             (flpdf={} bytes, qpdf={} bytes, first diff at byte {off})\n\
+             flpdf : {:?}\nqpdf  : {:?}",
+            actual.len(),
+            expected.len(),
+            &actual[lo..(off + 16).min(actual.len())],
+            &expected[lo..(off + 16).min(expected.len())],
+        );
+    }
+}
+
 /// The pinned qpdf 11.9.0 oracle, or `None` when it is unavailable. Comparing
 /// against a different qpdf is not a parity result, so the version is checked.
 fn pinned_qpdf() -> Option<&'static str> {

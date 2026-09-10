@@ -226,6 +226,11 @@ public 面（`libqpdf/QPDFObjectHandle.cc:1300-1342`, `include/qpdf/QPDFObjectHa
 （`libqpdf/QPDFWriter.cc:1519-1523`）→ `"\nstream\n"` → `pushEncryptionFilter` → `writeBuffer` →
 `newline_before_endstream || (qdf_mode && last_char != '\n')` で `"\n"` → `"endstream"`。
 
+2026-09-10（`flpdf-vo76`）: `/F`・`/FFilter`・`/FDecodeParms` を併記した external-file
+stream の preserve output を qpdf 11.9.0 と byte 比較し、qpdf が in-body payload を読み、
+writer が外部参照キーを保持して `/Length` を出力 payload の直値へ更新する契約を固定した。
+テストは `crates/flpdf/tests/cmp_diff_zero_tests.rs::preserve_external_file_stream_matches_qpdf_11_9`。
+
 decode level / compress の設定源: `setStreamDataMode`（`libqpdf/QPDFWriter.cc:148-169`）/
 `setCompressStreams`（`libqpdf/QPDFWriter.cc:171-176`）/ `setDecodeLevel`
 （`libqpdf/QPDFWriter.cc:178-183`）/ `setRecompressFlate`（`libqpdf/QPDFWriter.cc:185-189`）。
