@@ -465,58 +465,12 @@ fn attachment_replace_input_with_an_output_path_is_rejected() {
 fn attachment_diagnostics_preserve_non_utf8_bytes() {
     use std::os::unix::ffi::OsStringExt;
 
-    if !qpdf_available() {
-        eprintln!("skipping: qpdf 11.9.0 is unavailable");
-        return;
-    }
-
     let directory = tempfile::tempdir().expect("temporary directory");
     let fixture = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
         .join("../../tests/fixtures/compat/one-page.pdf");
 
-    let key = std::path::PathBuf::from(std::ffi::OsString::from_vec(b"key-\xff".to_vec()));
-    let key_path = directory.path().join(&key);
-    fs::write(&key_path, b"payload\n").expect("write attachment");
-
-    let with_attachment = directory.path().join("base.pdf");
-    Command::cargo_bin("flpdf")
-        .expect("flpdf binary")
-        .current_dir(directory.path())
-        .args(["--static-id"])
-        .arg(&fixture)
-        .arg("--add-attachment")
-        .arg(&key)
-        .args(["--"])
-        .arg(&with_attachment)
-        .assert()
-        .success();
-
-    // Verbose removal must echo the stored key byte for byte.
-    let output = Command::cargo_bin("flpdf")
-        .expect("flpdf binary")
-        .current_dir(directory.path())
-        .env("FLPDF_PROGNAME", "qpdf")
-        .args(["--static-id", "--verbose"])
-        .arg({
-            let mut arg = std::ffi::OsString::from("--remove-attachment=");
-            arg.push(key.as_os_str());
-            arg
-        })
-        .arg(&with_attachment)
-        .arg(directory.path().join("removed.pdf"))
-        .output()
-        .expect("flpdf runs");
-    assert!(output.status.success());
-    let combined = [output.stdout.as_slice(), output.stderr.as_slice()].concat();
-    assert!(
-        combined
-            .windows(8)
-            .any(|window| window == b"key-\xff\n" || window.starts_with(b"key-\xff")),
-        "verbose removal must echo the raw key bytes, got {:?}",
-        String::from_utf8_lossy(&combined)
-    );
-
-    // A failed open must report the path byte for byte.
+    // A failed open must report the path byte for byte. This path is never
+    // created, so it works on every unix filesystem.
     let missing =
         std::path::PathBuf::from(std::ffi::OsString::from_vec(b"missing-\xff.pdf".to_vec()));
     let output = Command::cargo_bin("flpdf")
@@ -536,5 +490,54 @@ fn attachment_diagnostics_preserve_non_utf8_bytes() {
             .any(|window| window.starts_with(b"missing-\xff.pdf")),
         "a failed open must report the raw path bytes, got {:?}",
         String::from_utf8_lossy(&output.stderr)
+    );
+
+    // The stored attachment key only carries raw bytes when it is derived from
+    // the source filename: `--key=` goes through the same lossy argument
+    // conversion in qpdf itself, so it cannot produce one. Some filesystems
+    // (APFS) reject a name that is not valid UTF-8, so skip this half there
+    // rather than asserting on a file that cannot exist.
+    let key = std::path::PathBuf::from(std::ffi::OsString::from_vec(b"key-\xff".to_vec()));
+    let key_path = directory.path().join(&key);
+    if fs::write(&key_path, b"payload\n").is_err() {
+        eprintln!("skipping the attachment-key half: this filesystem rejects non-UTF-8 names");
+        return;
+    }
+
+    let with_attachment = directory.path().join("base.pdf");
+    Command::cargo_bin("flpdf")
+        .expect("flpdf binary")
+        .current_dir(directory.path())
+        .args(["--static-id"])
+        .arg(&fixture)
+        .arg("--add-attachment")
+        .arg(&key)
+        .args(["--"])
+        .arg(&with_attachment)
+        .assert()
+        .success();
+
+    let mut remove_arg = std::ffi::OsString::from("--remove-attachment=");
+    remove_arg.push(std::ffi::OsString::from_vec(b"key-\xff".to_vec()));
+    let output = Command::cargo_bin("flpdf")
+        .expect("flpdf binary")
+        .current_dir(directory.path())
+        .env("FLPDF_PROGNAME", "qpdf")
+        .args(["--static-id", "--verbose"])
+        .arg(&remove_arg)
+        .arg(&with_attachment)
+        .arg(directory.path().join("removed.pdf"))
+        .output()
+        .expect("flpdf runs");
+    assert!(
+        output.status.success(),
+        "verbose removal should succeed: {:?}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let combined = [output.stdout.as_slice(), output.stderr.as_slice()].concat();
+    assert!(
+        combined.windows(6).any(|window| window == b"key-\xff\n"),
+        "verbose removal must echo the raw key bytes, got {:?}",
+        String::from_utf8_lossy(&combined)
     );
 }
