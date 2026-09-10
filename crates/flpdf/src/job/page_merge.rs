@@ -1518,7 +1518,12 @@ fn merge_documents_with_resource_decisions_and_preserve_primary_into_impl<
                 .map(|object| object.number)
                 .max()
                 .unwrap_or(0);
-            while target_max <= primary_max_object {
+            // `make_indirect_object_handle` allocates at `target_max + 1`, so
+            // the padding is complete once the target maximum has reached the
+            // primary maximum: running on equality too would leave it at
+            // `primary_max_object + 1` and push the first foreign copy to
+            // `primary_max_object + 2`.
+            while target_max < primary_max_object {
                 target.make_indirect_object_handle(ObjectHandle::null())?;
                 target_max += 1;
             }

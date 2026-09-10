@@ -2208,3 +2208,70 @@ fn original_direct_widget_dropped_sibling_page_is_not_repaired() {
         "flpdf must not repair a direct widget's /P to its current owner"
     );
 }
+
+/// qpdf keeps the primary document's whole object-number space reserved while
+/// it imports the next page source, so the first object a foreign `ObjCopier`
+/// allocates lands at `primary_max + 1`. The QDF `%% Original object ID`
+/// comments are the visible record of that allocator ordering, so compare the
+/// full `--qdf` output rather than passing `--no-original-object-ids`, which is
+/// what the qpdf `copy-annotations` suite does and which would hide an
+/// allocator that starts one slot too high.
+#[test]
+fn foreign_source_allocator_identities_match_qpdf() {
+    if !qpdf_available() {
+        eprintln!("[SKIP cli_pages_acroform_qpdf] qpdf 11.9.0 is unavailable");
+        return;
+    }
+
+    let temp = tempfile::tempdir().expect("temporary directory");
+    let manifest = Path::new(env!("CARGO_MANIFEST_DIR"));
+    let primary = manifest.join("../../tests/fixtures/compat/three-page.pdf");
+
+    for foreign in [
+        FIXTURE,
+        NO_ACROFORM_FIXTURE,
+        "../../tests/fixtures/compat/form-fields-and-annotations.pdf",
+    ] {
+        let foreign = manifest.join(foreign);
+
+        let qpdf_output = temp.path().join("qpdf.pdf");
+        let qpdf_status = Shell::new(QPDF)
+            .args(["--static-id", "--qdf"])
+            .arg(&primary)
+            .arg("--pages")
+            .arg(".")
+            .arg(&foreign)
+            .arg("--")
+            .arg(&qpdf_output)
+            .status()
+            .expect("qpdf should spawn");
+        assert!(
+            qpdf_status.success(),
+            "qpdf --pages should succeed for {}",
+            foreign.display()
+        );
+
+        let flpdf_output = temp.path().join("flpdf.pdf");
+        Command::cargo_bin("flpdf")
+            .unwrap()
+            .env("FLPDF_STATIC_ID_QUIET", "1")
+            .args(["--static-id", "--qdf"])
+            .arg(&primary)
+            .arg("--pages")
+            .arg(".")
+            .arg(&foreign)
+            .arg("--")
+            .arg(&flpdf_output)
+            .assert()
+            .success();
+
+        let expected = std::fs::read(&qpdf_output).expect("read qpdf output");
+        let actual = std::fs::read(&flpdf_output).expect("read flpdf output");
+        assert_eq!(
+            actual,
+            expected,
+            "merged output must match qpdf byte for byte for {}",
+            foreign.display()
+        );
+    }
+}
