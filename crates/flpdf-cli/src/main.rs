@@ -5760,7 +5760,14 @@ fn run_page_operations_with_qpdf_job(
     } else {
         let input = args.input.clone().ok_or_else(missing_input_usage_error)?;
         let output = args.output.clone().ok_or_else(missing_output_usage_error)?;
-        reject_same_job_output(&input, &output)?;
+        // qpdf exempts a split run from the same-file check
+        // (`QPDFJob.cc:627`: `if ((!m->split_pages) && QUtil::same_file(...))`).
+        // A split never opens the output path itself -- it is a template that
+        // derives `input-1.pdf` and so on -- so naming the input there is not
+        // the overwrite this check exists to prevent.
+        if args.page_ops.split_pages.is_none() {
+            reject_same_job_output(&input, &output)?;
+        }
         (Some(input), output)
     };
 

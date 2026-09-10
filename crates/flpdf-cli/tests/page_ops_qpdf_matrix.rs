@@ -3681,3 +3681,57 @@ fn pages_copy_encryption_v2_donor_matches_qpdf() {
         String::from_utf8_lossy(&qpdf_encryption.stdout)
     );
 }
+
+/// A split run never opens its output path: the template only derives
+/// `input-1.pdf` and so on, so naming the input there is not the overwrite the
+/// same-file check exists to prevent. qpdf exempts splits explicitly
+/// (`QPDFJob.cc:627`: `if ((!m->split_pages) && QUtil::same_file(...))`).
+#[test]
+fn split_pages_accepts_an_output_template_equal_to_the_input() {
+    if !qpdf_available() {
+        eprintln!("[SKIP page_ops_qpdf_matrix] qpdf {EXPECTED_QPDF_VERSION} is unavailable");
+        return;
+    }
+
+    let temp = tempfile::tempdir().expect("temporary directory");
+    let input = temp.path().join("input.pdf");
+    std::fs::copy(fixture_abs(THREE_PAGE), &input).expect("copy fixture");
+
+    Command::cargo_bin("flpdf")
+        .expect("flpdf binary")
+        .env("FLPDF_PROGNAME", "qpdf")
+        .args(["--static-id", "--qdf"])
+        .arg(&input)
+        .args(["--split-pages=1"])
+        .arg(&input)
+        .assert()
+        .success();
+
+    for page in 1..=3 {
+        let chunk = temp.path().join(format!("input-{page}.pdf"));
+        assert!(
+            chunk.exists(),
+            "split must write {} when the template equals the input",
+            chunk.display()
+        );
+    }
+
+    // The input itself must survive untouched.
+    let original = std::fs::read(fixture_abs(THREE_PAGE)).expect("read fixture");
+    assert_eq!(
+        std::fs::read(&input).expect("read input"),
+        original,
+        "the split template must not overwrite the input"
+    );
+
+    // Without splitting, the same pair is still refused.
+    Command::cargo_bin("flpdf")
+        .expect("flpdf binary")
+        .env("FLPDF_PROGNAME", "qpdf")
+        .args(["--static-id"])
+        .arg(&input)
+        .arg(&input)
+        .assert()
+        .failure()
+        .code(2);
+}
