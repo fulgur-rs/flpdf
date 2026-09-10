@@ -714,6 +714,38 @@ and guards stream-observation order; `body_object_append_propagates_member_resol
 covers fallible emission. qtest and qtest-exceptions routes, active
 `.48.7/.48.10/.48.49` sessions, plan/check/show, shared emission redesign, and
 unrelated hint/Part 2/3 semantics remain outside this slice.
+### A6/A7/A8 standard writer accessor slice `flpdf-3yn9.48.23.21` (2026-09-10)
+
+The remaining standard-writer observations in `crates/flpdf/src/writer.rs` now
+follow qpdf's live writer-handle boundary. `QPDFWriter::writeObjectStream` and
+`writeObject` resolve source handles while writing ordinary objects and ObjStm
+members (`libqpdf/QPDFWriter.cc:1606-1810`); special-stream setup and the PCLm
+queue use the same writer-owned observation boundary
+(`libqpdf/QPDFWriter.cc:1914-1931,2928-2954`). Typed, key, stream, and null
+accessors resolve their receiver at entry
+(`libqpdf/QPDFObjectHandle.cc:240-446,965-1015,1257-1262,1575-1593`).
+
+The fresh scoped census found seven explicit `Pdf::resolve` sites and one
+non-resolving `/Root` `is_null` site in the standard writer. After the cutover,
+PCLm source handling, specialized-root validation, QDF pre-scan and body
+emission, source-backed `/Extends`, and page-content container discovery use
+`try_dereference`, `try_get_key`, `try_is_null`, or the canonical typed
+accessors; the scoped production route has zero explicit `Pdf::resolve`,
+`resolve_handle`, `resolve_handle_ref`, `get_key`, `has_key`, and `is_null`
+bridges. `as_stream_dict` is retained only after canonical dereference.
+Generated direct-ID helper `as_array`/`as_string` observations are deliberately
+not part of this row. Object-stream member serialization remains owned by the
+writer's canonical serializer, while numbering, marker placement, content
+normalization, output ordering, and error propagation are unchanged. The route
+contract is `crates/flpdf/tests/writer_accessor_route_contract_tests.rs`.
+qtest and qtest-exceptions routes, active `.48.7/.48.10/.48.49` sessions,
+shared live queue/emission redesign, and generated direct-ID helper migration
+remain outside this bounded slice.
+This is the `writer.rs` coordinator slice only: `writer/pclm.rs::Plan::build`
+still has its separate mixed-route `is_null`/`Pdf::resolve` observations at
+`pclm.rs:40,57,63,87`, so the complete PCLm planner route is intentionally not
+closed here. The existing PCLm route classification remains mixed until that
+separate helper slice is completed.
 
 ### 2026-09-10 current caller audit: optimization bounded cutover
 

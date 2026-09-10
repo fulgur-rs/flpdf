@@ -1860,6 +1860,37 @@ target functions and checks stream-observation ordering, while
 emission. qtest and qtest-exceptions routes, active `.48.7/.48.10/.48.49`
 sessions, linearization planning/check/show, shared emission redesign, and
 unrelated hint/Part 2/3 semantics remain outside this bounded row.
+### A6/A7/A8 standard writer accessor slice `flpdf-3yn9.48.23.21` (2026-09-10)
+
+The remaining standard-writer observations in `crates/flpdf/src/writer.rs` now
+use live canonical handles at the accessor boundary. qpdf's ordinary object
+and ObjStm emission owns source-handle resolution and dictionary observation in
+`QPDFWriter::writeObjectStream`/`writeObject`
+(`libqpdf/QPDFWriter.cc:1606-1810`); its special-stream setup and PCLm queue
+walk are the corresponding writer-owned boundaries
+(`libqpdf/QPDFWriter.cc:1914-1931,2928-2954`). The resolving contract belongs
+to `QPDFObjectHandle` (`libqpdf/QPDFObjectHandle.cc:240-446,965-1015,
+1257-1262,1575-1593`).
+
+The scoped production route replaced seven explicit `Pdf::resolve` calls and
+one non-resolving `/Root` `is_null` observation. PCLm source observation, the
+specialized-root check, QDF pre-scan and main body emission, source-backed
+`/Extends`, and page-content container discovery now use
+`try_dereference`, `try_get_key`, and `try_is_null` (or the canonical typed
+accessors that resolve their receiver). `as_stream_dict` remains only after a
+canonical dereference; direct `as_array`/`as_string` observations used by the
+generated-ID helpers are intentionally outside this bounded row. Object-stream
+member serialization remains owned by the writer's canonical serializer, and
+object numbering, marker placement, content normalization, error propagation,
+and output ordering are unchanged. The route contract is
+`crates/flpdf/tests/writer_accessor_route_contract_tests.rs`, including the
+stream-observation ordering check. qtest and qtest-exceptions routes, active
+`.48.7/.48.10/.48.49` sessions, shared live queue/emission redesign, and
+generated direct-ID helper migration remain outside this slice.
+This is the `writer.rs` coordinator slice only: `writer/pclm.rs::Plan::build`
+still has its separate mixed-route `is_null`/`Pdf::resolve` observations at
+`pclm.rs:40,57,63,87`, so the complete PCLm planner route is intentionally not
+closed here.
 
 ### QPDFJob `doInspection` combined top-level consumer `flpdf-giz3` (2026-09-10)
 
