@@ -661,6 +661,60 @@ mod final_handle_tests {
             .is_null());
     }
 
+    #[test]
+    fn canonical_form_pruning_reports_a_parse_exception() {
+        let mut pdf = fixture();
+        let form = form_with_resources(&pdf, b"not-flate");
+        form.as_stream_dict()
+            .expect("form dictionary")
+            .replace_key(b"/Filter", ObjectHandle::name(b"FlateDecode".to_vec()))
+            .expect("filter");
+
+        remove_unreferenced_resources_on_form(&mut pdf, form)
+            .expect("recoverable Form parse failures should be warnings");
+
+        assert!(pdf
+            .repair_diagnostics()
+            .entries()
+            .iter()
+            .any(|diagnostic| diagnostic
+                .message_string()
+                .contains("Unable to parse content stream: stream inflate")));
+    }
+
+    #[test]
+    fn page_resource_pruning_reports_a_parse_exception() {
+        let mut pdf = fixture();
+        let page_ref = crate::pages::page_refs(&mut pdf).expect("page refs")[0];
+        let page_handle = pdf.get_object_handle(page_ref);
+        pdf.resolve(&page_handle).expect("page resolves");
+        let replacement = page_handle.shallow_copy().expect("page is copyable");
+        let contents = pdf
+            .new_stream_with_data(Rc::new(b"not-flate".to_vec()))
+            .expect("content stream");
+        contents
+            .as_stream_dict()
+            .expect("content stream dictionary")
+            .replace_key(b"/Filter", ObjectHandle::name(b"FlateDecode".to_vec()))
+            .expect("filter");
+        replacement
+            .replace_key(b"/Contents", contents)
+            .expect("page contents");
+        pdf.replace_object(page_ref, replacement)
+            .expect("replace page");
+
+        super::remove_unreferenced_resources_on_page(&mut pdf, page_ref)
+            .expect("recoverable page parse failures should be warnings");
+
+        assert!(pdf
+            .repair_diagnostics()
+            .entries()
+            .iter()
+            .any(|diagnostic| diagnostic
+                .message_string()
+                .contains("Unable to parse content stream: stream inflate")));
+    }
+
     /// Build a page whose single declared Form XObject is malformed (either
     /// undecodable or unparseable, per `outer_stream`/`outer_filter`) but
     /// still declares a nested child Form. `remove_unreferenced_resources_in_form_xobjects`
