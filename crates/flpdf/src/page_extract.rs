@@ -308,9 +308,13 @@ pub(crate) fn append_selection_kids<RT: Read + Seek>(
             // same destination-order group as those imported objects, not the
             // fresh-object fallback after them.
             let original_ref = ObjectRef::new(*next_foreign_original, 0);
+            // cov:ignore-start: exhausting the u32 PDF object space requires
+            // more than 2^32 allocated foreign objects and is unreachable in
+            // a practical page-selection job.
             *next_foreign_original = next_foreign_original.checked_add(1).ok_or_else(|| {
                 Error::Unsupported("foreign QDF object identity overflows u32".to_owned())
             })?;
+            // cov:ignore-end
             writer_object_order.insert(
                 clone_ref,
                 WriterObjectOrderKey::foreign_with_original(clone_ref, original_ref),
