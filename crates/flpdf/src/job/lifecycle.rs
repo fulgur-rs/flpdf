@@ -4775,6 +4775,24 @@ impl QPDFJobConfig<'_> {
         Ok(self)
     }
 
+    /// Select qpdf's empty primary input.
+    ///
+    /// This is `QPDFJob::Config::emptyInput` (`libqpdf/QPDFJob_config.cc:27-40`).
+    /// Keep the explicit configuration bit separate from the empty document's
+    /// display description: `QPDFJob::create_qpdf` uses it to choose the
+    /// `emptyPDF` creation path, while the resulting document is still named
+    /// `empty PDF` for diagnostics. Like qpdf, selecting an empty input after
+    /// an input file (or selecting it twice) is a usage error.
+    pub fn empty_input(&mut self) -> Result<&mut Self> {
+        if self.job.configuration.input_file.is_some() || self.job.configuration.empty_input {
+            return Err(Error::Usage(UsageError::new(
+                "empty input can't be used since input file has already been given",
+            )));
+        }
+        self.job.configuration.empty_input = true;
+        Ok(self)
+    }
+
     /// Set the output filename, rejecting duplicate output selection.
     pub fn output_file(&mut self, output_file: impl Into<PathBuf>) -> Result<&mut Self> {
         self.job.set_output_file(output_file)?;
@@ -4949,6 +4967,24 @@ impl QPDFJobConfig<'_> {
             .configuration
             .rotations
             .insert(parameter.range, parameter.spec);
+        Ok(self)
+    }
+
+    /// Append qpdf's `collate` page-group sizes.
+    ///
+    /// This is `QPDFJob::Config::collate` (`libqpdf/QPDFJob_config.cc:95-125`).
+    /// qpdf permits repeated calls and appends each call's comma-separated
+    /// values to one ordered vector; an empty parameter appends the default
+    /// group size of one. Reuse the byte-oriented parser shared with the job
+    /// JSON boundary so its unsigned-prefix and error behavior remains one
+    /// canonical implementation.
+    pub fn collate(&mut self, parameter: impl AsRef<[u8]>) -> Result<&mut Self> {
+        let values = parse_qpdf_collate_parameter(parameter.as_ref())?;
+        self.job
+            .configuration
+            .collate
+            .get_or_insert_with(Vec::new)
+            .extend(values);
         Ok(self)
     }
 

@@ -3786,6 +3786,117 @@ fn config_page_specs_reject_a_json_pages_group_after_config_pages() {
     ));
 }
 
+/// `Config::emptyInput` selects the empty primary before qpdf's create/write
+/// lifecycle runs, so a caller must be able to configure it without encoding
+/// an equivalent job-JSON document.
+#[test]
+fn config_empty_input_runs_the_canonical_inspection_lifecycle() {
+    let mut job = QPDFJob::new();
+    job.config()
+        .empty_input()
+        .expect("empty input should be a valid primary selector")
+        .show_pages();
+
+    assert_eq!(job.run().unwrap(), JobExitCode::Success);
+}
+
+#[test]
+fn config_empty_input_rejects_a_preselected_input() {
+    let mut job = QPDFJob::new();
+    job.config()
+        .input_file("input.pdf")
+        .expect("the first input selector should be accepted");
+
+    let error = job
+        .config()
+        .empty_input()
+        .err()
+        .expect("qpdf rejects empty input after an input file");
+    assert!(matches!(
+        error,
+        Error::Usage(usage)
+            if usage.to_string() == "empty input can't be used since input file has already been given"
+    ));
+}
+
+#[test]
+fn config_empty_input_rejects_a_duplicate_empty_selector() {
+    let mut job = QPDFJob::new();
+    job.config()
+        .empty_input()
+        .expect("the first empty selector should be accepted");
+
+    let error = job
+        .config()
+        .empty_input()
+        .err()
+        .expect("qpdf rejects a duplicate empty selector");
+    assert!(matches!(
+        error,
+        Error::Usage(usage)
+            if usage.to_string() == "empty input can't be used since input file has already been given"
+    ));
+}
+
+#[test]
+fn config_collate_zero_selects_no_pages() {
+    let input =
+        Path::new(env!("CARGO_MANIFEST_DIR")).join("../../tests/fixtures/compat/three-page.pdf");
+    let tempdir = tempfile::tempdir().unwrap();
+    let output = tempdir.path().join("collate-zero.pdf");
+
+    let mut job = QPDFJob::new();
+    job.config()
+        .input_file(&input)
+        .unwrap()
+        .output_file(&output)
+        .unwrap()
+        .add_page_spec(".", "1-2", None)
+        .unwrap()
+        .add_page_spec(".", "3", None)
+        .unwrap()
+        .collate("0")
+        .unwrap();
+    assert_eq!(job.run().unwrap(), JobExitCode::Success);
+
+    let mut pdf = Pdf::open(BufReader::new(File::open(output).unwrap())).unwrap();
+    assert!(
+        flpdf::pages::page_refs(&mut pdf).unwrap().is_empty(),
+        "qpdf collate=0 must produce an empty selected-page result"
+    );
+}
+
+#[test]
+fn config_collate_appends_values_in_declaration_order() {
+    let input =
+        Path::new(env!("CARGO_MANIFEST_DIR")).join("../../tests/fixtures/compat/three-page.pdf");
+    let tempdir = tempfile::tempdir().unwrap();
+    let output = tempdir.path().join("collate-append.pdf");
+
+    let mut job = QPDFJob::new();
+    job.config()
+        .input_file(&input)
+        .unwrap()
+        .output_file(&output)
+        .unwrap()
+        .add_page_spec(".", "1", None)
+        .unwrap()
+        .add_page_spec(".", "2", None)
+        .unwrap()
+        .collate("0")
+        .unwrap()
+        .collate("1")
+        .unwrap();
+    assert_eq!(job.run().unwrap(), JobExitCode::Success);
+
+    let mut pdf = Pdf::open(BufReader::new(File::open(output).unwrap())).unwrap();
+    assert_eq!(
+        flpdf::pages::page_refs(&mut pdf).unwrap().len(),
+        1,
+        "collate values must append as [0, 1], not replace the first group"
+    );
+}
+
 #[test]
 fn json_page_specs_reject_a_config_pages_group_after_json_pages() {
     let mut job = QPDFJob::new();

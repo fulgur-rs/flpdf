@@ -431,8 +431,30 @@ fn apply_top_level_inspection_transformations<R: Read + Seek + 'static>(
     remove_restrictions: bool,
     coalesce_contents: bool,
 ) -> CliResult<()> {
+    configure_top_level_inspection_transformations(
+        job,
+        options,
+        verbose,
+        remove_restrictions,
+        coalesce_contents,
+    );
+    job.apply_transformations(pdf)?;
+    Ok(())
+}
+
+/// Configure the create-stage transformations that qpdf applies before a
+/// top-level inspection. Keeping this separate from the application step lets
+/// the full `QPDFJob::create_qpdf` lifecycle own page-selection inspections as
+/// well as already-open standalone documents.
+fn configure_top_level_inspection_transformations(
+    job: &mut QPDFJob,
+    options: InspectionTransformOptions,
+    verbose: bool,
+    remove_restrictions: bool,
+    coalesce_contents: bool,
+) {
     if options.is_empty() && !remove_restrictions && !coalesce_contents {
-        return Ok(());
+        return;
     }
 
     job.set_verbose(verbose);
@@ -460,8 +482,6 @@ fn apply_top_level_inspection_transformations<R: Read + Seek + 'static>(
             configuration.optimize_images(options.image.image_options);
         }
     }
-    job.apply_transformations(pdf)?;
-    Ok(())
 }
 
 /// Translate the CLI's effective writer options into the reusable library
@@ -3898,7 +3918,7 @@ fn top_level_inspection_combination_requested(args: &Cli) -> bool {
     .filter(|selected| *selected)
     .count();
 
-    if inspection_count > 1 {
+    if inspection_count > 1 || (inspection_count == 1 && !args.page_ops.pages.is_empty()) {
         return true;
     }
 
@@ -3968,10 +3988,75 @@ fn configure_top_level_inspection_job(job: &mut QPDFJob, args: &Cli) -> CliResul
     Ok(())
 }
 
+/// Run a top-level `--pages` invocation whose output is a qpdf inspection.
+///
+/// qpdf still creates and transforms the page-selected document before its
+/// inspection branch; the absence of an output file only changes the
+/// `writeQPDF` consumer. Keep this route on the public QPDFJob lifecycle so
+/// page selection cannot be silently bypassed by a standalone inspection
+/// helper.
+fn run_top_level_page_selection_inspection(
+    args: &Cli,
+    transform_options: InspectionTransformOptions,
+) -> CliResult<()> {
+    let mut job = new_cli_job(args.no_warn);
+    let input_options = pdf_open_options(args.repair, &args.password)?;
+    job.set_password(input_options.password);
+    job.set_password_mode(args.password.password_mode.into());
+    job.set_password_is_hex_key(args.password.password_is_hex_key);
+    job.set_suppress_password_recovery(args.password.suppress_password_recovery);
+    job.set_suppress_recovery(args.password.recovery.suppress_recovery);
+    job.set_ignore_xref_streams(args.password.recovery.ignore_xref_streams);
+    job.set_verbose(args.verbose);
+    configure_top_level_inspection_job(&mut job, args)?;
+    configure_top_level_inspection_transformations(
+        &mut job,
+        transform_options,
+        args.verbose,
+        args.remove_restrictions,
+        args.coalesce_contents,
+    );
+    configure_keep_files_open(&mut job, &args.page_ops)?;
+
+    if args.page_ops.empty {
+        reject_empty_inspection_output(args.input.as_deref())?;
+        job.config().empty_input()?;
+    } else {
+        let input = args.input.as_ref().ok_or_else(missing_input_usage_error)?;
+        job.config().input_file(input.clone())?;
+    }
+
+    let raw_specs = parse_pages_segment(&raw_page_tokens(&args.page_ops))?;
+    {
+        let mut configuration = job.config();
+        for spec in raw_specs {
+            let password = spec.raw_password.or_else(|| {
+                spec.password
+                    .as_ref()
+                    .map(|password| arg_parser::os_bytes(password.as_os_str()))
+            });
+            configuration.add_page_spec(PathBuf::from(spec.file_token), &spec.range, password)?;
+        }
+        for parameter in &args.page_ops.rotate {
+            configuration.rotate(arg_parser::os_bytes(parameter.as_os_str()))?;
+        }
+        for parameter in &args.page_ops.collate {
+            configuration.collate(parameter.as_bytes())?;
+        }
+        configuration.remove_unreferenced_resources(args.remove_unreferenced_resources.into());
+    }
+
+    finish_job_exit_status(job.run()?)
+}
+
 fn run_combined_top_level_inspection(
     args: &Cli,
     transform_options: InspectionTransformOptions,
 ) -> CliResult<()> {
+    if !args.page_ops.pages.is_empty() {
+        return run_top_level_page_selection_inspection(args, transform_options);
+    }
+
     let mut job = new_cli_job(args.no_warn);
     configure_top_level_inspection_job(&mut job, args)?;
     if args.show_attachment.is_some() {
