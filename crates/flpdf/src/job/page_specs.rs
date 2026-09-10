@@ -406,19 +406,14 @@ fn restore_occurrence_writer_provenance<T: Read + Seek + 'static, R: Read + Seek
             }
         }
     }
-    for (output_index, &(source_index, group_index)) in ordered_pages.iter().enumerate() {
+    let mut cloned_pages: Vec<BTreeSet<ObjectRef>> = vec![BTreeSet::new(); sources.len()];
+    for &(source_index, group_index) in ordered_pages {
         let source_page_index = grouped_pages[source_index][group_index];
         let source_page_ref = source_page_refs[source_index][source_page_index];
-        let first =
-            ordered_pages[..output_index]
-                .iter()
-                .any(|&(previous_source, previous_group)| {
-                    previous_source == source_index
-                        && source_page_refs[previous_source]
-                            [grouped_pages[previous_source][previous_group]]
-                            == source_page_ref
-                });
-        if first {
+        // A repeated occurrence of a page already selected from the same source
+        // is the clone qpdf allocates at this point, so it takes fresh
+        // provenance. The per-source seen set keeps this pass linear.
+        if !cloned_pages[source_index].insert(source_page_ref) {
             fresh_refs.push(grouped_refs[offsets[source_index] + group_index]);
         }
     }
