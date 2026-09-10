@@ -4172,17 +4172,32 @@ impl<R: Read + Seek> ResolverHandle<R> {
                     Some(b'\n') | None => {}
                     Some(_) => {
                         self.unread_byte()?;
-                        self.push_warning("stream keyword followed by carriage return only")?;
+                        // qpdf calls damagedPDF(m->file->tell(), message)
+                        // here. The unread byte leaves tell() at the first
+                        // stream-data byte, while last_object_description is
+                        // still the stream object installed by readObject.
+                        let offset = self.tell()?;
+                        let message = "stream keyword followed by carriage return only";
+                        self.push_warning_at_with_last_object_description(offset, message)?;
                     }
                 }
                 return Ok(());
             }
             if !crate::tokenizer::is_ws(byte) {
                 self.unread_byte()?;
-                self.push_warning("stream keyword not followed by proper line terminator")?;
+                // The non-whitespace byte is unread before qpdf asks the
+                // InputSource for tell(), so the warning points at that byte
+                // rather than at the preceding read's last_offset.
+                let offset = self.tell()?;
+                let message = "stream keyword not followed by proper line terminator";
+                self.push_warning_at_with_last_object_description(offset, message)?;
                 return Ok(());
             }
-            self.push_warning("stream keyword followed by extraneous whitespace")?;
+            // qpdf reports tell() after consuming the extraneous whitespace;
+            // InputSource::getLastOffset() would be one byte too early.
+            let offset = self.tell()?;
+            let message = "stream keyword followed by extraneous whitespace";
+            self.push_warning_at_with_last_object_description(offset, message)?;
         }
     }
 
@@ -12956,17 +12971,17 @@ mod tests {
             (
                 b"\r",
                 b"abc",
-                &["offset 76: stream keyword followed by carriage return only"][..],
+                &["object 2 0, offset 76: stream keyword followed by carriage return only"][..],
             ),
             (
                 b" \n",
                 b"abc",
-                &["offset 75: stream keyword followed by extraneous whitespace"][..],
+                &["object 2 0, offset 76: stream keyword followed by extraneous whitespace"][..],
             ),
             (
                 b"",
                 b"(abc)",
-                &["offset 75: stream keyword not followed by proper line terminator"][..],
+                &["object 2 0, offset 75: stream keyword not followed by proper line terminator"][..],
             ),
         ] {
             let mut body = format!("2 0 obj\n<< /Length {} >>\nstream", payload.len()).into_bytes();
