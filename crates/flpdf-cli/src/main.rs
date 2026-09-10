@@ -6161,6 +6161,11 @@ fn parse_pages_segment<T: RawCliArg>(tokens: &[T]) -> CliResult<Vec<PageSegmentS
             let cur = specs
                 .last_mut()
                 .ok_or("--pages: --password= must follow a file in the --pages segment")?;
+            if cur.password.is_some() {
+                return Err(Box::new(UsageError::new(
+                    "--password already specified for this file",
+                )));
+            }
             cur.password = Some(arg_parser::os_string_from_bytes(pw));
             cur.raw_password = Some(pw.to_vec());
             continue;
