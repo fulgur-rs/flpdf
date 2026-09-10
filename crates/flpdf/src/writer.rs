@@ -3721,7 +3721,7 @@ fn write_pclm<R: Read + Seek, W: Write>(
         match *item {
             pclm::Item::Source { source, output } => {
                 let source_handle = pdf.get_object_handle(source);
-                pdf.resolve(&source_handle)?;
+                source_handle.try_dereference()?;
                 let offset = bytes.len();
                 bytes.extend_from_slice(format!("{} 0 obj\n", output.number).as_bytes());
                 let map = |object_ref| {
@@ -4047,7 +4047,7 @@ fn emit_canonical_pdf_inner<R: Read + Seek, W: Write>(
     let root_ref = pdf.root_ref();
     let root_handle = if root_ref.is_none() {
         let root_candidate = pdf.trailer_key_handle(b"Root");
-        if root_candidate.is_null() {
+        if root_candidate.try_is_null()? {
             return Err(crate::Error::Missing("/Root"));
         }
         Some(pdf.root_handle()?)
@@ -4618,7 +4618,7 @@ fn emit_canonical_pdf_inner<R: Read + Seek, W: Write>(
             // a non-stream object, or the XRef structural stream that the QDF
             // pre-scan skips because it is rebuilt separately.
             let object_handle = pdf.get_object_handle(*old_ref);
-            pdf.resolve(&object_handle)?;
+            object_handle.try_dereference()?;
             let is_real_stream = if object_handle.as_stream_dict().is_some() {
                 let is_structural = object_handle.try_is_stream_of_type(b"XRef", b"")?;
                 if is_structural {
@@ -4837,7 +4837,7 @@ fn emit_canonical_pdf_inner<R: Read + Seek, W: Write>(
         // unparsing; it does not materialize the whole object graph before
         // emission.
         let object_handle = pdf.get_object_handle(*old_ref);
-        pdf.resolve(&object_handle)?;
+        object_handle.try_dereference()?;
         let is_stream = object_handle.as_stream_dict().is_some();
 
         // Direct `/Contents` streams have no terminal ObjectRef to put in
@@ -5148,7 +5148,6 @@ fn emit_canonical_pdf_inner<R: Read + Seek, W: Write>(
         let mut handles = Vec::with_capacity(batch.len());
         for &old in batch {
             let handle = pdf.get_object_handle(old);
-            pdf.resolve(&handle)?;
             let new = if options.qdf {
                 qdf_emission_renumber
                     .get(&old)
@@ -5295,7 +5294,7 @@ fn emit_canonical_pdf_inner<R: Read + Seek, W: Write>(
         };
         let extends = if let Some(source_container) = source_container_for_batch[batch_idx] {
             let source_handle = pdf.get_object_handle(source_container);
-            pdf.resolve(&source_handle)?;
+            source_handle.try_dereference()?;
             let extends = source_handle
                 .as_stream_dict()
                 .map(|dict| dict.try_get_key(b"/Extends"))
@@ -5788,7 +5787,6 @@ fn collect_content_container_refs<R: Read + Seek>(
     containers: &mut BTreeSet<ObjectRef>,
 ) -> Result<()> {
     let page_handle = pdf.get_object_handle(page_ref);
-    pdf.resolve(&page_handle)?;
     let contents = page_handle.try_get_key(b"/Contents")?;
     if contents.type_code()? == 10 {
         if contents.object_ref().is_none() {
@@ -5821,7 +5819,6 @@ pub(crate) fn collect_content_stream_refs<R: Read + Seek>(
     page_ref: ObjectRef,
 ) -> Result<Vec<ObjectRef>> {
     let page_handle = pdf.get_object_handle(page_ref);
-    pdf.resolve(&page_handle)?;
     let contents = page_handle.try_get_key(b"/Contents")?;
     if contents.type_code()? == 10 {
         return Ok(contents.object_ref().into_iter().collect());

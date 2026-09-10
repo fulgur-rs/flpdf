@@ -24,8 +24,9 @@ pub(crate) struct ObjStmBody {
     pub n_members: usize,
 }
 
-/// Serialise a list of pre-resolved `(ObjectRef, Object)` pairs into an ObjStm
-/// body following ISO 32000-1 §7.5.7.
+/// Serialise a list of live `(ObjectRef, ObjectHandle)` pairs into an ObjStm
+/// body following ISO 32000-1 §7.5.7. The handles remain live until the
+/// caller-owned serializer observes each member.
 ///
 /// This inner function does the real work without touching a `Pdf` reader; it
 /// exists primarily to make unit-testing Pdf-free.
