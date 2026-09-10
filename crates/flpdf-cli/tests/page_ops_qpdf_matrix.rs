@@ -1745,6 +1745,86 @@ fn pages_then_split_encrypted_primary_matches_qpdf_cleartext_chunks() {
     }
 }
 
+#[test]
+fn pages_encrypt_then_split_outputs_encrypted_chunks_like_qpdf() {
+    // qpdf applies explicit --encrypt in setWriterOptions for every fresh
+    // doSplitPages writer. The page-operation guard must therefore not reject
+    // this combination before the canonical writer sees the configuration.
+    if !qpdf_available() {
+        return;
+    }
+    let qdir = tempfile::tempdir().unwrap();
+    let fdir = tempfile::tempdir().unwrap();
+    let src = fixture_abs(THREE_PAGE);
+    let qtemplate = qdir.path().join("encrypted.pdf");
+    let ftemplate = fdir.path().join("encrypted.pdf");
+
+    let qpdf_args = [
+        "--static-id",
+        "--static-aes-iv",
+        "--password-mode=bytes",
+        "--encrypt",
+        "user",
+        "owner",
+        "128",
+        "--use-aes=y",
+        "--",
+        src.to_str().unwrap(),
+        "--pages",
+        ".",
+        "1-3",
+        "--",
+        "--split-pages=1",
+        qtemplate.to_str().unwrap(),
+    ];
+    let (qpdf_ok, qpdf_stdout) = run_qpdf(&qpdf_args);
+    assert!(
+        qpdf_ok,
+        "qpdf pages+encrypt+split should succeed: {qpdf_stdout}"
+    );
+
+    Command::cargo_bin("flpdf")
+        .unwrap()
+        .args([
+            "--static-id",
+            "--static-aes-iv",
+            "--password-mode=bytes",
+            "--encrypt",
+            "user",
+            "owner",
+            "128",
+            "--use-aes=y",
+            "--",
+        ])
+        .arg(&src)
+        .args(["--pages", ".", "1-3", "--", "--split-pages=1"])
+        .arg(&ftemplate)
+        .assert()
+        .success();
+
+    let expected = vec![
+        "encrypted-1.pdf".to_owned(),
+        "encrypted-2.pdf".to_owned(),
+        "encrypted-3.pdf".to_owned(),
+    ];
+    assert_eq!(split_outputs(qdir.path()), expected);
+    assert_eq!(split_outputs(fdir.path()), expected);
+    for name in expected {
+        let qpath = qdir.path().join(&name);
+        let fpath = fdir.path().join(&name);
+        assert_eq!(npages_of_with_password(&qpath, "user"), 1);
+        assert_eq!(npages_of_with_password(&fpath, "user"), 1);
+        assert_qpdf_encrypted_output(&qpath, "user");
+        assert_qpdf_encrypted_output(&fpath, "user");
+        #[cfg(feature = "qpdf-zlib-compat")]
+        assert_eq!(
+            std::fs::read(&qpath).unwrap(),
+            std::fs::read(&fpath).unwrap(),
+            "encrypted split chunk {name} must be byte-identical to qpdf"
+        );
+    }
+}
+
 // ===========================================================================
 // --collate : interleave parity
 // ===========================================================================

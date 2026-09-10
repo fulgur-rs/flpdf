@@ -271,6 +271,14 @@ qtest exceptions と他の transformation/page-operation の未解消ルート�
 へ送り、writer 完了後に `wrote file <output>` を送り、missing key は qpdf の
 `attachment <key> not found` を raw bytes のまま返す（`libqpdf/QPDFJob.cc:2230-2241,3030-3062`）。
 
+2026-09-10（`flpdf-0saq`）: E-5 の page-operation output で明示的な `--encrypt` を許可し、
+qpdf の `writeQPDF` → `doSplitPages` → chunk ごとの `setWriterOptions`
+（`libqpdf/QPDFJob.cc:483-511,2847-2903,2939-3027`）に対応させた。top-level と `rewrite`
+の page-operation route は、ページ選択後の writer configuration へ encryption parameters を
+渡す。`page_ops_qpdf_matrix.rs::pages_encrypt_then_split_outputs_encrypted_chunks_like_qpdf`
+で qpdf 11.9.0 と 3 chunk の暗号化・byte parity を検証した。copy-encryption/decrypt と
+その他の create-stage mutation の組合せは `flpdf-1emn` など別 scope に残す。
+
 ### E-28 detail: `qpdf/test_driver.cc` case-level classification (P-2)
 
 2026-09-07、`flpdf-3yn9.48.11` の一環として 99 ケース全件（case 0〜98。case 0/1 は共有関数

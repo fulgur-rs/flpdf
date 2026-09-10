@@ -6287,9 +6287,10 @@ fn top_level_coalesce_contents_conflicts_with_linearize() {
 fn top_level_coalesce_contents_conflicts_with_pages() {
     // Silent-shadow guard: the page-op dispatch branch owns the write via
     // run_page_extraction / run_rewrite_with_page_ops, neither of which reads
-    // `args.coalesce_contents`. The `--encrypt` / `--overlay` combinations
-    // are already rejected inside that branch; mirror the same treatment for
-    // --coalesce-contents at the clap level.
+    // `args.coalesce_contents`. The remaining unsupported
+    // `--copy-encryption` / `--overlay` combinations are handled inside that
+    // branch; mirror the same treatment for --coalesce-contents at the clap
+    // level.
     Command::cargo_bin("flpdf")
         .unwrap()
         .args([
@@ -6456,7 +6457,7 @@ fn top_level_generate_appearances_conflicts_with_pages() {
     // Silent-shadow guard: the page-op dispatch branch owns the write via
     // run_page_extraction / run_rewrite_with_page_ops, neither of which
     // reads `args.generate_appearances` (mirrors the `--coalesce-contents`
-    // / `--encrypt` treatment in the same branch).
+    // / `--copy-encryption` treatment in the same branch).
     Command::cargo_bin("flpdf")
         .unwrap()
         .args([

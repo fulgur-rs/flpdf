@@ -1530,17 +1530,12 @@ fn encrypt_conflicts_with_check_inspection_path() {
         .stderr(predicates::str::contains("cannot be used"));
 }
 
-/// `--encrypt` combined with page operations (`--pages`, `--rotate`,
-/// `--split-pages`, `--collate`) must be rejected upfront: the page-op
-/// pipeline does not thread `WriterOptions.encrypt` through to its
-/// extraction/rewrite paths, so silently honoring `--encrypt` here would
-/// produce plaintext output despite the user's request. Mirrors the
-/// existing `--decrypt` / `--remove-restrictions` rejection in the same
-/// dispatch.
+/// `--encrypt` combined with `--pages` must reach the canonical writer after
+/// page selection, matching qpdf's createQPDF/writeQPDF split.
 #[test]
-fn encrypt_is_rejected_when_combined_with_page_operations_top_level() {
+fn encrypt_succeeds_when_combined_with_pages_top_level() {
     let tmp = tempfile::tempdir().unwrap();
-    let output = tmp.path().join("nope.pdf");
+    let output = tmp.path().join("encrypted-pages.pdf");
     Command::cargo_bin("flpdf")
         .unwrap()
         .args([
@@ -1555,19 +1550,23 @@ fn encrypt_is_rejected_when_combined_with_page_operations_top_level() {
             "1-z",
             "--",
         ])
-        .arg(fixture(UNENCRYPTED_FIXTURE))
+        .arg(fixture(ONE_PAGE_FIXTURE))
         .arg(&output)
         .assert()
-        .failure()
-        .stderr(predicates::str::contains("--encrypt"))
-        .stderr(predicates::str::contains("--pages"));
-    assert!(!output.exists());
+        .success();
+    let check = ShellCommand::new("qpdf")
+        .args(["--password=u", "--show-encryption"])
+        .arg(&output)
+        .output()
+        .unwrap();
+    assert!(check.status.success());
+    assert!(String::from_utf8_lossy(&check.stdout).contains("R = 4"));
 }
 
 #[test]
-fn encrypt_is_rejected_when_combined_with_page_operations_subcommand() {
+fn encrypt_succeeds_when_combined_with_pages_subcommand() {
     let tmp = tempfile::tempdir().unwrap();
-    let output = tmp.path().join("nope.pdf");
+    let output = tmp.path().join("encrypted-pages.pdf");
     Command::cargo_bin("flpdf")
         .unwrap()
         .args([
@@ -1583,13 +1582,17 @@ fn encrypt_is_rejected_when_combined_with_page_operations_subcommand() {
             "1-z",
             "--",
         ])
-        .arg(fixture(UNENCRYPTED_FIXTURE))
+        .arg(fixture(ONE_PAGE_FIXTURE))
         .arg(&output)
         .assert()
-        .failure()
-        .stderr(predicates::str::contains("--encrypt"))
-        .stderr(predicates::str::contains("--pages"));
-    assert!(!output.exists());
+        .success();
+    let check = ShellCommand::new("qpdf")
+        .args(["--password=u", "--show-encryption"])
+        .arg(&output)
+        .output()
+        .unwrap();
+    assert!(check.status.success());
+    assert!(String::from_utf8_lossy(&check.stdout).contains("R = 4"));
 }
 
 #[test]

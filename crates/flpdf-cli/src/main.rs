@@ -3606,23 +3606,6 @@ fn main() {
         // `flpdf in.pdf --pages . 1-3 -- out.pdf`). Mirrors the `rewrite`
         // subcommand's page-op dispatch below.
         //
-        // The page-op pipeline does not thread `WriterOptions.encrypt`
-        // through to the page-extraction / page-rewrite paths, so
-        // silently honoring `--encrypt` here would emit plaintext output
-        // even though the user asked for encryption. Reject upfront with
-        // the same shape `rewrite --encrypt --pages …` already uses
-        // (mirrors the existing `--decrypt` / `--remove-restrictions`
-        // rejection in the subcommand surface). Wiring encryption
-        // through the page-op pipeline is unsupported, so reject the option
-        // before any page operation runs.
-        if args.encrypt.is_some() {
-            emit_logger_error(
-                "flpdf: --encrypt is not applied in the \
-                 --pages/--rotate/--split-pages/--collate pipeline; \
-                 rerun without --encrypt or without the page operation\n",
-            );
-            std::process::exit(1);
-        }
         if args.copy_encryption.is_some() {
             emit_logger_error(
                 "flpdf: --copy-encryption is not applied in the \
@@ -3667,6 +3650,14 @@ fn main() {
                 }
             }
         }
+        apply_encryption_options(
+            &mut options,
+            args.raw_encrypt.as_deref(),
+            args.copy_encryption.as_deref(),
+            args.raw_encryption_file_password.as_deref(),
+            &args.password,
+            args.no_warn,
+        );
         if args.page_ops.empty && !args.page_ops.pages.is_empty() && args.output.is_none() {
             match args.input.clone() {
                 Some(output) => run_empty_page_extraction(
@@ -4847,8 +4838,9 @@ fn run_command(command: Commands, overlay_specs: &[OverlaySpec]) -> CliResult<()
                 // the rewrite-only mutation passes. Silently dropping them
                 // would make the command partially succeed; reject the
                 // unsupported combinations loudly instead. Writer settings,
-                // including content normalization, are applied by the final
-                // PdfWriter and are therefore intentionally accepted here.
+                // including explicit --encrypt and content normalization, are
+                // applied by the final PdfWriter and are therefore accepted
+                // here.
                 //
                 // --decrypt is rejected for the same reason: the page-ops
                 // pipeline already rejects encrypted inputs (so a useful
@@ -4867,13 +4859,12 @@ fn run_command(command: Commands, overlay_specs: &[OverlaySpec]) -> CliResult<()
                 if coalesce_contents
                     || cmd.remove_restrictions
                     || cmd.decrypt
-                    || cmd.encrypt.is_some()
                     || cmd.copy_encryption.is_some()
                     || cmd.generate_appearances
                     || cmd.flatten_annotations.is_some()
                 {
                     emit_logger_error(
-                        "flpdf: --coalesce-contents / --remove-restrictions / --decrypt / --encrypt / \
+                        "flpdf: --coalesce-contents / --remove-restrictions / --decrypt / \
                          --copy-encryption / --flatten-annotations / \
                          --generate-appearances are \
                          not applied in the --pages/--rotate/--split-pages/\
