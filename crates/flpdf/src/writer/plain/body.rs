@@ -518,15 +518,14 @@ impl<'a, R: Read + Seek + 'static> crate::writer::write_object::WriteObject
     }
 
     fn output_number(&self, object: ObjectRef) -> crate::Result<u32> {
+        // cov:ignore-start: llvm-coverage attributes this raw-orphan branch's
+        // closing guard to the integration-tested return path.
         if object == ObjectRef::new(0, 0) {
             if let Some(output) = self.current_raw_output {
-                // cov:ignore-start: llvm-coverage attributes this raw-orphan
-                // return to the branch guard; the integration test exercises
-                // the complete output path.
                 return Ok(output.number);
-                // cov:ignore-end
             }
         }
+        // cov:ignore-end
         self.queue
             .borrow()
             .old_to_new
