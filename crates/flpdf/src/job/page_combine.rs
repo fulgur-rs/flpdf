@@ -37,7 +37,7 @@
 //! let mut a = Pdf::open(BufReader::new(File::open("a.pdf")?))?;
 //! let mut b = Pdf::open(BufReader::new(File::open("b.pdf")?))?;
 //! let range_a = PageRange::parse("1-5")?;
-//! let range_b = PageRange::parse("")?;
+//! let range_b = PageRange::all();
 //!
 //! let plan = CombinedPlan::build(vec![
 //!     (&mut a, range_a),
@@ -355,7 +355,7 @@ mod tests {
     #[test]
     fn single_input_all_pages() {
         let mut pdf = open(build_n_page_pdf(3));
-        let range = PageRange::parse("").unwrap();
+        let range = PageRange::all();
         let plan = CombinedPlan::build(vec![(&mut pdf, range)]).unwrap();
 
         assert_eq!(plan.input_count(), 1);
@@ -397,7 +397,7 @@ mod tests {
         let mut pdf_b = open(build_n_page_pdf(2));
 
         let range_a = PageRange::parse("2,4").unwrap();
-        let range_b = PageRange::parse("").unwrap();
+        let range_b = PageRange::all();
         let plan = CombinedPlan::build(vec![(&mut pdf_a, range_a), (&mut pdf_b, range_b)]).unwrap();
 
         let plans = plan.per_input_plans();
@@ -413,8 +413,8 @@ mod tests {
         let mut pdf_a = open(build_n_page_pdf(2));
         let mut pdf_b = open(build_n_page_pdf(3));
         let plan = CombinedPlan::build(vec![
-            (&mut pdf_a, PageRange::parse("").unwrap()),
-            (&mut pdf_b, PageRange::parse("").unwrap()),
+            (&mut pdf_a, PageRange::all()),
+            (&mut pdf_b, PageRange::all()),
         ])
         .unwrap();
         assert_eq!(plan.base_index(), 0);
@@ -443,9 +443,9 @@ mod tests {
         let mut pdf_c = open(build_n_page_pdf(1));
 
         let plan = CombinedPlan::build(vec![
-            (&mut pdf_a, PageRange::parse("").unwrap()),
+            (&mut pdf_a, PageRange::all()),
             (&mut pdf_b, PageRange::parse("1,3").unwrap()),
-            (&mut pdf_c, PageRange::parse("").unwrap()),
+            (&mut pdf_c, PageRange::all()),
         ])
         .unwrap();
 
@@ -548,25 +548,17 @@ mod tests {
     fn input_spec_password_is_forwarded_to_open_options() {
         // Verify that InputSpec::new correctly stores the password field,
         // so it will be passed to PdfOpenOptions when from_specs is called.
-        let spec = InputSpec::new(
-            "test.pdf",
-            Some(b"secret".to_vec()),
-            PageRange::parse("").unwrap(),
-        );
+        let spec = InputSpec::new("test.pdf", Some(b"secret".to_vec()), PageRange::all());
         assert_eq!(spec.password, Some(b"secret".to_vec()));
 
         // Also verify no-password case
-        let spec_no_pw = InputSpec::new("test.pdf", None, PageRange::parse("").unwrap());
+        let spec_no_pw = InputSpec::new("test.pdf", None, PageRange::all());
         assert_eq!(spec_no_pw.password, None);
     }
 
     #[test]
     fn from_specs_nonexistent_file_is_actionable_error() {
-        let spec = InputSpec::new(
-            "/nonexistent/path/to/file.pdf",
-            None,
-            PageRange::parse("").unwrap(),
-        );
+        let spec = InputSpec::new("/nonexistent/path/to/file.pdf", None, PageRange::all());
         let err = CombinedPlan::from_specs(vec![spec]).unwrap_err();
         let msg = err.to_string();
         assert!(
@@ -587,11 +579,7 @@ mod tests {
 
     #[test]
     fn from_specs_nonexistent_file_preserves_io_error_variant() {
-        let spec = InputSpec::new(
-            "/nonexistent/path/to/file.pdf",
-            None,
-            PageRange::parse("").unwrap(),
-        );
+        let spec = InputSpec::new("/nonexistent/path/to/file.pdf", None, PageRange::all());
         let err = CombinedPlan::from_specs(vec![spec]).unwrap_err();
         // Error::Io must be preserved so CLI layers can distinguish IO failures.
         assert!(
@@ -606,12 +594,8 @@ mod tests {
         let input = directory.path().join("malformed.pdf");
         std::fs::write(&input, b"not a PDF").expect("write malformed fixture");
 
-        let error = CombinedPlan::from_specs(vec![InputSpec::new(
-            &input,
-            None,
-            PageRange::parse("").expect("all pages range"),
-        )])
-        .expect_err("a malformed input must fail to open");
+        let error = CombinedPlan::from_specs(vec![InputSpec::new(&input, None, PageRange::all())])
+            .expect_err("a malformed input must fail to open");
 
         assert!(matches!(error, Error::Unsupported(message)
             if message.contains("input 0")
@@ -633,7 +617,7 @@ mod tests {
         let error = CombinedPlan::from_specs(vec![InputSpec::new(
             &input,
             Some(b"wrong".to_vec()),
-            PageRange::parse("").expect("all pages range"),
+            PageRange::all(),
         )])
         .expect_err("wrong password must fail");
 
@@ -682,7 +666,7 @@ mod tests {
 
         let specs = vec![
             InputSpec::new(&path_a, None, PageRange::parse("1,3").unwrap()),
-            InputSpec::new(&path_b, None, PageRange::parse("").unwrap()),
+            InputSpec::new(&path_b, None, PageRange::all()),
         ];
         let plan = CombinedPlan::from_specs(specs).unwrap();
 

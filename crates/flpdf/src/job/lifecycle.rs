@@ -678,14 +678,31 @@ fn job_json_required_string(
 }
 
 fn job_json_range(value: Option<&crate::json::Json>, path: &str) -> Result<PageRange> {
+    job_json_range_with_empty_default(value, path, true)
+}
+
+fn job_json_overlay_range(value: Option<&crate::json::Json>, path: &str) -> Result<PageRange> {
+    job_json_range_with_empty_default(value, path, false)
+}
+
+fn job_json_range_with_empty_default(
+    value: Option<&crate::json::Json>,
+    path: &str,
+    empty_is_all: bool,
+) -> Result<PageRange> {
+    let Some(value) = value else {
+        return Ok(PageRange::all());
+    };
     let bytes = value
-        .map(|value| {
-            value.get_string().ok_or_else(|| {
-                Error::Usage(UsageError::new(format!("{path}: value must be a string")))
-            })
-        })
-        .transpose()?
-        .unwrap_or_default();
+        .get_string()
+        .ok_or_else(|| Error::Usage(UsageError::new(format!("{path}: value must be a string"))))?;
+    if bytes.is_empty() {
+        return Ok(if empty_is_all {
+            PageRange::all()
+        } else {
+            PageRange::empty()
+        });
+    }
     let value = String::from_utf8_lossy(&bytes);
     PageRange::parse(&value)
         .map_err(|error| Error::Usage(UsageError::new(format!("{path}: {error}"))))
@@ -1113,7 +1130,7 @@ fn parse_job_overlay_specs(
                 "file is required in underlay/overlay specification",
             ))
         })?;
-        let from = job_json_range(
+        let from = job_json_overlay_range(
             members.get(b"from".as_slice()),
             &format!(
                 ".{}[{index}].from",
@@ -1123,7 +1140,7 @@ fn parse_job_overlay_specs(
                 }
             ),
         )?; // cov:ignore: llvm-cov attributes this successful range conversion to the opening call lines
-        let to = job_json_range(
+        let to = job_json_overlay_range(
             members.get(b"to".as_slice()),
             &format!(
                 ".{}[{index}].to",
@@ -1135,7 +1152,7 @@ fn parse_job_overlay_specs(
         )?; // cov:ignore: llvm-cov attributes this successful range conversion to the opening call lines
         let repeat = members
             .get(b"repeat".as_slice())
-            .map(|value| job_json_range(Some(value), "underlay/overlay repeat"))
+            .map(|value| job_json_overlay_range(Some(value), "underlay/overlay repeat"))
             .transpose()?;
         destination.push(JobOverlayConfig {
             path: path_from_qpdf_json_bytes(&file),
@@ -5101,8 +5118,12 @@ impl QPDFJobConfig<'_> {
                 "--pages may only be specified one time",
             )));
         }
-        let range = PageRange::parse(range)
-            .map_err(|error| Error::Usage(UsageError::new(error.to_string())))?;
+        let range = if range.is_empty() {
+            PageRange::all()
+        } else {
+            PageRange::parse(range)
+                .map_err(|error| Error::Usage(UsageError::new(error.to_string())))?
+        };
         self.job.configuration.page_specs_origin = PageSpecsOrigin::Config;
         self.job.configuration.page_specs.push(JobPageConfig {
             path: file.into(),
@@ -6143,12 +6164,45 @@ mod tests {
             job_json_members(&crate::json::Json::parse(br#"{"range":"1-2"}"#).unwrap());
         assert!(job_json_range(range_members.get(b"range".as_slice()), ".range").is_ok());
         assert!(job_json_range(None, ".range").is_ok());
+        let empty_range = job_json_members(&crate::json::Json::parse(br#"{"range":""}"#).unwrap());
+        assert_eq!(
+            job_json_range(empty_range.get(b"range".as_slice()), ".range")
+                .unwrap()
+                .resolve(3)
+                .unwrap(),
+            vec![1, 2, 3]
+        );
         let bad_range_type =
             job_json_members(&crate::json::Json::parse(br#"{"range":false}"#).unwrap());
         assert!(job_json_range(bad_range_type.get(b"range".as_slice()), ".range").is_err());
         let bad_range_syntax =
             job_json_members(&crate::json::Json::parse(br#"{"range":"bad"}"#).unwrap());
         assert!(job_json_range(bad_range_syntax.get(b"range".as_slice()), ".range").is_err());
+
+        let empty_overlay =
+            crate::json::Json::parse(br#"[{"file":"source.pdf","from":"","to":"","repeat":""}]"#)
+                .unwrap();
+        let mut overlays = Vec::new();
+        parse_job_overlay_specs(&mut overlays, &empty_overlay, OverlayKind::Overlay).unwrap();
+        assert_eq!(overlays.len(), 1);
+        assert_eq!(overlays[0].from.resolve(3).unwrap(), Vec::<u32>::new());
+        assert_eq!(overlays[0].to.resolve(3).unwrap(), Vec::<u32>::new());
+        assert_eq!(
+            overlays[0]
+                .repeat
+                .as_ref()
+                .expect("explicit empty repeat remains present")
+                .resolve(3)
+                .unwrap(),
+            Vec::<u32>::new()
+        );
+
+        let absent_overlay = crate::json::Json::parse(br#"[{"file":"source.pdf"}]"#).unwrap();
+        let mut overlays = Vec::new();
+        parse_job_overlay_specs(&mut overlays, &absent_overlay, OverlayKind::Overlay).unwrap();
+        assert_eq!(overlays[0].from.resolve(3).unwrap(), vec![1, 2, 3]);
+        assert_eq!(overlays[0].to.resolve(3).unwrap(), vec![1, 2, 3]);
+        assert!(overlays[0].repeat.is_none());
     }
 
     #[test]

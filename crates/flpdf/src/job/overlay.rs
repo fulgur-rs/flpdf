@@ -933,7 +933,11 @@ mod byte_gate {
 
     /// Parse a page-range string, panicking with context on error.
     fn pr(input: &str) -> PageRange {
-        PageRange::parse(input).unwrap_or_else(|e| panic!("parse {input:?}: {e}"))
+        if input.is_empty() {
+            PageRange::all()
+        } else {
+            PageRange::parse(input).unwrap_or_else(|e| panic!("parse {input:?}: {e}"))
+        }
     }
 
     // cov:ignore-start: every line but the equal-inputs early return belongs to

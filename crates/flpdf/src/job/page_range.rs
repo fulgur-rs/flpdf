@@ -1,5 +1,5 @@
 //! qpdf correspondence: QPDFJob.cc page-range parsing split from page-operation orchestration.
-//! Page-range syntax parser, matching qpdf's page-range mini-language.
+//! Page-range value owned by qpdf's `QUtil::parse_numrange` primitive.
 //!
 //! # Syntax
 //!
@@ -14,30 +14,29 @@
 //! - Ranges may be ascending (`1-5`) or descending (`5-1`); both are inclusive.
 //! - `x` prepends an exclusion group. It removes the group's pages from the
 //!   immediately preceding positive group, matching qpdf's
-//!   `QUtil::parse_numrange` (`QUtil.cc:1304-1415`). The first group may not be
+//!   `QUtil::parse_numrange` (`QUtil.cc:1304-1429`). The first group may not be
 //!   an exclusion.
 //! - `:odd` / `:even` filter the *positions* in the final expanded selection:
 //!   `:odd` keeps positions 1, 3, 5, … (1-based); `:even` keeps positions 2,
 //!   4, 6, …. They are not based on the original page numbers. Example:
 //!   `2-8:even` → `[3,5,7]`.
-//! - An empty string means "all pages" and is resolved to `1..=page_count`.
+//! - `PageRange::parse` validates syntax with qpdf's `max == 0` mode; an empty
+//!   expression therefore selects no pages.
+//! - `PageRange::all` represents qpdf's page-spec default `1-z`.
 //! - Multiple entries are concatenated; the final resolved list preserves
-//!   duplicates in declaration order (qpdf-parity: `1,3,1` yields `[1,3,1]`,
-//!   verified against qpdf 11.9.0 with `qpdf --pages in 1,3,1 --`). Callers
-//!   that want a deduplicated set can build one from the returned vector.
+//!   duplicates in declaration order (qpdf-parity: `1,3,1` yields `[1,3,1]`).
 
 use crate::{Error, Result};
-use std::collections::BTreeSet;
 
 // ---------------------------------------------------------------------------
 // Public types
 // ---------------------------------------------------------------------------
 
-/// An unresolved endpoint of a page-range entry.
+/// Legacy structured endpoint vocabulary for a page-range entry.
 ///
-/// Concrete page numbers are not computed until [`PageRange::resolve`] is
-/// called with a known `page_count`, so that the parser does not need to know
-/// the document's page count.
+/// The canonical [`PageRange`] route now retains the raw qpdf expression and
+/// delegates both parsing and resolution to [`crate::qutil::parse_numrange`].
+/// This public vocabulary remains as a separate visibility/API cleanup surface.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Endpoint {
     /// Absolute 1-based page number. Must be ≥ 1.
@@ -49,7 +48,7 @@ pub enum Endpoint {
     FromEnd(u32),
 }
 
-/// Which positions to keep within the final expanded page selection.
+/// Legacy structured representation of a final-position filter.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Parity {
     /// Keep positions 1, 3, 5, … (`:odd`).
@@ -58,7 +57,7 @@ pub enum Parity {
     Even,
 }
 
-/// A single parsed entry in a page-range expression.
+/// Legacy structured representation of one page-range group.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct PageRangeEntry {
     /// Whether this group excludes pages from the preceding positive group.
@@ -71,349 +70,78 @@ pub struct PageRangeEntry {
     pub parity: Option<Parity>,
 }
 
-/// A parsed page-range expression, ready to be resolved against a page count.
+/// A qpdf page-range expression, ready to be resolved against a page count.
 ///
 /// Constructed via [`PageRange::parse`].
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct PageRange {
-    /// `None` means "all pages" (empty string input).
-    pub(crate) entries: Option<Vec<PageRangeEntry>>,
-    /// Optional final-position parity filter.
-    parity: Option<Parity>,
+    /// The original qpdf range expression, retained so parse and resolve both
+    /// invoke the same canonical primitive with their respective bounds.
+    raw: Vec<u8>,
 }
 
 impl PageRange {
     /// Parse a page-range expression.
     ///
-    /// An empty string returns the "all pages" sentinel. Any syntax error
-    /// produces an [`Error::Parse`] with an actionable message; the byte
-    /// offset is relative to the start of the input string.
+    /// Syntax validation uses qpdf's `QUtil::parse_numrange(range, 0)` mode,
+    /// which intentionally accepts values whose page bounds cannot be checked
+    /// until [`PageRange::resolve`] knows the document page count.
     ///
     /// # Errors
     ///
-    /// - [`Error::Parse`] when the input is a non-empty string that is not a
-    ///   valid page-range expression (invalid endpoint, `0`/`r0`, a dangling
-    ///   `-`, an empty or trailing entry, an unknown `:` parity suffix, or any
-    ///   unexpected character).
+    /// - The qpdf-compatible range error returned by
+    ///   [`crate::qutil::parse_numrange`] when syntax is invalid.
     pub fn parse(input: &str) -> Result<Self> {
-        if input.is_empty() {
-            return Ok(Self {
-                entries: None,
-                parity: None,
-            });
-        }
-        let (range, parity) = split_parity_suffix(input)?;
-        // qpdf truncates the input at the parity suffix (`range_end = p`,
-        // `QUtil.cc:1356`) and then runs `while (p != range_end)`
-        // (`QUtil.cc:1367`) zero times, returning an empty result without an
-        // error. So ":odd" and ":even" are valid and select nothing.
-        if range.is_empty() {
-            return Ok(Self {
-                entries: Some(Vec::new()),
-                parity,
-            });
-        }
-        let mut entries = parse_entries(range)?;
-        if let Some(parity) = parity {
-            if let Some(entry) = entries.last_mut() {
-                // Keep the suffix visible through the existing public entry
-                // shape while applying it to the final result in `resolve`.
-                entry.parity = Some(parity);
-            }
-        }
+        crate::qutil::parse_numrange(input.as_bytes(), 0)?;
         Ok(Self {
-            entries: Some(entries),
-            parity,
+            raw: input.as_bytes().to_vec(),
         })
+    }
+
+    /// Construct qpdf's default page selection (`1-z`).
+    ///
+    /// qpdf's page-spec job boundary replaces an omitted range with `1-z`
+    /// before resolving it (`libqpdf/QPDFJob.cc:2364-2372`). This constructor
+    /// keeps that default distinct from an explicitly empty range, which
+    /// selects no pages.
+    pub fn all() -> Self {
+        Self {
+            raw: b"1-z".to_vec(),
+        }
     }
 
     /// Construct a range that selects **no** pages.
     ///
-    /// This is distinct from [`PageRange::parse`] of the empty string, which
-    /// returns the "all pages" sentinel. It corresponds to qpdf's
-    /// overlay/underlay semantics where an explicitly empty `--from=` selects an
-    /// empty source set, so [`resolve`](PageRange::resolve) returns an empty
-    /// vector for any page count.
+    /// This corresponds to an explicitly empty overlay/underlay range. It is
+    /// equivalent to [`PageRange::parse`] with an empty string; qpdf's omitted
+    /// page-spec default is represented separately by [`PageRange::all`].
     pub fn empty() -> Self {
-        Self {
-            entries: Some(Vec::new()),
-            parity: None,
-        }
+        Self { raw: Vec::new() }
     }
 
     /// Resolve the parsed expression against `page_count` (the number of pages
     /// in the document, ≥ 1).
     ///
-    /// Returns a `Vec<u32>` of 1-based page numbers in declaration order,
-    /// preserving duplicates (qpdf-parity: `1,3,1` yields `[1,3,1]`, not
-    /// `[1,3]`). Callers that need a deduplicated set can build one from the
-    /// returned vector.
+    /// Returns a `Vec<u32>` of 1-based page numbers in qpdf declaration order,
+    /// preserving duplicates.
     ///
     /// # Errors
     ///
     /// - `page_count` is 0.
-    /// - An absolute page number exceeds `page_count`.
-    /// - A `rN` endpoint has N > `page_count`.
-    /// - A `z` endpoint when `page_count` is 0 (covered by the first check).
+    /// - The qpdf-compatible numeric-range error when an endpoint exceeds the
+    ///   page count.
     pub fn resolve(&self, page_count: u32) -> Result<Vec<u32>> {
         if page_count == 0 {
             return Err(Error::parse(0, "page_count must be at least 1"));
         }
-        let entries = match &self.entries {
-            None => return Ok((1..=page_count).collect()),
-            Some(e) => e,
-        };
-
-        let mut result: Vec<u32> = Vec::new();
-        let mut last_group: Vec<u32> = Vec::new();
-        for entry in entries {
-            let group = resolve_entry(entry, page_count)?;
-            if entry.exclude {
-                let exclusions = group.into_iter().collect::<BTreeSet<_>>();
-                last_group.retain(|page| !exclusions.contains(page));
-            } else {
-                result.extend(last_group);
-                last_group = group;
-            }
-        }
-        result.extend(last_group);
-
-        if let Some(parity) = self.parity {
-            let start = match parity {
-                Parity::Odd => 0,
-                Parity::Even => 1,
-            };
-            result = result.into_iter().skip(start).step_by(2).collect();
-        }
-        Ok(result)
+        let max = crate::qutil::qpdf_size_to_int(page_count as usize)?;
+        // qutil enforces 1 <= page <= max for a positive max, and max is
+        // already narrowed to i32 above, so this conversion is lossless.
+        Ok(crate::qutil::parse_numrange(&self.raw, max)?
+            .into_iter()
+            .map(|page| page as u32)
+            .collect())
     }
-}
-
-// ---------------------------------------------------------------------------
-// Internal helpers
-// ---------------------------------------------------------------------------
-
-fn resolve_endpoint(ep: &Endpoint, page_count: u32) -> Result<u32> {
-    match ep {
-        Endpoint::Num(n) => {
-            if *n > page_count {
-                return Err(Error::parse(
-                    0,
-                    format!("page number {n} is out of range (document has {page_count} page(s))"),
-                ));
-            }
-            Ok(*n)
-        }
-        Endpoint::Z => Ok(page_count),
-        Endpoint::FromEnd(n) => {
-            if *n > page_count {
-                return Err(Error::parse(
-                    0,
-                    format!("r{n} is out of range (document has {page_count} page(s))"),
-                ));
-            }
-            Ok(page_count + 1 - n)
-        }
-    }
-}
-
-fn resolve_entry(entry: &PageRangeEntry, page_count: u32) -> Result<Vec<u32>> {
-    let start = resolve_endpoint(&entry.start, page_count)?;
-    let end = match &entry.end {
-        None => start,
-        Some(ep) => resolve_endpoint(ep, page_count)?,
-    };
-
-    // Build the sequence (ascending or descending).
-    let seq: Vec<u32> = if start <= end {
-        (start..=end).collect()
-    } else {
-        (end..=start).rev().collect()
-    };
-
-    Ok(seq)
-}
-
-// ---------------------------------------------------------------------------
-// Parser
-// ---------------------------------------------------------------------------
-
-struct RangeParser<'a> {
-    input: &'a str,
-    pos: usize,
-}
-
-impl<'a> RangeParser<'a> {
-    fn new(input: &'a str) -> Self {
-        Self { input, pos: 0 }
-    }
-
-    fn remaining(&self) -> &str {
-        &self.input[self.pos..]
-    }
-
-    fn peek(&self) -> Option<char> {
-        self.remaining().chars().next()
-    }
-
-    fn advance(&mut self, n: usize) {
-        self.pos += n;
-    }
-
-    fn err(&self, msg: impl Into<String>) -> Error {
-        Error::parse(self.pos, msg.into())
-    }
-
-    /// Parse a non-negative integer. Returns Err if no digits are found.
-    fn parse_u32(&mut self) -> Result<u32> {
-        let start = self.pos;
-        let digits: String = self
-            .remaining()
-            .chars()
-            .take_while(|c| c.is_ascii_digit())
-            .collect();
-        if digits.is_empty() {
-            return Err(self.err(format!("expected a page number at position {}", self.pos)));
-        }
-        self.advance(digits.len());
-        digits
-            .parse::<u32>()
-            .map_err(|_| Error::parse(start, format!("page number too large at position {start}")))
-    }
-
-    /// Parse a single endpoint: `z`, `rN`, or a positive integer.
-    fn parse_endpoint(&mut self) -> Result<Endpoint> {
-        match self.peek() {
-            Some('z') => {
-                self.advance(1);
-                Ok(Endpoint::Z)
-            }
-            Some('r') => {
-                self.advance(1);
-                let n = self.parse_u32()?;
-                if n == 0 {
-                    return Err(self.err("r0 is invalid; r1 means the last page"));
-                }
-                Ok(Endpoint::FromEnd(n))
-            }
-            Some(c) if c.is_ascii_digit() => {
-                let start_pos = self.pos;
-                let n = self.parse_u32()?;
-                if n == 0 {
-                    return Err(Error::parse(
-                        start_pos,
-                        "page number 0 is invalid; pages are 1-based",
-                    ));
-                }
-                Ok(Endpoint::Num(n))
-            }
-            Some(c) => Err(self.err(format!(
-                "unexpected character '{c}' at position {}; expected a page number, 'z', or 'rN'",
-                self.pos
-            ))),
-            None => Err(self.err(format!(
-                "unexpected end of input at position {}; expected a page number, 'z', or 'rN'",
-                self.pos
-            ))),
-        }
-    }
-
-    /// Parse one group: `[x]endpoint ("-" endpoint)?`.
-    fn parse_entry(&mut self) -> Result<PageRangeEntry> {
-        let exclude = if self.peek() == Some('x') {
-            self.advance(1);
-            true
-        } else {
-            false
-        };
-        let start = self.parse_endpoint()?;
-
-        let end = if self.remaining().starts_with('-') {
-            self.advance(1);
-            Some(self.parse_endpoint()?)
-        } else {
-            None
-        };
-
-        Ok(PageRangeEntry {
-            exclude,
-            start,
-            end,
-            parity: None,
-        })
-    }
-}
-
-fn split_parity_suffix(input: &str) -> Result<(&str, Option<Parity>)> {
-    // qpdf takes the FIRST colon (`std::find`, `QUtil.cc:1348`) and then
-    // requires the remainder to be exactly ":odd" or ":even" (`strcmp`,
-    // `QUtil.cc:1350-1356`).
-    let Some(index) = input.find(':') else {
-        return Ok((input, None));
-    };
-    let (range, suffix) = input.split_at(index);
-    let parity = match suffix {
-        ":odd" => Parity::Odd,
-        ":even" => Parity::Even,
-        _ => {
-            return Err(Error::parse(
-                index,
-                format!(
-                "unknown parity suffix '{suffix}' at position {index}; expected ':odd' or ':even'"
-            ),
-            ))
-        }
-    };
-    Ok((range, Some(parity)))
-}
-
-fn parse_entries(input: &str) -> Result<Vec<PageRangeEntry>> {
-    let mut p = RangeParser::new(input);
-    let mut entries = Vec::new();
-
-    loop {
-        // Empty segment (e.g. "1,,2" would have an empty segment between commas).
-        match p.peek() {
-            None => break,
-            Some(',') => {
-                return Err(p.err(format!(
-                    "empty entry at position {}; consecutive commas are not allowed",
-                    p.pos
-                )));
-            }
-            _ => {}
-        }
-
-        if entries.is_empty() && p.peek() == Some('x') {
-            return Err(p.err("first range group may not be an exclusion"));
-        }
-        entries.push(p.parse_entry()?);
-
-        match p.peek() {
-            None => break,
-            Some(',') => {
-                p.advance(1);
-                // Check for trailing comma.
-                if p.peek().is_none() {
-                    return Err(p.err(format!("trailing comma at position {}", p.pos)));
-                }
-            }
-            Some(c) => {
-                return Err(p.err(format!(
-                    "unexpected character '{c}' at position {}; expected ',' or end of input",
-                    p.pos
-                )));
-            }
-        }
-    }
-
-    if entries.is_empty() {
-        // Should not reach here since we check `input.is_empty()` above,
-        // but guard defensively.
-        return Err(Error::parse(0, "page range is empty"));
-    }
-
-    Ok(entries)
 }
 
 // ---------------------------------------------------------------------------
@@ -425,174 +153,54 @@ mod tests {
     use super::*;
 
     // -----------------------------------------------------------------------
-    // Parse-level tests (no page count needed)
-    // -----------------------------------------------------------------------
-
-    fn parse_ok(input: &str) -> PageRange {
-        PageRange::parse(input).unwrap_or_else(|e| panic!("expected Ok for {input:?}, got: {e}"))
-    }
-
-    fn parse_err(input: &str) -> String {
-        PageRange::parse(input)
-            .err()
-            .unwrap_or_else(|| panic!("expected Err for {input:?}"))
-            .to_string()
-    }
-
-    #[test]
-    fn empty_string_is_all_pages() {
-        let pr = parse_ok("");
-        assert_eq!(pr.entries, None);
-    }
-
-    #[test]
-    fn single_page() {
-        let pr = parse_ok("3");
-        let entries = pr.entries.as_ref().unwrap();
-        assert_eq!(entries.len(), 1);
-        assert_eq!(entries[0].start, Endpoint::Num(3));
-        assert_eq!(entries[0].end, None);
-        assert_eq!(entries[0].parity, None);
-    }
-
-    #[test]
-    fn z_endpoint() {
-        let pr = parse_ok("z");
-        let entries = pr.entries.as_ref().unwrap();
-        assert_eq!(entries[0].start, Endpoint::Z);
-    }
-
-    #[test]
-    fn from_end_endpoint() {
-        let pr = parse_ok("r3");
-        let entries = pr.entries.as_ref().unwrap();
-        assert_eq!(entries[0].start, Endpoint::FromEnd(3));
-    }
-
-    #[test]
-    fn ascending_range() {
-        let pr = parse_ok("1-5");
-        let entries = pr.entries.as_ref().unwrap();
-        assert_eq!(entries[0].start, Endpoint::Num(1));
-        assert_eq!(entries[0].end, Some(Endpoint::Num(5)));
-    }
-
-    #[test]
-    fn descending_range() {
-        let pr = parse_ok("5-1");
-        let entries = pr.entries.as_ref().unwrap();
-        assert_eq!(entries[0].start, Endpoint::Num(5));
-        assert_eq!(entries[0].end, Some(Endpoint::Num(1)));
-    }
-
-    #[test]
-    fn range_with_z() {
-        let pr = parse_ok("r3-z");
-        let entries = pr.entries.as_ref().unwrap();
-        assert_eq!(entries[0].start, Endpoint::FromEnd(3));
-        assert_eq!(entries[0].end, Some(Endpoint::Z));
-    }
-
-    #[test]
-    fn odd_parity() {
-        let pr = parse_ok("1-9:odd");
-        let entries = pr.entries.as_ref().unwrap();
-        assert_eq!(entries[0].parity, Some(Parity::Odd));
-    }
-
-    #[test]
-    fn even_parity() {
-        let pr = parse_ok("1-9:even");
-        let entries = pr.entries.as_ref().unwrap();
-        assert_eq!(entries[0].parity, Some(Parity::Even));
-    }
-
-    #[test]
-    fn multiple_entries() {
-        let pr = parse_ok("1,3,5-9,15-12");
-        let entries = pr.entries.as_ref().unwrap();
-        assert_eq!(entries.len(), 4);
-    }
-
-    #[test]
-    fn parity_on_single_page() {
-        // ':odd' on a single page is syntactically valid.
-        let pr = parse_ok("5:odd");
-        let entries = pr.entries.as_ref().unwrap();
-        assert_eq!(entries[0].start, Endpoint::Num(5));
-        assert_eq!(entries[0].parity, Some(Parity::Odd));
-    }
-
-    // -----------------------------------------------------------------------
-    // Invalid inputs
+    // Parse-level tests (qpdf max=0 syntax-only mode)
     // -----------------------------------------------------------------------
 
     #[test]
-    fn page_zero_is_invalid() {
-        let msg = parse_err("0");
-        assert!(msg.contains("0 is invalid"), "got: {msg}");
+    fn parse_accepts_qpdf_syntax_only_values() {
+        // QPDFJob validates a page range with QUtil::parse_numrange(..., 0),
+        // so numeric bounds are intentionally deferred until resolve.
+        assert!(PageRange::parse("0").is_ok());
+        assert!(PageRange::parse("r0").is_ok());
+        assert!(PageRange::parse("99").is_ok());
+        assert!(PageRange::parse(":odd").is_ok());
     }
 
     #[test]
-    fn r0_is_invalid() {
-        let msg = parse_err("r0");
-        assert!(msg.contains("r0 is invalid"), "got: {msg}");
+    fn parse_rejects_only_qpdf_invalid_syntax() {
+        for input in ["1-", "-1", "1,,2", "1,2,", "1-9:foo", "abc", "r"] {
+            assert!(
+                PageRange::parse(input).is_err(),
+                "{input:?} must be invalid"
+            );
+        }
     }
 
     #[test]
-    fn trailing_dash_is_invalid() {
-        let msg = parse_err("1-");
-        assert!(msg.contains("expected a page number"), "got: {msg}");
-    }
+    fn resolve_preserves_qpdf_numeric_range_error_bytes() {
+        let range = PageRange::parse("0").expect("qpdf syntax-only parse accepts zero");
+        let error = range
+            .resolve(3)
+            .expect_err("zero is out of range for three pages");
+        assert_eq!(
+            error.raw_message(),
+            Some(b"error at * in numeric range *0: number 0 out of range".as_slice())
+        );
 
-    #[test]
-    fn leading_dash_is_invalid() {
-        let msg = parse_err("-1");
-        assert!(msg.contains("unexpected character"), "got: {msg}");
-    }
-
-    #[test]
-    fn double_comma_is_invalid() {
-        let msg = parse_err("1,,2");
-        assert!(
-            msg.contains("empty entry") || msg.contains("consecutive commas"),
-            "got: {msg}"
+        let range = PageRange::parse("r0").expect("qpdf syntax-only parse accepts r0");
+        let error = range
+            .resolve(3)
+            .expect_err("r0 resolves beyond the last page");
+        assert_eq!(
+            error.raw_message(),
+            Some(b"error at * in numeric range *r0: number 4 out of range".as_slice())
         );
     }
 
     #[test]
-    fn trailing_comma_is_invalid() {
-        let msg = parse_err("1,2,");
-        assert!(msg.contains("trailing comma"), "got: {msg}");
-    }
-
-    #[test]
-    fn unknown_suffix_is_invalid() {
-        let msg = parse_err("1-9:foo");
-        assert!(msg.contains("unknown parity suffix"), "got: {msg}");
-    }
-
-    #[test]
-    fn bare_parity_suffix_selects_nothing_like_qpdf() {
-        // qpdf truncates at the suffix (`QUtil.cc:1356`) and then never enters
-        // the group loop (`QUtil.cc:1367`), returning an empty result without
-        // an error. Probed with qpdf 11.9.0 on a 10-page file:
-        // `--pages . :odd --` and `--pages . :even --` both exit 0 and write a
-        // 0-page document.
-        assert_eq!(resolve(":odd", 10), Vec::<u32>::new());
-        assert_eq!(resolve(":even", 10), Vec::<u32>::new());
-    }
-
-    #[test]
-    fn alpha_input_is_invalid() {
-        let msg = parse_err("abc");
-        assert!(!msg.is_empty());
-    }
-
-    #[test]
-    fn lone_r_without_number_is_invalid() {
-        let msg = parse_err("r");
-        assert!(msg.contains("expected a page number"), "got: {msg}");
+    fn parse_empty_is_the_qpdf_empty_selection() {
+        let range = PageRange::parse("").expect("empty qpdf range is valid syntax");
+        assert_eq!(range.resolve(3).unwrap(), Vec::<u32>::new());
     }
 
     // -----------------------------------------------------------------------
@@ -616,18 +224,18 @@ mod tests {
     }
 
     #[test]
-    fn empty_resolves_to_all() {
-        assert_eq!(resolve("", 5), vec![1, 2, 3, 4, 5]);
+    fn all_constructor_resolves_to_all() {
+        assert_eq!(PageRange::all().resolve(5).unwrap(), vec![1, 2, 3, 4, 5]);
     }
 
     #[test]
     fn empty_constructor_selects_no_pages() {
-        // `PageRange::empty()` is the empty source set (qpdf `--from=`), distinct
-        // from `parse("")` which is the "all pages" sentinel.
+        // `PageRange::empty()` is the explicit empty source set, while qpdf's
+        // omitted page-spec default is represented by `PageRange::all()`.
         let none = PageRange::empty();
-        assert_eq!(none.entries, Some(Vec::new()));
         assert_eq!(none.resolve(5).unwrap(), Vec::<u32>::new());
-        assert_ne!(none, PageRange::parse("").unwrap());
+        assert_eq!(none, PageRange::parse("").unwrap());
+        assert_ne!(none, PageRange::all());
     }
 
     #[test]
@@ -742,7 +350,7 @@ mod tests {
 
     #[test]
     fn exclusion_group_may_not_be_the_first_group() {
-        let message = parse_err("x2");
+        let message = PageRange::parse("x2").unwrap_err().to_string();
         assert!(
             message.contains("first") || message.contains("exclusion"),
             "got: {message}"

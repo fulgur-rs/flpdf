@@ -56,7 +56,7 @@ pub struct SelectedPage {
 /// Constructed via [`PagePlan::build`] (from a [`PageRange`]) or
 /// [`PagePlan::from_1based_indices`] (from a pre-resolved slice of 1-based
 /// page numbers). The ordering is deterministic: it reflects the input
-/// expression order, with deduplication already handled by [`PageRange::resolve`].
+/// expression order, including duplicates preserved by [`PageRange::resolve`].
 ///
 /// The selected page refs it produces feed directly into
 /// [`rebuild_page_tree`](crate::pages::tree_rebuild::rebuild_page_tree), which
@@ -77,14 +77,14 @@ impl PagePlan {
     /// range against the page count, and maps each resolved 1-based number to
     /// the corresponding [`ObjectRef`].
     ///
-    /// An empty `range` selects all pages in document order.
+    /// Use [`PageRange::all`] to select all pages in document order.
     ///
     /// # Errors
     ///
     /// - [`Error::Missing`] when the document has no pages (empty `/Pages` tree).
-    /// - Any error returned by [`PageRange::resolve`] — notably
-    ///   [`Error::Parse`] with an actionable message when a page number or `rN`
-    ///   endpoint is out of range.
+    /// - Any qpdf-compatible numeric-range error returned by
+    ///   [`PageRange::resolve`] when a page number or `rN` endpoint is out of
+    ///   range.
     /// - Any I/O or structural error from resolving the page tree.
     pub fn build<R: Read + Seek>(pdf: &mut Pdf<R>, range: &PageRange) -> Result<Self> {
         let all_refs = page_refs(pdf)?;
@@ -126,9 +126,9 @@ impl PagePlan {
     /// - Out-of-range indices produce [`Error::Unsupported`] with an
     ///   actionable message.
     /// - Duplicates are **not** removed (the caller is expected to deduplicate
-    ///   if that is the desired behaviour; [`PageRange::resolve`] deduplicates
-    ///   automatically, so callers going through [`PagePlan::build`] get
-    ///   deduplication for free).
+    ///   if that is the desired behaviour; [`PageRange::resolve`] preserves
+    ///   duplicates according to qpdf, so callers needing a set must
+    ///   deduplicate explicitly.
     ///
     /// An empty slice selects **all** pages in document order.
     ///
@@ -151,7 +151,8 @@ impl PagePlan {
         }
 
         if indices.is_empty() {
-            // Empty slice = all pages, mirroring PageRange empty-string semantics.
+            // This pre-resolved API intentionally treats an empty slice as
+            // all pages; PageRange::parse("") itself is qpdf's empty result.
             let pages = (1u32..=page_count)
                 .map(|n| SelectedPage {
                     index_1based: n,
@@ -281,9 +282,9 @@ mod tests {
     // -----------------------------------------------------------------------
 
     #[test]
-    fn empty_range_selects_all_pages() {
+    fn all_range_selects_all_pages() {
         let mut pdf = open(build_n_page_pdf(5));
-        let range = PageRange::parse("").unwrap();
+        let range = PageRange::all();
         let plan = PagePlan::build(&mut pdf, &range).unwrap();
 
         assert_eq!(plan.source_page_count(), 5);

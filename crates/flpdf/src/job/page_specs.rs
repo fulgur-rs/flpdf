@@ -93,11 +93,11 @@ fn select_single_source_pages<R: Read + Seek>(
                 spec.source_index
             )));
         }
-        plans.push(PagePlan::build(source, &spec.range).map_err(|error| {
-            Error::Unsupported(format!(
-                "--pages: source 0 specification {spec_index}: {error}"
-            ))
-        })?);
+        let source_name = source.input_source_description();
+        plans.push(
+            PagePlan::build(source, &spec.range)
+                .map_err(|error| page_spec_error(&source_name, 0, spec_index, error))?,
+        );
     }
 
     let mut selected = Vec::new();
@@ -133,6 +133,33 @@ fn select_single_source_pages<R: Read + Seek>(
     // qpdf writes a valid 0-page document in that case, so flpdf must not
     // reject it.
     Ok(selected)
+}
+
+fn qpdf_page_range_error(source_name: &[u8], error: &Error) -> Option<Error> {
+    let message = error.raw_message()?;
+    let is_numeric_range = message.starts_with(b"error at * in numeric range ")
+        || message.starts_with(b"error in numeric range ");
+    if !is_numeric_range {
+        return None;
+    }
+    let mut what = b"parsing numeric range for ".to_vec();
+    what.extend_from_slice(source_name);
+    what.extend_from_slice(b": ");
+    what.extend_from_slice(message);
+    Some(Error::SystemBytes(what))
+}
+
+fn page_spec_error(
+    source_name: &[u8],
+    source_index: usize,
+    spec_index: usize,
+    error: Error,
+) -> Error {
+    qpdf_page_range_error(source_name, &error).unwrap_or_else(|| {
+        Error::Unsupported(format!(
+            "--pages: source {source_index} specification {spec_index}: {error}"
+        ))
+    })
 }
 
 fn collate_values_for_specs(
@@ -713,12 +740,9 @@ fn handle_page_specs_into<R: Read + Seek + 'static, T: Read + Seek + 'static>(
                 spec.source_index
             ))
         })?;
-        let plan = PagePlan::build(source, &spec.range).map_err(|error| {
-            Error::Unsupported(format!(
-                "--pages: source {} specification {spec_index}: {error}",
-                spec.source_index
-            ))
-        })?;
+        let source_name = source.input_source_description();
+        let plan = PagePlan::build(source, &spec.range)
+            .map_err(|error| page_spec_error(&source_name, spec.source_index, spec_index, error))?;
         plans.push(plan);
     }
     let collate_values = collate_values_for_specs(collate, plans.len())?;
@@ -1348,6 +1372,19 @@ mod tests {
         pdf.trailer().remove_key(b"/Root");
         assert!(pdf.root_ref().is_none());
         pdf
+    }
+
+    #[test]
+    fn page_spec_error_keeps_non_range_errors_in_the_existing_context() {
+        let error = page_spec_error(b"input.pdf", 2, 3, Error::Missing("/Root"));
+        assert!(matches!(
+            error,
+            Error::Unsupported(message)
+                if message == "--pages: source 2 specification 3: missing required PDF entry: /Root"
+        ));
+
+        let unrelated = Error::SystemBytes(b"not a numeric range error".to_vec());
+        assert!(qpdf_page_range_error(b"input.pdf", &unrelated).is_none());
     }
 
     #[test]
