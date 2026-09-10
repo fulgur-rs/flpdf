@@ -449,35 +449,58 @@ fn listed_test_count(output: &str) -> usize {
         .count()
 }
 
+/// Cargo's own usage is `cargo test [OPTIONS] [TESTNAME]`, so the filter is a
+/// positional argument that does not have to follow a target selector. Scan for
+/// any positional after `cargo test`, skipping the flags that take a value,
+/// rather than only looking next to `--lib` and `--test`.
 fn cargo_test_command_has_filter(command: &str) -> bool {
     let words = command.split_whitespace().collect::<Vec<_>>();
     if words.first() != Some(&"cargo") || words.get(1) != Some(&"test") {
         return false;
     }
 
-    for (index, word) in words.iter().enumerate() {
-        match *word {
-            "--lib" => {
-                return words
-                    .get(index + 1)
-                    .is_some_and(|filter| *filter != "--" && !filter.starts_with('-'));
-            }
-            "--test" => {
-                let target = index + 1;
-                let filter = index + 2;
-                if words.get(target).is_none() {
-                    return false;
-                }
-                return words
-                    .get(filter)
-                    .is_some_and(|value| *value != "--" && !value.starts_with('-'));
-            }
-            _ => {}
+    let mut index = 2;
+    while let Some(word) = words.get(index).copied() {
+        if word == "--" {
+            return false;
         }
+        if CARGO_TEST_VALUE_FLAGS.contains(&word) {
+            index += 2;
+            continue;
+        }
+        if word.starts_with('-') {
+            index += 1;
+            continue;
+        }
+        return true;
     }
 
     false
 }
+
+/// `cargo test` flags whose value is a separate word, so the word after them is
+/// not a test-name filter. `--features=x` and friends carry their value inline
+/// and need no entry here.
+const CARGO_TEST_VALUE_FLAGS: &[&str] = &[
+    "-p",
+    "--package",
+    "--test",
+    "--bin",
+    "--bench",
+    "--example",
+    "--features",
+    "--target",
+    "--target-dir",
+    "--manifest-path",
+    "--profile",
+    "--jobs",
+    "-j",
+    "--exclude",
+    "--color",
+    "--message-format",
+    "--config",
+    "-Z",
+];
 
 fn workflow_filtered_cargo_test_commands(workflow: &str) -> ContractResult<Vec<String>> {
     let workflow = parse_workflow(workflow)?;
@@ -496,15 +519,15 @@ fn workflow_filtered_cargo_test_commands(workflow: &str) -> ContractResult<Vec<S
             .as_vec()
             .ok_or_else(|| "job.steps must be a sequence".to_owned())?;
         for step in steps {
-            // Conditional commands run only on a subset of the matrix (for
-            // example the system-libjpeg check is Linux amd64-only). The
-            // contract itself runs on every supported host, so validating
-            // those commands here would report false zero-match failures on
-            // platforms where their feature dependencies are intentionally
-            // absent. Unconditional filters are checked below on every host.
-            if mapping_contains_key(step, "if") {
-                continue;
-            }
+            // Conditional steps are included. Every filtered command in this
+            // workflow today sits behind an `if`, so skipping them would leave
+            // nothing to check and the contract would pass while a renamed test
+            // silently stopped running -- the exact regression it exists to
+            // catch. `cargo test -- --list` resolves a filter against the
+            // compiled targets and does not need the step's own host, so the
+            // check is valid here; a command whose *feature* is unavailable is
+            // reported by cargo as a failure rather than as zero matches, and
+            // is handled at the call site.
             let Some(run) = mapping_get(step, "run").and_then(Yaml::as_str) else {
                 continue;
             };
@@ -533,16 +556,32 @@ fn assert_filtered_cargo_tests_are_nonempty(workflow: &str) -> ContractResult<()
             }
             args.push(word);
         }
+        // The parent `cargo test` holds the lock on the workspace artifact
+        // directory for the whole run, so a child cargo sharing it blocks
+        // until the parent exits -- which never happens. Give the child its
+        // own target directory.
+        let target_dir = workspace.join("target/ci-workflow-contract");
         let output = Command::new("cargo")
             .args(&args)
             .args(["--", "--list"])
             .current_dir(&workspace)
+            .env("CARGO_TARGET_DIR", &target_dir)
             .output()
             .map_err(|error| format!("failed to list tests for `{command}`: {error}"))?;
         if !output.status.success() {
+            let stderr = String::from_utf8_lossy(&output.stderr);
+            // A command gated on a host-specific system library cannot build
+            // everywhere. That is a missing dependency, not a stale filter, so
+            // it is reported by cargo before any test is listed and must not
+            // fail this contract.
+            if stderr.contains("could not find system library")
+                || stderr.contains("pkg-config")
+                || stderr.contains("linker `cc` not found")
+            {
+                continue;
+            }
             return Err(format!(
-                "filtered workflow command failed under --list: `{command}`\nstderr: {}",
-                String::from_utf8_lossy(&output.stderr)
+                "filtered workflow command failed under --list: `{command}`\nstderr: {stderr}"
             ));
         }
         let stdout = String::from_utf8_lossy(&output.stdout);
