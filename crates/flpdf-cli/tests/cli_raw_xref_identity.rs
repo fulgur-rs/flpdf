@@ -422,3 +422,25 @@ fn json_object_selection_is_unchanged_for_projectable_identities() {
         assert_eq!(flpdf.stderr, qpdf.stderr, "stderr for selector {selector}");
     }
 }
+
+#[test]
+fn json_object_selection_accepts_a_raw_generation_like_qpdf() {
+    if !qpdf_available() {
+        if std::env::var_os("CI").is_some() {
+            panic!("{EXPECTED_QPDF_VERSION} is required for this parity test on CI");
+        }
+        eprintln!("skipping: {EXPECTED_QPDF_VERSION} is not available");
+        return;
+    }
+
+    let temp = tempfile::tempdir().expect("temporary directory");
+    let input = temp.path().join("matching-in-use-generation-65536.pdf");
+    std::fs::write(&input, matching_in_use_generation_65536_pdf()).expect("write fixture");
+
+    let qpdf = run_qpdf_json_object(&input, "5,65536");
+    let flpdf = run_flpdf_json_object(&input, "5,65536");
+
+    assert_eq!(flpdf.status.code(), qpdf.status.code());
+    assert_eq!(flpdf.stdout, qpdf.stdout);
+    assert_eq!(flpdf.stderr, qpdf.stderr);
+}
