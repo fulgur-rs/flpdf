@@ -2655,6 +2655,20 @@ qpdf --check-linearization \
 qpdf --check-linearization \
     "$REF/objstm-lin-otherpage-thumbnail-rest-bearing/linearize-objstm-preserve.pdf"
 
+# --- objstm-lin-openaction-preserve-bearing: a qpdf-generated source ObjStm
+# carries the Catalog's /OpenAction dictionary while the JavaScript stream it
+# references cannot be packed into an ObjStm. qpdf Preserve keeps that source
+# container in the first-half part4 region ahead of the plain open-document
+# stream, so the combined sequence follows assigned object-number order
+# (flpdf-oq7g). ---
+mkdir -p "$REF/objstm-lin-openaction-preserve-bearing"
+qpdf --linearize --object-streams=preserve --deterministic-id --warning-exit-0 \
+    "$FIX/objstm-lin-openaction-preserve-bearing.pdf" \
+    "$REF/objstm-lin-openaction-preserve-bearing/linearize-objstm-preserve.pdf"
+
+qpdf --check-linearization \
+    "$REF/objstm-lin-openaction-preserve-bearing/linearize-objstm-preserve.pdf"
+
 for stem in objstm-lin-thumb-direct-descendant objstm-lin-thumb-first-edge-wins; do
     mkdir -p "$REF/$stem"
     qpdf --linearize --object-streams=generate --deterministic-id --warning-exit-0 \
