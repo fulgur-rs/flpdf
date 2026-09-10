@@ -130,7 +130,10 @@ fn pages_duplicate_password_matches_qpdf_usage_error_and_does_not_write_output()
             "--password already specified for this file",
         ));
 
-    assert!(!output.exists(), "usage errors must not create the output file");
+    assert!(
+        !output.exists(),
+        "usage errors must not create the output file"
+    );
 }
 
 #[test]
