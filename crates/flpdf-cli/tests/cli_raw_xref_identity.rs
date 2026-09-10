@@ -511,3 +511,155 @@ fn dump_object_accepts_a_raw_generation_like_qpdf() {
     assert_eq!(flpdf.stdout, qpdf.stdout);
     assert_eq!(flpdf.stderr, qpdf.stderr);
 }
+
+/// Both identity maps name objects in one output number space, so the
+/// allocation counter has to span them. Numbering the ordinary map alone hands
+/// out a number a raw-identity object already holds; the later xref entry then
+/// overwrites the earlier one and the file silently loses an object. `qpdf
+/// --check` does not catch that, because it only follows the xref.
+#[test]
+fn raw_and_ordinary_objects_get_distinct_output_numbers() {
+    if !qpdf_available() {
+        if std::env::var_os("CI").is_some() {
+            panic!("{EXPECTED_QPDF_VERSION} is required for this parity test on CI");
+        }
+        eprintln!("skipping: {EXPECTED_QPDF_VERSION} is not available");
+        return;
+    }
+
+    let temp = tempfile::tempdir().expect("temporary directory");
+    let input = temp.path().join("raw-and-ordinary-orphans.pdf");
+    std::fs::write(&input, raw_and_ordinary_orphans_pdf()).expect("write fixture");
+
+    for mode in ["disable", "preserve", "generate"] {
+        let output = temp.path().join(format!("out-{mode}.pdf"));
+        Command::cargo_bin("flpdf")
+            .expect("flpdf should build")
+            .env("FLPDF_PROGNAME", "qpdf")
+            .args([
+                "rewrite",
+                "--static-id",
+                "--preserve-unreferenced",
+                &format!("--object-streams={mode}"),
+            ])
+            .arg(&input)
+            .arg(&output)
+            .assert()
+            .success();
+
+        let written = std::fs::read(&output).expect("read output");
+        let mut numbers = Vec::new();
+        let mut rest = written.as_slice();
+        while let Some(at) = rest.windows(6).position(|w| w == b" 0 obj") {
+            let head = &rest[..at];
+            let start = head
+                .iter()
+                .rposition(|b| !b.is_ascii_digit())
+                .map_or(0, |i| i + 1);
+            if start < head.len() {
+                numbers.push(String::from_utf8_lossy(&head[start..]).into_owned());
+            }
+            rest = &rest[at + 6..];
+        }
+        let mut sorted = numbers.clone();
+        sorted.sort();
+        let before = sorted.len();
+        sorted.dedup();
+        assert_eq!(
+            sorted.len(),
+            before,
+            "object-streams={mode} reused an output object number: {numbers:?}"
+        );
+    }
+}
+
+/// A stream selected by its raw identity must serialize like any other stream.
+/// Emitting only the indirect reference would drop the dictionary, framing and
+/// bytes this command exists to print.
+#[test]
+fn dump_object_prints_stream_data_for_a_raw_identity() {
+    let temp = tempfile::tempdir().expect("temporary directory");
+    let input = temp.path().join("raw-generation-stream.pdf");
+    std::fs::write(&input, raw_generation_stream_pdf()).expect("write fixture");
+
+    let output = Command::cargo_bin("flpdf")
+        .expect("flpdf should build")
+        .env("FLPDF_PROGNAME", "qpdf")
+        .args(["dump-object", "5 65536"])
+        .arg(&input)
+        .output()
+        .expect("flpdf should spawn");
+    assert!(output.status.success());
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    assert!(
+        stdout.contains("/Length") && stdout.contains("stream") && stdout.contains("raw gen"),
+        "raw dump-object must print the stream dictionary and data, got {stdout:?}"
+    );
+}
+
+/// A catalog, a page tree, an unreferenced object whose header generation is
+/// outside the `N G R` range, and an ordinary unreferenced object numbered
+/// above it.
+fn raw_and_ordinary_orphans_pdf() -> Vec<u8> {
+    build_fixture(&[
+        (1, 0, b"<< /Type /Catalog /Pages 2 0 R >>".as_slice()),
+        (
+            2,
+            0,
+            b"<< /Type /Pages /Kids [3 0 R] /Count 1 >>".as_slice(),
+        ),
+        (
+            3,
+            0,
+            b"<< /Type /Page /Parent 2 0 R /MediaBox [0 0 200 200] >>".as_slice(),
+        ),
+        (5, 65_536, b"45".as_slice()),
+        (6, 0, b"(ordinary orphan)".as_slice()),
+    ])
+}
+
+fn raw_generation_stream_pdf() -> Vec<u8> {
+    build_fixture(&[
+        (1, 0, b"<< /Type /Catalog /Pages 2 0 R >>".as_slice()),
+        (
+            2,
+            0,
+            b"<< /Type /Pages /Kids [3 0 R] /Count 1 >>".as_slice(),
+        ),
+        (
+            3,
+            0,
+            b"<< /Type /Page /Parent 2 0 R /MediaBox [0 0 200 200] /Contents 5 65536 R >>"
+                .as_slice(),
+        ),
+        (
+            5,
+            65_536,
+            b"<< /Length 11 >>\nstream\n(raw gen)\n\nendstream".as_slice(),
+        ),
+    ])
+}
+
+fn build_fixture(objects: &[(u32, u32, &[u8])]) -> Vec<u8> {
+    let mut bytes = b"%PDF-1.4\n".to_vec();
+    let mut offsets = Vec::new();
+    for (number, generation, body) in objects {
+        offsets.push(bytes.len());
+        bytes.extend_from_slice(format!("{number} {generation} obj\n").as_bytes());
+        bytes.extend_from_slice(body);
+        bytes.extend_from_slice(b"\nendobj\n");
+    }
+    let xref_offset = bytes.len();
+    bytes.extend_from_slice(b"xref\n0 1\n0000000000 65535 f \n");
+    for (index, (number, generation, _)) in objects.iter().enumerate() {
+        bytes.extend_from_slice(
+            format!("{number} 1\n{:010} {generation:05} n \n", offsets[index]).as_bytes(),
+        );
+    }
+    let size = objects.iter().map(|(number, _, _)| number).max().unwrap() + 1;
+    bytes.extend_from_slice(
+        format!("trailer\n<< /Size {size} /Root 1 0 R >>\nstartxref\n{xref_offset}\n%%EOF\n")
+            .as_bytes(),
+    );
+    bytes
+}

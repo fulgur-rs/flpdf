@@ -46,6 +46,19 @@ struct LiveQueue {
 }
 
 impl LiveQueue {
+    /// Allocate the next output object number.
+    ///
+    /// Both maps name objects in the same output number space, so the counter
+    /// has to span them: numbering the ordinary map alone hands a number that a
+    /// raw-identity object already holds, and the later xref entry overwrites
+    /// the earlier one, dropping an object from the file.
+    fn next_output_number(&self) -> ObjectRef {
+        ObjectRef::new(
+            (self.old_to_new.len() + self.raw_old_to_new.len() + 1) as u32,
+            0,
+        )
+    }
+
     fn new(removed_refs: BTreeSet<ObjectRef>) -> Self {
         Self {
             old_to_new: BTreeMap::new(),
@@ -118,10 +131,7 @@ impl LiveQueue {
             if let Some(output) = self.raw_old_to_new.get(&raw_source).copied() {
                 return Ok(Some(output));
             }
-            let output = ObjectRef::new(
-                (self.old_to_new.len() + self.raw_old_to_new.len() + 1) as u32,
-                0,
-            );
+            let output = self.next_output_number();
             self.raw_old_to_new.insert(raw_source, output);
             self.pending.push_back(handle);
             return Ok(Some(output));
@@ -164,13 +174,13 @@ impl LiveQueue {
             self.enqueue_handle(pdf, container_handle)?;
             return Ok(self.old_to_new.get(&source).copied());
         }
-        let output = ObjectRef::new(self.old_to_new.len() as u32 + 1, 0);
+        let output = self.next_output_number();
         self.old_to_new.insert(source, output);
         self.pending.push_back(handle);
         if let Some(members) = self.container_to_members.get(&source).cloned() {
             for member in members {
                 if !self.old_to_new.contains_key(&member) {
-                    let member_output = ObjectRef::new(self.old_to_new.len() as u32 + 1, 0);
+                    let member_output = self.next_output_number();
                     self.old_to_new.insert(member, member_output);
                 }
             }
