@@ -194,6 +194,45 @@ fn rewrite_flatten_rotation_linearize_matches_qpdf() {
 }
 
 #[test]
+fn top_level_flatten_rotation_linearize_matches_qpdf() {
+    if skip_if_qpdf_missing() {
+        return;
+    }
+    let temp = tempfile::tempdir().unwrap();
+    let input = fixture("one-page-r90.pdf");
+    let qpdf_output = temp.path().join("qpdf-top-level-flatten.pdf");
+    let flpdf_output = temp.path().join("flpdf-top-level-flatten.pdf");
+    let input = input.to_str().unwrap();
+
+    let qpdf = run_qpdf(&[
+        "--static-id",
+        "--stream-data=uncompress",
+        "--linearize",
+        "--flatten-rotation",
+        input,
+        qpdf_output.to_str().unwrap(),
+    ]);
+    assert_success(&qpdf, "qpdf --linearize --flatten-rotation top-level");
+
+    let flpdf = run_flpdf(&[
+        "--static-id",
+        "--stream-data=uncompress",
+        "--linearize",
+        "--flatten-rotation",
+        input,
+        flpdf_output.to_str().unwrap(),
+    ]);
+    assert_success(&flpdf, "flpdf --linearize --flatten-rotation top-level");
+    assert_linearized(&qpdf_output, "qpdf top-level flatten output");
+    assert_linearized(&flpdf_output, "flpdf top-level flatten output");
+    assert_eq!(
+        std::fs::read(&flpdf_output).unwrap(),
+        std::fs::read(&qpdf_output).unwrap(),
+        "top-level linearized --flatten-rotation output must match qpdf"
+    );
+}
+
+#[test]
 fn top_level_split_pages_linearizes_every_chunk_like_qpdf() {
     if skip_if_qpdf_missing() {
         return;

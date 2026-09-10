@@ -1024,6 +1024,121 @@ fn pages_cross_document_collate_matches_qpdf() {
 // ===========================================================================
 
 #[test]
+fn top_level_rotate_flatten_rotation_matches_qpdf() {
+    // qpdf accepts --flatten-rotation on its top-level page-operation surface
+    // and applies it after --rotate inside handleTransformations. This is the
+    // canonical differential regression test for the top-level
+    // Config/consumer connection.
+    if !qpdf_available() {
+        return;
+    }
+    let tmp = tempfile::tempdir().unwrap();
+    let src = fixture_abs("../../tests/fixtures/compat/form-fields-and-annotations.pdf");
+    let q = tmp.path().join("q.pdf");
+    let f = tmp.path().join("f.pdf");
+
+    let q_args = [
+        "--qdf",
+        "--no-original-object-ids",
+        "--static-id",
+        "--rotate=90",
+        "--flatten-rotation",
+        src.to_str().unwrap(),
+        q.to_str().unwrap(),
+    ];
+    let q_output = Shell::new(QPDF)
+        .args(q_args)
+        .output()
+        .expect("qpdf should spawn");
+    assert_eq!(q_output.status.code(), Some(0));
+
+    let f_output = Command::cargo_bin("flpdf")
+        .unwrap()
+        .args([
+            "--qdf",
+            "--no-original-object-ids",
+            "--static-id",
+            "--rotate=90",
+            "--flatten-rotation",
+            src.to_str().unwrap(),
+            f.to_str().unwrap(),
+        ])
+        .output()
+        .expect("flpdf should spawn");
+    assert_eq!(
+        f_output.status.code(),
+        Some(0),
+        "top-level --flatten-rotation must be accepted: {}",
+        String::from_utf8_lossy(&f_output.stderr)
+    );
+    assert_eq!(f_output.stdout, q_output.stdout);
+    assert_eq!(f_output.stderr, q_output.stderr);
+    assert_eq!(
+        std::fs::read(&f).unwrap(),
+        std::fs::read(&q).unwrap(),
+        "top-level rotate then flatten output must match qpdf"
+    );
+}
+
+#[test]
+fn top_level_rotate_flatten_split_matches_qpdf() {
+    // qpdf applies rotation and flattening before doSplitPages, so each fresh
+    // chunk must receive the already-transformed page graph.
+    if !qpdf_available() {
+        return;
+    }
+    let tmp = tempfile::tempdir().unwrap();
+    let qdir = tmp.path().join("qpdf");
+    let fdir = tmp.path().join("flpdf");
+    std::fs::create_dir(&qdir).unwrap();
+    std::fs::create_dir(&fdir).unwrap();
+    let src = fixture_abs("../../tests/fixtures/compat/three-page.pdf");
+    let q = qdir.join("out.pdf");
+    let f = fdir.join("out.pdf");
+    let common = [
+        "--qdf",
+        "--no-original-object-ids",
+        "--static-id",
+        "--rotate=+90",
+        "--flatten-rotation",
+        "--split-pages=2",
+        src.to_str().unwrap(),
+    ];
+
+    let mut q_args = common.to_vec();
+    q_args.push(q.to_str().unwrap());
+    let q_output = Shell::new(QPDF)
+        .args(q_args)
+        .output()
+        .expect("qpdf should spawn");
+    assert_eq!(q_output.status.code(), Some(0));
+
+    let mut f_args = common.to_vec();
+    f_args.push(f.to_str().unwrap());
+    let f_output = Command::cargo_bin("flpdf")
+        .unwrap()
+        .args(f_args)
+        .output()
+        .expect("flpdf should spawn");
+    assert_eq!(
+        f_output.status.code(),
+        Some(0),
+        "top-level split rotate then flatten must be accepted: {}",
+        String::from_utf8_lossy(&f_output.stderr)
+    );
+    assert_eq!(f_output.stdout, q_output.stdout);
+    assert_eq!(f_output.stderr, q_output.stderr);
+    assert_eq!(split_outputs(&fdir), split_outputs(&qdir));
+    for filename in split_outputs(&qdir) {
+        assert_eq!(
+            std::fs::read(qdir.join(&filename)).unwrap(),
+            std::fs::read(fdir.join(&filename)).unwrap(),
+            "split chunk {filename} must match qpdf"
+        );
+    }
+}
+
+#[test]
 fn rotate_plus_delta_matches_qpdf() {
     // `+90` is a relative (delta) rotation in both tools. From /Rotate 0 the
     // result is 90 for every page. qpdf 11.9.0 verified.
@@ -2018,6 +2133,69 @@ fn pages_then_rotate_uses_output_page_numbering_like_qpdf() {
     assert_eq!(rotates_of(&q), vec![90, 0]);
     assert_eq!(rotates_of(&f), rotates_of(&q));
     assert_own_page_attributes_match(&q, &f);
+}
+
+#[test]
+fn pages_then_rotate_and_flatten_matches_qpdf() {
+    // Page selection completes before rotation and flattening. The qpdf
+    // transformation owner must therefore see the selected live document,
+    // not the source page tree that existed before --pages.
+    if !qpdf_available() {
+        return;
+    }
+    let tmp = tempfile::tempdir().unwrap();
+    let src = fixture_abs("../../tests/fixtures/compat/form-fields-and-annotations.pdf");
+    let q = tmp.path().join("q.pdf");
+    let f = tmp.path().join("f.pdf");
+    let q_args = [
+        src.to_str().unwrap(),
+        "--pages",
+        ".",
+        "1",
+        "--",
+        "--rotate=90",
+        "--flatten-rotation",
+        "--qdf",
+        "--static-id",
+        "--no-original-object-ids",
+        q.to_str().unwrap(),
+    ];
+    let q_output = Shell::new(QPDF)
+        .args(q_args)
+        .output()
+        .expect("qpdf should spawn");
+    assert_eq!(q_output.status.code(), Some(0));
+
+    let f_output = Command::cargo_bin("flpdf")
+        .unwrap()
+        .args([
+            src.to_str().unwrap(),
+            "--pages",
+            ".",
+            "1",
+            "--",
+            "--rotate=90",
+            "--flatten-rotation",
+            "--qdf",
+            "--static-id",
+            "--no-original-object-ids",
+            f.to_str().unwrap(),
+        ])
+        .output()
+        .expect("flpdf should spawn");
+    assert_eq!(
+        f_output.status.code(),
+        Some(0),
+        "pages rotate then flatten must be accepted: {}",
+        String::from_utf8_lossy(&f_output.stderr)
+    );
+    assert_eq!(f_output.stdout, q_output.stdout);
+    assert_eq!(f_output.stderr, q_output.stderr);
+    assert_eq!(
+        std::fs::read(&f).unwrap(),
+        std::fs::read(&q).unwrap(),
+        "pages rotate then flatten output must match qpdf"
+    );
 }
 
 #[test]

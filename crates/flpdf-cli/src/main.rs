@@ -132,6 +132,7 @@ struct InspectionTransformOptions {
     image: ImageTransformOptions,
     generate_appearances: bool,
     flatten_annotations: Option<CliFlattenMode>,
+    flatten_rotation: bool,
 }
 
 impl InspectionTransformOptions {
@@ -144,12 +145,14 @@ impl InspectionTransformOptions {
             image,
             generate_appearances,
             flatten_annotations,
+            flatten_rotation: false,
         }
     }
 
     fn is_empty(self) -> bool {
         !self.generate_appearances
             && self.flatten_annotations.is_none()
+            && !self.flatten_rotation
             && !self.image.externalize_inline_images
             && !self.image.optimize_images
     }
@@ -446,6 +449,9 @@ fn apply_top_level_inspection_transformations<R: Read + Seek + 'static>(
         }
         if let Some(mode) = options.flatten_annotations {
             configuration.flatten_annotations(mode.into());
+        }
+        if options.flatten_rotation {
+            configuration.flatten_rotation();
         }
         if options.image.externalize_inline_images {
             configuration.externalize_inline_images(options.image.image_options.inline_min_bytes);
@@ -1303,6 +1309,17 @@ struct Cli {
         overrides_with = "flatten_annotations"
     )]
     flatten_annotations: Option<CliFlattenMode>,
+
+    /// Flatten page rotation by baking `/Rotate` into page content (qpdf
+    /// `--flatten-rotation`). This is a create-stage transformation and is
+    /// intentionally compatible with top-level `--rotate`, linearization,
+    /// and split-page output; qpdf applies it in `handleTransformations`
+    /// after rotation and before `writeQPDF` (`QPDFJob.cc:469-473,2190-2194`).
+    #[arg(
+        long = "flatten-rotation",
+        help = "Flatten page rotation by baking /Rotate into content"
+    )]
+    flatten_rotation: bool,
 
     /// Generate appearance streams for form fields that need them (qpdf
     /// `--generate-appearances`). qpdf runs this inside
@@ -3160,11 +3177,12 @@ fn main() {
         args.optimize_images,
         top_level_image_options,
     );
-    let top_level_inspection_transform_options = InspectionTransformOptions::new(
+    let mut top_level_inspection_transform_options = InspectionTransformOptions::new(
         top_level_image_transform_options,
         args.generate_appearances,
         args.flatten_annotations,
     );
+    top_level_inspection_transform_options.flatten_rotation = args.flatten_rotation;
     // QPDFWriter::doWriteSetup clears QDF before deriving QDF's implicit
     // normalization defaults for linearized output (`QPDFWriter.cc:2068-2080`).
     // Keep an explicit --normalize-content value, but do not synthesize the
@@ -3521,7 +3539,7 @@ fn main() {
             args.generate_appearances,
             top_level_image_transform_options,
             args.flatten_annotations,
-            false, // flatten_rotation (not on top-level surface)
+            args.flatten_rotation,
             page_label_options(args.set_page_labels.as_deref(), args.remove_page_labels),
             &overlay_specs,
             args.verbose,
@@ -3554,7 +3572,7 @@ fn main() {
             args.generate_appearances,
             top_level_image_transform_options,
             args.flatten_annotations,
-            false, // flatten_rotation (not on top-level surface)
+            args.flatten_rotation,
             page_label_options(args.set_page_labels.as_deref(), args.remove_page_labels),
             &overlay_specs,
             args.verbose,
@@ -3643,6 +3661,7 @@ fn main() {
                     args.linearize,
                     args.linearize_pass1.as_deref(),
                     top_level_image_transform_options,
+                    args.flatten_rotation,
                     args.verbose,
                     args.no_warn,
                 ),
@@ -3665,6 +3684,7 @@ fn main() {
                         args.linearize,
                         args.linearize_pass1.as_deref(),
                         top_level_image_transform_options,
+                        args.flatten_rotation,
                         args.verbose,
                         args.no_warn,
                     )
@@ -3690,6 +3710,7 @@ fn main() {
                         args.linearize,
                         args.linearize_pass1.as_deref(),
                         top_level_image_transform_options,
+                        args.flatten_rotation,
                         args.verbose,
                         args.no_warn,
                     )
@@ -3725,7 +3746,7 @@ fn main() {
             args.generate_appearances,
             top_level_image_transform_options,
             args.flatten_annotations,
-            false, // flatten_rotation (not on top-level surface)
+            args.flatten_rotation,
             page_label_options(args.set_page_labels.as_deref(), args.remove_page_labels),
             &overlay_specs,
             args.verbose,
@@ -4765,12 +4786,11 @@ fn run_command(command: Commands, overlay_specs: &[OverlaySpec]) -> CliResult<()
                     || cmd.copy_encryption.is_some()
                     || cmd.generate_appearances
                     || cmd.flatten_annotations.is_some()
-                    || cmd.flatten_rotation
                 {
                     emit_logger_error(
                         "flpdf: --coalesce-contents / --remove-restrictions / --decrypt / --encrypt / \
                          --copy-encryption / --flatten-annotations / \
-                         --generate-appearances / --flatten-rotation are \
+                         --generate-appearances are \
                          not applied in the --pages/--rotate/--split-pages/\
                          --collate pipeline; rerun without them or without \
                          the page operation\n",
@@ -4810,6 +4830,7 @@ fn run_command(command: Commands, overlay_specs: &[OverlaySpec]) -> CliResult<()
                         cmd.linearize,
                         None,
                         image_transform_options,
+                        cmd.flatten_rotation,
                         cmd.verbose,
                         false,
                     )
@@ -4828,6 +4849,7 @@ fn run_command(command: Commands, overlay_specs: &[OverlaySpec]) -> CliResult<()
                         cmd.linearize,
                         None,
                         image_transform_options,
+                        cmd.flatten_rotation,
                         cmd.verbose,
                         false,
                     )
@@ -4845,6 +4867,7 @@ fn run_command(command: Commands, overlay_specs: &[OverlaySpec]) -> CliResult<()
                         cmd.linearize,
                         None,
                         image_transform_options,
+                        cmd.flatten_rotation,
                         cmd.verbose,
                         false,
                     )
@@ -5660,6 +5683,9 @@ fn run_rewrite(
         verbose,
         no_warn,
         options,
+        &[],
+        None,
+        _remove_unref.into(),
     )
 }
 
@@ -5687,6 +5713,9 @@ fn run_rewrite_with_qpdf_job(
     verbose: bool,
     no_warn: bool,
     options: WriterOptions,
+    rotate_args: &[OsString],
+    split_pages: Option<&str>,
+    remove_unreferenced_resources: RemoveUnreferencedResources,
 ) -> CliResult<()> {
     // qpdf's createQPDF owns input creation and all document transformations;
     // only writer configuration is deferred until writeQPDF. Keep the
@@ -5730,6 +5759,13 @@ fn run_rewrite_with_qpdf_job(
         }
         if let Some(path) = update_from_json {
             configuration.update_from_json(path.to_path_buf());
+        }
+        for parameter in rotate_args {
+            configuration.rotate(arg_parser::os_bytes(parameter.as_os_str()))?;
+        }
+        if let Some(parameter) = split_pages {
+            configuration.split_pages(parameter.as_bytes())?;
+            configuration.remove_unreferenced_resources(remove_unreferenced_resources);
         }
     }
 
@@ -6574,6 +6610,7 @@ fn run_page_extraction(
     linearize: bool,
     linearize_pass1: Option<&Path>,
     image_options: ImageTransformOptions,
+    flatten_rotation: bool,
     verbose: bool,
     no_warn: bool,
 ) -> CliResult<()> {
@@ -6679,6 +6716,7 @@ fn run_page_extraction(
                 linearize,
                 linearize_pass1,
                 image_options,
+                flatten_rotation,
                 verbose,
                 standard_output,
                 creates_output,
@@ -6698,6 +6736,7 @@ fn run_page_extraction(
                 linearize,
                 linearize_pass1,
                 image_options,
+                flatten_rotation,
                 verbose,
                 standard_output,
                 creates_output,
@@ -6724,6 +6763,7 @@ fn run_page_extraction(
             linearize,
             linearize_pass1,
             image_options,
+            flatten_rotation,
             verbose,
             no_warn,
             standard_output,
@@ -6745,6 +6785,7 @@ fn run_page_extraction(
         linearize,
         linearize_pass1,
         image_options,
+        flatten_rotation,
         verbose,
         standard_output,
         creates_output,
@@ -6773,6 +6814,7 @@ fn run_empty_page_extraction(
     linearize: bool,
     linearize_pass1: Option<&Path>,
     image_options: ImageTransformOptions,
+    flatten_rotation: bool,
     verbose: bool,
     no_warn: bool,
 ) -> CliResult<()> {
@@ -6895,6 +6937,7 @@ fn run_empty_page_extraction(
         None,
         combined_pages,
         image_options,
+        flatten_rotation,
         no_warn,
     )
 }
@@ -6920,6 +6963,7 @@ fn run_page_extraction_from_multiple_sources(
     linearize: bool,
     linearize_pass1: Option<&Path>,
     image_options: ImageTransformOptions,
+    flatten_rotation: bool,
     verbose: bool,
     no_warn: bool,
     standard_output: Option<PipelineWriter>,
@@ -7076,6 +7120,7 @@ fn run_page_extraction_from_multiple_sources(
         None,
         combined_pages,
         image_options,
+        flatten_rotation,
         no_warn,
     )
 }
@@ -7094,6 +7139,7 @@ fn run_page_extraction_from_single_source<R: Read + Seek + 'static>(
     linearize: bool,
     linearize_pass1: Option<&Path>,
     image_options: ImageTransformOptions,
+    flatten_rotation: bool,
     verbose: bool,
     standard_output: Option<PipelineWriter>,
     creates_output: bool,
@@ -7170,6 +7216,7 @@ fn run_page_extraction_from_single_source<R: Read + Seek + 'static>(
                 Some((result, prune_mode)),
                 combined_pages,
                 image_options,
+                flatten_rotation,
                 no_warn,
             )
         }
@@ -7215,6 +7262,7 @@ fn run_page_extraction_from_single_source<R: Read + Seek + 'static>(
                 None,
                 combined_pages,
                 image_options,
+                flatten_rotation,
                 no_warn,
             )
         }
@@ -7243,6 +7291,7 @@ fn run_page_extraction_after_plan<R: Read + Seek + 'static>(
     page_job_result: Option<(RebuildResult, RemoveUnreferencedResources)>,
     combined_pages: Vec<CombinedPage>,
     image_options: ImageTransformOptions,
+    flatten_rotation: bool,
     no_warn: bool,
 ) -> CliResult<()> {
     pdf.set_suppress_warnings(no_warn);
@@ -7335,6 +7384,19 @@ fn run_page_extraction_after_plan<R: Read + Seek + 'static>(
     } else {
         None
     };
+
+    // The page-selection consumer has already completed qpdf's page copy,
+    // rotation, and underlay/overlay phases. Run the remaining rotation
+    // flattening through the canonical Job transformation owner so the same
+    // AcroForm/page-helper boundary is used for `--pages` as for ordinary
+    // rewrites (`QPDFJob.cc:466-473,2190-2194`).
+    if flatten_rotation {
+        let mut transform_job = QPDFJob::new();
+        transform_job.set_verbose(verbose);
+        transform_job.set_suppress_warnings(no_warn);
+        transform_job.config().flatten_rotation();
+        transform_job.apply_transformations(pdf)?;
+    }
 
     let split_progress = split_pages_active && options.progress;
     if split_progress {
@@ -7508,61 +7570,10 @@ fn run_rewrite_with_page_ops(
     linearize: bool,
     linearize_pass1: Option<&Path>,
     image_options: ImageTransformOptions,
+    flatten_rotation: bool,
     verbose: bool,
     no_warn: bool,
 ) -> CliResult<()> {
-    let opened = open_job_pdf(
-        input,
-        repair,
-        password,
-        json_input,
-        update_from_json,
-        false,
-        no_warn,
-    )?;
-    match opened {
-        JobPdf::File(pdf) => run_rewrite_with_page_ops_opened(
-            pdf,
-            input,
-            output,
-            page_ops,
-            remove_unref,
-            options,
-            linearize,
-            linearize_pass1,
-            image_options,
-            verbose,
-        ),
-        JobPdf::Json(pdf) => run_rewrite_with_page_ops_opened(
-            pdf,
-            input,
-            output,
-            page_ops,
-            remove_unref,
-            options,
-            linearize,
-            linearize_pass1,
-            image_options,
-            verbose,
-        ),
-    }
-}
-
-#[allow(clippy::too_many_arguments)]
-fn run_rewrite_with_page_ops_opened<R: Read + Seek + 'static>(
-    mut pdf: Pdf<R>,
-    input: &Path,
-    output: &std::path::Path,
-    page_ops: &PageOpArgs,
-    remove_unref: CliRemoveUnreferencedResources,
-    options: WriterOptions,
-    linearize: bool,
-    linearize_pass1: Option<&Path>,
-    image_options: ImageTransformOptions,
-    verbose: bool,
-) -> CliResult<()> {
-    let mut standard_output = prepare_page_operation_standard_output(output, page_ops)?;
-    let creates_output = standard_output.is_none();
     if page_ops.empty {
         return Err(
             "--empty is accepted by qpdf but not implemented in flpdf at this layer \
@@ -7570,67 +7581,38 @@ fn run_rewrite_with_page_ops_opened<R: Read + Seek + 'static>(
                 .into(),
         );
     }
-    if !page_ops.rotate.is_empty() {
-        let page_refs = pages::page_refs(&mut pdf)?;
-        apply_rotate_specs(&mut pdf, &page_ops.rotate, &page_refs)?;
-    }
-    apply_image_transformations(&mut pdf, image_options, verbose)?;
-
-    // Page operations emit a fresh document and preserve encryption only when
-    // the primary input itself was encrypted, matching qpdf's page copier.
-    // `--split-pages` is the exception: qpdf's doSplitPages path makes a fresh
-    // empty output document per chunk, so its direct source and final chunks
-    // are cleartext unless explicit encryption options are configured.
-    let mut options = options;
-    let split_pages = page_ops
-        .split_pages
-        .as_deref()
-        .map(parse_split_n)
-        .transpose()?;
-    let split_pages_active = split_pages.is_some_and(|size| size > 0);
-    options.preserve_encryption = !split_pages_active && pdf.is_encrypted();
-    let split_progress = split_pages_active && options.progress;
-    if split_progress {
-        // qpdf creates a fresh writer for each split output. The memory
-        // rewrite is flpdf's internal preparation step and is not an
-        // observable qpdf writer, so it must not consume the progress stream.
-        options.progress = false;
-    }
-
-    if let Some(n) = split_pages.filter(|size| *size > 0) {
-        let suppress_warnings = pdf.suppress_warnings();
-        let (_, mut split_job) = split_pdf(
-            &mut pdf,
-            n,
-            output,
-            input,
-            options.deterministic_id,
-            split_progress,
-            verbose,
-            suppress_warnings,
-            remove_unref.into(),
-            writer_configuration(&options, linearize, linearize_pass1)?,
-        )?;
-        // Fold source warnings into the split job before completing it, as the
-        // ordinary write path does for its source document.
-        split_job.record_document_warnings(&pdf);
-        split_job.complete(true)?;
-        return finish_job_exit_status(split_job.get_exit_code());
-    } else {
-        let announce_file = standard_output.is_none();
-        write_with_pdf_writer(
-            &mut pdf,
-            output,
-            &mut standard_output,
-            &options,
-            linearize,
-            linearize_pass1,
-        )?;
-        if verbose && announce_file {
-            logger_info(wrote_file_message(&progname(), output))?;
-        }
-    }
-    finish_operation_warnings(&pdf, creates_output)
+    // qpdf's no-`--pages` page-operation path still uses the same QPDFJob
+    // create/write lifecycle: `handleRotations` runs before
+    // `handleTransformations`, and `writeQPDF` owns ordinary or split output
+    // (`QPDFJob.cc:466-491`). Queue the raw page-operation parameters on that
+    // canonical job instead of reopening a second direct PdfWriter route.
+    run_rewrite_with_qpdf_job(
+        input,
+        output,
+        false,
+        repair,
+        password,
+        json_input,
+        update_from_json,
+        linearize,
+        linearize_pass1,
+        false,
+        false,
+        options.content_normalization,
+        false,
+        false,
+        image_options,
+        None,
+        flatten_rotation,
+        PageLabelOptions::default(),
+        &[],
+        verbose,
+        no_warn,
+        options,
+        &page_ops.rotate,
+        page_ops.split_pages.as_deref(),
+        remove_unref.into(),
+    )
 }
 
 /// True when any page-operation flag that requires the page-op code paths is
