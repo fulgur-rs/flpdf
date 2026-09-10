@@ -320,6 +320,15 @@ fn page_selection_precedes_single_page_inspection() {
             "--".to_owned(),
             "--show-pages".to_owned(),
         ],
+        vec![
+            "--rotate=90".to_owned(),
+            three_page.display().to_string(),
+            "--pages".to_owned(),
+            ".".to_owned(),
+            "2".to_owned(),
+            "--".to_owned(),
+            "--show-pages".to_owned(),
+        ],
     ];
 
     for args in cases {
