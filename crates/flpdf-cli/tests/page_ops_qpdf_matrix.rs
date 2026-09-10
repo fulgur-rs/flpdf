@@ -3423,3 +3423,163 @@ fn pages_newline_before_endstream_matches_qpdf_bytes() {
         "--pages output with --newline-before-endstream must match qpdf byte-for-byte"
     );
 }
+
+/// An explicit `--encrypt` alongside a page operation must win over the
+/// implicit carryover of the primary's own encryption. The two are mutually
+/// exclusive in the writer, so getting this wrong silently discards the
+/// requested passwords and leaves the output openable with the source's
+/// credentials -- the opposite of what was asked for.
+#[test]
+fn pages_explicit_encrypt_overrides_source_encryption_like_qpdf() {
+    if !qpdf_available() {
+        eprintln!("[SKIP page_ops_qpdf_matrix] qpdf {EXPECTED_QPDF_VERSION} is unavailable");
+        return;
+    }
+
+    let temp = tempfile::tempdir().expect("temporary directory");
+    let source = temp.path().join("source.pdf");
+    let (ok, _) = run_qpdf(&[
+        "--static-id",
+        fixture_abs(THREE_PAGE).to_str().unwrap(),
+        "--encrypt",
+        "--user-password=source-user",
+        "--owner-password=source-owner",
+        "--bits=256",
+        "--",
+        source.to_str().unwrap(),
+    ]);
+    assert!(ok, "qpdf should build the encrypted source fixture");
+
+    for (label, output) in [
+        ("qpdf", temp.path().join("qpdf.pdf")),
+        ("flpdf", temp.path().join("flpdf.pdf")),
+    ] {
+        let args = [
+            "--static-id",
+            "--password=source-user",
+            source.to_str().unwrap(),
+            "--pages",
+            ".",
+            "1-2",
+            "--",
+            "--encrypt",
+            "--user-password=fresh-user",
+            "--owner-password=fresh-owner",
+            "--bits=256",
+            "--",
+            output.to_str().unwrap(),
+        ];
+        if label == "qpdf" {
+            let (ok, _) = run_qpdf(&args);
+            assert!(ok, "qpdf should re-encrypt while selecting pages");
+        } else {
+            Command::cargo_bin("flpdf")
+                .unwrap()
+                .env("FLPDF_STATIC_ID_QUIET", "1")
+                .args(args)
+                .assert()
+                .success();
+        }
+
+        assert_qpdf_encrypted_output(&output, "fresh-user");
+        assert_qpdf_rejects_password(&output, "source-user");
+    }
+}
+
+/// Without an explicit `--encrypt`, the primary's encryption still carries over
+/// to the page-operation output, so the fix above must not disable the donor
+/// path it guards.
+#[test]
+fn pages_without_explicit_encrypt_still_carries_source_encryption() {
+    if !qpdf_available() {
+        eprintln!("[SKIP page_ops_qpdf_matrix] qpdf {EXPECTED_QPDF_VERSION} is unavailable");
+        return;
+    }
+
+    let temp = tempfile::tempdir().expect("temporary directory");
+    let source = temp.path().join("source.pdf");
+    let (ok, _) = run_qpdf(&[
+        "--static-id",
+        fixture_abs(THREE_PAGE).to_str().unwrap(),
+        "--encrypt",
+        "--user-password=source-user",
+        "--owner-password=source-owner",
+        "--bits=256",
+        "--",
+        source.to_str().unwrap(),
+    ]);
+    assert!(ok, "qpdf should build the encrypted source fixture");
+
+    let output = temp.path().join("flpdf.pdf");
+    Command::cargo_bin("flpdf")
+        .unwrap()
+        .env("FLPDF_STATIC_ID_QUIET", "1")
+        .args([
+            "--static-id",
+            "--password=source-user",
+            source.to_str().unwrap(),
+            "--pages",
+            ".",
+            "1-2",
+            "--",
+            output.to_str().unwrap(),
+        ])
+        .assert()
+        .success();
+
+    assert_qpdf_encrypted_output(&output, "source-user");
+}
+
+/// `--allow-weak-crypto` is what lets RC4 through the write gate. The
+/// page-operation route accepts an explicit `--encrypt`, so it has to honour
+/// that opt-in as the plain rewrite routes already do.
+#[test]
+fn pages_allow_weak_crypto_permits_rc4_like_qpdf() {
+    if !qpdf_available() {
+        eprintln!("[SKIP page_ops_qpdf_matrix] qpdf {EXPECTED_QPDF_VERSION} is unavailable");
+        return;
+    }
+
+    let temp = tempfile::tempdir().expect("temporary directory");
+    let qpdf_output = temp.path().join("qpdf.pdf");
+    let (ok, _) = run_qpdf(&[
+        "--static-id",
+        "--allow-weak-crypto",
+        fixture_abs(THREE_PAGE).to_str().unwrap(),
+        "--pages",
+        ".",
+        "1-2",
+        "--",
+        "--encrypt",
+        "user",
+        "owner",
+        "40",
+        "--",
+        qpdf_output.to_str().unwrap(),
+    ]);
+    assert!(ok, "qpdf 11.9.0 accepts RC4 under --allow-weak-crypto");
+    assert_qpdf_encrypted_output(&qpdf_output, "user");
+
+    let flpdf_output = temp.path().join("flpdf.pdf");
+    Command::cargo_bin("flpdf")
+        .unwrap()
+        .env("FLPDF_STATIC_ID_QUIET", "1")
+        .args([
+            "--static-id",
+            "--allow-weak-crypto",
+            fixture_abs(THREE_PAGE).to_str().unwrap(),
+            "--pages",
+            ".",
+            "1-2",
+            "--",
+            "--encrypt",
+            "user",
+            "owner",
+            "40",
+            "--",
+            flpdf_output.to_str().unwrap(),
+        ])
+        .assert()
+        .success();
+    assert_qpdf_encrypted_output(&flpdf_output, "user");
+}

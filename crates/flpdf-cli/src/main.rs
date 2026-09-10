@@ -3633,6 +3633,10 @@ fn main() {
             // writer (`QPDFWriter.cc:1560`), including page-operation output.
             newline_before_endstream: args.newline_before_endstream.into(),
             password_mode: args.password.password_mode.into(),
+            // Now that this route accepts an explicit --encrypt, it also has to
+            // honour the opt-in that lets RC4 through, exactly as
+            // `top_level_writer_options` and the `rewrite` initializer do.
+            allow_weak_crypto: args.password.allow_weak_crypto,
             ..WriterOptions::default()
         };
         apply_cli_decode_level(&mut options, args.decode_level);
@@ -7485,7 +7489,13 @@ fn run_page_extraction_after_plan<R: Read + Seek + 'static>(
     // and an explicit non-`none` `--decode-level` does the same directly,
     // both of which `can_preserve` would likewise refuse to auto-preserve
     // through.
+    // An explicit --encrypt wins over the implicit donor carryover. The two
+    // are mutually exclusive in the writer -- `copy_encryption_parameters`
+    // clears `encryption_parameters` (`writer.rs:451-453`) -- so letting the
+    // carryover run here would silently drop the requested passwords and leave
+    // the output openable with the source credentials instead.
     if !split_pages_active
+        && options.encrypt.is_none()
         && options.copy_encryption.is_none()
         && !options.qdf
         && !options.content_normalization
