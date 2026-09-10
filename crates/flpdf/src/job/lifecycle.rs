@@ -4970,6 +4970,24 @@ impl QPDFJobConfig<'_> {
         Ok(self)
     }
 
+    /// Append qpdf's `collate` page-group sizes.
+    ///
+    /// This is `QPDFJob::Config::collate` (`libqpdf/QPDFJob_config.cc:95-125`).
+    /// qpdf permits repeated calls and appends each call's comma-separated
+    /// values to one ordered vector; an empty parameter appends the default
+    /// group size of one. Reuse the byte-oriented parser shared with the job
+    /// JSON boundary so its unsigned-prefix and error behavior remains one
+    /// canonical implementation.
+    pub fn collate(&mut self, parameter: impl AsRef<[u8]>) -> Result<&mut Self> {
+        let values = parse_qpdf_collate_parameter(parameter.as_ref())?;
+        self.job
+            .configuration
+            .collate
+            .get_or_insert_with(Vec::new)
+            .extend(values);
+        Ok(self)
+    }
+
     /// Configure qpdf's `splitPages` writer-stage dispatch.
     ///
     /// qpdf's Config stores the signed `int` produced by `string_to_int` and

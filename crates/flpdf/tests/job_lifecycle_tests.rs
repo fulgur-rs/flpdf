@@ -3839,6 +3839,65 @@ fn config_empty_input_rejects_a_duplicate_empty_selector() {
 }
 
 #[test]
+fn config_collate_zero_selects_no_pages() {
+    let input =
+        Path::new(env!("CARGO_MANIFEST_DIR")).join("../../tests/fixtures/compat/three-page.pdf");
+    let tempdir = tempfile::tempdir().unwrap();
+    let output = tempdir.path().join("collate-zero.pdf");
+
+    let mut job = QPDFJob::new();
+    job.config()
+        .input_file(&input)
+        .unwrap()
+        .output_file(&output)
+        .unwrap()
+        .add_page_spec(".", "1-2", None)
+        .unwrap()
+        .add_page_spec(".", "3", None)
+        .unwrap()
+        .collate("0")
+        .unwrap();
+    assert_eq!(job.run().unwrap(), JobExitCode::Success);
+
+    let mut pdf = Pdf::open(BufReader::new(File::open(output).unwrap())).unwrap();
+    assert!(
+        flpdf::pages::page_refs(&mut pdf).unwrap().is_empty(),
+        "qpdf collate=0 must produce an empty selected-page result"
+    );
+}
+
+#[test]
+fn config_collate_appends_values_in_declaration_order() {
+    let input =
+        Path::new(env!("CARGO_MANIFEST_DIR")).join("../../tests/fixtures/compat/three-page.pdf");
+    let tempdir = tempfile::tempdir().unwrap();
+    let output = tempdir.path().join("collate-append.pdf");
+
+    let mut job = QPDFJob::new();
+    job.config()
+        .input_file(&input)
+        .unwrap()
+        .output_file(&output)
+        .unwrap()
+        .add_page_spec(".", "1", None)
+        .unwrap()
+        .add_page_spec(".", "2", None)
+        .unwrap()
+        .collate("0")
+        .unwrap()
+        .collate("1")
+        .unwrap();
+    assert_eq!(job.run().unwrap(), JobExitCode::Success);
+
+    let mut pdf = Pdf::open(BufReader::new(File::open(output).unwrap())).unwrap();
+    assert_eq!(
+        flpdf::pages::page_refs(&mut pdf).unwrap().len(),
+        1,
+        "collate values must append as [0, 1], not replace the first group"
+    );
+}
+
+#[test]
 fn json_page_specs_reject_a_config_pages_group_after_json_pages() {
     let mut job = QPDFJob::new();
     job.initialize_from_json_partial(r#"{"pages":[{"file":"first.pdf"}]}"#)
