@@ -50,6 +50,49 @@ fn top_level_replace_input_rewrites_unicode_input() {
 }
 
 #[test]
+fn top_level_replace_input_removes_attachment_like_qpdf() {
+    if !qpdf_available() {
+        eprintln!("qpdf 11.9.0 is unavailable; skipping replace-input attachment differential");
+        return;
+    }
+
+    let directory = tempfile::tempdir().expect("temporary replace-input directory");
+    let qpdf_directory = directory.path().join("qpdf");
+    let flpdf_directory = directory.path().join("flpdf");
+    fs::create_dir(&qpdf_directory).expect("create qpdf directory");
+    fs::create_dir(&flpdf_directory).expect("create flpdf directory");
+    let fixture = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+        .join("../../tests/fixtures/compat/attachment-two-page.pdf");
+    fs::copy(&fixture, qpdf_directory.join("input.pdf")).expect("copy qpdf input");
+    fs::copy(&fixture, flpdf_directory.join("input.pdf")).expect("copy flpdf input");
+
+    let args = [
+        "--deterministic-id",
+        "--replace-input",
+        "--remove-attachment=attachment.txt",
+        "input.pdf",
+    ];
+    let qpdf = ProcessCommand::new("qpdf")
+        .current_dir(&qpdf_directory)
+        .args(args)
+        .output()
+        .expect("run qpdf replace-input attachment oracle");
+    let flpdf = Command::cargo_bin("flpdf")
+        .expect("flpdf binary")
+        .current_dir(&flpdf_directory)
+        .env("FLPDF_PROGNAME", "qpdf")
+        .args(args)
+        .output()
+        .expect("run flpdf replace-input attachment");
+
+    assert_eq!(qpdf.status.code(), Some(0));
+    assert_eq!(flpdf.status.code(), qpdf.status.code());
+    assert_eq!(flpdf.stdout, qpdf.stdout);
+    assert_eq!(flpdf.stderr, qpdf.stderr);
+    assert!(flpdf_directory.join("input.pdf").is_file());
+}
+
+#[test]
 fn top_level_replace_input_rejects_json_output_like_qpdf() {
     if !qpdf_available() {
         eprintln!("qpdf 11.9.0 is unavailable; skipping replace-input JSON differential");

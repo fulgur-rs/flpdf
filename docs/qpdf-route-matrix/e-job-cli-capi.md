@@ -503,6 +503,20 @@ callers belong to JSON/page-operation/inspection cohorts tracked separately.
 The E-4/E-11/E-12/E-21 rows above retain their original matrix row identity and
 are re-measured against this note during the next full route audit.
 
+### E-9 / E-21 / E-29 attachment mutation consumer update (2026-09-10, `flpdf-3yn9.48.81`)
+
+The three top-level mutation consumers (`run_add_attachment`,
+`run_remove_attachment`, and `run_copy_attachments_from`) now configure one
+`QPDFJob` and use `create_qpdf()` → `write_qpdf()` → `get_exit_code()`.
+`QPDFJob::prepare_document_transformations` therefore owns the qpdf order,
+writer configuration, warning completion, stdout reservation, and
+`--replace-input` boundary. The copy donor remains a direct per-donor
+`open_job_source` open inside `copy_attachments_with_opener`, preserving
+qpdf's target filename and verbose/open-warning order (`QPDFJob.cc:2089-2135`);
+it is not routed through `job.open_with_description`. The qtest exception
+routes and the separate page-operation replace-input issue remain outside this
+slice.
+
 ## unknown / probe
 
 | ID | 決められないこと | 必要な source / probe |

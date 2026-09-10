@@ -3340,7 +3340,12 @@ impl QPDFJob {
                 // The drain qpdf performs after `writeOutfile` returns
                 // (`libqpdf/QPDFJob.cc:493-494`).
                 self.drain_document_warnings(pdf);
-                self.complete(true)?;
+                // qpdf's writeOutfile clears its output filename when the
+                // destination is `-` before writeQPDF emits the completion
+                // summary (`libqpdf/QPDFJob.cc:3033-3040,493-503`). Therefore
+                // stdout is an output stream for dispatch, but not a named
+                // resulting file for the warning suffix.
+                self.complete(output != Path::new("-"))?;
                 if self.configuration.report_memory_usage {
                     self.report_memory_usage()?;
                 }
@@ -3678,10 +3683,10 @@ impl QPDFJob {
         self.apply_page_label_transformations(pdf, configuration)?;
         for key in &configuration.attachments_to_remove {
             if !pdf.embedded_files().remove_embedded_file(key)? {
-                return Err(Error::System(format!(
-                    "attachment {} not found",
-                    String::from_utf8_lossy(key)
-                )));
+                let mut message = b"attachment ".to_vec();
+                message.extend_from_slice(key);
+                message.extend_from_slice(b" not found");
+                return Err(Error::SystemBytes(message));
             }
             if configuration.verbose {
                 self.logger.info(format!(

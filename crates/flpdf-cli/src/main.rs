@@ -7,22 +7,22 @@ use clap::{
 };
 use flpdf::fix_qdf;
 use flpdf::job::{
-    copy_duplicate_page_annotations, AttachmentAddOptions, AttachmentCopyOptions, CheckError,
-    FlattenAnnotationsMode, ImageOptimizationOptions, JobExitCode, JsonJobError, JsonJobOptions,
-    JsonJobOutput, JsonStreamData, PageSpecInput, PageSpecJobOutput, QPDFJob,
-    RemoveUnreferencedResources, SplitPageOptions,
+    copy_duplicate_page_annotations, AttachmentAddOptions, CheckError, FlattenAnnotationsMode,
+    ImageOptimizationOptions, JobExitCode, JsonJobError, JsonJobOptions, JsonJobOutput,
+    JsonStreamData, PageSpecInput, PageSpecJobOutput, QPDFJob, RemoveUnreferencedResources,
+    SplitPageOptions,
 };
 use flpdf::pipeline::{FlateAction, Pipeline, PipelineHandle, PlFlate, PlStdioFile};
 use flpdf::qutil::same_file as qpdf_same_file;
 use flpdf::writer::DecodeLevel as StreamDecodeLevel;
 use flpdf::{
     json_inspect::{DecodeLevel, JsonKey, JsonObjectSelector},
-    normalize_content_stream, pages, parse_pdf_version, AcroFormDocumentHelper, CompressStreams,
-    CopyEncryptionSource, EncryptMethod, EncryptParams, Error, NewlineBeforeEndstream,
-    ObjectHandle, ObjectKeyAlg, ObjectRef, ObjectStreamMode, PageDocumentHelper, PageObjectHelper,
-    PasswordMode, PasswordWriteNotice, Pdf, PdfOpenOptions, PdfVersion, PdfWriter,
-    PermissionsConfig, PrintPermission, QPDFLogger, R2PermissionsConfig, StreamDataMode,
-    UsageError, WriterConfiguration,
+    normalize_content_stream, pages, parse_pdf_version, CompressStreams, CopyEncryptionSource,
+    EncryptMethod, EncryptParams, Error, NewlineBeforeEndstream, ObjectHandle, ObjectKeyAlg,
+    ObjectRef, ObjectStreamMode, PageDocumentHelper, PageObjectHelper, PasswordMode,
+    PasswordWriteNotice, Pdf, PdfOpenOptions, PdfVersion, PdfWriter, PermissionsConfig,
+    PrintPermission, QPDFLogger, R2PermissionsConfig, StreamDataMode, UsageError,
+    WriterConfiguration,
 };
 use flpdf::{
     pages::tree_rebuild::{rebuild_page_tree, RebuildResult},
@@ -3466,6 +3466,7 @@ fn main() {
         run_remove_attachment(
             args.input,
             args.output,
+            args.replace_input,
             args.repair,
             &args.password,
             &args.remove_attachment,
@@ -3487,6 +3488,7 @@ fn main() {
         run_add_attachment(
             args.input,
             args.output,
+            args.replace_input,
             args.repair,
             &args.password,
             attachment_segments,
@@ -3512,6 +3514,7 @@ fn main() {
         run_copy_attachments_from(
             args.input,
             args.output,
+            args.replace_input,
             args.repair,
             &args.password,
             copy_groups,
@@ -9238,32 +9241,6 @@ fn emit_content_normalization_warnings(
     logger_warn(message)
 }
 
-fn finish_rewrite_warnings<R: Read + Seek>(
-    input: &Path,
-    pdf: &Pdf<R>,
-    normalization_warnings: &[ContentNormalizationWarning],
-    creates_output: bool,
-    no_warn: bool,
-) -> CliResult<()> {
-    // qpdf retains open-time warnings in the document warning collection and
-    // emits the final summary after the output writer completes. Include the
-    // full collection here, not only warnings added after this route opened
-    // the document.
-    let has_repair_warnings = !pdf.repair_diagnostics().entries().is_empty();
-    // qpdf reports these through `QPDF::warn`, which records the warning but
-    // skips the text under `--no-warn` (`QPDF_Stream.cc:625`, `QPDF.cc:491`);
-    // the exit status still reflects it.
-    if !no_warn {
-        for &warning in normalization_warnings {
-            emit_content_normalization_warnings(input, warning)?;
-        }
-    }
-    if normalization_warnings.is_empty() && !has_repair_warnings {
-        return Ok(());
-    }
-    finish_warning_state(true, creates_output, no_warn)
-}
-
 /// Prefix a fatal post-open error with the input path so main() renders the
 /// qpdf shape `<progname>: <file>: <msg>` for path-scoped failures.
 ///
@@ -9552,11 +9529,85 @@ fn path_basename(path: &std::path::Path) -> CliResult<Vec<u8>> {
         .map(arg_parser::os_bytes)
 }
 
+#[allow(clippy::too_many_arguments)]
+fn configure_attachment_job(
+    input: &Path,
+    output: Option<&Path>,
+    replace_input: bool,
+    repair: bool,
+    password: &PasswordArgs,
+    verbose: bool,
+    suppress_warnings: bool,
+    remove_restrictions: bool,
+    linearize: bool,
+    linearize_pass1: Option<&Path>,
+    writer_options: &WriterOptions,
+    transform_options: InspectionTransformOptions,
+) -> CliResult<QPDFJob> {
+    let mut job = new_cli_job(suppress_warnings);
+    job.set_input_file(input.to_path_buf())?;
+    if replace_input {
+        job.config().replace_input()?;
+    } else {
+        job.set_output_file(output.ok_or_else(missing_output_usage_error)?.to_path_buf())?;
+    }
+
+    let input_options = pdf_open_options(repair, password)?;
+    job.set_password(input_options.password);
+    job.set_password_mode(password.password_mode.into());
+    job.set_password_is_hex_key(password.password_is_hex_key);
+    job.set_suppress_password_recovery(password.suppress_password_recovery);
+    job.set_suppress_recovery(password.recovery.suppress_recovery);
+    job.set_ignore_xref_streams(password.recovery.ignore_xref_streams);
+    job.set_allow_weak_crypto(writer_options.allow_weak_crypto);
+    job.set_progress(writer_options.progress);
+    job.set_verbose(verbose);
+    job.set_linearization(linearize, linearize_pass1.map(Path::to_path_buf));
+    configure_top_level_inspection_transformations(
+        &mut job,
+        transform_options,
+        verbose,
+        remove_restrictions,
+        false,
+    );
+    Ok(job)
+}
+
+fn run_configured_attachment_job(
+    mut job: QPDFJob,
+    writer_options: &WriterOptions,
+    linearize: bool,
+    linearize_pass1: Option<&Path>,
+) -> CliResult<()> {
+    let mut pdf = match job.create_qpdf()? {
+        Some(pdf) => pdf,
+        None => {
+            return Err(Box::new(CliExitError {
+                code: ExitCode::Errors,
+                message: String::new(),
+            }))
+        }
+    };
+    job.set_writer_configuration(writer_configuration_unnormalized(
+        writer_options,
+        linearize,
+        linearize_pass1,
+    )?);
+    match job.write_qpdf(&mut pdf) {
+        Ok(()) => finish_job_exit_status(job.get_exit_code()),
+        Err(_) => Err(Box::new(CliExitError {
+            code: ExitCode::Errors,
+            message: String::new(),
+        })),
+    }
+}
+
 /// `--add-attachment FILE [sub-flags] -- output.pdf`
 #[allow(clippy::too_many_arguments)]
 fn run_add_attachment(
     input: Option<PathBuf>,
     output: Option<PathBuf>,
+    replace_input: bool,
     repair: bool,
     password: &PasswordArgs,
     segments: Vec<Vec<Vec<u8>>>,
@@ -9569,7 +9620,6 @@ fn run_add_attachment(
     transform_options: InspectionTransformOptions,
 ) -> CliResult<()> {
     let input = input.ok_or_else(missing_input_usage_error)?;
-    let output = output.ok_or_else(missing_output_usage_error)?;
     let attachment_options = segments
         .into_iter()
         .map(|tokens| {
@@ -9594,57 +9644,30 @@ fn run_add_attachment(
     // Reserve standard output before opening the input, like qpdf's
     // `saveToStandardOutput` (`QPDFJob.cc:625`), so open-time `--verbose`
     // info lines go to stderr when the PDF goes to stdout.
-    let mut standard_output = prepare_pdf_standard_output(&output)?;
-
-    let file = File::open(&input).map_err(|error| open_error_with_file(&input, error.into()))?;
-    let options = pdf_open_options(repair, password)?;
-    let mut job = QPDFJob::new();
-    job.set_logger(cli_logger());
-    job.set_message_prefix(progname());
-    job.set_suppress_warnings(suppress_warnings);
-    job.set_warnings_exit_zero(cli_warning_exit_zero());
-    let mut pdf = job
-        .open_with_description(BufReader::new(file), path_description(&input), options)
-        .map_err(|error| error_with_file(&input, actionable_password_error(error)))?;
-    pdf.set_suppress_warnings(suppress_warnings);
-
-    if remove_restrictions {
-        AcroFormDocumentHelper::new(&mut pdf)?.disable_digital_signatures()?;
+    if let Some(output) = output.as_deref() {
+        let _ = prepare_pdf_standard_output(output)?;
     }
-    apply_inspection_transformations(&mut job, &mut pdf, transform_options, verbose)?;
-    job.add_attachments(&mut pdf, &attachment_options)?;
-
-    // qpdf's writer applies content normalization after all transformations
-    // have updated the document graph. The direct writer API requires the
-    // equivalent page-content prepass before it emits the final PDF.
-    let normalization_warnings = if writer_options.content_normalization {
-        normalize_page_contents(&mut pdf)?
-    } else {
-        Vec::new()
-    };
-    write_with_pdf_writer(
-        &mut pdf,
-        &output,
-        &mut standard_output,
-        &writer_options,
+    let mut job = configure_attachment_job(
+        &input,
+        output.as_deref(),
+        replace_input,
+        repair,
+        password,
+        verbose,
+        suppress_warnings,
+        remove_restrictions,
         linearize,
         linearize_pass1,
+        &writer_options,
+        transform_options,
     )?;
-    if verbose && output.as_os_str() != "-" {
-        job.logger()
-            .info(wrote_file_message(&progname(), &output))?;
-    }
-    if !suppress_warnings {
-        for &warning in &normalization_warnings {
-            emit_content_normalization_warnings(&input, warning)?;
+    {
+        let mut configuration = job.config();
+        for option in attachment_options {
+            configuration.add_attachment(option);
         }
     }
-    if !normalization_warnings.is_empty() {
-        job.record_warnings();
-    }
-    job.record_document_warnings(&pdf);
-    job.complete(true)?;
-    finish_job_exit_status(job.get_exit_code())
+    run_configured_attachment_job(job, &writer_options, linearize, linearize_pass1)
 }
 
 /// `--remove-attachment KEY [input] [output]`
@@ -9652,6 +9675,7 @@ fn run_add_attachment(
 fn run_remove_attachment(
     input: Option<PathBuf>,
     output: Option<PathBuf>,
+    replace_input: bool,
     repair: bool,
     password: &PasswordArgs,
     keys: &[OsString],
@@ -9664,64 +9688,30 @@ fn run_remove_attachment(
     transform_options: InspectionTransformOptions,
 ) -> CliResult<()> {
     let input = input.ok_or_else(missing_input_usage_error)?;
-    let output = output.ok_or_else(missing_output_usage_error)?;
-
-    // qpdf switches the logger to "save to standard output" before it opens
-    // the input (`QPDFJob.cc:625`), so every `--verbose` info line — the
-    // password-encoding recovery notice emitted while opening as well as the
-    // removal report below — lands on stderr when the PDF goes to stdout.
-    let mut standard_output = prepare_pdf_standard_output(&output)?;
-    let creates_output = standard_output.is_none();
-
-    let mut job = new_cli_job(suppress_warnings);
-    let mut pdf = open_pdf_with_suppression(&input, repair, password, suppress_warnings)?;
-    job.set_input_name_bytes(path_description(&input));
-
-    if remove_restrictions {
-        AcroFormDocumentHelper::new(&mut pdf)?.disable_digital_signatures()?;
+    if let Some(output) = output.as_deref() {
+        let _ = prepare_pdf_standard_output(output)?;
     }
-    apply_inspection_transformations(&mut job, &mut pdf, transform_options, verbose)?;
-    for key in keys {
-        let key = arg_parser::os_bytes(key);
-        let found = pdf.embedded_files().remove_embedded_file(&key)?;
-        if !found {
-            let mut message = b"attachment ".to_vec();
-            message.extend_from_slice(&key);
-            message.extend_from_slice(b" not found");
-            return Err(Error::SystemBytes(message).into());
-        }
-
-        if verbose {
-            let mut message = format!("{}: removed attachment ", progname()).into_bytes();
-            message.extend_from_slice(&key);
-            message.push(b'\n');
-            logger_info(message)?;
-        }
-    }
-
-    let normalization_warnings = if writer_options.content_normalization {
-        normalize_page_contents(&mut pdf)?
-    } else {
-        Vec::new()
-    };
-    write_with_pdf_writer(
-        &mut pdf,
-        &output,
-        &mut standard_output,
-        &writer_options,
+    let mut job = configure_attachment_job(
+        &input,
+        output.as_deref(),
+        replace_input,
+        repair,
+        password,
+        verbose,
+        suppress_warnings,
+        remove_restrictions,
         linearize,
         linearize_pass1,
+        &writer_options,
+        transform_options,
     )?;
-    if verbose && output.as_os_str() != "-" {
-        logger_info(wrote_file_message(&progname(), &output))?;
+    {
+        let mut configuration = job.config();
+        for key in keys {
+            configuration.remove_attachment(arg_parser::os_bytes(key));
+        }
     }
-    finish_rewrite_warnings(
-        &input,
-        &pdf,
-        &normalization_warnings,
-        creates_output,
-        suppress_warnings,
-    )
+    run_configured_attachment_job(job, &writer_options, linearize, linearize_pass1)
 }
 
 /// `--list-attachments [--verbose] input`
@@ -9808,6 +9798,7 @@ fn run_show_attachment(
 fn run_copy_attachments_from(
     input: Option<PathBuf>,
     output: Option<PathBuf>,
+    replace_input: bool,
     repair: bool,
     password: &PasswordArgs,
     groups: Vec<Vec<Vec<u8>>>,
@@ -9820,7 +9811,6 @@ fn run_copy_attachments_from(
     transform_options: InspectionTransformOptions,
 ) -> CliResult<()> {
     let input = input.ok_or_else(missing_input_usage_error)?;
-    let output = output.ok_or_else(missing_output_usage_error)?;
     let donor_args = groups
         .into_iter()
         .map(parse_copy_attachments_segment)
@@ -9829,88 +9819,34 @@ fn run_copy_attachments_from(
     // Reserve standard output before opening the target, like qpdf's
     // `saveToStandardOutput` (`QPDFJob.cc:625`), so open-time `--verbose`
     // info lines go to stderr when the PDF goes to stdout.
-    let mut standard_output = prepare_pdf_standard_output(&output)?;
-
-    let file = File::open(&input).map_err(|error| open_error_with_file(&input, error.into()))?;
-    let options = pdf_open_options(repair, password)?;
-    let mut job = QPDFJob::new();
-    job.set_logger(cli_logger());
-    job.set_message_prefix(progname());
-    job.set_suppress_warnings(suppress_warnings);
-    job.set_warnings_exit_zero(cli_warning_exit_zero());
-    let mut pdf = job
-        .open_with_description(BufReader::new(file), path_description(&input), options)
-        .map_err(|error| error_with_file(&input, actionable_password_error(error)))?;
-    pdf.set_suppress_warnings(suppress_warnings);
-    if remove_restrictions {
-        let _ = AcroFormDocumentHelper::new(&mut pdf)?.disable_digital_signatures()?;
+    if let Some(output) = output.as_deref() {
+        let _ = prepare_pdf_standard_output(output)?;
     }
-    apply_inspection_transformations(&mut job, &mut pdf, transform_options, verbose)?;
-
-    let copy_options = donor_args
-        .into_iter()
-        .map(|args| AttachmentCopyOptions {
-            path: args.file,
-            password: args.password,
-            prefix: args.prefix.unwrap_or_default(),
-            verbose,
-        })
-        .collect::<Vec<_>>();
-    job.copy_attachments_with_opener(&mut pdf, &copy_options, |_, option| {
-        let mut source_password = password.clone();
-        source_password.password = None;
-        source_password.raw_password = None;
-        source_password.password_file = None;
-        let mut src_options =
-            pdf_open_options_with_password_bytes(repair, &source_password, option.password.clone());
-        configure_document_logger(&mut src_options, &option.path);
-        src_options.suppress_warnings |= suppress_warnings;
-        let src_file = File::open(&option.path)
-            .map_err(|error| open_error_with_file(&option.path, error.into()))?;
-        let mut src = Pdf::<Box<dyn flpdf::ReadSeek>>::open_with_options(
-            Box::new(BufReader::new(src_file)),
-            src_options,
-        )
-        .map_err(|error| error_with_file(&option.path, actionable_password_error(error)))?;
-        src.root_handle()
-            .map_err(|error| error_with_file(&option.path, actionable_password_error(error)))?;
-        Ok::<_, Box<dyn std::error::Error>>(src)
-    })?;
-
-    // Content normalization is a writer option in qpdf, but the CLI's shared
-    // prepass also owns its diagnostic collection. Run it after attachments
-    // have been copied so the target page graph is the one normalized by the
-    // final writer.
-    let normalization_warnings = if writer_options.content_normalization {
-        normalize_page_contents(&mut pdf)?
-    } else {
-        Vec::new()
-    };
-    write_with_pdf_writer(
-        &mut pdf,
-        &output,
-        &mut standard_output,
-        &writer_options,
+    let mut job = configure_attachment_job(
+        &input,
+        output.as_deref(),
+        replace_input,
+        repair,
+        password,
+        verbose,
+        suppress_warnings,
+        remove_restrictions,
         linearize,
         linearize_pass1,
+        &writer_options,
+        transform_options,
     )?;
-    if verbose && output.as_os_str() != "-" {
-        job.logger()
-            .info(wrote_file_message(&progname(), &output))?;
-    }
-    // Same `--no-warn` boundary as `finish_rewrite_warnings`: the warning is
-    // recorded (exit status 3) but its text is suppressed like `QPDF::warn`.
-    if !suppress_warnings {
-        for &warning in &normalization_warnings {
-            emit_content_normalization_warnings(&input, warning)?;
+    {
+        let mut configuration = job.config();
+        for args in donor_args {
+            configuration.copy_attachments_from(
+                args.file,
+                args.password,
+                args.prefix.unwrap_or_default(),
+            );
         }
     }
-    if !normalization_warnings.is_empty() {
-        job.record_warnings();
-    }
-    job.record_document_warnings(&pdf);
-    job.complete(true)?;
-    finish_job_exit_status(job.get_exit_code())
+    run_configured_attachment_job(job, &writer_options, linearize, linearize_pass1)
 }
 
 #[cfg(test)]
