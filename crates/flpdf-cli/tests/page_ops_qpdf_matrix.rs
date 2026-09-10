@@ -2471,6 +2471,168 @@ fn pages_primary_encrypted_toplevel_password_matches_qpdf() {
 }
 
 #[test]
+fn pages_decrypts_encrypted_primary_like_qpdf() {
+    // qpdf applies --decrypt at the writer boundary after page selection, so
+    // an authenticated encrypted primary must produce a cleartext result.
+    let tmp = tempfile::tempdir().unwrap();
+    let Some(enc) = make_encrypted_three_page(tmp.path(), "secretpw") else {
+        return;
+    };
+    let q = tmp.path().join("q.pdf");
+    let f = tmp.path().join("f.pdf");
+
+    let (qpdf_ok, qpdf_output) = run_qpdf(&[
+        enc.to_str().unwrap(),
+        "--password=secretpw",
+        "--decrypt",
+        "--pages",
+        ".",
+        "1-2",
+        "--",
+        q.to_str().unwrap(),
+    ]);
+    assert!(
+        qpdf_ok,
+        "qpdf --decrypt with --pages should succeed: {qpdf_output}"
+    );
+
+    Command::cargo_bin("flpdf")
+        .unwrap()
+        .args([
+            "--password=secretpw",
+            "--decrypt",
+            enc.to_str().unwrap(),
+            "--pages",
+            ".",
+            "1-2",
+            "--",
+            f.to_str().unwrap(),
+        ])
+        .assert()
+        .success();
+
+    assert_qpdf_cleartext_chunk(&q);
+    assert_qpdf_cleartext_chunk(&f);
+    assert_eq!(npages_of(&q), npages_of(&f));
+}
+
+#[test]
+fn decrypt_applies_to_all_top_level_page_operation_outputs() {
+    // The same writer policy must reach rotate, multi-source page selection,
+    // and every fresh split writer, not only the single-source --pages case.
+    let tmp = tempfile::tempdir().unwrap();
+    let Some(enc) = make_encrypted_three_page(tmp.path(), "secretpw") else {
+        return;
+    };
+
+    let q_rotate = tmp.path().join("q-rotate.pdf");
+    let f_rotate = tmp.path().join("f-rotate.pdf");
+    let (qpdf_ok, qpdf_output) = run_qpdf(&[
+        enc.to_str().unwrap(),
+        "--password=secretpw",
+        "--decrypt",
+        "--rotate=90",
+        q_rotate.to_str().unwrap(),
+    ]);
+    assert!(
+        qpdf_ok,
+        "qpdf --decrypt with --rotate should succeed: {qpdf_output}"
+    );
+    Command::cargo_bin("flpdf")
+        .unwrap()
+        .args([
+            "--password=secretpw",
+            "--decrypt",
+            enc.to_str().unwrap(),
+            "--rotate=90",
+            f_rotate.to_str().unwrap(),
+        ])
+        .assert()
+        .success();
+    assert_qpdf_cleartext_chunk(&q_rotate);
+    assert_qpdf_cleartext_chunk(&f_rotate);
+
+    let secondary = fixture_abs(TWO_PAGE);
+    let q_merge = tmp.path().join("q-merge.pdf");
+    let f_merge = tmp.path().join("f-merge.pdf");
+    let (qpdf_ok, qpdf_output) = run_qpdf(&[
+        enc.to_str().unwrap(),
+        "--password=secretpw",
+        "--decrypt",
+        "--pages",
+        ".",
+        "1",
+        secondary.to_str().unwrap(),
+        "1",
+        "--",
+        q_merge.to_str().unwrap(),
+    ]);
+    assert!(
+        qpdf_ok,
+        "qpdf --decrypt with a foreign page source should succeed: {qpdf_output}"
+    );
+    Command::cargo_bin("flpdf")
+        .unwrap()
+        .args([
+            "--password=secretpw",
+            "--decrypt",
+            enc.to_str().unwrap(),
+            "--pages",
+            ".",
+            "1",
+            secondary.to_str().unwrap(),
+            "1",
+            "--",
+            f_merge.to_str().unwrap(),
+        ])
+        .assert()
+        .success();
+    assert_qpdf_cleartext_chunk(&q_merge);
+    assert_qpdf_cleartext_chunk(&f_merge);
+
+    let qdir = tempfile::tempdir().unwrap();
+    let fdir = tempfile::tempdir().unwrap();
+    let q_template = qdir.path().join("q.pdf");
+    let f_template = fdir.path().join("f.pdf");
+    let (qpdf_ok, qpdf_output) = run_qpdf(&[
+        enc.to_str().unwrap(),
+        "--password=secretpw",
+        "--decrypt",
+        "--split-pages=1",
+        q_template.to_str().unwrap(),
+    ]);
+    assert!(
+        qpdf_ok,
+        "qpdf --decrypt with --split-pages should succeed: {qpdf_output}"
+    );
+    Command::cargo_bin("flpdf")
+        .unwrap()
+        .args([
+            "--password=secretpw",
+            "--decrypt",
+            enc.to_str().unwrap(),
+            f_template.to_str().unwrap(),
+            "--split-pages=1",
+        ])
+        .assert()
+        .success();
+    assert_eq!(
+        split_outputs(qdir.path()),
+        vec!["q-1.pdf", "q-2.pdf", "q-3.pdf"]
+    );
+    assert_eq!(
+        split_outputs(fdir.path()),
+        vec!["f-1.pdf", "f-2.pdf", "f-3.pdf"]
+    );
+    for name in ["q-1.pdf", "q-2.pdf", "q-3.pdf"] {
+        assert_qpdf_cleartext_chunk(&qdir.path().join(name));
+    }
+    for name in ["f-1.pdf", "f-2.pdf", "f-3.pdf"] {
+        assert_qpdf_cleartext_chunk(&fdir.path().join(name));
+    }
+}
+
+#[test]
 fn pages_encrypted_primary_plaintext_secondary_preserves_primary_encryption() {
     // qpdf 11.9.0 keeps the primary document as the output/base document for
     // --pages (libqpdf/QPDFJob.cc:2360-2633). Therefore importing pages from a
