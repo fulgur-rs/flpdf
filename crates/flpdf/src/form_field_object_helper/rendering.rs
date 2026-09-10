@@ -37,7 +37,9 @@ use crate::tokenizer::{Token, TokenType};
 use crate::{Error, ObjectRef, Pdf, Result};
 
 /// Read a rectangle-shaped array (`/Rect`, `/BBox`, …) at `key` through a
-/// live handle.
+/// live handle. qpdf's `QPDFObjectHandle::getArrayAsRectangle` accepts any
+/// four numeric entries and normalizes the two corners with min/max before
+/// returning the rectangle (`libqpdf/QPDFObjectHandle.cc:816-836`).
 fn resolve_rectangle_canonical(handle: &ObjectHandle, key: &[u8]) -> Result<Option<PageBox>> {
     let rect = handle.try_get_key(key)?;
     let Some(items) = rect.try_as_array()? else {
@@ -55,7 +57,10 @@ fn resolve_rectangle_canonical(handle: &ObjectHandle, key: &[u8]) -> Result<Opti
         values[index] = item.try_get_numeric_value()?;
     }
     Ok(Some(PageBox::new(
-        values[0], values[1], values[2], values[3],
+        values[0].min(values[2]),
+        values[1].min(values[3]),
+        values[0].max(values[2]),
+        values[1].max(values[3]),
     )))
 }
 
@@ -847,6 +852,27 @@ mod tests {
         ])
     }
 
+    fn reversed_rect_tx_pdf() -> Vec<u8> {
+        pdf_with_objects(&[
+            "<< /Type /Catalog /Pages 2 0 R /AcroForm << /Fields [4 0 R] /DR <<>> /DA (/Helv 12 Tf 0 g) >> >>".to_string(),
+            "<< /Type /Pages /Kids [3 0 R] /Count 1 >>".to_string(),
+            "<< /Type /Page /Parent 2 0 R /MediaBox [0 0 612 792] /Annots [4 0 R] >>".to_string(),
+            "<< /Type /Annot /Subtype /Widget /FT /Tx /V (Hello) /Rect [250 150 50 50] >>".to_string(),
+        ])
+    }
+
+    fn existing_ap_with_bbox_pdf(field: &str, da: &str, bbox: &str, rect: &str) -> Vec<u8> {
+        pdf_with_objects(&[
+            "<< /Type /Catalog /Pages 2 0 R /AcroForm << /Fields [4 0 R] /DR <<>> /DA (/Helv 10 Tf 0 g) >> >>".to_string(),
+            "<< /Type /Pages /Kids [3 0 R] /Count 1 >>".to_string(),
+            "<< /Type /Page /Parent 2 0 R /MediaBox [0 0 612 792] /Annots [4 0 R] >>".to_string(),
+            format!(
+                "<< /Type /Annot /Subtype /Widget /FT {field} /V (B) /Opt [(A) (B) (C) (D)] /DA {da} /Rect {rect} /AP << /N 5 0 R >> >>"
+            ),
+            format!("<< /Type /XObject /Subtype /Form /BBox {bbox} /Resources <<>> /Length 4 >>\nstream\nq Q\nendstream"),
+        ])
+    }
+
     fn tx_without_rect_pdf() -> Vec<u8> {
         pdf_with_objects(&[
             "<< /Type /Catalog /Pages 2 0 R /AcroForm << /Fields [4 0 R] /DR <<>> /DA (/Helv 12 Tf 0 g) >> >>".to_string(),
@@ -883,6 +909,13 @@ mod tests {
         let stream = pdf.get_object_handle(reference);
         pdf.resolve(&stream).expect("resolve appearance");
         stream
+    }
+
+    fn generated_stream_data<R: Read + Seek>(pdf: &mut Pdf<R>, reference: ObjectRef) -> Vec<u8> {
+        generated_stream(pdf, reference)
+            .get_stream_data(crate::DecodeLevel::Generalized)
+            .expect("read generated appearance")
+            .to_vec()
     }
 
     fn existing_ap_with_dr_font_pdf(resources_indirect: bool) -> Vec<u8> {
@@ -1067,6 +1100,69 @@ mod tests {
             render_text_field_canonical(&mut pdf, ObjectRef::new(4, 0), ObjectRef::new(4, 0))
                 .expect("generation with missing Rect")
                 .is_none()
+        );
+    }
+
+    #[test]
+    fn canonical_tx_normalizes_reversed_fresh_rect_like_qpdf() {
+        let mut pdf = Pdf::open(Cursor::new(reversed_rect_tx_pdf())).expect("parse reversed Rect");
+        let reference =
+            render_text_field_canonical(&mut pdf, ObjectRef::new(4, 0), ObjectRef::new(4, 0))
+                .expect("generate")
+                .expect("Tx handled");
+        let data = generated_stream_data(&mut pdf, reference);
+        assert!(
+            data.windows(b"1 45.2 Td".len())
+                .any(|window| window == b"1 45.2 Td"),
+            "qpdf normalizes reversed /Rect before fresh appearance sizing"
+        );
+    }
+
+    #[test]
+    fn canonical_tx_normalizes_reversed_existing_bbox_like_qpdf() {
+        let mut pdf = Pdf::open(Cursor::new(existing_ap_with_bbox_pdf(
+            "/Tx",
+            "(/Helv 12 Tf 0 g)",
+            "[0 100 200 0]",
+            "[10 10 200 30]",
+        )))
+        .expect("parse reversed BBox");
+        let reference =
+            render_text_field_canonical(&mut pdf, ObjectRef::new(4, 0), ObjectRef::new(4, 0))
+                .expect("generate")
+                .expect("Tx handled");
+        let data = generated_stream_data(&mut pdf, reference);
+        assert!(
+            data.windows(b"1 45.2 Td".len())
+                .any(|window| window == b"1 45.2 Td"),
+            "qpdf normalizes reversed /BBox before appearance layout"
+        );
+    }
+
+    #[test]
+    fn canonical_choice_normalizes_reversed_bbox_for_rows_and_highlight_like_qpdf() {
+        let mut pdf = Pdf::open(Cursor::new(existing_ap_with_bbox_pdf(
+            "/Ch",
+            "(/Helv 10 Tf 0 g)",
+            "[0 100 200 0]",
+            "[10 10 200 110]",
+        )))
+        .expect("parse reversed choice BBox");
+        let reference =
+            render_choice_field_canonical(&mut pdf, ObjectRef::new(4, 0), ObjectRef::new(4, 0))
+                .expect("generate")
+                .expect("choice handled");
+        let data = generated_stream_data(&mut pdf, reference);
+        for value in [b"(A) Tj".as_slice(), b"(B) Tj", b"(C) Tj", b"(D) Tj"] {
+            assert!(
+                data.windows(value.len()).any(|window| window == value),
+                "qpdf lays out all four rows for normalized choice /BBox"
+            );
+        }
+        assert!(
+            data.windows(b"0.85 0.85 0.85 rg".len())
+                .any(|window| window == b"0.85 0.85 0.85 rg"),
+            "qpdf highlights the selected row after /BBox normalization"
         );
     }
 

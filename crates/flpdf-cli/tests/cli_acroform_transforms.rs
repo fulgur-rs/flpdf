@@ -124,6 +124,29 @@ fn tx_widget_without_ap_needing_appearances() -> Vec<u8> {
     ])
 }
 
+/// A Tx widget with an existing normal appearance whose `/BBox` endpoints are
+/// reversed. qpdf normalizes the box before its ValueSetter computes `Td`.
+/// Objects: 1=Catalog, 2=Pages, 3=Page, 4=Widget, 5=Contents, 6=AP/N.
+fn tx_widget_with_reversed_bbox() -> Vec<u8> {
+    assemble_pdf(&[
+        b"1 0 obj\n<< /Type /Catalog /Pages 2 0 R \
+          /AcroForm << /Fields [4 0 R] /NeedAppearances true /DR << >> /DA (/Helv 12 Tf 0 g) >> >>\nendobj\n"
+            .to_vec(),
+        b"2 0 obj\n<< /Type /Pages /Count 1 /Kids [3 0 R] >>\nendobj\n".to_vec(),
+        b"3 0 obj\n<< /Type /Page /Parent 2 0 R /MediaBox [0 0 612 792] \
+          /Contents 5 0 R /Annots [4 0 R] >>\nendobj\n"
+            .to_vec(),
+        b"4 0 obj\n<< /Type /Annot /Subtype /Widget /FT /Tx /T (name1) \
+          /V (Hello) /DA (/Helv 12 Tf 0 g) /Rect [10 10 200 30] \
+          /P 3 0 R /AP << /N 6 0 R >> >>\nendobj\n"
+            .to_vec(),
+        b"5 0 obj\n<< /Length 14 >>\nstream\nBT (pg) Tj ET\nendstream\nendobj\n".to_vec(),
+        b"6 0 obj\n<< /Type /XObject /Subtype /Form /BBox [0 100 200 0] \
+          /Resources <<>> /Length 4 >>\nstream\nq Q\nendstream\nendobj\n"
+            .to_vec(),
+    ])
+}
+
 /// Same as [`tx_widget_without_ap_needing_appearances`], except `/AP/N` is an
 /// indirect null. qpdf treats that as a missing normal appearance and replaces
 /// it while generating appearances.
@@ -457,6 +480,52 @@ fn top_level_generate_appearances_runs_before_show_object_like_qpdf() {
         flpdf.stderr, qpdf.stderr,
         "flpdf must preserve qpdf diagnostics for the transformed inspection"
     );
+}
+
+#[test]
+fn reversed_bbox_appearance_matches_qpdf_11_9_0_live() {
+    if !qpdf_available() {
+        if std::env::var_os("CI").is_some() {
+            panic!("{EXPECTED_QPDF_VERSION} is required for this parity test on CI");
+        }
+        eprintln!("skipping: {EXPECTED_QPDF_VERSION} is not available");
+        return;
+    }
+
+    let temp = tempfile::tempdir().unwrap();
+    let input = temp.path().join("reversed-bbox.pdf");
+    std::fs::write(&input, tx_widget_with_reversed_bbox()).unwrap();
+
+    let qpdf = ProcessCommand::new("qpdf")
+        .args([
+            "--show-object=6",
+            "--filtered-stream-data",
+            "--generate-appearances",
+        ])
+        .arg(&input)
+        .output()
+        .expect("qpdf 11.9.0 must be available");
+    assert!(qpdf.status.success(), "qpdf show-object failed: {qpdf:?}");
+
+    let flpdf = Command::cargo_bin("flpdf")
+        .unwrap()
+        .args([
+            "--show-object=6",
+            "--filtered-stream-data",
+            "--generate-appearances",
+        ])
+        .arg(&input)
+        .output()
+        .unwrap();
+    assert_eq!(flpdf.status.code(), qpdf.status.code());
+    assert_eq!(
+        flpdf.stdout,
+        qpdf.stdout,
+        "reversed /BBox appearance must match qpdf 11.9.0\nqpdf: {}\nflpdf: {}",
+        String::from_utf8_lossy(&qpdf.stdout),
+        String::from_utf8_lossy(&flpdf.stdout)
+    );
+    assert_eq!(flpdf.stderr, qpdf.stderr);
 }
 
 /// qpdf accepts the linearized combination even though its two-pass writer
