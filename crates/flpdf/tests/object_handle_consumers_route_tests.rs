@@ -29,7 +29,7 @@ fn overlay_contents_rewrite_uses_the_document_stream_factory() {
     let source = include_str!("../src/job/overlay.rs").replace("\r\n", "\n");
     let route = function_body(
         &source,
-        "fn apply_overlays_to_page_with_sources",
+        "fn under_overlay_for_page",
         "/// Pair selected destination pages",
     );
 

@@ -232,7 +232,7 @@ crates/flpdf/src/job/lifecycle.rs::run_configured_inspection             # E-7
 crates/flpdf/src/job/check.rs::QPDFJob::check                            # E-8（曖昧 leaf）
 crates/flpdf/src/job/attachments.rs::QPDFJob::list_attachments           # E-9
 crates/flpdf/src/job/page_specs.rs::QPDFJob::handle_page_specs           # E-10
-crates/flpdf/src/job/overlay.rs::apply_overlay_specs                     # E-11
+crates/flpdf/src/job/overlay.rs::handle_under_overlay                     # E-11
 crates/flpdf/src/job/overlay.rs::overlay_verbose_report                  # E-11
 crates/flpdf/src/job/lifecycle.rs::prepare_document_transformations       # E-12
 crates/flpdf/src/job/image_optimization.rs::optimize_images              # E-12 CLI 直呼び

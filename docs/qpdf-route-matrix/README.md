@@ -447,7 +447,7 @@ crates/flpdf/src/job/attachments.rs::QPDFJob::list_attachments: prod 9 (2 files)
     crates/flpdf/src/job/lifecycle.rs 5, crates/flpdf-cli/src/main.rs 4
 crates/flpdf/src/job/page_specs.rs::QPDFJob::handle_page_specs: prod 6 (3 files) / test 18
     crates/flpdf-cli/src/main.rs 4, crates/flpdf/src/job/lifecycle.rs 1, crates/flpdf/src/job/page_specs.rs 1
-crates/flpdf/src/job/overlay.rs::apply_overlay_specs: prod 3 (2 files) / test 0
+crates/flpdf/src/job/overlay.rs::handle_under_overlay: prod 3 (2 files) / test 0
     crates/flpdf-cli/src/main.rs 2, crates/flpdf/src/job/lifecycle.rs 1
 crates/flpdf/src/job/overlay.rs::overlay_verbose_report: prod 2 (1 files) / test 0
     crates/flpdf-cli/src/main.rs 2

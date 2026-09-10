@@ -17,7 +17,7 @@
 //! use flpdf::{PagePlan, PageRange, Pdf};
 //!
 //! let mut pdf = Pdf::open(BufReader::new(File::open("input.pdf")?))?;
-//! let range = PageRange::parse("1,3,5")?;
+//! let range = PageRange::parse_numrange("1,3,5")?;
 //! let plan = PagePlan::build(&mut pdf, &range)?;
 //! for entry in plan.pages() {
 //!     println!("page {}: {:?}", entry.index_1based, entry.page_ref);
@@ -152,7 +152,7 @@ impl PagePlan {
 
         if indices.is_empty() {
             // This pre-resolved API intentionally treats an empty slice as
-            // all pages; PageRange::parse("") itself is qpdf's empty result.
+            // all pages; PageRange::parse_numrange("") itself is qpdf's empty result.
             let pages = (1u32..=page_count)
                 .map(|n| SelectedPage {
                     index_1based: n,
@@ -299,7 +299,7 @@ mod tests {
     #[test]
     fn explicit_range_selects_subset_in_order() {
         let mut pdf = open(build_n_page_pdf(5));
-        let range = PageRange::parse("1,3,5").unwrap();
+        let range = PageRange::parse_numrange("1,3,5").unwrap();
         let plan = PagePlan::build(&mut pdf, &range).unwrap();
 
         assert_eq!(plan.len(), 3);
@@ -329,7 +329,7 @@ mod tests {
     #[test]
     fn descending_range_preserves_order() {
         let mut pdf = open(build_n_page_pdf(5));
-        let range = PageRange::parse("5-1").unwrap();
+        let range = PageRange::parse_numrange("5-1").unwrap();
         let plan = PagePlan::build(&mut pdf, &range).unwrap();
 
         assert_eq!(plan.len(), 5);
@@ -344,7 +344,7 @@ mod tests {
         // duplicates). Verified against qpdf 11.9.0 with
         // `qpdf --pages in 1,3,1 --` which emits 3 pages.
         let mut pdf = open(build_n_page_pdf(5));
-        let range = PageRange::parse("1,3,1").unwrap();
+        let range = PageRange::parse_numrange("1,3,1").unwrap();
         let plan = PagePlan::build(&mut pdf, &range).unwrap();
 
         assert_eq!(plan.len(), 3);
@@ -360,7 +360,7 @@ mod tests {
     #[test]
     fn determinism_same_plan_twice() {
         let bytes = build_n_page_pdf(5);
-        let range = PageRange::parse("2,4,1").unwrap();
+        let range = PageRange::parse_numrange("2,4,1").unwrap();
 
         let mut pdf1 = open(bytes.clone());
         let plan1 = PagePlan::build(&mut pdf1, &range).unwrap();
@@ -378,7 +378,7 @@ mod tests {
     #[test]
     fn out_of_range_page_number_is_error() {
         let mut pdf = open(build_n_page_pdf(5));
-        let range = PageRange::parse("10").unwrap(); // 10 > 5
+        let range = PageRange::parse_numrange("10").unwrap(); // 10 > 5
         let err = PagePlan::build(&mut pdf, &range).unwrap_err();
         let msg = err.to_string();
         assert!(
@@ -390,7 +390,7 @@ mod tests {
     #[test]
     fn out_of_range_from_end_is_error() {
         let mut pdf = open(build_n_page_pdf(3));
-        let range = PageRange::parse("r10").unwrap(); // r10 on 3-page doc
+        let range = PageRange::parse_numrange("r10").unwrap(); // r10 on 3-page doc
         let err = PagePlan::build(&mut pdf, &range).unwrap_err();
         let msg = err.to_string();
         assert!(
@@ -402,7 +402,7 @@ mod tests {
     #[test]
     fn single_page_document() {
         let mut pdf = open(build_n_page_pdf(1));
-        let range = PageRange::parse("z").unwrap(); // last = page 1
+        let range = PageRange::parse_numrange("z").unwrap(); // last = page 1
         let plan = PagePlan::build(&mut pdf, &range).unwrap();
         assert_eq!(plan.len(), 1);
         assert_eq!(plan.pages()[0].index_1based, 1);

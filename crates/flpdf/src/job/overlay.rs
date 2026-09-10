@@ -97,7 +97,7 @@ fn resolve_overlay_xobject<R: Read + Seek, RS: Read + Seek>(
 /// order. The page `/Resources` is replaced with `<< /XObject << /Fx0 … >> >>`
 /// and `/Contents` with one new stream that draws the underlays, then `/Fx0`,
 /// then the overlays.
-fn apply_overlays_to_page_with_sources<R: Read + Seek, RS: Read + Seek>(
+fn under_overlay_for_page<R: Read + Seek, RS: Read + Seek>(
     dest: &mut Pdf<R>,
     dest_page_ref: ObjectRef,
     sources: &[OverlaySource],
@@ -405,7 +405,7 @@ pub(crate) fn resolve_spec_pairs(
 /// `--from`/`--to`/`--repeat` page ranges, as one `--overlay`/`--underlay` group
 /// on the qpdf command line.
 ///
-/// [`apply_overlay_specs`] imports source pages via
+/// [`handle_under_overlay`] imports source pages via
 /// [`Pdf::copy_foreign_object`], which can leave a copied Form XObject's
 /// stream data unread until `dest` is written. Keep every `source` here
 /// alive at least until `dest` has been fully written (see
@@ -486,7 +486,7 @@ fn apply_aggregated_sources<R: Read + Seek, RS: Read + Seek>(
         // cov:ignore-start: the delegated page application is exercised by the
         // overlay byte/QDF matrix; llvm-cov attributes its success continuation
         // to an argument line in this multiline call.
-        apply_overlays_to_page_with_sources(
+        under_overlay_for_page(
             dest,
             dest_ref,
             &sources,
@@ -528,7 +528,7 @@ fn apply_aggregated_sources<R: Read + Seek, RS: Read + Seek>(
 ///   page lacks a usable placement box, or the object-number space is exhausted.
 /// - Any error propagated from page-range resolution, the cross-document copy, or
 ///   [`Pdf::resolve`].
-pub fn apply_overlay_specs<RS, RT>(dest: &mut Pdf<RT>, specs: &mut [OverlaySpec<RS>]) -> Result<()>
+pub fn handle_under_overlay<RS, RT>(dest: &mut Pdf<RT>, specs: &mut [OverlaySpec<RS>]) -> Result<()>
 where
     RS: Read + Seek,
     RT: Read + Seek,
@@ -602,7 +602,7 @@ pub struct OverlayVerbosePage {
 /// The returned vector covers every destination page in ascending order
 /// (`1..=n_dest`). Per-page sources are ordered underlays first (in declaration
 /// order across `specs`), then overlays (also in declaration order), matching
-/// the order [`apply_overlay_specs`] uses to paint the same page. Destination
+/// the order [`handle_under_overlay`] uses to paint the same page. Destination
 /// pages that no spec targets appear in the result with an empty `sources`.
 ///
 /// The source documents are taken by `&mut` because [`PageRange::resolve`]
@@ -611,7 +611,7 @@ pub struct OverlayVerbosePage {
 /// lacking an effective `/MediaBox` in place, matching qpdf's own
 /// `QPDFPageDocumentHelper::getAllPages` (qpdf 11.9.0). No source page is
 /// imported and no destination content stream is drawn on. Calling this before
-/// [`apply_overlay_specs`] on the same specs yields the paint plan that will be
+/// [`handle_under_overlay`] on the same specs yields the paint plan that will be
 /// applied.
 ///
 /// # Errors
@@ -870,7 +870,7 @@ fn overlay_page_handle<R: Read + Seek>(
 // byte-identical to qpdf 11.9.0's output. Gated on `qpdf-zlib-compat` because
 // byte-identity requires flpdf's deflate output to match qpdf's classic libz
 // output (see CLAUDE.md's DEFLATE carve-out). It lives inside the crate, not in
-// `tests/`, because `apply_overlay_specs` reaches page internals that the
+// `tests/`, because `handle_under_overlay` reaches page internals that the
 // integration-test crate cannot.
 //
 // The overlay/underlay placement families (rotation, /UserUnit, swapped boxes,
@@ -885,7 +885,7 @@ fn overlay_page_handle<R: Read + Seek>(
 // them are in `tests/golden/regenerate.sh`.
 #[cfg(all(test, feature = "qpdf-zlib-compat"))]
 mod byte_gate {
-    use super::{apply_overlay_specs, OverlayKind, OverlaySpec};
+    use super::{handle_under_overlay, OverlayKind, OverlaySpec};
     use crate::pages::page_refs;
     use crate::PageRange;
     use crate::{ObjectHandle, Pdf, PdfWriter};
@@ -936,7 +936,7 @@ mod byte_gate {
         if input.is_empty() {
             PageRange::all()
         } else {
-            PageRange::parse(input).unwrap_or_else(|e| panic!("parse {input:?}: {e}"))
+            PageRange::parse_numrange(input).unwrap_or_else(|e| panic!("parse {input:?}: {e}"))
         }
     }
 
@@ -1030,7 +1030,7 @@ mod byte_gate {
             to: pr(""),
             repeat: Some(pr("1")),
         }];
-        apply_overlay_specs(&mut dest, &mut specs).unwrap();
+        handle_under_overlay(&mut dest, &mut specs).unwrap();
         let actual = write_qpdf(&mut dest, |writer| {
             writer.set_static_id(true);
             writer.set_qdf_mode(true);
@@ -1079,7 +1079,7 @@ mod byte_gate {
                 repeat: None,
             },
         ];
-        apply_overlay_specs(&mut dest, &mut specs).unwrap();
+        handle_under_overlay(&mut dest, &mut specs).unwrap();
         let actual = write_qpdf(&mut dest, |writer| {
             writer.set_static_id(true);
             writer.set_qdf_mode(true);
@@ -1117,7 +1117,7 @@ mod byte_gate {
             to: pr(""),
             repeat: Some(pr("1")),
         }];
-        apply_overlay_specs(&mut dest, &mut specs).unwrap();
+        handle_under_overlay(&mut dest, &mut specs).unwrap();
         let actual = write_qpdf(&mut dest, |writer| {
             writer.set_static_id(true);
             writer.set_qdf_mode(true);
@@ -1146,7 +1146,7 @@ mod byte_gate {
             to: pr(""),
             repeat: Some(pr("1")),
         }];
-        apply_overlay_specs(&mut dest, &mut specs).unwrap();
+        handle_under_overlay(&mut dest, &mut specs).unwrap();
         let actual = write_qpdf(&mut dest, |writer| {
             writer.set_static_id(true);
             writer.set_qdf_mode(true);
@@ -1176,7 +1176,7 @@ mod byte_gate {
             to: pr("1"),
             repeat: None,
         }];
-        apply_overlay_specs(&mut dest, &mut specs).unwrap();
+        handle_under_overlay(&mut dest, &mut specs).unwrap();
 
         let after = page_annots(&mut dest, dest_page)
             .expect("destination annotations must survive the overlay rewrite");
@@ -1219,7 +1219,7 @@ mod byte_gate {
             to: pr(""),
             repeat: Some(pr("1")),
         }];
-        apply_overlay_specs(&mut dest, &mut specs).unwrap();
+        handle_under_overlay(&mut dest, &mut specs).unwrap();
         let actual = write_qpdf(&mut dest, |writer| {
             writer.set_static_id(true);
             writer.set_qdf_mode(true);
@@ -1246,7 +1246,7 @@ mod byte_gate {
             to: pr(""),
             repeat: Some(pr("1")),
         }];
-        apply_overlay_specs(&mut dest, &mut specs).unwrap();
+        handle_under_overlay(&mut dest, &mut specs).unwrap();
         let actual = write_qpdf(&mut dest, |writer| {
             writer.set_static_id(true);
             writer.set_qdf_mode(true);
@@ -1283,7 +1283,7 @@ mod byte_gate {
             to: pr(""),
             repeat: Some(pr("1")),
         }];
-        apply_overlay_specs(&mut dest, &mut specs).unwrap();
+        handle_under_overlay(&mut dest, &mut specs).unwrap();
         let actual = write_qpdf(&mut dest, |writer| {
             writer.set_static_id(true);
             writer.set_qdf_mode(true);
@@ -1340,7 +1340,7 @@ mod byte_gate {
             to: pr(""),
             repeat: Some(pr("1")),
         }];
-        apply_overlay_specs(&mut dest, &mut specs).unwrap();
+        handle_under_overlay(&mut dest, &mut specs).unwrap();
         let actual = write_qpdf(&mut dest, |writer| {
             writer.set_static_id(true);
             writer.set_qdf_mode(true);

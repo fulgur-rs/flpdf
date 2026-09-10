@@ -296,7 +296,7 @@ fn qpdfjob_error_report_uses_qpdf_invalid_password_wording() {
 
 #[test]
 fn keep_files_open_policy_counts_distinct_page_sources_and_honors_overrides() {
-    let range = PageRange::parse("1").unwrap();
+    let range = PageRange::parse_numrange("1").unwrap();
     let one_source = [
         PageSpecInput::new(1, range.clone()),
         PageSpecInput::new(1, range.clone()),
@@ -324,7 +324,7 @@ fn keep_files_open_policy_counts_distinct_page_sources_and_honors_overrides() {
 
 #[test]
 fn keep_files_open_policy_is_parsed_at_argv_and_json_job_boundaries() {
-    let range = PageRange::parse("1").unwrap();
+    let range = PageRange::parse_numrange("1").unwrap();
     let specs = [PageSpecInput::new(1, range.clone())];
 
     let mut argv_job = QPDFJob::new();
