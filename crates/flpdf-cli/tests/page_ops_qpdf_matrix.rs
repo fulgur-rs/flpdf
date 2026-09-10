@@ -984,6 +984,105 @@ fn pages_cross_document_merge_matches_qpdf() {
 }
 
 #[test]
+fn pages_duplicate_after_foreign_matches_qpdf_qdf_bytes() {
+    // qpdf processes page-spec occurrences in order: the primary page is
+    // copied, the foreign page is copied, and only then the repeated primary
+    // page is shallow-cloned. This is the shape that distinguishes occurrence
+    // order from source-grouped copying.
+    if !qpdf_available() {
+        return;
+    }
+    let tmp = tempfile::tempdir().unwrap();
+    let primary = fixture_abs(THREE_PAGE);
+    let foreign = fixture_abs(TWO_PAGE);
+    let q = tmp.path().join("q.pdf");
+    let f = tmp.path().join("f.pdf");
+    let common = ["--qdf", "--static-id"];
+
+    let mut q_args = common.to_vec();
+    q_args.extend([primary.to_str().unwrap(), "--pages", ".", "1"]);
+    q_args.push(foreign.to_str().unwrap());
+    q_args.extend(["1", ".", "1", "--", q.to_str().unwrap()]);
+    let q_output = Shell::new(QPDF)
+        .args(q_args)
+        .output()
+        .expect("qpdf should spawn");
+    assert_eq!(q_output.status.code(), Some(0));
+
+    let mut f_args = common.to_vec();
+    f_args.extend([primary.to_str().unwrap(), "--pages", ".", "1"]);
+    f_args.push(foreign.to_str().unwrap());
+    f_args.extend(["1", ".", "1", "--", f.to_str().unwrap()]);
+    let f_output = Command::cargo_bin("flpdf")
+        .unwrap()
+        .args(f_args)
+        .output()
+        .expect("flpdf should spawn");
+    assert_eq!(f_output.status.code(), Some(0));
+    assert_eq!(f_output.stdout, q_output.stdout);
+    assert_eq!(f_output.stderr, q_output.stderr);
+    assert_eq!(
+        std::fs::read(&f).unwrap(),
+        std::fs::read(&q).unwrap(),
+        "duplicate-after-foreign qdf output must match qpdf"
+    );
+}
+
+#[test]
+fn pages_foreign_source_repeated_after_interleaving_matches_qpdf_qdf_bytes() {
+    // A foreign source can contribute more than one page with another source
+    // interleaved between its occurrences. Each source-page graph must enter
+    // the destination order at its own first occurrence, not as one source
+    // grouped block.
+    if !qpdf_available() {
+        return;
+    }
+    let tmp = tempfile::tempdir().unwrap();
+    let primary = fixture_abs(ONE_PAGE);
+    let first_foreign = fixture_abs(THREE_PAGE);
+    let interleaved_foreign = fixture_abs(TWO_PAGE);
+    let q = tmp.path().join("q.pdf");
+    let f = tmp.path().join("f.pdf");
+    let common = ["--qdf", "--static-id"];
+
+    let mut q_args = common.to_vec();
+    q_args.extend([primary.to_str().unwrap(), "--pages", ".", "1"]);
+    q_args.push(first_foreign.to_str().unwrap());
+    q_args.push("1");
+    q_args.push(interleaved_foreign.to_str().unwrap());
+    q_args.extend(["1"]);
+    q_args.push(first_foreign.to_str().unwrap());
+    q_args.extend(["2", "--", q.to_str().unwrap()]);
+    let q_output = Shell::new(QPDF)
+        .args(q_args)
+        .output()
+        .expect("qpdf should spawn");
+    assert_eq!(q_output.status.code(), Some(0));
+
+    let mut f_args = common.to_vec();
+    f_args.extend([primary.to_str().unwrap(), "--pages", ".", "1"]);
+    f_args.push(first_foreign.to_str().unwrap());
+    f_args.push("1");
+    f_args.push(interleaved_foreign.to_str().unwrap());
+    f_args.extend(["1"]);
+    f_args.push(first_foreign.to_str().unwrap());
+    f_args.extend(["2", "--", f.to_str().unwrap()]);
+    let f_output = Command::cargo_bin("flpdf")
+        .unwrap()
+        .args(f_args)
+        .output()
+        .expect("flpdf should spawn");
+    assert_eq!(f_output.status.code(), Some(0));
+    assert_eq!(f_output.stdout, q_output.stdout);
+    assert_eq!(f_output.stderr, q_output.stderr);
+    assert_eq!(
+        std::fs::read(&f).unwrap(),
+        std::fs::read(&q).unwrap(),
+        "interleaved foreign page graphs must retain qpdf occurrence order"
+    );
+}
+
+#[test]
 fn pages_cross_document_collate_matches_qpdf() {
     // qpdf collates specification occurrences, not source-document groups:
     // A1,B1,A2,B2,B3 for A=2 pages and B=3 pages with --collate.

@@ -1303,6 +1303,16 @@ fn merge_documents_with_resource_decisions_and_preserve_primary_into_impl<
         }
         target.set_foreign_object_map(source_id, copy_seed);
         for &page_ref in &unique {
+            let before_page_copy = if is_primary {
+                None
+            } else {
+                Some(
+                    target
+                        .foreign_object_map_snapshot(source_id)
+                        .into_values()
+                        .collect::<BTreeSet<_>>(),
+                )
+            };
             let source_page = input.source.get_object_handle(page_ref);
             let copied_page = target.copy_foreign_object(&source_page)?;
             // cov:ignore-start: QPDF::copyForeignObject returns an indirect
@@ -1312,6 +1322,22 @@ fn merge_documents_with_resource_decisions_and_preserve_primary_into_impl<
                 return Err(Error::Missing("merged page missing from foreign copy map"));
             }
             // cov:ignore-end
+            if let Some(before_page_copy) = before_page_copy {
+                let after_page_copy = target
+                    .foreign_object_map_snapshot(source_id)
+                    .into_values()
+                    .collect::<BTreeSet<_>>();
+                let mut new_objects: Vec<ObjectRef> = after_page_copy
+                    .difference(&before_page_copy)
+                    .copied()
+                    .collect();
+                new_objects.sort_unstable();
+                target
+                    .foreign_page_copy_orders
+                    .entry(source_id)
+                    .or_default()
+                    .push((page_ref, new_objects));
+            }
         }
         let page_copy_map = target.foreign_object_map_snapshot(source_id);
         // qpdf keeps the primary Catalog and trailer in the same QPDF while

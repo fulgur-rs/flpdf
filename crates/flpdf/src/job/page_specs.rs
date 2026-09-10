@@ -22,6 +22,7 @@ use crate::page_label_document_helper::{
     record_primary_label_provenance, RawPageLabelEntry,
 };
 use crate::pages::tree_rebuild::RebuildResult;
+use crate::pdf::WriterObjectOrderKey;
 use crate::{
     AcroFormDocumentHelper, Error, Matrix, ObjectHandle, ObjectRef, PageObjectHelper, PageRange,
     Pdf, Result, UsageError,
@@ -372,6 +373,116 @@ fn merge_preserving_primary_into<R: Read + Seek, T: Read + Seek>(
 /// A selected page represented by its source and its occurrence within the
 /// source's grouped merge input.
 type OrderedPage = (usize, usize);
+
+/// Reassign fresh merge-object provenance in qpdf page-spec occurrence order.
+///
+/// The page merge keeps one foreign copier per source so shared source objects
+/// retain their identity, but qpdf allocates a repeated page clone at the
+/// occurrence where `handlePageSpecs` encounters it. The fresh Rust target has
+/// already copied the grouped graphs, so the writer-order map is corrected
+/// here without introducing a second copy route. Each foreign page graph group
+/// retains its existing discovery order, while those groups and shallow page
+/// clones are interleaved according to `ordered_pages`.
+fn restore_occurrence_writer_provenance<T: Read + Seek + 'static, R: Read + Seek + 'static>(
+    merged: &mut Pdf<T>,
+    sources: &mut [Pdf<R>],
+    source_page_refs: &[Vec<ObjectRef>],
+    grouped_pages: &[Vec<usize>],
+    ordered_pages: &[OrderedPage],
+    grouped_refs: &[ObjectRef],
+    offsets: &[usize],
+) -> Result<()> {
+    // cov:ignore-start: the page-spec merge target always records writer order.
+    let Some(existing_order) = merged.writer_object_order.clone() else {
+        return Ok(());
+    };
+    // cov:ignore-end
+    let mut fresh_refs = Vec::new();
+    for source in sources.iter().skip(1) {
+        let source_id = source.unique_id();
+        if let Some(copy_groups) = merged.foreign_page_copy_orders.get(&source_id) {
+            for (_, refs) in copy_groups {
+                fresh_refs.extend(refs.iter().copied());
+            }
+        }
+    }
+    for (output_index, &(source_index, group_index)) in ordered_pages.iter().enumerate() {
+        let source_page_index = grouped_pages[source_index][group_index];
+        let source_page_ref = source_page_refs[source_index][source_page_index];
+        let first =
+            ordered_pages[..output_index]
+                .iter()
+                .any(|&(previous_source, previous_group)| {
+                    previous_source == source_index
+                        && source_page_refs[previous_source]
+                            [grouped_pages[previous_source][previous_group]]
+                            == source_page_ref
+                });
+        if first {
+            fresh_refs.push(grouped_refs[offsets[source_index] + group_index]);
+        }
+    }
+    let Some(mut next_original) = fresh_refs
+        .iter()
+        .map(|object_ref| merged.writer_original_object_ref(*object_ref))
+        .min()
+    else {
+        return Ok(());
+    };
+    let mut order = existing_order;
+    let mut seen_pages: Vec<BTreeSet<ObjectRef>> = vec![BTreeSet::new(); sources.len()];
+    for &(source_index, group_index) in ordered_pages {
+        let source_page_index = grouped_pages[source_index][group_index];
+        let source_page_ref = source_page_refs[source_index][source_page_index];
+        let duplicate = !seen_pages[source_index].insert(source_page_ref);
+
+        if source_index != 0 && !duplicate {
+            let source_id = sources[source_index].unique_id();
+            if let Some((_, target_refs)) = merged
+                .foreign_page_copy_orders
+                .get(&source_id)
+                .and_then(|groups| {
+                    groups
+                        .iter()
+                        .find(|(source_ref, _)| *source_ref == source_page_ref)
+                })
+            {
+                for &target_ref in target_refs {
+                    order.insert(
+                        target_ref,
+                        WriterObjectOrderKey::foreign_with_original(target_ref, next_original),
+                    );
+                    // cov:ignore-start: exhausting the u32 PDF object space is unreachable for a page merge.
+                    next_original = ObjectRef::new(
+                        next_original.number.checked_add(1).ok_or_else(|| {
+                            Error::Unsupported("page-selection provenance overflows u32".to_owned())
+                        })?,
+                        next_original.generation,
+                    );
+                    // cov:ignore-end
+                }
+            } // cov:ignore: merge records a copy group for every selected foreign page
+        }
+
+        if duplicate {
+            let clone_ref = grouped_refs[offsets[source_index] + group_index];
+            order.insert(
+                clone_ref,
+                WriterObjectOrderKey::foreign_with_original(clone_ref, next_original),
+            );
+            // cov:ignore-start: exhausting the u32 PDF object space is unreachable for a page merge.
+            next_original = ObjectRef::new(
+                next_original.number.checked_add(1).ok_or_else(|| {
+                    Error::Unsupported("page-selection provenance overflows u32".to_owned())
+                })?,
+                next_original.generation,
+            );
+            // cov:ignore-end
+        }
+    }
+    merged.set_writer_object_order(order);
+    Ok(())
+}
 
 /// One qpdf-style reconstructed label in the test-only typed compatibility
 /// projection. Production page selection uses raw label handles instead.
@@ -923,6 +1034,15 @@ fn handle_page_specs_into<R: Read + Seek + 'static, T: Read + Seek + 'static>(
             Some(current)
         })
         .collect();
+    restore_occurrence_writer_provenance(
+        &mut merged,
+        sources,
+        &source_page_refs,
+        &grouped_pages,
+        &ordered_pages,
+        &grouped_refs,
+        &offsets,
+    )?; // cov:ignore: page-spec merge always supplies a valid writer-order target
     let final_refs: Vec<_> = ordered_pages
         .iter()
         .map(|&(source_index, group_index)| grouped_refs[offsets[source_index] + group_index])
