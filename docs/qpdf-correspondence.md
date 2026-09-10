@@ -2171,6 +2171,20 @@ member を source/destination order で予約するため（`QPDF.cc:2393-2474`;
 multi-source `--pages` + `--linearize` + `--object-streams=generate` の全 bytes
 を固定する。
 
+`flpdf-sof0` では、page-spec occurrence の境界を writer key の比較順にも
+反映する。`restore_occurrence_writer_provenance` が qpdf の同一 destination
+allocator に相当する `original_object_ref` を occurrence 順に更新した後、
+`WriterObjectOrderKey::occurrence_rank` を `object_ref` より先に比較する。
+これにより fresh target の source-grouped な target reference が
+`handlePageSpecs` の occurrence 順を覆さず、QDF の Original object ID の値は
+別フィールドのまま保持される（`QPDFJob.cc:2517-2555`;
+destination identity allocation は `QPDF.cc:1870-1897`、QDF の Original
+object ID emission は `QPDFWriter.cc:1681-1689,1774-1787`、ObjStm の
+ordering は `QPDFWriter.cc:1057-1118,1970-2005`）。
+`cli_pages_objstm_order_qpdf.rs` の occurrence-order 3 tests が primary →
+foreign → primary duplicate を、通常 Generate・QDF Generate・linearized
+Generate の各 ObjStm 経路で qpdf 11.9.0 と比較する。
+
 `flpdf-obsc` では、`QPDFJob::doSplitPages` が chunk 作成前に行う
 `shouldRemoveUnreferencedResources` の verbose side effect も同じ job boundary に
 接続した。qpdf は Auto 判定の開始、最初の共有 resource finding、または共有なしの

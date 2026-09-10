@@ -14,6 +14,8 @@ const LINEARIZED_PRIMARY: &str = "../../tests/fixtures/compat/multi-contents-one
 const LINEARIZED_FOREIGN: &str = "../../tests/fixtures/compat/fxo-red.pdf";
 const QDF_PRIMARY: &str = "../../tests/fixtures/compat/primary-objstm-exclusive-font.pdf";
 const QDF_FOREIGN: &str = "../../tests/fixtures/compat/no-stream-one-page.pdf";
+const OCCURRENCE_ORDER_PRIMARY: &str = "../../tests/fixtures/compat/three-page.pdf";
+const OCCURRENCE_ORDER_FOREIGN: &str = "../../tests/fixtures/compat/two-page.pdf";
 
 /// Gate the differential probe on the pinned oracle, mirroring
 /// `cli_linearize_multi_source_qpdf`: skip locally when qpdf 11.9.0 is not
@@ -77,6 +79,63 @@ fn run_qpdf_duplicate_page(output: &Path) -> Output {
         .arg(output)
         .output()
         .expect("qpdf should spawn")
+}
+
+fn occurrence_order_page_args() -> [&'static str; 9] {
+    [
+        OCCURRENCE_ORDER_PRIMARY,
+        "--pages",
+        OCCURRENCE_ORDER_PRIMARY,
+        "1",
+        OCCURRENCE_ORDER_FOREIGN,
+        "1",
+        OCCURRENCE_ORDER_PRIMARY,
+        "1",
+        "--",
+    ]
+}
+
+fn run_qpdf_duplicate_after_foreign(output: &Path, options: &[&str]) -> Output {
+    let mut args = vec!["--static-id"];
+    args.extend_from_slice(options);
+    args.extend(occurrence_order_page_args());
+    ProcessCommand::new("qpdf")
+        .args(args)
+        .arg(output)
+        .output()
+        .expect("qpdf should spawn")
+}
+
+fn run_flpdf_duplicate_after_foreign(output: &Path, options: &[&str]) {
+    let mut command = Command::cargo_bin("flpdf").unwrap();
+    command
+        .args(["--static-id"])
+        .args(options)
+        .args(occurrence_order_page_args())
+        .arg(output)
+        .assert()
+        .success();
+}
+
+fn assert_duplicate_after_foreign_matches_qpdf(options: &[&str], message: &str) {
+    let temp = tempfile::tempdir().unwrap();
+    let qpdf_output = temp.path().join("qpdf.pdf");
+    let flpdf_output = temp.path().join("flpdf.pdf");
+
+    let qpdf = run_qpdf_duplicate_after_foreign(&qpdf_output, options);
+    assert!(
+        qpdf.status.success(),
+        "qpdf occurrence-order probe failed: {}",
+        String::from_utf8_lossy(&qpdf.stderr)
+    );
+
+    run_flpdf_duplicate_after_foreign(&flpdf_output, options);
+
+    assert_eq!(
+        std::fs::read(&flpdf_output).unwrap(),
+        std::fs::read(&qpdf_output).unwrap(),
+        "{message}"
+    );
 }
 
 #[test]
@@ -156,6 +215,43 @@ fn duplicate_page_generated_objstm_members_match_qpdf() {
         std::fs::read(&flpdf_output).unwrap(),
         std::fs::read(&qpdf_output).unwrap(),
         "duplicate-page generated ObjStm allocation order must match qpdf"
+    );
+}
+
+#[test]
+fn duplicate_page_after_foreign_generated_objstm_matches_qpdf() {
+    if skip_if_qpdf_missing() {
+        return;
+    }
+    assert_duplicate_after_foreign_matches_qpdf(
+        &["--newline-before-endstream=n", "--object-streams=generate"],
+        "duplicate page after a foreign source must preserve qpdf occurrence-order ObjStm members",
+    );
+}
+
+#[test]
+fn duplicate_page_after_foreign_qdf_generated_objstm_matches_qpdf() {
+    if skip_if_qpdf_missing() {
+        return;
+    }
+    assert_duplicate_after_foreign_matches_qpdf(
+        &["--qdf", "--object-streams=generate"],
+        "duplicate page after a foreign source must preserve qpdf QDF ObjStm provenance",
+    );
+}
+
+#[test]
+fn duplicate_page_after_foreign_linearized_generated_objstm_matches_qpdf() {
+    if skip_if_qpdf_missing() {
+        return;
+    }
+    assert_duplicate_after_foreign_matches_qpdf(
+        &[
+            "--newline-before-endstream=n",
+            "--object-streams=generate",
+            "--linearize",
+        ],
+        "duplicate page after a foreign source must preserve qpdf linearized ObjStm ordering",
     );
 }
 

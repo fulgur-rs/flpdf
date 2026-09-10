@@ -445,7 +445,10 @@ fn restore_occurrence_writer_provenance<T: Read + Seek + 'static, R: Read + Seek
                 for &target_ref in target_refs {
                     order.insert(
                         target_ref,
-                        WriterObjectOrderKey::foreign_with_original(target_ref, next_original),
+                        WriterObjectOrderKey::foreign_with_allocation_identity(
+                            target_ref,
+                            next_original,
+                        ),
                     );
                     // cov:ignore-start: exhausting the u32 PDF object space is unreachable for a page merge.
                     next_original = ObjectRef::new(
@@ -463,7 +466,7 @@ fn restore_occurrence_writer_provenance<T: Read + Seek + 'static, R: Read + Seek
             let clone_ref = grouped_refs[offsets[source_index] + group_index];
             order.insert(
                 clone_ref,
-                WriterObjectOrderKey::foreign_with_original(clone_ref, next_original),
+                WriterObjectOrderKey::foreign_with_allocation_identity(clone_ref, next_original),
             );
             // cov:ignore-start: exhausting the u32 PDF object space is unreachable for a page merge.
             next_original = ObjectRef::new(
