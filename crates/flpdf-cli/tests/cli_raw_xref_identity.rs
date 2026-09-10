@@ -43,6 +43,32 @@ fn in_use_generation_65536_pdf() -> Vec<u8> {
     bytes
 }
 
+fn matching_in_use_generation_65536_pdf() -> Vec<u8> {
+    let mut bytes = b"%PDF-1.4\n".to_vec();
+    let objects = [
+        b"1 0 obj\n<< /Type /Catalog >>\nendobj\n".as_slice(),
+        b"2 0 obj\n42\nendobj\n".as_slice(),
+        b"3 0 obj\n43\nendobj\n".as_slice(),
+        b"4 0 obj\n44\nendobj\n".as_slice(),
+        b"5 65536 obj\n45\nendobj\n".as_slice(),
+    ];
+    let mut offsets = Vec::with_capacity(objects.len());
+    for object in objects {
+        offsets.push(bytes.len());
+        bytes.extend_from_slice(object);
+    }
+    let xref_offset = bytes.len();
+    bytes.extend_from_slice(b"xref\n0 6\n0000000000 65535 f \n");
+    for (index, offset) in offsets.iter().enumerate() {
+        let generation = if index == 4 { 65_536 } else { 0 };
+        bytes.extend_from_slice(format!("{offset:010} {generation:05} n \n").as_bytes());
+    }
+    bytes.extend_from_slice(
+        format!("trailer\n<< /Size 6 /Root 1 0 R >>\nstartxref\n{xref_offset}\n%%EOF\n").as_bytes(),
+    );
+    bytes
+}
+
 fn previous_generation_pdf() -> Vec<u8> {
     let mut bytes = b"%PDF-1.4\n".to_vec();
     let objects = [
@@ -154,6 +180,28 @@ fn check_resolves_raw_in_use_generation_like_qpdf() {
     let temp = tempfile::tempdir().expect("temporary directory");
     let input = temp.path().join("in-use-generation-65536.pdf");
     std::fs::write(&input, in_use_generation_65536_pdf()).expect("write fixture");
+
+    let qpdf = run_qpdf_check(&input);
+    let flpdf = run_flpdf_check(&input);
+
+    assert_eq!(flpdf.status.code(), qpdf.status.code());
+    assert_eq!(flpdf.stdout, qpdf.stdout);
+    assert_eq!(flpdf.stderr, qpdf.stderr);
+}
+
+#[test]
+fn check_accepts_a_matching_out_of_range_object_header_like_qpdf() {
+    if !qpdf_available() {
+        if std::env::var_os("CI").is_some() {
+            panic!("{EXPECTED_QPDF_VERSION} is required for this parity test on CI");
+        }
+        eprintln!("skipping: {EXPECTED_QPDF_VERSION} is not available");
+        return;
+    }
+
+    let temp = tempfile::tempdir().expect("temporary directory");
+    let input = temp.path().join("matching-in-use-generation-65536.pdf");
+    std::fs::write(&input, matching_in_use_generation_65536_pdf()).expect("write fixture");
 
     let qpdf = run_qpdf_check(&input);
     let flpdf = run_flpdf_check(&input);

@@ -8,17 +8,40 @@
 
 use crate::ObjectRef;
 
-/// Raw qpdf object/generation identity for xref registration.
+/// Raw qpdf object/generation identity for xref registration and cache keys.
+///
+/// Parsed qpdf identities are constructed through [`Self::new`], whose inputs
+/// match qpdf's signed `int` fields. The wider stored representation also lets
+/// the existing Rust `ObjectRef` factory keep its full `u32` object-number
+/// surface until a qpdf-backed operation explicitly applies the signed-int
+/// boundary.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub(crate) struct QpdfObjGen {
-    object: i32,
-    generation: i32,
+    object: i64,
+    generation: i64,
 }
 
 impl QpdfObjGen {
     /// Construct qpdf's signed object/generation pair.
     pub(crate) const fn new(object: i32, generation: i32) -> Self {
-        Self { object, generation }
+        Self {
+            object: object as i64,
+            generation: generation as i64,
+        }
+    }
+
+    /// Construct the internal cache key for an existing Rust object factory.
+    ///
+    /// Source parsing uses [`Self::new`] and therefore remains bounded by
+    /// qpdf's `QUtil::string_to_int` conversion. This constructor only keeps
+    /// the pre-existing public `ObjectRef` allocation surface representable;
+    /// qpdf-backed reads still apply [`Self::try_from_object_ref`] before
+    /// treating it as a parsed qpdf identity.
+    pub(crate) const fn from_object_ref(object_ref: ObjectRef) -> Self {
+        Self {
+            object: object_ref.number as i64,
+            generation: object_ref.generation as i64,
+        }
     }
 
     /// Convert a Rust object reference through qpdf's checked `int` boundary
@@ -39,12 +62,12 @@ impl QpdfObjGen {
     }
 
     /// Return qpdf's object number (`QPDFObjGen::getObj`).
-    pub(crate) const fn get_obj(self) -> i32 {
+    pub(crate) const fn get_obj(self) -> i64 {
         self.object
     }
 
     /// Return qpdf's generation (`QPDFObjGen::getGen`).
-    pub(crate) const fn get_gen(self) -> i32 {
+    pub(crate) const fn get_gen(self) -> i64 {
         self.generation
     }
 

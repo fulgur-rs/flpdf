@@ -14,10 +14,7 @@ fn matching_out_of_range_header_pdf() -> Vec<u8> {
     bytes.extend_from_slice(b"0000000000 00000 f \n");
     bytes.extend_from_slice(format!("{object_offset:010} 65536 n \n").as_bytes());
     bytes.extend_from_slice(
-        format!(
-            "trailer\n<< /Size 6 /Root 1 0 R >>\nstartxref\n{xref_offset}\n%%EOF\n"
-        )
-        .as_bytes(),
+        format!("trailer\n<< /Size 6 /Root 1 0 R >>\nstartxref\n{xref_offset}\n%%EOF\n").as_bytes(),
     );
     bytes
 }
