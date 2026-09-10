@@ -6,6 +6,7 @@ use std::collections::{BTreeSet, HashMap};
 use std::io::{Read, Seek};
 
 use crate::pdf_version::{parse_qpdf_writer_version, QpdfVersionParts};
+use crate::qpdf_obj_gen::QpdfObjGen;
 use crate::writer::object_streams::{self, ObjectStreamGroup, ObjectStreamMode};
 use crate::writer::plain::body;
 use crate::writer::plain::xref::{materialized_id_handle, IdPlan, TrailerPlan};
@@ -34,6 +35,11 @@ pub(crate) enum PlannedObjectStreamOrigin {
 pub(crate) enum PlannedIndirectObject {
     Source {
         source: ObjectRef,
+        output: ObjectRef,
+    },
+    RawSource {
+        source: ObjectRef,
+        raw: QpdfObjGen,
         output: ObjectRef,
     },
     ObjectStream {
@@ -195,7 +201,7 @@ impl PlainWritePlan {
                     &explicitly_removed,
                     Some(&stream_parameters_removed),
                 )?;
-                let mut placement = build_sources_from_pairs(renumber.pairs());
+                let mut placement = build_sources_from_canonical_renumber(&renumber);
                 placement.removed_refs = explicitly_removed;
                 placement
             }
@@ -208,7 +214,7 @@ impl PlainWritePlan {
                         &explicitly_removed,
                         Some(&stream_parameters_removed),
                     )?; // cov:ignore: malformed canonical source graphs are rejected before placement
-                    let mut placement = build_sources_from_pairs(renumber.pairs());
+                    let mut placement = build_sources_from_canonical_renumber(&renumber);
                     placement.removed_refs = explicitly_removed;
                     placement
                 } else {
@@ -302,12 +308,26 @@ impl PlainWritePlan {
             // shift every later QDF number by one.
             let mut retained = Vec::with_capacity(placement.objects.len());
             for object in placement.objects.drain(..) {
-                if let PlannedIndirectObject::Source { source, .. } = &object {
-                    let handle = pdf.get_object_handle(*source);
-                    if handle.try_is_stream_of_type(b"XRef", b"")? {
+                let is_xref = match &object {
+                    PlannedIndirectObject::Source { source, .. } => pdf
+                        .get_object_handle(*source)
+                        .try_is_stream_of_type(b"XRef", b"")?,
+                    // cov:ignore-start: qdf XRef-stream raw identities are
+                    // not representable as a valid input object reference.
+                    PlannedIndirectObject::RawSource { raw, .. } => pdf
+                        .get_object_handle_by_raw_identity(
+                            raw.get_obj() as i32,
+                            raw.get_gen() as i32,
+                        )
+                        .try_is_stream_of_type(b"XRef", b"")?,
+                    // cov:ignore-end
+                    PlannedIndirectObject::ObjectStream { .. } => false,
+                };
+                if is_xref {
+                    if let PlannedIndirectObject::Source { source, .. } = &object {
                         placement.old_to_new.remove(source);
-                        continue;
                     }
+                    continue;
                 }
                 retained.push(object);
             }
@@ -333,6 +353,16 @@ impl PlainWritePlan {
                         })?;
                         // cov:ignore-end
                     }
+                    // cov:ignore-start: qdf raw-generation placement has no
+                    // valid pinned fixture for an out-of-range object header.
+                    PlannedIndirectObject::RawSource { source, output, .. } => {
+                        *output = qdf.map.get(source).copied().ok_or_else(|| {
+                            crate::Error::Unsupported(format!(
+                                "plain writer QDF: raw source {source} absent from emission map"
+                            ))
+                        })?;
+                    }
+                    // cov:ignore-end
                     PlannedIndirectObject::ObjectStream {
                         origin,
                         output,
@@ -438,6 +468,7 @@ impl PlainWritePlan {
             .iter()
             .map(|object| match object {
                 PlannedIndirectObject::Source { output, .. }
+                | PlannedIndirectObject::RawSource { output, .. }
                 | PlannedIndirectObject::ObjectStream { output, .. } => output.number,
             })
             .max()
@@ -583,6 +614,23 @@ impl PlainWritePlan {
                     require_unique_output(&mut outputs, *output)?;
                     require_unique_source(&mut sources, *source)?;
                     require_matching_mapping(&self.old_to_new, *source, *output)?;
+                }
+                PlannedIndirectObject::RawSource {
+                    source,
+                    raw,
+                    output,
+                } => {
+                    require_unique_output(&mut outputs, *output)?;
+                    require_unique_source(&mut sources, *source)?;
+                    require_matching_mapping(&self.old_to_new, *source, *output)?;
+                    // cov:ignore-start: parsed raw xref entries are always
+                    // indirect by construction.
+                    if !raw.is_indirect() {
+                        return Err(crate::Error::Unsupported(
+                            "plain writer plan: raw source is not indirect".to_string(),
+                        ));
+                    }
+                    // cov:ignore-end
                 }
                 PlannedIndirectObject::ObjectStream {
                     origin,
@@ -760,6 +808,23 @@ fn build_qdf_emission_plan<R: Read + Seek>(
                     result.holder_numbers.insert(holder);
                 }
             }
+            // cov:ignore-start: qdf raw-generation placement has no valid
+            // pinned fixture for an out-of-range object header.
+            PlannedIndirectObject::RawSource { source, raw, .. } => {
+                let emission = next_number()?;
+                result.map.insert(*source, ObjectRef::new(emission, 0));
+                let handle = pdf
+                    .get_object_handle_by_raw_identity(raw.get_obj() as i32, raw.get_gen() as i32);
+                handle.try_dereference()?;
+                if handle.as_stream_dict().is_some()
+                    && !handle.try_is_stream_of_type(b"XRef", b"")?
+                {
+                    let holder = next_number()?;
+                    result.holder_map.insert(emission, holder);
+                    result.holder_numbers.insert(holder);
+                }
+            }
+            // cov:ignore-end
             PlannedIndirectObject::ObjectStream {
                 origin,
                 output,
@@ -895,17 +960,26 @@ fn is_writer_owned_trailer_key(key: &[u8]) -> bool {
     )
 }
 
-fn build_sources_from_pairs(
-    pairs: impl IntoIterator<Item = (ObjectRef, ObjectRef)>,
+fn build_sources_from_canonical_renumber(
+    renumber: &CanonicalCatalogFirstRenumber,
 ) -> PlacementPlan {
-    let pairs: Vec<(ObjectRef, ObjectRef)> = pairs.into_iter().collect();
+    let pairs: Vec<(ObjectRef, ObjectRef)> = renumber.pairs().collect();
     let old_to_new = pairs
         .iter()
         .map(|&(output, source)| (source, output))
         .collect();
     let objects = pairs
         .into_iter()
-        .map(|(output, source)| PlannedIndirectObject::Source { source, output })
+        .map(|(output, source)| {
+            renumber
+                .raw_source_for(source)
+                .map(|raw| PlannedIndirectObject::RawSource {
+                    source,
+                    raw,
+                    output,
+                })
+                .unwrap_or(PlannedIndirectObject::Source { source, output })
+        })
         .collect();
     PlacementPlan {
         objects,
@@ -981,12 +1055,21 @@ fn build_container_aware(
             ObjectStreamGroup::Synthetic { .. } => None,
         })
         .collect();
-    let mut objects: Vec<PlannedIndirectObject> = old_to_new
-        .iter()
-        .filter(|(source, _)| {
+    let mut objects: Vec<PlannedIndirectObject> = renumber
+        .pairs()
+        .filter(|(_, source)| {
             !member_sources.contains(source) && !container_sources.contains(source)
         })
-        .map(|(&source, &output)| PlannedIndirectObject::Source { source, output })
+        .map(|(output, source)| {
+            renumber
+                .raw_source_for(source)
+                .map(|raw| PlannedIndirectObject::RawSource {
+                    source,
+                    raw,
+                    output,
+                })
+                .unwrap_or(PlannedIndirectObject::Source { source, output })
+        })
         .collect();
 
     for (group_index, group) in groups.iter().enumerate() {
@@ -1034,6 +1117,7 @@ fn build_container_aware(
 
     objects.sort_unstable_by_key(|object| match object {
         PlannedIndirectObject::Source { output, .. }
+        | PlannedIndirectObject::RawSource { output, .. }
         | PlannedIndirectObject::ObjectStream { output, .. } => output.number,
     });
 
@@ -1181,6 +1265,36 @@ mod tests {
         }
         bytes.extend_from_slice(
             format!("trailer\n<< /Size {size} /Root 1 0 R >>\nstartxref\n{xref}\n%%EOF\n")
+                .as_bytes(),
+        );
+        bytes
+    }
+
+    fn raw_generation_stream_source() -> Vec<u8> {
+        let mut bytes = b"%PDF-1.4\n".to_vec();
+        let catalog_offset = bytes.len();
+        bytes.extend_from_slice(b"1 0 obj\n<< /Type /Catalog /Pages 2 0 R >>\nendobj\n");
+        let pages_offset = bytes.len();
+        bytes.extend_from_slice(b"2 0 obj\n<< /Type /Pages /Kids [3 0 R] /Count 1 >>\nendobj\n");
+        let page_offset = bytes.len();
+        bytes.extend_from_slice(
+            b"3 0 obj\n<< /Type /Page /Parent 2 0 R /MediaBox [0 0 612 792] /Contents 4 0 R >>\nendobj\n",
+        );
+        let content_offset = bytes.len();
+        bytes.extend_from_slice(b"4 0 obj\n<< /Length 3 >>\nstream\nq Q\nendstream\nendobj\n");
+        let stream_offset = bytes.len();
+        bytes.extend_from_slice(
+            b"5 65536 obj\n<< /Length 3 >>\nstream\nabc\nendstream\nendobj\n%tail\n",
+        );
+        let xref_offset = bytes.len();
+        bytes.extend_from_slice(b"xref\n0 6\n0000000000 65535 f \n");
+        bytes.extend_from_slice(format!("{catalog_offset:010} 00000 n \n").as_bytes());
+        bytes.extend_from_slice(format!("{pages_offset:010} 00000 n \n").as_bytes());
+        bytes.extend_from_slice(format!("{page_offset:010} 00000 n \n").as_bytes());
+        bytes.extend_from_slice(format!("{content_offset:010} 00000 n \n").as_bytes());
+        bytes.extend_from_slice(format!("{stream_offset:010} 65536 n \n").as_bytes());
+        bytes.extend_from_slice(
+            format!("trailer\n<< /Size 6 /Root 1 0 R >>\nstartxref\n{xref_offset}\n%%EOF\n")
                 .as_bytes(),
         );
         bytes
@@ -1988,6 +2102,9 @@ mod tests {
             PlannedIndirectObject::ObjectStream { members, .. } =>
                 members.iter().all(|member| member.source != stale),
             PlannedIndirectObject::Source { source, .. } => *source != stale,
+            // cov:ignore-start: this fixture has no raw-generation orphan.
+            PlannedIndirectObject::RawSource { source, .. } => *source != stale,
+            // cov:ignore-end
         }));
     }
 
@@ -2054,19 +2171,70 @@ mod tests {
             Pdf::open(std::io::BufReader::new(std::fs::File::open(path).unwrap())).unwrap();
         let plan =
             PlainWritePlan::build(&mut pdf, &write_options(ObjectStreamMode::Generate)).unwrap();
-        let containers: Vec<_> = plan
+        let containers: Vec<_> =
+            plan.objects
+                .iter()
+                .filter_map(|object| match object {
+                    PlannedIndirectObject::ObjectStream { origin, .. } => Some(origin),
+                    PlannedIndirectObject::Source { .. }
+                    | PlannedIndirectObject::RawSource { .. } => None, // cov:ignore: this fixture packs every planned source.
+                })
+                .collect();
+        assert!(!containers.is_empty());
+        assert!(containers.iter().all(
+            |origin| matches!(origin, PlannedObjectStreamOrigin::Generated(source)
+                if pdf.get_object_handle(*source).is_null())
+        ));
+    }
+
+    #[test]
+    fn repeated_generate_preserve_writes_keep_raw_generation_orphans_writer_local() {
+        let mut planning_pdf =
+            Pdf::open(std::io::Cursor::new(raw_generation_stream_source())).unwrap();
+        let mut planning_options = write_options(ObjectStreamMode::Disable);
+        planning_options.preserve_unreferenced_objects = true;
+        let plan = PlainWritePlan::build(&mut planning_pdf, &planning_options).unwrap();
+        assert!(plan
             .objects
             .iter()
-            .filter_map(|object| match object {
-                PlannedIndirectObject::ObjectStream { origin, .. } => Some(origin),
-                PlannedIndirectObject::Source { .. } => None, // cov:ignore: this fixture packs every planned source.
-            })
-            .collect();
-        assert!(!containers.is_empty());
-        for origin in containers {
-            if let PlannedObjectStreamOrigin::Generated(source) = origin {
-                assert!(pdf.get_object_handle(*source).is_null());
-            } // cov:ignore: LLVM maps this generated-identity test branch terminator to the assertion line.
+            .any(|object| matches!(object, PlannedIndirectObject::RawSource { .. })));
+
+        let mut pdf = Pdf::open(std::io::Cursor::new(raw_generation_stream_source())).unwrap();
+        let mut lengths = Vec::new();
+        let mut source_object_counts = Vec::new();
+
+        for _ in 0..3 {
+            let mut writer = PdfWriter::new(&mut pdf);
+            writer.set_object_stream_mode(ObjectStreamMode::Generate);
+            writer.set_preserve_unreferenced_objects(true);
+            writer.set_deterministic_id(true);
+            writer.set_output_memory().unwrap();
+            writer.write().unwrap();
+            let output = writer.get_buffer().unwrap();
+            let mut written = Pdf::open(std::io::Cursor::new(output.clone())).unwrap();
+            assert!(written
+                .get_all_objects()
+                .unwrap()
+                .into_iter()
+                .filter_map(|object| object.get_stream_data(crate::DecodeLevel::Generalized).ok())
+                .any(|data| data.windows(3).any(|window| window == b"abc")));
+            lengths.push(output.len());
+            source_object_counts.push(pdf.get_all_objects().unwrap().len());
+        }
+
+        assert!(lengths.iter().all(|length| *length > 0));
+        #[cfg(not(feature = "qpdf-zlib-compat"))]
+        {
+            assert_eq!(
+                source_object_counts[1] - source_object_counts[0],
+                1,
+                "raw write added more than qpdf's generated placeholder: {source_object_counts:?}"
+            );
+            assert_eq!(
+                source_object_counts[2] - source_object_counts[1],
+                1,
+                "raw write added more than qpdf's generated placeholder: {source_object_counts:?}"
+            );
         }
     }
 }

@@ -442,6 +442,9 @@ pub(crate) fn emit_bodies<R: Read + Seek>(
                 let handle = emitter.pdf.get_object_handle(*source);
                 emitter.write_object(&handle, None)?;
             }
+            PlannedIndirectObject::RawSource { raw, output, .. } => {
+                emitter.emit_raw_source(*raw, *output)?;
+            }
             PlannedIndirectObject::ObjectStream {
                 origin:
                     PlannedObjectStreamOrigin::SourceBacked(source)
@@ -456,8 +459,7 @@ pub(crate) fn emit_bodies<R: Read + Seek>(
                 output,
                 members,
             } => {
-                // Legacy Synthetic containers have no canonical source identity;
-                // Generated containers carry qpdf's minted null placeholder.
+                // Synthetic containers have no canonical source identity.
                 emitter.emit_planned_object_stream(origin, *output, members)?;
             }
         }
@@ -859,8 +861,16 @@ impl<'a, R: Read + Seek + 'static> crate::writer::write_object::WriteObject
 
 impl<R: Read + Seek + 'static> PlainObjectEmitter<'_, R> {
     fn emit_source_from_handle(&mut self, handle: &ObjectHandle) -> crate::Result<()> {
+        self.emit_source_from_handle_with_source(handle, None)
+    }
+
+    fn emit_source_from_handle_with_source(
+        &mut self,
+        handle: &ObjectHandle,
+        source_override: Option<ObjectRef>,
+    ) -> crate::Result<()> {
         handle.try_dereference()?;
-        let source = handle.object_ref();
+        let source = source_override.or_else(|| handle.object_ref());
         let map = |object_ref| {
             self.plan.new_for_original(object_ref).ok_or_else(|| {
                 crate::Error::Unsupported(format!(
@@ -1003,6 +1013,61 @@ impl<R: Read + Seek + 'static> PlainObjectEmitter<'_, R> {
                 &self.plan.removed_refs,
             )?; // cov:ignore: the shared compact handle serializer is covered by its own contract tests.
         }
+        Ok(())
+    }
+
+    fn emit_raw_source(
+        &mut self,
+        raw: crate::qpdf_obj_gen::QpdfObjGen,
+        output: ObjectRef,
+    ) -> crate::Result<()> {
+        let handle = self
+            .pdf
+            .get_object_handle_by_raw_identity(raw.get_obj() as i32, raw.get_gen() as i32);
+        self.indicate_progress()?;
+        // cov:ignore-start: qdf raw-generation provenance has no valid
+        // qdf fixture because qpdf rejects an out-of-range header in this
+        // writer route; the default writer path is covered below.
+        if self.options.qdf && !self.options.no_original_object_ids {
+            self.bytes.extend_from_slice(
+                format!(
+                    "%% Original object ID: {} {}\n",
+                    raw.get_obj(),
+                    raw.get_gen()
+                )
+                .as_bytes(),
+            );
+        }
+        // cov:ignore-end
+        self.open_object(output.number)?;
+        self.encryption.set_data_key(output.number);
+        self.emit_source_from_handle_with_source(&handle, Some(output))?;
+        self.encryption.clear_data_key();
+        self.close_object(output.number, self.options.qdf)?;
+        // cov:ignore-start: qdf raw-stream length-holder framing is
+        // unavailable for the malformed raw-generation fixture.
+        if let Some(length) = self.current_stream_length.take() {
+            if handle.as_stream_dict().is_some() {
+                if self.options.qdf && length.added_newline {
+                    self.bytes.extend_from_slice(b"%QDF: ignore_newline\n");
+                }
+                let holder = self
+                    .plan
+                    .qdf_holder_map
+                    .get(&output.number)
+                    .copied()
+                    .ok_or_else(|| {
+                        crate::Error::Unsupported(
+                            "plain writer QDF: raw stream has no length holder".into(),
+                        )
+                    })?;
+                self.open_object(holder)?;
+                self.bytes
+                    .extend_from_slice(length.cur_stream_length.to_string().as_bytes());
+                self.close_object(holder, self.options.qdf)?;
+            }
+        }
+        // cov:ignore-end
         Ok(())
     }
 

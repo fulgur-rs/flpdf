@@ -33,9 +33,9 @@ use std::io::{Read, Seek};
 
 use crate::object_ref::ObjectRef;
 use crate::parser::MAX_PARSE_DEPTH;
+use crate::qpdf_obj_gen::QpdfObjGen;
 use crate::writer::object_streams::ObjectStreamGroup;
 use crate::Error;
-use crate::ObjectHandle;
 use crate::Pdf;
 use crate::XrefEntry;
 
@@ -79,31 +79,14 @@ fn qpdf_source_objstm_containers<R: Read + Seek>(pdf: &Pdf<R>) -> BTreeSet<Objec
         .collect()
 }
 
-/// Give a writer-owned preserve seed a generation-zero output identity when
-/// its source header carries a raw qpdf generation that cannot be represented
-/// by `ObjectRef`. Such a header cannot be named by an in-file `N G R` edge, so
-/// qpdf's preserve walk only exposes its value as an orphan output object; the
-/// writer may copy that value into its ordinary fresh-output identity without
-/// changing any reachable reference.
-fn preserve_seed_object_ref<R: Read + Seek>(
-    pdf: &mut Pdf<R>,
-    handle: ObjectHandle,
-) -> crate::Result<Option<ObjectRef>> {
-    if let Some(object_ref) = handle.object_ref() {
-        return Ok(Some(object_ref));
+/// Return a stable writer-local key for a raw qpdf object identity that cannot
+/// be represented by `ObjectRef`. It is never registered in the source Pdf.
+fn writer_local_raw_ref(raw: QpdfObjGen) -> Option<ObjectRef> {
+    let object = u32::try_from(raw.get_obj()).ok()?;
+    if object == 0 {
+        return None;
     }
-    if !handle
-        .qpdf_obj_gen()
-        .is_some_and(crate::qpdf_obj_gen::QpdfObjGen::is_indirect)
-    {
-        return Ok(None);
-    }
-    let copied = if handle.as_stream_dict().is_some() {
-        handle.copy_stream()?
-    } else {
-        pdf.make_indirect_object_handle(handle.shallow_copy()?)?
-    };
-    Ok(copied.object_ref())
+    Some(ObjectRef::new(u32::MAX - object, 0))
 }
 
 /// Catalog-first numbering over the live [`crate::ObjectHandle`] graph.
@@ -116,6 +99,7 @@ fn preserve_seed_object_ref<R: Read + Seek>(
 pub(crate) struct CanonicalCatalogFirstRenumber {
     old_to_new: HashMap<ObjectRef, ObjectRef>,
     order: Vec<ObjectRef>,
+    raw_sources: HashMap<ObjectRef, QpdfObjGen>,
 }
 
 impl NewNumberLookup for CanonicalCatalogFirstRenumber {
@@ -142,6 +126,10 @@ impl CanonicalCatalogFirstRenumber {
             .map(|(index, &source)| (ObjectRef::new(index as u32 + 1, 0), source))
     }
 
+    pub(crate) fn raw_source_for(&self, source: ObjectRef) -> Option<QpdfObjGen> {
+        self.raw_sources.get(&source).copied()
+    }
+
     pub(crate) fn build_qpdf_with_stream_policy<R: Read + Seek>(
         pdf: &mut Pdf<R>,
         skip_length: bool,
@@ -161,11 +149,23 @@ impl CanonicalCatalogFirstRenumber {
         } else {
             None
         };
+        let mut raw_sources = HashMap::new();
         let mut seeds = if preserve_unreferenced_objects {
             let mut seeds = Vec::new();
             let source_objstm_containers = qpdf_source_objstm_containers(pdf);
             for handle in pdf.get_all_objects()? {
-                let Some(object_ref) = preserve_seed_object_ref(pdf, handle)? else {
+                let object_ref = if let Some(object_ref) = handle.object_ref() {
+                    object_ref
+                } else if let Some(raw) = handle.qpdf_obj_gen().filter(|raw| raw.is_indirect()) {
+                    // cov:ignore-start: an indirect raw qpdf identity with
+                    // object number zero is excluded by `is_indirect`.
+                    let Some(local_ref) = writer_local_raw_ref(raw) else {
+                        continue;
+                    };
+                    // cov:ignore-end
+                    raw_sources.insert(local_ref, raw);
+                    local_ref
+                } else {
                     // cov:ignore-start: qpdf's complete object cache yields
                     // indirect handles only.
                     continue;
@@ -235,7 +235,15 @@ impl CanonicalCatalogFirstRenumber {
         }
 
         while let Some(source) = queue.pop_front() {
-            let handle = pdf.get_object_handle(source);
+            let handle = raw_sources
+                .get(&source)
+                .map(|raw| {
+                    pdf.get_object_handle_by_raw_identity(
+                        raw.get_obj() as i32,
+                        raw.get_gen() as i32,
+                    )
+                })
+                .unwrap_or_else(|| pdf.get_object_handle(source));
             let mut found = Vec::new();
             collect_canonical_children_with_stream_policy(
                 pdf,
@@ -252,7 +260,11 @@ impl CanonicalCatalogFirstRenumber {
             }
         }
 
-        Ok(Self { old_to_new, order })
+        Ok(Self {
+            old_to_new,
+            order,
+            raw_sources,
+        })
     }
 }
 
@@ -649,6 +661,7 @@ fn walk_resurrectable_handle(
 // Shared by Preserve and Generate plain-writer planning.
 pub(crate) struct ObjectStreamRenumber {
     old_to_new: HashMap<ObjectRef, ObjectRef>,
+    raw_sources: HashMap<ObjectRef, QpdfObjGen>,
     /// New object number assigned to each input group's container, in group
     /// order. `container_new[i]` is `None` only if group `i` was never reached.
     container_new: Vec<Option<u32>>,
@@ -663,11 +676,16 @@ impl ObjectStreamRenumber {
         self.container_new.get(group_index).copied().flatten()
     }
 
+    pub(crate) fn raw_source_for(&self, source: ObjectRef) -> Option<QpdfObjGen> {
+        self.raw_sources.get(&source).copied()
+    }
+
     /// Iterate `(new_ref, old_ref)` pairs for every reachable input object.
-    /// Source-backed/generated containers, object-stream members, and plain
-    /// objects are included. Legacy Synthetic containers have no original ref;
-    /// obtain their numbers via [`Self::container_number`]. Yield order is unspecified (backed by a
-    /// hash map); callers that need ordering sort by the new number.
+    /// Source-backed containers, object-stream members, raw preserve seeds, and
+    /// plain objects are included. Synthetic containers have no original ref;
+    /// obtain their numbers via [`Self::container_number`]. Yield order is
+    /// unspecified (backed by a hash map); callers that need ordering sort by
+    /// the new number.
     pub(crate) fn pairs(&self) -> impl Iterator<Item = (ObjectRef, ObjectRef)> + '_ {
         self.old_to_new.iter().map(|(&old, &new)| (new, old))
     }
@@ -748,7 +766,6 @@ impl ObjectStreamRenumber {
                 }
             })
             .collect();
-
         let mut old_to_new: HashMap<ObjectRef, ObjectRef> = HashMap::new();
         let mut container_new: Vec<Option<u32>> = vec![None; groups.len()];
         let mut next: u32 = 1;
@@ -775,14 +792,33 @@ impl ObjectStreamRenumber {
         } else {
             None
         };
+        let mut raw_sources = HashMap::new();
         let mut seeds: Vec<ObjectRef> = if preserve_unreferenced_objects {
-            pdf.canonical_live_object_refs()
-                .into_iter()
-                .filter(|object_ref| {
-                    !removed_refs.contains(object_ref)
-                        && !generated_container_sources.contains(object_ref)
-                })
-                .collect()
+            let mut seeds = Vec::new();
+            for handle in pdf.get_all_objects()? {
+                let source = if let Some(object_ref) = handle.object_ref() {
+                    object_ref
+                } else if let Some(raw) = handle.qpdf_obj_gen().filter(|raw| raw.is_indirect()) {
+                    // cov:ignore-start: an indirect raw qpdf identity with
+                    // object number zero is excluded by `is_indirect`.
+                    let Some(local_ref) = writer_local_raw_ref(raw) else {
+                        continue;
+                    };
+                    // cov:ignore-end
+                    raw_sources.insert(local_ref, raw);
+                    local_ref
+                } else {
+                    // cov:ignore-start: every parsed indirect raw identity has
+                    // an object number accepted by writer_local_raw_ref.
+                    continue;
+                    // cov:ignore-end
+                };
+                if !removed_refs.contains(&source) && !generated_container_sources.contains(&source)
+                {
+                    seeds.push(source);
+                }
+            }
+            seeds
         } else {
             Vec::new()
         };
@@ -842,7 +878,15 @@ impl ObjectStreamRenumber {
         while let Some(work) = queue.pop_front() {
             match work {
                 RenumberWork::Ordinary(cur) => {
-                    let handle = pdf.get_object_handle(cur);
+                    let handle = raw_sources
+                        .get(&cur)
+                        .map(|raw| {
+                            pdf.get_object_handle_by_raw_identity(
+                                raw.get_obj() as i32,
+                                raw.get_gen() as i32,
+                            )
+                        })
+                        .unwrap_or_else(|| pdf.get_object_handle(cur));
                     let mut found = Vec::new();
                     collect_canonical_children_with_stream_policy(
                         pdf,
@@ -909,6 +953,7 @@ impl ObjectStreamRenumber {
         Ok(Self {
             old_to_new,
             container_new,
+            raw_sources,
         })
     }
 }
@@ -996,8 +1041,8 @@ fn enqueue(
 #[cfg(test)]
 mod tests {
     use super::{
-        collect_canonical_children, ensure_canonical_owner, preserve_seed_object_ref,
-        walk_resurrectable_handle, ResurrectableWalkState,
+        collect_canonical_children, ensure_canonical_owner, walk_resurrectable_handle,
+        writer_local_raw_ref, ResurrectableWalkState,
     };
     use crate::parser::MAX_PARSE_DEPTH;
     use crate::qpdf_obj_gen::QpdfObjGen;
@@ -1026,16 +1071,12 @@ mod tests {
     }
 
     #[test]
-    fn preserve_seed_helper_ignores_direct_values() {
-        let mut pdf = Pdf::empty().expect("create a document");
-        assert_eq!(
-            preserve_seed_object_ref(&mut pdf, ObjectHandle::integer(1)).unwrap(),
-            None
-        );
+    fn writer_local_raw_ref_rejects_qpdf_object_zero() {
+        assert_eq!(writer_local_raw_ref(QpdfObjGen::new(0, 65_536)), None);
     }
 
     #[test]
-    fn preserve_seed_helper_copies_a_raw_generation_stream() {
+    fn writer_local_raw_ref_keeps_a_raw_generation_stream_unregistered() {
         let mut pdf = Pdf::open(Cursor::new(raw_stream_pdf())).expect("open raw stream PDF");
         let handle = pdf
             .get_all_objects()
@@ -1043,9 +1084,12 @@ mod tests {
             .into_iter()
             .find(|handle| handle.qpdf_obj_gen() == Some(QpdfObjGen::new(5, 65_536)))
             .expect("raw stream cache entry");
-        assert!(preserve_seed_object_ref(&mut pdf, handle)
-            .unwrap()
-            .is_some());
+        let raw = handle.qpdf_obj_gen().expect("raw identity");
+        assert_eq!(
+            writer_local_raw_ref(raw),
+            Some(ObjectRef::new(u32::MAX - 5, 0))
+        );
+        assert_eq!(pdf.get_all_objects().unwrap().len(), 2);
     }
 
     #[test]
