@@ -28,7 +28,7 @@ use crate::object_handle::{ObjectHandle, QpdfStreamJsonData};
 use crate::pipeline::buffer::Buffer;
 use crate::pipeline::stdio_file::StdioBuffer;
 use crate::pipeline::{Pipeline, PlStdioFile};
-use crate::ObjectRef;
+use crate::qpdf_obj_gen::QpdfObjGen;
 use crate::Pdf;
 use std::fs::File;
 use std::io::{Read, Seek, Write};
@@ -53,13 +53,11 @@ pub(crate) fn write_json_v1_objects_key<R: Read + Seek>(
     let mut object_first = true;
     Json::write_dictionary_open(out, &mut object_first, 1)?;
     for handle in pdf.get_all_objects().map_err(ConvertError::from)? {
-        let object_ref = handle
-            .object_ref()
-            .expect("qpdf object-map entries are indirect handles");
-        if !object_selected(wanted_objects, object_ref) {
+        let object_gen = object_map_identity(&handle);
+        if !object_selected(wanted_objects, object_gen) {
             continue;
         }
-        let key = format!("{} {} R", object_ref.number, object_ref.generation);
+        let key = format!("{} {} R", object_gen.get_obj(), object_gen.get_gen());
         Json::write_dictionary_key(out, &mut object_first, key.as_bytes(), 2)?;
         handle.write_json(1, out, true, 2)?;
     }
@@ -83,10 +81,8 @@ pub(crate) fn write_json_v1_objectinfo_key<R: Read + Seek>(
     let mut object_first = true;
     Json::write_dictionary_open(out, &mut object_first, 1)?;
     for handle in pdf.get_all_objects().map_err(ConvertError::from)? {
-        let object_ref = handle
-            .object_ref()
-            .expect("qpdf object-map entries are indirect handles");
-        if !object_selected(wanted_objects, object_ref) {
+        let object_gen = object_map_identity(&handle);
+        if !object_selected(wanted_objects, object_gen) {
             continue;
         }
 
@@ -112,7 +108,7 @@ pub(crate) fn write_json_v1_objectinfo_key<R: Read + Seek>(
             (false, ObjectHandle::null(), ObjectHandle::null())
         };
 
-        let key = format!("{} {} R", object_ref.number, object_ref.generation);
+        let key = format!("{} {} R", object_gen.get_obj(), object_gen.get_gen());
         Json::write_dictionary_key(out, &mut object_first, key.as_bytes(), 2)?;
         let mut details_first = true;
         Json::write_dictionary_open(out, &mut details_first, 2)?;
@@ -142,11 +138,25 @@ pub(crate) fn write_json_v1_objectinfo_key<R: Read + Seek>(
 /// qpdf 11.9.0 names side files `<prefix>-<obj_num>` — the bare object
 /// number with no zero-padding. Centralized here so the JSON `datafile`
 /// value and the side-file writer always produce the same name.
-pub fn format_json_side_file_path(prefix: &[u8], obj_num: u32) -> Vec<u8> {
+pub(crate) fn format_json_side_file_path(prefix: &[u8], object_gen: QpdfObjGen) -> Vec<u8> {
     let mut path = prefix.to_vec();
     path.push(b'-');
-    path.extend_from_slice(obj_num.to_string().as_bytes());
+    path.extend_from_slice(object_gen.get_obj().to_string().as_bytes());
     path
+}
+
+/// Return the raw qpdf identity that keys an entry in the JSON object map.
+///
+/// qpdf keys `QPDF::Members::obj_cache` by the raw `QPDFObjGen` read from the
+/// object header and writes the JSON object map from that same identity
+/// (`libqpdf/QPDF.cc:1699-1753`), so an object whose header generation falls
+/// outside the `N G R` parser range still appears as `obj:5 65536 R`. Keying
+/// this map from the narrower indirect-reference projection would drop such an
+/// object instead.
+fn object_map_identity(handle: &ObjectHandle) -> QpdfObjGen {
+    handle
+        .qpdf_obj_gen()
+        .expect("qpdf object-map entries are indirect handles")
 }
 
 /// Write a complete JSON document containing only the `qpdf` key.
@@ -260,10 +270,8 @@ pub fn write_json_key<R: Read + Seek>(
     Json::write_dictionary_open(out, &mut objects_first, 2)?;
     let objects = pdf.get_all_objects().map_err(ConvertError::from)?;
     for handle in objects {
-        let object_ref = handle
-            .object_ref()
-            .expect("qpdf object-map entries are indirect handles");
-        if !object_selected(wanted_objects, object_ref) {
+        let object_gen = object_map_identity(&handle);
+        if !object_selected(wanted_objects, object_gen) {
             continue;
         }
         let result = match stream_mode {
@@ -309,14 +317,14 @@ pub fn write_json_key<R: Read + Seek>(
     Ok(())
 }
 
-fn object_selected(selectors: &[JsonObjectSelector], object_ref: ObjectRef) -> bool {
+fn object_selected(selectors: &[JsonObjectSelector], object_gen: QpdfObjGen) -> bool {
     selectors.is_empty()
         || selectors.iter().any(|selector| {
             matches!(
                 selector,
                 JsonObjectSelector::Object { number, generation }
-                    if *number == object_ref.number
-                        && *generation == object_ref.generation
+                    if i64::from(*number) == object_gen.get_obj()
+                        && i64::from(*generation) == object_gen.get_gen()
             )
         })
 }
@@ -344,10 +352,8 @@ fn write_non_file_mode_object_entry(
     out: &mut dyn Pipeline,
     objects_first: &mut bool,
 ) -> Result<(), JsonOutputError> {
-    let object_ref = handle
-        .object_ref()
-        .expect("qpdf object-map entries are indirect handles");
-    let key = format!("obj:{} {} R", object_ref.number, object_ref.generation);
+    let object_gen = object_map_identity(handle);
+    let key = format!("obj:{} {} R", object_gen.get_obj(), object_gen.get_gen());
 
     // Resolve the canonical object before dispatching by value. The object-map
     // entry itself remains keyed by its original indirect identity, while the
@@ -393,10 +399,8 @@ fn write_file_mode_object_entry(
     out: &mut dyn Pipeline,
     objects_first: &mut bool,
 ) -> Result<(), JsonOutputError> {
-    let object_ref = handle
-        .object_ref()
-        .expect("qpdf object-map entries are indirect handles");
-    let key = format!("obj:{} {} R", object_ref.number, object_ref.generation);
+    let object_gen = object_map_identity(handle);
+    let key = format!("obj:{} {} R", object_gen.get_obj(), object_gen.get_gen());
 
     // Resolve the canonical object before dispatching by value, keeping the
     // original indirect identity for the JSON object key.
@@ -408,7 +412,7 @@ fn write_file_mode_object_entry(
         Json::write_dictionary_open(out, &mut object_first, 3)?;
         Json::write_dictionary_key(out, &mut object_first, b"stream", 4)?;
 
-        let side_path = format_json_side_file_path(prefix, object_ref.number);
+        let side_path = format_json_side_file_path(prefix, object_gen);
         let side_path_fs = path_from_bytes(&side_path);
         let mut side_file = File::create(&side_path_fs)
             .map_err(|source| side_file_io_error("open", &side_path, source))?;

@@ -2068,6 +2068,11 @@ impl ObjectHandle {
 
         let left_object_gen = self.qpdf_obj_gen();
         let right_object_gen = other.qpdf_obj_gen();
+        // Carry the existing projections across the swap for the same reason
+        // `promote_to_indirect_qpdf_obj_gen` does: re-deriving them through the
+        // parser gate loses identities the Rust `ObjectRef` factory admits.
+        let left_object_ref = self.object_ref();
+        let right_object_ref = other.object_ref();
         let left_parent = self.containment_parent();
         let right_parent = other.containment_parent();
         Self::remove_state_owner(&left_state_owners, &self.0);
@@ -2085,11 +2090,13 @@ impl ObjectHandle {
             std::mem::swap(&mut left.state, &mut right.state);
             std::mem::swap(&mut left.identity, &mut right.identity);
             left.identity.borrow_mut().qpdf_obj_gen = left_object_gen;
-            left.identity.borrow_mut().object_ref =
-                left_object_gen.and_then(QpdfObjGen::to_object_ref);
+            left.identity.borrow_mut().object_ref = left_object_gen
+                .and_then(QpdfObjGen::to_object_ref)
+                .or(left_object_ref);
             right.identity.borrow_mut().qpdf_obj_gen = right_object_gen;
-            right.identity.borrow_mut().object_ref =
-                right_object_gen.and_then(QpdfObjGen::to_object_ref);
+            right.identity.borrow_mut().object_ref = right_object_gen
+                .and_then(QpdfObjGen::to_object_ref)
+                .or(right_object_ref);
             std::mem::swap(&mut left.state_owners, &mut right.state_owners);
             std::mem::swap(&mut left.parsed_offset, &mut right.parsed_offset);
             std::mem::swap(&mut left.description, &mut right.description);
@@ -2287,7 +2294,12 @@ impl ObjectHandle {
             let identity = slot.identity.borrow().clone();
             identity
         };
-        identity.object_ref = object_gen.to_object_ref();
+        // `to_object_ref` applies qpdf's `N G R` parser gate, so it is not the
+        // inverse of `from_object_ref`: an identity that entered through the
+        // Rust `ObjectRef` factory (which admits generation 65535 and object
+        // number 0) has no projection to fall back on. Keep the projection the
+        // handle already carried rather than dropping it.
+        identity.object_ref = object_gen.to_object_ref().or(identity.object_ref);
         identity.qpdf_obj_gen = Some(object_gen);
         identity.active_pdf_unique_id = Some(pdf_unique_id);
         identity.resolver = Some(resolver);

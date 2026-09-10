@@ -124,6 +124,46 @@ fn run_flpdf(path: &std::path::Path) -> Output {
         .expect("flpdf should spawn")
 }
 
+fn run_qpdf_json(path: &std::path::Path) -> Output {
+    ProcessCommand::new("qpdf")
+        .args(["--json=2", path.to_str().unwrap()])
+        .output()
+        .expect("qpdf should spawn")
+}
+
+fn run_flpdf_json(path: &std::path::Path) -> Output {
+    Command::cargo_bin("flpdf")
+        .expect("flpdf should build")
+        .env("FLPDF_PROGNAME", "qpdf")
+        .args(["--json=2", path.to_str().unwrap()])
+        .output()
+        .expect("flpdf should spawn")
+}
+
+fn run_qpdf_json_object(path: &std::path::Path, selector: &str) -> Output {
+    ProcessCommand::new("qpdf")
+        .args([
+            "--json=2",
+            &format!("--json-object={selector}"),
+            path.to_str().unwrap(),
+        ])
+        .output()
+        .expect("qpdf should spawn")
+}
+
+fn run_flpdf_json_object(path: &std::path::Path, selector: &str) -> Output {
+    Command::cargo_bin("flpdf")
+        .expect("flpdf should build")
+        .env("FLPDF_PROGNAME", "qpdf")
+        .args([
+            "--json=2",
+            &format!("--json-object={selector}"),
+            path.to_str().unwrap(),
+        ])
+        .output()
+        .expect("flpdf should spawn")
+}
+
 fn run_qpdf_check(path: &std::path::Path) -> Output {
     ProcessCommand::new("qpdf")
         .args(["--check", path.to_str().unwrap()])
@@ -321,4 +361,64 @@ fn show_xref_reports_offsets_repaired_during_trailer_resolution() {
     assert_eq!(flpdf.status.code(), qpdf.status.code());
     assert_eq!(flpdf.stdout, qpdf.stdout);
     assert_eq!(flpdf.stderr, qpdf.stderr);
+}
+
+#[test]
+fn json_object_map_keys_a_matching_out_of_range_header_like_qpdf() {
+    if !qpdf_available() {
+        if std::env::var_os("CI").is_some() {
+            panic!("{EXPECTED_QPDF_VERSION} is required for this parity test on CI");
+        }
+        eprintln!("skipping: {EXPECTED_QPDF_VERSION} is not available");
+        return;
+    }
+
+    let temp = tempfile::tempdir().expect("temporary directory");
+    let input = temp.path().join("matching-in-use-generation-65536.pdf");
+    std::fs::write(&input, matching_in_use_generation_65536_pdf()).expect("write fixture");
+
+    let qpdf = run_qpdf_json(&input);
+    let flpdf = run_flpdf_json(&input);
+
+    // qpdf writes the object map from the raw header identity, so the
+    // out-of-range generation appears verbatim as `obj:5 65536 R` rather than
+    // being dropped or projected onto the `N G R` parser range.
+    assert!(
+        String::from_utf8_lossy(&qpdf.stdout).contains("\"obj:5 65536 R\""),
+        "qpdf 11.9.0 is expected to key the object map by the raw identity"
+    );
+    assert_eq!(flpdf.status.code(), qpdf.status.code());
+    assert_eq!(flpdf.stdout, qpdf.stdout);
+    assert_eq!(flpdf.stderr, qpdf.stderr);
+}
+
+#[test]
+fn json_object_selection_is_unchanged_for_projectable_identities() {
+    if !qpdf_available() {
+        if std::env::var_os("CI").is_some() {
+            panic!("{EXPECTED_QPDF_VERSION} is required for this parity test on CI");
+        }
+        eprintln!("skipping: {EXPECTED_QPDF_VERSION} is not available");
+        return;
+    }
+
+    let temp = tempfile::tempdir().expect("temporary directory");
+    let input = temp.path().join("matching-in-use-generation-65536.pdf");
+    std::fs::write(&input, matching_in_use_generation_65536_pdf()).expect("write fixture");
+
+    // Selecting by an identity that projects onto `ObjectRef` must keep
+    // matching, and the out-of-range sibling in the same file must not
+    // perturb it.
+    for selector in ["1,0", "2,0", "4,0", "trailer"] {
+        let qpdf = run_qpdf_json_object(&input, selector);
+        let flpdf = run_flpdf_json_object(&input, selector);
+
+        assert_eq!(
+            flpdf.status.code(),
+            qpdf.status.code(),
+            "exit status for selector {selector}"
+        );
+        assert_eq!(flpdf.stdout, qpdf.stdout, "stdout for selector {selector}");
+        assert_eq!(flpdf.stderr, qpdf.stderr, "stderr for selector {selector}");
+    }
 }

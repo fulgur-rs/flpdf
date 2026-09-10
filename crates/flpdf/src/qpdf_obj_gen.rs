@@ -17,8 +17,17 @@ use crate::ObjectRef;
 /// boundary.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub(crate) struct QpdfObjGen {
+    // qpdf-deviation-start: qpdf's QPDFObjGen stores `int obj, int gen`
+    // (`include/qpdf/QPDFObjGen.hh:29-86`) and has no wider representation.
+    // The Rust `ObjectRef` factory predates this type and admits a full `u32`
+    // object number, so the cache key that projects from it is stored wider to
+    // stay total. Parsed identities still pass qpdf's signed-int boundary via
+    // `new` and `try_from_object_ref`, so no header value reaches this type
+    // outside qpdf's own range; the wider slots are reachable only from
+    // `ObjectRef::new`. Narrowing that public surface is tracked separately.
     object: i64,
     generation: i64,
+    // qpdf-deviation-end
 }
 
 impl QpdfObjGen {

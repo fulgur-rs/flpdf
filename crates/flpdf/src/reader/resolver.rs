@@ -1393,19 +1393,6 @@ impl<R: Read + Seek> ResolverHandle<R> {
     /// description and the object identity (`libqpdf/QPDF.cc:1298-1310`,
     /// `:1331-1354`, `:2641-2644`), so a described read such as the
     /// `linearization hint stream` keeps its prefix on this warning too.
-    fn push_expected_endobj_warning(
-        &self,
-        object_ref: ObjectRef,
-        offset: u64,
-        read_description: Option<&[u8]>,
-    ) -> Result<()> {
-        self.push_expected_endobj_warning_qpdf_obj_gen(
-            QpdfObjGen::from_object_ref(object_ref),
-            offset,
-            read_description,
-        )
-    }
-
     fn push_expected_endobj_warning_qpdf_obj_gen(
         &self,
         object_gen: QpdfObjGen,
@@ -3395,7 +3382,7 @@ impl<R: Read + Seek> ResolverHandle<R> {
             Vec::new()
         };
         self.seek(offset).map_err(ReadObjectAtOffsetError::Body)?;
-        let (found_raw, found, parsed, trailing, trailing_start, object_header_offset) = {
+        let (found_raw, parsed, trailing, trailing_start, object_header_offset) = {
             let mut input = self.live_input();
             let mut tokenizer = LiveTokenSource::new(&mut input);
             let number_token = tokenizer
@@ -3507,7 +3494,6 @@ impl<R: Read + Seek> ResolverHandle<R> {
             input.finish().map_err(ReadObjectAtOffsetError::Body)?;
             (
                 found_raw,
-                found,
                 parsed,
                 trailing,
                 trailing_start,
@@ -3617,22 +3603,16 @@ impl<R: Read + Seek> ResolverHandle<R> {
             })
         } else {
             if !trailing.is_word_value(b"endobj") {
-                if let Some(found) = found {
-                    self.push_expected_endobj_warning(
-                        found,
-                        u64::try_from(trailing.start).unwrap_or(u64::MAX),
-                        read_description.as_deref(),
-                    )
-                    .map_err(ReadObjectAtOffsetError::Body)?;
-                } else {
-                    let description = self.core.borrow().last_object_description_bytes.clone();
-                    self.push_stream_warning_with_object_description(
-                        &description,
-                        u64::try_from(trailing.start).unwrap_or(u64::MAX),
-                        "expected endobj",
-                    )
-                    .map_err(ReadObjectAtOffsetError::Body)?;
-                }
+                // qpdf renders this warning from the raw identity it just read,
+                // with no separate form for a header outside the `N G R` range
+                // (`QPDF.cc:1350-1354`), so route both cases through the raw
+                // helper rather than keeping a projection-only special case.
+                self.push_expected_endobj_warning_qpdf_obj_gen(
+                    found_raw,
+                    u64::try_from(trailing.start).unwrap_or(u64::MAX),
+                    read_description.as_deref(),
+                )
+                .map_err(ReadObjectAtOffsetError::Body)?;
             }
             let (end_before_space, end_after_space) = if capture_end_offsets {
                 self.object_end_offsets()
@@ -5932,7 +5912,7 @@ mod tests {
         );
 
         resolver
-            .push_expected_endobj_warning(ObjectRef::new(7, 0), 12, None)
+            .push_expected_endobj_warning_qpdf_obj_gen(QpdfObjGen::new(7, 0), 12, None)
             .expect("warning delivery");
 
         assert_eq!(
