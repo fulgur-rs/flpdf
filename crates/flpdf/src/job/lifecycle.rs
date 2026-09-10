@@ -273,6 +273,19 @@ struct JobConfiguration {
     show_attachment: Option<Vec<u8>>,
 }
 
+/// qpdf's QPDFJob Members default the writer decode level to generalized
+/// (`include/qpdf/QPDFJob.hh:635-637`), even though a standalone
+/// QPDFWriter defaults to none. Keep the job lifecycle's writer snapshot on
+/// that job-specific default so token-filtered streams still pass through the
+/// writer pipeline when compression is explicitly disabled.
+fn qpdf_default_job_configuration() -> JobConfiguration {
+    let mut configuration = JobConfiguration::default();
+    configuration
+        .writer
+        .set_decode_level(crate::writer::DecodeLevel::Generalized);
+    configuration
+}
+
 /// qpdf opens one `Config::pages()` group and then permits multiple
 /// `pageSpec()` calls inside that group. JSON and the fluent Config surface
 /// must therefore share one origin marker rather than using the page-spec
@@ -1530,7 +1543,7 @@ impl QPDFJob {
             suppress_warnings: false,
             warnings_exit_zero: false,
             progress_handler: None,
-            configuration: JobConfiguration::default(),
+            configuration: qpdf_default_job_configuration(),
             page_source_documents: Vec::new(),
             overlay_sources: Vec::new(),
             encryption_status: EncryptionStatus::default(),
@@ -2122,13 +2135,12 @@ impl QPDFJob {
         let mut configuration = if partial && self.partial_json_initialized {
             self.configuration.clone()
         } else {
-            JobConfiguration {
-                require_output: true,
-                json_decode_level: crate::writer::DecodeLevel::Generalized,
-                page_specs: self.configuration.page_specs.clone(),
-                page_specs_origin: self.configuration.page_specs_origin,
-                ..JobConfiguration::default()
-            }
+            let mut configuration = qpdf_default_job_configuration();
+            configuration.require_output = true;
+            configuration.json_decode_level = crate::writer::DecodeLevel::Generalized;
+            configuration.page_specs = self.configuration.page_specs.clone();
+            configuration.page_specs_origin = self.configuration.page_specs_origin;
+            configuration
         };
         self.dispatch_job_json_document(&mut configuration, &value, &mut BTreeSet::new())?;
 

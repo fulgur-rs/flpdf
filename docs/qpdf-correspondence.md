@@ -1434,6 +1434,17 @@ qpdf の `handleUnderOverlay` → `handleTransformations` 順を repository-owne
 probe と qpdf-zlib-compat byte comparison で固定した。linearized overlay は既存の明示拒否、
 page-operation別 route と QPDFJob ownerへの完全統合は残る。
 
+2026-09-10（`flpdf-m6kt`）: top-level no-`--pages` の `--rotate` / `--split-pages` も
+`--generate-appearances` / `--flatten-annotations` を `run_rewrite_with_qpdf_job` の
+`create_qpdf` → `write_qpdf` 境界へ渡すようにした。qpdf の
+`QPDFJob::createQPDF`（`QPDFJob.cc:466-473`）→ `handleTransformations`
+（`:2137-2194`）→ `writeQPDF` / `doSplitPages`（`:483-511,2940-3027`）の順を、
+rotate/split × generate/flatten の4セルで qpdf-zlib-compatible byte differential として固定。
+新規 Tx/Ch appearance は qpdf の `/Tx BMC\nEMC\n` 初期buffer + `ValueSetter`
+token-filter（`QPDFFormFieldObjectHelper.cc:766-860`）を使うため、通常書込みでは生成内容、
+split の foreign copy では qpdf と同じ初期bufferを観測する。Job writer の未指定 decode levelも
+qpdf の default generalized（`QPDFJob.hh:635-637`）へ揃えた。
+
 `writeQPDF` は選択した処理の後に文書のopen-time/lazy warningを集約し、warning summaryと
 memory reportを一度だけ出力する。終了コード3の判定は `QPDFJob.cc:534-563`、inspection側の
 warning集約は `doInspection`（同 `:1646-1693`）がoracleである。flpdfでは
