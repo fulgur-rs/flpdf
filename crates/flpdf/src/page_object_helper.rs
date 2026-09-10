@@ -167,61 +167,29 @@ struct ObjectRecordingCallbacks {
     objects: Vec<ObjectHandle>,
 }
 
-struct ExternalizedInlineImage {
-    name: Vec<u8>,
-    dictionary: ObjectHandle,
-    data: Vec<u8>,
-}
-
-struct InlineImageExternalizer {
+struct InlineImageExternalizer<'a, R: Read + Seek + 'static> {
+    pdf: &'a mut Pdf<R>,
     min_size: usize,
     resources: ObjectHandle,
-    color_spaces: Option<ObjectHandle>,
-    color_spaces_loaded: bool,
-    resource_names: std::collections::BTreeSet<Vec<u8>>,
-    resource_names_loaded: bool,
     min_suffix: usize,
     bi_bytes: Vec<u8>,
     dict_bytes: Vec<u8>,
     in_inline_image: bool,
-    images: Vec<ExternalizedInlineImage>,
-    unresolved_color_spaces: Vec<Vec<u8>>,
+    any_images: bool,
 }
 
-impl InlineImageExternalizer {
-    fn new(min_size: usize, resources: ObjectHandle) -> Self {
+impl<'a, R: Read + Seek + 'static> InlineImageExternalizer<'a, R> {
+    fn new(min_size: usize, resources: ObjectHandle, pdf: &'a mut Pdf<R>) -> Self {
         Self {
+            pdf,
             min_size,
             resources,
-            color_spaces: None,
-            color_spaces_loaded: false,
-            resource_names: std::collections::BTreeSet::new(),
-            resource_names_loaded: false,
             min_suffix: 1,
             bi_bytes: Vec::new(),
             dict_bytes: Vec::new(),
             in_inline_image: false,
-            images: Vec::new(),
-            unresolved_color_spaces: Vec::new(),
+            any_images: false,
         }
-    }
-
-    fn ensure_resource_names(&mut self) -> std::result::Result<(), PipelineError> {
-        if !self.resource_names_loaded {
-            self.resource_names = collect_resource_names(&self.resources)
-                .map_err(|error| PipelineError::runtime(error.to_string()))?;
-            self.resource_names_loaded = true;
-        }
-        Ok(())
-    }
-
-    fn ensure_color_spaces(&mut self) -> std::result::Result<(), PipelineError> {
-        if !self.color_spaces_loaded {
-            self.color_spaces = resolve_resource_dictionary(&self.resources, b"/ColorSpace")
-                .map_err(|error| PipelineError::runtime(error.to_string()))?;
-            self.color_spaces_loaded = true;
-        }
-        Ok(())
     }
 
     fn convert_inline_image_dictionary(
@@ -295,8 +263,9 @@ impl InlineImageExternalizer {
         if let Some(name) = builtin {
             return Ok(ObjectHandle::name(name.to_vec()));
         }
-        self.ensure_color_spaces()?;
-        if let Some(color_spaces) = &self.color_spaces {
+        let color_spaces = resolve_resource_dictionary(&self.resources, b"/ColorSpace")
+            .map_err(|error| PipelineError::runtime(error.to_string()))?;
+        if let Some(color_spaces) = color_spaces {
             let mut key = b"/".to_vec();
             key.extend_from_slice(name);
             if color_spaces
@@ -308,7 +277,12 @@ impl InlineImageExternalizer {
                     .map_err(|error| PipelineError::runtime(error.to_string()));
             }
         }
-        self.unresolved_color_spaces.push(name.to_vec());
+        self.resources
+            .warn_if_possible(&format!(
+                "unable to resolve colorspace /{}",
+                String::from_utf8_lossy(name)
+            ))
+            .map_err(|error| PipelineError::runtime(error.to_string()))?;
         Ok(value)
     }
 
@@ -348,19 +322,13 @@ impl InlineImageExternalizer {
     }
 
     fn next_name(&mut self) -> std::result::Result<Vec<u8>, PipelineError> {
-        self.ensure_resource_names()?;
-        loop {
-            let mut name = b"/IIm".to_vec();
-            name.extend_from_slice(self.min_suffix.to_string().as_bytes());
-            self.min_suffix += 1;
-            if self.resource_names.insert(name.clone()) {
-                return Ok(name);
-            }
-        }
+        self.resources
+            .get_unique_resource_name(b"/IIm", &mut self.min_suffix, None)
+            .map_err(|error| PipelineError::runtime(error.to_string()))
     }
 }
 
-impl TokenFilter for InlineImageExternalizer {
+impl<R: Read + Seek + 'static> TokenFilter for InlineImageExternalizer<'_, R> {
     fn handle_token(
         &mut self,
         token: &Token,
@@ -373,11 +341,31 @@ impl TokenFilter for InlineImageExternalizer {
                     let dictionary =
                         self.convert_inline_image_dictionary(&dict_bytes, token.value.len())?;
                     let name = self.next_name()?;
-                    self.images.push(ExternalizedInlineImage {
-                        name: name.clone(),
-                        dictionary,
-                        data: token.value.clone(),
-                    });
+
+                    let stream = self
+                        .pdf
+                        .new_stream_with_data(Rc::new(token.value.clone()))
+                        .map_err(|error| PipelineError::runtime(error.to_string()))?;
+                    // cov:ignore-start: Pdf::new_stream_with_data always returns a stream dictionary.
+                    let stream_dict = stream.as_stream_dict().ok_or_else(|| {
+                        PipelineError::runtime("new inline image stream has no dictionary")
+                    })?;
+                    // cov:ignore-end
+                    // cov:ignore-start: convert_inline_image_dictionary always returns a dictionary.
+                    if let Some(entries) = dictionary.as_dictionary() {
+                        for (key, value) in entries {
+                            stream_dict
+                                .replace_key(&key, value)
+                                .map_err(|error| PipelineError::runtime(error.to_string()))?;
+                        }
+                    }
+                    // cov:ignore-end
+                    self.resources
+                        .try_get_key(b"/XObject")
+                        .map_err(|error| PipelineError::runtime(error.to_string()))?
+                        .replace_key(&name, stream)
+                        .map_err(|error| PipelineError::runtime(error.to_string()))?;
+                    self.any_images = true;
                     output.write(&name)?;
                     output.write(b" Do\n")?;
                 } else {
@@ -1331,12 +1319,12 @@ impl<'a, R: Read + Seek> PageObjectHelper<'a, R> {
     /// Convert inline images into ordinary Image XObjects.
     ///
     /// This mirrors qpdf's `externalizeInlineImages` implementation
-    /// (`libqpdf/QPDFPageObjectHelper.cc:398-437`). The content is filtered
-    /// through the canonical page/Form pipeline, while image streams are
-    /// allocated and attached after filtering so the callback never needs a
-    /// second mutable borrow of the document. With `shallow == false`, nested
-    /// Form XObjects are processed in the same bounded traversal as qpdf;
-    /// `true` limits the operation to this target.
+    /// (`libqpdf/QPDFPageObjectHelper.cc:398-437`). The canonical page/Form
+    /// token pipeline allocates and attaches each image stream at the same
+    /// point that qpdf handles the qualifying inline-image token; the final
+    /// content stream is installed only after successful filtering. With
+    /// `shallow == false`, nested Form XObjects are processed in the same
+    /// bounded traversal as qpdf; `true` limits the operation to this target.
     pub fn externalize_inline_images(&mut self, min_size: usize, shallow: bool) -> Result<()> {
         let target = self.object.clone();
         let description = self.target_description();
@@ -1885,19 +1873,6 @@ impl<'a, R: Read + Seek> PageObjectHelper<'a, R> {
 // Private free functions
 // ---------------------------------------------------------------------------
 
-fn collect_resource_names(resources: &ObjectHandle) -> Result<std::collections::BTreeSet<Vec<u8>>> {
-    let mut result = std::collections::BTreeSet::new();
-    let Some(entries) = resources.try_as_dictionary()? else {
-        return Ok(result);
-    };
-    for value in entries.into_values() {
-        if let Some(entries) = value.try_as_dictionary()? {
-            result.extend(entries.into_keys());
-        }
-    }
-    Ok(result)
-}
-
 fn resolve_resource_dictionary(
     resources: &ObjectHandle,
     key: &[u8],
@@ -1909,7 +1884,7 @@ fn resolve_resource_dictionary(
     Ok(value.try_as_dictionary()?.map(|_| value))
 }
 
-fn externalize_inline_images_for_target<R: Read + Seek>(
+fn externalize_inline_images_for_target<R: Read + Seek + 'static>(
     pdf: &mut Pdf<R>,
     object: ObjectHandle,
     description: &str,
@@ -1926,60 +1901,31 @@ fn externalize_inline_images_for_target<R: Read + Seek>(
     let seed = ObjectHandle::dictionary(vec![(b"/XObject".to_vec(), empty_xobjects)]);
     resources.merge_resources(&seed, None)?;
 
-    let mut filter = InlineImageExternalizer::new(min_size, resources.clone());
     let mut rewritten = Vec::new();
-    {
-        let mut helper = PageObjectHelper::from_object_handle(target.clone(), pdf);
+    let any_images = {
+        let mut filter = InlineImageExternalizer::new(min_size, resources.clone(), pdf);
         let mut sink = PlString::new("externalized inline image content", None, &mut rewritten);
         // qpdf catches filter/parser failures here, warns, and leaves the
         // original content untouched. The Rust Result boundary is retained
         // for setup/mutation errors; an unsuccessful filter is the same
         // warning-only no-op rather than a partially rewritten page.
-        let filter_result = helper.filter_contents(&mut filter, Some(&mut sink));
-        if let Err(error) = filter_result {
-            // cov:ignore-start: the canonical decoder either fails before any
-            // inline-image header is committed or completes the filter; it
-            // cannot leave unresolved colorspaces in this error branch.
-            for name in filter.unresolved_color_spaces.drain(..) {
-                resources.warn_if_possible(&format!(
-                    "unable to resolve colorspace /{}",
-                    String::from_utf8_lossy(&name)
+        let filter_result = if is_form {
+            target.filter_as_contents(&mut filter, Some(&mut sink))
+        } else {
+            target.filter_page_contents(&mut filter, Some(&mut sink))
+        };
+        match filter_result {
+            Ok(()) => filter.any_images,
+            Err(error) => {
+                target.warn_if_possible(&format!(
+                    "Unable to filter content stream: {error}; not attempting to externalize inline images from this stream"
                 ))?;
+                return Ok(());
             }
-            // cov:ignore-end
-            target.warn_if_possible(&format!(
-                "Unable to filter content stream: {error}; not attempting to externalize inline images from this stream"
-            ))?;
-            return Ok(());
         }
-    }
-    for name in filter.unresolved_color_spaces.drain(..) {
-        resources.warn_if_possible(&format!(
-            "unable to resolve colorspace /{}",
-            String::from_utf8_lossy(&name)
-        ))?;
-    }
-    if filter.images.is_empty() {
+    };
+    if !any_images {
         return Ok(());
-    }
-
-    let xobjects = resources.try_get_key(b"/XObject")?;
-    if xobjects.try_as_dictionary()?.is_some() {
-        for image in filter.images {
-            let stream = pdf.new_stream_with_data(Rc::new(image.data))?;
-            // cov:ignore-start: Pdf::new_stream_with_data always returns a
-            // document-owned stream with a stream dictionary.
-            let stream_dict = stream.as_stream_dict().ok_or_else(|| {
-                Error::Internal("new inline image stream has no dictionary".to_owned())
-            })?;
-            // cov:ignore-end
-            if let Some(entries) = image.dictionary.as_dictionary() {
-                for (key, value) in entries {
-                    stream_dict.replace_key(&key, value)?;
-                }
-            }
-            xobjects.replace_key(&image.name, stream)?;
-        }
     }
 
     if is_form {
@@ -2516,7 +2462,8 @@ mod tests {
 
     #[test]
     fn resource_lookup_helpers_cover_missing_and_non_dictionary_values() {
-        assert!(collect_resource_names(&ObjectHandle::integer(1))
+        assert!(ObjectHandle::integer(1)
+            .get_resource_names()
             .expect("non-dictionary resources have no names")
             .is_empty());
 
@@ -2524,7 +2471,8 @@ mod tests {
             b"/Font".to_vec(),
             ObjectHandle::dictionary(vec![(b"/F1".to_vec(), ObjectHandle::integer(1))]),
         )]);
-        assert!(collect_resource_names(&nested)
+        assert!(nested
+            .get_resource_names()
             .expect("nested resource dictionaries have names")
             .contains(b"/F1".as_slice()));
 
@@ -2803,8 +2751,9 @@ mod tests {
 
     #[test]
     fn inline_image_dictionary_expands_qpdf_abbreviations() {
+        let mut pdf = Pdf::<Cursor<Vec<u8>>>::empty().expect("empty PDF should be available");
         let mut externalizer =
-            InlineImageExternalizer::new(0, ObjectHandle::dictionary(Vec::new()));
+            InlineImageExternalizer::new(0, ObjectHandle::dictionary(Vec::new()), &mut pdf);
 
         let image = externalizer
             .convert_inline_image_dictionary(
@@ -2839,6 +2788,7 @@ mod tests {
 
     #[test]
     fn inline_image_externalizer_covers_colorspace_filters_and_name_conflicts() {
+        let mut pdf = Pdf::<Cursor<Vec<u8>>>::empty().expect("empty PDF should be available");
         let mut externalizer = InlineImageExternalizer::new(
             0,
             ObjectHandle::dictionary(vec![
@@ -2851,9 +2801,10 @@ mod tests {
                 ),
                 (
                     b"/XObject".to_vec(),
-                    ObjectHandle::dictionary(vec![(b"/IIm1".to_vec(), ObjectHandle::null())]),
+                    ObjectHandle::dictionary(vec![(b"/IIm1".to_vec(), ObjectHandle::integer(1))]),
                 ),
             ]),
+            &mut pdf,
         );
 
         for (short, expanded) in [
@@ -2891,11 +2842,6 @@ mod tests {
                 .as_integer(),
             Some(7)
         );
-        assert_eq!(
-            externalizer.unresolved_color_spaces,
-            vec![b"Missing".to_vec()]
-        );
-
         for (short, expanded) in [
             (b"AHx".as_slice(), b"ASCIIHexDecode".as_slice()),
             (b"A85".as_slice(), b"ASCII85Decode".as_slice()),
@@ -2935,7 +2881,7 @@ mod tests {
         );
 
         assert_eq!(externalizer.next_name().unwrap(), b"/IIm2".to_vec());
-        assert_eq!(externalizer.next_name().unwrap(), b"/IIm3".to_vec());
+        assert_eq!(externalizer.next_name().unwrap(), b"/IIm2".to_vec());
     }
 
     #[test]
