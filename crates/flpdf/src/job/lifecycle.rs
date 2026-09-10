@@ -3340,7 +3340,12 @@ impl QPDFJob {
                 // The drain qpdf performs after `writeOutfile` returns
                 // (`libqpdf/QPDFJob.cc:493-494`).
                 self.drain_document_warnings(pdf);
-                self.complete(true)?;
+                // qpdf's writeOutfile clears its output filename when the
+                // destination is `-` before writeQPDF emits the completion
+                // summary (`libqpdf/QPDFJob.cc:3033-3040,493-503`). Therefore
+                // stdout is an output stream for dispatch, but not a named
+                // resulting file for the warning suffix.
+                self.complete(output != Path::new("-"))?;
                 if self.configuration.report_memory_usage {
                     self.report_memory_usage()?;
                 }
@@ -3678,17 +3683,21 @@ impl QPDFJob {
         self.apply_page_label_transformations(pdf, configuration)?;
         for key in &configuration.attachments_to_remove {
             if !pdf.embedded_files().remove_embedded_file(key)? {
-                return Err(Error::System(format!(
-                    "attachment {} not found",
-                    String::from_utf8_lossy(key)
-                )));
+                let mut message = b"attachment ".to_vec();
+                message.extend_from_slice(key);
+                message.extend_from_slice(b" not found");
+                return Err(Error::SystemBytes(message));
             }
             if configuration.verbose {
-                self.logger.info(format!(
-                    "{}: removed attachment {}\n",
-                    self.message_prefix,
-                    String::from_utf8_lossy(key)
-                ))?; // cov:ignore: llvm-cov attributes this successful logger write to its opening expressions
+                // The key is arbitrary PDF bytes, not UTF-8. Building the line
+                // as bytes keeps a key like `key-\xff` intact; going through
+                // `String::from_utf8_lossy` would print U+FFFD where qpdf
+                // prints the original byte.
+                let mut message = self.message_prefix.clone().into_bytes();
+                message.extend_from_slice(b": removed attachment ");
+                message.extend_from_slice(key);
+                message.push(b'\n');
+                self.logger.info(message)?; // cov:ignore: llvm-cov attributes this successful logger write to its opening expressions
             } // cov:ignore: llvm-cov attributes this successful attachment branch continuation
         }
         let attachments_to_add = configuration
@@ -4304,6 +4313,22 @@ impl QPDFJob {
             // sink reports itself as qpdf's `qpdf output` pipeline
             // (`QPDFWriter.cc:101-110`), so a bare `Error::Io` here comes from
             // the input side and keeps the input name qpdf prints for it.
+            // A failed open carries the path as a `PathBuf`, so render it
+            // through the byte-preserving helper. Falling through to the
+            // `Display` formatting below would substitute U+FFFD for any byte
+            // that is not valid UTF-8, and qpdf prints the original bytes.
+            Error::FileIo {
+                operation,
+                path,
+                source,
+            } => {
+                let mut rendered = operation.as_bytes().to_vec();
+                rendered.push(b' ');
+                rendered.extend_from_slice(&path_description_bytes(path));
+                rendered.extend_from_slice(b": ");
+                rendered.extend_from_slice(qpdf_file_io_source_message(source).as_bytes());
+                rendered
+            }
             Error::Io(error) if !self.input_name_bytes.is_empty() => {
                 let mut rendered = self.input_name_bytes.clone();
                 rendered.extend_from_slice(b": ");

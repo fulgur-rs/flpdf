@@ -1502,6 +1502,17 @@ qpdf は成功した removal を `doIfVerbose` で報告し、`writeOutfile` の
 （`QPDFJob.cc:2230-2241,3030-3062`）。flpdf は remove route に `verbose` を渡し、key の
 raw bytes を保持した info/error message と同じ completion order を使う。
 
+上記の旧 `flpdf-5nle` 記述は `flpdf-3yn9.48.81`（2026-09-10）で
+supersede された。現在の `run_add_attachment` / `run_remove_attachment` /
+`run_copy_attachments_from` は direct `PdfWriter`、手動 normalization、手動
+warning completionを持たず、`QPDFJobConfig`へ設定して
+`QPDFJob::create_qpdf` → `QPDFJob::write_qpdf`へ渡す。これにより
+`handleTransformations` の remove → add → copy 順、全 writer option、donorの
+per-file direct open（`open_job_source`）、stdout予約、warning summary、
+`--replace-input` renameを一つのJob境界で共有する。stdout出力時のcompletion
+suffixも、qpdfが `writeOutfile` 内で `outfilename` を `nullptr` にする順序
+（`QPDFJob.cc:3033-3040,493-503`）に合わせる。
+
 `flpdf-7l5e` では、名前付き JSON output も同じ completion boundary を使う。
 `QPDFJob::writeOutfile` は `writeJSON` が file pipeline を閉じた直後、かつ
 `writeQPDF` の warning summary より前に、明示 output path がある場合の
