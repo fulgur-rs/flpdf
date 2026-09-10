@@ -63,6 +63,21 @@ fn run_flpdf(args: &[&str], input: &str) -> Output {
         .expect("flpdf should start")
 }
 
+fn run_qpdf_exact(args: &[String]) -> Output {
+    Command::new("qpdf")
+        .args(args)
+        .output()
+        .expect("qpdf should start")
+}
+
+fn run_flpdf_exact(args: &[String]) -> Output {
+    Command::new(assert_cmd::cargo_bin!("flpdf"))
+        .env("FLPDF_PROGNAME", "qpdf")
+        .args(args)
+        .output()
+        .expect("flpdf should start")
+}
+
 fn normalize_text_newlines(bytes: &[u8]) -> Vec<u8> {
     let mut normalized = Vec::with_capacity(bytes.len());
     let mut remaining = bytes;
@@ -173,6 +188,26 @@ fn assert_matches_qpdf(args: &[&str], input: &str) {
     );
 }
 
+fn assert_matches_qpdf_exact(args: &[String]) {
+    let qpdf = run_qpdf_exact(args);
+    let flpdf = run_flpdf_exact(args);
+    assert_eq!(
+        flpdf.status.code(),
+        qpdf.status.code(),
+        "exit code mismatch for {args:?}"
+    );
+    assert_eq!(
+        normalize_text_newlines(&flpdf.stdout),
+        normalize_text_newlines(&qpdf.stdout),
+        "stdout mismatch for {args:?}"
+    );
+    assert_eq!(
+        normalize_text_newlines(&flpdf.stderr),
+        normalize_text_newlines(&qpdf.stderr),
+        "stderr mismatch for {args:?}"
+    );
+}
+
 #[test]
 fn check_linearization_accepts_and_runs_all_qpdf_compatible_combinations() {
     if !qpdf_available() {
@@ -245,6 +280,50 @@ fn inspection_flags_run_in_qpdf_do_inspection_order() {
                 FXO_RED
             },
         );
+    }
+}
+
+#[test]
+fn page_selection_precedes_single_page_inspection() {
+    if !qpdf_available() {
+        return;
+    }
+
+    let minimal =
+        Path::new(env!("CARGO_MANIFEST_DIR")).join("../../tests/fixtures/compat/one-page.pdf");
+    let three_page =
+        Path::new(env!("CARGO_MANIFEST_DIR")).join("../../tests/fixtures/compat/three-page.pdf");
+    let cases = [
+        vec![
+            "--empty".to_owned(),
+            "--pages".to_owned(),
+            minimal.display().to_string(),
+            "--".to_owned(),
+            "--show-pages".to_owned(),
+        ],
+        vec![
+            three_page.display().to_string(),
+            "--pages".to_owned(),
+            ".".to_owned(),
+            "2".to_owned(),
+            "--".to_owned(),
+            "--show-pages".to_owned(),
+        ],
+        vec![
+            "--collate=0".to_owned(),
+            three_page.display().to_string(),
+            "--pages".to_owned(),
+            ".".to_owned(),
+            "1".to_owned(),
+            ".".to_owned(),
+            "2".to_owned(),
+            "--".to_owned(),
+            "--show-pages".to_owned(),
+        ],
+    ];
+
+    for args in cases {
+        assert_matches_qpdf_exact(&args);
     }
 }
 

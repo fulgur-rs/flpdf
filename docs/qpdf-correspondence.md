@@ -1398,6 +1398,15 @@ underlay/overlay → image → appearance → annotation → coalesce → rotati
 page-label/output 順序を一つの Job owner へ集約した。残る direct CLI callers は
 JSON/page-operation/inspection cohort であり、`.48.8`〜`.48.10` の後続範囲である。
 
+2026-09-10（`flpdf-3yn9.48.76`）では、top-level `--pages` と no-output inspection
+の consumer を `QPDFJobConfig::empty_input`/`add_page_spec`/`collate` と
+`QPDFJob::run`（`create_qpdf` → `write_qpdf`）へ接続した。これは qpdf の
+`Config::emptyInput`/`collate`、`handlePageSpecs`、`writeQPDF`/`doInspection`
+（`QPDFJob_config.cc:27-40,95-125`, `QPDFJob.cc:428-511,1645-1693,2359-2633`）に
+対応し、`--empty --pages ... -- --show-pages` が空の primary を直接表示して
+しまう bypass を除去する。page-operation output の4つの直接 caller は依然
+mixed として残り、別の bounded cutover で扱う。
+
 `flpdf-ddk1` では、qpdf の output sink が `Pl_StdioFile("qpdf output", ...)`
 （`QPDFWriter.cc:101-110`。named file でも standard output でも identifier は同じ）
 として入力ファイル名とは独立した責務を持つことに合わせ、`PdfWriter` の file sink 自身が
