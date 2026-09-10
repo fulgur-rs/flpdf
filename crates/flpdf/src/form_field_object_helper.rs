@@ -121,8 +121,8 @@ impl<'a, R: Read + Seek> FormFieldObjectHelper<'a, R> {
 
     /// Return whether the referenced field object is PDF null.
     pub fn is_null(&mut self) -> Result<bool> {
-        let field = self.resolved(self.field.clone())?;
-        Ok(field.is_null())
+        let field = self.dereferenced(self.field.clone())?;
+        field.try_is_null()
     }
 
     /// Return this field's direct `/Parent` reference, if present.
@@ -175,10 +175,10 @@ impl<'a, R: Read + Seek> FormFieldObjectHelper<'a, R> {
                 break;
             }
 
-            let node = self.resolved(current.clone())?;
-            let parent = node.get_key(b"/Parent");
-            let parent = self.resolved(parent)?;
-            if parent.is_null() {
+            let node = self.dereferenced(current.clone())?;
+            let parent = node.try_get_key(b"/Parent")?;
+            let parent = self.dereferenced(parent)?;
+            if parent.try_is_null()? {
                 break;
             }
             let Some(parent_ref) = parent.object_ref() else {
@@ -306,15 +306,15 @@ impl<'a, R: Read + Seek> FormFieldObjectHelper<'a, R> {
                     self.field_ref.unwrap_or(ObjectRef::new(0, 0)),
                 ));
             }
-            let node = self.resolved(current.clone())?;
-            if node.as_dictionary().is_none() {
+            let node = self.dereferenced(current.clone())?;
+            if !node.try_is_dictionary()? {
                 break;
             }
-            if let Some(name) = self.resolve_string_handle(Some(node.get_key(b"/T")))? {
+            if let Some(name) = self.resolve_string_handle(Some(node.try_get_key(b"/T")?))? {
                 parts.push(name);
             }
-            let parent = self.resolved(node.get_key(b"/Parent"))?;
-            if parent.is_null() {
+            let parent = self.dereferenced(node.try_get_key(b"/Parent")?)?;
+            if parent.try_is_null()? {
                 break;
             }
             current = parent;
@@ -363,15 +363,17 @@ impl<'a, R: Read + Seek> FormFieldObjectHelper<'a, R> {
     /// `/AcroForm/Q`. Missing or non-integer values are zero as in qpdf.
     pub fn quadding(&mut self) -> Result<i64> {
         if let Some(value) = self.resolve_inherited_handle(b"Q")? {
-            if let Some(value) = self.resolved(value)?.as_integer() {
+            if let Some(value) = self.dereferenced(value)?.try_as_integer()? {
                 return Ok(value);
             }
         }
         Ok(self
             .acroform_value(b"Q")?
-            .map(|value| self.resolved(value))
+            .map(|value| self.dereferenced(value))
             .transpose()?
-            .and_then(|value| value.as_integer())
+            .map(|value| value.try_as_integer())
+            .transpose()?
+            .flatten()
             .unwrap_or(0))
     }
 
@@ -394,8 +396,8 @@ impl<'a, R: Read + Seek> FormFieldObjectHelper<'a, R> {
         let Some(value) = self.field_value()? else {
             return Ok(false);
         };
-        let value = self.resolved(value)?;
-        Ok(value.as_name().is_some_and(|value| value != b"Off"))
+        let value = self.dereferenced(value)?;
+        Ok(value.try_as_name()?.is_some_and(|value| value != b"Off"))
     }
 
     /// Return whether this field is a radio button (`/Btn`, flag bit 16).
@@ -423,8 +425,8 @@ impl<'a, R: Read + Seek> FormFieldObjectHelper<'a, R> {
         let Some(options) = self.resolve_inherited_handle(b"Opt")? else {
             return Ok(Vec::new());
         };
-        let options = self.resolved(options)?;
-        let Some(items) = options.as_array() else {
+        let options = self.dereferenced(options)?;
+        let Some(items) = options.try_as_array()? else {
             return Ok(Vec::new());
         };
 
@@ -452,16 +454,16 @@ impl<'a, R: Read + Seek> FormFieldObjectHelper<'a, R> {
 
     /// Set the field's `/V` value using qpdf's form-field dispatch.
     pub fn set_value(&mut self, value: ObjectHandle, need_appearances: bool) -> Result<()> {
-        let value = self.resolved(value)?;
+        let value = self.dereferenced(value)?;
         if self.field_type()?.as_deref() == Some(b"/Btn") {
             if self.is_checkbox()? {
-                if let Some(name) = value.as_name() {
+                if let Some(name) = value.try_as_name()? {
                     self.set_checkbox_value(name != b"Off")?;
                 } else {
                     self.field.warn_if_possible(NON_NAME_CHECKBOX_WARNING)?;
                 }
             } else if self.is_radio_button()? {
-                if let Some(name) = value.as_name() {
+                if let Some(name) = value.try_as_name()? {
                     self.set_radio_button_value(self.field.clone(), &name)?;
                 } else {
                     self.field.warn_if_possible(NON_NAME_RADIO_WARNING)?;
@@ -525,17 +527,15 @@ impl<'a, R: Read + Seek> FormFieldObjectHelper<'a, R> {
     /// Clear `/AcroForm/NeedAppearances` after a document appearance pass.
     pub fn clear_need_appearances_after_generation(pdf: &mut Pdf<R>) -> Result<()> {
         let root = pdf.trailer_key_handle(b"Root");
-        pdf.resolve(&root)?;
-        if root.is_null() {
+        if root.try_is_null()? {
             return Ok(());
         }
-        let acroform = root.get_key(b"/AcroForm");
-        pdf.resolve(&acroform)?;
-        if acroform.as_dictionary().is_none() {
+        let acroform = root.try_get_key(b"/AcroForm")?;
+        if !acroform.try_is_dictionary()? {
             return Ok(());
         }
-        let need_appearances = acroform.get_key(b"/NeedAppearances");
-        pdf.resolve(&need_appearances)?;
+        let need_appearances = acroform.try_get_key(b"/NeedAppearances")?;
+        need_appearances.try_dereference()?;
         if need_appearances.as_boolean() != Some(true) {
             return Ok(());
         }
@@ -576,26 +576,26 @@ impl<'a, R: Read + Seek> FormFieldObjectHelper<'a, R> {
     }
 
     fn set_radio_button_value(&mut self, field: ObjectHandle, value: &[u8]) -> Result<()> {
-        let field = self.resolved(field)?;
+        let field = self.dereferenced(field)?;
 
-        let parent = self.resolved(field.get_key(b"/Parent"))?;
-        if !parent.is_null() {
+        let parent = self.dereferenced(field.try_get_key(b"/Parent")?)?;
+        if !parent.try_is_null()? {
             if let Some(parent_dict) = self.dictionary_handle_for(parent.clone())? {
-                let parent_parent = self.resolved(parent_dict.get_key(b"/Parent"))?;
-                if parent_parent.is_null() && self.is_radio_for(parent_dict.clone())? {
+                let parent_parent = self.dereferenced(parent_dict.try_get_key(b"/Parent")?)?;
+                if parent_parent.try_is_null()? && self.is_radio_for(parent_dict.clone())? {
                     return self.set_radio_button_value(parent_dict, value);
                 }
             }
         }
 
-        let parent_is_null = parent.is_null();
-        let kids = self.resolved(field.get_key(b"/Kids"))?;
+        let parent_is_null = parent.try_is_null()?;
+        let kids = self.dereferenced(field.try_get_key(b"/Kids")?)?;
         if !parent_is_null {
             field.warn_if_possible(RADIO_BUTTON_SHAPE_WARNING)?;
             return Ok(());
         }
 
-        let Some(items) = kids.as_array() else {
+        let Some(items) = kids.try_as_array()? else {
             field.warn_if_possible(RADIO_BUTTON_SHAPE_WARNING)?;
             return Ok(());
         };
@@ -623,8 +623,8 @@ impl<'a, R: Read + Seek> FormFieldObjectHelper<'a, R> {
         value: &[u8],
         warning_handle: &ObjectHandle,
     ) -> Result<()> {
-        let kid = self.resolved(kid)?;
-        if kid.as_dictionary().is_none() {
+        let kid = self.dereferenced(kid)?;
+        if !kid.try_is_dictionary()? {
             warning_handle.warn_if_possible(BROKEN_RADIO_BUTTON_WARNING)?;
             return Ok(());
         }
@@ -634,8 +634,8 @@ impl<'a, R: Read + Seek> FormFieldObjectHelper<'a, R> {
             return Ok(());
         }
 
-        let grandkids = self.resolved(kid.get_key(b"/Kids"))?;
-        if let Some(items) = grandkids.as_array() {
+        let grandkids = self.dereferenced(kid.try_get_key(b"/Kids")?)?;
+        if let Some(items) = grandkids.try_as_array()? {
             if !self.update_first_radio_widget(items, value)? {
                 warning_handle.warn_if_possible(BROKEN_RADIO_BUTTON_WARNING)?;
             }
@@ -655,8 +655,8 @@ impl<'a, R: Read + Seek> FormFieldObjectHelper<'a, R> {
     }
 
     fn update_radio_widget(&mut self, widget: ObjectHandle, value: &[u8]) -> Result<bool> {
-        let widget = self.resolved(widget)?;
-        if widget.as_dictionary().is_none() || !self.has_non_null_appearance(&widget)? {
+        let widget = self.dereferenced(widget)?;
+        if !widget.try_is_dictionary()? || !self.has_non_null_appearance(&widget)? {
             return Ok(false);
         }
         let state = self.radio_state(&widget, value)?;
@@ -681,18 +681,18 @@ impl<'a, R: Read + Seek> FormFieldObjectHelper<'a, R> {
     /// earlier version of this helper, this must not require an object
     /// number, or a direct field/widget's `/AS` silently never gets synced.
     fn appearance_annotation(&mut self, start: ObjectHandle) -> Result<Option<ObjectHandle>> {
-        let field = self.resolved(start)?;
+        let field = self.dereferenced(start)?;
         if self.has_non_null_appearance(&field)? {
             return Ok(Some(field));
         }
 
-        let kids = self.resolved(field.get_key(b"/Kids"))?;
-        let Some(items) = kids.as_array() else {
+        let kids = self.dereferenced(field.try_get_key(b"/Kids")?)?;
+        let Some(items) = kids.try_as_array()? else {
             return Ok(None);
         };
         for kid in items {
-            let kid = self.resolved(kid)?;
-            if kid.as_dictionary().is_none() {
+            let kid = self.dereferenced(kid)?;
+            if !kid.try_is_dictionary()? {
                 continue;
             }
             if self.has_non_null_appearance(&kid)? {
@@ -705,14 +705,14 @@ impl<'a, R: Read + Seek> FormFieldObjectHelper<'a, R> {
     /// Any non-null `/AP` makes a radio candidate a widget, even when its
     /// appearance dictionary is malformed.
     fn has_non_null_appearance(&mut self, dictionary: &ObjectHandle) -> Result<bool> {
-        let appearance = self.resolved(dictionary.get_key(b"/AP"))?;
-        Ok(!appearance.is_null())
+        let appearance = self.dereferenced(dictionary.try_get_key(b"/AP")?)?;
+        Ok(!appearance.try_is_null()?)
     }
 
     fn normal_appearance_names(&mut self, dictionary: &ObjectHandle) -> Result<Vec<Vec<u8>>> {
-        let appearance = self.resolved(dictionary.get_key(b"/AP"))?;
-        let normal = self.resolved(appearance.get_key(b"/N"))?;
-        let Some(entries) = normal.as_dictionary() else {
+        let appearance = self.dereferenced(dictionary.try_get_key(b"/AP")?)?;
+        let normal = self.dereferenced(appearance.try_get_key(b"/N")?)?;
+        let Some(entries) = normal.try_as_dictionary()? else {
             return Ok(Vec::new());
         };
         Ok(entries
@@ -736,8 +736,12 @@ impl<'a, R: Read + Seek> FormFieldObjectHelper<'a, R> {
     }
 
     fn dictionary_handle_for(&mut self, handle: ObjectHandle) -> Result<Option<ObjectHandle>> {
-        let handle = self.resolved(handle)?;
-        Ok(handle.as_dictionary().map(|_| handle))
+        let handle = self.dereferenced(handle)?;
+        if handle.try_is_dictionary()? {
+            Ok(Some(handle))
+        } else {
+            Ok(None)
+        }
     }
 
     fn is_radio_for(&mut self, field: ObjectHandle) -> Result<bool> {
@@ -759,20 +763,20 @@ impl<'a, R: Read + Seek> FormFieldObjectHelper<'a, R> {
 
     fn acroform_value(&mut self, key: &[u8]) -> Result<Option<ObjectHandle>> {
         let root = self.pdf.trailer_key_handle(b"Root");
-        let root = self.resolved(root)?;
-        if root.is_null() || root.as_dictionary().is_none() {
+        let root = self.dereferenced(root)?;
+        if root.try_is_null()? || !root.try_is_dictionary()? {
             return Ok(None);
         }
-        let acroform = self.resolved(root.get_key(b"/AcroForm"))?;
-        if acroform.as_dictionary().is_none() {
+        let acroform = self.dereferenced(root.try_get_key(b"/AcroForm")?)?;
+        if !acroform.try_is_dictionary()? {
             return Ok(None);
         }
-        let value =
-            self.resolved(acroform.get_key(&crate::object_handle::canonical_dictionary_key(key)))?;
+        let key = crate::object_handle::canonical_dictionary_key(key);
+        let value = self.dereferenced(acroform.try_get_key(&key)?)?;
         // A live qpdf parse never stores a bare reference as an object's
         // value. Keep the document-level accessor on the same null/dictionary
         // boundary as qpdf without exposing any separate reference value.
-        Ok((!value.is_null()).then_some(value))
+        Ok((!value.try_is_null()?).then_some(value))
     }
 
     fn utf8_string(value: &[u8]) -> String {
@@ -780,12 +784,12 @@ impl<'a, R: Read + Seek> FormFieldObjectHelper<'a, R> {
     }
 
     fn direct_parent(&mut self, field: ObjectHandle) -> Result<Option<ObjectRef>> {
-        let field = self.resolved(field)?;
-        if field.as_dictionary().is_none() {
+        let field = self.dereferenced(field)?;
+        if !field.try_is_dictionary()? {
             return Ok(None);
         }
-        let parent = self.resolved(field.get_key(b"/Parent"))?;
-        if parent.is_null() {
+        let parent = self.dereferenced(field.try_get_key(b"/Parent")?)?;
+        if parent.try_is_null()? {
             return Ok(None);
         }
         Ok(parent.object_ref())
@@ -799,7 +803,7 @@ impl<'a, R: Read + Seek> FormFieldObjectHelper<'a, R> {
         let Some(value) = self.resolve_inherited_handle_from(field, key)? else {
             return Ok(None);
         };
-        Ok(self.resolved(value)?.as_name())
+        self.dereferenced(value)?.try_as_name()
     }
 
     fn resolve_inherited_handle(&mut self, key: &[u8]) -> Result<Option<ObjectHandle>> {
@@ -829,17 +833,17 @@ impl<'a, R: Read + Seek> FormFieldObjectHelper<'a, R> {
                 ));
             }
 
-            let node = self.resolved(current)?;
-            if node.as_dictionary().is_none() {
+            let node = self.dereferenced(current)?;
+            if !node.try_is_dictionary()? {
                 return Ok(None);
             }
-            let value = self.resolved(node.get_key(&key))?;
-            if !value.is_null() {
+            let value = self.dereferenced(node.try_get_key(&key)?)?;
+            if !value.try_is_null()? {
                 return Ok(Some(value));
             }
 
-            let parent = self.resolved(node.get_key(b"/Parent"))?;
-            if parent.is_null() {
+            let parent = self.dereferenced(node.try_get_key(b"/Parent")?)?;
+            if parent.try_is_null()? {
                 return Ok(None);
             }
             current = parent;
@@ -854,16 +858,18 @@ impl<'a, R: Read + Seek> FormFieldObjectHelper<'a, R> {
         let Some(value) = self.resolve_inherited_handle_from(field, key)? else {
             return Ok(None);
         };
-        Ok(Some(self.resolved(value)?.as_integer().unwrap_or(0)))
+        Ok(Some(
+            self.dereferenced(value)?.try_as_integer()?.unwrap_or(0),
+        ))
     }
 
     fn string_key(&mut self, field: ObjectHandle, key: &[u8]) -> Result<Option<String>> {
-        let field = self.resolved(field)?;
-        if field.as_dictionary().is_none() {
+        let field = self.dereferenced(field)?;
+        if !field.try_is_dictionary()? {
             return Ok(None);
         }
         self.resolve_string_handle(Some(
-            field.get_key(&crate::object_handle::canonical_dictionary_key(key)),
+            field.try_get_key(&crate::object_handle::canonical_dictionary_key(key))?,
         ))
     }
 
@@ -871,12 +877,12 @@ impl<'a, R: Read + Seek> FormFieldObjectHelper<'a, R> {
         let Some(value) = value else {
             return Ok(None);
         };
-        let value = self.resolved(value)?;
+        let value = self.dereferenced(value)?;
         Ok(value.as_string().map(|value| Self::utf8_string(&value)))
     }
 
-    fn resolved(&mut self, handle: ObjectHandle) -> Result<ObjectHandle> {
-        self.pdf.resolve(&handle)?;
+    fn dereferenced(&mut self, handle: ObjectHandle) -> Result<ObjectHandle> {
+        handle.try_dereference()?;
         Ok(handle)
     }
 }

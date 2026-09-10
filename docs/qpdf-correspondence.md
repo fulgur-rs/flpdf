@@ -1740,6 +1740,30 @@ Existing `/AP/N` reuse, `/Rect`/`/BBox`, `/DR` font fallback, encoding,
 token-filter replacement, warning order, and error propagation are unchanged.
 qtest exceptions and the separate merge/drop semantic issue remain outside
 this bounded row.
+### A6/A7/A8 FormField field-tree accessor slice `flpdf-3yn9.48.23.17` (2026-09-10)
+
+The FormField helper's parent-chain, inherited-value, button/value, choices,
+and `NeedAppearances` graph observations now use live canonical handles. qpdf's
+`QPDFFormFieldObjectHelper` performs these walks through `getKey` and typed
+accessors, preserving the field identity and cycle guard
+(`libqpdf/QPDFFormFieldObjectHelper.cc:30-236,267-285`), while button/value
+mutation follows `QPDFFormFieldObjectHelper.cc:300-469`. The resolving
+contract for those accessors is owned by `QPDFObjectHandle`
+(`libqpdf/QPDFObjectHandle.cc:240-446,965-989,2168-2189`), while document-level
+appearance-marker access follows `QPDFAcroFormDocumentHelper`
+(`libqpdf/QPDFAcroFormDocumentHelper.cc:365-415`).
+
+The scoped production route had four explicit resolver sites: the shared
+helper and `clear_need_appearances_after_generation`. The former
+`resolved` helper was replaced with canonical `try_dereference`, and field
+dictionary/key/array/name/integer/null boundaries now use the corresponding
+`try_*` accessors. Silent string, boolean, and other observations without a
+semantically identical resolving `try_as_*` counterpart remain only after
+canonical dereference, so malformed-input warning and fallback behavior is not
+changed by a warning-producing substitute. Direct-parent identity guards,
+inherited lookup order, checkbox/radio/pushbutton mutation order, and
+`NeedAppearances` removal remain unchanged. qtest exceptions and the separate
+merge/drop semantic issue remain outside this bounded row.
 
 ### QPDFJob `doInspection` combined top-level consumer `flpdf-giz3` (2026-09-10)
 
