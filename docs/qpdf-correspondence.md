@@ -2620,6 +2620,11 @@ filter-on-write veto、metadata、retry provider、token filterを実測し、Ru
 同じrunの契約として固定する。plain cache、specialized、linearizedの各consumerには
 同じ`StreamDictionaryOptions`を渡し、linearizedの専用pre-probe自体は変更していない。
 
+2026-09-10（`flpdf-vo76`）: `/F`・`/FFilter`・`/FDecodeParms` を持つ external-file
+stream fixture でも、`--stream-data=preserve` の出力を qpdf 11.9.0 と同一runで byte比較した。
+`crates/flpdf/tests/cmp_diff_zero_tests.rs::preserve_external_file_stream_matches_qpdf_11_9`
+が、in-body payload、直値 `/Length`、外部参照キーの保持をまとめて固定する。
+
 ### `QPDF::getRoot` の test_driver consumer
 
 `libqpdf/QPDF.cc:2355-2368` の `QPDF::getRoot` は trailer の `/Root` を
