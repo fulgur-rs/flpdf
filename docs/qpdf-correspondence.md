@@ -1715,6 +1715,32 @@ duplicate shallow-clone identity, shared child handles, PageLabels, and the
 page-merge writer-order provenance remain unchanged. qtest exceptions and the
 separate merge/drop semantic issue remain outside this bounded row.
 
+### A6/A7 AcroForm appearance renderer accessor slice `flpdf-3yn9.48.23.16` (2026-09-10)
+
+The Tx/Ch appearance renderer now reads and mutates the live widget graph
+through canonical `ObjectHandle` accessors. qpdf's
+`QPDFFormFieldObjectHelper::generateTextAppearance` selects the existing or
+new `/AP/N`, validates its rectangle, resolves font resources, and installs the
+`ValueSetter` token filter in that order
+(`libqpdf/QPDFFormFieldObjectHelper.cc:766-860`). The underlying qpdf
+`QPDFObjectHandle` key and typed accessors resolve their receiver at entry
+(`libqpdf/QPDFObjectHandle.cc:240-446,789-824,965-989`), and
+`generateAppearancesIfNeeded` owns the Tx/Ch dispatch
+(`libqpdf/QPDFAcroFormDocumentHelper.cc:393-415`).
+
+The scoped production route had four explicit `Pdf::resolve` calls: the local
+resolver helper and the widget boundaries in installation, Tx generation, and
+Ch generation. They were removed in favor of `try_dereference`,
+`try_get_key`, `try_is_dictionary`, `try_as_array`, `try_as_name`,
+`try_is_number`, `try_get_numeric_value`, and `try_is_null`. Silent
+`as_stream_dict`/parser-token and string/real observations remain only after
+canonical dereference where no semantically identical resolving `try_as_*`
+counterpart exists; warning-producing value fallbacks are not substituted.
+Existing `/AP/N` reuse, `/Rect`/`/BBox`, `/DR` font fallback, encoding,
+token-filter replacement, warning order, and error propagation are unchanged.
+qtest exceptions and the separate merge/drop semantic issue remain outside
+this bounded row.
+
 ### QPDFJob `doInspection` combined top-level consumer `flpdf-giz3` (2026-09-10)
 
 The top-level CLI now routes combined inspection selections through the

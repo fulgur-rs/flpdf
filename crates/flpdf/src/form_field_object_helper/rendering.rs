@@ -36,24 +36,11 @@ use crate::token_filter::{TokenFilter, TokenFilterOutput};
 use crate::tokenizer::{Token, TokenType};
 use crate::{Error, ObjectRef, Pdf, Result};
 
-/// Resolve one canonical handle hop without materializing a legacy `Object`.
-fn resolve_canonical<R: Read + Seek>(
-    pdf: &mut Pdf<R>,
-    handle: ObjectHandle,
-) -> Result<ObjectHandle> {
-    pdf.resolve(&handle)?;
-    Ok(handle)
-}
-
 /// Read a rectangle-shaped array (`/Rect`, `/BBox`, …) at `key` through a
 /// live handle.
-fn resolve_rectangle_canonical<R: Read + Seek>(
-    pdf: &mut Pdf<R>,
-    handle: &ObjectHandle,
-    key: &[u8],
-) -> Result<Option<PageBox>> {
-    let rect = resolve_canonical(pdf, handle.get_key(key))?;
-    let Some(items) = rect.as_array() else {
+fn resolve_rectangle_canonical(handle: &ObjectHandle, key: &[u8]) -> Result<Option<PageBox>> {
+    let rect = handle.try_get_key(key)?;
+    let Some(items) = rect.try_as_array()? else {
         return Ok(None);
     };
     if items.len() != 4 {
@@ -62,14 +49,10 @@ fn resolve_rectangle_canonical<R: Read + Seek>(
 
     let mut values = [0.0; 4];
     for (index, item) in items.into_iter().enumerate() {
-        let item = resolve_canonical(pdf, item)?;
-        let Some(value) = item
-            .as_real()
-            .or_else(|| item.as_integer().map(|n| n as f64))
-        else {
+        if !item.try_is_number()? {
             return Ok(None);
-        };
-        values[index] = value;
+        }
+        values[index] = item.try_get_numeric_value()?;
     }
     Ok(Some(PageBox::new(
         values[0], values[1], values[2], values[3],
@@ -77,11 +60,8 @@ fn resolve_rectangle_canonical<R: Read + Seek>(
 }
 
 /// Read a widget rectangle through the live annotation handle.
-fn resolve_rect_canonical<R: Read + Seek>(
-    pdf: &mut Pdf<R>,
-    widget: &ObjectHandle,
-) -> Result<Option<PageBox>> {
-    resolve_rectangle_canonical(pdf, widget, b"/Rect")
+fn resolve_rect_canonical(widget: &ObjectHandle) -> Result<Option<PageBox>> {
+    resolve_rectangle_canonical(widget, b"/Rect")
 }
 
 /// Resolve the bounding box used to size a widget's `/AP/N` appearance
@@ -107,10 +87,11 @@ fn resolve_appearance_bbox_canonical<R: Read + Seek>(
     widget: &ObjectHandle,
 ) -> Result<Option<PageBox>> {
     let normal = resolve_normal_appearance_canonical(pdf, widget)?;
+    normal.try_dereference()?;
     if let Some(stream_dict) = normal.as_stream_dict() {
-        return resolve_rectangle_canonical(pdf, &stream_dict, b"/BBox");
+        return resolve_rectangle_canonical(&stream_dict, b"/BBox");
     }
-    resolve_rect_canonical(pdf, widget)
+    resolve_rect_canonical(widget)
 }
 
 /// Select `/AP/N`, including qpdf's `/AS` lookup when `/N` is a state
@@ -138,17 +119,15 @@ struct AppearanceFont {
     from_default_resources: bool,
 }
 
-fn font_from_resources<R: Read + Seek>(
-    pdf: &mut Pdf<R>,
+fn font_from_resources(
     resources: ObjectHandle,
     resource_name: &[u8],
 ) -> Result<Option<ObjectHandle>> {
-    let resources = resolve_canonical(pdf, resources)?;
-    if resources.as_dictionary().is_none() {
+    if !resources.try_is_dictionary()? {
         return Ok(None);
     }
-    let font_dict = resolve_canonical(pdf, resources.get_key(b"/Font"))?;
-    if font_dict.as_dictionary().is_none() {
+    let font_dict = resources.try_get_key(b"/Font")?;
+    if !font_dict.try_is_dictionary()? {
         return Ok(None);
     }
     let resource_key = {
@@ -157,17 +136,14 @@ fn font_from_resources<R: Read + Seek>(
         key.extend_from_slice(resource_name);
         key
     };
-    let font = resolve_canonical(pdf, font_dict.get_key(&resource_key))?;
-    Ok((!font.is_null()).then_some(font))
+    let font = font_dict.try_get_key(&resource_key)?;
+    Ok((!font.try_is_null()?).then_some(font))
 }
 
-fn appearance_font_encoding<R: Read + Seek>(
-    pdf: &mut Pdf<R>,
-    font: &ObjectHandle,
-) -> Result<AppearanceEncoding> {
-    let font = resolve_canonical(pdf, font.clone())?;
-    let encoding = resolve_canonical(pdf, font.get_key(b"/Encoding"))?;
-    Ok(match encoding.as_name().as_deref() {
+fn appearance_font_encoding(font: &ObjectHandle) -> Result<AppearanceEncoding> {
+    font.try_dereference()?;
+    let encoding = font.try_get_key(b"/Encoding")?;
+    Ok(match encoding.try_as_name()?.as_deref() {
         Some(b"WinAnsiEncoding") => AppearanceEncoding::WinAnsi,
         Some(b"MacRomanEncoding") => AppearanceEncoding::MacRoman,
         _ => AppearanceEncoding::Ascii,
@@ -184,10 +160,11 @@ fn lookup_appearance_font<R: Read + Seek>(
         return Ok(None);
     };
 
+    normal_appearance.try_dereference()?;
     if let Some(stream_dict) = normal_appearance.as_stream_dict() {
-        let resources = resolve_canonical(pdf, stream_dict.get_key(b"/Resources"))?;
-        if let Some(font) = font_from_resources(pdf, resources, resource_name)? {
-            let encoding = appearance_font_encoding(pdf, &font)?;
+        let resources = stream_dict.try_get_key(b"/Resources")?;
+        if let Some(font) = font_from_resources(resources, resource_name)? {
+            let encoding = appearance_font_encoding(&font)?;
             return Ok(Some(AppearanceFont {
                 resource_name: resource_name.to_vec(),
                 font,
@@ -201,17 +178,17 @@ fn lookup_appearance_font<R: Read + Seek>(
     let Some(resources) = resources else {
         return Ok(None);
     };
-    let Some(font) = font_from_resources(pdf, resources, resource_name)? else {
+    let Some(font) = font_from_resources(resources, resource_name)? else {
         return Ok(None);
     };
     // qpdf merges a document-level fallback font only when the resolved
     // resource is a dictionary (`QPDFFormFieldObjectHelper.cc:817-832`).
     // A malformed scalar `/DR` entry is treated as no usable font rather
     // than being copied into the appearance resource dictionary.
-    if font.try_as_dictionary()?.is_none() {
+    if !font.try_is_dictionary()? {
         return Ok(None);
     }
-    let encoding = appearance_font_encoding(pdf, &font)?;
+    let encoding = appearance_font_encoding(&font)?;
     Ok(Some(AppearanceFont {
         resource_name: resource_name.to_vec(),
         font,
@@ -341,13 +318,15 @@ fn add_default_font_to_existing_appearance<R: Read + Seek>(
     normal: &ObjectHandle,
     font: &AppearanceFont,
 ) -> Result<()> {
+    normal.try_dereference()?;
     let Some(stream_dict) = normal.as_stream_dict() else {
         return Ok(()); // cov:ignore: qpdf calls this helper only after selecting a stream appearance
     };
-    let resources = resolve_canonical(pdf, stream_dict.get_key(b"/Resources"))?;
-    if resources.as_dictionary().is_none() {
+    let resources = stream_dict.try_get_key(b"/Resources")?;
+    if !resources.try_is_dictionary()? {
         return Ok(()); // cov:ignore: the missing-resources branch is covered by the malformed AP fixture
     }
+    resources.try_dereference()?;
     let resources = if resources.is_indirect() {
         let copy = resources.shallow_copy()?;
         let indirect = pdf.make_indirect_object_handle(copy)?;
@@ -362,7 +341,7 @@ fn add_default_font_to_existing_appearance<R: Read + Seek>(
     )]);
     resources.merge_resources(&empty_font, None)?;
     resources
-        .get_key(b"/Font")
+        .try_get_key(b"/Font")?
         .replace_key(&resource_key(&font.resource_name), font.font.clone())?;
     Ok(())
 }
@@ -375,8 +354,9 @@ fn install_normal_appearance_canonical_handles<R: Read + Seek>(
     bbox_h: f64,
     font_resource: Option<AppearanceFont>,
 ) -> Result<Option<ObjectRef>> {
-    pdf.resolve(&widget)?;
+    widget.try_dereference()?;
     let normal = resolve_normal_appearance_canonical(pdf, &widget)?;
+    normal.try_dereference()?;
 
     // qpdf keeps an existing normal appearance stream and installs a
     // `ValueSetter` token filter on that same canonical stream
@@ -397,7 +377,7 @@ fn install_normal_appearance_canonical_handles<R: Read + Seek>(
             .map(Some);
     }
 
-    let ap = resolve_canonical(pdf, widget.get_key(b"/AP"))?;
+    let ap = widget.try_get_key(b"/AP")?;
     let stream = pdf.new_stream_with_data(Rc::new(content))?;
     let bbox = ObjectHandle::array(vec![
         ObjectHandle::real(0.0),
@@ -427,7 +407,7 @@ fn install_normal_appearance_canonical_handles<R: Read + Seek>(
     ]);
     stream.replace_stream_dict(stream_dict)?;
 
-    let ap = if ap.is_null() {
+    let ap = if ap.try_is_null()? {
         let ap = ObjectHandle::dictionary(Vec::new());
         widget.replace_key(b"/AP", ap.clone())?;
         ap
@@ -436,7 +416,7 @@ fn install_normal_appearance_canonical_handles<R: Read + Seek>(
     };
 
     // qpdf's replaceKey is a no-op for a non-dictionary /AP value.
-    if ap.as_dictionary().is_some() {
+    if ap.try_is_dictionary()? {
         ap.replace_key(b"/N", stream.clone())?;
     } else {
         return Ok(None);
@@ -475,7 +455,7 @@ pub(crate) fn render_text_field_canonical_handles<R: Read + Seek>(
     }
 
     let value = FormFieldObjectHelper::from_object_handle(field.clone(), pdf).value_as_string()?;
-    pdf.resolve(&widget)?;
+    widget.try_dereference()?;
     let Some(rect) = resolve_appearance_bbox_canonical(pdf, &widget)? else {
         return Ok(None);
     };
@@ -531,7 +511,7 @@ pub(crate) fn render_choice_field_canonical_handles<R: Read + Seek>(
         return Ok(None);
     }
 
-    pdf.resolve(&widget)?;
+    widget.try_dereference()?;
     let Some(rect) = resolve_appearance_bbox_canonical(pdf, &widget)? else {
         return Ok(None);
     };

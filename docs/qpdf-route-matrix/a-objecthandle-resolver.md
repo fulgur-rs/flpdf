@@ -592,6 +592,28 @@ provenance remain outside the accessor-only change. qtest exceptions, the
 thread-bead/struct-tree drop-family, and the separate merge/drop semantic
 issue remain out of scope.
 
+### 2026-09-10 current caller audit: AcroForm appearance renderer bounded cutover
+
+`flpdf-3yn9.48.23.16` migrated the four non-qtest production
+`Pdf::resolve` callers in
+`crates/flpdf/src/form_field_object_helper/rendering.rs`: the
+`resolve_canonical` helper and the widget boundaries in appearance
+installation, Tx generation, and Ch generation. The post-cutover scoped
+production count is zero. The route contract is
+`crates/flpdf/tests/form_field_rendering_route_contract_tests.rs`.
+
+The qpdf boundary is `libqpdf/QPDFFormFieldObjectHelper.cc:766-860` for
+appearance selection, rectangle/font lookup, and `ValueSetter` installation;
+`libqpdf/QPDFAcroFormDocumentHelper.cc:393-415` owns Tx/Ch dispatch; and
+`libqpdf/QPDFObjectHandle.cc:240-446,789-824,965-989` owns resolving typed/key
+access. flpdf now uses canonical `try_dereference`/`try_*` accessors at each
+equivalent graph boundary. Silent stream-dictionary and parser-token/string-
+real observations remain only after dereference where no equivalent silent
+resolving accessor exists. Existing rendering layout and malformed-input
+warning behavior are covered by the focused FormField and CLI qpdf tests;
+qtest exceptions and unrelated AcroForm/FileSpec/signature routes remain out
+of scope.
+
 ### 2026-09-10 current caller audit: optimization bounded cutover
 
 `flpdf-3yn9.48.23.11` migrated the non-qtest production callers in
