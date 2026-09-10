@@ -736,7 +736,7 @@ impl<R: Read + Seek> Drop for ResolverHandle<R> {
 /// The `QPDF::StringDecrypter` qpdf binds to one indirect object immediately
 /// before `QPDFParser::parse` (`libqpdf/QPDF.cc:1331-1340`).
 struct ResolverStringDecrypter<'resolver, R: Read + Seek + 'static> {
-    object_ref: ObjectRef,
+    object_gen: QpdfObjGen,
     encryption_parameters: Rc<RefCell<Option<crate::encryption::state::EncryptionState>>>,
     resolver: &'resolver ResolverHandle<R>,
 }
@@ -759,7 +759,7 @@ struct ResolverStringDecrypter<'resolver, R: Read + Seek + 'static> {
 struct ForeignStreamData<R: Read + Seek + 'static> {
     input: Rc<StreamInput<R>>,
     encryption_parameters: Rc<RefCell<Option<crate::encryption::state::EncryptionState>>>,
-    object_ref: ObjectRef,
+    object_gen: QpdfObjGen,
     parsed_offset: i64,
     stream_length: usize,
     local_dict: ObjectHandle,
@@ -791,12 +791,12 @@ impl<R: Read + Seek + 'static> StreamDataProvider for OriginalStreamDataProvider
         let destination = self.destination_resolver.upgrade().ok_or_else(|| {
             Error::Internal("foreign stream destination resolver is no longer live".to_owned())
         })?;
-        pipe_stream_data_from_input(
+        pipe_stream_data_from_qpdf_obj_gen(
             &self.foreign_data.input,
             &self.foreign_data.encryption_parameters,
             destination.as_ref(),
             Some(self.foreign_data.description.as_slice()),
-            self.foreign_data.object_ref,
+            self.foreign_data.object_gen,
             self.foreign_data.parsed_offset,
             self.foreign_data.stream_length,
             &self.foreign_data.local_dict,
@@ -837,7 +837,7 @@ impl<R: Read + Seek + 'static> StringDecrypter for ResolverStringDecrypter<'_, R
             .as_mut()
             .ok_or_else(|| Error::Internal("string decrypter lost encryption parameters".into()))?;
         // cov:ignore-end
-        encryption.decrypt_object_string(self.object_ref, bytes, use_aes)
+        encryption.decrypt_object_string_qpdf_obj_gen(self.object_gen, bytes, use_aes)
     }
 }
 
@@ -1135,9 +1135,12 @@ impl<R: Read + Seek> ResolverHandle<R> {
         destination_dict: &ObjectHandle,
         destination_resolver: Weak<dyn DocumentResolver>,
     ) -> Result<Rc<dyn StreamDataProvider>> {
-        let object_ref = source.object_ref().ok_or_else(|| {
-            Error::Internal("original foreign stream has no object reference".to_owned())
-        })?;
+        let object_gen = source
+            .qpdf_obj_gen()
+            .filter(|object_gen| object_gen.is_indirect())
+            .ok_or_else(|| {
+                Error::Internal("original foreign stream has no object reference".to_owned())
+            })?;
         let stream_length = source.stream_source_length().ok_or_else(|| {
             Error::Internal("original foreign stream has no stream length".to_owned())
         })?;
@@ -1148,7 +1151,7 @@ impl<R: Read + Seek> ResolverHandle<R> {
             foreign_data: Rc::new(ForeignStreamData {
                 input,
                 encryption_parameters,
-                object_ref,
+                object_gen,
                 parsed_offset: source.get_parsed_offset(),
                 stream_length,
                 local_dict: destination_dict.clone(),
@@ -2351,7 +2354,15 @@ impl<R: Read + Seek> ResolverHandle<R> {
         let core = self.core.borrow();
         let mut entries = core.source_xref_entries.clone();
         for object_gen in &core.default_xref_entries {
-            if let Some(object_ref) = object_gen.to_object_ref() {
+            let object_ref = object_gen.to_object_ref().or_else(|| {
+                (object_gen.is_indirect()
+                    && object_gen.get_obj() >= 1
+                    && object_gen.get_obj() <= i64::from(u32::MAX)
+                    && object_gen.get_gen() >= 0
+                    && object_gen.get_gen() <= i64::from(u16::MAX))
+                .then(|| ObjectRef::new(object_gen.get_obj() as u32, object_gen.get_gen() as u16))
+            });
+            if let Some(object_ref) = object_ref {
                 entries
                     .entry(object_ref)
                     .or_insert(XrefEntry::Free { next: 0 });
@@ -2781,14 +2792,36 @@ impl<R: Read + Seek> ResolverHandle<R> {
         suppress_warnings: bool,
         will_retry: bool,
     ) -> Result<bool> {
+        self.pipe_stream_data_qpdf_obj_gen(
+            QpdfObjGen::from_object_ref(object_ref),
+            offset,
+            length,
+            stream_dict,
+            pipeline,
+            suppress_warnings,
+            will_retry,
+        )
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) fn pipe_stream_data_qpdf_obj_gen(
+        &self,
+        object_gen: QpdfObjGen,
+        offset: i64,
+        length: usize,
+        stream_dict: &ObjectHandle,
+        pipeline: &mut dyn Pipeline,
+        suppress_warnings: bool,
+        will_retry: bool,
+    ) -> Result<bool> {
         let input = self.stream_input();
         let encryption_parameters = self.encryption_parameters();
-        pipe_stream_data_from_input(
+        pipe_stream_data_from_qpdf_obj_gen(
             &input,
             &encryption_parameters,
             self,
             None,
-            object_ref,
+            object_gen,
             offset,
             length,
             stream_dict,
@@ -3324,15 +3357,14 @@ impl<R: Read + Seek> ResolverHandle<R> {
             .trailing_start
             .or_else(|| u64::try_from(parsed.end_after_space).ok());
         let object_gen = parsed.object_gen;
-        let cache_has_xref_value = object_gen
-            .to_object_ref()
-            .and_then(|object_ref| self.registered_handle(object_ref))
+        let cache_has_xref_value = self
+            .registered_qpdf_obj_gen_handle(object_gen)
             .is_some_and(|handle| handle.is_resolved() && !handle.is_null());
-        if object_gen
+        let object_is_in_xref = object_gen
             .to_object_ref()
-            .is_some_and(|object_ref| self.xref_entry(object_ref).is_some())
-            || cache_has_xref_value
-        {
+            .map(|object_ref| self.xref_entry(object_ref).is_some())
+            .unwrap_or_else(|| self.raw_xref_entries().contains_key(&object_gen));
+        if object_is_in_xref || cache_has_xref_value {
             let ParsedObjectAtOffset {
                 value,
                 parsed_offset,
@@ -3462,8 +3494,8 @@ impl<R: Read + Seek> ResolverHandle<R> {
                 .map(|encryption| (true, encryption.encrypt_ref))
                 .unwrap_or((false, None));
             let mut decrypter = if has_encryption && encrypt_ref != found {
-                found.map(|object_ref| ResolverStringDecrypter {
-                    object_ref,
+                Some(ResolverStringDecrypter {
+                    object_gen: found_raw,
                     encryption_parameters,
                     resolver: self,
                 })
@@ -4278,6 +4310,7 @@ const INPUT_CHUNK: usize = 4096;
 /// `QPDF_Stream`, including bytes found by recovered stream framing; the
 /// recovery-EOL metadata is not a pipe-time decryption adjustment.
 #[allow(clippy::too_many_arguments)]
+#[cfg(test)]
 fn pipe_stream_data_from_input<R: Read + Seek + 'static>(
     input: &StreamInput<R>,
     encryption_parameters: &Rc<RefCell<Option<crate::encryption::state::EncryptionState>>>,
@@ -4291,13 +4324,42 @@ fn pipe_stream_data_from_input<R: Read + Seek + 'static>(
     suppress_warnings: bool,
     will_retry: bool,
 ) -> Result<bool> {
+    pipe_stream_data_from_qpdf_obj_gen(
+        input,
+        encryption_parameters,
+        warning_sink,
+        description_override,
+        QpdfObjGen::from_object_ref(object_ref),
+        offset,
+        length,
+        stream_dict,
+        pipeline,
+        suppress_warnings,
+        will_retry,
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
+fn pipe_stream_data_from_qpdf_obj_gen<R: Read + Seek + 'static>(
+    input: &StreamInput<R>,
+    encryption_parameters: &Rc<RefCell<Option<crate::encryption::state::EncryptionState>>>,
+    warning_sink: &dyn DocumentResolver,
+    description_override: Option<&[u8]>,
+    object_gen: QpdfObjGen,
+    offset: i64,
+    length: usize,
+    stream_dict: &ObjectHandle,
+    pipeline: &mut dyn Pipeline,
+    suppress_warnings: bool,
+    will_retry: bool,
+) -> Result<bool> {
     let encryption_snapshot = encryption_parameters.borrow().as_ref().cloned();
     let Some(encryption_snapshot) = encryption_snapshot else {
         return pipe_stream_data_to_pipeline_for_input(
             input,
             warning_sink,
             description_override,
-            object_ref,
+            object_gen,
             offset,
             length,
             pipeline,
@@ -4312,7 +4374,7 @@ fn pipe_stream_data_from_input<R: Read + Seek + 'static>(
             input,
             warning_sink,
             description_override,
-            object_ref,
+            object_gen,
             offset,
             length,
             pipeline,
@@ -4357,12 +4419,12 @@ fn pipe_stream_data_from_input<R: Read + Seek + 'static>(
             Some(encryption) => {
                 let stage = match use_aes {
                     None => StreamDecryption::None,
-                    Some(false) => {
-                        StreamDecryption::Rc4(encryption.key_for_object(object_ref, false).to_vec())
-                    }
-                    Some(true) => {
-                        StreamDecryption::Aes(encryption.key_for_object(object_ref, true).to_vec())
-                    }
+                    Some(false) => StreamDecryption::Rc4(
+                        encryption.key_for_qpdf_obj_gen(object_gen, false).to_vec(),
+                    ),
+                    Some(true) => StreamDecryption::Aes(
+                        encryption.key_for_qpdf_obj_gen(object_gen, true).to_vec(),
+                    ),
                 };
                 Some(stage)
             }
@@ -4373,7 +4435,7 @@ fn pipe_stream_data_from_input<R: Read + Seek + 'static>(
             input,
             warning_sink,
             description_override,
-            object_ref,
+            object_gen,
             offset,
             length,
             pipeline,
@@ -4387,7 +4449,7 @@ fn pipe_stream_data_from_input<R: Read + Seek + 'static>(
             input,
             warning_sink,
             description_override,
-            object_ref,
+            object_gen,
             offset,
             length,
             pipeline,
@@ -4400,7 +4462,7 @@ fn pipe_stream_data_from_input<R: Read + Seek + 'static>(
                 input,
                 warning_sink,
                 description_override,
-                object_ref,
+                object_gen,
                 offset,
                 length,
                 &mut decrypt,
@@ -4414,7 +4476,7 @@ fn pipe_stream_data_from_input<R: Read + Seek + 'static>(
                 input,
                 warning_sink,
                 description_override,
-                object_ref,
+                object_gen,
                 offset,
                 length,
                 &mut decrypt,
@@ -4430,7 +4492,7 @@ fn pipe_stream_data_to_pipeline_for_input<R: Read + Seek + 'static>(
     input: &StreamInput<R>,
     warning_sink: &dyn DocumentResolver,
     description_override: Option<&[u8]>,
-    object_ref: ObjectRef,
+    object_gen: QpdfObjGen,
     offset: i64,
     length: usize,
     pipeline: &mut dyn Pipeline,
@@ -4467,7 +4529,7 @@ fn pipe_stream_data_to_pipeline_for_input<R: Read + Seek + 'static>(
                 warn(at, "unexpected EOF reading stream data".to_owned())?;
             }
             PipeFailure::Decoding { at, ref detail } => {
-                let og = format!("{} {}", object_ref.number, object_ref.generation);
+                let og = format!("{} {}", object_gen.get_obj(), object_gen.get_gen());
                 warn(
                     at,
                     format!("error decoding stream data for object {og}: {detail}"),
@@ -4897,6 +4959,28 @@ impl<R: Read + Seek> DocumentResolver for ResolverHandle<R> {
         ResolverHandle::pipe_stream_data(
             self,
             object_ref,
+            offset,
+            length,
+            stream_dict,
+            pipeline,
+            suppress_warnings,
+            will_retry,
+        )
+    }
+
+    fn pipe_stream_data_qpdf_obj_gen(
+        &self,
+        object_gen: QpdfObjGen,
+        offset: i64,
+        length: usize,
+        stream_dict: &ObjectHandle,
+        pipeline: &mut dyn Pipeline,
+        suppress_warnings: bool,
+        will_retry: bool,
+    ) -> Result<bool> {
+        ResolverHandle::pipe_stream_data_qpdf_obj_gen(
+            self,
+            object_gen,
             offset,
             length,
             stream_dict,
@@ -14281,6 +14365,128 @@ mod tests {
         assert!(resolver
             .get_object_handle_qpdf_obj_gen(QpdfObjGen::new(5, 65_536))
             .is_resolved());
+    }
+
+    #[test]
+    fn xref_stream_cache_protection_uses_raw_generation_identity() {
+        let mut bytes = b"%PDF-1.4\n".to_vec();
+        let offset = bytes.len();
+        bytes.extend_from_slice(b"5 65536 obj\n45\nendobj\n%tail\n");
+        let resolver = ResolverHandle::new_shared(
+            Cursor::new(bytes),
+            0,
+            BTreeMap::<ObjectRef, XrefEntry>::new(),
+            false,
+            false,
+            Diagnostics::default(),
+            ResolverWarningOptions::new(crate::QPDFLogger::create(), true, Vec::new()),
+            0,
+        );
+        let object_gen = QpdfObjGen::new(5, 65_536);
+        resolver.install_raw_xref_entries(BTreeMap::from([(
+            object_gen,
+            XrefEntry::Uncompressed {
+                offset: offset as u64,
+            },
+        )]));
+        let cached = resolver.get_object_handle_qpdf_obj_gen(object_gen);
+        cached.set_resolved(ObjectValue::Integer(99));
+
+        resolver
+            .resolve_xref_stream_at_offset(offset as u64, None)
+            .expect("xref-stream read should preserve an already cached raw identity");
+
+        assert_eq!(cached.try_get_int_value().unwrap(), 99);
+    }
+
+    #[test]
+    fn raw_generation_stream_data_uses_the_original_qpdf_identity() {
+        let mut bytes = b"%PDF-1.4\n".to_vec();
+        let offset = bytes.len();
+        bytes.extend_from_slice(
+            b"5 65536 obj\n<< /Length 5 >>\nstream\nhello\nendstream\nendobj\n%tail\n",
+        );
+        let resolver = ResolverHandle::new_shared(
+            Cursor::new(bytes),
+            0,
+            BTreeMap::<ObjectRef, XrefEntry>::new(),
+            false,
+            false,
+            Diagnostics::default(),
+            ResolverWarningOptions::new(crate::QPDFLogger::create(), true, Vec::new()),
+            0,
+        );
+        let object_gen = QpdfObjGen::new(5, 65_536);
+        resolver.install_raw_xref_entries(BTreeMap::from([(
+            object_gen,
+            XrefEntry::Uncompressed {
+                offset: offset as u64,
+            },
+        )]));
+        resolver
+            .fix_dangling_references()
+            .expect("raw-generation stream should resolve");
+
+        let stream = resolver.get_object_handle_qpdf_obj_gen(object_gen);
+        assert!(
+            stream.as_stream_dict().is_some(),
+            "raw object must remain a stream"
+        );
+        assert_eq!(stream.get_raw_stream_data().unwrap().as_ref(), b"hello");
+    }
+
+    #[test]
+    fn raw_generation_string_decryption_uses_the_original_qpdf_identity() {
+        let object_gen = QpdfObjGen::new(5, 65_536);
+        let mut encryption = authenticated_v2_rc4_encryption();
+        let key = encryption.key_for_qpdf_obj_gen(object_gen, false).to_vec();
+        let mut ciphertext = b"raw generation string".to_vec();
+        crate::encryption::rc4::Rc4::new(&key)
+            .expect("object key")
+            .process_in_place(&mut ciphertext);
+        let encoded: String = ciphertext
+            .iter()
+            .map(|byte| format!("{byte:02X}"))
+            .collect();
+
+        let mut bytes = b"%PDF-1.4\n".to_vec();
+        let offset = bytes.len();
+        bytes.extend_from_slice(format!("5 65536 obj\n<{encoded}>\nendobj\n%tail\n").as_bytes());
+        let resolver = ResolverHandle::new_shared(
+            Cursor::new(bytes),
+            0,
+            BTreeMap::<ObjectRef, XrefEntry>::new(),
+            false,
+            false,
+            Diagnostics::default(),
+            ResolverWarningOptions::new(crate::QPDFLogger::create(), true, Vec::new()),
+            0,
+        );
+        *resolver.encryption_parameters().borrow_mut() = Some(encryption);
+        resolver.install_raw_xref_entries(BTreeMap::from([(
+            object_gen,
+            XrefEntry::Uncompressed {
+                offset: offset as u64,
+            },
+        )]));
+        resolver
+            .fix_dangling_references()
+            .expect("raw-generation encrypted string should resolve");
+
+        let object = resolver.get_object_handle_qpdf_obj_gen(object_gen);
+        assert_eq!(object.as_string(), Some(b"raw generation string".to_vec()));
+    }
+
+    #[test]
+    fn xref_entries_retain_a_projectionless_default_identity() {
+        let resolver = resolver_over(Vec::new());
+        let sentinel = ObjectRef::new(55, u16::MAX);
+        resolver.insert_default_xref_entry_for_test(sentinel);
+
+        assert_eq!(
+            resolver.xref_entries().get(&sentinel),
+            Some(&XrefEntry::Free { next: 0 })
+        );
     }
 
     #[test]
