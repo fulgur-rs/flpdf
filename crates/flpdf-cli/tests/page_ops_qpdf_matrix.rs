@@ -1745,6 +1745,86 @@ fn pages_then_split_encrypted_primary_matches_qpdf_cleartext_chunks() {
     }
 }
 
+#[test]
+fn pages_encrypt_then_split_outputs_encrypted_chunks_like_qpdf() {
+    // qpdf applies explicit --encrypt in setWriterOptions for every fresh
+    // doSplitPages writer. The page-operation guard must therefore not reject
+    // this combination before the canonical writer sees the configuration.
+    if !qpdf_available() {
+        return;
+    }
+    let qdir = tempfile::tempdir().unwrap();
+    let fdir = tempfile::tempdir().unwrap();
+    let src = fixture_abs(THREE_PAGE);
+    let qtemplate = qdir.path().join("encrypted.pdf");
+    let ftemplate = fdir.path().join("encrypted.pdf");
+
+    let qpdf_args = [
+        "--static-id",
+        "--static-aes-iv",
+        "--password-mode=bytes",
+        "--encrypt",
+        "user",
+        "owner",
+        "128",
+        "--use-aes=y",
+        "--",
+        src.to_str().unwrap(),
+        "--pages",
+        ".",
+        "1-3",
+        "--",
+        "--split-pages=1",
+        qtemplate.to_str().unwrap(),
+    ];
+    let (qpdf_ok, qpdf_stdout) = run_qpdf(&qpdf_args);
+    assert!(
+        qpdf_ok,
+        "qpdf pages+encrypt+split should succeed: {qpdf_stdout}"
+    );
+
+    Command::cargo_bin("flpdf")
+        .unwrap()
+        .args([
+            "--static-id",
+            "--static-aes-iv",
+            "--password-mode=bytes",
+            "--encrypt",
+            "user",
+            "owner",
+            "128",
+            "--use-aes=y",
+            "--",
+        ])
+        .arg(&src)
+        .args(["--pages", ".", "1-3", "--", "--split-pages=1"])
+        .arg(&ftemplate)
+        .assert()
+        .success();
+
+    let expected = vec![
+        "encrypted-1.pdf".to_owned(),
+        "encrypted-2.pdf".to_owned(),
+        "encrypted-3.pdf".to_owned(),
+    ];
+    assert_eq!(split_outputs(qdir.path()), expected);
+    assert_eq!(split_outputs(fdir.path()), expected);
+    for name in expected {
+        let qpath = qdir.path().join(&name);
+        let fpath = fdir.path().join(&name);
+        assert_eq!(npages_of_with_password(&qpath, "user"), 1);
+        assert_eq!(npages_of_with_password(&fpath, "user"), 1);
+        assert_qpdf_encrypted_output(&qpath, "user");
+        assert_qpdf_encrypted_output(&fpath, "user");
+        #[cfg(feature = "qpdf-zlib-compat")]
+        assert_eq!(
+            std::fs::read(&qpath).unwrap(),
+            std::fs::read(&fpath).unwrap(),
+            "encrypted split chunk {name} must be byte-identical to qpdf"
+        );
+    }
+}
+
 // ===========================================================================
 // --collate : interleave parity
 // ===========================================================================
@@ -3342,4 +3422,164 @@ fn pages_newline_before_endstream_matches_qpdf_bytes() {
         flpdf_bytes, qpdf_bytes,
         "--pages output with --newline-before-endstream must match qpdf byte-for-byte"
     );
+}
+
+/// An explicit `--encrypt` alongside a page operation must win over the
+/// implicit carryover of the primary's own encryption. The two are mutually
+/// exclusive in the writer, so getting this wrong silently discards the
+/// requested passwords and leaves the output openable with the source's
+/// credentials -- the opposite of what was asked for.
+#[test]
+fn pages_explicit_encrypt_overrides_source_encryption_like_qpdf() {
+    if !qpdf_available() {
+        eprintln!("[SKIP page_ops_qpdf_matrix] qpdf {EXPECTED_QPDF_VERSION} is unavailable");
+        return;
+    }
+
+    let temp = tempfile::tempdir().expect("temporary directory");
+    let source = temp.path().join("source.pdf");
+    let (ok, _) = run_qpdf(&[
+        "--static-id",
+        fixture_abs(THREE_PAGE).to_str().unwrap(),
+        "--encrypt",
+        "--user-password=source-user",
+        "--owner-password=source-owner",
+        "--bits=256",
+        "--",
+        source.to_str().unwrap(),
+    ]);
+    assert!(ok, "qpdf should build the encrypted source fixture");
+
+    for (label, output) in [
+        ("qpdf", temp.path().join("qpdf.pdf")),
+        ("flpdf", temp.path().join("flpdf.pdf")),
+    ] {
+        let args = [
+            "--static-id",
+            "--password=source-user",
+            source.to_str().unwrap(),
+            "--pages",
+            ".",
+            "1-2",
+            "--",
+            "--encrypt",
+            "--user-password=fresh-user",
+            "--owner-password=fresh-owner",
+            "--bits=256",
+            "--",
+            output.to_str().unwrap(),
+        ];
+        if label == "qpdf" {
+            let (ok, _) = run_qpdf(&args);
+            assert!(ok, "qpdf should re-encrypt while selecting pages");
+        } else {
+            Command::cargo_bin("flpdf")
+                .unwrap()
+                .env("FLPDF_STATIC_ID_QUIET", "1")
+                .args(args)
+                .assert()
+                .success();
+        }
+
+        assert_qpdf_encrypted_output(&output, "fresh-user");
+        assert_qpdf_rejects_password(&output, "source-user");
+    }
+}
+
+/// Without an explicit `--encrypt`, the primary's encryption still carries over
+/// to the page-operation output, so the fix above must not disable the donor
+/// path it guards.
+#[test]
+fn pages_without_explicit_encrypt_still_carries_source_encryption() {
+    if !qpdf_available() {
+        eprintln!("[SKIP page_ops_qpdf_matrix] qpdf {EXPECTED_QPDF_VERSION} is unavailable");
+        return;
+    }
+
+    let temp = tempfile::tempdir().expect("temporary directory");
+    let source = temp.path().join("source.pdf");
+    let (ok, _) = run_qpdf(&[
+        "--static-id",
+        fixture_abs(THREE_PAGE).to_str().unwrap(),
+        "--encrypt",
+        "--user-password=source-user",
+        "--owner-password=source-owner",
+        "--bits=256",
+        "--",
+        source.to_str().unwrap(),
+    ]);
+    assert!(ok, "qpdf should build the encrypted source fixture");
+
+    let output = temp.path().join("flpdf.pdf");
+    Command::cargo_bin("flpdf")
+        .unwrap()
+        .env("FLPDF_STATIC_ID_QUIET", "1")
+        .args([
+            "--static-id",
+            "--password=source-user",
+            source.to_str().unwrap(),
+            "--pages",
+            ".",
+            "1-2",
+            "--",
+            output.to_str().unwrap(),
+        ])
+        .assert()
+        .success();
+
+    assert_qpdf_encrypted_output(&output, "source-user");
+}
+
+/// `--allow-weak-crypto` is what lets RC4 through the write gate. The
+/// page-operation route accepts an explicit `--encrypt`, so it has to honour
+/// that opt-in as the plain rewrite routes already do.
+#[test]
+fn pages_allow_weak_crypto_permits_rc4_like_qpdf() {
+    if !qpdf_available() {
+        eprintln!("[SKIP page_ops_qpdf_matrix] qpdf {EXPECTED_QPDF_VERSION} is unavailable");
+        return;
+    }
+
+    let temp = tempfile::tempdir().expect("temporary directory");
+    let qpdf_output = temp.path().join("qpdf.pdf");
+    let (ok, _) = run_qpdf(&[
+        "--static-id",
+        "--allow-weak-crypto",
+        fixture_abs(THREE_PAGE).to_str().unwrap(),
+        "--pages",
+        ".",
+        "1-2",
+        "--",
+        "--encrypt",
+        "user",
+        "owner",
+        "40",
+        "--",
+        qpdf_output.to_str().unwrap(),
+    ]);
+    assert!(ok, "qpdf 11.9.0 accepts RC4 under --allow-weak-crypto");
+    assert_qpdf_encrypted_output(&qpdf_output, "user");
+
+    let flpdf_output = temp.path().join("flpdf.pdf");
+    Command::cargo_bin("flpdf")
+        .unwrap()
+        .env("FLPDF_STATIC_ID_QUIET", "1")
+        .args([
+            "--static-id",
+            "--allow-weak-crypto",
+            fixture_abs(THREE_PAGE).to_str().unwrap(),
+            "--pages",
+            ".",
+            "1-2",
+            "--",
+            "--encrypt",
+            "user",
+            "owner",
+            "40",
+            "--",
+            flpdf_output.to_str().unwrap(),
+        ])
+        .assert()
+        .success();
+    assert_qpdf_encrypted_output(&flpdf_output, "user");
 }

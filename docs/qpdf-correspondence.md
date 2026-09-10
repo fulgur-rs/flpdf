@@ -1362,6 +1362,14 @@ linearization 設定を再適用する（`crates/flpdf-cli/src/main.rs` の
 `crates/flpdf/src/job/page_split.rs`）。rewrite の linearized branch でも
 `--flatten-rotation` を writer planning 前に実行する。
 
+2026-09-10（`flpdf-0saq`）: qpdf は `writeQPDF` から `doSplitPages` に入り、各 chunk
+ごとに生成する `QPDFWriter` へ `setWriterOptions` を適用する（`QPDFJob.cc:483-511,2847-2903,2939-3027`）。
+flpdf の top-level / `rewrite` page-operation route も、ページ選択後の canonical writer
+設定へ明示的な `--encrypt` を渡し、`--split-pages` の全 chunk を暗号化する。qpdf 11.9.0
+との V4 AES-128 byte comparison を `page_ops_qpdf_matrix.rs::pages_encrypt_then_split_outputs_encrypted_chunks_like_qpdf`
+で固定した。`--copy-encryption`、`--decrypt`、`--coalesce-contents` など別の未対応組合せは
+この変更の対象外である。
+
 `QPDF::initializeEncryption` (`QPDF_encryption.cc:718-751`) は、`/ID` が無い、配列でない、
 要素数が2でない、または第1要素が文字列でない場合に `invalid /ID in trailer dictionary` を
 warning として記録し、空の `id1` で暗号鍵導出を継続する。`flpdf-ez48` で
