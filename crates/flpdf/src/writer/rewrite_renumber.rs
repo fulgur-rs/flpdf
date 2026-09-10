@@ -124,7 +124,7 @@ impl CanonicalCatalogFirstRenumber {
         let root_ref = pdf.root_ref();
         let direct_root = if root_ref.is_none() {
             let candidate = pdf.trailer_key_handle(b"Root");
-            if candidate.is_null() {
+            if candidate.try_is_null()? {
                 return Err(Error::Unsupported(
                     "plain rewrite: trailer has no /Root".to_string(),
                 ));
@@ -206,7 +206,6 @@ impl CanonicalCatalogFirstRenumber {
 
         while let Some(source) = queue.pop_front() {
             let handle = pdf.get_object_handle(source);
-            pdf.resolve(&handle)?;
             let mut found = Vec::new();
             collect_canonical_children_with_stream_policy(
                 pdf,
@@ -288,7 +287,6 @@ fn collect_canonical_children_with_stream_policy<R: Read + Seek>(
                 .to_string(),
         ));
     }
-    pdf.resolve(handle)?;
     if let Some(items) = handle.try_as_array()? {
         for item in items {
             collect_canonical_enqueue_refs_with_stream_policy(
@@ -318,7 +316,6 @@ fn collect_canonical_children_with_stream_policy<R: Read + Seek>(
         return Ok(());
     }
     if let Some(stream_dict) = handle.as_stream_dict() {
-        pdf.resolve(&stream_dict)?;
         let skip_stream_parameters = stream_parameters_removed
             .map(|predicate| predicate(handle))
             .transpose()?
@@ -431,7 +428,6 @@ pub(crate) fn reachable_object_set_with_stream_parameters<R: Read + Seek>(
     }
     while let Some(cur) = queue.pop_front() {
         let handle = pdf.get_object_handle(cur);
-        pdf.resolve(&handle)?;
         let mut found = Vec::new();
         collect_canonical_children_with_stream_policy(
             pdf,
@@ -512,7 +508,6 @@ pub(crate) fn resurrectable_null_refs_excluding<R: Read + Seek>(
             continue;
         }
         let handle = pdf.get_object_handle(cur);
-        pdf.resolve(&handle)?;
         let mut follow: Vec<ObjectRef> = Vec::new();
         let mut state = ResurrectableWalkState {
             follow: &mut follow,
@@ -741,7 +736,7 @@ impl ObjectStreamRenumber {
         let root_ref = pdf.root_ref();
         let direct_root = if root_ref.is_none() {
             let candidate = pdf.trailer_key_handle(b"Root");
-            if candidate.is_null() {
+            if candidate.try_is_null()? {
                 return Err(Error::Unsupported(
                     "object-stream renumber: trailer has no /Root".to_string(),
                 ));
@@ -818,7 +813,6 @@ impl ObjectStreamRenumber {
             match work {
                 RenumberWork::Ordinary(cur) => {
                     let handle = pdf.get_object_handle(cur);
-                    pdf.resolve(&handle)?;
                     let mut found = Vec::new();
                     collect_canonical_children_with_stream_policy(
                         pdf,
@@ -855,8 +849,7 @@ impl ObjectStreamRenumber {
                         continue;
                     }
                     let handle = pdf.get_object_handle(source);
-                    pdf.resolve(&handle)?;
-                    if handle.is_null() {
+                    if handle.try_is_null()? {
                         continue;
                     }
                     let stream_dict = handle.as_stream_dict().ok_or_else(|| {
@@ -972,9 +965,12 @@ fn enqueue(
 
 #[cfg(test)]
 mod tests {
-    use super::{ensure_canonical_owner, walk_resurrectable_handle, ResurrectableWalkState};
+    use super::{
+        collect_canonical_children, ensure_canonical_owner, walk_resurrectable_handle,
+        ResurrectableWalkState,
+    };
     use crate::parser::MAX_PARSE_DEPTH;
-    use crate::{Error, ObjectHandle, Pdf};
+    use crate::{Error, ObjectHandle, ObjectRef, Pdf};
     use std::collections::BTreeSet;
 
     #[test]
@@ -1012,5 +1008,39 @@ mod tests {
         )
         .expect_err("the resurrectable walk has a parser-depth guard");
         assert!(error.to_string().contains("MAX_PARSE_DEPTH"));
+    }
+
+    #[test]
+    fn canonical_children_propagate_resolution_errors() {
+        let mut pdf = Pdf::empty().expect("create a document for the walk");
+        let unresolved = ObjectHandle::new_indirect_unresolved(ObjectRef::new(91, 0), -1);
+        let mut found = Vec::new();
+
+        let error = collect_canonical_children(&mut pdf, &unresolved, 0, false, &mut found)
+            .expect_err("an unresolved child must remain a fallible traversal");
+        assert!(matches!(
+            error,
+            Error::Internal(message) if message == "object 91 0 belongs to a dropped PDF"
+        ));
+    }
+
+    #[test]
+    fn resurrectable_walk_propagates_resolution_errors() {
+        let unresolved = ObjectHandle::new_indirect_unresolved(ObjectRef::new(92, 0), -1);
+        let mut follow = Vec::new();
+        let mut result = BTreeSet::new();
+        let removed_refs = BTreeSet::new();
+        let mut state = ResurrectableWalkState {
+            follow: &mut follow,
+            result: &mut result,
+            removed_refs: &removed_refs,
+        };
+
+        let error = walk_resurrectable_handle(&unresolved, 0, false, false, &mut state)
+            .expect_err("the resurrectable walk must propagate resolution errors");
+        assert!(matches!(
+            error,
+            Error::Internal(message) if message == "object 92 0 belongs to a dropped PDF"
+        ));
     }
 }

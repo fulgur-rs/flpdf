@@ -636,6 +636,32 @@ counterpart are performed only after `try_dereference`, rather than using a
 warning-producing fallback. qtest exceptions and unrelated rendering,
 writer/CLI, and stream routes remain outside this bounded slice.
 
+### A6/A7/A8 writer rewrite-renumber accessor slice `flpdf-3yn9.48.23.18` (2026-09-10)
+
+The production `writer/rewrite_renumber.rs` walk now follows qpdf's writer
+queue boundary. `QPDFWriter::enqueueObject` keeps indirect identity separate
+from direct recursive array/dictionary traversal, and `writeStandard` consumes
+the resulting breadth-first queue (`libqpdf/QPDFWriter.cc:1072-1141,2907-3044`).
+`writeObjectStream` preserves its source/member two-pass behavior and
+`/Extends` handling (`libqpdf/QPDFWriter.cc:1606-1758`). Every qpdf typed/null
+observation dereferences at entry (`libqpdf/QPDFObjectHandle.cc:240-446,
+857-866,965-1015`); `isIndirect` remains an identity predicate that does not
+resolve (`include/qpdf/QPDFObjectHandle.hh:353,1630-1645`).
+
+The fresh scoped census had seven `Pdf::resolve` sites and three
+non-resolving `is_null` sites. The post-cutover production census is zero for
+those bridges and for the removable non-resolving dictionary/array/integer/name
+and key accessors. `try_as_array`, `try_as_dictionary`, and `try_is_null` now
+own the corresponding boundaries; `as_stream_dict` is retained only after a
+canonical dereference supplied by those accessors. Catalog-first BFS,
+array-versus-dictionary null visibility, stream `/Length`/parameter exclusions,
+removed-reference filtering, source-backed object-stream membership and
+`/Extends`, and depth/error propagation are unchanged. The production route
+contract is extended in `crates/flpdf/tests/rewrite_renumber_module_route_tests.rs`,
+and `canonical_children_propagate_resolution_errors` verifies fallible child
+resolution. qtest and qtest-exceptions routes, active `.48.7/.48.10/.48.49`
+sessions, and shared writer emission ownership remain outside this slice.
+
 ### 2026-09-10 current caller audit: optimization bounded cutover
 
 `flpdf-3yn9.48.23.11` migrated the non-qtest production callers in

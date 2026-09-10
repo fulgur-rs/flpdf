@@ -81,6 +81,21 @@ fn cfg_test_item_body_end(body: &str) -> Option<usize> {
     None
 }
 
+fn production_function_body<'a>(source: &'a str, function_name: &str) -> &'a str {
+    let signature = format!("fn {function_name}");
+    let start = source
+        .find(&signature)
+        .unwrap_or_else(|| panic!("{function_name} must remain in the production source"));
+    let after_signature = &source[start..];
+    let brace_start = after_signature
+        .find('{')
+        .unwrap_or_else(|| panic!("{function_name} must have a body"));
+    let body = &after_signature[brace_start..];
+    let end = cfg_test_item_body_end(body)
+        .unwrap_or_else(|| panic!("{function_name} must have balanced braces"));
+    &body[..end]
+}
+
 /// Remove every `#[cfg(test)]`-attributed item's full body (not just the
 /// text before the first marker) so a scan of the remainder covers all
 /// production code, including any that follows an early test-only item.
@@ -140,5 +155,68 @@ fn production_renumber_route_has_only_the_canonical_handle_engine() {
             !contains_token(&production, forbidden),
             "production renumbering still contains obsolete raw engine token {forbidden:?}"
         );
+    }
+}
+
+#[test]
+fn production_renumber_walk_uses_resolving_handle_accessors() {
+    let source = fs::read_to_string(source_root().join("writer/rewrite_renumber.rs"))
+        .expect("rewrite_renumber.rs must be readable");
+    let production = strip_cfg_test_items(&source);
+
+    for forbidden in [
+        ".resolve(",
+        ".resolve_handle(",
+        ".resolve_handle_ref(",
+        ".get_key(",
+        ".has_key(",
+        ".as_dictionary(",
+        ".as_array(",
+        ".as_integer(",
+        ".as_name(",
+        ".is_null(",
+    ] {
+        assert!(
+            !production.contains(forbidden),
+            "rewrite_renumber production retains legacy accessor route {forbidden}"
+        );
+    }
+
+    assert!(
+        production.contains("try_as_array")
+            && production.contains("try_as_dictionary")
+            && production.contains("try_is_null"),
+        "rewrite_renumber production must use canonical resolving accessors"
+    );
+}
+
+#[test]
+fn stream_dictionary_observations_follow_canonical_resolution() {
+    let source = fs::read_to_string(source_root().join("writer/rewrite_renumber.rs"))
+        .expect("rewrite_renumber.rs must be readable");
+    let production = strip_cfg_test_items(&source);
+
+    for function_name in [
+        "collect_canonical_children_with_stream_policy",
+        "walk_resurrectable_handle",
+    ] {
+        let body = production_function_body(&production, function_name);
+        let mut search_from = 0;
+        while let Some(relative) = body[search_from..].find("as_stream_dict(") {
+            let stream_offset = search_from + relative;
+            let prefix = &body[..stream_offset];
+            assert!(
+                [
+                    "try_dereference(",
+                    "try_is_null(",
+                    "try_as_array(",
+                    "try_as_dictionary(",
+                ]
+                .iter()
+                .any(|accessor| prefix.contains(accessor)),
+                "{function_name} must resolve before observing a stream dictionary"
+            );
+            search_from = stream_offset + "as_stream_dict(".len();
+        }
     }
 }
