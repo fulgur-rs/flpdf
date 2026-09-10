@@ -1,5 +1,6 @@
 use std::fs;
 use std::path::Path;
+use std::process::Command;
 use yaml_rust2::{Yaml, YamlLoader};
 
 const CI_WORKFLOW: &str = include_str!("../../../.github/workflows/ci.yml");
@@ -438,6 +439,137 @@ fn test_job_contains_test_command(workflow: &str, command: &str) -> ContractResu
     Ok(total_raw_command_occurrences == 1
         && total_exact_command_lines == 1
         && executable_command_lines == 1)
+}
+
+fn listed_test_count(output: &str) -> usize {
+    output
+        .lines()
+        .map(str::trim)
+        .filter(|line| line.ends_with(": test"))
+        .count()
+}
+
+fn cargo_test_command_has_filter(command: &str) -> bool {
+    let words = command.split_whitespace().collect::<Vec<_>>();
+    if words.first() != Some(&"cargo") || words.get(1) != Some(&"test") {
+        return false;
+    }
+
+    for (index, word) in words.iter().enumerate() {
+        match *word {
+            "--lib" => {
+                return words
+                    .get(index + 1)
+                    .is_some_and(|filter| *filter != "--" && !filter.starts_with('-'));
+            }
+            "--test" => {
+                let target = index + 1;
+                let filter = index + 2;
+                if words.get(target).is_none() {
+                    return false;
+                }
+                return words
+                    .get(filter)
+                    .is_some_and(|value| *value != "--" && !value.starts_with('-'));
+            }
+            _ => {}
+        }
+    }
+
+    false
+}
+
+fn workflow_filtered_cargo_test_commands(workflow: &str) -> ContractResult<Vec<String>> {
+    let workflow = parse_workflow(workflow)?;
+    let jobs =
+        mapping_get(&workflow, "jobs").ok_or_else(|| "ci workflow must define jobs".to_owned())?;
+    let jobs = require_mapping(jobs, "workflow.jobs")?
+        .as_hash()
+        .expect("required mapping must remain a mapping");
+    let mut commands = Vec::new();
+
+    for job in jobs.values() {
+        let Some(steps) = mapping_get(job, "steps") else {
+            continue;
+        };
+        let steps = steps
+            .as_vec()
+            .ok_or_else(|| "job.steps must be a sequence".to_owned())?;
+        for step in steps {
+            // Conditional commands run only on a subset of the matrix (for
+            // example the system-libjpeg check is Linux amd64-only). The
+            // contract itself runs on every supported host, so validating
+            // those commands here would report false zero-match failures on
+            // platforms where their feature dependencies are intentionally
+            // absent. Unconditional filters are checked below on every host.
+            if mapping_contains_key(step, "if") {
+                continue;
+            }
+            let Some(run) = mapping_get(step, "run").and_then(Yaml::as_str) else {
+                continue;
+            };
+            for line in shell_script_without_comments(run).lines() {
+                let command = line.trim();
+                if cargo_test_command_has_filter(command) {
+                    commands.push(command.to_owned());
+                }
+            }
+        }
+    }
+
+    Ok(commands)
+}
+
+fn assert_filtered_cargo_tests_are_nonempty(workflow: &str) -> ContractResult<()> {
+    let workspace = Path::new(env!("CARGO_MANIFEST_DIR")).join("../..");
+    for command in workflow_filtered_cargo_test_commands(workflow)? {
+        let mut words = command.split_whitespace();
+        let _cargo = words.next();
+        let test = words.next().expect("filtered command must be cargo test");
+        let mut args = vec![test];
+        for word in words {
+            if word == "--" {
+                break;
+            }
+            args.push(word);
+        }
+        let output = Command::new("cargo")
+            .args(&args)
+            .args(["--", "--list"])
+            .current_dir(&workspace)
+            .output()
+            .map_err(|error| format!("failed to list tests for `{command}`: {error}"))?;
+        if !output.status.success() {
+            return Err(format!(
+                "filtered workflow command failed under --list: `{command}`\nstderr: {}",
+                String::from_utf8_lossy(&output.stderr)
+            ));
+        }
+        let stdout = String::from_utf8_lossy(&output.stdout);
+        let count = listed_test_count(&stdout);
+        if count == 0 {
+            return Err(format!(
+                "filtered workflow command matched zero tests: `{command}`"
+            ));
+        }
+    }
+    Ok(())
+}
+
+#[test]
+fn listed_test_count_distinguishes_a_real_filter_from_zero_matches() {
+    assert_eq!(listed_test_count("running 0 tests\n"), 0);
+    assert_eq!(listed_test_count("test one_case: test\n"), 1);
+    assert_eq!(
+        listed_test_count("test one_case: test\ntest two_case: test\n"),
+        2
+    );
+}
+
+#[test]
+fn workflow_filtered_cargo_tests_match_at_least_one_test() {
+    assert_filtered_cargo_tests_are_nonempty(CI_WORKFLOW)
+        .expect("every filtered cargo test command in CI must list a test");
 }
 
 fn test_job_contains_conditional_commands(
