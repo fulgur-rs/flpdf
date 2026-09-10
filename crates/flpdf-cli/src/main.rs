@@ -3666,6 +3666,12 @@ fn main() {
             &args.password,
             args.no_warn,
         );
+        if args.decrypt {
+            // qpdf applies --decrypt at the writer boundary after page
+            // selection, so page-operation output must not preserve the
+            // authenticated primary's encryption.
+            options.preserve_encryption = false;
+        }
         run_page_operations_with_qpdf_job(
             &args,
             options,
