@@ -7,8 +7,7 @@
 //! documents stay alive for the whole operation, matching qpdf's page heap.
 
 use super::page_merge::{
-    merge_documents_with_resource_decisions_and_preserve_primary_into,
-    source_top_level_field_names, MergeInput,
+    merge_documents_for_page_specs_into, source_top_level_field_names, MergeInput,
 };
 use super::page_plan::PagePlan;
 use super::resource_pruning::{
@@ -367,12 +366,7 @@ fn merge_preserving_primary_into<R: Read + Seek, T: Read + Seek>(
     remove_resources: &[bool],
     target: Pdf<T>,
 ) -> Result<Pdf<T>> {
-    merge_documents_with_resource_decisions_and_preserve_primary_into(
-        inputs,
-        remove_resources,
-        true,
-        target,
-    )
+    merge_documents_for_page_specs_into(inputs, remove_resources, true, target)
 }
 
 /// A selected page represented by its source and its occurrence within the
@@ -454,10 +448,53 @@ fn replace_merged_fields<T: Read + Seek>(
     let Some(_) = acroform.try_as_dictionary()? else {
         return Ok(());
     };
-    if fields.is_empty() {
-        root.remove_key(b"/AcroForm");
+    // qpdf does not perform the final `/AcroForm` removal until after every
+    // foreign `fixCopiedAnnotations` event (`QPDFJob.cc:2517-2585,2609-2629`).
+    // Keep the primary AcroForm itself, including its direct representation
+    // and `/DR`, alive while those events append their copied fields. The
+    // caller removes this temporary empty array only after replay completes.
+    let fields_holder = acroform.try_get_key(b"/Fields")?;
+    let replacement = ObjectHandle::array(fields);
+    let replacement = if fields_holder.is_indirect() {
+        // qpdf allocates a fresh indirect array when the original `/Fields`
+        // holder was indirect (`QPDFJob.cc:2615-2618`).
+        merged.make_indirect_object_handle(replacement)?
     } else {
-        acroform.replace_key(b"/Fields", ObjectHandle::array(fields))?;
+        replacement
+    };
+    acroform.replace_key(b"/Fields", replacement)?;
+    Ok(())
+}
+
+/// Apply qpdf's final empty-field AcroForm removal after occurrence replay.
+///
+/// This is deliberately separate from [`replace_merged_fields`]: removing the
+/// primary AcroForm before a foreign page is replayed loses the primary `/DR`
+/// merge base and changes a direct catalog child into a newly created indirect
+/// AcroForm (`QPDFJob.cc:2609-2629`).
+fn remove_empty_acroform_after_replay<T: Read + Seek>(
+    merged: &mut Pdf<T>,
+    had_fields_array: bool,
+) -> Result<()> {
+    if !had_fields_array {
+        return Ok(());
+    }
+    let Some(root_ref) = merged.root_ref() else {
+        return Ok(());
+    };
+    let root = merged.get_object_handle(root_ref);
+    let acroform = root.try_get_key(b"/AcroForm")?;
+    acroform.try_dereference()?;
+    if acroform.try_as_dictionary()?.is_none() {
+        return Ok(());
+    }
+    let fields = acroform.try_get_key(b"/Fields")?;
+    fields.try_dereference()?;
+    if fields
+        .try_as_array()?
+        .is_some_and(|fields| fields.is_empty())
+    {
+        root.remove_key(b"/AcroForm");
     }
     Ok(())
 }
@@ -544,15 +581,6 @@ fn rebuild_acroform_in_final_page_order<R: Read + Seek + 'static, T: Read + Seek
         None => BTreeSet::new(),
     };
 
-    // qpdf's branch is based on document ownership. The primary's first
-    // occurrence remains on the primary route; repeated primary pages use the
-    // same-document copier; only a secondary source with an AcroForm enters
-    // the foreign resource/field route.
-    let source_has_acroform: Vec<bool> = sources
-        .iter_mut()
-        .map(|source| source.acroform()?.has_acro_form())
-        .collect::<Result<_>>()?;
-
     // qpdf's foreign ObjCopier has already mapped each source page to the first
     // output page inserted for that source page. When a copied widget's `/P`
     // is encountered during a later field-tree copy, it therefore retains the
@@ -619,10 +647,11 @@ fn rebuild_acroform_in_final_page_order<R: Read + Seek + 'static, T: Read + Seek
             .ok_or(Error::Missing("first output page for source page"))?;
         let is_primary_first = source_index == 0 && first_output_page == final_refs[output_index];
 
-        if is_primary_first || (!source_has_acroform[source_index] && source_index != 0) {
-            // The grouped page copy already owns these annotations. Keep them
-            // for qpdf's primary-first and foreign-no-AcroForm branches, but
-            // repair `/P` after the grouped→final page-order reconstruction.
+        if is_primary_first {
+            // The grouped page copy already owns the primary's first
+            // occurrence annotations. Repair `/P` after the grouped→final
+            // page-order reconstruction; qpdf does not run
+            // fixCopiedAnnotations on this occurrence.
             set_annotation_page_refs(merged, final_refs[output_index], first_output_page)?;
             continue;
         }
@@ -653,6 +682,7 @@ fn rebuild_acroform_in_final_page_order<R: Read + Seek + 'static, T: Read + Seek
         }
     }
 
+    remove_empty_acroform_after_replay(merged, had_fields_array)?;
     Ok(())
 }
 
@@ -867,12 +897,8 @@ fn handle_page_specs_into<R: Read + Seek + 'static, T: Read + Seek + 'static>(
     let mut merged = if preserve_unreferenced {
         merge_preserving_primary_into(&mut merge_inputs, &remove_resources, target)?
     } else {
-        merge_documents_with_resource_decisions_and_preserve_primary_into(
-            &mut merge_inputs,
-            &remove_resources,
-            false,
-            target,
-        )? // cov:ignore: llvm-cov attributes this executed multiline merge call to its closing delimiter
+        merge_documents_for_page_specs_into(&mut merge_inputs, &remove_resources, false, target)?
+        // cov:ignore: llvm-cov attributes this executed multiline merge call to its closing delimiter
     };
     drop(merge_inputs);
 
@@ -1400,19 +1426,29 @@ mod tests {
         let mut merged = pdf_without_root();
         replace_merged_fields(&mut merged, Vec::new(), true)
             .expect("a missing merged root has no AcroForm to rebuild, even past the gate");
+        remove_empty_acroform_after_replay(&mut merged, true)
+            .expect("a missing merged root has no AcroForm to remove");
     }
 
     #[test]
-    fn replace_merged_fields_removes_acroform_when_no_fields_survive() {
+    fn replace_merged_fields_defers_empty_acroform_removal_until_replay_finishes() {
         let mut merged = acroform_pdf();
         replace_merged_fields(&mut merged, Vec::new(), true)
-            .expect("an empty survivor list removes /AcroForm");
+            .expect("an empty survivor list leaves the replay base in place");
         let root_ref = merged.root_ref().expect("root");
+        assert!(
+            !resolved_object(&mut merged, root_ref)
+                .get_key(b"/AcroForm")
+                .is_null(),
+            "qpdf keeps /AcroForm alive through foreign annotation replay"
+        );
+        remove_empty_acroform_after_replay(&mut merged, true)
+            .expect("final replay cleanup removes an empty /AcroForm");
         assert!(
             resolved_object(&mut merged, root_ref)
                 .get_key(b"/AcroForm")
                 .is_null(),
-            "qpdf removes /AcroForm entirely once the filtered field count reaches zero"
+            "qpdf removes /AcroForm after the filtered field count reaches zero"
         );
     }
 

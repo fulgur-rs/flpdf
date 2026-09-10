@@ -7,10 +7,10 @@ use clap::{
 };
 use flpdf::fix_qdf;
 use flpdf::job::{
-    copy_duplicate_page_annotations, should_remove_unreferenced_resources, AttachmentAddOptions,
-    AttachmentCopyOptions, CheckError, FlattenAnnotationsMode, ImageOptimizationOptions,
-    JobExitCode, JsonJobError, JsonJobOptions, JsonJobOutput, JsonStreamData, PageSpecInput,
-    PageSpecJobOutput, QPDFJob, RemoveUnreferencedResources, SplitPageOptions,
+    copy_duplicate_page_annotations, AttachmentAddOptions, AttachmentCopyOptions, CheckError,
+    FlattenAnnotationsMode, ImageOptimizationOptions, JobExitCode, JsonJobError, JsonJobOptions,
+    JsonJobOutput, JsonStreamData, PageSpecInput, PageSpecJobOutput, QPDFJob,
+    RemoveUnreferencedResources, SplitPageOptions,
 };
 use flpdf::pipeline::{FlateAction, Pipeline, PipelineHandle, PlFlate, PlStdioFile};
 use flpdf::qutil::same_file as qpdf_same_file;
@@ -1304,7 +1304,8 @@ struct Cli {
 
     /// Flatten annotations into page content (top-level alias of
     /// `rewrite --flatten-annotations`; qpdf `--flatten-annotations`
-    /// equivalent). Values are `all`, `screen`, or `print`.
+    /// equivalent). Values are `all`, `screen`, or `print`. qpdf applies this
+    /// after page selection when `--pages` is present.
     // `json_output` has no dedicated dispatch check of its own (unlike
     // `json`, which lists `flatten_annotations` on its own conflicts_with_all
     // for the same reason): without it, `--flatten-annotations=all
@@ -1322,7 +1323,6 @@ struct Cli {
             "check", "show_object",
             "show_npages", "show_pages", "show_xref", "show_linearization",
             "show_encryption",
-            "pages", "rotate", "split_pages", "empty",
             "json_output",
         ],
         help = "Flatten annotations into page content; MODE is all, screen, or print",
@@ -1347,15 +1347,12 @@ struct Cli {
     /// dispatches to `doInspection` (`QPDFJob.cc:473,484-491,2178-2180`), and
     /// `checkConfiguration` (`QPDFJob.cc:566-641`) rejects no combination, so
     /// the read-only inspection modes accept this flag and observe the
-    /// transformed document. It stays rejected against page-operation modes,
-    /// whose dispatch still does not consume this transformation. Attachment
+    /// transformed document. It remains available after page-operation modes,
+    /// whose selected document is transformed before writing. Attachment
     /// inspection and rewrite routes use the same canonical job phase. Combining
     /// with `--linearize` is supported (threaded through the linearize branch
     /// of `run_rewrite`), so it is intentionally absent from this list.
-    #[arg(long = "generate-appearances",
-          conflicts_with_all = [
-              "pages", "rotate", "split_pages", "json_output",
-          ])]
+    #[arg(long = "generate-appearances", conflicts_with_all = ["json_output"])]
     generate_appearances: bool,
 
     /// Recompress eligible non-JPEG images as DCT/JPEG (qpdf
@@ -3681,6 +3678,8 @@ fn main() {
                     args.linearize,
                     args.linearize_pass1.as_deref(),
                     top_level_image_transform_options,
+                    args.generate_appearances,
+                    args.flatten_annotations,
                     args.flatten_rotation,
                     args.verbose,
                     args.no_warn,
@@ -3704,6 +3703,8 @@ fn main() {
                         args.linearize,
                         args.linearize_pass1.as_deref(),
                         top_level_image_transform_options,
+                        args.generate_appearances,
+                        args.flatten_annotations,
                         args.flatten_rotation,
                         args.verbose,
                         args.no_warn,
@@ -4915,6 +4916,8 @@ fn run_command(command: Commands, overlay_specs: &[OverlaySpec]) -> CliResult<()
                         cmd.linearize,
                         None,
                         image_transform_options,
+                        cmd.generate_appearances,
+                        cmd.flatten_annotations,
                         cmd.flatten_rotation,
                         cmd.verbose,
                         false,
@@ -4934,6 +4937,8 @@ fn run_command(command: Commands, overlay_specs: &[OverlaySpec]) -> CliResult<()
                         cmd.linearize,
                         None,
                         image_transform_options,
+                        cmd.generate_appearances,
+                        cmd.flatten_annotations,
                         cmd.flatten_rotation,
                         cmd.verbose,
                         false,
@@ -6749,6 +6754,8 @@ fn run_page_extraction(
     linearize: bool,
     linearize_pass1: Option<&Path>,
     image_options: ImageTransformOptions,
+    generate_appearances: bool,
+    flatten_annotations_mode: Option<CliFlattenMode>,
     flatten_rotation: bool,
     verbose: bool,
     no_warn: bool,
@@ -6855,6 +6862,8 @@ fn run_page_extraction(
                 linearize,
                 linearize_pass1,
                 image_options,
+                generate_appearances,
+                flatten_annotations_mode,
                 flatten_rotation,
                 verbose,
                 standard_output,
@@ -6875,6 +6884,8 @@ fn run_page_extraction(
                 linearize,
                 linearize_pass1,
                 image_options,
+                generate_appearances,
+                flatten_annotations_mode,
                 flatten_rotation,
                 verbose,
                 standard_output,
@@ -6902,6 +6913,8 @@ fn run_page_extraction(
             linearize,
             linearize_pass1,
             image_options,
+            generate_appearances,
+            flatten_annotations_mode,
             flatten_rotation,
             verbose,
             no_warn,
@@ -6924,6 +6937,8 @@ fn run_page_extraction(
         linearize,
         linearize_pass1,
         image_options,
+        generate_appearances,
+        flatten_annotations_mode,
         flatten_rotation,
         verbose,
         standard_output,
@@ -6953,6 +6968,8 @@ fn run_empty_page_extraction(
     linearize: bool,
     linearize_pass1: Option<&Path>,
     image_options: ImageTransformOptions,
+    generate_appearances: bool,
+    flatten_annotations_mode: Option<CliFlattenMode>,
     flatten_rotation: bool,
     verbose: bool,
     no_warn: bool,
@@ -7076,6 +7093,8 @@ fn run_empty_page_extraction(
         None,
         combined_pages,
         image_options,
+        generate_appearances,
+        flatten_annotations_mode,
         flatten_rotation,
         no_warn,
     )
@@ -7102,6 +7121,8 @@ fn run_page_extraction_from_multiple_sources(
     linearize: bool,
     linearize_pass1: Option<&Path>,
     image_options: ImageTransformOptions,
+    generate_appearances: bool,
+    flatten_annotations_mode: Option<CliFlattenMode>,
     flatten_rotation: bool,
     verbose: bool,
     no_warn: bool,
@@ -7259,6 +7280,8 @@ fn run_page_extraction_from_multiple_sources(
         None,
         combined_pages,
         image_options,
+        generate_appearances,
+        flatten_annotations_mode,
         flatten_rotation,
         no_warn,
     )
@@ -7278,6 +7301,8 @@ fn run_page_extraction_from_single_source<R: Read + Seek + 'static>(
     linearize: bool,
     linearize_pass1: Option<&Path>,
     image_options: ImageTransformOptions,
+    generate_appearances: bool,
+    flatten_annotations_mode: Option<CliFlattenMode>,
     flatten_rotation: bool,
     verbose: bool,
     standard_output: Option<PipelineWriter>,
@@ -7355,6 +7380,8 @@ fn run_page_extraction_from_single_source<R: Read + Seek + 'static>(
                 Some((result, prune_mode)),
                 combined_pages,
                 image_options,
+                generate_appearances,
+                flatten_annotations_mode,
                 flatten_rotation,
                 no_warn,
             )
@@ -7401,6 +7428,8 @@ fn run_page_extraction_from_single_source<R: Read + Seek + 'static>(
                 None,
                 combined_pages,
                 image_options,
+                generate_appearances,
+                flatten_annotations_mode,
                 flatten_rotation,
                 no_warn,
             )
@@ -7430,6 +7459,8 @@ fn run_page_extraction_after_plan<R: Read + Seek + 'static>(
     page_job_result: Option<(RebuildResult, RemoveUnreferencedResources)>,
     combined_pages: Vec<CombinedPage>,
     image_options: ImageTransformOptions,
+    generate_appearances: bool,
+    flatten_annotations_mode: Option<CliFlattenMode>,
     flatten_rotation: bool,
     no_warn: bool,
 ) -> CliResult<()> {
@@ -7439,22 +7470,17 @@ fn run_page_extraction_after_plan<R: Read + Seek + 'static>(
     let (result, prune_mode) = if let Some((result, prune_mode)) = page_job_result {
         (result, prune_mode)
     } else {
-        // qpdf's --pages Auto mode scans the source page tree before it
-        // removes the old pages. A page-local indirect /Resources that appears
-        // only once does not trigger the expensive page-helper pruning route;
-        // inherited or shared resources do (QPDFJob.cc:2251-2337). Preserve
-        // that decision before rebuild_page_tree flattens the original
-        // inheritance structure.
-        let prune_mode = if remove_unref == CliRemoveUnreferencedResources::Auto
-            && !should_remove_unreferenced_resources(pdf)?
-        {
-            CliRemoveUnreferencedResources::No
-        } else {
-            remove_unref
-        };
+        // Multi-source and empty-primary page jobs already performed qpdf's
+        // Auto|Yes|No resource decision on each source before copying pages
+        // (`QPDFJob.cc:2251-2455`). The merged target is only being presented
+        // to the shared completion boundary here; running the page-local
+        // resource pass again would mutate shared page/appearance resources
+        // a second time and split identities that qpdf preserves. Keep the
+        // original mode for the later doSplitPages preflight, but make this
+        // post-copy completion a resource no-op.
         let result = rebuild_page_tree(pdf, &selected)?;
         copy_duplicate_page_annotations(pdf, &result)?;
-        (result, prune_mode.into())
+        (result, RemoveUnreferencedResources::No)
     };
     QPDFJob::complete_in_place_page_selection(pdf, &result, prune_mode)?;
     apply_rotate_specs(pdf, &page_ops.rotate, &result.new_kids)?;
@@ -7525,15 +7551,25 @@ fn run_page_extraction_after_plan<R: Read + Seek + 'static>(
     };
 
     // The page-selection consumer has already completed qpdf's page copy,
-    // rotation, and underlay/overlay phases. Run the remaining rotation
-    // flattening through the canonical Job transformation owner so the same
-    // AcroForm/page-helper boundary is used for `--pages` as for ordinary
-    // rewrites (`QPDFJob.cc:466-473,2190-2194`).
-    if flatten_rotation {
-        let mut transform_job = QPDFJob::new();
+    // rotation, and underlay/overlay phases. Run every remaining
+    // `handleTransformations` option through the canonical Job transformation
+    // owner so the same AcroForm/page-helper boundary is used for `--pages` as
+    // for ordinary rewrites (`QPDFJob.cc:466-473,2177-2194`).
+    if generate_appearances || flatten_annotations_mode.is_some() || flatten_rotation {
+        let mut transform_job = new_cli_job(no_warn);
         transform_job.set_verbose(verbose);
-        transform_job.set_suppress_warnings(no_warn);
-        transform_job.config().flatten_rotation();
+        {
+            let mut configuration = transform_job.config();
+            if generate_appearances {
+                configuration.generate_appearances();
+            }
+            if let Some(mode) = flatten_annotations_mode {
+                configuration.flatten_annotations(FlattenAnnotationsMode::from(mode));
+            }
+            if flatten_rotation {
+                configuration.flatten_rotation();
+            }
+        }
         transform_job.apply_transformations(pdf)?;
     }
 

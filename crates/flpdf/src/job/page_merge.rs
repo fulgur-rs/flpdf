@@ -314,6 +314,10 @@ struct PrimaryAcroForm {
     /// gate, `QPDFJob.cc:2609-2610`). Drives [`build_merged_acroform`]'s
     /// decision to rebuild or remove `/AcroForm`, independent of `/DR`/`/DA`.
     had_fields_array: bool,
+    /// Whether the primary's original `/Fields` array was held indirectly.
+    /// qpdf preserves that holder shape when it installs the filtered array
+    /// (`QPDFJob.cc:2615-2618`).
+    fields_are_indirect: bool,
     /// Original names of every primary top-level field, including fields on
     /// pages that are not selected. qpdf keeps those fields in its collision
     /// index until the final page-pruning pass (`QPDFJob.cc:2516-2521,
@@ -355,6 +359,8 @@ fn discover_primary_acroform<R: Read + Seek>(source: &mut Pdf<R>) -> Result<Prim
         let da = acroform.try_get_key(b"/DA")?;
         out.has_dr = !dr.try_is_null()?;
         out.has_da = !da.try_is_null()?;
+        let fields = acroform.try_get_key(b"/Fields")?;
+        out.fields_are_indirect = fields.is_indirect() && fields.try_as_array()?.is_some();
     }
     Ok(out)
 }
@@ -475,6 +481,13 @@ fn build_merged_acroform<R: Read + Seek>(
     primary: &PrimaryAcroForm,
     kept: &[KeptField],
 ) -> Result<()> {
+    // qpdf's final field-prune gate is the original `/Fields` array, not the
+    // presence of `/DR` or `/DA` (`QPDFJob.cc:2609-2614`). If that key was
+    // absent and no selected foreign field requires `addFormField`, retain the
+    // primary AcroForm exactly as the Catalog copier installed it.
+    if kept.is_empty() && !primary.had_fields_array {
+        return Ok(());
+    }
     if kept.is_empty() && !primary.has_dr && !primary.has_da {
         if primary.had_fields_array {
             // The primary had a /Fields array (so the generic catalog copy
@@ -526,7 +539,13 @@ fn build_merged_acroform<R: Read + Seek>(
         }
         fields.push(target.get_object_handle(field.target_ref));
     }
-    acroform.replace_key(b"/Fields", ObjectHandle::array(fields))?;
+    let replacement = ObjectHandle::array(fields);
+    let replacement = if primary.fields_are_indirect {
+        target.make_indirect_object_handle(replacement)?
+    } else {
+        replacement
+    };
+    acroform.replace_key(b"/Fields", replacement)?;
 
     Ok(())
 }
@@ -993,7 +1012,49 @@ pub(crate) fn merge_documents_with_resource_decisions_and_preserve_primary_into<
     inputs: &mut [MergeInput<'_, R>],
     remove_resources: &[bool],
     preserve_primary_unreferenced: bool,
+    target: Pdf<T>,
+) -> Result<Pdf<T>> {
+    merge_documents_with_resource_decisions_and_preserve_primary_into_impl(
+        inputs,
+        remove_resources,
+        preserve_primary_unreferenced,
+        target,
+        false,
+    )
+}
+
+/// Merge pages for qpdf's `QPDFJob::handlePageSpecs` consumer.
+///
+/// qpdf does not build a source-grouped AcroForm before its per-occurrence
+/// `fixCopiedAnnotations` loop (`QPDFJob.cc:2517-2585`). Foreign fields are
+/// therefore left on the copied page graph and are introduced only by that
+/// replay. The generic public merge primitive keeps its existing grouped-field
+/// behavior; this job-owned entry point selects the qpdf page-selection
+/// boundary without adding a second object-copy implementation.
+pub(crate) fn merge_documents_for_page_specs_into<R: Read + Seek, T: Read + Seek>(
+    inputs: &mut [MergeInput<'_, R>],
+    remove_resources: &[bool],
+    preserve_primary_unreferenced: bool,
+    target: Pdf<T>,
+) -> Result<Pdf<T>> {
+    merge_documents_with_resource_decisions_and_preserve_primary_into_impl(
+        inputs,
+        remove_resources,
+        preserve_primary_unreferenced,
+        target,
+        true,
+    )
+}
+
+fn merge_documents_with_resource_decisions_and_preserve_primary_into_impl<
+    R: Read + Seek,
+    T: Read + Seek,
+>(
+    inputs: &mut [MergeInput<'_, R>],
+    remove_resources: &[bool],
+    preserve_primary_unreferenced: bool,
     mut target: Pdf<T>,
+    defer_foreign_acroform_fields: bool,
 ) -> Result<Pdf<T>> {
     if inputs.is_empty() {
         return Err(Error::Unsupported(
@@ -1370,6 +1431,13 @@ pub(crate) fn merge_documents_with_resource_decisions_and_preserve_primary_into<
         let mut retained_widgets: BTreeSet<ObjectRef> = BTreeSet::new();
         collect_retained_widget_refs(input.source, &seen, &mut retained_widgets)?;
         for (src_field_ref, partial_name) in source_fields {
+            // The qpdf page job creates foreign fields only in the
+            // occurrence-ordered fixCopiedAnnotations pass. Do not mutate the
+            // grouped foreign field copy here: it is the object-map source
+            // that the later replay must reuse with its original `/T` value.
+            if defer_foreign_acroform_fields && !is_primary {
+                continue;
+            }
             if page_copy_map.contains_key(&src_field_ref) {
                 if let Some(&target_ref) = map.get(&src_field_ref) {
                     let mut visited: BTreeSet<ObjectRef> = BTreeSet::new();
@@ -1422,6 +1490,39 @@ pub(crate) fn merge_documents_with_resource_decisions_and_preserve_primary_into<
             &mut kids,
             &mut writer_object_order,
         )?; // cov:ignore: malformed page-copy map errors propagate at this boundary
+
+        // QPDF::copyForeignObject keeps the per-source ObjCopier alive after
+        // page insertion. QPDFJob::handlePageSpecs then reuses that same map
+        // when fixCopiedAnnotations makes each page occurrence independent
+        // (`QPDFJob.cc:2517-2585`, `QPDF.cc:2019-2272`). Keep the complete
+        // graph map on the target until the job-level AcroForm replay has
+        // finished; retaining only the page-ref projection would copy every
+        // field, annotation, appearance stream, and resource a second time.
+        target.set_foreign_object_map(source_id, map);
+
+        if is_primary && !preserve_primary_unreferenced && !all.is_empty() {
+            // qpdf keeps the primary QPDF's complete xref object-number
+            // universe alive while it imports the next page source, including
+            // unselected page/content objects that are nulled only after all
+            // `fixCopiedAnnotations` calls (`QPDFJob.cc:2390-2469,2596-2608`).
+            // The fresh Rust target has copied only the primary graph that is
+            // reachable at this boundary, so fill the unused portion of that
+            // primary number space with destination-owned null slots before a
+            // foreign ObjCopier can allocate its first object. The slots are
+            // unreachable and therefore omitted by the ordinary writer, but
+            // they preserve qpdf's diagnostic object identities and allocator
+            // ordering for the subsequent foreign copy.
+            let mut target_max = target
+                .canonical_live_object_refs()
+                .into_iter()
+                .map(|object| object.number)
+                .max()
+                .unwrap_or(0);
+            while target_max <= primary_max_object {
+                target.make_indirect_object_handle(ObjectHandle::null())?;
+                target_max += 1;
+            }
+        }
     }
 
     // Build the fresh single-level /Pages root over the accumulated kids
