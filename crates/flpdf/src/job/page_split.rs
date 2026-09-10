@@ -275,6 +275,13 @@ impl QPDFJob {
             }
 
             let mut output = Pdf::empty()?;
+            // qpdf creates a fresh QPDF for each chunk and applies the job's
+            // suppression flag before copying any page into it
+            // (`QPDFJob.cc:2976-2984`). Keep the same boundary so warnings
+            // raised by foreign-page copying and QDF normalization remain
+            // collected for exit status but are not delivered under
+            // `--no-warn`.
+            output.set_suppress_warnings(source.suppress_warnings());
             for &page_ref in &pages[chunk_start..chunk_end] {
                 let rebuild = PageDocumentHelper::new(&mut output)
                     .add_page(PageInput::foreign(source, page_ref), false)?;
