@@ -1696,6 +1696,25 @@ ring order, visited-cycle handling, direct/indirect entries, and `/P`
 remap/drop semantics remain unchanged. qtest exceptions and the separate
 merge/drop semantic issue remain outside this bounded row.
 
+### A6/A7 page-extract page-parent mutation slice `flpdf-3yn9.48.23.15` (2026-09-10)
+
+The library-level page extraction route now follows qpdf's live page-insertion
+mutation boundary. qpdf's `QPDF::insertPage` performs duplicate-page
+`shallowCopy`, replaces `/Parent` through `replaceKey`, and then inserts the
+page into `/Kids` (`libqpdf/QPDF_pages.cc:205-250`). `replaceKey` resolves its
+dictionary receiver at entry (`libqpdf/QPDFObjectHandle.cc:1200-1208`), while
+`shallowCopy` resolves before copying (`libqpdf/QPDFObjectHandle.cc:2073-2079`);
+`QPDFPageDocumentHelper::addPage` delegates to that page operation
+(`libqpdf/QPDFPageDocumentHelper.cc:36-53`).
+
+The scoped production route had two explicit `Pdf::resolve` callers. The
+`extract_pages` `/Parent` write now relies on canonical `ObjectHandle::replace_key`
+resolution, and the duplicate-page path uses `try_dereference` immediately
+before flpdf's intentionally non-resolving `shallow_copy`. Selection order,
+duplicate shallow-clone identity, shared child handles, PageLabels, and the
+page-merge writer-order provenance remain unchanged. qtest exceptions and the
+separate merge/drop semantic issue remain outside this bounded row.
+
 ### QPDFJob `doInspection` combined top-level consumer `flpdf-giz3` (2026-09-10)
 
 The top-level CLI now routes combined inspection selections through the

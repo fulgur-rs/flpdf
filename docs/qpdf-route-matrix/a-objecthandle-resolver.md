@@ -572,6 +572,26 @@ the handle-level resolution/error behavior is
 remaining qtest exception and unrelated struct-tree, writer/CLI, and stream
 caller counts are intentionally not included in this bounded slice.
 
+### 2026-09-10 current caller audit: page-extract bounded cutover
+
+`flpdf-3yn9.48.23.15` migrated the two non-qtest production callers in
+`crates/flpdf/src/page_extract.rs`: the fresh pre-cutover census was
+`Pdf::resolve: 2`, at the copied-page `/Parent` mutation and duplicate-page
+shallow-clone sites. The post-cutover scoped count is zero. The route contract
+is `crates/flpdf/tests/page_extract_route_contract_tests.rs`.
+
+The qpdf boundary is `libqpdf/QPDF_pages.cc:205-250`, where duplicate pages
+are shallow-copied and `/Parent` is replaced, with receiver-resolution
+contracts in `libqpdf/QPDFObjectHandle.cc:1200-1208,2073-2079` and the
+`QPDFPageDocumentHelper::addPage` delegation in
+`libqpdf/QPDFPageDocumentHelper.cc:36-53`. flpdf's `replace_key` already
+resolves its receiver; `shallow_copy` intentionally does not, so the latter
+retains an explicit canonical `try_dereference` at qpdf's boundary. Page
+selection, duplicate identity, shared children, PageLabels, and writer
+provenance remain outside the accessor-only change. qtest exceptions, the
+thread-bead/struct-tree drop-family, and the separate merge/drop semantic
+issue remain out of scope.
+
 ### 2026-09-10 current caller audit: optimization bounded cutover
 
 `flpdf-3yn9.48.23.11` migrated the non-qtest production callers in

@@ -159,7 +159,6 @@ pub fn extract_pages<R: Read + Seek>(
     let pages_handle = target.get_object_handle(pages_root_ref);
     for &copied_page_ref in page_map.values() {
         let page = target.get_object_handle(copied_page_ref);
-        target.resolve(&page)?;
         page.replace_key(b"/Parent", pages_handle.clone())?;
     }
 
@@ -298,7 +297,7 @@ pub(crate) fn append_selection_kids<RT: Read + Seek>(
             // qpdf's insertPage uses shallowCopy and then makeIndirectObject
             // for a page object that is already present in the page tree.
             let page = target.get_object_handle(copied_page_ref);
-            target.resolve(&page)?;
+            page.try_dereference()?;
             let clone = target.make_indirect_object_handle(page.shallow_copy()?)?;
             let clone_ref = clone.object_ref().ok_or(Error::Missing(
                 "duplicate extracted page missing from target",
