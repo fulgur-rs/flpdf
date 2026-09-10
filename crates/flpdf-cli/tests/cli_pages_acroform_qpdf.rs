@@ -997,6 +997,39 @@ fn acroform_secondary_bad_appearance_pdf() -> Vec<u8> {
     ])
 }
 
+/// A primary whose unselected page tree owns a direct inherited `/MediaBox`.
+/// qpdf promotes that value while removing the primary page before it copies
+/// the foreign occurrence (`QPDF_optimization.cc:179-190`,
+/// `QPDFJob.cc:2390-2469`). The foreign field and appearance both contain an
+/// unexpected array-close token so their warning stream identities expose
+/// whether that primary-side allocation was accounted for.
+fn acroform_primary_inherited_media_box_warning_pdf() -> Vec<u8> {
+    assemble_pdf(&[
+        b"1 0 obj\n<< /Type /Catalog /Pages 2 0 R /AcroForm 5 0 R >>\nendobj\n".to_vec(),
+        b"2 0 obj\n<< /Type /Pages /Count 1 /Kids [3 0 R] /MediaBox [0 0 612 792] >>\nendobj\n"
+            .to_vec(),
+        b"3 0 obj\n<< /Type /Page /Parent 2 0 R /Annots [4 0 R] >>\nendobj\n".to_vec(),
+        b"4 0 obj\n<< /Type /Annot /Subtype /Widget /FT /Tx /T (ForeignBadTokens) \
+          /DA (0.29803 0.29803 0.29803 rg ] /F1 12 Tf) /DR 6 0 R \
+          /AP << /N 8 0 R >> /Rect [0 0 10 10] /P 3 0 R >>\nendobj\n"
+            .to_vec(),
+        b"5 0 obj\n<< /Fields [4 0 R] /DR 6 0 R >>\nendobj\n".to_vec(),
+        b"6 0 obj\n<< /Font << /F1 7 0 R >> >>\nendobj\n".to_vec(),
+        b"7 0 obj\n<< /Type /Font /Subtype /Type1 /BaseFont /Helvetica >>\nendobj\n".to_vec(),
+        b"8 0 obj\n<< /Type /XObject /Subtype /Form /BBox [0 0 10 10] \
+          /Resources 6 0 R /Length 9 >>\nstream\n]\n/Tx BMC\nEMC\nendstream\nendobj\n"
+            .to_vec(),
+    ])
+}
+
+fn unexpected_array_close_warnings(stderr: &[u8]) -> Vec<String> {
+    String::from_utf8_lossy(stderr)
+        .lines()
+        .filter(|line| line.contains("unexpected array close token as null"))
+        .map(str::to_owned)
+        .collect()
+}
+
 /// Single-page foreign source with a valid appearance stream whose local
 /// `/Resources/Font/F1` collides with the primary AcroForm `/DR`. This drives
 /// qpdf's normal `adjustAppearanceStream` ResourceReplacer path without a
@@ -1574,6 +1607,61 @@ fn unselected_primary_field_names_reserve_later_collision_suffixes() {
     assert_eq!(
         flpdf_fields, qpdf_fields,
         "flpdf must reserve every primary original field name before renaming foreign fields"
+    );
+}
+
+/// The primary page-removal allocation must be visible before qpdf creates
+/// temporary `/DA` and copied-appearance streams for a foreign occurrence.
+#[test]
+fn inherited_primary_page_tree_allocation_preserves_foreign_warning_ids() {
+    if !qpdf_available() {
+        eprintln!("[SKIP cli_pages_acroform_qpdf] qpdf 11.9.0 is unavailable");
+        return;
+    }
+
+    let temp = tempfile::tempdir().expect("temporary directory");
+    let primary = temp.path().join("primary.pdf");
+    let foreign = temp.path().join("foreign.pdf");
+    let bytes = acroform_primary_inherited_media_box_warning_pdf();
+    std::fs::write(&primary, &bytes).expect("write primary");
+    std::fs::write(&foreign, bytes).expect("write foreign");
+
+    let qpdf_output = temp.path().join("qpdf.pdf");
+    let qpdf = Shell::new(QPDF)
+        .arg(&primary)
+        .args(["--pages"])
+        .arg(&foreign)
+        .arg("1")
+        .args(["--", "--static-id", "--stream-data=uncompress"])
+        .arg(&qpdf_output)
+        .output()
+        .expect("qpdf should spawn");
+    assert_eq!(qpdf.status.code(), Some(3), "qpdf stderr: {:?}", qpdf);
+
+    let flpdf_output = temp.path().join("flpdf.pdf");
+    let flpdf = Command::cargo_bin("flpdf")
+        .unwrap()
+        .arg(&primary)
+        .args(["--pages"])
+        .arg(&foreign)
+        .arg("1")
+        .args(["--", "--static-id", "--stream-data=uncompress"])
+        .arg(&flpdf_output)
+        .output()
+        .expect("flpdf should spawn");
+
+    assert_eq!(flpdf.status.code(), qpdf.status.code());
+    let qpdf_warnings = unexpected_array_close_warnings(&qpdf.stderr);
+    let flpdf_warnings = unexpected_array_close_warnings(&flpdf.stderr);
+    assert_eq!(qpdf_warnings.len(), 2, "qpdf stderr: {:?}", qpdf);
+    assert_eq!(
+        flpdf_warnings, qpdf_warnings,
+        "warning identities must match"
+    );
+    assert_eq!(
+        std::fs::read(&flpdf_output).expect("flpdf output"),
+        std::fs::read(&qpdf_output).expect("qpdf output"),
+        "qpdf and flpdf must preserve the same malformed output",
     );
 }
 
