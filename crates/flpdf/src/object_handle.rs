@@ -119,6 +119,7 @@
 
 use crate::matrix::Rectangle;
 use crate::pdf_string::{decode_pdf_text_string, lossy_utf16_to_utf8, utf8_value};
+use crate::qpdf_obj_gen::QpdfObjGen;
 use crate::token_filter::TokenFilter;
 use crate::{
     content_normalizer::ContentNormalizerPipeline,
@@ -367,6 +368,23 @@ pub type ResourceConflicts =
 /// document implementation can resolve an indirect slot.
 pub(crate) trait DocumentResolver {
     fn resolve_indirect(&self, object_ref: ObjectRef, handle: &ObjectHandle) -> Result<()>;
+
+    /// Resolve the raw qpdf object identity carried by a canonical handle.
+    ///
+    /// Ordinary test/document implementations can keep the valid
+    /// `ObjectRef` route. The document resolver overrides this boundary so a
+    /// parsed object header whose generation is outside the `N G R` parser
+    /// range still reaches qpdf's `QPDFObjGen`-keyed cache.
+    fn resolve_qpdf_obj_gen(&self, object_gen: QpdfObjGen, handle: &ObjectHandle) -> Result<()> {
+        let object_ref = object_gen.to_object_ref().ok_or_else(|| {
+            Error::System(format!(
+                "object {} {} is not a valid indirect reference",
+                object_gen.get_obj(),
+                object_gen.get_gen()
+            ))
+        })?;
+        self.resolve_indirect(object_ref, handle)
+    }
 
     /// The owning document identity carried by qpdf's `QPDF*` on parser-made
     /// direct values (`QPDFValue::setDescription`,
@@ -863,7 +881,7 @@ impl std::fmt::Debug for ObjectHandle {
             ObjectValue::Destroyed => "Destroyed",
             _ => "Resolved(..)",
         };
-        let label = if slot.object_ref().is_some() {
+        let label = if slot.is_indirect() {
             "ObjectHandle::Indirect"
         } else {
             "ObjectHandle::Direct"
@@ -1017,13 +1035,34 @@ struct ObjectSlot {
 #[derive(Clone, Default)]
 struct ValueIdentity {
     object_ref: Option<ObjectRef>,
+    qpdf_obj_gen: Option<QpdfObjGen>,
     active_pdf_unique_id: Option<u64>,
     resolver: Option<Weak<dyn DocumentResolver>>,
 }
 
 impl ObjectSlot {
+    fn qpdf_obj_gen(&self) -> Option<QpdfObjGen> {
+        let identity = self.identity.borrow();
+        identity
+            .qpdf_obj_gen
+            .or_else(|| identity.object_ref.map(QpdfObjGen::from_object_ref))
+    }
+
     fn object_ref(&self) -> Option<ObjectRef> {
-        self.identity.borrow().object_ref
+        self.qpdf_obj_gen()
+            .and_then(QpdfObjGen::to_object_ref)
+            .or_else(|| self.identity.borrow().object_ref)
+    }
+
+    fn is_indirect(&self) -> bool {
+        let identity = self.identity.borrow();
+        identity
+            .qpdf_obj_gen
+            .is_some_and(QpdfObjGen::is_indirect)
+            // Keep the pre-existing synthetic `ObjectRef(0, generation)`
+            // mutation surface isolated from parsed qpdf identities. Its
+            // invariant is tracked separately by flpdf-3sbf.
+            || identity.object_ref.is_some()
     }
 
     fn active_pdf_unique_id(&self) -> Option<u64> {
@@ -1064,8 +1103,8 @@ impl ObjectSlot {
                     result
                 }
             }
-        } else if let Some(object_ref) = self.object_ref() {
-            format!("object {} {}", object_ref.number, object_ref.generation).into_bytes()
+        } else if let Some(object_gen) = self.qpdf_obj_gen() {
+            format!("object {} {}", object_gen.get_obj(), object_gen.get_gen()).into_bytes()
         } else {
             Vec::new()
         }
@@ -1172,6 +1211,7 @@ fn empty_object_slot() -> Rc<RefCell<ObjectSlot>> {
         state_owners: Rc::new(RefCell::new(Vec::new())),
         identity: Rc::new(RefCell::new(ValueIdentity {
             object_ref: None,
+            qpdf_obj_gen: None,
             active_pdf_unique_id: None,
             resolver: None,
         })),
@@ -1553,12 +1593,12 @@ impl ObjectHandle {
     /// True if this handle wraps a value constructed directly, without an
     /// indirect object number/generation.
     pub fn is_direct(&self) -> bool {
-        self.0.borrow().object_ref().is_none()
+        !self.0.borrow().is_indirect()
     }
 
     /// True if this handle refers to an indirect object.
     pub fn is_indirect(&self) -> bool {
-        self.0.borrow().object_ref().is_some()
+        self.0.borrow().is_indirect()
     }
 
     /// True if this handle is qpdf's internal reserved construction sentinel.
@@ -1582,6 +1622,13 @@ impl ObjectHandle {
     /// direct one.
     pub fn object_ref(&self) -> Option<ObjectRef> {
         self.0.borrow().object_ref()
+    }
+
+    /// The qpdf raw object identity carried by this handle, if it is
+    /// indirect. Unlike [`Self::object_ref`], this preserves generations that
+    /// qpdf accepts in an object header but rejects in an `N G R` reference.
+    pub(crate) fn qpdf_obj_gen(&self) -> Option<QpdfObjGen> {
+        self.0.borrow().qpdf_obj_gen()
     }
 
     /// The owning document identity carried by this canonical handle, if it
@@ -1652,6 +1699,7 @@ impl ObjectHandle {
     /// identity and the route to the resolver. This port splits that single
     /// pointer into a plain tag plus a `Weak`, which is why both arguments
     /// have to be supplied together here.
+    #[cfg(test)]
     pub(crate) fn new_indirect_for_pdf_with_resolver(
         object_ref: ObjectRef,
         offset: i64,
@@ -1660,6 +1708,22 @@ impl ObjectHandle {
     ) -> Self {
         Self::new_indirect_unresolved_with_identity(
             object_ref,
+            offset,
+            Some(pdf_unique_id),
+            Some(resolver),
+        )
+    }
+
+    /// Construct a canonical unresolved slot from qpdf's raw object identity.
+    /// The valid `ObjectRef` view is only a projection of this identity.
+    pub(crate) fn new_indirect_for_qpdf_obj_gen_with_resolver(
+        object_gen: QpdfObjGen,
+        offset: i64,
+        pdf_unique_id: u64,
+        resolver: Weak<dyn DocumentResolver>,
+    ) -> Self {
+        Self::new_indirect_unresolved_qpdf_obj_gen_with_identity(
+            object_gen,
             offset,
             Some(pdf_unique_id),
             Some(resolver),
@@ -1681,6 +1745,7 @@ impl ObjectHandle {
             state_owners: Rc::new(RefCell::new(Vec::new())),
             identity: Rc::new(RefCell::new(ValueIdentity {
                 object_ref: Some(object_ref),
+                qpdf_obj_gen: Some(QpdfObjGen::from_object_ref(object_ref)),
                 active_pdf_unique_id: Some(pdf_unique_id),
                 resolver: Some(resolver),
             })),
@@ -1718,6 +1783,7 @@ impl ObjectHandle {
             state_owners: Rc::new(RefCell::new(Vec::new())),
             identity: Rc::new(RefCell::new(ValueIdentity {
                 object_ref: None,
+                qpdf_obj_gen: None,
                 active_pdf_unique_id: None,
                 resolver: None,
             })),
@@ -1747,7 +1813,7 @@ impl ObjectHandle {
     /// false for every document. That makes this the narrower test
     /// constructor, not the
     /// qpdf-native shape: upstream one `QPDF*` carries both identity and the
-    /// resolver, while [`Self::new_indirect_for_pdf_with_resolver`] is what a
+    /// resolver, while [`Self::new_indirect_for_qpdf_obj_gen_with_resolver`] is what a
     /// handle vended by a `Pdf` needs.
     pub(crate) fn new_indirect_with_resolver(
         object_ref: ObjectRef,
@@ -1768,13 +1834,31 @@ impl ObjectHandle {
         pdf_unique_id: Option<u64>,
         resolver: Option<Weak<dyn DocumentResolver>>,
     ) -> Self {
+        let handle = Self::new_indirect_unresolved_qpdf_obj_gen_with_identity(
+            QpdfObjGen::from_object_ref(object_ref),
+            offset,
+            pdf_unique_id,
+            resolver,
+        );
+        handle.0.borrow().identity.borrow_mut().object_ref = Some(object_ref);
+        handle
+    }
+
+    #[allow(deprecated)]
+    fn new_indirect_unresolved_qpdf_obj_gen_with_identity(
+        object_gen: QpdfObjGen,
+        offset: i64,
+        pdf_unique_id: Option<u64>,
+        resolver: Option<Weak<dyn DocumentResolver>>,
+    ) -> Self {
         let _ = offset;
         let handle = Self(Rc::new(RefCell::new(ObjectSlot {
             initialized: true,
             state: Rc::new(RefCell::new(ObjectValue::Unresolved)),
             state_owners: Rc::new(RefCell::new(Vec::new())),
             identity: Rc::new(RefCell::new(ValueIdentity {
-                object_ref: Some(object_ref),
+                object_ref: object_gen.to_object_ref(),
+                qpdf_obj_gen: Some(object_gen),
                 active_pdf_unique_id: pdf_unique_id,
                 resolver,
             })),
@@ -1829,6 +1913,7 @@ impl ObjectHandle {
             state_owners: Rc::new(RefCell::new(Vec::new())),
             identity: Rc::new(RefCell::new(ValueIdentity {
                 object_ref: None,
+                qpdf_obj_gen: None,
                 active_pdf_unique_id: None,
                 resolver,
             })),
@@ -1981,6 +2066,11 @@ impl ObjectHandle {
             )
         };
 
+        let left_object_gen = self.qpdf_obj_gen();
+        let right_object_gen = other.qpdf_obj_gen();
+        // Carry the existing projections across the swap for the same reason
+        // `promote_to_indirect_qpdf_obj_gen` does: re-deriving them through the
+        // parser gate loses identities the Rust `ObjectRef` factory admits.
         let left_object_ref = self.object_ref();
         let right_object_ref = other.object_ref();
         let left_parent = self.containment_parent();
@@ -1999,8 +2089,14 @@ impl ObjectHandle {
             let mut right = other.0.borrow_mut();
             std::mem::swap(&mut left.state, &mut right.state);
             std::mem::swap(&mut left.identity, &mut right.identity);
-            left.identity.borrow_mut().object_ref = left_object_ref;
-            right.identity.borrow_mut().object_ref = right_object_ref;
+            left.identity.borrow_mut().qpdf_obj_gen = left_object_gen;
+            left.identity.borrow_mut().object_ref = left_object_gen
+                .and_then(QpdfObjGen::to_object_ref)
+                .or(left_object_ref);
+            right.identity.borrow_mut().qpdf_obj_gen = right_object_gen;
+            right.identity.borrow_mut().object_ref = right_object_gen
+                .and_then(QpdfObjGen::to_object_ref)
+                .or(right_object_ref);
             std::mem::swap(&mut left.state_owners, &mut right.state_owners);
             std::mem::swap(&mut left.parsed_offset, &mut right.parsed_offset);
             std::mem::swap(&mut left.description, &mut right.description);
@@ -2149,6 +2245,7 @@ impl ObjectHandle {
         self.replace_detached_state(ObjectValue::Null);
         let mut slot = self.0.borrow_mut();
         slot.identity.borrow_mut().object_ref = None;
+        slot.identity.borrow_mut().qpdf_obj_gen = None;
         slot.identity.borrow_mut().active_pdf_unique_id = None;
         slot.tree_pdf_unique_id = None;
         slot.identity.borrow_mut().resolver = None;
@@ -2175,9 +2272,38 @@ impl ObjectHandle {
         let slot = self.0.borrow();
         *slot.identity.borrow_mut() = ValueIdentity {
             object_ref: Some(object_ref),
+            qpdf_obj_gen: Some(QpdfObjGen::from_object_ref(object_ref)),
             active_pdf_unique_id: Some(pdf_unique_id),
             resolver: Some(resolver),
         };
+        self.clone()
+    }
+
+    /// Promote an existing slot using qpdf's raw object identity. The public
+    /// `ObjectRef` projection remains absent when the generation is outside
+    /// the parser's `N G R` range, while the canonical handle still remains
+    /// indirect and resolvable through the raw cache key.
+    pub(crate) fn promote_to_indirect_qpdf_obj_gen(
+        &self,
+        object_gen: QpdfObjGen,
+        pdf_unique_id: u64,
+        resolver: Weak<dyn DocumentResolver>,
+    ) -> Self {
+        let mut identity = {
+            let slot = self.0.borrow();
+            let identity = slot.identity.borrow().clone();
+            identity
+        };
+        // `to_object_ref` applies qpdf's `N G R` parser gate, so it is not the
+        // inverse of `from_object_ref`: an identity that entered through the
+        // Rust `ObjectRef` factory (which admits generation 65535 and object
+        // number 0) has no projection to fall back on. Keep the projection the
+        // handle already carried rather than dropping it.
+        identity.object_ref = object_gen.to_object_ref().or(identity.object_ref);
+        identity.qpdf_obj_gen = Some(object_gen);
+        identity.active_pdf_unique_id = Some(pdf_unique_id);
+        identity.resolver = Some(resolver);
+        *self.0.borrow().identity.borrow_mut() = identity;
         self.clone()
     }
 
@@ -2234,7 +2360,7 @@ impl ObjectHandle {
     /// `Rc` is still shared elsewhere (refcount > 1) — the latter cannot
     /// happen for a handle a caller alone constructed and never cloned.
     pub(crate) fn into_direct_value(mut self) -> Option<(ObjectValue, i64)> {
-        if self.0.borrow().object_ref().is_some() {
+        if self.0.borrow().is_indirect() {
             return None; // cov:ignore: unreachable per the invariant noted above
         }
         if Rc::strong_count(&self.0) != 1 {
@@ -2271,7 +2397,7 @@ impl ObjectHandle {
     /// Canonical promotion uses [`Self::promote_to_indirect`] and never copies.
     pub(crate) fn direct_value_clone(&self) -> Result<Option<ObjectValue>> {
         let slot = self.0.borrow();
-        if slot.object_ref().is_some() {
+        if slot.is_indirect() {
             return Ok(None);
         }
         let state = slot.state.borrow();
@@ -2340,7 +2466,7 @@ impl ObjectHandle {
     #[allow(deprecated)]
     pub(crate) fn belongs_to_pdf(&self, pdf_unique_id: u64) -> bool {
         let slot = self.0.borrow();
-        if slot.object_ref().is_some() {
+        if slot.is_indirect() {
             slot.active_pdf_unique_id() == Some(pdf_unique_id)
         } else {
             slot.pdf_unique_ids.is_empty() || slot.pdf_unique_ids.contains(&pdf_unique_id)
@@ -2370,17 +2496,17 @@ impl ObjectHandle {
             if !visited.insert(identity) {
                 continue;
             }
-            let (object_ref, active_pdf_unique_id, pdf_unique_ids, children) = {
+            let (is_indirect, active_pdf_unique_id, pdf_unique_ids, children) = {
                 let slot = handle.0.borrow();
                 let state = slot.state.borrow();
                 (
-                    slot.object_ref(),
+                    slot.is_indirect(),
                     slot.active_pdf_unique_id(),
                     slot.pdf_unique_ids.clone(),
                     Self::state_children(&state),
                 )
             };
-            if object_ref.is_some() {
+            if is_indirect {
                 if active_pdf_unique_id != Some(pdf_unique_id) {
                     return false;
                 }
@@ -2479,24 +2605,17 @@ impl ObjectHandle {
                 let state = slot.state.borrow();
                 match &*state {
                     ObjectValue::Array(items) => {
-                        pending.extend(
-                            items
-                                .iter()
-                                .filter(|item| item.object_ref().is_none())
-                                .cloned(),
-                        );
+                        pending.extend(items.iter().filter(|item| !item.is_indirect()).cloned());
                     }
                     ObjectValue::Dictionary(entries) => {
                         pending.extend(
                             entries
                                 .values()
-                                .filter(|value| value.object_ref().is_none())
+                                .filter(|value| !value.is_indirect())
                                 .cloned(),
                         );
                     }
-                    ObjectValue::Stream { stream_dict, .. }
-                        if stream_dict.object_ref().is_none() =>
-                    {
+                    ObjectValue::Stream { stream_dict, .. } if !stream_dict.is_indirect() => {
                         pending.push(stream_dict.clone());
                     }
                     _ => {}
@@ -2559,30 +2678,31 @@ impl ObjectHandle {
     /// Direct and already-terminal handles are no-ops. An unresolved handle
     /// whose document has been dropped returns an error and stays unresolved.
     pub(crate) fn try_dereference(&self) -> Result<()> {
-        let (object_ref, resolver) = {
+        let (object_gen, resolver) = {
             let slot = self.0.borrow();
             if !slot.initialized {
                 return Err(Error::Internal(
                     "attempted to dereference an uninitialized QPDFObjectHandle".to_owned(),
                 ));
             }
-            let Some(object_ref) = slot.object_ref() else {
+            let Some(object_gen) = slot.qpdf_obj_gen() else {
                 return Ok(());
             };
             let state = slot.state.borrow();
             if !matches!(&*state, ObjectValue::Unresolved) {
                 return Ok(());
             }
-            (object_ref, slot.resolver())
+            (object_gen, slot.resolver())
         };
 
         let Some(resolver) = resolver.and_then(|resolver| resolver.upgrade()) else {
             return Err(Error::Internal(format!(
                 "object {} {} belongs to a dropped PDF",
-                object_ref.number, object_ref.generation
+                object_gen.get_obj(),
+                object_gen.get_gen()
             )));
         };
-        resolver.resolve_indirect(object_ref, self)
+        resolver.resolve_qpdf_obj_gen(object_gen, self)
     }
 
     /// The document that owns this handle, qpdf's `QPDF* context`.
@@ -5860,7 +5980,7 @@ impl ObjectHandle {
             )));
         }
         self.set_content_normalization_applied(false);
-        if self.object_ref().is_none() {
+        if !self.is_indirect() {
             return Err(Error::System(
                 STREAM_DATA_PROVIDER_REQUIRES_INDIRECT_ERROR.to_owned(),
             ));
@@ -7226,8 +7346,14 @@ fn unparse_resolved_into(handle: &ObjectHandle, out: &mut Vec<u8>, strict: bool)
             .with_value(|value| value.cloned())
             .expect("every ObjectHandle carries a value state");
 
-        if handle.object_ref().is_some() && matches!(value, ObjectValue::Stream { .. }) {
-            write_unparse_reference(handle.object_ref().expect("checked above"), out);
+        if handle.is_indirect() && matches!(value, ObjectValue::Stream { .. }) {
+            if let Some(object_ref) = handle.object_ref() {
+                write_unparse_reference(object_ref, out);
+            } else if let Some(object_gen) = handle.qpdf_obj_gen() {
+                out.extend_from_slice(
+                    format!("{} {} R", object_gen.get_obj(), object_gen.get_gen()).as_bytes(),
+                );
+            }
             return Ok(());
         }
 
@@ -7562,7 +7688,7 @@ impl<'a> ObjectJsonWriter<'a> {
                     if child.is_reserved() {
                         // A reserved child is not null; its non-dereferenced
                         // identity is still a valid JSON reference.
-                    } else if child.object_ref().is_some() && !child.is_resolved() {
+                    } else if child.is_indirect() && !child.is_resolved() {
                         if child.0.borrow().resolver().is_none() {
                             return Err(ObjectJsonError::Uninitialized);
                         }
@@ -9934,6 +10060,40 @@ pub(crate) mod identity_tests {
     }
 
     #[test]
+    fn a_non_document_resolver_rejects_a_raw_generation_without_a_valid_projection() {
+        struct ValidProjectionOnlyResolver;
+
+        impl DocumentResolver for ValidProjectionOnlyResolver {
+            // cov:ignore-start: this valid-reference hook is required by the
+            // trait but the test intentionally exercises the raw projection
+            // failure before a valid resolver call can occur.
+            fn resolve_indirect(
+                &self,
+                _object_ref: ObjectRef,
+                _handle: &ObjectHandle,
+            ) -> crate::Result<()> {
+                Ok(())
+            }
+            // cov:ignore-end
+        }
+
+        let resolver: Rc<dyn DocumentResolver> = Rc::new(ValidProjectionOnlyResolver);
+        let handle = ObjectHandle::new_indirect_for_qpdf_obj_gen_with_resolver(
+            QpdfObjGen::new(5, 65_536),
+            NO_PARSED_OFFSET,
+            1,
+            Rc::downgrade(&resolver),
+        );
+
+        assert_eq!(handle.object_ref(), None);
+        assert!(matches!(
+            handle.try_dereference(),
+            Err(Error::System(message))
+                if message == "object 5 65536 is not a valid indirect reference"
+        ));
+    }
+
+    #[test]
     fn cloning_an_indirect_handle_shares_the_same_slot() {
         let object_ref = ObjectRef::new(5, 0);
         let handle = ObjectHandle::new_indirect_unresolved(object_ref, 0);
@@ -11749,6 +11909,25 @@ mod unparse_object_tests {
         out.extend_from_slice(value);
         out.extend_from_slice(b"}");
         Ok(())
+    }
+
+    #[test]
+    fn unparse_resolved_emits_a_raw_qpdf_object_reference() {
+        let handle = ObjectHandle::new_indirect_unresolved_qpdf_obj_gen_with_identity(
+            QpdfObjGen::new(5, 65_536),
+            NO_PARSED_OFFSET,
+            None,
+            None,
+        );
+        handle.set_resolved(ObjectValue::Stream {
+            stream_dict: ObjectHandle::dictionary(Vec::new()),
+            stream_data: None,
+            stream_provider: None,
+            filter_on_write: true,
+            stream_length: 0,
+        });
+
+        assert_eq!(handle.try_unparse_resolved().unwrap(), b"5 65536 R");
     }
 
     #[test]

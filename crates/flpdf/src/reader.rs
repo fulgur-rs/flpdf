@@ -1290,9 +1290,9 @@ impl<R: Read + Seek> Pdf<R> {
     }
 
     pub(crate) fn is_canonical_object_handle(&self, handle: &ObjectHandle) -> bool {
-        handle.object_ref().is_some_and(|object_ref| {
+        handle.qpdf_obj_gen().is_some_and(|object_gen| {
             self.resolver
-                .registered_handle(object_ref)
+                .registered_qpdf_obj_gen_handle(object_gen)
                 .is_some_and(|canonical| canonical.is_same_object_as(handle))
         })
     }

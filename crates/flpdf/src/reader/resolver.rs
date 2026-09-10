@@ -326,7 +326,7 @@ pub(crate) struct ResolverCore<R: Read + Seek + 'static> {
     /// outside `0..65535` (`QPDF.cc:1149-1184,1212-1236`).
     raw_source_xref_entries: BTreeMap<QpdfObjGen, XrefEntry>,
     /// qpdf `m->obj_cache` (`QPDF.hh:1467`), and the document's *only*
-    /// canonical [`ObjectRef`] → [`ObjectHandle`] map.
+    /// canonical [`QpdfObjGen`] → [`ObjectHandle`] map.
     ///
     /// **It absorbed what was `Pdf::handle_registry`.** An earlier revision
     /// of this doc said the map was "empty for the whole of this slice … not
@@ -344,7 +344,7 @@ pub(crate) struct ResolverCore<R: Read + Seek + 'static> {
     ///
     /// The teardown walk moved with it: [`ResolverHandle::disconnect_all`] is
     /// what `Pdf::drop` now calls.
-    object_cache: BTreeMap<ObjectRef, ObjectHandle>,
+    object_cache: BTreeMap<QpdfObjGen, ObjectHandle>,
     /// qpdf m->last_object_description (QPDF.hh:1457), retained for
     /// damaged-PDF warnings raised after a cache-preparing operation such as
     /// QPDF::nextObjGen (QPDF.cc:1873-1879). This UTF-8-facing projection is
@@ -361,14 +361,14 @@ pub(crate) struct ResolverCore<R: Read + Seek + 'static> {
     /// cases in `m->obj_cache`, but the provenance is needed by the Pdf
     /// object-ref view to distinguish a real allocated null from a resolved
     /// dangling reference (`QPDF.cc:1882-1894,1986-1993`).
-    allocated_object_refs: BTreeSet<ObjectRef>,
+    allocated_object_refs: BTreeSet<QpdfObjGen>,
     /// qpdf `m->resolving` (`include/qpdf/QPDF.hh:1468`), the set
     /// `QPDF::resolve` tests to detect "an object references itself directly
     /// or indirectly in some key that has to be resolved during object
     /// parsing, such as stream length" (`libqpdf/QPDF.cc:1706-1708`).
     ///
     /// Written only through [`ResolveMark`], never directly.
-    resolving: BTreeSet<ObjectRef>,
+    resolving: BTreeSet<QpdfObjGen>,
     /// qpdf `m->in_parse` (`include/qpdf/QPDF.hh:1483`), the flag
     /// `QPDF::inParse` toggles and `QPDF::ParseGuard`
     /// (`include/qpdf/QPDF.hh:797-816`) sets for the duration of one
@@ -389,7 +389,7 @@ pub(crate) struct ResolverCore<R: Read + Seek + 'static> {
     /// an object that was never looked up at all. The effective source table
     /// still contains only live type-1/type-2 entries; this set records the
     /// lookup side effect needed for a later `resolve(og)` warning.
-    default_xref_entries: BTreeSet<ObjectRef>,
+    default_xref_entries: BTreeSet<QpdfObjGen>,
     /// qpdf `m->attempt_recovery` (`QPDF.hh:1461`).
     ///
     /// Same on/off flag and default: qpdf initialises it to `true` and
@@ -648,11 +648,11 @@ impl<R: Read + Seek> ResolverCore<R> {
 /// [`ResolverCore::resolving`] is not otherwise written.
 struct ResolveMark<'a, R: Read + Seek + 'static> {
     core: &'a RefCell<ResolverCore<R>>,
-    object_ref: ObjectRef,
+    object_gen: QpdfObjGen,
 }
 
 impl<'a, R: Read + Seek> ResolveMark<'a, R> {
-    /// Record `object_ref` as in progress, or report that it already was.
+    /// Record `object_gen` as in progress, or report that it already was.
     ///
     /// Folds two qpdf steps into one `BTreeSet::insert`: the loop test
     /// `m->resolving.count(og)` (`libqpdf/QPDF.cc:1706`) and the insert inside
@@ -667,9 +667,9 @@ impl<'a, R: Read + Seek> ResolveMark<'a, R> {
     ///
     /// Borrow discipline: the `borrow_mut()` is taken and dropped inside this
     /// expression, so no borrow is live when the caller runs its body.
-    fn begin(core: &'a RefCell<ResolverCore<R>>, object_ref: ObjectRef) -> Option<Self> {
-        if core.borrow_mut().resolving.insert(object_ref) {
-            Some(Self { core, object_ref })
+    fn begin(core: &'a RefCell<ResolverCore<R>>, object_gen: QpdfObjGen) -> Option<Self> {
+        if core.borrow_mut().resolving.insert(object_gen) {
+            Some(Self { core, object_gen })
         } else {
             None
         }
@@ -679,7 +679,7 @@ impl<'a, R: Read + Seek> ResolveMark<'a, R> {
 impl<R: Read + Seek> Drop for ResolveMark<'_, R> {
     /// qpdf `~ResolveRecorder` (`include/qpdf/QPDF.hh:988-991`).
     fn drop(&mut self) {
-        self.core.borrow_mut().resolving.remove(&self.object_ref);
+        self.core.borrow_mut().resolving.remove(&self.object_gen);
     }
 }
 
@@ -694,7 +694,7 @@ pub(crate) struct ResolverHandle<R: Read + Seek + 'static> {
     /// `endstream`. Retain the observed suffix for inspection consumers that
     /// have their own display-framing policy; the qpdf pipe path always reads
     /// the complete recovered length before any AES/RC4 stage.
-    recovered_stream_eols: RefCell<BTreeMap<ObjectRef, crate::parser::RecoveredStreamEol>>,
+    recovered_stream_eols: RefCell<BTreeMap<QpdfObjGen, crate::parser::RecoveredStreamEol>>,
     /// A `Weak` to this same allocation, so minting a canonical handle can
     /// attach the resolver the handle will later call back into.
     ///
@@ -846,7 +846,7 @@ impl<R: Read + Seek + 'static> StringDecrypter for ResolverStringDecrypter<'_, R
 /// they bracket the indirect object's terminator and following whitespace.
 #[derive(Debug)]
 struct ParsedObjectAtOffset {
-    object_ref: ObjectRef,
+    object_gen: QpdfObjGen,
     value: ObjectValue,
     /// Parser diagnostics observed while recovering this object's body. A
     /// recovered null is kept distinct from a literal null at the canonical
@@ -867,6 +867,7 @@ struct ParsedObjectAtOffset {
 /// stream framing, or cache-extent scan are caught by `QPDF::resolve` and do
 /// not trigger a second xref discovery pass. Keep that boundary explicit so a
 /// body parse failure cannot accidentally be treated as a stale xref offset.
+#[derive(Debug)]
 enum ReadObjectAtOffsetError {
     Header(Error),
     Body(Error),
@@ -1023,9 +1024,10 @@ impl<R: Read + Seek> ResolverHandle<R> {
         let resolver: Weak<dyn DocumentResolver> = self.self_weak.clone();
         let reserved =
             ObjectHandle::new_reserved_for_pdf(object_ref, self.pdf_unique_id.get(), resolver);
+        let object_gen = QpdfObjGen::from_object_ref(object_ref);
         let mut core = self.core.borrow_mut();
-        let previous = core.object_cache.insert(object_ref, reserved.clone());
-        core.allocated_object_refs.insert(object_ref);
+        let previous = core.object_cache.insert(object_gen, reserved.clone());
+        core.allocated_object_refs.insert(object_gen);
         debug_assert!(
             previous.is_none(),
             "next_obj_gen must return a fresh ObjGen"
@@ -1176,22 +1178,34 @@ impl<R: Read + Seek> ResolverHandle<R> {
     /// Borrow discipline: the `borrow_mut()` spans only the map lookup and
     /// the `ObjectHandle` construction, neither of which resolves anything.
     pub(crate) fn get_object_handle(&self, object_ref: ObjectRef) -> ObjectHandle {
+        let object_gen = QpdfObjGen::from_object_ref(object_ref);
+        let handle = self.get_object_handle_qpdf_obj_gen(object_gen);
+        handle.promote_to_indirect(object_ref, self.pdf_unique_id.get(), self.self_weak.clone())
+    }
+
+    /// Return the canonical handle for qpdf's raw object identity, including
+    /// a generation that cannot be projected to `ObjectRef`.
+    pub(crate) fn get_object_handle_qpdf_obj_gen(&self, object_gen: QpdfObjGen) -> ObjectHandle {
         let handle = self
             .core
             .borrow_mut()
             .object_cache
-            .entry(object_ref)
+            .entry(object_gen)
             .or_insert_with(|| {
                 let resolver: Weak<dyn DocumentResolver> = self.self_weak.clone();
-                ObjectHandle::new_indirect_for_pdf_with_resolver(
-                    object_ref,
+                ObjectHandle::new_indirect_for_qpdf_obj_gen_with_resolver(
+                    object_gen,
                     NO_PARSED_OFFSET,
                     self.pdf_unique_id.get(),
                     resolver,
                 )
             })
             .clone();
-        handle.promote_to_indirect(object_ref, self.pdf_unique_id.get(), self.self_weak.clone())
+        handle.promote_to_indirect_qpdf_obj_gen(
+            object_gen,
+            self.pdf_unique_id.get(),
+            self.self_weak.clone(),
+        )
     }
 
     /// Return qpdf's `reserveObjectIfNotExists` result for one object identity.
@@ -1213,9 +1227,10 @@ impl<R: Read + Seek> ResolverHandle<R> {
         let resolver: Weak<dyn DocumentResolver> = self.self_weak.clone();
         let reserved =
             ObjectHandle::new_reserved_for_pdf(object_ref, self.pdf_unique_id.get(), resolver);
+        let object_gen = QpdfObjGen::from_object_ref(object_ref);
         let mut core = self.core.borrow_mut();
-        let previous = core.object_cache.insert(object_ref, reserved.clone());
-        core.allocated_object_refs.insert(object_ref);
+        let previous = core.object_cache.insert(object_gen, reserved.clone());
+        core.allocated_object_refs.insert(object_gen);
         previous.unwrap_or(reserved)
     }
 
@@ -1265,22 +1280,23 @@ impl<R: Read + Seek> ResolverHandle<R> {
         Ok(parsed.value)
     }
 
-    pub(crate) fn parser_description_template(&self, object_ref: ObjectRef) -> Vec<u8> {
+    fn parser_description_template_qpdf_obj_gen(&self, object_gen: QpdfObjGen) -> Vec<u8> {
         let core = self.core.borrow();
         let mut description = core.description.clone();
         description.extend_from_slice(
             format!(
                 ", object {} {} at offset $PO",
-                object_ref.number, object_ref.generation
+                object_gen.get_obj(),
+                object_gen.get_gen()
             )
             .as_bytes(),
         );
         description
     }
 
-    fn parser_description_template_for_read(
+    fn parser_description_template_for_read_qpdf_obj_gen(
         &self,
-        object_ref: ObjectRef,
+        object_gen: QpdfObjGen,
         read_description: &[u8],
     ) -> Vec<u8> {
         let core = self.core.borrow();
@@ -1290,20 +1306,22 @@ impl<R: Read + Seek> ResolverHandle<R> {
         description.extend_from_slice(
             format!(
                 ": object {} {} at offset $PO",
-                object_ref.number, object_ref.generation
+                object_gen.get_obj(),
+                object_gen.get_gen()
             )
             .as_bytes(),
         );
         description
     }
 
-    pub(crate) fn stream_description(&self, object_ref: ObjectRef) -> Vec<u8> {
+    fn stream_description_qpdf_obj_gen(&self, object_gen: QpdfObjGen) -> Vec<u8> {
         let core = self.core.borrow();
         let mut description = core.description.clone();
         description.extend_from_slice(
             format!(
                 ", stream object {} {}",
-                object_ref.number, object_ref.generation
+                object_gen.get_obj(),
+                object_gen.get_gen()
             )
             .as_bytes(),
         );
@@ -1375,9 +1393,9 @@ impl<R: Read + Seek> ResolverHandle<R> {
     /// description and the object identity (`libqpdf/QPDF.cc:1298-1310`,
     /// `:1331-1354`, `:2641-2644`), so a described read such as the
     /// `linearization hint stream` keeps its prefix on this warning too.
-    fn push_expected_endobj_warning(
+    fn push_expected_endobj_warning_qpdf_obj_gen(
         &self,
-        object_ref: ObjectRef,
+        object_gen: QpdfObjGen,
         offset: u64,
         read_description: Option<&[u8]>,
     ) -> Result<()> {
@@ -1401,14 +1419,14 @@ impl<R: Read + Seek> ResolverHandle<R> {
             );
         }
         if read_description.is_some() {
-            return self.push_stream_warning_with_description(
-                object_ref,
+            return self.push_stream_warning_with_description_qpdf_obj_gen(
+                object_gen,
                 offset,
                 "expected endobj",
                 read_description,
             );
         }
-        self.push_stream_warning(object_ref, offset, "expected endobj")
+        self.push_stream_warning_qpdf_obj_gen(object_gen, offset, "expected endobj")
     }
 
     /// The canonical handle for `object_ref` **if one has already been
@@ -1417,7 +1435,15 @@ impl<R: Read + Seek> ResolverHandle<R> {
     /// The read-only counterpart of [`Self::get_object_handle`], for the
     /// `&self` callers that ask whether a reference has a handle at all.
     pub(crate) fn registered_handle(&self, object_ref: ObjectRef) -> Option<ObjectHandle> {
-        self.core.borrow().object_cache.get(&object_ref).cloned()
+        let object_gen = QpdfObjGen::from_object_ref(object_ref);
+        self.registered_qpdf_obj_gen_handle(object_gen)
+    }
+
+    pub(crate) fn registered_qpdf_obj_gen_handle(
+        &self,
+        object_gen: QpdfObjGen,
+    ) -> Option<ObjectHandle> {
+        self.core.borrow().object_cache.get(&object_gen).cloned()
     }
 
     /// Whether `object_ref` was created through a qpdf-shaped allocation or
@@ -1425,10 +1451,11 @@ impl<R: Read + Seek> ResolverHandle<R> {
     /// This is the provenance distinction required when both cases currently
     /// hold a resolved null in the same canonical object cache.
     pub(crate) fn is_allocated_object(&self, object_ref: ObjectRef) -> bool {
+        let object_gen = QpdfObjGen::from_object_ref(object_ref);
         self.core
             .borrow()
             .allocated_object_refs
-            .contains(&object_ref)
+            .contains(&object_gen)
     }
 
     /// Raw cache values for internal inspection, without `newIndirect`'s
@@ -1447,13 +1474,13 @@ impl<R: Read + Seek> ResolverHandle<R> {
             .borrow()
             .object_cache
             .iter()
-            .map(|(object_ref, handle)| (*object_ref, handle.clone()))
+            .map(|(object_gen, handle)| (*object_gen, handle.clone()))
             .collect();
         Ok(entries
             .into_iter()
-            .map(|(object_ref, handle)| {
-                handle.promote_to_indirect(
-                    object_ref,
+            .map(|(object_gen, handle)| {
+                handle.promote_to_indirect_qpdf_obj_gen(
+                    object_gen,
                     self.pdf_unique_id.get(),
                     self.self_weak.clone(),
                 )
@@ -1467,8 +1494,8 @@ impl<R: Read + Seek> ResolverHandle<R> {
             .borrow()
             .object_cache
             .keys()
-            .next_back()
-            .map(|object_ref| object_ref.number)
+            .filter_map(|object_gen| u32::try_from(object_gen.get_obj()).ok())
+            .max()
     }
 
     /// Resolve every unresolved entry in the effective xref table, matching
@@ -1619,10 +1646,11 @@ impl<R: Read + Seek> ResolverHandle<R> {
             ));
         }
         let object_ref = self.next_obj_gen()?;
+        let object_gen = QpdfObjGen::from_object_ref(object_ref);
         {
             let mut core = self.core.borrow_mut();
-            core.object_cache.insert(object_ref, handle.clone());
-            core.allocated_object_refs.insert(object_ref);
+            core.object_cache.insert(object_gen, handle.clone());
+            core.allocated_object_refs.insert(object_gen);
         }
         Ok(
             handle.promote_to_indirect(
@@ -1680,7 +1708,7 @@ impl<R: Read + Seek> ResolverHandle<R> {
             self.core
                 .borrow_mut()
                 .object_cache
-                .insert(object_ref, replacement.clone());
+                .insert(QpdfObjGen::from_object_ref(object_ref), replacement.clone());
             replacement
         };
         target.clear_description();
@@ -1690,7 +1718,7 @@ impl<R: Read + Seek> ResolverHandle<R> {
             self.core
                 .borrow_mut()
                 .allocated_object_refs
-                .insert(object_ref);
+                .insert(QpdfObjGen::from_object_ref(object_ref));
         }
         Ok(target)
     }
@@ -1727,7 +1755,7 @@ impl<R: Read + Seek> ResolverHandle<R> {
                 self.core
                     .borrow_mut()
                     .allocated_object_refs
-                    .insert(object_ref);
+                    .insert(QpdfObjGen::from_object_ref(object_ref));
             }
         }
         Ok(())
@@ -1738,12 +1766,13 @@ impl<R: Read + Seek> ResolverHandle<R> {
     /// (`libqpdf/QPDF.cc:2423-2430`), not a snapshot of the source xref table.
     pub(crate) fn has_newer_cached_generation(&self, object_ref: ObjectRef) -> bool {
         use std::ops::Bound::{Excluded, Unbounded};
+        let object_gen = QpdfObjGen::from_object_ref(object_ref);
         self.core
             .borrow()
             .object_cache
-            .range((Excluded(object_ref), Unbounded))
+            .range((Excluded(object_gen), Unbounded))
             .next()
-            .is_some_and(|(next, _)| next.number == object_ref.number)
+            .is_some_and(|(next, _)| next.get_obj() == i64::from(object_ref.number))
     }
 
     /// Remove the exact source row, nullify retained aliases, then erase the cache slot.
@@ -1752,6 +1781,7 @@ impl<R: Read + Seek> ResolverHandle<R> {
     /// cached object does not invalidate qpdf's already-completed dangling
     /// reference preparation. No resolver borrow spans value destruction.
     pub(crate) fn remove_object(&self, object_ref: ObjectRef) -> Result<()> {
+        let object_gen = QpdfObjGen::from_object_ref(object_ref);
         let cached = {
             let mut core = self.core.borrow_mut();
             core.source_xref_entries.remove(&object_ref);
@@ -1759,17 +1789,17 @@ impl<R: Read + Seek> ResolverHandle<R> {
                 // `QPDF::removeObject` erases the one row every consumer reads.
                 core.raw_source_xref_entries.remove(&key);
             }
-            core.default_xref_entries.remove(&object_ref);
-            core.object_cache.get(&object_ref).cloned()
+            core.default_xref_entries.remove(&object_gen);
+            core.object_cache.get(&object_gen).cloned()
         };
         if let Some(handle) = cached {
             handle.remove_from_document();
-            self.core.borrow_mut().object_cache.remove(&object_ref);
+            self.core.borrow_mut().object_cache.remove(&object_gen);
         }
         self.core
             .borrow_mut()
             .allocated_object_refs
-            .remove(&object_ref);
+            .remove(&object_gen);
         Ok(())
     }
 
@@ -2276,7 +2306,7 @@ impl<R: Read + Seek> ResolverHandle<R> {
         self.core
             .borrow_mut()
             .default_xref_entries
-            .insert(object_ref);
+            .insert(QpdfObjGen::from_object_ref(object_ref));
     }
 
     #[cfg(test)]
@@ -2285,10 +2315,11 @@ impl<R: Read + Seek> ResolverHandle<R> {
     }
 
     fn has_default_xref_entry(&self, object_ref: ObjectRef) -> bool {
+        let object_gen = QpdfObjGen::from_object_ref(object_ref);
         self.core
             .borrow()
             .default_xref_entries
-            .contains(&object_ref)
+            .contains(&object_gen)
     }
 
     /// A snapshot of the source cross-reference entries, excluding the
@@ -2319,10 +2350,12 @@ impl<R: Read + Seek> ResolverHandle<R> {
     pub(crate) fn xref_entries(&self) -> BTreeMap<ObjectRef, XrefEntry> {
         let core = self.core.borrow();
         let mut entries = core.source_xref_entries.clone();
-        for object_ref in &core.default_xref_entries {
-            entries
-                .entry(*object_ref)
-                .or_insert(XrefEntry::Free { next: 0 });
+        for object_gen in &core.default_xref_entries {
+            if let Some(object_ref) = object_gen.to_object_ref() {
+                entries
+                    .entry(object_ref)
+                    .or_insert(XrefEntry::Free { next: 0 });
+            }
         }
         entries
     }
@@ -2333,12 +2366,10 @@ impl<R: Read + Seek> ResolverHandle<R> {
     pub(crate) fn raw_xref_entries(&self) -> BTreeMap<QpdfObjGen, XrefEntry> {
         let core = self.core.borrow();
         let mut entries = core.raw_source_xref_entries.clone();
-        for object_ref in &core.default_xref_entries {
-            if let Ok(object_ref) = QpdfObjGen::try_from_object_ref(*object_ref) {
-                entries
-                    .entry(object_ref)
-                    .or_insert(XrefEntry::Free { next: 0 });
-            }
+        for object_gen in &core.default_xref_entries {
+            entries
+                .entry(*object_gen)
+                .or_insert(XrefEntry::Free { next: 0 });
         }
         entries
     }
@@ -2676,7 +2707,7 @@ impl<R: Read + Seek> ResolverHandle<R> {
     /// requested slot fall through to the common null fallback.
     fn cache_parsed_object(&self, parsed: ParsedObjectAtOffset) {
         let ParsedObjectAtOffset {
-            object_ref,
+            object_gen,
             value,
             malformed,
             parsed_offset,
@@ -2685,7 +2716,7 @@ impl<R: Read + Seek> ResolverHandle<R> {
             end_after_space,
             trailing_start: _,
         } = parsed;
-        let handle = self.get_object_handle(object_ref);
+        let handle = self.get_object_handle_qpdf_obj_gen(object_gen);
         if malformed && matches!(&value, ObjectValue::Null) {
             // The qpdf parser recovers a damaged scalar/container close as a
             // visible null. Source damage remains observable through the
@@ -3257,9 +3288,12 @@ impl<R: Read + Seek> ResolverHandle<R> {
         let damage_offset = parsed
             .trailing_start
             .or_else(|| u64::try_from(parsed.end_after_space).ok());
-        let object_ref = parsed.object_ref;
+        let object_gen = parsed.object_gen;
         self.cache_parsed_object(parsed);
-        Ok((self.get_object_handle(object_ref), damage_offset))
+        Ok((
+            self.get_object_handle_qpdf_obj_gen(object_gen),
+            damage_offset,
+        ))
     }
 
     /// Read an xref stream through qpdf's `skip_cache_if_in_xref` branch.
@@ -3289,11 +3323,16 @@ impl<R: Read + Seek> ResolverHandle<R> {
         let damage_offset = parsed
             .trailing_start
             .or_else(|| u64::try_from(parsed.end_after_space).ok());
-        let object_ref = parsed.object_ref;
-        let cache_has_xref_value = self
-            .registered_handle(object_ref)
+        let object_gen = parsed.object_gen;
+        let cache_has_xref_value = object_gen
+            .to_object_ref()
+            .and_then(|object_ref| self.registered_handle(object_ref))
             .is_some_and(|handle| handle.is_resolved() && !handle.is_null());
-        if self.xref_entry(object_ref).is_some() || cache_has_xref_value {
+        if object_gen
+            .to_object_ref()
+            .is_some_and(|object_ref| self.xref_entry(object_ref).is_some())
+            || cache_has_xref_value
+        {
             let ParsedObjectAtOffset {
                 value,
                 parsed_offset,
@@ -3303,8 +3342,8 @@ impl<R: Read + Seek> ResolverHandle<R> {
                 malformed,
                 ..
             } = parsed;
-            let handle = ObjectHandle::new_indirect_for_pdf_with_resolver(
-                object_ref,
+            let handle = ObjectHandle::new_indirect_for_qpdf_obj_gen_with_resolver(
+                object_gen,
                 NO_PARSED_OFFSET,
                 self.pdf_unique_id.get(),
                 self.self_weak.clone(),
@@ -3322,7 +3361,10 @@ impl<R: Read + Seek> ResolverHandle<R> {
             return Ok((handle, damage_offset));
         }
         self.cache_parsed_object(parsed);
-        Ok((self.get_object_handle(object_ref), damage_offset))
+        Ok((
+            self.get_object_handle_qpdf_obj_gen(object_gen),
+            damage_offset,
+        ))
     }
 
     fn read_object_at_offset_with_description(
@@ -3340,7 +3382,7 @@ impl<R: Read + Seek> ResolverHandle<R> {
             Vec::new()
         };
         self.seek(offset).map_err(ReadObjectAtOffsetError::Body)?;
-        let (found_raw, found, parsed, trailing, trailing_start, object_header_offset) = {
+        let (found_raw, parsed, trailing, trailing_start, object_header_offset) = {
             let mut input = self.live_input();
             let mut tokenizer = LiveTokenSource::new(&mut input);
             let number_token = tokenizer
@@ -3400,15 +3442,9 @@ impl<R: Read + Seek> ResolverHandle<R> {
             let mut minter = ChildHandles {
                 resolver: self,
                 description_template: match read_description.as_deref() {
-                    Some(description) => self.parser_description_template_for_read(
-                        found.unwrap_or_else(|| {
-                            expected.to_object_ref().unwrap_or(ObjectRef::new(0, 0))
-                        }),
-                        description,
-                    ),
-                    None => self.parser_description_template(found.unwrap_or_else(|| {
-                        expected.to_object_ref().unwrap_or(ObjectRef::new(0, 0))
-                    })),
+                    Some(description) => self
+                        .parser_description_template_for_read_qpdf_obj_gen(found_raw, description),
+                    None => self.parser_description_template_qpdf_obj_gen(found_raw),
                 },
             };
             let encryption_parameters = self.encryption_parameters();
@@ -3458,7 +3494,6 @@ impl<R: Read + Seek> ResolverHandle<R> {
             input.finish().map_err(ReadObjectAtOffsetError::Body)?;
             (
                 found_raw,
-                found,
                 parsed,
                 trailing,
                 trailing_start,
@@ -3466,20 +3501,6 @@ impl<R: Read + Seek> ResolverHandle<R> {
             )
         };
 
-        if found.is_some_and(|object_ref| object_ref.number == 0) {
-            return Err(ReadObjectAtOffsetError::Header(Error::parse(
-                offset as usize,
-                "object with ID 0",
-            )));
-        }
-
-        if found.is_none() {
-            return Err(ReadObjectAtOffsetError::Header(Error::parse(
-                offset as usize,
-                "object reference is out of range",
-            )));
-        }
-        let found = found.expect("the range check above establishes the header object reference");
         self.set_last_qpdf_obj_gen_description(found_raw, read_description.as_deref());
         let warning_filename = self.core.borrow().description.clone();
         if expected.is_indirect() && found_raw != expected {
@@ -3499,7 +3520,7 @@ impl<R: Read + Seek> ResolverHandle<R> {
             self.push_qpdf_warning(QpdfExc::new(
                 QpdfErrorCode::DamagedPdf,
                 &warning_filename,
-                format!("object {} {}", found.number, found.generation),
+                format!("object {} {}", found_raw.get_obj(), found_raw.get_gen()),
                 i64::try_from(warning_offset).unwrap_or(i64::MAX),
                 warning.message.into_bytes(),
             ))
@@ -3510,7 +3531,7 @@ impl<R: Read + Seek> ResolverHandle<R> {
             self.push_qpdf_warning(QpdfExc::new(
                 QpdfErrorCode::DamagedPdf,
                 &warning_filename,
-                format!("object {} {}", found.number, found.generation),
+                format!("object {} {}", found_raw.get_obj(), found_raw.get_gen()),
                 i64::try_from(empty_offset).unwrap_or(i64::MAX),
                 b"empty object treated as null",
             ))
@@ -3527,7 +3548,7 @@ impl<R: Read + Seek> ResolverHandle<R> {
                 (NO_PARSED_OFFSET, NO_PARSED_OFFSET)
             };
             return Ok(ParsedObjectAtOffset {
-                object_ref: found,
+                object_gen: found_raw,
                 value,
                 malformed: false,
                 parsed_offset,
@@ -3553,14 +3574,14 @@ impl<R: Read + Seek> ResolverHandle<R> {
         debug_assert_eq!(parsed_offset, parsed.parsed_offset);
         let trailing = trailing.expect("non-empty parse must have a framing token");
         if trailing.is_word_value(b"stream") {
-            let stream_description = self.stream_description(found);
+            let stream_description = self.stream_description_qpdf_obj_gen(found_raw);
             let (value, parsed_offset) = self
                 .read_stream(
                     value,
                     parsed_offset,
                     description,
                     object_header_offset,
-                    found,
+                    found_raw,
                     read_description.as_deref(),
                 )
                 .map_err(ReadObjectAtOffsetError::Body)?;
@@ -3571,7 +3592,7 @@ impl<R: Read + Seek> ResolverHandle<R> {
                 (NO_PARSED_OFFSET, NO_PARSED_OFFSET)
             };
             Ok(ParsedObjectAtOffset {
-                object_ref: found,
+                object_gen: found_raw,
                 value,
                 malformed,
                 parsed_offset,
@@ -3582,8 +3603,12 @@ impl<R: Read + Seek> ResolverHandle<R> {
             })
         } else {
             if !trailing.is_word_value(b"endobj") {
-                self.push_expected_endobj_warning(
-                    found,
+                // qpdf renders this warning from the raw identity it just read,
+                // with no separate form for a header outside the `N G R` range
+                // (`QPDF.cc:1350-1354`), so route both cases through the raw
+                // helper rather than keeping a projection-only special case.
+                self.push_expected_endobj_warning_qpdf_obj_gen(
+                    found_raw,
                     u64::try_from(trailing.start).unwrap_or(u64::MAX),
                     read_description.as_deref(),
                 )
@@ -3596,7 +3621,7 @@ impl<R: Read + Seek> ResolverHandle<R> {
                 (NO_PARSED_OFFSET, NO_PARSED_OFFSET)
             };
             Ok(ParsedObjectAtOffset {
-                object_ref: found,
+                object_gen: found_raw,
                 value,
                 malformed,
                 parsed_offset,
@@ -3653,7 +3678,7 @@ impl<R: Read + Seek> ResolverHandle<R> {
         dict_offset: i64,
         dict_description: Vec<u8>,
         object_header_offset: u64,
-        object_ref: ObjectRef,
+        object_gen: QpdfObjGen,
         read_description: Option<&[u8]>,
     ) -> Result<(ObjectValue, i64)> {
         self.validate_stream_line_end()?;
@@ -3678,14 +3703,18 @@ impl<R: Read + Seek> ResolverHandle<R> {
                 if !self.stream_recovery_enabled() {
                     return Err(error);
                 }
-                self.warn_stream_failure(
+                self.warn_stream_failure_qpdf_obj_gen(
                     &error,
                     object_header_offset,
-                    object_ref,
+                    object_gen,
                     read_description,
                 )?; // cov:ignore: LLVM maps this covered multiline recovery call terminator to a zero-count continuation region
                 recovered = true;
-                self.recover_stream_length(stream_offset, object_ref, read_description)?
+                self.recover_stream_length_qpdf_obj_gen(
+                    stream_offset,
+                    object_gen,
+                    read_description,
+                )? // cov:ignore: LLVM attributes the covered recovery-call terminator to a zero-count continuation region
             }
             Err(error) => return Err(error),
         };
@@ -3708,13 +3737,17 @@ impl<R: Read + Seek> ResolverHandle<R> {
                 if !self.stream_recovery_enabled() {
                     return Err(error);
                 }
-                self.warn_stream_failure(
+                self.warn_stream_failure_qpdf_obj_gen(
                     &error,
                     object_header_offset,
-                    object_ref,
+                    object_gen,
                     read_description,
                 )?; // cov:ignore: LLVM maps this covered multiline framing-recovery call terminator to a zero-count continuation region
-                length = self.recover_stream_length(stream_offset, object_ref, read_description)?;
+                length = self.recover_stream_length_qpdf_obj_gen(
+                    stream_offset,
+                    object_gen,
+                    read_description,
+                )?; // cov:ignore: LLVM attributes the covered framing-recovery-call terminator to a zero-count continuation region
             }
         }
 
@@ -3722,7 +3755,11 @@ impl<R: Read + Seek> ResolverHandle<R> {
         // `readStream` returns and warns if it is not `endobj`.
         let (trailing, trailing_offset) = self.read_token_from_input()?;
         if !trailing.is_word_value(b"endobj") {
-            self.push_expected_endobj_warning(object_ref, trailing_offset, read_description)?;
+            self.push_expected_endobj_warning_qpdf_obj_gen(
+                object_gen,
+                trailing_offset,
+                read_description,
+            )?; // cov:ignore: LLVM attributes the covered raw framing-warning call terminator to a zero-count continuation region
         }
 
         let dict = self.direct_object_handle(dict);
@@ -3765,11 +3802,27 @@ impl<R: Read + Seek> ResolverHandle<R> {
     /// `recoverStreamLength`. Length failures are attributed to the indirect
     /// object's header; `expected endstream` is attributed to the attempted
     /// framing read at the stream data position.
+    #[cfg(test)]
     fn warn_stream_failure(
         &self,
         error: &Error,
         object_header_offset: u64,
         object_ref: ObjectRef,
+        read_description: Option<&[u8]>,
+    ) -> Result<()> {
+        self.warn_stream_failure_qpdf_obj_gen(
+            error,
+            object_header_offset,
+            QpdfObjGen::from_object_ref(object_ref),
+            read_description,
+        )
+    }
+
+    fn warn_stream_failure_qpdf_obj_gen(
+        &self,
+        error: &Error,
+        object_header_offset: u64,
+        object_gen: QpdfObjGen,
         read_description: Option<&[u8]>,
     ) -> Result<()> {
         let Error::Parse { offset, message } = error else {
@@ -3780,8 +3833,8 @@ impl<R: Read + Seek> ResolverHandle<R> {
         } else {
             object_header_offset
         };
-        self.push_stream_warning_with_current_description(
-            object_ref,
+        self.push_stream_warning_with_current_description_qpdf_obj_gen(
+            object_gen,
             warning_offset,
             message,
             read_description,
@@ -3799,14 +3852,28 @@ impl<R: Read + Seek> ResolverHandle<R> {
     /// longer word remains discoverable. For `endobj`, qpdf rewinds to the
     /// token start so the outer `readObject` consumes it; for `endstream`, it
     /// leaves the input after the token.
+    #[cfg(test)]
     fn recover_stream_length(
         &self,
         stream_offset: u64,
         object_ref: ObjectRef,
         read_description: Option<&[u8]>,
     ) -> Result<usize> {
-        let warning = self.push_stream_warning_with_current_description(
-            object_ref,
+        self.recover_stream_length_qpdf_obj_gen(
+            stream_offset,
+            QpdfObjGen::from_object_ref(object_ref),
+            read_description,
+        )
+    }
+
+    fn recover_stream_length_qpdf_obj_gen(
+        &self,
+        stream_offset: u64,
+        object_gen: QpdfObjGen,
+        read_description: Option<&[u8]>,
+    ) -> Result<usize> {
+        let warning = self.push_stream_warning_with_current_description_qpdf_obj_gen(
+            object_gen,
             stream_offset,
             "attempting to recover stream length",
             read_description,
@@ -3831,25 +3898,25 @@ impl<R: Read + Seek> ResolverHandle<R> {
         if let Some(eol) = recovered_eol {
             self.recovered_stream_eols
                 .borrow_mut()
-                .insert(object_ref, eol);
+                .insert(object_gen, eol);
         } else {
-            self.recovered_stream_eols.borrow_mut().remove(&object_ref);
+            self.recovered_stream_eols.borrow_mut().remove(&object_gen);
         }
         if let Some(next_position) = next_position {
             self.seek(next_position)?;
         }
 
         if length == 0 {
-            self.push_stream_warning_with_current_description(
-                object_ref,
+            self.push_stream_warning_with_current_description_qpdf_obj_gen(
+                object_gen,
                 stream_offset,
                 "unable to recover stream data; treating stream as empty",
                 read_description,
             )?;
         } else {
             let message = format!("recovered stream length: {length}");
-            self.push_stream_warning_with_current_description(
-                object_ref,
+            self.push_stream_warning_with_current_description_qpdf_obj_gen(
+                object_gen,
                 stream_offset,
                 message,
                 read_description,
@@ -3886,7 +3953,7 @@ impl<R: Read + Seek> ResolverHandle<R> {
     ) -> Option<crate::parser::RecoveredStreamEol> {
         self.recovered_stream_eols
             .borrow()
-            .get(&object_ref)
+            .get(&QpdfObjGen::from_object_ref(object_ref))
             .copied()
     }
 
@@ -3912,9 +3979,9 @@ impl<R: Read + Seek> ResolverHandle<R> {
     /// that same shape instead of passing the offset as a bare diagnostic,
     /// which would lose the object identity at the canonical ObjectHandle
     /// boundary.
-    fn push_stream_warning(
+    fn push_stream_warning_qpdf_obj_gen(
         &self,
-        object_ref: ObjectRef,
+        object_gen: QpdfObjGen,
         offset: u64,
         message: impl Into<String>,
     ) -> Result<()> {
@@ -3922,7 +3989,7 @@ impl<R: Read + Seek> ResolverHandle<R> {
         self.push_qpdf_warning(QpdfExc::new(
             QpdfErrorCode::DamagedPdf,
             filename,
-            format!("object {} {}", object_ref.number, object_ref.generation),
+            format!("object {} {}", object_gen.get_obj(), object_gen.get_gen()),
             i64::try_from(offset).unwrap_or(i64::MAX),
             message.into().into_bytes(),
         ))
@@ -3934,20 +4001,20 @@ impl<R: Read + Seek> ResolverHandle<R> {
     /// (`libqpdf/QPDF.cc:488-504`, `QPDFExc.cc:19-50`). Keeping the complete
     /// bytes as an object-origin diagnostic keeps live delivery identical to
     /// later diagnostic inspection, including arbitrary input-description bytes.
-    fn push_stream_warning_with_description(
+    fn push_stream_warning_with_description_qpdf_obj_gen(
         &self,
-        object_ref: ObjectRef,
+        object_gen: QpdfObjGen,
         offset: u64,
         message: impl Into<String>,
         read_description: Option<&[u8]>,
     ) -> Result<()> {
         let Some(read_description) = read_description else {
-            return self.push_stream_warning(object_ref, offset, message);
+            return self.push_stream_warning_qpdf_obj_gen(object_gen, offset, message);
         };
         let message = message.into();
         let mut object_description = read_description.to_vec();
         object_description.extend_from_slice(
-            format!(": object {} {}", object_ref.number, object_ref.generation).as_bytes(),
+            format!(": object {} {}", object_gen.get_obj(), object_gen.get_gen()).as_bytes(),
         );
         self.push_stream_warning_with_object_description(&object_description, offset, message)
     }
@@ -3959,9 +4026,25 @@ impl<R: Read + Seek> ResolverHandle<R> {
     /// (`libqpdf/QPDF.cc:1371-1397,1482-1529,1725`). Direct `/Length` and
     /// legacy callers that have no current state fall back to the entry
     /// object's description, preserving the existing diagnostic shape.
+    #[cfg(test)]
     fn push_stream_warning_with_current_description(
         &self,
         object_ref: ObjectRef,
+        offset: u64,
+        message: impl Into<String>,
+        read_description: Option<&[u8]>,
+    ) -> Result<()> {
+        self.push_stream_warning_with_current_description_qpdf_obj_gen(
+            QpdfObjGen::from_object_ref(object_ref),
+            offset,
+            message,
+            read_description,
+        )
+    }
+
+    fn push_stream_warning_with_current_description_qpdf_obj_gen(
+        &self,
+        object_gen: QpdfObjGen,
         offset: u64,
         message: impl Into<String>,
         read_description: Option<&[u8]>,
@@ -3988,7 +4071,12 @@ impl<R: Read + Seek> ResolverHandle<R> {
                 message,
             );
         }
-        self.push_stream_warning_with_description(object_ref, offset, message, read_description)
+        self.push_stream_warning_with_description_qpdf_obj_gen(
+            object_gen,
+            offset,
+            message,
+            read_description,
+        )
     }
 
     /// Emit a stream warning using qpdf's already-composed object description.
@@ -4114,9 +4202,9 @@ impl<R: Read + Seek> ResolverHandle<R> {
     /// This helper only validates and dereferences `/Length`; it receives
     /// qpdf's post-`obj` header position so malformed `/Length` exceptions
     /// retain the offset captured by `readObject`. [`Self::read_stream`] passes
-    /// that position to this helper and to [`Self::warn_stream_failure`]. A
+    /// that position to this helper and to [`Self::warn_stream_failure_qpdf_obj_gen`]. A
     /// framing failure instead uses the attempted `endstream` token's offset,
-    /// while [`Self::recover_stream_length`] reports its recovery warning at
+    /// while [`Self::recover_stream_length_qpdf_obj_gen`] reports its recovery warning at
     /// the stream-data offset.
     fn stream_length(dict: &ObjectValue, object_header_offset: u64) -> Result<usize> {
         let error_offset = usize::try_from(object_header_offset).unwrap_or(usize::MAX);
@@ -4929,12 +5017,16 @@ impl<R: Read + Seek> DocumentResolver for ResolverHandle<R> {
     /// `parser.rs` wraps `Parser::object`: this is the frame that appears
     /// exactly once per level, so protecting it protects every level.
     fn resolve_indirect(&self, object_ref: ObjectRef, handle: &ObjectHandle) -> Result<()> {
+        self.resolve_qpdf_obj_gen(QpdfObjGen::from_object_ref(object_ref), handle)
+    }
+
+    fn resolve_qpdf_obj_gen(&self, object_gen: QpdfObjGen, handle: &ObjectHandle) -> Result<()> {
         // Keep this boundary small: enter the large dispatch frame only after
         // maybe_grow has had a chance to switch away from a small caller stack.
         stacker::maybe_grow(
             super::READER_STACK_RED_ZONE,
             super::READER_STACK_GROWTH_SIZE,
-            || self.resolve_indirect_inner(object_ref, handle),
+            || self.resolve_indirect_inner(object_gen, handle),
         )
     }
 }
@@ -4951,20 +5043,21 @@ impl<R: Read + Seek> ResolverHandle<R> {
     /// dispatch frame. The `/Length` resolver can re-enter this frame once
     /// per indirect link, so even a small local-layout change compounds on
     /// the deep-chain path.
-    fn resolve_indirect_inner(&self, object_ref: ObjectRef, handle: &ObjectHandle) -> Result<()> {
+    fn resolve_indirect_inner(&self, object_gen: QpdfObjGen, handle: &ObjectHandle) -> Result<()> {
         // ---- phase 1: short borrows only ----
 
         // Bound to a named local, not to `_`: the mark must live until
         // this method returns or unwinds, and `let Some(_) = ..` would
         // drop it at the end of this statement.
-        let Some(_mark) = ResolveMark::begin(&self.core, object_ref) else {
+        let Some(_mark) = ResolveMark::begin(&self.core, object_gen) else {
             // qpdf's order: warn, then cache null
             // (`libqpdf/QPDF.cc:1710-1711`). Neither call may hold a
             // borrow across the other — `push_warning` takes its own
             // `borrow_mut`.
             let detail = format!(
                 "loop detected resolving object {} {}",
-                object_ref.number, object_ref.generation
+                object_gen.get_obj(),
+                object_gen.get_gen()
             );
             let filename = self.core.borrow().description.clone();
             self.push_qpdf_warning(QpdfExc::new(
@@ -4977,12 +5070,26 @@ impl<R: Read + Seek> ResolverHandle<R> {
             handle.set_resolved(ObjectValue::Null);
             return Ok(());
         };
-        let entry = self.xref_entry(object_ref);
+        let entry = object_gen
+            .to_object_ref()
+            .and_then(|object_ref| self.xref_entry(object_ref))
+            .or_else(|| {
+                self.core
+                    .borrow()
+                    .raw_source_xref_entries
+                    .get(&object_gen)
+                    .copied()
+            });
 
-        if entry.is_none() && self.has_default_xref_entry(object_ref) {
+        if entry.is_none()
+            && object_gen
+                .to_object_ref()
+                .is_some_and(|object_ref| self.has_default_xref_entry(object_ref))
+        {
             self.push_warning(format!(
                 "object {}/{} has unexpected xref entry type",
-                object_ref.number, object_ref.generation
+                object_gen.get_obj(),
+                object_gen.get_gen()
             ))?;
             handle.set_resolved(ObjectValue::Null);
             return Ok(());
@@ -5000,7 +5107,7 @@ impl<R: Read + Seek> ResolverHandle<R> {
                 // particular, it must not turn this known sentinel
                 // into a resolution-time xref-recovery trigger.
                 if offset == 0 {
-                    self.set_last_object_description(object_ref, None)?;
+                    self.set_last_qpdf_obj_gen_description(object_gen, None);
                     self.push_warning_at_with_last_object_description(0, "object has offset 0")?;
                     handle.set_resolved(ObjectValue::Null);
                     return Ok(());
@@ -5008,15 +5115,15 @@ impl<R: Read + Seek> ResolverHandle<R> {
                 let attempt_recovery = self.attempt_recovery();
                 match self.read_object_at_offset_with_description(
                     offset,
-                    QpdfObjGen::try_from_object_ref(object_ref)?,
+                    object_gen,
                     true,
                     attempt_recovery,
                     None,
                 ) {
                     Ok(parsed) => {
-                        let parsed_ref = parsed.object_ref;
+                        let parsed_gen = parsed.object_gen;
                         self.cache_parsed_object(parsed);
-                        if parsed_ref != object_ref {
+                        if parsed_gen != object_gen {
                             // qpdf's common resolve tail sees the
                             // requested slot still unresolved after
                             // caching the header's actual generation.
@@ -5026,14 +5133,11 @@ impl<R: Read + Seek> ResolverHandle<R> {
                     }
                     Err(ReadObjectAtOffsetError::Body(error)) => Err(error),
                     Err(ReadObjectAtOffsetError::Header(error)) if attempt_recovery => {
-                        match self.reconstruct_xref_and_retry(
-                            error,
-                            QpdfObjGen::try_from_object_ref(object_ref)?,
-                        ) {
+                        match self.reconstruct_xref_and_retry(error, object_gen) {
                             Ok(Some(parsed)) => {
-                                let parsed_ref = parsed.object_ref;
+                                let parsed_gen = parsed.object_gen;
                                 self.cache_parsed_object(parsed);
-                                if parsed_ref != object_ref {
+                                if parsed_gen != object_gen {
                                     handle.set_resolved(ObjectValue::Null); // cov:ignore: reconstructed xref keys the exact parsed object reference
                                 }
                                 Ok(())
@@ -5041,7 +5145,7 @@ impl<R: Read + Seek> ResolverHandle<R> {
                             Ok(None) => {
                                 let warning = format!(
                                             "object {} {} not found in file after regenerating cross reference table",
-                                            object_ref.number, object_ref.generation
+                                            object_gen.get_obj(), object_gen.get_gen()
                                         );
                                 // qpdf uses damagedPDF("", 0, message) after
                                 // reconstruction cannot find the requested
@@ -5076,10 +5180,7 @@ impl<R: Read + Seek> ResolverHandle<R> {
         match result {
             Ok(()) => Ok(()),
             Err(error) => {
-                self.push_caught_resolution_warning(
-                    error,
-                    QpdfObjGen::try_from_object_ref(object_ref)?,
-                )?;
+                self.push_caught_resolution_warning(error, object_gen)?;
                 if !handle.is_resolved() {
                     handle.set_resolved(ObjectValue::Null);
                 }
@@ -5094,7 +5195,6 @@ mod tests {
     use super::pipe_stream_data_from_input;
     use super::ChildHandles;
     use super::ObjectStreamResolutionError;
-    use super::ReadObjectAtOffsetError;
     use super::ResolveMark;
     use super::ResolverHandle;
     use super::ResolverWarningOptions;
@@ -5612,10 +5712,10 @@ mod tests {
     fn recovered_stream_eol_lookup_returns_the_recorded_value() {
         let resolver = resolver_over(Vec::new());
         let object_ref = ObjectRef::new(1, 0);
-        resolver
-            .recovered_stream_eols
-            .borrow_mut()
-            .insert(object_ref, crate::parser::RecoveredStreamEol::CrLf);
+        resolver.recovered_stream_eols.borrow_mut().insert(
+            QpdfObjGen::from_object_ref(object_ref),
+            crate::parser::RecoveredStreamEol::CrLf,
+        );
 
         assert_eq!(
             resolver.recovered_stream_eol(object_ref),
@@ -5812,7 +5912,7 @@ mod tests {
         );
 
         resolver
-            .push_expected_endobj_warning(ObjectRef::new(7, 0), 12, None)
+            .push_expected_endobj_warning_qpdf_obj_gen(QpdfObjGen::new(7, 0), 12, None)
             .expect("warning delivery");
 
         assert_eq!(
@@ -8810,7 +8910,8 @@ mod tests {
         handle.set_parsed_offset_if_unset(100);
 
         let resolver = Rc::clone(&pdf.resolver);
-        let outer = ResolveMark::begin(&resolver.core, object_ref)
+        let object_gen = QpdfObjGen::from_object_ref(object_ref);
+        let outer = ResolveMark::begin(&resolver.core, object_gen)
             .expect("the first mark for a reference must be recorded, not reported as a loop");
 
         pdf.resolve(&handle)
@@ -8827,13 +8928,13 @@ mod tests {
             "qpdf caches the loop null at offset -1, overwriting what was there"
         );
         assert!(
-            pdf.resolver.core.borrow().resolving.contains(&object_ref),
+            pdf.resolver.core.borrow().resolving.contains(&object_gen),
             "the inner loop-detecting call must not erase the outer resolution's mark"
         );
 
         drop(outer);
         assert!(
-            !pdf.resolver.core.borrow().resolving.contains(&object_ref),
+            !pdf.resolver.core.borrow().resolving.contains(&object_gen),
             "the outer guard must remove its own mark when it goes out of scope"
         );
     }
@@ -10452,7 +10553,8 @@ mod tests {
         );
 
         let resolver = Rc::clone(&pdf.resolver);
-        let outer = ResolveMark::begin(&resolver.core, object_ref).expect("first mark");
+        let outer = ResolveMark::begin(&resolver.core, QpdfObjGen::from_object_ref(object_ref))
+            .expect("first mark");
         pdf.resolve(&handle).expect("a loop is not an error");
         drop(outer);
 
@@ -10482,7 +10584,8 @@ mod tests {
         pdf.set_logger(logger);
 
         let resolver = Rc::clone(&pdf.resolver);
-        let outer = ResolveMark::begin(&resolver.core, object_ref).unwrap();
+        let outer =
+            ResolveMark::begin(&resolver.core, QpdfObjGen::from_object_ref(object_ref)).unwrap();
         assert!(matches!(
             pdf.resolve(&handle),
             Err(Error::System(ref message)) if message == "sink write failure 1"
@@ -10506,7 +10609,8 @@ mod tests {
 
         pdf.push_warning("before the loop").unwrap();
         let resolver = Rc::clone(&pdf.resolver);
-        let outer = ResolveMark::begin(&resolver.core, object_ref).expect("first mark");
+        let outer = ResolveMark::begin(&resolver.core, QpdfObjGen::from_object_ref(object_ref))
+            .expect("first mark");
         pdf.resolve(&handle).expect("a loop is not an error");
         drop(outer);
         pdf.push_warning("after the loop").unwrap();
@@ -10545,13 +10649,19 @@ mod tests {
         let object_ref = ObjectRef::new(1, 0);
 
         let unwound = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-            let _mark = ResolveMark::begin(&pdf.resolver.core, object_ref).expect("first mark");
+            let _mark =
+                ResolveMark::begin(&pdf.resolver.core, QpdfObjGen::from_object_ref(object_ref))
+                    .expect("first mark");
             panic!("simulated failure part-way through a resolution");
         }));
 
         assert!(unwound.is_err(), "the body must actually have panicked");
         assert!(
-            !pdf.resolver.core.borrow().resolving.contains(&object_ref),
+            !pdf.resolver
+                .core
+                .borrow()
+                .resolving
+                .contains(&QpdfObjGen::from_object_ref(object_ref)),
             "an unwind must leave the reference resolvable, not permanently marked in progress"
         );
     }
@@ -14127,7 +14237,7 @@ mod tests {
     }
 
     #[test]
-    fn raw_invalid_generation_header_range_failure_uses_qpdf_warning_boundary() {
+    fn raw_invalid_generation_matching_header_is_cached_without_range_warning() {
         let mut bytes = b"%PDF-1.4\n".to_vec();
         let offset = bytes.len();
         bytes.extend_from_slice(b"5 65536 obj\n45\nendobj\n%tail\n");
@@ -14151,8 +14261,11 @@ mod tests {
 
         resolver
             .fix_dangling_references()
-            .expect("range failure is caught as a qpdf warning");
-        assert!(!resolver.repair_diagnostics().entries().is_empty());
+            .expect("matching raw header is read without recovery");
+        assert!(resolver.repair_diagnostics().entries().is_empty());
+        assert!(resolver
+            .get_object_handle_qpdf_obj_gen(QpdfObjGen::new(5, 65_536))
+            .is_resolved());
     }
 
     #[test]
@@ -14296,10 +14409,10 @@ mod tests {
     }
 
     #[test]
-    fn invalid_raw_generation_with_a_description_reports_range_failure() {
+    fn raw_generation_with_a_description_keeps_the_raw_identity() {
         let mut bytes = b"%PDF-1.4\n".to_vec();
         let offset = bytes.len();
-        bytes.extend_from_slice(b"5 65536 obj\n45\nendobj\n");
+        bytes.extend_from_slice(b"5 65536 obj\n45\nendobj\n%tail\n");
         let resolver = ResolverHandle::new_shared(
             Cursor::new(bytes),
             0,
@@ -14311,7 +14424,7 @@ mod tests {
             0,
         );
 
-        let error = resolver
+        let parsed = resolver
             .read_object_at_offset_with_description(
                 offset as u64,
                 QpdfObjGen::new(5, 65_536),
@@ -14319,12 +14432,142 @@ mod tests {
                 false,
                 Some(b"described read".to_vec()),
             )
-            .expect_err("invalid raw generation cannot become an ObjectRef");
-        assert!(matches!(
-            error,
-            ReadObjectAtOffsetError::Header(Error::Parse { message, .. })
-                if message == "object reference is out of range"
-        ));
+            .expect("qpdf reads a matching raw object header");
+        assert_eq!(parsed.object_gen, QpdfObjGen::new(5, 65_536));
+    }
+
+    #[test]
+    fn raw_generation_stream_headers_keep_the_raw_identity_through_framing() {
+        let mut bytes = b"%PDF-1.4\n".to_vec();
+        let offset = bytes.len();
+        bytes.extend_from_slice(
+            b"5 65536 obj\n<< /Length 0 >>\nstream\n\nendstream\nendobj\n%tail\n",
+        );
+        let resolver = ResolverHandle::new_shared(
+            Cursor::new(bytes),
+            0,
+            BTreeMap::<ObjectRef, XrefEntry>::new(),
+            false,
+            false,
+            Diagnostics::default(),
+            ResolverWarningOptions::new(crate::QPDFLogger::create(), true, Vec::new()),
+            0,
+        );
+
+        let parsed = resolver
+            .read_object_at_offset_with_description(
+                offset as u64,
+                QpdfObjGen::new(5, 65_536),
+                true,
+                false,
+                None,
+            )
+            .expect("qpdf keeps the raw stream header identity");
+        assert_eq!(parsed.object_gen, QpdfObjGen::new(5, 65_536));
+    }
+
+    #[test]
+    fn raw_generation_stream_recovery_and_framing_warnings_keep_the_raw_identity() {
+        let read = |body: &[u8]| {
+            let mut bytes = b"%PDF-1.4\n".to_vec();
+            let offset = bytes.len();
+            bytes.extend_from_slice(body);
+            let resolver = ResolverHandle::new_shared(
+                Cursor::new(bytes),
+                0,
+                BTreeMap::<ObjectRef, XrefEntry>::new(),
+                true,
+                false,
+                Diagnostics::default(),
+                ResolverWarningOptions::new(crate::QPDFLogger::create(), true, Vec::new()),
+                0,
+            );
+            let parsed = resolver
+                .read_object_at_offset_with_description(
+                    offset as u64,
+                    QpdfObjGen::new(5, 65_536),
+                    true,
+                    false,
+                    None,
+                )
+                .expect("raw stream framing remains on qpdf's recovery path");
+            (parsed, resolver)
+        };
+
+        let (missing_length, missing_length_resolver) =
+            read(b"5 65536 obj\n<< >>\nstream\npayload\nendstream\nendobj\n%tail\n");
+        assert_eq!(missing_length.object_gen, QpdfObjGen::new(5, 65_536));
+        assert!(missing_length_resolver
+            .repair_diagnostics()
+            .entries()
+            .iter()
+            .any(|entry| entry.message_string() == "attempting to recover stream length"));
+
+        let (wrong_length, wrong_length_resolver) =
+            read(b"5 65536 obj\n<< /Length 1 >>\nstream\nabc\nendstream\nendobj\n%tail\n");
+        assert_eq!(wrong_length.object_gen, QpdfObjGen::new(5, 65_536));
+        assert!(wrong_length_resolver
+            .repair_diagnostics()
+            .entries()
+            .iter()
+            .any(|entry| entry.message_string() == "expected endstream"));
+
+        let (wrong_endobj, wrong_endobj_resolver) =
+            read(b"5 65536 obj\n<< /Length 0 >>\nstream\n\nendstream\nnot-endobj\n%tail\n");
+        assert_eq!(wrong_endobj.object_gen, QpdfObjGen::new(5, 65_536));
+        assert!(wrong_endobj_resolver
+            .repair_diagnostics()
+            .entries()
+            .iter()
+            .any(|entry| entry.message_string() == "expected endobj"));
+    }
+
+    #[test]
+    fn raw_expected_endobj_warning_uses_a_described_raw_identity_when_state_is_empty() {
+        let resolver = bare_resolver();
+        resolver
+            .push_expected_endobj_warning_qpdf_obj_gen(
+                QpdfObjGen::new(5, 65_536),
+                7,
+                Some(b"described read"),
+            )
+            .expect("raw described warning");
+        assert!(resolver.repair_diagnostics().entries().iter().any(|entry| {
+            let what = String::from_utf8_lossy(entry.what_bytes());
+            what.contains("object 5 65536") && what.contains("expected endobj")
+        }));
+    }
+
+    #[test]
+    fn raw_generation_expected_endobj_warning_keeps_the_raw_identity() {
+        let mut bytes = b"%PDF-1.4\n".to_vec();
+        let offset = bytes.len();
+        bytes.extend_from_slice(b"5 65536 obj\n45\nnot-endobj\n%tail\n");
+        let resolver = ResolverHandle::new_shared(
+            Cursor::new(bytes),
+            0,
+            BTreeMap::<ObjectRef, XrefEntry>::new(),
+            false,
+            false,
+            Diagnostics::default(),
+            ResolverWarningOptions::new(crate::QPDFLogger::create(), true, Vec::new()),
+            0,
+        );
+
+        resolver
+            .read_object_at_offset_with_description(
+                offset as u64,
+                QpdfObjGen::new(5, 65_536),
+                true,
+                false,
+                None,
+            )
+            .expect("qpdf keeps the raw identity while warning about framing");
+        assert!(resolver
+            .repair_diagnostics()
+            .entries()
+            .iter()
+            .any(|entry| entry.message_string() == "expected endobj"));
     }
 
     #[test]
