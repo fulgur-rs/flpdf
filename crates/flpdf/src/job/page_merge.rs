@@ -1090,23 +1090,17 @@ fn merge_documents_with_resource_decisions_and_preserve_primary_into_impl<
     let mut writer_object_order: BTreeMap<ObjectRef, WriterObjectOrderKey> = BTreeMap::new();
     // qpdf keeps the primary QPDF object-number allocator alive while it
     // copies foreign page graphs. Foreign copies therefore receive the next
-    // object numbers after the primary xref universe, not the fresh target's
-    // local references. Retain that QDF-visible identity separately from the
-    // destination order key (`QPDF.cc:2019-2213`).
-    let primary_max_object = inputs[0]
-        .source
-        .source_xref_entries()
-        .keys()
-        .map(|object| object.number)
-        .max()
-        .unwrap_or(0);
-    // cov:ignore-start: a source xref object-number universe ending at
-    // u32::MAX cannot allocate the next foreign identity in a representable
-    // PDF object space.
-    let mut next_foreign_original = primary_max_object.checked_add(1).ok_or_else(|| {
-        Error::Unsupported("foreign QDF object identity overflows u32".to_owned())
-    })?;
-    // cov:ignore-end
+    // object numbers after the primary cache *after page removal*, not the
+    // fresh target's local references. Page removal can itself promote a
+    // direct inherited `/Pages` value into a newly allocated object
+    // (`QPDF_optimization.cc:179-190`), so these values are initialized at
+    // the primary mutation boundary below rather than from the pre-mutation
+    // xref table (`QPDF.cc:1271-1283,2019-2213`).
+    let mut primary_max_object = 0;
+    // This is assigned before the first non-primary input is processed. The
+    // initial value only keeps the variable initialized for Rust's definite
+    // assignment rules; qpdf always processes the primary input first.
+    let mut next_foreign_original = 1;
 
     // Output `/Kids`, accumulated across inputs in input/selection order.
     let mut kids: Vec<ObjectRef> = Vec::new();
@@ -1274,6 +1268,14 @@ fn merge_documents_with_resource_decisions_and_preserve_primary_into_impl<
             for &page_ref in &all {
                 PageDocumentHelper::new(input.source).remove_page(page_ref)?;
             }
+            primary_max_object = input.source.get_object_count()?;
+            // cov:ignore-start: a source object-number universe ending at
+            // u32::MAX cannot allocate the next foreign identity in a
+            // representable PDF object space.
+            next_foreign_original = primary_max_object.checked_add(1).ok_or_else(|| {
+                Error::Unsupported("foreign QDF object identity overflows u32".to_owned())
+            })?;
+            // cov:ignore-end
         }
 
         // qpdf's QPDFPageDocumentHelper::addPage delegates foreign page
@@ -1512,20 +1514,22 @@ fn merge_documents_with_resource_decisions_and_preserve_primary_into_impl<
             // unreachable and therefore omitted by the ordinary writer, but
             // they preserve qpdf's diagnostic object identities and allocator
             // ordering for the subsequent foreign copy.
-            let mut target_max = target
+            let target_max = target
                 .canonical_live_object_refs()
                 .into_iter()
                 .map(|object| object.number)
                 .max()
                 .unwrap_or(0);
-            // `make_indirect_object_handle` allocates at `target_max + 1`, so
-            // the padding is complete once the target maximum has reached the
-            // primary maximum: running on equality too would leave it at
-            // `primary_max_object + 1` and push the first foreign copy to
-            // `primary_max_object + 2`.
-            while target_max < primary_max_object {
-                target.make_indirect_object_handle(ObjectHandle::null())?;
-                target_max += 1;
+            // Raising the ceiling is what matters here, not owning every slot
+            // below it: the next allocation is `max + 1` either way, and the
+            // reserved slots are unreachable and never written. Claim only the
+            // top slot instead of one object per gap -- the gap is attacker
+            // controlled (a single dangling `100000000 0 R` in a 351-byte file
+            // reaches `get_object_count`), so filling it would let a tiny input
+            // allocate unboundedly.
+            if target_max < primary_max_object {
+                target
+                    .replace_object(ObjectRef::new(primary_max_object, 0), ObjectHandle::null())?;
             }
         }
     }
