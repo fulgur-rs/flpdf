@@ -314,6 +314,12 @@ jobs:
           bash scripts/ci-apt-install.sh libjpeg-dev
           cargo test -p flpdf --features qpdf-libjpeg-compat --lib pipeline::dct
           cargo test -p flpdf-libjpeg-compat --features system-libjpeg --test api
+          # The workspace run above cannot build the libjpeg command -- the
+          # header arrives on the first line of this step -- so its filter is
+          # the one the contract has to skip there. Re-run the contract here,
+          # where libjpeg is installed, so a renamed `pipeline::dct` test is
+          # still caught instead of passing as an unbuildable probe.
+          cargo test -p flpdf-cli --test ci_workflow_contract
 
       # amd64-Linux-only: the captured reference bytes match the amd64 Ubuntu
       # base image's zlib1g version; Windows (libz-sys vendored zlib),

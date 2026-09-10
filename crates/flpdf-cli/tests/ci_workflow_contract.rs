@@ -16,6 +16,13 @@ const RELEASE_JOB_NAME: &str = "release";
 const RELEASE_JOB_RUNS_ON: &str = "ubuntu-latest";
 const RELEASE_TEST_COMMAND: &str = "cargo test --workspace --profile release-ci";
 const LIBJPEG_COMPAT_TEST_CONDITION: &str = "${{ runner.os == 'Linux' && matrix.arch == 'amd64' }}";
+/// Filtered commands whose step installs a system library on an earlier line of
+/// its own `run:` block. The workspace test run happens before that install, so
+/// cargo cannot build them from there. ci.yml re-runs this contract inside that
+/// step, where the library is present and the filter is resolved for real, so
+/// the entry buys a skip in one place and never a skip everywhere.
+const SYSTEM_LIBRARY_FILTERED_COMMANDS: [&str; 1] =
+    ["cargo test -p flpdf --features qpdf-libjpeg-compat --lib pipeline::dct"];
 const BASH_CONTROL_FLOW_KEYWORDS: [&str; 11] = [
     "if", "then", "else", "fi", "case", "esac", "for", "while", "until", "do", "done",
 ];
@@ -502,7 +509,31 @@ const CARGO_TEST_VALUE_FLAGS: &[&str] = &[
     "-Z",
 ];
 
-fn workflow_filtered_cargo_test_commands(workflow: &str) -> ContractResult<Vec<String>> {
+/// A filtered `cargo test` command together with the `if:` condition of the step
+/// that runs it.
+struct FilteredCommand {
+    command: String,
+    condition: Option<String>,
+}
+
+/// Whether the host running this contract satisfies a step's `if:` condition.
+///
+/// Only conditions listed here are evaluated; anything else is an error rather
+/// than a skip, so a new gate cannot silently switch the check off.
+fn host_satisfies_step_condition(condition: Option<&str>) -> ContractResult<bool> {
+    match condition {
+        None => Ok(true),
+        Some(LIBJPEG_COMPAT_TEST_CONDITION) => {
+            Ok(cfg!(target_os = "linux") && cfg!(target_arch = "x86_64"))
+        }
+        Some(condition) => Err(format!(
+            "filtered cargo test command runs under an unrecognised step condition `{condition}`; \
+             teach host_satisfies_step_condition how to evaluate it"
+        )),
+    }
+}
+
+fn workflow_filtered_cargo_test_commands(workflow: &str) -> ContractResult<Vec<FilteredCommand>> {
     let workflow = parse_workflow(workflow)?;
     let jobs =
         mapping_get(&workflow, "jobs").ok_or_else(|| "ci workflow must define jobs".to_owned())?;
@@ -523,18 +554,21 @@ fn workflow_filtered_cargo_test_commands(workflow: &str) -> ContractResult<Vec<S
             // workflow today sits behind an `if`, so skipping them would leave
             // nothing to check and the contract would pass while a renamed test
             // silently stopped running -- the exact regression it exists to
-            // catch. `cargo test -- --list` resolves a filter against the
-            // compiled targets and does not need the step's own host, so the
-            // check is valid here; a command whose *feature* is unavailable is
-            // reported by cargo as a failure rather than as zero matches, and
-            // is handled at the call site.
+            // catch. The condition is carried along instead, so the probe runs
+            // only where the step itself would.
             let Some(run) = mapping_get(step, "run").and_then(Yaml::as_str) else {
                 continue;
             };
+            let condition = mapping_get(step, "if")
+                .and_then(Yaml::as_str)
+                .map(str::to_owned);
             for line in shell_script_without_comments(run).lines() {
                 let command = line.trim();
                 if cargo_test_command_has_filter(command) {
-                    commands.push(command.to_owned());
+                    commands.push(FilteredCommand {
+                        command: command.to_owned(),
+                        condition: condition.clone(),
+                    });
                 }
             }
         }
@@ -545,7 +579,11 @@ fn workflow_filtered_cargo_test_commands(workflow: &str) -> ContractResult<Vec<S
 
 fn assert_filtered_cargo_tests_are_nonempty(workflow: &str) -> ContractResult<()> {
     let workspace = Path::new(env!("CARGO_MANIFEST_DIR")).join("../..");
-    for command in workflow_filtered_cargo_test_commands(workflow)? {
+    for FilteredCommand { command, condition } in workflow_filtered_cargo_test_commands(workflow)? {
+        if !host_satisfies_step_condition(condition.as_deref())? {
+            continue;
+        }
+
         let mut words = command.split_whitespace();
         let _cargo = words.next();
         let test = words.next().expect("filtered command must be cargo test");
@@ -569,15 +607,18 @@ fn assert_filtered_cargo_tests_are_nonempty(workflow: &str) -> ContractResult<()
             .output()
             .map_err(|error| format!("failed to list tests for `{command}`: {error}"))?;
         if !output.status.success() {
-            // These commands are gated on host-specific system libraries
-            // (libjpeg, zlib), so on a host without them cargo fails while
-            // building and never reaches the listing step. That is a missing
-            // dependency, not a stale filter -- a stale filter builds fine and
-            // reports zero tests -- so the two are distinguishable by whether
-            // the command ran at all, and a build failure is skipped rather
-            // than matched against a message this test would have to keep in
-            // sync with cargo and every build script.
-            continue;
+            // A build failure is only forgiven for a command declared as needing
+            // a system library its own step installs; every other one is a real
+            // failure. Forgiving all of them would hide a stale filter behind
+            // any unrelated build break.
+            if SYSTEM_LIBRARY_FILTERED_COMMANDS.contains(&command.as_str()) {
+                continue;
+            }
+            return Err(format!(
+                "failed to list tests for `{command}`: cargo exited with {}\n{}",
+                output.status,
+                String::from_utf8_lossy(&output.stderr)
+            ));
         }
         let stdout = String::from_utf8_lossy(&output.stdout);
         let count = listed_test_count(&stdout);
@@ -588,6 +629,30 @@ fn assert_filtered_cargo_tests_are_nonempty(workflow: &str) -> ContractResult<()
         }
     }
     Ok(())
+}
+
+#[test]
+fn unrecognised_step_conditions_fail_instead_of_skipping() {
+    assert!(host_satisfies_step_condition(None).expect("an unconditional step always runs"));
+    host_satisfies_step_condition(Some(LIBJPEG_COMPAT_TEST_CONDITION))
+        .expect("the libjpeg condition is evaluated against the host");
+    host_satisfies_step_condition(Some("${{ runner.os == 'Windows' }}"))
+        .expect_err("an unrecognised condition must not be treated as a skip");
+}
+
+#[test]
+fn declared_system_library_commands_still_exist_in_the_workflow() {
+    let commands = workflow_filtered_cargo_test_commands(CI_WORKFLOW)
+        .expect("ci workflow must be valid")
+        .into_iter()
+        .map(|filtered| filtered.command)
+        .collect::<Vec<_>>();
+    for declared in SYSTEM_LIBRARY_FILTERED_COMMANDS {
+        assert!(
+            commands.iter().any(|command| command == declared),
+            "declared system-library command is no longer a filtered ci.yml command: `{declared}`"
+        );
+    }
 }
 
 #[test]
