@@ -273,31 +273,30 @@ qpdf の識別子に寄せるかで両者が対立するとき、このクレー
   `doListAttachments`→`list_attachments`、`doSplitPages`→`split_pages`。
   `handleX()` は `handle` 自体に「入力を受けて処理を実行する」という
   意味があるので落とさない: `handlePageSpecs`→`handle_page_specs`。
-  **既知の未解消の例外**: `job/overlay.rs` の `apply_overlay_specs` は
-  `QPDFJob::handleUnderOverlay`（`QPDFJob.cc:1937`、`--overlay`/
-  `--underlay` の適用全体を担う private メソッドで、qpdf 側に個別識別子が
-  無いケースにも該当しない）に対応するが、`handle_under_overlay` に
-  なっていない。リネームの影響範囲（呼び出し箇所・テスト関数名 40 箇所超）
-  が大きいため `flpdf-ei0h` として別途追跡する。同様に
-  `job/rotate_spec.rs` の `RotateSpec::parse` は qpdf の
-  `QPDFJob::parseRotationParameter`（`QPDFJob.cc:369`、private メソッド）
-  に対応するが `parse_rotation_parameter` になっていない（`main.rs` から
-  直接呼ばれる、対応する `QPDFJob` public メソッドの薄いラッパーが無い
-  ケース——8 の (D) 参照）。3 件目（PR #1015 Codex 再レビューで追加）は
-  `job/overlay.rs:178` の `apply_overlays_to_page_with_sources`
-  （同ファイル `:162` の doc comment 自身が `QPDFJob::doUnderOverlayForPage`
-  の移植と明記——1ページ分のcontentを組み立てる側で、`doX`→`x`規則に従えば
-  `under_overlay_for_page`相当になるはずだが独自命名になっている）。
-  4 件目（PR #1015 Codex 再レビューでさらに追加）は `job/page_range.rs`
-  の `PageRange::parse`（8 の (D) で `QUtil::parse_numrange` への
-  対応を確認済み）で、`RotateSpec::parse` と同じ形の乖離
-  （`parse_numrange` を反映していない）。qpdf の1関数呼び出しを
-  `parse`（文字列→中間表現、page count 不要）と `resolve`
-  （中間表現+page count→解決済み index 列）の2段階に分割している点は
-  命名とは別の設計判断で、page count が未確定な時点（CLI引数の妥当性
-  検証等）でも`parse`だけ先に走らせられる利点があるが、それ自体は
-  `parse`という名前の正当化にはならない。この 4 件が監査時点で見つかった
-  未対応の乖離で、この文書は「監査済みで全て一貫」とは主張しない。
+  **既知の未解消の例外**: `job/rotate_spec.rs` の `RotateSpec::parse` は
+  qpdf の `QPDFJob::parseRotationParameter`（`QPDFJob.cc:369`、private
+  メソッド）に対応するが `parse_rotation_parameter` になっていない
+  （`main.rs` から直接呼ばれる、対応する `QPDFJob` public メソッドの薄い
+  ラッパーが無いケース——8 の (D) 参照）。`flpdf-ei0h` で追跡する。
+
+  **解消済み（`flpdf-ei0h`、PR #1769）**: 監査時点ではこの 1 件に加えて
+  3 件の乖離があり、いずれもリネームで解消した——
+  `job/overlay.rs` の `apply_overlay_specs` →
+  `handle_under_overlay`（`QPDFJob::handleUnderOverlay`、
+  `include/qpdf/QPDFJob.hh:519`、`QPDFJob.cc:1937`。`--overlay`/`--underlay`
+  の適用全体を担う）、同ファイルの `apply_overlays_to_page_with_sources` →
+  `under_overlay_for_page`（`QPDFJob::doUnderOverlayForPage`、
+  `include/qpdf/QPDFJob.hh:520`、`QPDFJob.cc:1859`。1 ページ分の content を
+  組み立てる）、`job/page_range.rs` の `PageRange::parse` →
+  `PageRange::parse_numrange`（`QUtil::parse_numrange`、
+  `include/qpdf/QUtil.hh:464`）。
+  qpdf の 1 関数呼び出しを `parse_numrange`（文字列→中間表現、page count 不要）と
+  `resolve`（中間表現+page count→解決済み index 列）の 2 段階に分割している点は
+  命名とは別の話で、**これは逸脱ではない**——qpdf 自身が同じ関数を
+  `max=0`（構文のみ）と `max=npages`（解決）の 2 モードで呼び分けている
+  （構文のみ: `QPDFJob_argv.cc:253`、`QPDFJob_config.cc:1055,1064,1074`、
+  `QPDFJob.cc:399` / 解決: `QPDFJob.cc:266,1827,1837,1839,2645`）。
+  この文書は「監査済みで全て一貫」とは主張しない。
 - **戻り値の形が qpdf と違うために動詞ごと変えるのは許容される—ただし
   crate 内で一貫していること**。`doJSONPages`/`doJSONPageLabels`/
   `doJSONOutlines`/`doJSONAcroform`/`doJSONEncrypt`/`doJSONAttachments`
@@ -337,14 +336,15 @@ qpdf の識別子に寄せるかで両者が対立するとき、このクレー
 docs に書いた」という同一の失敗パターン。`crates/flpdf/src/job/*.rs`
 全 17 ファイルの `pub fn`/`fn` 宣言（`rg -c '^\s*(pub )?fn '` で数えた
 関数シグネチャの総数）を対象にした命名監査では、この 2 件の doc 記載
-ミスと、前項で挙げた `apply_overlay_specs`/`RotateSpec::parse`/
-`apply_overlays_to_page_with_sources`/`PageRange::parse`
-（未リネームの既知の例外、いずれも `flpdf-ei0h` で追跡中）以外に
-high confidence の命名乖離は見つからなかった——`doX`→`x`、
-`handleX`→`handle_x` の変換は、その 4 件を除き一貫して正確に
-行われていた（PR #1015 Codex 再レビューで訂正: 型に紐づく `parse`
-メソッドが qpdf 側のフルネームを落としてよいという主張は、
-`RotateSpec::parse`/`PageRange::parse` の 2 件を「未対応の乖離」として
+ミスと、前項で挙げた 4 件（`apply_overlay_specs`/`RotateSpec::parse`/
+`apply_overlays_to_page_with_sources`/`PageRange::parse`、いずれも
+`flpdf-ei0h` で追跡）以外に high confidence の命名乖離は見つからなかった
+——`doX`→`x`、`handleX`→`handle_x` の変換は、その 4 件を除き一貫して
+正確に行われていた。うち 3 件は PR #1769 で
+`handle_under_overlay`/`under_overlay_for_page`/`PageRange::parse_numrange`
+へリネーム済みで、残るのは `RotateSpec::parse` のみ（PR #1015 Codex 再レビューで
+訂正: 型に紐づく `parse` メソッドが qpdf 側のフルネームを落としてよいという
+主張は、`RotateSpec::parse`/`PageRange::parse` の 2 件を「未対応の乖離」として
 同時に挙げているのと矛盾するため削除した。この型スコープでの命名短縮を
 許容するかどうかは、まだこの文書で決着していない未決の設計判断であり、
 「機械的に正しい変換」として言い切ってはならない）。この監査自体、
@@ -522,20 +522,20 @@ public な対応物が無いことを確認済み）で、`prune_acroform_after_
 ラッパーで、実処理は `QUtil::parse_numrange`（`QUtil.hh:464`、namespace
 関数として真に public）に委譲している。根拠 1 の例示そのもの
 （`QPDFJob::parseNumrange` ではなく `QUtil::parse_numrange` を見る）が
-指す状況と一致するため、`PageRange::parse`（+`resolve`。2段階分割は
-flpdf 独自で qpdf 自体は1関数で行う）は根拠 1 で正当化される——
-**ただしこの2段階分割自体は CLAUDE.md 分類 (B) の「入れ物の違い」には
-当たらない**（PR #1015 Codex 再レビューで訂正、誤った分類だった）。
-(B) 条件2は処理順序を変えないことを要求するが、`main.rs:3534`
-（`--pages` 引数の file-path/page-range 判別ヒューリスティック）は
-page count もファイルも開く前に `PageRange::parse(tok).is_ok()` だけを
-呼んでおり、qpdf の単発 `parse_numrange` 呼び出しには無い「page count
-未確定の時点での構文検証」という flpdf 独自の制御フローを実現している。
-これは根拠1（`pub`可視性の正当化）の妥当性自体は変えないが、
-「入れ物の違いに過ぎない」という記述は誤りだったため削除した。
-分割そのものが qpdf のアルゴリズム・処理順序からの実際の逸脱で
-あることは別途 `flpdf-ei0h` に記録する（CLAUDE.md 分類上は独立した
-逸脱として扱うべきで、まだ正式に分類・記録されていない）。`lib.rs:203` から
+指す状況と一致するため、`PageRange::parse_numrange`（+`resolve`）は
+根拠 1 で正当化される。
+
+**この 2 段階分割は逸脱ではない**（PR #1766 で確定、2026-09-10）。
+以前この項は「qpdf 自体は 1 関数で行うのに flpdf は 2 段階に割っている
+独自の制御フロー」と記していたが、qpdf 自身が同じ `QUtil::parse_numrange`
+を 2 つのモードで呼び分けている——`max=0` で構文のみ検証する側が
+`QPDFJob_argv.cc:253`、`QPDFJob_config.cc:1055,1064,1074`、`QPDFJob.cc:399`、
+実 page count で解決する側が `QPDFJob.cc:266,1827,1837,1839,2645`。
+根拠に挙げていた `main.rs`（`--pages` 引数の file-path/page-range 判別
+ヒューリスティック）も PR #1766 で `qutil::parse_numrange(&token_bytes, 0)`
+の直接呼び出しになり、qpdf のプリミティブを qpdf 自身のモードで呼ぶ形に
+なっている。よって `flpdf-ei0h` に残る論点は命名のみで、逸脱側は解消済み。
+`lib.rs` から
 crate ルートへ再輸出されており、実行可能な doc example を持つ点も
 根拠 1 の補強になる（PR #1011 で `job/page_combine.rs`/
 `job/page_plan.rs` が job/ 内へ移動済みであることを反映——移動前に
@@ -550,7 +550,7 @@ job/ 内の他モジュールからも使われている事実自体は変わら
 CLI 経路を一本化すれば `pub(crate)` に落とせる見込み。
 
 **(E) 未検証の debt（PR #1015 Codex 再レビューで追加、スコープ外だった）**:
-`overlay_verbose_report`/`apply_overlay_specs`/`collate`（`job/mod.rs:58`、
+`overlay_verbose_report`/`handle_under_overlay`/`collate`（`job/mod.rs`、
 `page_collate.rs` から再輸出）。`main.rs:3398-3414,4816-4832` の
 overlay 2 つに加え、`collate` も `main.rs:4391,4653` から `QPDFJob` の
 public メソッドを経由せず `flpdf::` crate ルートから直接呼ばれており、
@@ -560,9 +560,9 @@ public メソッドを経由せず `flpdf::` crate ルートから直接呼ば�
 （**この文書は監査の網羅性を主張しない**——`job/mod.rs` 起点で
 見つかった範囲の記録である。実際、この一文自体も複数ラウンドの
 Codex レビューを経て書き足した項目が追加され続けている）。
-`apply_overlay_specs` は既に `flpdf-ei0h`（命名）で追跡中のため、
-可視性側も `overlay_verbose_report`/`collate` と合わせて同じ
-`flpdf-xsq1` に記録する。
+`handle_under_overlay`（PR #1769 でのリネーム前は `apply_overlay_specs`）は
+命名側を `flpdf-ei0h` で解消済みだが、可視性側は未解決のまま
+`overlay_verbose_report`/`collate` と合わせて `flpdf-xsq1` に記録する。
 
 ---
 
