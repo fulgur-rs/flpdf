@@ -456,22 +456,96 @@ fn listed_test_count(output: &str) -> usize {
         .count()
 }
 
-/// Cargo's own usage is `cargo test [OPTIONS] [TESTNAME]`, so the filter is a
-/// positional argument that does not have to follow a target selector. Scan for
-/// any positional after `cargo test`, skipping the flags that take a value,
-/// rather than only looking next to `--lib` and `--test`.
-fn cargo_test_command_has_filter(command: &str) -> bool {
-    let words = command.split_whitespace().collect::<Vec<_>>();
-    if words.first() != Some(&"cargo") || words.get(1) != Some(&"test") {
-        return false;
+/// Split a command line into words the way the workflow shell does, so a quoted
+/// argument reaches cargo without its quotes. Only quote removal and backslash
+/// escaping are modelled; no ci.yml command needs expansion, and a command that
+/// did would be replayed literally rather than guessed at.
+fn shell_words(command: &str) -> Vec<String> {
+    let mut words = Vec::new();
+    let mut current = String::new();
+    let mut in_word = false;
+    let mut characters = command.chars();
+    while let Some(character) = characters.next() {
+        match character {
+            character if character.is_whitespace() => {
+                if in_word {
+                    words.push(std::mem::take(&mut current));
+                    in_word = false;
+                }
+            }
+            '\'' => {
+                in_word = true;
+                for character in characters.by_ref() {
+                    if character == '\'' {
+                        break;
+                    }
+                    current.push(character);
+                }
+            }
+            '"' => {
+                in_word = true;
+                while let Some(character) = characters.next() {
+                    match character {
+                        '"' => break,
+                        '\\' => current.extend(characters.next()),
+                        character => current.push(character),
+                    }
+                }
+            }
+            '\\' => {
+                in_word = true;
+                current.extend(characters.next());
+            }
+            character => {
+                in_word = true;
+                current.push(character);
+            }
+        }
     }
+    if in_word {
+        words.push(current);
+    }
+    words
+}
+
+/// The words of a `cargo test` command line, or `None` for anything else.
+fn cargo_test_command_words(command: &str) -> Option<Vec<String>> {
+    let words = shell_words(command);
+    let is_cargo_test = words.first().map(String::as_str) == Some("cargo")
+        && words.get(1).map(String::as_str) == Some("test");
+    is_cargo_test.then_some(words)
+}
+
+/// Cargo's own usage is `cargo test [OPTIONS] [TESTNAME] [-- [args...]]`, and
+/// libtest's is `[OPTIONS] [FILTERS...]`, so a filter is a positional argument
+/// on either side of the separator and does not have to follow a target
+/// selector. Scan both sides for a positional, skipping the flags that take a
+/// value, rather than only looking next to `--lib` and `--test` or stopping at
+/// `--`.
+fn cargo_test_command_has_filter(command: &str) -> bool {
+    let Some(words) = cargo_test_command_words(command) else {
+        return false;
+    };
 
     let mut index = 2;
-    while let Some(word) = words.get(index).copied() {
+    while let Some(word) = words.get(index).map(String::as_str) {
         if word == "--" {
-            return false;
+            index += 1;
+            break;
         }
         if CARGO_TEST_VALUE_FLAGS.contains(&word) {
+            index += 2;
+            continue;
+        }
+        if word.starts_with('-') {
+            index += 1;
+            continue;
+        }
+        return true;
+    }
+
+    while let Some(word) = words.get(index).map(String::as_str) {
+        if LIBTEST_VALUE_FLAGS.contains(&word) {
             index += 2;
             continue;
         }
@@ -496,6 +570,7 @@ const CARGO_TEST_VALUE_FLAGS: &[&str] = &[
     "--bench",
     "--example",
     "--features",
+    "-F",
     "--target",
     "--target-dir",
     "--manifest-path",
@@ -507,6 +582,18 @@ const CARGO_TEST_VALUE_FLAGS: &[&str] = &[
     "--message-format",
     "--config",
     "-Z",
+];
+
+/// libtest options whose value is a separate word. `cargo test <cargo args> --
+/// <harness args>` accepts filters here too (`-- --exact some::test`), so the
+/// scan continues past the separator rather than stopping at it.
+const LIBTEST_VALUE_FLAGS: &[&str] = &[
+    "--skip",
+    "--test-threads",
+    "--logfile",
+    "--format",
+    "--color",
+    "--shuffle-seed",
 ];
 
 /// A filtered `cargo test` command together with the `if:` condition of the step
@@ -584,16 +671,17 @@ fn assert_filtered_cargo_tests_are_nonempty(workflow: &str) -> ContractResult<()
             continue;
         }
 
-        let mut words = command.split_whitespace();
-        let _cargo = words.next();
-        let test = words.next().expect("filtered command must be cargo test");
-        let mut args = vec![test];
-        for word in words {
-            if word == "--" {
-                break;
-            }
-            args.push(word);
+        // Replay the command as the workflow shell would run it, harness
+        // arguments included: a filter can live after the separator, and
+        // dropping `--exact` or `--skip` would resolve a different set of tests
+        // than CI does.
+        let words =
+            cargo_test_command_words(&command).expect("filtered command must be cargo test");
+        let mut args = words[1..].to_vec();
+        if !args.iter().any(|word| word == "--") {
+            args.push("--".to_owned());
         }
+        args.push("--list".to_owned());
         // The parent `cargo test` holds the lock on the workspace artifact
         // directory for the whole run, so a child cargo sharing it blocks
         // until the parent exits -- which never happens. Give the child its
@@ -601,7 +689,6 @@ fn assert_filtered_cargo_tests_are_nonempty(workflow: &str) -> ContractResult<()
         let target_dir = workspace.join("target/ci-workflow-contract");
         let output = Command::new("cargo")
             .args(&args)
-            .args(["--", "--list"])
             .current_dir(&workspace)
             .env("CARGO_TARGET_DIR", &target_dir)
             .output()
@@ -629,6 +716,49 @@ fn assert_filtered_cargo_tests_are_nonempty(workflow: &str) -> ContractResult<()
         }
     }
     Ok(())
+}
+
+#[test]
+fn shell_words_removes_the_quoting_the_workflow_shell_removes() {
+    assert_eq!(
+        shell_words("cargo test -p flpdf --lib \"pipeline::dct\""),
+        ["cargo", "test", "-p", "flpdf", "--lib", "pipeline::dct"]
+    );
+    assert_eq!(
+        shell_words("cargo test 'a b' c\\ d"),
+        ["cargo", "test", "a b", "c d"]
+    );
+    assert_eq!(shell_words("  "), Vec::<String>::new());
+    assert_eq!(shell_words("\"\\\"\""), ["\""]);
+}
+
+#[test]
+fn filter_scan_sees_quoted_and_post_separator_filters() {
+    assert!(cargo_test_command_has_filter(
+        "cargo test -p flpdf --lib \"pipeline::dct\""
+    ));
+    assert!(cargo_test_command_has_filter(
+        "cargo test -p flpdf --lib -- --exact pipeline::dct"
+    ));
+    assert!(!cargo_test_command_has_filter(
+        "cargo test -p flpdf --test api -- --nocapture"
+    ));
+    assert!(!cargo_test_command_has_filter(
+        "cargo test -p flpdf --test api -- --skip pipeline::dct"
+    ));
+    assert!(!cargo_test_command_has_filter(
+        "cargo test -p flpdf --test api -- --test-threads 1"
+    ));
+}
+
+#[test]
+fn filter_scan_consumes_the_short_features_flag_value() {
+    assert!(!cargo_test_command_has_filter(
+        "cargo test -p flpdf -F qpdf-zlib-compat --test zlib_compat_tests"
+    ));
+    assert!(cargo_test_command_has_filter(
+        "cargo test -p flpdf -F qpdf-zlib-compat --lib job::overlay::byte_gate"
+    ));
 }
 
 #[test]
