@@ -7786,6 +7786,7 @@ mod final_handle_tests {
         let Error::QpdfExc(source_warning) = source else {
             // cov:ignore: the preceding qpdf candidate assertion makes this defensive arm unreachable
             panic!("candidate recovery must preserve qpdf's structured terminal error");
+            // cov:ignore: defensive variant mismatch is unreachable after the qpdf candidate assertion
         };
         assert_eq!(
             source_warning.message_string(),
@@ -8540,7 +8541,7 @@ mod final_handle_tests {
 
         let Error::QpdfExc(warning) = error else {
             // cov:ignore: the preceding qpdf xref assertion makes this defensive arm unreachable
-            panic!("qpdf xref-stream damage must remain a structured warning");
+            panic!("qpdf xref-stream damage must remain a structured warning"); // cov:ignore: defensive variant mismatch is unreachable after the qpdf xref assertion
         };
         assert_eq!(warning.get_object(), b"xref stream");
         assert_eq!(warning.get_file_position(), 3);
@@ -9251,9 +9252,13 @@ mod final_handle_tests {
                     relative_offset: 7,
                     message: "invalid character (�) in hexstring".to_owned(),
                 },
+                ParserDiagnostic {
+                    relative_offset: 8,
+                    message: "invalid character (�) in hexstring".to_owned(),
+                },
             ],
             b"bad13.pdf",
-            Some(b"<a\xa8><a>\xa8"),
+            Some(b"<a\xa8><a>\xa8<a"),
         );
 
         assert_eq!(
@@ -9267,6 +9272,10 @@ mod final_handle_tests {
         assert_eq!(
             diagnostics[2].get_message_detail(),
             b"invalid character (\xa8) in hexstring"
+        );
+        assert_eq!(
+            diagnostics[3].get_message_detail(),
+            "invalid character (�) in hexstring".as_bytes()
         );
     }
 

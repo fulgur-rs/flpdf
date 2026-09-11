@@ -714,8 +714,8 @@ impl<'a, R: Read + Seek + 'static> LiveObjectEmitter<'a, R> {
                     handle
                         .warn_if_possible("stream found inside object stream; treating as null")?;
                 }
-                // cov:ignore-end
                 ObjectHandle::null()
+                // cov:ignore-end
             } else {
                 handle.clone()
             };
@@ -1177,8 +1177,8 @@ impl<R: Read + Seek + 'static> PlainObjectEmitter<'_, R> {
                     handle
                         .warn_if_possible("stream found inside object stream; treating as null")?;
                 }
-                // cov:ignore-end
                 ObjectHandle::null()
+                // cov:ignore-end
             } else {
                 handle.clone()
             };
