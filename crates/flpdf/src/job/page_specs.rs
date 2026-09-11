@@ -374,15 +374,25 @@ fn merge_preserving_primary_into<R: Read + Seek, T: Read + Seek>(
 /// source's grouped merge input.
 type OrderedPage = (usize, usize);
 
-/// Reassign fresh merge-object provenance in qpdf page-spec occurrence order.
+/// The page/replay allocations that qpdf assigns in one page-spec occurrence.
+/// The grouped page merge supplies the first list; the AcroForm replay fills
+/// the second list after the occurrence's copy helper returns.
+#[derive(Debug)]
+struct PageSpecWriterProvenance {
+    order: BTreeMap<ObjectRef, WriterObjectOrderKey>,
+    next_original: ObjectRef,
+    page_allocations: Vec<Vec<ObjectRef>>,
+}
+
+/// Collect fresh merge-object provenance in qpdf page-spec occurrence order.
 ///
 /// The page merge keeps one foreign copier per source so shared source objects
 /// retain their identity, but qpdf allocates a repeated page clone at the
 /// occurrence where `handlePageSpecs` encounters it. The fresh Rust target has
-/// already copied the grouped graphs, so the writer-order map is corrected
-/// here without introducing a second copy route. Each foreign page graph group
-/// retains its existing discovery order, while those groups and shallow page
-/// clones are interleaved according to `ordered_pages`.
+/// already copied the grouped graphs, so the writer-order map is finalized
+/// after replay without introducing a second copy route. Each foreign page
+/// graph group retains its existing discovery order, while those groups and
+/// shallow page clones are interleaved according to `ordered_pages`.
 fn restore_occurrence_writer_provenance<T: Read + Seek + 'static, R: Read + Seek + 'static>(
     merged: &mut Pdf<T>,
     sources: &mut [Pdf<R>],
@@ -391,46 +401,22 @@ fn restore_occurrence_writer_provenance<T: Read + Seek + 'static, R: Read + Seek
     ordered_pages: &[OrderedPage],
     grouped_refs: &[ObjectRef],
     offsets: &[usize],
-) -> Result<()> {
+) -> Result<Option<PageSpecWriterProvenance>> {
     // cov:ignore-start: the page-spec merge target always records writer order.
     let Some(existing_order) = merged.writer_object_order.clone() else {
-        return Ok(());
+        return Ok(None);
     };
     // cov:ignore-end
-    let mut fresh_refs = Vec::new();
-    for source in sources.iter().skip(1) {
-        let source_id = source.unique_id();
-        if let Some(copy_groups) = merged.foreign_page_copy_orders.get(&source_id) {
-            for (_, refs) in copy_groups {
-                fresh_refs.extend(refs.iter().copied());
-            }
-        }
-    }
-    let mut cloned_pages: Vec<BTreeSet<ObjectRef>> = vec![BTreeSet::new(); sources.len()];
+    let mut page_allocations = Vec::with_capacity(ordered_pages.len());
+    let mut seen_pages: Vec<BTreeSet<ObjectRef>> = vec![BTreeSet::new(); sources.len()];
     for &(source_index, group_index) in ordered_pages {
         let source_page_index = grouped_pages[source_index][group_index];
         let source_page_ref = source_page_refs[source_index][source_page_index];
         // A repeated occurrence of a page already selected from the same source
         // is the clone qpdf allocates at this point, so it takes fresh
         // provenance. The per-source seen set keeps this pass linear.
-        if !cloned_pages[source_index].insert(source_page_ref) {
-            fresh_refs.push(grouped_refs[offsets[source_index] + group_index]);
-        }
-    }
-    let Some(mut next_original) = fresh_refs
-        .iter()
-        .map(|object_ref| merged.writer_original_object_ref(*object_ref))
-        .min()
-    else {
-        return Ok(());
-    };
-    let mut order = existing_order;
-    let mut seen_pages: Vec<BTreeSet<ObjectRef>> = vec![BTreeSet::new(); sources.len()];
-    for &(source_index, group_index) in ordered_pages {
-        let source_page_index = grouped_pages[source_index][group_index];
-        let source_page_ref = source_page_refs[source_index][source_page_index];
         let duplicate = !seen_pages[source_index].insert(source_page_ref);
-
+        let mut allocations = Vec::new();
         if source_index != 0 && !duplicate {
             let source_id = sources[source_index].unique_id();
             if let Some((_, target_refs)) = merged
@@ -442,43 +428,64 @@ fn restore_occurrence_writer_provenance<T: Read + Seek + 'static, R: Read + Seek
                         .find(|(source_ref, _)| *source_ref == source_page_ref)
                 })
             {
-                for &target_ref in target_refs {
-                    order.insert(
-                        target_ref,
-                        WriterObjectOrderKey::foreign_with_allocation_identity(
-                            target_ref,
-                            next_original,
-                        ),
-                    );
-                    // cov:ignore-start: exhausting the u32 PDF object space is unreachable for a page merge.
-                    next_original = ObjectRef::new(
-                        next_original.number.checked_add(1).ok_or_else(|| {
-                            Error::Unsupported("page-selection provenance overflows u32".to_owned())
-                        })?,
-                        next_original.generation,
-                    );
-                    // cov:ignore-end
-                }
+                allocations.extend(target_refs.iter().copied());
             } // cov:ignore: merge records a copy group for every selected foreign page
         }
-
         if duplicate {
-            let clone_ref = grouped_refs[offsets[source_index] + group_index];
-            order.insert(
-                clone_ref,
-                WriterObjectOrderKey::foreign_with_allocation_identity(clone_ref, next_original),
+            allocations.push(grouped_refs[offsets[source_index] + group_index]);
+        }
+        page_allocations.push(allocations);
+    }
+    let Some(next_original) = page_allocations
+        .iter()
+        .flatten()
+        .map(|object_ref| merged.writer_original_object_ref(*object_ref))
+        .min()
+    else {
+        return Ok(None);
+    };
+    Ok(Some(PageSpecWriterProvenance {
+        order: existing_order,
+        next_original,
+        page_allocations,
+    }))
+}
+
+/// Add the allocation identities made by AcroForm replay to the same
+/// occurrence-ordered writer provenance as page graph copies and duplicate
+/// page shallow copies.
+fn finalize_page_spec_writer_provenance<T: Read + Seek + 'static>(
+    merged: &mut Pdf<T>,
+    mut provenance: PageSpecWriterProvenance,
+    replay_allocations: &[Vec<ObjectRef>],
+) -> Result<()> {
+    debug_assert_eq!(provenance.page_allocations.len(), replay_allocations.len());
+    for (page_allocations, replay_allocations) in
+        provenance.page_allocations.iter().zip(replay_allocations)
+    {
+        for &target_ref in page_allocations.iter().chain(replay_allocations) {
+            provenance.order.insert(
+                target_ref,
+                WriterObjectOrderKey::foreign_with_allocation_identity(
+                    target_ref,
+                    provenance.next_original,
+                ),
             );
             // cov:ignore-start: exhausting the u32 PDF object space is unreachable for a page merge.
-            next_original = ObjectRef::new(
-                next_original.number.checked_add(1).ok_or_else(|| {
-                    Error::Unsupported("page-selection provenance overflows u32".to_owned())
-                })?,
-                next_original.generation,
+            provenance.next_original = ObjectRef::new(
+                provenance
+                    .next_original
+                    .number
+                    .checked_add(1)
+                    .ok_or_else(|| {
+                        Error::Unsupported("page-selection provenance overflows u32".to_owned())
+                    })?,
+                provenance.next_original.generation,
             );
             // cov:ignore-end
         }
     }
-    merged.set_writer_object_order(order);
+    merged.set_writer_object_order(provenance.order);
     Ok(())
 }
 
@@ -675,7 +682,7 @@ fn rebuild_acroform_in_final_page_order<R: Read + Seek + 'static, T: Read + Seek
     grouped_pages: &[Vec<usize>],
     ordered_pages: &[OrderedPage],
     final_refs: &[ObjectRef],
-) -> Result<()> {
+) -> Result<Vec<Vec<ObjectRef>>> {
     debug_assert_eq!(ordered_pages.len(), final_refs.len());
 
     // qpdf analyzes the primary AcroForm before its final unselected-page
@@ -696,6 +703,7 @@ fn rebuild_acroform_in_final_page_order<R: Read + Seek + 'static, T: Read + Seek
     // first occurrence's destination page, including repeated primary pages.
     let mut first_output_for_source_page: Vec<BTreeMap<ObjectRef, ObjectRef>> =
         vec![BTreeMap::new(); sources.len()];
+    let mut replay_allocations = Vec::with_capacity(ordered_pages.len());
     for (output_index, &(source_index, group_index)) in ordered_pages.iter().enumerate() {
         let source_page_index = grouped_pages[source_index][group_index];
         let source_page_ref = source_page_refs[source_index][source_page_index];
@@ -762,11 +770,13 @@ fn rebuild_acroform_in_final_page_order<R: Read + Seek + 'static, T: Read + Seek
             // page-order reconstruction; qpdf does not run
             // fixCopiedAnnotations on this occurrence.
             set_annotation_page_refs(merged, final_refs[output_index], first_output_page)?;
+            replay_allocations.push(Vec::new());
             continue;
         }
 
         let destination_page = merged.get_object_handle(final_refs[output_index]);
         destination_page.remove_key(b"/Annots");
+        let allocation_checkpoint = merged.allocation_checkpoint();
 
         if source_index == 0 {
             // A repeated primary page is a same-document transform: it must
@@ -789,10 +799,11 @@ fn rebuild_acroform_in_final_page_order<R: Read + Seek + 'static, T: Read + Seek
                 &primary_field_names,
             )?; // cov:ignore: valid page selections exercise this route; malformed copy errors are covered by helper tests.
         }
+        replay_allocations.push(merged.allocated_object_refs_after(allocation_checkpoint));
     }
 
     remove_empty_acroform_after_replay(merged, had_fields_array)?;
-    Ok(())
+    Ok(replay_allocations)
 }
 
 #[cfg(test)]
@@ -1032,7 +1043,7 @@ fn handle_page_specs_into<R: Read + Seek + 'static, T: Read + Seek + 'static>(
             Some(current)
         })
         .collect();
-    restore_occurrence_writer_provenance(
+    let occurrence_provenance = restore_occurrence_writer_provenance(
         &mut merged,
         sources,
         &source_page_refs,
@@ -1049,7 +1060,7 @@ fn handle_page_specs_into<R: Read + Seek + 'static, T: Read + Seek + 'static>(
         crate::pages::tree_rebuild::rebuild_page_tree(&mut merged, &final_refs)?;
     }
 
-    rebuild_acroform_in_final_page_order(
+    let replay_allocations = rebuild_acroform_in_final_page_order(
         &mut merged,
         sources,
         &source_page_refs,
@@ -1057,6 +1068,13 @@ fn handle_page_specs_into<R: Read + Seek + 'static, T: Read + Seek + 'static>(
         &ordered_pages,
         &final_refs,
     )?; // cov:ignore: public page selection supplies validated refs; the fallible continuation is covered by the direct helper error test
+    if let Some(occurrence_provenance) = occurrence_provenance {
+        finalize_page_spec_writer_provenance(
+            &mut merged,
+            occurrence_provenance,
+            &replay_allocations,
+        )?; // cov:ignore: page-spec merge always supplies a valid writer-order target
+    }
 
     if any_page_labels {
         let folded = merge_adjacent_raw_page_labels(label_entries)?;

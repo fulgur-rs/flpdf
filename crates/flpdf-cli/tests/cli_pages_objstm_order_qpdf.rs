@@ -16,6 +16,13 @@ const QDF_PRIMARY: &str = "../../tests/fixtures/compat/primary-objstm-exclusive-
 const QDF_FOREIGN: &str = "../../tests/fixtures/compat/no-stream-one-page.pdf";
 const OCCURRENCE_ORDER_PRIMARY: &str = "../../tests/fixtures/compat/three-page.pdf";
 const OCCURRENCE_ORDER_FOREIGN: &str = "../../tests/fixtures/compat/two-page.pdf";
+const ANNOTATION_ORDER_PRIMARY: &str = "../../tests/fixtures/compat/three-page.pdf";
+const ANNOTATION_ORDER_FOREIGN: &str =
+    "../../tests/fixtures/compat/form-fields-and-annotations.pdf";
+const ANNOTATION_ORDER_LINK: &str = "../../tests/fixtures/compat/link-annot-no-acroform.pdf";
+const ANNOTATION_ORDER_FXO: &str = "../../tests/fixtures/compat/fxo-red-with-existing-acroform.pdf";
+const ANNOTATION_ORDER_DIRECT_DR: &str =
+    "../../tests/fixtures/compat/form-fields-and-annotations-direct-dr.pdf";
 
 /// Gate the differential probe on the pinned oracle, mirroring
 /// `cli_linearize_multi_source_qpdf`: skip locally when qpdf 11.9.0 is not
@@ -252,6 +259,161 @@ fn duplicate_page_after_foreign_linearized_generated_objstm_matches_qpdf() {
             "--linearize",
         ],
         "duplicate page after a foreign source must preserve qpdf linearized ObjStm ordering",
+    );
+}
+
+#[test]
+fn annotated_page_replay_preserves_qpdf_occurrence_provenance() {
+    if skip_if_qpdf_missing() {
+        return;
+    }
+    for (name, page_args) in [
+        (
+            "primary-foreign-duplicate",
+            vec![
+                ANNOTATION_ORDER_PRIMARY,
+                "--pages",
+                ANNOTATION_ORDER_PRIMARY,
+                "1,2",
+                ANNOTATION_ORDER_FOREIGN,
+                "1",
+                ANNOTATION_ORDER_PRIMARY,
+                "1",
+                "--",
+            ],
+        ),
+        (
+            "annotation-link-annotation",
+            vec![
+                ANNOTATION_ORDER_FOREIGN,
+                "--pages",
+                ANNOTATION_ORDER_FOREIGN,
+                "1",
+                ANNOTATION_ORDER_LINK,
+                "1",
+                ANNOTATION_ORDER_FOREIGN,
+                "1",
+                "--",
+            ],
+        ),
+        (
+            "annotation-fxo-annotation",
+            vec![
+                ANNOTATION_ORDER_FOREIGN,
+                "--pages",
+                ANNOTATION_ORDER_FOREIGN,
+                "1",
+                ANNOTATION_ORDER_FXO,
+                "1",
+                ANNOTATION_ORDER_FOREIGN,
+                "1",
+                "--",
+            ],
+        ),
+        (
+            "annotation-two-annotation-two",
+            vec![
+                ANNOTATION_ORDER_PRIMARY,
+                "--pages",
+                ANNOTATION_ORDER_PRIMARY,
+                "1",
+                ANNOTATION_ORDER_FOREIGN,
+                "1",
+                ANNOTATION_ORDER_PRIMARY,
+                "1",
+                ANNOTATION_ORDER_FOREIGN,
+                "1",
+                "--",
+            ],
+        ),
+        (
+            "annotation-direct-dr-annotation",
+            vec![
+                ANNOTATION_ORDER_FOREIGN,
+                "--pages",
+                ANNOTATION_ORDER_FOREIGN,
+                "1",
+                ANNOTATION_ORDER_DIRECT_DR,
+                "1",
+                ANNOTATION_ORDER_FOREIGN,
+                "1",
+                "--",
+            ],
+        ),
+    ] {
+        assert_annotated_replay_matches_qpdf(name, &page_args);
+    }
+}
+
+fn assert_annotated_replay_matches_qpdf(name: &str, page_args: &[&str]) {
+    assert_annotated_replay_with_flags(name, &["--static-id", "--qdf"], page_args);
+}
+
+#[test]
+fn annotated_direct_dr_replay_preserves_qpdf_objstm_provenance() {
+    if skip_if_qpdf_missing() {
+        return;
+    }
+    let page_args = [
+        ANNOTATION_ORDER_FOREIGN,
+        "--pages",
+        ANNOTATION_ORDER_FOREIGN,
+        "1",
+        ANNOTATION_ORDER_DIRECT_DR,
+        "1",
+        ANNOTATION_ORDER_FOREIGN,
+        "1",
+        "--",
+    ];
+    for (name, flags) in [
+        (
+            "annotation-direct-dr-objstm",
+            vec!["--static-id", "--qdf", "--object-streams=generate"],
+        ),
+        (
+            "annotation-direct-dr-linearized",
+            vec![
+                "--static-id",
+                "--qdf",
+                "--object-streams=generate",
+                "--linearize",
+            ],
+        ),
+    ] {
+        assert_annotated_replay_with_flags(name, &flags, &page_args);
+    }
+}
+
+fn assert_annotated_replay_with_flags(name: &str, flags: &[&str], page_args: &[&str]) {
+    let temp = tempfile::tempdir().unwrap();
+    let qpdf_output = temp.path().join("qpdf.pdf");
+    let flpdf_output = temp.path().join("flpdf.pdf");
+
+    let mut qpdf_args = flags.to_vec();
+    qpdf_args.extend_from_slice(page_args);
+    let qpdf = ProcessCommand::new("qpdf")
+        .args(qpdf_args)
+        .arg(&qpdf_output)
+        .output()
+        .expect("qpdf should spawn");
+    assert!(
+        qpdf.status.success(),
+        "qpdf annotated replay probe failed: {}",
+        String::from_utf8_lossy(&qpdf.stderr)
+    );
+
+    Command::cargo_bin("flpdf")
+        .unwrap()
+        .args(flags)
+        .args(page_args)
+        .arg(&flpdf_output)
+        .assert()
+        .success();
+
+    assert_eq!(
+        std::fs::read(&flpdf_output).unwrap(),
+        std::fs::read(&qpdf_output).unwrap(),
+        "annotation replay must preserve qpdf's occurrence allocation provenance for {name}"
     );
 }
 

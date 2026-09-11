@@ -362,6 +362,10 @@ pub(crate) struct ResolverCore<R: Read + Seek + 'static> {
     /// object-ref view to distinguish a real allocated null from a resolved
     /// dangling reference (`QPDF.cc:1882-1894,1986-1993`).
     allocated_object_refs: BTreeSet<QpdfObjGen>,
+    /// The first-registration order of qpdf-shaped allocations. The set above
+    /// answers membership queries, while this log preserves the allocator's
+    /// event order when target object numbers are not traversal-ordered.
+    allocated_object_order: Vec<QpdfObjGen>,
     /// qpdf `m->resolving` (`include/qpdf/QPDF.hh:1468`), the set
     /// `QPDF::resolve` tests to detect "an object references itself directly
     /// or indirectly in some key that has to be resolved during object
@@ -515,6 +519,14 @@ impl ResolverWarningOptions {
 }
 
 impl<R: Read + Seek> ResolverCore<R> {
+    /// Record one qpdf-shaped allocation while retaining both membership and
+    /// the order in which the destination allocator first registered it.
+    fn record_allocated_object(&mut self, object_gen: QpdfObjGen) {
+        if self.allocated_object_refs.insert(object_gen) {
+            self.allocated_object_order.push(object_gen);
+        }
+    }
+
     /// Position the input source at qpdf-logical `offset`.
     ///
     /// qpdf `m->file->seek(offset, SEEK_SET)`. The header shift is applied
@@ -913,6 +925,7 @@ impl<R: Read + Seek> ResolverHandle<R> {
                 last_object_description: String::new(),
                 last_object_description_bytes: Vec::new(),
                 allocated_object_refs: BTreeSet::new(),
+                allocated_object_order: Vec::new(),
                 resolving: BTreeSet::new(),
                 in_parse: false,
                 resolved_object_streams: BTreeSet::new(),
@@ -960,6 +973,7 @@ impl<R: Read + Seek> ResolverHandle<R> {
                 last_object_description: String::new(),
                 last_object_description_bytes: Vec::new(),
                 allocated_object_refs: BTreeSet::new(),
+                allocated_object_order: Vec::new(),
                 resolving: BTreeSet::new(),
                 in_parse: false,
                 resolved_object_streams: BTreeSet::new(),
@@ -1027,7 +1041,7 @@ impl<R: Read + Seek> ResolverHandle<R> {
         let object_gen = QpdfObjGen::from_object_ref(object_ref);
         let mut core = self.core.borrow_mut();
         let previous = core.object_cache.insert(object_gen, reserved.clone());
-        core.allocated_object_refs.insert(object_gen);
+        core.record_allocated_object(object_gen);
         debug_assert!(
             previous.is_none(),
             "next_obj_gen must return a fresh ObjGen"
@@ -1233,7 +1247,7 @@ impl<R: Read + Seek> ResolverHandle<R> {
         let object_gen = QpdfObjGen::from_object_ref(object_ref);
         let mut core = self.core.borrow_mut();
         let previous = core.object_cache.insert(object_gen, reserved.clone());
-        core.allocated_object_refs.insert(object_gen);
+        core.record_allocated_object(object_gen);
         previous.unwrap_or(reserved)
     }
 
@@ -1461,6 +1475,26 @@ impl<R: Read + Seek> ResolverHandle<R> {
             .contains(&object_gen)
     }
 
+    /// Return the current qpdf allocation-event count. This is a read-only
+    /// checkpoint: unlike `nextObjGen`/`getObjectCount`, it does not prepare or
+    /// mutate the live object cache (`libqpdf/QPDF.cc:1271-1283,1872-1880`).
+    pub(crate) fn allocation_checkpoint(&self) -> usize {
+        self.core.borrow().allocated_object_order.len()
+    }
+
+    /// Return valid qpdf allocation identities registered after `checkpoint`,
+    /// preserving their allocator event order. Cache entries minted only while
+    /// resolving an xref reference are intentionally absent from this log.
+    pub(crate) fn allocated_object_refs_after(&self, checkpoint: usize) -> Vec<ObjectRef> {
+        self.core
+            .borrow()
+            .allocated_object_order
+            .iter()
+            .skip(checkpoint)
+            .filter_map(|object_gen| object_gen.to_object_ref())
+            .collect()
+    }
+
     /// Raw cache values for internal inspection, without `newIndirect`'s
     /// active-identity update. Public enumeration uses [`Self::get_all_objects`].
     pub(crate) fn all_object_handles(&self) -> Vec<ObjectHandle> {
@@ -1653,7 +1687,7 @@ impl<R: Read + Seek> ResolverHandle<R> {
         {
             let mut core = self.core.borrow_mut();
             core.object_cache.insert(object_gen, handle.clone());
-            core.allocated_object_refs.insert(object_gen);
+            core.record_allocated_object(object_gen);
         }
         Ok(
             handle.promote_to_indirect(
@@ -1720,8 +1754,7 @@ impl<R: Read + Seek> ResolverHandle<R> {
         if self.xref_entry(object_ref).is_none() {
             self.core
                 .borrow_mut()
-                .allocated_object_refs
-                .insert(QpdfObjGen::from_object_ref(object_ref));
+                .record_allocated_object(QpdfObjGen::from_object_ref(object_ref));
         }
         Ok(target)
     }
@@ -1757,8 +1790,7 @@ impl<R: Read + Seek> ResolverHandle<R> {
             if self.xref_entry(object_ref).is_none() {
                 self.core
                     .borrow_mut()
-                    .allocated_object_refs
-                    .insert(QpdfObjGen::from_object_ref(object_ref));
+                    .record_allocated_object(QpdfObjGen::from_object_ref(object_ref));
             }
         }
         Ok(())
