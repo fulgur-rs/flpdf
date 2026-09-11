@@ -37,7 +37,14 @@ pub(crate) struct Plan {
 impl Plan {
     pub(crate) fn build<R: Read + Seek>(pdf: &mut Pdf<R>) -> Result<Self> {
         let root_candidate = pdf.trailer_key_handle(b"Root");
-        if root_candidate.try_is_null()? {
+        // Only a direct null or an absent /Root short-circuits here. An
+        // indirect value must reach `root_handle()`, whose dictionary gate is
+        // qpdf's: `QPDF::getRoot` tests `root.isDictionary()`
+        // (`libqpdf/QPDF.cc:2355-2360`), which dereferences first
+        // (`QPDFObjectHandle.cc:432-435`), so an indirect reference resolving to
+        // null reports "unable to find /Root dictionary" rather than a missing
+        // key.
+        if !root_candidate.is_indirect() && root_candidate.try_is_null()? {
             return Err(crate::Error::Missing("/Root"));
         }
         let root_handle = pdf.root_handle()?;
@@ -222,7 +229,7 @@ mod tests {
     }
 
     #[test]
-    fn plan_rejects_an_indirect_null_root_at_the_qpdf_accessor_boundary() {
+    fn plan_reports_qpdf_dictionary_error_for_an_indirect_null_root() {
         let mut bytes = b"%PDF-1.3\n".to_vec();
         let object_offset = bytes.len();
         bytes.extend_from_slice(b"1 0 obj\nnull\nendobj\n");
@@ -236,8 +243,8 @@ mod tests {
         );
         let mut pdf = Pdf::open(Cursor::new(bytes)).expect("indirect-null-root fixture must open");
 
-        let error = Plan::build(&mut pdf).expect_err("an indirect null Root is missing");
-        assert!(matches!(error, crate::Error::Missing("/Root")));
+        let error = Plan::build(&mut pdf).expect_err("an indirect null Root is not a dictionary");
+        assert_eq!(error.to_string(), "unable to find /Root dictionary");
     }
 
     #[test]
