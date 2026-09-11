@@ -86,6 +86,70 @@ fn job_json_file_runs_through_the_production_qpdf_job() {
 }
 
 #[test]
+fn job_json_file_preserves_input_encryption_when_compression_is_disabled() {
+    if !qpdf_available() {
+        return;
+    }
+    let directory = tempfile::tempdir().unwrap();
+    let fixture = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+        .join("../../tests/fixtures/encrypted/v4-aes-128-r4.pdf");
+    fs::copy(&fixture, directory.path().join("input.pdf")).unwrap();
+    fs::write(
+        directory.path().join("qpdf-job.json"),
+        br#"{"inputFile":"input.pdf","password":"user-v4-aes","outputFile":"qpdf-output.pdf","staticId":"","staticAesIv":"","compressStreams":"n"}"#,
+    )
+    .unwrap();
+    fs::write(
+        directory.path().join("flpdf-job.json"),
+        br#"{"inputFile":"input.pdf","password":"user-v4-aes","outputFile":"flpdf-output.pdf","staticId":"","staticAesIv":"","compressStreams":"n"}"#,
+    )
+    .unwrap();
+
+    let qpdf = ProcessCommand::new("/usr/bin/qpdf")
+        .current_dir(directory.path())
+        .arg("--job-json-file=qpdf-job.json")
+        .output()
+        .unwrap();
+    assert!(qpdf.status.success(), "qpdf job JSON failed: {qpdf:?}");
+
+    // qpdf's `compressStreams` setter changes only the writer compression
+    // switch (`QPDFJob_config.cc:128-132`). The writer must therefore retain
+    // source encryption unless an explicit decode/QDF/decrypt setting disables
+    // preservation (`QPDFJob.cc:2865-2878`, `QPDFWriter.cc:2090-2101`).
+    let flpdf = Command::cargo_bin("flpdf")
+        .unwrap()
+        .current_dir(directory.path())
+        .arg("--job-json-file=flpdf-job.json")
+        .output()
+        .unwrap();
+    assert!(flpdf.status.success(), "flpdf job JSON failed: {flpdf:?}");
+
+    let qpdf_encryption = ProcessCommand::new("/usr/bin/qpdf")
+        .current_dir(directory.path())
+        .args(["--password=user-v4-aes", "--show-encryption"])
+        .arg("qpdf-output.pdf")
+        .output()
+        .unwrap();
+    let flpdf_encryption = ProcessCommand::new("/usr/bin/qpdf")
+        .current_dir(directory.path())
+        .args(["--password=user-v4-aes", "--show-encryption"])
+        .arg("flpdf-output.pdf")
+        .output()
+        .unwrap();
+
+    assert!(
+        qpdf_encryption.status.success(),
+        "qpdf output was not readable: {qpdf_encryption:?}"
+    );
+    assert!(
+        flpdf_encryption.status.success(),
+        "flpdf output was not readable: {flpdf_encryption:?}"
+    );
+    assert_eq!(flpdf_encryption.stdout, qpdf_encryption.stdout);
+    assert_eq!(flpdf_encryption.stderr, qpdf_encryption.stderr);
+}
+
+#[test]
 fn job_json_file_accepts_literal_high_bit_password_bytes() {
     let directory = tempfile::tempdir().unwrap();
     let fixture =

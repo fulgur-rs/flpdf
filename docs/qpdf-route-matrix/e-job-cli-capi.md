@@ -9,6 +9,15 @@ C API）、`libqpdf/qpdf-c.cc`（`QPDF` / `QPDFWriter` の C API）。flpdf 側�
 `crates/flpdf-cli/src/main.rs` が `QPDFJob` public を経由せず直接触る crate 項目、
 `crates/flpdf-qtest-tools`（qtest 用 consumer）。
 
+**Writer decode の境界:** qpdf の `QPDFJob::Members::decode_level` は job-level の既定値として
+generalized だが、`decode_level_set` は `Config::decodeLevel` まで false のままである
+（`include/qpdf/QPDFJob.hh:635-637`、`libqpdf/QPDFJob_config.cc:717-729`）。したがって
+`setWriterOptions` は明示設定時だけ writer に decode level を渡し
+（`libqpdf/QPDFJob.cc:2865-2875`）、未指定時の writer は `QPDFWriter` の decode none・
+preserve-encryption=true を使う（`include/qpdf/QPDFWriter.hh:630-642`）。
+The E-12 historical summary below uses “Job default generalized decode” as shorthand for the
+job-level state; it does not mean that an unset decode level is replayed into the writer.
+
 **前提訂正（本表作成時に判明）:** 本ファイルの初版スケルトンは「`libqpdf/qpdf-c.cc` が `QPDF` /
 `QPDFWriter` / `QPDFJob` のどの public を叩くか」と書いていたが、これは誤り。
 `rg -n 'QPDFJob' $Q/libqpdf/qpdf-c.cc` は 0 件で、`qpdf-c.cc` は `QPDF` と `QPDFWriter` しか

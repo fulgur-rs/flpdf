@@ -273,17 +273,18 @@ struct JobConfiguration {
     show_attachment: Option<Vec<u8>>,
 }
 
-/// qpdf's QPDFJob Members default the writer decode level to generalized
-/// (`include/qpdf/QPDFJob.hh:635-637`), even though a standalone
-/// QPDFWriter defaults to none. Keep the job lifecycle's writer snapshot on
-/// that job-specific default so token-filtered streams still pass through the
-/// writer pipeline when compression is explicitly disabled.
+/// Build qpdf's initial job state.
+///
+/// qpdf keeps the job-level `decode_level` default at generalized, but leaves
+/// `decode_level_set` false until `Config::decodeLevel` is called
+/// (`include/qpdf/QPDFJob.hh:635-637`, `libqpdf/QPDFJob_config.cc:717-729`).
+/// The writer therefore retains its own default decode level (none) until the
+/// explicit setter is replayed by `setWriterOptions`
+/// (`libqpdf/QPDFJob.cc:2865-2875`). `JobConfiguration::default` already keeps
+/// those two states separate: `json_decode_level` defaults to generalized,
+/// while `WriterConfiguration` defaults to the standalone writer state.
 fn qpdf_default_job_configuration() -> JobConfiguration {
-    let mut configuration = JobConfiguration::default();
-    configuration
-        .writer
-        .set_decode_level(crate::writer::DecodeLevel::Generalized);
-    configuration
+    JobConfiguration::default()
 }
 
 /// qpdf opens one `Config::pages()` group and then permits multiple
