@@ -9,8 +9,9 @@ fn source_root() -> PathBuf {
 
 #[test]
 fn pdf_resolution_facades_are_removed_after_consumer_cutover() {
-    let reader =
-        fs::read_to_string(source_root().join("reader.rs")).expect("reader.rs must be readable");
+    let reader = fs::read_to_string(source_root().join("reader.rs"))
+        .expect("reader.rs must be readable")
+        .replace("\r\n", "\n");
 
     let qtest_resolve =
         "#[cfg(feature = \"qtest-driver\")]\n    #[doc(hidden)]\n    pub fn resolve(";
@@ -35,7 +36,8 @@ fn pdf_resolution_facades_are_removed_after_consumer_cutover() {
 #[test]
 fn panic_key_facades_are_only_available_to_the_qtest_driver_feature() {
     let object_handle = fs::read_to_string(source_root().join("object_handle.rs"))
-        .expect("object_handle.rs must be readable");
+        .expect("object_handle.rs must be readable")
+        .replace("\r\n", "\n");
 
     for method in ["get_key", "has_key"] {
         let marker =
@@ -52,7 +54,8 @@ fn merge_example_does_not_turn_fallible_key_lookups_into_panics() {
     let example = fs::read_to_string(
         PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("examples/merge_pdfs.rs"),
     )
-    .expect("merge_pdfs example must be readable");
+    .expect("merge_pdfs example must be readable")
+    .replace("\r\n", "\n");
 
     for forbidden in [
         "try_get_key(b\"/Resources\").unwrap()",
