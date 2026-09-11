@@ -122,7 +122,7 @@ are not treated as vulnerabilities on their own:
   warning, not as corruption. The cap is only reachable by calling
   `filters::decode_stream_data_recovering_with_limits`
   directly with a caller-supplied `DecodeLimits`; the ordinary document
-  paths (`Pdf::resolve`, the page/resource/attachment helpers, `PdfWriter`,
+  paths (`ObjectHandle::try_*` accessors, the page/resource/attachment helpers, `PdfWriter`,
   and `job::QPDFJob::check` / the `--check` route) all hard-code
   `DecodeLimits::default()` (`max_output: None`) internally and expose no
   way to set the cap, so they decode unbounded regardless of this opt-in —
@@ -160,7 +160,7 @@ Inventory of the mechanisms that uphold §2, as of the last review:
 | Depth limits (= 64) on destination-reference and action chains | `MAX_DEST_RESOLVE_DEPTH` (`job/outline_dest_remap.rs`), `MAX_ACTION_CHAIN_DEPTH` (`page_extract.rs`) |
 | Cycle detection (visited sets) on iterative chain following: xref `/Prev` chains, outline `/Next` chains, field `/Parent` chains (an iterative `while`-loop with a visited set — terminating; the missing depth cap is hardening only, `flpdf-hn1g.3`) | `xref.rs` (`merge_previous_xref_sections`), `outline_document_helper.rs` (`build_item`), `annotation_object_helper.rs`, `signatures.rs`, `json_inspect.rs` |
 | Checked arithmetic and non-negative validation on parser-derived sizes (`/Length` bounds, PNG-predictor row math, LZW table size cap of 4096 entries) | `parser.rs`, `filters.rs` |
-| Reference resolution that cannot loop (cache-based; unresolvable references resolve to null) | `reader.rs` (`resolve`, `resolve_borrowed`) |
+| Reference resolution that cannot loop (cache-based; unresolvable references resolve to null) | `ObjectHandle::try_*` accessors backed by `reader.rs`'s canonical resolver |
 | Weak-crypto write gate: selecting new RC4 or deprecated R=5 (AES-256) encryption parameters via `--encrypt` requires the explicit `--allow-weak-crypto` opt-in (a preserve-only rewrite of an already weakly encrypted input is not gated) | `parse_encrypt_segment`'s `guard_weak` (`main.rs`) refuses the new selection; encrypted inputs remain readable, matching qpdf's write-only weak-crypto policy |
 | OS CSPRNG for AES IVs and key material | `getrandom` in `encryption/` |
 | Signed-PDF qpdf-compatible handling (full rewrite proceeds, leaving signatures present-but-invalid like qpdf; signatures are stripped only via the explicit `--remove-restrictions` opt-in; like qpdf, that opt-in emits no extra diagnostic). A preserve-by-default *refusal* is a deferred post-v1.0 improvement (`flpdf-hn1g.14`). | [signed-pdf.md](signed-pdf.md), `signatures.rs` |
@@ -213,7 +213,7 @@ Entry points through which untrusted bytes reach flpdf:
 | --- | --- |
 | Document opening (qpdf-style recovery enabled by default) | `Pdf::open`, `Pdf::open_with_repair`, `Pdf::open_best_effort`, `Pdf::open_with_options`, `Pdf::open_for_encryption_inspection`, `Pdf::open_mem`, `Pdf::open_mem_with_options`, `Pdf::open_mem_owned`, and `Pdf::open_mem_owned_with_options` |
 | Recovery policy | `PdfOpenOptions::repair` defaults to `true`, matching qpdf's `attempt_recovery=true`; `--suppress-recovery` is the explicit CLI opt-out and maps to `repair=false`. flpdf retains `--repair`, but it does not change the default-enabled policy and qpdf has no `--repair` option. |
-| Lazy object loading | `Pdf::resolve` / `resolve_borrowed` (xref offsets, object syntax, object streams) |
+| Lazy object loading | `Pdf::get_object_handle` plus `ObjectHandle::try_*` accessors (xref offsets, object syntax, object streams) |
 | Stream decoding | filter pipeline in `filters.rs`: Flate, LZW, ASCII85, ASCIIHex, RunLength (+ pass-through DCT/JBIG2/JPX/CCITT) |
 | Decryption | standard security handler (`encryption/`): RC4-40/128, AES-128 (V4/R4), AES-256 (V5/R5 deprecated, V5/R6); qpdf-compatible UTF-8 validation/raw password bytes and the reader-side V5 prefix boundary (qpdf does not apply SASLprep) |
 | Validation | `job::QPDFJob::check` and the CLI `--check` route |

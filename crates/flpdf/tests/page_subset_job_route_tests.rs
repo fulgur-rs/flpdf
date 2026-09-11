@@ -14,11 +14,13 @@ fn page_subset_pruning_is_exposed_through_qpdf_job() {
 
     let page_ref = ObjectRef::new(4, 0);
     let page = pdf.get_object_handle(page_ref);
-    pdf.resolve(&page).expect("page should resolve");
-    let resources = page.get_key(b"/Resources");
-    pdf.resolve(&resources).expect("resources should resolve");
-    let fonts = resources.get_key(b"/Font");
-    pdf.resolve(&fonts).expect("font dictionary should resolve");
+    page.try_is_scalar().expect("page should resolve");
+    let resources = page.try_get_key(b"/Resources").unwrap();
+    resources.try_is_scalar().expect("resources should resolve");
+    let fonts = resources.try_get_key(b"/Font").unwrap();
+    fonts
+        .try_is_scalar()
+        .expect("font dictionary should resolve");
     let entries = fonts.as_dictionary().expect("font dictionary");
 
     assert!(entries.contains_key(b"/F1".as_slice()));

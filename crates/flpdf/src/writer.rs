@@ -2228,7 +2228,7 @@ pub(crate) fn inject_adbe_extension<R: Read + Seek>(
 ///
 /// # Errors
 ///
-/// - Propagates [`Pdf::resolve`] errors when materialising the Catalog or an
+/// - Propagates canonical ObjectHandle resolution errors when materialising the Catalog or an
 ///   indirect `/Extensions` value.
 pub(crate) fn strip_adbe_extension<R: Read + Seek>(
     pdf: &mut Pdf<R>,
@@ -2285,7 +2285,7 @@ pub(crate) fn strip_adbe_extension<R: Read + Seek>(
 /// Resolve and copy the live Catalog's immediate entries for writer-owned
 /// output mutations.
 ///
-/// The legacy writer used `Pdf::resolve`, which can return a stale materialized
+/// The legacy writer used `ObjectHandle` resolution, which can return a stale materialized
 /// cache entry after a canonical ObjectHandle mutation. qpdf's writer operates
 /// on a live `QPDFObjectHandle::unsafeShallowCopy` instead, so this boundary
 /// resolves the canonical root slot, makes a direct top-level dictionary copy,
@@ -6737,7 +6737,7 @@ mod final_handle_writer_tests {
         .expect("fixture must open");
         let page = crate::pages::page_refs(&mut pdf).expect("page refs")[0];
         let page_handle = pdf.get_object_handle(page);
-        pdf.resolve(&page_handle).expect("page resolves");
+        page_handle.try_is_scalar().expect("page resolves");
         let replacement = page_handle.shallow_copy().expect("page is copyable");
         let image = pdf
             .new_stream_with_data(Rc::new(b"image".to_vec()))
@@ -7090,7 +7090,7 @@ mod final_handle_writer_tests {
         ))
         .expect("one-page fixture");
         let page = pdf.get_object_handle(ObjectRef::new(3, 0));
-        pdf.resolve(&page).expect("page resolves");
+        page.try_is_scalar().expect("page resolves");
         let content = page.try_get_key(b"/Contents").expect("page contents");
         let eof_calls = Rc::new(std::cell::Cell::new(0));
         content

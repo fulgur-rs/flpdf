@@ -160,15 +160,15 @@ mod tests {
     use crate::{pages, ObjectHandle, PageBox, Pdf};
     use std::io::Cursor;
 
-    fn handle_to_pagebox(pdf: &mut Pdf<Cursor<Vec<u8>>>, obj: &ObjectHandle) -> Option<PageBox> {
-        pdf.resolve(obj).ok()?;
+    fn handle_to_pagebox(obj: &ObjectHandle) -> Option<PageBox> {
+        obj.try_is_scalar().ok()?;
         let values = obj.as_array()?;
         if values.len() != 4 {
             return None;
         }
         let mut numbers = [0.0; 4];
         for (index, value) in values.iter().enumerate() {
-            pdf.resolve(value).ok()?;
+            value.try_is_scalar().ok()?;
             numbers[index] = value
                 .as_integer()
                 .map(|value| value as f64)
@@ -188,22 +188,22 @@ mod tests {
         key: &[u8],
     ) -> ObjectHandle {
         let owner = pdf.get_object_handle(object_ref);
-        pdf.resolve(&owner).expect("object resolves");
-        let value = owner.get_key(key);
-        pdf.resolve(&value).expect("object key resolves");
+        owner.try_is_scalar().expect("object resolves");
+        let value = owner.try_get_key(key).unwrap();
+        value.try_is_scalar().expect("object key resolves");
         value
     }
 
     fn pagebox_for(pdf: &mut Pdf<Cursor<Vec<u8>>>, object_ref: ObjectRef, key: &[u8]) -> PageBox {
         let value = object_key_handle(pdf, object_ref, key);
-        handle_to_pagebox(pdf, &value).expect("page box must be a four-number array")
+        handle_to_pagebox(&value).expect("page box must be a four-number array")
     }
 
     fn rotate_value(pdf: &mut Pdf<Cursor<Vec<u8>>>, page_ref: ObjectRef) -> Option<i64> {
         let page = pdf.get_object_handle(page_ref);
-        pdf.resolve(&page).expect("page resolves");
-        let rotate = page.get_key(b"/Rotate");
-        pdf.resolve(&rotate).expect("/Rotate resolves");
+        page.try_is_scalar().expect("page resolves");
+        let rotate = page.try_get_key(b"/Rotate").unwrap();
+        rotate.try_is_scalar().expect("/Rotate resolves");
         rotate.as_integer()
     }
 
@@ -216,40 +216,29 @@ mod tests {
     /// `/Rotate` behind instead of removing it.
     fn rotate_key_absent(pdf: &mut Pdf<Cursor<Vec<u8>>>, page_ref: ObjectRef) -> bool {
         let page = pdf.get_object_handle(page_ref);
-        pdf.resolve(&page).expect("page resolves");
-        !page.has_key(b"/Rotate")
+        page.try_is_scalar().expect("page resolves");
+        !page.try_has_key(b"/Rotate").unwrap()
     }
 
     #[test]
     fn handle_to_pagebox_rejects_bad_shapes_and_accepts_real_literals() {
-        let mut pdf = Pdf::empty().unwrap();
-        assert!(handle_to_pagebox(&mut pdf, &ObjectHandle::integer(1)).is_none());
-        assert!(handle_to_pagebox(
-            &mut pdf,
-            &ObjectHandle::array(vec![ObjectHandle::integer(1)])
-        )
-        .is_none());
+        assert!(handle_to_pagebox(&ObjectHandle::integer(1)).is_none());
+        assert!(handle_to_pagebox(&ObjectHandle::array(vec![ObjectHandle::integer(1)])).is_none());
         assert_eq!(
-            handle_to_pagebox(
-                &mut pdf,
-                &ObjectHandle::array(vec![
-                    ObjectHandle::real_literal(1.5, b"1.5".to_vec()),
-                    ObjectHandle::integer(2),
-                    ObjectHandle::real(11.5),
-                    ObjectHandle::integer(22),
-                ])
-            ),
+            handle_to_pagebox(&ObjectHandle::array(vec![
+                ObjectHandle::real_literal(1.5, b"1.5".to_vec()),
+                ObjectHandle::integer(2),
+                ObjectHandle::real(11.5),
+                ObjectHandle::integer(22),
+            ])),
             Some(PageBox::new(1.5, 2.0, 11.5, 22.0))
         );
-        assert!(handle_to_pagebox(
-            &mut pdf,
-            &ObjectHandle::array(vec![
-                ObjectHandle::integer(1),
-                ObjectHandle::null(),
-                ObjectHandle::integer(11),
-                ObjectHandle::integer(22),
-            ])
-        )
+        assert!(handle_to_pagebox(&ObjectHandle::array(vec![
+            ObjectHandle::integer(1),
+            ObjectHandle::null(),
+            ObjectHandle::integer(11),
+            ObjectHandle::integer(22),
+        ]))
         .is_none());
     }
 
@@ -269,7 +258,7 @@ mod tests {
         let media_box = object_key_handle(&mut pdf, page, b"/MediaBox");
 
         assert_eq!(
-            handle_to_pagebox(&mut pdf, &media_box),
+            handle_to_pagebox(&media_box),
             Some(PageBox::new(1.0, 4.0, 3.0, 7.0))
         );
     }
@@ -357,7 +346,7 @@ mod tests {
         let bytes = build_single_page_pdf(None, None);
         let mut pdf = Pdf::open(Cursor::new(bytes)).unwrap();
         let parent = pdf.get_object_handle(ObjectRef::new(2, 0));
-        pdf.resolve(&parent).unwrap();
+        parent.try_is_scalar().unwrap();
         let page = pdf.get_object_handle(ObjectRef::new(3, 0));
         parent
             .replace_key(b"/Parent", page)
@@ -374,7 +363,7 @@ mod tests {
         let bytes = build_single_page_pdf(None, None);
         let mut pdf = Pdf::open(Cursor::new(bytes)).unwrap();
         let page = pdf.get_object_handle(ObjectRef::new(3, 0));
-        pdf.resolve(&page).unwrap();
+        page.try_is_scalar().unwrap();
         page.replace_key(b"/Parent", ObjectHandle::integer(42))
             .expect("page must be mutable");
 
@@ -400,7 +389,7 @@ mod tests {
         let mut pdf = Pdf::open(Cursor::new(bytes)).unwrap();
         let page_ref = ObjectRef::new(3, 0);
         let page = pdf.get_object_handle(page_ref);
-        pdf.resolve(&page).unwrap();
+        page.try_is_scalar().unwrap();
         let parent =
             ObjectHandle::dictionary(vec![(b"/Rotate".to_vec(), ObjectHandle::integer(90))]);
         page.replace_key(b"/Parent", parent)
@@ -421,7 +410,7 @@ mod tests {
         let mut pdf = Pdf::open(Cursor::new(bytes)).unwrap();
         let page_ref = ObjectRef::new(3, 0);
         let page = pdf.get_object_handle(page_ref);
-        pdf.resolve(&page).unwrap();
+        page.try_is_scalar().unwrap();
         page.replace_key(b"/Rotate", ObjectHandle::name(b"Bad".to_vec()))
             .expect("page must be mutable");
 
@@ -532,7 +521,7 @@ mod tests {
         let mut pdf = Pdf::open(Cursor::new(bytes)).unwrap();
         let page_ref = ObjectRef::new(3, 0);
         let page = pdf.get_object_handle(page_ref);
-        pdf.resolve(&page).unwrap();
+        page.try_is_scalar().unwrap();
         page.replace_key(b"/Rotate", ObjectHandle::integer(2_147_483_700))
             .expect("page must be mutable");
 
@@ -557,7 +546,7 @@ mod tests {
         let mut pdf = Pdf::open(Cursor::new(bytes)).unwrap();
         let page_ref = ObjectRef::new(3, 0);
         let page = pdf.get_object_handle(page_ref);
-        pdf.resolve(&page).unwrap();
+        page.try_is_scalar().unwrap();
         page.replace_key(b"/Rotate", ObjectHandle::integer(-2_147_483_700))
             .expect("page must be mutable");
 
@@ -582,7 +571,7 @@ mod tests {
         let mut pdf = Pdf::open(Cursor::new(bytes)).unwrap();
         let page_ref = ObjectRef::new(3, 0);
         let page = pdf.get_object_handle(page_ref);
-        pdf.resolve(&page).unwrap();
+        page.try_is_scalar().unwrap();
         page.replace_key(b"/Rotate", ObjectHandle::integer(9_223_372_036_854_775_800))
             .expect("page must be mutable");
 
@@ -1052,10 +1041,10 @@ mod tests {
             .expect("flattened annotation must remain on the page");
         assert_eq!(annotations.len(), 1);
         let annotation = &annotations[0];
-        pdf.resolve(annotation).unwrap();
-        let rect = annotation.get_key(b"/Rect");
-        pdf.resolve(&rect).unwrap();
-        let r = handle_to_pagebox(&mut pdf, &rect).expect("annotation rectangle");
+        annotation.try_is_scalar().unwrap();
+        let rect = annotation.try_get_key(b"/Rect").unwrap();
+        rect.try_is_scalar().unwrap();
+        let r = handle_to_pagebox(&rect).expect("annotation rectangle");
         assert_eq!((r.llx, r.lly, r.urx, r.ury), (20.0, 140.0, 40.0, 190.0));
     }
 
@@ -1068,19 +1057,19 @@ mod tests {
         flatten_rotation_on_pages(&mut pdf, &[page]).unwrap();
 
         let page_handle = pdf.get_object_handle(page);
-        pdf.resolve(&page_handle).unwrap();
-        let annots_handle = page_handle.get_key(b"/Annots");
-        pdf.resolve(&annots_handle).unwrap();
+        page_handle.try_is_scalar().unwrap();
+        let annots_handle = page_handle.try_get_key(b"/Annots").unwrap();
+        annots_handle.try_is_scalar().unwrap();
         let annots = annots_handle
             .as_array()
             .expect("/Annots must remain an array");
         let mut rects = annots
             .iter()
             .map(|annotation| {
-                pdf.resolve(annotation).unwrap();
-                let rect = annotation.get_key(b"/Rect");
-                pdf.resolve(&rect).unwrap();
-                let rectangle = handle_to_pagebox(&mut pdf, &rect).expect("annotation rectangle");
+                annotation.try_is_scalar().unwrap();
+                let rect = annotation.try_get_key(b"/Rect").unwrap();
+                rect.try_is_scalar().unwrap();
+                let rectangle = handle_to_pagebox(&rect).expect("annotation rectangle");
                 (rectangle.llx, rectangle.lly, rectangle.urx, rectangle.ury)
             })
             .collect::<Vec<_>>();
@@ -1091,7 +1080,7 @@ mod tests {
         );
         let original = object_key_handle(&mut pdf, indirect_annot, b"/Rect");
         assert_eq!(
-            handle_to_pagebox(&mut pdf, &original),
+            handle_to_pagebox(&original),
             Some(PageBox::new(20.0, 30.0, 70.0, 50.0))
         );
     }
@@ -1126,10 +1115,10 @@ mod tests {
             .expect("flattened annotation must be indirect");
         assert_eq!(annotations.len(), 1);
         let annotation = &annotations[0];
-        pdf.resolve(annotation).unwrap();
-        let rect = annotation.get_key(b"/Rect");
-        pdf.resolve(&rect).unwrap();
-        let r = handle_to_pagebox(&mut pdf, &rect).expect("annotation rectangle");
+        annotation.try_is_scalar().unwrap();
+        let rect = annotation.try_get_key(b"/Rect").unwrap();
+        rect.try_is_scalar().unwrap();
+        let r = handle_to_pagebox(&rect).expect("annotation rectangle");
         assert_eq!((r.llx, r.lly, r.urx, r.ury), (20.0, 140.0, 40.0, 190.0));
     }
 

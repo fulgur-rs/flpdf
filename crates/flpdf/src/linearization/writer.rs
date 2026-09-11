@@ -4450,7 +4450,7 @@ mod tests {
         );
 
         let root = pdf.get_object_handle(root_ref);
-        pdf.resolve(&root).expect("Catalog resolves");
+        root.try_is_scalar().expect("Catalog resolves");
         assert!(
             root.try_get_key(b"/Outlines")
                 .expect("Outlines lookup")

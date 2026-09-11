@@ -5415,7 +5415,7 @@ mod tests {
             .next()
             .expect("written page");
         let page = written.get_object_handle(page_ref);
-        written.resolve(&page).expect("written page resolves");
+        page.try_is_scalar().expect("written page resolves");
         let contents = page
             .try_get_key(b"/Contents")
             .expect("written contents key")

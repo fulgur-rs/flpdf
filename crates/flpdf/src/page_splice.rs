@@ -838,7 +838,7 @@ mod tests {
 
     fn dict_handle_of(pdf: &mut Pdf<Cursor<Vec<u8>>>, r: ObjectRef) -> ObjectHandle {
         let handle = pdf.get_object_handle(r);
-        pdf.resolve(&handle).expect("object should resolve");
+        handle.try_is_scalar().expect("object should resolve");
         assert!(handle.as_dictionary().is_some(), "not a dictionary");
         handle
     }
@@ -889,7 +889,7 @@ mod tests {
         assert_eq!(pages[1], ObjectRef::new(5, 0)); // C
                                                     // Root /Pages /Count should be 2.
         let root = dict_handle_of(&mut pdf, ObjectRef::new(2, 0));
-        assert_eq!(root.get_key(b"/Count").as_integer(), Some(2));
+        assert_eq!(root.try_get_key(b"/Count").unwrap().as_integer(), Some(2));
     }
 
     #[test]
@@ -901,7 +901,7 @@ mod tests {
         assert_eq!(pages[0], ObjectRef::new(3, 0)); // A
         assert_eq!(pages[1], ObjectRef::new(4, 0)); // B
         let root = dict_handle_of(&mut pdf, ObjectRef::new(2, 0));
-        assert_eq!(root.get_key(b"/Count").as_integer(), Some(2));
+        assert_eq!(root.try_get_key(b"/Count").unwrap().as_integer(), Some(2));
     }
 
     #[test]
@@ -917,12 +917,12 @@ mod tests {
         // /Parent of new_page must point at root /Pages (2 0 R).
         let d = dict_handle_of(&mut pdf, new_page);
         assert_eq!(
-            d.get_key(b"/Parent").object_ref(),
+            d.try_get_key(b"/Parent").unwrap().object_ref(),
             Some(ObjectRef::new(2, 0))
         );
         // /Count = 4
         let root = dict_handle_of(&mut pdf, ObjectRef::new(2, 0));
-        assert_eq!(root.get_key(b"/Count").as_integer(), Some(4));
+        assert_eq!(root.try_get_key(b"/Count").unwrap().as_integer(), Some(4));
     }
 
     #[test]
@@ -936,7 +936,7 @@ mod tests {
         assert_eq!(pages[3], new_page);
         let d = dict_handle_of(&mut pdf, new_page);
         assert_eq!(
-            d.get_key(b"/Parent").object_ref(),
+            d.try_get_key(b"/Parent").unwrap().object_ref(),
             Some(ObjectRef::new(2, 0))
         );
     }
@@ -964,7 +964,7 @@ mod tests {
         assert_eq!(pages.len(), 1);
         assert_eq!(pages[0], ObjectRef::new(5, 0)); // C only
         let root = dict_handle_of(&mut pdf, ObjectRef::new(2, 0));
-        assert_eq!(root.get_key(b"/Count").as_integer(), Some(1));
+        assert_eq!(root.try_get_key(b"/Count").unwrap().as_integer(), Some(1));
     }
 
     #[test]
@@ -973,11 +973,11 @@ mod tests {
         splice_pages(&mut pdf, 1..2, &[]).unwrap();
 
         let root = pdf.get_object_handle(ObjectRef::new(2, 0));
-        pdf.resolve(&root).unwrap();
+        root.try_is_scalar().unwrap();
         let kids_ref = root.try_get_key(b"/Kids").unwrap().object_ref();
         assert_eq!(kids_ref, Some(ObjectRef::new(9, 0)));
         let kids = pdf.get_object_handle(ObjectRef::new(9, 0));
-        pdf.resolve(&kids).unwrap();
+        kids.try_is_scalar().unwrap();
         let kids = kids
             .as_array()
             .expect("indirect /Kids array remains canonical");
@@ -987,7 +987,7 @@ mod tests {
             .collect();
         assert_eq!(kids_refs, vec![ObjectRef::new(3, 0), ObjectRef::new(5, 0)]);
         let count = root.try_get_key(b"/Count").unwrap();
-        pdf.resolve(&count).unwrap();
+        count.try_is_scalar().unwrap();
         assert_eq!(count.as_integer(), Some(2));
     }
 
@@ -1010,7 +1010,7 @@ mod tests {
         assert_eq!(pages[0], ObjectRef::new(3, 0));
         assert_ne!(pages[1], ObjectRef::new(3, 0));
         let root = dict_handle_of(&mut pdf, ObjectRef::new(2, 0));
-        let kids = root.get_key(b"/Kids").as_array().unwrap();
+        let kids = root.try_get_key(b"/Kids").unwrap().as_array().unwrap();
         assert!(kids.iter().all(|kid| kid.object_ref().is_some()));
     }
 
@@ -1020,9 +1020,9 @@ mod tests {
         splice_pages(&mut pdf, 0..0, &[ObjectRef::new(4, 0)]).unwrap();
 
         let root = pdf.get_object_handle(ObjectRef::new(2, 0));
-        pdf.resolve(&root).unwrap();
+        root.try_is_scalar().unwrap();
         let kids = root.try_get_key(b"/Kids").unwrap();
-        pdf.resolve(&kids).unwrap();
+        kids.try_is_scalar().unwrap();
         let kids = kids.as_array().expect("root /Kids array");
         assert_eq!(kids.len(), 2);
         assert_eq!(kids[0].object_ref(), Some(ObjectRef::new(4, 0)));
@@ -1036,9 +1036,9 @@ mod tests {
         splice_pages(&mut pdf, 1..1, &[ObjectRef::new(5, 0)]).unwrap();
 
         let root = pdf.get_object_handle(ObjectRef::new(2, 0));
-        pdf.resolve(&root).unwrap();
+        root.try_is_scalar().unwrap();
         let kids = root.try_get_key(b"/Kids").unwrap();
-        pdf.resolve(&kids).unwrap();
+        kids.try_is_scalar().unwrap();
         let kids = kids.as_array().expect("root /Kids array");
         assert_eq!(kids.len(), 3);
         assert!(kids[0].is_direct());
@@ -1052,9 +1052,9 @@ mod tests {
         splice_pages(&mut pdf, 0..1, &[]).unwrap();
 
         let root = pdf.get_object_handle(ObjectRef::new(2, 0));
-        pdf.resolve(&root).unwrap();
+        root.try_is_scalar().unwrap();
         let kids = root.try_get_key(b"/Kids").unwrap();
-        pdf.resolve(&kids).unwrap();
+        kids.try_is_scalar().unwrap();
         let root_kids = kids.as_array().expect("root /Kids array");
         assert_eq!(
             root_kids.len(),
@@ -1064,10 +1064,10 @@ mod tests {
         let intermediate = &root_kids[0];
         assert!(intermediate.is_direct());
         let count = intermediate.try_get_key(b"/Count").unwrap();
-        pdf.resolve(&count).unwrap();
+        count.try_is_scalar().unwrap();
         assert_eq!(count.as_integer(), Some(1));
         let child_kids = intermediate.try_get_key(b"/Kids").unwrap();
-        pdf.resolve(&child_kids).unwrap();
+        child_kids.try_is_scalar().unwrap();
         let child_kids = child_kids.as_array().expect("intermediate /Kids array");
         assert_eq!(child_kids.len(), 1);
         assert_eq!(child_kids[0].object_ref(), Some(ObjectRef::new(4, 0)));
@@ -1079,15 +1079,15 @@ mod tests {
         splice_pages(&mut pdf, 1..1, &[ObjectRef::new(5, 0)]).unwrap();
 
         let root = pdf.get_object_handle(ObjectRef::new(2, 0));
-        pdf.resolve(&root).unwrap();
+        root.try_is_scalar().unwrap();
         let root_kids = root.try_get_key(b"/Kids").unwrap();
-        pdf.resolve(&root_kids).unwrap();
+        root_kids.try_is_scalar().unwrap();
         let root_kids = root_kids.as_array().expect("root /Kids array");
         assert_eq!(root_kids.len(), 1);
         let intermediate = &root_kids[0];
         assert!(intermediate.is_direct());
         let child_kids = intermediate.try_get_key(b"/Kids").unwrap();
-        pdf.resolve(&child_kids).unwrap();
+        child_kids.try_is_scalar().unwrap();
         let child_kids = child_kids.as_array().expect("intermediate /Kids array");
         let child_refs: Vec<_> = child_kids
             .iter()
@@ -1130,7 +1130,7 @@ mod tests {
         splice_pages(&mut pdf, 0..0, &[ObjectRef::new(8, 0)]).unwrap();
 
         let right = dict_handle_of(&mut pdf, ObjectRef::new(6, 0));
-        let kids = right.get_key(b"/Kids").as_array().unwrap();
+        let kids = right.try_get_key(b"/Kids").unwrap().as_array().unwrap();
         assert_eq!(
             kids.len(),
             1,
@@ -1150,7 +1150,8 @@ mod tests {
         // parent, not the subtree it was copied into.
         assert_eq!(
             dict_handle_of(&mut pdf, duplicate)
-                .get_key(b"/Parent")
+                .try_get_key(b"/Parent")
+                .unwrap()
                 .object_ref(),
             Some(ObjectRef::new(3, 0))
         );
@@ -1214,7 +1215,7 @@ mod tests {
         let output = crate::writer::write_qpdf_to_memory(&mut pdf, |_| {}).unwrap();
         let mut round_trip = open(output);
         let root = dict_handle_of(&mut round_trip, ObjectRef::new(2, 0));
-        let kids = root.get_key(b"/Kids").as_array().unwrap();
+        let kids = root.try_get_key(b"/Kids").unwrap().as_array().unwrap();
         assert!(kids.first().is_some_and(|kid| kid.object_ref().is_some()));
     }
 
@@ -1225,19 +1226,22 @@ mod tests {
 
         assert_eq!(
             dict_handle_of(&mut pdf, ObjectRef::new(2, 0))
-                .get_key(b"/Type")
+                .try_get_key(b"/Type")
+                .unwrap()
                 .as_name(),
             Some(b"Pages".to_vec())
         );
         assert_eq!(
             dict_handle_of(&mut pdf, ObjectRef::new(3, 0))
-                .get_key(b"/Type")
+                .try_get_key(b"/Type")
+                .unwrap()
                 .as_name(),
             Some(b"Pages".to_vec())
         );
         assert_eq!(
             dict_handle_of(&mut pdf, ObjectRef::new(4, 0))
-                .get_key(b"/Type")
+                .try_get_key(b"/Type")
+                .unwrap()
                 .as_name(),
             Some(b"Page".to_vec())
         );
@@ -1248,7 +1252,7 @@ mod tests {
         let mut pdf = open(build_direct_pages_root_pdf());
         splice_pages(&mut pdf, 0..0, &[ObjectRef::new(4, 0)]).unwrap();
         let catalog = pdf.get_object_handle(ObjectRef::new(1, 0));
-        pdf.resolve(&catalog).unwrap();
+        catalog.try_is_scalar().unwrap();
         let pages = catalog.try_get_key(b"/Pages").unwrap();
         assert!(pages.object_ref().is_some());
         assert_eq!(page_list(&mut pdf).len(), 2);
@@ -1260,9 +1264,12 @@ mod tests {
         splice_pages(&mut pdf, 0..0, &[ObjectRef::new(3, 0)]).unwrap();
         assert_eq!(page_list(&mut pdf), vec![ObjectRef::new(3, 0)]);
         let root = dict_handle_of(&mut pdf, ObjectRef::new(2, 0));
-        assert_eq!(root.get_key(b"/Count").as_integer(), Some(1));
+        assert_eq!(root.try_get_key(b"/Count").unwrap().as_integer(), Some(1));
         assert_eq!(
-            root.get_key(b"/Kids").as_array().map(|items| items.len()),
+            root.try_get_key(b"/Kids")
+                .unwrap()
+                .as_array()
+                .map(|items| items.len()),
             Some(1)
         );
     }
@@ -1279,7 +1286,7 @@ mod tests {
         assert_eq!(pages[1], original);
         let copy = dict_handle_of(&mut pdf, pages[0]);
         assert_eq!(
-            copy.get_key(b"/Parent").object_ref(),
+            copy.try_get_key(b"/Parent").unwrap().object_ref(),
             Some(ObjectRef::new(2, 0))
         );
     }
@@ -1495,7 +1502,7 @@ mod tests {
         assert_eq!(pages[2], ObjectRef::new(5, 0)); // C
                                                     // Count stays 3.
         let root = dict_handle_of(&mut pdf, ObjectRef::new(2, 0));
-        assert_eq!(root.get_key(b"/Count").as_integer(), Some(3));
+        assert_eq!(root.try_get_key(b"/Count").unwrap().as_integer(), Some(3));
     }
 
     /// Remove page B (index 1, in left subtree) from the nested tree.
@@ -1513,13 +1520,13 @@ mod tests {
         assert_eq!(pages[2], ObjectRef::new(8, 0)); // D
                                                     // Root /Count = 3
         let root = dict_handle_of(&mut pdf, ObjectRef::new(2, 0));
-        assert_eq!(root.get_key(b"/Count").as_integer(), Some(3));
+        assert_eq!(root.try_get_key(b"/Count").unwrap().as_integer(), Some(3));
         // Left intermediate node /Count = 1 (only A remains)
         let left = dict_handle_of(&mut pdf, ObjectRef::new(3, 0));
-        assert_eq!(left.get_key(b"/Count").as_integer(), Some(1));
+        assert_eq!(left.try_get_key(b"/Count").unwrap().as_integer(), Some(1));
         // Right intermediate node /Count = 2 (unchanged)
         let right = dict_handle_of(&mut pdf, ObjectRef::new(6, 0));
-        assert_eq!(right.get_key(b"/Count").as_integer(), Some(2));
+        assert_eq!(right.try_get_key(b"/Count").unwrap().as_integer(), Some(2));
     }
 
     /// Remove pages B and C (indices 1 and 2), which span both left and right subtrees.
@@ -1532,13 +1539,13 @@ mod tests {
         assert_eq!(pages[0], ObjectRef::new(4, 0)); // A
         assert_eq!(pages[1], ObjectRef::new(8, 0)); // D
         let root = dict_handle_of(&mut pdf, ObjectRef::new(2, 0));
-        assert_eq!(root.get_key(b"/Count").as_integer(), Some(2));
+        assert_eq!(root.try_get_key(b"/Count").unwrap().as_integer(), Some(2));
         // Left subtree: only A remains → /Count = 1
         let left = dict_handle_of(&mut pdf, ObjectRef::new(3, 0));
-        assert_eq!(left.get_key(b"/Count").as_integer(), Some(1));
+        assert_eq!(left.try_get_key(b"/Count").unwrap().as_integer(), Some(1));
         // Right subtree: only D remains → /Count = 1
         let right = dict_handle_of(&mut pdf, ObjectRef::new(6, 0));
-        assert_eq!(right.get_key(b"/Count").as_integer(), Some(1));
+        assert_eq!(right.try_get_key(b"/Count").unwrap().as_integer(), Some(1));
     }
 
     #[test]
@@ -1574,10 +1581,10 @@ mod tests {
         assert_eq!(pages[1], ObjectRef::new(8, 0)); // D
         let root = dict_handle_of(&mut pdf, ObjectRef::new(2, 0));
         // Root /Kids should only contain right subtree (6 0 R).
-        let kids = root.get_key(b"/Kids").as_array().unwrap();
+        let kids = root.try_get_key(b"/Kids").unwrap().as_array().unwrap();
         assert_eq!(kids.len(), 1);
         assert_eq!(kids[0].object_ref(), Some(ObjectRef::new(6, 0)));
-        assert_eq!(root.get_key(b"/Count").as_integer(), Some(2));
+        assert_eq!(root.try_get_key(b"/Count").unwrap().as_integer(), Some(2));
     }
 
     /// Insert a new page at index 2 (between B and C, at the boundary of left and right subtrees).
@@ -1597,17 +1604,18 @@ mod tests {
         assert_eq!(pages[4], ObjectRef::new(8, 0)); // D
                                                     // Root /Count = 5
         let root = dict_handle_of(&mut pdf, ObjectRef::new(2, 0));
-        assert_eq!(root.get_key(b"/Count").as_integer(), Some(5));
+        assert_eq!(root.try_get_key(b"/Count").unwrap().as_integer(), Some(5));
         // new_page's /Parent should point at an ancestor /Pages node.
         let d = dict_handle_of(&mut pdf, new_page);
         let parent = d
-            .get_key(b"/Parent")
+            .try_get_key(b"/Parent")
+            .unwrap()
             .object_ref()
             .expect("/Parent must be set");
         // Parent must be a /Pages node in the tree
         let parent_dict = dict_handle_of(&mut pdf, parent);
         assert_eq!(
-            parent_dict.get_key(b"/Type").as_name(),
+            parent_dict.try_get_key(b"/Type").unwrap().as_name(),
             Some(b"Pages".to_vec())
         );
     }

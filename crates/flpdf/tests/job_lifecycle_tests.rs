@@ -994,7 +994,7 @@ fn json_job_run_applies_relative_rotation_to_a_real_page() {
     let mut pdf = Pdf::open(BufReader::new(File::open(output).unwrap())).unwrap();
     let page_ref = flpdf::pages::page_refs(&mut pdf).unwrap()[0];
     let page = pdf.get_object_handle(page_ref);
-    pdf.resolve(&page).unwrap();
+    page.try_is_scalar().unwrap();
     assert_eq!(page.try_get_key(b"/Rotate").unwrap().as_integer(), Some(90));
 }
 
@@ -1028,7 +1028,7 @@ fn create_qpdf_skips_the_stages_for_an_encryption_status_job() {
 
     let page_ref = flpdf::pages::page_refs(&mut pdf).unwrap()[0];
     let page = pdf.get_object_handle(page_ref);
-    pdf.resolve(&page).unwrap();
+    page.try_is_scalar().unwrap();
     assert_eq!(
         page.try_get_key(b"/Rotate").unwrap().as_integer(),
         None,
@@ -1061,7 +1061,7 @@ fn create_qpdf_returns_the_primary_after_rotation_transformation() {
 
     let page_ref = flpdf::pages::page_refs(&mut pdf).unwrap()[0];
     let page = pdf.get_object_handle(page_ref);
-    pdf.resolve(&page).unwrap();
+    page.try_is_scalar().unwrap();
     assert_eq!(page.try_get_key(b"/Rotate").unwrap().as_integer(), Some(90));
 }
 
@@ -1435,18 +1435,18 @@ fn json_job_run_in_place_page_subset_remaps_outline_dests() {
     // surviving outline item's `/Dest` rather than assuming the original
     // fixture's object number 4 persists in the output.
     let root = pdf.trailer_key_handle(b"Root");
-    pdf.resolve(&root).unwrap();
+    root.try_is_scalar().unwrap();
     let outlines = root.as_dictionary().unwrap()[b"/Outlines".as_slice()].clone();
-    pdf.resolve(&outlines).unwrap();
+    outlines.try_is_scalar().unwrap();
     let first_item = outlines.as_dictionary().unwrap()[b"/First".as_slice()].clone();
-    pdf.resolve(&first_item).unwrap();
+    first_item.try_is_scalar().unwrap();
     let dest = first_item.as_dictionary().unwrap()[b"/Dest".as_slice()].clone();
-    pdf.resolve(&dest).unwrap();
+    dest.try_is_scalar().unwrap();
     let target = dest.as_array().unwrap()[0].clone();
     let target_ref = target
         .object_ref()
         .expect("the outline dest target must still be an indirect reference");
-    pdf.resolve(&target).unwrap();
+    target.try_is_scalar().unwrap();
 
     assert!(
         target.is_null(),
@@ -2723,7 +2723,8 @@ fn json_create_update_and_write_share_one_job_lifecycle() {
         .expect("partial JSON update");
     assert_eq!(
         pdf.get_object_handle(flpdf::ObjectRef::new(1, 0))
-            .get_key(b"/Marker")
+            .try_get_key(b"/Marker")
+            .unwrap()
             .as_boolean(),
         Some(true)
     );

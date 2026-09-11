@@ -688,15 +688,15 @@ mod tests {
             .expect("reuse foreign object map");
 
         assert!(copied.is_same_object_as(&copied_again));
-        let copied_shared_a = copied.get_key(b"/SharedA");
-        let copied_shared_b = copied.get_key(b"/SharedB");
+        let copied_shared_a = copied.try_get_key(b"/SharedA").unwrap();
+        let copied_shared_b = copied.try_get_key(b"/SharedB").unwrap();
         assert!(copied_shared_a.is_same_object_as(&copied_shared_b));
         assert_ne!(copied_shared_a.object_ref(), shared.object_ref());
 
-        let copied_first = copied.get_key(b"/Cycle");
-        let copied_second = copied_first.get_key(b"/Next");
+        let copied_first = copied.try_get_key(b"/Cycle").unwrap();
+        let copied_second = copied_first.try_get_key(b"/Next").unwrap();
         assert_eq!(
-            copied_second.get_key(b"/Next").object_ref(),
+            copied_second.try_get_key(b"/Next").unwrap().object_ref(),
             copied_first.object_ref()
         );
     }
@@ -771,11 +771,16 @@ mod tests {
         let copied = copy_foreign_object_for_preserve(&mut target, &intermediate)
             .expect("preserve traversal must copy a page-tree container");
         assert!(copied.object_ref().is_some());
-        target
-            .resolve(&copied)
-            .expect("resolve preserved page tree");
+        copied.try_is_scalar().expect("resolve preserved page tree");
         assert!(target.repair_diagnostics().entries().is_empty());
-        assert_eq!(copied.get_key(b"/Kids").try_array_len().unwrap(), Some(1));
+        assert_eq!(
+            copied
+                .try_get_key(b"/Kids")
+                .unwrap()
+                .try_array_len()
+                .unwrap(),
+            Some(1)
+        );
     }
 
     #[test]
@@ -796,7 +801,7 @@ mod tests {
             .copy_foreign_object(&root)
             .expect("copy dictionary with an indirect null entry");
 
-        assert!(!copied.has_key(b"/IndirectNull"));
+        assert!(!copied.try_has_key(b"/IndirectNull").unwrap());
         assert_eq!(
             target.canonical_object_refs().len(),
             target_refs_before.len() + 1,
@@ -826,7 +831,8 @@ mod tests {
         assert!(!copied
             .as_stream_dict()
             .expect("copied stream dictionary")
-            .has_key(b"/IndirectNull"));
+            .try_has_key(b"/IndirectNull")
+            .unwrap());
         assert_eq!(
             target.canonical_object_refs().len(),
             target_refs_before.len() + 1,
@@ -885,7 +891,8 @@ mod tests {
         assert!(!copied
             .as_stream_dict()
             .expect("copied stream dictionary")
-            .has_key(b"/IndirectNull"));
+            .try_has_key(b"/IndirectNull")
+            .unwrap());
     }
 
     #[test]
@@ -1183,7 +1190,7 @@ mod tests {
         let copied = target
             .copy_foreign_object(&root)
             .expect("copy root with nested page");
-        let copied_page = copied.get_key(b"/Page");
+        let copied_page = copied.try_get_key(b"/Page").unwrap();
         assert!(copied_page.is_null());
         assert!(copied_page.object_ref().is_some());
         assert!(!target
@@ -1206,7 +1213,7 @@ mod tests {
         let copied_root = target
             .copy_foreign_object(&root)
             .expect("copy root with nested page boundary");
-        let boundary_page = copied_root.get_key(b"/Page");
+        let boundary_page = copied_root.try_get_key(b"/Page").unwrap();
         assert!(boundary_page.is_null());
         assert!(boundary_page.is_indirect());
 
@@ -1216,10 +1223,10 @@ mod tests {
         assert!(copied_page.is_same_object_as(&boundary_page));
         assert!(!copied_page.is_null());
         assert_eq!(
-            copied_page.get_key(b"/Type").as_name(),
+            copied_page.try_get_key(b"/Type").unwrap().as_name(),
             Some(b"Page".to_vec())
         );
-        assert!(copied_page.get_key(b"/Parent").is_null());
+        assert!(copied_page.try_get_key(b"/Parent").unwrap().is_null());
     }
 
     #[test]
@@ -1251,7 +1258,7 @@ mod tests {
         let copied_root = target
             .copy_foreign_object(&root)
             .expect("copy root with nested page boundary");
-        let kids = copied_root.get_key(b"/Kids");
+        let kids = copied_root.try_get_key(b"/Kids").unwrap();
         let boundary_ref = kids
             .as_array()
             .expect("Kids is an array")
@@ -1287,8 +1294,8 @@ mod tests {
         let mut reopened = Pdf::open(Cursor::new(out)).expect("reopen written output");
         assert!(reopened.canonical_object_refs().contains(&written_ref));
         let written_handle = reopened.get_object_handle(written_ref);
-        reopened
-            .resolve(&written_handle)
+        written_handle
+            .try_is_scalar()
             .expect("resolve written placeholder");
         assert!(written_handle.is_null());
     }
@@ -1314,7 +1321,7 @@ mod tests {
         let copied = target
             .copy_foreign_object(&root)
             .expect("copy stream graph");
-        let copied_stream = copied.get_key(b"/Stream");
+        let copied_stream = copied.try_get_key(b"/Stream").unwrap();
         assert!(copied_stream.is_indirect());
         assert!(Rc::ptr_eq(
             &copied_stream.as_stream_data().expect("copied buffer"),
@@ -1324,7 +1331,8 @@ mod tests {
             copied_stream
                 .as_stream_dict()
                 .expect("copied stream dictionary")
-                .get_key(b"/Filter")
+                .try_get_key(b"/Filter")
+                .unwrap()
                 .as_name(),
             Some(b"FlateDecode".to_vec())
         );
@@ -1359,7 +1367,7 @@ mod tests {
         let copied = target
             .copy_foreign_object(&root)
             .expect("copy provider graph");
-        let copied_stream = copied.get_key(b"/Stream");
+        let copied_stream = copied.try_get_key(b"/Stream").unwrap();
         assert!(copied_stream.as_stream_data().is_none());
         assert_eq!(*calls.borrow(), 0);
         assert_eq!(
@@ -1392,7 +1400,8 @@ mod tests {
                 .as_stream_data()
                 .expect("materialized immediate source"),
             &immediate_copy
-                .get_key(b"/Stream")
+                .try_get_key(b"/Stream")
+                .unwrap()
                 .as_stream_data()
                 .expect("shared immediate buffer")
         ));
@@ -1421,7 +1430,8 @@ mod tests {
             .copy_foreign_object(&root)
             .expect("provider failure must stay deferred");
         let error = copied
-            .get_key(b"/Stream")
+            .try_get_key(b"/Stream")
+            .unwrap()
             .get_raw_stream_data()
             .expect_err("destination read must propagate the foreign provider error");
         assert!(matches!(error, Error::System(message) if message == "foreign provider failed"));
@@ -1440,7 +1450,7 @@ mod tests {
         let copied = target
             .copy_foreign_object(&root)
             .expect("copy original stream graph");
-        let copied_stream = copied.get_key(b"/Stream");
+        let copied_stream = copied.try_get_key(b"/Stream").unwrap();
         assert!(copied_stream.as_stream_data().is_none());
         assert_eq!(
             copied_stream
@@ -1464,7 +1474,8 @@ mod tests {
             target
                 .copy_foreign_object(&root)
                 .expect("copy original stream graph")
-                .get_key(b"/Stream")
+                .try_get_key(b"/Stream")
+                .unwrap()
         };
 
         assert_eq!(
@@ -1490,7 +1501,8 @@ mod tests {
         let copied_stream = target
             .copy_foreign_object(&root)
             .expect("copy original stream graph")
-            .get_key(b"/Stream");
+            .try_get_key(b"/Stream")
+            .unwrap();
         let expected_offset = u64::try_from(source_stream.get_parsed_offset())
             .expect("source stream must retain its data offset");
 
@@ -1546,14 +1558,14 @@ mod tests {
         let copied = target
             .copy_foreign_object(&root)
             .expect("copy direct containers");
-        let copied_array = copied.get_key(b"/Array");
+        let copied_array = copied.try_get_key(b"/Array").unwrap();
         let copied_items = copied_array.as_array().expect("copied array");
         let copied_nested = copied_items[0].clone();
-        let copied_shared_from_dict = copied_nested.get_key(b"/Shared");
+        let copied_shared_from_dict = copied_nested.try_get_key(b"/Shared").unwrap();
         let copied_shared_from_array = copied_items[1].clone();
         assert!(copied_shared_from_dict.is_same_object_as(&copied_shared_from_array));
         assert_eq!(
-            copied_nested.get_key(b"/Name").as_name(),
+            copied_nested.try_get_key(b"/Name").unwrap().as_name(),
             Some(b"Nested".to_vec())
         );
         assert_ne!(copied_shared_from_array.object_ref(), shared.object_ref());
@@ -1574,10 +1586,17 @@ mod tests {
             .expect("reuse direct foreign value map");
 
         assert!(copied
-            .get_key(b"/Shared")
-            .is_same_object_as(&copied_again.get_key(b"/Shared")));
-        assert_eq!(copied.get_key(b"/Shared").as_integer(), Some(11));
-        assert!(!copied.get_key(b"/Shared").is_same_object_as(&shared));
+            .try_get_key(b"/Shared")
+            .unwrap()
+            .is_same_object_as(&copied_again.try_get_key(b"/Shared").unwrap()));
+        assert_eq!(
+            copied.try_get_key(b"/Shared").unwrap().as_integer(),
+            Some(11)
+        );
+        assert!(!copied
+            .try_get_key(b"/Shared")
+            .unwrap()
+            .is_same_object_as(&shared));
     }
 
     #[test]
@@ -1624,7 +1643,7 @@ mod tests {
             .expect("copy root referencing an unreserved /Pages object");
 
         assert!(
-            !copied.has_key(b"/Kids"),
+            !copied.try_has_key(b"/Kids").unwrap(),
             "a direct-null replacement must remove the key, matching qpdf's replaceKey"
         );
     }

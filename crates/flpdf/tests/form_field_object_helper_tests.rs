@@ -46,17 +46,17 @@ fn doc_with_root(root: &str, mut objects: Vec<(u32, String)>) -> Vec<u8> {
 
 fn resolved_handle(pdf: &mut Pdf<Cursor<Vec<u8>>>, object_ref: ObjectRef) -> ObjectHandle {
     let handle = pdf.get_object_handle(object_ref);
-    pdf.resolve(&handle).expect("resolve object");
+    handle.try_is_scalar().expect("resolve object");
     handle
 }
 
-fn resolved_value(pdf: &mut Pdf<Cursor<Vec<u8>>>, value: ObjectHandle) -> ObjectHandle {
-    pdf.resolve(&value).expect("resolve value");
+fn resolved_value(value: ObjectHandle) -> ObjectHandle {
+    value.try_is_scalar().expect("resolve value");
     value
 }
 
-fn resolved_key(pdf: &mut Pdf<Cursor<Vec<u8>>>, object: &ObjectHandle, key: &[u8]) -> ObjectHandle {
-    resolved_value(pdf, object.get_key(key))
+fn resolved_key(object: &ObjectHandle, key: &[u8]) -> ObjectHandle {
+    resolved_value(object.try_get_key(key).unwrap())
 }
 
 fn has_entry(object: &ObjectHandle, key: &[u8]) -> bool {
@@ -265,8 +265,8 @@ fn fully_qualified_name_terminates_on_a_reciprocal_direct_parent_cycle() {
     let mut pdf = open(bytes);
     let field_ref = ObjectRef::new(10, 0);
     let field = pdf.get_object_handle(field_ref);
-    pdf.resolve(&field).unwrap();
-    let direct_a = field.get_key(b"/Parent");
+    field.try_is_scalar().unwrap();
+    let direct_a = field.try_get_key(b"/Parent").unwrap();
     let direct_b =
         ObjectHandle::dictionary(vec![(b"/T".to_vec(), ObjectHandle::string(b"b".to_vec()))]);
     direct_a.replace_key(b"/Parent", direct_b.clone()).unwrap();
@@ -292,8 +292,8 @@ fn inherited_value_lookup_terminates_on_a_reciprocal_direct_parent_cycle() {
     let mut pdf = open(bytes);
     let field_ref = ObjectRef::new(10, 0);
     let field = pdf.get_object_handle(field_ref);
-    pdf.resolve(&field).unwrap();
-    let direct_a = field.get_key(b"/Parent");
+    field.try_is_scalar().unwrap();
+    let direct_a = field.try_get_key(b"/Parent").unwrap();
     let direct_b =
         ObjectHandle::dictionary(vec![(b"/T".to_vec(), ObjectHandle::string(b"b".to_vec()))]);
     direct_a.replace_key(b"/Parent", direct_b.clone()).unwrap();
@@ -318,7 +318,7 @@ fn fully_qualified_name_resolves_a_long_acyclic_direct_parent_chain() {
     let mut pdf = open(bytes);
     let field_ref = ObjectRef::new(10, 0);
     let field = pdf.get_object_handle(field_ref);
-    pdf.resolve(&field).unwrap();
+    field.try_is_scalar().unwrap();
 
     let mut parent = ObjectHandle::dictionary(vec![(
         b"/T".to_vec(),
@@ -354,7 +354,7 @@ fn field_value_resolves_a_long_acyclic_direct_parent_chain() {
     let mut pdf = open(bytes);
     let field_ref = ObjectRef::new(10, 0);
     let field = pdf.get_object_handle(field_ref);
-    pdf.resolve(&field).unwrap();
+    field.try_is_scalar().unwrap();
 
     let mut parent = ObjectHandle::dictionary(vec![(
         b"/V".to_vec(),
@@ -927,9 +927,9 @@ fn default_resources_preserves_a_natural_indirect_holder_identity() {
         .expect("resolve default resources")
         .expect("default resources handle");
     assert_eq!(resources.object_ref(), Some(ObjectRef::new(21, 0)));
-    let nested = resolved_key(&mut pdf, &resources, b"/Font");
+    let nested = resolved_key(&resources, b"/Font");
     assert_eq!(nested.object_ref(), Some(ObjectRef::new(22, 0)));
-    let back = resolved_key(&mut pdf, &nested, b"/Font");
+    let back = resolved_key(&nested, b"/Font");
     assert!(back.is_same_object_as(&resources));
 }
 
@@ -942,9 +942,9 @@ fn set_value_marks_the_live_catalog_acroform_and_writer_observes_it() {
     let mut pdf = open(bytes);
     let root_ref = pdf.root_ref().expect("catalog reference");
     let root = pdf.get_object_handle(root_ref);
-    pdf.resolve(&root).expect("catalog handle");
-    let acroform = root.get_key(b"/AcroForm");
-    pdf.resolve(&acroform).expect("AcroForm handle");
+    root.try_is_scalar().expect("catalog handle");
+    let acroform = root.try_get_key(b"/AcroForm").unwrap();
+    acroform.try_is_scalar().expect("AcroForm handle");
     assert!(acroform.as_dictionary().is_some());
     let same_acroform = pdf.get_object_handle(ObjectRef::new(20, 0));
     assert!(acroform.is_same_object_as(&same_acroform));
@@ -953,7 +953,10 @@ fn set_value_marks_the_live_catalog_acroform_and_writer_observes_it() {
         .set_value_string("value", true)
         .expect("set text value");
     assert_eq!(
-        same_acroform.get_key(b"/NeedAppearances").as_boolean(),
+        same_acroform
+            .try_get_key(b"/NeedAppearances")
+            .unwrap()
+            .as_boolean(),
         Some(true)
     );
 
@@ -962,15 +965,18 @@ fn set_value_marks_the_live_catalog_acroform_and_writer_observes_it() {
     let mut reopened = open(output);
     let reopened_root_ref = reopened.root_ref().expect("rewritten catalog");
     let reopened_root = reopened.get_object_handle(reopened_root_ref);
-    reopened
-        .resolve(&reopened_root)
+    reopened_root
+        .try_is_scalar()
         .expect("rewritten catalog handle");
-    let reopened_acroform = reopened_root.get_key(b"/AcroForm");
-    reopened
-        .resolve(&reopened_acroform)
+    let reopened_acroform = reopened_root.try_get_key(b"/AcroForm").unwrap();
+    reopened_acroform
+        .try_is_scalar()
         .expect("rewritten AcroForm handle");
     assert_eq!(
-        reopened_acroform.get_key(b"/NeedAppearances").as_boolean(),
+        reopened_acroform
+            .try_get_key(b"/NeedAppearances")
+            .unwrap()
+            .as_boolean(),
         Some(true)
     );
 }
@@ -1092,10 +1098,10 @@ fn set_value_updates_a_checkbox_direct_kid_widget() {
         key_name(&mut pdf, &field, b"/V").as_deref(),
         Some(b"Chosen".as_slice())
     );
-    let kids = resolved_key(&mut pdf, &field, b"/Kids")
+    let kids = resolved_key(&field, b"/Kids")
         .as_array()
         .expect("checkbox must retain direct widget child");
-    let widget = resolved_value(&mut pdf, kids.into_iter().next().expect("widget"));
+    let widget = resolved_value(kids.into_iter().next().expect("widget"));
     assert_direct_dictionary(&widget, "widget");
     assert_eq!(
         key_name(&mut pdf, &widget, b"/AS").as_deref(),
@@ -1130,10 +1136,10 @@ fn set_value_preserves_kids_order_when_direct_widget_precedes_a_reference() {
         key_name(&mut pdf, &field, b"/V").as_deref(),
         Some(b"Direct".as_slice())
     );
-    let kids = resolved_key(&mut pdf, &field, b"/Kids")
+    let kids = resolved_key(&field, b"/Kids")
         .as_array()
         .expect("kids must be an array");
-    let direct = resolved_value(&mut pdf, kids[0].clone());
+    let direct = resolved_value(kids[0].clone());
     assert_direct_dictionary(&direct, "first kid");
     assert_eq!(
         key_name(&mut pdf, &direct, b"/AS").as_deref(),
@@ -1300,15 +1306,15 @@ fn set_value_updates_a_radio_grandchild_widget_and_direct_kid_dictionaries() {
         key_name(&mut pdf, &field, b"/V").as_deref(),
         Some(b"On".as_slice())
     );
-    let children = resolved_key(&mut pdf, &field, b"/Kids")
+    let children = resolved_key(&field, b"/Kids")
         .as_array()
         .expect("radio field must retain direct children");
-    let child = resolved_value(&mut pdf, children.into_iter().next().expect("child field"));
+    let child = resolved_value(children.into_iter().next().expect("child field"));
     assert_direct_dictionary(&child, "child field");
-    let widgets = resolved_key(&mut pdf, &child, b"/Kids")
+    let widgets = resolved_key(&child, b"/Kids")
         .as_array()
         .expect("child field must retain direct widget children");
-    let widget = resolved_value(&mut pdf, widgets.into_iter().next().expect("widget"));
+    let widget = resolved_value(widgets.into_iter().next().expect("widget"));
     assert_direct_dictionary(&widget, "widget");
     assert_eq!(
         key_name(&mut pdf, &widget, b"/AS").as_deref(),
@@ -1372,9 +1378,9 @@ fn generates_a_field_value_on_its_separate_widget() {
     );
 
     let widget = resolved_handle(&mut pdf, ObjectRef::new(11, 0));
-    let ap = resolved_key(&mut pdf, &widget, b"/AP");
+    let ap = resolved_key(&widget, b"/AP");
     assert!(ap.as_dictionary().is_some());
-    let appearance = resolved_key(&mut pdf, &ap, b"/N");
+    let appearance = resolved_key(&ap, b"/N");
     assert!(
         appearance.as_stream_dict().is_some(),
         "normal appearance must be a stream"
@@ -1552,7 +1558,7 @@ fn checkbox_updates_a_direct_widget_through_an_indirect_kids_array() {
     let kids = kids_holder
         .as_array()
         .expect("/Kids holder must remain an array");
-    let widget = resolved_value(&mut pdf, kids[0].clone());
+    let widget = resolved_value(kids[0].clone());
     assert_direct_dictionary(&widget, "first /Kids item");
     assert_eq!(
         key_name(&mut pdf, &widget, b"/AS").as_deref(),
@@ -1612,13 +1618,13 @@ fn radio_keeps_direct_children_without_appearance_or_grandchildren() {
         .unwrap();
 
     let field = resolved_handle(&mut pdf, ObjectRef::new(10, 0));
-    let kids = resolved_key(&mut pdf, &field, b"/Kids")
+    let kids = resolved_key(&field, b"/Kids")
         .as_array()
         .expect("kids array");
-    let first = resolved_value(&mut pdf, kids[0].clone());
+    let first = resolved_value(kids[0].clone());
     assert_direct_dictionary(&first, "first radio child");
     assert!(!has_entry(&first, b"/AS"));
-    let second = resolved_value(&mut pdf, kids[1].clone());
+    let second = resolved_value(kids[1].clone());
     assert_direct_dictionary(&second, "second radio child");
     assert_eq!(
         key_name(&mut pdf, &second, b"/AS").as_deref(),
@@ -1759,14 +1765,9 @@ fn radio_preserves_unselectable_direct_and_indirect_grandchildren() {
     );
     let holder = resolved_handle(&mut pdf, ObjectRef::new(12, 0));
     let items = holder.as_array().expect("holder array");
-    assert_eq!(
-        resolved_value(&mut pdf, items[0].clone()).as_integer(),
-        Some(42)
-    );
-    assert!(resolved_value(&mut pdf, items[1].clone())
-        .object_ref()
-        .is_some());
-    let malformed = resolved_value(&mut pdf, items[2].clone());
+    assert_eq!(resolved_value(items[0].clone()).as_integer(), Some(42));
+    assert!(resolved_value(items[1].clone()).object_ref().is_some());
+    let malformed = resolved_value(items[2].clone());
     assert_direct_dictionary(&malformed, "direct malformed child");
     assert!(!has_entry(&malformed, b"/AS"));
 }
@@ -1829,12 +1830,12 @@ fn value_updates_cover_non_button_and_checkbox_document_boundaries() {
     let mut pdf = open(bytes);
     let root = pdf.root_ref().unwrap();
     let catalog = resolved_handle(&mut pdf, root);
-    let acroform = resolved_key(&mut pdf, &catalog, b"/AcroForm");
+    let acroform = resolved_key(&catalog, b"/AcroForm");
     assert_direct_dictionary(&acroform, "direct AcroForm");
     FormFieldObjectHelper::new(ObjectRef::new(10, 0), &mut pdf)
         .set_value(ObjectHandle::name(b"raw".to_vec()), true)
         .unwrap();
-    let acroform = resolved_key(&mut pdf, &catalog, b"/AcroForm");
+    let acroform = resolved_key(&catalog, b"/AcroForm");
     assert_eq!(
         key_boolean(&mut pdf, &acroform, b"/NeedAppearances"),
         Some(true)
@@ -1861,10 +1862,10 @@ fn clear_need_appearances_handles_direct_and_non_dictionary_catalog_values() {
     let mut pdf = open(bytes);
     let root = pdf.root_ref().unwrap();
     let catalog = resolved_handle(&mut pdf, root);
-    let acroform = resolved_key(&mut pdf, &catalog, b"/AcroForm");
+    let acroform = resolved_key(&catalog, b"/AcroForm");
     assert_direct_dictionary(&acroform, "direct AcroForm");
     FormFieldObjectHelper::clear_need_appearances_after_generation(&mut pdf).unwrap();
-    let acroform = resolved_key(&mut pdf, &catalog, b"/AcroForm");
+    let acroform = resolved_key(&catalog, b"/AcroForm");
     assert!(!has_entry(&acroform, b"/NeedAppearances"));
 
     let bytes = doc_with_root("null", vec![(10, "<< >>".into())]);
@@ -2185,10 +2186,10 @@ fn checkbox_updates_a_direct_kid_when_the_field_is_behind_multi_hop_holders() {
         key_name(&mut pdf, &field, b"/V").as_deref(),
         Some(b"Chosen".as_slice())
     );
-    let kids = resolved_key(&mut pdf, &field, b"/Kids")
+    let kids = resolved_key(&field, b"/Kids")
         .as_array()
         .expect("checkbox kids must stay an array");
-    let widget = resolved_value(&mut pdf, kids[0].clone());
+    let widget = resolved_value(kids[0].clone());
     assert_direct_dictionary(&widget, "checkbox widget");
     assert_eq!(
         key_name(&mut pdf, &widget, b"/AS").as_deref(),

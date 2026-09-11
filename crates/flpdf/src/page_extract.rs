@@ -348,7 +348,7 @@ fn resolve_dict<RT: Read + Seek>(
     ctx: &'static str,
 ) -> Result<ObjectHandle> {
     let handle = target.get_object_handle(r);
-    target.resolve(&handle)?;
+    handle.try_is_scalar()?;
     if handle.as_dictionary().is_some() {
         Ok(handle)
     } else {

@@ -1623,7 +1623,10 @@ impl DictItemCursor {
         };
         DictItem {
             key: key.clone(),
-            value: self.dictionary.get_key(key),
+            value: self
+                .dictionary
+                .try_get_key(key)
+                .unwrap_or_else(|error| panic!("DictItemCursor::current failed: {error}")),
         }
     }
 
@@ -4210,6 +4213,8 @@ impl ObjectHandle {
     /// `key` must be qpdf's decoded, canonical dictionary key including its
     /// leading `/` (for example, `/Type`); lookup is exact and slashless
     /// keys are missing.
+    #[cfg(feature = "qtest-driver")]
+    #[doc(hidden)]
     pub fn get_key(&self, key: &[u8]) -> ObjectHandle {
         self.try_get_key(key)
             .unwrap_or_else(|error| panic!("ObjectHandle::get_key failed: {error}"))
@@ -4224,6 +4229,8 @@ impl ObjectHandle {
     /// `QPDFObjectHandle::hasKey` (`libqpdf/QPDFObjectHandle.cc:966-976`).
     /// `key` must be qpdf's decoded, canonical dictionary key including its
     /// leading `/`; lookup is exact and slashless keys are absent.
+    #[cfg(feature = "qtest-driver")]
+    #[doc(hidden)]
     pub fn has_key(&self, key: &[u8]) -> bool {
         self.try_has_key(key)
             .unwrap_or_else(|error| panic!("ObjectHandle::has_key failed: {error}"))
@@ -4259,8 +4266,8 @@ impl ObjectHandle {
     /// API does not normalize slashless input.
     ///
     /// This mutates the live handle graph directly. If `self`'s ref has
-    /// already been read through [`crate::Pdf::resolve`] or
-    /// [`crate::Pdf::resolve`], resolution keeps the same canonical handle
+    /// already been read through canonical ObjectHandle resolution, resolution
+    /// keeps the same canonical handle
     /// identity while this mutation changes the live value in place. A later
     /// canonical resolve observes that value; it does not rebuild a separate
     /// raw snapshot.
@@ -8722,7 +8729,7 @@ fn merge_resource_subdict(
         return Ok(()); // cov:ignore: caller already confirmed other_val.as_dictionary().is_some()
     };
     for (key, rval) in other_sub_entries {
-        if !this_val.has_key(&key) {
+        if !this_val.try_has_key(&key)? {
             let installed = if rval.is_indirect() {
                 rval
             } else {
@@ -9329,7 +9336,7 @@ pub(crate) mod identity_tests {
         // Both at once. The child's identity and live root edge are written
         // by `set_resolved`, so both can only be present if the document
         // identity survived *into* the resolution the resolver drove.
-        let child = handle.get_key(b"/A");
+        let child = handle.try_get_key(b"/A").unwrap();
         assert_eq!(child.as_integer(), Some(1));
         assert_eq!(
             child.containing_object_refs_for_pdf(PDF_ID),
@@ -9445,11 +9452,17 @@ pub(crate) mod identity_tests {
 
         assert!(target.is_direct());
         assert!(target.is_null());
-        assert_eq!(replacement.get_key(b"/Value").as_integer(), Some(7));
+        assert_eq!(
+            replacement.try_get_key(b"/Value").unwrap().as_integer(),
+            Some(7)
+        );
         replacement
             .replace_key(b"/Value", ObjectHandle::integer(9))
             .unwrap();
-        assert_eq!(replacement.get_key(b"/Value").as_integer(), Some(9));
+        assert_eq!(
+            replacement.try_get_key(b"/Value").unwrap().as_integer(),
+            Some(9)
+        );
     }
 
     #[test]
@@ -9463,7 +9476,10 @@ pub(crate) mod identity_tests {
         target.disconnect_and_destroy();
 
         assert_eq!(target.type_code().expect("type code"), 14);
-        assert_eq!(replacement.get_key(b"/Value").as_integer(), Some(7));
+        assert_eq!(
+            replacement.try_get_key(b"/Value").unwrap().as_integer(),
+            Some(7)
+        );
     }
 
     #[test]
@@ -10420,11 +10436,20 @@ mod uniform_identity_tests {
         original
             .replace_key(b"/Value", ObjectHandle::integer(2))
             .unwrap();
-        assert_eq!(promoted.get_key(b"/Value").as_integer(), Some(2));
+        assert_eq!(
+            promoted.try_get_key(b"/Value").unwrap().as_integer(),
+            Some(2)
+        );
         promoted
             .replace_key(b"/Value", ObjectHandle::integer(3))
             .unwrap();
-        assert_eq!(outstanding_clone.get_key(b"/Value").as_integer(), Some(3));
+        assert_eq!(
+            outstanding_clone
+                .try_get_key(b"/Value")
+                .unwrap()
+                .as_integer(),
+            Some(3)
+        );
     }
 
     #[test]
@@ -10727,7 +10752,10 @@ mod uniform_identity_tests {
         assert_eq!(*first_calls.borrow(), Vec::<ObjectRef>::new());
         assert_eq!(*latest_calls.borrow(), vec![ObjectRef::new(61, 7)]);
         assert_eq!(handle.object_ref(), Some(ObjectRef::new(61, 7)));
-        assert_eq!(handle.get_key(b"/Resolved").as_boolean(), Some(true));
+        assert_eq!(
+            handle.try_get_key(b"/Resolved").unwrap().as_boolean(),
+            Some(true)
+        );
     }
 
     #[test]
@@ -10742,7 +10770,10 @@ mod uniform_identity_tests {
         handle.try_dereference().expect("reentrant resolver");
 
         assert_eq!(*calls.borrow(), vec![ObjectRef::new(67, 3)]);
-        assert_eq!(handle.get_key(b"/Resolved").as_boolean(), Some(true));
+        assert_eq!(
+            handle.try_get_key(b"/Resolved").unwrap().as_boolean(),
+            Some(true)
+        );
     }
 
     #[test]
@@ -10805,7 +10836,7 @@ mod object_value_tests {
             (b"/K".to_vec(), ObjectHandle::integer(2)),
         ]);
 
-        assert_eq!(dict.get_key(b"/K").as_integer(), Some(2));
+        assert_eq!(dict.try_get_key(b"/K").unwrap().as_integer(), Some(2));
     }
 
     #[test]
@@ -10969,7 +11000,8 @@ mod stream_payload_sharing_tests {
             destination
                 .as_stream_dict()
                 .expect("stream dict")
-                .get_key(b"/Length")
+                .try_get_key(b"/Length")
+                .unwrap()
                 .as_integer(),
             Some(4096),
         );
@@ -11002,7 +11034,7 @@ mod stream_payload_sharing_tests {
             .replace_key(b"/Length", ObjectHandle::integer(7))
             .unwrap();
         assert_eq!(
-            source_dict.get_key(b"/Length").as_integer(),
+            source_dict.try_get_key(b"/Length").unwrap().as_integer(),
             Some(4096),
             "each slot's dictionary describes only its own payload"
         );
@@ -11115,7 +11147,10 @@ mod stream_payload_sharing_tests {
             .shallow_copy()
             .expect("an indirect stream child is shared, never copied");
 
-        assert!(copy.get_key(b"/Nested").is_same_object_as(&stream));
+        assert!(copy
+            .try_get_key(b"/Nested")
+            .unwrap()
+            .is_same_object_as(&stream));
     }
 
     // `QPDF_Stream::getStreamDataBuffer` (`libqpdf/qpdf/QPDF_Stream.hh:39`)
@@ -11146,7 +11181,8 @@ mod stream_payload_sharing_tests {
         assert!(!stream
             .as_stream_dict()
             .expect("stream dict")
-            .has_key(b"/Length"));
+            .try_has_key(b"/Length")
+            .unwrap());
     }
 }
 
@@ -14222,9 +14258,13 @@ mod mutation_tests {
         direct.make_direct(false).expect("direct conversion");
 
         assert!(original_alias.as_dictionary().is_some());
-        assert!(original_alias.get_key(b"/A").is_indirect());
-        let first = direct.get_key(b"/A");
-        let second = direct.get_key(b"/B").get_key(b"/A");
+        assert!(original_alias.try_get_key(b"/A").unwrap().is_indirect());
+        let first = direct.try_get_key(b"/A").unwrap();
+        let second = direct
+            .try_get_key(b"/B")
+            .unwrap()
+            .try_get_key(b"/A")
+            .unwrap();
         assert!(first.is_direct());
         assert!(second.is_direct());
         assert!(!first.is_same_object_as(&second));
@@ -14263,15 +14303,22 @@ mod mutation_tests {
             Error::System(message)
                 if message == "attempt to make a stream into a direct object"
         ));
-        assert!(rejects_stream.get_key(b"/Stream").is_indirect());
+        assert!(rejects_stream
+            .try_get_key(b"/Stream")
+            .unwrap()
+            .is_indirect());
 
         let mut stops_at_stream = original;
         stops_at_stream
             .make_direct(true)
             .expect("allow_streams must preserve the stream reference");
-        assert!(stops_at_stream.get_key(b"/Stream").is_indirect());
         assert!(stops_at_stream
-            .get_key(b"/Stream")
+            .try_get_key(b"/Stream")
+            .unwrap()
+            .is_indirect());
+        assert!(stops_at_stream
+            .try_get_key(b"/Stream")
+            .unwrap()
             .is_same_object_as(&stream));
     }
 
@@ -15467,14 +15514,14 @@ mod mutation_tests {
     fn get_key_returns_a_live_child_handle_without_snapshotting_the_dictionary() {
         let child = ObjectHandle::integer(1);
         let dict = ObjectHandle::dictionary(vec![(b"A".to_vec(), child.clone())]);
-        let fetched = dict.get_key(b"/A");
+        let fetched = dict.try_get_key(b"/A").unwrap();
         assert!(fetched.ptr_eq(&child));
     }
 
     #[test]
     fn get_key_on_a_missing_key_returns_a_direct_null_handle() {
         let dict = ObjectHandle::dictionary(vec![]);
-        assert!(dict.get_key(b"/Missing").is_null());
+        assert!(dict.try_get_key(b"/Missing").unwrap().is_null());
     }
 
     #[test]
@@ -15492,14 +15539,14 @@ mod mutation_tests {
         let dict = ObjectHandle::dictionary(vec![]);
         let clone = dict.clone();
         dict.replace_key(b"/A", ObjectHandle::integer(9)).unwrap();
-        assert_eq!(clone.get_key(b"/A").as_integer(), Some(9));
+        assert_eq!(clone.try_get_key(b"/A").unwrap().as_integer(), Some(9));
     }
 
     #[test]
     fn replace_key_overwrites_an_existing_key() {
         let dict = ObjectHandle::dictionary(vec![(b"A".to_vec(), ObjectHandle::integer(1))]);
         dict.replace_key(b"/A", ObjectHandle::integer(2)).unwrap();
-        assert_eq!(dict.get_key(b"/A").as_integer(), Some(2));
+        assert_eq!(dict.try_get_key(b"/A").unwrap().as_integer(), Some(2));
     }
 
     #[test]
@@ -15514,7 +15561,7 @@ mod mutation_tests {
 
         dict.replace_key(b"/A", ObjectHandle::null()).unwrap();
 
-        assert!(!dict.has_key(b"/A"));
+        assert!(!dict.try_has_key(b"/A").unwrap());
         assert!(child.containing_object_refs().is_empty());
     }
 
@@ -15524,7 +15571,7 @@ mod mutation_tests {
 
         dict.replace_key(b"/Missing", ObjectHandle::null()).unwrap();
 
-        assert!(!dict.has_key(b"/Missing"));
+        assert!(!dict.try_has_key(b"/Missing").unwrap());
     }
 
     #[test]
@@ -15538,7 +15585,7 @@ mod mutation_tests {
 
         dict.replace_key(b"/A", ObjectHandle::null()).unwrap();
 
-        assert!(!dict.has_key(b"/A"));
+        assert!(!dict.try_has_key(b"/A").unwrap());
     }
 
     #[test]
@@ -15565,8 +15612,8 @@ mod mutation_tests {
 
         dict.replace_key(b"/Null", indirect_null.clone()).unwrap();
 
-        let retained = dict.get_key(b"/Null");
-        assert!(!dict.has_key(b"/Null"));
+        let retained = dict.try_get_key(b"/Null").unwrap();
+        assert!(!dict.try_has_key(b"/Null").unwrap());
         assert!(retained.is_indirect());
         assert!(retained.is_null());
         assert!(retained.is_same_object_as(&indirect_null));
@@ -15580,8 +15627,8 @@ mod mutation_tests {
 
         dict.replace_key(b"/Dangling", dangling.clone()).unwrap();
 
-        let retained = dict.get_key(b"/Dangling");
-        assert!(!dict.has_key(b"/Dangling"));
+        let retained = dict.try_get_key(b"/Dangling").unwrap();
+        assert!(!dict.try_has_key(b"/Dangling").unwrap());
         assert!(retained.is_indirect());
         assert!(retained.is_null());
         assert!(retained.is_same_object_as(&dangling));
@@ -15613,7 +15660,7 @@ mod mutation_tests {
             .replace_key(b"/K", ObjectHandle::integer(9))
             .unwrap();
         let inserted = array.as_array().expect("array")[0].clone();
-        assert_eq!(inserted.get_key(b"/K").as_integer(), Some(9));
+        assert_eq!(inserted.try_get_key(b"/K").unwrap().as_integer(), Some(9));
 
         assert!(!array.replace_array_item(1, ObjectHandle::integer(2)));
         assert!(!ObjectHandle::integer(1).replace_array_item(0, ObjectHandle::integer(2)));
@@ -15991,8 +16038,11 @@ mod mutation_tests {
             error,
             Error::Internal(message) if message == FOREIGN_OBJECT_OWNERSHIP_ERROR
         ));
-        assert!(!destination.has_key(b"/Foreign"));
-        assert_eq!(destination.get_key(b"/Existing").as_integer(), Some(1));
+        assert!(!destination.try_has_key(b"/Foreign").unwrap());
+        assert_eq!(
+            destination.try_get_key(b"/Existing").unwrap().as_integer(),
+            Some(1)
+        );
     }
 
     #[test]
@@ -16028,10 +16078,12 @@ mod mutation_tests {
             .replace_key(b"/Container", direct_container)
             .expect("checkOwnership does not inspect a direct value's descendants");
 
-        assert!(destination.has_key(b"/Container"));
+        assert!(destination.try_has_key(b"/Container").unwrap());
         assert!(destination
-            .get_key(b"/Container")
-            .get_key(b"/Foreign")
+            .try_get_key(b"/Container")
+            .unwrap()
+            .try_get_key(b"/Foreign")
+            .unwrap()
             .is_indirect());
     }
 
@@ -16065,7 +16117,7 @@ mod mutation_tests {
             "a programmatic direct null is unowned in qpdf, regardless of prior containment",
         );
 
-        assert!(!destination.has_key(b"/K"));
+        assert!(!destination.try_has_key(b"/K").unwrap());
     }
 
     #[test]
@@ -16088,7 +16140,10 @@ mod mutation_tests {
             "a programmatic direct scalar is unowned in qpdf, regardless of prior containment",
         );
 
-        assert_eq!(destination.get_key(b"/Int").as_integer(), Some(7));
+        assert_eq!(
+            destination.try_get_key(b"/Int").unwrap().as_integer(),
+            Some(7)
+        );
     }
 
     #[test]
@@ -16214,9 +16269,9 @@ mod mutation_tests {
         let dict = ObjectHandle::dictionary(vec![(b"A".to_vec(), ObjectHandle::integer(1))]);
         let self_clone = dict.clone();
         dict.replace_key(b"/Self", self_clone).unwrap();
-        assert!(dict.get_key(b"/Self").is_null());
+        assert!(dict.try_get_key(b"/Self").unwrap().is_null());
         // The rest of the dictionary is untouched by the rejected insert.
-        assert_eq!(dict.get_key(b"/A").as_integer(), Some(1));
+        assert_eq!(dict.try_get_key(b"/A").unwrap().as_integer(), Some(1));
     }
 
     #[test]
@@ -16227,7 +16282,7 @@ mod mutation_tests {
 
         target.replace_key(b"/Self", replacement.clone()).unwrap();
 
-        assert!(!target.has_key(b"Self"));
+        assert!(!target.try_has_key(b"Self").unwrap());
     }
 
     #[test]
@@ -16264,21 +16319,21 @@ mod mutation_tests {
         let indirect = ObjectHandle::new_indirect_unresolved(ObjectRef::new(7, 0), -1);
         indirect.set_resolved(ObjectValue::Dictionary(Default::default()));
         indirect.replace_key(b"/Self", indirect.clone()).unwrap();
-        assert!(indirect.get_key(b"/Self").is_indirect());
+        assert!(indirect.try_get_key(b"/Self").unwrap().is_indirect());
     }
 
     #[test]
     fn remove_key_deletes_a_present_key() {
         let dict = ObjectHandle::dictionary(vec![(b"A".to_vec(), ObjectHandle::integer(1))]);
         dict.remove_key(b"/A");
-        assert!(dict.get_key(b"/A").is_null());
+        assert!(dict.try_get_key(b"/A").unwrap().is_null());
     }
 
     #[test]
     fn remove_key_on_a_missing_key_is_a_no_op() {
         let dict = ObjectHandle::dictionary(vec![]);
         dict.remove_key(b"/Missing");
-        assert!(dict.get_key(b"/Missing").is_null());
+        assert!(dict.try_get_key(b"/Missing").unwrap().is_null());
     }
 
     #[test]
@@ -16561,8 +16616,8 @@ mod mutation_tests {
         let original = ObjectHandle::dictionary(vec![(b"A".to_vec(), ObjectHandle::integer(1))]);
         let copy = original.shallow_copy().expect("dictionary copy");
         copy.replace_key(b"/A", ObjectHandle::integer(2)).unwrap();
-        assert_eq!(original.get_key(b"/A").as_integer(), Some(1));
-        assert_eq!(copy.get_key(b"/A").as_integer(), Some(2));
+        assert_eq!(original.try_get_key(b"/A").unwrap().as_integer(), Some(1));
+        assert_eq!(copy.try_get_key(b"/A").unwrap().as_integer(), Some(2));
     }
 
     // Despite the name, qpdf's shallowCopy() recursively copies through
@@ -16577,14 +16632,27 @@ mod mutation_tests {
             ObjectHandle::dictionary(vec![(b"Inner".to_vec(), ObjectHandle::integer(1))]),
         )]);
         let copy = original.shallow_copy().expect("dictionary copy");
-        copy.get_key(b"/A")
+        copy.try_get_key(b"/A")
+            .unwrap()
             .replace_key(b"/Inner", ObjectHandle::integer(2))
             .unwrap();
         assert_eq!(
-            original.get_key(b"/A").get_key(b"/Inner").as_integer(),
+            original
+                .try_get_key(b"/A")
+                .unwrap()
+                .try_get_key(b"/Inner")
+                .unwrap()
+                .as_integer(),
             Some(1)
         );
-        assert_eq!(copy.get_key(b"/A").get_key(b"/Inner").as_integer(), Some(2));
+        assert_eq!(
+            copy.try_get_key(b"/A")
+                .unwrap()
+                .try_get_key(b"/Inner")
+                .unwrap()
+                .as_integer(),
+            Some(2)
+        );
     }
 
     #[test]
@@ -16593,7 +16661,7 @@ mod mutation_tests {
         child.set_resolved(ObjectValue::Integer(1));
         let original = ObjectHandle::dictionary(vec![(b"A".to_vec(), child.clone())]);
         let copy = original.shallow_copy().expect("dictionary copy");
-        assert!(copy.get_key(b"/A").ptr_eq(&child));
+        assert!(copy.try_get_key(b"/A").unwrap().ptr_eq(&child));
     }
 
     #[test]
@@ -16607,14 +16675,14 @@ mod mutation_tests {
     #[test]
     fn has_key_omits_a_present_null_value_like_qpdf() {
         let dict = ObjectHandle::dictionary(vec![(b"A".to_vec(), ObjectHandle::null())]);
-        assert!(!dict.has_key(b"/A"));
-        assert!(!dict.has_key(b"/Missing"));
+        assert!(!dict.try_has_key(b"/A").unwrap());
+        assert!(!dict.try_has_key(b"/Missing").unwrap());
     }
 
     #[test]
     fn get_key_missing_key_carries_parent_context_like_qpdf() {
         let dict = ObjectHandle::dictionary(vec![]);
-        let missing = dict.get_key(b"/Missing");
+        let missing = dict.try_get_key(b"/Missing").unwrap();
         let error = missing
             .try_get_keys()
             .expect_err("missing-key null should retain its dictionary context");
@@ -16643,8 +16711,8 @@ mod mutation_tests {
         let dict = ObjectHandle::dictionary(vec![(b"A".to_vec(), ObjectHandle::integer(1))]);
         scalar.merge_resources(&dict, None).expect("merge");
         dict.merge_resources(&scalar, None).expect("merge");
-        assert_eq!(dict.get_key(b"/A").as_integer(), Some(1));
-        assert!(dict.get_key(b"/B").is_null());
+        assert_eq!(dict.try_get_key(b"/A").unwrap().as_integer(), Some(1));
+        assert!(dict.try_get_key(b"/B").unwrap().is_null());
     }
 
     #[test]
@@ -16676,7 +16744,12 @@ mod mutation_tests {
             .expect("unresolved qpdf resource operands must merge");
 
         assert_eq!(
-            destination.get_key(b"/Font").get_key(b"/F2").as_integer(),
+            destination
+                .try_get_key(b"/Font")
+                .unwrap()
+                .try_get_key(b"/F2")
+                .unwrap()
+                .as_integer(),
             Some(2)
         );
         assert!(destination.is_resolved());
@@ -16703,14 +16776,15 @@ mod mutation_tests {
             .expect("an unresolved array category must merge");
 
         let values: Vec<_> = destination
-            .get_key(b"/ProcSet")
+            .try_get_key(b"/ProcSet")
+            .unwrap()
             .as_array()
             .expect("merged ProcSet array")
             .into_iter()
             .filter_map(|value| value.as_name())
             .collect();
         assert_eq!(values, vec![b"PDF".to_vec(), b"Text".to_vec()]);
-        assert!(other.get_key(b"/ProcSet").is_resolved());
+        assert!(other.try_get_key(b"/ProcSet").unwrap().is_resolved());
         drop(resolver);
     }
 
@@ -16768,7 +16842,12 @@ mod mutation_tests {
             .expect("an unresolved missing category must still merge");
 
         assert_eq!(
-            destination.get_key(b"/Font").get_key(b"/F1").as_integer(),
+            destination
+                .try_get_key(b"/Font")
+                .unwrap()
+                .try_get_key(b"/F1")
+                .unwrap()
+                .as_integer(),
             Some(1),
             "shallow-copying an unresolved category must not install a direct null"
         );
@@ -16819,25 +16898,28 @@ mod mutation_tests {
             .make_resources_indirect(&mut pdf)
             .expect("promote direct resource values");
 
-        let font = resources.get_key(b"/Font");
-        let promoted_font = font.get_key(b"/F1");
+        let font = resources.try_get_key(b"/Font").unwrap();
+        let promoted_font = font.try_get_key(b"/F1").unwrap();
         assert!(promoted_font.is_indirect());
         assert!(direct_font_alias.is_indirect());
         assert!(promoted_font.is_same_object_as(&direct_font_alias));
         assert_eq!(promoted_font.as_integer(), Some(1));
-        assert!(font.get_key(b"/F2").is_same_object_as(&already_indirect));
+        assert!(font
+            .try_get_key(b"/F2")
+            .unwrap()
+            .is_same_object_as(&already_indirect));
 
-        let promoted_nested = font.get_key(b"/Nested");
+        let promoted_nested = font.try_get_key(b"/Nested").unwrap();
         assert!(promoted_nested.is_indirect());
         assert!(direct_nested_alias.is_indirect());
         assert!(promoted_nested.is_same_object_as(&direct_nested_alias));
-        assert!(promoted_nested.get_key(b"/Child").is_direct());
+        assert!(promoted_nested.try_get_key(b"/Child").unwrap().is_direct());
 
         assert!(
             font.is_direct(),
             "the category dictionary itself stays direct"
         );
-        assert!(resources.get_key(b"/ProcSet").is_direct());
+        assert!(resources.try_get_key(b"/ProcSet").unwrap().is_direct());
     }
 
     #[test]
@@ -16904,8 +16986,8 @@ mod mutation_tests {
         let other = ObjectHandle::dictionary(vec![(b"Font".to_vec(), source_sub.clone())]);
         let dest = ObjectHandle::dictionary(vec![]);
         dest.merge_resources(&other, None).expect("merge");
-        let installed = dest.get_key(b"/Font");
-        assert_eq!(installed.get_key(b"/F1").as_integer(), Some(1));
+        let installed = dest.try_get_key(b"/Font").unwrap();
+        assert_eq!(installed.try_get_key(b"/F1").unwrap().as_integer(), Some(1));
         assert!(!installed.ptr_eq(&source_sub)); // privatized, not shared
     }
 
@@ -16916,9 +16998,9 @@ mod mutation_tests {
         let other_font = ObjectHandle::dictionary(vec![(b"F2".to_vec(), ObjectHandle::integer(2))]);
         let other = ObjectHandle::dictionary(vec![(b"Font".to_vec(), other_font)]);
         dest.merge_resources(&other, None).expect("merge");
-        let font = dest.get_key(b"/Font");
-        assert_eq!(font.get_key(b"/F1").as_integer(), Some(1));
-        assert_eq!(font.get_key(b"/F2").as_integer(), Some(2));
+        let font = dest.try_get_key(b"/Font").unwrap();
+        assert_eq!(font.try_get_key(b"/F1").unwrap().as_integer(), Some(1));
+        assert_eq!(font.try_get_key(b"/F2").unwrap().as_integer(), Some(2));
     }
 
     #[test]
@@ -16929,7 +17011,14 @@ mod mutation_tests {
             ObjectHandle::dictionary(vec![(b"F1".to_vec(), ObjectHandle::integer(99))]);
         let other = ObjectHandle::dictionary(vec![(b"Font".to_vec(), other_font)]);
         dest.merge_resources(&other, None).expect("merge");
-        assert_eq!(dest.get_key(b"/Font").get_key(b"/F1").as_integer(), Some(1));
+        assert_eq!(
+            dest.try_get_key(b"/Font")
+                .unwrap()
+                .try_get_key(b"/F1")
+                .unwrap()
+                .as_integer(),
+            Some(1)
+        );
     }
 
     #[test]
@@ -16947,7 +17036,12 @@ mod mutation_tests {
         dest.merge_resources(&other, Some(&mut conflicts))
             .expect("merge");
         assert!(conflicts.is_empty());
-        assert!(dest.get_key(b"/Font").get_key(b"/F1").ptr_eq(&shared));
+        assert!(dest
+            .try_get_key(b"/Font")
+            .unwrap()
+            .try_get_key(b"/F1")
+            .unwrap()
+            .ptr_eq(&shared));
     }
 
     #[test]
@@ -16975,7 +17069,14 @@ mod mutation_tests {
             Some(&b"/F2".to_vec())
         );
         // F1 keeps its own original (unrelated) value; nothing overwrote it.
-        assert_eq!(dest.get_key(b"/Font").get_key(b"/F1").as_integer(), Some(1));
+        assert_eq!(
+            dest.try_get_key(b"/Font")
+                .unwrap()
+                .try_get_key(b"/F1")
+                .unwrap()
+                .as_integer(),
+            Some(1)
+        );
     }
 
     #[test]
@@ -16992,9 +17093,20 @@ mod mutation_tests {
             .and_then(|m| m.get(b"/F1".as_slice()))
             .expect("F1 conflict recorded");
         assert_eq!(new_name, b"/F1_1");
-        assert_eq!(dest.get_key(b"/Font").get_key(b"/F1").as_integer(), Some(1));
         assert_eq!(
-            dest.get_key(b"/Font").get_key(new_name).as_integer(),
+            dest.try_get_key(b"/Font")
+                .unwrap()
+                .try_get_key(b"/F1")
+                .unwrap()
+                .as_integer(),
+            Some(1)
+        );
+        assert_eq!(
+            dest.try_get_key(b"/Font")
+                .unwrap()
+                .try_get_key(new_name)
+                .unwrap()
+                .as_integer(),
             Some(2)
         );
     }
@@ -17014,15 +17126,23 @@ mod mutation_tests {
         let other = ObjectHandle::dictionary(vec![(b"Font".to_vec(), other_font)]);
         shared_dest.merge_resources(&other, None).expect("merge");
         // shared_dest's own /Font is now a private direct copy...
-        assert!(shared_dest.get_key(b"/Font").is_direct());
+        assert!(shared_dest.try_get_key(b"/Font").unwrap().is_direct());
         assert_eq!(
-            shared_dest.get_key(b"/Font").get_key(b"/F2").as_integer(),
+            shared_dest
+                .try_get_key(b"/Font")
+                .unwrap()
+                .try_get_key(b"/F2")
+                .unwrap()
+                .as_integer(),
             Some(2)
         );
         // ...and the other holder's /Font (and the original indirect object)
         // is untouched.
-        assert!(another_holder.get_key(b"/Font").ptr_eq(&indirect_font));
-        assert!(indirect_font.get_key(b"/F2").is_null());
+        assert!(another_holder
+            .try_get_key(b"/Font")
+            .unwrap()
+            .ptr_eq(&indirect_font));
+        assert!(indirect_font.try_get_key(b"/F2").unwrap().is_null());
     }
 
     #[test]
@@ -17039,7 +17159,7 @@ mod mutation_tests {
             ]),
         )]);
         dest.merge_resources(&other, None).expect("merge");
-        let items = dest.get_key(b"/ProcSet").as_array().unwrap();
+        let items = dest.try_get_key(b"/ProcSet").unwrap().as_array().unwrap();
         let names: Vec<_> = items.iter().map(|i| i.as_name().unwrap()).collect();
         assert_eq!(names, vec![b"PDF".to_vec(), b"Text".to_vec()]);
     }
@@ -17065,7 +17185,8 @@ mod mutation_tests {
             .expect("indirect scalar array items merge");
 
         let items = dest
-            .get_key(b"/ProcSet")
+            .try_get_key(b"/ProcSet")
+            .unwrap()
             .as_array()
             .expect("merged ProcSet remains an array");
         assert_eq!(items.len(), 2);
@@ -17119,7 +17240,8 @@ mod mutation_tests {
         dest.merge_resources(&other, None).expect("merge");
 
         let merged = dest
-            .get_key(b"/ProcSet")
+            .try_get_key(b"/ProcSet")
+            .unwrap()
             .as_array()
             .expect("merged ProcSet remains an array");
         assert!(merged[1].is_same_object_as(&retained));
@@ -17134,7 +17256,7 @@ mod mutation_tests {
             ObjectHandle::dictionary(vec![(b"F1".to_vec(), ObjectHandle::integer(2))]),
         )]);
         dest.merge_resources(&other, None).expect("merge");
-        assert_eq!(dest.get_key(b"/Font").as_integer(), Some(1));
+        assert_eq!(dest.try_get_key(b"/Font").unwrap().as_integer(), Some(1));
     }
 
     #[test]
@@ -17149,7 +17271,7 @@ mod mutation_tests {
         });
         stream.replace_stream_data(Rc::new(b"new data".to_vec()), None, None);
         assert_eq!(stream.as_stream_data(), Some(Rc::new(b"new data".to_vec())));
-        assert_eq!(dict.get_key(b"/Length").as_integer(), Some(8));
+        assert_eq!(dict.try_get_key(b"/Length").unwrap().as_integer(), Some(8));
         assert_eq!(
             stream.with_value(|value| match value {
                 Some(ObjectValue::Stream { stream_length, .. }) => Some(*stream_length),
@@ -17173,7 +17295,7 @@ mod mutation_tests {
 
         stream.replace_stream_data(Rc::new(Vec::new()), None, None);
 
-        assert!(!dict.has_key(b"/Length"));
+        assert!(!dict.try_has_key(b"/Length").unwrap());
     }
 
     #[test]
@@ -17189,7 +17311,7 @@ mod mutation_tests {
 
         stream.replace_stream_data(Rc::new(Vec::new()), None, None);
 
-        assert!(!dict.has_key(b"/Length"));
+        assert!(!dict.try_has_key(b"/Length").unwrap());
     }
 
     #[test]
@@ -17204,13 +17326,13 @@ mod mutation_tests {
         });
 
         stream.replace_stream_data(Rc::new(Vec::new()), None, None);
-        assert!(!dict.has_key(b"/Length"));
+        assert!(!dict.try_has_key(b"/Length").unwrap());
 
         stream.replace_stream_data(Rc::new(b"new data".to_vec()), None, None);
-        assert_eq!(dict.get_key(b"/Length").as_integer(), Some(8));
+        assert_eq!(dict.try_get_key(b"/Length").unwrap().as_integer(), Some(8));
 
         stream.replace_stream_data(Rc::new(Vec::new()), None, None);
-        assert!(!dict.has_key(b"/Length"));
+        assert!(!dict.try_has_key(b"/Length").unwrap());
     }
 
     #[test]
@@ -17231,8 +17353,8 @@ mod mutation_tests {
             Some(filter.clone()),
             Some(parms.clone()),
         );
-        assert!(dict.get_key(b"/Filter").ptr_eq(&filter));
-        assert!(dict.get_key(b"/DecodeParms").ptr_eq(&parms));
+        assert!(dict.try_get_key(b"/Filter").unwrap().ptr_eq(&filter));
+        assert!(dict.try_get_key(b"/DecodeParms").unwrap().ptr_eq(&parms));
     }
 
     #[test]
@@ -17250,7 +17372,7 @@ mod mutation_tests {
         });
         stream.replace_stream_data(Rc::new(b"new".to_vec()), None, None);
         assert_eq!(
-            dict.get_key(b"/Filter").as_name(),
+            dict.try_get_key(b"/Filter").unwrap().as_name(),
             Some(b"FlateDecode".to_vec())
         );
     }
@@ -17338,7 +17460,7 @@ mod mutation_tests {
         indirect
             .replace_key(b"/A", ObjectHandle::integer(1))
             .unwrap();
-        assert_eq!(indirect.get_key(b"/A").as_integer(), Some(1));
+        assert_eq!(indirect.try_get_key(b"/A").unwrap().as_integer(), Some(1));
         indirect.remove_key(b"/A");
         assert!(indirect.try_get_key(b"/A").unwrap().is_null());
     }
@@ -17400,7 +17522,10 @@ mod mutation_tests {
 
         direct.replace_key(b"/Indirect", indirect.clone()).unwrap();
 
-        assert!(direct.get_key(b"/Indirect").is_same_object_as(&indirect));
+        assert!(direct
+            .try_get_key(b"/Indirect")
+            .unwrap()
+            .is_same_object_as(&indirect));
         assert!(indirect.containing_object_refs().is_empty());
     }
 
@@ -17461,7 +17586,8 @@ mod mutation_tests {
             .unsafe_shallow_copy()
             .expect("unsafe dictionary copy keeps child handles");
         assert!(dictionary_copy
-            .get_key(b"/Child")
+            .try_get_key(b"/Child")
+            .unwrap()
             .is_same_object_as(&dictionary_child));
 
         let scalar_copy = ObjectHandle::integer(7)
@@ -17540,7 +17666,12 @@ mod mutation_tests {
         let other_font = ObjectHandle::dictionary(vec![(b"F1".to_vec(), shared.clone())]);
         let other = ObjectHandle::dictionary(vec![(b"Font".to_vec(), other_font)]);
         dest.merge_resources(&other, None).expect("merge");
-        assert!(dest.get_key(b"/Font").get_key(b"/F1").ptr_eq(&shared));
+        assert!(dest
+            .try_get_key(b"/Font")
+            .unwrap()
+            .try_get_key(b"/F1")
+            .unwrap()
+            .ptr_eq(&shared));
     }
 
     #[test]
@@ -17552,7 +17683,12 @@ mod mutation_tests {
             ObjectHandle::array(vec![ObjectHandle::dictionary(vec![])]),
         )]);
         dest.merge_resources(&other, None).expect("merge");
-        assert!(dest.get_key(b"/ProcSet").as_array().unwrap().is_empty());
+        assert!(dest
+            .try_get_key(b"/ProcSet")
+            .unwrap()
+            .as_array()
+            .unwrap()
+            .is_empty());
     }
 
     #[test]
@@ -17593,7 +17729,11 @@ mod mutation_tests {
             .expect("F1 conflict recorded");
         assert_eq!(new_name, b"/F1_2");
         assert_eq!(
-            dest.get_key(b"/Font").get_key(new_name).as_integer(),
+            dest.try_get_key(b"/Font")
+                .unwrap()
+                .try_get_key(new_name)
+                .unwrap()
+                .as_integer(),
             Some(2)
         );
     }
@@ -17627,8 +17767,10 @@ mod mutation_tests {
             .expect("F1 conflict recorded");
         assert_eq!(new_name, b"/F1_2");
         assert!(dest
-            .get_key(b"/Font")
-            .get_key(b"/Widths")
+            .try_get_key(b"/Font")
+            .unwrap()
+            .try_get_key(b"/Widths")
+            .unwrap()
             .ptr_eq(&indirect_widths));
         drop(resolver);
     }
@@ -17908,7 +18050,8 @@ mod stream_provider_contract_tests {
             stream
                 .as_stream_dict()
                 .expect("stream dictionary")
-                .get_key(b"/Length")
+                .try_get_key(b"/Length")
+                .unwrap()
                 .as_integer(),
             Some(bytes.len() as i64)
         );
@@ -17948,7 +18091,8 @@ mod stream_provider_contract_tests {
         assert!(!stream
             .as_stream_dict()
             .expect("stream dictionary")
-            .has_key(b"/Length"));
+            .try_has_key(b"/Length")
+            .unwrap());
     }
 
     #[test]
@@ -18246,9 +18390,9 @@ mod stream_provider_contract_tests {
         stream
             .replace_stream_data_provider(Rc::new(LegacyProvider::default()), None, None)
             .expect("provider replacement");
-        assert!(dict.has_key(b"/Filter"));
-        assert!(dict.has_key(b"/DecodeParms"));
-        assert!(!dict.has_key(b"/Length"));
+        assert!(dict.try_has_key(b"/Filter").unwrap());
+        assert!(dict.try_has_key(b"/DecodeParms").unwrap());
+        assert!(!dict.try_has_key(b"/Length").unwrap());
 
         stream
             .replace_stream_data_provider(
@@ -18257,8 +18401,8 @@ mod stream_provider_contract_tests {
                 Some(ObjectHandle::null()),
             )
             .expect("provider replacement with explicit nulls");
-        assert!(!dict.has_key(b"/Filter"));
-        assert!(!dict.has_key(b"/DecodeParms"));
+        assert!(!dict.try_has_key(b"/Filter").unwrap());
+        assert!(!dict.try_has_key(b"/DecodeParms").unwrap());
     }
 
     #[test]
@@ -18869,7 +19013,9 @@ pub(crate) mod warning_emission_tests {
         let entry = cursor.current();
         assert_eq!(entry.key, b"/Key1");
         assert_eq!(entry.value.try_get_name().unwrap(), b"/Value1");
-        assert!(entry.value.is_same_object_as(&dictionary.get_key(b"/Key1")));
+        assert!(entry
+            .value
+            .is_same_object_as(&dictionary.try_get_key(b"/Key1").unwrap()));
         cursor.next();
         cursor.next();
         assert!(cursor.is_end());
@@ -18916,7 +19062,9 @@ pub(crate) mod warning_emission_tests {
         let mut cursor = items.begin();
         let first = cursor.current();
         assert_eq!(first.key, b"/A");
-        assert!(first.value.is_same_object_as(&dictionary.get_key(b"/A")));
+        assert!(first
+            .value
+            .is_same_object_as(&dictionary.try_get_key(b"/A").unwrap()));
 
         dictionary.remove_key(b"/A");
         let removed = cursor.current();
@@ -19958,13 +20106,13 @@ mod qpdf_mutator_api_tests {
         let inserted = dict
             .replace_key_and_get_new(b"/Three", ObjectHandle::array(vec![]))
             .expect("replaceKeyAndGetNew should insert into a dictionary");
-        assert!(inserted.is_same_object_as(&dict.get_key(b"/Three")));
+        assert!(inserted.is_same_object_as(&dict.try_get_key(b"/Three").unwrap()));
 
         let old = dict
             .replace_key_and_get_old(b"/Three", ObjectHandle::integer(3))
             .expect("replaceKeyAndGetOld should replace a dictionary key");
         assert!(old.is_same_object_as(&inserted));
-        assert_eq!(alias.get_key(b"/Three").as_integer(), Some(3));
+        assert_eq!(alias.try_get_key(b"/Three").unwrap().as_integer(), Some(3));
 
         let missing = dict
             .remove_key_and_get_old(b"/Missing")
@@ -19974,7 +20122,7 @@ mod qpdf_mutator_api_tests {
             .remove_key_and_get_old(b"/Three")
             .expect("removeKeyAndGetOld should return the existing value");
         assert_eq!(removed.as_integer(), Some(3));
-        assert!(dict.get_key(b"/Three").is_null());
+        assert!(dict.try_get_key(b"/Three").unwrap().is_null());
     }
 
     #[test]
@@ -20223,7 +20371,7 @@ mod drop_tests {
 
         drop(parent);
 
-        assert_eq!(alias.get_key(b"/Value").as_integer(), Some(7));
+        assert_eq!(alias.try_get_key(b"/Value").unwrap().as_integer(), Some(7));
         assert!(alias.containing_object_refs().is_empty());
         drop(alias);
     }

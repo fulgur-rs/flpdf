@@ -440,7 +440,7 @@ impl<'a, R: Read + Seek> AnnotationObjectHelper<'a, R> {
 // Private free functions
 // ---------------------------------------------------------------------------
 
-/// Prepend the `/` [`ObjectHandle::get_key`] requires to a decoded PDF name
+/// Prepend the `/` [`ObjectHandle::try_get_key`] requires to a decoded PDF name
 /// value (e.g. from [`AnnotationObjectHelper::get_appearance_state`], which
 /// like every other name-valued accessor in this crate returns the name
 /// without it).

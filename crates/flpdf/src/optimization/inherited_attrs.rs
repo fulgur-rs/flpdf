@@ -503,13 +503,16 @@ mod tests {
             // cov:ignore-end
         };
         let root_handle = pdf.get_object_handle(root);
-        pdf.resolve(&root_handle).unwrap();
-        let before = root_handle.get_key(b"/Rotate").as_integer();
+        root_handle.try_is_scalar().unwrap();
+        let before = root_handle.try_get_key(b"/Rotate").unwrap().as_integer();
 
         let error = push(&mut pdf, &prepared, false, false).unwrap_err();
 
         assert!(error.to_string().contains("inheritable attribute"));
-        assert_eq!(root_handle.get_key(b"/Rotate").as_integer(), before);
+        assert_eq!(
+            root_handle.try_get_key(b"/Rotate").unwrap().as_integer(),
+            before
+        );
     }
 
     #[test]
@@ -536,9 +539,9 @@ mod tests {
         push(&mut pdf, &prepared, true, false).unwrap();
 
         let leaf = pdf.get_object_handle(leaf_ref);
-        pdf.resolve(&leaf).unwrap();
+        leaf.try_is_scalar().unwrap();
         assert_eq!(
-            leaf.get_key(b"/Rotate").as_integer(),
+            leaf.try_get_key(b"/Rotate").unwrap().as_integer(),
             Some(90),
             "leaf must have actually inherited /Rotate"
         );
@@ -592,8 +595,8 @@ mod tests {
         push(&mut pdf, &prepared, true, false).expect("direct root walk");
 
         let page = pdf.get_object_handle(ObjectRef::new(3, 0));
-        pdf.resolve(&page).expect("resolve direct-root page");
-        assert_eq!(page.get_key(b"/Rotate").as_integer(), Some(90));
+        page.try_is_scalar().expect("resolve direct-root page");
+        assert_eq!(page.try_get_key(b"/Rotate").unwrap().as_integer(), Some(90));
     }
 
     #[test]
@@ -610,8 +613,8 @@ mod tests {
                 && diagnostic.message_string().contains("/Pages")
         }));
         let page = pdf.get_object_handle(prepared.pages[0]);
-        pdf.resolve(&page).unwrap();
-        assert!(page.has_key(b"/MediaBox"));
+        page.try_is_scalar().unwrap();
+        assert!(page.try_has_key(b"/MediaBox").unwrap());
     }
 
     #[test]

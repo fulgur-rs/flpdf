@@ -391,7 +391,7 @@ fn resolve_metadata_label(pdf: &mut Pdf<Cursor<Vec<u8>>>) -> Vec<u8> {
         .expect("resolve Metadata stream");
     metadata
         .as_stream_dict()
-        .and_then(|dict| dict.get_key(b"/Label").as_string())
+        .and_then(|dict| dict.try_get_key(b"/Label").unwrap().as_string())
         .expect("Metadata /Label must be a string")
 }
 
@@ -669,14 +669,16 @@ fn generated_objstm_member_strings_are_encrypted_only_by_the_container() {
         .expect("decode decrypted ObjStm payload");
     let first = usize::try_from(
         stream_dict
-            .get_key(b"/First")
+            .try_get_key(b"/First")
+            .unwrap()
             .as_integer()
             .expect("ObjStm /First must be an integer"),
     )
     .expect("non-negative /First");
     let member_count = u32::try_from(
         stream_dict
-            .get_key(b"/N")
+            .try_get_key(b"/N")
+            .unwrap()
             .as_integer()
             .expect("ObjStm /N must be an integer"),
     )
@@ -972,10 +974,10 @@ fn js_stream_length(pdf: &mut Pdf<Cursor<Vec<u8>>>) -> ObjectHandle {
     let open_action = catalog
         .try_get_key(b"/OpenAction")
         .expect("read /OpenAction");
-    pdf.resolve(&open_action).expect("resolve /OpenAction");
+    open_action.try_is_scalar().expect("resolve /OpenAction");
     let action = open_action;
     let js_ref = action.try_get_key(b"/JS").expect("read /JS");
-    pdf.resolve(&js_ref).expect("resolve /JS");
+    js_ref.try_is_scalar().expect("resolve /JS");
     let stream_dict = js_ref.as_stream_dict().expect("/JS is a stream");
     stream_dict
         .try_get_key(b"/Length")

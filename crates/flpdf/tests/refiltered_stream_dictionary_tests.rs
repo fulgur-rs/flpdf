@@ -105,7 +105,7 @@ fn rewrite_stream_result(
 
 fn emitted_stream_dict(bytes: Vec<u8>) -> ObjectHandle {
     let mut output = Pdf::open_mem_owned(bytes).unwrap();
-    let extra = output.trailer().get_key(b"/Extra");
+    let extra = output.trailer().try_get_key(b"/Extra").unwrap();
     extra.type_code().unwrap();
     extra.as_stream_dict().unwrap()
 }

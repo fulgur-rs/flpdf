@@ -1,4 +1,4 @@
-//! Public-API regression tests for qpdf-shaped canonical `Pdf::resolve` and
+//! Public-API regression tests for qpdf-shaped canonical `ObjectHandle` resolution and
 //! `ObjectHandle` behavior. These tests prove missing/dangling references,
 //! compressed (ObjStm) members, repaired cyclic indirect `/Length` streams,
 //! parsed offsets, and repeated `get_object_handle` calls through the live
@@ -281,7 +281,7 @@ fn resolve_resolves_the_catalog_dictionary() {
     let root_ref = pdf.root_ref().expect("minimal fixture has a root");
 
     let handle = pdf.get_object_handle(root_ref);
-    pdf.resolve(&handle).expect("resolve catalog");
+    handle.try_is_scalar().expect("resolve catalog");
 
     let dict = handle
         .as_dictionary()
@@ -308,7 +308,7 @@ fn trailer_returns_a_direct_handle_with_an_indirect_root() {
     let mut pdf = Pdf::open(BufReader::new(file)).unwrap();
 
     assert!(pdf.trailer().is_direct());
-    assert!(pdf.trailer().get_key(b"/Root").is_indirect());
+    assert!(pdf.trailer().try_get_key(b"/Root").unwrap().is_indirect());
 }
 
 #[test]
@@ -330,19 +330,19 @@ fn integer_width_accessors_are_public_and_match_qpdf_boundaries() {
         .replace_key(b"/Q3", ObjectHandle::integer(i64::from(u32::MAX)))
         .unwrap();
 
-    let q1_handle = trailer.get_key(b"/Q1");
+    let q1_handle = trailer.try_get_key(b"/Q1").unwrap();
     assert_eq!(q1_handle.try_get_int_value().unwrap(), q1);
     assert_eq!(q1_handle.try_get_uint_value().unwrap(), q1_l);
     assert_eq!(q1_handle.try_get_int_value_as_int().unwrap(), i32::MAX);
     assert_eq!(q1_handle.try_get_uint_value_as_uint().unwrap(), u32::MAX);
 
-    let q2_handle = trailer.get_key(b"/Q2");
+    let q2_handle = trailer.try_get_key(b"/Q2").unwrap();
     assert_eq!(q2_handle.try_get_int_value().unwrap(), q2);
     assert_eq!(q2_handle.try_get_uint_value().unwrap(), 0);
     assert_eq!(q2_handle.try_get_int_value_as_int().unwrap(), i32::MIN);
     assert_eq!(q2_handle.try_get_uint_value_as_uint().unwrap(), 0);
 
-    let q3_handle = trailer.get_key(b"/Q3");
+    let q3_handle = trailer.try_get_key(b"/Q3").unwrap();
     assert_eq!(q3_handle.try_get_int_value_as_int().unwrap(), i32::MAX);
     assert_eq!(q3_handle.try_get_uint_value_as_uint().unwrap(), u32::MAX);
 
@@ -363,13 +363,13 @@ fn resolve_resolves_a_fresh_handle_in_place() {
         !root.is_resolved(),
         "a fresh indirect handle starts unresolved"
     );
-    pdf.resolve(&root).unwrap();
+    root.try_is_scalar().unwrap();
 
     assert!(
         root.is_resolved(),
         "resolve must update the handle in place"
     );
-    assert!(root.get_key(b"/Pages").is_indirect());
+    assert!(root.try_get_key(b"/Pages").unwrap().is_indirect());
 }
 
 #[test]
@@ -465,21 +465,24 @@ fn dictionary_handles_use_qpdf_slash_prefixed_decoded_keys() {
     );
     let mut pdf = Pdf::open(std::io::Cursor::new(bytes)).expect("open key fixture");
     let catalog = pdf.get_object_handle(ObjectRef::new(1, 0));
-    pdf.resolve(&catalog).expect("resolve catalog dictionary");
+    catalog.try_is_scalar().expect("resolve catalog dictionary");
 
-    let decoded = catalog.get_key(b"/A B");
+    let decoded = catalog.try_get_key(b"/A B").unwrap();
     assert_eq!(decoded.object_ref(), Some(ObjectRef::new(2, 0)));
-    assert!(catalog.get_key(b"A B").is_null());
+    assert!(catalog.try_get_key(b"A B").unwrap().is_null());
 }
 
 #[test]
 fn dictionary_handle_lookup_and_writer_use_one_canonical_slash() {
     let dictionary = ObjectHandle::dictionary(vec![(b"A B".to_vec(), ObjectHandle::integer(7))]);
 
-    assert_eq!(dictionary.get_key(b"A B").as_integer(), None);
-    assert_eq!(dictionary.get_key(b"/A B").as_integer(), Some(7));
-    assert!(dictionary.has_key(b"/A B"));
-    assert!(!dictionary.has_key(b"A B"));
+    assert_eq!(dictionary.try_get_key(b"A B").unwrap().as_integer(), None);
+    assert_eq!(
+        dictionary.try_get_key(b"/A B").unwrap().as_integer(),
+        Some(7)
+    );
+    assert!(dictionary.try_has_key(b"/A B").unwrap());
+    assert!(!dictionary.try_has_key(b"A B").unwrap());
     assert_eq!(dictionary.unparse_resolved(), b"<< /A#20B 7 >>");
 }
 
@@ -501,9 +504,14 @@ fn make_resources_indirect_promotes_direct_values_through_the_public_api() {
         .make_resources_indirect(&mut pdf)
         .expect("promote direct resource values");
 
-    assert!(resources.get_key(b"/Font").get_key(b"/F1").is_indirect());
-    assert!(resources.get_key(b"/Font").is_direct());
-    assert!(resources.get_key(b"/ProcSet").is_direct());
+    assert!(resources
+        .try_get_key(b"/Font")
+        .unwrap()
+        .try_get_key(b"/F1")
+        .unwrap()
+        .is_indirect());
+    assert!(resources.try_get_key(b"/Font").unwrap().is_direct());
+    assert!(resources.try_get_key(b"/ProcSet").unwrap().is_direct());
 }
 
 /// A dangling indirect handle (a ref absent from the fixture's xref table)
@@ -516,7 +524,8 @@ fn resolve_resolves_a_dangling_reference_to_null() {
     let dangling_ref = ObjectRef::new(999, 0);
 
     let handle = pdf.get_object_handle(dangling_ref);
-    pdf.resolve(&handle)
+    handle
+        .try_is_scalar()
         .expect("a dangling reference must not error");
 
     assert!(handle.is_null());
@@ -551,7 +560,8 @@ fn resolve_survives_a_cyclic_indirect_stream_length() {
     let object_ref = ObjectRef::new(1, 0);
 
     let handle = pdf.get_object_handle(object_ref);
-    pdf.resolve(&handle)
+    handle
+        .try_is_scalar()
         .expect("a cyclic indirect /Length must not error");
 
     assert!(
@@ -588,7 +598,7 @@ fn resolve_resolves_a_compressed_object_stream_member() {
     let object_ref = ObjectRef::new(2, 0);
 
     let handle = pdf.get_object_handle(object_ref);
-    pdf.resolve(&handle).expect("resolve compressed member");
+    handle.try_is_scalar().expect("resolve compressed member");
 
     assert_eq!(handle.as_integer(), Some(42));
 }
@@ -621,11 +631,11 @@ fn recovery_resolves_catalog_when_root_lives_in_object_stream() {
         .root_handle()
         .expect("recovered type-2 /Root must resolve to the Catalog");
     assert_eq!(
-        root.get_key(b"/Type").as_name().as_deref(),
+        root.try_get_key(b"/Type").unwrap().as_name().as_deref(),
         Some(b"Catalog".as_slice())
     );
     assert_eq!(
-        root.get_key(b"/Pages").object_ref(),
+        root.try_get_key(b"/Pages").unwrap().object_ref(),
         Some(ObjectRef::new(3, 0))
     );
     let repair_diagnostics = pdf.repair_diagnostics();
@@ -836,7 +846,7 @@ fn get_object_handle_repeated_calls_share_already_resolved_state() {
     let root_ref = pdf.root_ref().expect("root");
 
     let first = pdf.get_object_handle(root_ref);
-    pdf.resolve(&first).expect("resolve catalog");
+    first.try_is_scalar().expect("resolve catalog");
 
     let second = pdf.get_object_handle(root_ref);
     assert!(
@@ -861,12 +871,15 @@ fn resolve_distinguishes_a_literal_null_from_a_dangling_reference() {
 
     let literal_null_ref = ObjectRef::new(1, 0);
     let literal_null_handle = pdf.get_object_handle(literal_null_ref);
-    pdf.resolve(&literal_null_handle)
+    literal_null_handle
+        .try_is_scalar()
         .expect("resolve literal null");
 
     let dangling_ref = ObjectRef::new(999, 0);
     let dangling_handle = pdf.get_object_handle(dangling_ref);
-    pdf.resolve(&dangling_handle).expect("resolve dangling ref");
+    dangling_handle
+        .try_is_scalar()
+        .expect("resolve dangling ref");
 
     assert!(literal_null_handle.is_null());
     assert!(dangling_handle.is_null());
@@ -877,10 +890,10 @@ fn resolve_distinguishes_a_literal_null_from_a_dangling_reference() {
 #[test]
 fn resolve_is_a_no_op_for_a_direct_handle() {
     let file = File::open(minimal_fixture_path()).unwrap();
-    let mut pdf = Pdf::open(BufReader::new(file)).unwrap();
+    let _pdf = Pdf::open(BufReader::new(file)).unwrap();
     let direct = ObjectHandle::integer(7);
 
-    pdf.resolve(&direct).expect("a direct handle is a no-op");
+    direct.try_is_scalar().expect("a direct handle is a no-op");
 
     assert_eq!(direct.as_integer(), Some(7));
 }
@@ -894,8 +907,8 @@ fn resolve_is_idempotent_for_an_already_resolved_handle() {
     let root_ref = pdf.root_ref().expect("root");
     let handle = pdf.get_object_handle(root_ref);
 
-    pdf.resolve(&handle).expect("first resolve");
-    pdf.resolve(&handle).expect("second resolve is a no-op");
+    handle.try_is_scalar().expect("first resolve");
+    handle.try_is_scalar().expect("second resolve is a no-op");
 
     assert!(handle.as_dictionary().is_some());
 }
@@ -917,7 +930,7 @@ fn resolve_lifts_array_elements_recursively() {
     let object_ref = ObjectRef::new(1, 0);
 
     let handle = pdf.get_object_handle(object_ref);
-    pdf.resolve(&handle).expect("resolve dict-with-array");
+    handle.try_is_scalar().expect("resolve dict-with-array");
 
     let dict = handle.as_dictionary().expect("dictionary");
     let kids_handle = dict.get(b"/Kids".as_slice()).expect("Kids entry");
@@ -943,7 +956,7 @@ fn resolve_lifts_every_scalar_object_value_variant() {
     let object_ref = ObjectRef::new(1, 0);
 
     let handle = pdf.get_object_handle(object_ref);
-    pdf.resolve(&handle).expect("resolve scalar dict");
+    handle.try_is_scalar().expect("resolve scalar dict");
 
     let dict = handle.as_dictionary().expect("dictionary");
     assert_eq!(
@@ -1004,7 +1017,7 @@ fn scalar_parsed_offset_includes_leading_whitespace_like_qpdf() {
     let bytes = classic_pdf_with_bodies(&[body], ObjectRef::new(1, 0));
     let mut pdf = Pdf::open_mem_owned(bytes).expect("open scalar-offset fixture");
     let handle = pdf.get_object_handle(ObjectRef::new(1, 0));
-    pdf.resolve(&handle).expect("resolve scalar");
+    handle.try_is_scalar().expect("resolve scalar");
 
     assert_eq!(handle.as_integer(), Some(42));
     assert_eq!(handle.get_parsed_offset(), expected_offset);
@@ -1026,7 +1039,7 @@ fn array_parsed_offset_is_the_bracket_not_the_first_child() {
     let bytes = classic_pdf_with_bodies(&[body], ObjectRef::new(1, 0));
     let mut pdf = Pdf::open_mem_owned(bytes).expect("open array-offset fixture");
     let handle = pdf.get_object_handle(ObjectRef::new(1, 0));
-    pdf.resolve(&handle).expect("resolve array");
+    handle.try_is_scalar().expect("resolve array");
 
     assert_eq!(handle.get_parsed_offset(), expected_array_offset);
     let children = handle.as_array().expect("array");
@@ -1044,7 +1057,7 @@ fn dictionary_parsed_offset_is_the_double_angle_bracket() {
     let bytes = classic_pdf_with_bodies(&[body], ObjectRef::new(1, 0));
     let mut pdf = Pdf::open_mem_owned(bytes).expect("open dictionary-offset fixture");
     let handle = pdf.get_object_handle(ObjectRef::new(1, 0));
-    pdf.resolve(&handle).expect("resolve dictionary");
+    handle.try_is_scalar().expect("resolve dictionary");
 
     assert_eq!(handle.get_parsed_offset(), expected_dict_offset);
     let dict = handle.as_dictionary().expect("dictionary");
@@ -1064,7 +1077,7 @@ fn parsed_null_offset_is_always_the_sentinel() {
     let bytes = classic_pdf_with_bodies(&[b"1 0 obj\nnull\nendobj\n"], ObjectRef::new(1, 0));
     let mut pdf = Pdf::open_mem_owned(bytes).expect("open null-offset fixture");
     let handle = pdf.get_object_handle(ObjectRef::new(1, 0));
-    pdf.resolve(&handle).expect("resolve null");
+    handle.try_is_scalar().expect("resolve null");
 
     assert!(handle.is_null());
     assert_eq!(handle.get_parsed_offset(), -1);
@@ -1083,7 +1096,7 @@ fn stream_handle_and_its_dictionary_handle_have_distinct_offsets() {
     let bytes = classic_pdf_with_bodies(&[body], ObjectRef::new(1, 0));
     let mut pdf = Pdf::open_mem_owned(bytes).expect("open stream-offset fixture");
     let handle = pdf.get_object_handle(ObjectRef::new(1, 0));
-    pdf.resolve(&handle).expect("resolve stream");
+    handle.try_is_scalar().expect("resolve stream");
 
     assert!(
         handle.as_stream_data().is_none(),
@@ -1130,13 +1143,13 @@ fn indirect_reference_child_is_the_canonical_handle_not_a_fresh_value() {
     assert!(canonical.as_integer().is_none(), "not yet resolved");
 
     let handle = pdf.get_object_handle(ObjectRef::new(1, 0));
-    pdf.resolve(&handle).expect("resolve parent");
+    handle.try_is_scalar().expect("resolve parent");
 
     let dict = handle.as_dictionary().expect("dictionary");
     let kid_handle = dict.get(b"/Kid".as_slice()).expect("Kid entry").clone();
     assert_eq!(kid_handle.object_ref(), Some(ObjectRef::new(5, 0)));
 
-    pdf.resolve(&kid_handle).expect("resolve kid");
+    kid_handle.try_is_scalar().expect("resolve kid");
     assert_eq!(canonical.as_integer(), Some(99));
 }
 
@@ -1149,7 +1162,7 @@ fn compressed_object_stream_member_records_its_canonical_member_offset() {
     let object_ref = ObjectRef::new(2, 0);
 
     let handle = pdf.get_object_handle(object_ref);
-    pdf.resolve(&handle).expect("resolve compressed member");
+    handle.try_is_scalar().expect("resolve compressed member");
 
     assert_eq!(handle.as_integer(), Some(42));
     assert_eq!(
@@ -1168,16 +1181,15 @@ fn real_literal_round_trips_through_native_parsing() {
     let bytes = classic_pdf_with_bodies(&[b"1 0 obj\n.4\nendobj\n"], ObjectRef::new(1, 0));
     let mut pdf = Pdf::open_mem_owned(bytes).expect("open real-literal fixture");
     let handle = pdf.get_object_handle(ObjectRef::new(1, 0));
-    pdf.resolve(&handle).expect("resolve real literal");
+    handle.try_is_scalar().expect("resolve real literal");
 
     assert_eq!(handle.as_real_literal(), Some((0.4, b".4".to_vec())));
 }
 
 // ---------------------------------------------------------------------
 // Canonical parser recovery: malformed containers are qpdf-style nulls with
-// diagnostics. These tests deliberately do not call `Pdf::resolve`; the old
-// recursive handle parser was removed, and the live parser is now the sole
-// ObjectHandle implementation.
+// diagnostics. These tests deliberately do not call an explicit Pdf resolver
+// facade; the live parser is now the sole ObjectHandle implementation.
 // ---------------------------------------------------------------------
 
 #[test]
@@ -1191,7 +1203,8 @@ fn canonical_unterminated_dictionary_resolves_to_null_with_diagnostics() {
     );
     let mut pdf = Pdf::open_mem_owned(bytes).expect("open unterminated-dict fixture");
     let handle = pdf.get_object_handle(ObjectRef::new(1, 0));
-    pdf.resolve(&handle)
+    handle
+        .try_is_scalar()
         .expect("qpdf parser recovers an unterminated dictionary");
 
     assert!(handle.is_null());
@@ -1217,7 +1230,8 @@ fn canonical_unterminated_array_resolves_to_null_with_diagnostics() {
     );
     let mut pdf = Pdf::open_mem_owned(bytes).expect("open unterminated-array fixture");
     let handle = pdf.get_object_handle(ObjectRef::new(1, 0));
-    pdf.resolve(&handle)
+    handle
+        .try_is_scalar()
         .expect("qpdf parser recovers an unterminated array");
 
     assert!(handle.is_null());
@@ -1252,7 +1266,8 @@ fn canonical_nesting_past_max_parse_depth_resolves_to_null_with_warning() {
             let bytes = classic_pdf_with_bodies(&[&body], ObjectRef::new(1, 0));
             let mut pdf = Pdf::open_mem_owned(bytes).expect("open deep-nesting fixture");
             let handle = pdf.get_object_handle(ObjectRef::new(1, 0));
-            pdf.resolve(&handle)
+            handle
+                .try_is_scalar()
                 .expect("qpdf parser recovers excessive nesting");
 
             assert!(handle.is_null());

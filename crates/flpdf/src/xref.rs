@@ -9542,7 +9542,8 @@ mod final_handle_tests {
             detached
                 .as_stream_dict()
                 .expect("detached stream dictionary")
-                .get_key(b"/Length")
+                .try_get_key(b"/Length")
+                .unwrap()
                 .as_integer(),
             Some(0)
         );

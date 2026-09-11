@@ -633,7 +633,7 @@ fn add_content_token_filter_coalesces_before_lazy_filter_execution() {
     let shared = Rc::new(RefCell::new(RecordingFilter::default()));
     page.add_content_token_filter(shared.clone()).unwrap();
 
-    let coalesced = page.get_key(b"/Contents");
+    let coalesced = page.try_get_key(b"/Contents").unwrap();
     assert!(coalesced.is_indirect());
     assert!(coalesced.as_stream_data().is_none());
     assert_eq!(shared.borrow().eof_calls, 0);

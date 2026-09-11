@@ -50,8 +50,8 @@ fn public_copy_foreign_object_preserves_shared_child_identity() {
         .copy_foreign_object(&source.get_object_handle(ObjectRef::new(5, 0)))
         .expect("copy second foreign object");
 
-    let first_child = first.get_key(b"/Child");
-    let second_child = second.get_key(b"/Child");
+    let first_child = first.try_get_key(b"/Child").unwrap();
+    let second_child = second.try_get_key(b"/Child").unwrap();
     assert!(first_child.is_same_object_as(&second_child));
     assert_eq!(first_child.object_ref(), second_child.object_ref());
 }
@@ -61,7 +61,7 @@ fn public_copy_foreign_object_accepts_a_canonical_direct_value_child() {
     let mut source = Pdf::empty().expect("source PDF");
     let mut target = Pdf::empty().expect("target PDF");
     let source_root = source.root_handle().expect("source root");
-    let direct = source_root.get_key(b"/Pages");
+    let direct = source_root.try_get_key(b"/Pages").unwrap();
     assert!(direct.is_indirect());
 
     let copied = target

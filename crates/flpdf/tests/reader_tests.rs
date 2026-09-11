@@ -25,16 +25,13 @@ where
     R: Read + Seek,
 {
     let handle = pdf.get_object_handle(object_ref);
-    pdf.resolve(&handle).expect("resolve object");
+    handle.try_is_scalar().expect("resolve object");
     handle
 }
 
-fn resolved_key<R>(pdf: &mut Pdf<R>, object: &ObjectHandle, key: &[u8]) -> ObjectHandle
-where
-    R: Read + Seek,
-{
-    let value = object.get_key(key);
-    pdf.resolve(&value).expect("resolve dictionary value");
+fn resolved_key(object: &ObjectHandle, key: &[u8]) -> ObjectHandle {
+    let value = object.try_get_key(key).unwrap();
+    value.try_is_scalar().expect("resolve dictionary value");
     value
 }
 
@@ -50,17 +47,14 @@ fn stream_data(stream: &ObjectHandle) -> Vec<u8> {
         .clone()
 }
 
-fn assert_crypt_filter_shape<R>(
-    pdf: &mut Pdf<R>,
+fn assert_crypt_filter_shape(
     stream: &ObjectHandle,
     crypt_after: bool,
     other_filter: &[u8],
     crypt_name: &[u8],
-) where
-    R: Read + Seek,
-{
+) {
     let dict = stream_dict(stream);
-    let filters = resolved_key(pdf, &dict, b"/Filter")
+    let filters = resolved_key(&dict, b"/Filter")
         .as_array()
         .expect("filter array");
     assert_eq!(filters.len(), 2);
@@ -72,23 +66,20 @@ fn assert_crypt_filter_shape<R>(
     assert_eq!(filters[0].as_name().as_deref(), Some(expected[0]));
     assert_eq!(filters[1].as_name().as_deref(), Some(expected[1]));
 
-    let decode_parms = resolved_key(pdf, &dict, b"/DecodeParms")
+    let decode_parms = resolved_key(&dict, b"/DecodeParms")
         .as_array()
         .expect("decode parms array");
     assert_eq!(decode_parms.len(), 2);
     let crypt_index = usize::from(crypt_after);
     let other_index = usize::from(!crypt_after);
-    assert!(resolved_value(pdf, decode_parms[other_index].clone()).is_null());
-    let crypt_params = resolved_value(pdf, decode_parms[crypt_index].clone());
-    let name = resolved_key(pdf, &crypt_params, b"/Name");
+    assert!(resolved_value(decode_parms[other_index].clone()).is_null());
+    let crypt_params = resolved_value(decode_parms[crypt_index].clone());
+    let name = resolved_key(&crypt_params, b"/Name");
     assert_eq!(name.as_name().as_deref(), Some(crypt_name));
 }
 
-fn resolved_value<R>(pdf: &mut Pdf<R>, value: ObjectHandle) -> ObjectHandle
-where
-    R: Read + Seek,
-{
-    pdf.resolve(&value).expect("resolve value");
+fn resolved_value(value: ObjectHandle) -> ObjectHandle {
+    value.try_is_scalar().expect("resolve value");
     value
 }
 
@@ -154,7 +145,7 @@ fn resolves_indirect_object_on_access() {
 
     let root = resolved_handle(&mut pdf, ObjectRef::new(1, 0));
     assert_eq!(
-        root.get_key(b"/Pages").object_ref(),
+        root.try_get_key(b"/Pages").unwrap().object_ref(),
         Some(ObjectRef::new(2, 0))
     );
     assert!(root.is_resolved());
@@ -194,7 +185,7 @@ fn resolving_eof_running_objects_uses_live_qpdf_recovery() {
     let mut resolved = 0usize;
     for i in 3..3 + N {
         let handle = pdf.get_object_handle(ObjectRef::new(i, 0));
-        if pdf.resolve(&handle).is_ok() {
+        if handle.try_is_scalar().is_ok() {
             resolved += 1;
         }
     }
@@ -211,7 +202,7 @@ fn resolve_returns_same_cached_handle() {
 
     let first = resolved_handle(&mut pdf, ObjectRef::new(1, 0));
     assert_eq!(
-        first.get_key(b"/Pages").object_ref(),
+        first.try_get_key(b"/Pages").unwrap().object_ref(),
         Some(ObjectRef::new(2, 0))
     );
 
@@ -652,7 +643,7 @@ fn resolve_decrypts_encrypted_strings_after_authentication() {
         .expect("writer fixture has /Info");
     let info = resolved_handle(&mut pdf, info_ref);
     assert_eq!(
-        resolved_key(&mut pdf, &info, b"/Title").as_string(),
+        resolved_key(&info, b"/Title").as_string(),
         Some(b"TopSecretTitle".to_vec())
     );
 }
@@ -681,10 +672,7 @@ fn resolve_decrypts_object_stream_before_filter_decode() {
     );
 
     let info = resolved_handle(&mut pdf, info_ref);
-    assert_eq!(
-        resolved_key(&mut pdf, &info, b"/Value").as_integer(),
-        Some(42)
-    );
+    assert_eq!(resolved_key(&info, b"/Value").as_integer(), Some(42));
 }
 
 #[test]
@@ -693,7 +681,7 @@ fn v4_uses_separate_stream_and_string_crypt_filters() {
 
     let dictionary = resolved_handle(&mut pdf, ObjectRef::new(3, 0));
     assert_eq!(
-        resolved_key(&mut pdf, &dictionary, b"/Secret").as_string(),
+        resolved_key(&dictionary, b"/Secret").as_string(),
         Some(b"plain text".to_vec())
     );
 
@@ -716,7 +704,7 @@ fn v4_explicit_crypt_filter_decrypts_before_flate_when_crypt_is_first() {
         b"explicit crypt stream"
     );
     let stream = resolved_handle(&mut pdf, ObjectRef::new(4, 0));
-    assert_crypt_filter_shape(&mut pdf, &stream, false, b"FlateDecode", b"StdCF");
+    assert_crypt_filter_shape(&stream, false, b"FlateDecode", b"StdCF");
 }
 
 #[test]
@@ -734,7 +722,7 @@ fn v4_explicit_crypt_filter_decrypts_before_flate_when_crypt_is_last() {
         b"explicit crypt stream"
     );
     let stream = resolved_handle(&mut pdf, ObjectRef::new(4, 0));
-    assert_crypt_filter_shape(&mut pdf, &stream, true, b"FlateDecode", b"StdCF");
+    assert_crypt_filter_shape(&stream, true, b"FlateDecode", b"StdCF");
 }
 
 #[test]
@@ -769,7 +757,7 @@ fn v4_explicit_identity_crypt_filter_is_noop_before_flate() {
         b"explicit crypt stream"
     );
     let stream = resolved_handle(&mut pdf, ObjectRef::new(4, 0));
-    assert_crypt_filter_shape(&mut pdf, &stream, false, b"FlateDecode", b"Identity");
+    assert_crypt_filter_shape(&stream, false, b"FlateDecode", b"Identity");
 }
 
 /// `/Crypt` in the first `/Filter` slot needs no prefix reconstruction, so the
@@ -795,7 +783,7 @@ fn v4_explicit_crypt_filter_before_ascii85_decrypts_at_filter_slot() {
         b"explicit crypt stream"
     );
     let stream = resolved_handle(&mut pdf, ObjectRef::new(4, 0));
-    assert_crypt_filter_shape(&mut pdf, &stream, false, b"ASCII85Decode", b"StdCF");
+    assert_crypt_filter_shape(&stream, false, b"ASCII85Decode", b"StdCF");
 }
 
 /// qpdf attaches the decryption pipeline to the raw stream bytes before any
@@ -818,7 +806,7 @@ fn v4_explicit_crypt_filter_after_ascii85_decrypts_before_filter() {
         b"explicit crypt stream"
     );
     let stream = resolved_handle(&mut pdf, ObjectRef::new(4, 0));
-    assert_crypt_filter_shape(&mut pdf, &stream, true, b"ASCII85Decode", b"StdCF");
+    assert_crypt_filter_shape(&stream, true, b"ASCII85Decode", b"StdCF");
 }
 
 /// qpdf prepends decryption to the raw stream and retries without filtering
@@ -883,7 +871,7 @@ fn v4_explicit_crypt_filter_failure_retries_unfiltered_like_qpdf() {
 
     let mut pdf = Pdf::open(std::io::Cursor::new(fixture)).unwrap();
     let stream = resolved_handle(&mut pdf, ObjectRef::new(4, 0));
-    assert_crypt_filter_shape(&mut pdf, &stream, true, b"ASCII85Decode", b"StdCF");
+    assert_crypt_filter_shape(&stream, true, b"ASCII85Decode", b"StdCF");
     assert_eq!(
         stream_data(&stream),
         qpdf_retained,
@@ -955,7 +943,7 @@ fn v4_explicit_crypt_filter_flate_failure_retries_unfiltered() {
 
     let mut pdf = Pdf::open(std::io::Cursor::new(fixture)).unwrap();
     let stream = resolved_handle(&mut pdf, ObjectRef::new(4, 0));
-    assert_crypt_filter_shape(&mut pdf, &stream, true, b"FlateDecode", b"StdCF");
+    assert_crypt_filter_shape(&stream, true, b"FlateDecode", b"StdCF");
     assert_eq!(
         stream_data(&stream),
         qpdf_retained,
@@ -977,7 +965,7 @@ fn r5_and_r6_identity_crypt_filters_leave_streams_and_strings_plaintext() {
 
         let dict = resolved_handle(&mut pdf, ObjectRef::new(3, 0));
         assert_eq!(
-            resolved_key(&mut pdf, &dict, b"/Secret").as_string(),
+            resolved_key(&dict, b"/Secret").as_string(),
             Some(b"plain text".to_vec())
         );
 
@@ -1140,7 +1128,7 @@ fn assert_encrypted_plaintext_stream_rewrite_restores_recovered_eol(
     let root = rewritten.root_ref().expect("root");
     let catalog = resolved_handle(&mut rewritten, root);
     let catalog_key = format!("/{catalog_key}");
-    let stream_ref = resolved_key(&mut rewritten, &catalog, catalog_key.as_bytes())
+    let stream_ref = resolved_key(&catalog, catalog_key.as_bytes())
         .object_ref()
         .expect("stream reference");
     let stream = resolved_handle(&mut rewritten, stream_ref);
@@ -1151,10 +1139,10 @@ fn assert_encrypted_plaintext_stream_rewrite_restores_recovered_eol(
     );
     if expect_unfiltered {
         let dict = stream_dict(&stream);
-        assert!(!dict.has_key(b"/Filter"));
-        assert!(!dict.has_key(b"/DecodeParms"));
+        assert!(!dict.try_has_key(b"/Filter").unwrap());
+        assert!(!dict.try_has_key(b"/DecodeParms").unwrap());
         assert_eq!(
-            resolved_key(&mut rewritten, &dict, b"/Length").as_integer(),
+            resolved_key(&dict, b"/Length").as_integer(),
             Some(expected_payload.len() as i64)
         );
     }
@@ -1215,7 +1203,7 @@ fn assert_explicit_identity_filter_chain_does_not_append_decoded_eol(crypt_after
         .expect("output stream dictionary");
     let raw_dict = ObjectHandle::parse(&output[dict_start..stream_marker])
         .expect("parse raw stream dictionary");
-    let raw_filter = raw_dict.get_key(b"/Filter");
+    let raw_filter = raw_dict.try_get_key(b"/Filter").unwrap();
     let raw_filter_items = raw_filter.as_array().expect("filter array");
     assert_eq!(raw_filter_items.len(), 1);
     assert_eq!(
@@ -1223,7 +1211,7 @@ fn assert_explicit_identity_filter_chain_does_not_append_decoded_eol(crypt_after
         Some(b"FlateDecode".as_slice()),
         "qpdf preserves the remaining filter as a one-element array"
     );
-    let raw_decode_parms = raw_dict.get_key(b"/DecodeParms");
+    let raw_decode_parms = raw_dict.try_get_key(b"/DecodeParms").unwrap();
     let raw_decode_items = raw_decode_parms.as_array().expect("decode parms array");
     assert_eq!(raw_decode_items.len(), 1);
     assert!(
@@ -1238,7 +1226,7 @@ fn assert_explicit_identity_filter_chain_does_not_append_decoded_eol(crypt_after
         raw
     };
     assert_eq!(
-        raw_dict.get_key(b"/Length").as_integer(),
+        raw_dict.try_get_key(b"/Length").unwrap().as_integer(),
         Some(expected_raw.len() as i64),
         "qpdf rewrites /Length to the preserved Flate representation"
     );
@@ -1252,7 +1240,7 @@ fn assert_explicit_identity_filter_chain_does_not_append_decoded_eol(crypt_after
     let mut rewritten = Pdf::open(std::io::Cursor::new(output)).expect("rewritten output");
     let root = rewritten.root_ref().expect("root");
     let catalog = resolved_handle(&mut rewritten, root);
-    let stream_ref = resolved_key(&mut rewritten, &catalog, b"/Data")
+    let stream_ref = resolved_key(&catalog, b"/Data")
         .object_ref()
         .expect("stream reference");
     let stream = resolved_handle(&mut rewritten, stream_ref);
@@ -1828,7 +1816,7 @@ fn an_unknown_crypt_filter_warns_once_per_kind_and_still_decrypts() {
 
     let secret = |pdf: &mut Pdf<std::io::Cursor<Vec<u8>>>, object_number: u32| {
         let dict = resolved_handle(pdf, ObjectRef::new(object_number, 0));
-        resolved_key(pdf, &dict, b"/Secret")
+        resolved_key(&dict, b"/Secret")
             .as_string()
             .unwrap_or_else(|| panic!("object {object_number} has a /Secret string"))
     };
@@ -3056,7 +3044,7 @@ fn encrypted_fixture_streams_decrypt_correctly_with_indirect_length_path() {
             // not obviously ciphertext garbage of the wrong length.
             let data = stream_data(&object);
             assert!(
-                !data.is_empty() || stream_dict(&object).has_key(b"/Length"),
+                !data.is_empty() || stream_dict(&object).try_has_key(b"/Length").unwrap(),
                 "decrypted stream {r:?} unexpectedly empty with no /Length"
             );
         }

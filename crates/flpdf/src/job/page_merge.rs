@@ -1678,7 +1678,7 @@ mod tests {
             .get(&member.number)
             .expect("copied member must have a compressed source row");
         let stream_handle = target.get_object_handle(ObjectRef::new(target_container, 0));
-        target.resolve(&stream_handle).unwrap();
+        stream_handle.try_is_scalar().unwrap();
         let extends = stream_handle
             .as_stream_dict()
             .unwrap()
@@ -1846,7 +1846,7 @@ mod tests {
         object_ref: ObjectRef,
     ) -> ObjectHandle {
         let handle = pdf.get_object_handle(object_ref);
-        pdf.resolve(&handle).expect("resolve object");
+        handle.try_is_scalar().expect("resolve object");
         handle
     }
 
@@ -1883,7 +1883,8 @@ mod tests {
             "catalog must be a dictionary"
         );
         let open_action_ref = catalog
-            .get_key(b"/OpenAction")
+            .try_get_key(b"/OpenAction")
+            .unwrap()
             .object_ref()
             .expect("indirect /OpenAction carrier is retained");
         assert!(
@@ -1970,7 +1971,8 @@ mod tests {
             "catalog must be a dictionary"
         );
         let acroform_ref = catalog
-            .get_key(b"/AcroForm")
+            .try_get_key(b"/AcroForm")
+            .unwrap()
             .object_ref()
             .expect("/AcroForm");
         let acroform = resolved_handle(&mut merged, acroform_ref);
@@ -1979,7 +1981,8 @@ mod tests {
             "AcroForm must be a dictionary"
         );
         let fields = acroform
-            .get_key(b"/Fields")
+            .try_get_key(b"/Fields")
+            .unwrap()
             .as_array()
             .expect("/Fields array");
         let names: Vec<Vec<u8>> = fields
@@ -1991,8 +1994,8 @@ mod tests {
                     field_dict.as_dictionary().is_some(),
                     "field must be a dictionary"
                 );
-                let name = field_dict.get_key(b"/T");
-                merged.resolve(&name).expect("resolve /T");
+                let name = field_dict.try_get_key(b"/T").unwrap();
+                name.try_is_scalar().expect("resolve /T");
                 name.as_string().expect("/T string")
             })
             .collect();
@@ -2052,8 +2055,8 @@ mod tests {
         ]);
         rewrite_field_kids(&mut target, ObjectRef::new(5, 0), &[kids[0]], &map)
             .expect("rewrite copied field kids");
-        target
-            .resolve(&target_field)
+        target_field
+            .try_is_scalar()
             .expect("resolve rewritten field");
         assert_eq!(
             target_field

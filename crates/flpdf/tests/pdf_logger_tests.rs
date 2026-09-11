@@ -341,7 +341,7 @@ fn object_warning_preserves_a_non_utf8_file_description() {
     .expect("open malformed filter PDF");
 
     let stream = pdf.get_object_handle(ObjectRef::new(4, 0));
-    pdf.resolve(&stream).expect("resolve content stream");
+    stream.try_is_scalar().expect("resolve content stream");
     let _ = stream.get_stream_data(DecodeLevel::All);
 
     let output = output.lock().expect("capture output");

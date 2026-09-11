@@ -8459,7 +8459,7 @@ mod tests {
             .expect("trailer /Info must be a reference");
 
         let info: ObjectHandle = rt.get_object_handle(info_ref);
-        rt.resolve(&info)
+        info.try_is_scalar()
             .expect("canonical resolver must resolve /Info");
         let values = info.as_dictionary().expect("/Info must be a dictionary");
         assert_eq!(
@@ -8633,7 +8633,8 @@ mod tests {
             .expect("open encrypted stream fixture");
             let object_ref = ObjectRef::new(3, 0);
             let stream: ObjectHandle = pdf.get_object_handle(object_ref);
-            pdf.resolve(&stream)
+            stream
+                .try_is_scalar()
                 .expect("resolve encrypted stream handle");
             let offset = stream.get_parsed_offset();
             let dict = stream.as_stream_dict().expect("stream dictionary");
@@ -8679,7 +8680,7 @@ mod tests {
             .object_ref()
             .expect("trailer /Info must be a reference");
         let info: ObjectHandle = pdf.get_object_handle(info_ref);
-        pdf.resolve(&info)
+        info.try_is_scalar()
             .expect("canonical resolver must resolve /Info");
         (
             info_ref,
@@ -8869,7 +8870,7 @@ mod tests {
             .object_ref()
             .expect("trailer /Info must be a reference");
         let info: ObjectHandle = pdf.get_object_handle(info_ref);
-        pdf.resolve(&info)
+        info.try_is_scalar()
             .expect("canonical resolver must decrypt with qpdf's AES fallback");
         assert_eq!(
             info.as_dictionary()
@@ -8923,7 +8924,7 @@ mod tests {
             .unwrap();
 
         let info: ObjectHandle = pdf.get_object_handle(info_ref);
-        pdf.resolve(&info)
+        info.try_is_scalar()
             .expect("warning failure is caught by the dispatch catch");
         assert!(info.is_null());
         assert!(!pdf.repair_diagnostics().entries().is_empty());
@@ -9054,7 +9055,7 @@ mod tests {
         let mut pdf = Pdf::open_mem_owned(minimal_pdf_bytes()).expect("open");
         let handle: ObjectHandle = pdf.get_object_handle(ObjectRef::new(1, 0));
 
-        pdf.resolve(&handle).expect(
+        handle.try_is_scalar().expect(
             "an attached resolver resolves an uncompressed object; \
              `belongs to a dropped PDF` here would instead mean `get_object_handle` \
              vended a handle whose `Weak` could not be upgraded, i.e. no resolver \
@@ -9102,7 +9103,7 @@ mod tests {
     fn disconnect_all_clears_xref_before_destroying_canonical_handles() {
         let mut pdf = Pdf::open_mem_owned(minimal_pdf_bytes()).expect("open");
         let handle = pdf.get_object_handle(ObjectRef::new(1, 0));
-        pdf.resolve(&handle).expect("resolve catalog");
+        handle.try_is_scalar().expect("resolve catalog");
         assert!(!pdf.resolver.source_xref_entries().is_empty());
 
         pdf.resolver.disconnect_all();
@@ -9193,7 +9194,8 @@ mod tests {
         let outer = ResolveMark::begin(&resolver.core, object_gen)
             .expect("the first mark for a reference must be recorded, not reported as a loop");
 
-        pdf.resolve(&handle)
+        handle
+            .try_is_scalar()
             .expect("a resolution loop is qpdf's null outcome, not an error");
 
         assert!(handle.is_null(), "a detected loop resolves to null");
@@ -9242,7 +9244,8 @@ mod tests {
         pdf.resolver.set_last_offset(85);
         let handle: ObjectHandle = pdf.get_object_handle(object_ref);
 
-        pdf.resolve(&handle)
+        handle
+            .try_is_scalar()
             .expect("qpdf catches the stream-shape error and resolves the member to null");
         assert!(handle.is_null());
         let diagnostics = pdf.repair_diagnostics();
@@ -9279,7 +9282,8 @@ mod tests {
         );
         let handle: ObjectHandle = pdf.get_object_handle(object_ref);
 
-        pdf.resolve(&handle)
+        handle
+            .try_is_scalar()
             .expect("qpdf resolves a malformed compressed object to null");
         assert!(handle.is_null());
         assert!(pdf
@@ -9320,7 +9324,8 @@ mod tests {
             });
 
         let member = pdf.get_object_handle(member_ref);
-        pdf.resolve(&member)
+        member
+            .try_is_scalar()
             .expect("qpdf catches the bad ObjStm keys");
         let diagnostics = pdf.repair_diagnostics();
         let warning = diagnostics
@@ -10885,7 +10890,7 @@ mod tests {
         resolver.set_last_offset(42);
         let outer = ResolveMark::begin(&resolver.core, QpdfObjGen::from_object_ref(object_ref))
             .expect("first mark");
-        pdf.resolve(&handle).expect("a loop is not an error");
+        handle.try_is_scalar().expect("a loop is not an error");
         drop(outer);
 
         let diagnostics = pdf.repair_diagnostics();
@@ -10917,7 +10922,7 @@ mod tests {
         let outer =
             ResolveMark::begin(&resolver.core, QpdfObjGen::from_object_ref(object_ref)).unwrap();
         assert!(matches!(
-            pdf.resolve(&handle),
+            handle.try_is_scalar(),
             Err(Error::System(ref message)) if message == "sink write failure 1"
         ));
         drop(outer);
@@ -10941,7 +10946,7 @@ mod tests {
         let resolver = Rc::clone(&pdf.resolver);
         let outer = ResolveMark::begin(&resolver.core, QpdfObjGen::from_object_ref(object_ref))
             .expect("first mark");
-        pdf.resolve(&handle).expect("a loop is not an error");
+        handle.try_is_scalar().expect("a loop is not an error");
         drop(outer);
         pdf.push_warning("after the loop").unwrap();
 
@@ -11206,7 +11211,8 @@ mod tests {
         let handle = pdf.get_object_handle(ObjectRef::new(1, 0));
         let before = pdf.resolver.with_reader_mut(|reader| reader.reads);
 
-        pdf.resolve(&handle)
+        handle
+            .try_is_scalar()
             .expect("an uncompressed object resolves");
 
         let after_first = pdf.resolver.with_reader_mut(|reader| reader.reads);
@@ -11223,7 +11229,7 @@ mod tests {
             Some(b"Catalog".to_vec())
         );
 
-        pdf.resolve(&handle).expect("a resolved slot is terminal");
+        handle.try_is_scalar().expect("a resolved slot is terminal");
 
         assert_eq!(
             pdf.resolver.with_reader_mut(|reader| reader.reads),
@@ -11249,7 +11255,7 @@ mod tests {
         let mut pdf = Pdf::open_mem_owned(minimal_pdf_bytes()).expect("open");
 
         let catalog: ObjectHandle = pdf.get_object_handle(ObjectRef::new(1, 0));
-        pdf.resolve(&catalog).expect("resolve the catalog");
+        catalog.try_is_scalar().expect("resolve the catalog");
         let minted_child = catalog
             .as_dictionary()
             .expect("the catalog is a dictionary")
@@ -11263,7 +11269,7 @@ mod tests {
 
         let page = pdf.get_object_handle(ObjectRef::new(3, 0));
         let pages: ObjectHandle = pdf.get_object_handle(ObjectRef::new(2, 0));
-        pdf.resolve(&pages).expect("resolve the page tree");
+        pages.try_is_scalar().expect("resolve the page tree");
         let kid = pages
             .as_dictionary()
             .expect("the page tree is a dictionary")
@@ -11289,7 +11295,7 @@ mod tests {
         for object_ref in [ObjectRef::new(1, 0), ObjectRef::new(4, 0)] {
             let mut pdf = Pdf::open_mem_owned(indirect_length_pdf_bytes()).expect("open");
             let handle: ObjectHandle = pdf.get_object_handle(object_ref);
-            pdf.resolve(&handle).expect("canonical resolution");
+            handle.try_is_scalar().expect("canonical resolution");
             assert_ne!(
                 handle.get_parsed_offset(),
                 NO_PARSED_OFFSET,
@@ -11326,7 +11332,8 @@ mod tests {
         let mut pdf = Pdf::open_mem_owned(indirect_length_pdf_bytes()).expect("open");
         let stream: ObjectHandle = pdf.get_object_handle(ObjectRef::new(4, 0));
 
-        pdf.resolve(&stream)
+        stream
+            .try_is_scalar()
             .expect("a stream with an indirect /Length resolves");
 
         assert!(
@@ -11374,7 +11381,7 @@ mod tests {
     fn raw_stream_data_reports_a_short_original_source_as_unsupported() {
         let mut pdf = Pdf::open_mem_owned(indirect_length_pdf_bytes()).expect("open");
         let stream: ObjectHandle = pdf.get_object_handle(ObjectRef::new(4, 0));
-        pdf.resolve(&stream).expect("resolve stream");
+        stream.try_is_scalar().expect("resolve stream");
         let stream_dict = stream.as_stream_dict().expect("stream dictionary");
 
         // `read_stream` cannot produce this shape: it validates the declared
@@ -11466,7 +11473,8 @@ mod tests {
         let object_ref = ObjectRef::new(2, 0);
         let handle: ObjectHandle = pdf.get_object_handle(object_ref);
 
-        pdf.resolve(&handle)
+        handle
+            .try_is_scalar()
             .expect("qpdf catches the null /Length after the loop");
         assert!(handle.is_null());
 
@@ -11488,7 +11496,8 @@ mod tests {
             "the inner call caches qpdf's loop null through the same slot the \
              outer call was resolving"
         );
-        pdf.resolve(&handle)
+        handle
+            .try_is_scalar()
             .expect("and that null is terminal, so nothing is re-read");
         assert!(
             pdf.resolver.core.borrow().resolving.is_empty(),
@@ -11508,7 +11517,7 @@ mod tests {
         let mut pdf = Pdf::open_mem_owned(indirect_length_pdf_bytes()).expect("open");
         for number in 1..=5 {
             let handle: ObjectHandle = pdf.get_object_handle(ObjectRef::new(number, 0));
-            pdf.resolve(&handle).expect("resolve");
+            handle.try_is_scalar().expect("resolve");
         }
 
         let messages: Vec<String> = pdf
@@ -11545,7 +11554,7 @@ mod tests {
 
         let mut pdf = Pdf::open_mem_owned(pdf).expect("open");
         let handle: ObjectHandle = pdf.get_object_handle(ObjectRef::new(1, 0));
-        pdf.resolve(&handle).expect("resolve");
+        handle.try_is_scalar().expect("resolve");
 
         assert_eq!(
             handle
@@ -11589,7 +11598,7 @@ mod tests {
         // is under test.
         let before = pdf.resolver.with_reader_mut(|reader| reader.reads);
 
-        pdf.resolve(&handle).expect("resolve");
+        handle.try_is_scalar().expect("resolve");
 
         let pulls = pdf.resolver.with_reader_mut(|reader| reader.reads) - before;
         assert!(
@@ -11648,7 +11657,7 @@ mod tests {
         let mut pdf = Pdf::open_mem_owned(bytes).expect("open");
         let handle: ObjectHandle = pdf.get_object_handle(ObjectRef::new(2, 0));
 
-        pdf.resolve(&handle).expect("qpdf-style recovery");
+        handle.try_is_scalar().expect("qpdf-style recovery");
 
         let dictionary = handle.as_dictionary().expect("recovered dictionary");
         assert_eq!(
@@ -11676,7 +11685,8 @@ mod tests {
         let mut pdf = Pdf::open_mem_owned(bytes).expect("open");
         let handle: ObjectHandle = pdf.get_object_handle(ObjectRef::new(2, 0));
 
-        pdf.resolve(&handle)
+        handle
+            .try_is_scalar()
             .expect("qpdf-style duplicate-key recovery");
 
         assert_eq!(
@@ -11853,7 +11863,7 @@ mod tests {
 
         let mut pdf = Pdf::open_mem_owned(bytes).expect("open");
         let handle: ObjectHandle = pdf.get_object_handle(ObjectRef::new(2, 0));
-        pdf.resolve(&handle).expect("flpdf recovery");
+        handle.try_is_scalar().expect("flpdf recovery");
         assert_eq!(
             pdf.repair_diagnostics()
                 .entries()
@@ -11899,7 +11909,7 @@ mod tests {
         let mut pdf = Pdf::open_mem_owned(bytes).expect("open");
         let handle: ObjectHandle = pdf.get_object_handle(ObjectRef::new(2, 0));
 
-        pdf.resolve(&handle).expect("resolve");
+        handle.try_is_scalar().expect("resolve");
 
         assert_eq!(
             handle
@@ -11929,7 +11939,7 @@ mod tests {
         ]);
         let mut pdf = Pdf::open_mem_owned(bytes).expect("open");
         let handle: crate::ObjectHandle = pdf.get_object_handle(ObjectRef::new(2, 0));
-        let outcome = pdf.resolve(&handle);
+        let outcome = handle.try_is_scalar().map(|_| ());
         let warnings = pdf
             .repair_diagnostics()
             .entries()
@@ -11959,7 +11969,7 @@ mod tests {
         )
         .expect("open strict fixture");
         let handle: crate::ObjectHandle = pdf.get_object_handle(ObjectRef::new(2, 0));
-        let outcome = pdf.resolve(&handle);
+        let outcome = handle.try_is_scalar().map(|_| ());
         let warnings = pdf
             .repair_diagnostics()
             .entries()
@@ -12051,7 +12061,8 @@ mod tests {
         );
         let handle: ObjectHandle = pdf.get_object_handle(ObjectRef::new(9, 0));
 
-        pdf.resolve(&handle)
+        handle
+            .try_is_scalar()
             .expect("qpdf catches EOF while recording the cache extent");
         assert!(handle.is_null());
         let messages: Vec<String> = pdf
@@ -12096,7 +12107,7 @@ mod tests {
         let mut pdf = Pdf::open_mem_owned(bytes).expect("open");
         let handle: ObjectHandle = pdf.get_object_handle(ObjectRef::new(2, 0));
 
-        pdf.resolve(&handle).expect("resolve");
+        handle.try_is_scalar().expect("resolve");
 
         assert_eq!(
             handle
@@ -12162,7 +12173,8 @@ mod tests {
         let mut pdf = Pdf::open_mem_owned(bytes).expect("open");
         let handle: ObjectHandle = pdf.get_object_handle(ObjectRef::new(2, 0));
 
-        pdf.resolve(&handle)
+        handle
+            .try_is_scalar()
             .expect("qpdf recovers a stray close parenthesis");
 
         let dictionary = handle.as_dictionary().expect("recovered dictionary");
@@ -12191,7 +12203,8 @@ mod tests {
         ]);
         let mut pdf = Pdf::open_mem_owned(bytes).expect("open");
         let handle: ObjectHandle = pdf.get_object_handle(ObjectRef::new(2, 0));
-        pdf.resolve(&handle)
+        handle
+            .try_is_scalar()
             .expect("qpdf catches a body parse failure and resolves to null");
         assert!(handle.is_null());
 
@@ -12370,7 +12383,8 @@ mod tests {
         )
         .expect("open strict mismatch fixture");
         let requested: ObjectHandle = pdf.get_object_handle(ObjectRef::new(2, 0));
-        pdf.resolve(&requested)
+        requested
+            .try_is_scalar()
             .expect("qpdf resolves the requested slot to null after warning");
 
         assert!(requested.is_null());
@@ -12421,7 +12435,8 @@ mod tests {
             )
             .expect("open repair fixture");
             let handle: ObjectHandle = pdf.get_object_handle(ObjectRef::new(2, 0));
-            pdf.resolve(&handle)
+            handle
+                .try_is_scalar()
                 .expect("repair mode recovers an unusable stream length");
 
             let messages: Vec<_> = pdf
@@ -12782,7 +12797,8 @@ mod tests {
             )
             .expect("open strict malformed-length fixture");
             let handle: ObjectHandle = pdf.get_object_handle(ObjectRef::new(2, 0));
-            pdf.resolve(&handle)
+            handle
+                .try_is_scalar()
                 .expect("qpdf catches the strict malformed-length failure");
             assert!(handle.is_null());
 
@@ -12902,7 +12918,8 @@ mod tests {
         .expect("open repair fixture");
         let handle: ObjectHandle = pdf.get_object_handle(ObjectRef::new(2, 0));
 
-        pdf.resolve(&handle)
+        handle
+            .try_is_scalar()
             .expect("bad framing enters qpdf's recovery arm");
         assert_eq!(
             handle
@@ -12935,7 +12952,8 @@ mod tests {
         .expect("open repair fixture");
         let handle: ObjectHandle = pdf.get_object_handle(ObjectRef::new(2, 0));
 
-        pdf.resolve(&handle)
+        handle
+            .try_is_scalar()
             .expect("qpdf allows a malformed framing token into recovery");
         assert_eq!(
             handle
@@ -12978,7 +12996,8 @@ mod tests {
         .expect("open repair fixture");
         let handle: ObjectHandle = pdf.get_object_handle(ObjectRef::new(2, 0));
 
-        pdf.resolve(&handle)
+        handle
+            .try_is_scalar()
             .expect("endobj is a valid qpdf recovery terminator");
         assert_eq!(
             handle
@@ -13012,7 +13031,8 @@ mod tests {
         .expect("open repair fixture");
         let handle: ObjectHandle = pdf.get_object_handle(ObjectRef::new(2, 0));
 
-        pdf.resolve(&handle)
+        handle
+            .try_is_scalar()
             .expect("a long rejected candidate still finds nested endstream");
         assert_eq!(
             handle
@@ -13046,7 +13066,8 @@ mod tests {
         let before = pdf.resolver.with_reader_mut(|reader| reader.seeks);
         let handle: ObjectHandle = pdf.get_object_handle(ObjectRef::new(2, 0));
 
-        pdf.resolve(&handle)
+        handle
+            .try_is_scalar()
             .expect("recovery must scan a long non-prefix payload");
 
         let seeks = pdf.resolver.with_reader_mut(|reader| reader.seeks) - before;
@@ -13096,7 +13117,7 @@ mod tests {
         )
         .expect("open repair fixture");
         let handle: ObjectHandle = pdf.get_object_handle(ObjectRef::new(2, 0));
-        pdf.resolve(&handle).expect("flpdf recovery");
+        handle.try_is_scalar().expect("flpdf recovery");
         assert_eq!(
             handle
                 .get_raw_stream_data()
@@ -13143,7 +13164,9 @@ mod tests {
         .expect("open repair fixture");
         let handle: ObjectHandle = pdf.get_object_handle(ObjectRef::new(2, 0));
 
-        pdf.resolve(&handle).expect("repair the bad framing length");
+        handle
+            .try_is_scalar()
+            .expect("repair the bad framing length");
 
         let diagnostics: Vec<_> = pdf
             .repair_diagnostics()
@@ -13184,7 +13207,9 @@ mod tests {
         .expect("open repair fixture");
         let handle: ObjectHandle = pdf.get_object_handle(ObjectRef::new(2, 0));
 
-        pdf.resolve(&handle).expect("repair the bad framing length");
+        handle
+            .try_is_scalar()
+            .expect("repair the bad framing length");
 
         let diagnostics: Vec<_> = pdf
             .repair_diagnostics()
@@ -13224,7 +13249,8 @@ mod tests {
         });
         let handle: ObjectHandle = pdf.get_object_handle(ObjectRef::new(2, 0));
 
-        pdf.resolve(&handle)
+        handle
+            .try_is_scalar()
             .expect("stream recovery scans the live source");
         assert_eq!(
             handle
@@ -13411,7 +13437,7 @@ mod tests {
         .expect("open");
         let handle: ObjectHandle = pdf.get_object_handle(ObjectRef::new(4, 0));
 
-        pdf.resolve(&handle).expect("resolve");
+        handle.try_is_scalar().expect("resolve");
 
         assert_eq!(
             handle
@@ -13448,7 +13474,8 @@ mod tests {
         );
         let handle: ObjectHandle = pdf.get_object_handle(ObjectRef::new(9, 0));
 
-        pdf.resolve(&handle)
+        handle
+            .try_is_scalar()
             .expect("qpdf catches the missing endstream framing error");
         assert!(handle.is_null());
         let messages: Vec<String> = pdf
@@ -13503,7 +13530,8 @@ mod tests {
         );
         let handle: ObjectHandle = pdf.get_object_handle(ObjectRef::new(9, 0));
 
-        pdf.resolve(&handle)
+        handle
+            .try_is_scalar()
             .expect("qpdf catches EOF while recording the cache extent");
         assert!(handle.is_null());
         let messages: Vec<String> = pdf
@@ -13551,7 +13579,8 @@ mod tests {
         let handle: ObjectHandle = pdf.get_object_handle(ObjectRef::new(1, 0));
         pdf.resolver.with_reader_mut(|reader| reader.broken = true);
 
-        pdf.resolve(&handle)
+        handle
+            .try_is_scalar()
             .expect("dispatch I/O failure is caught like qpdf");
         assert!(handle.is_null());
         assert!(pdf.repair_diagnostics().entries().iter().any(|warning| {
@@ -13605,7 +13634,8 @@ mod tests {
         let handle: ObjectHandle = pdf.get_object_handle(ObjectRef::new(1, 0));
         pdf.resolver.with_reader_mut(|reader| reader.broken = true);
 
-        pdf.resolve(&handle)
+        handle
+            .try_is_scalar()
             .expect("qpdf catches std::exception, warns, and resolves to null");
         assert!(handle.is_null());
         let diagnostics = pdf.repair_diagnostics();
@@ -13716,7 +13746,8 @@ mod tests {
         .expect("open strict fixture");
         let handle: ObjectHandle = pdf.get_object_handle(ObjectRef::new(2, 0));
 
-        pdf.resolve(&handle)
+        handle
+            .try_is_scalar()
             .expect("qpdf catches the unusable outer /Length");
         assert!(handle.is_null());
 
@@ -13802,7 +13833,8 @@ mod tests {
 
         let mut pdf = Pdf::open_mem_owned(bytes).expect("open");
         let annotation: ObjectHandle = pdf.get_object_handle(ObjectRef::new(4, 0));
-        pdf.resolve(&annotation)
+        annotation
+            .try_is_scalar()
             .expect("the annotation dictionary resolves");
 
         let ap = annotation
@@ -13832,7 +13864,7 @@ mod tests {
              indirect handle, not resolved it eagerly or copied its value"
         );
 
-        pdf.resolve(&n).expect(
+        n.try_is_scalar().expect(
             "a nested handle reached only by navigating /AP /N, never re-fetched \
              through `Pdf::get_object_handle`, must still resolve through the \
              owning document",
@@ -13970,7 +14002,8 @@ mod tests {
                 );
                 let handle: ObjectHandle = pdf.get_object_handle(ObjectRef::new(1, 0));
 
-                pdf.resolve(&handle)
+                handle
+                    .try_is_scalar()
                     .expect("qpdf catches the unusable chained /Length");
                 assert!(handle.is_null());
                 assert!(pdf
@@ -14167,7 +14200,7 @@ mod tests {
         assert!(!pdf.reconstructed_xref());
 
         let handle: ObjectHandle = pdf.get_object_handle(ObjectRef::new(1, 0));
-        pdf.resolve(&handle).expect("resolved after recovery");
+        handle.try_is_scalar().expect("resolved after recovery");
         assert_eq!(
             handle.unparse_resolved(),
             b"(recovered)",
@@ -14219,13 +14252,15 @@ mod tests {
         // contract is distinct from the public probe's removal_proxy, which
         // observes replaceObject(..., newNull()).
         let recovery_trigger: ObjectHandle = pdf.get_object_handle(ObjectRef::new(1, 0));
-        pdf.resolve(&recovery_trigger)
+        recovery_trigger
+            .try_is_scalar()
             .expect("the damaged header must recover object 1");
 
         assert!(pdf.reconstructed_xref());
         assert!(pdf.get_xref_table().contains_key(&removed_ref));
         let recovered: ObjectHandle = pdf.get_object_handle(removed_ref);
-        pdf.resolve(&recovered)
+        recovered
+            .try_is_scalar()
             .expect("reconstruction must mint a canonical handle");
         assert_eq!(recovered.as_integer(), Some(99));
         assert!(pdf.resolver.registered_handle(removed_ref).is_some());
@@ -14261,7 +14296,8 @@ mod tests {
         replace(&mut pdf, replacement_ref, 71);
 
         let recovery_trigger: ObjectHandle = pdf.get_object_handle(ObjectRef::new(1, 0));
-        pdf.resolve(&recovery_trigger)
+        recovery_trigger
+            .try_is_scalar()
             .expect("damaged header must trigger xref reconstruction");
 
         assert!(pdf.reconstructed_xref());
@@ -14286,7 +14322,8 @@ mod tests {
         }
 
         let recovered_source: ObjectHandle = pdf.get_object_handle(source_ref);
-        pdf.resolve(&recovered_source)
+        recovered_source
+            .try_is_scalar()
             .expect("same-generation replacement must keep a canonical handle");
         assert_eq!(
             recovered_source.as_integer(),
@@ -14294,7 +14331,8 @@ mod tests {
             "qpdf keeps the same-generation replacement cached across recovery"
         );
         let replacement: ObjectHandle = pdf.get_object_handle(replacement_ref);
-        pdf.resolve(&replacement)
+        replacement
+            .try_is_scalar()
             .expect("different-generation replacement must stay initialized");
         assert_eq!(replacement.as_integer(), Some(71));
         assert!(pdf.resolver.registered_handle(source_ref).is_some());
@@ -14322,13 +14360,15 @@ mod tests {
         let removed_ref = ObjectRef::new(3, 0);
 
         let recovery_trigger: ObjectHandle = pdf.get_object_handle(ObjectRef::new(1, 0));
-        pdf.resolve(&recovery_trigger)
+        recovery_trigger
+            .try_is_scalar()
             .expect("the damaged header must recover object 1");
 
         assert!(pdf.reconstructed_xref());
         assert!(pdf.resolver.xref_entry(removed_ref).is_some());
         let recovered: ObjectHandle = pdf.get_object_handle(removed_ref);
-        pdf.resolve(&recovered)
+        recovered
+            .try_is_scalar()
             .expect("reconstruction must re-register the stale body after xref loading clears it");
         assert_eq!(recovered.as_integer(), Some(99));
         assert!(pdf
@@ -14348,7 +14388,8 @@ mod tests {
             Pdf::open_mem_owned_with_options(synthetic_mismatch_pdf(true), options).expect("open");
 
         let recovered: ObjectHandle = pdf.get_object_handle(ObjectRef::new(1, 0));
-        pdf.resolve(&recovered)
+        recovered
+            .try_is_scalar()
             .expect("public resolve must use the reconstructed xref");
         assert_eq!(
             recovered.as_string(),
@@ -14366,8 +14407,8 @@ mod tests {
         )
         .expect("open second recovery fixture");
         let second_recovered: ObjectHandle = second_pdf.get_object_handle(ObjectRef::new(1, 0));
-        second_pdf
-            .resolve(&second_recovered)
+        second_recovered
+            .try_is_scalar()
             .expect("canonical resolver must use the reconstructed xref");
         assert_eq!(second_recovered.as_string(), Some(b"recovered".to_vec()));
     }
@@ -14384,7 +14425,8 @@ mod tests {
         .expect("open absent-recovery fixture");
         let handle: ObjectHandle = pdf.get_object_handle(ObjectRef::new(1, 0));
 
-        pdf.resolve(&handle)
+        handle
+            .try_is_scalar()
             .expect("absent recovered object must resolve to null");
         assert!(pdf.reconstructed_xref());
         assert!(handle.is_resolved());
@@ -14405,7 +14447,8 @@ mod tests {
         .expect("open");
 
         let handle: ObjectHandle = pdf.get_object_handle(object_ref);
-        pdf.resolve(&handle)
+        handle
+            .try_is_scalar()
             .expect("an unindexed packed member must resolve to null");
         assert!(handle.is_null());
         assert!(pdf.reconstructed_xref());
@@ -14424,7 +14467,8 @@ mod tests {
         .expect("open malformed-recovery fixture");
 
         let stream: ObjectHandle = pdf.get_object_handle(ObjectRef::new(1, 0));
-        pdf.resolve(&stream)
+        stream
+            .try_is_scalar()
             .expect("qpdf stream recovery must run after xref reconstruction");
         assert!(stream.as_stream_dict().is_some(), "recovered stream");
         assert_eq!(
@@ -14453,7 +14497,8 @@ mod tests {
         assert!(!pdf.reconstructed_xref());
 
         let handle: ObjectHandle = pdf.get_object_handle(ObjectRef::new(1, 0));
-        pdf.resolve(&handle)
+        handle
+            .try_is_scalar()
             .expect("qpdf catches a type-1 header mismatch");
         assert!(handle.is_null());
         assert!(pdf
@@ -14483,7 +14528,8 @@ mod tests {
         assert!(!pdf.reconstructed_xref());
 
         let handle: ObjectHandle = pdf.get_object_handle(ObjectRef::new(1, 0));
-        pdf.resolve(&handle)
+        handle
+            .try_is_scalar()
             .expect("absent post-rebuild resolves to null without panicking");
         assert!(handle.is_null(), "absent post-rebuild must resolve to null");
 
@@ -14523,7 +14569,9 @@ mod tests {
         let mut pdf = Pdf::open_mem_owned_with_options(bytes, options).expect("open");
 
         let handle: ObjectHandle = pdf.get_object_handle(ObjectRef::new(99, 0));
-        pdf.resolve(&handle).expect("absent entry resolves to null");
+        handle
+            .try_is_scalar()
+            .expect("absent entry resolves to null");
         assert!(handle.is_null(), "absent entry must resolve to null");
         assert!(
             !pdf.reconstructed_xref(),
@@ -14539,7 +14587,8 @@ mod tests {
             .insert_xref_entry(object_ref, XrefEntry::Uncompressed { offset: 0 });
 
         let handle: ObjectHandle = pdf.get_object_handle(object_ref);
-        pdf.resolve(&handle)
+        handle
+            .try_is_scalar()
             .expect("qpdf treats an offset-zero object as null");
 
         assert!(handle.is_null(), "offset zero must resolve to null");
@@ -15083,7 +15132,7 @@ mod tests {
 
         // First resolution triggers reconstruction and sets reconstructed_xref = true
         let recovery_trigger: ObjectHandle = pdf.get_object_handle(ObjectRef::new(1, 0));
-        let _ = pdf.resolve(&recovery_trigger);
+        let _ = recovery_trigger.try_is_scalar();
         assert!(pdf.reconstructed_xref());
 
         // Simulate a second recovery trigger by invoking reconstruct_xref_and_retry directly
@@ -15178,7 +15227,8 @@ mod tests {
             .expect("open malformed-object fixture");
 
         let handle: ObjectHandle = pdf.get_object_handle(ObjectRef::new(1, 0));
-        pdf.resolve(&handle)
+        handle
+            .try_is_scalar()
             .expect("the reconstructed stream must recover its length");
         assert_eq!(
             handle
@@ -15199,11 +15249,13 @@ mod tests {
         };
         let mut pdf = Pdf::open_mem_owned_with_options(bytes, options).expect("open fixture");
         let object_one: ObjectHandle = pdf.get_object_handle(ObjectRef::new(1, 0));
-        pdf.resolve(&object_one)
+        object_one
+            .try_is_scalar()
             .expect("canonical resolution must recover object 1");
 
         let object_two: ObjectHandle = pdf.get_object_handle(ObjectRef::new(2, 0));
-        pdf.resolve(&object_two)
+        object_two
+            .try_is_scalar()
             .expect("canonical cache must use the rebuilt offset");
         assert_eq!(object_two.as_integer(), Some(22));
         assert!(pdf.reconstructed_xref());
@@ -15226,7 +15278,8 @@ mod tests {
         assert!(!pdf.canonical_live_object_refs().contains(&discovered_ref));
 
         let recovered: ObjectHandle = pdf.get_object_handle(recovered_ref);
-        pdf.resolve(&recovered)
+        recovered
+            .try_is_scalar()
             .expect("handle resolution must reconstruct the xref");
 
         assert!(pdf.reconstructed_xref());
@@ -15250,7 +15303,8 @@ mod tests {
             .expect("open object-stream recovery fixture");
 
         let handle: ObjectHandle = pdf.get_object_handle(ObjectRef::new(7, 0));
-        pdf.resolve(&handle)
+        handle
+            .try_is_scalar()
             .expect("an unindexed packed member must resolve to null");
         assert_eq!(
             handle.unparse_resolved(),
@@ -15277,7 +15331,8 @@ mod tests {
         });
 
         let handle: ObjectHandle = pdf.get_object_handle(ObjectRef::new(1, 0));
-        pdf.resolve(&handle)
+        handle
+            .try_is_scalar()
             .expect("qpdf catches the reconstruction parse error");
         assert!(handle.is_null());
         assert!(pdf

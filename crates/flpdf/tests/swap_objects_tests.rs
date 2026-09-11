@@ -49,8 +49,11 @@ fn swap_objects_preserves_alias_identity_and_swaps_values() {
 
     assert!(first.is_same_object_as(&first_alias));
     assert!(second.is_same_object_as(&second_alias));
-    assert_eq!(first.get_key(b"/Marker").as_integer(), Some(2));
-    assert_eq!(second.get_key(b"/Marker").as_integer(), Some(1));
+    assert_eq!(first.try_get_key(b"/Marker").unwrap().as_integer(), Some(2));
+    assert_eq!(
+        second.try_get_key(b"/Marker").unwrap().as_integer(),
+        Some(1)
+    );
     assert!(pdf.get_object_handle(first_ref).is_same_object_as(&first));
     assert!(pdf.get_object_handle(second_ref).is_same_object_as(&second));
 }
@@ -70,8 +73,11 @@ fn swap_objects_resolves_lazy_source_values_before_swapping() {
 
     assert!(first.is_resolved());
     assert!(second.is_resolved());
-    assert_eq!(first.get_key(b"/Marker").as_integer(), Some(2));
-    assert_eq!(second.get_key(b"/Marker").as_integer(), Some(1));
+    assert_eq!(first.try_get_key(b"/Marker").unwrap().as_integer(), Some(2));
+    assert_eq!(
+        second.try_get_key(b"/Marker").unwrap().as_integer(),
+        Some(1)
+    );
 }
 
 #[test]
@@ -113,7 +119,8 @@ fn swap_objects_resolves_an_unknown_generation_to_null() {
     assert!(first.is_null());
     assert_eq!(
         pdf.get_object_handle(unknown)
-            .get_key(b"/Marker")
+            .try_get_key(b"/Marker")
+            .unwrap()
             .as_integer(),
         Some(1)
     );
@@ -150,13 +157,15 @@ fn swapping_two_slots_with_one_shared_value_is_a_noop() {
 
     assert_eq!(
         pdf.get_object_handle(root_ref)
-            .get_key(b"/Marker")
+            .try_get_key(b"/Marker")
+            .unwrap()
             .as_integer(),
         Some(7)
     );
     assert_eq!(
         pdf.get_object_handle(pages_ref)
-            .get_key(b"/Marker")
+            .try_get_key(b"/Marker")
+            .unwrap()
             .as_integer(),
         Some(7)
     );
@@ -194,7 +203,8 @@ fn swap_objects_preserves_a_replaced_null_slot_in_the_canonical_cache() {
     );
     assert_eq!(
         pdf.get_object_handle(deleted_ref)
-            .get_key(b"/Marker")
+            .try_get_key(b"/Marker")
+            .unwrap()
             .as_integer(),
         Some(9)
     );

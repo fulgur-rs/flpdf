@@ -77,7 +77,7 @@ use std::collections::BTreeSet;
 ///
 /// - [`Error::Unsupported`] when `page_ref` is not a `/Type /Page` dictionary
 ///   or when the object-number space is exhausted.
-/// - Any error propagated from [`Pdf::resolve`] or content extraction.
+/// - Any error propagated from canonical ObjectHandle resolution or content extraction.
 pub(crate) fn get_form_xobject_for_page<R: Read + Seek>(
     pdf: &mut Pdf<R>,
     page_ref: ObjectRef,
@@ -106,7 +106,7 @@ pub(crate) fn get_form_xobject_for_page<R: Read + Seek>(
 ///
 /// - [`Error::Unsupported`] when the source page cannot be converted or when
 ///   the destination object-number space is exhausted.
-/// - Any error propagated from [`Pdf::resolve`] or the cross-document copier.
+/// - Any error propagated from canonical ObjectHandle resolution or the cross-document copier.
 #[cfg(test)]
 pub(crate) fn import_page_as_form_xobject<RS, RT>(
     dest: &mut Pdf<RT>,
@@ -149,7 +149,7 @@ where
 /// - [`Error::Unsupported`] when a source page cannot be converted, when the
 ///   destination object-number space is exhausted, or when an imported XObject
 ///   is unexpectedly absent from the copy map.
-/// - Any error propagated from [`Pdf::resolve`] or the cross-document copier.
+/// - Any error propagated from canonical ObjectHandle resolution or the cross-document copier.
 #[cfg(test)]
 pub(crate) fn import_pages_as_form_xobjects<RS, RT>(
     dest: &mut Pdf<RT>,
@@ -226,7 +226,7 @@ fn leaf_box_array<R: Read + Seek>(
     key: &[u8],
 ) -> Result<Option<Vec<ObjectHandle>>> {
     let page = pdf.get_object_handle(page_ref);
-    pdf.resolve(&page)?;
+    page.try_is_scalar()?;
     let Some(dict) = page.as_dictionary() else {
         return Ok(None);
     };
@@ -241,7 +241,7 @@ fn leaf_box_array<R: Read + Seek>(
     if val.is_null() {
         return Ok(None);
     }
-    resolve_rect_array(pdf, val, page_ref, key)
+    resolve_rect_array(val, page_ref, key)
 }
 
 /// Walk the `/Parent` chain looking for an inheritable box `key` as a raw
@@ -267,7 +267,7 @@ fn inherited_box_array<R: Read + Seek>(
         }
 
         let node = pdf.get_object_handle(current);
-        pdf.resolve(&node)?;
+        node.try_is_scalar()?;
         let Some(dict) = node.as_dictionary() else {
             return Ok(None);
         };
@@ -284,7 +284,7 @@ fn inherited_box_array<R: Read + Seek>(
         let parent_val = dict.get(b"/Parent".as_slice()).cloned();
 
         if let Some(value) = val {
-            if let Some(array) = resolve_rect_array(pdf, value, current, key)? {
+            if let Some(array) = resolve_rect_array(value, current, key)? {
                 return Ok(Some(array));
             }
         }
@@ -302,14 +302,13 @@ fn inherited_box_array<R: Read + Seek>(
 /// Coerce a box value (a direct array or a reference to one) into a handle
 /// rectangle array, validating it has at least four elements.
 #[cfg(test)]
-fn resolve_rect_array<R: Read + Seek>(
-    pdf: &mut Pdf<R>,
+fn resolve_rect_array(
     val: ObjectHandle,
     node: ObjectRef,
     key: &[u8],
 ) -> Result<Option<Vec<ObjectHandle>>> {
     if val.is_indirect() || val.object_ref().is_some() {
-        pdf.resolve(&val)?;
+        val.try_is_scalar()?;
     }
     let resolved = val;
     let Some(arr) = resolved.as_array() else {
@@ -405,7 +404,7 @@ fn inherited_rotate_attribute<R: Read + Seek>(
 
         let (rotate_val, parent_val) = {
             let node = pdf.get_object_handle(current);
-            pdf.resolve(&node)?;
+            node.try_is_scalar()?;
             let Some(dict) = node.as_dictionary() else {
                 return Ok((false, 0));
             };
@@ -418,7 +417,7 @@ fn inherited_rotate_attribute<R: Read + Seek>(
         if let Some(val) = rotate_val {
             // /Rotate may be stored as an indirect reference; resolve it first.
             if val.is_indirect() || val.object_ref().is_some() {
-                pdf.resolve(&val)?;
+                val.try_is_scalar()?;
             }
             let resolved = val;
             if let Some(n) = resolved.as_integer() {
@@ -445,7 +444,7 @@ fn inherited_rotate_attribute<R: Read + Seek>(
 #[cfg(test)]
 fn leaf_user_unit<R: Read + Seek>(pdf: &mut Pdf<R>, page_ref: ObjectRef) -> Result<(bool, f64)> {
     let page = pdf.get_object_handle(page_ref);
-    pdf.resolve(&page)?;
+    page.try_is_scalar()?;
     let Some(dict) = page.as_dictionary() else {
         return Ok((false, 1.0));
     };
@@ -454,7 +453,7 @@ fn leaf_user_unit<R: Read + Seek>(pdf: &mut Pdf<R>, page_ref: ObjectRef) -> Resu
         return Ok((false, 1.0));
     };
     if val.is_indirect() || val.object_ref().is_some() {
-        pdf.resolve(&val)?;
+        val.try_is_scalar()?;
     }
     let resolved = val;
     if resolved.is_null() {
@@ -527,7 +526,7 @@ fn page_group<R: Read + Seek>(
     page_ref: ObjectRef,
 ) -> Result<Option<ObjectHandle>> {
     let page = pdf.get_object_handle(page_ref);
-    pdf.resolve(&page)?;
+    page.try_is_scalar()?;
     let Some(dict) = page.as_dictionary() else {
         return Ok(None);
     };
@@ -541,7 +540,7 @@ fn page_group<R: Read + Seek>(
         // direct dict), then both branches shallow-copy so the returned
         // handle never shares mutable identity with the page's own /Group.
         Some(value) if value.is_indirect() || value.object_ref().is_some() => {
-            pdf.resolve(&value)?;
+            value.try_is_scalar()?;
             Ok(Some(value.shallow_copy()?))
         }
         Some(direct) => Ok(Some(direct.shallow_copy()?)),
@@ -668,7 +667,7 @@ mod tests {
     /// Resolve the Form XObject at `xref` and return its stream.
     fn form_stream<R: Read + Seek>(pdf: &mut Pdf<R>, xref: ObjectRef) -> TestStream {
         let stream = pdf.get_object_handle(xref);
-        pdf.resolve(&stream).unwrap();
+        stream.try_is_scalar().unwrap();
         let dict = stream
             .as_stream_dict()
             .expect("Form XObject must be a stream")
@@ -1095,7 +1094,7 @@ mod tests {
             None => panic!("F1 should be a reference"), // cov:ignore: defensive — fixture guarantees a reference
         };
         let font_obj = dest.get_object_handle(font_ref);
-        dest.resolve(&font_obj).unwrap();
+        font_obj.try_is_scalar().unwrap();
         let font = TestHandle(font_obj)
             .as_dict()
             .expect("font ref resolves to a dict in dest");
@@ -1175,7 +1174,7 @@ mod tests {
             "the shared font must be copied into dest exactly once"
         );
         let font_obj = dest.get_object_handle(font_ref0);
-        dest.resolve(&font_obj).unwrap();
+        font_obj.try_is_scalar().unwrap();
         let font = TestHandle(font_obj)
             .as_dict()
             .expect("font ref resolves to a dict in dest");
@@ -1287,7 +1286,7 @@ mod tests {
             1,
         ));
         let value = pdf.get_object_handle(ObjectRef::new(3, 0));
-        let got = resolve_rect_array(&mut pdf, value, ObjectRef::new(1, 0), b"TrimBox").unwrap();
+        let got = resolve_rect_array(value, ObjectRef::new(1, 0), b"TrimBox").unwrap();
         assert!(got.is_none());
     }
 
@@ -1306,7 +1305,7 @@ mod tests {
             1,
         ));
         let value = pdf.get_object_handle(ObjectRef::new(3, 0));
-        let err = resolve_rect_array(&mut pdf, value, ObjectRef::new(1, 0), b"TrimBox");
+        let err = resolve_rect_array(value, ObjectRef::new(1, 0), b"TrimBox");
         assert!(matches!(err, Err(Error::Unsupported(_))));
     }
 
@@ -1419,9 +1418,9 @@ mod tests {
             .unwrap();
 
         let page = pdf.get_object_handle(ObjectRef::new(3, 0));
-        pdf.resolve(&page).unwrap();
-        let original_group = page.get_key(b"/Group");
-        let original_s = original_group.get_key(b"/S");
+        page.try_is_scalar().unwrap();
+        let original_group = page.try_get_key(b"/Group").unwrap();
+        let original_s = original_group.try_get_key(b"/S").unwrap();
         assert_eq!(
             original_s.as_name(),
             Some(b"Transparency".to_vec()),

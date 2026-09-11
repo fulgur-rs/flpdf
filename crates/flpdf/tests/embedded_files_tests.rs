@@ -72,7 +72,9 @@ fn handle_dictionary(entries: Vec<(&[u8], ObjectHandle)>) -> ObjectHandle {
 
 fn resolved_handle(pdf: &mut Pdf<Cursor<Vec<u8>>>, object_ref: ObjectRef) -> ObjectHandle {
     let handle = pdf.get_object_handle(object_ref);
-    pdf.resolve(&handle).expect("resolve canonical test object");
+    handle
+        .try_is_scalar()
+        .expect("resolve canonical test object");
     handle
 }
 
@@ -100,9 +102,9 @@ fn make_filespec(pdf: &mut Pdf<Cursor<Vec<u8>>>, filename: &[u8]) -> ObjectHandl
 
 fn embedded_names_handle(pdf: &mut Pdf<Cursor<Vec<u8>>>) -> ObjectHandle {
     let catalog = catalog_handle(pdf);
-    let mut names = catalog.get_key(b"/Names");
+    let mut names = catalog.try_get_key(b"/Names").unwrap();
     for _ in 0..8 {
-        pdf.resolve(&names).expect("resolve /Names");
+        names.try_is_scalar().expect("resolve /Names");
         if names.as_dictionary().is_some() {
             return names;
         }
@@ -456,10 +458,14 @@ fn insert_does_not_allocate_for_direct_names_dictionary() {
     let mut pdf = open(build_single_level_pdf());
     let catalog_ref = pdf.root_ref().expect("catalog");
     let catalog: ObjectHandle = pdf.get_object_handle(catalog_ref);
-    pdf.resolve(&catalog).expect("resolve catalog");
-    let names_ref = catalog.get_key(b"/Names").object_ref().expect("Names ref");
+    catalog.try_is_scalar().expect("resolve catalog");
+    let names_ref = catalog
+        .try_get_key(b"/Names")
+        .unwrap()
+        .object_ref()
+        .expect("Names ref");
     let names = pdf.get_object_handle(names_ref);
-    pdf.resolve(&names).expect("resolve Names");
+    names.try_is_scalar().expect("resolve Names");
     catalog
         .replace_key(b"/Names", names.shallow_copy().expect("copy Names"))
         .expect("make Names direct");
@@ -509,10 +515,10 @@ fn inserting_into_direct_embedded_files_root_preserves_it() {
 
     let catalog_ref = pdf.root_ref().expect("catalog");
     let catalog: ObjectHandle = pdf.get_object_handle(catalog_ref);
-    pdf.resolve(&catalog).expect("resolve catalog");
-    let names = catalog.get_key(b"/Names");
+    catalog.try_is_scalar().expect("resolve catalog");
+    let names = catalog.try_get_key(b"/Names").unwrap();
     assert!(names.is_direct(), "direct Names must remain direct");
-    let embedded_files = names.get_key(b"/EmbeddedFiles");
+    let embedded_files = names.try_get_key(b"/EmbeddedFiles").unwrap();
     assert!(
         embedded_files.is_direct(),
         "direct EmbeddedFiles root must remain direct"
@@ -635,7 +641,8 @@ fn writer_second_insert_mutates_existing_tree_root() {
 
     let first_root = {
         embedded_names_handle(&mut pdf)
-            .get_key(b"/EmbeddedFiles")
+            .try_get_key(b"/EmbeddedFiles")
+            .unwrap()
             .object_ref()
             .expect("tree root")
     };
@@ -644,7 +651,7 @@ fn writer_second_insert_mutates_existing_tree_root() {
 
     let names = embedded_names_handle(&mut pdf);
     assert_eq!(
-        names.get_key(b"/EmbeddedFiles").object_ref(),
+        names.try_get_key(b"/EmbeddedFiles").unwrap().object_ref(),
         Some(first_root),
         "qpdf helper insertion mutates the existing root instead of rebuilding it"
     );
@@ -700,7 +707,8 @@ fn writer_delete_mutates_existing_nonempty_tree_root() {
 
     let root_before = {
         embedded_names_handle(&mut pdf)
-            .get_key(b"/EmbeddedFiles")
+            .try_get_key(b"/EmbeddedFiles")
+            .unwrap()
             .object_ref()
             .expect("tree root")
     };
@@ -709,7 +717,7 @@ fn writer_delete_mutates_existing_nonempty_tree_root() {
 
     let names = embedded_names_handle(&mut pdf);
     assert_eq!(
-        names.get_key(b"/EmbeddedFiles").object_ref(),
+        names.try_get_key(b"/EmbeddedFiles").unwrap().object_ref(),
         Some(root_before)
     );
     assert_eq!(
@@ -777,32 +785,42 @@ fn writer_large_insert_produces_kids() {
     // indirect root created by `QPDFNameTreeObjectHelper::newEmpty`.
     let names = embedded_names_handle(&mut pdf);
     let ef_root_ref = names
-        .get_key(b"/EmbeddedFiles")
+        .try_get_key(b"/EmbeddedFiles")
+        .unwrap()
         .object_ref()
         .expect("/EmbeddedFiles");
     let ef_root = resolved_handle(&mut pdf, ef_root_ref);
 
     // The root must have /Kids (not a flat /Names leaf) because count > LEAF_MAX.
     assert!(
-        ef_root.get_key(b"/Kids").as_array().is_some(),
+        ef_root.try_get_key(b"/Kids").unwrap().as_array().is_some(),
         "tree root with {count} entries must have /Kids"
     );
     assert!(
-        ef_root.get_key(b"/Names").is_null(),
+        ef_root.try_get_key(b"/Names").unwrap().is_null(),
         "tree root with /Kids must not also have /Names"
     );
 
     // Verify /Limits on a leaf child.
-    let kids = ef_root.get_key(b"/Kids").as_array().expect("/Kids array");
+    let kids = ef_root
+        .try_get_key(b"/Kids")
+        .unwrap()
+        .as_array()
+        .expect("/Kids array");
     let first_leaf_ref = kids[0].object_ref().expect("first kid reference");
     let first_leaf = resolved_handle(&mut pdf, first_leaf_ref);
     assert!(
-        first_leaf.get_key(b"/Limits").as_array().is_some(),
+        first_leaf
+            .try_get_key(b"/Limits")
+            .unwrap()
+            .as_array()
+            .is_some(),
         "leaf node must have /Limits"
     );
     // /Limits must be a two-element array of strings.
     let limits = first_leaf
-        .get_key(b"/Limits")
+        .try_get_key(b"/Limits")
+        .unwrap()
         .as_array()
         .expect("/Limits array");
     assert_eq!(limits.len(), 2, "/Limits must have exactly 2 elements");
@@ -843,7 +861,8 @@ fn writer_single_insert_root_omits_limits() {
 
     let names = embedded_names_handle(&mut pdf);
     let ef_root_ref = names
-        .get_key(b"/EmbeddedFiles")
+        .try_get_key(b"/EmbeddedFiles")
+        .unwrap()
         .object_ref()
         .expect("/EmbeddedFiles");
     let ef_root = resolved_handle(&mut pdf, ef_root_ref);
@@ -851,21 +870,25 @@ fn writer_single_insert_root_omits_limits() {
     // Structural conformance (ISO 32000-2 §7.9.6; qpdf): a single-node root is a
     // /Names leaf-root that omits /Limits and is not a /Kids root.
     assert!(
-        ef_root.get_key(b"/Names").as_array().is_some(),
+        ef_root.try_get_key(b"/Names").unwrap().as_array().is_some(),
         "single-node root is a /Names leaf-root"
     );
     assert!(
-        ef_root.get_key(b"/Limits").is_null(),
+        ef_root.try_get_key(b"/Limits").unwrap().is_null(),
         "root omits /Limits (ISO 32000-2 §7.9.6; qpdf)"
     );
     assert!(
-        ef_root.get_key(b"/Kids").is_null(),
+        ef_root.try_get_key(b"/Kids").unwrap().is_null(),
         "single node is not a /Kids root"
     );
 
     // Substantive check: the /Names array actually names the single attachment,
     // confirming a populated single-node tree rather than an empty one.
-    let pairs = ef_root.get_key(b"/Names").as_array().expect("/Names array");
+    let pairs = ef_root
+        .try_get_key(b"/Names")
+        .unwrap()
+        .as_array()
+        .expect("/Names array");
     assert_eq!(
         pairs.len(),
         2,
@@ -973,12 +996,14 @@ fn writer_preserves_direct_dict_filespec_on_insert() {
     let catalog_ref = pdf.root_ref().expect("root");
     let catalog = resolved_handle(&mut pdf, catalog_ref);
     let names_ref = catalog
-        .get_key(b"/Names")
+        .try_get_key(b"/Names")
+        .unwrap()
         .object_ref()
         .expect("catalog /Names");
     let names_dict = resolved_handle(&mut pdf, names_ref);
     let ef_root_ref = names_dict
-        .get_key(b"/EmbeddedFiles")
+        .try_get_key(b"/EmbeddedFiles")
+        .unwrap()
         .object_ref()
         .expect("/EmbeddedFiles");
 
@@ -987,7 +1012,7 @@ fn writer_preserves_direct_dict_filespec_on_insert() {
     let mut stack = vec![ef_root_ref];
     while let Some(node_ref) = stack.pop() {
         let node = resolved_handle(&mut pdf, node_ref);
-        if let Some(arr) = node.get_key(b"/Names").as_array() {
+        if let Some(arr) = node.try_get_key(b"/Names").unwrap().as_array() {
             let mut it = arr.into_iter();
             while let (Some(k), Some(v)) = (it.next(), it.next()) {
                 if let Some(key) = k.as_string() {
@@ -995,7 +1020,7 @@ fn writer_preserves_direct_dict_filespec_on_insert() {
                 }
             }
         }
-        if let Some(kids) = node.get_key(b"/Kids").as_array() {
+        if let Some(kids) = node.try_get_key(b"/Kids").unwrap().as_array() {
             for kid in kids {
                 if let Some(r) = kid.object_ref() {
                     stack.push(r);
@@ -1346,7 +1371,7 @@ fn helper_lookup_returns_none_for_missing_key_in_existing_tree() {
 fn helper_listing_rejects_a_first_non_string_name_tree_key() {
     let mut pdf = open(build_no_names_pdf());
     let filespec = make_filespec(&mut pdf, b"valid.txt");
-    pdf.resolve(&filespec).expect("resolve filespec");
+    filespec.try_is_scalar().expect("resolve filespec");
     let tree = handle_dictionary(vec![(
         b"/Names",
         handle_array(vec![
@@ -1371,8 +1396,8 @@ fn helper_listing_skips_a_later_non_string_name_tree_key() {
     let mut pdf = open(build_no_names_pdf());
     let first = make_filespec(&mut pdf, b"first.txt");
     let last = make_filespec(&mut pdf, b"last.txt");
-    pdf.resolve(&first).expect("resolve first filespec");
-    pdf.resolve(&last).expect("resolve last filespec");
+    first.try_is_scalar().expect("resolve first filespec");
+    last.try_is_scalar().expect("resolve last filespec");
     let tree = handle_dictionary(vec![(
         b"/Names",
         handle_array(vec![
@@ -1406,7 +1431,7 @@ fn helper_replace_keeps_direct_names_dictionary_direct() {
     let filespec = make_filespec(&mut pdf, b"direct-names.txt");
     let catalog_ref = pdf.root_ref().expect("root");
     let catalog: ObjectHandle = pdf.get_object_handle(catalog_ref);
-    pdf.resolve(&catalog).expect("resolve catalog");
+    catalog.try_is_scalar().expect("resolve catalog");
     let names = ObjectHandle::dictionary(vec![(
         b"/Dests".to_vec(),
         ObjectHandle::dictionary(Vec::new()),
@@ -1420,8 +1445,8 @@ fn helper_replace_keeps_direct_names_dictionary_direct() {
         .expect("replace");
 
     let catalog: ObjectHandle = pdf.get_object_handle(catalog_ref);
-    pdf.resolve(&catalog).expect("resolve catalog");
-    let names = catalog.get_key(b"/Names");
+    catalog.try_is_scalar().expect("resolve catalog");
+    let names = catalog.try_get_key(b"/Names").unwrap();
     assert!(names.is_direct(), "direct Names must remain direct");
     assert!(
         names.as_dictionary().is_some(),
@@ -1444,7 +1469,7 @@ fn helper_replace_rejects_foreign_indirect_filespec_without_mutation() {
 
 #[test]
 fn helper_accepts_a_contextless_direct_filespec_from_a_promoted_container() {
-    let mut source = open(build_no_names_pdf());
+    let source = open(build_no_names_pdf());
     let owner = make_indirect(
         &source,
         handle_dictionary(vec![(
@@ -1452,8 +1477,8 @@ fn helper_accepts_a_contextless_direct_filespec_from_a_promoted_container() {
             handle_dictionary(vec![(b"/F", ObjectHandle::string(b"foreign.txt".to_vec()))]),
         )]),
     );
-    source.resolve(&owner).expect("resolve owner");
-    let foreign = owner.get_key(b"/FS");
+    owner.try_is_scalar().expect("resolve owner");
+    let foreign = owner.try_get_key(b"/FS").unwrap();
 
     let mut destination = open(build_no_names_pdf());
     // makeIndirectObject changes only its top value's owner. The nested
@@ -1595,7 +1620,7 @@ fn helper_remove_keeps_empty_embedded_files_tree() {
 
     let names = embedded_names_handle(&mut pdf);
     assert!(
-        names.get_key(b"/EmbeddedFiles").is_indirect(),
+        names.try_get_key(b"/EmbeddedFiles").unwrap().is_indirect(),
         "qpdf retains an indirect /EmbeddedFiles root after final remove"
     );
 }
@@ -1635,7 +1660,8 @@ fn helper_reads_repairs_direct_kid() {
 
     let names = embedded_names_handle(&mut pdf);
     let root = names
-        .get_key(b"/EmbeddedFiles")
+        .try_get_key(b"/EmbeddedFiles")
+        .unwrap()
         .as_dictionary()
         .expect("direct root");
     let kids = root
@@ -1656,8 +1682,12 @@ fn helper_persists_direct_kid_repair_before_empty_result() {
         .is_empty());
 
     let names = embedded_names_handle(&mut pdf);
-    let root = names.get_key(b"/EmbeddedFiles");
-    let kids = root.get_key(b"/Kids").as_array().expect("kids");
+    let root = names.try_get_key(b"/EmbeddedFiles").unwrap();
+    let kids = root
+        .try_get_key(b"/Kids")
+        .unwrap()
+        .as_array()
+        .expect("kids");
     assert!(kids.first().is_some_and(ObjectHandle::is_indirect));
 }
 
@@ -1672,8 +1702,12 @@ fn helper_persists_direct_kid_repair_before_valid_result_after_first_entry() {
         .contains_key(b"valid".as_slice()));
 
     let names = embedded_names_handle(&mut pdf);
-    let root = names.get_key(b"/EmbeddedFiles");
-    let kids = root.get_key(b"/Kids").as_array().expect("kids");
+    let root = names.try_get_key(b"/EmbeddedFiles").unwrap();
+    let kids = root
+        .try_get_key(b"/Kids")
+        .unwrap()
+        .as_array()
+        .expect("kids");
     assert!(kids.first().is_some_and(ObjectHandle::is_indirect));
     assert!(kids.get(1).is_some_and(ObjectHandle::is_direct));
 }
@@ -1689,8 +1723,12 @@ fn helper_lookup_persists_direct_kid_repair_before_find_none() {
         .is_none());
 
     let names = embedded_names_handle(&mut pdf);
-    let root = names.get_key(b"/EmbeddedFiles");
-    let kids = root.get_key(b"/Kids").as_array().expect("kids");
+    let root = names.try_get_key(b"/EmbeddedFiles").unwrap();
+    let kids = root
+        .try_get_key(b"/Kids")
+        .unwrap()
+        .as_array()
+        .expect("kids");
     assert!(kids.first().is_some_and(ObjectHandle::is_indirect));
 }
 
@@ -1704,8 +1742,12 @@ fn helper_remove_persists_direct_kid_repair_before_find_false() {
         .expect("qpdf resolves the malformed child to a null tree node"));
 
     let names = embedded_names_handle(&mut pdf);
-    let root = names.get_key(b"/EmbeddedFiles");
-    let kids = root.get_key(b"/Kids").as_array().expect("kids");
+    let root = names.try_get_key(b"/EmbeddedFiles").unwrap();
+    let kids = root
+        .try_get_key(b"/Kids")
+        .unwrap()
+        .as_array()
+        .expect("kids");
     assert!(kids.first().is_some_and(ObjectHandle::is_indirect));
 }
 
@@ -1719,7 +1761,11 @@ fn helper_remove_persists_indirect_root_repair_before_find_false() {
         .expect("qpdf resolves the malformed child to a null tree node"));
 
     let root = resolved_handle(&mut pdf, ObjectRef::new(3, 0));
-    let kids = root.get_key(b"/Kids").as_array().expect("kids");
+    let kids = root
+        .try_get_key(b"/Kids")
+        .unwrap()
+        .as_array()
+        .expect("kids");
     assert!(kids.first().is_some_and(ObjectHandle::is_indirect));
 }
 
@@ -1754,9 +1800,10 @@ fn helper_remove_missing_persists_direct_kid_repair() {
         .expect("absent remove"));
 
     let names = embedded_names_handle(&mut pdf);
-    let root = names.get_key(b"/EmbeddedFiles");
+    let root = names.try_get_key(b"/EmbeddedFiles").unwrap();
     assert!(root
-        .get_key(b"/Kids")
+        .try_get_key(b"/Kids")
+        .unwrap()
         .as_array()
         .and_then(|kids| kids.first().cloned())
         .is_some_and(|kid| kid.is_indirect()));
@@ -1929,7 +1976,8 @@ fn setting_embedded_file_date_creates_missing_params_dictionary() {
     assert!(stream
         .as_stream_dict()
         .expect("stream dictionary")
-        .get_key(b"/Params")
+        .try_get_key(b"/Params")
+        .unwrap()
         .is_null());
 
     let filespec_handle =
@@ -2031,7 +2079,11 @@ fn payload_round_trips_an_encrypted_compressed_attachment() {
         .expect("resolve /EF stream handle");
     let stream_dict = stream_handle.as_stream_dict().expect("stream dictionary");
     assert_eq!(
-        stream_dict.get_key(b"/Filter").as_name().as_deref(),
+        stream_dict
+            .try_get_key(b"/Filter")
+            .unwrap()
+            .as_name()
+            .as_deref(),
         Some(b"FlateDecode".as_slice()),
         "fixture must exercise a compressed, encrypted stream"
     );

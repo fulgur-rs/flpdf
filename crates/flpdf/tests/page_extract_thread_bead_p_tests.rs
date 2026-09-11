@@ -155,18 +155,19 @@ fn qpdf_job_in_place_page_selection_drops_dangling_bead_p() {
     let mut pdf = Pdf::open(BufReader::new(File::open(output).expect("open output")))
         .expect("reopen qpdf job output");
     let root = pdf.trailer_key_handle(b"Root");
-    pdf.resolve(&root).expect("resolve catalog");
-    let threads = root.get_key(b"/Threads");
-    pdf.resolve(&threads).expect("resolve threads");
+    root.try_is_scalar().expect("resolve catalog");
+    let threads = root.try_get_key(b"/Threads").unwrap();
+    threads.try_is_scalar().expect("resolve threads");
     let thread_ref = threads
         .as_array()
         .and_then(|items| items.first().cloned())
         .and_then(|item| item.object_ref())
         .expect("the thread entry must remain indirect");
     let thread = pdf.get_object_handle(thread_ref);
-    pdf.resolve(&thread).expect("resolve thread");
+    thread.try_is_scalar().expect("resolve thread");
     let mut bead_ref = thread
-        .get_key(b"/F")
+        .try_get_key(b"/F")
+        .unwrap()
         .object_ref()
         .expect("the thread first bead must remain indirect");
     let mut saw_dropped_page_bead = false;
@@ -177,14 +178,15 @@ fn qpdf_job_in_place_page_selection_drops_dangling_bead_p() {
             "the bead ring must not repeat early"
         );
         let bead = pdf.get_object_handle(bead_ref);
-        pdf.resolve(&bead).expect("resolve bead");
+        bead.try_is_scalar().expect("resolve bead");
         assert!(
             bead.as_dictionary().is_some(),
             "every ring bead must remain live"
         );
         saw_dropped_page_bead |= !bead.try_has_key(b"/P").expect("inspect bead /P");
         bead_ref = bead
-            .get_key(b"/N")
+            .try_get_key(b"/N")
+            .unwrap()
             .object_ref()
             .expect("the next bead must remain indirect");
     }
@@ -202,15 +204,15 @@ fn dangling_bead_p_dropped_and_page_gced() {
 
     // The bead pointing at the removed page loses its /P key entirely.
     let bead: ObjectHandle = pdf.get_object_handle(ObjectRef::new(12, 0));
-    pdf.resolve(&bead).expect("bead 12");
+    bead.try_is_scalar().expect("bead 12");
     assert!(bead.as_dictionary().is_some(), "bead 12 is a dict");
     assert!(
-        !bead.has_key(b"/P"),
+        !bead.try_has_key(b"/P").unwrap(),
         "bead 12 /P (removed page) must be dropped"
     );
     // The bead itself and its ring links survive (qpdf keeps the bead).
     assert!(
-        bead.get_key(b"/N").object_ref() == Some(ObjectRef::new(13, 0)),
+        bead.try_get_key(b"/N").unwrap().object_ref() == Some(ObjectRef::new(13, 0)),
         "bead 12 /N must be kept"
     );
 
@@ -229,10 +231,10 @@ fn dangling_bead_p_dropped_and_page_gced() {
 
     // Beads on surviving pages keep their /P.
     let bead: ObjectHandle = pdf.get_object_handle(ObjectRef::new(11, 0));
-    pdf.resolve(&bead).expect("bead 11");
+    bead.try_is_scalar().expect("bead 11");
     assert!(bead.as_dictionary().is_some(), "bead 11 is a dict");
     assert!(
-        bead.get_key(b"/P").object_ref() == Some(ObjectRef::new(3, 0)),
+        bead.try_get_key(b"/P").unwrap().object_ref() == Some(ObjectRef::new(3, 0)),
         "bead 11 /P (surviving page 1) must be kept"
     );
 
@@ -259,9 +261,10 @@ fn duplicate_selection_shares_bead_and_p_points_at_first_occurrence() {
     // Both copies' /B reference the same bead object (shallow clone shares /B).
     let bead_ref_of = |doc: &mut Pdf<Cursor<Vec<u8>>>, r: ObjectRef| -> ObjectRef {
         let page: ObjectHandle = doc.get_object_handle(r);
-        doc.resolve(&page).expect("page");
+        page.try_is_scalar().expect("page");
         assert!(page.as_dictionary().is_some(), "page is a dictionary");
-        page.get_key(b"/B")
+        page.try_get_key(b"/B")
+            .unwrap()
             .as_array()
             .and_then(|items| items.first().and_then(ObjectHandle::object_ref))
             .expect("/B[0] is an indirect ref")
@@ -275,10 +278,10 @@ fn duplicate_selection_shares_bead_and_p_points_at_first_occurrence() {
 
     // The single shared bead's /P targets the FIRST occurrence.
     let bead: ObjectHandle = out.get_object_handle(bead0);
-    out.resolve(&bead).expect("bead");
+    bead.try_is_scalar().expect("bead");
     assert!(bead.as_dictionary().is_some(), "bead is a dictionary");
     assert_eq!(
-        bead.get_key(b"/P").object_ref(),
+        bead.try_get_key(b"/P").unwrap().object_ref(),
         Some(page_refs[0]),
         "shared bead /P must point at the first occurrence's page ref"
     );
@@ -297,10 +300,10 @@ fn dangling_bead_p_dropped_and_page_gced_via_b_array_without_threads() {
     );
 
     let bead: ObjectHandle = pdf.get_object_handle(ObjectRef::new(12, 0));
-    pdf.resolve(&bead).expect("bead 12");
+    bead.try_is_scalar().expect("bead 12");
     assert!(bead.as_dictionary().is_some(), "bead 12 is a dict");
     assert!(
-        !bead.has_key(b"/P"),
+        !bead.try_has_key(b"/P").unwrap(),
         "bead 12 /P (removed page) must be dropped via /B seeding"
     );
 

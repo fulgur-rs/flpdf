@@ -766,7 +766,7 @@ mod tests {
         let mut pdf = open_minimal();
         let root = pdf.root_ref().expect("catalog");
         let catalog = pdf.get_object_handle(root);
-        pdf.resolve(&catalog).expect("resolve catalog");
+        catalog.try_is_scalar().expect("resolve catalog");
         let tree = HandleDict::new();
         tree.insert("Names", ObjectHandle::array(Vec::new()));
         let names = HandleDict::new();
@@ -787,7 +787,7 @@ mod tests {
     fn attach_raw_tree_value(pdf: &mut Pdf<Cursor<Vec<u8>>>, key: &[u8], value: ObjectHandle) {
         let root = pdf.root_ref().expect("catalog");
         let catalog = pdf.get_object_handle(root);
-        pdf.resolve(&catalog).expect("resolve catalog");
+        catalog.try_is_scalar().expect("resolve catalog");
         let tree = HandleDict::new();
         tree.insert(
             "Names",

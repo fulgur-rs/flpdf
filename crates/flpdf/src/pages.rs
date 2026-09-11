@@ -189,7 +189,7 @@ pub(crate) fn resolve_inherited_handle_with_max_depth<R: Read + Seek>(
 ///
 /// - [`Error::Missing`] when the catalog (`/Root`) or its `/Pages` entry is absent.
 /// - [`Error::Unsupported`] when the catalog is not a dictionary.
-/// - Any [`Error`] propagated from [`Pdf::resolve`] while walking the tree.
+/// - Any [`Error`] propagated from canonical ObjectHandle resolution while walking the tree.
 ///
 /// # Examples
 ///
@@ -215,7 +215,7 @@ pub fn page_refs<R: Read + Seek>(pdf: &mut Pdf<R>) -> Result<Vec<ObjectRef>> {
 /// - [`Error::Missing`] when the catalog (`/Root`) or its `/Pages` entry is absent.
 /// - [`Error::Unsupported`] when the catalog is not a dictionary, or when the page
 ///   tree exceeds `max_depth`.
-/// - Any [`Error`] propagated from [`Pdf::resolve`] while walking the tree.
+/// - Any [`Error`] propagated from canonical ObjectHandle resolution while walking the tree.
 pub fn page_refs_with_max_depth<R: Read + Seek>(
     pdf: &mut Pdf<R>,
     max_depth: usize,
@@ -239,7 +239,7 @@ pub fn page_refs_with_max_depth<R: Read + Seek>(
 ///
 /// - [`Error::Unsupported`] when `page_ref` does not resolve to a dictionary with
 ///   `/Type /Page`, or when a content stream cannot be decoded.
-/// - Any [`Error`] that [`Pdf::resolve`] or the canonical content
+/// - Any [`Error`] that canonical ObjectHandle resolution or the canonical content
 ///   pipeline may return.
 ///
 /// # Examples
@@ -393,7 +393,7 @@ impl<'a, R: Read + Seek> PageWalk<'a, R> {
     ///
     /// - [`Error::Missing`] when the catalog (`/Root`) or its `/Pages` entry is absent.
     /// - [`Error::Unsupported`] when the catalog is not a dictionary.
-    /// - Any [`Error`] propagated from [`Pdf::resolve`] while resolving the catalog.
+    /// - Any [`Error`] propagated from canonical ObjectHandle resolution while resolving the catalog.
     pub fn new(pdf: &'a mut Pdf<R>) -> Result<Self> {
         // Only a *directly* absent `/Root` is `Missing` here. A present
         // `/Root` that resolves to a non-dictionary — including an indirect
@@ -432,7 +432,7 @@ impl<'a, R: Read + Seek> PageWalk<'a, R> {
     ///
     /// - [`Error::Missing`] when the catalog (`/Root`) or its `/Pages` entry is absent.
     /// - [`Error::Unsupported`] when the catalog is not a dictionary.
-    /// - Any [`Error`] propagated from [`Pdf::resolve`] while resolving the catalog.
+    /// - Any [`Error`] propagated from canonical ObjectHandle resolution while resolving the catalog.
     pub fn with_max_depth(pdf: &'a mut Pdf<R>, max_depth: usize) -> Result<Self> {
         // Only a *directly* absent `/Root` is `Missing` here. A present
         // `/Root` that resolves to a non-dictionary — including an indirect

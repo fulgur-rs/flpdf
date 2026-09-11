@@ -24,14 +24,14 @@ fn font_ref_of_page<R: std::io::Read + std::io::Seek>(
     page: ObjectRef,
 ) -> Option<ObjectRef> {
     let page_obj: ObjectHandle = pdf.get_object_handle(page);
-    pdf.resolve(&page_obj).ok()?;
-    let resources = page_obj.get_key(b"/Resources");
-    pdf.resolve(&resources).ok()?;
+    page_obj.try_is_scalar().ok()?;
+    let resources = page_obj.try_get_key(b"/Resources").ok()?;
+    resources.try_is_scalar().ok()?;
     resources.as_dictionary()?;
-    let fonts = resources.get_key(b"/Font");
-    pdf.resolve(&fonts).ok()?;
+    let fonts = resources.try_get_key(b"/Font").ok()?;
+    fonts.try_is_scalar().ok()?;
     fonts.as_dictionary()?;
-    fonts.get_key(b"/F1").object_ref()
+    fonts.try_get_key(b"/F1").ok()?.object_ref()
 }
 
 fn main() -> Result<(), Box<dyn std::error::Error>> {
