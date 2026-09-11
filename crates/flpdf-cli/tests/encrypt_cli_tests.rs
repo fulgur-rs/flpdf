@@ -1608,9 +1608,9 @@ fn encrypt_succeeds_when_combined_with_pages_subcommand() {
 }
 
 #[test]
-fn encrypt_conflicts_with_decrypt_flag() {
+fn encrypt_follows_decrypt_flag_in_argv_order() {
     let tmp = tempfile::tempdir().unwrap();
-    let output = tmp.path().join("nope.pdf");
+    let output = tmp.path().join("encrypted.pdf");
     Command::cargo_bin("flpdf")
         .unwrap()
         .args([
@@ -1625,8 +1625,18 @@ fn encrypt_conflicts_with_decrypt_flag() {
         .arg(fixture(UNENCRYPTED_FIXTURE))
         .arg(&output)
         .assert()
-        .failure()
-        .stderr(predicates::str::contains("cannot be used"));
+        .success();
+
+    if !ensure_qpdf_or_skip() {
+        return;
+    }
+    let check = ShellCommand::new("qpdf")
+        .args(["--password=u", "--show-encryption"])
+        .arg(&output)
+        .output()
+        .unwrap();
+    assert!(check.status.success());
+    assert!(String::from_utf8_lossy(&check.stdout).contains("R = 4"));
 }
 
 // ── --static-aes-iv tests ───────────────────────────────────

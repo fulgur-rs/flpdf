@@ -320,11 +320,15 @@ fn top_level_writer_options(
 
     apply_encryption_options(
         &mut options,
-        args.raw_encrypt.as_deref(),
-        args.copy_encryption.as_deref(),
-        args.raw_encryption_file_password.as_deref(),
-        &args.password,
-        args.no_warn,
+        EncryptionCliOptions {
+            encrypt: args.raw_encrypt.as_deref(),
+            encrypt_segments: args.raw_encrypt_segments.as_deref(),
+            copy_encryption: args.copy_encryption.as_deref(),
+            encryption_file_password: args.raw_encryption_file_password.as_deref(),
+            password_args: &args.password,
+            suppress_warnings: args.no_warn,
+            last_mode: args.last_encryption_mode,
+        },
     );
     if args.decrypt {
         options.preserve_encryption = false;
@@ -1555,8 +1559,8 @@ struct Cli {
         allow_hyphen_values = true,
         value_name = "USER-PW OWNER-PW KEY-LEN [sub-flags]",
         // Reject combinations that don't make sense on the rewrite path.
-        // --remove-restrictions / --decrypt overlap with --encrypt and are
-        // rejected because they imply contradictory output forms; --check /
+        // --remove-restrictions overlaps with --encrypt and is rejected
+        // because it implies a contradictory output form; --check /
         // --show-object / --show-* are inspection paths that don't produce an
         // output file at all. --linearize is NOT rejected: qpdf itself
         // supports `--linearize --encrypt ...` (verified: `qpdf --linearize
@@ -1567,8 +1571,7 @@ struct Cli {
             "check", "show_object",
             "show_npages", "show_pages", "show_xref", "show_linearization",
             "show_encryption",
-            "remove_restrictions", "decrypt",
-            "copy_encryption",
+            "remove_restrictions",
         ],
         help = "Encrypt output (qpdf --encrypt compatible): \
                 USER-PW OWNER-PW KEY-LEN [sub-flags] --"
@@ -1576,6 +1579,10 @@ struct Cli {
     encrypt: Option<Vec<OsString>>,
     #[arg(skip)]
     raw_encrypt: Option<Vec<Vec<u8>>>,
+    #[arg(skip)]
+    raw_encrypt_segments: Option<Vec<Vec<Vec<u8>>>>,
+    #[arg(skip)]
+    last_encryption_mode: Option<EncryptionMode>,
 
     /// Copy the /Encrypt dictionary from a donor PDF and use its passwords for
     /// output encryption (qpdf --copy-encryption equivalent).
@@ -1585,18 +1592,19 @@ struct Cli {
     /// Standard handler schemes that qpdf's `copyEncryptionParameters` emits:
     /// V=1/V=2 RC4, V=4 canonicalized to AESV2, and V=5 AESV3.
     ///
-    /// Mutually exclusive with `--encrypt`. `--linearize` may be combined with
-    /// this option; qpdf supports copying encryption into a linearized output.
+    /// `--linearize` may be combined with this option; qpdf supports copying
+    /// encryption into a linearized output. When this option is combined with
+    /// `--decrypt` or `--encrypt`, the last option in argv order wins, like
+    /// qpdf's Config setters.
     #[arg(
         long = "copy-encryption",
         value_name = "FILE",
         require_equals = true,
         conflicts_with_all = [
-            "encrypt",
             "check", "show_object",
             "show_npages", "show_pages", "show_xref", "show_linearization",
             "show_encryption",
-            "remove_restrictions", "decrypt",
+            "remove_restrictions",
         ],
         help = "Copy /Encrypt from donor PDF (qpdf --copy-encryption); \
                 pair with --encryption-file-password"
@@ -2680,6 +2688,7 @@ fn preprocess_qpdf_args<T: Into<OsString>>(args: Vec<T>) -> CliResult<Preprocess
     let mut overlay_specs = Vec::new();
     let mut attachment_segments = Vec::new();
     let mut raw_encrypt = None;
+    let mut raw_encrypt_segments = Vec::new();
     let mut raw_pages = None;
     let mut raw_copy_attachments_from = Vec::new();
 
@@ -2696,7 +2705,10 @@ fn preprocess_qpdf_args<T: Into<OsString>>(args: Vec<T>) -> CliResult<Preprocess
                 overlay_specs.push(parse_overlay_segment(OverlayKind::Underlay, &tokens)?)
             }
             "add-attachment" => attachment_segments.push(tokens),
-            "encrypt" => raw_encrypt = Some(tokens),
+            "encrypt" => {
+                raw_encrypt_segments.push(tokens.clone());
+                raw_encrypt = Some(tokens);
+            }
             "pages" => {
                 // qpdf rejects a second --pages group as a usage error
                 // (`QPDFJob_config.cc:945-951`).
@@ -2733,6 +2745,9 @@ fn preprocess_qpdf_args<T: Into<OsString>>(args: Vec<T>) -> CliResult<Preprocess
             ),
             raw_encrypt,
             raw_pages,
+            raw_encrypt_segments: (!raw_encrypt_segments.is_empty())
+                .then_some(raw_encrypt_segments),
+            last_encryption_mode: last_encryption_mode(&parsed.raw_residual_args),
             raw_copy_attachments_from: (!raw_copy_attachments_from.is_empty())
                 .then_some(raw_copy_attachments_from),
         },
@@ -2780,6 +2795,33 @@ fn raw_option_value(args: &[arg_parser::RawArg], name: &str) -> Option<Vec<u8>> 
     found
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum EncryptionMode {
+    Decrypt,
+    Encrypt,
+    CopyEncryption,
+}
+
+fn last_encryption_mode(args: &[arg_parser::RawArg]) -> Option<EncryptionMode> {
+    let mut mode = None;
+    for arg in args.iter().skip(1) {
+        let bytes = arg.as_bytes();
+        match bytes {
+            b"--decrypt" => mode = Some(EncryptionMode::Decrypt),
+            b"--encrypt" => mode = Some(EncryptionMode::Encrypt),
+            bytes
+                if bytes
+                    .strip_prefix(b"--copy-encryption")
+                    .is_some_and(|suffix| suffix.is_empty() || suffix[0] == b'=') =>
+            {
+                mode = Some(EncryptionMode::CopyEncryption);
+            }
+            _ => {}
+        }
+    }
+    mode
+}
+
 fn is_named_segment_option(bytes: &[u8]) -> bool {
     matches!(
         bytes,
@@ -2801,7 +2843,9 @@ fn apply_raw_overrides(args: &mut Cli, overrides: RawCliOverrides) {
         password,
         encryption_file_password,
         raw_encrypt,
+        raw_encrypt_segments,
         raw_pages,
+        last_encryption_mode,
         raw_copy_attachments_from,
     } = overrides;
     args.password.raw_password = password.clone();
@@ -2810,8 +2854,10 @@ fn apply_raw_overrides(args: &mut Cli, overrides: RawCliOverrides) {
             .as_ref()
             .map(|value| arg_parser::os_bytes(value))
     });
+    args.last_encryption_mode = last_encryption_mode;
     args.raw_encrypt =
         raw_encrypt.or_else(|| args.encrypt.as_ref().map(|tokens| raw_os_args(tokens)));
+    args.raw_encrypt_segments = raw_encrypt_segments;
     args.page_ops.raw_pages = raw_pages
         .or_else(|| (!args.page_ops.pages.is_empty()).then(|| raw_os_args(&args.page_ops.pages)));
     args.raw_copy_attachments_from = raw_copy_attachments_from.or_else(|| {
@@ -3660,11 +3706,15 @@ fn main() {
         // encryption-file-password fallback.
         apply_encryption_options(
             &mut options,
-            args.raw_encrypt.as_deref(),
-            None,
-            args.raw_encryption_file_password.as_deref(),
-            &args.password,
-            args.no_warn,
+            EncryptionCliOptions {
+                encrypt: args.raw_encrypt.as_deref(),
+                encrypt_segments: args.raw_encrypt_segments.as_deref(),
+                copy_encryption: None,
+                encryption_file_password: args.raw_encryption_file_password.as_deref(),
+                password_args: &args.password,
+                suppress_warnings: args.no_warn,
+                last_mode: args.last_encryption_mode,
+            },
         );
         if args.decrypt {
             // qpdf applies --decrypt at the writer boundary after page
@@ -4740,11 +4790,15 @@ fn run_command(command: Commands, overlay_specs: &[OverlaySpec]) -> CliResult<()
             // apply_encryption_options).
             apply_encryption_options(
                 &mut options,
-                cmd.raw_encrypt.as_deref(),
-                cmd.copy_encryption.as_deref(),
-                cmd.raw_encryption_file_password.as_deref(),
-                &cmd.password,
-                false,
+                EncryptionCliOptions {
+                    encrypt: cmd.raw_encrypt.as_deref(),
+                    encrypt_segments: None,
+                    copy_encryption: cmd.copy_encryption.as_deref(),
+                    encryption_file_password: cmd.raw_encryption_file_password.as_deref(),
+                    password_args: &cmd.password,
+                    suppress_warnings: false,
+                    last_mode: None,
+                },
             );
             let normalize_content = matches!(cmd.normalize_content, Some(CliYesNo::Yes));
             options.content_normalization = normalize_content;
@@ -4999,24 +5053,65 @@ fn run_check_linearization(
     finish_job_exit_status(job.check_linearization(&mut pdf)?)
 }
 
-/// Wire `--encrypt` / `--copy-encryption` onto `options`, shared by the
-/// top-level and `rewrite` surfaces so the two stay in lock-step. A `--encrypt`
-/// parse error or a `--copy-encryption`
-/// donor-open/validation error prints a `flpdf:`-prefixed diagnostic and exits
-/// 2, matching the surrounding option parsers. The two options are mutually
-/// exclusive at the CLI layer (clap `conflicts_with`), so at most one branch
-/// fires.
-fn apply_encryption_options<T: RawCliArg>(
-    options: &mut WriterOptions,
-    encrypt: Option<&[T]>,
-    copy_encryption: Option<&std::path::Path>,
-    encryption_file_password: Option<&[u8]>,
-    password_args: &PasswordArgs,
+struct EncryptionCliOptions<'a> {
+    encrypt: Option<&'a [Vec<u8>]>,
+    encrypt_segments: Option<&'a [Vec<Vec<u8>>]>,
+    copy_encryption: Option<&'a std::path::Path>,
+    encryption_file_password: Option<&'a [u8]>,
+    password_args: &'a PasswordArgs,
     suppress_warnings: bool,
-) {
-    if let Some(encrypt) = encrypt {
-        match parse_encrypt_segment(encrypt) {
-            Ok(parsed) => {
+    last_mode: Option<EncryptionMode>,
+}
+
+/// Wire the final qpdf encryption mode onto `options`, shared by the
+/// top-level and `rewrite` surfaces. A `--encrypt` parse error or a
+/// `--copy-encryption`
+/// donor-open/validation error prints a `flpdf:`-prefixed diagnostic and exits
+/// 2, matching the surrounding option parsers. qpdf's Config setters clear
+/// the other modes, so only the last mode in argv order is applied.
+fn apply_encryption_options(options: &mut WriterOptions, inputs: EncryptionCliOptions<'_>) {
+    let EncryptionCliOptions {
+        encrypt,
+        encrypt_segments,
+        copy_encryption,
+        encryption_file_password,
+        password_args,
+        suppress_warnings,
+        last_mode,
+    } = inputs;
+    let parsed_encrypt = encrypt_segments.map(|segments| {
+        let mut parsed = None;
+        for segment in segments {
+            match parse_encrypt_segment(segment) {
+                Ok(value) => parsed = Some(value),
+                Err(error) => {
+                    emit_logger_error(format!("{}: {error}\n", progname()));
+                    std::process::exit(2);
+                }
+            }
+        }
+        parsed
+    });
+    match last_mode.or_else(|| {
+        if encrypt.is_some() {
+            Some(EncryptionMode::Encrypt)
+        } else if copy_encryption.is_some() {
+            Some(EncryptionMode::CopyEncryption)
+        } else {
+            None
+        }
+    }) {
+        Some(EncryptionMode::Encrypt) => {
+            let parsed = parsed_encrypt.flatten().or_else(|| {
+                encrypt.map(|encrypt| match parse_encrypt_segment(encrypt) {
+                    Ok(value) => value,
+                    Err(error) => {
+                        emit_logger_error(format!("{}: {error}\n", progname()));
+                        std::process::exit(2);
+                    }
+                })
+            });
+            if let Some(parsed) = parsed {
                 if parsed.accessibility_warning {
                     emit_logger_error(format!(
                         "{}: -accessibility=n is ignored for modern encryption formats\n",
@@ -5025,27 +5120,26 @@ fn apply_encryption_options<T: RawCliArg>(
                 }
                 options.encrypt = Some(parsed.params);
             }
-            Err(e) => {
-                emit_logger_error(format!("{}: {e}\n", progname()));
-                std::process::exit(2);
+        }
+        Some(EncryptionMode::CopyEncryption) => {
+            if let Some(donor_path) = copy_encryption {
+                match build_copy_encryption_source(
+                    donor_path,
+                    encryption_file_password,
+                    password_args,
+                    suppress_warnings,
+                ) {
+                    Ok(src) => {
+                        options.copy_encryption = Some(src);
+                    }
+                    Err(e) => {
+                        emit_logger_error(format!("flpdf: {e}\n"));
+                        std::process::exit(2);
+                    }
+                }
             }
         }
-    }
-    if let Some(donor_path) = copy_encryption {
-        match build_copy_encryption_source(
-            donor_path,
-            encryption_file_password,
-            password_args,
-            suppress_warnings,
-        ) {
-            Ok(src) => {
-                options.copy_encryption = Some(src);
-            }
-            Err(e) => {
-                emit_logger_error(format!("flpdf: {e}\n"));
-                std::process::exit(2);
-            }
-        }
+        Some(EncryptionMode::Decrypt) | None => {}
     }
 }
 
@@ -6549,7 +6643,9 @@ struct RawCliOverrides {
     password: Option<Vec<u8>>,
     encryption_file_password: Option<Vec<u8>>,
     raw_encrypt: Option<Vec<Vec<u8>>>,
+    raw_encrypt_segments: Option<Vec<Vec<Vec<u8>>>>,
     raw_pages: Option<Vec<Vec<u8>>>,
+    last_encryption_mode: Option<EncryptionMode>,
     raw_copy_attachments_from: Option<Vec<Vec<Vec<u8>>>>,
 }
 
