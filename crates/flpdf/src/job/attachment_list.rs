@@ -141,8 +141,8 @@ where
         // the recognized name keys is listed too; keys whose value is null are
         // skipped, as they are by QPDFObjectHandle::getKeys.
         for (stream_key, stream) in ef_entries {
-            pdf.resolve(&stream)?;
-            if stream.is_null() {
+            stream.try_dereference()?;
+            if stream.try_is_null()? {
                 continue;
             }
             out.extend_from_slice(b"    ")?;
@@ -679,6 +679,26 @@ mod tests {
         assert!(
             !out.contains("    /Unix -> "),
             "a reference to a missing object resolves to null: {out:?}"
+        );
+    }
+
+    #[test]
+    fn unresolved_ef_entries_are_skipped_by_canonical_dereference() {
+        let mut pdf = open_minimal();
+        let stream_ref = add_ef_stream(&mut pdf, None, None);
+        let missing = ObjectRef::new(stream_ref.number + 41, 0);
+        let ef = HandleDict::from_entries(vec![(b"/Zed".to_vec(), object_ref(&mut pdf, missing))]);
+        ef.insert("F", object_ref(&mut pdf, stream_ref));
+        let filespec = HandleDict::new();
+        filespec.insert("F", ObjectHandle::string(b"a.txt".to_vec()));
+        filespec.insert("EF", HandleDict::into_handle(ef));
+        attach(&mut pdf, b"a.txt", filespec);
+
+        let out = as_text(&listing(&mut pdf, true));
+        assert!(out.contains("    /F -> "), "{out:?}");
+        assert!(
+            !out.contains("    /Zed -> "),
+            "an unresolved /EF value must become qpdf's null and be skipped: {out:?}"
         );
     }
 
