@@ -8490,21 +8490,19 @@ fn apply_normalize_content<R: std::io::Read + std::io::Seek>(
 ) -> CliResult<Vec<ContentNormalizationWarning>> {
     let mut warnings = Vec::new();
     let page = pdf.get_object_handle(page_ref);
-    pdf.resolve(&page)?;
-    let contents = page.get_key(b"/Contents");
+    let contents = page.try_get_key(b"/Contents")?;
     let contents_ref = contents.object_ref();
-    pdf.resolve(&contents)?;
 
     let mut streams = Vec::new();
-    if contents.as_stream_dict().is_some() {
+    if contents.try_is_stream_of_type(b"", b"")? {
         if let Some(stream_ref) = contents_ref {
             streams.push((stream_ref, contents));
         }
-    } else if let Some(items) = contents.as_array() {
+    } else if contents.try_is_array()? {
+        let items = contents.as_array().unwrap_or_default();
         for item in items {
             let item_ref = item.object_ref();
-            pdf.resolve(&item)?;
-            if item.as_stream_dict().is_some() {
+            if item.try_is_stream_of_type(b"", b"")? {
                 if let Some(item_ref) = item_ref {
                     streams.push((item_ref, item));
                 }
