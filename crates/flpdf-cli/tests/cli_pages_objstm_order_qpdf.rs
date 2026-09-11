@@ -21,6 +21,8 @@ const ANNOTATION_ORDER_FOREIGN: &str =
     "../../tests/fixtures/compat/form-fields-and-annotations.pdf";
 const ANNOTATION_ORDER_LINK: &str = "../../tests/fixtures/compat/link-annot-no-acroform.pdf";
 const ANNOTATION_ORDER_FXO: &str = "../../tests/fixtures/compat/fxo-red-with-existing-acroform.pdf";
+const ANNOTATION_ORDER_DIRECT_DR: &str =
+    "../../tests/fixtures/compat/form-fields-and-annotations-direct-dr.pdf";
 
 /// Gate the differential probe on the pinned oracle, mirroring
 /// `cli_linearize_multi_source_qpdf`: skip locally when qpdf 11.9.0 is not
@@ -324,17 +326,70 @@ fn annotated_page_replay_preserves_qpdf_occurrence_provenance() {
                 "--",
             ],
         ),
+        (
+            "annotation-direct-dr-annotation",
+            vec![
+                ANNOTATION_ORDER_FOREIGN,
+                "--pages",
+                ANNOTATION_ORDER_FOREIGN,
+                "1",
+                ANNOTATION_ORDER_DIRECT_DR,
+                "1",
+                ANNOTATION_ORDER_FOREIGN,
+                "1",
+                "--",
+            ],
+        ),
     ] {
         assert_annotated_replay_matches_qpdf(name, &page_args);
     }
 }
 
 fn assert_annotated_replay_matches_qpdf(name: &str, page_args: &[&str]) {
+    assert_annotated_replay_with_flags(name, &["--static-id", "--qdf"], page_args);
+}
+
+#[test]
+fn annotated_direct_dr_replay_preserves_qpdf_objstm_provenance() {
+    if skip_if_qpdf_missing() {
+        return;
+    }
+    let page_args = [
+        ANNOTATION_ORDER_FOREIGN,
+        "--pages",
+        ANNOTATION_ORDER_FOREIGN,
+        "1",
+        ANNOTATION_ORDER_DIRECT_DR,
+        "1",
+        ANNOTATION_ORDER_FOREIGN,
+        "1",
+        "--",
+    ];
+    for (name, flags) in [
+        (
+            "annotation-direct-dr-objstm",
+            vec!["--static-id", "--qdf", "--object-streams=generate"],
+        ),
+        (
+            "annotation-direct-dr-linearized",
+            vec![
+                "--static-id",
+                "--qdf",
+                "--object-streams=generate",
+                "--linearize",
+            ],
+        ),
+    ] {
+        assert_annotated_replay_with_flags(name, &flags, &page_args);
+    }
+}
+
+fn assert_annotated_replay_with_flags(name: &str, flags: &[&str], page_args: &[&str]) {
     let temp = tempfile::tempdir().unwrap();
     let qpdf_output = temp.path().join("qpdf.pdf");
     let flpdf_output = temp.path().join("flpdf.pdf");
 
-    let mut qpdf_args = vec!["--static-id", "--qdf"];
+    let mut qpdf_args = flags.to_vec();
     qpdf_args.extend_from_slice(page_args);
     let qpdf = ProcessCommand::new("qpdf")
         .args(qpdf_args)
@@ -349,7 +404,7 @@ fn assert_annotated_replay_matches_qpdf(name: &str, page_args: &[&str]) {
 
     Command::cargo_bin("flpdf")
         .unwrap()
-        .args(["--static-id", "--qdf"])
+        .args(flags)
         .args(page_args)
         .arg(&flpdf_output)
         .assert()

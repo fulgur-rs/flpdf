@@ -2193,14 +2193,19 @@ qpdf は `handlePageSpecs` の selected-page loop 内で `shallowCopyPage` と
 `QPDFPageObjectHelper.cc:654-660`）、transform の field tree・annotation・appearance
 stream はその場の `makeIndirectObject` で割り当てる
 （`QPDFAcroFormDocumentHelper.cc:699-1047`、`QPDF.cc:1870-1897`）。flpdf は
-canonical resolver の `allocated_object_refs` を read-only checkpoint 差分として
-replay helper の前後で取得し、`page_specs.rs` の finalizer が page allocation と
-replay allocation を occurrence 順に `WriterObjectOrderKey` へ反映する。これにより
-QDF writer の `%% Original object ID`（`QPDFWriter.cc:1681-1705,1770-1800`）だけでなく、
-後続の writer-order consumer も同じ event order を観測し、copy 経路や qtest-only
-shim は増やさない。`cli_pages_objstm_order_qpdf.rs` の annotated replay differential
-gate が `three-page.pdf` → `form-fields-and-annotations.pdf` → duplicate primary の
-全 bytes を qpdf 11.9.0 と比較する。
+canonical resolver の `allocated_object_order` を read-only checkpoint 差分として
+replay helper の前後で取得し、初回登録順を失わずに `page_specs.rs` の finalizer が
+page allocation と replay allocation を occurrence 順に `WriterObjectOrderKey` へ反映
+する。AcroForm helper も qpdf同様にAP内の全 `copyStream` を先に行い、その後に
+各 copied stream の matrix/resource adjustment を行うため
+（`QPDFAcroFormDocumentHelper.cc:967-1010`）、direct `/DR` の resource dictionary
+allocation も同じ event order になる。これにより QDF writer の
+`%% Original object ID`（`QPDFWriter.cc:1681-1705,1770-1800`）だけでなく、後続の
+writer-order consumer も同じ event order を観測し、copy 経路や qtest-only shim は
+増やさない。`cli_pages_objstm_order_qpdf.rs` の annotated replay differential gate が
+`three-page.pdf` → `form-fields-and-annotations.pdf` → duplicate primary と
+direct-DR interleave の全 bytesを、QDF・Generate ObjStm・linearized Generateを含めて
+qpdf 11.9.0 と比較する。
 
 `flpdf-obsc` では、`QPDFJob::doSplitPages` が chunk 作成前に行う
 `shouldRemoveUnreferencedResources` の verbose side effect も同じ job boundary に

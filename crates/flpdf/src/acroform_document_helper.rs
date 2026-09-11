@@ -2132,8 +2132,10 @@ fn copy_and_transform_appearance_streams<R: Read + Seek>(
 /// appearance-resource privatization for a foreign AcroForm merge.
 ///
 /// The resource-replacer implementation is called through the canonical
-/// `ObjectHandle` path immediately after each copied appearance stream, which
-/// preserves qpdf's `transformAnnotations` ordering at the AcroForm boundary.
+/// `ObjectHandle` path after all appearance streams for one annotation have
+/// been copied. qpdf first collects every copied stream and then adjusts their
+/// matrices/resources (`QPDFAcroFormDocumentHelper.cc:967-1010`), so this
+/// two-phase shape also preserves its allocation order.
 fn copy_and_transform_appearance_streams_with_renames<R: Read + Seek>(
     pdf: &mut Pdf<R>,
     annotation: &ObjectHandle,
@@ -2146,14 +2148,14 @@ fn copy_and_transform_appearance_streams_with_renames<R: Read + Seek>(
         return Ok(());
     }
 
+    let mut copied_streams = Vec::new();
     for key in appearance.try_get_keys()? {
         let entry = appearance.try_get_key(&key)?;
         entry.try_dereference()?;
         if entry.as_stream_dict().is_some() {
             let copied = entry.copy_stream()?;
-            transform_appearance_stream_matrix(&copied, cm)?;
-            adjust_copied_appearance_resources(pdf, &copied, renames)?;
-            appearance.replace_key(&key, copied)?;
+            appearance.replace_key(&key, copied.clone())?;
+            copied_streams.push(copied);
             continue;
         }
         if entry.as_dictionary().is_none() {
@@ -2164,11 +2166,14 @@ fn copy_and_transform_appearance_streams_with_renames<R: Read + Seek>(
             stream.try_dereference()?;
             if stream.as_stream_dict().is_some() {
                 let copied = stream.copy_stream()?;
-                transform_appearance_stream_matrix(&copied, cm)?;
-                adjust_copied_appearance_resources(pdf, &copied, renames)?;
-                entry.replace_key(&state, copied)?;
+                entry.replace_key(&state, copied.clone())?;
+                copied_streams.push(copied);
             }
         }
+    }
+    for copied in copied_streams {
+        transform_appearance_stream_matrix(&copied, cm)?;
+        adjust_copied_appearance_resources(pdf, &copied, renames)?;
     }
     Ok(())
 }

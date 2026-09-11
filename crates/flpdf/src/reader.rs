@@ -1119,16 +1119,13 @@ impl<R: Read + Seek> Pdf<R> {
     /// Return the current destination allocation identity without preparing
     /// the resolver cache. Page-selection replay uses this to delimit the
     /// allocations made by one qpdf occurrence.
-    pub(crate) fn allocation_checkpoint(&self) -> Option<ObjectRef> {
+    pub(crate) fn allocation_checkpoint(&self) -> usize {
         self.resolver.allocation_checkpoint()
     }
 
     /// Return destination identities allocated after a page-selection
     /// occurrence checkpoint, in qpdf allocator order.
-    pub(crate) fn allocated_object_refs_after(
-        &self,
-        checkpoint: Option<ObjectRef>,
-    ) -> Vec<ObjectRef> {
+    pub(crate) fn allocated_object_refs_after(&self, checkpoint: usize) -> Vec<ObjectRef> {
         self.resolver.allocated_object_refs_after(checkpoint)
     }
 
