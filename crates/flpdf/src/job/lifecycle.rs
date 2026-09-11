@@ -3081,7 +3081,7 @@ impl QPDFJob {
                 // Keep the erased Pdf wrappers only for the replace-input
                 // close boundary; file-backed foreign streams already capture
                 // their input and stream metadata in the canonical provider.
-                for source in &page_sources {
+                for source in page_sources.iter().skip(1) {
                     source.resolver.disconnect_all();
                 }
                 self.page_source_documents = page_sources;
