@@ -1583,7 +1583,8 @@ loggerで再openする経路はtop-level CLIから除去し、`--show-linearizat
 
 以下の direct output は意図的に retained とする。
 
-- `run_show_stream` の passthrough-codec marker: flpdf-only fallback 表示で、qpdf は
+- `run_show_stream` の passthrough-codec marker（`job/inspection.rs::show_stream`、
+  `// qpdf-deviation` マーク済み）: flpdf-only fallback 表示で、qpdf は
   unfilterable stream を同じ marker へ変換しない
 - `dump-object` の recovered-EOL トリム（`job/inspection.rs::unparse_object_with_stream_data`、
   `// qpdf-deviation` マーク済み）: qpdf には `dump-object` に相当する再シリアライズ経路が無く、

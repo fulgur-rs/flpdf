@@ -126,9 +126,15 @@ impl QPDFJob {
                 return write_to_standard_output(&logger, raw.as_ref());
             }
 
-            // Preserve the existing CLI marker for the specialized codecs that
-            // qpdf keeps as raw data in this command. The name is read from the
-            // live stream dictionary; no filter dictionary is materialized.
+            // qpdf-deviation-start: `show-stream`'s passthrough-codec marker
+            // has no qpdf counterpart. qpdf has no `show-stream` command, and
+            // `QPDFJob::doShowObj` warns "unable to filter stream data" and
+            // writes nothing for a stream it cannot decode
+            // (QPDFJob.cc:806-832); it never substitutes a descriptive marker.
+            // Retained deliberately (docs/qpdf-correspondence.md, "以下の
+            // direct output は意図的に retained とする"). The name is read
+            // from the live stream dictionary; no filter dictionary is
+            // materialized.
             if let Some(filter_name) = first_stream_filter_name(&stream_dictionary)? {
                 if !crate::filters::is_decoded_filter(&filter_name) {
                     if let Some(label) = crate::filters::passthrough_codec_label(&filter_name) {
@@ -138,6 +144,7 @@ impl QPDFJob {
                     }
                 }
             }
+            // qpdf-deviation-end
 
             // Mirror emit_show_object's reconciliation: qpdf's getStreamData
             // decode failure records a typeWarning/decode warning and still
