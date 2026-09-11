@@ -145,6 +145,79 @@ fn assert_duplicate_after_foreign_matches_qpdf(options: &[&str], message: &str) 
     );
 }
 
+fn assert_annotated_linearized_matches_qpdf(page_args: &[&str], message: &str) {
+    let temp = tempfile::tempdir().unwrap();
+    let qpdf_output = temp.path().join("qpdf.pdf");
+    let flpdf_output = temp.path().join("flpdf.pdf");
+
+    let mut qpdf_args = vec!["--static-id", "--linearize"];
+    qpdf_args.extend_from_slice(page_args);
+    let qpdf = ProcessCommand::new("qpdf")
+        .args(qpdf_args)
+        .arg(&qpdf_output)
+        .output()
+        .expect("qpdf should spawn");
+    assert!(
+        qpdf.status.success(),
+        "qpdf annotated linearization probe failed: {}",
+        String::from_utf8_lossy(&qpdf.stderr)
+    );
+
+    Command::cargo_bin("flpdf")
+        .unwrap()
+        .args(["--static-id", "--linearize"])
+        .args(page_args)
+        .arg(&flpdf_output)
+        .assert()
+        .success();
+
+    assert_eq!(
+        std::fs::read(&flpdf_output).unwrap(),
+        std::fs::read(&qpdf_output).unwrap(),
+        "{message}"
+    );
+}
+
+#[test]
+fn annotated_multi_source_linearize_matches_qpdf() {
+    if skip_if_qpdf_missing() {
+        return;
+    }
+    assert_annotated_linearized_matches_qpdf(
+        &[
+            ANNOTATION_ORDER_FOREIGN,
+            "--pages",
+            ANNOTATION_ORDER_FOREIGN,
+            "1",
+            ANNOTATION_ORDER_FXO,
+            "1",
+            "--",
+        ],
+        "annotated multi-source linearization must match qpdf",
+    );
+}
+
+#[test]
+fn annotated_duplicate_multi_source_linearize_matches_qpdf() {
+    if skip_if_qpdf_missing() {
+        return;
+    }
+    assert_annotated_linearized_matches_qpdf(
+        &[
+            ANNOTATION_ORDER_FOREIGN,
+            "--pages",
+            ANNOTATION_ORDER_FOREIGN,
+            "1",
+            ANNOTATION_ORDER_FXO,
+            "1",
+            ANNOTATION_ORDER_FOREIGN,
+            "1",
+            "--",
+        ],
+        "annotated duplicate multi-source linearization must match qpdf",
+    );
+}
+
 #[test]
 fn multi_source_pages_generated_objstm_members_match_qpdf() {
     if skip_if_qpdf_missing() {
