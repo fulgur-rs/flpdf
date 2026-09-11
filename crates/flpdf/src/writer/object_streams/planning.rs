@@ -268,10 +268,29 @@ pub(crate) fn plan_qpdf_preserve_object_streams_with_unreferenced<
     pdf: &mut crate::Pdf<R>,
     preserve_unreferenced: bool,
 ) -> crate::Result<ObjectStreamPlan> {
+    plan_qpdf_preserve_object_streams_with_source_membership(pdf, preserve_unreferenced, None)
+}
+
+/// Reuse the source ObjStm map captured during qpdf writer setup.
+/// `QPDFWriter::preserveObjectStreams` runs before the later `getObjectCount`
+/// xref-reconstruction walk (`QPDFWriter.cc:2114-2140,2189-2195`), so a
+/// malformed document can expose a different current xref map by the time
+/// body emission begins. Keep that setup-time ownership explicit rather than
+/// silently consulting a later recovery result.
+pub(crate) fn plan_qpdf_preserve_object_streams_with_source_membership<
+    R: std::io::Read + std::io::Seek,
+>(
+    pdf: &mut crate::Pdf<R>,
+    preserve_unreferenced: bool,
+    source_membership_snapshot: Option<&BTreeMap<u32, u32>>,
+) -> crate::Result<ObjectStreamPlan> {
     // QPDFWriter captures source membership before the compressible-object
     // walk, which can resolve/recover objects and update the document xref.
-    let mut source_membership = BTreeMap::new();
-    pdf.get_object_stream_data(&mut source_membership);
+    let source_membership = source_membership_snapshot.cloned().unwrap_or_else(|| {
+        let mut source_membership = BTreeMap::new();
+        pdf.get_object_stream_data(&mut source_membership);
+        source_membership
+    });
     if source_membership.is_empty() {
         return Ok(ObjectStreamPlan::default());
     }
@@ -305,11 +324,19 @@ pub(crate) fn plan_qpdf_preserve_object_streams_with_unreferenced<
             {
                 continue;
             }
-            let eligible_for_objstm = {
+            // qpdf's preserve path applies the compressible eligibility filter
+            // only when `preserveUnreferencedObjects` is false
+            // (`QPDFWriter.cc:1939-1967`). With the flag enabled, even a
+            // malformed source stream member stays in its source container;
+            // the writer later warns and substitutes null while emitting it
+            // (`QPDFWriter.cc:1690-1705`).
+            let retain = if preserve_unreferenced {
+                true
+            } else {
                 let object = pdf.get_object_handle(member);
                 is_eligible_for_objstm_handle(member, &object, &ctx)?
             };
-            if eligible_for_objstm {
+            if retain {
                 retained.push(member);
             }
         }

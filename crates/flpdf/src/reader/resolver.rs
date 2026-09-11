@@ -394,6 +394,11 @@ pub(crate) struct ResolverCore<R: Read + Seek + 'static> {
     /// still contains only live type-1/type-2 entries; this set records the
     /// lookup side effect needed for a later `resolve(og)` warning.
     default_xref_entries: BTreeSet<QpdfObjGen>,
+    /// Default type-0 rows whose qpdf warning has already been delivered.
+    /// ObjStm header inspection can create object 0 while resolving another
+    /// object; qpdf then visits that row at the surrounding xref boundary,
+    /// before the next xref entry is resolved.
+    default_xref_warnings: BTreeSet<QpdfObjGen>,
     /// qpdf `m->attempt_recovery` (`QPDF.hh:1461`).
     ///
     /// Same on/off flag and default: qpdf initialises it to `true` and
@@ -930,6 +935,7 @@ impl<R: Read + Seek> ResolverHandle<R> {
                 in_parse: false,
                 resolved_object_streams: BTreeSet::new(),
                 default_xref_entries: BTreeSet::new(),
+                default_xref_warnings: BTreeSet::new(),
                 attempt_recovery,
                 // qpdf `m->reconstructed_xref` (`QPDF.cc:524`): set by
                 // `reconstruct_xref` which runs both at open time (`:464`) and
@@ -978,6 +984,7 @@ impl<R: Read + Seek> ResolverHandle<R> {
                 in_parse: false,
                 resolved_object_streams: BTreeSet::new(),
                 default_xref_entries: BTreeSet::new(),
+                default_xref_warnings: BTreeSet::new(),
                 attempt_recovery: true,
                 reconstructed_xref: false,
                 fixed_dangling_refs: false,
@@ -1567,7 +1574,29 @@ impl<R: Read + Seek> ResolverHandle<R> {
         // ObjectRef, but they still must reach the same offset/header/recovery
         // boundary so qpdf's expected-generation diagnostics are preserved.
         for (object_gen, entry) in self.raw_xref_entries() {
-            if object_gen.to_object_ref().is_some() || !object_gen.is_indirect() {
+            if !object_gen.is_indirect() {
+                // A failed xref-stream entry leaves qpdf's default type-0
+                // placeholder for object 0 in `m->xref_table`. It is not a
+                // valid ObjectRef, but `resolveXRefTable` still visits it and
+                // the type switch emits this damaged-PDF warning
+                // (`QPDF.cc:1728-1736`). Ordinary free rows never reach this
+                // branch because `insertFreeXrefEntry` stores only the
+                // deleted-object filter, not a raw table entry.
+                if object_gen == QpdfObjGen::new(0, 0) && matches!(entry, XrefEntry::Free { .. }) {
+                    let is_default = self
+                        .core
+                        .borrow()
+                        .default_xref_entries
+                        .contains(&object_gen);
+                    if is_default {
+                        self.warn_default_xref_entries()?;
+                    } else {
+                        self.push_warning_at(0, "object 0/0 has unexpected xref entry type")?;
+                    }
+                }
+                continue;
+            }
+            if object_gen.to_object_ref().is_some() {
                 continue;
             }
             let XrefEntry::Uncompressed { offset } = entry else {
@@ -2354,6 +2383,39 @@ impl<R: Read + Seek> ResolverHandle<R> {
             .insert(QpdfObjGen::from_object_ref(object_ref));
     }
 
+    /// Deliver warnings for qpdf's non-indirect default xref rows at the
+    /// boundary where ObjStm header inspection has made them visible. This is
+    /// the ordering seam that puts object 0 after the containing ObjStm's
+    /// member diagnostics but before the next xref object is resolved
+    /// (`QPDF.cc:1823`, followed by `resolveXRefTable`).
+    fn warn_default_xref_entries(&self) -> Result<()> {
+        let candidates: Vec<QpdfObjGen> = {
+            let core = self.core.borrow();
+            core.default_xref_entries
+                .iter()
+                .copied()
+                .filter(|object_gen| {
+                    !object_gen.is_indirect() && !core.default_xref_warnings.contains(object_gen)
+                })
+                .collect()
+        };
+        for object_gen in candidates {
+            self.push_warning_at(
+                0,
+                format!(
+                    "object {}/{} has unexpected xref entry type",
+                    object_gen.get_obj(),
+                    object_gen.get_gen()
+                ),
+            )?;
+            self.core
+                .borrow_mut()
+                .default_xref_warnings
+                .insert(object_gen);
+        }
+        Ok(())
+    }
+
     #[cfg(test)]
     pub(crate) fn insert_default_xref_entry_for_test(&self, object_ref: ObjectRef) {
         self.insert_default_xref_entry(object_ref);
@@ -2464,12 +2526,19 @@ impl<R: Read + Seek> ResolverHandle<R> {
         let stream_handle = self.get_object_handle(stream_ref);
         stream_handle.try_dereference()?;
         let (stream_end_before_space, stream_end_after_space) = stream_handle.end_offsets();
-        let stream_dict = stream_handle.as_stream_dict().ok_or_else(|| {
-            Error::parse(
-                0,
-                format!("supposed object stream {stream_number} is not a stream"),
-            )
-        })?;
+        let Some(stream_dict) = stream_handle.as_stream_dict() else {
+            // qpdf throws `damagedPDF(message)` here and lets the surrounding
+            // `QPDF::resolve` catch preserve the current object description
+            // and input `getLastOffset()` (`QPDF.cc:1765-1768,
+            // 2617-2644`). Deliver the warning at this responsibility
+            // boundary instead of manufacturing an offset-zero parse error
+            // for the outer generic resolver catch.
+            self.push_damaged_warning(format!(
+                "supposed object stream {stream_number} is not a stream"
+            ))
+            .map_err(ObjectStreamResolutionError::WarningDelivery)?;
+            return Ok(());
+        };
 
         if !stream_dict.try_is_dictionary_of_type(b"ObjStm", b"")? {
             // qpdf uses damagedPDF(message) here, so the warning carries the
@@ -2481,15 +2550,33 @@ impl<R: Read + Seek> ResolverHandle<R> {
             .map_err(ObjectStreamResolutionError::WarningDelivery)?;
         }
 
-        // qpdf calls QPDFObjectHandle::getStreamData(qpdf_dl_specialized)
-        // here. Keep its typed QPDFExc (source name, parsed offset, and empty
-        // object context) intact rather than manufacturing an offsetless
-        // Unsupported error when the stream cannot be filtered.
+        let object_count = match Self::object_stream_integer(&stream_dict, b"/N", "/N") {
+            Ok(value) => value,
+            Err(_) => {
+                self.push_damaged_warning(format!(
+                    "object stream {stream_number} has incorrect keys"
+                ))
+                .map_err(ObjectStreamResolutionError::WarningDelivery)?;
+                return Ok(());
+            }
+        };
+        let first = match Self::object_stream_integer(&stream_dict, b"/First", "/First") {
+            Ok(value) => value,
+            Err(_) => {
+                self.push_damaged_warning(format!(
+                    "object stream {stream_number} has incorrect keys"
+                ))
+                .map_err(ObjectStreamResolutionError::WarningDelivery)?;
+                return Ok(());
+            }
+        };
+        // qpdf validates `/N` and `/First` before it calls
+        // `getStreamData(qpdf_dl_specialized)` (`QPDF.cc:1779-1792`). Keep
+        // decoding after that validation so an incorrect-key warning retains
+        // the stream object's current source offset instead of the payload
+        // read position.
         let decoded_stream_data =
             stream_handle.get_stream_data(crate::writer::DecodeLevel::Specialized)?;
-
-        let object_count = Self::object_stream_integer(&stream_dict, b"/N", "/N")?;
-        let first = Self::object_stream_integer(&stream_dict, b"/First", "/First")?;
         let mut tokenizer = Tokenizer::new(&decoded_stream_data);
         let mut members = BTreeMap::new();
         for _ in 0..object_count {
@@ -2590,6 +2677,7 @@ impl<R: Read + Seek> ResolverHandle<R> {
                 }
             }
         }
+        self.warn_default_xref_entries()?;
         Ok(())
     }
 
@@ -3463,6 +3551,9 @@ impl<R: Read + Seek> ResolverHandle<R> {
         try_recovery: bool,
         read_description: Option<Vec<u8>>,
     ) -> std::result::Result<ParsedObjectAtOffset, ReadObjectAtOffsetError> {
+        let initially_resolved = self
+            .registered_qpdf_obj_gen_handle(expected)
+            .is_some_and(|handle| handle.is_resolved());
         let expected_description = if expected.is_indirect() {
             self.set_last_qpdf_obj_gen_description(expected, read_description.as_deref());
             self.core.borrow().last_object_description_bytes.clone()
@@ -3514,16 +3605,16 @@ impl<R: Read + Seek> ResolverHandle<R> {
                     )));
                 }
             };
-            if try_recovery && found_raw != expected {
-                return Err(ReadObjectAtOffsetError::Header(Error::parse(
-                    offset as usize,
-                    format!("expected {} {} obj", expected.get_obj(), expected.get_gen()),
-                )));
-            }
             if found_raw.get_obj() == 0 {
                 return Err(ReadObjectAtOffsetError::Header(Error::parse(
                     offset as usize,
                     "object with ID 0",
+                )));
+            }
+            if try_recovery && found_raw != expected {
+                return Err(ReadObjectAtOffsetError::Header(Error::parse(
+                    offset as usize,
+                    format!("expected {} {} obj", expected.get_obj(), expected.get_gen()),
                 )));
             }
             let found = found_raw.to_object_ref();
@@ -3629,6 +3720,18 @@ impl<R: Read + Seek> ResolverHandle<R> {
                 .into_direct_value()
                 .expect("live file parser's recovered empty object is always a direct null");
             debug_assert_eq!(parsed_offset, parsed.parsed_offset);
+            // qpdf only records the post-`endobj` extent while the requested
+            // cache slot is still unresolved (`QPDF.cc:1650-1663`). A
+            // self-referential stream length can resolve that slot to null
+            // during `readStream`; in that case qpdf returns from
+            // `readObjectAtOffset` without performing the EOF scan, so the
+            // later outer resolve catch must not manufacture an additional
+            // `EOF after endobj` warning.
+            let capture_end_offsets = capture_end_offsets
+                && !(!initially_resolved
+                    && self
+                        .registered_qpdf_obj_gen_handle(found_raw)
+                        .is_some_and(|handle| handle.is_resolved()));
             let (end_before_space, end_after_space) = if capture_end_offsets {
                 self.object_end_offsets()
                     .map_err(ReadObjectAtOffsetError::Body)?
@@ -3673,6 +3776,11 @@ impl<R: Read + Seek> ResolverHandle<R> {
                     read_description.as_deref(),
                 )
                 .map_err(ReadObjectAtOffsetError::Body)?;
+            let capture_end_offsets = capture_end_offsets
+                && !(!initially_resolved
+                    && self
+                        .registered_qpdf_obj_gen_handle(found_raw)
+                        .is_some_and(|handle| handle.is_resolved()));
             let (end_before_space, end_after_space) = if capture_end_offsets {
                 self.object_end_offsets()
                     .map_err(ReadObjectAtOffsetError::Body)?
@@ -3702,6 +3810,11 @@ impl<R: Read + Seek> ResolverHandle<R> {
                 )
                 .map_err(ReadObjectAtOffsetError::Body)?;
             }
+            let capture_end_offsets = capture_end_offsets
+                && !(!initially_resolved
+                    && self
+                        .registered_qpdf_obj_gen_handle(found_raw)
+                        .is_some_and(|handle| handle.is_resolved()));
             let (end_before_space, end_after_space) = if capture_end_offsets {
                 self.object_end_offsets()
                     .map_err(ReadObjectAtOffsetError::Body)?
@@ -4271,7 +4384,13 @@ impl<R: Read + Seek> ResolverHandle<R> {
                 }
                 return Ok(());
             }
-            if !crate::tokenizer::is_ws(byte) {
+            // qpdf's `QUtil::is_space` excludes NUL
+            // (`include/qpdf/QUtil.hh:497-501`), even though the tokenizer's
+            // broader PDF whitespace predicate accepts it as a delimiter.
+            // `validateStreamLineEnd` must keep the two contracts separate:
+            // a NUL immediately after `stream` is stream data, not
+            // extraneous framing whitespace.
+            if !matches!(byte, b'\t' | b'\n' | b'\x0b' | b'\x0c' | b'\r' | b' ') {
                 self.unread_byte()?;
                 // The non-whitespace byte is unread before qpdf asks the
                 // InputSource for tell(), so the warning points at that byte
@@ -5214,14 +5333,12 @@ impl<R: Read + Seek> ResolverHandle<R> {
                 object_gen.get_obj(),
                 object_gen.get_gen()
             );
-            let filename = self.core.borrow().description.clone();
-            self.push_qpdf_warning(QpdfExc::new(
-                QpdfErrorCode::DamagedPdf,
-                filename,
-                b"",
-                0,
-                detail.as_bytes(),
-            ))?;
+            // qpdf's two-argument `damagedPDF("", message)` overload uses
+            // the input source's `getLastOffset()` while leaving the object
+            // description empty (`QPDF.cc:1710,2617-2628`). Keep this on the
+            // generic warning route so the live source position, rather than
+            // a synthetic zero, is captured at the resolution boundary.
+            self.push_warning(detail)?;
             handle.set_resolved(ObjectValue::Null);
             return Ok(());
         };
@@ -9117,18 +9234,23 @@ mod tests {
                 index: 0,
             },
         );
+        pdf.resolver.set_last_offset(85);
         let handle: ObjectHandle = pdf.get_object_handle(object_ref);
 
         pdf.resolve(&handle)
             .expect("qpdf catches the stream-shape error and resolves the member to null");
         assert!(handle.is_null());
-        assert!(pdf
-            .repair_diagnostics()
+        let diagnostics = pdf.repair_diagnostics();
+        let diagnostic = diagnostics
             .entries()
             .iter()
-            .any(|diagnostic| diagnostic
-                .message_string()
-                .contains("supposed object stream 9 is not a stream")));
+            .find(|diagnostic| {
+                diagnostic
+                    .message_string()
+                    .contains("supposed object stream 9 is not a stream")
+            })
+            .expect("the object-stream shape warning must be recorded");
+        assert_eq!(diagnostic.get_file_position(), 85);
 
         assert!(
             pdf.resolver.core.borrow().resolving.is_empty(),
@@ -9162,6 +9284,51 @@ mod tests {
             .any(|diagnostic| diagnostic
                 .message_string()
                 .contains("supposed object stream 9 is not a stream")));
+    }
+
+    #[test]
+    fn an_object_stream_with_incorrect_keys_uses_qpdf_warning_context() {
+        let mut pdf = Pdf::open_mem_owned(minimal_pdf_bytes()).expect("open");
+        let member_ref = ObjectRef::new(1, 0);
+        let stream_ref = ObjectRef::new(4, 0);
+        pdf.resolver.insert_xref_entry(
+            member_ref,
+            crate::XrefEntry::Compressed {
+                stream: stream_ref.number,
+                index: 0,
+            },
+        );
+        pdf.resolver.set_last_offset(11_551);
+        pdf.resolver
+            .set_last_qpdf_obj_gen_description(QpdfObjGen::new(1, 0), None);
+        pdf.resolver
+            .get_object_handle(stream_ref)
+            .set_resolved(ObjectValue::Stream {
+                stream_dict: ObjectHandle::dictionary(vec![(
+                    b"/Type".to_vec(),
+                    ObjectHandle::name(b"NotObjStm".to_vec()),
+                )]),
+                stream_data: Some(Rc::new(Vec::new())),
+                stream_provider: None,
+                filter_on_write: true,
+                stream_length: 0,
+            });
+
+        let member = pdf.get_object_handle(member_ref);
+        pdf.resolve(&member)
+            .expect("qpdf catches the bad ObjStm keys");
+        let diagnostics = pdf.repair_diagnostics();
+        let warning = diagnostics
+            .entries()
+            .iter()
+            .find(|diagnostic| {
+                diagnostic
+                    .message_string()
+                    .contains("object stream 4 has incorrect keys")
+            })
+            .expect("the incorrect-key warning must be recorded");
+        assert_eq!(warning.get_file_position(), 11_551);
+        assert_eq!(warning.get_object(), b"object 1 0");
     }
 
     #[test]
@@ -10696,9 +10863,9 @@ mod tests {
     /// string, not a `contains`, because the point is the wording and the
     /// space separator rather than the mere presence of a warning.
     ///
-    /// The assertion that the collection was empty beforehand matters as much
-    /// as the one after it: this fixture opens cleanly, so a warning appearing
-    /// at all is attributable to the loop and not to the parse.
+    /// qpdf's two-argument `damagedPDF("", message)` keeps the input source's
+    /// `getLastOffset()` (`QPDF.cc:2617-2628`), so make that state non-zero to
+    /// catch a resolver that silently substitutes offset zero.
     #[test]
     fn a_detected_loop_warns_with_qpdfs_message_text() {
         let mut pdf = Pdf::open_mem_owned(minimal_pdf_bytes()).expect("open");
@@ -10710,6 +10877,7 @@ mod tests {
         );
 
         let resolver = Rc::clone(&pdf.resolver);
+        resolver.set_last_offset(42);
         let outer = ResolveMark::begin(&resolver.core, QpdfObjGen::from_object_ref(object_ref))
             .expect("first mark");
         pdf.resolve(&handle).expect("a loop is not an error");
@@ -10721,11 +10889,11 @@ mod tests {
             .iter()
             .map(|entry| String::from_utf8_lossy(entry.what_bytes()).into_owned())
             .collect::<Vec<_>>();
-        assert_eq!(messages, ["loop detected resolving object 1 0"]);
+        assert_eq!(messages, ["offset 42: loop detected resolving object 1 0"]);
         assert_eq!(
             diagnostics.entries()[0].get_file_position(),
-            0,
-            "qpdf uses offset zero for this contextless warning"
+            42,
+            "qpdf's contextless damagedPDF warning uses the input last offset"
         );
     }
 
@@ -11530,6 +11698,19 @@ mod tests {
             .read_object_at_offset(0, ObjectRef::new(0, 0))
             .expect_err("qpdf rejects object ID zero");
         assert_eq!(error.to_string(), "parse error at byte 0: object with ID 0");
+    }
+
+    #[test]
+    fn live_object_header_reports_object_zero_before_an_expected_identity_mismatch() {
+        let resolver = resolver_over(b"0 0 obj\n42\nendobj\n".to_vec());
+
+        let error = resolver
+            .read_object_at_offset_with_description(0, QpdfObjGen::new(1, 0), true, true, None)
+            .expect_err("qpdf checks object ID zero before the expected identity");
+        assert_eq!(
+            error.into_error().to_string(),
+            "parse error at byte 0: object with ID 0"
+        );
     }
 
     #[test]
@@ -13124,6 +13305,11 @@ mod tests {
             (
                 b"",
                 b"(abc)",
+                &["object 2 0, offset 75: stream keyword not followed by proper line terminator"][..],
+            ),
+            (
+                b"",
+                b"\0abc",
                 &["object 2 0, offset 75: stream keyword not followed by proper line terminator"][..],
             ),
         ] {

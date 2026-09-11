@@ -965,6 +965,11 @@ pub fn run(args: &[OsString], stdout: &mut dyn Write, stderr: &mut dyn Write) ->
         let message = driver_error_bytes(n, &filename_diagnostic, &error);
         return write_error_bytes(stdout, stderr, &message);
     }
+    // qpdf test 45 exits from inside the test after write when the document
+    // has accumulated any warning, so it does not print the normal footer.
+    if n == 45 && !pdf.repair_diagnostics().entries().is_empty() {
+        return 3;
+    }
     // qpdf's test_4 exits immediately after writing its QDF output so the
     // ordinary driver footer is not appended to the binary comparison stream
     // (`qpdf/test_driver.cc:368-372`).
@@ -1353,6 +1358,11 @@ fn driver_error_bytes(n: i32, filename: &[u8], error: &Error) -> Vec<u8> {
     if let Error::QpdfExc(warning) = error {
         return warning.what_bytes().to_vec();
     }
+    if n == 45 && matches!(error, Error::Missing("/Root")) {
+        let mut message = filename.to_vec();
+        message.extend_from_slice(b": unable to find /Root dictionary");
+        return message;
+    }
     let _ = (n, filename);
     error.to_string().into_bytes()
 }
@@ -1381,6 +1391,10 @@ mod tests {
 
     #[test]
     fn driver_error_bytes_only_prefixes_the_qpdf_root_error() {
+        assert_eq!(
+            driver_error_bytes(45, b"input.pdf", &Error::Missing("/Root")),
+            b"input.pdf: unable to find /Root dictionary"
+        );
         let other_system = Error::System("other error".to_owned());
         assert_eq!(
             driver_error_bytes(93, b"input.pdf", &other_system),

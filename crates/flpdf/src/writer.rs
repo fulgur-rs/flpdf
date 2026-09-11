@@ -832,6 +832,17 @@ impl<'pdf, R: Read + Seek + 'static> PdfWriter<'pdf, R> {
                 Flate::set_compression_level(level)?;
             }
         }
+        // QPDFWriter's constructor snapshots `pdf.getRoot().getObjGen()`
+        // before `doWriteSetup`/`getObjectCount`
+        // (`QPDFWriter.cc:53,2059-2065`). Resolve the trailer's Root handle
+        // at the same writer-owned boundary so root-driven lazy diagnostics
+        // precede the full xref-table walk; a missing Root remains a direct
+        // null candidate and is reported later by the normal writer route.
+        let root = self.pdf.trailer_key_handle(b"Root");
+        root.try_dereference()?;
+        if root.try_as_dictionary()?.is_none() {
+            return Err(crate::Error::Missing("/Root"));
+        }
         let setup = build_writer_setup(self.pdf, &options)?;
         // Page-tree repair below mutates `self.pdf`'s object graph in place
         // (promoting direct /Kids leaves, cloning duplicate leaves) and is not
@@ -849,6 +860,12 @@ impl<'pdf, R: Read + Seek + 'static> PdfWriter<'pdf, R> {
         // the repaired page order and its three derived maps together so the
         // specialized emitter consumes this setup without another page walk.
         let special_streams = initialize_special_streams(self.pdf, &options)?;
+        // qpdf snapshots `getObjectCount()` for every write, even when no
+        // progress reporter is configured (`QPDFWriter.cc:2189-2195`). That
+        // call is also the document-owned `fixDanglingReferences` boundary,
+        // so skipping it on the no-progress route changes lazy warning timing
+        // and the order in which malformed xref objects are resolved.
+        self.pdf.get_object_count()?;
         crate::writer::configure_progress_for_pdf(
             self.pdf,
             &options,
@@ -2817,6 +2834,9 @@ pub(crate) fn build_copy_encryption_parameters(
 pub(crate) struct WriterSetupState {
     pub(crate) generated_id: Option<ObjectHandle>,
     pub(crate) encryption_parameters: Option<EncryptionParameters>,
+    /// qpdf captures source ObjStm membership during `doWriteSetup`, before
+    /// the later `getObjectCount` xref walk can reconstruct damaged input.
+    pub(crate) source_object_stream_data: BTreeMap<u32, u32>,
 }
 
 /// Build the shared writer state before standard/linearized dispatch.
@@ -2824,6 +2844,10 @@ pub(crate) fn build_writer_setup<R: Read + Seek>(
     pdf: &mut Pdf<R>,
     options: &WriterOptions,
 ) -> Result<WriterSetupState> {
+    let mut source_object_stream_data = BTreeMap::new();
+    if options.object_streams == ObjectStreamMode::Preserve {
+        pdf.get_object_stream_data(&mut source_object_stream_data);
+    }
     let encrypting = options.encrypt.is_some() || options.copy_encryption.is_some();
     if uses_deterministic_id(options) && encrypting {
         return Err(deterministic_id_encryption_error(options));
@@ -2885,6 +2909,7 @@ pub(crate) fn build_writer_setup<R: Read + Seek>(
     Ok(WriterSetupState {
         generated_id,
         encryption_parameters,
+        source_object_stream_data,
     })
 }
 
@@ -3976,6 +4001,7 @@ fn emit_canonical_pdf_inner<R: Read + Seek, W: Write>(
     let WriterSetupState {
         generated_id,
         encryption_parameters,
+        source_object_stream_data,
     } = setup;
     let deterministic_id = uses_deterministic_id(options);
 
@@ -4067,7 +4093,13 @@ fn emit_canonical_pdf_inner<R: Read + Seek, W: Write>(
     }
 
     if plain_route {
-        return plain::write_plain(pdf, out, options, generated_id.as_ref());
+        return plain::write_plain(
+            pdf,
+            out,
+            options,
+            generated_id.as_ref(),
+            &source_object_stream_data,
+        );
     }
 
     // Only specialized modes reach the legacy coordinator below: QDF, output or
@@ -5890,6 +5922,7 @@ mod final_handle_writer_tests {
         let setup = WriterSetupState {
             generated_id: Some(generated_id),
             encryption_parameters: None,
+            source_object_stream_data: BTreeMap::new(),
         };
         let mut output = Vec::new();
 

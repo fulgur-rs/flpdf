@@ -165,10 +165,13 @@ impl LiveQueue {
             // a member, directly or through a chain, so this recursion is not
             // bounded by construction. qpdf guards it by storing the invalid
             // object ID `0` before recursing and ignoring the object when it
-            // meets that sentinel again (`:1097-1104,1120-1124`), which drops
-            // the looping object entirely.
+            // meets that sentinel again (`:1097-1104,1120-1124`).
             if !self.resolving_members.insert(source) {
-                return Ok(None);
+                // qpdf leaves the invalid object-number sentinel in
+                // `obj_renumber` and later serializes references to it as
+                // `0 0 R`; returning a missing queue result instead turns
+                // the same damaged graph into a writer exception.
+                return Ok(Some(ObjectRef::new(0, 0)));
             }
             let container_handle = pdf.get_object_handle(container);
             self.enqueue_handle(pdf, container_handle)?;
@@ -695,6 +698,25 @@ impl<'a, R: Read + Seek + 'static> LiveObjectEmitter<'a, R> {
                     })
                 // cov:ignore-end
             };
+            handle.try_dereference()?;
+            let handle = if handle.as_stream_dict().is_some() {
+                // qpdf's `writeObjectStream` warns through the member handle
+                // and substitutes an indirect null before serialization
+                // (`QPDFWriter.cc:1690-1705`). Preserve that writer-owned
+                // damage policy instead of letting a stream payload enter an
+                // ObjStm member body.
+                // qpdf builds an ObjStm body twice (offset pass and write
+                // pass), and this warning is inside that two-pass loop
+                // (`QPDFWriter.cc:1621-1705`), so the same damaged member
+                // warning is intentionally delivered twice.
+                for _ in 0..2 {
+                    handle
+                        .warn_if_possible("stream found inside object stream; treating as null")?;
+                }
+                ObjectHandle::null()
+            } else {
+                handle.clone()
+            };
             let result = if handle.object_ref() == root_source {
                 handle.write_root_object_with_dynamic_ref_map(
                     out,
@@ -1139,13 +1161,30 @@ impl<R: Read + Seek + 'static> PlainObjectEmitter<'_, R> {
                     out.extend_from_slice(format!("%% Page {sequence}\n").as_bytes());
                 }
             }
+            handle.try_dereference()?;
+            let is_root = handle.object_ref() == plan.root_source;
+            let handle_to_write = if handle.as_stream_dict().is_some() {
+                // qpdf's `writeObjectStream` warns through the member handle
+                // and substitutes an indirect null before serialization
+                // (`QPDFWriter.cc:1690-1705`). Preserve the same policy on
+                // the planned source-backed ObjStm route.
+                // See the live writer above: qpdf warns once in each of its
+                // two ObjStm passes.
+                for _ in 0..2 {
+                    handle
+                        .warn_if_possible("stream found inside object stream; treating as null")?;
+                }
+                ObjectHandle::null()
+            } else {
+                handle.clone()
+            };
             let result = if options.qdf {
                 // A Catalog compressed into an ObjStm is still the root, and
                 // qpdf's ADBE arbitration keys on `is_root` rather than on the
                 // output mode (`QPDFWriter.cc:1396-1436`), so it applies here
                 // exactly as it does to an uncompressed root.
-                if handle.object_ref() == plan.root_source {
-                    let arbitrated = handle.output_root_copy_with_adbe(
+                if is_root {
+                    let arbitrated = handle_to_write.output_root_copy_with_adbe(
                         &plan.version,
                         plan.final_extension_level,
                         true,
@@ -1157,15 +1196,15 @@ impl<R: Read + Seek + 'static> PlainObjectEmitter<'_, R> {
                         &plan.removed_refs,
                     )
                 } else {
-                    handle.write_object_qdf_with_ref_map_and_removed(
+                    handle_to_write.write_object_qdf_with_ref_map_and_removed(
                         out,
                         0,
                         &map,
                         &plan.removed_refs,
                     )
                 }
-            } else if handle.object_ref() == plan.root_source {
-                handle.write_root_object_with_ref_map_and_removed(
+            } else if is_root {
+                handle_to_write.write_root_object_with_ref_map_and_removed(
                     out,
                     &map,
                     &plan.removed_refs,
@@ -1174,7 +1213,7 @@ impl<R: Read + Seek + 'static> PlainObjectEmitter<'_, R> {
                     true,
                 )
             } else {
-                handle.write_object_with_ref_map_and_removed(out, &map, &plan.removed_refs)
+                handle_to_write.write_object_with_ref_map_and_removed(out, &map, &plan.removed_refs)
             };
             if result.is_ok() {
                 crate::writer::report_progress_event(options)?;

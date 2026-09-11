@@ -563,30 +563,23 @@ pub(crate) fn run_test_44<R: Read + Seek>(
 
 pub(crate) fn run_test_45<R: Read + Seek>(
     pdf: &mut Pdf<R>,
-    _filename: &[u8],
+    filename: &[u8],
     _arg2: Option<&OsStr>,
-    _stdout: &mut dyn Write,
-    _stderr: &mut dyn Write,
-    _diagnostics_written: &mut usize,
+    stdout: &mut dyn Write,
+    stderr: &mut dyn Write,
+    diagnostics_written: &mut usize,
 ) -> flpdf::Result<()> {
     // qpdf 11.9.0 qpdf/test_driver.cc:1631-1643.
     let mut writer = PdfWriter::new(pdf);
     writer.set_output_file("a.pdf")?;
     writer.set_static_id(true);
-    writer.write()?;
-
-    // GAP(QPDF::getWarnings): qpdf's `pdf.getWarnings()` returns every
-    // `QPDFExc` accumulated in `m->warnings` across the `QPDF` instance's
-    // whole lifetime, including ones `QPDFWriter::write` raises through
-    // `pipeStreamData`'s warn callback while copying stream data. flpdf's
-    // writer (`crates/flpdf/src/writer.rs`, `writer/*.rs`) never calls
-    // `Pdf::push_warning` (confirmed by grep: no hits in either), so
-    // `Pdf::repair_diagnostics()` -- the crate's `m->warnings`-equivalent
-    // sink, also fed by `nntree.rs`/`object_copy.rs` outside repair --
-    // reflects only open-time diagnostics here, not any write-time ones a
-    // real qpdf run against an obfuscated file could add. There is no
-    // accessor with qpdf's full-lifecycle coverage, so the `exit(3)` gate
-    // is skipped.
+    let write_result = writer.write();
+    // qpdf observes the warning collection after the writer returns. Flush
+    // it before propagating a writer error so malformed inputs retain the
+    // warnings emitted before their terminal failure.
+    emit_new_diagnostics(pdf, diagnostics_written, filename, stdout, stderr)
+        .map_err(flpdf::Error::Io)?;
+    write_result?;
     Ok(())
 }
 

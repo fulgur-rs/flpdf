@@ -2,7 +2,7 @@
 //! Logical object placements for the qpdf-shaped plain writer pipeline.
 
 use std::cell::RefCell;
-use std::collections::{BTreeSet, HashMap};
+use std::collections::{BTreeMap, BTreeSet, HashMap};
 use std::io::{Read, Seek};
 
 use crate::pdf_version::{parse_qpdf_writer_version, QpdfVersionParts};
@@ -124,10 +124,25 @@ impl PlainWritePlan {
         Self::build_with_generated_id(pdf, options, None)
     }
 
+    #[cfg(test)]
     pub(crate) fn build_with_generated_id<R: Read + Seek>(
         pdf: &mut Pdf<R>,
         options: &WriterOptions,
         setup_generated_id: Option<&crate::ObjectHandle>,
+    ) -> crate::Result<Self> {
+        Self::build_with_generated_id_and_source_object_stream_data(
+            pdf,
+            options,
+            setup_generated_id,
+            None,
+        )
+    }
+
+    pub(crate) fn build_with_generated_id_and_source_object_stream_data<R: Read + Seek>(
+        pdf: &mut Pdf<R>,
+        options: &WriterOptions,
+        setup_generated_id: Option<&crate::ObjectHandle>,
+        source_object_stream_data: Option<&BTreeMap<u32, u32>>,
     ) -> crate::Result<Self> {
         let source_root_ref = pdf.root_ref();
         let source_root_handle = if source_root_ref.is_none() {
@@ -219,9 +234,10 @@ impl PlainWritePlan {
                     placement
                 } else {
                     let mut packing =
-                        object_streams::plan_qpdf_preserve_object_streams_with_unreferenced(
+                        object_streams::plan_qpdf_preserve_object_streams_with_source_membership(
                             pdf,
                             options.preserve_unreferenced_objects,
+                            source_object_stream_data,
                         )?; // cov:ignore: malformed source graph is rejected by the preserve planner
                     packing
                         .removed_refs

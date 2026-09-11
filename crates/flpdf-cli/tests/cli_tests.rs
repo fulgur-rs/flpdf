@@ -745,7 +745,9 @@ fn ignore_xref_streams_applies_to_an_overlay_source() {
         ])
         .assert()
         .code(2)
-        .stderr(predicate::str::contains("parse error"));
+        .stderr(predicate::str::contains(
+            "error decoding candidate xref stream while recovering damaged file",
+        ));
 }
 
 #[test]
@@ -765,7 +767,9 @@ fn ignore_xref_streams_applies_to_a_copy_attachments_donor() {
         ])
         .assert()
         .code(2)
-        .stderr(predicate::str::contains("parse error"));
+        .stderr(predicate::str::contains(
+            "error decoding candidate xref stream while recovering damaged file",
+        ));
 }
 
 #[test]
@@ -784,7 +788,9 @@ fn ignore_xref_streams_applies_to_a_copy_encryption_donor() {
         ])
         .assert()
         .code(2)
-        .stderr(predicate::str::contains("parse error"));
+        .stderr(predicate::str::contains(
+            "error decoding candidate xref stream while recovering damaged file",
+        ));
 }
 
 #[test]
@@ -862,7 +868,9 @@ fn is_encrypted_applies_ignore_xref_streams() {
         ])
         .assert()
         .code(2)
-        .stderr(predicate::str::contains("parse error"));
+        .stderr(predicate::str::contains(
+            "error decoding candidate xref stream while recovering damaged file",
+        ));
 }
 
 #[test]

@@ -2301,6 +2301,16 @@ fn write_child_with_dynamic_ref_map(
     map: &mut DynamicObjectRefMap<'_>,
     removed_refs: &BTreeSet<ObjectRef>,
 ) -> Result<()> {
+    // qpdf's writer treats raw object number 0 as its null placeholder even
+    // when the handle cannot cross the normal ObjectRef generation boundary;
+    // do not send that placeholder into the live queue's discovery callback.
+    if handle
+        .qpdf_obj_gen()
+        .is_some_and(|object_gen| object_gen.get_obj() == 0)
+    {
+        out.extend_from_slice(b"null");
+        return Ok(());
+    }
     if let Some(object_ref) = handle.object_ref() {
         if object_ref.number == 0 || removed_refs.contains(&object_ref) {
             out.extend_from_slice(b"null");
