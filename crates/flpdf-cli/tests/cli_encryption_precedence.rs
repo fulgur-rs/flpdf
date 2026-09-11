@@ -193,7 +193,8 @@ fn overridden_encrypt_still_validates_its_key_length() {
     assert_eq!(qpdf.status.code(), Some(2));
     assert_eq!(flpdf.status.code(), qpdf.status.code());
     assert!(
-        String::from_utf8_lossy(&flpdf.stderr).contains("KEY-LEN"),
+        String::from_utf8_lossy(&flpdf.stderr)
+            .contains("encryption key length must be 40, 128, or 256"),
         "flpdf should validate the overridden encryption occurrence: {}",
         String::from_utf8_lossy(&flpdf.stderr)
     );

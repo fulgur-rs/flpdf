@@ -957,6 +957,52 @@ fn encrypt_round_trip_on_one_page_decrypts_cleanly_via_qpdf() {
 // `parse_encrypt_segment` accept matrix don't silently change error messages
 // that users may grep for.
 
+#[test]
+fn invalid_encrypt_key_length_matches_qpdf_usage_message() {
+    if !ensure_qpdf_or_skip() {
+        return;
+    }
+    let temp = tempfile::tempdir().unwrap();
+    let qpdf_output = temp.path().join("qpdf.pdf");
+    let flpdf_output = temp.path().join("flpdf.pdf");
+    let fixture = fixture(UNENCRYPTED_FIXTURE);
+    let args = ["--encrypt", "u", "o", "999", "--"];
+
+    let qpdf = ShellCommand::new("qpdf")
+        .args(args)
+        .arg(&fixture)
+        .arg(&qpdf_output)
+        .output()
+        .unwrap();
+    let flpdf = Command::cargo_bin("flpdf")
+        .unwrap()
+        .args(args)
+        .arg(&fixture)
+        .arg(&flpdf_output)
+        .output()
+        .unwrap();
+
+    assert_eq!(qpdf.status.code(), Some(2));
+    assert_eq!(flpdf.status.code(), qpdf.status.code());
+    let qpdf_stderr = String::from_utf8_lossy(&qpdf.stderr);
+    let qpdf_line = qpdf_stderr
+        .lines()
+        .find(|line| !line.is_empty())
+        .unwrap()
+        .strip_prefix("qpdf: ")
+        .unwrap();
+    let flpdf_stderr = String::from_utf8_lossy(&flpdf.stderr);
+    let flpdf_line = flpdf_stderr
+        .lines()
+        .find(|line| !line.is_empty())
+        .unwrap()
+        .strip_prefix("flpdf: ")
+        .unwrap();
+    assert_eq!(flpdf_line, qpdf_line);
+    assert!(!qpdf_output.exists());
+    assert!(!flpdf_output.exists());
+}
+
 /// KEY-LEN=40 is V=1 RC4-40 — weak crypto. The writer
 /// dispatch, but (like qpdf) refuses to write RC4 without --allow-weak-crypto.
 #[test]

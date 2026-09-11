@@ -5829,7 +5829,7 @@ fn parse_encrypt_key_len(value: &str) -> CliResult<u32> {
         format!("--encrypt KEY-LEN must be a positive integer (40 / 128 / 256), got: {value:?}")
     })?;
     if !matches!(key_len, 40 | 128 | 256) {
-        return Err(format!("--encrypt KEY-LEN must be 40, 128, or 256 (got {key_len})").into());
+        return Err("encryption key length must be 40, 128, or 256".into());
     }
     Ok(key_len)
 }
