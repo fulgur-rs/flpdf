@@ -8005,7 +8005,7 @@ fn add_attachment_missing_segment_terminator_is_a_usage_error() {
         .failure()
         .code(2)
         .stderr(predicate::str::contains(
-            "--add-attachment: missing -- terminator",
+            "missing -- at end of attachment options",
         ));
 }
 

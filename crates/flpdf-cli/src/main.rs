@@ -323,6 +323,7 @@ fn top_level_writer_options(
         EncryptionCliOptions {
             encrypt: args.raw_encrypt.as_deref(),
             encrypt_segments: args.raw_encrypt_segments.as_deref(),
+            parsed_encrypt_segments: args.parsed_encrypt_segments.as_deref(),
             copy_encryption: args.copy_encryption.as_deref(),
             encryption_file_password: args.raw_encryption_file_password.as_deref(),
             password_args: &args.password,
@@ -1582,6 +1583,8 @@ struct Cli {
     #[arg(skip)]
     raw_encrypt_segments: Option<Vec<Vec<Vec<u8>>>>,
     #[arg(skip)]
+    parsed_encrypt_segments: Option<Vec<ParsedEncryptSegment>>,
+    #[arg(skip)]
     last_encryption_mode: Option<EncryptionMode>,
 
     /// Copy the /Encrypt dictionary from a donor PDF and use its passwords for
@@ -1691,6 +1694,8 @@ struct PageOpArgs {
     pages: Vec<OsString>,
     #[arg(skip)]
     raw_pages: Option<Vec<Vec<u8>>>,
+    #[arg(skip)]
+    parsed_page_specs: Option<Vec<PageSegmentSpec>>,
 
     /// Rotate pages by a multiple of 90 degrees (qpdf `--rotate`).
     ///
@@ -2027,6 +2032,8 @@ struct RewriteCommand {
     encrypt: Option<Vec<OsString>>,
     #[arg(skip)]
     raw_encrypt: Option<Vec<Vec<u8>>>,
+    #[arg(skip)]
+    parsed_encrypt_segments: Option<Vec<ParsedEncryptSegment>>,
     /// Copy the /Encrypt dictionary from a donor PDF and use its passwords for
     /// output encryption (qpdf --copy-encryption equivalent).
     ///
@@ -2684,15 +2691,32 @@ fn warn_if_static_id(args: &Cli) {
 
 fn preprocess_qpdf_args<T: Into<OsString>>(args: Vec<T>) -> CliResult<PreprocessedArgs> {
     let args = args.into_iter().map(Into::into).collect();
-    let parsed = arg_parser::ArgParser::from_command(cli_command()).parse_os(args)?;
-    let mut overlay_specs = Vec::new();
+    let mut segment_handler = QpdfSegmentHandler::default();
+    let parsed = arg_parser::ArgParser::from_command(cli_command())
+        .parse_os_with_handler(args, &mut segment_handler)?;
+    let QpdfSegmentHandler {
+        overlay_specs,
+        page_specs,
+        encrypt_segments,
+        ..
+    } = segment_handler;
+    let arg_parser::ParsedArgs {
+        residual_args,
+        original_residual_args,
+        raw_residual_args,
+        raw_named_segments,
+        native_subcommand_mode,
+        expanded_arg_count,
+        first_unknown_option,
+        ..
+    } = parsed;
     let mut attachment_segments = Vec::new();
     let mut raw_encrypt = None;
     let mut raw_encrypt_segments = Vec::new();
     let mut raw_pages = None;
     let mut raw_copy_attachments_from = Vec::new();
 
-    for segment in parsed.raw_named_segments {
+    for segment in raw_named_segments {
         let option = segment.option;
         let tokens = segment
             .tokens
@@ -2700,25 +2724,13 @@ fn preprocess_qpdf_args<T: Into<OsString>>(args: Vec<T>) -> CliResult<Preprocess
             .map(|token| token.as_bytes().to_vec())
             .collect::<Vec<_>>();
         match option.as_str() {
-            "overlay" => overlay_specs.push(parse_overlay_segment(OverlayKind::Overlay, &tokens)?),
-            "underlay" => {
-                overlay_specs.push(parse_overlay_segment(OverlayKind::Underlay, &tokens)?)
-            }
+            "overlay" | "underlay" => {}
             "add-attachment" => attachment_segments.push(tokens),
             "encrypt" => {
                 raw_encrypt_segments.push(tokens.clone());
                 raw_encrypt = Some(tokens);
             }
-            "pages" => {
-                // qpdf rejects a second --pages group as a usage error
-                // (`QPDFJob_config.cc:945-951`).
-                if raw_pages.is_some() {
-                    return Err(Box::new(UsageError::new(
-                        "--pages may only be specified one time",
-                    )));
-                }
-                raw_pages = Some(tokens)
-            }
+            "pages" => raw_pages = Some(tokens),
             "copy-attachments-from" => {
                 // qpdf accumulates every --copy-attachments-from group and
                 // copies from all of them (`QPDFJob.hh:683`,
@@ -2730,24 +2742,26 @@ fn preprocess_qpdf_args<T: Into<OsString>>(args: Vec<T>) -> CliResult<Preprocess
     }
 
     Ok(PreprocessedArgs {
-        residual_args: parsed.residual_args,
-        original_residual_args: parsed.original_residual_args,
-        native_subcommand_mode: parsed.native_subcommand_mode,
-        expanded_arg_count: parsed.expanded_arg_count,
-        first_unknown_option: parsed.first_unknown_option,
+        residual_args,
+        original_residual_args,
+        native_subcommand_mode,
+        expanded_arg_count,
+        first_unknown_option,
         overlay_specs,
         attachment_segments,
         raw_overrides: RawCliOverrides {
-            password: raw_option_value(&parsed.raw_residual_args, "password"),
+            password: raw_option_value(&raw_residual_args, "password"),
             encryption_file_password: raw_option_value(
-                &parsed.raw_residual_args,
+                &raw_residual_args,
                 "encryption-file-password",
             ),
             raw_encrypt,
             raw_pages,
+            parsed_page_specs: page_specs,
             raw_encrypt_segments: (!raw_encrypt_segments.is_empty())
                 .then_some(raw_encrypt_segments),
-            last_encryption_mode: last_encryption_mode(&parsed.raw_residual_args),
+            parsed_encrypt_segments: (!encrypt_segments.is_empty()).then_some(encrypt_segments),
+            last_encryption_mode: last_encryption_mode(&raw_residual_args),
             raw_copy_attachments_from: (!raw_copy_attachments_from.is_empty())
                 .then_some(raw_copy_attachments_from),
         },
@@ -2845,6 +2859,8 @@ fn apply_raw_overrides(args: &mut Cli, overrides: RawCliOverrides) {
         raw_encrypt,
         raw_encrypt_segments,
         raw_pages,
+        parsed_page_specs,
+        parsed_encrypt_segments,
         last_encryption_mode,
         raw_copy_attachments_from,
     } = overrides;
@@ -2858,8 +2874,10 @@ fn apply_raw_overrides(args: &mut Cli, overrides: RawCliOverrides) {
     args.raw_encrypt =
         raw_encrypt.or_else(|| args.encrypt.as_ref().map(|tokens| raw_os_args(tokens)));
     args.raw_encrypt_segments = raw_encrypt_segments;
+    args.parsed_encrypt_segments = parsed_encrypt_segments.clone();
     args.page_ops.raw_pages = raw_pages
         .or_else(|| (!args.page_ops.pages.is_empty()).then(|| raw_os_args(&args.page_ops.pages)));
+    args.page_ops.parsed_page_specs = parsed_page_specs.clone();
     args.raw_copy_attachments_from = raw_copy_attachments_from.or_else(|| {
         (!args.copy_attachments_from.is_empty())
             .then(|| vec![raw_os_args(&args.copy_attachments_from)])
@@ -2881,7 +2899,9 @@ fn apply_raw_overrides(args: &mut Cli, overrides: RawCliOverrides) {
                 command.password.raw_password = password.clone();
                 command.raw_encryption_file_password = args.raw_encryption_file_password.clone();
                 command.raw_encrypt = args.raw_encrypt.clone();
+                command.parsed_encrypt_segments = args.parsed_encrypt_segments.clone();
                 command.page_ops.raw_pages = args.page_ops.raw_pages.clone();
+                command.page_ops.parsed_page_specs = args.page_ops.parsed_page_specs.clone();
                 command.raw_copy_attachments_from = args.raw_copy_attachments_from.clone();
             }
             Commands::CheckLinearization(_)
@@ -3709,6 +3729,7 @@ fn main() {
             EncryptionCliOptions {
                 encrypt: args.raw_encrypt.as_deref(),
                 encrypt_segments: args.raw_encrypt_segments.as_deref(),
+                parsed_encrypt_segments: args.parsed_encrypt_segments.as_deref(),
                 copy_encryption: None,
                 encryption_file_password: args.raw_encryption_file_password.as_deref(),
                 password_args: &args.password,
@@ -4013,7 +4034,7 @@ fn run_top_level_page_selection_inspection(
         job.config().input_file(input.clone())?;
     }
 
-    let raw_specs = parse_pages_segment(&raw_page_tokens(&args.page_ops))?;
+    let raw_specs = configured_page_specs(&args.page_ops)?;
     {
         let mut configuration = job.config();
         for spec in raw_specs {
@@ -4431,8 +4452,7 @@ fn apply_json_page_specs<R: Read + Seek + 'static>(
         return Ok(());
     }
 
-    let page_tokens = raw_page_tokens(page_ops);
-    let raw_specs = parse_pages_segment(&page_tokens)?;
+    let raw_specs = configured_page_specs(page_ops)?;
     let inputs = resolve_page_specs(&raw_specs, primary_input)?;
     if inputs.iter().any(|input| input.path != primary_input) {
         return Err("--pages: JSON output currently accepts only the primary input source".into());
@@ -4793,6 +4813,7 @@ fn run_command(command: Commands, overlay_specs: &[OverlaySpec]) -> CliResult<()
                 EncryptionCliOptions {
                     encrypt: cmd.raw_encrypt.as_deref(),
                     encrypt_segments: None,
+                    parsed_encrypt_segments: cmd.parsed_encrypt_segments.as_deref(),
                     copy_encryption: cmd.copy_encryption.as_deref(),
                     encryption_file_password: cmd.raw_encryption_file_password.as_deref(),
                     password_args: &cmd.password,
@@ -5056,6 +5077,7 @@ fn run_check_linearization(
 struct EncryptionCliOptions<'a> {
     encrypt: Option<&'a [Vec<u8>]>,
     encrypt_segments: Option<&'a [Vec<Vec<u8>>]>,
+    parsed_encrypt_segments: Option<&'a [ParsedEncryptSegment]>,
     copy_encryption: Option<&'a std::path::Path>,
     encryption_file_password: Option<&'a [u8]>,
     password_args: &'a PasswordArgs,
@@ -5073,25 +5095,30 @@ fn apply_encryption_options(options: &mut WriterOptions, inputs: EncryptionCliOp
     let EncryptionCliOptions {
         encrypt,
         encrypt_segments,
+        parsed_encrypt_segments,
         copy_encryption,
         encryption_file_password,
         password_args,
         suppress_warnings,
         last_mode,
     } = inputs;
-    let parsed_encrypt = encrypt_segments.map(|segments| {
-        let mut parsed = None;
-        for segment in segments {
-            match parse_encrypt_segment(segment) {
-                Ok(value) => parsed = Some(value),
-                Err(error) => {
-                    emit_logger_error(format!("{}: {error}\n", progname()));
-                    std::process::exit(2);
+    let parsed_encrypt = parsed_encrypt_segments
+        .and_then(|segments| segments.last().cloned())
+        .or_else(|| {
+            encrypt_segments.map(|segments| {
+                let mut parsed = None;
+                for segment in segments {
+                    match parse_encrypt_segment(segment) {
+                        Ok(value) => parsed = Some(value),
+                        Err(error) => {
+                            emit_logger_error(format!("{}: {error}\n", progname()));
+                            std::process::exit(2);
+                        }
+                    }
                 }
-            }
-        }
-        parsed
-    });
+                parsed.expect("non-empty encrypt segment list")
+            })
+        });
     match last_mode.or_else(|| {
         if encrypt.is_some() {
             Some(EncryptionMode::Encrypt)
@@ -5102,7 +5129,7 @@ fn apply_encryption_options(options: &mut WriterOptions, inputs: EncryptionCliOp
         }
     }) {
         Some(EncryptionMode::Encrypt) => {
-            let parsed = parsed_encrypt.flatten().or_else(|| {
+            let parsed = parsed_encrypt.or_else(|| {
                 encrypt.map(|encrypt| match parse_encrypt_segment(encrypt) {
                     Ok(value) => value,
                     Err(error) => {
@@ -5274,7 +5301,7 @@ fn parse_perm_yn(flag: &str, val: &str) -> CliResult<bool> {
         other => Err(format!("{flag} must be y or n (got {other:?})").into()),
     }
 }
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 struct ParsedEncryptSegment {
     params: EncryptParams,
     accessibility_warning: bool,
@@ -5339,123 +5366,222 @@ fn encrypt_option_table_name(key_len: Option<u32>) -> &'static str {
     }
 }
 
-fn unrecognized_encrypt_argument(token: &str, key_len: Option<u32>) -> String {
-    format!(
+/// Return whether the active qpdf encryption option table registers `name`.
+/// qpdf switches tables immediately after consuming the key length, so an
+/// option from another key-length table must fail at that token rather than
+/// being deferred until the segment terminator (`auto_job_init.hh:133-166`).
+fn encryption_option_table_accepts(key_len: Option<u32>, name: &str) -> bool {
+    match key_len {
+        None => matches!(name, "user-password" | "owner-password" | "bits"),
+        Some(40) => matches!(name, "extract" | "annotate" | "print" | "modify"),
+        Some(128) => matches!(
+            name,
+            "cleartext-metadata"
+                | "force-V4"
+                | "accessibility"
+                | "extract"
+                | "print"
+                | "assemble"
+                | "annotate"
+                | "form"
+                | "modify-other"
+                | "modify"
+                | "use-aes"
+        ),
+        Some(256) => matches!(
+            name,
+            "cleartext-metadata"
+                | "force-R5"
+                | "allow-insecure"
+                | "accessibility"
+                | "extract"
+                | "print"
+                | "assemble"
+                | "annotate"
+                | "form"
+                | "modify-other"
+                | "modify"
+        ),
+        Some(_) => false,
+    }
+}
+
+fn unrecognized_encrypt_argument(token: &str, key_len: Option<u32>) -> UsageError {
+    UsageError::new(format!(
         "unrecognized argument {token} ({} options must be terminated with --)",
         encrypt_option_table_name(key_len)
-    )
+    ))
+}
+
+#[derive(Debug, Clone)]
+struct EncryptSubFlag {
+    original: Vec<u8>,
+    canonical: Vec<u8>,
+}
+
+struct EncryptSegmentCallbackState {
+    positional: Vec<Vec<u8>>,
+    dashed_mode: bool,
+    positional_mode: bool,
+    user_password: Option<Vec<u8>>,
+    owner_password: Option<Vec<u8>>,
+    key_len: Option<u32>,
+    key_len_seen: bool,
+    subflags: Vec<EncryptSubFlag>,
+}
+
+impl EncryptSegmentCallbackState {
+    fn new() -> Self {
+        Self {
+            positional: Vec::new(),
+            dashed_mode: false,
+            positional_mode: false,
+            user_password: None,
+            owner_password: None,
+            key_len: None,
+            key_len_seen: false,
+            subflags: Vec::new(),
+        }
+    }
+
+    fn push(&mut self, original: &[u8], canonical: &[u8]) -> CliResult<()> {
+        let token_text = String::from_utf8_lossy(original);
+        let equal = canonical.iter().position(|byte| *byte == b'=');
+        let (raw_name, attached) = match equal {
+            Some(position) => (&canonical[..position], Some(&canonical[position + 1..])),
+            None => (canonical, None),
+        };
+        let option_name = segment_option_name(raw_name);
+
+        if let Some(name) = option_name {
+            if !encryption_option_table_accepts(self.key_len, name) {
+                return Err(unrecognized_encrypt_argument(&token_text, self.key_len).into());
+            }
+            if matches!(name, "user-password" | "owner-password" | "bits") {
+                if self.positional_mode {
+                    return Err(Box::new(UsageError::new(
+                        "positional and dashed encryption arguments may not be mixed",
+                    )));
+                }
+                let value = attached.ok_or_else(|| {
+                    let parameter = match name {
+                        "user-password" => "user_password",
+                        "owner-password" => "owner_password",
+                        "bits" => "{40,128,256}",
+                        _ => unreachable!("name was matched above"),
+                    };
+                    Box::new(UsageError::new(format!(
+                        "--{name} must be given as --{name}={parameter}"
+                    ))) as Box<dyn std::error::Error>
+                })?;
+                self.dashed_mode = true;
+                match name {
+                    "user-password" => self.user_password = Some(value.to_vec()),
+                    "owner-password" => self.owner_password = Some(value.to_vec()),
+                    "bits" => {
+                        self.key_len =
+                            Some(parse_encrypt_key_len(&String::from_utf8_lossy(value))?);
+                        self.key_len_seen = true;
+                    }
+                    _ => unreachable!("name was matched above"),
+                }
+                return Ok(());
+            }
+        }
+
+        if canonical.starts_with(b"-") && canonical != b"-" {
+            if self.dashed_mode && !self.key_len_seen {
+                return Err(unrecognized_encrypt_argument(&token_text, self.key_len).into());
+            }
+            if !self.dashed_mode && self.positional.len() < 3 {
+                return Err(unrecognized_encrypt_argument(&token_text, self.key_len).into());
+            }
+            self.subflags.push(EncryptSubFlag {
+                original: original.to_vec(),
+                canonical: canonical.to_vec(),
+            });
+            return Ok(());
+        }
+
+        if self.dashed_mode {
+            return Err(Box::new(UsageError::new(
+                "positional and dashed encryption arguments may not be mixed",
+            )));
+        }
+        if self.positional.len() < 3 {
+            self.positional_mode = true;
+            self.positional.push(canonical.to_vec());
+            if self.positional.len() == 3 {
+                self.key_len = Some(parse_encrypt_key_len(&String::from_utf8_lossy(canonical))?);
+            }
+            return Ok(());
+        }
+
+        Err(unrecognized_encrypt_argument(&token_text, self.key_len).into())
+    }
+
+    fn finish(self) -> CliResult<ParsedEncryptSegment> {
+        let EncryptSegmentCallbackState {
+            positional,
+            dashed_mode,
+            user_password,
+            owner_password,
+            key_len,
+            subflags,
+            ..
+        } = self;
+        finish_encrypt_segment(
+            positional,
+            dashed_mode,
+            user_password,
+            owner_password,
+            key_len,
+            subflags,
+        )
+    }
 }
 
 fn parse_encrypt_segment<T: RawCliArg>(tokens: &[T]) -> CliResult<ParsedEncryptSegment> {
-    if tokens.is_empty() {
-        return Err("--encrypt requires USER-PW OWNER-PW KEY-LEN".into());
-    }
-
-    // qpdf starts in a password-argument table and switches to a
-    // key-length-specific table after the third positional argument or the
-    // named --bits argument. Keep the two password forms distinct so the
-    // mixed-form error is raised at the same boundary as qpdf.
-    let mut positional: Vec<Vec<u8>> = Vec::new();
-    let mut dashed_mode = false;
-    let mut positional_mode = false;
-    let mut user_password = None;
-    let mut owner_password = None;
-    let mut key_len = None;
-    let mut key_len_seen = false;
-    let mut subflags: Vec<Vec<u8>> = Vec::new();
-
-    let mut index = 0;
-    while index < tokens.len() {
-        let token = &tokens[index];
+    let mut parser = EncryptSegmentCallbackState::new();
+    for token in tokens {
         let token_bytes = token.raw_bytes();
-        let token_text = String::from_utf8_lossy(&token_bytes);
-        let equal = token_bytes.iter().position(|byte| *byte == b'=');
-        let (raw_name, attached) = match equal {
-            Some(position) => (&token_bytes[..position], Some(&token_bytes[position + 1..])),
-            None => (token_bytes.as_slice(), None),
-        };
-        let name = raw_name
-            .strip_prefix(b"--")
-            .or_else(|| raw_name.strip_prefix(b"-"))
-            .and_then(|name| std::str::from_utf8(name).ok())
-            .unwrap_or("");
-        if matches!(name, "user-password" | "owner-password" | "bits") {
-            if positional_mode {
-                return Err("positional and dashed encryption arguments may not be mixed".into());
-            }
-            if key_len_seen {
-                return Err(unrecognized_encrypt_argument(&token_text, key_len).into());
-            }
-            dashed_mode = true;
-            let value = if let Some(value) = attached {
-                value.to_vec()
-            } else {
-                index += 1;
-                tokens
-                    .get(index)
-                    .map(RawCliArg::raw_bytes)
-                    .ok_or_else(|| format!("{token_text} requires a value"))?
-            };
-            match name {
-                "user-password" => user_password = Some(value),
-                "owner-password" => owner_password = Some(value),
-                "bits" => {
-                    key_len = Some(parse_encrypt_key_len(&String::from_utf8_lossy(&value))?);
-                    key_len_seen = true;
-                }
-                _ => unreachable!("name was matched above"),
-            }
-            index += 1;
-            continue;
-        }
-
-        if dashed_mode {
-            if !token_bytes.starts_with(b"-") || token_bytes == b"-" {
-                return Err("positional and dashed encryption arguments may not be mixed".into());
-            }
-            // qpdf's password-argument table has no key-specific options;
-            // `--bits` must select the key-length-specific table before any
-            // other named option is recognized.
-            if !key_len_seen {
-                return Err(unrecognized_encrypt_argument(&token_text, key_len).into());
-            }
-            subflags.push(token_bytes);
-        } else if positional.len() < 3 {
-            if token_bytes.starts_with(b"-") && token_bytes != b"-" {
-                return Err(unrecognized_encrypt_argument(&token_text, None).into());
-            }
-            positional_mode = true;
-            positional.push(token_bytes.clone());
-            if positional.len() == 3 {
-                key_len = Some(parse_encrypt_key_len(&token_text)?);
-            }
-        } else {
-            if !token_bytes.starts_with(b"-") || token_bytes == b"-" {
-                return Err(unrecognized_encrypt_argument(&token_text, key_len).into());
-            }
-            subflags.push(token_bytes);
-        }
-        index += 1;
+        parser.push(&token_bytes, &token_bytes)?;
     }
+    parser.finish()
+}
 
+fn finish_encrypt_segment(
+    positional: Vec<Vec<u8>>,
+    dashed_mode: bool,
+    user_password: Option<Vec<u8>>,
+    owner_password: Option<Vec<u8>>,
+    key_len: Option<u32>,
+    subflags: Vec<EncryptSubFlag>,
+) -> CliResult<ParsedEncryptSegment> {
     let (user_password, owner_password, key_len) = if dashed_mode {
         if key_len.is_none() && !subflags.is_empty() {
-            return Err("--encrypt key length is required before encryption options".into());
+            return Err(Box::new(UsageError::new(
+                "--encrypt key length is required before encryption options",
+            )));
         }
         (
             user_password.unwrap_or_default(),
             owner_password.unwrap_or_default(),
-            key_len.ok_or("--encrypt key length is required")?,
+            key_len.ok_or_else(|| {
+                Box::new(UsageError::new("encryption key length is required"))
+                    as Box<dyn std::error::Error>
+            })?,
         )
     } else {
         if positional.len() < 3 {
-            return Err(format!(
-                "--encrypt requires USER-PW OWNER-PW KEY-LEN (got {} arg(s))",
-                positional.len()
-            )
-            .into());
+            return Err(Box::new(UsageError::new(
+                "encryption key length is required",
+            )));
         }
-        let key_len = key_len.ok_or("--encrypt key length is required")?;
+        let key_len = key_len.ok_or_else(|| {
+            Box::new(UsageError::new("encryption key length is required"))
+                as Box<dyn std::error::Error>
+        })?;
         (positional[0].clone(), positional[1].clone(), key_len)
     };
 
@@ -5469,11 +5595,12 @@ fn parse_encrypt_segment<T: RawCliArg>(tokens: &[T]) -> CliResult<ParsedEncryptS
     let mut accessibility_explicitly_disabled = false;
 
     for token in &subflags {
-        let token_text = String::from_utf8_lossy(token);
-        let equal = token.iter().position(|byte| *byte == b'=');
+        let token_text = String::from_utf8_lossy(&token.original);
+        let token_bytes = &token.canonical;
+        let equal = token_bytes.iter().position(|byte| *byte == b'=');
         let (raw_flag, value_bytes) = match equal {
-            Some(position) => (&token[..position], &token[position + 1..]),
-            None => (token.as_slice(), b"".as_slice()),
+            Some(position) => (&token_bytes[..position], &token_bytes[position + 1..]),
+            None => (token_bytes.as_slice(), b"".as_slice()),
         };
         let flag = raw_flag
             .strip_prefix(b"--")
@@ -5936,7 +6063,7 @@ fn run_page_operations_with_qpdf_job(
     let raw_specs = if args.page_ops.pages.is_empty() {
         Vec::new()
     } else {
-        parse_pages_segment(&raw_page_tokens(&args.page_ops))?
+        configured_page_specs(&args.page_ops)?
     };
     if (args.json_input || args.update_from_json.is_some()) && !args.page_ops.empty {
         // The JSON-input/update page consumer historically accepts only page
@@ -6392,6 +6519,7 @@ fn run_rewrite_opened<R: Read + Seek + 'static>(
 // ===========================================================================
 
 /// One parsed entry from the `--pages` segment before file resolution.
+#[derive(Debug, Clone)]
 struct PageSegmentSpec {
     /// File token as written (`.` = primary input, or a path).
     file_token: OsString,
@@ -6401,6 +6529,167 @@ struct PageSegmentSpec {
     raw_password: Option<Vec<u8>>,
     /// Page-range string (empty = all pages).
     range: String,
+}
+
+#[derive(Default)]
+struct PagesSegmentParser {
+    specs: Vec<PageSegmentSpec>,
+    called_pages_file: bool,
+    called_pages_range: bool,
+}
+
+impl PagesSegmentParser {
+    fn push(&mut self, original: &[u8], canonical: &[u8], file_token: OsString) -> CliResult<()> {
+        if let Some(path) = canonical.strip_prefix(b"--file=") {
+            self.specs.push(PageSegmentSpec {
+                file_token: arg_parser::os_string_from_bytes(path),
+                password: None,
+                raw_password: None,
+                range: String::new(),
+            });
+            self.called_pages_range = false;
+            return Ok(());
+        }
+        if let Some(pw) = canonical.strip_prefix(b"--password=") {
+            let cur = self.specs.last_mut().ok_or_else(|| {
+                Box::new(UsageError::new(
+                    "in --pages, --password must follow a file name",
+                )) as Box<dyn std::error::Error>
+            })?;
+            if cur.password.is_some() {
+                return Err(Box::new(UsageError::new(
+                    "--password already specified for this file",
+                )));
+            }
+            cur.password = Some(arg_parser::os_string_from_bytes(pw));
+            cur.raw_password = Some(pw.to_vec());
+            return Ok(());
+        }
+        if let Some(range) = canonical.strip_prefix(b"--range=") {
+            let cur = self.specs.last_mut().ok_or_else(|| {
+                Box::new(UsageError::new("in --range must follow a file name"))
+                    as Box<dyn std::error::Error>
+            })?;
+            if !cur.range.is_empty() {
+                return Err(Box::new(UsageError::new(
+                    "--range already specified for this file",
+                )));
+            }
+            cur.range = String::from_utf8(range.to_vec())
+                .map_err(|_| UsageError::new("--range must be valid UTF-8"))?;
+            return Ok(());
+        }
+
+        if canonical.starts_with(b"-") && canonical != b"-" {
+            let name = segment_option_name(canonical);
+            if let Some(name) = name {
+                let parameter = match name {
+                    "file" => Some("file"),
+                    "range" => Some("page-range"),
+                    "password" => Some("password"),
+                    _ => None,
+                };
+                if !canonical.contains(&b'=') {
+                    if let Some(parameter) = parameter {
+                        return Err(Box::new(UsageError::new(format!(
+                            "--{name} must be given as --{name}={parameter}"
+                        ))));
+                    }
+                }
+            }
+            return Err(Box::new(UsageError::new(format!(
+                "unrecognized argument {} (pages options must be terminated with --)",
+                String::from_utf8_lossy(original)
+            ))));
+        }
+
+        if !self.called_pages_file {
+            self.specs.push(PageSegmentSpec {
+                file_token,
+                password: None,
+                raw_password: None,
+                range: String::new(),
+            });
+            self.called_pages_file = true;
+            return Ok(());
+        }
+        if self.called_pages_range {
+            self.specs.push(PageSegmentSpec {
+                file_token,
+                password: None,
+                raw_password: None,
+                range: String::new(),
+            });
+            self.called_pages_range = false;
+            return Ok(());
+        }
+
+        match parse_numrange(canonical, 0) {
+            Ok(_) => {
+                let range_bytes = canonical
+                    .split(|byte| *byte == 0)
+                    .next()
+                    .unwrap_or(canonical);
+                let range = String::from_utf8_lossy(range_bytes).into_owned();
+                let cur = self
+                    .specs
+                    .last_mut()
+                    .expect("qpdf page range requires a preceding file");
+                if !cur.range.is_empty() {
+                    return Err(Box::new(UsageError::new(
+                        "--range already specified for this file",
+                    )));
+                }
+                cur.range = range;
+                self.called_pages_range = true;
+            }
+            Err(error) => {
+                if !matches!(&error, Error::SystemBytes(_)) {
+                    return Err(Box::new(error));
+                }
+                let is_file = canonical == b"."
+                    || File::open(arg_parser::os_string_from_bytes(canonical)).is_ok();
+                if is_file {
+                    self.specs.push(PageSegmentSpec {
+                        file_token,
+                        password: None,
+                        raw_password: None,
+                        range: String::new(),
+                    });
+                    self.called_pages_range = false;
+                } else {
+                    let message = error
+                        .raw_message()
+                        .map_or_else(|| error.to_string().into_bytes(), ToOwned::to_owned);
+                    return Err(Box::new(UsageError::new(message)));
+                }
+            }
+        }
+        Ok(())
+    }
+
+    fn finish(self) -> CliResult<Vec<PageSegmentSpec>> {
+        if self.specs.is_empty() {
+            return Err(Box::new(UsageError::new(
+                "--pages: no page specifications given",
+            )));
+        }
+        Ok(self.specs)
+    }
+}
+
+fn segment_option_name(bytes: &[u8]) -> Option<&str> {
+    let name = bytes
+        .strip_prefix(b"--")
+        .or_else(|| bytes.strip_prefix(b"-"))?;
+    if name.is_empty() || name[0] == b'-' || name[0].is_ascii_digit() {
+        return None;
+    }
+    let end = name
+        .iter()
+        .position(|byte| *byte == b'=')
+        .unwrap_or(name.len());
+    std::str::from_utf8(&name[..end]).ok()
 }
 
 /// Parse the raw `--pages` segment tokens into ordered specs.
@@ -6416,130 +6705,12 @@ struct PageSegmentSpec {
 ///
 /// Bounded, non-recursive single pass over `tokens`; no panics.
 fn parse_pages_segment<T: RawCliArg>(tokens: &[T]) -> CliResult<Vec<PageSegmentSpec>> {
-    let mut specs: Vec<PageSegmentSpec> = Vec::new();
-    let mut called_pages_file = false;
-    let mut called_pages_range = false;
-
+    let mut parser = PagesSegmentParser::default();
     for tok in tokens {
         let token_bytes = tok.raw_bytes();
-        if let Some(path) = token_bytes.strip_prefix(b"--file=") {
-            specs.push(PageSegmentSpec {
-                file_token: arg_parser::os_string_from_bytes(path),
-                password: None,
-                raw_password: None,
-                range: String::new(),
-            });
-            continue;
-        }
-        if let Some(pw) = token_bytes.strip_prefix(b"--password=") {
-            let cur = specs
-                .last_mut()
-                .ok_or("--pages: --password= must follow a file in the --pages segment")?;
-            if cur.password.is_some() {
-                return Err(Box::new(UsageError::new(
-                    "--password already specified for this file",
-                )));
-            }
-            cur.password = Some(arg_parser::os_string_from_bytes(pw));
-            cur.raw_password = Some(pw.to_vec());
-            continue;
-        }
-        if let Some(r) = token_bytes.strip_prefix(b"--range=") {
-            let cur = specs
-                .last_mut()
-                .ok_or("--pages: --range= must follow a file in the --pages segment")?;
-            if !cur.range.is_empty() {
-                return Err("--pages: duplicate page-range for one input file".into());
-            }
-            cur.range =
-                String::from_utf8(r.to_vec()).map_err(|_| "--pages --range must be valid UTF-8")?;
-            continue;
-        }
-        if token_bytes.starts_with(b"--") {
-            return Err(format!(
-                "--pages: unsupported token {:?} in the page-selection segment",
-                tok.os_string()
-            )
-            .into());
-        }
-        // This is qpdf's ArgParser::argPagesPositional state machine
-        // (QPDFJob_argv.cc:243-272): the first positional is always a file;
-        // after a positional range, the next positional is always a file;
-        // otherwise the token is tested as range first and falls back to an
-        // openable file only when range syntax fails.
-        if !called_pages_file {
-            specs.push(PageSegmentSpec {
-                file_token: tok.os_string(),
-                password: None,
-                raw_password: None,
-                range: String::new(),
-            });
-            called_pages_file = true;
-            continue;
-        }
-        if called_pages_range {
-            specs.push(PageSegmentSpec {
-                file_token: tok.os_string(),
-                password: None,
-                raw_password: None,
-                range: String::new(),
-            });
-            called_pages_range = false;
-            continue;
-        }
-
-        match parse_numrange(&token_bytes, 0) {
-            Ok(_) => {
-                let range_bytes = token_bytes
-                    .split(|byte| *byte == 0)
-                    .next()
-                    .unwrap_or(&token_bytes);
-                let range = String::from_utf8_lossy(range_bytes).into_owned();
-                let cur = specs
-                    .last_mut()
-                    .expect("qpdf page range requires a preceding file");
-                if !cur.range.is_empty() {
-                    return Err(Box::new(UsageError::new(
-                        "--range already specified for this file",
-                    )));
-                }
-                cur.range = range;
-                called_pages_range = true;
-            }
-            Err(error) => {
-                // qpdf's QPDFJob::parseNumrange reframes std::runtime_error
-                // syntax failures as usage, but std::bad_alloc is a separate
-                // std::exception that must reach the outer CLI catch
-                // (`QPDFJob.cc:418-425`, `qpdf/qpdf.cc:37-42`). SystemBytes is
-                // the range parser's runtime-diagnostic representation; other
-                // error variants must retain their original exception class.
-                if !matches!(&error, Error::SystemBytes(_)) {
-                    return Err(Box::new(error));
-                }
-                let is_file = token_bytes == b"."
-                    || File::open(arg_parser::os_string_from_bytes(&token_bytes)).is_ok();
-                if is_file {
-                    specs.push(PageSegmentSpec {
-                        file_token: tok.os_string(),
-                        password: None,
-                        raw_password: None,
-                        range: String::new(),
-                    });
-                    called_pages_range = false;
-                } else {
-                    let message = error
-                        .raw_message()
-                        .map_or_else(|| error.to_string().into_bytes(), ToOwned::to_owned);
-                    return Err(Box::new(UsageError::new(message)));
-                }
-            }
-        }
+        parser.push(&token_bytes, &token_bytes, tok.os_string())?;
     }
-
-    if specs.is_empty() {
-        return Err("--pages: no input files given in the page-selection segment".into());
-    }
-    Ok(specs)
+    parser.finish()
 }
 
 fn raw_page_tokens(page_ops: &PageOpArgs) -> Vec<Vec<u8>> {
@@ -6547,6 +6718,13 @@ fn raw_page_tokens(page_ops: &PageOpArgs) -> Vec<Vec<u8>> {
         .raw_pages
         .clone()
         .unwrap_or_else(|| raw_os_args(&page_ops.pages))
+}
+
+fn configured_page_specs(page_ops: &PageOpArgs) -> CliResult<Vec<PageSegmentSpec>> {
+    page_ops
+        .parsed_page_specs
+        .clone()
+        .map_or_else(|| parse_pages_segment(&raw_page_tokens(page_ops)), Ok)
 }
 
 /// Resolve `--pages` specs into [`InputSpec`]s, mapping the `.` shorthand to
@@ -6633,6 +6811,152 @@ struct OverlaySpec {
     repeat: Option<String>,
 }
 
+struct OverlaySegmentParser {
+    kind: OverlayKind,
+    file: Option<OsString>,
+    password: Option<OsString>,
+    raw_password: Option<Vec<u8>>,
+    from: Option<String>,
+    to: Option<String>,
+    repeat: Option<String>,
+}
+
+impl OverlaySegmentParser {
+    fn new(kind: OverlayKind) -> Self {
+        Self {
+            kind,
+            file: None,
+            password: None,
+            raw_password: None,
+            from: None,
+            to: None,
+            repeat: None,
+        }
+    }
+
+    fn flag(&self) -> &'static str {
+        match self.kind {
+            OverlayKind::Overlay => "overlay",
+            OverlayKind::Underlay => "underlay",
+        }
+    }
+
+    fn push(&mut self, original: &[u8], canonical: &[u8], file_token: OsString) -> CliResult<()> {
+        if let Some(path) = canonical.strip_prefix(b"--file=") {
+            if self.file.is_some() {
+                return Err(Box::new(UsageError::new(format!(
+                    "{} file already specified",
+                    self.flag()
+                ))));
+            }
+            self.file = Some(arg_parser::os_string_from_bytes(path));
+            return Ok(());
+        }
+        if let Some(password) = canonical.strip_prefix(b"--password=") {
+            // QPDFJob::UOConfig::password is a regular setter and therefore
+            // follows qpdf's last-setting behavior when repeated.
+            self.password = Some(arg_parser::os_string_from_bytes(password));
+            self.raw_password = Some(password.to_vec());
+            return Ok(());
+        }
+        if let Some(range) = canonical.strip_prefix(b"--to=") {
+            let range = String::from_utf8(range.to_vec())
+                .map_err(|_| format!("{} --to must be valid UTF-8", self.flag()))?;
+            PageRange::parse_numrange(&range).map_err(|error| {
+                format!(
+                    "{}: invalid --to= page range {range:?}: {error}",
+                    self.flag()
+                )
+            })?;
+            self.to = Some(range);
+            return Ok(());
+        }
+        if let Some(range) = canonical.strip_prefix(b"--from=") {
+            let range = String::from_utf8(range.to_vec())
+                .map_err(|_| format!("{} --from must be valid UTF-8", self.flag()))?;
+            if !range.is_empty() {
+                PageRange::parse_numrange(&range).map_err(|error| {
+                    format!(
+                        "{}: invalid --from= page range {range:?}: {error}",
+                        self.flag()
+                    )
+                })?;
+            }
+            self.from = Some(range);
+            return Ok(());
+        }
+        if let Some(range) = canonical.strip_prefix(b"--repeat=") {
+            let range = String::from_utf8(range.to_vec())
+                .map_err(|_| format!("{} --repeat must be valid UTF-8", self.flag()))?;
+            if !range.is_empty() {
+                PageRange::parse_numrange(&range).map_err(|error| {
+                    format!(
+                        "{}: invalid --repeat= page range {range:?}: {error}",
+                        self.flag()
+                    )
+                })?;
+            }
+            self.repeat = Some(range);
+            return Ok(());
+        }
+
+        if canonical.starts_with(b"-") && canonical != b"-" {
+            let name = segment_option_name(canonical);
+            if let Some(name) = name {
+                let parameter = match name {
+                    "file" => Some("file"),
+                    "password" => Some("password"),
+                    "to" | "from" | "repeat" => Some("page-range"),
+                    _ => None,
+                };
+                if !canonical.contains(&b'=') {
+                    if let Some(parameter) = parameter {
+                        return Err(Box::new(UsageError::new(format!(
+                            "--{name} must be given as --{name}={parameter}"
+                        ))));
+                    }
+                }
+            }
+            return Err(Box::new(UsageError::new(format!(
+                "unrecognized argument {} (underlay/overlay options must be terminated with --)",
+                String::from_utf8_lossy(original)
+            ))));
+        }
+
+        if self.file.is_some() {
+            return Err(Box::new(UsageError::new(format!(
+                "{} file already specified",
+                self.flag()
+            ))));
+        }
+        self.file = Some(file_token);
+        Ok(())
+    }
+
+    fn finish(self) -> CliResult<OverlaySpec> {
+        let flag = self.flag();
+        let file = self.file.ok_or_else(|| {
+            Box::new(UsageError::new(format!("{} file not specified", flag)))
+                as Box<dyn std::error::Error>
+        })?;
+        if file.is_empty() {
+            return Err(Box::new(UsageError::new(format!(
+                "{} file not specified",
+                flag
+            ))));
+        }
+        Ok(OverlaySpec {
+            kind: self.kind,
+            file,
+            password: self.password,
+            raw_password: self.raw_password,
+            from: self.from,
+            to: self.to,
+            repeat: self.repeat,
+        })
+    }
+}
+
 struct PreprocessedArgs {
     residual_args: Vec<OsString>,
     /// Raw residual argv before qpdf-to-clap canonicalization. qpdf's usage
@@ -6655,8 +6979,119 @@ struct RawCliOverrides {
     raw_encrypt: Option<Vec<Vec<u8>>>,
     raw_encrypt_segments: Option<Vec<Vec<Vec<u8>>>>,
     raw_pages: Option<Vec<Vec<u8>>>,
+    parsed_page_specs: Option<Vec<PageSegmentSpec>>,
+    parsed_encrypt_segments: Option<Vec<ParsedEncryptSegment>>,
     last_encryption_mode: Option<EncryptionMode>,
     raw_copy_attachments_from: Option<Vec<Vec<Vec<u8>>>>,
+}
+
+enum ActiveQpdfSegment {
+    Pages(PagesSegmentParser),
+    Overlay(OverlaySegmentParser),
+    Encrypt(EncryptSegmentCallbackState),
+    Other,
+}
+
+#[derive(Default)]
+struct QpdfSegmentHandler {
+    active: Option<ActiveQpdfSegment>,
+    pages_seen: bool,
+    page_specs: Option<Vec<PageSegmentSpec>>,
+    overlay_specs: Vec<OverlaySpec>,
+    encrypt_segments: Vec<ParsedEncryptSegment>,
+}
+
+impl arg_parser::SegmentHandler for QpdfSegmentHandler {
+    fn begin(&mut self, kind: arg_parser::SegmentKind, option: &str) -> CliResult<()> {
+        if self.active.is_some() {
+            return Err(Error::Internal("nested qpdf named segment".into()).into());
+        }
+        self.active = Some(match kind {
+            arg_parser::SegmentKind::Pages => {
+                if self.pages_seen {
+                    return Err(Box::new(UsageError::new(
+                        "--pages may only be specified one time",
+                    )));
+                }
+                self.pages_seen = true;
+                ActiveQpdfSegment::Pages(PagesSegmentParser::default())
+            }
+            arg_parser::SegmentKind::Overlay => {
+                let kind = if option == "underlay" {
+                    OverlayKind::Underlay
+                } else {
+                    OverlayKind::Overlay
+                };
+                ActiveQpdfSegment::Overlay(OverlaySegmentParser::new(kind))
+            }
+            arg_parser::SegmentKind::Encrypt => {
+                ActiveQpdfSegment::Encrypt(EncryptSegmentCallbackState::new())
+            }
+            arg_parser::SegmentKind::AddAttachment
+            | arg_parser::SegmentKind::CopyAttachments
+            | arg_parser::SegmentKind::PageLabels => ActiveQpdfSegment::Other,
+        });
+        Ok(())
+    }
+
+    fn token(
+        &mut self,
+        _kind: arg_parser::SegmentKind,
+        original: &arg_parser::RawArg,
+        canonical: &arg_parser::RawArg,
+    ) -> CliResult<()> {
+        match self.active.as_mut() {
+            Some(ActiveQpdfSegment::Pages(parser)) => parser.push(
+                original.as_bytes(),
+                canonical.as_bytes(),
+                original.as_os_str().to_os_string(),
+            ),
+            Some(ActiveQpdfSegment::Overlay(parser)) => parser.push(
+                original.as_bytes(),
+                canonical.as_bytes(),
+                original.as_os_str().to_os_string(),
+            ),
+            Some(ActiveQpdfSegment::Encrypt(parser)) => {
+                parser.push(original.as_bytes(), canonical.as_bytes())
+            }
+            Some(ActiveQpdfSegment::Other) | None => Ok(()),
+        }
+    }
+
+    fn end(&mut self, _kind: arg_parser::SegmentKind) -> CliResult<()> {
+        let active = self
+            .active
+            .take()
+            .ok_or_else(|| Error::Internal("qpdf named segment ended without a begin".into()))?;
+        match active {
+            ActiveQpdfSegment::Pages(parser) => self.page_specs = Some(parser.finish()?),
+            ActiveQpdfSegment::Overlay(parser) => self.overlay_specs.push(parser.finish()?),
+            ActiveQpdfSegment::Encrypt(parser) => self.encrypt_segments.push(parser.finish()?),
+            ActiveQpdfSegment::Other => {}
+        }
+        Ok(())
+    }
+
+    fn missing_terminator(
+        &mut self,
+        kind: arg_parser::SegmentKind,
+        _option: &str,
+    ) -> Box<dyn std::error::Error> {
+        let table = match self.active.as_ref() {
+            Some(ActiveQpdfSegment::Encrypt(parser)) => encrypt_option_table_name(parser.key_len),
+            Some(ActiveQpdfSegment::Pages(_)) => "pages",
+            Some(ActiveQpdfSegment::Overlay(_)) => "underlay/overlay",
+            Some(ActiveQpdfSegment::Other) | None => match kind {
+                arg_parser::SegmentKind::Encrypt => "encryption",
+                arg_parser::SegmentKind::Pages => "pages",
+                arg_parser::SegmentKind::AddAttachment => "attachment",
+                arg_parser::SegmentKind::CopyAttachments => "copy attachment",
+                arg_parser::SegmentKind::Overlay => "underlay/overlay",
+                arg_parser::SegmentKind::PageLabels => "set page labels",
+            },
+        };
+        UsageError::new(format!("missing -- at end of {table} options")).into()
+    }
 }
 
 /// Parse the raw token slice captured between `--overlay`/`--underlay` and `--`.
@@ -6666,7 +7101,8 @@ struct RawCliOverrides {
 /// mirroring qpdf's UO segment parser (no positional ordering constraint).
 ///
 /// - `FILE` is mandatory (exactly one, either via `--file=PATH` or bare).
-/// - `--password=`, `--to=`, `--from=`, `--repeat=` are each optional; duplicates error.
+/// - `--password=`, `--to=`, `--from=`, `--repeat=` are each optional and
+///   repeated values use qpdf's last-setting behavior.
 /// - Range values are validated via [`PageRange::parse_numrange`] (syntax only; defaults not applied).
 /// - Unknown `--xxx` tokens, duplicate files, or an empty token list all produce an error.
 ///
@@ -6674,96 +7110,14 @@ struct RawCliOverrides {
 ///
 /// Returns an error if the token slice is empty, a file is missing or duplicated,
 /// a range is syntactically invalid, a flag is duplicated, or an unknown `--` flag appears.
+#[cfg(test)]
 fn parse_overlay_segment<T: RawCliArg>(kind: OverlayKind, tokens: &[T]) -> CliResult<OverlaySpec> {
-    let flag = match kind {
-        OverlayKind::Overlay => "--overlay",
-        OverlayKind::Underlay => "--underlay",
-    };
-
-    if tokens.is_empty() {
-        return Err(format!("{flag}: no source file given in the segment").into());
-    }
-
-    let mut file: Option<OsString> = None;
-    let mut password: Option<OsString> = None;
-    let mut raw_password: Option<Vec<u8>> = None;
-    let mut from: Option<String> = None;
-    let mut to: Option<String> = None;
-    let mut repeat: Option<String> = None;
-
+    let mut parser = OverlaySegmentParser::new(kind);
     for tok in tokens {
         let token_bytes = tok.raw_bytes();
-        if let Some(path) = token_bytes.strip_prefix(b"--file=") {
-            if file.is_some() {
-                return Err(format!("{flag}: duplicate file in segment").into());
-            }
-            file = Some(arg_parser::os_string_from_bytes(path));
-            continue;
-        }
-        if let Some(pw) = token_bytes.strip_prefix(b"--password=") {
-            if password.is_some() {
-                return Err(format!("{flag}: duplicate --password= in segment").into());
-            }
-            password = Some(arg_parser::os_string_from_bytes(pw));
-            raw_password = Some(pw.to_vec());
-            continue;
-        }
-        if let Some(r) = token_bytes.strip_prefix(b"--to=") {
-            if to.is_some() {
-                return Err(format!("{flag}: duplicate --to= in segment").into());
-            }
-            let r =
-                String::from_utf8(r.to_vec()).map_err(|_| "overlay --to must be valid UTF-8")?;
-            PageRange::parse_numrange(&r)
-                .map_err(|e| format!("{flag}: invalid --to= page range {r:?}: {e}"))?;
-            to = Some(r);
-            continue;
-        }
-        if let Some(r) = token_bytes.strip_prefix(b"--from=") {
-            if from.is_some() {
-                return Err(format!("{flag}: duplicate --from= in segment").into());
-            }
-            let r =
-                String::from_utf8(r.to_vec()).map_err(|_| "overlay --from must be valid UTF-8")?;
-            PageRange::parse_numrange(&r)
-                .map_err(|e| format!("{flag}: invalid --from= page range {r:?}: {e}"))?;
-            from = Some(r);
-            continue;
-        }
-        if let Some(r) = token_bytes.strip_prefix(b"--repeat=") {
-            if repeat.is_some() {
-                return Err(format!("{flag}: duplicate --repeat= in segment").into());
-            }
-            let r = String::from_utf8(r.to_vec())
-                .map_err(|_| "overlay --repeat must be valid UTF-8")?;
-            PageRange::parse_numrange(&r)
-                .map_err(|e| format!("{flag}: invalid --repeat= page range {r:?}: {e}"))?;
-            repeat = Some(r);
-            continue;
-        }
-        if token_bytes.starts_with(b"--") {
-            return Err(
-                format!("{flag}: unsupported token {:?} in segment", tok.os_string()).into(),
-            );
-        }
-        // Bare (non-flag) token: must be the file path (exactly one allowed).
-        if file.is_some() {
-            return Err(format!("{flag}: duplicate file in segment").into());
-        }
-        file = Some(tok.os_string());
+        parser.push(&token_bytes, &token_bytes, tok.os_string())?;
     }
-
-    let file = file.ok_or_else(|| format!("{flag}: no source file given in the segment"))?;
-
-    Ok(OverlaySpec {
-        kind,
-        file,
-        password,
-        raw_password,
-        from,
-        to,
-        repeat,
-    })
+    parser.finish()
 }
 
 fn overlay_verbose_message(report: &[flpdf::OverlayVerbosePage], specs: &[OverlaySpec]) -> Vec<u8> {
@@ -7065,8 +7419,7 @@ fn run_page_extraction(
         );
     }
 
-    let page_tokens = raw_page_tokens(page_ops);
-    let specs = parse_pages_segment(&page_tokens)?;
+    let specs = configured_page_specs(page_ops)?;
     let mut inputs = resolve_page_specs(&specs, primary_input)?;
     let has_external_source = inputs.iter().any(|spec| spec.path != primary_input);
 
@@ -7261,8 +7614,7 @@ fn run_empty_page_extraction(
 ) -> CliResult<()> {
     let standard_output = prepare_page_operation_standard_output(output, page_ops)?;
     let creates_output = standard_output.is_none();
-    let page_tokens = raw_page_tokens(page_ops);
-    let raw_specs = parse_pages_segment(&page_tokens)?;
+    let raw_specs = configured_page_specs(page_ops)?;
     if raw_specs
         .iter()
         .any(|spec| spec.file_token == OsStr::new("."))
@@ -10789,8 +11141,7 @@ mod tests {
         let err = parse_overlay_segment(OverlayKind::Overlay, &[] as &[String])
             .unwrap_err()
             .to_string();
-        assert!(err.contains("--overlay"), "got: {err}");
-        assert!(err.contains("no source file"), "got: {err}");
+        assert_eq!(err, "overlay file not specified");
     }
 
     #[test]
@@ -10801,8 +11152,7 @@ mod tests {
         let err = parse_overlay_segment(OverlayKind::Overlay, &strs(&["--password=pw"]))
             .unwrap_err()
             .to_string();
-        assert!(err.contains("--overlay"), "got: {err}");
-        assert!(err.contains("no source file"), "got: {err}");
+        assert_eq!(err, "overlay file not specified");
     }
 
     #[test]
@@ -10810,7 +11160,7 @@ mod tests {
         let err = parse_overlay_segment(OverlayKind::Overlay, &strs(&["a.pdf", "b.pdf"]))
             .unwrap_err()
             .to_string();
-        assert!(err.contains("duplicate file"), "got: {err}");
+        assert_eq!(err, "overlay file already specified");
     }
 
     #[test]
@@ -10821,7 +11171,7 @@ mod tests {
         )
         .unwrap_err()
         .to_string();
-        assert!(err.contains("duplicate file"), "got: {err}");
+        assert_eq!(err, "overlay file already specified");
     }
 
     #[test]
@@ -10829,40 +11179,37 @@ mod tests {
         let err = parse_overlay_segment(OverlayKind::Overlay, &strs(&["a.pdf", "--file=b.pdf"]))
             .unwrap_err()
             .to_string();
-        assert!(err.contains("duplicate file"), "got: {err}");
+        assert_eq!(err, "overlay file already specified");
     }
 
     #[test]
-    fn overlay_duplicate_to_error() {
-        let err = parse_overlay_segment(
+    fn overlay_repeated_to_uses_last_value() {
+        let spec = parse_overlay_segment(
             OverlayKind::Overlay,
             &strs(&["src.pdf", "--to=1", "--to=2"]),
         )
-        .unwrap_err()
-        .to_string();
-        assert!(err.contains("duplicate --to="), "got: {err}");
+        .unwrap();
+        assert_eq!(spec.to.as_deref(), Some("2"));
     }
 
     #[test]
-    fn overlay_duplicate_from_error() {
-        let err = parse_overlay_segment(
+    fn overlay_repeated_from_uses_last_value() {
+        let spec = parse_overlay_segment(
             OverlayKind::Overlay,
             &strs(&["src.pdf", "--from=1", "--from=2"]),
         )
-        .unwrap_err()
-        .to_string();
-        assert!(err.contains("duplicate --from="), "got: {err}");
+        .unwrap();
+        assert_eq!(spec.from.as_deref(), Some("2"));
     }
 
     #[test]
-    fn overlay_duplicate_repeat_error() {
-        let err = parse_overlay_segment(
+    fn overlay_repeated_repeat_uses_last_value() {
+        let spec = parse_overlay_segment(
             OverlayKind::Overlay,
             &strs(&["src.pdf", "--repeat=1", "--repeat=z"]),
         )
-        .unwrap_err()
-        .to_string();
-        assert!(err.contains("duplicate --repeat="), "got: {err}");
+        .unwrap();
+        assert_eq!(spec.repeat.as_deref(), Some("z"));
     }
 
     #[test]
@@ -10870,8 +11217,10 @@ mod tests {
         let err = parse_overlay_segment(OverlayKind::Overlay, &strs(&["src.pdf", "--bogus=x"]))
             .unwrap_err()
             .to_string();
-        assert!(err.contains("--overlay"), "got: {err}");
-        assert!(err.contains("unsupported token"), "got: {err}");
+        assert_eq!(
+            err,
+            "unrecognized argument --bogus=x (underlay/overlay options must be terminated with --)"
+        );
     }
 
     #[test]
@@ -10879,7 +11228,10 @@ mod tests {
         let err = parse_overlay_segment(OverlayKind::Underlay, &strs(&["src.pdf", "--unknown"]))
             .unwrap_err()
             .to_string();
-        assert!(err.contains("--underlay"), "got: {err}");
+        assert_eq!(
+            err,
+            "unrecognized argument --unknown (underlay/overlay options must be terminated with --)"
+        );
     }
 
     #[test]
@@ -10979,16 +11331,13 @@ mod tests {
     }
 
     #[test]
-    fn overlay_duplicate_to_before_file_error() {
-        // Duplicate detection stays effective even when duplicates straddle
-        // the file token.
-        let err = parse_overlay_segment(
+    fn overlay_repeated_to_before_file_uses_last_value() {
+        let spec = parse_overlay_segment(
             OverlayKind::Overlay,
             &strs(&["--to=1", "src.pdf", "--to=2"]),
         )
-        .unwrap_err()
-        .to_string();
-        assert!(err.contains("duplicate --to="), "got: {err}");
+        .unwrap();
+        assert_eq!(spec.to.as_deref(), Some("2"));
     }
 
     #[test]
@@ -11001,14 +11350,13 @@ mod tests {
     }
 
     #[test]
-    fn overlay_duplicate_password_error() {
-        let err = parse_overlay_segment(
+    fn overlay_repeated_password_uses_last_value() {
+        let spec = parse_overlay_segment(
             OverlayKind::Overlay,
             &strs(&["src.pdf", "--password=a", "--password=b"]),
         )
-        .unwrap_err()
-        .to_string();
-        assert!(err.contains("duplicate --password="), "got: {err}");
+        .unwrap();
+        assert_eq!(spec.password.as_deref(), Some(OsStr::new("b")));
     }
 
     // --- rewrite_qpdf_single_dash ---------------------------------------
@@ -11397,7 +11745,7 @@ mod tests {
         let error = extract_attachment_groups(strs(&["flpdf", "--add-attachment", "one.txt"]))
             .expect_err("an attachment group must have a terminator");
 
-        assert_eq!(error.to_string(), "--add-attachment: missing -- terminator");
+        assert_eq!(error.to_string(), "missing -- at end of attachment options");
     }
 
     #[test]
@@ -11546,10 +11894,10 @@ mod tests {
 
     #[test]
     fn extract_unterminated_group_errors() {
-        // No bare `--` after the file => qpdf requires the terminator.
+        // No bare `--` after the file: qpdf reports the active table name.
         let argv = strs(&["--overlay", "over.pdf", "out.pdf"]);
         let err = extract_overlay_groups(argv).unwrap_err().to_string();
-        assert!(err.contains("terminated by a `--`"), "got: {err}");
+        assert_eq!(err, "missing -- at end of underlay/overlay options");
     }
 
     #[test]
@@ -11590,16 +11938,14 @@ mod tests {
         // still has no source file and is rejected.
         let argv = strs(&["flpdf", "--overlay=discarded", "--"]);
         let err = extract_overlay_groups(argv).unwrap_err().to_string();
-        assert!(err.contains("--overlay"), "got: {err}");
-        assert!(err.contains("no source file"), "got: {err}");
+        assert_eq!(err, "overlay file not specified");
     }
 
     #[test]
     fn extract_underlay_equals_form_without_positional_file_is_rejected() {
         let argv = strs(&["flpdf", "--underlay=discarded", "--"]);
         let err = extract_overlay_groups(argv).unwrap_err().to_string();
-        assert!(err.contains("--underlay"), "got: {err}");
-        assert!(err.contains("no source file"), "got: {err}");
+        assert_eq!(err, "underlay file not specified");
     }
 
     #[test]
@@ -11691,8 +12037,7 @@ mod tests {
         // resumes the main table; the inner --overlay is not a new group.
         let argv = strs(&["--encrypt", "u", "o", "128", "--overlay", "x"]);
         let error = extract_overlay_groups(argv).unwrap_err().to_string();
-        assert!(error.contains("--encrypt"), "got: {error}");
-        assert!(error.contains("terminated"), "got: {error}");
+        assert_eq!(error, "missing -- at end of encryption options");
     }
 
     #[test]

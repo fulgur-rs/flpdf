@@ -190,13 +190,60 @@ pub(crate) struct RawNamedSegment {
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum SegmentKind {
+pub(crate) enum SegmentKind {
     Encrypt,
     Pages,
     AddAttachment,
     CopyAttachments,
     Overlay,
     PageLabels,
+}
+
+/// Receives qpdf named-segment callbacks while the raw argv parser walks the
+/// active option table. qpdf invokes these callbacks before it performs the
+/// final input/output checks, so the CLI semantic owner must see each token in
+/// argv order rather than receiving a completed segment only after `--`.
+pub(crate) trait SegmentHandler {
+    fn begin(&mut self, kind: SegmentKind, option: &str) -> CliResult<()>;
+
+    fn token(&mut self, kind: SegmentKind, original: &RawArg, canonical: &RawArg) -> CliResult<()>;
+
+    fn end(&mut self, kind: SegmentKind) -> CliResult<()>;
+
+    fn missing_terminator(
+        &mut self,
+        kind: SegmentKind,
+        _option: &str,
+    ) -> Box<dyn std::error::Error> {
+        let table = match kind {
+            SegmentKind::Encrypt => "encryption",
+            SegmentKind::Pages => "pages",
+            SegmentKind::AddAttachment => "attachment",
+            SegmentKind::CopyAttachments => "copy attachment",
+            SegmentKind::Overlay => "underlay/overlay",
+            SegmentKind::PageLabels => "set page labels",
+        };
+        flpdf::UsageError::new(format!("missing -- at end of {table} options")).into()
+    }
+}
+
+impl SegmentHandler for () {
+    fn begin(&mut self, _kind: SegmentKind, _option: &str) -> CliResult<()> {
+        Ok(())
+    }
+
+    fn token(
+        &mut self,
+        _kind: SegmentKind,
+        _original: &RawArg,
+        _canonical: &RawArg,
+    ) -> CliResult<()> {
+        Ok(())
+    }
+
+    fn end(&mut self, _kind: SegmentKind) -> CliResult<()> {
+        Ok(())
+    }
 }
 
 impl SegmentKind {
@@ -297,7 +344,17 @@ impl ArgParser {
         self.parse_os(args.into_iter().map(OsString::from).collect())
     }
 
+    #[cfg(test)]
     pub(crate) fn parse_os(&self, args: Vec<OsString>) -> CliResult<ParsedArgs> {
+        let mut handler = ();
+        self.parse_os_with_handler(args, &mut handler)
+    }
+
+    pub(crate) fn parse_os_with_handler<H: SegmentHandler>(
+        &self,
+        args: Vec<OsString>,
+        handler: &mut H,
+    ) -> CliResult<ParsedArgs> {
         let args = expand_arg_files(args.into_iter().map(RawArg::from_os).collect())?;
         let expanded_arg_count = args.len();
         // qpdf has no subcommands. Since flpdf adds a native clap surface, fix
@@ -360,10 +417,18 @@ impl ArgParser {
 
             let canonical = self.canonical_top_level_option(arg.clone());
             let Some(option) = option_name(canonical.as_os_str()) else {
+                let is_unknown = self.is_unrecognized_qpdf_option(&arg);
+                if !native_subcommand_mode
+                    && prior_qpdf_help_table_option(&original_residual_args).is_none()
+                    && is_unknown
+                    && arg.as_bytes().starts_with(b"--")
+                {
+                    return Err(unrecognized_qpdf_option_error(&arg).into());
+                }
                 record_unknown_option(
                     &mut first_unknown_option,
                     residual_args.len(),
-                    self.is_unrecognized_qpdf_option(&arg),
+                    is_unknown,
                     arg.clone(),
                 );
                 original_residual_args.push(arg);
@@ -373,6 +438,12 @@ impl ArgParser {
             match option.as_str() {
                 "empty" => {
                     if selected_empty_input && repeated_selector.is_none() {
+                        if !native_subcommand_mode {
+                            return Err(flpdf::UsageError::new(
+                                "empty input can't be used since input file has already been given",
+                            )
+                            .into());
+                        }
                         repeated_selector = Some((
                             residual_args.len(),
                             "empty input can't be used since input file has already been given",
@@ -382,6 +453,12 @@ impl ArgParser {
                 }
                 "replace-input" => {
                     if selected_replace_input && repeated_selector.is_none() {
+                        if !native_subcommand_mode {
+                            return Err(flpdf::UsageError::new(
+                                "replace-input can't be used since output file has already been given",
+                            )
+                            .into());
+                        }
                         repeated_selector = Some((
                             residual_args.len(),
                             "replace-input can't be used since output file has already been given",
@@ -413,10 +490,20 @@ impl ArgParser {
                 }
             }
             let Some(kind) = SegmentKind::from_option(&option) else {
+                let is_unknown = self.is_unrecognized_qpdf_option(&arg);
+                if !native_subcommand_mode {
+                    if let Some(help_option) = prior_qpdf_help_table_option(&original_residual_args)
+                    {
+                        return Err(unrecognized_qpdf_option_error(help_option).into());
+                    }
+                }
+                if !native_subcommand_mode && is_unknown && arg.as_bytes().starts_with(b"--") {
+                    return Err(unrecognized_qpdf_option_error(&arg).into());
+                }
                 record_unknown_option(
                     &mut first_unknown_option,
                     residual_args.len(),
-                    self.is_unrecognized_qpdf_option(&arg),
+                    is_unknown,
                     arg.clone(),
                 );
                 original_residual_args.push(arg);
@@ -425,6 +512,11 @@ impl ArgParser {
             };
 
             let segment_start_index = residual_args.len();
+            if !native_subcommand_mode {
+                if let Some(help_option) = prior_qpdf_help_table_option(&original_residual_args) {
+                    return Err(unrecognized_qpdf_option_error(help_option).into());
+                }
+            }
             let earlier_usage_error = first_unknown_option
                 .as_ref()
                 .is_some_and(|(index, _)| *index < segment_start_index)
@@ -433,8 +525,10 @@ impl ArgParser {
                     .is_some_and(|(index, _)| *index < segment_start_index);
             let mut tokens: Vec<RawArg> = Vec::new();
             let mut terminated = false;
+            handler.begin(kind, &option)?;
             for token in iter.by_ref() {
                 if token.as_bytes() == b"--" {
+                    handler.end(kind)?;
                     terminated = true;
                     break;
                 }
@@ -450,7 +544,9 @@ impl ArgParser {
                     );
                     return Err(flpdf::UsageError::new(message).into());
                 }
-                tokens.push(self.canonical_segment_option(kind, token));
+                let canonical = self.canonical_segment_option(kind, token.clone());
+                handler.token(kind, &token, &canonical)?;
+                tokens.push(canonical);
             }
             if !terminated && !(kind == SegmentKind::PageLabels && earlier_usage_error) {
                 if kind == SegmentKind::PageLabels {
@@ -459,12 +555,7 @@ impl ArgParser {
                     )
                     .into());
                 }
-                let message = if kind == SegmentKind::AddAttachment {
-                    format!("--{option}: missing -- terminator")
-                } else {
-                    format!("--{option}: segment must be terminated by a `--` token")
-                };
-                return Err(message.into());
+                return Err(handler.missing_terminator(kind, &option));
             }
             if kind == SegmentKind::PageLabels && !earlier_usage_error {
                 // QPDFArgParser commits Config::setPageLabels at this exact
@@ -669,6 +760,46 @@ fn record_unknown_option(
     if is_unknown && first_unknown_option.is_none() {
         *first_unknown_option = Some((index, arg));
     }
+}
+
+fn unrecognized_qpdf_option_error(arg: &RawArg) -> flpdf::UsageError {
+    let mut message = b"unrecognized argument ".to_vec();
+    message.extend_from_slice(arg.as_bytes());
+    flpdf::UsageError::new(message)
+}
+
+fn is_qpdf_help_table_option(arg: &RawArg) -> bool {
+    let bytes = arg.as_bytes();
+    bytes == b"-h"
+        || bytes == b"--help"
+        || bytes == b"-help"
+        || bytes.starts_with(b"--help=")
+        || bytes.starts_with(b"-help=")
+        || bytes == b"--version"
+        || bytes == b"-version"
+        || bytes == b"--copyright"
+        || bytes == b"-copyright"
+}
+
+fn prior_qpdf_help_table_option(args: &[RawArg]) -> Option<&RawArg> {
+    let mut index = 1;
+    while index < args.len() {
+        if let Some(name) = option_name(args[index].as_os_str()) {
+            if SegmentKind::from_option(&name).is_some() {
+                index += 1;
+                while index < args.len() && args[index].as_bytes() != b"--" {
+                    index += 1;
+                }
+                index += usize::from(index < args.len());
+                continue;
+            }
+        }
+        if is_qpdf_help_table_option(&args[index]) {
+            return Some(&args[index]);
+        }
+        index += 1;
+    }
+    None
 }
 
 fn required_parameter_name(name: &str) -> Option<&'static str> {
@@ -1364,20 +1495,16 @@ mod tests {
         use std::os::unix::ffi::{OsStrExt, OsStringExt};
 
         let input = OsString::from_vec(b"--unknown-\xff".to_vec());
-        let parsed = ArgParser::from_command(clap::Command::new("flpdf"))
+        let error = ArgParser::from_command(clap::Command::new("flpdf"))
             .parse_os(vec![OsString::from("flpdf"), input.clone()])
-            .expect("unknown raw option should remain available to the usage boundary");
+            .expect_err("unknown raw option should fail at the qpdf parser boundary");
 
-        let (index, argument) = parsed
-            .first_unknown_option
-            .as_ref()
-            .expect("non-UTF-8 option should be recorded as unknown");
-        assert_eq!(*index, 1);
-        assert_eq!(argument.as_bytes(), input.as_bytes());
-        assert_eq!(
-            parsed.original_residual_args[1].as_bytes(),
-            input.as_bytes()
-        );
+        let usage = error
+            .downcast_ref::<flpdf::UsageError>()
+            .expect("unknown raw option should use the qpdf usage error");
+        let mut expected = b"unrecognized argument ".to_vec();
+        expected.extend_from_slice(input.as_os_str().as_bytes());
+        assert_eq!(usage.what_bytes(), expected.as_slice());
     }
 
     #[cfg(unix)]
