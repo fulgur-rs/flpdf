@@ -336,8 +336,13 @@ impl<R: Read + Seek> Pdf<R> {
             }
         }
         // qpdf's readTrailer resets InputSource::last_offset to the xref read
-        // position before initializeEncryption runs (QPDF.cc:1313-1327).
-        resolver.set_last_offset(loaded.startxref);
+        // position before initializeEncryption only for a classic trailer
+        // (`QPDF.cc:1313-1327`). An xref-stream trailer is the stream object
+        // itself, so retain the live stream read position for later lazy
+        // resolution diagnostics.
+        if matches!(loaded.last_xref_form, XrefForm::Table) {
+            resolver.set_last_offset(loaded.startxref);
+        }
         let trailer = loaded.trailer;
         // `Pdf::encryption` is the same `Rc<RefCell<..>>` allocation as
         // `ResolverCore::encryption_parameters` (qpdf's `m->encp`), not a

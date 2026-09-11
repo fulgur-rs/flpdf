@@ -17,6 +17,7 @@ pub(crate) fn write_plain<R: Read + Seek, W: Write>(
     out: W,
     options: &WriterOptions,
     generated_id: Option<&crate::ObjectHandle>,
+    source_object_stream_data: &BTreeMap<u32, u32>,
 ) -> crate::Result<WriterResult> {
     // The live queue preserves the mutation/progress timing contract for the
     // ordinary unnormalized route. QDF and page-content normalization need the
@@ -41,9 +42,20 @@ pub(crate) fn write_plain<R: Read + Seek, W: Write>(
         ObjectStreamMode::Disable | ObjectStreamMode::Preserve
     );
     if is_live_disable_shaped && !options.qdf && !options.content_normalization {
-        return write_plain_live_disable(pdf, out, options, generated_id);
+        return write_plain_live_disable(
+            pdf,
+            out,
+            options,
+            generated_id,
+            source_object_stream_data,
+        );
     }
-    let plan = plan::PlainWritePlan::build_with_generated_id(pdf, options, generated_id)?;
+    let plan = plan::PlainWritePlan::build_with_generated_id_and_source_object_stream_data(
+        pdf,
+        options,
+        generated_id,
+        Some(source_object_stream_data),
+    )?;
     crate::writer::configure_progress_for_pdf(pdf, options, 0, false)?; // cov:ignore: a pre-emission object-enumeration failure is surfaced by the underlying writer validation
     write_planned(pdf, out, options, &plan)
 }
@@ -53,6 +65,7 @@ fn write_plain_live_disable<R: Read + Seek, W: Write>(
     mut out: W,
     options: &WriterOptions,
     generated_id: Option<&crate::ObjectHandle>,
+    source_object_stream_data: &BTreeMap<u32, u32>,
 ) -> crate::Result<WriterResult> {
     let source_root = pdf.root_ref();
     let direct_root = if source_root.is_none() {
@@ -66,9 +79,10 @@ fn write_plain_live_disable<R: Read + Seek, W: Write>(
     let mut removed_refs: BTreeSet<ObjectRef> = BTreeSet::new();
     let object_streams = if options.object_streams == ObjectStreamMode::Preserve {
         let packing =
-            crate::writer::object_streams::plan_qpdf_preserve_object_streams_with_unreferenced(
+            crate::writer::object_streams::plan_qpdf_preserve_object_streams_with_source_membership(
                 pdf,
                 options.preserve_unreferenced_objects,
+                Some(source_object_stream_data),
             )?; // cov:ignore: malformed source graph is rejected by the preserve planner
         removed_refs.extend(packing.removed_refs);
         packing.groups

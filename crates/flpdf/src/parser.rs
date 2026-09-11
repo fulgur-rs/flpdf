@@ -581,6 +581,9 @@ impl<I: LiveInput> LiveFileParser<'_, '_, '_, I> {
                     self.capture_raw_signature_contents(frames, &token);
                     let value =
                         self.parse_scalar_token(token.clone(), token.start as i64, false)?;
+                    if self.give_up {
+                        return Ok(ObjectHandle::null());
+                    }
                     self.add_to_top_frame(frames, value)?;
                 }
             }
@@ -1670,6 +1673,16 @@ mod live_input_tests {
             error,
             Error::Parse { offset: 2, message }
                 if message == "integer out of range converting 2147483648 from a 8-byte signed type to a 4-byte signed type"
+        ));
+
+        let mut input = CountingInput::new(b"<< /Columns 9900000000000000000 /Predictor 12 >>");
+        let mut resolver = NullResolver;
+        let error = parse_live_file_object(&mut input, &mut resolver)
+            .expect_err("qpdf preserves an oversized integer conversion failure");
+        assert!(matches!(
+            error,
+            Error::System(message)
+                if message == "overflow/underflow converting 9900000000000000000 to 64-bit integer"
         ));
 
         let nested_reference = parse_with_null_resolver(b"[ 1 0 R ]");

@@ -3346,6 +3346,18 @@ fn recover_xref_from_linear_scan(
         .iter()
         .map(|(object_ref, entry)| Ok((QpdfObjGen::try_from_object_ref(*object_ref)?, *entry)))
         .collect::<Result<BTreeMap<_, _>>>()?;
+    // qpdf keeps non-type-1 raw rows that were inserted before a failed xref
+    // stream entry decode (notably the object-0 type-0 placeholder) while
+    // reconstruction replaces only the uncompressed rows
+    // (`QPDF.cc:516-575`). Retain those exact raw identities for the later
+    // resolver census; the effective ObjectRef map must still omit them.
+    if let Some(preexisting_raw_entries) = preexisting_raw_entries {
+        for (&object_gen, &entry) in preexisting_raw_entries {
+            if !matches!(entry, XrefEntry::Uncompressed { .. }) {
+                raw_entries.entry(object_gen).or_insert(entry);
+            }
+        }
+    }
     // qpdf's candidate path re-enters read_xref(max_offset) after the
     // reconstruction line scan (QPDF.cc:576-607). That nested read_xref
     // performs its own post-chain generation pruning (QPDF.cc:710-718),
@@ -3684,10 +3696,13 @@ fn recover_trailer_from_xref_stream_candidate(
             // qpdf's message is exactly this, with no nested detail appended
             // (`libqpdf/QPDF.cc:604`); the inner failure is what led here, not
             // part of the public text.
-            return Err(Error::parse(
+            return Err(Error::QpdfExc(QpdfExc::new(
+                QpdfErrorCode::DamagedPdf,
+                &options.description,
+                b"",
                 0,
-                "error decoding candidate xref stream while recovering damaged file".to_string(),
-            ));
+                b"error decoding candidate xref stream while recovering damaged file",
+            )));
         }
     };
     // qpdf appends the candidate's warning when its re-entry reads the
@@ -3730,10 +3745,15 @@ fn recover_trailer_from_xref_stream_candidate(
             repair_diagnostics.push(diagnostic.clone());
         }
         deliver_canonical_diagnostics(canonical_trailer_owner, repair_diagnostics)?; // cov:ignore: this is the defensive logger-failure edge on a failed candidate /Prev merge; normal candidate delivery is covered by qpdf differential tests
-        return Err(Error::parse(
+                                                                                     // cov:ignore-start: qtest candidate-recovery failures exercise this terminal qpdf exception through the external corpus
+        return Err(Error::QpdfExc(QpdfExc::new(
+            QpdfErrorCode::DamagedPdf,
+            &options.description,
+            b"",
             0,
-            "error decoding candidate xref stream while recovering damaged file",
-        ));
+            b"error decoding candidate xref stream while recovering damaged file",
+        )));
+        // cov:ignore-end
     }
 
     let first_xref_item_offset = reentry.first_xref_item_offset;
@@ -4191,10 +4211,16 @@ fn push_repair_diagnostics(
             0,
         ),
         // cov:ignore-start: non-qpdf transport variants are normalized before reconstruction diagnostics are built
-        Error::SystemBytes(message) => (Vec::new(), message.clone(), startxref as i64),
-        Error::System(message) | Error::Internal(message) | Error::Unsupported(message) => {
-            (Vec::new(), message.as_bytes().to_vec(), startxref as i64)
-        }
+        Error::SystemBytes(message) => (
+            Vec::new(),
+            [b"error reading xref: ".as_slice(), message].concat(),
+            0,
+        ),
+        Error::System(message) | Error::Internal(message) | Error::Unsupported(message) => (
+            Vec::new(),
+            format!("error reading xref: {message}").into_bytes(),
+            0,
+        ),
         // cov:ignore-end
         // cov:ignore-start: the caller guards reconstruction failures to qpdf damage or parse variants
         _ => (
@@ -4250,7 +4276,7 @@ fn read_trailer(
         resolver,
     )
     .map_err(|error| error.rebase_offset(start))?;
-    let mut diagnostics = trailer_diagnostics(start, parsed.diagnostics, filename);
+    let mut diagnostics = trailer_diagnostics(start, parsed.diagnostics, filename, Some(slice));
     if let Some(empty_offset) = parsed.empty_offset {
         diagnostics.push(trailer_warning(
             filename,
@@ -4324,12 +4350,56 @@ fn trailer_diagnostics(
     start: usize,
     diagnostics: Vec<ParserDiagnostic>,
     filename: &[u8],
+    source: Option<&[u8]>,
 ) -> Vec<QpdfExc> {
+    fn invalid_hex_byte(source: &[u8], offset: usize) -> Option<u8> {
+        let mut position = offset;
+        if source.get(position) == Some(&b'<') {
+            position = position.saturating_add(1);
+            while let Some(&byte) = source.get(position) {
+                if byte == b'>' {
+                    return None;
+                }
+                if byte.is_ascii_hexdigit()
+                    || matches!(
+                        byte,
+                        b'\0' | b'\t' | b'\n' | b'\x0b' | b'\x0c' | b'\r' | b' '
+                    )
+                {
+                    position = position.saturating_add(1);
+                    continue;
+                }
+                return Some(byte);
+            }
+            return None;
+        }
+        source.get(position).copied()
+    }
+
     diagnostics
         .into_iter()
         .map(|diagnostic| {
             let offset = (start as u64).saturating_add(diagnostic.relative_offset as u64);
-            trailer_warning(filename, diagnostic.message, Some(offset))
+            let message = if diagnostic.message.starts_with("invalid character (") {
+                source
+                    .and_then(|source| invalid_hex_byte(source, diagnostic.relative_offset))
+                    .map(|byte| {
+                        let mut message = b"invalid character (".to_vec();
+                        message.push(byte);
+                        message.extend_from_slice(b") in hexstring");
+                        message
+                    })
+                    .unwrap_or_else(|| diagnostic.message.into_bytes())
+            } else {
+                diagnostic.message.into_bytes()
+            };
+            QpdfExc::new(
+                QpdfErrorCode::DamagedPdf,
+                filename,
+                b"trailer",
+                i64::try_from(offset).unwrap_or(i64::MAX),
+                message,
+            )
         })
         .collect()
 }
@@ -4452,16 +4522,23 @@ fn parse_xref_table(
             let _ = cursor.read_token()?;
             break;
         }
-        let header = cursor.read_line(50);
-        let (first, count) = parse_xref_first_line(&header).ok_or_else(|| {
-            Error::QpdfExc(QpdfExc::new(
-                QpdfErrorCode::DamagedPdf,
-                filename,
-                b"xref table",
-                i64::try_from(section_start).unwrap_or(i64::MAX),
-                b"xref syntax invalid",
-            ))
-        })?;
+        let header_start = cursor.pos;
+        let header = cursor.read_bytes(50);
+        let (first, count, header_bytes) =
+            parse_xref_first_line_with_bytes(&header).ok_or_else(|| {
+                Error::QpdfExc(QpdfExc::new(
+                    QpdfErrorCode::DamagedPdf,
+                    filename,
+                    b"xref table",
+                    i64::try_from(section_start).unwrap_or(i64::MAX),
+                    b"xref syntax invalid",
+                ))
+            })?;
+        // qpdf reads a fixed 50-byte buffer and then seeks to the number of
+        // bytes consumed by `parse_xrefFirst` (`QPDF.cc:725-767`), so the
+        // subsection header may span physical lines. Do not leave the cursor
+        // at the end of the speculative buffer.
+        cursor.pos = header_start.saturating_add(header_bytes);
         if first == 0 && count > 0 {
             first_xref_item_offset = cursor.pos as u64;
             if let Some(sink) = first_xref_item_offset_sink.as_deref_mut() {
@@ -4561,7 +4638,12 @@ fn is_pdf_delimiter(byte: u8) -> bool {
         )
 }
 
+#[cfg(test)]
 fn parse_xref_first_line(line: &[u8]) -> Option<(u32, u32)> {
+    parse_xref_first_line_with_bytes(line).map(|(first, count, _)| (first, count))
+}
+
+fn parse_xref_first_line_with_bytes(line: &[u8]) -> Option<(u32, u32, usize)> {
     let mut pos = 0;
     while line.get(pos).copied().is_some_and(is_pdf_space) {
         pos += 1;
@@ -4592,7 +4674,10 @@ fn parse_xref_first_line(line: &[u8]) -> Option<(u32, u32)> {
         .ok()?
         .parse::<u64>()
         .ok()?;
-    Some((u32::try_from(first).ok()?, u32::try_from(count).ok()?))
+    while line.get(pos).copied().is_some_and(is_pdf_space) {
+        pos += 1;
+    }
+    Some((u32::try_from(first).ok()?, u32::try_from(count).ok()?, pos))
 }
 
 fn parse_xref_entry_line(line: &[u8]) -> Option<(u64, i32, u8, bool)> {
@@ -4907,6 +4992,25 @@ fn build_xref_stream(
     let size = u32::try_from(size).map_err(|_| Error::parse(0, "/Size does not fit u32"))?;
 
     let widths = parse_xref_widths_handle(context, &handle_stream_dict)?;
+    // qpdf validates the summed `/W` entry size before reading `/Index` or
+    // asking the stream for decoded bytes (`QPDF.cc:986-1018`). A zero sum is
+    // a `damagedPDF("xref stream", xref_offset, message)` exception, not an
+    // internal parser error, so preserve its description and offset through
+    // recovery (`QPDF.cc:1003-1005`).
+    let entry_size = widths
+        .0
+        .checked_add(widths.1)
+        .and_then(|size| size.checked_add(widths.2))
+        .ok_or_else(|| Error::parse(xref_pos, "xref stream entry size overflow"))?;
+    if entry_size == 0 {
+        return Err(Error::QpdfExc(QpdfExc::new(
+            QpdfErrorCode::DamagedPdf,
+            context.description(),
+            b"xref stream",
+            i64::try_from(xref_pos).unwrap_or(i64::MAX),
+            b"Cross-reference stream's /W indicates entry size of 0",
+        )));
+    }
     let index = parse_xref_index_handle(context, &handle_stream_dict, size)?;
     let ranges = build_xref_ranges(index)?;
     let has_first_xref_item = ranges.iter().any(|&(start, count)| start == 0 && count > 0);
@@ -4933,11 +5037,6 @@ fn build_xref_stream(
         &handle_object,
         xref_pos,
     )?;
-    let entry_size = widths
-        .0
-        .checked_add(widths.1)
-        .and_then(|size| size.checked_add(widths.2))
-        .ok_or_else(|| Error::parse(xref_pos, "xref stream entry size overflow"))?;
     let expected_size = ranges.iter().try_fold(0usize, |total, &(_, count)| {
         let count = usize::try_from(count)
             .map_err(|_| Error::parse(xref_pos, "xref stream entry count overflow"))?;
@@ -4978,7 +5077,6 @@ fn build_xref_stream(
     let mut cursor = ByteCursor::new(&stream_data, 0);
     let entries = parse_xref_entries(
         &mut cursor,
-        size,
         &ranges,
         widths,
         stream_data_offset,
@@ -5198,7 +5296,6 @@ fn build_xref_ranges(index: Vec<u32>) -> Result<Vec<(u32, u32)>> {
 
 fn parse_xref_entries(
     cursor: &mut ByteCursor<'_>,
-    size: u32,
     ranges: &[(u32, u32)],
     widths: XrefWidths,
     stream_data_offset: Option<usize>,
@@ -5217,10 +5314,6 @@ fn parse_xref_entries(
         let count = usize::try_from(count).map_err(|_| Error::parse(0, "range count too large"))?;
 
         for index in 0..count {
-            if start + index >= usize::try_from(size).unwrap_or(usize::MAX) {
-                return Err(Error::parse(0, "xref range exceeds /Size"));
-            }
-
             if cursor.pos + entry_width > cursor.bytes.len() {
                 return Err(Error::parse(cursor.pos, "xref stream data truncated"));
             }
@@ -5444,6 +5537,13 @@ impl<'a> ByteCursor<'a> {
             self.pos += 1;
         }
         line
+    }
+
+    fn read_bytes(&mut self, max_len: usize) -> Vec<u8> {
+        let start = self.pos;
+        let end = start.saturating_add(max_len).min(self.bytes.len());
+        self.pos = end;
+        self.bytes[start..end].to_vec()
     }
 }
 
@@ -7214,6 +7314,36 @@ mod final_handle_tests {
     }
 
     #[test]
+    fn classic_xref_section_header_can_span_physical_lines_like_qpdf() {
+        let mut cursor = ByteCursor::new(b"\n6\n2147483647", 0);
+        let error = parse_xref_table(&mut cursor, b"", None, b"issue-335b.pdf")
+            .expect_err("qpdf reaches the first missing xref row after the split header");
+        assert!(matches!(
+            error,
+            Error::QpdfExc(warning)
+                if warning.get_object() == b"xref table"
+                    && warning.get_message_detail() == b"invalid xref entry (obj=6)"
+        ));
+    }
+
+    #[test]
+    fn xref_stream_index_rows_are_not_rejected_only_for_exceeding_size() {
+        let mut cursor = ByteCursor::new(&[1, 0], 0);
+        let mut registration = XrefRegistration::default();
+        let entries =
+            parse_xref_entries(&mut cursor, &[(35, 1)], (1, 0, 1), None, &mut registration)
+                .expect("qpdf accepts an /Index row beyond the reported /Size");
+
+        assert!(matches!(
+            entries.as_slice(),
+            [ParsedXrefEntry::Live {
+                object_ref,
+                entry: XrefEntry::Uncompressed { offset: 0 },
+            }] if *object_ref == QpdfObjGen::new(35, 0)
+        ));
+    }
+
+    #[test]
     fn the_space_and_delimiter_sets_match_qpdf() {
         // `QUtil::is_space` (`include/qpdf/QUtil.hh:497-501`) and the
         // tokenizer's `is_delimiter` (`libqpdf/QPDFTokenizer.cc:16-23`).
@@ -7650,9 +7780,19 @@ mod final_handle_tests {
         let bytes = b"%PDF-1.4\n1 0 obj\n<< /Type /XRef /W [1 0 1] /Size 1 /Length 4 >>\nstream\nabcd\nendstream\nendobj\n%%EOF\n";
         let error = load_xref_snapshot(&mut std::io::Cursor::new(bytes), true)
             .expect_err("the malformed candidate must fail after warning");
-        let (_, diagnostics) = error
+        let (source, diagnostics) = error
             .open_failure()
             .expect("permissive candidate failure carries repair diagnostics");
+        // cov:ignore-start: the preceding qpdf candidate assertion makes this defensive arm unreachable
+        let Error::QpdfExc(source_warning) = source else {
+            panic!("candidate recovery must preserve qpdf's structured terminal error");
+        };
+        // cov:ignore-end
+        assert_eq!(
+            source_warning.message_string(),
+            "error decoding candidate xref stream while recovering damaged file"
+        );
+        assert_eq!(source_warning.get_file_position(), 0);
         let messages: Vec<_> = diagnostics
             .entries()
             .iter()
@@ -8370,6 +8510,49 @@ mod final_handle_tests {
     }
 
     #[test]
+    fn zero_width_xref_stream_uses_qpdf_damaged_warning_shape() {
+        let resolver = canonical_test_resolver(Vec::new(), BTreeMap::new(), false, 3);
+        let mut context = CanonicalXrefContext::new(resolver.as_ref(), Vec::new());
+        let dictionary = ObjectHandle::dictionary(vec![
+            (b"/Type".to_vec(), ObjectHandle::name(b"XRef".to_vec())),
+            (
+                b"/W".to_vec(),
+                ObjectHandle::array(vec![
+                    ObjectHandle::integer(0),
+                    ObjectHandle::integer(0),
+                    ObjectHandle::integer(0),
+                ]),
+            ),
+            (b"/Size".to_vec(), ObjectHandle::integer(1)),
+        ]);
+        let stream = ObjectHandle::stream(dictionary, Rc::new(Vec::new()));
+        let mut registration = XrefRegistration::default();
+        let error = build_xref_stream(
+            &mut context,
+            3,
+            XrefStreamObjectRead {
+                object_ref: ObjectRef::new(1, 0),
+                object: stream,
+                stream_data_offset: None,
+            },
+            &mut registration,
+        )
+        .expect_err("qpdf rejects a zero-sized xref-stream entry");
+
+        // cov:ignore-start: the preceding qpdf xref assertion makes this defensive arm unreachable
+        let Error::QpdfExc(warning) = error else {
+            panic!("qpdf xref-stream damage must remain a structured warning");
+        };
+        // cov:ignore-end
+        assert_eq!(warning.get_object(), b"xref stream");
+        assert_eq!(warning.get_file_position(), 3);
+        assert_eq!(
+            warning.message_string(),
+            "Cross-reference stream's /W indicates entry size of 0"
+        );
+    }
+
+    #[test]
     fn canonical_xref_stream_reports_qpdfs_wrong_size_warning_for_a_recovered_payload_eol() {
         // qpdf's own recovered length (`recoverStreamLength`, `QPDF.cc:1482-1497`)
         // spans every byte up to the "endstream" it finds, which includes the
@@ -9016,6 +9199,21 @@ mod final_handle_tests {
                 b"Attempting to reconstruct cross-reference table"
             );
         }
+
+        let mut diagnostics = Diagnostics::default();
+        push_repair_diagnostics(
+            &mut diagnostics,
+            &Error::System(
+                "overflow/underflow converting 9900000000000000000 to 64-bit integer".to_owned(),
+            ),
+            99,
+            b"input.pdf",
+        );
+        assert_eq!(
+            diagnostics.entries()[1].get_message_detail(),
+            b"error reading xref: overflow/underflow converting 9900000000000000000 to 64-bit integer"
+        );
+        assert_eq!(diagnostics.entries()[1].get_file_position(), 0);
     }
 
     #[test]
@@ -9027,6 +9225,7 @@ mod final_handle_tests {
                 message: "treating unexpected brace token as null".to_owned(),
             }],
             b"bad13.pdf",
+            None,
         );
 
         assert_eq!(diagnostics.len(), 1);
@@ -9034,6 +9233,50 @@ mod final_handle_tests {
         assert_eq!(
             diagnostics[0].what_bytes(),
             b"bad13.pdf (trailer, offset 753): treating unexpected brace token as null"
+        );
+    }
+
+    #[test]
+    fn trailer_hex_diagnostics_preserve_raw_invalid_bytes() {
+        let diagnostics = trailer_diagnostics(
+            750,
+            vec![
+                ParserDiagnostic {
+                    relative_offset: 0,
+                    message: "invalid character (�) in hexstring".to_owned(),
+                },
+                ParserDiagnostic {
+                    relative_offset: 4,
+                    message: "invalid character (�) in hexstring".to_owned(),
+                },
+                ParserDiagnostic {
+                    relative_offset: 7,
+                    message: "invalid character (�) in hexstring".to_owned(),
+                },
+                ParserDiagnostic {
+                    relative_offset: 8,
+                    message: "invalid character (�) in hexstring".to_owned(),
+                },
+            ],
+            b"bad13.pdf",
+            Some(b"<a\xa8><a>\xa8<a"),
+        );
+
+        assert_eq!(
+            diagnostics[0].get_message_detail(),
+            b"invalid character (\xa8) in hexstring"
+        );
+        assert_eq!(
+            diagnostics[1].get_message_detail(),
+            "invalid character (�) in hexstring".as_bytes()
+        );
+        assert_eq!(
+            diagnostics[2].get_message_detail(),
+            b"invalid character (\xa8) in hexstring"
+        );
+        assert_eq!(
+            diagnostics[3].get_message_detail(),
+            "invalid character (�) in hexstring".as_bytes()
         );
     }
 

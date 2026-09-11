@@ -16,6 +16,7 @@ pub(crate) use emission::{
 pub use planning::ObjectStreamMode;
 pub(crate) use planning::{
     filter_objstm_batches_for_output, plan_object_streams_with_reachability,
+    plan_qpdf_preserve_object_streams_with_source_membership,
     plan_qpdf_preserve_object_streams_with_unreferenced, planner_config_from_options,
     ObjectStreamGroup, PlannerConfig,
 };

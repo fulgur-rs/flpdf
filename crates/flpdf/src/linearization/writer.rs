@@ -3184,6 +3184,7 @@ fn write_linearized_impl<R: Read + Seek>(
     let crate::writer::WriterSetupState {
         generated_id,
         encryption_parameters,
+        source_object_stream_data: _,
     } = setup;
     let deterministic_id = crate::writer::uses_deterministic_id(options);
 
