@@ -1787,11 +1787,6 @@ enum Commands {
     #[command(about = "Rewrite the input PDF to a normalized output")]
     Rewrite(RewriteCommand),
     #[command(
-        name = "show-stream",
-        about = "Show a stream object's decoded (or raw) data"
-    )]
-    ShowStream(ShowStreamCommand),
-    #[command(
         name = "show-encryption",
         about = "Show encryption parameters (qpdf --show-encryption compatible)",
         long_about = "\
@@ -1880,20 +1875,6 @@ struct CheckLinearizationCommand {
 struct DumpObjectCommand {
     object_ref: String,
     input: PathBuf,
-    #[arg(long)]
-    repair: bool,
-    #[command(flatten)]
-    password: PasswordArgs,
-}
-
-#[derive(Debug, ClapArgs)]
-struct ShowStreamCommand {
-    /// Object reference, e.g. "7 0" or "7 0 R".
-    object_ref: String,
-    input: PathBuf,
-    /// Emit unfiltered stored bytes instead of decoding (qpdf --raw-stream-data).
-    #[arg(long = "raw-stream-data")]
-    raw_stream_data: bool,
     #[arg(long)]
     repair: bool,
     #[command(flatten)]
@@ -2889,7 +2870,6 @@ fn apply_raw_overrides(args: &mut Cli, overrides: RawCliOverrides) {
             Commands::DumpObject(command) => command.password.raw_password = password.clone(),
             Commands::Pages(command) => command.password.raw_password = password.clone(),
             Commands::Qdf(command) => command.password.raw_password = password.clone(),
-            Commands::ShowStream(command) => command.password.raw_password = password.clone(),
             Commands::ShowEncryption(command)
             | Commands::RequiresPassword(command)
             | Commands::ShowEncryptionKey(command) => {
@@ -4727,7 +4707,6 @@ fn run_command(command: Commands, overlay_specs: &[OverlaySpec]) -> CliResult<()
             let usage_name = format!("{whoami} zlib-flate");
             run_zlib_flate(&cmd.modes, &whoami, &usage_name)
         }
-        Commands::ShowStream(cmd) => run_show_stream(cmd),
         Commands::ShowEncryption(cmd) => {
             // The native subcommand has no `--show-encryption-key` flag of its
             // own (the dedicated `show-encryption-key` subcommand covers that
@@ -9020,15 +8999,6 @@ fn run_show_object(
         raw_stream_data,
         filtered_stream_data,
     )?)
-}
-
-fn run_show_stream(cmd: ShowStreamCommand) -> CliResult<()> {
-    let object_ref = ObjectRef::parse(&cmd.object_ref)?;
-    let mut pdf = open_pdf(&cmd.input, cmd.repair, &cmd.password)?;
-    let mut job = QPDFJob::new();
-    job.set_logger(cli_logger());
-    job.set_message_prefix(progname());
-    finish_job_exit_status(job.show_stream(&mut pdf, object_ref, cmd.raw_stream_data)?)
 }
 
 fn run_show_npages(

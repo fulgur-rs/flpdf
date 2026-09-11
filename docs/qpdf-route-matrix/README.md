@@ -138,7 +138,7 @@ D19/D30はcanonical ownerへ委譲するbyte-neutral test scaffolding、D27は�
 | **`willFilterStream` の判定順序**（filter-on-write veto、metadata / normalize / compress の排他 chain） | `libqpdf/QPDFWriter.cc:1254-1285,2543-2551` | C20 canonical。C22 mixed — plain の `is_data_modified()` 早期 return と linearized の事前 probe は非対称だが、plain/QDF の出力cacheと qpdf の linearize 専用 optimizer probe を含めて照合する | 非対称だけで出力不一致や早期 return 撤去を決めない。C-U3 の library harness で provider 呼出回数、filter、payload を確認する |
 | **書き出し時に stream dict から削除するのは `/Filter` と `/DecodeParms` の 2 キーだけ** | `libqpdf/QPDFWriter.cc:1440-1486` / `libqpdf/QPDFWriter.cc:1451-1455` | C21 canonical。`crates/flpdf/src/writer/object.rs::prepare_stream_dict_entries` が qpdf の shallow-copy ownerで `/Length`・空`/DecodeParms`・`/Filter`/`/Crypt` を処理し、`/F` `/FFilter` `/FDecodeParms` はそのまま出力する。`crates/flpdf/src/writer/plain/body.rs::canonical_stream_output_with_rewrite_policy` はpipe結果と辞書方針を分離した。 | 外部ファイル参照 stream の `/F` が保持され、refilter/decode/filter-on-write veto/metadata/token-filter/provider retryの辞書と呼出順がqpdfと一致する |
 | **`compute_data_key` は読み側と書き側で同じ 1 実装を共有する** | `libqpdf/QPDF_encryption.cc:324-357`（呼び出し元は `libqpdf/QPDF_encryption.cc:963` と `libqpdf/QPDFWriter.cc:845` の 2 箇所のみ） | C17 / C18 canonical — `crates/flpdf/src/encryption/primitives.rs::compute_data_key` に統合し、reader `key_for_object` と writer `set_data_key` が共有。旧 writer 複製を削除した | V/R・key長5/16/24/32・AES/RC4・非zero generation を qpdf 11.9.0 C++ oracle vectors で固定。reader cache と writer generation 0 の call contract は各 consumer に保持 |
-| **pipe されるバイト数は常に `length`**（`recoverStreamLength` が復元した length は `endstream` 直前の改行を含み、qpdf はそれをそのまま pipe する） | `libqpdf/QPDF.cc:2496-2500` / `libqpdf/QPDF.cc:1488-1492` | C42 mixed — `crates/flpdf/src/reader/resolver.rs::pipe_stream_data_from_input` は通常・暗号化・foreign の全 route で caller の `length` を変更しない。`RecoveredStreamEol` は `job/inspection.rs::unparse_object_with_stream_data` の `dump-object` 再シリアライズframingだけに使い、show-streamのraw/decoded payloadはrecovered spanをtrimせず出す（`flpdf-zvjf`, `flpdf-hj7v`） | `encrypted-recovered-eol.pdf` と unencrypted recovered-length fixture で qpdf と flpdf の raw bytes、recovered length、content warning、exit 3 を一致させる |
+| **pipe されるバイト数は常に `length`**（`recoverStreamLength` が復元した length は `endstream` 直前の改行を含み、qpdf はそれをそのまま pipe する） | `libqpdf/QPDF.cc:2496-2500` / `libqpdf/QPDF.cc:1488-1492` | C42 mixed — `crates/flpdf/src/reader/resolver.rs::pipe_stream_data_from_input` は通常・暗号化・foreign の全 route で caller の `length` を変更しない。`RecoveredStreamEol` は `job/inspection.rs::unparse_object_with_stream_data` の `dump-object` 再シリアライズframingだけに使い、show-objectのraw/filtered payloadはrecovered spanをtrimせず出す（`flpdf-zvjf`, `flpdf-hj7v`） | `encrypted-recovered-eol.pdf` と unencrypted recovered-length fixture で qpdf と flpdf の raw bytes、recovered length、content warning、exit 3 を一致させる |
 | **ObjStm / xref stream / hint stream は `willFilterStream` を通らない**（deflate を直付けする） | `libqpdf/QPDFWriter.cc:1659-1665` / `libqpdf/QPDFWriter.cc:2422-2432` / `libqpdf/QPDFWriter.cc:2286-2330` | C31 / C32 / C33 canonical。plain / linearized の両 route が同じ primitive を共有 | ObjStm 本体に `--decode-level` や `--recompress-flate` が効いてしまい、container の payload が qpdf と変わる |
 
 ### 5.D writer
@@ -342,10 +342,8 @@ crates/flpdf/src/filters.rs::decode_stream_data_recovering_with_limits: prod 2 (
     crates/flpdf-qtest-tools/src/driver/test_0_1.rs 1, crates/flpdf/src/filters.rs 1
 crates/flpdf/src/filters.rs::encode_stream_data: removed by flpdf-3yn9.48.49; prod 0 / test 0
 crates/flpdf/src/filters.rs::encode_stream_data_from_handle: removed by flpdf-3yn9.48.49; prod 0 / test 0
-crates/flpdf/src/filters.rs::is_decoded_filter: prod 1 (1 files) / test 0
-    crates/flpdf/src/job/inspection.rs 1
-crates/flpdf/src/filters.rs::passthrough_codec_label: prod 3 (3 files) / test 0
-    crates/flpdf/src/filters.rs 1, crates/flpdf/src/job/inspection.rs 1, crates/flpdf/src/stream_filter.rs 1
+crates/flpdf/src/filters.rs::passthrough_codec_label: prod 2 (2 files) / test 0
+    crates/flpdf/src/filters.rs 1, crates/flpdf/src/stream_filter.rs 1
 crates/flpdf/src/encryption/primitives.rs::compute_data_key: prod 2 (2 files) / test 1
     crates/flpdf/src/encryption/state.rs 1, crates/flpdf/src/writer/encryption_state.rs 1
 crates/flpdf/src/writer/plain/body.rs::canonical_stream_filter_probe: prod 2 (1 files) / test 0
@@ -654,7 +652,7 @@ warning collectionやtoken primitiveの移植を、領域A全体の統合完了�
 1. **hygiene**（§7.4）— C19 / C28 の dead route 削除は `.42` で完了。C23 の `pub` 撤去は `.43` で完了。
 2. **C21 の辞書差** — `/F` `/FFilter` `/FDecodeParms` 削除の到達条件をoracle fixtureで固定し、qpdfの責務に沿って修正する。逸脱マーカーは修正完了の代替にしない。
 3. **C22** — C-U3 library harnessでplain/QDF cacheとlinearized probeの挙動を照合する。非対称だけで早期return撤去を決めない。
-4. **C42 / B11** — EOL 差し引きの決着は `flpdf-zvjf`（pipe）と `flpdf-hj7v`（show-stream）で完了。`RecoveredStreamEol` は `dump-object` 再シリアライズ専用として残る。前提: probe C-U1。
+4. **C42 / B11** — EOL 差し引きの決着は `flpdf-zvjf`（pipe）と show-object の raw/filtered payload で完了。`RecoveredStreamEol` は `dump-object` 再シリアライズ専用として残る。前提: probe C-U1。
 5. **C27** — bootstrapのdocument/source ownerを整えてからxref stream payloadのdecodeをcanonical pipeへ移す（`flpdf-3yn9.48.43`）。B17のxref entry構文処理の正本とは別責務である。
 6. **C44** — public `getStreamJSON` facade と deferred `StreamBlobProvider` 相当は `.48.47` で実装済み。残る C-U2 は provider 回数と lifetime を C++ harness で固定する probe。canonical C24 `write_stream_json` を二重pipeへ変更しない。
 7. **C4 / C8 / C9 / C25〜C29 / C43、E-27 / E-28** — provider/copy/decodeの不足primitiveを明示し、xrefとdriver test 0/1など既知consumerからbounded cutoverする。
@@ -926,7 +924,7 @@ P5 probe を参照）。qpdfのdocument-owned `ParseGuard` は
 対称チェックの両方向と失敗return時のguard復元を直接probeで固定した。
 
 B29 / D31 / E-28はsourceでmixedと判定した。E-28の未照合case/APIは引き続きunknownであり、
-行分類の確定を全caseの照合完了とは扱わない。C42は以前のpipe/show-stream修正完了を反映した。
+行分類の確定を全caseの照合完了とは扱わない。C42は以前のpipe-side EOL修正完了を反映した。
 
 ### 8.3 分類済みのprobeと既存結果（25件）
 
@@ -946,7 +944,7 @@ B29 / D31 / E-28はsourceでmixedと判定した。E-28の未照合case/APIは�
 | B-P6 | bounded cutover済み | B29 | QPDF.cc:345-363のdrain/anyWarningsを同じdocument collectionへ移植し、Job完了（inspect/write JSON/write/check/linearization）から移行済み。num_warningsも公開queryへ昇格。残るsnapshot/bookmark consumerは後続移行でcaller-zeroを確認する。 |
 | B-P7 | owner対応確認済み | B7 | ObjStm headerの2 token読取をQPDF::readTokenへ対応付ける。classic xrefのByteCursorはreadLine/parse_xrefEntry責務であり一律trueへ変えない。 |
 | B-P8 | 一部旧記述訂正 | B13/B17 | unknown xref stream entry typeは現src/testに存在する。stream keyword found in trailer等の残条件を個別fixtureで照合する。 |
-| C-U1 | 既存sliceで解決 | C42 | flpdf-zvjf/flpdf-hj7vのrecovered full-length pipe/show-streamを維持する。dump-objectのframing metadataは別責務。 |
+| C-U1 | 既存sliceで解決 | C42 | recovered full-length pipe と show-object raw/filtered payload を維持する。dump-objectのframing metadataは別責務。 |
 | C-U2 | API実装済・probe未了 | C44 | `.48.47` で public `get_stream_json` と deferred blob を実装済み（API欠落は解消）。残るのは直接getStreamJSONとdeferred blobのC++ harnessでprovider回数とlifetimeを固定すること。CLIのwriteStreamJSON/C24を二重pipeへ変更しない。 |
 | C-U3 | 未観測 | C22/C39 | token filter/providerを登録したlibrary harnessでplain/QDF cacheとlinearized optimizer probeを比較する。非対称だけでbugとはしない。 |
 | C-U4 | 完了 | C17/C18 | pinned qpdf headerをincludeしたC++ oracle probeと32固定vectorで、V/R・key長5/16/24/32・AES/RC4・非zero generationを確認し、単一primitiveへ統合した。 |
@@ -968,8 +966,8 @@ B29 / D31 / E-28はsourceでmixedと判定した。E-28の未照合case/APIは�
 
 | ID | 何が食い違うか | 両側の主張 | 解決に要ること |
 |---|---|---|---|
-| **X-1** | `crates/flpdf/src/reader/resolver.rs::recover_stream_length` の実装本数 | **B11 は `mixed`** — 「2 実装」。もう 1 本は `crates/flpdf/src/reader/file_object.rs::recover_stream_boundary` で、qpdf の `attempt_recovery` 1 bit（`libqpdf/QPDF.cc:1391`）を `RecoveryPolicy`（`RequireEndstream` / `Bounded`）という 2 値の別概念に置き換えている。C42 の pipe-side EOL subtraction は `flpdf-zvjf` で削除済み | B11 は recovery boundary の実装数、C42 は recovered length を pipe する責務として読む。残る `RecoveredStreamEol` は `dump-object` 再シリアライズの framing metadata であり、pipe length や show-stream payload の補正ではない |
-| **X-2** | C42 が要求した領域跨ぎの確認が B 側で行われていない | C-U1 は `flpdf-zvjf` と `flpdf-hj7v` で解決済み。B11 の `recover_stream_boundary` は xref bootstrap の raw stream framing、C42 の `recover_stream_length` は canonical resolver の source length を担い、show-stream はその payload を無加工で出す。暗号化 canonical pipe はどちらも caller の length を変更しない | C-U1 の qpdf AESv2 probe・unencrypted show-stream probe・canonical/foreign/writer tests で、recovery metadata が pipe-side subtraction や show-stream trim に戻らないことを確認する |
+| **X-1** | `crates/flpdf/src/reader/resolver.rs::recover_stream_length` の実装本数 | **B11 は `mixed`** — 「2 実装」。もう 1 本は `crates/flpdf/src/reader/file_object.rs::recover_stream_boundary` で、qpdf の `attempt_recovery` 1 bit（`libqpdf/QPDF.cc:1391`）を `RecoveryPolicy`（`RequireEndstream` / `Bounded`）という 2 値の別概念に置き換えている。C42 の pipe-side EOL subtraction は `flpdf-zvjf` で削除済み | B11 は recovery boundary の実装数、C42 は recovered length を pipe する責務として読む。残る `RecoveredStreamEol` は `dump-object` 再シリアライズの framing metadata であり、pipe length や show-object payload の補正ではない |
+| **X-2** | C42 が要求した領域跨ぎの確認が B 側で行われていない | C-U1 は recovered full-length pipe と show-object payload で解決済み。B11 の `recover_stream_boundary` は xref bootstrap の raw stream framing、C42 の `recover_stream_length` は canonical resolver の source length を担い、show-object はその payload を無加工で出す。暗号化 canonical pipe は caller の length を変更しない | C-U1 の qpdf AESv2 probe・unencrypted show-object probe・canonical/foreign/writer tests で、recovery metadata が pipe-side subtraction や show-object trim に戻らないことを確認する |
 | **X-3** | `QPDF::readStream` の分類が領域で逆 | **C41 は `canonical`**（`/Length` 検証 + `endstream` 確認を `crates/flpdf/src/reader/resolver.rs::read_stream` 1 本が持つ）。**B10 は `mixed`**（`validateStreamLineEnd` の 3 warning が `crates/flpdf/src/reader/resolver.rs::validate_stream_line_end` と `crates/flpdf/src/reader/file_object.rs::finish_file_object_handle` の 2 実装にある） | 粒度違いで両立する（同じ qpdf 関数の別部分を見ている）。ただし **C41 だけを読むと `readStream` が完全に片付いて見える**。cutover 時は B10 の 2 実装を先に畳む |
 | **X-4** | xref stream の読み出しが 2 領域で別分類 | **B17 は `canonical`**（`crates/flpdf/src/xref.rs::parse_xref_stream` 1 本）。**C27 も `.48.49` で `canonical` 化**し、bootstrap-context decode は `ObjectHandle::get_stream_data(DecodeLevel::Specialized)` へ移行した。ObjStm側は `.48.14` で同じ accessorへ移行済み。qpdf側は両責務とも `libqpdf/QPDF.cc:1051,1792` の `getStreamData(qpdf_dl_specialized)` に対応する | xref stream payloadもbootstrap/通常resolverで同じ canonical pipeを使う。owner-less bootstrapのbounded source-read policyは残るが、whole-buffer compatibility decoderは残らない |
 | **X-5** | writer 側 data key が D では canonical、C では mixed | **D17 は `canonical`**（`crates/flpdf/src/writer/encryption_state.rs::WriterEncryptionState` が set / unparse / clear の順序を写す）。**C18 も `canonical`**（`encryption/primitives.rs::compute_data_key` の共有 primitive を呼ぶ） | 順序と鍵計算をそれぞれ qpdf 責務どおり保持し、C-U4 oracle vectors の後に duplicate を削除した |

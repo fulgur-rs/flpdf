@@ -1592,15 +1592,12 @@ loggerで再openする経路はtop-level CLIから除去し、`--show-linearizat
 
 以下の direct output は意図的に retained とする。
 
-- `run_show_stream` の passthrough-codec marker（`job/inspection.rs::show_stream`、
-  `// qpdf-deviation` マーク済み）: flpdf-only fallback 表示で、qpdf は
-  unfilterable stream を同じ marker へ変換しない
 - `dump-object` の recovered-EOL トリム（`job/inspection.rs::unparse_object_with_stream_data`、
   `// qpdf-deviation` マーク済み）: qpdf には `dump-object` に相当する再シリアライズ経路が無く、
   `doShowObj` は stream に対して "Object is stream.  Dictionary:" と dict だけを出す
   （`QPDFJob.cc:806-832`）。flpdf 独自のこの再シリアライザは自前の `\nendstream` framing と
-  復元長に含まれる行末が二重にならないよう `RecoveredStreamEol` を差し引く。show-stream の
-  raw/decoded payload と pipe 経路は qpdf 同様に復元長の全 span を出す（`flpdf-zvjf`、`flpdf-hj7v`）。
+  復元長に含まれる行末が二重にならないよう `RecoveredStreamEol` を差し引く。show-object の
+  raw/filtered payload と pipe 経路は qpdf 同様に復元長の全 span を出す（`flpdf-zvjf`、`flpdf-hj7v`）。
 - native `rewrite --static-id` warning: qpdf-compatible CLI surfaceではないため残る
   flpdf-only test diagnostic（出力先は qpdf-compatible logger error route）
 - clap 自身が parse/usage のために直接終了する help・構文エラー、および logger の

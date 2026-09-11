@@ -187,24 +187,6 @@ fn binary_json_uses_stdout_without_stderr() {
 }
 
 #[test]
-fn binary_raw_stream_preserves_exact_bytes() {
-    let output = flpdf()
-        .args(["show-stream", "4 0 R", MULTI_STREAM, "--raw-stream-data"])
-        .output()
-        .unwrap();
-
-    assert!(output.status.success());
-    assert!(output.stderr.is_empty());
-    assert_eq!(
-        output.stdout,
-        [
-            0x78, 0x9c, 0x2b, 0x54, 0x30, 0x54, 0x30, 0x00, 0x42, 0x08, 0x99, 0x9c, 0x0b, 0x00,
-            0x1a, 0x69, 0x03, 0x44,
-        ]
-    );
-}
-
-#[test]
 fn binary_pdf_dash_writes_stdout_without_creating_a_dash_file() {
     let directory = tempfile::tempdir().unwrap();
     let output = flpdf()
@@ -546,13 +528,13 @@ fn qpdf_differential_matches_routed_output_matrix() {
         (
             "raw stream",
             &["--show-object=4", "--raw-stream-data", MULTI_STREAM],
-            &["show-stream", "4 0 R", MULTI_STREAM, "--raw-stream-data"],
+            &["--show-object=4", "--raw-stream-data", MULTI_STREAM],
             false,
         ),
         (
             "filtered stream",
             &["--show-object=4", "--filtered-stream-data", MULTI_STREAM],
-            &["show-stream", "4 0 R", MULTI_STREAM],
+            &["--show-object=4", "--filtered-stream-data", MULTI_STREAM],
             false,
         ),
         (

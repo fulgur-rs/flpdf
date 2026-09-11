@@ -156,7 +156,6 @@ crates/flpdf/src/object_handle.rs::get_stream_data                       # C4 Ob
 crates/flpdf/src/stream_filter.rs::decode_filter_specs_from_handle       # C9 filterable 第 3 実装
 crates/flpdf/src/filters.rs::decode_stream_data_recovering               # C28
 crates/flpdf/src/filters.rs::decode_stream_data_recovering_with_limits   # C28
-crates/flpdf/src/filters.rs::is_decoded_filter                           # C43
 crates/flpdf/src/filters.rs::passthrough_codec_label                     # C43
 
 # --- (b) baseline denominator ---

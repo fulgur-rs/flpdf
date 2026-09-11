@@ -74,11 +74,10 @@ pub(crate) fn normalize_filter_name(name: &[u8]) -> &[u8] {
 /// re-encoding.
 ///
 /// This is an **encode-side** classification, independent of whether flpdf's
-/// decode path can currently decode the codec — see [`is_decoded_filter`] for
-/// that question. Keeping this classification beside the filter registry lets
-/// the qpdf-shaped factory check use the same diagnostic that the later
-/// decode stage would have produced for a codec with no decode factory at
-/// all.
+/// decode path can currently decode the codec. Keeping this classification
+/// beside the filter registry lets the qpdf-shaped factory check use the same
+/// diagnostic that the later decode stage would have produced for a codec with
+/// no decode factory at all.
 pub(crate) fn passthrough_codec_label(filter_name: &[u8]) -> Option<&'static str> {
     match filter_name {
         b"DCTDecode" => Some("DCTDecode"),
@@ -87,17 +86,6 @@ pub(crate) fn passthrough_codec_label(filter_name: &[u8]) -> Option<&'static str
         b"CCITTFaxDecode" => Some("CCITTFaxDecode"),
         _ => None,
     }
-}
-
-/// Return whether flpdf's decode path can actually decode `filter_name`.
-///
-/// [`stream_filter_for`] registers a factory for `Crypt` too, but
-/// `filters::prepare_decode_filters` always routes a `Crypt` spec to the
-/// installed crypt provider before consulting the registry, so `Crypt` is
-/// excluded here to keep this predicate honest about what a caller like
-/// `show-stream` will actually observe.
-pub(crate) fn is_decoded_filter(filter_name: &[u8]) -> bool {
-    filter_name != b"Crypt" && stream_filter_for(filter_name).is_some()
 }
 
 /// Report why a filter name has no decode factory.
