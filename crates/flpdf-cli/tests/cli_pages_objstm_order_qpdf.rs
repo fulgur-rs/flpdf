@@ -504,6 +504,46 @@ fn annotated_direct_dr_replay_preserves_qpdf_objstm_provenance() {
     }
 }
 
+// These are full-byte QDF gates because qpdf's repeated-page path allocates a
+// shallow copy before later foreign-page objects, and QPDFWriter exposes that
+// allocation provenance as `%% Original object ID` (QPDFJob.cc:2533-2538;
+// QPDFWriter.cc:1773-1787).
+#[test]
+fn duplicate_page_before_foreign_qdf_provenance_matches_qpdf() {
+    if skip_if_qpdf_missing() {
+        return;
+    }
+    let page_args = [
+        OCCURRENCE_ORDER_PRIMARY,
+        "--pages",
+        ".",
+        "1,1",
+        OCCURRENCE_ORDER_FOREIGN,
+        "1",
+        "--",
+    ];
+    assert_annotated_replay_with_flags(
+        "duplicate-before-foreign-qdf",
+        &["--static-id", "--qdf"],
+        &page_args,
+    );
+}
+
+#[test]
+fn qtest_26_duplicate_page_qdf_provenance_matches_qpdf() {
+    if skip_if_qpdf_missing() {
+        return;
+    }
+    let page_args = [
+        PRIMARY, "--pages", ".", "3,2,3", ".", "2", FOREIGN, "1,1", FOREIGN, "1", "--",
+    ];
+    assert_annotated_replay_with_flags(
+        "qtest-26-duplicate-page-qdf",
+        &["--static-id", "--qdf"],
+        &page_args,
+    );
+}
+
 fn assert_annotated_replay_with_flags(name: &str, flags: &[&str], page_args: &[&str]) {
     let temp = tempfile::tempdir().unwrap();
     let qpdf_output = temp.path().join("qpdf.pdf");
