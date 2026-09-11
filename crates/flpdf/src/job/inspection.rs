@@ -23,7 +23,7 @@ impl QPDFJob {
         self.inspect(pdf, |pdf| {
             let object = pdf.get_object_handle(object_ref);
             ensure_present(&object, object_ref)?;
-            let mut output = unparse_object_with_stream_data(pdf, &object, object_ref)?;
+            let mut output = unparse_object_with_stream_data(pdf, &object)?;
             output.push(b'\n');
             logger.info(output)
         })
@@ -45,12 +45,10 @@ impl QPDFJob {
             // A stream selected by its raw identity has to serialize like any
             // other: `unparse_resolved` alone would emit only the indirect
             // reference, dropping the dictionary, framing and bytes this
-            // command exists to print. The projection is used solely to look up
-            // recovered stream EOL state, so fall back to a placeholder when
-            // the generation is outside the `N G R` range rather than skipping
-            // the stream-aware path.
-            let object_ref = object.object_ref().unwrap_or_else(|| ObjectRef::new(0, 0));
-            let mut output = unparse_object_with_stream_data(pdf, &object, object_ref)?;
+            // command exists to print. The helper uses the handle's raw qpdf
+            // identity and parsed stream-data offset directly, so no
+            // `ObjectRef` projection is needed for an out-of-range generation.
+            let mut output = unparse_object_with_stream_data(pdf, &object)?;
             output.push(b'\n');
             logger.info(output)
         })
@@ -285,7 +283,6 @@ fn ensure_present(object: &ObjectHandle, object_ref: ObjectRef) -> Result<()> {
 fn unparse_object_with_stream_data<R: Read + Seek>(
     pdf: &Pdf<R>,
     object: &ObjectHandle,
-    object_ref: ObjectRef,
 ) -> Result<Vec<u8>> {
     if let Some(dictionary) = object.as_stream_dict() {
         let data = object.get_raw_stream_data()?;
@@ -297,7 +294,7 @@ fn unparse_object_with_stream_data<R: Read + Seek>(
         // reserializes stream framing, QPDFJob.cc:806-832). This flpdf-only
         // reserializer drops the recovered-length EOL so its own
         // "\nendstream" framing does not double the source line ending.
-        let recovered_eol = pdf.canonical_recovered_stream_eol(object_ref, object)?;
+        let recovered_eol = pdf.canonical_recovered_stream_eol(object)?;
         let data = if let Some(eol) = recovered_eol.filter(|eol| data.ends_with(eol)) {
             &data[..data.len() - eol.len()]
         } else {
@@ -437,8 +434,7 @@ mod tests {
             include_bytes!("../../../../tests/fixtures/compat/one-page.pdf").to_vec(),
         )
         .unwrap();
-        let output =
-            unparse_object_with_stream_data(&pdf, &stream(), ObjectRef::new(7, 0)).unwrap();
+        let output = unparse_object_with_stream_data(&pdf, &stream()).unwrap();
         assert!(output.ends_with(b"encoded\nendstream"));
     }
 
@@ -456,5 +452,104 @@ mod tests {
             Error::Internal(message)
                 if message == "unknown cross-reference table type while showing xref_table"
         ));
+    }
+
+    fn xref_stream_entry(kind: u8, value: u32, generation: u16) -> [u8; 7] {
+        let value = value.to_be_bytes();
+        let generation = generation.to_be_bytes();
+        [
+            kind,
+            value[0],
+            value[1],
+            value[2],
+            value[3],
+            generation[0],
+            generation[1],
+        ]
+    }
+
+    fn append_reused_xref_stream(
+        bytes: &mut Vec<u8>,
+        object_offsets: (u32, u32),
+        length: usize,
+        previous: Option<usize>,
+    ) -> usize {
+        let xref_offset = bytes.len();
+        let mut dictionary = format!(
+            "5 0 obj\n<< /Type /XRef /Size 6 /Root 1 0 R /W [1 4 2] /Index [5 1 0 5] /Length {length}"
+        );
+        if let Some(previous) = previous {
+            dictionary.push_str(&format!(" /Prev {previous}"));
+        }
+        dictionary.push_str(" >>\nstream\n");
+        bytes.extend_from_slice(dictionary.as_bytes());
+
+        let entries = [
+            xref_stream_entry(1, xref_offset as u32, 0),
+            xref_stream_entry(0, 0, u16::MAX),
+            xref_stream_entry(1, object_offsets.0, 0),
+            xref_stream_entry(1, object_offsets.1, 0),
+            xref_stream_entry(0, 0, 0),
+            // A free-entry generation is ignored by qpdf; retaining 0x0a as
+            // its final byte gives the new stream a legitimate trailing LF.
+            xref_stream_entry(0, 0, 10),
+        ];
+        assert_eq!(entries.len() * 7, 42);
+        assert_eq!(entries.last().unwrap().last(), Some(&b'\n'));
+        for entry in entries {
+            bytes.extend_from_slice(&entry);
+        }
+        bytes.extend_from_slice(b"endstream\nendobj\n");
+        bytes.extend_from_slice(format!("startxref\n{xref_offset}\n%%EOF\n").as_bytes());
+        xref_offset
+    }
+
+    #[test]
+    fn dump_object_keeps_new_revision_payload_when_xref_object_is_reused() {
+        let mut bytes = b"%PDF-1.5\n".to_vec();
+        let object_one_offset = bytes.len() as u32;
+        bytes.extend_from_slice(b"1 0 obj\n<< /Type /Catalog /Pages 2 0 R >>\nendobj\n");
+        let object_two_offset = bytes.len() as u32;
+        bytes.extend_from_slice(b"2 0 obj\n<< /Type /Pages /Count 0 /Kids [] >>\nendobj\n");
+        let base_xref =
+            append_reused_xref_stream(&mut bytes, (object_one_offset, object_two_offset), 1, None);
+        append_reused_xref_stream(
+            &mut bytes,
+            (object_one_offset, object_two_offset),
+            42,
+            Some(base_xref),
+        );
+
+        let mut pdf = Pdf::open_mem_owned(bytes).expect("reused xref fixture should open");
+        assert!(
+            !pdf.reconstructed_xref(),
+            "the xref chain must stay canonical"
+        );
+        let object = pdf.get_object_handle(ObjectRef::new(5, 0));
+        object
+            .try_is_scalar()
+            .expect("new xref stream should resolve");
+        let output =
+            unparse_object_with_stream_data(&pdf, &object).expect("dump-object serialization");
+        let stream_start = output
+            .windows(b"\nstream\n".len())
+            .position(|window| window == b"\nstream\n")
+            .map(|position| position + b"\nstream\n".len())
+            .expect("stream framing");
+        let stream_end = output[stream_start..]
+            .windows(b"\nendstream".len())
+            .position(|window| window == b"\nendstream")
+            .map(|position| stream_start + position)
+            .expect("endstream framing");
+        assert_eq!(
+            output[stream_start..stream_end].len(),
+            42,
+            "the current xref stream must retain its complete raw payload"
+        );
+        assert_eq!(
+            output[stream_end - 1],
+            b'\n',
+            "the current payload's legitimate trailing LF must survive"
+        );
     }
 }
