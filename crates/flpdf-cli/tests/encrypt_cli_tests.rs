@@ -1601,16 +1601,24 @@ fn encrypt_cleartext_metadata_accept_reject_matrix() {
 
 #[test]
 fn encrypt_invalid_key_len_value_is_rejected() {
+    // qpdf's argEncBits never parses the argument as a number, so a
+    // non-numeric spelling gets the same fixed usage message as an
+    // out-of-range one (`libqpdf/QPDFJob_argv.cc:211-229`).
     let tmp = tempfile::tempdir().unwrap();
-    let output = tmp.path().join("nope.pdf");
-    Command::cargo_bin("flpdf")
-        .unwrap()
-        .args(["--encrypt", "u", "o", "not-a-number", "--"])
-        .arg(fixture(UNENCRYPTED_FIXTURE))
-        .arg(&output)
-        .assert()
-        .failure()
-        .stderr(predicates::str::contains("KEY-LEN"));
+    for value in ["not-a-number", "", "40.5", "040"] {
+        let output = tmp.path().join(format!("nope-{}.pdf", value.len()));
+        Command::cargo_bin("flpdf")
+            .unwrap()
+            .args(["--encrypt", "u", "o", value, "--"])
+            .arg(fixture(UNENCRYPTED_FIXTURE))
+            .arg(&output)
+            .assert()
+            .failure()
+            .stderr(predicates::str::contains(
+                "encryption key length must be 40, 128, or 256",
+            ));
+        assert!(!output.exists(), "no output for invalid KEY-LEN {value:?}");
+    }
 }
 
 #[test]
