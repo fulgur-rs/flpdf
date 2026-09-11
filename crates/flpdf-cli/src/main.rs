@@ -5823,13 +5823,20 @@ fn finish_encrypt_segment(
 }
 
 fn parse_encrypt_key_len(value: &str) -> CliResult<u32> {
-    let key_len = value.parse().map_err(|_| {
-        format!("--encrypt KEY-LEN must be a positive integer (40 / 128 / 256), got: {value:?}")
-    })?;
-    if !matches!(key_len, 40 | 128 | 256) {
-        return Err(format!("--encrypt KEY-LEN must be 40, 128, or 256 (got {key_len})").into());
+    // qpdf's ArgParser::argEncBits compares the raw argument against the three
+    // accepted spellings and reports one fixed message for everything else
+    // (`libqpdf/QPDFJob_argv.cc:211-229`). It never parses the value as a
+    // number, so a non-numeric argument and an out-of-range one produce the
+    // same diagnostic, and a numerically equal spelling like "040" is rejected.
+    match value {
+        "40" => Ok(40),
+        "128" => Ok(128),
+        "256" => Ok(256),
+        // A UsageError, not a plain string: qpdf reports this through
+        // `ArgParser::usage`, whose output carries the leading blank line and
+        // the trailing "For help:" block that `usage_exit` models.
+        _ => Err(UsageError::new("encryption key length must be 40, 128, or 256").into()),
     }
-    Ok(key_len)
 }
 
 #[allow(clippy::too_many_arguments)]
