@@ -106,6 +106,22 @@ fn previous_generation_pdf() -> Vec<u8> {
     bytes
 }
 
+fn recovery_huge_object_header_pdf() -> Vec<u8> {
+    b"%PDF-1.4\n\
+1 0 obj\n\
+<< /Type /Catalog >>\n\
+endobj\n\
+3000000000 0 obj\n\
+45\n\
+endobj\n\
+trailer\n\
+<< /Size 2 /Root 1 0 R >>\n\
+startxref\n\
+0\n\
+%%EOF\n"
+        .to_vec()
+}
+
 fn run_qpdf(path: &std::path::Path) -> Output {
     ProcessCommand::new("qpdf")
         .args(["--show-xref", path.to_str().unwrap()])
@@ -221,6 +237,28 @@ fn show_xref_preserves_in_use_generation_outside_object_ref_range() {
         .stdout
         .windows(b"5/65536: uncompressed".len())
         .any(|window| { window == b"5/65536: uncompressed" }));
+}
+
+#[test]
+fn show_xref_recovery_range_error_matches_qpdf() {
+    if !qpdf_available() {
+        if std::env::var_os("CI").is_some() {
+            panic!("{EXPECTED_QPDF_VERSION} is required for this parity test on CI");
+        }
+        eprintln!("skipping: {EXPECTED_QPDF_VERSION} is not available");
+        return;
+    }
+
+    let temp = tempfile::tempdir().expect("temporary directory");
+    let input = temp.path().join("recovery-huge-object-header.pdf");
+    std::fs::write(&input, recovery_huge_object_header_pdf()).expect("write fixture");
+
+    let qpdf = run_qpdf(&input);
+    let flpdf = run_flpdf(&input);
+
+    assert_eq!(flpdf.status.code(), qpdf.status.code());
+    assert_eq!(flpdf.stdout, qpdf.stdout);
+    assert_eq!(flpdf.stderr, qpdf.stderr);
 }
 
 #[test]
