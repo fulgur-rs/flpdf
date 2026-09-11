@@ -1116,6 +1116,22 @@ impl<R: Read + Seek> Pdf<R> {
         self.resolver.next_obj_gen()
     }
 
+    /// Return the current destination allocation identity without preparing
+    /// the resolver cache. Page-selection replay uses this to delimit the
+    /// allocations made by one qpdf occurrence.
+    pub(crate) fn allocation_checkpoint(&self) -> Option<ObjectRef> {
+        self.resolver.allocation_checkpoint()
+    }
+
+    /// Return destination identities allocated after a page-selection
+    /// occurrence checkpoint, in qpdf allocator order.
+    pub(crate) fn allocated_object_refs_after(
+        &self,
+        checkpoint: Option<ObjectRef>,
+    ) -> Vec<ObjectRef> {
+        self.resolver.allocated_object_refs_after(checkpoint)
+    }
+
     /// Promote and register an existing initialized handle without cloning its
     /// allocation or scheduling writer output. This is qpdf's
     /// `makeIndirectFromQPDFObject` (`libqpdf/QPDF.cc:1882-1888`). The returned

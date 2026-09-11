@@ -1461,6 +1461,41 @@ impl<R: Read + Seek> ResolverHandle<R> {
             .contains(&object_gen)
     }
 
+    /// Return the greatest valid qpdf allocation identity currently retained
+    /// by the destination document. This is a read-only checkpoint: unlike
+    /// `nextObjGen`/`getObjectCount`, it does not prepare or mutate the live
+    /// object cache (`libqpdf/QPDF.cc:1271-1283,1872-1880`).
+    pub(crate) fn allocation_checkpoint(&self) -> Option<ObjectRef> {
+        self.core
+            .borrow()
+            .allocated_object_refs
+            .iter()
+            .rev()
+            .find_map(|object_gen| object_gen.to_object_ref())
+    }
+
+    /// Return valid qpdf allocation identities created after `checkpoint`.
+    /// Allocation identities are monotonic in the destination resolver, so
+    /// the `BTreeSet` order is the qpdf allocation order. Cache entries minted
+    /// only while resolving an xref reference are intentionally absent from
+    /// this set.
+    pub(crate) fn allocated_object_refs_after(
+        &self,
+        checkpoint: Option<ObjectRef>,
+    ) -> Vec<ObjectRef> {
+        let checkpoint = checkpoint.map(QpdfObjGen::from_object_ref);
+        self.core
+            .borrow()
+            .allocated_object_refs
+            .iter()
+            .filter(|object_gen| match checkpoint {
+                Some(checkpoint) => **object_gen > checkpoint,
+                None => true,
+            })
+            .filter_map(|object_gen| object_gen.to_object_ref())
+            .collect()
+    }
+
     /// Raw cache values for internal inspection, without `newIndirect`'s
     /// active-identity update. Public enumeration uses [`Self::get_all_objects`].
     pub(crate) fn all_object_handles(&self) -> Vec<ObjectHandle> {
