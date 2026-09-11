@@ -499,84 +499,80 @@ impl PageOffsetHintTable {
             }
         }
 
-        // Order each page's shared identifiers the way qpdf does: by the shared
-        // object's number in qpdf's ObjGen-keyed `obj_user_to_objects`
-        // (QPDF_linearization.cc:1388-1402). With ObjStm folding, a plain
-        // object uses its physical output number from `renumber`; an ObjStm
-        // container uses `container_shared_sort_key` keyed by its physical
-        // output number. The classic path retains source-object ordering.
-        // A plain object minted by optimization in a shared first-page route
-        // sorts AFTER the container: qpdf allocates generated containers before
-        // `QPDF::optimize` creates inherited attributes. The first-page-private
-        // (`part2`) route is different: qpdf emits that plain object before its
-        // first-half container, so it never enters this shared-identifier sort.
-        //   * Preserve — source ObjStm members and containers can have different
-        //     source/output numbers after the linearization plan is renumbered,
-        //     so both are compared in the output-number key space.
-        // Without this the identifiers come out in shared-table-index
-        // (physical-number) order, which differs when a page references two
-        // containers whose pre-renumber order differs from their physical order.
-        let post_optimization_plain = plan
-            .optimization
-            .as_ref()
-            .and_then(|optimization| optimization.pre_optimization_object_refs());
-        let has_objstm_members = !member_to_container.is_empty();
-        let shared_sort_key = |shared_idx: u32| -> (u8, u32) {
-            let entry = &shared_hints[shared_idx as usize];
-            if entry.object_ref.generation == u16::MAX {
-                container_shared_sort_key
-                    .get(&entry.object_ref.number)
-                    .copied()
-                    .unwrap_or((1, 0))
-            } else {
-                let phase =
-                    post_optimization_plain.is_some_and(|refs| !refs.contains(&entry.object_ref));
-                // qpdf's obj_user_to_objects is keyed by the object's number
-                // BEFORE writer renumbering (QPDF_linearization.cc:1354-1402
-                // populates it from `oh.getObjectID()` during
-                // calculateLinearizationData, which runs ahead of the
-                // writer's own renumbering pass). A pre-optimization plain
-                // object therefore always retains its source-object number,
-                // whether or not this page also references a folded ObjStm
-                // container. Only a post-optimization mint — which has no
-                // meaningful pre-optimization source number to compare — is
-                // compared against folded containers in output-number space.
-                let output_number = if phase && has_objstm_members {
-                    renumber
-                        .new_for_original(entry.object_ref)
-                        .map_or(u32::MAX, |object_ref| object_ref.number)
-                } else {
-                    entry.object_ref.number
-                };
-                (if phase { 2 } else { 0 }, output_number)
-            }
-        };
-        for ids in &mut shared_ids_per_page {
-            // Preserve mode represents a folded container with a synthetic
-            // new-number sentinel, while a surviving plain source object can
-            // legitimately have that same number. In that alias case qpdf's
-            // shared-table walk keeps the plain source object before the
-            // container; otherwise the source-container key would make the
-            // second linearization reverse the two identifiers.
-            let plain_aliases: std::collections::BTreeSet<u32> = ids
-                .iter()
-                .filter_map(|&shared_idx| {
-                    let entry = &shared_hints[shared_idx as usize];
-                    (entry.object_ref.generation != u16::MAX).then_some(entry.object_ref.number)
-                })
-                .collect();
-            ids.sort_by_key(|&shared_idx| {
+        // qpdf appends each page's shared identifiers while iterating its
+        // `obj_user_to_objects[page]` set (QPDF_linearization.cc:1388-1402).
+        // `LinearizationPlan::shared_hints` already carries that source/discovery
+        // order, including the provenance key used for page-selection merges.
+        // Keep the resulting identifiers in that order on the classic path:
+        // sorting by the target ObjectRef number would discard the qpdf source
+        // order when a foreign page was copied into a fresh merge target.
+        //
+        // ObjStm folding is the exception. `canonical_shared_hints` replaces
+        // members with synthetic container entries and orders the physical
+        // shared table for output. Re-sort each page's identifiers in qpdf's
+        // pre-renumber/container allocation order after that transformation.
+        if !member_to_container.is_empty() {
+            let post_optimization_plain = plan
+                .optimization
+                .as_ref()
+                .and_then(|optimization| optimization.pre_optimization_object_refs());
+            let shared_sort_key = |shared_idx: u32| -> (u8, u32) {
                 let entry = &shared_hints[shared_idx as usize];
-                let key = shared_sort_key(shared_idx);
-                if entry.object_ref.generation == u16::MAX
-                    && key.0 == 0
-                    && plain_aliases.contains(&entry.object_ref.number)
-                {
-                    (key.0, key.1.max(entry.object_ref.number).saturating_add(1))
+                if entry.object_ref.generation == u16::MAX {
+                    container_shared_sort_key
+                        .get(&entry.object_ref.number)
+                        .copied()
+                        .unwrap_or((1, 0))
                 } else {
-                    key
+                    let phase = post_optimization_plain
+                        .is_some_and(|refs| !refs.contains(&entry.object_ref));
+                    // qpdf's obj_user_to_objects is keyed by the object's number
+                    // BEFORE writer renumbering (QPDF_linearization.cc:1354-1402
+                    // populates it from `oh.getObjectID()` during
+                    // calculateLinearizationData, which runs ahead of the
+                    // writer's own renumbering pass). A pre-optimization plain
+                    // object therefore always retains its source-object number,
+                    // whether or not this page also references a folded ObjStm
+                    // container. Only a post-optimization mint — which has no
+                    // meaningful pre-optimization source number to compare — is
+                    // compared against folded containers in output-number space.
+                    let output_number = if phase {
+                        renumber
+                            .new_for_original(entry.object_ref)
+                            .map_or(u32::MAX, |object_ref| object_ref.number)
+                    } else {
+                        entry.object_ref.number
+                    };
+                    (if phase { 2 } else { 0 }, output_number)
                 }
-            });
+            };
+            for ids in &mut shared_ids_per_page {
+                // Preserve mode represents a folded container with a synthetic
+                // new-number sentinel, while a surviving plain source object can
+                // legitimately have that same number. In that alias case qpdf's
+                // shared-table walk keeps the plain source object before the
+                // container; otherwise the source-container key would make the
+                // second linearization reverse the two identifiers.
+                let plain_aliases: std::collections::BTreeSet<u32> = ids
+                    .iter()
+                    .filter_map(|&shared_idx| {
+                        let entry = &shared_hints[shared_idx as usize];
+                        (entry.object_ref.generation != u16::MAX).then_some(entry.object_ref.number)
+                    })
+                    .collect();
+                ids.sort_by_key(|&shared_idx| {
+                    let entry = &shared_hints[shared_idx as usize];
+                    let key = shared_sort_key(shared_idx);
+                    if entry.object_ref.generation == u16::MAX
+                        && key.0 == 0
+                        && plain_aliases.contains(&entry.object_ref.number)
+                    {
+                        (key.0, key.1.max(entry.object_ref.number).saturating_add(1))
+                    } else {
+                        key
+                    }
+                });
+            }
         }
 
         // qpdf rejects page 0 entries that list shared identifiers

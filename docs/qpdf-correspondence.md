@@ -2207,6 +2207,20 @@ writer-order consumer も同じ event order を観測し、copy 経路や qtest-
 direct-DR interleave の全 bytesを、QDF・Generate ObjStm・linearized Generateを含めて
 qpdf 11.9.0 と比較する。
 
+`flpdf-pz5h` では、ObjStm を生成しない linearize の page-offset hint についても
+page-selection の occurrence provenance を保持する。qpdf は
+`calculateLinearizationData` で first-page/Part-8 の配置を決めた後、各ページの共有
+identifier を `obj_user_to_objects[page]` の `std::set<QPDFObjGen>` 順に追加する
+（`QPDF_linearization.cc:963-1265,1388-1402`）。fresh merge target の ObjectRef 番号で
+この列を再ソートすると、primary → foreign → primary duplicate の形状で source order
+を失い、physical hint-table index だけが qpdf と反転する。flpdf は
+`LinearizationPlan::shared_hints` の provenance order を classic path ではそのまま
+符号化し、ObjStm folding が synthetic container を導入する場合だけ既存の
+container-aware sort を適用する。`cli_pages_objstm_order_qpdf.rs` の
+`duplicate_page_after_foreign_linearized_hint_stream_matches_qpdf` が
+`--static-id --linearize` の qpdf-zlib 全 bytes を比較し、hint payload 内の共有
+identifier 列を固定する。
+
 `flpdf-obsc` では、`QPDFJob::doSplitPages` が chunk 作成前に行う
 `shouldRemoveUnreferencedResources` の verbose side effect も同じ job boundary に
 接続した。qpdf は Auto 判定の開始、最初の共有 resource finding、または共有なしの
