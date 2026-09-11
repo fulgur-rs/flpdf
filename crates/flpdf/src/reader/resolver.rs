@@ -1200,6 +1200,16 @@ impl<R: Read + Seek> ResolverHandle<R> {
         handle.promote_to_indirect(object_ref, self.pdf_unique_id.get(), self.self_weak.clone())
     }
 
+    #[cfg(test)]
+    pub(crate) fn resolved_object_count_for_test(&self) -> usize {
+        self.core
+            .borrow()
+            .object_cache
+            .values()
+            .filter(|handle| handle.is_resolved())
+            .count()
+    }
+
     /// Return the canonical handle for qpdf's raw object identity, including
     /// a generation that cannot be projected to `ObjectRef`.
     pub(crate) fn get_object_handle_qpdf_obj_gen(&self, object_gen: QpdfObjGen) -> ObjectHandle {

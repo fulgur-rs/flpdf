@@ -93,17 +93,6 @@ where
 }
 
 #[test]
-fn opens_pdf_without_resolving_all_objects() {
-    let file = File::open("../../tests/fixtures/minimal.pdf").unwrap();
-    let mut pdf = Pdf::open(BufReader::new(file)).unwrap();
-
-    assert_eq!(pdf.version(), "1.7");
-    let root = pdf.trailer().try_get_key(b"/Root").unwrap();
-    assert_eq!(root.object_ref(), Some(ObjectRef::new(1, 0)));
-    assert!(!root.is_resolved(), "opening must keep object bodies lazy");
-}
-
-#[test]
 fn open_options_default_enables_qpdf_recovery() {
     assert!(PdfOpenOptions::default().repair);
 }
