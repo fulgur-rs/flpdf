@@ -3074,9 +3074,16 @@ impl QPDFJob {
         )?; // cov:ignore: llvm-cov attributes this covered multi-source call continuation to the opening expression
         let mut primary = match page_output {
             PageSpecJobOutput::Merged(merged) => {
-                // The page-output enum no longer borrows `page_sources` in
-                // this variant, so the source owners can be transferred to
-                // the job before the merged document is returned.
+                // qpdf's page_heap is destroyed when createQPDF returns
+                // (`QPDF.cc:465-480`). Disconnect the source object graphs at
+                // that same boundary so direct values copied into the fresh
+                // target retain qpdf's destroyed-owner behavior at write time.
+                // Keep the erased Pdf wrappers only for the replace-input
+                // close boundary; file-backed foreign streams already capture
+                // their input and stream metadata in the canonical provider.
+                for source in page_sources.iter().skip(1) {
+                    source.resolver.disconnect_all();
+                }
                 self.page_source_documents = page_sources;
                 self.primary_copy_encryption = primary_copy_encryption;
                 *merged
