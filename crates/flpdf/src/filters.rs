@@ -3,9 +3,9 @@ use std::borrow::Cow;
 
 use crate::object_handle::ObjectHandle;
 use crate::stream_filter::{
-    decode_filter_specs_from_handle, is_decoded_filter as stream_is_decoded_filter,
-    passthrough_codec_label as stream_passthrough_codec_label, stream_filter_for,
-    undecodable_filter_error, FilterDecodePhase, FilterSpec, CRYPT_STAGE_UNSUPPORTED,
+    decode_filter_specs_from_handle, passthrough_codec_label as stream_passthrough_codec_label,
+    stream_filter_for, undecodable_filter_error, FilterDecodePhase, FilterSpec,
+    CRYPT_STAGE_UNSUPPORTED,
 };
 use crate::{Error, Result};
 
@@ -25,27 +25,12 @@ const MAX_FILTER_CHAIN_LEN: usize = 16;
 /// This is an **encode-side** classification: it does not indicate whether
 /// [`ObjectHandle::get_stream_data`] can decode the codec. `DCTDecode` streams,
 /// for example, are still reported here (the writer never re-encodes JPEG
-/// data) even though the canonical stream pipe decodes them. Callers that
-/// need to know whether a filter is decodable should use
-/// [`is_decoded_filter`] instead.
+/// data) even though the canonical stream pipe decodes them.
 ///
 /// Comparison is **byte-exact** (PDF names are case-sensitive per spec).
 /// Returns `None` for any other filter name.
 pub fn passthrough_codec_label(filter_name: &[u8]) -> Option<&'static str> {
     stream_passthrough_codec_label(filter_name)
-}
-
-/// Return whether the canonical stream pipe can decode a single-stage
-/// `/Filter` of `filter_name`.
-///
-/// Comparison is **byte-exact** (PDF names are case-sensitive per spec) and
-/// this function performs no filter-name normalization, so a qpdf
-/// abbreviation such as `DCT` returns `false` even though the expanded name
-/// `DCTDecode` returns `true`. The canonical stream pipe normalizes internally
-/// and decodes either spelling; this function is for callers that need to
-/// know decodability in advance without decoding.
-pub fn is_decoded_filter(filter_name: &[u8]) -> bool {
-    stream_is_decoded_filter(filter_name)
 }
 
 /// A non-fatal warning emitted while decoding a stream codec.

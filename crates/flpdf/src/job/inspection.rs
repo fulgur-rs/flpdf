@@ -98,74 +98,6 @@ impl QPDFJob {
         )
     }
 
-    /// Show one stream's raw or filtered data through qpdf's stream handle.
-    pub fn show_stream<R: Read + Seek>(
-        &mut self,
-        pdf: &mut Pdf<R>,
-        object_ref: ObjectRef,
-        raw_stream_data: bool,
-    ) -> Result<JobExitCode> {
-        let logger = self.logger();
-        self.inspect(pdf, |pdf| {
-            let object = pdf.get_object_handle(object_ref);
-            ensure_present(&object, object_ref)?;
-            object.type_code()?;
-            let Some(stream_dictionary) = object.as_stream_dict() else {
-                // Same reclassification concern as ensure_present above: a
-                // present-but-non-stream object is malformed selection, not
-                // an unsupported feature, and this diagnostic predates the
-                // migration -- keep it bare via Error::System.
-                return Err(Error::System(format!(
-                    "object {} {} R is not a stream",
-                    object_ref.number, object_ref.generation
-                )));
-            };
-
-            if raw_stream_data {
-                let raw = object.get_raw_stream_data()?;
-                return write_to_standard_output(&logger, raw.as_ref());
-            }
-
-            // qpdf-deviation-start: `show-stream`'s passthrough-codec marker
-            // has no qpdf counterpart. qpdf has no `show-stream` command, and
-            // `QPDFJob::doShowObj` warns "unable to filter stream data" and
-            // writes nothing for a stream it cannot decode
-            // (QPDFJob.cc:806-832); it never substitutes a descriptive marker.
-            // Retained deliberately (docs/qpdf-correspondence.md, "以下の
-            // direct output は意図的に retained とする"). The name is read
-            // from the live stream dictionary; no filter dictionary is
-            // materialized.
-            if let Some(filter_name) = first_stream_filter_name(&stream_dictionary)? {
-                if !crate::filters::is_decoded_filter(&filter_name) {
-                    if let Some(label) = crate::filters::passthrough_codec_label(&filter_name) {
-                        let raw = object.get_raw_stream_data()?;
-                        let len = raw.len();
-                        return logger.info(format!("<binary, {len} bytes, codec {label}>\n"));
-                    }
-                }
-            }
-            // qpdf-deviation-end
-
-            // Mirror emit_show_object's reconciliation: qpdf's getStreamData
-            // decode failure records a typeWarning/decode warning and still
-            // succeeds with empty output (QPDFJob.cc:806-832 pipes without
-            // treating a warned decode failure as a hard error). Without
-            // this check, a filter flpdf attempts to decode (e.g. a
-            // malformed DCTDecode stream) surfaces get_stream_data's Err
-            // directly, producing an extra error and the wrong exit code
-            // instead of qpdf's warn-and-succeed-empty behavior.
-            let warning_count = pdf.repair_diagnostics().entries().len();
-            let decoded = match object.get_stream_data(DecodeLevel::All) {
-                Ok(data) => data,
-                Err(_error) if pdf.repair_diagnostics().entries().len() > warning_count => {
-                    return Ok(());
-                }
-                Err(error) => return Err(error),
-            };
-            write_to_standard_output(&logger, decoded.as_ref())
-        })
-    }
-
     /// Show the raw `/Pages /Count` value from the catalog.
     ///
     /// This is qpdf's `QPDFJob::doInspection` `--show-npages` boundary
@@ -380,26 +312,6 @@ fn unparse_object_with_stream_data<R: Read + Seek>(
     }
 }
 
-fn first_stream_filter_name(stream_dictionary: &ObjectHandle) -> Result<Option<Vec<u8>>> {
-    let filter = stream_dictionary.try_get_key(b"/Filter")?;
-    filter.type_code()?;
-    if let Some(name) = filter.as_name() {
-        return Ok(Some(name));
-    }
-    let Some(items) = filter.as_array() else {
-        return Ok(None);
-    };
-    if items.len() != 1 {
-        return Ok(None);
-    }
-    let item = items
-        .into_iter()
-        .next()
-        .expect("one-element filter array has one item");
-    item.type_code()?;
-    Ok(item.as_name())
-}
-
 fn write_to_standard_output(logger: &crate::QPDFLogger, data: &[u8]) -> Result<()> {
     logger.save_to_standard_output(true)?;
     logger.get_save()?.write(data).map_err(Error::from)
@@ -496,63 +408,6 @@ mod tests {
     }
 
     #[test]
-    fn first_stream_filter_name_reads_direct_and_single_item_array() {
-        let direct = stream().as_stream_dict().expect("stream dictionary");
-        assert_eq!(
-            first_stream_filter_name(&direct).unwrap(),
-            Some(b"JBIG2Decode".to_vec())
-        );
-
-        let array = ObjectHandle::stream(
-            ObjectHandle::dictionary(vec![(
-                b"/Filter".to_vec(),
-                ObjectHandle::array(vec![ObjectHandle::name(b"JPXDecode".to_vec())]),
-            )]),
-            std::rc::Rc::new(Vec::new()),
-        );
-        assert_eq!(
-            first_stream_filter_name(&array.as_stream_dict().unwrap()).unwrap(),
-            Some(b"JPXDecode".to_vec())
-        );
-    }
-
-    #[test]
-    fn first_stream_filter_name_ignores_missing_and_multi_item_filters() {
-        let missing = ObjectHandle::dictionary(Vec::new());
-        assert_eq!(first_stream_filter_name(&missing).unwrap(), None);
-
-        let multiple = ObjectHandle::stream(
-            ObjectHandle::dictionary(vec![(
-                b"/Filter".to_vec(),
-                ObjectHandle::array(vec![
-                    ObjectHandle::name(b"ASCII85Decode".to_vec()),
-                    ObjectHandle::name(b"FlateDecode".to_vec()),
-                ]),
-            )]),
-            std::rc::Rc::new(Vec::new()),
-        );
-        assert_eq!(
-            first_stream_filter_name(&multiple.as_stream_dict().unwrap()).unwrap(),
-            None
-        );
-    }
-
-    #[test]
-    fn first_stream_filter_name_treats_an_unresolved_filter_as_absent() {
-        let mut pdf = recovered_pdf();
-        let stream = pdf.get_object_handle(ObjectRef::new(1, 0));
-        pdf.resolve(&stream).expect("stream must resolve");
-        let dictionary = stream
-            .as_stream_dict()
-            .expect("fixture object must be a stream");
-        dictionary
-            .replace_key(b"/Filter", pdf.get_object_handle(ObjectRef::new(99, 0)))
-            .expect("stream dictionary must be mutable");
-
-        assert_eq!(first_stream_filter_name(&dictionary).unwrap(), None);
-    }
-
-    #[test]
     fn show_object_reports_unfilterable_stream_before_object_error() {
         let mut pdf = Pdf::open_mem_owned(
             include_bytes!("../../../../tests/fixtures/test_driver/stream_unfilterable.pdf")
@@ -574,28 +429,6 @@ mod tests {
                     .windows(b"stream object 6 0".len())
                     .any(|window| window == b"stream object 6 0")
         }));
-    }
-
-    #[test]
-    fn show_stream_returns_an_unknown_filter_error_after_marker_probe() {
-        let mut pdf = Pdf::open_mem_owned(
-            include_bytes!("../../../../tests/fixtures/compat/one-page.pdf").to_vec(),
-        )
-        .unwrap();
-        let stream_ref = ObjectRef::new(7, 0);
-        let stream = pdf.get_object_handle(stream_ref);
-        pdf.resolve(&stream).unwrap();
-        stream
-            .as_stream_dict()
-            .unwrap()
-            .replace_key(b"/Filter", ObjectHandle::name(b"UnknownFilter".to_vec()))
-            .unwrap();
-        let error = quiet_job()
-            .show_stream(&mut pdf, stream_ref, false)
-            .expect_err("an unknown filter must remain an operation error");
-        assert!(error
-            .to_string()
-            .contains("getStreamData called on unfilterable stream"));
     }
 
     #[test]
