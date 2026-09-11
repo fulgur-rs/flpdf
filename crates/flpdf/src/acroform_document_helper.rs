@@ -308,7 +308,7 @@ impl<'a, R: Read + Seek> AcroFormDocumentHelper<'a, R> {
     ///   when an indirect `/AcroForm` reference does not resolve to a
     ///   dictionary, or when the field-tree depth limit is exceeded. A direct
     ///   non-dictionary `/AcroForm` value is ignored, not rejected.
-    /// - Any error from [`Pdf::resolve`].
+    /// - Any error from canonical ObjectHandle resolution.
     pub fn fields(&mut self) -> Result<Vec<ObjectRef>> {
         let Some(acroform) = self.acroform_dict()? else {
             return Ok(Vec::new());
@@ -339,7 +339,7 @@ impl<'a, R: Read + Seek> AcroFormDocumentHelper<'a, R> {
     ///   when an indirect `/AcroForm` reference does not resolve to a
     ///   dictionary, or when the field-tree depth limit is exceeded. A direct
     ///   non-dictionary `/AcroForm` value is ignored, not rejected.
-    /// - Any error from [`Pdf::resolve`].
+    /// - Any error from canonical ObjectHandle resolution.
     pub fn field_infos(&mut self) -> Result<Vec<AcroFormFieldInfo>> {
         let Some(acroform) = self.acroform_dict()? else {
             return Ok(Vec::new());
@@ -1893,7 +1893,7 @@ impl<'a, R: Read + Seek> AcroFormDocumentHelper<'a, R> {
     ///
     /// - [`Error::Unsupported`] when a field-tree node is not a dictionary, or
     ///   when the field-tree depth limit is exceeded.
-    /// - Any error from [`Pdf::resolve`].
+    /// - Any error from canonical ObjectHandle resolution.
     pub fn field_value(&mut self, field_ref: ObjectRef) -> Result<Option<ObjectHandle>> {
         FormFieldObjectHelper::new(field_ref, self.pdf).field_value()
     }
@@ -1993,7 +1993,7 @@ impl<'a, R: Read + Seek> AcroFormDocumentHelper<'a, R> {
     ///
     /// - [`Error::Unsupported`] when `field_ref` does not resolve to a
     ///   dictionary.
-    /// - Any error from [`Pdf::resolve`].
+    /// - Any error from canonical ObjectHandle resolution.
     pub fn set_field_value(&mut self, field_ref: ObjectRef, value: ObjectHandle) -> Result<()> {
         FormFieldObjectHelper::new(field_ref, self.pdf).set_field_attribute(b"V", value)
     }
@@ -2006,7 +2006,7 @@ impl<'a, R: Read + Seek> AcroFormDocumentHelper<'a, R> {
     /// - [`Error::Unsupported`] when `/AcroForm` does not resolve to a
     ///   dictionary, or when the object-number space is exhausted while
     ///   creating `/AcroForm`.
-    /// - Any error from [`Pdf::resolve`].
+    /// - Any error from canonical ObjectHandle resolution.
     pub fn set_default_appearance(&mut self, appearance: Vec<u8>) -> Result<()> {
         let acroform_ref = self.ensure_acroform_ref()?;
         let acroform = self.resolve_dict(acroform_ref, "AcroForm")?;
@@ -2762,7 +2762,7 @@ mod final_handle_tests {
         let mut pdf = fixture("form-fields-and-annotations-with-defaults.pdf");
         for field_ref in [ObjectRef::new(3, 0), ObjectRef::new(4, 0)] {
             let field = pdf.get_object_handle(field_ref);
-            pdf.resolve(&field).expect("field dictionary");
+            field.try_is_scalar().expect("field dictionary");
             field
                 .replace_key(b"/T", ObjectHandle::string(b"same".to_vec()))
                 .expect("set initial shared field name");

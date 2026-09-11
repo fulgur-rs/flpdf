@@ -2807,3 +2807,29 @@ writer/linearizationの遅延key走査はsource xrefとcanonical cacheのunion�
 `QPDF.hh:868-889,1467`、`QPDF.cc:1239-1295,1756-1833,1985-2005,2284-2291`
 の責務と一致し、qpdf absent の facade cache/synchronization/provenanceをcanonical
 document stateへ混ぜない。
+
+### A6/A7/A8 final facade cleanup `flpdf-3yn9.48.23.10` (2026-09-12)
+
+qpdf 11.9.0 の `QPDFObjectHandle` typed/null accessors は入口で
+`dereference()` し（`libqpdf/QPDFObjectHandle.cc:240-446`）、dictionary key
+accessorsも同じ境界で `getKey`/`getKeys`/`hasKey` を処理する
+（`libqpdf/QPDFObjectHandle.cc:965-1015`）。明示 `QPDF::resolve` は private で
+`QPDFObject` からだけ `Resolver` を通って呼ばれる
+（`include/qpdf/QPDF.hh:770-781,1031`; `libqpdf/QPDF.cc:1699-1753`）。
+
+`.23.10` はこの責務に合わせ、通常 flpdf build から `Pdf::resolve`、test-only
+`Pdf::resolve_handle`、panic `ObjectHandle::get_key`/`has_key` を撤去した。
+core source と全 core/CLI test・example caller は既存の fallible `try_*` routeへ
+移行し、`DictItemCursor::current` は live child lookupだけを
+`try_get_key`へ切り替えて既存の cursor value contractを保つ。この worktree
+（`origin/main` `2928b4ef2` ベース）の非qtest post-cleanup censusは
+対象facadeの production/test caller 0件で、
+`resolve_handle_ref`/`resolve_qpdf_json_handle`も不存在である。
+
+qtest-toolsの直接 facade callerは、別セッションで扱う qtest-exception boundary
+として変更していない。互換のため `Pdf::resolve` と panic key methods は
+`qtest-driver` feature にのみ hidden で残し、通常 buildからは公開されない。
+source route contract は
+`crates/flpdf/tests/final_accessor_route_tests.rs`、qpdf source mirrorは
+`/home/ubuntu/.cache/flpdf/qpdf-11.9.0`（pinned HEAD
+`3b97c9bd266b7c32ea36d3536e22dab77412886d`）である。

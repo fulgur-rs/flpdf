@@ -4,7 +4,7 @@
 //! The crate is organised as a few small layers that you can mix as needed:
 //!
 //! - [`Pdf`] is the parsed-but-lazy document handle. [`Pdf::open`] reads the trailer
-//!   and cross-reference table, then resolves objects on demand via [`Pdf::resolve`].
+//!   and cross-reference table, then resolves objects on demand via canonical ObjectHandle resolution.
 //!   [`Pdf::uninitialized`] represents qpdf's default-constructed document before
 //!   any input source has been processed.
 //! - [`ObjectHandle`] and [`ObjectRef`] are the data model.

@@ -398,7 +398,7 @@ mod tests {
 
     fn stream_handle<R: Read + Seek>(pdf: &mut Pdf<R>, stream_ref: ObjectRef) -> ObjectHandle {
         let stream = pdf.get_object_handle(stream_ref);
-        pdf.resolve(&stream).expect("resolve stream fixture");
+        stream.try_is_scalar().expect("resolve stream fixture");
         stream
     }
 
@@ -598,16 +598,15 @@ mod tests {
         );
         let dr_map = dr_map_with(b"Font", b"F1", b"F1_1");
         let ap = pdf.get_object_handle(ap_ref);
-        pdf.resolve(&ap).unwrap();
+        ap.try_is_scalar().unwrap();
 
         super::adjust_appearance_stream_handle(&mut pdf, &ap, &dr_map).unwrap();
 
         let stream_dict = ap
             .as_stream_dict()
             .expect("expected live stream dictionary");
-        let resources = pdf
-            .resolve_handle(&stream_dict.try_get_key(b"/Resources").unwrap())
-            .unwrap();
+        let resources = stream_dict.try_get_key(b"/Resources").unwrap();
+        resources.try_is_scalar().unwrap();
         let font = resources
             .try_get_key(b"/Font")
             .unwrap()
@@ -623,9 +622,8 @@ mod tests {
         assert_ne!(resources.object_ref(), Some(resources_ref));
 
         let original = pdf.get_object_handle(resources_ref);
-        let original_font = pdf
-            .resolve_handle(&original)
-            .unwrap()
+        original.try_is_scalar().unwrap();
+        let original_font = original
             .try_get_key(b"/Font")
             .unwrap()
             .try_get_key(b"/F1")
@@ -705,7 +703,7 @@ mod tests {
         let mut pdf = open_minimal();
         let ap_ref = set_stream(&mut pdf, 4, &[], b"/F1 18 Tf");
         let ap = pdf.get_object_handle(ap_ref);
-        pdf.resolve(&ap).unwrap();
+        ap.try_is_scalar().unwrap();
 
         super::adjust_appearance_stream_handle(&mut pdf, &ap, &DrMap::new()).unwrap();
 
@@ -734,7 +732,7 @@ mod tests {
         let ap_ref = set_stream(&mut pdf, 4, &[("Resources", resources)], b"/F1 18 Tf");
         let dr_map = dr_map_with(b"Font", b"F1", b"F1_1");
         let ap = pdf.get_object_handle(ap_ref);
-        pdf.resolve(&ap).unwrap();
+        ap.try_is_scalar().unwrap();
 
         super::adjust_appearance_stream_handle(&mut pdf, &ap, &dr_map).unwrap();
 
@@ -760,7 +758,7 @@ mod tests {
         let ap_ref = set_stream(&mut pdf, 4, &[("Resources", resources)], b"/F1 18 Tf");
         let dr_map = dr_map_with(b"Font", b"F1", b"F1_1");
         let ap = pdf.get_object_handle(ap_ref);
-        pdf.resolve(&ap).unwrap();
+        ap.try_is_scalar().unwrap();
 
         super::adjust_appearance_stream_handle(&mut pdf, &ap, &dr_map).unwrap();
 
@@ -790,7 +788,7 @@ mod tests {
         );
         let dr_map = dr_map_with(b"Font", b"F1", b"F1_1");
         let ap = pdf.get_object_handle(ap_ref);
-        pdf.resolve(&ap).unwrap();
+        ap.try_is_scalar().unwrap();
 
         super::adjust_appearance_stream_handle(&mut pdf, &ap, &dr_map).unwrap();
 
@@ -829,15 +827,14 @@ mod tests {
         );
         let dr_map = dr_map_with(b"Font", b"F1", b"F1_1");
         let ap = pdf.get_object_handle(ap_ref);
-        pdf.resolve(&ap).unwrap();
+        ap.try_is_scalar().unwrap();
 
         super::adjust_appearance_stream_handle(&mut pdf, &ap, &dr_map).unwrap();
 
         assert_eq!(ap.as_stream_data().unwrap().as_slice(), raw);
         let stream_dict = ap.as_stream_dict().unwrap();
-        let resources = pdf
-            .resolve_handle(&stream_dict.try_get_key(b"/Resources").unwrap())
-            .unwrap();
+        let resources = stream_dict.try_get_key(b"/Resources").unwrap();
+        resources.try_is_scalar().unwrap();
         assert!(!resources
             .try_get_key(b"/Font")
             .unwrap()
@@ -999,14 +996,13 @@ mod tests {
         );
         let dr_map = dr_map_with(b"Font", b"F1", b"F1_1");
         let ap = pdf.get_object_handle(ap_ref);
-        pdf.resolve(&ap).unwrap();
+        ap.try_is_scalar().unwrap();
 
         super::adjust_appearance_stream_handle(&mut pdf, &ap, &dr_map).unwrap();
 
         let stream_dict = ap.as_stream_dict().unwrap();
-        let resources = pdf
-            .resolve_handle(&stream_dict.try_get_key(b"/Resources").unwrap())
-            .unwrap();
+        let resources = stream_dict.try_get_key(b"/Resources").unwrap();
+        resources.try_is_scalar().unwrap();
         let fonts = resources.try_get_key(b"/Font").unwrap();
         assert_eq!(
             fonts.try_get_key(b"/F1_1").unwrap().object_ref(),

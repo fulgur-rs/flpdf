@@ -326,7 +326,7 @@ impl<'a, R: Read + Seek> FileSpec<'a, R> {
     ///
     /// - [`Error::Unsupported`] when the `/Filespec` object itself is not a
     ///   dictionary.
-    /// - Any error from [`Pdf::resolve`].
+    /// - Any error from canonical ObjectHandle resolution.
     ///
     /// # Examples
     ///

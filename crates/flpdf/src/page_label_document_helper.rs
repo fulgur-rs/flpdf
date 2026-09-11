@@ -430,7 +430,7 @@ impl<'a, R: Read + Seek> PageLabelDocumentHelper<'a, R> {
     ///
     /// # Errors
     ///
-    /// - Any error from [`Pdf::resolve`].
+    /// - Any error from canonical ObjectHandle resolution.
     pub fn has_page_labels(&mut self) -> Result<bool> {
         Ok(self.pagelabels_root_handle()?.is_some())
     }
@@ -485,7 +485,7 @@ impl<'a, R: Read + Seek> PageLabelDocumentHelper<'a, R> {
     ///
     /// - [`crate::Error::Unsupported`] when the number-tree depth limit is
     ///   exceeded.
-    /// - Any error from [`Pdf::resolve`].
+    /// - Any error from canonical ObjectHandle resolution.
     pub fn ranges(&mut self) -> Result<Vec<(i64, LabelRange)>> {
         let Some(mut tree) = self.pagelabels_tree()? else {
             return Ok(vec![]);
@@ -509,7 +509,7 @@ impl<'a, R: Read + Seek> PageLabelDocumentHelper<'a, R> {
     ///
     /// - [`crate::Error::Unsupported`] when the number-tree depth limit is
     ///   exceeded.
-    /// - Any error from [`Pdf::resolve`].
+    /// - Any error from canonical ObjectHandle resolution.
     pub fn label_for_page(&mut self, page_idx: i64) -> Result<Option<LabelRange>> {
         let Some(label) = self.get_label_for_page(page_idx)? else {
             return Ok(None);
@@ -658,7 +658,7 @@ impl<'a, R: Read + Seek> PageLabelDocumentHelper<'a, R> {
     ///
     /// - [`crate::Error::Unsupported`] when the number-tree depth limit is
     ///   exceeded.
-    /// - Any error from [`Pdf::resolve`].
+    /// - Any error from canonical ObjectHandle resolution.
     // qpdf-deviation-start: page-label rendering has no qpdf counterpart --
     // see the marker on LabelRange::format for the full citation.
     pub fn label_string_for_page(&mut self, page_idx: i64) -> Result<String> {
@@ -699,7 +699,7 @@ impl<'a, R: Read + Seek> PageLabelDocumentHelper<'a, R> {
     ///
     /// - [`crate::Error::Unsupported`] when the number-tree depth limit is
     ///   exceeded.
-    /// - Any error from [`Pdf::resolve`].
+    /// - Any error from canonical ObjectHandle resolution.
     pub fn labels_for_page_range(
         &mut self,
         start_idx: i64,
@@ -740,7 +740,7 @@ impl<'a, R: Read + Seek> PageLabelDocumentHelper<'a, R> {
     ///
     /// - [`crate::Error::Unsupported`] when the number-tree depth limit is
     ///   exceeded while reading the existing tree.
-    /// - Any error from [`Pdf::resolve`].
+    /// - Any error from canonical ObjectHandle resolution.
     pub fn labels_for_selection(
         &mut self,
         src_indices: &[i64],
@@ -880,7 +880,7 @@ impl<'a, R: Read + Seek> PageLabelDocumentHelper<'a, R> {
     ///
     /// # Errors
     ///
-    /// Any error from [`Pdf::resolve`].
+    /// Any error from canonical ObjectHandle resolution.
     pub fn write_reconstructed_labels(&mut self, entries: &[(i64, LabelRange)]) -> Result<()> {
         let Some(catalog_ref) = self.pdf.root_ref() else {
             return Ok(());
@@ -1033,7 +1033,7 @@ mod tests {
     fn install_page_labels(pdf: &mut Pdf<Cursor<Vec<u8>>>, value: ObjectHandle) {
         let catalog_ref = pdf.root_ref().expect("one-page fixture has a catalog root");
         let catalog = pdf.get_object_handle(catalog_ref);
-        pdf.resolve(&catalog).expect("resolve catalog");
+        catalog.try_is_scalar().expect("resolve catalog");
         catalog
             .replace_key(b"/PageLabels", value)
             .expect("install catalog page labels");
@@ -1180,7 +1180,7 @@ mod tests {
         install_page_labels(&mut pdf, leaf);
 
         let source = label.clone();
-        pdf.resolve(&source).unwrap();
+        source.try_is_scalar().unwrap();
         let source_style = source.try_get_key(b"/S").unwrap();
         let source_prefix = source.try_get_key(b"/P").unwrap();
 
@@ -1911,22 +1911,22 @@ mod tests {
         }
         let catalog_ref = pdf.root_ref().unwrap();
         let catalog = pdf.get_object_handle(catalog_ref);
-        pdf.resolve(&catalog).unwrap();
-        let page_labels = catalog.get_key(b"/PageLabels");
+        catalog.try_is_scalar().unwrap();
+        let page_labels = catalog.try_get_key(b"/PageLabels").unwrap();
         assert!(page_labels.as_dictionary().is_some());
         assert!(!page_labels.is_indirect(), "/PageLabels must be direct");
-        let nums = page_labels.get_key(b"/Nums");
+        let nums = page_labels.try_get_key(b"/Nums").unwrap();
         let nums = nums.as_array().expect("/Nums must be a direct array");
         assert_eq!(nums.len(), 4, "2 entries * (index, dict)");
         assert_eq!(nums[0].as_integer(), Some(0));
-        assert_eq!(nums[1].get_key(b"/St").as_integer(), Some(1));
+        assert_eq!(nums[1].try_get_key(b"/St").unwrap().as_integer(), Some(1));
         assert!(!nums[1].try_has_key(b"/S").unwrap());
         assert_eq!(nums[2].as_integer(), Some(3));
         assert_eq!(
-            nums[3].get_key(b"/S").try_as_name().unwrap(),
+            nums[3].try_get_key(b"/S").unwrap().try_as_name().unwrap(),
             Some(b"D".to_vec())
         );
-        assert_eq!(nums[3].get_key(b"/St").as_integer(), Some(1));
+        assert_eq!(nums[3].try_get_key(b"/St").unwrap().as_integer(), Some(1));
 
         // The high-level reader round-trips the installed entries too.
         let mut h = pdf.page_labels();
@@ -2013,13 +2013,17 @@ mod tests {
 
         let catalog_ref = pdf.root_ref().unwrap();
         let catalog = pdf.get_object_handle(catalog_ref);
-        pdf.resolve(&catalog).unwrap();
-        let page_labels = catalog.get_key(b"/PageLabels");
+        catalog.try_is_scalar().unwrap();
+        let page_labels = catalog.try_get_key(b"/PageLabels").unwrap();
         let nums = page_labels
-            .get_key(b"/Nums")
+            .try_get_key(b"/Nums")
+            .unwrap()
             .as_array()
             .expect("PageLabels /Nums must be an array");
-        assert_eq!(nums[1].get_key(b"/P").as_string(), Some(Vec::new()));
+        assert_eq!(
+            nums[1].try_get_key(b"/P").unwrap().as_string(),
+            Some(Vec::new())
+        );
         assert!(!nums[3].try_has_key(b"/P").unwrap());
     }
 
@@ -2037,8 +2041,8 @@ mod tests {
         }
         let catalog_ref = pdf.root_ref().unwrap();
         let catalog = pdf.get_object_handle(catalog_ref);
-        pdf.resolve(&catalog).unwrap();
-        let page_labels = catalog.get_key(b"/PageLabels");
+        catalog.try_is_scalar().unwrap();
+        let page_labels = catalog.try_get_key(b"/PageLabels").unwrap();
         assert!(
             page_labels.as_dictionary().is_some() && !page_labels.is_indirect(),
             "/PageLabels must now be a direct dict, not the old indirect ref"

@@ -99,7 +99,7 @@ type WidgetPageMap = HashMap<ObjectHandleIdentity, (ObjectHandle, ObjectRef)>;
 ///
 /// # Errors
 ///
-/// - Any error propagated from [`Pdf::resolve`].
+/// - Any error propagated from canonical ObjectHandle resolution.
 /// - [`crate::Error::Unsupported`] when the field-tree depth limit is exceeded.
 pub fn prune_acroform_after_subset<R: Read + Seek>(
     pdf: &mut Pdf<R>,
@@ -113,7 +113,7 @@ pub fn prune_acroform_after_subset<R: Read + Seek>(
 ///
 /// # Errors
 ///
-/// - Any error propagated from [`Pdf::resolve`].
+/// - Any error propagated from canonical ObjectHandle resolution.
 /// - [`crate::Error::Unsupported`] when the field-tree depth limit is exceeded.
 #[allow(clippy::mutable_key_type)]
 pub fn prune_acroform_after_subset_with_max_depth<R: Read + Seek>(
@@ -631,7 +631,7 @@ mod tests {
 
     fn dict_of(pdf: &mut Pdf<Cursor<Vec<u8>>>, r: ObjectRef) -> BTreeMap<Vec<u8>, ObjectHandle> {
         let handle = pdf.get_object_handle(r);
-        pdf.resolve(&handle).unwrap();
+        handle.try_is_scalar().unwrap();
         handle
             .as_dictionary()
             .unwrap_or_else(|| panic!("{r} is not a dictionary: {handle:?}"))
@@ -643,14 +643,14 @@ mod tests {
 
     fn acroform_fields(pdf: &mut Pdf<Cursor<Vec<u8>>>) -> Vec<ObjectRef> {
         let catalog = pdf.trailer().try_get_key(b"/Root").unwrap();
-        pdf.resolve(&catalog).unwrap();
+        catalog.try_is_scalar().unwrap();
         let acroform = catalog.try_get_key(b"/AcroForm").unwrap();
-        pdf.resolve(&acroform).unwrap();
+        acroform.try_is_scalar().unwrap();
         if acroform.as_dictionary().is_none() {
             return vec![];
         }
         let fields = acroform.try_get_key(b"/Fields").unwrap();
-        pdf.resolve(&fields).unwrap();
+        fields.try_is_scalar().unwrap();
         fields
             .as_array()
             .unwrap_or_default()
@@ -725,7 +725,7 @@ mod tests {
         // the target's null state to match qpdf's actual removal set.
         let mut pdf = open(build_acroform_pdf());
         let widget = pdf.get_object_handle(ObjectRef::new(11, 0));
-        pdf.resolve(&widget).unwrap();
+        widget.try_is_scalar().unwrap();
         let retained = BTreeSet::from([ObjectRef::new(3, 0), ObjectRef::new(4, 0)]);
         let removed_pages = BTreeSet::from([ObjectRef::new(5, 0)]);
 
@@ -743,7 +743,7 @@ mod tests {
     fn widget_non_reference_page_value_is_preserved() {
         let mut pdf = open(build_acroform_pdf());
         let widget = pdf.get_object_handle(ObjectRef::new(7, 0));
-        pdf.resolve(&widget).unwrap();
+        widget.try_is_scalar().unwrap();
         widget.replace_key(b"/P", ObjectHandle::integer(7)).unwrap();
 
         let result = rebuild_page_tree(&mut pdf, &[ObjectRef::new(3, 0)]).unwrap();
@@ -762,7 +762,7 @@ mod tests {
     fn widget_non_page_reference_is_preserved() {
         let mut pdf = open(build_acroform_pdf());
         let widget = pdf.get_object_handle(ObjectRef::new(7, 0));
-        pdf.resolve(&widget).unwrap();
+        widget.try_is_scalar().unwrap();
         let non_page_ref = pdf.get_object_handle(ObjectRef::new(6, 0));
         widget.replace_key(b"/P", non_page_ref).unwrap();
 
@@ -854,7 +854,7 @@ mod tests {
         // update is driven by our code, not just a pre-existing correct value.
         for &r in &[ObjectRef::new(7, 0), ObjectRef::new(9, 0)] {
             let widget = pdf.get_object_handle(r);
-            pdf.resolve(&widget).unwrap();
+            widget.try_is_scalar().unwrap();
             widget.remove_key(b"/P");
         }
 

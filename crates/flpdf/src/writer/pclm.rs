@@ -273,7 +273,7 @@ mod tests {
         .expect("fixture must open");
         let page = crate::pages::page_refs(&mut pdf).unwrap()[0];
         let page_handle = pdf.get_object_handle(page);
-        pdf.resolve(&page_handle).unwrap();
+        page_handle.try_is_scalar().unwrap();
         let replacement = page_handle
             .shallow_copy()
             .expect("page dictionary must be shallow-copyable");
@@ -297,7 +297,7 @@ mod tests {
         let mut pdf = fixture_pdf();
         let page = crate::pages::page_refs(&mut pdf).unwrap()[0];
         let page_handle = pdf.get_object_handle(page);
-        pdf.resolve(&page_handle).unwrap();
+        page_handle.try_is_scalar().unwrap();
         let replacement = page_handle
             .shallow_copy()
             .expect("page dictionary must be shallow-copyable");

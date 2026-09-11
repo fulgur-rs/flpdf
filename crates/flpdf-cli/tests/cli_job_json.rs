@@ -1862,9 +1862,9 @@ fn job_json_file_coalesce_contents_replaces_a_page_contents_array() {
     .unwrap();
     let page_ref = PageDocumentHelper::new(&mut pdf).get_all_pages().unwrap()[0];
     let page = pdf.get_object_handle(page_ref);
-    pdf.resolve(&page).unwrap();
+    page.try_is_scalar().unwrap();
     let contents = page.try_get_key(b"/Contents").unwrap();
-    pdf.resolve(&contents).unwrap();
+    contents.try_is_scalar().unwrap();
     assert!(
         contents.as_stream_dict().is_some(),
         "coalesceContents must replace an array with one stream"
@@ -1901,14 +1901,14 @@ fn job_json_file_flatten_rotation_bakes_rotate_into_page_content() {
     .unwrap();
     let page_ref = PageDocumentHelper::new(&mut pdf).get_all_pages().unwrap()[0];
     let page = pdf.get_object_handle(page_ref);
-    pdf.resolve(&page).unwrap();
+    page.try_is_scalar().unwrap();
     assert!(
-        !page.has_key(b"/Rotate"),
+        !page.try_has_key(b"/Rotate").unwrap(),
         "flattenRotation must remove /Rotate"
     );
 
     let media_box = page.try_get_key(b"/MediaBox").unwrap();
-    pdf.resolve(&media_box).unwrap();
+    media_box.try_is_scalar().unwrap();
     let media_box = media_box.as_array().unwrap();
     assert_eq!(
         media_box
@@ -1982,9 +1982,9 @@ fn job_json_file_generate_appearances_clears_need_marker_and_adds_ap() {
     .unwrap();
     let root = pdf.root_handle().unwrap();
     let acroform = root.try_get_key(b"/AcroForm").unwrap();
-    pdf.resolve(&acroform).unwrap();
+    acroform.try_is_scalar().unwrap();
     let need_appearances = acroform.try_get_key(b"/NeedAppearances").unwrap();
-    pdf.resolve(&need_appearances).unwrap();
+    need_appearances.try_is_scalar().unwrap();
     assert_ne!(
         need_appearances.as_boolean(),
         Some(true),
@@ -1993,15 +1993,15 @@ fn job_json_file_generate_appearances_clears_need_marker_and_adds_ap() {
 
     let page_ref = PageDocumentHelper::new(&mut pdf).get_all_pages().unwrap()[0];
     let page = pdf.get_object_handle(page_ref);
-    pdf.resolve(&page).unwrap();
+    page.try_is_scalar().unwrap();
     let annots = page.try_get_key(b"/Annots").unwrap();
-    pdf.resolve(&annots).unwrap();
+    annots.try_is_scalar().unwrap();
     let widget = annots.as_array().unwrap()[0].clone();
-    pdf.resolve(&widget).unwrap();
+    widget.try_is_scalar().unwrap();
     let appearance = widget.try_get_key(b"/AP").unwrap();
-    pdf.resolve(&appearance).unwrap();
+    appearance.try_is_scalar().unwrap();
     let normal = appearance.try_get_key(b"/N").unwrap();
-    pdf.resolve(&normal).unwrap();
+    normal.try_is_scalar().unwrap();
     assert!(
         normal.as_stream_dict().is_some(),
         "generateAppearances must install a normal widget appearance"
@@ -2751,12 +2751,12 @@ fn job_json_file_remove_restrictions_disables_signature_fields() {
     );
     let root = pdf.root_handle().unwrap();
     let acroform = root.try_get_key(b"/AcroForm").unwrap();
-    pdf.resolve(&acroform).unwrap();
+    acroform.try_is_scalar().unwrap();
     let fields = acroform.try_get_key(b"/Fields").unwrap();
-    pdf.resolve(&fields).unwrap();
+    fields.try_is_scalar().unwrap();
     assert!(fields.as_array().is_some_and(|items| items.is_empty()));
     let sig_flags = acroform.try_get_key(b"/SigFlags").unwrap();
-    pdf.resolve(&sig_flags).unwrap();
+    sig_flags.try_is_scalar().unwrap();
     assert_eq!(sig_flags.as_integer(), Some(0));
 }
 
@@ -2767,9 +2767,9 @@ fn page_rotations(bytes: &[u8]) -> Vec<Option<i64>> {
         .into_iter()
         .map(|page_ref| {
             let page = pdf.get_object_handle(page_ref);
-            pdf.resolve(&page).unwrap();
+            page.try_is_scalar().unwrap();
             let rotate = page.try_get_key(b"/Rotate").unwrap();
-            pdf.resolve(&rotate).unwrap();
+            rotate.try_is_scalar().unwrap();
             rotate.as_integer()
         })
         .collect()

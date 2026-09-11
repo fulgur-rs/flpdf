@@ -407,7 +407,7 @@ mod tests {
 
     fn bead_dict(pdf: &mut Pdf<Cursor<Vec<u8>>>, num: u32) -> TestDict {
         let bead = pdf.get_object_handle(ObjectRef::new(num, 0));
-        pdf.resolve(&bead).expect("resolve bead");
+        bead.try_is_scalar().expect("resolve bead");
         TestDict(bead.as_dictionary().expect("bead object is a dictionary"))
     }
 

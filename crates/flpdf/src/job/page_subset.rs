@@ -337,19 +337,20 @@ mod tests {
             "page should be a dictionary"
         );
 
-        let resources = page.get_key(b"/Resources");
-        pdf.resolve(&resources).expect("resources should resolve");
+        let resources = page.try_get_key(b"/Resources").unwrap();
+        resources.try_is_scalar().expect("resources should resolve");
         assert!(
             resources.as_dictionary().is_some(),
             "page resources should be a dictionary or reference"
         );
 
         let category_key = format!("/{category}").into_bytes();
-        if !resources.has_key(&category_key) {
+        if !resources.try_has_key(&category_key).unwrap() {
             return Vec::new();
         }
-        let category = resources.get_key(&category_key);
-        pdf.resolve(&category)
+        let category = resources.try_get_key(&category_key).unwrap();
+        category
+            .try_is_scalar()
             .expect("resource category should resolve");
         category
             .as_dictionary()
@@ -367,7 +368,7 @@ mod tests {
 
     fn resolved_handle<R: Read + Seek>(pdf: &mut Pdf<R>, object_ref: ObjectRef) -> ObjectHandle {
         let handle = pdf.get_object_handle(object_ref);
-        pdf.resolve(&handle).expect("resolve object");
+        handle.try_is_scalar().expect("resolve object");
         handle
     }
 
@@ -551,14 +552,14 @@ mod tests {
         // Name-level: page1's direct /Resources copy should have F1 but not F2.
         let page1 = resolved_handle(&mut pdf, ObjectRef::new(4, 0));
         assert!(page1.as_dictionary().is_some(), "page1 not a dict");
-        let res_dict = page1.get_key(b"/Resources");
-        pdf.resolve(&res_dict).expect("resolve page1 resources");
+        let res_dict = page1.try_get_key(b"/Resources").unwrap();
+        res_dict.try_is_scalar().expect("resolve page1 resources");
         assert!(
             res_dict.as_dictionary().is_some(),
             "page1 /Resources was not materialized directly"
         );
-        let font_dict = res_dict.get_key(b"/Font");
-        pdf.resolve(&font_dict).expect("resolve page1 fonts");
+        let font_dict = res_dict.try_get_key(b"/Font").unwrap();
+        font_dict.try_is_scalar().expect("resolve page1 fonts");
         let font_keys: Vec<String> = font_dict
             .as_dictionary()
             .expect("page1 /Font not a dict")
@@ -617,7 +618,7 @@ mod tests {
             "selected page should remain a dictionary"
         );
         assert_eq!(
-            page.get_key(b"/Resources").object_ref(),
+            page.try_get_key(b"/Resources").unwrap().object_ref(),
             Some(resources_ref),
             "parse failure must leave the page's indirect /Resources ownership unchanged"
         );
@@ -784,9 +785,9 @@ mod tests {
             .any(|window| window == b"UNREFERENCED_PAGE2"));
         let mut written = Pdf::open(Cursor::new(out.clone())).unwrap();
         let info = written.trailer_key_handle(b"Info");
-        written.resolve(&info).unwrap();
+        info.try_is_scalar().unwrap();
         assert_eq!(
-            info.get_key(b"/Author").as_string(),
+            info.try_get_key(b"/Author").unwrap().as_string(),
             Some(b"Test Author".to_vec())
         );
         assert_eq!(page_refs(&mut written).unwrap().len(), 1);

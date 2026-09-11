@@ -1515,17 +1515,13 @@ mod tests {
 
     fn resolved_object(pdf: &mut Pdf<Cursor<Vec<u8>>>, object_ref: ObjectRef) -> ObjectHandle {
         let object = pdf.get_object_handle(object_ref);
-        pdf.resolve(&object).expect("resolve object handle");
+        object.try_is_scalar().expect("resolve object handle");
         object
     }
 
-    fn resolved_key(
-        pdf: &mut Pdf<Cursor<Vec<u8>>>,
-        owner: &ObjectHandle,
-        key: &[u8],
-    ) -> ObjectHandle {
-        let value = owner.get_key(key);
-        pdf.resolve(&value).expect("resolve child handle");
+    fn resolved_key(owner: &ObjectHandle, key: &[u8]) -> ObjectHandle {
+        let value = owner.try_get_key(key).unwrap();
+        value.try_is_scalar().expect("resolve child handle");
         value
     }
 
@@ -1574,7 +1570,8 @@ mod tests {
         let root_ref = merged.root_ref().expect("root");
         assert!(
             !resolved_object(&mut merged, root_ref)
-                .get_key(b"/AcroForm")
+                .try_get_key(b"/AcroForm")
+                .unwrap()
                 .is_null(),
             "qpdf keeps /AcroForm alive through foreign annotation replay"
         );
@@ -1582,7 +1579,8 @@ mod tests {
             .expect("final replay cleanup removes an empty /AcroForm");
         assert!(
             resolved_object(&mut merged, root_ref)
-                .get_key(b"/AcroForm")
+                .try_get_key(b"/AcroForm")
+                .unwrap()
                 .is_null(),
             "qpdf removes /AcroForm after the filtered field count reaches zero"
         );
@@ -1672,7 +1670,10 @@ mod tests {
         for page_ref in page_refs {
             let page = resolved_object(&mut merged, page_ref);
             assert!(
-                page.get_key(b"/Resources").as_dictionary().is_some(),
+                page.try_get_key(b"/Resources")
+                    .unwrap()
+                    .as_dictionary()
+                    .is_some(),
                 "qpdf --pages default copies inherited /Resources directly onto the page"
             );
         }
@@ -1868,13 +1869,13 @@ mod tests {
         .expect("merge across a fields-less-AcroForm primary and a secondary source");
         let root_ref = merged.root_ref().expect("merged root");
         let root = resolved_object(&mut merged, root_ref);
-        let acroform = resolved_key(&mut merged, &root, b"/AcroForm");
+        let acroform = resolved_key(&root, b"/AcroForm");
         assert_eq!(
-            resolved_key(&mut merged, &acroform, b"/NeedAppearances").as_boolean(),
+            resolved_key(&acroform, b"/NeedAppearances").as_boolean(),
             Some(true)
         );
         assert!(
-            acroform.get_key(b"/Fields").is_null(),
+            acroform.try_get_key(b"/Fields").unwrap().is_null(),
             "no /Fields array existed originally; the merge must not manufacture one"
         );
     }
@@ -1900,7 +1901,8 @@ mod tests {
         let root_ref = merged.root_ref().expect("merged root");
         assert!(
             resolved_object(&mut merged, root_ref)
-                .get_key(b"/AcroForm")
+                .try_get_key(b"/AcroForm")
+                .unwrap()
                 .is_null(),
             "qpdf removes /AcroForm entirely once its filtered field count reaches zero"
         );
@@ -1919,7 +1921,8 @@ mod tests {
         let root_ref = pdf.root_ref().expect("root");
         assert!(
             resolved_object(&mut pdf, root_ref)
-                .get_key(b"/AcroForm")
+                .try_get_key(b"/AcroForm")
+                .unwrap()
                 .is_null(),
             "the job boundary must remove an empty AcroForm after page selection"
         );
@@ -2114,15 +2117,18 @@ mod tests {
 
         let catalog_ref = output.root_ref().unwrap();
         let catalog = resolved_object(&mut output, catalog_ref);
-        let page_labels = resolved_key(&mut output, &catalog, b"/PageLabels");
-        let nums = resolved_key(&mut output, &page_labels, b"/Nums")
+        let page_labels = resolved_key(&catalog, b"/PageLabels");
+        let nums = resolved_key(&page_labels, b"/Nums")
             .as_array()
             .expect("merged PageLabels /Nums must be an array");
         let first_label = nums.get(1).cloned().expect("first reconstructed label");
-        output
-            .resolve(&first_label)
+        first_label
+            .try_is_scalar()
             .expect("resolve first reconstructed label");
-        assert_eq!(first_label.get_key(b"/P").as_string(), Some(Vec::new()));
+        assert_eq!(
+            first_label.try_get_key(b"/P").unwrap().as_string(),
+            Some(Vec::new())
+        );
     }
 
     #[test]

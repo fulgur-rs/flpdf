@@ -527,7 +527,7 @@ fn apply_aggregated_sources<R: Read + Seek, RS: Read + Seek>(
 /// - [`Error::Unsupported`] when a page number resolves outside its document, a
 ///   page lacks a usable placement box, or the object-number space is exhausted.
 /// - Any error propagated from page-range resolution, the cross-document copy, or
-///   [`Pdf::resolve`].
+///   canonical ObjectHandle resolution.
 pub fn handle_under_overlay<RS, RT>(dest: &mut Pdf<RT>, specs: &mut [OverlaySpec<RS>]) -> Result<()>
 where
     RS: Read + Seek,

@@ -77,7 +77,7 @@ impl WriterObjectOrderKey {
 ///
 /// `Pdf` is the core type of the crate. Opening a document only reads the cross-reference
 /// table and the trailer; individual objects are parsed on first access via
-/// [`Pdf::resolve`]. The same handle is what every higher-level helper
+/// canonical ObjectHandle resolution. The same handle is what every higher-level helper
 /// ([`crate::pages`], [`crate::outline_object_helper`], [`crate::PdfWriter`])
 /// consumes.
 ///

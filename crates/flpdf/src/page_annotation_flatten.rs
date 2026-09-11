@@ -80,7 +80,7 @@ const FLAG_NO_VIEW: i64 = 0x20;
 ///
 /// - [`Error::Unsupported`] if `page_ref` does not resolve to a `/Type /Page`
 ///   dictionary.
-/// - Any error from [`Pdf::resolve`] or content-stream decoding.
+/// - Any error from canonical ObjectHandle resolution or content-stream decoding.
 fn flatten_annotations_on_page<R: Read + Seek>(
     pdf: &mut Pdf<R>,
     page_ref: ObjectRef,
@@ -976,9 +976,9 @@ mod tests {
         let mut pdf = Pdf::open(Cursor::new(build_pdf("", &[]))).unwrap();
         flatten_annotations_qpdf(&mut pdf, &[ObjectRef::new(3, 0)], 0, 0x3).unwrap();
         let page = pdf.get_object_handle(ObjectRef::new(3, 0));
-        pdf.resolve(&page).unwrap();
-        let resources = page.get_key(b"/Resources");
-        pdf.resolve(&resources).unwrap();
+        page.try_is_scalar().unwrap();
+        let resources = page.try_get_key(b"/Resources").unwrap();
+        resources.try_is_scalar().unwrap();
         assert!(resources.as_dictionary().is_some());
     }
 
@@ -987,7 +987,7 @@ mod tests {
         let mut pdf = Pdf::open(Cursor::new(build_pdf("", &[]))).unwrap();
         let page_ref = ObjectRef::new(3, 0);
         let page = pdf.get_object_handle(page_ref);
-        pdf.resolve(&page).unwrap();
+        page.try_is_scalar().unwrap();
         let rotate = pdf.get_object_handle(ObjectRef::new(4, 0));
         page.replace_key(b"/Rotate", rotate)
             .expect("page must be mutable");
@@ -1002,7 +1002,7 @@ mod tests {
         let mut pdf = Pdf::open(Cursor::new(build_pdf("", &[]))).unwrap();
         let root_ref = pdf.root_ref().expect("fixture catalog must exist");
         let root = pdf.get_object_handle(root_ref);
-        pdf.resolve(&root).unwrap();
+        root.try_is_scalar().unwrap();
         root.replace_key(
             b"/AcroForm",
             ObjectHandle::dictionary(vec![(
@@ -1034,7 +1034,7 @@ mod tests {
         )
         .unwrap();
         let root = pdf.get_object_handle(ObjectRef::new(1, 0));
-        pdf.resolve(&root).unwrap();
+        root.try_is_scalar().unwrap();
         root.replace_key(b"/AcroForm", pdf.get_object_handle(acroform_ref))
             .unwrap();
 
@@ -1054,7 +1054,7 @@ mod tests {
     fn build_pruned_annots_array_treats_a_non_array_as_empty() {
         let mut pdf = Pdf::open(Cursor::new(build_pdf("", &[]))).unwrap();
         let page = pdf.get_object_handle(ObjectRef::new(3, 0));
-        pdf.resolve(&page).unwrap();
+        page.try_is_scalar().unwrap();
         page.replace_key(b"/Annots", ObjectHandle::integer(7))
             .unwrap();
 
@@ -1066,7 +1066,7 @@ mod tests {
     fn qpdf_flatten_merges_an_indirect_default_resource_category() {
         let mut pdf = Pdf::open(Cursor::new(build_pdf("/Annots [4 0 R]", &[]))).unwrap();
         let root = pdf.get_object_handle(ObjectRef::new(1, 0));
-        pdf.resolve(&root).unwrap();
+        root.try_is_scalar().unwrap();
         root.replace_key(
             b"/AcroForm",
             ObjectHandle::dictionary(vec![(b"/Fields".to_vec(), ObjectHandle::array(Vec::new()))]),
@@ -1113,12 +1113,12 @@ mod tests {
             .unwrap();
 
         let appearance = pdf.get_object_handle(ObjectRef::new(5, 0));
-        pdf.resolve(&appearance).unwrap();
+        appearance.try_is_scalar().unwrap();
         let stream_dict = appearance.as_stream_dict().unwrap();
         let resources = stream_dict.try_get_key(b"/Resources").unwrap();
-        pdf.resolve(&resources).unwrap();
+        resources.try_is_scalar().unwrap();
         let fonts = resources.try_get_key(b"/Font").unwrap();
-        pdf.resolve(&fonts).unwrap();
+        fonts.try_is_scalar().unwrap();
         let f1 = fonts.try_get_key(b"/F1").unwrap();
         assert_eq!(f1.object_ref(), Some(ObjectRef::new(7, 0)));
     }
@@ -1171,7 +1171,7 @@ mod tests {
         // Keep `/AcroForm/DR` present while omitting `/Fields`, which is the
         // qpdf shape where `analyze()` skips the orphan-widget fallback.
         let catalog = pdf.get_object_handle(ObjectRef::new(1, 0));
-        pdf.resolve(&catalog).unwrap();
+        catalog.try_is_scalar().unwrap();
         catalog
             .replace_key(
                 b"/AcroForm",
@@ -1186,12 +1186,12 @@ mod tests {
             .unwrap();
 
         let appearance = pdf.get_object_handle(ObjectRef::new(5, 0));
-        pdf.resolve(&appearance).unwrap();
+        appearance.try_is_scalar().unwrap();
         let stream_dict = appearance.as_stream_dict().unwrap();
         let resources = stream_dict.try_get_key(b"/Resources").unwrap();
-        pdf.resolve(&resources).unwrap();
+        resources.try_is_scalar().unwrap();
         let font = resources.try_get_key(b"/Font").unwrap();
-        pdf.resolve(&font).unwrap();
+        font.try_is_scalar().unwrap();
         assert!(
             font.try_get_keys().unwrap().is_empty(),
             "an unassociated Widget must not inherit /AcroForm/DR"
@@ -1273,7 +1273,7 @@ mod tests {
             (b"/DR".to_vec(), default_resources),
         ]);
         let catalog = pdf.get_object_handle(ObjectRef::new(1, 0));
-        pdf.resolve(&catalog).unwrap();
+        catalog.try_is_scalar().unwrap();
         catalog.replace_key(b"/AcroForm", acroform).unwrap();
 
         let error = flatten_annotations_qpdf(&mut pdf, &[ObjectRef::new(3, 0)], 0, 0x3)
@@ -1361,7 +1361,7 @@ mod tests {
         let mut privatized_resource_ids = Vec::new();
         for appearance_ref in [ObjectRef::new(5, 0), ObjectRef::new(7, 0)] {
             let appearance = pdf.get_object_handle(appearance_ref);
-            pdf.resolve(&appearance).unwrap();
+            appearance.try_is_scalar().unwrap();
             let stream_dict = appearance.as_stream_dict().unwrap();
             let resources = stream_dict.try_get_key(b"/Resources").unwrap();
             assert!(
@@ -1369,9 +1369,9 @@ mod tests {
                 "appearance resources must be privatized as a direct copy"
             );
             privatized_resource_ids.push(resources.identity_key());
-            pdf.resolve(&resources).unwrap();
+            resources.try_is_scalar().unwrap();
             let fonts = resources.try_get_key(b"/Font").unwrap();
-            pdf.resolve(&fonts).unwrap();
+            fonts.try_is_scalar().unwrap();
             let f1 = fonts.try_get_key(b"/F1").unwrap();
             assert_eq!(f1.as_integer(), Some(41));
             let helv = fonts.try_get_key(b"/Helv").unwrap();
@@ -1380,14 +1380,14 @@ mod tests {
         assert!(privatized_resource_ids[0] != privatized_resource_ids[1]);
 
         let original_resources = pdf.get_object_handle(ObjectRef::new(9, 0));
-        pdf.resolve(&original_resources).unwrap();
+        original_resources.try_is_scalar().unwrap();
         let original_font = original_resources.try_get_key(b"/Font").unwrap();
         assert_eq!(
             original_font.object_ref(),
             Some(ObjectRef::new(20, 0)),
             "shared resources object must keep its own indirect Font reference, unmerged"
         );
-        pdf.resolve(&original_font).unwrap();
+        original_font.try_is_scalar().unwrap();
         let original_f1 = original_font.try_get_key(b"/F1").unwrap();
         assert_eq!(original_f1.as_integer(), Some(41));
         assert_eq!(
@@ -1445,10 +1445,10 @@ mod tests {
             .expect("an unrelated destination-only category must never be touched");
 
         let appearance = pdf.get_object_handle(ObjectRef::new(5, 0));
-        pdf.resolve(&appearance).unwrap();
+        appearance.try_is_scalar().unwrap();
         let stream_dict = appearance.as_stream_dict().unwrap();
         let resources = stream_dict.try_get_key(b"/Resources").unwrap();
-        pdf.resolve(&resources).unwrap();
+        resources.try_is_scalar().unwrap();
         let colorspace = resources.try_get_key(b"/ColorSpace").unwrap();
         assert_eq!(
             colorspace.object_ref(),
@@ -1501,12 +1501,12 @@ mod tests {
             .unwrap();
 
         let appearance = pdf.get_object_handle(ObjectRef::new(5, 0));
-        pdf.resolve(&appearance).unwrap();
+        appearance.try_is_scalar().unwrap();
         let stream_dict = appearance.as_stream_dict().unwrap();
         let resources = stream_dict.try_get_key(b"/Resources").unwrap();
-        pdf.resolve(&resources).unwrap();
+        resources.try_is_scalar().unwrap();
         let proc_set = resources.try_get_key(b"/ProcSet").unwrap();
-        pdf.resolve(&proc_set).unwrap();
+        proc_set.try_is_scalar().unwrap();
         let proc_set_items = proc_set.as_array().unwrap();
         assert_eq!(proc_set_items.len(), 2);
         assert_eq!(proc_set_items[0].as_name(), Some(b"PDF".to_vec()));
@@ -1564,12 +1564,12 @@ mod tests {
         // not by looking object 9 up directly, so a regression that rebinds
         // the entry to a different (or direct) array would be caught.
         let appearance = pdf.get_object_handle(ObjectRef::new(5, 0));
-        pdf.resolve(&appearance).unwrap();
+        appearance.try_is_scalar().unwrap();
         let stream_dict = appearance.as_stream_dict().unwrap();
         let resources = stream_dict.try_get_key(b"/Resources").unwrap();
-        pdf.resolve(&resources).unwrap();
+        resources.try_is_scalar().unwrap();
         let proc_set = resources.try_get_key(b"/ProcSet").unwrap();
-        pdf.resolve(&proc_set).unwrap();
+        proc_set.try_is_scalar().unwrap();
         assert_eq!(
             proc_set.object_ref(),
             Some(ObjectRef::new(9, 0)),
@@ -1651,7 +1651,7 @@ mod tests {
 
         // Sanity-check the pre-merge fixture shape.
         let proc_set_before = pdf.get_object_handle(ObjectRef::new(9, 0));
-        pdf.resolve(&proc_set_before).unwrap();
+        proc_set_before.try_is_scalar().unwrap();
         let proc_set_before_items = proc_set_before
             .as_array()
             .expect("shared ProcSet array must remain an array");
@@ -1676,12 +1676,12 @@ mod tests {
         // not by looking object 9 up directly, so a regression that rebinds
         // the entry to a different (or direct) array would be caught.
         let appearance_after = pdf.get_object_handle(ObjectRef::new(5, 0));
-        pdf.resolve(&appearance_after).unwrap();
+        appearance_after.try_is_scalar().unwrap();
         let resources_after = appearance_after.as_stream_dict().unwrap();
         let proc_set_after = resources_after.try_get_key(b"/Resources").unwrap();
-        pdf.resolve(&proc_set_after).unwrap();
+        proc_set_after.try_is_scalar().unwrap();
         let proc_set_after = proc_set_after.try_get_key(b"/ProcSet").unwrap();
-        pdf.resolve(&proc_set_after).unwrap();
+        proc_set_after.try_is_scalar().unwrap();
         assert_eq!(
             proc_set_after.object_ref(),
             Some(ObjectRef::new(9, 0)),
@@ -1756,17 +1756,17 @@ mod tests {
             .unwrap();
 
         let appearance = pdf.get_object_handle(ObjectRef::new(5, 0));
-        pdf.resolve(&appearance).unwrap();
+        appearance.try_is_scalar().unwrap();
         let resources = appearance
             .as_stream_dict()
             .expect("fixture appearance must remain a stream")
             .try_get_key(b"/Resources")
             .expect("fixture appearance must gain a resources dictionary");
-        pdf.resolve(&resources).unwrap();
+        resources.try_is_scalar().unwrap();
         let proc_set = resources
             .try_get_key(b"/ProcSet")
             .expect("fixture appearance must gain ProcSet");
-        pdf.resolve(&proc_set).unwrap();
+        proc_set.try_is_scalar().unwrap();
         let proc_set_items = proc_set
             .as_array()
             .expect("installed ProcSet category must be an array");
@@ -1819,17 +1819,17 @@ mod tests {
             .unwrap();
 
         let appearance = pdf.get_object_handle(ObjectRef::new(5, 0));
-        pdf.resolve(&appearance).unwrap();
+        appearance.try_is_scalar().unwrap();
         let resources = appearance
             .as_stream_dict()
             .expect("fixture appearance must remain a stream")
             .try_get_key(b"/Resources")
             .expect("fixture appearance must retain resources");
-        pdf.resolve(&resources).unwrap();
+        resources.try_is_scalar().unwrap();
         let proc_set = resources
             .try_get_key(b"/ProcSet")
             .expect("fixture appearance must retain ProcSet");
-        pdf.resolve(&proc_set).unwrap();
+        proc_set.try_is_scalar().unwrap();
         let proc_set_items = proc_set
             .as_array()
             .expect("fixture ProcSet must remain an array");
@@ -1879,17 +1879,17 @@ mod tests {
             .unwrap();
 
         let appearance = pdf.get_object_handle(ObjectRef::new(5, 0));
-        pdf.resolve(&appearance).unwrap();
+        appearance.try_is_scalar().unwrap();
         let resources = appearance
             .as_stream_dict()
             .expect("fixture appearance must remain a stream")
             .try_get_key(b"/Resources")
             .expect("fixture appearance must retain resources");
-        pdf.resolve(&resources).unwrap();
+        resources.try_is_scalar().unwrap();
         let proc_set = resources
             .try_get_key(b"/ProcSet")
             .expect("fixture appearance must retain ProcSet");
-        pdf.resolve(&proc_set).unwrap();
+        proc_set.try_is_scalar().unwrap();
         assert_eq!(proc_set.as_integer(), Some(7));
     }
 
@@ -1931,17 +1931,17 @@ mod tests {
             .unwrap();
 
         let appearance = pdf.get_object_handle(ObjectRef::new(5, 0));
-        pdf.resolve(&appearance).unwrap();
+        appearance.try_is_scalar().unwrap();
         let resources = appearance
             .as_stream_dict()
             .expect("fixture appearance must remain a stream")
             .try_get_key(b"/Resources")
             .expect("fixture appearance must retain resources");
-        pdf.resolve(&resources).unwrap();
+        resources.try_is_scalar().unwrap();
         let proc_set = resources
             .try_get_key(b"/ProcSet")
             .expect("fixture appearance must retain ProcSet");
-        pdf.resolve(&proc_set).unwrap();
+        proc_set.try_is_scalar().unwrap();
         let proc_set_items = proc_set
             .as_array()
             .expect("fixture ProcSet must remain an array");
@@ -1984,7 +1984,7 @@ mod tests {
         ]);
 
         let page = pdf.get_object_handle(page_ref);
-        pdf.resolve(&page).unwrap();
+        page.try_is_scalar().unwrap();
         page.replace_key(b"/Annots", ObjectHandle::array(vec![widget]))
             .unwrap();
 
@@ -1992,9 +1992,9 @@ mod tests {
         merge_widget_default_resources_on_page(&mut pdf, page_ref, &default_resources).unwrap();
 
         let page = pdf.get_object_handle(page_ref);
-        pdf.resolve(&page).unwrap();
+        page.try_is_scalar().unwrap();
         let annots = page.try_get_key(b"/Annots").unwrap();
-        pdf.resolve(&annots).unwrap();
+        annots.try_is_scalar().unwrap();
         let annots = annots.as_array().unwrap();
         assert_eq!(annots.len(), 1);
     }
@@ -2053,8 +2053,12 @@ mod tests {
             Some(7)
         );
         let appearance = pdf.get_object_handle(ObjectRef::new(7, 0));
-        pdf.resolve(&appearance).unwrap();
-        let resources = appearance.as_stream_dict().unwrap().get_key(b"/Resources");
+        appearance.try_is_scalar().unwrap();
+        let resources = appearance
+            .as_stream_dict()
+            .unwrap()
+            .try_get_key(b"/Resources")
+            .unwrap();
         assert!(resources.as_dictionary().is_some());
         assert!(resources.try_get_keys().unwrap().is_empty());
     }
@@ -2066,7 +2070,7 @@ mod tests {
         pdf.replace_object(annotation_ref, ObjectHandle::dictionary(Vec::new()))
             .unwrap();
         let annotation = pdf.get_object_handle(annotation_ref);
-        pdf.resolve(&annotation).unwrap();
+        annotation.try_is_scalar().unwrap();
         annotation
             .replace_key(b"/AP", ObjectHandle::dictionary(Vec::new()))
             .unwrap();
@@ -2074,10 +2078,10 @@ mod tests {
         flatten_annotations_qpdf(&mut pdf, &[ObjectRef::new(3, 0)], 0, 0x3).unwrap();
 
         let page = pdf.get_object_handle(ObjectRef::new(3, 0));
-        pdf.resolve(&page).unwrap();
+        page.try_is_scalar().unwrap();
         assert!(page.try_get_key(b"/Annots").unwrap().is_null());
         let contents = page.try_get_key(b"/Contents").unwrap();
-        pdf.resolve(&contents).unwrap();
+        contents.try_is_scalar().unwrap();
         assert_eq!(contents.as_array().map(|items| items.len()), Some(2));
     }
 
@@ -2183,13 +2187,13 @@ mod tests {
         )
         .unwrap();
         let root = pdf.get_object_handle(ObjectRef::new(1, 0));
-        pdf.resolve(&root).unwrap();
+        root.try_is_scalar().unwrap();
         let acroform_handle = pdf.get_object_handle(acroform_ref);
         root.replace_key(b"/AcroForm", acroform_handle).unwrap();
 
         flatten_annotations_qpdf(&mut pdf, &[ObjectRef::new(3, 0)], 0, 0x3).unwrap();
         let appearance = pdf.get_object_handle(appearance_ref);
-        pdf.resolve(&appearance).unwrap();
+        appearance.try_is_scalar().unwrap();
         let stream_dict = appearance
             .as_stream_dict()
             .expect("fixture appearance must remain a stream");
@@ -2200,7 +2204,7 @@ mod tests {
             resources.is_direct(),
             "flattening must privatize /Resources into a direct copy, not keep the shared {resources_ref:?} indirect reference"
         );
-        pdf.resolve(&resources).unwrap();
+        resources.try_is_scalar().unwrap();
         let fonts = resources
             .try_get_key(b"/Font")
             .expect("appearance must retain Font resources");
@@ -2208,24 +2212,24 @@ mod tests {
             fonts.is_direct(),
             "flattening must privatize /Font into a direct copy, not keep the shared {font_ref:?} indirect reference"
         );
-        pdf.resolve(&fonts).unwrap();
+        fonts.try_is_scalar().unwrap();
         let helv = fonts.try_get_key(b"/Helv").unwrap();
-        pdf.resolve(&helv).unwrap();
+        helv.try_is_scalar().unwrap();
         assert_eq!(helv.as_integer(), Some(42));
 
         let page = pdf.get_object_handle(ObjectRef::new(3, 0));
-        pdf.resolve(&page).unwrap();
+        page.try_is_scalar().unwrap();
         let annots = page.try_get_key(b"/Annots").unwrap();
-        pdf.resolve(&annots).unwrap();
+        annots.try_is_scalar().unwrap();
         let annots = annots.as_array().expect("retained annotations array");
         assert_eq!(annots.len(), 1);
         assert_eq!(annots[0].object_ref(), Some(link_ref));
         let contents = page.try_get_key(b"/Contents").unwrap();
-        pdf.resolve(&contents).unwrap();
+        contents.try_is_scalar().unwrap();
         assert!(contents.as_array().is_some());
 
         let root = pdf.get_object_handle(ObjectRef::new(1, 0));
-        pdf.resolve(&root).unwrap();
+        root.try_is_scalar().unwrap();
         assert!(
             !root
                 .as_dictionary()
@@ -2312,7 +2316,7 @@ mod tests {
         .unwrap();
 
         let root = pdf.get_object_handle(ObjectRef::new(1, 0));
-        pdf.resolve(&root).unwrap();
+        root.try_is_scalar().unwrap();
         root.replace_key(b"/Type", ObjectHandle::name(b"Catalog".to_vec()))
             .unwrap();
         root.replace_key(b"/Pages", pdf.get_object_handle(ObjectRef::new(2, 0)))
@@ -2467,7 +2471,7 @@ mod tests {
         pdf.replace_object(annotation_ref, ObjectHandle::dictionary(Vec::new()))
             .unwrap();
         let annotation = pdf.get_object_handle(annotation_ref);
-        pdf.resolve(&annotation).unwrap();
+        annotation.try_is_scalar().unwrap();
         annotation
             .replace_key(b"/Subtype", ObjectHandle::name(b"Widget".to_vec()))
             .unwrap();
@@ -2556,8 +2560,8 @@ mod tests {
         };
         assert!(annotations.is_empty());
         let page = pdf.get_object_handle(ObjectRef::new(3, 0));
-        pdf.resolve(&page).unwrap();
-        assert!(!page.has_key(b"/Annots"));
+        page.try_is_scalar().unwrap();
+        assert!(!page.try_has_key(b"/Annots").unwrap());
         assert!(page_content_bytes(&mut pdf, ObjectRef::new(3, 0))
             .unwrap()
             .windows(2)
@@ -2586,11 +2590,11 @@ mod tests {
 
         // Page /Resources/XObject should have one entry pointing to the xobj.
         let page = pdf.get_object_handle(page_ref);
-        pdf.resolve(&page).unwrap();
-        let resources = page.get_key(b"/Resources");
-        pdf.resolve(&resources).unwrap();
-        let xobj = resources.get_key(b"/XObject");
-        pdf.resolve(&xobj).unwrap();
+        page.try_is_scalar().unwrap();
+        let resources = page.try_get_key(b"/Resources").unwrap();
+        resources.try_is_scalar().unwrap();
+        let xobj = resources.try_get_key(b"/XObject").unwrap();
+        xobj.try_is_scalar().unwrap();
         let xobj_dict = xobj.as_dictionary().expect("XObject should be a dict");
         assert_eq!(xobj_dict.len(), 1, "exactly one XObject entry");
         // The value should reference obj 5.
@@ -2610,7 +2614,7 @@ mod tests {
         assert!(content_str.contains('Q'), "content should contain Q");
 
         // qpdf removes /Annots after every annotation has been flattened.
-        assert!(!page.has_key(b"/Annots"));
+        assert!(!page.try_has_key(b"/Annots").unwrap());
     }
 
     // -----------------------------------------------------------------------
@@ -2856,11 +2860,12 @@ mod tests {
         let mut pdf = Pdf::open(Cursor::new(bytes)).unwrap();
         let page_ref = ObjectRef::new(3, 0);
         let appearance = pdf.get_object_handle(ObjectRef::new(5, 0));
-        pdf.resolve(&appearance).unwrap();
+        appearance.try_is_scalar().unwrap();
         assert!(!appearance
             .as_stream_dict()
             .expect("fixture appearance must be a stream")
-            .has_key(b"/Subtype"));
+            .try_has_key(b"/Subtype")
+            .unwrap());
 
         assert_eq!(
             flatten_annotations_on_page(&mut pdf, page_ref, FlattenMode::All).unwrap(),
@@ -2876,13 +2881,11 @@ mod tests {
         // output object number is incidental to the current page graph.
         let written_page_ref = crate::pages::page_refs(&mut pdf2).unwrap()[0];
         let written_page = pdf2.get_object_handle(written_page_ref);
-        pdf2.resolve(&written_page).unwrap();
-        let resources = pdf2
-            .resolve_handle(&written_page.try_get_key(b"/Resources").unwrap())
-            .unwrap();
-        let xobjects = pdf2
-            .resolve_handle(&resources.try_get_key(b"/XObject").unwrap())
-            .unwrap();
+        written_page.try_is_scalar().unwrap();
+        let resources = written_page.try_get_key(b"/Resources").unwrap();
+        resources.try_is_scalar().unwrap();
+        let xobjects = resources.try_get_key(b"/XObject").unwrap();
+        xobjects.try_is_scalar().unwrap();
         let xobject_entries = xobjects
             .as_dictionary()
             .expect("flattened page must expose an /XObject dictionary");
@@ -2892,14 +2895,14 @@ mod tests {
             "the flattened appearance should be the page's only XObject"
         );
         let appearance = xobject_entries.into_values().next().unwrap();
-        pdf2.resolve(&appearance).unwrap();
+        appearance.try_is_scalar().unwrap();
         let appearance_dict = appearance
             .as_stream_dict()
             .expect("written appearance must remain a stream");
         let subtype = appearance_dict
             .try_get_key(b"/Subtype")
             .expect("flattening must write /Subtype");
-        pdf2.resolve(&subtype).unwrap();
+        subtype.try_is_scalar().unwrap();
         assert_eq!(subtype.as_name(), Some(b"Form".to_vec()));
     }
 
@@ -2971,11 +2974,11 @@ mod tests {
 
         // Both XObjects in /Resources.
         let page = pdf.get_object_handle(page_ref);
-        pdf.resolve(&page).unwrap();
+        page.try_is_scalar().unwrap();
         let resources = page.try_get_key(b"/Resources").unwrap();
-        pdf.resolve(&resources).unwrap();
+        resources.try_is_scalar().unwrap();
         let xobj_dict = resources.try_get_key(b"/XObject").unwrap();
-        pdf.resolve(&xobj_dict).unwrap();
+        xobj_dict.try_is_scalar().unwrap();
         assert_eq!(
             xobj_dict.as_dictionary().unwrap().len(),
             2,
@@ -3322,11 +3325,11 @@ mod tests {
         assert_eq!(count, 0, "the zero-area annotation must produce no output");
 
         let page = pdf.get_object_handle(page_ref);
-        pdf.resolve(&page).unwrap();
+        page.try_is_scalar().unwrap();
         let resources = page.try_get_key(b"/Resources").unwrap();
-        pdf.resolve(&resources).unwrap();
+        resources.try_is_scalar().unwrap();
         let xobject = resources.try_get_key(b"/XObject").unwrap();
-        pdf.resolve(&xobject).unwrap();
+        xobject.try_is_scalar().unwrap();
         assert!(
             xobject.is_null(),
             "no candidate produced content, so /Resources/XObject must not be created"
@@ -3428,11 +3431,11 @@ mod tests {
         // Page 1's /Resources/XObject must now be a privatized (direct)
         // dictionary carrying the new Fxo entry.
         let page1 = pdf.get_object_handle(page1_ref);
-        pdf.resolve(&page1).unwrap();
+        page1.try_is_scalar().unwrap();
         let resources1 = page1.try_get_key(b"/Resources").unwrap();
-        pdf.resolve(&resources1).unwrap();
+        resources1.try_is_scalar().unwrap();
         let xobject1 = resources1.try_get_key(b"/XObject").unwrap();
-        pdf.resolve(&xobject1).unwrap();
+        xobject1.try_is_scalar().unwrap();
         assert!(
             !xobject1.is_indirect(),
             "flattening must privatize a shared indirect /XObject dict"
@@ -3443,7 +3446,7 @@ mod tests {
         // /Im1, no leaked /Fxo1 -- this is what page 2 (still pointing at the
         // original indirect ref) would see.
         let original = pdf.get_object_handle(ObjectRef::new(7, 0));
-        pdf.resolve(&original).unwrap();
+        original.try_is_scalar().unwrap();
         assert!(
             original.try_has_key(b"/Im1").unwrap(),
             "original shared dict must retain its own entry"
@@ -3456,9 +3459,9 @@ mod tests {
         // Page 2's /Resources/XObject must still be the original, untouched
         // indirect reference.
         let page2 = pdf.get_object_handle(page2_ref);
-        pdf.resolve(&page2).unwrap();
+        page2.try_is_scalar().unwrap();
         let resources2 = page2.try_get_key(b"/Resources").unwrap();
-        pdf.resolve(&resources2).unwrap();
+        resources2.try_is_scalar().unwrap();
         let xobject2 = resources2.try_get_key(b"/XObject").unwrap();
         assert_eq!(xobject2.object_ref(), Some(ObjectRef::new(7, 0)));
     }
@@ -3588,11 +3591,11 @@ mod tests {
         assert!(content.windows(2).any(|w| w == b"Do"));
 
         let page = pdf.get_object_handle(page_ref);
-        pdf.resolve(&page).unwrap();
+        page.try_is_scalar().unwrap();
         let resources = page.try_get_key(b"/Resources").unwrap();
-        pdf.resolve(&resources).unwrap();
+        resources.try_is_scalar().unwrap();
         let xobject = resources.try_get_key(b"/XObject").unwrap();
-        pdf.resolve(&xobject).unwrap();
+        xobject.try_is_scalar().unwrap();
         assert_eq!(xobject.as_integer(), Some(42));
     }
 
@@ -3636,18 +3639,18 @@ mod tests {
 
         let root_ref = pdf.root_ref().unwrap();
         let root_after_flatten = pdf.get_object_handle(root_ref);
-        pdf.resolve(&root_after_flatten).unwrap();
+        root_after_flatten.try_is_scalar().unwrap();
         assert!(
-            !root_after_flatten.has_key(b"/AcroForm"),
+            !root_after_flatten.try_has_key(b"/AcroForm").unwrap(),
             "/AcroForm must be removed once every widget lacks /NeedAppearances"
         );
 
         crate::job::flatten_rotation_on_pages(&mut pdf, &[page_ref]).unwrap();
 
         let root_after_rotation = pdf.get_object_handle(root_ref);
-        pdf.resolve(&root_after_rotation).unwrap();
+        root_after_rotation.try_is_scalar().unwrap();
         assert!(
-            !root_after_rotation.has_key(b"/AcroForm"),
+            !root_after_rotation.try_has_key(b"/AcroForm").unwrap(),
             "flatten_rotation must not resurrect /AcroForm from a stale \
              pre-removal AcroForm association cache"
         );

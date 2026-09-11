@@ -92,7 +92,7 @@ fn run_subset(pages: &[ObjectRef]) -> Pdf<Cursor<Vec<u8>>> {
 
 fn resolved_handle(pdf: &mut Pdf<Cursor<Vec<u8>>>, object_ref: ObjectRef) -> ObjectHandle {
     let handle = pdf.get_object_handle(object_ref);
-    pdf.resolve(&handle).expect("resolve object");
+    handle.try_is_scalar().expect("resolve object");
     handle
 }
 
@@ -236,12 +236,12 @@ fn outline_and_names_retained_all_entries_kept() {
         cat.as_dictionary().is_some(),
         "catalog must be a dictionary"
     );
-    assert!(cat.has_key(b"/Outlines"), "/Outlines retained");
-    assert!(cat.has_key(b"/Names"), "/Names retained");
+    assert!(cat.try_has_key(b"/Outlines").unwrap(), "/Outlines retained");
+    assert!(cat.try_has_key(b"/Names").unwrap(), "/Names retained");
 
     // All four named dests still present; /Limits unchanged.
     let leaf = resolved_handle(&mut pdf, ObjectRef::new(30, 0));
-    let names = leaf.get_key(b"/Names").as_array().unwrap();
+    let names = leaf.try_get_key(b"/Names").unwrap().as_array().unwrap();
     let keys: Vec<Vec<u8>> = names
         .iter()
         .step_by(2)
@@ -256,12 +256,15 @@ fn outline_and_names_retained_all_entries_kept() {
             b"dp4".to_vec()
         ]
     );
-    assert!(leaf.has_key(b"/Limits"), "/Limits not recomputed/removed");
+    assert!(
+        leaf.try_has_key(b"/Limits").unwrap(),
+        "/Limits not recomputed/removed"
+    );
 
     // Both outline items kept with their chain intact.
     let i20 = resolved_handle(&mut pdf, ObjectRef::new(20, 0));
     assert_eq!(
-        i20.get_key(b"/Next").object_ref(),
+        i20.try_get_key(b"/Next").unwrap().object_ref(),
         Some(ObjectRef::new(21, 0)),
         "outline chain not stitched"
     );
@@ -280,9 +283,13 @@ fn full_rewrite_roundtrip_reopens_and_keeps_nav() {
     let root = re.root_ref().expect("root");
     let cat = resolved_handle(&mut re, root);
     assert!(cat.as_dictionary().is_some(), "catalog dict");
-    assert!(cat.has_key(b"/Outlines"), "/Outlines survives round trip");
+    assert!(
+        cat.try_has_key(b"/Outlines").unwrap(),
+        "/Outlines survives round trip"
+    );
     let names_ref = cat
-        .get_key(b"/Names")
+        .try_get_key(b"/Names")
+        .unwrap()
         .object_ref()
         .expect("/Names survives round trip");
 
@@ -290,11 +297,12 @@ fn full_rewrite_roundtrip_reopens_and_keeps_nav() {
     // (a removed-but-referenced page emitted as `N 0 obj null`).
     let names_dict = resolved_handle(&mut re, names_ref);
     let dests_ref = names_dict
-        .get_key(b"/Dests")
+        .try_get_key(b"/Dests")
+        .unwrap()
         .object_ref()
         .expect("/Dests survives round trip");
     let leaf = resolved_handle(&mut re, dests_ref);
-    let pairs = leaf.get_key(b"/Names").as_array().unwrap();
+    let pairs = leaf.try_get_key(b"/Names").unwrap().as_array().unwrap();
     assert_eq!(
         pairs.len(),
         8,
@@ -340,7 +348,7 @@ fn malformed_dest_to_non_page_object_is_never_nulled() {
     let sig_field = resolved_handle(&mut pdf, ObjectRef::new(7, 0));
     assert!(sig_field.as_dictionary().is_some(), "signature field dict");
     assert_eq!(
-        sig_field.get_key(b"/FT").as_name(),
+        sig_field.try_get_key(b"/FT").unwrap().as_name(),
         Some(b"Sig".to_vec()),
         "non-page dest target (signature field) must survive null-out"
     );
@@ -364,16 +372,18 @@ fn malformed_dest_to_non_page_object_is_never_nulled() {
     let root_ref = re.root_ref().unwrap();
     let root = resolved_handle(&mut re, root_ref);
     let names_ref = root
-        .get_key(b"/Names")
+        .try_get_key(b"/Names")
+        .unwrap()
         .object_ref()
         .expect("/Names survives");
     let names = resolved_handle(&mut re, names_ref);
     let dests_ref = names
-        .get_key(b"/Dests")
+        .try_get_key(b"/Dests")
+        .unwrap()
         .object_ref()
         .expect("/Dests survives");
     let leaf = resolved_handle(&mut re, dests_ref);
-    let pairs = leaf.get_key(b"/Names").as_array().unwrap();
+    let pairs = leaf.try_get_key(b"/Names").unwrap().as_array().unwrap();
     // pairs == [(evil) [<ref> /Fit] (dp2) [<ref> /Fit]]; the first dest's target
     // must still be the live signature field, not null.
     let evil_target = pairs[1]
@@ -383,7 +393,7 @@ fn malformed_dest_to_non_page_object_is_never_nulled() {
     let resolved = resolved_handle(&mut re, evil_target);
     assert!(resolved.as_dictionary().is_some(), "signature field dict");
     assert_eq!(
-        resolved.get_key(b"/FT").as_name(),
+        resolved.try_get_key(b"/FT").unwrap().as_name(),
         Some(b"Sig".to_vec()),
         "signature field survives the full rewrite (not nulled)"
     );

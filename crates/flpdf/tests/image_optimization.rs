@@ -116,7 +116,7 @@ fn resource_image<R: std::io::Read + std::io::Seek + 'static>(
         .try_get_key(b"/XObject")
         .expect("XObject resources");
     let image = xobjects.try_get_key(key).expect("image resource");
-    pdf.resolve(&image).expect("image object");
+    image.try_is_scalar().expect("image object");
     image
 }
 
@@ -127,7 +127,7 @@ fn filter_name<R: std::io::Read + std::io::Seek + 'static>(
     let image = resource_image(pdf, key);
     let dictionary = image.as_stream_dict().expect("image dictionary");
     let filter = dictionary.try_get_key(b"/Filter").expect("filter key");
-    pdf.resolve(&filter).expect("filter value");
+    filter.try_is_scalar().expect("filter value");
     filter.as_name()
 }
 

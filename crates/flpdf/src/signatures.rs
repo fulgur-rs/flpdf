@@ -58,7 +58,7 @@ pub struct SignatureInfo {
 /// # Errors
 ///
 /// - Propagates any error from resolving catalog, `/AcroForm`, and field-tree
-///   objects (for example I/O or parse failures surfaced by [`Pdf::resolve`]).
+///   objects (for example I/O or parse failures surfaced by canonical ObjectHandle resolution).
 /// - [`Error::Parse`] when a signature field's `/ByteRange` is malformed (not a
 ///   four-element array of non-negative integers).
 pub fn signatures<R: Read + Seek>(pdf: &mut Pdf<R>) -> Result<Vec<SignatureInfo>> {
@@ -70,7 +70,7 @@ pub fn signatures<R: Read + Seek>(pdf: &mut Pdf<R>) -> Result<Vec<SignatureInfo>
 /// # Errors
 ///
 /// - Propagates any error from resolving catalog, `/AcroForm`, and field-tree
-///   objects (for example I/O or parse failures surfaced by [`Pdf::resolve`]).
+///   objects (for example I/O or parse failures surfaced by canonical ObjectHandle resolution).
 /// - [`Error::Parse`] when a signature field's `/ByteRange` is malformed (not a
 ///   four-element array of non-negative integers).
 pub fn signatures_with_max_depth<R: Read + Seek>(
@@ -117,7 +117,7 @@ pub fn signatures_with_max_depth<R: Read + Seek>(
 /// # Errors
 ///
 /// Propagates any error from resolving the catalog and `/AcroForm` objects (for
-/// example I/O or parse failures surfaced by [`Pdf::resolve`]).
+/// example I/O or parse failures surfaced by canonical ObjectHandle resolution).
 pub fn acroform_sig_flags<R: Read + Seek>(pdf: &mut Pdf<R>) -> Result<Option<u32>> {
     let Some(acroform) = resolve_catalog_acroform(pdf)? else {
         return Ok(None);
@@ -136,7 +136,7 @@ pub fn acroform_sig_flags<R: Read + Seek>(pdf: &mut Pdf<R>) -> Result<Option<u32
 /// # Errors
 ///
 /// Propagates any error from resolving the catalog and `/AcroForm` objects (for
-/// example I/O or parse failures surfaced by [`Pdf::resolve`]).
+/// example I/O or parse failures surfaced by canonical ObjectHandle resolution).
 pub fn clear_sig_flags<R: Read + Seek>(pdf: &mut Pdf<R>) -> Result<bool> {
     let Some(acroform) = resolve_catalog_acroform(pdf)? else {
         return Ok(false);
@@ -160,7 +160,7 @@ pub fn clear_sig_flags<R: Read + Seek>(pdf: &mut Pdf<R>) -> Result<bool> {
 ///
 /// Propagates any error from resolving the catalog, `/AcroForm`, `/Fields`, and
 /// field-tree objects (for example I/O or parse failures surfaced by
-/// [`Pdf::resolve`]).
+/// canonical ObjectHandle resolution).
 pub fn strip_signature_values<R: Read + Seek>(pdf: &mut Pdf<R>) -> Result<bool> {
     let Some(acroform) = resolve_catalog_acroform(pdf)? else {
         return Ok(false);

@@ -26,7 +26,7 @@ fn classic_free_row_generation_65536_is_accepted_without_recovery() {
         .trailer()
         .try_get_key(b"/Root")
         .expect("trailer has /Root");
-    pdf.resolve(&root).expect("catalog resolves");
+    root.try_is_scalar().expect("catalog resolves");
 
     assert!(
         pdf.repair_diagnostics().entries().is_empty(),
@@ -49,7 +49,8 @@ fn a_signed_free_row_generation_is_not_a_qpdf_xref_entry() {
             .trailer()
             .try_get_key(b"/Root")
             .expect("trailer has /Root");
-        pdf.resolve(&root).expect("catalog resolves after recovery");
+        root.try_is_scalar()
+            .expect("catalog resolves after recovery");
 
         assert!(
             !pdf.repair_diagnostics().entries().is_empty(),

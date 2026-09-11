@@ -584,7 +584,7 @@ fn json_reactor_builds_canonical_objects_trailer_and_deferred_stream() {
     let trailer = pdf.trailer();
     trailer.try_dereference().expect("trailer resolves");
     assert_eq!(
-        trailer.get_key(b"/Root").object_ref(),
+        trailer.try_get_key(b"/Root").unwrap().object_ref(),
         Some(ObjectRef::new(1, 0))
     );
 }
@@ -609,7 +609,7 @@ fn json_reactor_normalizes_new_dangling_references_to_null() {
 
     let object = pdf.get_object_handle(ObjectRef::new(1, 0));
     object.try_dereference().expect("object resolves");
-    assert!(object.get_key(b"/Dangling").is_null());
+    assert!(object.try_get_key(b"/Dangling").unwrap().is_null());
     assert!(!pdf.get_object_handle(ObjectRef::new(9, 0)).is_reserved());
 }
 
@@ -871,14 +871,16 @@ fn json_reactor_updates_an_existing_stream_without_requiring_new_data() {
         updated
             .as_stream_dict()
             .expect("stream dictionary")
-            .get_key(b"/K")
+            .try_get_key(b"/K")
+            .unwrap()
             .as_integer(),
         Some(7)
     );
     assert!(updated
         .as_stream_dict()
         .expect("stream dictionary")
-        .get_key(b"/Length")
+        .try_get_key(b"/Length")
+        .unwrap()
         .is_null());
     assert_eq!(
         updated

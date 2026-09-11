@@ -92,7 +92,7 @@ fn raw_child(parent: &ObjectHandle, key: &[u8]) -> Result<Option<ObjectHandle>> 
 ///
 /// # Errors
 ///
-/// Any error propagated from [`Pdf::resolve`] while resolving a target
+/// Any error propagated from canonical ObjectHandle resolution while resolving a target
 /// annotation or its `/P` value.
 pub fn drop_objr_obj_annot_dangling_p<R: Read + Seek>(
     pdf: &mut Pdf<R>,
@@ -234,7 +234,7 @@ mod tests {
 
     fn annot(pdf: &mut Pdf<Cursor<Vec<u8>>>, num: u32) -> ObjectHandle {
         let annot = pdf.get_object_handle(ObjectRef::new(num, 0));
-        pdf.resolve(&annot).expect("resolve annot");
+        annot.try_is_scalar().expect("resolve annot");
         assert!(
             annot.as_dictionary().is_some(),
             "annot object is not a dictionary"
@@ -253,7 +253,7 @@ mod tests {
         drop_objr_obj_annot_dangling_p(&mut pdf, &keep_3_and_5(), &[ObjectRef::new(30, 0)])
             .expect("drop");
         assert!(
-            !annot(&mut pdf, 30).has_key(b"/P"),
+            !annot(&mut pdf, 30).try_has_key(b"/P").unwrap(),
             "removed-page /P must be dropped"
         );
     }
@@ -269,7 +269,8 @@ mod tests {
         drop_objr_obj_annot_dangling_p(&mut pdf, &keep_3_and_5(), &[ObjectRef::new(30, 0)])
             .expect("drop");
         assert!(
-            annot(&mut pdf, 30).get_key(b"/P").object_ref() == Some(ObjectRef::new(3, 0)),
+            annot(&mut pdf, 30).try_get_key(b"/P").unwrap().object_ref()
+                == Some(ObjectRef::new(3, 0)),
             "surviving-page /P must be kept",
         );
     }
@@ -292,7 +293,8 @@ mod tests {
         };
         drop_objr_obj_annot_dangling_p(&mut pdf, &result, &[ObjectRef::new(30, 0)]).expect("drop");
         assert!(
-            annot(&mut pdf, 30).get_key(b"/P").object_ref() == Some(ObjectRef::new(7, 0)),
+            annot(&mut pdf, 30).try_get_key(b"/P").unwrap().object_ref()
+                == Some(ObjectRef::new(7, 0)),
             "surviving-page /P must be remapped to the new ref",
         );
     }
@@ -309,7 +311,7 @@ mod tests {
             .expect("drop");
         let a = annot(&mut pdf, 30);
         assert!(
-            !a.has_key(b"/P") && a.has_key(b"/Subtype"),
+            !a.try_has_key(b"/P").unwrap() && a.try_has_key(b"/Subtype").unwrap(),
             "non-/P annot untouched"
         );
     }
@@ -320,7 +322,10 @@ mod tests {
         objs.insert(30, "<< /Type /Annot /Subtype /Text /P 4 0 R >>".into());
         let mut pdf = open(&objs);
         drop_objr_obj_annot_dangling_p(&mut pdf, &keep_3_and_5(), &[]).expect("noop");
-        assert!(annot(&mut pdf, 30).has_key(b"/P"), "no targets ⇒ no change");
+        assert!(
+            annot(&mut pdf, 30).try_has_key(b"/P").unwrap(),
+            "no targets ⇒ no change"
+        );
     }
 
     #[test]
@@ -357,7 +362,8 @@ mod tests {
         )
         .expect("drop");
         assert!(
-            annot(&mut pdf, 30).get_key(b"/P").object_ref() == Some(ObjectRef::new(7, 0)),
+            annot(&mut pdf, 30).try_get_key(b"/P").unwrap().object_ref()
+                == Some(ObjectRef::new(7, 0)),
             "remapped /P 7 must survive the duplicate target; dedup guard prevents re-drop",
         );
     }
@@ -372,7 +378,7 @@ mod tests {
         drop_objr_obj_annot_dangling_p(&mut pdf, &keep_3_and_5(), &[ObjectRef::new(30, 0)])
             .expect("non-dict target skipped");
         let target = pdf.get_object_handle(ObjectRef::new(30, 0));
-        pdf.resolve(&target).expect("resolve");
+        target.try_is_scalar().expect("resolve");
         assert_eq!(
             target.as_integer(),
             Some(42),
@@ -400,7 +406,7 @@ mod tests {
         drop_objr_obj_annot_dangling_p(&mut pdf, &keep_3_and_5(), &[ObjectRef::new(30, 0)])
             .expect("drop");
         assert!(
-            annot(&mut pdf, 30).get_key(b"/P").as_integer() == Some(999),
+            annot(&mut pdf, 30).try_get_key(b"/P").unwrap().as_integer() == Some(999),
             "a non-reference /P must be left unchanged",
         );
     }
@@ -422,7 +428,8 @@ mod tests {
         drop_objr_obj_annot_dangling_p(&mut pdf, &keep_3_and_5(), &[ObjectRef::new(30, 0)])
             .expect("drop");
         assert!(
-            annot(&mut pdf, 30).get_key(b"/P").object_ref() == Some(ObjectRef::new(60, 0)),
+            annot(&mut pdf, 30).try_get_key(b"/P").unwrap().object_ref()
+                == Some(ObjectRef::new(60, 0)),
             "a /P resolving to a non-page object must be left unchanged",
         );
     }
@@ -444,7 +451,8 @@ mod tests {
             .expect("orphan-page /P");
 
         assert!(
-            annot(&mut pdf, 30).get_key(b"/P").object_ref() == Some(ObjectRef::new(60, 0)),
+            annot(&mut pdf, 30).try_get_key(b"/P").unwrap().object_ref()
+                == Some(ObjectRef::new(60, 0)),
             "a /P to a page outside the original page tree must be left unchanged",
         );
     }
@@ -468,7 +476,7 @@ mod tests {
         drop_objr_obj_annot_dangling_p(&mut pdf, &keep_3_and_5(), &[ObjectRef::new(30, 0)])
             .expect("drop");
         assert!(
-            !annot(&mut pdf, 30).has_key(b"/P"),
+            !annot(&mut pdf, 30).try_has_key(b"/P").unwrap(),
             "a /P to a removed page nulled by the dest null-out pass must still be dropped",
         );
     }
@@ -484,7 +492,7 @@ mod tests {
         drop_objr_obj_annot_dangling_p(&mut pdf, &keep_3_and_5(), &[ObjectRef::new(30, 0)])
             .expect("stream target skipped without error");
         let target = pdf.get_object_handle(ObjectRef::new(30, 0));
-        pdf.resolve(&target).expect("resolve stream target");
+        target.try_is_scalar().expect("resolve stream target");
         assert!(
             target.as_stream_dict().is_some(),
             "a stream OBJR /Obj target must be left unchanged"

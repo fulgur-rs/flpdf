@@ -930,8 +930,8 @@ impl LinearizationPlan {
     /// Propagates any error from [`crate::pages::page_refs`] when collecting the
     /// document's page references (e.g. a malformed or unresolvable `/Pages`
     /// tree). Also propagates any error from resolving objects while computing
-    /// each page's reachability closure (via [`Pdf::resolve`] /
-    /// [`Pdf::resolve`]) — typically an [`crate::Error::Io`] or
+    /// each page's reachability closure (via canonical ObjectHandle resolution /
+    /// canonical ObjectHandle resolution) — typically an [`crate::Error::Io`] or
     /// [`crate::Error::Parse`] on a truncated or malformed object. Before any
     /// of that, this also pushes inherited page attributes down the `/Pages`
     /// tree, which propagates the same object-resolution errors and returns
@@ -3087,7 +3087,7 @@ mod tests {
     fn qpdf_linearization_parameter_probe_runs_once_before_raw_retry() {
         let mut pdf = Pdf::open(Cursor::new(parameter_probe_fixture())).expect("parse fixture");
         let stream = pdf.get_object_handle(crate::ObjectRef::new(4, 0));
-        pdf.resolve(&stream).expect("resolve page content");
+        stream.try_is_scalar().expect("resolve page content");
 
         let token = crate::tokenizer::Token::new(crate::tokenizer::TokenType::Word, b"q".to_vec());
         let mut filter = PassThroughTokenFilter;

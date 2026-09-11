@@ -650,7 +650,7 @@ pub fn ascii_filename_fallback(filename: &str) -> Vec<u8> {
 /// - [`Error::Unsupported`] when the filespec at `key` has no resolvable
 ///   `/EmbeddedFile` stream (e.g. the `/EF` sub-dictionary is absent or
 ///   malformed).
-/// - Any error from [`Pdf::resolve`] or the filter decoder.
+/// - Any error from canonical ObjectHandle resolution or the filter decoder.
 ///
 /// # Example
 ///
@@ -863,8 +863,8 @@ mod tests {
     fn page_mode(pdf: &mut Pdf<Cursor<Vec<u8>>>) -> Option<Vec<u8>> {
         let root_ref = pdf.root_ref().expect("catalog root");
         let root = pdf.get_object_handle(root_ref);
-        pdf.resolve(&root).expect("resolve catalog");
-        root.get_key(b"/PageMode").as_name()
+        root.try_is_scalar().expect("resolve catalog");
+        root.try_get_key(b"/PageMode").unwrap().as_name()
     }
 
     #[test]
@@ -1034,7 +1034,7 @@ mod tests {
             .expect("open fixture");
         let filespec_ref = crate::ObjectRef::new(5, 0);
         let filespec = pdf.get_object_handle(filespec_ref);
-        pdf.resolve(&filespec).expect("resolve filespec");
+        filespec.try_is_scalar().expect("resolve filespec");
         filespec.remove_key(b"/EF");
 
         let error = job
@@ -1186,7 +1186,7 @@ mod tests {
 
         let root_ref = pdf.root_ref().expect("catalog root");
         let root = pdf.get_object_handle(root_ref);
-        pdf.resolve(&root).expect("resolve catalog");
+        root.try_is_scalar().expect("resolve catalog");
         root.replace_key(b"/PageMode", crate::ObjectHandle::name(b"UseNone".to_vec()))
             .expect("set existing page mode");
 

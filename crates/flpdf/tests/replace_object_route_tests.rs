@@ -5,7 +5,8 @@ fn public_replace_object_keeps_the_target_handle_identity() {
     let mut pdf = Pdf::empty().expect("empty PDF");
     let target_ref = pdf.root_ref().expect("empty PDF root");
     let target = pdf.get_object_handle(target_ref);
-    pdf.resolve(&target)
+    target
+        .try_is_scalar()
         .expect("resolve root before replacement");
 
     let replacement =
@@ -16,7 +17,10 @@ fn public_replace_object_keeps_the_target_handle_identity() {
 
     assert!(returned.is_same_object_as(&target));
     assert_eq!(target.object_ref(), Some(target_ref));
-    assert_eq!(target.get_key(b"/Marker").as_integer(), Some(42));
+    assert_eq!(
+        target.try_get_key(b"/Marker").unwrap().as_integer(),
+        Some(42)
+    );
 }
 
 #[test]

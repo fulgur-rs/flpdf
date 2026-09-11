@@ -188,7 +188,7 @@ fn create_from_json_uses_qpdf_rootless_seed_and_complete_metadata() {
         !pdf.ever_called_get_all_pages(),
         "create mode ignores update flags"
     );
-    assert!(pdf.trailer().get_key(b"/Size").is_null());
+    assert!(pdf.trailer().try_get_key(b"/Size").unwrap().is_null());
 }
 
 #[test]
@@ -293,7 +293,10 @@ fn update_from_json_replaces_only_named_objects_and_runs_update_flags() {
         .expect("partial JSON should update the document");
 
     let catalog = pdf.get_object_handle(ObjectRef::new(1, 0));
-    assert_eq!(catalog.get_key(b"/Marker").as_boolean(), Some(true));
+    assert_eq!(
+        catalog.try_get_key(b"/Marker").unwrap().as_boolean(),
+        Some(true)
+    );
     assert!(pdf
         .resolve_canonical_object(ObjectRef::new(2, 0))
         .unwrap()

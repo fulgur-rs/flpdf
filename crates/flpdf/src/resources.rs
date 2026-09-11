@@ -574,7 +574,7 @@ mod final_handle_tests {
         let mut pdf = fixture();
         let page_ref = crate::pages::page_refs(&mut pdf).expect("page refs")[0];
         let page_handle = pdf.get_object_handle(page_ref);
-        pdf.resolve(&page_handle).expect("page resolves");
+        page_handle.try_is_scalar().expect("page resolves");
         let replacement = page_handle.shallow_copy().expect("page is copyable");
 
         let form = pdf
@@ -687,7 +687,7 @@ mod final_handle_tests {
         let mut pdf = fixture();
         let page_ref = crate::pages::page_refs(&mut pdf).expect("page refs")[0];
         let page_handle = pdf.get_object_handle(page_ref);
-        pdf.resolve(&page_handle).expect("page resolves");
+        page_handle.try_is_scalar().expect("page resolves");
         let replacement = page_handle.shallow_copy().expect("page is copyable");
         let contents = pdf
             .new_stream_with_data(Rc::new(b"not-flate".to_vec()))
@@ -733,7 +733,7 @@ mod final_handle_tests {
             .expect("fixture opens");
         let page_ref = crate::pages::page_refs(&mut pdf).expect("page refs")[0];
         let page_handle = pdf.get_object_handle(page_ref);
-        pdf.resolve(&page_handle).expect("page resolves");
+        page_handle.try_is_scalar().expect("page resolves");
         let replacement = page_handle.shallow_copy().expect("page is copyable");
 
         let child_form = pdf

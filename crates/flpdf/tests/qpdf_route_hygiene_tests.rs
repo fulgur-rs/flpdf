@@ -151,9 +151,11 @@ fn handle_only_helpers_do_not_carry_dead_pdf_parameters() {
         "nntree.rs",
         "page_annotation_flatten.rs",
         "page_object_helper.rs",
+        "page_form_xobject.rs",
         "pages/repair.rs",
         "pages/tree_rebuild.rs",
         "resources.rs",
+        "job/rotate.rs",
         // The CLI reaches the same handle-only routes, and the dirty bridge
         // left a dead parameter here too.
         "../../flpdf-cli/src/main.rs",

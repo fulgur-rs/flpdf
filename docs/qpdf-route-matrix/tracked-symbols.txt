@@ -73,6 +73,10 @@
 # A. ObjectHandle / Resolver
 # ===========================================================================
 
+# A7/A8 final cleanup: Pdf::resolve and panic get_key/has_key are hidden behind
+# the qtest-driver feature only. Their qtest-tools callers remain an explicitly
+# excluded exception denominator; the normal flpdf source/test census is zero.
+
 # --- (a) deletable route ---
 crates/flpdf/src/object_handle.rs::ObjectHandle::as_dictionary           # A6 非解決族
 crates/flpdf/src/object_handle.rs::ObjectHandle::as_array                # A6
@@ -81,10 +85,9 @@ crates/flpdf/src/object_handle.rs::ObjectHandle::as_name                 # A6
 crates/flpdf/src/object_handle.rs::ObjectHandle::as_string               # A6
 crates/flpdf/src/object_handle.rs::ObjectHandle::as_real                 # A6
 crates/flpdf/src/object_handle.rs::ObjectHandle::is_null                 # A6
-crates/flpdf/src/reader.rs::Pdf::resolve                                 # A7（曖昧 leaf）
-crates/flpdf/src/reader.rs::Pdf::resolve_handle                          # A7
-crates/flpdf/src/object_handle.rs::ObjectHandle::get_key                 # A8 panic 版
-crates/flpdf/src/object_handle.rs::ObjectHandle::has_key                 # A8
+crates/flpdf/src/reader.rs::Pdf::resolve                                 # A7（qtest-driver exception）
+crates/flpdf/src/object_handle.rs::ObjectHandle::get_key                 # A8 qtest-driver exception
+crates/flpdf/src/object_handle.rs::ObjectHandle::has_key                 # A8 qtest-driver exception
 crates/flpdf/src/reader.rs::Pdf::get_all_objects                         # A9
 crates/flpdf/src/reader.rs::Pdf::canonical_object_refs                   # A10
 crates/flpdf/src/reader.rs::Pdf::canonical_live_object_refs              # A10

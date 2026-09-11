@@ -250,8 +250,8 @@ fn annotation_appearance_indirect_dict() {
         .get_appearance_dictionary()
         .expect("get_appearance_dictionary()");
     assert!(ap.as_dictionary().is_some(), "AP should resolve to a dict");
-    let n = ap.get_key(b"/N");
-    pdf.resolve(&n).unwrap();
+    let n = ap.try_get_key(b"/N").unwrap();
+    n.try_is_scalar().unwrap();
     assert_eq!(n.object_ref(), Some(ObjectRef::new(5, 0)));
 }
 
@@ -436,7 +436,8 @@ fn annotation_handle_builds_qpdf_page_content_for_appearance() {
         appearance
             .as_stream_dict()
             .expect("appearance stream dictionary")
-            .get_key(b"/Subtype")
+            .try_get_key(b"/Subtype")
+            .unwrap()
             .as_name(),
         Some(b"Form".to_vec())
     );

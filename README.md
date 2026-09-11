@@ -131,7 +131,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 The crate is organized as a few small layers:
 
 - `Pdf` — parsed-but-lazy document handle (`Pdf::open` reads the trailer and
-  cross-reference table, then resolves objects on demand via `Pdf::resolve`).
+  cross-reference table; `ObjectHandle::try_*` accessors resolve objects on demand).
 - `Object`, `Dictionary`, `Stream`, `ObjectRef` — the data model.
 - `pages`, `outline_object_helper` — read-only traversal helpers that mirror
   `qpdf --show-pages` and `--json-key=outlines`.

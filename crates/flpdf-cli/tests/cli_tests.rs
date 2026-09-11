@@ -5176,7 +5176,7 @@ fn resource_category_keys_from_path(
     let category = resources
         .try_get_key(category_key.as_bytes())
         .expect("resource category should be readable");
-    pdf.resolve(&category).expect("resolve resource category");
+    category.try_is_scalar().expect("resolve resource category");
     category
         .as_dictionary()
         .unwrap_or_default()
@@ -5685,9 +5685,9 @@ fn acroform_fields_len(pdf: &mut Pdf<BufReader<File>>) -> Option<usize> {
     let root_ref = pdf.root_ref()?;
     let catalog = pdf.resolve_canonical_object(root_ref).ok()?;
     let acroform = catalog.try_get_key(b"/AcroForm").ok()?;
-    pdf.resolve(&acroform).ok()?;
+    acroform.try_is_scalar().ok()?;
     let fields = acroform.try_get_key(b"/Fields").ok()?;
-    pdf.resolve(&fields).ok()?;
+    fields.try_is_scalar().ok()?;
     Some(fields.as_array()?.len())
 }
 
@@ -6017,7 +6017,7 @@ fn rewrite_normalize_content_skips_null_array_entries_like_qpdf() {
     let contents = page
         .try_get_key(b"/Contents")
         .expect("rewritten page must have /Contents");
-    pdf.resolve(&contents).unwrap();
+    contents.try_is_scalar().unwrap();
     let contents = contents
         .as_array()
         .expect("rewritten page must retain its /Contents array");
@@ -9794,7 +9794,7 @@ fn rewrite_generate_appearances_adds_ap_n() {
     let mut helper = AnnotationObjectHelper::new(widget, &mut pdf);
     let ap = helper.get_appearance_dictionary().unwrap();
     assert!(
-        !ap.get_key(b"/N").is_null(),
+        !ap.try_get_key(b"/N").unwrap().is_null(),
         "widget /AP should carry an /N normal appearance after --generate-appearances"
     );
 }

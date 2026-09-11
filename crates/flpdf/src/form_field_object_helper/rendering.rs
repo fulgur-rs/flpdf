@@ -907,7 +907,7 @@ mod tests {
 
     fn generated_stream<R: Read + Seek>(pdf: &mut Pdf<R>, reference: ObjectRef) -> ObjectHandle {
         let stream = pdf.get_object_handle(reference);
-        pdf.resolve(&stream).expect("resolve appearance");
+        stream.try_is_scalar().expect("resolve appearance");
         stream
     }
 
@@ -958,12 +958,13 @@ mod tests {
             let resources = stream
                 .as_stream_dict()
                 .expect("stream dictionary")
-                .get_key(b"/Resources");
-            pdf.resolve(&resources).expect("resolve resources");
-            let fonts = resources.get_key(b"/Font");
-            pdf.resolve(&fonts).expect("resolve fonts");
+                .try_get_key(b"/Resources")
+                .unwrap();
+            resources.try_is_scalar().expect("resolve resources");
+            let fonts = resources.try_get_key(b"/Font").unwrap();
+            fonts.try_is_scalar().expect("resolve fonts");
             assert_eq!(
-                fonts.get_key(b"/F1").object_ref(),
+                fonts.try_get_key(b"/F1").unwrap().object_ref(),
                 Some(ObjectRef::new(6, 0))
             );
         }
@@ -1039,10 +1040,10 @@ mod tests {
                 .expect("Tx handled");
         let stream = generated_stream(&mut pdf, reference);
         let dict = stream.as_stream_dict().expect("stream dictionary");
-        let resources = dict.get_key(b"/Resources");
-        pdf.resolve(&resources).expect("resolve resources");
-        assert!(resources.get_key(b"/Font").is_null());
-        assert!(dict.get_key(b"/FormType").is_null());
+        let resources = dict.try_get_key(b"/Resources").unwrap();
+        resources.try_is_scalar().expect("resolve resources");
+        assert!(resources.try_get_key(b"/Font").unwrap().is_null());
+        assert!(dict.try_get_key(b"/FormType").unwrap().is_null());
     }
 
     #[test]
@@ -1057,12 +1058,13 @@ mod tests {
         let resources = stream
             .as_stream_dict()
             .expect("stream dictionary")
-            .get_key(b"/Resources");
-        pdf.resolve(&resources).expect("resolve resources");
-        let fonts = resources.get_key(b"/Font");
-        pdf.resolve(&fonts).expect("resolve fonts");
+            .try_get_key(b"/Resources")
+            .unwrap();
+        resources.try_is_scalar().expect("resolve resources");
+        let fonts = resources.try_get_key(b"/Font").unwrap();
+        fonts.try_is_scalar().expect("resolve fonts");
         assert_eq!(
-            fonts.get_key(b"/F1").object_ref(),
+            fonts.try_get_key(b"/F1").unwrap().object_ref(),
             Some(ObjectRef::new(5, 0))
         );
     }
@@ -1078,9 +1080,10 @@ mod tests {
         let resources = stream
             .as_stream_dict()
             .expect("stream dictionary")
-            .get_key(b"/Resources");
-        pdf.resolve(&resources).expect("resolve resources");
-        assert!(resources.get_key(b"/Font").is_null());
+            .try_get_key(b"/Resources")
+            .unwrap();
+        resources.try_is_scalar().expect("resolve resources");
+        assert!(resources.try_get_key(b"/Font").unwrap().is_null());
     }
 
     #[test]

@@ -1444,7 +1444,7 @@ mod tests {
         )]);
         let catalog_ref = pdf.root_ref().expect("catalog");
         let catalog = pdf.get_object_handle(catalog_ref);
-        pdf.resolve(&catalog).expect("resolve catalog");
+        catalog.try_is_scalar().expect("resolve catalog");
         catalog
             .replace_key(b"/Outlines", outlines)
             .expect("install outlines");

@@ -133,7 +133,7 @@ mod tests {
 
     fn resolved_handle(pdf: &mut Pdf<Cursor<Vec<u8>>>, object_ref: ObjectRef) -> ObjectHandle {
         let handle = pdf.get_object_handle(object_ref);
-        pdf.resolve(&handle).expect("resolve object");
+        handle.try_is_scalar().expect("resolve object");
         handle
     }
 
@@ -198,14 +198,19 @@ mod tests {
         let owner = ObjectHandle::dictionary(vec![(b"/FS".to_vec(), filespec)]);
         pdf.replace_object(owner_ref, owner).unwrap();
         let owner = pdf.get_object_handle(owner_ref);
-        pdf.resolve(&owner).unwrap();
-        let direct_filespec = owner.get_key(b"/FS");
+        owner.try_is_scalar().unwrap();
+        let direct_filespec = owner.try_get_key(b"/FS").unwrap();
 
         let mut helper = FileSpec::new(direct_filespec, &mut pdf).unwrap();
         helper.set_description("persisted through owner").unwrap();
         drop(helper);
         assert_eq!(
-            owner.get_key(b"/FS").get_key(b"/Desc").as_string(),
+            owner
+                .try_get_key(b"/FS")
+                .unwrap()
+                .try_get_key(b"/Desc")
+                .unwrap()
+                .as_string(),
             Some(b"persisted through owner".to_vec())
         );
     }
@@ -232,8 +237,8 @@ mod tests {
         let owner_dict = ObjectHandle::dictionary(vec![(b"/FS".to_vec(), filespec)]);
         source.replace_object(owner_ref, owner_dict).unwrap();
         let owner = source.get_object_handle(owner_ref);
-        source.resolve(&owner).unwrap();
-        let foreign_direct_filespec = owner.get_key(b"/FS");
+        owner.try_is_scalar().unwrap();
+        let foreign_direct_filespec = owner.try_get_key(b"/FS").unwrap();
         assert!(foreign_direct_filespec.is_direct());
 
         let mut destination = open_minimal();
@@ -311,7 +316,7 @@ mod tests {
         let stream_dict = stream.as_stream_dict().expect("stream dictionary");
         // No /Filter in uncompressed stream
         assert!(
-            stream_dict.get_key(b"/Filter").is_null(),
+            stream_dict.try_get_key(b"/Filter").unwrap().is_null(),
             "uncompressed stream must have no /Filter"
         );
         let decoded = stream
@@ -330,8 +335,16 @@ mod tests {
 
         let fs_dict = resolved_handle(&mut pdf, fs_ref);
         assert!(fs_dict.as_dictionary().is_some(), "expected dictionary");
-        let f = fs_dict.get_key(b"/F").as_string().expect("missing /F");
-        let uf = fs_dict.get_key(b"/UF").as_string().expect("missing /UF");
+        let f = fs_dict
+            .try_get_key(b"/F")
+            .unwrap()
+            .as_string()
+            .expect("missing /F");
+        let uf = fs_dict
+            .try_get_key(b"/UF")
+            .unwrap()
+            .as_string()
+            .expect("missing /UF");
         assert_eq!(f, b"myfile.txt", "/F must be the filename");
         assert_eq!(uf, b"myfile.txt", "/UF must use qpdf newUnicodeString");
     }
@@ -347,8 +360,16 @@ mod tests {
 
         let fs_dict = resolved_handle(&mut pdf, fs_ref);
         assert!(fs_dict.as_dictionary().is_some(), "expected dictionary");
-        let f = fs_dict.get_key(b"/F").as_string().expect("missing /F");
-        let uf = fs_dict.get_key(b"/UF").as_string().expect("missing /UF");
+        let f = fs_dict
+            .try_get_key(b"/F")
+            .unwrap()
+            .as_string()
+            .expect("missing /F");
+        let uf = fs_dict
+            .try_get_key(b"/UF")
+            .unwrap()
+            .as_string()
+            .expect("missing /UF");
 
         assert_eq!(f, b"____.pdf", "/F must be ASCII fallback");
         assert_eq!(
@@ -431,7 +452,7 @@ mod tests {
         let stream = embedded_file_stream_handle(&mut pdf, fs_ref);
         let stream_dict = stream.as_stream_dict().expect("stream dictionary");
         assert!(
-            stream_dict.get_key(b"/Filter").is_null(),
+            stream_dict.try_get_key(b"/Filter").unwrap().is_null(),
             "attachment construction must not install a helper-local filter"
         );
         assert_eq!(
@@ -452,13 +473,15 @@ mod tests {
 
         let stream = embedded_file_stream_handle(&mut pdf, fs_ref);
         let stream_dict = stream.as_stream_dict().expect("stream dictionary");
-        let params = stream_dict.get_key(b"/Params");
+        let params = stream_dict.try_get_key(b"/Params").unwrap();
         let size = params
-            .get_key(b"/Size")
+            .try_get_key(b"/Size")
+            .unwrap()
             .as_integer()
             .expect("missing /Params /Size");
         let checksum = params
-            .get_key(b"/CheckSum")
+            .try_get_key(b"/CheckSum")
+            .unwrap()
             .as_string()
             .expect("missing /Params /CheckSum");
         assert_eq!(
@@ -487,8 +510,16 @@ mod tests {
 
         let fs_dict = resolved_handle(&mut pdf, fs_ref);
         assert!(fs_dict.as_dictionary().is_some(), "expected dict");
-        let f = fs_dict.get_key(b"/F").as_string().expect("missing /F");
-        let uf = fs_dict.get_key(b"/UF").as_string().expect("missing /UF");
+        let f = fs_dict
+            .try_get_key(b"/F")
+            .unwrap()
+            .as_string()
+            .expect("missing /F");
+        let uf = fs_dict
+            .try_get_key(b"/UF")
+            .unwrap()
+            .as_string()
+            .expect("missing /UF");
         assert_eq!(f, b"report.pdf", "/F must be basename");
         assert_eq!(uf, b"report.pdf", "/UF must use qpdf's PDFDocEncoding form");
     }
@@ -518,8 +549,16 @@ mod tests {
 
         let fs_dict = resolved_handle(&mut pdf, fs_ref);
         assert!(fs_dict.as_dictionary().is_some(), "expected dict");
-        let f = fs_dict.get_key(b"/F").as_string().expect("missing /F");
-        let uf = fs_dict.get_key(b"/UF").as_string().expect("missing /UF");
+        let f = fs_dict
+            .try_get_key(b"/F")
+            .unwrap()
+            .as_string()
+            .expect("missing /F");
+        let uf = fs_dict
+            .try_get_key(b"/UF")
+            .unwrap()
+            .as_string()
+            .expect("missing /UF");
 
         assert_eq!(f, b"____.pdf", "/F must be ASCII-safe fallback");
         assert_eq!(

@@ -1335,13 +1335,13 @@ mod tests {
         for modified in [false, true] {
             let mut pdf = Pdf::open_mem_owned(direct_stream_source()).unwrap();
             let page = pdf.get_object_handle(ObjectRef::new(3, 0));
-            pdf.resolve(&page).unwrap();
+            page.try_is_scalar().unwrap();
             let direct_stream = ObjectHandle::stream(
                 ObjectHandle::dictionary(vec![(b"Length".to_vec(), ObjectHandle::integer(3))]),
                 Rc::new(b"q Q".to_vec()),
             );
             page.replace_key(b"Contents", direct_stream).unwrap();
-            let contents = page.get_key(b"Contents");
+            let contents = page.try_get_key(b"Contents").unwrap();
             if modified {
                 contents
                     .add_token_filter(Rc::new(RefCell::new(PassThroughTokenFilter)))

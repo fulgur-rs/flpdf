@@ -23,7 +23,7 @@ pub trait PdfCanonicalTestExt {
 impl<R: Read + Seek + 'static> PdfCanonicalTestExt for Pdf<R> {
     fn resolve_canonical_object(&mut self, object_ref: ObjectRef) -> Result<ObjectHandle> {
         let handle = self.get_object_handle(object_ref);
-        self.resolve(&handle)?;
+        handle.try_is_scalar()?;
         Ok(handle)
     }
 }

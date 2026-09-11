@@ -849,12 +849,12 @@ mod tests {
             .next()
             .expect("fixture has a page");
         let page = pdf.get_object_handle(page_ref);
-        pdf.resolve(&page).expect("page resolves");
-        if !page.has_key(b"/Annots") {
+        page.try_is_scalar().expect("page resolves");
+        if !page.try_has_key(b"/Annots").unwrap() {
             return 0;
         }
-        let annots = page.get_key(b"/Annots");
-        pdf.resolve(&annots).expect("/Annots resolves");
+        let annots = page.try_get_key(b"/Annots").unwrap();
+        annots.try_is_scalar().expect("/Annots resolves");
         annots
             .as_array()
             .map(|annots| annots.len())
@@ -1100,17 +1100,20 @@ mod tests {
             Pdf::open_mem_owned(std::fs::read(&written[0]).expect("first chunk should be written"))
                 .expect("chunk should parse");
         let catalog = catalog(&mut chunk);
-        assert!(!catalog.has_key(b"/Outlines"));
-        assert!(!catalog.has_key(b"/PageMode"));
+        assert!(!catalog.try_has_key(b"/Outlines").unwrap());
+        assert!(!catalog.try_has_key(b"/PageMode").unwrap());
 
-        let page_labels = catalog.get_key(b"/PageLabels");
-        chunk.resolve(&page_labels).expect("PageLabels resolves");
-        let nums = page_labels.get_key(b"/Nums");
-        chunk.resolve(&nums).expect("PageLabels /Nums resolves");
+        let page_labels = catalog.try_get_key(b"/PageLabels").unwrap();
+        page_labels.try_is_scalar().expect("PageLabels resolves");
+        let nums = page_labels.try_get_key(b"/Nums").unwrap();
+        nums.try_is_scalar().expect("PageLabels /Nums resolves");
         let labels = nums.as_array().expect("PageLabels /Nums must be an array");
         let label = labels.get(1).expect("first label dictionary");
-        chunk.resolve(label).expect("label dictionary resolves");
-        assert_eq!(label.get_key(b"/P").as_string(), Some(Vec::new()));
+        label.try_is_scalar().expect("label dictionary resolves");
+        assert_eq!(
+            label.try_get_key(b"/P").unwrap().as_string(),
+            Some(Vec::new())
+        );
     }
 
     #[test]
@@ -1369,10 +1372,10 @@ mod tests {
     fn read_nums(bytes: &[u8]) -> Vec<(i64, ObjectHandle)> {
         let mut pdf = Pdf::open(Cursor::new(bytes.to_vec())).expect("should parse");
         let catalog = pdf.root_handle().expect("/Root");
-        let page_labels = catalog.get_key(b"/PageLabels");
-        pdf.resolve(&page_labels).expect("resolve PageLabels");
-        let nums = page_labels.get_key(b"/Nums");
-        pdf.resolve(&nums).expect("resolve /Nums");
+        let page_labels = catalog.try_get_key(b"/PageLabels").unwrap();
+        page_labels.try_is_scalar().expect("resolve PageLabels");
+        let nums = page_labels.try_get_key(b"/Nums").unwrap();
+        nums.try_is_scalar().expect("resolve /Nums");
         nums.as_array()
             .expect("/Nums must be a direct array")
             .chunks_exact(2)
@@ -1584,23 +1587,47 @@ mod tests {
         let nums1 = read_nums(&chunk1);
         assert_eq!(nums1.len(), 1);
         assert_eq!(nums1[0].0, 0);
-        assert_eq!(nums1[0].1.get_key(b"/S").as_name(), Some(s("r")));
-        assert_eq!(nums1[0].1.get_key(b"/St").as_integer(), Some(1));
+        assert_eq!(
+            nums1[0].1.try_get_key(b"/S").unwrap().as_name(),
+            Some(s("r"))
+        );
+        assert_eq!(
+            nums1[0].1.try_get_key(b"/St").unwrap().as_integer(),
+            Some(1)
+        );
 
         let nums2 = read_nums(&chunk2);
         assert_eq!(nums2.len(), 2, "roman continuation + decimal restart");
         assert_eq!(nums2[0].0, 0);
-        assert_eq!(nums2[0].1.get_key(b"/S").as_name(), Some(s("r")));
-        assert_eq!(nums2[0].1.get_key(b"/St").as_integer(), Some(3));
+        assert_eq!(
+            nums2[0].1.try_get_key(b"/S").unwrap().as_name(),
+            Some(s("r"))
+        );
+        assert_eq!(
+            nums2[0].1.try_get_key(b"/St").unwrap().as_integer(),
+            Some(3)
+        );
         assert_eq!(nums2[1].0, 1);
-        assert_eq!(nums2[1].1.get_key(b"/S").as_name(), Some(s("D")));
-        assert_eq!(nums2[1].1.get_key(b"/St").as_integer(), Some(1));
+        assert_eq!(
+            nums2[1].1.try_get_key(b"/S").unwrap().as_name(),
+            Some(s("D"))
+        );
+        assert_eq!(
+            nums2[1].1.try_get_key(b"/St").unwrap().as_integer(),
+            Some(1)
+        );
 
         let nums3 = read_nums(&chunk3);
         assert_eq!(nums3.len(), 1);
         assert_eq!(nums3[0].0, 0);
-        assert_eq!(nums3[0].1.get_key(b"/S").as_name(), Some(s("D")));
-        assert_eq!(nums3[0].1.get_key(b"/St").as_integer(), Some(2));
+        assert_eq!(
+            nums3[0].1.try_get_key(b"/S").unwrap().as_name(),
+            Some(s("D"))
+        );
+        assert_eq!(
+            nums3[0].1.try_get_key(b"/St").unwrap().as_integer(),
+            Some(2)
+        );
     }
 
     #[test]
@@ -1614,7 +1641,7 @@ mod tests {
         let mut pdf = Pdf::open(Cursor::new(chunk)).expect("should parse");
         let catalog = pdf.root_handle().unwrap();
         assert!(
-            !catalog.has_key(b"/PageLabels"),
+            !catalog.try_has_key(b"/PageLabels").unwrap(),
             "a source with no /PageLabels must not gain one"
         );
     }

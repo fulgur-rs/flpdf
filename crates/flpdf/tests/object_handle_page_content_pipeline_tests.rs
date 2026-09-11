@@ -50,13 +50,13 @@ fn add_page_contents_always_installs_an_array_in_qpdf_order() {
 
     let prepended = stream(b"prepended");
     page.add_page_contents(prepended.clone(), true).unwrap();
-    let contents = page.get_key(b"/Contents").as_array().unwrap();
+    let contents = page.try_get_key(b"/Contents").unwrap().as_array().unwrap();
     assert_eq!(contents.len(), 2);
     assert!(contents[0].is_same_object_as(&prepended));
     assert!(contents[1].is_same_object_as(&first));
 
     page.add_page_contents(second.clone(), false).unwrap();
-    let contents = page.get_key(b"/Contents").as_array().unwrap();
+    let contents = page.try_get_key(b"/Contents").unwrap().as_array().unwrap();
     assert_eq!(contents.len(), 3);
     assert!(contents[2].is_same_object_as(&second));
 }
@@ -76,10 +76,16 @@ fn rotate_page_uses_the_nearest_valid_inherited_angle_and_normalizes() {
     let page = ObjectHandle::dictionary(vec![(b"/Parent".to_vec(), parent)]);
 
     page.rotate_page(180, true).unwrap();
-    assert_eq!(page.get_key(b"/Rotate").as_integer(), Some(270));
+    assert_eq!(
+        page.try_get_key(b"/Rotate").unwrap().as_integer(),
+        Some(270)
+    );
 
     page.rotate_page(-90, false).unwrap();
-    assert_eq!(page.get_key(b"/Rotate").as_integer(), Some(270));
+    assert_eq!(
+        page.try_get_key(b"/Rotate").unwrap().as_integer(),
+        Some(270)
+    );
 }
 
 #[test]
@@ -100,7 +106,7 @@ fn rotate_page_ignores_a_non_quarter_turn_inherited_angle() {
 
     page.rotate_page(90, true).unwrap();
 
-    assert_eq!(page.get_key(b"/Rotate").as_integer(), Some(90));
+    assert_eq!(page.try_get_key(b"/Rotate").unwrap().as_integer(), Some(90));
 }
 
 #[test]
@@ -109,7 +115,7 @@ fn rotate_page_stops_when_parent_is_not_a_dictionary() {
 
     page.rotate_page(90, true).unwrap();
 
-    assert_eq!(page.get_key(b"/Rotate").as_integer(), Some(90));
+    assert_eq!(page.try_get_key(b"/Rotate").unwrap().as_integer(), Some(90));
 }
 
 #[test]
@@ -275,10 +281,14 @@ fn coalesce_content_streams_installs_a_lazy_document_owned_provider() {
         .unwrap();
 
     page.coalesce_content_streams().unwrap();
-    let coalesced = page.get_key(b"/Contents");
+    let coalesced = page.try_get_key(b"/Contents").unwrap();
     assert!(coalesced.is_indirect());
     assert!(coalesced.as_stream_data().is_none());
-    assert!(!coalesced.as_stream_dict().unwrap().has_key(b"/Length"));
+    assert!(!coalesced
+        .as_stream_dict()
+        .unwrap()
+        .try_has_key(b"/Length")
+        .unwrap());
 
     assert_eq!(
         coalesced
@@ -296,7 +306,7 @@ fn coalesce_content_streams_is_a_noop_for_a_single_stream() {
 
     page.coalesce_content_streams().unwrap();
 
-    let current = page.get_key(b"/Contents");
+    let current = page.try_get_key(b"/Contents").unwrap();
     assert!(current.is_same_object_as(&content));
     assert_eq!(current.as_stream_data().unwrap().as_slice(), b"q");
 }

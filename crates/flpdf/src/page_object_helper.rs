@@ -1507,7 +1507,7 @@ impl<'a, R: Read + Seek> PageObjectHelper<'a, R> {
     /// # Errors
     ///
     /// - [`Error::Unsupported`] if the page-tree depth limit is exceeded.
-    /// - Any error from [`Pdf::resolve`].
+    /// - Any error from canonical ObjectHandle resolution.
     ///
     /// # Examples
     ///
@@ -1548,7 +1548,7 @@ impl<'a, R: Read + Seek> PageObjectHelper<'a, R> {
     /// - [`Error::Unsupported`] when `page_ref` does not resolve to a
     ///   dictionary, when `/Annots` is not an array, or when an array element
     ///   is not an indirect object handle.
-    /// - Any error from [`Pdf::resolve`].
+    /// - Any error from canonical ObjectHandle resolution.
     ///
     /// # Examples
     ///
@@ -1655,7 +1655,7 @@ impl<'a, R: Read + Seek> PageObjectHelper<'a, R> {
     ///
     /// - [`Error::Unsupported`] if the page-tree depth limit is exceeded, or
     ///   the rectangle array has fewer than 4 numeric elements.
-    /// - Any error from [`Pdf::resolve`].
+    /// - Any error from canonical ObjectHandle resolution.
     ///
     /// # Examples
     ///
@@ -2536,17 +2536,15 @@ mod tests {
 
         let root_ref = target.root_ref().expect("target has a catalog");
         let root = target.get_object_handle(root_ref);
-        target.resolve(&root).expect("resolve target catalog");
-        let acroform = target
-            .resolve_handle(&root.try_get_key(b"/AcroForm").expect("read /AcroForm key"))
-            .expect("resolve /AcroForm");
+        root.try_is_scalar().expect("resolve target catalog");
+        let acroform = root.try_get_key(b"/AcroForm").expect("read /AcroForm key");
+        acroform.try_is_scalar().expect("resolve /AcroForm");
         assert!(
             acroform.as_dictionary().is_some(),
             "the copied orphan widget must produce a destination /AcroForm"
         );
-        let fields = target
-            .resolve_handle(&acroform.try_get_key(b"/Fields").expect("read /Fields key"))
-            .expect("resolve /Fields");
+        let fields = acroform.try_get_key(b"/Fields").expect("read /Fields key");
+        fields.try_is_scalar().expect("resolve /Fields");
         assert_eq!(
             fields
                 .try_as_array()
@@ -2645,9 +2643,10 @@ mod tests {
         );
 
         let page = target.get_object_handle(new_page);
-        target.resolve(&page).expect("copied page should resolve");
-        let annots = target
-            .resolve_handle(&page.try_get_key(b"/Annots").expect("read /Annots"))
+        page.try_is_scalar().expect("copied page should resolve");
+        let annots = page.try_get_key(b"/Annots").expect("read /Annots");
+        annots
+            .try_is_scalar()
             .expect("copied annotations should resolve");
         let widget_refs: Vec<ObjectRef> = annots
             .try_as_array()
@@ -2655,8 +2654,8 @@ mod tests {
             .expect("/Annots should be present")
             .into_iter()
             .filter_map(|annotation| {
-                target
-                    .resolve(&annotation)
+                annotation
+                    .try_is_scalar()
                     .expect("annotation should resolve");
                 annotation
                     .try_is_dictionary_of_type(b"", b"Widget")
@@ -2723,17 +2722,19 @@ mod tests {
         );
 
         let page = target.get_object_handle(new_page);
-        target.resolve(&page).expect("copied page should resolve");
-        let annotation = target
-            .resolve_handle(&page.try_get_key(b"/Annots").expect("read /Annots"))
-            .expect("copied annotations should resolve")
+        page.try_is_scalar().expect("copied page should resolve");
+        let annotation = page.try_get_key(b"/Annots").expect("read /Annots");
+        annotation
+            .try_is_scalar()
+            .expect("copied annotations should resolve");
+        let annotation = annotation
             .try_as_array()
             .expect("/Annots should be an array")
             .expect("/Annots should be present")
             .into_iter()
             .next()
             .expect("copied orphan should be present");
-        target.resolve(&annotation).expect("orphan should resolve");
+        annotation.try_is_scalar().expect("orphan should resolve");
         let annotation_ref = annotation
             .object_ref()
             .expect("orphan copy should be indirect");
@@ -2761,24 +2762,33 @@ mod tests {
                 3,
             )
             .expect("valid inline-image dictionaries should convert");
-        assert_eq!(image.get_key(b"/Type").as_name(), Some(b"XObject".to_vec()));
         assert_eq!(
-            image.get_key(b"/Subtype").as_name(),
+            image.try_get_key(b"/Type").unwrap().as_name(),
+            Some(b"XObject".to_vec())
+        );
+        assert_eq!(
+            image.try_get_key(b"/Subtype").unwrap().as_name(),
             Some(b"Image".to_vec())
         );
-        assert_eq!(image.get_key(b"/BitsPerComponent").as_integer(), Some(8));
         assert_eq!(
-            image.get_key(b"/ColorSpace").as_name(),
+            image
+                .try_get_key(b"/BitsPerComponent")
+                .unwrap()
+                .as_integer(),
+            Some(8)
+        );
+        assert_eq!(
+            image.try_get_key(b"/ColorSpace").unwrap().as_name(),
             Some(b"DeviceRGB".to_vec())
         );
         assert_eq!(
-            image.get_key(b"/Filter").as_name(),
+            image.try_get_key(b"/Filter").unwrap().as_name(),
             Some(b"ASCIIHexDecode".to_vec())
         );
-        assert_eq!(image.get_key(b"/Height").as_integer(), Some(2));
-        assert_eq!(image.get_key(b"/Width").as_integer(), Some(1));
-        assert_eq!(image.get_key(b"/Length").as_integer(), Some(3));
-        assert_eq!(image.get_key(b"/Other").as_integer(), Some(5));
+        assert_eq!(image.try_get_key(b"/Height").unwrap().as_integer(), Some(2));
+        assert_eq!(image.try_get_key(b"/Width").unwrap().as_integer(), Some(1));
+        assert_eq!(image.try_get_key(b"/Length").unwrap().as_integer(), Some(3));
+        assert_eq!(image.try_get_key(b"/Other").unwrap().as_integer(), Some(5));
 
         let error = externalizer
             .convert_inline_image_dictionary(b"[]", 0)

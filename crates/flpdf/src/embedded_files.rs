@@ -42,7 +42,7 @@
 //!
 //! Any of `/Root`, `/Names`, `/EmbeddedFiles`, or the name-tree root being absent
 //! results in an empty list (`Ok(vec![])`) rather than an error. I/O errors
-//! propagate from [`Pdf::resolve`], [`crate::Error::Unsupported`] reports a
+//! propagate from canonical ObjectHandle resolution, [`crate::Error::Unsupported`] reports a
 //! structural cycle from the name-tree walker, and [`crate::Error::Internal`]
 //! reports an invalid first name-tree key, matching qpdf's iterator
 //! dereference failure.
@@ -373,7 +373,7 @@ pub const DEFAULT_MAX_EMBEDDED_FILES_DEPTH: usize = 100;
 ///
 /// # Errors
 ///
-/// Propagates any error from [`Pdf::resolve`], and returns
+/// Propagates any error from canonical ObjectHandle resolution, and returns
 /// [`crate::Error::Unsupported`] for an explicit bounded-traversal limit.
 pub fn list_embedded_files<R: Read + Seek>(pdf: &mut Pdf<R>) -> Result<Vec<(Vec<u8>, ObjectRef)>> {
     list_embedded_files_with_max_depth(pdf, DEFAULT_MAX_EMBEDDED_FILES_DEPTH)
@@ -386,7 +386,7 @@ pub fn list_embedded_files<R: Read + Seek>(pdf: &mut Pdf<R>) -> Result<Vec<(Vec<
 ///
 /// # Errors
 ///
-/// Propagates any error from [`Pdf::resolve`], and returns
+/// Propagates any error from canonical ObjectHandle resolution, and returns
 /// [`crate::Error::Unsupported`] if a `/Kids` chain depth reaches `max_depth`.
 pub fn list_embedded_files_with_max_depth<R: Read + Seek>(
     pdf: &mut Pdf<R>,
@@ -420,7 +420,7 @@ pub fn list_embedded_files_with_max_depth<R: Read + Seek>(
 ///
 /// # Errors
 ///
-/// Propagates any error from [`Pdf::resolve`].
+/// Propagates any error from canonical ObjectHandle resolution.
 pub fn insert_embedded_file<R: Read + Seek>(
     pdf: &mut Pdf<R>,
     key: &[u8],
@@ -519,7 +519,9 @@ mod tests {
         object_ref: ObjectRef,
     ) -> ObjectHandle {
         let handle = pdf.get_object_handle(object_ref);
-        pdf.resolve(&handle).expect("resolve canonical test object");
+        handle
+            .try_is_scalar()
+            .expect("resolve canonical test object");
         handle
     }
 
@@ -538,7 +540,7 @@ mod tests {
         objects
             .into_iter()
             .filter(|object| {
-                pdf.resolve(object).expect("resolve rewritten object");
+                object.try_is_scalar().expect("resolve rewritten object");
                 object.as_stream_dict().is_some()
             })
             .count()
@@ -549,12 +551,12 @@ mod tests {
         objects
             .into_iter()
             .filter(|object| {
-                pdf.resolve(object).expect("resolve rewritten object");
+                object.try_is_scalar().expect("resolve rewritten object");
                 let Some(dict) = object.as_stream_dict() else {
                     return false;
                 };
-                let kind = dict.get_key(b"/Type");
-                pdf.resolve(&kind).expect("resolve embedded stream type");
+                let kind = dict.try_get_key(b"/Type").unwrap();
+                kind.try_is_scalar().expect("resolve embedded stream type");
                 kind.as_name().as_deref() == Some(b"EmbeddedFile")
             })
             .count()
@@ -665,9 +667,14 @@ mod tests {
         let mut pdf = Pdf::open(std::io::Cursor::new(indirect_names_pdf_bytes())).expect("open");
         let catalog_ref = pdf.root_ref().expect("root");
         let catalog = pdf.get_object_handle(catalog_ref);
-        pdf.resolve(&catalog).expect("resolve catalog");
-        let retained_root = catalog.get_key(b"/Names").get_key(b"/EmbeddedFiles");
-        pdf.resolve(&retained_root)
+        catalog.try_is_scalar().expect("resolve catalog");
+        let retained_root = catalog
+            .try_get_key(b"/Names")
+            .unwrap()
+            .try_get_key(b"/EmbeddedFiles")
+            .unwrap();
+        retained_root
+            .try_is_scalar()
             .expect("resolve embedded-files root");
 
         let filespec_ref = ObjectRef::new(90, 0);
@@ -675,7 +682,8 @@ mod tests {
         insert_embedded_file(&mut pdf, b"new.txt", filespec_ref).expect("insert");
 
         let pairs = retained_root
-            .get_key(b"/Names")
+            .try_get_key(b"/Names")
+            .unwrap()
             .as_array()
             .expect("retained names array");
         assert_eq!(pairs.len(), 4, "the retained root must observe insertion");
@@ -708,7 +716,7 @@ mod tests {
             .expect("replace page /AF");
 
         let retained_af = pdf.get_object_handle(af_ref);
-        pdf.resolve(&retained_af).expect("resolve AF array");
+        retained_af.try_is_scalar().expect("resolve AF array");
 
         assert!(
             remove_attachment(&mut pdf, b"retained-af.txt").expect("remove"),
@@ -734,8 +742,12 @@ mod tests {
         replace_catalog_key(&mut pdf, b"/Names", names);
 
         let catalog_handle = catalog_handle(&mut pdf);
-        let retained_root = catalog_handle.get_key(b"/Names").get_key(b"/EmbeddedFiles");
-        let retained_pairs = retained_root.get_key(b"/Names");
+        let retained_root = catalog_handle
+            .try_get_key(b"/Names")
+            .unwrap()
+            .try_get_key(b"/EmbeddedFiles")
+            .unwrap();
+        let retained_pairs = retained_root.try_get_key(b"/Names").unwrap();
 
         let filespec_ref = ObjectRef::new(90, 0);
         set_test_object(&mut pdf, filespec_ref, handle_dictionary(Vec::new()));
@@ -746,7 +758,8 @@ mod tests {
 
         assert!(
             retained_root
-                .get_key(b"/Names")
+                .try_get_key(b"/Names")
+                .unwrap()
                 .as_array()
                 .is_some_and(|pairs| pairs.len() == 2),
             "a retained direct root must observe helper replacement"
@@ -766,7 +779,8 @@ mod tests {
             .expect("remove"));
         assert_eq!(
             retained_root
-                .get_key(b"/Names")
+                .try_get_key(b"/Names")
+                .unwrap()
                 .as_array()
                 .expect("names array")
                 .len(),
@@ -806,11 +820,17 @@ mod tests {
         replace_catalog_key(&mut pdf, b"/Names", names);
 
         let catalog_handle = catalog_handle(&mut pdf);
-        let retained_root = catalog_handle.get_key(b"/Names").get_key(b"/EmbeddedFiles");
-        pdf.resolve(&retained_root)
+        let retained_root = catalog_handle
+            .try_get_key(b"/Names")
+            .unwrap()
+            .try_get_key(b"/EmbeddedFiles")
+            .unwrap();
+        retained_root
+            .try_is_scalar()
             .expect("resolve embedded-files root");
         let retained_filespec = retained_root
-            .get_key(b"/Names")
+            .try_get_key(b"/Names")
+            .unwrap()
             .as_array()
             .expect("names array")[1]
             .clone();
@@ -842,12 +862,13 @@ mod tests {
             .replace_key(b"/F", ObjectHandle::string(b"new.txt".to_vec()))
             .unwrap();
         let current_filespec = retained_root
-            .get_key(b"/Names")
+            .try_get_key(b"/Names")
+            .unwrap()
             .as_array()
             .expect("updated names array")[1]
             .clone();
         assert_eq!(
-            current_filespec.get_key(b"/F").as_string(),
+            current_filespec.try_get_key(b"/F").unwrap().as_string(),
             Some(b"new.txt".to_vec())
         );
     }
@@ -876,7 +897,11 @@ mod tests {
         replace_catalog_key(&mut pdf, b"/Names", names);
 
         let catalog_handle = catalog_handle(&mut pdf);
-        let retained_root = catalog_handle.get_key(b"/Names").get_key(b"/EmbeddedFiles");
+        let retained_root = catalog_handle
+            .try_get_key(b"/Names")
+            .unwrap()
+            .try_get_key(b"/EmbeddedFiles")
+            .unwrap();
 
         let filespec_ref = ObjectRef::new(90, 0);
         set_test_object(&mut pdf, filespec_ref, handle_dictionary(Vec::new()));
@@ -887,7 +912,8 @@ mod tests {
 
         assert!(
             retained_root
-                .get_key(b"/Kids")
+                .try_get_key(b"/Kids")
+                .unwrap()
                 .as_array()
                 .and_then(|kids| kids.first().cloned())
                 .is_some_and(|kid| kid.is_indirect()),
@@ -910,9 +936,14 @@ mod tests {
         replace_catalog_key(&mut pdf, b"/Names", names);
 
         let catalog_handle = catalog_handle(&mut pdf);
-        let retained_root = catalog_handle.get_key(b"/Names").get_key(b"/EmbeddedFiles");
+        let retained_root = catalog_handle
+            .try_get_key(b"/Names")
+            .unwrap()
+            .try_get_key(b"/EmbeddedFiles")
+            .unwrap();
         let retained_filespec = retained_root
-            .get_key(b"/Names")
+            .try_get_key(b"/Names")
+            .unwrap()
             .as_array()
             .expect("names array")[1]
             .clone();
@@ -928,12 +959,13 @@ mod tests {
             .replace_key(b"/F", ObjectHandle::string(b"new.txt".to_vec()))
             .unwrap();
         let current_filespec = retained_root
-            .get_key(b"/Names")
+            .try_get_key(b"/Names")
+            .unwrap()
             .as_array()
             .expect("updated names array")[1]
             .clone();
         assert_eq!(
-            current_filespec.get_key(b"/F").as_string(),
+            current_filespec.try_get_key(b"/F").unwrap().as_string(),
             Some(b"new.txt".to_vec())
         );
     }
@@ -995,7 +1027,11 @@ mod tests {
             .build(&mut pdf)
             .expect("build filespec");
         let filespec = resolved_handle(&mut pdf, fs_ref);
-        let ef_dict = filespec.get_key(b"/EF").as_dictionary().expect("/EF dict");
+        let ef_dict = filespec
+            .try_get_key(b"/EF")
+            .unwrap()
+            .as_dictionary()
+            .expect("/EF dict");
         let ef_ref = ObjectRef::new(fs_ref.number + 100, 0);
         let ef_handle = ObjectHandle::dictionary(ef_dict.into_iter().collect());
         set_test_object(&mut pdf, ef_ref, ef_handle);
@@ -1095,7 +1131,7 @@ mod tests {
         // Catalog /AF and its null Filespec reference remain.
         let catalog2 = catalog_handle(&mut pdf);
         assert_eq!(
-            catalog2.get_key(b"/AF").object_ref(),
+            catalog2.try_get_key(b"/AF").unwrap().object_ref(),
             Some(af_array_ref),
             "catalog /AF must remain in place"
         );
@@ -1167,7 +1203,7 @@ mod tests {
         // Page /AF must still point at the surviving shared array.
         let page_after = resolved_handle(&mut pdf, page_ref);
         assert_eq!(
-            page_after.get_key(b"/AF").object_ref(),
+            page_after.try_get_key(b"/AF").unwrap().object_ref(),
             Some(af_array_ref),
             "page /AF must still point at the surviving shared array"
         );
@@ -1233,7 +1269,8 @@ mod tests {
         // The /Dests reference itself must remain intact.
         let leaf = resolved_handle(&mut pdf, dests_leaf_ref);
         let names = leaf
-            .get_key(b"/Names")
+            .try_get_key(b"/Names")
+            .unwrap()
             .as_array()
             .expect("dests leaf names");
         assert!(
@@ -1378,10 +1415,11 @@ mod tests {
 
         // The builder points /EF /F and /EF /UF at one stream; capture it.
         let filespec = resolved_handle(&mut pdf, fs_ref);
-        let ef = filespec.get_key(b"/EF");
+        let ef = filespec.try_get_key(b"/EF").unwrap();
         assert!(ef.as_dictionary().is_some(), "expected inline /EF dict");
         let stream_f = ef
-            .get_key(b"/F")
+            .try_get_key(b"/F")
+            .unwrap()
             .object_ref()
             .expect("expected /EF /F indirect stream");
 
@@ -1464,7 +1502,7 @@ mod tests {
         );
         let catalog2 = catalog_handle(&mut pdf);
         assert!(
-            catalog2.get_key(b"/AF").object_ref() == Some(af_array_ref),
+            catalog2.try_get_key(b"/AF").unwrap().object_ref() == Some(af_array_ref),
             "catalog /AF must still point at the untouched indirect array"
         );
     }
@@ -1521,7 +1559,11 @@ mod tests {
         // qpdf leaves the associated-files reference in place; the Filespec
         // object itself is replaced with null by removeEmbeddedFile.
         let catalog2 = catalog_handle(&mut pdf);
-        let catalog_af = catalog2.get_key(b"/AF").as_array().expect("catalog /AF");
+        let catalog_af = catalog2
+            .try_get_key(b"/AF")
+            .unwrap()
+            .as_array()
+            .expect("catalog /AF");
         assert_eq!(
             catalog_af.len(),
             1,
@@ -1536,7 +1578,11 @@ mod tests {
 
         // The page's /AF reference is retained too.
         let page_dict2 = resolved_handle(&mut pdf, page_ref);
-        let page_af = page_dict2.get_key(b"/AF").as_array().expect("page /AF");
+        let page_af = page_dict2
+            .try_get_key(b"/AF")
+            .unwrap()
+            .as_array()
+            .expect("page /AF");
         assert_eq!(
             page_af.len(),
             1,
@@ -1675,7 +1721,7 @@ mod tests {
             .expect("direct Filespec entry");
         assert!(filespec.as_dictionary().is_some());
         assert_eq!(
-            filespec.get_key(b"/F").as_string(),
+            filespec.try_get_key(b"/F").unwrap().as_string(),
             Some(b"direct.txt".to_vec())
         );
     }
@@ -1700,7 +1746,8 @@ mod tests {
         // and add a surviving sibling key.
         let catalog = catalog_handle(&mut pdf);
         let terminal = catalog
-            .get_key(b"/Names")
+            .try_get_key(b"/Names")
+            .unwrap()
             .shallow_copy()
             .expect("copy direct names");
         // /Dests as a small inline dict: survives writer output because it is
@@ -1726,7 +1773,8 @@ mod tests {
         // qpdf modifies the indirect names dictionary in place.
         let catalog_after = catalog_handle(&mut pdf);
         let names_after = catalog_after
-            .get_key(b"/Names")
+            .try_get_key(b"/Names")
+            .unwrap()
             .object_ref()
             .expect("catalog /Names must still be indirect");
         assert_eq!(names_after, terminal_ref);
@@ -1734,10 +1782,10 @@ mod tests {
         // The terminal retains its sibling and an empty EmbeddedFiles tree.
         let names_dict = resolved_handle(&mut pdf, terminal_ref);
         assert!(
-            names_dict.has_key(b"/Dests"),
+            names_dict.try_has_key(b"/Dests").unwrap(),
             "terminal /Names dict must retain the surviving /Dests sibling"
         );
-        assert!(names_dict.has_key(b"/EmbeddedFiles"));
+        assert!(names_dict.try_has_key(b"/EmbeddedFiles").unwrap());
     }
 
     // ── Test: non-empty rebuild with a *direct* (inline) /Names dict ──────────
@@ -1766,7 +1814,8 @@ mod tests {
         // /Names stays direct and retains /Dests.
         let catalog_after = catalog_handle(&mut pdf);
         let names_after = catalog_after
-            .get_key(b"/Names")
+            .try_get_key(b"/Names")
+            .unwrap()
             .as_dictionary()
             .expect("/Names direct after insert");
         assert!(
@@ -1798,7 +1847,8 @@ mod tests {
         // the catalog reaches /EmbeddedFiles through a *direct* /Names dict.
         let catalog = catalog_handle(&mut pdf);
         let names = catalog
-            .get_key(b"/Names")
+            .try_get_key(b"/Names")
+            .unwrap()
             .shallow_copy()
             .expect("copy direct Names");
         names
@@ -1816,7 +1866,8 @@ mod tests {
         // /EmbeddedFiles tree are preserved.
         let catalog_after = catalog_handle(&mut pdf);
         let names_after = catalog_after
-            .get_key(b"/Names")
+            .try_get_key(b"/Names")
+            .unwrap()
             .as_dictionary()
             .expect("/Names must remain a direct dict");
         assert!(

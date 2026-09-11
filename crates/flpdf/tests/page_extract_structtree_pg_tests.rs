@@ -102,10 +102,10 @@ fn dangling_pg_dropped_and_page_gced() {
 
     // The StructElem pointing at the removed page loses its /Pg key entirely.
     let elem: ObjectHandle = pdf.get_object_handle(ObjectRef::new(21, 0));
-    pdf.resolve(&elem).expect("elem 21");
+    elem.try_is_scalar().expect("elem 21");
     assert!(elem.as_dictionary().is_some(), "elem 21 is a dict");
     assert!(
-        !elem.has_key(b"/Pg"),
+        !elem.try_has_key(b"/Pg").unwrap(),
         "StructElem 21 /Pg (removed page) must be dropped"
     );
 
@@ -119,10 +119,10 @@ fn dangling_pg_dropped_and_page_gced() {
 
     // The StructElem pointing at a surviving page keeps its /Pg.
     let elem: ObjectHandle = pdf.get_object_handle(ObjectRef::new(22, 0));
-    pdf.resolve(&elem).expect("elem 22");
+    elem.try_is_scalar().expect("elem 22");
     assert!(elem.as_dictionary().is_some(), "elem 22 is a dict");
     assert!(
-        elem.get_key(b"/Pg").object_ref() == Some(ObjectRef::new(3, 0)),
+        elem.try_get_key(b"/Pg").unwrap().object_ref() == Some(ObjectRef::new(3, 0)),
         "StructElem 22 /Pg (surviving page 1) must be kept"
     );
 

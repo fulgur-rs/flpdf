@@ -644,7 +644,7 @@ impl<R: Read + Seek> Pdf<R> {
     ///
     /// - Propagates any error from resolving the catalog, `/AcroForm`, and
     ///   field-tree objects (for example I/O or parse failures surfaced by
-    ///   [`Pdf::resolve`]).
+    ///   canonical ObjectHandle resolution).
     /// - [`Error::Parse`] when a signature field's `/ByteRange` is malformed (not a
     ///   four-element array of non-negative integers).
     pub fn signatures(&mut self) -> Result<Vec<crate::SignatureInfo>> {
@@ -1479,46 +1479,13 @@ impl<R: Read + Seek> Pdf<R> {
         self.resolver.fix_dangling_references()
     }
 
-    /// Resolve `handle` in place if it is an unresolved indirect handle.
-    ///
-    /// A direct handle, or an indirect handle that has already been resolved,
-    /// is a no-op. Resolution is delegated directly to the canonical
-    /// `ResolverHandle` cache; it never materializes an independent value
-    /// snapshot.
-    ///
-    /// qpdf's typed `QPDFObjectHandle` accessors call `QPDF::resolve` lazily
-    /// and retain the same shared object identity: resolving the same
-    /// indirect reference more than once yields handles that alias the same
-    /// cached value rather than independent copies.
-    ///
-    /// This resolves the supplied canonical handle once and leaves any
-    /// already-resolved value in place; callers that need a terminal child
-    /// explicitly resolve the child handle they obtained from the value.
-    ///
-    /// The canonical parser records source descriptions and offsets while it
-    /// builds the graph. Streams retain their source filter dictionaries and
-    /// are decrypted at pipe time, matching qpdf's `QPDF_Stream` path.
-    ///
-    /// # Errors
-    ///
-    /// I/O, parse, filter, or decryption failures propagate. Free, absent, or
-    /// overridden references resolve to the canonical null fallback.
+    /// Compatibility-only explicit resolution for the qtest-driver binary.
+    /// Normal library users must use the resolving `try_*` accessors; qpdf has
+    /// no public explicit `QPDF::resolve` handle facade.
+    #[cfg(feature = "qtest-driver")]
+    #[doc(hidden)]
     pub fn resolve(&mut self, handle: &ObjectHandle) -> Result<()> {
-        // ObjectHandle resolution is qpdf's canonical cache operation. The
-        // resolver owns the source xref table, live parser, stream pipeline,
-        // and one handle per object reference; no raw Object materialization
-        // or metadata-only reparse belongs on this path.
         handle.try_dereference()
-    }
-
-    /// Resolve one canonical handle and return the same identity. This is a
-    /// small convenience for callers that need an owned handle after the
-    /// resolver call; it does not chase stored reference values because the
-    /// canonical value model has no reference-as-value variant.
-    #[cfg(test)]
-    pub(crate) fn resolve_handle(&mut self, handle: &ObjectHandle) -> Result<ObjectHandle> {
-        self.resolve(handle)?;
-        Ok(handle.clone())
     }
 
     /// Read a linearization hint object and retain qpdf's source position for
