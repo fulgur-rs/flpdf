@@ -2422,7 +2422,7 @@ mod object_emitter_tests {
         }];
         pdf.set_writer_object_order(BTreeMap::from([(
             member_id,
-            crate::pdf::WriterObjectOrderKey::foreign_with_original(
+            crate::pdf::WriterObjectOrderKey::foreign_with_allocation_identity(
                 member_id,
                 ObjectRef::new(12, 1),
             ),

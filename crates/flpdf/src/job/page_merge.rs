@@ -1401,7 +1401,7 @@ fn merge_documents_with_resource_decisions_and_preserve_primary_into_impl<
             let order_key = if is_primary {
                 WriterObjectOrderKey::primary(source_ref)
             } else {
-                WriterObjectOrderKey::foreign_with_original(
+                WriterObjectOrderKey::foreign_with_allocation_identity(
                     target_ref,
                     foreign_originals
                         .get(&target_ref)

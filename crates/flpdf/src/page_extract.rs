@@ -317,7 +317,7 @@ pub(crate) fn append_selection_kids<RT: Read + Seek>(
             // cov:ignore-end
             writer_object_order.insert(
                 clone_ref,
-                WriterObjectOrderKey::foreign_with_original(clone_ref, original_ref),
+                WriterObjectOrderKey::foreign_with_allocation_identity(clone_ref, original_ref),
             );
             clone_ref
         };

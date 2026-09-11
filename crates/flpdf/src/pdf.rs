@@ -23,6 +23,10 @@ use std::rc::Rc;
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
 pub(crate) struct WriterObjectOrderKey {
     group: u8,
+    /// qpdf's destination allocation rank for foreign/page occurrences.
+    /// Primary and fresh objects have no occurrence rank and retain their
+    /// existing group-local reference ordering.
+    occurrence_rank: Option<u32>,
     object_ref: ObjectRef,
     original_object_ref: Option<ObjectRef>,
 }
@@ -31,6 +35,7 @@ impl WriterObjectOrderKey {
     pub(crate) const fn primary(object_ref: ObjectRef) -> Self {
         Self {
             group: 0,
+            occurrence_rank: None,
             object_ref,
             original_object_ref: Some(object_ref),
         }
@@ -40,25 +45,28 @@ impl WriterObjectOrderKey {
     pub(crate) const fn foreign(object_ref: ObjectRef) -> Self {
         Self {
             group: 1,
+            occurrence_rank: None,
             object_ref,
             original_object_ref: None,
         }
     }
 
-    pub(crate) const fn foreign_with_original(
+    pub(crate) const fn foreign_with_allocation_identity(
         object_ref: ObjectRef,
-        original_object_ref: ObjectRef,
+        allocation_identity: ObjectRef,
     ) -> Self {
         Self {
             group: 1,
+            occurrence_rank: Some(allocation_identity.number),
             object_ref,
-            original_object_ref: Some(original_object_ref),
+            original_object_ref: Some(allocation_identity),
         }
     }
 
     pub(crate) const fn fresh(object_ref: ObjectRef) -> Self {
         Self {
             group: 2,
+            occurrence_rank: None,
             object_ref,
             original_object_ref: None,
         }
@@ -707,6 +715,23 @@ mod tests {
         assert_eq!(
             pdf.writer_object_order_key(fresh_ref),
             WriterObjectOrderKey::fresh(fresh_ref)
+        );
+    }
+
+    #[test]
+    fn writer_order_uses_foreign_occurrence_rank_before_target_ref() {
+        let first_occurrence = WriterObjectOrderKey::foreign_with_allocation_identity(
+            ObjectRef::new(100, 0),
+            ObjectRef::new(1, 0),
+        );
+        let second_occurrence = WriterObjectOrderKey::foreign_with_allocation_identity(
+            ObjectRef::new(2, 0),
+            ObjectRef::new(2, 0),
+        );
+
+        assert!(
+            first_occurrence < second_occurrence,
+            "foreign writer ordering must follow occurrence rank before target reference"
         );
     }
 }
