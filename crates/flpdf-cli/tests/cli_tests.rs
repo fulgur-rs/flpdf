@@ -83,6 +83,60 @@ fn check_accepts_ignore_xref_streams_on_a_clean_pdf() {
 }
 
 #[test]
+fn check_reframes_non_qpdf_exception_like_qpdf_resolve() {
+    if !qpdf_available() {
+        return;
+    }
+    let mut input = tempfile::NamedTempFile::new().unwrap();
+    let mut pdf = b"%PDF-1.4\n".to_vec();
+    let object_one = pdf.len();
+    pdf.extend_from_slice(
+        b"1 0 obj\n<< /Type /Catalog /Pages 2 0 R /Probe 3000000000 0 R >>\nendobj\n",
+    );
+    let object_two = pdf.len();
+    pdf.extend_from_slice(b"2 0 obj\n<< /Type /Pages /Kids [] /Count 0 >>\nendobj\n");
+    let xref = pdf.len();
+    pdf.extend_from_slice(
+        format!(
+            "xref\n0 3\n0000000000 65535 f \n{object_one:010} 00000 n \n{object_two:010} 00000 n \n"
+        )
+        .as_bytes(),
+    );
+    pdf.extend_from_slice(
+        format!("trailer\n<< /Size 3 /Root 1 0 R >>\nstartxref\n{xref}\n%%EOF\n").as_bytes(),
+    );
+    input.write_all(&pdf).unwrap();
+
+    let qpdf = ProcessCommand::new("qpdf")
+        .args(["--check"])
+        .arg(input.path())
+        .output()
+        .unwrap();
+    let flpdf = Command::cargo_bin("flpdf")
+        .unwrap()
+        .args(["--check"])
+        .arg(input.path())
+        .output()
+        .unwrap();
+
+    assert_eq!(flpdf.status.code(), qpdf.status.code());
+    let qpdf_stderr = String::from_utf8_lossy(&qpdf.stderr).replace("\r\n", "\n");
+    let flpdf_stderr = String::from_utf8_lossy(&flpdf.stderr).replace("\r\n", "\n");
+    let qpdf_lines: Vec<_> = qpdf_stderr.lines().collect();
+    let flpdf_lines: Vec<_> = flpdf_stderr.lines().collect();
+    assert_eq!(flpdf_lines.first(), qpdf_lines.first());
+    let qpdf_tail = qpdf_lines[1..]
+        .iter()
+        .map(|line| line.replacen("qpdf:", "flpdf:", 1))
+        .collect::<Vec<_>>();
+    let flpdf_tail = flpdf_lines[1..]
+        .iter()
+        .map(|line| (*line).to_owned())
+        .collect::<Vec<_>>();
+    assert_eq!(flpdf_tail, qpdf_tail);
+}
+
+#[test]
 fn top_level_object_streams_modes_reach_the_writer() {
     let temp = tempfile::tempdir().unwrap();
     let input = "../../tests/fixtures/compat/one-page.pdf";

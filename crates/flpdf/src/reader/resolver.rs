@@ -2633,6 +2633,20 @@ impl<R: Read + Seek> ResolverHandle<R> {
         Ok(())
     }
 
+    /// Convert the parser's QIntC narrowing failure into qpdf's runtime-error
+    /// category before it reaches the resolve catch. QPDFParser's `range_error`
+    /// is a `std::exception`, not a QPDFExc (`QPDFParser.cc:151-178`).
+    fn reframe_qpdf_int_runtime_error(error: Error) -> Error {
+        match error {
+            Error::Parse { message, .. }
+                if message.starts_with("integer out of range converting ") =>
+            {
+                Error::System(message)
+            }
+            error => error,
+        }
+    }
+
     /// Preserve the source position carried by qpdf's `QPDFExc` when its
     /// resolve catch turns a structural failure into a warning. qpdf's
     /// `QPDF::warn` receives the exception unchanged (`QPDF.cc:1737-1741`),
@@ -5272,7 +5286,9 @@ impl<R: Read + Seek> ResolverHandle<R> {
                         }
                         Ok(())
                     }
-                    Err(ReadObjectAtOffsetError::Body(error)) => Err(error),
+                    Err(ReadObjectAtOffsetError::Body(error)) => {
+                        Err(Self::reframe_qpdf_int_runtime_error(error))
+                    }
                     Err(ReadObjectAtOffsetError::Header(error)) if attempt_recovery => {
                         match self.reconstruct_xref_and_retry(error, object_gen) {
                             Ok(Some(parsed)) => {
@@ -11950,17 +11966,12 @@ mod tests {
     }
 
     #[test]
-    fn a_caught_parse_failure_preserves_its_warning_offset() {
+    fn a_caught_runtime_parse_failure_reframes_without_an_offset() {
         let malformed_body = b"2 0 obj\n[ 2147483648 0 R ]\nendobj\n";
         let bytes = pdf_with_bodies(&[
             b"1 0 obj\n<< /Type /Catalog >>\nendobj\n".to_vec(),
             malformed_body.to_vec(),
         ]);
-        let malformed_at = bytes
-            .windows(b"2147483648".len())
-            .position(|window| window == b"2147483648")
-            .expect("the fixture must contain the malformed integer");
-
         let mut pdf = Pdf::open_mem_owned(bytes).expect("open");
         let handle: ObjectHandle = pdf.get_object_handle(ObjectRef::new(2, 0));
         pdf.resolve(&handle)
@@ -11977,7 +11988,13 @@ mod tests {
                     .contains("integer out of range converting 2147483648")
             })
             .expect("the caught parse failure must be warned");
-        assert_eq!(warning.get_file_position(), malformed_at as i64);
+        assert_eq!(warning.get_file_position(), 0);
+        assert_eq!(
+            warning.message_string(),
+            format!(
+                "object 2/0: error reading object: integer out of range converting 2147483648 from a 8-byte signed type to a 4-byte signed type"
+            )
+        );
     }
 
     #[test]
