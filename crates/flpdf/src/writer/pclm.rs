@@ -37,7 +37,7 @@ pub(crate) struct Plan {
 impl Plan {
     pub(crate) fn build<R: Read + Seek>(pdf: &mut Pdf<R>) -> Result<Self> {
         let root_candidate = pdf.trailer_key_handle(b"Root");
-        if root_candidate.is_null() {
+        if root_candidate.try_is_null()? {
             return Err(crate::Error::Missing("/Root"));
         }
         let root_handle = pdf.root_handle()?;
@@ -54,13 +54,13 @@ impl Plan {
             builder.enqueue_reference(page);
 
             let page_handle = builder.pdf.get_object_handle(page);
-            builder.pdf.resolve(&page_handle)?;
+            page_handle.try_dereference()?;
             if page_handle.try_as_dictionary()?.is_none() {
                 continue; // cov:ignore: page_refs yields only dictionary /Type /Page leaves
             }
 
             let contents = page_handle.try_get_key(b"/Contents")?;
-            if !contents.is_null() {
+            if !contents.try_is_null()? {
                 builder.enqueue_handle_with_stream_length_policy(&contents)?;
             }
 
@@ -84,7 +84,7 @@ impl Plan {
                 continue;
             };
             let source_handle = builder.pdf.get_object_handle(source);
-            builder.pdf.resolve(&source_handle)?;
+            source_handle.try_dereference()?;
             let mut references = Vec::new();
             collect_canonical_children(builder.pdf, &source_handle, 0, true, &mut references)?;
             for reference in references {
@@ -218,6 +218,25 @@ mod tests {
         .expect("rootless fixture must open");
 
         let error = Plan::build(&mut pdf).expect_err("PCLm requires a trailer /Root");
+        assert!(matches!(error, crate::Error::Missing("/Root")));
+    }
+
+    #[test]
+    fn plan_rejects_an_indirect_null_root_at_the_qpdf_accessor_boundary() {
+        let mut bytes = b"%PDF-1.3\n".to_vec();
+        let object_offset = bytes.len();
+        bytes.extend_from_slice(b"1 0 obj\nnull\nendobj\n");
+        let xref_offset = bytes.len();
+        bytes.extend_from_slice(
+            format!("xref\n0 2\n0000000000 65535 f \n{object_offset:010} 00000 n \n").as_bytes(),
+        );
+        bytes.extend_from_slice(
+            format!("trailer\n<< /Size 2 /Root 1 0 R >>\nstartxref\n{xref_offset}\n%%EOF\n")
+                .as_bytes(),
+        );
+        let mut pdf = Pdf::open(Cursor::new(bytes)).expect("indirect-null-root fixture must open");
+
+        let error = Plan::build(&mut pdf).expect_err("an indirect null Root is missing");
         assert!(matches!(error, crate::Error::Missing("/Root")));
     }
 

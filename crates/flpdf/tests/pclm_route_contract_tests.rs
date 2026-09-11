@@ -26,3 +26,24 @@ fn pclm_planning_and_emission_do_not_materialize_legacy_objects() {
         "PCLm emission must not rebuild a legacy Object snapshot"
     );
 }
+
+#[test]
+fn pclm_planning_uses_canonical_resolving_accessors() {
+    let pclm = production_source(include_str!("../src/writer/pclm.rs"));
+
+    for forbidden in [
+        ".resolve(",
+        ".resolve_handle(",
+        ".resolve_handle_ref(",
+        ".is_null(",
+    ] {
+        assert!(
+            !pclm.contains(forbidden),
+            "PCLm planning retains legacy accessor route {forbidden}"
+        );
+    }
+    assert!(
+        pclm.contains("try_dereference") && pclm.contains("try_is_null"),
+        "PCLm planning must use canonical resolving accessors"
+    );
+}
