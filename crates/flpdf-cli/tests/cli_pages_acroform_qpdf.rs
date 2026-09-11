@@ -14,6 +14,10 @@ use std::process::Command as Shell;
 const QPDF: &str = "/usr/bin/qpdf";
 const EXPECTED_QPDF_VERSION: &str = "11.9.0";
 const FIXTURE: &str = "../../tests/fixtures/compat/acroform-sig-widget.pdf";
+const PROVENANCE_ORDER_FIXTURES: [&str; 2] = [
+    "../../tests/fixtures/compat/acroform-sig-nonterminal-parent.pdf",
+    "../../tests/fixtures/compat/acroform-sig-parent-pure-widget-kid.pdf",
+];
 const NO_ACROFORM_FIXTURE: &str = "../../tests/fixtures/compat/link-annot-no-acroform.pdf";
 const MULTI_PAGE_FIXTURE: &str =
     "../../tests/fixtures/compat/objstm-lin-acroform-widget-page1-page2.pdf";
@@ -2315,11 +2319,13 @@ fn foreign_source_allocator_identities_match_qpdf() {
     let manifest = Path::new(env!("CARGO_MANIFEST_DIR"));
     let primary = manifest.join("../../tests/fixtures/compat/three-page.pdf");
 
-    for foreign in [
-        FIXTURE,
-        NO_ACROFORM_FIXTURE,
-        "../../tests/fixtures/compat/form-fields-and-annotations.pdf",
-    ] {
+    let foreign_fixtures = std::iter::once(FIXTURE)
+        .chain(std::iter::once(NO_ACROFORM_FIXTURE))
+        .chain(std::iter::once(
+            "../../tests/fixtures/compat/form-fields-and-annotations.pdf",
+        ))
+        .chain(PROVENANCE_ORDER_FIXTURES);
+    for foreign in foreign_fixtures {
         let foreign = manifest.join(foreign);
 
         let qpdf_output = temp.path().join("qpdf.pdf");

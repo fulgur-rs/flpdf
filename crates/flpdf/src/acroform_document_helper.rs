@@ -1043,19 +1043,32 @@ impl<'a, R: Read + Seek> AcroFormDocumentHelper<'a, R> {
                     let copied_top = self
                         .copy_transform_object(&copied_source_top, &mut orig_to_copy)?
                         .expect("copy_transform_object always returns a non-stream clone");
-                    if foreign_resources.is_none() {
-                        foreign_resources = Some(self.prepare_foreign_resource_plan(
-                            copied_source_resources.clone(),
-                            source_defaults.need_appearances,
-                        )?); // cov:ignore: LLVM maps this multiline resource-plan call to a defensive continuation edge
-                    }
-                    let copied_top = self.copy_field_tree_with_copied_top(
-                        &copied_source_top,
-                        copied_top,
-                        &mut orig_to_copy,
-                        Some(&inherited_overrides),
-                        foreign_resources.as_ref(),
-                    )?; // cov:ignore: LLVM maps this multiline field-tree call to a defensive continuation edge
+                    let copied_top = if let Some(foreign_resources) = foreign_resources.as_ref() {
+                        self.copy_field_tree_with_copied_top(
+                            &copied_source_top,
+                            copied_top,
+                            &mut orig_to_copy,
+                            Some(&inherited_overrides),
+                            Some(foreign_resources),
+                        )? // cov:ignore: LLVM maps this multiline field-tree call to a defensive continuation edge
+                    } else {
+                        // qpdf copies the top field and its immediate /Kids before
+                        // lazily creating the destination /AcroForm and /DR
+                        // (`QPDFAcroFormDocumentHelper.cc:811-823,914-917`).
+                        // Preparing resources before the tree walk would assign
+                        // those identities before the first widget.
+                        let (copied_top, resources) = self
+                            .copy_field_tree_with_lazy_foreign_resources(
+                                &copied_source_top,
+                                copied_top,
+                                &mut orig_to_copy,
+                                Some(&inherited_overrides),
+                                copied_source_resources.clone(),
+                                source_defaults.need_appearances,
+                            )?; // cov:ignore: LLVM maps this multiline field-tree call to a defensive continuation edge
+                        foreign_resources = Some(resources);
+                        copied_top
+                    };
                     if let Some(copied_ref) = copied_top.object_ref() {
                         if added_new_fields.insert(copied_ref) {
                             transformed.new_fields.push(copied_top);
@@ -1175,48 +1188,113 @@ impl<'a, R: Read + Seek> AcroFormDocumentHelper<'a, R> {
         let mut seen = HashSet::new();
 
         while let Some((source, copied)) = queue.pop_front() {
-            source.try_dereference()?;
-            if !seen.insert(source.identity_key()) {
-                continue;
-            }
-
-            let parent = copied.try_get_key(b"/Parent")?;
-            if !parent.try_is_null()? {
-                parent.try_dereference()?;
-                if let Some(parent_copy) = orig_to_copy.get(&parent.identity_key()) {
-                    copied.replace_key(b"/Parent", parent_copy.clone())?;
-                } else {
-                    parent.warn_if_possible(
-                        "while traversing an AcroForm field, found a parent that had not been seen",
-                    )?; // cov:ignore: warning continuation is an llvm-cov defensive error-edge artifact
-                }
-            }
-
-            let kids_holder = copied.try_get_key(b"/Kids")?;
-            kids_holder.try_dereference()?;
-            // qpdf's `if (kids.isArray()) { ... }` (`QPDFAcroFormDocumentHelper.cc:900-909`)
-            // is a plain conditional, not an early exit: a terminal field with
-            // no `/Kids` still falls through to the unconditional
-            // `adjustInheritedFields` call below (`:914-917`).
-            if let Some(kids) = kids_holder.try_as_array()? {
-                for (index, kid) in kids.into_iter().enumerate() {
-                    kid.try_dereference()?;
-                    let Some(copied_kid) = self.copy_transform_object(&kid, orig_to_copy)? else {
-                        continue; // cov:ignore: defensive compatibility arm; stream copies now propagate qpdf's clone error
-                    };
-                    kids_holder.set_array_item(index, copied_kid.clone())?;
-                    queue.push_back((kid, copied_kid));
-                }
-            }
-            if let Some(inherited_overrides) = inherited_overrides {
-                self.adjust_inherited_field(&copied, inherited_overrides)?;
-            }
-            if let Some(foreign_resources) = foreign_resources {
-                self.adjust_foreign_field_resources(&copied, foreign_resources)?;
-            }
+            self.copy_field_tree_node(
+                (source, copied),
+                orig_to_copy,
+                &mut seen,
+                &mut queue,
+                inherited_overrides,
+                foreign_resources,
+            )?; // cov:ignore: LLVM attributes this multiline helper-call continuation to the defensive error edge
         }
 
         Ok(copied_top)
+    }
+
+    /// Copy the first foreign field tree with qpdf's lazy `/AcroForm`/`/DR`
+    /// allocation boundary.
+    #[allow(clippy::mutable_key_type)]
+    fn copy_field_tree_with_lazy_foreign_resources(
+        &mut self,
+        top_field: &ObjectHandle,
+        copied_top: ObjectHandle,
+        orig_to_copy: &mut HashMap<ObjectHandleIdentity, ObjectHandle>,
+        inherited_overrides: Option<&InheritedFieldOverrides>,
+        source_resources: Option<ObjectHandle>,
+        source_need_appearances: bool,
+    ) -> Result<(ObjectHandle, ForeignResourcePlan)> {
+        let mut queue = VecDeque::from([(top_field.clone(), copied_top.clone())]);
+        let mut seen = HashSet::new();
+        let (source, copied) = queue
+            .pop_front()
+            .expect("lazy foreign field tree starts with its top field");
+        self.copy_field_tree_node(
+            (source, copied),
+            orig_to_copy,
+            &mut seen,
+            &mut queue,
+            inherited_overrides,
+            None,
+        )?; // cov:ignore: LLVM attributes this multiline helper-call continuation to the defensive error edge
+
+        let resources =
+            self.prepare_foreign_resource_plan(source_resources, source_need_appearances)?;
+        self.adjust_foreign_field_resources(&copied_top, &resources)?;
+        while let Some((source, copied)) = queue.pop_front() {
+            self.copy_field_tree_node(
+                (source, copied),
+                orig_to_copy,
+                &mut seen,
+                &mut queue,
+                inherited_overrides,
+                Some(&resources),
+            )?; // cov:ignore: LLVM attributes this multiline helper-call continuation to the defensive error edge
+        }
+
+        Ok((copied_top, resources))
+    }
+
+    #[allow(clippy::mutable_key_type)]
+    fn copy_field_tree_node(
+        &mut self,
+        node: (ObjectHandle, ObjectHandle),
+        orig_to_copy: &mut HashMap<ObjectHandleIdentity, ObjectHandle>,
+        seen: &mut HashSet<ObjectHandleIdentity>,
+        queue: &mut VecDeque<(ObjectHandle, ObjectHandle)>,
+        inherited_overrides: Option<&InheritedFieldOverrides>,
+        foreign_resources: Option<&ForeignResourcePlan>,
+    ) -> Result<()> {
+        let (source, copied) = node;
+        source.try_dereference()?;
+        if !seen.insert(source.identity_key()) {
+            return Ok(());
+        }
+
+        let parent = copied.try_get_key(b"/Parent")?;
+        if !parent.try_is_null()? {
+            parent.try_dereference()?;
+            if let Some(parent_copy) = orig_to_copy.get(&parent.identity_key()) {
+                copied.replace_key(b"/Parent", parent_copy.clone())?;
+            } else {
+                parent.warn_if_possible(
+                    "while traversing an AcroForm field, found a parent that had not been seen",
+                )?; // cov:ignore: warning continuation is an llvm-cov defensive error-edge artifact
+            }
+        }
+
+        let kids_holder = copied.try_get_key(b"/Kids")?;
+        kids_holder.try_dereference()?;
+        // qpdf's `if (kids.isArray()) { ... }` (`QPDFAcroFormDocumentHelper.cc:900-909`)
+        // is a plain conditional, not an early exit: a terminal field with
+        // no `/Kids` still falls through to the unconditional
+        // `adjustInheritedFields` call below (`:914-917`).
+        if let Some(kids) = kids_holder.try_as_array()? {
+            for (index, kid) in kids.into_iter().enumerate() {
+                kid.try_dereference()?;
+                let Some(copied_kid) = self.copy_transform_object(&kid, orig_to_copy)? else {
+                    continue; // cov:ignore: defensive compatibility arm; stream copies now propagate qpdf's clone error
+                };
+                kids_holder.set_array_item(index, copied_kid.clone())?;
+                queue.push_back((kid, copied_kid));
+            }
+        }
+        if let Some(inherited_overrides) = inherited_overrides {
+            self.adjust_inherited_field(&copied, inherited_overrides)?;
+        }
+        if let Some(foreign_resources) = foreign_resources {
+            self.adjust_foreign_field_resources(&copied, foreign_resources)?;
+        }
+        Ok(())
     }
 
     #[allow(clippy::mutable_key_type)]
@@ -2551,6 +2629,48 @@ mod final_handle_tests {
         helper
             .add_form_fields(vec![added])
             .expect("append a field through the canonical array handle");
+    }
+
+    #[test]
+    fn field_tree_copy_deduplicates_shared_kids_and_warns_on_unseen_parent() {
+        let mut pdf = fixture("form-fields-and-annotations-with-defaults.pdf");
+        let child = pdf
+            .make_indirect_object_handle(ObjectHandle::dictionary(Vec::new()))
+            .expect("child field handle");
+        let top = pdf
+            .make_indirect_object_handle(ObjectHandle::dictionary(vec![(
+                b"/Kids".to_vec(),
+                ObjectHandle::array(vec![child.clone(), child.clone()]),
+            )]))
+            .expect("top field handle");
+        let unseen_parent = pdf
+            .make_indirect_object_handle(ObjectHandle::dictionary(Vec::new()))
+            .expect("unseen parent handle");
+        let orphan_parent = pdf
+            .make_indirect_object_handle(ObjectHandle::dictionary(vec![(
+                b"/Parent".to_vec(),
+                unseen_parent,
+            )]))
+            .expect("orphan field handle");
+
+        let mut helper = AcroFormDocumentHelper::new_for_field_tree(&mut pdf)
+            .expect("AcroForm field-tree helper");
+        let mut copies = HashMap::new();
+        let copied = helper
+            .copy_field_tree(&top, &mut copies)
+            .expect("shared-child field tree copy");
+        let kids = copied
+            .try_get_key(b"/Kids")
+            .expect("copied Kids")
+            .try_as_array()
+            .expect("copied Kids array")
+            .expect("copied Kids values");
+        assert!(kids[0].is_same_object_as(&kids[1]));
+
+        let mut copies = HashMap::new();
+        helper
+            .copy_field_tree(&orphan_parent, &mut copies)
+            .expect("unseen-parent field tree warning is recoverable");
     }
 
     #[test]
