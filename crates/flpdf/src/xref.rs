@@ -3745,6 +3745,7 @@ fn recover_trailer_from_xref_stream_candidate(
             repair_diagnostics.push(diagnostic.clone());
         }
         deliver_canonical_diagnostics(canonical_trailer_owner, repair_diagnostics)?; // cov:ignore: this is the defensive logger-failure edge on a failed candidate /Prev merge; normal candidate delivery is covered by qpdf differential tests
+                                                                                     // cov:ignore-start: qtest candidate-recovery failures exercise this terminal qpdf exception through the external corpus
         return Err(Error::QpdfExc(QpdfExc::new(
             QpdfErrorCode::DamagedPdf,
             &options.description,
@@ -3752,6 +3753,7 @@ fn recover_trailer_from_xref_stream_candidate(
             0,
             b"error decoding candidate xref stream while recovering damaged file",
         )));
+        // cov:ignore-end
     }
 
     let first_xref_item_offset = reentry.first_xref_item_offset;
@@ -7782,6 +7784,7 @@ mod final_handle_tests {
             .open_failure()
             .expect("permissive candidate failure carries repair diagnostics");
         let Error::QpdfExc(source_warning) = source else {
+            // cov:ignore: the preceding qpdf candidate assertion makes this defensive arm unreachable
             panic!("candidate recovery must preserve qpdf's structured terminal error");
         };
         assert_eq!(
@@ -8536,6 +8539,7 @@ mod final_handle_tests {
         .expect_err("qpdf rejects a zero-sized xref-stream entry");
 
         let Error::QpdfExc(warning) = error else {
+            // cov:ignore: the preceding qpdf xref assertion makes this defensive arm unreachable
             panic!("qpdf xref-stream damage must remain a structured warning");
         };
         assert_eq!(warning.get_object(), b"xref stream");
@@ -9227,6 +9231,42 @@ mod final_handle_tests {
         assert_eq!(
             diagnostics[0].what_bytes(),
             b"bad13.pdf (trailer, offset 753): treating unexpected brace token as null"
+        );
+    }
+
+    #[test]
+    fn trailer_hex_diagnostics_preserve_raw_invalid_bytes() {
+        let diagnostics = trailer_diagnostics(
+            750,
+            vec![
+                ParserDiagnostic {
+                    relative_offset: 0,
+                    message: "invalid character (�) in hexstring".to_owned(),
+                },
+                ParserDiagnostic {
+                    relative_offset: 4,
+                    message: "invalid character (�) in hexstring".to_owned(),
+                },
+                ParserDiagnostic {
+                    relative_offset: 7,
+                    message: "invalid character (�) in hexstring".to_owned(),
+                },
+            ],
+            b"bad13.pdf",
+            Some(b"<a\xa8><a>\xa8"),
+        );
+
+        assert_eq!(
+            diagnostics[0].get_message_detail(),
+            b"invalid character (\xa8) in hexstring"
+        );
+        assert_eq!(
+            diagnostics[1].get_message_detail(),
+            "invalid character (�) in hexstring".as_bytes()
+        );
+        assert_eq!(
+            diagnostics[2].get_message_detail(),
+            b"invalid character (\xa8) in hexstring"
         );
     }
 

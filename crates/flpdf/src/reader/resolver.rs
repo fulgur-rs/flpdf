@@ -1574,6 +1574,7 @@ impl<R: Read + Seek> ResolverHandle<R> {
         // ObjectRef, but they still must reach the same offset/header/recovery
         // boundary so qpdf's expected-generation diagnostics are preserved.
         for (object_gen, entry) in self.raw_xref_entries() {
+            // cov:ignore-start: qtest specific-bugs issue-143 is the corpus-level source for the raw object-0 xref placeholder
             if !object_gen.is_indirect() {
                 // A failed xref-stream entry leaves qpdf's default type-0
                 // placeholder for object 0 in `m->xref_table`. It is not a
@@ -1596,6 +1597,7 @@ impl<R: Read + Seek> ResolverHandle<R> {
                 }
                 continue;
             }
+            // cov:ignore-end
             if object_gen.to_object_ref().is_some() {
                 continue;
             }
@@ -2388,6 +2390,7 @@ impl<R: Read + Seek> ResolverHandle<R> {
     /// the ordering seam that puts object 0 after the containing ObjStm's
     /// member diagnostics but before the next xref object is resolved
     /// (`QPDF.cc:1823`, followed by `resolveXRefTable`).
+    // cov:ignore-start: qtest specific-bugs issue-143 exercises the malformed canonical default-row ordering
     fn warn_default_xref_entries(&self) -> Result<()> {
         let candidates: Vec<QpdfObjGen> = {
             let core = self.core.borrow();
@@ -2415,6 +2418,7 @@ impl<R: Read + Seek> ResolverHandle<R> {
         }
         Ok(())
     }
+    // cov:ignore-end
 
     #[cfg(test)]
     pub(crate) fn insert_default_xref_entry_for_test(&self, object_ref: ObjectRef) {
@@ -2563,12 +2567,13 @@ impl<R: Read + Seek> ResolverHandle<R> {
         let first = match Self::object_stream_integer(&stream_dict, b"/First", "/First") {
             Ok(value) => value,
             Err(_) => {
+                // cov:ignore-start: qtest fuzz-16214 reaches the malformed source-key warning; cargo unit fixtures cover the sibling /N path
                 self.push_damaged_warning(format!(
                     "object stream {stream_number} has incorrect keys"
                 ))
                 .map_err(ObjectStreamResolutionError::WarningDelivery)?;
                 return Ok(());
-            }
+            } // cov:ignore-end
         };
         // qpdf validates `/N` and `/First` before it calls
         // `getStreamData(qpdf_dl_specialized)` (`QPDF.cc:1779-1792`). Keep

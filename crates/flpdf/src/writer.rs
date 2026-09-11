@@ -838,11 +838,7 @@ impl<'pdf, R: Read + Seek + 'static> PdfWriter<'pdf, R> {
         // at the same writer-owned boundary so root-driven lazy diagnostics
         // precede the full xref-table walk; a missing Root remains a direct
         // null candidate and is reported later by the normal writer route.
-        let root = self.pdf.trailer_key_handle(b"Root");
-        root.try_dereference()?;
-        if root.try_as_dictionary()?.is_none() {
-            return Err(crate::Error::Missing("/Root"));
-        }
+        self.pdf.root_handle()?;
         let setup = build_writer_setup(self.pdf, &options)?;
         // Page-tree repair below mutates `self.pdf`'s object graph in place
         // (promoting direct /Kids leaves, cloning duplicate leaves) and is not

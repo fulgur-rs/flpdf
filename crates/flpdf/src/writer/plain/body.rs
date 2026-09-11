@@ -709,10 +709,12 @@ impl<'a, R: Read + Seek + 'static> LiveObjectEmitter<'a, R> {
                 // pass), and this warning is inside that two-pass loop
                 // (`QPDFWriter.cc:1621-1705`), so the same damaged member
                 // warning is intentionally delivered twice.
+                // cov:ignore-start: qtest fuzz-16214 is the corpus-level stream-in-ObjStm warning oracle
                 for _ in 0..2 {
                     handle
                         .warn_if_possible("stream found inside object stream; treating as null")?;
                 }
+                // cov:ignore-end
                 ObjectHandle::null()
             } else {
                 handle.clone()
@@ -1170,10 +1172,12 @@ impl<R: Read + Seek + 'static> PlainObjectEmitter<'_, R> {
                 // the planned source-backed ObjStm route.
                 // See the live writer above: qpdf warns once in each of its
                 // two ObjStm passes.
+                // cov:ignore-start: qtest fuzz-16214 is the corpus-level stream-in-ObjStm warning oracle
                 for _ in 0..2 {
                     handle
                         .warn_if_possible("stream found inside object stream; treating as null")?;
                 }
+                // cov:ignore-end
                 ObjectHandle::null()
             } else {
                 handle.clone()

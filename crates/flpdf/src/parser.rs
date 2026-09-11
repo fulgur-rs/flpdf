@@ -575,15 +575,6 @@ impl<I: LiveInput> LiveFileParser<'_, '_, '_, I> {
                     }
                     let value =
                         self.parse_scalar_token(token.clone(), token.start as i64, false)?;
-                    // qpdf returns immediately when `tooManyBadTokens()`
-                    // trips; it does not add the recovered null to the
-                    // current dictionary frame. Keeping that null out is
-                    // observable when the pending key would otherwise turn
-                    // the final bad token into an extra duplicate-key warning
-                    // (`QPDFParser.cc:198-210,456-469`).
-                    if self.give_up {
-                        return Ok(ObjectHandle::null());
-                    }
                     self.add_to_top_frame(frames, value)?;
                 }
                 _ => {
