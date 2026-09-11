@@ -114,7 +114,7 @@ pub fn drop_objr_obj_annot_dangling_p<R: Read + Seek>(
             continue;
         }
         let annot = pdf.get_object_handle(start);
-        pdf.resolve(&annot)?;
+        annot.try_dereference()?;
         if annot.try_as_dictionary()?.is_none() {
             continue;
         }
@@ -378,6 +378,13 @@ mod tests {
             Some(42),
             "a non-dict OBJR /Obj target must be left unchanged",
         );
+    }
+
+    #[test]
+    fn unresolved_target_skipped() {
+        let mut pdf = open(&base());
+        drop_objr_obj_annot_dangling_p(&mut pdf, &keep_3_and_5(), &[ObjectRef::new(4096, 0)])
+            .expect("an unresolved OBJR target must be skipped");
     }
 
     #[test]
