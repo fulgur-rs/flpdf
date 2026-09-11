@@ -953,12 +953,12 @@ impl<I: LiveInput> LiveFileParser<'_, '_, '_, I> {
 #[cfg(test)]
 mod live_input_tests {
     use super::{
-        parse_live_file_object, parse_live_file_object_with_decrypter, HandleResolver,
-        LiveFileParser, LiveFrame, LiveInput, LiveParsedObject, LiveTokenSource,
+        parse_integer_token, parse_live_file_object, parse_live_file_object_with_decrypter,
+        HandleResolver, LiveFileParser, LiveFrame, LiveInput, LiveParsedObject, LiveTokenSource,
         OffsetHandleResolver, SliceLiveInput, StringDecrypter, MAX_PARSE_DEPTH,
     };
     use crate::object_handle::{DocumentResolver, ObjectHandle, ObjectValue};
-    use crate::tokenizer::TokenType;
+    use crate::tokenizer::{Token, TokenType};
     use crate::{Error, ObjectRef, QpdfExc, Result};
     use std::cell::RefCell;
     use std::collections::VecDeque;
@@ -1683,6 +1683,22 @@ mod live_input_tests {
     }
 
     #[test]
+    fn integer_token_conversion_matches_qpdf_runtime_overflow_boundary() {
+        let overflow = Token::new(TokenType::Integer, b"99999999999999999999".to_vec());
+        assert!(matches!(
+            parse_integer_token(&overflow),
+            Err(Error::System(message))
+                if message == "overflow/underflow converting 99999999999999999999 to 64-bit integer"
+        ));
+
+        let invalid = Token::new(TokenType::Integer, b"not-an-integer".to_vec());
+        assert!(matches!(
+            parse_integer_token(&invalid),
+            Err(Error::Parse { message, .. }) if message == "invalid integer"
+        ));
+    }
+
+    #[test]
     fn live_dictionary_recovery_reserves_orphan_name_fake_keys() {
         let mut input = CountingInput::new(b"");
         let mut resolver = NullResolver;
@@ -2084,11 +2100,27 @@ fn classify_real(token: Token) -> Result<RealClassification> {
     }
 }
 
+/// Parse qpdf's `QUtil::string_to_ll` integer-token boundary
+/// (`QPDFParser.cc:151-157,314-319`; `QUtil.cc:373-385`). An i64 overflow is
+/// a runtime error, not a damaged-PDF parser error, so the resolver can apply
+/// `QPDF::resolve`'s `std::exception` warning reframe.
 fn parse_integer_token(token: &Token) -> Result<i64> {
-    std::str::from_utf8(&token.value)
-        .ok()
-        .and_then(|text| text.parse::<i64>().ok())
-        .ok_or_else(|| Error::parse(token.start, "invalid integer"))
+    let text = std::str::from_utf8(&token.value)
+        .map_err(|_| Error::parse(token.start, "invalid integer"))?;
+    match text.parse::<i64>() {
+        Ok(value) => Ok(value),
+        Err(error)
+            if matches!(
+                error.kind(),
+                std::num::IntErrorKind::PosOverflow | std::num::IntErrorKind::NegOverflow
+            ) =>
+        {
+            Err(Error::System(format!(
+                "overflow/underflow converting {text} to 64-bit integer"
+            )))
+        }
+        Err(_) => Err(Error::parse(token.start, "invalid integer")),
+    }
 }
 
 /// qpdf converts indirect-reference components from its `long long` token

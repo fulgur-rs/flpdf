@@ -6986,13 +6986,21 @@ mod final_handle_tests {
             XrefLoadOptions::default(),
         )
         .expect_err("an overflowing trailer integer must fail the owner-less parser");
-        assert!(matches!(error, Error::Parse { message, .. } if message == "invalid integer"));
+        assert!(matches!(
+            error,
+            Error::System(message)
+                if message == "overflow/underflow converting 999999999999999999999999 to 64-bit integer"
+        ));
 
         let resolver = canonical_test_resolver(bytes.clone(), BTreeMap::new(), false, 9);
         let error =
             load_xref_state_from_bytes(&bytes, XrefLoadOptions::default(), Some(resolver.as_ref()))
                 .expect_err("an overflowing trailer integer must fail the canonical parser");
-        assert!(matches!(error, Error::Parse { message, .. } if message == "invalid integer"));
+        assert!(matches!(
+            error,
+            Error::System(message)
+                if message == "overflow/underflow converting 999999999999999999999999 to 64-bit integer"
+        ));
     }
 
     #[test]
