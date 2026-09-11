@@ -403,9 +403,7 @@ impl QPDFJob {
         // qpdf's `maybe_set_pagemode` (`QPDFJob.cc:2036-2042`) calls
         // `QPDF::getRoot`, which throws when the trailer has no valid
         // `/Root` dictionary (`QPDF.cc:2355-2359`).
-        let root_ref = pdf.root_ref().ok_or(Error::Missing("/Root"))?;
-        let root = pdf.get_object_handle(root_ref);
-        pdf.resolve(&root)?;
+        let root = pdf.root_handle()?;
         if root.try_get_key(b"/PageMode")?.try_is_null()? {
             root.replace_key(b"/PageMode", ObjectHandle::name(b"UseAttachments".to_vec()))?;
         }
@@ -1349,7 +1347,7 @@ mod tests {
         let error = job
             .set_attachment_page_mode(&mut pdf)
             .expect_err("missing root must be rejected, matching qpdf's getRoot() throw");
-        assert_eq!(error.to_string(), "missing required PDF entry: /Root");
+        assert_eq!(error.to_string(), "unable to find /Root dictionary");
     }
 
     #[test]
@@ -1363,7 +1361,7 @@ mod tests {
         let error = job
             .add_attachment(&mut pdf, add_options(attachment, b"payload-key"))
             .expect_err("missing root must be rejected before creating any objects");
-        assert_eq!(error.to_string(), "missing required PDF entry: /Root");
+        assert_eq!(error.to_string(), "unable to find /Root dictionary");
     }
 
     #[test]
