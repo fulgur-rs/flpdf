@@ -2210,11 +2210,13 @@ impl LinearizationPlan {
     /// back to fresh target object numbers. Ordinary parsed documents use the
     /// live ref as their destination ObjGen, matching qpdf's direct order.
     pub(crate) fn writer_object_order_key(&self, object_ref: ObjectRef) -> WriterObjectOrderKey {
-        self.writer_object_order
-            .as_ref()
-            .and_then(|order| order.get(&object_ref))
-            .copied()
-            .unwrap_or_else(|| WriterObjectOrderKey::primary(object_ref))
+        match &self.writer_object_order {
+            Some(order) => order
+                .get(&object_ref)
+                .copied()
+                .unwrap_or_else(|| WriterObjectOrderKey::fresh(object_ref)),
+            None => WriterObjectOrderKey::primary(object_ref),
+        }
     }
 
     /// The refs that [`RenumberMap::from_plan`] assigns a renumber slot
@@ -2979,7 +2981,7 @@ mod tests {
     use flate2::write::ZlibEncoder;
     use flate2::Compression;
     use std::cell::Cell;
-    use std::collections::BTreeSet;
+    use std::collections::{BTreeMap, BTreeSet};
     use std::io::{Cursor, Write};
     use std::rc::Rc;
 
@@ -3161,5 +3163,16 @@ mod tests {
             error,
             Error::Internal(message) if message == "object 91 0 belongs to a dropped PDF"
         ));
+    }
+
+    #[test]
+    fn merge_writer_order_missing_ref_uses_fresh_fallback() {
+        let mut plan = LinearizationPlan::default();
+        plan.writer_object_order = Some(BTreeMap::new());
+        let object_ref = ObjectRef::new(91, 0);
+        assert_eq!(
+            plan.writer_object_order_key(object_ref),
+            crate::pdf::WriterObjectOrderKey::fresh(object_ref)
+        );
     }
 }
