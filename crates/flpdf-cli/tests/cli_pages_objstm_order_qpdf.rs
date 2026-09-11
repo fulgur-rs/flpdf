@@ -263,6 +263,53 @@ fn duplicate_page_after_foreign_linearized_generated_objstm_matches_qpdf() {
 }
 
 #[test]
+fn duplicate_page_after_foreign_linearized_hint_stream_matches_qpdf() {
+    if skip_if_qpdf_missing() {
+        return;
+    }
+    let temp = tempfile::tempdir().unwrap();
+    let qpdf_output = temp.path().join("qpdf.pdf");
+    let flpdf_output = temp.path().join("flpdf.pdf");
+    let page_args = [
+        OCCURRENCE_ORDER_PRIMARY,
+        "--pages",
+        OCCURRENCE_ORDER_PRIMARY,
+        "1",
+        OCCURRENCE_ORDER_FOREIGN,
+        "1",
+        OCCURRENCE_ORDER_PRIMARY,
+        "1",
+        "--",
+    ];
+    let mut qpdf_args = vec!["--static-id", "--linearize"];
+    qpdf_args.extend_from_slice(&page_args);
+    let qpdf = ProcessCommand::new("qpdf")
+        .args(qpdf_args)
+        .arg(&qpdf_output)
+        .output()
+        .expect("qpdf should spawn");
+    assert!(
+        qpdf.status.success(),
+        "qpdf linearized hint probe failed: {}",
+        String::from_utf8_lossy(&qpdf.stderr)
+    );
+
+    Command::cargo_bin("flpdf")
+        .unwrap()
+        .args(["--static-id", "--linearize"])
+        .args(page_args)
+        .arg(&flpdf_output)
+        .assert()
+        .success();
+
+    assert_eq!(
+        std::fs::read(&flpdf_output).unwrap(),
+        std::fs::read(&qpdf_output).unwrap(),
+        "linearized hint stream must preserve qpdf page-offset fields"
+    );
+}
+
+#[test]
 fn annotated_page_replay_preserves_qpdf_occurrence_provenance() {
     if skip_if_qpdf_missing() {
         return;
