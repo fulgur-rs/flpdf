@@ -7783,11 +7783,11 @@ mod final_handle_tests {
         let (source, diagnostics) = error
             .open_failure()
             .expect("permissive candidate failure carries repair diagnostics");
+        // cov:ignore-start: the preceding qpdf candidate assertion makes this defensive arm unreachable
         let Error::QpdfExc(source_warning) = source else {
-            // cov:ignore: the preceding qpdf candidate assertion makes this defensive arm unreachable
             panic!("candidate recovery must preserve qpdf's structured terminal error");
-            // cov:ignore: defensive variant mismatch is unreachable after the qpdf candidate assertion
         };
+        // cov:ignore-end
         assert_eq!(
             source_warning.message_string(),
             "error decoding candidate xref stream while recovering damaged file"
@@ -8539,10 +8539,11 @@ mod final_handle_tests {
         )
         .expect_err("qpdf rejects a zero-sized xref-stream entry");
 
+        // cov:ignore-start: the preceding qpdf xref assertion makes this defensive arm unreachable
         let Error::QpdfExc(warning) = error else {
-            // cov:ignore: the preceding qpdf xref assertion makes this defensive arm unreachable
-            panic!("qpdf xref-stream damage must remain a structured warning"); // cov:ignore: defensive variant mismatch is unreachable after the qpdf xref assertion
+            panic!("qpdf xref-stream damage must remain a structured warning");
         };
+        // cov:ignore-end
         assert_eq!(warning.get_object(), b"xref stream");
         assert_eq!(warning.get_file_position(), 3);
         assert_eq!(
