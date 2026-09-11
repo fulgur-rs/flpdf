@@ -126,9 +126,15 @@ impl QPDFJob {
                 return write_to_standard_output(&logger, raw.as_ref());
             }
 
-            // Preserve the existing CLI marker for the specialized codecs that
-            // qpdf keeps as raw data in this command. The name is read from the
-            // live stream dictionary; no filter dictionary is materialized.
+            // qpdf-deviation-start: `show-stream`'s passthrough-codec marker
+            // has no qpdf counterpart. qpdf has no `show-stream` command, and
+            // `QPDFJob::doShowObj` warns "unable to filter stream data" and
+            // writes nothing for a stream it cannot decode
+            // (QPDFJob.cc:806-832); it never substitutes a descriptive marker.
+            // Retained deliberately (docs/qpdf-correspondence.md, "以下の
+            // direct output は意図的に retained とする"). The name is read
+            // from the live stream dictionary; no filter dictionary is
+            // materialized.
             if let Some(filter_name) = first_stream_filter_name(&stream_dictionary)? {
                 if !crate::filters::is_decoded_filter(&filter_name) {
                     if let Some(label) = crate::filters::passthrough_codec_label(&filter_name) {
@@ -138,6 +144,7 @@ impl QPDFJob {
                     }
                 }
             }
+            // qpdf-deviation-end
 
             // Mirror emit_show_object's reconciliation: qpdf's getStreamData
             // decode failure records a typeWarning/decode warning and still
@@ -374,7 +381,7 @@ fn unparse_object_with_stream_data<R: Read + Seek>(
 }
 
 fn first_stream_filter_name(stream_dictionary: &ObjectHandle) -> Result<Option<Vec<u8>>> {
-    let filter = stream_dictionary.get_key(b"/Filter");
+    let filter = stream_dictionary.try_get_key(b"/Filter")?;
     filter.type_code()?;
     if let Some(name) = filter.as_name() {
         return Ok(Some(name));
@@ -528,6 +535,21 @@ mod tests {
             first_stream_filter_name(&multiple.as_stream_dict().unwrap()).unwrap(),
             None
         );
+    }
+
+    #[test]
+    fn first_stream_filter_name_treats_an_unresolved_filter_as_absent() {
+        let mut pdf = recovered_pdf();
+        let stream = pdf.get_object_handle(ObjectRef::new(1, 0));
+        pdf.resolve(&stream).expect("stream must resolve");
+        let dictionary = stream
+            .as_stream_dict()
+            .expect("fixture object must be a stream");
+        dictionary
+            .replace_key(b"/Filter", pdf.get_object_handle(ObjectRef::new(99, 0)))
+            .expect("stream dictionary must be mutable");
+
+        assert_eq!(first_stream_filter_name(&dictionary).unwrap(), None);
     }
 
     #[test]
