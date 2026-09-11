@@ -50,6 +50,62 @@ fn top_level_replace_input_rewrites_unicode_input() {
 }
 
 #[test]
+fn top_level_pages_replace_input_matches_qpdf() {
+    if !qpdf_available() {
+        eprintln!("qpdf 11.9.0 is unavailable; skipping page replace-input differential");
+        return;
+    }
+
+    let directory = tempfile::tempdir().expect("temporary replace-input directory");
+    let qpdf_directory = directory.path().join("qpdf");
+    let flpdf_directory = directory.path().join("flpdf");
+    fs::create_dir(&qpdf_directory).expect("create qpdf directory");
+    fs::create_dir(&flpdf_directory).expect("create flpdf directory");
+    let manifest = std::path::Path::new(env!("CARGO_MANIFEST_DIR"));
+    let primary = manifest.join("../../tests/fixtures/compat/three-page.pdf");
+    let secondary = manifest.join("../../tests/fixtures/compat/two-page.pdf");
+    for target in [&qpdf_directory, &flpdf_directory] {
+        fs::copy(&primary, target.join("input.pdf")).expect("copy primary input");
+        fs::copy(&secondary, target.join("secondary.pdf")).expect("copy secondary input");
+    }
+
+    let args = [
+        "--static-id",
+        "--qdf",
+        "input.pdf",
+        "--pages",
+        ".",
+        "1",
+        "secondary.pdf",
+        "1",
+        "--",
+        "--replace-input",
+    ];
+    let qpdf = ProcessCommand::new("qpdf")
+        .current_dir(&qpdf_directory)
+        .args(args)
+        .output()
+        .expect("run qpdf page replace-input oracle");
+    let flpdf = Command::cargo_bin("flpdf")
+        .expect("flpdf binary")
+        .current_dir(&flpdf_directory)
+        .env("FLPDF_PROGNAME", "qpdf")
+        .args(args)
+        .output()
+        .expect("run flpdf page replace-input");
+
+    assert_eq!(qpdf.status.code(), Some(0));
+    assert_eq!(flpdf.status.code(), qpdf.status.code());
+    assert_eq!(flpdf.stdout, qpdf.stdout);
+    assert_eq!(flpdf.stderr, qpdf.stderr);
+    assert_eq!(
+        fs::read(qpdf_directory.join("input.pdf")).unwrap(),
+        fs::read(flpdf_directory.join("input.pdf")).unwrap(),
+        "page replace-input must replace the primary input with qpdf's result"
+    );
+}
+
+#[test]
 fn top_level_replace_input_removes_attachment_like_qpdf() {
     if !qpdf_available() {
         eprintln!("qpdf 11.9.0 is unavailable; skipping replace-input attachment differential");
