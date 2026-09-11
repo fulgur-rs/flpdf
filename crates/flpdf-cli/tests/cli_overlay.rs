@@ -279,11 +279,12 @@ fn overlay_with_linearize_is_rejected() {
 }
 
 #[test]
-fn unterminated_overlay_group_is_rejected() {
+fn unterminated_overlay_group_treats_the_output_token_as_a_second_file() {
     let one = fixture("one-page.pdf");
     let tmp = tempfile::tempdir().unwrap();
     let out = tmp.path().join("o.pdf");
-    // No bare `--` after the source: qpdf requires the terminator.
+    // Without the bare `--`, qpdf keeps parsing the output token inside the
+    // underlay/overlay table, so it is the second file and not the output yet.
     Command::cargo_bin("flpdf")
         .unwrap()
         .arg("rewrite")
@@ -292,7 +293,7 @@ fn unterminated_overlay_group_is_rejected() {
         .arg(out.to_str().unwrap())
         .assert()
         .failure()
-        .stderr(predicate::str::contains("terminated by a `--`"));
+        .stderr(predicate::str::contains("overlay file already specified"));
 }
 
 #[test]
@@ -319,8 +320,7 @@ fn top_level_overlay_with_pages_composes() {
 }
 
 #[test]
-fn unterminated_underlay_group_is_rejected() {
-    // The --underlay flag-name arm of the unterminated-group error.
+fn unterminated_underlay_group_treats_the_output_token_as_a_second_file() {
     let two = fixture("two-page.pdf");
     let tmp = tempfile::tempdir().unwrap();
     let out = tmp.path().join("o.pdf");
@@ -332,7 +332,7 @@ fn unterminated_underlay_group_is_rejected() {
         .arg(out.to_str().unwrap())
         .assert()
         .failure()
-        .stderr(predicate::str::contains("terminated by a `--`"));
+        .stderr(predicate::str::contains("underlay file already specified"));
 }
 
 #[test]
@@ -417,7 +417,7 @@ fn overlay_on_non_rewrite_subcommand_is_rejected() {
 }
 
 #[test]
-fn overlay_equals_form_is_rejected() {
+fn overlay_equals_form_without_a_positional_source_is_rejected() {
     // qpdf discards the value attached to its bare `--overlay` option. With no
     // following positional source, both qpdf and flpdf reject the empty group.
     let one = fixture("one-page.pdf");
@@ -432,7 +432,7 @@ fn overlay_equals_form_is_rejected() {
         .arg(out.to_str().unwrap())
         .assert()
         .failure()
-        .stderr(predicate::str::contains("no source file"));
+        .stderr(predicate::str::contains("overlay file not specified"));
 }
 
 #[test]

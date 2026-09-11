@@ -190,13 +190,60 @@ pub(crate) struct RawNamedSegment {
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum SegmentKind {
+pub(crate) enum SegmentKind {
     Encrypt,
     Pages,
     AddAttachment,
     CopyAttachments,
     Overlay,
     PageLabels,
+}
+
+/// Receives qpdf named-segment callbacks while the raw argv parser walks the
+/// active option table. qpdf invokes these callbacks before it performs the
+/// final input/output checks, so the CLI semantic owner must see each token in
+/// argv order rather than receiving a completed segment only after `--`.
+pub(crate) trait SegmentHandler {
+    fn begin(&mut self, kind: SegmentKind, option: &str) -> CliResult<()>;
+
+    fn token(&mut self, kind: SegmentKind, original: &RawArg, canonical: &RawArg) -> CliResult<()>;
+
+    fn end(&mut self, kind: SegmentKind) -> CliResult<()>;
+
+    fn missing_terminator(
+        &mut self,
+        kind: SegmentKind,
+        _option: &str,
+    ) -> Box<dyn std::error::Error> {
+        let table = match kind {
+            SegmentKind::Encrypt => "encryption",
+            SegmentKind::Pages => "pages",
+            SegmentKind::AddAttachment => "attachment",
+            SegmentKind::CopyAttachments => "copy attachment",
+            SegmentKind::Overlay => "underlay/overlay",
+            SegmentKind::PageLabels => "set page labels",
+        };
+        flpdf::UsageError::new(format!("missing -- at end of {table} options")).into()
+    }
+}
+
+impl SegmentHandler for () {
+    fn begin(&mut self, _kind: SegmentKind, _option: &str) -> CliResult<()> {
+        Ok(())
+    }
+
+    fn token(
+        &mut self,
+        _kind: SegmentKind,
+        _original: &RawArg,
+        _canonical: &RawArg,
+    ) -> CliResult<()> {
+        Ok(())
+    }
+
+    fn end(&mut self, _kind: SegmentKind) -> CliResult<()> {
+        Ok(())
+    }
 }
 
 impl SegmentKind {
@@ -297,7 +344,17 @@ impl ArgParser {
         self.parse_os(args.into_iter().map(OsString::from).collect())
     }
 
+    #[cfg(test)]
     pub(crate) fn parse_os(&self, args: Vec<OsString>) -> CliResult<ParsedArgs> {
+        let mut handler = ();
+        self.parse_os_with_handler(args, &mut handler)
+    }
+
+    pub(crate) fn parse_os_with_handler<H: SegmentHandler>(
+        &self,
+        args: Vec<OsString>,
+        handler: &mut H,
+    ) -> CliResult<ParsedArgs> {
         let args = expand_arg_files(args.into_iter().map(RawArg::from_os).collect())?;
         let expanded_arg_count = args.len();
         // qpdf has no subcommands. Since flpdf adds a native clap surface, fix
@@ -433,8 +490,10 @@ impl ArgParser {
                     .is_some_and(|(index, _)| *index < segment_start_index);
             let mut tokens: Vec<RawArg> = Vec::new();
             let mut terminated = false;
+            handler.begin(kind, &option)?;
             for token in iter.by_ref() {
                 if token.as_bytes() == b"--" {
+                    handler.end(kind)?;
                     terminated = true;
                     break;
                 }
@@ -450,7 +509,9 @@ impl ArgParser {
                     );
                     return Err(flpdf::UsageError::new(message).into());
                 }
-                tokens.push(self.canonical_segment_option(kind, token));
+                let canonical = self.canonical_segment_option(kind, token.clone());
+                handler.token(kind, &token, &canonical)?;
+                tokens.push(canonical);
             }
             if !terminated && !(kind == SegmentKind::PageLabels && earlier_usage_error) {
                 if kind == SegmentKind::PageLabels {
@@ -459,12 +520,7 @@ impl ArgParser {
                     )
                     .into());
                 }
-                let message = if kind == SegmentKind::AddAttachment {
-                    format!("--{option}: missing -- terminator")
-                } else {
-                    format!("--{option}: segment must be terminated by a `--` token")
-                };
-                return Err(message.into());
+                return Err(handler.missing_terminator(kind, &option));
             }
             if kind == SegmentKind::PageLabels && !earlier_usage_error {
                 // QPDFArgParser commits Config::setPageLabels at this exact

@@ -1311,7 +1311,7 @@ fn encrypt_empty_segment_is_rejected_not_treated_as_absent() {
         .assert()
         .failure()
         .stderr(predicates::str::contains(
-            "--encrypt requires USER-PW OWNER-PW KEY-LEN",
+            "encryption key length is required",
         ));
     assert!(
         !output.exists(),
