@@ -33,3 +33,34 @@ fn page_rotation_uses_separate_job_route_without_the_legacy_module() {
         .expect("page_object_helper.rs must be readable");
     assert!(!page_helper.contains("crate::page_rotate"));
 }
+
+#[test]
+fn apply_rotate_to_pages_uses_canonical_live_handle_accessors() {
+    let source = fs::read_to_string(source_root().join("job/rotate.rs"))
+        .expect("rotate.rs must be readable")
+        .replace("\r\n", "\n");
+    let start = source
+        .find("pub fn apply_rotate_to_pages")
+        .expect("apply_rotate_to_pages must exist");
+    let body = &source[start..];
+    let end = body
+        .find("// ---------------------------------------------------------------------------\n// Public API")
+        .expect("flattening API must follow page rotation");
+    let body = &body[..end];
+
+    for forbidden in [
+        ".resolve(",
+        ".resolve_handle(",
+        ".resolve_handle_ref(",
+        ".get_key(",
+        ".has_key(",
+    ] {
+        assert!(
+            !body.contains(forbidden),
+            "apply_rotate_to_pages retains non-canonical route {forbidden}"
+        );
+    }
+    assert!(body.contains("page.try_dereference()?"));
+    assert!(body.contains("page.try_as_dictionary()?"));
+    assert!(body.contains("page.try_get_key(b\"/Type\")?"));
+}

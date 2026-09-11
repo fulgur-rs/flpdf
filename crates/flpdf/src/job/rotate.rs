@@ -89,11 +89,11 @@ pub fn apply_rotate_to_pages<R: Read + Seek>(
 ) -> Result<()> {
     for &page_ref in pages {
         // qpdf's QPDFPageObjectHelper::rotatePage operates on the live handle,
-        // not a materialized Object snapshot. Resolve and validate the page
-        // through the same canonical handle before mutating it.
+        // not a materialized Object snapshot. Dereference and validate the
+        // page through the same canonical handle before mutating it.
         let page = pdf.get_object_handle(page_ref);
-        pdf.resolve(&page)?;
-        if page.as_dictionary().is_none() {
+        page.try_dereference()?;
+        if page.try_as_dictionary()?.is_none() {
             return Err(Error::Unsupported(format!(
                 "object {page_ref} is not a dictionary, cannot set /Rotate"
             )));
@@ -685,6 +685,24 @@ mod tests {
             rotate_value(&mut pdf, pages_ref),
             None,
             "/Pages node must not gain /Rotate"
+        );
+    }
+
+    #[test]
+    fn rejects_an_unresolved_page_handle_without_panicking() {
+        let bytes = build_single_page_pdf(None, None);
+        let mut pdf = Pdf::open(Cursor::new(bytes)).unwrap();
+        let missing_page = ObjectRef::new(4096, 0);
+        let op = RotateOp {
+            mode: RotateMode::Assign,
+            degrees: 90,
+        };
+
+        let error = apply_rotate_to_pages(&mut pdf, &[missing_page], &op)
+            .expect_err("an unresolved page handle must be rejected");
+        assert!(
+            matches!(&error, Error::Unsupported(message) if message.contains("not a dictionary")),
+            "unexpected unresolved-page error: {error:?}"
         );
     }
 
