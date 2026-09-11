@@ -6403,6 +6403,15 @@ fn parse_pages_segment<T: RawCliArg>(tokens: &[T]) -> CliResult<Vec<PageSegmentS
                 called_pages_range = true;
             }
             Err(error) => {
+                // qpdf's QPDFJob::parseNumrange reframes std::runtime_error
+                // syntax failures as usage, but std::bad_alloc is a separate
+                // std::exception that must reach the outer CLI catch
+                // (`QPDFJob.cc:418-425`, `qpdf/qpdf.cc:37-42`). SystemBytes is
+                // the range parser's runtime-diagnostic representation; other
+                // error variants must retain their original exception class.
+                if !matches!(&error, Error::SystemBytes(_)) {
+                    return Err(Box::new(error));
+                }
                 let is_file = token_bytes == b"."
                     || File::open(arg_parser::os_string_from_bytes(&token_bytes)).is_ok();
                 if is_file {
