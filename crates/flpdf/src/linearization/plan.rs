@@ -2570,7 +2570,7 @@ impl LinearizationPlan {
                     continue;
                 }
                 let obj = pdf.get_object_handle(obj_ref);
-                if !crate::writer::object_streams::is_qpdf_signature_dict(pdf, &obj)? {
+                if !crate::writer::object_streams::is_qpdf_signature_dict(&obj)? {
                     surviving.push(obj_ref);
                 }
             }

@@ -2174,7 +2174,7 @@ fn validate_objstm_member_bodies<R: Read + Seek>(
         for member in members {
             let member_handle = pdf.get_object_handle(member.source);
             member_handle.try_dereference()?;
-            let is_signature = object_streams::is_qpdf_signature_dict(pdf, &member_handle)?;
+            let is_signature = object_streams::is_qpdf_signature_dict(&member_handle)?;
             let violation = planned_member_body_violation(
                 member.source,
                 member.output,

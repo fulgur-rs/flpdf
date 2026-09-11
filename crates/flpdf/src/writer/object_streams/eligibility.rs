@@ -163,7 +163,7 @@ pub(crate) fn compressible_objgens_qpdf_plan<R: std::io::Read + std::io::Seek>(
                 }
             }
         }
-        let is_signature = !is_stream && is_qpdf_signature_dict(pdf, &object)?;
+        let is_signature = !is_stream && is_qpdf_signature_dict(&object)?;
         // Streams, signature value dictionaries, and the encryption dictionary
         // cannot be stored inside an object stream, so they are excluded from
         // the result — but they are still traversed for child references
@@ -216,15 +216,11 @@ pub(crate) fn even_split_into_streams_with_cap(
 /// whose value is direct null or resolves to null is therefore absent for this
 /// predicate. This is shared by Generate's `getCompressibleObjGens` port and
 /// Preserve's source-container filtering.
-pub(crate) fn is_qpdf_signature_dict<R: std::io::Read + std::io::Seek>(
-    pdf: &mut crate::Pdf<R>,
-    object: &ObjectHandle,
-) -> crate::Result<bool> {
+pub(crate) fn is_qpdf_signature_dict(object: &ObjectHandle) -> crate::Result<bool> {
     if !object.try_is_dictionary_of_type(b"", b"")? {
         return Ok(false);
     }
     let type_value = object.try_get_key(b"/Type")?;
-    let type_value = pdf.resolve_handle(&type_value)?;
     if !type_value.try_is_name_and_equals(b"Sig")? {
         return Ok(false);
     }
@@ -312,6 +308,21 @@ mod tests {
         assert!(
             !plan.eligible.contains(&holder),
             "the stream's /Length edge must not make its holder eligible"
+        );
+    }
+
+    #[test]
+    fn indirect_null_type_is_not_signature_eligible() {
+        let bytes = b"%PDF-1.5\n\
+1 0 obj\n<< /Type /Catalog /Sig 2 0 R >>\nendobj\n\
+2 0 obj\n<< /Type 3 0 R /ByteRange [0 1 2 3] /Contents <00> >>\nendobj\n\
+3 0 obj\nnull\nendobj\n\
+trailer\n<< /Size 4 /Root 1 0 R >>\nstartxref\n0\n%%EOF\n";
+        let mut pdf = Pdf::open(Cursor::new(bytes.as_slice())).expect("open signature fixture");
+        let signature = pdf.get_object_handle(ObjectRef::new(2, 0));
+        assert!(
+            !super::is_qpdf_signature_dict(&signature).expect("signature eligibility"),
+            "an indirect-null /Type must not satisfy qpdf's /Sig predicate"
         );
     }
 }
