@@ -69,7 +69,29 @@ pub(crate) enum FileObjectDiagnosticKind {
     RecoveredStreamLength { length: usize },
     EmptyRecoveredStream,
     ExpectedEndobj,
-    TokenizerWarning { message: String },
+    TokenizerWarning { message: Vec<u8> },
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum InvalidStreamLengthKind {
+    Missing,
+    Invalid,
+}
+
+impl InvalidStreamLengthKind {
+    const fn diagnostic(self) -> FileObjectDiagnosticKind {
+        match self {
+            Self::Missing => FileObjectDiagnosticKind::MissingStreamLength,
+            Self::Invalid => FileObjectDiagnosticKind::InvalidStreamLength,
+        }
+    }
+
+    const fn message(self) -> &'static str {
+        match self {
+            Self::Missing => "stream dictionary lacks /Length key",
+            Self::Invalid => "/Length key in stream dictionary is not an integer",
+        }
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -339,17 +361,11 @@ fn complete_handle_stream(
         }
         ResolvedStreamLength::Integer(value) => {
             let length = usize::try_from(value).ok();
-            let invalid = length
-                .is_none()
-                .then_some(FileObjectDiagnosticKind::InvalidStreamLength);
+            let invalid = length.is_none().then_some(InvalidStreamLengthKind::Invalid);
             (length, invalid)
         }
-        ResolvedStreamLength::Missing => {
-            (None, Some(FileObjectDiagnosticKind::MissingStreamLength))
-        }
-        ResolvedStreamLength::Invalid => {
-            (None, Some(FileObjectDiagnosticKind::InvalidStreamLength))
-        }
+        ResolvedStreamLength::Missing => (None, Some(InvalidStreamLengthKind::Missing)),
+        ResolvedStreamLength::Invalid => (None, Some(InvalidStreamLengthKind::Invalid)),
     };
     let exact_end = length.and_then(|length| data_start.checked_add(length));
     let usable_length = matches!(
@@ -372,9 +388,9 @@ fn complete_handle_stream(
             ));
         }
         None if policy != RecoveryPolicy::Strict => {
-            if let Some(kind) = invalid_length.as_ref() {
+            if let Some(kind) = invalid_length {
                 diagnostics.push(FileObjectDiagnostic {
-                    kind: kind.clone(),
+                    kind: kind.diagnostic(),
                     relative_offset: 0,
                 });
             } else {
@@ -401,9 +417,7 @@ fn complete_handle_stream(
             };
             return Err(Error::parse(
                 error_offset,
-                invalid_length
-                    .as_ref()
-                    .map_or_else(|| "expected endstream".into(), |kind| kind.message()),
+                invalid_length.map_or("expected endstream", InvalidStreamLengthKind::message),
             ));
         }
     };
@@ -490,7 +504,10 @@ fn recover_stream_boundary(
 
 #[cfg(test)]
 mod final_handle_tests {
-    use super::{finish_file_object_handle, parse_file_object_handle_syntax, RecoveryPolicy};
+    use super::{
+        finish_file_object_handle, parse_file_object_handle_syntax, FileObjectDiagnosticKind,
+        RecoveryPolicy,
+    };
     use crate::object_handle::{ObjectHandle, ObjectValue};
     use crate::parser::HandleResolver;
     use crate::{ObjectRef, Result};
@@ -530,6 +547,90 @@ mod final_handle_tests {
                 .expect_err("strict qpdf stream framing requires a recoverable endstream");
         assert!(error.to_string().contains("stream data exceeds input"));
         Ok(())
+    }
+
+    #[test]
+    fn strict_framing_reports_the_qpdf_endstream_and_length_messages() -> Result<()> {
+        for (input, expected) in [
+            (
+                b"1 0 obj\n<< >>\nstream\nabc\nnot-endstream\nendobj\n".as_slice(),
+                "stream dictionary lacks /Length key",
+            ),
+            (
+                b"1 0 obj\n<< /Length (bad) >>\nstream\nabc\nnot-endstream\nendobj\n",
+                "/Length key in stream dictionary is not an integer",
+            ),
+            (
+                b"1 0 obj\n<< /Length 3 >>\nstream\nabc\nnot-endstream\nendobj\n",
+                "expected endstream",
+            ),
+        ] {
+            let mut resolver = Detached;
+            let pending = parse_file_object_handle_syntax(input, &mut resolver)?;
+            let error = finish_file_object_handle(input, pending, None, RecoveryPolicy::Strict)
+                .expect_err("strict framing must reject the missing endstream");
+            assert!(error.to_string().contains(expected), "{error}");
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn diagnostic_message_preserves_each_qpdf_framing_variant() {
+        let cases = [
+            (
+                FileObjectDiagnosticKind::EmptyObject,
+                b"empty object treated as null".as_slice(),
+            ),
+            (
+                FileObjectDiagnosticKind::StreamCarriageReturnOnly,
+                b"stream keyword followed by carriage return only".as_slice(),
+            ),
+            (
+                FileObjectDiagnosticKind::StreamMissingLineTerminator,
+                b"stream keyword not followed by proper line terminator".as_slice(),
+            ),
+            (
+                FileObjectDiagnosticKind::MissingStreamLength,
+                b"stream dictionary lacks /Length key".as_slice(),
+            ),
+            (
+                FileObjectDiagnosticKind::InvalidStreamLength,
+                b"/Length key in stream dictionary is not an integer".as_slice(),
+            ),
+            (
+                FileObjectDiagnosticKind::NegativeStreamLength,
+                b"unsigned value request for negative number; returning 0".as_slice(),
+            ),
+            (
+                FileObjectDiagnosticKind::ExpectedEndstream,
+                b"expected endstream".as_slice(),
+            ),
+            (
+                FileObjectDiagnosticKind::AttemptingStreamLengthRecovery,
+                b"attempting to recover stream length".as_slice(),
+            ),
+            (
+                FileObjectDiagnosticKind::RecoveredStreamLength { length: 7 },
+                b"recovered stream length: 7".as_slice(),
+            ),
+            (
+                FileObjectDiagnosticKind::EmptyRecoveredStream,
+                b"unable to recover stream data; treating stream as empty".as_slice(),
+            ),
+            (
+                FileObjectDiagnosticKind::ExpectedEndobj,
+                b"expected endobj".as_slice(),
+            ),
+            (
+                FileObjectDiagnosticKind::TokenizerWarning {
+                    message: b"raw-\xff-warning".to_vec(),
+                },
+                b"raw-\xff-warning".as_slice(),
+            ),
+        ];
+        for (kind, expected) in cases {
+            assert_eq!(kind.message().as_slice(), expected);
+        }
     }
 }
 
@@ -596,31 +697,31 @@ fn included_stream_data_eol(
 }
 
 impl FileObjectDiagnosticKind {
-    pub(crate) fn message(&self) -> String {
+    pub(crate) fn message(&self) -> Vec<u8> {
         match self {
-            Self::EmptyObject => "empty object treated as null".into(),
+            Self::EmptyObject => b"empty object treated as null".to_vec(),
             Self::StreamCarriageReturnOnly => {
-                "stream keyword followed by carriage return only".into()
+                b"stream keyword followed by carriage return only".to_vec()
             }
             Self::StreamMissingLineTerminator => {
-                "stream keyword not followed by proper line terminator".into()
+                b"stream keyword not followed by proper line terminator".to_vec()
             }
-            Self::MissingStreamLength => "stream dictionary lacks /Length key".into(),
+            Self::MissingStreamLength => b"stream dictionary lacks /Length key".to_vec(),
             Self::InvalidStreamLength => {
-                "/Length key in stream dictionary is not an integer".into()
+                b"/Length key in stream dictionary is not an integer".to_vec()
             }
             Self::NegativeStreamLength => {
-                "unsigned value request for negative number; returning 0".into()
+                b"unsigned value request for negative number; returning 0".to_vec()
             }
-            Self::ExpectedEndstream => "expected endstream".into(),
-            Self::AttemptingStreamLengthRecovery => "attempting to recover stream length".into(),
+            Self::ExpectedEndstream => b"expected endstream".to_vec(),
+            Self::AttemptingStreamLengthRecovery => b"attempting to recover stream length".to_vec(),
             Self::RecoveredStreamLength { length } => {
-                format!("recovered stream length: {length}")
+                format!("recovered stream length: {length}").into_bytes()
             }
             Self::EmptyRecoveredStream => {
-                "unable to recover stream data; treating stream as empty".into()
+                b"unable to recover stream data; treating stream as empty".to_vec()
             }
-            Self::ExpectedEndobj => "expected endobj".into(),
+            Self::ExpectedEndobj => b"expected endobj".to_vec(),
             Self::TokenizerWarning { message } => message.clone(),
         }
     }

@@ -91,8 +91,6 @@ crates/flpdf/src/reader.rs::Pdf::canonical_live_object_refs              # A10
 crates/flpdf/src/reader.rs::Pdf::next_available_object_ref               # A11 facade 側
 crates/flpdf/src/reader.rs::Pdf::make_indirect_object_handle             # A12 canonical public factory
 crates/flpdf/src/xref.rs::BootstrapCache                                 # A20 第 2 の teardown walk
-crates/flpdf/src/object_handle.rs::legacy_dictionary_key                 # A23（parser残caller。writerは.48.35、stream_filterは.48.36でcutover済み）
-
 # --- (b) baseline denominator ---
 crates/flpdf/src/reader/resolver.rs::ResolverCore                        # A1/A24 canonical
 crates/flpdf/src/reader/resolver.rs::object_cache                        # A1（フィールド）
