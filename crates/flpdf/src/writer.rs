@@ -3471,8 +3471,9 @@ fn run_writer_pipeline(pipeline: &mut dyn Pipeline, data: &[u8]) -> Result<()> {
 }
 
 /// Feed one emitted stream through qpdf's conditional encryption stage and
-/// write it directly to the final output sink. The `Count` stage preserves
-/// qpdf's last-byte framing decision while `PlString` is the output sink.
+/// write it directly to the final output sink. The `Count` stage is qpdf's
+/// base pipeline downstream of the optional encryption filter; QDF framing
+/// observes the raw payload separately in [`write_stream_payload_with_pipeline_qdf`].
 fn pipe_writer_stream_payload(
     out: &mut Vec<u8>,
     data: &[u8],
@@ -3480,7 +3481,7 @@ fn pipe_writer_stream_payload(
     ctx: &EncryptionContext,
     encrypt_stream: bool,
     explicit_iv: Option<[u8; 16]>,
-) -> Result<u8> {
+) -> Result<()> {
     let mut sink = PlString::new("writer stream output", None, out);
     let mut count = crate::pipeline::count::Count::new("writer stream count", &mut sink);
     let explicit_iv = explicit_iv.or_else(|| {
@@ -3490,7 +3491,7 @@ fn pipe_writer_stream_payload(
 
     if !encrypt_stream {
         run_writer_pipeline(&mut count, data)?;
-        return Ok(count.last_byte());
+        return Ok(());
     }
 
     let mut state = encryption_state::WriterEncryptionState::new(
@@ -3542,7 +3543,7 @@ fn pipe_writer_stream_payload(
         }
     })?;
 
-    Ok(count.last_byte())
+    Ok(())
 }
 
 /// Write a stream payload through the qpdf-shaped writer pipeline, including
@@ -3581,8 +3582,12 @@ pub(crate) fn write_stream_payload_with_pipeline_qdf(
     explicit_iv: Option<[u8; 16]>,
 ) -> Result<bool> {
     out.extend_from_slice(b"\nstream\n");
-    let last_byte =
-        pipe_writer_stream_payload(out, data, object_ref, ctx, encrypt_stream, explicit_iv)?;
+    pipe_writer_stream_payload(out, data, object_ref, ctx, encrypt_stream, explicit_iv)?;
+    // qpdf's `m->pipeline` is the base Count stage downstream of the optional
+    // encryption filter (`QPDFWriter.cc:976-995,1553-1558`), so its
+    // `getLastChar()` observes the raw stream payload, not the final encrypted
+    // byte. Keep the same QDF framing decision here.
+    let last_byte = data.last().copied().unwrap_or(0);
     let add_newline = match policy {
         NewlineBeforeEndstream::Yes => true,
         NewlineBeforeEndstream::Never => qdf_mode && last_byte != b'\n',

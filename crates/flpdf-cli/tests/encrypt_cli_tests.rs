@@ -460,6 +460,57 @@ fn qdf_direct_encryption_works_on_top_level_and_rewrite_surfaces() {
     }
 }
 
+/// QDF framing of an encrypted stream follows qpdf's base-pipeline observation
+/// of the raw payload's last byte, not the ciphertext's last byte. Compare the
+/// full deterministic AES-128 output with qpdf so an extra QDF newline or
+/// holder marker cannot be hidden by a decrypt-and-rewrite comparison.
+#[test]
+fn encrypted_qdf_document_is_byte_identical_to_qpdf() {
+    if !ensure_qpdf_or_skip() {
+        return;
+    }
+    let tmp = tempfile::tempdir().unwrap();
+    let ours = tmp.path().join("flpdf-qdf.pdf");
+    let theirs = tmp.path().join("qpdf-qdf.pdf");
+    let input = fixture(QDF_ENCRYPTION_FIXTURE);
+    let args = [
+        "--qdf",
+        "--static-id",
+        "--static-aes-iv",
+        "--encrypt",
+        "",
+        "",
+        "128",
+        "--use-aes=y",
+        "--",
+    ];
+
+    Command::cargo_bin("flpdf")
+        .unwrap()
+        .args(args)
+        .arg(&input)
+        .arg(&ours)
+        .assert()
+        .success();
+    let qpdf = ShellCommand::new("qpdf")
+        .args(args)
+        .arg(&input)
+        .arg(&theirs)
+        .output()
+        .unwrap();
+    assert!(
+        qpdf.status.success(),
+        "qpdf reference run failed: {}",
+        String::from_utf8_lossy(&qpdf.stderr)
+    );
+
+    assert_eq!(
+        std::fs::read(&ours).unwrap(),
+        std::fs::read(&theirs).unwrap(),
+        "encrypted QDF framing must be byte-identical to qpdf 11.9.0"
+    );
+}
+
 /// `flpdf --encrypt USER OWNER 256 -- IN OUT` produces a V=5 R=6 AES-256
 /// document that qpdf authenticates with BOTH the user and owner passwords —
 /// the cross-implementation gate. qpdf recovering the user
