@@ -168,6 +168,19 @@ fn validate_inputs(inputs: &StandardHandlerInputs<'_>) -> Result<usize> {
         }
         .into());
     }
+    // qpdf's initializeEncryption selects 40 bits for every V <= 1. The
+    // reader-side input object already carries that effective length, so a
+    // V=1 value other than 40 bits is an invalid internal projection even
+    // though R=3 itself is accepted.
+    if inputs.v == 1 && inputs.length_bits != 40 {
+        return Err(EncryptedError::UnsupportedHandler {
+            filter: "Standard".into(),
+            v: inputs.v,
+            r: inputs.r,
+            cfm: None,
+        }
+        .into());
+    }
     // R=2 is a 40-bit revision regardless of V; reject longer keys to keep
     // the R=2 branch in compute_file_key/check_user_password from emitting
     // longer-than-spec keys.
@@ -1651,5 +1664,34 @@ mod v1_v2_reader_tests {
             .expect("qpdf accepts Standard V=1/R=3 with a 40-bit key");
 
         assert_eq!(file_key, [0xe3, 0x90, 0xe2, 0x20, 0xda]);
+    }
+
+    #[test]
+    fn v1_rejects_an_inconsistent_non_40_bit_internal_projection() {
+        let id0 = [0xdd; 16];
+        let o = [0xd8; 32];
+        let u = [0x16; 32];
+        let inputs = StandardHandlerInputs {
+            v: 1,
+            r: 3,
+            length_bits: 128,
+            p: -12,
+            id0: &id0,
+            u: &u,
+            o: &o,
+            encrypt_metadata: true,
+        };
+
+        let error = check_user_password(b"623", &inputs)
+            .expect_err("V=1 must retain qpdf's fixed 40-bit effective length");
+
+        assert!(matches!(
+            error,
+            crate::Error::Encrypted(crate::error::EncryptedError::UnsupportedHandler {
+                v: 1,
+                r: 3,
+                ..
+            })
+        ));
     }
 }

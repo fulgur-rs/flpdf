@@ -1036,4 +1036,47 @@ mod tests {
         assert_eq!(&padded[..short_u.len()], short_u.as_slice());
         assert_eq!(&padded[short_u.len()..], &[0; 32 - 16]);
     }
+
+    #[test]
+    fn v_lt_5_missing_standard_entry_is_malformed() {
+        let encrypt = ObjectHandle::dictionary(Vec::new());
+
+        let error = required_v_lt_5_32_byte_string_from_handle(&encrypt, "U")
+            .expect_err("missing /U must remain malformed");
+
+        assert!(matches!(
+            error,
+            crate::Error::Encrypted(crate::error::EncryptedError::Malformed { reason })
+                if reason == "missing /U entry"
+        ));
+    }
+
+    #[test]
+    fn v_lt_5_non_string_standard_entry_is_malformed() {
+        let encrypt = ObjectHandle::dictionary(vec![(b"/U".to_vec(), ObjectHandle::integer(1))]);
+
+        let error = required_v_lt_5_32_byte_string_from_handle(&encrypt, "U")
+            .expect_err("non-string /U must remain malformed");
+
+        assert!(matches!(
+            error,
+            crate::Error::Encrypted(crate::error::EncryptedError::Malformed { reason })
+                if reason == "/U entry is not a string"
+        ));
+    }
+
+    #[test]
+    fn v_lt_5_overlength_standard_entry_is_malformed() {
+        let encrypt =
+            ObjectHandle::dictionary(vec![(b"/U".to_vec(), ObjectHandle::string(vec![0; 33]))]);
+
+        let error = required_v_lt_5_32_byte_string_from_handle(&encrypt, "U")
+            .expect_err("overlength /U must remain malformed");
+
+        assert!(matches!(
+            error,
+            crate::Error::Encrypted(crate::error::EncryptedError::Malformed { reason })
+                if reason == "/U entry is not 32 bytes"
+        ));
+    }
 }
