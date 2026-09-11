@@ -579,12 +579,9 @@ fn cli_empty_pages_rejects_destroyed_indirect_label_handles_like_qpdf() {
     );
 
     let flpdf_output = tmp.path().join("flpdf.pdf");
-    // flpdf reaches the same ownership boundary and the same exit status, but
-    // through the foreign-owner check rather than a destroyed-owner one: its
-    // secondary `Pdf` is still alive at write time because `prepare_document`
-    // moves every page source into `page_source_documents`. Pin the current
-    // text rather than settling for `.failure()`, so the remaining wording gap
-    // is visible here instead of silently passing.
+    // qpdf destroys the secondary document before writing the empty primary,
+    // so the indirect label children report the destroyed-owner boundary.
+    // Pin the exact ownership wording rather than settling for `.failure()`.
     let flpdf = Command::cargo_bin("flpdf")
         .unwrap()
         .args(["--qdf", "--static-id", "--empty", "--pages"])
@@ -596,12 +593,12 @@ fn cli_empty_pages_rejects_destroyed_indirect_label_handles_like_qpdf() {
     assert_eq!(flpdf.status.code(), qpdf.status.code());
     let flpdf_stderr = String::from_utf8_lossy(&flpdf.stderr).into_owned();
     assert!(
-        flpdf_stderr.contains("from different QPDF"),
-        "flpdf should reject the foreign label handle: {flpdf_stderr}"
+        flpdf_stderr.contains("destroyed QPDF"),
+        "flpdf should report qpdf's destroyed-owner error: {flpdf_stderr}"
     );
     assert!(
-        !flpdf_stderr.contains("destroyed QPDF"),
-        "known gap: flpdf does not yet release the secondary document before          writing, so it cannot report qpdf's destroyed-owner wording. Update          this assertion together with that fix: {flpdf_stderr}"
+        !flpdf_stderr.contains("from different QPDF"),
+        "flpdf should not report a live foreign owner after source teardown: {flpdf_stderr}"
     );
 }
 
