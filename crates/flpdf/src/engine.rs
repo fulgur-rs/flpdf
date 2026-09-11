@@ -296,6 +296,17 @@ impl<R: Read + Seek> Pdf<R> {
                     resolver.repair_diagnostics(),
                 ));
             }
+            // These are terminal xref-load failures raised after the canonical
+            // owner has already collected earlier qpdf warnings. Keep the
+            // logger-delivery Error::System path below unwrapped: qpdf's
+            // warning sink failure is a caller-channel failure, not a failed
+            // PDF open (`QPDF::warn`, libqpdf/QPDF.cc:487-504).
+            Err(error @ (Error::Io(_) | Error::Missing(_))) => {
+                return Err(Error::with_open_diagnostics(
+                    error,
+                    resolver.repair_diagnostics(),
+                ));
+            }
             Err(error) => return Err(error),
         };
         // The production xref loader was given this resolver as its canonical

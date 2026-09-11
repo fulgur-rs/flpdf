@@ -94,6 +94,29 @@ fn unknown_xref_entry_type_bytes() -> Vec<u8> {
     b"%PDF-1.4\n1 0 obj\n<< /Type /XRef /W [1 0 1] /Size 1 /Length 4 >>\nstream\nabcd\nendstream\nendobj\nstartxref\n9\n%%EOF\n".to_vec()
 }
 
+fn missing_xref_stream_size_bytes() -> Vec<u8> {
+    let mut bytes = b"not-a-pdf\n".to_vec();
+    let xref_offset = bytes.len();
+    bytes.extend_from_slice(
+        b"1 0 obj\n<< /Type /XRef /W [1 0 1] /Length 1 >>\nstream\n\x01\nendstream\nendobj\n",
+    );
+    bytes.extend_from_slice(format!("startxref\n{xref_offset}\n%%EOF\n").as_bytes());
+    bytes
+}
+
+fn negative_hybrid_xref_stream_bytes() -> Vec<u8> {
+    let mut bytes = b"%PDF-1.4\n1 0 obj\n<< /Type /Catalog >>\nendobj\n".to_vec();
+    let xref_offset = bytes.len();
+    bytes.extend_from_slice(b" xref\n0 2\n0000000000 65535 f \n0000000009 00000 n \n");
+    bytes.extend_from_slice(
+        format!(
+            "trailer\n<< /Size 2 /Root 1 0 R /XRefStm -1 >>\nstartxref\n{xref_offset}\n%%EOF\n"
+        )
+        .as_bytes(),
+    );
+    bytes
+}
+
 /// Two entries: a valid type-1 row followed by an unknown type `a` (97).
 fn unknown_second_xref_entry_type_bytes() -> Vec<u8> {
     b"%PDF-1.4\n1 0 obj\n<< /Type /XRef /W [1 0 1] /Size 2 /Length 4 >>\nstream\n\x01\x00a\x00\nendstream\nendobj\nstartxref\n9\n%%EOF\n".to_vec()
@@ -423,6 +446,54 @@ fn warning_delivery_failure_is_returned_by_open() {
         ),
         Err(Error::System(ref message)) if message == "warning sink failed"
     ));
+}
+
+#[test]
+fn missing_xref_stream_size_keeps_prior_open_diagnostics() {
+    let error = match Pdf::open_with_options(
+        Cursor::new(missing_xref_stream_size_bytes()),
+        PdfOpenOptions {
+            repair: false,
+            description: b"missing-size.pdf".to_vec(),
+            ..PdfOpenOptions::default()
+        },
+    ) {
+        Ok(_) => panic!("missing xref stream size must fail to open"),
+        Err(error) => error,
+    };
+
+    let (source, diagnostics) = error
+        .open_failure()
+        .expect("load failure must retain prior diagnostics");
+    assert!(matches!(source, Error::Missing("XRef stream /Size")));
+    assert!(diagnostics
+        .entries()
+        .iter()
+        .any(|warning| warning.get_message_detail() == b"can't find PDF header"));
+}
+
+#[test]
+fn negative_hybrid_xref_stream_offset_keeps_prior_open_diagnostics() {
+    let error = match Pdf::open_with_options(
+        Cursor::new(negative_hybrid_xref_stream_bytes()),
+        PdfOpenOptions {
+            repair: false,
+            description: b"negative-xref-stm.pdf".to_vec(),
+            ..PdfOpenOptions::default()
+        },
+    ) {
+        Ok(_) => panic!("negative hybrid xref stream offset must fail to open"),
+        Err(error) => error,
+    };
+
+    let (source, diagnostics) = error
+        .open_failure()
+        .expect("load failure must retain prior diagnostics");
+    assert!(matches!(source, Error::Io(_)));
+    assert!(diagnostics.entries().iter().any(|warning| warning
+        .get_message_detail()
+        .windows(b"extraneous whitespace seen before xref".len())
+        .any(|window| window == b"extraneous whitespace seen before xref")));
 }
 
 #[test]
