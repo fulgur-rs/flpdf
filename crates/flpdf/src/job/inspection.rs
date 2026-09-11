@@ -374,7 +374,7 @@ fn unparse_object_with_stream_data<R: Read + Seek>(
 }
 
 fn first_stream_filter_name(stream_dictionary: &ObjectHandle) -> Result<Option<Vec<u8>>> {
-    let filter = stream_dictionary.get_key(b"/Filter");
+    let filter = stream_dictionary.try_get_key(b"/Filter")?;
     filter.type_code()?;
     if let Some(name) = filter.as_name() {
         return Ok(Some(name));
@@ -528,6 +528,21 @@ mod tests {
             first_stream_filter_name(&multiple.as_stream_dict().unwrap()).unwrap(),
             None
         );
+    }
+
+    #[test]
+    fn first_stream_filter_name_treats_an_unresolved_filter_as_absent() {
+        let mut pdf = recovered_pdf();
+        let stream = pdf.get_object_handle(ObjectRef::new(1, 0));
+        pdf.resolve(&stream).expect("stream must resolve");
+        let dictionary = stream
+            .as_stream_dict()
+            .expect("fixture object must be a stream");
+        dictionary
+            .replace_key(b"/Filter", pdf.get_object_handle(ObjectRef::new(99, 0)))
+            .expect("stream dictionary must be mutable");
+
+        assert_eq!(first_stream_filter_name(&dictionary).unwrap(), None);
     }
 
     #[test]
