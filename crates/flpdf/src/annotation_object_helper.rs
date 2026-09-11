@@ -5,8 +5,7 @@
 //! a `&mut Pdf<R>` and exposes typed, fail-soft read-only accessors for the
 //! common annotation attributes, mirroring qpdf's own transparently
 //! dereferencing `QPDFObjectHandle` API on top of this crate's
-//! [`ObjectHandle`], which requires an explicit resolve at every hop
-//! (`Pdf::resolve`) — see
+//! [`ObjectHandle`], which resolves each handle at the qpdf accessor boundary — see
 //! [`crate::form_field_object_helper::FormFieldObjectHelper`] for the same
 //! established shape.
 //!
@@ -72,7 +71,7 @@ use std::io::{Read, Seek};
 /// attributes are not inheritable.
 pub struct AnnotationObjectHelper<'a, R: Read + Seek + 'static> {
     annot: ObjectHandle,
-    pdf: &'a mut Pdf<R>,
+    _pdf: &'a mut Pdf<R>,
 }
 
 /// qpdf's `QPDFObjectHandle::getName` dummy-name sentinel
@@ -89,7 +88,7 @@ impl<'a, R: Read + Seek> AnnotationObjectHelper<'a, R> {
     /// the individual accessor methods.
     pub fn new(annot_ref: ObjectRef, pdf: &'a mut Pdf<R>) -> Self {
         let annot = pdf.get_object_handle(annot_ref);
-        Self { annot, pdf }
+        Self { annot, _pdf: pdf }
     }
 
     /// Construct a helper from the canonical annotation handle returned by
@@ -97,13 +96,13 @@ impl<'a, R: Read + Seek> AnnotationObjectHelper<'a, R> {
     /// direct annotation dictionaries, which have no [`ObjectRef`], as qpdf's
     /// `QPDFAnnotationObjectHelper` does.
     pub fn from_object_handle(annot: ObjectHandle, pdf: &'a mut Pdf<R>) -> Self {
-        Self { annot, pdf }
+        Self { annot, _pdf: pdf }
     }
 
     /// Resolve `self.annot` and return the key's resolved child handle.
-    fn resolved_key(&mut self, key: &[u8]) -> Result<ObjectHandle> {
+    fn resolved_key(&self, key: &[u8]) -> Result<ObjectHandle> {
         let child = self.annot.try_get_key(key)?;
-        self.pdf.resolve(&child)?;
+        child.try_dereference()?;
         Ok(child)
     }
 
@@ -281,7 +280,7 @@ impl<'a, R: Read + Seek> AnnotationObjectHelper<'a, R> {
         let ap = self.get_appearance_dictionary()?;
         if ap.as_dictionary().is_some() {
             let ap_sub = ap.try_get_key(&dict_key(which))?;
-            self.pdf.resolve(&ap_sub)?;
+            ap_sub.try_dereference()?;
             if ap_sub.as_stream_dict().is_some() {
                 // A direct appearance stream disregards state entirely
                 // (`QPDFAnnotationObjectHelper.cc:59-63`).
@@ -299,7 +298,7 @@ impl<'a, R: Read + Seek> AnnotationObjectHelper<'a, R> {
                 };
                 if !desired_state.is_empty() {
                     let ap_sub_val = ap_sub.try_get_key(&dict_key(&desired_state))?;
-                    self.pdf.resolve(&ap_sub_val)?;
+                    ap_sub_val.try_dereference()?;
                     if ap_sub_val.as_stream_dict().is_some() {
                         return Ok(ap_sub_val);
                     }
@@ -526,4 +525,30 @@ fn matrix_from_handle(handle: &ObjectHandle) -> Result<Option<Matrix>> {
         numbers[index] = number;
     }
     Ok(Some(Matrix::from(numbers)))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::io::Cursor;
+
+    #[test]
+    fn appearance_stream_propagates_unresolved_child_error() {
+        let unresolved = ObjectHandle::new_indirect_unresolved(ObjectRef::new(99, 0), -1);
+        let appearance = ObjectHandle::dictionary(vec![(b"/N".to_vec(), unresolved)]);
+        let annot = ObjectHandle::dictionary(vec![(b"/AP".to_vec(), appearance)]);
+        let mut pdf = Pdf::<Cursor<Vec<u8>>>::empty().expect("empty PDF should be available");
+        let mut helper = AnnotationObjectHelper {
+            annot,
+            _pdf: &mut pdf,
+        };
+
+        let error = helper
+            .get_appearance_stream(b"N", None)
+            .expect_err("unresolved appearance stream child must be reported");
+        assert!(matches!(
+            error,
+            crate::Error::Internal(message) if message == "object 99 0 belongs to a dropped PDF"
+        ));
+    }
 }
