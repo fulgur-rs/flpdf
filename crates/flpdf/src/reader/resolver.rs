@@ -1305,7 +1305,7 @@ impl<R: Read + Seek> ResolverHandle<R> {
                 b"parsed object",
                 object_description.as_bytes(),
                 i64::try_from(diagnostic.relative_offset).unwrap_or(i64::MAX),
-                diagnostic.message.as_bytes(),
+                &diagnostic.message,
             ))?;
         }
         if let Some(error) = trailing_data_error(input, parsed.next_offset, parsed.last_offset) {
@@ -2210,7 +2210,7 @@ impl<R: Read + Seek> ResolverHandle<R> {
         stream_number: u32,
         object_ref: ObjectRef,
         offset: u64,
-        message: impl Into<String>,
+        message: impl AsRef<[u8]>,
     ) -> Result<()> {
         let mut filename = self.core.borrow().description.clone();
         if !filename.is_empty() {
@@ -2224,7 +2224,7 @@ impl<R: Read + Seek> ResolverHandle<R> {
             filename,
             object,
             i64::try_from(offset).unwrap_or(i64::MAX),
-            message.into().into_bytes(),
+            message.as_ref(),
         ))
     }
 
@@ -3706,7 +3706,7 @@ impl<R: Read + Seek> ResolverHandle<R> {
                 &warning_filename,
                 format!("object {} {}", found_raw.get_obj(), found_raw.get_gen()),
                 i64::try_from(warning_offset).unwrap_or(i64::MAX),
-                warning.message.into_bytes(),
+                warning.message,
             ))
             .map_err(ReadObjectAtOffsetError::Body)?;
         }
@@ -11664,6 +11664,37 @@ mod tests {
                 .map(|entry| String::from_utf8_lossy(entry.what_bytes()).into_owned())
                 .collect::<Vec<_>>(),
             vec!["object 2 0, offset 55: expected dictionary key but found non-name object; inserting key /QPDFFake1"]
+        );
+    }
+
+    #[test]
+    fn a_live_resolver_preserves_raw_duplicate_dictionary_key_warning_bytes() {
+        let bytes = pdf_with_bodies(&[
+            b"1 0 obj\n<< /Type /Catalog >>\nendobj\n".to_vec(),
+            b"2 0 obj\n<< /K#ff 1 /K#ff 2 >>\nendobj\n".to_vec(),
+        ]);
+        let mut pdf = Pdf::open_mem_owned(bytes).expect("open");
+        let handle: ObjectHandle = pdf.get_object_handle(ObjectRef::new(2, 0));
+
+        pdf.resolve(&handle)
+            .expect("qpdf-style duplicate-key recovery");
+
+        assert_eq!(
+            handle
+                .try_get_key(b"/K\xff")
+                .expect("decoded raw key")
+                .as_integer(),
+            Some(2)
+        );
+        let diagnostics = pdf.repair_diagnostics();
+        let warning = diagnostics
+            .entries()
+            .iter()
+            .find(|warning| warning.get_message_detail().contains(&0xff))
+            .expect("duplicate-key warning");
+        assert_eq!(
+            warning.get_message_detail(),
+            b"dictionary has duplicated key /K\xff; last occurrence overrides earlier ones"
         );
     }
 

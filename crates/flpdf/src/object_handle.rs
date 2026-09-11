@@ -695,10 +695,11 @@ mod parse_tests {
 
         assert!(matches!(
             error,
-            crate::Error::Parse {
-                offset: 0,
-                ref message,
-            } if message == "treating unexpected brace token as null"
+            crate::Error::QpdfExc(warning)
+                if warning.get_filename() == b"parsed object"
+                    && warning.get_object().is_empty()
+                    && warning.get_file_position() == 0
+                    && warning.get_message_detail() == b"treating unexpected brace token as null"
         ));
     }
 
@@ -713,8 +714,11 @@ mod parse_tests {
 
         assert!(matches!(
             error,
-            crate::Error::Parse { ref message, .. }
-                if message == "ignoring excessively deeply nested data structure"
+            crate::Error::QpdfExc(warning)
+                if warning.get_filename() == b"parsed object"
+                    && warning.get_object().is_empty()
+                    && warning.get_message_detail()
+                        == b"ignoring excessively deeply nested data structure"
         ));
     }
 
@@ -728,10 +732,11 @@ mod parse_tests {
 
         assert!(matches!(
             error,
-            crate::Error::Parse {
-                offset: 2,
-                ref message,
-            } if message == "treating unexpected brace token as null"
+            crate::Error::QpdfExc(warning)
+                if warning.get_filename() == b"parsed object"
+                    && warning.get_object().is_empty()
+                    && warning.get_file_position() == 2
+                    && warning.get_message_detail() == b"treating unexpected brace token as null"
         ));
     }
 
@@ -758,7 +763,10 @@ mod parse_tests {
             let error = ObjectHandle::parse(input).expect_err("qpdf warning must fail parse");
             assert!(matches!(
                 error,
-                crate::Error::Parse { ref message, .. } if message == expected
+                crate::Error::QpdfExc(warning)
+                    if warning.get_filename() == b"parsed object"
+                        && warning.get_object().is_empty()
+                        && warning.get_message_detail() == expected.as_bytes()
             ));
         }
     }
@@ -874,6 +882,54 @@ mod parse_tests {
                 "parsed object (dictionary test, offset 2): expected dictionary key but found non-name object; inserting key /QPDFFake2".to_owned()
             )
         );
+    }
+
+    #[test]
+    fn parse_with_context_preserves_raw_dictionary_key_bytes_in_duplicate_warning() {
+        let pdf = quiet_context();
+        let parsed =
+            ObjectHandle::parse_with_context(&pdf, b"<< /K#ff 1 /K#ff 2 >>", "raw dictionary key")
+                .expect("qpdf recovers a duplicate dictionary key");
+
+        assert_eq!(
+            parsed
+                .try_get_key(b"/K\xff")
+                .expect("the decoded raw key is present")
+                .as_integer(),
+            Some(2)
+        );
+        let diagnostics = pdf.repair_diagnostics();
+        let warning = diagnostics
+            .entries()
+            .first()
+            .expect("duplicate-key warning");
+        assert_eq!(
+            warning.get_message_detail(),
+            b"dictionary has duplicated key /K\xff; last occurrence overrides earlier ones"
+        );
+        assert_eq!(
+            warning.what_bytes(),
+            b"parsed object (raw dictionary key, offset 2): dictionary has duplicated key /K\xff; last occurrence overrides earlier ones"
+        );
+    }
+
+    #[test]
+    fn parse_without_context_preserves_raw_dictionary_key_bytes_in_qpdf_exception() {
+        let error =
+            ObjectHandle::parse_with_description(b"<< /K#ff 1 /K#ff 2 >>", "raw dictionary key")
+                .expect_err("qpdf throws a contextless duplicate-key warning");
+
+        assert!(matches!(
+            error,
+            crate::Error::QpdfExc(warning)
+                if warning.get_filename() == b"parsed object"
+                    && warning.get_object() == b"raw dictionary key"
+                    && warning.get_file_position() == 2
+                    && warning.get_message_detail()
+                        == b"dictionary has duplicated key /K\xff; last occurrence overrides earlier ones"
+                    && warning.what_bytes()
+                        == b"parsed object (raw dictionary key, offset 2): dictionary has duplicated key /K\xff; last occurrence overrides earlier ones"
+        ));
     }
 
     #[test]
@@ -1369,12 +1425,6 @@ pub(crate) fn canonical_dictionary_key(key: &[u8]) -> Vec<u8> {
         canonical.extend_from_slice(key);
         canonical
     }
-}
-
-/// Convert a canonical ObjectHandle dictionary key back to the legacy
-/// `Dictionary` representation, whose writer adds the leading slash itself.
-pub(crate) fn legacy_dictionary_key(key: &[u8]) -> &[u8] {
-    key.strip_prefix(b"/").unwrap_or(key)
 }
 
 fn canonicalize_object_value(value: ObjectValue) -> ObjectValue {

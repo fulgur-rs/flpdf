@@ -64,14 +64,14 @@ fn deliver_diagnostic(
     source_description: &str,
     object_description: &str,
     offset: usize,
-    message: &str,
+    message: &[u8],
 ) -> Result<()> {
     let warning = QpdfExc::new(
         QpdfErrorCode::DamagedPdf,
         source_description.as_bytes(),
         object_description.as_bytes(),
         i64::try_from(offset).unwrap_or(i64::MAX),
-        message.as_bytes(),
+        message,
     );
     if let Some(context) = context {
         context.warn(warning)?;
@@ -161,7 +161,7 @@ fn parse_content_stream_handles_internal<C: ObjectHandleParserCallbacks>(
         };
         tokenizer.set_position(live_input.position())?;
         for diagnostic in diagnostics {
-            if diagnostic.message == "parse error while reading object" {
+            if diagnostic.message == b"parse error while reading object" {
                 stopped_on_container_eof = true;
             }
             deliver_diagnostic(
@@ -191,7 +191,7 @@ fn parse_content_stream_handles_internal<C: ObjectHandleParserCallbacks>(
                     source_description,
                     "stream data",
                     input.len(),
-                    "EOF found while reading inline image",
+                    b"EOF found while reading inline image",
                 )?;
                 break;
             }
@@ -223,7 +223,7 @@ fn parse_content_stream_handles_internal<C: ObjectHandleParserCallbacks>(
                     source_description,
                     "stream data",
                     image.end,
-                    diagnostic,
+                    diagnostic.as_bytes(),
                 )?; // cov:ignore: LLVM attributes this successful diagnostic-delivery terminator to the fallible error edge.
                 break;
             }

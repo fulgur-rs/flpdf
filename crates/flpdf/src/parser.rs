@@ -3,7 +3,7 @@ use std::collections::VecDeque;
 
 use crate::object_handle::{DocumentResolver, ObjectHandle, ObjectValue, NO_PARSED_OFFSET};
 use crate::tokenizer::{is_delimiter, is_ws, Token, TokenType, Tokenizer};
-use crate::{Error, ObjectRef, Result};
+use crate::{Error, ObjectRef, QpdfErrorCode, QpdfExc, Result};
 use std::rc::{Rc, Weak};
 
 /// Supplies handles created while building the parser's object graph: the
@@ -54,6 +54,12 @@ pub(crate) trait HandleResolver {
     /// call, if the caller has an observable object-description context.
     /// Detached legacy materialization keeps the default `None`.
     fn description_template(&self) -> Option<Vec<u8>> {
+        None
+    }
+
+    /// Return the object description used by qpdf when a parser warning is
+    /// thrown without an owning document (`QPDFParser.cc:487-498`).
+    fn contextless_warning_object_description(&self) -> Option<Vec<u8>> {
         None
     }
 
@@ -163,6 +169,7 @@ impl LiveInput for SliceLiveInput<'_> {
 #[derive(Default)]
 struct DetachedHandles {
     description_template: Option<Vec<u8>>,
+    warning_object_description: Option<Vec<u8>>,
 }
 
 impl HandleResolver for DetachedHandles {
@@ -172,6 +179,10 @@ impl HandleResolver for DetachedHandles {
 
     fn description_template(&self) -> Option<Vec<u8>> {
         self.description_template.clone()
+    }
+
+    fn contextless_warning_object_description(&self) -> Option<Vec<u8>> {
+        self.warning_object_description.clone()
     }
 }
 
@@ -320,6 +331,7 @@ pub(crate) fn parse_explicit_object_handle_with_description(
         description_template: Some(
             format!("parsed object, {object_description} at offset $PO").into_bytes(),
         ),
+        warning_object_description: Some(object_description.as_bytes().to_vec()),
     };
     let parsed =
         parse_live_file_object_with_context(&mut input_source, &mut detached_handles, false, None)?;
@@ -714,13 +726,10 @@ impl<I: LiveInput> LiveFileParser<'_, '_, '_, I> {
                     break candidate;
                 }
             };
-            self.warn(
-                frame_offset,
-                format!(
-                    "expected dictionary key but found non-name object; inserting key /{}",
-                    String::from_utf8_lossy(crate::object_handle::legacy_dictionary_key(&key))
-                ),
-            )?;
+            let mut message =
+                b"expected dictionary key but found non-name object; inserting key ".to_vec();
+            message.extend_from_slice(key.as_slice());
+            self.warn(frame_offset, message)?;
             values.insert(key, value);
         }
 
@@ -828,13 +837,10 @@ impl<I: LiveInput> LiveFileParser<'_, '_, '_, I> {
         parser: &mut Self,
     ) -> Result<()> {
         if values.insert(key.clone(), value).is_some() {
-            parser.warn(
-                offset,
-                format!(
-                    "dictionary has duplicated key /{}; last occurrence overrides earlier ones",
-                    String::from_utf8_lossy(crate::object_handle::legacy_dictionary_key(&key))
-                ),
-            )?;
+            let mut message = b"dictionary has duplicated key ".to_vec();
+            message.extend_from_slice(key.as_slice());
+            message.extend_from_slice(b"; last occurrence overrides earlier ones");
+            parser.warn(offset, message)?;
         }
         Ok(())
     }
@@ -914,7 +920,7 @@ impl<I: LiveInput> LiveFileParser<'_, '_, '_, I> {
         // (`QPDFParser.cc:140-143`). Buffered lookahead is parser-local, so
         // consume that one-shot diagnostic before the token can be replayed.
         if let Some(message) = token.error_message.take() {
-            self.warn(token.start, String::from_utf8_lossy(&message))?;
+            self.warn(token.start, message)?;
         }
         Ok(token)
     }
@@ -940,10 +946,18 @@ impl<I: LiveInput> LiveFileParser<'_, '_, '_, I> {
         Ok(())
     }
 
-    fn warn(&mut self, offset: usize, message: impl Into<String>) -> Result<()> {
-        let message = message.into();
+    fn warn(&mut self, offset: usize, message: impl AsRef<[u8]>) -> Result<()> {
+        let message = message.as_ref().to_vec();
         if !self.has_context {
-            return Err(Error::parse(offset, message));
+            return Err(Error::QpdfExc(QpdfExc::new(
+                QpdfErrorCode::DamagedPdf,
+                b"parsed object",
+                self.resolver
+                    .contextless_warning_object_description()
+                    .unwrap_or_default(),
+                i64::try_from(offset).unwrap_or(i64::MAX),
+                message,
+            )));
         }
         self.diagnostics.push(ParserDiagnostic {
             relative_offset: offset,
@@ -1102,11 +1116,16 @@ mod live_input_tests {
     fn detached_and_offset_handle_resolvers_preserve_reference_identity() {
         let mut detached_resolver = super::DetachedHandles {
             description_template: Some(b"parsed object,  at offset $PO".to_vec()),
+            warning_object_description: None,
         };
         let detached = detached_resolver.indirect_handle(ObjectRef::new(7, 2));
         assert_eq!(detached.object_ref(), Some(ObjectRef::new(7, 2)));
 
         let mut base = NullResolver;
+        assert_eq!(
+            HandleResolver::contextless_warning_object_description(&base),
+            None
+        );
         let mut rebasing = OffsetHandleResolver {
             resolver: &mut base,
             base_offset: 100,
@@ -1444,16 +1463,16 @@ mod live_input_tests {
             parsed
                 .diagnostics
                 .iter()
-                .map(|diagnostic| diagnostic.message.as_str())
+                .map(|diagnostic| diagnostic.message.as_slice())
                 .collect::<Vec<_>>(),
             vec![
-                "treating unexpected brace token as null",
-                "treating unexpected brace token as null",
-                "treating unexpected brace token as null",
-                "treating unexpected brace token as null",
-                "treating unexpected brace token as null",
-                "treating unexpected brace token as null",
-                "too many errors; giving up on reading object",
+                b"treating unexpected brace token as null".as_slice(),
+                b"treating unexpected brace token as null".as_slice(),
+                b"treating unexpected brace token as null".as_slice(),
+                b"treating unexpected brace token as null".as_slice(),
+                b"treating unexpected brace token as null".as_slice(),
+                b"treating unexpected brace token as null".as_slice(),
+                b"too many errors; giving up on reading object".as_slice(),
             ]
         );
         assert_eq!(input.position, 13, "tokens after the give-up remain unread");
@@ -1473,8 +1492,8 @@ mod live_input_tests {
             parsed
                 .diagnostics
                 .last()
-                .map(|diagnostic| diagnostic.message.as_str()),
-            Some("ignoring excessively deeply nested data structure")
+                .map(|diagnostic| diagnostic.message.as_slice()),
+            Some(b"ignoring excessively deeply nested data structure".as_slice())
         );
     }
 
@@ -1548,11 +1567,12 @@ mod live_input_tests {
         assert_eq!(
             diagnostics
                 .iter()
-                .map(|diagnostic| (diagnostic.relative_offset, diagnostic.message.as_str()))
+                .map(|diagnostic| (diagnostic.relative_offset, diagnostic.message.as_slice()))
                 .collect::<Vec<_>>(),
             vec![(
                 2,
-                "expected dictionary key but found non-name object; inserting key /QPDFFake1"
+                b"expected dictionary key but found non-name object; inserting key /QPDFFake1"
+                    .as_slice()
             )]
         );
     }
@@ -1576,27 +1596,27 @@ mod live_input_tests {
         let word = parse_with_null_resolver(b"bare-word");
         assert_eq!(word.value.as_string(), Some(b"bare-word".to_vec()));
         assert_eq!(
-            word.diagnostics[0].message,
-            "unknown token while reading object; treating as string"
+            word.diagnostics[0].message.as_slice(),
+            b"unknown token while reading object; treating as string"
         );
 
         let array_close = parse_with_null_resolver(b"]");
         assert!(array_close.value.is_null());
         assert_eq!(
-            array_close.diagnostics[0].message,
-            "treating unexpected array close token as null"
+            array_close.diagnostics[0].message.as_slice(),
+            b"treating unexpected array close token as null"
         );
 
         let dictionary_close = parse_with_null_resolver(b">>");
         assert!(dictionary_close.value.is_null());
         assert_eq!(
-            dictionary_close.diagnostics[0].message,
-            "unexpected dictionary close token"
+            dictionary_close.diagnostics[0].message.as_slice(),
+            b"unexpected dictionary close token"
         );
 
         let eof = parse_with_null_resolver(b"");
         assert!(eof.value.is_null());
-        assert_eq!(eof.diagnostics[0].message, "unexpected EOF");
+        assert_eq!(eof.diagnostics[0].message.as_slice(), b"unexpected EOF");
 
         let array_eof = parse_with_null_resolver(b"[");
         assert!(array_eof.value.is_null());
@@ -1604,9 +1624,12 @@ mod live_input_tests {
             array_eof
                 .diagnostics
                 .iter()
-                .map(|diagnostic| diagnostic.message.as_str())
+                .map(|diagnostic| diagnostic.message.as_slice())
                 .collect::<Vec<_>>(),
-            vec!["parse error while reading object", "unexpected EOF"]
+            vec![
+                b"parse error while reading object".as_slice(),
+                b"unexpected EOF".as_slice()
+            ]
         );
 
         let dictionary_eof = parse_with_null_resolver(b"<<");
@@ -1615,9 +1638,12 @@ mod live_input_tests {
             dictionary_eof
                 .diagnostics
                 .iter()
-                .map(|diagnostic| diagnostic.message.as_str())
+                .map(|diagnostic| diagnostic.message.as_slice())
                 .collect::<Vec<_>>(),
-            vec!["parse error while reading object", "unexpected EOF"]
+            vec![
+                b"parse error while reading object".as_slice(),
+                b"unexpected EOF".as_slice()
+            ]
         );
     }
 
@@ -1629,8 +1655,8 @@ mod live_input_tests {
             .get(b"/Last".as_slice())
             .is_some_and(ObjectHandle::is_null));
         assert_eq!(
-            missing_value.diagnostics[0].message,
-            "dictionary ended prematurely; using null as value for last key"
+            missing_value.diagnostics[0].message.as_slice(),
+            b"dictionary ended prematurely; using null as value for last key"
         );
 
         let duplicate = parse_with_null_resolver(b"<< /K 1 /K 2 >>");
@@ -1642,8 +1668,8 @@ mod live_input_tests {
             Some(2)
         );
         assert_eq!(
-            duplicate.diagnostics[0].message,
-            "dictionary has duplicated key /K; last occurrence overrides earlier ones"
+            duplicate.diagnostics[0].message.as_slice(),
+            b"dictionary has duplicated key /K; last occurrence overrides earlier ones"
         );
 
         let collision = parse_with_null_resolver(b"<< /QPDFFake1 1 2 >>");
@@ -1655,8 +1681,8 @@ mod live_input_tests {
             Some(2)
         );
         assert_eq!(
-            collision.diagnostics[0].message,
-            "expected dictionary key but found non-name object; inserting key /QPDFFake2"
+            collision.diagnostics[0].message.as_slice(),
+            b"expected dictionary key but found non-name object; inserting key /QPDFFake2"
         );
 
         let invalid_reference = parse_with_null_resolver(b"[ 0 0 R ]");
@@ -1771,9 +1797,9 @@ mod live_input_tests {
             parsed
                 .diagnostics
                 .iter()
-                .map(|diagnostic| diagnostic.message.as_str())
+                .map(|diagnostic| diagnostic.message.as_slice())
                 .collect::<Vec<_>>(),
-            vec!["name with stray # will not work with PDF >= 1.2"]
+            vec![b"name with stray # will not work with PDF >= 1.2".as_slice()]
         );
     }
 
@@ -1786,9 +1812,9 @@ mod live_input_tests {
             parsed
                 .diagnostics
                 .iter()
-                .map(|diagnostic| diagnostic.message.as_str())
+                .map(|diagnostic| diagnostic.message.as_slice())
                 .collect::<Vec<_>>(),
-            vec!["treating unexpected brace token as null"]
+            vec![b"treating unexpected brace token as null".as_slice()]
         );
     }
 
@@ -1806,8 +1832,8 @@ mod live_input_tests {
             parsed
                 .diagnostics
                 .last()
-                .map(|diagnostic| diagnostic.message.as_str()),
-            Some("ignoring excessively deeply nested data structure")
+                .map(|diagnostic| diagnostic.message.as_slice()),
+            Some(b"ignoring excessively deeply nested data structure".as_slice())
         );
     }
 
@@ -1841,15 +1867,15 @@ mod live_input_tests {
         if let Some(empty_offset) = parsed.empty {
             diagnostics.push(super::ParserDiagnostic {
                 relative_offset: usize::try_from(empty_offset).unwrap_or(usize::MAX),
-                message: "empty object treated as null".to_string(),
+                message: b"empty object treated as null".to_vec(),
             });
         }
         assert_eq!(
             diagnostics
                 .iter()
-                .map(|diagnostic| (diagnostic.relative_offset, diagnostic.message.as_str()))
+                .map(|diagnostic| (diagnostic.relative_offset, diagnostic.message.as_slice()))
                 .collect::<Vec<_>>(),
-            vec![(0, "empty object treated as null")]
+            vec![(0, b"empty object treated as null".as_slice())]
         );
     }
 
@@ -1870,7 +1896,7 @@ mod live_input_tests {
             diagnostics,
             vec![super::ParserDiagnostic {
                 relative_offset: 2,
-                message: "empty object treated as null".to_string(),
+                message: b"empty object treated as null".to_vec(),
             }]
         );
 
@@ -1916,7 +1942,7 @@ pub(crate) const MAX_PARSE_DEPTH: usize = 500;
 #[derive(Debug, PartialEq, Eq)]
 pub(crate) struct ParserDiagnostic {
     pub(crate) relative_offset: usize,
-    pub(crate) message: String,
+    pub(crate) message: Vec<u8>,
 }
 
 /// Handle-producing direct-object parse with the parser diagnostics retained.
@@ -1939,7 +1965,7 @@ pub(crate) fn parse_qpdf_direct_object_handle_with_diagnostics(
             NO_PARSED_OFFSET,
             vec![ParserDiagnostic {
                 relative_offset: usize::try_from(empty_offset).unwrap_or(usize::MAX),
-                message: "empty object treated as null".to_owned(),
+                message: b"empty object treated as null".to_vec(),
             }],
         ));
     }

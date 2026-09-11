@@ -406,6 +406,15 @@ the source header; the output graph and qpdf-visible orphan value are retained.
 | `QPDFTokenizer.cc` | 965 | `tokenizer.rs`（18 token types、owned value/raw/error bytes/offset、push/pull、pull-only `allowEOF`、`includeIgnorable`、space/comment、bad-token recovery、max length、`betweenTokens`、unread、inline-image `EI` discovery。`QPDFTokenizer.hh:34-193`; `QPDFTokenizer.cc:45-965`）+ `parser.rs` の content mode + `content_stream.rs` の `ParserCallbacks` orchestration + `object.rs` の `Operator` / `InlineImage`（`QPDFParser.cc:27-125,130-377`; `QPDFObjectHandle.cc:1770-1847`） | ✅ `QPDFTokenizer` の責務境界を移植済み。object/parser/content callback consumers は共有 tokenizer を使用し、旧 content lexer は削除 |
 | `InputSource` 系 5 ファイル | 625 | `Read + Seek` ジェネリクスで代替。所有者は `reader/resolver.rs` の `ResolverCore`（`m->file` 相当）。`ResolverCore` のメソッドは `InputSource` の 3 操作 `seek`/`tell`/`read`（`InputSource.hh:71-74`）に限定し、`OffsetInputSource`（`QPDF.cc:406`）が担う header shift は `seek`/`tell` が適用する。例外は `rewind_underlying_source` 1 つで、これは wrapper が持つ `proxied`（`libqpdf/qpdf/OffsetInputSource.hh:24`）に相当する — `OffsetInputSource::rewind` は logical 0 に行く（`OffsetInputSource.cc:55-59`）ため `m->file` では表現できない。owned-window 系の legacy helper（`read_window` / `read_to_owned`）は 2026-09-08（`flpdf-3yn9.48.25`）に `MAX_RESOLUTION_FALLBACKS` / `resolution_fallbacks_remaining` ごと削除済みで、現在は `crates/flpdf/tests/qpdf_route_hygiene_tests.rs` が不在を検査する。撤去前は `ResolverHandle` 側で `#[deprecated]` により記録していた（関数単位で切り離せるため CLAUDE.md 分類 (C) のマーク方式は comment block ではなく `#[deprecated]`）、`ResolverCore` の面には置かない | ⚪ |
 
+2026-09-12（`flpdf-3yn9.48.34`）: parser dictionary warnings now retain the
+tokenizer-decoded slash-prefixed key as raw bytes through the internal
+`ParserDiagnostic` transport. Document-owned parses deliver the same bytes to
+`QpdfExc`/`Diagnostics`, and contextless `ObjectHandle::parse` throws the
+qpdf-shaped `QPDFExc` with the `parsed object` filename. The parser no longer
+uses the legacy slash-removal helper and does not call `QPDF_Name::normalizeName`;
+that qpdf routine remains available to the unparse/JSON and writer name-emission
+owners.
+
 `QPDFObjectHandle::parsePageContents` keeps the `all_description` produced by
 `arrayOrStreamToStreamArray` when it enters `parseContentStream_data`
 (`libqpdf/QPDFObjectHandle.cc:1438-1485,1740-1850`). The canonical flpdf

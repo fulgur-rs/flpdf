@@ -230,8 +230,8 @@ crates/flpdf/src/xref.rs::BootstrapCache: prod 2 (1 files) / test 2
     crates/flpdf/src/xref.rs 2
 crates/flpdf/src/reader/resolver.rs::read_window: prod 5 (1 files) / test 0
     crates/flpdf/src/reader.rs 5
-crates/flpdf/src/object_handle.rs::legacy_dictionary_key: prod 3 (2 files) / test 0
-    crates/flpdf/src/parser.rs 2, crates/flpdf/src/writer/object.rs 1
+legacy_dictionary_key (A23): removed; production and test callers 0 after `.48.34`, `.48.35`, and `.48.36`
+crates/flpdf/src/object_handle.rs::canonical_dictionary_key: prod 22 / test 2
 crates/flpdf/src/reader/resolver.rs::ResolverCore: prod 5 (1 files) / test 0
     crates/flpdf/src/reader/resolver.rs 5
 crates/flpdf/src/reader/resolver.rs::object_cache: prod 10 (1 files) / test 1

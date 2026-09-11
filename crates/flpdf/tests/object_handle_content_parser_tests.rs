@@ -370,6 +370,27 @@ fn parse_page_contents_matches_qpdf_content_recovery_and_errors() {
 }
 
 #[test]
+fn parse_page_contents_preserves_raw_duplicate_dictionary_key_warning_bytes() {
+    let (pdf, page) = owned_page_with_contents(b"<< /K#ff 1 /K#ff 2 >>");
+    let mut callbacks = RecordingCallbacks::default();
+
+    page.parse_page_contents(&mut callbacks).unwrap();
+
+    let diagnostics = pdf.repair_diagnostics();
+    let warning = diagnostics
+        .entries()
+        .iter()
+        .find(|warning| warning.get_message_detail().contains(&0xff))
+        .expect("duplicate-key content warning");
+    assert_eq!(
+        warning.get_message_detail(),
+        b"dictionary has duplicated key /K\xff; last occurrence overrides earlier ones"
+    );
+    assert!(warning.what_bytes().ends_with(warning.get_message_detail()));
+    assert_eq!(warning.get_file_position(), 2);
+}
+
+#[test]
 fn parse_page_contents_reports_non_bad_token_diagnostics_and_nesting_limit() {
     let (pdf, page) = owned_page_with_contents(b"/a#1x");
     let mut callbacks = RecordingCallbacks::default();

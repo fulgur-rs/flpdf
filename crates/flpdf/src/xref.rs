@@ -467,7 +467,7 @@ pub(crate) struct XrefLoadOptions {
 fn damaged_warning(
     filename: &[u8],
     object: impl AsRef<[u8]>,
-    message: impl Into<String>,
+    message: impl AsRef<[u8]>,
     offset: Option<u64>,
 ) -> QpdfExc {
     QpdfExc::new(
@@ -477,7 +477,7 @@ fn damaged_warning(
         offset
             .map(|value| i64::try_from(value).unwrap_or(i64::MAX))
             .unwrap_or(0),
-        message.into().into_bytes(),
+        message.as_ref(),
     )
 }
 
@@ -775,7 +775,7 @@ impl BootstrapHandleDocument {
         handle
     }
 
-    fn push_warning(&self, message: impl Into<String>, offset: Option<u64>) {
+    fn push_warning(&self, message: impl AsRef<[u8]>, offset: Option<u64>) {
         // cov:ignore-start: bootstrap diagnostics are emitted only by the recoverable xref paths, which are covered through their public loader
         self.state.borrow_mut().diagnostics.push(damaged_warning(
             &self.options.description,
@@ -1130,13 +1130,13 @@ impl BootstrapHandleDocument {
             let malformed = !diagnostics.is_empty() && matches!(&value, ObjectValue::Null);
             for diagnostic in diagnostics {
                 let offset = diagnostic_start.saturating_add(diagnostic.relative_offset);
-                self.push_warning(
-                    format!(
-                        "object stream {stream_number} (object {} 0, offset {offset}): {}",
-                        object_ref.number, diagnostic.message
-                    ),
-                    Some(offset as u64),
-                );
+                let mut message = format!(
+                    "object stream {stream_number} (object {} 0, offset {offset}): ",
+                    object_ref.number
+                )
+                .into_bytes();
+                message.extend_from_slice(&diagnostic.message);
+                self.push_warning(message, Some(offset as u64));
             }
             // qpdf's `resolveObjectsInStream` always parses the member and
             // `updateCache` overwrites an existing cache slot
@@ -4380,7 +4380,7 @@ fn trailer_diagnostics(
         .into_iter()
         .map(|diagnostic| {
             let offset = (start as u64).saturating_add(diagnostic.relative_offset as u64);
-            let message = if diagnostic.message.starts_with("invalid character (") {
+            let message = if diagnostic.message.starts_with(b"invalid character (") {
                 source
                     .and_then(|source| invalid_hex_byte(source, diagnostic.relative_offset))
                     .map(|byte| {
@@ -4389,9 +4389,9 @@ fn trailer_diagnostics(
                         message.extend_from_slice(b") in hexstring");
                         message
                     })
-                    .unwrap_or_else(|| diagnostic.message.into_bytes())
+                    .unwrap_or(diagnostic.message)
             } else {
-                diagnostic.message.into_bytes()
+                diagnostic.message
             };
             QpdfExc::new(
                 QpdfErrorCode::DamagedPdf,
@@ -4941,7 +4941,7 @@ fn xref_file_object_diagnostic(
         filename,
         object,
         i64::try_from(offset.saturating_add(diagnostic.relative_offset as u64)).unwrap_or(i64::MAX),
-        diagnostic.kind.message().as_bytes(),
+        diagnostic.kind.message(),
     )
 }
 
@@ -5725,6 +5725,48 @@ mod final_handle_tests {
         let source_stream = document.handle_for_reference(ObjectRef::new(4, 0));
         assert!(source_stream.end_offsets().0 >= 0);
         assert_eq!(member.end_offsets(), source_stream.end_offsets());
+    }
+
+    #[test]
+    fn bootstrap_objstm_preserves_raw_duplicate_key_warning_bytes() {
+        let member_ref = ObjectRef::new(7, 0);
+        let document = bootstrap_objstm_document(
+            1,
+            b"7 0 ",
+            b"<< /K#ff 1 /K#ff 2 >>",
+            BTreeMap::from([(
+                member_ref,
+                XrefEntry::Compressed {
+                    stream: 4,
+                    index: 0,
+                },
+            )]),
+        );
+
+        document
+            .resolve_objects_in_stream(4)
+            .expect("duplicate-key member warning is recoverable");
+        let member = document.handle_for_reference(member_ref);
+        assert_eq!(
+            member
+                .try_get_key(b"/K\xff")
+                .expect("decoded raw member key")
+                .as_integer(),
+            Some(2)
+        );
+        let state = document.state.borrow();
+        let warning = state
+            .diagnostics
+            .entries()
+            .iter()
+            .find(|warning| warning.get_message_detail().contains(&0xff))
+            .expect("duplicate-key ObjStm warning");
+        assert_eq!(
+            warning.get_message_detail(),
+            b"object stream 4 (object 7 0, offset 6): dictionary has duplicated key /K\xff; last occurrence overrides earlier ones"
+        );
+        assert_eq!(warning.get_file_position(), 6);
+        assert!(warning.what_bytes().ends_with(warning.get_message_detail()));
     }
 
     #[test]
@@ -9222,7 +9264,7 @@ mod final_handle_tests {
             750,
             vec![ParserDiagnostic {
                 relative_offset: 3,
-                message: "treating unexpected brace token as null".to_owned(),
+                message: b"treating unexpected brace token as null".to_vec(),
             }],
             b"bad13.pdf",
             None,
@@ -9237,25 +9279,51 @@ mod final_handle_tests {
     }
 
     #[test]
+    fn xref_file_object_diagnostic_preserves_raw_tokenizer_warning_bytes() {
+        let warning = xref_file_object_diagnostic(
+            XrefObjectDescription::Ordinary,
+            ObjectRef::new(7, 0),
+            50,
+            b"input.pdf",
+            FileObjectDiagnostic {
+                kind: FileObjectDiagnosticKind::TokenizerWarning {
+                    message: b"dictionary has duplicated key /K\xff".to_vec(),
+                },
+                relative_offset: 2,
+            },
+        );
+
+        assert_eq!(
+            warning.get_message_detail(),
+            b"dictionary has duplicated key /K\xff"
+        );
+        assert_eq!(warning.get_file_position(), 52);
+        assert_eq!(
+            warning.what_bytes(),
+            b"input.pdf (object 7 0, offset 52): dictionary has duplicated key /K\xff"
+        );
+    }
+
+    #[test]
     fn trailer_hex_diagnostics_preserve_raw_invalid_bytes() {
         let diagnostics = trailer_diagnostics(
             750,
             vec![
                 ParserDiagnostic {
                     relative_offset: 0,
-                    message: "invalid character (�) in hexstring".to_owned(),
+                    message: "invalid character (�) in hexstring".as_bytes().to_vec(),
                 },
                 ParserDiagnostic {
                     relative_offset: 4,
-                    message: "invalid character (�) in hexstring".to_owned(),
+                    message: "invalid character (�) in hexstring".as_bytes().to_vec(),
                 },
                 ParserDiagnostic {
                     relative_offset: 7,
-                    message: "invalid character (�) in hexstring".to_owned(),
+                    message: "invalid character (�) in hexstring".as_bytes().to_vec(),
                 },
                 ParserDiagnostic {
                     relative_offset: 8,
-                    message: "invalid character (�) in hexstring".to_owned(),
+                    message: "invalid character (�) in hexstring".as_bytes().to_vec(),
                 },
             ],
             b"bad13.pdf",
