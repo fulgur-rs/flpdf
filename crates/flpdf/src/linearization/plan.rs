@@ -34,6 +34,7 @@
 use crate::linearization::renumber::RenumberMap;
 use crate::object_handle::ObjectHandle;
 use crate::parser::MAX_PARSE_DEPTH;
+use crate::pdf::WriterObjectOrderKey;
 use crate::writer::object_streams::{
     compressible_objgens_qpdf_plan, eligibility_context, is_eligible_for_objstm_handle,
     ObjectStreamMode, PlannerConfig,
@@ -876,6 +877,12 @@ pub struct LinearizationPlan {
     /// Empty only when the document has no open-document objects (or, in generate
     /// mode, when all of them are ObjStm-eligible).
     pub part4_open_document_plain: Vec<ObjectRef>,
+
+    /// qpdf destination-object ordering projected onto a fresh page-selection
+    /// target. Ordinary parsed documents leave this absent and use their live
+    /// `ObjectRef` order. The hint builder needs this same projection when a
+    /// page references shared objects from different linearization sections.
+    pub(crate) writer_object_order: Option<BTreeMap<ObjectRef, WriterObjectOrderKey>>,
 
     /// Retained qpdf-style bidirectional object-user map used to route generated
     /// and preserved ObjStm containers without re-reading the PDF.
@@ -1787,6 +1794,7 @@ impl LinearizationPlan {
             part4_other_pages_shared,
             part4_rest,
             part4_open_document_plain,
+            writer_object_order: pdf.writer_object_order.clone(),
             total_object_count,
             root_ref,
             pages_tree_ref,
@@ -2195,6 +2203,20 @@ impl LinearizationPlan {
             .collect()
     }
 
+    /// Return qpdf's destination-object ordering projection for a plan ref.
+    ///
+    /// A page-selection target retains this map from the merge job so hint
+    /// consumers can compare objects across Part 3 and Part 8 without falling
+    /// back to fresh target object numbers. Ordinary parsed documents use the
+    /// live ref as their destination ObjGen, matching qpdf's direct order.
+    pub(crate) fn writer_object_order_key(&self, object_ref: ObjectRef) -> WriterObjectOrderKey {
+        self.writer_object_order
+            .as_ref()
+            .and_then(|order| order.get(&object_ref))
+            .copied()
+            .unwrap_or_else(|| WriterObjectOrderKey::primary(object_ref))
+    }
+
     /// The refs that [`RenumberMap::from_plan`] assigns a renumber slot
     /// (`by_original` key set).
     ///
@@ -2264,6 +2286,7 @@ impl Default for LinearizationPlan {
             part4_other_pages_shared: Vec::new(),
             part4_rest: Vec::new(),
             part4_open_document_plain: Vec::new(),
+            writer_object_order: None,
             total_object_count: 0,
             root_ref: None,
             pages_tree_ref: None,

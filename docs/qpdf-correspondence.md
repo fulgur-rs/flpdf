@@ -2238,6 +2238,17 @@ flpdf は primary/foreign allocation を表す provenance projection
 全 bytes gate が qpdf 11.9.0 との一致を固定し、qtest route や compatibility bridge は
 追加しない。
 
+`flpdf-mwyo` では、classic hint page が Part 3 と Part 8 の shared object を同時に
+参照する場合も、section 順ではなく qpdf の destination `ObjGen` 順で
+`shared_identifiers` を出力する。qpdf は `obj_user_to_objects[page]` の set を走査して
+shared-table index へ変換するため（`QPDF_linearization.cc:1350-1410`）、Part-8 object
+7 と Part-3 object 20 の synthetic cross-section fixture では `[3,2]` が正しく、
+`[2,3]` は構造的に valid でも byte parity を壊す。flpdf は page-selection target の
+allocation provenance projection を `LinearizationPlan` から hint builder へ渡し、
+fresh target number に戻らず classic/ObjStm の既存 ordering contract と整合させる。
+`cli_pages_objstm_order_qpdf.rs` の qpdf-zlib differential test がこの4-byte hint差を
+固定する。
+
 `flpdf-obsc` では、`QPDFJob::doSplitPages` が chunk 作成前に行う
 `shouldRemoveUnreferencedResources` の verbose side effect も同じ job boundary に
 接続した。qpdf は Auto 判定の開始、最初の共有 resource finding、または共有なしの

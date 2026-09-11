@@ -3,6 +3,8 @@
 #![cfg(feature = "qpdf-zlib-compat")]
 
 use assert_cmd::Command;
+use std::collections::BTreeMap;
+use std::io::Write;
 use std::path::Path;
 use std::process::{Command as ProcessCommand, Output};
 
@@ -175,6 +177,112 @@ fn assert_annotated_linearized_matches_qpdf(page_args: &[&str], message: &str) {
         std::fs::read(&flpdf_output).unwrap(),
         std::fs::read(&qpdf_output).unwrap(),
         "{message}"
+    );
+}
+
+fn cross_section_shared_pdf() -> Vec<u8> {
+    let mut objects = BTreeMap::new();
+    objects.insert(1, b"<< /Type /Catalog /Pages 2 0 R >>".to_vec());
+    objects.insert(
+        2,
+        b"<< /Type /Pages /Kids [4 0 R 5 0 R 6 0 R] /Count 3 >>".to_vec(),
+    );
+    objects.insert(
+        4,
+        b"<< /Type /Page /Parent 2 0 R /MediaBox [0 0 200 200] /Resources << /Font << /FA 20 0 R >> >> /Contents 10 0 R >>".to_vec(),
+    );
+    objects.insert(
+        5,
+        b"<< /Type /Page /Parent 2 0 R /MediaBox [0 0 200 200] /Resources << /Font << /FA 20 0 R /FB 7 0 R >> >> /Contents 11 0 R >>".to_vec(),
+    );
+    objects.insert(
+        6,
+        b"<< /Type /Page /Parent 2 0 R /MediaBox [0 0 200 200] /Resources << /Font << /FB 7 0 R >> >> /Contents 12 0 R >>".to_vec(),
+    );
+    objects.insert(
+        7,
+        b"<< /Type /Font /Subtype /Type1 /BaseFont /Courier >>".to_vec(),
+    );
+    objects.insert(
+        20,
+        b"<< /Type /Font /Subtype /Type1 /BaseFont /Helvetica >>".to_vec(),
+    );
+    for (number, text) in [
+        (10, b"BT /FA 12 Tf 20 100 Td (p1) Tj ET\n".as_slice()),
+        (
+            11,
+            b"BT /FA 12 Tf 20 100 Td (p2a) Tj ET BT /FB 12 Tf 20 80 Td (p2b) Tj ET\n",
+        ),
+        (12, b"BT /FB 12 Tf 20 100 Td (p3) Tj ET\n"),
+    ] {
+        let mut stream = format!("<< /Length {} >>\nstream\n", text.len()).into_bytes();
+        stream.extend_from_slice(text);
+        stream.extend_from_slice(b"endstream");
+        objects.insert(number, stream);
+    }
+
+    let max_object = *objects.keys().max().unwrap();
+    let mut bytes = b"%PDF-1.7\n".to_vec();
+    let mut offsets = vec![None; max_object as usize + 1];
+    for (number, body) in objects {
+        offsets[number as usize] = Some(bytes.len());
+        writeln!(&mut bytes, "{number} 0 obj").unwrap();
+        bytes.extend_from_slice(&body);
+        bytes.extend_from_slice(b"\nendobj\n");
+    }
+    let xref_offset = bytes.len();
+    writeln!(&mut bytes, "xref\n0 {}", max_object + 1).unwrap();
+    bytes.extend_from_slice(b"0000000000 65535 f \n");
+    for offset in offsets.into_iter().skip(1) {
+        match offset {
+            Some(offset) => writeln!(&mut bytes, "{offset:010} 00000 n ").unwrap(),
+            None => bytes.extend_from_slice(b"0000000000 65535 f \n"),
+        }
+    }
+    writeln!(
+        &mut bytes,
+        "trailer\n<< /Size {} /Root 1 0 R >>\nstartxref\n{xref_offset}\n%%EOF",
+        max_object + 1
+    )
+    .unwrap();
+    bytes
+}
+
+#[test]
+fn classic_linearize_cross_section_shared_identifiers_match_qpdf() {
+    if skip_if_qpdf_missing() {
+        return;
+    }
+    let temp = tempfile::tempdir().unwrap();
+    let input = temp.path().join("cross-section-shared.pdf");
+    let qpdf_output = temp.path().join("qpdf.pdf");
+    let flpdf_output = temp.path().join("flpdf.pdf");
+    std::fs::write(&input, cross_section_shared_pdf()).unwrap();
+
+    let qpdf = ProcessCommand::new("qpdf")
+        .args(["--static-id", "--linearize", "--object-streams=disable"])
+        .arg(&input)
+        .arg(&qpdf_output)
+        .output()
+        .expect("qpdf should spawn");
+    assert!(
+        qpdf.status.success(),
+        "qpdf cross-section probe failed: {}",
+        String::from_utf8_lossy(&qpdf.stderr)
+    );
+
+    Command::cargo_bin("flpdf")
+        .unwrap()
+        .args(["--static-id", "--linearize", "--object-streams=disable"])
+        .arg(&input)
+        .arg(&flpdf_output)
+        .assert()
+        .success();
+
+    assert_eq!(
+        std::fs::read(&flpdf_output).unwrap(),
+        std::fs::read(&qpdf_output).unwrap(),
+        "classic cross-section shared identifiers must match qpdf"
     );
 }
 
