@@ -3167,8 +3167,10 @@ mod tests {
 
     #[test]
     fn merge_writer_order_missing_ref_uses_fresh_fallback() {
-        let mut plan = LinearizationPlan::default();
-        plan.writer_object_order = Some(BTreeMap::new());
+        let plan = LinearizationPlan {
+            writer_object_order: Some(BTreeMap::new()),
+            ..Default::default()
+        };
         let object_ref = ObjectRef::new(91, 0);
         assert_eq!(
             plan.writer_object_order_key(object_ref),
