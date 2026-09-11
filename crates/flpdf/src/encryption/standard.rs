@@ -27,7 +27,7 @@
 //! SHA-256/384/512 construction.
 //!
 //! # Scope
-//! V=1 (R=2, 40-bit), V=2 (R=2/R=3, 40–128-bit), V=4 (R=4, 128-bit), and
+//! V=1/V=2 (R=2/R=3, with V=1 fixed at 40 bits), V=4 (R=4, 128-bit), and
 //! V=5 R=5/R=6 AES-256 key derivation are covered here.
 //!
 //! # Note on end-to-end compatibility
@@ -141,7 +141,7 @@ fn truncate_password_v5(password: &[u8]) -> &[u8] {
 /// Only the V/R/Length combinations that this module's Algorithms 2/6/7
 /// actually implement are accepted:
 ///
-/// - V=1 ⇒ R=2 and Length=40 (RC4-40, fixed)
+/// - V=1 ⇒ Length=40; qpdf accepts both R=2 and the observed R=3 form
 /// - V=2 ⇒ R∈{2,3} and Length∈`[40,128]` in 8-bit steps (RC4-{40..128})
 ///
 /// Other handlers (V=4 CF dispatch, V=5 R=5/R=6 AES-256) belong to other
@@ -168,8 +168,11 @@ fn validate_inputs(inputs: &StandardHandlerInputs<'_>) -> Result<usize> {
         }
         .into());
     }
-    // V=1 is fixed at R=2 / Length=40 by spec.
-    if inputs.v == 1 && (inputs.r != 2 || inputs.length_bits != 40) {
+    // qpdf's initializeEncryption selects 40 bits for every V <= 1. The
+    // reader-side input object already carries that effective length, so a
+    // V=1 value other than 40 bits is an invalid internal projection even
+    // though R=3 itself is accepted.
+    if inputs.v == 1 && inputs.length_bits != 40 {
         return Err(EncryptedError::UnsupportedHandler {
             filter: "Standard".into(),
             v: inputs.v,
@@ -673,9 +676,11 @@ pub(crate) fn trim_user_password(password: &[u8]) -> Vec<u8> {
 /// Inputs for building a V=1 or V=2 `/Encrypt` dictionary via
 /// [`build_v1_v2_encrypt_dict`].
 ///
-/// The V/R/Length matrix is the same as the reader-side [`StandardHandlerInputs`]
-/// accepts for V=1/V=2: V=1 ⇒ R=2/Length=40; V=2 ⇒ R∈{2,3} with R=2 fixed at
-/// Length=40 and R=3 spanning Length∈`[40,128]` in 8-bit steps.
+/// This writer-side matrix is intentionally narrower than the reader-side
+/// [`StandardHandlerInputs`] matrix: writer generation keeps V=1 at R=2,
+/// while the reader also accepts qpdf's V=1/R=3 input form. V=2 accepts
+/// R∈{2,3}, with R=2 fixed at Length=40 and R=3 spanning Length∈`[40,128]`
+/// in 8-bit steps.
 pub(crate) struct V1V2EncryptParams<'a> {
     /// `/V` — algorithm version (1 or 2).
     pub v: i64,
@@ -1621,5 +1626,72 @@ mod v5_dictionary_tests {
                 .as_boolean(),
             Some(false)
         );
+    }
+}
+
+#[cfg(test)]
+mod v1_v2_reader_tests {
+    use super::{check_user_password, StandardHandlerInputs};
+
+    #[test]
+    fn v1_r3_uses_qpdf_r3_key_derivation_with_a_40_bit_key() {
+        let id0 = [
+            0xdd, 0x22, 0x11, 0x51, 0x71, 0xe3, 0x2b, 0x2c, 0x97, 0x7f, 0x0d, 0x40, 0xd4, 0x5c,
+            0x99, 0x72,
+        ];
+        let o = [
+            0xd8, 0x03, 0xdb, 0xa0, 0x8a, 0xc8, 0xe1, 0x91, 0xd7, 0x89, 0x88, 0xa6, 0x74, 0xbd,
+            0x14, 0xb8, 0x18, 0x01, 0xc4, 0xa2, 0xac, 0x82, 0xde, 0x11, 0x52, 0x5b, 0x69, 0xac,
+            0x42, 0xf0, 0x45, 0x89,
+        ];
+        let u = [
+            0x16, 0xa5, 0xf5, 0xd4, 0xa6, 0x3a, 0x2c, 0xd3, 0x26, 0x55, 0x24, 0xfa, 0x22, 0x48,
+            0x46, 0x60, 0x28, 0xbf, 0x4e, 0x5e, 0x4e, 0x75, 0x8a, 0x41, 0x64, 0x00, 0x4e, 0x56,
+            0xff, 0xfa, 0x01, 0x08,
+        ];
+        let inputs = StandardHandlerInputs {
+            v: 1,
+            r: 3,
+            length_bits: 40,
+            p: -12,
+            id0: &id0,
+            u: &u,
+            o: &o,
+            encrypt_metadata: true,
+        };
+
+        let file_key = check_user_password(b"623", &inputs)
+            .expect("qpdf accepts Standard V=1/R=3 with a 40-bit key");
+
+        assert_eq!(file_key, [0xe3, 0x90, 0xe2, 0x20, 0xda]);
+    }
+
+    #[test]
+    fn v1_rejects_an_inconsistent_non_40_bit_internal_projection() {
+        let id0 = [0xdd; 16];
+        let o = [0xd8; 32];
+        let u = [0x16; 32];
+        let inputs = StandardHandlerInputs {
+            v: 1,
+            r: 3,
+            length_bits: 128,
+            p: -12,
+            id0: &id0,
+            u: &u,
+            o: &o,
+            encrypt_metadata: true,
+        };
+
+        let error = check_user_password(b"623", &inputs)
+            .expect_err("V=1 must retain qpdf's fixed 40-bit effective length");
+
+        assert!(matches!(
+            error,
+            crate::Error::Encrypted(crate::error::EncryptedError::UnsupportedHandler {
+                v: 1,
+                r: 3,
+                ..
+            })
+        ));
     }
 }
