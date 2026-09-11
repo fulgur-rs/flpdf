@@ -158,3 +158,39 @@ fn encryption_segment_errors_follow_qpdf_callbacks_before_termination() {
         assert_matches_qpdf(args, label);
     }
 }
+
+#[test]
+fn segment_callbacks_do_not_overtake_earlier_argv_errors() {
+    if !qpdf_available() {
+        if std::env::var_os("CI").is_some() {
+            panic!("{EXPECTED_QPDF_VERSION} is required for this parity test on CI");
+        }
+        eprintln!("skipping: {EXPECTED_QPDF_VERSION} is not available");
+        return;
+    }
+
+    assert_matches_qpdf(
+        &["--bad", "--pages", "--"],
+        "unknown top-level option before pages callback",
+    );
+    assert_matches_qpdf(
+        &[
+            "--encrypt",
+            "u",
+            "o",
+            "256",
+            "--use-aes=y",
+            "input.pdf",
+            "output.pdf",
+        ],
+        "unknown option after encryption key-length table switch",
+    );
+    assert_matches_qpdf(
+        &["--empty", "--empty", "--pages", "--"],
+        "repeated top-level selector before pages callback",
+    );
+    assert_matches_qpdf(
+        &["--help", "--pages", "--"],
+        "help-table error before pages callback",
+    );
+}

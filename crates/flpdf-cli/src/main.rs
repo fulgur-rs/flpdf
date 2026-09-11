@@ -5366,6 +5366,46 @@ fn encrypt_option_table_name(key_len: Option<u32>) -> &'static str {
     }
 }
 
+/// Return whether the active qpdf encryption option table registers `name`.
+/// qpdf switches tables immediately after consuming the key length, so an
+/// option from another key-length table must fail at that token rather than
+/// being deferred until the segment terminator (`auto_job_init.hh:133-166`).
+fn encryption_option_table_accepts(key_len: Option<u32>, name: &str) -> bool {
+    match key_len {
+        None => matches!(name, "user-password" | "owner-password" | "bits"),
+        Some(40) => matches!(name, "extract" | "annotate" | "print" | "modify"),
+        Some(128) => matches!(
+            name,
+            "cleartext-metadata"
+                | "force-V4"
+                | "accessibility"
+                | "extract"
+                | "print"
+                | "assemble"
+                | "annotate"
+                | "form"
+                | "modify-other"
+                | "modify"
+                | "use-aes"
+        ),
+        Some(256) => matches!(
+            name,
+            "cleartext-metadata"
+                | "force-R5"
+                | "allow-insecure"
+                | "accessibility"
+                | "extract"
+                | "print"
+                | "assemble"
+                | "annotate"
+                | "form"
+                | "modify-other"
+                | "modify"
+        ),
+        Some(_) => false,
+    }
+}
+
 fn unrecognized_encrypt_argument(token: &str, key_len: Option<u32>) -> UsageError {
     UsageError::new(format!(
         "unrecognized argument {token} ({} options must be terminated with --)",
@@ -5414,14 +5454,14 @@ impl EncryptSegmentCallbackState {
         let option_name = segment_option_name(raw_name);
 
         if let Some(name) = option_name {
+            if !encryption_option_table_accepts(self.key_len, name) {
+                return Err(unrecognized_encrypt_argument(&token_text, self.key_len).into());
+            }
             if matches!(name, "user-password" | "owner-password" | "bits") {
                 if self.positional_mode {
                     return Err(Box::new(UsageError::new(
                         "positional and dashed encryption arguments may not be mixed",
                     )));
-                }
-                if self.key_len_seen {
-                    return Err(unrecognized_encrypt_argument(&token_text, self.key_len).into());
                 }
                 let value = attached.ok_or_else(|| {
                     let parameter = match name {
