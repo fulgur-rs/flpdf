@@ -143,7 +143,7 @@ pub fn drop_struct_elem_dangling_pg_with_max_depth<R: Read + Seek>(
         None => return Ok(Vec::new()), // No catalog, nothing to do.
     };
     let catalog = pdf.get_object_handle(catalog_ref);
-    pdf.resolve(&catalog)?;
+    catalog.try_dereference()?;
     if catalog.try_as_dictionary()?.is_none() {
         return Ok(state.objr_obj_targets);
     }
@@ -733,6 +733,16 @@ mod tests {
         let mut pdf = open(&objs);
         let targets = drop_struct_elem_dangling_pg(&mut pdf, &keep_3_and_5())
             .expect("non-dict catalog is a noop");
+        assert!(targets.is_empty());
+    }
+
+    #[test]
+    fn unresolved_catalog_is_a_noop() {
+        let mut objs = base_objs();
+        objs.remove(&1);
+        let mut pdf = open(&objs);
+        let targets = drop_struct_elem_dangling_pg(&mut pdf, &keep_3_and_5())
+            .expect("an unresolved catalog handle must be skipped");
         assert!(targets.is_empty());
     }
 
