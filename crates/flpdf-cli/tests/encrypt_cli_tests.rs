@@ -984,21 +984,18 @@ fn invalid_encrypt_key_length_matches_qpdf_usage_message() {
 
     assert_eq!(qpdf.status.code(), Some(2));
     assert_eq!(flpdf.status.code(), qpdf.status.code());
-    let qpdf_stderr = String::from_utf8_lossy(&qpdf.stderr);
-    let qpdf_line = qpdf_stderr
-        .lines()
-        .find(|line| !line.is_empty())
-        .unwrap()
-        .strip_prefix("qpdf: ")
-        .unwrap();
-    let flpdf_stderr = String::from_utf8_lossy(&flpdf.stderr);
-    let flpdf_line = flpdf_stderr
-        .lines()
-        .find(|line| !line.is_empty())
-        .unwrap()
-        .strip_prefix("flpdf: ")
-        .unwrap();
-    assert_eq!(flpdf_line, qpdf_line);
+    // Compare the whole stderr, not just the message line: qpdf reports this
+    // through `ArgParser::usage`, so the leading blank line and the trailing
+    // "For help:" block are part of the contract too.
+    let normalize = |stderr: &[u8], program: &str| {
+        String::from_utf8_lossy(stderr)
+            .replace(&format!("{program}: "), "PROG: ")
+            .replace(&format!("{program} --help"), "PROG --help")
+    };
+    assert_eq!(
+        normalize(&flpdf.stderr, "flpdf"),
+        normalize(&qpdf.stderr, "qpdf")
+    );
     assert!(!qpdf_output.exists());
     assert!(!flpdf_output.exists());
 }

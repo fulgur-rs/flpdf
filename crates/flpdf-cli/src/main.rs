@@ -5834,7 +5834,10 @@ fn parse_encrypt_key_len(value: &str) -> CliResult<u32> {
         "40" => Ok(40),
         "128" => Ok(128),
         "256" => Ok(256),
-        _ => Err("encryption key length must be 40, 128, or 256".into()),
+        // A UsageError, not a plain string: qpdf reports this through
+        // `ArgParser::usage`, whose output carries the leading blank line and
+        // the trailing "For help:" block that `usage_exit` models.
+        _ => Err(UsageError::new("encryption key length must be 40, 128, or 256").into()),
     }
 }
 
