@@ -939,6 +939,81 @@ fn json_object_selector_limits_qpdf_section() {
         .stdout(predicate::str::contains("\"obj:1 0 R\"").not());
 }
 
+#[test]
+fn json_object_selector_matches_qpdf_parse_object_id_prefix_rules() {
+    if skip_unless_qpdf_11_9() {
+        return;
+    }
+    let input = write_temp_pdf(&one_page_pdf_with_stream());
+    for selector in ["3 garbage", "3 R", "3 99 R", "xyz", "-1", "5,-1", "+3tail"] {
+        let selector_arg = format!("--json-object={selector}");
+        let qpdf = ShellCommand::new("qpdf")
+            .args(["--json=2", "--json-key=qpdf", &selector_arg])
+            .arg(input.path())
+            .output()
+            .unwrap();
+        let flpdf = Command::cargo_bin("flpdf")
+            .unwrap()
+            .args(["--json=2", "--json-key=qpdf", &selector_arg])
+            .arg(input.path())
+            .output()
+            .unwrap();
+
+        assert_eq!(flpdf.status.code(), qpdf.status.code(), "{selector}");
+        assert!(
+            qpdf.status.success(),
+            "qpdf 11.9.0 probe failed for {selector}: {}",
+            String::from_utf8_lossy(&qpdf.stderr)
+        );
+        let qpdf_json: serde_json::Value = serde_json::from_slice(&qpdf.stdout).unwrap();
+        let flpdf_json: serde_json::Value = serde_json::from_slice(&flpdf.stdout).unwrap();
+        assert_eq!(flpdf_json["qpdf"][1], qpdf_json["qpdf"][1], "{selector}");
+    }
+
+    let selector_arg = "--json-object=5,2147483648";
+    let qpdf = ShellCommand::new("qpdf")
+        .args(["--json=2", "--json-key=qpdf", selector_arg])
+        .arg(input.path())
+        .output()
+        .unwrap();
+    let flpdf = Command::cargo_bin("flpdf")
+        .unwrap()
+        .args(["--json=2", "--json-key=qpdf", selector_arg])
+        .arg(input.path())
+        .output()
+        .unwrap();
+    assert_eq!(flpdf.status.code(), Some(2));
+    assert_eq!(flpdf.status.code(), qpdf.status.code());
+    assert!(String::from_utf8_lossy(&flpdf.stderr).contains("integer out of range converting"));
+}
+
+#[test]
+fn json_v1_zero_object_selector_keeps_object_maps_empty_like_qpdf() {
+    if skip_unless_qpdf_11_9() {
+        return;
+    }
+    let input = write_temp_pdf(&one_page_pdf_with_stream());
+    let args = ["--json=1", "--json-object=xyz"];
+    let qpdf = ShellCommand::new("qpdf")
+        .args(args)
+        .arg(input.path())
+        .output()
+        .unwrap();
+    let flpdf = Command::cargo_bin("flpdf")
+        .unwrap()
+        .args(args)
+        .arg(input.path())
+        .output()
+        .unwrap();
+    assert_eq!(flpdf.status.code(), qpdf.status.code());
+    let qpdf_json: serde_json::Value = serde_json::from_slice(&qpdf.stdout).unwrap();
+    let flpdf_json: serde_json::Value = serde_json::from_slice(&flpdf.stdout).unwrap();
+    assert_eq!(flpdf_json["objects"], qpdf_json["objects"]);
+    assert_eq!(flpdf_json["objectinfo"], qpdf_json["objectinfo"]);
+    assert!(flpdf_json["objects"].as_object().unwrap().is_empty());
+    assert!(flpdf_json["objectinfo"].as_object().unwrap().is_empty());
+}
+
 // ---------------------------------------------------------------------------
 // Test 5: --json-key invalid — exit code != 0, error on stderr
 // ---------------------------------------------------------------------------
@@ -1030,20 +1105,18 @@ fn live_qpdf_json_v2_rejects_v1_only_object_keys_with_same_diagnostic() {
 // ---------------------------------------------------------------------------
 
 #[test]
-fn json_object_invalid_exits_nonzero_with_error() {
+fn json_object_integer_overflow_exits_nonzero_with_qpdf_error() {
     let input = write_temp_pdf(&one_page_pdf_with_stream());
 
     let mut cmd = Command::cargo_bin("flpdf").unwrap();
     cmd.args([
         "--json",
-        "--json-object=xyz",
+        "--json-object=5,2147483648",
         input.path().to_str().unwrap(),
     ])
     .assert()
-    // Exit code 2 specifically (see sibling test rationale).
     .code(2)
-    .stderr(predicate::str::contains("--json-object"))
-    .stderr(predicate::str::contains("xyz"));
+    .stderr(predicate::str::contains("integer out of range converting"));
 }
 
 // ---------------------------------------------------------------------------

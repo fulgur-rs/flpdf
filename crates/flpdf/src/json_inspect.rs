@@ -221,62 +221,57 @@ impl JsonKey {
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum JsonObjectSelector {
     /// A specific indirect object identified by (number, generation).
-    Object { number: u32, generation: i32 },
+    Object { number: i32, generation: i32 },
     /// The trailer dictionary entry in the objects map.
     Trailer,
 }
 
 impl JsonObjectSelector {
-    /// Parse a qpdf-style selector string: `"trailer"`, `"3"`, `"3,0"`.
+    /// Parse qpdf's `QPDFJob::parse_object_id` selector string.
     ///
-    /// Returns `None` if the syntax is malformed (caller maps to the
-    /// actionable error required by the acceptance criteria).
+    /// qpdf parses the object and generation through `QUtil::string_to_int`,
+    /// so both fields consume a signed decimal prefix and missing digits mean
+    /// zero. Generation is read only after the first comma; an empty suffix
+    /// leaves it at zero. Integer overflow is the only parse error.
     ///
     /// Rules:
     /// - `"trailer"` → `Trailer` (exact lowercase match only)
     /// - `"N"` → `Object { number: N, generation: 0 }`
     /// - `"N,G"` → `Object { number: N, generation: G }`
-    /// - The qpdf object-reference spelling `"N G R"` is also accepted; qpdf
-    ///   uses this form when an argument is passed as one token from its test
-    ///   driver (`QPDFJob.cc:929-952`).
-    /// - More than 2 comma-separated parts, empty string, non-numeric
-    ///   parts, negative numbers, or integer overflow → `None`.
+    /// - trailing text, signed values, empty strings, and `"N G R"`-shaped
+    ///   values follow qpdf's decimal-prefix behavior rather than a separate
+    ///   reference grammar (`QPDFJob.cc:929-940`).
     #[allow(clippy::should_implement_trait)]
-    pub fn from_str(s: &str) -> Option<Self> {
+    pub fn parse(s: &str) -> Result<Self, String> {
         if s == "trailer" {
-            return Some(JsonObjectSelector::Trailer);
+            return Ok(JsonObjectSelector::Trailer);
         }
-        if s.is_empty() {
-            return None;
-        }
-        let reference_parts: Vec<&str> = s.split_whitespace().collect();
-        if reference_parts.len() == 3 && reference_parts[2] == "R" {
-            let number = reference_parts[0].parse::<u32>().ok()?;
-            let generation = reference_parts[1].parse::<i32>().ok()?;
-            return Some(JsonObjectSelector::Object { number, generation });
-        }
-        let parts: Vec<&str> = s.splitn(3, ',').collect();
-        if parts.len() > 2 {
-            return None;
-        }
-        // Reject leading '+' or any non-digit characters to match qpdf's strict parsing.
-        let num_str = parts[0];
-        if num_str.is_empty() || !num_str.bytes().all(|b| b.is_ascii_digit()) {
-            return None;
-        }
-        let number: u32 = num_str.parse().ok()?;
-
-        let generation: i32 = if parts.len() == 2 {
-            let gen_str = parts[1];
-            if gen_str.is_empty() || !gen_str.bytes().all(|b| b.is_ascii_digit()) {
-                return None;
+        let number = parse_qpdf_selector_integer(s)?;
+        let generation = if let Some(comma) = s.find(',') {
+            if comma + 1 == s.len() {
+                0
+            } else {
+                parse_qpdf_selector_integer(&s[comma + 1..])?
             }
-            gen_str.parse().ok()?
         } else {
             0
         };
+        Ok(JsonObjectSelector::Object { number, generation })
+    }
 
-        Some(JsonObjectSelector::Object { number, generation })
+    /// Parse a selector while preserving the old optional API for callers
+    /// that only need to distinguish success from overflow.
+    #[allow(clippy::should_implement_trait)]
+    pub fn from_str(s: &str) -> Option<Self> {
+        Self::parse(s).ok()
+    }
+}
+
+fn parse_qpdf_selector_integer(value: &str) -> Result<i32, String> {
+    match crate::qutil::qpdf_string_to_int_checked(value) {
+        crate::qutil::QpdfIntParse::Value(value) => Ok(value),
+        crate::qutil::QpdfIntParse::NoDigits => Ok(0),
+        crate::qutil::QpdfIntParse::Overflow(message) => Err(message),
     }
 }
 
@@ -655,9 +650,27 @@ mod tests {
                 generation: 3
             })
         );
-        assert!(JsonObjectSelector::from_str("").is_none());
-        assert!(JsonObjectSelector::from_str("1,2,3").is_none());
-        assert!(JsonObjectSelector::from_str("1,").is_none());
+        assert_eq!(
+            JsonObjectSelector::from_str("1,2,3"),
+            Some(JsonObjectSelector::Object {
+                number: 1,
+                generation: 2
+            })
+        );
+        assert_eq!(
+            JsonObjectSelector::from_str("1,"),
+            Some(JsonObjectSelector::Object {
+                number: 1,
+                generation: 0
+            })
+        );
+        assert_eq!(
+            JsonObjectSelector::from_str("-1"),
+            Some(JsonObjectSelector::Object {
+                number: -1,
+                generation: 0
+            })
+        );
 
         assert!(matches!(
             convert_object_json_error(ObjectJsonError::NonFiniteFloat),

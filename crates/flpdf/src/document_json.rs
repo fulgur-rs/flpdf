@@ -54,14 +54,14 @@ pub(crate) fn write_json_v1_objects_key<R: Read + Seek>(
     Json::write_dictionary_open(out, &mut object_first, 1)?;
     for handle in pdf.get_all_objects().map_err(ConvertError::from)? {
         let object_gen = object_map_identity(&handle);
-        if !object_selected(wanted_objects, object_gen) {
+        if !object_selected(wanted_objects, object_gen, false) {
             continue;
         }
         let key = format!("{} {} R", object_gen.get_obj(), object_gen.get_gen());
         Json::write_dictionary_key(out, &mut object_first, key.as_bytes(), 2)?;
         handle.write_json(1, out, true, 2)?;
     }
-    if trailer_selected(wanted_objects) {
+    if trailer_selected(wanted_objects, false) {
         Json::write_dictionary_key(out, &mut object_first, b"trailer", 2)?;
         pdf.trailer().write_json(1, out, true, 2)?; // cov:ignore: llvm-cov attributes this successful trailer serialization to its opening write expressions
     } // cov:ignore: llvm-cov attributes the successful trailer branch continuation to its write expressions
@@ -82,7 +82,7 @@ pub(crate) fn write_json_v1_objectinfo_key<R: Read + Seek>(
     Json::write_dictionary_open(out, &mut object_first, 1)?;
     for handle in pdf.get_all_objects().map_err(ConvertError::from)? {
         let object_gen = object_map_identity(&handle);
-        if !object_selected(wanted_objects, object_gen) {
+        if !object_selected(wanted_objects, object_gen, false) {
             continue;
         }
 
@@ -271,7 +271,7 @@ pub fn write_json_key<R: Read + Seek>(
     let objects = pdf.get_all_objects().map_err(ConvertError::from)?;
     for handle in objects {
         let object_gen = object_map_identity(&handle);
-        if !object_selected(wanted_objects, object_gen) {
+        if !object_selected(wanted_objects, object_gen, true) {
             continue;
         }
         let result = match stream_mode {
@@ -296,7 +296,7 @@ pub fn write_json_key<R: Read + Seek>(
         result?;
     }
 
-    if trailer_selected(wanted_objects) {
+    if trailer_selected(wanted_objects, true) {
         let trailer = pdf.trailer();
         Json::write_dictionary_key(out, &mut objects_first, b"trailer", 3)?;
         let mut trailer_first = true;
@@ -317,23 +317,30 @@ pub fn write_json_key<R: Read + Seek>(
     Ok(())
 }
 
-fn object_selected(selectors: &[JsonObjectSelector], object_gen: QpdfObjGen) -> bool {
+fn object_selected(
+    selectors: &[JsonObjectSelector],
+    object_gen: QpdfObjGen,
+    zero_object_is_all: bool,
+) -> bool {
     selectors.is_empty()
         || selectors.iter().any(|selector| {
             matches!(
                 selector,
                 JsonObjectSelector::Object { number, generation }
-                    if i64::from(*number) == object_gen.get_obj()
-                        && i64::from(*generation) == object_gen.get_gen()
+                    if zero_object_is_all && *number == 0
+                        || i64::from(*number) == object_gen.get_obj()
+                            && i64::from(*generation) == object_gen.get_gen()
             )
         })
 }
 
-fn trailer_selected(selectors: &[JsonObjectSelector]) -> bool {
+fn trailer_selected(selectors: &[JsonObjectSelector], zero_object_is_all: bool) -> bool {
     selectors.is_empty()
-        || selectors
-            .iter()
-            .any(|selector| matches!(selector, JsonObjectSelector::Trailer))
+        || selectors.iter().any(|selector| {
+            matches!(selector, JsonObjectSelector::Trailer)
+                || (zero_object_is_all
+                    && matches!(selector, JsonObjectSelector::Object { number: 0, .. }))
+        })
 }
 
 fn stream_decode_level(level: DecodeLevel) -> crate::writer::DecodeLevel {

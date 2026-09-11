@@ -2572,10 +2572,8 @@ impl QPDFJob {
                     Error::Usage(UsageError::new(".jsonObject: value must be a string"))
                 })?;
                 let item = String::from_utf8_lossy(&item);
-                let selector = JsonObjectSelector::from_str(&item).ok_or_else(|| {
-                    Error::Usage(UsageError::new(format!(
-                        ".jsonObject: invalid object selector {item}"
-                    )))
+                let selector = JsonObjectSelector::parse(&item).map_err(|message| {
+                    Error::Usage(UsageError::new(format!(".jsonObject: {message}")))
                 })?;
                 configuration.json_objects.push(selector);
             }
@@ -6715,8 +6713,8 @@ mod tests {
         job.initialize_from_json_partial(r#"{"jsonObject":[1]}"#)
             .expect_err("jsonObject entries must be strings");
         let mut job = QPDFJob::new();
-        job.initialize_from_json_partial(r#"{"jsonObject":["unknown"]}"#)
-            .expect_err("jsonObject selectors must be valid");
+        job.initialize_from_json_partial(r#"{"jsonObject":["2147483648"]}"#)
+            .expect_err("jsonObject selector integer overflow must be rejected");
         let mut job = QPDFJob::new();
         job.initialize_from_json_partial(r#"{"removeAttachment":[1]}"#)
             .expect_err("attachment names must be strings");

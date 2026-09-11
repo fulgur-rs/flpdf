@@ -4253,12 +4253,10 @@ fn run_json(cli: &Cli, image_options: ImageTransformOptions, empty: bool) -> Cli
     // 2. Validate --json-object selectors before doing any I/O.
     let mut json_objects: Vec<JsonObjectSelector> = Vec::new();
     for raw in &cli.json_object {
-        match JsonObjectSelector::from_str(raw.as_str()) {
-            Some(s) => json_objects.push(s),
-            None => {
-                emit_logger_error(format!(
-                    "flpdf: --json-object selector \"{raw}\" must be 'trailer', 'N', or 'N,G'\n"
-                ));
+        match JsonObjectSelector::parse(raw.as_str()) {
+            Ok(s) => json_objects.push(s),
+            Err(message) => {
+                emit_logger_error(format!("flpdf: {message}\n"));
                 std::process::exit(2);
             }
         }
@@ -8490,6 +8488,7 @@ fn run_dump_object(
     object_ref: &str,
     suppress_warnings: bool,
 ) -> CliResult<()> {
+    let selector = parse_show_object_selector(object_ref)?;
     let input = input.ok_or_else(missing_input_usage_error)?;
 
     let mut pdf = open_pdf_with_suppression(&input, repair, password, suppress_warnings)?;
@@ -8497,25 +8496,28 @@ fn run_dump_object(
     job.set_logger(cli_logger());
     job.set_message_prefix(progname());
     job.set_suppress_warnings(suppress_warnings);
-    if let Some((number, generation)) = parse_raw_dump_object_selector(object_ref)
-        .filter(|(_, generation)| *generation > i32::from(u16::MAX))
-    {
-        return finish_job_exit_status(
-            job.dump_object_by_raw_identity(&mut pdf, number, generation)?,
-        );
+    match selector {
+        ShowObjectSelector::Trailer => {
+            let object = pdf.trailer();
+            finish_job_exit_status(job.show_object(&mut pdf, object, false, false)?)
+        }
+        ShowObjectSelector::Object { number, generation } => {
+            if generation > i32::from(u16::MAX) {
+                return finish_job_exit_status(
+                    job.dump_object_by_raw_identity(&mut pdf, number, generation)?,
+                );
+            }
+            let object_ref = ObjectRef::new(number as u32, generation as u16);
+            finish_job_exit_status(job.dump_object(&mut pdf, object_ref)?)
+        }
+        ShowObjectSelector::Null => {
+            logger_info(b"null\n")?;
+            finish_job_exit_status(job.inspect(&mut pdf, |_pdf| Ok::<(), flpdf::Error>(()))?)
+        }
+        ShowObjectSelector::NoObject => {
+            finish_job_exit_status(job.inspect(&mut pdf, |_pdf| Ok::<(), flpdf::Error>(()))?)
+        }
     }
-    let object_ref = ObjectRef::parse(object_ref)?;
-    finish_job_exit_status(job.dump_object(&mut pdf, object_ref)?)
-}
-
-fn parse_raw_dump_object_selector(value: &str) -> Option<(i32, i32)> {
-    let parts: Vec<_> = value.split_whitespace().collect();
-    if parts.len() != 2 && !(parts.len() == 3 && parts[2] == "R") {
-        return None;
-    }
-    let number = parts[0].parse::<i32>().ok()?;
-    let generation = parts[1].parse::<i32>().ok()?;
-    (number > 0 && generation >= 0).then_some((number, generation))
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -8526,27 +8528,21 @@ enum ShowObjectSelector {
     NoObject,
 }
 
-/// Parse qpdf's `--show-object` selector without changing the shared
-/// `ObjectRef::parse` syntax used by the legacy `dump-object` command.
+/// Parse qpdf's `parse_object_id` selector for both top-level `--show-object`
+/// and the legacy `dump-object` command.
 fn parse_show_object_selector(value: &str) -> CliResult<ShowObjectSelector> {
-    if value == "trailer" {
-        return Ok(ShowObjectSelector::Trailer);
+    match JsonObjectSelector::parse(value).map_err(UsageError::new)? {
+        JsonObjectSelector::Trailer => Ok(ShowObjectSelector::Trailer),
+        JsonObjectSelector::Object { number, .. } if number <= 0 => {
+            Ok(ShowObjectSelector::NoObject)
+        }
+        JsonObjectSelector::Object { generation, .. } if generation < 0 => {
+            Ok(ShowObjectSelector::Null)
+        }
+        JsonObjectSelector::Object { number, generation } => {
+            Ok(ShowObjectSelector::Object { number, generation })
+        }
     }
-
-    let (number, generation) = value.split_once(',').unwrap_or((value, "0"));
-    let number = qpdf_selector_integer(number)?;
-    let generation = if generation.is_empty() {
-        0
-    } else {
-        qpdf_selector_integer(generation)?
-    };
-    if number <= 0 {
-        return Ok(ShowObjectSelector::NoObject);
-    }
-    if generation < 0 {
-        return Ok(ShowObjectSelector::Null);
-    }
-    Ok(ShowObjectSelector::Object { number, generation })
 }
 
 /// qpdf's `QUtil::string_to_int` uses `strtoll`: it accepts a signed decimal
