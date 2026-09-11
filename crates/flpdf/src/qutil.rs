@@ -606,14 +606,14 @@ pub fn parse_numrange(range: &[u8], max: i32) -> crate::Result<Vec<i32>> {
         let last_num = last_num.unwrap_or_default();
 
         if group_match.is_exclude {
-            let work = populate_numrange_group(first_num, is_span, last_num);
+            let work = populate_numrange_group(first_num, is_span, last_num)?;
             let mut exclusions = std::collections::BTreeSet::new();
             exclusions.extend(work.iter().copied());
             let previous = std::mem::take(&mut last_group);
             last_group.extend(previous.into_iter().filter(|n| !exclusions.contains(n)));
         } else {
             result.append(&mut last_group);
-            last_group = populate_numrange_group(first_num, is_span, last_num);
+            last_group = populate_numrange_group(first_num, is_span, last_num)?;
         }
 
         cursor = group_end;
@@ -714,16 +714,33 @@ fn check_numrange_value(input: &[u8], offset: usize, value: i32, max: i32) -> cr
     Ok(value)
 }
 
-fn populate_numrange_group(first: i32, is_span: bool, last: i32) -> Vec<i32> {
-    let mut group = vec![first];
+fn populate_numrange_group(first: i32, is_span: bool, last: i32) -> crate::Result<Vec<i32>> {
+    let mut group = Vec::new();
+    try_push_numrange_value(&mut group, first)?;
     if is_span {
         if first > last {
-            group.extend((last..first).rev());
+            for value in (last..first).rev() {
+                try_push_numrange_value(&mut group, value)?;
+            }
         } else if first < last {
-            group.extend((first + 1)..=last);
+            for value in (first + 1)..=last {
+                try_push_numrange_value(&mut group, value)?;
+            }
         }
     }
+    Ok(group)
+}
+
+/// Push one eagerly materialized range value without allowing Rust's global
+/// allocator to abort the process. qpdf's vector growth throws `std::bad_alloc`,
+/// which its CLI catches as an ordinary exit-2 error (`QUtil.cc:1328-1340`,
+/// `qpdf/qpdf.cc:32-43`).
+fn try_push_numrange_value(group: &mut Vec<i32>, value: i32) -> crate::Result<()> {
     group
+        .try_reserve(1)
+        .map_err(|_| crate::Error::System("std::bad_alloc".to_owned()))?;
+    group.push(value);
+    Ok(())
 }
 
 fn numrange_error(input: &[u8], offset: usize, detail: &[u8]) -> crate::Error {

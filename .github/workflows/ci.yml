@@ -363,6 +363,7 @@ jobs:
           # qpdf 11.9.0 oracle (flpdf-d499).
           cargo test -p flpdf-cli --features qpdf-zlib-compat --test cli_linearize_multi_source_qpdf
           cargo test -p flpdf-cli --features qpdf-zlib-compat --test cli_pages_objstm_order_qpdf
+          cargo test -p flpdf-cli --features qpdf-zlib-compat --test cli_pages_numrange_alloc_qpdf
           # Pins top-level no-pages rotate/split transformation handoff
           # (generate-appearances and flatten-annotations) against qpdf's
           # createQPDF -> writeQPDF boundary (flpdf-m6kt).
