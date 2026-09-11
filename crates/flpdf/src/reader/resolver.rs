@@ -710,8 +710,12 @@ pub(crate) struct ResolverHandle<R: Read + Seek + 'static> {
     /// and therefore includes the line ending immediately before
     /// `endstream`. Retain the observed suffix for inspection consumers that
     /// have their own display-framing policy; the qpdf pipe path always reads
-    /// the complete recovered length before any AES/RC4 stage.
-    recovered_stream_eols: RefCell<BTreeMap<QpdfObjGen, crate::parser::RecoveredStreamEol>>,
+    /// the complete recovered length before any AES/RC4 stage. The map key is
+    /// `(QpdfObjGen, stream-data offset)` rather than object identity alone:
+    /// qpdf can read an older `/Prev` xref stream at a different offset while
+    /// retaining a newer value for the same object generation
+    /// (`libqpdf/QPDF.cc:1664-1689`).
+    recovered_stream_eols: RefCell<BTreeMap<(QpdfObjGen, u64), crate::parser::RecoveredStreamEol>>,
     /// A `Weak` to this same allocation, so minting a canonical handle can
     /// attach the resolver the handle will later call back into.
     ///
@@ -4104,9 +4108,11 @@ impl<R: Read + Seek> ResolverHandle<R> {
         if let Some(eol) = recovered_eol {
             self.recovered_stream_eols
                 .borrow_mut()
-                .insert(object_gen, eol);
+                .insert((object_gen, stream_offset), eol);
         } else {
-            self.recovered_stream_eols.borrow_mut().remove(&object_gen);
+            self.recovered_stream_eols
+                .borrow_mut()
+                .remove(&(object_gen, stream_offset));
         }
         if let Some(next_position) = next_position {
             self.seek(next_position)?;
@@ -4153,13 +4159,17 @@ impl<R: Read + Seek> ResolverHandle<R> {
         })
     }
 
+    /// Return the recovered framing suffix for one exact source read.
+    /// `stream_offset` is qpdf's stream-data position, not the object header
+    /// position (`libqpdf/QPDF.cc:1363-1368,1488-1492`).
     pub(crate) fn recovered_stream_eol(
         &self,
-        object_ref: ObjectRef,
+        object_gen: QpdfObjGen,
+        stream_offset: u64,
     ) -> Option<crate::parser::RecoveredStreamEol> {
         self.recovered_stream_eols
             .borrow()
-            .get(&QpdfObjGen::from_object_ref(object_ref))
+            .get(&(object_gen, stream_offset))
             .copied()
     }
 
@@ -5787,7 +5797,14 @@ mod tests {
             .expect("canonical stream read");
 
         assert!(read.as_stream_dict().is_some());
-        assert!(resolver.recovered_stream_eol(object_ref).is_some());
+        let stream_offset = read.get_parsed_offset();
+        assert!(stream_offset >= 0);
+        assert!(resolver
+            .recovered_stream_eol(
+                QpdfObjGen::from_object_ref(object_ref),
+                stream_offset as u64
+            )
+            .is_some());
         assert!(owner
             .repair_diagnostics()
             .entries()
@@ -5991,16 +6008,28 @@ mod tests {
     fn recovered_stream_eol_lookup_returns_the_recorded_value() {
         let resolver = resolver_over(Vec::new());
         let object_ref = ObjectRef::new(1, 0);
+        let stream_offset = 42;
         resolver.recovered_stream_eols.borrow_mut().insert(
-            QpdfObjGen::from_object_ref(object_ref),
+            (QpdfObjGen::from_object_ref(object_ref), stream_offset),
             crate::parser::RecoveredStreamEol::CrLf,
         );
 
         assert_eq!(
-            resolver.recovered_stream_eol(object_ref),
+            resolver.recovered_stream_eol(QpdfObjGen::from_object_ref(object_ref), stream_offset),
             Some(crate::parser::RecoveredStreamEol::CrLf)
         );
-        assert_eq!(resolver.recovered_stream_eol(ObjectRef::new(2, 0)), None);
+        assert_eq!(
+            resolver
+                .recovered_stream_eol(QpdfObjGen::from_object_ref(object_ref), stream_offset + 1),
+            None
+        );
+        assert_eq!(
+            resolver.recovered_stream_eol(
+                QpdfObjGen::from_object_ref(ObjectRef::new(2, 0)),
+                stream_offset,
+            ),
+            None
+        );
     }
 
     /// AC6 case 4: a resolver on which no authentication step has run at all

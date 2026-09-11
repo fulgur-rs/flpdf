@@ -8624,8 +8624,14 @@ mod final_handle_tests {
         )
         .expect("a recovered canonical xref stream should still parse its one free entry");
 
+        let stream = resolver.get_object_handle(ObjectRef::new(1, 0));
+        let stream_offset = stream.get_parsed_offset();
+        assert!(stream_offset >= 0);
         assert_eq!(
-            resolver.recovered_stream_eol(ObjectRef::new(1, 0)),
+            resolver.recovered_stream_eol(
+                QpdfObjGen::from_object_ref(ObjectRef::new(1, 0)),
+                stream_offset as u64,
+            ),
             Some(crate::parser::RecoveredStreamEol::Lf)
         );
         assert!(state.loaded.entries.is_empty());

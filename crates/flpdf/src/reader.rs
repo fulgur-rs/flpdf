@@ -382,14 +382,17 @@ impl<R: Read + Seek> Pdf<R> {
     /// after a repaired stream-length scan. The `dump-object` reserialization
     /// consumer uses this qpdf-shaped metadata without a second raw value
     /// cache; stream-data output itself keeps the complete recovered span.
+    /// The lookup uses this handle's raw qpdf object identity and its
+    /// stream-data parsed offset, so an older `/Prev` read cannot lend its
+    /// framing classification to a newer revision reusing the same identity.
     ///
     /// A recovered EOL is not removable framing when the stream's own bytes
     /// were replaced, it has a data provider, qpdf's `decryptStream` route
     /// would transform this stream, or the source went through qpdf-style xref
-    /// reconstruction.
+    /// reconstruction. A direct or otherwise offset-less stream has no
+    /// recovered source framing to trim.
     pub(crate) fn canonical_recovered_stream_eol(
         &self,
-        object_ref: ObjectRef,
         stream: &ObjectHandle,
     ) -> Result<Option<&'static [u8]>> {
         if self.resolver.reconstructed_xref() {
@@ -406,9 +409,16 @@ impl<R: Read + Seek> Pdf<R> {
                 return Ok(None);
             }
         }
+        let Some(object_gen) = stream.qpdf_obj_gen() else {
+            return Ok(None);
+        };
+        let parsed_offset = stream.get_parsed_offset();
+        if parsed_offset < 0 {
+            return Ok(None);
+        }
         Ok(self
             .resolver
-            .recovered_stream_eol(object_ref)
+            .recovered_stream_eol(object_gen, parsed_offset as u64)
             .map(crate::parser::RecoveredStreamEol::as_bytes))
     }
 
@@ -1547,6 +1557,36 @@ mod warning_api_tests {
         assert_eq!(second.len(), 1);
         assert_eq!(second.entries()[0].get_message_detail(), b"second warning");
         assert!(!pdf.any_warnings());
+    }
+}
+
+#[cfg(test)]
+mod recovered_stream_eol_lookup_tests {
+    use super::Pdf;
+    use crate::{ObjectHandle, ObjectRef};
+
+    #[test]
+    fn direct_values_have_no_recovered_source_eol() {
+        let pdf = Pdf::empty().expect("empty PDF");
+        let value = ObjectHandle::integer(7);
+
+        assert_eq!(
+            pdf.canonical_recovered_stream_eol(&value)
+                .expect("direct value lookup"),
+            None
+        );
+    }
+
+    #[test]
+    fn unresolved_indirect_values_have_no_parsed_offset_for_eol_lookup() {
+        let mut pdf = Pdf::empty().expect("empty PDF");
+        let value = pdf.get_object_handle(ObjectRef::new(99, 0));
+
+        assert_eq!(
+            pdf.canonical_recovered_stream_eol(&value)
+                .expect("unresolved value lookup"),
+            None
+        );
     }
 }
 
