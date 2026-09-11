@@ -1462,8 +1462,11 @@ page-operation別 route と QPDFJob ownerへの完全統合は残る。
 rotate/split × generate/flatten の4セルで qpdf-zlib-compatible byte differential として固定。
 新規 Tx/Ch appearance は qpdf の `/Tx BMC\nEMC\n` 初期buffer + `ValueSetter`
 token-filter（`QPDFFormFieldObjectHelper.cc:766-860`）を使うため、通常書込みでは生成内容、
-split の foreign copy では qpdf と同じ初期bufferを観測する。Job writer の未指定 decode levelも
-qpdf の default generalized（`QPDFJob.hh:635-637`）へ揃えた。
+split の foreign copy では qpdf と同じ初期bufferを観測する。Job-level の未指定 decode level は
+qpdf の default generalized（`QPDFJob.hh:635-637`）を JSON/inspection 側で保持する一方、writer
+へは `decode_level_set` が true のときだけ渡す（`QPDFJob.cc:2865-2875`）。したがって writer の
+未指定 decode は qpdf `QPDFWriter` の default none であり、`compressStreams: "n"` でも入力暗号化を
+保持する。この job/writer の状態分離を `flpdf-skim` で固定した。
 
 `writeQPDF` は選択した処理の後に文書のopen-time/lazy warningを集約し、warning summaryと
 memory reportを一度だけ出力する。終了コード3の判定は `QPDFJob.cc:534-563`、inspection側の
