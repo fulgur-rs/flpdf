@@ -37,7 +37,8 @@ fn page_rotation_uses_separate_job_route_without_the_legacy_module() {
 #[test]
 fn apply_rotate_to_pages_uses_canonical_live_handle_accessors() {
     let source = fs::read_to_string(source_root().join("job/rotate.rs"))
-        .expect("rotate.rs must be readable");
+        .expect("rotate.rs must be readable")
+        .replace("\r\n", "\n");
     let start = source
         .find("pub fn apply_rotate_to_pages")
         .expect("apply_rotate_to_pages must exist");
