@@ -85,7 +85,7 @@ fn dump_object_unknown_object_reports_clear_error() {
     let mut cmd = Command::cargo_bin("flpdf").unwrap();
     cmd.args([
         "dump-object",
-        "99 0",
+        "99",
         "../../tests/fixtures/compat/one-page.pdf",
     ])
     .assert()
@@ -384,7 +384,7 @@ fn dump_object_surfaces_lazy_recovery_warnings() {
     std::fs::write(temp.path(), build_pdf_with_stale_length_stream(b"payload")).unwrap();
 
     let mut cmd = Command::cargo_bin("flpdf").unwrap();
-    cmd.args(["dump-object", "3 0"])
+    cmd.args(["dump-object", "3"])
         .arg(temp.path())
         .assert()
         .code(3)

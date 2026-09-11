@@ -2993,7 +2993,7 @@ fn json_job_parser_accepts_all_covered_qpdf_handler_shapes() {
         r#"{"jsonKey":[1]}"#,
         r#"{"jsonKey":["unknown"]}"#,
         r#"{"jsonObject":[1]}"#,
-        r#"{"jsonObject":["unknown"]}"#,
+        r#"{"jsonObject":["2147483648"]}"#,
         r#"{"removeAttachment":[1]}"#,
         r#"{"setPageLabels":[1]}"#,
         r#"{"inputFile":"input.pdf","empty":""}"#,

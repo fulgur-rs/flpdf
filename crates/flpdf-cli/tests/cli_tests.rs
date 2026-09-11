@@ -1456,7 +1456,7 @@ fn pages_subcommand_prints_count() {
 #[test]
 fn dump_object_subcommand_accepts_ref() {
     let mut cmd = Command::cargo_bin("flpdf").unwrap();
-    cmd.args(["dump-object", "1 0", "../../tests/fixtures/minimal.pdf"])
+    cmd.args(["dump-object", "1", "../../tests/fixtures/minimal.pdf"])
         .assert()
         .success()
         .stdout(predicate::str::contains("/Type /Catalog"));
@@ -2759,6 +2759,17 @@ fn dump_object_accepts_ref_with_r_suffix() {
         .assert()
         .success()
         .stdout(predicate::str::contains("/Type /Catalog"));
+}
+
+#[test]
+fn dump_object_accepts_qpdf_object_selector_forms() {
+    for selector in ["1", "1,0"] {
+        let mut cmd = Command::cargo_bin("flpdf").unwrap();
+        cmd.args(["dump-object", selector, "../../tests/fixtures/minimal.pdf"])
+            .assert()
+            .success()
+            .stdout(predicate::str::contains("/Type /Catalog"));
+    }
 }
 
 #[test]

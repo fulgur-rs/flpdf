@@ -503,7 +503,7 @@ fn dump_object_accepts_a_raw_generation_like_qpdf() {
     let flpdf = Command::cargo_bin("flpdf")
         .expect("flpdf should build")
         .env("FLPDF_PROGNAME", "qpdf")
-        .args(["dump-object", "5 65536", input.to_str().unwrap()])
+        .args(["dump-object", "5,65536", input.to_str().unwrap()])
         .output()
         .expect("flpdf should spawn");
 
@@ -585,7 +585,7 @@ fn dump_object_prints_stream_data_for_a_raw_identity() {
     let output = Command::cargo_bin("flpdf")
         .expect("flpdf should build")
         .env("FLPDF_PROGNAME", "qpdf")
-        .args(["dump-object", "5 65536"])
+        .args(["dump-object", "5,65536"])
         .arg(&input)
         .output()
         .expect("flpdf should spawn");
