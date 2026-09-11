@@ -613,8 +613,8 @@ fn standard_handler_inputs_from_handle(
     let length = encrypt.try_get_key(b"/Length")?;
     let length_bits = effective_length_bits(v, &length)?;
     let p = required_permissions_from_handle(encrypt)?;
-    let u = required_32_byte_string_from_handle(encrypt, "U")?;
-    let o = required_32_byte_string_from_handle(encrypt, "O")?;
+    let u = required_v_lt_5_32_byte_string_from_handle(encrypt, "U")?;
+    let o = required_v_lt_5_32_byte_string_from_handle(encrypt, "O")?;
     let encrypt_metadata = encrypt_metadata_flag_from_handle(encrypt)?;
     Ok(StandardHandlerInputsOwned {
         v,
@@ -768,6 +768,39 @@ fn required_32_byte_string_from_handle(dict: &ObjectHandle, key: &'static str) -
         }
         .into()
     })
+}
+
+fn required_v_lt_5_32_byte_string_from_handle(
+    dict: &ObjectHandle,
+    key: &'static str,
+) -> Result<[u8; 32]> {
+    let key_name = format!("/{key}");
+    let value = dict.try_get_key(key_name.as_bytes())?;
+    value.try_dereference()?;
+    let Some(bytes) = value.as_string() else {
+        return Err(if value.is_null() {
+            crate::error::EncryptedError::Malformed {
+                reason: format!("missing /{key} entry"),
+            }
+        } else {
+            crate::error::EncryptedError::Malformed {
+                reason: format!("/{key} entry is not a string"),
+            }
+        }
+        .into());
+    };
+    if bytes.len() > 32 {
+        return Err(crate::error::EncryptedError::Malformed {
+            reason: format!("/{key} entry is not 32 bytes"),
+        }
+        .into());
+    }
+
+    // qpdf's pad_short_parameter (QPDF_encryption.cc:316-321) pads short
+    // V<5 /O and /U entries with NUL bytes before the exact-size check.
+    let mut padded = [0; 32];
+    padded[..bytes.len()].copy_from_slice(&bytes);
+    Ok(padded)
 }
 
 fn required_48_byte_string_from_handle(dict: &ObjectHandle, key: &'static str) -> Result<[u8; 48]> {
@@ -941,7 +974,9 @@ pub(crate) fn first_file_id_handle(id: &ObjectHandle) -> Result<Vec<u8>> {
 
 #[cfg(test)]
 mod tests {
-    use super::{decode_hex_file_key, parse_inspection_state};
+    use super::{
+        decode_hex_file_key, parse_inspection_state, required_v_lt_5_32_byte_string_from_handle,
+    };
     use crate::ObjectHandle;
 
     #[test]
@@ -982,5 +1017,23 @@ mod tests {
     fn raw_key_hex_decoding_matches_qpdf_ignored_characters_and_odd_nibbles() {
         assert_eq!(decode_hex_file_key(b"zA-1").unwrap(), vec![0xa1]);
         assert_eq!(decode_hex_file_key(b"F").unwrap(), vec![0xf0]);
+    }
+
+    #[test]
+    fn v_lt_5_short_standard_entry_is_nul_padded_like_qpdf() {
+        let short_u = vec![
+            0x82, 0xf8, 0x58, 0xc9, 0x56, 0xfc, 0x27, 0xa1, 0xd0, 0x51, 0xb0, 0x9b, 0xfb, 0x19,
+            0xb7, 0x2,
+        ];
+        let encrypt = ObjectHandle::dictionary(vec![(
+            b"/U".to_vec(),
+            ObjectHandle::string(short_u.clone()),
+        )]);
+
+        let padded = required_v_lt_5_32_byte_string_from_handle(&encrypt, "U")
+            .expect("qpdf pads a short V<5 /U entry with NUL bytes");
+
+        assert_eq!(&padded[..short_u.len()], short_u.as_slice());
+        assert_eq!(&padded[short_u.len()..], &[0; 32 - 16]);
     }
 }
