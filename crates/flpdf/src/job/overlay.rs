@@ -787,7 +787,7 @@ fn overlay_page_handle<R: Read + Seek>(
     page_ref: ObjectRef,
 ) -> Result<ObjectHandle> {
     let page = pdf.get_object_handle(page_ref);
-    pdf.resolve(&page)?;
+    page.try_dereference()?;
     if page.try_as_dictionary()?.is_none() {
         return Err(Error::Unsupported(format!(
             "page {page_ref} is not a dictionary"
