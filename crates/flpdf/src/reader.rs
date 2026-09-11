@@ -1762,6 +1762,35 @@ mod encryption_state_commit_tests {
 }
 
 #[cfg(test)]
+mod lazy_open_tests {
+    use super::*;
+    use std::fs::File;
+    use std::io::BufReader;
+
+    #[test]
+    fn opens_pdf_without_resolving_any_object_body() {
+        let path = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("../../tests/fixtures/minimal.pdf");
+        let file = File::open(path).unwrap();
+        let mut pdf = Pdf::open(BufReader::new(file)).unwrap();
+
+        assert_eq!(
+            pdf.resolver.resolved_object_count_for_test(),
+            0,
+            "opening must leave every cached object body unresolved"
+        );
+        assert_eq!(pdf.version(), "1.7");
+        let root = pdf.trailer().try_get_key(b"/Root").unwrap();
+        assert_eq!(root.object_ref(), Some(ObjectRef::new(1, 0)));
+        assert_eq!(
+            pdf.resolver.resolved_object_count_for_test(),
+            0,
+            "reading the trailer root reference must not resolve its body"
+        );
+    }
+}
+
+#[cfg(test)]
 mod compressible_owner_tests {
     use super::*;
     use crate::reader::resolver::ResolverHandle;
