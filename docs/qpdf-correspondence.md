@@ -2221,6 +2221,20 @@ container-aware sort を適用する。`cli_pages_objstm_order_qpdf.rs` の
 `--static-id --linearize` の qpdf-zlib 全 bytes を比較し、hint payload 内の共有
 identifier 列を固定する。
 
+`flpdf-8gwx` では、同じ AcroForm/annotation replay の結果を linearization の
+part-4 open-document order へ渡す。qpdf は `handlePageSpecs` の occurrence loop で
+`fixCopiedAnnotations` を実行し、`makeIndirectObject`/`copyForeignObject` の
+allocation identity を保持したまま、`calculateLinearizationData` の
+`lc_open_document` を page-selection 後の destination `std::set<QPDFObjGen>` 順で part 4 に置く
+（`QPDFJob.cc:2517-2584`; `QPDF.cc:1891-2095`; `QPDFAcroFormDocumentHelper.cc:699-1047`;
+`QPDF_linearization.cc:963-1265`）。page-selection target の fresh ObjectRef 番号で
+`part4_open_document_plain` を並べると、この destination allocation order が失われるため、
+flpdf は primary/foreign allocation を表す provenance projection
+`Pdf::writer_object_order_key` で Part 2/3 と同じように part 4 を並べる。
+`cli_pages_objstm_order_qpdf.rs` の annotated multi-source linearize（重複なし/重複あり）
+全 bytes gate が qpdf 11.9.0 との一致を固定し、qtest route や compatibility bridge は
+追加しない。
+
 `flpdf-obsc` では、`QPDFJob::doSplitPages` が chunk 作成前に行う
 `shouldRemoveUnreferencedResources` の verbose side effect も同じ job boundary に
 接続した。qpdf は Auto 判定の開始、最初の共有 resource finding、または共有なしの
