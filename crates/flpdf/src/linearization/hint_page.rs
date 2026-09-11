@@ -500,12 +500,12 @@ impl PageOffsetHintTable {
         }
 
         // qpdf appends each page's shared identifiers while iterating its
-        // `obj_user_to_objects[page]` set (QPDF_linearization.cc:1388-1402).
-        // `LinearizationPlan::shared_hints` already carries that source/discovery
-        // order, including the provenance key used for page-selection merges.
-        // Keep the resulting identifiers in that order on the classic path:
-        // sorting by the target ObjectRef number would discard the qpdf source
-        // order when a foreign page was copied into a fresh merge target.
+        // destination `obj_user_to_objects[page]` set
+        // (QPDF_linearization.cc:1388-1402). `LinearizationPlan` retains the
+        // primary/foreign allocation projection needed to reproduce that
+        // destination ObjGen order after a page-selection merge. Do not use
+        // section order or fresh target ObjectRef numbers: a page can reference
+        // a lower-numbered Part-8 object before a Part-3 object.
         //
         // ObjStm folding is the exception. `canonical_shared_hints` replaces
         // members with synthetic container entries and orders the physical
@@ -571,6 +571,18 @@ impl PageOffsetHintTable {
                     } else {
                         key
                     }
+                });
+            }
+        } else {
+            // qpdf walks the destination document's ObjGen-keyed user set,
+            // not the shared-table's section order. A Part-3/Part-8 page can
+            // therefore reference a lower-numbered Part-8 object before a
+            // higher-numbered Part-3 object. For page-selection targets the
+            // plan's provenance key projects that qpdf destination order
+            // without reviving target-number sorting (flpdf-pz5h).
+            for ids in &mut shared_ids_per_page {
+                ids.sort_unstable_by_key(|&shared_idx| {
+                    plan.writer_object_order_key(shared_hints[shared_idx as usize].object_ref)
                 });
             }
         }
