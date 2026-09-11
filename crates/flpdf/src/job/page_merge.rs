@@ -1302,12 +1302,15 @@ fn merge_documents_with_resource_decisions_and_preserve_primary_into_impl<
             copy_seed.insert(primary_pages_ref, pages_root_ref);
         }
         target.set_foreign_object_map(source_id, copy_seed);
-        // Target references already attributed to an earlier page of this
-        // source. Carrying the delta across the loop keeps the per-page work
-        // proportional to the map rather than cloning the whole cumulative map
-        // twice for every page.
-        let mut recorded_copies: BTreeSet<ObjectRef> = BTreeSet::new();
         for &page_ref in &unique {
+            // qpdf's ObjCopier records newly reserved foreign objects in the
+            // depth-first `to_copy` order from `reserveObjects`, not in source
+            // object-number or destination-map order (`QPDF.cc:2071-2089,
+            // 2101-2155`). The resolver's allocation log is the canonical
+            // destination-side equivalent of that event sequence. Capture its
+            // delta at the copy boundary so page-spec provenance can retain
+            // the exact discovery order for QDF Original object IDs.
+            let allocation_checkpoint = target.allocation_checkpoint();
             let source_page = input.source.get_object_handle(page_ref);
             let copied_page = target.copy_foreign_object(&source_page)?;
             // cov:ignore-start: QPDF::copyForeignObject returns an indirect
@@ -1318,15 +1321,7 @@ fn merge_documents_with_resource_decisions_and_preserve_primary_into_impl<
             }
             // cov:ignore-end
             if !is_primary {
-                let mut new_objects: Vec<ObjectRef> = target
-                    .foreign_object_maps
-                    .get(&source_id)
-                    .into_iter()
-                    .flat_map(|copies| copies.values().copied())
-                    .filter(|target_ref| !recorded_copies.contains(target_ref))
-                    .collect();
-                new_objects.sort_unstable();
-                recorded_copies.extend(new_objects.iter().copied());
+                let new_objects = target.allocated_object_refs_after(allocation_checkpoint);
                 target
                     .foreign_page_copy_orders
                     .entry(source_id)
