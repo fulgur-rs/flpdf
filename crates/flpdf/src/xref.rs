@@ -33,6 +33,7 @@ use crate::parser::{
     parse_qpdf_file_object_handle_with_diagnostics, HandleResolver, ParserDiagnostic,
 };
 use crate::qpdf_obj_gen::QpdfObjGen;
+use crate::qutil::{qpdf_string_to_int_checked, QpdfIntParse};
 use crate::reader::file_object::{
     finish_file_object_handle, parse_file_object_handle_syntax, parse_file_object_header,
     FileObjectDiagnostic, FileObjectDiagnosticKind, HandleFileObjectRead, RecoveryPolicy,
@@ -3502,7 +3503,7 @@ fn recover_xref_entries_with_owner(
                 trailer = candidate;
                 trailer_diagnostics.extend(diagnostics);
             } else if let Some((object_ref, offset)) =
-                scan_object_header_after_first_token(bytes, &first_token)
+                scan_object_header_after_first_token(bytes, &first_token)?
             {
                 entries.insert(object_ref, XrefEntry::Uncompressed { offset });
             }
@@ -4384,11 +4385,13 @@ fn read_scan_token(bytes: &[u8], from: usize, limit: usize) -> Option<Token> {
     (token.token_type != TokenType::Eof && token.start < limit).then_some(token)
 }
 
-fn parse_scan_integer(token: &Token) -> Option<i64> {
-    if !token.is_integer() {
-        return None;
+fn parse_scan_integer(token: &Token) -> Result<i32> {
+    let text = std::str::from_utf8(&token.value).unwrap_or_default();
+    match qpdf_string_to_int_checked(text) {
+        QpdfIntParse::Value(value) => Ok(value),
+        QpdfIntParse::NoDigits => Ok(0),
+        QpdfIntParse::Overflow(message) => Err(Error::SystemBytes(message.into_bytes())),
     }
-    std::str::from_utf8(&token.value).ok()?.parse().ok()
 }
 
 /// If the already-read first token opens an `int int obj` token sequence,
@@ -4403,27 +4406,34 @@ fn parse_scan_integer(token: &Token) -> Option<i64> {
 fn scan_object_header_after_first_token(
     bytes: &[u8],
     number_token: &Token,
-) -> Option<(ObjectRef, u64)> {
-    let obj = parse_scan_integer(number_token)?;
-
-    let gen_token = read_scan_token(bytes, number_token.end, bytes.len())?;
-    let gen = parse_scan_integer(&gen_token)?;
-
-    let obj_token = read_scan_token(bytes, gen_token.end, bytes.len())?;
-    if !obj_token.is_word_value(b"obj") {
-        return None;
+) -> Result<Option<(ObjectRef, u64)>> {
+    let Some(gen_token) = read_scan_token(bytes, number_token.end, bytes.len()) else {
+        return Ok(None);
+    };
+    if !gen_token.is_integer() {
+        return Ok(None);
     }
+
+    let Some(obj_token) = read_scan_token(bytes, gen_token.end, bytes.len()) else {
+        return Ok(None);
+    };
+    if !obj_token.is_word_value(b"obj") {
+        return Ok(None);
+    }
+
+    let obj = parse_scan_integer(number_token)?;
+    let gen = parse_scan_integer(&gen_token)?;
 
     // qpdf's `insertReconstructedXrefEntry` guards (`obj > 0`, `0 <= gen < 65535`).
     if obj <= 0 || !(0..65535).contains(&gen) {
-        return None;
+        return Ok(None);
     }
-    let number = u32::try_from(obj).ok()?;
-    let generation = u16::try_from(gen).ok()?;
-    Some((
+    let number = u32::try_from(obj).expect("positive qpdf int fits u32");
+    let generation = u16::try_from(gen).expect("qpdf generation guard fits u16");
+    Ok(Some((
         ObjectRef::new(number, generation),
         number_token.start as u64,
-    ))
+    )))
 }
 
 fn parse_xref_table(
@@ -7113,6 +7123,23 @@ mod final_handle_tests {
             .map(|object_ref| (object_ref.number, object_ref.generation))
             .collect();
         assert_eq!(recovered, vec![(1, 0), (2, 0), (3, 0)], "{recovered:?}");
+    }
+
+    #[test]
+    fn recovery_scan_integer_preserves_qpdf_narrowing_error() {
+        let token = Token::new(TokenType::Integer, b"3000000000".to_vec());
+        let error = parse_scan_integer(&token).expect_err("oversized object header must fail");
+        assert!(matches!(
+            error,
+            Error::SystemBytes(message)
+                if message == b"integer out of range converting 3000000000 from a 8-byte signed type to a 4-byte signed type"
+        ));
+    }
+
+    #[test]
+    fn recovery_scan_integer_uses_qpdf_no_digit_zero() {
+        let empty_numeric = Token::new(TokenType::Integer, b"-".to_vec());
+        assert_eq!(parse_scan_integer(&empty_numeric).unwrap(), 0);
     }
 
     #[test]
