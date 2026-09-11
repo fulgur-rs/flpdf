@@ -1515,6 +1515,7 @@ impl<R: Read + Seek> Pdf<R> {
     /// small convenience for callers that need an owned handle after the
     /// resolver call; it does not chase stored reference values because the
     /// canonical value model has no reference-as-value variant.
+    #[cfg(test)]
     pub(crate) fn resolve_handle(&mut self, handle: &ObjectHandle) -> Result<ObjectHandle> {
         self.resolve(handle)?;
         Ok(handle.clone())
