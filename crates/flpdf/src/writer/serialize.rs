@@ -157,14 +157,16 @@ pub(crate) mod xref_stream {
     //! feature). The structural encoding (rows, predictor, key order, field widths)
     //! is backend-independent.
 
-    use std::collections::BTreeMap;
+    use std::collections::{BTreeMap, BTreeSet};
 
     use crate::pipeline::buffer::Buffer;
     use crate::pipeline::flate::{Flate, FlateAction, DEFAULT_OUT_BUFFER_SIZE};
     use crate::pipeline::png_filter::{PngFilter, PngFilterAction};
     use crate::pipeline::{Pipeline, PipelineError, PipelineResult};
 
+    use crate::writer::object::ObjectWriterEmission;
     use crate::writer::output::OutputSink;
+    use crate::ObjectHandle;
     use crate::ObjectRef;
     use crate::Result;
 
@@ -355,9 +357,11 @@ pub(crate) mod xref_stream {
         /// `/Root` reference, when present (omitted on the main xref stream, which
         /// is reached only via the first-page stream's `/Prev` chain).
         pub root: Option<ObjectRef>,
-        /// Serialized direct `/Root` value, when the source trailer carries an
-        /// inline Catalog rather than an indirect object.
+        /// Pre-serialized direct `/Root` value retained by the legacy
+        /// linearized/fallback callers. Plain output uses `live_root_value`.
         pub root_value: Option<&'a [u8]>,
+        /// Live direct `/Root` value for the plain non-linearized route.
+        pub live_root_value: Option<&'a ObjectHandle>,
         /// `/Size` — the highest object number plus one.
         pub size: u32,
         /// `/Prev` byte offset of the previous xref stream (left-justified in a
@@ -367,6 +371,11 @@ pub(crate) mod xref_stream {
         /// and values are already serialized with the writer reference map, so
         /// the xref route does not reconstruct trailer data from a stale
         pub canonical_entries: Option<&'a [(Vec<u8>, Vec<u8>)]>,
+        /// Live trailer metadata for the plain non-linearized route. Values
+        /// are serialized directly to `OutputSink` in sorted key order.
+        pub live_trailer: Option<&'a ObjectHandle>,
+        pub live_map: Option<&'a dyn Fn(ObjectRef) -> Result<ObjectRef>>,
+        pub live_removed_refs: Option<&'a BTreeSet<ObjectRef>>,
         /// Trailer `/ID` as two raw byte strings, serialized as `<hex><hex>`.
         pub id: Option<(&'a [u8], &'a [u8])>,
         /// Trailer `/Encrypt` reference. qpdf emits this after `/ID` on the
@@ -428,41 +437,155 @@ pub(crate) mod xref_stream {
         if let Some((start, count)) = dict.index {
             out.write_bytes(format!(" /Index [ {start} {count} ]").as_bytes())?;
         }
-        let mut entries = dict
-            .canonical_entries
-            .map_or_else(Vec::new, ToOwned::to_owned);
-        if let Some(info) = dict.info {
-            entries.push((
-                b"/Info".to_vec(),
-                format!("{} {} R", info.number, info.generation).into_bytes(),
-            ));
-        }
-        if let Some(root) = dict.root {
-            entries.push((
-                b"/Root".to_vec(),
-                format!("{} {} R", root.number, root.generation).into_bytes(),
-            ));
-        } else if let Some(root) = dict.root_value {
-            entries.push((b"/Root".to_vec(), root.to_vec()));
-        }
-        entries.push((b"/Size".to_vec(), dict.size.to_string().into_bytes()));
-        entries.sort_by(|left, right| left.0.cmp(&right.0));
-        for (key, value) in entries {
-            if qdf {
-                out.write_bytes(b"\n  ")?;
-            } else {
-                out.write_bytes(b" ")?;
+        if let Some(trailer) = dict.live_trailer {
+            let map = dict.live_map.ok_or_else(|| {
+                crate::Error::Internal(
+                    "plain writer live trailer is missing its reference map".to_string(),
+                )
+            })?;
+            let removed_refs = dict.live_removed_refs.ok_or_else(|| {
+                crate::Error::Internal(
+                    "plain writer live trailer is missing its removed-reference set".to_string(),
+                )
+            })?;
+            write_live_trailer_entries(out, trailer, dict, qdf, map, removed_refs)?;
+        } else {
+            let mut entries = dict
+                .canonical_entries
+                .map_or_else(Vec::new, ToOwned::to_owned);
+            if let Some(info) = dict.info {
+                entries.push((
+                    b"/Info".to_vec(),
+                    format!("{} {} R", info.number, info.generation).into_bytes(),
+                ));
             }
-            write_qpdf_dictionary_key(out, &key)?;
-            out.write_bytes(b" ")?;
-            out.write_bytes(&value)?;
-            if key == b"/Size" {
-                if let Some(prev) = dict.prev {
-                    out.write_bytes(format!(" /Prev {prev:<PREV_FIELD_WIDTH$}").as_bytes())?;
+            if let Some(root) = dict.root {
+                entries.push((
+                    b"/Root".to_vec(),
+                    format!("{} {} R", root.number, root.generation).into_bytes(),
+                ));
+            } else if let Some(root) = dict.root_value {
+                entries.push((b"/Root".to_vec(), root.to_vec()));
+            }
+            entries.push((b"/Size".to_vec(), dict.size.to_string().into_bytes()));
+            entries.sort_by(|left, right| left.0.cmp(&right.0));
+            for (key, value) in entries {
+                write_xref_dictionary_entry_prefix(out, qdf, &key)?;
+                out.write_bytes(&value)?;
+                if key == b"/Size" {
+                    if let Some(prev) = dict.prev {
+                        out.write_bytes(format!(" /Prev {prev:<PREV_FIELD_WIDTH$}").as_bytes())?;
+                    }
                 }
             }
         }
         Ok(())
+    }
+
+    fn write_xref_dictionary_entry_prefix(
+        out: &mut OutputSink<'_>,
+        qdf: bool,
+        key: &[u8],
+    ) -> Result<()> {
+        if qdf {
+            out.write_bytes(b"\n  ")?;
+        } else {
+            out.write_bytes(b" ")?;
+        }
+        write_qpdf_dictionary_key(out, key)?;
+        out.write_bytes(b" ")
+    }
+
+    fn write_live_trailer_entries(
+        out: &mut OutputSink<'_>,
+        trailer: &ObjectHandle,
+        dict: &XrefStreamDict<'_>,
+        qdf: bool,
+        map: &dyn Fn(ObjectRef) -> Result<ObjectRef>,
+        removed_refs: &BTreeSet<ObjectRef>,
+    ) -> Result<()> {
+        let entries = trailer.try_as_dictionary()?.unwrap_or_default();
+        let mut keys = BTreeSet::new();
+        for key in entries.keys() {
+            if !is_writer_owned_trailer_key(key) {
+                keys.insert(key.clone());
+            }
+        }
+        if dict.root.is_some() || dict.live_root_value.is_some() {
+            keys.insert(b"/Root".to_vec());
+        }
+        keys.insert(b"/Size".to_vec());
+
+        for key in keys {
+            if key == b"/Root" {
+                write_xref_dictionary_entry_prefix(out, qdf, &key)?;
+                if let Some(root) = dict.root {
+                    let mapped = root;
+                    out.write_bytes(
+                        format!("{} {} R", mapped.number, mapped.generation).as_bytes(),
+                    )?;
+                } else if let Some(root) = dict.live_root_value {
+                    if qdf {
+                        root.write_object_qdf_with_ref_map_and_removed(out, 0, map, removed_refs)?;
+                    } else {
+                        root.write_object_with_ref_map_and_removed(out, map, removed_refs)?;
+                    }
+                }
+                continue;
+            }
+            if key == b"/Size" {
+                write_xref_dictionary_entry_prefix(out, qdf, &key)?;
+                out.write_bytes(dict.size.to_string().as_bytes())?;
+                if let Some(prev) = dict.prev {
+                    out.write_bytes(format!(" /Prev {prev:<PREV_FIELD_WIDTH$}").as_bytes())?;
+                }
+                continue;
+            }
+
+            let Some(value) = entries.get(&key) else {
+                continue;
+            };
+            if value.object_ref().is_some_and(|object_ref| {
+                object_ref.number == 0 || removed_refs.contains(&object_ref)
+            }) || value.try_is_null()?
+            {
+                continue;
+            }
+            write_xref_dictionary_entry_prefix(out, qdf, &key)?;
+            if let Some(object_ref) = value.object_ref() {
+                let mapped = map(object_ref).map_err(|_| {
+                    crate::Error::Unsupported(format!(
+                        "plain writer: trailer /{} reference {object_ref} absent from renumber map",
+                        String::from_utf8_lossy(key.strip_prefix(b"/").unwrap_or(&key))
+                    ))
+                })?;
+                out.write_bytes(mapped.to_string().as_bytes())?;
+            } else {
+                value.write_object_with_ref_map_and_removed(out, map, removed_refs)?;
+            }
+        }
+        Ok(())
+    }
+
+    fn is_writer_owned_trailer_key(key: &[u8]) -> bool {
+        matches!(
+            key,
+            b"/ID"
+                | b"/Encrypt"
+                | b"/Prev"
+                | b"/Root"
+                | b"/Size"
+                | b"/Type"
+                | b"/F"
+                | b"/FFilter"
+                | b"/FDecodeParms"
+                | b"/W"
+                | b"/Index"
+                | b"/Length"
+                | b"/Filter"
+                | b"/DecodeParms"
+                | b"/XRefStm"
+        )
     }
 
     fn write_qpdf_dictionary_key(out: &mut OutputSink<'_>, key: &[u8]) -> Result<()> {

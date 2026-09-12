@@ -1169,8 +1169,8 @@ impl<'pdf, 'output, 'sink, R: Read + Seek + 'static> LiveObjectEmitter<'pdf, 'ou
         let first_marker_len = marker_lengths.first().copied().ok_or_else(|| {
             crate::Error::Internal("plain live QDF ObjStm marker lengths are empty".into())
         })?;
-        let mut objects_section = body.bytes;
-        objects_section.drain(..body.first_offset);
+        let mut body_bytes = body.bytes;
+        body_bytes.drain(..body.first_offset);
         let mut pair_table = Vec::new();
         for (index, ((member, _), (&marker_start, &marker_len))) in handles
             .iter()
@@ -1193,12 +1193,23 @@ impl<'pdf, 'output, 'sink, R: Read + Seek + 'static> LiveObjectEmitter<'pdf, 'ou
         }
         pair_table.push(b'\n');
         let first_offset = pair_table.len();
-        pair_table.append(&mut objects_section);
+        let objects_len = body_bytes.len();
+        body_bytes.reserve(first_offset);
+        body_bytes.resize(
+            objects_len.checked_add(first_offset).ok_or_else(|| {
+                crate::Error::Unsupported(
+                    "plain live QDF ObjStm body length overflows usize".into(),
+                )
+            })?,
+            0,
+        );
+        body_bytes.copy_within(0..objects_len, first_offset);
+        body_bytes[..first_offset].copy_from_slice(&pair_table);
         let qdf_first_offset = first_offset.checked_add(first_marker_len).ok_or_else(|| {
             crate::Error::Unsupported("plain live QDF ObjStm /First overflows usize".into())
         })?;
         let body = object_streams::ObjStmBody {
-            bytes: pair_table,
+            bytes: body_bytes,
             first_offset,
             n_members: handles.len(),
         };

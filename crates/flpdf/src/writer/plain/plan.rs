@@ -1,7 +1,9 @@
 //! qpdf correspondence: QPDFWriter.cc standard-write object placement and renumber planning.
 //! Logical object placements for the qpdf-shaped plain writer pipeline.
 
-use std::collections::{BTreeMap, BTreeSet, HashMap};
+#[cfg(test)]
+use std::collections::HashMap;
+use std::collections::{BTreeMap, BTreeSet};
 use std::io::{Read, Seek};
 
 #[cfg(test)]
@@ -15,7 +17,7 @@ use crate::writer::plain::xref::{materialized_id_handle, IdPlan, TrailerPlan};
 use crate::writer::rewrite_renumber::{
     CanonicalCatalogFirstRenumber, NewNumberLookup, ObjectStreamRenumber,
 };
-use crate::writer::{ObjectWriterEmission, WriterOptions};
+use crate::writer::WriterOptions;
 #[cfg(test)]
 use crate::{CompressStreams, XrefEntry, XrefForm};
 use crate::{ObjectHandle, ObjectRef, Pdf};
@@ -499,75 +501,14 @@ impl PlainWritePlan {
             }
         };
         let encrypt = trailer_handle.try_get_key(b"/Encrypt")?.object_ref();
-        let direct_root_bytes = if root.is_none() {
-            let root_handle = trailer_handle.try_get_key(b"/Root")?;
-            let map = |object_ref| {
-                placement
-                    .old_to_new
-                    .get(&object_ref)
-                    .copied()
-                    .ok_or_else(|| {
-                        // cov:ignore-start: the direct Catalog is collected
-                        // by the same traversal that builds this map, so a
-                        // live reference cannot be absent at emission.
-                        crate::Error::Unsupported(format!(
-                            "plain writer: direct /Root reference {} {} R absent from renumber map",
-                            object_ref.number, object_ref.generation
-                        ))
-                        // cov:ignore-end
-                    }) // cov:ignore: the direct-root reference map is exercised; LLVM places the successful closure-exit counter on this continuation line.
-            };
-            let mut bytes = Vec::new();
-            if options.qdf {
-                // Same reasoning as the indirect root in `body.rs`: qpdf's ADBE
-                // arbitration is guarded by `is_root`, not by mode
-                // (`QPDFWriter.cc:1396-1436`), so the QDF layout must serialize
-                // the arbitrated copy rather than the raw Catalog. A direct
-                // Catalog is not `is_root` for qpdf either — the test is
-                // `old_og == m->root_og` (`:1374`) and a direct dictionary has
-                // no object identity — so arbitration stays off here.
-                let arbitrated = root_handle.output_root_copy_with_adbe(
-                    &version,
-                    final_extension_level,
-                    false,
-                )?; // cov:ignore: LLVM attributes this covered multiline call terminator to the call setup
-                crate::writer::output::with_buffer_sink(&mut bytes, |out| {
-                    arbitrated.write_object_qdf_with_ref_map_and_removed(
-                        out,
-                        0,
-                        &map,
-                        &placement.removed_refs,
-                    )
-                })?; // cov:ignore: direct Catalog QDF serialization is exercised; LLVM maps this validated continuation to the call setup.
-            } else {
-                crate::writer::output::with_buffer_sink(&mut bytes, |out| {
-                    root_handle.write_root_object_with_ref_map_and_removed(
-                        out,
-                        &map,
-                        &placement.removed_refs,
-                        &version,
-                        final_extension_level,
-                        false,
-                    )
-                })?; // cov:ignore: the direct Catalog serializer is exercised; LLVM maps this call terminator to a zero-count continuation region.
-            }
-            Some(bytes)
-        } else {
-            None
-        };
         let structural_filtered = matches!(
             crate::writer::effective_stream_policy(options),
             Some(CompressStreams::Yes)
         );
         let trailer = TrailerPlan {
             form,
-            canonical_entries: canonical_trailer_entries(
-                pdf,
-                &placement.old_to_new,
-                &placement.removed_refs,
-            )?, // cov:ignore: malformed live trailer graphs are rejected at the helper boundary
             root,
-            direct_root: direct_root_bytes,
+            direct_root: direct_root.clone(),
             id,
             encrypt,
             structural_filtered,
@@ -856,97 +797,6 @@ pub(crate) fn live_source_id0<R: Read + Seek>(pdf: &mut Pdf<R>) -> crate::Result
     Ok(first.as_string().filter(|bytes| !bytes.is_empty()))
 }
 
-/// Snapshot the writer-owned trailer entries from qpdf's live canonical
-/// trailer handle, preserving the handle graph until each value is emitted.
-///
-/// qpdf's `getTrimmedTrailer`/`writeTrailer` path works from the live trailer,
-/// while `enqueueObjectsStandard` applies `getKeys()` null visibility before
-/// it seeds the object queue (`QPDFWriter.cc:1163-1192, 2009-2029, 2916-2924`).
-/// The legacy `Pdf::trailer()` dictionary is a construction-time snapshot and
-/// cannot represent a later `trailer()` mutation. Direct dictionaries
-/// and arrays are serialized through the canonical writer boundary so nested
-/// dictionary nulls are omitted and array null positions remain present.
-pub(crate) fn canonical_trailer_entries(
-    pdf: &mut Pdf<impl Read + Seek>,
-    map: &HashMap<ObjectRef, ObjectRef>,
-    removed_refs: &BTreeSet<ObjectRef>,
-) -> crate::Result<Vec<(Vec<u8>, Vec<u8>)>> {
-    canonical_trailer_entries_with_visibility(pdf, map, removed_refs, true)
-}
-
-/// Snapshot trailer entries while preserving qpdf's mode-independent
-/// top-level null visibility. `QPDFWriter::getTrimmedTrailer` applies the
-/// `getKeys()` rule before `writeTrailer` for plain, QDF, and encrypted output
-/// alike (`QPDFWriter.cc:1163-1192, 2009-2029, 2917-2926`).
-pub(crate) fn canonical_trailer_entries_with_visibility(
-    pdf: &mut Pdf<impl Read + Seek>,
-    map: &HashMap<ObjectRef, ObjectRef>,
-    removed_refs: &BTreeSet<ObjectRef>,
-    suppress_null_values: bool,
-) -> crate::Result<Vec<(Vec<u8>, Vec<u8>)>> {
-    let trailer = pdf.trailer();
-    let entries = trailer.try_as_dictionary()?.unwrap_or_default();
-    let mut serialized = Vec::with_capacity(entries.len());
-    for (key, value) in entries {
-        if is_writer_owned_trailer_key(&key) {
-            continue;
-        }
-        if value
-            .object_ref()
-            .is_some_and(|object_ref| object_ref.number == 0 || removed_refs.contains(&object_ref))
-            || (suppress_null_values && value.try_is_null()?)
-        {
-            continue;
-        }
-
-        let mut value_bytes = Vec::new();
-        if let Some(object_ref) = value.object_ref() {
-            let mapped = map.get(&object_ref).copied().ok_or_else(|| {
-                crate::Error::Unsupported(format!(
-                    "plain writer: trailer /{} reference {object_ref} absent from renumber map",
-                    String::from_utf8_lossy(key.strip_prefix(b"/").unwrap_or(&key))
-                ))
-            })?;
-            value_bytes.extend_from_slice(mapped.to_string().as_bytes());
-        } else {
-            let map_ref = |object_ref: ObjectRef| {
-                map.get(&object_ref).copied().ok_or_else(|| {
-                    crate::Error::Unsupported(format!(
-                        "plain writer: trailer nested reference {object_ref} absent from renumber map"
-                    ))
-                })
-            };
-            crate::writer::output::with_buffer_sink(&mut value_bytes, |out| {
-                value.write_object_with_ref_map_and_removed(out, &map_ref, removed_refs)
-            })?;
-        }
-
-        // Keep qpdf's decoded key for the writer's raw-name sort. The xref
-        // emitter escapes it only after sorting, since escaping can change
-        // the bytewise order (e.g. `/ A` versus `/!A`).
-        serialized.push((key, value_bytes));
-    }
-    Ok(serialized)
-}
-
-fn is_writer_owned_trailer_key(key: &[u8]) -> bool {
-    matches!(
-        key,
-        b"/ID"
-            | b"/Encrypt"
-            | b"/Prev"
-            | b"/Root"
-            | b"/Size"
-            | b"/Type"
-            | b"/W"
-            | b"/Index"
-            | b"/Length"
-            | b"/Filter"
-            | b"/DecodeParms"
-            | b"/XRefStm"
-    )
-}
-
 #[cfg(test)]
 fn build_sources_from_canonical_renumber(
     renumber: &CanonicalCatalogFirstRenumber,
@@ -1200,7 +1050,6 @@ fn require_matching_mapping(
 mod tests {
     use super::*;
 
-    use crate::object_handle::ObjectValue;
     use crate::writer::object_streams::ObjectStreamMode;
     use crate::writer::plain::xref::{append_xref_and_trailer, BodyLayout, IdPlan, TrailerPlan};
     use crate::writer::WriterOptions;
@@ -1393,8 +1242,8 @@ mod tests {
             .trailer
             .direct_root
             .as_ref()
-            .expect("direct root bytes");
-        assert!(direct_root.starts_with(b"<<\n"));
+            .expect("direct root handle");
+        assert!(direct_root.as_dictionary().is_some());
     }
 
     fn source(source: u32, output: u32) -> PlannedIndirectObject {
@@ -1419,7 +1268,6 @@ mod tests {
             qdf_holder_numbers: BTreeSet::new(),
             trailer: TrailerPlan {
                 form: XrefForm::Table,
-                canonical_entries: Vec::new(),
                 root: Some(root_output),
                 direct_root: None,
                 id: IdPlan::Materialized { value: None },
@@ -1562,38 +1410,6 @@ mod tests {
     }
 
     #[test]
-    fn canonical_trailer_entries_follow_qpdf_null_visibility() {
-        let mut pdf = Pdf::open(std::io::BufReader::new(
-            std::fs::File::open(fixture_path("three-page.pdf")).unwrap(),
-        ))
-        .unwrap();
-        let trailer = pdf.trailer();
-        trailer.remove_key(b"/Info");
-        let null_ref = ObjectRef::new(100, 0);
-        let null_handle = pdf.get_object_handle(null_ref);
-        null_handle.set_resolved(ObjectValue::Null);
-        trailer.replace_key(b"/Null", null_handle).unwrap();
-        let mut map = HashMap::new();
-        map.insert(null_ref, ObjectRef::new(200, 0));
-
-        let suppressed =
-            canonical_trailer_entries_with_visibility(&mut pdf, &map, &BTreeSet::new(), true)
-                .unwrap();
-        assert!(!suppressed.iter().any(|(key, _)| key == b"/Null"));
-
-        let visible =
-            canonical_trailer_entries_with_visibility(&mut pdf, &map, &BTreeSet::new(), false)
-                .unwrap();
-        assert_eq!(
-            visible
-                .iter()
-                .find(|(key, _)| key == b"/Null")
-                .map(|(_, value)| value.as_slice()),
-            Some(b"200 0 R".as_slice())
-        );
-    }
-
-    #[test]
     fn generated_xref_stream_uses_live_trailer_entries() {
         let mut pdf = Pdf::open(std::io::BufReader::new(
             std::fs::File::open(fixture_path("three-page.pdf")).unwrap(),
@@ -1715,6 +1531,10 @@ mod tests {
 
         let plan =
             PlainWritePlan::build(&mut pdf, &write_options(ObjectStreamMode::Disable)).unwrap();
+        let trailer_handle = ObjectHandle::dictionary(vec![
+            (b"/ A".to_vec(), ObjectHandle::integer(1)),
+            (b"/!A".to_vec(), ObjectHandle::integer(2)),
+        ]);
         let mut bytes = b"BODY".to_vec();
         let mut layout = BodyLayout::default();
         layout.uncompressed.insert(
@@ -1729,7 +1549,14 @@ mod tests {
             ),
         );
         crate::writer::output::with_buffer_sink(&mut bytes, |out| {
-            append_xref_and_trailer(out, &layout, &plan.trailer)
+            append_xref_and_trailer(
+                out,
+                &layout,
+                &plan.trailer,
+                &trailer_handle,
+                &HashMap::new(),
+                &BTreeSet::new(),
+            )
         })
         .unwrap();
         let text = String::from_utf8_lossy(&bytes);
@@ -1740,21 +1567,6 @@ mod tests {
             escaped_space < exclamation,
             "decoded key order must precede PDF name escaping: {text}"
         );
-    }
-
-    #[test]
-    fn canonical_trailer_entries_reject_an_unmapped_indirect_value() {
-        let mut pdf = Pdf::open(std::io::BufReader::new(
-            std::fs::File::open(fixture_path("three-page.pdf")).unwrap(),
-        ))
-        .unwrap();
-
-        let error =
-            canonical_trailer_entries(&mut pdf, &HashMap::new(), &BTreeSet::new()).unwrap_err();
-
-        assert!(matches!(error, crate::Error::Unsupported(message)
-            if message.contains("trailer /Info reference")
-                && message.contains("absent from renumber map")));
     }
 
     #[test]

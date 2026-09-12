@@ -681,6 +681,163 @@ fn memory_output_is_the_one_complete_output_owner() {
     assert_eq!(memory_bytes, *writer_bytes.borrow());
 }
 
+const LARGE_TRAILER_VALUE_BYTES: usize = 512 * 1024;
+const DIRECT_METADATA_BUFFER_ALLOWANCE: usize = 128 * 1024;
+const OBJSTM_MEMBER_COUNT: usize = 64;
+const OBJSTM_MEMBER_PAYLOAD_BYTES: usize = 16 * 1024;
+const OBJSTM_SINGLE_BUFFER_OVERHEAD: usize = 256 * 1024;
+
+fn measure_direct_catalog_peak(padding: usize, mode: ObjectStreamMode, qdf: bool) -> usize {
+    let mut pdf = minimal_pdf();
+    let pages = pdf.get_object_handle(flpdf::ObjectRef::new(2, 0));
+    pdf.trailer()
+        .replace_key(
+            b"/Root",
+            ObjectHandle::dictionary(vec![
+                (b"/Type".to_vec(), ObjectHandle::name(b"Catalog".to_vec())),
+                (b"/Pages".to_vec(), pages),
+                (
+                    b"/Padding".to_vec(),
+                    ObjectHandle::string(vec![b'c'; padding]),
+                ),
+            ]),
+        )
+        .expect("install direct Catalog");
+
+    start_allocation_measurement_after_fixture_baseline();
+    let mut writer = configure_disable_writer(&mut pdf);
+    writer.set_object_stream_mode(mode);
+    writer.set_qdf_mode(qdf);
+    writer
+        .set_output_writer(DiscardWriter)
+        .expect("install discard output");
+    writer.write().expect("direct Catalog write succeeds");
+    finish_allocation_measurement()
+}
+
+fn measure_custom_trailer_peak(padding: usize, mode: ObjectStreamMode, qdf: bool) -> usize {
+    let mut pdf = minimal_pdf();
+    pdf.trailer()
+        .replace_key(
+            b"/Custom",
+            ObjectHandle::dictionary(vec![(
+                b"/Padding".to_vec(),
+                ObjectHandle::string(vec![b't'; padding]),
+            )]),
+        )
+        .expect("install custom trailer value");
+
+    start_allocation_measurement_after_fixture_baseline();
+    let mut writer = configure_disable_writer(&mut pdf);
+    writer.set_object_stream_mode(mode);
+    writer.set_qdf_mode(qdf);
+    writer
+        .set_output_writer(DiscardWriter)
+        .expect("install discard output");
+    writer.write().expect("custom trailer write succeeds");
+    finish_allocation_measurement()
+}
+
+#[test]
+fn direct_catalog_metadata_does_not_become_a_complete_local_buffer() {
+    let baseline = measure_direct_catalog_peak(0, ObjectStreamMode::Disable, false);
+    let large =
+        measure_direct_catalog_peak(LARGE_TRAILER_VALUE_BYTES, ObjectStreamMode::Disable, false);
+
+    assert!(
+        large <= baseline + DIRECT_METADATA_BUFFER_ALLOWANCE,
+        "direct Catalog serialization retained a body-sized buffer: baseline={baseline}, large={large}, allowance={DIRECT_METADATA_BUFFER_ALLOWANCE}"
+    );
+}
+
+#[test]
+fn direct_catalog_metadata_is_live_in_an_xref_stream() {
+    let baseline = measure_direct_catalog_peak(0, ObjectStreamMode::Generate, false);
+    let large =
+        measure_direct_catalog_peak(LARGE_TRAILER_VALUE_BYTES, ObjectStreamMode::Generate, false);
+
+    assert!(
+        large <= baseline + DIRECT_METADATA_BUFFER_ALLOWANCE,
+        "direct Catalog xref-stream serialization retained a body-sized buffer: baseline={baseline}, large={large}, allowance={DIRECT_METADATA_BUFFER_ALLOWANCE}"
+    );
+}
+
+#[test]
+fn custom_trailer_metadata_does_not_become_a_complete_local_buffer() {
+    let baseline = measure_custom_trailer_peak(0, ObjectStreamMode::Generate, false);
+    let large =
+        measure_custom_trailer_peak(LARGE_TRAILER_VALUE_BYTES, ObjectStreamMode::Generate, false);
+
+    assert!(
+        large <= baseline + DIRECT_METADATA_BUFFER_ALLOWANCE,
+        "custom trailer serialization retained a body-sized buffer: baseline={baseline}, large={large}, allowance={DIRECT_METADATA_BUFFER_ALLOWANCE}"
+    );
+}
+
+#[test]
+fn custom_trailer_metadata_is_live_in_a_classic_xref_table() {
+    let baseline = measure_custom_trailer_peak(0, ObjectStreamMode::Disable, false);
+    let large =
+        measure_custom_trailer_peak(LARGE_TRAILER_VALUE_BYTES, ObjectStreamMode::Disable, false);
+
+    assert!(
+        large <= baseline + DIRECT_METADATA_BUFFER_ALLOWANCE,
+        "custom trailer table serialization retained a body-sized buffer: baseline={baseline}, large={large}, allowance={DIRECT_METADATA_BUFFER_ALLOWANCE}"
+    );
+}
+
+fn measure_generated_objstm_peak(qdf: bool) -> usize {
+    let mut pdf = minimal_pdf();
+    let root = pdf.root_handle().expect("resolve live Catalog");
+    let mut members = Vec::with_capacity(OBJSTM_MEMBER_COUNT);
+    for index in 0..OBJSTM_MEMBER_COUNT {
+        let member = pdf
+            .make_indirect_from_object_handle(ObjectHandle::dictionary(vec![(
+                b"/Payload".to_vec(),
+                ObjectHandle::string(vec![b'o'; OBJSTM_MEMBER_PAYLOAD_BYTES]),
+            )]))
+            .expect("create ObjStm member");
+        members.push(member);
+        root.replace_key(
+            format!("/ObjStmMember{index:02}").as_bytes(),
+            members[index].clone(),
+        )
+        .expect("attach ObjStm member");
+    }
+
+    start_allocation_measurement_after_fixture_baseline();
+    let mut writer = configure_disable_writer(&mut pdf);
+    writer.set_object_stream_mode(ObjectStreamMode::Generate);
+    writer.set_qdf_mode(qdf);
+    writer
+        .set_output_writer(DiscardWriter)
+        .expect("install discard output");
+    writer.write().expect("generated ObjStm write succeeds");
+    finish_allocation_measurement()
+}
+
+#[test]
+fn generated_objstm_does_not_copy_the_complete_container_payload() {
+    let peak = measure_generated_objstm_peak(false);
+    let payload_bytes = OBJSTM_MEMBER_COUNT * OBJSTM_MEMBER_PAYLOAD_BYTES;
+
+    assert!(
+        peak <= payload_bytes.saturating_mul(2) + OBJSTM_SINGLE_BUFFER_OVERHEAD,
+        "generated ObjStm retained a second full container payload: peak={peak}, payload={payload_bytes}, overhead={OBJSTM_SINGLE_BUFFER_OVERHEAD}"
+    );
+}
+
+#[test]
+fn generated_qdf_objstm_does_not_copy_the_complete_container_payload() {
+    let peak = measure_generated_objstm_peak(true);
+    let payload_bytes = OBJSTM_MEMBER_COUNT * OBJSTM_MEMBER_PAYLOAD_BYTES;
+
+    assert!(
+        peak <= payload_bytes.saturating_mul(2) + OBJSTM_SINGLE_BUFFER_OVERHEAD,
+        "generated QDF ObjStm retained a second full container payload: peak={peak}, payload={payload_bytes}, overhead={OBJSTM_SINGLE_BUFFER_OVERHEAD}"
+    );
+}
+
 fn write_memory_output() -> Vec<u8> {
     let mut memory_pdf = minimal_pdf();
     let mut memory_writer = configure_disable_writer(&mut memory_pdf);

@@ -157,7 +157,7 @@ fn write_plain_live<R: Read + Seek>(
         crate::Error::Unsupported("plain live writer: late trailer number overflows u32".into())
         // cov:ignore-end
     })?; // cov:ignore: checked body-derived late-trailer allocation cannot overflow a supported output
-    let mut next_late_trailer_number = extend_late_trailer_map(
+    let _ = extend_late_trailer_map(
         pdf,
         &mut trailer_map,
         initial_late_trailer_number,
@@ -185,58 +185,16 @@ fn write_plain_live<R: Read + Seek>(
         crate::writer::effective_stream_policy(options),
         Some(CompressStreams::Yes)
     ) && !options.qdf;
-    // `canonical_trailer_entries` deliberately omits `/Root`, and the
-    // cross-reference stream serializer reads it only from `root` or
-    // `direct_root`. The live route can now select `XrefForm::Stream`, so a
-    // direct Catalog has to be serialized here too or the output loses its
-    // `/Root` entirely. The classic-table form gets it from the trailer handle
-    // above, which is why this stayed `None` while the route was table-only.
-    let direct_root_bytes = direct_root_output
-        .as_ref()
-        .map(|arbitrated| {
-            let map_ref = |object_ref: ObjectRef| {
-                map.get(&object_ref).copied().ok_or_else(|| {
-                    // cov:ignore-start: the direct Catalog is collected by the
-                    // same walk that fills this map, so a live reference cannot
-                    // be absent at emission.
-                    crate::Error::Unsupported(format!(
-                        "plain live writer: direct /Root reference {} {} R absent from renumber map",
-                        object_ref.number, object_ref.generation
-                    ))
-                    // cov:ignore-end
-                }) // cov:ignore: the direct-root reference map is exercised; LLVM places the successful closure-exit counter on this continuation line.
-            };
-            let mut bytes = Vec::new();
-            crate::writer::output::with_buffer_sink(&mut bytes, |direct_out| {
-                if options.qdf {
-                    arbitrated.write_object_qdf_with_ref_map_and_removed(
-                        direct_out,
-                        0,
-                        &map_ref,
-                        &removed_refs,
-                    )
-                } else {
-                    arbitrated.write_object_with_ref_map_and_removed(
-                        direct_out,
-                        &map_ref,
-                        &removed_refs,
-                    )
-                }
-            })
-            .map(|()| bytes)
-        })
-        .transpose()?;
     let trailer = TrailerPlan {
         form,
-        canonical_entries: plan::canonical_trailer_entries(pdf, &trailer_map, &removed_refs)?,
         root,
-        direct_root: direct_root_bytes,
+        direct_root: direct_root_output,
         id,
         encrypt: trailer_handle.try_get_key(b"/Encrypt")?.object_ref(),
         structural_filtered,
         qdf: options.qdf,
     };
-    let written_xref = xref::append_xref_and_trailer_with_handle(
+    let written_xref = xref::append_xref_and_trailer(
         out,
         &body.layout,
         &trailer,
@@ -249,7 +207,7 @@ fn write_plain_live<R: Read + Seek>(
         // (`:1057-1069`) writes an entry for every member of a container, so a
         // type-2 member has a renumbered identity just like an uncompressed
         // object. Keep both, matching the planned route below.
-    let old_to_new = map
+    let old_to_new = trailer_map
         .into_iter()
         .filter(|(_, output)| {
             body.layout.uncompressed.contains_key(&output.number)

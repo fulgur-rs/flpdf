@@ -5645,46 +5645,9 @@ fn emit_canonical_pdf_inner<R: Read + Seek>(
                     )?, // cov:ignore: build_writer_trailer_handle constructs the writer-owned /ID in the validated two-string shape
                 }
             };
-            let trailer_map = |object_ref: ObjectRef| {
-                old_to_new.get(&object_ref).copied().ok_or_else(|| {
-                    // cov:ignore-start: the direct Catalog is collected by the
-                    // same canonical traversal that builds `old_to_new`, so a
-                    // live reference can never be absent here.
-                    crate::Error::Unsupported(format!(
-                        "full-rewrite: direct /Root reference {object_ref} absent from renumber map"
-                    ))
-                    // cov:ignore-end
-                }) // cov:ignore: the direct-root reference map is exercised; LLVM places the successful closure-exit counter on this continuation line.
-            };
-            let direct_root = if new_root.is_none() {
-                let root = trailer_handle.try_get_key(b"/Root")?;
-                let mut direct_root = Vec::new();
-                if options.qdf {
-                    output::with_buffer_sink(&mut direct_root, |out| {
-                        root.write_object_qdf_with_ref_map_and_removed(
-                            out,
-                            0,
-                            &trailer_map,
-                            &skip_ref_set,
-                        )
-                    })?; // cov:ignore: the canonical direct-root serializer is exercised; LLVM maps this call terminator to a zero-count continuation region.
-                } else {
-                    output::with_buffer_sink(&mut direct_root, |out| {
-                        root.write_object_with_ref_map_and_removed(out, &trailer_map, &skip_ref_set)
-                    })?; // cov:ignore: the canonical direct-root serializer is exercised; LLVM maps this call terminator to a zero-count continuation region.
-                }
-                Some(direct_root)
-            } else {
-                None
-            };
+            let direct_root = new_root.is_none().then(|| root_handle.clone()).flatten();
             let trailer = plain::xref::TrailerPlan {
                 form: XrefForm::Stream,
-                canonical_entries: plain::plan::canonical_trailer_entries_with_visibility(
-                    pdf,
-                    &old_to_new,
-                    &skip_ref_set,
-                    suppress_null_values,
-                )?, // cov:ignore: live trailer references are validated by the canonical map
                 root: new_root,
                 direct_root,
                 id,
@@ -5695,11 +5658,25 @@ fn emit_canonical_pdf_inner<R: Read + Seek>(
             };
             written_xref = if deterministic_id {
                 output::with_digested_buffer_sink(&mut bytes, |xref_out| {
-                    plain::xref::append_xref_and_trailer(xref_out, &layout, &trailer)
+                    plain::xref::append_xref_and_trailer(
+                        xref_out,
+                        &layout,
+                        &trailer,
+                        &trailer_handle,
+                        &old_to_new,
+                        &skip_ref_set,
+                    )
                 })?
             } else {
                 output::with_buffer_sink(&mut bytes, |xref_out| {
-                    plain::xref::append_xref_and_trailer(xref_out, &layout, &trailer)
+                    plain::xref::append_xref_and_trailer(
+                        xref_out,
+                        &layout,
+                        &trailer,
+                        &trailer_handle,
+                        &old_to_new,
+                        &skip_ref_set,
+                    )
                 })?
             };
         }

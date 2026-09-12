@@ -61,14 +61,11 @@ pub(crate) enum IdPlan {
 #[derive(Clone, Debug)]
 pub(crate) struct TrailerPlan {
     pub(crate) form: XrefForm,
-    /// Canonical trailer entries from the live ObjectHandle graph. Keys remain
-    /// decoded until emission so qpdf's raw-name sort is preserved.
-    pub(crate) canonical_entries: Vec<(Vec<u8>, Vec<u8>)>,
     /// Remapped output reference for an indirect Catalog, when `/Root` is
     /// indirect in the source.
     pub(crate) root: Option<ObjectRef>,
-    /// Serialized direct Catalog value for a direct source `/Root`.
-    pub(crate) direct_root: Option<Vec<u8>>,
+    /// Live direct Catalog value for a direct source `/Root`.
+    pub(crate) direct_root: Option<ObjectHandle>,
     pub(crate) id: IdPlan,
     pub(crate) encrypt: Option<ObjectRef>,
     pub(crate) structural_filtered: bool,
@@ -77,24 +74,9 @@ pub(crate) struct TrailerPlan {
 }
 
 /// Stream a classic xref table or xref stream after an already-written body.
+/// Trailer values stay in the live handle graph until this call, matching
+/// qpdf's `writeTrailer`/`unparseChild` ownership boundary.
 pub(crate) fn append_xref_and_trailer(
-    out: &mut OutputSink<'_>,
-    layout: &BodyLayout,
-    trailer: &TrailerPlan,
-) -> crate::Result<BTreeMap<ObjectRef, XrefEntry>> {
-    layout.validate()?;
-
-    match trailer.form {
-        XrefForm::Table => append_classic_xref_and_trailer(out, layout, trailer),
-        XrefForm::Stream => append_xref_stream_and_trailer(out, layout, trailer),
-    }
-}
-
-/// Append a plain xref section from the writer-owned trailer plan. The classic
-/// handle route delegates trailer emission to the shared `ObjectHandle` owner;
-/// the stream route consumes the plan's already-canonical trailer entries and
-/// uses the shared xref-stream serializer.
-pub(crate) fn append_xref_and_trailer_with_handle(
     out: &mut OutputSink<'_>,
     layout: &BodyLayout,
     trailer: &TrailerPlan,
@@ -104,7 +86,7 @@ pub(crate) fn append_xref_and_trailer_with_handle(
 ) -> crate::Result<BTreeMap<ObjectRef, XrefEntry>> {
     layout.validate()?;
     match trailer.form {
-        XrefForm::Table => append_classic_xref_and_trailer_with_handle(
+        XrefForm::Table => append_classic_xref_and_trailer(
             out,
             layout,
             trailer,
@@ -112,7 +94,14 @@ pub(crate) fn append_xref_and_trailer_with_handle(
             old_to_new,
             removed_refs,
         ),
-        XrefForm::Stream => append_xref_stream_and_trailer(out, layout, trailer),
+        XrefForm::Stream => append_xref_stream_and_trailer(
+            out,
+            layout,
+            trailer,
+            trailer_handle,
+            old_to_new,
+            removed_refs,
+        ),
     }
 }
 
@@ -120,6 +109,9 @@ fn append_xref_stream_and_trailer(
     out: &mut OutputSink<'_>,
     layout: &BodyLayout,
     trailer: &TrailerPlan,
+    trailer_handle: &ObjectHandle,
+    old_to_new: &HashMap<ObjectRef, ObjectRef>,
+    removed_refs: &BTreeSet<ObjectRef>,
 ) -> crate::Result<BTreeMap<ObjectRef, XrefEntry>> {
     let xref_offset = usize::try_from(out.position()).map_err(|_| {
         crate::Error::Unsupported("plain writer xref offset exceeds usize range".into())
@@ -164,16 +156,27 @@ fn append_xref_stream_and_trailer(
         false,
     )?; // cov:ignore: plain xref payload setup is a validated in-memory writer boundary.
 
+    let map = |object_ref: ObjectRef| {
+        old_to_new.get(&object_ref).copied().ok_or_else(|| {
+            crate::Error::Unsupported(format!(
+                "plain writer: trailer reference {object_ref} absent from renumber map"
+            ))
+        })
+    };
     let dictionary = xref_stream::XrefStreamDict {
         filtered: trailer.structural_filtered,
         widths: stream_layout.widths,
         index: None,
         info: None,
         root: trailer.root,
-        root_value: trailer.direct_root.as_deref(),
+        root_value: None,
+        live_root_value: trailer.direct_root.as_ref(),
         size,
         prev: None,
-        canonical_entries: Some(&trailer.canonical_entries),
+        canonical_entries: None,
+        live_trailer: Some(trailer_handle),
+        live_map: Some(&map),
+        live_removed_refs: Some(removed_refs),
         id: None,
         encrypt: trailer.encrypt,
     };
@@ -236,7 +239,7 @@ fn append_xref_stream_and_trailer(
     written_xref_stream(layout, xref_ref, xref_offset)
 }
 
-fn append_classic_xref_and_trailer_with_handle(
+fn append_classic_xref_and_trailer(
     out: &mut OutputSink<'_>,
     layout: &BodyLayout,
     trailer: &TrailerPlan,
@@ -365,54 +368,6 @@ pub(crate) fn materialized_id_handle(
     }
 }
 
-fn append_classic_xref_and_trailer(
-    out: &mut OutputSink<'_>,
-    layout: &BodyLayout,
-    trailer: &TrailerPlan,
-) -> crate::Result<BTreeMap<ObjectRef, XrefEntry>> {
-    let xref_offset = usize::try_from(out.position()).map_err(|_| {
-        crate::Error::Unsupported("plain writer xref offset exceeds usize range".into())
-    })?;
-    let size = layout
-        .max_number()
-        .checked_add(1)
-        .ok_or_else(|| crate::Error::Unsupported("plain writer /Size overflows u32".into()))?;
-    if layout
-        .uncompressed
-        .values()
-        .any(|&(_, offset)| offset as u64 >= 10_000_000_000)
-    {
-        return Err(crate::Error::Unsupported(
-            "plain writer classic xref offset exceeds ten digits".into(),
-        ));
-    }
-
-    let mut entries = BTreeMap::new();
-    for (&number, &(_, offset)) in &layout.uncompressed {
-        entries.insert(
-            number,
-            XrefEntry::Uncompressed {
-                offset: offset as u64,
-            },
-        );
-    }
-    for (&number, location) in &layout.compressed {
-        entries.insert(
-            number,
-            XrefEntry::Compressed {
-                stream: location.container,
-                index: location.index,
-            },
-        );
-    }
-    let _ = write_xref_table(out, 0, size - 1, &entries, false, 0, 0, 0)?;
-
-    out.write_bytes(b"trailer ")?;
-    write_canonical_classic_trailer(out, trailer, size, &trailer.canonical_entries)?;
-    out.write_bytes(format!("\nstartxref\n{xref_offset}\n%%EOF\n").as_bytes())?;
-    written_xref_table(layout, size)
-}
-
 /// Write qpdf's classic xref table rows.
 ///
 /// This is the direct Rust counterpart of
@@ -475,80 +430,6 @@ pub(crate) fn write_xref_table(
         out.write_bytes(format!("{offset:010} 00000 n \n").as_bytes())?;
     }
     Ok(space_before_zero)
-}
-
-fn write_canonical_classic_trailer(
-    out: &mut OutputSink<'_>,
-    trailer: &TrailerPlan,
-    size: u32,
-    canonical: &[(Vec<u8>, Vec<u8>)],
-) -> crate::Result<()> {
-    let mut entries = canonical.to_vec();
-    if let Some(root) = trailer.root {
-        entries.push((
-            b"/Root".to_vec(),
-            format!("{} {} R", root.number, root.generation).into_bytes(),
-        ));
-    }
-    if let Some(root) = &trailer.direct_root {
-        entries.push((b"/Root".to_vec(), root.clone()));
-    }
-    entries.push((b"/Size".to_vec(), size.to_string().into_bytes()));
-    entries.sort_by(|left, right| left.0.cmp(&right.0));
-
-    out.write_bytes(b"<<")?;
-    for (key, value) in entries {
-        out.write_bytes(b" ")?;
-        write_qpdf_dictionary_key(out, &key)?;
-        out.write_bytes(b" ")?;
-        out.write_bytes(&value)?;
-    }
-
-    if let IdPlan::Materialized {
-        value: Some((id0, id1)),
-    } = &trailer.id
-    {
-        out.write_bytes(b" /ID [<")?;
-        write_hex(out, id0)?;
-        out.write_bytes(b"><")?;
-        write_hex(out, id1)?;
-        out.write_bytes(b">]")?;
-    } else if let IdPlan::Deterministic {
-        source_id0,
-        info_suffix,
-    } = &trailer.id
-    {
-        out.write_bytes(b" /ID ")?;
-        write_deterministic_id_inline(out, info_suffix, source_id0.as_deref())?;
-    }
-
-    if let Some(encrypt) = trailer.encrypt {
-        out.write_bytes(b" /Encrypt ")?;
-        out.write_bytes(format!("{} {} R", encrypt.number, encrypt.generation).as_bytes())?;
-    }
-    out.write_bytes(b" >>")?;
-    Ok(())
-}
-
-/// Emit a qpdf dictionary key without changing its first byte.
-/// `QPDF_Name::normalizeName` (`libqpdf/QPDF_Name.cc:27-50`) preserves a raw
-/// slashless key such as `Array1`, while canonical keys already carry `/`.
-fn write_qpdf_dictionary_key(out: &mut OutputSink<'_>, key: &[u8]) -> crate::Result<()> {
-    if let Some(key) = key.strip_prefix(b"/") {
-        out.write_bytes(b"/")?;
-        crate::pdf_syntax::write_name_escaped(out, key)?;
-    } else {
-        crate::pdf_syntax::write_name_escaped(out, key)?;
-    }
-    Ok(())
-}
-
-fn write_hex(out: &mut OutputSink<'_>, bytes: &[u8]) -> crate::Result<()> {
-    const HEX: &[u8; 16] = b"0123456789abcdef";
-    for &byte in bytes {
-        out.write_bytes(&[HEX[(byte >> 4) as usize], HEX[(byte & 0x0f) as usize]])?;
-    }
-    Ok(())
 }
 
 fn written_xref_table(
@@ -632,8 +513,16 @@ mod tests {
         layout: &BodyLayout,
         trailer: &TrailerPlan,
     ) -> crate::Result<BTreeMap<ObjectRef, XrefEntry>> {
+        let trailer_handle = ObjectHandle::dictionary(Vec::new());
         crate::writer::output::with_buffer_sink(bytes, |out| {
-            append_xref_and_trailer(out, layout, trailer)
+            append_xref_and_trailer(
+                out,
+                layout,
+                trailer,
+                &trailer_handle,
+                &HashMap::new(),
+                &BTreeSet::new(),
+            )
         })
     }
 
@@ -646,7 +535,7 @@ mod tests {
         removed_refs: &BTreeSet<ObjectRef>,
     ) -> crate::Result<BTreeMap<ObjectRef, XrefEntry>> {
         crate::writer::output::with_buffer_sink(bytes, |out| {
-            append_xref_and_trailer_with_handle(
+            append_xref_and_trailer(
                 out,
                 layout,
                 trailer,
@@ -685,7 +574,6 @@ mod tests {
     fn trailer() -> TrailerPlan {
         TrailerPlan {
             form: XrefForm::Table,
-            canonical_entries: Vec::new(),
             root: None,
             direct_root: None,
             id: IdPlan::Materialized { value: None },

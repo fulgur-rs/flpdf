@@ -128,12 +128,23 @@ where
 
     let first_offset = pair_table.len();
 
-    // Concatenate: pair table || objects section.
-    let mut bytes = pair_table;
-    bytes.extend_from_slice(&objects_section);
+    // Prefix the pair table in place. The member bodies and the pair table
+    // share one final local allocation; inserting the small prefix with an
+    // in-place shift avoids the second full-size `pair_table || objects`
+    // allocation that a normal `extend_from_slice` would require.
+    let objects_len = objects_section.len();
+    objects_section.reserve(first_offset);
+    objects_section.resize(
+        objects_len.checked_add(first_offset).ok_or_else(|| {
+            crate::Error::Unsupported("ObjStm body length overflows usize".to_string())
+        })?,
+        0,
+    );
+    objects_section.copy_within(0..objects_len, first_offset);
+    objects_section[..first_offset].copy_from_slice(&pair_table);
 
     Ok(ObjStmBody {
-        bytes,
+        bytes: objects_section,
         first_offset,
         n_members: members.len(),
     })
