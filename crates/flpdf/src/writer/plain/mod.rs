@@ -204,8 +204,12 @@ fn write_plain_live<R: Read + Seek>(
     // (`QPDFWriter.cc:3023-3031`), not from what the walk turned out to
     // reach, so a registered-but-unreached container still produces a
     // cross-reference stream with zero type-2 rows.
-    let form = if has_object_stream_hint || (!options.qdf && pdf.last_xref_form == XrefForm::Stream)
-    {
+    let preserve_source_xref_stream = encryption_context.is_some()
+        && !options.qdf
+        && pdf.last_xref_form == XrefForm::Stream
+        && crate::pdf_version::parse_qpdf_writer_version(&version)
+            .is_some_and(|version| version >= crate::pdf_version::QpdfVersionParts::new(1, 5));
+    let form = if has_object_stream_hint || preserve_source_xref_stream {
         XrefForm::Stream
     } else {
         XrefForm::Table
