@@ -7,6 +7,8 @@ pub(crate) mod encryption_state;
 pub(crate) mod object;
 #[path = "writer/object_streams/mod.rs"]
 pub(crate) mod object_streams;
+#[path = "writer/output.rs"]
+pub(crate) mod output;
 #[path = "writer/pclm.rs"]
 pub(crate) mod pclm;
 #[path = "writer/pclm_live.rs"]
@@ -22,6 +24,7 @@ mod settings;
 pub(crate) mod write_object;
 pub(crate) use object::{ObjectWriterEmission, StreamDictionaryOptions};
 pub use object_streams::ObjectStreamMode;
+use output::{OutputSink, OutputTarget};
 pub use serialize::write_stream_to_buf;
 pub use settings::DecodeLevel;
 use settings::WriterSettings;
@@ -158,6 +161,27 @@ impl<'a> WriterOutputSink<'a> {
 
     fn take_failure(&mut self) -> Option<Error> {
         self.failure.take()
+    }
+}
+
+impl OutputTarget for WriterOutputSink<'_> {
+    fn write_chunk(&mut self, bytes: &[u8]) -> io::Result<usize> {
+        self.write(bytes)
+    }
+
+    fn finish_segment(&mut self) -> Result<()> {
+        match self.output {
+            WriterOutput::Memory(_) => Ok(()),
+            WriterOutput::Writer { .. } => {
+                self.flush()?;
+                Ok(())
+            }
+            WriterOutput::Pipeline(pipeline) => pipeline.finish().map_err(Into::into),
+        }
+    }
+
+    fn finish_document(&mut self) -> Result<()> {
+        self.finish_output()
     }
 }
 
@@ -933,21 +957,23 @@ impl<'pdf, R: Read + Seek + 'static> PdfWriter<'pdf, R> {
                 .output
                 .as_mut()
                 .expect("output was checked before writing");
-            let mut sink = WriterOutputSink::new(output);
-            match emit_canonical_pdf_with_special_streams(
-                self.pdf,
-                &mut sink,
-                &options,
-                special_streams.as_ref(),
-                setup,
-            ) {
-                Ok(result) => {
-                    if let Err(error) = sink.finish_output() {
-                        return Err(sink.take_failure().unwrap_or(error));
-                    }
-                    result
+            let mut target = WriterOutputSink::new(output);
+            let emission = {
+                let mut sink = OutputSink::new(&mut target);
+                match emit_canonical_pdf_with_special_streams(
+                    self.pdf,
+                    &mut sink,
+                    &options,
+                    special_streams.as_ref(),
+                    setup,
+                ) {
+                    Ok(result) => sink.finish_document().map(|()| result),
+                    Err(error) => Err(error),
                 }
-                Err(error) => return Err(sink.take_failure().unwrap_or(error)),
+            };
+            match emission {
+                Ok(result) => result,
+                Err(error) => return Err(target.take_failure().unwrap_or(error)),
             }
         };
 
