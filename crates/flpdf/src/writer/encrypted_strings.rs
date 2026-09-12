@@ -280,6 +280,61 @@ impl EncryptedStringEmitter {
             })
     }
 
+    /// QDF stream-dictionary emission for a dictionary already prepared by
+    /// the live writer's discovery pass. This keeps Crypt/filter cleanup
+    /// single-pass while still applying the current object's string key.
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) fn write_prepared_handle_stream_dict_with_ref_map(
+        &mut self,
+        out: &mut Vec<u8>,
+        emitted_ref: ObjectRef,
+        object_stream_index: Option<u32>,
+        dict: &ObjectHandle,
+        options: StreamDictOptions,
+        map: &dyn Fn(ObjectRef) -> crate::Result<ObjectRef>,
+        removed_refs: &std::collections::BTreeSet<ObjectRef>,
+        length_ref: Option<ObjectRef>,
+    ) -> crate::Result<()> {
+        if !options.encrypt_strings {
+            return crate::writer::object::write_prepared_stream_body_qdf_with_ref_map_and_removed_and_length_with_options(
+                dict,
+                out,
+                0,
+                map,
+                removed_refs,
+                length_ref,
+                options.dictionary,
+            );
+        }
+
+        let cipher = self.cipher;
+        let static_aes_iv = self.static_aes_iv;
+        let aes_iv_generator = self.aes_iv_generator.as_mut();
+        self.state
+            .with_object_data_key(emitted_ref.number, object_stream_index, |state| {
+                let mut write_string = |out: &mut Vec<u8>, plaintext: &[u8]| {
+                    write_encrypted_or_plain_string(
+                        state,
+                        cipher,
+                        static_aes_iv,
+                        aes_iv_generator,
+                        out,
+                        plaintext,
+                    )
+                };
+                crate::writer::object::write_prepared_stream_body_qdf_with_ref_map_and_removed_and_length_with_string_writer_with_options(
+                    dict,
+                    out,
+                    0,
+                    map,
+                    removed_refs,
+                    length_ref,
+                    options.dictionary,
+                    &mut write_string,
+                )
+            })
+    }
+
     /// Standard-writer stream-dictionary counterpart of
     /// [`Self::write_handle_stream_dict_with_ref_map`].
     #[allow(clippy::too_many_arguments)]

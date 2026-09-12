@@ -3520,13 +3520,35 @@ fn emit_canonical_pdf_inner<R: Read + Seek, W: Write>(
         && options.copy_encryption.is_none()
         && !options.pclm
         && plain::qdf_or_normalize_live_eligible(options, &source_object_stream_data);
+    // The live body already owns encryption-aware object and stream emission.
+    // Extend the QDF/normalize live boundary to the indirect-Root encrypted
+    // cohort, while keeping direct-Root trailer serialization, source-backed
+    // Preserve containers, and generated ObjStm packing on their existing
+    // planned consumers.
+    let encrypted_qdf_or_normalize_live = (options.qdf || options.content_normalization)
+        && pdf.root_ref().is_some()
+        && !options.pclm
+        && encryption_parameters.is_some()
+        && matches!(
+            options.object_streams,
+            ObjectStreamMode::Disable | ObjectStreamMode::Preserve
+        )
+        && (options.object_streams == ObjectStreamMode::Disable
+            || source_object_stream_data.is_empty());
     let specialized_standard_live = !plain_route
         && !qdf_or_normalize_live
+        && !encrypted_qdf_or_normalize_live
         && !options.qdf
         && !options.content_normalization
         && !options.pclm;
-    if specialized_standard_live {
-        return emit_specialized_standard_live(
+    if specialized_standard_live || encrypted_qdf_or_normalize_live {
+        let (page_sequences, contents_sequences, content_container_sequences) =
+            if encrypted_qdf_or_normalize_live {
+                plain::live_page_context(pdf, special_streams)?
+            } else {
+                (BTreeMap::new(), BTreeMap::new(), BTreeMap::new())
+            };
+        return emit_specialized_standard_live_with_page_context(
             pdf,
             out,
             options,
@@ -3535,6 +3557,10 @@ fn emit_canonical_pdf_inner<R: Read + Seek, W: Write>(
             &source_object_stream_data,
             generated_compressible.as_ref(),
             &generated_object_stream_sources,
+            options.qdf,
+            page_sequences,
+            contents_sequences,
+            content_container_sequences,
         );
     }
     if options.pclm {
@@ -3890,11 +3916,6 @@ fn emit_canonical_pdf_inner<R: Read + Seek, W: Write>(
         false,
         !plan.batches.is_empty(),
     );
-    let direct_root_output = root_handle
-        .as_ref()
-        .map(|root| root.output_root_copy_with_adbe(&version, final_extension_level, false))
-        .transpose()?;
-
     if (options.qdf || qpdf_generate_standard || qpdf_preserve_source_objstm)
         && !plan.batches.is_empty()
     {
@@ -4373,14 +4394,7 @@ fn emit_canonical_pdf_inner<R: Read + Seek, W: Write>(
         let object_handle = pdf.get_object_handle(*old_ref);
         object_handle.try_dereference()?;
         let is_stream = object_handle.as_stream_dict().is_some();
-        let root_output = if root_ref == Some(*old_ref) {
-            // qpdf's unparseObject shallow-copies the Catalog at the moment it
-            // is emitted. Keep this copy inside the body loop so the legacy
-            // planner cannot observe an output-only ADBE mutation.
-            Some(object_handle.output_root_copy_with_adbe(&version, final_extension_level, true)?)
-        } else {
-            None
-        };
+        let is_root = root_ref == Some(*old_ref);
 
         // Direct `/Contents` streams have no terminal ObjectRef to put in
         // `contents_seq`. Their owning page/array holder uses the dedicated
@@ -4443,6 +4457,14 @@ fn emit_canonical_pdf_inner<R: Read + Seek, W: Write>(
                 )
                 .as_bytes(),
             );
+        }
+
+        // qpdf reports progress before entering unparseObject. Do this before
+        // creating the output-only Catalog copy so a callback can replace,
+        // delete, or attach Root state and have that state observed by the
+        // same emission.
+        if is_root {
+            report_progress_event(options)?;
         }
 
         // The body header uses the emitted number.
@@ -4625,6 +4647,15 @@ fn emit_canonical_pdf_inner<R: Read + Seek, W: Write>(
                 ));
             }
         } else {
+            let root_output = if is_root {
+                Some(object_handle.output_root_copy_with_adbe(
+                    &version,
+                    final_extension_level,
+                    true,
+                )?)
+            } else {
+                None
+            };
             let object_to_write = root_output.as_ref().unwrap_or(&object_handle);
             if let Some(emitter) = encrypted_strings.as_mut() {
                 emitter.write_handle_object_with_ref_map(
@@ -4664,7 +4695,9 @@ fn emit_canonical_pdf_inner<R: Read + Seek, W: Write>(
         }
         offsets.insert(emit_ref.number, (emit_ref.generation, emit_offset));
         emitted_old_to_new.insert(*old_ref, ObjectRef::new(emit_ref.number, 0));
-        report_progress_event(options)?;
+        if !is_root {
+            report_progress_event(options)?;
+        }
 
         // QDF: emit the length-holder object IMMEDIATELY after its stream's
         // endobj + blank line, numbered in sequential emission order so that
@@ -4782,7 +4815,13 @@ fn emit_canonical_pdf_inner<R: Read + Seek, W: Write>(
                 qdf_marker_starts.push(marker_start);
                 qdf_marker_lengths.push(out.len() - marker_start);
             }
-            let object_to_write = if root_ref == handle.object_ref() {
+            let is_root = root_ref == handle.object_ref();
+            if is_root {
+                // Keep the callback before Root reconciliation, matching the
+                // writeObject -> unparseObject order used by qpdf.
+                report_progress_event(options)?;
+            }
+            let object_to_write = if is_root {
                 // A generated/preserved ObjStm may contain the Catalog. qpdf
                 // still applies the root-only output copy from inside
                 // `unparseObject`, after the object has been planned and
@@ -4806,7 +4845,7 @@ fn emit_canonical_pdf_inner<R: Read + Seek, W: Write>(
             } else {
                 object_to_write.write_object_with_ref_map_and_removed(out, &map, &removed_refs)
             }; // cov:ignore: llvm-cov maps the successful callback branch closing here
-            if result.is_ok() {
+            if !is_root && result.is_ok() {
                 report_progress_event(options)?;
             } // cov:ignore: llvm-cov maps the successful progress branch closing here
             result
@@ -5067,6 +5106,14 @@ fn emit_canonical_pdf_inner<R: Read + Seek, W: Write>(
         }
         offsets.insert(ctx.encrypt_ref.number, (0, emit_offset));
     }
+
+    // A direct Catalog is serialized as a trailer value, after all body
+    // progress callbacks have run. Defer its shallow copy until this boundary
+    // so callback mutations are visible, just like qpdf's writeTrailer path.
+    let direct_root_output = root_handle
+        .as_ref()
+        .map(|root| root.output_root_copy_with_adbe(&version, final_extension_level, false))
+        .transpose()?;
 
     // Build xref / trailer matching the input's xref form.
     let xref_offset = bytes.len();
@@ -5341,13 +5388,14 @@ fn emit_canonical_pdf_inner<R: Read + Seek, W: Write>(
 /// Specialized non-linearized standard output using qpdf's growing queue.
 ///
 /// This consumer intentionally owns the whole standard body/xref handoff for
-/// its cohort. The legacy coordinator below still owns QDF and normalization,
-/// whose indirect length holders and content maps need their own pending
-/// migration (`flpdf-ay5b`). Keeping this boundary explicit prevents a frozen
-/// catalog-first prewalk from silently remaining underneath the root output
-/// shallow-copy migration.
+/// its cohort. It also serves the bounded encrypted QDF/normalization cohort
+/// when no source or generated ObjStm packing is required; the legacy
+/// coordinator remains only for planned ObjStm-bearing consumers and direct
+/// Root forms excluded from that live path. Keeping this boundary explicit
+/// prevents a frozen catalog-first prewalk from silently remaining underneath
+/// the root output shallow-copy migration.
 #[allow(clippy::too_many_arguments)]
-fn emit_specialized_standard_live<R: Read + Seek + 'static, W: Write>(
+fn emit_specialized_standard_live_with_page_context<R: Read + Seek + 'static, W: Write>(
     pdf: &mut Pdf<R>,
     mut out: W,
     options: &WriterOptions,
@@ -5356,6 +5404,10 @@ fn emit_specialized_standard_live<R: Read + Seek + 'static, W: Write>(
     source_object_stream_data: &BTreeMap<u32, u32>,
     generated_compressible: Option<&object_streams::CompressiblePlan>,
     generated_object_stream_sources: &[ObjectRef],
+    qdf: bool,
+    page_sequences: BTreeMap<ObjectRef, usize>,
+    contents_sequences: BTreeMap<ObjectRef, usize>,
+    content_container_sequences: BTreeMap<ObjectRef, usize>,
 ) -> Result<WriterResult> {
     let deterministic_id = uses_deterministic_id(options);
     let encrypting = options.encrypt.is_some() || options.copy_encryption.is_some();
@@ -5520,7 +5572,7 @@ fn emit_specialized_standard_live<R: Read + Seek + 'static, W: Write>(
     // Preserve as well so stale aliases become null/omitted at emission time
     // (`QPDFWriter.cc:1953-1966`, `QPDF.cc:2426-2443`).
     let removed_refs = plan.removed_refs.clone();
-    let mut body = plain::body::emit_live_specialized_standard(
+    let mut body = plain::body::emit_live_specialized_standard_with_page_context(
         pdf,
         options,
         &version,
@@ -5529,8 +5581,15 @@ fn emit_specialized_standard_live<R: Read + Seek + 'static, W: Write>(
         removed_refs.clone(),
         &object_stream_groups,
         encrypt_ctx.as_ref(),
+        qdf,
+        page_sequences,
+        contents_sequences,
+        content_container_sequences,
     )?; // cov:ignore: LLVM attributes the live-body call continuation to callback cleanup
-    let body_map: HashMap<ObjectRef, ObjectRef> = body.old_to_new.into_iter().collect();
+    let mut body_map: HashMap<ObjectRef, ObjectRef> = body.old_to_new.into_iter().collect();
+    for ignored in body.ignored_refs {
+        body_map.insert(ignored, ObjectRef::new(0, 0));
+    }
     let new_root = root_source.and_then(|source| body_map.get(&source).copied());
     if root_source.is_some() && new_root.is_none() {
         // cov:ignore-start: the live body seeds /Root before the queue is drained
@@ -5564,6 +5623,9 @@ fn emit_specialized_standard_live<R: Read + Seek + 'static, W: Write>(
         let encrypt_handle = ctx.encrypt_dict_handle();
         encrypted_strings::write_encryption_dictionary_handle(&mut body.bytes, &encrypt_handle)?;
         body.bytes.extend_from_slice(b"\nendobj\n");
+        if qdf {
+            body.bytes.push(b'\n');
+        }
         body.layout
             .uncompressed
             .insert(ctx.encrypt_ref.number, (0, offset));
@@ -5653,7 +5715,7 @@ fn emit_specialized_standard_live<R: Read + Seek + 'static, W: Write>(
         id,
         encrypt: encrypt_ctx.as_ref().map(|ctx| ctx.encrypt_ref),
         structural_filtered,
-        qdf: false,
+        qdf,
     };
 
     let mut bytes = body.bytes;

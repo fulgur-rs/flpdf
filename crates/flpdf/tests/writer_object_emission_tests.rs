@@ -329,6 +329,84 @@ fn qdf_and_normalize_progress_direct_root_child_gets_a_late_number() {
 }
 
 #[test]
+fn legacy_direct_root_is_copied_after_body_progress_callbacks() {
+    for qdf in [true, false] {
+        let mut pdf = Pdf::open(Cursor::new(
+            include_bytes!("../../../tests/fixtures/compat/direct-root-one-page.pdf").to_vec(),
+        ))
+        .unwrap();
+        let root = pdf.root_handle().unwrap();
+        let mut writer = PdfWriter::new(&mut pdf);
+        writer.set_object_stream_mode(ObjectStreamMode::Generate);
+        writer.set_qdf_mode(qdf);
+        writer.set_content_normalization(!qdf);
+        writer.set_extra_header_text("% legacy direct-root callback\n");
+        writer.set_static_id(true);
+        writer.set_output_memory().unwrap();
+        writer.register_progress_reporter(Box::new(move |percent| {
+            if percent == 0 {
+                root.replace_key(b"/CallbackMarker", ObjectHandle::integer(42))?;
+            }
+            Ok(())
+        }));
+        writer
+            .write()
+            .unwrap_or_else(|error| panic!("qdf={qdf} legacy direct-root write failed: {error}"));
+        let output = writer.get_buffer().unwrap();
+        assert!(
+            output
+                .windows(b"/CallbackMarker 42".len())
+                .any(|window| window == b"/CallbackMarker 42"),
+            "qdf={qdf} must copy direct Root after body progress"
+        );
+    }
+}
+
+#[test]
+fn encrypted_normalize_root_progress_failure_precedes_adbe_reconciliation() {
+    let mut pdf = Pdf::open(Cursor::new(
+        include_bytes!("../../../tests/fixtures/compat/one-page-ext-indirect.pdf").to_vec(),
+    ))
+    .unwrap();
+    let extensions = pdf
+        .root_handle()
+        .unwrap()
+        .try_get_key(b"/Extensions")
+        .unwrap();
+    let mut writer = PdfWriter::new(&mut pdf);
+    writer.set_content_normalization(true);
+    writer.set_object_stream_mode(ObjectStreamMode::Disable);
+    writer.set_static_id(true);
+    writer.set_static_aes_iv(true);
+    writer.force_pdf_version("1.7", 8);
+    writer.set_encryption_parameters(EncryptParams::v4_aes128(b"u", b"o"));
+    writer.set_output_memory().unwrap();
+    writer.register_progress_reporter(Box::new(|percent| {
+        if percent == 0 {
+            return Err(flpdf::Error::System("root progress failure".into()));
+        }
+        Ok(())
+    }));
+
+    let error = writer.write().unwrap_err();
+    assert!(matches!(
+        error,
+        flpdf::Error::System(ref message) if message == "root progress failure"
+    ));
+    assert_eq!(
+        extensions
+            .try_get_key(b"/ADBE")
+            .unwrap()
+            .try_get_key(b"/ExtensionLevel")
+            .unwrap()
+            .try_get_int_value()
+            .unwrap(),
+        3,
+        "a failed Root progress event must not leave output-only ADBE state"
+    );
+}
+
+#[test]
 fn qdf_discovery_walks_a_direct_stream_dictionary_child() {
     let mut pdf = Pdf::open(Cursor::new(
         include_bytes!("../../../tests/fixtures/compat/one-page-no-ext.pdf").to_vec(),
