@@ -165,7 +165,7 @@ pub(crate) trait ObjectWriterEmission {
             "dynamic stream writer map is unavailable for this emission owner".into(),
         ))
     }
-    #[allow(dead_code)] // low-level object serializer test surface; production live consumers inject their stream policy
+    #[cfg(test)]
     fn write_object_with_dynamic_ref_map_and_string_writer<F>(
         &self,
         out: &mut Vec<u8>,
@@ -613,6 +613,7 @@ impl ObjectWriterEmission for ObjectHandle {
         unparse_stream_dict_entries_with_dynamic_ref_map(&entries, options, out, map, removed_refs)
     }
 
+    #[cfg(test)]
     fn write_object_with_dynamic_ref_map_and_string_writer<F>(
         &self,
         out: &mut Vec<u8>,
