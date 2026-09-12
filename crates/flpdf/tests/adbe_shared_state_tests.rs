@@ -187,6 +187,14 @@ fn legacy_normalize_reconciles_an_uncompressed_root() {
         ]);
         root.replace_key(b"/Extensions", extensions.clone())
             .expect("install shared Extensions");
+        let audit = pdf
+            .make_indirect_from_object_handle(ObjectHandle::dictionary(vec![(
+                b"/Marker".to_vec(),
+                ObjectHandle::integer(1),
+            )]))
+            .expect("create a planned non-page dictionary");
+        root.replace_key(b"/Audit", audit)
+            .expect("attach planned non-page dictionary");
 
         let mut writer = PdfWriter::new(&mut pdf);
         writer.set_content_normalization(true);
