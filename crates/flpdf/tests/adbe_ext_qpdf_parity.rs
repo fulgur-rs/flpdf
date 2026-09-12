@@ -525,6 +525,67 @@ fn encrypted_qdf_adbe_orphan_root_cutover_matches_qpdf() {
     );
 }
 
+#[cfg(feature = "qpdf-zlib-compat")]
+#[test]
+fn encrypted_qdf_content_streams_match_qpdf() {
+    use std::process::Command;
+
+    if !Command::new("qpdf")
+        .arg("--version")
+        .output()
+        .is_ok_and(|result| result.status.success())
+    {
+        eprintln!("qpdf is unavailable; skipping encrypted QDF content parity");
+        return;
+    }
+
+    let input = Path::new(env!("CARGO_MANIFEST_DIR"))
+        .join("../../tests/fixtures/compat/qdf-contents-ref-array.pdf");
+    let temporary = tempfile::tempdir().expect("create qpdf comparison directory");
+    let qpdf_output = temporary.path().join("qpdf.pdf");
+    let result = Command::new("qpdf")
+        .args([
+            "--qdf",
+            "--static-id",
+            "--static-aes-iv",
+            "--object-streams=disable",
+            "--force-version=1.7.8",
+            "--stream-data=uncompress",
+            "--encrypt",
+            "u",
+            "o",
+            "128",
+            "--use-aes=y",
+            "--",
+        ])
+        .arg(&input)
+        .arg(&qpdf_output)
+        .output()
+        .expect("run qpdf encrypted QDF content rewrite");
+    assert!(result.status.success(), "qpdf rewrite failed: {result:?}");
+
+    let file = std::fs::File::open(&input).expect("open QDF content fixture");
+    let mut pdf = Pdf::open(std::io::BufReader::new(file)).expect("parse QDF content fixture");
+    let settings = WriterTestSettings {
+        qdf: true,
+        object_streams: ObjectStreamMode::Disable,
+        force_version: Some("1.7".to_owned()),
+        force_extension_level: Some(8),
+        stream_data: Some(flpdf::StreamDataMode::Uncompress),
+        static_id: true,
+        static_aes_iv: true,
+        encrypt: Some(EncryptParams::v4_aes128(b"u", b"o")),
+        ..WriterTestSettings::default()
+    };
+    let mut actual = Vec::new();
+    write_with_settings(&mut pdf, &mut actual, &settings).expect("encrypted QDF content rewrite");
+    assert_eq!(
+        actual,
+        std::fs::read(&qpdf_output).expect("read qpdf encrypted QDF content output"),
+        "encrypted QDF content stream parity"
+    );
+}
+
 #[test]
 fn direct_root_adbe_survives_forced_version_in_plain_disable_output() {
     for force_version in ["1.4", "1.7", "2.0"] {
