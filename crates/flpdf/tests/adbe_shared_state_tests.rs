@@ -164,6 +164,66 @@ fn legacy_root_reconciles_shared_extensions_on_success_and_failure() {
     }
 }
 
+#[test]
+fn legacy_normalize_reconciles_an_uncompressed_root() {
+    for level in [0, 8] {
+        let mut pdf = Pdf::open(Cursor::new(
+            include_bytes!("../../../tests/fixtures/compat/three-page-objstm.pdf").to_vec(),
+        ))
+        .expect("ObjStm fixture");
+        let root = pdf.root_handle().expect("Catalog");
+        let extensions = ObjectHandle::dictionary(vec![
+            (
+                b"/ADBE".to_vec(),
+                ObjectHandle::dictionary(vec![
+                    (
+                        b"/BaseVersion".to_vec(),
+                        ObjectHandle::name(b"1.7".to_vec()),
+                    ),
+                    (b"/ExtensionLevel".to_vec(), ObjectHandle::integer(3)),
+                ]),
+            ),
+            (b"/ACME".to_vec(), ObjectHandle::integer(1)),
+        ]);
+        root.replace_key(b"/Extensions", extensions.clone())
+            .expect("install shared Extensions");
+
+        let mut writer = PdfWriter::new(&mut pdf);
+        writer.set_content_normalization(true);
+        writer.set_object_stream_mode(flpdf::ObjectStreamMode::Preserve);
+        writer.set_extra_header_text("% legacy normalize ADBE probe\n");
+        writer.set_static_id(true);
+        writer.force_pdf_version("1.7", level);
+        writer.set_output_memory().unwrap();
+        writer.write().expect("legacy normalization rewrite");
+
+        assert!(root
+            .try_get_key(b"/Extensions")
+            .unwrap()
+            .is_same_object_as(&extensions));
+        assert_eq!(
+            extensions
+                .try_get_key(b"/ACME")
+                .unwrap()
+                .try_get_int_value()
+                .unwrap(),
+            1
+        );
+        let adbe = extensions.try_get_key(b"/ADBE").unwrap();
+        if level == 0 {
+            assert!(adbe.is_null());
+        } else {
+            assert_eq!(
+                adbe.try_get_key(b"/ExtensionLevel")
+                    .unwrap()
+                    .try_get_int_value()
+                    .unwrap(),
+                level
+            );
+        }
+    }
+}
+
 fn callback_failure(percent: u8, expected_level: i64) {
     let (mut pdf, _root, extensions) = document();
     let mut writer = PdfWriter::new(&mut pdf);
