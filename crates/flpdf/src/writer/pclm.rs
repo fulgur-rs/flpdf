@@ -62,7 +62,7 @@ impl Plan {
 
             let page_handle = builder.pdf.get_object_handle(page);
             page_handle.try_dereference()?;
-            if page_handle.try_as_dictionary()?.is_none() {
+            if !page_handle.try_is_dictionary()? {
                 continue; // cov:ignore: page_refs yields only dictionary /Type /Page leaves
             }
 

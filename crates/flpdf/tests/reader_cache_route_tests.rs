@@ -32,7 +32,7 @@ fn encryption_dictionary_reader_route_uses_handle_accessors() {
         .and_then(|tail| tail.split("pub(crate) fn last_xref_form").next())
         .expect("encryption dictionary route exists");
 
-    assert!(route.contains("try_as_dictionary"));
+    assert!(route.contains("try_is_dictionary"));
     assert!(!route.contains("materialize"));
 }
 

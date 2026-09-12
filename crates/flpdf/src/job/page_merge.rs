@@ -90,7 +90,7 @@ fn wire_primary_catalog<RS: Read + Seek, RT: Read + Seek>(
     let source_catalog_handle = source.get_object_handle(source_catalog_ref);
     source_catalog_handle.try_dereference()?;
     let source_catalog = source_catalog_handle;
-    if source_catalog.try_as_dictionary()?.is_none() {
+    if !source_catalog.try_is_dictionary()? {
         return Ok(()); // cov:ignore: page selection already requires a dictionary catalog
     }
     let Some(target_catalog_ref) = target.root_ref() else {
@@ -99,7 +99,7 @@ fn wire_primary_catalog<RS: Read + Seek, RT: Read + Seek>(
     let target_catalog_handle = target.get_object_handle(target_catalog_ref);
     target_catalog_handle.try_dereference()?;
     let target_catalog = target_catalog_handle;
-    if target_catalog.try_as_dictionary()?.is_none() {
+    if !target_catalog.try_is_dictionary()? {
         return Ok(()); // cov:ignore: Pdf::empty always supplies a dictionary catalog
     }
 
@@ -349,18 +349,18 @@ fn discover_primary_acroform<R: Read + Seek>(source: &mut Pdf<R>) -> Result<Prim
     let root_handle = source.get_object_handle(root_ref);
     root_handle.try_dereference()?;
     let root = root_handle;
-    if root.try_as_dictionary()?.is_none() {
+    if !root.try_is_dictionary()? {
         return Ok(out); // cov:ignore: page selection already requires a dictionary catalog
     }
     let acroform = root.try_get_key(b"/AcroForm")?;
     acroform.try_dereference()?;
-    if acroform.try_as_dictionary()?.is_some() {
+    if acroform.try_is_dictionary()? {
         let dr = acroform.try_get_key(b"/DR")?;
         let da = acroform.try_get_key(b"/DA")?;
         out.has_dr = !dr.try_is_null()?;
         out.has_da = !da.try_is_null()?;
         let fields = acroform.try_get_key(b"/Fields")?;
-        out.fields_are_indirect = fields.is_indirect() && fields.try_as_array()?.is_some();
+        out.fields_are_indirect = fields.is_indirect() && fields.try_is_array()?;
     }
     Ok(out)
 }
@@ -431,7 +431,7 @@ fn resolve_field_partial_name<R: Read + Seek>(
     let field_handle = source.get_object_handle(field_ref);
     field_handle.try_dereference()?;
     let field = field_handle;
-    if field.try_as_dictionary()?.is_none() {
+    if !field.try_is_dictionary()? {
         return Ok(None);
     }
     let t_value = field.try_get_key(b"/T")?;
@@ -460,7 +460,7 @@ fn remove_target_acroform<R: Read + Seek>(target: &mut Pdf<R>) -> Result<()> {
     let catalog_handle = target.get_object_handle(catalog_ref);
     catalog_handle.try_dereference()?;
     let catalog = catalog_handle;
-    if catalog.try_as_dictionary()?.is_none() {
+    if !catalog.try_is_dictionary()? {
         return Ok(()); // cov:ignore: the seed catalog is always a dict
     }
     catalog.remove_key(b"/AcroForm");
@@ -505,7 +505,7 @@ fn build_merged_acroform<R: Read + Seek>(
     // annotations are not reported as source-document orphans.
     let acroform =
         AcroFormDocumentHelper::new_for_field_tree(target)?.canonical_get_or_create_acroform()?;
-    if acroform.try_as_dictionary()?.is_none() {
+    if !acroform.try_is_dictionary()? {
         return Ok(()); // cov:ignore: ensure_acroform_ref always yields a dictionary
     }
 
@@ -562,7 +562,7 @@ fn rename_field<R: Read + Seek>(
     let field_handle = target.get_object_handle(field_ref);
     field_handle.try_dereference()?;
     let field = field_handle;
-    if field.try_as_dictionary()?.is_none() {
+    if !field.try_is_dictionary()? {
         return Ok(()); // cov:ignore: a copied field ref always resolves to a dictionary
     }
     field.replace_key(b"/T", ObjectHandle::string(new_unicode_string(&name)))?;
@@ -580,7 +580,7 @@ fn field_kid_refs<R: Read + Seek>(
     let field_handle = source.get_object_handle(field_ref);
     field_handle.try_dereference()?;
     let field = field_handle;
-    if field.try_as_dictionary()?.is_none() {
+    if !field.try_is_dictionary()? {
         return Ok(None);
     }
     let kids_value = field.try_get_key(b"/Kids")?;
@@ -627,7 +627,7 @@ fn collect_retained_widget_refs<R: Read + Seek>(
         let page_handle = source.get_object_handle(page_ref);
         page_handle.try_dereference()?;
         let page = page_handle;
-        if page.try_as_dictionary()?.is_none() {
+        if !page.try_is_dictionary()? {
             continue; // cov:ignore: a selected page ref always resolves to a dictionary
         }
         let annots_val = page.try_get_key(b"/Annots")?;
@@ -664,7 +664,7 @@ fn widget_page_ref<R: Read + Seek>(
     let widget_handle = source.get_object_handle(widget_ref);
     widget_handle.try_dereference()?;
     let widget = widget_handle;
-    if widget.try_as_dictionary()?.is_none() {
+    if !widget.try_is_dictionary()? {
         return Ok(None);
     }
     let p_value = widget.try_get_key(b"/P")?;
@@ -798,7 +798,7 @@ fn rewrite_field_kids<R: Read + Seek>(
     let field_handle = target.get_object_handle(target_field_ref);
     field_handle.try_dereference()?;
     let field = field_handle;
-    if field.try_as_dictionary()?.is_none() {
+    if !field.try_is_dictionary()? {
         return Ok(()); // cov:ignore: a copied field ref always resolves to a dictionary
     }
     let mut kids = Vec::with_capacity(survivors.len());
@@ -1555,7 +1555,7 @@ fn merge_documents_with_resource_decisions_and_preserve_primary_into_impl<
     root.try_dereference()?;
     // cov:ignore-start: Pdf::empty() owns the target /Pages dictionary and no
     // merge operation replaces that slot with another value before this point.
-    if root.try_as_dictionary()?.is_none() {
+    if !root.try_is_dictionary()? {
         return Err(Error::Unsupported(
             "target /Pages is not a dictionary".to_owned(),
         ));

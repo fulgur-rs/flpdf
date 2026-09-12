@@ -1881,7 +1881,7 @@ fn compute_outline_hint_info<R: Read + Seek>(
     // so the catalog is always a resolvable dictionary here.
     let outlines_ref = if let Some(root_ref) = pdf.root_ref() {
         let root = pdf.get_object_handle(root_ref);
-        if root.try_as_dictionary()?.is_none() {
+        if !root.try_is_dictionary()? {
             None // cov:ignore: catalog is always a dict when outlines exist
         } else {
             let outlines = root.try_get_key(b"/Outlines")?;
@@ -2961,11 +2961,11 @@ fn resolve_catalog_adbe_status<R: Read + Seek>(pdf: &mut Pdf<R>) -> Result<Catal
     // cov:ignore-end
 
     let catalog = pdf.get_object_handle(root_ref);
-    if catalog.try_as_dictionary()?.is_none() {
+    if !catalog.try_is_dictionary()? {
         return Ok(NONE);
     }
     let extensions = catalog.try_get_key(b"/Extensions")?;
-    if extensions.try_as_dictionary()?.is_none() {
+    if !extensions.try_is_dictionary()? {
         return Ok(NONE);
     }
     Ok(CatalogAdbeStatus {

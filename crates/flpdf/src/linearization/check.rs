@@ -190,9 +190,9 @@ pub(crate) fn check_linearization_parameters<R: Read + Seek>(
         return Ok(LinearizationParameterCheck::Clean); // cov:ignore: the caller already accepted the same linearization candidate
     };
     let candidate = pdf.get_object_handle(object_ref);
-    let Some(_) = candidate.try_as_dictionary()? else {
+    if !candidate.try_is_dictionary()? {
         return Ok(LinearizationParameterCheck::Clean);
-    };
+    }
 
     let h = candidate.try_get_key(b"/H")?;
     let o = candidate.try_get_key(b"/O")?;
@@ -239,7 +239,7 @@ pub(crate) fn check_linearization_parameters<R: Read + Seek>(
 }
 
 fn resolved_is_array(handle: &ObjectHandle) -> Result<bool> {
-    Ok(handle.try_as_array()?.is_some())
+    handle.try_is_array()
 }
 
 fn resolved_is_integer(handle: &ObjectHandle) -> Result<bool> {
@@ -1137,12 +1137,12 @@ fn check_linearization_inner<R: Read + Seek>(
         .map_err(LinearizationCheckError::from)?
         .ok_or(LinearizationCheckError::NotLinearized)?;
     let first_obj = pdf.get_object_handle(first_obj_ref);
-    let Some(_) = first_obj
-        .try_as_dictionary()
+    if !first_obj
+        .try_is_dictionary()
         .map_err(LinearizationCheckError::from)?
-    else {
+    {
         return Err(LinearizationCheckError::NotLinearized);
-    };
+    }
 
     // `is_linearized` owns qpdf's `/L` rule: an integer `/L` must match the
     // file size, while a missing or non-integer `/L` is not rejected here.
@@ -1191,15 +1191,15 @@ fn check_linearization_inner<R: Read + Seek>(
         let is_null = o_object
             .try_is_null()
             .map_err(LinearizationCheckError::from)?;
-        let Some(_) = o_object
-            .try_as_dictionary()
+        if !o_object
+            .try_is_dictionary()
             .map_err(LinearizationCheckError::from)?
-        else {
+        {
             if is_null {
                 fail!("/O ({o_num}) refers to a non-existent object");
             }
             fail!("/O ({o_num}) does not refer to a dictionary");
-        };
+        }
 
         let type_obj = o_object
             .try_get_key(b"/Type")

@@ -131,7 +131,7 @@ impl Optimization {
         if let Some(root_ref) = pdf.root_ref() {
             let root = pdf.get_object_handle(root_ref);
             let outlines = root.try_get_key(b"/Outlines")?;
-            if outlines.try_as_dictionary()?.is_some() && outlines.is_direct() {
+            if outlines.try_is_dictionary()? && outlines.is_direct() {
                 // qpdf's optimize makes a direct /Outlines dictionary indirect
                 // without cloning its live allocation
                 // (libqpdf/QPDF_optimization.cc:73-77).
@@ -318,7 +318,7 @@ impl Optimization {
                 continue;
             }
 
-            if pending.object.try_as_dictionary()?.is_some() {
+            if pending.object.try_is_dictionary()? {
                 let page = is_page(&pending.object)?;
                 for key in pending.object.try_get_keys()?.into_iter().rev() {
                     if page && key == b"/Parent" {

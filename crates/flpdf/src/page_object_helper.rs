@@ -966,7 +966,7 @@ impl<'a, R: Read + Seek> PageObjectHelper<'a, R> {
         }
 
         let old_annots = page.try_get_key(b"/Annots")?;
-        if old_annots.try_as_array()?.is_some() {
+        if old_annots.try_is_array()? {
             let transformed = {
                 let mut acroform = crate::AcroFormDocumentHelper::new(self.pdf)?;
                 let transformed = acroform.transform_annotations(old_annots, matrix)?;
@@ -1030,7 +1030,7 @@ impl<'a, R: Read + Seek> PageObjectHelper<'a, R> {
         self.require_page_ref()?;
         validate_same_document_page_handle(self.pdf, &from_page)?;
         let old_annots = from_page.try_get_key(b"/Annots")?;
-        if old_annots.try_as_array()?.is_none() {
+        if !old_annots.try_is_array()? {
             return Ok(());
         }
 
@@ -1090,7 +1090,7 @@ impl<'a, R: Read + Seek> PageObjectHelper<'a, R> {
         self.require_page_ref()?;
         validate_foreign_page_handle(source, self.pdf, &from_page)?;
         let old_annots = from_page.try_get_key(b"/Annots")?;
-        if old_annots.try_as_array()?.is_none() {
+        if !old_annots.try_is_array()? {
             return Ok(());
         }
 
@@ -1157,7 +1157,7 @@ impl<'a, R: Read + Seek> PageObjectHelper<'a, R> {
         self.require_page_ref()?;
         validate_foreign_page_handle(source, self.pdf, &from_page)?;
         let old_annots = from_page.try_get_key(b"/Annots")?;
-        if old_annots.try_as_array()?.is_none() {
+        if !old_annots.try_is_array()? {
             return Ok(());
         }
 
@@ -1616,7 +1616,7 @@ impl<'a, R: Read + Seek> PageObjectHelper<'a, R> {
         let mut result = Vec::with_capacity(annots_array.len());
         for item in annots_array {
             let annotation = &item;
-            if annotation.try_as_dictionary()?.is_none() {
+            if !annotation.try_is_dictionary()? {
                 continue;
             }
             if let Some(expected) = only_subtype {
@@ -1881,7 +1881,7 @@ fn resolve_resource_dictionary(
     if value.try_is_null()? {
         return Ok(None);
     }
-    Ok(value.try_as_dictionary()?.map(|_| value))
+    Ok(value.try_is_dictionary()?.then_some(value))
 }
 
 fn externalize_inline_images_for_target<R: Read + Seek + 'static>(
@@ -2037,7 +2037,7 @@ fn rectangle_to_handle(rectangle: Rectangle) -> ObjectHandle {
 
 fn append_annotation_handles(page: &ObjectHandle, annotations: Vec<ObjectHandle>) -> Result<()> {
     let existing = page.try_get_key(b"/Annots")?;
-    let annots = if existing.try_as_array()?.is_some() {
+    let annots = if existing.try_is_array()? {
         existing
     } else {
         let replacement = ObjectHandle::array(Vec::new());
@@ -2254,7 +2254,7 @@ pub(crate) fn resolve_inherited_rotate_with_max_depth<R: Read + Seek>(
         }
 
         let parent = current.try_get_key(b"/Parent")?;
-        if parent.try_as_dictionary()?.is_none() {
+        if !parent.try_is_dictionary()? {
             return Ok(0);
         }
         current = parent;

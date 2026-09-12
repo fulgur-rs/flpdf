@@ -19,5 +19,5 @@ fn page_document_helper_has_no_explicit_resolve_bridge() {
             "page_document_helper retains non-canonical route {forbidden}"
         );
     }
-    assert!(source.contains(".try_as_dictionary()?"));
+    assert!(source.contains(".try_is_dictionary()?"));
 }

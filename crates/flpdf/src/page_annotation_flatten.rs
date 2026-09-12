@@ -241,7 +241,7 @@ fn flatten_annotations_on_page<R: Read + Seek>(
 
     if candidates.is_empty() {
         let page = pdf.get_object_handle(page_ref);
-        if page.try_as_dictionary()?.is_none() {
+        if !page.try_is_dictionary()? {
             // cov:ignore-start: repaired PageDocumentHelper snapshots contain leaf dictionaries
             return Err(Error::Unsupported(format!(
                 "object {page_ref} is not a dictionary after flatten"
@@ -279,7 +279,7 @@ fn flatten_annotations_on_page<R: Read + Seek>(
     let mut page_helper = PageObjectHelper::new(page_ref, pdf);
     let resources = page_helper.get_attribute(b"/Resources", true)?;
     let page = pdf.get_object_handle(page_ref);
-    let resources = if resources.try_as_dictionary()?.is_some() {
+    let resources = if resources.try_is_dictionary()? {
         resources
     } else {
         let replacement = ObjectHandle::dictionary(Vec::new());
@@ -308,9 +308,8 @@ fn flatten_annotations_on_page<R: Read + Seek>(
         let xobj_name = loop {
             let candidate = format!("Fxo{xobj_counter}");
             let candidate_key = format!("/{candidate}");
-            let collides = existing_xobj
-                .try_as_dictionary()?
-                .is_some_and(|dict| dict.contains_key(candidate_key.as_bytes()));
+            let collides = existing_xobj.try_is_dictionary()?
+                && existing_xobj.try_has_key(candidate_key.as_bytes())?;
             if !collides {
                 break candidate;
             }
@@ -363,7 +362,7 @@ fn flatten_annotations_on_page<R: Read + Seek>(
 
     if flattened_count == 0 {
         let page = pdf.get_object_handle(page_ref);
-        if page.try_as_dictionary()?.is_none() {
+        if !page.try_is_dictionary()? {
             // cov:ignore-start: repaired PageDocumentHelper snapshots contain leaf dictionaries
             return Err(Error::Unsupported(format!(
                 "object {page_ref} is not a dictionary after flatten"
@@ -379,7 +378,7 @@ fn flatten_annotations_on_page<R: Read + Seek>(
 
     // ── Step 6: Add qpdf-shaped page-content wrappers ─────────────────────
     let page = pdf.get_object_handle(page_ref);
-    if page.try_as_dictionary()?.is_none() {
+    if !page.try_is_dictionary()? {
         return Err(Error::Unsupported(format!(
             "object {page_ref} is not a dictionary after flatten"
         )));
@@ -413,7 +412,10 @@ fn replace_pruned_annots<R: Read + Seek>(
     let page = pdf.get_object_handle(page_ref);
     let old_annots = page.try_get_key(b"/Annots")?;
     let new_annots = build_pruned_annots_array(pdf, page_ref, to_remove)?;
-    if new_annots.as_array().is_some_and(|items| items.is_empty()) {
+    if new_annots
+        .try_array_len()?
+        .is_some_and(|length| length == 0)
+    {
         page.remove_key(b"/Annots");
     } else if preserve_indirect_holder {
         if let Some(array_ref) = old_annots.object_ref() {
@@ -541,7 +543,7 @@ pub(crate) fn flatten_annotations_qpdf<R: Read + Seek>(
 
 fn direct_page_rotate<R: Read + Seek>(pdf: &mut Pdf<R>, page_ref: ObjectRef) -> Result<i32> {
     let page = pdf.get_object_handle(page_ref);
-    if page.try_as_dictionary()?.is_none() {
+    if !page.try_is_dictionary()? {
         return Ok(0); // cov:ignore: repaired page snapshot is always a dictionary
     }
     let rotate = page.try_get_key(b"/Rotate")?;
@@ -558,7 +560,7 @@ fn materialize_page_resources<R: Read + Seek>(pdf: &mut Pdf<R>, page_ref: Object
     let resources = {
         let mut helper = PageObjectHelper::new(page_ref, pdf);
         match helper.get_attribute(b"/Resources", true) {
-            Ok(resources) if resources.try_as_dictionary()?.is_some() => resources,
+            Ok(resources) if resources.try_is_dictionary()? => resources,
             Ok(_) => ObjectHandle::dictionary(Vec::new()),
             // cov:ignore-start: public page walk rejects malformed inherited-resource errors first
             Err(Error::Unsupported(message)) if message.contains("/Resources") => {
@@ -570,7 +572,7 @@ fn materialize_page_resources<R: Read + Seek>(pdf: &mut Pdf<R>, page_ref: Object
     };
     let page = pdf.get_object_handle(page_ref);
     // cov:ignore-start: public page traversal guarantees a page dictionary at this boundary
-    if page.try_as_dictionary()?.is_none() {
+    if !page.try_is_dictionary()? {
         return Err(Error::Unsupported(format!(
             "object {page_ref} is not a page dictionary"
         ))); // cov:ignore: repaired page snapshot is always a dictionary
@@ -616,7 +618,7 @@ fn acroform_default_resources<R: Read + Seek>(pdf: &mut Pdf<R>) -> Result<Option
         return Ok(None); // cov:ignore: a parsed Pdf always has a resolvable root
     };
     let acroform = root.try_get_key(b"/AcroForm")?;
-    if acroform.try_as_dictionary()?.is_none() {
+    if !acroform.try_is_dictionary()? {
         return Ok(None);
     }
     let resources = acroform.try_get_key(b"/DR")?;
@@ -700,7 +702,7 @@ fn resolve_matched_category_handles(
         if !dest_terminal.is_same_object_as(dest_value) {
             resources.replace_key(&category, dest_terminal.clone())?;
         }
-        if dest_terminal.try_as_array()?.is_some() && source_terminal.try_as_array()?.is_some() {
+        if dest_terminal.try_is_array()? && source_terminal.try_is_array()? {
             resolve_array_item_handles(&dest_terminal)?;
             resolve_array_item_handles(&source_terminal)?;
         }
@@ -806,13 +808,13 @@ fn merge_widget_default_resources_on_page_with_associations<R: Read + Seek>(
         } else {
             resources
         };
-        if resources.try_as_dictionary()?.is_none() {
+        if !resources.try_is_dictionary()? {
             continue;
         }
         // Lazy: qpdf only ever reads /DR from inside this same per-widget
         // merge path (see acroform_default_resources's doc), so resolving
         // it earlier than this would touch a value flattening may not need.
-        if default_resources.try_as_dictionary()?.is_none() {
+        if !default_resources.try_is_dictionary()? {
             continue;
         }
         // See resolve_matched_category_handles's doc for why this resolves

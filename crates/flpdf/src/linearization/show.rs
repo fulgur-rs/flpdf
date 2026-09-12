@@ -778,10 +778,9 @@ fn show_with_pdf<R: Read + Seek>(
         return not_linearized();
     }
     let param_dict = pdf.get_object_handle(first_obj_ref);
-    if param_dict
-        .try_as_dictionary()
+    if !param_dict
+        .try_is_dictionary()
         .map_err(ShowLinearizationError::from)?
-        .is_none()
     {
         return not_linearized();
     }

@@ -1591,7 +1591,7 @@ where
                 }
 
                 if root {
-                    if value.as_array().is_some() && has_direct_stream_in_value(value)? {
+                    if value.try_is_array()? && has_direct_stream_in_value(value)? {
                         let items = value.as_array().ok_or_else(|| {
                             // cov:ignore-start: the handle cannot change between the shape probe and this read
                             crate::Error::Internal(

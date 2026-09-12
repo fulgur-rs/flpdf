@@ -21,7 +21,7 @@ fn build_fixture() -> Vec<u8> {
     let mut objs: BTreeMap<u32, String> = BTreeMap::new();
     objs.insert(
         1,
-        "<< /Type /Catalog /Pages 2 0 R /Outlines 10 0 R /Names 11 0 R >>".into(),
+        "<< /Type /Catalog /Pages 2 0 R /Outlines 10 0 R /Names 11 0 R /Dests 31 0 R >>".into(),
     );
     objs.insert(
         2,
@@ -47,6 +47,9 @@ fn build_fixture() -> Vec<u8> {
          (dp3) [5 0 R /Fit] (dp4) [6 0 R /Fit]] >>"
             .into(),
     );
+    // The legacy catalog /Dests path includes a dictionary-form destination;
+    // both forms are remapped through the same live destination predicate.
+    objs.insert(31, "<< /legacy << /D [3 0 R /Fit] >> >>".into());
     objs.insert(
         20,
         "<< /Title (P1) /Parent 10 0 R /Next 21 0 R /Dest [3 0 R /Fit] >>".into(),
@@ -260,6 +263,16 @@ fn outline_and_names_retained_all_entries_kept() {
         leaf.try_has_key(b"/Limits").unwrap(),
         "/Limits not recomputed/removed"
     );
+
+    let legacy = resolved_handle(&mut pdf, ObjectRef::new(31, 0));
+    let legacy_dest = legacy.try_get_key(b"/legacy").unwrap();
+    assert!(legacy_dest.try_is_dictionary().unwrap());
+    assert!(legacy_dest
+        .try_get_key(b"/D")
+        .unwrap()
+        .as_array()
+        .and_then(|items| items.first().and_then(ObjectHandle::object_ref))
+        .is_some());
 
     // Both outline items kept with their chain intact.
     let i20 = resolved_handle(&mut pdf, ObjectRef::new(20, 0));

@@ -83,7 +83,7 @@ fn goto_action_dest<R: Read + Seek>(
     action: ObjectHandle,
 ) -> Result<Option<ObjectHandle>> {
     let action = helper.resolve_value_handle(action)?;
-    if action.try_as_dictionary()?.is_none() {
+    if !action.try_is_dictionary()? {
         return Ok(None);
     }
     // Resolve the selected action subtype through the canonical document
@@ -358,5 +358,30 @@ impl<'a> Iterator for OutlineTreeIter<'a> {
         self.stack
             .extend(item.kids.iter().rev().map(|&kid| (depth + 1, kid)));
         Some((depth, id, item))
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn non_dictionary_action_is_ignored_by_goto_destination() {
+        let mut pdf = crate::Pdf::empty().unwrap();
+        let catalog = pdf.root_handle().unwrap();
+        catalog
+            .replace_key(b"/A", ObjectHandle::integer(1))
+            .unwrap();
+        let item = OutlineItem {
+            source_ref: None,
+            parent: None,
+            kids: Vec::new(),
+            object: catalog,
+        };
+        let mut helper = pdf.outline();
+
+        let destination = item.get_dest(&mut helper).unwrap();
+
+        assert!(destination.try_is_null().unwrap());
     }
 }

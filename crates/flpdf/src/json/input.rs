@@ -1033,7 +1033,14 @@ where
                     return; // cov:ignore: object state is entered only with next_obj populated
                 };
                 let dictionary = current.as_stream_dict().unwrap_or_else(|| current.clone());
-                if dictionary.as_dictionary().is_none() {
+                let is_dictionary = match dictionary.try_is_dictionary() {
+                    Ok(is_dictionary) => is_dictionary,
+                    Err(error) => {
+                        self.fatal(error.to_string());
+                        return;
+                    }
+                };
+                if !is_dictionary {
                     // cov:ignore-start: qpdf parser state guarantees dictionary/array container shape here
                     if let Err(error) =
                         dictionary.type_warning("dictionary", "ignoring key replacement request")
@@ -1171,4 +1178,37 @@ fn validate_pdf_version(value: &[u8]) -> Option<String> {
         return None;
     }
     String::from_utf8(value.to_vec()).ok()
+}
+
+#[cfg(test)]
+mod shape_predicate_tests {
+    use super::{Json, JsonReactor, Reactor, ReactorState, StackFrame};
+    use crate::object_handle::{warning_emission_tests::handle_resolving, ObjectValue};
+    use crate::{ObjectHandle, Pdf};
+    use std::cell::RefCell;
+    use std::io::Cursor;
+    use std::rc::Rc;
+
+    #[test]
+    fn json_reactor_reports_a_shape_probe_resolution_failure() {
+        let source = Rc::new(RefCell::new(Cursor::new(Vec::new())));
+        let mut pdf = Pdf::empty().expect("empty PDF");
+        let mut reactor = JsonReactor::new(&mut pdf, Rc::clone(&source), "input.json", false);
+
+        let (dictionary, recorder) =
+            handle_resolving(ObjectValue::Dictionary(std::collections::BTreeMap::new()));
+        drop(recorder);
+        let current = ObjectHandle::stream(dictionary, Rc::new(Vec::new()));
+        reactor.stack.push(StackFrame {
+            state: ReactorState::Object,
+            object: Some(current),
+        });
+        let value = Json::parse(br#"1"#).expect("JSON value");
+
+        Reactor::dictionary_item(&mut reactor, b"/K", &value);
+
+        assert!(reactor
+            .fatal_error()
+            .is_some_and(|message| message.contains("belongs to a dropped PDF")));
+    }
 }

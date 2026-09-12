@@ -100,7 +100,7 @@ pub(crate) fn next_page_parent(parent: ObjectHandle) -> Result<Option<PageParent
     if parent.is_indirect() && !parent.is_resolved() {
         return Ok(Some(PageParentCursor::from_handle(parent)));
     }
-    if parent.try_as_dictionary()?.is_none() {
+    if !parent.try_is_dictionary()? {
         return Ok(None);
     }
     Ok(Some(PageParentCursor::from_handle(parent)))
@@ -263,7 +263,7 @@ pub fn page_content_bytes<R: Read + Seek>(
 ) -> Result<Vec<u8>> {
     let page = pdf.get_object_handle(page_ref);
     page.try_dereference()?;
-    if page.try_as_dictionary()?.is_none() {
+    if !page.try_is_dictionary()? {
         return Err(Error::Unsupported(format!(
             "object {page_ref} is not a dictionary, cannot extract /Contents"
         )));
@@ -469,7 +469,7 @@ impl<'a, R: Read + Seek> PageWalk<'a, R> {
         let node_obj = node.handle(self.pdf);
         node_obj.try_dereference()?;
 
-        if node_obj.try_as_dictionary()?.is_none() {
+        if !node_obj.try_is_dictionary()? {
             return Ok(None); // non-dictionary: skip silently
         }
 
@@ -482,7 +482,7 @@ impl<'a, R: Read + Seek> PageWalk<'a, R> {
                 for kid in kids.iter().rev() {
                     if let Some(r) = kid.object_ref() {
                         self.stack.push((PageNode::Indirect(r), depth + 1));
-                    } else if kid.try_as_dictionary()?.is_some() {
+                    } else if kid.try_is_dictionary()? {
                         self.stack.push((PageNode::Direct(kid.clone()), depth + 1));
                     }
                 }

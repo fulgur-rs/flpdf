@@ -343,7 +343,7 @@ impl<'a, R: Read + Seek> PageDocumentHelper<'a, R> {
         // cov:ignore-end
         let pages = catalog.try_get_key(b"/Pages")?;
         let root = pages;
-        if root.try_as_dictionary()?.is_none() {
+        if !root.try_is_dictionary()? {
             // cov:ignore-start: remove_page first obtains a repaired, dictionary /Pages root
             return Err(Error::Unsupported(
                 "document /Pages root is not a dictionary".into(),

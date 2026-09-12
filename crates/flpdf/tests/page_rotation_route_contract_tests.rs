@@ -61,6 +61,6 @@ fn apply_rotate_to_pages_uses_canonical_live_handle_accessors() {
         );
     }
     assert!(body.contains("page.try_dereference()?"));
-    assert!(body.contains("page.try_as_dictionary()?"));
+    assert!(body.contains("page.try_is_dictionary()?"));
     assert!(body.contains("page.try_get_key(b\"/Type\")?"));
 }

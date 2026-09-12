@@ -431,11 +431,11 @@ impl<R: Read + Seek> Pdf<R> {
     fn extension_level_handle(&mut self) -> Result<Option<ObjectHandle>> {
         let catalog = self.root_handle()?;
         let extensions = catalog.try_get_key(b"/Extensions")?;
-        if extensions.try_as_dictionary()?.is_none() {
+        if !extensions.try_is_dictionary()? {
             return Ok(None);
         }
         let adbe = extensions.try_get_key(b"/ADBE")?;
-        if adbe.try_as_dictionary()?.is_none() {
+        if !adbe.try_is_dictionary()? {
             return Ok(None);
         }
         let level = adbe.try_get_key(b"/ExtensionLevel")?;
@@ -557,7 +557,7 @@ impl<R: Read + Seek> Pdf<R> {
             self.root_handle_memo = Some(candidate.clone());
         }
         let root = candidate;
-        if root.try_as_dictionary()?.is_none() {
+        if !root.try_is_dictionary()? {
             let message = "unable to find /Root dictionary";
             let filename = if self.resolver.input_source_closed() {
                 CLOSED_INPUT_SOURCE_NAME.as_bytes().to_vec()

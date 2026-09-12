@@ -115,7 +115,7 @@ pub fn drop_objr_obj_annot_dangling_p<R: Read + Seek>(
         }
         let annot = pdf.get_object_handle(start);
         annot.try_dereference()?;
-        if annot.try_as_dictionary()?.is_none() {
+        if !annot.try_is_dictionary()? {
             continue;
         }
         remap_or_drop_annot_p(pdf, &annot, &surviving, removed_pages)?;

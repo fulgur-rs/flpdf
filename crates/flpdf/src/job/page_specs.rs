@@ -561,9 +561,9 @@ fn replace_merged_fields<T: Read + Seek>(
     let root = merged.get_object_handle(root_ref);
     let acroform = root.try_get_key(b"/AcroForm")?;
     acroform.try_dereference()?;
-    let Some(_) = acroform.try_as_dictionary()? else {
+    if !acroform.try_is_dictionary()? {
         return Ok(());
-    };
+    }
     // qpdf does not perform the final `/AcroForm` removal until after every
     // foreign `fixCopiedAnnotations` event (`QPDFJob.cc:2517-2585,2609-2629`).
     // Keep the primary AcroForm itself, including its direct representation
@@ -601,15 +601,12 @@ fn remove_empty_acroform_after_replay<T: Read + Seek>(
     let root = merged.get_object_handle(root_ref);
     let acroform = root.try_get_key(b"/AcroForm")?;
     acroform.try_dereference()?;
-    if acroform.try_as_dictionary()?.is_none() {
+    if !acroform.try_is_dictionary()? {
         return Ok(());
     }
     let fields = acroform.try_get_key(b"/Fields")?;
     fields.try_dereference()?;
-    if fields
-        .try_as_array()?
-        .is_some_and(|fields| fields.is_empty())
-    {
+    if fields.try_array_len()?.is_some_and(|length| length == 0) {
         root.remove_key(b"/AcroForm");
     }
     Ok(())
@@ -629,12 +626,12 @@ fn clear_grouped_foreign_fields_for_replay<T: Read + Seek>(merged: &mut Pdf<T>) 
     let root = merged.get_object_handle(root_ref);
     let acroform = root.try_get_key(b"/AcroForm")?;
     acroform.try_dereference()?;
-    if acroform.try_as_dictionary()?.is_none() {
+    if !acroform.try_is_dictionary()? {
         return Ok(());
     }
     let fields = acroform.try_get_key(b"/Fields")?;
     fields.try_dereference()?;
-    if fields.try_as_array()?.is_none() {
+    if !fields.try_is_array()? {
         return Ok(());
     }
     acroform.replace_key(b"/Fields", ObjectHandle::array(Vec::new()))?;

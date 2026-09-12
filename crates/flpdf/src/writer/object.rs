@@ -1299,11 +1299,7 @@ fn prepare_stream_dict_entries(
         .enumerate()
         .find(|(_, (key, _))| key.as_slice() == b"/DecodeParms")
     {
-        if value
-            .1
-            .try_as_array()?
-            .is_some_and(|items| items.is_empty())
-        {
+        if value.1.try_array_len()?.is_some_and(|length| length == 0) {
             prepared.remove(index);
         }
     }

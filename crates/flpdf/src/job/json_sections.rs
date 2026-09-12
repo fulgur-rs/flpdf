@@ -109,8 +109,7 @@ fn image_to_json(
     };
 
     let decode_parms = value_for(b"/DecodeParms");
-    let decode_parm_items = decode_parms.try_as_array()?;
-    let decode_parms = if decode_parm_items.is_some() {
+    let decode_parms = if decode_parms.try_is_array()? {
         pdf_object_to_json_with_version(&decode_parms, version)?
     } else {
         json_array(

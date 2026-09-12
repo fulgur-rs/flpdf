@@ -158,7 +158,7 @@ pub(crate) fn should_remove_unreferenced_resources_with_report<
         }
 
         resources.try_dereference()?;
-        if resources.try_as_dictionary()?.is_none() {
+        if !resources.try_is_dictionary()? {
             continue;
         }
         let resources_dict = resources;

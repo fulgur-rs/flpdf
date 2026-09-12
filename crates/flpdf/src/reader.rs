@@ -832,7 +832,7 @@ impl<R: Read + Seek> Pdf<R> {
         if encrypt.try_is_null()? {
             return Ok(None);
         }
-        if encrypt.try_as_dictionary()?.is_none() {
+        if !encrypt.try_is_dictionary()? {
             return Err(EncryptedError::Malformed {
                 reason: "/Encrypt object is not a dictionary".into(),
             }

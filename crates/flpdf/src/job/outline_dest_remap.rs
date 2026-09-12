@@ -209,7 +209,7 @@ pub fn remap_outline_and_dests_with_max_depth<R: Read + Seek>(
     // /Names may be an indirect reference OR a direct dictionary on the catalog;
     // /Dests inside it likewise.
     if let Some(names) = child_if_present(&catalog, b"/Names")? {
-        if names.try_as_dictionary()?.is_some() {
+        if names.try_is_dictionary()? {
             if let Some(dests) = child_if_present(&names, b"/Dests")? {
                 let mut nt_visited = BTreeSet::new();
                 remap_name_tree(pdf, &dests, &surviving, 0, max_depth, &mut nt_visited)?;
@@ -219,7 +219,7 @@ pub fn remap_outline_and_dests_with_max_depth<R: Read + Seek>(
 
     // 2b. Legacy /Catalog /Dests dictionary (PDF 1.1 style)
     if let Some(dests) = child_if_present(&catalog, b"/Dests")? {
-        if dests.try_as_dictionary()?.is_some() {
+        if dests.try_is_dictionary()? {
             remap_dests_dict(pdf, &dests, &surviving)?;
         }
     }
@@ -291,7 +291,7 @@ fn remap_annot_dests<R: Read + Seek>(
         let Some(annots) = child_if_present(&page, b"/Annots")? else {
             continue;
         };
-        if annots.try_as_array()?.is_none() {
+        if !annots.try_is_array()? {
             continue;
         }
         if let Some(array_ref) = annots.object_ref() {
@@ -364,7 +364,7 @@ fn remap_action_dest<R: Read + Seek>(
 ) -> Result<bool> {
     // Resolve to inspect /S without losing the original value form for the
     // write-back (remap_dest handles an indirect value in place).
-    if value.try_as_dictionary()?.is_none() {
+    if !value.try_is_dictionary()? {
         return remap_dest(pdf, value, surviving);
     }
     if let Some(action_type) = child_if_present(value, b"/S")? {
@@ -387,7 +387,7 @@ fn remap_goto_action<R: Read + Seek>(
     action: &ObjectHandle,
     surviving: &Surviving,
 ) -> Result<bool> {
-    if action.try_as_dictionary()?.is_none() {
+    if !action.try_is_dictionary()? {
         return Ok(false);
     }
     let Some(action_type) = child_if_present(action, b"/S")? else {
@@ -451,7 +451,7 @@ fn remap_name_tree<R: Read + Seek>(
             return Ok(()); // Cycle: already processed.
         }
     }
-    if node.try_as_dictionary()?.is_none() {
+    if !node.try_is_dictionary()? {
         return Ok(()); // Malformed node.
     }
 
@@ -531,7 +531,7 @@ fn remap_dest_depth<R: Read + Seek>(
         dest.set_array_item(0, pdf.get_object_handle(new_ref))?;
         return Ok(true);
     }
-    if dest.try_as_dictionary()?.is_some() {
+    if dest.try_is_dictionary()? {
         let Some(value) = child_if_present(dest, b"/D")? else {
             return Ok(false);
         };
@@ -583,7 +583,7 @@ fn remap_outline_tree<R: Read + Seek>(
                 break; // Cycle guard (/Next or /First back-edge).
             }
         }
-        if item.try_as_dictionary()?.is_none() {
+        if !item.try_is_dictionary()? {
             break; // Malformed — stop this chain.
         }
         let next = indirect_child(&item, b"/Next")?;
@@ -612,7 +612,7 @@ fn remap_item_dest<R: Read + Seek>(
     item: &ObjectHandle,
     surviving: &Surviving,
 ) -> Result<()> {
-    if item.try_as_dictionary()?.is_none() {
+    if !item.try_is_dictionary()? {
         return Ok(());
     }
 

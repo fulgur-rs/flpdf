@@ -86,7 +86,7 @@ impl LabelRange {
     fn from_handle(handle: &ObjectHandle) -> Result<Option<Self>> {
         let handle = handle.clone();
         handle.try_dereference()?;
-        if handle.try_as_dictionary()?.is_none() {
+        if !handle.try_is_dictionary()? {
             return Ok(None);
         }
         let style = handle
@@ -406,7 +406,7 @@ impl<'a, R: Read + Seek> PageLabelDocumentHelper<'a, R> {
         };
         let catalog = self.pdf.get_object_handle(catalog_ref);
         catalog.try_dereference()?;
-        if catalog.try_as_dictionary()?.is_none() {
+        if !catalog.try_is_dictionary()? {
             return Ok(None);
         }
         // qpdf's QPDF_Dictionary::hasKey hides values that are null, including
@@ -575,9 +575,7 @@ impl<'a, R: Read + Seek> PageLabelDocumentHelper<'a, R> {
         }
 
         let skip_first = if let Some((last_index, last_label)) = labels.last() {
-            if last_label.try_as_dictionary()?.is_some()
-                && first_label.try_as_dictionary()?.is_some()
-            {
+            if last_label.try_is_dictionary()? && first_label.try_is_dictionary()? {
                 let last_s = last_label.try_get_key(b"/S")?;
                 let first_s = first_label.try_get_key(b"/S")?;
                 let last_p = last_label.try_get_key(b"/P")?;
@@ -633,7 +631,7 @@ impl<'a, R: Read + Seek> PageLabelDocumentHelper<'a, R> {
             return Ok(None);
         };
         label.try_dereference()?;
-        if label.try_as_dictionary()?.is_none() {
+        if !label.try_is_dictionary()? {
             return Ok(None);
         }
 
@@ -887,7 +885,7 @@ impl<'a, R: Read + Seek> PageLabelDocumentHelper<'a, R> {
         };
         let catalog = self.pdf.get_object_handle(catalog_ref);
         catalog.try_dereference()?;
-        if catalog.try_as_dictionary()?.is_none() {
+        if !catalog.try_is_dictionary()? {
             return Ok(());
         }
         let mut nums = Vec::with_capacity(entries.len() * 2);
@@ -914,7 +912,7 @@ impl<'a, R: Read + Seek> PageLabelDocumentHelper<'a, R> {
         };
         let catalog = self.pdf.get_object_handle(catalog_ref);
         catalog.try_dereference()?;
-        if catalog.try_as_dictionary()?.is_none() {
+        if !catalog.try_is_dictionary()? {
             return Ok(());
         }
         let mut nums = Vec::with_capacity(entries.len() * 2);
@@ -940,7 +938,7 @@ impl<'a, R: Read + Seek> PageLabelDocumentHelper<'a, R> {
         };
         let catalog = self.pdf.get_object_handle(catalog_ref);
         catalog.try_dereference()?;
-        if catalog.try_as_dictionary()?.is_none() {
+        if !catalog.try_is_dictionary()? {
             return Ok(());
         }
         let mut nums = Vec::with_capacity(entries.len() * 2);

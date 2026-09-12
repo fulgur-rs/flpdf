@@ -93,7 +93,7 @@ pub fn apply_rotate_to_pages<R: Read + Seek>(
         // page through the same canonical handle before mutating it.
         let page = pdf.get_object_handle(page_ref);
         page.try_dereference()?;
-        if page.try_as_dictionary()?.is_none() {
+        if !page.try_is_dictionary()? {
             return Err(Error::Unsupported(format!(
                 "object {page_ref} is not a dictionary, cannot set /Rotate"
             )));

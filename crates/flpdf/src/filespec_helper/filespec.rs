@@ -89,7 +89,7 @@ impl<'a, R: Read + Seek> FileSpec<'a, R> {
         // non-dictionary value or a dictionary with the wrong /Type.
         filespec.try_dereference()?;
         let resolved = filespec.clone();
-        if resolved.try_as_dictionary()?.is_none() {
+        if !resolved.try_is_dictionary()? {
             resolved.warn_if_possible("Embedded file object is not a dictionary")?;
         } else if !resolved.try_is_dictionary_of_type(b"Filespec", b"")? {
             resolved.warn_if_possible("Embedded file object's type is not /Filespec")?;
@@ -121,7 +121,7 @@ impl<'a, R: Read + Seek> FileSpec<'a, R> {
 
     fn filespec_dict(&mut self) -> Result<Option<ObjectHandle>> {
         let filespec = self.filespec_handle()?;
-        Ok(filespec.try_as_dictionary()?.map(|_| filespec))
+        Ok(filespec.try_is_dictionary()?.then_some(filespec))
     }
 
     /// Set `/Desc` with qpdf's `newUnicodeString` storage semantics.

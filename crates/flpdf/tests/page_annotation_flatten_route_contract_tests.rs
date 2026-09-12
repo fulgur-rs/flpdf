@@ -26,6 +26,6 @@ fn production_page_annotation_flatten_uses_canonical_resolving_routes() {
         production.contains(".try_dereference()?"),
         "stream dictionary inspection must use the canonical handle resolver"
     );
-    assert!(production.contains(".try_as_dictionary()?"));
+    assert!(production.contains(".try_is_dictionary()?"));
     assert!(production.contains(".try_is_null()?"));
 }
