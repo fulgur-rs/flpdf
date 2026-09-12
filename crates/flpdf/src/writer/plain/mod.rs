@@ -122,8 +122,10 @@ fn live_page_context<R: Read + Seek>(
             content_container_sequences,
         ))
     } else {
+        // cov:ignore-start: PdfWriter always supplies initialize_special_streams state for this route
         let (page_sequences, contents_sequences) = body::qdf_page_context(pdf)?;
         Ok((page_sequences, contents_sequences, BTreeMap::new()))
+        // cov:ignore-end
     }
 }
 
@@ -182,7 +184,7 @@ pub(crate) fn extend_late_trailer_map<R: Read + Seek>(
                 // cov:ignore-start: the qpdf object-number domain cannot be exhausted by a supported in-memory PDF
                 crate::Error::Unsupported("plain live writer: late trailer number overflow".into())
                 // cov:ignore-end
-            })?;
+            })?; // cov:ignore: checked late-trailer allocation cannot overflow a supported output
         }
     }
     Ok(next)
@@ -366,7 +368,7 @@ fn write_plain_live<R: Read + Seek, W: Write>(
         // cov:ignore-start: the body queue is bounded by the qpdf u32 object-number domain
         crate::Error::Unsupported("plain live writer: late trailer number overflows u32".into())
         // cov:ignore-end
-    })?;
+    })?; // cov:ignore: checked body-derived late-trailer allocation cannot overflow a supported output
     let mut next_late_trailer_number =
         extend_late_trailer_map(pdf, &mut trailer_map, initial_late_trailer_number, true)?;
     // Object streams require a cross-reference stream: a classic table has no
@@ -425,7 +427,7 @@ fn write_plain_live<R: Read + Seek, W: Write>(
                     "plain live writer: direct /Root reference {object_ref} has no output number"
                 ))
                 // cov:ignore-end
-            })
+            }) // cov:ignore: direct-root references were collected into trailer_map before serialization
         };
         let mut bytes = Vec::new();
         if options.qdf {

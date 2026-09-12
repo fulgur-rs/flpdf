@@ -249,7 +249,7 @@ impl LiveQueue {
             // cov:ignore-start: the live queue cannot allocate an output number above u32::MAX
             crate::Error::Unsupported("plain QDF length-holder number overflows u32".into())
             // cov:ignore-end
-        })?;
+        })?; // cov:ignore: checked QDF holder allocation cannot overflow a supported output
         self.qdf_length_holders
             .insert(source, ObjectRef::new(holder, 0));
         Ok(())
@@ -802,14 +802,14 @@ fn qdf_output_number(
                 .qdf_ignored_refs
                 .contains(&object_ref)
                 .then_some(ObjectRef::new(0, 0))
-        })
+        }) // cov:ignore: a prepared live QDF reference map is complete by construction
         .ok_or_else(|| {
             // cov:ignore-start: every reference written by the prepared QDF serializer is discovered before this lookup
             crate::Error::Unsupported(format!(
                 "plain QDF live writer: reference {object_ref} has no output number"
             ))
             // cov:ignore-end
-        })
+        }) // cov:ignore: a prepared live QDF reference map is complete by construction
 }
 
 fn pclm_stream_parts(stream: &ObjectHandle) -> crate::Result<(ObjectHandle, Vec<u8>)> {
@@ -1256,7 +1256,7 @@ impl<'a, R: Read + Seek + 'static> LiveObjectEmitter<'a, R> {
                     "plain QDF live writer: object has no source identity".into(),
                 )
                 // cov:ignore-end
-            })?;
+            })?; // cov:ignore: queued QDF objects always carry a source identity
         if self.root_source == source {
             let root = object.output_root_copy_with_adbe(
                 self.version,
@@ -1284,7 +1284,7 @@ impl<'a, R: Read + Seek + 'static> LiveObjectEmitter<'a, R> {
             let discovery_dict = crate::writer::object::prepared_stream_dictionary_for_discovery(
                 &dict,
                 dictionary_options,
-            )?;
+            )?; // cov:ignore: stream preparation receives the validated canonical dictionary
             self.discover_qdf_children(&discovery_dict, 0)?;
             let queue = &self.queue;
             let map = |object_ref: ObjectRef| qdf_output_number(queue, object_ref);
@@ -1298,7 +1298,7 @@ impl<'a, R: Read + Seek + 'static> LiveObjectEmitter<'a, R> {
                         "plain QDF live writer: stream {source_gen:?} has no length holder"
                     ))
                     // cov:ignore-end
-                })?;
+                })?; // cov:ignore: enqueue_handle reserves a holder for every queued QDF stream
             crate::writer::object::write_prepared_stream_body_qdf_with_ref_map_and_removed_and_length_with_options(
                 &discovery_dict,
                 self.bytes,
