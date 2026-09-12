@@ -99,6 +99,23 @@ class MeasurementContracts(unittest.TestCase):
 
 @unittest.skipUnless(pinned_qpdf_available(), "qpdf 11.9.0 required for live harness contracts")
 class LiveContracts(unittest.TestCase):
+    def test_failed_validation_preserves_report_and_exits_nonzero(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            out = Path(tmp) / "invalid"
+            result = subprocess.run(
+                [sys.executable, str(SCRIPT), "--output", str(out),
+                 "--flpdf", "/usr/bin/true", "--sizes", "2", "--stream-mib", "1",
+                 "--operations", "npages", "--runs", "1", "--warmups", "0", "--skip-qtest"],
+                capture_output=True, text=True)
+            self.assertEqual(result.returncode, 1, result.stderr)
+            report = json.loads((out / "results.json").read_text())
+            self.assertEqual(report["status"], "validation-failed")
+            self.assertEqual(len(report["cases"]), 4)
+            for case in report["cases"]:
+                self.assertEqual(case["memory_verdict"], "invalid")
+                self.assertNotIn("statistics", case)
+                self.assertFalse(case["validation"]["ok"])
+
     def test_generated_families_are_valid(self):
         with tempfile.TemporaryDirectory() as tmp:
             for family in ("pages", "content", "objects", "stream"):
