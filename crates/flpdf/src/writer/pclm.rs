@@ -279,6 +279,8 @@ impl EmissionQueue {
 mod tests {
     use super::*;
     use crate::pipeline::{Pipeline, PipelineError, PipelineResult};
+    use crate::token_filter::{TokenFilter, TokenFilterOutput};
+    use crate::tokenizer::Token;
     use crate::{Error, PdfWriter, StreamDataProvider};
     use std::cell::RefCell;
     use std::io::{self, Cursor, Read, Seek, SeekFrom, Write};
@@ -356,6 +358,46 @@ mod tests {
         event: &'static str,
         payload: &'static [u8],
         events: Events,
+    }
+
+    struct SuccessfulUnfilteredRetryProvider {
+        calls: Rc<RefCell<Vec<(bool, bool)>>>,
+    }
+
+    struct PassThroughFilter;
+
+    impl TokenFilter for PassThroughFilter {
+        fn handle_token(
+            &mut self,
+            token: &Token,
+            output: &mut TokenFilterOutput<'_>,
+        ) -> PipelineResult<()> {
+            output.write_token(token)
+        }
+    }
+
+    impl StreamDataProvider for SuccessfulUnfilteredRetryProvider {
+        fn supports_retry(&self) -> bool {
+            true
+        }
+
+        fn provide_stream_data_with_retry_by_id(
+            &self,
+            _object_number: u32,
+            _generation: u16,
+            pipeline: &mut dyn Pipeline,
+            suppress_warnings: bool,
+            will_retry: bool,
+        ) -> crate::Result<bool> {
+            self.calls
+                .borrow_mut()
+                .push((suppress_warnings, will_retry));
+            pipeline
+                .write(b"PCLm-unfiltered-success")
+                .map_err(Error::from)?;
+            pipeline.finish().map_err(Error::from)?;
+            Ok(true)
+        }
     }
 
     impl StreamDataProvider for EventProvider {
@@ -524,6 +566,40 @@ mod tests {
         Some(PathBuf::from(path.trim()))
     }
 
+    fn first_page_content(path: &std::path::Path) -> Vec<u8> {
+        let pages = Command::new("qpdf")
+            .arg("--show-pages")
+            .arg(path)
+            .output()
+            .expect("inspect page content references");
+        assert!(
+            pages.status.success(),
+            "qpdf --show-pages failed: {}",
+            String::from_utf8_lossy(&pages.stderr)
+        );
+        let pages = String::from_utf8(pages.stdout).expect("qpdf page listing is UTF-8");
+        let content = pages
+            .split_once("  content:\n")
+            .and_then(|(_, rest)| rest.lines().next())
+            .expect("qpdf page listing has a content stream");
+        let object = content
+            .split_whitespace()
+            .next()
+            .expect("content stream has an object number");
+        let stream = Command::new("qpdf")
+            .arg(format!("--show-object={object}"))
+            .arg("--raw-stream-data")
+            .arg(path)
+            .output()
+            .expect("read qpdf content stream");
+        assert!(
+            stream.status.success(),
+            "qpdf --show-object failed: {}",
+            String::from_utf8_lossy(&stream.stderr)
+        );
+        stream.stdout
+    }
+
     #[test]
     fn plan_retains_only_qpdfs_initial_pclm_enqueue_order() {
         let mut pdf = one_page_fixture_pdf();
@@ -598,6 +674,118 @@ mod tests {
     }
 
     #[test]
+    fn pclm_forced_uncompressed_successful_first_call_retries_on_filter_result() {
+        let mut pdf = one_page_fixture_pdf();
+        let calls = Rc::new(RefCell::new(Vec::new()));
+        let stream = provider_stream(
+            &pdf,
+            SuccessfulUnfilteredRetryProvider {
+                calls: Rc::clone(&calls),
+            },
+        );
+        stream
+            .add_token_filter(Rc::new(RefCell::new(PassThroughFilter)))
+            .expect("mark the provider stream as modified");
+        pdf.root_handle()
+            .expect("resolve Catalog")
+            .replace_key(b"/PclmProvider", stream)
+            .expect("attach PCLm provider");
+
+        let mut writer = configure_pclm_writer(&mut pdf);
+        writer.set_output_memory().expect("install memory output");
+        writer
+            .write()
+            .expect("PCLm raw retry after an unfiltered success");
+
+        assert_eq!(*calls.borrow(), vec![(false, true), (false, false)]);
+    }
+
+    #[test]
+    fn pclm_progress_failure_happens_before_current_object_bytes_reach_sink() {
+        let events = Events::new();
+        let bytes = Rc::new(RefCell::new(Vec::new()));
+        let mut pdf = one_page_fixture_pdf();
+        let mut writer = configure_pclm_writer(&mut pdf);
+        writer
+            .set_output_writer(EventWriter {
+                events,
+                bytes: Rc::clone(&bytes),
+            })
+            .expect("install PCLm event sink");
+        writer.register_progress_reporter(Box::new(|percent| {
+            assert_eq!(percent, 0);
+            Err(Error::System("PCLm progress failure".to_owned()))
+        }));
+
+        let error = writer
+            .write()
+            .expect_err("PCLm progress failure must escape before object output");
+
+        assert!(error.to_string().contains("PCLm progress failure"));
+        let bytes = bytes.borrow();
+        assert!(bytes.starts_with(b"%PDF-"));
+        assert!(
+            !bytes
+                .windows(b"1 0 obj\n".len())
+                .any(|window| window == b"1 0 obj\n"),
+            "progress failure must not leave the current PCLm object in the sink"
+        );
+    }
+
+    #[test]
+    fn pclm_content_normalization_matches_qpdf_11_9() {
+        if !exact_qpdf_11_9() {
+            eprintln!("qpdf 11.9.0 is unavailable; skipping PCLm normalization oracle");
+            return;
+        }
+        let Some(source) = pinned_qpdf_source() else {
+            eprintln!("pinned qpdf source is unavailable; skipping PCLm normalization oracle");
+            return;
+        };
+        let input = source.join("qpdf/qtest/qpdf/good7.pdf");
+        let temporary = tempfile::tempdir().expect("PCLm normalization tempdir");
+        let normalized = temporary.path().join("qpdf-normalized.pdf");
+        let qpdf = Command::new("qpdf")
+            .args([
+                "--normalize-content=y",
+                "--stream-data=uncompress",
+                "--object-streams=disable",
+                "--static-id",
+            ])
+            .arg(&input)
+            .arg(&normalized)
+            .output()
+            .expect("run qpdf content normalization");
+        assert!(
+            qpdf.status.success(),
+            "qpdf normalization failed: {}",
+            String::from_utf8_lossy(&qpdf.stderr)
+        );
+
+        let mut pdf = Pdf::open(Cursor::new(
+            std::fs::read(&input).expect("read qpdf normalization input"),
+        ))
+        .expect("open qpdf normalization input");
+        let mut writer = PdfWriter::new(&mut pdf);
+        writer.set_pclm(true);
+        writer.set_content_normalization(true);
+        writer.set_static_id(true);
+        writer
+            .set_output_memory()
+            .expect("install PCLm memory output");
+        writer.write().expect("write normalized PCLm output");
+        let actual = writer.get_buffer().expect("read normalized PCLm output");
+        let actual_path = temporary.path().join("pclm-normalized.pdf");
+        std::fs::write(&actual_path, actual).expect("write PCLm normalization output");
+
+        assert_eq!(
+            first_page_content(&actual_path),
+            first_page_content(&normalized),
+            "PCLm page content normalization must match qpdf 11.9.0"
+        );
+    }
+
+    #[test]
     fn pclm_filtering_disabled_false_uses_the_first_retryable_attempt_once() {
         let mut pdf = one_page_fixture_pdf();
         let calls = Rc::new(RefCell::new(Vec::new()));
@@ -663,6 +851,9 @@ mod tests {
                 None,
             )
             .expect("register retry-aware PCLm stream");
+        stream
+            .add_token_filter(Rc::new(RefCell::new(PassThroughFilter)))
+            .expect("mark the retrying stream as modified");
         pdf.root_handle()
             .expect("resolve Catalog")
             .replace_key(b"/PclmProvider", stream)
@@ -997,7 +1188,7 @@ mod tests {
         };
         let mut output = Vec::new();
         let result = crate::writer::output::with_buffer_sink(&mut output, |out| {
-            crate::writer::write_pclm(&mut pdf, out, &options)
+            crate::writer::write_pclm(&mut pdf, out, &options, None)
         });
 
         assert!(result.is_ok(), "qpdf-compatible PCLm output: {result:?}");
@@ -1019,7 +1210,7 @@ mod tests {
         };
         let mut output = Vec::new();
         let result = crate::writer::output::with_buffer_sink(&mut output, |out| {
-            crate::writer::write_pclm(&mut pdf, out, &options)
+            crate::writer::write_pclm(&mut pdf, out, &options, None)
         });
 
         assert!(result.is_ok(), "qpdf-compatible PCLm output: {result:?}");

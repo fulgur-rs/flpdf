@@ -1769,12 +1769,13 @@ fn canonical_stream_filter_probe(
     apply_full_rewrite_metadata_policy: bool,
     normalize_content: bool,
 ) -> crate::Result<bool> {
-    let Some((encode_flags, decode_level, _normalized_content)) = canonical_stream_filter_plan(
-        handle,
-        options,
-        apply_full_rewrite_metadata_policy,
-        normalize_content,
-    )?
+    let Some((encode_flags, decode_level, _normalized_content, _outer_filter)) =
+        canonical_stream_filter_plan(
+            handle,
+            options,
+            apply_full_rewrite_metadata_policy,
+            normalize_content,
+        )?
     else {
         return Ok(false);
     };
@@ -1860,21 +1861,21 @@ fn canonical_stream_output_with_rewrite_policy(
         normalize_content,
     )?; // cov:ignore: canonical stream policy validation is exercised by the body tests; llvm-cov attributes this continuation to the defensive error path
     let (data, filtering_attempted, normalized_content) =
-        if let Some((encode_flags, decode_level, normalized_content)) = filter_plan {
+        if let Some((encode_flags, decode_level, normalized_content, outer_filter)) = filter_plan {
             let mut attempt = 1_u8;
-            let (data, filtering_attempted) = loop {
+            let (data, filtering_attempted, _source_success) = loop {
                 let mut buffer =
                     crate::pipeline::buffer::Buffer::new("canonical writer stream", None);
-                let mut filtering_attempted = false;
+                let mut actual_filtering_attempted = false;
                 let (attempt_encode_flags, attempt_decode_level) = if attempt == 1 {
                     (encode_flags, decode_level)
                 } else {
                     (0, crate::writer::DecodeLevel::None)
                 };
-                let success = source_for_pipe
+                let source_success = source_for_pipe
                     .pipe_stream_data(
                         &mut buffer,
-                        &mut filtering_attempted,
+                        &mut actual_filtering_attempted,
                         attempt_encode_flags,
                         attempt_decode_level,
                         false,
@@ -1882,14 +1883,27 @@ fn canonical_stream_output_with_rewrite_policy(
                     )
                     .map_err(|error| stream_data_error(&source_for_pipe, error))?; // cov:ignore: filter-pipeline failures are covered at the pipeline boundary, not by this validated emitter
 
-                if success || attempt == 2 {
-                    // QPDFWriter retries a failed filter pipeline against a
-                    // fresh raw pipe (`QPDFWriter.cc:1287-1314`). The second
-                    // attempt's buffer is authoritative even when the
-                    // provider reports that no filtering branch was used.
-                    break (buffer.take_buffer()?, filtering_attempted && success);
+                if outer_filter && !actual_filtering_attempted && attempt == 1 {
+                    // qpdf tests the separate `filtered` result returned by
+                    // QPDFObjectHandle::pipeStreamData, not its source
+                    // success result. A successful source/provider call that
+                    // did not pass through an actual filter stage therefore
+                    // receives exactly one fresh raw retry
+                    // (`QPDFWriter.cc:1287-1314`).
+                    attempt = 2;
+                    continue;
                 }
-                attempt = 2;
+                // The source/provider success result is intentionally kept
+                // separate from the filtering result above. Once the outer
+                // filter has been disabled or the second attempt is reached,
+                // qpdf keeps this attempt's buffer regardless of that source
+                // result; terminal provider/pipeline errors have already
+                // escaped as errors.
+                break (
+                    buffer.take_buffer()?,
+                    actual_filtering_attempted,
+                    source_success,
+                );
             };
             (data, filtering_attempted, normalized_content)
         } else {
@@ -1964,7 +1978,7 @@ fn canonical_stream_filter_plan(
     options: &WriterOptions,
     apply_full_rewrite_metadata_policy: bool,
     normalize_content: bool,
-) -> crate::Result<Option<(u32, crate::writer::DecodeLevel, bool)>> {
+) -> crate::Result<Option<(u32, crate::writer::DecodeLevel, bool, bool)>> {
     let stream_dict = handle
         .as_stream_dict()
         .ok_or_else(|| crate::Error::Internal("canonical stream dictionary is missing".into()))?;
@@ -2029,7 +2043,21 @@ fn canonical_stream_filter_plan(
     if normalize_content {
         encode_flags |= crate::object_handle::STREAM_ENCODE_NORMALIZE;
     }
-    Ok(Some((encode_flags, decode_level, normalized_content)))
+    // Keep qpdf's outer `filter` request separate from the effective stream
+    // policy used to choose the source pipe. In particular, `Some(No)` means
+    // "use the canonical pipe without compression" but does not itself mean
+    // that a filter stage was requested (`QPDFWriter.cc:1239-1284`).
+    let outer_filter = handle.is_data_modified()
+        || matches!(options.compress_streams, CompressStreams::Yes)
+        || options.decode_level != crate::writer::DecodeLevel::None
+        || is_metadata_stream
+        || normalize_content;
+    Ok(Some((
+        encode_flags,
+        decode_level,
+        normalized_content,
+        outer_filter,
+    )))
 }
 
 fn canonical_is_lone_flate(dict: &ObjectHandle) -> crate::Result<bool> {

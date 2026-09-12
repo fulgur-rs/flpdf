@@ -1030,12 +1030,14 @@ impl<'pdf, R: Read + Seek + 'static> PdfWriter<'pdf, R> {
             options.qdf = false;
         }
         if options.pclm {
-            // qpdf's doWriteSetup makes PCLm a cleartext, unfiltered
-            // output mode before source-encryption preservation is considered.
+            // qpdf's doWriteSetup makes PCLm cleartext with decode disabled
+            // and compression disabled before source-encryption preservation
+            // is considered. Explicit content normalization remains active;
+            // willFilterStream applies it only to selected page-content
+            // streams (`QPDFWriter.cc:2072-2093,2114-2115`).
             options.encrypt = None;
             options.copy_encryption = None;
             options.qdf = false;
-            options.content_normalization = false;
             options.decode_level = DecodeLevel::None;
             options.compress_streams = crate::CompressStreams::No;
             options.stream_data = None;
@@ -3557,6 +3559,7 @@ fn write_pclm<R: Read + Seek>(
     pdf: &mut Pdf<R>,
     out: &mut OutputSink<'_>,
     options: &WriterOptions,
+    special_streams: Option<&SpecialStreams>,
 ) -> Result<WriterResult> {
     let deterministic_id = uses_deterministic_id(options);
     let plan = pclm::Plan::build(pdf)?;
@@ -3577,6 +3580,10 @@ fn write_pclm<R: Read + Seek>(
     let removed: BTreeSet<_> = BTreeSet::new();
 
     while let Some(item) = queue.pop() {
+        // qpdf's writeObject reports progress before it opens or unparses the
+        // current object (`QPDFWriter.cc:1761-1778`). A callback failure must
+        // therefore leave only the already-written prefix in the final sink.
+        report_progress_event(options)?;
         match item {
             pclm::Item::Source { source, output } => {
                 let source_handle = pdf.get_object_handle(source);
@@ -3584,11 +3591,14 @@ fn write_pclm<R: Read + Seek>(
                 let offset = out.position();
                 out.write_bytes(format!("{} 0 obj\n", output.number).as_bytes())?;
                 if source_handle.as_stream_dict().is_some() {
+                    let normalize_content = options.content_normalization
+                        && special_streams
+                            .is_some_and(|streams| streams.normalized_streams.contains(&source));
                     let (dict, data, dictionary_options) =
                         plain::body::canonical_stream_output_for_rewrite(
                             &source_handle,
                             options,
-                            false,
+                            normalize_content,
                         )?;
                     let mut map = |child: &ObjectHandle| queue.enqueue_handle(pdf, child.clone());
                     dict.write_stream_body_with_dynamic_ref_map(
@@ -3630,7 +3640,6 @@ fn write_pclm<R: Read + Seek>(
                 offsets.insert(output.number, (0, offset));
             }
         }
-        report_progress_event(options)?;
     }
 
     let object_count = queue.object_count()?;
@@ -3866,7 +3875,7 @@ fn emit_canonical_pdf_inner<R: Read + Seek>(
         );
     }
     if options.pclm {
-        return pclm_live::write_pclm(pdf, out, options);
+        return write_pclm(pdf, out, options, special_streams);
     }
 
     if plain_route.is_plain_consumer() {
