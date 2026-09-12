@@ -14,6 +14,8 @@ use std::rc::Rc;
 
 struct LiveAllocationTracker;
 
+const PROVIDER_A_PAYLOAD: &[u8] = b"provider-payload-A";
+
 std::thread_local! {
     static ALLOCATION_TRACKING: Cell<bool> = const { Cell::new(false) };
     static LIVE_BYTES: Cell<usize> = const { Cell::new(0) };
@@ -262,12 +264,41 @@ impl Write for EventWriter {
 
 struct TerminalSinkWriter {
     events: ProviderEvents,
+    accepted: Rc<RefCell<Vec<u8>>>,
+    rejected: bool,
 }
 
 impl Write for TerminalSinkWriter {
-    fn write(&mut self, _data: &[u8]) -> io::Result<usize> {
-        self.events.record("sink-error");
-        Err(io::Error::other("terminal output sink failure"))
+    fn write(&mut self, data: &[u8]) -> io::Result<usize> {
+        if self.rejected {
+            self.events.record("sink-error:A");
+            return Err(io::Error::other(
+                "terminal output sink rejected provider A payload",
+            ));
+        }
+
+        if let Some(payload_start) = data
+            .windows(PROVIDER_A_PAYLOAD.len())
+            .position(|window| window == PROVIDER_A_PAYLOAD)
+        {
+            self.accepted
+                .borrow_mut()
+                .extend_from_slice(&data[..payload_start]);
+            if payload_start > 0 {
+                self.events.record("sink-prefix");
+                self.rejected = true;
+                return Ok(payload_start);
+            }
+            self.rejected = true;
+            self.events.record("sink-error:A");
+            return Err(io::Error::other(
+                "terminal output sink rejected provider A payload",
+            ));
+        }
+
+        self.accepted.borrow_mut().extend_from_slice(data);
+        self.events.record("sink-prefix");
+        Ok(data.len())
     }
 
     fn flush(&mut self) -> io::Result<()> {
@@ -284,7 +315,7 @@ fn non_linearized_disable_reaches_the_sink_before_the_next_stream_provider() {
         &pdf,
         PayloadProvider {
             name: "A",
-            payload: Rc::new(b"provider-payload-A".to_vec()),
+            payload: Rc::new(PROVIDER_A_PAYLOAD.to_vec()),
             events: Some(events.clone()),
         },
     );
@@ -331,12 +362,13 @@ fn non_linearized_disable_reaches_the_sink_before_the_next_stream_provider() {
 #[test]
 fn terminal_output_sink_failure_never_requests_the_second_provider() {
     let events = ProviderEvents(Rc::new(RefCell::new(Vec::new())));
+    let accepted = Rc::new(RefCell::new(Vec::new()));
     let mut pdf = minimal_pdf();
     let first = provider_stream(
         &pdf,
         PayloadProvider {
             name: "A",
-            payload: Rc::new(b"provider-payload-A".to_vec()),
+            payload: Rc::new(PROVIDER_A_PAYLOAD.to_vec()),
             events: Some(events.clone()),
         },
     );
@@ -354,17 +386,40 @@ fn terminal_output_sink_failure_never_requests_the_second_provider() {
     writer
         .set_output_writer(TerminalSinkWriter {
             events: events.clone(),
+            accepted: Rc::clone(&accepted),
+            rejected: false,
         })
         .expect("install terminal output sink");
     let error = writer
         .write()
         .expect_err("terminal sink failure must escape the writer");
 
-    assert!(error.to_string().contains("terminal output sink failure"));
+    assert!(error
+        .to_string()
+        .contains("terminal output sink rejected provider A payload"));
+    assert!(
+        accepted.borrow().starts_with(b"%PDF-"),
+        "header and earlier document bytes must be accepted before A is rejected"
+    );
+    let events = events.snapshot();
+    let provider_a_count = events.iter().filter(|event| *event == "provider:A").count();
+    let sink_error = events
+        .iter()
+        .position(|event| event == "sink-error:A")
+        .expect("the sink must identify A's rejected payload");
     assert_eq!(
-        events.snapshot(),
-        vec!["provider:A", "sink-error"],
-        "a terminal sink error must stop the queue without retrying A or requesting B"
+        provider_a_count, 1,
+        "A must not be retried after sink failure"
+    );
+    assert!(
+        events[..sink_error]
+            .iter()
+            .any(|event| event == "provider:A"),
+        "A must be requested before its payload reaches the rejecting sink"
+    );
+    assert!(
+        !events.iter().any(|event| event == "provider:B"),
+        "a terminal A sink failure must not request B or any later provider; events: {events:?}"
     );
 }
 
@@ -405,7 +460,7 @@ fn segment_finish_failure_never_requests_the_second_provider() {
         &pdf,
         SegmentFinishFailureProvider {
             events: events.clone(),
-            payload: Rc::new(b"provider-payload-A".to_vec()),
+            payload: Rc::new(PROVIDER_A_PAYLOAD.to_vec()),
         },
     );
     let second = provider_stream(
