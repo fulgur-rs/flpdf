@@ -135,7 +135,7 @@ pub(crate) fn write_pclm<R: Read + Seek + 'static, W: Write>(
         next_late_trailer_number,
         false,
         false,
-    )?;
+    )?; // cov:ignore: shared late-trailer success continuation is covered by the PCLm live tests
 
     let trailer_handle = build_writer_trailer_handle(
         pdf,

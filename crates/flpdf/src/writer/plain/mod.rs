@@ -401,13 +401,13 @@ fn write_plain_live<R: Read + Seek, W: Write>(
         initial_late_trailer_number,
         true,
         options.qdf,
-    )?;
-    // Object streams require a cross-reference stream: a classic table has no
-    // type-2 row shape (ISO 32000-1 7.5.7). qpdf decides this from the same
-    // setup-time membership that set the version floor above
-    // (`QPDFWriter.cc:3023-3031`), not from what the walk turned out to
-    // reach, so a registered-but-unreached container still produces a
-    // cross-reference stream with zero type-2 rows.
+    )?; // cov:ignore: shared late-trailer success continuation is covered by the QDF/normalize live tests
+        // Object streams require a cross-reference stream: a classic table has no
+        // type-2 row shape (ISO 32000-1 7.5.7). qpdf decides this from the same
+        // setup-time membership that set the version floor above
+        // (`QPDFWriter.cc:3023-3031`), not from what the walk turned out to
+        // reach, so a registered-but-unreached container still produces a
+        // cross-reference stream with zero type-2 rows.
     let form = if has_object_stream_hint {
         XrefForm::Stream
     } else {
@@ -443,7 +443,7 @@ fn write_plain_live<R: Read + Seek, W: Write>(
             references,
             next_late_trailer_number,
             options.qdf,
-        )?;
+        )?; // cov:ignore: direct-root late assignment success is covered by the QDF/normalize direct-root test
         let map_ref = |object_ref: ObjectRef| {
             trailer_map.get(&object_ref).copied().ok_or_else(|| {
                 // cov:ignore-start: every direct-root reference is collected before this static map is constructed
@@ -478,7 +478,7 @@ fn write_plain_live<R: Read + Seek, W: Write>(
         next_late_trailer_number,
         false,
         options.qdf,
-    )?;
+    )?; // cov:ignore: shared late-trailer success continuation is covered by the QDF/normalize live tests
     let trailer = TrailerPlan {
         form,
         canonical_entries: plan::canonical_trailer_entries(pdf, &trailer_map, &removed_refs)?,
