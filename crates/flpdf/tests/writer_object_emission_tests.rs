@@ -1,6 +1,6 @@
 //! qpdf writeObject progress precedes unparse of the live object.
 
-use flpdf::{ObjectHandle, ObjectStreamMode, Pdf, PdfWriter};
+use flpdf::{EncryptParams, ObjectHandle, ObjectStreamMode, Pdf, PdfOpenOptions, PdfWriter};
 use std::io::Cursor;
 use std::rc::Rc;
 
@@ -95,4 +95,140 @@ fn progress_callback_attaches_a_new_indirect_child_to_the_live_root() {
     assert!(output
         .windows(b"/ProgressChild 42".len())
         .any(|window| window == b"/ProgressChild 42"));
+}
+
+#[test]
+fn specialized_progress_callback_attaches_a_new_child_to_a_future_object() {
+    // qpdf's writeObject reports progress before unparseObject.  The
+    // specialized non-linearized route must keep that same live queue
+    // contract: a callback may mutate an object that is still waiting in the
+    // queue, and the newly observed child is numbered at unparseChild time.
+    let mut pdf = Pdf::open(Cursor::new(
+        include_bytes!("../../../tests/fixtures/compat/one-page-no-ext.pdf").to_vec(),
+    ))
+    .unwrap();
+    let root = pdf.root_handle().unwrap();
+    let pages_ref = root
+        .try_get_key(b"/Pages")
+        .unwrap()
+        .object_ref()
+        .expect("fixture has an indirect Pages object");
+    let pages = pdf.get_object_handle(pages_ref);
+    let child = pdf
+        .make_indirect_object_handle(ObjectHandle::dictionary(vec![(
+            b"/SpecializedProgressChild".to_vec(),
+            ObjectHandle::integer(42),
+        )]))
+        .unwrap();
+    let mut writer = PdfWriter::new(&mut pdf);
+    writer.set_object_stream_mode(ObjectStreamMode::Disable);
+    writer.set_extra_header_text("% specialized-live-queue");
+    writer.set_static_id(true);
+    writer.set_output_memory().unwrap();
+    let mut called = false;
+    writer.register_progress_reporter(Box::new(move |_percent| {
+        if !called {
+            called = true;
+            pages.replace_key(b"/SpecializedProgressProbe", child.clone())?;
+        }
+        Ok(())
+    }));
+    writer
+        .write()
+        .expect("specialized writer must discover callback children live");
+    let output = writer.get_buffer().unwrap();
+    assert!(output
+        .windows(b"/SpecializedProgressProbe".len())
+        .any(|window| window == b"/SpecializedProgressProbe"));
+    assert!(output
+        .windows(b"/SpecializedProgressChild 42".len())
+        .any(|window| window == b"/SpecializedProgressChild 42"));
+}
+
+#[test]
+fn specialized_encrypted_live_queue_discovers_callback_children_in_each_mode() {
+    for object_streams in [
+        ObjectStreamMode::Disable,
+        ObjectStreamMode::Preserve,
+        ObjectStreamMode::Generate,
+    ] {
+        let mut pdf = Pdf::open(Cursor::new(
+            include_bytes!("../../../tests/fixtures/compat/one-page-no-ext.pdf").to_vec(),
+        ))
+        .unwrap();
+        let root = pdf.root_handle().unwrap();
+        let pages_ref = root
+            .try_get_key(b"/Pages")
+            .unwrap()
+            .object_ref()
+            .expect("fixture has an indirect Pages object");
+        let pages = pdf.get_object_handle(pages_ref);
+        let child = pdf
+            .make_indirect_object_handle(ObjectHandle::dictionary(vec![
+                (
+                    b"/EncryptedSpecializedChild".to_vec(),
+                    ObjectHandle::integer(42),
+                ),
+                (
+                    b"/EncryptedSpecializedString".to_vec(),
+                    ObjectHandle::string(b"dynamic-string".to_vec()),
+                ),
+            ]))
+            .unwrap();
+        let mut writer = PdfWriter::new(&mut pdf);
+        writer.set_object_stream_mode(object_streams);
+        writer.set_encryption_parameters(EncryptParams::v4_aes128(b"u", b"o"));
+        writer.set_static_id(true);
+        writer.set_static_aes_iv(true);
+        writer.set_output_memory().unwrap();
+        let mut called = false;
+        writer.register_progress_reporter(Box::new(move |_percent| {
+            if !called {
+                called = true;
+                pages.replace_key(b"/EncryptedSpecializedProbe", child.clone())?;
+            }
+            Ok(())
+        }));
+        writer.write().unwrap_or_else(|error| {
+            panic!("encrypted specialized mode {object_streams:?}: {error}")
+        });
+        let output = writer.get_buffer().unwrap();
+        let mut reopened = Pdf::open_with_options(
+            Cursor::new(output),
+            PdfOpenOptions {
+                password: b"u".to_vec(),
+                ..PdfOpenOptions::default()
+            },
+        )
+        .unwrap();
+        let rewritten_root = reopened.root_handle().unwrap();
+        let rewritten_pages_ref = rewritten_root
+            .try_get_key(b"/Pages")
+            .unwrap()
+            .object_ref()
+            .expect("rewritten fixture has an indirect Pages object");
+        let rewritten_pages = reopened.get_object_handle(rewritten_pages_ref);
+        assert!(
+            rewritten_pages
+                .try_get_key(b"/EncryptedSpecializedProbe")
+                .unwrap()
+                .object_ref()
+                .is_some(),
+            "encrypted specialized mode {object_streams:?} must retain the callback child"
+        );
+        let child_ref = rewritten_pages
+            .try_get_key(b"/EncryptedSpecializedProbe")
+            .unwrap()
+            .object_ref()
+            .expect("callback child remains indirect");
+        let rewritten_child = reopened.get_object_handle(child_ref);
+        assert_eq!(
+            rewritten_child
+                .try_get_key(b"/EncryptedSpecializedString")
+                .unwrap()
+                .as_string(),
+            Some(b"dynamic-string".to_vec()),
+            "encrypted specialized mode {object_streams:?} must encrypt/decrypt dynamic child strings"
+        );
+    }
 }

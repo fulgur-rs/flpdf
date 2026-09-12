@@ -7,7 +7,7 @@ mod planning;
 pub(crate) use eligibility::{
     compressible_objgens_qpdf_plan, eligibility_context, even_split_into_streams,
     get_compressible_objgens, is_eligible_for_objstm_handle, is_qpdf_signature_dict,
-    EligibilityContext,
+    CompressiblePlan, EligibilityContext,
 };
 pub(crate) use emission::{
     emit_objstm_body_from_handles_with_writer, emit_objstm_body_from_handles_with_writer_qdf,
@@ -16,6 +16,7 @@ pub(crate) use emission::{
 pub use planning::ObjectStreamMode;
 pub(crate) use planning::{
     filter_objstm_batches_for_output, plan_object_streams_with_reachability,
+    plan_object_streams_with_reachability_and_source_membership,
     plan_qpdf_preserve_object_streams_with_source_membership,
     plan_qpdf_preserve_object_streams_with_unreferenced, planner_config_from_options,
     ObjectStreamGroup, PlannerConfig,

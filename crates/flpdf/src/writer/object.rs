@@ -165,6 +165,25 @@ pub(crate) trait ObjectWriterEmission {
             "dynamic stream writer map is unavailable for this emission owner".into(),
         ))
     }
+    fn write_object_with_dynamic_ref_map_and_string_writer<F>(
+        &self,
+        out: &mut Vec<u8>,
+        map: &mut dyn FnMut(&ObjectHandle) -> Result<ObjectRef>,
+        removed_refs: &BTreeSet<ObjectRef>,
+        write_string: &mut F,
+    ) -> Result<()>
+    where
+        F: FnMut(&mut Vec<u8>, &[u8]) -> Result<()>;
+    fn write_stream_body_with_dynamic_ref_map_and_string_writer<F>(
+        &self,
+        out: &mut Vec<u8>,
+        options: StreamDictionaryOptions,
+        map: &mut dyn FnMut(&ObjectHandle) -> Result<ObjectRef>,
+        removed_refs: &BTreeSet<ObjectRef>,
+        write_string: &mut F,
+    ) -> Result<()>
+    where
+        F: FnMut(&mut Vec<u8>, &[u8]) -> Result<()>;
     // cov:ignore-end
     fn write_object_with_ref_map_and_removed_with_string_writer<F>(
         &self,
@@ -591,6 +610,47 @@ impl ObjectWriterEmission for ObjectHandle {
     ) -> Result<()> {
         let entries = stream_dictionary_entries_for_emission(self)?;
         unparse_stream_dict_entries_with_dynamic_ref_map(&entries, options, out, map, removed_refs)
+    }
+
+    fn write_object_with_dynamic_ref_map_and_string_writer<F>(
+        &self,
+        out: &mut Vec<u8>,
+        map: &mut dyn FnMut(&ObjectHandle) -> Result<ObjectRef>,
+        removed_refs: &BTreeSet<ObjectRef>,
+        write_string: &mut F,
+    ) -> Result<()>
+    where
+        F: FnMut(&mut Vec<u8>, &[u8]) -> Result<()>,
+    {
+        unparse_object_walk_with_dynamic_ref_map_and_string_writer(
+            self,
+            out,
+            map,
+            removed_refs,
+            write_string,
+        )
+    }
+
+    fn write_stream_body_with_dynamic_ref_map_and_string_writer<F>(
+        &self,
+        out: &mut Vec<u8>,
+        options: StreamDictionaryOptions,
+        map: &mut dyn FnMut(&ObjectHandle) -> Result<ObjectRef>,
+        removed_refs: &BTreeSet<ObjectRef>,
+        write_string: &mut F,
+    ) -> Result<()>
+    where
+        F: FnMut(&mut Vec<u8>, &[u8]) -> Result<()>,
+    {
+        let entries = stream_dictionary_entries_for_emission(self)?;
+        unparse_stream_dict_entries_with_dynamic_ref_map_and_string_writer(
+            &entries,
+            options,
+            out,
+            map,
+            removed_refs,
+            write_string,
+        )
     }
 
     /// Encrypted writer counterpart of
@@ -2434,6 +2494,216 @@ fn unparse_stream_dict_entries_with_dynamic_ref_map(
         out.extend_from_slice(b" /Length ");
         write_child_with_dynamic_ref_map(length, out, map, removed_refs)?; // cov:ignore: LLVM attributes this length-call terminator to callback cleanup.
     } // cov:ignore: LLVM attributes this length-call terminator to callback cleanup.
+    if options.add_flate_filter {
+        out.extend_from_slice(b" /Filter /FlateDecode");
+    }
+    out.extend_from_slice(b" >>");
+    Ok(())
+}
+
+fn write_child_with_dynamic_ref_map_and_string_writer<F>(
+    handle: &ObjectHandle,
+    out: &mut Vec<u8>,
+    map: &mut DynamicObjectRefMap<'_>,
+    removed_refs: &BTreeSet<ObjectRef>,
+    write_string: &mut F,
+) -> Result<()>
+where
+    F: FnMut(&mut Vec<u8>, &[u8]) -> Result<()>,
+{
+    if handle
+        .qpdf_obj_gen()
+        .is_some_and(|object_gen| object_gen.get_obj() == 0)
+    {
+        out.extend_from_slice(b"null");
+        return Ok(());
+    }
+    if let Some(object_ref) = handle.object_ref() {
+        if object_ref.number == 0 || removed_refs.contains(&object_ref) {
+            out.extend_from_slice(b"null");
+            return Ok(());
+        }
+        out.extend_from_slice(map(handle)?.to_string().as_bytes());
+        return Ok(());
+    }
+    unparse_object_walk_with_dynamic_ref_map_and_string_writer(
+        handle,
+        out,
+        map,
+        removed_refs,
+        write_string,
+    )
+}
+
+fn unparse_object_walk_with_dynamic_ref_map_and_string_writer<F>(
+    handle: &ObjectHandle,
+    out: &mut Vec<u8>,
+    map: &mut DynamicObjectRefMap<'_>,
+    removed_refs: &BTreeSet<ObjectRef>,
+    write_string: &mut F,
+) -> Result<()>
+where
+    F: FnMut(&mut Vec<u8>, &[u8]) -> Result<()>,
+{
+    stacker::maybe_grow(UNPARSE_STACK_RED_ZONE, UNPARSE_STACK_GROWTH_SIZE, || {
+        if handle.is_reserved() {
+            return Err(reserved_unparse_error());
+        }
+        handle.try_dereference()?;
+        let container = handle.with_value(|value| match value {
+            Some(value) => {
+                if let Some(container) = snapshot_unparse_container(value) {
+                    Ok(Some(container))
+                } else {
+                    unparse_object_value_with_dynamic_ref_map_and_string_writer(
+                        value,
+                        out,
+                        write_string,
+                    )
+                    .map(|()| None)
+                }
+            }
+            None => {
+                // cov:ignore-start: after try_dereference a live non-reserved handle cannot expose None
+                out.extend_from_slice(b"null");
+                Ok(None)
+                // cov:ignore-end
+            }
+        })?;
+        match container {
+            Some(UnparseContainer::Array(children)) => {
+                out.push(b'[');
+                for child in children {
+                    out.push(b' ');
+                    write_child_with_dynamic_ref_map_and_string_writer(
+                        &child,
+                        out,
+                        map,
+                        removed_refs,
+                        write_string,
+                    )?;
+                }
+                out.extend_from_slice(b" ]");
+            }
+            Some(UnparseContainer::Dictionary(entries)) => {
+                unparse_dict_entries_with_dynamic_ref_map_and_string_writer(
+                    &entries,
+                    out,
+                    map,
+                    removed_refs,
+                    write_string,
+                )?;
+            }
+            Some(UnparseContainer::Stream(stream_dict)) => {
+                unparse_object_walk_with_dynamic_ref_map_and_string_writer(
+                    &stream_dict,
+                    out,
+                    map,
+                    removed_refs,
+                    write_string,
+                )?;
+            }
+            None => {}
+        }
+        Ok(())
+    })
+}
+
+fn unparse_object_value_with_dynamic_ref_map_and_string_writer<F>(
+    value: &ObjectValue,
+    out: &mut Vec<u8>,
+    write_string: &mut F,
+) -> Result<()>
+where
+    F: FnMut(&mut Vec<u8>, &[u8]) -> Result<()>,
+{
+    match value {
+        ObjectValue::String(bytes) => write_string(out, bytes),
+        _ => unparse_object_value(value, out),
+    }
+}
+
+fn unparse_dict_entries_with_dynamic_ref_map_and_string_writer<F>(
+    entries: &[(Vec<u8>, ObjectHandle)],
+    out: &mut Vec<u8>,
+    map: &mut DynamicObjectRefMap<'_>,
+    removed_refs: &BTreeSet<ObjectRef>,
+    write_string: &mut F,
+) -> Result<()>
+where
+    F: FnMut(&mut Vec<u8>, &[u8]) -> Result<()>,
+{
+    out.extend_from_slice(b"<<");
+    for (key, value) in visible_dict_entries(entries)? {
+        if is_removed_reference(value, removed_refs) {
+            continue;
+        }
+        out.push(b' ');
+        write_dictionary_key(out, key);
+        out.push(b' ');
+        let force_hex_string =
+            key.as_slice() == b"/Contents" && dict_is_sig_with_byte_range(entries)?;
+        if !try_write_sig_contents_hex_string(value, force_hex_string, out)? {
+            write_child_with_dynamic_ref_map_and_string_writer(
+                value,
+                out,
+                map,
+                removed_refs,
+                write_string,
+            )?;
+        }
+    }
+    out.extend_from_slice(b" >>");
+    Ok(())
+}
+
+fn unparse_stream_dict_entries_with_dynamic_ref_map_and_string_writer<F>(
+    entries: &[(Vec<u8>, ObjectHandle)],
+    options: StreamDictionaryOptions,
+    out: &mut Vec<u8>,
+    map: &mut DynamicObjectRefMap<'_>,
+    removed_refs: &BTreeSet<ObjectRef>,
+    write_string: &mut F,
+) -> Result<()>
+where
+    F: FnMut(&mut Vec<u8>, &[u8]) -> Result<()>,
+{
+    let entries = prepare_stream_dict_entries(entries, options)?;
+    out.extend_from_slice(b"<<");
+    let mut length_value: Option<&ObjectHandle> = None;
+    for (key, value) in visible_dict_entries(&entries)? {
+        if is_removed_reference(value, removed_refs) {
+            continue;
+        }
+        if key.as_slice() == b"/Length" {
+            length_value = Some(value);
+            continue;
+        }
+        out.push(b' ');
+        write_dictionary_key(out, key);
+        out.push(b' ');
+        let force_hex_string =
+            key.as_slice() == b"/Contents" && dict_is_sig_with_byte_range(&entries)?;
+        if !try_write_sig_contents_hex_string(value, force_hex_string, out)? {
+            write_child_with_dynamic_ref_map_and_string_writer(
+                value,
+                out,
+                map,
+                removed_refs,
+                write_string,
+            )?;
+        }
+    }
+    if let Some(length) = length_value {
+        out.extend_from_slice(b" /Length ");
+        write_child_with_dynamic_ref_map_and_string_writer(
+            length,
+            out,
+            map,
+            removed_refs,
+            write_string,
+        )?;
+    }
     if options.add_flate_filter {
         out.extend_from_slice(b" /Filter /FlateDecode");
     }

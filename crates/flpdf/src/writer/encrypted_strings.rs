@@ -118,6 +118,48 @@ impl EncryptedStringEmitter {
             })
     }
 
+    /// Standard-writer counterpart that discovers indirect children at the
+    /// qpdf `unparseChild` boundary instead of consulting a precomputed map.
+    /// String encryption remains inside the same writer-owned data-key scope;
+    /// only the reference allocator changes from a static source map to the
+    /// live queue callback.
+    pub(crate) fn write_handle_object_with_dynamic_ref_map(
+        &mut self,
+        out: &mut Vec<u8>,
+        emitted_ref: ObjectRef,
+        object_stream_index: Option<u32>,
+        object: &ObjectHandle,
+        map: &mut dyn FnMut(&ObjectHandle) -> crate::Result<ObjectRef>,
+        removed_refs: &std::collections::BTreeSet<ObjectRef>,
+    ) -> crate::Result<()> {
+        if emitted_ref == self.encrypt_ref {
+            return write_encryption_dictionary_handle(out, object);
+        }
+
+        let cipher = self.cipher;
+        let static_aes_iv = self.static_aes_iv;
+        let aes_iv_generator = self.aes_iv_generator.as_mut();
+        self.state
+            .with_object_data_key(emitted_ref.number, object_stream_index, |state| {
+                let mut write_string = |out: &mut Vec<u8>, plaintext: &[u8]| {
+                    write_encrypted_or_plain_string(
+                        state,
+                        cipher,
+                        static_aes_iv,
+                        aes_iv_generator,
+                        out,
+                        plaintext,
+                    )
+                };
+                object.write_object_with_dynamic_ref_map_and_string_writer(
+                    out,
+                    map,
+                    removed_refs,
+                    &mut write_string,
+                )
+            })
+    }
+
     /// Emit a page or `/Contents` array holder that owns direct streams while
     /// keeping qpdf's per-object string data key active. The stream payload is
     /// deliberately handled by the content-container helper's raw-stream
@@ -233,6 +275,49 @@ impl EncryptedStringEmitter {
                         &mut write_string,
                     )
                 }
+            })
+    }
+
+    /// Standard-writer stream-dictionary counterpart of
+    /// [`Self::write_handle_stream_dict_with_ref_map`].
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) fn write_handle_stream_dict_with_dynamic_ref_map(
+        &mut self,
+        out: &mut Vec<u8>,
+        emitted_ref: ObjectRef,
+        object_stream_index: Option<u32>,
+        dict: &ObjectHandle,
+        dictionary: StreamDictionaryOptions,
+        encrypt_strings: bool,
+        map: &mut dyn FnMut(&ObjectHandle) -> crate::Result<ObjectRef>,
+        removed_refs: &std::collections::BTreeSet<ObjectRef>,
+    ) -> crate::Result<()> {
+        if !encrypt_strings {
+            return dict.write_stream_body_with_dynamic_ref_map(out, dictionary, map, removed_refs);
+        }
+
+        let cipher = self.cipher;
+        let static_aes_iv = self.static_aes_iv;
+        let aes_iv_generator = self.aes_iv_generator.as_mut();
+        self.state
+            .with_object_data_key(emitted_ref.number, object_stream_index, |state| {
+                let mut write_string = |out: &mut Vec<u8>, plaintext: &[u8]| {
+                    write_encrypted_or_plain_string(
+                        state,
+                        cipher,
+                        static_aes_iv,
+                        aes_iv_generator,
+                        out,
+                        plaintext,
+                    )
+                };
+                dict.write_stream_body_with_dynamic_ref_map_and_string_writer(
+                    out,
+                    dictionary,
+                    map,
+                    removed_refs,
+                    &mut write_string,
+                )
             })
     }
 }
