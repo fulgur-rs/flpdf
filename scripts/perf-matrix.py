@@ -223,8 +223,15 @@ def validate_sample(sample, operation, output, qpdf, expected_pages, family, tim
         elif operation == "json":
             with artifact.open() as stream:
                 obj = json.load(stream)
-            if not isinstance(obj, dict) or not isinstance(obj.get("qpdf"), list):
+            # A constant `{"qpdf": []}` must not pass as a serialized document,
+            # so require the object map qpdf always emits as the second element
+            # and at least one object beside the trailer. This holds for the
+            # pinned fixture too, which has no generated marker to check.
+            payload = obj.get("qpdf") if isinstance(obj, dict) else None
+            if not isinstance(payload, list) or len(payload) < 2 or not isinstance(payload[1], dict):
                 raise ValueError("missing qpdf JSON payload")
+            if len(payload[1]) < 2:
+                raise ValueError(f"qpdf JSON payload holds {len(payload[1])} objects")
             require_markers(artifact.read_text(errors="replace"), family)
         elif operation != "check":
             checked = subprocess.run([str(qpdf), "--check", str(output)], capture_output=True,

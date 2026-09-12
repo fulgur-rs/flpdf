@@ -91,9 +91,18 @@ class MeasurementContracts(unittest.TestCase):
             output.write_text('{"qpdf": []}')
             self.assertFalse(
                 perf.validate_sample(sample, "json", None, None, 1, "pages", 10)["ok"])
-            output.write_text('{"qpdf": [{"obj:1 0 R": {"value": {"/Bench": true}}}]}')
+            for thin in ('{"qpdf": [{}]}', '{"qpdf": [{}, {}]}',
+                         '{"qpdf": [{}, {"obj:1 0 R": {}}]}'):
+                output.write_text(thin)
+                self.assertFalse(
+                    perf.validate_sample(sample, "json", None, None, 1, "qtest", 10)["ok"],
+                    thin)
+            output.write_text(
+                '{"qpdf": [{}, {"obj:1 0 R": {"value": {"/Bench": true}}, "obj:2 0 R": {}}]}')
             self.assertTrue(
                 perf.validate_sample(sample, "json", None, None, 1, "pages", 10)["ok"])
+            self.assertTrue(
+                perf.validate_sample(sample, "json", None, None, 1, "qtest", 10)["ok"])
 
     def test_marker_check_requires_the_embedded_file_tree_for_streams(self):
         perf.require_markers("/Bench /EmbeddedFiles", "stream")
