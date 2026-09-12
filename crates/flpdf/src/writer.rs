@@ -6166,7 +6166,7 @@ fn emit_specialized_standard_live<R: Read + Seek + 'static, W: Write>(
             };
             let mut bytes = Vec::new();
             object::write_object_with_dynamic_ref_map_and_string_writer_and_direct_stream_writer(
-                &root,
+                root,
                 &mut bytes,
                 &mut map_ref,
                 &removed_refs,
