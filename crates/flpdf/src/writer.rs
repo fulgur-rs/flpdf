@@ -6003,14 +6003,14 @@ fn emit_specialized_standard_live<R: Read + Seek + 'static, W: Write>(
     if force_version_below_1_5(options) && !encrypting {
         effective_xref_form = XrefForm::Table;
     }
+    // cov:ignore-start: effective_pdf_version_and_ext supplies the 1.5 floor for every emitted ObjStm; this defensive invalid-version guard is unreachable from supported writer inputs.
     if matches!(effective_xref_form, XrefForm::Stream)
         && parse_qpdf_writer_version(&version)
             .is_none_or(|current| current < QpdfVersionParts::new(1, 5))
     {
-        // cov:ignore-start: effective_pdf_version_and_ext already applies the 1.5 ObjStm floor; this is a defensive guard for an invalid/custom version source.
         version = "1.5".to_string();
-        // cov:ignore-end
-    } // cov:ignore: effective_pdf_version_and_ext supplies the required version floor before this defensive correction.
+    }
+    // cov:ignore-end
 
     let (det_id_source_id0, det_id_info_suffix): (Option<Vec<u8>>, Vec<u8>) = if deterministic_id {
         let id_handle = pdf.trailer_key_handle(b"ID");

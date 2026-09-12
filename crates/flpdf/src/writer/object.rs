@@ -2397,8 +2397,8 @@ impl DynamicDirectStreamWriter for DefaultDynamicDirectStreamWriter {
                 // cov:ignore-start: an allocatable direct stream payload fits in i64
                 Error::Unsupported("direct stream /Length does not fit in i64".to_string())
                 // cov:ignore-end
-            })?),
-        )?;
+            })?), // cov:ignore: allocatable direct stream payloads fit in i64; LLVM attributes the covered conversion continuation here.
+        )?; // cov:ignore: the validated direct-stream dictionary replacement is covered; LLVM attributes its multiline terminator here.
         let entries = stream_dictionary_entries_for_emission(&dict)?;
         let mut write_string_wrapper = |out: &mut Vec<u8>, value: &[u8]| write_string(out, value);
         unparse_stream_dict_entries_with_dynamic_ref_map_and_string_writer(
@@ -2409,7 +2409,7 @@ impl DynamicDirectStreamWriter for DefaultDynamicDirectStreamWriter {
             removed_refs,
             &mut write_string_wrapper,
             self,
-        )?;
+        )?; // cov:ignore: the validated direct-stream dictionary serializer is covered; LLVM attributes its multiline terminator here.
         out.extend_from_slice(b"\nstream\n");
         out.extend_from_slice(data.as_ref());
         out.extend_from_slice(b"\nendstream");
@@ -2462,7 +2462,7 @@ where
         final_pdf_version,
         final_extension_level,
         apply_adbe_reconciliation,
-    )?;
+    )?; // cov:ignore: root output-copy validation is covered by the root serializer test; LLVM attributes this multiline continuation here.
     write_object_with_dynamic_ref_map_and_string_writer_and_direct_stream_writer(
         &root,
         out,
@@ -4678,6 +4678,31 @@ mod tests {
         assert!(dictionary_text.contains("/Mapped"));
         assert!(!dictionary_text.contains("/Removed"));
 
+        let direct_stream = ObjectHandle::stream(
+            ObjectHandle::dictionary(vec![
+                (b"/Length".to_vec(), ObjectHandle::integer(999)),
+                (b"/Label".to_vec(), ObjectHandle::string(b"direct".to_vec())),
+                (b"/Child".to_vec(), child.clone()),
+            ]),
+            Rc::new(b"direct-body".to_vec()),
+        );
+        let nested_direct_stream =
+            ObjectHandle::dictionary(vec![(b"/DirectStream".to_vec(), direct_stream)]);
+        let mut nested_direct_output = Vec::new();
+        let mut nested_direct_map = |handle: &ObjectHandle| {
+            Ok(handle
+                .object_ref()
+                .expect("nested direct stream child is indirect"))
+        };
+        nested_direct_stream.write_object_with_dynamic_ref_map(
+            &mut nested_direct_output,
+            &mut nested_direct_map,
+            &BTreeSet::new(),
+        )?;
+        let nested_direct_text = String::from_utf8_lossy(&nested_direct_output);
+        assert!(nested_direct_text.contains("/Length 11"));
+        assert!(nested_direct_text.contains("stream\ndirect-body\nendstream"));
+
         let stream_length = pdf.make_indirect_object_handle(ObjectHandle::integer(4))?;
         let stream_child = pdf.make_indirect_object_handle(ObjectHandle::integer(8))?;
         let stream = ObjectHandle::stream(
@@ -4820,6 +4845,50 @@ mod tests {
             )?; // cov:ignore: LLVM attributes the covered dynamic stream-dictionary call terminator to test cleanup.
         assert!(String::from_utf8_lossy(&stream_output).contains("/Length"));
         assert!(!String::from_utf8_lossy(&stream_output).contains("/Removed"));
+
+        let top_level_stream = ObjectHandle::stream(
+            ObjectHandle::dictionary(vec![
+                (b"/Length".to_vec(), ObjectHandle::integer(4)),
+                (
+                    b"/Label".to_vec(),
+                    ObjectHandle::string(b"top-level-stream".to_vec()),
+                ),
+            ]),
+            Rc::new(b"body".to_vec()),
+        );
+        let mut top_level_stream_output = Vec::new();
+        let mut top_level_stream_map = |handle: &ObjectHandle| {
+            Ok(handle
+                .object_ref()
+                .expect("top-level stream child is indirect"))
+        };
+        top_level_stream.write_object_with_dynamic_ref_map_and_string_writer(
+            &mut top_level_stream_output,
+            &mut top_level_stream_map,
+            &BTreeSet::new(),
+            &mut write_string,
+        )?;
+        let top_level_stream_text = String::from_utf8_lossy(&top_level_stream_output);
+        assert!(top_level_stream_text.contains("/Label (top-level-stream)"));
+
+        let root = pdf.root_handle()?;
+        let mut root_output = Vec::new();
+        let mut root_map = |handle: &ObjectHandle| {
+            Ok(handle.object_ref().expect("root dynamic child is indirect"))
+        };
+        let mut root_direct_stream_writer = super::DefaultDynamicDirectStreamWriter;
+        super::write_root_object_with_dynamic_ref_map_and_string_writer_and_direct_stream_writer(
+            &root,
+            &mut root_output,
+            &mut root_map,
+            &BTreeSet::new(),
+            "1.4",
+            0,
+            false,
+            &mut write_string,
+            &mut root_direct_stream_writer,
+        )?;
+        assert!(String::from_utf8_lossy(&root_output).contains("/Type /Catalog"));
 
         let reserved = ObjectHandle::new_reserved_direct();
         let error = reserved
