@@ -267,7 +267,9 @@ portion of Step 3, Steps 4–7, and the complete-PDF ownership removal. Neither
 stage may claim Task 4 complete until both stages have passed their scoped
 review.
 
-- [ ] **Step 1: Extract or generalize LiveQueue without changing its proven Disable order.**
+- [x] **Stage A: planning removal and emission-time child discovery bridge.**
+
+- [x] **Step 1: Extract or generalize LiveQueue without changing its proven Disable order.**
 
   Retain root/trailer seed order, first-enqueue numbering, source ownership
   checks, null dictionary visibility, and dynamic child callback behavior from
@@ -276,7 +278,7 @@ review.
   member numbers reserved when a container is first enqueued, matching
   `QPDFWriter.cc:1057-1069,1939-2006`.
 
-- [ ] **Step 2: Remove payload-dependent planning callbacks.**
+- [x] **Step 2: Remove payload-dependent planning callbacks.**
 
   Delete the non-linearized use of `StreamParametersRemoved` and the
   `stream_parameters_removed` callback from `CanonicalCatalogFirstRenumber`
