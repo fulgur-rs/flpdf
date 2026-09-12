@@ -268,6 +268,7 @@ stage may claim Task 4 complete until both stages have passed their scoped
 review.
 
 - [x] **Stage A: planning removal and emission-time child discovery bridge.**
+- [x] **Stage B: final-sink body, ObjStm, and xref cutover.**
 
 - [x] **Step 1: Extract or generalize LiveQueue without changing its proven Disable order.**
 
@@ -286,7 +287,7 @@ review.
   explicitly named. Remove `CachedStreamOutput` payload data and its
   plan-wide fingerprint cache from the non-linearized plan.
 
-- [ ] **Step 3: Emit normal objects directly to OutputSink.**
+- [x] **Step 3: Emit normal objects directly to OutputSink.**
 
   Change `LiveObjectEmitter` to hold `&mut OutputSink`; record each object
   offset from `position()` immediately before framing, run the actual stream
@@ -295,7 +296,7 @@ review.
   to the final sink. Preserve progress-before-unparse and qpdf encryption key
   setup/clear order.
 
-- [ ] **Step 4: Emit ObjStm containers with local-only bodies.**
+- [x] **Step 4: Emit ObjStm containers with local-only bodies.**
 
   Build one ObjStm member/pair body in its local buffer, calculate `/First` and
   pair offsets in that buffer's coordinate system, write the container header
@@ -303,7 +304,7 @@ review.
   next unrelated container. Do not append container bytes to a body-wide Vec.
   Ensure member dynamic references are queued during the same emission.
 
-- [ ] **Step 5: Stream classic xref, xref-stream object, trailer, and EOF.**
+- [x] **Step 5: Stream classic xref, xref-stream object, trailer, and EOF.**
 
   Record the xref offset from `OutputSink::position()`. Write classic rows and
   trailer entries directly. For xref streams, retain only the encoded xref
@@ -312,14 +313,14 @@ review.
   deterministic digest. Preserve `/W`, `/Index`, compression, and removed-row
   semantics.
 
-- [ ] **Step 6: Make the source-level and causal RED tests GREEN.**
+- [x] **Step 6: Make the source-level and causal RED tests GREEN.**
 
   Rerun Task 1 provider-order, terminal-failure, partial-write, Memory, and
   source guard tests. Add assertions that body bytes reach the sink before a
   later provider and that xref offsets parse successfully. Do not weaken a RED
   assertion to a write-count-only check.
 
-- [ ] **Step 7: Run plain mode differential tests and commit.**
+- [x] **Step 7: Run plain mode differential tests and commit.**
 
   ```bash
   cargo test -p flpdf --lib writer::plain
