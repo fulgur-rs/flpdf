@@ -169,7 +169,8 @@ D19/D30はcanonical ownerへ委譲するbyte-neutral test scaffolding、D27は�
 
 ## 6. 二重正本トラッカー
 
-追跡対象の symbol manifest は [tracked-symbols.txt](tracked-symbols.txt)。現行の bridge / mixed は97行だが、
+追跡対象の symbol manifest は [tracked-symbols.txt](tracked-symbols.txt)。この matrix revision の
+236 行は canonical 113 / mixed 114 / bridge 9 / unknown 0（bridge + mixed は123行）である。
 manifest は行集合の完全な機械変換ではなく、削除済みsymbolの0確認とcanonical側の分母も保持する。
 B7 は `.48.14` でObjStm header用の専用token consumerを追加した。C44 は `ObjectHandle::get_stream_json` を owner とする。B29 は `Pdf::get_warnings` / `any_warnings` / `num_warnings` の canonical API と、後続移行対象の `repair_diagnostics` snapshot を区別する。
 symbol数はmanifestの非comment・非空行から数え、行数と同一視しない。
