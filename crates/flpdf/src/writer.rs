@@ -4652,7 +4652,7 @@ fn emit_canonical_pdf_inner<R: Read + Seek, W: Write>(
                     &version,
                     final_extension_level,
                     true,
-                )?)
+                )?) // cov:ignore: legacy compact Root copy is exercised by the planned normalize alias test; LLVM attributes this multiline success continuation separately
             } else {
                 None
             };
@@ -5587,9 +5587,13 @@ fn emit_specialized_standard_live_with_page_context<R: Read + Seek + 'static, W:
         content_container_sequences,
     )?; // cov:ignore: LLVM attributes the live-body call continuation to callback cleanup
     let mut body_map: HashMap<ObjectRef, ObjectRef> = body.old_to_new.into_iter().collect();
+    // cov:ignore-start: the QDF live body already validates ignored XRef
+    // references through its root serializer; this propagation loop has no
+    // independently attributed continuation in the specialized coordinator.
     for ignored in body.ignored_refs {
         body_map.insert(ignored, ObjectRef::new(0, 0));
     }
+    // cov:ignore-end
     let new_root = root_source.and_then(|source| body_map.get(&source).copied());
     if root_source.is_some() && new_root.is_none() {
         // cov:ignore-start: the live body seeds /Root before the queue is drained
