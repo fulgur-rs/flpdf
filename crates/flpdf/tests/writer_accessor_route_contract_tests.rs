@@ -77,6 +77,20 @@ fn function_body<'a>(source: &'a str, function_name: &str) -> &'a str {
     &body[..end]
 }
 
+fn function_body_exact<'a>(source: &'a str, function_name: &str) -> &'a str {
+    let signature = format!("fn {function_name}(");
+    let start = source
+        .find(&signature)
+        .unwrap_or_else(|| panic!("{function_name} must be present"));
+    let after_signature = &source[start..];
+    let brace_start = after_signature
+        .find('{')
+        .unwrap_or_else(|| panic!("{function_name} must have a body"));
+    let body = &after_signature[brace_start..];
+    let end = item_body_end(body).unwrap_or_else(|| panic!("{function_name} must balance braces"));
+    &body[..end]
+}
+
 fn assert_local_stream_resolution(body: &str, handle_name: &str, expected: usize) {
     // Formatting may split a receiver and its method across lines, as in
     // `source_handle\n    .as_stream_dict()`. Compact only whitespace so the
@@ -103,7 +117,13 @@ fn assert_local_stream_resolution(body: &str, handle_name: &str, expected: usize
 
 #[test]
 fn standard_writer_production_uses_canonical_accessor_routes() {
-    let source = include_str!("../src/writer.rs").replace("\r\n", "\n");
+    let source = [
+        include_str!("../src/writer.rs"),
+        include_str!("../src/writer/write_object.rs"),
+        include_str!("../src/writer/plain/body.rs"),
+    ]
+    .join("\n")
+    .replace("\r\n", "\n");
     let production = strip_cfg_test_items(&source);
 
     for forbidden in [
@@ -129,19 +149,15 @@ fn standard_writer_production_uses_canonical_accessor_routes() {
 
 #[test]
 fn standard_writer_stream_observations_follow_resolution() {
-    let pclm_live = include_str!("../src/writer/pclm_live.rs");
-    assert!(
-        pclm_live.contains("emit_live_pclm"),
-        "PCLm must use the shared live body owner"
-    );
-    let pclm_seed = include_str!("../src/writer/pclm.rs");
-    assert!(
-        pclm_seed.contains("try_dereference") && pclm_seed.contains("try_is_null"),
-        "PCLm seed discovery must use canonical resolving accessors"
-    );
-
     let source = strip_cfg_test_items(&include_str!("../src/writer.rs").replace("\r\n", "\n"));
-    let standard_body = function_body(&source, "emit_canonical_pdf_inner");
-    assert_local_stream_resolution(standard_body, "object_handle", 2);
-    assert_local_stream_resolution(standard_body, "source_handle", 1);
+    let pclm_body = function_body(&source, "write_pclm");
+    assert_local_stream_resolution(pclm_body, "source_handle", 1);
+
+    let write_object_source = include_str!("../src/writer/write_object.rs");
+    let write_object_body = function_body_exact(write_object_source, "write_object");
+    assert_local_stream_resolution(write_object_body, "object", 1);
+
+    let plain_body_source = include_str!("../src/writer/plain/body.rs");
+    let unparse_body = function_body_exact(plain_body_source, "unparse_object");
+    assert_local_stream_resolution(unparse_body, "object", 1);
 }

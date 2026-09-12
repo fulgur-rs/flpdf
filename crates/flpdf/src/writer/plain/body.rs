@@ -719,6 +719,7 @@ impl<'pdf, 'output, 'sink, R: Read + Seek + 'static> crate::writer::write_object
         _in_object_stream: bool,
     ) -> crate::Result<()> {
         self.current_stream_length = None;
+        object.try_dereference()?;
         if object
             .object_ref()
             .is_some_and(|source| self.content_container_refs.contains(&source))
