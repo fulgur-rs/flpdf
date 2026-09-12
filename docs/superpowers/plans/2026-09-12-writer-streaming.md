@@ -132,7 +132,7 @@ GitHub Actions.
 - Consumes: existing `WriterOutputSink`, `WriterOutput::{Writer,Pipeline,Memory}`, and qpdf `Pl_Count`/`PipelinePopper` semantics.
 - Produces: `pub(crate) trait OutputTarget`, `pub(crate) struct OutputSink<'a>`, `OutputSink::write_bytes`, `position`, `last_byte`, `begin_digest`, `take_digest`, `finish_segment`, and `finish_document` for all writer routes.
 
-- [ ] **Step 1: Define the target/lifecycle contract.**
+- [x] **Step 1: Define the target/lifecycle contract.**
 
   Add an internal target trait with fallible chunk writes plus distinct
   `finish_segment` and `finish_document` operations. Implement it for
@@ -142,7 +142,7 @@ GitHub Actions.
   not finish early. Preserve `WriterOutputSink.failure` so outer writer code
   can return the original file/Pipeline error rather than a generic wrapper.
 
-- [ ] **Step 2: Implement accepted-byte counting.**
+- [x] **Step 2: Implement accepted-byte counting.**
 
   `OutputSink` must loop over the target's partial writes, retry only
   `ErrorKind::Interrupted`, convert zero progress to `WriteZero`, and update
@@ -150,7 +150,7 @@ GitHub Actions.
   Counter overflow returns the existing qpdf-shaped unsupported/I/O error
   boundary. Do not use local buffer length as the final position.
 
-- [ ] **Step 3: Implement incremental digest state.**
+- [x] **Step 3: Implement incremental digest state.**
 
   Add an optional MD5 state to the final sink. When enabled, every accepted
   final-output byte updates it; `suspend_digest` is called immediately after
@@ -159,7 +159,7 @@ GitHub Actions.
   fallible helper for the writer's qpdf-shaped second MD5 seed using existing
   `/Info` raw bytes and first-NUL truncation.
 
-- [ ] **Step 4: Add unit tests for the primitive.**
+- [x] **Step 4: Add unit tests for the primitive.**
 
   Test short writes, `Interrupted`, `WriteZero`, position overflow, last-byte
   tracking, segment finish versus document finish counts, finish failure, and
@@ -167,7 +167,7 @@ GitHub Actions.
   introduce a second serializer or a complete-output buffer inside
   `OutputSink`.
 
-- [ ] **Step 5: Run primitive tests and commit.**
+- [x] **Step 5: Run primitive tests and commit.**
 
   ```bash
   cargo test -p flpdf --lib writer::output
