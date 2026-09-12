@@ -1442,6 +1442,7 @@ declare -A G6HB2_FIX=(
     [objstm-lin-outlines-80-200]="gen_outlines_gap.py 80 200"
     [objstm-lin-useoutlines-80-80]="gen_outlines_gap.py 80 80 --use-outlines"
     [objstm-lin-outlines-shared-page-80-80]="gen_outlines_shared_page.py 80 80"
+    [objstm-lin-useoutlines-shared-page-80-80]="gen_outlines_shared_page.py 80 80 --use-outlines"
     [objstm-lin-outlines-coloc-200-20]="gen_outlines_gap.py 200 20"
     [objstm-lin-outlines-otherpage-2-60-20]="gen_outlines_otherpage_shared.py 2 60 20"
     [objstm-lin-outlines-otherpage-0-60-20]="gen_outlines_otherpage_shared.py 0 60 20"
@@ -2894,9 +2895,12 @@ echo "objstm-lin-otherpage-shared-docother-bearing/linearize-objstm-preserve.pdf
 #   AND an outline item (/Extra), so qpdf's in_outlines category outranks
 #   in_first_page and that font lands in part9 (second half) — pins the classic
 #   path's outline > first-page precedence (the ObjStm path already covered it).
+# useoutlines-shared-page-80-80 (flpdf-sft9): the same page∩outline overlap
+#   under /PageMode /UseOutlines; the overlapping font stays in part6 and must
+#   remain present in page 1's shared-object identifiers.
 # Pinned to linearize-classic.pdf to coexist with the ObjStm golden in the same dir.
 for stem in objstm-lin-outlines-80-80 objstm-lin-useoutlines-80-80 \
-    objstm-lin-outlines-shared-page-80-80; do
+    objstm-lin-outlines-shared-page-80-80 objstm-lin-useoutlines-shared-page-80-80; do
     mkdir -p "$REF/$stem"
     qpdf --linearize --deterministic-id --warning-exit-0 \
         "$FIX/$stem.pdf" "$REF/$stem/linearize-classic.pdf"

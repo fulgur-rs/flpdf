@@ -867,6 +867,27 @@ fn useoutlines_classic_byte_identical_to_qpdf() {
     );
 }
 
+// useoutlines-shared-page-80-80: the /PageMode /UseOutlines variant of the
+// page∩outline overlap fixture below. The shared /S1 font is physically in
+// part6 with the outline objects, but qpdf still records page 1's reference
+// to it in the Shared Object Hint Table. This is distinct from the ordinary
+// UseOutlines fixture above, which has no outline/page overlap.
+#[test]
+fn useoutlines_shared_page_classic_structurally_byte_identical_to_qpdf() {
+    assert_classic_structurally_byte_identical(
+        "objstm-lin-useoutlines-shared-page-80-80.pdf",
+        "objstm-lin-useoutlines-shared-page-80-80",
+    );
+}
+
+#[test]
+fn useoutlines_shared_page_classic_byte_identical_to_qpdf() {
+    assert_classic_byte_identical(
+        "objstm-lin-useoutlines-shared-page-80-80.pdf",
+        "objstm-lin-useoutlines-shared-page-80-80",
+    );
+}
+
 // outlines-shared-page-80-80: one font (the highest-numbered outline
 // object) is referenced by BOTH pages AND an outline item via /Extra. qpdf's
 // categorization (QPDF_linearization.cc:1120) ranks in_outlines above in_first_page,
