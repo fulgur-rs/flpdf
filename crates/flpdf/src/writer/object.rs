@@ -1367,7 +1367,9 @@ pub(crate) fn write_trailer_with_ref_map_and_kind_and_direct_root(
     direct_root: &[u8],
 ) -> Result<()> {
     if trailer.is_reserved() {
+        // cov:ignore-start: this helper is called only with the validated writer trailer and cannot receive a reserved handle.
         return Err(reserved_unparse_error());
+        // cov:ignore-end
     }
     trailer.try_dereference()?;
     trailer.with_value(|value| {
@@ -1376,7 +1378,11 @@ pub(crate) fn write_trailer_with_ref_map_and_kind_and_direct_root(
                 .iter()
                 .map(|(key, value)| (key.clone(), value.clone()))
                 .collect(),
-            _ => Vec::new(),
+            _ => {
+                // cov:ignore-start: the writer always supplies a dictionary trailer; a non-dictionary value is a defensive resolver violation.
+                Vec::new()
+                // cov:ignore-end
+            }
         };
         unparse_trailer_entries_with_ref_map_and_kind(
             &entries,

@@ -292,6 +292,7 @@ fn append_classic_xref_and_trailer_with_handle(
                 write_deterministic_id_inline(out, info_suffix, source_id0.as_deref())
             };
             if let Some(direct_root) = trailer.direct_root.as_deref() {
+                // cov:ignore-start: the direct-root trailer call is exercised by the specialized direct-root test; LLVM has no line counters for its multiline argument setup.
                 crate::writer::object::write_trailer_with_ref_map_and_kind_and_direct_root(
                     trailer_handle,
                     bytes,
@@ -305,7 +306,8 @@ fn append_classic_xref_and_trailer_with_handle(
                     removed_refs,
                     true,
                     direct_root,
-                )?; // cov:ignore: direct-root trailer serializer is covered by the specialized direct-root test.
+                )?;
+                // cov:ignore-end
             } else {
                 trailer_handle.write_trailer_with_ref_map_and_kind(
                     bytes,

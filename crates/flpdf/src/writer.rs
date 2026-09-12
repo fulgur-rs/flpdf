@@ -6145,6 +6145,7 @@ fn emit_specialized_standard_live<R: Read + Seek + 'static, W: Write>(
         .as_ref()
         .map(|root| {
             let mut map_ref = |handle: &ObjectHandle| {
+                // cov:ignore-start: every direct-root child in the live queue is an indirect handle with a body-map entry; these are defensive invariant failures.
                 let object_ref = handle.object_ref().ok_or_else(|| {
                     Error::Unsupported(
                         "specialized live writer: direct /Root child has no object identity"
@@ -6156,6 +6157,7 @@ fn emit_specialized_standard_live<R: Read + Seek + 'static, W: Write>(
                         "specialized live writer: direct /Root reference {object_ref} absent from queue"
                     ))
                 })
+                // cov:ignore-end
             };
             let mut write_string = |out: &mut Vec<u8>, value: &[u8]| {
                 crate::pdf_syntax::write_string_value(out, value);
@@ -6172,7 +6174,7 @@ fn emit_specialized_standard_live<R: Read + Seek + 'static, W: Write>(
                 &removed_refs,
                 &mut write_string,
                 &mut direct_stream_writer,
-            )?;
+            )?; // cov:ignore: the validated direct-root serializer is covered; LLVM attributes this multiline call continuation to callback cleanup.
             Ok::<_, Error>(bytes)
         })
         .transpose()?;
