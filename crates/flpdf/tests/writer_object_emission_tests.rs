@@ -240,6 +240,42 @@ fn qdf_and_normalize_progress_direct_root_child_gets_a_late_number() {
 }
 
 #[test]
+fn qdf_discovery_walks_a_direct_stream_dictionary_child() {
+    let mut pdf = Pdf::open(Cursor::new(
+        include_bytes!("../../../tests/fixtures/compat/one-page-no-ext.pdf").to_vec(),
+    ))
+    .unwrap();
+    let direct_stream = ObjectHandle::stream(
+        ObjectHandle::dictionary(vec![
+            (b"/Length".to_vec(), ObjectHandle::integer(4)),
+            (
+                b"/DirectQdfLabel".to_vec(),
+                ObjectHandle::string(b"direct".to_vec()),
+            ),
+        ]),
+        Rc::new(b"data".to_vec()),
+    );
+    pdf.root_handle()
+        .unwrap()
+        .replace_key(b"/DirectQdfStream", direct_stream)
+        .unwrap();
+
+    let mut writer = PdfWriter::new(&mut pdf);
+    writer.set_object_stream_mode(ObjectStreamMode::Disable);
+    writer.set_qdf_mode(true);
+    writer.set_static_id(true);
+    writer.set_output_memory().unwrap();
+    writer.write().unwrap();
+    let output = writer.get_buffer().unwrap();
+    assert!(output
+        .windows(b"/DirectQdfStream".len())
+        .any(|window| window == b"/DirectQdfStream"));
+    assert!(output
+        .windows(b"/DirectQdfLabel".len())
+        .any(|window| window == b"/DirectQdfLabel"));
+}
+
+#[test]
 fn qdf_crypt_cleanup_is_single_pass_for_stream_dictionary_state() {
     let mut pdf = Pdf::open(Cursor::new(
         include_bytes!("../../../tests/fixtures/compat/one-page-no-ext.pdf").to_vec(),

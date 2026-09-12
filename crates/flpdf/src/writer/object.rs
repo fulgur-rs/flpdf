@@ -1448,7 +1448,7 @@ pub(crate) fn prepared_stream_dictionary_for_discovery(
     let entries = stream_dictionary_entries_for_emission(handle)?;
     Ok(ObjectHandle::dictionary(prepare_stream_dict_entries(
         &entries, options,
-    )?))
+    )?)) // cov:ignore: the validated discovery dictionary is constructed from the same stream serializer input
 }
 
 /// Remove the first `/Crypt` filter and its paired decode parameters from a

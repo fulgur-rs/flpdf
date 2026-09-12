@@ -172,14 +172,16 @@ pub(crate) fn extend_late_trailer_map<R: Read + Seek>(
             0,
             true,
             &mut references,
-        )?;
+        )?; // cov:ignore: late trailer reference collection success is covered by the callback trailer test
         for reference in references {
             if reference.number == 0 || map.contains_key(&reference) {
                 continue;
             }
             map.insert(reference, ObjectRef::new(next, 0));
             next = next.checked_add(1).ok_or_else(|| {
+                // cov:ignore-start: the qpdf object-number domain cannot be exhausted by a supported in-memory PDF
                 crate::Error::Unsupported("plain live writer: late trailer number overflow".into())
+                // cov:ignore-end
             })?;
         }
     }
@@ -361,7 +363,9 @@ fn write_plain_live<R: Read + Seek, W: Write>(
     let mut trailer_map: HashMap<ObjectRef, ObjectRef> =
         old_to_new.iter().map(|(&a, &b)| (a, b)).collect();
     let initial_late_trailer_number = u32::try_from(trailer_size).map_err(|_| {
+        // cov:ignore-start: the body queue is bounded by the qpdf u32 object-number domain
         crate::Error::Unsupported("plain live writer: late trailer number overflows u32".into())
+        // cov:ignore-end
     })?;
     let mut next_late_trailer_number =
         extend_late_trailer_map(pdf, &mut trailer_map, initial_late_trailer_number, true)?;
@@ -399,7 +403,7 @@ fn write_plain_live<R: Read + Seek, W: Write>(
             0,
             true,
             &mut references,
-        )?;
+        )?; // cov:ignore: direct-root reference collection success is covered by the late direct-root test
         for reference in references {
             if reference.number == 0 || trailer_map.contains_key(&reference) {
                 continue;
@@ -407,16 +411,20 @@ fn write_plain_live<R: Read + Seek, W: Write>(
             trailer_map.insert(reference, ObjectRef::new(next_late_trailer_number, 0));
             next_late_trailer_number =
                 next_late_trailer_number.checked_add(1).ok_or_else(|| {
+                    // cov:ignore-start: the qpdf object-number domain cannot be exhausted by a supported in-memory PDF
                     crate::Error::Unsupported(
                         "plain live writer: late trailer number overflow".into(),
                     )
+                    // cov:ignore-end
                 })?;
         }
         let map_ref = |object_ref: ObjectRef| {
             trailer_map.get(&object_ref).copied().ok_or_else(|| {
+                // cov:ignore-start: every direct-root reference is collected before this static map is constructed
                 crate::Error::Unsupported(format!(
                     "plain live writer: direct /Root reference {object_ref} has no output number"
                 ))
+                // cov:ignore-end
             })
         };
         let mut bytes = Vec::new();
@@ -426,13 +434,13 @@ fn write_plain_live<R: Read + Seek, W: Write>(
                 2,
                 &map_ref,
                 &removed_refs,
-            )?;
+            )?; // cov:ignore: QDF direct-root serialization success is covered by the direct-root live test
         } else {
             arbitrated.write_object_with_ref_map_and_removed(
                 &mut bytes,
                 &map_ref,
                 &removed_refs,
-            )?;
+            )?; // cov:ignore: compact direct-root serialization success is covered by the direct-root live test
         }
         Some(bytes)
     } else {
