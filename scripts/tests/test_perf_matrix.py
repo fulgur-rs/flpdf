@@ -73,7 +73,7 @@ class MeasurementContracts(unittest.TestCase):
             self.assertTrue(sample["timeout"])
             self.assertNotEqual(sample["exit_status"], 0)
             self.assertLess(sample["wall_seconds"], 5)
-            self.assertFalse(perf.validate_sample(sample, "check", None, None, 1, 10)["ok"])
+            self.assertFalse(perf.validate_sample(sample, "check", None, None, 1, "pages", 10)["ok"])
 
     def test_successful_exit_with_invalid_json_is_rejected(self):
         with tempfile.TemporaryDirectory() as tmp:
@@ -81,11 +81,30 @@ class MeasurementContracts(unittest.TestCase):
             sample = {"exit_status": 0, "max_rss_kib": 100, "stdout": str(output)}
             for body in ("not json", "{}", "[]"):
                 output.write_text(body)
-                self.assertFalse(perf.validate_sample(sample, "json", None, None, 1, 10)["ok"])
+                self.assertFalse(perf.validate_sample(sample, "json", None, None, 1, "pages", 10)["ok"])
+
+    def test_json_payload_must_contain_the_benchmarked_objects(self):
+        """A constant `{"qpdf": []}` must not pass as a serialized document."""
+        with tempfile.TemporaryDirectory() as tmp:
+            output = Path(tmp) / "output"
+            sample = {"exit_status": 0, "max_rss_kib": 100, "stdout": str(output)}
+            output.write_text('{"qpdf": []}')
+            self.assertFalse(
+                perf.validate_sample(sample, "json", None, None, 1, "pages", 10)["ok"])
+            output.write_text('{"qpdf": [{"obj:1 0 R": {"value": {"/Bench": true}}}]}')
+            self.assertTrue(
+                perf.validate_sample(sample, "json", None, None, 1, "pages", 10)["ok"])
+
+    def test_marker_check_requires_the_embedded_file_tree_for_streams(self):
+        perf.require_markers("/Bench /EmbeddedFiles", "stream")
+        perf.require_markers("/Bench", "pages")
+        for serialized, family in (("/Bench", "stream"), ("", "pages"), ("/EmbeddedFiles", "objects")):
+            with self.assertRaises(ValueError):
+                perf.require_markers(serialized, family)
 
     def test_zero_rss_cannot_be_reported_as_memory_improvement(self):
         sample = {"exit_status": 0, "max_rss_kib": 0}
-        self.assertFalse(perf.validate_sample(sample, "check", None, None, 1, 10)["ok"])
+        self.assertFalse(perf.validate_sample(sample, "check", None, None, 1, "pages", 10)["ok"])
 
     def test_pdf_recipe_offsets_and_reachability(self):
         with tempfile.TemporaryDirectory() as tmp:

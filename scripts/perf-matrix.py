@@ -193,7 +193,21 @@ def command_for(binary, operation, source, output):
     return args
 
 
-def validate_sample(sample, operation, output, qpdf, expected_pages, timeout):
+def require_markers(serialized, family):
+    """The measured objects must survive, or a writer that drops them scores well.
+
+    `generate_pdf` reaches every benchmarked object from the Catalog: each page
+    carries `/Bench`, `objects` adds a Catalog `/Bench` array, and `stream` adds
+    an `/EmbeddedFiles` name tree. Readability and page count alone accept an
+    output that silently discarded them.
+    """
+    markers = ["/Bench"] + (["/EmbeddedFiles"] if family == "stream" else [])
+    missing = [marker for marker in markers if marker not in serialized]
+    if missing:
+        raise ValueError("output dropped benchmark objects: " + ",".join(missing))
+
+
+def validate_sample(sample, operation, output, qpdf, expected_pages, family, timeout):
     if sample["exit_status"] or sample.get("timeout") or not sample["max_rss_kib"]:
         return {"ok": False, "reason": "command failed or metrics missing"}
     try:
@@ -206,6 +220,7 @@ def validate_sample(sample, operation, output, qpdf, expected_pages, timeout):
                 obj = json.load(stream)
             if not isinstance(obj, dict) or not isinstance(obj.get("qpdf"), list):
                 raise ValueError("missing qpdf JSON payload")
+            require_markers(artifact.read_text(errors="replace"), family)
         elif operation != "check":
             checked = subprocess.run([str(qpdf), "--check", str(output)], capture_output=True,
                                      env=ENV, timeout=timeout)
@@ -213,6 +228,7 @@ def validate_sample(sample, operation, output, qpdf, expected_pages, timeout):
                 raise ValueError("output qpdf --check: " + checked.stderr.decode(errors="replace"))
             if int(capture([qpdf, "--show-npages", output])) != expected_pages:
                 raise ValueError("output page count mismatch")
+            require_markers(capture([qpdf, "--json=2", output]), family)
         return {"ok": True, "bytes": artifact.stat().st_size, "sha256": digest(artifact)}
     except (ValueError, OSError, subprocess.SubprocessError) as error:
         return {"ok": False, "reason": str(error)}
@@ -234,7 +250,7 @@ def benchmark_case(source, operation, binaries, args, out):
             sample = measure(command_for(binaries[name], operation, source["path"], output),
                              directory, f"{name}-{phase}-{index}", args.timeout)
             sample["validation"] = validate_sample(sample, operation, output, binaries["qpdf"],
-                                                   source["pages"], args.timeout)
+                                                   source["pages"], source["family"], args.timeout)
             if phase == "first":
                 row["samples"][name][phase] = sample
             else:
