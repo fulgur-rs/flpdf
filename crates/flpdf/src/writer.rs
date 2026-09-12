@@ -2422,7 +2422,7 @@ pub(crate) fn snapshot_catalog_extensions<R: Read + Seek>(
         .and_then(|dict| dict.get(b"/Extensions".as_slice()).cloned());
     let restoration = extensions
         .as_ref()
-        .map(ObjectHandle::shallow_copy)
+        .map(ObjectHandle::unsafe_shallow_copy)
         .transpose()?;
     Ok(Some(CatalogExtensionsSnapshot {
         root_ref,
@@ -5137,6 +5137,48 @@ mod final_handle_writer_tests {
                 if message.contains("param-dict object number")
                     && message.contains("exceeds /Size")
         ));
+    }
+
+    #[test]
+    fn direct_root_catalog_extension_restore_accepts_a_missing_snapshot() {
+        let mut pdf = Pdf::open(Cursor::new(
+            include_bytes!("../../../tests/fixtures/compat/direct-root-one-page.pdf").to_vec(),
+        ))
+        .expect("direct-root fixture");
+        let snapshot = snapshot_catalog_extensions(&mut pdf).expect("snapshot direct root");
+        assert!(
+            snapshot.is_none(),
+            "an inline Catalog has no restoration snapshot"
+        );
+        restore_catalog_extensions(&mut pdf, snapshot).expect("restore absent snapshot");
+    }
+
+    #[test]
+    fn catalog_extension_snapshot_restore_preserves_direct_child_identity() {
+        let mut pdf = Pdf::open(Cursor::new(
+            include_bytes!("../../../tests/fixtures/compat/one-page-ext-indirect.pdf").to_vec(),
+        ))
+        .expect("indirect-extensions fixture");
+        prepare_file_for_write(&mut pdf).expect("prepare writer graph");
+        let root = pdf.root_handle().expect("Catalog handle");
+        let extensions = root.try_get_key(b"/Extensions").expect("Extensions handle");
+        let adbe = extensions.try_get_key(b"/ADBE").expect("ADBE handle");
+        let snapshot = snapshot_catalog_extensions(&mut pdf).expect("snapshot extensions");
+
+        extensions.remove_key(b"/ADBE");
+        restore_catalog_extensions(&mut pdf, snapshot).expect("restore extensions");
+
+        let restored = pdf
+            .root_handle()
+            .expect("restored Catalog")
+            .try_get_key(b"/Extensions")
+            .expect("restored Extensions")
+            .try_get_key(b"/ADBE")
+            .expect("restored ADBE");
+        assert!(
+            restored.is_same_object_as(&adbe),
+            "restoring output-only Extensions must preserve direct child handle identity"
+        );
     }
 
     #[test]
