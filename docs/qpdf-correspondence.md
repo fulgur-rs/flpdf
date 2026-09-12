@@ -2488,9 +2488,14 @@ warning text の `-> dictionary key $VD` を組み立てるための診断文脈
 containment root の逆引きではない（`QPDFValue.hh:41-58,74-84`;
 `QPDFObject_private.hh:77-92`）。したがって flpdf の
 `ObjectSlot::containment_parents` は qpdf に対応物のない reverse edge として
-module内で `qpdf-deviation` を明示する。ただし全readerは `cfg(test)` の
-current containment-root assertion と teardown safety netに限られ、本番の
-ownership・warning・writer scheduling・output bytesを決めない。qpdfのforward
+module内で `qpdf-deviation` を明示する。**逆引き（lookup）**は
+`containing_object_refs`/`containing_object_refs_for_pdf`（いずれも `#[cfg(test)]`）
+による current containment-root assertion と teardown safety net に限られるが、
+**edge の保守（attach/detach）は本番ビルドでも走る**——
+`attach_child_to_parent` が entry を push し、`detach_child_from_parent` が
+state 置換・swap・削除・array/dictionary 変更の際に走査して remove する。
+この bookkeeping は ownership・warning・writer scheduling・output bytes を
+決めない。qpdfのforward
 teardown（`QPDF.cc:215-235`; `QPDF_Array.cc:103-119`; `QPDF_Dictionary.cc:51-56`）
 や `active_pdf_unique_id` の単一owner表現とは混同しない。
 
