@@ -615,13 +615,13 @@ jobs:
         with:
           shared-key: ubuntu-latest-flpdf-qtest
 
-      # TODO: replace with the flpdf-qtest commit that action.yml lands on,
-      # once fulgur-rs/flpdf-qtest#172 has merged. The ordering is
-      # load-bearing -- the action has to exist on flpdf-qtest main before
-      # this workflow names it, or every pull request here fails on a missing
-      # action. This placeholder keeps that mistake unmergeable.
+      # Pinned by SHA, like every other action here. What used to make
+      # pinning flpdf-qtest impractical was its parity ledger -- promotions
+      # are most of its commit traffic -- but the baseline above replaced any
+      # need to track that, so this pin only moves when the vendored corpus or
+      # the harness scripts change.
       - name: Run the qtest survey
-        uses: fulgur-rs/flpdf-qtest@REPLACE_WITH_MERGED_SHA
+        uses: fulgur-rs/flpdf-qtest@50c1652b166b1141263ac9ac93ae0adfa2669961 # v1
         with:
           baseline: .github/qtest-baseline.jsonl
           # Red when a regression appears, never blocking: continue-on-error
