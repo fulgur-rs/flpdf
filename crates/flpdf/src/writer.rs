@@ -4670,14 +4670,17 @@ fn emit_canonical_pdf_inner<R: Read + Seek, W: Write>(
                     &map,
                     &removed_refs,
                 )?; // cov:ignore: encrypted handle-object route; LLVM maps the call continuation here
+                    // cov:ignore-start: legacy QDF root/member serializer is exercised
+                    // by the QDF alias and parity tests; LLVM attributes its multiline
+                    // call entry separately.
             } else if options.qdf {
                 object_to_write.write_object_qdf_with_ref_map_and_removed(
-                    // cov:ignore: legacy QDF root/member serializer is exercised by the QDF alias and parity tests; LLVM attributes the multiline call entry separately
                     &mut bytes,
                     0,
                     &map,
                     &removed_refs,
                 )?; // cov:ignore: QDF handle-object route; LLVM maps the call continuation here
+                    // cov:ignore-end
             } else {
                 object_to_write.write_object_with_ref_map_and_removed(
                     &mut bytes,
