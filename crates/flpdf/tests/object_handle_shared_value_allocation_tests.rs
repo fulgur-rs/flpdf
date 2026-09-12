@@ -1,38 +1,16 @@
 use flpdf::ObjectHandle;
 use std::alloc::{GlobalAlloc, Layout, System};
+use std::cell::Cell;
 use std::rc::Rc;
-use std::sync::atomic::{AtomicBool, AtomicIsize, AtomicUsize, Ordering};
-
-static COUNTING: AtomicBool = AtomicBool::new(false);
-static ALLOCATIONS: AtomicUsize = AtomicUsize::new(0);
-static ALLOCATED_BYTES: AtomicUsize = AtomicUsize::new(0);
 
 const SIZE_CLASS_COUNT: usize = 6;
-static LIVE_BYTES: AtomicIsize = AtomicIsize::new(0);
-static LIVE_SIZE_CLASS_BYTES: [AtomicIsize; SIZE_CLASS_COUNT] = [
-    AtomicIsize::new(0),
-    AtomicIsize::new(0),
-    AtomicIsize::new(0),
-    AtomicIsize::new(0),
-    AtomicIsize::new(0),
-    AtomicIsize::new(0),
-];
-static SIZE_CLASS_ALLOCATIONS: [AtomicUsize; SIZE_CLASS_COUNT] = [
-    AtomicUsize::new(0),
-    AtomicUsize::new(0),
-    AtomicUsize::new(0),
-    AtomicUsize::new(0),
-    AtomicUsize::new(0),
-    AtomicUsize::new(0),
-];
-static SIZE_CLASS_BYTES: [AtomicUsize; SIZE_CLASS_COUNT] = [
-    AtomicUsize::new(0),
-    AtomicUsize::new(0),
-    AtomicUsize::new(0),
-    AtomicUsize::new(0),
-    AtomicUsize::new(0),
-    AtomicUsize::new(0),
-];
+
+thread_local! {
+    // libtest's coordinator can allocate even when this binary has one test.
+    // Constant, drop-free TLS avoids allocating or registering a destructor
+    // from inside GlobalAlloc. Only the measuring thread records events.
+    static MEASUREMENT: Cell<Option<AllocationMeasurement>> = const { Cell::new(None) };
+}
 
 #[derive(Clone, Copy, Debug)]
 struct AllocationMeasurement {
@@ -42,12 +20,6 @@ struct AllocationMeasurement {
     size_class_bytes: [usize; SIZE_CLASS_COUNT],
     live_bytes: isize,
     live_size_class_bytes: [isize; SIZE_CLASS_COUNT],
-}
-
-#[derive(Clone, Copy, Debug)]
-struct LiveAllocationSnapshot {
-    bytes: isize,
-    size_class_bytes: [isize; SIZE_CLASS_COUNT],
 }
 
 struct CountingAllocator;
@@ -97,95 +69,78 @@ fn size_class(size: usize) -> usize {
     }
 }
 
-fn adjust_live_bytes(size: usize, direction: isize) {
-    let bytes = isize::try_from(size).expect("GlobalAlloc layout must fit in isize");
-    LIVE_BYTES.fetch_add(bytes * direction, Ordering::Relaxed);
-    LIVE_SIZE_CLASS_BYTES[size_class(size)].fetch_add(bytes * direction, Ordering::Relaxed);
+impl AllocationMeasurement {
+    const ZERO: Self = Self {
+        allocations: 0,
+        allocated_bytes: 0,
+        size_class_allocations: [0; SIZE_CLASS_COUNT],
+        size_class_bytes: [0; SIZE_CLASS_COUNT],
+        live_bytes: 0,
+        live_size_class_bytes: [0; SIZE_CLASS_COUNT],
+    };
+
+    fn adjust_live_bytes(&mut self, size: usize, direction: isize) {
+        // GlobalAlloc layouts fit in isize. These are net bytes allocated and
+        // freed on this thread during the window, not process-wide live heap.
+        let bytes = size as isize * direction;
+        self.live_bytes += bytes;
+        self.live_size_class_bytes[size_class(size)] += bytes;
+    }
+
+    fn record_allocation(&mut self, size: usize) {
+        let class = size_class(size);
+        self.allocations += 1;
+        self.allocated_bytes += size;
+        self.size_class_allocations[class] += 1;
+        self.size_class_bytes[class] += size;
+        self.adjust_live_bytes(size, 1);
+    }
+}
+
+fn update_measurement(update: impl FnOnce(&mut AllocationMeasurement)) {
+    // Allocator callbacks may also run during thread teardown. If TLS is no
+    // longer accessible, leave System's allocation/deallocation unaffected.
+    let _ = MEASUREMENT.try_with(|state| {
+        if let Some(mut measurement) = state.get() {
+            update(&mut measurement);
+            state.set(Some(measurement));
+        }
+    });
 }
 
 fn record_allocation(size: usize) {
-    adjust_live_bytes(size, 1);
-    if !COUNTING.load(Ordering::Relaxed) {
-        return;
-    }
-
-    record_allocation_event(size);
-}
-
-fn record_allocation_event(size: usize) {
-    let class = size_class(size);
-    ALLOCATIONS.fetch_add(1, Ordering::Relaxed);
-    ALLOCATED_BYTES.fetch_add(size, Ordering::Relaxed);
-    SIZE_CLASS_ALLOCATIONS[class].fetch_add(1, Ordering::Relaxed);
-    SIZE_CLASS_BYTES[class].fetch_add(size, Ordering::Relaxed);
+    update_measurement(|measurement| measurement.record_allocation(size));
 }
 
 fn record_deallocation(size: usize) {
-    adjust_live_bytes(size, -1);
+    update_measurement(|measurement| measurement.adjust_live_bytes(size, -1));
 }
 
 fn record_reallocation(old_size: usize, new_size: usize) {
-    adjust_live_bytes(old_size, -1);
-    // GlobalAlloc::realloc requires a non-zero new size from its caller. Keep
-    // the zero-size branch explicit so a successful zero-size extension does
-    // not create a phantom live size class or event allocation.
-    if new_size != 0 {
-        adjust_live_bytes(new_size, 1);
-        if COUNTING.load(Ordering::Relaxed) {
-            record_allocation_event(new_size);
-        }
-    }
+    update_measurement(|measurement| {
+        measurement.adjust_live_bytes(old_size, -1);
+        measurement.record_allocation(new_size);
+    });
 }
 
-fn live_snapshot() -> LiveAllocationSnapshot {
-    let mut size_class_bytes = [0; SIZE_CLASS_COUNT];
-    for class in 0..SIZE_CLASS_COUNT {
-        size_class_bytes[class] = LIVE_SIZE_CLASS_BYTES[class].load(Ordering::Relaxed);
-    }
-    LiveAllocationSnapshot {
-        bytes: LIVE_BYTES.load(Ordering::Relaxed),
-        size_class_bytes,
-    }
-}
+struct MeasurementGuard;
 
-fn reset_measurement() -> LiveAllocationSnapshot {
-    ALLOCATIONS.store(0, Ordering::Relaxed);
-    ALLOCATED_BYTES.store(0, Ordering::Relaxed);
-    for class in 0..SIZE_CLASS_COUNT {
-        SIZE_CLASS_ALLOCATIONS[class].store(0, Ordering::Relaxed);
-        SIZE_CLASS_BYTES[class].store(0, Ordering::Relaxed);
+impl Drop for MeasurementGuard {
+    fn drop(&mut self) {
+        MEASUREMENT.with(|state| state.set(None));
     }
-    live_snapshot()
 }
 
 fn measure_construction<T>(call: impl FnOnce() -> T) -> (T, AllocationMeasurement) {
-    let baseline = reset_measurement();
-    COUNTING.store(true, Ordering::Relaxed);
+    MEASUREMENT.with(|state| {
+        assert!(state.get().is_none(), "allocation measurements cannot nest");
+        state.set(Some(AllocationMeasurement::ZERO));
+    });
+    // Stop recording on unwind as well as on success.
+    let _guard = MeasurementGuard;
     let value = call();
-    COUNTING.store(false, Ordering::Relaxed);
-    let after = live_snapshot();
-
-    let mut size_class_allocations = [0; SIZE_CLASS_COUNT];
-    let mut size_class_bytes = [0; SIZE_CLASS_COUNT];
-    let mut live_size_class_bytes = [0; SIZE_CLASS_COUNT];
-    for class in 0..SIZE_CLASS_COUNT {
-        size_class_allocations[class] = SIZE_CLASS_ALLOCATIONS[class].load(Ordering::Relaxed);
-        size_class_bytes[class] = SIZE_CLASS_BYTES[class].load(Ordering::Relaxed);
-        live_size_class_bytes[class] =
-            after.size_class_bytes[class] - baseline.size_class_bytes[class];
-    }
-
-    (
-        value,
-        AllocationMeasurement {
-            allocations: ALLOCATIONS.load(Ordering::Relaxed),
-            allocated_bytes: ALLOCATED_BYTES.load(Ordering::Relaxed),
-            size_class_allocations,
-            size_class_bytes,
-            live_bytes: after.bytes - baseline.bytes,
-            live_size_class_bytes,
-        },
-    )
+    let measurement = MEASUREMENT.with(|state| state.take().unwrap());
+    (value, measurement)
 }
 
 fn report_measurement(label: &str, measurement: AllocationMeasurement) {
@@ -231,6 +186,112 @@ fn report_measurement(label: &str, measurement: AllocationMeasurement) {
 }
 
 #[test]
+fn measurement_excludes_other_threads() {
+    use std::sync::atomic::{AtomicBool, Ordering};
+
+    // Barrier/Condvar can lazily allocate on platforms such as macOS. Keep
+    // synchronization inside the measuring window allocation-free too.
+    fn wait_for(signal: &AtomicBool) {
+        while !signal.load(Ordering::Acquire) {
+            std::thread::yield_now();
+        }
+    }
+
+    let start = AtomicBool::new(false);
+    let allocated = AtomicBool::new(false);
+    let finish = AtomicBool::new(false);
+    std::thread::scope(|scope| {
+        let worker = scope.spawn(|| {
+            wait_for(&start);
+            let temporary = std::hint::black_box(Box::new([0_u8; 96]));
+            let mut noise = std::hint::black_box(vec![0_u8; 96]);
+            noise.resize(2048, 0);
+            std::hint::black_box(&noise);
+            drop(temporary);
+            allocated.store(true, Ordering::Release);
+            wait_for(&finish);
+            drop(noise);
+        });
+        let (value, measurement) = measure_construction(|| {
+            start.store(true, Ordering::Release);
+            wait_for(&allocated);
+            std::hint::black_box(Box::new([0_u8; 32]))
+        });
+        // Release the worker before asserting, including on failure.
+        finish.store(true, Ordering::Release);
+        worker.join().unwrap();
+        std::hint::black_box(&value);
+        assert_eq!(measurement.allocations, 1, "{measurement:?}");
+        assert_eq!(measurement.allocated_bytes, 32);
+        assert_eq!(measurement.live_bytes, 32);
+        assert_eq!(measurement.size_class_allocations, [1, 0, 0, 0, 0, 0]);
+        assert_eq!(measurement.size_class_bytes, [32, 0, 0, 0, 0, 0]);
+        assert_eq!(measurement.live_size_class_bytes, [32, 0, 0, 0, 0, 0]);
+    });
+}
+
+#[test]
+fn measurement_tracks_allocation_reallocation_and_frees() {
+    use std::alloc::{alloc, alloc_zeroed, dealloc, handle_alloc_error, realloc};
+
+    let small = Layout::from_size_align(32, 8).unwrap();
+    let medium = Layout::from_size_align(96, 8).unwrap();
+    let large = Layout::from_size_align(2048, 8).unwrap();
+    let fixture_layout = Layout::from_size_align(513, 8).unwrap();
+    // Every allocation below is checked and freed with its current layout;
+    // the realloc result replaces the original pointer on success.
+    unsafe {
+        let fixture = alloc(fixture_layout);
+        if fixture.is_null() {
+            handle_alloc_error(fixture_layout);
+        }
+        let (value, measurement) = measure_construction(|| {
+            let value = alloc(small);
+            if value.is_null() {
+                handle_alloc_error(small);
+            }
+            let zeroed = alloc_zeroed(medium);
+            if zeroed.is_null() {
+                handle_alloc_error(medium);
+            }
+            let value = realloc(value, small, large.size());
+            if value.is_null() {
+                handle_alloc_error(large);
+            }
+            dealloc(zeroed, medium);
+            dealloc(fixture, fixture_layout);
+            value
+        });
+        dealloc(value, large);
+
+        assert_eq!(measurement.allocations, 3);
+        assert_eq!(measurement.allocated_bytes, 2176);
+        assert_eq!(measurement.live_bytes, 1535);
+        assert_eq!(measurement.size_class_allocations, [1, 1, 0, 0, 0, 1]);
+        assert_eq!(measurement.size_class_bytes, [32, 96, 0, 0, 0, 2048]);
+        assert_eq!(measurement.live_size_class_bytes, [0, 0, 0, 0, -513, 2048]);
+    }
+    let (_, empty) = measure_construction(|| ());
+    assert_eq!(empty.allocations, 0);
+    assert_eq!(empty.allocated_bytes, 0);
+    assert_eq!(empty.live_bytes, 0);
+    assert_eq!(empty.size_class_allocations, [0; SIZE_CLASS_COUNT]);
+    assert_eq!(empty.size_class_bytes, [0; SIZE_CLASS_COUNT]);
+    assert_eq!(empty.live_size_class_bytes, [0; SIZE_CLASS_COUNT]);
+}
+
+#[test]
+fn measurement_stops_on_unwind() {
+    let result = std::panic::catch_unwind(|| measure_construction(|| panic!("measurement probe")));
+    assert!(result.is_err());
+    let (value, measurement) = measure_construction(|| std::hint::black_box(Box::new([0_u8; 32])));
+    std::hint::black_box(&value);
+    assert_eq!(measurement.allocations, 1);
+    assert_eq!(measurement.allocated_bytes, 32);
+    assert_eq!(measurement.live_bytes, 32);
+}
+
+#[test]
 fn direct_scalar_uses_at_most_three_allocations() {
     const WIDE_ITEMS: usize = 128;
     const STREAM_BYTES: usize = 64 * 1024;
@@ -247,8 +308,8 @@ fn direct_scalar_uses_at_most_three_allocations() {
     );
 
     // Allocate fixtures before resetting the counters so every reported number
-    // covers construction, not test-data preparation. This integration binary
-    // deliberately has one test, keeping its process-global allocator isolated.
+    // covers construction, not test-data preparation. Thread-local measurement
+    // also excludes allocations and frees from libtest and other tests.
     let values = (0..WIDE_ITEMS)
         .map(|value| value as i64)
         .collect::<Vec<_>>();
