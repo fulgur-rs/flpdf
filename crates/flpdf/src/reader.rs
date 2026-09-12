@@ -1227,6 +1227,13 @@ impl<R: Read + Seek> Pdf<R> {
         Ok(())
     }
 
+    /// Return whether qpdf's live object cache has a newer generation for this
+    /// object number. The writer's compressible walk uses this dynamic lookup
+    /// rather than an xref-only snapshot (`QPDF.cc:2423-2430`).
+    pub(crate) fn has_newer_cached_generation(&self, object_ref: ObjectRef) -> bool {
+        self.resolver.has_newer_cached_generation(object_ref)
+    }
+
     pub(crate) fn is_canonical_object_handle(&self, handle: &ObjectHandle) -> bool {
         handle.qpdf_obj_gen().is_some_and(|object_gen| {
             self.resolver

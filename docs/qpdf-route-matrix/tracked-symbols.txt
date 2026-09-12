@@ -102,7 +102,7 @@ crates/flpdf/src/object_handle.rs::ObjectHandle::try_get_key             # A8 ca
 crates/flpdf/src/reader/resolver.rs::get_object_count                    # A11 canonical count owner
 crates/flpdf/src/reader/resolver.rs::next_obj_gen                        # A11 canonical
 crates/flpdf/src/reader/resolver.rs::make_indirect_from_object_handle    # A12 canonical
-crates/flpdf/src/reader/resolver.rs::remove_object                       # A13 canonical（prod 1 / test 3）
+crates/flpdf/src/reader/resolver.rs::remove_object                       # A13 canonical（prod 1 / test 2）
 crates/flpdf/src/reader.rs::Pdf::replace_object                          # A16（facade+canonical 合流）
 crates/flpdf/src/reader.rs::Pdf::swap_objects                            # A17（facade+canonical 合流）
 crates/flpdf/src/reader/resolver.rs::disconnect_all                      # A20 canonical

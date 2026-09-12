@@ -1827,6 +1827,21 @@ impl<R: Read + Seek> ResolverHandle<R> {
         Ok(())
     }
 
+    /// Whether qpdf's live cache upper_bound finds a newer generation of this
+    /// number. This is the per-object test in `getCompressibleObjGens`
+    /// (`libqpdf/QPDF.cc:2423-2430`), including cached dangling references
+    /// that do not have an effective xref row.
+    pub(crate) fn has_newer_cached_generation(&self, object_ref: ObjectRef) -> bool {
+        use std::ops::Bound::{Excluded, Unbounded};
+        let object_gen = QpdfObjGen::from_object_ref(object_ref);
+        self.core
+            .borrow()
+            .object_cache
+            .range((Excluded(object_gen), Unbounded))
+            .next()
+            .is_some_and(|(next, _)| next.get_obj() == i64::from(object_ref.number))
+    }
+
     /// Remove the exact source row, nullify retained aliases, then erase the cache slot.
     ///
     /// Matches `QPDF::removeObject` (`libqpdf/QPDF.cc:1996-2005`). Removing a

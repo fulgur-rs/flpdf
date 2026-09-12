@@ -283,3 +283,65 @@ fn generate_indirect_extensions_matches_qpdf_before_prepare_file_for_write() {
         }
     }
 }
+
+#[cfg(feature = "qpdf-zlib-compat")]
+#[test]
+fn generate_dangling_higher_generation_matches_qpdf_live_cache_lookup() {
+    let mut source =
+        include_bytes!("../../../tests/fixtures/compat/compressible-stale-generation-alias.pdf")
+            .to_vec();
+    let object_header = b"3 1 obj";
+    let object_header_offset = source
+        .windows(object_header.len())
+        .position(|window| window == object_header)
+        .expect("fixture contains the source object header");
+    source[object_header_offset..object_header_offset + object_header.len()]
+        .copy_from_slice(b"3 0 obj");
+    let xref_entry = b"0000000134 00001 n ";
+    let xref_offset = source
+        .windows(xref_entry.len())
+        .position(|window| window == xref_entry)
+        .expect("fixture contains the source xref entry");
+    source[xref_offset..xref_offset + xref_entry.len()].copy_from_slice(b"0000000134 00000 n ");
+
+    let temporary = tempfile::tempdir().unwrap();
+    let input = temporary.path().join("input.pdf");
+    let qpdf_output = temporary.path().join("qpdf.pdf");
+    fs::write(&input, &source).unwrap();
+    let qpdf = Command::new("qpdf")
+        .args(["--static-id", "--object-streams=generate"])
+        .arg(&input)
+        .arg(&qpdf_output)
+        .output()
+        .unwrap();
+    assert!(
+        qpdf.status.success(),
+        "qpdf Generate rewrite failed: {}",
+        String::from_utf8_lossy(&qpdf.stderr)
+    );
+
+    let mut pdf = Pdf::open(Cursor::new(source)).unwrap();
+    let old = pdf
+        .root_handle()
+        .unwrap()
+        .try_get_key(b"/Versions")
+        .unwrap()
+        .try_get_array_item(0)
+        .unwrap();
+    let mut writer = PdfWriter::new(&mut pdf);
+    writer.set_object_stream_mode(ObjectStreamMode::Generate);
+    writer.set_static_id(true);
+    writer.set_output_memory().unwrap();
+    writer.write().unwrap();
+
+    assert_eq!(
+        writer.get_buffer().unwrap(),
+        fs::read(&qpdf_output).unwrap(),
+        "Generate must consult the live cache for dangling higher generations"
+    );
+    assert!(old.is_direct(), "qpdf removes the superseded cached object");
+    assert!(
+        old.is_null(),
+        "the removed cached object becomes a direct null"
+    );
+}
