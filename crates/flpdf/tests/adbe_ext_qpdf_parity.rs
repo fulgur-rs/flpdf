@@ -16,7 +16,7 @@
 //! Fixtures are content-stream-free, so byte-identity is independent of the
 //! deflate backend — this file is NOT gated on `qpdf-zlib-compat`.
 
-use flpdf::{EncryptParams, NewlineBeforeEndstream, ObjectStreamMode, Pdf};
+use flpdf::{EncryptParams, NewlineBeforeEndstream, ObjectStreamMode, Pdf, PdfOpenOptions};
 use std::path::Path;
 
 /// STRIP-side WriterTestSettings (plain full rewrite, qpdf-matching newline/id).
@@ -584,6 +584,106 @@ fn encrypted_qdf_content_streams_match_qpdf() {
         std::fs::read(&qpdf_output).expect("read qpdf encrypted QDF content output"),
         "encrypted QDF content stream parity"
     );
+}
+
+#[cfg(feature = "qpdf-zlib-compat")]
+#[test]
+fn encrypted_input_decrypt_qdf_and_normalize_match_qpdf() {
+    use std::process::Command;
+
+    if !Command::new("qpdf")
+        .arg("--version")
+        .output()
+        .is_ok_and(|result| result.status.success())
+    {
+        eprintln!("qpdf is unavailable; skipping encrypted-input decrypt parity");
+        return;
+    }
+
+    let input = Path::new(env!("CARGO_MANIFEST_DIR"))
+        .join("../../tests/fixtures/compat/adbe-orphan-url.pdf");
+    let temporary = tempfile::tempdir().expect("create qpdf comparison directory");
+    let encrypted_source = temporary.path().join("encrypted-source.pdf");
+    let encrypted = Command::new("qpdf")
+        .args([
+            "--static-id",
+            "--static-aes-iv",
+            "--object-streams=disable",
+            "--force-version=1.7.8",
+            "--stream-data=uncompress",
+            "--encrypt",
+            "u",
+            "o",
+            "128",
+            "--use-aes=y",
+            "--",
+        ])
+        .arg(&input)
+        .arg(&encrypted_source)
+        .output()
+        .expect("create encrypted qpdf source");
+    assert!(
+        encrypted.status.success(),
+        "qpdf encryption failed: {encrypted:?}"
+    );
+
+    for qdf in [true, false] {
+        let output_path = temporary.path().join(if qdf {
+            "qpdf-decrypt-qdf.pdf"
+        } else {
+            "qpdf-decrypt-normalize.pdf"
+        });
+        let mut qpdf = Command::new("qpdf");
+        qpdf.args([
+            "--password=u",
+            "--decrypt",
+            "--static-id",
+            "--object-streams=disable",
+            "--force-version=1.7.8",
+            "--stream-data=uncompress",
+        ]);
+        if qdf {
+            qpdf.arg("--qdf");
+        } else {
+            qpdf.arg("--normalize-content=y");
+        }
+        let decrypted = qpdf
+            .arg(&encrypted_source)
+            .arg(&output_path)
+            .output()
+            .expect("run qpdf encrypted-input decrypt rewrite");
+        assert!(
+            decrypted.status.success(),
+            "qpdf decrypt rewrite failed: {decrypted:?}"
+        );
+
+        let mut pdf = Pdf::open_with_options(
+            std::io::Cursor::new(std::fs::read(&encrypted_source).expect("read encrypted source")),
+            PdfOpenOptions {
+                password: b"u".to_vec(),
+                ..PdfOpenOptions::default()
+            },
+        )
+        .expect("open encrypted source with user password");
+        let settings = WriterTestSettings {
+            qdf,
+            content_normalization: !qdf,
+            object_streams: ObjectStreamMode::Disable,
+            force_version: Some("1.7".to_owned()),
+            force_extension_level: Some(8),
+            stream_data: Some(flpdf::StreamDataMode::Uncompress),
+            static_id: true,
+            ..WriterTestSettings::default()
+        };
+        let mut actual = Vec::new();
+        write_with_settings(&mut pdf, &mut actual, &settings)
+            .expect("flpdf encrypted-input decrypt rewrite");
+        assert_eq!(
+            actual,
+            std::fs::read(&output_path).expect("read qpdf decrypt output"),
+            "encrypted-input decrypt parity qdf={qdf}"
+        );
+    }
 }
 
 #[test]

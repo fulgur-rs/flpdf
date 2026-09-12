@@ -441,6 +441,56 @@ fn encrypted_qdf_live_root_maps_an_extraneous_xref_child_to_null() {
 }
 
 #[test]
+fn encrypted_qdf_and_normalize_encrypt_direct_page_dictionary_strings() {
+    for qdf in [true, false] {
+        let mut pdf = Pdf::open(Cursor::new(
+            include_bytes!("../../../tests/fixtures/compat/qdf-contents-ref-array.pdf").to_vec(),
+        ))
+        .unwrap();
+        let page = pdf.get_object_handle(flpdf::ObjectRef::new(3, 0));
+        let stream = pdf.new_stream_with_data(Rc::new(b"q Q".to_vec())).unwrap();
+        page.replace_key(b"/Contents", ObjectHandle::array(vec![stream]))
+            .unwrap();
+        page.replace_key(
+            b"/PieceInfo",
+            ObjectHandle::dictionary(vec![(
+                b"/App".to_vec(),
+                ObjectHandle::dictionary(vec![(
+                    b"/Private".to_vec(),
+                    ObjectHandle::string(b"SecretPageData".to_vec()),
+                )]),
+            )]),
+        )
+        .unwrap();
+
+        let mut writer = PdfWriter::new(&mut pdf);
+        writer.set_qdf_mode(qdf);
+        writer.set_content_normalization(!qdf);
+        writer.set_object_stream_mode(ObjectStreamMode::Disable);
+        writer.set_compress_streams(false);
+        writer.set_static_id(true);
+        writer.set_static_aes_iv(true);
+        writer.force_pdf_version("1.7", 8);
+        writer.set_encryption_parameters(EncryptParams::v4_aes128(b"u", b"o"));
+        writer.set_output_memory().unwrap();
+        writer.write().unwrap();
+        let output = writer.get_buffer().unwrap();
+        assert!(
+            output
+                .windows(b"/PieceInfo".len())
+                .any(|window| window == b"/PieceInfo"),
+            "qdf={qdf} must retain the page dictionary"
+        );
+        assert!(
+            !output
+                .windows(b"SecretPageData".len())
+                .any(|window| window == b"SecretPageData"),
+            "qdf={qdf} direct page dictionary strings must be encrypted"
+        );
+    }
+}
+
+#[test]
 fn qdf_discovery_walks_a_direct_stream_dictionary_child() {
     let mut pdf = Pdf::open(Cursor::new(
         include_bytes!("../../../tests/fixtures/compat/one-page-no-ext.pdf").to_vec(),

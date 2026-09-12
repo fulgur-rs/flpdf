@@ -1220,6 +1220,28 @@ impl<'a, R: Read + Seek + 'static> LiveObjectEmitter<'a, R> {
         self.discover_qdf_children(object, 0)?;
         let queue = &self.queue;
         let map = |object_ref: ObjectRef| qdf_output_number(queue, object_ref);
+        if let Some(emitter) = self.encrypted_strings.as_mut() {
+            let emitted_ref = object
+                .object_ref()
+                .and_then(|source| self.queue.borrow().old_to_new.get(&source).copied())
+                .or(self.current_raw_output)
+                .ok_or_else(|| {
+                    // cov:ignore-start: content containers are queued indirect page/array handles
+                    crate::Error::Unsupported(
+                        "plain live writer: content container has no output number".into(),
+                    )
+                    // cov:ignore-end
+                })?; // cov:ignore: the content-container queue assigns its output before emission
+            return emitter.write_handle_content_container_with_ref_map(
+                self.bytes,
+                emitted_ref,
+                None,
+                object,
+                self.options,
+                &map,
+                &self.removed_refs,
+            );
+        }
         crate::writer::plain::body::emit_content_container_from_handle_with_ref_map(
             object,
             self.options,

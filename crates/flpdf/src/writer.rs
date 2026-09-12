@@ -3528,7 +3528,10 @@ fn emit_canonical_pdf_inner<R: Read + Seek, W: Write>(
     let encrypted_qdf_or_normalize_live = (options.qdf || options.content_normalization)
         && pdf.root_ref().is_some()
         && !options.pclm
-        && encryption_parameters.is_some()
+        && (encryption_parameters.is_some()
+            || (pdf.is_encrypted()
+                && options.encrypt.is_none()
+                && options.copy_encryption.is_none()))
         && matches!(
             options.object_streams,
             ObjectStreamMode::Disable | ObjectStreamMode::Preserve
