@@ -1013,6 +1013,7 @@ impl<R: Read + Seek> Pdf<R> {
     /// `QPDF::removeObject` erases the resolver cache entry; the returned
     /// operation-specific removal set lets a writer keep its own traversal
     /// bookkeeping without adding a second document cache.
+    #[cfg(test)]
     pub(crate) fn get_compressible_objgens_with_removed(
         &mut self,
     ) -> Result<(Vec<ObjectRef>, BTreeSet<ObjectRef>)> {
@@ -1273,7 +1274,6 @@ impl<R: Read + Seek> Pdf<R> {
     /// `removeObject`'s exact xref/cache mutation (`QPDF.cc:1996-2005`),
     /// separate from xref registration's transient free-row state
     /// (`QPDF.cc:686-708`, `:1187-1210`).
-    #[cfg(test)]
     pub(crate) fn remove_object_handle(&mut self, object_ref: ObjectRef) -> Result<()> {
         // qpdf's removeObject changes only the requested cache slot; already
         // resolved members of an ObjStm remain live in their own cache slots.

@@ -135,6 +135,8 @@ impl PlainWritePlan {
             options,
             setup_generated_id,
             None,
+            None,
+            &[],
         )
     }
 
@@ -143,6 +145,8 @@ impl PlainWritePlan {
         options: &WriterOptions,
         setup_generated_id: Option<&crate::ObjectHandle>,
         source_object_stream_data: Option<&BTreeMap<u32, u32>>,
+        generated_compressible: Option<&object_streams::CompressiblePlan>,
+        generated_object_stream_sources: &[ObjectRef],
     ) -> crate::Result<Self> {
         let source_root_ref = pdf.root_ref();
         let source_root_handle = if source_root_ref.is_none() {
@@ -268,21 +272,34 @@ impl PlainWritePlan {
                 }
             }
             ObjectStreamMode::Generate => {
-                let (mut eligible, mut removed_refs) =
-                    pdf.get_compressible_objgens_with_removed()?;
+                let setup_generated = generated_compressible.is_some();
+                let compressible = if let Some(snapshot) = generated_compressible {
+                    snapshot.clone()
+                } else {
+                    object_streams::compressible_objgens_qpdf_plan(pdf)?
+                };
+                let mut eligible = compressible.eligible;
+                let mut removed_refs = compressible.removed_refs;
                 removed_refs.extend(explicitly_removed.iter().copied());
                 eligible.retain(|member| !removed_refs.contains(member));
                 let groups = object_streams::even_split_into_streams(&eligible);
                 let mut renumber_groups = Vec::with_capacity(groups.len());
-                for members in groups {
-                    let container = pdf.make_indirect_object_handle(ObjectHandle::null())?;
-                    // cov:ignore-start: make_indirect_object_handle always returns an indirect handle.
-                    let source = container.object_ref().ok_or_else(|| {
-                        crate::Error::Internal(
-                            "generated object-stream container lost its indirect identity".into(),
-                        )
-                    })?;
-                    // cov:ignore-end
+                for (group_index, members) in groups.into_iter().enumerate() {
+                    let source =
+                        if let Some(&source) = generated_object_stream_sources.get(group_index) {
+                            source
+                        } else {
+                            let container = pdf.make_indirect_object_handle(ObjectHandle::null())?;
+                            // cov:ignore-start: make_indirect_object_handle always returns an indirect handle.
+                            let source = container.object_ref().ok_or_else(|| {
+                                crate::Error::Internal(
+                                    "generated object-stream container lost its indirect identity"
+                                        .into(),
+                                )
+                            })?;
+                            // cov:ignore-end
+                            source
+                        };
                     renumber_groups.push(ObjectStreamGroup::Generated { source, members });
                 }
                 let removed = &removed_refs;
@@ -292,15 +309,17 @@ impl PlainWritePlan {
                 // when preserve-unreferenced is enabled (`QPDFWriter.cc:2907-2914`).
                 // Keep that distinction: preserved orphans receive plain slots
                 // instead of being silently dropped from the generated rewrite.
-                // cov:ignore-start: LLVM attributes this covered Generate-group call to its opening line; the writer contract test exercises the complete call
-                retain_reachable_object_stream_members(
-                    pdf,
-                    &mut renumber_groups,
-                    removed,
-                    options.preserve_unreferenced_objects,
-                    Some(&stream_parameters_removed),
-                )?;
-                // cov:ignore-end
+                if !setup_generated {
+                    // cov:ignore-start: LLVM attributes this covered Generate-group call to its opening line; the writer contract test exercises the complete call
+                    retain_reachable_object_stream_members(
+                        pdf,
+                        &mut renumber_groups,
+                        removed,
+                        options.preserve_unreferenced_objects,
+                        Some(&stream_parameters_removed),
+                    )?;
+                    // cov:ignore-end
+                }
                 let renumber = renumber_plain(
                     pdf,
                     &renumber_groups,

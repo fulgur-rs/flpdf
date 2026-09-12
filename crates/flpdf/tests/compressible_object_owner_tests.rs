@@ -246,11 +246,7 @@ fn generate_indirect_extensions_matches_qpdf_before_prepare_file_for_write() {
         .unwrap();
 
         let qpdf = Command::new("qpdf")
-            .args([
-                "--static-id",
-                "--newline-before-endstream=n",
-                "--object-streams=generate",
-            ])
+            .args(["--static-id", "--object-streams=generate"])
             .arg(&input)
             .arg(&qpdf_output)
             .output()
@@ -268,10 +264,22 @@ fn generate_indirect_extensions_matches_qpdf_before_prepare_file_for_write() {
         writer.set_output_memory().unwrap();
         writer.write().unwrap();
 
-        assert_eq!(
-            writer.get_buffer().unwrap(),
-            fs::read(&qpdf_output).unwrap(),
-            "Generate output for {fixture} must match qpdf's setup-time membership"
-        );
+        let actual = writer.get_buffer().unwrap();
+        let expected = fs::read(&qpdf_output).unwrap();
+        if actual != expected {
+            let first_diff = actual
+                .iter()
+                .zip(&expected)
+                .position(|(actual, expected)| actual != expected)
+                .unwrap_or(actual.len().min(expected.len()));
+            let start = first_diff.saturating_sub(16);
+            panic!(
+                "Generate output for {fixture} differs from qpdf's setup-time membership: flpdf={} bytes, qpdf={} bytes, first diff at {first_diff}; flpdf={:?}, qpdf={:?}",
+                actual.len(),
+                expected.len(),
+                &actual[start..actual.len().min(first_diff + 32)],
+                &expected[start..expected.len().min(first_diff + 32)],
+            );
+        }
     }
 }

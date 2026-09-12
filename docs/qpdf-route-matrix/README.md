@@ -392,7 +392,7 @@ crates/flpdf/src/writer/object_streams/planning.rs::ObjectStreamGroup: prod 20 (
     crates/flpdf/src/writer/plain/plan.rs 10, crates/flpdf/src/writer/rewrite_renumber.rs 6, crates/flpdf/src/writer.rs 2, crates/flpdf/src/writer/object_streams/planning.rs 2
 crates/flpdf/src/writer/object_streams/planning.rs::plan_qpdf_preserve_object_streams_with_unreferenced: prod 1 (1 files) / test 0
     crates/flpdf/src/writer/plain/plan.rs 1
-crates/flpdf/src/writer/object_streams/eligibility.rs::compressible_objgens_qpdf_plan: prod 9 (6 files) / test 1
+crates/flpdf/src/writer/object_streams/eligibility.rs::compressible_objgens_qpdf_plan: prod 11 (6 files) / test 1
     crates/flpdf/src/writer/object_streams/planning.rs 3, crates/flpdf/src/linearization/plan.rs 2, crates/flpdf/src/linearization/writer.rs 1, crates/flpdf/src/writer.rs 1, crates/flpdf/src/writer/object_streams/eligibility.rs 1, crates/flpdf/src/writer/plain/plan.rs 1
 crates/flpdf/src/reader/resolver.rs::source_xref_entries: prod 29 (9 files) / test 3
     crates/flpdf/src/reader/resolver.rs 9, crates/flpdf/src/writer.rs 5, crates/flpdf/src/reader.rs 4, crates/flpdf/src/linearization/writer.rs 3, crates/flpdf/src/engine.rs 2, crates/flpdf/src/linearization/plan.rs 2, crates/flpdf/src/writer/object_streams/planning.rs 2, crates/flpdf/src/writer/plain/plan.rs 1, crates/flpdf/src/writer/rewrite_renumber.rs 1

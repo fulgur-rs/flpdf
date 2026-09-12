@@ -859,12 +859,20 @@ impl<'pdf, R: Read + Seek + 'static> PdfWriter<'pdf, R> {
         // specialized emitter consumes this setup without another page walk.
         let special_streams = initialize_special_streams(self.pdf, &options)?;
         let effective_object_streams = effective_object_stream_mode(&options);
+        let plain_generate_setup = effective_object_streams == ObjectStreamMode::Generate
+            && !self.settings.linearization
+            && !options.pclm
+            && plain::eligible(self.pdf.is_encrypted(), &options, effective_object_streams);
         let specialized_standard_live = effective_object_streams == options.object_streams
             && !options.qdf
             && !options.content_normalization
             && !options.pclm
             && !plain::eligible(self.pdf.is_encrypted(), &options, effective_object_streams);
-        if effective_object_streams == ObjectStreamMode::Generate && specialized_standard_live {
+        if effective_object_streams == ObjectStreamMode::Generate
+            && !self.settings.linearization
+            && !options.pclm
+            && (plain_generate_setup || specialized_standard_live)
+        {
             // qpdf initializes special streams before Generate computes its
             // compressible membership (`QPDFWriter.cc:2114-2135`). Capture
             // this snapshot at the same boundary, still before the common
@@ -3578,6 +3586,8 @@ fn emit_canonical_pdf_inner<R: Read + Seek, W: Write>(
             generated_id.as_ref(),
             special_streams,
             &source_object_stream_data,
+            generated_compressible.as_ref(),
+            &generated_object_stream_sources,
         );
     }
 

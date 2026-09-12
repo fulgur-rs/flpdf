@@ -100,7 +100,6 @@ pub(crate) struct CompressiblePlan {
     pub indirect_objstm_length_refs: BTreeSet<ObjectRef>,
 }
 
-// qpdf-deviation: remaining writer consumers use a generation snapshot and removed_refs; the canonical document walk mutates retained aliases.
 pub(crate) fn compressible_objgens_qpdf_plan<R: std::io::Read + std::io::Seek>(
     pdf: &mut crate::Pdf<R>,
 ) -> crate::Result<CompressiblePlan> {
@@ -139,16 +138,18 @@ pub(crate) fn compressible_objgens_qpdf_plan<R: std::io::Read + std::io::Seek>(
         if object_ref.number == 0 {
             continue;
         }
+        if visited.contains(&object_ref.number) {
+            continue;
+        }
         if highest_live_generation
             .get(&object_ref.number)
             .is_some_and(|generation| *generation > object_ref.generation)
         {
+            pdf.remove_object_handle(object_ref)?;
             removed_refs.insert(object_ref);
             continue;
         }
-        if !visited.insert(object_ref.number) {
-            continue;
-        }
+        visited.insert(object_ref.number);
 
         object.try_dereference()?;
         let stream_dict = object.as_stream_dict();

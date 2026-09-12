@@ -1830,6 +1830,7 @@ impl<R: Read + Seek> ResolverHandle<R> {
     /// Whether qpdf's live cache upper_bound finds a newer generation of this number.
     /// This is the per-object test in `getCompressibleObjGens`
     /// (`libqpdf/QPDF.cc:2423-2430`), not a snapshot of the source xref table.
+    #[cfg(test)]
     pub(crate) fn has_newer_cached_generation(&self, object_ref: ObjectRef) -> bool {
         use std::ops::Bound::{Excluded, Unbounded};
         let object_gen = QpdfObjGen::from_object_ref(object_ref);
