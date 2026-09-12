@@ -553,9 +553,15 @@ impl PlainWritePlan {
                     final_extension_level,
                     false,
                 )?; // cov:ignore: LLVM attributes this covered multiline call terminator to the call setup
+                    // The trailer splices these bytes in verbatim, so they must
+                    // already carry the nesting qpdf gives a trailer value:
+                    // `writeTrailer` unparses each entry at depth 1
+                    // (`QPDFWriter.cc:1188`), which is the same indent the
+                    // non-direct QDF path passes at `object.rs`'s
+                    // `write_child_qdf_with_ref_map(value, 2, ...)`.
                 arbitrated.write_object_qdf_with_ref_map_and_removed(
                     &mut bytes,
-                    0,
+                    2,
                     &map,
                     &placement.removed_refs,
                 )?; // cov:ignore: direct Catalog QDF serialization is exercised; LLVM maps this validated continuation to the call setup.
