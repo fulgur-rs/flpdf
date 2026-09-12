@@ -3,6 +3,19 @@ use std::io::Cursor;
 use std::path::Path;
 
 #[test]
+fn every_plain_mode_uses_the_live_queue_consumer() {
+    let root = Path::new(env!("CARGO_MANIFEST_DIR")).join("src");
+    let plain = std::fs::read_to_string(root.join("writer/plain/mod.rs")).unwrap();
+    let body = std::fs::read_to_string(root.join("writer/plain/body.rs")).unwrap();
+
+    assert!(plain.contains("write_plain_live"));
+    assert!(!plain.contains("write_planned"));
+    assert!(body.contains("struct LiveQueue"));
+    assert!(body.contains("pub(crate) fn emit_live"));
+    assert!(body.contains("enqueue_handle"));
+}
+
+#[test]
 fn planned_preserve_uses_the_d9_source_membership_owner() {
     // qpdf has one source-membership owner, `getObjectStreamData`
     // (`QPDF.cc:2381-2390`); Preserve's early-return decision consumes that

@@ -3463,15 +3463,33 @@ fn write_qdf_objstm_dictionary(
 #[cfg(test)]
 pub(crate) fn emit_canonical_pdf<R: Read + Seek, W: Write>(
     pdf: &mut Pdf<R>,
-    out: W,
+    mut out: W,
     options: &WriterOptions,
 ) -> Result<WriterResult> {
+    struct BorrowedWriterTarget<'a>(&'a mut dyn Write);
+
+    impl OutputTarget for BorrowedWriterTarget<'_> {
+        fn write_chunk(&mut self, bytes: &[u8]) -> io::Result<usize> {
+            self.0.write(bytes)
+        }
+
+        fn finish_segment(&mut self) -> Result<()> {
+            self.0.flush().map_err(Error::Io)
+        }
+
+        fn finish_document(&mut self) -> Result<()> {
+            self.0.flush().map_err(Error::Io)
+        }
+    }
+
     let setup = build_writer_setup(pdf, options)?;
     let special_streams = initialize_special_streams(pdf, options);
+    let mut target = BorrowedWriterTarget(&mut out);
+    let mut sink = OutputSink::new(&mut target);
     match special_streams {
         Ok(special_streams) => emit_canonical_pdf_with_special_streams(
             pdf,
-            out,
+            &mut sink,
             options,
             special_streams.as_ref(),
             setup,
@@ -3480,9 +3498,9 @@ pub(crate) fn emit_canonical_pdf<R: Read + Seek, W: Write>(
     }
 }
 
-fn emit_canonical_pdf_with_special_streams<R: Read + Seek, W: Write>(
+fn emit_canonical_pdf_with_special_streams<R: Read + Seek>(
     pdf: &mut Pdf<R>,
-    out: W,
+    out: &mut OutputSink<'_>,
     options: &WriterOptions,
     special_streams: Option<&SpecialStreams>,
     setup: WriterSetupState,
@@ -3785,9 +3803,9 @@ fn write_pclm<R: Read + Seek, W: Write>(
     Ok(WriterResult::new(emitted_old_to_new, written_xref))
 }
 
-fn emit_canonical_pdf_inner<R: Read + Seek, W: Write>(
+fn emit_canonical_pdf_inner<R: Read + Seek>(
     pdf: &mut Pdf<R>,
-    mut out: W,
+    out: &mut OutputSink<'_>,
     options: &WriterOptions,
     special_streams: Option<&SpecialStreams>,
     setup: WriterSetupState,
@@ -5675,7 +5693,15 @@ fn emit_canonical_pdf_inner<R: Read + Seek, W: Write>(
                     && matches!(options.compress_streams, CompressStreams::Yes),
                 qdf: options.qdf,
             };
-            written_xref = plain::xref::append_xref_and_trailer(&mut bytes, &layout, &trailer)?;
+            written_xref = if deterministic_id {
+                output::with_digested_buffer_sink(&mut bytes, |xref_out| {
+                    plain::xref::append_xref_and_trailer(xref_out, &layout, &trailer)
+                })?
+            } else {
+                output::with_buffer_sink(&mut bytes, |xref_out| {
+                    plain::xref::append_xref_and_trailer(xref_out, &layout, &trailer)
+                })?
+            };
         }
     }
 
@@ -6169,13 +6195,9 @@ mod final_handle_writer_tests {
         };
         let mut output = Vec::new();
 
-        emit_canonical_pdf_inner(
-            &mut pdf,
-            &mut output,
-            &WriterOptions::default(),
-            None,
-            setup,
-        )
+        output::with_buffer_sink(&mut output, |out| {
+            emit_canonical_pdf_inner(&mut pdf, out, &WriterOptions::default(), None, setup)
+        })
         .expect("plain writer route succeeds");
 
         assert!(

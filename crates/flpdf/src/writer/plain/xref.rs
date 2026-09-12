@@ -3,6 +3,7 @@ use std::collections::{BTreeMap, BTreeSet, HashMap};
 
 use crate::writer::{
     object::{ObjectWriterEmission, TrailerKind},
+    output::OutputSink,
     serialize::xref_stream,
     write_deterministic_id_inline,
 };
@@ -75,17 +76,17 @@ pub(crate) struct TrailerPlan {
     pub(crate) qdf: bool,
 }
 
-/// Append a classic xref table or xref stream for an already-written body.
+/// Stream a classic xref table or xref stream after an already-written body.
 pub(crate) fn append_xref_and_trailer(
-    bytes: &mut Vec<u8>,
+    out: &mut OutputSink<'_>,
     layout: &BodyLayout,
     trailer: &TrailerPlan,
 ) -> crate::Result<BTreeMap<ObjectRef, XrefEntry>> {
     layout.validate()?;
 
     match trailer.form {
-        XrefForm::Table => append_classic_xref_and_trailer(bytes, layout, trailer),
-        XrefForm::Stream => append_xref_stream_and_trailer(bytes, layout, trailer),
+        XrefForm::Table => append_classic_xref_and_trailer(out, layout, trailer),
+        XrefForm::Stream => append_xref_stream_and_trailer(out, layout, trailer),
     }
 }
 
@@ -94,7 +95,7 @@ pub(crate) fn append_xref_and_trailer(
 /// the stream route consumes the plan's already-canonical trailer entries and
 /// uses the shared xref-stream serializer.
 pub(crate) fn append_xref_and_trailer_with_handle(
-    bytes: &mut Vec<u8>,
+    out: &mut OutputSink<'_>,
     layout: &BodyLayout,
     trailer: &TrailerPlan,
     trailer_handle: &ObjectHandle,
@@ -104,23 +105,25 @@ pub(crate) fn append_xref_and_trailer_with_handle(
     layout.validate()?;
     match trailer.form {
         XrefForm::Table => append_classic_xref_and_trailer_with_handle(
-            bytes,
+            out,
             layout,
             trailer,
             trailer_handle,
             old_to_new,
             removed_refs,
         ),
-        XrefForm::Stream => append_xref_stream_and_trailer(bytes, layout, trailer),
+        XrefForm::Stream => append_xref_stream_and_trailer(out, layout, trailer),
     }
 }
 
 fn append_xref_stream_and_trailer(
-    bytes: &mut Vec<u8>,
+    out: &mut OutputSink<'_>,
     layout: &BodyLayout,
     trailer: &TrailerPlan,
 ) -> crate::Result<BTreeMap<ObjectRef, XrefEntry>> {
-    let xref_offset = bytes.len();
+    let xref_offset = usize::try_from(out.position()).map_err(|_| {
+        crate::Error::Unsupported("plain writer xref offset exceeds usize range".into())
+    })?;
     let max_number = layout.max_number();
     let xref_number = max_number.checked_add(1).ok_or_else(|| {
         crate::Error::Unsupported("plain writer xref object number overflows u32".into())
@@ -182,27 +185,23 @@ fn append_xref_stream_and_trailer(
                 .map(|(id0, id1)| (id0.as_slice(), id1.as_slice()));
             let dictionary = xref_stream::XrefStreamDict { id, ..dictionary };
             if trailer.qdf {
-                crate::writer::output::with_buffer_sink(bytes, |out| {
-                    xref_stream::write_xref_stream(
-                        out,
-                        xref_ref,
-                        &dictionary,
-                        &stream_layout,
-                        true,
-                        None,
-                    )
-                })?;
+                xref_stream::write_xref_stream(
+                    out,
+                    xref_ref,
+                    &dictionary,
+                    &stream_layout,
+                    true,
+                    None,
+                )?;
             } else {
-                crate::writer::output::with_buffer_sink(bytes, |out| {
-                    xref_stream::write_xref_stream(
-                        out,
-                        xref_ref,
-                        &dictionary,
-                        &stream_layout,
-                        false,
-                        None,
-                    )
-                })?;
+                xref_stream::write_xref_stream(
+                    out,
+                    xref_ref,
+                    &dictionary,
+                    &stream_layout,
+                    false,
+                    None,
+                )?;
             }
         }
         IdPlan::Deterministic {
@@ -213,43 +212,41 @@ fn append_xref_stream_and_trailer(
                 write_deterministic_id_inline(out, info_suffix, source_id0.as_deref())
             };
             if trailer.qdf {
-                crate::writer::output::with_digested_buffer_sink(bytes, |out| {
-                    xref_stream::write_xref_stream(
-                        out,
-                        xref_ref,
-                        &dictionary,
-                        &stream_layout,
-                        true,
-                        Some(&mut id_writer),
-                    )
-                })?;
+                xref_stream::write_xref_stream(
+                    out,
+                    xref_ref,
+                    &dictionary,
+                    &stream_layout,
+                    true,
+                    Some(&mut id_writer),
+                )?;
             } else {
-                crate::writer::output::with_digested_buffer_sink(bytes, |out| {
-                    xref_stream::write_xref_stream(
-                        out,
-                        xref_ref,
-                        &dictionary,
-                        &stream_layout,
-                        false,
-                        Some(&mut id_writer),
-                    )
-                })?;
+                xref_stream::write_xref_stream(
+                    out,
+                    xref_ref,
+                    &dictionary,
+                    &stream_layout,
+                    false,
+                    Some(&mut id_writer),
+                )?;
             }
         }
     }
-    bytes.extend_from_slice(format!("startxref\n{xref_offset}\n%%EOF\n").as_bytes());
+    out.write_bytes(format!("startxref\n{xref_offset}\n%%EOF\n").as_bytes())?;
     written_xref_stream(layout, xref_ref, xref_offset)
 }
 
 fn append_classic_xref_and_trailer_with_handle(
-    bytes: &mut Vec<u8>,
+    out: &mut OutputSink<'_>,
     layout: &BodyLayout,
     trailer: &TrailerPlan,
     trailer_handle: &ObjectHandle,
     old_to_new: &HashMap<ObjectRef, ObjectRef>,
     removed_refs: &BTreeSet<ObjectRef>,
 ) -> crate::Result<BTreeMap<ObjectRef, XrefEntry>> {
-    let xref_offset = bytes.len();
+    let xref_offset = usize::try_from(out.position()).map_err(|_| {
+        crate::Error::Unsupported("plain writer xref offset exceeds usize range".into())
+    })?;
     let size = layout
         .max_number()
         .checked_add(1)
@@ -282,7 +279,7 @@ fn append_classic_xref_and_trailer_with_handle(
             },
         );
     }
-    let _ = write_xref_table(bytes, 0, size - 1, &entries, false, 0, 0, 0)?;
+    let _ = write_xref_table(out, 0, size - 1, &entries, false, 0, 0, 0)?;
 
     let map = |object_ref: ObjectRef| {
         old_to_new.get(&object_ref).copied().ok_or_else(|| {
@@ -299,42 +296,38 @@ fn append_classic_xref_and_trailer_with_handle(
             let mut id_writer = |out: &mut crate::writer::output::OutputSink<'_>| {
                 write_deterministic_id_inline(out, info_suffix, source_id0.as_deref())
             };
-            crate::writer::output::with_digested_buffer_sink(bytes, |out| {
-                trailer_handle.write_trailer_with_ref_map_and_kind(
-                    out,
-                    TrailerKind::Normal {
-                        size: i64::from(size),
-                    },
-                    false,
-                    trailer.qdf,
-                    Some(&mut id_writer),
-                    &map,
-                    removed_refs,
-                    true,
-                )
-            })?; // cov:ignore: deterministic ID writer call is covered; LLVM maps this multiline terminator to the call setup
+            trailer_handle.write_trailer_with_ref_map_and_kind(
+                out,
+                TrailerKind::Normal {
+                    size: i64::from(size),
+                },
+                false,
+                trailer.qdf,
+                Some(&mut id_writer),
+                &map,
+                removed_refs,
+                true,
+            )?; // cov:ignore: deterministic ID writer call is covered; LLVM maps this multiline terminator to the call setup
         }
         IdPlan::Materialized { .. } => {
-            crate::writer::output::with_buffer_sink(bytes, |out| {
-                trailer_handle.write_trailer_with_ref_map_and_kind(
-                    out,
-                    TrailerKind::Normal {
-                        size: i64::from(size),
-                    },
-                    false,
-                    trailer.qdf,
-                    None,
-                    &map,
-                    removed_refs,
-                    true,
-                )
-            })?; // cov:ignore: materialized ID writer call is covered; LLVM maps this multiline terminator to the call setup
+            trailer_handle.write_trailer_with_ref_map_and_kind(
+                out,
+                TrailerKind::Normal {
+                    size: i64::from(size),
+                },
+                false,
+                trailer.qdf,
+                None,
+                &map,
+                removed_refs,
+                true,
+            )?; // cov:ignore: materialized ID writer call is covered; LLVM maps this multiline terminator to the call setup
         }
     }
     if trailer.qdf {
-        bytes.extend_from_slice(format!("startxref\n{xref_offset}\n%%EOF\n").as_bytes());
+        out.write_bytes(format!("startxref\n{xref_offset}\n%%EOF\n").as_bytes())?;
     } else {
-        bytes.extend_from_slice(format!("\nstartxref\n{xref_offset}\n%%EOF\n").as_bytes());
+        out.write_bytes(format!("\nstartxref\n{xref_offset}\n%%EOF\n").as_bytes())?;
     }
     written_xref_table(layout, size)
 }
@@ -373,11 +366,13 @@ pub(crate) fn materialized_id_handle(
 }
 
 fn append_classic_xref_and_trailer(
-    bytes: &mut Vec<u8>,
+    out: &mut OutputSink<'_>,
     layout: &BodyLayout,
     trailer: &TrailerPlan,
 ) -> crate::Result<BTreeMap<ObjectRef, XrefEntry>> {
-    let xref_offset = bytes.len();
+    let xref_offset = usize::try_from(out.position()).map_err(|_| {
+        crate::Error::Unsupported("plain writer xref offset exceeds usize range".into())
+    })?;
     let size = layout
         .max_number()
         .checked_add(1)
@@ -410,11 +405,11 @@ fn append_classic_xref_and_trailer(
             },
         );
     }
-    let _ = write_xref_table(bytes, 0, size - 1, &entries, false, 0, 0, 0)?;
+    let _ = write_xref_table(out, 0, size - 1, &entries, false, 0, 0, 0)?;
 
-    bytes.extend_from_slice(b"trailer ");
-    write_canonical_classic_trailer(bytes, trailer, size, &trailer.canonical_entries)?;
-    bytes.extend_from_slice(format!("\nstartxref\n{xref_offset}\n%%EOF\n").as_bytes());
+    out.write_bytes(b"trailer ")?;
+    write_canonical_classic_trailer(out, trailer, size, &trailer.canonical_entries)?;
+    out.write_bytes(format!("\nstartxref\n{xref_offset}\n%%EOF\n").as_bytes())?;
     written_xref_table(layout, size)
 }
 
@@ -433,7 +428,7 @@ fn append_classic_xref_and_trailer(
     reason = "preserve QPDFWriter::writeXRefTable's full overload fields one-to-one"
 )]
 pub(crate) fn write_xref_table(
-    bytes: &mut Vec<u8>,
+    out: &mut OutputSink<'_>,
     first: u32,
     last: u32,
     entries: &BTreeMap<u32, XrefEntry>,
@@ -451,12 +446,13 @@ pub(crate) fn write_xref_table(
     // so the returned offset identifies the whitespace immediately preceding
     // the object-0 row. A linearized `/T` consumer relies on that exact byte,
     // so the newline must be appended only after the snapshot.
-    bytes.extend_from_slice(format!("xref\n{first} {count}").as_bytes());
-    let space_before_zero = bytes.len();
-    bytes.push(b'\n');
+    out.write_bytes(format!("xref\n{first} {count}").as_bytes())?;
+    let space_before_zero = usize::try_from(out.position())
+        .map_err(|_| crate::Error::Unsupported("xref table position exceeds usize range".into()))?;
+    out.write_bytes(b"\n")?;
     for number in first..=last {
         if number == 0 {
-            bytes.extend_from_slice(b"0000000000 65535 f \n");
+            out.write_bytes(b"0000000000 65535 f \n")?;
             continue;
         }
 
@@ -476,13 +472,13 @@ pub(crate) fn write_xref_table(
                     .ok_or_else(|| crate::Error::Internal("xref offset overflow".to_string()))?;
             }
         }
-        bytes.extend_from_slice(format!("{offset:010} 00000 n \n").as_bytes());
+        out.write_bytes(format!("{offset:010} 00000 n \n").as_bytes())?;
     }
     Ok(space_before_zero)
 }
 
 fn write_canonical_classic_trailer(
-    bytes: &mut Vec<u8>,
+    out: &mut OutputSink<'_>,
     trailer: &TrailerPlan,
     size: u32,
     canonical: &[(Vec<u8>, Vec<u8>)],
@@ -500,66 +496,59 @@ fn write_canonical_classic_trailer(
     entries.push((b"/Size".to_vec(), size.to_string().into_bytes()));
     entries.sort_by(|left, right| left.0.cmp(&right.0));
 
-    bytes.extend_from_slice(b"<<");
+    out.write_bytes(b"<<")?;
     for (key, value) in entries {
-        bytes.push(b' ');
-        write_qpdf_dictionary_key(bytes, &key);
-        bytes.push(b' ');
-        bytes.extend_from_slice(&value);
+        out.write_bytes(b" ")?;
+        write_qpdf_dictionary_key(out, &key)?;
+        out.write_bytes(b" ")?;
+        out.write_bytes(&value)?;
     }
 
     if let IdPlan::Materialized {
         value: Some((id0, id1)),
     } = &trailer.id
     {
-        bytes.extend_from_slice(b" /ID [<");
-        write_hex(bytes, id0);
-        bytes.extend_from_slice(b"><");
-        write_hex(bytes, id1);
-        bytes.extend_from_slice(b">]");
+        out.write_bytes(b" /ID [<")?;
+        write_hex(out, id0)?;
+        out.write_bytes(b"><")?;
+        write_hex(out, id1)?;
+        out.write_bytes(b">]")?;
     } else if let IdPlan::Deterministic {
         source_id0,
         info_suffix,
     } = &trailer.id
     {
-        bytes.extend_from_slice(b" /ID ");
-        crate::writer::output::with_digested_buffer_sink(bytes, |out| {
-            write_deterministic_id_inline(out, info_suffix, source_id0.as_deref())
-        })?;
+        out.write_bytes(b" /ID ")?;
+        write_deterministic_id_inline(out, info_suffix, source_id0.as_deref())?;
     }
 
     if let Some(encrypt) = trailer.encrypt {
-        bytes.extend_from_slice(b" /Encrypt ");
-        bytes.extend_from_slice(format!("{} {} R", encrypt.number, encrypt.generation).as_bytes());
+        out.write_bytes(b" /Encrypt ")?;
+        out.write_bytes(format!("{} {} R", encrypt.number, encrypt.generation).as_bytes())?;
     }
-    bytes.extend_from_slice(b" >>");
+    out.write_bytes(b" >>")?;
     Ok(())
 }
 
 /// Emit a qpdf dictionary key without changing its first byte.
 /// `QPDF_Name::normalizeName` (`libqpdf/QPDF_Name.cc:27-50`) preserves a raw
 /// slashless key such as `Array1`, while canonical keys already carry `/`.
-fn write_qpdf_dictionary_key(out: &mut Vec<u8>, key: &[u8]) {
+fn write_qpdf_dictionary_key(out: &mut OutputSink<'_>, key: &[u8]) -> crate::Result<()> {
     if let Some(key) = key.strip_prefix(b"/") {
-        out.push(b'/');
-        crate::writer::output::with_buffer_sink(out, |sink| {
-            crate::pdf_syntax::write_name_escaped(sink, key)
-        })
-        .expect("writing a PDF name to a Vec cannot fail");
+        out.write_bytes(b"/")?;
+        crate::pdf_syntax::write_name_escaped(out, key)?;
     } else {
-        crate::writer::output::with_buffer_sink(out, |sink| {
-            crate::pdf_syntax::write_name_escaped(sink, key)
-        })
-        .expect("writing a PDF name to a Vec cannot fail");
+        crate::pdf_syntax::write_name_escaped(out, key)?;
     }
+    Ok(())
 }
 
-fn write_hex(out: &mut Vec<u8>, bytes: &[u8]) {
+fn write_hex(out: &mut OutputSink<'_>, bytes: &[u8]) -> crate::Result<()> {
     const HEX: &[u8; 16] = b"0123456789abcdef";
     for &byte in bytes {
-        out.push(HEX[(byte >> 4) as usize]);
-        out.push(HEX[(byte & 0x0f) as usize]);
+        out.write_bytes(&[HEX[(byte >> 4) as usize], HEX[(byte & 0x0f) as usize]])?;
     }
+    Ok(())
 }
 
 fn written_xref_table(
@@ -638,6 +627,61 @@ mod tests {
     use super::*;
     use std::collections::BTreeSet;
 
+    fn append_bytes(
+        bytes: &mut Vec<u8>,
+        layout: &BodyLayout,
+        trailer: &TrailerPlan,
+    ) -> crate::Result<BTreeMap<ObjectRef, XrefEntry>> {
+        crate::writer::output::with_buffer_sink(bytes, |out| {
+            append_xref_and_trailer(out, layout, trailer)
+        })
+    }
+
+    fn append_with_handle_bytes(
+        bytes: &mut Vec<u8>,
+        layout: &BodyLayout,
+        trailer: &TrailerPlan,
+        trailer_handle: &ObjectHandle,
+        old_to_new: &HashMap<ObjectRef, ObjectRef>,
+        removed_refs: &BTreeSet<ObjectRef>,
+    ) -> crate::Result<BTreeMap<ObjectRef, XrefEntry>> {
+        crate::writer::output::with_buffer_sink(bytes, |out| {
+            append_xref_and_trailer_with_handle(
+                out,
+                layout,
+                trailer,
+                trailer_handle,
+                old_to_new,
+                removed_refs,
+            )
+        })
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn write_table_bytes(
+        bytes: &mut Vec<u8>,
+        first: u32,
+        last: u32,
+        entries: &BTreeMap<u32, XrefEntry>,
+        suppress_offsets: bool,
+        hint_id: u32,
+        hint_offset: u64,
+        hint_length: u64,
+    ) -> crate::Result<usize> {
+        crate::writer::output::with_buffer_sink(bytes, |out| {
+            write_xref_table(
+                out,
+                first,
+                last,
+                entries,
+                suppress_offsets,
+                hint_id,
+                hint_offset,
+                hint_length,
+            )
+        })
+    }
+
     fn trailer() -> TrailerPlan {
         TrailerPlan {
             form: XrefForm::Table,
@@ -671,7 +715,7 @@ mod tests {
         let mut bytes = Vec::new();
         let map = HashMap::new();
 
-        append_xref_and_trailer_with_handle(
+        append_with_handle_bytes(
             &mut bytes,
             &layout,
             &trailer(),
@@ -707,7 +751,7 @@ mod tests {
         let mut bytes = Vec::new();
         let map = HashMap::new();
 
-        append_xref_and_trailer_with_handle(
+        append_with_handle_bytes(
             &mut bytes,
             &layout,
             &trailer(),
@@ -734,7 +778,7 @@ mod tests {
         layout.uncompressed.insert(1, (0, 10_000_000_000));
         let trailer_handle =
             ObjectHandle::dictionary(vec![(b"/Size".to_vec(), ObjectHandle::integer(2))]);
-        let error = append_xref_and_trailer_with_handle(
+        let error = append_with_handle_bytes(
             &mut Vec::new(),
             &layout,
             &trailer(),
@@ -760,7 +804,7 @@ mod tests {
         );
         let trailer_handle =
             ObjectHandle::dictionary(vec![(b"/Size".to_vec(), ObjectHandle::integer(2))]);
-        let error = append_xref_and_trailer_with_handle(
+        let error = append_with_handle_bytes(
             &mut Vec::new(),
             &layout,
             &trailer(),
@@ -784,7 +828,7 @@ mod tests {
         ]);
         let mut layout = BodyLayout::default();
         layout.uncompressed.insert(1, (0, 12));
-        let error = append_xref_and_trailer_with_handle(
+        let error = append_with_handle_bytes(
             &mut Vec::new(),
             &layout,
             &trailer(),
@@ -805,7 +849,7 @@ mod tests {
         layout.uncompressed.insert(3, (0, 34));
         let mut bytes = Vec::new();
 
-        let error = append_xref_and_trailer(&mut bytes, &layout, &trailer())
+        let error = append_bytes(&mut bytes, &layout, &trailer())
             .expect_err("a missing nonzero row must not be serialized as free");
         assert!(matches!(
             error,
@@ -826,7 +870,7 @@ mod tests {
         );
         let mut bytes = Vec::new();
 
-        let error = append_xref_and_trailer(&mut bytes, &layout, &trailer())
+        let error = append_bytes(&mut bytes, &layout, &trailer())
             .expect_err("a classic table must reject a compressed xref entry");
         assert!(matches!(
             error,
@@ -841,7 +885,7 @@ mod tests {
         layout.uncompressed.insert(1, (7, 12));
         let mut bytes = Vec::new();
 
-        append_xref_and_trailer(&mut bytes, &layout, &trailer()).expect("valid xref");
+        append_bytes(&mut bytes, &layout, &trailer()).expect("valid xref");
 
         assert!(bytes
             .windows(b"0000000012 00000 n \n".len())
@@ -866,8 +910,7 @@ mod tests {
         trailer.form = XrefForm::Stream;
         let mut bytes = Vec::new();
 
-        append_xref_and_trailer(&mut bytes, &layout, &trailer)
-            .expect("xref stream emits a type-1 row");
+        append_bytes(&mut bytes, &layout, &trailer).expect("xref stream emits a type-1 row");
 
         let text = String::from_utf8_lossy(&bytes);
         assert!(
@@ -890,7 +933,7 @@ mod tests {
         trailer.form = XrefForm::Stream;
         let mut bytes = Vec::new();
 
-        append_xref_and_trailer(&mut bytes, &layout, &trailer)
+        append_bytes(&mut bytes, &layout, &trailer)
             .expect("xref stream emits the high-numbered range");
 
         assert!(String::from_utf8_lossy(&bytes).contains("/W [ 1 2 0 ]"));
@@ -907,7 +950,7 @@ mod tests {
         entries.insert(1, XrefEntry::Uncompressed { offset: 100 });
         let mut bytes = Vec::new();
         let space_before_zero =
-            write_xref_table(&mut bytes, 0, 1, &entries, false, 0, 0, 0).expect("table writes");
+            write_table_bytes(&mut bytes, 0, 1, &entries, false, 0, 0, 0).expect("table writes");
         assert_eq!(bytes[space_before_zero], b'\n');
         assert_eq!(
             &bytes[space_before_zero + 1..space_before_zero + 1 + b"0000000000 65535 f \n".len()],
@@ -922,7 +965,7 @@ mod tests {
         entries.insert(2, XrefEntry::Uncompressed { offset: 200 });
         let mut bytes = Vec::new();
 
-        write_xref_table(&mut bytes, 1, 2, &entries, false, 2, 50, 7)
+        write_table_bytes(&mut bytes, 1, 2, &entries, false, 2, 50, 7)
             .expect("range and hint-adjusted table");
         let text = String::from_utf8(bytes).expect("xref is ASCII");
         assert!(text.starts_with("xref\n1 2\n"));
@@ -935,7 +978,7 @@ mod tests {
     fn classic_xref_suppress_offsets_does_not_resolve_rows() {
         let mut bytes = Vec::new();
 
-        write_xref_table(&mut bytes, 0, 2, &BTreeMap::new(), true, 0, 0, 0)
+        write_table_bytes(&mut bytes, 0, 2, &BTreeMap::new(), true, 0, 0, 0)
             .expect("suppressed pass-1 rows do not require offsets");
         let text = String::from_utf8(bytes).expect("xref is ASCII");
         assert!(text.contains("0000000000 65535 f \n"));
@@ -948,7 +991,7 @@ mod tests {
         entries.insert(1, XrefEntry::Free { next: 0 });
         let mut bytes = Vec::new();
 
-        let error = write_xref_table(&mut bytes, 1, 1, &entries, false, 0, 0, 0)
+        let error = write_table_bytes(&mut bytes, 1, 1, &entries, false, 0, 0, 0)
             .expect_err("free rows cannot be emitted as classic live rows");
         assert!(matches!(
             error,
@@ -960,7 +1003,7 @@ mod tests {
     #[test]
     fn classic_xref_rejects_invalid_ranges_and_offset_overflow() {
         let mut bytes = Vec::new();
-        let error = write_xref_table(&mut bytes, 2, 1, &BTreeMap::new(), false, 0, 0, 0)
+        let error = write_table_bytes(&mut bytes, 2, 1, &BTreeMap::new(), false, 0, 0, 0)
             .expect_err("reversed ranges are invalid");
         assert!(
             matches!(error, crate::Error::Internal(message) if message == "invalid xref table range")
@@ -968,7 +1011,7 @@ mod tests {
 
         let mut entries = BTreeMap::new();
         entries.insert(1, XrefEntry::Uncompressed { offset: u64::MAX });
-        let error = write_xref_table(&mut bytes, 1, 1, &entries, false, 2, 0, 1)
+        let error = write_table_bytes(&mut bytes, 1, 1, &entries, false, 2, 0, 1)
             .expect_err("hint adjustment must reject offset overflow");
         assert!(
             matches!(error, crate::Error::Internal(message) if message == "xref offset overflow")

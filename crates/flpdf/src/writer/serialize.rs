@@ -77,18 +77,28 @@ pub(crate) fn framing_adds_newline_with_qdf(
 /// edge when this is a source-backed Preserve group.
 pub(crate) fn write_objstm_stream_with_extends(
     out: &mut OutputSink<'_>,
-    body: &object_streams::ObjStmBody,
+    body: object_streams::ObjStmBody,
     compress: CompressStreams,
     policy: NewlineBeforeEndstream,
     extends: Option<crate::ObjectRef>,
 ) -> crate::Result<()> {
-    let (_, data) = object_streams::wrap_objstm_body_as_handle(body, compress, extends)?;
+    let first_offset = body.first_offset;
+    let n_members = body.n_members;
+    let body_bytes = body.bytes;
+    let data = match compress {
+        CompressStreams::Yes => {
+            let encoded = crate::stream_filter::encode_flate(&body_bytes)?;
+            drop(body_bytes);
+            encoded
+        }
+        CompressStreams::No => body_bytes,
+    };
     out.write_bytes(b"<< /Type /ObjStm /Length ")?;
     out.write_bytes(data.len().to_string().as_bytes())?;
     if matches!(compress, CompressStreams::Yes) {
         out.write_bytes(b" /Filter /FlateDecode")?;
     }
-    out.write_bytes(format!(" /N {} /First {}", body.n_members, body.first_offset).as_bytes())?;
+    out.write_bytes(format!(" /N {n_members} /First {first_offset}").as_bytes())?;
     if let Some(extends) = extends {
         out.write_bytes(
             format!(" /Extends {} {} R", extends.number, extends.generation).as_bytes(),
@@ -103,15 +113,16 @@ pub(crate) fn write_objstm_stream_with_extends(
 /// applies the QDF stream framing rule (`QPDFWriter.cc:1620-1775`).
 pub(crate) fn write_objstm_stream_with_extends_qdf(
     out: &mut OutputSink<'_>,
-    body: &object_streams::ObjStmBody,
+    body: object_streams::ObjStmBody,
     extends: Option<crate::ObjectRef>,
     first_offset: usize,
     newline_before_endstream: NewlineBeforeEndstream,
 ) -> crate::Result<()> {
-    let (_, data) = object_streams::wrap_objstm_body_as_handle(body, CompressStreams::No, extends)?;
+    let n_members = body.n_members;
+    let data = body.bytes;
     out.write_bytes(b"<<\n  /Type /ObjStm\n")?;
     out.write_bytes(format!("  /Length {}\n", data.len()).as_bytes())?;
-    out.write_bytes(format!("  /N {}\n", body.n_members).as_bytes())?;
+    out.write_bytes(format!("  /N {n_members}\n").as_bytes())?;
     out.write_bytes(format!("  /First {first_offset}\n").as_bytes())?;
     if let Some(extends) = extends {
         out.write_bytes(

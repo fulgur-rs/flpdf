@@ -99,6 +99,7 @@ fn writer_local_raw_ref(raw: QpdfObjGen) -> Option<ObjectRef> {
 pub(crate) struct CanonicalCatalogFirstRenumber {
     old_to_new: HashMap<ObjectRef, ObjectRef>,
     order: Vec<ObjectRef>,
+    #[cfg(test)]
     raw_sources: HashMap<ObjectRef, QpdfObjGen>,
 }
 
@@ -126,6 +127,7 @@ impl CanonicalCatalogFirstRenumber {
             .map(|(index, &source)| (ObjectRef::new(index as u32 + 1, 0), source))
     }
 
+    #[cfg(test)]
     pub(crate) fn raw_source_for(&self, source: ObjectRef) -> Option<QpdfObjGen> {
         self.raw_sources.get(&source).copied()
     }
@@ -243,6 +245,7 @@ impl CanonicalCatalogFirstRenumber {
         Ok(Self {
             old_to_new,
             order,
+            #[cfg(test)]
             raw_sources,
         })
     }
@@ -656,6 +659,7 @@ fn walk_resurrectable_handle(
 // Shared by Preserve and Generate plain-writer planning.
 pub(crate) struct ObjectStreamRenumber {
     old_to_new: HashMap<ObjectRef, ObjectRef>,
+    #[cfg(test)]
     raw_sources: HashMap<ObjectRef, QpdfObjGen>,
     /// New object number assigned to each input group's container, in group
     /// order. `container_new[i]` is `None` only if group `i` was never reached.
@@ -671,6 +675,7 @@ impl ObjectStreamRenumber {
         self.container_new.get(group_index).copied().flatten()
     }
 
+    #[cfg(test)]
     pub(crate) fn raw_source_for(&self, source: ObjectRef) -> Option<QpdfObjGen> {
         self.raw_sources.get(&source).copied()
     }
@@ -927,6 +932,7 @@ impl ObjectStreamRenumber {
         Ok(Self {
             old_to_new,
             container_new,
+            #[cfg(test)]
             raw_sources,
         })
     }

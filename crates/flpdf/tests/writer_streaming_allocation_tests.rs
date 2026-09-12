@@ -662,6 +662,11 @@ fn arbitrary_writer_surfaces_write_zero_as_an_io_failure() {
 #[test]
 fn memory_output_is_the_one_complete_output_owner() {
     let memory_bytes = write_memory_output();
+    let mut parsed = Pdf::open(Cursor::new(memory_bytes.clone()))
+        .expect("streamed xref offsets must reopen the completed PDF");
+    parsed
+        .root_handle()
+        .expect("streamed xref must resolve the written Catalog");
 
     let writer_bytes = Rc::new(RefCell::new(Vec::new()));
     let mut writer_pdf = minimal_pdf();

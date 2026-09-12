@@ -93,6 +93,7 @@ pub(crate) trait ObjectWriterEmission {
         map: &dyn Fn(ObjectRef) -> Result<ObjectRef>,
         removed_refs: &BTreeSet<ObjectRef>,
     ) -> Result<()>;
+    #[cfg(test)]
     fn write_root_object_with_ref_map_and_removed(
         &self,
         out: &mut OutputSink<'_>,
@@ -878,6 +879,7 @@ impl ObjectWriterEmission for ObjectHandle {
     /// copy local to serialization. Existing direct Extensions remain shared:
     /// replacing or removing ADBE there also changes the live graph. Creating
     /// or removing the root's Extensions key changes only the output copy.
+    #[cfg(test)]
     fn write_root_object_with_ref_map_and_removed(
         &self,
         out: &mut OutputSink<'_>,

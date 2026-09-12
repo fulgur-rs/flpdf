@@ -4,22 +4,30 @@
 use std::collections::{BTreeMap, BTreeSet, HashMap};
 use std::io::{Read, Seek};
 
+#[cfg(test)]
 use crate::pdf_version::{parse_qpdf_writer_version, QpdfVersionParts};
+#[cfg(test)]
 use crate::qpdf_obj_gen::QpdfObjGen;
 use crate::writer::object_streams::{self, ObjectStreamGroup, ObjectStreamMode};
+#[cfg(test)]
 use crate::writer::plain::xref::{materialized_id_handle, IdPlan, TrailerPlan};
+#[cfg(test)]
 use crate::writer::rewrite_renumber::{
     CanonicalCatalogFirstRenumber, NewNumberLookup, ObjectStreamRenumber,
 };
 use crate::writer::{ObjectWriterEmission, WriterOptions};
-use crate::{CompressStreams, ObjectHandle, ObjectRef, Pdf, XrefEntry, XrefForm};
+#[cfg(test)]
+use crate::{CompressStreams, XrefEntry, XrefForm};
+use crate::{ObjectHandle, ObjectRef, Pdf};
 
+#[cfg(test)]
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub(crate) struct PlannedMember {
     pub(crate) source: ObjectRef,
     pub(crate) output: ObjectRef,
 }
 
+#[cfg(test)]
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub(crate) enum PlannedObjectStreamOrigin {
     SourceBacked(ObjectRef),
@@ -27,6 +35,7 @@ pub(crate) enum PlannedObjectStreamOrigin {
     Synthetic,
 }
 
+#[cfg(test)]
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub(crate) enum PlannedIndirectObject {
     Source {
@@ -98,6 +107,7 @@ pub(crate) fn build_live_object_stream_plan<R: Read + Seek>(
     }
 }
 
+#[cfg(test)]
 #[derive(Clone, Debug)]
 pub(crate) struct PlainWritePlan {
     pub(crate) version: String,
@@ -110,16 +120,11 @@ pub(crate) struct PlainWritePlan {
     pub(crate) direct_root: Option<crate::ObjectHandle>,
     pub(crate) old_to_new: HashMap<ObjectRef, ObjectRef>,
     pub(crate) removed_refs: BTreeSet<ObjectRef>,
-    /// QDF re-numbers the same planned objects in emission order and inserts
-    /// a synthetic length holder after each ordinary stream. The holder map is
-    /// kept beside the plan so the body emitter can use the qpdf numbering
-    /// without manufacturing source identities for those output-only objects.
-    pub(crate) qdf_holder_map: HashMap<u32, u32>,
     pub(crate) qdf_holder_numbers: BTreeSet<u32>,
-    pub(crate) trailer_handle: crate::ObjectHandle,
     pub(crate) trailer: TrailerPlan,
 }
 
+#[cfg(test)]
 impl PlainWritePlan {
     #[cfg(test)]
     pub(crate) fn build<R: Read + Seek>(
@@ -578,15 +583,10 @@ impl PlainWritePlan {
             direct_root,
             old_to_new: placement.old_to_new,
             removed_refs: placement.removed_refs,
-            qdf_holder_map: qdf_emission
-                .as_ref()
-                .map(|qdf| qdf.holder_map.clone())
-                .unwrap_or_default(),
             qdf_holder_numbers: qdf_emission
                 .as_ref()
                 .map(|qdf| qdf.holder_numbers.clone())
                 .unwrap_or_default(),
-            trailer_handle,
             trailer,
         };
         plan.validate()?;
@@ -744,17 +744,18 @@ impl PlainWritePlan {
     }
 }
 
+#[cfg(test)]
 struct PlacementPlan {
     objects: Vec<PlannedIndirectObject>,
     old_to_new: HashMap<ObjectRef, ObjectRef>,
     removed_refs: BTreeSet<ObjectRef>,
 }
 
+#[cfg(test)]
 #[derive(Debug, Default)]
 struct QdfEmissionPlan {
     map: HashMap<ObjectRef, ObjectRef>,
     container_map: HashMap<ObjectRef, ObjectRef>,
-    holder_map: HashMap<u32, u32>,
     holder_numbers: BTreeSet<u32>,
 }
 
@@ -763,6 +764,7 @@ struct QdfEmissionPlan {
 /// inserts an output-only `/Length` holder immediately after every ordinary
 /// stream; ObjStm members are part of the container body and do not receive
 /// holders of their own (`QPDFWriter.cc:1621-1775`).
+#[cfg(test)]
 fn build_qdf_emission_plan<R: Read + Seek>(
     pdf: &mut Pdf<R>,
     placement: &PlacementPlan,
@@ -796,7 +798,6 @@ fn build_qdf_emission_plan<R: Read + Seek>(
                     && !handle.try_is_stream_of_type(b"XRef", b"")?;
                 if is_real_stream {
                     let holder = next_number()?;
-                    result.holder_map.insert(emission, holder);
                     result.holder_numbers.insert(holder);
                 }
             }
@@ -812,7 +813,6 @@ fn build_qdf_emission_plan<R: Read + Seek>(
                     && !handle.try_is_stream_of_type(b"XRef", b"")?
                 {
                     let holder = next_number()?;
-                    result.holder_map.insert(emission, holder);
                     result.holder_numbers.insert(holder);
                 }
             }
@@ -947,6 +947,7 @@ fn is_writer_owned_trailer_key(key: &[u8]) -> bool {
     )
 }
 
+#[cfg(test)]
 fn build_sources_from_canonical_renumber(
     renumber: &CanonicalCatalogFirstRenumber,
 ) -> PlacementPlan {
@@ -975,6 +976,7 @@ fn build_sources_from_canonical_renumber(
     }
 }
 
+#[cfg(test)]
 fn renumber_plain<R: Read + Seek>(
     pdf: &mut Pdf<R>,
     groups: &[ObjectStreamGroup],
@@ -990,6 +992,7 @@ fn renumber_plain<R: Read + Seek>(
     )
 }
 
+#[cfg(test)]
 fn retain_reachable_object_stream_members<R: Read + Seek>(
     pdf: &mut Pdf<R>,
     groups: &mut Vec<ObjectStreamGroup>,
@@ -1016,6 +1019,7 @@ fn retain_reachable_object_stream_members<R: Read + Seek>(
     Ok(())
 }
 
+#[cfg(test)]
 fn build_container_aware(
     renumber: ObjectStreamRenumber,
     groups: Vec<ObjectStreamGroup>,
@@ -1111,12 +1115,21 @@ fn build_container_aware(
     })
 }
 
+#[cfg(test)]
+pub(crate) fn source_has_compressed_entries<R: Read + Seek>(pdf: &Pdf<R>) -> bool {
+    pdf.source_xref_entries()
+        .values()
+        .any(|offset| matches!(offset, XrefEntry::Compressed { .. }))
+}
+
+#[cfg(test)]
 impl NewNumberLookup for PlainWritePlan {
     fn new_for_original(&self, original: ObjectRef) -> Option<ObjectRef> {
         PlainWritePlan::new_for_original(self, original)
     }
 }
 
+#[cfg(test)]
 fn require_unique_output(outputs: &mut BTreeSet<u32>, output: ObjectRef) -> crate::Result<()> {
     if outputs.insert(output.number) {
         Ok(())
@@ -1128,6 +1141,7 @@ fn require_unique_output(outputs: &mut BTreeSet<u32>, output: ObjectRef) -> crat
     }
 }
 
+#[cfg(test)]
 fn require_unique_source(
     sources: &mut BTreeSet<ObjectRef>,
     source: ObjectRef,
@@ -1142,6 +1156,7 @@ fn require_unique_source(
     }
 }
 
+#[cfg(test)]
 fn require_not_removed(
     removed_refs: &BTreeSet<ObjectRef>,
     source: ObjectRef,
@@ -1157,6 +1172,7 @@ fn require_not_removed(
     }
 }
 
+#[cfg(test)]
 fn require_matching_mapping(
     old_to_new: &HashMap<ObjectRef, ObjectRef>,
     source: ObjectRef,
@@ -1347,7 +1363,11 @@ mod tests {
         let plan = PlainWritePlan::build(&mut pdf, &options).unwrap();
         assert!(calls.borrow().is_empty());
 
-        crate::writer::plain::body::emit_bodies(&mut pdf, &options, &plan).unwrap();
+        let mut output = Vec::new();
+        crate::writer::output::with_buffer_sink(&mut output, |out| {
+            crate::writer::plain::body::emit_bodies(&mut pdf, out, &options, &plan)
+        })
+        .unwrap();
         assert_eq!(*calls.borrow(), vec![(false, true), (false, false)]);
     }
 
@@ -1396,9 +1416,7 @@ mod tests {
             direct_root: None,
             old_to_new: HashMap::from([(root_source, root_output)]),
             removed_refs: BTreeSet::new(),
-            qdf_holder_map: HashMap::new(),
             qdf_holder_numbers: BTreeSet::new(),
-            trailer_handle: crate::ObjectHandle::dictionary(Vec::new()),
             trailer: TrailerPlan {
                 form: XrefForm::Table,
                 canonical_entries: Vec::new(),
@@ -1710,7 +1728,10 @@ mod tests {
                 0,
             ),
         );
-        append_xref_and_trailer(&mut bytes, &layout, &plan.trailer).unwrap();
+        crate::writer::output::with_buffer_sink(&mut bytes, |out| {
+            append_xref_and_trailer(out, &layout, &plan.trailer)
+        })
+        .unwrap();
         let text = String::from_utf8_lossy(&bytes);
         let escaped_space = text.find("/#20A").expect("escaped space-name key");
         let exclamation = text.find("/!A").expect("exclamation-name key");

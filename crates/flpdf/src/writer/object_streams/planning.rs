@@ -102,6 +102,7 @@ impl ObjectStreamGroup {
         }
     }
 
+    #[cfg(test)]
     pub(crate) fn members_mut(&mut self) -> &mut Vec<ObjectRef> {
         match self {
             Self::SourceBacked { members, .. }
