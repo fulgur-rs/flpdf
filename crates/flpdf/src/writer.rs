@@ -5882,6 +5882,7 @@ mod final_handle_writer_tests {
     use super::*;
     use crate::encryption::standard::ObjectKeyAlg;
     use crate::encryption::CopyEncryptionSource;
+    use crate::pipeline::{PipelineError, PipelineResult};
     use crate::writer::object::TrailerKind;
     use std::io::{self, Cursor, Write};
 
@@ -5956,6 +5957,47 @@ mod final_handle_writer_tests {
         fn flush(&mut self) -> io::Result<()> {
             Ok(())
         }
+    }
+
+    struct FinishFailingPipeline {
+        writes: Rc<Cell<usize>>,
+        finishes: Rc<Cell<usize>>,
+    }
+
+    impl Pipeline for FinishFailingPipeline {
+        fn identifier(&self) -> &str {
+            "writer test finish failure"
+        }
+
+        fn write(&mut self, _data: &[u8]) -> PipelineResult<()> {
+            self.writes.set(self.writes.get() + 1);
+            Ok(())
+        }
+
+        fn finish(&mut self) -> PipelineResult<()> {
+            self.finishes.set(self.finishes.get() + 1);
+            Err(PipelineError::runtime(
+                "writer stream segment finish failure",
+            ))
+        }
+    }
+
+    #[test]
+    fn writer_pipeline_surfaces_a_segment_finish_failure_after_writing() {
+        let writes = Rc::new(Cell::new(0));
+        let finishes = Rc::new(Cell::new(0));
+        let mut pipeline = FinishFailingPipeline {
+            writes: Rc::clone(&writes),
+            finishes: Rc::clone(&finishes),
+        };
+
+        let error = run_writer_pipeline(&mut pipeline, b"stream payload")
+            .expect_err("a segment finish failure must escape the writer pipeline");
+        assert!(error
+            .to_string()
+            .contains("writer stream segment finish failure"));
+        assert_eq!(writes.get(), 1, "the segment payload was written once");
+        assert_eq!(finishes.get(), 1, "the segment was finished once");
     }
 
     fn shared_trailer_contract_fixture(
