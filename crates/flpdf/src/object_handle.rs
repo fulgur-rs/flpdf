@@ -1128,6 +1128,9 @@ struct ObjectSlot {
     /// this token preserves that single-document boundary for flpdf's
     /// per-call `&mut Pdf` API without introducing a raw-object bridge.
     tree_pdf_unique_id: Option<u64>,
+    // qpdf-deviation: qpdf keeps only forward child handles; this weak reverse
+    // edge has no qpdf counterpart and is retained solely for cfg(test)
+    // containment-root assertions and stack-safe teardown bookkeeping.
     containment_parents: Vec<Weak<RefCell<ObjectSlot>>>,
     description: Option<ObjectDescription>,
     /// qpdf's `QPDF_Stream::token_filters` list. It is attached to the

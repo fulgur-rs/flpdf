@@ -2478,6 +2478,22 @@ CI で走らない。ファイル全体が gated な 11 件は全て列挙済み
 
 配列・辞書の `ArrayItemCursor` / `DictItemCursor` もこの ObjectHandle 境界で qpdf の identity を保持する。qpdf の `operator*` は内部 `ivalue` への参照を返すため C++ の `auto&` はカーソル移動を観測するが、コピーされた `QPDFObjectHandle` は選択 child の shared identity を保ったまま移動後も安定する。Rust の `current()` は安全な値返却 API なので後者に対応し、移動後は新しい `current()` を読む。辞書は qpdf の visible key snapshot を維持し、snapshot 内の削除済み key は initialized null、非辞書 receiver は qpdf の contextual warning/null contract、snapshot end だけが uninitialized を返す（`libqpdf/QPDFObjectHandle.cc:2398-2561`; `qpdf/test_driver.cc:1418-1434`）。
 
+### `ObjectSlot::containment_parents` の確定済み逸脱（`flpdf-ymuj.3.3`）
+
+qpdf の `QPDF_Array` / `QPDF_Dictionary` は forward child handles だけを保持し、
+`push_back` / `replaceKey` / `removeKey` で上向きの親indexを更新しない
+（`QPDF_Array.cc:33-48,235-286`; `QPDF_Dictionary.cc:10-18,51-56,117-150`）。
+`QPDFValue::ChildDescr` の弱い親は optional な object description の一部で、
+warning text の `-> dictionary key $VD` を組み立てるための診断文脈であり、
+containment root の逆引きではない（`QPDFValue.hh:41-58,74-84`;
+`QPDFObject_private.hh:77-92`）。したがって flpdf の
+`ObjectSlot::containment_parents` は qpdf に対応物のない reverse edge として
+module内で `qpdf-deviation` を明示する。ただし全readerは `cfg(test)` の
+current containment-root assertion と teardown safety netに限られ、本番の
+ownership・warning・writer scheduling・output bytesを決めない。qpdfのforward
+teardown（`QPDF.cc:215-235`; `QPDF_Array.cc:103-119`; `QPDF_Dictionary.cc:51-56`）
+や `active_pdf_unique_id` の単一owner表現とは混同しない。
+
 直接構築された深いコンテナの破棄は、qpdf 11.9.0 の `QPDFObject`/`QPDFValue` と
 `QPDF_Array`/`QPDF_Dictionary` の shared-pointer ownership（`QPDFObject_private.hh:19-24,176-179`、
 `QPDFValue.hh:18-27`、`QPDF_Array.hh:9-50`、`QPDF_Dictionary.hh:11-38`、
