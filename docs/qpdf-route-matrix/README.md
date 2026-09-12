@@ -169,7 +169,12 @@ D19/D30はcanonical ownerへ委譲するbyte-neutral test scaffolding、D27は�
 
 ## 6. 二重正本トラッカー
 
-追跡対象の symbol manifest は [tracked-symbols.txt](tracked-symbols.txt)。現行の bridge / mixed は97行だが、
+追跡対象の symbol manifest は [tracked-symbols.txt](tracked-symbols.txt)。この matrix revision の
+classified row は 259 行で、canonical 119 / mixed 128 / bridge 12 / unknown 0（bridge + mixed は140行）である。
+内訳は A=24 / B=34 / C=42 / D=31 / E=128（E 表 29 行 + qtest exception 表 99 行）。
+`scripts/check-qpdf-route-matrix.py` が報告する 236 行はこれより 23 行少ない。同スクリプトは
+classification テーブルの途中に散文行が入るとその表のカウントを打ち切るため、
+`e-job-cli-capi.md` の E-8 〜 E-29 などが集計から落ちる（`flpdf-335in` で追跡）。
 manifest は行集合の完全な機械変換ではなく、削除済みsymbolの0確認とcanonical側の分母も保持する。
 B7 は `.48.14` でObjStm header用の専用token consumerを追加した。C44 は `ObjectHandle::get_stream_json` を owner とする。B29 は `Pdf::get_warnings` / `any_warnings` / `num_warnings` の canonical API と、後続移行対象の `repair_diagnostics` snapshot を区別する。
 symbol数はmanifestの非comment・非空行から数え、行数と同一視しない。
