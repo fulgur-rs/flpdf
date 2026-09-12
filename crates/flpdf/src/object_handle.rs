@@ -53,10 +53,7 @@
 //! `ValueIdentity::active_pdf_unique_id` is a container representation
 //! substitute for qpdf's per-value `QPDF*` back-pointer (`QPDFValue.hh:150`):
 //! a real qpdf counterpart exists, flpdf just projects it to a numeric id
-//! beside a separate `Weak` resolver route. `ObjectSlot::pdf_unique_ids` has
-//! no qpdf counterpart at all -- it is flpdf-only history bookkeeping that
-//! outlives detachment, not a live containment index; see the field's own
-//! `#[deprecated]` attribute.
+//! beside a separate `Weak` resolver route.
 //
 // qpdf-deviation-start: qpdf 11.9.0's default destruction of a sufficiently
 // deep programmatic direct container graph recursively follows the
@@ -1125,19 +1122,6 @@ struct ObjectSlot {
     parsed_offset: i64,
     end_before_space: i64,
     end_after_space: i64,
-    // Separable at field granularity, so CLAUDE.md's marker policy calls for
-    // #[deprecated] here rather than a comment marker: qpdf has no per-object
-    // document-id set. This set supports flpdf's ownership-history
-    // bookkeeping, but it is not a live containment index:
-    // `associate_pdf_identity` inserts an id that `detach_child_from_parent`
-    // never removes, so a value's prior document ids remain here as history
-    // after it is no longer reachable there (see `check_key_value_ownership`'s
-    // own note on this). Its six accessor functions get #[allow(deprecated)]
-    // locally rather than spreading unchecked.
-    #[deprecated(
-        note = "no qpdf counterpart; not a live containment index -- retains stale document ids as history, do not add new callers"
-    )]
-    pdf_unique_ids: BTreeSet<u64>,
     /// The document identity claimed by a handle-native name/number-tree
     /// wrapper while this shared root is still contextless. qpdf's tree
     /// helper retains its owning `QPDF` alongside the shared object handle;
@@ -1336,7 +1320,6 @@ pub(crate) enum ObjectValue {
     },
 }
 
-#[allow(deprecated)]
 fn empty_object_slot() -> Rc<RefCell<ObjectSlot>> {
     Rc::new(RefCell::new(ObjectSlot {
         initialized: false,
@@ -1351,7 +1334,6 @@ fn empty_object_slot() -> Rc<RefCell<ObjectSlot>> {
         parsed_offset: NO_PARSED_OFFSET,
         end_before_space: NO_PARSED_OFFSET,
         end_after_space: NO_PARSED_OFFSET,
-        pdf_unique_ids: BTreeSet::new(),
         tree_pdf_unique_id: None,
         containment_parents: Vec::new(),
         description: None,
@@ -1802,9 +1784,8 @@ impl ObjectHandle {
     ///
     /// Neither half is sufficient alone. The resolver is what
     /// [`Self::try_dereference`] upgrades and calls; the identity is what
-    /// [`Self::belongs_to_pdf`] answers on. [`Self::set_resolved`] propagates
-    /// that identity separately from the live immediate-parent edges used by
-    /// test-only containment inspection helpers.
+    /// [`Self::belongs_to_pdf`] answers on. [`Self::set_resolved`] installs
+    /// the resolved value and its live immediate-parent edges independently.
     ///
     /// `pdf_unique_id` itself ports qpdf's document-level unique id:
     /// `QPDF::getUniqueId` (`include/qpdf/QPDF.hh:283`,
@@ -1863,7 +1844,6 @@ impl ObjectHandle {
     /// Construct qpdf's document-owned reserved sentinel with a fresh
     /// indirect identity. The resolver link is weak for the same lifetime
     /// reason as ordinary canonical handles.
-    #[allow(deprecated)]
     pub(crate) fn new_reserved_for_pdf(
         object_ref: ObjectRef,
         pdf_unique_id: u64,
@@ -1882,7 +1862,6 @@ impl ObjectHandle {
             parsed_offset: NO_PARSED_OFFSET,
             end_before_space: NO_PARSED_OFFSET,
             end_after_space: NO_PARSED_OFFSET,
-            pdf_unique_ids: BTreeSet::new(),
             tree_pdf_unique_id: None,
             containment_parents: Vec::new(),
             description: None,
@@ -1905,7 +1884,6 @@ impl ObjectHandle {
     /// [`crate::Pdf::new_reserved`] hands out), this shares no identity, no
     /// object number, and no owning document with the handle it was copied
     /// from.
-    #[allow(deprecated)]
     pub(crate) fn new_reserved_direct() -> Self {
         let handle = Self(Rc::new(RefCell::new(ObjectSlot {
             initialized: true,
@@ -1920,7 +1898,6 @@ impl ObjectHandle {
             parsed_offset: NO_PARSED_OFFSET,
             end_before_space: NO_PARSED_OFFSET,
             end_after_space: NO_PARSED_OFFSET,
-            pdf_unique_ids: BTreeSet::new(),
             tree_pdf_unique_id: None,
             containment_parents: Vec::new(),
             description: None,
@@ -1957,7 +1934,6 @@ impl ObjectHandle {
         )
     }
 
-    #[allow(deprecated)]
     fn new_indirect_unresolved_with_identity(
         object_ref: ObjectRef,
         offset: i64,
@@ -1974,7 +1950,6 @@ impl ObjectHandle {
         handle
     }
 
-    #[allow(deprecated)]
     fn new_indirect_unresolved_qpdf_obj_gen_with_identity(
         object_gen: QpdfObjGen,
         offset: i64,
@@ -1995,7 +1970,6 @@ impl ObjectHandle {
             parsed_offset: NO_PARSED_OFFSET,
             end_before_space: NO_PARSED_OFFSET,
             end_after_space: NO_PARSED_OFFSET,
-            pdf_unique_ids: BTreeSet::new(),
             tree_pdf_unique_id: None,
             containment_parents: Vec::new(),
             description: None,
@@ -2031,7 +2005,6 @@ impl ObjectHandle {
         Self::new_direct_with_resolver_inner(value, parsed_offset, None)
     }
 
-    #[allow(deprecated)]
     fn new_direct_with_resolver_inner(
         value: ObjectValue,
         parsed_offset: i64,
@@ -2050,7 +2023,6 @@ impl ObjectHandle {
             parsed_offset,
             end_before_space: NO_PARSED_OFFSET,
             end_after_space: NO_PARSED_OFFSET,
-            pdf_unique_ids: BTreeSet::new(),
             tree_pdf_unique_id: None,
             containment_parents: Vec::new(),
             description: None,
@@ -2593,13 +2565,15 @@ impl ObjectHandle {
             .collect()
     }
 
-    #[allow(deprecated)]
     pub(crate) fn belongs_to_pdf(&self, pdf_unique_id: u64) -> bool {
         let slot = self.0.borrow();
         if slot.is_indirect() {
             slot.active_pdf_unique_id() == Some(pdf_unique_id)
         } else {
-            slot.pdf_unique_ids.is_empty() || slot.pdf_unique_ids.contains(&pdf_unique_id)
+            match slot.active_pdf_unique_id() {
+                Some(owner) => owner == pdf_unique_id,
+                None => true,
+            }
         }
     }
 
@@ -2617,7 +2591,6 @@ impl ObjectHandle {
     /// check does not catch. [`Self::check_key_value_ownership`] (the
     /// `replace_key` and array mutator ownership boundary) intentionally does
     /// not call this: qpdf's real `checkOwnership` never does either.
-    #[allow(deprecated)]
     pub(crate) fn belongs_exclusively_to_pdf(&self, pdf_unique_id: u64) -> bool {
         let mut pending = vec![self.clone()];
         let mut visited = BTreeSet::new();
@@ -2626,13 +2599,12 @@ impl ObjectHandle {
             if !visited.insert(identity) {
                 continue;
             }
-            let (is_indirect, active_pdf_unique_id, pdf_unique_ids, children) = {
+            let (is_indirect, active_pdf_unique_id, children) = {
                 let slot = handle.0.borrow();
                 let state = slot.state.borrow();
                 (
                     slot.is_indirect(),
                     slot.active_pdf_unique_id(),
-                    slot.pdf_unique_ids.clone(),
                     Self::state_children(&state),
                 )
             };
@@ -2642,10 +2614,7 @@ impl ObjectHandle {
                 }
                 continue;
             }
-            if pdf_unique_ids
-                .iter()
-                .any(|known_pdf_unique_id| *known_pdf_unique_id != pdf_unique_id)
-            {
+            if active_pdf_unique_id.is_some_and(|owner| owner != pdf_unique_id) {
                 return false;
             }
             pending.extend(children);
@@ -4803,15 +4772,9 @@ impl ObjectHandle {
     /// carry the parser's QPDF context (`QPDFParser.cc:394-444`). Mere
     /// containment inside another document's object graph does not confer
     /// ownership. This deliberately does not consult
-    /// [`Self::belongs_exclusively_to_pdf`] or the `pdf_unique_ids` history
-    /// set that field reads from: that bookkeeping records document identity
-    /// history but is not a live containment index -- it keeps a value's prior
-    /// document id after it is
-    /// no longer reachable there, which is not qpdf's ownership semantics
-    /// and would reject a direct value (a null or any other scalar) that
-    /// merely passed through a different document's object graph at some
-    /// earlier point, even though qpdf itself never associates ownership
-    /// with a direct value that way.
+    /// [`Self::belongs_exclusively_to_pdf`]: qpdf's real `checkOwnership`
+    /// compares only the two handles' own active document identities and does
+    /// not walk direct containment edges.
     fn check_key_value_ownership(&self, value: &ObjectHandle) -> Result<()> {
         if let (Some(self_pdf_unique_id), Some(value_pdf_unique_id)) =
             (self.owning_pdf_unique_id(), value.owning_pdf_unique_id())
@@ -4996,7 +4959,6 @@ impl ObjectHandle {
         Weak::ptr_eq(left, right)
     }
 
-    #[allow(deprecated)]
     fn attach_child_to_parent(child: &ObjectHandle, parent: &Weak<RefCell<ObjectSlot>>) {
         if child.is_indirect() {
             return;
@@ -5006,21 +4968,6 @@ impl ObjectHandle {
             slot.containment_parents
                 .retain(Self::containment_parent_is_live);
             slot.containment_parents.push(parent.clone());
-        }
-
-        let pdf_unique_ids = parent
-            .upgrade()
-            .map(|parent| {
-                let slot = parent.borrow();
-                slot.pdf_unique_ids
-                    .iter()
-                    .copied()
-                    .chain(slot.active_pdf_unique_id())
-                    .collect::<BTreeSet<_>>()
-            })
-            .unwrap_or_default();
-        for pdf_unique_id in pdf_unique_ids {
-            child.associate_pdf_identity(pdf_unique_id, &mut BTreeSet::new());
         }
     }
 
@@ -5043,29 +4990,6 @@ impl ObjectHandle {
         let parent = self.containment_parent();
         for child in Self::direct_children(value) {
             Self::attach_child_to_parent(&child, &parent);
-        }
-    }
-
-    #[allow(deprecated)]
-    fn associate_pdf_identity(&self, pdf_unique_id: u64, visited: &mut BTreeSet<usize>) {
-        let mut pending = vec![self.clone()];
-        while let Some(handle) = pending.pop() {
-            if handle.is_indirect() {
-                continue;
-            }
-            let identity = Rc::as_ptr(&handle.0) as usize;
-            if !visited.insert(identity) {
-                continue;
-            }
-            let children = {
-                let mut slot = handle.0.borrow_mut();
-                slot.pdf_unique_ids.insert(pdf_unique_id);
-                let state = slot.state.clone();
-                drop(slot);
-                let children = Self::direct_children(&state.borrow());
-                children
-            };
-            pending.extend(children);
         }
     }
 
@@ -9293,14 +9217,12 @@ pub(crate) mod identity_tests {
     /// resolver at once: `Pdf::get_object_handle` hands out one handle that
     /// must answer both questions.
     ///
-    /// The identity is not decorative. `set_resolved` propagates the slot's
-    /// `pdf_unique_id` through every current direct descendant independently
-    /// of the live immediate-parent edges. The identity provenance drives
-    /// [`ObjectHandle::belongs_to_pdf`], while those edges drive
+    /// The identity is not decorative. The slot's single active
+    /// `pdf_unique_id` drives [`ObjectHandle::belongs_to_pdf`], while live
+    /// immediate-parent edges drive
     /// [`ObjectHandle::containing_object_refs_for_pdf`] — respectively the
-    /// foreign-object rejection and current owner lookup in
-    /// `filespec_helper` and `embedded_files`. Measured against the current
-    /// tree, not predicted:
+    /// document-ownership check and current owner lookup in `filespec_helper`
+    /// and `embedded_files`. Measured against the current tree, not predicted:
     /// this is now the constructor `Pdf::get_object_handle` uses — the
     /// identity-only `new_indirect_unresolved_for_pdf` was deleted when it
     /// switched over — and patching it to discard its `pdf_unique_id`
@@ -9495,7 +9417,7 @@ pub(crate) mod identity_tests {
     }
 
     #[test]
-    fn detached_child_preserves_pdf_identity_without_a_live_root() {
+    fn detached_programmatic_child_remains_unowned_without_a_live_root() {
         let owner_ref = ObjectRef::new(7, 0);
         let resolver: Rc<dyn DocumentResolver> = Rc::new(RecordingResolver::default());
         let owner = ObjectHandle::new_indirect_for_pdf_with_resolver(
@@ -9514,12 +9436,51 @@ pub(crate) mod identity_tests {
         parent.remove_key(b"/Child");
 
         assert!(child.belongs_to_pdf(41));
-        assert!(!child.belongs_to_pdf(42));
+        assert!(child.belongs_to_pdf(42));
+        assert!(child.belongs_exclusively_to_pdf(42));
         assert!(child.containing_object_refs_for_pdf(41).is_empty());
     }
 
+    struct OwnedIdentityResolver;
+
+    impl DocumentResolver for OwnedIdentityResolver {
+        fn resolve_indirect(
+            &self,
+            _object_ref: ObjectRef,
+            _handle: &ObjectHandle,
+        ) -> crate::Result<()> {
+            Ok(())
+        }
+
+        fn pdf_unique_id(&self) -> Option<u64> {
+            Some(4242)
+        }
+    }
+
     #[test]
-    fn pdf_identity_propagation_terminates_on_a_direct_cycle() {
+    fn parser_direct_value_uses_its_single_qpdf_owner_identity() {
+        let resolver: Rc<dyn DocumentResolver> = Rc::new(OwnedIdentityResolver);
+        let value = ObjectHandle::from_parsed_value_with_resolver(
+            ObjectValue::Integer(7),
+            Rc::downgrade(&resolver),
+        );
+
+        assert!(value.belongs_to_pdf(4242));
+        assert!(!value.belongs_to_pdf(4243));
+        assert!(value.belongs_exclusively_to_pdf(4242));
+        assert!(!value.belongs_exclusively_to_pdf(4243));
+
+        let unresolved = ObjectHandle::new_indirect_with_resolver(
+            ObjectRef::new(9, 0),
+            Rc::downgrade(&resolver),
+        );
+        unresolved
+            .try_dereference()
+            .expect("the identity resolver must remain a valid document resolver");
+    }
+
+    #[test]
+    fn direct_cycle_ownership_walk_terminates_without_history() {
         let resolver: Rc<dyn DocumentResolver> = Rc::new(RecordingResolver::default());
         let owner = ObjectHandle::new_indirect_for_pdf_with_resolver(
             ObjectRef::new(7, 0),
@@ -9536,8 +9497,8 @@ pub(crate) mod identity_tests {
             [(b"First".to_vec(), first.clone())].into_iter().collect(),
         ));
 
-        assert!(first.belongs_to_pdf(41));
-        assert!(second.belongs_to_pdf(41));
+        assert!(first.belongs_exclusively_to_pdf(41));
+        assert!(second.belongs_exclusively_to_pdf(41));
     }
 
     #[test]
@@ -10511,7 +10472,7 @@ mod uniform_identity_tests {
     }
 
     #[test]
-    fn re_promotion_updates_active_root_but_preserves_additive_provenance() {
+    fn re_promotion_updates_active_root_without_claiming_direct_children() {
         let first = resolver();
         let second = resolver();
         let child = ObjectHandle::dictionary(vec![]);
@@ -10526,6 +10487,7 @@ mod uniform_identity_tests {
         assert_eq!(parent.object_ref(), Some(ObjectRef::new(37, 4)));
         assert!(!parent.belongs_to_pdf(71));
         assert!(parent.belongs_to_pdf(72));
+        assert_eq!(child.owning_pdf_unique_id(), None);
         assert!(child.belongs_to_pdf(71));
         assert!(child.belongs_to_pdf(72));
         assert!(child.containing_object_refs_for_pdf(71).is_empty());
@@ -16089,21 +16051,13 @@ mod mutation_tests {
 
     #[test]
     fn replace_key_removes_the_key_for_a_direct_null_previously_contained_by_another_document() {
-        // A direct null handle that was earlier a
-        // descendant of a PDF-A indirect object picks up PDF A's id in its
-        // `pdf_unique_ids` history bookkeeping (`promote_to_indirect` ->
-        // `associate_pdf_identity`). That bookkeeping records identity history,
-        // not qpdf's notion of ownership
-        // (`getOwningQPDF()`, set only by `setObjGen`/indirect promotion --
-        // see `replace_key_accepts_a_foreign_descendant_nested_in_a_direct_
-        // container` above), and never clears when the null value is no
-        // longer reachable from PDF A. Using it to drive the ownership check
-        // wrongly rejects this direct null when it is later passed to
-        // `replace_key` on a PDF-B dictionary, even though this programmatic
-        // direct value is unowned in qpdf and `QPDF_Dictionary::replaceKey`'s
-        // null-removes-key branch (`QPDF_Dictionary.cc:135-146`) would run
-        // unconditionally after qpdf's own (shallow, `object_ref`-only)
-        // `checkOwnership` passes.
+        // A direct null handle that was earlier a descendant of a PDF-A
+        // indirect object remains a programmatic, unowned value: qpdf's
+        // `getOwningQPDF()` is set on the value itself, not by containment
+        // (`QPDFValue.hh:60-66,149-152`; `QPDF_Array.cc:10-26`). It must still
+        // be accepted by `replace_key` on a PDF-B dictionary, after which
+        // qpdf's null-removes-key branch (`QPDF_Dictionary.cc:135-146`) runs
+        // unconditionally.
         let (_, resolver) = super::identity_tests::resolver_bearing_handle(ObjectValue::Null);
         let stale_null = ObjectHandle::null();
         let pdf_a_container = ObjectHandle::dictionary(vec![(b"/X".to_vec(), stale_null.clone())]);
@@ -16125,8 +16079,8 @@ mod mutation_tests {
         // Companion to the null regression above: the fix must not be a
         // null-specific exemption. qpdf's `checkOwnership` never associates
         // ownership with a direct value through containment, for any type,
-        // so a direct (non-null) scalar with the same stale `pdf_unique_ids`
-        // history must be accepted and inserted, not rejected.
+        // so a direct (non-null) scalar previously contained by another
+        // document must be accepted and inserted, not rejected.
         let (_, resolver) = super::identity_tests::resolver_bearing_handle(ObjectValue::Null);
         let stale_integer = ObjectHandle::integer(7);
         let pdf_a_container =
@@ -17489,10 +17443,11 @@ mod mutation_tests {
     }
 
     #[test]
-    fn replacing_a_contained_direct_value_propagates_its_owner_to_new_children() {
+    fn replacing_a_contained_direct_value_retains_its_live_owner_for_new_children() {
         // A preserved direct stream dictionary is replaced in place by
-        // Canonical replacement. New direct descendants must inherit the same
-        // incremental-write owner rather than requiring a later graph scan.
+        // canonical replacement. New direct descendants must retain the same
+        // incremental-write containment owner rather than requiring a later
+        // graph scan.
         let owner_ref = ObjectRef::new(7, 0);
         let owner = ObjectHandle::new_indirect_unresolved(owner_ref, -1);
         let direct = ObjectHandle::dictionary(vec![]);
@@ -17509,10 +17464,10 @@ mod mutation_tests {
     }
 
     #[test]
-    fn associating_direct_owners_stops_at_an_indirect_child() {
-        // Direct containment ends at indirect identity. Propagating owner 7
-        // through this boundary would incorrectly make object 9's payload a
-        // direct child of object 7.
+    fn containment_owner_walk_stops_at_an_indirect_child() {
+        // Direct containment ends at an indirect identity. Traversing through
+        // this boundary would incorrectly make object 9's payload a direct
+        // child of object 7.
         let owner = ObjectHandle::new_indirect_unresolved(ObjectRef::new(7, 0), -1);
         let direct = ObjectHandle::dictionary(vec![]);
         owner.set_resolved(ObjectValue::Dictionary(std::collections::BTreeMap::from([
