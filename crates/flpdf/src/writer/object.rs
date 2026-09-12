@@ -4734,6 +4734,38 @@ mod tests {
     }
 
     #[test]
+    fn compact_string_writer_emits_removed_array_reference_as_null() -> Result<()> {
+        let mut pdf = Pdf::empty()?;
+        let kept = pdf.make_indirect_object_handle(ObjectHandle::integer(1))?;
+        let kept_ref = kept.object_ref().unwrap();
+        let removed = pdf.make_indirect_object_handle(ObjectHandle::integer(2))?;
+        let removed_refs = [removed.object_ref().unwrap()].into_iter().collect();
+        let array =
+            ObjectHandle::array(vec![kept, removed, ObjectHandle::string(b"value".to_vec())]);
+        let mut strings = |out: &mut OutputSink<'_>, value: &[u8]| {
+            out.write_bytes(b"<string:")?;
+            out.write_bytes(value)?;
+            out.write_bytes(b">")
+        };
+        let mut output = Vec::new();
+
+        super::super::output::with_buffer_sink(&mut output, |out| {
+            array.write_object_with_ref_map_and_removed_with_string_writer(
+                out,
+                &|object_ref| {
+                    assert_eq!(object_ref, kept_ref);
+                    Ok(ObjectRef::new(12, 0))
+                },
+                &removed_refs,
+                &mut strings,
+            )
+        })?;
+
+        assert_eq!(output, b"[ 12 0 R null <string:value> ]");
+        Ok(())
+    }
+
+    #[test]
     fn qdf_string_writer_keeps_signature_contents_hex_and_formats_arrays() -> Result<()> {
         let mut pdf = Pdf::empty()?;
         let mapped = pdf.make_indirect_object_handle(ObjectHandle::integer(9))?;

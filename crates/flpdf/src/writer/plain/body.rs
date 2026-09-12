@@ -2311,6 +2311,7 @@ fn planned_member_body_violation(
 mod final_handle_tests {
     use super::{
         canonical_stream_output_for_rewrite, emit_content_container_from_handle_with_ref_map,
+        emit_content_container_from_handle_with_ref_map_and_string_writer,
     };
     use crate::writer::{NewlineBeforeEndstream, WriterOptions};
     use crate::ObjectHandle;
@@ -2409,6 +2410,73 @@ mod final_handle_tests {
         assert!(text.contains("/Nested 2"));
         assert!(text.contains("stream\ndata\nendstream"));
         assert!(text.ends_with(">>"));
+    }
+
+    #[test]
+    fn content_array_frames_direct_streams_nulls_removed_refs_and_uses_string_writer() {
+        let mut pdf = crate::Pdf::empty().expect("create content-array owner");
+        let removed = pdf
+            .make_indirect_object_handle(ObjectHandle::integer(9))
+            .expect("create removed content reference");
+        let kept = pdf
+            .make_indirect_object_handle(ObjectHandle::integer(8))
+            .expect("create mapped content reference");
+        let kept_ref = kept.object_ref().expect("mapped identity");
+        let removed_refs = [removed.object_ref().expect("removed identity")]
+            .into_iter()
+            .collect();
+        let stream = ObjectHandle::stream(
+            ObjectHandle::dictionary(vec![(b"/Length".to_vec(), ObjectHandle::integer(4))]),
+            Rc::new(b"data".to_vec()),
+        );
+        let container = ObjectHandle::array(vec![
+            ObjectHandle::string(b"secret".to_vec()),
+            kept,
+            removed,
+            stream,
+        ]);
+
+        for qdf in [false, true] {
+            let options = WriterOptions {
+                qdf,
+                newline_before_endstream: NewlineBeforeEndstream::Never,
+                ..WriterOptions::default()
+            };
+            let mut output = Vec::new();
+            let mut write_string = |out: &mut crate::writer::output::OutputSink<'_>,
+                                    value: &[u8]| {
+                out.write_bytes(b"<wrapped:")?;
+                out.write_bytes(value)?;
+                out.write_bytes(b">")
+            };
+
+            crate::writer::output::with_buffer_sink(&mut output, |out| {
+                emit_content_container_from_handle_with_ref_map_and_string_writer(
+                    &container,
+                    &options,
+                    out,
+                    &|object_ref| {
+                        assert_eq!(object_ref, kept_ref);
+                        Ok(crate::ObjectRef::new(77, 0))
+                    },
+                    &removed_refs,
+                    &mut write_string,
+                )
+            })
+            .expect("content-array emission");
+
+            let text = String::from_utf8(output).expect("content-array output is text");
+            assert!(text.contains("<wrapped:secret>"));
+            assert!(text.contains("null"));
+            assert!(text.contains("stream\ndata\nendstream"));
+            if qdf {
+                assert!(text.starts_with("[\n  <wrapped:secret>\n  77 0 R\n  null\n"));
+                assert!(text.ends_with("\n]"));
+            } else {
+                assert!(text.starts_with("[ <wrapped:secret> 77 0 R null "));
+                assert!(text.ends_with(" ]"));
+            }
+        }
     }
 }
 
@@ -2982,6 +3050,65 @@ mod object_emitter_tests {
         assert!(bytes
             .windows(expected.len())
             .any(|window| window == expected.as_bytes()));
+        Ok(())
+    }
+
+    #[test]
+    fn live_qdf_object_stream_covers_plain_and_encrypted_members_with_extends() -> crate::Result<()>
+    {
+        for encrypted in [false, true] {
+            let mut pdf = super::object_emitter_tests::pdf();
+            let predecessor = pdf.new_stream_with_data(Rc::new(Vec::new()))?;
+            let source = pdf.new_stream_with_data(Rc::new(Vec::new()))?;
+            source
+                .as_stream_dict()
+                .unwrap()
+                .replace_key(b"/Extends", predecessor)?;
+            let member = pdf.make_indirect_from_object_handle(ObjectHandle::dictionary(vec![(
+                b"/Secret".to_vec(),
+                ObjectHandle::string(b"qdf-member-secret".to_vec()),
+            )]))?;
+            let member_ref = member.object_ref().unwrap();
+            pdf.root_handle()?.replace_key(b"/Member", member)?;
+            let root_source = pdf.root_ref();
+            let object_streams = [object_streams::ObjectStreamGroup::SourceBacked {
+                source: source.object_ref().unwrap(),
+                members: vec![member_ref],
+            }];
+            let options = WriterOptions {
+                qdf: true,
+                compress_streams: CompressStreams::No,
+                ..WriterOptions::default()
+            };
+            let context = encryption_context();
+            let mut bytes = Vec::new();
+
+            crate::writer::output::with_buffer_sink(&mut bytes, |out| {
+                emit_live(
+                    &mut pdf,
+                    out,
+                    &options,
+                    "1.5",
+                    0,
+                    root_source,
+                    BTreeSet::new(),
+                    &object_streams,
+                    encrypted.then_some(&context),
+                    &BTreeSet::new(),
+                )
+            })?;
+
+            let text = String::from_utf8_lossy(&bytes);
+            assert!(text.contains("/Type /ObjStm"));
+            assert!(text.contains("/Extends"));
+            assert!(text.contains("endstream"));
+            if encrypted {
+                assert!(!text.contains("qdf-member-secret"));
+            } else {
+                assert!(text.contains("%% Object stream: object"));
+                assert!(text.contains("/Secret (qdf-member-secret)"));
+            }
+        }
         Ok(())
     }
 }
