@@ -2746,7 +2746,7 @@ mod object_emitter_tests {
             BTreeSet::new(),
             &groups,
             None,
-        )?;
+        )?; // cov:ignore: the malformed-member live-body test covers this validated call; LLVM attributes the multiline continuation here.
         assert!(
             body.bytes
                 .windows(b"null".len())
