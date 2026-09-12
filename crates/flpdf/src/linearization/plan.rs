@@ -162,7 +162,7 @@ fn stream_parameters_removed_for_linearization(
     // its /Filter and /DecodeParms entries are direct. That probe is
     // observable because ValueSetter is stateful; use the linearization probe
     // for modified streams so the first body pass sees qpdf's already-consumed
-    // filter. Unmodified streams retain the plain-writer cache-aware probe used
+    // filter. Unmodified streams use the linearized writer-policy probe below
     // to decide whether parameter edges disappear.
     let normalize_content =
         stream_ref.is_some_and(|object_ref| content_normalize_refs.contains(&object_ref));

@@ -6,7 +6,7 @@ use crate::writer::ObjectWriterEmission;
 use crate::writer::WriterOptions;
 use crate::writer::WriterResult;
 use crate::{CompressStreams, ObjectHandle, ObjectRef, ObjectStreamMode, Pdf, XrefForm};
-use std::collections::{BTreeMap, BTreeSet, HashMap};
+use std::collections::{BTreeMap, HashMap};
 
 pub(crate) mod body;
 pub(crate) mod plan;
@@ -331,19 +331,10 @@ fn write_plain_live<R: Read + Seek, W: Write>(
     // qpdf's removeObject erases the only document cache slot and turns
     // retained aliases into direct null; it does not leave a tombstone for a
     // later writer pass. Keep the writer's operation-local set empty here.
-    let mut removed_refs: BTreeSet<ObjectRef> = BTreeSet::new();
-    let object_streams = if options.object_streams == ObjectStreamMode::Preserve {
-        let packing =
-            crate::writer::object_streams::plan_qpdf_preserve_object_streams_with_source_membership(
-                pdf,
-                options.preserve_unreferenced_objects,
-                Some(source_object_stream_data),
-            )?; // cov:ignore: malformed source graph is rejected by the preserve planner
-        removed_refs.extend(packing.removed_refs);
-        packing.groups
-    } else {
-        Vec::new()
-    };
+    let object_stream_plan =
+        plan::build_live_object_stream_plan(pdf, options, source_object_stream_data)?;
+    let removed_refs = object_stream_plan.removed_refs;
+    let object_streams = object_stream_plan.groups;
     // qpdf gates both the 1.5 version floor and the cross-reference form on the
     // same setup-time map, `object_stream_to_objects`
     // (`QPDFWriter.cc:2172-2173` and `:3023-3031`), which

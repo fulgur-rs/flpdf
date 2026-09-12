@@ -39,7 +39,7 @@ use crate::Error;
 use crate::Pdf;
 use crate::XrefEntry;
 
-pub(crate) type StreamParametersRemoved<'a> =
+type LinearizedStreamParameterOmission<'a> =
     Option<&'a dyn Fn(&crate::ObjectHandle) -> crate::Result<bool>>;
 
 /// Maps an original object reference to its assigned new reference.
@@ -130,12 +130,11 @@ impl CanonicalCatalogFirstRenumber {
         self.raw_sources.get(&source).copied()
     }
 
-    pub(crate) fn build_qpdf_with_stream_policy<R: Read + Seek>(
+    pub(crate) fn build_qpdf<R: Read + Seek>(
         pdf: &mut Pdf<R>,
         skip_length: bool,
         preserve_unreferenced_objects: bool,
         removed_refs: &BTreeSet<ObjectRef>,
-        stream_parameters_removed: StreamParametersRemoved<'_>,
     ) -> crate::Result<Self> {
         let root_ref = pdf.root_ref();
         let direct_root = if root_ref.is_none() {
@@ -189,14 +188,8 @@ impl CanonicalCatalogFirstRenumber {
             // qpdf's enqueueObject recurses through a direct Catalog instead
             // of assigning it an object number. Its indirect descendants are
             // nevertheless numbered in the Catalog's dictionary order.
-            collect_canonical_enqueue_refs_with_stream_policy(
-                pdf,
-                root,
-                0,
-                skip_length,
-                &mut seeds,
-                stream_parameters_removed,
-            )?; // cov:ignore: direct-root traversal is exercised by the writer tests; LLVM maps this successful-call terminator to a zero-count continuation region.
+            collect_canonical_enqueue_refs(pdf, root, 0, skip_length, &mut seeds)?;
+            // cov:ignore: direct-root traversal is exercised by the writer tests; LLVM maps this successful-call terminator to a zero-count continuation region.
         } // cov:ignore: direct-root traversal executes above; LLVM places this branch-exit counter on an uninstrumented continuation line.
 
         let trailer = pdf.trailer();
@@ -214,14 +207,8 @@ impl CanonicalCatalogFirstRenumber {
             // array-valued trailer entry still reaches the recursive collector
             // so its null elements retain their positions/identities.
             if !value.try_is_null()? {
-                collect_canonical_enqueue_refs_with_stream_policy(
-                    pdf,
-                    &value,
-                    0,
-                    skip_length,
-                    &mut seeds,
-                    stream_parameters_removed,
-                )?; // cov:ignore: successful trailer traversal is covered; llvm-cov attributes this continuation to the defensive error path
+                collect_canonical_enqueue_refs(pdf, &value, 0, skip_length, &mut seeds)?;
+                // cov:ignore: successful trailer traversal is covered; llvm-cov attributes this continuation to the defensive error path
             }
         }
 
@@ -245,14 +232,7 @@ impl CanonicalCatalogFirstRenumber {
                 })
                 .unwrap_or_else(|| pdf.get_object_handle(source));
             let mut found = Vec::new();
-            collect_canonical_children_with_stream_policy(
-                pdf,
-                &handle,
-                0,
-                skip_length,
-                &mut found,
-                stream_parameters_removed,
-            )?;
+            collect_canonical_children(pdf, &handle, 0, skip_length, &mut found)?;
             for reference in found {
                 if !removed_refs.contains(&reference) {
                     enqueue(reference, &mut old_to_new, &mut order, &mut queue);
@@ -275,16 +255,23 @@ pub(crate) fn collect_canonical_enqueue_refs<R: Read + Seek>(
     skip_length: bool,
     found: &mut Vec<ObjectRef>,
 ) -> crate::Result<()> {
-    collect_canonical_enqueue_refs_with_stream_policy(pdf, handle, depth, skip_length, found, None)
+    collect_canonical_enqueue_refs_with_linearized_omission(
+        pdf,
+        handle,
+        depth,
+        skip_length,
+        found,
+        None,
+    )
 }
 
-fn collect_canonical_enqueue_refs_with_stream_policy<R: Read + Seek>(
+fn collect_canonical_enqueue_refs_with_linearized_omission<R: Read + Seek>(
     pdf: &mut Pdf<R>,
     handle: &crate::ObjectHandle,
     depth: usize,
     skip_length: bool,
     found: &mut Vec<ObjectRef>,
-    stream_parameters_removed: StreamParametersRemoved<'_>,
+    stream_parameter_omission: LinearizedStreamParameterOmission<'_>,
 ) -> crate::Result<()> {
     if let Some(object_ref) = handle.object_ref() {
         ensure_canonical_owner(pdf, handle)?;
@@ -295,13 +282,13 @@ fn collect_canonical_enqueue_refs_with_stream_policy<R: Read + Seek>(
         }
         return Ok(());
     }
-    collect_canonical_children_with_stream_policy(
+    collect_canonical_children_with_linearized_omission(
         pdf,
         handle,
         depth,
         skip_length,
         found,
-        stream_parameters_removed,
+        stream_parameter_omission,
     )
 }
 
@@ -313,16 +300,23 @@ pub(crate) fn collect_canonical_children<R: Read + Seek>(
     skip_length: bool,
     found: &mut Vec<ObjectRef>,
 ) -> crate::Result<()> {
-    collect_canonical_children_with_stream_policy(pdf, handle, depth, skip_length, found, None)
+    collect_canonical_children_with_linearized_omission(
+        pdf,
+        handle,
+        depth,
+        skip_length,
+        found,
+        None,
+    )
 }
 
-fn collect_canonical_children_with_stream_policy<R: Read + Seek>(
+fn collect_canonical_children_with_linearized_omission<R: Read + Seek>(
     pdf: &mut Pdf<R>,
     handle: &crate::ObjectHandle,
     depth: usize,
     skip_length: bool,
     found: &mut Vec<ObjectRef>,
-    stream_parameters_removed: StreamParametersRemoved<'_>,
+    stream_parameter_omission: LinearizedStreamParameterOmission<'_>,
 ) -> crate::Result<()> {
     if depth > MAX_PARSE_DEPTH {
         return Err(Error::Unsupported(
@@ -332,13 +326,13 @@ fn collect_canonical_children_with_stream_policy<R: Read + Seek>(
     }
     if let Some(items) = handle.try_as_array()? {
         for item in items {
-            collect_canonical_enqueue_refs_with_stream_policy(
+            collect_canonical_enqueue_refs_with_linearized_omission(
                 pdf,
                 &item,
                 depth + 1,
                 skip_length,
                 found,
-                stream_parameters_removed,
+                stream_parameter_omission,
             )?; // cov:ignore: successful array traversal is covered; llvm-cov attributes this continuation to the defensive error path
         }
         return Ok(());
@@ -346,20 +340,20 @@ fn collect_canonical_children_with_stream_policy<R: Read + Seek>(
     if let Some(entries) = handle.try_as_dictionary()? {
         for (_, value) in entries {
             if !value.try_is_null()? {
-                collect_canonical_enqueue_refs_with_stream_policy(
+                collect_canonical_enqueue_refs_with_linearized_omission(
                     pdf,
                     &value,
                     depth + 1,
                     skip_length,
                     found,
-                    stream_parameters_removed,
+                    stream_parameter_omission,
                 )?; // cov:ignore: successful dictionary traversal is covered; llvm-cov attributes this continuation to the defensive error path
             }
         }
         return Ok(());
     }
     if let Some(stream_dict) = handle.as_stream_dict() {
-        let skip_stream_parameters = stream_parameters_removed
+        let skip_stream_parameters = stream_parameter_omission
             .map(|predicate| predicate(handle))
             .transpose()?
             .unwrap_or(false);
@@ -373,13 +367,13 @@ fn collect_canonical_children_with_stream_policy<R: Read + Seek>(
                     continue;
                 }
                 if !value.try_is_null()? {
-                    collect_canonical_enqueue_refs_with_stream_policy(
+                    collect_canonical_enqueue_refs_with_linearized_omission(
                         pdf,
                         &value,
                         depth + 1,
                         skip_length,
                         found,
-                        stream_parameters_removed,
+                        stream_parameter_omission,
                     )?; // cov:ignore: successful stream traversal is covered; llvm-cov attributes this continuation to the defensive error path
                 }
             }
@@ -451,7 +445,7 @@ pub(crate) fn reachable_object_set_with_stream_parameters<R: Read + Seek>(
         // (e.g. inside a direct `/Info` dict) is seeded, matching qpdf's recursive
         // trailer enqueue. A bare reference yields exactly one seed as before.
         if !value.try_is_null()? {
-            collect_canonical_enqueue_refs_with_stream_policy(
+            collect_canonical_enqueue_refs_with_linearized_omission(
                 pdf,
                 &value,
                 0,
@@ -472,7 +466,7 @@ pub(crate) fn reachable_object_set_with_stream_parameters<R: Read + Seek>(
     while let Some(cur) = queue.pop_front() {
         let handle = pdf.get_object_handle(cur);
         let mut found = Vec::new();
-        collect_canonical_children_with_stream_policy(
+        collect_canonical_children_with_linearized_omission(
             pdf,
             &handle,
             0,
@@ -691,13 +685,12 @@ impl ObjectStreamRenumber {
         self.old_to_new.iter().map(|(&old, &new)| (new, old))
     }
 
-    pub(crate) fn build_with_stream_policy<R: Read + Seek>(
+    pub(crate) fn build<R: Read + Seek>(
         pdf: &mut Pdf<R>,
         groups: &[ObjectStreamGroup],
         skip_length: bool,
         removed_refs: &BTreeSet<ObjectRef>,
         preserve_unreferenced_objects: bool,
-        stream_parameters_removed: StreamParametersRemoved<'_>,
     ) -> crate::Result<Self> {
         Self::build_with_seed_policy(
             pdf,
@@ -705,7 +698,6 @@ impl ObjectStreamRenumber {
             skip_length,
             removed_refs,
             preserve_unreferenced_objects,
-            stream_parameters_removed,
         )
     }
 
@@ -715,7 +707,6 @@ impl ObjectStreamRenumber {
         skip_length: bool,
         removed_refs: &BTreeSet<ObjectRef>,
         preserve_unreferenced_objects: bool,
-        stream_parameters_removed: StreamParametersRemoved<'_>,
     ) -> crate::Result<Self> {
         let mut member_to_group: HashMap<ObjectRef, usize> = HashMap::new();
         let mut source_to_group: HashMap<ObjectRef, usize> = HashMap::new();
@@ -827,14 +818,8 @@ impl ObjectStreamRenumber {
         if let Some(root) = root_ref {
             seeds.push(root);
         } else if let Some(root) = &direct_root {
-            collect_canonical_enqueue_refs_with_stream_policy(
-                pdf,
-                root,
-                0,
-                skip_length,
-                &mut seeds,
-                stream_parameters_removed,
-            )?; // cov:ignore: direct-root traversal is exercised by the writer tests; LLVM maps this successful-call terminator to a zero-count continuation region.
+            collect_canonical_enqueue_refs(pdf, root, 0, skip_length, &mut seeds)?;
+            // cov:ignore: direct-root traversal is exercised by the writer tests; LLVM maps this successful-call terminator to a zero-count continuation region.
         } // cov:ignore: direct-root traversal executes above; LLVM places this branch-exit counter on an uninstrumented continuation line.
         let trailer = pdf.trailer();
         let trailer_entries = trailer.try_as_dictionary()?.unwrap_or_default();
@@ -852,14 +837,8 @@ impl ObjectStreamRenumber {
             // ref is seeded, matching qpdf's recursive trailer enqueue. A bare
             // reference yields exactly one seed as before. The live handle
             // graph applies qpdf's null-visible dictionary rule while walking.
-            collect_canonical_enqueue_refs_with_stream_policy(
-                pdf,
-                &value,
-                0,
-                skip_length,
-                &mut seeds,
-                stream_parameters_removed,
-            )?; // cov:ignore: successful trailer traversal is covered; llvm-cov attributes this continuation to the defensive error path
+            collect_canonical_enqueue_refs(pdf, &value, 0, skip_length, &mut seeds)?;
+            // cov:ignore: successful trailer traversal is covered; llvm-cov attributes this continuation to the defensive error path
         }
         seeds.retain(|reference| !removed_refs.contains(reference));
 
@@ -890,14 +869,7 @@ impl ObjectStreamRenumber {
                         })
                         .unwrap_or_else(|| pdf.get_object_handle(cur));
                     let mut found = Vec::new();
-                    collect_canonical_children_with_stream_policy(
-                        pdf,
-                        &handle,
-                        0,
-                        skip_length,
-                        &mut found,
-                        stream_parameters_removed,
-                    )?; // cov:ignore: successful object-stream traversal is covered; llvm-cov attributes this continuation to the defensive error path
+                    collect_canonical_children(pdf, &handle, 0, skip_length, &mut found)?; // cov:ignore: successful object-stream traversal is covered; llvm-cov attributes this continuation to the defensive error path
                     found.retain(|reference| !removed_refs.contains(reference));
                     for reference in found {
                         enqueue_object_stream(

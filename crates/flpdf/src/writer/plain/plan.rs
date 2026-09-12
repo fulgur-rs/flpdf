@@ -1,20 +1,18 @@
 //! qpdf correspondence: QPDFWriter.cc standard-write object placement and renumber planning.
 //! Logical object placements for the qpdf-shaped plain writer pipeline.
 
-use std::cell::RefCell;
 use std::collections::{BTreeMap, BTreeSet, HashMap};
 use std::io::{Read, Seek};
 
 use crate::pdf_version::{parse_qpdf_writer_version, QpdfVersionParts};
 use crate::qpdf_obj_gen::QpdfObjGen;
 use crate::writer::object_streams::{self, ObjectStreamGroup, ObjectStreamMode};
-use crate::writer::plain::body;
 use crate::writer::plain::xref::{materialized_id_handle, IdPlan, TrailerPlan};
 use crate::writer::rewrite_renumber::{
-    CanonicalCatalogFirstRenumber, NewNumberLookup, ObjectStreamRenumber, StreamParametersRemoved,
+    CanonicalCatalogFirstRenumber, NewNumberLookup, ObjectStreamRenumber,
 };
 use crate::writer::{ObjectWriterEmission, WriterOptions};
-use crate::{CompressStreams, ObjectHandle, ObjectRef, PageDocumentHelper, Pdf, XrefForm};
+use crate::{CompressStreams, ObjectHandle, ObjectRef, Pdf, XrefEntry, XrefForm};
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub(crate) struct PlannedMember {
@@ -47,47 +45,57 @@ pub(crate) enum PlannedIndirectObject {
     },
 }
 
-#[derive(Clone, Debug)]
-pub(crate) struct CachedStreamOutput {
-    pub(crate) dict: crate::ObjectHandle,
-    pub(crate) data: Vec<u8>,
-    pub(crate) dictionary_options: crate::writer::StreamDictionaryOptions,
-    pub(crate) fingerprint: StreamCacheFingerprint,
+/// Object-stream membership fixed during qpdf writer setup, before the live
+/// standard-write queue starts assigning output numbers.
+pub(crate) struct LiveObjectStreamPlan {
+    pub(crate) groups: Vec<ObjectStreamGroup>,
+    pub(crate) removed_refs: BTreeSet<ObjectRef>,
 }
 
-#[derive(Clone, Debug, PartialEq, Eq)]
-pub(crate) struct StreamCacheFingerprint {
-    stream: (usize, u64),
-    dictionary: (usize, u64),
-    parameter_handles: Vec<(usize, u64)>,
-}
-
-pub(crate) fn stream_cache_fingerprint(
-    handle: &crate::ObjectHandle,
-) -> crate::Result<StreamCacheFingerprint> {
-    let dictionary = handle
-        .as_stream_dict()
-        .ok_or_else(|| crate::Error::Internal("canonical stream dictionary is missing".into()))?;
-    let mut parameter_handles = Vec::new();
-    for key in [
-        b"/Filter".as_slice(),
-        b"/DecodeParms".as_slice(),
-        b"/F".as_slice(),
-        b"/FFilter".as_slice(),
-        b"/FDecodeParms".as_slice(),
-    ] {
-        let value = dictionary.try_get_key(key)?;
-        if value.try_is_null()? {
-            continue;
+/// Build only the object-stream membership qpdf decides in `doWriteSetup`.
+/// Reachability, stream dictionary visibility, child discovery, and output
+/// numbering remain emission-time responsibilities of the live queue.
+pub(crate) fn build_live_object_stream_plan<R: Read + Seek>(
+    pdf: &mut Pdf<R>,
+    options: &WriterOptions,
+    source_object_stream_data: &BTreeMap<u32, u32>,
+) -> crate::Result<LiveObjectStreamPlan> {
+    match options.object_streams {
+        ObjectStreamMode::Disable => Ok(LiveObjectStreamPlan {
+            groups: Vec::new(),
+            removed_refs: BTreeSet::new(),
+        }),
+        ObjectStreamMode::Preserve => {
+            let plan = object_streams::plan_qpdf_preserve_object_streams_with_source_membership(
+                pdf,
+                options.preserve_unreferenced_objects,
+                Some(source_object_stream_data),
+            )?;
+            Ok(LiveObjectStreamPlan {
+                groups: plan.groups,
+                removed_refs: plan.removed_refs,
+            })
         }
-        value.try_dereference()?;
-        parameter_handles.push(value.mutation_fingerprint());
+        ObjectStreamMode::Generate => {
+            let (mut eligible, removed_refs) = pdf.get_compressible_objgens_with_removed()?;
+            eligible.retain(|member| !removed_refs.contains(member));
+            let batches = object_streams::even_split_into_streams(&eligible);
+            let mut groups = Vec::with_capacity(batches.len());
+            for members in batches {
+                let container = pdf.make_indirect_object_handle(ObjectHandle::null())?;
+                let source = container.object_ref().ok_or_else(|| {
+                    crate::Error::Internal(
+                        "generated object-stream container lost its indirect identity".into(),
+                    )
+                })?;
+                groups.push(ObjectStreamGroup::Generated { source, members });
+            }
+            Ok(LiveObjectStreamPlan {
+                groups,
+                removed_refs,
+            })
+        }
     }
-    Ok(StreamCacheFingerprint {
-        stream: handle.mutation_fingerprint(),
-        dictionary: dictionary.mutation_fingerprint(),
-        parameter_handles,
-    })
 }
 
 #[derive(Clone, Debug)]
@@ -102,7 +110,6 @@ pub(crate) struct PlainWritePlan {
     pub(crate) direct_root: Option<crate::ObjectHandle>,
     pub(crate) old_to_new: HashMap<ObjectRef, ObjectRef>,
     pub(crate) removed_refs: BTreeSet<ObjectRef>,
-    pub(crate) cached_stream_outputs: HashMap<ObjectRef, CachedStreamOutput>,
     /// QDF re-numbers the same planned objects in emission order and inserts
     /// a synthetic length holder after each ordinary stream. The holder map is
     /// kept beside the plan so the body emitter can use the qpdf numbering
@@ -167,63 +174,13 @@ impl PlainWritePlan {
         // qpdf's removeObject erases the canonical cache slot rather than
         // retaining a persistent deleted-reference tombstone.
         let explicitly_removed = BTreeSet::new();
-        let normalized_content_refs: BTreeSet<ObjectRef> = if options.content_normalization {
-            let pages = PageDocumentHelper::new(pdf).get_all_pages()?;
-            let mut refs = BTreeSet::new();
-            for page in pages {
-                refs.extend(crate::writer::collect_content_stream_refs(pdf, page)?);
-            }
-            refs
-        } else {
-            BTreeSet::new()
-        };
-        let cached_stream_outputs: RefCell<HashMap<ObjectRef, CachedStreamOutput>> =
-            RefCell::new(HashMap::new());
-        let stream_parameters_removed = |handle: &crate::ObjectHandle| {
-            let Some(source) = handle.object_ref() else {
-                return if handle.is_data_modified() {
-                    Ok(false)
-                } else {
-                    body::canonical_stream_will_be_refiltered(handle, options)
-                };
-            };
-            if let Some(cached) = cached_stream_outputs.borrow().get(&source) {
-                if cached.fingerprint == stream_cache_fingerprint(handle)? {
-                    return Ok(cached.dictionary_options.remove_filter_parameters);
-                }
-            }
-
-            // QPDFWriter::willFilterStream retains the produced buffer for the
-            // later unparseObject emission (`QPDFWriter.cc:1239-1314,1539-1560`).
-            // Cache every indirect source stream, not only data-modified ones,
-            // so deferred providers are invoked once across planning and emit.
-            let (dict, data, dictionary_options) = body::canonical_stream_output_with_status(
-                handle,
-                options,
-                true,
-                normalized_content_refs.contains(&source),
-            )?;
-            let fingerprint = stream_cache_fingerprint(handle)?;
-            cached_stream_outputs.borrow_mut().insert(
-                source,
-                CachedStreamOutput {
-                    dict,
-                    data,
-                    dictionary_options,
-                    fingerprint,
-                },
-            );
-            Ok(dictionary_options.remove_filter_parameters)
-        };
-
         let mut placement = match options.object_streams {
             ObjectStreamMode::Disable => {
-                let renumber = CanonicalCatalogFirstRenumber::build_qpdf_with_stream_policy(
+                let renumber = CanonicalCatalogFirstRenumber::build_qpdf(
                     pdf,
                     true,
                     options.preserve_unreferenced_objects,
                     &explicitly_removed,
-                    Some(&stream_parameters_removed),
                 )?;
                 let mut placement = build_sources_from_canonical_renumber(&renumber);
                 placement.removed_refs = explicitly_removed;
@@ -231,12 +188,11 @@ impl PlainWritePlan {
             }
             ObjectStreamMode::Preserve => {
                 if !source_had_compressed_objects {
-                    let renumber = CanonicalCatalogFirstRenumber::build_qpdf_with_stream_policy(
+                    let renumber = CanonicalCatalogFirstRenumber::build_qpdf(
                         pdf,
                         true,
                         options.preserve_unreferenced_objects,
                         &explicitly_removed,
-                        Some(&stream_parameters_removed),
                     )?; // cov:ignore: malformed canonical source graphs are rejected before placement
                     let mut placement = build_sources_from_canonical_renumber(&renumber);
                     placement.removed_refs = explicitly_removed;
@@ -262,7 +218,6 @@ impl PlainWritePlan {
                         &mut packing.groups,
                         &packing.removed_refs,
                         options.preserve_unreferenced_objects,
-                        Some(&stream_parameters_removed),
                     )?; // cov:ignore: LLVM maps this covered preserve-group call terminator to a zero-count continuation region
                     let groups = &packing.groups;
                     let removed = &packing.removed_refs;
@@ -271,13 +226,11 @@ impl PlainWritePlan {
                         groups,
                         removed,
                         options.preserve_unreferenced_objects,
-                        Some(&stream_parameters_removed),
                     )?; // cov:ignore: planner groups are produced by the same validated source walk
                     build_container_aware(renumber, packing.groups, packing.removed_refs)?
                 }
             }
             ObjectStreamMode::Generate => {
-                let setup_generated = generated_compressible.is_some();
                 let compressible = if let Some(snapshot) = generated_compressible {
                     snapshot.clone()
                 } else {
@@ -314,23 +267,19 @@ impl PlainWritePlan {
                 // when preserve-unreferenced is enabled (`QPDFWriter.cc:2907-2914`).
                 // Keep that distinction: preserved orphans receive plain slots
                 // instead of being silently dropped from the generated rewrite.
-                if !setup_generated {
-                    // cov:ignore-start: LLVM attributes this covered Generate-group call to its opening line; the writer contract test exercises the complete call
-                    retain_reachable_object_stream_members(
-                        pdf,
-                        &mut renumber_groups,
-                        removed,
-                        options.preserve_unreferenced_objects,
-                        Some(&stream_parameters_removed),
-                    )?;
-                    // cov:ignore-end
-                }
+                // cov:ignore-start: LLVM attributes this covered Generate-group call to its opening line; the writer contract test exercises the complete call
+                retain_reachable_object_stream_members(
+                    pdf,
+                    &mut renumber_groups,
+                    removed,
+                    options.preserve_unreferenced_objects,
+                )?;
+                // cov:ignore-end
                 let renumber = renumber_plain(
                     pdf,
                     &renumber_groups,
                     removed,
                     options.preserve_unreferenced_objects,
-                    Some(&stream_parameters_removed),
                 )?; // cov:ignore: llvm-cov assigns no executable counter to this multiline-call terminator; the Generate preserve path is exercised by the writer contract test.
                 build_container_aware(renumber, renumber_groups, removed_refs)?
             }
@@ -629,7 +578,6 @@ impl PlainWritePlan {
             direct_root,
             old_to_new: placement.old_to_new,
             removed_refs: placement.removed_refs,
-            cached_stream_outputs: cached_stream_outputs.into_inner(),
             qdf_holder_map: qdf_emission
                 .as_ref()
                 .map(|qdf| qdf.holder_map.clone())
@@ -1032,15 +980,13 @@ fn renumber_plain<R: Read + Seek>(
     groups: &[ObjectStreamGroup],
     removed_refs: &BTreeSet<ObjectRef>,
     preserve_unreferenced_objects: bool,
-    stream_parameters_removed: StreamParametersRemoved<'_>,
 ) -> crate::Result<ObjectStreamRenumber> {
-    ObjectStreamRenumber::build_with_stream_policy(
+    ObjectStreamRenumber::build(
         pdf,
         groups,
         true,
         removed_refs,
         preserve_unreferenced_objects,
-        stream_parameters_removed,
     )
 }
 
@@ -1049,18 +995,16 @@ fn retain_reachable_object_stream_members<R: Read + Seek>(
     groups: &mut Vec<ObjectStreamGroup>,
     removed_refs: &BTreeSet<ObjectRef>,
     preserve_unreferenced_objects: bool,
-    stream_parameters_removed: StreamParametersRemoved<'_>,
 ) -> crate::Result<()> {
     if groups.is_empty() {
         return Ok(());
     }
     // cov:ignore-start: LLVM attributes this covered reachability call to an argument line; the preserve and Generate writer tests exercise the complete call
-    let reachable = CanonicalCatalogFirstRenumber::build_qpdf_with_stream_policy(
+    let reachable = CanonicalCatalogFirstRenumber::build_qpdf(
         pdf,
         true,
         preserve_unreferenced_objects,
         removed_refs,
-        stream_parameters_removed,
     )?;
     // cov:ignore-end
     for group in groups.iter_mut() {
@@ -1334,7 +1278,7 @@ mod tests {
     }
 
     #[test]
-    fn plan_handles_direct_streams_without_a_source_cache_identity() {
+    fn plan_handles_direct_modified_streams_without_payload_execution() {
         struct PassThroughTokenFilter;
 
         // cov:ignore-start: the direct-stream planning branch intentionally does not pipe data; this filter only flips qpdf's isDataModified bit.
@@ -1369,6 +1313,42 @@ mod tests {
                 PlainWritePlan::build(&mut pdf, &write_options(ObjectStreamMode::Disable)).unwrap();
             assert_eq!(plan.root, Some(ObjectRef::new(1, 0)));
         }
+    }
+
+    #[test]
+    fn non_linearized_plan_does_not_invoke_a_stream_provider() {
+        let mut pdf = Pdf::empty().unwrap();
+        let calls = Rc::new(RefCell::new(Vec::new()));
+        let calls_for_provider = Rc::clone(&calls);
+        let stream = pdf.new_stream().unwrap();
+        stream
+            .replace_stream_data_with_retry_callback(
+                move |pipeline, suppress_warnings, will_retry| {
+                    calls_for_provider
+                        .borrow_mut()
+                        .push((suppress_warnings, will_retry));
+                    if will_retry {
+                        return Ok(false);
+                    }
+                    pipeline.write(b"planned-at-emission")?;
+                    pipeline.finish()?;
+                    Ok(true)
+                },
+                Some(ObjectHandle::null()),
+                Some(ObjectHandle::null()),
+            )
+            .unwrap();
+        pdf.root_handle()
+            .unwrap()
+            .replace_key(b"/Deferred", stream)
+            .unwrap();
+        let options = write_options(ObjectStreamMode::Disable);
+
+        let plan = PlainWritePlan::build(&mut pdf, &options).unwrap();
+        assert!(calls.borrow().is_empty());
+
+        crate::writer::plain::body::emit_bodies(&mut pdf, &options, &plan).unwrap();
+        assert_eq!(*calls.borrow(), vec![(false, true), (false, false)]);
     }
 
     #[test]
@@ -1416,7 +1396,6 @@ mod tests {
             direct_root: None,
             old_to_new: HashMap::from([(root_source, root_output)]),
             removed_refs: BTreeSet::new(),
-            cached_stream_outputs: HashMap::new(),
             qdf_holder_map: HashMap::new(),
             qdf_holder_numbers: BTreeSet::new(),
             trailer_handle: crate::ObjectHandle::dictionary(Vec::new()),
@@ -2218,6 +2197,21 @@ mod tests {
             |origin| matches!(origin, PlannedObjectStreamOrigin::Generated(source)
                 if pdf.get_object_handle(*source).is_null())
         ));
+    }
+
+    #[test]
+    fn live_generate_setup_mints_qpdf_null_container_handles() {
+        let path = fixture_path("objstm-gen-nostream-130rev.pdf");
+        let mut pdf =
+            Pdf::open(std::io::BufReader::new(std::fs::File::open(path).unwrap())).unwrap();
+        let options = write_options(ObjectStreamMode::Generate);
+        let plan = build_live_object_stream_plan(&mut pdf, &options, &BTreeMap::new()).unwrap();
+
+        assert!(!plan.groups.is_empty());
+        assert!(plan.groups.iter().all(|group| {
+            matches!(group, ObjectStreamGroup::Generated { source, .. }
+                if pdf.get_object_handle(*source).is_null())
+        }));
     }
 
     #[test]

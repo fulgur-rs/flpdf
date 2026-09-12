@@ -3961,17 +3961,6 @@ fn emit_canonical_pdf_inner<R: Read + Seek, W: Write>(
     // function never performs a second page repair or contents enumeration.
     let empty_special_streams = SpecialStreams::default();
     let special_streams = special_streams.unwrap_or(&empty_special_streams);
-    // qpdf always fills normalized_streams during setup, but writeStream only
-    // consults it when normalize_content is enabled (QPDFWriter.cc:1279).
-    // Keep that gate here so decode-only setup repairs the page graph without
-    // accidentally normalizing content streams.
-    let normalized_stream_refs = if options.content_normalization {
-        &special_streams.normalized_streams
-    } else {
-        &empty_special_streams.normalized_streams
-    };
-    let cached_stream_outputs: RefCell<BTreeMap<ObjectRef, plain::plan::CachedStreamOutput>> =
-        RefCell::new(BTreeMap::new());
     // The specialized writer is a live ObjectHandle consumer. Its
     // Catalog-first walk must therefore use the same canonical graph as the
     // emission loop; the legacy raw-Object walk would parse a content holder
@@ -3981,45 +3970,14 @@ fn emit_canonical_pdf_inner<R: Read + Seek, W: Write>(
     // with every input object; QDF changes formatting and ObjStm policy, not
     // the reachability setting (`QPDFWriter.cc:2907-2914`). Keep the setting
     // alive on this specialized coordinator, which is the route QDF uses.
-    // The canonical graph walk needs the same filter-parameter visibility that
-    // qpdf decides while writing, but qpdf's enqueue walk itself never invokes
-    // a StreamDataProvider (`QPDFWriter.cc:1072-1141`). Cache every indirect
-    // stream outcome here so the later emission reuses the provider result
-    // rather than running the source a second time.
-    let stream_parameters_removed = |handle: &ObjectHandle| {
-        if let Some(source) = handle.object_ref() {
-            if let Some(parameters_removed) = cached_stream_outputs
-                .borrow()
-                .get(&source)
-                .map(|cached| cached.dictionary_options.remove_filter_parameters)
-            {
-                return Ok(parameters_removed); // The catalog-first and ObjStm-aware walks share this cache.
-            }
-            let (dict, data, dictionary_options) =
-                plain::body::canonical_stream_output_for_rewrite_with_status(
-                    handle,
-                    options,
-                    normalized_stream_refs.contains(&source),
-                )?; // cov:ignore: LLVM maps this covered cache-fill call terminator to a zero-count continuation region
-            cached_stream_outputs.borrow_mut().insert(
-                source,
-                plain::plan::CachedStreamOutput {
-                    dict,
-                    data,
-                    dictionary_options,
-                    fingerprint: plain::plan::stream_cache_fingerprint(handle)?,
-                },
-            );
-            return Ok(dictionary_options.remove_filter_parameters);
-        }
-        plain::body::canonical_stream_will_be_refiltered(handle, options)
-    };
-    let renumber = CanonicalCatalogFirstRenumber::build_qpdf_with_stream_policy(
+    // qpdf's non-linearized enqueue walk does not invoke stream providers or
+    // decide output filter parameters (`QPDFWriter.cc:1072-1141`). Keep this
+    // walk structural; the emission pass below owns stream policy and payloads.
+    let renumber = CanonicalCatalogFirstRenumber::build_qpdf(
         pdf,
         true,
         options.preserve_unreferenced_objects,
         &removed_refs,
-        Some(&stream_parameters_removed),
     )?; // cov:ignore: llvm-cov assigns no executable counter to this multiline-call terminator; the preserve qdf call is exercised by the writer contract test.
 
     // Pass `false` here because full-rewrite ObjStm emission is only known
@@ -4325,13 +4283,12 @@ fn emit_canonical_pdf_inner<R: Read + Seek, W: Write>(
         } else {
             &removed_refs
         };
-        Some(ObjectStreamRenumber::build_with_stream_policy(
+        Some(ObjectStreamRenumber::build(
             pdf,
             &object_stream_groups,
             true,
             numbering_removed_refs,
             options.preserve_unreferenced_objects,
-            Some(&stream_parameters_removed),
         )?) // cov:ignore: the canonical ObjStm plan validates this shared walk before QDF emission
     } else {
         None
@@ -4876,24 +4833,12 @@ fn emit_canonical_pdf_inner<R: Read + Seek, W: Write>(
             // This is the qpdf stream writer's live-handle path: filtering and
             // payload framing are decided from the stream handle, while the
             // dictionary serializer remaps only child reference tokens.
-            // Each stream is emitted exactly once (streams cannot be ObjStm
-            // members), so remove the cache entry on consumption instead of
-            // cloning it: this frees the cached body immediately rather than
-            // retaining every cached stream's bytes alongside the growing
-            // output buffer through the rest of emission.
-            let cached = cached_stream_outputs
-                .borrow_mut()
-                .remove(old_ref)
-                .map(|cached| (cached.dict, cached.data, cached.dictionary_options));
-            let (stream_dict, stream_data, dictionary_options) = if let Some(cached) = cached {
-                (cached.0, cached.1, cached.2)
-            } else {
+            let (stream_dict, stream_data, dictionary_options) =
                 plain::body::canonical_stream_output_for_rewrite(
                     &object_handle,
                     options,
                     options.content_normalization && contents_seq.contains_key(old_ref),
-                )? // cov:ignore: canonical stream output is validated before this success continuation
-            };
+                )?;
             let stream_encryption = encrypt_ctx
                 .as_ref()
                 .filter(|ctx| emit_ref != ctx.encrypt_ref);
@@ -7419,7 +7364,7 @@ mod final_handle_writer_tests {
     }
 
     #[test]
-    fn qdf_generate_reuses_modified_stream_parameters_between_plans() {
+    fn qdf_generate_prepares_modified_stream_only_during_emission() {
         struct CountEofTokenFilter {
             eof_calls: Rc<std::cell::Cell<usize>>,
         }
@@ -7468,7 +7413,7 @@ mod final_handle_writer_tests {
         assert_eq!(
             eof_calls.get(),
             1,
-            "the modified stream must be prepared once across both planning walks"
+            "non-linearized planning must not prepare the modified stream payload"
         );
     }
 
