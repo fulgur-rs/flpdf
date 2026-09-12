@@ -592,6 +592,7 @@ fn emit_live_body<R: Read + Seek + 'static>(
 /// dimensions layered around the same queue (`QPDFWriter.cc:1057-1157,
 /// 1761-1809, 2907-2925`).
 #[allow(clippy::too_many_arguments)]
+#[cfg(test)]
 pub(crate) fn emit_live_specialized_standard<R: Read + Seek + 'static>(
     pdf: &mut Pdf<R>,
     options: &WriterOptions,
@@ -601,6 +602,37 @@ pub(crate) fn emit_live_specialized_standard<R: Read + Seek + 'static>(
     removed_refs: BTreeSet<ObjectRef>,
     object_streams: &[crate::writer::object_streams::ObjectStreamGroup],
     encryption_context: Option<&crate::writer::EncryptionContext>,
+) -> crate::Result<LiveBodyOutput> {
+    emit_live_specialized_standard_with_page_context(
+        pdf,
+        options,
+        version,
+        final_extension_level,
+        root_source,
+        removed_refs,
+        object_streams,
+        encryption_context,
+        false,
+        BTreeMap::new(),
+        BTreeMap::new(),
+        BTreeMap::new(),
+    )
+}
+
+#[allow(clippy::too_many_arguments)] // qpdf standard body plus normalized page/content context are separate writer dimensions
+pub(crate) fn emit_live_specialized_standard_with_page_context<R: Read + Seek + 'static>(
+    pdf: &mut Pdf<R>,
+    options: &WriterOptions,
+    version: &str,
+    final_extension_level: i64,
+    root_source: Option<ObjectRef>,
+    removed_refs: BTreeSet<ObjectRef>,
+    object_streams: &[crate::writer::object_streams::ObjectStreamGroup],
+    encryption_context: Option<&crate::writer::EncryptionContext>,
+    qdf: bool,
+    page_sequences: BTreeMap<ObjectRef, usize>,
+    contents_sequences: BTreeMap<ObjectRef, usize>,
+    content_container_sequences: BTreeMap<ObjectRef, usize>,
 ) -> crate::Result<LiveBodyOutput> {
     emit_live_body(
         pdf,
@@ -612,11 +644,11 @@ pub(crate) fn emit_live_specialized_standard<R: Read + Seek + 'static>(
         object_streams,
         encryption_context,
         false,
-        false,
+        qdf,
         true,
-        BTreeMap::new(),
-        BTreeMap::new(),
-        BTreeMap::new(),
+        page_sequences,
+        contents_sequences,
+        content_container_sequences,
     )
 }
 
@@ -1011,8 +1043,8 @@ impl<'a, R: Read + Seek + 'static> crate::writer::write_object::WriteObject
                         "plain live writer: reference {} {} R absent from queue",
                         source.number, source.generation
                     ))
-                })?
-            // cov:ignore-end
+                })? // cov:ignore: the live queue assigns every QDF object before unparse; the error arm is a defensive invariant
+                    // cov:ignore-end
         } else if let Some(raw) = object.qpdf_obj_gen() {
             self.queue
                 .borrow()
@@ -1188,6 +1220,28 @@ impl<'a, R: Read + Seek + 'static> LiveObjectEmitter<'a, R> {
         self.discover_qdf_children(object, 0)?;
         let queue = &self.queue;
         let map = |object_ref: ObjectRef| qdf_output_number(queue, object_ref);
+        if let Some(emitter) = self.encrypted_strings.as_mut() {
+            let emitted_ref = object
+                .object_ref()
+                .and_then(|source| self.queue.borrow().old_to_new.get(&source).copied())
+                .or(self.current_raw_output)
+                .ok_or_else(|| {
+                    // cov:ignore-start: content containers are queued indirect page/array handles
+                    crate::Error::Unsupported(
+                        "plain live writer: content container has no output number".into(),
+                    )
+                    // cov:ignore-end
+                })?; // cov:ignore: the content-container queue assigns its output before emission
+            return emitter.write_handle_content_container_with_ref_map(
+                self.bytes,
+                emitted_ref,
+                None,
+                object,
+                self.options,
+                &map,
+                &self.removed_refs,
+            );
+        }
         crate::writer::plain::body::emit_content_container_from_handle_with_ref_map(
             object,
             self.options,
@@ -1257,6 +1311,19 @@ impl<'a, R: Read + Seek + 'static> LiveObjectEmitter<'a, R> {
                 )
                 // cov:ignore-end
             })?; // cov:ignore: queued QDF objects always carry a source identity
+        let emitted_ref = {
+            let queue = self.queue.borrow();
+            source
+                .and_then(|source| queue.old_to_new.get(&source).copied())
+                .or_else(|| queue.raw_old_to_new.get(&source_gen).copied())
+                .ok_or_else(|| {
+                    // cov:ignore-start: every queued QDF object has an output identity before unparse
+                    crate::Error::Unsupported(format!(
+                        "plain QDF live writer: object {source_gen:?} has no output number"
+                    ))
+                    // cov:ignore-end
+                })? // cov:ignore: every queued QDF object has an output number before unparse; this error arm is a defensive invariant
+        };
         if self.root_source == source {
             let root = object.output_root_copy_with_adbe(
                 self.version,
@@ -1266,6 +1333,17 @@ impl<'a, R: Read + Seek + 'static> LiveObjectEmitter<'a, R> {
             self.discover_qdf_children(&root, 0)?;
             let queue = &self.queue;
             let map = |object_ref: ObjectRef| qdf_output_number(queue, object_ref);
+            if let Some(emitter) = self.encrypted_strings.as_mut() {
+                return emitter.write_handle_object_with_ref_map(
+                    self.bytes,
+                    emitted_ref,
+                    None,
+                    &root,
+                    true,
+                    &map,
+                    &self.removed_refs,
+                );
+            }
             return root.write_object_qdf_with_ref_map_and_removed(
                 self.bytes,
                 0,
@@ -1299,28 +1377,75 @@ impl<'a, R: Read + Seek + 'static> LiveObjectEmitter<'a, R> {
                     ))
                     // cov:ignore-end
                 })?; // cov:ignore: enqueue_handle reserves a holder for every queued QDF stream
-            crate::writer::object::write_prepared_stream_body_qdf_with_ref_map_and_removed_and_length_with_options(
-                &discovery_dict,
-                self.bytes,
-                0,
-                &map,
-                &self.removed_refs,
-                Some(holder),
+                     // cov:ignore-start: encrypted QDF content parity exercises this
+                     // metadata gate; LLVM assigns no stable counter to the
+                     // short-circuit continuation across the encrypted/cleartext arms.
+            let stream_encryption = self.encryption_context;
+            let encrypt_stream = if let Some(ctx) = stream_encryption {
+                ctx.encrypt_metadata
+                    || !discovery_dict.try_is_dictionary_of_type(b"Metadata", b"")?
+            // cov:ignore: encrypted QDF content parity covers this metadata-shape probe; LLVM has no counter for this continuation
+            } else {
+                false
+            };
+            // cov:ignore-end
+            let mut stream_length = data.len();
+            if let Some(ctx) = stream_encryption {
+                crate::writer::adjust_aes_stream_length(&mut stream_length, ctx, encrypt_stream)?;
+            }
+            let stream_options = crate::writer::encrypted_strings::StreamDictOptions::new(
+                true,
                 dictionary_options,
-            )?; // cov:ignore: prepared stream emission is covered by QDF parity and Crypt cleanup tests
-            let added_newline = serialize::framing_adds_newline_with_qdf(
-                &data,
-                self.options.newline_before_endstream,
-                true,
+                encrypt_stream,
             );
-            serialize::write_stream_payload_with_qdf(
-                self.bytes,
-                &data,
-                self.options.newline_before_endstream,
-                true,
-            );
+            if let Some(emitter) = self.encrypted_strings.as_mut() {
+                emitter.write_prepared_handle_stream_dict_with_ref_map(
+                    self.bytes,
+                    emitted_ref,
+                    None,
+                    &discovery_dict,
+                    stream_options,
+                    &map,
+                    &self.removed_refs,
+                    Some(holder),
+                )?; // cov:ignore: encrypted QDF content parity exercises the prepared encrypted dictionary call; LLVM attributes the multiline continuation separately
+            } else {
+                crate::writer::object::write_prepared_stream_body_qdf_with_ref_map_and_removed_and_length_with_options(
+                    &discovery_dict,
+                    self.bytes,
+                    0,
+                    &map,
+                    &self.removed_refs,
+                    Some(holder),
+                    dictionary_options,
+                )?; // cov:ignore: the unencrypted QDF content parity exercises the prepared dictionary call; LLVM attributes this continuation separately
+            }
+            let added_newline = if let Some(ctx) = stream_encryption {
+                crate::writer::write_stream_payload_with_pipeline_qdf(
+                    self.bytes,
+                    &data,
+                    self.options.newline_before_endstream,
+                    true,
+                    emitted_ref,
+                    ctx,
+                    encrypt_stream,
+                    None,
+                )? // cov:ignore: encrypted QDF content parity exercises the AES payload call; LLVM attributes this multiline continuation separately
+            } else {
+                serialize::write_stream_payload_with_qdf(
+                    self.bytes,
+                    &data,
+                    self.options.newline_before_endstream,
+                    true,
+                );
+                serialize::framing_adds_newline_with_qdf(
+                    &data,
+                    self.options.newline_before_endstream,
+                    true,
+                )
+            };
             self.current_stream_length = Some(IndirectStreamLength {
-                cur_stream_length: data.len(),
+                cur_stream_length: stream_length,
                 added_newline,
             });
             return Ok(());
@@ -1328,7 +1453,24 @@ impl<'a, R: Read + Seek + 'static> LiveObjectEmitter<'a, R> {
         self.discover_qdf_children(object, 0)?;
         let queue = &self.queue;
         let map = |object_ref: ObjectRef| qdf_output_number(queue, object_ref);
-        object.write_object_qdf_with_ref_map_and_removed(self.bytes, 0, &map, &self.removed_refs)
+        if let Some(emitter) = self.encrypted_strings.as_mut() {
+            emitter.write_handle_object_with_ref_map(
+                self.bytes,
+                emitted_ref,
+                None,
+                object,
+                true,
+                &map,
+                &self.removed_refs,
+            )
+        } else {
+            object.write_object_qdf_with_ref_map_and_removed(
+                self.bytes,
+                0,
+                &map,
+                &self.removed_refs,
+            )
+        }
     }
 }
 

@@ -106,6 +106,132 @@ fn specialized_standard_sink_failure_keeps_shared_adbe_changes() {
     }
 }
 
+fn legacy_planned_shared_extensions(qdf: bool, level: i64, fail: bool) {
+    let (mut pdf, root, extensions) = document();
+    let mut writer = PdfWriter::new(&mut pdf);
+    // Extra header text excludes this Generate route from the migrated live
+    // queue, so the test exercises the remaining legacy coordinator's Root
+    // emission boundary for both QDF and content normalization.
+    if qdf {
+        writer.set_qdf_mode(true);
+    } else {
+        writer.set_content_normalization(true);
+    }
+    writer.set_object_stream_mode(flpdf::ObjectStreamMode::Generate);
+    writer.set_extra_header_text("% legacy QDF ADBE probe\n");
+    writer.set_static_id(true);
+    writer.force_pdf_version("1.7", level);
+    if fail {
+        writer.set_output_writer(FailingOutput).unwrap();
+    } else {
+        writer.set_output_memory().unwrap();
+    }
+    assert_eq!(writer.write().is_err(), fail);
+    assert!(root
+        .try_get_key(b"/Extensions")
+        .unwrap()
+        .is_same_object_as(&extensions));
+    assert_eq!(
+        extensions
+            .try_get_key(b"/ACME")
+            .unwrap()
+            .try_get_int_value()
+            .unwrap(),
+        1
+    );
+    let adbe = extensions.try_get_key(b"/ADBE").unwrap();
+    if level == 0 {
+        assert!(adbe.is_null());
+    } else {
+        assert_eq!(
+            adbe.try_get_key(b"/ExtensionLevel")
+                .unwrap()
+                .try_get_int_value()
+                .unwrap(),
+            level
+        );
+    }
+}
+
+#[test]
+fn legacy_root_reconciles_shared_extensions_on_success_and_failure() {
+    for fail in [false, true] {
+        for level in [0, 8] {
+            for qdf in [true, false] {
+                legacy_planned_shared_extensions(qdf, level, fail);
+            }
+        }
+    }
+}
+
+#[test]
+fn legacy_normalize_reconciles_an_uncompressed_root() {
+    for level in [0, 8] {
+        let mut pdf = Pdf::open(Cursor::new(
+            include_bytes!("../../../tests/fixtures/compat/three-page-objstm.pdf").to_vec(),
+        ))
+        .expect("ObjStm fixture");
+        let root = pdf.root_handle().expect("Catalog");
+        let extensions = ObjectHandle::dictionary(vec![
+            (
+                b"/ADBE".to_vec(),
+                ObjectHandle::dictionary(vec![
+                    (
+                        b"/BaseVersion".to_vec(),
+                        ObjectHandle::name(b"1.7".to_vec()),
+                    ),
+                    (b"/ExtensionLevel".to_vec(), ObjectHandle::integer(3)),
+                ]),
+            ),
+            (b"/ACME".to_vec(), ObjectHandle::integer(1)),
+        ]);
+        root.replace_key(b"/Extensions", extensions.clone())
+            .expect("install shared Extensions");
+        let audit = pdf
+            .make_indirect_from_object_handle(ObjectHandle::dictionary(vec![(
+                b"/Marker".to_vec(),
+                ObjectHandle::integer(1),
+            )]))
+            .expect("create a planned non-page dictionary");
+        root.replace_key(b"/Audit", audit)
+            .expect("attach planned non-page dictionary");
+
+        let mut writer = PdfWriter::new(&mut pdf);
+        writer.set_content_normalization(true);
+        writer.set_object_stream_mode(flpdf::ObjectStreamMode::Preserve);
+        writer.set_extra_header_text("% legacy normalize ADBE probe\n");
+        writer.set_static_id(true);
+        writer.force_pdf_version("1.7", level);
+        writer.set_output_memory().unwrap();
+        writer.write().expect("legacy normalization rewrite");
+
+        assert!(root
+            .try_get_key(b"/Extensions")
+            .unwrap()
+            .is_same_object_as(&extensions));
+        assert_eq!(
+            extensions
+                .try_get_key(b"/ACME")
+                .unwrap()
+                .try_get_int_value()
+                .unwrap(),
+            1
+        );
+        let adbe = extensions.try_get_key(b"/ADBE").unwrap();
+        if level == 0 {
+            assert!(adbe.is_null());
+        } else {
+            assert_eq!(
+                adbe.try_get_key(b"/ExtensionLevel")
+                    .unwrap()
+                    .try_get_int_value()
+                    .unwrap(),
+                level
+            );
+        }
+    }
+}
+
 fn callback_failure(percent: u8, expected_level: i64) {
     let (mut pdf, _root, extensions) = document();
     let mut writer = PdfWriter::new(&mut pdf);

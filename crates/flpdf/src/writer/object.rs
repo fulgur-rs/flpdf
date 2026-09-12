@@ -1773,6 +1773,43 @@ pub(crate) fn write_prepared_stream_body_qdf_with_ref_map_and_removed_and_length
     )
 }
 
+/// QDF stream-dictionary emission for a dictionary that has already passed
+/// qpdf's one-shot filter/parameter preparation. This variant keeps the
+/// encrypted-string writer on the same prepared entries used for child
+/// discovery; calling the ordinary trait method here would run `/Crypt` and
+/// empty-`/DecodeParms` cleanup a second time.
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn write_prepared_stream_body_qdf_with_ref_map_and_removed_and_length_with_string_writer_with_options<
+    F,
+>(
+    handle: &ObjectHandle,
+    out: &mut Vec<u8>,
+    indent: usize,
+    map: &dyn Fn(ObjectRef) -> Result<ObjectRef>,
+    removed_refs: &BTreeSet<ObjectRef>,
+    length_ref: Option<ObjectRef>,
+    options: StreamDictionaryOptions,
+    write_string: &mut F,
+) -> Result<()>
+where
+    F: FnMut(&mut Vec<u8>, &[u8]) -> Result<()>,
+{
+    let entries = handle
+        .try_as_dictionary()?
+        .ok_or_else(|| Error::Internal("prepared stream dictionary is not a dictionary".into()))?;
+    let entries = entries.into_iter().collect::<Vec<_>>();
+    unparse_stream_dict_entries_qdf_with_ref_map_and_string_writer(
+        &entries,
+        indent,
+        out,
+        map,
+        removed_refs,
+        length_ref,
+        options,
+        write_string,
+    )
+}
+
 #[allow(clippy::too_many_arguments)]
 fn unparse_stream_dict_entries_qdf_with_ref_map_and_string_writer<F>(
     entries: &[(Vec<u8>, ObjectHandle)],

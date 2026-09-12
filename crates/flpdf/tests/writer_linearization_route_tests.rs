@@ -8,7 +8,7 @@ fn production_source(source: &str, test_module: &str) -> String {
 }
 
 #[test]
-fn full_rewrite_catalog_restore_uses_the_live_handle() {
+fn full_rewrite_root_reconciliation_has_no_legacy_snapshot_bridge() {
     let source = include_str!("../src/writer.rs").replace("\r\n", "\n");
     let route = source
         .split_once("pub(crate) fn emit_canonical_pdf")
@@ -16,16 +16,28 @@ fn full_rewrite_catalog_restore_uses_the_live_handle() {
         .map(|(route, _)| route)
         .expect("full-rewrite writer route exists");
 
-    assert!(route.contains("root_handle"));
-    assert!(route.contains("restore_key_raw"));
+    assert!(route.contains("emit_canonical_pdf_inner"));
+    assert!(!route.contains("snapshot_catalog_extensions"));
+    assert!(!route.contains("restore_catalog_extensions"));
     assert!(
         !route.contains(".materialize()"),
-        "Catalog restoration must not rebuild a legacy Object snapshot"
+        "Root reconciliation must not rebuild a legacy Object snapshot"
     );
     assert!(
         !route.contains("Object::Dictionary"),
-        "Catalog restoration must remain on the canonical handle graph"
+        "Root reconciliation must remain on the canonical handle graph"
     );
+    for legacy_bridge in [
+        "snapshot_catalog_extensions",
+        "restore_catalog_extensions",
+        "inject_adbe_extension",
+        "strip_adbe_extension",
+    ] {
+        assert!(
+            !source.contains(legacy_bridge),
+            "legacy ADBE bridge {legacy_bridge} must be removed after root cutover"
+        );
+    }
 }
 
 #[test]

@@ -280,6 +280,61 @@ impl EncryptedStringEmitter {
             })
     }
 
+    /// QDF stream-dictionary emission for a dictionary already prepared by
+    /// the live writer's discovery pass. This keeps Crypt/filter cleanup
+    /// single-pass while still applying the current object's string key.
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) fn write_prepared_handle_stream_dict_with_ref_map(
+        &mut self,
+        out: &mut Vec<u8>,
+        emitted_ref: ObjectRef,
+        object_stream_index: Option<u32>,
+        dict: &ObjectHandle,
+        options: StreamDictOptions,
+        map: &dyn Fn(ObjectRef) -> crate::Result<ObjectRef>,
+        removed_refs: &std::collections::BTreeSet<ObjectRef>,
+        length_ref: Option<ObjectRef>,
+    ) -> crate::Result<()> {
+        if !options.encrypt_strings {
+            return crate::writer::object::write_prepared_stream_body_qdf_with_ref_map_and_removed_and_length_with_options(
+                dict,
+                out,
+                0,
+                map,
+                removed_refs,
+                length_ref,
+                options.dictionary,
+            );
+        }
+
+        let cipher = self.cipher;
+        let static_aes_iv = self.static_aes_iv;
+        let aes_iv_generator = self.aes_iv_generator.as_mut();
+        self.state
+            .with_object_data_key(emitted_ref.number, object_stream_index, |state| {
+                let mut write_string = |out: &mut Vec<u8>, plaintext: &[u8]| {
+                    write_encrypted_or_plain_string(
+                        state,
+                        cipher,
+                        static_aes_iv,
+                        aes_iv_generator,
+                        out,
+                        plaintext,
+                    )
+                };
+                crate::writer::object::write_prepared_stream_body_qdf_with_ref_map_and_removed_and_length_with_string_writer_with_options(
+                    dict,
+                    out,
+                    0,
+                    map,
+                    removed_refs,
+                    length_ref,
+                    options.dictionary,
+                    &mut write_string,
+                )
+            })
+    }
+
     /// Standard-writer stream-dictionary counterpart of
     /// [`Self::write_handle_stream_dict_with_ref_map`].
     #[allow(clippy::too_many_arguments)]
@@ -485,5 +540,44 @@ mod tests {
         let text = String::from_utf8(output).unwrap();
         assert!(text.contains("/Filter /FlateDecode"));
         assert!(!text.contains("ASCIIHexDecode"));
+    }
+
+    #[test]
+    fn prepared_qdf_stream_dict_can_keep_metadata_strings_cleartext() {
+        let context = EncryptionContext {
+            encrypt_dict: ObjectHandle::dictionary(Vec::new()),
+            file_key: vec![1; 5],
+            cipher: WriteCipher::PerObject(ObjectKeyAlg::Rc4),
+            encryption_v: 2,
+            encryption_r: 3,
+            encrypt_ref: ObjectRef::new(99, 0),
+            id0: b"id".to_vec(),
+            static_aes_iv: true,
+            encrypt_metadata: false,
+            metadata_ref: None,
+        };
+        let mut emitter = EncryptedStringEmitter::from_context(&context);
+        let dict = ObjectHandle::dictionary(vec![
+            (b"/Length".to_vec(), ObjectHandle::integer(3)),
+            (
+                b"/MetadataLabel".to_vec(),
+                ObjectHandle::string(b"plain".to_vec()),
+            ),
+        ]);
+        let mut output = Vec::new();
+        emitter
+            .write_prepared_handle_stream_dict_with_ref_map(
+                &mut output,
+                ObjectRef::new(3, 0),
+                None,
+                &dict,
+                StreamDictOptions::new(true, StreamDictionaryOptions::preserve(), false),
+                &|object_ref| Ok(object_ref), // cov:ignore: the dictionary has no indirect child references
+                &BTreeSet::new(),
+                None,
+            )
+            .unwrap();
+        let text = String::from_utf8(output).unwrap();
+        assert!(text.contains("/MetadataLabel (plain)"));
     }
 }

@@ -92,7 +92,7 @@ pub(crate) fn qdf_or_normalize_live_eligible(
 }
 
 #[allow(clippy::type_complexity)] // the three maps are distinct qpdf setup dimensions and are kept separate at this boundary
-fn live_page_context<R: Read + Seek>(
+pub(crate) fn live_page_context<R: Read + Seek>(
     pdf: &mut Pdf<R>,
     special_streams: Option<&crate::writer::SpecialStreams>,
 ) -> crate::Result<(

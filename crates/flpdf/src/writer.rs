@@ -1815,17 +1815,14 @@ pub(crate) const fn uses_deterministic_id(options: &WriterOptions) -> bool {
 ///
 /// The qpdf writer calls `QPDF::fixDanglingReferences` and then makes a
 /// dictionary-valued Catalog `/Extensions` direct, followed by an indirect
-/// `/ADBE` child when present (`libqpdf/QPDFWriter.cc:2034-2055`). The plain
-/// writer's ADBE add/remove decision now happens in the root dictionary's
-/// output-time `unparseObject` copy (`ObjectWriterEmission`); specialized and
-/// linearized consumers retain their legacy output mutation until their own
-/// migration slices.
+/// `/ADBE` child when present (`libqpdf/QPDFWriter.cc:2034-2055`). Every writer
+/// consumer's ADBE add/remove decision happens in the root dictionary's
+/// output-time `unparseObject` copy (`ObjectWriterEmission`).
 ///
 /// This function is called once by [`PdfWriter::write`] before the standard or
 /// linearized route is selected. The directization is permanent on the live
-/// Catalog graph, matching qpdf; output-only ADBE reconciliation may still
-/// use the surrounding writer cleanup until that responsibility moves to the
-/// root serializer.
+/// Catalog graph, matching qpdf; output-only ADBE reconciliation is owned by
+/// each root serializer.
 pub(crate) fn prepare_file_for_write<R: Read + Seek>(pdf: &mut Pdf<R>) -> Result<()> {
     pdf.fix_dangling_references()?;
 
@@ -2169,300 +2166,6 @@ fn effective_pdf_version_and_ext_without_force<'a>(
 
     best.map(|version| (version.raw, version.extension_level))
         .unwrap_or((source, 0))
-}
-
-/// Ensure the destination Catalog carries
-/// `/Extensions << /ADBE << /BaseVersion /<version> /ExtensionLevel <lvl> >> >>`.
-///
-/// Mirrors qpdf's `QPDFWriter::addDeveloperExtension` handling
-/// (QPDFWriter.cc L1355-1450): if the Catalog has no `/Extensions`, create a
-/// direct dict carrying only `/ADBE`; if it has one (direct dict or indirect
-/// reference), resolve it to a Dictionary and overwrite the `/ADBE` entry
-/// only, leaving non-ADBE developer prefixes intact; write the resulting
-/// Extensions dict back onto the Catalog inline as a direct value.
-///
-/// Callers must only invoke this when the effective extension level is > 0.
-///
-/// # Errors
-///
-/// - [`crate::Error::Missing`] if the input has no `/Root` in its trailer.
-/// - Propagates canonical-handle resolution errors when materialising the
-///   Catalog or an indirect `/Extensions` value.
-pub(crate) fn inject_adbe_extension<R: Read + Seek>(
-    pdf: &mut Pdf<R>,
-    version: &str,
-    extension_level: i64,
-) -> Result<()> {
-    // cov:ignore-start: defensive /Root guard. Called from
-    // emit_canonical_pdf (AFTER its own root_ref check has already
-    // returned Missing("/Root")) and from
-    // crate::linearization::writer::write_linearized (whose own
-    // resolve_catalog_adbe_status pre-check treats a missing root as
-    // `has_adbe: false` rather than
-    // erroring, so this is that caller's actual root check) -- unreachable
-    // in every fixture in either test module.
-    let (root_ref, catalog) = writer_catalog_copy(pdf)?;
-    // cov:ignore-end
-
-    // qpdf's unparse path works on an unsafe top-level dictionary copy and
-    // makes the `/Extensions` value direct before changing `/ADBE`. Copy only
-    // the immediate entries here so a direct stream elsewhere in the Catalog
-    // remains accepted, matching qpdf's `unsafeShallowCopy` boundary.
-    let raw_extensions = catalog.try_get_key(b"/Extensions")?;
-    let extensions = if let Some(entries) = raw_extensions.try_as_dictionary()? {
-        ObjectHandle::dictionary(entries.into_iter().collect())
-    } else {
-        ObjectHandle::dictionary(Vec::new())
-    };
-
-    // qpdf preserves an existing ADBE dictionary when its version pair is
-    // already the final pair, including extra keys such as `/URL`. Its
-    // `prepareFileForWrite` step directizes the ADBE value before the unparse
-    // decision, so do the same before comparing the two required fields.
-    let mut adbe = extensions.try_get_key(b"/ADBE")?;
-    if adbe.is_indirect() {
-        adbe.make_direct(false)?;
-        extensions.replace_key(b"/ADBE", adbe.clone())?;
-    }
-    let preserves_existing = adbe.try_is_dictionary()?
-        && adbe
-            .try_get_key(b"/BaseVersion")?
-            .try_is_name_and_equals(version.as_bytes())?
-        && adbe.try_get_key(b"/ExtensionLevel")?.try_as_integer()? == Some(extension_level);
-    if !preserves_existing {
-        let replacement = ObjectHandle::dictionary(vec![
-            (
-                b"/BaseVersion".to_vec(),
-                ObjectHandle::name(version.as_bytes().to_vec()),
-            ),
-            (
-                b"/ExtensionLevel".to_vec(),
-                ObjectHandle::integer(extension_level),
-            ),
-        ]);
-        extensions.replace_key(b"/ADBE", replacement)?;
-    }
-
-    catalog.replace_key(b"/Extensions", extensions)?;
-    replace_writer_catalog(pdf, root_ref, catalog)?;
-    Ok(())
-}
-
-/// Reconcile `/Extensions /ADBE` when the effective extension level is 0.
-/// This complements [`inject_adbe_extension`] and
-/// mirrors qpdf's removal branches (QPDFWriter.cc L1408 whole-`/Extensions`
-/// removal and L1432 `/ADBE`-only removal). Fires for two related cases:
-/// (1) a version race (min_version bump or ObjStm floor) drops the pairwise
-/// ext to 0 but the source Catalog carries an `/ADBE` entry that would
-/// otherwise survive; (2) the source Catalog carries a stale / malformed
-/// `/ADBE` (no `/ExtensionLevel` or non-integer) even without a race — qpdf
-/// removes it based on key existence, not `/ExtensionLevel` validity, so
-/// flpdf must match to preserve byte parity.
-///
-/// Only touches `/ADBE`; any other developer-prefix keys under `/Extensions`
-/// are preserved (matching qpdf's per-prefix handling). Drops `/Extensions`
-/// itself when it becomes empty after ADBE removal. If other developer keys
-/// remain and the existing `/ADBE` dictionary already matches the supplied
-/// version and extension level, qpdf preserves that entry and this function
-/// leaves the Catalog unchanged.
-///
-/// # Errors
-///
-/// - Propagates canonical ObjectHandle resolution errors when materialising the Catalog or an
-///   indirect `/Extensions` value.
-pub(crate) fn strip_adbe_extension<R: Read + Seek>(
-    pdf: &mut Pdf<R>,
-    version: &str,
-    extension_level: i64,
-) -> Result<()> {
-    // cov:ignore-start: defensive /Root guard, mirroring
-    // inject_adbe_extension's identical comment (same two callers:
-    // emit_canonical_pdf and crate::linearization::writer::write_linearized).
-    let (root_ref, catalog) = writer_catalog_copy(pdf)?;
-    // cov:ignore-end
-    let raw_extensions = catalog.try_get_key(b"/Extensions")?;
-    let Some(entries) = raw_extensions.try_as_dictionary()? else {
-        return Ok(());
-    };
-    let extensions_was_indirect = raw_extensions.is_indirect();
-    let extensions = ObjectHandle::dictionary(entries.into_iter().collect());
-    let keys = extensions.try_get_keys()?;
-    if !keys.contains(b"/ADBE".as_slice()) {
-        return Ok(());
-    }
-    let has_other = keys.iter().any(|key| key.as_slice() != b"/ADBE");
-    if has_other {
-        let mut adbe = extensions.try_get_key(b"/ADBE")?;
-        let adbe_was_indirect = adbe.is_indirect();
-        if adbe_was_indirect {
-            adbe.make_direct(false)?;
-            extensions.replace_key(b"/ADBE", adbe.clone())?;
-        }
-        let valid_adbe = adbe.try_is_dictionary()?
-            && adbe
-                .try_get_key(b"/BaseVersion")?
-                .try_is_name_and_equals(version.as_bytes())?
-            && adbe.try_get_key(b"/ExtensionLevel")?.try_as_integer()? == Some(extension_level);
-        if valid_adbe {
-            if extensions_was_indirect || adbe_was_indirect {
-                catalog.replace_key(b"/Extensions", extensions)?;
-                replace_writer_catalog(pdf, root_ref, catalog)?;
-            }
-            return Ok(());
-        }
-    }
-
-    extensions.remove_key(b"/ADBE");
-    if extensions.try_get_keys()?.is_empty() {
-        catalog.remove_key(b"/Extensions");
-    } else {
-        catalog.replace_key(b"/Extensions", extensions)?;
-    }
-    replace_writer_catalog(pdf, root_ref, catalog)?;
-    Ok(())
-}
-
-/// Resolve and copy the live Catalog's immediate entries for writer-owned
-/// output mutations.
-///
-/// The legacy writer used `ObjectHandle` resolution, which can return a stale materialized
-/// cache entry after a canonical ObjectHandle mutation. qpdf's writer operates
-/// on a live `QPDFObjectHandle::unsafeShallowCopy` instead, so this boundary
-/// resolves the canonical root slot, makes a direct top-level dictionary copy,
-/// and leaves the final replacement to the writer Catalog replacement helper.
-/// The immediate
-/// entries stay shared; callers replace only top-level keys, so nested direct
-/// values—including streams—are not cloned or rejected. A direct Catalog has
-/// no `ObjectRef`, so the returned identity is optional and replacement is
-/// performed through the live root handle.
-fn writer_catalog_copy<R: Read + Seek>(
-    pdf: &mut Pdf<R>,
-) -> Result<(Option<ObjectRef>, ObjectHandle)> {
-    let source = pdf.root_handle()?;
-    let root_ref = source.object_ref();
-    let entries = source
-        .try_as_dictionary()?
-        .ok_or_else(|| crate::Error::Unsupported("Catalog is not a dictionary".to_string()))?;
-    let catalog = ObjectHandle::dictionary(entries.into_iter().collect());
-    Ok((root_ref, catalog))
-}
-
-/// Replace the writer-owned top-level Catalog copy without inventing an
-/// indirect identity for a direct trailer `/Root`.
-fn replace_writer_catalog<R: Read + Seek>(
-    pdf: &mut Pdf<R>,
-    root_ref: Option<ObjectRef>,
-    catalog: ObjectHandle,
-) -> Result<()> {
-    if let Some(root_ref) = root_ref {
-        pdf.replace_object(root_ref, catalog).map(|_| ())?;
-        return Ok(());
-    }
-    let root = pdf.root_handle()?;
-    root.assign_value_state(&catalog);
-    Ok(())
-}
-
-/// Capture the output-only `/Extensions` value of the live Catalog before a
-/// specialized writer mutates it for emission.
-///
-/// qpdf's writer may replace `/Extensions /ADBE` while preparing an output
-/// object, but the canonical flpdf `PdfWriter` keeps the source `Pdf` attached
-/// to the caller. Preserve permanent graph preparation while restoring only
-/// this output-only Catalog key after linearization.
-pub(crate) struct CatalogExtensionsSnapshot {
-    root_ref: ObjectRef,
-    extensions: Option<ObjectHandle>,
-}
-
-/// Snapshot the live Catalog's output-only extension state.
-pub(crate) fn snapshot_catalog_extensions<R: Read + Seek>(
-    pdf: &mut Pdf<R>,
-) -> Result<Option<CatalogExtensionsSnapshot>> {
-    let catalog = pdf.root_handle()?;
-    let Some(root_ref) = catalog.object_ref() else {
-        return Ok(None);
-    };
-    // Raw dictionary membership, not `try_has_key`'s qpdf-semantic hasKey:
-    // an explicit `/Extensions null` entry is a present key whose restored
-    // shape must survive, even though qpdf's own `hasKey`/`getKeys` treat a
-    // null-resolving value as absent (`libqpdf/QPDF_Dictionary.cc:98-99`).
-    let extensions = catalog
-        .try_as_dictionary()?
-        .and_then(|dict| dict.get(b"/Extensions".as_slice()).cloned());
-    Ok(Some(CatalogExtensionsSnapshot {
-        root_ref,
-        extensions,
-    }))
-}
-
-/// Restore a previously captured output-only Catalog extension state.
-pub(crate) fn restore_catalog_extensions<R: Read + Seek>(
-    pdf: &mut Pdf<R>,
-    snapshot: Option<CatalogExtensionsSnapshot>,
-) -> Result<()> {
-    let Some(snapshot) = snapshot else {
-        return Ok(());
-    };
-    let (_, catalog) = writer_catalog_copy(pdf)?;
-    // Raw dictionary membership, matching the snapshot side (see
-    // `snapshot_catalog_extensions`).
-    let current_extensions = catalog
-        .try_as_dictionary()?
-        .and_then(|dict| dict.get(b"/Extensions".as_slice()).cloned());
-    // Identity, not serialized-value equality: the writer always allocates a
-    // fresh handle when it injects or replaces `/Extensions /ADBE`, even when
-    // the resulting bytes happen to match the original. Comparing by
-    // `unparse()` would treat that byte-identical replacement as "unchanged"
-    // and skip restoring the captured handle, leaving any external reference
-    // to the original handle detached from the Catalog.
-    let extensions_changed = match (&snapshot.extensions, &current_extensions) {
-        (None, None) => false,
-        (Some(before), Some(after)) => !before.is_same_object_as(after),
-        _ => true,
-    };
-    if extensions_changed {
-        match snapshot.extensions {
-            // `restore_key_raw`, not `replace_key`: this restores the exact
-            // pre-write raw entry, including a literal direct null, rather
-            // than performing a semantic document edit (`replace_key` treats
-            // a direct null as key removal, matching qpdf's own
-            // `QPDF_Dictionary::replaceKey`, which is the wrong contract
-            // when undoing a temporary output-only mutation).
-            Some(extensions) => catalog.restore_key_raw(b"/Extensions", extensions)?,
-            None => catalog.remove_key(b"/Extensions"),
-        }
-        pdf.replace_object(snapshot.root_ref, catalog)?;
-    }
-    Ok(())
-}
-
-/// Detect whether the destination Catalog carries `/Extensions /ADBE` in any
-/// form (dict-valued or via indirect reference; regardless of `/ExtensionLevel`
-/// presence or value).
-///
-/// Mirrors qpdf's `have_extensions_adbe = keys.count("/ADBE") > 0` check
-/// (QPDFWriter.cc L1387). Used as the strip trigger for `eff_ext == 0`: when
-/// the effective extension level is zero, qpdf removes stale `/ADBE` whether
-/// or not the source dict carried a valid `/ExtensionLevel`; the previous
-/// `adobe_extension_level() > 0` gate only fired for positive integer
-/// `/ExtensionLevel` and silently passed through malformed / partial /ADBE
-/// entries.
-///
-/// # Errors
-///
-/// - Propagates canonical-handle resolution errors when materialising the
-///   Catalog or an indirect `/Extensions` value.
-fn catalog_has_extensions_adbe<R: Read + Seek>(pdf: &mut Pdf<R>) -> Result<bool> {
-    let catalog = pdf.root_handle()?;
-    if !catalog.try_has_key(b"/Extensions")? {
-        return Ok(false);
-    }
-    let extensions = catalog.try_get_key(b"/Extensions")?;
-    if !extensions.try_is_dictionary()? {
-        return Ok(false);
-    }
-    Ok(extensions.try_get_keys()?.contains(b"/ADBE".as_slice()))
 }
 
 /// Binary header marker emitted by qpdf on the second line of every output
@@ -3751,69 +3454,11 @@ fn emit_canonical_pdf_with_special_streams<R: Read + Seek, W: Write>(
     special_streams: Option<&SpecialStreams>,
     setup: WriterSetupState,
 ) -> Result<WriterResult> {
-    // Plain, specialized, PCLm, and the migrated QDF/normalize cohort reconcile
-    // ADBE on the root's output-only shallow copy. Only routes that still use
-    // the legacy coordinator retain the snapshot boundary below.
-    let specialized_standard_live = !options.qdf
-        && !options.content_normalization
-        && !options.pclm
-        && !plain::eligible(
-            pdf.is_encrypted(),
-            options,
-            effective_object_stream_mode(options),
-        );
-    let qdf_or_normalize_live = !pdf.is_encrypted()
-        && options.encrypt.is_none()
-        && options.copy_encryption.is_none()
-        && !options.pclm
-        && plain::qdf_or_normalize_live_eligible(options, &setup.source_object_stream_data);
-    if options.pclm
-        || plain::eligible(
-            pdf.is_encrypted(),
-            options,
-            effective_object_stream_mode(options),
-        )
-        || qdf_or_normalize_live
-        || specialized_standard_live
-    {
-        return emit_canonical_pdf_inner(pdf, out, options, special_streams, setup);
-    }
-
-    // Reuse the qpdf-shaped snapshot boundary so resolving the Catalog cannot
-    // turn a logger/read failure into an absent snapshot. QPDFWriter constructs
-    // its Members with `pdf.getRoot()` before writing and propagates that
-    // failure; the Rust snapshot must preserve the same error category.
-    let catalog_snapshot = snapshot_catalog_extensions(pdf)?;
-    let direct_catalog_snapshot = if catalog_snapshot.is_none() {
-        let root = pdf.root_handle()?;
-        let extensions = root
-            .try_as_dictionary()?
-            .and_then(|entries| entries.get(b"/Extensions".as_slice()).cloned());
-        Some((root, extensions))
-    } else {
-        None
-    };
-    let result = emit_canonical_pdf_inner(pdf, out, options, special_streams, setup);
-    if let Some(snapshot) = catalog_snapshot {
-        restore_catalog_extensions(pdf, Some(snapshot))?;
-    }
-    if let Some((root, original_extensions)) = direct_catalog_snapshot {
-        let current_extensions = root
-            .try_as_dictionary()?
-            .and_then(|entries| entries.get(b"/Extensions".as_slice()).cloned());
-        let changed = match (&original_extensions, &current_extensions) {
-            (None, None) => false,
-            (Some(before), Some(after)) => !before.is_same_object_as(after),
-            _ => true,
-        };
-        if changed {
-            match original_extensions {
-                Some(extensions) => root.restore_key_raw(b"/Extensions", extensions)?,
-                None => root.remove_key(b"/Extensions"),
-            }
-        }
-    }
-    result
+    // Every standard writer consumer now owns ADBE reconciliation at its root
+    // emission boundary. The legacy coordinator is retained for routes whose
+    // queue/ObjStm implementation is not yet migrated, but it must consume the
+    // same output-only root copy rather than mutating the live Catalog here.
+    emit_canonical_pdf_inner(pdf, out, options, special_streams, setup)
 }
 
 fn emit_canonical_pdf_inner<R: Read + Seek, W: Write>(
@@ -3875,13 +3520,38 @@ fn emit_canonical_pdf_inner<R: Read + Seek, W: Write>(
         && options.copy_encryption.is_none()
         && !options.pclm
         && plain::qdf_or_normalize_live_eligible(options, &source_object_stream_data);
+    // The live body already owns encryption-aware object and stream emission.
+    // Extend the QDF/normalize live boundary to the indirect-Root encrypted
+    // cohort, while keeping direct-Root trailer serialization, source-backed
+    // Preserve containers, and generated ObjStm packing on their existing
+    // planned consumers.
+    let encrypted_qdf_or_normalize_live = (options.qdf || options.content_normalization)
+        && pdf.root_ref().is_some()
+        && !options.pclm
+        && (encryption_parameters.is_some()
+            || (pdf.is_encrypted()
+                && options.encrypt.is_none()
+                && options.copy_encryption.is_none()))
+        && matches!(
+            options.object_streams,
+            ObjectStreamMode::Disable | ObjectStreamMode::Preserve
+        )
+        && (options.object_streams == ObjectStreamMode::Disable
+            || source_object_stream_data.is_empty());
     let specialized_standard_live = !plain_route
         && !qdf_or_normalize_live
+        && !encrypted_qdf_or_normalize_live
         && !options.qdf
         && !options.content_normalization
         && !options.pclm;
-    if specialized_standard_live {
-        return emit_specialized_standard_live(
+    if specialized_standard_live || encrypted_qdf_or_normalize_live {
+        let (page_sequences, contents_sequences, content_container_sequences) =
+            if encrypted_qdf_or_normalize_live {
+                plain::live_page_context(pdf, special_streams)?
+            } else {
+                (BTreeMap::new(), BTreeMap::new(), BTreeMap::new())
+            };
+        return emit_specialized_standard_live_with_page_context(
             pdf,
             out,
             options,
@@ -3890,53 +3560,12 @@ fn emit_canonical_pdf_inner<R: Read + Seek, W: Write>(
             &source_object_stream_data,
             generated_compressible.as_ref(),
             &generated_object_stream_sources,
+            options.qdf,
+            page_sequences,
+            contents_sequences,
+            content_container_sequences,
         );
     }
-    // Compute the Adobe extension level before downstream dispatch. Live root
-    // consumers apply it to an output-only shallow copy; legacy coordinator
-    // routes still use the existing live-graph mutation below.
-    // When WriterOptions::min_extension_level requests an ext >= 1 (or the
-    // source Catalog already carries one that survives the pairwise rule)
-    // inject
-    //   /Extensions << /ADBE << /BaseVersion /<ver> /ExtensionLevel <lvl> >> >>
-    // so it becomes part of the Catalog the selected writer sees. A source
-    // indirect /Extensions ref, if any, is inlined here and
-    // drops out of the reachable graph — mirroring qpdf's writer behaviour.
-    if !plain_route && !qdf_or_normalize_live && !options.pclm {
-        let source_ver = pdf.version().to_string();
-        let source_ext = pdf.adobe_extension_level()?.unwrap_or(0);
-        // Predict whether the header floor will bump to PDF 1.5 due to
-        // ObjStm emission, so the pairwise pairwise-contribution logic in
-        // `effective_pdf_version_and_ext` sees the same version race that
-        // the header writer will apply. Generate mode always emits ObjStm
-        // through either the shared plain pipeline or this legacy excluded-mode
-        // planner. Generate mode emits ObjStm under QDF as under ordinary output.
-        // `Preserve` and `Disable` skip the floor here;
-        // Preserve+source-has-ObjStm remains a latent edge case (walking
-        // the source for eligibility would be expensive).
-        let will_emit_objstm = matches!(options.object_streams, ObjectStreamMode::Generate);
-        let (eff_ver, eff_ext) = effective_pdf_version_and_ext(
-            &source_ver,
-            source_ext,
-            options,
-            false,
-            will_emit_objstm,
-        );
-        if eff_ext > 0 {
-            inject_adbe_extension(pdf, eff_ver, eff_ext)?;
-        } else if catalog_has_extensions_adbe(pdf)? {
-            // qpdf QPDFWriter.cc L1387/L1408/L1432: when the effective extension
-            // level is 0, any `/Extensions /ADBE` key must be removed —
-            // whether from a prior injection that lost the pairwise version race
-            // (min_version bump / ObjStm floor drops the ext to 0) or from a
-            // stale/malformed source /ADBE without a valid /ExtensionLevel.
-            // strip_adbe_extension handles both branches: it drops /Extensions
-            // when nothing else remains, otherwise keeps it with the non-ADBE
-            // developer prefixes intact.
-            strip_adbe_extension(pdf, eff_ver, eff_ext)?;
-        }
-    }
-
     if options.pclm {
         return pclm_live::write_pclm(pdf, out, options);
     }
@@ -3952,10 +3581,13 @@ fn emit_canonical_pdf_inner<R: Read + Seek, W: Write>(
         );
     }
 
-    // Only specialized modes reach the legacy coordinator below: QDF, output or
-    // copied encryption, source-encrypted input, and requested Preserve/Generate
-    // suppressed to Disable by a forced version below 1.5. Its container planner
-    // and generic xref emitter remain live for those explicitly excluded modes.
+    // Only routes not covered by the live/plain consumers reach the legacy
+    // coordinator below: QDF/normalization variants with a remaining planned
+    // container boundary, output or copied encryption, source-encrypted input,
+    // and requested Preserve/Generate suppressed to Disable by a forced version
+    // below 1.5. Its planner and generic xref emitter remain live for those
+    // explicitly excluded modes, but Root is still emitted through the common
+    // output-only shallow-copy contract.
     let root_ref = pdf.root_ref();
     let root_handle = if root_ref.is_none() {
         let root_candidate = pdf.trailer_key_handle(b"Root");
@@ -4273,6 +3905,20 @@ fn emit_canonical_pdf_inner<R: Read + Seek, W: Write>(
         }
     }
 
+    // The ADBE pair is decided from the final body feature set, not from the
+    // pre-planning request. This is the same pair passed to the root
+    // `unparseObject` copy in qpdf: a generated or preserved ObjStm can raise
+    // the version floor and reset the extension level. Direct Catalogs use the
+    // same output copy with reconciliation disabled because they have no
+    // `QPDFObjGen` identity and therefore do not satisfy qpdf's `is_root` test.
+    let source_extension_level = pdf.adobe_extension_level()?.unwrap_or(0);
+    let (_, final_extension_level) = effective_pdf_version_and_ext(
+        pdf.version(),
+        source_extension_level,
+        options,
+        false,
+        !plan.batches.is_empty(),
+    );
     if (options.qdf || qpdf_generate_standard || qpdf_preserve_source_objstm)
         && !plan.batches.is_empty()
     {
@@ -4751,6 +4397,7 @@ fn emit_canonical_pdf_inner<R: Read + Seek, W: Write>(
         let object_handle = pdf.get_object_handle(*old_ref);
         object_handle.try_dereference()?;
         let is_stream = object_handle.as_stream_dict().is_some();
+        let is_root = root_ref == Some(*old_ref);
 
         // Direct `/Contents` streams have no terminal ObjectRef to put in
         // `contents_seq`. Their owning page/array holder uses the dedicated
@@ -4813,6 +4460,14 @@ fn emit_canonical_pdf_inner<R: Read + Seek, W: Write>(
                 )
                 .as_bytes(),
             );
+        }
+
+        // qpdf reports progress before entering unparseObject. Do this before
+        // creating the output-only Catalog copy so a callback can replace,
+        // delete, or attach Root state and have that state observed by the
+        // same emission.
+        if is_root {
+            report_progress_event(options)?;
         }
 
         // The body header uses the emitted number.
@@ -4995,25 +4650,39 @@ fn emit_canonical_pdf_inner<R: Read + Seek, W: Write>(
                 ));
             }
         } else {
+            let root_output = if is_root {
+                Some(object_handle.output_root_copy_with_adbe(
+                    &version,
+                    final_extension_level,
+                    true,
+                )?) // cov:ignore: legacy compact Root copy is exercised by the planned normalize alias test; LLVM attributes this multiline success continuation separately
+            } else {
+                None
+            };
+            let object_to_write = root_output.as_ref().unwrap_or(&object_handle);
             if let Some(emitter) = encrypted_strings.as_mut() {
                 emitter.write_handle_object_with_ref_map(
                     &mut bytes,
                     emit_ref,
                     None,
-                    &object_handle,
+                    object_to_write,
                     options.qdf,
                     &map,
                     &removed_refs,
                 )?; // cov:ignore: encrypted handle-object route; LLVM maps the call continuation here
+                    // cov:ignore-start: legacy QDF root/member serializer is exercised
+                    // by the QDF alias and parity tests; LLVM attributes its multiline
+                    // call entry separately.
             } else if options.qdf {
-                object_handle.write_object_qdf_with_ref_map_and_removed(
+                object_to_write.write_object_qdf_with_ref_map_and_removed(
                     &mut bytes,
                     0,
                     &map,
                     &removed_refs,
                 )?; // cov:ignore: QDF handle-object route; LLVM maps the call continuation here
+                    // cov:ignore-end
             } else {
-                object_handle.write_object_with_ref_map_and_removed(
+                object_to_write.write_object_with_ref_map_and_removed(
                     &mut bytes,
                     &map,
                     &removed_refs,
@@ -5033,7 +4702,9 @@ fn emit_canonical_pdf_inner<R: Read + Seek, W: Write>(
         }
         offsets.insert(emit_ref.number, (emit_ref.generation, emit_offset));
         emitted_old_to_new.insert(*old_ref, ObjectRef::new(emit_ref.number, 0));
-        report_progress_event(options)?;
+        if !is_root {
+            report_progress_event(options)?;
+        }
 
         // QDF: emit the length-holder object IMMEDIATELY after its stream's
         // endobj + blank line, numbered in sequential emission order so that
@@ -5151,17 +4822,37 @@ fn emit_canonical_pdf_inner<R: Read + Seek, W: Write>(
                 qdf_marker_starts.push(marker_start);
                 qdf_marker_lengths.push(out.len() - marker_start);
             }
+            let is_root = root_ref == handle.object_ref();
+            if is_root {
+                // Keep the callback before Root reconciliation, matching the
+                // writeObject -> unparseObject order used by qpdf.
+                report_progress_event(options)?;
+            }
+            let object_to_write = if is_root {
+                // A generated/preserved ObjStm may contain the Catalog. qpdf
+                // still applies the root-only output copy from inside
+                // `unparseObject`, after the object has been planned and
+                // assigned its output number.
+                handle.output_root_copy_with_adbe(&version, final_extension_level, true)?
+            } else {
+                handle.clone()
+            };
             let result = if options.qdf {
-                if let Some(original) = handle.object_ref() {
+                if let Some(original) = object_to_write.object_ref() {
                     if let Some(&seq) = page_seq.get(&original) {
                         out.extend_from_slice(format!("%% Page {seq}\n").as_bytes());
                     }
                 } // cov:ignore: every ObjStm member has a source ObjectRef
-                handle.write_object_qdf_with_ref_map_and_removed(out, 0, &map, &removed_refs)
+                object_to_write.write_object_qdf_with_ref_map_and_removed(
+                    out,
+                    0,
+                    &map,
+                    &removed_refs,
+                )
             } else {
-                handle.write_object_with_ref_map_and_removed(out, &map, &removed_refs)
+                object_to_write.write_object_with_ref_map_and_removed(out, &map, &removed_refs)
             }; // cov:ignore: llvm-cov maps the successful callback branch closing here
-            if result.is_ok() {
+            if !is_root && result.is_ok() {
                 report_progress_event(options)?;
             } // cov:ignore: llvm-cov maps the successful progress branch closing here
             result
@@ -5423,6 +5114,14 @@ fn emit_canonical_pdf_inner<R: Read + Seek, W: Write>(
         offsets.insert(ctx.encrypt_ref.number, (0, emit_offset));
     }
 
+    // A direct Catalog is serialized as a trailer value, after all body
+    // progress callbacks have run. Defer its shallow copy until this boundary
+    // so callback mutations are visible, just like qpdf's writeTrailer path.
+    let direct_root_output = root_handle
+        .as_ref()
+        .map(|root| root.output_root_copy_with_adbe(&version, final_extension_level, false))
+        .transpose()?;
+
     // Build xref / trailer matching the input's xref form.
     let xref_offset = bytes.len();
     // `object_count` is the smallest object number strictly greater than every
@@ -5476,7 +5175,7 @@ fn emit_canonical_pdf_inner<R: Read + Seek, W: Write>(
                 pdf,
                 object_count,
                 new_root,
-                root_handle.as_ref(),
+                direct_root_output.as_ref(), // cov:ignore: the legacy classic direct-Root trailer builder is exercised by the direct-root route tests; LLVM attributes this argument separately
                 options,
                 encrypt_ctx.as_ref(),
                 deterministic_id,
@@ -5619,7 +5318,7 @@ fn emit_canonical_pdf_inner<R: Read + Seek, W: Write>(
                 pdf,
                 xref_size,
                 new_root,
-                root_handle.as_ref(),
+                direct_root_output.as_ref(),
                 options,
                 encrypt_ctx.as_ref(),
                 deterministic_id,
@@ -5696,13 +5395,14 @@ fn emit_canonical_pdf_inner<R: Read + Seek, W: Write>(
 /// Specialized non-linearized standard output using qpdf's growing queue.
 ///
 /// This consumer intentionally owns the whole standard body/xref handoff for
-/// its cohort. The legacy coordinator below still owns QDF and normalization,
-/// whose indirect length holders and content maps need their own pending
-/// migration (`flpdf-ay5b`). Keeping this boundary explicit prevents a frozen
-/// catalog-first prewalk from silently remaining underneath the root output
-/// shallow-copy migration.
+/// its cohort. It also serves the bounded encrypted QDF/normalization cohort
+/// when no source or generated ObjStm packing is required; the legacy
+/// coordinator remains only for planned ObjStm-bearing consumers and direct
+/// Root forms excluded from that live path. Keeping this boundary explicit
+/// prevents a frozen catalog-first prewalk from silently remaining underneath
+/// the root output shallow-copy migration.
 #[allow(clippy::too_many_arguments)]
-fn emit_specialized_standard_live<R: Read + Seek + 'static, W: Write>(
+fn emit_specialized_standard_live_with_page_context<R: Read + Seek + 'static, W: Write>(
     pdf: &mut Pdf<R>,
     mut out: W,
     options: &WriterOptions,
@@ -5711,6 +5411,10 @@ fn emit_specialized_standard_live<R: Read + Seek + 'static, W: Write>(
     source_object_stream_data: &BTreeMap<u32, u32>,
     generated_compressible: Option<&object_streams::CompressiblePlan>,
     generated_object_stream_sources: &[ObjectRef],
+    qdf: bool,
+    page_sequences: BTreeMap<ObjectRef, usize>,
+    contents_sequences: BTreeMap<ObjectRef, usize>,
+    content_container_sequences: BTreeMap<ObjectRef, usize>,
 ) -> Result<WriterResult> {
     let deterministic_id = uses_deterministic_id(options);
     let encrypting = options.encrypt.is_some() || options.copy_encryption.is_some();
@@ -5875,7 +5579,7 @@ fn emit_specialized_standard_live<R: Read + Seek + 'static, W: Write>(
     // Preserve as well so stale aliases become null/omitted at emission time
     // (`QPDFWriter.cc:1953-1966`, `QPDF.cc:2426-2443`).
     let removed_refs = plan.removed_refs.clone();
-    let mut body = plain::body::emit_live_specialized_standard(
+    let mut body = plain::body::emit_live_specialized_standard_with_page_context(
         pdf,
         options,
         &version,
@@ -5884,8 +5588,19 @@ fn emit_specialized_standard_live<R: Read + Seek + 'static, W: Write>(
         removed_refs.clone(),
         &object_stream_groups,
         encrypt_ctx.as_ref(),
+        qdf,
+        page_sequences,
+        contents_sequences,
+        content_container_sequences,
     )?; // cov:ignore: LLVM attributes the live-body call continuation to callback cleanup
-    let body_map: HashMap<ObjectRef, ObjectRef> = body.old_to_new.into_iter().collect();
+    let mut body_map: HashMap<ObjectRef, ObjectRef> = body.old_to_new.into_iter().collect();
+    // cov:ignore-start: the QDF live body already validates ignored XRef
+    // references through its root serializer; this propagation loop has no
+    // independently attributed continuation in the specialized coordinator.
+    for ignored in body.ignored_refs {
+        body_map.insert(ignored, ObjectRef::new(0, 0));
+    }
+    // cov:ignore-end
     let new_root = root_source.and_then(|source| body_map.get(&source).copied());
     if root_source.is_some() && new_root.is_none() {
         // cov:ignore-start: the live body seeds /Root before the queue is drained
@@ -5919,6 +5634,9 @@ fn emit_specialized_standard_live<R: Read + Seek + 'static, W: Write>(
         let encrypt_handle = ctx.encrypt_dict_handle();
         encrypted_strings::write_encryption_dictionary_handle(&mut body.bytes, &encrypt_handle)?;
         body.bytes.extend_from_slice(b"\nendobj\n");
+        if qdf {
+            body.bytes.push(b'\n');
+        }
         body.layout
             .uncompressed
             .insert(ctx.encrypt_ref.number, (0, offset));
@@ -6008,7 +5726,7 @@ fn emit_specialized_standard_live<R: Read + Seek + 'static, W: Write>(
         id,
         encrypt: encrypt_ctx.as_ref().map(|ctx| ctx.encrypt_ref),
         structural_filtered,
-        qdf: false,
+        qdf,
     };
 
     let mut bytes = body.bytes;
@@ -6999,20 +6717,6 @@ mod final_handle_writer_tests {
                 if message.contains("param-dict object number")
                     && message.contains("exceeds /Size")
         ));
-    }
-
-    #[test]
-    fn direct_root_catalog_extension_restore_accepts_a_missing_snapshot() {
-        let mut pdf = Pdf::open(Cursor::new(
-            include_bytes!("../../../tests/fixtures/compat/direct-root-one-page.pdf").to_vec(),
-        ))
-        .expect("direct-root fixture");
-        let snapshot = snapshot_catalog_extensions(&mut pdf).expect("snapshot direct root");
-        assert!(
-            snapshot.is_none(),
-            "an inline Catalog has no restoration snapshot"
-        );
-        restore_catalog_extensions(&mut pdf, snapshot).expect("restore absent snapshot");
     }
 
     #[test]
