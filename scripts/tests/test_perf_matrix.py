@@ -110,6 +110,11 @@ class MeasurementContracts(unittest.TestCase):
         for serialized, family in (("/Bench", "stream"), ("", "pages"), ("/EmbeddedFiles", "objects")):
             with self.assertRaises(ValueError):
                 perf.require_markers(serialized, family)
+        # A page-level `/Bench` must not stand in for the objects family's
+        # Catalog array: dropping the array has to fail even when pages survive.
+        perf.require_markers('"/Bench": {} "/Bench": [', "objects")
+        with self.assertRaises(ValueError):
+            perf.require_markers('"/Bench": {"/Flag": true}', "objects")
         # The pinned qtest fixture is read unchanged and has no generated marker.
         perf.require_markers("", "qtest")
         self.assertNotIn("qtest", perf.GENERATED_FAMILIES)

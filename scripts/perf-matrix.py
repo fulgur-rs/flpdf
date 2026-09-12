@@ -206,7 +206,15 @@ def require_markers(serialized, family):
     """
     if family not in GENERATED_FAMILIES:
         return
-    markers = ["/Bench"] + (["/EmbeddedFiles"] if family == "stream" else [])
+    # Every family puts a `/Bench` dictionary on each page, so that name alone
+    # does not prove the family's own objects survived: an `objects` output
+    # could drop the Catalog array and all its dictionaries and still match.
+    # Require the shape each family actually contributes.
+    markers = ["/Bench"]
+    if family == "objects":
+        markers.append('"/Bench": [')
+    if family == "stream":
+        markers.append("/EmbeddedFiles")
     missing = [marker for marker in markers if marker not in serialized]
     if missing:
         raise ValueError("output dropped benchmark objects: " + ",".join(missing))
