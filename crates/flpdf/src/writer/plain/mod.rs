@@ -76,13 +76,15 @@ fn write_plain_live<R: Read + Seek>(
     let source_id0 = plan::live_source_id0(pdf)?;
     let source_version = pdf.version().to_string();
     let source_extension_level = pdf.adobe_extension_level()?.unwrap_or(0);
-    let (effective_version, final_extension_level) = crate::writer::effective_pdf_version_and_ext(
-        &source_version,
-        source_extension_level,
-        options,
-        false,
-        has_object_stream_hint,
-    );
+    let (effective_version, final_extension_level) =
+        crate::writer::effective_pdf_version_and_ext_with_encryption(
+            &source_version,
+            source_extension_level,
+            options,
+            false,
+            has_object_stream_hint,
+            encryption_parameters.as_ref(),
+        );
     let version = effective_version.to_string();
     crate::writer::configure_progress_for_pdf(pdf, options, 0, false)?;
     let deterministic_id = crate::writer::uses_deterministic_id(options);
@@ -202,7 +204,8 @@ fn write_plain_live<R: Read + Seek>(
     // (`QPDFWriter.cc:3023-3031`), not from what the walk turned out to
     // reach, so a registered-but-unreached container still produces a
     // cross-reference stream with zero type-2 rows.
-    let form = if has_object_stream_hint {
+    let form = if has_object_stream_hint || (!options.qdf && pdf.last_xref_form == XrefForm::Stream)
+    {
         XrefForm::Stream
     } else {
         XrefForm::Table

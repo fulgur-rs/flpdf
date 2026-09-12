@@ -2200,6 +2200,48 @@ fn effective_pdf_version_and_ext_without_force<'a>(
         .unwrap_or((source, 0))
 }
 
+/// Apply the encryption floor after setup has moved the resolved parameters
+/// out of `WriterOptions` and into the route state consumed by the live writer.
+/// This preserves qpdf's V/R-dependent header and Adobe extension floor for
+/// standard encrypted output, including V=5 R=5's `(1.7, 3)` pair.
+pub(crate) fn effective_pdf_version_and_ext_with_encryption<'a>(
+    source: &'a str,
+    source_ext: i64,
+    options: &'a WriterOptions,
+    linearize: bool,
+    object_streams: bool,
+    encryption: Option<&EncryptionParameters>,
+) -> (&'a str, i64) {
+    let (raw, extension_level) =
+        effective_pdf_version_and_ext(source, source_ext, options, linearize, object_streams);
+    let Some(encryption) = encryption else {
+        return (raw, extension_level);
+    };
+
+    let (encryption_version, encryption_extension) = if encryption.encryption_r >= 6 {
+        ("1.7", 8)
+    } else if encryption.encryption_v >= 5 && encryption.encryption_r >= 5 {
+        ("1.7", 3)
+    } else if encryption.encryption_v == 4 {
+        match encryption.cipher {
+            WriteCipher::PerObject(crate::encryption::standard::ObjectKeyAlg::Aes) => ("1.6", 0),
+            WriteCipher::PerObject(crate::encryption::standard::ObjectKeyAlg::Rc4) => ("1.5", 0),
+            WriteCipher::FileKeyAes256 => ("1.7", 3),
+        }
+    } else if encryption.encryption_v == 2 || encryption.encryption_r >= 3 {
+        ("1.4", 0)
+    } else {
+        ("1.3", 0)
+    };
+
+    let mut effective = None;
+    update_effective_pdf_version(&mut effective, raw, extension_level);
+    update_effective_pdf_version(&mut effective, encryption_version, encryption_extension);
+    effective
+        .map(|version| (version.raw, version.extension_level))
+        .unwrap_or((raw, extension_level))
+}
+
 /// Ensure the destination Catalog carries
 /// `/Extensions << /ADBE << /BaseVersion /<version> /ExtensionLevel <lvl> >> >>`.
 ///

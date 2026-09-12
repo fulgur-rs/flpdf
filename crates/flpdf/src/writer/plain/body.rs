@@ -754,7 +754,7 @@ impl<'pdf, 'output, 'sink, R: Read + Seek + 'static> crate::writer::write_object
                 let root = object.output_root_copy_with_adbe(
                     self.version,
                     self.final_extension_level,
-                    self.options.qdf,
+                    true,
                 )?;
                 self.enqueue_surviving_children(&root)?;
                 let queued_map = self.queue.borrow().old_to_new.clone();
