@@ -103,7 +103,7 @@ fn embedded_files_tree_with_options<R: Read + Seek>(
     // cov:ignore-end
     let catalog = pdf.get_object_handle(catalog_ref);
     catalog.try_dereference()?;
-    if catalog.try_as_dictionary()?.is_none() {
+    if !catalog.try_is_dictionary()? {
         return Ok(None);
     }
 
@@ -114,13 +114,13 @@ fn embedded_files_tree_with_options<R: Read + Seek>(
     let names_seed = catalog.try_get_key(b"/Names")?;
     names_seed.try_dereference()?;
     let names = names_seed;
-    if names.try_as_dictionary()?.is_none() {
+    if !names.try_is_dictionary()? {
         return Ok(None);
     }
     let root_seed = names.try_get_key(b"/EmbeddedFiles")?;
     root_seed.try_dereference()?;
     let root = root_seed;
-    if root.try_as_dictionary()?.is_none() {
+    if !root.try_is_dictionary()? {
         return Ok(None);
     }
 
@@ -153,7 +153,7 @@ impl<'a, R: Read + Seek> EmbeddedFileDocumentHelper<'a, R> {
         // cov:ignore-end
         let catalog = self.pdf.get_object_handle(catalog_ref);
         catalog.try_dereference()?;
-        if catalog.try_as_dictionary()?.is_none() {
+        if !catalog.try_is_dictionary()? {
             return Ok(None);
         }
 
@@ -161,7 +161,7 @@ impl<'a, R: Read + Seek> EmbeddedFileDocumentHelper<'a, R> {
             let candidate = catalog.try_get_key(b"/Names")?;
             candidate.try_dereference()?;
             let names = candidate;
-            if names.try_as_dictionary()?.is_some() {
+            if names.try_is_dictionary()? {
                 names
             } else {
                 let names = ObjectHandle::dictionary(Vec::new());

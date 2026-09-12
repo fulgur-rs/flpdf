@@ -250,7 +250,7 @@ struct LiveDictionary {
 impl LiveDictionary {
     fn new(handle: ObjectHandle, filename: &[u8]) -> Result<Self> {
         handle.try_dereference()?;
-        if handle.try_as_dictionary()?.is_none() {
+        if !handle.try_is_dictionary()? {
             return Err(structural_error(filename, handle.object_ref(), "bad node"));
         }
         Ok(Self { handle })
@@ -1685,12 +1685,12 @@ impl<K: TreeKey> NNTree<K> {
             if let (Some(first_kid), Some(last_kid)) = (kids.values.first(), kids.values.last()) {
                 first_kid.try_dereference()?;
                 let first_kid = first_kid.clone();
-                if first_kid.try_as_dictionary()?.is_none() {
+                if !first_kid.try_is_dictionary()? {
                     return Ok(None);
                 }
                 last_kid.try_dereference()?;
                 let last_kid = last_kid.clone();
-                if last_kid.try_as_dictionary()?.is_none() {
+                if !last_kid.try_is_dictionary()? {
                     return Ok(None);
                 }
                 let filename = pdf.input_description();
@@ -1880,7 +1880,7 @@ impl<K: TreeKey> NNTree<K> {
                         .expect("binary-search index is in range");
                     let filename = pdf.input_description();
                     kid.try_dereference()?;
-                    if kid.try_as_dictionary()?.is_none() {
+                    if !kid.try_is_dictionary()? {
                         return Err(structural_error(
                             &filename,
                             root_diagnostic_ref,
@@ -2328,7 +2328,7 @@ impl<K: TreeKey> NNTree<K> {
         pdf: &mut Pdf<R>,
         kid: &ObjectHandle,
     ) -> Result<bool> {
-        if kid.try_as_dictionary()?.is_none() {
+        if !kid.try_is_dictionary()? {
             return Ok(false); // cov:ignore: non-dictionary kids are rejected by LiveDictionary before traversal
         }
         let filename = pdf.input_description();

@@ -26,5 +26,5 @@ fn overlay_destination_uses_the_canonical_handle_resolver() {
         );
     }
     assert!(source.contains(".try_dereference()?"));
-    assert!(source.contains(".try_as_dictionary()?"));
+    assert!(source.contains(".try_is_dictionary()?"));
 }

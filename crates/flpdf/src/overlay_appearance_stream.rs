@@ -99,7 +99,7 @@ pub(crate) fn adjust_appearance_stream_handle<R: Read + Seek>(
     }
     let resources_terminal = resources_value.clone();
     resources_terminal.try_dereference()?;
-    if resources_terminal.try_as_dictionary()?.is_none() {
+    if !resources_terminal.try_is_dictionary()? {
         // qpdf's caller only invokes adjustAppearanceStream when
         // `resources.isDictionary()` (QPDFAcroFormDocumentHelper.cc:1006-1008).
         // A non-dictionary `/Resources` (e.g. an Integer in a malformed or
@@ -142,7 +142,7 @@ pub(crate) fn adjust_appearance_stream_handle<R: Read + Seek>(
         let Some(renames) = dr_map.category(category) else {
             continue; // cov:ignore: categories() iterates the same map
         };
-        if subdict.try_as_dictionary()?.is_none() {
+        if !subdict.try_is_dictionary()? {
             continue;
         }
         let staged = merge_with.try_get_key(&category_key)?;
@@ -169,7 +169,7 @@ pub(crate) fn adjust_appearance_stream_handle<R: Read + Seek>(
     for category_key in private_resources.try_get_keys()? {
         let category = private_resources.try_get_key(&category_key)?;
         category.try_dereference()?;
-        if category.try_as_dictionary()?.is_some() && category.try_get_keys()?.is_empty() {
+        if category.try_is_dictionary()? && category.try_get_keys()?.is_empty() {
             private_resources.remove_key(&category_key);
         }
     }

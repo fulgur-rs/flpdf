@@ -1791,7 +1791,7 @@ pub(crate) fn prepare_file_for_write<R: Read + Seek>(pdf: &mut Pdf<R>) -> Result
 
     let root = pdf.root_handle()?;
     let extensions = root.try_get_key(b"/Extensions")?;
-    if extensions.try_as_dictionary()?.is_none() {
+    if !extensions.try_is_dictionary()? {
         return Ok(());
     }
 
@@ -2184,7 +2184,7 @@ pub(crate) fn inject_adbe_extension<R: Read + Seek>(
         adbe.make_direct(false)?;
         extensions.replace_key(b"/ADBE", adbe.clone())?;
     }
-    let preserves_existing = adbe.try_as_dictionary()?.is_some()
+    let preserves_existing = adbe.try_is_dictionary()?
         && adbe
             .try_get_key(b"/BaseVersion")?
             .try_is_name_and_equals(version.as_bytes())?
@@ -2258,7 +2258,7 @@ pub(crate) fn strip_adbe_extension<R: Read + Seek>(
             adbe.make_direct(false)?;
             extensions.replace_key(b"/ADBE", adbe.clone())?;
         }
-        let valid_adbe = adbe.try_as_dictionary()?.is_some()
+        let valid_adbe = adbe.try_is_dictionary()?
             && adbe
                 .try_get_key(b"/BaseVersion")?
                 .try_is_name_and_equals(version.as_bytes())?
@@ -2419,7 +2419,7 @@ fn catalog_has_extensions_adbe<R: Read + Seek>(pdf: &mut Pdf<R>) -> Result<bool>
         return Ok(false);
     }
     let extensions = catalog.try_get_key(b"/Extensions")?;
-    if extensions.try_as_dictionary()?.is_none() {
+    if !extensions.try_is_dictionary()? {
         return Ok(false);
     }
     Ok(extensions.try_get_keys()?.contains(b"/ADBE".as_slice()))
@@ -5857,7 +5857,7 @@ fn collect_content_container_refs<R: Read + Seek>(
         return Ok(());
     }
 
-    if contents.try_as_array()?.is_none() {
+    if !contents.try_is_array()? {
         return Ok(());
     }
     containers.insert(contents.object_ref().unwrap_or(page_ref));

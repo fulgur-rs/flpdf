@@ -46,7 +46,7 @@ fn struct_tree_and_objr_drop_routes_use_canonical_handles() {
         "drop_struct_elem_dangling_pg_with_max_depth",
         "catalog",
     );
-    assert!(struct_body.contains("catalog.try_as_dictionary()?"));
+    assert!(struct_body.contains("catalog.try_is_dictionary()?"));
 
     let objr = fs::read_to_string(source_root().join("objr_obj_annot_p.rs"))
         .expect("objr_obj_annot_p.rs must be readable")
@@ -57,5 +57,5 @@ fn struct_tree_and_objr_drop_routes_use_canonical_handles() {
         "/// Remap-or-drop the `/P`",
     );
     assert_canonical_route(objr_body, "drop_objr_obj_annot_dangling_p", "annot");
-    assert!(objr_body.contains("annot.try_as_dictionary()?"));
+    assert!(objr_body.contains("annot.try_is_dictionary()?"));
 }

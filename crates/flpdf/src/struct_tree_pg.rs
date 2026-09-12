@@ -144,14 +144,14 @@ pub fn drop_struct_elem_dangling_pg_with_max_depth<R: Read + Seek>(
     };
     let catalog = pdf.get_object_handle(catalog_ref);
     catalog.try_dereference()?;
-    if catalog.try_as_dictionary()?.is_none() {
+    if !catalog.try_is_dictionary()? {
         return Ok(state.objr_obj_targets);
     }
 
     let Some(root) = child_if_present(&catalog, b"/StructTreeRoot")? else {
         return Ok(state.objr_obj_targets);
     };
-    if root.try_as_dictionary()?.is_none() {
+    if !root.try_is_dictionary()? {
         return Ok(state.objr_obj_targets);
     }
     if let Some(root_ref) = root.object_ref() {
@@ -204,7 +204,7 @@ fn walk_kids<R: Read + Seek>(
         }
         return Ok(());
     }
-    if k.try_as_dictionary()?.is_some() {
+    if k.try_is_dictionary()? {
         process_elem_dict(pdf, k, surviving, removed_pages, depth, max_depth, state)?;
     }
     Ok(())

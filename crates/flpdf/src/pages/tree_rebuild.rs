@@ -134,9 +134,8 @@ fn promote_inherited_value<R: Read + Seek>(
     value: ObjectHandle,
 ) -> Result<ObjectHandle> {
     value.try_dereference()?;
-    let non_scalar = value.as_array().is_some()
-        || value.as_dictionary().is_some()
-        || value.as_stream_dict().is_some();
+    let non_scalar =
+        value.try_is_array()? || value.try_is_dictionary()? || value.as_stream_dict().is_some();
     if !value.is_direct() || !non_scalar {
         return Ok(value);
     }
@@ -562,7 +561,7 @@ fn rebuild_page_tree_canonical<R: Read + Seek>(
     // /Count equal to the selection length, and no stale /Parent. A direct
     // root remains the live dictionary embedded in the catalog.
     // cov:ignore-start: prepare_for_optimization guarantees that the retained /Pages root is a dictionary
-    if root.try_as_dictionary()?.is_none() {
+    if !root.try_is_dictionary()? {
         return Err(Error::Unsupported(match page_root {
             PageTreeRoot::Indirect(root_ref) => {
                 format!("document /Pages root {root_ref} is not a dictionary")

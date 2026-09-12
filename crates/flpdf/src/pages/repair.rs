@@ -88,7 +88,7 @@ fn prepare_for_optimization_canonical<R: Read + Seek>(
         return Ok(None);
     }
     root_candidate.try_dereference()?;
-    if root_candidate.try_as_dictionary()?.is_none() {
+    if !root_candidate.try_is_dictionary()? {
         return Ok(None);
     }
     let catalog = root_candidate;
@@ -121,7 +121,7 @@ fn prepare_for_optimization_canonical<R: Read + Seek>(
         // node for /Parent. This keeps a missing or scalar /Pages value on
         // qpdf's warning-tolerant empty-page path rather than manufacturing
         // a hard page-tree error.
-        if pages.try_as_dictionary()?.is_none() {
+        if !pages.try_is_dictionary()? {
             break;
         }
         if !pages.try_has_key(b"/Parent")? {
@@ -148,7 +148,7 @@ fn prepare_for_optimization_canonical<R: Read + Seek>(
     // dictionary. That access is observable as a type warning for a missing
     // or scalar /Pages entry and is followed by an empty page cache.
     let has_kids = pages.try_has_key(b"/Kids")?;
-    if pages.try_as_dictionary()?.is_none() {
+    if !pages.try_is_dictionary()? {
         return Ok(None);
     }
 
@@ -334,7 +334,7 @@ fn repair_page_tree_frame<R: Read + Seek>(
     }
 
     node.try_dereference()?;
-    if node.try_as_dictionary()?.is_none() || !node.try_has_key(b"/Kids")? {
+    if !node.try_is_dictionary()? || !node.try_has_key(b"/Kids")? {
         return Ok(None); // cov:ignore: callers recurse only after observing a dictionary /Kids key
     }
 

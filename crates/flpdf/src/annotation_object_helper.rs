@@ -278,7 +278,7 @@ impl<'a, R: Read + Seek> AnnotationObjectHelper<'a, R> {
         state: Option<&[u8]>,
     ) -> Result<ObjectHandle> {
         let ap = self.get_appearance_dictionary()?;
-        if ap.as_dictionary().is_some() {
+        if ap.try_is_dictionary()? {
             let ap_sub = ap.try_get_key(&dict_key(which))?;
             ap_sub.try_dereference()?;
             if ap_sub.as_stream_dict().is_some() {
@@ -291,7 +291,7 @@ impl<'a, R: Read + Seek> AnnotationObjectHelper<'a, R> {
                 // must not surface for a state qpdf never consults here.
                 return Ok(ap_sub);
             }
-            if ap_sub.as_dictionary().is_some() {
+            if ap_sub.try_is_dictionary()? {
                 let desired_state: Vec<u8> = match state {
                     Some(s) if !s.is_empty() => s.to_vec(),
                     _ => self.get_appearance_state()?,

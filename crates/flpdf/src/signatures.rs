@@ -83,13 +83,13 @@ pub fn signatures_with_max_depth<R: Read + Seek>(
     let catalog_handle = pdf.get_object_handle(catalog_ref);
     catalog_handle.try_dereference()?;
     let catalog = catalog_handle;
-    if catalog.try_as_dictionary()?.is_none() {
+    if !catalog.try_is_dictionary()? {
         return Ok(Vec::new());
     }
     let acroform_value = catalog.try_get_key(b"/AcroForm")?;
     acroform_value.try_dereference()?;
     let acroform = acroform_value;
-    if acroform.try_is_null()? || acroform.try_as_dictionary()?.is_none() {
+    if acroform.try_is_null()? || !acroform.try_is_dictionary()? {
         return Ok(Vec::new());
     }
 
@@ -195,12 +195,14 @@ fn resolve_catalog_acroform<R: Read + Seek>(pdf: &mut Pdf<R>) -> Result<Option<O
     let catalog_handle = pdf.get_object_handle(root_ref);
     catalog_handle.try_dereference()?;
     let catalog = catalog_handle;
-    if catalog.try_as_dictionary()?.is_none() {
+    if !catalog.try_is_dictionary()? {
         return Ok(None);
     }
     let acroform_value = catalog.try_get_key(b"/AcroForm")?;
     acroform_value.try_dereference()?;
-    Ok(acroform_value.try_as_dictionary()?.map(|_| acroform_value))
+    Ok(acroform_value
+        .try_is_dictionary()?
+        .then_some(acroform_value))
 }
 
 /// Extract `/SigFlags` as a `u32` bitfield from an already-resolved `/AcroForm`
@@ -241,9 +243,9 @@ fn strip_signature_values_from_field<R: Read + Seek>(
     let field_handle = pdf.get_object_handle(field_ref);
     field_handle.try_dereference()?;
     let field = field_handle;
-    let Some(_entries) = field.try_as_dictionary()? else {
+    if !field.try_is_dictionary()? {
         return Ok(());
-    };
+    }
 
     let field_type = FormFieldObjectHelper::new(field_ref, pdf)
         .field_type()?
@@ -329,9 +331,9 @@ fn walk_signature_field<R: Read + Seek>(
     let field_handle = pdf.get_object_handle(field_ref);
     field_handle.try_dereference()?;
     let field_obj = field_handle;
-    let Some(_field_dict) = field_obj.try_as_dictionary()? else {
+    if !field_obj.try_is_dictionary()? {
         return Ok(());
-    };
+    }
 
     let (partial_name, is_signature) = {
         let mut field = FormFieldObjectHelper::new(field_ref, pdf);
@@ -523,7 +525,7 @@ fn certificate_entry(dict: &BTreeMap<Vec<u8>, ObjectHandle>) -> Result<Option<Ve
             if value.as_string().is_some() {
                 return Ok(value.as_string());
             }
-            if value.try_as_array()?.is_some() {
+            if value.try_is_array()? {
                 let values = value.try_as_array()?.unwrap_or_default();
                 for value in values {
                     value.try_dereference()?;

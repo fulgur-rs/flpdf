@@ -4104,7 +4104,7 @@ impl QPDFJob {
         };
         let root = pdf.get_object_handle(root_ref);
         root.try_dereference()?;
-        if root.try_as_dictionary()?.is_none() {
+        if !root.try_is_dictionary()? {
             return Ok(());
         }
         // cov:ignore-end

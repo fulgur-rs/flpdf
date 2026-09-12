@@ -101,7 +101,7 @@ pub(crate) fn remove_unreferenced_resources_on_page<R: Read + Seek>(
             continue;
         }
         value.try_dereference()?;
-        if value.try_as_dictionary()?.is_none() {
+        if !value.try_is_dictionary()? {
             // qpdf only shallow-copies and mutates a category when
             // `dict.isDictionary()` (`QPDFPageObjectHelper.cc:576-585`); a
             // malformed category is left as its original (possibly indirect)
@@ -205,7 +205,7 @@ fn prune_canonical_resource_target<R: Read + Seek>(
             continue;
         }
         value.try_dereference()?;
-        if value.try_as_dictionary()?.is_none() {
+        if !value.try_is_dictionary()? {
             // qpdf leaves a malformed /Font or /XObject category untouched;
             // see the matching comment in remove_unreferenced_resources_on_page.
             continue;
@@ -236,7 +236,7 @@ fn prune_canonical_resource_target<R: Read + Seek>(
         .filter(|name| !known_names.contains(*name))
         .cloned()
         .collect::<BTreeSet<_>>();
-    if !local_unresolved.is_empty() && resources.try_as_dictionary()?.is_some() {
+    if !local_unresolved.is_empty() && resources.try_is_dictionary()? {
         return Ok(());
     }
 
@@ -297,7 +297,7 @@ fn remove_unreferenced_resources_in_form_xobjects<R: Read + Seek>(
         let stream_dict = form_stream_dict(&form_handle)?;
         // Resolve the live resource dictionary before reading its children.
         let resources = stream_dict.try_get_key(b"/Resources")?;
-        let resources = resources.try_as_dictionary()?.map(|_| resources);
+        let resources = resources.try_is_dictionary()?.then_some(resources);
         // qpdf's removeUnreferencedResourcesHelper (QPDFPageObjectHelper.cc:539-556)
         // is the single function called for every Form and for the page
         // itself: parse through ResourceFinder and reject the scope if
@@ -444,7 +444,7 @@ fn prune_font_and_xobject_dictionaries(resources: &ObjectHandle, used: &UsedName
         key.extend_from_slice(category);
         let value = resources.try_get_key(&key)?;
         value.try_dereference()?;
-        if value.try_as_dictionary()?.is_none() {
+        if !value.try_is_dictionary()? {
             // qpdf leaves a malformed /Font or /XObject category untouched;
             // see the matching comment in remove_unreferenced_resources_on_page.
             continue;

@@ -197,7 +197,7 @@ pub(crate) fn parse_file_object_handle_syntax(
     }
 
     let object = parsed.value;
-    if object.as_dictionary().is_some() {
+    if object.try_is_dictionary()? {
         let stream_pos = skip_pdf_ws(input, next_offset);
         if let Some(after_stream) = keyword_token_end(input, stream_pos, b"stream") {
             let (data_start, start_eol) = consume_stream_start_eol(input, after_stream);

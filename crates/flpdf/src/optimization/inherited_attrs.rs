@@ -81,7 +81,7 @@ fn push_direct_root<R: Read + Seek>(
 ) -> Result<()> {
     // cov:ignore-start: PreparedPages::Direct is created and consumed without an intervening public mutation
     let pages = catalog.try_get_key(b"/Pages")?;
-    if pages.try_as_dictionary()?.is_none() {
+    if !pages.try_is_dictionary()? {
         return Ok(());
     }
     // cov:ignore-end

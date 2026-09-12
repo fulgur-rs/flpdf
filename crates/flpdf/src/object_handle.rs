@@ -3275,22 +3275,27 @@ impl ObjectHandle {
         Ok(self.as_integer().is_some())
     }
 
-    /// Test whether the resolved value is an array.
+    /// Test whether the resolved value is an array without snapshotting its
+    /// children. This mirrors qpdf's `isArray`, which dereferences and checks
+    /// only the value type code (`libqpdf/QPDFObjectHandle.cc:426-428`).
     pub fn try_is_array(&self) -> Result<bool> {
         if !self.is_initialized() {
             return Ok(false);
         }
         self.try_dereference()?;
-        Ok(self.as_array().is_some())
+        Ok(self.with_value(|value| matches!(value, Some(ObjectValue::Array(_)))))
     }
 
-    /// Test whether the resolved value is a dictionary.
+    /// Test whether the resolved value is a dictionary without snapshotting
+    /// its entries. This mirrors qpdf's `isDictionary`, which dereferences
+    /// and checks only the value type code
+    /// (`libqpdf/QPDFObjectHandle.cc:432-434`).
     pub fn try_is_dictionary(&self) -> Result<bool> {
         if !self.is_initialized() {
             return Ok(false);
         }
         self.try_dereference()?;
-        Ok(self.as_dictionary().is_some())
+        Ok(self.with_value(|value| matches!(value, Some(ObjectValue::Dictionary(_)))))
     }
 
     /// Test whether the resolved value is a name.
@@ -5396,7 +5401,7 @@ impl ObjectHandle {
         mut conflicts: Option<&mut ResourceConflicts>,
     ) -> Result<()> {
         self.try_dereference()?;
-        if self.as_dictionary().is_none() {
+        if !self.try_is_dictionary()? {
             return Ok(());
         }
         other.try_dereference()?;
@@ -5412,14 +5417,14 @@ impl ObjectHandle {
             let mut this_val = self.try_get_key(&rtype)?;
             this_val.try_dereference()?;
             other_val.try_dereference()?;
-            if this_val.as_dictionary().is_some() && other_val.as_dictionary().is_some() {
+            if this_val.try_is_dictionary()? && other_val.try_is_dictionary()? {
                 if this_val.is_indirect() {
                     let privatized = this_val.shallow_copy()?;
                     self.replace_key(&rtype, privatized.clone())?;
                     this_val = privatized;
                 }
                 merge_resource_subdict(&this_val, &other_val, &rtype, conflicts.as_deref_mut())?;
-            } else if this_val.as_array().is_some() && other_val.as_array().is_some() {
+            } else if this_val.try_is_array()? && other_val.try_is_array()? {
                 merge_resource_array(&this_val, &other_val)?;
             }
             // Any other shape combination for an existing rtype: untouched,
@@ -5683,7 +5688,7 @@ impl ObjectHandle {
 
                 let parent = current.try_get_key(b"/Parent")?;
                 parent.try_dereference()?;
-                if parent.as_dictionary().is_some() {
+                if parent.try_is_dictionary()? {
                     current = parent;
                 } else {
                     break;
@@ -5719,7 +5724,7 @@ impl ObjectHandle {
     /// stream allocation, or provider-registration failures.
     pub fn coalesce_content_streams(&self) -> Result<()> {
         let old_contents = self.try_get_key(b"/Contents")?;
-        if old_contents.type_code()? == 10 || old_contents.as_array().is_none() {
+        if old_contents.type_code()? == 10 || !old_contents.try_is_array()? {
             return Ok(());
         }
 
@@ -6118,7 +6123,7 @@ impl ObjectHandle {
     pub(crate) fn replace_stream_dict(&self, dictionary: ObjectHandle) -> Result<()> {
         self.try_dereference()?;
         dictionary.try_dereference()?;
-        if dictionary.as_dictionary().is_none() {
+        if !dictionary.try_is_dictionary()? {
             return Err(Error::System(
                 "operation for stream dictionary attempted with a non-dictionary".to_owned(),
             ));
@@ -8791,7 +8796,7 @@ fn try_get_resource_names(dict: &ObjectHandle) -> Result<std::collections::BTree
     };
     for (_, value) in entries {
         value.try_dereference()?;
-        if value.as_dictionary().is_some() {
+        if value.try_is_dictionary()? {
             result.extend(value.try_get_keys()?);
         }
     }
@@ -18743,6 +18748,26 @@ pub(crate) mod warning_emission_tests {
             warnings(&recorder),
             ["object 3 0: operation for dictionary attempted on object of type integer: returning null for attempted key retrieval"]
         );
+    }
+
+    #[test]
+    fn shape_predicates_resolve_lazy_containers_without_snapshotting() {
+        let (array, _array_recorder) = handle_resolving(ObjectValue::Array(vec![]));
+        let (dictionary, _dictionary_recorder) =
+            handle_resolving(ObjectValue::Dictionary(BTreeMap::new()));
+        let (integer, _integer_recorder) = handle_resolving(ObjectValue::Integer(7));
+        let null = ObjectHandle::null();
+
+        assert!(array.as_array().is_none());
+        assert!(dictionary.as_dictionary().is_none());
+        assert!(array.try_is_array().unwrap());
+        assert!(!array.try_is_dictionary().unwrap());
+        assert!(dictionary.try_is_dictionary().unwrap());
+        assert!(!dictionary.try_is_array().unwrap());
+        assert!(!integer.try_is_array().unwrap());
+        assert!(!integer.try_is_dictionary().unwrap());
+        assert!(!null.try_is_array().unwrap());
+        assert!(!null.try_is_dictionary().unwrap());
     }
 
     #[test]

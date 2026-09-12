@@ -1139,7 +1139,7 @@ impl<'a, R: Read + Seek> AcroFormDocumentHelper<'a, R> {
             // a non-dictionary parent is followed once, emits the normal
             // dictionary type warning from `getKey`, and is returned as the
             // top-level handle (`QPDFFormFieldObjectHelper.cc:36-47`).
-            if current.try_as_dictionary()?.is_none() {
+            if !current.try_is_dictionary()? {
                 let _ = current.try_get_key(b"/Parent")?;
                 return Ok(current);
             }
@@ -1402,7 +1402,7 @@ impl<'a, R: Read + Seek> AcroFormDocumentHelper<'a, R> {
                 return Ok(true);
             }
             let parent = current.try_get_key(b"/Parent")?;
-            if parent.try_is_null()? || parent.try_as_dictionary()?.is_none() {
+            if parent.try_is_null()? || !parent.try_is_dictionary()? {
                 return Ok(false);
             }
             parent.try_dereference()?;
@@ -1428,7 +1428,7 @@ impl<'a, R: Read + Seek> AcroFormDocumentHelper<'a, R> {
                 break;
             }
             let parent = current.try_get_key(b"/Parent")?;
-            if parent.try_is_null()? || parent.try_as_dictionary()?.is_none() {
+            if parent.try_is_null()? || !parent.try_is_dictionary()? {
                 break;
             }
             parent.try_dereference()?;
@@ -1454,7 +1454,7 @@ impl<'a, R: Read + Seek> AcroFormDocumentHelper<'a, R> {
                 break;
             }
             let parent = current.try_get_key(b"/Parent")?;
-            if parent.try_is_null()? || parent.try_as_dictionary()?.is_none() {
+            if parent.try_is_null()? || !parent.try_is_dictionary()? {
                 break;
             }
             parent.try_dereference()?;
@@ -1548,7 +1548,7 @@ impl<'a, R: Read + Seek> AcroFormDocumentHelper<'a, R> {
 
         let acroform = self.canonical_get_or_create_acroform()?;
         let fields_array = acroform.try_get_key(b"/Fields")?;
-        let fields_array = if fields_array.try_as_array()?.is_some() {
+        let fields_array = if fields_array.try_is_array()? {
             fields_array
         } else {
             let replacement = ObjectHandle::array(Vec::new());
@@ -1589,7 +1589,7 @@ impl<'a, R: Read + Seek> AcroFormDocumentHelper<'a, R> {
 
         let acroform = self.canonical_get_or_create_acroform()?;
         let fields_array = acroform.try_get_key(b"/Fields")?;
-        let fields_array = if fields_array.try_as_array()?.is_some() {
+        let fields_array = if fields_array.try_is_array()? {
             fields_array
         } else {
             let replacement = ObjectHandle::array(Vec::new());
@@ -1622,7 +1622,7 @@ impl<'a, R: Read + Seek> AcroFormDocumentHelper<'a, R> {
         // AcroForm gets an indirect identity when needed.
         let root = self.pdf.root_handle()?;
         let acroform = root.try_get_key(b"/AcroForm")?;
-        if acroform.try_as_dictionary()?.is_some() {
+        if acroform.try_is_dictionary()? {
             return Ok(acroform);
         }
 
@@ -1664,7 +1664,7 @@ impl<'a, R: Read + Seek> AcroFormDocumentHelper<'a, R> {
     fn canonical_get_or_create_acroform_resources(&mut self) -> Result<ObjectHandle> {
         let acroform = self.canonical_get_or_create_acroform()?;
         let resources = acroform.try_get_key(b"/DR")?;
-        if resources.try_as_dictionary()?.is_some() {
+        if resources.try_is_dictionary()? {
             if resources.object_ref().is_some() {
                 return Ok(resources);
             }
@@ -1698,7 +1698,7 @@ impl<'a, R: Read + Seek> AcroFormDocumentHelper<'a, R> {
                 .map(|value| decode_field_name(&value).into_bytes())
                 .unwrap_or_default(),
             quadding: quadding.try_as_integer()?.unwrap_or(0),
-            resources: resources.try_as_dictionary()?.map(|_| resources),
+            resources: resources.try_is_dictionary()?.then_some(resources),
             need_appearances: need_appearances.as_boolean() == Some(true),
         })
     }
@@ -1719,7 +1719,7 @@ impl<'a, R: Read + Seek> AcroFormDocumentHelper<'a, R> {
                 parts.push(decode_field_name(&name));
             }
             let parent = current.try_get_key(b"/Parent")?;
-            if parent.try_is_null()? || parent.try_as_dictionary()?.is_none() {
+            if parent.try_is_null()? || !parent.try_is_dictionary()? {
                 break;
             }
             parent.try_dereference()?;
@@ -1793,7 +1793,7 @@ impl<'a, R: Read + Seek> AcroFormDocumentHelper<'a, R> {
             return Ok(None);
         };
         let acroform = root.try_get_key(b"/AcroForm")?;
-        Ok(acroform.try_as_dictionary()?.is_some().then_some(acroform))
+        Ok(acroform.try_is_dictionary()?.then_some(acroform))
     }
 
     fn traverse_field_handles(
@@ -1815,7 +1815,7 @@ impl<'a, R: Read + Seek> AcroFormDocumentHelper<'a, R> {
             )?; // cov:ignore: warning continuation is an llvm-cov defensive error-edge artifact
             return Ok(());
         };
-        if field.try_as_dictionary()?.is_none() {
+        if !field.try_is_dictionary()? {
             field.warn_if_possible(
                 "encountered a non-dictionary as a field or annotation while traversing /AcroForm; ignoring field or annotation",
             )?; // cov:ignore: warning continuation is an llvm-cov defensive error-edge artifact
@@ -2031,7 +2031,7 @@ impl<'a, R: Read + Seek> AcroFormDocumentHelper<'a, R> {
         }
         let catalog = self.pdf.root_handle()?;
         let acroform = catalog.try_get_key(b"/AcroForm")?;
-        Ok(acroform.try_as_dictionary()?.is_some().then_some(acroform))
+        Ok(acroform.try_is_dictionary()?.then_some(acroform))
     }
 
     pub(crate) fn ensure_acroform_ref(&mut self) -> Result<ObjectRef> {
@@ -2044,7 +2044,7 @@ impl<'a, R: Read + Seek> AcroFormDocumentHelper<'a, R> {
         // for a direct trailer Catalog (`QPDFAcroFormDocumentHelper.cc:37-46`).
         let catalog = self.pdf.root_handle()?;
         let existing = catalog.try_get_key(b"/AcroForm")?;
-        let acroform = if existing.try_as_dictionary()?.is_some() {
+        let acroform = if existing.try_is_dictionary()? {
             existing.shallow_copy()?
         } else {
             ObjectHandle::dictionary(vec![(b"/Fields".to_vec(), ObjectHandle::array(Vec::new()))])
@@ -2061,7 +2061,7 @@ impl<'a, R: Read + Seek> AcroFormDocumentHelper<'a, R> {
     fn resolve_dict(&mut self, object_ref: ObjectRef, label: &str) -> Result<ObjectHandle> {
         let handle = self.pdf.get_object_handle(object_ref);
         handle.try_dereference()?;
-        if handle.try_as_dictionary()?.is_some() {
+        if handle.try_is_dictionary()? {
             Ok(handle)
         } else {
             Err(Error::Unsupported(format!(
@@ -2222,7 +2222,7 @@ fn copy_and_transform_appearance_streams_with_renames<R: Read + Seek>(
 ) -> Result<()> {
     let appearance = annotation.try_get_key(b"/AP")?;
     appearance.try_dereference()?;
-    if appearance.as_dictionary().is_none() {
+    if !appearance.try_is_dictionary()? {
         return Ok(());
     }
 
@@ -2236,7 +2236,7 @@ fn copy_and_transform_appearance_streams_with_renames<R: Read + Seek>(
             copied_streams.push(copied);
             continue;
         }
-        if entry.as_dictionary().is_none() {
+        if !entry.try_is_dictionary()? {
             continue;
         }
         for state in entry.try_get_keys()? {
@@ -2279,7 +2279,7 @@ fn transform_appearance_stream_matrix(stream: &ObjectHandle, cm: Matrix) -> Resu
     };
     let matrix = dictionary.try_get_key(b"/Matrix")?;
     matrix.try_dereference()?;
-    let had_matrix = matrix.as_array().is_some();
+    let had_matrix = matrix.try_is_array()?;
     let mut transformed = if had_matrix {
         matrix_from_handle(&matrix).unwrap_or_default()
     } else {

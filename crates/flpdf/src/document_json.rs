@@ -90,9 +90,8 @@ pub(crate) fn write_json_v1_objectinfo_key<R: Read + Seek>(
         resolved.try_dereference().map_err(ConvertError::from)?;
         let (is_stream, filter, length) = if let Some(stream_dict) = resolved.as_stream_dict() {
             if stream_dict
-                .try_as_dictionary()
+                .try_is_dictionary()
                 .map_err(ConvertError::from)?
-                .is_some()
             {
                 let filter = stream_dict
                     .try_get_key(b"/Filter")

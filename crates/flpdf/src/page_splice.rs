@@ -132,14 +132,14 @@ pub fn splice_pages_with_max_depth<R: Read + Seek>(
 fn pages_ref<R: Read + Seek>(pdf: &mut Pdf<R>) -> Result<ObjectRef> {
     let catalog_ref = pdf.root_ref().ok_or(Error::Missing("/Root"))?;
     let catalog = pdf.get_object_handle(catalog_ref);
-    if catalog.try_as_dictionary()?.is_none() {
+    if !catalog.try_is_dictionary()? {
         return Err(Error::Missing("/Catalog dict"));
     }
     let pages = catalog.try_get_key(b"/Pages")?;
     if let Some(pages_ref) = pages.object_ref() {
         return Ok(pages_ref);
     }
-    if pages.try_as_dictionary()?.is_none() {
+    if !pages.try_is_dictionary()? {
         return Err(Error::Missing("/Pages"));
     }
     let indirect = pdf.make_indirect_object_handle(pages)?;
@@ -226,7 +226,7 @@ fn collect_page_refs<R: Read + Seek>(
         )));
     }
 
-    if node.try_as_dictionary()?.is_none() {
+    if !node.try_is_dictionary()? {
         return Err(Error::Unsupported(format!(
             "node {node_label} is not a dictionary"
         )));
@@ -261,7 +261,7 @@ fn collect_page_refs<R: Read + Seek>(
     // (`QPDF_pages.cc:77-87`) would name a different object than qpdf does.
     let mut actual_count = 0usize;
     for (index, mut child) in kids.unwrap_or_default().into_iter().enumerate() {
-        let child_is_pages = child.try_as_dictionary()?.is_some() && child.try_has_key(b"/Kids")?;
+        let child_is_pages = child.try_is_dictionary()? && child.try_has_key(b"/Kids")?;
         if !child_is_pages && child.is_direct() {
             let indirect = pdf.make_indirect_object_handle(child)?;
             let kids_handle = kids_handle
@@ -376,7 +376,7 @@ fn normalize_insert_pages<R: Read + Seek>(
 /// - another dictionary type → 1
 fn leaf_count_of(node: &ObjectHandle) -> Result<usize> {
     let node_label = node_label(node);
-    if node.try_as_dictionary()?.is_none() {
+    if !node.try_is_dictionary()? {
         return Err(Error::Unsupported(format!(
             "node {node_label} is not a dictionary"
         )));
@@ -411,7 +411,7 @@ fn set_page_parent_for_node<R: Read + Seek>(
     parent: &ObjectHandle,
 ) -> Result<()> {
     let page = pdf.get_object_handle(page_ref);
-    if page.try_as_dictionary()?.is_none() {
+    if !page.try_is_dictionary()? {
         return Err(Error::Unsupported(format!(
             "page {page_ref} is not a dictionary"
         )));
@@ -451,7 +451,7 @@ fn splice_subtree<R: Read + Seek>(
     // Snapshot the node's kids and count *before* any mutation so that the
     // canonical node handle remains stable while we recurse.
     let (kids, old_count, kids_handle) = {
-        if node.try_as_dictionary()?.is_none() {
+        if !node.try_is_dictionary()? {
             return Err(Error::Unsupported(format!(
                 "{node_label} is not a /Pages dictionary"
             )));
@@ -462,8 +462,7 @@ fn splice_subtree<R: Read + Seek>(
         let kids_handle = kids.as_ref().map(|_| kids_value.clone());
         let kids = kids.unwrap_or_default();
         for child in &kids {
-            let child_is_pages =
-                child.try_as_dictionary()?.is_some() && child.try_has_key(b"/Kids")?;
+            let child_is_pages = child.try_is_dictionary()? && child.try_has_key(b"/Kids")?;
             if child.is_direct() && !child_is_pages {
                 return Err(Error::Unsupported(format!(
                     "child of /Pages node {node_label} is not an indirect object"
@@ -520,7 +519,7 @@ fn splice_subtree<R: Read + Seek>(
         let overlaps_remove = kid_end > remove.start && kid_start < remove.end;
         if overlaps_remove {
             // Determine kid type (Page vs Pages) through the live child handle.
-            let kid_is_pages = kid.try_as_dictionary()?.is_some() && kid.try_has_key(b"/Kids")?;
+            let kid_is_pages = kid.try_is_dictionary()? && kid.try_has_key(b"/Kids")?;
 
             if kid_is_pages {
                 let sub_delta = splice_subtree(

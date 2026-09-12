@@ -220,7 +220,7 @@ impl<'a, R: Read + Seek> EmbeddedFileStream<'a, R> {
             return Ok(ObjectHandle::null());
         };
         let params = self.resolved_key(&stream_dict, b"Params")?;
-        if params.try_as_dictionary()?.is_none() {
+        if !params.try_is_dictionary()? {
             return Ok(ObjectHandle::null());
         }
         self.resolved_key(&params, key)
@@ -414,7 +414,7 @@ impl<'a, R: Read + Seek> EmbeddedFileStream<'a, R> {
             return Ok(());
         };
         let params = stream_dict.try_get_key(b"/Params")?;
-        if params.try_as_dictionary()?.is_some() {
+        if params.try_is_dictionary()? {
             let target = params;
             let key = canonical_dictionary_key(key.as_bytes());
             target.replace_key(&key, ObjectHandle::string(value))?;

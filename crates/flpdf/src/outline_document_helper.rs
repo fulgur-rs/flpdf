@@ -157,7 +157,7 @@ impl<'a, R: Read + Seek> OutlineDocumentHelper<'a, R> {
             return Ok(false);
         };
         outlines.try_dereference()?;
-        if outlines.try_as_dictionary()?.is_none() {
+        if !outlines.try_is_dictionary()? {
             return Ok(false);
         }
         if !outlines.try_has_key(b"/First")? {
@@ -229,7 +229,7 @@ impl<'a, R: Read + Seek> OutlineDocumentHelper<'a, R> {
         };
         let catalog = self.pdf.get_object_handle(catalog_ref);
         catalog.try_dereference()?;
-        if catalog.try_as_dictionary()?.is_none() {
+        if !catalog.try_is_dictionary()? {
             return Ok(None);
         }
         Ok(Some(catalog))
@@ -256,7 +256,7 @@ impl<'a, R: Read + Seek> OutlineDocumentHelper<'a, R> {
             return Ok(tree);
         };
         outlines.try_dereference()?;
-        if outlines.try_as_dictionary()?.is_none() {
+        if !outlines.try_is_dictionary()? {
             return Ok(tree);
         }
         if !outlines.try_has_key(b"/First")? {
@@ -442,7 +442,7 @@ impl<'a, R: Read + Seek> OutlineDocumentHelper<'a, R> {
     /// `resolveNamedDest()` (`libqpdf/QPDFOutlineDocumentHelper.cc:65-73`).
     fn resolve_named_dest_by_name(&mut self, name: &[u8]) -> Result<Option<ObjectHandle>> {
         let dests = self.cached_dest_dict()?;
-        if dests.try_as_dictionary()?.is_none() {
+        if !dests.try_is_dictionary()? {
             return Ok(None);
         }
         let mut key = Vec::with_capacity(name.len() + 1);
@@ -468,12 +468,12 @@ impl<'a, R: Read + Seek> OutlineDocumentHelper<'a, R> {
                 return Ok(None);
             };
             let names = self.resolve_value_handle(names)?;
-            if names.try_as_dictionary()?.is_none() || !names.try_has_key(b"/Dests")? {
+            if !names.try_is_dictionary()? || !names.try_has_key(b"/Dests")? {
                 return Ok(None);
             }
             let root = names.try_get_key(b"/Dests")?;
             let root = self.resolve_value_handle(root)?;
-            if root.try_as_dictionary()?.is_none() {
+            if !root.try_is_dictionary()? {
                 return Ok(None);
             }
             self.names_dest = Some(NameTree::new(root, true));
@@ -598,6 +598,22 @@ mod tests {
             resolved.try_is_null().unwrap(),
             "a non-name, non-string candidate must resolve to null"
         );
+    }
+
+    #[test]
+    fn resolve_named_dest_ignores_a_non_dictionary_legacy_table() {
+        let mut pdf = Pdf::open(Cursor::new(minimal_pdf_bytes())).unwrap();
+        let catalog = pdf.root_handle().unwrap();
+        catalog
+            .replace_key(b"/Dests", ObjectHandle::integer(1))
+            .unwrap();
+        let mut helper = pdf.outline();
+
+        let resolved = helper
+            .resolve_named_dest(ObjectHandle::name(b"missing".to_vec()))
+            .unwrap();
+
+        assert!(resolved.try_is_null().unwrap());
     }
 
     /// Mirrors `form_field_object_helper.rs`'s
