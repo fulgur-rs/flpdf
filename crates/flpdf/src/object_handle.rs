@@ -152,7 +152,6 @@ use std::hash::{Hash, Hasher};
 use std::rc::{Rc, Weak};
 
 type StreamTokenFilter = Rc<RefCell<dyn TokenFilter>>;
-type StreamTokenFilterList = Rc<RefCell<Vec<StreamTokenFilter>>>;
 
 /// qpdf's `qpdf_ef_compress` bit in `QPDF_Stream::pipeStreamData`, for the
 /// `encode_flags` argument of [`ObjectHandle::pipe_stream_data`].
@@ -2657,34 +2656,22 @@ impl ObjectHandle {
         // contains interior mutability, which clippy's `mutable_key_type`
         // rightly rejects as a set key. Identity here is `Rc` identity, exactly
         // what `is_same_object_as` compares, so the pointer is the whole key.
-        let mut visited: BTreeSet<*const RefCell<ObjectSlot>> = BTreeSet::new();
+        let mut visited: BTreeSet<*const RefCell<SharedValueState>> = BTreeSet::new();
         let mut pending = vec![self.clone()];
         while let Some(handle) = pending.pop() {
-            if !visited.insert(Rc::as_ptr(&handle.0)) {
+            let shared = handle.0.borrow().shared.clone();
+            if !visited.insert(Rc::as_ptr(&shared)) {
                 continue;
             }
             {
-                let slot = handle.0.borrow();
-                let state = slot.state.borrow();
-                match &*state {
-                    ObjectValue::Array(items) => {
-                        pending.extend(items.iter().filter(|item| !item.is_indirect()).cloned());
-                    }
-                    ObjectValue::Dictionary(entries) => {
-                        pending.extend(
-                            entries
-                                .values()
-                                .filter(|value| !value.is_indirect())
-                                .cloned(),
-                        );
-                    }
-                    ObjectValue::Stream { stream_dict, .. } if !stream_dict.is_indirect() => {
-                        pending.push(stream_dict.clone());
-                    }
-                    _ => {}
-                }
+                let shared = shared.borrow();
+                pending.extend(
+                    Self::state_children(&shared.value)
+                        .into_iter()
+                        .filter(|child| !child.is_indirect()),
+                );
             }
-            *handle.0.borrow().identity.borrow_mut() = ValueIdentity::default();
+            shared.borrow_mut().identity = ValueIdentity::default();
             handle.0.borrow_mut().tree_pdf_unique_id = None;
         }
     }
@@ -2702,15 +2689,19 @@ impl ObjectHandle {
     pub(crate) fn disconnect_and_destroy(&self) {
         self.disconnect();
         let should_destroy = {
-            let slot = self.0.borrow();
-            let state = slot.state.borrow();
-            !matches!(&*state, ObjectValue::Null)
+            let shared = self.0.borrow().shared.clone();
+            let should_destroy = !matches!(shared.borrow().value, ObjectValue::Null);
+            should_destroy
         };
         if should_destroy {
             self.replace_detached_state(ObjectValue::Destroyed);
+            let shared = self.0.borrow().shared.clone();
+            {
+                let mut shared = shared.borrow_mut();
+                shared.description = None;
+                shared.parsed_offset = NO_PARSED_OFFSET;
+            }
             let mut slot = self.0.borrow_mut();
-            slot.description = None;
-            slot.parsed_offset = NO_PARSED_OFFSET;
             slot.end_before_space = NO_PARSED_OFFSET;
             slot.end_after_space = NO_PARSED_OFFSET;
         }
@@ -4716,12 +4707,8 @@ impl ObjectHandle {
     /// value carries its source document identity just as qpdf's parsed value
     /// does.
     fn check_array_item_ownership(&self, item: &ObjectHandle) -> Result<()> {
-        let item_is_destroyed = {
-            let slot = item.0.borrow();
-            let state = slot.state.borrow();
-            let destroyed = matches!(&*state, ObjectValue::Destroyed);
-            destroyed
-        };
+        let item_is_destroyed =
+            item.with_value(|value| matches!(value, Some(ObjectValue::Destroyed)));
         // qpdf's QPDF_Array::checkOwnership rejects an item whose
         // getObjectPtr() is null -- the default-constructed
         // QPDFObjectHandle() shape, distinct from an initialized handle
@@ -4822,9 +4809,9 @@ impl ObjectHandle {
         if !other.is_direct() {
             return false;
         }
-        let self_state = self.0.borrow().state.clone();
-        let other_state = other.0.borrow().state.clone();
-        Rc::ptr_eq(&self_state, &other_state)
+        let self_shared = self.0.borrow().shared.clone();
+        let other_shared = other.0.borrow().shared.clone();
+        Rc::ptr_eq(&self_shared, &other_shared)
     }
 
     fn direct_cycle_error() -> Error {
@@ -4842,21 +4829,21 @@ impl ObjectHandle {
             return false;
         }
 
-        let target_state = self.0.borrow().state.clone();
-        let target_id = Rc::as_ptr(&target_state) as usize;
+        let target_shared = self.0.borrow().shared.clone();
+        let target_id = Rc::as_ptr(&target_shared) as usize;
         let mut pending = vec![candidate.clone()];
         let mut visited = BTreeSet::new();
 
         while let Some(handle) = pending.pop() {
-            let state = handle.0.borrow().state.clone();
-            let identity = Rc::as_ptr(&state) as usize;
+            let shared = handle.0.borrow().shared.clone();
+            let identity = Rc::as_ptr(&shared) as usize;
             if identity == target_id {
                 return true;
             }
             if !visited.insert(identity) {
                 continue;
             }
-            let children = Self::direct_children(&state.borrow());
+            let children = Self::direct_children(&shared.borrow().value);
             pending.extend(children.into_iter().filter(|child| child.is_direct()));
         }
 
@@ -4888,12 +4875,12 @@ impl ObjectHandle {
         let parent = Rc::downgrade(slot);
         let children = {
             let slot_ref = slot.borrow();
-            if Rc::strong_count(&slot_ref.state) != 1 {
+            if Rc::strong_count(&slot_ref.shared) != 1 {
                 return Vec::new();
             }
 
-            let mut state = slot_ref.state.borrow_mut();
-            match &mut *state {
+            let mut shared = slot_ref.shared.borrow_mut();
+            match &mut shared.value {
                 ObjectValue::Array(children) => std::mem::take(children),
                 ObjectValue::Dictionary(entries) => std::mem::take(entries).into_values().collect(),
                 ObjectValue::Stream { stream_dict, .. } => {
@@ -6250,8 +6237,8 @@ impl ObjectHandle {
         if !self.with_value(|value| matches!(value, Some(ObjectValue::Stream { .. }))) {
             return false;
         }
-        let filters = self.0.borrow().stream_token_filters.clone();
-        let modified = !filters.borrow().is_empty();
+        let shared = self.0.borrow().shared.clone();
+        let modified = !shared.borrow().stream_token_filters.is_empty();
         modified
     }
 
@@ -6260,7 +6247,9 @@ impl ObjectHandle {
     /// from `replaceStreamData`: qpdf's replacement API is also used for
     /// arbitrary caller data that still needs QDF normalization.
     pub(crate) fn content_normalization_applied(&self) -> bool {
-        self.0.borrow().content_normalization_applied.get()
+        let shared = self.0.borrow().shared.clone();
+        let applied = shared.borrow().content_normalization_applied;
+        applied
     }
 
     /// Mark the current stream bytes as normalized by the content consumer.
@@ -6272,11 +6261,8 @@ impl ObjectHandle {
     }
 
     fn set_content_normalization_applied(&self, applied: bool) {
-        let marker = self.0.borrow().content_normalization_applied.clone();
-        marker.set(applied);
-        for owner in self.state_owner_handles() {
-            owner.0.borrow_mut().content_normalization_applied = marker.clone();
-        }
+        let shared = self.0.borrow().shared.clone();
+        shared.borrow_mut().content_normalization_applied = applied;
         self.bump_mutation_generation();
     }
 
@@ -6292,16 +6278,8 @@ impl ObjectHandle {
                 type_name
             )));
         }
-        let filters = self.0.borrow().stream_token_filters.clone();
-        // A canonical object can have distinct handle slots that share one
-        // payload state (for example a dictionary child and the document's
-        // object-cache handle). qpdf's token-filter list belongs to that one
-        // stream allocation, so make every state owner observe the same list
-        // before registering the callback.
-        for owner in self.state_owner_handles() {
-            owner.0.borrow_mut().stream_token_filters = filters.clone();
-        }
-        filters.borrow_mut().push(filter);
+        let shared = self.0.borrow().shared.clone();
+        shared.borrow_mut().stream_token_filters.push(filter);
         self.bump_mutation_generation();
         Ok(())
     }
@@ -6651,8 +6629,8 @@ impl ObjectHandle {
     ) -> Result<bool> {
         self.try_dereference()?;
         let token_filters = {
-            let filters = self.0.borrow().stream_token_filters.clone();
-            let token_filters = filters.borrow().clone();
+            let shared = self.0.borrow().shared.clone();
+            let token_filters = shared.borrow().stream_token_filters.clone();
             token_filters
         };
         let Some((stream_dict, stream_data, stream_provider, stream_length)) =
@@ -7270,23 +7248,23 @@ impl ObjectHandle {
     // Mutable twin of `with_value`: every resolved qpdf value, including the
     // internal sentinels, is a real mutable value-layer slot.
     fn with_value_mut<T>(&self, f: impl FnOnce(Option<&mut ObjectValue>) -> T) -> T {
-        let state = self.0.borrow().state.clone();
-        let result = {
-            let mut state = state.borrow_mut();
-            f(Some(&mut state))
-        };
-        self.bump_mutation_generation();
+        let shared = self.0.borrow().shared.clone();
+        let mut shared = shared.borrow_mut();
+        let result = f(Some(&mut shared.value));
+        shared.mutation_generation = shared.mutation_generation.wrapping_add(1);
         result
     }
 
     fn bump_mutation_generation(&self) {
-        let generation = self.0.borrow().mutation_generation.clone();
-        generation.set(generation.get().wrapping_add(1));
+        let shared = self.0.borrow().shared.clone();
+        let mut shared = shared.borrow_mut();
+        shared.mutation_generation = shared.mutation_generation.wrapping_add(1);
     }
 
     pub(crate) fn mutation_fingerprint(&self) -> (usize, u64) {
-        let generation = self.0.borrow().mutation_generation.clone();
-        (Rc::as_ptr(&generation) as usize, generation.get())
+        let shared = self.0.borrow().shared.clone();
+        let generation = shared.borrow().mutation_generation;
+        (Rc::as_ptr(&shared) as usize, generation)
     }
 
     /// This handle's qpdf-syntax unparse form
@@ -7369,7 +7347,6 @@ impl ObjectHandle {
     #[cfg(test)]
     pub(crate) fn replace_direct_value(&self, value: ObjectValue) {
         if self.is_direct() {
-            self.0.borrow().stream_token_filters.borrow_mut().clear();
             self.replace_shared_state(canonicalize_object_value(value));
         }
     }
@@ -11231,10 +11208,15 @@ mod resolution_state_tests {
         let source = include_str!("object_handle.rs");
         let state_name = ["Object", "State"].concat();
         let resolved_name = [state_name.as_str(), "::Resolved"].concat();
-        let state_field = ["state: Rc<RefCell<", "ObjectValue>>"].concat();
+        let legacy_state_field = ["state: Rc<RefCell<", "ObjectValue>>"].concat();
+        let shared_field = ["shared: Rc<RefCell<", "SharedValueState>>"].concat();
+        let value_field = ["value: Object", "Value"].concat();
         assert!(!source.contains(&format!("enum {state_name}")));
         assert!(!source.contains(&resolved_name));
-        assert!(source.contains(&state_field));
+        assert!(!source.contains(&legacy_state_field));
+        assert!(source.contains("struct SharedValueState"));
+        assert!(source.contains(&shared_field));
+        assert!(source.contains(&value_field));
     }
 
     #[test]
