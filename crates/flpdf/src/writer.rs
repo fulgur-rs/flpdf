@@ -3553,68 +3553,57 @@ fn emit_canonical_pdf_with_special_streams<R: Read + Seek>(
     result
 }
 
-fn write_pclm<R: Read + Seek, W: Write>(
+fn write_pclm<R: Read + Seek>(
     pdf: &mut Pdf<R>,
-    mut out: W,
+    out: &mut OutputSink<'_>,
     options: &WriterOptions,
 ) -> Result<WriterResult> {
     let deterministic_id = uses_deterministic_id(options);
-
     let plan = pclm::Plan::build(pdf)?;
+    let root = plan.root;
+    let direct_root = plan.direct_root.clone();
+    let mut queue = pclm::EmissionQueue::from_plan(&plan)?;
     let version = effective_pdf_version(pdf.version(), options, false, false);
-    let mut bytes = Vec::new();
-    bytes.extend_from_slice(format!("%PDF-{version}\n%PCLm 1.0\n").as_bytes());
-    bytes.extend_from_slice(options.extra_header_text.as_bytes());
+    if deterministic_id {
+        out.begin_digest();
+    }
+    out.write_bytes(format!("%PDF-{version}\n%PCLm 1.0\n").as_bytes())?;
+    out.write_bytes(options.extra_header_text.as_bytes())?;
     if !options.extra_header_text.is_empty() && !options.extra_header_text.ends_with('\n') {
-        bytes.push(b'\n');
+        out.write_bytes(b"\n")?;
     }
 
-    let mut offsets = BTreeMap::<u32, (u16, usize)>::new();
-    let mut emitted_old_to_new = BTreeMap::<ObjectRef, ObjectRef>::new();
+    let mut offsets = BTreeMap::<u32, (u16, u64)>::new();
     let removed: BTreeSet<_> = BTreeSet::new();
 
-    for item in &plan.items {
-        match *item {
+    while let Some(item) = queue.pop() {
+        match item {
             pclm::Item::Source { source, output } => {
                 let source_handle = pdf.get_object_handle(source);
                 source_handle.try_dereference()?;
-                let offset = bytes.len();
-                bytes.extend_from_slice(format!("{} 0 obj\n", output.number).as_bytes());
-                let map = |object_ref| {
-                    plan.old_to_new.get(&object_ref).copied().ok_or_else(|| {
-                        // cov:ignore-start: Plan::build collects every live reference before
-                        // this emission loop, so a valid PCLm item cannot miss this map entry.
-                        crate::Error::Unsupported(format!(
-                            "PCLm reference {object_ref} absent from renumber map"
-                        ))
-                        // cov:ignore-end
-                    }) // cov:ignore: the canonical PCLm plan queues every reference before emission; LLVM maps this closure terminator to the unreachable error arm.
-                };
+                let offset = out.position();
+                out.write_bytes(format!("{} 0 obj\n", output.number).as_bytes())?;
                 if source_handle.as_stream_dict().is_some() {
-                    let data = source_handle.get_raw_stream_data()?;
-                    output::with_buffer_sink(&mut bytes, |out| {
-                        source_handle
-                            .write_stream_body_with_ref_map_and_removed_and_length_with_options(
-                                out,
-                                StreamDictionaryOptions::preserve(),
-                                &map,
-                                &removed,
-                                data.len(),
-                            )?;
-                        serialize::write_stream_payload(
-                            out,
-                            data.as_ref(),
-                            options.newline_before_endstream,
-                        )
-                    })?; // cov:ignore: PCLm stream emission is covered by the filtered and recovered-stream fixtures; LLVM attributes this continuation to cleanup-only code.
+                    let (dict, data, dictionary_options) =
+                        plain::body::canonical_stream_output_for_rewrite(
+                            &source_handle,
+                            options,
+                            false,
+                        )?;
+                    let mut map = |child: &ObjectHandle| queue.enqueue_handle(pdf, child.clone());
+                    dict.write_stream_body_with_dynamic_ref_map(
+                        out,
+                        dictionary_options,
+                        &mut map,
+                        &removed,
+                    )?;
+                    write_pclm_stream_payload(out, &data, options.newline_before_endstream)?;
                 } else {
-                    output::with_buffer_sink(&mut bytes, |out| {
-                        source_handle.write_object_with_ref_map_and_removed(out, &map, &removed)
-                    })?;
+                    let mut map = |child: &ObjectHandle| queue.enqueue_handle(pdf, child.clone());
+                    source_handle.write_object_with_dynamic_ref_map(out, &mut map, &removed)?;
                 }
-                bytes.extend_from_slice(b"\nendobj\n");
+                out.write_bytes(b"\nendobj\n")?;
                 offsets.insert(output.number, (0, offset));
-                emitted_old_to_new.insert(source, output);
             }
             pclm::Item::Synthetic { output } => {
                 let payload = b"q /image Do Q\n".to_vec();
@@ -3625,47 +3614,41 @@ fn write_pclm<R: Read + Seek, W: Write>(
                     )]),
                     Rc::new(payload),
                 );
-                let offset = bytes.len();
-                bytes.extend_from_slice(format!("{} 0 obj\n", output.number).as_bytes());
-                write_stream_to_buf(&mut bytes, &stream, options.newline_before_endstream)?;
-                bytes.extend_from_slice(b"\nendobj\n");
+                let offset = out.position();
+                out.write_bytes(format!("{} 0 obj\n", output.number).as_bytes())?;
+                let (dict, data, dictionary_options) =
+                    plain::body::canonical_stream_output_for_rewrite(&stream, options, false)?;
+                let mut map = |child: &ObjectHandle| queue.enqueue_handle(pdf, child.clone());
+                dict.write_stream_body_with_dynamic_ref_map(
+                    out,
+                    dictionary_options,
+                    &mut map,
+                    &removed,
+                )?;
+                write_pclm_stream_payload(out, &data, options.newline_before_endstream)?;
+                out.write_bytes(b"\nendobj\n")?;
                 offsets.insert(output.number, (0, offset));
             }
         }
         report_progress_event(options)?;
     }
 
-    let max_object_number = offsets.keys().next_back().copied().unwrap_or(0);
-    // cov:ignore-start: PCLm assigns contiguous u32 output numbers and supported
-    // targets can represent the resulting object count in usize.
-    let object_count = usize::try_from(max_object_number)
-        .ok()
-        .and_then(|number| number.checked_add(1))
-        .ok_or_else(|| {
-            crate::Error::Unsupported("PCLm object count does not fit in usize".to_string())
-        })?;
-    // cov:ignore-end
+    let object_count = queue.object_count()?;
+    let emitted_old_to_new = queue.into_old_to_new();
     let mut written_xref = BTreeMap::<ObjectRef, XrefEntry>::new();
-    let xref_offset = bytes.len();
-    bytes.extend_from_slice(format!("xref\n0 {object_count}\n").as_bytes());
-    bytes.extend_from_slice(b"0000000000 65535 f \n");
+    let xref_offset = out.position();
+    out.write_bytes(format!("xref\n0 {object_count}\n").as_bytes())?;
+    out.write_bytes(b"0000000000 65535 f \n")?;
     for number in 1..object_count {
         match offsets.get(&(number as u32)) {
             Some((generation, offset)) => {
-                bytes.extend_from_slice(format!("{offset:010} {generation:05} n \n").as_bytes());
+                out.write_bytes(format!("{offset:010} {generation:05} n \n").as_bytes())?;
                 written_xref.insert(
                     ObjectRef::new(number as u32, 0),
-                    XrefEntry::Uncompressed {
-                        // cov:ignore-start: offsets originate in Vec::len and usize fits u64
-                        // on every supported target.
-                        offset: u64::try_from(*offset).map_err(|_| {
-                            crate::Error::Unsupported("PCLm xref offset does not fit u64".into())
-                        })?,
-                        // cov:ignore-end
-                    },
+                    XrefEntry::Uncompressed { offset: *offset },
                 );
             }
-            None => bytes.extend_from_slice(b"0000000000 65535 f \n"), // cov:ignore: every PCLm item receives the next contiguous output number
+            None => out.write_bytes(b"0000000000 65535 f \n")?, // cov:ignore: every PCLm item receives the next contiguous output number
         }
     }
 
@@ -3682,7 +3665,7 @@ fn write_pclm<R: Read + Seek, W: Write>(
     })?);
     // cov:ignore-end
     let trailer_map = |object_ref: ObjectRef| {
-        if let Some(output) = plan.old_to_new.get(&object_ref).copied() {
+        if let Some(output) = emitted_old_to_new.get(&object_ref).copied() {
             return Ok(output);
         }
         if let Some(output) = late_trailer_refs.borrow().get(&object_ref).copied() {
@@ -3700,107 +3683,74 @@ fn write_pclm<R: Read + Seek, W: Write>(
         Ok(output)
     };
 
-    match plan.root {
-        None => {
-            let root = plan.direct_root.as_ref().ok_or_else(|| {
-                // cov:ignore-start: Plan::build guarantees a direct Catalog
-                // handle whenever its root identity is absent.
-                crate::Error::Unsupported("PCLm Catalog root is inconsistent".into())
-                // cov:ignore-end
-            })?; // cov:ignore: Plan::build guarantees the direct Catalog handle before PCLm emission; LLVM places this continuation counter on the closure exit.
-            let id_handle = pdf.trailer_key_handle(b"ID");
-            let source_id0 = source_permanent_id_value_handle(&id_handle);
-            let generated_id = (!deterministic_id)
-                .then(|| generate_id_handle(source_id0.as_deref(), options.static_id));
-            let trailer = build_writer_trailer_handle(
-                pdf,
-                object_count,
-                None,
-                Some(root),
-                options,
-                None,
-                deterministic_id,
-                generated_id.as_ref(),
-            )?; // cov:ignore: validated writer trailer construction; LLVM maps this continuation to the call setup.
-            if deterministic_id {
-                let info_suffix = deterministic_id_info_suffix(pdf);
-                let mut id_writer = |out: &mut OutputSink<'_>| {
-                    write_deterministic_id_inline(out, &info_suffix, source_id0.as_deref())
-                };
-                output::with_digested_buffer_sink(&mut bytes, |out| {
-                    trailer.write_trailer_with_ref_map(
-                        out,
-                        false,
-                        false,
-                        Some(&mut id_writer),
-                        &trailer_map,
-                        &removed,
-                        true,
-                    )
-                })?; // cov:ignore: deterministic direct-root trailer emission is exercised; LLVM maps this continuation to the call setup.
-            } else {
-                output::with_buffer_sink(&mut bytes, |out| {
-                    trailer.write_trailer_with_ref_map(
-                        out,
-                        false,
-                        false,
-                        None,
-                        &trailer_map,
-                        &removed,
-                        true,
-                    )
-                })?; // cov:ignore: non-deterministic direct-root trailer emission is exercised; LLVM maps this continuation to the call setup.
-            }
-        }
-        Some(root) => {
-            let id_handle = pdf.trailer_key_handle(b"ID");
-            let source_id0 = source_permanent_id_value_handle(&id_handle);
-            let generated_id = (!deterministic_id)
-                .then(|| generate_id_handle(source_id0.as_deref(), options.static_id));
-            let trailer = build_writer_trailer_handle(
-                pdf,
-                object_count,
-                Some(root),
-                None,
-                options,
-                None,
-                deterministic_id,
-                generated_id.as_ref(),
-            )?; // cov:ignore: validated writer trailer construction; LLVM maps this continuation to the call setup
-            if deterministic_id {
-                let info_suffix = deterministic_id_info_suffix(pdf);
-                let mut id_writer = |out: &mut OutputSink<'_>| {
-                    write_deterministic_id_inline(out, &info_suffix, source_id0.as_deref())
-                };
-                output::with_digested_buffer_sink(&mut bytes, |out| {
-                    trailer.write_trailer_with_ref_map(
-                        out,
-                        false,
-                        false,
-                        Some(&mut id_writer),
-                        &trailer_map,
-                        &removed,
-                        true,
-                    )
-                })?; // cov:ignore: validated deterministic PCLm trailer emission; LLVM maps this continuation to the call setup
-            } else {
-                output::with_buffer_sink(&mut bytes, |out| {
-                    trailer.write_trailer_with_ref_map(
-                        out,
-                        false,
-                        false,
-                        None,
-                        &trailer_map,
-                        &removed,
-                        true,
-                    )
-                })?; // cov:ignore: validated PCLm trailer emission; LLVM maps this continuation to the call setup
-            }
-        }
+    let direct_root = match root {
+        Some(_) => None,
+        None => Some(direct_root.as_ref().ok_or_else(|| {
+            // cov:ignore-start: Plan::build guarantees a direct Catalog
+            // handle whenever its root identity is absent.
+            crate::Error::Unsupported("PCLm Catalog root is inconsistent".into())
+            // cov:ignore-end
+        })?), // cov:ignore: Plan::build guarantees the direct Catalog handle before PCLm emission; LLVM places this continuation counter on the closure exit.
+    };
+    let id_handle = pdf.trailer_key_handle(b"ID");
+    let source_id0 = source_permanent_id_value_handle(&id_handle);
+    let generated_id =
+        (!deterministic_id).then(|| generate_id_handle(source_id0.as_deref(), options.static_id));
+    let trailer = build_writer_trailer_handle(
+        pdf,
+        object_count,
+        root,
+        direct_root,
+        options,
+        None,
+        deterministic_id,
+        generated_id.as_ref(),
+    )?; // cov:ignore: validated PCLm trailer construction; LLVM maps this continuation to the call setup.
+    if deterministic_id {
+        let info_suffix = deterministic_id_info_suffix(pdf);
+        let mut id_writer = |out: &mut OutputSink<'_>| {
+            write_deterministic_id_inline(out, &info_suffix, source_id0.as_deref())
+        };
+        trailer.write_trailer_with_ref_map(
+            out,
+            false,
+            false,
+            Some(&mut id_writer),
+            &trailer_map,
+            &removed,
+            true,
+        )?;
+    } else {
+        trailer.write_trailer_with_ref_map(
+            out,
+            false,
+            false,
+            None,
+            &trailer_map,
+            &removed,
+            true,
+        )?;
     }
-    bytes.extend_from_slice(format!("\nstartxref\n{xref_offset}\n%%EOF\n").as_bytes());
-    out.write_all(&bytes)?;
+    out.write_bytes(format!("\nstartxref\n{xref_offset}\n%%EOF\n").as_bytes())?;
     Ok(WriterResult::new(emitted_old_to_new, written_xref))
+}
+
+/// Emit one qpdf-buffered PCLm stream payload to the active final pipeline.
+/// The payload Vec is local to `willFilterStream`; finishing the segment after
+/// its bytes mirrors the unencrypted `PipelinePopper` scope in
+/// `QPDFWriter::unparseObject` (`QPDFWriter.cc:1535-1566`).
+fn write_pclm_stream_payload(
+    out: &mut OutputSink<'_>,
+    data: &[u8],
+    policy: NewlineBeforeEndstream,
+) -> Result<()> {
+    out.write_bytes(b"\nstream\n")?;
+    out.write_bytes(data)?;
+    out.finish_segment()?;
+    if serialize::framing_adds_newline_with_qdf(data, policy, false) {
+        out.write_bytes(b"\n")?;
+    }
+    out.write_bytes(b"endstream")
 }
 
 fn emit_canonical_pdf_inner<R: Read + Seek>(
@@ -7075,12 +7025,11 @@ mod final_handle_writer_tests {
             .expect("replace page resources");
         pdf.replace_object(page, replacement).expect("replace page");
 
-        let options = WriterOptions {
-            pclm: true,
-            ..WriterOptions::default()
-        };
-        let mut output = Vec::new();
-        pclm_live::write_pclm(&mut pdf, &mut output, &options).expect("PCLm writer succeeds");
+        let output = write_qpdf_to_memory(&mut pdf, |writer| {
+            writer.set_pclm(true);
+            writer.set_static_id(true);
+        })
+        .expect("PCLm writer succeeds");
         assert!(output
             .windows(b"q /image Do Q\n".len())
             .any(|window| { window == b"q /image Do Q\n" }));

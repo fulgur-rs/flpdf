@@ -1281,10 +1281,10 @@ pub(crate) fn canonical_stream_output_with_status(
 
 /// Full-rewrite variant of [`canonical_stream_output`]. The legacy writer
 /// applies the same qpdf filter/provider pipeline and the cleartext-metadata
-/// policy that belongs to encrypted output. The live handle's source pipe owns
-/// recovered stream framing for these non-PCLm routes; the PCLm writer selects
-/// its own qpdf `pipeStreamData` length boundary around its queue. The writer
-/// must never append scan framing a second time.
+/// policy that belongs to encrypted output. PCLm calls this same writer-owned
+/// policy after forcing qpdf's uncompressed setup; callers own only the final
+/// stream framing around the returned one-stream buffer. The writer must never
+/// append scan framing a second time.
 pub(crate) fn canonical_stream_output_for_rewrite(
     handle: &ObjectHandle,
     options: &WriterOptions,
@@ -1913,10 +1913,14 @@ fn canonical_stream_output_with_rewrite_policy(
     if dict.context().is_none() && handle.context().is_some() {
         dict.set_child_description(handle, b" -> stream dictionary", b"");
     }
-    let dictionary_options = StreamDictionaryOptions::new(
-        filtering_attempted,
-        filtering_attempted && matches!(policy, Some(CompressStreams::Yes)) && !normalized_content,
-    );
+    let dictionary_options = if filtering_attempted {
+        StreamDictionaryOptions::new(
+            true,
+            matches!(policy, Some(CompressStreams::Yes)) && !normalized_content,
+        )
+    } else {
+        StreamDictionaryOptions::preserve()
+    };
     Ok((dict, data, dictionary_options))
 }
 
