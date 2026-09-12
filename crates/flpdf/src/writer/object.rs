@@ -4524,7 +4524,7 @@ mod tests {
         let stream_child = pdf.make_indirect_object_handle(ObjectHandle::integer(8))?;
         let stream = ObjectHandle::stream(
             ObjectHandle::dictionary(vec![
-                (b"/Length".to_vec(), stream_length),
+                (b"/Length".to_vec(), stream_length.clone()),
                 (b"/Child".to_vec(), stream_child),
             ]),
             Rc::new(b"body".to_vec()),
@@ -4567,6 +4567,112 @@ mod tests {
             )?; // cov:ignore: LLVM attributes this stream-body call terminator to callback cleanup.
         assert!(String::from_utf8_lossy(&stream_output).contains("/Length"));
         assert!(String::from_utf8_lossy(&stream_output).contains("/Filter /FlateDecode"));
+        Ok(())
+    }
+
+    #[test]
+    fn dynamic_ref_map_with_string_writer_preserves_qpdf_child_boundaries() -> Result<()> {
+        let mut pdf = Pdf::empty()?;
+        let child = pdf.make_indirect_object_handle(ObjectHandle::integer(42))?;
+        let removed_child = pdf.make_indirect_object_handle(ObjectHandle::integer(9))?;
+        let zero_ref = ObjectHandle::new_indirect_unresolved(ObjectRef::new(0, 0), -1);
+        let stream_length = pdf.make_indirect_object_handle(ObjectHandle::integer(4))?;
+        let stream_child = pdf.make_indirect_object_handle(ObjectHandle::integer(8))?;
+        let stream = ObjectHandle::stream(
+            ObjectHandle::dictionary(vec![
+                (b"/Length".to_vec(), stream_length.clone()),
+                (b"/Child".to_vec(), stream_child.clone()),
+                (b"/Removed".to_vec(), removed_child.clone()),
+            ]),
+            Rc::new(b"body".to_vec()),
+        );
+        let value = ObjectHandle::dictionary(vec![
+            (
+                b"/Array".to_vec(),
+                ObjectHandle::array(vec![child.clone(), zero_ref]),
+            ),
+            (
+                b"/Nested".to_vec(),
+                ObjectHandle::dictionary(vec![(
+                    b"/Text".to_vec(),
+                    ObjectHandle::string(b"dynamic".to_vec()),
+                )]),
+            ),
+            (b"/Removed".to_vec(), removed_child.clone()),
+            (b"/Stream".to_vec(), stream),
+            (
+                b"/Text".to_vec(),
+                ObjectHandle::string(b"top-level".to_vec()),
+            ),
+        ]);
+        let removed = [removed_child.object_ref().unwrap()].into_iter().collect();
+        let mut mapped = Vec::new();
+        let mut map = |handle: &ObjectHandle| {
+            let object_ref = handle.object_ref().expect("dynamic child is indirect");
+            mapped.push(object_ref);
+            Ok(object_ref)
+        };
+        let mut write_string = |out: &mut Vec<u8>, bytes: &[u8]| {
+            crate::pdf_syntax::write_string_value(out, bytes);
+            Ok(())
+        };
+        let mut output = Vec::new();
+        value.write_object_with_dynamic_ref_map_and_string_writer(
+            &mut output,
+            &mut map,
+            &removed,
+            &mut write_string,
+        )?;
+        let text = String::from_utf8_lossy(&output);
+        assert!(text.contains("/Text (top-level)"));
+        assert!(text.contains("/Nested << /Text (dynamic) >>"));
+        assert!(text.contains("/Stream << /Child"));
+        assert!(!text.contains("/Removed"));
+        assert!(mapped.contains(&child.object_ref().unwrap()));
+        assert!(mapped.contains(&stream_child.object_ref().unwrap()));
+
+        let mut stream_output = Vec::new();
+        let mut stream_map = |handle: &ObjectHandle| {
+            Ok(handle
+                .object_ref()
+                .expect("stream dictionary child is indirect"))
+        };
+        let stream = pdf.new_stream_with_data(Rc::new(b"body".to_vec()))?;
+        stream
+            .as_stream_dict()
+            .unwrap()
+            .replace_key(b"/Length", stream_length)?;
+        stream
+            .as_stream_dict()
+            .unwrap()
+            .replace_key(b"/Child", child)?;
+        stream
+            .as_stream_dict()
+            .unwrap()
+            .replace_key(b"/Removed", removed_child)?;
+        stream
+            .as_stream_dict()
+            .unwrap()
+            .write_stream_body_with_dynamic_ref_map_and_string_writer(
+                &mut stream_output,
+                StreamDictionaryOptions::new(false, false),
+                &mut stream_map,
+                &removed,
+                &mut write_string,
+            )?;
+        assert!(String::from_utf8_lossy(&stream_output).contains("/Length"));
+        assert!(!String::from_utf8_lossy(&stream_output).contains("/Removed"));
+
+        let reserved = ObjectHandle::new_reserved_direct();
+        let error = reserved
+            .write_object_with_dynamic_ref_map_and_string_writer(
+                &mut Vec::new(),
+                &mut |_| Ok(ObjectRef::new(1, 0)),
+                &BTreeSet::new(),
+                &mut write_string,
+            )
+            .expect_err("reserved dynamic string object must be rejected");
+        assert!(error.to_string().contains("reserved object"));
         Ok(())
     }
 }
