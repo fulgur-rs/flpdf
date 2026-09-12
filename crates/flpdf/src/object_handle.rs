@@ -11465,6 +11465,9 @@ mod resolution_state_tests {
         let unresolved = ObjectHandle::new_indirect_unresolved(ObjectRef::new(1, 0), 0);
         assert!(format!("{unresolved:?}").contains("Unresolved"));
 
+        let reserved = ObjectHandle::new_reserved_direct();
+        assert!(format!("{reserved:?}").contains("Reserved"));
+
         let null = ObjectHandle::new_indirect_unresolved(ObjectRef::new(2, 0), 0);
         null.set_resolved(ObjectValue::Null);
         assert!(format!("{null:?}").contains("Resolved(..)"));
