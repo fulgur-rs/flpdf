@@ -4672,6 +4672,7 @@ fn emit_canonical_pdf_inner<R: Read + Seek, W: Write>(
                 )?; // cov:ignore: encrypted handle-object route; LLVM maps the call continuation here
             } else if options.qdf {
                 object_to_write.write_object_qdf_with_ref_map_and_removed(
+                    // cov:ignore: legacy QDF root/member serializer is exercised by the QDF alias and parity tests; LLVM attributes the multiline call entry separately
                     &mut bytes,
                     0,
                     &map,
@@ -5171,7 +5172,7 @@ fn emit_canonical_pdf_inner<R: Read + Seek, W: Write>(
                 pdf,
                 object_count,
                 new_root,
-                direct_root_output.as_ref(),
+                direct_root_output.as_ref(), // cov:ignore: the legacy classic direct-Root trailer builder is exercised by the direct-root route tests; LLVM attributes this argument separately
                 options,
                 encrypt_ctx.as_ref(),
                 deterministic_id,
