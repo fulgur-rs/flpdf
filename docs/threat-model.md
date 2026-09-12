@@ -219,5 +219,5 @@ Entry points through which untrusted bytes reach flpdf:
 | Validation | `job::QPDFJob::check` and the CLI `--check` route |
 | Writing (reads everything it writes) | `PdfWriter`, QDF repair, linearization |
 | Signature inspection | `signatures.rs` (`/ByteRange`, signature dictionaries, certificates) |
-| CLI (drives all of the above on argv-named files) | `flpdf-cli`: `check`, `rewrite`, `qdf`, `qdf-fix`, `linearize`, `dump-object`, `pages`/`--pages`, `--split-pages`, attachment options, encryption options, JSON output |
+| CLI (drives all of the above on argv-named files) | `flpdf-cli`: `check`, `rewrite`, `qdf`, `qdf-fix`, `linearize`, `pages`/`--pages`, `--split-pages`, attachment options, encryption options, JSON output |
 | Cross-document operations (two untrusted documents interacting) | `--pages` merging, `--copy-attachments-from`, `--copy-encryption` |

@@ -1,7 +1,6 @@
 //! qpdf correspondence: QPDF.cc readObject/readStream framing and recovery split from the document reader.
 use crate::parser::{
     keyword_token_end, parse_qpdf_file_object_handle_with_diagnostics, HandleResolver,
-    RecoveredStreamEol,
 };
 use crate::tokenizer::{is_ws, Tokenizer};
 use crate::{Error, ObjectHandle, ObjectRef, Result};
@@ -36,14 +35,6 @@ impl IncludedStreamDataEol {
             Self::Lf => b"\n",
             Self::Cr => b"\r",
             Self::CrLf => b"\r\n",
-        }
-    }
-
-    const fn as_removed(self) -> RecoveredStreamEol {
-        match self {
-            Self::Lf => RecoveredStreamEol::Lf,
-            Self::Cr => RecoveredStreamEol::Cr,
-            Self::CrLf => RecoveredStreamEol::CrLf,
         }
     }
 }
@@ -138,8 +129,10 @@ pub(crate) struct HandleFileObjectRead {
 fn remove_included_recovery_eol_from_handle(
     object: &ObjectHandle,
     included_recovery_eol: &mut Option<IncludedStreamDataEol>,
-) -> Option<RecoveredStreamEol> {
-    let included = (*included_recovery_eol)?;
+) {
+    let Some(included) = *included_recovery_eol else {
+        return;
+    };
     let data = object
         .as_stream_data()
         .expect("included recovery EOL belongs to a stream");
@@ -152,13 +145,10 @@ fn remove_included_recovery_eol_from_handle(
     data.truncate(data.len() - eol.len());
     object.replace_stream_data(Rc::new(data), None, None);
     *included_recovery_eol = None;
-    Some(included.as_removed())
 }
 
 impl HandleFileObjectRead {
-    pub(crate) fn remove_included_recovery_eol_for_decryption(
-        &mut self,
-    ) -> Option<RecoveredStreamEol> {
+    pub(crate) fn remove_included_recovery_eol_for_decryption(&mut self) {
         remove_included_recovery_eol_from_handle(&self.object, &mut self.included_recovery_eol)
     }
 }

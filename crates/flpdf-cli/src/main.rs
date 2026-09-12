@@ -1768,8 +1768,6 @@ enum Commands {
         about = "Validate linearization structure (param dict, hint stream, offsets)"
     )]
     CheckLinearization(CheckLinearizationCommand),
-    #[command(name = "dump-object", about = "Dump one indirect object as PDF syntax")]
-    DumpObject(DumpObjectCommand),
     #[command(about = "Show page structure summary or detail")]
     Pages(PagesCommand),
     #[command(about = "Create a PDF in QDF form (alias of `rewrite --qdf`)")]
@@ -1869,16 +1867,6 @@ struct CheckCommand {
 struct CheckLinearizationCommand {
     /// Input PDF file to validate.
     input: PathBuf,
-}
-
-#[derive(Debug, ClapArgs)]
-struct DumpObjectCommand {
-    object_ref: String,
-    input: PathBuf,
-    #[arg(long)]
-    repair: bool,
-    #[command(flatten)]
-    password: PasswordArgs,
 }
 
 #[derive(Debug, ClapArgs)]
@@ -2867,7 +2855,6 @@ fn apply_raw_overrides(args: &mut Cli, overrides: RawCliOverrides) {
     if let Some(command) = args.command.as_mut() {
         match command {
             Commands::Check(command) => command.password.raw_password = password.clone(),
-            Commands::DumpObject(command) => command.password.raw_password = password.clone(),
             Commands::Pages(command) => command.password.raw_password = password.clone(),
             Commands::Qdf(command) => command.password.raw_password = password.clone(),
             Commands::ShowEncryption(command)
@@ -4661,13 +4648,6 @@ fn run_command(command: Commands, overlay_specs: &[OverlaySpec]) -> CliResult<()
             false,
             false,
             InspectionTransformOptions::new(ImageTransformOptions::default(), false, None),
-            false,
-        ),
-        Commands::DumpObject(cmd) => run_dump_object(
-            Some(cmd.input),
-            cmd.repair,
-            &cmd.password,
-            &cmd.object_ref,
             false,
         ),
         Commands::Pages(cmd) => {
@@ -8817,45 +8797,6 @@ fn open_verified_json_output(input: Option<&File>, output: &Path) -> CliResult<F
     Ok(output_file)
 }
 
-fn run_dump_object(
-    input: Option<PathBuf>,
-    repair: bool,
-    password: &PasswordArgs,
-    object_ref: &str,
-    suppress_warnings: bool,
-) -> CliResult<()> {
-    let selector = parse_show_object_selector(object_ref)?;
-    let input = input.ok_or_else(missing_input_usage_error)?;
-
-    let mut pdf = open_pdf_with_suppression(&input, repair, password, suppress_warnings)?;
-    let mut job = QPDFJob::new();
-    job.set_logger(cli_logger());
-    job.set_message_prefix(progname());
-    job.set_suppress_warnings(suppress_warnings);
-    match selector {
-        ShowObjectSelector::Trailer => {
-            let object = pdf.trailer();
-            finish_job_exit_status(job.show_object(&mut pdf, object, false, false)?)
-        }
-        ShowObjectSelector::Object { number, generation } => {
-            if generation > i32::from(u16::MAX) {
-                return finish_job_exit_status(
-                    job.dump_object_by_raw_identity(&mut pdf, number, generation)?,
-                );
-            }
-            let object_ref = ObjectRef::new(number as u32, generation as u16);
-            finish_job_exit_status(job.dump_object(&mut pdf, object_ref)?)
-        }
-        ShowObjectSelector::Null => {
-            logger_info(b"null\n")?;
-            finish_job_exit_status(job.inspect(&mut pdf, |_pdf| Ok::<(), flpdf::Error>(()))?)
-        }
-        ShowObjectSelector::NoObject => {
-            finish_job_exit_status(job.inspect(&mut pdf, |_pdf| Ok::<(), flpdf::Error>(()))?)
-        }
-    }
-}
-
 #[derive(Debug, Clone, Copy)]
 enum ShowObjectSelector {
     Trailer,
@@ -8864,8 +8805,7 @@ enum ShowObjectSelector {
     NoObject,
 }
 
-/// Parse qpdf's `parse_object_id` selector for both top-level `--show-object`
-/// and the legacy `dump-object` command.
+/// Parse qpdf's `parse_object_id` selector for top-level `--show-object`.
 fn parse_show_object_selector(value: &str) -> CliResult<ShowObjectSelector> {
     match JsonObjectSelector::parse(value).map_err(UsageError::new)? {
         JsonObjectSelector::Trailer => Ok(ShowObjectSelector::Trailer),

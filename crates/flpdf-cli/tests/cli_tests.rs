@@ -1529,19 +1529,9 @@ fn pages_subcommand_prints_count() {
 }
 
 #[test]
-fn dump_object_subcommand_accepts_ref() {
-    let mut cmd = Command::cargo_bin("flpdf").unwrap();
-    cmd.args(["dump-object", "1", "../../tests/fixtures/minimal.pdf"])
-        .assert()
-        .success()
-        .stdout(predicate::str::contains("/Type /Catalog"));
-}
-
-#[test]
 fn qdf_subcommand_rewrites_output() {
     // The `qdf` subcommand is an alias of `rewrite --qdf`: it must
-    // emit canonical QDF, not the
-    // legacy raw-dump route.
+    // emit canonical QDF, not inspection output.
     let temp = tempfile::tempdir().unwrap();
     let output = temp.path().join("out.pdf");
 
@@ -2819,7 +2809,7 @@ fn check_with_repair_accepts_corrupt_xref() {
 }
 
 #[test]
-fn dump_object_accepts_ref_without_suffix() {
+fn show_object_accepts_ref_without_suffix() {
     let mut cmd = Command::cargo_bin("flpdf").unwrap();
     cmd.args(["--show-object=1 0", "../../tests/fixtures/minimal.pdf"])
         .assert()
@@ -2828,23 +2818,12 @@ fn dump_object_accepts_ref_without_suffix() {
 }
 
 #[test]
-fn dump_object_accepts_ref_with_r_suffix() {
+fn show_object_accepts_ref_with_r_suffix() {
     let mut cmd = Command::cargo_bin("flpdf").unwrap();
     cmd.args(["--show-object=1 0 R", "../../tests/fixtures/minimal.pdf"])
         .assert()
         .success()
         .stdout(predicate::str::contains("/Type /Catalog"));
-}
-
-#[test]
-fn dump_object_accepts_qpdf_object_selector_forms() {
-    for selector in ["1", "1,0"] {
-        let mut cmd = Command::cargo_bin("flpdf").unwrap();
-        cmd.args(["dump-object", selector, "../../tests/fixtures/minimal.pdf"])
-            .assert()
-            .success()
-            .stdout(predicate::str::contains("/Type /Catalog"));
-    }
 }
 
 #[test]

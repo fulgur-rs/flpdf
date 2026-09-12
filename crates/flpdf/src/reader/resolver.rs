@@ -704,18 +704,6 @@ impl<R: Read + Seek> Drop for ResolveMark<'_, R> {
 /// [`DocumentResolver`] a document's handles hold a `Weak` to.
 pub(crate) struct ResolverHandle<R: Read + Seek + 'static> {
     core: RefCell<ResolverCore<R>>,
-    /// Source line endings included by canonical stream-boundary recovery.
-    ///
-    /// The recovered length follows qpdf's `recoverStreamLength` coordinate
-    /// and therefore includes the line ending immediately before
-    /// `endstream`. Retain the observed suffix for inspection consumers that
-    /// have their own display-framing policy; the qpdf pipe path always reads
-    /// the complete recovered length before any AES/RC4 stage. The map key is
-    /// `(QpdfObjGen, stream-data offset)` rather than object identity alone:
-    /// qpdf can read an older `/Prev` xref stream at a different offset while
-    /// retaining a newer value for the same object generation
-    /// (`libqpdf/QPDF.cc:1664-1689`).
-    recovered_stream_eols: RefCell<BTreeMap<(QpdfObjGen, u64), crate::parser::RecoveredStreamEol>>,
     /// A `Weak` to this same allocation, so minting a canonical handle can
     /// attach the resolver the handle will later call back into.
     ///
@@ -954,7 +942,6 @@ impl<R: Read + Seek> ResolverHandle<R> {
                 description,
                 encryption_parameters: Rc::new(RefCell::new(None)),
             }),
-            recovered_stream_eols: RefCell::new(BTreeMap::new()),
             self_weak: self_weak.clone(),
             immediate_copy_from: Cell::new(false),
             pdf_unique_id: Cell::new(pdf_unique_id),
@@ -998,7 +985,6 @@ impl<R: Read + Seek> ResolverHandle<R> {
                 description,
                 encryption_parameters: Rc::new(RefCell::new(None)),
             }),
-            recovered_stream_eols: RefCell::new(BTreeMap::new()),
             self_weak: self_weak.clone(),
             immediate_copy_from: Cell::new(false),
             pdf_unique_id: Cell::new(pdf_unique_id),
@@ -4091,29 +4077,18 @@ impl<R: Read + Seek> ResolverHandle<R> {
         warning?;
 
         let terminator = self.find_stream_recovery_terminator(stream_offset)?;
-        let (length, next_position, recovered_eol) = match terminator {
+        let (length, next_position) = match terminator {
             Some((position, next_position)) => {
-                let recovered_eol = self.recovered_stream_eol_at(stream_offset, position)?;
                 (
                     usize::try_from(position.saturating_sub(stream_offset)).map_err(|_| {
                         // cov:ignore-start: u64-to-usize overflow is unreachable on supported 64-bit CI; retain the defensive error for narrower targets
                         Error::parse(usize::MAX, "recovered stream length is out of range")
                     })?, // cov:ignore-end
                     Some(next_position),
-                    recovered_eol,
                 )
             }
-            None => (0, None, None),
+            None => (0, None),
         };
-        if let Some(eol) = recovered_eol {
-            self.recovered_stream_eols
-                .borrow_mut()
-                .insert((object_gen, stream_offset), eol);
-        } else {
-            self.recovered_stream_eols
-                .borrow_mut()
-                .remove(&(object_gen, stream_offset));
-        }
         if let Some(next_position) = next_position {
             self.seek(next_position)?;
         }
@@ -4135,58 +4110,6 @@ impl<R: Read + Seek> ResolverHandle<R> {
             )?; // cov:ignore: LLVM maps this covered multiline recovery-warning call terminator to a zero-count continuation region
         }
         Ok(length)
-    }
-
-    fn recovered_stream_eol_at(
-        &self,
-        stream_offset: u64,
-        data_end: u64,
-    ) -> Result<Option<crate::parser::RecoveredStreamEol>> {
-        if data_end <= stream_offset {
-            return Ok(None);
-        }
-        let start = data_end.saturating_sub(2).max(stream_offset);
-        let width = usize::try_from(data_end - start).unwrap_or(2).min(2);
-        self.seek(start)?;
-        let mut suffix = [0u8; 2];
-        let read = self.read(&mut suffix[..width])?;
-        self.seek(data_end)?;
-        Ok(match read {
-            2 if suffix == *b"\r\n" => Some(crate::parser::RecoveredStreamEol::CrLf),
-            1..=2 if suffix[read - 1] == b'\n' => Some(crate::parser::RecoveredStreamEol::Lf),
-            1..=2 if suffix[read - 1] == b'\r' => Some(crate::parser::RecoveredStreamEol::Cr),
-            _ => None,
-        })
-    }
-
-    /// Return the recovered framing suffix for one exact source read.
-    /// `stream_offset` is qpdf's stream-data position, not the object header
-    /// position (`libqpdf/QPDF.cc:1363-1368,1488-1492`).
-    pub(crate) fn recovered_stream_eol(
-        &self,
-        object_gen: QpdfObjGen,
-        stream_offset: u64,
-    ) -> Option<crate::parser::RecoveredStreamEol> {
-        self.recovered_stream_eols
-            .borrow()
-            .get(&(object_gen, stream_offset))
-            .copied()
-    }
-
-    /// Whether the canonical `decryptStream` route transforms the complete
-    /// recovered source span for this stream. Inspection uses this
-    /// classification to avoid applying its separate display-framing trim;
-    /// the pipe itself still passes the full length to the decrypt stage.
-    pub(crate) fn recovered_stream_eol_is_transformed(
-        &self,
-        stream_dict: &ObjectHandle,
-    ) -> Result<bool> {
-        let encryption = self.encryption_parameters().borrow().as_ref().cloned();
-        let Some(encryption) = encryption else {
-            return Ok(false);
-        };
-        let inspection = inspect_stream_encryption(&encryption, stream_dict)?;
-        Ok(!inspection.is_xref && encryption.stream_method_transforms(inspection.method))
     }
 
     /// qpdf's `damagedPDF(input, offset, message)` warning carries the
@@ -5775,7 +5698,7 @@ mod tests {
     }
 
     #[test]
-    fn canonical_owner_keeps_stream_recovery_diagnostics_and_eol_state() {
+    fn canonical_owner_keeps_stream_recovery_diagnostics() {
         let mut bytes = b"%PDF-1.4\n".to_vec();
         let offset = bytes.len() as u64;
         bytes.extend_from_slice(b"1 0 obj\n<< >>\nstream\nhello\nendstream\nendobj\n%tail\n");
@@ -5797,14 +5720,6 @@ mod tests {
             .expect("canonical stream read");
 
         assert!(read.as_stream_dict().is_some());
-        let stream_offset = read.get_parsed_offset();
-        assert!(stream_offset >= 0);
-        assert!(resolver
-            .recovered_stream_eol(
-                QpdfObjGen::from_object_ref(object_ref),
-                stream_offset as u64
-            )
-            .is_some());
         assert!(owner
             .repair_diagnostics()
             .entries()
@@ -5969,67 +5884,6 @@ mod tests {
         let diagnostics = destination.repair_diagnostics();
         assert_eq!(diagnostics.entries().len(), 1);
         assert_eq!(diagnostics.entries()[0].get_filename(), b"source.pdf");
-    }
-
-    #[test]
-    fn canonical_stream_recovery_identifies_the_included_line_ending() {
-        let recover = |source: &[u8], data_end: u64| {
-            let resolver = ResolverHandle::new_shared(
-                Cursor::new(source.to_vec()),
-                0,
-                BTreeMap::new(),
-                false,
-                false,
-                Diagnostics::default(),
-                ResolverWarningOptions::new(crate::QPDFLogger::create(), true, Vec::new()),
-                0,
-            );
-            resolver
-                .recovered_stream_eol_at(0, data_end)
-                .expect("line-ending probe")
-        };
-
-        assert_eq!(
-            recover(b"payload\r\nendstream", 9),
-            Some(crate::parser::RecoveredStreamEol::CrLf)
-        );
-        assert_eq!(
-            recover(b"payload\nendstream", 8),
-            Some(crate::parser::RecoveredStreamEol::Lf)
-        );
-        assert_eq!(
-            recover(b"payload\rendstream", 8),
-            Some(crate::parser::RecoveredStreamEol::Cr)
-        );
-        assert_eq!(recover(b"endstream", 0), None);
-    }
-
-    #[test]
-    fn recovered_stream_eol_lookup_returns_the_recorded_value() {
-        let resolver = resolver_over(Vec::new());
-        let object_ref = ObjectRef::new(1, 0);
-        let stream_offset = 42;
-        resolver.recovered_stream_eols.borrow_mut().insert(
-            (QpdfObjGen::from_object_ref(object_ref), stream_offset),
-            crate::parser::RecoveredStreamEol::CrLf,
-        );
-
-        assert_eq!(
-            resolver.recovered_stream_eol(QpdfObjGen::from_object_ref(object_ref), stream_offset),
-            Some(crate::parser::RecoveredStreamEol::CrLf)
-        );
-        assert_eq!(
-            resolver
-                .recovered_stream_eol(QpdfObjGen::from_object_ref(object_ref), stream_offset + 1),
-            None
-        );
-        assert_eq!(
-            resolver.recovered_stream_eol(
-                QpdfObjGen::from_object_ref(ObjectRef::new(2, 0)),
-                stream_offset,
-            ),
-            None
-        );
     }
 
     /// AC6 case 4: a resolver on which no authentication step has run at all

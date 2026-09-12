@@ -1592,12 +1592,6 @@ loggerで再openする経路はtop-level CLIから除去し、`--show-linearizat
 
 以下の direct output は意図的に retained とする。
 
-- `dump-object` の recovered-EOL トリム（`job/inspection.rs::unparse_object_with_stream_data`、
-  `// qpdf-deviation` マーク済み）: qpdf には `dump-object` に相当する再シリアライズ経路が無く、
-  `doShowObj` は stream に対して "Object is stream.  Dictionary:" と dict だけを出す
-  （`QPDFJob.cc:806-832`）。flpdf 独自のこの再シリアライザは自前の `\nendstream` framing と
-  復元長に含まれる行末が二重にならないよう `RecoveredStreamEol` を差し引く。show-object の
-  raw/filtered payload と pipe 経路は qpdf 同様に復元長の全 span を出す（`flpdf-zvjf`、`flpdf-hj7v`）。
 - native `rewrite --static-id` warning: qpdf-compatible CLI surfaceではないため残る
   flpdf-only test diagnostic（出力先は qpdf-compatible logger error route）
 - clap 自身が parse/usage のために直接終了する help・構文エラー、および logger の
@@ -2854,30 +2848,3 @@ source route contract は
 `crates/flpdf/tests/final_accessor_route_tests.rs`、qpdf source mirrorは
 `/home/ubuntu/.cache/flpdf/qpdf-11.9.0`（pinned HEAD
 `3b97c9bd266b7c32ea36d3536e22dab77412886d`）である。
-
-### `flpdf-3gdi`: dump-object recovered-EOL metadata ownership (2026-09-12)
-
-qpdf の `readStream` は stream-data offset を capture し、`recoverStreamLength`
-は `endstream` までの span（直前の EOL を含む）を返す
-（`libqpdf/QPDF.cc:1361-1398,1482-1532`）。また `/Prev` を読む xref stream が
-同じ `QPDFObjGen` を再利用しても、`readObjectAtOffset` の
-`skip_cache_if_in_xref` 分岐は現行 cache の value を保ったまま旧 offset の
-object を処理する（`libqpdf/QPDF.cc:1641-1693`）。
-
-flpdf の `dump-object` は qpdf に相当する再 serializer がないため独自の
-framing extension だが、その `RecoveredStreamEol` metadata は旧来
-`QpdfObjGen` だけで共有されていた。旧 `/Prev` stream の recovery が先に
-記録した EOL が、同じ object identity を持つ新 stream の末尾 payload を
-誤って trim するため、`.3gdi` で key を
-`(QpdfObjGen, stream-data parsed offset)` に変更した。inspection は
-`ObjectHandle` の raw identity と parsed offsetを使い、canonical xref decode
-や raw/filtered stream pipe の length は変更しない。qtest exceptions は別境界
-として未変更である。
-
-`crates/flpdf/src/job/inspection.rs` の
-`dump_object_keeps_new_revision_payload_when_xref_object_is_reused` は、旧
-malformed xref stream と新 revision の同一 object `5 0` を別 offsetで作り、
-新 stream の 42-byte payload（末尾 LF を含む）が trim されないことを固定する。
-qpdf `QPDFJob::doShowObj` は辞書表示または `pipeStreamData` のみで framing を
-再構築しないため（`libqpdf/QPDFJob.cc:806-839`）、この検証は flpdf-only
-inspection extension の ownership correctness として扱う。

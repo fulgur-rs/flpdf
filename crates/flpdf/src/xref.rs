@@ -1008,7 +1008,7 @@ impl BootstrapHandleDocument {
             .collect();
         let parsed_offset = completed.object.get_parsed_offset();
         let (end_before_space, end_after_space) = completed.object.end_offsets();
-        let _ = completed.remove_included_recovery_eol_for_decryption();
+        completed.remove_included_recovery_eol_for_decryption();
         // cov:ignore-start: the handle parser guarantees an exclusively owned direct top-level value
         let value = completed.object.into_direct_value().ok_or_else(|| {
             Error::Internal(format!(
@@ -4077,7 +4077,7 @@ fn read_xref_candidate(
     if completed.object_ref != object_ref {
         return None;
     }
-    let _ = completed.remove_included_recovery_eol_for_decryption();
+    completed.remove_included_recovery_eol_for_decryption();
     Some(completed)
 }
 
@@ -4796,7 +4796,7 @@ fn parse_xref_stream(
         };
         // Xref streams are not encrypted, but filter decoding still requires
         // the logical payload rather than qpdf's raw recovery EOL.
-        let _recovered_handle_eol = handle_completed.remove_included_recovery_eol_for_decryption();
+        handle_completed.remove_included_recovery_eol_for_decryption();
         let stream_data_offset = handle_completed
             .stream_data_offset
             .map(|offset| xref_pos.saturating_add(offset));
@@ -8625,15 +8625,7 @@ mod final_handle_tests {
         .expect("a recovered canonical xref stream should still parse its one free entry");
 
         let stream = resolver.get_object_handle(ObjectRef::new(1, 0));
-        let stream_offset = stream.get_parsed_offset();
-        assert!(stream_offset >= 0);
-        assert_eq!(
-            resolver.recovered_stream_eol(
-                QpdfObjGen::from_object_ref(ObjectRef::new(1, 0)),
-                stream_offset as u64,
-            ),
-            Some(crate::parser::RecoveredStreamEol::Lf)
-        );
+        assert!(stream.as_stream_dict().is_some());
         assert!(state.loaded.entries.is_empty());
         assert!(resolver
             .repair_diagnostics()

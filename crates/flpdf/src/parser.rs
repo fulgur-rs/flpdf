@@ -1911,26 +1911,6 @@ mod live_input_tests {
     }
 }
 
-/// Exact line ending observed at the end of a recovered stream span immediately
-/// before a line-anchored `endstream`. The `dump-object` reserializer may use
-/// this metadata to distinguish source payload from its own framing.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub(crate) enum RecoveredStreamEol {
-    Lf,
-    Cr,
-    CrLf,
-}
-
-impl RecoveredStreamEol {
-    pub(crate) const fn as_bytes(self) -> &'static [u8] {
-        match self {
-            Self::Lf => b"\n",
-            Self::Cr => b"\r",
-            Self::CrLf => b"\r\n",
-        }
-    }
-}
-
 // Maximum object-nesting depth the recursive-descent parser will accept before
 // returning an error. Without this bound, deeply nested input (`[[[[…` or
 // `<</A <</A …`) recurses until the stack overflows and the process aborts —
