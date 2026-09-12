@@ -81,7 +81,7 @@ impl EncryptedStringEmitter {
         removed_refs: &std::collections::BTreeSet<ObjectRef>,
     ) -> crate::Result<()> {
         if emitted_ref == self.encrypt_ref {
-            return write_encryption_dictionary_handle(out, object);
+            return write_encryption_dictionary_handle(out, object); // cov:ignore: /Encrypt is emitted by the writer-owned trailer/body boundary, never through this dynamic body serializer.
         }
 
         let cipher = self.cipher;
@@ -115,6 +115,50 @@ impl EncryptedStringEmitter {
                         &mut write_string,
                     )
                 }
+            })
+    }
+
+    /// Standard-writer dynamic object emission with the surrounding writer's
+    /// direct-stream policy. This keeps nested stream payload/framing and
+    /// string encryption in one current-object data-key scope.
+    #[allow(clippy::too_many_arguments)] // qpdf keeps output identity, key scope, map, and stream policy independent
+    pub(crate) fn write_handle_object_with_dynamic_ref_map_and_direct_stream_writer(
+        &mut self,
+        out: &mut Vec<u8>,
+        emitted_ref: ObjectRef,
+        object_stream_index: Option<u32>,
+        object: &ObjectHandle,
+        map: &mut dyn FnMut(&ObjectHandle) -> crate::Result<ObjectRef>,
+        removed_refs: &std::collections::BTreeSet<ObjectRef>,
+        direct_stream_writer: &mut dyn crate::writer::object::DynamicDirectStreamWriter,
+    ) -> crate::Result<()> {
+        if emitted_ref == self.encrypt_ref {
+            return write_encryption_dictionary_handle(out, object); // cov:ignore: /Encrypt is emitted by the writer-owned body/trailer boundary, never through this dynamic body serializer.
+        }
+
+        let cipher = self.cipher;
+        let static_aes_iv = self.static_aes_iv;
+        let aes_iv_generator = self.aes_iv_generator.as_mut();
+        self.state
+            .with_object_data_key(emitted_ref.number, object_stream_index, |state| {
+                let mut write_string = |out: &mut Vec<u8>, plaintext: &[u8]| {
+                    write_encrypted_or_plain_string(
+                        state,
+                        cipher,
+                        static_aes_iv,
+                        aes_iv_generator,
+                        out,
+                        plaintext,
+                    )
+                };
+                crate::writer::object::write_object_with_dynamic_ref_map_and_string_writer_and_direct_stream_writer(
+                    object,
+                    out,
+                    map,
+                    removed_refs,
+                    &mut write_string,
+                    direct_stream_writer,
+                )
             })
     }
 
@@ -233,6 +277,49 @@ impl EncryptedStringEmitter {
                         &mut write_string,
                     )
                 }
+            })
+    }
+
+    /// Standard-writer stream-dictionary counterpart of
+    /// [`Self::write_handle_stream_dict_with_ref_map`].
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) fn write_handle_stream_dict_with_dynamic_ref_map(
+        &mut self,
+        out: &mut Vec<u8>,
+        emitted_ref: ObjectRef,
+        object_stream_index: Option<u32>,
+        dict: &ObjectHandle,
+        dictionary: StreamDictionaryOptions,
+        encrypt_strings: bool,
+        map: &mut dyn FnMut(&ObjectHandle) -> crate::Result<ObjectRef>,
+        removed_refs: &std::collections::BTreeSet<ObjectRef>,
+    ) -> crate::Result<()> {
+        if !encrypt_strings {
+            return dict.write_stream_body_with_dynamic_ref_map(out, dictionary, map, removed_refs);
+        }
+
+        let cipher = self.cipher;
+        let static_aes_iv = self.static_aes_iv;
+        let aes_iv_generator = self.aes_iv_generator.as_mut();
+        self.state
+            .with_object_data_key(emitted_ref.number, object_stream_index, |state| {
+                let mut write_string = |out: &mut Vec<u8>, plaintext: &[u8]| {
+                    write_encrypted_or_plain_string(
+                        state,
+                        cipher,
+                        static_aes_iv,
+                        aes_iv_generator,
+                        out,
+                        plaintext,
+                    )
+                };
+                dict.write_stream_body_with_dynamic_ref_map_and_string_writer(
+                    out,
+                    dictionary,
+                    map,
+                    removed_refs,
+                    &mut write_string,
+                )
             })
     }
 }

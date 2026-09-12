@@ -468,3 +468,44 @@ specialized coordinator 内部（`4a2faf5c` の状態）:
 | `D31` | `flpdf-oq7g` | linearized Preserve のbyte-parity受入拡張 |
 | `D20` | `flpdf-o99` | shared hint container番号のwriter統合試験 |
 | `D11` | `flpdf-vo76` | 外部stream Lengthの既存受入 |
+
+## 2026-09-12: specialized standard live-queue slice (`flpdf-s07c`)
+
+`flpdf-s07c` は、`qdf=false`・`content_normalization=false`・`pclm=false` の
+non-linearized specialized standard cohortを、qpdfの増加する object queueへ接続した。
+`crates/flpdf/src/writer.rs::emit_specialized_standard_live` が
+`ObjectStreamMode::Disable/Preserve/Generate`、明示暗号化、source encryptionの
+preserve/decrypt、extra headerをこのcohortの入口として持ち、bodyは
+`crates/flpdf/src/writer/plain/body.rs::emit_live_specialized_standard` の
+`LiveQueue` → `WriteObject` → dynamic child mapを通る。
+
+qpdfの `enqueueObject` / `unparseChild` / `writeStandard`
+（`libqpdf/QPDFWriter.cc:1072-1157,1761-1809,2907-3044`）に合わせ、採番は
+child tokenを実際にunparseする時点で行う。Generateの候補membershipは
+`prepareFileForWrite` より前のsetup snapshotを使用し、rootのADBE output
+shallow-copyが置換した旧childを、queueが見ていない限り発見・保持しない。
+ObjStmはsource-backed Preserveまたはqpdfのfresh null placeholderを
+`Generated` groupとして同じqueueに登録し、container first / member range
+reservation / encrypted container framingを共有する。
+
+今回のREDは、specializedのprogress callbackがまだqueueにない `/Pages` childを
+追加すると固定renumber mapが `absent from renumber map` で失敗すること。GREEN後は
+そのcallback回帰、encrypted全3 ObjStm mode、`adbe-orphan-url.pdf` の
+qpdf 11.9.0 byte parity（Disable/Preserve/Generate）、encrypted sourceの
+decrypt/preserve matrixを確認した。
+
+このsliceでD2/D3/D11の **specialized standard** はliveになったが、QDF/normalize
+（`flpdf-ay5b`）、PCLm、linearizedの別consumerは残る。したがってD25の
+`inject_adbe_extension` / `strip_adbe_extension` / `snapshot_catalog_extensions` /
+`restore_catalog_extensions` caller-zero、ならびにroute matrix全体の
+bridge/mixed解消を完了とは扱わない。`.60` はこのsliceを取り込んだ後に
+specialized root ownerを最終cutoverし、残るhelper callerを監査して撤去する。
+
+後続のoracle再確認で、specialized consumerの境界もqpdfに合わせて補正した。
+GenerateのObjStm placeholderは`getObjectCount`より前にsetupで確保し、progressの
+first/final passは`writeObject`と同じ`indicateProgress(false, false)`位置で動かす。
+`EncryptMetadata=false`は`/Type /Metadata`のstreamだけをcleartextにし、通常の
+direct Streamは暗号化する。Preserveのstale generation removalはGenerateと同じく
+emissionまで渡し、classic xref trailerのdirect Rootもdynamic serializerを通して
+payload/framingを保持する。これらはQPDFWriter.cc:1251-1278,1639-1707,
+1953-1966,1998-2004,2189-2195,3023-3031に対応する。

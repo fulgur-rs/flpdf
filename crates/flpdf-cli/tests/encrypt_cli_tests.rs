@@ -3146,13 +3146,11 @@ fn encrypt_with_generate_object_streams_uncompressed_xref_matches_qpdf() {
 
 /// xref-stream ソース + --object-streams=disable + --encrypt
 ///
-/// source がすでに xref stream 形式を持つ場合、ObjStm を無効化して暗号化しても
-/// xref stream 形式が保持され、qpdf で復号できること。
-///
-/// これは 4.16/4.17 で実装された「--encrypt は classic xref table を強制しない」
-/// 動作を、ObjStm バッチが空の場合（preserve 元の xref form）について検証する。
+/// qpdf 11.9.0 は入力の xref 形式をそのまま保持するのではなく、出力時の
+/// ObjStm reverse map が空なら classic xref table を選ぶ（`QPDFWriter.cc:3023-3031`）。
+/// ObjStm を無効化して暗号化する場合も、qpdf と同じ形式選択・復号可能性を検証する。
 #[test]
-fn encrypt_preserves_xref_stream_form_when_objstm_disabled() {
+fn encrypt_uses_classic_xref_when_objstm_disabled() {
     if !ensure_qpdf_or_skip() {
         return;
     }
@@ -3168,8 +3166,9 @@ fn encrypt_preserves_xref_stream_form_when_objstm_disabled() {
         .assert()
         .success();
 
-    // Then, disable ObjStm and encrypt it while preserving the source form.
-    let encrypted = tmp.path().join("encrypted_xref_stream.pdf");
+    // Then, disable ObjStm and encrypt it. qpdf selects a classic xref table
+    // because the output ObjStm reverse map is empty.
+    let encrypted = tmp.path().join("encrypted_classic_xref.pdf");
     Command::cargo_bin("flpdf")
         .unwrap()
         .args([
@@ -3189,18 +3188,18 @@ fn encrypt_preserves_xref_stream_form_when_objstm_disabled() {
 
     let bytes = std::fs::read(&encrypted).unwrap();
 
-    // xref stream 形式が保持されていること（positive: /Type /XRef が存在する）
+    // qpdf's output form is a classic xref table, not an xref stream.
     assert!(
-        bytes.windows(b"/XRef".len()).any(|w| w == b"/XRef"),
-        "output must use xref stream form (/Type /XRef), not a classic xref table"
+        !bytes.windows(b"/XRef".len()).any(|w| w == b"/XRef"),
+        "output must not use xref stream form when the output ObjStm map is empty"
     );
-    // classic xref table が出力されていないこと（negative: "\nxref\n" が存在しない）
+    // classic xref table の存在（positive: "\nxref\n" が存在する）
     // "startxref\n" は classic table でも xref stream でも現れるため使えない。
     // "\nxref\n" は classic table の xref セクション開始を示すキーワードで
     // xref stream 形式では現れない。
     assert!(
-        !bytes.windows(b"\nxref\n".len()).any(|w| w == b"\nxref\n"),
-        "output must not contain a classic xref table (\\nxref\\n keyword found)"
+        bytes.windows(b"\nxref\n".len()).any(|w| w == b"\nxref\n"),
+        "output must use a classic xref table when the output ObjStm map is empty"
     );
 
     // ObjStm が存在しないこと（disable モードなので）
@@ -3231,7 +3230,7 @@ fn encrypt_preserves_xref_stream_form_when_objstm_disabled() {
     assert!(stdout.contains("R = 4"), "qpdf must report R=4: {stdout}");
 
     // qpdf --decrypt で完全に復号できること
-    let decrypted = tmp.path().join("decrypted_xref_stream.pdf");
+    let decrypted = tmp.path().join("decrypted_classic_xref.pdf");
     let decrypt_result = std::process::Command::new("qpdf")
         .arg("--password=user-pw")
         .arg("--decrypt")

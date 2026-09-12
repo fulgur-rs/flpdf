@@ -16,7 +16,7 @@
 //! Fixtures are content-stream-free, so byte-identity is independent of the
 //! deflate backend — this file is NOT gated on `qpdf-zlib-compat`.
 
-use flpdf::{NewlineBeforeEndstream, Pdf};
+use flpdf::{EncryptParams, NewlineBeforeEndstream, ObjectStreamMode, Pdf};
 use std::path::Path;
 
 /// STRIP-side WriterTestSettings (plain full rewrite, qpdf-matching newline/id).
@@ -215,9 +215,9 @@ fn common_writer_preparation_is_shared_by_linearized_output() {
     );
 }
 
-fn suppressed_mode_restores_output_only_adbe_on_live_catalog(
+fn specialized_mode_reconciles_shared_extensions_alias_on_live_catalog(
     object_streams: flpdf::ObjectStreamMode,
-) {
+) -> flpdf::Result<()> {
     let path = Path::new(env!("CARGO_MANIFEST_DIR"))
         .join("../../tests/fixtures/compat/one-page-ext-indirect.pdf");
     let file = std::fs::File::open(&path).expect("open indirect Extensions fixture");
@@ -255,26 +255,86 @@ fn suppressed_mode_restores_output_only_adbe_on_live_catalog(
         after.as_dictionary().is_some(),
         "output-only ADBE mutation must not remove the live Extensions dictionary"
     );
-    let after_adbe = after
-        .try_get_key(b"/ADBE")
-        .expect("output-only ADBE mutation must be restored");
-    assert_eq!(
-        after_adbe
-            .try_get_key(b"/ExtensionLevel")
-            .expect("read restored extension level")
-            .as_integer(),
-        Some(3)
+    assert!(
+        !after.try_has_key(b"/ADBE")?,
+        "qpdf's shallow root copy shares an existing direct Extensions dictionary, so ADBE removal is observable on the live alias"
     );
+    Ok(())
 }
 
 #[test]
-fn suppressed_generate_restores_output_only_adbe_on_live_catalog() {
-    suppressed_mode_restores_output_only_adbe_on_live_catalog(flpdf::ObjectStreamMode::Generate);
+fn specialized_generate_reconciles_shared_extensions_alias_on_live_catalog() {
+    specialized_mode_reconciles_shared_extensions_alias_on_live_catalog(
+        flpdf::ObjectStreamMode::Generate,
+    )
+    .expect("specialized Generate write succeeds");
 }
 
 #[test]
-fn suppressed_preserve_restores_output_only_adbe_on_live_catalog() {
-    suppressed_mode_restores_output_only_adbe_on_live_catalog(flpdf::ObjectStreamMode::Preserve);
+fn specialized_preserve_reconciles_shared_extensions_alias_on_live_catalog() {
+    specialized_mode_reconciles_shared_extensions_alias_on_live_catalog(
+        flpdf::ObjectStreamMode::Preserve,
+    )
+    .expect("specialized Preserve write succeeds");
+}
+
+#[cfg(feature = "qpdf-zlib-compat")]
+#[test]
+fn specialized_standard_adbe_root_cutover_matches_qpdf_for_all_object_stream_modes() {
+    use std::process::Command;
+
+    let input = Path::new(env!("CARGO_MANIFEST_DIR"))
+        .join("../../tests/fixtures/compat/adbe-orphan-url.pdf");
+    let temp = tempfile::tempdir().expect("create qpdf comparison directory");
+    for mode in [
+        ObjectStreamMode::Disable,
+        ObjectStreamMode::Preserve,
+        ObjectStreamMode::Generate,
+    ] {
+        let mode_name = match mode {
+            ObjectStreamMode::Disable => "disable",
+            ObjectStreamMode::Preserve => "preserve",
+            ObjectStreamMode::Generate => "generate",
+        };
+        let oracle_path = temp.path().join(format!("qpdf-{mode_name}.pdf"));
+        let object_streams_arg = format!("--object-streams={mode_name}");
+        let oracle = Command::new("qpdf")
+            .args(["--static-id", "--static-aes-iv"])
+            .arg(&object_streams_arg)
+            .args([
+                "--min-version=1.7.8",
+                "--encrypt",
+                "u",
+                "o",
+                "128",
+                "--use-aes=y",
+                "--",
+            ])
+            .arg(&input)
+            .arg(&oracle_path)
+            .output()
+            .expect("run qpdf 11.9.0");
+        assert!(oracle.status.success(), "qpdf failed: {:?}", oracle.stderr);
+
+        let file = std::fs::File::open(&input).expect("open ADBE orphan fixture");
+        let mut pdf = Pdf::open(std::io::BufReader::new(file)).expect("parse ADBE orphan fixture");
+        let settings = WriterTestSettings {
+            object_streams: mode,
+            min_version: Some("1.7".to_owned()),
+            min_extension_level: Some(8),
+            static_id: true,
+            static_aes_iv: true,
+            encrypt: Some(EncryptParams::v4_aes128(b"u", b"o")),
+            ..WriterTestSettings::default()
+        };
+        let mut actual = Vec::new();
+        write_with_settings(&mut pdf, &mut actual, &settings).expect("specialized rewrite");
+        let expected = std::fs::read(&oracle_path).expect("read qpdf output");
+        assert_eq!(
+            actual, expected,
+            "specialized ADBE cutover mode={mode_name}"
+        );
+    }
 }
 
 #[test]

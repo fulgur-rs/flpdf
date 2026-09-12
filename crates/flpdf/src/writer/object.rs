@@ -165,6 +165,26 @@ pub(crate) trait ObjectWriterEmission {
             "dynamic stream writer map is unavailable for this emission owner".into(),
         ))
     }
+    #[cfg(test)]
+    fn write_object_with_dynamic_ref_map_and_string_writer<F>(
+        &self,
+        out: &mut Vec<u8>,
+        map: &mut dyn FnMut(&ObjectHandle) -> Result<ObjectRef>,
+        removed_refs: &BTreeSet<ObjectRef>,
+        write_string: &mut F,
+    ) -> Result<()>
+    where
+        F: FnMut(&mut Vec<u8>, &[u8]) -> Result<()>;
+    fn write_stream_body_with_dynamic_ref_map_and_string_writer<F>(
+        &self,
+        out: &mut Vec<u8>,
+        options: StreamDictionaryOptions,
+        map: &mut dyn FnMut(&ObjectHandle) -> Result<ObjectRef>,
+        removed_refs: &BTreeSet<ObjectRef>,
+        write_string: &mut F,
+    ) -> Result<()>
+    where
+        F: FnMut(&mut Vec<u8>, &[u8]) -> Result<()>;
     // cov:ignore-end
     fn write_object_with_ref_map_and_removed_with_string_writer<F>(
         &self,
@@ -591,6 +611,56 @@ impl ObjectWriterEmission for ObjectHandle {
     ) -> Result<()> {
         let entries = stream_dictionary_entries_for_emission(self)?;
         unparse_stream_dict_entries_with_dynamic_ref_map(&entries, options, out, map, removed_refs)
+    }
+
+    #[cfg(test)]
+    fn write_object_with_dynamic_ref_map_and_string_writer<F>(
+        &self,
+        out: &mut Vec<u8>,
+        map: &mut dyn FnMut(&ObjectHandle) -> Result<ObjectRef>,
+        removed_refs: &BTreeSet<ObjectRef>,
+        write_string: &mut F,
+    ) -> Result<()>
+    where
+        F: FnMut(&mut Vec<u8>, &[u8]) -> Result<()>,
+    {
+        let mut direct_stream_writer = DefaultDynamicDirectStreamWriter {
+            newline_before_endstream: None,
+        };
+        write_object_with_dynamic_ref_map_and_string_writer_and_direct_stream_writer(
+            self,
+            out,
+            map,
+            removed_refs,
+            write_string,
+            &mut direct_stream_writer,
+        )
+    }
+
+    fn write_stream_body_with_dynamic_ref_map_and_string_writer<F>(
+        &self,
+        out: &mut Vec<u8>,
+        options: StreamDictionaryOptions,
+        map: &mut dyn FnMut(&ObjectHandle) -> Result<ObjectRef>,
+        removed_refs: &BTreeSet<ObjectRef>,
+        write_string: &mut F,
+    ) -> Result<()>
+    where
+        F: FnMut(&mut Vec<u8>, &[u8]) -> Result<()>,
+    {
+        let mut direct_stream_writer = DefaultDynamicDirectStreamWriter {
+            newline_before_endstream: None,
+        };
+        let entries = stream_dictionary_entries_for_emission(self)?;
+        unparse_stream_dict_entries_with_dynamic_ref_map_and_string_writer(
+            &entries,
+            options,
+            out,
+            map,
+            removed_refs,
+            write_string,
+            &mut direct_stream_writer,
+        )
     }
 
     /// Encrypted writer counterpart of
@@ -1221,6 +1291,7 @@ impl ObjectWriterEmission for ObjectHandle {
                 map,
                 removed_refs,
                 suppress_null_values,
+                None,
                 out,
             )
         })
@@ -1276,6 +1347,56 @@ impl ObjectWriterEmission for ObjectHandle {
     ) -> Result<()> {
         write_id_style_value_handle_with_ref_map(self, out, map, removed_refs)
     }
+}
+
+/// Classic xref trailers need the same direct Catalog serialization as the
+/// xref-stream route. The caller supplies the already-emitted direct-root
+/// bytes so nested direct Streams retain their payload and framing instead
+/// of falling through the generic trailer child walker.
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn write_trailer_with_ref_map_and_kind_and_direct_root(
+    trailer: &ObjectHandle,
+    out: &mut Vec<u8>,
+    kind: TrailerKind,
+    xref_stream: bool,
+    qdf: bool,
+    id_writer: Option<crate::pdf_syntax::TrailerIdWriter>,
+    map: &dyn Fn(ObjectRef) -> Result<ObjectRef>,
+    removed_refs: &BTreeSet<ObjectRef>,
+    suppress_null_values: bool,
+    direct_root: &[u8],
+) -> Result<()> {
+    if trailer.is_reserved() {
+        // cov:ignore-start: this helper is called only with the validated writer trailer and cannot receive a reserved handle.
+        return Err(reserved_unparse_error());
+        // cov:ignore-end
+    }
+    trailer.try_dereference()?;
+    trailer.with_value(|value| {
+        let entries: Vec<(Vec<u8>, ObjectHandle)> = match value {
+            Some(ObjectValue::Dictionary(entries)) => entries
+                .iter()
+                .map(|(key, value)| (key.clone(), value.clone()))
+                .collect(),
+            _ => {
+                // cov:ignore-start: the writer always supplies a dictionary trailer; a non-dictionary value is a defensive resolver violation.
+                Vec::new()
+                // cov:ignore-end
+            }
+        };
+        unparse_trailer_entries_with_ref_map_and_kind(
+            &entries,
+            kind,
+            xref_stream,
+            qdf,
+            id_writer,
+            map,
+            removed_refs,
+            suppress_null_values,
+            Some(direct_root),
+            out,
+        )
+    })
 }
 /// Apply qpdf's stream-dictionary preparation to a shallow copy.
 ///
@@ -2289,7 +2410,134 @@ fn unparse_dict_entries_with_ref_map(
     Ok(())
 }
 
-type DynamicObjectRefMap<'a> = dyn FnMut(&ObjectHandle) -> Result<ObjectRef> + 'a;
+pub(crate) type DynamicObjectRefMap<'a> = dyn FnMut(&ObjectHandle) -> Result<ObjectRef> + 'a;
+
+/// Writer-owned hook for the exceptional case where a direct Stream value is
+/// nested inside an array or dictionary. qpdf still emits that stream's
+/// payload and framing through `unparseObject`; callers supply the stream
+/// policy because filtering/encryption belongs to the surrounding writer.
+pub(crate) trait DynamicDirectStreamWriter {
+    #[allow(clippy::type_complexity)] // the callback preserves qpdf's live map plus current object string-key scope
+    fn write_direct_stream(
+        &mut self,
+        stream: &ObjectHandle,
+        out: &mut Vec<u8>,
+        map: &mut DynamicObjectRefMap<'_>,
+        removed_refs: &BTreeSet<ObjectRef>,
+        write_string: &mut dyn FnMut(&mut Vec<u8>, &[u8]) -> Result<()>,
+    ) -> Result<()>;
+}
+
+pub(crate) struct DefaultDynamicDirectStreamWriter {
+    /// `None` retains the low-level helper's historical newline behavior;
+    /// writer-owned consumers pass qpdf's explicit policy.
+    pub(crate) newline_before_endstream: Option<crate::writer::NewlineBeforeEndstream>,
+}
+
+impl DynamicDirectStreamWriter for DefaultDynamicDirectStreamWriter {
+    fn write_direct_stream(
+        &mut self,
+        stream: &ObjectHandle,
+        out: &mut Vec<u8>,
+        map: &mut DynamicObjectRefMap<'_>,
+        removed_refs: &BTreeSet<ObjectRef>,
+        write_string: &mut dyn FnMut(&mut Vec<u8>, &[u8]) -> Result<()>,
+    ) -> Result<()> {
+        stream.try_dereference()?;
+        let dict = stream.as_stream_dict().ok_or_else(|| {
+            // cov:ignore-start: the dynamic child dispatch calls this hook only after a stream shape probe
+            Error::Internal("direct stream disappeared during emission".to_string())
+            // cov:ignore-end
+        })?; // cov:ignore: the stream-shape probe above makes this validated continuation a non-branching LLVM cleanup edge.
+        let data = stream.get_raw_stream_data()?;
+        let dict = dict.unsafe_shallow_copy()?;
+        dict.replace_key(
+            b"/Length",
+            ObjectHandle::integer(i64::try_from(data.len()).map_err(|_| {
+                // cov:ignore-start: an allocatable direct stream payload fits in i64
+                Error::Unsupported("direct stream /Length does not fit in i64".to_string())
+                // cov:ignore-end
+            })?), // cov:ignore: allocatable direct stream payloads fit in i64; LLVM attributes the covered conversion continuation here.
+        )?; // cov:ignore: the validated direct-stream dictionary replacement is covered; LLVM attributes its multiline terminator here.
+        let entries = stream_dictionary_entries_for_emission(&dict)?;
+        let mut write_string_wrapper = |out: &mut Vec<u8>, value: &[u8]| write_string(out, value);
+        unparse_stream_dict_entries_with_dynamic_ref_map_and_string_writer(
+            &entries,
+            StreamDictionaryOptions::preserve(),
+            out,
+            map,
+            removed_refs,
+            &mut write_string_wrapper,
+            self,
+        )?; // cov:ignore: the validated direct-stream dictionary serializer is covered; LLVM attributes its multiline terminator here.
+        out.extend_from_slice(b"\nstream\n");
+        out.extend_from_slice(data.as_ref());
+        if self
+            .newline_before_endstream
+            .is_none_or(|policy| matches!(policy, crate::writer::NewlineBeforeEndstream::Yes))
+        {
+            out.push(b'\n');
+        }
+        out.extend_from_slice(b"endstream");
+        Ok(())
+    }
+}
+
+/// Dynamic object emission with an injected direct-stream policy. This is the
+/// specialized counterpart to [`ObjectWriterEmission::write_object_with_dynamic_ref_map`];
+/// the default trait method uses a raw-preserve policy, while encrypted and
+/// filtered writer consumers provide their own qpdf stream boundary.
+pub(crate) fn write_object_with_dynamic_ref_map_and_string_writer_and_direct_stream_writer<F>(
+    handle: &ObjectHandle,
+    out: &mut Vec<u8>,
+    map: &mut DynamicObjectRefMap<'_>,
+    removed_refs: &BTreeSet<ObjectRef>,
+    write_string: &mut F,
+    direct_stream_writer: &mut dyn DynamicDirectStreamWriter,
+) -> Result<()>
+where
+    F: FnMut(&mut Vec<u8>, &[u8]) -> Result<()>,
+{
+    unparse_object_walk_with_dynamic_ref_map_and_string_writer(
+        handle,
+        out,
+        map,
+        removed_refs,
+        write_string,
+        direct_stream_writer,
+    )
+}
+
+#[allow(clippy::too_many_arguments)] // root identity, ADBE pair, dynamic map, and stream policy are separate qpdf dimensions
+pub(crate) fn write_root_object_with_dynamic_ref_map_and_string_writer_and_direct_stream_writer<F>(
+    source: &ObjectHandle,
+    out: &mut Vec<u8>,
+    map: &mut DynamicObjectRefMap<'_>,
+    removed_refs: &BTreeSet<ObjectRef>,
+    final_pdf_version: &str,
+    final_extension_level: i64,
+    apply_adbe_reconciliation: bool,
+    write_string: &mut F,
+    direct_stream_writer: &mut dyn DynamicDirectStreamWriter,
+) -> Result<()>
+where
+    F: FnMut(&mut Vec<u8>, &[u8]) -> Result<()>,
+{
+    let root = root_output_copy_with_adbe(
+        source,
+        final_pdf_version,
+        final_extension_level,
+        apply_adbe_reconciliation,
+    )?; // cov:ignore: root output-copy validation is covered by the root serializer test; LLVM attributes this multiline continuation here.
+    write_object_with_dynamic_ref_map_and_string_writer_and_direct_stream_writer(
+        &root,
+        out,
+        map,
+        removed_refs,
+        write_string,
+        direct_stream_writer,
+    )
+}
 
 fn write_child_with_dynamic_ref_map(
     handle: &ObjectHandle,
@@ -2315,6 +2563,23 @@ fn write_child_with_dynamic_ref_map(
         let mapped = map(handle)?;
         out.extend_from_slice(mapped.to_string().as_bytes());
         return Ok(());
+    }
+    handle.try_dereference()?;
+    if handle.as_stream_dict().is_some() {
+        let mut write_string = |out: &mut Vec<u8>, value: &[u8]| {
+            crate::pdf_syntax::write_string_value(out, value);
+            Ok(())
+        };
+        let mut direct_stream_writer = DefaultDynamicDirectStreamWriter {
+            newline_before_endstream: None,
+        };
+        return direct_stream_writer.write_direct_stream(
+            handle,
+            out,
+            map,
+            removed_refs,
+            &mut write_string,
+        );
     }
     unparse_object_walk_with_dynamic_ref_map(handle, out, map, removed_refs)
 }
@@ -2434,6 +2699,237 @@ fn unparse_stream_dict_entries_with_dynamic_ref_map(
         out.extend_from_slice(b" /Length ");
         write_child_with_dynamic_ref_map(length, out, map, removed_refs)?; // cov:ignore: LLVM attributes this length-call terminator to callback cleanup.
     } // cov:ignore: LLVM attributes this length-call terminator to callback cleanup.
+    if options.add_flate_filter {
+        out.extend_from_slice(b" /Filter /FlateDecode");
+    }
+    out.extend_from_slice(b" >>");
+    Ok(())
+}
+
+fn write_child_with_dynamic_ref_map_and_string_writer<F>(
+    handle: &ObjectHandle,
+    out: &mut Vec<u8>,
+    map: &mut DynamicObjectRefMap<'_>,
+    removed_refs: &BTreeSet<ObjectRef>,
+    write_string: &mut F,
+    direct_stream_writer: &mut dyn DynamicDirectStreamWriter,
+) -> Result<()>
+where
+    F: FnMut(&mut Vec<u8>, &[u8]) -> Result<()>,
+{
+    if handle
+        .qpdf_obj_gen()
+        .is_some_and(|object_gen| object_gen.get_obj() == 0)
+    {
+        out.extend_from_slice(b"null");
+        return Ok(());
+    }
+    if let Some(object_ref) = handle.object_ref() {
+        if object_ref.number == 0 || removed_refs.contains(&object_ref) {
+            out.extend_from_slice(b"null");
+            return Ok(());
+        }
+        out.extend_from_slice(map(handle)?.to_string().as_bytes());
+        return Ok(());
+    }
+    handle.try_dereference()?;
+    if handle.as_stream_dict().is_some() {
+        return direct_stream_writer.write_direct_stream(
+            handle,
+            out,
+            map,
+            removed_refs,
+            write_string,
+        );
+    }
+    unparse_object_walk_with_dynamic_ref_map_and_string_writer(
+        handle,
+        out,
+        map,
+        removed_refs,
+        write_string,
+        direct_stream_writer,
+    )
+}
+
+fn unparse_object_walk_with_dynamic_ref_map_and_string_writer<F>(
+    handle: &ObjectHandle,
+    out: &mut Vec<u8>,
+    map: &mut DynamicObjectRefMap<'_>,
+    removed_refs: &BTreeSet<ObjectRef>,
+    write_string: &mut F,
+    direct_stream_writer: &mut dyn DynamicDirectStreamWriter,
+) -> Result<()>
+where
+    F: FnMut(&mut Vec<u8>, &[u8]) -> Result<()>,
+{
+    stacker::maybe_grow(UNPARSE_STACK_RED_ZONE, UNPARSE_STACK_GROWTH_SIZE, || {
+        if handle.is_reserved() {
+            return Err(reserved_unparse_error());
+        }
+        handle.try_dereference()?;
+        let container = handle.with_value(|value| match value {
+            Some(value) => {
+                if let Some(container) = snapshot_unparse_container(value) {
+                    Ok(Some(container))
+                } else {
+                    unparse_object_value_with_dynamic_ref_map_and_string_writer(
+                        value,
+                        out,
+                        write_string,
+                    )
+                    .map(|()| None)
+                }
+            }
+            None => {
+                // cov:ignore-start: after try_dereference a live non-reserved handle cannot expose None
+                out.extend_from_slice(b"null");
+                Ok(None)
+                // cov:ignore-end
+            }
+        })?;
+        match container {
+            Some(UnparseContainer::Array(children)) => {
+                out.push(b'[');
+                for child in children {
+                    out.push(b' ');
+                    write_child_with_dynamic_ref_map_and_string_writer(
+                        &child,
+                        out,
+                        map,
+                        removed_refs,
+                        write_string,
+                        direct_stream_writer,
+                    )?; // cov:ignore: LLVM attributes the covered dynamic array-child call terminator to callback cleanup.
+                }
+                out.extend_from_slice(b" ]");
+            }
+            Some(UnparseContainer::Dictionary(entries)) => {
+                unparse_dict_entries_with_dynamic_ref_map_and_string_writer(
+                    &entries,
+                    out,
+                    map,
+                    removed_refs,
+                    write_string,
+                    direct_stream_writer,
+                )?; // cov:ignore: LLVM attributes the covered dynamic dictionary-child call terminator to callback cleanup.
+            }
+            Some(UnparseContainer::Stream(stream_dict)) => {
+                unparse_object_walk_with_dynamic_ref_map_and_string_writer(
+                    &stream_dict,
+                    out,
+                    map,
+                    removed_refs,
+                    write_string,
+                    direct_stream_writer,
+                )?; // cov:ignore: LLVM attributes the covered dynamic stream-child call terminator to callback cleanup.
+            }
+            None => {}
+        }
+        Ok(())
+    })
+}
+
+fn unparse_object_value_with_dynamic_ref_map_and_string_writer<F>(
+    value: &ObjectValue,
+    out: &mut Vec<u8>,
+    write_string: &mut F,
+) -> Result<()>
+where
+    F: FnMut(&mut Vec<u8>, &[u8]) -> Result<()>,
+{
+    match value {
+        ObjectValue::String(bytes) => write_string(out, bytes),
+        _ => unparse_object_value(value, out),
+    }
+}
+
+fn unparse_dict_entries_with_dynamic_ref_map_and_string_writer<F>(
+    entries: &[(Vec<u8>, ObjectHandle)],
+    out: &mut Vec<u8>,
+    map: &mut DynamicObjectRefMap<'_>,
+    removed_refs: &BTreeSet<ObjectRef>,
+    write_string: &mut F,
+    direct_stream_writer: &mut dyn DynamicDirectStreamWriter,
+) -> Result<()>
+where
+    F: FnMut(&mut Vec<u8>, &[u8]) -> Result<()>,
+{
+    out.extend_from_slice(b"<<");
+    for (key, value) in visible_dict_entries(entries)? {
+        if is_removed_reference(value, removed_refs) {
+            continue;
+        }
+        out.push(b' ');
+        write_dictionary_key(out, key);
+        out.push(b' ');
+        let force_hex_string =
+            key.as_slice() == b"/Contents" && dict_is_sig_with_byte_range(entries)?;
+        if !try_write_sig_contents_hex_string(value, force_hex_string, out)? {
+            write_child_with_dynamic_ref_map_and_string_writer(
+                value,
+                out,
+                map,
+                removed_refs,
+                write_string,
+                direct_stream_writer,
+            )?; // cov:ignore: LLVM attributes the covered dynamic dictionary call terminator to callback cleanup.
+        }
+    }
+    out.extend_from_slice(b" >>");
+    Ok(())
+}
+
+fn unparse_stream_dict_entries_with_dynamic_ref_map_and_string_writer<F>(
+    entries: &[(Vec<u8>, ObjectHandle)],
+    options: StreamDictionaryOptions,
+    out: &mut Vec<u8>,
+    map: &mut DynamicObjectRefMap<'_>,
+    removed_refs: &BTreeSet<ObjectRef>,
+    write_string: &mut F,
+    direct_stream_writer: &mut dyn DynamicDirectStreamWriter,
+) -> Result<()>
+where
+    F: FnMut(&mut Vec<u8>, &[u8]) -> Result<()>,
+{
+    let entries = prepare_stream_dict_entries(entries, options)?;
+    out.extend_from_slice(b"<<");
+    let mut length_value: Option<&ObjectHandle> = None;
+    for (key, value) in visible_dict_entries(&entries)? {
+        if is_removed_reference(value, removed_refs) {
+            continue;
+        }
+        if key.as_slice() == b"/Length" {
+            length_value = Some(value);
+            continue;
+        }
+        out.push(b' ');
+        write_dictionary_key(out, key);
+        out.push(b' ');
+        let force_hex_string =
+            key.as_slice() == b"/Contents" && dict_is_sig_with_byte_range(&entries)?;
+        if !try_write_sig_contents_hex_string(value, force_hex_string, out)? {
+            write_child_with_dynamic_ref_map_and_string_writer(
+                value,
+                out,
+                map,
+                removed_refs,
+                write_string,
+                direct_stream_writer,
+            )?; // cov:ignore: LLVM attributes the covered dynamic stream-dictionary child call terminator to callback cleanup.
+        } // cov:ignore: the dynamic stream-dictionary child serializer has already handled the covered success path above.
+    }
+    if let Some(length) = length_value {
+        out.extend_from_slice(b" /Length ");
+        write_child_with_dynamic_ref_map_and_string_writer(
+            length,
+            out,
+            map,
+            removed_refs,
+            write_string,
+            direct_stream_writer,
+        )?; // cov:ignore: LLVM attributes the covered dynamic stream-length call terminator to callback cleanup.
+    } // cov:ignore: the dynamic stream-length serializer has already handled the covered success path above.
     if options.add_flate_filter {
         out.extend_from_slice(b" /Filter /FlateDecode");
     }
@@ -3751,6 +4247,7 @@ fn unparse_trailer_entries_with_ref_map_and_kind(
     map: &dyn Fn(ObjectRef) -> Result<ObjectRef>,
     removed_refs: &BTreeSet<ObjectRef>,
     suppress_null_values: bool,
+    direct_root: Option<&[u8]>,
     out: &mut Vec<u8>,
 ) -> Result<()> {
     let (size, prev, second_half) = match kind {
@@ -3826,7 +4323,9 @@ fn unparse_trailer_entries_with_ref_map_and_kind(
         write_dictionary_key(out, key);
         out.push(b' ');
         if key.as_slice() == b"/Root" && value.object_ref().is_none() {
-            if qdf {
+            if let Some(direct_root) = direct_root {
+                out.extend_from_slice(direct_root);
+            } else if qdf {
                 write_child_qdf_with_ref_map(value, 2, out, map, removed_refs)?;
             } else {
                 write_child_with_ref_map(value, out, map, removed_refs)?;
@@ -4250,11 +4749,36 @@ mod tests {
         assert!(dictionary_text.contains("/Mapped"));
         assert!(!dictionary_text.contains("/Removed"));
 
+        let direct_stream = ObjectHandle::stream(
+            ObjectHandle::dictionary(vec![
+                (b"/Length".to_vec(), ObjectHandle::integer(999)),
+                (b"/Label".to_vec(), ObjectHandle::string(b"direct".to_vec())),
+                (b"/Child".to_vec(), child.clone()),
+            ]),
+            Rc::new(b"direct-body".to_vec()),
+        );
+        let nested_direct_stream =
+            ObjectHandle::dictionary(vec![(b"/DirectStream".to_vec(), direct_stream)]);
+        let mut nested_direct_output = Vec::new();
+        let mut nested_direct_map = |handle: &ObjectHandle| {
+            Ok(handle
+                .object_ref()
+                .expect("nested direct stream child is indirect"))
+        };
+        nested_direct_stream.write_object_with_dynamic_ref_map(
+            &mut nested_direct_output,
+            &mut nested_direct_map,
+            &BTreeSet::new(),
+        )?; // cov:ignore: the nested direct-stream serializer is covered; LLVM attributes this multiline test continuation here.
+        let nested_direct_text = String::from_utf8_lossy(&nested_direct_output);
+        assert!(nested_direct_text.contains("/Length 11"));
+        assert!(nested_direct_text.contains("stream\ndirect-body\nendstream"));
+
         let stream_length = pdf.make_indirect_object_handle(ObjectHandle::integer(4))?;
         let stream_child = pdf.make_indirect_object_handle(ObjectHandle::integer(8))?;
         let stream = ObjectHandle::stream(
             ObjectHandle::dictionary(vec![
-                (b"/Length".to_vec(), stream_length),
+                (b"/Length".to_vec(), stream_length.clone()),
                 (b"/Child".to_vec(), stream_child),
             ]),
             Rc::new(b"body".to_vec()),
@@ -4297,6 +4821,159 @@ mod tests {
             )?; // cov:ignore: LLVM attributes this stream-body call terminator to callback cleanup.
         assert!(String::from_utf8_lossy(&stream_output).contains("/Length"));
         assert!(String::from_utf8_lossy(&stream_output).contains("/Filter /FlateDecode"));
+        Ok(())
+    }
+
+    #[test]
+    fn dynamic_ref_map_with_string_writer_preserves_qpdf_child_boundaries() -> Result<()> {
+        let mut pdf = Pdf::empty()?;
+        let child = pdf.make_indirect_object_handle(ObjectHandle::integer(42))?;
+        let removed_child = pdf.make_indirect_object_handle(ObjectHandle::integer(9))?;
+        let zero_ref = ObjectHandle::new_indirect_unresolved(ObjectRef::new(0, 0), -1);
+        let stream_length = pdf.make_indirect_object_handle(ObjectHandle::integer(4))?;
+        let stream_child = pdf.make_indirect_object_handle(ObjectHandle::integer(8))?;
+        let stream = ObjectHandle::stream(
+            ObjectHandle::dictionary(vec![
+                (b"/Length".to_vec(), stream_length.clone()),
+                (b"/Child".to_vec(), stream_child.clone()),
+                (b"/Removed".to_vec(), removed_child.clone()),
+            ]),
+            Rc::new(b"body".to_vec()),
+        );
+        let value = ObjectHandle::dictionary(vec![
+            (
+                b"/Array".to_vec(),
+                ObjectHandle::array(vec![child.clone(), removed_child.clone(), zero_ref]),
+            ),
+            (
+                b"/Nested".to_vec(),
+                ObjectHandle::dictionary(vec![(
+                    b"/Text".to_vec(),
+                    ObjectHandle::string(b"dynamic".to_vec()),
+                )]),
+            ),
+            (b"/Removed".to_vec(), removed_child.clone()),
+            (b"/Stream".to_vec(), stream),
+            (
+                b"/Text".to_vec(),
+                ObjectHandle::string(b"top-level".to_vec()),
+            ),
+        ]);
+        let removed = [removed_child.object_ref().unwrap()].into_iter().collect();
+        let mut mapped = Vec::new();
+        let mut map = |handle: &ObjectHandle| {
+            let object_ref = handle.object_ref().expect("dynamic child is indirect");
+            mapped.push(object_ref);
+            Ok(object_ref)
+        };
+        let mut write_string = |out: &mut Vec<u8>, bytes: &[u8]| {
+            crate::pdf_syntax::write_string_value(out, bytes);
+            Ok(())
+        };
+        let mut output = Vec::new();
+        value.write_object_with_dynamic_ref_map_and_string_writer(
+            &mut output,
+            &mut map,
+            &removed,
+            &mut write_string,
+        )?; // cov:ignore: LLVM attributes the covered dynamic string-writer call terminator to test cleanup.
+        let text = String::from_utf8_lossy(&output);
+        assert!(text.contains("/Text (top-level)"));
+        assert!(text.contains("/Nested << /Text (dynamic) >>"));
+        assert!(text.contains("/Stream << /Child"));
+        assert!(!text.contains("/Removed"));
+        assert!(mapped.contains(&child.object_ref().unwrap()));
+        assert!(mapped.contains(&stream_child.object_ref().unwrap()));
+
+        let mut stream_output = Vec::new();
+        let mut stream_map = |handle: &ObjectHandle| {
+            Ok(handle
+                .object_ref()
+                .expect("stream dictionary child is indirect"))
+        };
+        let stream = pdf.new_stream_with_data(Rc::new(b"body".to_vec()))?;
+        stream
+            .as_stream_dict()
+            .unwrap()
+            .replace_key(b"/Length", stream_length)?;
+        stream
+            .as_stream_dict()
+            .unwrap()
+            .replace_key(b"/Child", child)?;
+        stream
+            .as_stream_dict()
+            .unwrap()
+            .replace_key(b"/Removed", removed_child)?;
+        stream
+            .as_stream_dict()
+            .unwrap()
+            .write_stream_body_with_dynamic_ref_map_and_string_writer(
+                &mut stream_output,
+                StreamDictionaryOptions::new(false, false),
+                &mut stream_map,
+                &removed,
+                &mut write_string,
+            )?; // cov:ignore: LLVM attributes the covered dynamic stream-dictionary call terminator to test cleanup.
+        assert!(String::from_utf8_lossy(&stream_output).contains("/Length"));
+        assert!(!String::from_utf8_lossy(&stream_output).contains("/Removed"));
+
+        let top_level_stream = ObjectHandle::stream(
+            ObjectHandle::dictionary(vec![
+                (b"/Length".to_vec(), ObjectHandle::integer(4)),
+                (b"/Child".to_vec(), stream_child.clone()),
+                (
+                    b"/Label".to_vec(),
+                    ObjectHandle::string(b"top-level-stream".to_vec()),
+                ),
+            ]),
+            Rc::new(b"body".to_vec()),
+        );
+        let mut top_level_stream_output = Vec::new();
+        let mut top_level_stream_map = |handle: &ObjectHandle| {
+            Ok(handle
+                .object_ref()
+                .expect("top-level stream child is indirect"))
+        };
+        top_level_stream.write_object_with_dynamic_ref_map_and_string_writer(
+            &mut top_level_stream_output,
+            &mut top_level_stream_map,
+            &BTreeSet::new(),
+            &mut write_string,
+        )?; // cov:ignore: the top-level stream walk and child callback are covered; LLVM attributes this multiline test continuation here.
+        let top_level_stream_text = String::from_utf8_lossy(&top_level_stream_output);
+        assert!(top_level_stream_text.contains("/Label (top-level-stream)"));
+
+        let root = pdf.root_handle()?;
+        let mut root_output = Vec::new();
+        let mut root_map = |handle: &ObjectHandle| {
+            Ok(handle.object_ref().expect("root dynamic child is indirect"))
+        };
+        let mut root_direct_stream_writer = super::DefaultDynamicDirectStreamWriter {
+            newline_before_endstream: None,
+        };
+        super::write_root_object_with_dynamic_ref_map_and_string_writer_and_direct_stream_writer(
+            &root,
+            &mut root_output,
+            &mut root_map,
+            &BTreeSet::new(),
+            "1.4",
+            0,
+            false,
+            &mut write_string,
+            &mut root_direct_stream_writer,
+        )?; // cov:ignore: the root output-copy serializer is covered; LLVM attributes this multiline test continuation here.
+        assert!(String::from_utf8_lossy(&root_output).contains("/Type /Catalog"));
+
+        let reserved = ObjectHandle::new_reserved_direct();
+        let error = reserved
+            .write_object_with_dynamic_ref_map_and_string_writer(
+                &mut Vec::new(),
+                &mut |_| Ok(ObjectRef::new(1, 0)), // cov:ignore: the reserved-object guard returns before invoking this defensive callback.
+                &BTreeSet::new(),
+                &mut write_string,
+            )
+            .expect_err("reserved dynamic string object must be rejected");
+        assert!(error.to_string().contains("reserved object"));
         Ok(())
     }
 }

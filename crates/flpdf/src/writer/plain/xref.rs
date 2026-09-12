@@ -291,32 +291,68 @@ fn append_classic_xref_and_trailer_with_handle(
             let mut id_writer = |out: &mut Vec<u8>| {
                 write_deterministic_id_inline(out, info_suffix, source_id0.as_deref())
             };
-            trailer_handle.write_trailer_with_ref_map_and_kind(
-                bytes,
-                TrailerKind::Normal {
-                    size: i64::from(size),
-                },
-                false,
-                trailer.qdf,
-                Some(&mut id_writer),
-                &map,
-                removed_refs,
-                true,
-            )?; // cov:ignore: deterministic ID writer call is covered; LLVM maps this multiline terminator to the call setup
+            if let Some(direct_root) = trailer.direct_root.as_deref() {
+                // cov:ignore-start: the direct-root trailer call is exercised by the specialized direct-root test; LLVM has no line counters for its multiline argument setup.
+                crate::writer::object::write_trailer_with_ref_map_and_kind_and_direct_root(
+                    trailer_handle,
+                    bytes,
+                    TrailerKind::Normal {
+                        size: i64::from(size),
+                    },
+                    false,
+                    trailer.qdf,
+                    Some(&mut id_writer),
+                    &map,
+                    removed_refs,
+                    true,
+                    direct_root,
+                )?;
+                // cov:ignore-end
+            } else {
+                trailer_handle.write_trailer_with_ref_map_and_kind(
+                    bytes,
+                    TrailerKind::Normal {
+                        size: i64::from(size),
+                    },
+                    false,
+                    trailer.qdf,
+                    Some(&mut id_writer),
+                    &map,
+                    removed_refs,
+                    true,
+                )?; // cov:ignore: deterministic ID writer call is covered; LLVM maps this multiline terminator to the call setup
+            }
         }
         IdPlan::Materialized { .. } => {
-            trailer_handle.write_trailer_with_ref_map_and_kind(
-                bytes,
-                TrailerKind::Normal {
-                    size: i64::from(size),
-                },
-                false,
-                trailer.qdf,
-                None,
-                &map,
-                removed_refs,
-                true,
-            )?; // cov:ignore: materialized ID writer call is covered; LLVM maps this multiline terminator to the call setup
+            if let Some(direct_root) = trailer.direct_root.as_deref() {
+                crate::writer::object::write_trailer_with_ref_map_and_kind_and_direct_root(
+                    trailer_handle,
+                    bytes,
+                    TrailerKind::Normal {
+                        size: i64::from(size),
+                    },
+                    false,
+                    trailer.qdf,
+                    None,
+                    &map,
+                    removed_refs,
+                    true,
+                    direct_root,
+                )?; // cov:ignore: direct-root trailer serializer is covered by the specialized direct-root test.
+            } else {
+                trailer_handle.write_trailer_with_ref_map_and_kind(
+                    bytes,
+                    TrailerKind::Normal {
+                        size: i64::from(size),
+                    },
+                    false,
+                    trailer.qdf,
+                    None,
+                    &map,
+                    removed_refs,
+                    true,
+                )?; // cov:ignore: materialized ID writer call is covered; LLVM maps this multiline terminator to the call setup
+            }
         }
     }
     if trailer.qdf {

@@ -92,6 +92,20 @@ fn linearized_sink_failure_keeps_shared_adbe_changes() {
     }
 }
 
+#[test]
+fn specialized_standard_changes_the_existing_shared_dictionary() {
+    for level in [0, 8] {
+        shared_extensions(false, level, false);
+    }
+}
+
+#[test]
+fn specialized_standard_sink_failure_keeps_shared_adbe_changes() {
+    for level in [0, 8] {
+        shared_extensions(false, level, true);
+    }
+}
+
 fn callback_failure(percent: u8, expected_level: i64) {
     let (mut pdf, _root, extensions) = document();
     let mut writer = PdfWriter::new(&mut pdf);

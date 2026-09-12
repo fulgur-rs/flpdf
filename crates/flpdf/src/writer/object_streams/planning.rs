@@ -161,6 +161,24 @@ pub(crate) fn plan_object_streams_with_reachability<R: std::io::Read + std::io::
     config: &PlannerConfig,
     reachable: Option<&BTreeSet<ObjectRef>>,
 ) -> crate::Result<PackingPlan> {
+    plan_object_streams_with_reachability_and_source_membership(pdf, config, reachable, None, None)
+}
+
+/// Variant of [`plan_object_streams_with_reachability`] that consumes the
+/// source ObjStm membership captured during qpdf writer setup. qpdf records
+/// that map before its later recovery/object-count walk
+/// (`QPDFWriter.cc:2114-2140,2189-2195`); specialized live standard output
+/// therefore passes the shared setup snapshot through this boundary instead
+/// of silently re-reading a possibly changed xref view.
+pub(crate) fn plan_object_streams_with_reachability_and_source_membership<
+    R: std::io::Read + std::io::Seek,
+>(
+    pdf: &mut crate::Pdf<R>,
+    config: &PlannerConfig,
+    reachable: Option<&BTreeSet<ObjectRef>>,
+    source_membership_snapshot: Option<&BTreeMap<u32, u32>>,
+    generated_snapshot: Option<&super::CompressiblePlan>,
+) -> crate::Result<PackingPlan> {
     if config.mode == ObjectStreamMode::Disable {
         return Ok(PackingPlan::default());
     }
@@ -170,10 +188,18 @@ pub(crate) fn plan_object_streams_with_reachability<R: std::io::Read + std::io::
             unreachable!() // cov:ignore: the early Disable return makes this arm unreachable
         }
         ObjectStreamMode::Preserve => {
-            let source_plan = plan_qpdf_preserve_object_streams_with_unreferenced(
-                pdf,
-                config.preserve_unreferenced_objects,
-            )?; // cov:ignore: LLVM attributes this covered multiline planner terminator to the call setup
+            let source_plan = if let Some(snapshot) = source_membership_snapshot {
+                plan_qpdf_preserve_object_streams_with_source_membership(
+                    pdf,
+                    config.preserve_unreferenced_objects,
+                    Some(snapshot),
+                )? // cov:ignore: LLVM attributes the covered setup-snapshot planner continuation to the match arm.
+            } else {
+                plan_qpdf_preserve_object_streams_with_unreferenced(
+                    pdf,
+                    config.preserve_unreferenced_objects,
+                )? // cov:ignore: LLVM attributes the covered live-membership fallback continuation to the match arm.
+            }; // cov:ignore: LLVM attributes this covered multiline planner terminator to the call setup
             let mut batches = Vec::with_capacity(source_plan.groups.len());
             let mut source_containers = Vec::with_capacity(source_plan.groups.len());
             for group in source_plan.groups {
@@ -207,9 +233,18 @@ pub(crate) fn plan_object_streams_with_reachability<R: std::io::Read + std::io::
             // the walk up front inverted it, because the walk can drop stale
             // generations from the document xref that the membership map is
             // about to be read from.
-            let length_exclusions =
-                compressible_objgens_qpdf_plan(pdf)?.indirect_objstm_length_refs;
-            plan_generate(pdf, config, &length_exclusions, reachable)
+            let length_exclusions = if let Some(snapshot) = generated_snapshot {
+                snapshot.indirect_objstm_length_refs.clone()
+            } else {
+                compressible_objgens_qpdf_plan(pdf)?.indirect_objstm_length_refs
+            };
+            plan_generate(
+                pdf,
+                config,
+                &length_exclusions,
+                reachable,
+                generated_snapshot,
+            )
         }
     }
 }
@@ -375,12 +410,17 @@ fn plan_generate<R: std::io::Read + std::io::Seek>(
     config: &PlannerConfig,
     length_exclusions: &BTreeSet<ObjectRef>,
     reachable: Option<&BTreeSet<ObjectRef>>,
+    generated_snapshot: Option<&super::CompressiblePlan>,
 ) -> crate::Result<PackingPlan> {
     // QPDFWriter::generateObjectStreams obtains its candidates from
     // QPDF::getCompressibleObjGens (QPDFWriter.cc:1970-2004), not from the
     // object-number-sorted xref universe. That walk is the semantic source of
     // both member order and the set of reachable candidates.
-    let mut compressible = compressible_objgens_qpdf_plan(pdf)?;
+    let mut compressible = if let Some(snapshot) = generated_snapshot {
+        snapshot.clone()
+    } else {
+        compressible_objgens_qpdf_plan(pdf)?
+    };
     compressible.eligible.retain(|member| {
         !length_exclusions.contains(member)
             && reachable.is_none_or(|reachable| reachable.contains(member))
