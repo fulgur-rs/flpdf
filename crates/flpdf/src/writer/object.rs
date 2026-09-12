@@ -1785,6 +1785,25 @@ pub(crate) fn prepared_stream_dictionary_for_discovery(
     )?)) // cov:ignore: the validated discovery dictionary is constructed from the same stream serializer input
 }
 
+/// Return the dictionary values that the stream serializer will expose to
+/// `unparseChild` after qpdf's shallow-copy preparation. The returned handles
+/// intentionally retain their original identity: in particular, removing
+/// `/Crypt` from an indirect filter/decode-parameter array mutates the shared
+/// array holder and returns that holder here instead of manufacturing a direct
+/// replacement array.
+pub(crate) fn prepared_stream_dictionary_children(
+    dictionary: &ObjectHandle,
+    options: StreamDictionaryOptions,
+) -> Result<Vec<ObjectHandle>> {
+    let entries = stream_dictionary_entries_for_emission(dictionary)?;
+    let prepared = prepare_stream_dict_entries(&entries, options)?;
+    Ok(visible_dict_entries(&prepared)?
+        .into_iter()
+        .filter(|(key, _)| key.as_slice() != b"/Length")
+        .map(|(_, value)| value.clone())
+        .collect())
+}
+
 /// Remove the first `/Crypt` filter and its paired decode parameters from a
 /// copied dictionary. This mutates only the copy, matching qpdf's shallow
 /// `unparseObject` preparation.

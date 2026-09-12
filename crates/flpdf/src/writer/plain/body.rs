@@ -557,92 +557,6 @@ fn map_queued_output(
     })
 }
 
-fn surviving_stream_dictionary_for_children(
-    dictionary: &ObjectHandle,
-    options: StreamDictionaryOptions,
-) -> crate::Result<ObjectHandle> {
-    let entries = dictionary.try_as_dictionary()?.unwrap_or_default();
-    let filter = entries
-        .iter()
-        .find(|(key, _)| key.as_slice() == b"/Filter")
-        .map(|(_, value)| value.clone());
-    let crypt_index = if options.remove_filter_parameters {
-        None
-    } else if let Some(filter) = filter.as_ref() {
-        if filter.try_is_name_and_equals(b"Crypt")? {
-            Some(usize::MAX)
-        } else if let Some(filters) = filter.try_as_array()? {
-            let mut index = None;
-            for (filter_index, filter) in filters.iter().enumerate() {
-                if filter.try_is_name_and_equals(b"Crypt")? {
-                    index = Some(filter_index);
-                    break;
-                }
-            }
-            index
-        } else {
-            None
-        }
-    } else {
-        None
-    };
-    let mut surviving = Vec::with_capacity(entries.len());
-    for (key, mut value) in entries {
-        if key.as_slice() == b"/Length" {
-            continue;
-        }
-        if options.remove_filter_parameters
-            && matches!(key.as_slice(), b"/Filter" | b"/DecodeParms")
-        {
-            continue;
-        }
-        if key.as_slice() == b"/Filter" && crypt_index == Some(usize::MAX) {
-            continue;
-        }
-        if key.as_slice() == b"/DecodeParms" {
-            if crypt_index == Some(usize::MAX) {
-                continue;
-            }
-            if value
-                .try_as_array()?
-                .is_some_and(|parameters| parameters.is_empty())
-            {
-                continue;
-            }
-            if let Some(index) = crypt_index.filter(|index| *index != usize::MAX) {
-                if let Some(parameters) = value.try_as_array()? {
-                    value = ObjectHandle::array(
-                        parameters
-                            .into_iter()
-                            .enumerate()
-                            .filter_map(|(parameter_index, parameter)| {
-                                (parameter_index != index).then_some(parameter)
-                            })
-                            .collect(),
-                    );
-                }
-            }
-        }
-        if key.as_slice() == b"/Filter" {
-            if let Some(index) = crypt_index.filter(|index| *index != usize::MAX) {
-                if let Some(filters) = value.try_as_array()? {
-                    value = ObjectHandle::array(
-                        filters
-                            .into_iter()
-                            .enumerate()
-                            .filter_map(|(filter_index, filter)| {
-                                (filter_index != index).then_some(filter)
-                            })
-                            .collect(),
-                    );
-                }
-            }
-        }
-        surviving.push((key, value));
-    }
-    Ok(ObjectHandle::dictionary(surviving))
-}
-
 fn planned_object_stream_groups(
     plan: &PlainWritePlan,
 ) -> crate::Result<Vec<crate::writer::object_streams::ObjectStreamGroup>> {
@@ -879,9 +793,11 @@ impl<'a, R: Read + Seek + 'static> crate::writer::write_object::WriteObject
                         && self.contents_sequences.contains_key(&source)
                 }),
             )?;
-            let child_dictionary =
-                surviving_stream_dictionary_for_children(&dict, dictionary_options)?;
-            self.enqueue_surviving_children(&child_dictionary)?;
+            let surviving_children = crate::writer::object::prepared_stream_dictionary_children(
+                &dict,
+                dictionary_options,
+            )?;
+            self.enqueue_surviving_handles(surviving_children)?;
             if self.options.qdf {
                 let output_number = self.output_number(source.unwrap_or(ObjectRef::new(0, 0)))?;
                 let holder = self
@@ -1045,13 +961,24 @@ impl<'a, R: Read + Seek + 'static> LiveObjectEmitter<'a, R> {
         Ok(())
     }
 
+    fn enqueue_surviving_handles(
+        &mut self,
+        children: impl IntoIterator<Item = ObjectHandle>,
+    ) -> crate::Result<()> {
+        for value in children {
+            let mut indirect_children = Vec::new();
+            collect_live_seed_handles(&value, &mut indirect_children, 0)?;
+            for child in indirect_children {
+                self.queue.borrow_mut().enqueue_handle(self.pdf, child)?;
+            }
+        }
+        Ok(())
+    }
+
     fn enqueue_surviving_children(&mut self, value: &ObjectHandle) -> crate::Result<()> {
         let mut children = Vec::new();
         collect_live_child_handles(value, &mut children, 0)?;
-        for child in children {
-            self.queue.borrow_mut().enqueue_handle(self.pdf, child)?;
-        }
-        Ok(())
+        self.enqueue_surviving_handles(children)
     }
 
     fn discover_qdf_child(&mut self, child: &ObjectHandle, depth: usize) -> crate::Result<()> {
@@ -3459,7 +3386,7 @@ mod object_emitter_tests {
     }
 
     #[test]
-    fn surviving_stream_children_drop_decode_parms_with_scalar_crypt() {
+    fn prepared_stream_children_drop_decode_parms_with_scalar_crypt() {
         let dictionary = ObjectHandle::dictionary(vec![
             (b"/Filter".to_vec(), ObjectHandle::name(b"Crypt".to_vec())),
             (
@@ -3472,26 +3399,13 @@ mod object_emitter_tests {
             (b"/Keep".to_vec(), ObjectHandle::integer(42)),
         ]);
 
-        let surviving = surviving_stream_dictionary_for_children(
+        let surviving = crate::writer::object::prepared_stream_dictionary_children(
             &dictionary,
             StreamDictionaryOptions::preserve(),
         )
-        .expect("prepare surviving stream dictionary");
-        assert!(surviving
-            .try_get_key(b"/Filter")
-            .expect("read Filter")
-            .is_null());
-        assert!(surviving
-            .try_get_key(b"/DecodeParms")
-            .expect("read DecodeParms")
-            .is_null());
-        assert_eq!(
-            surviving
-                .try_get_key(b"/Keep")
-                .expect("read surviving key")
-                .unparse(),
-            b"42"
-        );
+        .expect("prepare surviving stream children");
+        assert_eq!(surviving.len(), 1);
+        assert_eq!(surviving[0].unparse(), b"42");
     }
 
     #[test]
