@@ -266,6 +266,7 @@ struct TerminalSinkWriter {
     events: ProviderEvents,
     accepted: Rc<RefCell<Vec<u8>>>,
     rejected: bool,
+    matched_a_payload_prefix: usize,
 }
 
 impl Write for TerminalSinkWriter {
@@ -277,23 +278,22 @@ impl Write for TerminalSinkWriter {
             ));
         }
 
-        if let Some(payload_start) = data
-            .windows(PROVIDER_A_PAYLOAD.len())
-            .position(|window| window == PROVIDER_A_PAYLOAD)
-        {
-            self.accepted
-                .borrow_mut()
-                .extend_from_slice(&data[..payload_start]);
-            if payload_start > 0 {
-                self.events.record("sink-prefix");
+        for (index, &byte) in data.iter().enumerate() {
+            if self.advance_a_payload_match(byte) {
+                let payload_start = (index + 1).saturating_sub(PROVIDER_A_PAYLOAD.len());
+                self.accepted
+                    .borrow_mut()
+                    .extend_from_slice(&data[..payload_start]);
                 self.rejected = true;
-                return Ok(payload_start);
+                if payload_start > 0 {
+                    self.events.record("sink-prefix");
+                    return Ok(payload_start);
+                }
+                self.events.record("sink-error:A");
+                return Err(io::Error::other(
+                    "terminal output sink rejected provider A payload",
+                ));
             }
-            self.rejected = true;
-            self.events.record("sink-error:A");
-            return Err(io::Error::other(
-                "terminal output sink rejected provider A payload",
-            ));
         }
 
         self.accepted.borrow_mut().extend_from_slice(data);
@@ -303,6 +303,60 @@ impl Write for TerminalSinkWriter {
 
     fn flush(&mut self) -> io::Result<()> {
         Ok(())
+    }
+}
+
+impl TerminalSinkWriter {
+    fn advance_a_payload_match(&mut self, byte: u8) -> bool {
+        let marker = PROVIDER_A_PAYLOAD;
+        let mut matched = self.matched_a_payload_prefix;
+        while matched > 0 && marker[matched] != byte {
+            matched = Self::marker_fallback(matched);
+        }
+        if marker[matched] == byte {
+            matched += 1;
+        } else {
+            matched = 0;
+        }
+        self.matched_a_payload_prefix = matched;
+        matched == marker.len()
+    }
+
+    fn marker_fallback(prefix_len: usize) -> usize {
+        let marker = PROVIDER_A_PAYLOAD;
+        (0..prefix_len)
+            .rev()
+            .find(|&suffix_len| marker[..suffix_len] == marker[prefix_len - suffix_len..prefix_len])
+            .unwrap_or(0)
+    }
+
+    fn new(events: ProviderEvents, accepted: Rc<RefCell<Vec<u8>>>) -> Self {
+        Self {
+            events,
+            accepted,
+            rejected: false,
+            matched_a_payload_prefix: 0,
+        }
+    }
+}
+
+#[test]
+fn terminal_sink_writer_rejects_a_payload_split_at_any_write_boundary() {
+    for split in 1..PROVIDER_A_PAYLOAD.len() {
+        let events = ProviderEvents(Rc::new(RefCell::new(Vec::new())));
+        let accepted = Rc::new(RefCell::new(Vec::new()));
+        let mut sink = TerminalSinkWriter::new(events, Rc::clone(&accepted));
+        sink.write(b"%PDF-1.7\n")
+            .expect("header bytes must be accepted");
+        sink.write(&PROVIDER_A_PAYLOAD[..split])
+            .expect("an incomplete A marker is not yet an error");
+        let error = sink
+            .write(&PROVIDER_A_PAYLOAD[split..])
+            .expect_err("the rolling matcher must reject a split A marker");
+        assert!(error
+            .to_string()
+            .contains("terminal output sink rejected provider A payload"));
+        assert!(accepted.borrow().starts_with(b"%PDF-"));
     }
 }
 
@@ -384,11 +438,10 @@ fn terminal_output_sink_failure_never_requests_the_second_provider() {
 
     let mut writer = configure_disable_writer(&mut pdf);
     writer
-        .set_output_writer(TerminalSinkWriter {
-            events: events.clone(),
-            accepted: Rc::clone(&accepted),
-            rejected: false,
-        })
+        .set_output_writer(TerminalSinkWriter::new(
+            events.clone(),
+            Rc::clone(&accepted),
+        ))
         .expect("install terminal output sink");
     let error = writer
         .write()
