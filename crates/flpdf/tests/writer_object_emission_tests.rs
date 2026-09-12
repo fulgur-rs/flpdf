@@ -161,6 +161,42 @@ fn qdf_and_normalize_progress_id_replacement_is_read_at_trailer_time() {
 }
 
 #[test]
+fn qdf_and_normalize_progress_id_deletion_does_not_restore_the_setup_id() {
+    for qdf in [true, false] {
+        let mut pdf = Pdf::open(Cursor::new(
+            include_bytes!("../../../tests/fixtures/compat/nonid-id0.pdf").to_vec(),
+        ))
+        .unwrap();
+        let trailer = pdf.trailer();
+        let mut writer = PdfWriter::new(&mut pdf);
+        writer.set_object_stream_mode(ObjectStreamMode::Disable);
+        writer.set_qdf_mode(qdf);
+        writer.set_content_normalization(!qdf);
+        writer.set_static_id(true);
+        writer.set_output_memory().unwrap();
+        writer.register_progress_reporter(Box::new(move |percent| {
+            if percent == 0 {
+                trailer.remove_key(b"/ID");
+            }
+            Ok(())
+        }));
+        writer
+            .write()
+            .unwrap_or_else(|error| panic!("qdf={qdf} ID deletion write failed: {error}"));
+        let output = writer.get_buffer().unwrap();
+        assert!(
+            output
+                .windows(b"<31415926535897932384626433832795>".len())
+                .any(|window| window == b"<31415926535897932384626433832795>"),
+            "qdf={qdf} must generate a new static ID after callback deletion"
+        );
+        assert!(!output
+            .windows(b"<aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa>".len())
+            .any(|window| window == b"<aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa>"));
+    }
+}
+
+#[test]
 fn qdf_and_normalize_progress_trailer_child_gets_a_late_number() {
     for qdf in [true, false] {
         let mut pdf = Pdf::open(Cursor::new(
@@ -194,6 +230,59 @@ fn qdf_and_normalize_progress_trailer_child_gets_a_late_number() {
             output.windows(b"/Z ".len()).any(|window| window == b"/Z "),
             "qdf={qdf} must serialize the callback's trailer child"
         );
+    }
+}
+
+#[test]
+fn qdf_late_trailer_streams_reserve_holders_and_ignore_xref_streams() {
+    for xref in [false, true] {
+        let mut pdf = Pdf::open(Cursor::new(
+            include_bytes!("../../../tests/fixtures/compat/one-page-no-ext.pdf").to_vec(),
+        ))
+        .unwrap();
+        let trailer = pdf.trailer();
+        let late_stream = pdf.new_stream_with_data(Rc::new(b"late".to_vec())).unwrap();
+        if xref {
+            late_stream
+                .as_stream_dict()
+                .unwrap()
+                .replace_key(b"/Type", ObjectHandle::name(b"XRef".to_vec()))
+                .unwrap();
+        }
+        let late_integer = pdf
+            .make_indirect_object_handle(ObjectHandle::integer(42))
+            .unwrap();
+        let mut writer = PdfWriter::new(&mut pdf);
+        writer.set_object_stream_mode(ObjectStreamMode::Disable);
+        writer.set_qdf_mode(true);
+        writer.set_static_id(true);
+        writer.set_output_memory().unwrap();
+        writer.register_progress_reporter(Box::new(move |percent| {
+            if percent == 0 {
+                trailer.replace_key(b"/Y", late_stream.clone())?;
+                trailer.replace_key(b"/Z", late_integer.clone())?;
+            }
+            Ok(())
+        }));
+        writer
+            .write()
+            .unwrap_or_else(|error| panic!("xref={xref} late stream write failed: {error}"));
+        let output = writer.get_buffer().unwrap();
+        if xref {
+            assert!(output
+                .windows(b"/Y 0 0 R".len())
+                .any(|window| window == b"/Y 0 0 R"));
+            assert!(output
+                .windows(b"/Z 3 0 R".len())
+                .any(|window| window == b"/Z 3 0 R"));
+        } else {
+            assert!(output
+                .windows(b"/Y 3 0 R".len())
+                .any(|window| window == b"/Y 3 0 R"));
+            assert!(output
+                .windows(b"/Z 5 0 R".len())
+                .any(|window| window == b"/Z 5 0 R"));
+        }
     }
 }
 

@@ -81,6 +81,7 @@ pub(crate) fn write_pclm<R: Read + Seek + 'static, W: Write>(
         &mut trailer_map,
         initial_late_trailer_number,
         true,
+        false,
     )?; // cov:ignore: shared late-trailer success continuation is covered by the PCLm live tests
 
     let direct_root_output = direct_root
@@ -128,7 +129,13 @@ pub(crate) fn write_pclm<R: Read + Seek + 'static, W: Write>(
         })
         .transpose()?;
 
-    super::plain::extend_late_trailer_map(pdf, &mut trailer_map, next_late_trailer_number, false)?;
+    super::plain::extend_late_trailer_map(
+        pdf,
+        &mut trailer_map,
+        next_late_trailer_number,
+        false,
+        false,
+    )?;
 
     let trailer_handle = build_writer_trailer_handle(
         pdf,

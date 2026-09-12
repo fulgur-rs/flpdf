@@ -138,6 +138,7 @@ pub(crate) fn extend_late_trailer_map<R: Read + Seek>(
     map: &mut HashMap<ObjectRef, ObjectRef>,
     mut next: u32,
     before_root: bool,
+    qdf: bool,
 ) -> crate::Result<u32> {
     let entries = pdf.trailer().try_as_dictionary()?.unwrap_or_default();
     for (key, value) in entries {
@@ -175,17 +176,35 @@ pub(crate) fn extend_late_trailer_map<R: Read + Seek>(
             true,
             &mut references,
         )?; // cov:ignore: late trailer reference collection success is covered by the callback trailer test
-        for reference in references {
-            if reference.number == 0 || map.contains_key(&reference) {
-                continue;
-            }
-            map.insert(reference, ObjectRef::new(next, 0));
-            next = next.checked_add(1).ok_or_else(|| {
-                // cov:ignore-start: the qpdf object-number domain cannot be exhausted by a supported in-memory PDF
-                crate::Error::Unsupported("plain live writer: late trailer number overflow".into())
-                // cov:ignore-end
-            })?; // cov:ignore: checked late-trailer allocation cannot overflow a supported output
+        next = assign_late_references(pdf, map, references, next, qdf)?;
+    }
+    Ok(next)
+}
+
+fn assign_late_references<R: Read + Seek>(
+    pdf: &mut Pdf<R>,
+    map: &mut HashMap<ObjectRef, ObjectRef>,
+    references: Vec<ObjectRef>,
+    mut next: u32,
+    qdf: bool,
+) -> crate::Result<u32> {
+    for reference in references {
+        if reference.number == 0 || map.contains_key(&reference) {
+            continue;
         }
+        let handle = pdf.get_object_handle(reference);
+        if qdf && handle.try_is_stream_of_type(b"XRef", b"")? {
+            map.insert(reference, ObjectRef::new(0, 0));
+            continue;
+        }
+        let is_stream = qdf && handle.try_is_stream_of_type(b"", b"")?;
+        map.insert(reference, ObjectRef::new(next, 0));
+        let increment = if is_stream { 2 } else { 1 };
+        next = next.checked_add(increment).ok_or_else(|| {
+            // cov:ignore-start: the qpdf object-number domain cannot be exhausted by a supported in-memory PDF
+            crate::Error::Unsupported("plain live writer: late trailer number overflow".into())
+            // cov:ignore-end
+        })?; // cov:ignore: checked late-trailer allocation cannot overflow a supported output
     }
     Ok(next)
 }
@@ -226,6 +245,10 @@ fn write_plain_live<R: Read + Seek, W: Write>(
     } else {
         None
     };
+    let initial_id_present = pdf
+        .trailer()
+        .try_as_dictionary()?
+        .is_some_and(|entries| entries.iter().any(|(key, _)| key.as_slice() == b"/ID"));
     // qpdf's removeObject erases the only document cache slot and turns
     // retained aliases into direct null; it does not leave a tombstone for a
     // later writer pass. Keep the writer's operation-local set empty here.
@@ -302,8 +325,11 @@ fn write_plain_live<R: Read + Seek, W: Write>(
         .and_then(|id| id.as_array())
         .and_then(|values| values.first().and_then(ObjectHandle::as_string));
     let reuse_setup_id = generated_id.is_some()
-        && (live_id.try_is_null()?
-            || (source_id0.is_some() && setup_id0.as_deref() == source_id0.as_deref()));
+        && if live_id.try_is_null()? {
+            !initial_id_present
+        } else {
+            source_id0.is_some() && setup_id0.as_deref() == source_id0.as_deref()
+        };
     let root = source_root.and_then(|source| old_to_new.get(&source).copied());
     if source_root.is_some() && root.is_none() {
         // cov:ignore-start: root is seeded before emission; this guards only a violated queue invariant.
@@ -369,8 +395,13 @@ fn write_plain_live<R: Read + Seek, W: Write>(
         crate::Error::Unsupported("plain live writer: late trailer number overflows u32".into())
         // cov:ignore-end
     })?; // cov:ignore: checked body-derived late-trailer allocation cannot overflow a supported output
-    let mut next_late_trailer_number =
-        extend_late_trailer_map(pdf, &mut trailer_map, initial_late_trailer_number, true)?;
+    let mut next_late_trailer_number = extend_late_trailer_map(
+        pdf,
+        &mut trailer_map,
+        initial_late_trailer_number,
+        true,
+        options.qdf,
+    )?;
     // Object streams require a cross-reference stream: a classic table has no
     // type-2 row shape (ISO 32000-1 7.5.7). qpdf decides this from the same
     // setup-time membership that set the version floor above
@@ -406,20 +437,13 @@ fn write_plain_live<R: Read + Seek, W: Write>(
             true,
             &mut references,
         )?; // cov:ignore: direct-root reference collection success is covered by the late direct-root test
-        for reference in references {
-            if reference.number == 0 || trailer_map.contains_key(&reference) {
-                continue;
-            }
-            trailer_map.insert(reference, ObjectRef::new(next_late_trailer_number, 0));
-            next_late_trailer_number =
-                next_late_trailer_number.checked_add(1).ok_or_else(|| {
-                    // cov:ignore-start: the qpdf object-number domain cannot be exhausted by a supported in-memory PDF
-                    crate::Error::Unsupported(
-                        "plain live writer: late trailer number overflow".into(),
-                    )
-                    // cov:ignore-end
-                })?; // cov:ignore: checked late direct-root allocation cannot overflow a supported output
-        }
+        next_late_trailer_number = assign_late_references(
+            pdf,
+            &mut trailer_map,
+            references,
+            next_late_trailer_number,
+            options.qdf,
+        )?;
         let map_ref = |object_ref: ObjectRef| {
             trailer_map.get(&object_ref).copied().ok_or_else(|| {
                 // cov:ignore-start: every direct-root reference is collected before this static map is constructed
@@ -448,7 +472,13 @@ fn write_plain_live<R: Read + Seek, W: Write>(
     } else {
         None
     };
-    extend_late_trailer_map(pdf, &mut trailer_map, next_late_trailer_number, false)?;
+    extend_late_trailer_map(
+        pdf,
+        &mut trailer_map,
+        next_late_trailer_number,
+        false,
+        options.qdf,
+    )?;
     let trailer = TrailerPlan {
         form,
         canonical_entries: plan::canonical_trailer_entries(pdf, &trailer_map, &removed_refs)?,
