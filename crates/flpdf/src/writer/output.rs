@@ -226,7 +226,7 @@ mod tests {
     use crate::{Error, Result};
     use md5::Digest as _;
     use std::collections::VecDeque;
-    use std::io::{self, ErrorKind};
+    use std::io::{self, ErrorKind, Write as _};
 
     #[derive(Default)]
     struct VecOutputTarget {
@@ -302,6 +302,35 @@ mod tests {
     }
 
     #[test]
+    fn rejects_a_target_that_overreports_accepted_bytes() {
+        struct OverreportingTarget;
+
+        impl OutputTarget for OverreportingTarget {
+            fn write_chunk(&mut self, bytes: &[u8]) -> io::Result<usize> {
+                Ok(bytes.len() + 1)
+            }
+
+            fn finish_segment(&mut self) -> Result<()> {
+                Ok(())
+            }
+
+            fn finish_document(&mut self) -> Result<()> {
+                Ok(())
+            }
+        }
+
+        let mut target = OverreportingTarget;
+        let mut sink = OutputSink::new(&mut target);
+        let error = sink
+            .write_bytes(b"abc")
+            .expect_err("an impossible target byte count must be rejected");
+
+        assert!(matches!(error, Error::Io(error) if error.kind() == ErrorKind::InvalidData));
+        assert_eq!(sink.position(), 0);
+        assert_eq!(sink.last_byte(), None);
+    }
+
+    #[test]
     fn rejects_position_overflow_without_updating_last_byte() {
         let mut target = VecOutputTarget::default();
         let mut sink = OutputSink::new(&mut target);
@@ -341,6 +370,22 @@ mod tests {
     }
 
     #[test]
+    fn bounded_buffer_target_keeps_segment_and_document_finish_non_terminal() {
+        let mut bytes = b"prefix".to_vec();
+        let mut sink = OutputSink::new(&mut bytes);
+
+        sink.finish_segment()
+            .expect("buffer segment finish is a no-op");
+        sink.finish_document()
+            .expect("buffer document finish is a no-op");
+        sink.write_bytes(b"-suffix")
+            .expect("buffer remains writable after local finishes");
+
+        drop(sink);
+        assert_eq!(bytes, b"prefix-suffix");
+    }
+
+    #[test]
     fn digest_stops_after_identifier_opening_marker() {
         let mut target = VecOutputTarget::default();
         let mut sink = OutputSink::new(&mut target);
@@ -357,6 +402,53 @@ mod tests {
         let mut expected_bytes = [0; 16];
         expected_bytes.copy_from_slice(&expected);
         assert_eq!(digest, expected_bytes);
+    }
+
+    #[test]
+    fn suspending_a_disabled_digest_does_not_enable_it() {
+        let mut target = VecOutputTarget::default();
+        let mut sink = OutputSink::new(&mut target);
+
+        sink.suspend_digest();
+        let error = sink
+            .take_digest()
+            .expect_err("a disabled digest must stay disabled");
+
+        assert!(matches!(error, Error::Internal(message) if message.contains("disabled MD5")));
+    }
+
+    #[test]
+    fn write_trait_uses_the_same_short_write_and_flush_contract() {
+        let mut target = VecOutputTarget {
+            writes: VecDeque::from([Ok(1), Ok(2)]),
+            ..Default::default()
+        };
+        let mut sink = OutputSink::new(&mut target);
+
+        sink.write_all(b"abc")
+            .expect("Write::write_all completes through short writes");
+        sink.flush()
+            .expect("the counted sink has no local flush state");
+
+        assert_eq!(sink.position(), 3);
+        assert_eq!(sink.last_byte(), Some(b'c'));
+        drop(sink);
+        assert_eq!(target.bytes, b"abc");
+    }
+
+    #[test]
+    fn write_trait_reports_position_overflow_as_io_error() {
+        let mut target = VecOutputTarget::default();
+        let mut sink = OutputSink::new(&mut target);
+        sink.position = u64::MAX;
+
+        let error = sink
+            .write_all(b"a")
+            .expect_err("Write maps counted-position overflow to io::Error");
+
+        assert_eq!(error.kind(), ErrorKind::Other);
+        assert!(error.to_string().contains("position exceeds u64"));
+        assert_eq!(sink.position(), u64::MAX);
     }
 
     #[test]

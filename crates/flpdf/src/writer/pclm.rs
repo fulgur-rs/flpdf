@@ -615,6 +615,81 @@ mod tests {
     }
 
     #[test]
+    fn builder_deduplicates_references_and_ignores_object_zero() {
+        let mut pdf = one_page_fixture_pdf();
+        let source = pdf.root_ref().expect("fixture Catalog");
+        let mut builder = Builder {
+            pdf: &mut pdf,
+            items: Vec::new(),
+            old_to_new: HashMap::new(),
+            next_output: 1,
+        };
+
+        assert_eq!(builder.enqueue_reference(ObjectRef::new(0, 0)), None);
+        let first = builder
+            .enqueue_reference(source)
+            .expect("first reference gets a number");
+        assert_eq!(builder.enqueue_reference(source), Some(first));
+        assert_eq!(builder.items.len(), 1);
+    }
+
+    #[test]
+    fn emission_queue_reports_invalid_dynamic_children_and_number_overflow() {
+        let overflowing_plan = Plan {
+            items: vec![Item::Synthetic {
+                output: ObjectRef::new(u32::MAX, 0),
+            }],
+            root: None,
+            direct_root: None,
+        };
+        let error = EmissionQueue::from_plan(&overflowing_plan)
+            .err()
+            .expect("a plan ending at u32::MAX cannot reserve a next object");
+        assert!(
+            matches!(error, Error::Unsupported(message) if message.contains("object number overflows"))
+        );
+
+        let mut local_pdf = one_page_fixture_pdf();
+        let mut foreign_pdf = one_page_fixture_pdf();
+        let mut queue = EmissionQueue::from_plan(&Plan {
+            items: Vec::new(),
+            root: None,
+            direct_root: None,
+        })
+        .expect("empty emission queue");
+        let error = queue
+            .enqueue_handle(
+                &local_pdf,
+                foreign_pdf.root_handle().expect("foreign Catalog"),
+            )
+            .expect_err("foreign dynamic children must be rejected");
+        assert!(matches!(error, Error::Internal(message) if message.contains("different QPDF")));
+
+        let direct_child = local_pdf
+            .root_handle()
+            .expect("local Catalog")
+            .try_get_key(b"/Type")
+            .expect("direct Catalog type");
+        let error = queue
+            .enqueue_handle(&local_pdf, direct_child)
+            .expect_err("dynamic queue entries must be indirect");
+        assert!(
+            matches!(error, Error::Internal(message) if message.contains("no indirect identity"))
+        );
+
+        let child = local_pdf
+            .make_indirect_from_object_handle(ObjectHandle::integer(7))
+            .expect("local dynamic child");
+        queue.next_output = u32::MAX;
+        let error = queue
+            .enqueue_handle(&local_pdf, child)
+            .expect_err("dynamic object numbering must not wrap");
+        assert!(
+            matches!(error, Error::Unsupported(message) if message.contains("object number overflows"))
+        );
+    }
+
+    #[test]
     fn pclm_reaches_the_final_sink_before_requesting_the_next_provider() {
         let events = Events::new();
         let bytes = Rc::new(RefCell::new(Vec::new()));

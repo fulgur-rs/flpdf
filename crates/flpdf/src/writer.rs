@@ -4345,6 +4345,112 @@ mod final_handle_writer_tests {
         assert_eq!(finishes.get(), 1, "the segment was finished once");
     }
 
+    fn stream_encryption_context(
+        cipher: WriteCipher,
+        file_key: Vec<u8>,
+        static_aes_iv: bool,
+    ) -> EncryptionContext {
+        EncryptionContext {
+            encrypt_dict: ObjectHandle::dictionary(Vec::new()),
+            file_key,
+            cipher,
+            encryption_v: match cipher {
+                WriteCipher::FileKeyAes256 => 5,
+                WriteCipher::PerObject(ObjectKeyAlg::Aes) => 4,
+                WriteCipher::PerObject(ObjectKeyAlg::Rc4) => 2,
+            },
+            encryption_r: match cipher {
+                WriteCipher::FileKeyAes256 => 6,
+                WriteCipher::PerObject(ObjectKeyAlg::Aes) => 4,
+                WriteCipher::PerObject(ObjectKeyAlg::Rc4) => 3,
+            },
+            encrypt_ref: ObjectRef::new(99, 0),
+            id0: b"id".to_vec(),
+            static_aes_iv,
+            encrypt_metadata: true,
+            metadata_ref: None,
+        }
+    }
+
+    #[test]
+    fn stream_pipeline_covers_plain_empty_key_rc4_and_aes_stage_routes() {
+        let data = b"stream payload";
+
+        let mut plain = Vec::new();
+        output::with_buffer_sink(&mut plain, |out| {
+            pipe_writer_stream_payload(
+                out,
+                data,
+                ObjectRef::new(3, 0),
+                &stream_encryption_context(
+                    WriteCipher::PerObject(ObjectKeyAlg::Rc4),
+                    Vec::new(),
+                    true,
+                ),
+                false,
+                None,
+            )
+        })
+        .expect("disabled stream encryption leaves payload plain");
+        assert_eq!(plain, data);
+
+        let mut rc4 = Vec::new();
+        output::with_buffer_sink(&mut rc4, |out| {
+            pipe_writer_stream_payload(
+                out,
+                data,
+                ObjectRef::new(3, 0),
+                &stream_encryption_context(
+                    WriteCipher::PerObject(ObjectKeyAlg::Rc4),
+                    vec![1; 5],
+                    true,
+                ),
+                true,
+                None,
+            )
+        })
+        .expect("RC4 stage writes ciphertext");
+        assert_eq!(rc4.len(), data.len());
+        assert_ne!(rc4, data);
+
+        for explicit_iv in [Some([2; 16]), None] {
+            let mut aes = Vec::new();
+            output::with_buffer_sink(&mut aes, |out| {
+                pipe_writer_stream_payload(
+                    out,
+                    data,
+                    ObjectRef::new(3, 0),
+                    &stream_encryption_context(
+                        WriteCipher::PerObject(ObjectKeyAlg::Aes),
+                        vec![1; 16],
+                        explicit_iv.is_some(),
+                    ),
+                    true,
+                    explicit_iv,
+                )
+            })
+            .expect("AES stage writes IV-prefixed ciphertext");
+            assert!(aes.len() >= 32);
+            assert_ne!(&aes[..data.len()], data);
+        }
+    }
+
+    #[test]
+    fn output_sink_pipeline_reports_its_stage_identity() {
+        let mut bytes = Vec::new();
+        let mut out = OutputSink::new(&mut bytes);
+        let mut failure = None;
+        let mut pipeline = OutputSinkPipeline {
+            out: &mut out,
+            failure: &mut failure,
+        };
+
+        assert_eq!(pipeline.identifier(), "writer stream output");
+        pipeline
+            .finish()
+            .expect("sink tail has no nested finish work");
+    }
+
     fn shared_trailer_contract_fixture(
     ) -> (Pdf<Cursor<Vec<u8>>>, ObjectHandle, ObjectRef, ObjectRef) {
         let pdf = Pdf::empty().expect("empty PDF for trailer fixture");
@@ -5162,6 +5268,78 @@ mod final_handle_writer_tests {
         assert!(output
             .windows(b"q /image Do Q\n".len())
             .any(|window| { window == b"q /image Do Q\n" }));
+    }
+
+    #[test]
+    fn pclm_deterministic_route_emits_source_and_synthetic_streams_with_requested_framing() {
+        let mut pdf = Pdf::open(Cursor::new(
+            include_bytes!("../../../tests/fixtures/compat/direct-root-one-page.pdf").to_vec(),
+        ))
+        .expect("fixture must open");
+        let page = crate::pages::page_refs(&mut pdf).expect("page refs")[0];
+        let page_handle = pdf.get_object_handle(page);
+        page_handle.try_is_scalar().expect("page resolves");
+        let replacement = page_handle.shallow_copy().expect("page is copyable");
+        let source_stream = pdf
+            .new_stream_with_data(Rc::new(b"source-payload".to_vec()))
+            .expect("source stream");
+        let image = pdf
+            .new_stream_with_data(Rc::new(b"image".to_vec()))
+            .expect("image stream");
+        replacement
+            .replace_key(b"/ExtraStream", source_stream)
+            .expect("attach source stream");
+        replacement
+            .replace_key(
+                b"/Resources",
+                ObjectHandle::dictionary(vec![(
+                    b"/XObject".to_vec(),
+                    ObjectHandle::dictionary(vec![(b"/Im0".to_vec(), image)]),
+                )]),
+            )
+            .expect("attach page image");
+        pdf.replace_object(page, replacement).expect("replace page");
+
+        let output = write_qpdf_to_memory(&mut pdf, |writer| {
+            writer.set_pclm(true);
+            writer.set_deterministic_id(true);
+            writer.set_extra_header_text("%coverage-header");
+            writer.set_newline_before_endstream(true);
+        })
+        .expect("PCLm deterministic route succeeds");
+
+        assert!(output.starts_with(b"%PDF-1.4\n%PCLm 1.0\n%coverage-header\n"));
+        assert!(output
+            .windows(b"source-payload\nendstream".len())
+            .any(|window| window == b"source-payload\nendstream"));
+        assert!(output
+            .windows(b"q /image Do Q\n".len())
+            .any(|window| window == b"q /image Do Q\n"));
+        assert!(output
+            .windows(b"/ID [".len())
+            .any(|window| window == b"/ID ["));
+    }
+
+    #[test]
+    fn direct_page_content_stream_marks_the_page_as_its_emission_container() {
+        let mut pdf = Pdf::open(Cursor::new(
+            include_bytes!("../../../tests/fixtures/compat/direct-root-one-page.pdf").to_vec(),
+        ))
+        .expect("minimal fixture must open");
+        let page = crate::pages::page_refs(&mut pdf).expect("page refs")[0];
+        let direct_stream = ObjectHandle::stream(
+            ObjectHandle::dictionary(vec![(b"/Length".to_vec(), ObjectHandle::integer(1))]),
+            Rc::new(b"q".to_vec()),
+        );
+        pdf.get_object_handle(page)
+            .replace_key(b"/Contents", direct_stream)
+            .expect("install direct page content stream");
+        let mut containers = BTreeSet::new();
+
+        collect_content_container_refs(&mut pdf, page, &mut containers)
+            .expect("collect direct content container");
+
+        assert_eq!(containers, [page].into_iter().collect());
     }
 
     #[test]

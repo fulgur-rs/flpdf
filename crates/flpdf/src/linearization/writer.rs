@@ -4476,4 +4476,49 @@ mod tests {
             crate::Error::Internal(message) if message == "object 91 0 belongs to a dropped PDF"
         ));
     }
+
+    #[test]
+    fn linearization_trailer_serializes_live_direct_custom_values() {
+        let pdf = Pdf::empty().expect("create trailer reference owner");
+        let indirect = pdf
+            .make_indirect_from_object_handle(ObjectHandle::integer(11))
+            .expect("create indirect custom value");
+        let indirect_ref = indirect.object_ref().unwrap();
+        let removed = pdf
+            .make_indirect_from_object_handle(ObjectHandle::integer(12))
+            .expect("create removed custom value");
+        let removed_ref = removed.object_ref().unwrap();
+        let trailer = ObjectHandle::dictionary(vec![
+            (
+                b"/Direct".to_vec(),
+                ObjectHandle::dictionary(vec![(
+                    b"/Name".to_vec(),
+                    ObjectHandle::name(b"Value".to_vec()),
+                )]),
+            ),
+            (b"/Indirect".to_vec(), indirect),
+            (b"/Removed".to_vec(), removed),
+            (b"/Null".to_vec(), ObjectHandle::null()),
+            (b"/Size".to_vec(), ObjectHandle::integer(99)),
+        ]);
+        let map = |object_ref| {
+            assert_eq!(object_ref, indirect_ref);
+            Ok(ObjectRef::new(21, 0))
+        };
+
+        let entries = canonical_linearization_trailer_entries(
+            &trailer,
+            &map,
+            &[removed_ref].into_iter().collect(),
+        )
+        .expect("serialize canonical linearization trailer entries");
+
+        assert_eq!(
+            entries,
+            vec![
+                (b"/Direct".to_vec(), b"<< /Name /Value >>".to_vec()),
+                (b"/Indirect".to_vec(), b"21 0 R".to_vec()),
+            ]
+        );
+    }
 }

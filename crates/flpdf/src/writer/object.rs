@@ -4671,4 +4671,132 @@ mod tests {
         assert!(String::from_utf8_lossy(&stream_output).contains("/Filter /FlateDecode"));
         Ok(())
     }
+
+    #[test]
+    fn array_writers_cover_compact_qdf_mapping_and_removed_reference_shapes() -> Result<()> {
+        let mut pdf = Pdf::empty()?;
+        let kept = pdf.make_indirect_object_handle(ObjectHandle::integer(1))?;
+        let removed = pdf.make_indirect_object_handle(ObjectHandle::integer(2))?;
+        let removed_refs = [removed.object_ref().unwrap()].into_iter().collect();
+        let array = ObjectHandle::array(vec![
+            ObjectHandle::integer(7),
+            kept.clone(),
+            removed.clone(),
+        ]);
+
+        let mut compact = Vec::new();
+        super::super::output::with_buffer_sink(&mut compact, |out| {
+            ObjectWriterEmission::write_object(&array, out)
+        })?;
+        assert!(String::from_utf8_lossy(&compact).contains("[ 7"));
+
+        let map = |object_ref: ObjectRef| {
+            assert_eq!(object_ref, kept.object_ref().unwrap());
+            Ok(ObjectRef::new(21, 0))
+        };
+        let mut mapped = Vec::new();
+        super::super::output::with_buffer_sink(&mut mapped, |out| {
+            ObjectWriterEmission::write_object_with_ref_map_and_removed(
+                &array,
+                out,
+                &map,
+                &removed_refs,
+            )
+        })?;
+        assert_eq!(mapped, b"[ 7 21 0 R null ]");
+
+        let mut qdf = Vec::new();
+        super::super::output::with_buffer_sink(&mut qdf, |out| {
+            array.write_object_qdf_with_ref_map_and_removed(out, 2, &map, &removed_refs)
+        })?;
+        assert_eq!(qdf, b"[\n    7\n    21 0 R\n    null\n  ]");
+
+        let mut strings = |out: &mut OutputSink<'_>, value: &[u8]| {
+            out.write_bytes(b"<string:")?;
+            out.write_bytes(value)?;
+            out.write_bytes(b">")
+        };
+        let string_array =
+            ObjectHandle::array(vec![ObjectHandle::string(b"value".to_vec()), removed]);
+        let mut qdf_strings = Vec::new();
+        super::super::output::with_buffer_sink(&mut qdf_strings, |out| {
+            string_array.write_object_qdf_with_ref_map_and_removed_with_string_writer(
+                out,
+                0,
+                &map,
+                &removed_refs,
+                &mut strings,
+            )
+        })?;
+        assert!(String::from_utf8_lossy(&qdf_strings).contains("<string:value>"));
+        assert!(String::from_utf8_lossy(&qdf_strings).contains("null"));
+        Ok(())
+    }
+
+    #[test]
+    fn qdf_string_writer_keeps_signature_contents_hex_and_formats_arrays() -> Result<()> {
+        let signature = ObjectHandle::dictionary(vec![
+            (
+                b"/ByteRange".to_vec(),
+                ObjectHandle::array(vec![ObjectHandle::integer(0), ObjectHandle::integer(1)]),
+            ),
+            (b"/Contents".to_vec(), ObjectHandle::string(vec![0, 0xff])),
+        ]);
+        let mut output = Vec::new();
+        let mut strings = |out: &mut OutputSink<'_>, value: &[u8]| {
+            crate::pdf_syntax::write_string_value(out, value)
+        };
+
+        super::super::output::with_buffer_sink(&mut output, |out| {
+            signature.write_object_qdf_with_ref_map_and_removed_with_string_writer(
+                out,
+                0,
+                &|object_ref| Ok(object_ref),
+                &BTreeSet::new(),
+                &mut strings,
+            )
+        })?;
+
+        let text = String::from_utf8_lossy(&output);
+        assert!(text.contains("/ByteRange [\n"));
+        assert!(text.contains("/Contents <00ff>"));
+        Ok(())
+    }
+
+    #[test]
+    fn qdf_trailer_with_ref_map_emits_direct_root_id_encrypt_and_custom_values() -> Result<()> {
+        let root = ObjectHandle::dictionary(vec![(
+            b"/Type".to_vec(),
+            ObjectHandle::name(b"Catalog".to_vec()),
+        )]);
+        let trailer = ObjectHandle::dictionary(vec![
+            (b"/Root".to_vec(), root),
+            (b"/Custom".to_vec(), ObjectHandle::integer(9)),
+            (
+                b"/ID".to_vec(),
+                ObjectHandle::array(vec![
+                    ObjectHandle::string(b"a".to_vec()),
+                    ObjectHandle::string(b"b".to_vec()),
+                ]),
+            ),
+            (
+                b"/Encrypt".to_vec(),
+                ObjectHandle::new_indirect_unresolved(ObjectRef::new(8, 0), -1),
+            ),
+        ]);
+        let mut output = Vec::new();
+        let map = |object_ref| Ok(object_ref);
+
+        super::super::output::with_buffer_sink(&mut output, |out| {
+            trailer.write_trailer_with_ref_map(out, false, true, None, &map, &BTreeSet::new(), true)
+        })?;
+
+        let text = String::from_utf8(output).unwrap();
+        assert!(text.starts_with("trailer <<\n"));
+        assert!(text.contains("  /Root <<\n"));
+        assert!(text.contains("  /Custom 9\n"));
+        assert!(text.contains("  /ID [<61><62>] /Encrypt 8 0 R\n"));
+        assert!(text.contains(" /Encrypt 8 0 R\n>>\n"));
+        Ok(())
+    }
 }

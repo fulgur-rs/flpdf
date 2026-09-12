@@ -403,4 +403,74 @@ mod tests {
         assert!(text.contains("/Filter /FlateDecode"));
         assert!(!text.contains("ASCIIHexDecode"));
     }
+
+    #[test]
+    fn content_container_encrypts_dictionary_strings_but_keeps_direct_stream_data_raw() {
+        let context = EncryptionContext {
+            encrypt_dict: ObjectHandle::dictionary(Vec::new()),
+            file_key: vec![1; 5],
+            cipher: WriteCipher::PerObject(ObjectKeyAlg::Rc4),
+            encryption_v: 2,
+            encryption_r: 3,
+            encrypt_ref: ObjectRef::new(99, 0),
+            id0: b"id".to_vec(),
+            static_aes_iv: true,
+            encrypt_metadata: true,
+            metadata_ref: None,
+        };
+        let direct_stream = ObjectHandle::stream(
+            ObjectHandle::dictionary(vec![(b"/Length".to_vec(), ObjectHandle::integer(8))]),
+            Rc::new(b"raw-data".to_vec()),
+        );
+        let container = ObjectHandle::dictionary(vec![
+            (
+                b"/Label".to_vec(),
+                ObjectHandle::string(b"secret-label".to_vec()),
+            ),
+            (b"/Contents".to_vec(), direct_stream),
+        ]);
+        let mut emitter = EncryptedStringEmitter::from_context(&context);
+        let mut output = Vec::new();
+
+        crate::writer::output::with_buffer_sink(&mut output, |out| {
+            emitter.write_handle_content_container_with_ref_map(
+                out,
+                ObjectRef::new(3, 0),
+                None,
+                &container,
+                &WriterOptions::default(),
+                &|object_ref| Ok(object_ref),
+                &BTreeSet::new(),
+            )
+        })
+        .expect("encrypted content-container emission");
+
+        assert!(output
+            .windows(b"stream\nraw-data\nendstream".len())
+            .any(|window| window == b"stream\nraw-data\nendstream"));
+        assert!(!output
+            .windows(b"secret-label".len())
+            .any(|window| window == b"secret-label"));
+    }
+
+    #[test]
+    fn string_writer_without_an_object_data_key_uses_plain_pdf_string_syntax() {
+        let state = WriterEncryptionState::new(false, Vec::new(), false, 0, 0);
+        let mut iv_generator = |_iv: &mut [u8; 16]| Ok(());
+        let mut output = Vec::new();
+
+        crate::writer::output::with_buffer_sink(&mut output, |out| {
+            write_encrypted_or_plain_string(
+                &state,
+                WriteCipher::PerObject(ObjectKeyAlg::Rc4),
+                true,
+                &mut iv_generator,
+                out,
+                b"plain text",
+            )
+        })
+        .expect("plain string emission without a current data key");
+
+        assert_eq!(output, b"(plain text)");
+    }
 }

@@ -1080,6 +1080,26 @@ pub(crate) mod xref_stream {
     mod tests {
         use super::*;
 
+        fn base_dict<'a>() -> XrefStreamDict<'a> {
+            XrefStreamDict {
+                filtered: false,
+                widths: [1, 1, 0],
+                index: None,
+                info: None,
+                root: None,
+                root_value: None,
+                live_root_value: None,
+                size: 2,
+                prev: None,
+                canonical_entries: None,
+                live_trailer: None,
+                live_map: None,
+                live_removed_refs: None,
+                id: None,
+                encrypt: None,
+            }
+        }
+
         #[test]
         fn build_entries_with_self_registers_a_zero_generation_type1_row() {
             let mut offsets = BTreeMap::new();
@@ -1188,6 +1208,195 @@ pub(crate) mod xref_stream {
             .expect("explicit max offset");
             assert_eq!(layout.widths, [1, 3, 0]);
             assert_eq!(max_offset_for_range(&offsets, 0, 2), 65_536);
+        }
+
+        #[test]
+        fn live_xref_trailer_requires_both_reference_policy_inputs() {
+            let trailer = ObjectHandle::dictionary(Vec::new());
+            let mut output = Vec::new();
+            let mut dict = XrefStreamDict {
+                live_trailer: Some(&trailer),
+                ..base_dict()
+            };
+            let error = crate::writer::output::with_buffer_sink(&mut output, |out| {
+                write_object(out, ObjectRef::new(2, 0), &dict, b"xref")
+            })
+            .expect_err("live trailer without a map must fail");
+            assert!(
+                matches!(error, crate::Error::Internal(message) if message.contains("reference map"))
+            );
+
+            let map = |object_ref| Ok(object_ref);
+            dict.live_map = Some(&map);
+            output.clear();
+            let error = crate::writer::output::with_buffer_sink(&mut output, |out| {
+                write_object(out, ObjectRef::new(2, 0), &dict, b"xref")
+            })
+            .expect_err("live trailer without removed-reference policy must fail");
+            assert!(
+                matches!(error, crate::Error::Internal(message) if message.contains("removed-reference set"))
+            );
+        }
+
+        #[test]
+        fn xref_dictionary_covers_canonical_and_live_direct_root_layouts() {
+            let canonical = XrefStreamDict {
+                index: Some((3, 2)),
+                info: Some(ObjectRef::new(7, 0)),
+                root_value: Some(b"<< /Type /Catalog >>"),
+                prev: Some(41),
+                canonical_entries: Some(&[(b"/Custom".to_vec(), b"/Value".to_vec())]),
+                encrypt: Some(ObjectRef::new(8, 0)),
+                ..base_dict()
+            };
+            let mut output = Vec::new();
+            crate::writer::output::with_buffer_sink(&mut output, |out| {
+                write_object(out, ObjectRef::new(2, 0), &canonical, b"xref")
+            })
+            .expect("canonical xref dictionary");
+            let text = String::from_utf8(output).unwrap();
+            assert!(text.contains("/Index [ 3 2 ]"));
+            assert!(text.contains("/Root << /Type /Catalog >>"));
+            assert!(text.contains("/Size 2 /Prev 41"));
+            assert!(text.contains("/Encrypt 8 0 R"));
+
+            let direct_root = ObjectHandle::dictionary(vec![(
+                b"/Type".to_vec(),
+                ObjectHandle::name(b"Catalog".to_vec()),
+            )]);
+            let trailer = ObjectHandle::dictionary(vec![
+                (b"/Custom".to_vec(), ObjectHandle::integer(9)),
+                (b"/Null".to_vec(), ObjectHandle::null()),
+            ]);
+            let map = |object_ref| Ok(object_ref);
+            let removed = BTreeSet::new();
+            for qdf in [false, true] {
+                let dict = XrefStreamDict {
+                    live_root_value: Some(&direct_root),
+                    live_trailer: Some(&trailer),
+                    live_map: Some(&map),
+                    live_removed_refs: Some(&removed),
+                    prev: Some(17),
+                    ..base_dict()
+                };
+                let layout = XrefStreamLayout {
+                    widths: dict.widths,
+                    payload: b"xref".to_vec(),
+                };
+                let mut output = Vec::new();
+                crate::writer::output::with_buffer_sink(&mut output, |out| {
+                    write_xref_stream(out, ObjectRef::new(2, 0), &dict, &layout, qdf, None)
+                })
+                .expect("live direct-root xref dictionary");
+                let text = String::from_utf8(output).unwrap();
+                assert!(text.contains("/Root"));
+                assert!(text.contains("/Type /Catalog"));
+                assert!(text.contains("/Custom 9"));
+                assert!(text.contains("/Size 2 /Prev 17"));
+                assert!(!text.contains("/Null"));
+            }
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::encryption::standard::ObjectKeyAlg;
+    use crate::writer::{EncryptionContext, WriteCipher};
+
+    fn body() -> object_streams::ObjStmBody {
+        object_streams::ObjStmBody {
+            bytes: b"1 0 value".to_vec(),
+            first_offset: 4,
+            n_members: 1,
+        }
+    }
+
+    fn encryption_context() -> EncryptionContext {
+        EncryptionContext {
+            encrypt_dict: crate::ObjectHandle::dictionary(Vec::new()),
+            file_key: vec![1; 5],
+            cipher: WriteCipher::PerObject(ObjectKeyAlg::Rc4),
+            encryption_v: 2,
+            encryption_r: 3,
+            encrypt_ref: crate::ObjectRef::new(99, 0),
+            id0: b"id".to_vec(),
+            static_aes_iv: true,
+            encrypt_metadata: true,
+            metadata_ref: None,
+        }
+    }
+
+    #[test]
+    fn object_stream_extends_is_emitted_in_plain_encrypted_compact_and_qdf_routes() {
+        let extends = Some(crate::ObjectRef::new(7, 2));
+        let mut outputs = Vec::new();
+
+        let mut compact = Vec::new();
+        crate::writer::output::with_buffer_sink(&mut compact, |out| {
+            write_objstm_stream_with_extends(
+                out,
+                body(),
+                CompressStreams::No,
+                NewlineBeforeEndstream::Never,
+                extends,
+            )
+        })
+        .expect("plain compact ObjStm");
+        outputs.push(compact);
+
+        let mut qdf = Vec::new();
+        crate::writer::output::with_buffer_sink(&mut qdf, |out| {
+            write_objstm_stream_with_extends_qdf(
+                out,
+                body(),
+                extends,
+                4,
+                NewlineBeforeEndstream::Never,
+            )
+        })
+        .expect("plain QDF ObjStm");
+        outputs.push(qdf);
+
+        let context = encryption_context();
+        let mut encrypted = Vec::new();
+        crate::writer::output::with_buffer_sink(&mut encrypted, |out| {
+            write_encrypted_objstm_stream_with_extends(
+                out,
+                body(),
+                CompressStreams::No,
+                NewlineBeforeEndstream::Never,
+                extends,
+                crate::ObjectRef::new(3, 0),
+                &context,
+            )
+        })
+        .expect("encrypted compact ObjStm");
+        outputs.push(encrypted);
+
+        let mut encrypted_qdf = Vec::new();
+        crate::writer::output::with_buffer_sink(&mut encrypted_qdf, |out| {
+            write_encrypted_objstm_stream_with_extends_qdf(
+                out,
+                body(),
+                extends,
+                4,
+                NewlineBeforeEndstream::Never,
+                crate::ObjectRef::new(3, 0),
+                &context,
+            )
+        })
+        .expect("encrypted QDF ObjStm");
+        outputs.push(encrypted_qdf);
+
+        for output in outputs {
+            assert!(output
+                .windows(b"/Extends 7 2 R".len())
+                .any(|window| window == b"/Extends 7 2 R"));
+            assert!(output
+                .windows(b"endstream".len())
+                .any(|window| window == b"endstream"));
         }
     }
 }

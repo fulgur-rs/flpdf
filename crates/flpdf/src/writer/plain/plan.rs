@@ -2066,6 +2066,23 @@ mod tests {
     }
 
     #[test]
+    fn live_preserve_setup_keeps_source_backed_object_stream_membership() {
+        let path = fixture_path("three-page-objstm.pdf");
+        let mut pdf =
+            Pdf::open(std::io::BufReader::new(std::fs::File::open(path).unwrap())).unwrap();
+        let options = write_options(ObjectStreamMode::Preserve);
+        let mut source_object_stream_data = BTreeMap::new();
+        pdf.get_object_stream_data(&mut source_object_stream_data);
+
+        let plan = build_live_object_stream_plan(&mut pdf, &options, &source_object_stream_data)
+            .expect("live Preserve membership setup");
+
+        assert!(plan.groups.iter().any(|group| {
+            matches!(group, ObjectStreamGroup::SourceBacked { members, .. } if !members.is_empty())
+        }));
+    }
+
+    #[test]
     fn repeated_generate_preserve_writes_keep_raw_generation_orphans_writer_local() {
         let mut planning_pdf =
             Pdf::open(std::io::Cursor::new(raw_generation_stream_source())).unwrap();

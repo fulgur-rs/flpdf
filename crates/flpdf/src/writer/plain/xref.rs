@@ -546,6 +546,25 @@ mod tests {
         })
     }
 
+    fn append_with_digest(
+        bytes: &mut Vec<u8>,
+        layout: &BodyLayout,
+        trailer: &TrailerPlan,
+    ) -> crate::Result<BTreeMap<ObjectRef, XrefEntry>> {
+        let trailer_handle = ObjectHandle::dictionary(Vec::new());
+        let mut sink = OutputSink::new(bytes);
+        sink.begin_digest();
+        sink.write_bytes(b"body")?;
+        append_xref_and_trailer(
+            &mut sink,
+            layout,
+            trailer,
+            &trailer_handle,
+            &HashMap::new(),
+            &BTreeSet::new(),
+        )
+    }
+
     #[allow(clippy::too_many_arguments)]
     fn write_table_bytes(
         bytes: &mut Vec<u8>,
@@ -811,6 +830,69 @@ mod tests {
             .expect("xref stream framing")
             + b"\nstream\n".len();
         assert_eq!(&bytes[stream + 3..stream + 6], &[1, 12, 0]);
+    }
+
+    #[test]
+    fn xref_stream_materialized_and_deterministic_ids_cover_qdf_and_compact_routes() {
+        let mut layout = BodyLayout::default();
+        layout.uncompressed.insert(1, (0, 12));
+
+        for qdf in [false, true] {
+            let mut materialized = trailer();
+            materialized.form = XrefForm::Stream;
+            materialized.qdf = qdf;
+            materialized.id = IdPlan::Materialized {
+                value: Some((b"permanent".to_vec(), b"changing".to_vec())),
+            };
+            let mut bytes = Vec::new();
+            append_bytes(&mut bytes, &layout, &materialized).expect("materialized xref-stream ID");
+            assert!(bytes
+                .windows(b"/ID [<7065726d616e656e74><6368616e67696e67>]".len())
+                .any(|window| { window == b"/ID [<7065726d616e656e74><6368616e67696e67>]" }));
+
+            let mut deterministic = trailer();
+            deterministic.form = XrefForm::Stream;
+            deterministic.qdf = qdf;
+            deterministic.id = IdPlan::Deterministic {
+                source_id0: Some(b"source".to_vec()),
+                info_suffix: b" info".to_vec(),
+            };
+            let mut bytes = Vec::new();
+            append_with_digest(&mut bytes, &layout, &deterministic)
+                .expect("deterministic xref-stream ID");
+            assert!(bytes
+                .windows(b"/ID [<736f75726365><".len())
+                .any(|window| { window == b"/ID [<736f75726365><" }));
+            assert!(bytes.ends_with(b"%%EOF\n"));
+        }
+    }
+
+    #[test]
+    fn xref_stream_reports_a_missing_live_trailer_reference_mapping() {
+        let pdf = crate::Pdf::empty().expect("empty PDF for trailer reference test");
+        let custom = pdf
+            .make_indirect_from_object_handle(ObjectHandle::integer(3))
+            .expect("indirect custom trailer value");
+        let trailer_handle = ObjectHandle::dictionary(vec![(b"/CustomRef".to_vec(), custom)]);
+        let mut layout = BodyLayout::default();
+        layout.uncompressed.insert(1, (0, 12));
+        let mut stream_trailer = trailer();
+        stream_trailer.form = XrefForm::Stream;
+
+        let error = append_with_handle_bytes(
+            &mut Vec::new(),
+            &layout,
+            &stream_trailer,
+            &trailer_handle,
+            &HashMap::new(),
+            &BTreeSet::new(),
+        )
+        .expect_err("missing xref-stream trailer map entry must be reported");
+
+        assert!(
+            matches!(&error, crate::Error::Unsupported(message) if message.contains("trailer /CustomRef reference") && message.contains("absent from renumber map")),
+            "unexpected xref-stream mapping error: {error:?}"
+        );
     }
 
     #[test]

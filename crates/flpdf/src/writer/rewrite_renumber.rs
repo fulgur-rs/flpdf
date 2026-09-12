@@ -1040,10 +1040,11 @@ fn enqueue(
 mod tests {
     use super::{
         collect_canonical_children, ensure_canonical_owner, walk_resurrectable_handle,
-        writer_local_raw_ref, ResurrectableWalkState,
+        writer_local_raw_ref, ObjectStreamRenumber, ResurrectableWalkState,
     };
     use crate::parser::MAX_PARSE_DEPTH;
     use crate::qpdf_obj_gen::QpdfObjGen;
+    use crate::writer::object_streams::ObjectStreamGroup;
     use crate::{Error, ObjectHandle, ObjectRef, Pdf};
     use std::collections::BTreeSet;
     use std::io::Cursor;
@@ -1104,6 +1105,44 @@ mod tests {
             Error::Internal(message)
                 if message == "QPDFObjectHandle from different QPDF found while writing.  Use QPDF::copyForeignObject to add objects from another file."
         ));
+    }
+
+    #[test]
+    fn object_stream_renumber_rejects_a_duplicate_source_container() {
+        let mut pdf = Pdf::empty().expect("create object-stream owner");
+        let source = pdf
+            .make_indirect_object_handle(ObjectHandle::null())
+            .expect("create source container")
+            .object_ref()
+            .unwrap();
+        let first = pdf
+            .make_indirect_object_handle(ObjectHandle::integer(1))
+            .expect("create first member")
+            .object_ref()
+            .unwrap();
+        let second = pdf
+            .make_indirect_object_handle(ObjectHandle::integer(2))
+            .expect("create second member")
+            .object_ref()
+            .unwrap();
+        let groups = [
+            ObjectStreamGroup::Generated {
+                source,
+                members: vec![first],
+            },
+            ObjectStreamGroup::Generated {
+                source,
+                members: vec![second],
+            },
+        ];
+
+        let error = ObjectStreamRenumber::build(&mut pdf, &groups, false, &BTreeSet::new(), false)
+            .err()
+            .expect("duplicate source containers must fail before traversal");
+
+        assert!(
+            matches!(error, Error::Unsupported(message) if message.contains("source container") && message.contains("groups 0 and 1"))
+        );
     }
 
     #[test]
