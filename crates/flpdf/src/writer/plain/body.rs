@@ -1790,9 +1790,11 @@ where
             )?; // cov:ignore: LLVM does not attribute the successful compact dictionary continuation
         }
         self.out.write_bytes(b"\nstream\n")?;
-        self.out
-            .write_bytes(stream.get_raw_stream_data()?.as_ref())?;
-        self.out.finish_segment()?;
+        let payload = stream.get_raw_stream_data()?;
+        let payload_result = self.out.write_bytes(payload.as_ref());
+        let finish_result = self.out.finish_segment();
+        payload_result?;
+        finish_result?;
         self.out.write_bytes(b"\nendstream")
     }
 }

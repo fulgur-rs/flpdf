@@ -1497,14 +1497,16 @@ pub(crate) struct WriterOptions {
     /// Mirrors `qpdf --static-id` and is intended for byte-identical testing.
     pub static_id: bool,
 
-    /// Derive the trailer `/ID[1]` (the changing identifier) from an MD5 digest
-    /// of the rewritten output body — the bytes from the file header through the
-    /// last body object, up to (but not including) the cross-reference table —
-    /// so the identifier is stable across runs for identical input and flags.
-    /// The permanent identifier `/ID[0]` is preserved from the input (ISO
-    /// 32000-1 §14.4), falling back to the digest when the input has no usable
-    /// `/ID`. Like `qpdf --deterministic-id`, this yields a content-derived,
-    /// run-stable `/ID` and preserves the permanent identifier.
+    /// Derive the trailer `/ID[1]` (the changing identifier) with qpdf's
+    /// two-seed deterministic-ID algorithm. The first MD5 is an incremental
+    /// digest of every final-output byte through the opening `/ID [` marker:
+    /// this includes a classic xref table and the xref-stream dictionary, but
+    /// excludes the identifier bytes themselves and the xref-stream payload
+    /// after that cutoff. The second MD5 hashes qpdf's hex first digest plus
+    /// ` QPDF ` and the decoded `/Info` string values, truncated at the first
+    /// NUL byte. The permanent identifier `/ID[0]` is preserved from the input
+    /// (ISO 32000-1 §14.4), falling back to the second digest when the input has
+    /// no usable `/ID`. This mirrors `qpdf --deterministic-id` byte-for-byte.
     ///
     /// The canonical rewrite honors this flag. When it is combined with
     /// [`WriterOptions::static_id`], the static ID takes precedence for the
@@ -1513,10 +1515,6 @@ pub(crate) struct WriterOptions {
     /// encryption because qpdf still enables its deterministic digest pipeline
     /// and the encryption setup generates an ID before that pipeline exists.
     ///
-    /// The digest is flpdf's own scheme (a single MD5 over the body); it is
-    /// **not** byte-identical to the value qpdf writes, which seeds a second MD5
-    /// with the body digest plus the `/Info` strings. The `/ID` is therefore
-    /// self-stable and qpdf-equivalent in behaviour, but not in exact bytes.
     pub deterministic_id: bool,
 
     /// Force every AES CBC IV to `0x00 × 16` instead of a cryptographically
@@ -3551,6 +3549,7 @@ fn run_writer_pipeline(pipeline: &mut dyn Pipeline, data: &[u8]) -> Result<()> {
 /// afterward so the configured target's exact error category is preserved.
 struct OutputSinkPipeline<'output, 'sink> {
     out: &'output mut OutputSink<'sink>,
+    failure: &'output mut Option<Error>,
 }
 
 impl Pipeline for OutputSinkPipeline<'_, '_> {
@@ -3559,9 +3558,13 @@ impl Pipeline for OutputSinkPipeline<'_, '_> {
     }
 
     fn write(&mut self, data: &[u8]) -> PipelineResult<()> {
-        self.out
-            .write_bytes(data)
-            .map_err(|error| PipelineError::runtime(error.to_string()))
+        match self.out.write_bytes(data) {
+            Ok(()) => Ok(()),
+            Err(error) => {
+                *self.failure = Some(error);
+                Err(PipelineError::runtime("writer output sink failed"))
+            }
+        }
     }
 
     fn finish(&mut self) -> PipelineResult<()> {
@@ -3585,11 +3588,15 @@ fn pipe_writer_stream_payload(
         (ctx.static_aes_iv && cipher_needs_aes_iv(ctx.cipher))
             .then(crate::pipeline::aes::static_initialization_vector)
     });
-    {
-        let mut sink = OutputSinkPipeline { out };
+    let mut sink_failure = None;
+    let pipeline_result = {
+        let mut sink = OutputSinkPipeline {
+            out,
+            failure: &mut sink_failure,
+        };
         let mut count = crate::pipeline::count::Count::new("writer stream count", &mut sink);
         if !encrypt_stream {
-            run_writer_pipeline(&mut count, data)?;
+            run_writer_pipeline(&mut count, data)
         } else {
             let mut state = encryption_state::WriterEncryptionState::new(
                 true,
@@ -3639,11 +3646,16 @@ fn pipe_writer_stream_payload(
                         }
                     }
                 }
-            })?;
+            })
         }
-    }
+    };
 
-    out.finish_segment()
+    let finish_result = out.finish_segment();
+    if let Some(error) = sink_failure {
+        return Err(error);
+    }
+    pipeline_result?;
+    finish_result
 }
 
 /// Write a stream payload through the qpdf-shaped writer pipeline, including

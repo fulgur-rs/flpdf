@@ -54,12 +54,13 @@ pub(crate) fn write_stream_payload_with_qdf(
     qdf_mode: bool,
 ) -> crate::Result<()> {
     out.write_bytes(b"\nstream\n")?;
-    out.write_bytes(data)?;
+    let payload_result = out.write_bytes(data);
     // QPDFWriter's stream-data PipelinePopper finishes the active stream
-    // segment before `endstream` is emitted. The final output position and
-    // deterministic-ID digest belong to OutputSink and deliberately survive
-    // this nested finish boundary.
-    out.finish_segment()?;
+    // segment even while unwinding from a payload write error. The final
+    // output position and deterministic-ID digest survive this boundary.
+    let finish_result = out.finish_segment();
+    payload_result?;
+    finish_result?;
     if framing_adds_newline_with_qdf(data, policy, qdf_mode) {
         out.write_bytes(b"\n")?;
     }

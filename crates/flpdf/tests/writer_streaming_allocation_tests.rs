@@ -303,6 +303,101 @@ struct EventWriter {
     bytes: Rc<RefCell<Vec<u8>>>,
 }
 
+struct ArmOnProvider {
+    name: &'static str,
+    payload: Rc<Vec<u8>>,
+    events: ProviderEvents,
+    arm: Rc<Cell<bool>>,
+}
+
+impl StreamDataProvider for ArmOnProvider {
+    fn provide_stream_data_by_id(
+        &self,
+        _object_number: u32,
+        _generation: u16,
+        pipeline: &mut dyn Pipeline,
+    ) -> flpdf::Result<()> {
+        self.events.record(format!("provider:{}", self.name));
+        self.arm.set(true);
+        pipeline.write(&self.payload).map_err(Error::from)?;
+        pipeline.finish().map_err(Error::from)
+    }
+}
+
+struct ArmableFailureWriter {
+    events: ProviderEvents,
+    bytes: Rc<RefCell<Vec<u8>>>,
+    arm: Rc<Cell<bool>>,
+    fail_after_stream_marker: bool,
+    error_kind: ErrorKind,
+    flushes: Rc<Cell<usize>>,
+}
+
+impl Write for ArmableFailureWriter {
+    fn write(&mut self, data: &[u8]) -> io::Result<usize> {
+        if self.fail_after_stream_marker {
+            self.fail_after_stream_marker = false;
+            self.events.record("sink-error:armed");
+            return Err(io::Error::new(
+                self.error_kind,
+                "task-6 armed writer failure",
+            ));
+        }
+        if self.arm.get()
+            && data
+                .windows(b"\nstream\n".len())
+                .any(|part| part == b"\nstream\n")
+        {
+            self.arm.set(false);
+            self.fail_after_stream_marker = true;
+        }
+        self.events.record("sink-write");
+        self.bytes.borrow_mut().extend_from_slice(data);
+        Ok(data.len())
+    }
+
+    fn flush(&mut self) -> io::Result<()> {
+        self.flushes.set(self.flushes.get() + 1);
+        self.events.record("sink-flush");
+        Ok(())
+    }
+}
+
+struct ArmOnObjStmWriter {
+    bytes: Rc<RefCell<Vec<u8>>>,
+    saw_objstm: bool,
+    armed: bool,
+    flushes: Rc<Cell<usize>>,
+}
+
+impl Write for ArmOnObjStmWriter {
+    fn write(&mut self, data: &[u8]) -> io::Result<usize> {
+        if self.armed {
+            return Ok(0);
+        }
+        if self.saw_objstm
+            && data
+                .windows(b"\nstream\n".len())
+                .any(|part| part == b"\nstream\n")
+        {
+            self.armed = true;
+        }
+        if data
+            .windows(b"/Type /ObjStm".len())
+            .any(|part| part == b"/Type /ObjStm")
+        {
+            self.saw_objstm = true;
+        }
+        self.bytes.borrow_mut().extend_from_slice(data);
+        Ok(data.len())
+    }
+
+    fn flush(&mut self) -> io::Result<()> {
+        self.flushes.set(self.flushes.get() + 1);
+        Ok(())
+    }
+}
+
 impl Write for EventWriter {
     fn write(&mut self, data: &[u8]) -> io::Result<usize> {
         self.events.record("sink-write");
@@ -487,6 +582,111 @@ fn encrypted_fallback_reaches_the_sink_before_the_next_provider() {
         writer.set_encryption_parameters(EncryptParams::v4_aes128(b"user", b"owner"));
         writer.set_static_aes_iv(true);
     });
+}
+
+fn assert_armed_stream_writer_error_preserves_io_kind(encrypted: bool) {
+    let events = ProviderEvents(Rc::new(RefCell::new(Vec::new())));
+    let arm = Rc::new(Cell::new(false));
+    let bytes = Rc::new(RefCell::new(Vec::new()));
+    let flushes = Rc::new(Cell::new(0));
+    let mut pdf = minimal_pdf();
+    let first = provider_stream(
+        &pdf,
+        ArmOnProvider {
+            name: "A",
+            payload: Rc::new(PROVIDER_A_PAYLOAD.to_vec()),
+            events: events.clone(),
+            arm: Rc::clone(&arm),
+        },
+    );
+    let second = provider_stream(
+        &pdf,
+        PayloadProvider {
+            name: "B",
+            payload: Rc::new(b"provider-payload-B".to_vec()),
+            events: Some(events.clone()),
+        },
+    );
+    attach_two_streams(&mut pdf, first, second);
+
+    let mut writer = configure_disable_writer(&mut pdf);
+    if encrypted {
+        writer.set_encryption_parameters(EncryptParams::v4_aes128(b"user", b"owner"));
+        writer.set_static_aes_iv(true);
+    }
+    writer
+        .set_output_writer(ArmableFailureWriter {
+            events: events.clone(),
+            bytes,
+            arm,
+            fail_after_stream_marker: false,
+            error_kind: ErrorKind::PermissionDenied,
+            flushes: Rc::clone(&flushes),
+        })
+        .expect("install armed Writer sink");
+    let error = writer
+        .write()
+        .expect_err("armed stream Writer failure must escape");
+
+    assert!(
+        matches!(error, Error::Io(ref source) if source.kind() == ErrorKind::PermissionDenied),
+        "encrypted={encrypted} must preserve Error::Io kind, got {error:?}"
+    );
+    assert_eq!(flushes.get(), 1, "stream teardown must flush once");
+    let events = events.snapshot();
+    assert!(
+        !events.iter().any(|event| event == "provider:B"),
+        "events: {events:?}"
+    );
+}
+
+#[test]
+fn ordinary_stream_writer_error_preserves_io_kind_and_finishes_segment_once() {
+    assert_armed_stream_writer_error_preserves_io_kind(false);
+}
+
+#[test]
+fn encrypted_stream_writer_error_preserves_io_kind_and_finishes_segment_once() {
+    assert_armed_stream_writer_error_preserves_io_kind(true);
+}
+
+#[test]
+fn encrypted_objstm_write_zero_preserves_io_kind_and_finishes_segment_once() {
+    let mut pdf = minimal_pdf();
+    let root = pdf.root_handle().expect("resolve Catalog");
+    for index in 0..4 {
+        let member = pdf
+            .make_indirect_from_object_handle(ObjectHandle::dictionary(vec![(
+                format!("/Member{index}").into_bytes(),
+                ObjectHandle::integer(i64::from(index)),
+            )]))
+            .expect("create ObjStm member");
+        root.replace_key(format!("/Generated{index}").as_bytes(), member)
+            .expect("attach ObjStm member");
+    }
+
+    let flushes = Rc::new(Cell::new(0));
+    let mut writer = configure_disable_writer(&mut pdf);
+    writer.set_object_stream_mode(ObjectStreamMode::Generate);
+    writer.set_encryption_parameters(EncryptParams::v4_aes128(b"user", b"owner"));
+    writer.set_static_aes_iv(true);
+    writer
+        .set_output_writer(ArmOnObjStmWriter {
+            bytes: Rc::new(RefCell::new(Vec::new())),
+            saw_objstm: false,
+            armed: false,
+            flushes: Rc::clone(&flushes),
+        })
+        .expect("install ObjStm WriteZero sink");
+    let error = writer
+        .write()
+        .expect_err("encrypted ObjStm WriteZero must escape");
+
+    assert!(
+        matches!(error, Error::Io(ref source) if source.kind() == ErrorKind::WriteZero),
+        "encrypted ObjStm must preserve WriteZero, got {error:?}"
+    );
+    assert_eq!(flushes.get(), 1, "ObjStm stream teardown must flush once");
 }
 
 #[test]
