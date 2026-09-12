@@ -1039,7 +1039,7 @@ impl std::fmt::Debug for ObjectHandle {
 
 #[derive(Clone)]
 pub(crate) struct ChildDescription {
-    parent: Weak<RefCell<ObjectSlot>>,
+    parent: Weak<RefCell<SharedValueState>>,
     static_descr: Vec<u8>,
     var_descr: Vec<u8>,
 }
@@ -1102,35 +1102,100 @@ fn expand_description_template(
 
 // Deliberately not `Debug`: see `ObjectHandle`'s own hand-written `Debug`
 // impl above for why a derived one is unsafe here (object-handle cycles).
-// This uniform allocation corresponds to qpdf's QPDFObject/QPDFValue pair:
-// it keeps the current payload and all indirect metadata together rather
-// than placing direct and indirect forms in separate backing storage.
+// This is flpdf's counterpart to qpdf's QPDFValue allocation: every field
+// here moves as one value pointer through QPDFObject::assign/swapWith.
+struct SharedValueState {
+    value: ObjectValue,
+    identity: ValueIdentity,
+    parsed_offset: i64,
+    description: Option<ObjectDescription>,
+    state_owners: Vec<Weak<RefCell<ObjectSlot>>>,
+    stream_token_filters: Vec<StreamTokenFilter>,
+    content_normalization_applied: bool,
+    mutation_generation: u64,
+}
+
+impl SharedValueState {
+    fn qpdf_obj_gen(&self) -> Option<QpdfObjGen> {
+        self.identity
+            .qpdf_obj_gen
+            .or_else(|| self.identity.object_ref.map(QpdfObjGen::from_object_ref))
+    }
+
+    fn object_ref(&self) -> Option<ObjectRef> {
+        self.qpdf_obj_gen()
+            .and_then(QpdfObjGen::to_object_ref)
+            .or(self.identity.object_ref)
+    }
+
+    fn get_description(&self) -> Vec<u8> {
+        if let Some(desc) = &self.description {
+            match desc {
+                ObjectDescription::Template(tmpl) => expand_description_template(
+                    tmpl,
+                    self.object_ref(),
+                    &self.value,
+                    self.parsed_offset,
+                ),
+                ObjectDescription::Json(j) => {
+                    let mut result = j.input.clone();
+                    if !j.object.is_empty() {
+                        result.extend_from_slice(b", ");
+                        result.extend_from_slice(&j.object);
+                    }
+                    result.extend_from_slice(b" at offset ");
+                    result.extend_from_slice(self.parsed_offset.to_string().as_bytes());
+                    result
+                }
+                ObjectDescription::Child(child) => {
+                    let mut result = child
+                        .parent
+                        .upgrade()
+                        .map(|parent| parent.borrow().get_description())
+                        .unwrap_or_default();
+                    result.extend_from_slice(&child.static_descr);
+                    // qpdf's child branch replaces only the first marker in
+                    // the already-rendered parent/static string
+                    // (`libqpdf/QPDFValue.cc:52-54`).
+                    replace_first(&mut result, b"$VD", &child.var_descr);
+                    result
+                }
+            }
+        } else if let Some(object_gen) = self.qpdf_obj_gen() {
+            format!("object {} {}", object_gen.get_obj(), object_gen.get_gen()).into_bytes()
+        } else {
+            Vec::new()
+        }
+    }
+}
+
+fn new_shared_value_state(
+    value: ObjectValue,
+    identity: ValueIdentity,
+    parsed_offset: i64,
+) -> Rc<RefCell<SharedValueState>> {
+    Rc::new(RefCell::new(SharedValueState {
+        value,
+        identity,
+        parsed_offset,
+        description: None,
+        state_owners: Vec::new(),
+        stream_token_filters: Vec::new(),
+        content_normalization_applied: false,
+        mutation_generation: 0,
+    }))
+}
+
+// This outer allocation corresponds to qpdf's QPDFObject. It preserves
+// handle/cache/provenance identity while its `shared` QPDFValue counterpart
+// can be assigned independently.
 struct ObjectSlot {
     /// Whether this handle points at an actual qpdf object allocation.
     /// qpdf's default-constructed `QPDFObjectHandle` has no value at all;
     /// keeping this separate from `ObjectValue::Unresolved` preserves that
     /// state from both an initialized lazy indirect object and a null value.
     initialized: bool,
-    /// The payload state is separately reference-counted so qpdf's
-    /// `QPDFObject::assign` boundary can make two distinct handles observe
-    /// one replacement value while retaining their own handle identities.
-    state: Rc<RefCell<ObjectValue>>,
-    /// Every slot whose payload is the [`Self::state`] allocation. Normally
-    /// this contains only the slot itself; qpdf's `QPDFObject::assign` can
-    /// temporarily make a direct replacement handle and an indirect target
-    /// share one payload while retaining distinct handle identities.
-    ///
-    /// The weak back-links let a later mutation through either alias update
-    /// containment edges for every owner of the shared payload. Without this
-    /// list, mutating the direct replacement after `replaceObject` would
-    /// update only its own parent edges while the canonical target retained
-    /// stale ownership metadata.
-    state_owners: Rc<RefCell<Vec<Weak<RefCell<ObjectSlot>>>>>,
-    /// qpdf's QPDFValue object generation and owning QPDF. This allocation
-    /// follows the shared payload through assign, swap, and detachment;
-    /// distinct QObject slots sharing a value observe one active identity.
-    identity: Rc<RefCell<ValueIdentity>>,
-    parsed_offset: i64,
+    shared: Rc<RefCell<SharedValueState>>,
     end_before_space: i64,
     end_after_space: i64,
     /// The document identity claimed by a handle-native name/number-tree
@@ -1143,22 +1208,6 @@ struct ObjectSlot {
     // edge has no qpdf counterpart and is retained solely for cfg(test)
     // containment-root assertions and stack-safe teardown bookkeeping.
     containment_parents: Vec<Weak<RefCell<ObjectSlot>>>,
-    description: Option<ObjectDescription>,
-    /// qpdf's `QPDF_Stream::token_filters` list. It is attached to the
-    /// canonical handle allocation rather than eagerly rewriting the source
-    /// bytes; the stream pipeline consumes it after decoding and before
-    /// normalization/encoding (`libqpdf/QPDF_Stream.cc:488-620`).
-    stream_token_filters: StreamTokenFilterList,
-    /// Whether the current stream bytes have already passed the CLI's
-    /// content-normalization pass. This is deliberately separate from
-    /// `replaceStreamData`: qpdf treats replacement bytes as ordinary stream
-    /// data, while the writer must skip only the normalization that this
-    /// particular consumer has already performed.
-    content_normalization_applied: Rc<Cell<bool>>,
-    /// Monotonic identity for in-place mutations of this handle's payload.
-    /// Writer caches use it to distinguish a plan-time stream snapshot from
-    /// later qpdf-shaped replacement/filter mutations.
-    mutation_generation: Rc<Cell<u64>>,
 }
 
 /// The active identity on qpdf's shared QPDFValue (QPDFValue.hh:68-72).
@@ -1205,40 +1254,7 @@ impl ObjectSlot {
     }
 
     fn get_description(&self) -> Vec<u8> {
-        let state = self.state.borrow();
-        if let Some(desc) = &self.description {
-            match desc {
-                ObjectDescription::Template(tmpl) => {
-                    expand_description_template(tmpl, self.object_ref(), &state, self.parsed_offset)
-                }
-                ObjectDescription::Json(j) => {
-                    let mut result = j.input.clone();
-                    if !j.object.is_empty() {
-                        result.extend_from_slice(b", ");
-                        result.extend_from_slice(&j.object);
-                    }
-                    result.extend_from_slice(b" at offset ");
-                    result.extend_from_slice(self.parsed_offset.to_string().as_bytes());
-                    result
-                }
-                ObjectDescription::Child(child) => {
-                    let mut result = Vec::new();
-                    if let Some(parent_slot) = child.parent.upgrade() {
-                        result = parent_slot.borrow().get_description();
-                    }
-                    result.extend_from_slice(&child.static_descr);
-                    // qpdf's child branch replaces only the first marker in
-                    // the already-rendered parent/static string
-                    // (`libqpdf/QPDFValue.cc:52-54`).
-                    replace_first(&mut result, b"$VD", &child.var_descr);
-                    result
-                }
-            }
-        } else if let Some(object_gen) = self.qpdf_obj_gen() {
-            format!("object {} {}", object_gen.get_obj(), object_gen.get_gen()).into_bytes()
-        } else {
-            Vec::new()
-        }
+        self.shared.borrow().get_description()
     }
 }
 
@@ -1337,23 +1353,15 @@ pub(crate) enum ObjectValue {
 fn empty_object_slot() -> Rc<RefCell<ObjectSlot>> {
     Rc::new(RefCell::new(ObjectSlot {
         initialized: false,
-        state: Rc::new(RefCell::new(ObjectValue::Unresolved)),
-        state_owners: Rc::new(RefCell::new(Vec::new())),
-        identity: Rc::new(RefCell::new(ValueIdentity {
-            object_ref: None,
-            qpdf_obj_gen: None,
-            active_pdf_unique_id: None,
-            resolver: None,
-        })),
-        parsed_offset: NO_PARSED_OFFSET,
+        shared: new_shared_value_state(
+            ObjectValue::Unresolved,
+            ValueIdentity::default(),
+            NO_PARSED_OFFSET,
+        ),
         end_before_space: NO_PARSED_OFFSET,
         end_after_space: NO_PARSED_OFFSET,
         tree_pdf_unique_id: None,
         containment_parents: Vec::new(),
-        description: None,
-        stream_token_filters: Rc::new(RefCell::new(Vec::new())),
-        content_normalization_applied: Rc::new(Cell::new(false)),
-        mutation_generation: Rc::new(Cell::new(0)),
     }))
 }
 
@@ -1865,23 +1873,20 @@ impl ObjectHandle {
     ) -> Self {
         let handle = Self(Rc::new(RefCell::new(ObjectSlot {
             initialized: true,
-            state: Rc::new(RefCell::new(ObjectValue::Reserved)),
-            state_owners: Rc::new(RefCell::new(Vec::new())),
-            identity: Rc::new(RefCell::new(ValueIdentity {
-                object_ref: Some(object_ref),
-                qpdf_obj_gen: Some(QpdfObjGen::from_object_ref(object_ref)),
-                active_pdf_unique_id: Some(pdf_unique_id),
-                resolver: Some(resolver),
-            })),
-            parsed_offset: NO_PARSED_OFFSET,
+            shared: new_shared_value_state(
+                ObjectValue::Reserved,
+                ValueIdentity {
+                    object_ref: Some(object_ref),
+                    qpdf_obj_gen: Some(QpdfObjGen::from_object_ref(object_ref)),
+                    active_pdf_unique_id: Some(pdf_unique_id),
+                    resolver: Some(resolver),
+                },
+                NO_PARSED_OFFSET,
+            ),
             end_before_space: NO_PARSED_OFFSET,
             end_after_space: NO_PARSED_OFFSET,
             tree_pdf_unique_id: None,
             containment_parents: Vec::new(),
-            description: None,
-            stream_token_filters: Rc::new(RefCell::new(Vec::new())),
-            content_normalization_applied: Rc::new(Cell::new(false)),
-            mutation_generation: Rc::new(Cell::new(0)),
         })));
         handle.register_state_owner();
         handle
@@ -1901,23 +1906,15 @@ impl ObjectHandle {
     pub(crate) fn new_reserved_direct() -> Self {
         let handle = Self(Rc::new(RefCell::new(ObjectSlot {
             initialized: true,
-            state: Rc::new(RefCell::new(ObjectValue::Reserved)),
-            state_owners: Rc::new(RefCell::new(Vec::new())),
-            identity: Rc::new(RefCell::new(ValueIdentity {
-                object_ref: None,
-                qpdf_obj_gen: None,
-                active_pdf_unique_id: None,
-                resolver: None,
-            })),
-            parsed_offset: NO_PARSED_OFFSET,
+            shared: new_shared_value_state(
+                ObjectValue::Reserved,
+                ValueIdentity::default(),
+                NO_PARSED_OFFSET,
+            ),
             end_before_space: NO_PARSED_OFFSET,
             end_after_space: NO_PARSED_OFFSET,
             tree_pdf_unique_id: None,
             containment_parents: Vec::new(),
-            description: None,
-            stream_token_filters: Rc::new(RefCell::new(Vec::new())),
-            content_normalization_applied: Rc::new(Cell::new(false)),
-            mutation_generation: Rc::new(Cell::new(0)),
         })));
         handle.register_state_owner();
         handle
@@ -1960,7 +1957,7 @@ impl ObjectHandle {
             pdf_unique_id,
             resolver,
         );
-        handle.0.borrow().identity.borrow_mut().object_ref = Some(object_ref);
+        handle.0.borrow().shared.borrow_mut().identity.object_ref = Some(object_ref);
         handle
     }
 
@@ -1973,23 +1970,20 @@ impl ObjectHandle {
         let _ = offset;
         let handle = Self(Rc::new(RefCell::new(ObjectSlot {
             initialized: true,
-            state: Rc::new(RefCell::new(ObjectValue::Unresolved)),
-            state_owners: Rc::new(RefCell::new(Vec::new())),
-            identity: Rc::new(RefCell::new(ValueIdentity {
-                object_ref: object_gen.to_object_ref(),
-                qpdf_obj_gen: Some(object_gen),
-                active_pdf_unique_id: pdf_unique_id,
-                resolver,
-            })),
-            parsed_offset: NO_PARSED_OFFSET,
+            shared: new_shared_value_state(
+                ObjectValue::Unresolved,
+                ValueIdentity {
+                    object_ref: object_gen.to_object_ref(),
+                    qpdf_obj_gen: Some(object_gen),
+                    active_pdf_unique_id: pdf_unique_id,
+                    resolver,
+                },
+                NO_PARSED_OFFSET,
+            ),
             end_before_space: NO_PARSED_OFFSET,
             end_after_space: NO_PARSED_OFFSET,
             tree_pdf_unique_id: None,
             containment_parents: Vec::new(),
-            description: None,
-            stream_token_filters: Rc::new(RefCell::new(Vec::new())),
-            content_normalization_applied: Rc::new(Cell::new(false)),
-            mutation_generation: Rc::new(Cell::new(0)),
         })));
         handle.register_state_owner();
         handle
@@ -2026,23 +2020,18 @@ impl ObjectHandle {
     ) -> Self {
         let handle = Self(Rc::new(RefCell::new(ObjectSlot {
             initialized: true,
-            state: Rc::new(RefCell::new(value)),
-            state_owners: Rc::new(RefCell::new(Vec::new())),
-            identity: Rc::new(RefCell::new(ValueIdentity {
-                object_ref: None,
-                qpdf_obj_gen: None,
-                active_pdf_unique_id: None,
-                resolver,
-            })),
-            parsed_offset,
+            shared: new_shared_value_state(
+                value,
+                ValueIdentity {
+                    resolver,
+                    ..ValueIdentity::default()
+                },
+                parsed_offset,
+            ),
             end_before_space: NO_PARSED_OFFSET,
             end_after_space: NO_PARSED_OFFSET,
             tree_pdf_unique_id: None,
             containment_parents: Vec::new(),
-            description: None,
-            stream_token_filters: Rc::new(RefCell::new(Vec::new())),
-            content_normalization_applied: Rc::new(Cell::new(false)),
-            mutation_generation: Rc::new(Cell::new(0)),
         })));
         handle.register_state_owner();
         handle.with_value(|value| {
@@ -2989,9 +2978,10 @@ impl ObjectHandle {
         static_descr: impl AsRef<[u8]>,
         var_descr: impl AsRef<[u8]>,
     ) {
-        let mut slot = self.0.borrow_mut();
-        slot.description = Some(ObjectDescription::Child(ChildDescription {
-            parent: Rc::downgrade(&parent.0),
+        let parent_shared = parent.0.borrow().shared.clone();
+        let slot = self.0.borrow();
+        slot.shared.borrow_mut().description = Some(ObjectDescription::Child(ChildDescription {
+            parent: Rc::downgrade(&parent_shared),
             static_descr: static_descr.as_ref().to_vec(),
             var_descr: var_descr.as_ref().to_vec(),
         }));
