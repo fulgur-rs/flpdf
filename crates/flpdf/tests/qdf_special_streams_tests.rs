@@ -15,6 +15,12 @@ fn fixture(name: &str) -> PathBuf {
         .join(name)
 }
 
+fn test_driver_fixture(name: &str) -> PathBuf {
+    Path::new(env!("CARGO_MANIFEST_DIR"))
+        .join("../../tests/fixtures/test_driver")
+        .join(name)
+}
+
 fn qpdf_available() -> bool {
     Command::new("qpdf")
         .arg("--version")
@@ -225,5 +231,57 @@ fn qdf_child_discovery_ignores_an_extraneous_xref_stream() -> flpdf::Result<()> 
     let mut actual = Vec::new();
     write_with_settings(&mut pdf, &mut actual, &settings)?;
     assert_eq!(actual, read_file(&qpdf_output)?);
+    Ok(())
+}
+
+#[test]
+fn qdf_uncompress_drops_indirect_decode_parms_children_before_numbering() -> flpdf::Result<()> {
+    if !qpdf_available() {
+        eprintln!("qpdf is unavailable; skipping indirect DecodeParms differential");
+        return Ok(());
+    }
+
+    let input = test_driver_fixture("stream_decode_parms_indirect_nondict.pdf");
+    let temporary = tempfile::tempdir()?;
+    let qpdf_output = temporary.path().join("qpdf.pdf");
+    let qpdf = Command::new("qpdf")
+        .args([
+            "--qdf",
+            "--static-id",
+            "--stream-data=uncompress",
+            "--object-streams=disable",
+        ])
+        .arg(&input)
+        .arg(&qpdf_output)
+        .output()
+        .expect("run qpdf indirect DecodeParms rewrite");
+    assert!(
+        matches!(qpdf.status.code(), Some(0) | Some(3)),
+        "qpdf indirect DecodeParms rewrite failed: {}",
+        String::from_utf8_lossy(&qpdf.stderr)
+    );
+
+    let settings = WriterTestSettings {
+        qdf: true,
+        static_id: true,
+        object_streams: ObjectStreamMode::Disable,
+        stream_data: Some(flpdf::StreamDataMode::Uncompress),
+        ..WriterTestSettings::default()
+    };
+    let mut pdf = Pdf::open(BufReader::new(File::open(&input)?))?;
+    let mut actual = Vec::new();
+    write_with_settings(&mut pdf, &mut actual, &settings)?;
+    let expected = read_file(&qpdf_output)?;
+
+    assert!(
+        !expected
+            .windows(b"5 0 obj".len())
+            .any(|window| window == b"5 0 obj"),
+        "qpdf oracle must not emit the removed parameter-only child as object 5"
+    );
+    assert_eq!(
+        actual, expected,
+        "QDF uncompress numbering must not retain an indirect DecodeParms-only child"
+    );
     Ok(())
 }
