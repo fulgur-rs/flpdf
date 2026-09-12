@@ -320,6 +320,10 @@ mod tests {
         }
 
         let mut target = OverreportingTarget;
+        OutputTarget::finish_segment(&mut target)
+            .expect("overreporting test target segment finish");
+        OutputTarget::finish_document(&mut target)
+            .expect("overreporting test target document finish");
         let mut sink = OutputSink::new(&mut target);
         let error = sink
             .write_bytes(b"abc")
@@ -449,6 +453,22 @@ mod tests {
         assert_eq!(error.kind(), ErrorKind::Other);
         assert!(error.to_string().contains("position exceeds u64"));
         assert_eq!(sink.position(), u64::MAX);
+    }
+
+    #[test]
+    fn write_trait_preserves_target_io_error_kind() {
+        let mut target = VecOutputTarget {
+            writes: VecDeque::from([Ok(0)]),
+            ..Default::default()
+        };
+        let mut sink = OutputSink::new(&mut target);
+
+        let error = sink
+            .write_all(b"a")
+            .expect_err("Write preserves the target's zero-progress error");
+
+        assert_eq!(error.kind(), ErrorKind::WriteZero);
+        assert_eq!(sink.position(), 0);
     }
 
     #[test]

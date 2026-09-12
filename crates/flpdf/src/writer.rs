@@ -4433,6 +4433,21 @@ mod final_handle_writer_tests {
             assert!(aes.len() >= 32);
             assert_ne!(&aes[..data.len()], data);
         }
+
+        let mut aes256 = Vec::new();
+        output::with_buffer_sink(&mut aes256, |out| {
+            pipe_writer_stream_payload(
+                out,
+                data,
+                ObjectRef::new(3, 0),
+                &stream_encryption_context(WriteCipher::FileKeyAes256, vec![1; 32], true),
+                true,
+                Some([3; 16]),
+            )
+        })
+        .expect("AES-256 stage writes IV-prefixed ciphertext");
+        assert!(aes256.len() >= 32);
+        assert_ne!(&aes256[..data.len()], data);
     }
 
     #[test]
@@ -4842,6 +4857,33 @@ mod final_handle_writer_tests {
                 "forced version {forced_version} must disable its incompatible encryption"
             );
         }
+    }
+
+    #[test]
+    fn malformed_v4_aes256_parameters_keep_the_aes256_extension_floor() {
+        let encryption = EncryptionParameters {
+            encrypt_dict: ObjectHandle::dictionary(Vec::new()),
+            file_key: vec![1; 32],
+            cipher: WriteCipher::FileKeyAes256,
+            encryption_v: 4,
+            encryption_r: 4,
+            id0: b"id".to_vec(),
+            static_aes_iv: true,
+            encrypt_metadata: true,
+            metadata_ref: None,
+        };
+
+        assert_eq!(
+            effective_pdf_version_and_ext_with_encryption(
+                "1.4",
+                0,
+                &WriterOptions::default(),
+                false,
+                false,
+                Some(&encryption),
+            ),
+            ("1.7", 3)
+        );
     }
 
     #[test]

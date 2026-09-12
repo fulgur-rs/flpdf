@@ -4735,12 +4735,15 @@ mod tests {
 
     #[test]
     fn qdf_string_writer_keeps_signature_contents_hex_and_formats_arrays() -> Result<()> {
+        let mut pdf = Pdf::empty()?;
+        let mapped = pdf.make_indirect_object_handle(ObjectHandle::integer(9))?;
         let signature = ObjectHandle::dictionary(vec![
             (
                 b"/ByteRange".to_vec(),
                 ObjectHandle::array(vec![ObjectHandle::integer(0), ObjectHandle::integer(1)]),
             ),
             (b"/Contents".to_vec(), ObjectHandle::string(vec![0, 0xff])),
+            (b"/Mapped".to_vec(), mapped),
         ]);
         let mut output = Vec::new();
         let mut strings = |out: &mut OutputSink<'_>, value: &[u8]| {

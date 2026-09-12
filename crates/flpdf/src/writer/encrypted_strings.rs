@@ -406,6 +406,11 @@ mod tests {
 
     #[test]
     fn content_container_encrypts_dictionary_strings_but_keeps_direct_stream_data_raw() {
+        let mut pdf = crate::Pdf::empty().expect("create content-container reference owner");
+        let mapped = pdf
+            .make_indirect_object_handle(ObjectHandle::integer(7))
+            .expect("create mapped content-container child");
+        let mapped_ref = mapped.object_ref().unwrap();
         let context = EncryptionContext {
             encrypt_dict: ObjectHandle::dictionary(Vec::new()),
             file_key: vec![1; 5],
@@ -428,6 +433,7 @@ mod tests {
                 ObjectHandle::string(b"secret-label".to_vec()),
             ),
             (b"/Contents".to_vec(), direct_stream),
+            (b"/Mapped".to_vec(), mapped),
         ]);
         let mut emitter = EncryptedStringEmitter::from_context(&context);
         let mut output = Vec::new();
@@ -439,7 +445,10 @@ mod tests {
                 None,
                 &container,
                 &WriterOptions::default(),
-                &|object_ref| Ok(object_ref),
+                &|object_ref| {
+                    assert_eq!(object_ref, mapped_ref);
+                    Ok(ObjectRef::new(7, 0))
+                },
                 &BTreeSet::new(),
             )
         })
@@ -451,6 +460,9 @@ mod tests {
         assert!(!output
             .windows(b"secret-label".len())
             .any(|window| window == b"secret-label"));
+        assert!(output
+            .windows(b"7 0 R".len())
+            .any(|window| window == b"7 0 R"));
     }
 
     #[test]

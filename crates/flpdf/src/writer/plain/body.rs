@@ -2369,6 +2369,47 @@ mod final_handle_tests {
         );
         assert!(policy.add_flate_filter);
     }
+
+    #[test]
+    fn qdf_content_container_formats_nested_arrays_dictionaries_and_direct_streams() {
+        let stream = ObjectHandle::stream(
+            ObjectHandle::dictionary(vec![(b"/Length".to_vec(), ObjectHandle::integer(4))]),
+            Rc::new(b"data".to_vec()),
+        );
+        let container = ObjectHandle::dictionary(vec![
+            (
+                b"/Array".to_vec(),
+                ObjectHandle::array(vec![
+                    ObjectHandle::integer(1),
+                    ObjectHandle::dictionary(vec![(b"/Nested".to_vec(), ObjectHandle::integer(2))]),
+                ]),
+            ),
+            (b"/Contents".to_vec(), stream),
+        ]);
+        let options = WriterOptions {
+            qdf: true,
+            newline_before_endstream: NewlineBeforeEndstream::Never,
+            ..WriterOptions::default()
+        };
+        let mut output = Vec::new();
+
+        crate::writer::output::with_buffer_sink(&mut output, |out| {
+            emit_content_container_from_handle_with_ref_map(
+                &container,
+                &options,
+                out,
+                &|object_ref| Ok(object_ref),
+                &BTreeSet::new(),
+            )
+        })
+        .expect("QDF direct content-container emission");
+
+        let text = String::from_utf8(output).unwrap();
+        assert!(text.starts_with("<<\n  /Array [\n"));
+        assert!(text.contains("/Nested 2"));
+        assert!(text.contains("stream\ndata\nendstream"));
+        assert!(text.ends_with(">>"));
+    }
 }
 
 #[cfg(test)]
@@ -2404,6 +2445,216 @@ mod object_emitter_tests {
         .expect("prepare surviving stream children");
         assert_eq!(surviving.len(), 1);
         assert_eq!(surviving[0].unparse(), b"42");
+    }
+
+    #[test]
+    fn live_queue_helpers_report_overflow_depth_missing_map_and_direct_stream_children() {
+        let mut queue = LiveQueue::new(BTreeSet::new(), false);
+        queue.next_objid = u32::MAX;
+        let error = queue
+            .reserve_output_number()
+            .expect_err("live queue numbering must not wrap");
+        assert!(
+            matches!(error, crate::Error::Unsupported(message) if message.contains("overflows u32"))
+        );
+
+        let error = collect_live_child_handles(
+            &ObjectHandle::null(),
+            &mut Vec::new(),
+            crate::parser::MAX_PARSE_DEPTH + 1,
+        )
+        .expect_err("emission-time child traversal must enforce the parser depth");
+        assert!(
+            matches!(error, crate::Error::Unsupported(message) if message.contains("nesting exceeds maximum"))
+        );
+
+        let mut pdf = pdf();
+        let child = pdf
+            .make_indirect_object_handle(ObjectHandle::integer(7))
+            .expect("indirect stream dictionary child");
+        let direct_stream = ObjectHandle::stream(
+            ObjectHandle::dictionary(vec![(b"/Child".to_vec(), child.clone())]),
+            Rc::new(b"data".to_vec()),
+        );
+        let mut found = Vec::new();
+        collect_live_child_handles(&direct_stream, &mut found, 0)
+            .expect("direct stream dictionary traversal");
+        assert_eq!(found.len(), 1);
+        assert!(found[0].is_same_object_as(&child));
+
+        let missing = map_queued_output(&BTreeMap::new(), ObjectRef::new(7, 2))
+            .expect_err("an absent queued output must be diagnosed");
+        assert!(
+            matches!(missing, crate::Error::Unsupported(message) if message.contains("7 2 R absent from queue"))
+        );
+
+        let mut spaces = Vec::new();
+        crate::writer::output::with_buffer_sink(&mut spaces, |out| push_spaces(out, 130))
+            .expect("space writer handles more than one static chunk");
+        assert_eq!(spaces, vec![b' '; 130]);
+    }
+
+    fn plan_with_objects(objects: Vec<PlannedIndirectObject>) -> PlainWritePlan {
+        PlainWritePlan {
+            version: "1.5".to_string(),
+            final_extension_level: 0,
+            objects,
+            root_source: None,
+            root: None,
+            direct_root: None,
+            old_to_new: std::collections::HashMap::new(),
+            removed_refs: BTreeSet::new(),
+            qdf_holder_numbers: BTreeSet::new(),
+            trailer: crate::writer::plain::xref::TrailerPlan {
+                form: crate::XrefForm::Stream,
+                root: None,
+                direct_root: None,
+                id: crate::writer::plain::xref::IdPlan::Materialized { value: None },
+                encrypt: None,
+                structural_filtered: false,
+                qdf: false,
+            },
+        }
+    }
+
+    #[test]
+    fn planned_group_adapter_preserves_source_and_generated_origins_and_rejects_synthetic() {
+        let member = crate::writer::plain::plan::PlannedMember {
+            source: ObjectRef::new(2, 0),
+            output: ObjectRef::new(2, 0),
+        };
+        let plan = plan_with_objects(vec![
+            PlannedIndirectObject::Source {
+                source: ObjectRef::new(1, 0),
+                output: ObjectRef::new(1, 0),
+            },
+            PlannedIndirectObject::ObjectStream {
+                origin: PlannedObjectStreamOrigin::SourceBacked(ObjectRef::new(8, 0)),
+                output: ObjectRef::new(3, 0),
+                members: vec![member.clone()],
+            },
+            PlannedIndirectObject::ObjectStream {
+                origin: PlannedObjectStreamOrigin::Generated(ObjectRef::new(9, 0)),
+                output: ObjectRef::new(4, 0),
+                members: vec![member.clone()],
+            },
+        ]);
+        let groups = planned_object_stream_groups(&plan).expect("adapt supported ObjStm origins");
+        assert!(
+            matches!(groups[0], object_streams::ObjectStreamGroup::SourceBacked { source, .. } if source == ObjectRef::new(8, 0))
+        );
+        assert!(
+            matches!(groups[1], object_streams::ObjectStreamGroup::Generated { source, .. } if source == ObjectRef::new(9, 0))
+        );
+
+        let synthetic = plan_with_objects(vec![PlannedIndirectObject::ObjectStream {
+            origin: PlannedObjectStreamOrigin::Synthetic,
+            output: ObjectRef::new(3, 0),
+            members: vec![member],
+        }]);
+        let error = planned_object_stream_groups(&synthetic)
+            .expect_err("the live queue cannot emit a synthetic planned ObjStm");
+        assert!(
+            matches!(error, crate::Error::Unsupported(message) if message.contains("synthetic ObjStm"))
+        );
+    }
+
+    fn encryption_context() -> crate::writer::EncryptionContext {
+        crate::writer::EncryptionContext {
+            encrypt_dict: ObjectHandle::dictionary(Vec::new()),
+            file_key: vec![1; 5],
+            cipher: crate::writer::WriteCipher::PerObject(
+                crate::encryption::standard::ObjectKeyAlg::Rc4,
+            ),
+            encryption_v: 2,
+            encryption_r: 3,
+            encrypt_ref: ObjectRef::new(0, 0),
+            id0: b"id".to_vec(),
+            static_aes_iv: true,
+            encrypt_metadata: true,
+            metadata_ref: None,
+        }
+    }
+
+    #[test]
+    fn encrypted_live_body_covers_compact_qdf_stream_and_content_container_routes() {
+        for qdf in [false, true] {
+            let mut pdf = pdf();
+            let root_source = pdf.root_ref();
+            let stream = pdf
+                .new_stream_with_data(Rc::new(b"stream-data".to_vec()))
+                .expect("indirect encrypted stream");
+            stream
+                .as_stream_dict()
+                .unwrap()
+                .replace_key(b"/Label", ObjectHandle::string(b"stream-secret".to_vec()))
+                .expect("attach encrypted stream-dictionary string");
+            pdf.root_handle()
+                .unwrap()
+                .replace_key(b"/EncryptedStream", stream)
+                .expect("attach encrypted stream");
+            let options = WriterOptions {
+                qdf,
+                compress_streams: CompressStreams::No,
+                ..WriterOptions::default()
+            };
+            let mut output = Vec::new();
+            crate::writer::output::with_buffer_sink(&mut output, |out| {
+                emit_live(
+                    &mut pdf,
+                    out,
+                    &options,
+                    "1.4",
+                    0,
+                    root_source,
+                    BTreeSet::new(),
+                    &[],
+                    Some(&encryption_context()),
+                    &BTreeSet::new(),
+                )
+            })
+            .expect("encrypted live body");
+            assert!(output
+                .windows(b"stream\n".len())
+                .any(|window| window == b"stream\n"));
+            assert!(!output
+                .windows(b"stream-secret".len())
+                .any(|window| window == b"stream-secret"));
+        }
+
+        let mut pdf = pdf();
+        let root_source = pdf.root_ref().expect("indirect Catalog");
+        let direct_stream = ObjectHandle::stream(
+            ObjectHandle::dictionary(vec![(b"/Length".to_vec(), ObjectHandle::integer(10))]),
+            Rc::new(b"direct-raw".to_vec()),
+        );
+        let root = pdf.root_handle().unwrap();
+        root.replace_key(b"/Label", ObjectHandle::string(b"root-secret".to_vec()))
+            .expect("attach encrypted container string");
+        root.replace_key(b"/Contents", direct_stream)
+            .expect("attach direct content stream");
+        let mut output = Vec::new();
+        crate::writer::output::with_buffer_sink(&mut output, |out| {
+            emit_live(
+                &mut pdf,
+                out,
+                &WriterOptions::default(),
+                "1.4",
+                0,
+                Some(root_source),
+                BTreeSet::new(),
+                &[],
+                Some(&encryption_context()),
+                &[root_source].into_iter().collect(),
+            )
+        })
+        .expect("encrypted live content container");
+        assert!(output
+            .windows(b"stream\ndirect-raw\nendstream".len())
+            .any(|window| window == b"stream\ndirect-raw\nendstream"));
+        assert!(!output
+            .windows(b"root-secret".len())
+            .any(|window| window == b"root-secret"));
     }
 
     #[test]
