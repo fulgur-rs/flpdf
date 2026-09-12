@@ -418,7 +418,7 @@ fn write_plain_live<R: Read + Seek, W: Write>(
                         "plain live writer: late trailer number overflow".into(),
                     )
                     // cov:ignore-end
-                })?;
+                })?; // cov:ignore: checked late direct-root allocation cannot overflow a supported output
         }
         let map_ref = |object_ref: ObjectRef| {
             trailer_map.get(&object_ref).copied().ok_or_else(|| {
