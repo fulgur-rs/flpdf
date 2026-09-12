@@ -379,8 +379,6 @@ crates/flpdf/src/writer.rs::snapshot_catalog_extensions: prod 2 (2 files) / test
     crates/flpdf/src/linearization/writer.rs 1, crates/flpdf/src/writer.rs 1
 crates/flpdf/src/writer.rs::restore_catalog_extensions: prod 2 (2 files) / test 1
     crates/flpdf/src/linearization/writer.rs 1, crates/flpdf/src/writer.rs 1
-crates/flpdf/src/writer.rs::qpdf_preserve_source_objstm: prod 7 (1 files) / test 0
-    crates/flpdf/src/writer.rs 7
 crates/flpdf/src/writer.rs::write_qpdf_to_memory: prod 2 (1 files) / test 16
     crates/flpdf-cli/src/main.rs 2
 crates/flpdf/src/writer.rs::PdfWriter::write: prod 328 (74 files) / test 1003
@@ -399,8 +397,6 @@ crates/flpdf/src/writer/plain/body.rs::emit_bodies: prod 1 (1 files) / test 0
     crates/flpdf/src/writer/plain/mod.rs 1
 crates/flpdf/src/writer/plain/xref.rs::append_xref_and_trailer: prod 2 (2 files) / test 1
     crates/flpdf/src/writer.rs 1, crates/flpdf/src/writer/plain/mod.rs 1
-crates/flpdf/src/writer/plain/plan.rs::canonical_trailer_entries_with_visibility: prod 2 (2 files) / test 2
-    crates/flpdf/src/writer.rs 1, crates/flpdf/src/writer/plain/plan.rs 1
 crates/flpdf/src/writer.rs::build_writer_trailer_handle: prod 5 (2 files) / test 0
     crates/flpdf/src/writer.rs 4, crates/flpdf/src/writer/plain/plan.rs 1
 crates/flpdf/src/writer.rs::EncryptionContext: prod 21 (3 files) / test 0
