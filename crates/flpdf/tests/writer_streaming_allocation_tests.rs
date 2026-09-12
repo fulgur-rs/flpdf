@@ -370,6 +370,52 @@ struct ArmOnObjStmWriter {
     flushes: Rc<Cell<usize>>,
 }
 
+struct FirstThenTeardownErrorWriter {
+    bytes: Rc<RefCell<Vec<u8>>>,
+    arm: Rc<Cell<bool>>,
+    stage: Rc<Cell<u8>>,
+    flushes: Rc<Cell<usize>>,
+}
+
+impl Write for FirstThenTeardownErrorWriter {
+    fn write(&mut self, data: &[u8]) -> io::Result<usize> {
+        match self.stage.get() {
+            1 => {
+                self.stage.set(2);
+                self.bytes.borrow_mut().extend_from_slice(data);
+                Ok(data.len())
+            }
+            2 => {
+                self.stage.set(3);
+                Err(io::Error::new(
+                    ErrorKind::PermissionDenied,
+                    "task-6 first encrypted payload failure",
+                ))
+            }
+            3 => {
+                Ok(0)
+            }
+            _ => {
+                if self.arm.get()
+                    && data
+                        .windows(b"\nstream\n".len())
+                        .any(|part| part == b"\nstream\n")
+                {
+                    self.arm.set(false);
+                    self.stage.set(1);
+                }
+                self.bytes.borrow_mut().extend_from_slice(data);
+                Ok(data.len())
+            }
+        }
+    }
+
+    fn flush(&mut self) -> io::Result<()> {
+        self.flushes.set(self.flushes.get() + 1);
+        Ok(())
+    }
+}
+
 impl Write for ArmOnObjStmWriter {
     fn write(&mut self, data: &[u8]) -> io::Result<usize> {
         if self.armed {
@@ -594,7 +640,7 @@ fn assert_armed_stream_writer_error_preserves_io_kind(encrypted: bool) {
         &pdf,
         ArmOnProvider {
             name: "A",
-            payload: Rc::new(PROVIDER_A_PAYLOAD.to_vec()),
+            payload: Rc::new(vec![b'A'; 4096]),
             events: events.clone(),
             arm: Rc::clone(&arm),
         },
@@ -648,6 +694,55 @@ fn ordinary_stream_writer_error_preserves_io_kind_and_finishes_segment_once() {
 #[test]
 fn encrypted_stream_writer_error_preserves_io_kind_and_finishes_segment_once() {
     assert_armed_stream_writer_error_preserves_io_kind(true);
+}
+
+#[test]
+fn encrypted_stream_first_writer_error_wins_over_a_different_teardown_error() {
+    let events = ProviderEvents(Rc::new(RefCell::new(Vec::new())));
+    let arm = Rc::new(Cell::new(false));
+    let stage = Rc::new(Cell::new(0));
+    let flushes = Rc::new(Cell::new(0));
+    let mut pdf = minimal_pdf();
+    let first = provider_stream(
+        &pdf,
+        ArmOnProvider {
+            name: "A",
+            payload: Rc::new(PROVIDER_A_PAYLOAD.to_vec()),
+            events: events.clone(),
+            arm: Rc::clone(&arm),
+        },
+    );
+    let second = provider_stream(
+        &pdf,
+        PayloadProvider {
+            name: "B",
+            payload: Rc::new(b"provider-payload-B".to_vec()),
+            events: Some(events.clone()),
+        },
+    );
+    attach_two_streams(&mut pdf, first, second);
+
+    let mut writer = configure_disable_writer(&mut pdf);
+    writer.set_encryption_parameters(EncryptParams::v4_aes128(b"user", b"owner"));
+    writer.set_static_aes_iv(true);
+    writer
+        .set_output_writer(FirstThenTeardownErrorWriter {
+            bytes: Rc::new(RefCell::new(Vec::new())),
+            arm,
+            stage,
+            flushes: Rc::clone(&flushes),
+        })
+        .expect("install first-then-teardown error Writer");
+    let error = writer
+        .write()
+        .expect_err("the first encrypted payload error must escape");
+
+    assert!(
+        matches!(error, Error::Io(ref source) if source.kind() == ErrorKind::PermissionDenied),
+        "the first Writer error must win over teardown WriteZero, got {error:?}"
+    );
+    assert_eq!(flushes.get(), 1, "encrypted segment teardown must run once");
+    assert!(!events.snapshot().iter().any(|event| event == "provider:B"));
 }
 
 #[test]

@@ -3561,7 +3561,9 @@ impl Pipeline for OutputSinkPipeline<'_, '_> {
         match self.out.write_bytes(data) {
             Ok(()) => Ok(()),
             Err(error) => {
-                *self.failure = Some(error);
+                if self.failure.is_none() {
+                    *self.failure = Some(error);
+                }
                 Err(PipelineError::runtime("writer output sink failed"))
             }
         }
