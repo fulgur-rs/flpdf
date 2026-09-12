@@ -2402,6 +2402,7 @@ fn replace_writer_catalog<R: Read + Seek>(
 pub(crate) struct CatalogExtensionsSnapshot {
     root_ref: ObjectRef,
     extensions: Option<ObjectHandle>,
+    restoration: Option<ObjectHandle>,
 }
 
 /// Snapshot the live Catalog's output-only extension state.
@@ -2419,9 +2420,14 @@ pub(crate) fn snapshot_catalog_extensions<R: Read + Seek>(
     let extensions = catalog
         .try_as_dictionary()?
         .and_then(|dict| dict.get(b"/Extensions".as_slice()).cloned());
+    let restoration = extensions
+        .as_ref()
+        .map(ObjectHandle::shallow_copy)
+        .transpose()?;
     Ok(Some(CatalogExtensionsSnapshot {
         root_ref,
         extensions,
+        restoration,
     }))
 }
 
@@ -2447,7 +2453,7 @@ pub(crate) fn restore_catalog_extensions<R: Read + Seek>(
     // to the original handle detached from the Catalog.
     let extensions_changed = match (&snapshot.extensions, &current_extensions) {
         (None, None) => false,
-        (Some(before), Some(after)) => !before.is_same_object_as(after),
+        (Some(_), Some(_)) => true,
         _ => true,
     };
     if extensions_changed {
@@ -2458,7 +2464,12 @@ pub(crate) fn restore_catalog_extensions<R: Read + Seek>(
             // a direct null as key removal, matching qpdf's own
             // `QPDF_Dictionary::replaceKey`, which is the wrong contract
             // when undoing a temporary output-only mutation).
-            Some(extensions) => catalog.restore_key_raw(b"/Extensions", extensions)?,
+            Some(extensions) => {
+                if let Some(restoration) = snapshot.restoration {
+                    extensions.assign_value_state(&restoration);
+                }
+                catalog.restore_key_raw(b"/Extensions", extensions)?;
+            }
             None => catalog.remove_key(b"/Extensions"),
         }
         pdf.replace_object(snapshot.root_ref, catalog)?;
@@ -3758,10 +3769,41 @@ fn emit_canonical_pdf_with_special_streams<R: Read + Seek>(
     special_streams: Option<&SpecialStreams>,
     setup: WriterSetupState,
 ) -> Result<WriterResult> {
-    // Every standard route now reconciles Catalog extensions on the live
-    // emitter's output-only root copy. No route mutates and then restores the
-    // document merely to select a fallback serializer.
-    emit_canonical_pdf_inner(pdf, out, options, special_streams, setup)
+    // qpdf's output-only ADBE reconciliation can still mutate a shared
+    // indirect /Extensions child while the root is being prepared for
+    // emission. Preserve the caller's live Catalog key across every standard
+    // route; permanent prepareFileForWrite graph repairs remain untouched.
+    let catalog_snapshot = snapshot_catalog_extensions(pdf)?;
+    let direct_catalog_snapshot = if catalog_snapshot.is_none() {
+        let root = pdf.root_handle()?;
+        let extensions = root
+            .try_as_dictionary()?
+            .and_then(|entries| entries.get(b"/Extensions".as_slice()).cloned());
+        Some((root, extensions))
+    } else {
+        None
+    };
+    let result = emit_canonical_pdf_inner(pdf, out, options, special_streams, setup);
+    if let Some(snapshot) = catalog_snapshot {
+        restore_catalog_extensions(pdf, Some(snapshot))?;
+    }
+    if let Some((root, original_extensions)) = direct_catalog_snapshot {
+        let current_extensions = root
+            .try_as_dictionary()?
+            .and_then(|entries| entries.get(b"/Extensions".as_slice()).cloned());
+        let changed = match (&original_extensions, &current_extensions) {
+            (None, None) => false,
+            (Some(before), Some(after)) => !before.is_same_object_as(after),
+            _ => true,
+        };
+        if changed {
+            match original_extensions {
+                Some(extensions) => root.restore_key_raw(b"/Extensions", extensions)?,
+                None => root.remove_key(b"/Extensions"),
+            }
+        }
+    }
+    result
 }
 
 fn write_pclm<R: Read + Seek>(
