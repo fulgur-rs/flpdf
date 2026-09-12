@@ -322,14 +322,103 @@ pub(crate) fn emit_live_disable<R: Read + Seek + 'static>(
     removed_refs: BTreeSet<ObjectRef>,
     object_streams: &[crate::writer::object_streams::ObjectStreamGroup],
 ) -> crate::Result<LiveBodyOutput> {
+    emit_live_body(
+        pdf,
+        options,
+        version,
+        final_extension_level,
+        root_source,
+        removed_refs,
+        object_streams,
+        None,
+        false,
+        false,
+    )
+}
+
+/// Emit a PCLm body using the same live queue and `WriteObject` owner as the
+/// ordinary standard writer. Only the initial seed order is PCLm-specific;
+/// descendants are discovered while each queued object is written.
+pub(crate) fn emit_live_pclm<R: Read + Seek + 'static>(
+    pdf: &mut Pdf<R>,
+    options: &WriterOptions,
+    version: &str,
+    final_extension_level: i64,
+    root_source: Option<ObjectRef>,
+    removed_refs: BTreeSet<ObjectRef>,
+) -> crate::Result<LiveBodyOutput> {
+    emit_live_body(
+        pdf,
+        options,
+        version,
+        final_extension_level,
+        root_source,
+        removed_refs,
+        &[],
+        None,
+        true,
+        false,
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
+fn emit_live_body<R: Read + Seek + 'static>(
+    pdf: &mut Pdf<R>,
+    options: &WriterOptions,
+    version: &str,
+    final_extension_level: i64,
+    root_source: Option<ObjectRef>,
+    removed_refs: BTreeSet<ObjectRef>,
+    object_streams: &[crate::writer::object_streams::ObjectStreamGroup],
+    encryption_context: Option<&crate::writer::EncryptionContext>,
+    pclm: bool,
+    two_pass_object_streams: bool,
+) -> crate::Result<LiveBodyOutput> {
     let mut queue = LiveQueue::new(removed_refs.clone());
     queue.register_object_streams(object_streams);
-    seed_live_queue(pdf, &mut queue, options)?;
+    if pclm {
+        for handle in crate::writer::pclm::seed_handles(pdf)? {
+            queue.enqueue_handle(pdf, handle)?;
+        }
+    } else {
+        seed_live_queue(pdf, &mut queue, options)?;
+    }
 
     let mut bytes = Vec::new();
-    bytes.extend_from_slice(format!("%PDF-{version}\n").as_bytes());
-    bytes.extend_from_slice(QPDF_BINARY_MARKER);
+    if pclm {
+        bytes.extend_from_slice(format!("%PDF-{version}\n%PCLm 1.0\n").as_bytes());
+    } else {
+        bytes.extend_from_slice(format!("%PDF-{version}\n").as_bytes());
+        bytes.extend_from_slice(QPDF_BINARY_MARKER);
+    }
+    bytes.extend_from_slice(options.extra_header_text.as_bytes());
+    if pclm && !options.extra_header_text.is_empty() && !options.extra_header_text.ends_with('\n') {
+        bytes.push(b'\n');
+    }
     let mut layout = BodyLayout::default();
+    let (encryption, encrypted_strings) = if let Some(ctx) = encryption_context {
+        (
+            crate::writer::encryption_state::WriterEncryptionState::new(
+                true,
+                ctx.file_key.clone(),
+                crate::writer::cipher_needs_aes_iv(ctx.cipher),
+                ctx.encryption_v,
+                ctx.encryption_r,
+            ),
+            Some(crate::writer::encrypted_strings::EncryptedStringEmitter::from_context(ctx)),
+        )
+    } else {
+        (
+            crate::writer::encryption_state::WriterEncryptionState::new(
+                false,
+                Vec::new(),
+                false,
+                0,
+                0,
+            ),
+            None,
+        )
+    };
     let mut emitter = LiveObjectEmitter {
         pdf,
         options,
@@ -341,16 +430,11 @@ pub(crate) fn emit_live_disable<R: Read + Seek + 'static>(
         final_extension_level,
         removed_refs,
         lengths: BTreeMap::new(),
-        encryption: crate::writer::encryption_state::WriterEncryptionState::new(
-            false,
-            Vec::new(),
-            false,
-            0,
-            0,
-        ),
-        encryption_context: None,
-        encrypted_strings: None,
-        two_pass_object_streams: false,
+        encryption,
+        encryption_context,
+        encrypted_strings,
+        pclm,
+        two_pass_object_streams,
         current_raw_output: None,
     };
     loop {
@@ -395,78 +479,18 @@ pub(crate) fn emit_live_specialized_standard<R: Read + Seek + 'static>(
     object_streams: &[crate::writer::object_streams::ObjectStreamGroup],
     encryption_context: Option<&crate::writer::EncryptionContext>,
 ) -> crate::Result<LiveBodyOutput> {
-    let mut queue = LiveQueue::new(removed_refs.clone());
-    queue.register_object_streams(object_streams);
-    seed_live_queue(pdf, &mut queue, options)?;
-
-    let mut bytes = Vec::new();
-    bytes.extend_from_slice(format!("%PDF-{version}\n").as_bytes());
-    bytes.extend_from_slice(QPDF_BINARY_MARKER);
-    bytes.extend_from_slice(options.extra_header_text.as_bytes());
-    let mut layout = BodyLayout::default();
-    let (encryption, encrypted_strings) = if let Some(ctx) = encryption_context {
-        (
-            crate::writer::encryption_state::WriterEncryptionState::new(
-                true,
-                ctx.file_key.clone(),
-                crate::writer::cipher_needs_aes_iv(ctx.cipher),
-                ctx.encryption_v,
-                ctx.encryption_r,
-            ),
-            Some(crate::writer::encrypted_strings::EncryptedStringEmitter::from_context(ctx)),
-        )
-    } else {
-        (
-            crate::writer::encryption_state::WriterEncryptionState::new(
-                false,
-                Vec::new(),
-                false,
-                0,
-                0,
-            ),
-            None,
-        )
-    };
-    let mut emitter = LiveObjectEmitter {
+    emit_live_body(
         pdf,
         options,
-        bytes: &mut bytes,
-        layout: &mut layout,
-        queue: RefCell::new(queue),
-        root_source,
         version,
         final_extension_level,
+        root_source,
         removed_refs,
-        lengths: BTreeMap::new(),
-        encryption,
+        object_streams,
         encryption_context,
-        encrypted_strings,
-        two_pass_object_streams: true,
-        current_raw_output: None,
-    };
-    loop {
-        let source = emitter.queue.borrow_mut().pop();
-        let Some(handle) = source else { break };
-        emitter.current_raw_output = handle.qpdf_obj_gen().and_then(|object_gen| {
-            emitter
-                .queue
-                .borrow()
-                .raw_old_to_new
-                .get(&object_gen)
-                .copied()
-        });
-        emitter.write_object(&handle, None)?;
-        emitter.current_raw_output = None;
-    }
-    let queue = emitter.queue.into_inner();
-    let old_to_new = queue.old_to_new;
-    let object_count = old_to_new.len() + queue.raw_old_to_new.len();
-    Ok(LiveBodyOutput {
-        bytes,
-        layout,
-        old_to_new,
-        object_count,
-    })
+        false,
+        true,
+    )
 }
 
 fn qdf_page_context<R: Read + Seek>(
@@ -616,6 +640,7 @@ struct LiveObjectEmitter<'a, R: Read + Seek + 'static> {
     encryption: crate::writer::encryption_state::WriterEncryptionState,
     encryption_context: Option<&'a crate::writer::EncryptionContext>,
     encrypted_strings: Option<crate::writer::encrypted_strings::EncryptedStringEmitter>,
+    pclm: bool,
     two_pass_object_streams: bool,
     current_raw_output: Option<ObjectRef>,
 }
@@ -631,6 +656,24 @@ struct LiveDirectStreamWriter<'a> {
     encryption_context: Option<&'a crate::writer::EncryptionContext>,
 }
 
+fn pclm_stream_parts(stream: &ObjectHandle) -> crate::Result<(ObjectHandle, Vec<u8>)> {
+    stream.try_dereference()?;
+    let dict = stream
+        .as_stream_dict()
+        .ok_or_else(|| crate::Error::Internal("PCLm stream dictionary is missing".to_string()))?
+        .unsafe_shallow_copy()?;
+    let data = stream.get_raw_stream_data()?.as_ref().to_vec();
+    dict.replace_key(
+        b"/Length",
+        ObjectHandle::integer(i64::try_from(data.len()).map_err(|_| {
+            // cov:ignore-start: Vec payloads on supported targets fit in i64.
+            crate::Error::Unsupported("PCLm stream /Length does not fit in i64".to_string())
+            // cov:ignore-end
+        })?), // cov:ignore: Vec payloads on supported targets fit in i64.
+    )?; // cov:ignore: the validated PCLm stream dictionary replacement cannot fail.
+    Ok((dict, data))
+}
+
 impl crate::writer::object::DynamicDirectStreamWriter for LiveDirectStreamWriter<'_> {
     fn write_direct_stream(
         &mut self,
@@ -641,7 +684,12 @@ impl crate::writer::object::DynamicDirectStreamWriter for LiveDirectStreamWriter
         write_string: &mut dyn FnMut(&mut Vec<u8>, &[u8]) -> crate::Result<()>,
     ) -> crate::Result<()> {
         stream.try_dereference()?;
-        let (dict, data, dictionary_options) = canonical_stream_output(stream, self.options)?;
+        let (dict, data, dictionary_options) = if self.options.pclm {
+            let (dict, data) = pclm_stream_parts(stream)?;
+            (dict, data, StreamDictionaryOptions::preserve())
+        } else {
+            canonical_stream_output(stream, self.options)?
+        };
         let stream_encryption = self.encryption_context;
         let is_metadata_stream = dict.try_is_dictionary_of_type(b"Metadata", b"")?;
         // qpdf exempts only a stream whose dictionary is /Type /Metadata when
@@ -804,6 +852,21 @@ impl<'a, R: Read + Seek + 'static> crate::writer::write_object::WriteObject
         } else {
             self.current_raw_output.unwrap_or(ObjectRef::new(0, 0)) // cov:ignore: WriteObject invokes this unparser only for queued indirect or raw-indirect handles; direct values recurse inside the object serializer.
         };
+        if self.pclm && object.as_stream_dict().is_some() {
+            let (dict, data) = pclm_stream_parts(object)?;
+            dict.write_stream_body_with_dynamic_ref_map(
+                self.bytes,
+                StreamDictionaryOptions::preserve(),
+                &mut map,
+                &self.removed_refs,
+            )?; // cov:ignore: the validated PCLm stream dictionary has no reachable serialization error.
+            serialize::write_stream_payload(
+                self.bytes,
+                &data,
+                self.options.newline_before_endstream,
+            );
+            return Ok(());
+        }
         if self.root_source == object.object_ref() {
             let mut direct_stream_writer = LiveDirectStreamWriter {
                 options: self.options,

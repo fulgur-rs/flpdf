@@ -7,12 +7,62 @@
 //! direct/indirect root split follows `QPDFWriter.cc:328-333,1160-1236,
 //! 2068-2076,2928-2954` and the `qpdf/qtest/pclm.test` test-driver contract.
 
-use std::collections::HashMap;
 use std::io::{Read, Seek};
+use std::rc::Rc;
 
-use crate::writer::rewrite_renumber::{collect_canonical_children, collect_canonical_enqueue_refs};
-use crate::{ObjectHandle, ObjectRef, Pdf, Result};
+use crate::writer::rewrite_renumber::collect_canonical_enqueue_refs;
+use crate::{ObjectHandle, Pdf, Result};
 
+/// Return qpdf's initial PCLm queue seeds in enqueue order. Only the
+/// page/Contents/strip/synthetic/root seed differs from standard output; all
+/// descendants are discovered by the shared live writer while those objects
+/// are emitted (`QPDFWriter.cc:2928-2954`).
+pub(crate) fn seed_handles<R: Read + Seek>(pdf: &mut Pdf<R>) -> Result<Vec<ObjectHandle>> {
+    let mut seeds = Vec::new();
+    for page in crate::pages::page_refs(pdf)? {
+        seeds.push(pdf.get_object_handle(page));
+
+        let page_handle = pdf.get_object_handle(page);
+        page_handle.try_dereference()?;
+        let contents = page_handle.try_get_key(b"/Contents")?;
+        if !contents.try_is_null()? {
+            let mut references = Vec::new();
+            collect_canonical_enqueue_refs(pdf, &contents, 0, true, &mut references)?;
+            for reference in references {
+                seeds.push(pdf.get_object_handle(reference));
+            }
+        }
+
+        let resources = page_handle.try_get_key(b"/Resources")?;
+        let xobjects = resources.try_get_key(b"/XObject")?;
+        for key in xobjects.try_get_keys()? {
+            let image = xobjects.try_get_key(&key)?;
+            let mut references = Vec::new();
+            collect_canonical_enqueue_refs(pdf, &image, 0, true, &mut references)?;
+            for reference in references {
+                seeds.push(pdf.get_object_handle(reference));
+            }
+            seeds.push(pdf.new_stream_with_data(Rc::new(b"q /image Do Q\n".to_vec()))?);
+        }
+    }
+
+    let root = pdf.root_handle()?;
+    let mut references = Vec::new();
+    collect_canonical_enqueue_refs(pdf, &root, 0, true, &mut references)?;
+    for reference in references {
+        seeds.push(pdf.get_object_handle(reference));
+    }
+    Ok(seeds)
+}
+
+#[cfg(test)]
+use crate::writer::rewrite_renumber::collect_canonical_children;
+#[cfg(test)]
+use crate::ObjectRef;
+#[cfg(test)]
+use std::collections::HashMap;
+
+#[cfg(test)]
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub(crate) enum Item {
     Source {
@@ -24,16 +74,13 @@ pub(crate) enum Item {
     },
 }
 
+#[cfg(test)]
 #[derive(Clone, Debug)]
 pub(crate) struct Plan {
     pub(crate) items: Vec<Item>,
-    pub(crate) old_to_new: HashMap<ObjectRef, ObjectRef>,
-    /// Remapped Catalog identity when the source `/Root` is indirect.
-    pub(crate) root: Option<ObjectRef>,
-    /// Canonical Catalog handle when the source `/Root` is direct.
-    pub(crate) direct_root: Option<ObjectHandle>,
 }
 
+#[cfg(test)]
 impl Plan {
     pub(crate) fn build<R: Read + Seek>(pdf: &mut Pdf<R>) -> Result<Self> {
         let root_candidate = pdf.trailer_key_handle(b"Root");
@@ -99,19 +146,13 @@ impl Plan {
             }
         }
 
-        let root = root_ref.and_then(|root| builder.old_to_new.get(&root).copied());
-        if root_ref.is_some() && root.is_none() {
-            return Err(crate::Error::Missing("/Root")); // cov:ignore: enqueue_reference always inserts an indirect PCLm root before the plan map is read.
-        }
         Ok(Self {
             items: builder.items,
-            old_to_new: builder.old_to_new,
-            root,
-            direct_root,
         })
     }
 }
 
+#[cfg(test)]
 struct Builder<'pdf, R: Read + Seek + 'static> {
     pdf: &'pdf mut Pdf<R>,
     items: Vec<Item>,
@@ -119,6 +160,7 @@ struct Builder<'pdf, R: Read + Seek + 'static> {
     next_output: u32,
 }
 
+#[cfg(test)]
 impl<R: Read + Seek + 'static> Builder<'_, R> {
     fn enqueue_reference(&mut self, source: ObjectRef) {
         if source.number == 0 || self.old_to_new.contains_key(&source) {
@@ -335,7 +377,7 @@ mod tests {
             ..crate::writer::WriterOptions::default()
         };
         let mut output = Vec::new();
-        let result = crate::writer::write_pclm(&mut pdf, &mut output, &options);
+        let result = crate::writer::pclm_live::write_pclm(&mut pdf, &mut output, &options);
 
         assert!(result.is_ok(), "qpdf-compatible PCLm output: {result:?}");
         let output = String::from_utf8_lossy(&output);
@@ -355,7 +397,7 @@ mod tests {
             ..crate::writer::WriterOptions::default()
         };
         let mut output = Vec::new();
-        let result = crate::writer::write_pclm(&mut pdf, &mut output, &options);
+        let result = crate::writer::pclm_live::write_pclm(&mut pdf, &mut output, &options);
 
         assert!(result.is_ok(), "qpdf-compatible PCLm output: {result:?}");
         let output = String::from_utf8_lossy(&output);

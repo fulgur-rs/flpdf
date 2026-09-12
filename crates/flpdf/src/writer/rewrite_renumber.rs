@@ -305,6 +305,7 @@ fn collect_canonical_enqueue_refs_with_stream_policy<R: Read + Seek>(
     )
 }
 
+#[cfg(test)]
 pub(crate) fn collect_canonical_children<R: Read + Seek>(
     pdf: &mut Pdf<R>,
     handle: &crate::ObjectHandle,
