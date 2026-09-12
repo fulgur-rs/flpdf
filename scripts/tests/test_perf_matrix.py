@@ -104,6 +104,21 @@ class MeasurementContracts(unittest.TestCase):
             self.assertTrue(
                 perf.validate_sample(sample, "json", None, None, 1, "qtest", 10)["ok"])
 
+    @unittest.skipUnless(pinned_qpdf_available(), "qpdf 11.9.0 required")
+    def test_linearize_requires_a_linearized_output(self):
+        """An ordinary rewrite is a valid PDF; the operation must still be checked."""
+        qpdf = shutil.which("qpdf")
+        with tempfile.TemporaryDirectory() as tmp:
+            source = Path(tmp) / "input.pdf"
+            perf.generate_pdf(source, "pages", 2)
+            sample = {"exit_status": 0, "max_rss_kib": 100, "stdout": str(Path(tmp) / "unused")}
+            for operation, expected in (("linearize", False), ("rewrite", True)):
+                output = Path(tmp) / f"{operation}.pdf"
+                subprocess.run([qpdf, str(source), "--static-id", str(output)],
+                               capture_output=True, check=True)
+                result = perf.validate_sample(sample, operation, output, qpdf, 2, "pages", 60)
+                self.assertEqual(result["ok"], expected, f"{operation}: {result}")
+
     def test_marker_check_requires_the_embedded_file_tree_for_streams(self):
         perf.require_markers("/Bench /EmbeddedFiles", "stream")
         perf.require_markers("/Bench", "pages")

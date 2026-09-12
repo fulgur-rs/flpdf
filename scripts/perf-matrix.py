@@ -246,6 +246,11 @@ def validate_sample(sample, operation, output, qpdf, expected_pages, family, tim
                                      env=ENV, timeout=timeout)
             if checked.returncode:
                 raise ValueError("output qpdf --check: " + checked.stderr.decode(errors="replace"))
+            # A binary that ignores --linearize still produces a valid PDF, which
+            # this generic check accepts. qpdf reports the property explicitly,
+            # so read it from the output already collected.
+            if operation == "linearize" and b"File is linearized" not in checked.stdout:
+                raise ValueError("output is not linearized")
             if int(capture([qpdf, "--show-npages", output])) != expected_pages:
                 raise ValueError("output page count mismatch")
             require_markers(capture([qpdf, "--json=2", output]), family)
