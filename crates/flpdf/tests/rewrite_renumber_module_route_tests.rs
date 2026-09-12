@@ -136,14 +136,15 @@ fn contains_token(haystack: &str, needle: &str) -> bool {
 }
 
 #[test]
-fn production_renumber_route_has_only_the_canonical_handle_engine() {
+fn production_renumber_route_has_only_the_canonical_handle_walk() {
     let source = fs::read_to_string(source_root().join("writer/rewrite_renumber.rs"))
         .expect("rewrite_renumber.rs must be readable");
     let production = strip_cfg_test_items(&source);
 
     assert!(
-        production.contains("CanonicalCatalogFirstRenumber"),
-        "production renumbering must retain the canonical handle engine"
+        production.contains("collect_canonical_enqueue_refs")
+            && production.contains("collect_canonical_children_with_linearized_omission"),
+        "production renumbering must retain the canonical resolving handle walk"
     );
     for forbidden in [
         "struct CatalogFirstRenumber",
