@@ -74,8 +74,8 @@ use crate::writer::object_streams::{
 };
 use crate::writer::{
     decrement_progress_event, effective_pdf_version_and_ext, effective_stream_policy,
-    inject_adbe_extension, report_progress_event, serialize::xref_stream, strip_adbe_extension,
-    CompressStreams, NewlineBeforeEndstream, ObjectWriterEmission, WriterOptions, WriterResult,
+    report_progress_event, serialize::xref_stream, CompressStreams, NewlineBeforeEndstream,
+    ObjectWriterEmission, WriterOptions, WriterResult,
 };
 use crate::{ObjectHandle, ObjectRef, Pdf, Result};
 
@@ -2068,6 +2068,8 @@ fn do_write_pass<R: Read + Seek>(
     mut id_writer: Option<crate::pdf_syntax::ReborrowableIdWriter>,
     encrypt_ctx: Option<&crate::writer::EncryptionContext>,
     mut encrypted_string_emitter: Option<&mut EncryptedStringEmitter>,
+    final_pdf_version: &str,
+    final_extension_level: i64,
 ) -> Result<LinearizedPassOutput> {
     let mut bytes: Vec<u8> = Vec::new();
     let mut xref_offsets: BTreeMap<u32, usize> = BTreeMap::new();
@@ -2230,11 +2232,17 @@ fn do_write_pass<R: Read + Seek>(
                 .contains_key(&catalog_orig),
             "planner invariant: /Catalog is never an ObjStm member"
         );
-        let offset = append_body_object_for_ref(
+        // QPDFWriter::writeObject reports progress before unparseObject
+        // mutates shared Extensions (QPDFWriter.cc:1773,1794).
+        report_progress_event(options)?;
+        let catalog = pdf
+            .get_object_handle(catalog_orig)
+            .output_root_copy_with_adbe(final_pdf_version, final_extension_level, true)?;
+        let offset = append_body_object(
             &mut bytes,
-            pdf,
             catalog_new_ref,
             catalog_orig,
+            &catalog,
             options,
             encrypt_ctx,
             encrypted_string_emitter.as_deref_mut(),
@@ -2243,7 +2251,6 @@ fn do_write_pass<R: Read + Seek>(
             &plan.content_normalize_refs,
         )?; // cov:ignore: planner-produced Catalog references are valid by construction.
         xref_offsets.insert(catalog_new_ref.number, offset);
-        report_progress_event(options)?;
         catalog_emitted_early = true;
     }
 
@@ -2933,46 +2940,6 @@ fn reject_multiple_generations(plan: &LinearizationPlan) -> Result<()> {
     Ok(())
 }
 
-/// Resolved state of the destination Catalog's /Extensions /ADBE entry.
-struct CatalogAdbeStatus {
-    /// Whether an /ADBE key exists under /Extensions in a dictionary.
-    /// This mirrors qpdf's key-existence-based removal trigger
-    /// (QPDFWriter.cc:1387), not /ExtensionLevel validity.
-    has_adbe: bool,
-}
-
-fn finish_linearization_write<T>(result: Result<T>, restore: Result<()>) -> Result<T> {
-    match (result, restore) {
-        (Err(error), _) => Err(error),
-        (Ok(value), Ok(())) => Ok(value),
-        (Ok(_), Err(error)) => Err(error),
-    }
-}
-
-/// Resolve Catalog ADBE state from the live handle graph.
-fn resolve_catalog_adbe_status<R: Read + Seek>(pdf: &mut Pdf<R>) -> Result<CatalogAdbeStatus> {
-    const NONE: CatalogAdbeStatus = CatalogAdbeStatus { has_adbe: false };
-
-    // cov:ignore-start: defensive /Root guard. A successful linearization
-    // plan always carries the same Catalog root on this Pdf.
-    let Some(root_ref) = pdf.root_ref() else {
-        return Ok(NONE);
-    };
-    // cov:ignore-end
-
-    let catalog = pdf.get_object_handle(root_ref);
-    if !catalog.try_is_dictionary()? {
-        return Ok(NONE);
-    }
-    let extensions = catalog.try_get_key(b"/Extensions")?;
-    if !extensions.try_is_dictionary()? {
-        return Ok(NONE);
-    }
-    Ok(CatalogAdbeStatus {
-        has_adbe: extensions.try_has_key(b"/ADBE")?,
-    })
-}
-
 /// Write a complete linearized PDF to an in-memory buffer.
 ///
 /// Given a [`LinearizationPlan`] (which partitions all objects into the four
@@ -3055,12 +3022,6 @@ pub(crate) fn write_linearized_for_pdf_writer<R: Read + Seek>(
     pass1_path: Option<&Path>,
     setup: crate::writer::WriterSetupState,
 ) -> Result<(LinearizedDocument, WriterResult)> {
-    // Capture the already-prepared Catalog extension entry before the
-    // output-only ADBE mutation. PdfWriter::write performs qpdf's permanent
-    // prepareFileForWrite boundary before choosing this route, so restoration
-    // cannot undo graph preparation.
-    let catalog_snapshot = crate::writer::snapshot_catalog_extensions(pdf)?;
-
     let plan_result = (|| {
         let mode = if crate::writer::force_version_below_1_5(options) {
             crate::writer::ObjectStreamMode::Disable
@@ -3092,12 +3053,9 @@ pub(crate) fn write_linearized_for_pdf_writer<R: Read + Seek>(
         Ok((plan, renumber))
     })();
 
-    let result = plan_result.and_then(|(plan, renumber)| {
+    plan_result.and_then(|(plan, renumber)| {
         write_linearized_impl(&plan, &renumber, pdf, options, pass1_path, setup)
-    });
-
-    let restore = crate::writer::restore_catalog_extensions(pdf, catalog_snapshot);
-    finish_linearization_write(result, restore)
+    })
 }
 
 /// Write the pass-1 body through qpdf's stdio-shaped buffering boundary.
@@ -3594,14 +3552,6 @@ fn write_linearized_impl<R: Read + Seek>(
     let source_ext = pdf.adobe_extension_level()?.unwrap_or(0);
     let (eff_version, eff_ext) =
         effective_pdf_version_and_ext(&source_ver, source_ext, options, true, emits_object_streams);
-    let adbe_status = resolve_catalog_adbe_status(pdf)?;
-    if eff_ext > 0 || adbe_status.has_adbe {
-        if eff_ext > 0 {
-            inject_adbe_extension(pdf, eff_version, eff_ext)?;
-        } else {
-            strip_adbe_extension(pdf, eff_version, eff_ext)?;
-        }
-    }
     let part1 = Part1Bytes::build(plan, renumber, eff_version);
     let part1_placeholders = part1.placeholders.clone();
     let part1_dict_region = part1.dict_writable_region.clone();
@@ -3803,6 +3753,8 @@ fn write_linearized_impl<R: Read + Seek>(
         None,
         encrypt_ctx.as_ref(),
         encrypted_string_emitter.as_mut(),
+        eff_version,
+        eff_ext,
     )?; // cov:ignore: pass-1 mode uses the same write path as the successful final pass while omitting only the hint object.
 
     let classic_det_id: Option<(Vec<u8>, [u8; 16])> = if deterministic_id {
@@ -4203,6 +4155,8 @@ fn write_linearized_impl<R: Read + Seek>(
         id_writer,
         encrypt_ctx.as_ref(),
         encrypted_string_emitter.as_mut(),
+        eff_version,
+        eff_ext,
     )?; // cov:ignore: pass 2 reuses the validated plan and fixed layout after pass 1 succeeds; this is only defensive error propagation.
     let LinearizedPassOutput {
         bytes: mut final_bytes,

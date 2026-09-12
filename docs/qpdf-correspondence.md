@@ -2856,3 +2856,23 @@ source route contract は
 `crates/flpdf/tests/final_accessor_route_tests.rs`、qpdf source mirrorは
 `/home/ubuntu/.cache/flpdf/qpdf-11.9.0`（pinned HEAD
 `3b97c9bd266b7c32ea36d3536e22dab77412886d`）である。
+
+### Linearized root ADBE output ownership (`flpdf-3yn9.48.60`)
+
+`linearization/writer.rs::do_write_pass` emits each pass's Catalog through
+`ObjectWriterEmission::output_root_copy_with_adbe`. Progress precedes root
+reconciliation and unparse, matching `QPDFWriter.cc:1773-1794`. The final
+version/extension pair is fixed before the passes; each pass makes an output
+shallow copy while sharing existing direct Extensions values
+(`QPDFWriter.cc:1347-1435,2786-2808`). A first-root callback failure leaves
+the source extension level unchanged; a second-pass callback or final sink
+failure retains the first pass's shared changes. The linearized route no
+longer calls the Catalog snapshot/restore helpers. Permanent
+`prepareFileForWrite` remains on the common writer boundary.
+
+This is a bounded linearized cutover. Specialized standard output still
+uses the old snapshot/restore helpers: removing its pre-emission mutation
+before migrating child discovery regresses encrypted ADBE-only orphan
+reachability. `flpdf-s07c` owns that prerequisite, and `flpdf-ay5b` retains
+the separate QDF/normalize residual. D25 remains mixed until those remaining
+root consumers migrate; the full helper-removal condition is not met here.
