@@ -259,10 +259,13 @@ GitHub Actions.
 
 Because this task crosses planning, emission, object streams, and xref
 ownership, execute it as two reviewable stages while preserving the same
-acceptance contract. Stage A completes Steps 1–2 and removes payload-dependent
-planning. Stage B completes Steps 3–7 and performs final-sink emission,
-verification, and the exact Task 4 commit. Neither stage may claim Task 4
-complete until both stages have passed their scoped review.
+acceptance contract. Stage A completes Steps 1–2 and the emission-time stream
+child-discovery/numbering portion of Step 3 using the existing body buffer;
+this prevents a planned route from guessing the surviving dictionary while
+keeping final-output ownership unchanged. Stage B completes the final-sink
+portion of Step 3, Steps 4–7, and the complete-PDF ownership removal. Neither
+stage may claim Task 4 complete until both stages have passed their scoped
+review.
 
 - [ ] **Step 1: Extract or generalize LiveQueue without changing its proven Disable order.**
 
