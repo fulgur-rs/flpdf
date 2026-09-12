@@ -1759,14 +1759,21 @@ impl LinearizationPlan {
             }
         });
         // Outline objects are in the first-page section (physically owned by
-        // page 0), so page 0 is not listed in referencing_pages.
-        let outline_entries =
-            outline_first_page_members
-                .iter()
-                .map(|&obj_ref| SharedObjectHintEntry {
-                    object_ref: obj_ref,
-                    referencing_pages: vec![],
-                });
+        // page 0), so page 0 is not listed in referencing_pages. An outline
+        // object that is also reached from a later page must still list that
+        // later page: qpdf includes every part-6 object in the shared-object
+        // table and adds identifiers for later-page users
+        // (QPDF_linearization.cc:1354-1356,1388-1400).
+        let outline_entries = outline_first_page_members.iter().map(|&obj_ref| {
+            let pages: Vec<u32> = all_referenced_pages
+                .get(&obj_ref)
+                .map(|set| set.iter().copied().filter(|&page| page != 0).collect())
+                .unwrap_or_default();
+            SharedObjectHintEntry {
+                object_ref: obj_ref,
+                referencing_pages: pages,
+            }
+        });
         // Part-4 shared objects: referenced by ≥ 2 pages but NOT in the
         // first-page closure.  These live after /E (not physically owned
         // by any page via layout), so ALL referencing pages are listed.
