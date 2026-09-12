@@ -154,6 +154,7 @@
 | `crates/flpdf/src/writer/object_streams/emission.rs` | correspondence | QPDFWriter.cc object-stream body and container emission |
 | `crates/flpdf/src/writer/object_streams/mod.rs` | correspondence | QPDF.cc getCompressibleObjGens and QPDFWriter.cc ObjStm planning and emission |
 | `crates/flpdf/src/writer/object_streams/planning.rs` | correspondence | QPDFWriter.cc object-stream planning and source-container preservation |
+| `crates/flpdf/src/writer/output.rs` | correspondence | QPDFWriter.cc pipeline ownership, Pl_Count accepted-byte accounting, PipelinePopper segment scopes, and deterministic-ID digest boundaries |
 | `crates/flpdf/src/writer/pclm.rs` | correspondence | \`QPDFWriter::enqueueObjectsPCLm\` |
 | `crates/flpdf/src/writer/pclm_live.rs` | correspondence | \`QPDFWriter::writeStandard\` and \`QPDFWriter::enqueueObjectsPCLm\` |
 | `crates/flpdf/src/writer/plain/body.rs` | correspondence | QPDFWriter.cc plain object-body emission split from planning and xref output |

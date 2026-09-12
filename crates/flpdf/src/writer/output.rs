@@ -1,3 +1,5 @@
+//! qpdf correspondence: QPDFWriter.cc pipeline ownership, Pl_Count accepted-byte accounting, PipelinePopper segment scopes, and deterministic-ID digest boundaries.
+
 use crate::{Error, Result};
 use md5::{Digest as _, Md5};
 use std::io::{self, ErrorKind, Write};

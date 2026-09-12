@@ -392,9 +392,7 @@ impl Write for FirstThenTeardownErrorWriter {
                     "task-6 first encrypted payload failure",
                 ))
             }
-            3 => {
-                Ok(0)
-            }
+            3 => Ok(0),
             _ => {
                 if self.arm.get()
                     && data
