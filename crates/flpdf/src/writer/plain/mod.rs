@@ -402,12 +402,13 @@ fn write_plain_live<R: Read + Seek, W: Write>(
         true,
         options.qdf,
     )?; // cov:ignore: shared late-trailer success continuation is covered by the QDF/normalize live tests
-        // Object streams require a cross-reference stream: a classic table has no
-        // type-2 row shape (ISO 32000-1 7.5.7). qpdf decides this from the same
-        // setup-time membership that set the version floor above
-        // (`QPDFWriter.cc:3023-3031`), not from what the walk turned out to
-        // reach, so a registered-but-unreached container still produces a
-        // cross-reference stream with zero type-2 rows.
+
+    // Object streams require a cross-reference stream: a classic table has no
+    // type-2 row shape (ISO 32000-1 7.5.7). qpdf decides this from the same
+    // setup-time membership that set the version floor above
+    // (`QPDFWriter.cc:3023-3031`), not from what the walk turned out to
+    // reach, so a registered-but-unreached container still produces a
+    // cross-reference stream with zero type-2 rows.
     let form = if has_object_stream_hint {
         XrefForm::Stream
     } else {
