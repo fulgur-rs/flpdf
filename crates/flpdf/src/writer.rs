@@ -856,17 +856,36 @@ impl<'pdf, R: Read + Seek + 'static> PdfWriter<'pdf, R> {
         // the repaired page order and its three derived maps together so the
         // specialized emitter consumes this setup without another page walk.
         let special_streams = initialize_special_streams(self.pdf, &options)?;
-        if effective_object_stream_mode(&options) == ObjectStreamMode::Generate
+        let effective_object_streams = effective_object_stream_mode(&options);
+        let specialized_standard_live = effective_object_streams == options.object_streams
             && !options.qdf
             && !options.content_normalization
             && !options.pclm
-        {
+            && !plain::eligible(self.pdf.is_encrypted(), &options, effective_object_streams);
+        if effective_object_streams == ObjectStreamMode::Generate && specialized_standard_live {
             // qpdf initializes special streams before Generate computes its
             // compressible membership (`QPDFWriter.cc:2114-2135`). Capture
             // this snapshot at the same boundary, still before the common
-            // `prepareFileForWrite` call below.
-            setup.generated_compressible =
-                Some(object_streams::compressible_objgens_qpdf_plan(self.pdf)?);
+            // `prepareFileForWrite` call below. Its fresh ObjStm placeholders
+            // are also allocated before getObjectCount so they contribute to
+            // the progress denominator (`QPDFWriter.cc:1998-2004,2189-2195`).
+            let compressible = object_streams::compressible_objgens_qpdf_plan(self.pdf)?;
+            let generated_object_stream_count =
+                object_streams::even_split_into_streams(&compressible.eligible).len();
+            setup.generated_compressible = Some(compressible);
+            for _ in 0..generated_object_stream_count {
+                let placeholder = self
+                    .pdf
+                    .make_indirect_from_object_handle(ObjectHandle::null())?;
+                let source = placeholder.object_ref().ok_or_else(|| {
+                    // cov:ignore-start: make_indirect_from_object_handle always returns an indirect handle
+                    Error::Internal(
+                        "generated ObjStm placeholder has no source identity".to_string(),
+                    )
+                    // cov:ignore-end
+                })?; // cov:ignore: make_indirect_from_object_handle guarantees a source identity for a generated placeholder.
+                setup.generated_object_stream_sources.push(source);
+            }
         }
         // qpdf snapshots `getObjectCount()` for every write, even when no
         // progress reporter is configured (`QPDFWriter.cc:2189-2195`). That
@@ -2850,6 +2869,10 @@ pub(crate) struct WriterSetupState {
     /// so output-time root reconciliation cannot feed a stale post-prepare
     /// graph into the planner.
     pub(crate) generated_compressible: Option<object_streams::CompressiblePlan>,
+    /// Fresh qpdf null placeholders allocated during setup for specialized
+    /// Generate groups. Their source identities must survive into the live
+    /// queue instead of being allocated after progress setup.
+    pub(crate) generated_object_stream_sources: Vec<ObjectRef>,
 }
 
 /// Build the shared writer state before standard/linearized dispatch.
@@ -2924,6 +2947,7 @@ pub(crate) fn build_writer_setup<R: Read + Seek>(
         encryption_parameters,
         source_object_stream_data,
         generated_compressible: None,
+        generated_object_stream_sources: Vec::new(),
     })
 }
 
@@ -4026,6 +4050,7 @@ fn emit_canonical_pdf_inner<R: Read + Seek, W: Write>(
         encryption_parameters,
         source_object_stream_data,
         generated_compressible,
+        generated_object_stream_sources,
     } = setup;
     let deterministic_id = uses_deterministic_id(options);
 
@@ -4078,6 +4103,7 @@ fn emit_canonical_pdf_inner<R: Read + Seek, W: Write>(
             encryption_parameters,
             &source_object_stream_data,
             generated_compressible.as_ref(),
+            &generated_object_stream_sources,
         );
     }
     // Compute the Adobe extension level before downstream dispatch. The plain
@@ -5897,6 +5923,7 @@ fn emit_specialized_standard_live<R: Read + Seek + 'static, W: Write>(
     encryption_parameters: Option<EncryptionParameters>,
     source_object_stream_data: &BTreeMap<u32, u32>,
     generated_compressible: Option<&object_streams::CompressiblePlan>,
+    generated_object_stream_sources: &[ObjectRef],
 ) -> Result<WriterResult> {
     let deterministic_id = uses_deterministic_id(options);
     let encrypting = options.encrypt.is_some() || options.copy_encryption.is_some();
@@ -5940,6 +5967,24 @@ fn emit_specialized_standard_live<R: Read + Seek + 'static, W: Write>(
         generated_compressible,
     )?; // cov:ignore: LLVM attributes the validated object-stream planning continuation to callback cleanup.
 
+    // Keep the pre-filter generated-group identity beside each member. The
+    // output-placement filter may remove a whole group (for example, a group
+    // containing only the encrypted Catalog), so the retained batch index is
+    // not necessarily the original Generate index.
+    let generated_source_by_member: HashMap<ObjectRef, ObjectRef> = plan
+        .batches
+        .iter()
+        .enumerate()
+        .filter_map(|(batch_index, members)| {
+            plan.source_containers[batch_index]
+                .is_none()
+                .then(|| generated_object_stream_sources.get(batch_index).copied())
+                .flatten()
+                .map(|source| members.iter().copied().map(move |member| (member, source)))
+        })
+        .flatten()
+        .collect();
+
     // Encrypted output keeps the Catalog outside ObjStm. This is the only
     // standard live-route placement filter; reachability is intentionally left
     // to the queue so output-time root reconciliation can discard a member
@@ -5965,16 +6010,26 @@ fn emit_specialized_standard_live<R: Read + Seek + 'static, W: Write>(
             object_stream_groups
                 .push(object_streams::ObjectStreamGroup::SourceBacked { source, members });
         } else {
-            // qpdf creates a fresh indirect null placeholder for each Generate
-            // group during setup. Retaining that identity lets the shared
-            // LiveQueue use the same source/container dispatch as Preserve,
-            // while activation still happens only at first live discovery.
-            let source_handle = pdf.make_indirect_from_object_handle(ObjectHandle::null())?;
-            let source = source_handle.object_ref().ok_or_else(|| {
-                // cov:ignore-start: make_indirect_from_object_handle always returns an indirect handle
-                Error::Internal("generated ObjStm placeholder has no source identity".to_string())
+            // qpdf creates a fresh indirect null object during setup. The
+            // normal PdfWriter path passes those identities from before
+            // getObjectCount; the direct internal test seam may omit them and
+            // allocates a fallback here.
+            let source = if let Some(source) = members
+                .first()
+                .and_then(|member| generated_source_by_member.get(member))
+                .copied()
+            {
+                source
+            } else {
+                // cov:ignore-start: production setup allocates one placeholder per generated group before this consumer runs.
+                let source_handle = pdf.make_indirect_from_object_handle(ObjectHandle::null())?;
+                source_handle.object_ref().ok_or_else(|| {
+                    Error::Internal(
+                        "generated ObjStm placeholder has no source identity".to_string(),
+                    )
+                })?
                 // cov:ignore-end
-            })?; // cov:ignore: make_indirect_from_object_handle guarantees a source identity for a generated placeholder.
+            };
             object_stream_groups
                 .push(object_streams::ObjectStreamGroup::Generated { source, members });
         }
@@ -6028,11 +6083,11 @@ fn emit_specialized_standard_live<R: Read + Seek + 'static, W: Write>(
     // queue has settled.
     let mut encrypt_ctx = encryption_parameters
         .map(|parameters| parameters.into_context(ObjectRef::new(u32::MAX, 0)));
-    let removed_refs = if options.object_streams == ObjectStreamMode::Generate {
-        plan.removed_refs.clone()
-    } else {
-        BTreeSet::new()
-    };
+    // Both Generate and Preserve may carry stale-generation removals from the
+    // qpdf compressible walk. Disable produces the empty plan. Keep the set for
+    // Preserve as well so stale aliases become null/omitted at emission time
+    // (`QPDFWriter.cc:1953-1966`, `QPDF.cc:2426-2443`).
+    let removed_refs = plan.removed_refs.clone();
     let mut body = plain::body::emit_live_specialized_standard(
         pdf,
         options,
@@ -6086,6 +6141,41 @@ fn emit_specialized_standard_live<R: Read + Seek + 'static, W: Write>(
         .as_ref()
         .map(|root| root.output_root_copy_with_adbe(&version, final_extension_level, false))
         .transpose()?;
+    let direct_root_bytes = direct_root_output
+        .as_ref()
+        .map(|root| {
+            let mut map_ref = |handle: &ObjectHandle| {
+                let object_ref = handle.object_ref().ok_or_else(|| {
+                    Error::Unsupported(
+                        "specialized live writer: direct /Root child has no object identity"
+                            .to_string(),
+                    )
+                })?;
+                body_map.get(&object_ref).copied().ok_or_else(|| {
+                    Error::Unsupported(format!(
+                        "specialized live writer: direct /Root reference {object_ref} absent from queue"
+                    ))
+                })
+            };
+            let mut write_string = |out: &mut Vec<u8>, value: &[u8]| {
+                crate::pdf_syntax::write_string_value(out, value);
+                Ok(())
+            };
+            let mut direct_stream_writer = object::DefaultDynamicDirectStreamWriter {
+                newline_before_endstream: Some(options.newline_before_endstream),
+            };
+            let mut bytes = Vec::new();
+            object::write_object_with_dynamic_ref_map_and_string_writer_and_direct_stream_writer(
+                &root,
+                &mut bytes,
+                &mut map_ref,
+                &removed_refs,
+                &mut write_string,
+                &mut direct_stream_writer,
+            )?;
+            Ok::<_, Error>(bytes)
+        })
+        .transpose()?;
     let trailer_size = body
         .object_count
         .checked_add(1 + usize::from(encrypt_ctx.is_some()))
@@ -6125,27 +6215,7 @@ fn emit_specialized_standard_live<R: Read + Seek + 'static, W: Write>(
             true,
         )?, // cov:ignore: LLVM attributes the validated canonical trailer snapshot continuation to callback cleanup.
         root: new_root,
-        direct_root: direct_root_output
-            .as_ref()
-            .map(|root| {
-                let map_ref = |object_ref: ObjectRef| {
-                    // cov:ignore-start: a direct Catalog's initial and callback-discovered children are seeded by the same live queue; this guard is defensive for a violated queue invariant.
-                    body_map.get(&object_ref).copied().ok_or_else(|| {
-                        Error::Unsupported(format!(
-                            "specialized live writer: direct /Root reference {object_ref} absent from queue"
-                        ))
-                    })
-                    // cov:ignore-end
-                };
-                let mut bytes = Vec::new();
-                root.write_object_with_ref_map_and_removed(
-                    &mut bytes,
-                    &map_ref,
-                    &removed_refs,
-                )?; // cov:ignore: LLVM attributes the validated direct-root serializer continuation to callback cleanup
-                Ok::<_, Error>(bytes)
-            })
-            .transpose()?,
+        direct_root: direct_root_bytes,
         id,
         encrypt: encrypt_ctx.as_ref().map(|ctx| ctx.encrypt_ref),
         structural_filtered,
@@ -6253,6 +6323,7 @@ mod final_handle_writer_tests {
             encryption_parameters: None,
             source_object_stream_data: BTreeMap::new(),
             generated_compressible: None,
+            generated_object_stream_sources: Vec::new(),
         };
         let mut output = Vec::new();
 
@@ -6284,6 +6355,7 @@ mod final_handle_writer_tests {
             encryption_parameters: None,
             source_object_stream_data: BTreeMap::new(),
             generated_compressible: None,
+            generated_object_stream_sources: Vec::new(),
         };
         let options = WriterOptions {
             object_streams: ObjectStreamMode::Generate,

@@ -643,7 +643,12 @@ impl crate::writer::object::DynamicDirectStreamWriter for LiveDirectStreamWriter
         stream.try_dereference()?;
         let (dict, data, dictionary_options) = canonical_stream_output(stream, self.options)?;
         let stream_encryption = self.encryption_context;
-        let encrypt_stream = stream_encryption.is_some_and(|ctx| ctx.encrypt_metadata);
+        let is_metadata_stream = dict.try_is_dictionary_of_type(b"Metadata", b"")?;
+        // qpdf exempts only a stream whose dictionary is /Type /Metadata when
+        // EncryptMetadata is false. A direct Stream nested in an ordinary
+        // object remains encrypted (`QPDFWriter.cc:1251-1278,1545-1556`).
+        let encrypt_stream =
+            stream_encryption.is_some_and(|ctx| ctx.encrypt_metadata || !is_metadata_stream);
         let mut stream_length = data.len();
         if let Some(ctx) = stream_encryption {
             crate::writer::adjust_aes_stream_length(&mut stream_length, ctx, encrypt_stream)?;
@@ -1047,9 +1052,10 @@ impl<'a, R: Read + Seek + 'static> LiveObjectEmitter<'a, R> {
             handles.push((member_output, handle));
         }
         if self.two_pass_object_streams {
-            // qpdf's first pass only measures member offsets. It decrements
-            // the progress event count and performs the same live unparse,
-            // but does not notify the reporter (`QPDFWriter.cc:1639-1699`).
+            // qpdf's first pass decrements the anticipated count and then
+            // writeObject increments it again before the member unparse. The
+            // same indicateProgress(false, false) boundary is used by the
+            // final pass (`QPDFWriter.cc:1639-1707,1771-1796`).
             let mut first_pass = |out: &mut Vec<u8>,
                                   member_index: u32,
                                   member_ref: ObjectRef,
@@ -1059,7 +1065,7 @@ impl<'a, R: Read + Seek + 'static> LiveObjectEmitter<'a, R> {
                     member_index,
                     member_ref,
                     handle,
-                    false,
+                    true,
                     false,
                     true,
                 )

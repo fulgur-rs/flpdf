@@ -500,3 +500,12 @@ decrypt/preserve matrixを確認した。
 `restore_catalog_extensions` caller-zero、ならびにroute matrix全体の
 bridge/mixed解消を完了とは扱わない。`.60` はこのsliceを取り込んだ後に
 specialized root ownerを最終cutoverし、残るhelper callerを監査して撤去する。
+
+後続のoracle再確認で、specialized consumerの境界もqpdfに合わせて補正した。
+GenerateのObjStm placeholderは`getObjectCount`より前にsetupで確保し、progressの
+first/final passは`writeObject`と同じ`indicateProgress(false, false)`位置で動かす。
+`EncryptMetadata=false`は`/Type /Metadata`のstreamだけをcleartextにし、通常の
+direct Streamは暗号化する。Preserveのstale generation removalはGenerateと同じく
+emissionまで渡し、classic xref trailerのdirect Rootもdynamic serializerを通して
+payload/framingを保持する。これらはQPDFWriter.cc:1251-1278,1639-1707,
+1953-1966,1998-2004,2189-2195,3023-3031に対応する。

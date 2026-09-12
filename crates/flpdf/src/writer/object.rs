@@ -624,7 +624,9 @@ impl ObjectWriterEmission for ObjectHandle {
     where
         F: FnMut(&mut Vec<u8>, &[u8]) -> Result<()>,
     {
-        let mut direct_stream_writer = DefaultDynamicDirectStreamWriter;
+        let mut direct_stream_writer = DefaultDynamicDirectStreamWriter {
+            newline_before_endstream: None,
+        };
         write_object_with_dynamic_ref_map_and_string_writer_and_direct_stream_writer(
             self,
             out,
@@ -646,7 +648,9 @@ impl ObjectWriterEmission for ObjectHandle {
     where
         F: FnMut(&mut Vec<u8>, &[u8]) -> Result<()>,
     {
-        let mut direct_stream_writer = DefaultDynamicDirectStreamWriter;
+        let mut direct_stream_writer = DefaultDynamicDirectStreamWriter {
+            newline_before_endstream: None,
+        };
         let entries = stream_dictionary_entries_for_emission(self)?;
         unparse_stream_dict_entries_with_dynamic_ref_map_and_string_writer(
             &entries,
@@ -1287,6 +1291,7 @@ impl ObjectWriterEmission for ObjectHandle {
                 map,
                 removed_refs,
                 suppress_null_values,
+                None,
                 out,
             )
         })
@@ -1342,6 +1347,50 @@ impl ObjectWriterEmission for ObjectHandle {
     ) -> Result<()> {
         write_id_style_value_handle_with_ref_map(self, out, map, removed_refs)
     }
+}
+
+/// Classic xref trailers need the same direct Catalog serialization as the
+/// xref-stream route. The caller supplies the already-emitted direct-root
+/// bytes so nested direct Streams retain their payload and framing instead
+/// of falling through the generic trailer child walker.
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn write_trailer_with_ref_map_and_kind_and_direct_root(
+    trailer: &ObjectHandle,
+    out: &mut Vec<u8>,
+    kind: TrailerKind,
+    xref_stream: bool,
+    qdf: bool,
+    id_writer: Option<crate::pdf_syntax::TrailerIdWriter>,
+    map: &dyn Fn(ObjectRef) -> Result<ObjectRef>,
+    removed_refs: &BTreeSet<ObjectRef>,
+    suppress_null_values: bool,
+    direct_root: &[u8],
+) -> Result<()> {
+    if trailer.is_reserved() {
+        return Err(reserved_unparse_error());
+    }
+    trailer.try_dereference()?;
+    trailer.with_value(|value| {
+        let entries: Vec<(Vec<u8>, ObjectHandle)> = match value {
+            Some(ObjectValue::Dictionary(entries)) => entries
+                .iter()
+                .map(|(key, value)| (key.clone(), value.clone()))
+                .collect(),
+            _ => Vec::new(),
+        };
+        unparse_trailer_entries_with_ref_map_and_kind(
+            &entries,
+            kind,
+            xref_stream,
+            qdf,
+            id_writer,
+            map,
+            removed_refs,
+            suppress_null_values,
+            Some(direct_root),
+            out,
+        )
+    })
 }
 /// Apply qpdf's stream-dictionary preparation to a shallow copy.
 ///
@@ -2373,7 +2422,11 @@ pub(crate) trait DynamicDirectStreamWriter {
     ) -> Result<()>;
 }
 
-pub(crate) struct DefaultDynamicDirectStreamWriter;
+pub(crate) struct DefaultDynamicDirectStreamWriter {
+    /// `None` retains the low-level helper's historical newline behavior;
+    /// writer-owned consumers pass qpdf's explicit policy.
+    pub(crate) newline_before_endstream: Option<crate::writer::NewlineBeforeEndstream>,
+}
 
 impl DynamicDirectStreamWriter for DefaultDynamicDirectStreamWriter {
     fn write_direct_stream(
@@ -2413,7 +2466,13 @@ impl DynamicDirectStreamWriter for DefaultDynamicDirectStreamWriter {
         )?; // cov:ignore: the validated direct-stream dictionary serializer is covered; LLVM attributes its multiline terminator here.
         out.extend_from_slice(b"\nstream\n");
         out.extend_from_slice(data.as_ref());
-        out.extend_from_slice(b"\nendstream");
+        if self
+            .newline_before_endstream
+            .is_none_or(|policy| matches!(policy, crate::writer::NewlineBeforeEndstream::Yes))
+        {
+            out.push(b'\n');
+        }
+        out.extend_from_slice(b"endstream");
         Ok(())
     }
 }
@@ -2505,7 +2564,9 @@ fn write_child_with_dynamic_ref_map(
             crate::pdf_syntax::write_string_value(out, value);
             Ok(())
         };
-        let mut direct_stream_writer = DefaultDynamicDirectStreamWriter;
+        let mut direct_stream_writer = DefaultDynamicDirectStreamWriter {
+            newline_before_endstream: None,
+        };
         return direct_stream_writer.write_direct_stream(
             handle,
             out,
@@ -4180,6 +4241,7 @@ fn unparse_trailer_entries_with_ref_map_and_kind(
     map: &dyn Fn(ObjectRef) -> Result<ObjectRef>,
     removed_refs: &BTreeSet<ObjectRef>,
     suppress_null_values: bool,
+    direct_root: Option<&[u8]>,
     out: &mut Vec<u8>,
 ) -> Result<()> {
     let (size, prev, second_half) = match kind {
@@ -4255,7 +4317,9 @@ fn unparse_trailer_entries_with_ref_map_and_kind(
         write_dictionary_key(out, key);
         out.push(b' ');
         if key.as_slice() == b"/Root" && value.object_ref().is_none() {
-            if qdf {
+            if let Some(direct_root) = direct_root {
+                out.extend_from_slice(direct_root);
+            } else if qdf {
                 write_child_qdf_with_ref_map(value, 2, out, map, removed_refs)?;
             } else {
                 write_child_with_ref_map(value, out, map, removed_refs)?;
@@ -4878,7 +4942,9 @@ mod tests {
         let mut root_map = |handle: &ObjectHandle| {
             Ok(handle.object_ref().expect("root dynamic child is indirect"))
         };
-        let mut root_direct_stream_writer = super::DefaultDynamicDirectStreamWriter;
+        let mut root_direct_stream_writer = super::DefaultDynamicDirectStreamWriter {
+            newline_before_endstream: None,
+        };
         super::write_root_object_with_dynamic_ref_map_and_string_writer_and_direct_stream_writer(
             &root,
             &mut root_output,

@@ -360,7 +360,9 @@ fn specialized_encrypted_nested_direct_stream_keeps_payload_and_framing() {
     writer.set_object_stream_mode(ObjectStreamMode::Disable);
     writer.set_compress_streams(false);
     writer.set_extra_header_text("% specialized-live-queue");
-    writer.set_encryption_parameters(EncryptParams::v4_aes128(b"u", b"o"));
+    let mut encryption = EncryptParams::v4_aes128(b"u", b"o");
+    encryption.encrypt_metadata = false;
+    writer.set_encryption_parameters(encryption);
     writer.set_static_id(true);
     writer.set_static_aes_iv(true);
     writer.set_output_memory().unwrap();
@@ -379,4 +381,48 @@ fn specialized_encrypted_nested_direct_stream_keeps_payload_and_framing() {
     assert!(!output
         .windows(b"encrypted-direct-payload".len())
         .any(|window| window == b"encrypted-direct-payload"));
+}
+
+#[test]
+fn specialized_direct_root_nested_stream_keeps_payload_and_framing() {
+    let mut pdf = Pdf::open(Cursor::new(
+        include_bytes!("../../../tests/fixtures/compat/direct-root-one-page.pdf").to_vec(),
+    ))
+    .unwrap();
+    assert!(
+        pdf.root_ref().is_none(),
+        "fixture must have a direct Catalog"
+    );
+    pdf.root_handle()
+        .unwrap()
+        .replace_key(
+            b"/DirectRootStreamProbe",
+            ObjectHandle::stream(
+                ObjectHandle::dictionary(vec![
+                    (b"/Length".to_vec(), ObjectHandle::integer(999)),
+                    (
+                        b"/DirectRootStreamLabel".to_vec(),
+                        ObjectHandle::string(b"direct-root".to_vec()),
+                    ),
+                ]),
+                Rc::new(b"direct-root-payload".to_vec()),
+            ),
+        )
+        .unwrap();
+    let mut writer = PdfWriter::new(&mut pdf);
+    writer.set_object_stream_mode(ObjectStreamMode::Disable);
+    writer.set_compress_streams(false);
+    writer.set_extra_header_text("% specialized-live-queue");
+    writer.set_static_id(true);
+    writer.set_output_memory().unwrap();
+    writer
+        .write()
+        .expect("specialized direct-root stream write succeeds");
+    let output = writer.get_buffer().unwrap();
+    assert!(output
+        .windows(b"/DirectRootStreamLabel (direct-root)".len())
+        .any(|window| window == b"/DirectRootStreamLabel (direct-root)"));
+    assert!(output
+        .windows(b"stream\ndirect-root-payloadendstream".len())
+        .any(|window| window == b"stream\ndirect-root-payloadendstream"));
 }

@@ -1,7 +1,9 @@
 //! qpdf getCompressibleObjGens removes stale generations from the live graph.
 
-use flpdf::{ObjectHandle, ObjectRef, ObjectStreamMode, Pdf, PdfWriter};
+use flpdf::{EncryptParams, ObjectHandle, ObjectRef, ObjectStreamMode, Pdf, PdfWriter};
+use std::fs;
 use std::io::Cursor;
+use std::process::Command;
 
 #[test]
 fn generate_turns_a_retained_stale_generation_handle_into_direct_null() {
@@ -118,6 +120,55 @@ fn repeated_generate_preserve_does_not_resurrect_a_removed_generation() {
             .windows(b" 42\n".len())
             .any(|window| window == b" 42\n"));
     }
+}
+
+#[cfg(feature = "qpdf-zlib-compat")]
+#[test]
+fn specialized_preserve_encryption_removes_stale_generation_like_qpdf() {
+    let temporary = tempfile::tempdir().unwrap();
+    let input = temporary.path().join("input.pdf");
+    let qpdf_output = temporary.path().join("qpdf.pdf");
+    fs::write(
+        &input,
+        include_bytes!("../../../tests/fixtures/compat/null-visible-stale-generation-objstm.pdf"),
+    )
+    .unwrap();
+    let qpdf = Command::new("qpdf")
+        .args([
+            "--static-id",
+            "--static-aes-iv",
+            "--object-streams=preserve",
+            "--encrypt",
+            "u",
+            "o",
+            "128",
+            "--use-aes=y",
+            "--",
+        ])
+        .arg(&input)
+        .arg(&qpdf_output)
+        .output()
+        .unwrap();
+    assert!(
+        qpdf.status.success(),
+        "qpdf preserve/encrypt failed: {}",
+        String::from_utf8_lossy(&qpdf.stderr)
+    );
+
+    let mut pdf = Pdf::open(Cursor::new(fs::read(&input).unwrap())).unwrap();
+    let mut writer = PdfWriter::new(&mut pdf);
+    writer.set_object_stream_mode(ObjectStreamMode::Preserve);
+    writer.set_encryption_parameters(EncryptParams::v4_aes128(b"u", b"o"));
+    writer.set_static_id(true);
+    writer.set_static_aes_iv(true);
+    writer.set_output_memory().unwrap();
+    writer.write().unwrap();
+
+    assert_eq!(
+        writer.get_buffer().unwrap(),
+        fs::read(&qpdf_output).unwrap(),
+        "specialized Preserve must carry qpdf's stale-generation removal into encrypted output"
+    );
 }
 
 #[cfg(feature = "qpdf-zlib-compat")]
