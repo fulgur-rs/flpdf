@@ -160,8 +160,9 @@ fn direct_scalar_uses_at_most_three_allocations() {
     const STREAM_BYTES: usize = 64 * 1024;
 
     let (scalar, direct_scalar) = measure_construction(|| ObjectHandle::integer(7));
-    std::hint::black_box(scalar);
+    std::hint::black_box(&scalar);
     report_measurement("direct-scalar", direct_scalar);
+    assert_eq!(scalar.try_get_int_value().unwrap(), 7);
 
     assert!(
         direct_scalar.allocations <= 3,
@@ -184,8 +185,26 @@ fn direct_scalar_uses_at_most_three_allocations() {
     let (wide_array, scalar_heavy) = measure_construction(|| {
         ObjectHandle::array(values.iter().copied().map(ObjectHandle::integer).collect())
     });
-    std::hint::black_box(wide_array);
+    std::hint::black_box(&wide_array);
     report_measurement("wide-array-scalar-heavy", scalar_heavy);
+    assert!(wide_array.try_is_array().unwrap());
+    assert_eq!(wide_array.try_get_array_n_items().unwrap(), WIDE_ITEMS);
+    assert_eq!(
+        wide_array
+            .try_get_array_item(0)
+            .unwrap()
+            .try_get_int_value()
+            .unwrap(),
+        0
+    );
+    assert_eq!(
+        wide_array
+            .try_get_array_item((WIDE_ITEMS - 1) as i64)
+            .unwrap()
+            .try_get_int_value()
+            .unwrap(),
+        (WIDE_ITEMS - 1) as i64
+    );
 
     let (wide_dictionary, dictionary_heavy) = measure_construction(|| {
         ObjectHandle::dictionary(
@@ -196,8 +215,20 @@ fn direct_scalar_uses_at_most_three_allocations() {
                 .collect(),
         )
     });
-    std::hint::black_box(wide_dictionary);
+    std::hint::black_box(&wide_dictionary);
     report_measurement("wide-dictionary", dictionary_heavy);
+    assert!(wide_dictionary.try_is_dictionary().unwrap());
+    assert_eq!(wide_dictionary.try_get_keys().unwrap().len(), WIDE_ITEMS);
+    for (key, value) in dictionary_keys.iter().zip(values.iter().copied()) {
+        assert_eq!(
+            wide_dictionary
+                .try_get_key(key)
+                .unwrap()
+                .try_get_int_value()
+                .unwrap(),
+            value
+        );
+    }
 
     let (wide_stream, stream_heavy) = measure_construction(|| {
         let dictionary = ObjectHandle::dictionary(
@@ -209,14 +240,37 @@ fn direct_scalar_uses_at_most_three_allocations() {
         );
         ObjectHandle::stream(dictionary, Rc::clone(&stream_data))
     });
-    std::hint::black_box(wide_stream);
+    std::hint::black_box(&wide_stream);
     report_measurement("wide-stream", stream_heavy);
+    let stream_dictionary = wide_stream
+        .as_stream_dict()
+        .expect("wide value is a stream");
+    assert!(stream_dictionary.try_is_dictionary().unwrap());
+    assert_eq!(stream_dictionary.try_get_keys().unwrap().len(), WIDE_ITEMS);
+    for (key, value) in dictionary_keys.iter().zip(values.iter().copied()) {
+        assert_eq!(
+            stream_dictionary
+                .try_get_key(key)
+                .unwrap()
+                .try_get_int_value()
+                .unwrap(),
+            value
+        );
+    }
+    let observed_stream_data = wide_stream
+        .as_stream_data()
+        .expect("wide stream has prepared data");
+    assert!(Rc::ptr_eq(&observed_stream_data, &stream_data));
 
     let (aliases, alias_measurement) = measure_construction(|| {
         (0..WIDE_ITEMS)
             .map(|_| alias_source.clone())
             .collect::<Vec<_>>()
     });
-    std::hint::black_box(aliases);
+    std::hint::black_box(&aliases);
     report_measurement("aliases", alias_measurement);
+    assert_eq!(aliases.len(), WIDE_ITEMS);
+    assert!(aliases
+        .iter()
+        .all(|alias| alias.is_same_object_as(&alias_source)));
 }
