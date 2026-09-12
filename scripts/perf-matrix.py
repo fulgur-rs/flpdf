@@ -190,7 +190,7 @@ def command_for(binary, operation, source, output):
 
 
 def validate_sample(sample, operation, output, qpdf, expected_pages, timeout):
-    if sample["exit_status"] or sample.get("timeout") or sample["max_rss_kib"] is None:
+    if sample["exit_status"] or sample.get("timeout") or not sample["max_rss_kib"]:
         return {"ok": False, "reason": "command failed or metrics missing"}
     try:
         artifact = Path(sample["stdout"]) if operation in ("check", "npages", "json") else output

@@ -83,6 +83,10 @@ class MeasurementContracts(unittest.TestCase):
                 output.write_text(body)
                 self.assertFalse(perf.validate_sample(sample, "json", None, None, 1, 10)["ok"])
 
+    def test_zero_rss_cannot_be_reported_as_memory_improvement(self):
+        sample = {"exit_status": 0, "max_rss_kib": 0}
+        self.assertFalse(perf.validate_sample(sample, "check", None, None, 1, 10)["ok"])
+
     def test_pdf_recipe_offsets_and_reachability(self):
         with tempfile.TemporaryDirectory() as tmp:
             path = Path(tmp) / "input.pdf"
