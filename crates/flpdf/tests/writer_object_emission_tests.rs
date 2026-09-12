@@ -407,6 +407,40 @@ fn encrypted_normalize_root_progress_failure_precedes_adbe_reconciliation() {
 }
 
 #[test]
+fn encrypted_qdf_live_root_maps_an_extraneous_xref_child_to_null() {
+    let mut pdf = Pdf::open(Cursor::new(
+        include_bytes!("../../../tests/fixtures/compat/one-page-no-ext.pdf").to_vec(),
+    ))
+    .unwrap();
+    let xref = pdf.new_stream_with_data(Rc::new(Vec::new())).unwrap();
+    xref.as_stream_dict()
+        .unwrap()
+        .replace_key(b"/Type", ObjectHandle::name(b"XRef".to_vec()))
+        .unwrap();
+    pdf.root_handle()
+        .unwrap()
+        .replace_key(b"/ExtraneousXRef", xref)
+        .unwrap();
+
+    let mut writer = PdfWriter::new(&mut pdf);
+    writer.set_qdf_mode(true);
+    writer.set_object_stream_mode(ObjectStreamMode::Disable);
+    writer.set_static_id(true);
+    writer.set_static_aes_iv(true);
+    writer.force_pdf_version("1.7", 8);
+    writer.set_encryption_parameters(EncryptParams::v4_aes128(b"u", b"o"));
+    writer.set_output_memory().unwrap();
+    writer.write().unwrap();
+    let output = writer.get_buffer().unwrap();
+    assert!(output
+        .windows(b"/ExtraneousXRef 0 0 R".len())
+        .any(|window| window == b"/ExtraneousXRef 0 0 R"));
+    assert!(!output
+        .windows(b"/Type /XRef".len())
+        .any(|window| window == b"/Type /XRef"));
+}
+
+#[test]
 fn qdf_discovery_walks_a_direct_stream_dictionary_child() {
     let mut pdf = Pdf::open(Cursor::new(
         include_bytes!("../../../tests/fixtures/compat/one-page-no-ext.pdf").to_vec(),

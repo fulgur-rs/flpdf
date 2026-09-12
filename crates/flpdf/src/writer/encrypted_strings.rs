@@ -541,4 +541,43 @@ mod tests {
         assert!(text.contains("/Filter /FlateDecode"));
         assert!(!text.contains("ASCIIHexDecode"));
     }
+
+    #[test]
+    fn prepared_qdf_stream_dict_can_keep_metadata_strings_cleartext() {
+        let context = EncryptionContext {
+            encrypt_dict: ObjectHandle::dictionary(Vec::new()),
+            file_key: vec![1; 5],
+            cipher: WriteCipher::PerObject(ObjectKeyAlg::Rc4),
+            encryption_v: 2,
+            encryption_r: 3,
+            encrypt_ref: ObjectRef::new(99, 0),
+            id0: b"id".to_vec(),
+            static_aes_iv: true,
+            encrypt_metadata: false,
+            metadata_ref: None,
+        };
+        let mut emitter = EncryptedStringEmitter::from_context(&context);
+        let dict = ObjectHandle::dictionary(vec![
+            (b"/Length".to_vec(), ObjectHandle::integer(3)),
+            (
+                b"/MetadataLabel".to_vec(),
+                ObjectHandle::string(b"plain".to_vec()),
+            ),
+        ]);
+        let mut output = Vec::new();
+        emitter
+            .write_prepared_handle_stream_dict_with_ref_map(
+                &mut output,
+                ObjectRef::new(3, 0),
+                None,
+                &dict,
+                StreamDictOptions::new(true, StreamDictionaryOptions::preserve(), false),
+                &|object_ref| Ok(object_ref), // cov:ignore: the dictionary has no indirect child references
+                &BTreeSet::new(),
+                None,
+            )
+            .unwrap();
+        let text = String::from_utf8(output).unwrap();
+        assert!(text.contains("/MetadataLabel (plain)"));
+    }
 }
