@@ -61,7 +61,7 @@ GitHub Actions.
 - Consumes: public `Pdf`, `PdfWriter`, `ObjectHandle`, stream factories, and crate-private writer test helpers.
 - Produces: failing tests that constrain final-sink streaming, provider order, local-buffer ownership, partial writes, and finish/error behavior before serializer migration.
 
-- [ ] **Step 1: Build a provider-backed two-stream fixture before output measurement.**
+- [x] **Step 1: Build a provider-backed two-stream fixture before output measurement.**
 
   Use an existing one-page fixture or `Pdf::empty`, attach two indirect streams
   to the live Catalog in a deterministic key order, and register retry-aware
@@ -69,7 +69,7 @@ GitHub Actions.
   Each provider writes a distinct payload through the supplied pipeline and
   calls `finish`; do not allocate the final output in the provider.
 
-- [ ] **Step 2: Add the causal RED test.**
+- [x] **Step 2: Add the causal RED test.**
 
   Install an event-recording arbitrary Writer with `PdfWriter::set_output_writer`
   and run a non-linearized Disable write. Assert that a sink-write event occurs
@@ -78,7 +78,7 @@ GitHub Actions.
   fail before the implementation. Assert final bytes are non-empty but do not
   assert an exact write count or chunk size.
 
-- [ ] **Step 3: Add terminal-error ordering tests.**
+- [x] **Step 3: Add terminal-error ordering tests.**
 
   Add one provider/sink test where the first stream has a terminal error and
   assert the second provider is never requested. Add a separate output-pipeline
@@ -87,7 +87,7 @@ GitHub Actions.
   asserts only the same stream is retried; do not conflate it with terminal
   sink/finish failure.
 
-- [ ] **Step 4: Add partial-write and memory ownership RED tests.**
+- [x] **Step 4: Add partial-write and memory ownership RED tests.**
 
   Implement test sinks that return a short positive write, `Interrupted`, and
   `WriteZero`; assert the eventual successful output or exact error category.
@@ -96,7 +96,7 @@ GitHub Actions.
   verification script that the non-linearized body result does not expose a
   complete `Vec<u8>` field/return; this must fail against `LiveBodyOutput.bytes`.
 
-- [ ] **Step 5: Add peak live-allocation RED evidence.**
+- [x] **Step 5: Add peak live-allocation RED evidence.**
 
   In the dedicated integration binary, install a process-global allocator that
   tracks successful alloc/alloc_zeroed/realloc/dealloc live bytes and peak live
@@ -107,13 +107,13 @@ GitHub Actions.
   RSS thresholds. The current whole-output Vec must scale with total emitted
   payload and fail the relational assertion.
 
-- [ ] **Step 6: Run and record RED.**
+- [x] **Step 6: Run and record RED.**
 
   Run the new focused integration and writer tests. Record the expected RED
   failures, exact current whole-body behavior, and all baseline successes in
   `.superpowers/sdd/2026-09-12-writer-streaming/task-1-report.md`.
 
-- [ ] **Step 7: Commit only the RED tests.**
+- [x] **Step 7: Commit only the RED tests.**
 
   ```bash
   git add crates/flpdf/tests/writer_streaming_allocation_tests.rs crates/flpdf/src/writer.rs crates/flpdf/src/writer/plain/body.rs crates/flpdf/src/writer/pclm.rs
