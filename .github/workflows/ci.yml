@@ -92,6 +92,9 @@ jobs:
       - name: Test qpdf route caller tracker
         run: python3 -m unittest scripts/tests/test_qpdf_route_callers.py
 
+      - name: Test performance harness contracts (no timing gates)
+        run: python3 -m unittest scripts/tests/test_perf_matrix.py
+
       - name: Test patch-coverage gate contract
         run: bash scripts/tests/patch-coverage-contract.sh
 
