@@ -174,7 +174,6 @@ fn linearization_writer_target_consumers_use_resolving_accessor_routes() {
         "append_body_object",
         "append_body_object_for_ref",
         "compute_outline_hint_info",
-        "resolve_catalog_adbe_status",
     ];
     let target = target_functions
         .iter()
