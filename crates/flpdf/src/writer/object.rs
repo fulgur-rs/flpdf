@@ -7,6 +7,7 @@
 //! and emission-time string policy.  Keeping this boundary in `writer/`
 //! prevents the object model from growing a second writer responsibility.
 
+use super::output::OutputSink;
 use crate::object_handle::{ObjectHandle, ObjectValue};
 use crate::{Error, ObjectRef, Result};
 use std::collections::BTreeSet;
@@ -59,20 +60,20 @@ impl StreamDictionaryOptions {
 /// live at the writer boundary, while the handle itself retains only graph
 /// identity, payload, and mutation responsibilities.
 pub(crate) trait ObjectWriterEmission {
-    fn write_object(&self, out: &mut Vec<u8>) -> Result<()>;
+    fn write_object(&self, out: &mut OutputSink<'_>) -> Result<()>;
     #[cfg(test)]
     fn write_object_with_string_writer<F>(
         &self,
-        out: &mut Vec<u8>,
+        out: &mut OutputSink<'_>,
         write_string: &mut F,
     ) -> Result<()>
     where
-        F: FnMut(&mut Vec<u8>, &[u8]) -> Result<()>;
+        F: FnMut(&mut OutputSink<'_>, &[u8]) -> Result<()>;
     #[cfg(test)]
-    fn write_object_qdf(&self, out: &mut Vec<u8>, indent: usize) -> Result<()>;
+    fn write_object_qdf(&self, out: &mut OutputSink<'_>, indent: usize) -> Result<()>;
     fn write_object_qdf_with_ref_map_and_removed(
         &self,
-        out: &mut Vec<u8>,
+        out: &mut OutputSink<'_>,
         indent: usize,
         map: &dyn Fn(ObjectRef) -> Result<ObjectRef>,
         removed_refs: &BTreeSet<ObjectRef>,
@@ -80,21 +81,21 @@ pub(crate) trait ObjectWriterEmission {
     #[cfg(test)]
     fn write_object_qdf_with_string_writer<F>(
         &self,
-        out: &mut Vec<u8>,
+        out: &mut OutputSink<'_>,
         indent: usize,
         write_string: &mut F,
     ) -> Result<()>
     where
-        F: FnMut(&mut Vec<u8>, &[u8]) -> Result<()>;
+        F: FnMut(&mut OutputSink<'_>, &[u8]) -> Result<()>;
     fn write_object_with_ref_map_and_removed(
         &self,
-        out: &mut Vec<u8>,
+        out: &mut OutputSink<'_>,
         map: &dyn Fn(ObjectRef) -> Result<ObjectRef>,
         removed_refs: &BTreeSet<ObjectRef>,
     ) -> Result<()>;
     fn write_root_object_with_ref_map_and_removed(
         &self,
-        out: &mut Vec<u8>,
+        out: &mut OutputSink<'_>,
         map: &dyn Fn(ObjectRef) -> Result<ObjectRef>,
         removed_refs: &BTreeSet<ObjectRef>,
         final_pdf_version: &str,
@@ -123,7 +124,7 @@ pub(crate) trait ObjectWriterEmission {
     /// first-seen queue insertion happen at qpdf's `unparseChild` boundary.
     fn write_object_with_dynamic_ref_map(
         &self,
-        out: &mut Vec<u8>,
+        out: &mut OutputSink<'_>,
         map: &mut dyn FnMut(&ObjectHandle) -> Result<ObjectRef>,
         removed_refs: &BTreeSet<ObjectRef>,
     ) -> Result<()> {
@@ -134,7 +135,7 @@ pub(crate) trait ObjectWriterEmission {
     }
     fn write_root_object_with_dynamic_ref_map(
         &self,
-        out: &mut Vec<u8>,
+        out: &mut OutputSink<'_>,
         map: &mut dyn FnMut(&ObjectHandle) -> Result<ObjectRef>,
         removed_refs: &BTreeSet<ObjectRef>,
         final_pdf_version: &str,
@@ -155,7 +156,7 @@ pub(crate) trait ObjectWriterEmission {
     }
     fn write_stream_body_with_dynamic_ref_map(
         &self,
-        out: &mut Vec<u8>,
+        out: &mut OutputSink<'_>,
         options: StreamDictionaryOptions,
         map: &mut dyn FnMut(&ObjectHandle) -> Result<ObjectRef>,
         removed_refs: &BTreeSet<ObjectRef>,
@@ -188,40 +189,40 @@ pub(crate) trait ObjectWriterEmission {
     // cov:ignore-end
     fn write_object_with_ref_map_and_removed_with_string_writer<F>(
         &self,
-        out: &mut Vec<u8>,
+        out: &mut OutputSink<'_>,
         map: &dyn Fn(ObjectRef) -> Result<ObjectRef>,
         removed_refs: &BTreeSet<ObjectRef>,
         write_string: &mut F,
     ) -> Result<()>
     where
-        F: FnMut(&mut Vec<u8>, &[u8]) -> Result<()>;
+        F: FnMut(&mut OutputSink<'_>, &[u8]) -> Result<()>;
     fn write_object_qdf_with_ref_map_and_removed_with_string_writer<F>(
         &self,
-        out: &mut Vec<u8>,
+        out: &mut OutputSink<'_>,
         indent: usize,
         map: &dyn Fn(ObjectRef) -> Result<ObjectRef>,
         removed_refs: &BTreeSet<ObjectRef>,
         write_string: &mut F,
     ) -> Result<()>
     where
-        F: FnMut(&mut Vec<u8>, &[u8]) -> Result<()>;
+        F: FnMut(&mut OutputSink<'_>, &[u8]) -> Result<()>;
 
-    fn write_stream_body(&self, out: &mut Vec<u8>, refiltered: bool) -> Result<()>;
+    fn write_stream_body(&self, out: &mut OutputSink<'_>, refiltered: bool) -> Result<()>;
     #[cfg(test)]
     fn write_stream_body_with_string_writer<F>(
         &self,
-        out: &mut Vec<u8>,
+        out: &mut OutputSink<'_>,
         refiltered: bool,
         write_string: &mut F,
     ) -> Result<()>
     where
-        F: FnMut(&mut Vec<u8>, &[u8]) -> Result<()>;
+        F: FnMut(&mut OutputSink<'_>, &[u8]) -> Result<()>;
     #[cfg(test)]
-    fn write_stream_body_qdf(&self, out: &mut Vec<u8>, indent: usize) -> Result<()>;
+    fn write_stream_body_qdf(&self, out: &mut OutputSink<'_>, indent: usize) -> Result<()>;
     #[cfg(test)]
     fn write_stream_body_qdf_with_ref_map_and_removed_and_length(
         &self,
-        out: &mut Vec<u8>,
+        out: &mut OutputSink<'_>,
         indent: usize,
         map: &dyn Fn(ObjectRef) -> Result<ObjectRef>,
         removed_refs: &BTreeSet<ObjectRef>,
@@ -229,7 +230,7 @@ pub(crate) trait ObjectWriterEmission {
     ) -> Result<()>;
     fn write_stream_body_qdf_with_ref_map_and_removed_and_length_with_options(
         &self,
-        out: &mut Vec<u8>,
+        out: &mut OutputSink<'_>,
         indent: usize,
         map: &dyn Fn(ObjectRef) -> Result<ObjectRef>,
         removed_refs: &BTreeSet<ObjectRef>,
@@ -239,7 +240,7 @@ pub(crate) trait ObjectWriterEmission {
     #[cfg(test)]
     fn write_stream_body_qdf_with_ref_map_and_removed_and_length_with_string_writer<F>(
         &self,
-        out: &mut Vec<u8>,
+        out: &mut OutputSink<'_>,
         indent: usize,
         map: &dyn Fn(ObjectRef) -> Result<ObjectRef>,
         removed_refs: &BTreeSet<ObjectRef>,
@@ -247,13 +248,13 @@ pub(crate) trait ObjectWriterEmission {
         write_string: &mut F,
     ) -> Result<()>
     where
-        F: FnMut(&mut Vec<u8>, &[u8]) -> Result<()>;
+        F: FnMut(&mut OutputSink<'_>, &[u8]) -> Result<()>;
     #[allow(clippy::too_many_arguments)]
     fn write_stream_body_qdf_with_ref_map_and_removed_and_length_with_string_writer_with_options<
         F,
     >(
         &self,
-        out: &mut Vec<u8>,
+        out: &mut OutputSink<'_>,
         indent: usize,
         map: &dyn Fn(ObjectRef) -> Result<ObjectRef>,
         removed_refs: &BTreeSet<ObjectRef>,
@@ -262,27 +263,27 @@ pub(crate) trait ObjectWriterEmission {
         write_string: &mut F,
     ) -> Result<()>
     where
-        F: FnMut(&mut Vec<u8>, &[u8]) -> Result<()>;
+        F: FnMut(&mut OutputSink<'_>, &[u8]) -> Result<()>;
     #[cfg(test)]
     fn write_stream_body_qdf_with_string_writer<F>(
         &self,
-        out: &mut Vec<u8>,
+        out: &mut OutputSink<'_>,
         indent: usize,
         write_string: &mut F,
     ) -> Result<()>
     where
-        F: FnMut(&mut Vec<u8>, &[u8]) -> Result<()>;
+        F: FnMut(&mut OutputSink<'_>, &[u8]) -> Result<()>;
     #[cfg(test)]
     fn write_stream_body_with_ref_map_and_removed(
         &self,
-        out: &mut Vec<u8>,
+        out: &mut OutputSink<'_>,
         refiltered: bool,
         map: &dyn Fn(ObjectRef) -> Result<ObjectRef>,
         removed_refs: &BTreeSet<ObjectRef>,
     ) -> Result<()>;
     fn write_stream_body_with_ref_map_and_removed_with_options(
         &self,
-        out: &mut Vec<u8>,
+        out: &mut OutputSink<'_>,
         options: StreamDictionaryOptions,
         map: &dyn Fn(ObjectRef) -> Result<ObjectRef>,
         removed_refs: &BTreeSet<ObjectRef>,
@@ -293,7 +294,7 @@ pub(crate) trait ObjectWriterEmission {
     #[cfg(test)]
     fn write_stream_body_with_ref_map_and_removed_and_length(
         &self,
-        out: &mut Vec<u8>,
+        out: &mut OutputSink<'_>,
         refiltered: bool,
         map: &dyn Fn(ObjectRef) -> Result<ObjectRef>,
         removed_refs: &BTreeSet<ObjectRef>,
@@ -302,7 +303,7 @@ pub(crate) trait ObjectWriterEmission {
     #[cfg(test)]
     fn write_stream_body_with_ref_map_and_removed_and_length_with_options(
         &self,
-        out: &mut Vec<u8>,
+        out: &mut OutputSink<'_>,
         options: StreamDictionaryOptions,
         map: &dyn Fn(ObjectRef) -> Result<ObjectRef>,
         removed_refs: &BTreeSet<ObjectRef>,
@@ -311,36 +312,36 @@ pub(crate) trait ObjectWriterEmission {
     #[cfg(test)]
     fn write_stream_body_with_ref_map_and_removed_with_string_writer<F>(
         &self,
-        out: &mut Vec<u8>,
+        out: &mut OutputSink<'_>,
         refiltered: bool,
         map: &dyn Fn(ObjectRef) -> Result<ObjectRef>,
         removed_refs: &BTreeSet<ObjectRef>,
         write_string: &mut F,
     ) -> Result<()>
     where
-        F: FnMut(&mut Vec<u8>, &[u8]) -> Result<()>;
+        F: FnMut(&mut OutputSink<'_>, &[u8]) -> Result<()>;
     fn write_stream_body_with_ref_map_and_removed_with_options_and_string_writer<F>(
         &self,
-        out: &mut Vec<u8>,
+        out: &mut OutputSink<'_>,
         options: StreamDictionaryOptions,
         map: &dyn Fn(ObjectRef) -> Result<ObjectRef>,
         removed_refs: &BTreeSet<ObjectRef>,
         write_string: &mut F,
     ) -> Result<()>
     where
-        F: FnMut(&mut Vec<u8>, &[u8]) -> Result<()>;
+        F: FnMut(&mut OutputSink<'_>, &[u8]) -> Result<()>;
 
     #[cfg(test)]
     fn write_trailer(
         &self,
-        out: &mut Vec<u8>,
+        out: &mut OutputSink<'_>,
         xref_stream: bool,
         id_writer: Option<crate::pdf_syntax::TrailerIdWriter>,
     ) -> Result<()>;
     #[allow(clippy::too_many_arguments)]
     fn write_trailer_with_ref_map(
         &self,
-        out: &mut Vec<u8>,
+        out: &mut OutputSink<'_>,
         xref_stream: bool,
         qdf: bool,
         id_writer: Option<crate::pdf_syntax::TrailerIdWriter>,
@@ -351,7 +352,7 @@ pub(crate) trait ObjectWriterEmission {
     #[allow(clippy::too_many_arguments)]
     fn write_trailer_with_ref_map_and_kind(
         &self,
-        out: &mut Vec<u8>,
+        out: &mut OutputSink<'_>,
         kind: TrailerKind,
         xref_stream: bool,
         qdf: bool,
@@ -363,7 +364,7 @@ pub(crate) trait ObjectWriterEmission {
     #[cfg(test)]
     fn write_dictionary_with_ref_map_and_id_writer(
         &self,
-        out: &mut Vec<u8>,
+        out: &mut OutputSink<'_>,
         id_writer: Option<crate::pdf_syntax::TrailerIdWriter>,
         map: &dyn Fn(ObjectRef) -> Result<ObjectRef>,
         removed_refs: &BTreeSet<ObjectRef>,
@@ -371,10 +372,342 @@ pub(crate) trait ObjectWriterEmission {
     ) -> Result<()>;
     fn write_id_value_with_ref_map(
         &self,
+        out: &mut OutputSink<'_>,
+        map: &dyn Fn(ObjectRef) -> Result<ObjectRef>,
+        removed_refs: &BTreeSet<ObjectRef>,
+    ) -> Result<()>;
+}
+
+/// Vec-backed adapter used only by legacy serializer unit tests.
+///
+/// Production callers have one canonical [`OutputSink`] surface. These
+/// wrappers keep existing byte assertions compact while ensuring every test
+/// invocation still traverses that sink surface.
+#[cfg(test)]
+pub(crate) trait ObjectWriterEmissionVecTestExt {
+    fn write_object(&self, out: &mut Vec<u8>) -> Result<()>;
+    fn write_object_qdf(&self, out: &mut Vec<u8>, indent: usize) -> Result<()>;
+    fn write_object_with_string_writer<F>(
+        &self,
+        out: &mut Vec<u8>,
+        write_string: &mut F,
+    ) -> Result<()>
+    where
+        F: FnMut(&mut Vec<u8>, &[u8]) -> Result<()>;
+    fn write_object_qdf_with_string_writer<F>(
+        &self,
+        out: &mut Vec<u8>,
+        indent: usize,
+        write_string: &mut F,
+    ) -> Result<()>
+    where
+        F: FnMut(&mut Vec<u8>, &[u8]) -> Result<()>;
+    fn write_object_with_ref_map_and_removed(
+        &self,
         out: &mut Vec<u8>,
         map: &dyn Fn(ObjectRef) -> Result<ObjectRef>,
         removed_refs: &BTreeSet<ObjectRef>,
     ) -> Result<()>;
+    fn write_stream_body(&self, out: &mut Vec<u8>, refiltered: bool) -> Result<()>;
+    fn write_stream_body_with_string_writer<F>(
+        &self,
+        out: &mut Vec<u8>,
+        refiltered: bool,
+        write_string: &mut F,
+    ) -> Result<()>
+    where
+        F: FnMut(&mut Vec<u8>, &[u8]) -> Result<()>;
+    fn write_stream_body_qdf(&self, out: &mut Vec<u8>, indent: usize) -> Result<()>;
+    fn write_stream_body_qdf_with_string_writer<F>(
+        &self,
+        out: &mut Vec<u8>,
+        indent: usize,
+        write_string: &mut F,
+    ) -> Result<()>
+    where
+        F: FnMut(&mut Vec<u8>, &[u8]) -> Result<()>;
+    fn write_stream_body_with_ref_map_and_removed(
+        &self,
+        out: &mut Vec<u8>,
+        refiltered: bool,
+        map: &dyn Fn(ObjectRef) -> Result<ObjectRef>,
+        removed_refs: &BTreeSet<ObjectRef>,
+    ) -> Result<()>;
+    fn write_stream_body_with_ref_map_and_removed_with_string_writer<F>(
+        &self,
+        out: &mut Vec<u8>,
+        refiltered: bool,
+        map: &dyn Fn(ObjectRef) -> Result<ObjectRef>,
+        removed_refs: &BTreeSet<ObjectRef>,
+        write_string: &mut F,
+    ) -> Result<()>
+    where
+        F: FnMut(&mut Vec<u8>, &[u8]) -> Result<()>;
+    fn write_stream_body_qdf_with_ref_map_and_removed_and_length(
+        &self,
+        out: &mut Vec<u8>,
+        indent: usize,
+        map: &dyn Fn(ObjectRef) -> Result<ObjectRef>,
+        removed_refs: &BTreeSet<ObjectRef>,
+        length_ref: Option<ObjectRef>,
+    ) -> Result<()>;
+    fn write_stream_body_qdf_with_ref_map_and_removed_and_length_with_string_writer<F>(
+        &self,
+        out: &mut Vec<u8>,
+        indent: usize,
+        map: &dyn Fn(ObjectRef) -> Result<ObjectRef>,
+        removed_refs: &BTreeSet<ObjectRef>,
+        length_ref: Option<ObjectRef>,
+        write_string: &mut F,
+    ) -> Result<()>
+    where
+        F: FnMut(&mut Vec<u8>, &[u8]) -> Result<()>;
+    fn write_trailer(
+        &self,
+        out: &mut Vec<u8>,
+        xref_stream: bool,
+        id_writer: Option<&mut dyn FnMut(&mut Vec<u8>)>,
+    ) -> Result<()>;
+}
+
+#[cfg(test)]
+impl ObjectWriterEmissionVecTestExt for ObjectHandle {
+    fn write_object(&self, out: &mut Vec<u8>) -> Result<()> {
+        super::output::with_buffer_sink(out, |out| ObjectWriterEmission::write_object(self, out))
+    }
+
+    fn write_object_qdf(&self, out: &mut Vec<u8>, indent: usize) -> Result<()> {
+        super::output::with_buffer_sink(out, |out| {
+            ObjectWriterEmission::write_object_qdf(self, out, indent)
+        })
+    }
+
+    fn write_object_with_string_writer<F>(
+        &self,
+        out: &mut Vec<u8>,
+        write_string: &mut F,
+    ) -> Result<()>
+    where
+        F: FnMut(&mut Vec<u8>, &[u8]) -> Result<()>,
+    {
+        let mut sink_writer = |out: &mut OutputSink<'_>, value: &[u8]| {
+            let mut bytes = Vec::new();
+            write_string(&mut bytes, value)?;
+            out.write_bytes(&bytes)
+        };
+        super::output::with_buffer_sink(out, |out| {
+            ObjectWriterEmission::write_object_with_string_writer(self, out, &mut sink_writer)
+        })
+    }
+
+    fn write_object_qdf_with_string_writer<F>(
+        &self,
+        out: &mut Vec<u8>,
+        indent: usize,
+        write_string: &mut F,
+    ) -> Result<()>
+    where
+        F: FnMut(&mut Vec<u8>, &[u8]) -> Result<()>,
+    {
+        let mut sink_writer = |out: &mut OutputSink<'_>, value: &[u8]| {
+            let mut bytes = Vec::new();
+            write_string(&mut bytes, value)?;
+            out.write_bytes(&bytes)
+        };
+        super::output::with_buffer_sink(out, |out| {
+            ObjectWriterEmission::write_object_qdf_with_string_writer(
+                self,
+                out,
+                indent,
+                &mut sink_writer,
+            )
+        })
+    }
+
+    fn write_object_with_ref_map_and_removed(
+        &self,
+        out: &mut Vec<u8>,
+        map: &dyn Fn(ObjectRef) -> Result<ObjectRef>,
+        removed_refs: &BTreeSet<ObjectRef>,
+    ) -> Result<()> {
+        super::output::with_buffer_sink(out, |out| {
+            ObjectWriterEmission::write_object_with_ref_map_and_removed(
+                self,
+                out,
+                map,
+                removed_refs,
+            )
+        })
+    }
+
+    fn write_stream_body(&self, out: &mut Vec<u8>, refiltered: bool) -> Result<()> {
+        super::output::with_buffer_sink(out, |out| {
+            ObjectWriterEmission::write_stream_body(self, out, refiltered)
+        })
+    }
+
+    fn write_stream_body_with_string_writer<F>(
+        &self,
+        out: &mut Vec<u8>,
+        refiltered: bool,
+        write_string: &mut F,
+    ) -> Result<()>
+    where
+        F: FnMut(&mut Vec<u8>, &[u8]) -> Result<()>,
+    {
+        let mut sink_writer = |out: &mut OutputSink<'_>, value: &[u8]| {
+            let mut bytes = Vec::new();
+            write_string(&mut bytes, value)?;
+            out.write_bytes(&bytes)
+        };
+        super::output::with_buffer_sink(out, |out| {
+            ObjectWriterEmission::write_stream_body_with_string_writer(
+                self,
+                out,
+                refiltered,
+                &mut sink_writer,
+            )
+        })
+    }
+
+    fn write_stream_body_qdf(&self, out: &mut Vec<u8>, indent: usize) -> Result<()> {
+        super::output::with_buffer_sink(out, |out| {
+            ObjectWriterEmission::write_stream_body_qdf(self, out, indent)
+        })
+    }
+
+    fn write_stream_body_qdf_with_string_writer<F>(
+        &self,
+        out: &mut Vec<u8>,
+        indent: usize,
+        write_string: &mut F,
+    ) -> Result<()>
+    where
+        F: FnMut(&mut Vec<u8>, &[u8]) -> Result<()>,
+    {
+        let mut sink_writer = |out: &mut OutputSink<'_>, value: &[u8]| {
+            let mut bytes = Vec::new();
+            write_string(&mut bytes, value)?;
+            out.write_bytes(&bytes)
+        };
+        super::output::with_buffer_sink(out, |out| {
+            ObjectWriterEmission::write_stream_body_qdf_with_string_writer(
+                self,
+                out,
+                indent,
+                &mut sink_writer,
+            )
+        })
+    }
+
+    fn write_stream_body_with_ref_map_and_removed(
+        &self,
+        out: &mut Vec<u8>,
+        refiltered: bool,
+        map: &dyn Fn(ObjectRef) -> Result<ObjectRef>,
+        removed_refs: &BTreeSet<ObjectRef>,
+    ) -> Result<()> {
+        super::output::with_buffer_sink(out, |out| {
+            ObjectWriterEmission::write_stream_body_with_ref_map_and_removed(
+                self,
+                out,
+                refiltered,
+                map,
+                removed_refs,
+            )
+        })
+    }
+
+    fn write_stream_body_with_ref_map_and_removed_with_string_writer<F>(
+        &self,
+        out: &mut Vec<u8>,
+        refiltered: bool,
+        map: &dyn Fn(ObjectRef) -> Result<ObjectRef>,
+        removed_refs: &BTreeSet<ObjectRef>,
+        write_string: &mut F,
+    ) -> Result<()>
+    where
+        F: FnMut(&mut Vec<u8>, &[u8]) -> Result<()>,
+    {
+        let mut sink_writer = |out: &mut OutputSink<'_>, value: &[u8]| {
+            let mut bytes = Vec::new();
+            write_string(&mut bytes, value)?;
+            out.write_bytes(&bytes)
+        };
+        super::output::with_buffer_sink(out, |out| {
+            ObjectWriterEmission::write_stream_body_with_ref_map_and_removed_with_string_writer(
+                self,
+                out,
+                refiltered,
+                map,
+                removed_refs,
+                &mut sink_writer,
+            )
+        })
+    }
+
+    fn write_stream_body_qdf_with_ref_map_and_removed_and_length(
+        &self,
+        out: &mut Vec<u8>,
+        indent: usize,
+        map: &dyn Fn(ObjectRef) -> Result<ObjectRef>,
+        removed_refs: &BTreeSet<ObjectRef>,
+        length_ref: Option<ObjectRef>,
+    ) -> Result<()> {
+        super::output::with_buffer_sink(out, |out| {
+            ObjectWriterEmission::write_stream_body_qdf_with_ref_map_and_removed_and_length(
+                self,
+                out,
+                indent,
+                map,
+                removed_refs,
+                length_ref,
+            )
+        })
+    }
+
+    fn write_stream_body_qdf_with_ref_map_and_removed_and_length_with_string_writer<F>(
+        &self,
+        out: &mut Vec<u8>,
+        indent: usize,
+        map: &dyn Fn(ObjectRef) -> Result<ObjectRef>,
+        removed_refs: &BTreeSet<ObjectRef>,
+        length_ref: Option<ObjectRef>,
+        write_string: &mut F,
+    ) -> Result<()>
+    where
+        F: FnMut(&mut Vec<u8>, &[u8]) -> Result<()>,
+    {
+        let mut sink_writer = |out: &mut OutputSink<'_>, value: &[u8]| {
+            let mut bytes = Vec::new();
+            write_string(&mut bytes, value)?;
+            out.write_bytes(&bytes)
+        };
+        super::output::with_buffer_sink(out, |out| {
+            ObjectWriterEmission::write_stream_body_qdf_with_ref_map_and_removed_and_length_with_string_writer(self, out, indent, map, removed_refs, length_ref, &mut sink_writer)
+        })
+    }
+
+    fn write_trailer(
+        &self,
+        out: &mut Vec<u8>,
+        xref_stream: bool,
+        mut id_writer: Option<&mut dyn FnMut(&mut Vec<u8>)>,
+    ) -> Result<()> {
+        let has_id_writer = id_writer.is_some();
+        let mut sink_writer = |out: &mut OutputSink<'_>| {
+            let mut bytes = Vec::new();
+            if let Some(write_id) = id_writer.as_deref_mut() {
+                write_id(&mut bytes);
+            }
+            out.write_bytes(&bytes)
+        };
+        let sink_writer =
+            has_id_writer.then_some(&mut sink_writer as crate::pdf_syntax::TrailerIdWriter<'_>);
+        super::output::with_buffer_sink(out, |out| {
+            ObjectWriterEmission::write_trailer(self, out, xref_stream, sink_writer)
+        })
+    }
 }
 
 const UNPARSE_STACK_RED_ZONE: usize = 32 * 1024;
@@ -392,17 +725,18 @@ fn destroyed_unparse_error() -> Error {
     Error::Internal("attempted to unparse a QPDFObjectHandle from a destroyed QPDF".to_owned())
 }
 
-fn write_dictionary_key(out: &mut Vec<u8>, key: &[u8]) {
+fn write_dictionary_key(out: &mut OutputSink<'_>, key: &[u8]) -> Result<()> {
     if let Some(key) = key.strip_prefix(b"/") {
-        out.push(b'/');
-        crate::pdf_syntax::write_name_escaped(out, key);
+        out.write_bytes(&[b'/'])?;
+        crate::pdf_syntax::write_name_escaped_to_sink(out, key)?;
     } else {
         // QPDF_Name::normalizeName preserves the first byte of a raw qpdf
         // dictionary key (`libqpdf/QPDF_Name.cc:27-50`). In particular,
         // `replaceKey("Array1", ...)` is intentionally emitted as the
         // slashless token `Array1`; do not silently canonicalize it here.
-        crate::pdf_syntax::write_name_escaped(out, key);
+        crate::pdf_syntax::write_name_escaped_to_sink(out, key)?;
     }
+    Ok(())
 }
 
 impl ObjectWriterEmission for ObjectHandle {
@@ -435,7 +769,7 @@ impl ObjectWriterEmission for ObjectHandle {
     /// is pinned, in `unparse_object_tests`, by
     /// `unparse_object_on_an_indirect_handle_resolving_to_a_stream_inlines_the_dictionary`
     /// rather than derived from any qpdf oracle.
-    fn write_object(&self, out: &mut Vec<u8>) -> Result<()> {
+    fn write_object(&self, out: &mut OutputSink<'_>) -> Result<()> {
         unparse_object_walk(self, out)
     }
 
@@ -451,11 +785,11 @@ impl ObjectWriterEmission for ObjectHandle {
     #[cfg(test)]
     fn write_object_with_string_writer<F>(
         &self,
-        out: &mut Vec<u8>,
+        out: &mut OutputSink<'_>,
         write_string: &mut F,
     ) -> Result<()>
     where
-        F: FnMut(&mut Vec<u8>, &[u8]) -> Result<()>,
+        F: FnMut(&mut OutputSink<'_>, &[u8]) -> Result<()>,
     {
         unparse_object_walk_with_string_writer(self, out, write_string)
     }
@@ -492,7 +826,7 @@ impl ObjectWriterEmission for ObjectHandle {
     /// identical caveat instead. Do not conflate the two when fixing this
     /// shape at a real call site.
     #[cfg(test)]
-    fn write_object_qdf(&self, out: &mut Vec<u8>, indent: usize) -> Result<()> {
+    fn write_object_qdf(&self, out: &mut OutputSink<'_>, indent: usize) -> Result<()> {
         unparse_object_walk_qdf(self, indent, out)
     }
 
@@ -500,7 +834,7 @@ impl ObjectWriterEmission for ObjectHandle {
     /// visibility for references removed during this write.
     fn write_object_qdf_with_ref_map_and_removed(
         &self,
-        out: &mut Vec<u8>,
+        out: &mut OutputSink<'_>,
         indent: usize,
         map: &dyn Fn(ObjectRef) -> Result<ObjectRef>,
         removed_refs: &BTreeSet<ObjectRef>,
@@ -513,12 +847,12 @@ impl ObjectWriterEmission for ObjectHandle {
     #[cfg(test)]
     fn write_object_qdf_with_string_writer<F>(
         &self,
-        out: &mut Vec<u8>,
+        out: &mut OutputSink<'_>,
         indent: usize,
         write_string: &mut F,
     ) -> Result<()>
     where
-        F: FnMut(&mut Vec<u8>, &[u8]) -> Result<()>,
+        F: FnMut(&mut OutputSink<'_>, &[u8]) -> Result<()>,
     {
         unparse_object_walk_qdf_with_string_writer(self, indent, out, write_string)
     }
@@ -530,7 +864,7 @@ impl ObjectWriterEmission for ObjectHandle {
     /// the null-valued key.
     fn write_object_with_ref_map_and_removed(
         &self,
-        out: &mut Vec<u8>,
+        out: &mut OutputSink<'_>,
         map: &dyn Fn(ObjectRef) -> Result<ObjectRef>,
         removed_refs: &BTreeSet<ObjectRef>,
     ) -> Result<()> {
@@ -546,7 +880,7 @@ impl ObjectWriterEmission for ObjectHandle {
     /// or removing the root's Extensions key changes only the output copy.
     fn write_root_object_with_ref_map_and_removed(
         &self,
-        out: &mut Vec<u8>,
+        out: &mut OutputSink<'_>,
         map: &dyn Fn(ObjectRef) -> Result<ObjectRef>,
         removed_refs: &BTreeSet<ObjectRef>,
         final_pdf_version: &str,
@@ -564,7 +898,7 @@ impl ObjectWriterEmission for ObjectHandle {
 
     fn write_object_with_dynamic_ref_map(
         &self,
-        out: &mut Vec<u8>,
+        out: &mut OutputSink<'_>,
         map: &mut dyn FnMut(&ObjectHandle) -> Result<ObjectRef>,
         removed_refs: &BTreeSet<ObjectRef>,
     ) -> Result<()> {
@@ -573,7 +907,7 @@ impl ObjectWriterEmission for ObjectHandle {
 
     fn write_root_object_with_dynamic_ref_map(
         &self,
-        out: &mut Vec<u8>,
+        out: &mut OutputSink<'_>,
         map: &mut dyn FnMut(&ObjectHandle) -> Result<ObjectRef>,
         removed_refs: &BTreeSet<ObjectRef>,
         final_pdf_version: &str,
@@ -605,7 +939,7 @@ impl ObjectWriterEmission for ObjectHandle {
 
     fn write_stream_body_with_dynamic_ref_map(
         &self,
-        out: &mut Vec<u8>,
+        out: &mut OutputSink<'_>,
         options: StreamDictionaryOptions,
         map: &mut dyn FnMut(&ObjectHandle) -> Result<ObjectRef>,
         removed_refs: &BTreeSet<ObjectRef>,
@@ -670,13 +1004,13 @@ impl ObjectWriterEmission for ObjectHandle {
     /// live handle graph is walked.
     fn write_object_with_ref_map_and_removed_with_string_writer<F>(
         &self,
-        out: &mut Vec<u8>,
+        out: &mut OutputSink<'_>,
         map: &dyn Fn(ObjectRef) -> Result<ObjectRef>,
         removed_refs: &BTreeSet<ObjectRef>,
         write_string: &mut F,
     ) -> Result<()>
     where
-        F: FnMut(&mut Vec<u8>, &[u8]) -> Result<()>,
+        F: FnMut(&mut OutputSink<'_>, &[u8]) -> Result<()>,
     {
         unparse_object_walk_with_ref_map_and_string_writer(
             self,
@@ -691,14 +1025,14 @@ impl ObjectWriterEmission for ObjectHandle {
     /// [`Self::write_object_with_ref_map_and_removed_with_string_writer`].
     fn write_object_qdf_with_ref_map_and_removed_with_string_writer<F>(
         &self,
-        out: &mut Vec<u8>,
+        out: &mut OutputSink<'_>,
         indent: usize,
         map: &dyn Fn(ObjectRef) -> Result<ObjectRef>,
         removed_refs: &BTreeSet<ObjectRef>,
         write_string: &mut F,
     ) -> Result<()>
     where
-        F: FnMut(&mut Vec<u8>, &[u8]) -> Result<()>,
+        F: FnMut(&mut OutputSink<'_>, &[u8]) -> Result<()>,
     {
         unparse_object_walk_qdf_with_ref_map_and_string_writer(
             self,
@@ -762,7 +1096,7 @@ impl ObjectWriterEmission for ObjectHandle {
     /// unresolved [`Self::with_value`] read alone would (see
     /// `unparse_stream_body_propagates_a_dropped_document_error`, which
     /// fails without this call).
-    fn write_stream_body(&self, out: &mut Vec<u8>, refiltered: bool) -> Result<()> {
+    fn write_stream_body(&self, out: &mut OutputSink<'_>, refiltered: bool) -> Result<()> {
         if self.is_reserved() {
             return Err(reserved_unparse_error());
         }
@@ -782,12 +1116,12 @@ impl ObjectWriterEmission for ObjectHandle {
     #[cfg(test)]
     fn write_stream_body_with_string_writer<F>(
         &self,
-        out: &mut Vec<u8>,
+        out: &mut OutputSink<'_>,
         refiltered: bool,
         write_string: &mut F,
     ) -> Result<()>
     where
-        F: FnMut(&mut Vec<u8>, &[u8]) -> Result<()>,
+        F: FnMut(&mut OutputSink<'_>, &[u8]) -> Result<()>,
     {
         if self.is_reserved() {
             return Err(reserved_unparse_error());
@@ -841,7 +1175,7 @@ impl ObjectWriterEmission for ObjectHandle {
     /// exactly except for the QDF layout and the missing `refiltered`
     /// parameter.
     #[cfg(test)]
-    fn write_stream_body_qdf(&self, out: &mut Vec<u8>, indent: usize) -> Result<()> {
+    fn write_stream_body_qdf(&self, out: &mut OutputSink<'_>, indent: usize) -> Result<()> {
         if self.is_reserved() {
             return Err(reserved_unparse_error());
         }
@@ -852,7 +1186,7 @@ impl ObjectWriterEmission for ObjectHandle {
     #[cfg(test)]
     fn write_stream_body_qdf_with_ref_map_and_removed_and_length(
         &self,
-        out: &mut Vec<u8>,
+        out: &mut OutputSink<'_>,
         indent: usize,
         map: &dyn Fn(ObjectRef) -> Result<ObjectRef>,
         removed_refs: &BTreeSet<ObjectRef>,
@@ -876,7 +1210,7 @@ impl ObjectWriterEmission for ObjectHandle {
     /// source handle for an output-only object number.
     fn write_stream_body_qdf_with_ref_map_and_removed_and_length_with_options(
         &self,
-        out: &mut Vec<u8>,
+        out: &mut OutputSink<'_>,
         indent: usize,
         map: &dyn Fn(ObjectRef) -> Result<ObjectRef>,
         removed_refs: &BTreeSet<ObjectRef>,
@@ -901,7 +1235,7 @@ impl ObjectWriterEmission for ObjectHandle {
     #[cfg(test)]
     fn write_stream_body_qdf_with_ref_map_and_removed_and_length_with_string_writer<F>(
         &self,
-        out: &mut Vec<u8>,
+        out: &mut OutputSink<'_>,
         indent: usize,
         map: &dyn Fn(ObjectRef) -> Result<ObjectRef>,
         removed_refs: &BTreeSet<ObjectRef>,
@@ -909,7 +1243,7 @@ impl ObjectWriterEmission for ObjectHandle {
         write_string: &mut F,
     ) -> Result<()>
     where
-        F: FnMut(&mut Vec<u8>, &[u8]) -> Result<()>,
+        F: FnMut(&mut OutputSink<'_>, &[u8]) -> Result<()>,
     {
         self.write_stream_body_qdf_with_ref_map_and_removed_and_length_with_string_writer_with_options(
             out,
@@ -929,7 +1263,7 @@ impl ObjectWriterEmission for ObjectHandle {
         F,
     >(
         &self,
-        out: &mut Vec<u8>,
+        out: &mut OutputSink<'_>,
         indent: usize,
         map: &dyn Fn(ObjectRef) -> Result<ObjectRef>,
         removed_refs: &BTreeSet<ObjectRef>,
@@ -938,7 +1272,7 @@ impl ObjectWriterEmission for ObjectHandle {
         write_string: &mut F,
     ) -> Result<()>
     where
-        F: FnMut(&mut Vec<u8>, &[u8]) -> Result<()>,
+        F: FnMut(&mut OutputSink<'_>, &[u8]) -> Result<()>,
     {
         if self.is_reserved() {
             return Err(reserved_unparse_error());
@@ -962,12 +1296,12 @@ impl ObjectWriterEmission for ObjectHandle {
     #[cfg(test)]
     fn write_stream_body_qdf_with_string_writer<F>(
         &self,
-        out: &mut Vec<u8>,
+        out: &mut OutputSink<'_>,
         indent: usize,
         write_string: &mut F,
     ) -> Result<()>
     where
-        F: FnMut(&mut Vec<u8>, &[u8]) -> Result<()>,
+        F: FnMut(&mut OutputSink<'_>, &[u8]) -> Result<()>,
     {
         if self.is_reserved() {
             return Err(reserved_unparse_error());
@@ -998,7 +1332,7 @@ impl ObjectWriterEmission for ObjectHandle {
     #[cfg(test)]
     fn write_stream_body_with_ref_map_and_removed(
         &self,
-        out: &mut Vec<u8>,
+        out: &mut OutputSink<'_>,
         refiltered: bool,
         map: &dyn Fn(ObjectRef) -> Result<ObjectRef>,
         removed_refs: &BTreeSet<ObjectRef>,
@@ -1015,7 +1349,7 @@ impl ObjectWriterEmission for ObjectHandle {
     /// qpdf null visibility for references removed during this write.
     fn write_stream_body_with_ref_map_and_removed_with_options(
         &self,
-        out: &mut Vec<u8>,
+        out: &mut OutputSink<'_>,
         options: StreamDictionaryOptions,
         map: &dyn Fn(ObjectRef) -> Result<ObjectRef>,
         removed_refs: &BTreeSet<ObjectRef>,
@@ -1030,7 +1364,7 @@ impl ObjectWriterEmission for ObjectHandle {
     #[cfg(test)]
     fn write_stream_body_with_ref_map_and_removed_and_length(
         &self,
-        out: &mut Vec<u8>,
+        out: &mut OutputSink<'_>,
         refiltered: bool,
         map: &dyn Fn(ObjectRef) -> Result<ObjectRef>,
         removed_refs: &BTreeSet<ObjectRef>,
@@ -1048,7 +1382,7 @@ impl ObjectWriterEmission for ObjectHandle {
     #[cfg(test)]
     fn write_stream_body_with_ref_map_and_removed_and_length_with_options(
         &self,
-        out: &mut Vec<u8>,
+        out: &mut OutputSink<'_>,
         options: StreamDictionaryOptions,
         map: &dyn Fn(ObjectRef) -> Result<ObjectRef>,
         removed_refs: &BTreeSet<ObjectRef>,
@@ -1071,14 +1405,14 @@ impl ObjectWriterEmission for ObjectHandle {
     #[cfg(test)]
     fn write_stream_body_with_ref_map_and_removed_with_string_writer<F>(
         &self,
-        out: &mut Vec<u8>,
+        out: &mut OutputSink<'_>,
         refiltered: bool,
         map: &dyn Fn(ObjectRef) -> Result<ObjectRef>,
         removed_refs: &BTreeSet<ObjectRef>,
         write_string: &mut F,
     ) -> Result<()>
     where
-        F: FnMut(&mut Vec<u8>, &[u8]) -> Result<()>,
+        F: FnMut(&mut OutputSink<'_>, &[u8]) -> Result<()>,
     {
         self.write_stream_body_with_ref_map_and_removed_with_options_and_string_writer(
             out,
@@ -1093,14 +1427,14 @@ impl ObjectWriterEmission for ObjectHandle {
     /// removed-reference null visibility, and encrypted string serialization.
     fn write_stream_body_with_ref_map_and_removed_with_options_and_string_writer<F>(
         &self,
-        out: &mut Vec<u8>,
+        out: &mut OutputSink<'_>,
         options: StreamDictionaryOptions,
         map: &dyn Fn(ObjectRef) -> Result<ObjectRef>,
         removed_refs: &BTreeSet<ObjectRef>,
         write_string: &mut F,
     ) -> Result<()>
     where
-        F: FnMut(&mut Vec<u8>, &[u8]) -> Result<()>,
+        F: FnMut(&mut OutputSink<'_>, &[u8]) -> Result<()>,
     {
         if self.is_reserved() {
             return Err(reserved_unparse_error());
@@ -1192,7 +1526,7 @@ impl ObjectWriterEmission for ObjectHandle {
     #[cfg(test)]
     fn write_trailer(
         &self,
-        out: &mut Vec<u8>,
+        out: &mut OutputSink<'_>,
         xref_stream: bool,
         id_writer: Option<crate::pdf_syntax::TrailerIdWriter>,
     ) -> Result<()> {
@@ -1227,7 +1561,7 @@ impl ObjectWriterEmission for ObjectHandle {
     #[allow(clippy::too_many_arguments)] // qpdf keeps trailer layout, ID, mapping, and visibility controls orthogonal
     fn write_trailer_with_ref_map(
         &self,
-        out: &mut Vec<u8>,
+        out: &mut OutputSink<'_>,
         xref_stream: bool,
         qdf: bool,
         id_writer: Option<crate::pdf_syntax::TrailerIdWriter>,
@@ -1263,7 +1597,7 @@ impl ObjectWriterEmission for ObjectHandle {
     #[allow(clippy::too_many_arguments)]
     fn write_trailer_with_ref_map_and_kind(
         &self,
-        out: &mut Vec<u8>,
+        out: &mut OutputSink<'_>,
         kind: TrailerKind,
         xref_stream: bool,
         qdf: bool,
@@ -1307,7 +1641,7 @@ impl ObjectWriterEmission for ObjectHandle {
     #[cfg(test)]
     fn write_dictionary_with_ref_map_and_id_writer(
         &self,
-        out: &mut Vec<u8>,
+        out: &mut OutputSink<'_>,
         id_writer: Option<crate::pdf_syntax::TrailerIdWriter>,
         map: &dyn Fn(ObjectRef) -> Result<ObjectRef>,
         removed_refs: &BTreeSet<ObjectRef>,
@@ -1343,7 +1677,7 @@ impl ObjectWriterEmission for ObjectHandle {
     /// for the identifier itself (`QPDFWriter.cc:1194-1222`).
     fn write_id_value_with_ref_map(
         &self,
-        out: &mut Vec<u8>,
+        out: &mut OutputSink<'_>,
         map: &dyn Fn(ObjectRef) -> Result<ObjectRef>,
         removed_refs: &BTreeSet<ObjectRef>,
     ) -> Result<()> {
@@ -1591,19 +1925,19 @@ fn stream_dictionary_entries_for_emission(
 fn unparse_stream_dict_entries(
     entries: &[(Vec<u8>, ObjectHandle)],
     options: StreamDictionaryOptions,
-    out: &mut Vec<u8>,
+    out: &mut OutputSink<'_>,
 ) -> Result<()> {
     let entries = prepare_stream_dict_entries(entries, options)?;
-    out.extend_from_slice(b"<<");
+    out.write_bytes(b"<<")?;
     let mut length_value: Option<&ObjectHandle> = None;
     for (key, value) in visible_dict_entries(&entries)? {
         if key.as_slice() == b"/Length" {
             length_value = Some(value);
             continue;
         }
-        out.push(b' ');
-        write_dictionary_key(out, key);
-        out.push(b' ');
+        out.write_bytes(&[b' '])?;
+        write_dictionary_key(out, key)?;
+        out.write_bytes(&[b' '])?;
         let force_hex_string =
             key.as_slice() == b"/Contents" && dict_is_sig_with_byte_range(&entries)?;
         if !try_write_sig_contents_hex_string(value, force_hex_string, out)? {
@@ -1611,13 +1945,13 @@ fn unparse_stream_dict_entries(
         }
     }
     if let Some(length) = length_value {
-        out.extend_from_slice(b" /Length ");
+        out.write_bytes(b" /Length ")?;
         write_child(length, out)?;
     }
     if options.add_flate_filter {
-        out.extend_from_slice(b" /Filter /FlateDecode");
+        out.write_bytes(b" /Filter /FlateDecode")?;
     }
-    out.extend_from_slice(b" >>");
+    out.write_bytes(b" >>")?;
     Ok(())
 }
 
@@ -1643,34 +1977,34 @@ fn unparse_stream_dict_entries(
 fn unparse_stream_dict_entries_qdf(
     entries: &[(Vec<u8>, ObjectHandle)],
     indent: usize,
-    out: &mut Vec<u8>,
+    out: &mut OutputSink<'_>,
 ) -> Result<()> {
     let entries = prepare_stream_dict_entries(entries, StreamDictionaryOptions::preserve())?;
-    out.extend_from_slice(b"<<\n");
+    out.write_bytes(b"<<\n")?;
     let mut length_value: Option<&ObjectHandle> = None;
     for (key, value) in visible_dict_entries(&entries)? {
         if key.as_slice() == b"/Length" {
             length_value = Some(value);
             continue;
         }
-        push_spaces(out, indent + 2);
-        write_dictionary_key(out, key);
-        out.push(b' ');
+        push_spaces(out, indent + 2)?;
+        write_dictionary_key(out, key)?;
+        out.write_bytes(&[b' '])?;
         let force_hex_string =
             key.as_slice() == b"/Contents" && dict_is_sig_with_byte_range(&entries)?;
         if !try_write_sig_contents_hex_string(value, force_hex_string, out)? {
             write_child_qdf(value, indent + 2, out)?;
         }
-        out.push(b'\n');
+        out.write_bytes(&[b'\n'])?;
     }
     if let Some(length) = length_value {
-        push_spaces(out, indent + 2);
-        out.extend_from_slice(b"/Length ");
+        push_spaces(out, indent + 2)?;
+        out.write_bytes(b"/Length ")?;
         write_child_qdf(length, indent + 2, out)?;
-        out.push(b'\n');
+        out.write_bytes(&[b'\n'])?;
     }
-    push_spaces(out, indent);
-    out.extend_from_slice(b">>");
+    push_spaces(out, indent)?;
+    out.write_bytes(b">>")?;
     Ok(())
 }
 
@@ -1678,35 +2012,14 @@ fn unparse_stream_dict_entries_qdf(
 fn unparse_stream_dict_entries_qdf_with_ref_map(
     entries: &[(Vec<u8>, ObjectHandle)],
     indent: usize,
-    out: &mut Vec<u8>,
+    out: &mut OutputSink<'_>,
     map: &ObjectRefMap<'_>,
     removed_refs: &BTreeSet<ObjectRef>,
     length_ref: Option<ObjectRef>,
     options: StreamDictionaryOptions,
 ) -> Result<()> {
     let entries = prepare_stream_dict_entries(entries, options)?;
-    unparse_stream_dict_entries_qdf_with_ref_map_prepared(
-        &entries,
-        out,
-        indent,
-        map,
-        removed_refs,
-        length_ref,
-        options,
-    )
-}
-
-#[allow(clippy::too_many_arguments)]
-fn unparse_stream_dict_entries_qdf_with_ref_map_prepared(
-    entries: &[(Vec<u8>, ObjectHandle)],
-    out: &mut Vec<u8>,
-    indent: usize,
-    map: &ObjectRefMap<'_>,
-    removed_refs: &BTreeSet<ObjectRef>,
-    length_ref: Option<ObjectRef>,
-    options: StreamDictionaryOptions,
-) -> Result<()> {
-    out.extend_from_slice(b"<<\n");
+    out.write_bytes(b"<<\n")?;
     let mut length_value: Option<&ObjectHandle> = None;
     for (key, value) in visible_dict_entries(entries)? {
         if is_removed_reference(value, removed_refs) {
@@ -1716,33 +2029,33 @@ fn unparse_stream_dict_entries_qdf_with_ref_map_prepared(
             length_value = Some(value);
             continue;
         }
-        push_spaces(out, indent + 2);
-        write_dictionary_key(out, key);
-        out.push(b' ');
+        push_spaces(out, indent + 2)?;
+        write_dictionary_key(out, key)?;
+        out.write_bytes(&[b' '])?;
         let force_hex_string =
             key.as_slice() == b"/Contents" && dict_is_sig_with_byte_range(entries)?;
         if !try_write_sig_contents_hex_string(value, force_hex_string, out)? {
             write_child_qdf_with_ref_map(value, indent + 2, out, map, removed_refs)?;
         }
-        out.push(b'\n');
+        out.write_bytes(&[b'\n'])?;
     }
     if let Some(length_ref) = length_ref {
-        push_spaces(out, indent + 2);
-        out.extend_from_slice(b"/Length ");
-        out.extend_from_slice(length_ref.to_string().as_bytes());
-        out.push(b'\n');
+        push_spaces(out, indent + 2)?;
+        out.write_bytes(b"/Length ")?;
+        out.write_bytes(length_ref.to_string().as_bytes())?;
+        out.write_bytes(&[b'\n'])?;
     } else if let Some(length) = length_value {
-        push_spaces(out, indent + 2);
-        out.extend_from_slice(b"/Length ");
+        push_spaces(out, indent + 2)?;
+        out.write_bytes(b"/Length ")?;
         write_child_qdf_with_ref_map(length, indent + 2, out, map, removed_refs)?;
-        out.push(b'\n');
+        out.write_bytes(&[b'\n'])?;
     }
     if options.add_flate_filter {
-        push_spaces(out, indent + 2);
-        out.extend_from_slice(b"/Filter /FlateDecode\n");
+        push_spaces(out, indent + 2)?;
+        out.write_bytes(b"/Filter /FlateDecode\n")?;
     }
-    push_spaces(out, indent);
-    out.extend_from_slice(b">>");
+    push_spaces(out, indent)?;
+    out.write_bytes(b">>")?;
     Ok(())
 }
 
@@ -1814,7 +2127,7 @@ where
 fn unparse_stream_dict_entries_qdf_with_ref_map_and_string_writer<F>(
     entries: &[(Vec<u8>, ObjectHandle)],
     indent: usize,
-    out: &mut Vec<u8>,
+    out: &mut OutputSink<'_>,
     map: &ObjectRefMap<'_>,
     removed_refs: &BTreeSet<ObjectRef>,
     length_ref: Option<ObjectRef>,
@@ -1822,10 +2135,10 @@ fn unparse_stream_dict_entries_qdf_with_ref_map_and_string_writer<F>(
     write_string: &mut F,
 ) -> Result<()>
 where
-    F: FnMut(&mut Vec<u8>, &[u8]) -> Result<()>,
+    F: FnMut(&mut OutputSink<'_>, &[u8]) -> Result<()>,
 {
     let entries = prepare_stream_dict_entries(entries, options)?;
-    out.extend_from_slice(b"<<\n");
+    out.write_bytes(b"<<\n")?;
     let mut length_value: Option<&ObjectHandle> = None;
     for (key, value) in visible_dict_entries(&entries)? {
         if is_removed_reference(value, removed_refs) {
@@ -1835,13 +2148,13 @@ where
             length_value = Some(value);
             continue;
         }
-        push_spaces(out, indent + 2);
-        write_dictionary_key(out, key);
-        out.push(b' ');
+        push_spaces(out, indent + 2)?;
+        write_dictionary_key(out, key)?;
+        out.write_bytes(&[b' '])?;
         let force_hex_string =
             key.as_slice() == b"/Contents" && dict_is_sig_with_byte_range(&entries)?;
         if try_write_sig_contents_hex_string(value, force_hex_string, out)? {
-            out.push(b'\n');
+            out.write_bytes(&[b'\n'])?;
             continue;
         }
         write_child_qdf_with_ref_map_and_string_writer(
@@ -1852,12 +2165,12 @@ where
             removed_refs,
             write_string,
         )?; // cov:ignore: LLVM maps the covered mapped stream child call continuation to this line
-        out.push(b'\n');
+        out.write_bytes(&[b'\n'])?;
     }
-    push_spaces(out, indent + 2);
-    out.extend_from_slice(b"/Length ");
+    push_spaces(out, indent + 2)?;
+    out.write_bytes(b"/Length ")?;
     if let Some(length_ref) = length_ref {
-        out.extend_from_slice(length_ref.to_string().as_bytes());
+        out.write_bytes(length_ref.to_string().as_bytes())?;
     } else if let Some(length) = length_value {
         write_child_qdf_with_ref_map_and_string_writer(
             length,
@@ -1868,15 +2181,15 @@ where
             write_string,
         )?; // cov:ignore: LLVM maps the covered mapped length child call continuation to this line
     } else {
-        out.extend_from_slice(b"null");
+        out.write_bytes(b"null")?;
     }
-    out.push(b'\n');
+    out.write_bytes(&[b'\n'])?;
     if options.add_flate_filter {
-        push_spaces(out, indent + 2);
-        out.extend_from_slice(b"/Filter /FlateDecode\n");
+        push_spaces(out, indent + 2)?;
+        out.write_bytes(b"/Filter /FlateDecode\n")?;
     }
-    push_spaces(out, indent);
-    out.extend_from_slice(b">>");
+    push_spaces(out, indent)?;
+    out.write_bytes(b">>")?;
     Ok(())
 }
 
@@ -1884,26 +2197,26 @@ where
 fn unparse_stream_dict_entries_with_string_writer<F>(
     entries: &[(Vec<u8>, ObjectHandle)],
     refiltered: bool,
-    out: &mut Vec<u8>,
+    out: &mut OutputSink<'_>,
     write_string: &mut F,
 ) -> Result<()>
 where
-    F: FnMut(&mut Vec<u8>, &[u8]) -> Result<()>,
+    F: FnMut(&mut OutputSink<'_>, &[u8]) -> Result<()>,
 {
     let entries = prepare_stream_dict_entries(
         entries,
         StreamDictionaryOptions::from_refiltered(refiltered),
     )?; // cov:ignore: legacy test-only string-writer wrapper delegates to the covered options primitive
-    out.extend_from_slice(b"<<");
+    out.write_bytes(b"<<")?;
     let mut length_value: Option<&ObjectHandle> = None;
     for (key, value) in visible_dict_entries(&entries)? {
         if key.as_slice() == b"/Length" {
             length_value = Some(value);
             continue;
         }
-        out.push(b' ');
-        write_dictionary_key(out, key);
-        out.push(b' ');
+        out.write_bytes(&[b' '])?;
+        write_dictionary_key(out, key)?;
+        out.write_bytes(&[b' '])?;
         let force_hex_string =
             key.as_slice() == b"/Contents" && dict_is_sig_with_byte_range(&entries)?;
         if try_write_sig_contents_with_string_writer(value, force_hex_string, out)? {
@@ -1912,13 +2225,13 @@ where
         write_child_with_string_writer(value, out, write_string)?;
     }
     if let Some(length) = length_value {
-        out.extend_from_slice(b" /Length ");
+        out.write_bytes(b" /Length ")?;
         write_child_with_string_writer(length, out, write_string)?;
     }
     if refiltered {
-        out.extend_from_slice(b" /Filter /FlateDecode");
+        out.write_bytes(b" /Filter /FlateDecode")?;
     }
-    out.extend_from_slice(b" >>");
+    out.write_bytes(b" >>")?;
     Ok(())
 }
 
@@ -1926,46 +2239,46 @@ where
 fn unparse_stream_dict_entries_qdf_with_string_writer<F>(
     entries: &[(Vec<u8>, ObjectHandle)],
     indent: usize,
-    out: &mut Vec<u8>,
+    out: &mut OutputSink<'_>,
     write_string: &mut F,
 ) -> Result<()>
 where
-    F: FnMut(&mut Vec<u8>, &[u8]) -> Result<()>,
+    F: FnMut(&mut OutputSink<'_>, &[u8]) -> Result<()>,
 {
-    out.extend_from_slice(b"<<\n");
+    out.write_bytes(b"<<\n")?;
     let mut length_value: Option<&ObjectHandle> = None;
     for (key, value) in visible_dict_entries(entries)? {
         if key.as_slice() == b"/Length" {
             length_value = Some(value);
             continue;
         }
-        push_spaces(out, indent + 2);
-        write_dictionary_key(out, key);
-        out.push(b' ');
+        push_spaces(out, indent + 2)?;
+        write_dictionary_key(out, key)?;
+        out.write_bytes(&[b' '])?;
         let force_hex_string =
             key.as_slice() == b"/Contents" && dict_is_sig_with_byte_range(entries)?;
         if try_write_sig_contents_with_string_writer(value, force_hex_string, out)? {
-            out.push(b'\n');
+            out.write_bytes(&[b'\n'])?;
             continue;
         }
         write_child_qdf_with_string_writer(value, indent + 2, out, write_string)?;
-        out.push(b'\n');
+        out.write_bytes(&[b'\n'])?;
     }
     if let Some(length) = length_value {
-        push_spaces(out, indent + 2);
-        out.extend_from_slice(b"/Length ");
+        push_spaces(out, indent + 2)?;
+        out.write_bytes(b"/Length ")?;
         write_child_qdf_with_string_writer(length, indent + 2, out, write_string)?;
-        out.push(b'\n');
+        out.write_bytes(&[b'\n'])?;
     }
-    push_spaces(out, indent);
-    out.extend_from_slice(b">>");
+    push_spaces(out, indent)?;
+    out.write_bytes(b">>")?;
     Ok(())
 }
 
 fn unparse_stream_dict_entries_with_ref_map(
     entries: &[(Vec<u8>, ObjectHandle)],
     options: StreamDictionaryOptions,
-    out: &mut Vec<u8>,
+    out: &mut OutputSink<'_>,
     map: &ObjectRefMap<'_>,
     removed_refs: &BTreeSet<ObjectRef>,
 ) -> Result<()> {
@@ -1982,13 +2295,13 @@ fn unparse_stream_dict_entries_with_ref_map(
 fn unparse_stream_dict_entries_with_ref_map_and_length(
     entries: &[(Vec<u8>, ObjectHandle)],
     options: StreamDictionaryOptions,
-    out: &mut Vec<u8>,
+    out: &mut OutputSink<'_>,
     map: &ObjectRefMap<'_>,
     removed_refs: &BTreeSet<ObjectRef>,
     length_override: Option<usize>,
 ) -> Result<()> {
     let entries = prepare_stream_dict_entries(entries, options)?;
-    out.extend_from_slice(b"<<");
+    out.write_bytes(b"<<")?;
     let mut length_value: Option<&ObjectHandle> = None;
     for (key, value) in visible_dict_entries(&entries)? {
         if is_removed_reference(value, removed_refs) {
@@ -1998,9 +2311,9 @@ fn unparse_stream_dict_entries_with_ref_map_and_length(
             length_value = Some(value);
             continue;
         }
-        out.push(b' ');
-        write_dictionary_key(out, key);
-        out.push(b' ');
+        out.write_bytes(&[b' '])?;
+        write_dictionary_key(out, key)?;
+        out.write_bytes(&[b' '])?;
         let force_hex_string =
             key.as_slice() == b"/Contents" && dict_is_sig_with_byte_range(&entries)?;
         if !try_write_sig_contents_hex_string(value, force_hex_string, out)? {
@@ -2008,32 +2321,32 @@ fn unparse_stream_dict_entries_with_ref_map_and_length(
         }
     }
     if let Some(length) = length_override {
-        out.extend_from_slice(b" /Length ");
-        out.extend_from_slice(length.to_string().as_bytes());
+        out.write_bytes(b" /Length ")?;
+        out.write_bytes(length.to_string().as_bytes())?;
     } else if let Some(length) = length_value {
-        out.extend_from_slice(b" /Length ");
+        out.write_bytes(b" /Length ")?;
         write_child_with_ref_map(length, out, map, removed_refs)?;
     }
     if options.add_flate_filter {
-        out.extend_from_slice(b" /Filter /FlateDecode");
+        out.write_bytes(b" /Filter /FlateDecode")?;
     }
-    out.extend_from_slice(b" >>");
+    out.write_bytes(b" >>")?;
     Ok(())
 }
 
 fn unparse_stream_dict_entries_with_ref_map_and_string_writer<F>(
     entries: &[(Vec<u8>, ObjectHandle)],
     options: StreamDictionaryOptions,
-    out: &mut Vec<u8>,
+    out: &mut OutputSink<'_>,
     map: &ObjectRefMap<'_>,
     removed_refs: &BTreeSet<ObjectRef>,
     write_string: &mut F,
 ) -> Result<()>
 where
-    F: FnMut(&mut Vec<u8>, &[u8]) -> Result<()>,
+    F: FnMut(&mut OutputSink<'_>, &[u8]) -> Result<()>,
 {
     let entries = prepare_stream_dict_entries(entries, options)?;
-    out.extend_from_slice(b"<<");
+    out.write_bytes(b"<<")?;
     let mut length_value: Option<&ObjectHandle> = None;
     for (key, value) in visible_dict_entries(&entries)? {
         if is_removed_reference(value, removed_refs) {
@@ -2043,9 +2356,9 @@ where
             length_value = Some(value);
             continue;
         }
-        out.push(b' ');
-        write_dictionary_key(out, key);
-        out.push(b' ');
+        out.write_bytes(&[b' '])?;
+        write_dictionary_key(out, key)?;
+        out.write_bytes(&[b' '])?;
         let force_hex_string =
             key.as_slice() == b"/Contents" && dict_is_sig_with_byte_range(&entries)?;
         if try_write_sig_contents_hex_string(value, force_hex_string, out)? {
@@ -2054,13 +2367,13 @@ where
         write_child_with_ref_map_and_string_writer(value, out, map, removed_refs, write_string)?;
     }
     if let Some(length) = length_value {
-        out.extend_from_slice(b" /Length ");
+        out.write_bytes(b" /Length ")?;
         write_child_with_ref_map_and_string_writer(length, out, map, removed_refs, write_string)?;
     }
     if options.add_flate_filter {
-        out.extend_from_slice(b" /Filter /FlateDecode");
+        out.write_bytes(b" /Filter /FlateDecode")?;
     }
-    out.extend_from_slice(b" >>");
+    out.write_bytes(b" >>")?;
     Ok(())
 }
 
@@ -2086,9 +2399,9 @@ where
 // runs on whatever handle it is entered with, top-level `self` or a
 // recursed-into direct child alike -- this function does not need its own
 // copy of that check to get the same result.
-pub(crate) fn write_child(handle: &ObjectHandle, out: &mut Vec<u8>) -> Result<()> {
+pub(crate) fn write_child(handle: &ObjectHandle, out: &mut OutputSink<'_>) -> Result<()> {
     if let Some(object_ref) = handle.object_ref() {
-        out.extend_from_slice(object_ref.to_string().as_bytes());
+        out.write_bytes(object_ref.to_string().as_bytes())?;
         return Ok(());
     }
     unparse_object_walk(handle, out)
@@ -2238,17 +2551,17 @@ fn snapshot_unparse_container(value: &ObjectValue) -> Option<UnparseContainer> {
     }
 }
 
-fn unparse_container(container: UnparseContainer, out: &mut Vec<u8>) -> Result<()> {
+fn unparse_container(container: UnparseContainer, out: &mut OutputSink<'_>) -> Result<()> {
     match container {
         UnparseContainer::Array(children) => {
             // QPDFWriter.cc:1334-1345: no token-boundary rule, a space is
             // written before every element regardless of adjacency.
-            out.push(b'[');
+            out.write_bytes(&[b'['])?;
             for child in children {
-                out.push(b' ');
+                out.write_bytes(&[b' '])?;
                 write_child(&child, out)?;
             }
-            out.extend_from_slice(b" ]");
+            out.write_bytes(b" ]")?;
         }
         UnparseContainer::Dictionary(entries) => unparse_dict_entries(&entries, out)?,
         UnparseContainer::Stream(stream_dict) => {
@@ -2260,7 +2573,7 @@ fn unparse_container(container: UnparseContainer, out: &mut Vec<u8>) -> Result<(
     Ok(())
 }
 
-fn unparse_object_walk(handle: &ObjectHandle, out: &mut Vec<u8>) -> Result<()> {
+fn unparse_object_walk(handle: &ObjectHandle, out: &mut OutputSink<'_>) -> Result<()> {
     stacker::maybe_grow(UNPARSE_STACK_RED_ZONE, UNPARSE_STACK_GROWTH_SIZE, || {
         if handle.is_reserved() {
             return Err(reserved_unparse_error());
@@ -2280,7 +2593,7 @@ fn unparse_object_walk(handle: &ObjectHandle, out: &mut Vec<u8>) -> Result<()> {
                 // cov:ignore-start: unreachable once `try_dereference()`
                 // above has returned `Ok`; retain the conservative null
                 // fallback for a resolver that violates that invariant.
-                out.extend_from_slice(b"null");
+                out.write_bytes(b"null")?;
                 Ok(None)
                 // cov:ignore-end
             }
@@ -2292,39 +2605,39 @@ fn unparse_object_walk(handle: &ObjectHandle, out: &mut Vec<u8>) -> Result<()> {
     })
 }
 
-pub(crate) fn unparse_object_value(value: &ObjectValue, out: &mut Vec<u8>) -> Result<()> {
+pub(crate) fn unparse_object_value(value: &ObjectValue, out: &mut OutputSink<'_>) -> Result<()> {
     match value {
-        ObjectValue::Null => out.extend_from_slice(b"null"),
+        ObjectValue::Null => out.write_bytes(b"null")?,
         ObjectValue::Unresolved => return Err(unresolved_unparse_error()),
         ObjectValue::Reserved => return Err(reserved_unparse_error()),
         ObjectValue::Destroyed => return Err(destroyed_unparse_error()),
-        ObjectValue::Boolean(v) => out.extend_from_slice(if *v { b"true" } else { b"false" }),
-        ObjectValue::Integer(v) => out.extend_from_slice(v.to_string().as_bytes()),
-        ObjectValue::Real(v) => out.extend_from_slice(v.to_string().as_bytes()),
+        ObjectValue::Boolean(v) => out.write_bytes(if *v { b"true" } else { b"false" })?,
+        ObjectValue::Integer(v) => out.write_bytes(v.to_string().as_bytes())?,
+        ObjectValue::Real(v) => out.write_bytes(v.to_string().as_bytes())?,
         ObjectValue::RealLiteral { value, literal } => {
             if crate::pdf_syntax::real_literal_is_safe(literal, *value) {
-                out.extend_from_slice(literal);
+                out.write_bytes(literal)?;
             } else {
-                out.extend_from_slice(value.to_string().as_bytes());
+                out.write_bytes(value.to_string().as_bytes())?;
             }
         }
         ObjectValue::Name(name) => {
-            out.push(b'/');
-            crate::pdf_syntax::write_name_escaped(out, name);
+            out.write_bytes(&[b'/'])?;
+            crate::pdf_syntax::write_name_escaped_to_sink(out, name)?;
         }
-        ObjectValue::String(value) => crate::pdf_syntax::write_string_value(out, value),
+        ObjectValue::String(value) => crate::pdf_syntax::write_string_value_to_sink(out, value)?,
         ObjectValue::Operator(value) | ObjectValue::InlineImage(value) => {
-            out.extend_from_slice(value);
+            out.write_bytes(value)?;
         }
         ObjectValue::Array(children) => {
             // QPDFWriter.cc:1334-1345: no token-boundary rule, a space is
             // written before every element regardless of adjacency.
-            out.push(b'[');
+            out.write_bytes(&[b'['])?;
             for child in children {
-                out.push(b' ');
+                out.write_bytes(&[b' '])?;
                 write_child(child, out)?;
             }
-            out.extend_from_slice(b" ]");
+            out.write_bytes(b" ]")?;
         }
         ObjectValue::Dictionary(entries) => {
             let entries: Vec<(Vec<u8>, ObjectHandle)> = entries
@@ -2378,7 +2691,7 @@ type ObjectRefMap<'a> = dyn Fn(ObjectRef) -> Result<ObjectRef> + 'a;
 // reaching a live document write is already covered by this path.
 fn write_child_with_ref_map(
     handle: &ObjectHandle,
-    out: &mut Vec<u8>,
+    out: &mut OutputSink<'_>,
     map: &ObjectRefMap<'_>,
     removed_refs: &BTreeSet<ObjectRef>,
 ) -> Result<()> {
@@ -2387,11 +2700,11 @@ fn write_child_with_ref_map(
             // qpdf's direct-null identity is object number zero, not an
             // output reference (QPDFObjectHandle.cc:344-350). A removed
             // identity follows the same null path in the qpdf rewrite.
-            out.extend_from_slice(b"null");
+            out.write_bytes(b"null")?;
             return Ok(());
         }
         let mapped = map(object_ref)?;
-        out.extend_from_slice(mapped.to_string().as_bytes());
+        out.write_bytes(mapped.to_string().as_bytes())?;
         return Ok(());
     }
     unparse_object_walk_with_ref_map(handle, out, map, removed_refs)
@@ -2399,7 +2712,7 @@ fn write_child_with_ref_map(
 
 fn unparse_object_walk_with_ref_map(
     handle: &ObjectHandle,
-    out: &mut Vec<u8>,
+    out: &mut OutputSink<'_>,
     map: &ObjectRefMap<'_>,
     removed_refs: &BTreeSet<ObjectRef>,
 ) -> Result<()> {
@@ -2421,7 +2734,7 @@ fn unparse_object_walk_with_ref_map(
             None => {
                 // cov:ignore-start: successful dereference exposes Null for
                 // the null fallback or errors while unresolved.
-                out.extend_from_slice(b"null");
+                out.write_bytes(b"null")?;
                 Ok(None)
                 // cov:ignore-end
             }
@@ -2435,18 +2748,18 @@ fn unparse_object_walk_with_ref_map(
 
 fn unparse_container_with_ref_map(
     container: UnparseContainer,
-    out: &mut Vec<u8>,
+    out: &mut OutputSink<'_>,
     map: &ObjectRefMap<'_>,
     removed_refs: &BTreeSet<ObjectRef>,
 ) -> Result<()> {
     match container {
         UnparseContainer::Array(children) => {
-            out.push(b'[');
+            out.write_bytes(&[b'['])?;
             for child in children {
-                out.push(b' ');
+                out.write_bytes(&[b' '])?;
                 write_child_with_ref_map(&child, out, map, removed_refs)?;
             }
-            out.extend_from_slice(b" ]");
+            out.write_bytes(b" ]")?;
         }
         UnparseContainer::Dictionary(entries) => {
             unparse_dict_entries_with_ref_map(&entries, out, map, removed_refs)?;
@@ -2460,18 +2773,18 @@ fn unparse_container_with_ref_map(
 
 fn unparse_object_value_with_ref_map(
     value: &ObjectValue,
-    out: &mut Vec<u8>,
+    out: &mut OutputSink<'_>,
     map: &ObjectRefMap<'_>,
     removed_refs: &BTreeSet<ObjectRef>,
 ) -> Result<()> {
     match value {
         ObjectValue::Array(children) => {
-            out.push(b'[');
+            out.write_bytes(&[b'['])?;
             for child in children {
-                out.push(b' ');
+                out.write_bytes(&[b' '])?;
                 write_child_with_ref_map(child, out, map, removed_refs)?;
             }
-            out.extend_from_slice(b" ]");
+            out.write_bytes(b" ]")?;
         }
         ObjectValue::Dictionary(entries) => {
             let entries: Vec<(Vec<u8>, ObjectHandle)> = entries
@@ -2490,25 +2803,25 @@ fn unparse_object_value_with_ref_map(
 
 fn unparse_dict_entries_with_ref_map(
     entries: &[(Vec<u8>, ObjectHandle)],
-    out: &mut Vec<u8>,
+    out: &mut OutputSink<'_>,
     map: &ObjectRefMap<'_>,
     removed_refs: &BTreeSet<ObjectRef>,
 ) -> Result<()> {
-    out.extend_from_slice(b"<<");
+    out.write_bytes(b"<<")?;
     for (key, value) in visible_dict_entries(entries)? {
         if is_removed_reference(value, removed_refs) {
             continue;
         }
-        out.push(b' ');
-        write_dictionary_key(out, key);
-        out.push(b' ');
+        out.write_bytes(&[b' '])?;
+        write_dictionary_key(out, key)?;
+        out.write_bytes(&[b' '])?;
         let force_hex_string =
             key.as_slice() == b"/Contents" && dict_is_sig_with_byte_range(entries)?;
         if !try_write_sig_contents_hex_string(value, force_hex_string, out)? {
             write_child_with_ref_map(value, out, map, removed_refs)?;
         }
     }
-    out.extend_from_slice(b" >>");
+    out.write_bytes(b" >>")?;
     Ok(())
 }
 
@@ -2643,7 +2956,7 @@ where
 
 fn write_child_with_dynamic_ref_map(
     handle: &ObjectHandle,
-    out: &mut Vec<u8>,
+    out: &mut OutputSink<'_>,
     map: &mut DynamicObjectRefMap<'_>,
     removed_refs: &BTreeSet<ObjectRef>,
 ) -> Result<()> {
@@ -2654,16 +2967,16 @@ fn write_child_with_dynamic_ref_map(
         .qpdf_obj_gen()
         .is_some_and(|object_gen| object_gen.get_obj() == 0)
     {
-        out.extend_from_slice(b"null");
+        out.write_bytes(b"null")?;
         return Ok(());
     }
     if let Some(object_ref) = handle.object_ref() {
         if object_ref.number == 0 || removed_refs.contains(&object_ref) {
-            out.extend_from_slice(b"null");
+            out.write_bytes(b"null")?;
             return Ok(());
         }
         let mapped = map(handle)?;
-        out.extend_from_slice(mapped.to_string().as_bytes());
+        out.write_bytes(mapped.to_string().as_bytes())?;
         return Ok(());
     }
     handle.try_dereference()?;
@@ -2688,7 +3001,7 @@ fn write_child_with_dynamic_ref_map(
 
 fn unparse_object_walk_with_dynamic_ref_map(
     handle: &ObjectHandle,
-    out: &mut Vec<u8>,
+    out: &mut OutputSink<'_>,
     map: &mut DynamicObjectRefMap<'_>,
     removed_refs: &BTreeSet<ObjectRef>,
 ) -> Result<()> {
@@ -2708,19 +3021,19 @@ fn unparse_object_walk_with_dynamic_ref_map(
             }
             None => {
                 // cov:ignore-start: with_value exposes every resolved slot as Some; this is a defensive resolver-violation fallback.
-                out.extend_from_slice(b"null");
+                out.write_bytes(b"null")?;
                 Ok(None)
                 // cov:ignore-end
             }
         })?;
         match container {
             Some(UnparseContainer::Array(children)) => {
-                out.push(b'[');
+                out.write_bytes(&[b'['])?;
                 for child in children {
-                    out.push(b' ');
+                    out.write_bytes(&[b' '])?;
                     write_child_with_dynamic_ref_map(&child, out, map, removed_refs)?;
                 }
-                out.extend_from_slice(b" ]");
+                out.write_bytes(b" ]")?;
             }
             Some(UnparseContainer::Dictionary(entries)) => {
                 unparse_dict_entries_with_dynamic_ref_map(&entries, out, map, removed_refs)?;
@@ -2736,7 +3049,7 @@ fn unparse_object_walk_with_dynamic_ref_map(
 
 fn unparse_object_value_with_dynamic_ref_map(
     value: &ObjectValue,
-    out: &mut Vec<u8>,
+    out: &mut OutputSink<'_>,
     _map: &mut DynamicObjectRefMap<'_>,
     _removed_refs: &BTreeSet<ObjectRef>,
 ) -> Result<()> {
@@ -2748,37 +3061,37 @@ fn unparse_object_value_with_dynamic_ref_map(
 
 fn unparse_dict_entries_with_dynamic_ref_map(
     entries: &[(Vec<u8>, ObjectHandle)],
-    out: &mut Vec<u8>,
+    out: &mut OutputSink<'_>,
     map: &mut DynamicObjectRefMap<'_>,
     removed_refs: &BTreeSet<ObjectRef>,
 ) -> Result<()> {
-    out.extend_from_slice(b"<<");
+    out.write_bytes(b"<<")?;
     for (key, value) in visible_dict_entries(entries)? {
         if is_removed_reference(value, removed_refs) {
             continue;
         }
-        out.push(b' ');
-        write_dictionary_key(out, key);
-        out.push(b' ');
+        out.write_bytes(&[b' '])?;
+        write_dictionary_key(out, key)?;
+        out.write_bytes(&[b' '])?;
         let force_hex_string =
             key.as_slice() == b"/Contents" && dict_is_sig_with_byte_range(entries)?;
         if !try_write_sig_contents_hex_string(value, force_hex_string, out)? {
             write_child_with_dynamic_ref_map(value, out, map, removed_refs)?; // cov:ignore: LLVM attributes this child-call terminator to callback cleanup.
         } // cov:ignore: LLVM attributes this child-call terminator to callback cleanup.
     }
-    out.extend_from_slice(b" >>");
+    out.write_bytes(b" >>")?;
     Ok(())
 }
 
 fn unparse_stream_dict_entries_with_dynamic_ref_map(
     entries: &[(Vec<u8>, ObjectHandle)],
     options: StreamDictionaryOptions,
-    out: &mut Vec<u8>,
+    out: &mut OutputSink<'_>,
     map: &mut DynamicObjectRefMap<'_>,
     removed_refs: &BTreeSet<ObjectRef>,
 ) -> Result<()> {
     let entries = prepare_stream_dict_entries(entries, options)?;
-    out.extend_from_slice(b"<<");
+    out.write_bytes(b"<<")?;
     let mut length_value: Option<&ObjectHandle> = None;
     for (key, value) in visible_dict_entries(&entries)? {
         if is_removed_reference(value, removed_refs) {
@@ -2788,9 +3101,9 @@ fn unparse_stream_dict_entries_with_dynamic_ref_map(
             length_value = Some(value);
             continue;
         }
-        out.push(b' ');
-        write_dictionary_key(out, key);
-        out.push(b' ');
+        out.write_bytes(&[b' '])?;
+        write_dictionary_key(out, key)?;
+        out.write_bytes(&[b' '])?;
         let force_hex_string =
             key.as_slice() == b"/Contents" && dict_is_sig_with_byte_range(&entries)?;
         if !try_write_sig_contents_hex_string(value, force_hex_string, out)? {
@@ -2798,13 +3111,13 @@ fn unparse_stream_dict_entries_with_dynamic_ref_map(
         } // cov:ignore: LLVM attributes this child-call terminator to callback cleanup.
     }
     if let Some(length) = length_value {
-        out.extend_from_slice(b" /Length ");
+        out.write_bytes(b" /Length ")?;
         write_child_with_dynamic_ref_map(length, out, map, removed_refs)?; // cov:ignore: LLVM attributes this length-call terminator to callback cleanup.
     } // cov:ignore: LLVM attributes this length-call terminator to callback cleanup.
     if options.add_flate_filter {
-        out.extend_from_slice(b" /Filter /FlateDecode");
+        out.write_bytes(b" /Filter /FlateDecode")?;
     }
-    out.extend_from_slice(b" >>");
+    out.write_bytes(b" >>")?;
     Ok(())
 }
 
@@ -3147,7 +3460,7 @@ pub(crate) fn dict_is_sig_with_byte_range(entries: &[(Vec<u8>, ObjectHandle)]) -
 // non-encrypting sub-pipeline while the rest of the document is encrypted.
 // This crate's `ObjectHandle` writer-emission primitives carry no
 // pipeline/encryption context at all -- every one of them is a plain
-// `(&self, out: &mut Vec<u8>, ...) -> Result<()>` -- so there is no
+// `(&self, out: &mut OutputSink<'_>, ...) -> Result<()>` -- so there is no
 // encryption state to route around in the first place here; wiring an
 // actual encryption pipeline around these bytes is a future
 // consumer-migration/encryption-integration concern this primitive does not
@@ -3157,20 +3470,20 @@ pub(crate) fn dict_is_sig_with_byte_range(entries: &[(Vec<u8>, ObjectHandle)]) -
 fn try_write_sig_contents_hex_string(
     handle: &ObjectHandle,
     force_hex_string: bool,
-    out: &mut Vec<u8>,
+    out: &mut OutputSink<'_>,
 ) -> Result<bool> {
     if !force_hex_string || handle.object_ref().is_some() {
         return Ok(false);
     }
     handle.try_dereference()?;
-    Ok(handle.with_value(|value| {
+    handle.with_value(|value| {
         if let Some(ObjectValue::String(bytes)) = value {
-            crate::pdf_syntax::write_hex_string(out, bytes);
-            true
+            crate::pdf_syntax::write_hex_string_to_sink(out, bytes)?;
+            Ok(true)
         } else {
-            false
+            Ok(false)
         }
-    }))
+    })
 }
 
 // Writes `<< /K1 v1 /K2 v2 >>` with qpdf's suppression rule applied
@@ -3182,19 +3495,22 @@ fn try_write_sig_contents_hex_string(
 // qpdf loop applies unconditionally (`QPDFWriter.cc:1490-1504`) -- see
 // `dict_is_sig_with_byte_range`/`try_write_sig_contents_hex_string`'s own
 // docs for the detection/writing split.
-fn unparse_dict_entries(entries: &[(Vec<u8>, ObjectHandle)], out: &mut Vec<u8>) -> Result<()> {
-    out.extend_from_slice(b"<<");
+fn unparse_dict_entries(
+    entries: &[(Vec<u8>, ObjectHandle)],
+    out: &mut OutputSink<'_>,
+) -> Result<()> {
+    out.write_bytes(b"<<")?;
     for (key, value) in visible_dict_entries(entries)? {
-        out.push(b' ');
-        write_dictionary_key(out, key);
-        out.push(b' ');
+        out.write_bytes(&[b' '])?;
+        write_dictionary_key(out, key)?;
+        out.write_bytes(&[b' '])?;
         let force_hex_string =
             key.as_slice() == b"/Contents" && dict_is_sig_with_byte_range(entries)?;
         if !try_write_sig_contents_hex_string(value, force_hex_string, out)? {
             write_child(value, out)?;
         }
     }
-    out.extend_from_slice(b" >>");
+    out.write_bytes(b" >>")?;
     Ok(())
 }
 
@@ -3203,8 +3519,11 @@ fn unparse_dict_entries(entries: &[(Vec<u8>, ObjectHandle)], out: &mut Vec<u8>) 
 // boundary (that one is not `pub(crate)`, and this task's scope is
 // `object_handle.rs` only), but the two are one-line bodies, not logic worth
 // sharing at the cost of widening `object.rs`'s API for a single call site.
-fn push_spaces(out: &mut Vec<u8>, n: usize) {
-    out.resize(out.len() + n, b' ');
+fn push_spaces(out: &mut OutputSink<'_>, n: usize) -> Result<()> {
+    for _ in 0..n {
+        out.write_bytes(b" ")?;
+    }
+    Ok(())
 }
 
 // QDF-mode sibling of `write_child` above: an indirect child always writes
@@ -3223,9 +3542,9 @@ fn push_spaces(out: &mut Vec<u8>, n: usize) {
 // dereferenced here, and a *direct* one is still rejected one level down,
 // by `unparse_object_walk_qdf`'s own `is_reserved` check on whatever
 // handle the `None` branch below recurses into.
-fn write_child_qdf(handle: &ObjectHandle, indent: usize, out: &mut Vec<u8>) -> Result<()> {
+fn write_child_qdf(handle: &ObjectHandle, indent: usize, out: &mut OutputSink<'_>) -> Result<()> {
     if let Some(object_ref) = handle.object_ref() {
-        out.extend_from_slice(object_ref.to_string().as_bytes());
+        out.write_bytes(object_ref.to_string().as_bytes())?;
         return Ok(());
     }
     unparse_object_walk_qdf(handle, indent, out)
@@ -3237,7 +3556,11 @@ fn write_child_qdf(handle: &ObjectHandle, indent: usize, out: &mut Vec<u8>) -> R
 // is forced here rather than left to `with_value`'s ordinary no-hidden-I/O
 // contract, and for the same conservative-null fallback rationale on the
 // `None` arm below.
-fn unparse_object_walk_qdf(handle: &ObjectHandle, indent: usize, out: &mut Vec<u8>) -> Result<()> {
+fn unparse_object_walk_qdf(
+    handle: &ObjectHandle,
+    indent: usize,
+    out: &mut OutputSink<'_>,
+) -> Result<()> {
     stacker::maybe_grow(UNPARSE_STACK_RED_ZONE, UNPARSE_STACK_GROWTH_SIZE, || {
         if handle.is_reserved() {
             return Err(reserved_unparse_error());
@@ -3257,7 +3580,7 @@ fn unparse_object_walk_qdf(handle: &ObjectHandle, indent: usize, out: &mut Vec<u
                 // cov:ignore-start: unreachable once `try_dereference()`
                 // above has returned `Ok` -- see `unparse_object_walk`'s own
                 // identical arm for why.
-                out.extend_from_slice(b"null");
+                out.write_bytes(b"null")?;
                 Ok(None)
                 // cov:ignore-end
             }
@@ -3272,22 +3595,22 @@ fn unparse_object_walk_qdf(handle: &ObjectHandle, indent: usize, out: &mut Vec<u
 fn unparse_container_qdf(
     container: UnparseContainer,
     indent: usize,
-    out: &mut Vec<u8>,
+    out: &mut OutputSink<'_>,
 ) -> Result<()> {
     match container {
         UnparseContainer::Array(children) => {
             // qpdf's QDF array arm: `[`, a newline, then each
             // child at `indent + 2`, followed by the closing bracket at
             // `indent`.
-            out.push(b'[');
-            out.push(b'\n');
+            out.write_bytes(&[b'['])?;
+            out.write_bytes(&[b'\n'])?;
             for child in children {
-                push_spaces(out, indent + 2);
+                push_spaces(out, indent + 2)?;
                 write_child_qdf(&child, indent + 2, out)?;
-                out.push(b'\n');
+                out.write_bytes(&[b'\n'])?;
             }
-            push_spaces(out, indent);
-            out.push(b']');
+            push_spaces(out, indent)?;
+            out.write_bytes(&[b']'])?;
         }
         UnparseContainer::Dictionary(entries) => {
             unparse_dict_entries_qdf(&entries, indent, out)?;
@@ -3306,22 +3629,26 @@ fn unparse_container_qdf(
 // `self.write_pdf(out)` for everything but its three container arms is the
 // same split), so this delegates that whole fallthrough set to
 // `unparse_object_value` itself rather than duplicating its match arms.
-fn unparse_object_value_qdf(value: &ObjectValue, indent: usize, out: &mut Vec<u8>) -> Result<()> {
+fn unparse_object_value_qdf(
+    value: &ObjectValue,
+    indent: usize,
+    out: &mut OutputSink<'_>,
+) -> Result<()> {
     match value {
         ObjectValue::Array(children) => {
             // qpdf's QDF array arm: `[`, a newline,
             // then per element `indent + 2` leading spaces + the child's own
             // QDF form + a trailing newline, then `indent` leading spaces and
             // `]`.
-            out.push(b'[');
-            out.push(b'\n');
+            out.write_bytes(&[b'['])?;
+            out.write_bytes(&[b'\n'])?;
             for child in children {
-                push_spaces(out, indent + 2);
+                push_spaces(out, indent + 2)?;
                 write_child_qdf(child, indent + 2, out)?;
-                out.push(b'\n');
+                out.write_bytes(&[b'\n'])?;
             }
-            push_spaces(out, indent);
-            out.push(b']');
+            push_spaces(out, indent)?;
+            out.write_bytes(&[b']'])?;
         }
         ObjectValue::Dictionary(entries) => {
             let entries: Vec<(Vec<u8>, ObjectHandle)> = entries
@@ -3387,37 +3714,37 @@ fn unparse_object_value_qdf(value: &ObjectValue, indent: usize, out: &mut Vec<u8
 fn unparse_dict_entries_qdf(
     entries: &[(Vec<u8>, ObjectHandle)],
     indent: usize,
-    out: &mut Vec<u8>,
+    out: &mut OutputSink<'_>,
 ) -> Result<()> {
-    out.extend_from_slice(b"<<\n");
+    out.write_bytes(b"<<\n")?;
     for (key, value) in visible_dict_entries(entries)? {
-        push_spaces(out, indent + 2);
-        write_dictionary_key(out, key);
-        out.push(b' ');
+        push_spaces(out, indent + 2)?;
+        write_dictionary_key(out, key)?;
+        out.write_bytes(&[b' '])?;
         let force_hex_string =
             key.as_slice() == b"/Contents" && dict_is_sig_with_byte_range(entries)?;
         if !try_write_sig_contents_hex_string(value, force_hex_string, out)? {
             write_child_qdf(value, indent + 2, out)?;
         }
-        out.push(b'\n');
+        out.write_bytes(&[b'\n'])?;
     }
-    push_spaces(out, indent);
-    out.extend_from_slice(b">>");
+    push_spaces(out, indent)?;
+    out.write_bytes(b">>")?;
     Ok(())
 }
 
 fn write_child_qdf_with_ref_map(
     handle: &ObjectHandle,
     indent: usize,
-    out: &mut Vec<u8>,
+    out: &mut OutputSink<'_>,
     map: &ObjectRefMap<'_>,
     removed_refs: &BTreeSet<ObjectRef>,
 ) -> Result<()> {
     if let Some(object_ref) = handle.object_ref() {
         if object_ref.number == 0 || removed_refs.contains(&object_ref) {
-            out.extend_from_slice(b"null");
+            out.write_bytes(b"null")?;
         } else {
-            out.extend_from_slice(map(object_ref)?.to_string().as_bytes());
+            out.write_bytes(map(object_ref)?.to_string().as_bytes())?;
         }
         return Ok(());
     }
@@ -3427,7 +3754,7 @@ fn write_child_qdf_with_ref_map(
 fn unparse_object_walk_qdf_with_ref_map(
     handle: &ObjectHandle,
     indent: usize,
-    out: &mut Vec<u8>,
+    out: &mut OutputSink<'_>,
     map: &ObjectRefMap<'_>,
     removed_refs: &BTreeSet<ObjectRef>,
 ) -> Result<()> {
@@ -3447,7 +3774,7 @@ fn unparse_object_walk_qdf_with_ref_map(
             }
             None => {
                 // cov:ignore-start: after try_dereference, a live non-reserved handle cannot expose None
-                out.extend_from_slice(b"null");
+                out.write_bytes(b"null")?;
                 Ok(None)
                 // cov:ignore-end
             }
@@ -3464,21 +3791,21 @@ fn unparse_object_walk_qdf_with_ref_map(
 fn unparse_container_qdf_with_ref_map(
     container: UnparseContainer,
     indent: usize,
-    out: &mut Vec<u8>,
+    out: &mut OutputSink<'_>,
     map: &ObjectRefMap<'_>,
     removed_refs: &BTreeSet<ObjectRef>,
 ) -> Result<()> {
     match container {
         UnparseContainer::Array(children) => {
-            out.push(b'[');
-            out.push(b'\n');
+            out.write_bytes(&[b'['])?;
+            out.write_bytes(&[b'\n'])?;
             for child in children {
-                push_spaces(out, indent + 2);
+                push_spaces(out, indent + 2)?;
                 write_child_qdf_with_ref_map(&child, indent + 2, out, map, removed_refs)?;
-                out.push(b'\n');
+                out.write_bytes(&[b'\n'])?;
             }
-            push_spaces(out, indent);
-            out.push(b']');
+            push_spaces(out, indent)?;
+            out.write_bytes(&[b']'])?;
         }
         UnparseContainer::Dictionary(entries) => {
             unparse_dict_entries_qdf_with_ref_map(&entries, indent, out, map, removed_refs)?;
@@ -3493,7 +3820,7 @@ fn unparse_container_qdf_with_ref_map(
 fn unparse_object_value_qdf_with_ref_map(
     value: &ObjectValue,
     _indent: usize,
-    out: &mut Vec<u8>,
+    out: &mut OutputSink<'_>,
     _map: &ObjectRefMap<'_>,
     _removed_refs: &BTreeSet<ObjectRef>,
 ) -> Result<()> {
@@ -3508,45 +3835,45 @@ fn unparse_object_value_qdf_with_ref_map(
 fn unparse_dict_entries_qdf_with_ref_map(
     entries: &[(Vec<u8>, ObjectHandle)],
     indent: usize,
-    out: &mut Vec<u8>,
+    out: &mut OutputSink<'_>,
     map: &ObjectRefMap<'_>,
     removed_refs: &BTreeSet<ObjectRef>,
 ) -> Result<()> {
-    out.extend_from_slice(b"<<\n");
+    out.write_bytes(b"<<\n")?;
     for (key, value) in visible_dict_entries(entries)? {
         if is_removed_reference(value, removed_refs) {
             continue;
         }
-        push_spaces(out, indent + 2);
-        write_dictionary_key(out, key);
-        out.push(b' ');
+        push_spaces(out, indent + 2)?;
+        write_dictionary_key(out, key)?;
+        out.write_bytes(&[b' '])?;
         let force_hex_string =
             key.as_slice() == b"/Contents" && dict_is_sig_with_byte_range(entries)?;
         if !try_write_sig_contents_hex_string(value, force_hex_string, out)? {
             write_child_qdf_with_ref_map(value, indent + 2, out, map, removed_refs)?;
         }
-        out.push(b'\n');
+        out.write_bytes(&[b'\n'])?;
     }
-    push_spaces(out, indent);
-    out.extend_from_slice(b">>");
+    push_spaces(out, indent)?;
+    out.write_bytes(b">>")?;
     Ok(())
 }
 
 fn write_child_with_ref_map_and_string_writer<F>(
     handle: &ObjectHandle,
-    out: &mut Vec<u8>,
+    out: &mut OutputSink<'_>,
     map: &ObjectRefMap<'_>,
     removed_refs: &BTreeSet<ObjectRef>,
     write_string: &mut F,
 ) -> Result<()>
 where
-    F: FnMut(&mut Vec<u8>, &[u8]) -> Result<()>,
+    F: FnMut(&mut OutputSink<'_>, &[u8]) -> Result<()>,
 {
     if let Some(object_ref) = handle.object_ref() {
         if object_ref.number == 0 || removed_refs.contains(&object_ref) {
-            out.extend_from_slice(b"null");
+            out.write_bytes(b"null")?;
         } else {
-            out.extend_from_slice(map(object_ref)?.to_string().as_bytes());
+            out.write_bytes(map(object_ref)?.to_string().as_bytes())?;
         }
         return Ok(());
     }
@@ -3555,13 +3882,13 @@ where
 
 fn unparse_object_walk_with_ref_map_and_string_writer<F>(
     handle: &ObjectHandle,
-    out: &mut Vec<u8>,
+    out: &mut OutputSink<'_>,
     map: &ObjectRefMap<'_>,
     removed_refs: &BTreeSet<ObjectRef>,
     write_string: &mut F,
 ) -> Result<()>
 where
-    F: FnMut(&mut Vec<u8>, &[u8]) -> Result<()>,
+    F: FnMut(&mut OutputSink<'_>, &[u8]) -> Result<()>,
 {
     stacker::maybe_grow(UNPARSE_STACK_RED_ZONE, UNPARSE_STACK_GROWTH_SIZE, || {
         if handle.is_reserved() {
@@ -3585,7 +3912,7 @@ where
             }
             None => {
                 // cov:ignore-start: after try_dereference, a live non-reserved handle cannot expose None
-                out.extend_from_slice(b"null");
+                out.write_bytes(b"null")?;
                 Ok(None)
                 // cov:ignore-end
             }
@@ -3605,19 +3932,19 @@ where
 
 fn unparse_container_with_ref_map_and_string_writer<F>(
     container: UnparseContainer,
-    out: &mut Vec<u8>,
+    out: &mut OutputSink<'_>,
     map: &ObjectRefMap<'_>,
     removed_refs: &BTreeSet<ObjectRef>,
     write_string: &mut F,
 ) -> Result<()>
 where
-    F: FnMut(&mut Vec<u8>, &[u8]) -> Result<()>,
+    F: FnMut(&mut OutputSink<'_>, &[u8]) -> Result<()>,
 {
     match container {
         UnparseContainer::Array(children) => {
-            out.push(b'[');
+            out.write_bytes(&[b'['])?;
             for child in children {
-                out.push(b' ');
+                out.write_bytes(&[b' '])?;
                 write_child_with_ref_map_and_string_writer(
                     &child,
                     out,
@@ -3626,7 +3953,7 @@ where
                     write_string,
                 )?; // cov:ignore: LLVM maps the covered child call continuation to this line
             }
-            out.extend_from_slice(b" ]");
+            out.write_bytes(b" ]")?;
         }
         UnparseContainer::Dictionary(entries) => {
             unparse_dict_entries_with_ref_map_and_string_writer(
@@ -3652,13 +3979,13 @@ where
 
 fn unparse_object_value_with_ref_map_and_string_writer<F>(
     value: &ObjectValue,
-    out: &mut Vec<u8>,
+    out: &mut OutputSink<'_>,
     _map: &ObjectRefMap<'_>,
     _removed_refs: &BTreeSet<ObjectRef>,
     write_string: &mut F,
 ) -> Result<()>
 where
-    F: FnMut(&mut Vec<u8>, &[u8]) -> Result<()>,
+    F: FnMut(&mut OutputSink<'_>, &[u8]) -> Result<()>,
 {
     match value {
         ObjectValue::String(bytes) => write_string(out, bytes),
@@ -3668,22 +3995,22 @@ where
 
 fn unparse_dict_entries_with_ref_map_and_string_writer<F>(
     entries: &[(Vec<u8>, ObjectHandle)],
-    out: &mut Vec<u8>,
+    out: &mut OutputSink<'_>,
     map: &ObjectRefMap<'_>,
     removed_refs: &BTreeSet<ObjectRef>,
     write_string: &mut F,
 ) -> Result<()>
 where
-    F: FnMut(&mut Vec<u8>, &[u8]) -> Result<()>,
+    F: FnMut(&mut OutputSink<'_>, &[u8]) -> Result<()>,
 {
-    out.extend_from_slice(b"<<");
+    out.write_bytes(b"<<")?;
     for (key, value) in visible_dict_entries(entries)? {
         if is_removed_reference(value, removed_refs) {
             continue;
         }
-        out.push(b' ');
-        write_dictionary_key(out, key);
-        out.push(b' ');
+        out.write_bytes(&[b' '])?;
+        write_dictionary_key(out, key)?;
+        out.write_bytes(&[b' '])?;
         let force_hex_string =
             key.as_slice() == b"/Contents" && dict_is_sig_with_byte_range(entries)?;
         if try_write_sig_contents_hex_string(value, force_hex_string, out)? {
@@ -3691,26 +4018,26 @@ where
         }
         write_child_with_ref_map_and_string_writer(value, out, map, removed_refs, write_string)?;
     }
-    out.extend_from_slice(b" >>");
+    out.write_bytes(b" >>")?;
     Ok(())
 }
 
 fn write_child_qdf_with_ref_map_and_string_writer<F>(
     handle: &ObjectHandle,
     indent: usize,
-    out: &mut Vec<u8>,
+    out: &mut OutputSink<'_>,
     map: &ObjectRefMap<'_>,
     removed_refs: &BTreeSet<ObjectRef>,
     write_string: &mut F,
 ) -> Result<()>
 where
-    F: FnMut(&mut Vec<u8>, &[u8]) -> Result<()>,
+    F: FnMut(&mut OutputSink<'_>, &[u8]) -> Result<()>,
 {
     if let Some(object_ref) = handle.object_ref() {
         if object_ref.number == 0 || removed_refs.contains(&object_ref) {
-            out.extend_from_slice(b"null");
+            out.write_bytes(b"null")?;
         } else {
-            out.extend_from_slice(map(object_ref)?.to_string().as_bytes());
+            out.write_bytes(map(object_ref)?.to_string().as_bytes())?;
         }
         return Ok(());
     }
@@ -3727,13 +4054,13 @@ where
 fn unparse_object_walk_qdf_with_ref_map_and_string_writer<F>(
     handle: &ObjectHandle,
     indent: usize,
-    out: &mut Vec<u8>,
+    out: &mut OutputSink<'_>,
     map: &ObjectRefMap<'_>,
     removed_refs: &BTreeSet<ObjectRef>,
     write_string: &mut F,
 ) -> Result<()>
 where
-    F: FnMut(&mut Vec<u8>, &[u8]) -> Result<()>,
+    F: FnMut(&mut OutputSink<'_>, &[u8]) -> Result<()>,
 {
     stacker::maybe_grow(UNPARSE_STACK_RED_ZONE, UNPARSE_STACK_GROWTH_SIZE, || {
         // cov:ignore: reserved precondition closure has no independent LLVM counter
@@ -3759,7 +4086,7 @@ where
             }
             None => {
                 // cov:ignore-start: after try_dereference, a live non-reserved handle cannot expose None
-                out.extend_from_slice(b"null");
+                out.write_bytes(b"null")?;
                 Ok(None)
                 // cov:ignore-end
             }
@@ -3781,20 +4108,20 @@ where
 fn unparse_container_qdf_with_ref_map_and_string_writer<F>(
     container: UnparseContainer,
     indent: usize,
-    out: &mut Vec<u8>,
+    out: &mut OutputSink<'_>,
     map: &ObjectRefMap<'_>,
     removed_refs: &BTreeSet<ObjectRef>,
     write_string: &mut F,
 ) -> Result<()>
 where
-    F: FnMut(&mut Vec<u8>, &[u8]) -> Result<()>,
+    F: FnMut(&mut OutputSink<'_>, &[u8]) -> Result<()>,
 {
     match container {
         UnparseContainer::Array(children) => {
-            out.push(b'[');
-            out.push(b'\n');
+            out.write_bytes(&[b'['])?;
+            out.write_bytes(&[b'\n'])?;
             for child in children {
-                push_spaces(out, indent + 2);
+                push_spaces(out, indent + 2)?;
                 write_child_qdf_with_ref_map_and_string_writer(
                     &child,
                     indent + 2,
@@ -3803,10 +4130,10 @@ where
                     removed_refs,
                     write_string,
                 )?; // cov:ignore: LLVM maps the covered child call continuation to this line
-                out.push(b'\n');
+                out.write_bytes(&[b'\n'])?;
             }
-            push_spaces(out, indent);
-            out.push(b']');
+            push_spaces(out, indent)?;
+            out.write_bytes(&[b']'])?;
         }
         UnparseContainer::Dictionary(entries) => {
             unparse_dict_entries_qdf_with_ref_map_and_string_writer(
@@ -3835,13 +4162,13 @@ where
 fn unparse_object_value_qdf_with_ref_map_and_string_writer<F>(
     value: &ObjectValue,
     _indent: usize,
-    out: &mut Vec<u8>,
+    out: &mut OutputSink<'_>,
     _map: &ObjectRefMap<'_>,
     _removed_refs: &BTreeSet<ObjectRef>,
     write_string: &mut F,
 ) -> Result<()>
 where
-    F: FnMut(&mut Vec<u8>, &[u8]) -> Result<()>,
+    F: FnMut(&mut OutputSink<'_>, &[u8]) -> Result<()>,
 {
     match value {
         ObjectValue::String(bytes) => write_string(out, bytes),
@@ -3852,26 +4179,26 @@ where
 fn unparse_dict_entries_qdf_with_ref_map_and_string_writer<F>(
     entries: &[(Vec<u8>, ObjectHandle)],
     indent: usize,
-    out: &mut Vec<u8>,
+    out: &mut OutputSink<'_>,
     map: &ObjectRefMap<'_>,
     removed_refs: &BTreeSet<ObjectRef>,
     write_string: &mut F,
 ) -> Result<()>
 where
-    F: FnMut(&mut Vec<u8>, &[u8]) -> Result<()>,
+    F: FnMut(&mut OutputSink<'_>, &[u8]) -> Result<()>,
 {
-    out.extend_from_slice(b"<<\n");
+    out.write_bytes(b"<<\n")?;
     for (key, value) in visible_dict_entries(entries)? {
         if is_removed_reference(value, removed_refs) {
             continue;
         }
-        push_spaces(out, indent + 2);
-        write_dictionary_key(out, key);
-        out.push(b' ');
+        push_spaces(out, indent + 2)?;
+        write_dictionary_key(out, key)?;
+        out.write_bytes(&[b' '])?;
         let force_hex_string =
             key.as_slice() == b"/Contents" && dict_is_sig_with_byte_range(entries)?;
         if try_write_sig_contents_hex_string(value, force_hex_string, out)? {
-            out.push(b'\n');
+            out.write_bytes(&[b'\n'])?;
             continue;
         }
         write_child_qdf_with_ref_map_and_string_writer(
@@ -3882,24 +4209,24 @@ where
             removed_refs,
             write_string,
         )?; // cov:ignore: LLVM maps the covered mapped dictionary child call continuation to this line
-        out.push(b'\n');
+        out.write_bytes(&[b'\n'])?;
     }
-    push_spaces(out, indent);
-    out.extend_from_slice(b">>");
+    push_spaces(out, indent)?;
+    out.write_bytes(b">>")?;
     Ok(())
 }
 
 #[cfg(test)]
 fn write_child_with_string_writer<F>(
     handle: &ObjectHandle,
-    out: &mut Vec<u8>,
+    out: &mut OutputSink<'_>,
     write_string: &mut F,
 ) -> Result<()>
 where
-    F: FnMut(&mut Vec<u8>, &[u8]) -> Result<()>,
+    F: FnMut(&mut OutputSink<'_>, &[u8]) -> Result<()>,
 {
     if let Some(object_ref) = handle.object_ref() {
-        out.extend_from_slice(object_ref.to_string().as_bytes());
+        out.write_bytes(object_ref.to_string().as_bytes())?;
         return Ok(());
     }
     unparse_object_walk_with_string_writer(handle, out, write_string)
@@ -3908,20 +4235,20 @@ where
 #[cfg(test)]
 fn unparse_container_with_string_writer<F>(
     container: UnparseContainer,
-    out: &mut Vec<u8>,
+    out: &mut OutputSink<'_>,
     write_string: &mut F,
 ) -> Result<()>
 where
-    F: FnMut(&mut Vec<u8>, &[u8]) -> Result<()>,
+    F: FnMut(&mut OutputSink<'_>, &[u8]) -> Result<()>,
 {
     match container {
         UnparseContainer::Array(children) => {
-            out.push(b'[');
+            out.write_bytes(&[b'['])?;
             for child in children {
-                out.push(b' ');
+                out.write_bytes(&[b' '])?;
                 write_child_with_string_writer(&child, out, write_string)?;
             }
-            out.extend_from_slice(b" ]");
+            out.write_bytes(b" ]")?;
         }
         UnparseContainer::Dictionary(entries) => {
             unparse_dict_entries_with_string_writer(&entries, out, write_string)?;
@@ -3936,11 +4263,11 @@ where
 #[cfg(test)]
 fn unparse_object_walk_with_string_writer<F>(
     handle: &ObjectHandle,
-    out: &mut Vec<u8>,
+    out: &mut OutputSink<'_>,
     write_string: &mut F,
 ) -> Result<()>
 where
-    F: FnMut(&mut Vec<u8>, &[u8]) -> Result<()>,
+    F: FnMut(&mut OutputSink<'_>, &[u8]) -> Result<()>,
 {
     stacker::maybe_grow(UNPARSE_STACK_RED_ZONE, UNPARSE_STACK_GROWTH_SIZE, || {
         if handle.is_reserved() {
@@ -3958,7 +4285,7 @@ where
             None => {
                 // cov:ignore-start: successful dereference exposes Null for
                 // the null fallback or errors while unresolved.
-                out.extend_from_slice(b"null");
+                out.write_bytes(b"null")?;
                 Ok(None)
                 // cov:ignore-end
             }
@@ -3973,11 +4300,11 @@ where
 #[cfg(test)]
 fn unparse_object_value_with_string_writer<F>(
     value: &ObjectValue,
-    out: &mut Vec<u8>,
+    out: &mut OutputSink<'_>,
     write_string: &mut F,
 ) -> Result<()>
 where
-    F: FnMut(&mut Vec<u8>, &[u8]) -> Result<()>,
+    F: FnMut(&mut OutputSink<'_>, &[u8]) -> Result<()>,
 {
     match value {
         ObjectValue::String(bytes) => write_string(out, bytes),
@@ -3989,7 +4316,7 @@ where
 fn try_write_sig_contents_with_string_writer(
     handle: &ObjectHandle,
     force_hex_string: bool,
-    out: &mut Vec<u8>,
+    out: &mut OutputSink<'_>,
 ) -> Result<bool> {
     if !force_hex_string || handle.object_ref().is_some() {
         return Ok(false);
@@ -4006,24 +4333,24 @@ fn try_write_sig_contents_with_string_writer(
     // signature contents. The ordinary string callback is therefore bypassed
     // here: qpdf keeps this value cleartext and only changes its spelling to
     // hexadecimal, even while the surrounding object is encrypted.
-    crate::pdf_syntax::write_hex_string(out, &bytes);
+    crate::pdf_syntax::write_hex_string_to_sink(out, &bytes)?;
     Ok(true)
 }
 
 #[cfg(test)]
 fn unparse_dict_entries_with_string_writer<F>(
     entries: &[(Vec<u8>, ObjectHandle)],
-    out: &mut Vec<u8>,
+    out: &mut OutputSink<'_>,
     write_string: &mut F,
 ) -> Result<()>
 where
-    F: FnMut(&mut Vec<u8>, &[u8]) -> Result<()>,
+    F: FnMut(&mut OutputSink<'_>, &[u8]) -> Result<()>,
 {
-    out.extend_from_slice(b"<<");
+    out.write_bytes(b"<<")?;
     for (key, value) in visible_dict_entries(entries)? {
-        out.push(b' ');
-        write_dictionary_key(out, key);
-        out.push(b' ');
+        out.write_bytes(&[b' '])?;
+        write_dictionary_key(out, key)?;
+        out.write_bytes(&[b' '])?;
         let force_hex_string =
             key.as_slice() == b"/Contents" && dict_is_sig_with_byte_range(entries)?;
         if try_write_sig_contents_with_string_writer(value, force_hex_string, out)? {
@@ -4031,7 +4358,7 @@ where
         }
         write_child_with_string_writer(value, out, write_string)?;
     }
-    out.extend_from_slice(b" >>");
+    out.write_bytes(b" >>")?;
     Ok(())
 }
 
@@ -4039,14 +4366,14 @@ where
 fn write_child_qdf_with_string_writer<F>(
     handle: &ObjectHandle,
     indent: usize,
-    out: &mut Vec<u8>,
+    out: &mut OutputSink<'_>,
     write_string: &mut F,
 ) -> Result<()>
 where
-    F: FnMut(&mut Vec<u8>, &[u8]) -> Result<()>,
+    F: FnMut(&mut OutputSink<'_>, &[u8]) -> Result<()>,
 {
     if let Some(object_ref) = handle.object_ref() {
-        out.extend_from_slice(object_ref.to_string().as_bytes());
+        out.write_bytes(object_ref.to_string().as_bytes())?;
         return Ok(());
     }
     unparse_object_walk_qdf_with_string_writer(handle, indent, out, write_string)
@@ -4056,23 +4383,23 @@ where
 fn unparse_container_qdf_with_string_writer<F>(
     container: UnparseContainer,
     indent: usize,
-    out: &mut Vec<u8>,
+    out: &mut OutputSink<'_>,
     write_string: &mut F,
 ) -> Result<()>
 where
-    F: FnMut(&mut Vec<u8>, &[u8]) -> Result<()>,
+    F: FnMut(&mut OutputSink<'_>, &[u8]) -> Result<()>,
 {
     match container {
         UnparseContainer::Array(children) => {
-            out.push(b'[');
-            out.push(b'\n');
+            out.write_bytes(&[b'['])?;
+            out.write_bytes(&[b'\n'])?;
             for child in children {
-                push_spaces(out, indent + 2);
+                push_spaces(out, indent + 2)?;
                 write_child_qdf_with_string_writer(&child, indent + 2, out, write_string)?;
-                out.push(b'\n');
+                out.write_bytes(&[b'\n'])?;
             }
-            push_spaces(out, indent);
-            out.push(b']');
+            push_spaces(out, indent)?;
+            out.write_bytes(&[b']'])?;
         }
         UnparseContainer::Dictionary(entries) => {
             unparse_dict_entries_qdf_with_string_writer(&entries, indent, out, write_string)?;
@@ -4088,11 +4415,11 @@ where
 fn unparse_object_walk_qdf_with_string_writer<F>(
     handle: &ObjectHandle,
     indent: usize,
-    out: &mut Vec<u8>,
+    out: &mut OutputSink<'_>,
     write_string: &mut F,
 ) -> Result<()>
 where
-    F: FnMut(&mut Vec<u8>, &[u8]) -> Result<()>,
+    F: FnMut(&mut OutputSink<'_>, &[u8]) -> Result<()>,
 {
     stacker::maybe_grow(UNPARSE_STACK_RED_ZONE, UNPARSE_STACK_GROWTH_SIZE, || {
         if handle.is_reserved() {
@@ -4111,7 +4438,7 @@ where
             None => {
                 // cov:ignore-start: successful dereference exposes Null for
                 // the null fallback or errors while unresolved.
-                out.extend_from_slice(b"null");
+                out.write_bytes(b"null")?;
                 Ok(None)
                 // cov:ignore-end
             }
@@ -4129,11 +4456,11 @@ where
 fn unparse_object_value_qdf_with_string_writer<F>(
     value: &ObjectValue,
     _indent: usize,
-    out: &mut Vec<u8>,
+    out: &mut OutputSink<'_>,
     write_string: &mut F,
 ) -> Result<()>
 where
-    F: FnMut(&mut Vec<u8>, &[u8]) -> Result<()>,
+    F: FnMut(&mut OutputSink<'_>, &[u8]) -> Result<()>,
 {
     match value {
         ObjectValue::String(bytes) => write_string(out, bytes),
@@ -4145,28 +4472,28 @@ where
 fn unparse_dict_entries_qdf_with_string_writer<F>(
     entries: &[(Vec<u8>, ObjectHandle)],
     indent: usize,
-    out: &mut Vec<u8>,
+    out: &mut OutputSink<'_>,
     write_string: &mut F,
 ) -> Result<()>
 where
-    F: FnMut(&mut Vec<u8>, &[u8]) -> Result<()>,
+    F: FnMut(&mut OutputSink<'_>, &[u8]) -> Result<()>,
 {
-    out.extend_from_slice(b"<<\n");
+    out.write_bytes(b"<<\n")?;
     for (key, value) in visible_dict_entries(entries)? {
-        push_spaces(out, indent + 2);
-        write_dictionary_key(out, key);
-        out.push(b' ');
+        push_spaces(out, indent + 2)?;
+        write_dictionary_key(out, key)?;
+        out.write_bytes(&[b' '])?;
         let force_hex_string =
             key.as_slice() == b"/Contents" && dict_is_sig_with_byte_range(entries)?;
         if try_write_sig_contents_with_string_writer(value, force_hex_string, out)? {
-            out.push(b'\n');
+            out.write_bytes(&[b'\n'])?;
             continue;
         }
         write_child_qdf_with_string_writer(value, indent + 2, out, write_string)?;
-        out.push(b'\n');
+        out.write_bytes(&[b'\n'])?;
     }
-    push_spaces(out, indent);
-    out.extend_from_slice(b">>");
+    push_spaces(out, indent)?;
+    out.write_bytes(b">>")?;
     Ok(())
 }
 
@@ -4188,10 +4515,10 @@ fn unparse_trailer_entries(
     entries: &[(Vec<u8>, ObjectHandle)],
     xref_stream: bool,
     mut id_writer: Option<crate::pdf_syntax::TrailerIdWriter>,
-    out: &mut Vec<u8>,
+    out: &mut OutputSink<'_>,
 ) -> Result<()> {
     if !xref_stream {
-        out.extend_from_slice(b"trailer <<");
+        out.write_bytes(b"trailer <<")?;
     }
     let mut id_value: Option<&ObjectHandle> = None;
     let mut encrypt_value: Option<&ObjectHandle> = None;
@@ -4207,23 +4534,23 @@ fn unparse_trailer_entries(
             }
             _ => {}
         }
-        out.push(b' ');
-        write_dictionary_key(out, key);
-        out.push(b' ');
+        out.write_bytes(&[b' '])?;
+        write_dictionary_key(out, key)?;
+        out.write_bytes(&[b' '])?;
         write_child(value, out)?;
     }
     if let Some(value) = id_value {
-        out.extend_from_slice(b" /ID ");
+        out.write_bytes(b" /ID ")?;
         match id_writer.as_mut() {
-            Some(write_id) => write_id(out),
+            Some(write_id) => write_id(out)?,
             None => write_id_style_value_handle(value, out)?,
         }
     }
     if let Some(value) = encrypt_value {
-        out.extend_from_slice(b" /Encrypt ");
+        out.write_bytes(b" /Encrypt ")?;
         write_child(value, out)?;
     }
-    out.extend_from_slice(b" >>");
+    out.write_bytes(b" >>")?;
     Ok(())
 }
 
@@ -4236,12 +4563,12 @@ fn unparse_trailer_entries_with_ref_map(
     map: &dyn Fn(ObjectRef) -> Result<ObjectRef>,
     removed_refs: &BTreeSet<ObjectRef>,
     suppress_null_values: bool,
-    out: &mut Vec<u8>,
+    out: &mut OutputSink<'_>,
 ) -> Result<()> {
     if qdf {
-        out.extend_from_slice(b"trailer <<\n");
+        out.write_bytes(b"trailer <<\n")?;
     } else if !xref_stream {
-        out.extend_from_slice(b"trailer <<");
+        out.write_bytes(b"trailer <<")?;
     }
 
     let mut id_value: Option<&ObjectHandle> = None;
@@ -4278,12 +4605,12 @@ fn unparse_trailer_entries_with_ref_map(
         }
 
         if qdf {
-            out.extend_from_slice(b"  ");
+            out.write_bytes(b"  ")?;
         } else {
-            out.push(b' ');
+            out.write_bytes(&[b' '])?;
         }
-        write_dictionary_key(out, key);
-        out.push(b' ');
+        write_dictionary_key(out, key)?;
+        out.write_bytes(&[b' '])?;
         if key.as_slice() == b"/Root" && value.object_ref().is_none() {
             // An inline Catalog is writer-owned, but its indirect descendants
             // remain in source space until this final child walk. qpdf's
@@ -4308,33 +4635,33 @@ fn unparse_trailer_entries_with_ref_map(
             write_child_with_ref_map(value, out, map, removed_refs)?;
         }
         if qdf {
-            out.push(b'\n');
+            out.write_bytes(&[b'\n'])?;
         }
     }
 
     if let Some(value) = id_value {
         if qdf {
-            out.extend_from_slice(b"  /ID ");
+            out.write_bytes(b"  /ID ")?;
         } else {
-            out.extend_from_slice(b" /ID ");
+            out.write_bytes(b" /ID ")?;
         }
         match id_writer.as_mut() {
-            Some(write_id) => write_id(out),
+            Some(write_id) => write_id(out)?,
             None => write_id_style_value_handle_with_ref_map(value, out, map, removed_refs)?,
         }
     }
     if let Some(value) = encrypt_value {
-        out.extend_from_slice(b" /Encrypt ");
+        out.write_bytes(b" /Encrypt ")?;
         write_child(value, out)?;
     }
 
     if qdf {
         if id_value.is_some() || encrypt_value.is_some() {
-            out.push(b'\n');
+            out.write_bytes(&[b'\n'])?;
         }
-        out.extend_from_slice(b">>\n");
+        out.write_bytes(b">>\n")?;
     } else {
-        out.extend_from_slice(b" >>");
+        out.write_bytes(b" >>")?;
     }
     Ok(())
 }
@@ -4349,8 +4676,7 @@ fn unparse_trailer_entries_with_ref_map_and_kind(
     map: &dyn Fn(ObjectRef) -> Result<ObjectRef>,
     removed_refs: &BTreeSet<ObjectRef>,
     suppress_null_values: bool,
-    direct_root: Option<&[u8]>,
-    out: &mut Vec<u8>,
+    out: &mut OutputSink<'_>,
 ) -> Result<()> {
     let (size, prev, second_half) = match kind {
         TrailerKind::Normal { size } => (size, None, false),
@@ -4358,9 +4684,9 @@ fn unparse_trailer_entries_with_ref_map_and_kind(
         TrailerKind::LinearizedSecond { size } => (size, None, true),
     };
     if qdf {
-        out.extend_from_slice(b"trailer <<\n");
+        out.write_bytes(b"trailer <<\n")?;
     } else if !xref_stream {
-        out.extend_from_slice(b"trailer <<");
+        out.write_bytes(b"trailer <<")?;
     }
 
     let mut id_value: Option<&ObjectHandle> = None;
@@ -4384,22 +4710,22 @@ fn unparse_trailer_entries_with_ref_map_and_kind(
 
         if key.as_slice() == b"/Size" {
             if qdf {
-                out.extend_from_slice(b"  ");
+                out.write_bytes(b"  ")?;
             } else {
-                out.push(b' ');
+                out.write_bytes(&[b' '])?;
             }
-            write_dictionary_key(out, key);
-            out.extend_from_slice(b" ");
-            out.extend_from_slice(size.to_string().as_bytes());
+            write_dictionary_key(out, key)?;
+            out.write_bytes(b" ")?;
+            out.write_bytes(size.to_string().as_bytes())?;
             if let Some(prev) = prev {
-                out.extend_from_slice(b" /Prev ");
+                out.write_bytes(b" /Prev ")?;
                 let prev_text = prev.to_string();
-                out.extend_from_slice(prev_text.as_bytes());
+                out.write_bytes(prev_text.as_bytes())?;
                 let padding = 21usize.saturating_sub(prev_text.len());
-                out.extend(std::iter::repeat_n(b' ', padding));
+                push_spaces(out, padding)?;
             }
             if qdf {
-                out.push(b'\n');
+                out.write_bytes(&[b'\n'])?;
             }
             continue;
         }
@@ -4418,12 +4744,12 @@ fn unparse_trailer_entries_with_ref_map_and_kind(
             continue;
         }
         if qdf {
-            out.extend_from_slice(b"  ");
+            out.write_bytes(b"  ")?;
         } else {
-            out.push(b' ');
+            out.write_bytes(&[b' '])?;
         }
-        write_dictionary_key(out, key);
-        out.push(b' ');
+        write_dictionary_key(out, key)?;
+        out.write_bytes(&[b' '])?;
         if key.as_slice() == b"/Root" && value.object_ref().is_none() {
             if let Some(direct_root) = direct_root {
                 out.extend_from_slice(direct_root);
@@ -4444,32 +4770,32 @@ fn unparse_trailer_entries_with_ref_map_and_kind(
             write_child_with_ref_map(value, out, map, removed_refs)?;
         }
         if qdf {
-            out.push(b'\n');
+            out.write_bytes(&[b'\n'])?;
         }
     }
 
     if let Some(value) = id_value {
         if qdf {
-            out.extend_from_slice(b"  /ID ");
+            out.write_bytes(b"  /ID ")?;
         } else {
-            out.extend_from_slice(b" /ID ");
+            out.write_bytes(b" /ID ")?;
         }
         match id_writer.as_mut() {
-            Some(write_id) => write_id(out),
+            Some(write_id) => write_id(out)?,
             None => write_id_style_value_handle_with_ref_map(value, out, map, removed_refs)?,
         }
     }
     if let Some(value) = encrypt_value {
-        out.extend_from_slice(b" /Encrypt ");
+        out.write_bytes(b" /Encrypt ")?;
         write_child(value, out)?;
     }
     if qdf {
         if id_value.is_some() || encrypt_value.is_some() {
-            out.push(b'\n');
+            out.write_bytes(&[b'\n'])?;
         }
-        out.extend_from_slice(b">>\n");
+        out.write_bytes(b">>\n")?;
     } else {
-        out.extend_from_slice(b" >>");
+        out.write_bytes(b" >>")?;
     }
     Ok(())
 }
@@ -4481,9 +4807,9 @@ fn unparse_dictionary_entries_with_ref_map_and_id_writer(
     map: &dyn Fn(ObjectRef) -> Result<ObjectRef>,
     removed_refs: &BTreeSet<ObjectRef>,
     suppress_null_values: bool,
-    out: &mut Vec<u8>,
+    out: &mut OutputSink<'_>,
 ) -> Result<()> {
-    out.extend_from_slice(b"<<");
+    out.write_bytes(b"<<")?;
     for (key, value) in entries {
         // qpdf's writeTrailer always emits the writer-owned /Root
         // (QPDFWriter.cc:1160-1236 applies no null/removed filtering). Its value
@@ -4498,12 +4824,12 @@ fn unparse_dictionary_entries_with_ref_map_and_id_writer(
         if !writer_owned_root && is_removed_reference(value, removed_refs) {
             continue;
         }
-        out.push(b' ');
-        write_dictionary_key(out, key);
-        out.push(b' ');
+        out.write_bytes(&[b' '])?;
+        write_dictionary_key(out, key)?;
+        out.write_bytes(&[b' '])?;
         if key.as_slice() == b"/ID" {
             match id_writer.as_mut() {
-                Some(write_id) => write_id(out),
+                Some(write_id) => write_id(out)?,
                 None => write_id_style_value_handle_with_ref_map(value, out, map, removed_refs)?,
             }
         } else if matches!(key.as_slice(), b"/Root" | b"/Encrypt") {
@@ -4512,7 +4838,7 @@ fn unparse_dictionary_entries_with_ref_map_and_id_writer(
             write_child_with_ref_map(value, out, map, removed_refs)?;
         }
     }
-    out.extend_from_slice(b" >>");
+    out.write_bytes(b" >>")?;
     Ok(())
 }
 
@@ -4531,7 +4857,7 @@ fn unparse_dictionary_entries_with_ref_map_and_id_writer(
 // `write_child`'s generic form rather than silently truncating -- the
 // same "fall back, don't truncate" choice `write_id_style_value` makes.
 #[cfg(test)]
-fn write_id_style_value_handle(value: &ObjectHandle, out: &mut Vec<u8>) -> Result<()> {
+fn write_id_style_value_handle(value: &ObjectHandle, out: &mut OutputSink<'_>) -> Result<()> {
     if value.object_ref().is_some() {
         return write_child(value, out);
     }
@@ -4552,10 +4878,10 @@ fn write_id_style_value_handle(value: &ObjectHandle, out: &mut Vec<u8>) -> Resul
     });
     match compact {
         Some((b0, b1)) => {
-            out.push(b'[');
-            crate::pdf_syntax::write_hex_string(out, &b0);
-            crate::pdf_syntax::write_hex_string(out, &b1);
-            out.push(b']');
+            out.write_bytes(&[b'['])?;
+            crate::pdf_syntax::write_hex_string_to_sink(out, &b0)?;
+            crate::pdf_syntax::write_hex_string_to_sink(out, &b1)?;
+            out.write_bytes(&[b']'])?;
             Ok(())
         }
         None => write_child(value, out),
@@ -4564,7 +4890,7 @@ fn write_id_style_value_handle(value: &ObjectHandle, out: &mut Vec<u8>) -> Resul
 
 fn write_id_style_value_handle_with_ref_map(
     value: &ObjectHandle,
-    out: &mut Vec<u8>,
+    out: &mut OutputSink<'_>,
     map: &dyn Fn(ObjectRef) -> Result<ObjectRef>,
     removed_refs: &BTreeSet<ObjectRef>,
 ) -> Result<()> {
@@ -4588,10 +4914,10 @@ fn write_id_style_value_handle_with_ref_map(
     });
     match compact {
         Some((b0, b1)) => {
-            out.push(b'[');
-            crate::pdf_syntax::write_hex_string(out, &b0);
-            crate::pdf_syntax::write_hex_string(out, &b1);
-            out.push(b']');
+            out.write_bytes(&[b'['])?;
+            crate::pdf_syntax::write_hex_string_to_sink(out, &b0)?;
+            crate::pdf_syntax::write_hex_string_to_sink(out, &b1)?;
+            out.write_bytes(&[b']'])?;
             Ok(())
         }
         None => unparse_object_walk_with_ref_map(value, out, map, removed_refs),
@@ -4607,9 +4933,12 @@ mod tests {
     #[test]
     fn dictionary_key_writer_preserves_qpdfs_first_byte() {
         let mut out = Vec::new();
-        write_dictionary_key(&mut out, b"/Canonical");
-        out.push(b' ');
-        write_dictionary_key(&mut out, b"Raw");
+        super::super::output::with_buffer_sink(&mut out, |out| {
+            write_dictionary_key(out, b"/Canonical")?;
+            out.write_bytes(b" ")?;
+            write_dictionary_key(out, b"Raw")
+        })
+        .unwrap();
         assert_eq!(out, b"/Canonical Raw");
     }
 
@@ -4636,15 +4965,17 @@ mod tests {
             (b"/Keep".to_vec(), ObjectHandle::integer(1)),
         ]);
         let mut output = Vec::new();
-        let mut write_id = |out: &mut Vec<u8>| out.extend_from_slice(b"[<01><02>]");
+        let mut write_id = |out: &mut OutputSink<'_>| out.write_bytes(b"[<01><02>]");
         let map = |object_ref: ObjectRef| Ok(object_ref);
-        dictionary.write_dictionary_with_ref_map_and_id_writer(
-            &mut output,
-            Some(&mut write_id),
-            &map,
-            &BTreeSet::new(),
-            false,
-        )?; // cov:ignore: LLVM maps this successful generic dictionary call continuation to test cleanup
+        super::super::output::with_buffer_sink(&mut output, |out| {
+            dictionary.write_dictionary_with_ref_map_and_id_writer(
+                out,
+                Some(&mut write_id),
+                &map,
+                &BTreeSet::new(),
+                false,
+            )
+        })?; // cov:ignore: LLVM maps this successful generic dictionary call continuation to test cleanup
         assert_eq!(output, b"<< /ID [<01><02>] /Keep 1 >>");
         Ok(())
     }
@@ -4663,62 +4994,51 @@ mod tests {
         let removed = BTreeSet::new();
         let map = |object_ref: ObjectRef| Ok(object_ref);
 
-        stream.write_stream_body_with_ref_map_and_removed_and_length(
-            &mut output,
-            false,
-            &map,
-            &removed,
-            3,
-        )?; // cov:ignore: LLVM attributes this successful stream-emission continuation to the test call cleanup.
+        super::super::output::with_buffer_sink(&mut output, |out| {
+            stream.write_stream_body_with_ref_map_and_removed_and_length(
+                out, false, &map, &removed, 3,
+            )
+        })?; // cov:ignore: LLVM attributes this successful stream-emission continuation to the test call cleanup.
 
         assert_eq!(output, b"<< /Keep 1 /Length 3 >>");
 
         let dictionary =
             ObjectHandle::dictionary(vec![(b"/Keep".to_vec(), ObjectHandle::integer(1))]);
         let mut dictionary_output = Vec::new();
-        dictionary.write_stream_body_with_ref_map_and_removed_and_length(
-            &mut dictionary_output,
-            false,
-            &map,
-            &removed,
-            2,
-        )?; // cov:ignore: LLVM attributes this successful dictionary-emission continuation to the test call cleanup.
+        super::super::output::with_buffer_sink(&mut dictionary_output, |out| {
+            dictionary.write_stream_body_with_ref_map_and_removed_and_length(
+                out, false, &map, &removed, 2,
+            )
+        })?; // cov:ignore: LLVM attributes this successful dictionary-emission continuation to the test call cleanup.
         assert_eq!(dictionary_output, b"<< /Keep 1 /Length 2 >>");
 
         let scalar = ObjectHandle::integer(1);
         let mut scalar_output = Vec::new();
-        scalar.write_stream_body_with_ref_map_and_removed_and_length(
-            &mut scalar_output,
-            false,
-            &map,
-            &removed,
-            1,
-        )?; // cov:ignore: LLVM attributes this successful scalar-emission continuation to the test call cleanup.
+        super::super::output::with_buffer_sink(&mut scalar_output, |out| {
+            scalar.write_stream_body_with_ref_map_and_removed_and_length(
+                out, false, &map, &removed, 1,
+            )
+        })?; // cov:ignore: LLVM attributes this successful scalar-emission continuation to the test call cleanup.
         assert_eq!(scalar_output, b"<< /Length 1 >>");
 
         let malformed_stream =
             ObjectHandle::stream(ObjectHandle::integer(1), Rc::new(b"x".to_vec()));
         let mut malformed_output = Vec::new();
-        malformed_stream.write_stream_body_with_ref_map_and_removed_and_length(
-            &mut malformed_output,
-            false,
-            &map,
-            &removed,
-            1,
-        )?; // cov:ignore: LLVM attributes this successful malformed-stream fallback continuation to test cleanup.
+        super::super::output::with_buffer_sink(&mut malformed_output, |out| {
+            malformed_stream.write_stream_body_with_ref_map_and_removed_and_length(
+                out, false, &map, &removed, 1,
+            )
+        })?; // cov:ignore: LLVM attributes this successful malformed-stream fallback continuation to test cleanup.
         assert_eq!(malformed_output, b"<< /Length 1 >>");
 
         let reserved = ObjectHandle::new_reserved_direct();
         // cov:ignore-start: reserved validation returns before invoking this callback.
-        let error = reserved
-            .write_stream_body_with_ref_map_and_removed_and_length(
-                &mut Vec::new(),
-                false,
-                &map,
-                &removed,
-                0,
+        let error = super::super::output::with_buffer_sink(&mut Vec::new(), |out| {
+            reserved.write_stream_body_with_ref_map_and_removed_and_length(
+                out, false, &map, &removed, 0,
             )
-            .expect_err("reserved stream emission must be rejected");
+        })
+        .expect_err("reserved stream emission must be rejected");
         assert!(error.to_string().contains("reserved object"));
         // cov:ignore-end
         Ok(())
@@ -4737,14 +5057,15 @@ mod tests {
             ]),
         )?; // cov:ignore: test setup mutation has no independent branch
         let map = |object_ref: ObjectRef| Ok(object_ref);
-        let missing_decode_error = stream
-            .write_stream_body_with_ref_map_and_removed_with_options(
-                &mut Vec::new(),
+        let missing_decode_error = super::super::output::with_buffer_sink(&mut Vec::new(), |out| {
+            stream.write_stream_body_with_ref_map_and_removed_with_options(
+                out,
                 StreamDictionaryOptions::preserve(),
                 &map,
                 &BTreeSet::new(),
             )
-            .expect_err("qpdf propagates a missing DecodeParms erase warning");
+        })
+        .expect_err("qpdf propagates a missing DecodeParms erase warning");
         assert_eq!(
             missing_decode_error.to_string(),
             " -> dictionary key /DecodeParms: operation for array attempted on object of type null: ignoring attempt to erase item"
@@ -4754,44 +5075,47 @@ mod tests {
             .unwrap()
             .replace_key(b"/DecodeParms", ObjectHandle::array(Vec::new()))?;
         let mut compact = Vec::new();
-        stream.write_stream_body_with_ref_map_and_removed_with_options(
-            &mut compact,
-            StreamDictionaryOptions::preserve(),
-            &map,
-            &BTreeSet::new(),
-        )?; // cov:ignore: qdf/compact policy owner call is covered by the surrounding assertions; llvm-cov attributes this terminator to the callback cleanup.
+        super::super::output::with_buffer_sink(&mut compact, |out| {
+            stream.write_stream_body_with_ref_map_and_removed_with_options(
+                out,
+                StreamDictionaryOptions::preserve(),
+                &map,
+                &BTreeSet::new(),
+            )
+        })?; // cov:ignore: qdf/compact policy owner call is covered by the surrounding assertions; llvm-cov attributes this terminator to the callback cleanup.
         assert!(String::from_utf8_lossy(&compact).contains("/Filter [ /ASCIIHexDecode ]"));
 
         let policy = StreamDictionaryOptions::new(true, true);
         let mut qdf = Vec::new();
-        stream.write_stream_body_qdf_with_ref_map_and_removed_and_length_with_options(
-            &mut qdf,
-            0,
-            &map,
-            &BTreeSet::new(),
-            None,
-            policy,
-        )?; // cov:ignore: qdf policy owner call is covered by the surrounding assertions; llvm-cov attributes this terminator to the callback cleanup.
+        super::super::output::with_buffer_sink(&mut qdf, |out| {
+            stream.write_stream_body_qdf_with_ref_map_and_removed_and_length_with_options(
+                out,
+                0,
+                &map,
+                &BTreeSet::new(),
+                None,
+                policy,
+            )
+        })?; // cov:ignore: qdf policy owner call is covered by the surrounding assertions; llvm-cov attributes this terminator to the callback cleanup.
         let qdf_text = String::from_utf8(qdf).unwrap();
         assert!(qdf_text.contains("/Filter /FlateDecode"));
         assert!(!qdf_text.contains("ASCIIHexDecode"));
 
         // cov:ignore-start: test-only callback body forwards strings without an independent branch
         let mut qdf_string = Vec::new();
-        let mut callback = |out: &mut Vec<u8>, value: &[u8]| {
-            out.extend_from_slice(value);
-            Ok(())
-        };
+        let mut callback = |out: &mut OutputSink<'_>, value: &[u8]| out.write_bytes(value);
         // cov:ignore-end
-        stream.write_stream_body_qdf_with_ref_map_and_removed_and_length_with_string_writer_with_options(
-            &mut qdf_string,
-            0,
-            &map,
-            &BTreeSet::new(),
-            None,
-            policy,
-            &mut callback,
-        )?; // cov:ignore: qdf string policy owner call is covered by the surrounding assertions; llvm-cov attributes this terminator to callback cleanup.
+        super::super::output::with_buffer_sink(&mut qdf_string, |out| {
+            stream.write_stream_body_qdf_with_ref_map_and_removed_and_length_with_string_writer_with_options(
+                out,
+                0,
+                &map,
+                &BTreeSet::new(),
+                None,
+                policy,
+                &mut callback,
+            )
+        })?; // cov:ignore: qdf string policy owner call is covered by the surrounding assertions; llvm-cov attributes this terminator to callback cleanup.
         assert!(String::from_utf8(qdf_string)
             .unwrap()
             .contains("/Filter /FlateDecode"));
@@ -4818,20 +5142,23 @@ mod tests {
         };
         let mut output = Vec::new();
         let removed = [removed_child.object_ref().unwrap()].into_iter().collect();
-        array.write_object_with_dynamic_ref_map(&mut output, &mut map, &removed)?;
+        super::super::output::with_buffer_sink(&mut output, |out| {
+            array.write_object_with_dynamic_ref_map(out, &mut map, &removed)
+        })?;
         assert_eq!(mapped, vec![child.object_ref().unwrap()]);
         assert!(String::from_utf8_lossy(&output).contains(&child.object_ref().unwrap().to_string()));
         assert!(String::from_utf8_lossy(&output).contains("null"));
 
         let reserved = ObjectHandle::new_reserved_direct();
         // cov:ignore-start: reserved validation returns before invoking this callback.
-        let error = reserved
-            .write_object_with_dynamic_ref_map(
-                &mut Vec::new(),
+        let error = super::super::output::with_buffer_sink(&mut Vec::new(), |out| {
+            reserved.write_object_with_dynamic_ref_map(
+                out,
                 &mut |_| Ok(ObjectRef::new(1, 0)),
                 &BTreeSet::new(),
             )
-            .expect_err("reserved dynamic object must be rejected");
+        })
+        .expect_err("reserved dynamic object must be rejected");
         // cov:ignore-end
         assert!(error.to_string().contains("reserved object"));
 
@@ -4842,11 +5169,9 @@ mod tests {
         let mut dictionary_output = Vec::new();
         let mut dictionary_map =
             |handle: &ObjectHandle| Ok(handle.object_ref().expect("dictionary child is indirect"));
-        dictionary.write_object_with_dynamic_ref_map(
-            &mut dictionary_output,
-            &mut dictionary_map,
-            &removed,
-        )?; // cov:ignore: LLVM attributes this dictionary-call terminator to callback cleanup.
+        super::super::output::with_buffer_sink(&mut dictionary_output, |out| {
+            dictionary.write_object_with_dynamic_ref_map(out, &mut dictionary_map, &removed)
+        })?; // cov:ignore: LLVM attributes this dictionary-call terminator to callback cleanup.
         let dictionary_text = String::from_utf8_lossy(&dictionary_output);
         assert!(dictionary_text.contains("/Mapped"));
         assert!(!dictionary_text.contains("/Removed"));
@@ -4888,11 +5213,9 @@ mod tests {
         let mut stream_object_output = Vec::new();
         let mut stream_object_map =
             |handle: &ObjectHandle| Ok(handle.object_ref().expect("stream child is indirect"));
-        stream.write_object_with_dynamic_ref_map(
-            &mut stream_object_output,
-            &mut stream_object_map,
-            &BTreeSet::new(),
-        )?; // cov:ignore: LLVM attributes this stream-call terminator to callback cleanup.
+        super::super::output::with_buffer_sink(&mut stream_object_output, |out| {
+            stream.write_object_with_dynamic_ref_map(out, &mut stream_object_map, &BTreeSet::new())
+        })?; // cov:ignore: LLVM attributes this stream-call terminator to callback cleanup.
         assert!(String::from_utf8_lossy(&stream_object_output).contains("/Child"));
 
         let stream = pdf.new_stream_with_data(Rc::new(b"body".to_vec()))?;
@@ -4912,15 +5235,17 @@ mod tests {
         let mut stream_output = Vec::new();
         let mut stream_map =
             |handle: &ObjectHandle| Ok(handle.object_ref().expect("dynamic child is indirect"));
-        stream
-            .as_stream_dict()
-            .unwrap()
-            .write_stream_body_with_dynamic_ref_map(
-                &mut stream_output,
-                StreamDictionaryOptions::new(false, true),
-                &mut stream_map,
-                &removed,
-            )?; // cov:ignore: LLVM attributes this stream-body call terminator to callback cleanup.
+        super::super::output::with_buffer_sink(&mut stream_output, |out| {
+            stream
+                .as_stream_dict()
+                .unwrap()
+                .write_stream_body_with_dynamic_ref_map(
+                    out,
+                    StreamDictionaryOptions::new(false, true),
+                    &mut stream_map,
+                    &removed,
+                )
+        })?; // cov:ignore: LLVM attributes this stream-body call terminator to callback cleanup.
         assert!(String::from_utf8_lossy(&stream_output).contains("/Length"));
         assert!(String::from_utf8_lossy(&stream_output).contains("/Filter /FlateDecode"));
         Ok(())

@@ -508,57 +508,28 @@ fn write_plain_live<R: Read + Seek, W: Write>(
     // direct Catalog has to be serialized here too or the output loses its
     // `/Root` entirely. The classic-table form gets it from the trailer handle
     // above, which is why this stayed `None` while the route was table-only.
-    let direct_root_bytes = if let Some(arbitrated) = direct_root_output.as_ref() {
-        let mut references = Vec::new();
-        crate::writer::rewrite_renumber::collect_canonical_enqueue_refs(
-            pdf,
-            arbitrated,
-            0,
-            true,
-            &mut references,
-        )?; // cov:ignore: direct-root reference collection success is covered by the late direct-root test
-        next_late_trailer_number = assign_late_references(
-            pdf,
-            &mut trailer_map,
-            references,
-            next_late_trailer_number,
-            options.qdf,
-        )?; // cov:ignore: direct-root late assignment success is covered by the QDF/normalize direct-root test
-        let map_ref = |object_ref: ObjectRef| {
-            trailer_map.get(&object_ref).copied().ok_or_else(|| {
-                // cov:ignore-start: every direct-root reference is collected before this static map is constructed
-                crate::Error::Unsupported(format!(
-                    "plain live writer: direct /Root reference {object_ref} has no output number"
-                ))
-                // cov:ignore-end
-            }) // cov:ignore: direct-root references were collected into trailer_map before serialization
-        };
-        let mut bytes = Vec::new();
-        if options.qdf {
-            arbitrated.write_object_qdf_with_ref_map_and_removed(
-                &mut bytes,
-                2,
-                &map_ref,
-                &removed_refs,
-            )?; // cov:ignore: QDF direct-root serialization success is covered by the direct-root live test
-        } else {
-            arbitrated.write_object_with_ref_map_and_removed(
-                &mut bytes,
-                &map_ref,
-                &removed_refs,
-            )?; // cov:ignore: compact direct-root serialization success is covered by the direct-root live test
-        }
-        Some(bytes)
-    } else {
-        None
-    };
-    extend_late_trailer_map(
-        pdf,
-        &mut trailer_map,
-        next_late_trailer_number,
-        false,
-        options.qdf,
-    )?; // cov:ignore: shared late-trailer success continuation is covered by the QDF/normalize live tests
+    let direct_root_bytes = direct_root_output
+        .as_ref()
+        .map(|arbitrated| {
+            let map_ref = |object_ref: ObjectRef| {
+                map.get(&object_ref).copied().ok_or_else(|| {
+                    // cov:ignore-start: the direct Catalog is collected by the
+                    // same walk that fills this map, so a live reference cannot
+                    // be absent at emission.
+                    crate::Error::Unsupported(format!(
+                        "plain live writer: direct /Root reference {} {} R absent from renumber map",
+                        object_ref.number, object_ref.generation
+                    ))
+                    // cov:ignore-end
+                }) // cov:ignore: the direct-root reference map is exercised; LLVM places the successful closure-exit counter on this continuation line.
+            };
+            let mut bytes = Vec::new();
+            crate::writer::output::with_buffer_sink(&mut bytes, |out| {
+                arbitrated.write_object_with_ref_map_and_removed(out, &map_ref, &removed_refs)
+            })
+            .map(|()| bytes)
+        })
+        .transpose()?;
     let trailer = TrailerPlan {
         form,
         canonical_entries: plan::canonical_trailer_entries(pdf, &trailer_map, &removed_refs)?,

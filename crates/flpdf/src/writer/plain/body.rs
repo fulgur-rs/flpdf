@@ -6,6 +6,7 @@ use std::rc::Rc;
 
 use crate::qpdf_obj_gen::QpdfObjGen;
 use crate::writer::object_streams;
+use crate::writer::output::OutputSink;
 use crate::writer::plain::plan::{
     stream_cache_fingerprint, PlainWritePlan, PlannedIndirectObject, PlannedMember,
     PlannedObjectStreamOrigin,
@@ -1036,185 +1037,32 @@ impl<'a, R: Read + Seek + 'static> crate::writer::write_object::WriteObject
                 })
             // cov:ignore-end
         };
-        let output = if let Some(source) = object.object_ref() {
-            self.queue
-                .borrow()
-                .old_to_new
-                .get(&source)
-                .copied()
-                // cov:ignore-start: every queued indirect object is numbered before writeObject invokes its unparser.
-                .ok_or_else(|| {
-                    crate::Error::Unsupported(format!(
-                        "plain live writer: reference {} {} R absent from queue",
-                        source.number, source.generation
-                    ))
-                })? // cov:ignore: the live queue assigns every QDF object before unparse; the error arm is a defensive invariant
-                    // cov:ignore-end
-        } else if let Some(raw) = object.qpdf_obj_gen() {
-            self.queue
-                .borrow()
-                .raw_old_to_new
-                .get(&raw)
-                .copied()
-                .or(self.current_raw_output)
-                // cov:ignore-start: a raw indirect handle is recorded by enqueue_handle before it reaches the unparser.
-                .ok_or_else(|| {
-                    crate::Error::Unsupported(
-                        "plain live writer: raw reference absent from queue".to_string(),
-                    )
-                })?
-            // cov:ignore-end
-        } else {
-            self.current_raw_output.unwrap_or(ObjectRef::new(0, 0)) // cov:ignore: WriteObject invokes this unparser only for queued indirect or raw-indirect handles; direct values recurse inside the object serializer.
-        };
-        if self.pclm && object.as_stream_dict().is_some() {
-            let (dict, data) = pclm_stream_parts(object)?;
-            dict.write_stream_body_with_dynamic_ref_map(
-                self.bytes,
-                StreamDictionaryOptions::preserve(),
-                &mut map,
-                &self.removed_refs,
-            )?; // cov:ignore: the validated PCLm stream dictionary has no reachable serialization error.
-            serialize::write_stream_payload(
-                self.bytes,
-                &data,
-                self.options.newline_before_endstream,
-            );
-            return Ok(());
-        }
         if self.root_source == object.object_ref() {
-            let mut direct_stream_writer = LiveDirectStreamWriter {
-                options: self.options,
-                output,
-                encryption_context: self.encryption_context,
-            };
-            if let Some(emitter) = self.encrypted_strings.as_mut() {
-                let root = object.output_root_copy_with_adbe(
-                    self.version,
-                    self.final_extension_level,
-                    true,
-                )?; // cov:ignore: LLVM attributes the covered encrypted root-copy call terminator to callback cleanup.
-                emitter.write_handle_object_with_dynamic_ref_map_and_direct_stream_writer(
-                    self.bytes,
-                    output,
-                    None,
-                    &root,
-                    &mut map,
-                    &self.removed_refs,
-                    &mut direct_stream_writer,
-                )?; // cov:ignore: LLVM attributes the covered encrypted dynamic-object call terminator to callback cleanup.
-            } else {
-                let mut write_string = |out: &mut Vec<u8>, value: &[u8]| {
-                    crate::pdf_syntax::write_string_value(out, value);
-                    Ok(())
-                };
-                crate::writer::object::write_root_object_with_dynamic_ref_map_and_string_writer_and_direct_stream_writer(
-                    object,
-                    self.bytes,
+            crate::writer::output::with_buffer_sink(self.bytes, |out| {
+                object.write_root_object_with_dynamic_ref_map(
+                    out,
                     &mut map,
                     &self.removed_refs,
                     self.version,
                     self.final_extension_level,
                     true,
-                    &mut write_string,
-                    &mut direct_stream_writer,
-                )?; // cov:ignore: LLVM attributes root emission's call terminator to callback cleanup.
-            }
+                )
+            })?; // cov:ignore: LLVM attributes root emission's call terminator to callback cleanup.
         } else if object.as_stream_dict().is_some() {
-            let source = object.object_ref();
-            let normalize_content = self.options.content_normalization
-                && source.is_some_and(|source| self.contents_sequences.contains_key(&source));
-            let (dict, data, dictionary_options) = canonical_stream_output_for_rewrite_with_status(
-                object,
-                self.options,
-                normalize_content,
-            )?;
-            let stream_encryption = self.encryption_context;
-            let encrypt_stream = stream_encryption
-                .is_some_and(|ctx| ctx.encrypt_metadata || ctx.metadata_ref != source);
-            let mut stream_length = data.len();
-            if let Some(ctx) = stream_encryption {
-                crate::writer::adjust_aes_stream_length(&mut stream_length, ctx, encrypt_stream)?;
-            }
-            dict.replace_key(
-                b"/Length",
-                ObjectHandle::integer(i64::try_from(stream_length).map_err(|_| {
-                    // cov:ignore-start: an allocatable stream payload fits in i64
-                    crate::Error::Unsupported("stream /Length does not fit in i64".to_string())
-                    // cov:ignore-end
-                })?), // cov:ignore: the allocated stream length fits in i64 on supported targets; this overflow arm is defensive.
-            )?; // cov:ignore: validated stream /Length replacement
-            if let Some(emitter) = self.encrypted_strings.as_mut() {
-                emitter.write_handle_stream_dict_with_dynamic_ref_map(
-                    self.bytes,
-                    output,
-                    None,
-                    &dict,
-                    dictionary_options,
-                    encrypt_stream,
-                    &mut map,
-                    &self.removed_refs,
-                )?; // cov:ignore: LLVM attributes the covered encrypted dynamic stream-dictionary call terminator to callback cleanup.
-            } else {
+            let (dict, data, dictionary_options) = canonical_stream_output(object, self.options)?;
+            crate::writer::output::with_buffer_sink(self.bytes, |out| {
                 dict.write_stream_body_with_dynamic_ref_map(
-                    self.bytes,
+                    out,
                     dictionary_options,
                     &mut map,
                     &self.removed_refs,
-                )?; // cov:ignore: LLVM attributes stream dictionary emission's call terminator to callback cleanup.
-            }
-            if let Some(ctx) = stream_encryption {
-                crate::writer::write_stream_payload_with_pipeline(
-                    self.bytes,
-                    &data,
-                    self.options.newline_before_endstream,
-                    output,
-                    ctx,
-                    encrypt_stream,
-                    None,
-                )?; // cov:ignore: LLVM attributes the covered encrypted stream-pipeline call terminator to callback cleanup.
-            } else {
-                serialize::write_stream_payload(
-                    self.bytes,
-                    &data,
-                    self.options.newline_before_endstream,
-                );
-            }
+                )?;
+                serialize::write_stream_payload(out, &data, self.options.newline_before_endstream)
+            })?; // cov:ignore: LLVM attributes stream dictionary emission's call terminator to callback cleanup.
         } else {
-            if let Some(emitter) = self.encrypted_strings.as_mut() {
-                let mut direct_stream_writer = LiveDirectStreamWriter {
-                    options: self.options,
-                    output,
-                    encryption_context: self.encryption_context,
-                };
-                emitter.write_handle_object_with_dynamic_ref_map_and_direct_stream_writer(
-                    self.bytes,
-                    output,
-                    None,
-                    object,
-                    &mut map,
-                    &self.removed_refs,
-                    &mut direct_stream_writer,
-                )?; // cov:ignore: LLVM attributes the covered encrypted dynamic-object call terminator to callback cleanup.
-            } else {
-                let mut write_string = |out: &mut Vec<u8>, value: &[u8]| {
-                    crate::pdf_syntax::write_string_value(out, value);
-                    Ok(())
-                };
-                let mut direct_stream_writer = LiveDirectStreamWriter {
-                    options: self.options,
-                    output,
-                    encryption_context: None,
-                };
-                crate::writer::object::write_object_with_dynamic_ref_map_and_string_writer_and_direct_stream_writer(
-                    object,
-                    self.bytes,
-                    &mut map,
-                    &self.removed_refs,
-                    &mut write_string,
-                    &mut direct_stream_writer,
-                )?; // cov:ignore: LLVM attributes the covered dynamic-object call terminator to callback cleanup.
-            }
+            crate::writer::output::with_buffer_sink(self.bytes, |out| {
+                object.write_object_with_dynamic_ref_map(out, &mut map, &self.removed_refs)
+            })?;
         }
         Ok(())
     }
@@ -1660,51 +1508,50 @@ impl<'a, R: Read + Seek + 'static> LiveObjectEmitter<'a, R> {
         let qdf = self.qdf;
         let mut qdf_first_pass_offsets = Vec::new();
         let mut qdf_first_pass_marker_length = None;
-        if self.two_pass_object_streams {
-            // qpdf's first pass decrements the anticipated count and then
-            // writeObject increments it again before the member unparse. The
-            // same indicateProgress(false, false) boundary is used by the
-            // final pass (`QPDFWriter.cc:1639-1707,1771-1796`).
-            let mut first_pass = |out: &mut Vec<u8>,
-                                  member_index: u32,
-                                  member_ref: ObjectRef,
-                                  handle: &ObjectHandle| {
-                let marker = self.emit_live_object_stream_member(
-                    out,
-                    member_index,
-                    member_ref,
-                    handle,
-                    true,
-                    false,
-                    true,
-                )?; // cov:ignore: LLVM attributes the covered first-pass member callback terminator separately
-                if let Some((marker_start, marker_length)) = marker {
-                    let marker_end = marker_start.checked_add(marker_length).ok_or_else(|| {
-                        // cov:ignore-start: marker positions are bounded by one in-memory Vec.
-                        crate::Error::Unsupported(
-                            "plain live writer QDF marker offset overflows usize".into(),
-                        )
-                        // cov:ignore-end
-                    })?; // cov:ignore: marker arithmetic is bounded by one in-memory Vec
-                    qdf_first_pass_marker_length.get_or_insert(marker_length);
-                    qdf_first_pass_offsets.push(marker_end);
-                }
-                Ok(())
-            };
-            if qdf {
+        let body;
+        let qdf_first_offset;
+        if qdf {
+            if self.two_pass_object_streams {
+                // qpdf's first pass decrements the anticipated count and then
+                // writeObject increments it again before the member unparse. The
+                // same indicateProgress(false, false) boundary is used by the
+                // final pass (`QPDFWriter.cc:1639-1707,1771-1796`).
+                let mut first_pass = |out: &mut Vec<u8>,
+                                      member_index: u32,
+                                      member_ref: ObjectRef,
+                                      handle: &ObjectHandle| {
+                    let marker = self.emit_live_object_stream_member(
+                        out,
+                        member_index,
+                        member_ref,
+                        handle,
+                        true,
+                        false,
+                        true,
+                    )?; // cov:ignore: LLVM attributes the covered first-pass member callback terminator separately
+                    if let Some((marker_start, marker_length)) = marker {
+                        let marker_end =
+                            marker_start.checked_add(marker_length).ok_or_else(|| {
+                                // cov:ignore-start: marker positions are bounded by one in-memory Vec.
+                                crate::Error::Unsupported(
+                                    "plain live writer QDF marker offset overflows usize".into(),
+                                )
+                                // cov:ignore-end
+                            })?; // cov:ignore: marker arithmetic is bounded by one in-memory Vec
+                        qdf_first_pass_marker_length.get_or_insert(marker_length);
+                        qdf_first_pass_offsets.push(marker_end);
+                    }
+                    Ok(())
+                };
                 let _ = object_streams::emit_objstm_body_from_handles_with_writer_qdf(
                     &handles,
                     &mut first_pass,
                 )?; // cov:ignore: the QDF first-pass helper is covered by the live QDF ObjStm tests
-            } else {
-                let _ = object_streams::emit_objstm_body_from_handles_with_writer(
-                    &handles,
-                    &mut first_pass,
-                )?; // cov:ignore: the first-pass writer is exercised by the malformed-member test; LLVM attributes this multiline continuation here.
             }
-        }
-        let mut final_pass =
-            |out: &mut Vec<u8>, member_index: u32, member_ref: ObjectRef, handle: &ObjectHandle| {
+            let mut final_pass = |out: &mut Vec<u8>,
+                                  member_index: u32,
+                                  member_ref: ObjectRef,
+                                  handle: &ObjectHandle| {
                 self.emit_live_object_stream_member(
                     out,
                     member_index,
@@ -1716,58 +1563,54 @@ impl<'a, R: Read + Seek + 'static> LiveObjectEmitter<'a, R> {
                 )?; // cov:ignore: LLVM attributes the covered final-pass member callback terminator separately
                 Ok(())
             };
-        let mut body = if qdf {
-            object_streams::emit_objstm_body_from_handles_with_writer_qdf(
+            let mut qdf_body = object_streams::emit_objstm_body_from_handles_with_writer_qdf(
                 &handles,
                 &mut final_pass,
-            )? // cov:ignore: the QDF final-pass helper is covered by the live QDF ObjStm tests
-        } else {
-            object_streams::emit_objstm_body_from_handles_with_writer(&handles, &mut final_pass)?
-        };
-        let qdf_first_offset = if qdf {
-            let first_pass_first_offset =
-                qdf_first_pass_offsets.first().copied().ok_or_else(|| {
-                    // cov:ignore-start: a valid ObjStm group has at least one member.
-                    crate::Error::Internal(
-                        "plain live writer QDF first-pass offsets are empty".into(),
-                    )
-                    // cov:ignore-end
-                })?; // cov:ignore: every valid QDF ObjStm group records a first-pass offset
-            let first_marker_len = qdf_first_pass_marker_length.ok_or_else(|| {
-                // cov:ignore-start: a valid ObjStm group records the first marker together with its offset.
-                crate::Error::Internal(
-                    "plain live writer QDF first marker length is missing".into(),
-                )
-                // cov:ignore-end
-            })?; // cov:ignore: every valid QDF ObjStm group records the first marker length
-            let objects_section = body.bytes.split_off(body.first_offset);
-            let mut pair_table = Vec::new();
-            for (index, ((member, _), &member_offset)) in handles
-                .iter()
-                .zip(qdf_first_pass_offsets.iter())
-                .enumerate()
-            {
-                if index != 0 {
-                    pair_table.push(b'\n');
-                }
-                let offset = member_offset
-                    .checked_sub(first_pass_first_offset)
-                    .ok_or_else(|| {
-                        // cov:ignore-start: first-pass offsets are recorded in monotonic pipeline order.
-                        crate::Error::Unsupported(
-                            "plain live writer QDF ObjStm member offset overflows usize".into(),
+            )?; // cov:ignore: the QDF final-pass helper is covered by the live QDF ObjStm tests
+            qdf_first_offset = {
+                let first_pass_first_offset =
+                    qdf_first_pass_offsets.first().copied().ok_or_else(|| {
+                        // cov:ignore-start: a valid ObjStm group has at least one member.
+                        crate::Error::Internal(
+                            "plain live writer QDF first-pass offsets are empty".into(),
                         )
                         // cov:ignore-end
-                    })?; // cov:ignore: marker arithmetic is bounded by one in-memory Vec
-                use std::io::Write as _;
-                let _ = write!(pair_table, "{} {}", member.number, offset);
-            }
-            pair_table.push(b'\n');
-            body.first_offset = pair_table.len();
-            pair_table.extend_from_slice(&objects_section);
-            body.bytes = pair_table;
-            Some(
-                body.first_offset
+                    })?; // cov:ignore: every valid QDF ObjStm group records a first-pass offset
+                let first_marker_len = qdf_first_pass_marker_length.ok_or_else(|| {
+                    // cov:ignore-start: a valid ObjStm group records the first marker together with its offset.
+                    crate::Error::Internal(
+                        "plain live writer QDF first marker length is missing".into(),
+                    )
+                    // cov:ignore-end
+                })?; // cov:ignore: every valid QDF ObjStm group records the first marker length
+                let objects_section = qdf_body.bytes.split_off(qdf_body.first_offset);
+                let mut pair_table = Vec::new();
+                for (index, ((member, _), &member_offset)) in handles
+                    .iter()
+                    .zip(qdf_first_pass_offsets.iter())
+                    .enumerate()
+                {
+                    if index != 0 {
+                        pair_table.push(b'\n');
+                    }
+                    let offset = member_offset
+                        .checked_sub(first_pass_first_offset)
+                        .ok_or_else(|| {
+                            // cov:ignore-start: first-pass offsets are recorded in monotonic pipeline order.
+                            crate::Error::Unsupported(
+                                "plain live writer QDF ObjStm member offset overflows usize".into(),
+                            )
+                            // cov:ignore-end
+                        })?; // cov:ignore: marker arithmetic is bounded by one in-memory Vec
+                    use std::io::Write as _;
+                    let _ = write!(pair_table, "{} {}", member.number, offset);
+                }
+                pair_table.push(b'\n');
+                qdf_body.first_offset = pair_table.len();
+                pair_table.extend_from_slice(&objects_section);
+                qdf_body.bytes = pair_table;
+                qdf_body
+                    .first_offset
                     .checked_add(first_marker_len)
                     .ok_or_else(|| {
                         // cov:ignore-start: both operands are lengths of one in-memory Vec.
@@ -1775,11 +1618,79 @@ impl<'a, R: Read + Seek + 'static> LiveObjectEmitter<'a, R> {
                             "plain live writer QDF /First overflows usize".into(),
                         )
                         // cov:ignore-end
-                    })?, // cov:ignore: QDF /First arithmetic is bounded by one in-memory ObjStm body
-            )
+                    })? // cov:ignore: QDF /First arithmetic is bounded by one in-memory ObjStm body
+            };
+            body = qdf_body;
         } else {
-            None
-        };
+            let root_source = self.root_source;
+            let removed_refs = &self.removed_refs;
+            let body_writer = &mut |out: &mut Vec<u8>,
+                                    _member_index: u32,
+                                    _member_ref: ObjectRef,
+                                    handle: &ObjectHandle|
+             -> crate::Result<()> {
+                let mut map = |child: &ObjectHandle| {
+                    self.queue
+                        .borrow_mut()
+                        .enqueue_handle(self.pdf, child.clone())?
+                        // cov:ignore-start: dynamic child callbacks run only after the removed/direct filters.
+                        .ok_or_else(|| {
+                            crate::Error::Unsupported(
+                                "plain live writer: child is direct or removed".to_string(),
+                            )
+                        })
+                    // cov:ignore-end
+                };
+                handle.try_dereference()?;
+                let handle = if handle.as_stream_dict().is_some() {
+                    // qpdf's `writeObjectStream` warns through the member handle
+                    // and substitutes an indirect null before serialization
+                    // (`QPDFWriter.cc:1690-1705`). Preserve that writer-owned
+                    // damage policy instead of letting a stream payload enter an
+                    // ObjStm member body.
+                    // qpdf builds an ObjStm body twice (offset pass and write
+                    // pass), and this warning is inside that two-pass loop
+                    // (`QPDFWriter.cc:1621-1705`), so the same damaged member
+                    // warning is intentionally delivered twice.
+                    // cov:ignore-start: qtest fuzz-16214 is the corpus-level stream-in-ObjStm warning oracle
+                    for _ in 0..2 {
+                        handle.warn_if_possible(
+                            "stream found inside object stream; treating as null",
+                        )?;
+                    }
+                    ObjectHandle::null()
+                    // cov:ignore-end
+                } else {
+                    handle.clone()
+                };
+                let result = crate::writer::output::with_buffer_sink(out, |out| {
+                    if handle.object_ref() == root_source {
+                        handle.write_root_object_with_dynamic_ref_map(
+                            out,
+                            &mut map,
+                            removed_refs,
+                            self.version,
+                            self.final_extension_level,
+                            true,
+                        )
+                    } else {
+                        handle.write_object_with_dynamic_ref_map(out, &mut map, removed_refs)
+                    }
+                });
+                // cov:ignore-start: llvm-cov attributes the uncovered region to
+                // this block's closing brace, the merge point for an exercised
+                // member write failing (the sibling planned-writer copy of this
+                // pattern, `emit_planned_object_stream`, has the same artifact).
+                if result.is_ok() {
+                    crate::writer::report_progress_event(self.options)?;
+                }
+                // cov:ignore-end
+                result
+            };
+            body =
+                object_streams::emit_objstm_body_from_handles_with_writer(&handles, body_writer)?;
+            qdf_first_offset = None;
+        }
         let extends = {
             let source_handle = self.pdf.get_object_handle(container_source);
             source_handle.try_dereference()?;
@@ -1879,13 +1790,15 @@ impl<'a, R: Read + Seek + 'static> LiveObjectEmitter<'a, R> {
                 None,
             )?; // cov:ignore: LLVM attributes the covered encrypted ObjStm pipeline call terminator to callback cleanup.
         } else {
-            serialize::write_objstm_stream_with_extends(
-                self.bytes,
-                &body,
-                self.options.compress_streams,
-                self.options.newline_before_endstream,
-                extends,
-            )?; // cov:ignore: error arm requires an in-memory zlib encoder failure
+            crate::writer::output::with_buffer_sink(self.bytes, |out| {
+                serialize::write_objstm_stream_with_extends(
+                    out,
+                    &body,
+                    self.options.compress_streams,
+                    self.options.newline_before_endstream,
+                    extends,
+                )
+            })?; // cov:ignore: error arm requires an in-memory zlib encoder failure
         }
         self.bytes.extend_from_slice(b"\nendobj\n");
         if qdf {
@@ -2021,21 +1934,25 @@ impl<R: Read + Seek + 'static> PlainObjectEmitter<'_, R> {
                     self.plan.final_extension_level,
                     true,
                 )?; // cov:ignore: LLVM attributes this covered multiline call terminator to the call setup
-                return arbitrated.write_object_qdf_with_ref_map_and_removed(
-                    self.bytes,
-                    0,
+                return crate::writer::output::with_buffer_sink(self.bytes, |out| {
+                    arbitrated.write_object_qdf_with_ref_map_and_removed(
+                        out,
+                        0,
+                        &map,
+                        &self.plan.removed_refs,
+                    )
+                });
+            }
+            return crate::writer::output::with_buffer_sink(self.bytes, |out| {
+                handle.write_root_object_with_ref_map_and_removed(
+                    out,
                     &map,
                     &self.plan.removed_refs,
-                );
-            }
-            return handle.write_root_object_with_ref_map_and_removed(
-                self.bytes,
-                &map,
-                &self.plan.removed_refs,
-                &self.plan.version,
-                self.plan.final_extension_level,
-                true,
-            );
+                    &self.plan.version,
+                    self.plan.final_extension_level,
+                    true,
+                )
+            });
         }
 
         if handle.as_stream_dict().is_some() {
@@ -2088,55 +2005,61 @@ impl<R: Read + Seek + 'static> PlainObjectEmitter<'_, R> {
                         ))
                         // cov:ignore-end
                     })?; // cov:ignore: qdf_holder_map is populated for every valid planned stream
-                dict.write_stream_body_qdf_with_ref_map_and_removed_and_length_with_options(
-                    self.bytes,
-                    0,
-                    &map,
-                    &self.plan.removed_refs,
-                    Some(holder),
-                    dictionary_options,
-                )?; // cov:ignore: LLVM maps this validated QDF dictionary continuation to the call setup.
+                crate::writer::output::with_buffer_sink(self.bytes, |out| {
+                    dict.write_stream_body_qdf_with_ref_map_and_removed_and_length_with_options(
+                        out,
+                        0,
+                        &map,
+                        &self.plan.removed_refs,
+                        Some(holder),
+                        dictionary_options,
+                    )
+                })?; // cov:ignore: LLVM maps this validated QDF dictionary continuation to the call setup.
                 let added_newline = serialize::framing_adds_newline_with_qdf(
                     &data,
                     self.options.newline_before_endstream,
                     true,
                 );
-                serialize::write_stream_payload_with_qdf(
-                    self.bytes,
-                    &data,
-                    self.options.newline_before_endstream,
-                    true,
-                );
+                crate::writer::output::with_buffer_sink(self.bytes, |out| {
+                    serialize::write_stream_payload_with_qdf(
+                        out,
+                        &data,
+                        self.options.newline_before_endstream,
+                        true,
+                    )
+                })?;
                 self.current_stream_length = Some(IndirectStreamLength {
                     cur_stream_length: data.len(),
                     added_newline,
                 });
             } else {
-                dict.write_stream_body_with_ref_map_and_removed_with_options(
-                    self.bytes,
-                    dictionary_options,
-                    &map,
-                    &self.plan.removed_refs,
-                )?;
-                serialize::write_stream_payload(
-                    self.bytes,
-                    &data,
-                    self.options.newline_before_endstream,
-                );
+                crate::writer::output::with_buffer_sink(self.bytes, |out| {
+                    dict.write_stream_body_with_ref_map_and_removed_with_options(
+                        out,
+                        dictionary_options,
+                        &map,
+                        &self.plan.removed_refs,
+                    )?;
+                    serialize::write_stream_payload(
+                        out,
+                        &data,
+                        self.options.newline_before_endstream,
+                    )
+                })?;
             }
         } else if self.options.qdf {
-            handle.write_object_qdf_with_ref_map_and_removed(
-                self.bytes,
-                0,
-                &map,
-                &self.plan.removed_refs,
-            )?; // cov:ignore: the shared QDF handle serializer is covered by its own contract tests.
+            crate::writer::output::with_buffer_sink(self.bytes, |out| {
+                handle.write_object_qdf_with_ref_map_and_removed(
+                    out,
+                    0,
+                    &map,
+                    &self.plan.removed_refs,
+                )
+            })?; // cov:ignore: the shared QDF handle serializer is covered by its own contract tests.
         } else {
-            handle.write_object_with_ref_map_and_removed(
-                self.bytes,
-                &map,
-                &self.plan.removed_refs,
-            )?; // cov:ignore: the shared compact handle serializer is covered by its own contract tests.
+            crate::writer::output::with_buffer_sink(self.bytes, |out| {
+                handle.write_object_with_ref_map_and_removed(out, &map, &self.plan.removed_refs)
+            })?; // cov:ignore: the shared compact handle serializer is covered by its own contract tests.
         }
         Ok(())
     }
@@ -2283,43 +2206,49 @@ impl<R: Read + Seek + 'static> PlainObjectEmitter<'_, R> {
             } else {
                 handle.clone()
             };
-            let result = if options.qdf {
-                // A Catalog compressed into an ObjStm is still the root, and
-                // qpdf's ADBE arbitration keys on `is_root` rather than on the
-                // output mode (`QPDFWriter.cc:1396-1436`), so it applies here
-                // exactly as it does to an uncompressed root.
-                if is_root {
-                    let arbitrated = handle_to_write.output_root_copy_with_adbe(
+            let result = crate::writer::output::with_buffer_sink(out, |out| {
+                if options.qdf {
+                    // A Catalog compressed into an ObjStm is still the root, and
+                    // qpdf's ADBE arbitration keys on `is_root` rather than on the
+                    // output mode (`QPDFWriter.cc:1396-1436`), so it applies here
+                    // exactly as it does to an uncompressed root.
+                    if is_root {
+                        let arbitrated = handle_to_write.output_root_copy_with_adbe(
+                            &plan.version,
+                            plan.final_extension_level,
+                            true,
+                        )?; // cov:ignore: LLVM attributes this covered multiline call terminator to the call setup
+                        arbitrated.write_object_qdf_with_ref_map_and_removed(
+                            out,
+                            0,
+                            &map,
+                            &plan.removed_refs,
+                        )
+                    } else {
+                        handle_to_write.write_object_qdf_with_ref_map_and_removed(
+                            out,
+                            0,
+                            &map,
+                            &plan.removed_refs,
+                        )
+                    }
+                } else if is_root {
+                    handle_to_write.write_root_object_with_ref_map_and_removed(
+                        out,
+                        &map,
+                        &plan.removed_refs,
                         &plan.version,
                         plan.final_extension_level,
                         true,
-                    )?; // cov:ignore: LLVM attributes this covered multiline call terminator to the call setup
-                    arbitrated.write_object_qdf_with_ref_map_and_removed(
-                        out,
-                        0,
-                        &map,
-                        &plan.removed_refs,
                     )
                 } else {
-                    handle_to_write.write_object_qdf_with_ref_map_and_removed(
+                    handle_to_write.write_object_with_ref_map_and_removed(
                         out,
-                        0,
                         &map,
                         &plan.removed_refs,
                     )
                 }
-            } else if is_root {
-                handle_to_write.write_root_object_with_ref_map_and_removed(
-                    out,
-                    &map,
-                    &plan.removed_refs,
-                    &plan.version,
-                    plan.final_extension_level,
-                    true,
-                )
-            } else {
-                handle_to_write.write_object_with_ref_map_and_removed(out, &map, &plan.removed_refs)
-            };
+            });
             if result.is_ok() {
                 crate::writer::report_progress_event(options)?;
             }
@@ -2413,21 +2342,25 @@ impl<R: Read + Seek + 'static> PlainObjectEmitter<'_, R> {
             crate::writer::plain::plan::PlannedObjectStreamOrigin::Synthetic => None,
         };
         if options.qdf {
-            serialize::write_objstm_stream_with_extends_qdf(
-                bytes,
-                &body,
-                extends,
-                qdf_first_offset.expect("QDF first offset is set with QDF body"),
-                options.newline_before_endstream,
-            )?; // cov:ignore: the QDF ObjStm wrapper is exercised by byte-parity tests; LLVM maps this validated continuation to the call setup.
+            crate::writer::output::with_buffer_sink(bytes, |out| {
+                serialize::write_objstm_stream_with_extends_qdf(
+                    out,
+                    &body,
+                    extends,
+                    qdf_first_offset.expect("QDF first offset is set with QDF body"),
+                    options.newline_before_endstream,
+                )
+            })?; // cov:ignore: the QDF ObjStm wrapper is exercised by byte-parity tests; LLVM maps this validated continuation to the call setup.
         } else {
-            serialize::write_objstm_stream_with_extends(
-                bytes,
-                &body,
-                structural_compress,
-                options.newline_before_endstream,
-                extends,
-            )?; // cov:ignore: error arm requires an in-memory zlib encoder failure
+            crate::writer::output::with_buffer_sink(bytes, |out| {
+                serialize::write_objstm_stream_with_extends(
+                    out,
+                    &body,
+                    structural_compress,
+                    options.newline_before_endstream,
+                    extends,
+                )
+            })?; // cov:ignore: error arm requires an in-memory zlib encoder failure
         }
         bytes.extend_from_slice(b"\nendobj\n");
         if options.qdf {
@@ -2505,13 +2438,12 @@ pub(crate) fn canonical_stream_output_for_rewrite_with_status(
 pub(crate) fn emit_content_container_from_handle_with_ref_map(
     container: &ObjectHandle,
     options: &WriterOptions,
-    out: &mut Vec<u8>,
+    out: &mut OutputSink<'_>,
     map: &dyn Fn(ObjectRef) -> crate::Result<ObjectRef>,
     removed_refs: &BTreeSet<ObjectRef>,
 ) -> crate::Result<()> {
-    let mut write_string = |out: &mut Vec<u8>, value: &[u8]| {
-        crate::pdf_syntax::write_string_value(out, value);
-        Ok(())
+    let mut write_string = |out: &mut OutputSink<'_>, value: &[u8]| {
+        crate::pdf_syntax::write_string_value_to_sink(out, value)
     };
     emit_content_container_from_handle_with_ref_map_and_string_writer(
         container,
@@ -2530,13 +2462,13 @@ pub(crate) fn emit_content_container_from_handle_with_ref_map(
 pub(crate) fn emit_content_container_from_handle_with_ref_map_and_string_writer<F>(
     container: &ObjectHandle,
     options: &WriterOptions,
-    out: &mut Vec<u8>,
+    out: &mut OutputSink<'_>,
     map: &dyn Fn(ObjectRef) -> crate::Result<ObjectRef>,
     removed_refs: &BTreeSet<ObjectRef>,
     write_string: &mut F,
 ) -> crate::Result<()>
 where
-    F: FnMut(&mut Vec<u8>, &[u8]) -> crate::Result<()>,
+    F: FnMut(&mut OutputSink<'_>, &[u8]) -> crate::Result<()>,
 {
     let container = if options.content_normalization {
         normalize_content_container(container, options)?
@@ -2633,20 +2565,20 @@ fn normalize_content_value(
     )
 }
 
-struct ContentEmitter<'a, F>
+struct ContentEmitter<'out, 'sink, 'map, 'removed, 'writer, F>
 where
-    F: FnMut(&mut Vec<u8>, &[u8]) -> crate::Result<()>,
+    F: FnMut(&mut OutputSink<'_>, &[u8]) -> crate::Result<()>,
 {
     qdf: bool,
-    out: &'a mut Vec<u8>,
-    map: &'a dyn Fn(ObjectRef) -> crate::Result<ObjectRef>,
-    removed_refs: &'a BTreeSet<ObjectRef>,
-    write_string: &'a mut F,
+    out: &'out mut OutputSink<'sink>,
+    map: &'map dyn Fn(ObjectRef) -> crate::Result<ObjectRef>,
+    removed_refs: &'removed BTreeSet<ObjectRef>,
+    write_string: &'writer mut F,
 }
 
-impl<F> ContentEmitter<'_, F>
+impl<F> ContentEmitter<'_, '_, '_, '_, '_, F>
 where
-    F: FnMut(&mut Vec<u8>, &[u8]) -> crate::Result<()>,
+    F: FnMut(&mut OutputSink<'_>, &[u8]) -> crate::Result<()>,
 {
     // The recursion hub for this impl's `emit_array`/`emit_dictionary`
     // arms below -- every nested descent (including `has_direct_stream_in_value`'s
@@ -2677,10 +2609,10 @@ where
                 if !root {
                     if let Some(object_ref) = value.object_ref() {
                         if object_ref.number == 0 || self.removed_refs.contains(&object_ref) {
-                            self.out.extend_from_slice(b"null");
+                            self.out.write_bytes(b"null")?;
                         } else {
                             self.out
-                                .extend_from_slice((self.map)(object_ref)?.to_string().as_bytes());
+                                .write_bytes((self.map)(object_ref)?.to_string().as_bytes())?;
                         }
                         return Ok(());
                     }
@@ -2743,21 +2675,21 @@ where
 
     fn emit_array(&mut self, items: &[ObjectHandle], indent: usize) -> crate::Result<()> {
         if self.qdf {
-            self.out.extend_from_slice(b"[\n");
+            self.out.write_bytes(b"[\n")?;
             for item in items {
-                push_spaces(self.out, indent + 2);
+                push_spaces(self.out, indent + 2)?;
                 self.emit_value(item, false, indent + 2)?;
-                self.out.push(b'\n');
+                self.out.write_bytes(b"\n")?;
             }
-            push_spaces(self.out, indent);
-            self.out.push(b']');
+            push_spaces(self.out, indent)?;
+            self.out.write_bytes(b"]")?;
         } else {
-            self.out.push(b'[');
+            self.out.write_bytes(b"[")?;
             for item in items {
-                self.out.push(b' ');
+                self.out.write_bytes(b" ")?;
                 self.emit_value(item, false, indent)?;
             }
-            self.out.extend_from_slice(b" ]");
+            self.out.write_bytes(b" ]")?;
         }
         Ok(())
     }
@@ -2768,9 +2700,9 @@ where
         indent: usize,
     ) -> crate::Result<()> {
         if self.qdf {
-            self.out.extend_from_slice(b"<<\n");
+            self.out.write_bytes(b"<<\n")?;
         } else {
-            self.out.extend_from_slice(b"<<");
+            self.out.write_bytes(b"<<")?;
         }
 
         for (key, value) in entries {
@@ -2778,23 +2710,23 @@ where
                 continue;
             }
             if self.qdf {
-                push_spaces(self.out, indent + 2);
+                push_spaces(self.out, indent + 2)?;
             } else {
-                self.out.push(b' ');
+                self.out.write_bytes(b" ")?;
             }
-            write_content_key(self.out, key);
-            self.out.push(b' ');
+            write_content_key(self.out, key)?;
+            self.out.write_bytes(b" ")?;
             self.emit_value(value, false, indent + 2)?; // cov:ignore: LLVM does not attribute the successful nested emitter continuation
             if self.qdf {
-                self.out.push(b'\n');
+                self.out.write_bytes(b"\n")?;
             }
         }
 
         if self.qdf {
-            push_spaces(self.out, indent);
-            self.out.extend_from_slice(b">>");
+            push_spaces(self.out, indent)?;
+            self.out.write_bytes(b">>")?;
         } else {
-            self.out.extend_from_slice(b" >>");
+            self.out.write_bytes(b" >>")?;
         }
         Ok(())
     }
@@ -2821,11 +2753,10 @@ where
                 self.write_string,
             )?; // cov:ignore: LLVM does not attribute the successful compact dictionary continuation
         }
-        self.out.extend_from_slice(b"\nstream\n");
+        self.out.write_bytes(b"\nstream\n")?;
         self.out
-            .extend_from_slice(stream.get_raw_stream_data()?.as_ref());
-        self.out.extend_from_slice(b"\nendstream");
-        Ok(())
+            .write_bytes(stream.get_raw_stream_data()?.as_ref())?;
+        self.out.write_bytes(b"\nendstream")
     }
 }
 
@@ -2871,14 +2802,22 @@ fn is_removed_content_reference(value: &ObjectHandle, removed_refs: &BTreeSet<Ob
         .is_some_and(|object_ref| removed_refs.contains(&object_ref))
 }
 
-fn write_content_key(out: &mut Vec<u8>, key: &[u8]) {
-    out.push(b'/');
+fn write_content_key(out: &mut OutputSink<'_>, key: &[u8]) -> crate::Result<()> {
+    out.write_bytes(b"/")?;
     let key = key.strip_prefix(b"/").unwrap_or(key);
-    crate::pdf_syntax::write_name_escaped(out, key);
+    crate::pdf_syntax::write_name_escaped_to_sink(out, key)?;
+    Ok(())
 }
 
-fn push_spaces(out: &mut Vec<u8>, count: usize) {
-    out.resize(out.len().saturating_add(count), b' ');
+fn push_spaces(out: &mut OutputSink<'_>, count: usize) -> crate::Result<()> {
+    const SPACES: &[u8; 64] = b"                                                                ";
+    let mut remaining = count;
+    while remaining > 0 {
+        let chunk = remaining.min(SPACES.len());
+        out.write_bytes(&SPACES[..chunk])?;
+        remaining -= chunk;
+    }
+    Ok(())
 }
 
 /// Canonical stream output for qpdf's linearized body route.
@@ -3100,10 +3039,7 @@ fn canonical_stream_output_with_rewrite_policy(
                     // fresh raw pipe (`QPDFWriter.cc:1287-1314`). The second
                     // attempt's buffer is authoritative even when the
                     // provider reports that no filtering branch was used.
-                    break (
-                        buffer.take_buffer()?.to_vec(),
-                        filtering_attempted && success,
-                    );
+                    break (buffer.take_buffer()?, filtering_attempted && success);
                 }
                 attempt = 2;
             };
@@ -3157,7 +3093,7 @@ fn canonical_stream_source_data(handle: &ObjectHandle) -> crate::Result<Vec<u8>>
         false,
         true,
     )?; // cov:ignore: LLVM attributes this covered qpdf-shaped multiline call terminator without an executable counter
-    Ok(buffer.take_buffer()?.to_vec())
+    Ok(buffer.take_buffer()?)
 }
 
 fn stream_data_error(handle: &ObjectHandle, error: crate::Error) -> crate::Error {
@@ -3352,13 +3288,15 @@ mod final_handle_tests {
         let map = |object_ref| Ok(object_ref);
         let mut output = Vec::new();
 
-        emit_content_container_from_handle_with_ref_map(
-            &container,
-            &options,
-            &mut output,
-            &map,
-            &BTreeSet::new(),
-        )
+        crate::writer::output::with_buffer_sink(&mut output, |out| {
+            emit_content_container_from_handle_with_ref_map(
+                &container,
+                &options,
+                out,
+                &map,
+                &BTreeSet::new(),
+            )
+        })
         .expect("direct content stream emission");
 
         assert!(output

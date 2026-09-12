@@ -44,10 +44,22 @@ pub(crate) fn qpdf_real_value(value: f64) -> f64 {
 /// kept as the literal three-byte text `#00` (`QPDFTokenizer.cc:471-475`) --
 /// so a raw NUL byte reaching this function can only be that sentinel.
 pub(crate) fn write_name_escaped(out: &mut Vec<u8>, raw: &[u8]) {
+    write_name_escaped_to_sink_inner(&mut VecSyntaxSink(out), raw)
+        .expect("writing a PDF name to Vec cannot fail");
+}
+
+pub(crate) fn write_name_escaped_to_sink(
+    out: &mut crate::writer::output::OutputSink<'_>,
+    raw: &[u8],
+) -> crate::Result<()> {
+    write_name_escaped_to_sink_inner(out, raw)
+}
+
+fn write_name_escaped_to_sink_inner(out: &mut impl SyntaxSink, raw: &[u8]) -> crate::Result<()> {
     const HEX: &[u8; 16] = b"0123456789abcdef";
     for &byte in raw {
         if byte == 0 {
-            out.push(b'#');
+            out.write_syntax(b"#")?;
             continue;
         }
         let needs_escape = !(0x21..=0x7e).contains(&byte)
@@ -56,13 +68,12 @@ pub(crate) fn write_name_escaped(out: &mut Vec<u8>, raw: &[u8]) {
                 b'(' | b')' | b'<' | b'>' | b'[' | b']' | b'{' | b'}' | b'/' | b'%' | b'#'
             );
         if needs_escape {
-            out.push(b'#');
-            out.push(HEX[(byte >> 4) as usize]);
-            out.push(HEX[(byte & 0x0f) as usize]);
+            out.write_syntax(&[b'#', HEX[(byte >> 4) as usize], HEX[(byte & 0x0f) as usize]])?;
         } else {
-            out.push(byte);
+            out.write_syntax(&[byte])?;
         }
     }
+    Ok(())
 }
 
 /// Return whether a PDF string must use hex syntax.
@@ -88,26 +99,34 @@ fn is_iso_latin1_printable(byte: u8) -> bool {
 
 /// Write a PDF literal string with qpdf-compatible escapes.
 pub(crate) fn write_literal_string(out: &mut Vec<u8>, value: &[u8]) {
-    out.push(b'(');
+    write_literal_string_to_sink_inner(&mut VecSyntaxSink(out), value)
+        .expect("writing a PDF string to Vec cannot fail");
+}
+
+fn write_literal_string_to_sink_inner(
+    out: &mut impl SyntaxSink,
+    value: &[u8],
+) -> crate::Result<()> {
+    out.write_syntax(b"(")?;
     for &byte in value {
         match byte {
             b'\\' | b'(' | b')' => {
-                out.push(b'\\');
-                out.push(byte);
+                out.write_syntax(&[b'\\', byte])?;
             }
-            b'\n' => out.extend_from_slice(br"\n"),
-            b'\r' => out.extend_from_slice(br"\r"),
-            b'\t' => out.extend_from_slice(br"\t"),
-            0x08 => out.extend_from_slice(br"\b"),
-            0x0c => out.extend_from_slice(br"\f"),
-            _ if is_iso_latin1_printable(byte) => out.push(byte),
+            b'\n' => out.write_syntax(br"\n")?,
+            b'\r' => out.write_syntax(br"\r")?,
+            b'\t' => out.write_syntax(br"\t")?,
+            0x08 => out.write_syntax(br"\b")?,
+            0x0c => out.write_syntax(br"\f")?,
+            _ if is_iso_latin1_printable(byte) => out.write_syntax(&[byte])?,
             _ => {
-                out.push(b'\\');
-                out.extend_from_slice(format!("{byte:03o}").as_bytes());
+                out.write_syntax(b"\\")?;
+                out.write_syntax(format!("{byte:03o}").as_bytes())?;
             }
         }
     }
-    out.push(b')');
+    out.write_syntax(b")")?;
+    Ok(())
 }
 
 /// Write a string in qpdf's literal-or-hex representation.
@@ -119,22 +138,71 @@ pub(crate) fn write_string_value(out: &mut Vec<u8>, value: &[u8]) {
     }
 }
 
+pub(crate) fn write_string_value_to_sink(
+    out: &mut crate::writer::output::OutputSink<'_>,
+    value: &[u8],
+) -> crate::Result<()> {
+    write_string_value_to_sink_inner(out, value)
+}
+
+fn write_string_value_to_sink_inner(out: &mut impl SyntaxSink, value: &[u8]) -> crate::Result<()> {
+    if use_hex_string(value) {
+        write_hex_string_to_sink_inner(out, value)?;
+    } else {
+        write_literal_string_to_sink_inner(out, value)?;
+    }
+    Ok(())
+}
+
 /// Write bytes as a lowercase hexadecimal PDF string.
 pub(crate) fn write_hex_string(out: &mut Vec<u8>, value: &[u8]) {
+    write_hex_string_to_sink_inner(&mut VecSyntaxSink(out), value)
+        .expect("writing a PDF string to Vec cannot fail");
+}
+
+pub(crate) fn write_hex_string_to_sink(
+    out: &mut crate::writer::output::OutputSink<'_>,
+    value: &[u8],
+) -> crate::Result<()> {
+    write_hex_string_to_sink_inner(out, value)
+}
+
+fn write_hex_string_to_sink_inner(out: &mut impl SyntaxSink, value: &[u8]) -> crate::Result<()> {
     const HEX: &[u8; 16] = b"0123456789abcdef";
-    out.push(b'<');
+    out.write_syntax(b"<")?;
     for &byte in value {
-        out.push(HEX[(byte >> 4) as usize]);
-        out.push(HEX[(byte & 0x0f) as usize]);
+        out.write_syntax(&[HEX[(byte >> 4) as usize], HEX[(byte & 0x0f) as usize]])?;
     }
-    out.push(b'>');
+    out.write_syntax(b">")?;
+    Ok(())
+}
+
+trait SyntaxSink {
+    fn write_syntax(&mut self, bytes: &[u8]) -> crate::Result<()>;
+}
+
+struct VecSyntaxSink<'a>(&'a mut Vec<u8>);
+
+impl SyntaxSink for VecSyntaxSink<'_> {
+    fn write_syntax(&mut self, bytes: &[u8]) -> crate::Result<()> {
+        self.0.extend_from_slice(bytes);
+        Ok(())
+    }
+}
+
+impl SyntaxSink for crate::writer::output::OutputSink<'_> {
+    fn write_syntax(&mut self, bytes: &[u8]) -> crate::Result<()> {
+        self.write_bytes(bytes)
+    }
 }
 
 /// Callback used by the two-pass trailer writers to emit an /ID value.
-pub(crate) type TrailerIdWriter<'a> = &'a mut dyn FnMut(&mut Vec<u8>);
+pub(crate) type TrailerIdWriter<'a> =
+    &'a mut dyn FnMut(&mut crate::writer::output::OutputSink<'_>) -> crate::Result<()>;
 
 /// Reborrowable two-lifetime form of TrailerIdWriter.
-pub(crate) type ReborrowableIdWriter<'r, 'd> = &'r mut (dyn FnMut(&mut Vec<u8>) + 'd);
+pub(crate) type ReborrowableIdWriter<'r, 'd> =
+    &'r mut (dyn FnMut(&mut crate::writer::output::OutputSink<'_>) -> crate::Result<()> + 'd);
 
 #[cfg(test)]
 mod tests {

@@ -12,6 +12,54 @@ pub(crate) trait OutputTarget {
     fn finish_document(&mut self) -> Result<()>;
 }
 
+/// Target adapter for bounded writer-owned buffers.
+///
+/// Linearization and length-before-payload serializers keep local `Vec`
+/// ownership, but still enter the canonical serializer through an
+/// [`OutputSink`]. Final-output coordinates are therefore counted only by the
+/// outer sink when the completed local payload is consumed.
+impl OutputTarget for Vec<u8> {
+    fn write_chunk(&mut self, bytes: &[u8]) -> io::Result<usize> {
+        self.extend_from_slice(bytes);
+        Ok(bytes.len())
+    }
+
+    fn finish_segment(&mut self) -> Result<()> {
+        Ok(())
+    }
+
+    fn finish_document(&mut self) -> Result<()> {
+        Ok(())
+    }
+}
+
+/// Run one canonical serializer operation against a bounded local buffer.
+pub(crate) fn with_buffer_sink<T>(
+    bytes: &mut Vec<u8>,
+    write: impl FnOnce(&mut OutputSink<'_>) -> Result<T>,
+) -> Result<T> {
+    let position = u64::try_from(bytes.len())
+        .map_err(|_| Error::Unsupported("writer buffer position exceeds u64 range".to_string()))?;
+    let mut sink = OutputSink::new_at_position(bytes, position);
+    write(&mut sink)
+}
+
+/// Run one serializer operation with a digest seeded from an existing local
+/// whole-output buffer. This preserves the pre-Task-6 deterministic-ID owner
+/// while its trailer callback is mechanically migrated to [`OutputSink`].
+pub(crate) fn with_digested_buffer_sink<T>(
+    bytes: &mut Vec<u8>,
+    write: impl FnOnce(&mut OutputSink<'_>) -> Result<T>,
+) -> Result<T> {
+    let position = u64::try_from(bytes.len())
+        .map_err(|_| Error::Unsupported("writer buffer position exceeds u64 range".to_string()))?;
+    let mut digest = Md5::new();
+    digest.update(bytes.as_slice());
+    let mut sink = OutputSink::new_at_position(bytes, position);
+    sink.digest = DigestState::Active(digest);
+    write(&mut sink)
+}
+
 /// qpdf-shaped final-output counter and optional deterministic-ID digest.
 ///
 /// Only bytes accepted by the final target advance this counter or digest.
@@ -37,9 +85,13 @@ enum WriteFailure {
 
 impl<'a> OutputSink<'a> {
     pub(crate) fn new(target: &'a mut dyn OutputTarget) -> Self {
+        Self::new_at_position(target, 0)
+    }
+
+    fn new_at_position(target: &'a mut dyn OutputTarget, position: u64) -> Self {
         Self {
             target,
-            position: 0,
+            position,
             last_byte: None,
             digest: DigestState::Disabled,
         }

@@ -1,5 +1,8 @@
 //! qpdf correspondence: QPDFWriter.cc shared object, stream, trailer, and xref serialization primitives.
-use super::{object_streams, CompressStreams, NewlineBeforeEndstream, ObjectWriterEmission};
+use super::{
+    object_streams, output::OutputSink, CompressStreams, NewlineBeforeEndstream,
+    ObjectWriterEmission,
+};
 use crate::ObjectHandle;
 
 /// Write a PDF stream to `out`, applying the [`NewlineBeforeEndstream`] policy.
@@ -27,30 +30,35 @@ pub fn write_stream_to_buf(
     stream: &ObjectHandle,
     policy: NewlineBeforeEndstream,
 ) -> crate::Result<()> {
-    stream.write_stream_body(out, false)?;
     let data = stream.get_raw_stream_data()?;
-    write_stream_payload(out, &data, policy);
-    Ok(())
+    super::output::with_buffer_sink(out, |out| {
+        stream.write_stream_body(out, false)?;
+        write_stream_payload(out, &data, policy)
+    })
 }
 
 /// Emit stream framing after its dictionary has already been written.
-pub(crate) fn write_stream_payload(out: &mut Vec<u8>, data: &[u8], policy: NewlineBeforeEndstream) {
-    write_stream_payload_with_qdf(out, data, policy, false);
+pub(crate) fn write_stream_payload(
+    out: &mut OutputSink<'_>,
+    data: &[u8],
+    policy: NewlineBeforeEndstream,
+) -> crate::Result<()> {
+    write_stream_payload_with_qdf(out, data, policy, false)
 }
 
 /// Emit stream framing with qpdf's QDF-specific conditional newline rule.
 pub(crate) fn write_stream_payload_with_qdf(
-    out: &mut Vec<u8>,
+    out: &mut OutputSink<'_>,
     data: &[u8],
     policy: NewlineBeforeEndstream,
     qdf_mode: bool,
-) {
-    out.extend_from_slice(b"\nstream\n");
-    out.extend_from_slice(data);
+) -> crate::Result<()> {
+    out.write_bytes(b"\nstream\n")?;
+    out.write_bytes(data)?;
     if framing_adds_newline_with_qdf(data, policy, qdf_mode) {
-        out.push(b'\n');
+        out.write_bytes(b"\n")?;
     }
-    out.extend_from_slice(b"endstream");
+    out.write_bytes(b"endstream")
 }
 
 /// Whether stream framing adds one LF, including qpdf's QDF-only rule.
@@ -68,54 +76,50 @@ pub(crate) fn framing_adds_newline_with_qdf(
 /// Serialize an object-stream container, preserving qpdf's source `/Extends`
 /// edge when this is a source-backed Preserve group.
 pub(crate) fn write_objstm_stream_with_extends(
-    out: &mut Vec<u8>,
+    out: &mut OutputSink<'_>,
     body: &object_streams::ObjStmBody,
     compress: CompressStreams,
     policy: NewlineBeforeEndstream,
     extends: Option<crate::ObjectRef>,
 ) -> crate::Result<()> {
     let (_, data) = object_streams::wrap_objstm_body_as_handle(body, compress, extends)?;
-    out.extend_from_slice(b"<< /Type /ObjStm /Length ");
-    out.extend_from_slice(data.len().to_string().as_bytes());
+    out.write_bytes(b"<< /Type /ObjStm /Length ")?;
+    out.write_bytes(data.len().to_string().as_bytes())?;
     if matches!(compress, CompressStreams::Yes) {
-        out.extend_from_slice(b" /Filter /FlateDecode");
+        out.write_bytes(b" /Filter /FlateDecode")?;
     }
-    out.extend_from_slice(
-        format!(" /N {} /First {}", body.n_members, body.first_offset).as_bytes(),
-    );
+    out.write_bytes(format!(" /N {} /First {}", body.n_members, body.first_offset).as_bytes())?;
     if let Some(extends) = extends {
-        out.extend_from_slice(
+        out.write_bytes(
             format!(" /Extends {} {} R", extends.number, extends.generation).as_bytes(),
-        );
+        )?;
     }
-    out.extend_from_slice(b" >>");
-    write_stream_payload(out, &data, policy);
-    Ok(())
+    out.write_bytes(b" >>")?;
+    write_stream_payload(out, &data, policy)
 }
 
 /// Emit an object-stream container in qpdf QDF layout. QDF keeps the body
 /// uncompressed, writes the structural dictionary one entry per line, and
 /// applies the QDF stream framing rule (`QPDFWriter.cc:1620-1775`).
 pub(crate) fn write_objstm_stream_with_extends_qdf(
-    out: &mut Vec<u8>,
+    out: &mut OutputSink<'_>,
     body: &object_streams::ObjStmBody,
     extends: Option<crate::ObjectRef>,
     first_offset: usize,
     newline_before_endstream: NewlineBeforeEndstream,
 ) -> crate::Result<()> {
     let (_, data) = object_streams::wrap_objstm_body_as_handle(body, CompressStreams::No, extends)?;
-    out.extend_from_slice(b"<<\n  /Type /ObjStm\n");
-    out.extend_from_slice(format!("  /Length {}\n", data.len()).as_bytes());
-    out.extend_from_slice(format!("  /N {}\n", body.n_members).as_bytes());
-    out.extend_from_slice(format!("  /First {first_offset}\n").as_bytes());
+    out.write_bytes(b"<<\n  /Type /ObjStm\n")?;
+    out.write_bytes(format!("  /Length {}\n", data.len()).as_bytes())?;
+    out.write_bytes(format!("  /N {}\n", body.n_members).as_bytes())?;
+    out.write_bytes(format!("  /First {first_offset}\n").as_bytes())?;
     if let Some(extends) = extends {
-        out.extend_from_slice(
+        out.write_bytes(
             format!("  /Extends {} {} R\n", extends.number, extends.generation).as_bytes(),
-        );
+        )?;
     }
-    out.extend_from_slice(b">>");
-    write_stream_payload_with_qdf(out, &data, newline_before_endstream, true);
-    Ok(())
+    out.write_bytes(b">>")?;
+    write_stream_payload_with_qdf(out, &data, newline_before_endstream, true)
 }
 
 pub(crate) mod xref_stream {
@@ -149,6 +153,7 @@ pub(crate) mod xref_stream {
     use crate::pipeline::png_filter::{PngFilter, PngFilterAction};
     use crate::pipeline::{Pipeline, PipelineError, PipelineResult};
 
+    use crate::writer::output::OutputSink;
     use crate::ObjectRef;
     use crate::Result;
 
@@ -317,9 +322,11 @@ pub(crate) mod xref_stream {
     #[test]
     fn dictionary_key_preserves_qpdf_first_byte() {
         let mut out = Vec::new();
-        write_qpdf_dictionary_key(&mut out, b"/Canonical");
-        out.push(b' ');
-        write_qpdf_dictionary_key(&mut out, b"Raw");
+        let mut sink = OutputSink::new(&mut out);
+        write_qpdf_dictionary_key(&mut sink, b"/Canonical").unwrap();
+        sink.write_bytes(b" ").unwrap();
+        write_qpdf_dictionary_key(&mut sink, b"Raw").unwrap();
+        drop(sink);
         assert_eq!(out, b"/Canonical Raw");
     }
 
@@ -358,12 +365,12 @@ pub(crate) mod xref_stream {
     }
 
     /// Append two lowercase hex digits per byte of `bytes` to `out`.
-    fn push_hex(out: &mut Vec<u8>, bytes: &[u8]) {
+    fn push_hex(out: &mut OutputSink<'_>, bytes: &[u8]) -> Result<()> {
         const HEX: &[u8; 16] = b"0123456789abcdef";
         for &b in bytes {
-            out.push(HEX[(b >> 4) as usize]);
-            out.push(HEX[(b & 0x0f) as usize]);
+            out.write_bytes(&[HEX[(b >> 4) as usize], HEX[(b & 0x0f) as usize]])?;
         }
+        Ok(())
     }
 
     /// Write the xref-stream object header and every dictionary key up to (but not
@@ -374,41 +381,41 @@ pub(crate) mod xref_stream {
     /// qpdf's newline-plus-two-space layout; `/Index` remains on the `/W` line,
     /// matching `QPDFWriter::writeXRefStream`.
     fn write_object_dict_prefix(
-        out: &mut Vec<u8>,
+        out: &mut OutputSink<'_>,
         object: ObjectRef,
         dict: &XrefStreamDict,
         payload_len: usize,
         qdf: bool,
-    ) {
-        out.extend_from_slice(format!("{} {} obj\n", object.number, object.generation).as_bytes());
+    ) -> Result<()> {
+        out.write_bytes(format!("{} {} obj\n", object.number, object.generation).as_bytes())?;
         if qdf {
-            out.extend_from_slice(b"<<\n  /Type /XRef");
-            out.extend_from_slice(format!("\n  /Length {payload_len}").as_bytes());
+            out.write_bytes(b"<<\n  /Type /XRef")?;
+            out.write_bytes(format!("\n  /Length {payload_len}").as_bytes())?;
         } else {
-            out.extend_from_slice(b"<< /Type /XRef");
-            out.extend_from_slice(format!(" /Length {payload_len}").as_bytes());
+            out.write_bytes(b"<< /Type /XRef")?;
+            out.write_bytes(format!(" /Length {payload_len}").as_bytes())?;
         }
         if dict.filtered {
             if qdf {
                 // cov:ignore-start: qpdf never filters a QDF structural stream
-                out.extend_from_slice(b"\n  /Filter /FlateDecode /DecodeParms << /Columns ");
+                out.write_bytes(b"\n  /Filter /FlateDecode /DecodeParms << /Columns ")?;
                 // cov:ignore-end
             } else {
-                out.extend_from_slice(b" /Filter /FlateDecode /DecodeParms << /Columns ");
+                out.write_bytes(b" /Filter /FlateDecode /DecodeParms << /Columns ")?;
             }
-            out.extend_from_slice(columns(dict.widths).to_string().as_bytes());
-            out.extend_from_slice(b" /Predictor 12 >>");
+            out.write_bytes(columns(dict.widths).to_string().as_bytes())?;
+            out.write_bytes(b" /Predictor 12 >>")?;
         }
         if qdf {
-            out.extend_from_slice(b"\n  /W [ ");
+            out.write_bytes(b"\n  /W [ ")?;
         } else {
-            out.extend_from_slice(b" /W [ ");
+            out.write_bytes(b" /W [ ")?;
         }
-        out.extend_from_slice(
+        out.write_bytes(
             format!("{} {} {} ]", dict.widths[0], dict.widths[1], dict.widths[2]).as_bytes(),
-        );
+        )?;
         if let Some((start, count)) = dict.index {
-            out.extend_from_slice(format!(" /Index [ {start} {count} ]").as_bytes());
+            out.write_bytes(format!(" /Index [ {start} {count} ]").as_bytes())?;
         }
         let mut entries = dict
             .canonical_entries
@@ -431,96 +438,101 @@ pub(crate) mod xref_stream {
         entries.sort_by(|left, right| left.0.cmp(&right.0));
         for (key, value) in entries {
             if qdf {
-                out.extend_from_slice(b"\n  ");
+                out.write_bytes(b"\n  ")?;
             } else {
-                out.push(b' ');
+                out.write_bytes(b" ")?;
             }
-            write_qpdf_dictionary_key(out, &key);
-            out.push(b' ');
-            out.extend_from_slice(&value);
+            write_qpdf_dictionary_key(out, &key)?;
+            out.write_bytes(b" ")?;
+            out.write_bytes(&value)?;
             if key == b"/Size" {
                 if let Some(prev) = dict.prev {
-                    out.extend_from_slice(format!(" /Prev {prev:<PREV_FIELD_WIDTH$}").as_bytes());
+                    out.write_bytes(format!(" /Prev {prev:<PREV_FIELD_WIDTH$}").as_bytes())?;
                 }
             }
         }
+        Ok(())
     }
 
-    fn write_qpdf_dictionary_key(out: &mut Vec<u8>, key: &[u8]) {
+    fn write_qpdf_dictionary_key(out: &mut OutputSink<'_>, key: &[u8]) -> Result<()> {
         if let Some(key) = key.strip_prefix(b"/") {
-            out.push(b'/');
-            crate::pdf_syntax::write_name_escaped(out, key);
+            out.write_bytes(b"/")?;
+            crate::pdf_syntax::write_name_escaped_to_sink(out, key)?;
         } else {
-            crate::pdf_syntax::write_name_escaped(out, key);
+            crate::pdf_syntax::write_name_escaped_to_sink(out, key)?;
         }
+        Ok(())
     }
 
     /// Append the framing that closes a cross-reference stream object. QDF adds
     /// the extra newline after `endobj`, as `closeObject` does in qpdf.
-    fn write_object_framing(out: &mut Vec<u8>, payload: &[u8], qdf: bool) {
+    fn write_object_framing(out: &mut OutputSink<'_>, payload: &[u8], qdf: bool) -> Result<()> {
         if qdf {
-            out.extend_from_slice(b"\nstream\n");
+            out.write_bytes(b"\nstream\n")?;
         } else {
-            out.extend_from_slice(b" >>\nstream\n");
+            out.write_bytes(b" >>\nstream\n")?;
         }
-        out.extend_from_slice(payload);
-        out.extend_from_slice(b"\nendstream\nendobj\n");
+        out.write_bytes(payload)?;
+        out.write_bytes(b"\nendstream\nendobj\n")?;
         if qdf {
-            out.push(b'\n');
+            out.write_bytes(b"\n")?;
         }
+        Ok(())
     }
 
     fn write_object_internal(
-        out: &mut Vec<u8>,
+        out: &mut OutputSink<'_>,
         object: ObjectRef,
         dict: &XrefStreamDict,
         payload: &[u8],
         qdf: bool,
         id_writer: Option<crate::pdf_syntax::TrailerIdWriter>,
-    ) -> Option<std::ops::Range<usize>> {
-        write_object_dict_prefix(out, object, dict, payload.len(), qdf);
+    ) -> Result<Option<std::ops::Range<usize>>> {
+        write_object_dict_prefix(out, object, dict, payload.len(), qdf)?;
         let (id_range, has_id) = if let Some(id_writer) = id_writer {
             if qdf {
-                out.extend_from_slice(b"\n  /ID ");
+                out.write_bytes(b"\n  /ID ")?;
             } else {
-                out.extend_from_slice(b" /ID ");
+                out.write_bytes(b" /ID ")?;
             }
-            id_writer(out);
+            id_writer(out)?;
             (None, true)
         } else if let Some((id0, id1)) = dict.id {
             if qdf {
-                out.extend_from_slice(b"\n  /ID ");
+                out.write_bytes(b"\n  /ID ")?;
             } else {
-                out.extend_from_slice(b" /ID ");
+                out.write_bytes(b" /ID ")?;
             }
-            let id_start = out.len();
-            out.push(b'[');
-            out.push(b'<');
-            push_hex(out, id0);
-            out.extend_from_slice(b"><");
-            push_hex(out, id1);
-            out.extend_from_slice(b">]");
-            (Some(id_start..out.len()), true)
+            let id_start = usize::try_from(out.position()).map_err(|_| {
+                crate::Error::Unsupported("xref stream ID offset exceeds usize range".to_string())
+            })?;
+            out.write_bytes(b"[<")?;
+            push_hex(out, id0)?;
+            out.write_bytes(b"><")?;
+            push_hex(out, id1)?;
+            out.write_bytes(b">]")?;
+            let id_end = usize::try_from(out.position()).map_err(|_| {
+                crate::Error::Unsupported("xref stream ID offset exceeds usize range".to_string())
+            })?;
+            (Some(id_start..id_end), true)
         } else {
             (None, false)
         };
         if let Some(encrypt) = dict.encrypt {
             if qdf && !has_id {
                 // cov:ignore-start: qpdf xref streams always emit /ID before /Encrypt
-                out.extend_from_slice(b"\n  /Encrypt ");
+                out.write_bytes(b"\n  /Encrypt ")?;
                 // cov:ignore-end
             } else {
-                out.extend_from_slice(b" /Encrypt ");
+                out.write_bytes(b" /Encrypt ")?;
             }
-            out.extend_from_slice(
-                format!("{} {} R", encrypt.number, encrypt.generation).as_bytes(),
-            );
+            out.write_bytes(format!("{} {} R", encrypt.number, encrypt.generation).as_bytes())?;
         }
         if qdf {
-            out.extend_from_slice(b"\n>>");
+            out.write_bytes(b"\n>>")?;
         }
-        write_object_framing(out, payload, qdf);
-        id_range
+        write_object_framing(out, payload, qdf)?;
+        Ok(id_range)
     }
 
     /// Write a complete cross-reference stream indirect object
@@ -534,11 +546,11 @@ pub(crate) mod xref_stream {
     /// custom entries, whose serialized bytes are not guaranteed to avoid the
     /// placeholder's fixed byte pattern.
     pub(crate) fn write_object(
-        out: &mut Vec<u8>,
+        out: &mut OutputSink<'_>,
         object: ObjectRef,
         dict: &XrefStreamDict,
         payload: &[u8],
-    ) -> Option<std::ops::Range<usize>> {
+    ) -> Result<Option<std::ops::Range<usize>>> {
         write_object_internal(out, object, dict, payload, false, None)
     }
 
@@ -546,16 +558,18 @@ pub(crate) mod xref_stream {
     /// framing owner. The returned `space_before_zero` is qpdf's
     /// `xref_offset - 1` value used by linearization's `/T` calculation.
     pub(crate) fn write_xref_stream(
-        out: &mut Vec<u8>,
+        out: &mut OutputSink<'_>,
         object: ObjectRef,
         dict: &XrefStreamDict,
         layout: &XrefStreamLayout,
         qdf: bool,
         id_writer: Option<crate::pdf_syntax::TrailerIdWriter<'_>>,
-    ) -> (usize, Option<std::ops::Range<usize>>) {
-        let xref_offset = out.len();
-        let id_range = write_object_internal(out, object, dict, &layout.payload, qdf, id_writer);
-        (xref_offset.saturating_sub(1), id_range)
+    ) -> Result<(usize, Option<std::ops::Range<usize>>)> {
+        let xref_offset = usize::try_from(out.position()).map_err(|_| {
+            crate::Error::Unsupported("xref stream offset exceeds usize range".to_string())
+        })?;
+        let id_range = write_object_internal(out, object, dict, &layout.payload, qdf, id_writer)?;
+        Ok((xref_offset.saturating_sub(1), id_range))
     }
 
     // ---------------------------------------------------------------------------
@@ -619,7 +633,10 @@ pub(crate) mod xref_stream {
     ) -> usize {
         let payload_len = first_pass_payload_len(n_entries, dict.widths, dict.filtered);
         let mut buf = Vec::new();
-        write_object(&mut buf, object, dict, &vec![0u8; payload_len]);
+        let mut sink = OutputSink::new(&mut buf);
+        write_object(&mut sink, object, dict, &vec![0u8; payload_len])
+            .expect("writing a first-pass xref stream to Vec cannot fail");
+        drop(sink);
         buf.len() + calculate_xref_stream_padding(buf.len())
     }
 
@@ -824,7 +841,9 @@ pub(crate) mod xref_stream {
         region_len: usize,
     ) -> Result<(Vec<u8>, Option<std::ops::Range<usize>>)> {
         let mut buf = Vec::with_capacity(region_len);
-        let (_, id_range) = write_xref_stream(&mut buf, object, dict, layout, false, None);
+        let mut sink = OutputSink::new(&mut buf);
+        let (_, id_range) = write_xref_stream(&mut sink, object, dict, layout, false, None)?;
+        drop(sink);
         if buf.len() > region_len {
             return Err(crate::Error::Unsupported(format!(
                 "linearized xref stream object ({} bytes) exceeds its reserved region \

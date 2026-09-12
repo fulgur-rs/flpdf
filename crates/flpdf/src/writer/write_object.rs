@@ -256,35 +256,44 @@ mod tests {
             if object.as_stream_dict().is_some() {
                 let data = object.get_raw_stream_data()?;
                 self.cur_stream_length = data.len();
-                if self.qdf.is_some() {
-                    let length_ref = (!self.direct_stream_lengths).then_some(ObjectRef::new(2, 0));
-                    object.write_stream_body_qdf_with_ref_map_and_removed_and_length_with_options(
-                        &mut self.bytes,
-                        0,
-                        &|object| Ok(object),
-                        &BTreeSet::new(),
-                        length_ref,
-                        crate::writer::StreamDictionaryOptions::preserve(),
-                    )?;
-                } else {
-                    object.write_stream_body(&mut self.bytes, false)?;
-                }
+                let qdf = self.qdf.is_some();
+                crate::writer::output::with_buffer_sink(&mut self.bytes, |out| {
+                    if qdf {
+                        let length_ref =
+                            (!self.direct_stream_lengths).then_some(ObjectRef::new(2, 0));
+                        object
+                            .write_stream_body_qdf_with_ref_map_and_removed_and_length_with_options(
+                                out,
+                                0,
+                                &|object| Ok(object),
+                                &BTreeSet::new(),
+                                length_ref,
+                                crate::writer::StreamDictionaryOptions::preserve(),
+                            )?;
+                    } else {
+                        object.write_stream_body(out, false)?;
+                    }
+                    serialize::write_stream_payload_with_qdf(
+                        out,
+                        &data,
+                        NewlineBeforeEndstream::Never,
+                        qdf,
+                    )
+                })?;
                 self.added_newline = serialize::framing_adds_newline_with_qdf(
                     &data,
                     NewlineBeforeEndstream::Never,
-                    self.qdf.is_some(),
-                );
-                serialize::write_stream_payload_with_qdf(
-                    &mut self.bytes,
-                    &data,
-                    NewlineBeforeEndstream::Never,
-                    self.qdf.is_some(),
+                    qdf,
                 );
                 Ok(())
             } else if self.qdf.is_some() {
-                object.write_object_qdf(&mut self.bytes, 0)
+                crate::writer::output::with_buffer_sink(&mut self.bytes, |out| {
+                    object.write_object_qdf(out, 0)
+                })
             } else {
-                ObjectWriterEmission::write_object(object, &mut self.bytes)
+                crate::writer::output::with_buffer_sink(&mut self.bytes, |out| {
+                    ObjectWriterEmission::write_object(object, out)
+                })
             }
         }
     }

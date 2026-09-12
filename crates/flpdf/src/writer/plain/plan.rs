@@ -577,27 +577,25 @@ impl PlainWritePlan {
                     final_extension_level,
                     false,
                 )?; // cov:ignore: LLVM attributes this covered multiline call terminator to the call setup
-                    // The trailer splices these bytes in verbatim, so they must
-                    // already carry the nesting qpdf gives a trailer value:
-                    // `writeTrailer` unparses each entry at depth 1
-                    // (`QPDFWriter.cc:1188`), which is the same indent the
-                    // non-direct QDF path passes at `object.rs`'s
-                    // `write_child_qdf_with_ref_map(value, 2, ...)`.
-                arbitrated.write_object_qdf_with_ref_map_and_removed(
-                    &mut bytes,
-                    2,
-                    &map,
-                    &placement.removed_refs,
-                )?; // cov:ignore: direct Catalog QDF serialization is exercised; LLVM maps this validated continuation to the call setup.
+                crate::writer::output::with_buffer_sink(&mut bytes, |out| {
+                    arbitrated.write_object_qdf_with_ref_map_and_removed(
+                        out,
+                        0,
+                        &map,
+                        &placement.removed_refs,
+                    )
+                })?; // cov:ignore: direct Catalog QDF serialization is exercised; LLVM maps this validated continuation to the call setup.
             } else {
-                root_handle.write_root_object_with_ref_map_and_removed(
-                    &mut bytes,
-                    &map,
-                    &placement.removed_refs,
-                    &version,
-                    final_extension_level,
-                    false,
-                )?; // cov:ignore: the direct Catalog serializer is exercised; LLVM maps this call terminator to a zero-count continuation region.
+                crate::writer::output::with_buffer_sink(&mut bytes, |out| {
+                    root_handle.write_root_object_with_ref_map_and_removed(
+                        out,
+                        &map,
+                        &placement.removed_refs,
+                        &version,
+                        final_extension_level,
+                        false,
+                    )
+                })?; // cov:ignore: the direct Catalog serializer is exercised; LLVM maps this call terminator to a zero-count continuation region.
             }
             Some(bytes)
         } else {
@@ -970,11 +968,9 @@ pub(crate) fn canonical_trailer_entries_with_visibility(
                     ))
                 })
             };
-            value.write_object_with_ref_map_and_removed(
-                &mut value_bytes,
-                &map_ref,
-                removed_refs,
-            )?;
+            crate::writer::output::with_buffer_sink(&mut value_bytes, |out| {
+                value.write_object_with_ref_map_and_removed(out, &map_ref, removed_refs)
+            })?;
         }
 
         // Keep qpdf's decoded key for the writer's raw-name sort. The xref

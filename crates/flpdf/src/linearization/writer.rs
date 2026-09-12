@@ -330,7 +330,9 @@ fn append_objstm_container_object<R: Read + Seek>(
     let body = emit_objstm_body_from_handles_with_writer(
         &members,
         &mut |out, _member_index, _object_ref, handle| {
-            handle.write_object_with_ref_map_and_removed(out, &map, removed_refs)
+            crate::writer::output::with_buffer_sink(out, |out| {
+                handle.write_object_with_ref_map_and_removed(out, &map, removed_refs)
+            })
         },
     )?;
     let compress = if filtered {
@@ -366,17 +368,27 @@ fn append_objstm_container_object<R: Read + Seek>(
     let offset = bytes.len();
     bytes.extend_from_slice(format!("{} 0 obj\n", container.container_new_num).as_bytes());
     bytes.extend_from_slice(b"<< /Type ");
-    stream_dict.try_get_key(b"/Type")?.write_object(bytes)?;
+    crate::writer::output::with_buffer_sink(bytes, |out| {
+        stream_dict.try_get_key(b"/Type")?.write_object(out)
+    })?;
     bytes.extend_from_slice(b" /Length ");
-    stream_dict.try_get_key(b"/Length")?.write_object(bytes)?;
+    crate::writer::output::with_buffer_sink(bytes, |out| {
+        stream_dict.try_get_key(b"/Length")?.write_object(out)
+    })?;
     if filtered {
         bytes.extend_from_slice(b" /Filter ");
-        stream_dict.try_get_key(b"/Filter")?.write_object(bytes)?;
+        crate::writer::output::with_buffer_sink(bytes, |out| {
+            stream_dict.try_get_key(b"/Filter")?.write_object(out)
+        })?;
     }
     bytes.extend_from_slice(b" /N ");
-    stream_dict.try_get_key(b"/N")?.write_object(bytes)?;
+    crate::writer::output::with_buffer_sink(bytes, |out| {
+        stream_dict.try_get_key(b"/N")?.write_object(out)
+    })?;
     bytes.extend_from_slice(b" /First ");
-    stream_dict.try_get_key(b"/First")?.write_object(bytes)?;
+    crate::writer::output::with_buffer_sink(bytes, |out| {
+        stream_dict.try_get_key(b"/First")?.write_object(out)
+    })?;
     bytes.extend_from_slice(b" >>");
     if let Some(ctx) = encrypt_ctx {
         crate::writer::write_stream_payload_with_pipeline(
@@ -389,11 +401,13 @@ fn append_objstm_container_object<R: Read + Seek>(
             None,
         )?;
     } else {
-        crate::writer::serialize::write_stream_payload(
-            bytes,
-            &data,
-            options.newline_before_endstream,
-        );
+        crate::writer::output::with_buffer_sink(bytes, |out| {
+            crate::writer::serialize::write_stream_payload(
+                out,
+                &data,
+                options.newline_before_endstream,
+            )
+        })?;
     }
     bytes.extend_from_slice(b"\nendobj\n");
     Ok(offset)
@@ -512,17 +526,21 @@ fn append_object(
     let offset = bytes.len();
     bytes.extend_from_slice(format!("{} {} obj\n", new_ref.number, new_ref.generation).as_bytes());
     if let Some(emitter) = encrypted_string_emitter {
-        emitter.write_handle_object_with_ref_map(
-            bytes,
-            new_ref,
-            None,
-            object,
-            false,
-            map,
-            removed_refs,
-        )?; // cov:ignore: canonical handle emission only errors for an invalid source graph.
+        crate::writer::output::with_buffer_sink(bytes, |out| {
+            emitter.write_handle_object_with_ref_map(
+                out,
+                new_ref,
+                None,
+                object,
+                false,
+                map,
+                removed_refs,
+            )
+        })?; // cov:ignore: canonical handle emission only errors for an invalid source graph.
     } else {
-        object.write_object_with_ref_map_and_removed(bytes, map, removed_refs)?;
+        crate::writer::output::with_buffer_sink(bytes, |out| {
+            object.write_object_with_ref_map_and_removed(out, map, removed_refs)
+        })?;
     }
     bytes.extend_from_slice(b"\nendobj\n");
     Ok(offset)
@@ -590,27 +608,31 @@ fn append_body_object(
     let offset = bytes.len();
     bytes.extend_from_slice(format!("{} {} obj\n", new_ref.number, new_ref.generation).as_bytes());
     if let Some(emitter) = encrypted_string_emitter {
-        emitter.write_handle_stream_dict_with_ref_map(
-            bytes,
-            new_ref,
-            None,
-            &dict,
-            crate::writer::encrypted_strings::StreamDictOptions::new(
-                false,
-                dictionary_options,
-                true,
-            ),
-            &map,
-            removed_refs,
-            None,
-        )?; // cov:ignore: canonical stream-dictionary emission only errors for an invalid source graph.
+        crate::writer::output::with_buffer_sink(bytes, |out| {
+            emitter.write_handle_stream_dict_with_ref_map(
+                out,
+                new_ref,
+                None,
+                &dict,
+                crate::writer::encrypted_strings::StreamDictOptions::new(
+                    false,
+                    dictionary_options,
+                    true,
+                ),
+                &map,
+                removed_refs,
+                None,
+            )
+        })?; // cov:ignore: canonical stream-dictionary emission only errors for an invalid source graph.
     } else {
-        dict.write_stream_body_with_ref_map_and_removed_with_options(
-            bytes,
-            dictionary_options,
-            &map,
-            removed_refs,
-        )?; // cov:ignore: the unencrypted linearized route normally uses the shared string emitter; this direct owner call is validated by the compact writer tests
+        crate::writer::output::with_buffer_sink(bytes, |out| {
+            dict.write_stream_body_with_ref_map_and_removed_with_options(
+                out,
+                dictionary_options,
+                &map,
+                removed_refs,
+            )
+        })?; // cov:ignore: the unencrypted linearized route normally uses the shared string emitter; this direct owner call is validated by the compact writer tests
     }
 
     if let Some(ctx) = payload_ctx.filter(|_| !cleartext_metadata) {
@@ -624,11 +646,13 @@ fn append_body_object(
             None,
         )?; // cov:ignore: stream payload encryption is a validated in-memory writer boundary.
     } else {
-        crate::writer::serialize::write_stream_payload(
-            bytes,
-            &data,
-            options.newline_before_endstream,
-        );
+        crate::writer::output::with_buffer_sink(bytes, |out| {
+            crate::writer::serialize::write_stream_payload(
+                out,
+                &data,
+                options.newline_before_endstream,
+            )
+        })?;
     }
     bytes.extend_from_slice(b"\nendobj\n");
     Ok(offset)
@@ -820,10 +844,10 @@ fn write_part1_xref_and_trailer(
     // trailing pad already separates the value, exactly as qpdf writes it.
     bytes.extend_from_slice(b"/ID ");
     let id_value = source_trailer.try_get_key(b"/ID")?;
-    match id_writer {
-        Some(write_id) => write_id(bytes),
-        None => id_value.write_id_value_with_ref_map(bytes, map, removed_refs)?,
-    }
+    crate::writer::output::with_buffer_sink(bytes, |out| match id_writer {
+        Some(write_id) => write_id(out),
+        None => id_value.write_id_value_with_ref_map(out, map, removed_refs),
+    })?;
 
     // /Encrypt — reference to the `/Encrypt` dictionary object, written right
     // after `/ID` (qpdf `writeTrailer` writes `/ID` first, then — for every
@@ -973,10 +997,10 @@ fn write_main_xref_and_trailer(
     // trailing `startxref` advertises the identifier.
     bytes.extend_from_slice(b"/ID ");
     let id_value = source_trailer.try_get_key(b"/ID")?;
-    match id_writer {
-        Some(write_id) => write_id(bytes),
-        None => id_value.write_id_value_with_ref_map(bytes, map, removed_refs)?,
-    }
+    crate::writer::output::with_buffer_sink(bytes, |out| match id_writer {
+        Some(write_id) => write_id(out),
+        None => id_value.write_id_value_with_ref_map(out, map, removed_refs),
+    })?;
     bytes.extend_from_slice(b" ");
     bytes.extend_from_slice(b">>");
     bytes.extend_from_slice(format!("\nstartxref\n{}\n%%EOF\n", first_page_xref_offset).as_bytes());
@@ -1087,7 +1111,9 @@ fn canonical_linearization_trailer_entries(
             let mapped = map(object_ref)?;
             value_bytes.extend_from_slice(mapped.to_string().as_bytes());
         } else {
-            value.write_object_with_ref_map_and_removed(&mut value_bytes, map, removed_refs)?;
+            crate::writer::output::with_buffer_sink(&mut value_bytes, |out| {
+                value.write_object_with_ref_map_and_removed(out, map, removed_refs)
+            })?;
         }
         serialized.push((key, value_bytes));
     }
@@ -1827,12 +1853,14 @@ fn append_hint_stream_object(
             Some(hint_stream_aes_iv),
         )?;
     } else {
-        crate::writer::serialize::write_stream_payload_with_qdf(
-            bytes,
-            payload,
-            NewlineBeforeEndstream::Never,
-            true,
-        );
+        crate::writer::output::with_buffer_sink(bytes, |out| {
+            crate::writer::serialize::write_stream_payload_with_qdf(
+                out,
+                payload,
+                NewlineBeforeEndstream::Never,
+                true,
+            )
+        })?;
     }
     bytes.extend_from_slice(b"\nendobj\n");
     Ok(offset)
@@ -2372,10 +2400,12 @@ fn do_write_pass<R: Read + Seek>(
             )
             .as_bytes(),
         );
-        crate::writer::encrypted_strings::write_encryption_dictionary_handle(
-            &mut bytes,
-            &ctx.encrypt_dict,
-        )?; // cov:ignore: LLVM maps this covered encrypted-dictionary continuation to cleanup
+        crate::writer::output::with_buffer_sink(&mut bytes, |out| {
+            crate::writer::encrypted_strings::write_encryption_dictionary_handle(
+                out,
+                &ctx.encrypt_dict,
+            )
+        })?; // cov:ignore: LLVM maps this covered encrypted-dictionary continuation to cleanup
         bytes.extend_from_slice(b"\nendobj\n");
         xref_offsets.insert(ctx.encrypt_ref.number, offset);
     }
@@ -4119,8 +4149,10 @@ fn write_linearized_impl<R: Read + Seek>(
             // (the permanent id0 is now an owned `Vec`, not `Copy`).
             let id0 = id0.clone();
             let id1 = *id1;
-            det_id_closure = move |out: &mut Vec<u8>| {
-                crate::writer::write_deterministic_id_array(out, &id0, &id1)
+            det_id_closure = move |out: &mut crate::writer::output::OutputSink<'_>| {
+                let mut id_bytes = Vec::new();
+                crate::writer::write_deterministic_id_array(&mut id_bytes, &id0, &id1);
+                out.write_bytes(&id_bytes)
             };
             Some(&mut det_id_closure)
         }

@@ -182,50 +182,58 @@ fn append_xref_stream_and_trailer(
                 .map(|(id0, id1)| (id0.as_slice(), id1.as_slice()));
             let dictionary = xref_stream::XrefStreamDict { id, ..dictionary };
             if trailer.qdf {
-                xref_stream::write_xref_stream(
-                    bytes,
-                    xref_ref,
-                    &dictionary,
-                    &stream_layout,
-                    true,
-                    None,
-                );
+                crate::writer::output::with_buffer_sink(bytes, |out| {
+                    xref_stream::write_xref_stream(
+                        out,
+                        xref_ref,
+                        &dictionary,
+                        &stream_layout,
+                        true,
+                        None,
+                    )
+                })?;
             } else {
-                xref_stream::write_xref_stream(
-                    bytes,
-                    xref_ref,
-                    &dictionary,
-                    &stream_layout,
-                    false,
-                    None,
-                );
+                crate::writer::output::with_buffer_sink(bytes, |out| {
+                    xref_stream::write_xref_stream(
+                        out,
+                        xref_ref,
+                        &dictionary,
+                        &stream_layout,
+                        false,
+                        None,
+                    )
+                })?;
             }
         }
         IdPlan::Deterministic {
             source_id0,
             info_suffix,
         } => {
-            let mut id_writer = |out: &mut Vec<u8>| {
+            let mut id_writer = |out: &mut crate::writer::output::OutputSink<'_>| {
                 write_deterministic_id_inline(out, info_suffix, source_id0.as_deref())
             };
             if trailer.qdf {
-                xref_stream::write_xref_stream(
-                    bytes,
-                    xref_ref,
-                    &dictionary,
-                    &stream_layout,
-                    true,
-                    Some(&mut id_writer),
-                );
+                crate::writer::output::with_digested_buffer_sink(bytes, |out| {
+                    xref_stream::write_xref_stream(
+                        out,
+                        xref_ref,
+                        &dictionary,
+                        &stream_layout,
+                        true,
+                        Some(&mut id_writer),
+                    )
+                })?;
             } else {
-                xref_stream::write_xref_stream(
-                    bytes,
-                    xref_ref,
-                    &dictionary,
-                    &stream_layout,
-                    false,
-                    Some(&mut id_writer),
-                );
+                crate::writer::output::with_digested_buffer_sink(bytes, |out| {
+                    xref_stream::write_xref_stream(
+                        out,
+                        xref_ref,
+                        &dictionary,
+                        &stream_layout,
+                        false,
+                        Some(&mut id_writer),
+                    )
+                })?;
             }
         }
     }
@@ -288,29 +296,12 @@ fn append_classic_xref_and_trailer_with_handle(
             source_id0,
             info_suffix,
         } => {
-            let mut id_writer = |out: &mut Vec<u8>| {
+            let mut id_writer = |out: &mut crate::writer::output::OutputSink<'_>| {
                 write_deterministic_id_inline(out, info_suffix, source_id0.as_deref())
             };
-            if let Some(direct_root) = trailer.direct_root.as_deref() {
-                // cov:ignore-start: the direct-root trailer call is exercised by the specialized direct-root test; LLVM has no line counters for its multiline argument setup.
-                crate::writer::object::write_trailer_with_ref_map_and_kind_and_direct_root(
-                    trailer_handle,
-                    bytes,
-                    TrailerKind::Normal {
-                        size: i64::from(size),
-                    },
-                    false,
-                    trailer.qdf,
-                    Some(&mut id_writer),
-                    &map,
-                    removed_refs,
-                    true,
-                    direct_root,
-                )?;
-                // cov:ignore-end
-            } else {
+            crate::writer::output::with_digested_buffer_sink(bytes, |out| {
                 trailer_handle.write_trailer_with_ref_map_and_kind(
-                    bytes,
+                    out,
                     TrailerKind::Normal {
                         size: i64::from(size),
                     },
@@ -320,28 +311,13 @@ fn append_classic_xref_and_trailer_with_handle(
                     &map,
                     removed_refs,
                     true,
-                )?; // cov:ignore: deterministic ID writer call is covered; LLVM maps this multiline terminator to the call setup
-            }
+                )
+            })?; // cov:ignore: deterministic ID writer call is covered; LLVM maps this multiline terminator to the call setup
         }
         IdPlan::Materialized { .. } => {
-            if let Some(direct_root) = trailer.direct_root.as_deref() {
-                crate::writer::object::write_trailer_with_ref_map_and_kind_and_direct_root(
-                    trailer_handle,
-                    bytes,
-                    TrailerKind::Normal {
-                        size: i64::from(size),
-                    },
-                    false,
-                    trailer.qdf,
-                    None,
-                    &map,
-                    removed_refs,
-                    true,
-                    direct_root,
-                )?; // cov:ignore: direct-root trailer serializer is covered by the specialized direct-root test.
-            } else {
+            crate::writer::output::with_buffer_sink(bytes, |out| {
                 trailer_handle.write_trailer_with_ref_map_and_kind(
-                    bytes,
+                    out,
                     TrailerKind::Normal {
                         size: i64::from(size),
                     },
@@ -351,8 +327,8 @@ fn append_classic_xref_and_trailer_with_handle(
                     &map,
                     removed_refs,
                     true,
-                )?; // cov:ignore: materialized ID writer call is covered; LLVM maps this multiline terminator to the call setup
-            }
+                )
+            })?; // cov:ignore: materialized ID writer call is covered; LLVM maps this multiline terminator to the call setup
         }
     }
     if trailer.qdf {
@@ -437,7 +413,7 @@ fn append_classic_xref_and_trailer(
     let _ = write_xref_table(bytes, 0, size - 1, &entries, false, 0, 0, 0)?;
 
     bytes.extend_from_slice(b"trailer ");
-    write_canonical_classic_trailer(bytes, trailer, size, &trailer.canonical_entries);
+    write_canonical_classic_trailer(bytes, trailer, size, &trailer.canonical_entries)?;
     bytes.extend_from_slice(format!("\nstartxref\n{xref_offset}\n%%EOF\n").as_bytes());
     written_xref_table(layout, size)
 }
@@ -510,7 +486,7 @@ fn write_canonical_classic_trailer(
     trailer: &TrailerPlan,
     size: u32,
     canonical: &[(Vec<u8>, Vec<u8>)],
-) {
+) -> crate::Result<()> {
     let mut entries = canonical.to_vec();
     if let Some(root) = trailer.root {
         entries.push((
@@ -547,7 +523,9 @@ fn write_canonical_classic_trailer(
     } = &trailer.id
     {
         bytes.extend_from_slice(b" /ID ");
-        write_deterministic_id_inline(bytes, info_suffix, source_id0.as_deref());
+        crate::writer::output::with_digested_buffer_sink(bytes, |out| {
+            write_deterministic_id_inline(out, info_suffix, source_id0.as_deref())
+        })?;
     }
 
     if let Some(encrypt) = trailer.encrypt {
@@ -555,6 +533,7 @@ fn write_canonical_classic_trailer(
         bytes.extend_from_slice(format!("{} {} R", encrypt.number, encrypt.generation).as_bytes());
     }
     bytes.extend_from_slice(b" >>");
+    Ok(())
 }
 
 /// Emit a qpdf dictionary key without changing its first byte.

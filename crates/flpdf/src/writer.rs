@@ -3068,19 +3068,23 @@ pub(crate) fn compute_deterministic_id(
 /// real `/ID`. The emitted bytes are identical to
 /// [`write_deterministic_id_array`] for the same computed id.
 pub(crate) fn write_deterministic_id_inline(
-    out: &mut Vec<u8>,
+    out: &mut OutputSink<'_>,
     info_suffix: &[u8],
     source_id0: Option<&[u8]>,
-) {
-    out.push(b'[');
-    let id_array_offset = out.len() - 1; // index of the just-pushed `[`
-    let (id0, id1) = compute_deterministic_id(out, id_array_offset, info_suffix, source_id0);
-    for id in [id0.as_slice(), &id1[..]] {
-        out.push(b'<');
-        push_hex_lower(out, id);
-        out.push(b'>');
-    }
-    out.push(b']');
+) -> Result<()> {
+    use md5::Digest as _;
+
+    out.write_bytes(b"[")?;
+    out.suspend_digest();
+    let output_digest = out.take_digest()?;
+    let seed = output::deterministic_id_second_seed(&output_digest, info_suffix)?;
+    let id1: [u8; 16] = md5::Md5::digest(&seed).into();
+    let id0 = source_id0
+        .map(<[u8]>::to_vec)
+        .unwrap_or_else(|| id1.to_vec());
+    let mut id_array = Vec::with_capacity(deterministic_id_array_len(id0.len()));
+    write_deterministic_id_array(&mut id_array, &id0, &id1);
+    out.write_bytes(&id_array[1..])
 }
 
 /// Apply writer-owned trailer values without converting the live trailer back
@@ -3485,11 +3489,302 @@ fn emit_canonical_pdf_with_special_streams<R: Read + Seek, W: Write>(
     special_streams: Option<&SpecialStreams>,
     setup: WriterSetupState,
 ) -> Result<WriterResult> {
-    // Every standard writer consumer now owns ADBE reconciliation at its root
-    // emission boundary. The legacy coordinator is retained for routes whose
-    // queue/ObjStm implementation is not yet migrated, but it must consume the
-    // same output-only root copy rather than mutating the live Catalog here.
-    emit_canonical_pdf_inner(pdf, out, options, special_streams, setup)
+    // The plain route now reconciles ADBE on the root's output-only shallow
+    // copy. It therefore needs no Catalog snapshot/restore; specialized routes
+    // still retain that boundary until their own root consumers migrate.
+    if plain::eligible(
+        pdf.is_encrypted(),
+        options,
+        effective_object_stream_mode(options),
+    ) {
+        return emit_canonical_pdf_inner(pdf, out, options, special_streams, setup);
+    }
+
+    // Reuse the qpdf-shaped snapshot boundary so resolving the Catalog cannot
+    // turn a logger/read failure into an absent snapshot. QPDFWriter constructs
+    // its Members with `pdf.getRoot()` before writing and propagates that
+    // failure; the Rust snapshot must preserve the same error category.
+    let catalog_snapshot = snapshot_catalog_extensions(pdf)?;
+    let direct_catalog_snapshot = if catalog_snapshot.is_none() {
+        let root = pdf.root_handle()?;
+        let extensions = root
+            .try_as_dictionary()?
+            .and_then(|entries| entries.get(b"/Extensions".as_slice()).cloned());
+        Some((root, extensions))
+    } else {
+        None
+    };
+    let result = emit_canonical_pdf_inner(pdf, out, options, special_streams, setup);
+    if let Some(snapshot) = catalog_snapshot {
+        restore_catalog_extensions(pdf, Some(snapshot))?;
+    }
+    if let Some((root, original_extensions)) = direct_catalog_snapshot {
+        let current_extensions = root
+            .try_as_dictionary()?
+            .and_then(|entries| entries.get(b"/Extensions".as_slice()).cloned());
+        let changed = match (&original_extensions, &current_extensions) {
+            (None, None) => false,
+            (Some(before), Some(after)) => !before.is_same_object_as(after),
+            _ => true,
+        };
+        if changed {
+            match original_extensions {
+                Some(extensions) => root.restore_key_raw(b"/Extensions", extensions)?,
+                None => root.remove_key(b"/Extensions"),
+            }
+        }
+    }
+    result
+}
+
+fn write_pclm<R: Read + Seek, W: Write>(
+    pdf: &mut Pdf<R>,
+    mut out: W,
+    options: &WriterOptions,
+) -> Result<WriterResult> {
+    let deterministic_id = uses_deterministic_id(options);
+
+    let plan = pclm::Plan::build(pdf)?;
+    let version = effective_pdf_version(pdf.version(), options, false, false);
+    let mut bytes = Vec::new();
+    bytes.extend_from_slice(format!("%PDF-{version}\n%PCLm 1.0\n").as_bytes());
+    bytes.extend_from_slice(options.extra_header_text.as_bytes());
+    if !options.extra_header_text.is_empty() && !options.extra_header_text.ends_with('\n') {
+        bytes.push(b'\n');
+    }
+
+    let mut offsets = BTreeMap::<u32, (u16, usize)>::new();
+    let mut emitted_old_to_new = BTreeMap::<ObjectRef, ObjectRef>::new();
+    let removed: BTreeSet<_> = BTreeSet::new();
+
+    for item in &plan.items {
+        match *item {
+            pclm::Item::Source { source, output } => {
+                let source_handle = pdf.get_object_handle(source);
+                source_handle.try_dereference()?;
+                let offset = bytes.len();
+                bytes.extend_from_slice(format!("{} 0 obj\n", output.number).as_bytes());
+                let map = |object_ref| {
+                    plan.old_to_new.get(&object_ref).copied().ok_or_else(|| {
+                        // cov:ignore-start: Plan::build collects every live reference before
+                        // this emission loop, so a valid PCLm item cannot miss this map entry.
+                        crate::Error::Unsupported(format!(
+                            "PCLm reference {object_ref} absent from renumber map"
+                        ))
+                        // cov:ignore-end
+                    }) // cov:ignore: the canonical PCLm plan queues every reference before emission; LLVM maps this closure terminator to the unreachable error arm.
+                };
+                if source_handle.as_stream_dict().is_some() {
+                    let data = source_handle.get_raw_stream_data()?;
+                    output::with_buffer_sink(&mut bytes, |out| {
+                        source_handle
+                            .write_stream_body_with_ref_map_and_removed_and_length_with_options(
+                                out,
+                                StreamDictionaryOptions::preserve(),
+                                &map,
+                                &removed,
+                                data.len(),
+                            )?;
+                        serialize::write_stream_payload(
+                            out,
+                            data.as_ref(),
+                            options.newline_before_endstream,
+                        )
+                    })?; // cov:ignore: PCLm stream emission is covered by the filtered and recovered-stream fixtures; LLVM attributes this continuation to cleanup-only code.
+                } else {
+                    output::with_buffer_sink(&mut bytes, |out| {
+                        source_handle.write_object_with_ref_map_and_removed(out, &map, &removed)
+                    })?;
+                }
+                bytes.extend_from_slice(b"\nendobj\n");
+                offsets.insert(output.number, (0, offset));
+                emitted_old_to_new.insert(source, output);
+            }
+            pclm::Item::Synthetic { output } => {
+                let payload = b"q /image Do Q\n".to_vec();
+                let stream = ObjectHandle::stream(
+                    ObjectHandle::dictionary(vec![(
+                        b"Length".to_vec(),
+                        ObjectHandle::integer(payload.len() as i64),
+                    )]),
+                    Rc::new(payload),
+                );
+                let offset = bytes.len();
+                bytes.extend_from_slice(format!("{} 0 obj\n", output.number).as_bytes());
+                write_stream_to_buf(&mut bytes, &stream, options.newline_before_endstream)?;
+                bytes.extend_from_slice(b"\nendobj\n");
+                offsets.insert(output.number, (0, offset));
+            }
+        }
+        report_progress_event(options)?;
+    }
+
+    let max_object_number = offsets.keys().next_back().copied().unwrap_or(0);
+    // cov:ignore-start: PCLm assigns contiguous u32 output numbers and supported
+    // targets can represent the resulting object count in usize.
+    let object_count = usize::try_from(max_object_number)
+        .ok()
+        .and_then(|number| number.checked_add(1))
+        .ok_or_else(|| {
+            crate::Error::Unsupported("PCLm object count does not fit in usize".to_string())
+        })?;
+    // cov:ignore-end
+    let mut written_xref = BTreeMap::<ObjectRef, XrefEntry>::new();
+    let xref_offset = bytes.len();
+    bytes.extend_from_slice(format!("xref\n0 {object_count}\n").as_bytes());
+    bytes.extend_from_slice(b"0000000000 65535 f \n");
+    for number in 1..object_count {
+        match offsets.get(&(number as u32)) {
+            Some((generation, offset)) => {
+                bytes.extend_from_slice(format!("{offset:010} {generation:05} n \n").as_bytes());
+                written_xref.insert(
+                    ObjectRef::new(number as u32, 0),
+                    XrefEntry::Uncompressed {
+                        // cov:ignore-start: offsets originate in Vec::len and usize fits u64
+                        // on every supported target.
+                        offset: u64::try_from(*offset).map_err(|_| {
+                            crate::Error::Unsupported("PCLm xref offset does not fit u64".into())
+                        })?,
+                        // cov:ignore-end
+                    },
+                );
+            }
+            None => bytes.extend_from_slice(b"0000000000 65535 f \n"), // cov:ignore: every PCLm item receives the next contiguous output number
+        }
+    }
+
+    // qpdf's PCLm queue does not enqueue other trailer values before the body
+    // queue is written (`QPDFWriter.cc:2928-2954`). When writeTrailer later
+    // unparses one of those indirect values, unparseChild calls enqueueObject,
+    // which assigns a number after the xref size has already been fixed. Keep
+    // that observable late-numbering behavior local to PCLm trailer emission:
+    // the value is remapped, but no body or xref entry is added for it.
+    let late_trailer_refs = RefCell::new(HashMap::<ObjectRef, ObjectRef>::new());
+    // cov:ignore-start: PCLm output numbers originate in a u32 queue, so an object count that does not fit u32 is not constructible on supported targets.
+    let next_late_trailer_number = Cell::new(u32::try_from(object_count).map_err(|_| {
+        crate::Error::Unsupported("PCLm trailer object number does not fit in u32".to_string())
+    })?);
+    // cov:ignore-end
+    let trailer_map = |object_ref: ObjectRef| {
+        if let Some(output) = plan.old_to_new.get(&object_ref).copied() {
+            return Ok(output);
+        }
+        if let Some(output) = late_trailer_refs.borrow().get(&object_ref).copied() {
+            return Ok(output);
+        }
+        let output_number = next_late_trailer_number.get();
+        // cov:ignore-start: reaching the next-number overflow requires a u32::MAX-sized emitted object queue.
+        let next_number = output_number.checked_add(1).ok_or_else(|| {
+            crate::Error::Unsupported("PCLm trailer object number overflow".to_string())
+        })?;
+        // cov:ignore-end
+        let output = ObjectRef::new(output_number, 0);
+        late_trailer_refs.borrow_mut().insert(object_ref, output);
+        next_late_trailer_number.set(next_number);
+        Ok(output)
+    };
+
+    match plan.root {
+        None => {
+            let root = plan.direct_root.as_ref().ok_or_else(|| {
+                // cov:ignore-start: Plan::build guarantees a direct Catalog
+                // handle whenever its root identity is absent.
+                crate::Error::Unsupported("PCLm Catalog root is inconsistent".into())
+                // cov:ignore-end
+            })?; // cov:ignore: Plan::build guarantees the direct Catalog handle before PCLm emission; LLVM places this continuation counter on the closure exit.
+            let id_handle = pdf.trailer_key_handle(b"ID");
+            let source_id0 = source_permanent_id_value_handle(&id_handle);
+            let generated_id = (!deterministic_id)
+                .then(|| generate_id_handle(source_id0.as_deref(), options.static_id));
+            let trailer = build_writer_trailer_handle(
+                pdf,
+                object_count,
+                None,
+                Some(root),
+                options,
+                None,
+                deterministic_id,
+                generated_id.as_ref(),
+            )?; // cov:ignore: validated writer trailer construction; LLVM maps this continuation to the call setup.
+            if deterministic_id {
+                let info_suffix = deterministic_id_info_suffix(pdf);
+                let mut id_writer = |out: &mut OutputSink<'_>| {
+                    write_deterministic_id_inline(out, &info_suffix, source_id0.as_deref())
+                };
+                output::with_digested_buffer_sink(&mut bytes, |out| {
+                    trailer.write_trailer_with_ref_map(
+                        out,
+                        false,
+                        false,
+                        Some(&mut id_writer),
+                        &trailer_map,
+                        &removed,
+                        true,
+                    )
+                })?; // cov:ignore: deterministic direct-root trailer emission is exercised; LLVM maps this continuation to the call setup.
+            } else {
+                output::with_buffer_sink(&mut bytes, |out| {
+                    trailer.write_trailer_with_ref_map(
+                        out,
+                        false,
+                        false,
+                        None,
+                        &trailer_map,
+                        &removed,
+                        true,
+                    )
+                })?; // cov:ignore: non-deterministic direct-root trailer emission is exercised; LLVM maps this continuation to the call setup.
+            }
+        }
+        Some(root) => {
+            let id_handle = pdf.trailer_key_handle(b"ID");
+            let source_id0 = source_permanent_id_value_handle(&id_handle);
+            let generated_id = (!deterministic_id)
+                .then(|| generate_id_handle(source_id0.as_deref(), options.static_id));
+            let trailer = build_writer_trailer_handle(
+                pdf,
+                object_count,
+                Some(root),
+                None,
+                options,
+                None,
+                deterministic_id,
+                generated_id.as_ref(),
+            )?; // cov:ignore: validated writer trailer construction; LLVM maps this continuation to the call setup
+            if deterministic_id {
+                let info_suffix = deterministic_id_info_suffix(pdf);
+                let mut id_writer = |out: &mut OutputSink<'_>| {
+                    write_deterministic_id_inline(out, &info_suffix, source_id0.as_deref())
+                };
+                output::with_digested_buffer_sink(&mut bytes, |out| {
+                    trailer.write_trailer_with_ref_map(
+                        out,
+                        false,
+                        false,
+                        Some(&mut id_writer),
+                        &trailer_map,
+                        &removed,
+                        true,
+                    )
+                })?; // cov:ignore: validated deterministic PCLm trailer emission; LLVM maps this continuation to the call setup
+            } else {
+                output::with_buffer_sink(&mut bytes, |out| {
+                    trailer.write_trailer_with_ref_map(
+                        out,
+                        false,
+                        false,
+                        None,
+                        &trailer_map,
+                        &removed,
+                        true,
+                    )
+                })?; // cov:ignore: validated PCLm trailer emission; LLVM maps this continuation to the call setup
+            }
+        }
+    }
+    bytes.extend_from_slice(format!("\nstartxref\n{xref_offset}\n%%EOF\n").as_bytes());
+    out.write_all(&bytes)?;
+    Ok(WriterResult::new(emitted_old_to_new, written_xref))
 }
 
 fn emit_canonical_pdf_inner<R: Read + Seek, W: Write>(
@@ -4557,23 +4852,27 @@ fn emit_canonical_pdf_inner<R: Read + Seek, W: Write>(
 
         if content_container {
             if let Some(emitter) = encrypted_strings.as_mut() {
-                emitter.write_handle_content_container_with_ref_map(
-                    &mut bytes,
-                    emit_ref,
-                    None,
-                    &object_handle,
-                    options,
-                    &map,
-                    &removed_refs,
-                )?; // cov:ignore: LLVM does not attribute the successful encrypted emitter continuation
+                output::with_buffer_sink(&mut bytes, |out| {
+                    emitter.write_handle_content_container_with_ref_map(
+                        out,
+                        emit_ref,
+                        None,
+                        &object_handle,
+                        options,
+                        &map,
+                        &removed_refs,
+                    )
+                })?; // cov:ignore: LLVM does not attribute the successful encrypted emitter continuation
             } else {
-                plain::body::emit_content_container_from_handle_with_ref_map(
-                    &object_handle,
-                    options,
-                    &mut bytes,
-                    &map,
-                    &removed_refs,
-                )?; // cov:ignore: LLVM does not attribute the successful plain emitter continuation
+                output::with_buffer_sink(&mut bytes, |out| {
+                    plain::body::emit_content_container_from_handle_with_ref_map(
+                        &object_handle,
+                        options,
+                        out,
+                        &map,
+                        &removed_refs,
+                    )
+                })?; // cov:ignore: LLVM does not attribute the successful plain emitter continuation
             }
         } else if is_stream {
             // This is the qpdf stream writer's live-handle path: filtering and
@@ -4639,33 +4938,39 @@ fn emit_canonical_pdf_inner<R: Read + Seek, W: Write>(
                 encrypt_stream,
             );
             if let Some(emitter) = encrypted_strings.as_mut() {
-                emitter.write_handle_stream_dict_with_ref_map(
-                    &mut bytes,
-                    emit_ref,
-                    None,
-                    &stream_dict,
-                    stream_options,
-                    &map,
-                    &removed_refs,
-                    holder_ref,
-                )?; // cov:ignore: handle-native stream dictionary route; LLVM maps the call continuation here
-            } else if options.qdf {
-                stream_dict
-                    .write_stream_body_qdf_with_ref_map_and_removed_and_length_with_options(
-                        &mut bytes,
-                        0,
+                output::with_buffer_sink(&mut bytes, |out| {
+                    emitter.write_handle_stream_dict_with_ref_map(
+                        out,
+                        emit_ref,
+                        None,
+                        &stream_dict,
+                        stream_options,
                         &map,
                         &removed_refs,
                         holder_ref,
-                        dictionary_options,
-                    )?; // cov:ignore: handle-native QDF stream dictionary route; LLVM maps the call continuation here
+                    )
+                })?; // cov:ignore: handle-native stream dictionary route; LLVM maps the call continuation here
+            } else if options.qdf {
+                output::with_buffer_sink(&mut bytes, |out| {
+                    stream_dict
+                        .write_stream_body_qdf_with_ref_map_and_removed_and_length_with_options(
+                            out,
+                            0,
+                            &map,
+                            &removed_refs,
+                            holder_ref,
+                            dictionary_options,
+                        )
+                })?; // cov:ignore: handle-native QDF stream dictionary route; LLVM maps the call continuation here
             } else {
-                stream_dict.write_stream_body_with_ref_map_and_removed_with_options(
-                    &mut bytes,
-                    dictionary_options,
-                    &map,
-                    &removed_refs,
-                )?; // cov:ignore: handle-native stream dictionary route; LLVM maps the call continuation here
+                output::with_buffer_sink(&mut bytes, |out| {
+                    stream_dict.write_stream_body_with_ref_map_and_removed_with_options(
+                        out,
+                        dictionary_options,
+                        &map,
+                        &removed_refs,
+                    )
+                })?; // cov:ignore: handle-native stream dictionary route; LLVM maps the call continuation here
             }
 
             let added_newline = if let Some(ctx) = stream_encryption {
@@ -4680,12 +4985,14 @@ fn emit_canonical_pdf_inner<R: Read + Seek, W: Write>(
                     None,
                 )? // cov:ignore: encrypted stream payload route; LLVM maps the call continuation here
             } else {
-                serialize::write_stream_payload_with_qdf(
-                    &mut bytes,
-                    &stream_data,
-                    options.newline_before_endstream,
-                    options.qdf,
-                );
+                output::with_buffer_sink(&mut bytes, |out| {
+                    serialize::write_stream_payload_with_qdf(
+                        out,
+                        &stream_data,
+                        options.newline_before_endstream,
+                        options.qdf,
+                    )
+                })?;
                 serialize::framing_adds_newline_with_qdf(
                     &stream_data,
                     options.newline_before_endstream,
@@ -4709,34 +5016,31 @@ fn emit_canonical_pdf_inner<R: Read + Seek, W: Write>(
             } else {
                 None
             };
-            let object_to_write = root_output.as_ref().unwrap_or(&object_handle);
             if let Some(emitter) = encrypted_strings.as_mut() {
-                emitter.write_handle_object_with_ref_map(
-                    &mut bytes,
-                    emit_ref,
-                    None,
-                    object_to_write,
-                    options.qdf,
-                    &map,
-                    &removed_refs,
-                )?; // cov:ignore: encrypted handle-object route; LLVM maps the call continuation here
-                    // cov:ignore-start: legacy QDF root/member serializer is exercised
-                    // by the QDF alias and parity tests; LLVM attributes its multiline
-                    // call entry separately.
+                output::with_buffer_sink(&mut bytes, |out| {
+                    emitter.write_handle_object_with_ref_map(
+                        out,
+                        emit_ref,
+                        None,
+                        &object_handle,
+                        options.qdf,
+                        &map,
+                        &removed_refs,
+                    )
+                })?; // cov:ignore: encrypted handle-object route; LLVM maps the call continuation here
             } else if options.qdf {
-                object_to_write.write_object_qdf_with_ref_map_and_removed(
-                    &mut bytes,
-                    0,
-                    &map,
-                    &removed_refs,
-                )?; // cov:ignore: QDF handle-object route; LLVM maps the call continuation here
-                    // cov:ignore-end
+                output::with_buffer_sink(&mut bytes, |out| {
+                    object_handle.write_object_qdf_with_ref_map_and_removed(
+                        out,
+                        0,
+                        &map,
+                        &removed_refs,
+                    )
+                })?; // cov:ignore: QDF handle-object route; LLVM maps the call continuation here
             } else {
-                object_to_write.write_object_with_ref_map_and_removed(
-                    &mut bytes,
-                    &map,
-                    &removed_refs,
-                )?; // cov:ignore: compact handle-object route; LLVM maps the call continuation here
+                output::with_buffer_sink(&mut bytes, |out| {
+                    object_handle.write_object_with_ref_map_and_removed(out, &map, &removed_refs)
+                })?; // cov:ignore: compact handle-object route; LLVM maps the call continuation here
             }
         }
 
@@ -4872,37 +5176,21 @@ fn emit_canonical_pdf_inner<R: Read + Seek, W: Write>(
                 qdf_marker_starts.push(marker_start);
                 qdf_marker_lengths.push(out.len() - marker_start);
             }
-            let is_root = root_ref == handle.object_ref();
-            if is_root {
-                // Keep the callback before Root reconciliation, matching the
-                // writeObject -> unparseObject order used by qpdf.
-                report_progress_event(options)?;
-            }
-            let object_to_write = if is_root {
-                // A generated/preserved ObjStm may contain the Catalog. qpdf
-                // still applies the root-only output copy from inside
-                // `unparseObject`, after the object has been planned and
-                // assigned its output number.
-                handle.output_root_copy_with_adbe(&version, final_extension_level, true)?
-            } else {
-                handle.clone()
-            };
-            let result = if options.qdf {
-                if let Some(original) = object_to_write.object_ref() {
+            if options.qdf {
+                if let Some(original) = handle.object_ref() {
                     if let Some(&seq) = page_seq.get(&original) {
                         out.extend_from_slice(format!("%% Page {seq}\n").as_bytes());
                     }
                 } // cov:ignore: every ObjStm member has a source ObjectRef
-                object_to_write.write_object_qdf_with_ref_map_and_removed(
-                    out,
-                    0,
-                    &map,
-                    &removed_refs,
-                )
-            } else {
-                object_to_write.write_object_with_ref_map_and_removed(out, &map, &removed_refs)
-            }; // cov:ignore: llvm-cov maps the successful callback branch closing here
-            if !is_root && result.is_ok() {
+            }
+            let result = output::with_buffer_sink(out, |out| {
+                if options.qdf {
+                    handle.write_object_qdf_with_ref_map_and_removed(out, 0, &map, &removed_refs)
+                } else {
+                    handle.write_object_with_ref_map_and_removed(out, &map, &removed_refs)
+                }
+            }); // cov:ignore: llvm-cov maps the successful callback branch closing here
+            if result.is_ok() {
                 report_progress_event(options)?;
             } // cov:ignore: llvm-cov maps the successful progress branch closing here
             result
@@ -5045,12 +5333,14 @@ fn emit_canonical_pdf_inner<R: Read + Seek, W: Write>(
                 objstm_first,
                 extends,
             );
-            serialize::write_stream_payload_with_qdf(
-                &mut bytes,
-                &stream_data,
-                options.newline_before_endstream,
-                true,
-            );
+            output::with_buffer_sink(&mut bytes, |out| {
+                serialize::write_stream_payload_with_qdf(
+                    out,
+                    &stream_data,
+                    options.newline_before_endstream,
+                    true,
+                )
+            })?;
         } else {
             // qpdf's writeObjectStream emits the container dictionary in the
             // fixed order /Type /Length [/Filter] /N /First
@@ -5064,11 +5354,9 @@ fn emit_canonical_pdf_inner<R: Read + Seek, W: Write>(
                 objstm_first,
                 extends,
             );
-            serialize::write_stream_payload(
-                &mut bytes,
-                &stream_data,
-                options.newline_before_endstream,
-            );
+            output::with_buffer_sink(&mut bytes, |out| {
+                serialize::write_stream_payload(out, &stream_data, options.newline_before_endstream)
+            })?;
         }
         bytes.extend_from_slice(b"\nendobj\n");
         // QDF inter-object blank-line separator. This applies
@@ -5156,7 +5444,9 @@ fn emit_canonical_pdf_inner<R: Read + Seek, W: Write>(
         let emit_offset = bytes.len();
         bytes.extend_from_slice(format!("{} 0 obj\n", ctx.encrypt_ref.number).as_bytes());
         let encrypt_handle = ctx.encrypt_dict_handle();
-        encrypted_strings::write_encryption_dictionary_handle(&mut bytes, &encrypt_handle)?;
+        output::with_buffer_sink(&mut bytes, |out| {
+            encrypted_strings::write_encryption_dictionary_handle(out, &encrypt_handle)
+        })?;
         bytes.extend_from_slice(b"\nendobj\n");
         if options.qdf {
             bytes.push(b'\n');
@@ -5266,33 +5556,37 @@ fn emit_canonical_pdf_inner<R: Read + Seek, W: Write>(
                 // dict serializer. Closing ">>" then startxref directly (no
                 // extra leading newline) to match the qpdf reference.
                 if deterministic_id {
-                    let mut id_writer = |out: &mut Vec<u8>| {
+                    let mut id_writer = |out: &mut OutputSink<'_>| {
                         write_deterministic_id_inline(
                             out,
                             &det_id_info_suffix,
                             det_id_source_id0.as_deref(),
                         )
                     };
-                    trailer.write_trailer_with_ref_map(
-                        &mut bytes,
-                        false,
-                        true,
-                        Some(&mut id_writer),
-                        &trailer_map,
-                        &skip_ref_set,
-                        suppress_null_values,
-                    )?;
+                    output::with_digested_buffer_sink(&mut bytes, |out| {
+                        trailer.write_trailer_with_ref_map(
+                            out,
+                            false,
+                            true,
+                            Some(&mut id_writer),
+                            &trailer_map,
+                            &skip_ref_set,
+                            suppress_null_values,
+                        )
+                    })?;
                 } else {
                     // cov:ignore-start: multiline handle-native trailer call; branch selection is covered by the writer fixtures
-                    trailer.write_trailer_with_ref_map(
-                        &mut bytes,
-                        false,
-                        true,
-                        None,
-                        &trailer_map,
-                        &skip_ref_set,
-                        suppress_null_values,
-                    )?;
+                    output::with_buffer_sink(&mut bytes, |out| {
+                        trailer.write_trailer_with_ref_map(
+                            out,
+                            false,
+                            true,
+                            None,
+                            &trailer_map,
+                            &skip_ref_set,
+                            suppress_null_values,
+                        )
+                    })?;
                     // cov:ignore-end
                 }
                 bytes.extend_from_slice(format!("startxref\n{xref_offset}\n%%EOF\n").as_bytes());
@@ -5302,7 +5596,7 @@ fn emit_canonical_pdf_inner<R: Read + Seek, W: Write>(
                 // forced last — `trailer << /Info .. /Root .. /Size N /ID [..]
                 // >>` (verified against qpdf 11.9.0 static-id goldens).
                 if deterministic_id {
-                    let mut id_writer = |out: &mut Vec<u8>| {
+                    let mut id_writer = |out: &mut OutputSink<'_>| {
                         write_deterministic_id_inline(
                             out,
                             &det_id_info_suffix,
@@ -5310,27 +5604,31 @@ fn emit_canonical_pdf_inner<R: Read + Seek, W: Write>(
                         )
                     };
                     // cov:ignore-start: multiline handle-native trailer call; branch selection is covered by the writer fixtures
-                    trailer.write_trailer_with_ref_map(
-                        &mut bytes,
-                        false,
-                        false,
-                        Some(&mut id_writer),
-                        &trailer_map,
-                        &skip_ref_set,
-                        suppress_null_values,
-                    )?;
+                    output::with_digested_buffer_sink(&mut bytes, |out| {
+                        trailer.write_trailer_with_ref_map(
+                            out,
+                            false,
+                            false,
+                            Some(&mut id_writer),
+                            &trailer_map,
+                            &skip_ref_set,
+                            suppress_null_values,
+                        )
+                    })?;
                     // cov:ignore-end
                 } else {
                     // cov:ignore-start: multiline handle-native trailer call; branch selection is covered by the writer fixtures
-                    trailer.write_trailer_with_ref_map(
-                        &mut bytes,
-                        false,
-                        false,
-                        None,
-                        &trailer_map,
-                        &skip_ref_set,
-                        suppress_null_values,
-                    )?;
+                    output::with_buffer_sink(&mut bytes, |out| {
+                        trailer.write_trailer_with_ref_map(
+                            out,
+                            false,
+                            false,
+                            None,
+                            &trailer_map,
+                            &skip_ref_set,
+                            suppress_null_values,
+                        )
+                    })?;
                     // cov:ignore-end
                 }
                 bytes.extend_from_slice(format!("\nstartxref\n{xref_offset}\n%%EOF\n").as_bytes());
@@ -5401,18 +5699,18 @@ fn emit_canonical_pdf_inner<R: Read + Seek, W: Write>(
                 let root = trailer_handle.try_get_key(b"/Root")?;
                 let mut direct_root = Vec::new();
                 if options.qdf {
-                    root.write_object_qdf_with_ref_map_and_removed(
-                        &mut direct_root,
-                        0,
-                        &trailer_map,
-                        &skip_ref_set,
-                    )?; // cov:ignore: the canonical direct-root serializer is exercised; LLVM maps this call terminator to a zero-count continuation region.
+                    output::with_buffer_sink(&mut direct_root, |out| {
+                        root.write_object_qdf_with_ref_map_and_removed(
+                            out,
+                            0,
+                            &trailer_map,
+                            &skip_ref_set,
+                        )
+                    })?; // cov:ignore: the canonical direct-root serializer is exercised; LLVM maps this call terminator to a zero-count continuation region.
                 } else {
-                    root.write_object_with_ref_map_and_removed(
-                        &mut direct_root,
-                        &trailer_map,
-                        &skip_ref_set,
-                    )?; // cov:ignore: the canonical direct-root serializer is exercised; LLVM maps this call terminator to a zero-count continuation region.
+                    output::with_buffer_sink(&mut direct_root, |out| {
+                        root.write_object_with_ref_map_and_removed(out, &trailer_map, &skip_ref_set)
+                    })?; // cov:ignore: the canonical direct-root serializer is exercised; LLVM maps this call terminator to a zero-count continuation region.
                 }
                 Some(direct_root)
             } else {
@@ -6063,9 +6361,9 @@ mod final_handle_writer_tests {
         let removed = BTreeSet::new();
 
         let mut normal = Vec::new();
-        trailer
-            .write_trailer_with_ref_map_and_kind(
-                &mut normal,
+        output::with_buffer_sink(&mut normal, |out| {
+            trailer.write_trailer_with_ref_map_and_kind(
+                out,
                 TrailerKind::Normal { size: 6 },
                 false,
                 false,
@@ -6074,7 +6372,8 @@ mod final_handle_writer_tests {
                 &removed,
                 true,
             )
-            .expect("normal shared trailer succeeds");
+        })
+        .expect("normal shared trailer succeeds");
         assert_eq!(
             normal,
             format!(
@@ -6085,9 +6384,9 @@ mod final_handle_writer_tests {
         );
 
         let mut qdf = Vec::new();
-        trailer
-            .write_trailer_with_ref_map_and_kind(
-                &mut qdf,
+        output::with_buffer_sink(&mut qdf, |out| {
+            trailer.write_trailer_with_ref_map_and_kind(
+                out,
                 TrailerKind::Normal { size: 6 },
                 false,
                 true,
@@ -6096,7 +6395,8 @@ mod final_handle_writer_tests {
                 &removed,
                 true,
             )
-            .expect("QDF shared trailer succeeds");
+        })
+        .expect("QDF shared trailer succeeds");
         assert_eq!(
             qdf,
             format!(
@@ -6107,9 +6407,9 @@ mod final_handle_writer_tests {
         );
 
         let mut first = Vec::new();
-        trailer
-            .write_trailer_with_ref_map_and_kind(
-                &mut first,
+        output::with_buffer_sink(&mut first, |out| {
+            trailer.write_trailer_with_ref_map_and_kind(
+                out,
                 TrailerKind::LinearizedFirst { size: 6, prev: 123 },
                 false,
                 false,
@@ -6118,7 +6418,8 @@ mod final_handle_writer_tests {
                 &removed,
                 true,
             )
-            .expect("linearized first trailer succeeds");
+        })
+        .expect("linearized first trailer succeeds");
         let first_text = String::from_utf8(first).expect("trailer is UTF-8");
         let prev_start = first_text.find("/Prev ").expect("/Prev is present") + 6;
         assert_eq!(
@@ -6131,9 +6432,9 @@ mod final_handle_writer_tests {
         )));
 
         let mut second = b"<< /Type /XRef".to_vec();
-        trailer
-            .write_trailer_with_ref_map_and_kind(
-                &mut second,
+        output::with_buffer_sink(&mut second, |out| {
+            trailer.write_trailer_with_ref_map_and_kind(
+                out,
                 TrailerKind::LinearizedSecond { size: 6 },
                 true,
                 false,
@@ -6142,7 +6443,8 @@ mod final_handle_writer_tests {
                 &removed,
                 true,
             )
-            .expect("linearized second xref trailer succeeds");
+        })
+        .expect("linearized second xref trailer succeeds");
         assert_eq!(second, b"<< /Type /XRef /Size 6 /ID [<696430><696431>] >>");
     }
 
@@ -6154,11 +6456,11 @@ mod final_handle_writer_tests {
         };
         let removed = BTreeSet::new();
         let mut output = Vec::new();
-        let mut id_writer = |out: &mut Vec<u8>| out.extend_from_slice(b"[<custom>]");
+        let mut id_writer = |out: &mut OutputSink<'_>| out.write_bytes(b"[<custom>]");
 
-        trailer
-            .write_trailer_with_ref_map_and_kind(
-                &mut output,
+        output::with_buffer_sink(&mut output, |out| {
+            trailer.write_trailer_with_ref_map_and_kind(
+                out,
                 TrailerKind::Normal { size: 7 },
                 false,
                 false,
@@ -6167,7 +6469,8 @@ mod final_handle_writer_tests {
                 &removed,
                 true,
             )
-            .expect("writer-owned trailer values survive filtering");
+        })
+        .expect("writer-owned trailer values survive filtering");
         let text = String::from_utf8(output).expect("trailer is UTF-8");
         assert!(!text.contains("/NullEntry"));
         assert!(text.contains(&format!("/Root {} 0 R", root_ref.number)));
@@ -6180,9 +6483,9 @@ mod final_handle_writer_tests {
     #[test]
     fn shared_trailer_contract_rejects_reserved_and_non_dictionary_handles() {
         let reserved = ObjectHandle::new_reserved_direct();
-        let error = reserved
-            .write_trailer_with_ref_map_and_kind(
-                &mut Vec::new(),
+        let error = output::with_buffer_sink(&mut Vec::new(), |out| {
+            reserved.write_trailer_with_ref_map_and_kind(
+                out,
                 TrailerKind::Normal { size: 1 },
                 false,
                 false,
@@ -6191,14 +6494,15 @@ mod final_handle_writer_tests {
                 &BTreeSet::new(),
                 true,
             )
-            .expect_err("reserved trailer handle must fail");
+        })
+        .expect_err("reserved trailer handle must fail");
         assert!(matches!(error, Error::System(message) if message.contains("reserved")));
 
         let scalar = ObjectHandle::integer(1);
         let mut output = Vec::new();
-        scalar
-            .write_trailer_with_ref_map_and_kind(
-                &mut output,
+        output::with_buffer_sink(&mut output, |out| {
+            scalar.write_trailer_with_ref_map_and_kind(
+                out,
                 TrailerKind::Normal { size: 1 },
                 false,
                 false,
@@ -6207,7 +6511,8 @@ mod final_handle_writer_tests {
                 &BTreeSet::new(),
                 true,
             )
-            .expect("non-dictionary trailer is emitted as an empty shell");
+        })
+        .expect("non-dictionary trailer is emitted as an empty shell");
         assert_eq!(output, b"trailer << >>");
     }
 
@@ -6226,9 +6531,9 @@ mod final_handle_writer_tests {
         };
         // cov:ignore-end
         let mut output = Vec::new();
-        trailer
-            .write_trailer_with_ref_map_and_kind(
-                &mut output,
+        output::with_buffer_sink(&mut output, |out| {
+            trailer.write_trailer_with_ref_map_and_kind(
+                out,
                 TrailerKind::Normal { size: 1 },
                 false,
                 true,
@@ -6237,7 +6542,8 @@ mod final_handle_writer_tests {
                 &BTreeSet::new(),
                 true,
             )
-            .expect("direct QDF Catalog is emitted");
+        })
+        .expect("direct QDF Catalog is emitted");
         let text = String::from_utf8(output).expect("trailer is UTF-8");
         assert!(text.contains("/Pages 3"));
     }
@@ -6254,9 +6560,9 @@ mod final_handle_writer_tests {
             (b"/Size".to_vec(), ObjectHandle::integer(2)),
         ]);
         let mut output = Vec::new();
-        trailer
-            .write_trailer_with_ref_map_and_kind(
-                &mut output,
+        output::with_buffer_sink(&mut output, |out| {
+            trailer.write_trailer_with_ref_map_and_kind(
+                out,
                 TrailerKind::Normal { size: 2 },
                 false,
                 false,
@@ -6265,7 +6571,8 @@ mod final_handle_writer_tests {
                 &[custom_ref].into_iter().collect(),
                 true,
             )
-            .expect("removed trailer reference is filtered");
+        })
+        .expect("removed trailer reference is filtered");
         assert!(!String::from_utf8(output)
             .expect("trailer is UTF-8")
             .contains("/CustomRef"));
@@ -6988,14 +7295,9 @@ mod final_handle_writer_tests {
         let map = |object_ref| Ok(object_ref);
         let removed = BTreeSet::new();
         let mut output = Vec::new();
-        root.write_root_object_with_ref_map_and_removed(
-            &mut output,
-            &map,
-            &removed,
-            "1.7",
-            8,
-            true,
-        )
+        output::with_buffer_sink(&mut output, |out| {
+            root.write_root_object_with_ref_map_and_removed(out, &map, &removed, "1.7", 8, true)
+        })
         .expect("root output succeeds");
         assert_eq!(
             extensions
@@ -7009,14 +7311,9 @@ mod final_handle_writer_tests {
         );
 
         output.clear();
-        root.write_root_object_with_ref_map_and_removed(
-            &mut output,
-            &map,
-            &removed,
-            "1.7",
-            0,
-            true,
-        )
+        output::with_buffer_sink(&mut output, |out| {
+            root.write_root_object_with_ref_map_and_removed(out, &map, &removed, "1.7", 0, true)
+        })
         .expect("root output succeeds");
         assert!(extensions.try_get_key(b"/ADBE").unwrap().is_null());
         assert_eq!(
@@ -7041,14 +7338,16 @@ mod final_handle_writer_tests {
             ),
         ]);
         let map = |_| Err(Error::Internal("test reference mapping failure".into()));
-        let result = root.write_root_object_with_ref_map_and_removed(
-            &mut Vec::new(),
-            &map,
-            &BTreeSet::new(),
-            "1.7",
-            8,
-            true,
-        );
+        let result = output::with_buffer_sink(&mut Vec::new(), |out| {
+            root.write_root_object_with_ref_map_and_removed(
+                out,
+                &map,
+                &BTreeSet::new(),
+                "1.7",
+                8,
+                true,
+            )
+        });
         assert!(result.is_err());
         assert_eq!(
             extensions
@@ -7077,14 +7376,9 @@ mod final_handle_writer_tests {
         let mut output = Vec::new();
         let map = |object_ref| Ok(object_ref);
         let removed = BTreeSet::new();
-        root.write_root_object_with_ref_map_and_removed(
-            &mut output,
-            &map,
-            &removed,
-            "1.7",
-            8,
-            true,
-        )
+        output::with_buffer_sink(&mut output, |out| {
+            root.write_root_object_with_ref_map_and_removed(out, &map, &removed, "1.7", 8, true)
+        })
         .expect("root output succeeds");
 
         assert!(output

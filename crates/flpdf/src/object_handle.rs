@@ -11461,8 +11461,10 @@ mod internal_state_value_tests {
             ),
         ] {
             let mut out = Vec::new();
-            let unparse_error = unparse_object_value(&value, &mut out)
-                .expect_err("internal qpdf values cannot unparse as PDF values");
+            let unparse_error = crate::writer::output::with_buffer_sink(&mut out, |out| {
+                unparse_object_value(&value, out)
+            })
+            .expect_err("internal qpdf values cannot unparse as PDF values");
             assert!(
                 unparse_error.to_string().contains(expected),
                 "unexpected unparse error: {unparse_error:?}"
@@ -11998,8 +12000,14 @@ mod type_code_tests {
 mod unparse_object_tests {
     use super::identity_tests::{error_resolving_handle, resolver_bearing_handle};
     use super::*;
-    use crate::writer::object::{dict_is_sig_with_byte_range, visible_dict_entries, write_child};
-    use crate::writer::ObjectWriterEmission;
+    use crate::writer::object::{
+        dict_is_sig_with_byte_range, visible_dict_entries, write_child as write_child_to_sink,
+        ObjectWriterEmissionVecTestExt,
+    };
+
+    fn write_child(handle: &ObjectHandle, out: &mut Vec<u8>) -> Result<()> {
+        crate::writer::output::with_buffer_sink(out, |out| write_child_to_sink(handle, out))
+    }
 
     fn compact_string_hook(out: &mut Vec<u8>, value: &[u8]) -> Result<()> {
         out.extend_from_slice(b"<hook:");

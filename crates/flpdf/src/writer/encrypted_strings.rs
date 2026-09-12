@@ -2,8 +2,11 @@
 
 use crate::encryption::standard::{encrypt_cipher_bytes, ObjectKeyAlg, StringEncryptCipher};
 use crate::object_handle::ObjectHandle;
-use crate::pdf_syntax::{write_hex_string, write_name_escaped, write_string_value};
+use crate::pdf_syntax::{
+    write_hex_string_to_sink, write_name_escaped_to_sink, write_string_value_to_sink,
+};
 use crate::writer::encryption_state::WriterEncryptionState;
+use crate::writer::output::OutputSink;
 use crate::writer::{
     EncryptionContext, ObjectWriterEmission, StreamDictionaryOptions, WriteCipher, WriterOptions,
 };
@@ -72,7 +75,7 @@ impl EncryptedStringEmitter {
     #[allow(clippy::too_many_arguments)] // emission identity, qdf layout, mapping, and encryption remain separate qpdf dimensions
     pub(crate) fn write_handle_object_with_ref_map(
         &mut self,
-        out: &mut Vec<u8>,
+        out: &mut OutputSink<'_>,
         emitted_ref: ObjectRef,
         object_stream_index: Option<u32>,
         object: &ObjectHandle,
@@ -89,7 +92,7 @@ impl EncryptedStringEmitter {
         let aes_iv_generator = self.aes_iv_generator.as_mut();
         self.state
             .with_object_data_key(emitted_ref.number, object_stream_index, |state| {
-                let mut write_string = |out: &mut Vec<u8>, plaintext: &[u8]| {
+                let mut write_string = |out: &mut OutputSink<'_>, plaintext: &[u8]| {
                     write_encrypted_or_plain_string(
                         state,
                         cipher,
@@ -170,7 +173,7 @@ impl EncryptedStringEmitter {
     #[allow(clippy::too_many_arguments)]
     pub(crate) fn write_handle_content_container_with_ref_map(
         &mut self,
-        out: &mut Vec<u8>,
+        out: &mut OutputSink<'_>,
         emitted_ref: ObjectRef,
         object_stream_index: Option<u32>,
         object: &ObjectHandle,
@@ -187,7 +190,7 @@ impl EncryptedStringEmitter {
         let aes_iv_generator = self.aes_iv_generator.as_mut();
         self.state
             .with_object_data_key(emitted_ref.number, object_stream_index, |state| {
-                let mut write_string = |out: &mut Vec<u8>, plaintext: &[u8]| {
+                let mut write_string = |out: &mut OutputSink<'_>, plaintext: &[u8]| {
                     write_encrypted_or_plain_string(
                         state,
                         cipher,
@@ -214,7 +217,7 @@ impl EncryptedStringEmitter {
     #[allow(clippy::too_many_arguments)] // keeps the qpdf stream-dictionary contract explicit at this boundary
     pub(crate) fn write_handle_stream_dict_with_ref_map(
         &mut self,
-        out: &mut Vec<u8>,
+        out: &mut OutputSink<'_>,
         emitted_ref: ObjectRef,
         object_stream_index: Option<u32>,
         dict: &ObjectHandle,
@@ -248,7 +251,7 @@ impl EncryptedStringEmitter {
         let aes_iv_generator = self.aes_iv_generator.as_mut();
         self.state
             .with_object_data_key(emitted_ref.number, object_stream_index, |state| {
-                let mut write_string = |out: &mut Vec<u8>, plaintext: &[u8]| {
+                let mut write_string = |out: &mut OutputSink<'_>, plaintext: &[u8]| {
                     write_encrypted_or_plain_string(
                         state,
                         cipher,
@@ -391,16 +394,14 @@ fn write_encrypted_or_plain_string(
     cipher: WriteCipher,
     static_aes_iv: bool,
     aes_iv_generator: &mut AesIvGenerator,
-    out: &mut Vec<u8>,
+    out: &mut OutputSink<'_>,
     plaintext: &[u8],
 ) -> crate::Result<()> {
     let Some(data_key) = state.current_data_key() else {
-        write_string_value(out, plaintext);
-        return Ok(());
+        return write_string_value_to_sink(out, plaintext);
     };
     let ciphertext = encrypt_string(cipher, static_aes_iv, aes_iv_generator, data_key, plaintext)?;
-    serialize_encrypted_string(out, &ciphertext, crate::writer::cipher_needs_aes_iv(cipher));
-    Ok(())
+    serialize_encrypted_string(out, &ciphertext, crate::writer::cipher_needs_aes_iv(cipher))
 }
 
 fn encrypt_string(
@@ -449,12 +450,17 @@ fn fill_aes_iv(aes_iv_generator: &mut AesIvGenerator, iv: &mut [u8; 16]) -> crat
 
 /// Serialize encrypted bytes using qpdf's cipher-specific representation:
 /// AES ciphertext is always hexadecimal; RC4 retains normal string heuristics.
-pub(crate) fn serialize_encrypted_string(out: &mut Vec<u8>, ciphertext: &[u8], use_aes: bool) {
+pub(crate) fn serialize_encrypted_string(
+    out: &mut OutputSink<'_>,
+    ciphertext: &[u8],
+    use_aes: bool,
+) -> crate::Result<()> {
     if use_aes {
-        write_hex_string(out, ciphertext);
+        write_hex_string_to_sink(out, ciphertext)?;
     } else {
-        write_string_value(out, ciphertext);
+        write_string_value_to_sink(out, ciphertext)?;
     }
+    Ok(())
 }
 
 /// Serialize an ObjectHandle-backed `/Encrypt` dictionary with the same
@@ -462,7 +468,7 @@ pub(crate) fn serialize_encrypted_string(out: &mut Vec<u8>, ciphertext: &[u8], u
 /// tree is kept as the source of truth; nested values and indirect references
 /// use the canonical ObjectHandle writer rather than materializing `Object`.
 pub(crate) fn write_encryption_dictionary_handle(
-    out: &mut Vec<u8>,
+    out: &mut OutputSink<'_>,
     handle: &ObjectHandle,
 ) -> crate::Result<()> {
     const HEX_ENCRYPT_KEYS: [&[u8]; 5] = [b"/O", b"/U", b"/OE", b"/UE", b"/Perms"];
@@ -473,22 +479,21 @@ pub(crate) fn write_encryption_dictionary_handle(
         ));
     };
 
-    out.extend_from_slice(b"<<");
+    out.write_bytes(b"<<")?;
     for (key, value) in entries {
         let key_without_slash = key.strip_prefix(b"/").unwrap_or(&key);
-        out.extend_from_slice(b" /");
-        write_name_escaped(out, key_without_slash);
-        out.push(b' ');
+        out.write_bytes(b" /")?;
+        write_name_escaped_to_sink(out, key_without_slash)?;
+        out.write_bytes(b" ")?;
         if HEX_ENCRYPT_KEYS.contains(&key.as_slice()) {
             if let Some(bytes) = value.as_string() {
-                write_hex_string(out, &bytes);
+                write_hex_string_to_sink(out, &bytes)?;
                 continue;
             }
         }
         value.write_object(out)?;
     }
-    out.extend_from_slice(b" >>");
-    Ok(())
+    out.write_bytes(b" >>")
 }
 
 #[cfg(test)]
@@ -525,9 +530,9 @@ mod tests {
             Rc::new(b"abc".to_vec()),
         );
         let mut output = Vec::new();
-        emitter
-            .write_handle_stream_dict_with_ref_map(
-                &mut output,
+        crate::writer::output::with_buffer_sink(&mut output, |out| {
+            emitter.write_handle_stream_dict_with_ref_map(
+                out,
                 ObjectRef::new(3, 0),
                 None,
                 &dict,
@@ -536,7 +541,8 @@ mod tests {
                 &BTreeSet::new(),
                 None,
             )
-            .unwrap();
+        })
+        .unwrap();
         let text = String::from_utf8(output).unwrap();
         assert!(text.contains("/Filter /FlateDecode"));
         assert!(!text.contains("ASCIIHexDecode"));
