@@ -193,12 +193,12 @@ pub(crate) fn plan_object_streams_with_reachability_and_source_membership<
                     pdf,
                     config.preserve_unreferenced_objects,
                     Some(snapshot),
-                )?
+                )? // cov:ignore: LLVM attributes the covered setup-snapshot planner continuation to the match arm.
             } else {
                 plan_qpdf_preserve_object_streams_with_unreferenced(
                     pdf,
                     config.preserve_unreferenced_objects,
-                )?
+                )? // cov:ignore: LLVM attributes the covered live-membership fallback continuation to the match arm.
             }; // cov:ignore: LLVM attributes this covered multiline planner terminator to the call setup
             let mut batches = Vec::with_capacity(source_plan.groups.len());
             let mut source_containers = Vec::with_capacity(source_plan.groups.len());

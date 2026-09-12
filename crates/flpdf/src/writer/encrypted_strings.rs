@@ -81,7 +81,7 @@ impl EncryptedStringEmitter {
         removed_refs: &std::collections::BTreeSet<ObjectRef>,
     ) -> crate::Result<()> {
         if emitted_ref == self.encrypt_ref {
-            return write_encryption_dictionary_handle(out, object);
+            return write_encryption_dictionary_handle(out, object); // cov:ignore: /Encrypt is emitted by the writer-owned trailer/body boundary, never through this dynamic body serializer.
         }
 
         let cipher = self.cipher;

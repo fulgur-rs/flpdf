@@ -232,3 +232,27 @@ fn specialized_encrypted_live_queue_discovers_callback_children_in_each_mode() {
         );
     }
 }
+
+#[test]
+fn specialized_generate_preserve_unreferenced_uses_setup_snapshot_and_deterministic_id() {
+    let mut pdf = Pdf::open(Cursor::new(
+        include_bytes!("../../../tests/fixtures/compat/one-page-no-ext.pdf").to_vec(),
+    ))
+    .unwrap();
+    let mut writer = PdfWriter::new(&mut pdf);
+    writer.set_object_stream_mode(ObjectStreamMode::Generate);
+    writer.set_preserve_unreferenced_objects(true);
+    writer.set_extra_header_text("% specialized-live-queue");
+    writer.set_deterministic_id(true);
+    writer.set_output_memory().unwrap();
+    writer
+        .write()
+        .expect("specialized Generate with preserved objects succeeds");
+    let output = writer.get_buffer().unwrap();
+    assert!(output
+        .windows(b"/Type /ObjStm".len())
+        .any(|window| window == b"/Type /ObjStm"));
+    assert!(output
+        .windows(b"/ID [<".len())
+        .any(|window| window == b"/ID [<"));
+}
