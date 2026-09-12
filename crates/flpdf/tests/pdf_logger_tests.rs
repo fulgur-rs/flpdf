@@ -10,6 +10,8 @@ use std::sync::{Arc, Mutex};
 const MINIMAL_PDF: &[u8] = include_bytes!("../../../tests/fixtures/minimal.pdf");
 const LAZY_WARNING_PDF: &[u8] =
     include_bytes!("../../../tests/fixtures/compat/chained-indirect-contents.pdf");
+const WHITESPACE_BROKEN_XREF_PDF: &[u8] =
+    include_bytes!("../../../tests/fixtures/compat/xref-whitespace-broken-table.pdf");
 
 struct RecordingSink(Arc<Mutex<Vec<u8>>>);
 
@@ -405,6 +407,42 @@ fn warning_delivers_initial_repair_diagnostics_once_in_original_order() {
             "xref not found",
             "Attempting to reconstruct cross-reference table",
         ]
+    );
+}
+
+#[test]
+fn whitespace_before_broken_xref_warns_once_during_recovery() {
+    let (logger, output) = recording_logger();
+    let pdf = Pdf::open_with_options(
+        Cursor::new(WHITESPACE_BROKEN_XREF_PDF),
+        PdfOpenOptions {
+            repair: true,
+            logger: Some(logger),
+            description: b"ws_broken.pdf".to_vec(),
+            ..PdfOpenOptions::default()
+        },
+    )
+    .expect("the damaged xref table should be reconstructed");
+
+    let output = output.lock().unwrap().clone();
+    let warning = b"extraneous whitespace seen before xref";
+    assert_eq!(
+        output
+            .windows(warning.len())
+            .filter(|window| *window == warning)
+            .count(),
+        1,
+        "logger output: {output:?}"
+    );
+    assert_eq!(
+        pdf.repair_diagnostics()
+            .entries()
+            .iter()
+            .filter(|diagnostic| diagnostic.get_message_detail() == warning)
+            .count(),
+        1,
+        "repair diagnostics: {:?}",
+        pdf.repair_diagnostics().entries()
     );
 }
 

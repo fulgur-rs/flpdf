@@ -2380,11 +2380,13 @@ fn parse_xref_from_start_with_owner_and_build_diagnostics(
         let (entries, trailer_start, mut table_diagnostics, first_xref_item_offset) = match table {
             Ok(table) => table,
             Err(error) => {
-                if let (Some(warning), Some(sink)) = (
-                    whitespace_warning.clone(),
-                    error_diagnostics_sink.as_deref_mut(),
-                ) {
-                    sink.push(warning);
+                if canonical_trailer_owner.is_none() {
+                    if let (Some(warning), Some(sink)) = (
+                        whitespace_warning.clone(),
+                        error_diagnostics_sink.as_deref_mut(),
+                    ) {
+                        sink.push(warning);
+                    }
                 }
                 // The canonical owner keeps its diagnostics through
                 // `push_warning`, not through the caller's sink.
