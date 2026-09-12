@@ -129,10 +129,18 @@ fn standard_writer_production_uses_canonical_accessor_routes() {
 
 #[test]
 fn standard_writer_stream_observations_follow_resolution() {
-    let source = strip_cfg_test_items(&include_str!("../src/writer.rs").replace("\r\n", "\n"));
-    let pclm_body = function_body(&source, "write_pclm");
-    assert_local_stream_resolution(pclm_body, "source_handle", 1);
+    let pclm_live = include_str!("../src/writer/pclm_live.rs");
+    assert!(
+        pclm_live.contains("emit_live_pclm"),
+        "PCLm must use the shared live body owner"
+    );
+    let pclm_seed = include_str!("../src/writer/pclm.rs");
+    assert!(
+        pclm_seed.contains("try_dereference") && pclm_seed.contains("try_is_null"),
+        "PCLm seed discovery must use canonical resolving accessors"
+    );
 
+    let source = strip_cfg_test_items(&include_str!("../src/writer.rs").replace("\r\n", "\n"));
     let standard_body = function_body(&source, "emit_canonical_pdf_inner");
     assert_local_stream_resolution(standard_body, "object_handle", 2);
     assert_local_stream_resolution(standard_body, "source_handle", 1);

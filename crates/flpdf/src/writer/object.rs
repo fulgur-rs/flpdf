@@ -299,6 +299,7 @@ pub(crate) trait ObjectWriterEmission {
         removed_refs: &BTreeSet<ObjectRef>,
         length: usize,
     ) -> Result<()>;
+    #[cfg(test)]
     fn write_stream_body_with_ref_map_and_removed_and_length_with_options(
         &self,
         out: &mut Vec<u8>,
@@ -1044,6 +1045,7 @@ impl ObjectWriterEmission for ObjectHandle {
         )
     }
 
+    #[cfg(test)]
     fn write_stream_body_with_ref_map_and_removed_and_length_with_options(
         &self,
         out: &mut Vec<u8>,

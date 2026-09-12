@@ -205,7 +205,7 @@ crates/flpdf/src/writer.rs::build_writer_trailer_handle                  # D14 c
 crates/flpdf/src/writer.rs::EncryptionContext                            # D16
 crates/flpdf/src/writer/object_streams/planning.rs::filter_objstm_batches_for_output       # D23 canonical
 crates/flpdf/src/writer/pclm.rs::Plan                                    # D24（曖昧 leaf）
-crates/flpdf/src/writer.rs::write_pclm                                   # D24
+crates/flpdf/src/writer/pclm_live.rs::write_pclm                          # D24
 crates/flpdf/src/writer.rs::inject_adbe_extension                        # D25
 crates/flpdf/src/writer.rs::strip_adbe_extension                         # D25
 crates/flpdf/src/writer/plain/plan.rs::retain_reachable_object_stream_members              # D28

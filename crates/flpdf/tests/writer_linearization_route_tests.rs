@@ -16,7 +16,7 @@ fn full_rewrite_catalog_restore_uses_the_live_handle() {
         .map(|(route, _)| route)
         .expect("full-rewrite writer route exists");
 
-    assert!(route.contains("ObjectHandle"));
+    assert!(route.contains("root_handle"));
     assert!(route.contains("restore_key_raw"));
     assert!(
         !route.contains(".materialize()"),
