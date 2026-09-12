@@ -346,7 +346,7 @@ review.
 - Consumes: all-mode live queue, `OutputSink`, writer-owned `willFilterStream` policy, and PCLm initial ordering plan.
 - Produces: PCLm/non-linearized plan metadata with no complete child prewalk or multi-stream payload cache.
 
-- [ ] **Step 1: Reduce PCLm Plan to initial enqueue ordering.**
+- [x] **Step 1: Reduce PCLm Plan to initial enqueue ordering.**
 
   Retain qpdf's page/content/image/synthetic/root seed order and output-number
   reservation, but remove the `collect_canonical_children` loop and fixed map
@@ -354,7 +354,7 @@ review.
   children after actual object/stream serialization. Keep the existing late
   trailer-reference behavior and synthetic image-strip ordering.
 
-- [ ] **Step 2: Implement full PCLm willFilterStream policy.**
+- [x] **Step 2: Implement full PCLm willFilterStream policy.**
 
   Replace `get_raw_stream_data` with the canonical writer stream helper that
   considers `is_data_modified`, `filter_on_write`, metadata cleartext,
@@ -363,21 +363,21 @@ review.
   `OutputSink`. Preserve PCLm's forced uncompressed output settings where qpdf
   actually sets them in `doWriteSetup`.
 
-- [ ] **Step 3: Migrate PCLm body/xref/trailer to final sink.**
+- [x] **Step 3: Migrate PCLm body/xref/trailer to final sink.**
 
   Replace the main `bytes: Vec<u8>` with `OutputSink`, use its position for
   offsets, stream each item in qpdf order, and write late trailer references
   without reassembling a complete body. Any direct-root serialization remains
   a bounded value/entry buffer, not a PDF-wide output Vec.
 
-- [ ] **Step 4: Add PCLm causal/retry/failure tests.**
+- [x] **Step 4: Add PCLm causal/retry/failure tests.**
 
   Test provider order, `false` with filtering disabled (no unconditional
   retry), recoverable filter retry, segment-finish failure, sink failure,
   late trailer references, and deterministic-ID output. Compare PCLm bytes and
   exit behavior with qpdf 11.9.0.
 
-- [ ] **Step 5: Run and commit PCLm checks.**
+- [x] **Step 5: Run and commit PCLm checks.**
 
   ```bash
   cargo test -p flpdf --lib writer::pclm
