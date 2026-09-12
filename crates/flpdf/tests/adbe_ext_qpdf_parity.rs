@@ -337,6 +337,65 @@ fn specialized_standard_adbe_root_cutover_matches_qpdf_for_all_object_stream_mod
     }
 }
 
+fn assert_qdf_or_normalize_adbe_orphan_parity(content_normalization: bool) {
+    use std::process::Command;
+
+    if Command::new("qpdf").arg("--version").output().is_err() {
+        eprintln!("qpdf is unavailable; skipping QDF/normalize ADBE orphan parity");
+        return;
+    }
+
+    let input = Path::new(env!("CARGO_MANIFEST_DIR"))
+        .join("../../tests/fixtures/compat/adbe-orphan-url.pdf");
+    let temporary = tempfile::tempdir().expect("create qpdf comparison directory");
+    let qpdf_output = temporary.path().join("qpdf.pdf");
+    let mut qpdf = Command::new("qpdf");
+    qpdf.args([
+        "--static-id",
+        "--object-streams=disable",
+        "--force-version=1.7.8",
+    ]);
+    if content_normalization {
+        qpdf.arg("--normalize-content=y");
+    } else {
+        qpdf.arg("--qdf");
+    }
+    qpdf.args(["--stream-data=uncompress"])
+        .arg(&input)
+        .arg(&qpdf_output);
+    let result = qpdf.output().expect("run qpdf QDF/normalize rewrite");
+    assert!(result.status.success(), "qpdf rewrite failed: {result:?}");
+
+    let file = std::fs::File::open(&input).expect("open ADBE orphan fixture");
+    let mut pdf = Pdf::open(std::io::BufReader::new(file)).expect("parse ADBE orphan fixture");
+    let settings = WriterTestSettings {
+        content_normalization,
+        qdf: !content_normalization,
+        object_streams: ObjectStreamMode::Disable,
+        force_version: Some("1.7".to_owned()),
+        force_extension_level: Some(8),
+        stream_data: Some(flpdf::StreamDataMode::Uncompress),
+        static_id: true,
+        ..WriterTestSettings::default()
+    };
+    let mut actual = Vec::new();
+    write_with_settings(&mut pdf, &mut actual, &settings).expect("QDF/normalize rewrite");
+    let expected = std::fs::read(&qpdf_output).expect("read qpdf QDF/normalize output");
+    assert_eq!(actual, expected, "QDF/normalize ADBE orphan parity");
+}
+
+#[cfg(feature = "qpdf-zlib-compat")]
+#[test]
+fn qdf_adbe_orphan_root_cutover_matches_qpdf() {
+    assert_qdf_or_normalize_adbe_orphan_parity(false);
+}
+
+#[cfg(feature = "qpdf-zlib-compat")]
+#[test]
+fn normalize_adbe_orphan_root_cutover_matches_qpdf() {
+    assert_qdf_or_normalize_adbe_orphan_parity(true);
+}
+
 #[test]
 fn direct_root_adbe_survives_forced_version_in_plain_disable_output() {
     for force_version in ["1.4", "1.7", "2.0"] {

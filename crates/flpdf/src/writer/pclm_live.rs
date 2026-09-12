@@ -16,7 +16,6 @@ use super::{
     generate_id_handle, source_permanent_id_value_handle, uses_deterministic_id, WriterOptions,
 };
 use crate::writer::plain::plan::canonical_trailer_entries_with_visibility;
-use crate::writer::rewrite_renumber::collect_canonical_enqueue_refs;
 use crate::{Error, ObjectHandle, ObjectRef, Pdf, Result, XrefForm};
 
 pub(crate) fn write_pclm<R: Read + Seek + 'static, W: Write>(
@@ -77,8 +76,12 @@ pub(crate) fn write_pclm<R: Read + Seek + 'static, W: Write>(
         Error::Unsupported("PCLm live writer: late trailer number overflows u32".into())
     })?;
     // cov:ignore-end
-    let mut next_late_trailer_number =
-        extend_late_trailer_map(pdf, &mut trailer_map, initial_late_trailer_number, true)?;
+    let mut next_late_trailer_number = super::plain::extend_late_trailer_map(
+        pdf,
+        &mut trailer_map,
+        initial_late_trailer_number,
+        true,
+    )?;
 
     let direct_root_output = direct_root
         .as_ref()
@@ -125,7 +128,7 @@ pub(crate) fn write_pclm<R: Read + Seek + 'static, W: Write>(
         })
         .transpose()?;
 
-    extend_late_trailer_map(pdf, &mut trailer_map, next_late_trailer_number, false)?;
+    super::plain::extend_late_trailer_map(pdf, &mut trailer_map, next_late_trailer_number, false)?;
 
     let trailer_handle = build_writer_trailer_handle(
         pdf,
@@ -183,62 +186,6 @@ pub(crate) fn write_pclm<R: Read + Seek + 'static, W: Write>(
         .collect();
     out.write_all(&bytes)?;
     Ok(super::WriterResult::new(emitted_old_to_new, written_xref))
-}
-
-fn extend_late_trailer_map<R: Read + Seek>(
-    pdf: &mut Pdf<R>,
-    map: &mut HashMap<ObjectRef, ObjectRef>,
-    mut next: u32,
-    before_root: bool,
-) -> Result<u32> {
-    let entries = pdf.trailer().try_as_dictionary()?.unwrap_or_default();
-    for (key, value) in entries {
-        if key.as_slice() == b"/Root" || (key.as_slice() < b"/Root") != before_root {
-            continue;
-        }
-        if matches!(
-            key.as_slice(),
-            b"/ID"
-                | b"/Encrypt"
-                | b"/Prev"
-                | b"/Root"
-                | b"/Size"
-                | b"/Type"
-                | b"/F"
-                | b"/FFilter"
-                | b"/FDecodeParms"
-                | b"/W"
-                | b"/Index"
-                | b"/Length"
-                | b"/Filter"
-                | b"/DecodeParms"
-                | b"/XRefStm"
-        ) {
-            continue;
-        }
-        // `QPDF_Dictionary::getKeys()` omits values that resolve to null,
-        // including an indirect null (`QPDF_Dictionary.cc:118-123`). The
-        // late-numbering pass must apply the same visibility rule before
-        // reserving any output number, or a hidden value shifts every later
-        // trailer reference.
-        if value.try_is_null()? {
-            continue;
-        }
-        let mut references = Vec::new();
-        collect_canonical_enqueue_refs(pdf, &value, 0, true, &mut references)?;
-        for reference in references {
-            if reference.number == 0 || map.contains_key(&reference) {
-                continue;
-            }
-            map.insert(reference, ObjectRef::new(next, 0));
-            // cov:ignore-start: a supported output cannot exhaust the u32 object-number space.
-            next = next.checked_add(1).ok_or_else(|| {
-                Error::Unsupported("PCLm live writer: late trailer number overflow".into())
-            })?;
-            // cov:ignore-end
-        }
-    }
-    Ok(next)
 }
 
 #[cfg(test)]

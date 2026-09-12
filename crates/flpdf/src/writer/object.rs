@@ -1436,6 +1436,21 @@ fn prepare_stream_dict_entries(
     Ok(prepared)
 }
 
+/// Return the stream dictionary after the same shallow-copy preparation that
+/// the stream serializers will apply. Writer consumers that must discover
+/// references before using a static serializer (QDF's map contract) use this
+/// view so removed `/Filter`, `/DecodeParms`, and empty parameter entries do
+/// not become false queue edges.
+pub(crate) fn prepared_stream_dictionary_for_discovery(
+    handle: &ObjectHandle,
+    options: StreamDictionaryOptions,
+) -> Result<ObjectHandle> {
+    let entries = stream_dictionary_entries_for_emission(handle)?;
+    Ok(ObjectHandle::dictionary(prepare_stream_dict_entries(
+        &entries, options,
+    )?))
+}
+
 /// Remove the first `/Crypt` filter and its paired decode parameters from a
 /// copied dictionary. This mutates only the copy, matching qpdf's shallow
 /// `unparseObject` preparation.
@@ -1670,9 +1685,30 @@ fn unparse_stream_dict_entries_qdf_with_ref_map(
     options: StreamDictionaryOptions,
 ) -> Result<()> {
     let entries = prepare_stream_dict_entries(entries, options)?;
+    unparse_stream_dict_entries_qdf_with_ref_map_prepared(
+        &entries,
+        out,
+        indent,
+        map,
+        removed_refs,
+        length_ref,
+        options,
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
+fn unparse_stream_dict_entries_qdf_with_ref_map_prepared(
+    entries: &[(Vec<u8>, ObjectHandle)],
+    out: &mut Vec<u8>,
+    indent: usize,
+    map: &ObjectRefMap<'_>,
+    removed_refs: &BTreeSet<ObjectRef>,
+    length_ref: Option<ObjectRef>,
+    options: StreamDictionaryOptions,
+) -> Result<()> {
     out.extend_from_slice(b"<<\n");
     let mut length_value: Option<&ObjectHandle> = None;
-    for (key, value) in visible_dict_entries(&entries)? {
+    for (key, value) in visible_dict_entries(entries)? {
         if is_removed_reference(value, removed_refs) {
             continue;
         }
@@ -1684,7 +1720,7 @@ fn unparse_stream_dict_entries_qdf_with_ref_map(
         write_dictionary_key(out, key);
         out.push(b' ');
         let force_hex_string =
-            key.as_slice() == b"/Contents" && dict_is_sig_with_byte_range(&entries)?;
+            key.as_slice() == b"/Contents" && dict_is_sig_with_byte_range(entries)?;
         if !try_write_sig_contents_hex_string(value, force_hex_string, out)? {
             write_child_qdf_with_ref_map(value, indent + 2, out, map, removed_refs)?;
         }
@@ -1708,6 +1744,33 @@ fn unparse_stream_dict_entries_qdf_with_ref_map(
     push_spaces(out, indent);
     out.extend_from_slice(b">>");
     Ok(())
+}
+
+/// Emit a QDF stream dictionary whose qpdf shallow-copy preparation has already
+/// happened. This is used by live QDF consumers that must inspect the prepared
+/// dictionary for child discovery before serializing it. Re-running preparation
+/// would observe an emptied `/DecodeParms` array after `/Crypt` cleanup and
+/// incorrectly remove a key that qpdf retained during its single pass.
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn write_prepared_stream_body_qdf_with_ref_map_and_removed_and_length_with_options(
+    handle: &ObjectHandle,
+    out: &mut Vec<u8>,
+    indent: usize,
+    map: &ObjectRefMap<'_>,
+    removed_refs: &BTreeSet<ObjectRef>,
+    length_ref: Option<ObjectRef>,
+    options: StreamDictionaryOptions,
+) -> Result<()> {
+    let entries = stream_dictionary_entries_for_emission(handle)?;
+    unparse_stream_dict_entries_qdf_with_ref_map_prepared(
+        &entries,
+        out,
+        indent,
+        map,
+        removed_refs,
+        length_ref,
+        options,
+    )
 }
 
 #[allow(clippy::too_many_arguments)]
