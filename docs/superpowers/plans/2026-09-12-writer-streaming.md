@@ -403,7 +403,7 @@ review.
 - Consumes: all-mode plain/PCLm sink paths and `OutputSink` digest/lifecycle contract.
 - Produces: no non-linearized `writer.rs` body aggregation or `write_complete` call; exact qpdf deterministic ID, encryption, segment finish, and sink-error behavior.
 
-- [ ] **Step 1: Inventory every remaining non-linearized Vec.**
+- [x] **Step 1: Inventory every remaining non-linearized Vec.**
 
   Search `writer.rs`, `plain`, `pclm`, `object`, `serialize`, and `object_streams`
   for body-sized `Vec<u8>`, `body.bytes`, `emit_bodies` complete-output returns,
@@ -412,7 +412,7 @@ review.
   prohibited whole-document retention. Remove or source-cite every prohibited
   result before continuing.
 
-- [ ] **Step 2: Route encryption/extra-header/forced-version fallbacks.**
+- [x] **Step 2: Route encryption/extra-header/forced-version fallbacks.**
 
   Make the non-plain coordinator use the same final `OutputSink` and live
   emission queue. Preserve output object data-key set/clear, AES length/IV,
@@ -420,7 +420,7 @@ review.
   and specialized writer error boundaries. Do not route sink failures through
   stream filter retry or restore a legacy body Vec.
 
-- [ ] **Step 3: Implement incremental deterministic ID at the exact cutoff.**
+- [x] **Step 3: Implement incremental deterministic ID at the exact cutoff.**
 
   Replace flat non-linearized `write_deterministic_id_inline` Vec hashing with
   `OutputSink` digest operations. Write `/ID [` through the digesting sink,
@@ -429,7 +429,7 @@ review.
   after the xref dictionary ID is excluded, and EOF/document finish happens
   after ID emission. Leave linearized placeholder/back-patch behavior intact.
 
-- [ ] **Step 4: Enforce qpdf segment/document finish order.**
+- [x] **Step 4: Enforce qpdf segment/document finish order.**
 
   Ensure each stream's local/filter/encryption pipeline is finished at the
   qpdf `PipelinePopper` boundary, a finish error stops subsequent provider
@@ -437,7 +437,7 @@ review.
   and final position survive segment finish unchanged. Add tests for MD5 pop,
   segment finish count, document finish count, and finish failures.
 
-- [ ] **Step 5: Run all non-linearized route tests.**
+- [x] **Step 5: Run all non-linearized route tests.**
 
   ```bash
   cargo test -p flpdf --lib writer
@@ -449,7 +449,7 @@ review.
   git diff --check
   ```
 
-- [ ] **Step 6: Commit the fallback/ID/finish cutover.**
+- [x] **Step 6: Commit the fallback/ID/finish cutover.**
 
   ```bash
   git add crates/flpdf/src/writer.rs crates/flpdf/src/writer/plain crates/flpdf/src/writer/object.rs crates/flpdf/src/writer/serialize.rs
