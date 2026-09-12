@@ -1749,12 +1749,13 @@ pub(crate) struct WriterOptions {
 /// together so the specialized writer does not repair or enumerate the page
 /// tree again while it is preparing QDF markers and stream policy.
 #[derive(Debug, Default)]
-struct SpecialStreams {
+pub(crate) struct SpecialStreams {
     pages: Vec<ObjectRef>,
     page_seq: HashMap<ObjectRef, u32>,
     contents_seq: HashMap<ObjectRef, u32>,
     normalized_streams: BTreeSet<ObjectRef>,
     content_container_refs: BTreeSet<ObjectRef>,
+    content_container_seq: HashMap<ObjectRef, u32>,
 }
 
 /// Build qpdf's page/content maps once for the writer setup trigger.
@@ -1773,6 +1774,7 @@ fn initialize_special_streams<R: Read + Seek>(
         contents_seq: HashMap::new(),
         normalized_streams: BTreeSet::new(),
         content_container_refs: BTreeSet::new(),
+        content_container_seq: HashMap::new(),
         pages,
     };
 
@@ -1787,7 +1789,12 @@ fn initialize_special_streams<R: Read + Seek>(
             streams.normalized_streams.insert(content_ref);
         }
         if options.qdf || options.content_normalization {
-            collect_content_container_refs(pdf, page_ref, &mut streams.content_container_refs)?;
+            let mut content_containers = BTreeSet::new();
+            collect_content_container_refs(pdf, page_ref, &mut content_containers)?;
+            for container in content_containers {
+                streams.content_container_refs.insert(container);
+                streams.content_container_seq.insert(container, sequence);
+            }
         }
     }
 
@@ -3744,10 +3751,9 @@ fn emit_canonical_pdf_with_special_streams<R: Read + Seek, W: Write>(
     special_streams: Option<&SpecialStreams>,
     setup: WriterSetupState,
 ) -> Result<WriterResult> {
-    // The plain route now reconciles ADBE on the root's output-only shallow
-    // copy. It therefore needs no Catalog snapshot/restore; QDF and content
-    // normalization routes still retain that boundary until their root
-    // consumers migrate.
+    // Plain, specialized, PCLm, and the migrated QDF/normalize cohort reconcile
+    // ADBE on the root's output-only shallow copy. Only routes that still use
+    // the legacy coordinator retain the snapshot boundary below.
     let specialized_standard_live = !options.qdf
         && !options.content_normalization
         && !options.pclm
@@ -3756,12 +3762,18 @@ fn emit_canonical_pdf_with_special_streams<R: Read + Seek, W: Write>(
             options,
             effective_object_stream_mode(options),
         );
+    let qdf_or_normalize_live = !pdf.is_encrypted()
+        && options.encrypt.is_none()
+        && options.copy_encryption.is_none()
+        && !options.pclm
+        && plain::qdf_or_normalize_live_eligible(options, &setup.source_object_stream_data);
     if options.pclm
         || plain::eligible(
             pdf.is_encrypted(),
             options,
             effective_object_stream_mode(options),
         )
+        || qdf_or_normalize_live
         || specialized_standard_live
     {
         return emit_canonical_pdf_inner(pdf, out, options, special_streams, setup);
@@ -3858,8 +3870,16 @@ fn emit_canonical_pdf_inner<R: Read + Seek, W: Write>(
         ));
     }
     let plain_route = plain::eligible(pdf.is_encrypted(), options, requested_object_streams);
-    let specialized_standard_live =
-        !plain_route && !options.qdf && !options.content_normalization && !options.pclm;
+    let qdf_or_normalize_live = !pdf.is_encrypted()
+        && options.encrypt.is_none()
+        && options.copy_encryption.is_none()
+        && !options.pclm
+        && plain::qdf_or_normalize_live_eligible(options, &source_object_stream_data);
+    let specialized_standard_live = !plain_route
+        && !qdf_or_normalize_live
+        && !options.qdf
+        && !options.content_normalization
+        && !options.pclm;
     if specialized_standard_live {
         return emit_specialized_standard_live(
             pdf,
@@ -3872,9 +3892,9 @@ fn emit_canonical_pdf_inner<R: Read + Seek, W: Write>(
             &generated_object_stream_sources,
         );
     }
-    // Compute the Adobe extension level before downstream dispatch. The plain
-    // and PCLm routes apply it to the root's output-only shallow copy; legacy
-    // specialized routes still apply the existing live-graph mutation below.
+    // Compute the Adobe extension level before downstream dispatch. Live root
+    // consumers apply it to an output-only shallow copy; legacy coordinator
+    // routes still use the existing live-graph mutation below.
     // When WriterOptions::min_extension_level requests an ext >= 1 (or the
     // source Catalog already carries one that survives the pairwise rule)
     // inject
@@ -3882,7 +3902,7 @@ fn emit_canonical_pdf_inner<R: Read + Seek, W: Write>(
     // so it becomes part of the Catalog the selected writer sees. A source
     // indirect /Extensions ref, if any, is inlined here and
     // drops out of the reachable graph — mirroring qpdf's writer behaviour.
-    if !plain_route && !options.pclm {
+    if !plain_route && !qdf_or_normalize_live && !options.pclm {
         let source_ver = pdf.version().to_string();
         let source_ext = pdf.adobe_extension_level()?.unwrap_or(0);
         // Predict whether the header floor will bump to PDF 1.5 due to
@@ -3921,12 +3941,13 @@ fn emit_canonical_pdf_inner<R: Read + Seek, W: Write>(
         return pclm_live::write_pclm(pdf, out, options);
     }
 
-    if plain_route {
+    if plain_route || qdf_or_normalize_live {
         return plain::write_plain(
             pdf,
             out,
             options,
             generated_id.as_ref(),
+            special_streams,
             &source_object_stream_data,
         );
     }

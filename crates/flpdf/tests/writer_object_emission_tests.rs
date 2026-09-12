@@ -32,6 +32,398 @@ fn progress_callback_mutation_is_visible_in_the_current_root_output() {
 }
 
 #[test]
+fn qdf_and_normalize_progress_mutations_are_visible_before_child_discovery() {
+    // QPDFWriter::writeObject reports progress before the mode-specific
+    // unparseObject body. QDF and normalize-content must keep that same live
+    // boundary after leaving the planned emitter.
+    for qdf in [true, false] {
+        let mut pdf = Pdf::open(Cursor::new(
+            include_bytes!("../../../tests/fixtures/compat/one-page-no-ext.pdf").to_vec(),
+        ))
+        .unwrap();
+        let root = pdf.root_handle().unwrap();
+        let child = pdf
+            .make_indirect_object_handle(ObjectHandle::dictionary(vec![(
+                b"/QdfProgressChild".to_vec(),
+                ObjectHandle::integer(42),
+            )]))
+            .unwrap();
+        let mut writer = PdfWriter::new(&mut pdf);
+        writer.set_object_stream_mode(ObjectStreamMode::Disable);
+        writer.set_qdf_mode(qdf);
+        writer.set_content_normalization(!qdf);
+        writer.set_extra_header_text("% qdf-normalize-live\n");
+        writer.set_static_id(true);
+        writer.set_output_memory().unwrap();
+        writer.register_progress_reporter(Box::new(move |percent| {
+            if percent == 0 {
+                root.replace_key(b"/QdfProgressProbe", child.clone())?;
+            }
+            Ok(())
+        }));
+        writer
+            .write()
+            .unwrap_or_else(|error| panic!("qdf={qdf} live write failed: {error}"));
+        let output = writer.get_buffer().unwrap();
+        assert!(
+            output
+                .windows(b"/QdfProgressProbe".len())
+                .any(|window| window == b"/QdfProgressProbe"),
+            "qdf={qdf} must retain the callback mutation"
+        );
+        assert!(
+            output
+                .windows(b"/QdfProgressChild 42".len())
+                .any(|window| window == b"/QdfProgressChild 42"),
+            "qdf={qdf} must discover the callback child after the root event"
+        );
+    }
+}
+
+#[test]
+fn qdf_and_normalize_progress_stream_replacement_uses_live_payload() {
+    for qdf in [true, false] {
+        let mut pdf = Pdf::open(Cursor::new(
+            include_bytes!("../../../tests/fixtures/compat/one-page-no-ext.pdf").to_vec(),
+        ))
+        .unwrap();
+        let stream = pdf
+            .new_stream_with_data(Rc::new(b"before".to_vec()))
+            .unwrap();
+        pdf.root_handle()
+            .unwrap()
+            .replace_key(b"/QdfProgressStream", stream.clone())
+            .unwrap();
+        let mut writer = PdfWriter::new(&mut pdf);
+        writer.set_object_stream_mode(ObjectStreamMode::Disable);
+        writer.set_qdf_mode(qdf);
+        writer.set_content_normalization(!qdf);
+        writer.set_compress_streams(false);
+        writer.set_static_id(true);
+        writer.set_output_memory().unwrap();
+        writer.register_progress_reporter(Box::new(move |percent| {
+            if percent == 0 {
+                stream.replace_stream_data(Rc::new(b"after".to_vec()), None, None);
+            }
+            Ok(())
+        }));
+        writer
+            .write()
+            .unwrap_or_else(|error| panic!("qdf={qdf} live stream write failed: {error}"));
+        let output = writer.get_buffer().unwrap();
+        assert!(
+            output
+                .windows(b"after".len())
+                .any(|window| window == b"after"),
+            "qdf={qdf} must emit the callback replacement"
+        );
+        assert!(!output
+            .windows(b"before".len())
+            .any(|window| window == b"before"));
+    }
+}
+
+#[test]
+fn qdf_and_normalize_progress_id_replacement_is_read_at_trailer_time() {
+    for qdf in [true, false] {
+        let mut pdf = Pdf::open(Cursor::new(
+            include_bytes!("../../../tests/fixtures/compat/one-page-no-ext.pdf").to_vec(),
+        ))
+        .unwrap();
+        let trailer = pdf.trailer();
+        let replacement = ObjectHandle::array(vec![
+            ObjectHandle::string(b"changed-id".to_vec()),
+            ObjectHandle::string(b"changed-id".to_vec()),
+        ]);
+        let mut writer = PdfWriter::new(&mut pdf);
+        writer.set_object_stream_mode(ObjectStreamMode::Disable);
+        writer.set_qdf_mode(qdf);
+        writer.set_content_normalization(!qdf);
+        writer.set_static_id(true);
+        writer.set_output_memory().unwrap();
+        writer.register_progress_reporter(Box::new(move |percent| {
+            if percent == 0 {
+                trailer.replace_key(b"/ID", replacement.clone())?;
+            }
+            Ok(())
+        }));
+        writer
+            .write()
+            .unwrap_or_else(|error| panic!("qdf={qdf} late ID write failed: {error}"));
+        let output = writer.get_buffer().unwrap();
+        assert!(
+            output
+                .windows(b"<6368616e6765642d6964>".len())
+                .any(|window| window == b"<6368616e6765642d6964>"),
+            "qdf={qdf} must use the callback's live /ID[0]"
+        );
+    }
+}
+
+#[test]
+fn qdf_and_normalize_progress_id_deletion_does_not_restore_the_setup_id() {
+    for qdf in [true, false] {
+        let mut pdf = Pdf::open(Cursor::new(
+            include_bytes!("../../../tests/fixtures/compat/nonid-id0.pdf").to_vec(),
+        ))
+        .unwrap();
+        let trailer = pdf.trailer();
+        let mut writer = PdfWriter::new(&mut pdf);
+        writer.set_object_stream_mode(ObjectStreamMode::Disable);
+        writer.set_qdf_mode(qdf);
+        writer.set_content_normalization(!qdf);
+        writer.set_static_id(true);
+        writer.set_output_memory().unwrap();
+        writer.register_progress_reporter(Box::new(move |percent| {
+            if percent == 0 {
+                trailer.remove_key(b"/ID");
+            }
+            Ok(())
+        }));
+        writer
+            .write()
+            .unwrap_or_else(|error| panic!("qdf={qdf} ID deletion write failed: {error}"));
+        let output = writer.get_buffer().unwrap();
+        assert!(
+            output
+                .windows(b"<31415926535897932384626433832795>".len())
+                .any(|window| window == b"<31415926535897932384626433832795>"),
+            "qdf={qdf} must generate a new static ID after callback deletion"
+        );
+        assert!(!output
+            .windows(b"<aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa>".len())
+            .any(|window| window == b"<aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa>"));
+    }
+}
+
+#[test]
+fn qdf_and_normalize_progress_trailer_child_gets_a_late_number() {
+    for qdf in [true, false] {
+        let mut pdf = Pdf::open(Cursor::new(
+            include_bytes!("../../../tests/fixtures/compat/one-page-no-ext.pdf").to_vec(),
+        ))
+        .unwrap();
+        let trailer = pdf.trailer();
+        let child = pdf
+            .make_indirect_object_handle(ObjectHandle::dictionary(vec![(
+                b"/LateTrailerChild".to_vec(),
+                ObjectHandle::integer(42),
+            )]))
+            .unwrap();
+        let mut writer = PdfWriter::new(&mut pdf);
+        writer.set_object_stream_mode(ObjectStreamMode::Disable);
+        writer.set_qdf_mode(qdf);
+        writer.set_content_normalization(!qdf);
+        writer.set_static_id(true);
+        writer.set_output_memory().unwrap();
+        writer.register_progress_reporter(Box::new(move |percent| {
+            if percent == 0 {
+                trailer.replace_key(b"/Z", child.clone())?;
+            }
+            Ok(())
+        }));
+        writer
+            .write()
+            .unwrap_or_else(|error| panic!("qdf={qdf} late trailer write failed: {error}"));
+        let output = writer.get_buffer().unwrap();
+        assert!(
+            output.windows(b"/Z ".len()).any(|window| window == b"/Z "),
+            "qdf={qdf} must serialize the callback's trailer child"
+        );
+    }
+}
+
+#[test]
+fn qdf_late_trailer_streams_reserve_holders_and_ignore_xref_streams() {
+    for xref in [false, true] {
+        let mut pdf = Pdf::open(Cursor::new(
+            include_bytes!("../../../tests/fixtures/compat/one-page-no-ext.pdf").to_vec(),
+        ))
+        .unwrap();
+        let trailer = pdf.trailer();
+        let late_stream = pdf.new_stream_with_data(Rc::new(b"late".to_vec())).unwrap();
+        if xref {
+            late_stream
+                .as_stream_dict()
+                .unwrap()
+                .replace_key(b"/Type", ObjectHandle::name(b"XRef".to_vec()))
+                .unwrap();
+        }
+        let late_integer = pdf
+            .make_indirect_object_handle(ObjectHandle::integer(42))
+            .unwrap();
+        let mut writer = PdfWriter::new(&mut pdf);
+        writer.set_object_stream_mode(ObjectStreamMode::Disable);
+        writer.set_qdf_mode(true);
+        writer.set_static_id(true);
+        writer.set_output_memory().unwrap();
+        writer.register_progress_reporter(Box::new(move |percent| {
+            if percent == 0 {
+                trailer.replace_key(b"/Y", late_stream.clone())?;
+                trailer.replace_key(b"/Z", late_integer.clone())?;
+            }
+            Ok(())
+        }));
+        writer
+            .write()
+            .unwrap_or_else(|error| panic!("xref={xref} late stream write failed: {error}"));
+        let output = writer.get_buffer().unwrap();
+        if xref {
+            assert!(output
+                .windows(b"/Y 0 0 R".len())
+                .any(|window| window == b"/Y 0 0 R"));
+            assert!(output
+                .windows(b"/Z 3 0 R".len())
+                .any(|window| window == b"/Z 3 0 R"));
+        } else {
+            assert!(output
+                .windows(b"/Y 3 0 R".len())
+                .any(|window| window == b"/Y 3 0 R"));
+            assert!(output
+                .windows(b"/Z 5 0 R".len())
+                .any(|window| window == b"/Z 5 0 R"));
+        }
+    }
+}
+
+#[test]
+fn qdf_and_normalize_progress_direct_root_child_gets_a_late_number() {
+    for qdf in [true, false] {
+        let mut pdf = Pdf::open(Cursor::new(
+            include_bytes!("../../../tests/fixtures/compat/direct-root-one-page.pdf").to_vec(),
+        ))
+        .unwrap();
+        let root = pdf.root_handle().unwrap();
+        let child = pdf
+            .make_indirect_object_handle(ObjectHandle::dictionary(vec![(
+                b"/LateDirectRootChild".to_vec(),
+                ObjectHandle::integer(42),
+            )]))
+            .unwrap();
+        let mut writer = PdfWriter::new(&mut pdf);
+        writer.set_object_stream_mode(ObjectStreamMode::Disable);
+        writer.set_qdf_mode(qdf);
+        writer.set_content_normalization(!qdf);
+        writer.set_static_id(true);
+        writer.set_output_memory().unwrap();
+        writer.register_progress_reporter(Box::new(move |percent| {
+            if percent == 0 {
+                root.replace_key(b"/LateDirectRoot", child.clone())?;
+            }
+            Ok(())
+        }));
+        writer
+            .write()
+            .unwrap_or_else(|error| panic!("qdf={qdf} direct-root write failed: {error}"));
+        let output = writer.get_buffer().unwrap();
+        assert!(
+            output
+                .windows(b"/LateDirectRoot 3 0 R".len())
+                .any(|window| window == b"/LateDirectRoot 3 0 R"),
+            "qdf={qdf} must serialize the callback's direct-root child"
+        );
+        assert!(!output
+            .windows(b"3 0 obj\n".len())
+            .any(|window| window == b"3 0 obj\n"));
+    }
+}
+
+#[test]
+fn qdf_discovery_walks_a_direct_stream_dictionary_child() {
+    let mut pdf = Pdf::open(Cursor::new(
+        include_bytes!("../../../tests/fixtures/compat/one-page-no-ext.pdf").to_vec(),
+    ))
+    .unwrap();
+    let direct_stream = ObjectHandle::stream(
+        ObjectHandle::dictionary(vec![
+            (b"/Length".to_vec(), ObjectHandle::integer(4)),
+            (
+                b"/DirectQdfLabel".to_vec(),
+                ObjectHandle::string(b"direct".to_vec()),
+            ),
+        ]),
+        Rc::new(b"data".to_vec()),
+    );
+    pdf.root_handle()
+        .unwrap()
+        .replace_key(b"/DirectQdfStream", direct_stream)
+        .unwrap();
+
+    let mut writer = PdfWriter::new(&mut pdf);
+    writer.set_object_stream_mode(ObjectStreamMode::Disable);
+    writer.set_qdf_mode(true);
+    writer.set_static_id(true);
+    writer.set_output_memory().unwrap();
+    writer.write().unwrap();
+    let output = writer.get_buffer().unwrap();
+    assert!(output
+        .windows(b"/DirectQdfStream".len())
+        .any(|window| window == b"/DirectQdfStream"));
+    assert!(output
+        .windows(b"/DirectQdfLabel".len())
+        .any(|window| window == b"/DirectQdfLabel"));
+}
+
+#[test]
+fn qdf_crypt_cleanup_is_single_pass_for_stream_dictionary_state() {
+    let mut pdf = Pdf::open(Cursor::new(
+        include_bytes!("../../../tests/fixtures/compat/one-page-no-ext.pdf").to_vec(),
+    ))
+    .unwrap();
+    let stream = pdf.new_stream_with_data(Rc::new(b"raw".to_vec())).unwrap();
+    let dictionary = stream.as_stream_dict().unwrap();
+    dictionary
+        .replace_key(
+            b"/Filter",
+            ObjectHandle::array(vec![ObjectHandle::name(b"Crypt".to_vec())]),
+        )
+        .unwrap();
+    dictionary
+        .replace_key(
+            b"/DecodeParms",
+            ObjectHandle::array(vec![ObjectHandle::dictionary(Vec::new())]),
+        )
+        .unwrap();
+    stream.set_filter_on_write(false).unwrap();
+    pdf.root_handle()
+        .unwrap()
+        .replace_key(b"/QdfCryptProbe", stream)
+        .unwrap();
+
+    let mut writer = PdfWriter::new(&mut pdf);
+    writer.set_object_stream_mode(ObjectStreamMode::Disable);
+    writer.set_qdf_mode(true);
+    writer.set_static_id(true);
+    writer.set_output_memory().unwrap();
+    writer.write().unwrap();
+    let output = writer.get_buffer().unwrap();
+
+    let mut rewritten = Pdf::open(Cursor::new(output)).unwrap();
+    let stream_ref = rewritten
+        .root_handle()
+        .unwrap()
+        .try_get_key(b"/QdfCryptProbe")
+        .unwrap()
+        .object_ref()
+        .unwrap();
+    let rewritten_stream = rewritten.get_object_handle(stream_ref);
+    rewritten_stream.get_raw_stream_data().unwrap();
+    let rewritten_dictionary = rewritten_stream.as_stream_dict().unwrap();
+    assert!(rewritten_dictionary
+        .try_get_key(b"/Filter")
+        .unwrap()
+        .as_array()
+        .unwrap()
+        .is_empty());
+    assert!(rewritten_dictionary
+        .try_get_key(b"/DecodeParms")
+        .unwrap()
+        .as_array()
+        .unwrap()
+        .is_empty());
+}
+
+#[test]
 fn progress_callback_stream_replacement_invalidates_the_planned_payload() {
     let mut pdf = Pdf::open(Cursor::new(
         include_bytes!("../../../tests/fixtures/compat/one-page-no-ext.pdf").to_vec(),
