@@ -745,18 +745,33 @@ container は新しい pipeline route を使う。
 qpdf 11.9.0 は `initializePipelineStack` の base `Pl_Count` を final target の直前に
 置き（`QPDFWriter.cc:916-931`）、`writeStandard` が optional `Pl_MD5`、header、
 standard/PCLm seed queue、live `writeObject` walk、xref、trailer/EOF の順にその active
-pipeline へ書く（`:2991-3044`）。`PipelinePopper` は stream/filter segment を finish して
-stack を戻すだけであり、文書全体の `m->pipeline->finish()` は `write()` が
-`writeStandard`/`writeLinearized` の後に一度行う（`:933-956,2187-2205`）。
+pipeline へ書く（`:2991-3044`）。`PipelinePopper` は stream/filter 専用ではなく、
+`willFilterStream` の `Pl_Buffer`、stream/object-stream/xref/hint の encryption または
+buffer scope、linearization pass の discard scope、そして deterministic-ID の `Pl_MD5`
+scopeを push/pop する共通の nested pipeline-stack lifecycle である
+（`:935-971,965-1034,1288-1292,1553-1558,1639-1655,2433-2437,2667-2675,2875-2880`）。
+その destructor は active nested `Pl_Count` を finish して nested stages を pop し、必要なら
+buffer を返すが、qpdf の base final target を nested popper が finish するという意味ではない。
+deterministic-ID では `computeDeterministicIDData` が ID cutoff で digest を取得して MD5 を
+disable し（`:1027-1033,1213-1217`）、`writeStandard` が ID と EOF を書いた後に
+`pp_md5` を解放してその MD5 scope を閉じる（`:3036-3044`）。これは stream payload の
+`Pl_Buffer`/encryption segment scopeとは別の、文書全体の ID-digest scopeである。
+文書全体の base `m->pipeline->finish()` は `write()` が `writeStandard`/`writeLinearized` の
+後に行う（`:933-956,2187-2205`）。
 
 flpdf の non-linearized `PdfWriter` は `WriterOutputSink` を final `OutputTarget` とし、
 plain/QDF/Preserve/Generate/暗号化と PCLm を**同じ一つの** `writer::output::OutputSink`
 へ渡す。`OutputSink` は final target が実際に受理した byte だけを checked `u64`
 position と MD5 へ反映する。従って object と xref の位置は final sink の座標であり、
-short write・`Interrupted`・`WriteZero` もこの境界で処理する。`finish_segment` は一つの
-stream/filter stage の終了、`finish_document` は正常に全 PDF を emission した後の output
-lifecycle であり、stream segment が文書を finalize するものではない
-（`writer/output.rs`; `writer.rs::WriterOutputSink`; `writer.rs::PdfWriter::write`）。
+short write・`Interrupted`・`WriteZero` もこの境界で処理する。`finish_segment` は stream
+payload の境界で呼ばれるが、その意味は qpdf の nested `PipelinePopper` と同一ではなく、
+Rust の `OutputTarget` adapter に依存する。`WriterOutput::Pipeline` target は設定された
+final pipeline の `finish()` を segment boundary で呼ぶことがあり、`WriterOutput::Writer`
+は flush、Memory は no-op である。`finish_document` は全 PDF の emission が EOF まで成功
+した後に呼ばれ、Pipeline adapter では `finish_output` が configured final pipeline を
+finalize する。この adapter lifecycle distinction は qpdf の nested popper が base target を
+finish するという対応付けではない（`writer/output.rs`; `writer.rs::WriterOutputSink`;
+`writer.rs::PdfWriter::write`）。
 
 stream payload、ObjStm member/pair body、xref-stream encoded payload は `/Length`、`/First`、
 member pair offset、xref encoding を決めるためだけの bounded local `Vec` である。
