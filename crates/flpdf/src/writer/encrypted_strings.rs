@@ -118,12 +118,11 @@ impl EncryptedStringEmitter {
             })
     }
 
-    /// Standard-writer counterpart that discovers indirect children at the
-    /// qpdf `unparseChild` boundary instead of consulting a precomputed map.
-    /// String encryption remains inside the same writer-owned data-key scope;
-    /// only the reference allocator changes from a static source map to the
-    /// live queue callback.
-    pub(crate) fn write_handle_object_with_dynamic_ref_map(
+    /// Standard-writer dynamic object emission with the surrounding writer's
+    /// direct-stream policy. This keeps nested stream payload/framing and
+    /// string encryption in one current-object data-key scope.
+    #[allow(clippy::too_many_arguments)] // qpdf keeps output identity, key scope, map, and stream policy independent
+    pub(crate) fn write_handle_object_with_dynamic_ref_map_and_direct_stream_writer(
         &mut self,
         out: &mut Vec<u8>,
         emitted_ref: ObjectRef,
@@ -131,9 +130,10 @@ impl EncryptedStringEmitter {
         object: &ObjectHandle,
         map: &mut dyn FnMut(&ObjectHandle) -> crate::Result<ObjectRef>,
         removed_refs: &std::collections::BTreeSet<ObjectRef>,
+        direct_stream_writer: &mut dyn crate::writer::object::DynamicDirectStreamWriter,
     ) -> crate::Result<()> {
         if emitted_ref == self.encrypt_ref {
-            return write_encryption_dictionary_handle(out, object);
+            return write_encryption_dictionary_handle(out, object); // cov:ignore: /Encrypt is emitted by the writer-owned body/trailer boundary, never through this dynamic body serializer.
         }
 
         let cipher = self.cipher;
@@ -151,11 +151,13 @@ impl EncryptedStringEmitter {
                         plaintext,
                     )
                 };
-                object.write_object_with_dynamic_ref_map_and_string_writer(
+                crate::writer::object::write_object_with_dynamic_ref_map_and_string_writer_and_direct_stream_writer(
+                    object,
                     out,
                     map,
                     removed_refs,
                     &mut write_string,
+                    direct_stream_writer,
                 )
             })
     }

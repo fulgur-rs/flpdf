@@ -165,6 +165,7 @@ pub(crate) trait ObjectWriterEmission {
             "dynamic stream writer map is unavailable for this emission owner".into(),
         ))
     }
+    #[allow(dead_code)] // low-level object serializer test surface; production live consumers inject their stream policy
     fn write_object_with_dynamic_ref_map_and_string_writer<F>(
         &self,
         out: &mut Vec<u8>,
@@ -622,12 +623,14 @@ impl ObjectWriterEmission for ObjectHandle {
     where
         F: FnMut(&mut Vec<u8>, &[u8]) -> Result<()>,
     {
-        unparse_object_walk_with_dynamic_ref_map_and_string_writer(
+        let mut direct_stream_writer = DefaultDynamicDirectStreamWriter;
+        write_object_with_dynamic_ref_map_and_string_writer_and_direct_stream_writer(
             self,
             out,
             map,
             removed_refs,
             write_string,
+            &mut direct_stream_writer,
         )
     }
 
@@ -642,6 +645,7 @@ impl ObjectWriterEmission for ObjectHandle {
     where
         F: FnMut(&mut Vec<u8>, &[u8]) -> Result<()>,
     {
+        let mut direct_stream_writer = DefaultDynamicDirectStreamWriter;
         let entries = stream_dictionary_entries_for_emission(self)?;
         unparse_stream_dict_entries_with_dynamic_ref_map_and_string_writer(
             &entries,
@@ -650,6 +654,7 @@ impl ObjectWriterEmission for ObjectHandle {
             map,
             removed_refs,
             write_string,
+            &mut direct_stream_writer,
         )
     }
 
@@ -2349,7 +2354,124 @@ fn unparse_dict_entries_with_ref_map(
     Ok(())
 }
 
-type DynamicObjectRefMap<'a> = dyn FnMut(&ObjectHandle) -> Result<ObjectRef> + 'a;
+pub(crate) type DynamicObjectRefMap<'a> = dyn FnMut(&ObjectHandle) -> Result<ObjectRef> + 'a;
+
+/// Writer-owned hook for the exceptional case where a direct Stream value is
+/// nested inside an array or dictionary. qpdf still emits that stream's
+/// payload and framing through `unparseObject`; callers supply the stream
+/// policy because filtering/encryption belongs to the surrounding writer.
+pub(crate) trait DynamicDirectStreamWriter {
+    #[allow(clippy::type_complexity)] // the callback preserves qpdf's live map plus current object string-key scope
+    fn write_direct_stream(
+        &mut self,
+        stream: &ObjectHandle,
+        out: &mut Vec<u8>,
+        map: &mut DynamicObjectRefMap<'_>,
+        removed_refs: &BTreeSet<ObjectRef>,
+        write_string: &mut dyn FnMut(&mut Vec<u8>, &[u8]) -> Result<()>,
+    ) -> Result<()>;
+}
+
+pub(crate) struct DefaultDynamicDirectStreamWriter;
+
+impl DynamicDirectStreamWriter for DefaultDynamicDirectStreamWriter {
+    fn write_direct_stream(
+        &mut self,
+        stream: &ObjectHandle,
+        out: &mut Vec<u8>,
+        map: &mut DynamicObjectRefMap<'_>,
+        removed_refs: &BTreeSet<ObjectRef>,
+        write_string: &mut dyn FnMut(&mut Vec<u8>, &[u8]) -> Result<()>,
+    ) -> Result<()> {
+        stream.try_dereference()?;
+        let dict = stream.as_stream_dict().ok_or_else(|| {
+            // cov:ignore-start: the dynamic child dispatch calls this hook only after a stream shape probe
+            Error::Internal("direct stream disappeared during emission".to_string())
+            // cov:ignore-end
+        })?;
+        let data = stream.get_raw_stream_data()?;
+        let dict = dict.unsafe_shallow_copy()?;
+        dict.replace_key(
+            b"/Length",
+            ObjectHandle::integer(i64::try_from(data.len()).map_err(|_| {
+                // cov:ignore-start: an allocatable direct stream payload fits in i64
+                Error::Unsupported("direct stream /Length does not fit in i64".to_string())
+                // cov:ignore-end
+            })?),
+        )?;
+        let entries = stream_dictionary_entries_for_emission(&dict)?;
+        let mut write_string_wrapper = |out: &mut Vec<u8>, value: &[u8]| write_string(out, value);
+        unparse_stream_dict_entries_with_dynamic_ref_map_and_string_writer(
+            &entries,
+            StreamDictionaryOptions::preserve(),
+            out,
+            map,
+            removed_refs,
+            &mut write_string_wrapper,
+            self,
+        )?;
+        out.extend_from_slice(b"\nstream\n");
+        out.extend_from_slice(data.as_ref());
+        out.extend_from_slice(b"\nendstream");
+        Ok(())
+    }
+}
+
+/// Dynamic object emission with an injected direct-stream policy. This is the
+/// specialized counterpart to [`ObjectWriterEmission::write_object_with_dynamic_ref_map`];
+/// the default trait method uses a raw-preserve policy, while encrypted and
+/// filtered writer consumers provide their own qpdf stream boundary.
+pub(crate) fn write_object_with_dynamic_ref_map_and_string_writer_and_direct_stream_writer<F>(
+    handle: &ObjectHandle,
+    out: &mut Vec<u8>,
+    map: &mut DynamicObjectRefMap<'_>,
+    removed_refs: &BTreeSet<ObjectRef>,
+    write_string: &mut F,
+    direct_stream_writer: &mut dyn DynamicDirectStreamWriter,
+) -> Result<()>
+where
+    F: FnMut(&mut Vec<u8>, &[u8]) -> Result<()>,
+{
+    unparse_object_walk_with_dynamic_ref_map_and_string_writer(
+        handle,
+        out,
+        map,
+        removed_refs,
+        write_string,
+        direct_stream_writer,
+    )
+}
+
+#[allow(clippy::too_many_arguments)] // root identity, ADBE pair, dynamic map, and stream policy are separate qpdf dimensions
+pub(crate) fn write_root_object_with_dynamic_ref_map_and_string_writer_and_direct_stream_writer<F>(
+    source: &ObjectHandle,
+    out: &mut Vec<u8>,
+    map: &mut DynamicObjectRefMap<'_>,
+    removed_refs: &BTreeSet<ObjectRef>,
+    final_pdf_version: &str,
+    final_extension_level: i64,
+    apply_adbe_reconciliation: bool,
+    write_string: &mut F,
+    direct_stream_writer: &mut dyn DynamicDirectStreamWriter,
+) -> Result<()>
+where
+    F: FnMut(&mut Vec<u8>, &[u8]) -> Result<()>,
+{
+    let root = root_output_copy_with_adbe(
+        source,
+        final_pdf_version,
+        final_extension_level,
+        apply_adbe_reconciliation,
+    )?;
+    write_object_with_dynamic_ref_map_and_string_writer_and_direct_stream_writer(
+        &root,
+        out,
+        map,
+        removed_refs,
+        write_string,
+        direct_stream_writer,
+    )
+}
 
 fn write_child_with_dynamic_ref_map(
     handle: &ObjectHandle,
@@ -2375,6 +2497,21 @@ fn write_child_with_dynamic_ref_map(
         let mapped = map(handle)?;
         out.extend_from_slice(mapped.to_string().as_bytes());
         return Ok(());
+    }
+    handle.try_dereference()?;
+    if handle.as_stream_dict().is_some() {
+        let mut write_string = |out: &mut Vec<u8>, value: &[u8]| {
+            crate::pdf_syntax::write_string_value(out, value);
+            Ok(())
+        };
+        let mut direct_stream_writer = DefaultDynamicDirectStreamWriter;
+        return direct_stream_writer.write_direct_stream(
+            handle,
+            out,
+            map,
+            removed_refs,
+            &mut write_string,
+        );
     }
     unparse_object_walk_with_dynamic_ref_map(handle, out, map, removed_refs)
 }
@@ -2507,6 +2644,7 @@ fn write_child_with_dynamic_ref_map_and_string_writer<F>(
     map: &mut DynamicObjectRefMap<'_>,
     removed_refs: &BTreeSet<ObjectRef>,
     write_string: &mut F,
+    direct_stream_writer: &mut dyn DynamicDirectStreamWriter,
 ) -> Result<()>
 where
     F: FnMut(&mut Vec<u8>, &[u8]) -> Result<()>,
@@ -2526,12 +2664,23 @@ where
         out.extend_from_slice(map(handle)?.to_string().as_bytes());
         return Ok(());
     }
+    handle.try_dereference()?;
+    if handle.as_stream_dict().is_some() {
+        return direct_stream_writer.write_direct_stream(
+            handle,
+            out,
+            map,
+            removed_refs,
+            write_string,
+        );
+    }
     unparse_object_walk_with_dynamic_ref_map_and_string_writer(
         handle,
         out,
         map,
         removed_refs,
         write_string,
+        direct_stream_writer,
     )
 }
 
@@ -2541,6 +2690,7 @@ fn unparse_object_walk_with_dynamic_ref_map_and_string_writer<F>(
     map: &mut DynamicObjectRefMap<'_>,
     removed_refs: &BTreeSet<ObjectRef>,
     write_string: &mut F,
+    direct_stream_writer: &mut dyn DynamicDirectStreamWriter,
 ) -> Result<()>
 where
     F: FnMut(&mut Vec<u8>, &[u8]) -> Result<()>,
@@ -2581,6 +2731,7 @@ where
                         map,
                         removed_refs,
                         write_string,
+                        direct_stream_writer,
                     )?; // cov:ignore: LLVM attributes the covered dynamic array-child call terminator to callback cleanup.
                 }
                 out.extend_from_slice(b" ]");
@@ -2592,6 +2743,7 @@ where
                     map,
                     removed_refs,
                     write_string,
+                    direct_stream_writer,
                 )?; // cov:ignore: LLVM attributes the covered dynamic dictionary-child call terminator to callback cleanup.
             }
             Some(UnparseContainer::Stream(stream_dict)) => {
@@ -2601,6 +2753,7 @@ where
                     map,
                     removed_refs,
                     write_string,
+                    direct_stream_writer,
                 )?; // cov:ignore: LLVM attributes the covered dynamic stream-child call terminator to callback cleanup.
             }
             None => {}
@@ -2629,6 +2782,7 @@ fn unparse_dict_entries_with_dynamic_ref_map_and_string_writer<F>(
     map: &mut DynamicObjectRefMap<'_>,
     removed_refs: &BTreeSet<ObjectRef>,
     write_string: &mut F,
+    direct_stream_writer: &mut dyn DynamicDirectStreamWriter,
 ) -> Result<()>
 where
     F: FnMut(&mut Vec<u8>, &[u8]) -> Result<()>,
@@ -2650,6 +2804,7 @@ where
                 map,
                 removed_refs,
                 write_string,
+                direct_stream_writer,
             )?; // cov:ignore: LLVM attributes the covered dynamic dictionary call terminator to callback cleanup.
         }
     }
@@ -2664,6 +2819,7 @@ fn unparse_stream_dict_entries_with_dynamic_ref_map_and_string_writer<F>(
     map: &mut DynamicObjectRefMap<'_>,
     removed_refs: &BTreeSet<ObjectRef>,
     write_string: &mut F,
+    direct_stream_writer: &mut dyn DynamicDirectStreamWriter,
 ) -> Result<()>
 where
     F: FnMut(&mut Vec<u8>, &[u8]) -> Result<()>,
@@ -2691,8 +2847,9 @@ where
                 map,
                 removed_refs,
                 write_string,
+                direct_stream_writer,
             )?; // cov:ignore: LLVM attributes the covered dynamic stream-dictionary child call terminator to callback cleanup.
-        }
+        } // cov:ignore: the dynamic stream-dictionary child serializer has already handled the covered success path above.
     }
     if let Some(length) = length_value {
         out.extend_from_slice(b" /Length ");
@@ -2702,8 +2859,9 @@ where
             map,
             removed_refs,
             write_string,
+            direct_stream_writer,
         )?; // cov:ignore: LLVM attributes the covered dynamic stream-length call terminator to callback cleanup.
-    }
+    } // cov:ignore: the dynamic stream-length serializer has already handled the covered success path above.
     if options.add_flate_filter {
         out.extend_from_slice(b" /Filter /FlateDecode");
     }
@@ -4667,7 +4825,7 @@ mod tests {
         let error = reserved
             .write_object_with_dynamic_ref_map_and_string_writer(
                 &mut Vec::new(),
-                &mut |_| Ok(ObjectRef::new(1, 0)),
+                &mut |_| Ok(ObjectRef::new(1, 0)), // cov:ignore: the reserved-object guard returns before invoking this defensive callback.
                 &BTreeSet::new(),
                 &mut write_string,
             )

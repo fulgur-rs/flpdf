@@ -839,7 +839,7 @@ impl<'pdf, R: Read + Seek + 'static> PdfWriter<'pdf, R> {
         // precede the full xref-table walk; a missing Root remains a direct
         // null candidate and is reported later by the normal writer route.
         self.pdf.root_handle()?;
-        let setup = build_writer_setup(self.pdf, &options)?;
+        let mut setup = build_writer_setup(self.pdf, &options)?;
         // Page-tree repair below mutates `self.pdf`'s object graph in place
         // (promoting direct /Kids leaves, cloning duplicate leaves) and is not
         // safe to retry from a partially-mutated state on failure. Close off
@@ -856,6 +856,18 @@ impl<'pdf, R: Read + Seek + 'static> PdfWriter<'pdf, R> {
         // the repaired page order and its three derived maps together so the
         // specialized emitter consumes this setup without another page walk.
         let special_streams = initialize_special_streams(self.pdf, &options)?;
+        if effective_object_stream_mode(&options) == ObjectStreamMode::Generate
+            && !options.qdf
+            && !options.content_normalization
+            && !options.pclm
+        {
+            // qpdf initializes special streams before Generate computes its
+            // compressible membership (`QPDFWriter.cc:2114-2135`). Capture
+            // this snapshot at the same boundary, still before the common
+            // `prepareFileForWrite` call below.
+            setup.generated_compressible =
+                Some(object_streams::compressible_objgens_qpdf_plan(self.pdf)?);
+        }
         // qpdf snapshots `getObjectCount()` for every write, even when no
         // progress reporter is configured (`QPDFWriter.cc:2189-2195`). That
         // call is also the document-owned `fixDanglingReferences` boundary,
@@ -2849,16 +2861,6 @@ pub(crate) fn build_writer_setup<R: Read + Seek>(
     if options.object_streams == ObjectStreamMode::Preserve {
         pdf.get_object_stream_data(&mut source_object_stream_data);
     }
-    let generated_compressible = if effective_object_stream_mode(options)
-        == ObjectStreamMode::Generate
-        && !options.qdf
-        && !options.content_normalization
-        && !options.pclm
-    {
-        Some(object_streams::compressible_objgens_qpdf_plan(pdf)?)
-    } else {
-        None
-    };
     let encrypting = options.encrypt.is_some() || options.copy_encryption.is_some();
     if uses_deterministic_id(options) && encrypting {
         return Err(deterministic_id_encryption_error(options));
@@ -2921,7 +2923,7 @@ pub(crate) fn build_writer_setup<R: Read + Seek>(
         generated_id,
         encryption_parameters,
         source_object_stream_data,
-        generated_compressible,
+        generated_compressible: None,
     })
 }
 
@@ -5908,18 +5910,11 @@ fn emit_specialized_standard_live<R: Read + Seek + 'static, W: Write>(
     // Match qpdf's setup order: object-stream membership is fixed before the
     // write queue starts, but a group is not assigned an output number until a
     // member or its container is encountered by that queue.
-    let planner_options;
-    let copy_generate =
-        options.copy_encryption.is_some() && options.object_streams == ObjectStreamMode::Generate;
-    let planner_config = if options.copy_encryption.is_some() && !copy_generate {
-        planner_options = WriterOptions {
-            object_streams: ObjectStreamMode::Disable,
-            ..options.clone()
-        };
-        object_streams::planner_config_from_options(&planner_options)
-    } else {
-        object_streams::planner_config_from_options(options)
-    };
+    // copyEncryptionParameters supplies encryption material only; qpdf does
+    // not rewrite the selected object-stream mode. Preserve must therefore
+    // retain source ObjStm membership here just like an unencrypted standard
+    // write (`QPDFWriter.cc:651-703,2099-2136`).
+    let planner_config = object_streams::planner_config_from_options(options);
     let generated_reachable = if options.preserve_unreferenced_objects
         && planner_config.mode == ObjectStreamMode::Generate
     {
@@ -5943,7 +5938,7 @@ fn emit_specialized_standard_live<R: Read + Seek + 'static, W: Write>(
         generated_reachable.as_ref(),
         Some(source_object_stream_data),
         generated_compressible,
-    )?;
+    )?; // cov:ignore: LLVM attributes the validated object-stream planning continuation to callback cleanup.
 
     // Encrypted output keeps the Catalog outside ObjStm. This is the only
     // standard live-route placement filter; reachability is intentionally left
@@ -5979,7 +5974,7 @@ fn emit_specialized_standard_live<R: Read + Seek + 'static, W: Write>(
                 // cov:ignore-start: make_indirect_from_object_handle always returns an indirect handle
                 Error::Internal("generated ObjStm placeholder has no source identity".to_string())
                 // cov:ignore-end
-            })?;
+            })?; // cov:ignore: make_indirect_from_object_handle guarantees a source identity for a generated placeholder.
             object_stream_groups
                 .push(object_streams::ObjectStreamGroup::Generated { source, members });
         }
@@ -5999,11 +5994,12 @@ fn emit_specialized_standard_live<R: Read + Seek + 'static, W: Write>(
     let mut effective_xref_form = if has_object_streams {
         XrefForm::Stream
     } else {
-        pdf.last_xref_form()
+        // qpdf selects the standard xref form from its output ObjStm reverse
+        // map, not from the source file's last xref section
+        // (`QPDFWriter.cc:3023-3031`). A specialized Disable/empty-Preserve
+        // write therefore downgrades an input xref stream to a classic table.
+        XrefForm::Table
     };
-    if options.copy_encryption.is_some() && !copy_generate {
-        effective_xref_form = XrefForm::Table;
-    }
     if force_version_below_1_5(options) && !encrypting {
         effective_xref_form = XrefForm::Table;
     }
@@ -6014,7 +6010,7 @@ fn emit_specialized_standard_live<R: Read + Seek + 'static, W: Write>(
         // cov:ignore-start: effective_pdf_version_and_ext already applies the 1.5 ObjStm floor; this is a defensive guard for an invalid/custom version source.
         version = "1.5".to_string();
         // cov:ignore-end
-    }
+    } // cov:ignore: effective_pdf_version_and_ext supplies the required version floor before this defensive correction.
 
     let (det_id_source_id0, det_id_info_suffix): (Option<Vec<u8>>, Vec<u8>) = if deterministic_id {
         let id_handle = pdf.trailer_key_handle(b"ID");
@@ -6067,7 +6063,7 @@ fn emit_specialized_standard_live<R: Read + Seek + 'static, W: Write>(
                     "specialized live writer: /Encrypt object number overflows u32".to_string(),
                 )
                 // cov:ignore-end
-            })?;
+            })?; // cov:ignore: the live queue cannot allocate enough objects to overflow u32.
         ctx.encrypt_ref = ObjectRef::new(encrypt_number, 0);
     }
 
@@ -6127,7 +6123,7 @@ fn emit_specialized_standard_live<R: Read + Seek + 'static, W: Write>(
             &body_map,
             &removed_refs,
             true,
-        )?,
+        )?, // cov:ignore: LLVM attributes the validated canonical trailer snapshot continuation to callback cleanup.
         root: new_root,
         direct_root: direct_root_output
             .as_ref()

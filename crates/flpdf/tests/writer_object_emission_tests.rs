@@ -256,3 +256,127 @@ fn specialized_generate_preserve_unreferenced_uses_setup_snapshot_and_determinis
         .windows(b"/ID [<".len())
         .any(|window| window == b"/ID [<"));
 }
+
+#[test]
+fn specialized_objstm_member_progress_mutation_is_visible_on_the_second_pass() {
+    let mut pdf = Pdf::open(Cursor::new(
+        include_bytes!("../../../tests/fixtures/compat/one-page-no-ext.pdf").to_vec(),
+    ))
+    .unwrap();
+    let root = pdf.root_handle().unwrap();
+    let pages_ref = root
+        .try_get_key(b"/Pages")
+        .unwrap()
+        .object_ref()
+        .expect("fixture has an indirect Pages object");
+    let pages = pdf.get_object_handle(pages_ref);
+    let mut writer = PdfWriter::new(&mut pdf);
+    writer.set_object_stream_mode(ObjectStreamMode::Generate);
+    writer.set_compress_streams(false);
+    writer.set_extra_header_text("% specialized-live-queue");
+    writer.set_static_id(true);
+    writer.set_output_memory().unwrap();
+    let mut calls = 0_u8;
+    writer.register_progress_reporter(Box::new(move |_percent| {
+        calls = calls.saturating_add(1);
+        if calls == 2 {
+            pages.replace_key(b"/MemberProgressProbe", ObjectHandle::integer(42))?;
+        }
+        Ok(())
+    }));
+    writer
+        .write()
+        .expect("specialized Generate member progress mutation succeeds");
+    let output = writer.get_buffer().unwrap();
+    assert!(
+        output
+            .windows(b"/MemberProgressProbe 42".len())
+            .any(|window| window == b"/MemberProgressProbe 42"),
+        "a member mutation made before the second-pass unparse must be emitted"
+    );
+}
+
+#[test]
+fn specialized_nested_direct_stream_keeps_payload_and_framing() {
+    let mut pdf = Pdf::open(Cursor::new(
+        include_bytes!("../../../tests/fixtures/compat/one-page-no-ext.pdf").to_vec(),
+    ))
+    .unwrap();
+    let direct_stream = ObjectHandle::stream(
+        ObjectHandle::dictionary(vec![
+            (b"/Length".to_vec(), ObjectHandle::integer(999)),
+            (
+                b"/DirectStreamLabel".to_vec(),
+                ObjectHandle::string(b"nested".to_vec()),
+            ),
+        ]),
+        Rc::new(b"direct-payload".to_vec()),
+    );
+    pdf.root_handle()
+        .unwrap()
+        .replace_key(b"/DirectStreamProbe", direct_stream)
+        .unwrap();
+    let mut writer = PdfWriter::new(&mut pdf);
+    writer.set_object_stream_mode(ObjectStreamMode::Disable);
+    writer.set_compress_streams(false);
+    writer.set_extra_header_text("% specialized-live-queue");
+    writer.set_static_id(true);
+    writer.set_output_memory().unwrap();
+    writer
+        .write()
+        .expect("specialized direct-stream write succeeds");
+    let output = writer.get_buffer().unwrap();
+    assert!(output
+        .windows(b"/DirectStreamLabel (nested)".len())
+        .any(|window| window == b"/DirectStreamLabel (nested)"));
+    assert!(output
+        .windows(b"stream\ndirect-payloadendstream".len())
+        .any(|window| window == b"stream\ndirect-payloadendstream"));
+}
+
+#[test]
+fn specialized_encrypted_nested_direct_stream_keeps_payload_and_framing() {
+    let mut pdf = Pdf::open(Cursor::new(
+        include_bytes!("../../../tests/fixtures/compat/one-page-no-ext.pdf").to_vec(),
+    ))
+    .unwrap();
+    pdf.root_handle()
+        .unwrap()
+        .replace_key(
+            b"/EncryptedDirectStreamProbe",
+            ObjectHandle::stream(
+                ObjectHandle::dictionary(vec![
+                    (b"/Length".to_vec(), ObjectHandle::integer(999)),
+                    (
+                        b"/DirectStreamLabel".to_vec(),
+                        ObjectHandle::string(b"encrypted-nested".to_vec()),
+                    ),
+                ]),
+                Rc::new(b"encrypted-direct-payload".to_vec()),
+            ),
+        )
+        .unwrap();
+    let mut writer = PdfWriter::new(&mut pdf);
+    writer.set_object_stream_mode(ObjectStreamMode::Disable);
+    writer.set_compress_streams(false);
+    writer.set_extra_header_text("% specialized-live-queue");
+    writer.set_encryption_parameters(EncryptParams::v4_aes128(b"u", b"o"));
+    writer.set_static_id(true);
+    writer.set_static_aes_iv(true);
+    writer.set_output_memory().unwrap();
+    writer.write().expect("specialized encrypted stream write");
+    let output = writer.get_buffer().unwrap();
+
+    assert!(output
+        .windows(b"/Length 48".len())
+        .any(|window| window == b"/Length 48"));
+    assert!(output
+        .windows(b"stream\n".len())
+        .any(|window| window == b"stream\n"));
+    assert!(output
+        .windows(b"endstream /Pages".len())
+        .any(|window| window == b"endstream /Pages"));
+    assert!(!output
+        .windows(b"encrypted-direct-payload".len())
+        .any(|window| window == b"encrypted-direct-payload"));
+}
