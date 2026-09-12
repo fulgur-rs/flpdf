@@ -260,6 +260,21 @@ impl Write for EventWriter {
     }
 }
 
+struct TerminalSinkWriter {
+    events: ProviderEvents,
+}
+
+impl Write for TerminalSinkWriter {
+    fn write(&mut self, _data: &[u8]) -> io::Result<usize> {
+        self.events.record("sink-error");
+        Err(io::Error::other("terminal output sink failure"))
+    }
+
+    fn flush(&mut self) -> io::Result<()> {
+        Ok(())
+    }
+}
+
 #[test]
 fn non_linearized_disable_reaches_the_sink_before_the_next_stream_provider() {
     let events = ProviderEvents(Rc::new(RefCell::new(Vec::new())));
@@ -310,6 +325,46 @@ fn non_linearized_disable_reaches_the_sink_before_the_next_stream_provider() {
             .iter()
             .any(|event| event == "sink-write"),
         "a final-sink write must occur after provider A and before provider B; events: {events:?}"
+    );
+}
+
+#[test]
+fn terminal_output_sink_failure_never_requests_the_second_provider() {
+    let events = ProviderEvents(Rc::new(RefCell::new(Vec::new())));
+    let mut pdf = minimal_pdf();
+    let first = provider_stream(
+        &pdf,
+        PayloadProvider {
+            name: "A",
+            payload: Rc::new(b"provider-payload-A".to_vec()),
+            events: Some(events.clone()),
+        },
+    );
+    let second = provider_stream(
+        &pdf,
+        PayloadProvider {
+            name: "B",
+            payload: Rc::new(b"provider-payload-B".to_vec()),
+            events: Some(events.clone()),
+        },
+    );
+    attach_two_streams(&mut pdf, first, second);
+
+    let mut writer = configure_disable_writer(&mut pdf);
+    writer
+        .set_output_writer(TerminalSinkWriter {
+            events: events.clone(),
+        })
+        .expect("install terminal output sink");
+    let error = writer
+        .write()
+        .expect_err("terminal sink failure must escape the writer");
+
+    assert!(error.to_string().contains("terminal output sink failure"));
+    assert_eq!(
+        events.snapshot(),
+        vec!["provider:A", "sink-error"],
+        "a terminal sink error must stop the queue without retrying A or requesting B"
     );
 }
 
@@ -468,6 +523,7 @@ fn arbitrary_writer_retries_short_positive_writes() {
 
 #[test]
 fn arbitrary_writer_retries_interrupted_writes() {
+    let expected = write_memory_output();
     let bytes = Rc::new(RefCell::new(Vec::new()));
     let mut pdf = minimal_pdf();
     let mut writer = configure_disable_writer(&mut pdf);
@@ -478,7 +534,7 @@ fn arbitrary_writer_retries_interrupted_writes() {
         })
         .expect("install interrupted writer");
     writer.write().expect("write_all must retry Interrupted");
-    assert!(bytes.borrow().starts_with(b"%PDF-"));
+    assert_eq!(bytes.borrow().as_slice(), expected.as_slice());
 }
 
 #[test]
@@ -497,15 +553,7 @@ fn arbitrary_writer_surfaces_write_zero_as_an_io_failure() {
 
 #[test]
 fn memory_output_is_the_one_complete_output_owner() {
-    let mut memory_pdf = minimal_pdf();
-    let mut memory_writer = configure_disable_writer(&mut memory_pdf);
-    memory_writer
-        .set_output_memory()
-        .expect("install memory output");
-    memory_writer.write().expect("memory writer succeeds");
-    let memory_bytes = memory_writer
-        .get_buffer()
-        .expect("memory output can be taken exactly once");
+    let memory_bytes = write_memory_output();
 
     let writer_bytes = Rc::new(RefCell::new(Vec::new()));
     let mut writer_pdf = minimal_pdf();
@@ -518,6 +566,18 @@ fn memory_output_is_the_one_complete_output_owner() {
     writer.write().expect("arbitrary writer succeeds");
 
     assert_eq!(memory_bytes, *writer_bytes.borrow());
+}
+
+fn write_memory_output() -> Vec<u8> {
+    let mut memory_pdf = minimal_pdf();
+    let mut memory_writer = configure_disable_writer(&mut memory_pdf);
+    memory_writer
+        .set_output_memory()
+        .expect("install memory output");
+    memory_writer.write().expect("memory writer succeeds");
+    memory_writer
+        .get_buffer()
+        .expect("memory output can be taken exactly once")
 }
 
 #[test]
