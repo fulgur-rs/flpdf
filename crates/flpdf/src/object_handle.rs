@@ -2935,9 +2935,25 @@ impl ObjectHandle {
         static_descr: impl AsRef<[u8]>,
         var_descr: impl AsRef<[u8]>,
     ) {
+        // qpdf's `setChildDescription` stores a weak parent value and copies
+        // the parent's owning QPDF onto the child at the same time
+        // (`libqpdf/qpdf/QPDFValue.hh:74-83`). The parent value may be
+        // replaced immediately after this call, so retain the effective
+        // resolver on the child rather than relying on the weak description
+        // chain to keep reaching the old shared state. `context` completes
+        // its traversal before this child borrow begins.
+        let parent_context = parent.context();
+        let active_pdf_unique_id = parent_context
+            .as_ref()
+            .and_then(|context| context.pdf_unique_id())
+            .or_else(|| parent.owning_pdf_unique_id());
+        let resolver = parent_context.as_ref().map(Rc::downgrade);
         let parent_shared = parent.0.borrow().shared.clone();
         let shared = self.0.borrow().shared.clone();
-        shared.borrow_mut().description = Some(ObjectDescription::Child(ChildDescription {
+        let mut shared = shared.borrow_mut();
+        shared.identity.resolver = resolver;
+        shared.identity.active_pdf_unique_id = active_pdf_unique_id;
+        shared.description = Some(ObjectDescription::Child(ChildDescription {
             parent: Rc::downgrade(&parent_shared),
             static_descr: static_descr.as_ref().to_vec(),
             var_descr: var_descr.as_ref().to_vec(),
@@ -19861,6 +19877,23 @@ pub(crate) mod warning_emission_tests {
                 "object 3 0 -> dictionary key /Pages: operation for dictionary attempted on object of type null: returning null for attempted key retrieval",
                 "object 3 0 -> dictionary key /Pages -> null returned from getting key  from non-Dictionary: operation for integer attempted on object of type null: returning 0",
             ]
+        );
+    }
+
+    #[test]
+    fn missing_key_warning_context_survives_parent_shared_value_replacement() {
+        let (parent, recorder) =
+            handle_resolving(ObjectValue::Dictionary(std::collections::BTreeMap::new()));
+        let missing = parent.try_get_key(b"/Missing").unwrap();
+
+        let replacement = ObjectHandle::dictionary(Vec::new());
+        parent.assign_value_state(&replacement);
+        drop(replacement);
+
+        assert_eq!(missing.try_get_int_value().unwrap(), 0);
+        assert_eq!(
+            warnings(&recorder),
+            [" -> dictionary key /Missing: operation for integer attempted on object of type null: returning 0"]
         );
     }
 
