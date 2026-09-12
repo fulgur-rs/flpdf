@@ -521,35 +521,6 @@ fn show_object_accepts_a_raw_generation_like_qpdf() {
     assert_eq!(flpdf.stderr, qpdf.stderr);
 }
 
-#[test]
-fn dump_object_accepts_a_raw_generation_like_qpdf() {
-    if !qpdf_available() {
-        if std::env::var_os("CI").is_some() {
-            panic!("{EXPECTED_QPDF_VERSION} is required for this parity test on CI");
-        }
-        eprintln!("skipping: {EXPECTED_QPDF_VERSION} is not available");
-        return;
-    }
-
-    let temp = tempfile::tempdir().expect("temporary directory");
-    let input = temp.path().join("matching-in-use-generation-65536.pdf");
-    std::fs::write(&input, matching_in_use_generation_65536_pdf()).expect("write fixture");
-    let qpdf = ProcessCommand::new("qpdf")
-        .args(["--show-object=5,65536", input.to_str().unwrap()])
-        .output()
-        .expect("qpdf should spawn");
-    let flpdf = Command::cargo_bin("flpdf")
-        .expect("flpdf should build")
-        .env("FLPDF_PROGNAME", "qpdf")
-        .args(["dump-object", "5,65536", input.to_str().unwrap()])
-        .output()
-        .expect("flpdf should spawn");
-
-    assert_eq!(flpdf.status.code(), qpdf.status.code());
-    assert_eq!(flpdf.stdout, qpdf.stdout);
-    assert_eq!(flpdf.stderr, qpdf.stderr);
-}
-
 /// Both identity maps name objects in one output number space, so the
 /// allocation counter has to span them. Numbering the ordinary map alone hands
 /// out a number a raw-identity object already holds; the later xref entry then
@@ -611,30 +582,6 @@ fn raw_and_ordinary_objects_get_distinct_output_numbers() {
     }
 }
 
-/// A stream selected by its raw identity must serialize like any other stream.
-/// Emitting only the indirect reference would drop the dictionary, framing and
-/// bytes this command exists to print.
-#[test]
-fn dump_object_prints_stream_data_for_a_raw_identity() {
-    let temp = tempfile::tempdir().expect("temporary directory");
-    let input = temp.path().join("raw-generation-stream.pdf");
-    std::fs::write(&input, raw_generation_stream_pdf()).expect("write fixture");
-
-    let output = Command::cargo_bin("flpdf")
-        .expect("flpdf should build")
-        .env("FLPDF_PROGNAME", "qpdf")
-        .args(["dump-object", "5,65536"])
-        .arg(&input)
-        .output()
-        .expect("flpdf should spawn");
-    assert!(output.status.success());
-    let stdout = String::from_utf8_lossy(&output.stdout);
-    assert!(
-        stdout.contains("/Length") && stdout.contains("stream") && stdout.contains("raw gen"),
-        "raw dump-object must print the stream dictionary and data, got {stdout:?}"
-    );
-}
-
 /// A catalog, a page tree, an unreferenced object whose header generation is
 /// outside the `N G R` range, and an ordinary unreferenced object numbered
 /// above it.
@@ -653,28 +600,6 @@ fn raw_and_ordinary_orphans_pdf() -> Vec<u8> {
         ),
         (5, 65_536, b"45".as_slice()),
         (6, 0, b"(ordinary orphan)".as_slice()),
-    ])
-}
-
-fn raw_generation_stream_pdf() -> Vec<u8> {
-    build_fixture(&[
-        (1, 0, b"<< /Type /Catalog /Pages 2 0 R >>".as_slice()),
-        (
-            2,
-            0,
-            b"<< /Type /Pages /Kids [3 0 R] /Count 1 >>".as_slice(),
-        ),
-        (
-            3,
-            0,
-            b"<< /Type /Page /Parent 2 0 R /MediaBox [0 0 200 200] /Contents 5 65536 R >>"
-                .as_slice(),
-        ),
-        (
-            5,
-            65_536,
-            b"<< /Length 11 >>\nstream\n(raw gen)\n\nendstream".as_slice(),
-        ),
     ])
 }
 

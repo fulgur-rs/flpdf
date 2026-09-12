@@ -87,7 +87,6 @@ Common subcommands (`flpdf <subcommand> --help` for full options):
 ```bash
 flpdf check input.pdf                       # validate structure / report diagnostics
 flpdf pages input.pdf                       # show page structure
-flpdf dump-object 7 0 input.pdf             # dump one indirect object
 flpdf qdf      input.pdf  out.qdf           # qdf-style flat dump
 flpdf rewrite  input.pdf  out.pdf           # fresh full rewrite
 flpdf rewrite --linearize    in.pdf out.pdf # produce a linearized PDF

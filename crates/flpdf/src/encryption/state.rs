@@ -150,13 +150,6 @@ impl EncryptionState {
         }
     }
 
-    /// Whether qpdf would prepend a decryption stage for this stream method,
-    /// without applying the unknown-filter state rewrite.
-    pub(crate) fn stream_method_transforms(&self, method: Option<EncryptionMode>) -> bool {
-        let method = method.unwrap_or(self.cf_stream);
-        self.encryption_v < 4 || !matches!(method, EncryptionMode::Identity)
-    }
-
     /// qpdf `QPDF::getKeyForObject` cache semantics. The cache key is only the
     /// object/generation pair; `use_aes` is intentionally omitted.
     #[allow(dead_code)]
