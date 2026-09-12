@@ -191,7 +191,7 @@ GitHub Actions.
 - Consumes: `OutputSink` from Task 2 and existing `ObjectWriterEmission` methods.
 - Produces: the same crate-private serializer methods with `&mut OutputSink` output, while test-only callers use a target-backed sink.
 
-- [ ] **Step 1: Change ObjectWriterEmission signatures once.**
+- [x] **Step 1: Change ObjectWriterEmission signatures once.**
 
   Replace production `out: &mut Vec<u8>` parameters and string-writer
   callbacks with `out: &mut OutputSink`. Keep method names and argument order
@@ -199,7 +199,7 @@ GitHub Actions.
   implementation and caller in the writer and linearized modules; do not add
   parallel `*_to_sink`/`*_to_vec` production methods.
 
-- [ ] **Step 2: Convert serializer writes to fallible sink writes.**
+- [x] **Step 2: Convert serializer writes to fallible sink writes.**
 
   Replace `push`, `extend_from_slice`, and `write!` calls for final output with
   `OutputSink::write_bytes`/format helpers. Preserve qpdf null-key visibility,
@@ -207,7 +207,7 @@ GitHub Actions.
   dynamic child callback order. A serializer error must stop before any next
   provider request.
 
-- [ ] **Step 3: Keep local buffers explicit and move-owned.**
+- [x] **Step 3: Keep local buffers explicit and move-owned.**
 
   For stream payload, ObjStm member body, and xref-stream payload helpers, wrap
   their local Vec in a target-backed sink only while constructing that local
@@ -215,14 +215,14 @@ GitHub Actions.
   one sink write. Do not pass local coordinates into the final `OutputSink`
   counter until the payload is actually emitted.
 
-- [ ] **Step 4: Adapt test helpers and linearized callers.**
+- [x] **Step 4: Adapt test helpers and linearized callers.**
 
   Update existing serializer tests to construct a target-backed `OutputSink`
   and compare its Vec. Linearization may retain its own pass buffers and
   back-patch regions, but must use the migrated serializer surface through a
   local sink adapter; no linearized ownership redesign is allowed here.
 
-- [ ] **Step 5: Run serializer and writer focused tests.**
+- [x] **Step 5: Run serializer and writer focused tests.**
 
   ```bash
   cargo test -p flpdf --lib writer::object
@@ -233,7 +233,7 @@ GitHub Actions.
   git diff --check
   ```
 
-- [ ] **Step 6: Commit the canonical serializer migration.**
+- [x] **Step 6: Commit the canonical serializer migration.**
 
   ```bash
   git add crates/flpdf/src/writer/object.rs crates/flpdf/src/writer/serialize.rs crates/flpdf/src/writer/object_streams/emission.rs crates/flpdf/src/linearization
