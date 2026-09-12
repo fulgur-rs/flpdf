@@ -15,10 +15,14 @@ pub(crate) use emission::{
 };
 pub use planning::ObjectStreamMode;
 pub(crate) use planning::{
-    filter_objstm_batches_for_output, plan_object_streams_with_reachability_and_source_membership,
-    plan_qpdf_preserve_object_streams_with_source_membership,
+    filter_objstm_batches_for_output, plan_qpdf_preserve_object_streams_with_source_membership,
     plan_qpdf_preserve_object_streams_with_unreferenced, planner_config_from_options,
     sort_members_qpdf_order, ObjectStreamGroup, PlannerConfig,
+};
+#[cfg(test)]
+pub(crate) use planning::{
+    plan_object_streams_with_reachability,
+    plan_object_streams_with_reachability_and_source_membership,
 };
 
 // ── Tests ────────────────────────────────────────────────────────────────────

@@ -58,12 +58,7 @@ pub(crate) fn seed_handles<R: Read + Seek>(pdf: &mut Pdf<R>) -> Result<Vec<Objec
 
 #[cfg(test)]
 use crate::writer::rewrite_renumber::collect_canonical_children;
-#[cfg(test)]
-use crate::ObjectRef;
-#[cfg(test)]
-use std::collections::HashMap;
 
-#[cfg(test)]
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub(crate) enum Item {
     Source {
@@ -75,7 +70,6 @@ pub(crate) enum Item {
     },
 }
 
-#[cfg(test)]
 #[derive(Clone, Debug)]
 pub(crate) struct Plan {
     pub(crate) items: Vec<Item>,
@@ -85,7 +79,6 @@ pub(crate) struct Plan {
     pub(crate) direct_root: Option<ObjectHandle>,
 }
 
-#[cfg(test)]
 impl Plan {
     pub(crate) fn build<R: Read + Seek>(pdf: &mut Pdf<R>) -> Result<Self> {
         let root_candidate = pdf.trailer_key_handle(b"Root");
@@ -148,7 +141,6 @@ impl Plan {
     }
 }
 
-#[cfg(test)]
 struct Builder<'pdf, R: Read + Seek + 'static> {
     pdf: &'pdf mut Pdf<R>,
     items: Vec<Item>,
@@ -156,7 +148,6 @@ struct Builder<'pdf, R: Read + Seek + 'static> {
     next_output: u32,
 }
 
-#[cfg(test)]
 impl<R: Read + Seek + 'static> Builder<'_, R> {
     fn enqueue_reference(&mut self, source: ObjectRef) -> Option<ObjectRef> {
         if source.number == 0 || self.old_to_new.contains_key(&source) {

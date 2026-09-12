@@ -411,6 +411,8 @@ fn emit_live_body<R: Read + Seek + 'static>(
     root_source: Option<ObjectRef>,
     removed_refs: BTreeSet<ObjectRef>,
     object_streams: &[crate::writer::object_streams::ObjectStreamGroup],
+    encryption_context: Option<&crate::writer::EncryptionContext>,
+    content_container_refs: &BTreeSet<ObjectRef>,
 ) -> crate::Result<LiveBodyOutput> {
     out.write_bytes(format!("%PDF-{version}\n").as_bytes())?;
     out.write_bytes(QPDF_BINARY_MARKER)?;
@@ -428,6 +430,7 @@ fn emit_live_body<R: Read + Seek + 'static>(
     if options.qdf {
         out.write_bytes(b"%QDF-1.0\n\n")?;
     }
+    out.write_bytes(options.extra_header_text.as_bytes())?;
     let mut layout = BodyLayout::default();
     let mut emitter = LiveObjectEmitter {
         pdf,
@@ -441,12 +444,19 @@ fn emit_live_body<R: Read + Seek + 'static>(
         removed_refs,
         lengths: BTreeMap::new(),
         encryption: crate::writer::encryption_state::WriterEncryptionState::new(
-            false,
-            Vec::new(),
-            false,
-            0,
-            0,
+            encryption_context.is_some(),
+            encryption_context
+                .map(|context| context.file_key.clone())
+                .unwrap_or_default(),
+            encryption_context
+                .is_some_and(|context| crate::writer::cipher_needs_aes_iv(context.cipher)),
+            encryption_context.map_or(0, |context| context.encryption_v),
+            encryption_context.map_or(0, |context| context.encryption_r),
         ),
+        encrypted_strings: encryption_context
+            .map(crate::writer::encrypted_strings::EncryptedStringEmitter::from_context),
+        encryption_context,
+        content_container_refs: content_container_refs.clone(),
         current_raw_output: None,
         page_sequences,
         contents_sequences,
@@ -487,6 +497,8 @@ pub(crate) fn emit_live<R: Read + Seek + 'static>(
     root_source: Option<ObjectRef>,
     removed_refs: BTreeSet<ObjectRef>,
     object_streams: &[crate::writer::object_streams::ObjectStreamGroup],
+    encryption_context: Option<&crate::writer::EncryptionContext>,
+    content_container_refs: &BTreeSet<ObjectRef>,
 ) -> crate::Result<LiveBodyOutput> {
     emit_live_body(
         pdf,
@@ -497,6 +509,8 @@ pub(crate) fn emit_live<R: Read + Seek + 'static>(
         root_source,
         removed_refs,
         object_streams,
+        encryption_context,
+        content_container_refs,
     )
 }
 
@@ -587,6 +601,8 @@ pub(crate) fn emit_bodies<R: Read + Seek>(
         plan.root_source,
         plan.removed_refs.clone(),
         &groups,
+        None,
+        &BTreeSet::new(),
     )
 }
 
@@ -602,6 +618,9 @@ struct LiveObjectEmitter<'pdf, 'output, 'sink, R: Read + Seek + 'static> {
     removed_refs: BTreeSet<ObjectRef>,
     lengths: BTreeMap<u32, usize>,
     encryption: crate::writer::encryption_state::WriterEncryptionState,
+    encrypted_strings: Option<crate::writer::encrypted_strings::EncryptedStringEmitter>,
+    encryption_context: Option<&'pdf crate::writer::EncryptionContext>,
+    content_container_refs: BTreeSet<ObjectRef>,
     current_raw_output: Option<ObjectRef>,
     page_sequences: BTreeMap<ObjectRef, usize>,
     contents_sequences: BTreeMap<ObjectRef, usize>,
@@ -700,22 +719,65 @@ impl<'pdf, 'output, 'sink, R: Read + Seek + 'static> crate::writer::write_object
         _in_object_stream: bool,
     ) -> crate::Result<()> {
         self.current_stream_length = None;
+        if object
+            .object_ref()
+            .is_some_and(|source| self.content_container_refs.contains(&source))
+        {
+            self.enqueue_surviving_children(object)?;
+            let queued_map = self.queue.borrow().old_to_new.clone();
+            let static_map = |object_ref| map_queued_output(&queued_map, object_ref);
+            let output = self.output_number(object.object_ref().unwrap_or(ObjectRef::new(0, 0)))?;
+            if let Some(emitter) = self.encrypted_strings.as_mut() {
+                emitter.write_handle_content_container_with_ref_map(
+                    self.out,
+                    ObjectRef::new(output, 0),
+                    None,
+                    object,
+                    self.options,
+                    &static_map,
+                    &self.removed_refs,
+                )?;
+            } else {
+                emit_content_container_from_handle_with_ref_map(
+                    object,
+                    self.options,
+                    self.out,
+                    &static_map,
+                    &self.removed_refs,
+                )?;
+            }
+            return Ok(());
+        }
         if self.root_source == object.object_ref() {
-            if self.options.qdf {
+            if self.encrypted_strings.is_some() || self.options.qdf {
                 let root = object.output_root_copy_with_adbe(
                     self.version,
                     self.final_extension_level,
-                    true,
+                    self.options.qdf,
                 )?;
                 self.enqueue_surviving_children(&root)?;
                 let queued_map = self.queue.borrow().old_to_new.clone();
                 let static_map = |object_ref| map_queued_output(&queued_map, object_ref);
-                root.write_object_qdf_with_ref_map_and_removed(
-                    self.out,
-                    0,
-                    &static_map,
-                    &self.removed_refs,
-                )?;
+                let output =
+                    self.output_number(object.object_ref().unwrap_or(ObjectRef::new(0, 0)))?;
+                if let Some(emitter) = self.encrypted_strings.as_mut() {
+                    emitter.write_handle_object_with_ref_map(
+                        self.out,
+                        ObjectRef::new(output, 0),
+                        None,
+                        &root,
+                        self.options.qdf,
+                        &static_map,
+                        &self.removed_refs,
+                    )?;
+                } else {
+                    root.write_object_qdf_with_ref_map_and_removed(
+                        self.out,
+                        0,
+                        &static_map,
+                        &self.removed_refs,
+                    )?;
+                }
             } else {
                 let mut map = |child: &ObjectHandle| {
                     self.queue
@@ -751,8 +813,28 @@ impl<'pdf, 'output, 'sink, R: Read + Seek + 'static> crate::writer::write_object
                 dictionary_options,
             )?;
             self.enqueue_surviving_handles(surviving_children)?;
+            let output_number = self.output_number(source.unwrap_or(ObjectRef::new(0, 0)))?;
+            let emitted_ref = ObjectRef::new(output_number, 0);
+            let encryption_context = self.encryption_context;
+            let encrypt_stream = encryption_context
+                .is_some_and(|context| context.encrypt_metadata || context.metadata_ref != source);
+            let mut stream_length = data.len();
+            if let Some(context) = encryption_context {
+                crate::writer::adjust_aes_stream_length(
+                    &mut stream_length,
+                    context,
+                    encrypt_stream,
+                )?;
+                dict.replace_key(
+                    b"/Length",
+                    ObjectHandle::integer(i64::try_from(stream_length).map_err(|_| {
+                        crate::Error::Unsupported("stream /Length does not fit in i64".into())
+                    })?),
+                )?;
+            }
+            let queued_map = self.queue.borrow().old_to_new.clone();
+            let static_map = |object_ref| map_queued_output(&queued_map, object_ref);
             if self.options.qdf {
-                let output_number = self.output_number(source.unwrap_or(ObjectRef::new(0, 0)))?;
                 let holder = self
                     .queue
                     .borrow()
@@ -764,24 +846,52 @@ impl<'pdf, 'output, 'sink, R: Read + Seek + 'static> crate::writer::write_object
                             "plain live writer: stream {output_number} has no length holder"
                         ))
                     })?;
-                let queued_map = self.queue.borrow().old_to_new.clone();
-                let static_map = |object_ref| map_queued_output(&queued_map, object_ref);
-                dict.write_stream_body_qdf_with_ref_map_and_removed_and_length_with_options(
-                    self.out,
-                    0,
-                    &static_map,
-                    &self.removed_refs,
-                    Some(holder),
-                    dictionary_options,
-                )?;
-                serialize::write_stream_payload_with_qdf(
-                    self.out,
-                    &data,
-                    self.options.newline_before_endstream,
-                    true,
-                )?;
+                if let Some(emitter) = self.encrypted_strings.as_mut() {
+                    emitter.write_handle_stream_dict_with_ref_map(
+                        self.out,
+                        emitted_ref,
+                        None,
+                        &dict,
+                        crate::writer::encrypted_strings::StreamDictOptions::new(
+                            true,
+                            dictionary_options,
+                            encrypt_stream,
+                        ),
+                        &static_map,
+                        &self.removed_refs,
+                        Some(holder),
+                    )?;
+                } else {
+                    dict.write_stream_body_qdf_with_ref_map_and_removed_and_length_with_options(
+                        self.out,
+                        0,
+                        &static_map,
+                        &self.removed_refs,
+                        Some(holder),
+                        dictionary_options,
+                    )?;
+                }
+                if let Some(context) = encryption_context {
+                    crate::writer::write_stream_payload_with_pipeline_qdf(
+                        self.out,
+                        &data,
+                        self.options.newline_before_endstream,
+                        true,
+                        emitted_ref,
+                        context,
+                        encrypt_stream,
+                        None,
+                    )?;
+                } else {
+                    serialize::write_stream_payload_with_qdf(
+                        self.out,
+                        &data,
+                        self.options.newline_before_endstream,
+                        true,
+                    )?;
+                }
                 self.current_stream_length = Some(IndirectStreamLength {
-                    cur_stream_length: data.len(),
+                    cur_stream_length: stream_length,
                     added_newline: serialize::framing_adds_newline_with_qdf(
                         &data,
                         self.options.newline_before_endstream,
@@ -789,38 +899,67 @@ impl<'pdf, 'output, 'sink, R: Read + Seek + 'static> crate::writer::write_object
                     ),
                 });
             } else {
-                let mut map = |child: &ObjectHandle| {
-                    self.queue
-                        .borrow_mut()
-                        .enqueue_handle(self.pdf, child.clone())?
-                        .ok_or_else(|| {
-                            crate::Error::Unsupported(
-                                "plain live writer: child is direct or removed".to_string(),
-                            )
-                        })
-                };
-                dict.write_stream_body_with_dynamic_ref_map(
-                    self.out,
-                    dictionary_options,
-                    &mut map,
-                    &self.removed_refs,
-                )?;
-                serialize::write_stream_payload(
-                    self.out,
-                    &data,
-                    self.options.newline_before_endstream,
-                )?;
+                if let Some(emitter) = self.encrypted_strings.as_mut() {
+                    emitter.write_handle_stream_dict_with_ref_map(
+                        self.out,
+                        emitted_ref,
+                        None,
+                        &dict,
+                        crate::writer::encrypted_strings::StreamDictOptions::new(
+                            false,
+                            dictionary_options,
+                            encrypt_stream,
+                        ),
+                        &static_map,
+                        &self.removed_refs,
+                        None,
+                    )?;
+                    crate::writer::write_stream_payload_with_pipeline(
+                        self.out,
+                        &data,
+                        self.options.newline_before_endstream,
+                        emitted_ref,
+                        encryption_context.expect("encrypted emitter has a context"),
+                        encrypt_stream,
+                        None,
+                    )?;
+                } else {
+                    dict.write_stream_body_with_ref_map_and_removed_with_options(
+                        self.out,
+                        dictionary_options,
+                        &static_map,
+                        &self.removed_refs,
+                    )?;
+                    serialize::write_stream_payload(
+                        self.out,
+                        &data,
+                        self.options.newline_before_endstream,
+                    )?;
+                }
             }
-        } else if self.options.qdf {
+        } else if self.encrypted_strings.is_some() || self.options.qdf {
             self.enqueue_surviving_children(object)?;
             let queued_map = self.queue.borrow().old_to_new.clone();
             let static_map = |object_ref| map_queued_output(&queued_map, object_ref);
-            object.write_object_qdf_with_ref_map_and_removed(
-                self.out,
-                0,
-                &static_map,
-                &self.removed_refs,
-            )?;
+            let output = self.output_number(object.object_ref().unwrap_or(ObjectRef::new(0, 0)))?;
+            if let Some(emitter) = self.encrypted_strings.as_mut() {
+                emitter.write_handle_object_with_ref_map(
+                    self.out,
+                    ObjectRef::new(output, 0),
+                    None,
+                    object,
+                    self.options.qdf,
+                    &static_map,
+                    &self.removed_refs,
+                )?;
+            } else {
+                object.write_object_qdf_with_ref_map_and_removed(
+                    self.out,
+                    0,
+                    &static_map,
+                    &self.removed_refs,
+                )?;
+            }
         } else {
             let mut map = |child: &ObjectHandle| {
                 self.queue
@@ -1019,13 +1158,25 @@ impl<'pdf, 'output, 'sink, R: Read + Seek + 'static> LiveObjectEmitter<'pdf, 'ou
         let offset = self.output_count()?;
         self.out
             .write_bytes(format!("{} {} obj\n", output.number, output.generation).as_bytes())?;
-        serialize::write_objstm_stream_with_extends(
-            self.out,
-            body,
-            self.options.compress_streams,
-            self.options.newline_before_endstream,
-            extends,
-        )?; // cov:ignore: error arm requires an in-memory zlib encoder failure
+        if let Some(context) = self.encryption_context {
+            serialize::write_encrypted_objstm_stream_with_extends(
+                self.out,
+                body,
+                self.options.compress_streams,
+                self.options.newline_before_endstream,
+                extends,
+                output,
+                context,
+            )?;
+        } else {
+            serialize::write_objstm_stream_with_extends(
+                self.out,
+                body,
+                self.options.compress_streams,
+                self.options.newline_before_endstream,
+                extends,
+            )?;
+        } // cov:ignore: error arm requires an in-memory zlib encoder failure
         self.out.write_bytes(b"\nendobj\n")?;
         self.layout
             .uncompressed
@@ -1241,13 +1392,25 @@ impl<'pdf, 'output, 'sink, R: Read + Seek + 'static> LiveObjectEmitter<'pdf, 'ou
         let offset = self.output_count()?;
         self.out
             .write_bytes(format!("{} {} obj\n", output.number, output.generation).as_bytes())?;
-        serialize::write_objstm_stream_with_extends_qdf(
-            self.out,
-            body,
-            extends,
-            qdf_first_offset,
-            self.options.newline_before_endstream,
-        )?;
+        if let Some(context) = self.encryption_context {
+            serialize::write_encrypted_objstm_stream_with_extends_qdf(
+                self.out,
+                body,
+                extends,
+                qdf_first_offset,
+                self.options.newline_before_endstream,
+                output,
+                context,
+            )?;
+        } else {
+            serialize::write_objstm_stream_with_extends_qdf(
+                self.out,
+                body,
+                extends,
+                qdf_first_offset,
+                self.options.newline_before_endstream,
+            )?;
+        }
         self.out.write_bytes(b"\nendobj\n\n")?;
         self.layout
             .uncompressed
@@ -1629,6 +1792,7 @@ where
         self.out.write_bytes(b"\nstream\n")?;
         self.out
             .write_bytes(stream.get_raw_stream_data()?.as_ref())?;
+        self.out.finish_segment()?;
         self.out.write_bytes(b"\nendstream")
     }
 }
@@ -2317,6 +2481,8 @@ mod object_emitter_tests {
                 root_source,
                 BTreeSet::new(),
                 &[],
+                None,
+                &BTreeSet::new(),
             )
         })?; // cov:ignore: LLVM attributes the live-body test call terminator to callback cleanup.
         assert!(!bytes.is_empty());
@@ -2508,6 +2674,8 @@ mod object_emitter_tests {
                 root_source,
                 BTreeSet::new(),
                 &object_streams,
+                None,
+                &BTreeSet::new(),
             )
         })?; // cov:ignore: LLVM attributes the live-body test call terminator to callback cleanup.
         assert!(bytes
@@ -2551,6 +2719,8 @@ mod object_emitter_tests {
                 root_source,
                 BTreeSet::new(),
                 &object_streams,
+                None,
+                &BTreeSet::new(),
             )
         })?; // cov:ignore: LLVM attributes the live-body test call terminator to callback cleanup.
         let predecessor_output = body

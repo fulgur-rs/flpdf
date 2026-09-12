@@ -55,6 +55,11 @@ pub(crate) fn write_stream_payload_with_qdf(
 ) -> crate::Result<()> {
     out.write_bytes(b"\nstream\n")?;
     out.write_bytes(data)?;
+    // QPDFWriter's stream-data PipelinePopper finishes the active stream
+    // segment before `endstream` is emitted. The final output position and
+    // deterministic-ID digest belong to OutputSink and deliberately survive
+    // this nested finish boundary.
+    out.finish_segment()?;
     if framing_adds_newline_with_qdf(data, policy, qdf_mode) {
         out.write_bytes(b"\n")?;
     }
@@ -108,6 +113,49 @@ pub(crate) fn write_objstm_stream_with_extends(
     write_stream_payload(out, &data, policy)
 }
 
+/// Encrypted sibling of [`write_objstm_stream_with_extends`]. The ObjStm body
+/// remains the one qpdf-required container buffer; encoded bytes are consumed
+/// directly by the encryption stage and never copied into a document buffer.
+pub(crate) fn write_encrypted_objstm_stream_with_extends(
+    out: &mut OutputSink<'_>,
+    body: object_streams::ObjStmBody,
+    compress: CompressStreams,
+    policy: NewlineBeforeEndstream,
+    extends: Option<crate::ObjectRef>,
+    object_ref: crate::ObjectRef,
+    context: &crate::writer::EncryptionContext,
+) -> crate::Result<()> {
+    let first_offset = body.first_offset;
+    let n_members = body.n_members;
+    let body_bytes = body.bytes;
+    let data = match compress {
+        CompressStreams::Yes => {
+            let encoded = crate::stream_filter::encode_flate(&body_bytes)?;
+            drop(body_bytes);
+            encoded
+        }
+        CompressStreams::No => body_bytes,
+    };
+    let mut stream_length = data.len();
+    crate::writer::adjust_aes_stream_length(&mut stream_length, context, true)?;
+    out.write_bytes(b"<< /Type /ObjStm /Length ")?;
+    out.write_bytes(stream_length.to_string().as_bytes())?;
+    if matches!(compress, CompressStreams::Yes) {
+        out.write_bytes(b" /Filter /FlateDecode")?;
+    }
+    out.write_bytes(format!(" /N {n_members} /First {first_offset}").as_bytes())?;
+    if let Some(extends) = extends {
+        out.write_bytes(
+            format!(" /Extends {} {} R", extends.number, extends.generation).as_bytes(),
+        )?;
+    }
+    out.write_bytes(b" >>")?;
+    crate::writer::write_stream_payload_with_pipeline(
+        out, &data, policy, object_ref, context, true, None,
+    )?;
+    Ok(())
+}
+
 /// Emit an object-stream container in qpdf QDF layout. QDF keeps the body
 /// uncompressed, writes the structural dictionary one entry per line, and
 /// applies the QDF stream framing rule (`QPDFWriter.cc:1620-1775`).
@@ -131,6 +179,44 @@ pub(crate) fn write_objstm_stream_with_extends_qdf(
     }
     out.write_bytes(b">>")?;
     write_stream_payload_with_qdf(out, &data, newline_before_endstream, true)
+}
+
+/// QDF-formatted encrypted ObjStm using the same one-container buffer and
+/// stream-segment finish boundary as ordinary encrypted streams.
+pub(crate) fn write_encrypted_objstm_stream_with_extends_qdf(
+    out: &mut OutputSink<'_>,
+    body: object_streams::ObjStmBody,
+    extends: Option<crate::ObjectRef>,
+    first_offset: usize,
+    newline_before_endstream: NewlineBeforeEndstream,
+    object_ref: crate::ObjectRef,
+    context: &crate::writer::EncryptionContext,
+) -> crate::Result<()> {
+    let n_members = body.n_members;
+    let data = body.bytes;
+    let mut stream_length = data.len();
+    crate::writer::adjust_aes_stream_length(&mut stream_length, context, true)?;
+    out.write_bytes(b"<<\n  /Type /ObjStm\n")?;
+    out.write_bytes(format!("  /Length {stream_length}\n").as_bytes())?;
+    out.write_bytes(format!("  /N {n_members}\n").as_bytes())?;
+    out.write_bytes(format!("  /First {first_offset}\n").as_bytes())?;
+    if let Some(extends) = extends {
+        out.write_bytes(
+            format!("  /Extends {} {} R\n", extends.number, extends.generation).as_bytes(),
+        )?;
+    }
+    out.write_bytes(b">>")?;
+    crate::writer::write_stream_payload_with_pipeline_qdf(
+        out,
+        &data,
+        newline_before_endstream,
+        true,
+        object_ref,
+        context,
+        true,
+        None,
+    )?;
+    Ok(())
 }
 
 pub(crate) mod xref_stream {

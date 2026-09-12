@@ -391,15 +391,17 @@ fn append_objstm_container_object<R: Read + Seek>(
     })?;
     bytes.extend_from_slice(b" >>");
     if let Some(ctx) = encrypt_ctx {
-        crate::writer::write_stream_payload_with_pipeline(
-            bytes,
-            &data,
-            options.newline_before_endstream,
-            object_ref,
-            ctx,
-            true,
-            None,
-        )?;
+        crate::writer::output::with_buffer_sink(bytes, |out| {
+            crate::writer::write_stream_payload_with_pipeline(
+                out,
+                &data,
+                options.newline_before_endstream,
+                object_ref,
+                ctx,
+                true,
+                None,
+            )
+        })?;
     } else {
         crate::writer::output::with_buffer_sink(bytes, |out| {
             crate::writer::serialize::write_stream_payload(
@@ -636,15 +638,17 @@ fn append_body_object(
     }
 
     if let Some(ctx) = payload_ctx.filter(|_| !cleartext_metadata) {
-        crate::writer::write_stream_payload_with_pipeline(
-            bytes,
-            &data,
-            options.newline_before_endstream,
-            new_ref,
-            ctx,
-            true,
-            None,
-        )?; // cov:ignore: stream payload encryption is a validated in-memory writer boundary.
+        crate::writer::output::with_buffer_sink(bytes, |out| {
+            crate::writer::write_stream_payload_with_pipeline(
+                out,
+                &data,
+                options.newline_before_endstream,
+                new_ref,
+                ctx,
+                true,
+                None,
+            )
+        })?; // cov:ignore: stream payload encryption is a validated in-memory writer boundary.
     } else {
         crate::writer::output::with_buffer_sink(bytes, |out| {
             crate::writer::serialize::write_stream_payload(
@@ -1860,16 +1864,18 @@ fn append_hint_stream_object(
         // writes the payload through the encryption pipeline exactly once.
         // Pass 2 receives this complete framed object unchanged, so the
         // explicit IV preserves the same ciphertext across both passes.
-        crate::writer::write_stream_payload_with_pipeline_qdf(
-            bytes,
-            payload,
-            NewlineBeforeEndstream::Never,
-            true,
-            new_ref,
-            ctx,
-            true,
-            Some(hint_stream_aes_iv),
-        )?;
+        crate::writer::output::with_buffer_sink(bytes, |out| {
+            crate::writer::write_stream_payload_with_pipeline_qdf(
+                out,
+                payload,
+                NewlineBeforeEndstream::Never,
+                true,
+                new_ref,
+                ctx,
+                true,
+                Some(hint_stream_aes_iv),
+            )
+        })?;
     } else {
         crate::writer::output::with_buffer_sink(bytes, |out| {
             crate::writer::serialize::write_stream_payload_with_qdf(

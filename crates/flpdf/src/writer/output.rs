@@ -44,22 +44,6 @@ pub(crate) fn with_buffer_sink<T>(
     write(&mut sink)
 }
 
-/// Run one serializer operation with a digest seeded from an existing local
-/// whole-output buffer. This preserves the pre-Task-6 deterministic-ID owner
-/// while its trailer callback is mechanically migrated to [`OutputSink`].
-pub(crate) fn with_digested_buffer_sink<T>(
-    bytes: &mut Vec<u8>,
-    write: impl FnOnce(&mut OutputSink<'_>) -> Result<T>,
-) -> Result<T> {
-    let position = u64::try_from(bytes.len())
-        .map_err(|_| Error::Unsupported("writer buffer position exceeds u64 range".to_string()))?;
-    let mut digest = Md5::new();
-    digest.update(bytes.as_slice());
-    let mut sink = OutputSink::new_at_position(bytes, position);
-    sink.digest = DigestState::Active(digest);
-    write(&mut sink)
-}
-
 /// qpdf-shaped final-output counter and optional deterministic-ID digest.
 ///
 /// Only bytes accepted by the final target advance this counter or digest.
@@ -111,6 +95,7 @@ impl<'a> OutputSink<'a> {
         self.position
     }
 
+    #[cfg(test)]
     pub(crate) const fn last_byte(&self) -> Option<u8> {
         self.last_byte
     }
@@ -370,6 +355,26 @@ mod tests {
         let mut expected_bytes = [0; 16];
         expected_bytes.copy_from_slice(&expected);
         assert_eq!(digest, expected_bytes);
+    }
+
+    #[test]
+    fn segment_finish_preserves_position_and_active_digest() {
+        let mut target = VecOutputTarget::default();
+        let mut sink = OutputSink::new(&mut target);
+        sink.begin_digest();
+        sink.write_bytes(b"body-stream")
+            .expect("write stream bytes");
+        sink.finish_segment().expect("finish stream segment");
+        assert_eq!(sink.position(), 11);
+        sink.write_bytes(b" /ID [").expect("write ID opening");
+        sink.suspend_digest();
+
+        let digest = sink.take_digest().expect("digest survives segment finish");
+        let expected = md5::Md5::digest(b"body-stream /ID [");
+        assert_eq!(digest.as_slice(), expected.as_slice());
+        drop(sink);
+        assert_eq!(target.segment_finishes, 1);
+        assert_eq!(target.document_finishes, 0);
     }
 
     #[test]

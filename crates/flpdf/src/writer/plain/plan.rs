@@ -71,24 +71,26 @@ pub(crate) fn build_live_object_stream_plan<R: Read + Seek>(
     options: &WriterOptions,
     source_object_stream_data: &BTreeMap<u32, u32>,
 ) -> crate::Result<LiveObjectStreamPlan> {
-    match options.object_streams {
-        ObjectStreamMode::Disable => Ok(LiveObjectStreamPlan {
+    let mut plan = match options.object_streams {
+        ObjectStreamMode::Disable => LiveObjectStreamPlan {
             groups: Vec::new(),
             removed_refs: BTreeSet::new(),
-        }),
+        },
         ObjectStreamMode::Preserve => {
             let plan = object_streams::plan_qpdf_preserve_object_streams_with_source_membership(
                 pdf,
                 options.preserve_unreferenced_objects,
                 Some(source_object_stream_data),
             )?;
-            Ok(LiveObjectStreamPlan {
+            LiveObjectStreamPlan {
                 groups: plan.groups,
                 removed_refs: plan.removed_refs,
-            })
+            }
         }
         ObjectStreamMode::Generate => {
-            let (mut eligible, removed_refs) = pdf.get_compressible_objgens_with_removed()?;
+            let compressible = object_streams::compressible_objgens_qpdf_plan(pdf)?;
+            let mut eligible = compressible.eligible;
+            let removed_refs = compressible.removed_refs;
             eligible.retain(|member| !removed_refs.contains(member));
             let batches = object_streams::even_split_into_streams(&eligible);
             let mut groups = Vec::with_capacity(batches.len());
@@ -101,12 +103,31 @@ pub(crate) fn build_live_object_stream_plan<R: Read + Seek>(
                 })?;
                 groups.push(ObjectStreamGroup::Generated { source, members });
             }
-            Ok(LiveObjectStreamPlan {
+            LiveObjectStreamPlan {
                 groups,
                 removed_refs,
-            })
+            }
         }
+    };
+
+    // QPDFWriter applies output-sensitive exclusions after Preserve/Generate
+    // membership is built but before constructing the reverse container map
+    // (`QPDFWriter.cc:2141-2173`). Non-linearized encryption keeps the Catalog
+    // outside ObjStm while retaining every other member and source-container
+    // identity in the planned order.
+    if options.encrypt.is_some() || options.copy_encryption.is_some() {
+        let root = pdf.root_ref();
+        plan.groups.retain_mut(|group| match group {
+            ObjectStreamGroup::SourceBacked { members, .. }
+            | ObjectStreamGroup::Generated { members, .. }
+            | ObjectStreamGroup::Synthetic { members } => {
+                members.retain(|member| Some(*member) != root);
+                !members.is_empty()
+            }
+        });
     }
+
+    Ok(plan)
 }
 
 #[cfg(test)]

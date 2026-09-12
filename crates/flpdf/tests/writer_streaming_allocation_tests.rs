@@ -4,9 +4,10 @@
 //! until the writer emits each body object through its configured final sink.
 
 use flpdf::{
-    Error, ObjectHandle, ObjectStreamMode, Pdf, PdfWriter, Pipeline, PipelineError, PipelineResult,
-    StreamDataProvider,
+    EncryptParams, Error, ObjectHandle, ObjectStreamMode, Pdf, PdfOpenOptions, PdfWriter, Pipeline,
+    PipelineError, PipelineResult, StreamDataProvider,
 };
+use md5::Digest as _;
 use std::alloc::{GlobalAlloc, Layout, System};
 use std::cell::{Cell, RefCell};
 use std::io::{self, Cursor, ErrorKind, Write};
@@ -245,6 +246,58 @@ fn configure_disable_writer<'pdf>(
     writer
 }
 
+fn assert_fallback_reaches_sink_before_provider_b(
+    configure: impl FnOnce(&mut PdfWriter<'_, Cursor<Vec<u8>>>),
+) {
+    let events = ProviderEvents(Rc::new(RefCell::new(Vec::new())));
+    let bytes = Rc::new(RefCell::new(Vec::new()));
+    let mut pdf = minimal_pdf();
+    let first = provider_stream(
+        &pdf,
+        PayloadProvider {
+            name: "A",
+            payload: Rc::new(PROVIDER_A_PAYLOAD.to_vec()),
+            events: Some(events.clone()),
+        },
+    );
+    let second = provider_stream(
+        &pdf,
+        PayloadProvider {
+            name: "B",
+            payload: Rc::new(b"provider-payload-B".to_vec()),
+            events: Some(events.clone()),
+        },
+    );
+    attach_two_streams(&mut pdf, first, second);
+
+    let mut writer = configure_disable_writer(&mut pdf);
+    configure(&mut writer);
+    writer
+        .set_output_writer(EventWriter {
+            events: events.clone(),
+            bytes: Rc::clone(&bytes),
+        })
+        .expect("install event-recording fallback Writer output");
+    writer.write().expect("fallback writer output succeeds");
+
+    let events = events.snapshot();
+    let provider_a = events
+        .iter()
+        .position(|event| event == "provider:A")
+        .expect("first provider event");
+    let provider_b = events
+        .iter()
+        .position(|event| event == "provider:B")
+        .expect("second provider event");
+    assert!(
+        events[provider_a + 1..provider_b]
+            .iter()
+            .any(|event| event == "sink-write"),
+        "fallback must emit A to the final sink before requesting B: {events:?}"
+    );
+    assert!(bytes.borrow().starts_with(b"%PDF-"));
+}
+
 struct EventWriter {
     events: ProviderEvents,
     bytes: Rc<RefCell<Vec<u8>>>,
@@ -411,6 +464,139 @@ fn non_linearized_disable_reaches_the_sink_before_the_next_stream_provider() {
             .any(|event| event == "sink-write"),
         "a final-sink write must occur after provider A and before provider B; events: {events:?}"
     );
+}
+
+#[test]
+fn extra_header_fallback_reaches_the_sink_before_the_next_provider() {
+    assert_fallback_reaches_sink_before_provider_b(|writer| {
+        writer.set_extra_header_text("% task-6 extra header");
+    });
+}
+
+#[test]
+fn forced_version_fallback_reaches_the_sink_before_the_next_provider() {
+    assert_fallback_reaches_sink_before_provider_b(|writer| {
+        writer.set_object_stream_mode(ObjectStreamMode::Generate);
+        writer.force_pdf_version("1.4", 0);
+    });
+}
+
+#[test]
+fn encrypted_fallback_reaches_the_sink_before_the_next_provider() {
+    assert_fallback_reaches_sink_before_provider_b(|writer| {
+        writer.set_encryption_parameters(EncryptParams::v4_aes128(b"user", b"owner"));
+        writer.set_static_aes_iv(true);
+    });
+}
+
+#[test]
+fn source_encrypted_fallback_reaches_the_sink_before_the_next_provider() {
+    let mut source = minimal_pdf();
+    let mut source_writer = configure_disable_writer(&mut source);
+    source_writer.set_encryption_parameters(EncryptParams::v4_aes128(b"user", b"owner"));
+    source_writer.set_static_aes_iv(true);
+    source_writer
+        .set_output_memory()
+        .expect("install encrypted source output");
+    source_writer.write().expect("write encrypted source");
+    let encrypted = source_writer
+        .get_buffer()
+        .expect("take encrypted source output");
+    let mut pdf = Pdf::open_with_options(
+        Cursor::new(encrypted),
+        PdfOpenOptions {
+            password: b"user".to_vec(),
+            ..PdfOpenOptions::default()
+        },
+    )
+    .expect("open encrypted source");
+
+    let events = ProviderEvents(Rc::new(RefCell::new(Vec::new())));
+    let bytes = Rc::new(RefCell::new(Vec::new()));
+    let first = provider_stream(
+        &pdf,
+        PayloadProvider {
+            name: "A",
+            payload: Rc::new(PROVIDER_A_PAYLOAD.to_vec()),
+            events: Some(events.clone()),
+        },
+    );
+    let second = provider_stream(
+        &pdf,
+        PayloadProvider {
+            name: "B",
+            payload: Rc::new(b"provider-payload-B".to_vec()),
+            events: Some(events.clone()),
+        },
+    );
+    attach_two_streams(&mut pdf, first, second);
+
+    let mut writer = configure_disable_writer(&mut pdf);
+    writer.set_static_aes_iv(true);
+    writer
+        .set_output_writer(EventWriter {
+            events: events.clone(),
+            bytes,
+        })
+        .expect("install source-encrypted output");
+    writer.write().expect("rewrite source-encrypted PDF");
+
+    let events = events.snapshot();
+    let provider_a = events
+        .iter()
+        .position(|event| event == "provider:A")
+        .unwrap();
+    let provider_b = events
+        .iter()
+        .position(|event| event == "provider:B")
+        .unwrap();
+    assert!(
+        events[provider_a + 1..provider_b]
+            .iter()
+            .any(|event| event == "sink-write"),
+        "source-encrypted fallback must emit A before requesting B: {events:?}"
+    );
+}
+
+#[test]
+fn cleartext_metadata_stays_clear_while_other_encrypted_streams_do_not() {
+    let mut pdf = minimal_pdf();
+    let metadata_payload = b"task-6-cleartext-metadata";
+    let secret_payload = b"task-6-encrypted-payload";
+    let metadata = pdf
+        .new_stream_with_data(Rc::new(metadata_payload.to_vec()))
+        .expect("create metadata stream");
+    metadata
+        .as_stream_dict()
+        .expect("metadata stream dictionary")
+        .replace_key(b"/Type", ObjectHandle::name(b"Metadata".to_vec()))
+        .expect("mark metadata stream");
+    let secret = pdf
+        .new_stream_with_data(Rc::new(secret_payload.to_vec()))
+        .expect("create encrypted stream");
+    let root = pdf.root_handle().expect("resolve Catalog");
+    root.replace_key(b"/Metadata", metadata)
+        .expect("attach metadata");
+    root.replace_key(b"/Secret", secret)
+        .expect("attach secret stream");
+
+    let mut params = EncryptParams::v4_aes128(b"user", b"owner");
+    params.encrypt_metadata = false;
+    let mut writer = configure_disable_writer(&mut pdf);
+    writer.set_encryption_parameters(params);
+    writer.set_static_aes_iv(true);
+    writer.set_output_memory().expect("install memory output");
+    writer
+        .write()
+        .expect("write cleartext metadata encryption route");
+    let bytes = writer.get_buffer().expect("take encrypted output");
+
+    assert!(bytes
+        .windows(metadata_payload.len())
+        .any(|part| part == metadata_payload));
+    assert!(!bytes
+        .windows(secret_payload.len())
+        .any(|part| part == secret_payload));
 }
 
 #[test]
@@ -613,6 +799,130 @@ impl Write for WriteZeroWriter {
     }
 }
 
+struct RecordingPipeline {
+    events: ProviderEvents,
+    bytes: Rc<RefCell<Vec<u8>>>,
+    finishes: Rc<Cell<usize>>,
+    fail_finish: Option<usize>,
+}
+
+impl Pipeline for RecordingPipeline {
+    fn identifier(&self) -> &str {
+        "task-6 recording output pipeline"
+    }
+
+    fn write(&mut self, data: &[u8]) -> PipelineResult<()> {
+        self.events.record("sink-write");
+        self.bytes.borrow_mut().extend_from_slice(data);
+        Ok(())
+    }
+
+    fn finish(&mut self) -> PipelineResult<()> {
+        let count = self.finishes.get() + 1;
+        self.finishes.set(count);
+        self.events.record(format!("sink-finish:{count}"));
+        if self.fail_finish == Some(count) {
+            return Err(PipelineError::runtime(
+                "task-6 output segment finish failure",
+            ));
+        }
+        Ok(())
+    }
+}
+
+#[test]
+fn fallback_finishes_each_stream_segment_then_the_document_after_eof() {
+    let events = ProviderEvents(Rc::new(RefCell::new(Vec::new())));
+    let bytes = Rc::new(RefCell::new(Vec::new()));
+    let finishes = Rc::new(Cell::new(0));
+    let mut pdf = minimal_pdf();
+    let first = provider_stream(
+        &pdf,
+        PayloadProvider {
+            name: "A",
+            payload: Rc::new(PROVIDER_A_PAYLOAD.to_vec()),
+            events: Some(events.clone()),
+        },
+    );
+    let second = provider_stream(
+        &pdf,
+        PayloadProvider {
+            name: "B",
+            payload: Rc::new(b"provider-payload-B".to_vec()),
+            events: Some(events.clone()),
+        },
+    );
+    attach_two_streams(&mut pdf, first, second);
+
+    let mut writer = configure_disable_writer(&mut pdf);
+    writer.set_extra_header_text("% force fallback lifecycle");
+    writer
+        .set_output_pipeline(RecordingPipeline {
+            events: events.clone(),
+            bytes: Rc::clone(&bytes),
+            finishes: Rc::clone(&finishes),
+            fail_finish: None,
+        })
+        .expect("install recording pipeline");
+    writer.write().expect("fallback pipeline write succeeds");
+
+    assert_eq!(
+        finishes.get(),
+        3,
+        "two stream segments plus document finish"
+    );
+    assert!(bytes.borrow().ends_with(b"%%EOF\n"));
+    assert_eq!(
+        events.snapshot().last().map(String::as_str),
+        Some("sink-finish:3")
+    );
+}
+
+#[test]
+fn fallback_segment_finish_failure_stops_later_providers() {
+    let events = ProviderEvents(Rc::new(RefCell::new(Vec::new())));
+    let mut pdf = minimal_pdf();
+    let first = provider_stream(
+        &pdf,
+        PayloadProvider {
+            name: "A",
+            payload: Rc::new(PROVIDER_A_PAYLOAD.to_vec()),
+            events: Some(events.clone()),
+        },
+    );
+    let second = provider_stream(
+        &pdf,
+        PayloadProvider {
+            name: "B",
+            payload: Rc::new(b"provider-payload-B".to_vec()),
+            events: Some(events.clone()),
+        },
+    );
+    attach_two_streams(&mut pdf, first, second);
+
+    let mut writer = configure_disable_writer(&mut pdf);
+    writer.set_extra_header_text("% force fallback finish failure");
+    writer
+        .set_output_pipeline(RecordingPipeline {
+            events: events.clone(),
+            bytes: Rc::new(RefCell::new(Vec::new())),
+            finishes: Rc::new(Cell::new(0)),
+            fail_finish: Some(1),
+        })
+        .expect("install failing pipeline");
+    let error = writer.write().expect_err("first segment finish must fail");
+
+    assert!(error
+        .to_string()
+        .contains("task-6 output segment finish failure"));
+    let events = events.snapshot();
+    assert!(events.iter().any(|event| event == "provider:A"));
+    assert!(
+        !events.iter().any(|event| event == "provider:B"),
+        "events: {events:?}"
+    );
+}
+
 #[test]
 fn arbitrary_writer_retries_short_positive_writes() {
     let bytes = Rc::new(RefCell::new(Vec::new()));
@@ -679,6 +989,125 @@ fn memory_output_is_the_one_complete_output_owner() {
     writer.write().expect("arbitrary writer succeeds");
 
     assert_eq!(memory_bytes, *writer_bytes.borrow());
+}
+
+fn decode_hex_16(value: &[u8]) -> [u8; 16] {
+    assert_eq!(value.len(), 32);
+    let mut decoded = [0; 16];
+    for (index, pair) in value.chunks_exact(2).enumerate() {
+        let digit = |byte: u8| match byte {
+            b'0'..=b'9' => byte - b'0',
+            b'a'..=b'f' => byte - b'a' + 10,
+            _ => panic!("non-hex deterministic ID byte: {byte}"),
+        };
+        decoded[index] = (digit(pair[0]) << 4) | digit(pair[1]);
+    }
+    decoded
+}
+
+fn deterministic_id1(bytes: &[u8]) -> ([u8; 16], usize) {
+    let marker = b"/ID [";
+    let marker_start = bytes
+        .windows(marker.len())
+        .position(|part| part == marker)
+        .expect("deterministic ID marker");
+    let cutoff = marker_start + marker.len() - 1;
+    let first_end = bytes[cutoff + 1..]
+        .iter()
+        .position(|byte| *byte == b'>')
+        .map(|offset| cutoff + 1 + offset)
+        .expect("permanent ID terminator");
+    assert_eq!(bytes[first_end + 1], b'<');
+    let second_start = first_end + 2;
+    let second_end = bytes[second_start..]
+        .iter()
+        .position(|byte| *byte == b'>')
+        .map(|offset| second_start + offset)
+        .expect("changing ID terminator");
+    (decode_hex_16(&bytes[second_start..second_end]), cutoff)
+}
+
+fn expected_deterministic_id1(prefix: &[u8], info_suffix: &[u8]) -> [u8; 16] {
+    let first = md5::Md5::digest(prefix);
+    let mut seed = Vec::new();
+    for byte in first {
+        const HEX: &[u8; 16] = b"0123456789abcdef";
+        seed.push(HEX[(byte >> 4) as usize]);
+        seed.push(HEX[(byte & 0x0f) as usize]);
+    }
+    seed.extend_from_slice(b" QPDF ");
+    seed.extend_from_slice(info_suffix);
+    let seed = &seed[..seed
+        .iter()
+        .position(|byte| *byte == 0)
+        .unwrap_or(seed.len())];
+    md5::Md5::digest(seed).into()
+}
+
+#[test]
+fn fallback_classic_deterministic_id_includes_xref_and_stops_after_open_bracket() {
+    let mut pdf = minimal_pdf();
+    pdf.trailer()
+        .replace_key(
+            b"/Info",
+            ObjectHandle::dictionary(vec![
+                (
+                    b"/A".to_vec(),
+                    ObjectHandle::string(b"before\0after".to_vec()),
+                ),
+                (b"/B".to_vec(), ObjectHandle::string(b"excluded".to_vec())),
+            ]),
+        )
+        .expect("install deterministic Info seed");
+    let mut writer = configure_disable_writer(&mut pdf);
+    writer.set_static_id(false);
+    writer.set_deterministic_id(true);
+    writer.set_extra_header_text("% force classic deterministic fallback");
+    writer.set_output_memory().expect("install memory output");
+    writer
+        .write()
+        .expect("write classic deterministic fallback");
+    let bytes = writer.get_buffer().expect("take deterministic output");
+
+    let (actual, cutoff) = deterministic_id1(&bytes);
+    let expected = expected_deterministic_id1(&bytes[..=cutoff], b" before\0after excluded");
+    assert_eq!(actual, expected);
+    let xref = bytes.windows(5).position(|part| part == b"xref\n").unwrap();
+    assert!(xref < cutoff, "classic xref must precede the ID cutoff");
+    assert_ne!(
+        actual,
+        expected_deterministic_id1(&bytes[..xref], b" before\0after excluded"),
+        "classic xref bytes must contribute to the digest"
+    );
+}
+
+#[test]
+fn fallback_xref_stream_deterministic_id_excludes_the_stream_payload() {
+    let mut pdf = minimal_pdf();
+    let mut writer = configure_disable_writer(&mut pdf);
+    writer.set_static_id(false);
+    writer.set_deterministic_id(true);
+    writer.set_object_stream_mode(ObjectStreamMode::Generate);
+    writer.set_extra_header_text("% force xref-stream deterministic fallback");
+    writer.set_output_memory().expect("install memory output");
+    writer
+        .write()
+        .expect("write xref-stream deterministic fallback");
+    let bytes = writer.get_buffer().expect("take deterministic output");
+
+    let (actual, cutoff) = deterministic_id1(&bytes);
+    assert_eq!(actual, expected_deterministic_id1(&bytes[..=cutoff], b""));
+    let payload_start = bytes[cutoff + 1..]
+        .windows(b"stream\n".len())
+        .position(|part| part == b"stream\n")
+        .map(|offset| cutoff + 1 + offset + b"stream\n".len())
+        .expect("xref stream payload follows ID dictionary entry");
+    assert!(payload_start > cutoff);
+    assert_ne!(
+        actual,
+        expected_deterministic_id1(&bytes, b""),
+        "xref-stream payload and identifier bytes must remain after the digest cutoff"
+    );
 }
 
 const LARGE_TRAILER_VALUE_BYTES: usize = 512 * 1024;

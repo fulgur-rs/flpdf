@@ -6,7 +6,7 @@ use crate::writer::plain::xref::{IdPlan, TrailerPlan};
 use crate::writer::ObjectWriterEmission;
 use crate::writer::WriterOptions;
 use crate::writer::WriterResult;
-use crate::{CompressStreams, ObjectHandle, ObjectRef, ObjectStreamMode, Pdf, XrefForm};
+use crate::{CompressStreams, ObjectRef, ObjectStreamMode, Pdf, XrefForm};
 use std::collections::{BTreeMap, HashMap};
 
 pub(crate) mod body;
@@ -18,21 +18,26 @@ pub(crate) fn write_plain<R: Read + Seek>(
     out: &mut OutputSink<'_>,
     options: &WriterOptions,
     generated_id: Option<&crate::ObjectHandle>,
-    special_streams: Option<&crate::writer::SpecialStreams>,
+    encryption_parameters: Option<crate::writer::EncryptionParameters>,
     source_object_stream_data: &BTreeMap<u32, u32>,
+    special_streams: Option<&crate::writer::SpecialStreams>,
     generated_compressible: Option<&crate::writer::object_streams::CompressiblePlan>,
     generated_object_stream_sources: &[ObjectRef],
 ) -> crate::Result<WriterResult> {
-    let _ = (
-        special_streams,
-        generated_compressible,
-        generated_object_stream_sources,
-    );
+    let _ = (generated_compressible, generated_object_stream_sources);
     // qpdf's writeStandard uses one enqueueObject/object_queue walk for every
     // non-linearized object-stream and QDF combination. Membership is fixed
     // during setup; numbering and surviving stream-child discovery remain
     // emission-time responsibilities of that one live queue.
-    write_plain_live(pdf, out, options, generated_id, source_object_stream_data)
+    write_plain_live(
+        pdf,
+        out,
+        options,
+        generated_id,
+        encryption_parameters,
+        source_object_stream_data,
+        special_streams,
+    )
 }
 
 fn write_plain_live<R: Read + Seek>(
@@ -40,7 +45,9 @@ fn write_plain_live<R: Read + Seek>(
     out: &mut OutputSink<'_>,
     options: &WriterOptions,
     generated_id: Option<&crate::ObjectHandle>,
+    encryption_parameters: Option<crate::writer::EncryptionParameters>,
     source_object_stream_data: &BTreeMap<u32, u32>,
+    special_streams: Option<&crate::writer::SpecialStreams>,
 ) -> crate::Result<WriterResult> {
     let source_root = pdf.root_ref();
     let direct_root = if source_root.is_none() {
@@ -85,7 +92,18 @@ fn write_plain_live<R: Read + Seek>(
         // bracket. The xref payload is written only after that cutoff.
         out.begin_digest();
     }
-    let body = body::emit_live(
+    // Object/string/stream encryption needs the file-key state while the live
+    // queue is still assigning numbers. The /Encrypt object itself is emitted
+    // only after that queue, so zero is a non-body sentinel for this temporary
+    // context; the final context below receives qpdf's actual next object ID.
+    let body_encryption_context = encryption_parameters
+        .clone()
+        .map(|parameters| parameters.into_context(ObjectRef::new(0, 0)));
+    let empty_content_containers = std::collections::BTreeSet::new();
+    let content_container_refs = special_streams
+        .map(|streams| &streams.content_container_refs)
+        .unwrap_or(&empty_content_containers);
+    let mut body = body::emit_live(
         pdf,
         out,
         options,
@@ -94,6 +112,8 @@ fn write_plain_live<R: Read + Seek>(
         source_root,
         removed_refs.clone(),
         &object_streams,
+        body_encryption_context.as_ref(),
+        content_container_refs,
     )?; // cov:ignore: LLVM attributes the live-body call terminator to closure cleanup.
     let old_to_new = body.old_to_new;
     let root = source_root.and_then(|source| old_to_new.get(&source).copied());
@@ -114,7 +134,30 @@ fn write_plain_live<R: Read + Seek>(
     // number can exceed every uncompressed number, so `/Size` cannot be
     // derived from the uncompressed map alone once Preserve has live
     // compressed content.
-    let max_output = u32::try_from(body.object_count).unwrap_or(u32::MAX);
+    let mut max_output = u32::try_from(body.object_count).unwrap_or(u32::MAX);
+    let encryption_context = if let Some(parameters) = encryption_parameters {
+        let encrypt_number = max_output.checked_add(1).ok_or_else(|| {
+            crate::Error::Unsupported("plain live writer /Encrypt number overflows u32".into())
+        })?;
+        let context = parameters.into_context(ObjectRef::new(encrypt_number, 0));
+        let offset = usize::try_from(out.position()).map_err(|_| {
+            crate::Error::Unsupported("plain live writer output position exceeds usize".into())
+        })?;
+        out.write_bytes(format!("{encrypt_number} 0 obj\n").as_bytes())?;
+        crate::writer::encrypted_strings::write_encryption_dictionary_handle(
+            out,
+            &context.encrypt_dict_handle(),
+        )?;
+        out.write_bytes(b"\nendobj\n")?;
+        if options.qdf {
+            out.write_bytes(b"\n")?;
+        }
+        body.layout.uncompressed.insert(encrypt_number, (0, offset));
+        max_output = encrypt_number;
+        Some(context)
+    } else {
+        None
+    };
     let trailer_size = usize::try_from(max_output)
         .ok()
         .and_then(|size| size.checked_add(1))
@@ -136,7 +179,7 @@ fn write_plain_live<R: Read + Seek>(
         root,
         direct_root_output.as_ref(),
         options,
-        None,
+        encryption_context.as_ref(),
         deterministic_id,
         generated_id.as_ref(),
     )?; // cov:ignore: LLVM attributes trailer construction's call terminator to callback cleanup.
@@ -152,18 +195,6 @@ fn write_plain_live<R: Read + Seek>(
     };
     let mut trailer_map: HashMap<ObjectRef, ObjectRef> =
         old_to_new.iter().map(|(&a, &b)| (a, b)).collect();
-    let initial_late_trailer_number = u32::try_from(trailer_size).map_err(|_| {
-        // cov:ignore-start: the body queue is bounded by the qpdf u32 object-number domain
-        crate::Error::Unsupported("plain live writer: late trailer number overflows u32".into())
-        // cov:ignore-end
-    })?; // cov:ignore: checked body-derived late-trailer allocation cannot overflow a supported output
-    let _ = extend_late_trailer_map(
-        pdf,
-        &mut trailer_map,
-        initial_late_trailer_number,
-        true,
-        options.qdf,
-    )?; // cov:ignore: shared late-trailer success continuation is covered by the QDF/normalize live tests
 
     // Object streams require a cross-reference stream: a classic table has no
     // type-2 row shape (ISO 32000-1 7.5.7). qpdf decides this from the same
@@ -222,9 +253,6 @@ pub(crate) fn eligible(
     options: &WriterOptions,
     mode: ObjectStreamMode,
 ) -> bool {
-    // QDF and content normalization alter stream serialization, while the
-    // same live standard-writer queue owns every selected object-stream mode
-    // (`QPDFWriter.cc:2038-2140,2907-3044`).
     mode == options.object_streams
         && !options.pclm
         && options.extra_header_text.is_empty()

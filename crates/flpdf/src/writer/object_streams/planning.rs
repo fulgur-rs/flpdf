@@ -6,9 +6,10 @@ use std::collections::{BTreeMap, BTreeSet};
 use std::io::{Read, Seek};
 use std::num::NonZeroUsize;
 
+#[cfg(test)]
+use super::eligibility::even_split_into_streams_with_cap;
 use super::eligibility::{
-    compressible_objgens_qpdf_plan, eligibility_context, even_split_into_streams_with_cap,
-    is_eligible_for_objstm_handle,
+    compressible_objgens_qpdf_plan, eligibility_context, is_eligible_for_objstm_handle,
 };
 use crate::writer::WriterOptions;
 use crate::ObjectRef;
@@ -61,6 +62,7 @@ impl Default for PlannerConfig {
 
 /// The output of the packing planner: an ordered list of batches,
 /// each of which will become one ObjStm in the output.
+#[cfg(test)]
 #[derive(Debug, Clone, PartialEq, Eq, Default)]
 pub(crate) struct PackingPlan {
     /// Each inner `Vec` is one ObjStm batch, members in deterministic order.
@@ -164,6 +166,7 @@ pub(crate) fn planner_config_from_options(options: &WriterOptions) -> PlannerCon
 /// (`QPDFWriter.cc:2114-2140,2189-2195`); specialized live standard output
 /// therefore passes the shared setup snapshot through this boundary instead
 /// of silently re-reading a possibly changed xref view.
+#[cfg(test)]
 pub(crate) fn plan_object_streams_with_reachability_and_source_membership<
     R: std::io::Read + std::io::Seek,
 >(
@@ -219,6 +222,15 @@ pub(crate) fn plan_object_streams_with_reachability_and_source_membership<
         }
         ObjectStreamMode::Generate => plan_generate(pdf, config, reachable, generated_snapshot),
     }
+}
+
+#[cfg(test)]
+pub(crate) fn plan_object_streams_with_reachability<R: std::io::Read + std::io::Seek>(
+    pdf: &mut crate::Pdf<R>,
+    config: &PlannerConfig,
+    reachable: Option<&BTreeSet<ObjectRef>>,
+) -> crate::Result<PackingPlan> {
+    plan_object_streams_with_reachability_and_source_membership(pdf, config, reachable, None, None)
 }
 
 /// Apply qpdf's output-mode ObjStm exclusions after membership planning.
@@ -371,6 +383,7 @@ pub(crate) fn plan_qpdf_preserve_object_streams_with_source_membership<
 /// or real-null objects.
 /// Generate mode: follow qpdf's live compressible-object traversal and evenly
 /// split it across the minimum number of object streams.
+#[cfg(test)]
 fn plan_generate<R: std::io::Read + std::io::Seek>(
     pdf: &mut crate::Pdf<R>,
     config: &PlannerConfig,
@@ -406,13 +419,22 @@ fn plan_generate<R: std::io::Read + std::io::Seek>(
     })
 }
 
-/// Order ObjStm members the way qpdf's `std::set<QPDFObjGen>` orders them.
-/// A fresh multi-source target has new local `ObjectRef`s, so use the recorded
-/// original-object provenance there; an ordinary parsed document has no
-/// separate provenance map and its local source reference is already the
-/// qpdf source ObjGen. The same rule applies to fresh Generated groups: their
-/// members still represent source objects copied into the merge target.
-pub(crate) fn sort_members_qpdf_order<R: Read + Seek>(
+#[cfg(test)]
+fn sort_compressible_for_writer_order<R: Read + Seek + 'static>(
+    pdf: &crate::Pdf<R>,
+    eligible: &mut [ObjectRef],
+) {
+    if pdf.writer_object_order.is_some() {
+        eligible.sort_unstable_by_key(|object_ref| pdf.writer_object_order_key(*object_ref));
+    }
+}
+
+/// Order members of an existing source-backed ObjStm the way qpdf's
+/// `std::set<QPDFObjGen>` orders the source membership. A fresh multi-source
+/// target has new local `ObjectRef`s, so use the recorded original-object
+/// provenance there; an ordinary parsed document has no separate provenance
+/// map and its local source reference is already the qpdf source ObjGen.
+pub(crate) fn sort_source_backed_members_qpdf_order<R: Read + Seek>(
     pdf: &crate::Pdf<R>,
     members: &mut [ObjectRef],
 ) {
@@ -426,8 +448,9 @@ pub(crate) fn sort_members_qpdf_order<R: Read + Seek>(
 #[cfg(test)]
 mod tests {
     use super::{
-        plan_object_streams_with_reachability_and_source_membership, sort_members_qpdf_order,
-        ObjectStreamMode, PlannerConfig, DEFAULT_BATCH_SIZE_CAP,
+        plan_object_streams_with_reachability_and_source_membership,
+        sort_compressible_for_writer_order, ObjectStreamMode, PlannerConfig,
+        DEFAULT_BATCH_SIZE_CAP,
     };
     use crate::pdf::WriterObjectOrderKey;
     use crate::{ObjectRef, Pdf};
@@ -453,7 +476,7 @@ mod tests {
         pdf.set_writer_object_order(order);
 
         let mut eligible = vec![foreign, primary];
-        sort_members_qpdf_order(&pdf, &mut eligible);
+        sort_compressible_for_writer_order(&pdf, &mut eligible);
 
         assert_eq!(eligible, [primary, foreign]);
     }
