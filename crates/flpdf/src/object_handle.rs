@@ -2652,10 +2652,13 @@ impl ObjectHandle {
         // reached, not just the active path, so a direct DAG — an array holding
         // the same child twice is enough — is walked once per node rather than
         // once per path.
-        // Key on the raw allocation address rather than on a handle: the slot
-        // contains interior mutability, which clippy's `mutable_key_type`
-        // rightly rejects as a set key. Identity here is `Rc` identity, exactly
-        // what `is_same_object_as` compares, so the pointer is the whole key.
+        // Key on the raw allocation address of `SharedValueState`, rather than
+        // on a handle or its outer `ObjectSlot`: the shared state contains
+        // interior mutability, which clippy's `mutable_key_type` rightly
+        // rejects as a set key. `ObjectHandle::is_same_object_as` compares
+        // outer `ObjectSlot` identity; this visited key instead identifies a
+        // shared value allocation so each shared value is processed once,
+        // even when multiple slots or handles refer to it.
         let mut visited: BTreeSet<*const RefCell<SharedValueState>> = BTreeSet::new();
         let mut pending = vec![self.clone()];
         while let Some(handle) = pending.pop() {
