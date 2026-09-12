@@ -272,8 +272,9 @@ repository.
 
 In scope: `writer/plain/body.rs`, `writer/plain/mod.rs`,
 `writer/plain/plan.rs`, `writer/plain/xref.rs`, `writer/rewrite_renumber.rs`,
-`writer/object.rs`, `writer/serialize.rs`, the non-linearized coordinator and
-`write_pclm` path in `writer.rs`, plus the relevant output/sink and tests/docs.
+`writer/object.rs`, `writer/serialize.rs`, `writer/pclm.rs`, the
+non-linearized coordinator and `write_pclm` path in `writer.rs`, plus the
+relevant output/sink and tests/docs.
 Every non-linearized fallback that currently assembles a complete body is
 included in the inventory. The plan may refactor the existing live queue into a
 single all-mode queue; it must not retain the old prewalk as a second canonical
