@@ -129,6 +129,10 @@ def measure(command, directory, name, timeout):
             try:
                 os.killpg(process.pid, signal.SIGKILL)
             except ProcessLookupError:
+                # The process group exited between the timer firing and this
+                # kill, so the timeout is recorded but there is nothing to
+                # signal. `expired` is already set, so the caller still treats
+                # the sample as invalid.
                 pass
 
         timer = threading.Timer(timeout, kill_timed_out)
