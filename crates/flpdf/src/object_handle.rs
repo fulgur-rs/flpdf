@@ -54,6 +54,17 @@
 //! substitute for qpdf's per-value `QPDF*` back-pointer (`QPDFValue.hh:150`):
 //! a real qpdf counterpart exists, flpdf just projects it to a numeric id
 //! beside a separate `Weak` resolver route.
+//!
+//! `ObjectSlot::containment_parents` has no qpdf counterpart at all. qpdf's
+//! containers hold only forward child handles and never maintain an upward
+//! index (`QPDF_Array.cc:33-48,235-286`, `QPDF_Dictionary.cc:10-18,51-56,117-150`);
+//! `QPDFValue::ChildDescr`'s weak parent is diagnostic description context for
+//! warning text, not a containment lookup (`QPDFValue.hh:41-58,74-84`,
+//! `QPDFObject_private.hh:77-92`). flpdf keeps this reverse edge as a marked
+//! deviation on the field itself: its **lookups** are `cfg(test)`-only
+//! containment-root assertions, while attach/detach **maintain** the edge in
+//! production builds.
+//! Neither decides ownership, warning text, writer scheduling, or output bytes.
 //
 // qpdf-deviation-start: qpdf 11.9.0's default destruction of a sufficiently
 // deep programmatic direct container graph recursively follows the
@@ -1128,6 +1139,9 @@ struct ObjectSlot {
     /// this token preserves that single-document boundary for flpdf's
     /// per-call `&mut Pdf` API without introducing a raw-object bridge.
     tree_pdf_unique_id: Option<u64>,
+    // qpdf-deviation: qpdf keeps only forward child handles; this weak reverse
+    // edge has no qpdf counterpart and is retained solely for cfg(test)
+    // containment-root assertions and stack-safe teardown bookkeeping.
     containment_parents: Vec<Weak<RefCell<ObjectSlot>>>,
     description: Option<ObjectDescription>,
     /// qpdf's `QPDF_Stream::token_filters` list. It is attached to the
