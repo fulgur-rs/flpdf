@@ -107,6 +107,11 @@ pub(crate) fn compressible_objgens_qpdf_plan<R: std::io::Read + std::io::Seek>(
     let mut result: Vec<ObjectRef> = Vec::new();
     let mut removed_refs = BTreeSet::new();
     let mut indirect_objstm_length_refs = BTreeSet::new();
+    // qpdf prepares the cache and takes the object-number bound inside
+    // getCompressibleObjGens before traversing the trailer (`QPDF.cc:2400`).
+    // This also makes cached dangling references visible to the dynamic
+    // upper_bound check below.
+    let max_object = pdf.get_object_count()?;
     // The encryption dictionary is excluded from the result, matching qpdf's
     // `m->trailer.getKey("/Encrypt")` guard (QPDF.cc:2402/2437): it must stay
     // a plain indirect object so the rest of the file can be decrypted. Read it
@@ -127,6 +132,11 @@ pub(crate) fn compressible_objgens_qpdf_plan<R: std::io::Read + std::io::Seek>(
 
         if object_ref.number == 0 {
             continue;
+        }
+        if object_ref.number > max_object {
+            return Err(crate::Error::Internal(
+                "unexpected object id encountered in getCompressibleObjGens".to_string(),
+            ));
         }
         if visited.contains(&object_ref.number) {
             continue;
