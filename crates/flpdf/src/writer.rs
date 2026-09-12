@@ -3079,12 +3079,10 @@ pub(crate) fn write_deterministic_id_inline(
     let output_digest = out.take_digest()?;
     let seed = output::deterministic_id_second_seed(&output_digest, info_suffix)?;
     let id1: [u8; 16] = md5::Md5::digest(&seed).into();
-    let id0 = source_id0
-        .map(<[u8]>::to_vec)
-        .unwrap_or_else(|| id1.to_vec());
-    let mut id_array = Vec::with_capacity(deterministic_id_array_len(id0.len()));
-    write_deterministic_id_array(&mut id_array, &id0, &id1);
-    out.write_bytes(&id_array[1..])
+    let id0 = source_id0.unwrap_or(&id1);
+    crate::pdf_syntax::write_hex_string(out, id0)?;
+    crate::pdf_syntax::write_hex_string(out, &id1)?;
+    out.write_bytes(b"]")
 }
 
 /// Apply writer-owned trailer values without converting the live trailer back

@@ -728,13 +728,13 @@ fn destroyed_unparse_error() -> Error {
 fn write_dictionary_key(out: &mut OutputSink<'_>, key: &[u8]) -> Result<()> {
     if let Some(key) = key.strip_prefix(b"/") {
         out.write_bytes(&[b'/'])?;
-        crate::pdf_syntax::write_name_escaped_to_sink(out, key)?;
+        crate::pdf_syntax::write_name_escaped(out, key)?;
     } else {
         // QPDF_Name::normalizeName preserves the first byte of a raw qpdf
         // dictionary key (`libqpdf/QPDF_Name.cc:27-50`). In particular,
         // `replaceKey("Array1", ...)` is intentionally emitted as the
         // slashless token `Array1`; do not silently canonicalize it here.
-        crate::pdf_syntax::write_name_escaped_to_sink(out, key)?;
+        crate::pdf_syntax::write_name_escaped(out, key)?;
     }
     Ok(())
 }
@@ -2623,9 +2623,9 @@ pub(crate) fn unparse_object_value(value: &ObjectValue, out: &mut OutputSink<'_>
         }
         ObjectValue::Name(name) => {
             out.write_bytes(&[b'/'])?;
-            crate::pdf_syntax::write_name_escaped_to_sink(out, name)?;
+            crate::pdf_syntax::write_name_escaped(out, name)?;
         }
-        ObjectValue::String(value) => crate::pdf_syntax::write_string_value_to_sink(out, value)?,
+        ObjectValue::String(value) => crate::pdf_syntax::write_string_value(out, value)?,
         ObjectValue::Operator(value) | ObjectValue::InlineImage(value) => {
             out.write_bytes(value)?;
         }
@@ -3478,7 +3478,7 @@ fn try_write_sig_contents_hex_string(
     handle.try_dereference()?;
     handle.with_value(|value| {
         if let Some(ObjectValue::String(bytes)) = value {
-            crate::pdf_syntax::write_hex_string_to_sink(out, bytes)?;
+            crate::pdf_syntax::write_hex_string(out, bytes)?;
             Ok(true)
         } else {
             Ok(false)
@@ -4333,7 +4333,7 @@ fn try_write_sig_contents_with_string_writer(
     // signature contents. The ordinary string callback is therefore bypassed
     // here: qpdf keeps this value cleartext and only changes its spelling to
     // hexadecimal, even while the surrounding object is encrypted.
-    crate::pdf_syntax::write_hex_string_to_sink(out, &bytes)?;
+    crate::pdf_syntax::write_hex_string(out, &bytes)?;
     Ok(true)
 }
 
@@ -4879,8 +4879,8 @@ fn write_id_style_value_handle(value: &ObjectHandle, out: &mut OutputSink<'_>) -
     match compact {
         Some((b0, b1)) => {
             out.write_bytes(&[b'['])?;
-            crate::pdf_syntax::write_hex_string_to_sink(out, &b0)?;
-            crate::pdf_syntax::write_hex_string_to_sink(out, &b1)?;
+            crate::pdf_syntax::write_hex_string(out, &b0)?;
+            crate::pdf_syntax::write_hex_string(out, &b1)?;
             out.write_bytes(&[b']'])?;
             Ok(())
         }
@@ -4915,8 +4915,8 @@ fn write_id_style_value_handle_with_ref_map(
     match compact {
         Some((b0, b1)) => {
             out.write_bytes(&[b'['])?;
-            crate::pdf_syntax::write_hex_string_to_sink(out, &b0)?;
-            crate::pdf_syntax::write_hex_string_to_sink(out, &b1)?;
+            crate::pdf_syntax::write_hex_string(out, &b0)?;
+            crate::pdf_syntax::write_hex_string(out, &b1)?;
             out.write_bytes(&[b']'])?;
             Ok(())
         }

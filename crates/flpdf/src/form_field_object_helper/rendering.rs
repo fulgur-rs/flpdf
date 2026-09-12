@@ -780,7 +780,8 @@ fn build_qpdf_choice_appearance_content(
         // selects literal or hexadecimal syntax from the encoded bytes. This
         // matters for a single-byte value such as PDFDocEncoding 0xf7:
         // `10\xf7` becomes `<3130f7>`, not a UTF-8 lossy literal.
-        write_string_value(&mut out, line);
+        crate::writer::output::with_buffer_sink(&mut out, |sink| write_string_value(sink, line))
+            .expect("writing a PDF string to a Vec cannot fail");
         out.extend_from_slice(b" Tj\n");
     }
     out.extend_from_slice(b"ET\nQ\nEMC\n");

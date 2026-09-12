@@ -2442,9 +2442,8 @@ pub(crate) fn emit_content_container_from_handle_with_ref_map(
     map: &dyn Fn(ObjectRef) -> crate::Result<ObjectRef>,
     removed_refs: &BTreeSet<ObjectRef>,
 ) -> crate::Result<()> {
-    let mut write_string = |out: &mut OutputSink<'_>, value: &[u8]| {
-        crate::pdf_syntax::write_string_value_to_sink(out, value)
-    };
+    let mut write_string =
+        |out: &mut OutputSink<'_>, value: &[u8]| crate::pdf_syntax::write_string_value(out, value);
     emit_content_container_from_handle_with_ref_map_and_string_writer(
         container,
         options,
@@ -2805,7 +2804,7 @@ fn is_removed_content_reference(value: &ObjectHandle, removed_refs: &BTreeSet<Ob
 fn write_content_key(out: &mut OutputSink<'_>, key: &[u8]) -> crate::Result<()> {
     out.write_bytes(b"/")?;
     let key = key.strip_prefix(b"/").unwrap_or(key);
-    crate::pdf_syntax::write_name_escaped_to_sink(out, key)?;
+    crate::pdf_syntax::write_name_escaped(out, key)?;
     Ok(())
 }
 

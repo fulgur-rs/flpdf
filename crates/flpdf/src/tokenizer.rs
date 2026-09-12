@@ -90,7 +90,10 @@ impl Token {
 fn canonical_name_raw(value: &[u8]) -> Vec<u8> {
     let mut raw = Vec::with_capacity(value.len());
     raw.push(b'/');
-    write_name_escaped(&mut raw, value.strip_prefix(b"/").unwrap_or(value));
+    crate::writer::output::with_buffer_sink(&mut raw, |out| {
+        write_name_escaped(out, value.strip_prefix(b"/").unwrap_or(value))
+    })
+    .expect("writing a PDF name to a Vec cannot fail");
     raw
 }
 

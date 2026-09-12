@@ -43,23 +43,14 @@ pub(crate) fn qpdf_real_value(value: f64) -> f64 {
 /// never decoded to a raw NUL by the tokenizer in the first place -- it is
 /// kept as the literal three-byte text `#00` (`QPDFTokenizer.cc:471-475`) --
 /// so a raw NUL byte reaching this function can only be that sentinel.
-pub(crate) fn write_name_escaped(out: &mut Vec<u8>, raw: &[u8]) {
-    write_name_escaped_to_sink_inner(&mut VecSyntaxSink(out), raw)
-        .expect("writing a PDF name to Vec cannot fail");
-}
-
-pub(crate) fn write_name_escaped_to_sink(
+pub(crate) fn write_name_escaped(
     out: &mut crate::writer::output::OutputSink<'_>,
     raw: &[u8],
 ) -> crate::Result<()> {
-    write_name_escaped_to_sink_inner(out, raw)
-}
-
-fn write_name_escaped_to_sink_inner(out: &mut impl SyntaxSink, raw: &[u8]) -> crate::Result<()> {
     const HEX: &[u8; 16] = b"0123456789abcdef";
     for &byte in raw {
         if byte == 0 {
-            out.write_syntax(b"#")?;
+            out.write_bytes(b"#")?;
             continue;
         }
         let needs_escape = !(0x21..=0x7e).contains(&byte)
@@ -68,9 +59,9 @@ fn write_name_escaped_to_sink_inner(out: &mut impl SyntaxSink, raw: &[u8]) -> cr
                 b'(' | b')' | b'<' | b'>' | b'[' | b']' | b'{' | b'}' | b'/' | b'%' | b'#'
             );
         if needs_escape {
-            out.write_syntax(&[b'#', HEX[(byte >> 4) as usize], HEX[(byte & 0x0f) as usize]])?;
+            out.write_bytes(&[b'#', HEX[(byte >> 4) as usize], HEX[(byte & 0x0f) as usize]])?;
         } else {
-            out.write_syntax(&[byte])?;
+            out.write_bytes(&[byte])?;
         }
     }
     Ok(())
@@ -98,102 +89,57 @@ fn is_iso_latin1_printable(byte: u8) -> bool {
 }
 
 /// Write a PDF literal string with qpdf-compatible escapes.
-pub(crate) fn write_literal_string(out: &mut Vec<u8>, value: &[u8]) {
-    write_literal_string_to_sink_inner(&mut VecSyntaxSink(out), value)
-        .expect("writing a PDF string to Vec cannot fail");
-}
-
-fn write_literal_string_to_sink_inner(
-    out: &mut impl SyntaxSink,
+pub(crate) fn write_literal_string(
+    out: &mut crate::writer::output::OutputSink<'_>,
     value: &[u8],
 ) -> crate::Result<()> {
-    out.write_syntax(b"(")?;
+    out.write_bytes(b"(")?;
     for &byte in value {
         match byte {
             b'\\' | b'(' | b')' => {
-                out.write_syntax(&[b'\\', byte])?;
+                out.write_bytes(&[b'\\', byte])?;
             }
-            b'\n' => out.write_syntax(br"\n")?,
-            b'\r' => out.write_syntax(br"\r")?,
-            b'\t' => out.write_syntax(br"\t")?,
-            0x08 => out.write_syntax(br"\b")?,
-            0x0c => out.write_syntax(br"\f")?,
-            _ if is_iso_latin1_printable(byte) => out.write_syntax(&[byte])?,
+            b'\n' => out.write_bytes(br"\n")?,
+            b'\r' => out.write_bytes(br"\r")?,
+            b'\t' => out.write_bytes(br"\t")?,
+            0x08 => out.write_bytes(br"\b")?,
+            0x0c => out.write_bytes(br"\f")?,
+            _ if is_iso_latin1_printable(byte) => out.write_bytes(&[byte])?,
             _ => {
-                out.write_syntax(b"\\")?;
-                out.write_syntax(format!("{byte:03o}").as_bytes())?;
+                out.write_bytes(b"\\")?;
+                out.write_bytes(format!("{byte:03o}").as_bytes())?;
             }
         }
     }
-    out.write_syntax(b")")?;
+    out.write_bytes(b")")?;
     Ok(())
 }
 
 /// Write a string in qpdf's literal-or-hex representation.
-pub(crate) fn write_string_value(out: &mut Vec<u8>, value: &[u8]) {
-    if use_hex_string(value) {
-        write_hex_string(out, value);
-    } else {
-        write_literal_string(out, value);
-    }
-}
-
-pub(crate) fn write_string_value_to_sink(
+pub(crate) fn write_string_value(
     out: &mut crate::writer::output::OutputSink<'_>,
     value: &[u8],
 ) -> crate::Result<()> {
-    write_string_value_to_sink_inner(out, value)
-}
-
-fn write_string_value_to_sink_inner(out: &mut impl SyntaxSink, value: &[u8]) -> crate::Result<()> {
     if use_hex_string(value) {
-        write_hex_string_to_sink_inner(out, value)?;
+        write_hex_string(out, value)?;
     } else {
-        write_literal_string_to_sink_inner(out, value)?;
+        write_literal_string(out, value)?;
     }
     Ok(())
 }
 
 /// Write bytes as a lowercase hexadecimal PDF string.
-pub(crate) fn write_hex_string(out: &mut Vec<u8>, value: &[u8]) {
-    write_hex_string_to_sink_inner(&mut VecSyntaxSink(out), value)
-        .expect("writing a PDF string to Vec cannot fail");
-}
-
-pub(crate) fn write_hex_string_to_sink(
+pub(crate) fn write_hex_string(
     out: &mut crate::writer::output::OutputSink<'_>,
     value: &[u8],
 ) -> crate::Result<()> {
-    write_hex_string_to_sink_inner(out, value)
-}
-
-fn write_hex_string_to_sink_inner(out: &mut impl SyntaxSink, value: &[u8]) -> crate::Result<()> {
     const HEX: &[u8; 16] = b"0123456789abcdef";
-    out.write_syntax(b"<")?;
+    out.write_bytes(b"<")?;
     for &byte in value {
-        out.write_syntax(&[HEX[(byte >> 4) as usize], HEX[(byte & 0x0f) as usize]])?;
+        out.write_bytes(&[HEX[(byte >> 4) as usize], HEX[(byte & 0x0f) as usize]])?;
     }
-    out.write_syntax(b">")?;
+    out.write_bytes(b">")?;
     Ok(())
-}
-
-trait SyntaxSink {
-    fn write_syntax(&mut self, bytes: &[u8]) -> crate::Result<()>;
-}
-
-struct VecSyntaxSink<'a>(&'a mut Vec<u8>);
-
-impl SyntaxSink for VecSyntaxSink<'_> {
-    fn write_syntax(&mut self, bytes: &[u8]) -> crate::Result<()> {
-        self.0.extend_from_slice(bytes);
-        Ok(())
-    }
-}
-
-impl SyntaxSink for crate::writer::output::OutputSink<'_> {
-    fn write_syntax(&mut self, bytes: &[u8]) -> crate::Result<()> {
-        self.write_bytes(bytes)
-    }
 }
 
 /// Callback used by the two-pass trailer writers to emit an /ID value.
@@ -216,7 +162,10 @@ mod tests {
     #[test]
     fn name_escaping_covers_nul_delimiters_and_non_ascii_bytes() {
         let mut output = Vec::new();
-        write_name_escaped(&mut output, b"a\0#/ \x80z");
+        crate::writer::output::with_buffer_sink(&mut output, |out| {
+            write_name_escaped(out, b"a\0#/ \x80z")
+        })
+        .unwrap();
         assert_eq!(output, b"a##23#2f#20#80z");
     }
 
@@ -228,7 +177,10 @@ mod tests {
         // `#00`, which is a distinct, valid escape for an actual NUL that the
         // tokenizer never decodes to a raw byte in the first place.
         let mut output = Vec::new();
-        write_name_escaped(&mut output, b"a\0\x31x");
+        crate::writer::output::with_buffer_sink(&mut output, |out| {
+            write_name_escaped(out, b"a\0\x31x")
+        })
+        .unwrap();
         assert_eq!(output, b"a#1x");
     }
 }

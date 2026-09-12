@@ -823,7 +823,9 @@ fn write_part1_xref_and_trailer(
     let mut prev_value_range = None;
     for (key, value) in entries {
         bytes.push(b'/');
-        crate::pdf_syntax::write_name_escaped(bytes, key.strip_prefix(b"/").unwrap_or(&key));
+        crate::writer::output::with_buffer_sink(bytes, |out| {
+            crate::pdf_syntax::write_name_escaped(out, key.strip_prefix(b"/").unwrap_or(&key))
+        })?;
         bytes.push(b' ');
         bytes.extend_from_slice(&value);
         if key == b"/Size" {
@@ -4150,9 +4152,10 @@ fn write_linearized_impl<R: Read + Seek>(
             let id0 = id0.clone();
             let id1 = *id1;
             det_id_closure = move |out: &mut crate::writer::output::OutputSink<'_>| {
-                let mut id_bytes = Vec::new();
-                crate::writer::write_deterministic_id_array(&mut id_bytes, &id0, &id1);
-                out.write_bytes(&id_bytes)
+                out.write_bytes(b"[")?;
+                crate::pdf_syntax::write_hex_string(out, &id0)?;
+                crate::pdf_syntax::write_hex_string(out, &id1)?;
+                out.write_bytes(b"]")
             };
             Some(&mut det_id_closure)
         }

@@ -2,9 +2,7 @@
 
 use crate::encryption::standard::{encrypt_cipher_bytes, ObjectKeyAlg, StringEncryptCipher};
 use crate::object_handle::ObjectHandle;
-use crate::pdf_syntax::{
-    write_hex_string_to_sink, write_name_escaped_to_sink, write_string_value_to_sink,
-};
+use crate::pdf_syntax::{write_hex_string, write_name_escaped, write_string_value};
 use crate::writer::encryption_state::WriterEncryptionState;
 use crate::writer::output::OutputSink;
 use crate::writer::{
@@ -398,7 +396,7 @@ fn write_encrypted_or_plain_string(
     plaintext: &[u8],
 ) -> crate::Result<()> {
     let Some(data_key) = state.current_data_key() else {
-        return write_string_value_to_sink(out, plaintext);
+        return write_string_value(out, plaintext);
     };
     let ciphertext = encrypt_string(cipher, static_aes_iv, aes_iv_generator, data_key, plaintext)?;
     serialize_encrypted_string(out, &ciphertext, crate::writer::cipher_needs_aes_iv(cipher))
@@ -456,9 +454,9 @@ pub(crate) fn serialize_encrypted_string(
     use_aes: bool,
 ) -> crate::Result<()> {
     if use_aes {
-        write_hex_string_to_sink(out, ciphertext)?;
+        write_hex_string(out, ciphertext)?;
     } else {
-        write_string_value_to_sink(out, ciphertext)?;
+        write_string_value(out, ciphertext)?;
     }
     Ok(())
 }
@@ -483,11 +481,11 @@ pub(crate) fn write_encryption_dictionary_handle(
     for (key, value) in entries {
         let key_without_slash = key.strip_prefix(b"/").unwrap_or(&key);
         out.write_bytes(b" /")?;
-        write_name_escaped_to_sink(out, key_without_slash)?;
+        write_name_escaped(out, key_without_slash)?;
         out.write_bytes(b" ")?;
         if HEX_ENCRYPT_KEYS.contains(&key.as_slice()) {
             if let Some(bytes) = value.as_string() {
-                write_hex_string_to_sink(out, &bytes)?;
+                write_hex_string(out, &bytes)?;
                 continue;
             }
         }

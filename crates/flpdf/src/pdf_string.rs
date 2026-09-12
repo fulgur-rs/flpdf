@@ -188,7 +188,10 @@ pub fn new_unicode_string(utf8: &[u8]) -> Vec<u8> {
 /// Force a stored PDF string into qpdf's binary hexadecimal representation.
 pub fn unparse_binary(stored: &[u8]) -> Vec<u8> {
     let mut output = Vec::with_capacity(stored.len().saturating_mul(2).saturating_add(2));
-    crate::pdf_syntax::write_hex_string(&mut output, stored);
+    crate::writer::output::with_buffer_sink(&mut output, |out| {
+        crate::pdf_syntax::write_hex_string(out, stored)
+    })
+    .expect("writing a PDF string to a Vec cannot fail");
     output
 }
 

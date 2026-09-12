@@ -542,9 +542,15 @@ fn write_canonical_classic_trailer(
 fn write_qpdf_dictionary_key(out: &mut Vec<u8>, key: &[u8]) {
     if let Some(key) = key.strip_prefix(b"/") {
         out.push(b'/');
-        crate::pdf_syntax::write_name_escaped(out, key);
+        crate::writer::output::with_buffer_sink(out, |sink| {
+            crate::pdf_syntax::write_name_escaped(sink, key)
+        })
+        .expect("writing a PDF name to a Vec cannot fail");
     } else {
-        crate::pdf_syntax::write_name_escaped(out, key);
+        crate::writer::output::with_buffer_sink(out, |sink| {
+            crate::pdf_syntax::write_name_escaped(sink, key)
+        })
+        .expect("writing a PDF name to a Vec cannot fail");
     }
 }
 

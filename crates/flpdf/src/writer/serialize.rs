@@ -457,9 +457,9 @@ pub(crate) mod xref_stream {
     fn write_qpdf_dictionary_key(out: &mut OutputSink<'_>, key: &[u8]) -> Result<()> {
         if let Some(key) = key.strip_prefix(b"/") {
             out.write_bytes(b"/")?;
-            crate::pdf_syntax::write_name_escaped_to_sink(out, key)?;
+            crate::pdf_syntax::write_name_escaped(out, key)?;
         } else {
-            crate::pdf_syntax::write_name_escaped_to_sink(out, key)?;
+            crate::pdf_syntax::write_name_escaped(out, key)?;
         }
         Ok(())
     }
