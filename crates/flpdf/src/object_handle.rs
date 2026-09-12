@@ -1015,12 +1015,17 @@ impl Hash for ObjectHandleIdentity {
 impl std::fmt::Debug for ObjectHandle {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         let slot = self.0.borrow();
-        let state = slot.state.borrow();
-        let state: &str = match &*state {
-            ObjectValue::Unresolved => "Unresolved",
-            ObjectValue::Reserved => "Reserved",
-            ObjectValue::Destroyed => "Destroyed",
-            _ => "Resolved(..)",
+        let (state, parsed_offset) = {
+            let shared = slot.shared.borrow();
+            (
+                match &shared.value {
+                    ObjectValue::Unresolved => "Unresolved",
+                    ObjectValue::Reserved => "Reserved",
+                    ObjectValue::Destroyed => "Destroyed",
+                    _ => "Resolved(..)",
+                },
+                shared.parsed_offset,
+            )
         };
         let label = if slot.is_indirect() {
             "ObjectHandle::Indirect"
@@ -1030,7 +1035,7 @@ impl std::fmt::Debug for ObjectHandle {
         f.debug_struct(label)
             .field("object_ref", &slot.object_ref())
             .field("state", &state)
-            .field("parsed_offset", &slot.parsed_offset)
+            .field("parsed_offset", &parsed_offset)
             .field("end_before_space", &slot.end_before_space)
             .field("end_after_space", &slot.end_after_space)
             .finish()
@@ -1222,35 +1227,31 @@ struct ValueIdentity {
 
 impl ObjectSlot {
     fn qpdf_obj_gen(&self) -> Option<QpdfObjGen> {
-        let identity = self.identity.borrow();
-        identity
-            .qpdf_obj_gen
-            .or_else(|| identity.object_ref.map(QpdfObjGen::from_object_ref))
+        self.shared.borrow().qpdf_obj_gen()
     }
 
     fn object_ref(&self) -> Option<ObjectRef> {
-        self.qpdf_obj_gen()
-            .and_then(QpdfObjGen::to_object_ref)
-            .or_else(|| self.identity.borrow().object_ref)
+        self.shared.borrow().object_ref()
     }
 
     fn is_indirect(&self) -> bool {
-        let identity = self.identity.borrow();
-        identity
+        let shared = self.shared.borrow();
+        shared
+            .identity
             .qpdf_obj_gen
             .is_some_and(QpdfObjGen::is_indirect)
             // Keep the pre-existing synthetic `ObjectRef(0, generation)`
             // mutation surface isolated from parsed qpdf identities. Its
             // invariant is tracked separately by flpdf-3sbf.
-            || identity.object_ref.is_some()
+            || shared.identity.object_ref.is_some()
     }
 
     fn active_pdf_unique_id(&self) -> Option<u64> {
-        self.identity.borrow().active_pdf_unique_id
+        self.shared.borrow().identity.active_pdf_unique_id
     }
 
     fn resolver(&self) -> Option<Weak<dyn DocumentResolver>> {
-        self.identity.borrow().resolver.clone()
+        self.shared.borrow().identity.resolver.clone()
     }
 
     fn get_description(&self) -> Vec<u8> {
@@ -1747,9 +1748,7 @@ impl ObjectHandle {
     /// a second, *direct* reserved handle with neither — so indirect
     /// identity is this sentinel's common case, not a universal one.
     pub fn is_reserved(&self) -> bool {
-        let state = self.0.borrow().state.clone();
-        let reserved = matches!(&*state.borrow(), ObjectValue::Reserved);
-        reserved
+        self.with_value(|value| matches!(value, Some(ObjectValue::Reserved)))
     }
 
     /// The object number/generation for an indirect handle, or `None` for a
@@ -2769,9 +2768,7 @@ impl ObjectHandle {
     /// that turned out to be missing from the source, or on a value severed
     /// because its owning document was dropped.
     pub fn is_resolved(&self) -> bool {
-        let state = self.0.borrow().state.clone();
-        let resolved = !matches!(&*state.borrow(), ObjectValue::Unresolved);
-        resolved
+        self.with_value(|value| !matches!(value, Some(ObjectValue::Unresolved)))
     }
 
     /// Resolve this handle's own canonical slot in place, mirroring
@@ -2781,20 +2778,23 @@ impl ObjectHandle {
     /// whose document has been dropped returns an error and stays unresolved.
     pub(crate) fn try_dereference(&self) -> Result<()> {
         let (object_gen, resolver) = {
-            let slot = self.0.borrow();
-            if !slot.initialized {
+            let (initialized, shared) = {
+                let slot = self.0.borrow();
+                (slot.initialized, slot.shared.clone())
+            };
+            if !initialized {
                 return Err(Error::Internal(
                     "attempted to dereference an uninitialized QPDFObjectHandle".to_owned(),
                 ));
             }
-            let Some(object_gen) = slot.qpdf_obj_gen() else {
+            let shared = shared.borrow();
+            let Some(object_gen) = shared.qpdf_obj_gen() else {
                 return Ok(());
             };
-            let state = slot.state.borrow();
-            if !matches!(&*state, ObjectValue::Unresolved) {
+            if !matches!(&shared.value, ObjectValue::Unresolved) {
                 return Ok(());
             }
-            (object_gen, slot.resolver())
+            (object_gen, shared.identity.resolver.clone())
         };
 
         let Some(resolver) = resolver.and_then(|resolver| resolver.upgrade()) else {
@@ -2823,23 +2823,18 @@ impl ObjectHandle {
         // child-description chain rather than checking only its immediate
         // parent. Keep a slot-identity guard because malformed programmatic
         // direct values can construct reciprocal description links.
-        let mut current = self.clone();
+        let mut current = self.0.borrow().shared.clone();
         let mut seen = BTreeSet::new();
         loop {
-            let current_id = Rc::as_ptr(&current.0) as usize;
+            let current_id = Rc::as_ptr(&current) as usize;
             if !seen.insert(current_id) {
                 break;
             }
 
             let (resolver, parent) = {
-                let slot = current.0.borrow();
-                let resolver = slot
-                    .identity
-                    .borrow()
-                    .resolver
-                    .as_ref()
-                    .and_then(Weak::upgrade);
-                let parent = match &slot.description {
+                let shared = current.borrow();
+                let resolver = shared.identity.resolver.as_ref().and_then(Weak::upgrade);
+                let parent = match &shared.description {
                     Some(ObjectDescription::Child(child)) => child.parent.upgrade(),
                     _ => None,
                 };
@@ -2851,7 +2846,7 @@ impl ObjectHandle {
             let Some(parent) = parent else {
                 break;
             };
-            current = ObjectHandle(parent);
+            current = parent;
         }
 
         // Containment links are ownership/traversal metadata, not qpdf object
@@ -2869,8 +2864,9 @@ impl ObjectHandle {
         object: impl AsRef<[u8]>,
         offset: i64,
     ) {
-        let mut slot = self.0.borrow_mut();
-        slot.description = Some(ObjectDescription::Json(JsonDescription {
+        let shared = self.0.borrow().shared.clone();
+        let mut shared = shared.borrow_mut();
+        shared.description = Some(ObjectDescription::Json(JsonDescription {
             input: input.as_ref().to_vec(),
             object: object.as_ref().to_vec(),
         }));
@@ -2879,8 +2875,8 @@ impl ObjectHandle {
         // `setParsedOffset`, `libqpdf/qpdf/QPDFValue.hh:60-65,90-100`), so a
         // value that already carries an operational offset (e.g. a stream's
         // encoded-data start) keeps it.
-        if slot.parsed_offset < 0 {
-            slot.parsed_offset = offset;
+        if shared.parsed_offset < 0 {
+            shared.parsed_offset = offset;
         }
     }
 
@@ -2913,10 +2909,12 @@ impl ObjectHandle {
     /// `$PO`/`$OG` would otherwise become parser-owned placeholders again on
     /// the next render.
     pub(crate) fn description_template(&self) -> Option<Vec<u8>> {
-        match self.0.borrow().description.as_ref() {
+        let shared = self.0.borrow().shared.clone();
+        let description = match shared.borrow().description.as_ref() {
             Some(ObjectDescription::Template(template)) => Some(template.clone()),
             Some(ObjectDescription::Json(_) | ObjectDescription::Child(_)) | None => None,
-        }
+        };
+        description
     }
 
     /// Attach a qpdf document and explicit description to this shared object
@@ -2942,16 +2940,18 @@ impl ObjectHandle {
         description: impl AsRef<[u8]>,
     ) -> Result<()> {
         let resolver = pdf.resolver.document_resolver_weak()?;
-        let mut slot = self.0.borrow_mut();
-        slot.identity.borrow_mut().resolver = Some(resolver);
-        slot.identity.borrow_mut().active_pdf_unique_id = Some(pdf.unique_id);
-        slot.description = Some(ObjectDescription::Template(description.as_ref().to_vec()));
+        let shared = self.0.borrow().shared.clone();
+        let mut shared = shared.borrow_mut();
+        shared.identity.resolver = Some(resolver);
+        shared.identity.active_pdf_unique_id = Some(pdf.unique_id);
+        shared.description = Some(ObjectDescription::Template(description.as_ref().to_vec()));
         Ok(())
     }
 
     pub(crate) fn set_description(&self, description: impl AsRef<[u8]>, offset: i64) {
-        let mut slot = self.0.borrow_mut();
-        slot.description = Some(ObjectDescription::Template(description.as_ref().to_vec()));
+        let shared = self.0.borrow().shared.clone();
+        let mut shared = shared.borrow_mut();
+        shared.description = Some(ObjectDescription::Template(description.as_ref().to_vec()));
         // Set-once, matching qpdf's `setParsedOffset` guard that
         // `QPDFValue::setDescription` calls through
         // (`libqpdf/qpdf/QPDFValue.hh:60-65,90-100`). `QPDF_Stream::setDescription`
@@ -2959,8 +2959,8 @@ impl ObjectHandle {
         // stream's already-recorded encoded-data start survives a later
         // description assignment rather than being overwritten by the
         // description's own offset.
-        if slot.parsed_offset < 0 {
-            slot.parsed_offset = offset;
+        if shared.parsed_offset < 0 {
+            shared.parsed_offset = offset;
         }
     }
 
@@ -2969,7 +2969,8 @@ impl ObjectHandle {
     /// source location that produced the old description, so the indirect
     /// object fallback (`object N G`) must be used instead.
     pub(crate) fn clear_description(&self) {
-        self.0.borrow_mut().description = None;
+        let shared = self.0.borrow().shared.clone();
+        shared.borrow_mut().description = None;
     }
 
     pub(crate) fn set_child_description(
@@ -2979,8 +2980,8 @@ impl ObjectHandle {
         var_descr: impl AsRef<[u8]>,
     ) {
         let parent_shared = parent.0.borrow().shared.clone();
-        let slot = self.0.borrow();
-        slot.shared.borrow_mut().description = Some(ObjectDescription::Child(ChildDescription {
+        let shared = self.0.borrow().shared.clone();
+        shared.borrow_mut().description = Some(ObjectDescription::Child(ChildDescription {
             parent: Rc::downgrade(&parent_shared),
             static_descr: static_descr.as_ref().to_vec(),
             var_descr: var_descr.as_ref().to_vec(),
@@ -3920,7 +3921,9 @@ impl ObjectHandle {
     /// accessor only where the handle is already known to be resolved (a
     /// direct value, or an indirect one already dereferenced by the caller).
     pub fn get_parsed_offset(&self) -> i64 {
-        self.0.borrow().parsed_offset
+        let shared = self.0.borrow().shared.clone();
+        let parsed_offset = shared.borrow().parsed_offset;
+        parsed_offset
     }
 
     /// The qpdf-compatible signed parsed offset, resolving a lazy indirect
@@ -3951,9 +3954,10 @@ impl ObjectHandle {
     // this remains exposed so this module's own tests can exercise the
     // set-once contract independently.
     pub(crate) fn set_parsed_offset_if_unset(&self, offset: i64) {
-        let mut slot = self.0.borrow_mut();
-        if slot.parsed_offset < 0 {
-            slot.parsed_offset = offset;
+        let shared = self.0.borrow().shared.clone();
+        let mut shared = shared.borrow_mut();
+        if shared.parsed_offset < 0 {
+            shared.parsed_offset = offset;
         }
     }
 
@@ -4130,9 +4134,7 @@ impl ObjectHandle {
     /// qpdf resolved to its null fallback. A handle disconnected when its
     /// owning document is dropped is `Destroyed`, not null.
     pub fn is_null(&self) -> bool {
-        let state = self.0.borrow().state.clone();
-        let is_null = matches!(&*state.borrow(), ObjectValue::Null);
-        is_null
+        self.with_value(|value| matches!(value, Some(ObjectValue::Null)))
     }
 
     /// The value as `i64` if this handle's value — its own if direct, or its
@@ -7298,9 +7300,9 @@ impl ObjectHandle {
     // handle is resolved, including to qpdf's internal Unresolved/Reserved/
     // Destroyed value, this helper exposes the actual ObjectValue.
     pub(crate) fn with_value<T>(&self, f: impl FnOnce(Option<&ObjectValue>) -> T) -> T {
-        let state = self.0.borrow().state.clone();
-        let state = state.borrow();
-        f(Some(&state))
+        let shared = self.0.borrow().shared.clone();
+        let shared = shared.borrow();
+        f(Some(&shared.value))
     }
 
     // Mutable twin of `with_value`: every resolved qpdf value, including the
@@ -7418,7 +7420,8 @@ impl ObjectHandle {
     /// value with a caller-supplied one, any previously recorded source
     /// position no longer describes that value.
     pub(crate) fn reset_parsed_offset(&self) {
-        self.0.borrow_mut().parsed_offset = NO_PARSED_OFFSET;
+        let shared = self.0.borrow().shared.clone();
+        shared.borrow_mut().parsed_offset = NO_PARSED_OFFSET;
     }
 }
 
@@ -9372,15 +9375,7 @@ pub(crate) mod identity_tests {
             Rc::downgrade(&foreign_resolver),
         );
         assert_eq!(promoted_foreign.object_ref(), Some(ObjectRef::new(34, 0)));
-        assert_eq!(
-            promoted_foreign
-                .0
-                .borrow()
-                .identity
-                .borrow()
-                .active_pdf_unique_id,
-            Some(4243)
-        );
+        assert_eq!(promoted_foreign.owning_pdf_unique_id(), Some(4243));
         assert!(!promoted_foreign.belongs_exclusively_to_pdf(4242));
     }
 
@@ -11345,9 +11340,10 @@ mod resolution_state_tests {
 
         assert!(null.is_resolved());
         assert!(null.is_null());
-        let state = null.0.borrow().state.clone();
+        let shared = null.0.borrow().shared.clone();
+        let state = shared.borrow();
         assert!(
-            matches!(&*state.borrow(), ObjectValue::Null),
+            matches!(&state.value, ObjectValue::Null),
             "`set_resolved(Null)` must leave the slot in the value layer"
         );
     }
@@ -16380,10 +16376,10 @@ mod mutation_tests {
 
         assert!(owner.is_indirect());
         let slot = owner.0.borrow();
-        let state = slot.state.clone();
+        let shared = slot.shared.clone();
         drop(slot);
-        let state = state.borrow();
-        let ObjectValue::Dictionary(entries) = &*state else {
+        let shared = shared.borrow();
+        let ObjectValue::Dictionary(entries) = &shared.value else {
             panic!("test owner must resolve to the supplied dictionary"); // cov:ignore: successful set_resolved fixes this state
         };
         let resolved_key_allocation = entries
