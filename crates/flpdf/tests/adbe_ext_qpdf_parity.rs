@@ -2,12 +2,12 @@
 //! /ADBE mutations (removal AND injection) byte-for-byte.
 //!
 //! REMOVAL (QPDFWriter.cc L1408 whole /Extensions removal, L1432 /ADBE-only
-//! removal): proves `catalog_has_extensions_adbe` broadened trigger matches
-//! qpdf's `have_extensions_adbe = keys.count("/ADBE") > 0` (L1387) on inputs
-//! whose source /ADBE dict lacks a valid `/ExtensionLevel`.
+//! removal): proves the root output-copy reconciliation matches qpdf's
+//! `have_extensions_adbe = keys.count("/ADBE") > 0` (L1387) on inputs whose
+//! source /ADBE dict lacks a valid `/ExtensionLevel`.
 //!
-//! INJECTION (`inject_adbe_extension` fired by `WriterTestSettings::min_extension_level`,
-//! qpdf `--min-version=<v>.<ext>`) covers three shapes: (1) fresh /Extensions
+//! INJECTION (`WriterTestSettings::min_extension_level`, qpdf
+//! `--min-version=<v>.<ext>`) covers three shapes: (1) fresh /Extensions
 //! creation when the source Catalog has none, (2) direct /Extensions with a
 //! non-ADBE developer prefix (/XYZW) preserved, (3) indirect /Extensions
 //! reference with existing /ADBE weak + /ACRO — inlined onto the Catalog,
@@ -121,7 +121,7 @@ fn non_adbe_prefix_preserved_when_source_adbe_lacks_extension_level_byte_identic
 fn fresh_extensions_adbe_injected_when_source_has_none_byte_identical_to_qpdf() {
     // qpdf --min-version=1.7.8 on a Catalog with no /Extensions must emit
     // a fresh /Extensions << /ADBE << /BaseVersion /1.7 /ExtensionLevel 8 >> >>.
-    // Verifies inject_adbe_extension's fresh-creation branch byte-for-byte.
+    // Verifies the root output-copy fresh-creation branch byte-for-byte.
     assert_parity("one-page-no-ext.pdf", "adbe-inject.pdf", &inject_options());
 }
 

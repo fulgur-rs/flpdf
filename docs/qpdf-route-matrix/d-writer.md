@@ -330,7 +330,7 @@ encryption は上記 3 経路すべてで `doWriteSetup` の同一分岐（D-0�
 | D22 | `QPDF::getLinearizedParts` / `calculateLinearizationData`（part4/6/7/8/9） | `libqpdf/QPDF_linearization.cc:1435-1449,963-1403,1174-1336` | `crates/flpdf/src/linearization/plan.rs::LinearizationPlan`（`pub`、`crates/flpdf/src/linearization/plan.rs:744`） | prod: 21 (`crates/flpdf/src/linearization/writer.rs`=9, `crates/flpdf/src/linearization/hint_page.rs`=4, `crates/flpdf/src/linearization/{plan,renumber}.rs`=各3, `crates/flpdf/src/linearization/{hint_shared,part1}.rs`=各1) / test: 57 (10 files) | canonical | `crates/flpdf/src/linearization/plan.rs::LinearizationPlan` | `from_pdf_with_writer_options`（`crates/flpdf/src/linearization/plan.rs:959`）が production 入口。part 分類は qpdf の `lc_*` 集合を写している |
 | D23 | `doWriteSetup` の ObjStm 除外（linearized なら page + root、encrypted なら root） | `libqpdf/QPDFWriter.cc:2140-2158` | `crates/flpdf/src/writer/object_streams/planning.rs::filter_objstm_batches_for_output`（`pub(crate)`、`crates/flpdf/src/writer/object_streams/planning.rs:165`） | prod: 1 (`crates/flpdf/src/writer.rs:3889` legacy coordinator) + re-export 1 / test: 0 | mixed | `crates/flpdf/src/writer/object_streams/planning.rs::filter_objstm_batches_for_output` | `.48.54` で specialized coordinator、linearized Preserve、linearized Generate の全てが `filter_objstm_batches_for_output` を共有し、page dictionaries/Catalog の除外を一正本から適用する。plain pipeline は呼ばないが、`plain::eligible` が encrypted を除外し linearized は別経路なので `output_linearized \|\| output_encrypted` の組み合わせは各 route の呼び出し側で固定する。 |
 | D24 | `QPDFWriter::enqueueObjectsPCLm` + `writeStandard`（pclm は xref/trailer を standard と共有） | `libqpdf/QPDFWriter.cc:2928-2954,2991-3044` | `crates/flpdf/src/writer/pclm.rs::seed_handles`（`pub(crate)`、`:20`）→ `crates/flpdf/src/writer/pclm_live.rs::write_pclm`（`pub(crate)`、`:22`）→ shared `plain::body` / `plain::xref` | prod: PCLm route 1 (`crates/flpdf/src/writer.rs:3918`) / test: PCLm live callback + route contracts | canonical | `crates/flpdf/src/writer/plain/body.rs::emit_live_body` + `crates/flpdf/src/writer/plain/xref.rs::append_xref_and_trailer_with_handle` | qpdf の PCLm は initial seed (`enqueueObjectsPCLm`) だけが差分で、body ループ・dynamic child discovery・classic xref・trailer は `writeStandard` と共有する。flpdf は `seed_handles` が page → contents → strip/synthetic → root の seed を供給し、`pclm_live::write_pclm` が shared live body / shared trailer-xref ownerへ接続する。旧 `pclm::Plan` は unit-test planner のみで production caller ではない。 |
-| D25 | `QPDFWriter::prepareFileForWrite` と root `unparseObject` の ADBE reconciliation | `libqpdf/QPDFWriter.cc:1347-1435,1773-1794,2036-2056` | `crates/flpdf/src/writer.rs::prepare_file_for_write` → plain / specialized standard / PCLm と `crates/flpdf/src/linearization/writer.rs::do_write_pass` の `ObjectWriterEmission::output_root_copy_with_adbe` | linearized: pass1/pass2 のCatalog各1回。QDF/normalize の Disable と source ObjStm なし Preserve も live root consumerへ移行済み。残る helper caller は encrypted / source-encrypted / 一部 legacy consumer | mixed | `crates/flpdf/src/writer/object.rs::root_output_copy_with_adbe` | `.48.60` linearized slice: callback → root shallow-copy reconciliation → unparse を両passで実行。共有direct Extensionsの変更は成功・失敗後もqpdfどおり保持し、linearized snapshot/restoreを撤去。`.48.s07c` の specialized standard と `.48.86` の PCLm は live root consumerへ移行済み。`flpdf-ay5b` は QDF/normalize の Disable・source ObjStm なし Preserve について、先行計画を廃して QDF length-holder / page-context と emission-time child discovery を同じ live queueへ接続した。Generate と source ObjStm-bearing Preserve、暗号化系は別 consumerとして残る。D25全体と旧helper撤去は未完。 |
+| D25 | `QPDFWriter::prepareFileForWrite` と root `unparseObject` の ADBE reconciliation | `libqpdf/QPDFWriter.cc:1347-1435,1773-1794,2036-2056` | `crates/flpdf/src/writer.rs::prepare_file_for_write` と全 writer root consumer の `ObjectWriterEmission::output_root_copy_with_adbe` | prod: common preparation 1 + non-linearized root consumers（plain / specialized / PCLm / remaining planned coordinator）+ linearized pass1/pass2。legacy ADBE helper caller 0 | canonical | `crates/flpdf/src/writer/object.rs::root_output_copy_with_adbe` | `.48.60` の linearized、`.48.s07c` の specialized standard、`.48.86` の PCLm、ay5b bounded QDF/normalize は output-time root copy を使用する。`.60` で残る planned/encrypted coordinatorも indirect Root・ObjStm member・direct trailerの3境界を同じcopyへ切替え、inject/strip/snapshot/restoreの定義・production callerを撤去した。Generate/source-ObjStm Preserve、暗号化系のchild discovery／packingはD2/D3/D11のmixed残スコープであり、D25のroot ownership移行を全writer parityとは扱わない。`prepare_file_for_write` の恒久的directizationとfixDanglingReferencesは維持する。 |
 | D26 | `QPDFWriter::initializeSpecialStreams`（page seq / contents seq / normalized streams） | `libqpdf/QPDFWriter.cc:1912-1936`、トリガは `libqpdf/QPDFWriter.cc:2113-2115` | `crates/flpdf/src/writer.rs::initialize_special_streams`（`PdfWriter::write` が setup で呼び、`emit_canonical_pdf_with_special_streams` が specialized consumer として受け取る） | prod: 1 (`crates/flpdf/src/writer.rs` の `PdfWriter::write`) / test: 3（direct wrapper と setup snapshot tests） | mixed | `crates/flpdf/src/writer.rs::initialize_special_streams` | qpdf と同じ `qdf \|\| content_normalization \|\| decode_level != None` trigger で、修復済み page snapshot から 3 map と direct-content container set を一度だけ生成する。QDF の `page_seq` / `contents_seq` と stream policy の normalized set は同じ state を参照し、normalized set の適用自体は `content_normalization` gate に限定する。linearized/他 route の consumer 移行は後続 |
 | D27 | `enqueueObject` による到達性（qpdf に独立した削除パスは無い） | `libqpdf/QPDFWriter.cc:1072-1141,2907-2925` | `sweep_unreachable_objects` と multi-source merge 専用の `sweep_unreachable_objects_except` はともに撤去済み。書き込み時の canonical owner は `crates/flpdf/src/writer/rewrite_renumber.rs::ObjectStreamRenumber` | pre-write route: prod 0 / test 0 | canonical | `crates/flpdf/src/writer/rewrite_renumber.rs::ObjectStreamRenumber`（書き込み経路の到達性） | pre-write sweep の撤去という本行の責務は完了。`sweep_unreachable_objects` と `_except` は Rust 全域 0 hit（2026-09-06）。closed `flpdf-3yn9.44` / `.45` が single/multi-source consumer の撤去、`.44.1` / `.44.1.1` が reachable stream probe の移行を所有する。新たな sweep cleanup は不要。書き込み前採番 walk と実際の emission の統合は D2/D3/D11 の別責務なので、本行の完了を writer 全体の単一 owner 完了とは扱わない |
 | D28 | `getCompressibleObjGens` と writer到達性・stream parameter処理の分離 | `libqpdf/QPDF.cc:2393-2474`、`libqpdf/QPDFWriter.cc:1953-1958` | document candidate walk / `crates/flpdf/src/writer/plain/plan.rs::retain_reachable_object_stream_members` | Generate candidate: document owner / remaining writer rewalks | mixed | `Pdf::get_compressible_objgens` owns candidate selection | plain Generateの候補選択から旧removed_refsとindirect ObjStm Length集合を切り離した。writerのstream-parameter処理、採番reachability再walk、Preserve intersection、linearizedは別の残責務であり、候補選択へ混合しない。 |
@@ -370,7 +370,7 @@ static ID を出力しつつ、deterministic の暗号化禁止は保持）→
 (2) **force<1.5 による ObjStm 抑制** →
 (3) `encrypt && copy_encryption` の排他チェック →
 (4) live plain / PCLm / specialized の root consumerを先に選択 →
-(5) それ以外だけ `/Extensions /ADBE` の legacy inject・strip と snapshot 境界 →
+(5) legacy coordinator を含む全 consumerが Root emission-time shallow copyを実行 →
 (6) `if options.pclm → writer/pclm_live.rs::write_pclm` →
 (7) `plain::write_plain` または legacy coordinator。
 
@@ -495,11 +495,11 @@ decrypt/preserve matrixを確認した。
 
 このsliceでD2/D3/D11の **specialized standard** はliveになったが、QDF/normalize
 （`flpdf-ay5b`）と linearized の別consumerは残る。PCLm は別の shared-live
-consumer slice (`flpdf-3yn9.48.86`) に切り出した。したがってD25の
-`inject_adbe_extension` / `strip_adbe_extension` / `snapshot_catalog_extensions` /
-`restore_catalog_extensions` caller-zero、ならびにroute matrix全体の
-bridge/mixed解消を完了とは扱わない。`.60` はこのsliceを取り込んだ後に
-specialized root ownerを最終cutoverし、残るhelper callerを監査して撤去する。
+consumer slice (`flpdf-3yn9.48.86`) に切り出した。RootのADBE ownership自体は
+各consumerの output-time shallow copyへ集約し、旧inject・strip・snapshot・restore
+bridgeは `.60` で撤去する。Generate/source-ObjStm-bearing Preserve、暗号化系の
+child discoveryとObjStm packingはD2/D3/D11のmixed残スコープであり、Root ownerの
+caller-zeroだけからroute matrix全体のbridge/mixed解消や全writer parityを主張しない。
 
 後続のoracle再確認で、specialized consumerの境界もqpdfに合わせて補正した。
 GenerateのObjStm placeholderは`getObjectCount`より前にsetupで確保し、progressの
@@ -548,8 +548,29 @@ queue を読む。この境界は old `/ADBE` descendants を pre-plan で保持
 ObjStm-bearing Preserve は ObjStm packing/order を含む planned consumerとして
 この sliceの対象外であり、暗号化入力・出力暗号化も別 consumerとして残る。
 
-この slice により D2/D3/D11 の QDF/normalize bounded cohort は live になったが、
-D25 の旧 `inject_adbe_extension` / `strip_adbe_extension` /
-`snapshot_catalog_extensions` / `restore_catalog_extensions` は暗号化・残る
-planned/specialized consumerで引き続き実 caller がある。全 helper caller-zero と
-route matrix 全体の bridge/mixed 解消は `.60` の最終監査まで完了扱いにしない。
+この slice により D2/D3/D11 の QDF/normalize bounded cohort は live になった。
+Generate/source-ObjStm-bearing Preserve と暗号化系は planned consumerとして残るが、
+RootのADBE reconciliationは後続の `.60` cutoverで共通output copyへ移す。
+
+## 2026-09-13: Root ADBE helper caller-zero (`flpdf-3yn9.48.60`)
+
+`.60` は、既に移行済みだった specialized standard・linearized・PCLm・QDF/normalize
+bounded cohortに加え、legacy coordinatorに残っていたRootの3つのemission境界を
+`ObjectWriterEmission::output_root_copy_with_adbe`へ接続した。
+
+* 通常bodyのindirect Catalogはbody emission時にshallow copyを作る。
+* Generate/PreserveのObjStm member Catalogもmember serializerの直前に同じcopyを作る。
+* direct Catalogはtrailer handleへoutput copyを渡し、classic/xref-streamのdirect-root
+  spliceが同じ値を出す。
+
+これにより `inject_adbe_extension`、`strip_adbe_extension`、
+`snapshot_catalog_extensions`、`restore_catalog_extensions` と、それ専用だった
+raw restoration primitiveは定義・production callerとも0になった。成功時とsink
+failure時のshared direct `/Extensions` aliasは `adbe_shared_state_tests.rs` のlegacy
+QDFケースで確認した。`prepare_file_for_write` のfixDanglingReferencesと恒久的な
+`/Extensions`・`/ADBE` directizationは保持する。
+
+Root ownershipの切替はD25をcanonicalへ更新するが、Generate/source-ObjStm-bearing
+Preserve・暗号化系のplanned child discovery／ObjStm packingはD2/D3/D11のmixed残差で
+あり、ay5bの既知QDF/normalize残差も別ownerのままである。したがって、このsliceの
+完了はroute matrix全体のbridge/mixed解消や全writer parityを意味しない。
