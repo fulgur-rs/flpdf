@@ -9313,6 +9313,45 @@ pub(crate) mod identity_tests {
     }
 
     #[test]
+    fn assigning_value_state_shares_mutations_without_merging_slot_identity() {
+        let source = ObjectHandle::dictionary(vec![(b"Value".to_vec(), ObjectHandle::integer(7))]);
+        let target = ObjectHandle::dictionary(vec![]);
+
+        target.assign_value_state(&source);
+
+        assert!(!target.is_same_object_as(&source));
+        source
+            .replace_key(b"/Value", ObjectHandle::integer(8))
+            .expect("dictionary replacement");
+        assert_eq!(target.try_get_key(b"/Value").unwrap().as_integer(), Some(8));
+    }
+
+    #[test]
+    fn swapping_value_state_moves_values_without_moving_object_references() {
+        let left_ref = ObjectRef::new(40, 0);
+        let right_ref = ObjectRef::new(41, 0);
+        let left = ObjectHandle::new_indirect_unresolved(left_ref, NO_PARSED_OFFSET);
+        let right = ObjectHandle::new_indirect_unresolved(right_ref, NO_PARSED_OFFSET);
+        left.set_resolved(ObjectValue::Dictionary(
+            [(b"Value".to_vec(), ObjectHandle::integer(7))]
+                .into_iter()
+                .collect(),
+        ));
+        right.set_resolved(ObjectValue::Dictionary(
+            [(b"Value".to_vec(), ObjectHandle::integer(8))]
+                .into_iter()
+                .collect(),
+        ));
+
+        left.swap_value_state_with(&right);
+
+        assert_eq!(left.object_ref(), Some(left_ref));
+        assert_eq!(right.object_ref(), Some(right_ref));
+        assert_eq!(left.try_get_key(b"/Value").unwrap().as_integer(), Some(8));
+        assert_eq!(right.try_get_key(b"/Value").unwrap().as_integer(), Some(7));
+    }
+
+    #[test]
     fn removing_a_direct_handle_is_a_no_op() {
         let direct = ObjectHandle::integer(1);
         direct.remove_from_document();
@@ -9392,7 +9431,8 @@ pub(crate) mod identity_tests {
         target.remove_from_document();
 
         assert!(target.is_direct());
-        assert!(target.is_null());
+        assert!(target.try_is_null().unwrap());
+        assert_eq!(target.object_ref(), None);
         assert_eq!(
             replacement.try_get_key(b"/Value").unwrap().as_integer(),
             Some(7)
@@ -9417,6 +9457,7 @@ pub(crate) mod identity_tests {
         target.disconnect_and_destroy();
 
         assert_eq!(target.type_code().expect("type code"), 14);
+        assert!(!replacement.try_is_null().unwrap());
         assert_eq!(
             replacement.try_get_key(b"/Value").unwrap().as_integer(),
             Some(7)
