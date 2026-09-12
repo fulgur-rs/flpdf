@@ -3,6 +3,7 @@
 use flpdf::{EncryptParams, ObjectHandle, ObjectRef, ObjectStreamMode, Pdf, PdfWriter};
 use std::fs;
 use std::io::Cursor;
+use std::path::Path;
 use std::process::Command;
 
 #[test]
@@ -208,6 +209,69 @@ fn generated_stale_generation_arrays_match_qpdf_in_both_visit_orders() {
         assert_eq!(
             writer.get_buffer().unwrap(),
             std::fs::read(expected).unwrap()
+        );
+    }
+}
+
+#[cfg(feature = "qpdf-zlib-compat")]
+#[test]
+fn generate_indirect_extensions_matches_qpdf_before_prepare_file_for_write() {
+    let version = Command::new("qpdf")
+        .arg("--version")
+        .output()
+        .expect("qpdf should be installed for the Generate differential oracle");
+    assert!(version.status.success(), "qpdf --version failed");
+    assert_eq!(
+        String::from_utf8_lossy(&version.stdout).lines().next(),
+        Some("qpdf version 11.9.0"),
+        "Generate differential oracle must be qpdf 11.9.0"
+    );
+
+    for fixture in [
+        "one-page-ext-indirect.pdf",
+        "linearize-indirect-extensions.pdf",
+    ] {
+        let temporary = tempfile::tempdir().unwrap();
+        let input = temporary.path().join("input.pdf");
+        let qpdf_output = temporary.path().join("qpdf.pdf");
+        fs::write(
+            &input,
+            std::fs::read(
+                Path::new(env!("CARGO_MANIFEST_DIR"))
+                    .join("../../tests/fixtures/compat")
+                    .join(fixture),
+            )
+            .unwrap(),
+        )
+        .unwrap();
+
+        let qpdf = Command::new("qpdf")
+            .args([
+                "--static-id",
+                "--newline-before-endstream=n",
+                "--object-streams=generate",
+            ])
+            .arg(&input)
+            .arg(&qpdf_output)
+            .output()
+            .unwrap();
+        assert!(
+            qpdf.status.success(),
+            "qpdf Generate rewrite failed for {fixture}: {}",
+            String::from_utf8_lossy(&qpdf.stderr)
+        );
+
+        let mut pdf = Pdf::open(Cursor::new(fs::read(&input).unwrap())).unwrap();
+        let mut writer = PdfWriter::new(&mut pdf);
+        writer.set_object_stream_mode(ObjectStreamMode::Generate);
+        writer.set_static_id(true);
+        writer.set_output_memory().unwrap();
+        writer.write().unwrap();
+
+        assert_eq!(
+            writer.get_buffer().unwrap(),
+            fs::read(&qpdf_output).unwrap(),
+            "Generate output for {fixture} must match qpdf's setup-time membership"
         );
     }
 }
