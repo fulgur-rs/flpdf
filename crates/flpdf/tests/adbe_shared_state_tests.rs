@@ -106,13 +106,17 @@ fn specialized_standard_sink_failure_keeps_shared_adbe_changes() {
     }
 }
 
-fn legacy_qdf_shared_extensions(level: i64, fail: bool) {
+fn legacy_planned_shared_extensions(qdf: bool, level: i64, fail: bool) {
     let (mut pdf, root, extensions) = document();
     let mut writer = PdfWriter::new(&mut pdf);
-    // Extra header text excludes this QDF Generate route from the migrated
-    // live queue, so the test exercises the remaining legacy coordinator's
-    // Root emission boundary.
-    writer.set_qdf_mode(true);
+    // Extra header text excludes this Generate route from the migrated live
+    // queue, so the test exercises the remaining legacy coordinator's Root
+    // emission boundary for both QDF and content normalization.
+    if qdf {
+        writer.set_qdf_mode(true);
+    } else {
+        writer.set_content_normalization(true);
+    }
     writer.set_object_stream_mode(flpdf::ObjectStreamMode::Generate);
     writer.set_extra_header_text("% legacy QDF ADBE probe\n");
     writer.set_static_id(true);
@@ -150,10 +154,12 @@ fn legacy_qdf_shared_extensions(level: i64, fail: bool) {
 }
 
 #[test]
-fn legacy_qdf_root_reconciles_shared_extensions_on_success_and_failure() {
+fn legacy_root_reconciles_shared_extensions_on_success_and_failure() {
     for fail in [false, true] {
         for level in [0, 8] {
-            legacy_qdf_shared_extensions(level, fail);
+            for qdf in [true, false] {
+                legacy_planned_shared_extensions(qdf, level, fail);
+            }
         }
     }
 }
