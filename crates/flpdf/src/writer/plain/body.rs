@@ -1440,7 +1440,7 @@ pub(crate) fn canonical_stream_output_with_status(
     )
 }
 
-/// Full-rewrite variant of [`canonical_stream_output`]. The legacy writer
+/// Full-rewrite variant of [`canonical_stream_output_with_status`]. The legacy writer
 /// applies the same qpdf filter/provider pipeline and the cleartext-metadata
 /// policy that belongs to encrypted output. PCLm calls this same writer-owned
 /// policy after forcing qpdf's uncompressed setup; callers own only the final
