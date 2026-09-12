@@ -146,13 +146,12 @@ use crate::{
     writer::DecodeLevel,
 };
 use crate::{json::Json, Error, ObjectRef, QpdfErrorCode, QpdfExc, Result};
-use std::cell::{Cell, RefCell};
+use std::cell::RefCell;
 use std::collections::{BTreeMap, BTreeSet};
 use std::hash::{Hash, Hasher};
 use std::rc::{Rc, Weak};
 
 type StreamTokenFilter = Rc<RefCell<dyn TokenFilter>>;
-type StreamTokenFilterList = Rc<RefCell<Vec<StreamTokenFilter>>>;
 
 /// qpdf's `qpdf_ef_compress` bit in `QPDF_Stream::pipeStreamData`, for the
 /// `encode_flags` argument of [`ObjectHandle::pipe_stream_data`].
@@ -1015,12 +1014,17 @@ impl Hash for ObjectHandleIdentity {
 impl std::fmt::Debug for ObjectHandle {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         let slot = self.0.borrow();
-        let state = slot.state.borrow();
-        let state: &str = match &*state {
-            ObjectValue::Unresolved => "Unresolved",
-            ObjectValue::Reserved => "Reserved",
-            ObjectValue::Destroyed => "Destroyed",
-            _ => "Resolved(..)",
+        let (state, parsed_offset) = {
+            let shared = slot.shared.borrow();
+            (
+                match &shared.value {
+                    ObjectValue::Unresolved => "Unresolved",
+                    ObjectValue::Reserved => "Reserved",
+                    ObjectValue::Destroyed => "Destroyed",
+                    _ => "Resolved(..)",
+                },
+                shared.parsed_offset,
+            )
         };
         let label = if slot.is_indirect() {
             "ObjectHandle::Indirect"
@@ -1030,7 +1034,7 @@ impl std::fmt::Debug for ObjectHandle {
         f.debug_struct(label)
             .field("object_ref", &slot.object_ref())
             .field("state", &state)
-            .field("parsed_offset", &slot.parsed_offset)
+            .field("parsed_offset", &parsed_offset)
             .field("end_before_space", &slot.end_before_space)
             .field("end_after_space", &slot.end_after_space)
             .finish()
@@ -1039,7 +1043,7 @@ impl std::fmt::Debug for ObjectHandle {
 
 #[derive(Clone)]
 pub(crate) struct ChildDescription {
-    parent: Weak<RefCell<ObjectSlot>>,
+    parent: Weak<RefCell<SharedValueState>>,
     static_descr: Vec<u8>,
     var_descr: Vec<u8>,
 }
@@ -1102,35 +1106,100 @@ fn expand_description_template(
 
 // Deliberately not `Debug`: see `ObjectHandle`'s own hand-written `Debug`
 // impl above for why a derived one is unsafe here (object-handle cycles).
-// This uniform allocation corresponds to qpdf's QPDFObject/QPDFValue pair:
-// it keeps the current payload and all indirect metadata together rather
-// than placing direct and indirect forms in separate backing storage.
+// This is flpdf's counterpart to qpdf's QPDFValue allocation: every field
+// here moves as one value pointer through QPDFObject::assign/swapWith.
+struct SharedValueState {
+    value: ObjectValue,
+    identity: ValueIdentity,
+    parsed_offset: i64,
+    description: Option<ObjectDescription>,
+    state_owners: Vec<Weak<RefCell<ObjectSlot>>>,
+    stream_token_filters: Vec<StreamTokenFilter>,
+    content_normalization_applied: bool,
+    mutation_generation: u64,
+}
+
+impl SharedValueState {
+    fn qpdf_obj_gen(&self) -> Option<QpdfObjGen> {
+        self.identity
+            .qpdf_obj_gen
+            .or_else(|| self.identity.object_ref.map(QpdfObjGen::from_object_ref))
+    }
+
+    fn object_ref(&self) -> Option<ObjectRef> {
+        self.qpdf_obj_gen()
+            .and_then(QpdfObjGen::to_object_ref)
+            .or(self.identity.object_ref)
+    }
+
+    fn get_description(&self) -> Vec<u8> {
+        if let Some(desc) = &self.description {
+            match desc {
+                ObjectDescription::Template(tmpl) => expand_description_template(
+                    tmpl,
+                    self.object_ref(),
+                    &self.value,
+                    self.parsed_offset,
+                ),
+                ObjectDescription::Json(j) => {
+                    let mut result = j.input.clone();
+                    if !j.object.is_empty() {
+                        result.extend_from_slice(b", ");
+                        result.extend_from_slice(&j.object);
+                    }
+                    result.extend_from_slice(b" at offset ");
+                    result.extend_from_slice(self.parsed_offset.to_string().as_bytes());
+                    result
+                }
+                ObjectDescription::Child(child) => {
+                    let mut result = child
+                        .parent
+                        .upgrade()
+                        .map(|parent| parent.borrow().get_description())
+                        .unwrap_or_default();
+                    result.extend_from_slice(&child.static_descr);
+                    // qpdf's child branch replaces only the first marker in
+                    // the already-rendered parent/static string
+                    // (`libqpdf/QPDFValue.cc:52-54`).
+                    replace_first(&mut result, b"$VD", &child.var_descr);
+                    result
+                }
+            }
+        } else if let Some(object_gen) = self.qpdf_obj_gen() {
+            format!("object {} {}", object_gen.get_obj(), object_gen.get_gen()).into_bytes()
+        } else {
+            Vec::new()
+        }
+    }
+}
+
+fn new_shared_value_state(
+    value: ObjectValue,
+    identity: ValueIdentity,
+    parsed_offset: i64,
+) -> Rc<RefCell<SharedValueState>> {
+    Rc::new(RefCell::new(SharedValueState {
+        value,
+        identity,
+        parsed_offset,
+        description: None,
+        state_owners: Vec::new(),
+        stream_token_filters: Vec::new(),
+        content_normalization_applied: false,
+        mutation_generation: 0,
+    }))
+}
+
+// This outer allocation corresponds to qpdf's QPDFObject. It preserves
+// handle/cache/provenance identity while its `shared` QPDFValue counterpart
+// can be assigned independently.
 struct ObjectSlot {
     /// Whether this handle points at an actual qpdf object allocation.
     /// qpdf's default-constructed `QPDFObjectHandle` has no value at all;
     /// keeping this separate from `ObjectValue::Unresolved` preserves that
     /// state from both an initialized lazy indirect object and a null value.
     initialized: bool,
-    /// The payload state is separately reference-counted so qpdf's
-    /// `QPDFObject::assign` boundary can make two distinct handles observe
-    /// one replacement value while retaining their own handle identities.
-    state: Rc<RefCell<ObjectValue>>,
-    /// Every slot whose payload is the [`Self::state`] allocation. Normally
-    /// this contains only the slot itself; qpdf's `QPDFObject::assign` can
-    /// temporarily make a direct replacement handle and an indirect target
-    /// share one payload while retaining distinct handle identities.
-    ///
-    /// The weak back-links let a later mutation through either alias update
-    /// containment edges for every owner of the shared payload. Without this
-    /// list, mutating the direct replacement after `replaceObject` would
-    /// update only its own parent edges while the canonical target retained
-    /// stale ownership metadata.
-    state_owners: Rc<RefCell<Vec<Weak<RefCell<ObjectSlot>>>>>,
-    /// qpdf's QPDFValue object generation and owning QPDF. This allocation
-    /// follows the shared payload through assign, swap, and detachment;
-    /// distinct QObject slots sharing a value observe one active identity.
-    identity: Rc<RefCell<ValueIdentity>>,
-    parsed_offset: i64,
+    shared: Rc<RefCell<SharedValueState>>,
     end_before_space: i64,
     end_after_space: i64,
     /// The document identity claimed by a handle-native name/number-tree
@@ -1143,22 +1212,6 @@ struct ObjectSlot {
     // edge has no qpdf counterpart and is retained solely for cfg(test)
     // containment-root assertions and stack-safe teardown bookkeeping.
     containment_parents: Vec<Weak<RefCell<ObjectSlot>>>,
-    description: Option<ObjectDescription>,
-    /// qpdf's `QPDF_Stream::token_filters` list. It is attached to the
-    /// canonical handle allocation rather than eagerly rewriting the source
-    /// bytes; the stream pipeline consumes it after decoding and before
-    /// normalization/encoding (`libqpdf/QPDF_Stream.cc:488-620`).
-    stream_token_filters: StreamTokenFilterList,
-    /// Whether the current stream bytes have already passed the CLI's
-    /// content-normalization pass. This is deliberately separate from
-    /// `replaceStreamData`: qpdf treats replacement bytes as ordinary stream
-    /// data, while the writer must skip only the normalization that this
-    /// particular consumer has already performed.
-    content_normalization_applied: Rc<Cell<bool>>,
-    /// Monotonic identity for in-place mutations of this handle's payload.
-    /// Writer caches use it to distinguish a plan-time stream snapshot from
-    /// later qpdf-shaped replacement/filter mutations.
-    mutation_generation: Rc<Cell<u64>>,
 }
 
 /// The active identity on qpdf's shared QPDFValue (QPDFValue.hh:68-72).
@@ -1173,72 +1226,35 @@ struct ValueIdentity {
 
 impl ObjectSlot {
     fn qpdf_obj_gen(&self) -> Option<QpdfObjGen> {
-        let identity = self.identity.borrow();
-        identity
-            .qpdf_obj_gen
-            .or_else(|| identity.object_ref.map(QpdfObjGen::from_object_ref))
+        self.shared.borrow().qpdf_obj_gen()
     }
 
     fn object_ref(&self) -> Option<ObjectRef> {
-        self.qpdf_obj_gen()
-            .and_then(QpdfObjGen::to_object_ref)
-            .or_else(|| self.identity.borrow().object_ref)
+        self.shared.borrow().object_ref()
     }
 
     fn is_indirect(&self) -> bool {
-        let identity = self.identity.borrow();
-        identity
+        let shared = self.shared.borrow();
+        shared
+            .identity
             .qpdf_obj_gen
             .is_some_and(QpdfObjGen::is_indirect)
             // Keep the pre-existing synthetic `ObjectRef(0, generation)`
             // mutation surface isolated from parsed qpdf identities. Its
             // invariant is tracked separately by flpdf-3sbf.
-            || identity.object_ref.is_some()
+            || shared.identity.object_ref.is_some()
     }
 
     fn active_pdf_unique_id(&self) -> Option<u64> {
-        self.identity.borrow().active_pdf_unique_id
+        self.shared.borrow().identity.active_pdf_unique_id
     }
 
     fn resolver(&self) -> Option<Weak<dyn DocumentResolver>> {
-        self.identity.borrow().resolver.clone()
+        self.shared.borrow().identity.resolver.clone()
     }
 
     fn get_description(&self) -> Vec<u8> {
-        let state = self.state.borrow();
-        if let Some(desc) = &self.description {
-            match desc {
-                ObjectDescription::Template(tmpl) => {
-                    expand_description_template(tmpl, self.object_ref(), &state, self.parsed_offset)
-                }
-                ObjectDescription::Json(j) => {
-                    let mut result = j.input.clone();
-                    if !j.object.is_empty() {
-                        result.extend_from_slice(b", ");
-                        result.extend_from_slice(&j.object);
-                    }
-                    result.extend_from_slice(b" at offset ");
-                    result.extend_from_slice(self.parsed_offset.to_string().as_bytes());
-                    result
-                }
-                ObjectDescription::Child(child) => {
-                    let mut result = Vec::new();
-                    if let Some(parent_slot) = child.parent.upgrade() {
-                        result = parent_slot.borrow().get_description();
-                    }
-                    result.extend_from_slice(&child.static_descr);
-                    // qpdf's child branch replaces only the first marker in
-                    // the already-rendered parent/static string
-                    // (`libqpdf/QPDFValue.cc:52-54`).
-                    replace_first(&mut result, b"$VD", &child.var_descr);
-                    result
-                }
-            }
-        } else if let Some(object_gen) = self.qpdf_obj_gen() {
-            format!("object {} {}", object_gen.get_obj(), object_gen.get_gen()).into_bytes()
-        } else {
-            Vec::new()
-        }
+        self.shared.borrow().get_description()
     }
 }
 
@@ -1337,23 +1353,15 @@ pub(crate) enum ObjectValue {
 fn empty_object_slot() -> Rc<RefCell<ObjectSlot>> {
     Rc::new(RefCell::new(ObjectSlot {
         initialized: false,
-        state: Rc::new(RefCell::new(ObjectValue::Unresolved)),
-        state_owners: Rc::new(RefCell::new(Vec::new())),
-        identity: Rc::new(RefCell::new(ValueIdentity {
-            object_ref: None,
-            qpdf_obj_gen: None,
-            active_pdf_unique_id: None,
-            resolver: None,
-        })),
-        parsed_offset: NO_PARSED_OFFSET,
+        shared: new_shared_value_state(
+            ObjectValue::Unresolved,
+            ValueIdentity::default(),
+            NO_PARSED_OFFSET,
+        ),
         end_before_space: NO_PARSED_OFFSET,
         end_after_space: NO_PARSED_OFFSET,
         tree_pdf_unique_id: None,
         containment_parents: Vec::new(),
-        description: None,
-        stream_token_filters: Rc::new(RefCell::new(Vec::new())),
-        content_normalization_applied: Rc::new(Cell::new(false)),
-        mutation_generation: Rc::new(Cell::new(0)),
     }))
 }
 
@@ -1739,9 +1747,7 @@ impl ObjectHandle {
     /// a second, *direct* reserved handle with neither — so indirect
     /// identity is this sentinel's common case, not a universal one.
     pub fn is_reserved(&self) -> bool {
-        let state = self.0.borrow().state.clone();
-        let reserved = matches!(&*state.borrow(), ObjectValue::Reserved);
-        reserved
+        self.with_value(|value| matches!(value, Some(ObjectValue::Reserved)))
     }
 
     /// The object number/generation for an indirect handle, or `None` for a
@@ -1865,23 +1871,20 @@ impl ObjectHandle {
     ) -> Self {
         let handle = Self(Rc::new(RefCell::new(ObjectSlot {
             initialized: true,
-            state: Rc::new(RefCell::new(ObjectValue::Reserved)),
-            state_owners: Rc::new(RefCell::new(Vec::new())),
-            identity: Rc::new(RefCell::new(ValueIdentity {
-                object_ref: Some(object_ref),
-                qpdf_obj_gen: Some(QpdfObjGen::from_object_ref(object_ref)),
-                active_pdf_unique_id: Some(pdf_unique_id),
-                resolver: Some(resolver),
-            })),
-            parsed_offset: NO_PARSED_OFFSET,
+            shared: new_shared_value_state(
+                ObjectValue::Reserved,
+                ValueIdentity {
+                    object_ref: Some(object_ref),
+                    qpdf_obj_gen: Some(QpdfObjGen::from_object_ref(object_ref)),
+                    active_pdf_unique_id: Some(pdf_unique_id),
+                    resolver: Some(resolver),
+                },
+                NO_PARSED_OFFSET,
+            ),
             end_before_space: NO_PARSED_OFFSET,
             end_after_space: NO_PARSED_OFFSET,
             tree_pdf_unique_id: None,
             containment_parents: Vec::new(),
-            description: None,
-            stream_token_filters: Rc::new(RefCell::new(Vec::new())),
-            content_normalization_applied: Rc::new(Cell::new(false)),
-            mutation_generation: Rc::new(Cell::new(0)),
         })));
         handle.register_state_owner();
         handle
@@ -1901,23 +1904,15 @@ impl ObjectHandle {
     pub(crate) fn new_reserved_direct() -> Self {
         let handle = Self(Rc::new(RefCell::new(ObjectSlot {
             initialized: true,
-            state: Rc::new(RefCell::new(ObjectValue::Reserved)),
-            state_owners: Rc::new(RefCell::new(Vec::new())),
-            identity: Rc::new(RefCell::new(ValueIdentity {
-                object_ref: None,
-                qpdf_obj_gen: None,
-                active_pdf_unique_id: None,
-                resolver: None,
-            })),
-            parsed_offset: NO_PARSED_OFFSET,
+            shared: new_shared_value_state(
+                ObjectValue::Reserved,
+                ValueIdentity::default(),
+                NO_PARSED_OFFSET,
+            ),
             end_before_space: NO_PARSED_OFFSET,
             end_after_space: NO_PARSED_OFFSET,
             tree_pdf_unique_id: None,
             containment_parents: Vec::new(),
-            description: None,
-            stream_token_filters: Rc::new(RefCell::new(Vec::new())),
-            content_normalization_applied: Rc::new(Cell::new(false)),
-            mutation_generation: Rc::new(Cell::new(0)),
         })));
         handle.register_state_owner();
         handle
@@ -1960,7 +1955,7 @@ impl ObjectHandle {
             pdf_unique_id,
             resolver,
         );
-        handle.0.borrow().identity.borrow_mut().object_ref = Some(object_ref);
+        handle.0.borrow().shared.borrow_mut().identity.object_ref = Some(object_ref);
         handle
     }
 
@@ -1973,23 +1968,20 @@ impl ObjectHandle {
         let _ = offset;
         let handle = Self(Rc::new(RefCell::new(ObjectSlot {
             initialized: true,
-            state: Rc::new(RefCell::new(ObjectValue::Unresolved)),
-            state_owners: Rc::new(RefCell::new(Vec::new())),
-            identity: Rc::new(RefCell::new(ValueIdentity {
-                object_ref: object_gen.to_object_ref(),
-                qpdf_obj_gen: Some(object_gen),
-                active_pdf_unique_id: pdf_unique_id,
-                resolver,
-            })),
-            parsed_offset: NO_PARSED_OFFSET,
+            shared: new_shared_value_state(
+                ObjectValue::Unresolved,
+                ValueIdentity {
+                    object_ref: object_gen.to_object_ref(),
+                    qpdf_obj_gen: Some(object_gen),
+                    active_pdf_unique_id: pdf_unique_id,
+                    resolver,
+                },
+                NO_PARSED_OFFSET,
+            ),
             end_before_space: NO_PARSED_OFFSET,
             end_after_space: NO_PARSED_OFFSET,
             tree_pdf_unique_id: None,
             containment_parents: Vec::new(),
-            description: None,
-            stream_token_filters: Rc::new(RefCell::new(Vec::new())),
-            content_normalization_applied: Rc::new(Cell::new(false)),
-            mutation_generation: Rc::new(Cell::new(0)),
         })));
         handle.register_state_owner();
         handle
@@ -2026,23 +2018,18 @@ impl ObjectHandle {
     ) -> Self {
         let handle = Self(Rc::new(RefCell::new(ObjectSlot {
             initialized: true,
-            state: Rc::new(RefCell::new(value)),
-            state_owners: Rc::new(RefCell::new(Vec::new())),
-            identity: Rc::new(RefCell::new(ValueIdentity {
-                object_ref: None,
-                qpdf_obj_gen: None,
-                active_pdf_unique_id: None,
-                resolver,
-            })),
-            parsed_offset,
+            shared: new_shared_value_state(
+                value,
+                ValueIdentity {
+                    resolver,
+                    ..ValueIdentity::default()
+                },
+                parsed_offset,
+            ),
             end_before_space: NO_PARSED_OFFSET,
             end_after_space: NO_PARSED_OFFSET,
             tree_pdf_unique_id: None,
             containment_parents: Vec::new(),
-            description: None,
-            stream_token_filters: Rc::new(RefCell::new(Vec::new())),
-            content_normalization_applied: Rc::new(Cell::new(false)),
-            mutation_generation: Rc::new(Cell::new(0)),
         })));
         handle.register_state_owner();
         handle.with_value(|value| {
@@ -2054,25 +2041,27 @@ impl ObjectHandle {
     }
 
     fn register_state_owner(&self) {
-        let owners = self.0.borrow().state_owners.clone();
+        let shared = self.0.borrow().shared.clone();
         let self_slot = self.0.clone();
-        let mut owners = owners.borrow_mut();
-        owners.retain(|owner| owner.strong_count() != 0);
-        if !owners.iter().any(|owner| {
+        let mut shared = shared.borrow_mut();
+        shared
+            .state_owners
+            .retain(|owner| owner.strong_count() != 0);
+        if !shared.state_owners.iter().any(|owner| {
             owner
                 .upgrade()
                 .is_some_and(|slot| Rc::ptr_eq(&slot, &self_slot))
         }) {
-            owners.push(Rc::downgrade(&self_slot));
+            shared.state_owners.push(Rc::downgrade(&self_slot));
         }
     }
 
     fn remove_state_owner(
-        owners: &Rc<RefCell<Vec<Weak<RefCell<ObjectSlot>>>>>,
+        shared: &Rc<RefCell<SharedValueState>>,
         slot_to_remove: &Rc<RefCell<ObjectSlot>>,
     ) {
-        let mut owners = owners.borrow_mut();
-        owners.retain(|owner| {
+        let mut shared = shared.borrow_mut();
+        shared.state_owners.retain(|owner| {
             owner
                 .upgrade()
                 .is_some_and(|slot| !Rc::ptr_eq(&slot, slot_to_remove))
@@ -2080,10 +2069,10 @@ impl ObjectHandle {
     }
 
     fn state_owner_handles(&self) -> Vec<Self> {
-        let owners = self.0.borrow().state_owners.clone();
-        let mut owners = owners.borrow_mut();
+        let shared = self.0.borrow().shared.clone();
+        let mut shared = shared.borrow_mut();
         let mut handles = Vec::new();
-        owners.retain(|owner| {
+        shared.state_owners.retain(|owner| {
             let Some(slot) = owner.upgrade() else {
                 return false;
             };
@@ -2114,28 +2103,19 @@ impl ObjectHandle {
     /// Replace the shared payload and keep every slot that owns it in sync
     /// with the payload's direct-child containment edges.
     fn replace_shared_state(&self, new_state: ObjectValue) -> ObjectValue {
-        let state = self.0.borrow().state.clone();
-        let old_state = {
-            let mut state = state.borrow_mut();
-            std::mem::replace(&mut *state, new_state)
+        let shared = self.0.borrow().shared.clone();
+        let (old_state, new_children) = {
+            let mut shared = shared.borrow_mut();
+            let old_state = std::mem::replace(&mut shared.value, new_state);
+            shared.stream_token_filters.clear();
+            shared.content_normalization_applied = false;
+            shared.mutation_generation = 0;
+            let new_children = Self::state_children(&shared.value);
+            (old_state, new_children)
         };
         let old_children = Self::state_children(&old_state);
-        let new_children = {
-            let state = state.borrow();
-            Self::state_children(&state)
-        };
-        let new_token_filters = Rc::new(RefCell::new(Vec::new()));
-        let new_content_normalization_applied = Rc::new(Cell::new(false));
-        let new_mutation_generation = Rc::new(Cell::new(0));
         for owner in self.state_owner_handles() {
             let parent = owner.containment_parent();
-            {
-                let mut owner_slot = owner.0.borrow_mut();
-                owner_slot.stream_token_filters = new_token_filters.clone();
-                owner_slot.content_normalization_applied =
-                    new_content_normalization_applied.clone();
-                owner_slot.mutation_generation = new_mutation_generation.clone();
-            }
             for child in &old_children {
                 Self::detach_child_from_parent(child, &parent);
             }
@@ -2164,22 +2144,17 @@ impl ObjectHandle {
             return;
         }
 
-        let (left_state_owners, left_children, right_state_owners, right_children) = {
+        let (left_shared, left_children, right_shared, right_children) = {
             let left = self.0.borrow();
             let right = other.0.borrow();
-            let left_state = left.state.clone();
-            let right_state = right.state.clone();
-            if Rc::ptr_eq(&left_state, &right_state) {
+            let left_shared = left.shared.clone();
+            let right_shared = right.shared.clone();
+            if Rc::ptr_eq(&left_shared, &right_shared) {
                 return;
             }
-            let left_children = Self::state_children(&left_state.borrow());
-            let right_children = Self::state_children(&right_state.borrow());
-            (
-                left.state_owners.clone(),
-                left_children,
-                right.state_owners.clone(),
-                right_children,
-            )
+            let left_children = Self::state_children(&left_shared.borrow().value);
+            let right_children = Self::state_children(&right_shared.borrow().value);
+            (left_shared, left_children, right_shared, right_children)
         };
 
         let left_object_gen = self.qpdf_obj_gen();
@@ -2191,8 +2166,8 @@ impl ObjectHandle {
         let right_object_ref = other.object_ref();
         let left_parent = self.containment_parent();
         let right_parent = other.containment_parent();
-        Self::remove_state_owner(&left_state_owners, &self.0);
-        Self::remove_state_owner(&right_state_owners, &other.0);
+        Self::remove_state_owner(&left_shared, &self.0);
+        Self::remove_state_owner(&right_shared, &other.0);
         for child in &left_children {
             Self::detach_child_from_parent(child, &left_parent);
         }
@@ -2203,31 +2178,23 @@ impl ObjectHandle {
         {
             let mut left = self.0.borrow_mut();
             let mut right = other.0.borrow_mut();
-            std::mem::swap(&mut left.state, &mut right.state);
-            std::mem::swap(&mut left.identity, &mut right.identity);
-            left.identity.borrow_mut().qpdf_obj_gen = left_object_gen;
-            left.identity.borrow_mut().object_ref = left_object_gen
+            std::mem::swap(&mut left.shared, &mut right.shared);
+        }
+        {
+            let shared = self.0.borrow().shared.clone();
+            let mut shared = shared.borrow_mut();
+            shared.identity.qpdf_obj_gen = left_object_gen;
+            shared.identity.object_ref = left_object_gen
                 .and_then(QpdfObjGen::to_object_ref)
                 .or(left_object_ref);
-            right.identity.borrow_mut().qpdf_obj_gen = right_object_gen;
-            right.identity.borrow_mut().object_ref = right_object_gen
+        }
+        {
+            let shared = other.0.borrow().shared.clone();
+            let mut shared = shared.borrow_mut();
+            shared.identity.qpdf_obj_gen = right_object_gen;
+            shared.identity.object_ref = right_object_gen
                 .and_then(QpdfObjGen::to_object_ref)
                 .or(right_object_ref);
-            std::mem::swap(&mut left.state_owners, &mut right.state_owners);
-            std::mem::swap(&mut left.parsed_offset, &mut right.parsed_offset);
-            std::mem::swap(&mut left.description, &mut right.description);
-            std::mem::swap(
-                &mut left.stream_token_filters,
-                &mut right.stream_token_filters,
-            );
-            std::mem::swap(
-                &mut left.content_normalization_applied,
-                &mut right.content_normalization_applied,
-            );
-            std::mem::swap(
-                &mut left.mutation_generation,
-                &mut right.mutation_generation,
-            );
         }
 
         self.register_state_owner();
@@ -2245,24 +2212,23 @@ impl ObjectHandle {
     /// transitions rebind the departing `QPDFObject`; they do not mutate the
     /// `QPDFValue` allocation that a replacement alias still observes.
     fn replace_detached_state(&self, new_state: ObjectValue) {
-        let old_state = self.0.borrow().state.clone();
-        let old_owners = self.0.borrow().state_owners.clone();
-        let old_children = {
-            let state = old_state.borrow();
-            Self::state_children(&state)
+        let old_shared = self.0.borrow().shared.clone();
+        let (old_children, identity, parsed_offset, description) = {
+            let shared = old_shared.borrow();
+            (
+                Self::state_children(&shared.value),
+                shared.identity.clone(),
+                shared.parsed_offset,
+                shared.description.clone(),
+            )
         };
-        let new_state = Rc::new(RefCell::new(new_state));
+        let new_shared = new_shared_value_state(new_state, identity, parsed_offset);
+        new_shared.borrow_mut().description = description;
 
-        Self::remove_state_owner(&old_owners, &self.0);
+        Self::remove_state_owner(&old_shared, &self.0);
         {
             let mut slot = self.0.borrow_mut();
-            slot.state = new_state;
-            let identity = slot.identity.borrow().clone();
-            slot.identity = Rc::new(RefCell::new(identity));
-            slot.state_owners = Rc::new(RefCell::new(Vec::new()));
-            slot.stream_token_filters = Rc::new(RefCell::new(Vec::new()));
-            slot.content_normalization_applied = Rc::new(Cell::new(false));
-            slot.mutation_generation = Rc::new(Cell::new(0));
+            slot.shared = new_shared;
         }
         self.register_state_owner();
 
@@ -2304,45 +2270,19 @@ impl ObjectHandle {
         if self.is_same_object_as(source) {
             return;
         }
-        let (
-            source_state,
-            source_owners,
-            source_token_filters,
-            source_content_normalization_applied,
-            source_mutation_generation,
-        ) = {
-            let source_slot = source.0.borrow();
-            (
-                source_slot.state.clone(),
-                source_slot.state_owners.clone(),
-                source_slot.stream_token_filters.clone(),
-                source_slot.content_normalization_applied.clone(),
-                source_slot.mutation_generation.clone(),
-            )
-        };
-        let old_state = {
-            let mut target = self.0.borrow_mut();
-            let old_state = target.state.clone();
-            let old_owners = target.state_owners.clone();
-            Self::remove_state_owner(&old_owners, &self.0);
-            target.state = source_state.clone();
-            target.identity = source.0.borrow().identity.clone();
-            target.state_owners = source_owners.clone();
-            target.stream_token_filters = source_token_filters;
-            target.content_normalization_applied = source_content_normalization_applied;
-            target.mutation_generation = source_mutation_generation;
-            old_state
-        };
-        Self::register_state_owner(self);
-
+        let source_shared = source.0.borrow().shared.clone();
+        let old_shared = self.0.borrow().shared.clone();
         let old_children = {
-            let state = old_state.borrow();
-            Self::state_children(&state)
+            let shared = old_shared.borrow();
+            Self::state_children(&shared.value)
         };
         let new_children = {
-            let state = source_state.borrow();
-            Self::state_children(&state)
+            let shared = source_shared.borrow();
+            Self::state_children(&shared.value)
         };
+        Self::remove_state_owner(&old_shared, &self.0);
+        self.0.borrow_mut().shared = source_shared;
+        self.register_state_owner();
         let parent = self.containment_parent();
         for child in &old_children {
             Self::detach_child_from_parent(child, &parent);
@@ -2359,14 +2299,18 @@ impl ObjectHandle {
             return;
         }
         self.replace_detached_state(ObjectValue::Null);
+        let shared = self.0.borrow().shared.clone();
+        {
+            let mut shared = shared.borrow_mut();
+            shared.identity.object_ref = None;
+            shared.identity.qpdf_obj_gen = None;
+            shared.identity.active_pdf_unique_id = None;
+            shared.identity.resolver = None;
+            shared.description = None;
+            shared.parsed_offset = NO_PARSED_OFFSET;
+        }
         let mut slot = self.0.borrow_mut();
-        slot.identity.borrow_mut().object_ref = None;
-        slot.identity.borrow_mut().qpdf_obj_gen = None;
-        slot.identity.borrow_mut().active_pdf_unique_id = None;
         slot.tree_pdf_unique_id = None;
-        slot.identity.borrow_mut().resolver = None;
-        slot.description = None;
-        slot.parsed_offset = NO_PARSED_OFFSET;
         slot.end_before_space = NO_PARSED_OFFSET;
         slot.end_after_space = NO_PARSED_OFFSET;
     }
@@ -2385,8 +2329,8 @@ impl ObjectHandle {
         pdf_unique_id: u64,
         resolver: Weak<dyn DocumentResolver>,
     ) -> Self {
-        let slot = self.0.borrow();
-        *slot.identity.borrow_mut() = ValueIdentity {
+        let shared = self.0.borrow().shared.clone();
+        shared.borrow_mut().identity = ValueIdentity {
             object_ref: Some(object_ref),
             qpdf_obj_gen: Some(QpdfObjGen::from_object_ref(object_ref)),
             active_pdf_unique_id: Some(pdf_unique_id),
@@ -2405,11 +2349,7 @@ impl ObjectHandle {
         pdf_unique_id: u64,
         resolver: Weak<dyn DocumentResolver>,
     ) -> Self {
-        let mut identity = {
-            let slot = self.0.borrow();
-            let identity = slot.identity.borrow().clone();
-            identity
-        };
+        let mut identity = { self.0.borrow().shared.borrow().identity.clone() };
         // `to_object_ref` applies qpdf's `N G R` parser gate, so it is not the
         // inverse of `from_object_ref`: an identity that entered through the
         // Rust `ObjectRef` factory (which admits generation 65535 and object
@@ -2419,7 +2359,7 @@ impl ObjectHandle {
         identity.qpdf_obj_gen = Some(object_gen);
         identity.active_pdf_unique_id = Some(pdf_unique_id);
         identity.resolver = Some(resolver);
-        *self.0.borrow().identity.borrow_mut() = identity;
+        self.0.borrow().shared.borrow_mut().identity = identity;
         self.clone()
     }
 
@@ -2457,7 +2397,13 @@ impl ObjectHandle {
             .and_then(|resolver| resolver.pdf_unique_id());
         let handle = Self::from_value_with_resolver(value, resolver);
         if !handle.is_null() {
-            handle.0.borrow().identity.borrow_mut().active_pdf_unique_id = pdf_unique_id;
+            handle
+                .0
+                .borrow()
+                .shared
+                .borrow_mut()
+                .identity
+                .active_pdf_unique_id = pdf_unique_id;
         }
         handle
     }
@@ -2485,8 +2431,8 @@ impl ObjectHandle {
         let parent = Rc::downgrade(&self.0);
         let children = {
             let slot = self.0.borrow();
-            let state = slot.state.borrow();
-            match &*state {
+            let shared = slot.shared.borrow();
+            match &shared.value {
                 value @ (ObjectValue::Unresolved
                 | ObjectValue::Reserved
                 | ObjectValue::Destroyed) => {
@@ -2502,8 +2448,8 @@ impl ObjectHandle {
         let slot = Rc::try_unwrap(std::mem::replace(&mut self.0, empty_object_slot()))
             .ok()?
             .into_inner();
-        let state = Rc::try_unwrap(slot.state).ok()?.into_inner();
-        Some((state, slot.parsed_offset))
+        let shared = Rc::try_unwrap(slot.shared).ok()?.into_inner();
+        Some((shared.value, shared.parsed_offset))
     }
 
     /// Legacy direct-value extraction for `object_copy`'s remaining facade
@@ -2516,8 +2462,8 @@ impl ObjectHandle {
         if slot.is_indirect() {
             return Ok(None);
         }
-        let state = slot.state.borrow();
-        Ok(Some(match &*state {
+        let shared = slot.shared.borrow();
+        Ok(Some(match &shared.value {
             ObjectValue::Reserved => return Err(reserved_clone_error()),
             ObjectValue::Unresolved | ObjectValue::Destroyed => return Ok(None),
             ObjectValue::Stream {
@@ -2550,11 +2496,14 @@ impl ObjectHandle {
             let is_null = matches!(value, ObjectValue::Null);
             self.replace_shared_state(value);
             if is_null {
+                let shared = self.0.borrow().shared.clone();
+                let mut shared = shared.borrow_mut();
+                shared.parsed_offset = NO_PARSED_OFFSET;
+                shared.description = None;
+                drop(shared);
                 let mut slot = self.0.borrow_mut();
-                slot.parsed_offset = NO_PARSED_OFFSET;
                 slot.end_before_space = NO_PARSED_OFFSET;
                 slot.end_after_space = NO_PARSED_OFFSET;
-                slot.description = None;
             }
         }
     }
@@ -2615,11 +2564,11 @@ impl ObjectHandle {
             }
             let (is_indirect, active_pdf_unique_id, children) = {
                 let slot = handle.0.borrow();
-                let state = slot.state.borrow();
+                let shared = slot.shared.borrow();
                 (
                     slot.is_indirect(),
                     slot.active_pdf_unique_id(),
-                    Self::state_children(&state),
+                    Self::state_children(&shared.value),
                 )
             };
             if is_indirect {
@@ -2703,38 +2652,29 @@ impl ObjectHandle {
         // reached, not just the active path, so a direct DAG — an array holding
         // the same child twice is enough — is walked once per node rather than
         // once per path.
-        // Key on the raw allocation address rather than on a handle: the slot
-        // contains interior mutability, which clippy's `mutable_key_type`
-        // rightly rejects as a set key. Identity here is `Rc` identity, exactly
-        // what `is_same_object_as` compares, so the pointer is the whole key.
-        let mut visited: BTreeSet<*const RefCell<ObjectSlot>> = BTreeSet::new();
+        // Key on the raw allocation address of `SharedValueState`, rather than
+        // on a handle or its outer `ObjectSlot`: the shared state contains
+        // interior mutability, which clippy's `mutable_key_type` rightly
+        // rejects as a set key. `ObjectHandle::is_same_object_as` compares
+        // outer `ObjectSlot` identity; this visited key instead identifies a
+        // shared value allocation so each shared value is processed once,
+        // even when multiple slots or handles refer to it.
+        let mut visited: BTreeSet<*const RefCell<SharedValueState>> = BTreeSet::new();
         let mut pending = vec![self.clone()];
         while let Some(handle) = pending.pop() {
-            if !visited.insert(Rc::as_ptr(&handle.0)) {
+            let shared = handle.0.borrow().shared.clone();
+            if !visited.insert(Rc::as_ptr(&shared)) {
                 continue;
             }
             {
-                let slot = handle.0.borrow();
-                let state = slot.state.borrow();
-                match &*state {
-                    ObjectValue::Array(items) => {
-                        pending.extend(items.iter().filter(|item| !item.is_indirect()).cloned());
-                    }
-                    ObjectValue::Dictionary(entries) => {
-                        pending.extend(
-                            entries
-                                .values()
-                                .filter(|value| !value.is_indirect())
-                                .cloned(),
-                        );
-                    }
-                    ObjectValue::Stream { stream_dict, .. } if !stream_dict.is_indirect() => {
-                        pending.push(stream_dict.clone());
-                    }
-                    _ => {}
-                }
+                let shared = shared.borrow();
+                pending.extend(
+                    Self::state_children(&shared.value)
+                        .into_iter()
+                        .filter(|child| !child.is_indirect()),
+                );
             }
-            *handle.0.borrow().identity.borrow_mut() = ValueIdentity::default();
+            shared.borrow_mut().identity = ValueIdentity::default();
             handle.0.borrow_mut().tree_pdf_unique_id = None;
         }
     }
@@ -2752,15 +2692,19 @@ impl ObjectHandle {
     pub(crate) fn disconnect_and_destroy(&self) {
         self.disconnect();
         let should_destroy = {
-            let slot = self.0.borrow();
-            let state = slot.state.borrow();
-            !matches!(&*state, ObjectValue::Null)
+            let shared = self.0.borrow().shared.clone();
+            let should_destroy = !matches!(shared.borrow().value, ObjectValue::Null);
+            should_destroy
         };
         if should_destroy {
             self.replace_detached_state(ObjectValue::Destroyed);
+            let shared = self.0.borrow().shared.clone();
+            {
+                let mut shared = shared.borrow_mut();
+                shared.description = None;
+                shared.parsed_offset = NO_PARSED_OFFSET;
+            }
             let mut slot = self.0.borrow_mut();
-            slot.description = None;
-            slot.parsed_offset = NO_PARSED_OFFSET;
             slot.end_before_space = NO_PARSED_OFFSET;
             slot.end_after_space = NO_PARSED_OFFSET;
         }
@@ -2780,9 +2724,7 @@ impl ObjectHandle {
     /// that turned out to be missing from the source, or on a value severed
     /// because its owning document was dropped.
     pub fn is_resolved(&self) -> bool {
-        let state = self.0.borrow().state.clone();
-        let resolved = !matches!(&*state.borrow(), ObjectValue::Unresolved);
-        resolved
+        self.with_value(|value| !matches!(value, Some(ObjectValue::Unresolved)))
     }
 
     /// Resolve this handle's own canonical slot in place, mirroring
@@ -2792,20 +2734,23 @@ impl ObjectHandle {
     /// whose document has been dropped returns an error and stays unresolved.
     pub(crate) fn try_dereference(&self) -> Result<()> {
         let (object_gen, resolver) = {
-            let slot = self.0.borrow();
-            if !slot.initialized {
+            let (initialized, shared) = {
+                let slot = self.0.borrow();
+                (slot.initialized, slot.shared.clone())
+            };
+            if !initialized {
                 return Err(Error::Internal(
                     "attempted to dereference an uninitialized QPDFObjectHandle".to_owned(),
                 ));
             }
-            let Some(object_gen) = slot.qpdf_obj_gen() else {
+            let shared = shared.borrow();
+            let Some(object_gen) = shared.qpdf_obj_gen() else {
                 return Ok(());
             };
-            let state = slot.state.borrow();
-            if !matches!(&*state, ObjectValue::Unresolved) {
+            if !matches!(&shared.value, ObjectValue::Unresolved) {
                 return Ok(());
             }
-            (object_gen, slot.resolver())
+            (object_gen, shared.identity.resolver.clone())
         };
 
         let Some(resolver) = resolver.and_then(|resolver| resolver.upgrade()) else {
@@ -2834,23 +2779,18 @@ impl ObjectHandle {
         // child-description chain rather than checking only its immediate
         // parent. Keep a slot-identity guard because malformed programmatic
         // direct values can construct reciprocal description links.
-        let mut current = self.clone();
+        let mut current = self.0.borrow().shared.clone();
         let mut seen = BTreeSet::new();
         loop {
-            let current_id = Rc::as_ptr(&current.0) as usize;
+            let current_id = Rc::as_ptr(&current) as usize;
             if !seen.insert(current_id) {
                 break;
             }
 
             let (resolver, parent) = {
-                let slot = current.0.borrow();
-                let resolver = slot
-                    .identity
-                    .borrow()
-                    .resolver
-                    .as_ref()
-                    .and_then(Weak::upgrade);
-                let parent = match &slot.description {
+                let shared = current.borrow();
+                let resolver = shared.identity.resolver.as_ref().and_then(Weak::upgrade);
+                let parent = match &shared.description {
                     Some(ObjectDescription::Child(child)) => child.parent.upgrade(),
                     _ => None,
                 };
@@ -2862,7 +2802,7 @@ impl ObjectHandle {
             let Some(parent) = parent else {
                 break;
             };
-            current = ObjectHandle(parent);
+            current = parent;
         }
 
         // Containment links are ownership/traversal metadata, not qpdf object
@@ -2880,8 +2820,9 @@ impl ObjectHandle {
         object: impl AsRef<[u8]>,
         offset: i64,
     ) {
-        let mut slot = self.0.borrow_mut();
-        slot.description = Some(ObjectDescription::Json(JsonDescription {
+        let shared = self.0.borrow().shared.clone();
+        let mut shared = shared.borrow_mut();
+        shared.description = Some(ObjectDescription::Json(JsonDescription {
             input: input.as_ref().to_vec(),
             object: object.as_ref().to_vec(),
         }));
@@ -2890,8 +2831,8 @@ impl ObjectHandle {
         // `setParsedOffset`, `libqpdf/qpdf/QPDFValue.hh:60-65,90-100`), so a
         // value that already carries an operational offset (e.g. a stream's
         // encoded-data start) keeps it.
-        if slot.parsed_offset < 0 {
-            slot.parsed_offset = offset;
+        if shared.parsed_offset < 0 {
+            shared.parsed_offset = offset;
         }
     }
 
@@ -2924,10 +2865,12 @@ impl ObjectHandle {
     /// `$PO`/`$OG` would otherwise become parser-owned placeholders again on
     /// the next render.
     pub(crate) fn description_template(&self) -> Option<Vec<u8>> {
-        match self.0.borrow().description.as_ref() {
+        let shared = self.0.borrow().shared.clone();
+        let description = match shared.borrow().description.as_ref() {
             Some(ObjectDescription::Template(template)) => Some(template.clone()),
             Some(ObjectDescription::Json(_) | ObjectDescription::Child(_)) | None => None,
-        }
+        };
+        description
     }
 
     /// Attach a qpdf document and explicit description to this shared object
@@ -2953,16 +2896,18 @@ impl ObjectHandle {
         description: impl AsRef<[u8]>,
     ) -> Result<()> {
         let resolver = pdf.resolver.document_resolver_weak()?;
-        let mut slot = self.0.borrow_mut();
-        slot.identity.borrow_mut().resolver = Some(resolver);
-        slot.identity.borrow_mut().active_pdf_unique_id = Some(pdf.unique_id);
-        slot.description = Some(ObjectDescription::Template(description.as_ref().to_vec()));
+        let shared = self.0.borrow().shared.clone();
+        let mut shared = shared.borrow_mut();
+        shared.identity.resolver = Some(resolver);
+        shared.identity.active_pdf_unique_id = Some(pdf.unique_id);
+        shared.description = Some(ObjectDescription::Template(description.as_ref().to_vec()));
         Ok(())
     }
 
     pub(crate) fn set_description(&self, description: impl AsRef<[u8]>, offset: i64) {
-        let mut slot = self.0.borrow_mut();
-        slot.description = Some(ObjectDescription::Template(description.as_ref().to_vec()));
+        let shared = self.0.borrow().shared.clone();
+        let mut shared = shared.borrow_mut();
+        shared.description = Some(ObjectDescription::Template(description.as_ref().to_vec()));
         // Set-once, matching qpdf's `setParsedOffset` guard that
         // `QPDFValue::setDescription` calls through
         // (`libqpdf/qpdf/QPDFValue.hh:60-65,90-100`). `QPDF_Stream::setDescription`
@@ -2970,8 +2915,8 @@ impl ObjectHandle {
         // stream's already-recorded encoded-data start survives a later
         // description assignment rather than being overwritten by the
         // description's own offset.
-        if slot.parsed_offset < 0 {
-            slot.parsed_offset = offset;
+        if shared.parsed_offset < 0 {
+            shared.parsed_offset = offset;
         }
     }
 
@@ -2980,7 +2925,8 @@ impl ObjectHandle {
     /// source location that produced the old description, so the indirect
     /// object fallback (`object N G`) must be used instead.
     pub(crate) fn clear_description(&self) {
-        self.0.borrow_mut().description = None;
+        let shared = self.0.borrow().shared.clone();
+        shared.borrow_mut().description = None;
     }
 
     pub(crate) fn set_child_description(
@@ -2989,9 +2935,26 @@ impl ObjectHandle {
         static_descr: impl AsRef<[u8]>,
         var_descr: impl AsRef<[u8]>,
     ) {
-        let mut slot = self.0.borrow_mut();
-        slot.description = Some(ObjectDescription::Child(ChildDescription {
-            parent: Rc::downgrade(&parent.0),
+        // qpdf's `setChildDescription` stores a weak parent value and copies
+        // the parent's owning QPDF onto the child at the same time
+        // (`libqpdf/qpdf/QPDFValue.hh:74-83`). The parent value may be
+        // replaced immediately after this call, so retain the effective
+        // resolver on the child rather than relying on the weak description
+        // chain to keep reaching the old shared state. `context` completes
+        // its traversal before this child borrow begins.
+        let parent_context = parent.context();
+        let active_pdf_unique_id = parent_context
+            .as_ref()
+            .and_then(|context| context.pdf_unique_id())
+            .or_else(|| parent.owning_pdf_unique_id());
+        let resolver = parent_context.as_ref().map(Rc::downgrade);
+        let parent_shared = parent.0.borrow().shared.clone();
+        let shared = self.0.borrow().shared.clone();
+        let mut shared = shared.borrow_mut();
+        shared.identity.resolver = resolver;
+        shared.identity.active_pdf_unique_id = active_pdf_unique_id;
+        shared.description = Some(ObjectDescription::Child(ChildDescription {
+            parent: Rc::downgrade(&parent_shared),
             static_descr: static_descr.as_ref().to_vec(),
             var_descr: var_descr.as_ref().to_vec(),
         }));
@@ -3930,7 +3893,9 @@ impl ObjectHandle {
     /// accessor only where the handle is already known to be resolved (a
     /// direct value, or an indirect one already dereferenced by the caller).
     pub fn get_parsed_offset(&self) -> i64 {
-        self.0.borrow().parsed_offset
+        let shared = self.0.borrow().shared.clone();
+        let parsed_offset = shared.borrow().parsed_offset;
+        parsed_offset
     }
 
     /// The qpdf-compatible signed parsed offset, resolving a lazy indirect
@@ -3961,9 +3926,10 @@ impl ObjectHandle {
     // this remains exposed so this module's own tests can exercise the
     // set-once contract independently.
     pub(crate) fn set_parsed_offset_if_unset(&self, offset: i64) {
-        let mut slot = self.0.borrow_mut();
-        if slot.parsed_offset < 0 {
-            slot.parsed_offset = offset;
+        let shared = self.0.borrow().shared.clone();
+        let mut shared = shared.borrow_mut();
+        if shared.parsed_offset < 0 {
+            shared.parsed_offset = offset;
         }
     }
 
@@ -4140,9 +4106,7 @@ impl ObjectHandle {
     /// qpdf resolved to its null fallback. A handle disconnected when its
     /// owning document is dropped is `Destroyed`, not null.
     pub fn is_null(&self) -> bool {
-        let state = self.0.borrow().state.clone();
-        let is_null = matches!(&*state.borrow(), ObjectValue::Null);
-        is_null
+        self.with_value(|value| matches!(value, Some(ObjectValue::Null)))
     }
 
     /// The value as `i64` if this handle's value — its own if direct, or its
@@ -4762,12 +4726,8 @@ impl ObjectHandle {
     /// value carries its source document identity just as qpdf's parsed value
     /// does.
     fn check_array_item_ownership(&self, item: &ObjectHandle) -> Result<()> {
-        let item_is_destroyed = {
-            let slot = item.0.borrow();
-            let state = slot.state.borrow();
-            let destroyed = matches!(&*state, ObjectValue::Destroyed);
-            destroyed
-        };
+        let item_is_destroyed =
+            item.with_value(|value| matches!(value, Some(ObjectValue::Destroyed)));
         // qpdf's QPDF_Array::checkOwnership rejects an item whose
         // getObjectPtr() is null -- the default-constructed
         // QPDFObjectHandle() shape, distinct from an initialized handle
@@ -4868,9 +4828,9 @@ impl ObjectHandle {
         if !other.is_direct() {
             return false;
         }
-        let self_state = self.0.borrow().state.clone();
-        let other_state = other.0.borrow().state.clone();
-        Rc::ptr_eq(&self_state, &other_state)
+        let self_shared = self.0.borrow().shared.clone();
+        let other_shared = other.0.borrow().shared.clone();
+        Rc::ptr_eq(&self_shared, &other_shared)
     }
 
     fn direct_cycle_error() -> Error {
@@ -4888,21 +4848,21 @@ impl ObjectHandle {
             return false;
         }
 
-        let target_state = self.0.borrow().state.clone();
-        let target_id = Rc::as_ptr(&target_state) as usize;
+        let target_shared = self.0.borrow().shared.clone();
+        let target_id = Rc::as_ptr(&target_shared) as usize;
         let mut pending = vec![candidate.clone()];
         let mut visited = BTreeSet::new();
 
         while let Some(handle) = pending.pop() {
-            let state = handle.0.borrow().state.clone();
-            let identity = Rc::as_ptr(&state) as usize;
+            let shared = handle.0.borrow().shared.clone();
+            let identity = Rc::as_ptr(&shared) as usize;
             if identity == target_id {
                 return true;
             }
             if !visited.insert(identity) {
                 continue;
             }
-            let children = Self::direct_children(&state.borrow());
+            let children = Self::direct_children(&shared.borrow().value);
             pending.extend(children.into_iter().filter(|child| child.is_direct()));
         }
 
@@ -4934,12 +4894,12 @@ impl ObjectHandle {
         let parent = Rc::downgrade(slot);
         let children = {
             let slot_ref = slot.borrow();
-            if Rc::strong_count(&slot_ref.state) != 1 {
+            if Rc::strong_count(&slot_ref.shared) != 1 {
                 return Vec::new();
             }
 
-            let mut state = slot_ref.state.borrow_mut();
-            match &mut *state {
+            let mut shared = slot_ref.shared.borrow_mut();
+            match &mut shared.value {
                 ObjectValue::Array(children) => std::mem::take(children),
                 ObjectValue::Dictionary(entries) => std::mem::take(entries).into_values().collect(),
                 ObjectValue::Stream { stream_dict, .. } => {
@@ -6296,8 +6256,8 @@ impl ObjectHandle {
         if !self.with_value(|value| matches!(value, Some(ObjectValue::Stream { .. }))) {
             return false;
         }
-        let filters = self.0.borrow().stream_token_filters.clone();
-        let modified = !filters.borrow().is_empty();
+        let shared = self.0.borrow().shared.clone();
+        let modified = !shared.borrow().stream_token_filters.is_empty();
         modified
     }
 
@@ -6306,7 +6266,9 @@ impl ObjectHandle {
     /// from `replaceStreamData`: qpdf's replacement API is also used for
     /// arbitrary caller data that still needs QDF normalization.
     pub(crate) fn content_normalization_applied(&self) -> bool {
-        self.0.borrow().content_normalization_applied.get()
+        let shared = self.0.borrow().shared.clone();
+        let applied = shared.borrow().content_normalization_applied;
+        applied
     }
 
     /// Mark the current stream bytes as normalized by the content consumer.
@@ -6318,11 +6280,8 @@ impl ObjectHandle {
     }
 
     fn set_content_normalization_applied(&self, applied: bool) {
-        let marker = self.0.borrow().content_normalization_applied.clone();
-        marker.set(applied);
-        for owner in self.state_owner_handles() {
-            owner.0.borrow_mut().content_normalization_applied = marker.clone();
-        }
+        let shared = self.0.borrow().shared.clone();
+        shared.borrow_mut().content_normalization_applied = applied;
         self.bump_mutation_generation();
     }
 
@@ -6338,16 +6297,8 @@ impl ObjectHandle {
                 type_name
             )));
         }
-        let filters = self.0.borrow().stream_token_filters.clone();
-        // A canonical object can have distinct handle slots that share one
-        // payload state (for example a dictionary child and the document's
-        // object-cache handle). qpdf's token-filter list belongs to that one
-        // stream allocation, so make every state owner observe the same list
-        // before registering the callback.
-        for owner in self.state_owner_handles() {
-            owner.0.borrow_mut().stream_token_filters = filters.clone();
-        }
-        filters.borrow_mut().push(filter);
+        let shared = self.0.borrow().shared.clone();
+        shared.borrow_mut().stream_token_filters.push(filter);
         self.bump_mutation_generation();
         Ok(())
     }
@@ -6697,8 +6648,8 @@ impl ObjectHandle {
     ) -> Result<bool> {
         self.try_dereference()?;
         let token_filters = {
-            let filters = self.0.borrow().stream_token_filters.clone();
-            let token_filters = filters.borrow().clone();
+            let shared = self.0.borrow().shared.clone();
+            let token_filters = shared.borrow().stream_token_filters.clone();
             token_filters
         };
         let Some((stream_dict, stream_data, stream_provider, stream_length)) =
@@ -7308,31 +7259,31 @@ impl ObjectHandle {
     // handle is resolved, including to qpdf's internal Unresolved/Reserved/
     // Destroyed value, this helper exposes the actual ObjectValue.
     pub(crate) fn with_value<T>(&self, f: impl FnOnce(Option<&ObjectValue>) -> T) -> T {
-        let state = self.0.borrow().state.clone();
-        let state = state.borrow();
-        f(Some(&state))
+        let shared = self.0.borrow().shared.clone();
+        let shared = shared.borrow();
+        f(Some(&shared.value))
     }
 
     // Mutable twin of `with_value`: every resolved qpdf value, including the
     // internal sentinels, is a real mutable value-layer slot.
     fn with_value_mut<T>(&self, f: impl FnOnce(Option<&mut ObjectValue>) -> T) -> T {
-        let state = self.0.borrow().state.clone();
-        let result = {
-            let mut state = state.borrow_mut();
-            f(Some(&mut state))
-        };
-        self.bump_mutation_generation();
+        let shared = self.0.borrow().shared.clone();
+        let mut shared = shared.borrow_mut();
+        let result = f(Some(&mut shared.value));
+        shared.mutation_generation = shared.mutation_generation.wrapping_add(1);
         result
     }
 
     fn bump_mutation_generation(&self) {
-        let generation = self.0.borrow().mutation_generation.clone();
-        generation.set(generation.get().wrapping_add(1));
+        let shared = self.0.borrow().shared.clone();
+        let mut shared = shared.borrow_mut();
+        shared.mutation_generation = shared.mutation_generation.wrapping_add(1);
     }
 
     pub(crate) fn mutation_fingerprint(&self) -> (usize, u64) {
-        let generation = self.0.borrow().mutation_generation.clone();
-        (Rc::as_ptr(&generation) as usize, generation.get())
+        let shared = self.0.borrow().shared.clone();
+        let generation = shared.borrow().mutation_generation;
+        (Rc::as_ptr(&shared) as usize, generation)
     }
 
     /// This handle's qpdf-syntax unparse form
@@ -7415,7 +7366,6 @@ impl ObjectHandle {
     #[cfg(test)]
     pub(crate) fn replace_direct_value(&self, value: ObjectValue) {
         if self.is_direct() {
-            self.0.borrow().stream_token_filters.borrow_mut().clear();
             self.replace_shared_state(canonicalize_object_value(value));
         }
     }
@@ -7428,7 +7378,8 @@ impl ObjectHandle {
     /// value with a caller-supplied one, any previously recorded source
     /// position no longer describes that value.
     pub(crate) fn reset_parsed_offset(&self) {
-        self.0.borrow_mut().parsed_offset = NO_PARSED_OFFSET;
+        let shared = self.0.borrow().shared.clone();
+        shared.borrow_mut().parsed_offset = NO_PARSED_OFFSET;
     }
 }
 
@@ -9313,6 +9264,45 @@ pub(crate) mod identity_tests {
     }
 
     #[test]
+    fn assigning_value_state_shares_mutations_without_merging_slot_identity() {
+        let source = ObjectHandle::dictionary(vec![(b"Value".to_vec(), ObjectHandle::integer(7))]);
+        let target = ObjectHandle::dictionary(vec![]);
+
+        target.assign_value_state(&source);
+
+        assert!(!target.is_same_object_as(&source));
+        source
+            .replace_key(b"/Value", ObjectHandle::integer(8))
+            .expect("dictionary replacement");
+        assert_eq!(target.try_get_key(b"/Value").unwrap().as_integer(), Some(8));
+    }
+
+    #[test]
+    fn swapping_value_state_moves_values_without_moving_object_references() {
+        let left_ref = ObjectRef::new(40, 0);
+        let right_ref = ObjectRef::new(41, 0);
+        let left = ObjectHandle::new_indirect_unresolved(left_ref, NO_PARSED_OFFSET);
+        let right = ObjectHandle::new_indirect_unresolved(right_ref, NO_PARSED_OFFSET);
+        left.set_resolved(ObjectValue::Dictionary(
+            [(b"Value".to_vec(), ObjectHandle::integer(7))]
+                .into_iter()
+                .collect(),
+        ));
+        right.set_resolved(ObjectValue::Dictionary(
+            [(b"Value".to_vec(), ObjectHandle::integer(8))]
+                .into_iter()
+                .collect(),
+        ));
+
+        left.swap_value_state_with(&right);
+
+        assert_eq!(left.object_ref(), Some(left_ref));
+        assert_eq!(right.object_ref(), Some(right_ref));
+        assert_eq!(left.try_get_key(b"/Value").unwrap().as_integer(), Some(8));
+        assert_eq!(right.try_get_key(b"/Value").unwrap().as_integer(), Some(7));
+    }
+
+    #[test]
     fn removing_a_direct_handle_is_a_no_op() {
         let direct = ObjectHandle::integer(1);
         direct.remove_from_document();
@@ -9343,15 +9333,7 @@ pub(crate) mod identity_tests {
             Rc::downgrade(&foreign_resolver),
         );
         assert_eq!(promoted_foreign.object_ref(), Some(ObjectRef::new(34, 0)));
-        assert_eq!(
-            promoted_foreign
-                .0
-                .borrow()
-                .identity
-                .borrow()
-                .active_pdf_unique_id,
-            Some(4243)
-        );
+        assert_eq!(promoted_foreign.owning_pdf_unique_id(), Some(4243));
         assert!(!promoted_foreign.belongs_exclusively_to_pdf(4242));
     }
 
@@ -9386,13 +9368,15 @@ pub(crate) mod identity_tests {
         let target = ObjectHandle::new_indirect_unresolved(ObjectRef::new(37, 0), -1);
         let replacement =
             ObjectHandle::dictionary(vec![(b"Value".to_vec(), ObjectHandle::integer(7))]);
-        *replacement.0.borrow().identity.borrow_mut() = target.0.borrow().identity.borrow().clone();
+        replacement.0.borrow().shared.borrow_mut().identity =
+            target.0.borrow().shared.borrow().identity.clone();
         target.assign_value_state(&replacement);
 
         target.remove_from_document();
 
         assert!(target.is_direct());
-        assert!(target.is_null());
+        assert!(target.try_is_null().unwrap());
+        assert_eq!(target.object_ref(), None);
         assert_eq!(
             replacement.try_get_key(b"/Value").unwrap().as_integer(),
             Some(7)
@@ -9411,12 +9395,14 @@ pub(crate) mod identity_tests {
         let target = ObjectHandle::new_indirect_unresolved(ObjectRef::new(38, 0), -1);
         let replacement =
             ObjectHandle::dictionary(vec![(b"Value".to_vec(), ObjectHandle::integer(7))]);
-        *replacement.0.borrow().identity.borrow_mut() = target.0.borrow().identity.borrow().clone();
+        replacement.0.borrow().shared.borrow_mut().identity =
+            target.0.borrow().shared.borrow().identity.clone();
         target.assign_value_state(&replacement);
 
         target.disconnect_and_destroy();
 
         assert_eq!(target.type_code().expect("type code"), 14);
+        assert!(!replacement.try_is_null().unwrap());
         assert_eq!(
             replacement.try_get_key(b"/Value").unwrap().as_integer(),
             Some(7)
@@ -11241,10 +11227,15 @@ mod resolution_state_tests {
         let source = include_str!("object_handle.rs");
         let state_name = ["Object", "State"].concat();
         let resolved_name = [state_name.as_str(), "::Resolved"].concat();
-        let state_field = ["state: Rc<RefCell<", "ObjectValue>>"].concat();
+        let legacy_state_field = ["state: Rc<RefCell<", "ObjectValue>>"].concat();
+        let shared_field = ["shared: Rc<RefCell<", "SharedValueState>>"].concat();
+        let value_field = ["value: Object", "Value"].concat();
         assert!(!source.contains(&format!("enum {state_name}")));
         assert!(!source.contains(&resolved_name));
-        assert!(source.contains(&state_field));
+        assert!(!source.contains(&legacy_state_field));
+        assert!(source.contains("struct SharedValueState"));
+        assert!(source.contains(&shared_field));
+        assert!(source.contains(&value_field));
     }
 
     #[test]
@@ -11314,9 +11305,10 @@ mod resolution_state_tests {
 
         assert!(null.is_resolved());
         assert!(null.is_null());
-        let state = null.0.borrow().state.clone();
+        let shared = null.0.borrow().shared.clone();
+        let state = shared.borrow();
         assert!(
-            matches!(&*state.borrow(), ObjectValue::Null),
+            matches!(&state.value, ObjectValue::Null),
             "`set_resolved(Null)` must leave the slot in the value layer"
         );
     }
@@ -11488,6 +11480,9 @@ mod resolution_state_tests {
     fn debug_format_summarizes_every_indirect_resolution_state() {
         let unresolved = ObjectHandle::new_indirect_unresolved(ObjectRef::new(1, 0), 0);
         assert!(format!("{unresolved:?}").contains("Unresolved"));
+
+        let reserved = ObjectHandle::new_reserved_direct();
+        assert!(format!("{reserved:?}").contains("Reserved"));
 
         let null = ObjectHandle::new_indirect_unresolved(ObjectRef::new(2, 0), 0);
         null.set_resolved(ObjectValue::Null);
@@ -16349,10 +16344,10 @@ mod mutation_tests {
 
         assert!(owner.is_indirect());
         let slot = owner.0.borrow();
-        let state = slot.state.clone();
+        let shared = slot.shared.clone();
         drop(slot);
-        let state = state.borrow();
-        let ObjectValue::Dictionary(entries) = &*state else {
+        let shared = shared.borrow();
+        let ObjectValue::Dictionary(entries) = &shared.value else {
             panic!("test owner must resolve to the supplied dictionary"); // cov:ignore: successful set_resolved fixes this state
         };
         let resolved_key_allocation = entries
@@ -19167,8 +19162,8 @@ pub(crate) mod warning_emission_tests {
         // cursor must keep the snapshotted key non-end and use qpdf's
         // contextual warning/null lookup rather than a stale value.
         let replacement = ObjectHandle::integer(2);
-        *replacement.0.borrow().identity.borrow_mut() =
-            dictionary.0.borrow().identity.borrow().clone();
+        replacement.0.borrow().shared.borrow_mut().identity =
+            dictionary.0.borrow().shared.borrow().identity.clone();
         dictionary.assign_value_state(&replacement);
 
         let entry = cursor.current();
@@ -19882,6 +19877,23 @@ pub(crate) mod warning_emission_tests {
                 "object 3 0 -> dictionary key /Pages: operation for dictionary attempted on object of type null: returning null for attempted key retrieval",
                 "object 3 0 -> dictionary key /Pages -> null returned from getting key  from non-Dictionary: operation for integer attempted on object of type null: returning 0",
             ]
+        );
+    }
+
+    #[test]
+    fn missing_key_warning_context_survives_parent_shared_value_replacement() {
+        let (parent, recorder) =
+            handle_resolving(ObjectValue::Dictionary(std::collections::BTreeMap::new()));
+        let missing = parent.try_get_key(b"/Missing").unwrap();
+
+        let replacement = ObjectHandle::dictionary(Vec::new());
+        parent.assign_value_state(&replacement);
+        drop(replacement);
+
+        assert_eq!(missing.try_get_int_value().unwrap(), 0);
+        assert_eq!(
+            warnings(&recorder),
+            [" -> dictionary key /Missing: operation for integer attempted on object of type null: returning 0"]
         );
     }
 
