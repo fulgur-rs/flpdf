@@ -7264,12 +7264,6 @@ impl ObjectHandle {
         shared.mutation_generation = shared.mutation_generation.wrapping_add(1);
     }
 
-    pub(crate) fn mutation_fingerprint(&self) -> (usize, u64) {
-        let shared = self.0.borrow().shared.clone();
-        let generation = shared.borrow().mutation_generation;
-        (Rc::as_ptr(&shared) as usize, generation)
-    }
-
     /// This handle's qpdf-syntax unparse form
     /// (`include/qpdf/QPDFObjectHandle.hh:1159`,
     /// `libqpdf/QPDFObjectHandle.cc:1574-1584`): an indirect handle always

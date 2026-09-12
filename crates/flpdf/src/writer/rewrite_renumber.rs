@@ -28,15 +28,22 @@
 //! - Objects unreachable from the seed never receive a number (qpdf drops them
 //!   by default).
 
-use std::collections::{BTreeSet, HashMap, VecDeque};
+#[cfg(test)]
+use std::collections::HashMap;
+use std::collections::{BTreeSet, VecDeque};
 use std::io::{Read, Seek};
 
 use crate::object_ref::ObjectRef;
 use crate::parser::MAX_PARSE_DEPTH;
+#[cfg(test)]
 use crate::qpdf_obj_gen::QpdfObjGen;
-use crate::writer::object_streams::{sort_members_qpdf_order, ObjectStreamGroup};
+#[cfg(test)]
+use crate::writer::object_streams::sort_source_backed_members_qpdf_order;
+#[cfg(test)]
+use crate::writer::object_streams::ObjectStreamGroup;
 use crate::Error;
 use crate::Pdf;
+#[cfg(test)]
 use crate::XrefEntry;
 
 type LinearizedStreamParameterOmission<'a> =
@@ -48,17 +55,20 @@ type LinearizedStreamParameterOmission<'a> =
 /// rewrite, [`ObjectStreamRenumber`] for object-stream output) so that
 /// `renumber_qpdf_refs_in_place` can rewrite an object's internal references
 /// under either numbering without duplication.
+#[cfg(test)]
 pub(crate) trait NewNumberLookup {
     /// Return the new reference assigned to `original`, if it was reachable.
     fn new_for_original(&self, original: ObjectRef) -> Option<ObjectRef>;
 }
 
+#[cfg(test)]
 impl NewNumberLookup for ObjectStreamRenumber {
     fn new_for_original(&self, original: ObjectRef) -> Option<ObjectRef> {
         self.old_to_new.get(&original).copied()
     }
 }
 
+#[cfg(test)]
 impl NewNumberLookup for HashMap<ObjectRef, ObjectRef> {
     fn new_for_original(&self, original: ObjectRef) -> Option<ObjectRef> {
         self.get(&original).copied()
@@ -69,6 +79,7 @@ impl NewNumberLookup for HashMap<ObjectRef, ObjectRef> {
 /// entries. qpdf derives this mapping from its xref table
 /// (`QPDF.cc:2381-2390`), not from an object's dictionary `/Type`; an ordinary
 /// orphan stream merely typed `/ObjStm` remains a preserve-unreferenced object.
+#[cfg(test)]
 fn qpdf_source_objstm_containers<R: Read + Seek>(pdf: &Pdf<R>) -> BTreeSet<ObjectRef> {
     pdf.source_xref_entries()
         .into_values()
@@ -81,6 +92,7 @@ fn qpdf_source_objstm_containers<R: Read + Seek>(pdf: &Pdf<R>) -> BTreeSet<Objec
 
 /// Return a stable writer-local key for a raw qpdf object identity that cannot
 /// be represented by `ObjectRef`. It is never registered in the source Pdf.
+#[cfg(test)]
 fn writer_local_raw_ref(raw: QpdfObjGen) -> Option<ObjectRef> {
     let object = u32::try_from(raw.get_obj()).ok()?;
     if object == 0 {
@@ -96,6 +108,7 @@ fn writer_local_raw_ref(raw: QpdfObjGen) -> Option<ObjectRef> {
 /// creating a separate legacy `Object` snapshot. The enqueue order and
 /// null-visible edge rules mirror `QPDFWriter::enqueueObject` and
 /// `enqueueObjectsStandard` (`QPDFWriter.cc:1072-1141,2916-2924`).
+#[cfg(test)]
 pub(crate) struct CanonicalCatalogFirstRenumber {
     old_to_new: HashMap<ObjectRef, ObjectRef>,
     order: Vec<ObjectRef>,
@@ -103,18 +116,15 @@ pub(crate) struct CanonicalCatalogFirstRenumber {
     raw_sources: HashMap<ObjectRef, QpdfObjGen>,
 }
 
+#[cfg(test)]
 impl NewNumberLookup for CanonicalCatalogFirstRenumber {
     fn new_for_original(&self, original: ObjectRef) -> Option<ObjectRef> {
         self.old_to_new.get(&original).copied()
     }
 }
 
+#[cfg(test)]
 impl CanonicalCatalogFirstRenumber {
-    /// Number of source objects reached by the canonical qpdf-style walk.
-    pub(crate) fn len(&self) -> usize {
-        self.order.len()
-    }
-
     /// Return the new number assigned to an original object reference.
     pub(crate) fn new_for_original(&self, original: ObjectRef) -> Option<ObjectRef> {
         self.old_to_new.get(&original).copied()
@@ -295,6 +305,7 @@ fn collect_canonical_enqueue_refs_with_linearized_omission<R: Read + Seek>(
     )
 }
 
+#[cfg(test)]
 pub(crate) fn collect_canonical_children<R: Read + Seek>(
     pdf: &mut Pdf<R>,
     handle: &crate::ObjectHandle,
@@ -656,6 +667,7 @@ fn walk_resurrectable_handle(
 /// qpdf's order.
 //
 // Shared by Preserve and Generate plain-writer planning.
+#[cfg(test)]
 pub(crate) struct ObjectStreamRenumber {
     old_to_new: HashMap<ObjectRef, ObjectRef>,
     #[cfg(test)]
@@ -665,6 +677,7 @@ pub(crate) struct ObjectStreamRenumber {
     container_new: Vec<Option<u32>>,
 }
 
+#[cfg(test)]
 impl ObjectStreamRenumber {
     /// The container object number assigned to input group `group_index`, or
     /// `None` if the index is out of range or that group was never reached.
@@ -727,7 +740,13 @@ impl ObjectStreamRenumber {
             // that set directly (`QPDFWriter.cc:1621-1758`). A multi-source
             // target therefore uses the recorded original-object provenance,
             // while an ordinary source uses its local ObjGen directly.
-            sort_members_qpdf_order(pdf, &mut sorted);
+            if matches!(group, ObjectStreamGroup::SourceBacked { .. }) {
+                sort_source_backed_members_qpdf_order(pdf, &mut sorted);
+            } else if pdf.writer_object_order.is_some() {
+                sorted.sort_unstable_by_key(|object_ref| pdf.writer_object_order_key(*object_ref));
+            } else {
+                sorted.sort_unstable_by_key(|r| (r.number, r.generation));
+            }
             for &m in &sorted {
                 if let Some(previous) = member_to_group.insert(m, gi) {
                     return Err(Error::Unsupported(format!(
@@ -735,14 +754,14 @@ impl ObjectStreamRenumber {
                     )));
                 }
             }
-            if let ObjectStreamGroup::SourceBacked { source, .. }
-            | ObjectStreamGroup::Generated { source, .. } = group
-            {
-                if let Some(previous) = source_to_group.insert(*source, gi) {
-                    return Err(Error::Unsupported(format!(
-                        "object-stream renumber: source container {source} occurs in groups {previous} and {gi}"
-                    )));
-                }
+            let source = match group {
+                ObjectStreamGroup::SourceBacked { source, .. }
+                | ObjectStreamGroup::Generated { source, .. } => *source,
+            };
+            if let Some(previous) = source_to_group.insert(source, gi) {
+                return Err(Error::Unsupported(format!(
+                    "object-stream renumber: source container {source} occurs in groups {previous} and {gi}"
+                )));
             }
             groups_sorted.push(sorted);
         }
@@ -758,9 +777,7 @@ impl ObjectStreamRenumber {
             .iter()
             .filter_map(|group| match group {
                 ObjectStreamGroup::Generated { source, .. } => Some(*source),
-                ObjectStreamGroup::SourceBacked { .. } | ObjectStreamGroup::Synthetic { .. } => {
-                    None
-                }
+                ObjectStreamGroup::SourceBacked { .. } => None,
             })
             .collect();
         let mut old_to_new: HashMap<ObjectRef, ObjectRef> = HashMap::new();
@@ -938,6 +955,7 @@ impl ObjectStreamRenumber {
 }
 
 #[derive(Clone, Copy, Debug)]
+#[cfg(test)]
 enum RenumberWork {
     Ordinary(ObjectRef),
     SourceContainer(ObjectRef),
@@ -946,6 +964,7 @@ enum RenumberWork {
 /// Number a plain object directly, or activate its source-backed/synthetic
 /// object-stream group from either the source container or any member.
 #[allow(clippy::too_many_arguments)]
+#[cfg(test)]
 fn enqueue_object_stream(
     r: ObjectRef,
     groups: &[ObjectStreamGroup],
@@ -978,7 +997,6 @@ fn enqueue_object_stream(
                     old_to_new.insert(*source, ObjectRef::new(container, 0));
                     Some(*source)
                 }
-                ObjectStreamGroup::Synthetic { .. } => None,
             };
             for &m in &groups_sorted[gi] {
                 old_to_new.insert(m, ObjectRef::new(*next, 0));
@@ -999,6 +1017,7 @@ fn enqueue_object_stream(
 
 /// Assign `original` a new number on first encounter and enqueue it for the BFS
 /// walk. Repeated calls for the same reference are no-ops.
+#[cfg(test)]
 fn enqueue(
     original: ObjectRef,
     old_to_new: &mut HashMap<ObjectRef, ObjectRef>,

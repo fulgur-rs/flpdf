@@ -9,7 +9,7 @@ use crate::encryption::CopyEncryptionSource;
 use crate::error::EncryptedError;
 use crate::object_handle::DocumentResolver;
 use crate::qpdf_obj_gen::QpdfObjGen;
-use crate::{Diagnostics, Error, ObjectHandle, ObjectRef, QpdfExc, Result, XrefEntry, XrefForm};
+use crate::{Diagnostics, Error, ObjectHandle, ObjectRef, QpdfExc, Result, XrefEntry};
 use std::any::Any;
 use std::cell::RefCell;
 use std::collections::{BTreeMap, BTreeSet};
@@ -795,10 +795,6 @@ impl<R: Read + Seek> Pdf<R> {
             .into());
         }
         Ok(Some(encrypt))
-    }
-
-    pub(crate) fn last_xref_form(&self) -> XrefForm {
-        self.last_xref_form
     }
 
     /// Return qpdf's xref-parser-owned `first_xref_item_offset` used by the

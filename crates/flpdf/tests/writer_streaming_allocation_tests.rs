@@ -538,10 +538,16 @@ fn terminal_sink_writer_rejects_a_payload_split_at_any_write_boundary() {
         let events = ProviderEvents(Rc::new(RefCell::new(Vec::new())));
         let accepted = Rc::new(RefCell::new(Vec::new()));
         let mut sink = TerminalSinkWriter::new(events, Rc::clone(&accepted));
-        sink.write(b"%PDF-1.7\n")
-            .expect("header bytes must be accepted");
-        sink.write(&PROVIDER_A_PAYLOAD[..split])
-            .expect("an incomplete A marker is not yet an error");
+        assert_eq!(
+            sink.write(b"%PDF-1.7\n")
+                .expect("header bytes must be accepted"),
+            b"%PDF-1.7\n".len()
+        );
+        assert_eq!(
+            sink.write(&PROVIDER_A_PAYLOAD[..split])
+                .expect("an incomplete A marker is not yet an error"),
+            split
+        );
         let error = sink
             .write(&PROVIDER_A_PAYLOAD[split..])
             .expect_err("the rolling matcher must reject a split A marker");

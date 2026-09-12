@@ -86,8 +86,6 @@ pub(crate) enum ObjectStreamGroup {
         source: ObjectRef,
         members: Vec<ObjectRef>,
     },
-    /// A legacy Generate group whose consumer has no source identity yet.
-    Synthetic { members: Vec<ObjectRef> },
     /// A Generate group backed by qpdf's newly minted indirect null container.
     Generated {
         source: ObjectRef,
@@ -96,20 +94,17 @@ pub(crate) enum ObjectStreamGroup {
 }
 
 impl ObjectStreamGroup {
+    #[cfg(test)]
     pub(crate) fn members(&self) -> &[ObjectRef] {
         match self {
-            Self::SourceBacked { members, .. }
-            | Self::Synthetic { members }
-            | Self::Generated { members, .. } => members,
+            Self::SourceBacked { members, .. } | Self::Generated { members, .. } => members,
         }
     }
 
     #[cfg(test)]
     pub(crate) fn members_mut(&mut self) -> &mut Vec<ObjectRef> {
         match self {
-            Self::SourceBacked { members, .. }
-            | Self::Synthetic { members } // cov:ignore: LLVM maps this shared pattern continuation to the generated arm counter.
-            | Self::Generated { members, .. } => members,
+            Self::SourceBacked { members, .. } | Self::Generated { members, .. } => members,
         }
     }
 }
@@ -205,7 +200,7 @@ pub(crate) fn plan_object_streams_with_reachability_and_source_membership<
                         source_containers.push(Some(source));
                         batches.push(members);
                     }
-                    ObjectStreamGroup::Synthetic { .. } | ObjectStreamGroup::Generated { .. } => {
+                    ObjectStreamGroup::Generated { .. } => {
                         // cov:ignore-start: the shared Preserve planner returns SourceBacked groups only.
                         return Err(crate::Error::Internal(
                             "Preserve planner returned a generated ObjStm group".to_string(),

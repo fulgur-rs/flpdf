@@ -657,9 +657,7 @@ mod tests {
             .position(|event| *event == "provider:B")
             .expect("provider B event");
         assert!(
-            events[provider_a + 1..provider_b]
-                .iter()
-                .any(|event| *event == "sink-write"),
+            events[provider_a + 1..provider_b].contains(&"sink-write"),
             "PCLm must emit A before requesting B; events: {events:?}"
         );
     }

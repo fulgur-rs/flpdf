@@ -119,8 +119,7 @@ pub(crate) fn build_live_object_stream_plan<R: Read + Seek>(
         let root = pdf.root_ref();
         plan.groups.retain_mut(|group| match group {
             ObjectStreamGroup::SourceBacked { members, .. }
-            | ObjectStreamGroup::Generated { members, .. }
-            | ObjectStreamGroup::Synthetic { members } => {
+            | ObjectStreamGroup::Generated { members, .. } => {
                 members.retain(|member| Some(*member) != root);
                 !members.is_empty()
             }
@@ -907,10 +906,9 @@ fn build_container_aware(
         .collect();
     let container_sources: BTreeSet<ObjectRef> = groups
         .iter()
-        .filter_map(|group| match group {
+        .map(|group| match group {
             ObjectStreamGroup::SourceBacked { source, .. }
-            | ObjectStreamGroup::Generated { source, .. } => Some(*source),
-            ObjectStreamGroup::Synthetic { .. } => None,
+            | ObjectStreamGroup::Generated { source, .. } => *source,
         })
         .collect();
     let mut objects: Vec<PlannedIndirectObject> = renumber
@@ -964,7 +962,6 @@ fn build_container_aware(
             ObjectStreamGroup::Generated { source, .. } => {
                 PlannedObjectStreamOrigin::Generated(*source)
             }
-            ObjectStreamGroup::Synthetic { .. } => PlannedObjectStreamOrigin::Synthetic,
         };
         objects.push(PlannedIndirectObject::ObjectStream {
             origin,

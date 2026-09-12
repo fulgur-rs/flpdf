@@ -103,11 +103,6 @@ impl LiveQueue {
                 crate::writer::object_streams::ObjectStreamGroup::Generated { source, members } => {
                     (*source, members, true)
                 }
-                crate::writer::object_streams::ObjectStreamGroup::Synthetic { .. } => {
-                    return Err(crate::Error::Internal(
-                        "plain live writer received an ObjStm group without source identity".into(),
-                    ));
-                }
             };
             if generated {
                 self.generated_container_sources.insert(source);
@@ -402,6 +397,7 @@ fn initialize_live_queue<R: Read + Seek>(
 /// Emit a plain non-linearized body using qpdf's live queue. Direct values are
 /// traversed only when they are queue seeds; indirect children are discovered
 /// by the writer-owned unparser while each queued object is emitted.
+#[allow(clippy::too_many_arguments)] // qpdf setup keeps output, numbering, encryption, and page-derived state orthogonal
 fn emit_live_body<R: Read + Seek + 'static>(
     pdf: &mut Pdf<R>,
     out: &mut OutputSink<'_>,
@@ -488,6 +484,7 @@ fn emit_live_body<R: Read + Seek + 'static>(
     })
 }
 
+#[allow(clippy::too_many_arguments)] // qpdf setup keeps output, numbering, encryption, and page-derived state orthogonal
 pub(crate) fn emit_live<R: Read + Seek + 'static>(
     pdf: &mut Pdf<R>,
     out: &mut OutputSink<'_>,

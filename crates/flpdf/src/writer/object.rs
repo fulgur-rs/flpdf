@@ -331,6 +331,7 @@ pub(crate) trait ObjectWriterEmission {
         suppress_null_values: bool,
     ) -> Result<()>;
     #[allow(clippy::too_many_arguments)]
+    #[allow(clippy::type_complexity)] // test-only legacy adapter mirrors the qpdf trailer callback boundary
     fn write_trailer_with_ref_map_and_kind(
         &self,
         out: &mut OutputSink<'_>,
@@ -443,6 +444,7 @@ pub(crate) trait ObjectWriterEmissionVecTestExt {
     ) -> Result<()>
     where
         F: FnMut(&mut Vec<u8>, &[u8]) -> Result<()>;
+    #[allow(clippy::type_complexity)] // test-only legacy adapter mirrors the qpdf trailer callback boundary
     fn write_trailer(
         &self,
         out: &mut Vec<u8>,
@@ -708,7 +710,7 @@ fn destroyed_unparse_error() -> Error {
 
 fn write_dictionary_key(out: &mut OutputSink<'_>, key: &[u8]) -> Result<()> {
     if let Some(key) = key.strip_prefix(b"/") {
-        out.write_bytes(&[b'/'])?;
+        out.write_bytes(b"/")?;
         crate::pdf_syntax::write_name_escaped(out, key)?;
     } else {
         // QPDF_Name::normalizeName preserves the first byte of a raw qpdf
@@ -1820,9 +1822,9 @@ fn unparse_stream_dict_entries(
             length_value = Some(value);
             continue;
         }
-        out.write_bytes(&[b' '])?;
+        out.write_bytes(b" ")?;
         write_dictionary_key(out, key)?;
-        out.write_bytes(&[b' '])?;
+        out.write_bytes(b" ")?;
         let force_hex_string =
             key.as_slice() == b"/Contents" && dict_is_sig_with_byte_range(&entries)?;
         if !try_write_sig_contents_hex_string(value, force_hex_string, out)? {
@@ -1874,19 +1876,19 @@ fn unparse_stream_dict_entries_qdf(
         }
         push_spaces(out, indent + 2)?;
         write_dictionary_key(out, key)?;
-        out.write_bytes(&[b' '])?;
+        out.write_bytes(b" ")?;
         let force_hex_string =
             key.as_slice() == b"/Contents" && dict_is_sig_with_byte_range(&entries)?;
         if !try_write_sig_contents_hex_string(value, force_hex_string, out)? {
             write_child_qdf(value, indent + 2, out)?;
         }
-        out.write_bytes(&[b'\n'])?;
+        out.write_bytes(b"\n")?;
     }
     if let Some(length) = length_value {
         push_spaces(out, indent + 2)?;
         out.write_bytes(b"/Length ")?;
         write_child_qdf(length, indent + 2, out)?;
-        out.write_bytes(&[b'\n'])?;
+        out.write_bytes(b"\n")?;
     }
     push_spaces(out, indent)?;
     out.write_bytes(b">>")?;
@@ -1916,24 +1918,24 @@ fn unparse_stream_dict_entries_qdf_with_ref_map(
         }
         push_spaces(out, indent + 2)?;
         write_dictionary_key(out, key)?;
-        out.write_bytes(&[b' '])?;
+        out.write_bytes(b" ")?;
         let force_hex_string =
             key.as_slice() == b"/Contents" && dict_is_sig_with_byte_range(&entries)?;
         if !try_write_sig_contents_hex_string(value, force_hex_string, out)? {
             write_child_qdf_with_ref_map(value, indent + 2, out, map, removed_refs)?;
         }
-        out.write_bytes(&[b'\n'])?;
+        out.write_bytes(b"\n")?;
     }
     if let Some(length_ref) = length_ref {
         push_spaces(out, indent + 2)?;
         out.write_bytes(b"/Length ")?;
         out.write_bytes(length_ref.to_string().as_bytes())?;
-        out.write_bytes(&[b'\n'])?;
+        out.write_bytes(b"\n")?;
     } else if let Some(length) = length_value {
         push_spaces(out, indent + 2)?;
         out.write_bytes(b"/Length ")?;
         write_child_qdf_with_ref_map(length, indent + 2, out, map, removed_refs)?;
-        out.write_bytes(&[b'\n'])?;
+        out.write_bytes(b"\n")?;
     }
     if options.add_flate_filter {
         push_spaces(out, indent + 2)?;
@@ -1971,11 +1973,11 @@ where
         }
         push_spaces(out, indent + 2)?;
         write_dictionary_key(out, key)?;
-        out.write_bytes(&[b' '])?;
+        out.write_bytes(b" ")?;
         let force_hex_string =
             key.as_slice() == b"/Contents" && dict_is_sig_with_byte_range(&entries)?;
         if try_write_sig_contents_hex_string(value, force_hex_string, out)? {
-            out.write_bytes(&[b'\n'])?;
+            out.write_bytes(b"\n")?;
             continue;
         }
         write_child_qdf_with_ref_map_and_string_writer(
@@ -1986,7 +1988,7 @@ where
             removed_refs,
             write_string,
         )?; // cov:ignore: LLVM maps the covered mapped stream child call continuation to this line
-        out.write_bytes(&[b'\n'])?;
+        out.write_bytes(b"\n")?;
     }
     push_spaces(out, indent + 2)?;
     out.write_bytes(b"/Length ")?;
@@ -2004,7 +2006,7 @@ where
     } else {
         out.write_bytes(b"null")?;
     }
-    out.write_bytes(&[b'\n'])?;
+    out.write_bytes(b"\n")?;
     if options.add_flate_filter {
         push_spaces(out, indent + 2)?;
         out.write_bytes(b"/Filter /FlateDecode\n")?;
@@ -2035,9 +2037,9 @@ where
             length_value = Some(value);
             continue;
         }
-        out.write_bytes(&[b' '])?;
+        out.write_bytes(b" ")?;
         write_dictionary_key(out, key)?;
-        out.write_bytes(&[b' '])?;
+        out.write_bytes(b" ")?;
         let force_hex_string =
             key.as_slice() == b"/Contents" && dict_is_sig_with_byte_range(&entries)?;
         if try_write_sig_contents_with_string_writer(value, force_hex_string, out)? {
@@ -2075,21 +2077,21 @@ where
         }
         push_spaces(out, indent + 2)?;
         write_dictionary_key(out, key)?;
-        out.write_bytes(&[b' '])?;
+        out.write_bytes(b" ")?;
         let force_hex_string =
             key.as_slice() == b"/Contents" && dict_is_sig_with_byte_range(entries)?;
         if try_write_sig_contents_with_string_writer(value, force_hex_string, out)? {
-            out.write_bytes(&[b'\n'])?;
+            out.write_bytes(b"\n")?;
             continue;
         }
         write_child_qdf_with_string_writer(value, indent + 2, out, write_string)?;
-        out.write_bytes(&[b'\n'])?;
+        out.write_bytes(b"\n")?;
     }
     if let Some(length) = length_value {
         push_spaces(out, indent + 2)?;
         out.write_bytes(b"/Length ")?;
         write_child_qdf_with_string_writer(length, indent + 2, out, write_string)?;
-        out.write_bytes(&[b'\n'])?;
+        out.write_bytes(b"\n")?;
     }
     push_spaces(out, indent)?;
     out.write_bytes(b">>")?;
@@ -2132,9 +2134,9 @@ fn unparse_stream_dict_entries_with_ref_map_and_length(
             length_value = Some(value);
             continue;
         }
-        out.write_bytes(&[b' '])?;
+        out.write_bytes(b" ")?;
         write_dictionary_key(out, key)?;
-        out.write_bytes(&[b' '])?;
+        out.write_bytes(b" ")?;
         let force_hex_string =
             key.as_slice() == b"/Contents" && dict_is_sig_with_byte_range(&entries)?;
         if !try_write_sig_contents_hex_string(value, force_hex_string, out)? {
@@ -2177,9 +2179,9 @@ where
             length_value = Some(value);
             continue;
         }
-        out.write_bytes(&[b' '])?;
+        out.write_bytes(b" ")?;
         write_dictionary_key(out, key)?;
-        out.write_bytes(&[b' '])?;
+        out.write_bytes(b" ")?;
         let force_hex_string =
             key.as_slice() == b"/Contents" && dict_is_sig_with_byte_range(&entries)?;
         if try_write_sig_contents_hex_string(value, force_hex_string, out)? {
@@ -2377,9 +2379,9 @@ fn unparse_container(container: UnparseContainer, out: &mut OutputSink<'_>) -> R
         UnparseContainer::Array(children) => {
             // QPDFWriter.cc:1334-1345: no token-boundary rule, a space is
             // written before every element regardless of adjacency.
-            out.write_bytes(&[b'['])?;
+            out.write_bytes(b"[")?;
             for child in children {
-                out.write_bytes(&[b' '])?;
+                out.write_bytes(b" ")?;
                 write_child(&child, out)?;
             }
             out.write_bytes(b" ]")?;
@@ -2443,7 +2445,7 @@ pub(crate) fn unparse_object_value(value: &ObjectValue, out: &mut OutputSink<'_>
             }
         }
         ObjectValue::Name(name) => {
-            out.write_bytes(&[b'/'])?;
+            out.write_bytes(b"/")?;
             crate::pdf_syntax::write_name_escaped(out, name)?;
         }
         ObjectValue::String(value) => crate::pdf_syntax::write_string_value(out, value)?,
@@ -2453,9 +2455,9 @@ pub(crate) fn unparse_object_value(value: &ObjectValue, out: &mut OutputSink<'_>
         ObjectValue::Array(children) => {
             // QPDFWriter.cc:1334-1345: no token-boundary rule, a space is
             // written before every element regardless of adjacency.
-            out.write_bytes(&[b'['])?;
+            out.write_bytes(b"[")?;
             for child in children {
-                out.write_bytes(&[b' '])?;
+                out.write_bytes(b" ")?;
                 write_child(child, out)?;
             }
             out.write_bytes(b" ]")?;
@@ -2575,9 +2577,9 @@ fn unparse_container_with_ref_map(
 ) -> Result<()> {
     match container {
         UnparseContainer::Array(children) => {
-            out.write_bytes(&[b'['])?;
+            out.write_bytes(b"[")?;
             for child in children {
-                out.write_bytes(&[b' '])?;
+                out.write_bytes(b" ")?;
                 write_child_with_ref_map(&child, out, map, removed_refs)?;
             }
             out.write_bytes(b" ]")?;
@@ -2600,9 +2602,9 @@ fn unparse_object_value_with_ref_map(
 ) -> Result<()> {
     match value {
         ObjectValue::Array(children) => {
-            out.write_bytes(&[b'['])?;
+            out.write_bytes(b"[")?;
             for child in children {
-                out.write_bytes(&[b' '])?;
+                out.write_bytes(b" ")?;
                 write_child_with_ref_map(child, out, map, removed_refs)?;
             }
             out.write_bytes(b" ]")?;
@@ -2633,9 +2635,9 @@ fn unparse_dict_entries_with_ref_map(
         if is_removed_reference(value, removed_refs) {
             continue;
         }
-        out.write_bytes(&[b' '])?;
+        out.write_bytes(b" ")?;
         write_dictionary_key(out, key)?;
-        out.write_bytes(&[b' '])?;
+        out.write_bytes(b" ")?;
         let force_hex_string =
             key.as_slice() == b"/Contents" && dict_is_sig_with_byte_range(entries)?;
         if !try_write_sig_contents_hex_string(value, force_hex_string, out)? {
@@ -2705,9 +2707,9 @@ fn unparse_object_walk_with_dynamic_ref_map(
         })?;
         match container {
             Some(UnparseContainer::Array(children)) => {
-                out.write_bytes(&[b'['])?;
+                out.write_bytes(b"[")?;
                 for child in children {
-                    out.write_bytes(&[b' '])?;
+                    out.write_bytes(b" ")?;
                     write_child_with_dynamic_ref_map(&child, out, map, removed_refs)?;
                 }
                 out.write_bytes(b" ]")?;
@@ -2747,9 +2749,9 @@ fn unparse_dict_entries_with_dynamic_ref_map(
         if is_removed_reference(value, removed_refs) {
             continue;
         }
-        out.write_bytes(&[b' '])?;
+        out.write_bytes(b" ")?;
         write_dictionary_key(out, key)?;
-        out.write_bytes(&[b' '])?;
+        out.write_bytes(b" ")?;
         let force_hex_string =
             key.as_slice() == b"/Contents" && dict_is_sig_with_byte_range(entries)?;
         if !try_write_sig_contents_hex_string(value, force_hex_string, out)? {
@@ -2778,9 +2780,9 @@ fn unparse_stream_dict_entries_with_dynamic_ref_map(
             length_value = Some(value);
             continue;
         }
-        out.write_bytes(&[b' '])?;
+        out.write_bytes(b" ")?;
         write_dictionary_key(out, key)?;
-        out.write_bytes(&[b' '])?;
+        out.write_bytes(b" ")?;
         let force_hex_string =
             key.as_slice() == b"/Contents" && dict_is_sig_with_byte_range(&entries)?;
         if !try_write_sig_contents_hex_string(value, force_hex_string, out)? {
@@ -2947,9 +2949,9 @@ fn unparse_dict_entries(
 ) -> Result<()> {
     out.write_bytes(b"<<")?;
     for (key, value) in visible_dict_entries(entries)? {
-        out.write_bytes(&[b' '])?;
+        out.write_bytes(b" ")?;
         write_dictionary_key(out, key)?;
-        out.write_bytes(&[b' '])?;
+        out.write_bytes(b" ")?;
         let force_hex_string =
             key.as_slice() == b"/Contents" && dict_is_sig_with_byte_range(entries)?;
         if !try_write_sig_contents_hex_string(value, force_hex_string, out)? {
@@ -3048,15 +3050,15 @@ fn unparse_container_qdf(
             // qpdf's QDF array arm: `[`, a newline, then each
             // child at `indent + 2`, followed by the closing bracket at
             // `indent`.
-            out.write_bytes(&[b'['])?;
-            out.write_bytes(&[b'\n'])?;
+            out.write_bytes(b"[")?;
+            out.write_bytes(b"\n")?;
             for child in children {
                 push_spaces(out, indent + 2)?;
                 write_child_qdf(&child, indent + 2, out)?;
-                out.write_bytes(&[b'\n'])?;
+                out.write_bytes(b"\n")?;
             }
             push_spaces(out, indent)?;
-            out.write_bytes(&[b']'])?;
+            out.write_bytes(b"]")?;
         }
         UnparseContainer::Dictionary(entries) => {
             unparse_dict_entries_qdf(&entries, indent, out)?;
@@ -3086,15 +3088,15 @@ fn unparse_object_value_qdf(
             // then per element `indent + 2` leading spaces + the child's own
             // QDF form + a trailing newline, then `indent` leading spaces and
             // `]`.
-            out.write_bytes(&[b'['])?;
-            out.write_bytes(&[b'\n'])?;
+            out.write_bytes(b"[")?;
+            out.write_bytes(b"\n")?;
             for child in children {
                 push_spaces(out, indent + 2)?;
                 write_child_qdf(child, indent + 2, out)?;
-                out.write_bytes(&[b'\n'])?;
+                out.write_bytes(b"\n")?;
             }
             push_spaces(out, indent)?;
-            out.write_bytes(&[b']'])?;
+            out.write_bytes(b"]")?;
         }
         ObjectValue::Dictionary(entries) => {
             let entries: Vec<(Vec<u8>, ObjectHandle)> = entries
@@ -3166,13 +3168,13 @@ fn unparse_dict_entries_qdf(
     for (key, value) in visible_dict_entries(entries)? {
         push_spaces(out, indent + 2)?;
         write_dictionary_key(out, key)?;
-        out.write_bytes(&[b' '])?;
+        out.write_bytes(b" ")?;
         let force_hex_string =
             key.as_slice() == b"/Contents" && dict_is_sig_with_byte_range(entries)?;
         if !try_write_sig_contents_hex_string(value, force_hex_string, out)? {
             write_child_qdf(value, indent + 2, out)?;
         }
-        out.write_bytes(&[b'\n'])?;
+        out.write_bytes(b"\n")?;
     }
     push_spaces(out, indent)?;
     out.write_bytes(b">>")?;
@@ -3243,15 +3245,15 @@ fn unparse_container_qdf_with_ref_map(
 ) -> Result<()> {
     match container {
         UnparseContainer::Array(children) => {
-            out.write_bytes(&[b'['])?;
-            out.write_bytes(&[b'\n'])?;
+            out.write_bytes(b"[")?;
+            out.write_bytes(b"\n")?;
             for child in children {
                 push_spaces(out, indent + 2)?;
                 write_child_qdf_with_ref_map(&child, indent + 2, out, map, removed_refs)?;
-                out.write_bytes(&[b'\n'])?;
+                out.write_bytes(b"\n")?;
             }
             push_spaces(out, indent)?;
-            out.write_bytes(&[b']'])?;
+            out.write_bytes(b"]")?;
         }
         UnparseContainer::Dictionary(entries) => {
             unparse_dict_entries_qdf_with_ref_map(&entries, indent, out, map, removed_refs)?;
@@ -3292,13 +3294,13 @@ fn unparse_dict_entries_qdf_with_ref_map(
         }
         push_spaces(out, indent + 2)?;
         write_dictionary_key(out, key)?;
-        out.write_bytes(&[b' '])?;
+        out.write_bytes(b" ")?;
         let force_hex_string =
             key.as_slice() == b"/Contents" && dict_is_sig_with_byte_range(entries)?;
         if !try_write_sig_contents_hex_string(value, force_hex_string, out)? {
             write_child_qdf_with_ref_map(value, indent + 2, out, map, removed_refs)?;
         }
-        out.write_bytes(&[b'\n'])?;
+        out.write_bytes(b"\n")?;
     }
     push_spaces(out, indent)?;
     out.write_bytes(b">>")?;
@@ -3388,9 +3390,9 @@ where
 {
     match container {
         UnparseContainer::Array(children) => {
-            out.write_bytes(&[b'['])?;
+            out.write_bytes(b"[")?;
             for child in children {
-                out.write_bytes(&[b' '])?;
+                out.write_bytes(b" ")?;
                 write_child_with_ref_map_and_string_writer(
                     &child,
                     out,
@@ -3454,9 +3456,9 @@ where
         if is_removed_reference(value, removed_refs) {
             continue;
         }
-        out.write_bytes(&[b' '])?;
+        out.write_bytes(b" ")?;
         write_dictionary_key(out, key)?;
-        out.write_bytes(&[b' '])?;
+        out.write_bytes(b" ")?;
         let force_hex_string =
             key.as_slice() == b"/Contents" && dict_is_sig_with_byte_range(entries)?;
         if try_write_sig_contents_hex_string(value, force_hex_string, out)? {
@@ -3564,8 +3566,8 @@ where
 {
     match container {
         UnparseContainer::Array(children) => {
-            out.write_bytes(&[b'['])?;
-            out.write_bytes(&[b'\n'])?;
+            out.write_bytes(b"[")?;
+            out.write_bytes(b"\n")?;
             for child in children {
                 push_spaces(out, indent + 2)?;
                 write_child_qdf_with_ref_map_and_string_writer(
@@ -3576,10 +3578,10 @@ where
                     removed_refs,
                     write_string,
                 )?; // cov:ignore: LLVM maps the covered child call continuation to this line
-                out.write_bytes(&[b'\n'])?;
+                out.write_bytes(b"\n")?;
             }
             push_spaces(out, indent)?;
-            out.write_bytes(&[b']'])?;
+            out.write_bytes(b"]")?;
         }
         UnparseContainer::Dictionary(entries) => {
             unparse_dict_entries_qdf_with_ref_map_and_string_writer(
@@ -3640,11 +3642,11 @@ where
         }
         push_spaces(out, indent + 2)?;
         write_dictionary_key(out, key)?;
-        out.write_bytes(&[b' '])?;
+        out.write_bytes(b" ")?;
         let force_hex_string =
             key.as_slice() == b"/Contents" && dict_is_sig_with_byte_range(entries)?;
         if try_write_sig_contents_hex_string(value, force_hex_string, out)? {
-            out.write_bytes(&[b'\n'])?;
+            out.write_bytes(b"\n")?;
             continue;
         }
         write_child_qdf_with_ref_map_and_string_writer(
@@ -3655,7 +3657,7 @@ where
             removed_refs,
             write_string,
         )?; // cov:ignore: LLVM maps the covered mapped dictionary child call continuation to this line
-        out.write_bytes(&[b'\n'])?;
+        out.write_bytes(b"\n")?;
     }
     push_spaces(out, indent)?;
     out.write_bytes(b">>")?;
@@ -3689,9 +3691,9 @@ where
 {
     match container {
         UnparseContainer::Array(children) => {
-            out.write_bytes(&[b'['])?;
+            out.write_bytes(b"[")?;
             for child in children {
-                out.write_bytes(&[b' '])?;
+                out.write_bytes(b" ")?;
                 write_child_with_string_writer(&child, out, write_string)?;
             }
             out.write_bytes(b" ]")?;
@@ -3794,9 +3796,9 @@ where
 {
     out.write_bytes(b"<<")?;
     for (key, value) in visible_dict_entries(entries)? {
-        out.write_bytes(&[b' '])?;
+        out.write_bytes(b" ")?;
         write_dictionary_key(out, key)?;
-        out.write_bytes(&[b' '])?;
+        out.write_bytes(b" ")?;
         let force_hex_string =
             key.as_slice() == b"/Contents" && dict_is_sig_with_byte_range(entries)?;
         if try_write_sig_contents_with_string_writer(value, force_hex_string, out)? {
@@ -3837,15 +3839,15 @@ where
 {
     match container {
         UnparseContainer::Array(children) => {
-            out.write_bytes(&[b'['])?;
-            out.write_bytes(&[b'\n'])?;
+            out.write_bytes(b"[")?;
+            out.write_bytes(b"\n")?;
             for child in children {
                 push_spaces(out, indent + 2)?;
                 write_child_qdf_with_string_writer(&child, indent + 2, out, write_string)?;
-                out.write_bytes(&[b'\n'])?;
+                out.write_bytes(b"\n")?;
             }
             push_spaces(out, indent)?;
-            out.write_bytes(&[b']'])?;
+            out.write_bytes(b"]")?;
         }
         UnparseContainer::Dictionary(entries) => {
             unparse_dict_entries_qdf_with_string_writer(&entries, indent, out, write_string)?;
@@ -3928,15 +3930,15 @@ where
     for (key, value) in visible_dict_entries(entries)? {
         push_spaces(out, indent + 2)?;
         write_dictionary_key(out, key)?;
-        out.write_bytes(&[b' '])?;
+        out.write_bytes(b" ")?;
         let force_hex_string =
             key.as_slice() == b"/Contents" && dict_is_sig_with_byte_range(entries)?;
         if try_write_sig_contents_with_string_writer(value, force_hex_string, out)? {
-            out.write_bytes(&[b'\n'])?;
+            out.write_bytes(b"\n")?;
             continue;
         }
         write_child_qdf_with_string_writer(value, indent + 2, out, write_string)?;
-        out.write_bytes(&[b'\n'])?;
+        out.write_bytes(b"\n")?;
     }
     push_spaces(out, indent)?;
     out.write_bytes(b">>")?;
@@ -3980,9 +3982,9 @@ fn unparse_trailer_entries(
             }
             _ => {}
         }
-        out.write_bytes(&[b' '])?;
+        out.write_bytes(b" ")?;
         write_dictionary_key(out, key)?;
-        out.write_bytes(&[b' '])?;
+        out.write_bytes(b" ")?;
         write_child(value, out)?;
     }
     if let Some(value) = id_value {
@@ -4053,10 +4055,10 @@ fn unparse_trailer_entries_with_ref_map(
         if qdf {
             out.write_bytes(b"  ")?;
         } else {
-            out.write_bytes(&[b' '])?;
+            out.write_bytes(b" ")?;
         }
         write_dictionary_key(out, key)?;
-        out.write_bytes(&[b' '])?;
+        out.write_bytes(b" ")?;
         if key.as_slice() == b"/Root" && value.object_ref().is_none() {
             // An inline Catalog is writer-owned, but its indirect descendants
             // remain in source space until this final child walk. qpdf's
@@ -4081,7 +4083,7 @@ fn unparse_trailer_entries_with_ref_map(
             write_child_with_ref_map(value, out, map, removed_refs)?;
         }
         if qdf {
-            out.write_bytes(&[b'\n'])?;
+            out.write_bytes(b"\n")?;
         }
     }
 
@@ -4103,7 +4105,7 @@ fn unparse_trailer_entries_with_ref_map(
 
     if qdf {
         if id_value.is_some() || encrypt_value.is_some() {
-            out.write_bytes(&[b'\n'])?;
+            out.write_bytes(b"\n")?;
         }
         out.write_bytes(b">>\n")?;
     } else {
@@ -4158,7 +4160,7 @@ fn unparse_trailer_entries_with_ref_map_and_kind(
             if qdf {
                 out.write_bytes(b"  ")?;
             } else {
-                out.write_bytes(&[b' '])?;
+                out.write_bytes(b" ")?;
             }
             write_dictionary_key(out, key)?;
             out.write_bytes(b" ")?;
@@ -4171,7 +4173,7 @@ fn unparse_trailer_entries_with_ref_map_and_kind(
                 push_spaces(out, padding)?;
             }
             if qdf {
-                out.write_bytes(&[b'\n'])?;
+                out.write_bytes(b"\n")?;
             }
             continue;
         }
@@ -4192,10 +4194,10 @@ fn unparse_trailer_entries_with_ref_map_and_kind(
         if qdf {
             out.write_bytes(b"  ")?;
         } else {
-            out.write_bytes(&[b' '])?;
+            out.write_bytes(b" ")?;
         }
         write_dictionary_key(out, key)?;
-        out.write_bytes(&[b' '])?;
+        out.write_bytes(b" ")?;
         if key.as_slice() == b"/Root" && value.object_ref().is_none() {
             if qdf {
                 write_child_qdf_with_ref_map(value, 2, out, map, removed_refs)?;
@@ -4214,7 +4216,7 @@ fn unparse_trailer_entries_with_ref_map_and_kind(
             write_child_with_ref_map(value, out, map, removed_refs)?;
         }
         if qdf {
-            out.write_bytes(&[b'\n'])?;
+            out.write_bytes(b"\n")?;
         }
     }
 
@@ -4235,7 +4237,7 @@ fn unparse_trailer_entries_with_ref_map_and_kind(
     }
     if qdf {
         if id_value.is_some() || encrypt_value.is_some() {
-            out.write_bytes(&[b'\n'])?;
+            out.write_bytes(b"\n")?;
         }
         out.write_bytes(b">>\n")?;
     } else {
@@ -4268,9 +4270,9 @@ fn unparse_dictionary_entries_with_ref_map_and_id_writer(
         if !writer_owned_root && is_removed_reference(value, removed_refs) {
             continue;
         }
-        out.write_bytes(&[b' '])?;
+        out.write_bytes(b" ")?;
         write_dictionary_key(out, key)?;
-        out.write_bytes(&[b' '])?;
+        out.write_bytes(b" ")?;
         if key.as_slice() == b"/ID" {
             match id_writer.as_mut() {
                 Some(write_id) => write_id(out)?,
@@ -4322,10 +4324,10 @@ fn write_id_style_value_handle(value: &ObjectHandle, out: &mut OutputSink<'_>) -
     });
     match compact {
         Some((b0, b1)) => {
-            out.write_bytes(&[b'['])?;
+            out.write_bytes(b"[")?;
             crate::pdf_syntax::write_hex_string(out, &b0)?;
             crate::pdf_syntax::write_hex_string(out, &b1)?;
-            out.write_bytes(&[b']'])?;
+            out.write_bytes(b"]")?;
             Ok(())
         }
         None => write_child(value, out),
@@ -4358,10 +4360,10 @@ fn write_id_style_value_handle_with_ref_map(
     });
     match compact {
         Some((b0, b1)) => {
-            out.write_bytes(&[b'['])?;
+            out.write_bytes(b"[")?;
             crate::pdf_syntax::write_hex_string(out, &b0)?;
             crate::pdf_syntax::write_hex_string(out, &b1)?;
-            out.write_bytes(&[b']'])?;
+            out.write_bytes(b"]")?;
             Ok(())
         }
         None => unparse_object_walk_with_ref_map(value, out, map, removed_refs),
