@@ -52,15 +52,6 @@ pub(crate) struct LiveObjectStreamPlan {
     pub(crate) removed_refs: BTreeSet<ObjectRef>,
 }
 
-/// Planned routes that can remove `/Filter` and `/DecodeParms` must not use
-/// those keys as graph edges before emission. This is a route-level setup
-/// fact only; no stream payload or provider is inspected here.
-pub(crate) fn skip_stream_parameters_for_non_linearized_plan(options: &WriterOptions) -> bool {
-    options.qdf
-        || options.content_normalization
-        || options.object_streams == ObjectStreamMode::Generate
-}
-
 /// Build only the object-stream membership qpdf decides in `doWriteSetup`.
 /// Reachability, stream dictionary visibility, child discovery, and output
 /// numbering remain emission-time responsibilities of the live queue.
@@ -183,7 +174,6 @@ impl PlainWritePlan {
         // qpdf's removeObject erases the canonical cache slot rather than
         // retaining a persistent deleted-reference tombstone.
         let explicitly_removed = BTreeSet::new();
-        let skip_stream_parameters = skip_stream_parameters_for_non_linearized_plan(options);
         let mut placement = match options.object_streams {
             ObjectStreamMode::Disable => {
                 let renumber = CanonicalCatalogFirstRenumber::build_qpdf(
@@ -191,7 +181,6 @@ impl PlainWritePlan {
                     true,
                     options.preserve_unreferenced_objects,
                     &explicitly_removed,
-                    skip_stream_parameters,
                 )?;
                 let mut placement = build_sources_from_canonical_renumber(&renumber);
                 placement.removed_refs = explicitly_removed;
@@ -204,7 +193,6 @@ impl PlainWritePlan {
                         true,
                         options.preserve_unreferenced_objects,
                         &explicitly_removed,
-                        skip_stream_parameters,
                     )?; // cov:ignore: malformed canonical source graphs are rejected before placement
                     let mut placement = build_sources_from_canonical_renumber(&renumber);
                     placement.removed_refs = explicitly_removed;
@@ -230,7 +218,6 @@ impl PlainWritePlan {
                         &mut packing.groups,
                         &packing.removed_refs,
                         options.preserve_unreferenced_objects,
-                        skip_stream_parameters,
                     )?; // cov:ignore: LLVM maps this covered preserve-group call terminator to a zero-count continuation region
                     let groups = &packing.groups;
                     let removed = &packing.removed_refs;
@@ -239,7 +226,6 @@ impl PlainWritePlan {
                         groups,
                         removed,
                         options.preserve_unreferenced_objects,
-                        skip_stream_parameters,
                     )?; // cov:ignore: planner groups are produced by the same validated source walk
                     build_container_aware(renumber, packing.groups, packing.removed_refs)?
                 }
@@ -287,7 +273,6 @@ impl PlainWritePlan {
                     &mut renumber_groups,
                     removed,
                     options.preserve_unreferenced_objects,
-                    skip_stream_parameters,
                 )?;
                 // cov:ignore-end
                 let renumber = renumber_plain(
@@ -295,7 +280,6 @@ impl PlainWritePlan {
                     &renumber_groups,
                     removed,
                     options.preserve_unreferenced_objects,
-                    skip_stream_parameters,
                 )?; // cov:ignore: llvm-cov assigns no executable counter to this multiline-call terminator; the Generate preserve path is exercised by the writer contract test.
                 build_container_aware(renumber, renumber_groups, removed_refs)?
             }
@@ -996,7 +980,6 @@ fn renumber_plain<R: Read + Seek>(
     groups: &[ObjectStreamGroup],
     removed_refs: &BTreeSet<ObjectRef>,
     preserve_unreferenced_objects: bool,
-    skip_stream_parameters: bool,
 ) -> crate::Result<ObjectStreamRenumber> {
     ObjectStreamRenumber::build(
         pdf,
@@ -1004,7 +987,6 @@ fn renumber_plain<R: Read + Seek>(
         true,
         removed_refs,
         preserve_unreferenced_objects,
-        skip_stream_parameters,
     )
 }
 
@@ -1013,7 +995,6 @@ fn retain_reachable_object_stream_members<R: Read + Seek>(
     groups: &mut Vec<ObjectStreamGroup>,
     removed_refs: &BTreeSet<ObjectRef>,
     preserve_unreferenced_objects: bool,
-    skip_stream_parameters: bool,
 ) -> crate::Result<()> {
     if groups.is_empty() {
         return Ok(());
@@ -1024,7 +1005,6 @@ fn retain_reachable_object_stream_members<R: Read + Seek>(
         true,
         preserve_unreferenced_objects,
         removed_refs,
-        skip_stream_parameters,
     )?;
     // cov:ignore-end
     for group in groups.iter_mut() {

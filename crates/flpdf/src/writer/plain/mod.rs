@@ -563,18 +563,27 @@ fn write_planned<R: Read + Seek, W: Write>(
     plan: &plan::PlainWritePlan,
 ) -> crate::Result<WriterResult> {
     plan.validate()?;
-    let (mut bytes, layout) = body::emit_bodies(pdf, options, plan)?;
+    let body = body::emit_bodies(pdf, options, plan)?;
+    let mut bytes = body.bytes;
+    let layout = body.layout;
+    let mut old_to_new: HashMap<ObjectRef, ObjectRef> = body.old_to_new.into_iter().collect();
+    for planned in &plan.objects {
+        if let plan::PlannedIndirectObject::RawSource { source, raw, .. } = planned {
+            if let Some(output) = body.raw_old_to_new.get(raw).copied() {
+                old_to_new.insert(*source, output);
+            }
+        }
+    }
     let written_xref = xref::append_xref_and_trailer_with_handle(
         &mut bytes,
         &layout,
         &plan.trailer,
         &plan.trailer_handle,
-        &plan.old_to_new,
+        &old_to_new,
         &plan.removed_refs,
     )?; // cov:ignore: validated plain body/trailer consumer; LLVM maps this multiline call continuation to a zero-count terminator
     out.write_all(&bytes)?;
-    let old_to_new = plan
-        .old_to_new
+    let old_to_new = old_to_new
         .iter()
         .filter(|(_, output)| {
             layout.uncompressed.contains_key(&output.number)

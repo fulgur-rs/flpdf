@@ -197,7 +197,7 @@ fn stream_dictionary_observations_follow_canonical_resolution() {
     let production = strip_cfg_test_items(&source);
 
     for function_name in [
-        "collect_canonical_children_with_stream_policy",
+        "collect_canonical_children_with_linearized_omission",
         "walk_resurrectable_handle",
     ] {
         let body = production_function_body(&production, function_name);
@@ -218,5 +218,29 @@ fn stream_dictionary_observations_follow_canonical_resolution() {
             );
             search_from = stream_offset + "as_stream_dict(".len();
         }
+    }
+}
+
+#[test]
+fn non_linearized_renumber_has_no_route_wide_stream_parameter_skip() {
+    let renumber = fs::read_to_string(source_root().join("writer/rewrite_renumber.rs"))
+        .expect("rewrite_renumber.rs must be readable");
+    let plan = fs::read_to_string(source_root().join("writer/plain/plan.rs"))
+        .expect("plain/plan.rs must be readable");
+    let production = format!(
+        "{}\n{}",
+        strip_cfg_test_items(&renumber),
+        strip_cfg_test_items(&plan)
+    );
+
+    for removed_route in [
+        "skip_stream_parameters_for_non_linearized_plan",
+        "collect_canonical_children_with_skip_stream_parameters",
+        "collect_canonical_enqueue_refs_with_skip_stream_parameters",
+    ] {
+        assert!(
+            !contains_token(&production, removed_route),
+            "non-linearized planning must not retain route-wide stream-parameter skip {removed_route}"
+        );
     }
 }

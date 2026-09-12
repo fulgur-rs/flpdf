@@ -285,3 +285,100 @@ fn qdf_uncompress_drops_indirect_decode_parms_children_before_numbering() -> flp
     );
     Ok(())
 }
+
+#[test]
+fn qdf_preserve_keeps_indirect_decode_parms_children_in_numbering() -> flpdf::Result<()> {
+    if !qpdf_available() {
+        eprintln!("qpdf is unavailable; skipping surviving indirect DecodeParms differential");
+        return Ok(());
+    }
+
+    let input = test_driver_fixture("stream_decode_parms_indirect_nondict.pdf");
+    let temporary = tempfile::tempdir()?;
+    let qpdf_output = temporary.path().join("qpdf-preserve.pdf");
+    let qpdf = Command::new("qpdf")
+        .args([
+            "--qdf",
+            "--static-id",
+            "--stream-data=preserve",
+            "--object-streams=disable",
+        ])
+        .arg(&input)
+        .arg(&qpdf_output)
+        .output()
+        .expect("run qpdf surviving indirect DecodeParms rewrite");
+    assert!(
+        matches!(qpdf.status.code(), Some(0) | Some(3)),
+        "qpdf surviving indirect DecodeParms rewrite failed: {}",
+        String::from_utf8_lossy(&qpdf.stderr)
+    );
+
+    let settings = WriterTestSettings {
+        qdf: true,
+        static_id: true,
+        object_streams: ObjectStreamMode::Disable,
+        stream_data: Some(flpdf::StreamDataMode::Preserve),
+        ..WriterTestSettings::default()
+    };
+    let mut pdf = Pdf::open(BufReader::new(File::open(&input)?))?;
+    let mut actual = Vec::new();
+    write_with_settings(&mut pdf, &mut actual, &settings)?;
+    let expected = read_file(&qpdf_output)?;
+
+    assert!(
+        expected
+            .windows(b"/DecodeParms 5 0 R".len())
+            .any(|window| window == b"/DecodeParms 5 0 R"),
+        "qpdf oracle must preserve the indirect DecodeParms reference"
+    );
+    assert!(
+        expected
+            .windows(b"5 0 obj\n42".len())
+            .any(|window| window == b"5 0 obj\n42"),
+        "qpdf oracle must emit the surviving parameter-only child"
+    );
+    assert_eq!(
+        actual, expected,
+        "QDF preserve numbering must retain an indirect DecodeParms-only child"
+    );
+    Ok(())
+}
+
+#[test]
+fn qdf_generate_object_stream_first_offset_matches_qpdf() -> flpdf::Result<()> {
+    if !qpdf_available() {
+        eprintln!("qpdf is unavailable; skipping QDF Generate differential");
+        return Ok(());
+    }
+
+    let input = fixture("one-page.pdf");
+    let temporary = tempfile::tempdir()?;
+    let qpdf_output = temporary.path().join("qpdf-qdf-generate.pdf");
+    let qpdf = Command::new("qpdf")
+        .args(["--qdf", "--static-id", "--object-streams=generate"])
+        .arg(&input)
+        .arg(&qpdf_output)
+        .output()
+        .expect("run qpdf QDF Generate rewrite");
+    assert!(
+        matches!(qpdf.status.code(), Some(0) | Some(3)),
+        "qpdf QDF Generate rewrite failed: {}",
+        String::from_utf8_lossy(&qpdf.stderr)
+    );
+
+    let settings = WriterTestSettings {
+        qdf: true,
+        static_id: true,
+        object_streams: ObjectStreamMode::Generate,
+        ..WriterTestSettings::default()
+    };
+    let mut pdf = Pdf::open(BufReader::new(File::open(&input)?))?;
+    let mut actual = Vec::new();
+    write_with_settings(&mut pdf, &mut actual, &settings)?;
+    assert_eq!(
+        actual,
+        read_file(&qpdf_output)?,
+        "QDF Generate ObjStm /First and member offsets must match qpdf"
+    );
+    Ok(())
+}

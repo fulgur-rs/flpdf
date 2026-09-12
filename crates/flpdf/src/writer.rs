@@ -3973,14 +3973,11 @@ fn emit_canonical_pdf_inner<R: Read + Seek, W: Write>(
     // qpdf's non-linearized enqueue walk does not invoke stream providers or
     // decide output filter parameters (`QPDFWriter.cc:1072-1141`). Keep this
     // walk structural; the emission pass below owns stream policy and payloads.
-    let skip_stream_parameters =
-        plain::plan::skip_stream_parameters_for_non_linearized_plan(options);
     let renumber = CanonicalCatalogFirstRenumber::build_qpdf(
         pdf,
         true,
         options.preserve_unreferenced_objects,
         &removed_refs,
-        skip_stream_parameters,
     )?; // cov:ignore: llvm-cov assigns no executable counter to this multiline-call terminator; the preserve qdf call is exercised by the writer contract test.
 
     // Pass `false` here because full-rewrite ObjStm emission is only known
@@ -4292,7 +4289,6 @@ fn emit_canonical_pdf_inner<R: Read + Seek, W: Write>(
             true,
             numbering_removed_refs,
             options.preserve_unreferenced_objects,
-            skip_stream_parameters,
         )?) // cov:ignore: the canonical ObjStm plan validates this shared walk before QDF emission
     } else {
         None
