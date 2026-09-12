@@ -101,6 +101,9 @@ class MeasurementContracts(unittest.TestCase):
         for serialized, family in (("/Bench", "stream"), ("", "pages"), ("/EmbeddedFiles", "objects")):
             with self.assertRaises(ValueError):
                 perf.require_markers(serialized, family)
+        # The pinned qtest fixture is read unchanged and has no generated marker.
+        perf.require_markers("", "qtest")
+        self.assertNotIn("qtest", perf.GENERATED_FAMILIES)
 
     def test_zero_rss_cannot_be_reported_as_memory_improvement(self):
         sample = {"exit_status": 0, "max_rss_kib": 0}

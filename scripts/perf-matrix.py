@@ -22,6 +22,7 @@ from datetime import datetime, timezone
 
 ROOT = Path(__file__).resolve().parents[1]
 QPDF_COMMIT = "3b97c9bd266b7c32ea36d3536e22dab77412886d"
+GENERATED_FAMILIES = ("pages", "content", "objects", "stream")
 SIZES = [100, 1000, 5000]
 STREAM_MIB = [1, 8, 32]
 OPERATIONS = {
@@ -199,8 +200,12 @@ def require_markers(serialized, family):
     `generate_pdf` reaches every benchmarked object from the Catalog: each page
     carries `/Bench`, `objects` adds a Catalog `/Bench` array, and `stream` adds
     an `/EmbeddedFiles` name tree. Readability and page count alone accept an
-    output that silently discarded them.
+    output that silently discarded them. The pinned qtest fixture is read
+    unchanged from the qpdf source tree and carries none of these markers, so it
+    has no generated invariant to check here.
     """
+    if family not in GENERATED_FAMILIES:
+        return
     markers = ["/Bench"] + (["/EmbeddedFiles"] if family == "stream" else [])
     missing = [marker for marker in markers if marker not in serialized]
     if missing:
@@ -294,8 +299,8 @@ def prepare_inputs(args, out, qpdf, source):
     directory = out / "inputs"
     directory.mkdir()
     inputs = []
-    for family, sizes in (("pages", args.sizes), ("content", args.sizes), ("objects", args.sizes),
-                          ("stream", args.stream_mib)):
+    for family in GENERATED_FAMILIES:
+        sizes = args.stream_mib if family == "stream" else args.sizes
         for size in sizes:
             identity = f"{family}-{size}"
             raw, path = directory / f"{identity}-raw.pdf", directory / f"{identity}.pdf"
