@@ -280,7 +280,7 @@ cargo test -p flpdf --test object_handle_shared_value_allocation_tests -- --noca
 
 ~~~bash
 cargo test --workspace --all-features --quiet
-cargo clippy --workspace --all-targets --all-features -- -D warnings -A clippy::chunks-exact-to-as-chunks -A clippy::useless-format
+cargo clippy --workspace --all-targets --all-features -- -D warnings
 RUSTDOCFLAGS='-D rustdoc::broken_intra_doc_links -D rustdoc::private_intra_doc_links -D rustdoc::invalid_html_tags' cargo doc --workspace --no-deps --document-private-items
 python3 scripts/check-qpdf-deviation-markers.py --check
 python3 scripts/check-qpdf-route-matrix.py --check
