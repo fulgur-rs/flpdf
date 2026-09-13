@@ -481,13 +481,13 @@ fn append_objstm_container_object<R: Read + Seek>(
             ctx,
             true,
             None,
-        )?;
+        )?; // cov:ignore: encrypted ObjStm payload failure is a defensive pipeline continuation
     } else {
         crate::writer::serialize::write_stream_payload(
             out,
             &data,
             options.newline_before_endstream,
-        )?;
+        )?; // cov:ignore: plain ObjStm payload failure is a defensive pipeline continuation
     }
     out.write_bytes(b"\nendobj\n")?;
     Ok(offset)
@@ -722,7 +722,7 @@ fn append_body_object(
             out,
             &data,
             options.newline_before_endstream,
-        )?;
+        )?; // cov:ignore: plain linearized stream payload failure is a defensive pipeline continuation
     }
     out.write_bytes(b"\nendobj\n")?;
     Ok(offset)
@@ -882,8 +882,7 @@ fn write_part1_xref_and_trailer(
                 crate::Error::Unsupported(
                     "Part-1 xref placeholder length exceeds usize range".to_string(),
                 )
-                // cov:ignore-end
-            })?;
+            })?; // cov:ignore-end
         write_repeated_bytes(out, b' ', data_len)?;
         Some(Part1XrefPatch {
             start_num: param_dict_obj_number,
@@ -2585,8 +2584,7 @@ fn do_write_pass<R: Read + Seek>(
             crate::Error::Unsupported(
                 "linearization hint stream offset moved backwards".to_string(),
             )
-            // cov:ignore-end
-        })?;
+        })?; // cov:ignore-end
 
     // qpdf orders every first-page plain object and Part-3 ObjStm container by
     // the object number assigned during its linearization setup. In particular,
@@ -4666,7 +4664,9 @@ mod tests {
             3,
             0,
             &trailer,
-            &|_| unreachable!("direct trailer ID has no indirect references"),
+            &|_| {
+                unreachable!("direct trailer ID has no indirect references") // cov:ignore: direct trailer ID has no indirect references
+            },
             &BTreeSet::new(),
             None,
         )

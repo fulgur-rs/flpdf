@@ -130,8 +130,7 @@ impl<'a> OutputSink<'a> {
             // value in u64; this defensive narrowing error is only reachable
             // on a 32-bit process after an externally supplied u64 position.
             Error::Unsupported("writer output position exceeds usize range".to_string())
-            // cov:ignore-end
-        })
+        }) // cov:ignore-end
     }
 
     pub(crate) const fn last_byte(&self) -> Option<u8> {
