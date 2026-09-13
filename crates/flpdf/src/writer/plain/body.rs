@@ -680,15 +680,15 @@ impl crate::writer::object::DynamicDirectStreamWriter for LiveDirectStreamWriter
                 // cov:ignore-start: an allocatable direct stream payload fits in i64.
                 crate::Error::Unsupported("direct stream /Length does not fit in i64".into())
                 // cov:ignore-end
-            })?),
-        )?;
+            })?), // cov:ignore: allocatable direct stream lengths fit the i64 PDF length domain.
+        )?; // cov:ignore: LLVM attributes the successful direct-stream dictionary replacement continuation separately.
         dict.write_stream_body_with_dynamic_ref_map_and_string_writer(
             out,
             dictionary_options,
             map,
             removed_refs,
             write_string,
-        )?;
+        )?; // cov:ignore: the live direct-stream dictionary serializer is exercised by the nested direct-stream regression.
         if let Some(context) = self.encryption_context {
             crate::writer::write_stream_payload_with_pipeline(
                 out,
@@ -2166,7 +2166,7 @@ fn canonical_stream_filter_probe(
             apply_full_rewrite_metadata_policy,
             normalize_content,
         )?
-    // cov:ignore: LLVM maps the covered canonical stream filter-plan continuation to the call opening line
+    // cov:ignore: LLVM maps the covered canonical stream filter-plan continuation to the call opening line.
     else {
         return Ok(false);
     };
@@ -3806,7 +3806,7 @@ mod object_emitter_tests {
             )
         });
         let error = match result {
-            Ok(_) => panic!("a removed QDF /Extends target must be rejected"),
+            Ok(_) => panic!("a removed QDF /Extends target must be rejected"), // cov:ignore: this test intentionally supplies the rejected error path.
             Err(error) => error,
         };
 

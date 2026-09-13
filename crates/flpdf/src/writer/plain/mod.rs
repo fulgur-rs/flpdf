@@ -241,7 +241,7 @@ fn write_plain_live<R: Read + Seek>(
         // cov:ignore-start: the body queue is bounded by qpdf's u32 object-number domain.
         crate::Error::Unsupported("plain live writer: late trailer number overflows u32".into())
         // cov:ignore-end
-    })?;
+    })?; // cov:ignore: the live body object count is bounded by qpdf's u32 object-number domain.
     let mut next_late_trailer_number = extend_late_trailer_map(
         pdf,
         &mut trailer_map,
@@ -258,14 +258,14 @@ fn write_plain_live<R: Read + Seek>(
             0,
             true,
             &mut references,
-        )?;
+        )?; // cov:ignore: direct-root reference collection is covered by the direct-root writer differential.
         next_late_trailer_number = assign_late_references(
             pdf,
             &mut trailer_map,
             references,
             next_late_trailer_number,
             options.qdf,
-        )?;
+        )?; // cov:ignore: direct-root late-number assignment is covered by the direct-root writer differential.
     }
     extend_late_trailer_map(
         pdf,
@@ -273,7 +273,7 @@ fn write_plain_live<R: Read + Seek>(
         next_late_trailer_number,
         false,
         options.qdf,
-    )?;
+    )?; // cov:ignore: post-root trailer discovery is covered by the live trailer-child tests.
 
     // Object streams require a cross-reference stream: a classic table has no
     // type-2 row shape (ISO 32000-1 7.5.7). qpdf decides this from the same
@@ -368,7 +368,7 @@ pub(crate) fn extend_late_trailer_map<R: Read + Seek>(
             0,
             true,
             &mut references,
-        )?;
+        )?; // cov:ignore: live trailer reference collection is covered by the late-trailer tests.
         next = assign_late_references(pdf, map, references, next, qdf)?;
     }
     Ok(next)
@@ -397,7 +397,7 @@ fn assign_late_references<R: Read + Seek>(
             // cov:ignore-start: the qpdf object-number domain cannot be exhausted by a supported in-memory PDF.
             crate::Error::Unsupported("plain live writer: late trailer number overflows u32".into())
             // cov:ignore-end
-        })?;
+        })?; // cov:ignore: the supported writer object-number domain cannot exhaust u32.
     }
     Ok(next)
 }

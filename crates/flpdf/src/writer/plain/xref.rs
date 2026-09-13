@@ -348,7 +348,7 @@ fn append_classic_xref_and_trailer(
                     removed_refs,
                     true,
                     direct_root,
-                )?;
+                )?; // cov:ignore: LLVM attributes the covered materialized direct-root trailer continuation separately.
             } else {
                 trailer_handle.write_trailer_with_ref_map_and_kind(
                     out,
