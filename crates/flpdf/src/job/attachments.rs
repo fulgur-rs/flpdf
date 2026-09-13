@@ -415,8 +415,8 @@ impl QPDFJob {
     /// `QPDFJob::doListAttachments` owns the output and warning lifecycle,
     /// while `QPDFEmbeddedFileDocumentHelper` and the FileSpec/EF helpers own
     /// name-tree traversal and metadata projection. The existing
-    /// [`format_attachment_list_with_sink`] implementation remains the one
-    /// attachment traversal route.
+    /// The internal `format_attachment_list_with_sink` implementation remains
+    /// the one attachment traversal route.
     pub fn list_attachments<R: Read + Seek>(
         &mut self,
         pdf: &mut Pdf<R>,

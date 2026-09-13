@@ -101,7 +101,7 @@ type WidgetPageMap = HashMap<ObjectHandleIdentity, (ObjectHandle, ObjectRef)>;
 ///
 /// - Any error propagated from canonical ObjectHandle resolution.
 /// - [`crate::Error::Unsupported`] when the field-tree depth limit is exceeded.
-pub fn prune_acroform_after_subset<R: Read + Seek>(
+pub(crate) fn prune_acroform_after_subset<R: Read + Seek>(
     pdf: &mut Pdf<R>,
     result: &RebuildResult,
 ) -> Result<()> {
@@ -116,7 +116,7 @@ pub fn prune_acroform_after_subset<R: Read + Seek>(
 /// - Any error propagated from canonical ObjectHandle resolution.
 /// - [`crate::Error::Unsupported`] when the field-tree depth limit is exceeded.
 #[allow(clippy::mutable_key_type)]
-pub fn prune_acroform_after_subset_with_max_depth<R: Read + Seek>(
+pub(crate) fn prune_acroform_after_subset_with_max_depth<R: Read + Seek>(
     pdf: &mut Pdf<R>,
     result: &RebuildResult,
     max_depth: usize,

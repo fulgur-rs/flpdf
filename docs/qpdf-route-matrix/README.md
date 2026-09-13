@@ -33,17 +33,17 @@ container-above-max だった — `flpdf-hi08` / PR #1486）。本表は残る m
 
 | canonical | bridge | mixed | unknown | 合計 |
 |---|---|---|---|---|
-| 95 | 4 | 61 | 0 | 160 |
+| 97 | 2 | 61 | 0 | 160 |
 
 ### checker logical aggregate（259 rows）
 
 `scripts/check-qpdf-route-matrix.py --check` は、A〜E の160行に加えて
 E の qtest exception 表（物理98行を論理99ケースとして数える）を含む259 logical
-rowsを検証する。2026-09-13 の現行 `origin/main` (`f08ecba2e`) での集計は次のとおり。
+rowsを検証する。2026-09-13 の現行 `origin/main` (`f9e94c26d`) での集計は次のとおり。
 
 | canonical | bridge | mixed | unknown | 合計 |
 |---|---|---|---|---|
-| 119 | 12 | 128 | 0 | 259 |
+| 121 | 10 | 128 | 0 | 259 |
 
 したがって、160行の領域別表と259 logical rowsの checker 分母は異なる。どちらも
 parity 完了数ではなく、責務／経路の分類数である。
@@ -430,8 +430,7 @@ crates/flpdf-cli/src/main.rs::write_with_pdf_writer: prod 8 (1 files) / test 0
 crates/flpdf/src/job/attachment_list.rs::format_attachment_list_with_sink: prod 1 (1 files) / test 0
     crates/flpdf/src/job/attachments.rs 1
 crates/flpdf/src/job/attachment_list.rs::AttachmentInfo: prod 0 (0 files) / test 0
-crates/flpdf/src/job/json.rs::write_json: prod 10 (3 files) / test 19
-    crates/flpdf/src/document_json.rs 6, crates/flpdf/src/object_handle.rs 3, crates/flpdf-qtest-tools/src/driver/test_88_98.rs 1
+job/json.rs free `write_json` / `write_json_with_version`: removed by `flpdf-xsq1`; tests now use the canonical `QPDFJob::write_json` method
 crates/flpdf/src/job/acroform_field_prune.rs::prune_acroform_after_subset: prod 2 (1 files) / test 17
     crates/flpdf/src/job/page_specs.rs 2
 crates/flpdf/src/reader.rs::Pdf::qtest_object_value_source_offsets: prod 0 (0 files) / test 0
@@ -519,11 +518,11 @@ crates/flpdf/src/job/lifecycle.rs::QPDFJob::open: prod 63 (28 files) / test 1283
 | D30 | `write_qpdf_to_memory` | 0 | 旧2 | CLIローカルの同名関数に衝突する。現値は§6.2 | test-only helperはcanonical scaffolding。production callerはreceiver/pathで確認する |
 | D29 | `qpdf_preserve_source_objstm` | 1 | 1 | reachable な §6.2 snapshot では PR #1486 merge 後の `crates/flpdf/src/writer.rs:3919,3997` を含む | tracker（行の caller 数と tracker の leaf 数が一致） |
 | E-5 | `split_pages` | 2 | 23 | leaf が `QPDFJob::split_pages` メソッドと `configuration.split_pages` フィールド（`crates/flpdf/src/job/lifecycle.rs:191`）に衝突 | 行（leaf が曖昧）。tracker の 23 は分母としてのみ読む |
-| E-9 | `format_attachment_list_with_sink` | 0 | 1 | `.43` で buffer-returning wrapperを削除した後も、`QPDFJob::list_attachments` から logger sink として 1 箇所だけ呼ばれる | tracker |
+| E-9 | `format_attachment_list_with_sink` | 1 | 0 | `QPDFJob::list_attachments` から logger sink として 1 箇所だけ呼ばれる。`flpdf-xsq1` で `pub(crate)` 化し、public re-export を撤去した | tracker |
 | E-9 | `list_attachments` | 1 | 11 | leaf が `QPDFJob::list_attachments` の直接呼び出しに加えて、同名の configuration field なども拾う。`.43` の test/example 移行後は直接呼び出しが `attachments.rs`、`attachment_list.rs`、`pull_attachments.rs` に増えた | tracker（leaf が曖昧） |
 | E-12 | `optimize_images` | 6 | 23 | 同上（`crates/flpdf-cli/src/main.rs` 19 件 = `flpdf::optimize_images` の 6 呼び出し + `--optimize-images` の引数処理、`crates/flpdf/src/job/lifecycle.rs` 4 件 = configuration フィールド） | 行（leaf が曖昧） |
 | E-19 | `complete` / `has_warnings` | 13 / 8 | 22 / 12 | 行は `QPDFJob::complete()` / `QPDFJob::has_warnings()` の **呼び出しだけ**を数え、型位置・フィールド参照・同名の別項目を含めていない | tracker（分母として。`QPDFJob` メソッドの呼び出し数だけが要るときは行の数を使う） |
-| E-24 | `write_json` | 0（free 関数） | 10 | leaf が `crates/flpdf/src/document_json.rs` の同名関数（6 件、加えて `crates/flpdf-qtest-tools/src/driver/test_88_98.rs:342` からの同関数呼び出し 1 件）と `crates/flpdf/src/object_handle.rs` の 3 件にも衝突（計 10） | 行（leaf が曖昧）。free `write_json` 自身の prod caller は 0 のまま |
+| E-24 | free job/json writers | 0（free declarations removed） | 0 | `flpdf-xsq1` で integration test callers を `QPDFJob::write_json` に移行し、job/json.rs の free entrypoints と re-export を撤去 | tracker |
 | E-14 / E-15 | `parse_rotation_parameter` / `parse_numrange` | 3 / 3 | — | rotation consumer sliceではqpdf parserとsigned `QUtil::parse_numrange`を共有化。旧`RotateSpec::parse`のPageRange AST依存は削除したが、CLI適用ownerと他PageRange consumerは後続issueに残るため行全体はmixed | 行 |
 
 領域 D は他の 4 領域より tracker との乖離が多い。原因は §8 X-6 に書いたとおり、D ファイルが
@@ -877,7 +876,7 @@ A14 を完了した。D27 の後続 cutover も完了し、D27 と独立に進�
 | 位置づけ | 内容 | issue ID |
 |---|---|---|
 | 完了（hygiene、ゼロリスク） | §6.4 (a-i) の prod 0 かつ test 0 だったC19/C28/E-27のdead route 4 symbolを削除し、`crates/flpdf/src/encryption/keys.rs` の `#![allow(dead_code)]` を外した。ゲートは各 leaf の `--expect-zero` | `flpdf-3yn9.42` |
-| 完了（hygiene、test 移行あり） | §6.4 (a-ii) の C23/E-9 test-only route を canonical `PdfWriter`/`QPDFJob::list_attachments` 経由へ移して削除。`AttachmentInfo` と `format_attachment_list_with_sink` の可視性判断は `flpdf-xsq1` に残す | `flpdf-3yn9.43` |
+| 完了（hygiene、test 移行あり） | §6.4 (a-ii) の C23/E-9 test-only route を canonical `PdfWriter`/`QPDFJob::list_attachments` 経由へ移して削除。`flpdf-xsq1` の第1 slice で `format_attachment_list_with_sink` の内部化、AcroForm free helper の内部化、job/json free writer の撤去も完了。`AttachmentInfo` の public type 判断と CLI callers は残る | `flpdf-3yn9.43` / `flpdf-xsq1` |
 | 本体 | 最初の bounded cutover（§7.3）。D27 の pre-write sweep 撤去 | `flpdf-3yn9.44` |
 | 完了（D27 の multi-source follow-up） | `sweep_unreachable_objects_except` とその module を撤去。D3/D11 の採番差が残るため、`--preserve-unreferenced` multi-source `--pages` は object 数・内容 control で検証し、byte gate は採番統合後に行う。A14 の着手条件を満たす | `flpdf-3yn9.45`（`flpdf-3yn9.44` に依存） |
 | 完了 | A14 `Pdf::delete_object` の撤去と `replaceObject(og, newNull())` への cutover。§7.2.1 の 4 | `flpdf-3yn9.46`（`flpdf-3yn9.45` に依存） |

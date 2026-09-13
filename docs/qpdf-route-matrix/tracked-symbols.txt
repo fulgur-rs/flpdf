@@ -49,7 +49,7 @@
 #   write                       D1 + D26
 #   write_qpdf                  E-3 + E-4
 #   write_qpdf_to_memory        D30（writer.rs, test-only）+ E-4（flpdf-cli の同名別関数）
-#   write_json_with_version     E-6（QPDFJob メソッド）+ E-24（free 関数）
+#   write_json_with_version     E-6（QPDFJob メソッド）。E-24 free 関数は flpdf-xsq1 で撤去
 #   finish_file_object_handle   B9 + B10
 #   append_xref_and_trailer     D12 + D13
 #   prune_acroform_after_subset E-26（free 関数と QPDFJob メソッドが同名）
@@ -213,8 +213,7 @@ crates/flpdf/src/writer/plain/plan.rs::retain_reachable_object_stream_members   
 crates/flpdf-cli/src/main.rs::write_with_pdf_writer                      # E-4 CLI 直書き出し
 crates/flpdf/src/job/attachment_list.rs::format_attachment_list_with_sink # E-9
 crates/flpdf/src/job/attachment_list.rs::AttachmentInfo                  # E-9
-crates/flpdf/src/job/json.rs::write_json                                 # E-24 free pub, prod caller 0
-crates/flpdf/src/job/acroform_field_prune.rs::prune_acroform_after_subset # E-26（free+method 合流）
+crates/flpdf/src/job/acroform_field_prune.rs::prune_acroform_after_subset # E-26（pub(crate) free implementation + method owner）
 
 # --- (b) baseline denominator ---
 crates/flpdf/src/job/lifecycle.rs::QPDFJob::run                          # E-1（曖昧 leaf）

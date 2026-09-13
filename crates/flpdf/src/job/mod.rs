@@ -36,11 +36,8 @@ mod resource_pruning;
 mod rotate;
 mod rotate_spec;
 
-pub use acroform_field_prune::{
-    prune_acroform_after_subset, prune_acroform_after_subset_with_max_depth,
-    DEFAULT_MAX_ACROFORM_DEPTH,
-};
-pub use attachment_list::{format_attachment_list_with_sink, AttachmentInfo};
+pub use acroform_field_prune::DEFAULT_MAX_ACROFORM_DEPTH;
+pub use attachment_list::AttachmentInfo;
 #[allow(deprecated)]
 pub use attachments::{
     add_attachment_from_path, ascii_filename_fallback, extract_attachment,
@@ -51,7 +48,7 @@ pub use attachments::{
 pub(crate) use check::check_bytes_for_test;
 pub use check::CheckError;
 pub use image_optimization::{optimize_images, ImageOptimizationOptions};
-pub use json::{write_json, JsonJobError, JsonJobOptions, JsonJobOutput, JsonStreamData};
+pub use json::{JsonJobError, JsonJobOptions, JsonJobOutput, JsonStreamData};
 pub(crate) use json_sections::checksum_to_hex;
 pub use lifecycle::{FlattenAnnotationsMode, JobDocument, JobExitCode, QPDFJob, QPDFJobConfig};
 pub use outline_dest_remap::{remap_outline_and_dests, remap_outline_and_dests_with_max_depth};
