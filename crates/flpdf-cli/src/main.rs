@@ -1124,14 +1124,13 @@ struct Cli {
     /// --remove-restrictions`; qpdf `--remove-restrictions` equivalent).
     /// Combine with `--decrypt` to strip encryption too. Does NOT bypass
     /// authentication.
-    // qpdf applies this create-stage mutation before `doInspection`, so
-    // `--check --remove-restrictions` is routed through the combined Job
-    // inspection boundary. Other standalone inspection combinations remain
+    // qpdf applies this create-stage mutation before `doInspection`, so the
+    // supported inspection combinations are routed through the combined Job
+    // inspection boundary. Other standalone inspection conflicts remain
     // bounded by their existing conflict tables.
     #[arg(long = "remove-restrictions",
           conflicts_with_all = [
               "show_object",
-              "show_npages", "show_pages", "show_xref", "show_linearization",
               "show_encryption",
           ])]
     remove_restrictions: bool,
@@ -1294,16 +1293,15 @@ struct Cli {
     /// `--coalesce-contents` equivalent). Requires a full rewrite of the
     /// document. It may be combined with `--linearize`; qpdf applies this
     /// create-stage transformation before constructing its linearized writer.
-    /// It remains rejected against inspection and attachment modes. Top-level
-    /// page-operation routes apply it through the QPDFJob transformation
-    /// boundary, and rewrite page-operation routes use the same post-selection
-    /// transformation owner.
+    /// The bounded inspection combinations tracked by flpdf-ca9zm are routed
+    /// through the combined QPDFJob transformation boundary; other standalone
+    /// inspection conflicts remain explicit until their own consumer scope is
+    /// audited.
     #[arg(long = "coalesce-contents",
           conflicts_with_all = [
               "show_object",
-              "show_npages", "show_pages", "show_xref", "show_linearization",
               "show_encryption",
-              "list_attachments", "show_attachment", "remove_attachment",
+              "show_attachment", "remove_attachment",
               "add_attachment", "copy_attachments_from",
           ])]
     coalesce_contents: bool,
@@ -1324,7 +1322,6 @@ struct Cli {
         overrides_with = "flatten_annotations",
         conflicts_with_all = [
             "show_object",
-            "show_npages", "show_pages", "show_xref", "show_linearization",
             "show_encryption",
         ],
         help = "Flatten annotations into page content; MODE is all, screen, or print",
