@@ -1289,8 +1289,9 @@ impl<R: Read + Seek> ResolverHandle<R> {
     ) -> Result<ObjectHandle> {
         let mut handles = ChildHandles {
             resolver: self,
-            description_template: format!("parsed object, {object_description} at offset $PO")
-                .into_bytes(),
+            description_template: Rc::new(
+                format!("parsed object, {object_description} at offset $PO").into_bytes(),
+            ),
         };
         let parsed = parse_object_handle_with_context(input, &mut handles)?;
         for diagnostic in &parsed.diagnostics {
@@ -2624,11 +2625,11 @@ impl<R: Read + Seek> ResolverHandle<R> {
             let member_start = i64::try_from(diagnostic_start)
                 .map_err(|_| Error::parse(0, "object stream member offset is too large"))?;
             let description_template =
-                self.object_stream_description_template(stream_number, object_ref);
+                Rc::new(self.object_stream_description_template(stream_number, object_ref));
             self.set_last_object_description(object_ref, None)?;
             let mut handles = ChildHandles {
                 resolver: self,
-                description_template: description_template.clone(),
+                description_template: Rc::clone(&description_template),
             };
             let (value, parsed_offset, diagnostics) =
                 match parse_qpdf_direct_object_handle_with_diagnostics(
@@ -2670,10 +2671,7 @@ impl<R: Read + Seek> ResolverHandle<R> {
                 member_handle.set_parsed_offset_if_unset(parsed_offset);
                 member_handle.set_end_offsets(stream_end_before_space, stream_end_after_space);
                 if parsed_offset >= 0 && !member_handle.is_null() {
-                    member_handle.set_description(
-                        self.object_stream_description_template(stream_number, object_ref),
-                        parsed_offset,
-                    );
+                    member_handle.set_shared_description(description_template, parsed_offset);
                 }
             }
         }
@@ -3620,11 +3618,11 @@ impl<R: Read + Seek> ResolverHandle<R> {
             let found = found_raw.to_object_ref();
             let mut minter = ChildHandles {
                 resolver: self,
-                description_template: match read_description.as_deref() {
+                description_template: Rc::new(match read_description.as_deref() {
                     Some(description) => self
                         .parser_description_template_for_read_qpdf_obj_gen(found_raw, description),
                     None => self.parser_description_template_qpdf_obj_gen(found_raw),
-                },
+                }),
             };
             let encryption_parameters = self.encryption_parameters();
             // qpdf reads and caches the `/Encrypt` dictionary before it marks
@@ -3758,7 +3756,7 @@ impl<R: Read + Seek> ResolverHandle<R> {
         let description = parsed
             .value
             .description_template()
-            .unwrap_or_else(|| parsed.value.description());
+            .unwrap_or_else(|| Rc::new(parsed.value.description()));
         let (value, parsed_offset) = parsed.value.into_direct_value().expect(
             "live file parser's top-level bare-reference recovery always returns a direct value",
         );
@@ -3826,7 +3824,7 @@ impl<R: Read + Seek> ResolverHandle<R> {
                 value,
                 malformed,
                 parsed_offset,
-                description,
+                description: description.as_ref().clone(),
                 end_before_space,
                 end_after_space,
                 trailing_start,
@@ -3877,7 +3875,7 @@ impl<R: Read + Seek> ResolverHandle<R> {
         &self,
         dict: ObjectValue,
         dict_offset: i64,
-        dict_description: Vec<u8>,
+        dict_description: Rc<Vec<u8>>,
         object_header_offset: u64,
         object_gen: QpdfObjGen,
         read_description: Option<&[u8]>,
@@ -3970,7 +3968,7 @@ impl<R: Read + Seek> ResolverHandle<R> {
             // dictionary untouched (`QPDF_Stream.cc:299-312`). The parser's
             // dictionary description was rendered before the value was
             // unwrapped, so restore that metadata on the rewrapped handle.
-            dict.set_description(dict_description, dict_offset);
+            dict.set_shared_description(dict_description, dict_offset);
         }
         Ok((
             ObjectValue::Stream(Box::new(StreamValue {
@@ -4984,7 +4982,7 @@ fn stream_copy_dictionary_value(dictionary: &ObjectHandle, key: &[u8]) -> Result
 /// this hands back is unresolved.
 struct ChildHandles<'a, R: Read + Seek + 'static> {
     resolver: &'a ResolverHandle<R>,
-    description_template: Vec<u8>,
+    description_template: Rc<Vec<u8>>,
 }
 
 impl<R: Read + Seek> crate::parser::HandleResolver for ChildHandles<'_, R> {
@@ -4996,8 +4994,8 @@ impl<R: Read + Seek> crate::parser::HandleResolver for ChildHandles<'_, R> {
         self.resolver.parsed_direct_object_handle(value)
     }
 
-    fn description_template(&self) -> Option<Vec<u8>> {
-        Some(self.description_template.clone())
+    fn description_template(&self) -> Option<Rc<Vec<u8>>> {
+        Some(Rc::clone(&self.description_template))
     }
 
     fn begin_parse(&self) -> Result<()> {
@@ -5627,7 +5625,7 @@ mod tests {
         let resolver = bare_resolver();
         let handles = ChildHandles {
             resolver: &resolver,
-            description_template: Vec::new(),
+            description_template: Rc::new(Vec::new()),
         };
 
         crate::parser::HandleResolver::begin_parse(&handles).expect("guard begins clear");

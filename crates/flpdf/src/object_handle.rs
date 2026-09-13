@@ -1112,10 +1112,11 @@ pub(crate) struct JsonDescription {
 /// qpdf's `QPDFValue::Description`, whose `std::string` payload is an
 /// arbitrary byte sequence rather than a UTF-8 contract.
 pub(crate) enum ObjectDescription {
-    Template(Vec<u8>),
+    /// qpdf's parser owns one shared Description per parse call; keep only an
+    /// Rc handle in each value rather than copying the template bytes.
+    Template(Rc<Vec<u8>>),
     /// Keep the larger qpdf description shapes out of every common value
-    /// allocation without adding a wrapper allocation to the usual template
-    /// description installed by the parser.
+    /// allocation by boxing their independent payloads.
     Json(Box<JsonDescription>),
     Child(Box<ChildDescription>),
 }
@@ -1456,9 +1457,9 @@ struct SharedValueState {
     identity: ValueIdentity,
     parsed_offset: i64,
     /// qpdf keeps `Description` behind an optional shared pointer
-    /// (`libqpdf/qpdf/QPDFValue.hh:58-82,141-144`). The template form already
-    /// owns its byte buffer, so it stays inline; the larger JSON and child
-    /// forms are boxed to keep their shapes out of every value allocation.
+    /// (`libqpdf/qpdf/QPDFValue.hh:58-82,141-144`). The parser template keeps
+    /// its payload in one Rc allocation per parse call; JSON and child forms
+    /// remain boxed to keep their larger shapes out of every value allocation.
     description: Option<ObjectDescription>,
     state_owners: StateOwners,
 }
@@ -1480,7 +1481,7 @@ impl SharedValueState {
         if let Some(desc) = &self.description {
             match desc {
                 ObjectDescription::Template(tmpl) => expand_description_template(
-                    tmpl,
+                    tmpl.as_slice(),
                     self.object_ref(),
                     &self.value,
                     self.parsed_offset,
@@ -3154,13 +3155,18 @@ impl ObjectHandle {
     /// than the rendered [`Self::description`]: a caller's escaped literal
     /// `$PO`/`$OG` would otherwise become parser-owned placeholders again on
     /// the next render.
-    pub(crate) fn description_template(&self) -> Option<Vec<u8>> {
+    pub(crate) fn description_template(&self) -> Option<Rc<Vec<u8>>> {
         let shared = self.0.borrow().shared.clone();
         let description = match shared.borrow().description.as_ref() {
-            Some(ObjectDescription::Template(template)) => Some(template.clone()),
+            Some(ObjectDescription::Template(template)) => Some(Rc::clone(template)),
             Some(ObjectDescription::Json(_) | ObjectDescription::Child(_)) | None => None,
         };
         description
+    }
+
+    #[cfg(test)]
+    fn description_template_owner(&self) -> Option<Rc<Vec<u8>>> {
+        self.description_template()
     }
 
     /// Attach a qpdf document and explicit description to this shared object
@@ -3190,14 +3196,20 @@ impl ObjectHandle {
         let mut shared = shared.borrow_mut();
         shared.identity.resolver = Some(resolver);
         shared.identity.active_pdf_unique_id = NonZeroU64::new(pdf.unique_id);
-        shared.description = Some(ObjectDescription::Template(description.as_ref().to_vec()));
+        shared.description = Some(ObjectDescription::Template(Rc::new(
+            description.as_ref().to_vec(),
+        )));
         Ok(())
     }
 
     pub(crate) fn set_description(&self, description: impl AsRef<[u8]>, offset: i64) {
+        self.set_shared_description(Rc::new(description.as_ref().to_vec()), offset);
+    }
+
+    pub(crate) fn set_shared_description(&self, template: Rc<Vec<u8>>, offset: i64) {
         let shared = self.0.borrow().shared.clone();
         let mut shared = shared.borrow_mut();
-        shared.description = Some(ObjectDescription::Template(description.as_ref().to_vec()));
+        shared.description = Some(ObjectDescription::Template(template));
         // Set-once, matching qpdf's `setParsedOffset` guard that
         // `QPDFValue::setDescription` calls through
         // (`libqpdf/qpdf/QPDFValue.hh:60-65,90-100`). `QPDF_Stream::setDescription`
@@ -20027,6 +20039,41 @@ pub(crate) mod warning_emission_tests {
                 "object 3 0: operation for dictionary attempted on object of type integer: treating as empty",
                 "object 3 0: operation for array attempted on object of type integer: treating as empty",
             ]
+        );
+    }
+
+    #[test]
+    fn parser_values_share_one_description_template_owner() {
+        let parsed =
+            ObjectHandle::parse_with_description(b"[1 [2] << /K 3 >>]", "shared template").unwrap();
+        let scalar = parsed.try_get_array_item(0).unwrap();
+        let nested_scalar = parsed
+            .try_get_array_item(1)
+            .unwrap()
+            .try_get_array_item(0)
+            .unwrap();
+        let dictionary_value = parsed
+            .try_get_array_item(2)
+            .unwrap()
+            .try_get_key(b"/K")
+            .unwrap();
+
+        let first = scalar.description_template_owner().unwrap();
+        let second = nested_scalar.description_template_owner().unwrap();
+        let third = dictionary_value.description_template_owner().unwrap();
+        assert!(Rc::ptr_eq(&first, &second));
+        assert!(Rc::ptr_eq(&first, &third));
+        assert_eq!(
+            scalar.description(),
+            b"parsed object, shared template at offset 1"
+        );
+        assert_eq!(
+            nested_scalar.description(),
+            b"parsed object, shared template at offset 4"
+        );
+        assert_eq!(
+            dictionary_value.description(),
+            b"parsed object, shared template at offset 13"
         );
     }
 
