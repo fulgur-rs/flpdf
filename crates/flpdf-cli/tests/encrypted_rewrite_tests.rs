@@ -513,31 +513,254 @@ fn decrypt_conflicts_with_inspection_subcommands() {
         .stderr(predicates::str::contains("cannot be used"));
 }
 
-/// `--decrypt` combined with the page-ops pipeline (`--pages` / `--rotate` /
-/// `--split-pages` / `--collate`) must be rejected upfront, mirroring the
-/// existing `--remove-restrictions` rejection. The page-ops pipeline does not
-/// thread the rewrite-only flags, and on encrypted input it rejects the file
-/// outright — so silently passing through `--decrypt` would leave the user
-/// guessing whether decryption actually happened.
+/// `--decrypt` is applied at qpdf's writer boundary after page selection and
+/// page operations. The rewrite page-operation surface must therefore keep it
+/// through the pages/rotate/split routes instead of rejecting or dropping it.
 #[test]
-fn decrypt_is_rejected_when_combined_with_page_operations() {
-    let input = Path::new(env!("CARGO_MANIFEST_DIR")).join(UNENCRYPTED_FIXTURE);
-    let tmp = tempfile::tempdir().unwrap();
-    let output = tmp.path().join("decrypt-pages.pdf");
+fn decrypt_is_applied_to_rewrite_page_operations() {
+    if !ensure_qpdf_or_skip() {
+        return;
+    }
 
-    Command::cargo_bin("flpdf")
+    let input = Path::new(env!("CARGO_MANIFEST_DIR"))
+        .join("../../tests/fixtures/compat/encrypted-r4-three-page.pdf");
+    let input = input.to_str().unwrap().to_owned();
+    for (label, operation, page_selection, split) in [
+        ("pages", Vec::<String>::new(), true, false),
+        ("rotate", vec!["--rotate=+90".to_owned()], false, false),
+        ("split", vec!["--split-pages=1".to_owned()], false, true),
+    ] {
+        let tmp = tempfile::tempdir().unwrap();
+        let qpdf_output = tmp.path().join("q-output.pdf");
+        let flpdf_output = tmp.path().join("f-output.pdf");
+        let mut qpdf_args = vec![
+            "--qdf".to_owned(),
+            "--static-id".to_owned(),
+            "--no-original-object-ids".to_owned(),
+            "--stream-data=uncompress".to_owned(),
+            "--decrypt".to_owned(),
+            "--password=".to_owned(),
+        ];
+        qpdf_args.extend(operation.iter().cloned());
+        qpdf_args.push(input.clone());
+        if page_selection {
+            qpdf_args.extend([
+                "--pages".to_owned(),
+                input.clone(),
+                "1-2".to_owned(),
+                "--".to_owned(),
+            ]);
+        }
+        qpdf_args.push(qpdf_output.to_str().unwrap().to_owned());
+
+        let mut flpdf_args = vec![
+            "rewrite".to_owned(),
+            "--qdf".to_owned(),
+            "--static-id".to_owned(),
+            "--no-original-object-ids".to_owned(),
+            "--stream-data=uncompress".to_owned(),
+            "--decrypt".to_owned(),
+            "--password=".to_owned(),
+        ];
+        flpdf_args.extend(operation);
+        flpdf_args.push(input.clone());
+        flpdf_args.push(flpdf_output.to_str().unwrap().to_owned());
+        if page_selection {
+            flpdf_args.extend([
+                "--pages".to_owned(),
+                input.clone(),
+                "1-2".to_owned(),
+                "--".to_owned(),
+            ]);
+        }
+
+        let qpdf = ShellCommand::new("qpdf").args(&qpdf_args).output().unwrap();
+        let flpdf = Command::cargo_bin("flpdf")
+            .unwrap()
+            .env("FLPDF_STATIC_ID_QUIET", "1")
+            .args(&flpdf_args)
+            .output()
+            .unwrap();
+        assert_eq!(
+            flpdf.status.code(),
+            qpdf.status.code(),
+            "{label}: exit status differs: qpdf={} flpdf={}",
+            String::from_utf8_lossy(&qpdf.stderr),
+            String::from_utf8_lossy(&flpdf.stderr)
+        );
+        assert_eq!(flpdf.stdout, qpdf.stdout, "{label}: stdout differs");
+        assert_eq!(flpdf.stderr, qpdf.stderr, "{label}: stderr differs");
+        assert!(qpdf.status.success(), "qpdf {label} failed");
+
+        if split {
+            for page in 1..=3 {
+                let qpdf_chunk = qpdf_output.with_file_name(format!("q-output-{page}.pdf"));
+                let flpdf_chunk = flpdf_output.with_file_name(format!("f-output-{page}.pdf"));
+                assert!(qpdf_chunk.is_file(), "qpdf {label} chunk {page} must exist");
+                assert!(
+                    flpdf_chunk.is_file(),
+                    "flpdf {label} chunk {page} must exist"
+                );
+                assert_eq!(
+                    std::fs::read(&flpdf_chunk).unwrap(),
+                    std::fs::read(&qpdf_chunk).unwrap(),
+                    "{label} chunk {page} differs"
+                );
+            }
+        } else {
+            assert_eq!(
+                std::fs::read(&flpdf_output).unwrap(),
+                std::fs::read(&qpdf_output).unwrap(),
+                "{label} output differs"
+            );
+        }
+    }
+}
+
+#[test]
+fn copy_encryption_is_applied_to_rewrite_page_selection() {
+    if !ensure_qpdf_or_skip() {
+        return;
+    }
+
+    let input =
+        Path::new(env!("CARGO_MANIFEST_DIR")).join("../../tests/fixtures/compat/three-page.pdf");
+    let donor = encrypted_fixture("v4-aes-128-r4.pdf");
+    let tmp = tempfile::tempdir().unwrap();
+    let qpdf_output = tmp.path().join("qpdf-copied-encryption.pdf");
+    let flpdf_output = tmp.path().join("flpdf-copied-encryption.pdf");
+    let common = [
+        "--static-id".to_owned(),
+        format!("--copy-encryption={}", donor.display()),
+        "--encryption-file-password=user-v4-aes".to_owned(),
+    ];
+    let input = input.to_str().unwrap().to_owned();
+    let mut qpdf_args = common.to_vec();
+    qpdf_args.extend([
+        input.clone(),
+        "--pages".to_owned(),
+        input.clone(),
+        "1-2".to_owned(),
+        "--".to_owned(),
+        qpdf_output.to_str().unwrap().to_owned(),
+    ]);
+    let mut flpdf_args = vec!["rewrite".to_owned()];
+    flpdf_args.extend(common);
+    flpdf_args.extend([
+        input.clone(),
+        flpdf_output.to_str().unwrap().to_owned(),
+        "--pages".to_owned(),
+        input,
+        "1-2".to_owned(),
+        "--".to_owned(),
+    ]);
+
+    let qpdf = ShellCommand::new("qpdf").args(&qpdf_args).output().unwrap();
+    let flpdf = Command::cargo_bin("flpdf")
         .unwrap()
-        .args(["rewrite", "--decrypt", "--pages", ".", "1-z", "--"])
-        .arg(&input)
-        .arg(&output)
-        .assert()
-        .failure()
-        .stderr(predicates::str::contains("--decrypt"))
-        .stderr(predicates::str::contains("are not applied in the --pages"));
-    assert!(
-        !output.exists(),
-        "no output must be produced when the unsupported combination is rejected"
+        .env("FLPDF_STATIC_ID_QUIET", "1")
+        .args(&flpdf_args)
+        .output()
+        .unwrap();
+    assert_eq!(
+        flpdf.status.code(),
+        qpdf.status.code(),
+        "copy encryption status"
     );
+    assert_eq!(flpdf.stdout, qpdf.stdout, "copy encryption stdout");
+    assert_eq!(flpdf.stderr, qpdf.stderr, "copy encryption stderr");
+    assert!(
+        qpdf.status.success(),
+        "qpdf copy-encryption page selection failed"
+    );
+
+    let qpdf_bytes = std::fs::read(&qpdf_output).unwrap();
+    let flpdf_bytes = std::fs::read(&flpdf_output).unwrap();
+    assert!(qpdf_bytes
+        .windows(b"/Encrypt".len())
+        .any(|w| w == b"/Encrypt"));
+    assert!(flpdf_bytes
+        .windows(b"/Encrypt".len())
+        .any(|w| w == b"/Encrypt"));
+    assert_eq!(
+        qpdf_objects_json(&qpdf_output, "user-v4-aes", false),
+        qpdf_objects_json(&flpdf_output, "user-v4-aes", false),
+        "rewrite page selection copy-encryption objects must match qpdf"
+    );
+}
+
+#[test]
+fn copy_encryption_is_applied_to_rewrite_rotate_and_split() {
+    if !ensure_qpdf_or_skip() {
+        return;
+    }
+
+    let input =
+        Path::new(env!("CARGO_MANIFEST_DIR")).join("../../tests/fixtures/compat/three-page.pdf");
+    let donor = encrypted_fixture("v4-aes-128-r4.pdf");
+    let input = input.to_str().unwrap().to_owned();
+    let common = [
+        "--static-id".to_owned(),
+        format!("--copy-encryption={}", donor.display()),
+        "--encryption-file-password=user-v4-aes".to_owned(),
+    ];
+
+    for (label, operation, split) in [
+        ("rotate", "--rotate=+90", false),
+        ("split", "--split-pages=1", true),
+    ] {
+        let tmp = tempfile::tempdir().unwrap();
+        let qpdf_output = tmp.path().join("q-output.pdf");
+        let flpdf_output = tmp.path().join("f-output.pdf");
+        let mut qpdf_args = common.to_vec();
+        qpdf_args.extend([
+            operation.to_owned(),
+            input.clone(),
+            qpdf_output.to_str().unwrap().to_owned(),
+        ]);
+        let mut flpdf_args = vec!["rewrite".to_owned()];
+        flpdf_args.extend(common.iter().cloned());
+        flpdf_args.extend([
+            operation.to_owned(),
+            input.clone(),
+            flpdf_output.to_str().unwrap().to_owned(),
+        ]);
+
+        let qpdf = ShellCommand::new("qpdf").args(&qpdf_args).output().unwrap();
+        let flpdf = Command::cargo_bin("flpdf")
+            .unwrap()
+            .env("FLPDF_STATIC_ID_QUIET", "1")
+            .args(&flpdf_args)
+            .output()
+            .unwrap();
+        assert_eq!(flpdf.status.code(), qpdf.status.code(), "{label}: status");
+        assert_eq!(flpdf.stdout, qpdf.stdout, "{label}: stdout");
+        assert_eq!(flpdf.stderr, qpdf.stderr, "{label}: stderr");
+        assert!(qpdf.status.success(), "qpdf {label} failed");
+
+        if split {
+            for page in 1..=3 {
+                let qpdf_chunk = qpdf_output.with_file_name(format!("q-output-{page}.pdf"));
+                let flpdf_chunk = flpdf_output.with_file_name(format!("f-output-{page}.pdf"));
+                assert!(qpdf_chunk.is_file(), "qpdf {label} chunk {page} must exist");
+                assert!(
+                    flpdf_chunk.is_file(),
+                    "flpdf {label} chunk {page} must exist"
+                );
+                assert_eq!(
+                    qpdf_objects_json(&flpdf_chunk, "user-v4-aes", false),
+                    qpdf_objects_json(&qpdf_chunk, "user-v4-aes", false),
+                    "{label} chunk {page} objects differ"
+                );
+            }
+        } else {
+            assert_eq!(
+                qpdf_objects_json(&flpdf_output, "user-v4-aes", false),
+                qpdf_objects_json(&qpdf_output, "user-v4-aes", false),
+                "{label} objects differ"
+            );
+        }
+    }
 }
 
 fn ensure_qpdf_or_skip() -> bool {

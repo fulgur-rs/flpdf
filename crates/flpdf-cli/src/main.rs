@@ -4822,14 +4822,6 @@ fn run_command(command: Commands, overlay_specs: &[OverlaySpec]) -> CliResult<()
                 // --coalesce-contents is handled separately below: it is a
                 // page transformation with the same post-selection owner as
                 // generate-appearances and flatten-annotations.
-                //
-                // --decrypt is rejected for the same reason: the page-ops
-                // pipeline already rejects encrypted inputs (so a useful
-                // --decrypt + page-ops combination is impossible), and on
-                // plaintext input --decrypt is a silent no-op anyway —
-                // rejecting upfront surfaces the unsupported combination
-                // instead of leaving the user wondering whether decryption
-                // happened.
                 // --optimize-images and --externalize-inline-images are NOT in
                 // this list: unlike the other
                 // rewrite-only mutation passes above, the page-operation
@@ -4837,16 +4829,8 @@ fn run_command(command: Commands, overlay_specs: &[OverlaySpec]) -> CliResult<()
                 // run_rewrite_with_page_ops) already accept and apply it via
                 // `image_transform_options`, mirroring
                 // the top-level --pages/--rotate/--split-pages routes.
-                if cmd.decrypt || cmd.copy_encryption.is_some() {
-                    emit_logger_error(
-                        "flpdf: --decrypt / \
-                         --copy-encryption are \
-                         not applied in the --pages/--rotate/--split-pages/\
-                         --collate pipeline; rerun without them or without \
-                         the page operation\n",
-                    );
-                    std::process::exit(1);
-                }
+                // --copy-encryption is carried in WriterOptions and applied
+                // by the final writer for each page-operation output.
                 // The decorate path (--rotate/--split-pages without --pages)
                 // does not thread remove_unreferenced_resources; an explicit
                 // Yes/No would be silently dropped, so reject it. Auto (the
@@ -4877,6 +4861,7 @@ fn run_command(command: Commands, overlay_specs: &[OverlaySpec]) -> CliResult<()
                         overlay_specs,
                         remove_unref,
                         cmd.remove_restrictions,
+                        cmd.decrypt,
                         options,
                         cmd.linearize,
                         None,
@@ -4900,6 +4885,7 @@ fn run_command(command: Commands, overlay_specs: &[OverlaySpec]) -> CliResult<()
                         overlay_specs,
                         remove_unref,
                         cmd.remove_restrictions,
+                        cmd.decrypt,
                         options,
                         cmd.linearize,
                         None,
@@ -4922,6 +4908,7 @@ fn run_command(command: Commands, overlay_specs: &[OverlaySpec]) -> CliResult<()
                         &cmd.page_ops,
                         remove_unref,
                         cmd.remove_restrictions,
+                        cmd.decrypt,
                         options,
                         cmd.linearize,
                         None,
@@ -7359,6 +7346,7 @@ fn run_page_extraction(
     overlay_specs: &[OverlaySpec],
     remove_unref: CliRemoveUnreferencedResources,
     remove_restrictions: bool,
+    decrypt: bool,
     options: WriterOptions,
     linearize: bool,
     linearize_pass1: Option<&Path>,
@@ -7468,6 +7456,7 @@ fn run_page_extraction(
                 overlay_specs,
                 remove_unref,
                 remove_restrictions,
+                decrypt,
                 options,
                 linearize,
                 linearize_pass1,
@@ -7492,6 +7481,7 @@ fn run_page_extraction(
                 overlay_specs,
                 remove_unref,
                 remove_restrictions,
+                decrypt,
                 options,
                 linearize,
                 linearize_pass1,
@@ -7523,6 +7513,7 @@ fn run_page_extraction(
             overlay_specs,
             remove_unref,
             remove_restrictions,
+            decrypt,
             options,
             linearize,
             linearize_pass1,
@@ -7549,6 +7540,7 @@ fn run_page_extraction(
         overlay_specs,
         remove_unref,
         remove_restrictions,
+        decrypt,
         options,
         linearize,
         linearize_pass1,
@@ -7582,6 +7574,7 @@ fn run_empty_page_extraction(
     overlay_specs: &[OverlaySpec],
     remove_unref: CliRemoveUnreferencedResources,
     remove_restrictions: bool,
+    decrypt: bool,
     options: WriterOptions,
     linearize: bool,
     linearize_pass1: Option<&Path>,
@@ -7700,6 +7693,7 @@ fn run_empty_page_extraction(
         overlay_specs,
         remove_unref,
         remove_restrictions,
+        decrypt,
         options,
         linearize,
         linearize_pass1,
@@ -7738,6 +7732,7 @@ fn run_page_extraction_from_multiple_sources(
     overlay_specs: &[OverlaySpec],
     remove_unref: CliRemoveUnreferencedResources,
     remove_restrictions: bool,
+    decrypt: bool,
     options: WriterOptions,
     linearize: bool,
     linearize_pass1: Option<&Path>,
@@ -7891,6 +7886,7 @@ fn run_page_extraction_from_multiple_sources(
         // no-op for resource pruning.
         remove_unref,
         remove_restrictions,
+        decrypt,
         options,
         linearize,
         linearize_pass1,
@@ -7922,6 +7918,7 @@ fn run_page_extraction_from_single_source<R: Read + Seek + 'static>(
     overlay_specs: &[OverlaySpec],
     remove_unref: CliRemoveUnreferencedResources,
     remove_restrictions: bool,
+    decrypt: bool,
     options: WriterOptions,
     linearize: bool,
     linearize_pass1: Option<&Path>,
@@ -7995,6 +7992,7 @@ fn run_page_extraction_from_single_source<R: Read + Seek + 'static>(
                 overlay_specs,
                 remove_unref,
                 remove_restrictions,
+                decrypt,
                 options,
                 linearize,
                 linearize_pass1,
@@ -8045,6 +8043,7 @@ fn run_page_extraction_from_single_source<R: Read + Seek + 'static>(
                 // a no-op for resource pruning.
                 remove_unref,
                 remove_restrictions,
+                decrypt,
                 options,
                 linearize,
                 linearize_pass1,
@@ -8078,6 +8077,7 @@ fn run_page_extraction_after_plan<R: Read + Seek + 'static>(
     overlay_specs: &[OverlaySpec],
     remove_unref: CliRemoveUnreferencedResources,
     remove_restrictions: bool,
+    decrypt: bool,
     options: WriterOptions,
     linearize: bool,
     linearize_pass1: Option<&Path>,
@@ -8130,13 +8130,16 @@ fn run_page_extraction_after_plan<R: Read + Seek + 'static>(
         .map(parse_split_n)
         .transpose()?;
     let split_pages_active = split_pages.is_some_and(|size| size > 0);
-    options.preserve_encryption = primary_encrypted && !split_pages_active;
+    options.preserve_encryption = primary_encrypted && !split_pages_active && !decrypt;
     // qpdf keeps the authenticated primary input as the output/base document
     // for `--pages` (libqpdf/QPDFJob.cc:2360-2633). The multi-source job has
     // already copied selected pages into a fresh plaintext Pdf, so its writer
     // cannot rediscover the primary's encryption from the merged document.
     // Carry the authenticated donor explicitly to the final writer; split
     // chunks remain cleartext, matching qpdf's fresh chunk writers. Gate on
+    // the decrypt flag as well: qpdf clears encryption preservation at this
+    // same writer boundary when the output is explicitly decrypted
+    // (QPDFJob.cc:2847-2877).
     // the same conditions as `PdfWriter::prepared_write_options`'s implicit
     // `can_preserve` (`writer.rs:645-652`) so an explicit source
     // doesn't bypass qpdf's QDF-is-always-cleartext contract
@@ -8391,6 +8394,7 @@ fn run_rewrite_with_page_ops(
     page_ops: &PageOpArgs,
     remove_unref: CliRemoveUnreferencedResources,
     remove_restrictions: bool,
+    decrypt: bool,
     options: WriterOptions,
     linearize: bool,
     linearize_pass1: Option<&Path>,
@@ -8425,7 +8429,7 @@ fn run_rewrite_with_page_ops(
         linearize,
         linearize_pass1,
         remove_restrictions,
-        false,
+        decrypt,
         options.content_normalization,
         coalesce_contents,
         generate_appearances,
