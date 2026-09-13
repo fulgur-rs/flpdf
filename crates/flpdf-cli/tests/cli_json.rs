@@ -1686,10 +1686,11 @@ fn json_flag_conflicts_with_compress_streams() {
 }
 
 /// `--json-output` dispatches through the same `run_json` boundary as
-/// `--json`. Every rewrite or inspection flag that the latter rejects must be
-/// rejected here too; otherwise the second flag is silently dropped before
-/// its consumer can run. Keep this table aligned with `Cli::json`'s
-/// `conflicts_with_all` list, including the later-added encryption checks.
+/// `--json`. Every exclusive rewrite or inspection flag that the latter
+/// rejects must be rejected here too; create-stage transformations are
+/// intentionally absent because `run_json` applies them before serialization.
+/// Keep this table aligned with `Cli::json`'s `conflicts_with_all` list,
+/// including the later-added encryption checks.
 #[test]
 fn json_output_conflicts_with_the_json_exclusive_flag_set() {
     let cases: &[&[&str]] = &[
@@ -1720,7 +1721,6 @@ fn json_output_conflicts_with_the_json_exclusive_flag_set() {
         &["--no-original-object-ids"],
         &["--qdf"],
         &["--coalesce-contents"],
-        &["--flatten-annotations=all"],
         &["--preserve-unreferenced"],
     ];
 
@@ -1871,6 +1871,125 @@ fn one_page_pdf_with_unsupported_stream(content: &[u8]) -> Vec<u8> {
         format!("trailer\n<< /Size 5 /Root 1 0 R >>\nstartxref\n{xref_start}\n%%EOF\n").as_bytes(),
     );
     pdf
+}
+
+fn assert_json_transform_stdout_matches_qpdf(transform: &str, fixture_name: &str) {
+    if skip_unless_qpdf_11_9() {
+        return;
+    }
+
+    let fixture = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+        .join("../../tests/fixtures/compat")
+        .join(fixture_name);
+    let args = [transform, "--json=2", "--json-key=qpdf"];
+    let qpdf = ShellCommand::new("qpdf")
+        .args(args)
+        .arg(&fixture)
+        .output()
+        .unwrap();
+    let flpdf = Command::cargo_bin("flpdf")
+        .unwrap()
+        .args(args)
+        .arg(&fixture)
+        .output()
+        .unwrap();
+
+    assert!(
+        qpdf.status.success(),
+        "qpdf 11.9.0 failed for {transform}: {}",
+        String::from_utf8_lossy(&qpdf.stderr)
+    );
+    assert_eq!(flpdf.status.code(), qpdf.status.code(), "{transform}");
+    assert_eq!(flpdf.stdout, qpdf.stdout, "{transform} stdout");
+    assert_eq!(flpdf.stderr, qpdf.stderr, "{transform} stderr");
+}
+
+fn normalize_json_newlines(bytes: &[u8]) -> Vec<u8> {
+    let mut normalized = Vec::with_capacity(bytes.len());
+    let mut remaining = bytes;
+    while let Some((&byte, rest)) = remaining.split_first() {
+        if byte == b'\r' && rest.first() == Some(&b'\n') {
+            normalized.push(b'\n');
+            remaining = &rest[1..];
+        } else {
+            normalized.push(byte);
+            remaining = rest;
+        }
+    }
+    normalized
+}
+
+fn assert_json_transform_file_matches_qpdf(transform: &str, fixture_name: &str) {
+    if skip_unless_qpdf_11_9() {
+        return;
+    }
+
+    let temp = tempfile::tempdir().unwrap();
+    let fixture = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+        .join("../../tests/fixtures/compat")
+        .join(fixture_name);
+    let input = temp.path().join("input.pdf");
+    let qpdf_output = temp.path().join("qpdf.json");
+    let flpdf_output = temp.path().join("flpdf.json");
+    std::fs::copy(fixture, &input).unwrap();
+    let args = [transform, "--json-output=2"];
+
+    let qpdf = ShellCommand::new("qpdf")
+        .args(args)
+        .arg(&input)
+        .arg(&qpdf_output)
+        .output()
+        .unwrap();
+    let flpdf = Command::cargo_bin("flpdf")
+        .unwrap()
+        .args(args)
+        .arg(&input)
+        .arg(&flpdf_output)
+        .output()
+        .unwrap();
+
+    assert!(
+        qpdf.status.success(),
+        "qpdf 11.9.0 failed for {transform}: {}",
+        String::from_utf8_lossy(&qpdf.stderr)
+    );
+    assert_eq!(flpdf.status.code(), qpdf.status.code(), "{transform}");
+    assert_eq!(flpdf.stdout, qpdf.stdout, "{transform} stdout");
+    assert_eq!(flpdf.stderr, qpdf.stderr, "{transform} stderr");
+    assert_eq!(
+        normalize_json_newlines(&std::fs::read(&flpdf_output).unwrap()),
+        normalize_json_newlines(&std::fs::read(&qpdf_output).unwrap()),
+        "{transform} JSON output"
+    );
+}
+
+#[test]
+fn json_transformations_apply_before_stdout_serialization() {
+    assert_json_transform_stdout_matches_qpdf(
+        "--flatten-rotation",
+        "inherited-rotate-one-page.pdf",
+    );
+    assert_json_transform_stdout_matches_qpdf(
+        "--generate-appearances",
+        "form-fields-and-annotations.pdf",
+    );
+    assert_json_transform_stdout_matches_qpdf(
+        "--flatten-annotations=all",
+        "form-fields-and-annotations.pdf",
+    );
+}
+
+#[test]
+fn json_output_transformations_apply_before_file_serialization() {
+    assert_json_transform_file_matches_qpdf("--flatten-rotation", "inherited-rotate-one-page.pdf");
+    assert_json_transform_file_matches_qpdf(
+        "--generate-appearances",
+        "form-fields-and-annotations.pdf",
+    );
+    assert_json_transform_file_matches_qpdf(
+        "--flatten-annotations=all",
+        "form-fields-and-annotations.pdf",
+    );
 }
 
 fn assert_stream_json_is_qpdf_exact(pdf: &[u8], stream_mode: &str) {

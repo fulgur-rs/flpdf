@@ -6571,20 +6571,6 @@ fn top_level_generate_appearances_conflicts_with_split_pages() {
 }
 
 #[test]
-fn top_level_generate_appearances_conflicts_with_json_output() {
-    // Without this conflict, `--generate-appearances --json-output=2 in`
-    // would exit 0 while run_json dumps the unmodified input, silently
-    // dropping the requested appearance generation (same class of bug
-    // documented on `--flatten-annotations` above).
-    Command::cargo_bin("flpdf")
-        .unwrap()
-        .args(["--generate-appearances", "--json-output=2", "in.pdf"])
-        .assert()
-        .failure()
-        .code(2);
-}
-
-#[test]
 fn top_level_coalesce_contents_with_overlay_underlay_trailing_position() {
     // The exact shape qtest form-xobject uo-3 emits (via the PATH-shim
     // qpdf→flpdf): --coalesce-contents at the very end of argv, after
@@ -9842,31 +9828,6 @@ fn rewrite_flatten_annotations_all_removes_widget_from_annots() {
         "flattened widget should be removed from /Annots, found {} annotation(s)",
         annots.len()
     );
-}
-
-/// `--json-output` has no dispatch check of its own the way `--json` does
-/// (main's dispatch chain routes to `run_json` for either flag before any
-/// rewrite path that consumes `flatten_annotations`), so without this
-/// conflict `--flatten-annotations=all --json-output=2 IN OUT` would exit 0
-/// and silently write a JSON dump of the unmodified input while dropping the
-/// requested transformation entirely.
-#[test]
-fn top_level_flatten_annotations_rejects_json_output() {
-    let temp = tempfile::tempdir().unwrap();
-    let input = temp.path().join("form.pdf");
-    let output = temp.path().join("out.pdf");
-    std::fs::write(&input, tx_form_pdf_with_ap()).unwrap();
-
-    Command::cargo_bin("flpdf")
-        .unwrap()
-        .args(["--flatten-annotations=all", "--json-output=2"])
-        .arg(&input)
-        .arg(&output)
-        .assert()
-        .failure()
-        .stderr(predicate::str::contains(
-            "cannot be used with '--json-output",
-        ));
 }
 
 /// The qpdf-compatible top-level form must route the same flattening

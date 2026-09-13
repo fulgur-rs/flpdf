@@ -1260,6 +1260,7 @@ impl<R: Read + Seek> Pdf<R> {
     /// Delegate allocation to qpdf's canonical object cache. The resolver
     /// prepares dangling references and selects the next generation-zero
     /// identity from the same map used by every other document operation.
+    #[cfg(test)]
     pub(crate) fn next_available_object_ref(&self) -> Result<ObjectRef> {
         self.resolver.next_obj_gen()
     }
