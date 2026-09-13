@@ -1193,6 +1193,10 @@ enum ContainmentParents {
     #[default]
     Empty,
     One(Weak<RefCell<ObjectSlot>>),
+    // The box keeps Vec's three-word header out of every ObjectSlot. This
+    // flpdf-only alias state is deliberately rare; the common zero/one-parent
+    // cases never allocate this collection.
+    #[allow(clippy::box_collection)]
     Many(Box<Vec<Weak<RefCell<ObjectSlot>>>>),
 }
 
