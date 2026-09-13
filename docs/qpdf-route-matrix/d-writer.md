@@ -630,8 +630,10 @@ body mapだけを xref serializerへ渡していたため、progress callback �
 `/F` に追加した indirect child が map から欠落した。`emit_specialized_standard_live_with_page_context`
 も plain/PCLm と同じ `/Root` 前後の late map、direct `/Root` の動的 child mapを使う
 ようにし、body object や xref rowを後付けせず qpdf の trailer-time numberだけを
-割り当てる。AES-128・Disable・0% callback の RED→GREEN 回帰を
-`writer_object_emission_tests.rs` に追加した。これは specialized の bounded D14
+割り当てる。xref-stream routeでは qpdf が `writeTrailer` 前に xref-stream object
+自身の番号を予約するため、late mapの開始点もその予約の後へ進める。AES-128・
+Disable/Generate・0% callback の RED→GREEN 回帰を `writer_object_emission_tests.rs`
+に追加した。これは specialized の bounded D14
 修正であり、legacy/planned/linearized の writeTrailer ownerや route matrix 全体の
 mixed/bridge 解消を意味しない。
 

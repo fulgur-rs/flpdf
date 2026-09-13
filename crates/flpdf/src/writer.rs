@@ -5662,9 +5662,24 @@ fn emit_specialized_standard_live_with_page_context<R: Read + Seek + 'static, W:
         Error::Unsupported("specialized live writer: late trailer number overflows u32".to_string())
         // cov:ignore-end
     })?; // cov:ignore: checked body-derived late-trailer allocation cannot overflow a supported output
-         // The encryption dictionary is writer-owned and is emitted after the live
-         // body queue, exactly as qpdf's `writeStandard` does. Add its physical
-         // location before the xref layer computes `/Size` and the xref stream row.
+    // A standard xref-stream write reserves its own object number before it
+    // serializes the trailer (`QPDFWriter.cc:3023-3030`).  Trailer-time
+    // references must start after that reservation; a classic xref table does
+    // not consume an object number.
+    let initial_late_trailer_number = if matches!(effective_xref_form, XrefForm::Stream) {
+        initial_late_trailer_number.checked_add(1).ok_or_else(|| {
+            // cov:ignore-start: a supported output cannot exhaust the u32 object-number space.
+            Error::Unsupported(
+                "specialized live writer: late trailer number overflows u32".to_string(),
+            )
+            // cov:ignore-end
+        })? // cov:ignore: xref-stream reservation cannot overflow for a supported body
+    } else {
+        initial_late_trailer_number
+    };
+    // The encryption dictionary is writer-owned and is emitted after the live
+    // body queue, exactly as qpdf's `writeStandard` does. Add its physical
+    // location before the xref layer computes `/Size` and the xref stream row.
     if let Some(ctx) = encrypt_ctx.as_ref() {
         let offset = body.bytes.len();
         body.bytes
