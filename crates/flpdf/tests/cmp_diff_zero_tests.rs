@@ -600,6 +600,35 @@ fn preserve_with_no_source_object_streams_matches_disable_byte_for_byte() {
 #[test]
 fn preserve_no_source_objstm_xref_stream_matches_qpdf_11_9() {
     let fixture = "preserve-no-source-objstm-xref.pdf";
+    let fixture_path = Path::new(env!("CARGO_MANIFEST_DIR"))
+        .join("../../tests/fixtures/compat")
+        .join(fixture);
+
+    // Pin what makes this fixture the regression case: a source cross-reference
+    // *stream* carrying no type-2 rows. Without this, swapping the file for any
+    // classic-xref document would leave every assertion below green and quietly
+    // remove the source-xref-form coverage this test claims.
+    let source = std::fs::read(&fixture_path).expect("fixture is readable");
+    assert!(
+        source
+            .windows(b"/Type /XRef".len())
+            .any(|window| window == b"/Type /XRef"),
+        "the fixture must carry its cross-reference data in an xref stream"
+    );
+    assert!(
+        !source
+            .windows(b"\nxref\n0 ".len())
+            .any(|window| window == b"\nxref\n0 "),
+        "the fixture must not also carry a classic cross-reference table"
+    );
+    let source_pdf = Pdf::open(std::io::Cursor::new(source)).expect("fixture opens");
+    assert!(
+        source_pdf
+            .get_xref_table()
+            .values()
+            .all(|entry| !matches!(entry, XrefEntry::Compressed { .. })),
+        "the fixture must have no type-2 rows, or it is no longer the empty-membership case"
+    );
 
     // The local mode and output-form assertions do not need the oracle, so
     // they run everywhere. Only the byte comparison against qpdf is gated;
@@ -632,14 +661,11 @@ fn preserve_no_source_objstm_xref_stream_matches_qpdf_11_9() {
         eprintln!("[SKIP cmp_diff_zero_tests] qpdf 11.9.0 is unavailable for the byte comparison");
         return;
     };
-    let input = Path::new(env!("CARGO_MANIFEST_DIR"))
-        .join("../../tests/fixtures/compat")
-        .join(fixture);
     let directory = tempfile::tempdir().expect("tempdir");
     let expected_path = directory.path().join("qpdf.pdf");
     let status = std::process::Command::new(oracle)
         .args(["--static-id", "--object-streams=preserve"])
-        .arg(&input)
+        .arg(&fixture_path)
         .arg(&expected_path)
         .status()
         .expect("qpdf runs");
