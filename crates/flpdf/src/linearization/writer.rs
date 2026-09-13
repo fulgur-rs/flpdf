@@ -769,7 +769,7 @@ fn write_repeated_bytes(out: &mut OutputSink<'_>, byte: u8, mut count: usize) ->
     }
     if count != 0 {
         out.write_bytes(&chunk[..count])?;
-    }
+    } // cov:ignore: LLVM attributes this covered partial-padding branch to the write line
     Ok(())
 }
 
@@ -4651,7 +4651,7 @@ mod tests {
         let trailer = ObjectHandle::dictionary(vec![(
             b"/ID".to_vec(),
             ObjectHandle::array(vec![
-                ObjectHandle::string(vec![0; 16]),
+                ObjectHandle::new_indirect_unresolved(ObjectRef::new(8, 0), -1),
                 ObjectHandle::string(vec![1; 16]),
             ]),
         )]);
@@ -4664,9 +4664,7 @@ mod tests {
             3,
             0,
             &trailer,
-            &|_| {
-                unreachable!("direct trailer ID has no indirect references") // cov:ignore: direct trailer ID has no indirect references
-            },
+            &|object_ref| Ok(object_ref),
             &BTreeSet::new(),
             None,
         )
