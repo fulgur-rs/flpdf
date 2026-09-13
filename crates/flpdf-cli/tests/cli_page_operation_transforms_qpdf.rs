@@ -75,6 +75,36 @@ fn assemble_pdf(objects: &[&[u8]]) -> Vec<u8> {
     bytes
 }
 
+fn signed_page_operation_fixture() -> Vec<u8> {
+    assemble_pdf(&[
+        br#"1 0 obj
+<< /Type /Catalog /Pages 2 0 R /AcroForm 4 0 R >>
+endobj
+"#,
+        br#"2 0 obj
+<< /Type /Pages /Count 1 /Kids [3 0 R] >>
+endobj
+"#,
+        br#"3 0 obj
+<< /Type /Page /Parent 2 0 R /MediaBox [0 0 612 792] >>
+endobj
+"#,
+        br#"4 0 obj
+<< /Fields [5 0 R] /SigFlags 3 >>
+endobj
+"#,
+        br#"5 0 obj
+<< /FT /Sig /T (Approval) /V 6 0 R /Rect [0 0 0 0] >>
+endobj
+"#,
+        br#"6 0 obj
+<< /Type /Sig /Filter /Adobe.PPKLite /SubFilter /adbe.pkcs7.detached
+   /ByteRange [0 10 20 30] /Contents <00> >>
+endobj
+"#,
+    ])
+}
+
 /// Two-page input with both non-no-op transformations:
 /// - the generate case has a `/NeedAppearances` Tx widget with no `/AP`;
 /// - the flatten case has an existing widget `/AP` and a Link `/AP`.
@@ -402,6 +432,126 @@ fn rewrite_page_operations_apply_appearance_and_flatten_transformations_like_qpd
             "qpdf {label} page operation should succeed"
         );
         assert_pdf_outputs_match(&qpdf_output, &flpdf_output, false, label);
+    }
+}
+
+#[test]
+fn rewrite_page_selection_remove_restrictions_matches_qpdf() {
+    if !qpdf_available() {
+        if std::env::var_os("CI").is_some() {
+            panic!("{EXPECTED_QPDF_VERSION} is required for this parity test on CI");
+        }
+        eprintln!("skipping: {EXPECTED_QPDF_VERSION} is not available");
+        return;
+    }
+
+    let tempdir = tempfile::tempdir().unwrap();
+    let input_path = tempdir.path().join("signed.pdf");
+    let qpdf_output = tempdir.path().join("q-output.pdf");
+    let flpdf_output = tempdir.path().join("f-output.pdf");
+    std::fs::write(&input_path, signed_page_operation_fixture()).unwrap();
+    let input = input_path.to_str().unwrap();
+
+    let qpdf_args = vec![
+        "--qdf".to_owned(),
+        "--static-id".to_owned(),
+        "--no-original-object-ids".to_owned(),
+        "--remove-restrictions".to_owned(),
+        input.to_owned(),
+        "--pages".to_owned(),
+        input.to_owned(),
+        "1".to_owned(),
+        "--".to_owned(),
+        qpdf_output.to_str().unwrap().to_owned(),
+    ];
+    let flpdf_args = vec![
+        "rewrite".to_owned(),
+        "--qdf".to_owned(),
+        "--static-id".to_owned(),
+        "--no-original-object-ids".to_owned(),
+        "--remove-restrictions".to_owned(),
+        input.to_owned(),
+        flpdf_output.to_str().unwrap().to_owned(),
+        "--pages".to_owned(),
+        input.to_owned(),
+        "1".to_owned(),
+        "--".to_owned(),
+    ];
+    let qpdf = run_qpdf(&qpdf_args);
+    let flpdf = run_flpdf_quiet(&flpdf_args);
+    assert_process_matches(&qpdf, &flpdf, "rewrite --pages --remove-restrictions");
+    assert!(
+        qpdf.status.success(),
+        "qpdf rewrite page selection should succeed"
+    );
+    assert_pdf_outputs_match(
+        &qpdf_output,
+        &flpdf_output,
+        false,
+        "rewrite --pages --remove-restrictions",
+    );
+}
+
+#[test]
+fn rewrite_rotate_and_split_remove_restrictions_match_qpdf() {
+    if !qpdf_available() {
+        if std::env::var_os("CI").is_some() {
+            panic!("{EXPECTED_QPDF_VERSION} is required for this parity test on CI");
+        }
+        eprintln!("skipping: {EXPECTED_QPDF_VERSION} is not available");
+        return;
+    }
+
+    for (label, operation, split) in [
+        ("rotate", "--rotate=+90", false),
+        ("split", "--split-pages=1", true),
+    ] {
+        let tempdir = tempfile::tempdir().unwrap();
+        let input_path = tempdir.path().join("signed.pdf");
+        let qpdf_output = tempdir.path().join("q-output.pdf");
+        let flpdf_output = tempdir.path().join("f-output.pdf");
+        std::fs::write(&input_path, signed_page_operation_fixture()).unwrap();
+        let input = input_path.to_str().unwrap();
+        let qpdf_args = vec![
+            "--qdf".to_owned(),
+            "--static-id".to_owned(),
+            "--no-original-object-ids".to_owned(),
+            "--remove-restrictions".to_owned(),
+            operation.to_owned(),
+            input.to_owned(),
+            qpdf_output.to_str().unwrap().to_owned(),
+        ];
+        let flpdf_args = vec![
+            "rewrite".to_owned(),
+            "--qdf".to_owned(),
+            "--static-id".to_owned(),
+            "--no-original-object-ids".to_owned(),
+            "--remove-restrictions".to_owned(),
+            operation.to_owned(),
+            input.to_owned(),
+            flpdf_output.to_str().unwrap().to_owned(),
+        ];
+        let qpdf = run_qpdf(&qpdf_args);
+        let flpdf = run_flpdf_quiet(&flpdf_args);
+        assert_process_matches(&qpdf, &flpdf, label);
+        assert!(qpdf.status.success(), "qpdf {label} should succeed");
+        if split {
+            let qpdf_chunk = qpdf_output.with_file_name("q-output-1.pdf");
+            let flpdf_chunk = flpdf_output.with_file_name("f-output-1.pdf");
+            assert!(qpdf_chunk.is_file(), "qpdf {label} output must exist");
+            assert!(flpdf_chunk.is_file(), "flpdf {label} output must exist");
+            assert_eq!(
+                std::fs::read(&flpdf_chunk).unwrap(),
+                std::fs::read(&qpdf_chunk).unwrap(),
+                "rewrite {label} output must match qpdf"
+            );
+        } else {
+            assert_eq!(
+                std::fs::read(&flpdf_output).unwrap(),
+                std::fs::read(&qpdf_output).unwrap(),
+                "rewrite {label} output must match qpdf"
+            );
+        }
     }
 }
 
