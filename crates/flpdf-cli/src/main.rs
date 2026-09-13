@@ -8117,12 +8117,6 @@ fn run_page_extraction_after_plan<R: Read + Seek + 'static>(
     QPDFJob::complete_in_place_page_selection(pdf, &result, prune_mode)?;
     apply_rotate_specs(pdf, &page_ops.rotate, &result.new_kids)?;
 
-    // qpdf runs image externalization/optimization after page selection and
-    // before the final writer (`QPDFJob.cc:2151-2174`). Keep the same order so
-    // selected pages, including copied pages from secondary sources, are the
-    // only images considered by this job.
-    apply_image_transformations(pdf, image_options, verbose)?;
-
     let mut options = options;
     let split_pages = page_ops
         .split_pages
@@ -8190,6 +8184,12 @@ fn run_page_extraction_after_plan<R: Read + Seek + 'static>(
     } else {
         None
     };
+
+    // qpdf runs image externalization/optimization after page selection,
+    // rotation, and underlay/overlay (`QPDFJob.cc:2151-2174`). Keeping this
+    // after the overlay block makes images introduced by a copied overlay
+    // page visible to the same transformation pass.
+    apply_image_transformations(pdf, image_options, verbose)?;
 
     // The page-selection consumer has already completed qpdf's page copy,
     // rotation, and underlay/overlay phases. Run every remaining

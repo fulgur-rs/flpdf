@@ -189,3 +189,72 @@ fn direct_rewrite_overlay_images_match_qpdf_after_externalization() {
         "qpdf-zlib-compat overlay image rewrite must be byte-identical"
     );
 }
+
+#[test]
+fn rewrite_page_selection_overlay_images_match_qpdf_after_externalization() {
+    if !qpdf_available() {
+        return;
+    }
+    let directory = tempfile::tempdir().expect("temporary directory");
+    let primary = directory.path().join("primary.pdf");
+    let overlay = directory.path().join("overlay.pdf");
+    let flpdf_output = directory.path().join("flpdf-output.pdf");
+    let qpdf_output = directory.path().join("qpdf-output.pdf");
+    let input = inline_image_pdf(200, 200);
+    fs::write(&primary, &input).expect("write primary");
+    fs::write(&overlay, &input).expect("write overlay");
+
+    let qpdf = ProcessCommand::new("/usr/bin/qpdf")
+        .args([
+            "--qdf",
+            "--no-original-object-ids",
+            "--static-id",
+            "--optimize-images",
+            "--ii-min-bytes=0",
+            "--overlay",
+        ])
+        .arg(&overlay)
+        .arg("--")
+        .arg(&primary)
+        .args(["--pages", ".", "1", "--"])
+        .arg(&qpdf_output)
+        .output()
+        .expect("run qpdf page-selection overlay image transformation");
+    assert!(qpdf.status.success(), "qpdf failed: {qpdf:?}");
+
+    let flpdf = Command::cargo_bin("flpdf")
+        .expect("flpdf binary")
+        .env("FLPDF_STATIC_ID_QUIET", "1")
+        .args([
+            "rewrite",
+            "--qdf",
+            "--no-original-object-ids",
+            "--static-id",
+            "--optimize-images",
+            "--ii-min-bytes=0",
+        ])
+        .arg(&primary)
+        .args(["--overlay"])
+        .arg(&overlay)
+        .arg("--")
+        .args(["--pages", ".", "1", "--"])
+        .arg(&flpdf_output)
+        .output()
+        .expect("run flpdf page-selection overlay image transformation");
+    assert_eq!(flpdf.status.code(), qpdf.status.code());
+    assert_eq!(flpdf.stdout, qpdf.stdout);
+    assert_eq!(flpdf.stderr, qpdf.stderr);
+    assert!(flpdf.status.success(), "flpdf failed: {flpdf:?}");
+    let qpdf_images = image_count(&qpdf_output);
+    let flpdf_images = image_count(&flpdf_output);
+    assert!(qpdf_images > 0, "probe must contain images");
+    assert_eq!(
+        flpdf_images, qpdf_images,
+        "page-selection overlay image traversal diverged"
+    );
+    assert_eq!(
+        fs::read(&flpdf_output).expect("read flpdf output"),
+        fs::read(&qpdf_output).expect("read qpdf output"),
+        "page-selection overlay image rewrite must be byte-identical"
+    );
+}
