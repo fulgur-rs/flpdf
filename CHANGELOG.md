@@ -232,6 +232,428 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.6.0](https://github.com/fulgur-rs/flpdf/compare/v0.5.1...v0.6.0) - 2026-09-13
+
+### Added
+
+- use live queue for specialized standard writer
+- *(job)* expose canonical collate configuration
+- *(job)* expose canonical empty input configuration
+- *(writer)* route Preserve with source ObjStm through the live queue
+- route ordinary rewrites through qpdf job
+- *(job)* add Config builder methods for attachment mutation
+- *(job)* add qpdf's argv grammar foundation to initialize_from_argv
+- *(cli)* route page-label transforms through QPDFJob
+- *(job)* port qpdf page-label argv config
+- *(job)* align qpdf create and write lifecycle
+- *(reader)* add qpdf warning drain boundary
+- *(pdf)* port QPDF::getExtensionLevel/getVersionAsPDFVersion (flpdf-wd2e)
+- *(json)* expose ObjectHandle write_json/get_json and implement test_98 (flpdf-wkju)
+- *(reader)* construct canonical document before classic trailer parse
+- *(writer)* share qpdf trailer emission contract
+- add structured qpdf exception primitive
+- port qpdf UTF-8 utility
+- port qpdf integer base formatting
+- port qpdf safe_fopen utility
+- port qpdf memory-file recovery lifecycle
+
+### Fixed
+
+- *(writer)* preserve compressible object count bound
+- *(writer)* consult live generations during eligibility
+- *(writer)* snapshot generate membership before preparation
+- *(writer)* encrypt live page containers
+- *(writer)* keep encrypted root discovery live
+- *(writer)* number late qdf trailer streams
+- satisfy live root serializer lint
+- align specialized live writer with qpdf edge cases
+- align specialized queue with qpdf write passes
+- *(linearize)* preserve UseOutlines shared page hints
+- preserve child context and live allocation accounting
+- *(inspection)* key recovered stream EOL by source offset
+- keep qpdf's dictionary error for an indirect null root
+- reframe qpdf integer overflow warnings
+- preserve qpdf recovery range errors
+- reframe resolver runtime parse failures
+- match qpdf object selector parsing
+- match qdf encrypted stream framing
+- keep the primary page source connected
+- mirror qpdf page source teardown boundary
+- report page-range allocation failures
+- preserve fresh fallback for merge ordering
+- preserve cross-section hint identifier order
+- preserve encrypted input in job JSON writes
+- match qpdf annotation stream allocation order
+- preserve annotation replay allocation provenance
+- order page merge writer keys by occurrence
+- match page label option table diagnostics
+- preserve page occurrence provenance
+- match qpdf inline image resource lookups
+- complete split-pages warning parity
+- keep attachment routes from discarding arguments and bytes
+- route attachment CLI through QPDFJob
+- align preserve linearized ObjStm emission order
+- start the foreign allocator at the primary maximum
+- preserve qpdf inspection combinations
+- keep qpdf root and pages classification at the walk entry
+- resolve signature fields null checks
+- preserve indirect acroform and null signature keys
+- start the classic table where qpdf starts it
+- end a trailer keyword at any delimiter
+- reject zero startxref before xref reads
+- align qpdf classic xref error diagnostics
+- use explicit stacks for deep page trees
+- preserve explicit job normalization
+- align show-object extraction parity
+- *(job)* label replace-input progress with its real destination
+- *(cli)* preserve qpdf write and file error boundaries
+- *(cli)* route top-level replace-input through QPDFJob
+- *(page)* keep the AcroForm /DR lookup lazy
+- *(job)* accept empty page selections and match qpdf's parity parsing
+- *(job)* align page-spec groups and ranges with qpdf
+- *(pages)* recurse inside the kids loop like qpdf
+- *(pages)* reuse qpdf cycle exception in splice
+- *(writer)* keep reserved and swapped objects in the live view
+- *(writer)* keep compressed members and the direct root in the live route
+- *(writer)* guard the container recursion and unify the xref gating
+- *(writer)* route Preserve-with-no-source-ObjStm through the live queue
+- keep the input version floor on the job, not the writer
+- *(cli)* restore the qpdf create/write boundary for ordinary rewrites
+- normalize job file errors like qpdf
+- deliver canonical xref warnings through live sink
+- *(job)* match qpdf's page-label error class and empty-spec guard
+- *(xref)* retain ObjStm members after stream warnings
+- *(resolver)* treat a post-reconstruction compressed entry as not found
+- *(xref)* keep the ObjStm source in the member description template
+- *(xref)* propagate ObjStm member descriptions
+- *(job)* stop duplicating diagnostics at the new write boundary
+- *(xref)* release the entry-table borrow before resolving a compressed object
+- *(xref)* raise EOF after endobj instead of inventing a bootstrap extent
+- *(annotation_object_helper)* close the A6/A7/A8 bridge in this file
+- *(page_object_helper)* close the shared attribute-walk's A6/A7 bridge
+- *(objecthandle)* migrate reader/resolver's own A7 bridge callers to try_* accessors
+- preserve recovered reused-generation catalog
+- *(xref)* skip the offset-0 retry for a canonical trailer owner
+- *(job)* drain warnings after the post-write steps, as qpdf does
+- *(stream)* route filterable() warnings through the parsed-offset owner
+- preserve qpdf warning object context
+- *(xref)* let the document own its repair warnings, and keep qpdf's terminal message
+- *(parser)* mark ContentHandleResolver::indirect_handle unreachable via cov:ignore block
+- *(writer)* route suppressed object-stream modes through the plain writer
+- *(writer)* keep XRef exclusion, ADBE arbitration and normalization context in QDF
+- *(pdf)* clamp the extension level through the canonical accessor
+- *(job)* move replace-input completion into write_qpdf (E-4/E-6/E-21)
+- *(reader)* keep a reconstruction that ran during the trailer parse
+- *(job)* copy source ObjStm containers instead of blank placeholders
+- *(job)* preserve primary ObjStm across page merges
+- *(writer)* exclude every writer-trimmed trailer key from live seeds
+- *(writer)* harden plain live-queue seed collection
+- *(writer)* connect plain disable to live queue
+- *(job)* map direct stdout reservation failures
+- *(content)* honor qpdf Form pipe false contract
+- *(job)* preserve auto password diagnostic order
+- *(reader)* preserve qpdf promotion and shared value identity
+- *(writer)* keep the writer-owned /Root out of source trailer filtering
+- *(writer)* return space_before_zero at the header newline
+- *(writer)* centralize classic xref table emission
+- *(linearization)* normalize extra header separator
+- *(check)* match qpdf parsing diagnostics
+- *(reader)* keep unnamed-input described stream warnings paren-free
+- *(reader)* preserve qpdf description after indirect length resolution
+- *(linearization)* reuse loaded hint data during show
+- *(overlay)* match qpdf QDF allocation order
+- *(acroform)* preserve qpdf stream warning descriptions
+- *(engine)* parse a processed memory file under the existing document identity
+- *(qutil)* match qpdf's stream and strerror rendering in the ported helpers
+- align test 61 with qpdf process and canonical types
+
+### Other
+
+- Merge pull request #1849 from fulgur-rs/refactor/flpdf-idd3-preserve-snapshot
+- Merge pull request #1848 from fulgur-rs/fix/flpdf-r96x-preserve-source-order
+- Merge pull request #1847 from fulgur-rs/refactor/flpdf-zv0i-source-objstm-owner
+- *(writer)* use canonical source ObjStm snapshot
+- *(reader)* share compressible walk with tests
+- *(writer)* expose generate extensions membership gap
+- *(writer)* mark legacy QDF continuation
+- *(writer)* finish root cutover coverage
+- *(writer)* pin root callback ordering
+- *(writer)* cover encrypted QDF edge paths
+- *(writer)* cover encrypted QDF streams
+- *(writer)* exercise legacy root child emission
+- *(writer)* cover legacy compact root emission
+- *(writer)* cover planned root serializer branches
+- *(writer)* lock root cutover and caller zero
+- *(writer)* remove legacy ADBE snapshot bridge
+- *(writer)* keep qdf coverage comment aligned
+- *(writer)* cover shared late trailer calls
+- *(writer)* close qdf patch coverage
+- *(writer)* cover qdf discovery boundaries
+- *(writer)* cover qdf late discovery edges
+- *(writer)* move qdf normalize into live queue
+- Merge pull request #1839 from fulgur-rs/refactor/flpdf-pclm-live
+- move PCLm emission to shared live writer
+- account for direct root coverage boundaries
+- keep dynamic helper out of production trait
+- cover remaining live serializer paths
+- cover specialized live emission boundaries
+- cover specialized live writer boundaries
+- cover dynamic encrypted emission
+- Merge pull request #1834 from fulgur-rs/fix/flpdf-f7a2
+- isolate shared-value allocation measurements by thread
+- cover reserved ObjectHandle debug state
+- assert measured ObjectHandle shapes
+- measure shared ObjectHandle value allocation
+- clarify shared disconnect visited identity
+- co-locate ObjectHandle auxiliary state
+- preserve ObjectHandle alias mutations in shared state
+- route ObjectHandle reads through shared value state
+- introduce shared ObjectHandle value state
+- pin shared ObjectHandle allocation budget
+- *(cli)* remove flpdf-only dump-object command
+- avoid snapshots in object shape predicates
+- record the containment reverse edge in the module doc
+- record containment edge qpdf deviation
+- remove direct value ownership history
+- normalize route contract source line endings
+- *(object)* remove final resolution facades
+- Merge pull request #1824 from fulgur-rs/chore/remove-show-stream
+- *(cli)* remove flpdf-only show-stream command
+- Merge pull request #1822 from fulgur-rs/feature/flpdf-3yn9-48-23-30
+- mark the show-stream passthrough-codec marker as a qpdf deviation
+- route inspection filter access through canonical handles
+- route struct tree drop passes through canonical handles
+- Merge pull request #1819 from fulgur-rs/feature/flpdf-3yn9-48-23-27
+- normalize rotation route source line endings
+- route page rotation through canonical handles
+- route overlay page through canonical handles
+- route annotation accessors through canonical handles
+- Merge pull request #1814 from fulgur-rs/feature/flpdf-j20m-specific-bugs
+- route PCLm planning through canonical handles
+- Merge pull request #1812 from fulgur-rs/feature/flpdf-gzyp
+- Merge pull request #1802 from fulgur-rs/feature/flpdf-5cp6
+- Merge pull request #1799 from fulgur-rs/feature/flpdf-an95-encryption-parameters
+- guard document-wide lazy resolution
+- satisfy linearization plan lint
+- Merge pull request #1793 from fulgur-rs/feature/flpdf-skim
+- record page-copy provenance without rescanning
+- Merge pull request #1783 from fulgur-rs/feature/flpdf-zu6l-merge-and-split
+- exclude unreachable page identity overflow
+- Merge remote-tracking branch 'origin/main' into feature/flpdf-zu6l-merge-and-split
+- route merge-and-split through QPDFJob
+- Merge pull request #1779 from fulgur-rs/feature/flpdf-25kg-64-split-pages
+- cover split resource parse warnings
+- Merge pull request #1777 from fulgur-rs/feature/flpdf-25kg-62-stream-line-terminators
+- Merge pull request #1776 from fulgur-rs/feature/flpdf-k4bp
+- Merge pull request #1775 from fulgur-rs/feature/flpdf-3yn9-48-81
+- cover preserve external stream files
+- Merge pull request #1770 from fulgur-rs/feature/flpdf-copy-annotations
+- Fix qpdf copy-annotations page replay parity
+- refactor page ranges through qpdf parser
+- refactor writer accessors through canonical handles
+- migrate linearization writer accessors to canonical handles
+- Merge pull request #1763 from fulgur-rs/feature/flpdf-3yn9-48-76-xref-errors
+- migrate rewrite renumber accessors to canonical handles
+- Merge pull request #1760 from fulgur-rs/feature/flpdf-v7vr
+- migrate FormField accessors to canonical handles
+- use canonical handles for appearance rendering
+- use canonical handles for page extraction mutations
+- migrate thread bead accessors to canonical handles
+- migrate outline remap to canonical handles
+- migrate AcroForm field prune to canonical handles
+- migrate optimization accessors to canonical handles
+- align linearization accessor consumers
+- Merge pull request #1749 from fulgur-rs/feature/flpdf-25kg-60-invalid-objects
+- cover null-valued resource entries and correct the parent-cursor note
+- migrate remaining job page resource JSON accessors
+- Merge pull request #1748 from fulgur-rs/feature/flpdf-hrgj
+- Merge pull request #1738 from fulgur-rs/feature/flpdf-25kg-58-check-show-xref
+- Merge pull request #1747 from fulgur-rs/feature/flpdf-3yn9-48-23-7
+- cover null-valued widget field entries
+- document llvm coverage branch joins
+- cover signature helper branches
+- cover acroform file bridge cutover
+- cut over acroform file bridges
+- Merge pull request #1745 from fulgur-rs/feature/flpdf-25qd
+- Merge pull request #1744 from fulgur-rs/feature/flpdf-k4tn
+- Merge pull request #1734 from fulgur-rs/feature/flpdf-25kg-54-error-condition-xref
+- cover the paths the new table offset reaches
+- describe the open errors this route actually returns
+- use byte strings in the delimiter test
+- cover the delimiter sets and the header rejection
+- avoid uncovered strict-open test branch
+- cover qpdf xref diagnostic boundaries
+- update qpdf-shaped recovery expectations
+- Merge pull request #1732 from fulgur-rs/feature/flpdf-shlk
+- Merge pull request #1730 from fulgur-rs/feature/flpdf-y88w
+- drop the CLI's dead PDF parameter too
+- remove dead PDF parameters from handle helpers
+- compare deep-tree check and json output with qpdf
+- attach live ResourceReplacer to appearance streams
+- *(route-matrix)* retire the dirty bridge from the live tables
+- *(object)* [**breaking**] remove dirty tracking bridge
+- cover stream inspection branches
+- *(overlay)* exclude the gate's mismatch report from patch coverage
+- *(overlay)* drop the stale cov:ignore on the DR-merge gate
+- *(overlay)* restore the copy-annotations byte gate
+- *(outline)* route helpers through canonical handles
+- *(page)* route final page-tree clear through handles
+- Merge pull request #1717 from fulgur-rs/feature/flpdf-3yn9-48-7-3
+- *(page)* route annotation flattening through canonical handles
+- Merge pull request #1716 from fulgur-rs/feature/flpdf-3yn9-48-23-2
+- Merge pull request #1715 from fulgur-rs/feature/flpdf-25kg-51
+- Merge pull request #1710 from fulgur-rs/feature/flpdf-lxmn
+- Merge pull request #1712 from fulgur-rs/feature/flpdf-e72g
+- Merge pull request #1709 from fulgur-rs/feature/flpdf-rn4k
+- *(qtest)* walk all objects in the tokenizer runner
+- *(reader)* [**breaking**] remove facade object cache after canonical cutover
+- Merge pull request #1707 from fulgur-rs/feature/flpdf-gd1q
+- Merge pull request #1706 from fulgur-rs/feature/flpdf-7l5e
+- Merge pull request #1705 from fulgur-rs/feature/flpdf-nyzp
+- Merge pull request #1701 from fulgur-rs/feature/flpdf-bkhw
+- *(writer)* mark the direct-root closure terminator cov:ignore
+- *(writer)* drop the needless mut on the xref row builder
+- *(writer)* cover the self-referential object stream guard
+- *(writer)* mark multi-line live-body call terminators cov:ignore
+- *(writer)* cover ObjStm registration pruning and live /Extends discovery
+- Merge pull request #1698 from fulgur-rs/feature/flpdf-3yn9-48-65
+- *(writer)* cite the early return and reconcile the matrix rows
+- *(writer)* pin Preserve-no-source == Disable, record D2/D65 findings
+- Merge pull request #1692 from fulgur-rs/feature/flpdf-3yn9-48-7
+- cover qpdf job rewrite setters
+- normalize route guard source newlines
+- record ownerless xref route cutover
+- *(xref)* [**breaking**] remove ownerless xref public route
+- include xref wrapper close in coverage ignore
+- ignore defensive xref wrapper edge
+- format xref warning edge comments
+- mark defensive xref warning edges
+- cover canonical xref warning sink edges
+- pin the single-site precondition of the teardown order check
+- document unreachable xref recovery branch
+- cover canonical nonzero recovery path
+- cover canonical xref handoff boundaries
+- keep canonical xref ownership single
+- *(job)* name the error variant argfile reads actually return
+- *(job)* cover the argument-file final-line case, mark stdin as cov:ignore
+- *(page)* cover non-name page type error
+- *(page)* migrate helper to resolving accessors
+- Merge pull request #1682 from fulgur-rs/feature/flpdf-waly
+- Merge pull request #1680 from fulgur-rs/feature/flpdf-lomd
+- Merge pull request #1678 from fulgur-rs/feature/flpdf-kt4z
+- *(reader)* [**breaking**] remove dead qtest source-reread and fallback-budget machinery
+- Merge pull request #1676 from fulgur-rs/feature/flpdf-buy0
+- *(job)* exclude the unreachable catalog guards from coverage
+- *(job)* cover the catalog guards on the page-label route
+- *(job)* cover page-label argv termination errors
+- Merge pull request #1673 from fulgur-rs/feature/flpdf-thb2
+- Merge pull request #1671 from fulgur-rs/feature/flpdf-5snx
+- Merge pull request #1670 from fulgur-rs/feature/flpdf-92r5
+- *(xref)* evaluate the assertion payload eagerly for coverage
+- *(xref)* check the ObjStm member context on warnings, not on errors
+- *(route-matrix)* keep the B22 compressed-retry probe open
+- *(xref)* cover ObjStm description enum
+- Merge pull request #1665 from fulgur-rs/feature/flpdf-3yn9-48-5
+- *(job)* cover both write-boundary reporting arms
+- *(job)* cover multi-source preparation edge
+- *(job)* cover lifecycle dispatch edges
+- *(xref)* drop needless mut in the new bootstrap extent tests
+- *(xref)* align bootstrap ObjStm resolution
+- Merge pull request #1657 from fulgur-rs/feature/flpdf-3yn9-48-31
+- use resolving handles in plain writer
+- Merge pull request #1653 from fulgur-rs/feature/flpdf-3yn9-48-29
+- *(job)* assert warning drain on attachment inspection
+- *(xref)* route canonical-owner xref stream decode through get_stream_data
+- Mark xref route plan verification steps complete
+- Cover trailer parser error routes
+- Cover canonical classic trailer diagnostics
+- Align xref trailer and previous-section routes with qpdf
+- *(xref)* adapt the synthetic warnings to the four-argument builder
+- keep linearization error docs lint-clean
+- cover structured linearization errors
+- *(xref)* extend the coverage marker past the closing brace
+- *(xref)* mark the now-empty diagnostic forwarding loop
+- Align xref test owner with parse guard
+- Cover canonical xref error boundaries
+- Cover canonical xref failure branches
+- Cover canonical xref edge paths
+- Route xref reads through the canonical resolver
+- Expose canonical xref object reads
+- *(parser)* unify content-stream parsing into QPDFParser's content_stream mode
+- Merge pull request #1642 from fulgur-rs/feature/flpdf-3yn9-48-28
+- Merge pull request #1641 from fulgur-rs/feature/flpdf-6f6h
+- Revert the suppressed-mode routing change
+- *(writer)* mark the arbitrated-root call terminators
+- Preserve direct-root ADBE extensions
+- Merge pull request #1636 from fulgur-rs/feature/flpdf-fhzm
+- *(writer)* extend the coverage marker past the closing brace
+- *(writer)* wrap the provenance block for coverage attribution
+- *(writer)* simplify the arbitrated root emission
+- Preserve object streams in QDF plain writes
+- Merge pull request #1638 from fulgur-rs/feature/flpdf-88sf
+- Merge pull request #1632 from fulgur-rs/feature/flpdf-3yn9-48-3
+- *(pdf)* document the clamp warning on get_extension_level
+- *(pdf)* drop the unreachable assertion formatter
+- *(job)* cover write_qpdf completing replace-input without run()
+- Merge pull request #1628 from fulgur-rs/feature/flpdf-3yn9-48-12
+- Merge pull request #1620 from fulgur-rs/feature/flpdf-clq9
+- Merge pull request #1624 from fulgur-rs/feature/flpdf-j2bt
+- Merge pull request #1618 from fulgur-rs/refactor/flpdf-3yn9-48-42
+- *(attachments)* unwrap the payload Rc instead of copying it
+- *(embedded-files)* qualify the error contract and record the warning delta
+- *(embedded-files)* finish the payload migration audit
+- *(embedded-files)* correct payload errors, C27 anchors and the migration delta
+- *(embedded-files)* migrate EmbeddedFileStream::payload to the canonical stream pipeline
+- Merge pull request #1609 from fulgur-rs/feature/flpdf-3yn9-48-53
+- *(writer)* mark the unreachable direct-stream seed descent cov:ignore
+- *(writer)* cover the direct-stream seed arm; ignore defensive depth bound
+- *(writer)* thread depth argument through seed collector unit tests
+- *(writer)* cover stale ADBE orphan child
+- Merge pull request #1606 from fulgur-rs/feature/flpdf-3yn9-48-58
+- *(content)* clarify legacy pipe overload
+- Merge pull request #1602 from fulgur-rs/feature/flpdf-3yn9-48-64
+- Merge pull request #1601 from fulgur-rs/feature/flpdf-hv7d-1
+- Merge pull request #1600 from fulgur-rs/feature/flpdf-2yq5
+- *(flatten)* follow renumbered appearance via page /Resources/XObject
+- *(flatten)* verify written appearance form subtype
+- Merge pull request #1598 from fulgur-rs/feature/flpdf-innn
+- Merge pull request #1596 from fulgur-rs/feature/flpdf-lkat
+- Merge pull request #1595 from fulgur-rs/feature/flpdf-940i
+- Merge pull request #1593 from fulgur-rs/feature/flpdf-o8fm
+- Merge pull request #1594 from fulgur-rs/refactor/flpdf-3yn9-48-46
+- Merge pull request #1592 from fulgur-rs/feature/flpdf-3yn9-48-20
+- *(object-handle)* cover JSON resolution after re-promotion
+- *(object-handle)* remove redundant assignment ownership walk
+- *(reader)* expose makeIndirectObject alias and promotion differences
+- *(reader)* verify provider remains usable after candidate traversal
+- *(reader)* own qpdf compressible object traversal
+- *(reader)* reproduce stale-generation handle removal gap
+- Merge pull request #1586 from fulgur-rs/feature/flpdf-3yn9-48-62
+- Merge pull request #1587 from fulgur-rs/refactor/flpdf-3yn9-48-2
+- Merge pull request #1583 from fulgur-rs/feature/flpdf-3yn9-48-55
+- Merge pull request #1585 from fulgur-rs/feature/flpdf-3yn9-48-50
+- Merge pull request #1584 from fulgur-rs/feature/flpdf-3yn9-48-56
+- *(writer)* mark direct-root coverage fixture
+- *(writer)* annotate unreachable coverage callbacks
+- *(writer)* cover trailer filtering branches
+- *(writer)* cover shared trailer route boundaries
+- *(writer)* route plain trailer through shared owner
+- *(writer)* require live trailer owner in plain xref
+- *(writer)* pin shared qpdf trailer forms
+- Merge pull request #1581 from fulgur-rs/refactor/flpdf-3yn9-48-36
+- name qpdf what case tuple
+- Merge pull request #1578 from fulgur-rs/refactor/flpdf-3yn9-48-40
+- remove legacy JSON stream payload routes
+- Merge pull request #1577 from fulgur-rs/refactor/flpdf-3yn9-48-39
+- Merge pull request #1576 from fulgur-rs/feature/flpdf-3yn9-48-57
+- *(writer)* document xref overload shape
+- remove inert removed-object snapshot state
+- Merge pull request #1571 from fulgur-rs/feature/flpdf-25kg-45-parsing
+- *(check)* cover parsing error paths
+- Merge pull request #1567 from fulgur-rs/feature/flpdf-25kg-44-attachments
+- Merge pull request #1561 from fulgur-rs/feature/flpdf-atdi
+- cover qtest exception parity primitives
+
 ## [0.5.1](https://github.com/fulgur-rs/flpdf/compare/v0.5.0...v0.5.1) - 2026-09-06
 
 ### Added
