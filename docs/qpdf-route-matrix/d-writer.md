@@ -485,6 +485,7 @@ specialized coordinator 内部（`4a2faf5c` の状態）:
 | `D1` / `D25` | `flpdf-3yn9.48.59` | prepareFileForWriteのgraph準備を分岐前に一度だけ実行する |
 | `D25` | `flpdf-3yn9.48.60` | root unparseObjectへADBE出力処理を移しsnapshot/restoreを撤去する |
 | `D14` | `flpdf-nhet` | `getTrimmedTrailer` の xref-structural key と source trailer key の境界を揃え、`/F`・`/FFilter`・`/FDecodeParms` の到達性・late numbering を保持する |
+| `D14` | `flpdf-53t8k` | specialized standard live の body 後 trailer walk に `/Root` 前後の late indirect-reference numbering を接続する |
 | `D25` | `flpdf-mcjj` | PCLm の direct `/Root` では qpdf の `is_root` 判定を満たさないため ADBE reconciliation を適用しない |
 | `D26` | `flpdf-3yn9.48.61` | initializeSpecialStreamsのpage/content/normalized mapをsetupで一度生成する |
 | `D16` / `D1` | `flpdf-3yn9.48.62` | encryption設定・doWriteSetupを単一writer stateに揃える |
@@ -620,6 +621,19 @@ Generate、QDF Preserve、linearized の byte/status を比較し、PCLm の pag
 seed後に late-number される trailer reference も専用テストで固定した。これは D14
 の source-key boundary 修正であり、writeTrailer の複数 consumer が残る D14 mixed
 分類や route matrix 全体の parity 完了を意味しない。
+
+`flpdf-53t8k` は nhet 後に判明した specialized standard live の late-reference
+欠落を補う。qpdf は body queue と `/Encrypt` dictionary の後、`writeTrailer` の
+sorted key walk で `unparseChild` → `enqueueObject` を実行する
+（`libqpdf/QPDFWriter.cc:1072-1157,1160-1236,2991-3031`）。specialized の旧実装は
+body mapだけを xref serializerへ渡していたため、progress callback が trailer の
+`/F` に追加した indirect child が map から欠落した。`emit_specialized_standard_live_with_page_context`
+も plain/PCLm と同じ `/Root` 前後の late map、direct `/Root` の動的 child mapを使う
+ようにし、body object や xref rowを後付けせず qpdf の trailer-time numberだけを
+割り当てる。AES-128・Disable・0% callback の RED→GREEN 回帰を
+`writer_object_emission_tests.rs` に追加した。これは specialized の bounded D14
+修正であり、legacy/planned/linearized の writeTrailer ownerや route matrix 全体の
+mixed/bridge 解消を意味しない。
 
 `flpdf-mcjj` は PCLm の direct-root semantics を補正する。qpdf の
 `QPDFWriter::Members::root_og` は direct `/Root` では `(-1, 0)` となり、

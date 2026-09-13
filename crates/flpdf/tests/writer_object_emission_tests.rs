@@ -788,6 +788,62 @@ fn specialized_encrypted_live_queue_discovers_callback_children_in_each_mode() {
 }
 
 #[test]
+fn specialized_encrypted_progress_trailer_child_gets_a_late_number() {
+    let mut pdf = Pdf::open(Cursor::new(
+        include_bytes!("../../../tests/fixtures/compat/one-page-no-ext.pdf").to_vec(),
+    ))
+    .unwrap();
+    let trailer = pdf.trailer();
+    let late_file = pdf
+        .make_indirect_object_handle(ObjectHandle::dictionary(vec![(
+            b"/LateFileName".to_vec(),
+            ObjectHandle::string(b"late-file".to_vec()),
+        )]))
+        .unwrap();
+
+    let mut writer = PdfWriter::new(&mut pdf);
+    writer.set_object_stream_mode(ObjectStreamMode::Disable);
+    writer.set_encryption_parameters(EncryptParams::v4_aes128(b"u", b"o"));
+    writer.set_static_id(true);
+    writer.set_static_aes_iv(true);
+    writer.set_output_memory().unwrap();
+    let mut called = false;
+    writer.register_progress_reporter(Box::new(move |_percent| {
+        if !called {
+            called = true;
+            trailer.replace_key(b"/F", late_file.clone())?;
+        }
+        Ok(())
+    }));
+    writer
+        .write()
+        .expect("specialized encrypted writer must number a callback trailer child");
+
+    let output = writer.get_buffer().unwrap();
+    assert!(
+        !output
+            .windows(b"/LateFileName".len())
+            .any(|window| window == b"/LateFileName"),
+        "late trailer children are numbered at writeTrailer time without a body object"
+    );
+    let mut rewritten = Pdf::open_with_options(
+        Cursor::new(output),
+        PdfOpenOptions {
+            password: b"u".to_vec(),
+            ..PdfOpenOptions::default()
+        },
+    )
+    .unwrap();
+    let file_ref = rewritten
+        .trailer()
+        .try_get_key(b"/F")
+        .unwrap()
+        .object_ref()
+        .expect("callback trailer /F must remain indirect");
+    assert!(file_ref.number > 0, "late trailer /F must not use 0 0 R");
+}
+
+#[test]
 fn specialized_generate_preserve_unreferenced_uses_setup_snapshot_and_deterministic_id() {
     let mut pdf = Pdf::open(Cursor::new(
         include_bytes!("../../../tests/fixtures/compat/one-page-no-ext.pdf").to_vec(),
