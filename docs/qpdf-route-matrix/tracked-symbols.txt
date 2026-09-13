@@ -102,7 +102,7 @@ crates/flpdf/src/object_handle.rs::ObjectHandle::try_get_key             # A8 ca
 crates/flpdf/src/reader/resolver.rs::get_object_count                    # A11 canonical count owner
 crates/flpdf/src/reader/resolver.rs::next_obj_gen                        # A11 canonical
 crates/flpdf/src/reader/resolver.rs::make_indirect_from_object_handle    # A12 canonical
-crates/flpdf/src/reader/resolver.rs::remove_object                       # A13 canonical（prod 到達不能）
+crates/flpdf/src/reader/resolver.rs::remove_object                       # A13 canonical（prod 1 / test 2）
 crates/flpdf/src/reader.rs::Pdf::replace_object                          # A16（facade+canonical 合流）
 crates/flpdf/src/reader.rs::Pdf::swap_objects                            # A17（facade+canonical 合流）
 crates/flpdf/src/reader/resolver.rs::disconnect_all                      # A20 canonical
@@ -190,7 +190,7 @@ crates/flpdf/src/writer.rs::PdfWriter::write                             # D1/D2
 crates/flpdf/src/writer/rewrite_renumber.rs::ObjectStreamRenumber        # D2 canonical
 crates/flpdf/src/writer/object_streams/planning.rs::ObjectStreamGroup    # D5
 crates/flpdf/src/writer/object_streams/planning.rs::plan_qpdf_preserve_object_streams_with_unreferenced  # D6 canonical
-crates/flpdf/src/writer/object_streams/eligibility.rs::compressible_objgens_qpdf_plan      # D8 legacy remaining consumers
+crates/flpdf/src/writer/object_streams/eligibility.rs::compressible_objgens_qpdf_plan      # D8 shared Generate/Preserve/linearized walk
 crates/flpdf/src/reader.rs::get_compressible_objgens                                   # D8 canonical document walk
 crates/flpdf/src/reader/resolver.rs::has_newer_cached_generation                       # D8 live cache upper_bound
 crates/flpdf/src/reader/resolver.rs::source_xref_entries                 # D9 source view, retained

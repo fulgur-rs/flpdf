@@ -3,6 +3,7 @@
 use flpdf::{EncryptParams, ObjectHandle, ObjectRef, ObjectStreamMode, Pdf, PdfWriter};
 use std::fs;
 use std::io::Cursor;
+use std::path::Path;
 use std::process::Command;
 
 #[test]
@@ -210,4 +211,137 @@ fn generated_stale_generation_arrays_match_qpdf_in_both_visit_orders() {
             std::fs::read(expected).unwrap()
         );
     }
+}
+
+#[cfg(feature = "qpdf-zlib-compat")]
+#[test]
+fn generate_indirect_extensions_matches_qpdf_before_prepare_file_for_write() {
+    let version = Command::new("qpdf")
+        .arg("--version")
+        .output()
+        .expect("qpdf should be installed for the Generate differential oracle");
+    assert!(version.status.success(), "qpdf --version failed");
+    assert_eq!(
+        String::from_utf8_lossy(&version.stdout).lines().next(),
+        Some("qpdf version 11.9.0"),
+        "Generate differential oracle must be qpdf 11.9.0"
+    );
+
+    for fixture in [
+        "one-page-ext-indirect.pdf",
+        "linearize-indirect-extensions.pdf",
+    ] {
+        let temporary = tempfile::tempdir().unwrap();
+        let input = temporary.path().join("input.pdf");
+        let qpdf_output = temporary.path().join("qpdf.pdf");
+        fs::write(
+            &input,
+            std::fs::read(
+                Path::new(env!("CARGO_MANIFEST_DIR"))
+                    .join("../../tests/fixtures/compat")
+                    .join(fixture),
+            )
+            .unwrap(),
+        )
+        .unwrap();
+
+        let qpdf = Command::new("qpdf")
+            .args(["--static-id", "--object-streams=generate"])
+            .arg(&input)
+            .arg(&qpdf_output)
+            .output()
+            .unwrap();
+        assert!(
+            qpdf.status.success(),
+            "qpdf Generate rewrite failed for {fixture}: {}",
+            String::from_utf8_lossy(&qpdf.stderr)
+        );
+
+        let mut pdf = Pdf::open(Cursor::new(fs::read(&input).unwrap())).unwrap();
+        let mut writer = PdfWriter::new(&mut pdf);
+        writer.set_object_stream_mode(ObjectStreamMode::Generate);
+        writer.set_static_id(true);
+        writer.set_output_memory().unwrap();
+        writer.write().unwrap();
+
+        let actual = writer.get_buffer().unwrap();
+        let expected = fs::read(&qpdf_output).unwrap();
+        if actual != expected {
+            let first_diff = actual
+                .iter()
+                .zip(&expected)
+                .position(|(actual, expected)| actual != expected)
+                .unwrap_or(actual.len().min(expected.len()));
+            let start = first_diff.saturating_sub(16);
+            panic!(
+                "Generate output for {fixture} differs from qpdf's setup-time membership: flpdf={} bytes, qpdf={} bytes, first diff at {first_diff}; flpdf={:?}, qpdf={:?}",
+                actual.len(),
+                expected.len(),
+                &actual[start..actual.len().min(first_diff + 32)],
+                &expected[start..expected.len().min(first_diff + 32)],
+            );
+        }
+    }
+}
+
+#[cfg(feature = "qpdf-zlib-compat")]
+#[test]
+fn generate_dangling_higher_generation_matches_qpdf_live_cache_lookup() {
+    let mut source =
+        include_bytes!("../../../tests/fixtures/compat/compressible-stale-generation-alias.pdf")
+            .to_vec();
+    let object_header = b"3 1 obj";
+    let object_header_offset = source
+        .windows(object_header.len())
+        .position(|window| window == object_header)
+        .expect("fixture contains the source object header");
+    source[object_header_offset..object_header_offset + object_header.len()]
+        .copy_from_slice(b"3 0 obj");
+    let xref_entry = b"0000000134 00001 n ";
+    let xref_offset = source
+        .windows(xref_entry.len())
+        .position(|window| window == xref_entry)
+        .expect("fixture contains the source xref entry");
+    source[xref_offset..xref_offset + xref_entry.len()].copy_from_slice(b"0000000134 00000 n ");
+
+    let temporary = tempfile::tempdir().unwrap();
+    let input = temporary.path().join("input.pdf");
+    let qpdf_output = temporary.path().join("qpdf.pdf");
+    fs::write(&input, &source).unwrap();
+    let qpdf = Command::new("qpdf")
+        .args(["--static-id", "--object-streams=generate"])
+        .arg(&input)
+        .arg(&qpdf_output)
+        .output()
+        .unwrap();
+    assert!(
+        qpdf.status.success(),
+        "qpdf Generate rewrite failed: {}",
+        String::from_utf8_lossy(&qpdf.stderr)
+    );
+
+    let mut pdf = Pdf::open(Cursor::new(source)).unwrap();
+    let old = pdf
+        .root_handle()
+        .unwrap()
+        .try_get_key(b"/Versions")
+        .unwrap()
+        .try_get_array_item(0)
+        .unwrap();
+    let mut writer = PdfWriter::new(&mut pdf);
+    writer.set_object_stream_mode(ObjectStreamMode::Generate);
+    writer.set_static_id(true);
+    writer.set_output_memory().unwrap();
+    writer.write().unwrap();
+
+    assert_eq!(
+        writer.get_buffer().unwrap(),
+        fs::read(&qpdf_output).unwrap(),
+        "Generate must consult the live cache for dangling higher generations"
+    );
+    assert!(old.is_direct(), "qpdf removes the superseded cached object");
+    assert!(
+        old.is_null(),
+        "the removed cached object becomes a direct null"
+    );
 }

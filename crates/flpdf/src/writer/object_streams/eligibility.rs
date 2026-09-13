@@ -6,7 +6,7 @@
 //! indirect `/Length` targets from the same reachable walk; it never scans the
 //! full xref/object universe just to compute an ObjStm planning exclusion.
 
-use std::collections::{BTreeMap, BTreeSet};
+use std::collections::BTreeSet;
 use std::num::NonZeroUsize;
 
 use crate::ObjectHandle;
@@ -100,7 +100,6 @@ pub(crate) struct CompressiblePlan {
     pub indirect_objstm_length_refs: BTreeSet<ObjectRef>,
 }
 
-// qpdf-deviation: remaining writer consumers use a generation snapshot and removed_refs; the canonical document walk mutates retained aliases.
 pub(crate) fn compressible_objgens_qpdf_plan<R: std::io::Read + std::io::Seek>(
     pdf: &mut crate::Pdf<R>,
 ) -> crate::Result<CompressiblePlan> {
@@ -108,16 +107,11 @@ pub(crate) fn compressible_objgens_qpdf_plan<R: std::io::Read + std::io::Seek>(
     let mut result: Vec<ObjectRef> = Vec::new();
     let mut removed_refs = BTreeSet::new();
     let mut indirect_objstm_length_refs = BTreeSet::new();
-    // qpdf's obj_cache upper_bound test is operation-specific. Build the
-    // highest LIVE generation index once so null edges are O(1), and exclude
-    // free/deleted generations from superseding a lower live object.
-    let mut highest_live_generation: BTreeMap<u32, u16> = BTreeMap::new();
-    for object_ref in pdf.canonical_live_object_refs() {
-        highest_live_generation
-            .entry(object_ref.number)
-            .and_modify(|generation| *generation = (*generation).max(object_ref.generation))
-            .or_insert(object_ref.generation);
-    }
+    // qpdf prepares the cache and takes the object-number bound inside
+    // getCompressibleObjGens before traversing the trailer (`QPDF.cc:2400`).
+    // This also makes cached dangling references visible to the dynamic
+    // upper_bound check below.
+    let max_object = pdf.get_object_count()?;
     // The encryption dictionary is excluded from the result, matching qpdf's
     // `m->trailer.getKey("/Encrypt")` guard (QPDF.cc:2402/2437): it must stay
     // a plain indirect object so the rest of the file can be decrypted. Read it
@@ -139,16 +133,20 @@ pub(crate) fn compressible_objgens_qpdf_plan<R: std::io::Read + std::io::Seek>(
         if object_ref.number == 0 {
             continue;
         }
-        if highest_live_generation
-            .get(&object_ref.number)
-            .is_some_and(|generation| *generation > object_ref.generation)
-        {
+        if object_ref.number > max_object {
+            return Err(crate::Error::Internal(
+                "unexpected object id encountered in getCompressibleObjGens".to_string(),
+            ));
+        }
+        if visited.contains(&object_ref.number) {
+            continue;
+        }
+        if pdf.has_newer_cached_generation(object_ref) {
+            pdf.remove_object_handle(object_ref)?;
             removed_refs.insert(object_ref);
             continue;
         }
-        if !visited.insert(object_ref.number) {
-            continue;
-        }
+        visited.insert(object_ref.number);
 
         object.try_dereference()?;
         let stream_dict = object.as_stream_dict();

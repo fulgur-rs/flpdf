@@ -1013,65 +1013,12 @@ impl<R: Read + Seek> Pdf<R> {
     /// `QPDF::removeObject` erases the resolver cache entry; the returned
     /// operation-specific removal set lets a writer keep its own traversal
     /// bookkeeping without adding a second document cache.
+    #[cfg(test)]
     pub(crate) fn get_compressible_objgens_with_removed(
         &mut self,
     ) -> Result<(Vec<ObjectRef>, BTreeSet<ObjectRef>)> {
-        let encryption = self.trailer().try_get_key(b"/Encrypt")?.object_ref();
-        let max_object = self.get_object_count()? as usize;
-        let mut visited = vec![0u64; max_object.div_ceil(64)];
-        let mut queue = Vec::with_capacity(512);
-        queue.push(self.trailer());
-        let mut result = Vec::new();
-        let mut removed = BTreeSet::new();
-        while let Some(object) = queue.pop() {
-            if let Some(og) = object.object_ref().filter(|og| og.number > 0) {
-                let index = (og.number - 1) as usize;
-                if index >= max_object {
-                    return Err(Error::Internal(
-                        "unexpected object id encountered in getCompressibleObjGens".into(),
-                    ));
-                }
-                let bit = 1u64 << (index % 64);
-                if visited[index / 64] & bit != 0 {
-                    continue;
-                }
-                if self.resolver.has_newer_cached_generation(og) {
-                    removed.insert(og);
-                    self.resolver.remove_object(og)?;
-                    continue;
-                }
-                visited[index / 64] |= bit;
-                if Some(og) != encryption {
-                    object.try_dereference()?;
-                    if object.as_stream_dict().is_none()
-                        && !(object.try_is_dictionary_of_type(b"Sig", b"")?
-                            && object.try_has_key(b"/ByteRange")?
-                            && object.try_has_key(b"/Contents")?)
-                    {
-                        result.push(og);
-                    }
-                }
-            }
-            object.try_dereference()?;
-            if let Some(dict) = object.as_stream_dict() {
-                for key in dict.try_get_keys()?.into_iter().rev() {
-                    let value = dict.try_get_key(&key)?;
-                    if key != b"/Length" {
-                        queue.push(value);
-                    }
-                }
-            } else if object.try_is_dictionary()? {
-                for key in object.try_get_keys()?.into_iter().rev() {
-                    queue.push(object.try_get_key(&key)?);
-                }
-            } else if object.try_is_array()? {
-                let count = object.try_get_array_n_items()?;
-                for index in (0..count).rev() {
-                    queue.push(object.try_get_array_item(index as i64)?);
-                }
-            }
-        }
-        Ok((result, removed))
+        let plan = crate::writer::object_streams::compressible_objgens_qpdf_plan(self)?;
+        Ok((plan.eligible, plan.removed_refs))
     }
 
     /// Return the next qpdf-shaped generation-zero object identity from the
@@ -1273,12 +1220,18 @@ impl<R: Read + Seek> Pdf<R> {
     /// `removeObject`'s exact xref/cache mutation (`QPDF.cc:1996-2005`),
     /// separate from xref registration's transient free-row state
     /// (`QPDF.cc:686-708`, `:1187-1210`).
-    #[cfg(test)]
     pub(crate) fn remove_object_handle(&mut self, object_ref: ObjectRef) -> Result<()> {
         // qpdf's removeObject changes only the requested cache slot; already
         // resolved members of an ObjStm remain live in their own cache slots.
         self.resolver.remove_object(object_ref)?;
         Ok(())
+    }
+
+    /// Return whether qpdf's live object cache has a newer generation for this
+    /// object number. The writer's compressible walk uses this dynamic lookup
+    /// rather than an xref-only snapshot (`QPDF.cc:2423-2430`).
+    pub(crate) fn has_newer_cached_generation(&self, object_ref: ObjectRef) -> bool {
+        self.resolver.has_newer_cached_generation(object_ref)
     }
 
     pub(crate) fn is_canonical_object_handle(&self, handle: &ObjectHandle) -> bool {

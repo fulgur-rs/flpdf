@@ -12,6 +12,7 @@ pub(crate) mod body;
 pub(crate) mod plan;
 pub(crate) mod xref;
 
+#[allow(clippy::too_many_arguments)] // qpdf setup snapshots and route-local state stay explicit at this consumer boundary
 pub(crate) fn write_plain<R: Read + Seek, W: Write>(
     pdf: &mut Pdf<R>,
     out: W,
@@ -19,6 +20,8 @@ pub(crate) fn write_plain<R: Read + Seek, W: Write>(
     generated_id: Option<&crate::ObjectHandle>,
     special_streams: Option<&crate::writer::SpecialStreams>,
     source_object_stream_data: &BTreeMap<u32, u32>,
+    generated_compressible: Option<&crate::writer::object_streams::CompressiblePlan>,
+    generated_object_stream_sources: &[ObjectRef],
 ) -> crate::Result<WriterResult> {
     // The live queue preserves the mutation/progress timing contract for both
     // ordinary output and the QDF/normalization variants whose object-stream
@@ -69,6 +72,8 @@ pub(crate) fn write_plain<R: Read + Seek, W: Write>(
         options,
         generated_id,
         Some(source_object_stream_data),
+        generated_compressible,
+        generated_object_stream_sources,
     )?;
     crate::writer::configure_progress_for_pdf(pdf, options, 0, false)?; // cov:ignore: a pre-emission object-enumeration failure is surfaced by the underlying writer validation
     write_planned(pdf, out, options, &plan)
