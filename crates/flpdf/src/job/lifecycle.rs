@@ -3167,13 +3167,16 @@ impl QPDFJob {
             };
         }
         let input_name = path_description_bytes(&input);
-        let open_result: Result<JobDocument> = if self.configuration.show_encryption {
+        let needs_encryption_inspection_open = self.configuration.show_encryption
+            || self.configuration.is_encrypted
+            || self.configuration.requires_password;
+        let open_result: Result<JobDocument> = if needs_encryption_inspection_open {
             // qpdf's createQPDF keeps the partially initialized QPDF when the
-            // password handler throws, but only for the show-encryption
-            // fallback (`libqpdf/QPDFJob.cc:432-448`). Use the existing
-            // inspection opener here so combined `run()` routes retain that
-            // parsed encryption state instead of converting it into the
-            // ordinary invalid-password error.
+            // password handler throws for show-encryption and status queries
+            // (`libqpdf/QPDFJob.cc:432-448`). Use the existing inspection
+            // opener here so direct `create_qpdf` callers retain that parsed
+            // encryption state instead of converting it into the ordinary
+            // invalid-password error.
             let source: Box<dyn ReadSeek> = Box::new(BufReader::new(file));
             self.open_for_encryption_inspection_with_description(
                 source,
@@ -3189,14 +3192,25 @@ impl QPDFJob {
         };
         match open_result {
             Ok(mut pdf)
-                if self.configuration.show_encryption
+                if needs_encryption_inspection_open
                     && pdf.is_encrypted()
                     && pdf.encryption_file_key().is_none() =>
             {
-                // qpdf reports the encryption parameters from the partial
-                // document and returns nullptr before update/page
-                // transformations or write/inspection continuation.
-                self.show_encryption(&mut pdf, self.configuration.password_is_hex_key)?;
+                // qpdf evaluates encryption-status queries before its
+                // show-encryption fallback in the password-error catch
+                // (`libqpdf/QPDFJob.cc:436-448`). Record the status and skip
+                // the report when both kinds of inspection are configured.
+                if self.configuration.is_encrypted || self.configuration.requires_password {
+                    self.encryption_status = EncryptionStatus {
+                        encrypted: true,
+                        password_incorrect: true,
+                    };
+                } else {
+                    // qpdf reports the encryption parameters from the partial
+                    // document and returns nullptr before update/page
+                    // transformations or write/inspection continuation.
+                    self.show_encryption(&mut pdf, self.configuration.password_is_hex_key)?;
+                }
                 self.create_qpdf_succeeded_without_document = true;
                 Ok(None)
             }
