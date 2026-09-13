@@ -292,6 +292,8 @@ qpdf の `writeQPDF` → `doSplitPages` → chunk ごとの `setWriterOptions`
 で qpdf 11.9.0 と 3 chunk の暗号化・byte parity を検証した。copy-encryption/decrypt と
 その他の create-stage mutation の組合せは `flpdf-1emn` など別 scope に残す。
 
+2026-09-14（flpdf-1emn follow-up slice）: rewrite の --decrypt を page-operation の writer boundary へ渡し、暗号化3ページfixtureの pages/rotate/split で qpdf の cleartext output と status/stdout/stderr/byte parity を固定した。copy_encryption の guard と、page-selection後の image/overlay 順序は残る。
+
 ### E-28 detail: `qpdf/test_driver.cc` case-level classification (P-2)
 
 2026-09-07、`flpdf-3yn9.48.11` の一環として 99 ケース全件（case 0〜98。case 0/1 は共有関数
