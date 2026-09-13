@@ -345,3 +345,80 @@ fn generate_dangling_higher_generation_matches_qpdf_live_cache_lookup() {
         "the removed cached object becomes a direct null"
     );
 }
+
+#[cfg(feature = "qpdf-zlib-compat")]
+#[test]
+fn preserve_planner_keeps_members_when_reachable_source_container_is_removed() {
+    let mut pdf = Pdf::open(Cursor::new(
+        include_bytes!("../../../tests/fixtures/compat/three-page-objstm.pdf").to_vec(),
+    ))
+    .unwrap();
+    let source_container = pdf.get_object_handle(ObjectRef::new(1, 0));
+    assert!(
+        source_container
+            .try_is_stream_of_type(b"ObjStm", b"")
+            .unwrap(),
+        "the fixture must expose its source ObjStm before the mutation"
+    );
+    pdf.root_handle()
+        .unwrap()
+        .replace_key(b"/SourceObjStm", source_container)
+        .unwrap();
+    // QPDF::getCompressibleObjGens removes an older cache entry when a newer
+    // generation exists. The preserved type-2 membership map is captured
+    // before that walk, so the removed source container must still be emitted
+    // as a null-backed ObjStm carrying its retained members.
+    pdf.replace_object(ObjectRef::new(1, 1), ObjectHandle::null())
+        .unwrap();
+
+    let mut writer = PdfWriter::new(&mut pdf);
+    writer.set_object_stream_mode(ObjectStreamMode::Preserve);
+    writer.set_static_id(true);
+    writer.set_output_memory().unwrap();
+    writer.write().unwrap();
+    let output = writer.get_buffer().unwrap();
+
+    // Generated with qpdf 11.9.0's C++ API using the same source fixture and
+    // mutation sequence: getObjectByID(1, 0), root.replaceKey, and
+    // replaceObject(1, 1, newNull()). This keeps the qpdf oracle on the
+    // mutation path that the command-line input format cannot represent.
+    let expected_hex: String = include_str!(
+        "../../../tests/fixtures/compat/removed-source-container-preserve-qpdf-api.pdf.hex"
+    )
+    .chars()
+    .filter(|character| !character.is_ascii_whitespace())
+    .collect();
+    let expected = hex::decode(expected_hex).unwrap();
+    assert_eq!(
+        output, expected,
+        "planner-driven Preserve output must match qpdf's live-cache mutation"
+    );
+
+    let mut reopened = Pdf::open(Cursor::new(output)).unwrap();
+    let root = reopened.root_handle().unwrap();
+    assert!(
+        root.try_get_key(b"/SourceObjStm").unwrap().is_null(),
+        "a reference to the removed source container must serialize as null"
+    );
+    let objstm_counts: Vec<i64> = reopened
+        .get_all_objects()
+        .unwrap()
+        .into_iter()
+        .filter_map(|object| {
+            object
+                .as_stream_dict()
+                .and_then(|dict| dict.try_get_key(b"/Type").ok()?.as_name())
+                .filter(|name| name.as_slice() == b"ObjStm")
+                .and_then(|_| {
+                    object
+                        .as_stream_dict()
+                        .and_then(|dict| dict.try_get_key(b"/N").ok()?.as_integer())
+                })
+        })
+        .collect();
+    assert_eq!(
+        objstm_counts,
+        vec![8],
+        "the planner-driven Preserve path must retain all source members"
+    );
+}
