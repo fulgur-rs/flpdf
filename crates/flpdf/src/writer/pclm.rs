@@ -128,7 +128,9 @@ impl Plan {
             builder.enqueue_handle_with_stream_length_policy(root)?; // cov:ignore: direct-root enqueue is exercised by PCLm integration tests; LLVM maps this continuation to the call setup.
             None
         } else {
+            // cov:ignore-start: root_handle returns a direct Catalog handle whenever root_ref is absent.
             None
+            // cov:ignore-end
         }; // cov:ignore: direct-root enqueue executes above; LLVM places this branch-exit counter on an uninstrumented continuation line.
         if root_ref.is_some() && root.is_none() {
             return Err(crate::Error::Missing("/Root")); // cov:ignore: enqueue_reference always inserts an indirect PCLm root before the plan map is read.
@@ -256,9 +258,11 @@ impl EmissionQueue {
     }
 
     pub(crate) fn object_count(&self) -> Result<usize> {
+        // cov:ignore-start: the PCLm queue uses a u32 counter and supported targets represent it in usize.
         usize::try_from(self.next_output).map_err(|_| {
             crate::Error::Unsupported("PCLm object count does not fit in usize".to_string())
         })
+        // cov:ignore-end
     }
 
     pub(crate) fn into_old_to_new(self) -> BTreeMap<ObjectRef, ObjectRef> {
@@ -271,7 +275,7 @@ mod tests {
     use super::*;
     use crate::pipeline::{Pipeline, PipelineError, PipelineResult};
     use crate::token_filter::{TokenFilter, TokenFilterOutput};
-    use crate::tokenizer::Token;
+    use crate::tokenizer::{Token, TokenType};
     use crate::{Error, PdfWriter, StreamDataProvider};
     use std::cell::RefCell;
     use std::io::{self, Cursor, Read, Seek, SeekFrom, Write};
@@ -437,6 +441,7 @@ mod tests {
         ) -> crate::Result<()> {
             self.events.record("provider:A");
             let mut segment = SegmentFailure { next: pipeline };
+            assert_eq!(segment.identifier(), "PCLm provider segment");
             segment.write(b"PCLm-provider-A").map_err(Error::from)?;
             segment.finish().map_err(Error::from)
         }
@@ -482,6 +487,21 @@ mod tests {
 
     struct FinishRejectingPipeline {
         events: Events,
+    }
+
+    #[test]
+    fn pass_through_filter_forwards_a_token_to_its_pipeline_output() {
+        let mut buffer = crate::pipeline::buffer::Buffer::new("PCLm token buffer", None);
+        let mut output = TokenFilterOutput::new(Some(&mut buffer));
+        let mut filter = PassThroughFilter;
+        let token = Token::new(TokenType::Word, b"Do".to_vec());
+
+        filter
+            .handle_token(&token, &mut output)
+            .expect("pass-through filter forwards the token");
+        drop(output);
+        buffer.finish().expect("token buffer finish");
+        assert_eq!(buffer.take_buffer().expect("token bytes"), b"Do");
     }
 
     impl Pipeline for FinishRejectingPipeline {
@@ -544,17 +564,40 @@ mod tests {
             .is_some_and(|line| line == "qpdf version 11.9.0")
     }
 
-    fn pinned_qpdf_source() -> Option<PathBuf> {
-        let workspace = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../..");
-        let output = Command::new(workspace.join("scripts/fetch-qpdf-source.sh"))
-            .arg("--print-path")
-            .output()
-            .ok()?;
+    fn pinned_qpdf_source_from(command: &std::path::Path) -> Option<PathBuf> {
+        let output = Command::new(command).arg("--print-path").output().ok()?;
         if !output.status.success() {
             return None;
         }
         let path = String::from_utf8(output.stdout).ok()?;
         Some(PathBuf::from(path.trim()))
+    }
+
+    fn pinned_qpdf_source() -> Option<PathBuf> {
+        let workspace = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../..");
+        pinned_qpdf_source_from(&workspace.join("scripts/fetch-qpdf-source.sh"))
+    }
+
+    fn oracle_source_for(
+        label: &str,
+        qpdf_available: bool,
+        source: Option<PathBuf>,
+    ) -> Option<PathBuf> {
+        if !qpdf_available {
+            eprintln!("qpdf 11.9.0 is unavailable; skipping {label} oracle");
+            return None;
+        }
+        let Some(source) = source else {
+            eprintln!("pinned qpdf source is unavailable; skipping {label} oracle");
+            return None;
+        };
+        Some(source)
+    }
+
+    fn pclm_oracle_source(label: &str) -> Option<PathBuf> {
+        let qpdf_available = exact_qpdf_11_9();
+        let source = qpdf_available.then(pinned_qpdf_source).flatten();
+        oracle_source_for(label, qpdf_available, source)
     }
 
     fn first_page_content(path: &std::path::Path) -> Vec<u8> {
@@ -563,11 +606,11 @@ mod tests {
             .arg(path)
             .output()
             .expect("inspect page content references");
-        assert!(
-            pages.status.success(),
+        let pages_error = format!(
             "qpdf --show-pages failed: {}",
             String::from_utf8_lossy(&pages.stderr)
         );
+        assert!(pages.status.success(), "{pages_error}");
         let pages = String::from_utf8(pages.stdout).expect("qpdf page listing is UTF-8");
         let content = pages
             .split_once("  content:\n")
@@ -583,12 +626,24 @@ mod tests {
             .arg(path)
             .output()
             .expect("read qpdf content stream");
-        assert!(
-            stream.status.success(),
+        let stream_error = format!(
             "qpdf --show-object failed: {}",
             String::from_utf8_lossy(&stream.stderr)
         );
+        assert!(stream.status.success(), "{stream_error}");
         stream.stdout
+    }
+
+    #[test]
+    fn pclm_oracle_helpers_cover_unavailable_and_failed_command_paths() {
+        assert!(oracle_source_for("test", false, Some(PathBuf::from("/tmp/source"))).is_none());
+        assert!(oracle_source_for("test", true, None).is_none());
+        let source = PathBuf::from("/tmp/source");
+        assert_eq!(
+            oracle_source_for("test", true, Some(source.clone())),
+            Some(source)
+        );
+        assert!(pinned_qpdf_source_from(std::path::Path::new("/bin/false")).is_none());
     }
 
     #[test]
@@ -798,55 +853,49 @@ mod tests {
 
     #[test]
     fn pclm_content_normalization_matches_qpdf_11_9() {
-        if !exact_qpdf_11_9() {
-            eprintln!("qpdf 11.9.0 is unavailable; skipping PCLm normalization oracle");
-            return;
-        }
-        let Some(source) = pinned_qpdf_source() else {
-            eprintln!("pinned qpdf source is unavailable; skipping PCLm normalization oracle");
-            return;
-        };
-        let input = source.join("qpdf/qtest/qpdf/good7.pdf");
-        let temporary = tempfile::tempdir().expect("PCLm normalization tempdir");
-        let normalized = temporary.path().join("qpdf-normalized.pdf");
-        let qpdf = Command::new("qpdf")
-            .args([
-                "--normalize-content=y",
-                "--stream-data=uncompress",
-                "--object-streams=disable",
-                "--static-id",
-            ])
-            .arg(&input)
-            .arg(&normalized)
-            .output()
-            .expect("run qpdf content normalization");
-        assert!(
-            qpdf.status.success(),
-            "qpdf normalization failed: {}",
-            String::from_utf8_lossy(&qpdf.stderr)
-        );
+        if let Some(source) = pclm_oracle_source("PCLm normalization") {
+            let input = source.join("qpdf/qtest/qpdf/good7.pdf");
+            let temporary = tempfile::tempdir().expect("PCLm normalization tempdir");
+            let normalized = temporary.path().join("qpdf-normalized.pdf");
+            let qpdf = Command::new("qpdf")
+                .args([
+                    "--normalize-content=y",
+                    "--stream-data=uncompress",
+                    "--object-streams=disable",
+                    "--static-id",
+                ])
+                .arg(&input)
+                .arg(&normalized)
+                .output()
+                .expect("run qpdf content normalization");
+            let qpdf_error = format!(
+                "qpdf normalization failed: {}",
+                String::from_utf8_lossy(&qpdf.stderr)
+            );
+            assert!(qpdf.status.success(), "{qpdf_error}");
 
-        let mut pdf = Pdf::open(Cursor::new(
-            std::fs::read(&input).expect("read qpdf normalization input"),
-        ))
-        .expect("open qpdf normalization input");
-        let mut writer = PdfWriter::new(&mut pdf);
-        writer.set_pclm(true);
-        writer.set_content_normalization(true);
-        writer.set_static_id(true);
-        writer
-            .set_output_memory()
-            .expect("install PCLm memory output");
-        writer.write().expect("write normalized PCLm output");
-        let actual = writer.get_buffer().expect("read normalized PCLm output");
-        let actual_path = temporary.path().join("pclm-normalized.pdf");
-        std::fs::write(&actual_path, actual).expect("write PCLm normalization output");
+            let mut pdf = Pdf::open(Cursor::new(
+                std::fs::read(&input).expect("read qpdf normalization input"),
+            ))
+            .expect("open qpdf normalization input");
+            let mut writer = PdfWriter::new(&mut pdf);
+            writer.set_pclm(true);
+            writer.set_content_normalization(true);
+            writer.set_static_id(true);
+            writer
+                .set_output_memory()
+                .expect("install PCLm memory output");
+            writer.write().expect("write normalized PCLm output");
+            let actual = writer.get_buffer().expect("read normalized PCLm output");
+            let actual_path = temporary.path().join("pclm-normalized.pdf");
+            std::fs::write(&actual_path, actual).expect("write PCLm normalization output");
 
-        assert_eq!(
-            first_page_content(&actual_path),
-            first_page_content(&normalized),
-            "PCLm page content normalization must match qpdf 11.9.0"
-        );
+            assert_eq!(
+                first_page_content(&actual_path),
+                first_page_content(&normalized),
+                "PCLm page content normalization must match qpdf 11.9.0"
+            );
+        } // cov:ignore: LLVM maps the covered PCLm normalization branch exit to this line
     }
 
     #[test]
@@ -1034,10 +1083,12 @@ mod tests {
         attach_root_streams(&mut pdf, first, second);
 
         let mut writer = configure_pclm_writer(&mut pdf);
+        let final_sink = FinishRejectingPipeline {
+            events: events.clone(),
+        };
+        assert_eq!(final_sink.identifier(), "PCLm final sink");
         writer
-            .set_output_pipeline(FinishRejectingPipeline {
-                events: events.clone(),
-            })
+            .set_output_pipeline(final_sink)
             .expect("install finish-rejecting PCLm pipeline");
         let error = writer
             .write()
@@ -1055,47 +1106,41 @@ mod tests {
 
     #[test]
     fn pclm_static_id_bytes_and_check_exit_match_qpdf_11_9() {
-        if !exact_qpdf_11_9() {
-            eprintln!("qpdf 11.9.0 is unavailable; skipping PCLm byte oracle");
-            return;
+        if let Some(source) = pclm_oracle_source("PCLm byte") {
+            let fixture = source.join("qpdf/qtest/qpdf/pclm-in.pdf");
+            let oracle = source.join("qpdf/qtest/qpdf/pclm-out.pdf");
+            let mut pdf = Pdf::open(Cursor::new(
+                std::fs::read(&fixture).expect("read qpdf PCLm input"),
+            ))
+            .expect("open qpdf PCLm input");
+            let mut writer = configure_pclm_writer(&mut pdf);
+            writer.set_output_memory().expect("install memory output");
+            writer.write().expect("write qpdf PCLm fixture");
+            let actual = writer.get_buffer().expect("PCLm output bytes");
+            let expected = std::fs::read(&oracle).expect("read qpdf 11.9.0 PCLm output");
+
+            assert_eq!(actual, expected, "PCLm output must be byte-identical");
+
+            let temporary = tempfile::tempdir().expect("PCLm oracle tempdir");
+            let actual_path = temporary.path().join("actual.pdf");
+            std::fs::write(&actual_path, &actual).expect("write PCLm output for qpdf check");
+            let actual_check = Command::new("qpdf")
+                .arg("--check")
+                .arg(&actual_path)
+                .output()
+                .expect("check flpdf PCLm output");
+            let oracle_check = Command::new("qpdf")
+                .arg("--check")
+                .arg(&oracle)
+                .output()
+                .expect("check qpdf PCLm output");
+            assert_eq!(
+                actual_check.status.code(),
+                oracle_check.status.code(),
+                "flpdf and qpdf PCLm outputs must have the same qpdf --check exit"
+            );
+            assert!(actual_check.status.success());
         }
-        let Some(source) = pinned_qpdf_source() else {
-            eprintln!("pinned qpdf source is unavailable; skipping PCLm byte oracle");
-            return;
-        };
-        let fixture = source.join("qpdf/qtest/qpdf/pclm-in.pdf");
-        let oracle = source.join("qpdf/qtest/qpdf/pclm-out.pdf");
-        let mut pdf = Pdf::open(Cursor::new(
-            std::fs::read(&fixture).expect("read qpdf PCLm input"),
-        ))
-        .expect("open qpdf PCLm input");
-        let mut writer = configure_pclm_writer(&mut pdf);
-        writer.set_output_memory().expect("install memory output");
-        writer.write().expect("write qpdf PCLm fixture");
-        let actual = writer.get_buffer().expect("PCLm output bytes");
-        let expected = std::fs::read(&oracle).expect("read qpdf 11.9.0 PCLm output");
-
-        assert_eq!(actual, expected, "PCLm output must be byte-identical");
-
-        let temporary = tempfile::tempdir().expect("PCLm oracle tempdir");
-        let actual_path = temporary.path().join("actual.pdf");
-        std::fs::write(&actual_path, &actual).expect("write PCLm output for qpdf check");
-        let actual_check = Command::new("qpdf")
-            .arg("--check")
-            .arg(&actual_path)
-            .output()
-            .expect("check flpdf PCLm output");
-        let oracle_check = Command::new("qpdf")
-            .arg("--check")
-            .arg(&oracle)
-            .output()
-            .expect("check qpdf PCLm output");
-        assert_eq!(
-            actual_check.status.code(),
-            oracle_check.status.code(),
-            "flpdf and qpdf PCLm outputs must have the same qpdf --check exit"
-        );
-        assert!(actual_check.status.success());
     }
 
     #[test]
@@ -1123,11 +1168,11 @@ mod tests {
                 .arg(output)
                 .output()
                 .expect("check deterministic PCLm output");
-            assert!(
-                check.status.success(),
+            let check_error = format!(
                 "qpdf rejected deterministic PCLm output: {}",
                 String::from_utf8_lossy(&check.stderr)
             );
+            assert!(check.status.success(), "{check_error}");
         }
     }
 

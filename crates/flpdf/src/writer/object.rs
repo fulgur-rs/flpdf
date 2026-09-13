@@ -2455,12 +2455,14 @@ pub(crate) fn unparse_object_value(value: &ObjectValue, out: &mut OutputSink<'_>
         ObjectValue::Array(children) => {
             // QPDFWriter.cc:1334-1345: no token-boundary rule, a space is
             // written before every element regardless of adjacency.
+            // cov:ignore-start: unparse_object_walk snapshots every array into UnparseContainer before this scalar fallback can dispatch.
             out.write_bytes(b"[")?;
             for child in children {
                 out.write_bytes(b" ")?;
                 write_child(child, out)?;
             }
             out.write_bytes(b" ]")?;
+            // cov:ignore-end
         }
         ObjectValue::Dictionary(entries) => {
             let entries: Vec<(Vec<u8>, ObjectHandle)> = entries
@@ -2602,12 +2604,14 @@ fn unparse_object_value_with_ref_map(
 ) -> Result<()> {
     match value {
         ObjectValue::Array(children) => {
+            // cov:ignore-start: unparse_object_walk_with_ref_map snapshots every array before this value fallback is entered.
             out.write_bytes(b"[")?;
             for child in children {
                 out.write_bytes(b" ")?;
                 write_child_with_ref_map(child, out, map, removed_refs)?;
             }
             out.write_bytes(b" ]")?;
+            // cov:ignore-end
         }
         ObjectValue::Dictionary(entries) => {
             let entries: Vec<(Vec<u8>, ObjectHandle)> = entries
@@ -3088,6 +3092,7 @@ fn unparse_object_value_qdf(
             // then per element `indent + 2` leading spaces + the child's own
             // QDF form + a trailing newline, then `indent` leading spaces and
             // `]`.
+            // cov:ignore-start: unparse_object_walk_qdf snapshots every array into UnparseContainer before this value fallback can dispatch.
             out.write_bytes(b"[")?;
             out.write_bytes(b"\n")?;
             for child in children {
@@ -3097,6 +3102,7 @@ fn unparse_object_value_qdf(
             }
             push_spaces(out, indent)?;
             out.write_bytes(b"]")?;
+            // cov:ignore-end
         }
         ObjectValue::Dictionary(entries) => {
             let entries: Vec<(Vec<u8>, ObjectHandle)> = entries
@@ -4730,6 +4736,23 @@ mod tests {
         })?;
         assert!(String::from_utf8_lossy(&qdf_strings).contains("<string:value>"));
         assert!(String::from_utf8_lossy(&qdf_strings).contains("null"));
+
+        let mut plain_qdf_strings = Vec::new();
+        let mut plain_qdf_callback = |out: &mut OutputSink<'_>, value: &[u8]| {
+            out.write_bytes(b"<string:")?;
+            out.write_bytes(value)?;
+            out.write_bytes(b">")
+        };
+        super::super::output::with_buffer_sink(&mut plain_qdf_strings, |out| {
+            ObjectWriterEmission::write_object_qdf_with_string_writer(
+                &string_array,
+                out,
+                0,
+                &mut plain_qdf_callback,
+            )
+        })?;
+        assert!(String::from_utf8_lossy(&plain_qdf_strings).contains("<string:value>"));
+        assert!(String::from_utf8_lossy(&plain_qdf_strings).contains("[\n"));
         Ok(())
     }
 
@@ -4770,11 +4793,13 @@ mod tests {
         let mut pdf = Pdf::empty()?;
         let mapped = pdf.make_indirect_object_handle(ObjectHandle::integer(9))?;
         let signature = ObjectHandle::dictionary(vec![
+            (b"/Type".to_vec(), ObjectHandle::name(b"Sig".to_vec())),
             (
                 b"/ByteRange".to_vec(),
                 ObjectHandle::array(vec![ObjectHandle::integer(0), ObjectHandle::integer(1)]),
             ),
             (b"/Contents".to_vec(), ObjectHandle::string(vec![0, 0xff])),
+            (b"/Label".to_vec(), ObjectHandle::string(b"label".to_vec())),
             (b"/Mapped".to_vec(), mapped),
         ]);
         let mut output = Vec::new();
@@ -4795,6 +4820,56 @@ mod tests {
         let text = String::from_utf8_lossy(&output);
         assert!(text.contains("/ByteRange [\n"));
         assert!(text.contains("/Contents <00ff>"));
+        assert!(text.contains("/Label (label)"));
+        Ok(())
+    }
+
+    #[test]
+    fn mapped_id_writer_falls_back_to_general_object_emission() -> Result<()> {
+        let value = ObjectHandle::integer(7);
+        let mut output = Vec::new();
+        let map = |object_ref| Ok::<ObjectRef, Error>(object_ref);
+        assert_eq!(map(ObjectRef::new(1, 0))?, ObjectRef::new(1, 0));
+        super::super::output::with_buffer_sink(&mut output, |out| {
+            super::write_id_style_value_handle_with_ref_map(&value, out, &map, &BTreeSet::new())
+        })?;
+        assert_eq!(output, b"7");
+        Ok(())
+    }
+
+    #[test]
+    fn compact_trailer_adapter_skips_a_removed_reference() -> Result<()> {
+        let removed = ObjectHandle::new_indirect_unresolved(ObjectRef::new(9, 0), -1);
+        let entries = vec![(b"/Removed".to_vec(), removed)];
+        let removed_refs = [ObjectRef::new(9, 0)].into_iter().collect();
+        let map = |object_ref| Ok::<ObjectRef, Error>(object_ref);
+        assert_eq!(map(ObjectRef::new(1, 0))?, ObjectRef::new(1, 0));
+        let mut output = Vec::new();
+        super::super::output::with_buffer_sink(&mut output, |out| {
+            super::unparse_dictionary_entries_with_ref_map_and_id_writer(
+                &entries,
+                None,
+                &map,
+                &removed_refs,
+                false,
+                out,
+            )
+        })?;
+        assert_eq!(output, b"<< >>");
+
+        let null_entries = vec![(b"/Null".to_vec(), ObjectHandle::null())];
+        let mut null_output = Vec::new();
+        super::super::output::with_buffer_sink(&mut null_output, |out| {
+            super::unparse_dictionary_entries_with_ref_map_and_id_writer(
+                &null_entries,
+                None,
+                &map,
+                &BTreeSet::new(),
+                true,
+                out,
+            )
+        })?;
+        assert_eq!(null_output, b"<< >>");
         Ok(())
     }
 
@@ -4807,6 +4882,10 @@ mod tests {
         let trailer = ObjectHandle::dictionary(vec![
             (b"/Root".to_vec(), root),
             (b"/Custom".to_vec(), ObjectHandle::integer(9)),
+            (
+                b"/Removed".to_vec(),
+                ObjectHandle::new_indirect_unresolved(ObjectRef::new(10, 0), -1),
+            ),
             (
                 b"/ID".to_vec(),
                 ObjectHandle::array(vec![
@@ -4821,9 +4900,10 @@ mod tests {
         ]);
         let mut output = Vec::new();
         let map = |object_ref| Ok(object_ref);
+        let removed_refs = [ObjectRef::new(10, 0)].into_iter().collect();
 
         super::super::output::with_buffer_sink(&mut output, |out| {
-            trailer.write_trailer_with_ref_map(out, false, true, None, &map, &BTreeSet::new(), true)
+            trailer.write_trailer_with_ref_map(out, false, true, None, &map, &removed_refs, false)
         })?;
 
         let text = String::from_utf8(output).unwrap();
@@ -4832,6 +4912,7 @@ mod tests {
         assert!(text.contains("  /Custom 9\n"));
         assert!(text.contains("  /ID [<61><62>] /Encrypt 8 0 R\n"));
         assert!(text.contains(" /Encrypt 8 0 R\n>>\n"));
+        assert!(!text.contains("/Removed"));
         Ok(())
     }
 }

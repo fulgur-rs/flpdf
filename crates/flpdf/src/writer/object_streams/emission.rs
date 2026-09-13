@@ -136,8 +136,10 @@ where
     objects_section.reserve(first_offset);
     objects_section.resize(
         objects_len.checked_add(first_offset).ok_or_else(|| {
+            // cov:ignore-start: both lengths come from the same supported Vec allocation, so their sum cannot exceed usize in a constructible ObjStm.
             crate::Error::Unsupported("ObjStm body length overflows usize".to_string())
-        })?,
+            // cov:ignore-end
+        })?, // cov:ignore: LLVM maps the covered ObjStm body resize continuation to this line
         0,
     );
     objects_section.copy_within(0..objects_len, first_offset);

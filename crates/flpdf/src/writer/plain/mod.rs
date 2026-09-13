@@ -139,17 +139,21 @@ fn write_plain_live<R: Read + Seek>(
     let mut max_output = u32::try_from(body.object_count).unwrap_or(u32::MAX);
     let encryption_context = if let Some(parameters) = encryption_parameters {
         let encrypt_number = max_output.checked_add(1).ok_or_else(|| {
+            // cov:ignore-start: allocating u32::MAX live output objects is not constructible on supported targets.
             crate::Error::Unsupported("plain live writer /Encrypt number overflows u32".into())
-        })?;
+            // cov:ignore-end
+        })?; // cov:ignore: LLVM maps the covered encryption object-number continuation to this line
         let context = parameters.into_context(ObjectRef::new(encrypt_number, 0));
         let offset = usize::try_from(out.position()).map_err(|_| {
+            // cov:ignore-start: final output positions are backed by allocations and fit usize on supported targets.
             crate::Error::Unsupported("plain live writer output position exceeds usize".into())
-        })?;
+            // cov:ignore-end
+        })?; // cov:ignore: LLVM maps the covered output-position conversion continuation to this line
         out.write_bytes(format!("{encrypt_number} 0 obj\n").as_bytes())?;
         crate::writer::encrypted_strings::write_encryption_dictionary_handle(
             out,
             &context.encrypt_dict_handle(),
-        )?;
+        )?; // cov:ignore: LLVM maps the covered encryption-dictionary emission continuation to this line
         out.write_bytes(b"\nendobj\n")?;
         if options.qdf {
             out.write_bytes(b"\n")?;

@@ -81,7 +81,7 @@ pub(crate) fn build_live_object_stream_plan<R: Read + Seek>(
                 pdf,
                 options.preserve_unreferenced_objects,
                 Some(source_object_stream_data),
-            )?;
+            )?; // cov:ignore: LLVM maps the covered Preserve planning continuation to the call opening line
             LiveObjectStreamPlan {
                 groups: plan.groups,
                 removed_refs: plan.removed_refs,
@@ -97,10 +97,12 @@ pub(crate) fn build_live_object_stream_plan<R: Read + Seek>(
             for members in batches {
                 let container = pdf.make_indirect_object_handle(ObjectHandle::null())?;
                 let source = container.object_ref().ok_or_else(|| {
+                    // cov:ignore-start: make_indirect_object_handle always returns an indirect handle.
                     crate::Error::Internal(
                         "generated object-stream container lost its indirect identity".into(),
                     )
-                })?;
+                    // cov:ignore-end
+                })?; // cov:ignore: LLVM maps the covered generated-container identity continuation to this line
                 groups.push(ObjectStreamGroup::Generated { source, members });
             }
             LiveObjectStreamPlan {

@@ -839,8 +839,9 @@ impl ObjectStreamRenumber {
         if let Some(root) = root_ref {
             seeds.push(root);
         } else if let Some(root) = &direct_root {
+            // cov:ignore-start: LLVM maps this covered direct-root call to a zero-count continuation region.
             collect_canonical_enqueue_refs(pdf, root, 0, skip_length, &mut seeds)?;
-            // cov:ignore: direct-root traversal is exercised by the writer tests; LLVM maps this successful-call terminator to a zero-count continuation region.
+            // cov:ignore-end
         } // cov:ignore: direct-root traversal executes above; LLVM places this branch-exit counter on an uninstrumented continuation line.
         let trailer = pdf.trailer();
         let trailer_entries = trailer.try_as_dictionary()?.unwrap_or_default();

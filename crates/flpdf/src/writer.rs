@@ -3662,10 +3662,12 @@ fn pipe_writer_stream_payload(
             );
             state.with_object_data_key(object_ref.number, None, |state| {
                 let key = state.current_data_key().ok_or_else(|| {
+                    // cov:ignore-start: with_object_data_key always sets the key before invoking the top-level callback, matching QPDFWriter::setDataKey.
                     crate::Error::Internal(
                         "QPDFWriter stream encryption data key was not initialized".to_string(),
                     )
-                })?;
+                    // cov:ignore-end
+                })?; // cov:ignore: LLVM maps the covered empty-key fallback pipeline continuation to this line
                 if key.is_empty() {
                     run_writer_pipeline(&mut count, data)?;
                     return Ok(());
@@ -3677,7 +3679,7 @@ fn pipe_writer_stream_payload(
                             "rc4 stream encryption",
                             &mut count,
                             key,
-                        )?;
+                        )?; // cov:ignore: the preceding non-empty key guard makes the RC4 constructor's empty-key error unreachable here
                         run_writer_pipeline(&mut stage, data)
                     }
                     WriteCipher::PerObject(crate::encryption::standard::ObjectKeyAlg::Aes)
@@ -3783,9 +3785,11 @@ pub(crate) fn emit_canonical_pdf<R: Read + Seek, W: Write>(
             self.0.flush().map_err(Error::Io)
         }
 
+        // cov:ignore-start: this cfg(test) adapter emits bytes for unit tests; document finalization is owned by PdfWriter, not this helper.
         fn finish_document(&mut self) -> Result<()> {
             self.0.flush().map_err(Error::Io)
         }
+        // cov:ignore-end
     }
 
     let setup = build_writer_setup(pdf, options)?;
@@ -3899,7 +3903,7 @@ fn write_pclm<R: Read + Seek>(
                         dictionary_options,
                         &mut map,
                         &removed,
-                    )?;
+                    )?; // cov:ignore: LLVM maps the covered PCLm source-stream dictionary call continuation to this line
                     write_pclm_stream_payload(out, &data, options.newline_before_endstream)?;
                 } else {
                     let mut map = |child: &ObjectHandle| queue.enqueue_handle(pdf, child.clone());
@@ -3927,7 +3931,7 @@ fn write_pclm<R: Read + Seek>(
                     dictionary_options,
                     &mut map,
                     &removed,
-                )?;
+                )?; // cov:ignore: LLVM maps the covered PCLm synthetic-stream dictionary call continuation to this line
                 write_pclm_stream_payload(out, &data, options.newline_before_endstream)?;
                 out.write_bytes(b"\nendobj\n")?;
                 offsets.insert(output.number, (0, offset));
@@ -4021,7 +4025,7 @@ fn write_pclm<R: Read + Seek>(
             &trailer_map,
             &removed,
             true,
-        )?;
+        )?; // cov:ignore: LLVM maps the covered deterministic PCLm trailer call continuation to this line
     } else {
         trailer.write_trailer_with_ref_map(
             out,
@@ -4031,7 +4035,7 @@ fn write_pclm<R: Read + Seek>(
             &trailer_map,
             &removed,
             true,
-        )?;
+        )?; // cov:ignore: LLVM maps the covered materialized PCLm trailer call continuation to this line
     }
     out.write_bytes(format!("\nstartxref\n{xref_offset}\n%%EOF\n").as_bytes())?;
     Ok(WriterResult::new(emitted_old_to_new, written_xref))
@@ -4335,6 +4339,7 @@ mod final_handle_writer_tests {
             writes: Rc::clone(&writes),
             finishes: Rc::clone(&finishes),
         };
+        assert_eq!(pipeline.identifier(), "writer test finish failure");
 
         let error = run_writer_pipeline(&mut pipeline, b"stream payload")
             .expect_err("a segment finish failure must escape the writer pipeline");
@@ -4393,6 +4398,40 @@ mod final_handle_writer_tests {
         })
         .expect("disabled stream encryption leaves payload plain");
         assert_eq!(plain, data);
+
+        let mut empty_file_key = Vec::new();
+        output::with_buffer_sink(&mut empty_file_key, |out| {
+            pipe_writer_stream_payload(
+                out,
+                data,
+                ObjectRef::new(3, 0),
+                &stream_encryption_context(WriteCipher::FileKeyAes256, Vec::new(), true),
+                true,
+                None,
+            )
+        })
+        .expect("an empty V5 file key uses the cleartext pipeline fallback");
+        assert_eq!(empty_file_key, data);
+
+        for (static_aes_iv, explicit_iv) in [(true, Some([4; 16])), (false, None)] {
+            let mut short_aes = Vec::new();
+            let error = output::with_buffer_sink(&mut short_aes, |out| {
+                pipe_writer_stream_payload(
+                    out,
+                    data,
+                    ObjectRef::new(3, 0),
+                    &stream_encryption_context(
+                        WriteCipher::FileKeyAes256,
+                        vec![1; 15],
+                        static_aes_iv,
+                    ),
+                    true,
+                    explicit_iv,
+                )
+            })
+            .expect_err("a short AES key must be rejected by the encryption pipeline");
+            assert!(error.to_string().contains("at least 16"));
+        }
 
         let mut rc4 = Vec::new();
         output::with_buffer_sink(&mut rc4, |out| {
@@ -4987,6 +5026,34 @@ mod final_handle_writer_tests {
     }
 
     #[test]
+    fn canonical_writer_rejects_mutually_exclusive_encryption_modes() {
+        let mut pdf = Pdf::empty().expect("empty PDF");
+        let options = WriterOptions {
+            encrypt: Some(EncryptParams::v4_aes128(b"user", b"owner")),
+            copy_encryption: Some(CopyEncryptionSource {
+                encrypt_dict: ObjectHandle::dictionary(vec![
+                    (b"/V".to_vec(), ObjectHandle::integer(4)),
+                    (b"/R".to_vec(), ObjectHandle::integer(4)),
+                ]),
+                file_key: vec![0; 16],
+                id0: vec![0; 16],
+                object_key_alg: ObjectKeyAlg::Rc4,
+            }),
+            ..WriterOptions::default()
+        };
+        let setup = WriterSetupState {
+            generated_id: None,
+            encryption_parameters: None,
+            source_object_stream_data: BTreeMap::new(),
+        };
+        let error = output::with_buffer_sink(&mut Vec::new(), |out| {
+            emit_canonical_pdf_inner(&mut pdf, out, &options, None, setup)
+        })
+        .expect_err("encrypt and copy_encryption must not be combined");
+        assert!(error.to_string().contains("mutually exclusive"));
+    }
+
+    #[test]
     fn job_writer_password_normalization_covers_each_encryption_revision() {
         let mut empty = WriterConfiguration::default();
         assert_eq!(
@@ -5360,6 +5427,25 @@ mod final_handle_writer_tests {
         assert!(output
             .windows(b"/ID [".len())
             .any(|window| window == b"/ID ["));
+    }
+
+    #[test]
+    fn pclm_adds_a_separator_after_raw_internal_header_text() {
+        let mut pdf = Pdf::open(Cursor::new(
+            include_bytes!("../../../tests/fixtures/compat/direct-root-one-page.pdf").to_vec(),
+        ))
+        .expect("minimal PCLm fixture must open");
+        let options = WriterOptions {
+            pclm: true,
+            extra_header_text: "%raw-internal-header".to_owned(),
+            ..WriterOptions::default()
+        };
+        let mut output = Vec::new();
+
+        output::with_buffer_sink(&mut output, |out| write_pclm(&mut pdf, out, &options, None))
+            .expect("PCLm accepts an internal header value without a trailing newline");
+
+        assert!(output.starts_with(b"%PDF-1.4\n%PCLm 1.0\n%raw-internal-header\n"));
     }
 
     #[test]
