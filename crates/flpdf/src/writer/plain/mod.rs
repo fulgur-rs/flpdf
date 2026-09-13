@@ -242,6 +242,15 @@ fn write_plain_live<R: Read + Seek>(
         crate::Error::Unsupported("plain live writer: late trailer number overflows u32".into())
         // cov:ignore-end
     })?; // cov:ignore: the live body object count is bounded by qpdf's u32 object-number domain.
+    let initial_late_trailer_number = if has_object_stream_hint {
+        initial_late_trailer_number.checked_add(1).ok_or_else(|| {
+            // cov:ignore-start: the supported writer object-number domain cannot exhaust u32.
+            crate::Error::Unsupported("plain live writer: xref object number overflows u32".into())
+            // cov:ignore-end
+        })? // cov:ignore: xref-number reservation is bounded by qpdf's u32 object-number domain.
+    } else {
+        initial_late_trailer_number
+    };
     let mut next_late_trailer_number = extend_late_trailer_map(
         pdf,
         &mut trailer_map,
