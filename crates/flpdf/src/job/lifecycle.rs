@@ -3193,10 +3193,21 @@ impl QPDFJob {
                     && pdf.is_encrypted()
                     && pdf.encryption_file_key().is_none() =>
             {
-                // qpdf reports the encryption parameters from the partial
-                // document and returns nullptr before update/page
-                // transformations or write/inspection continuation.
-                self.show_encryption(&mut pdf, self.configuration.password_is_hex_key)?;
+                // qpdf evaluates encryption-status queries before its
+                // show-encryption fallback in the password-error catch
+                // (`libqpdf/QPDFJob.cc:436-448`). Record the status and skip
+                // the report when both kinds of inspection are configured.
+                if self.configuration.is_encrypted || self.configuration.requires_password {
+                    self.encryption_status = EncryptionStatus {
+                        encrypted: true,
+                        password_incorrect: true,
+                    };
+                } else {
+                    // qpdf reports the encryption parameters from the partial
+                    // document and returns nullptr before update/page
+                    // transformations or write/inspection continuation.
+                    self.show_encryption(&mut pdf, self.configuration.password_is_hex_key)?;
+                }
                 self.create_qpdf_succeeded_without_document = true;
                 Ok(None)
             }

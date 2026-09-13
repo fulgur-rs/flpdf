@@ -93,9 +93,9 @@ if (pdf) { writeQPDF(*pdf); }
 
 1. `checkConfiguration()`（public、`libqpdf/QPDFJob.cc:566-642`）。
 2. `processFile(pdf_sp, infilename, password, true, true)`（private、`libqpdf/QPDFJob.cc:1793-1804`）。
-   `QPDFExc` で `qpdf_e_password` の場合のみ、`check_is_encrypted` / `check_requires_password` なら
-   `encryption_status` を立てて `nullptr`、`show_encryption` なら `showEncryption` を呼んで `nullptr`。
-   それ以外は再 throw。
+   `QPDFExc` で `qpdf_e_password` の場合のみ、`check_is_encrypted` / `check_requires_password` を
+   `show_encryption` より先に評価し、`encryption_status` を立てて `nullptr`、status query が無い場合だけ
+   `show_encryption` が `showEncryption` を呼んで `nullptr`。それ以外は再 throw。
 3. `pdf.isEncrypted()` なら `encryption_status = qpdf_es_encrypted`。
 4. `check_is_encrypted || check_requires_password` なら **ここで `nullptr`**（出力しない）。
 5. `update_from_json` が非空なら `pdf.updateFromJSON(...)`（「他の変換より先」と明記）。
