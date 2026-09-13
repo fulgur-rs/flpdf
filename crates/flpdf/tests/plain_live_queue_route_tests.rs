@@ -15,6 +15,21 @@ fn plain_disable_uses_the_live_queue_consumer() {
 }
 
 #[test]
+fn planned_preserve_uses_the_d9_source_membership_owner() {
+    // qpdf has one source-membership owner, `getObjectStreamData`
+    // (`QPDF.cc:2381-2390`); Preserve's early-return decision consumes that
+    // map inside `preserveObjectStreams` (`QPDFWriter.cc:1939-1967`). The
+    // planned consumer must not rederive the same fact from a second raw-xref
+    // predicate.
+    let root = Path::new(env!("CARGO_MANIFEST_DIR")).join("src");
+    let plan = std::fs::read_to_string(root.join("writer/plain/plan.rs")).unwrap();
+
+    assert!(!plan.contains("source_has_compressed_entries"));
+    assert!(plan.contains("source_object_stream_data"));
+    assert!(plan.contains("get_object_stream_data"));
+}
+
+#[test]
 fn plain_disable_reconciles_direct_adbe_before_live_child_enqueue() {
     // qpdf 11.9.0: QPDFWriter.cc:1418-1430 replaces stale /ADBE before
     // unparseChild can enqueue the obsolete indirect /URL value.

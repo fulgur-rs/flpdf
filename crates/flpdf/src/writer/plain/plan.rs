@@ -14,9 +14,7 @@ use crate::writer::rewrite_renumber::{
     CanonicalCatalogFirstRenumber, NewNumberLookup, ObjectStreamRenumber, StreamParametersRemoved,
 };
 use crate::writer::{ObjectWriterEmission, WriterOptions};
-use crate::{
-    CompressStreams, ObjectHandle, ObjectRef, PageDocumentHelper, Pdf, XrefEntry, XrefForm,
-};
+use crate::{CompressStreams, ObjectHandle, ObjectRef, PageDocumentHelper, Pdf, XrefForm};
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub(crate) struct PlannedMember {
@@ -130,11 +128,18 @@ impl PlainWritePlan {
         options: &WriterOptions,
         setup_generated_id: Option<&crate::ObjectHandle>,
     ) -> crate::Result<Self> {
+        let mut source_object_stream_data = BTreeMap::new();
+        if options.object_streams == ObjectStreamMode::Preserve {
+            // Keep the test-only convenience wrapper on the same canonical
+            // D9 source-membership owner as production setup. It must not
+            // rederive the empty/non-empty decision from raw xref entries.
+            pdf.get_object_stream_data(&mut source_object_stream_data);
+        }
         Self::build_with_generated_id_and_source_object_stream_data(
             pdf,
             options,
             setup_generated_id,
-            None,
+            &source_object_stream_data,
             None,
             &[],
         )
@@ -144,7 +149,7 @@ impl PlainWritePlan {
         pdf: &mut Pdf<R>,
         options: &WriterOptions,
         setup_generated_id: Option<&crate::ObjectHandle>,
-        source_object_stream_data: Option<&BTreeMap<u32, u32>>,
+        source_object_stream_data: &BTreeMap<u32, u32>,
         generated_compressible: Option<&object_streams::CompressiblePlan>,
         generated_object_stream_sources: &[ObjectRef],
     ) -> crate::Result<Self> {
@@ -158,7 +163,7 @@ impl PlainWritePlan {
         } else {
             None
         };
-        let source_had_compressed_objects = source_has_compressed_entries(pdf);
+        let source_had_compressed_objects = !source_object_stream_data.is_empty();
         // qpdf's removeObject erases the canonical cache slot rather than
         // retaining a persistent deleted-reference tombstone.
         let explicitly_removed = BTreeSet::new();
@@ -241,7 +246,7 @@ impl PlainWritePlan {
                         object_streams::plan_qpdf_preserve_object_streams_with_source_membership(
                             pdf,
                             options.preserve_unreferenced_objects,
-                            source_object_stream_data,
+                            Some(source_object_stream_data),
                         )?; // cov:ignore: malformed source graph is rejected by the preserve planner
                     packing
                         .removed_refs
@@ -1167,12 +1172,6 @@ fn build_container_aware(
         old_to_new,
         removed_refs,
     })
-}
-
-pub(crate) fn source_has_compressed_entries<R: Read + Seek>(pdf: &Pdf<R>) -> bool {
-    pdf.source_xref_entries()
-        .values()
-        .any(|offset| matches!(offset, XrefEntry::Compressed { .. }))
 }
 
 impl NewNumberLookup for PlainWritePlan {

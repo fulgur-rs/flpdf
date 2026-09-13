@@ -71,7 +71,7 @@ pub(crate) fn write_plain<R: Read + Seek, W: Write>(
         pdf,
         options,
         generated_id,
-        Some(source_object_stream_data),
+        source_object_stream_data,
         generated_compressible,
         generated_object_stream_sources,
     )?;
