@@ -34,7 +34,7 @@ use std::io::{Read, Seek};
 use crate::object_ref::ObjectRef;
 use crate::parser::MAX_PARSE_DEPTH;
 use crate::qpdf_obj_gen::QpdfObjGen;
-use crate::writer::object_streams::{sort_source_backed_members_qpdf_order, ObjectStreamGroup};
+use crate::writer::object_streams::{sort_members_qpdf_order, ObjectStreamGroup};
 use crate::Error;
 use crate::Pdf;
 use crate::XrefEntry;
@@ -732,13 +732,7 @@ impl ObjectStreamRenumber {
             // that set directly (`QPDFWriter.cc:1621-1758`). A multi-source
             // target therefore uses the recorded original-object provenance,
             // while an ordinary source uses its local ObjGen directly.
-            if matches!(group, ObjectStreamGroup::SourceBacked { .. }) {
-                sort_source_backed_members_qpdf_order(pdf, &mut sorted);
-            } else if pdf.writer_object_order.is_some() {
-                sorted.sort_unstable_by_key(|object_ref| pdf.writer_object_order_key(*object_ref));
-            } else {
-                sorted.sort_unstable_by_key(|r| (r.number, r.generation));
-            }
+            sort_members_qpdf_order(pdf, &mut sorted);
             for &m in &sorted {
                 if let Some(previous) = member_to_group.insert(m, gi) {
                     return Err(Error::Unsupported(format!(

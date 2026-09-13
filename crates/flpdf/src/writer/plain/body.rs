@@ -132,7 +132,7 @@ impl LiveQueue {
                 continue;
             }
             if source_backed {
-                object_streams::sort_source_backed_members_qpdf_order(pdf, &mut retained);
+                object_streams::sort_members_qpdf_order(pdf, &mut retained);
             }
             for member in &retained {
                 self.member_to_container.insert(*member, source);

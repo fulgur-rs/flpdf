@@ -788,6 +788,54 @@ fn specialized_encrypted_live_queue_discovers_callback_children_in_each_mode() {
 }
 
 #[test]
+fn plain_generate_progress_callback_discovers_child_through_live_queue() {
+    let mut pdf = Pdf::open(Cursor::new(
+        include_bytes!("../../../tests/fixtures/compat/one-page-no-ext.pdf").to_vec(),
+    ))
+    .unwrap();
+    let root = pdf.root_handle().unwrap();
+    let child = pdf
+        .make_indirect_object_handle(ObjectHandle::dictionary(vec![(
+            b"/PlainGenerateProgressChild".to_vec(),
+            ObjectHandle::integer(42),
+        )]))
+        .unwrap();
+
+    let mut writer = PdfWriter::new(&mut pdf);
+    writer.set_object_stream_mode(ObjectStreamMode::Generate);
+    writer.set_static_id(true);
+    writer.set_output_memory().unwrap();
+    let mut called = false;
+    writer.register_progress_reporter(Box::new(move |_percent| {
+        if !called {
+            called = true;
+            root.replace_key(b"/PlainGenerateProgressProbe", child.clone())?;
+        }
+        Ok(())
+    }));
+    writer
+        .write()
+        .expect("plain Generate must use specialized live child discovery");
+
+    let output = writer.get_buffer().unwrap();
+    let mut rewritten = Pdf::open(Cursor::new(output)).unwrap();
+    let rewritten_root = rewritten.root_handle().unwrap();
+    let child_ref = rewritten_root
+        .try_get_key(b"/PlainGenerateProgressProbe")
+        .unwrap()
+        .object_ref()
+        .expect("live Generate must retain the callback child reference");
+    assert_eq!(
+        rewritten
+            .get_object_handle(child_ref)
+            .try_get_key(b"/PlainGenerateProgressChild")
+            .unwrap()
+            .as_integer(),
+        Some(42)
+    );
+}
+
+#[test]
 fn specialized_encrypted_progress_trailer_child_gets_a_late_number() {
     let mut pdf = Pdf::open(Cursor::new(
         include_bytes!("../../../tests/fixtures/compat/one-page-no-ext.pdf").to_vec(),

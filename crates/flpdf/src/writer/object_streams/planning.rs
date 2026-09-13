@@ -216,29 +216,7 @@ pub(crate) fn plan_object_streams_with_reachability_and_source_membership<
                 removed_refs: source_plan.removed_refs,
             })
         }
-        ObjectStreamMode::Generate => {
-            // Only Generate consumes the `/Length` exclusions, and only
-            // QPDFWriter::generateObjectStreams calls getCompressibleObjGens
-            // unconditionally. Preserve must not run the walk here: qpdf reads
-            // the source membership map first and only then intersects it with
-            // the compressible set (`QPDFWriter.cc:1941-1957`), an order the
-            // shared Preserve planner already reproduces internally. Running
-            // the walk up front inverted it, because the walk can drop stale
-            // generations from the document xref that the membership map is
-            // about to be read from.
-            let length_exclusions = if let Some(snapshot) = generated_snapshot {
-                snapshot.indirect_objstm_length_refs.clone()
-            } else {
-                compressible_objgens_qpdf_plan(pdf)?.indirect_objstm_length_refs
-            };
-            plan_generate(
-                pdf,
-                config,
-                &length_exclusions,
-                reachable,
-                generated_snapshot,
-            )
-        }
+        ObjectStreamMode::Generate => plan_generate(pdf, config, reachable, generated_snapshot),
     }
 }
 
@@ -326,10 +304,6 @@ pub(crate) fn plan_qpdf_preserve_object_streams_with_source_membership<
         .then(|| compressible_objgens_qpdf_plan(pdf))
         .transpose()?;
     let ctx = eligibility_context(pdf)?;
-    let length_exclusions = compressible
-        .as_ref()
-        .map(|plan| plan.indirect_objstm_length_refs.clone())
-        .unwrap_or_default();
     let eligible: BTreeSet<ObjectRef> = compressible
         .as_ref()
         .map(|plan| plan.eligible.iter().copied().collect())
@@ -347,9 +321,7 @@ pub(crate) fn plan_qpdf_preserve_object_streams_with_source_membership<
     for (source, members) in by_container {
         let mut retained = Vec::new();
         for member in members {
-            if length_exclusions.contains(&member)
-                || (!preserve_unreferenced && !eligible.contains(&member))
-            {
+            if !preserve_unreferenced && !eligible.contains(&member) {
                 continue;
             }
             // qpdf's preserve path applies the compressible eligibility filter
@@ -368,7 +340,7 @@ pub(crate) fn plan_qpdf_preserve_object_streams_with_source_membership<
                 retained.push(member);
             }
         }
-        sort_source_backed_members_qpdf_order(pdf, &mut retained);
+        sort_members_qpdf_order(pdf, &mut retained);
         if !retained.is_empty() {
             groups.push(ObjectStreamGroup::SourceBacked {
                 source,
@@ -401,7 +373,6 @@ pub(crate) fn plan_qpdf_preserve_object_streams_with_source_membership<
 fn plan_generate<R: std::io::Read + std::io::Seek>(
     pdf: &mut crate::Pdf<R>,
     config: &PlannerConfig,
-    length_exclusions: &BTreeSet<ObjectRef>,
     reachable: Option<&BTreeSet<ObjectRef>>,
     generated_snapshot: Option<&super::CompressiblePlan>,
 ) -> crate::Result<PackingPlan> {
@@ -414,16 +385,16 @@ fn plan_generate<R: std::io::Read + std::io::Seek>(
     } else {
         compressible_objgens_qpdf_plan(pdf)?
     };
-    compressible.eligible.retain(|member| {
-        !length_exclusions.contains(member)
-            && reachable.is_none_or(|reachable| reachable.contains(member))
-    });
-    // A fresh multi-source page target has new local ObjectRefs for both the
-    // primary and foreign graphs. qpdf keeps primary objects in source-number
-    // order while copyForeignObject assigns foreign objects in discovery
-    // order; the merge records that provenance on Pdf so generated ObjStm
-    // members can use the same order without changing ordinary documents.
-    sort_compressible_for_writer_order(pdf, &mut compressible.eligible);
+    compressible
+        .eligible
+        .retain(|member| reachable.is_none_or(|reachable| reachable.contains(member)));
+    // Keep the qpdf DFS order through the even split. qpdf creates the groups
+    // from that candidate sequence (`QPDFWriter.cc:1970-2006`) and only the
+    // reverse membership walk sorts members within each group
+    // (`QPDFWriter.cc:1621-1758`). A fresh multi-source target's provenance is
+    // therefore applied by `sort_members_qpdf_order` after this split, not to
+    // the full candidate vector before it; sorting here would move objects
+    // across the qpdf group boundary.
     let batches = even_split_into_streams_with_cap(&compressible.eligible, config.batch_size_cap);
     let source_containers = vec![None; batches.len()];
 
@@ -434,21 +405,13 @@ fn plan_generate<R: std::io::Read + std::io::Seek>(
     })
 }
 
-fn sort_compressible_for_writer_order<R: Read + Seek + 'static>(
-    pdf: &crate::Pdf<R>,
-    eligible: &mut [ObjectRef],
-) {
-    if pdf.writer_object_order.is_some() {
-        eligible.sort_unstable_by_key(|object_ref| pdf.writer_object_order_key(*object_ref));
-    }
-}
-
-/// Order members of an existing source-backed ObjStm the way qpdf's
-/// `std::set<QPDFObjGen>` orders the source membership. A fresh multi-source
-/// target has new local `ObjectRef`s, so use the recorded original-object
-/// provenance there; an ordinary parsed document has no separate provenance
-/// map and its local source reference is already the qpdf source ObjGen.
-pub(crate) fn sort_source_backed_members_qpdf_order<R: Read + Seek>(
+/// Order ObjStm members the way qpdf's `std::set<QPDFObjGen>` orders them.
+/// A fresh multi-source target has new local `ObjectRef`s, so use the recorded
+/// original-object provenance there; an ordinary parsed document has no
+/// separate provenance map and its local source reference is already the
+/// qpdf source ObjGen. The same rule applies to fresh Generated groups: their
+/// members still represent source objects copied into the merge target.
+pub(crate) fn sort_members_qpdf_order<R: Read + Seek>(
     pdf: &crate::Pdf<R>,
     members: &mut [ObjectRef],
 ) {
@@ -462,9 +425,8 @@ pub(crate) fn sort_source_backed_members_qpdf_order<R: Read + Seek>(
 #[cfg(test)]
 mod tests {
     use super::{
-        plan_object_streams_with_reachability_and_source_membership,
-        sort_compressible_for_writer_order, ObjectStreamMode, PlannerConfig,
-        DEFAULT_BATCH_SIZE_CAP,
+        plan_object_streams_with_reachability_and_source_membership, sort_members_qpdf_order,
+        ObjectStreamMode, PlannerConfig, DEFAULT_BATCH_SIZE_CAP,
     };
     use crate::pdf::WriterObjectOrderKey;
     use crate::{ObjectRef, Pdf};
@@ -480,7 +442,7 @@ mod tests {
     }
 
     #[test]
-    fn generated_merge_candidates_use_primary_then_foreign_writer_order() {
+    fn generated_merge_members_use_primary_then_foreign_writer_order() {
         let mut pdf = crate::Pdf::empty().expect("create merge target");
         let primary = ObjectRef::new(17, 0);
         let foreign = ObjectRef::new(3, 0);
@@ -490,7 +452,7 @@ mod tests {
         pdf.set_writer_object_order(order);
 
         let mut eligible = vec![foreign, primary];
-        sort_compressible_for_writer_order(&pdf, &mut eligible);
+        sort_members_qpdf_order(&pdf, &mut eligible);
 
         assert_eq!(eligible, [primary, foreign]);
     }
