@@ -2092,6 +2092,19 @@ same Job configuration for the `show-pages` and `show-object` consumers
 (`QPDFJob_config.cc:414-417,654-656`; `QPDFJob.cc:816-829`). qtest exceptions
 and unrelated transformation/page-operation routes remain outside this row.
 
+`flpdf-5qbs` closes the remaining argv-surface mismatch in this inspection row.
+qpdf accepts repeated `doInspection` selectors: the boolean Config setters are
+idempotent, while `Config::showObject` and `Config::showAttachment` overwrite
+their stored selector with the last occurrence (`QPDFJob.cc:1645-1693`;
+`QPDFJob_config.cc:378-380,543-545,766-768`). The top-level clap surface now
+models those same last-occurrence/idempotent semantics with self-overrides.
+`--list-attachments` and `--show-attachment` are left as independent
+inspection consumers so both execute in qpdf order; only the three
+mutation-operation group members remain mutually exclusive at the argv layer.
+`crates/flpdf-cli/tests/cli_inspection_argv.rs` fixes the qpdf 11.9.0
+status/stdout/stderr differential for repeated inspection flags, selector
+last-wins, and list-plus-show attachment output.
+
 ### `qpdfjob-c` wrapper のエラー境界
 
 qpdf の `wrap_qpdfjob`（`libqpdf/qpdfjob-c.cc:32-40`）は、
