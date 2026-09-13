@@ -4837,16 +4837,10 @@ fn run_command(command: Commands, overlay_specs: &[OverlaySpec]) -> CliResult<()
                 // run_rewrite_with_page_ops) already accept and apply it via
                 // `image_transform_options`, mirroring
                 // the top-level --pages/--rotate/--split-pages routes.
-                if cmd.remove_restrictions
-                    || cmd.decrypt
-                    || cmd.copy_encryption.is_some()
-                    || cmd.generate_appearances
-                    || cmd.flatten_annotations.is_some()
-                {
+                if cmd.remove_restrictions || cmd.decrypt || cmd.copy_encryption.is_some() {
                     emit_logger_error(
                         "flpdf: --remove-restrictions / --decrypt / \
-                         --copy-encryption / --flatten-annotations / \
-                         --generate-appearances are \
+                         --copy-encryption are \
                          not applied in the --pages/--rotate/--split-pages/\
                          --collate pipeline; rerun without them or without \
                          the page operation\n",
