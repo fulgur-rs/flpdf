@@ -1,4 +1,5 @@
 //! qpdf correspondence: QPDF.cc readObject/readStream framing and recovery split from the document reader.
+use crate::object_handle::SourceExtents;
 use crate::parser::{
     keyword_token_end, parse_qpdf_file_object_handle_with_diagnostics, HandleResolver,
 };
@@ -119,6 +120,7 @@ pub(crate) struct HandleFileObjectRead {
     pub(crate) object_ref: ObjectRef,
     pub(crate) object: ObjectHandle,
     pub(crate) diagnostics: Vec<FileObjectDiagnostic>,
+    pub(crate) source_extents: SourceExtents,
     /// Stream payload offset relative to the input slice, when this read
     /// produced a stream. Bootstrap xref parsing uses it to report errors at
     /// the same source byte as qpdf's xref-stream decoder.
@@ -257,11 +259,12 @@ pub(crate) fn finish_file_object_handle(
             next_offset,
         } => {
             let end_before_space = check_endobj(input, next_offset, &mut diagnostics)?;
-            set_end_offsets(&object, input, end_before_space);
+            let source_extents = source_extents_for_input(input, end_before_space);
             Ok(HandleFileObjectRead {
                 object_ref,
                 object,
                 diagnostics,
+                source_extents,
                 stream_data_offset: None,
                 included_recovery_eol: None,
             })
@@ -299,11 +302,12 @@ fn finish_handle_stream(
     )?;
     let end_before_space =
         check_endobj(input, completed.after_endstream, &mut completed.diagnostics)?;
-    set_end_offsets(&completed.object, input, end_before_space);
+    let source_extents = source_extents_for_input(input, end_before_space);
     Ok(HandleFileObjectRead {
         object_ref,
         object: completed.object,
         diagnostics: completed.diagnostics,
+        source_extents,
         stream_data_offset: Some(data_start),
         included_recovery_eol: completed.included_recovery_eol,
     })
@@ -440,16 +444,15 @@ fn check_endobj(
 /// a cache value (`libqpdf/QPDF.cc:1651-1663`). The file-object parser works
 /// on an object-relative slice, so `read_file_object` rebases these positions
 /// to the source offset before the handle leaves this module.
-fn set_end_offsets(object: &ObjectHandle, input: &[u8], end_before_space: Option<usize>) {
+fn source_extents_for_input(input: &[u8], end_before_space: Option<usize>) -> SourceExtents {
     let Some(end_before_space) = end_before_space else {
-        object.set_end_offsets(-1, -1);
-        return;
+        return SourceExtents::UNSET;
     };
     let end_after_space = skip_pdf_ws(input, end_before_space);
-    object.set_end_offsets(
-        i64::try_from(end_before_space).unwrap_or(i64::MAX),
-        i64::try_from(end_after_space).unwrap_or(i64::MAX),
-    );
+    SourceExtents {
+        end_before_space: i64::try_from(end_before_space).unwrap_or(i64::MAX),
+        end_after_space: i64::try_from(end_after_space).unwrap_or(i64::MAX),
+    }
 }
 
 fn recover_stream_boundary(

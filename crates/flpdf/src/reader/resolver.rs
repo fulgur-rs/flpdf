@@ -87,7 +87,7 @@
 use crate::encryption::crypt_filters::interpret_cf_from_handle;
 use crate::encryption::state::{EncryptionMode, EncryptionState};
 use crate::object_handle::{
-    DocumentResolver, ObjectValue, StreamDataProvider, StreamValue, NO_PARSED_OFFSET,
+    DocumentResolver, ObjectValue, SourceExtents, StreamDataProvider, StreamValue, NO_PARSED_OFFSET,
 };
 use crate::parser::{
     parse_live_file_object_with_decrypter, parse_object_handle_with_context,
@@ -323,6 +323,23 @@ fn object_ref_xref_entries(
         .collect()
 }
 
+/// qpdf's private `QPDF::ObjCache` entry (`include/qpdf/QPDF.hh:868-889`):
+/// canonical handle identity and source-layout metadata share one cache node.
+#[derive(Clone, Debug)]
+pub(crate) struct ObjectCacheEntry {
+    pub(crate) handle: ObjectHandle,
+    pub(crate) source_extents: SourceExtents,
+}
+
+impl ObjectCacheEntry {
+    fn new(handle: ObjectHandle) -> Self {
+        Self {
+            handle,
+            source_extents: SourceExtents::UNSET,
+        }
+    }
+}
+
 pub(crate) struct ResolverCore<R: Read + Seek + 'static> {
     /// qpdf `m->file` (`QPDF.hh:1456`).
     /// The current `InputSource` pointer. Closing replaces this pointer with
@@ -365,7 +382,7 @@ pub(crate) struct ResolverCore<R: Read + Seek + 'static> {
     ///
     /// The teardown walk moved with it: [`ResolverHandle::disconnect_all`] is
     /// what `Pdf::drop` now calls.
-    object_cache: BTreeMap<QpdfObjGen, ObjectHandle>,
+    object_cache: BTreeMap<QpdfObjGen, ObjectCacheEntry>,
     /// qpdf m->last_object_description (QPDF.hh:1457), retained for
     /// damaged-PDF warnings raised after a cache-preparing operation such as
     /// QPDF::nextObjGen (QPDF.cc:1873-1879). This UTF-8-facing projection is
@@ -1061,7 +1078,9 @@ impl<R: Read + Seek> ResolverHandle<R> {
             ObjectHandle::new_reserved_for_pdf(object_ref, self.pdf_unique_id.get(), resolver);
         let object_gen = QpdfObjGen::from_object_ref(object_ref);
         let mut core = self.core.borrow_mut();
-        let previous = core.object_cache.insert(object_gen, reserved.clone());
+        let previous = core
+            .object_cache
+            .insert(object_gen, ObjectCacheEntry::new(reserved.clone()));
         core.record_allocated_object(object_gen);
         debug_assert!(
             previous.is_none(),
@@ -1227,7 +1246,7 @@ impl<R: Read + Seek> ResolverHandle<R> {
             .borrow()
             .object_cache
             .values()
-            .filter(|handle| handle.is_resolved())
+            .filter(|entry| entry.handle.is_resolved())
             .count()
     }
 
@@ -1241,13 +1260,14 @@ impl<R: Read + Seek> ResolverHandle<R> {
             .entry(object_gen)
             .or_insert_with(|| {
                 let resolver: Weak<dyn DocumentResolver> = self.self_weak.clone();
-                ObjectHandle::new_indirect_for_qpdf_obj_gen_with_resolver(
+                ObjectCacheEntry::new(ObjectHandle::new_indirect_for_qpdf_obj_gen_with_resolver(
                     object_gen,
                     NO_PARSED_OFFSET,
                     self.pdf_unique_id.get(),
                     resolver,
-                )
+                ))
             })
+            .handle
             .clone();
         handle.promote_to_indirect_qpdf_obj_gen(
             object_gen,
@@ -1277,9 +1297,11 @@ impl<R: Read + Seek> ResolverHandle<R> {
             ObjectHandle::new_reserved_for_pdf(object_ref, self.pdf_unique_id.get(), resolver);
         let object_gen = QpdfObjGen::from_object_ref(object_ref);
         let mut core = self.core.borrow_mut();
-        let previous = core.object_cache.insert(object_gen, reserved.clone());
+        let previous = core
+            .object_cache
+            .insert(object_gen, ObjectCacheEntry::new(reserved.clone()));
         core.record_allocated_object(object_gen);
-        previous.unwrap_or(reserved)
+        previous.map(|entry| entry.handle).unwrap_or(reserved)
     }
 
     /// Construct a direct value with this document's weak context, matching
@@ -1492,7 +1514,11 @@ impl<R: Read + Seek> ResolverHandle<R> {
         &self,
         object_gen: QpdfObjGen,
     ) -> Option<ObjectHandle> {
-        self.core.borrow().object_cache.get(&object_gen).cloned()
+        self.core
+            .borrow()
+            .object_cache
+            .get(&object_gen)
+            .map(|entry| entry.handle.clone())
     }
 
     /// Whether `object_ref` was created through a qpdf-shaped allocation or
@@ -1530,7 +1556,12 @@ impl<R: Read + Seek> ResolverHandle<R> {
     /// Raw cache values for internal inspection, without `newIndirect`'s
     /// active-identity update. Public enumeration uses [`Self::get_all_objects`].
     pub(crate) fn all_object_handles(&self) -> Vec<ObjectHandle> {
-        self.core.borrow().object_cache.values().cloned().collect()
+        self.core
+            .borrow()
+            .object_cache
+            .values()
+            .map(|entry| entry.handle.clone())
+            .collect()
     }
 
     /// Prepare and enumerate qpdf's cache in key order. Each `newIndirect`
@@ -1543,7 +1574,7 @@ impl<R: Read + Seek> ResolverHandle<R> {
             .borrow()
             .object_cache
             .iter()
-            .map(|(object_gen, handle)| (*object_gen, handle.clone()))
+            .map(|(object_gen, entry)| (*object_gen, entry.handle.clone()))
             .collect();
         Ok(entries
             .into_iter()
@@ -1742,7 +1773,8 @@ impl<R: Read + Seek> ResolverHandle<R> {
         let object_gen = QpdfObjGen::from_object_ref(object_ref);
         {
             let mut core = self.core.borrow_mut();
-            core.object_cache.insert(object_gen, handle.clone());
+            core.object_cache
+                .insert(object_gen, ObjectCacheEntry::new(handle.clone()));
             core.record_allocated_object(object_gen);
         }
         Ok(
@@ -1798,10 +1830,10 @@ impl<R: Read + Seek> ResolverHandle<R> {
             target.assign_value_state(&replacement);
             target
         } else {
-            self.core
-                .borrow_mut()
-                .object_cache
-                .insert(QpdfObjGen::from_object_ref(object_ref), replacement.clone());
+            self.core.borrow_mut().object_cache.insert(
+                QpdfObjGen::from_object_ref(object_ref),
+                ObjectCacheEntry::new(replacement.clone()),
+            );
             replacement
         };
         target.clear_description();
@@ -1879,7 +1911,9 @@ impl<R: Read + Seek> ResolverHandle<R> {
             // `QPDF::removeObject` erases the one raw-keyed row every consumer reads.
             core.raw_source_xref_entries.remove(&object_gen);
             core.default_xref_entries.remove(&object_gen);
-            core.object_cache.get(&object_gen).cloned()
+            core.object_cache
+                .get(&object_gen)
+                .map(|entry| entry.handle.clone())
         };
         if let Some(handle) = cached {
             handle.remove_from_document();
@@ -2064,7 +2098,10 @@ impl<R: Read + Seek> ResolverHandle<R> {
         let handles: Vec<_> = {
             let mut core = self.core.borrow_mut();
             core.raw_source_xref_entries.clear();
-            core.object_cache.values().cloned().collect()
+            core.object_cache
+                .values()
+                .map(|entry| entry.handle.clone())
+                .collect()
         };
         for handle in handles {
             handle.disconnect_and_destroy();
@@ -2886,6 +2923,7 @@ impl<R: Read + Seek> ResolverHandle<R> {
             // visible null. Source damage remains observable through the
             // diagnostics; the value itself follows qpdf's null fallback.
             handle.set_resolved(ObjectValue::Null);
+            handle.set_end_offsets(NO_PARSED_OFFSET, NO_PARSED_OFFSET);
             return;
         }
         handle.set_resolved(value);
@@ -5020,6 +5058,21 @@ impl<R: Read + Seek> crate::parser::HandleResolver for ChildHandles<'_, R> {
 }
 
 impl<R: Read + Seek> DocumentResolver for ResolverHandle<R> {
+    fn source_extents(&self, object_gen: QpdfObjGen) -> SourceExtents {
+        self.core
+            .borrow()
+            .object_cache
+            .get(&object_gen)
+            .map(|entry| entry.source_extents)
+            .unwrap_or(SourceExtents::UNSET)
+    }
+
+    fn set_source_extents(&self, object_gen: QpdfObjGen, extents: SourceExtents) {
+        if let Some(entry) = self.core.borrow_mut().object_cache.get_mut(&object_gen) {
+            entry.source_extents = extents;
+        }
+    }
+
     fn pdf_unique_id(&self) -> Option<u64> {
         Some(self.pdf_unique_id.get())
     }
@@ -11268,7 +11321,66 @@ mod tests {
                 NO_PARSED_OFFSET,
                 "canonical resolution must record an offset for {object_ref:?}"
             );
+            let (end_before_space, end_after_space) = handle.end_offsets();
+            assert!(
+                end_before_space >= 0 && end_after_space >= end_before_space,
+                "canonical cache must retain a monotonic source extent for {object_ref:?}: {end_before_space}..{end_after_space}"
+            );
         }
+    }
+
+    #[test]
+    fn cache_source_extents_reset_on_replace_and_stay_with_object_generation_on_swap() {
+        let mut replaced = Pdf::open_mem_owned(minimal_pdf_bytes()).expect("open");
+        let replaced_ref = ObjectRef::new(3, 0);
+        let replaced_handle = replaced.get_object_handle(replaced_ref);
+        replaced_handle
+            .try_is_scalar()
+            .expect("resolve the replacement target");
+        let original_extents = replaced_handle.end_offsets();
+        assert!(
+            original_extents.0 >= 0 && original_extents.1 >= original_extents.0,
+            "the parsed target must have source extents before replacement: {original_extents:?}"
+        );
+
+        replaced
+            .replace_object(replaced_ref, ObjectHandle::integer(7))
+            .expect("replace the canonical cache value");
+        assert_eq!(
+            replaced.get_object_handle(replaced_ref).end_offsets(),
+            (NO_PARSED_OFFSET, NO_PARSED_OFFSET),
+            "qpdf updateCache resets source extents for a replacement"
+        );
+        assert_eq!(
+            ObjectHandle::integer(7).end_offsets(),
+            (NO_PARSED_OFFSET, NO_PARSED_OFFSET),
+            "a direct replacement value must not acquire document cache extents"
+        );
+
+        let mut swapped = Pdf::open_mem_owned(minimal_pdf_bytes()).expect("open");
+        let first_ref = ObjectRef::new(1, 0);
+        let second_ref = ObjectRef::new(2, 0);
+        let first = swapped.get_object_handle(first_ref);
+        let second = swapped.get_object_handle(second_ref);
+        first.try_is_scalar().expect("resolve the first object");
+        second.try_is_scalar().expect("resolve the second object");
+        let first_extents = first.end_offsets();
+        let second_extents = second.end_offsets();
+        assert!(first_extents.0 >= 0 && second_extents.0 >= 0);
+
+        swapped
+            .swap_objects(first_ref, second_ref)
+            .expect("swap canonical object values");
+        assert_eq!(
+            swapped.get_object_handle(first_ref).end_offsets(),
+            first_extents,
+            "swapWith must leave the first cache entry's source extents in place"
+        );
+        assert_eq!(
+            swapped.get_object_handle(second_ref).end_offsets(),
+            second_extents,
+            "swapWith must leave the second cache entry's source extents in place"
+        );
     }
 
     /// A stream whose `/Length` is an indirect reference resolves without
