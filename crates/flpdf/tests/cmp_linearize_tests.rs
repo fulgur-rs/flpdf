@@ -163,6 +163,22 @@ fn assert_classic_structurally_byte_identical(fixture: &str, stem: &str) {
     }
 }
 
+/// Return the pinned qpdf 11.9.0 binary, or `None` when it is unavailable.
+///
+/// A differently versioned qpdf on `PATH` is deliberately rejected: this
+/// comparison claims 11.9.0 parity, so another release would silently change
+/// the oracle rather than the expectation.
+fn pinned_qpdf() -> Option<&'static str> {
+    let output = Command::new("qpdf").arg("--version").output();
+    output.ok().and_then(|output| {
+        String::from_utf8_lossy(&output.stdout)
+            .lines()
+            .next()
+            .is_some_and(|line| line == "qpdf version 11.9.0")
+            .then_some("qpdf")
+    })
+}
+
 #[test]
 fn one_page_linearized_is_byte_identical_to_qpdf() {
     assert_linearize_byte_identical("one-page.pdf", "one-page");
@@ -744,9 +760,13 @@ fn trailer_external_file_keys_linearized_match_qpdf_11_9() {
     let input = Path::new(env!("CARGO_MANIFEST_DIR"))
         .join("../../tests/fixtures/compat")
         .join(fixture);
+    let Some(oracle) = pinned_qpdf() else {
+        eprintln!("[SKIP cmp_linearize_tests] qpdf 11.9.0 is unavailable");
+        return;
+    };
     let directory = tempfile::tempdir().expect("tempdir");
     let expected_path = directory.path().join("qpdf.pdf");
-    let status = Command::new("qpdf")
+    let status = Command::new(oracle)
         .args(["--linearize", "--deterministic-id"])
         .arg(&input)
         .arg(&expected_path)
