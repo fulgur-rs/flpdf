@@ -1183,6 +1183,59 @@ impl StateOwners {
     }
 }
 
+#[cfg(test)]
+mod state_owner_tests {
+    use super::*;
+
+    fn slot() -> Rc<RefCell<ObjectSlot>> {
+        ObjectHandle::integer(1).0.clone()
+    }
+
+    #[test]
+    fn state_owners_cover_inline_alias_and_cleanup_transitions() {
+        let first = slot();
+        let mut owners = StateOwners::default();
+
+        assert!(!owners.contains(&first));
+        owners.insert(&first);
+        owners.insert(&first);
+        assert!(owners.contains(&first));
+        assert_eq!(owners.handles().len(), 1);
+
+        owners.remove(&first);
+        assert!(owners.handles().is_empty());
+
+        let second = slot();
+        let third = slot();
+        owners.insert(&first);
+        owners.insert(&second);
+        assert!(owners.contains(&first));
+        assert!(!owners.contains(&third));
+        owners.insert(&third);
+        assert_eq!(owners.handles().len(), 3);
+
+        owners.remove(&third);
+        assert_eq!(owners.handles().len(), 2);
+        owners.remove(&first);
+        assert_eq!(owners.handles().len(), 1);
+
+        drop(second);
+        assert!(owners.handles().is_empty());
+    }
+
+    #[test]
+    fn state_owners_discard_dead_many_entries_before_handles() {
+        let first = slot();
+        let second = slot();
+        let mut owners = StateOwners::Many(vec![Rc::downgrade(&first), Rc::downgrade(&second)]);
+
+        drop(first);
+        drop(second);
+        owners.retain_live();
+        assert!(owners.handles().is_empty());
+    }
+}
+
 fn replace_first(bytes: &mut Vec<u8>, needle: &[u8], replacement: &[u8]) {
     if let Some(position) = bytes
         .windows(needle.len())
