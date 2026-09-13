@@ -3519,12 +3519,13 @@ fn emit_canonical_pdf_inner<R: Read + Seek, W: Write>(
             "encrypt and copy_encryption are mutually exclusive".to_string(),
         ));
     }
-    let plain_route = plain::eligible(pdf.is_encrypted(), options, requested_object_streams);
-    let qdf_or_normalize_live = !pdf.is_encrypted()
-        && options.encrypt.is_none()
-        && options.copy_encryption.is_none()
-        && !options.pclm
-        && plain::qdf_or_normalize_live_eligible(options, &source_object_stream_data);
+    let plain_route = plain::classify_plain_route(
+        pdf.is_encrypted(),
+        options,
+        requested_object_streams,
+        &source_object_stream_data,
+    );
+    let qdf_or_normalize_live = matches!(plain_route, plain::PlainRoute::QdfOrNormalizeLive);
     // The live body already owns encryption-aware object and stream emission.
     // Extend the QDF/normalize live boundary to the indirect-Root encrypted
     // cohort, while keeping direct-Root trailer serialization, source-backed
@@ -3543,7 +3544,7 @@ fn emit_canonical_pdf_inner<R: Read + Seek, W: Write>(
         )
         && (options.object_streams == ObjectStreamMode::Disable
             || source_object_stream_data.is_empty());
-    let specialized_standard_live = !plain_route
+    let specialized_standard_live = matches!(plain_route, plain::PlainRoute::OutsidePlain)
         && !qdf_or_normalize_live
         && !encrypted_qdf_or_normalize_live
         && !options.qdf
@@ -3575,7 +3576,7 @@ fn emit_canonical_pdf_inner<R: Read + Seek, W: Write>(
         return pclm_live::write_pclm(pdf, out, options);
     }
 
-    if plain_route || qdf_or_normalize_live {
+    if plain_route.is_plain_consumer() {
         return plain::write_plain(
             pdf,
             out,

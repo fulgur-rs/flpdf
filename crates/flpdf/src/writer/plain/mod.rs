@@ -12,6 +12,62 @@ pub(crate) mod body;
 pub(crate) mod plan;
 pub(crate) mod xref;
 
+/// The plain writer's qpdf-shaped consumer selected before body emission.
+///
+/// `OutsidePlain` is the outer-dispatch result for cohorts owned by the
+/// specialized or legacy coordinator. Keeping it in this enum prevents the
+/// caller and [`write_plain`] from maintaining separate route predicates.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum PlainRoute {
+    QdfOrNormalizeLive,
+    LiveDisableShaped,
+    Planned,
+    OutsidePlain,
+}
+
+impl PlainRoute {
+    pub(crate) fn is_plain_consumer(self) -> bool {
+        !matches!(self, Self::OutsidePlain)
+    }
+}
+
+/// Classify the plain-writer route once for both outer dispatch and the
+/// `write_plain` consumer.
+///
+/// qpdf's standard writer selects QDF/normalization state independently from
+/// object-stream packing (`QPDFWriter.cc:2038-2140`), while the plain live
+/// queue owns Disable and Preserve when the writer cohort is otherwise plain.
+/// Encryption, PCLm, extra headers, encrypted input, or a requested mode that
+/// no longer matches the effective option set belong to another consumer.
+pub(crate) fn classify_plain_route(
+    pdf_is_encrypted: bool,
+    options: &WriterOptions,
+    requested_object_streams: ObjectStreamMode,
+    source_object_stream_data: &BTreeMap<u32, u32>,
+) -> PlainRoute {
+    let qdf_or_normalize_live = !pdf_is_encrypted
+        && options.encrypt.is_none()
+        && options.copy_encryption.is_none()
+        && !options.pclm
+        && qdf_or_normalize_live_eligible(options, source_object_stream_data);
+    if qdf_or_normalize_live {
+        return PlainRoute::QdfOrNormalizeLive;
+    }
+    if !eligible(pdf_is_encrypted, options, requested_object_streams) {
+        return PlainRoute::OutsidePlain;
+    }
+    if matches!(
+        options.object_streams,
+        ObjectStreamMode::Disable | ObjectStreamMode::Preserve
+    ) && !options.qdf
+        && !options.content_normalization
+    {
+        PlainRoute::LiveDisableShaped
+    } else {
+        PlainRoute::Planned
+    }
+}
+
 #[allow(clippy::too_many_arguments)] // qpdf setup snapshots and route-local state stay explicit at this consumer boundary
 pub(crate) fn write_plain<R: Read + Seek, W: Write>(
     pdf: &mut Pdf<R>,
@@ -40,11 +96,13 @@ pub(crate) fn write_plain<R: Read + Seek, W: Write>(
     // numbering in the second case, so Preserve routes through the live queue
     // either way. Generate does not: it packs fresh containers the live walk
     // cannot discover incrementally, so it keeps the plan-based path.
-    let is_live_disable_shaped = matches!(
+    let route = classify_plain_route(
+        pdf.is_encrypted(),
+        options,
         options.object_streams,
-        ObjectStreamMode::Disable | ObjectStreamMode::Preserve
+        source_object_stream_data,
     );
-    if qdf_or_normalize_live_eligible(options, source_object_stream_data) {
+    if route == PlainRoute::QdfOrNormalizeLive {
         let (page_sequences, contents_sequences, content_container_sequences) =
             live_page_context(pdf, special_streams)?;
         return write_plain_live(
@@ -58,7 +116,7 @@ pub(crate) fn write_plain<R: Read + Seek, W: Write>(
             content_container_sequences,
         );
     }
-    if is_live_disable_shaped && !options.qdf && !options.content_normalization {
+    if route == PlainRoute::LiveDisableShaped {
         return write_plain_live_disable(
             pdf,
             out,
@@ -66,6 +124,11 @@ pub(crate) fn write_plain<R: Read + Seek, W: Write>(
             generated_id,
             source_object_stream_data,
         );
+    }
+    if route == PlainRoute::OutsidePlain {
+        return Err(crate::Error::Unsupported(
+            "plain writer route is not applicable to this writer cohort".to_string(),
+        ));
     }
     let plan = plan::PlainWritePlan::build_with_generated_id_and_source_object_stream_data(
         pdf,
@@ -560,4 +623,106 @@ pub(crate) fn eligible(
         && options.encrypt.is_none()
         && options.copy_encryption.is_none()
         && !pdf_is_encrypted
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn options(mode: ObjectStreamMode) -> WriterOptions {
+        WriterOptions {
+            object_streams: mode,
+            ..WriterOptions::default()
+        }
+    }
+
+    #[test]
+    fn plain_route_classifier_distinguishes_live_qdf_and_planned_routes() {
+        let empty = BTreeMap::new();
+
+        let disable = options(ObjectStreamMode::Disable);
+        assert_eq!(
+            classify_plain_route(false, &disable, ObjectStreamMode::Disable, &empty),
+            PlainRoute::LiveDisableShaped
+        );
+
+        let preserve = options(ObjectStreamMode::Preserve);
+        assert_eq!(
+            classify_plain_route(false, &preserve, ObjectStreamMode::Preserve, &empty),
+            PlainRoute::LiveDisableShaped
+        );
+
+        let preserve_with_membership = options(ObjectStreamMode::Preserve);
+        let mut source_membership = BTreeMap::new();
+        source_membership.insert(7, 3);
+        assert_eq!(
+            classify_plain_route(
+                false,
+                &preserve_with_membership,
+                ObjectStreamMode::Preserve,
+                &source_membership,
+            ),
+            PlainRoute::LiveDisableShaped
+        );
+
+        let mut qdf = options(ObjectStreamMode::Disable);
+        qdf.qdf = true;
+        assert_eq!(
+            classify_plain_route(false, &qdf, ObjectStreamMode::Disable, &empty),
+            PlainRoute::QdfOrNormalizeLive
+        );
+
+        let mut normalize = options(ObjectStreamMode::Disable);
+        normalize.content_normalization = true;
+        assert_eq!(
+            classify_plain_route(false, &normalize, ObjectStreamMode::Disable, &empty),
+            PlainRoute::QdfOrNormalizeLive
+        );
+
+        let mut qdf_preserve = options(ObjectStreamMode::Preserve);
+        qdf_preserve.qdf = true;
+        assert_eq!(
+            classify_plain_route(
+                false,
+                &qdf_preserve,
+                ObjectStreamMode::Preserve,
+                &source_membership,
+            ),
+            PlainRoute::Planned
+        );
+
+        let generate = options(ObjectStreamMode::Generate);
+        assert_eq!(
+            classify_plain_route(false, &generate, ObjectStreamMode::Generate, &empty),
+            PlainRoute::Planned
+        );
+    }
+
+    #[test]
+    fn plain_route_classifier_covers_outer_dispatch_exclusions() {
+        let empty = BTreeMap::new();
+
+        assert!(PlainRoute::QdfOrNormalizeLive.is_plain_consumer());
+        assert!(PlainRoute::LiveDisableShaped.is_plain_consumer());
+        assert!(PlainRoute::Planned.is_plain_consumer());
+        assert!(!PlainRoute::OutsidePlain.is_plain_consumer());
+
+        let mut extra_header = options(ObjectStreamMode::Disable);
+        extra_header.extra_header_text = "% header\n".to_string();
+        assert_eq!(
+            classify_plain_route(false, &extra_header, ObjectStreamMode::Disable, &empty),
+            PlainRoute::OutsidePlain
+        );
+
+        let disable = options(ObjectStreamMode::Disable);
+        assert_eq!(
+            classify_plain_route(true, &disable, ObjectStreamMode::Disable, &empty),
+            PlainRoute::OutsidePlain
+        );
+
+        assert_eq!(
+            classify_plain_route(false, &disable, ObjectStreamMode::Preserve, &empty),
+            PlainRoute::OutsidePlain
+        );
+    }
 }
