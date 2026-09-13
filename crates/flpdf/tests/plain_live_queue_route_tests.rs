@@ -30,6 +30,22 @@ fn planned_preserve_uses_the_d9_source_membership_owner() {
 }
 
 #[test]
+fn preserve_without_source_objstm_selects_the_disable_shaped_live_consumer() {
+    // qpdf returns from `preserveObjectStreams` when its source ObjStm map is
+    // empty (`QPDFWriter.cc:1939-1945`), leaving the same enqueue/writeStandard
+    // shape as Disable. The byte differential for the corresponding xref
+    // stream fixture lives in `cmp_diff_zero_tests`; this contract keeps the
+    // intended Preserve branch connected to that live consumer.
+    let root = Path::new(env!("CARGO_MANIFEST_DIR")).join("src");
+    let plain = std::fs::read_to_string(root.join("writer/plain/mod.rs")).unwrap();
+
+    assert!(plain.contains("ObjectStreamMode::Disable | ObjectStreamMode::Preserve"));
+    assert!(plain.contains("qdf_or_normalize_live_eligible"));
+    assert!(plain.contains("source_object_stream_data.is_empty()"));
+    assert!(plain.contains("return write_plain_live_disable("));
+}
+
+#[test]
 fn plain_disable_reconciles_direct_adbe_before_live_child_enqueue() {
     // qpdf 11.9.0: QPDFWriter.cc:1418-1430 replaces stale /ADBE before
     // unparseChild can enqueue the obsolete indirect /URL value.

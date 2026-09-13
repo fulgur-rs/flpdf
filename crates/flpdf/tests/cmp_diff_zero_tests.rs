@@ -573,7 +573,12 @@ fn rewrite_qdf_preserve_unreferenced(fixture: &str) -> flpdf::Result<Vec<u8>> {
 /// eligibility filter and reaches the live walk with every source container.
 #[test]
 fn preserve_with_no_source_object_streams_matches_disable_byte_for_byte() {
-    for fixture in ["one-page", "two-page", "three-page"] {
+    for fixture in [
+        "one-page",
+        "two-page",
+        "three-page",
+        "preserve-no-source-objstm-xref",
+    ] {
         let disable =
             rewrite_qpdf_equivalent_mode(&format!("{fixture}.pdf"), ObjectStreamMode::Disable);
         let preserve =
@@ -583,6 +588,55 @@ fn preserve_with_no_source_object_streams_matches_disable_byte_for_byte() {
             "{fixture}: Preserve-with-no-source-ObjStm diverged from Disable"
         );
     }
+}
+
+/// A source xref stream with no type-2 rows must not make Preserve retain an
+/// object-stream layout. qpdf's `preserveObjectStreams` returns at its empty
+/// source-membership check, so both Preserve and Disable emit the same
+/// classic-xref rewrite (`QPDFWriter.cc:1939-1945,2172-2173,3023-3025`).
+/// Compare both modes with the live qpdf 11.9.0 output as well as with each
+/// other so this is an observable source-xref-form regression case, not only a
+/// comparison against a shared golden.
+#[test]
+fn preserve_no_source_objstm_xref_stream_matches_qpdf_11_9() {
+    let Some(oracle) = pinned_qpdf() else {
+        eprintln!("[SKIP cmp_diff_zero_tests] qpdf 11.9.0 is unavailable");
+        return;
+    };
+    let fixture = "preserve-no-source-objstm-xref.pdf";
+    let input = Path::new(env!("CARGO_MANIFEST_DIR"))
+        .join("../../tests/fixtures/compat")
+        .join(fixture);
+    let directory = tempfile::tempdir().expect("tempdir");
+    let expected_path = directory.path().join("qpdf.pdf");
+    let status = std::process::Command::new(oracle)
+        .args(["--static-id", "--object-streams=preserve"])
+        .arg(&input)
+        .arg(&expected_path)
+        .status()
+        .expect("qpdf runs");
+    assert_eq!(status.code(), Some(0), "qpdf preserve rewrite must succeed");
+
+    let preserve = rewrite_qpdf_equivalent_mode(fixture, ObjectStreamMode::Preserve);
+    let disable = rewrite_qpdf_equivalent_mode(fixture, ObjectStreamMode::Disable);
+    let expected = std::fs::read(&expected_path).expect("qpdf output");
+    assert_eq!(
+        preserve, disable,
+        "empty source membership must produce the Disable-equivalent bytes"
+    );
+    assert_eq!(preserve, expected, "Preserve output must match qpdf 11.9.0");
+    assert!(
+        preserve
+            .windows(b"xref\n".len())
+            .any(|window| window == b"xref\n"),
+        "an empty source membership must use a classic xref table"
+    );
+    assert!(
+        !preserve
+            .windows(b"/Type /XRef".len())
+            .any(|window| window == b"/Type /XRef"),
+        "the source xref stream must not be carried into the rewritten output"
+    );
 }
 
 #[test]
