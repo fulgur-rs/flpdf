@@ -156,17 +156,10 @@ pub(crate) fn planner_config_from_options(options: &WriterOptions) -> PlannerCon
 /// from that same qpdf-shaped reachable walk; Preserve with
 /// `preserveUnreferencedObjects` deliberately has no such intersection
 /// (`QPDFWriter.cc:1939-1967`).
-pub(crate) fn plan_object_streams_with_reachability<R: std::io::Read + std::io::Seek>(
-    pdf: &mut crate::Pdf<R>,
-    config: &PlannerConfig,
-    reachable: Option<&BTreeSet<ObjectRef>>,
-) -> crate::Result<PackingPlan> {
-    plan_object_streams_with_reachability_and_source_membership(pdf, config, reachable, None, None)
-}
-
-/// Variant of [`plan_object_streams_with_reachability`] that consumes the
-/// source ObjStm membership captured during qpdf writer setup. qpdf records
-/// that map before its later recovery/object-count walk
+///
+/// This entry accepts an optional qpdf-reachable candidate set and an optional
+/// source-membership snapshot captured during writer setup. qpdf records that
+/// map before its later recovery/object-count walk
 /// (`QPDFWriter.cc:2114-2140,2189-2195`); specialized live standard output
 /// therefore passes the shared setup snapshot through this boundary instead
 /// of silently re-reading a possibly changed xref view.
@@ -469,8 +462,9 @@ pub(crate) fn sort_source_backed_members_qpdf_order<R: Read + Seek>(
 #[cfg(test)]
 mod tests {
     use super::{
-        plan_object_streams_with_reachability, sort_compressible_for_writer_order,
-        ObjectStreamMode, PlannerConfig, DEFAULT_BATCH_SIZE_CAP,
+        plan_object_streams_with_reachability_and_source_membership,
+        sort_compressible_for_writer_order, ObjectStreamMode, PlannerConfig,
+        DEFAULT_BATCH_SIZE_CAP,
     };
     use crate::pdf::WriterObjectOrderKey;
     use crate::{ObjectRef, Pdf};
@@ -508,8 +502,10 @@ mod tests {
         ))
         .expect("open ObjStm fixture");
         let config = PlannerConfig::default();
-        let plan = plan_object_streams_with_reachability(&mut pdf, &config, None)
-            .expect("build Preserve plan");
+        let plan = plan_object_streams_with_reachability_and_source_membership(
+            &mut pdf, &config, None, None, None,
+        )
+        .expect("build Preserve plan");
 
         assert_eq!(
             plan.source_containers,
