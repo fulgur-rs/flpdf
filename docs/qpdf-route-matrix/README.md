@@ -98,7 +98,7 @@ done | sort | uniq -c
 
 2026-09-13 の current-main audit anchor は `origin/main=ffc782439`、pinned qpdf は
 11.9.0 commit `3b97c9bd266b7c32ea36d3536e22dab77412886d` である。checker の実測は
-1051 qpdf citations / 925 flpdf citations / 259 logical rows、分類は
+1051 qpdf citations / 928 flpdf citations / 259 logical rows、分類は
 canonical 119 / mixed 128 / bridge 12 / unknown 0。A〜E の160行だけを数える
 上の領域別集計は canonical 95 / mixed 61 / bridge 4 / unknown 0 なので、checker
 の259 logical rowsと混同しない。
@@ -111,11 +111,11 @@ D19/D30はcanonical ownerへ委譲するbyte-neutral test scaffolding、D27は�
 
 | ファイル | 行数 | canonical | bridge | mixed | unknown |
 |---|---|---|---|---|---|
-| [A. ObjectHandle / Resolver — object identity, lazy resolve, ownership, teardown](a-objecthandle-resolver.md) | 24 | 6 | 5 | 13 | 0 |
-| [B. parser / xref recovery / warning・error・diagnostics](b-parser-recovery-diagnostics.md) | 34 | 13 | 1 | 19 | 1 |
-| [C. stream data provider / decode / retry / filter / encryption / `/Length`](c-stream-pipeline-encryption.md) | 42 | 30 | 2 | 10 | 0 |
-| [D. writer — reachability, ObjStm planning / renumber / emission, xref / trailer, encryption, linearize](d-writer.md) | 31 | 12 | 0 | 19 | 0 |
-| [E. QPDFJob / CLI / C API 相当の consumer・adaptor](e-job-cli-capi.md) | 29 | 5 | 3 | 21 | 0 |
+| [A. ObjectHandle / Resolver — object identity, lazy resolve, ownership, teardown](a-objecthandle-resolver.md) | 24 | 16 | 0 | 8 | 0 |
+| [B. parser / xref recovery / warning・error・diagnostics](b-parser-recovery-diagnostics.md) | 34 | 20 | 0 | 14 | 0 |
+| [C. stream data provider / decode / retry / filter / encryption / `/Length`](c-stream-pipeline-encryption.md) | 42 | 35 | 2 | 5 | 0 |
+| [D. writer — reachability, ObjStm planning / renumber / emission, xref / trailer, encryption, linearize](d-writer.md) | 31 | 15 | 0 | 16 | 0 |
+| [E. QPDFJob / CLI / C API 相当の consumer・adaptor](e-job-cli-capi.md) | 29 | 9 | 2 | 18 | 0 |
 
 ## 5. 責任境界と不変条件
 
