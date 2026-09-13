@@ -143,6 +143,13 @@ pinned qpdf 11.9.0 の `libqpdf/QPDFWriter.cc`（3044 行）/ `include/qpdf/QPDF
   `calculateLinearizationData`（`libqpdf/QPDF_linearization.cc:963-1403`）末尾で
   `num_placed == num_wanted` を検査する。
 
+2026-09-13（`flpdf-zv0i`）: plain planned Preserve の source ObjStm 有無も、
+production setup が取得した `get_object_stream_data` の D9 snapshot を consumer に渡して判定する。
+test-only の `PlainWritePlan::build` wrapper も同じ canonical ownerから snapshotを作るため、
+`source_xref_entries()` を再走査する source-presence predicate は残さない。linearized の source
+container lookup と `rewrite_renumber` の source-container helper は、presence 判定ではなく
+別の source membership consumer として後続スコープに残る。
+
 ### D-3. `writeObject` / `writeObjectStream`
 
 - `writeObject(object, object_stream_index = -1)`（`libqpdf/QPDFWriter.cc:1761-1809`）:
