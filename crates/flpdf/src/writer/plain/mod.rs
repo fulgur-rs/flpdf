@@ -37,7 +37,9 @@ impl PlainRoute {
 /// qpdf's standard writer selects QDF/normalization state independently from
 /// object-stream packing (`QPDFWriter.cc:2038-2140`), while the plain live
 /// queue owns Disable and Preserve when the writer cohort is otherwise plain.
-/// Encryption, PCLm, extra headers, encrypted input, or a requested mode that
+/// Plain non-QDF/non-normalize Generate is owned by the specialized standard
+/// live coordinator after its setup snapshot; QDF/normalization Generate,
+/// encryption, PCLm, extra headers, encrypted input, or a requested mode that
 /// no longer matches the effective option set belong to another consumer.
 pub(crate) fn classify_plain_route(
     pdf_is_encrypted: bool,
@@ -54,6 +56,17 @@ pub(crate) fn classify_plain_route(
         return PlainRoute::QdfOrNormalizeLive;
     }
     if !eligible(pdf_is_encrypted, options, requested_object_streams) {
+        return PlainRoute::OutsidePlain;
+    }
+    // qpdf computes Generate membership and fresh null containers during setup,
+    // then emits them through the same live standard queue as Disable/Preserve
+    // (`QPDFWriter.cc:1970-2006,2907-3031`). The specialized live coordinator
+    // consumes that setup snapshot; only QDF/normalization still needs the
+    // planned consumer because its formatting/length-holder state is distinct.
+    if options.object_streams == ObjectStreamMode::Generate
+        && !options.qdf
+        && !options.content_normalization
+    {
         return PlainRoute::OutsidePlain;
     }
     if matches!(
@@ -94,8 +107,10 @@ pub(crate) fn write_plain<R: Read + Seek, W: Write>(
     // (`assignCompressedObjectNumbers`, `:1057-1069`). Both are the same
     // `enqueueObject`/`writeStandard` live walk, just with container-aware
     // numbering in the second case, so Preserve routes through the live queue
-    // either way. Generate does not: it packs fresh containers the live walk
-    // cannot discover incrementally, so it keeps the plan-based path.
+    // either way. Plain non-QDF/non-normalize Generate now follows that same
+    // specialized live coordinator after setup has registered its fresh
+    // containers; Generate with QDF/normalization remains plan-based because
+    // its formatting and length-holder state is a separate consumer.
     let route = classify_plain_route(
         pdf.is_encrypted(),
         options,
@@ -144,8 +159,10 @@ pub(crate) fn write_plain<R: Read + Seek, W: Write>(
 
 /// Return whether the QDF/normalization route can use the live queue without
 /// having to rebuild source or generated ObjStm containers. A source Preserve
-/// map makes the container-membership boundary observable, and Generate has
-/// fresh packing decisions; both remain on the plan-based consumer.
+/// map makes the container-membership boundary observable, and QDF/normalize
+/// Generate has fresh packing plus formatting decisions; those cases remain
+/// on the plan-based consumer. Plain non-QDF/non-normalize Generate is set up
+/// before the live coordinator and is classified outside this consumer.
 pub(crate) fn qdf_or_normalize_live_eligible(
     options: &WriterOptions,
     source_object_stream_data: &BTreeMap<u32, u32>,
@@ -694,6 +711,25 @@ mod tests {
         let generate = options(ObjectStreamMode::Generate);
         assert_eq!(
             classify_plain_route(false, &generate, ObjectStreamMode::Generate, &empty),
+            PlainRoute::OutsidePlain
+        );
+
+        let mut qdf_generate = options(ObjectStreamMode::Generate);
+        qdf_generate.qdf = true;
+        assert_eq!(
+            classify_plain_route(false, &qdf_generate, ObjectStreamMode::Generate, &empty),
+            PlainRoute::Planned
+        );
+
+        let mut normalize_generate = options(ObjectStreamMode::Generate);
+        normalize_generate.content_normalization = true;
+        assert_eq!(
+            classify_plain_route(
+                false,
+                &normalize_generate,
+                ObjectStreamMode::Generate,
+                &empty,
+            ),
             PlainRoute::Planned
         );
     }
@@ -724,6 +760,19 @@ mod tests {
             classify_plain_route(false, &disable, ObjectStreamMode::Preserve, &empty),
             PlainRoute::OutsidePlain
         );
+    }
+
+    #[test]
+    fn plain_generate_without_stream_transform_uses_specialized_dispatch() {
+        let options = options(ObjectStreamMode::Generate);
+        let route = classify_plain_route(
+            false,
+            &options,
+            ObjectStreamMode::Generate,
+            &BTreeMap::new(),
+        );
+        assert_eq!(route, PlainRoute::OutsidePlain);
+        assert!(!route.is_plain_consumer());
     }
 
     #[test]

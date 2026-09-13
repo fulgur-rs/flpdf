@@ -91,11 +91,11 @@ pub(crate) fn get_compressible_objgens<R: std::io::Read + std::io::Seek>(
 pub(crate) struct CompressiblePlan {
     pub eligible: Vec<ObjectRef>,
     pub removed_refs: BTreeSet<ObjectRef>,
-    /// Indirect `/Length` targets of reachable ObjStm streams. qpdf's
-    /// compressible-object walk does not follow a stream's `/Length` edge,
-    /// but the writer still needs this set to keep those holders out of a
-    /// different ObjStm when they are reachable through another edge. This is
-    /// intentionally separate from qpdf's writer-setup `getObjectCount`
+    /// Indirect `/Length` targets of reachable ObjStm streams, retained for
+    /// diagnostics and focused tests. qpdf omits only the stream's `/Length`
+    /// edge from the compressible walk; a target reached through another edge
+    /// remains in `eligible` and must not be filtered from it afterward.
+    /// This is intentionally separate from qpdf's writer-setup `getObjectCount`
     /// resolution of the complete xref table (`QPDF.cc:1271-1283`).
     pub indirect_objstm_length_refs: BTreeSet<ObjectRef>,
 }

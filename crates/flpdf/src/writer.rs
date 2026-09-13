@@ -3946,7 +3946,7 @@ fn emit_canonical_pdf_inner<R: Read + Seek, W: Write>(
             .zip(source_container_for_batch.iter())
         {
             if source_container.is_some() {
-                object_streams::sort_source_backed_members_qpdf_order(pdf, batch);
+                object_streams::sort_members_qpdf_order(pdf, batch);
             } else {
                 batch.sort_unstable_by_key(|member| (member.number, member.generation));
             }
@@ -5509,12 +5509,8 @@ fn emit_specialized_standard_live_with_page_context<R: Read + Seek + 'static, W:
         // `std::set<QPDFObjGen>`, so the physical member order is source
         // object-number order even though Generate's candidate walk is depth-first.
         // The live queue must reserve and serialize members in that same order.
-    for (batch, source_container) in plan.batches.iter_mut().zip(plan.source_containers.iter()) {
-        if source_container.is_some() {
-            object_streams::sort_source_backed_members_qpdf_order(pdf, batch);
-        } else {
-            batch.sort_unstable_by_key(|member| (member.number, member.generation));
-        }
+    for batch in &mut plan.batches {
+        object_streams::sort_members_qpdf_order(pdf, batch);
     }
 
     let mut object_stream_groups = Vec::with_capacity(plan.batches.len());

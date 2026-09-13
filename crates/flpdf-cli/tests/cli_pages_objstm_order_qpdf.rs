@@ -10,6 +10,8 @@ use std::process::{Command as ProcessCommand, Output};
 
 const PRIMARY: &str = "../../tests/fixtures/compat/three-page.pdf";
 const FOREIGN: &str = "../../tests/fixtures/compat/one-page.pdf";
+const MULTI_CONTAINER_PRIMARY: &str = "../../tests/fixtures/compat/objstm-gen-nostream-130rev.pdf";
+const MULTI_CONTAINER_FOREIGN: &str = "../../tests/fixtures/compat/one-page.pdf";
 const DUPLICATE_PRIMARY: &str = "../../tests/fixtures/compat/multi-contents-one-page.pdf";
 const DUPLICATE_FOREIGN: &str = "../../tests/fixtures/compat/fxo-red.pdf";
 const LINEARIZED_PRIMARY: &str = "../../tests/fixtures/compat/multi-contents-one-page.pdf";
@@ -64,6 +66,24 @@ fn run_qpdf(output: &Path) -> Output {
             PRIMARY,
             "1",
             FOREIGN,
+            "--",
+        ])
+        .arg(output)
+        .output()
+        .expect("qpdf should spawn")
+}
+
+fn run_qpdf_multi_container(output: &Path) -> Output {
+    ProcessCommand::new("qpdf")
+        .args([
+            "--static-id",
+            "--object-streams=generate",
+            MULTI_CONTAINER_PRIMARY,
+            "--pages",
+            ".",
+            "1-z",
+            MULTI_CONTAINER_FOREIGN,
+            "1",
             "--",
         ])
         .arg(output)
@@ -248,6 +268,54 @@ fn cross_section_shared_pdf() -> Vec<u8> {
     bytes
 }
 
+/// A reachable ObjStm has an indirect `/Length` holder that is also reached
+/// through an ordinary Catalog key. qpdf omits only the stream's `/Length`
+/// edge from its compressible walk; the holder remains eligible through the
+/// second edge and is packed into the generated ObjStm.
+fn objstm_length_alias_pdf() -> Vec<u8> {
+    let mut objects = BTreeMap::new();
+    objects.insert(
+        1,
+        b"<< /Type /Catalog /Pages 2 0 R /ObjStm 5 0 R /KeptObjStmLength 6 0 R >>".to_vec(),
+    );
+    objects.insert(2, b"<< /Type /Pages /Kids [3 0 R] /Count 1 >>".to_vec());
+    objects.insert(
+        3,
+        b"<< /Type /Page /Parent 2 0 R /MediaBox [0 0 200 200] >>".to_vec(),
+    );
+    objects.insert(
+        5,
+        b"<< /Type /ObjStm /N 1 /First 4 /Length 6 0 R >>\nstream\n2 0 <<>>\nendstream".to_vec(),
+    );
+    objects.insert(6, b"8".to_vec());
+
+    let max_object = *objects.keys().max().unwrap();
+    let mut bytes = b"%PDF-1.5\n".to_vec();
+    let mut offsets = vec![None; max_object as usize + 1];
+    for (number, body) in objects {
+        offsets[number as usize] = Some(bytes.len());
+        writeln!(&mut bytes, "{number} 0 obj").unwrap();
+        bytes.extend_from_slice(&body);
+        bytes.extend_from_slice(b"\nendobj\n");
+    }
+    let xref_offset = bytes.len();
+    writeln!(&mut bytes, "xref\n0 {}", max_object + 1).unwrap();
+    bytes.extend_from_slice(b"0000000000 65535 f \n");
+    for offset in offsets.into_iter().skip(1) {
+        match offset {
+            Some(offset) => writeln!(&mut bytes, "{offset:010} 00000 n ").unwrap(),
+            None => bytes.extend_from_slice(b"0000000000 65535 f \n"),
+        }
+    }
+    writeln!(
+        &mut bytes,
+        "trailer\n<< /Size {} /Root 1 0 R >>\nstartxref\n{xref_offset}\n%%EOF",
+        max_object + 1
+    )
+    .unwrap();
+    bytes
+}
+
 #[test]
 fn classic_linearize_cross_section_shared_identifiers_match_qpdf() {
     if skip_if_qpdf_missing() {
@@ -283,6 +351,44 @@ fn classic_linearize_cross_section_shared_identifiers_match_qpdf() {
         std::fs::read(&flpdf_output).unwrap(),
         std::fs::read(&qpdf_output).unwrap(),
         "classic cross-section shared identifiers must match qpdf"
+    );
+}
+
+#[test]
+fn generated_objstm_length_target_reached_through_alias_matches_qpdf() {
+    if skip_if_qpdf_missing() {
+        return;
+    }
+    let temp = tempfile::tempdir().unwrap();
+    let input = temp.path().join("objstm-length-alias.pdf");
+    let qpdf_output = temp.path().join("qpdf.pdf");
+    let flpdf_output = temp.path().join("flpdf.pdf");
+    std::fs::write(&input, objstm_length_alias_pdf()).unwrap();
+
+    let qpdf = ProcessCommand::new("qpdf")
+        .args(["--static-id", "--object-streams=generate"])
+        .arg(&input)
+        .arg(&qpdf_output)
+        .output()
+        .expect("qpdf should spawn");
+    assert!(
+        qpdf.status.success(),
+        "qpdf ObjStm length-alias probe failed: {}",
+        String::from_utf8_lossy(&qpdf.stderr)
+    );
+
+    Command::cargo_bin("flpdf")
+        .unwrap()
+        .args(["--static-id", "--object-streams=generate"])
+        .arg(&input)
+        .arg(&flpdf_output)
+        .assert()
+        .success();
+
+    assert_eq!(
+        std::fs::read(&flpdf_output).unwrap(),
+        std::fs::read(&qpdf_output).unwrap(),
+        "Generate must retain an ObjStm /Length target reached through another edge"
     );
 }
 
@@ -362,6 +468,46 @@ fn multi_source_pages_generated_objstm_members_match_qpdf() {
         std::fs::read(&flpdf_output).unwrap(),
         std::fs::read(&qpdf_output).unwrap(),
         "multi-source generated ObjStm member order must match qpdf"
+    );
+}
+
+#[test]
+fn multi_source_multiple_generated_objstms_keep_qpdf_group_boundaries() {
+    if skip_if_qpdf_missing() {
+        return;
+    }
+    let temp = tempfile::tempdir().unwrap();
+    let qpdf_output = temp.path().join("qpdf.pdf");
+    let flpdf_output = temp.path().join("flpdf.pdf");
+
+    let qpdf = run_qpdf_multi_container(&qpdf_output);
+    assert!(
+        qpdf.status.success(),
+        "qpdf multi-container probe failed: {}",
+        String::from_utf8_lossy(&qpdf.stderr)
+    );
+
+    Command::cargo_bin("flpdf")
+        .unwrap()
+        .args([
+            "--static-id",
+            "--object-streams=generate",
+            MULTI_CONTAINER_PRIMARY,
+            "--pages",
+            ".",
+            "1-z",
+            MULTI_CONTAINER_FOREIGN,
+            "1",
+            "--",
+        ])
+        .arg(&flpdf_output)
+        .assert()
+        .success();
+
+    assert_eq!(
+        std::fs::read(&flpdf_output).unwrap(),
+        std::fs::read(&qpdf_output).unwrap(),
+        "multi-source Generate must preserve qpdf DFS group boundaries before member sorting"
     );
 }
 
