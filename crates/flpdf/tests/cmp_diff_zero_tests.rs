@@ -609,17 +609,23 @@ fn preserve_no_source_objstm_xref_stream_matches_qpdf_11_9() {
     // classic-xref document would leave every assertion below green and quietly
     // remove the source-xref-form coverage this test claims.
     let source = std::fs::read(&fixture_path).expect("fixture is readable");
+    // Resolve `startxref` and inspect the section it points at rather than
+    // searching the whole file for markers: a raw search accepts a decoy
+    // string such as `(/Type /XRef)` in unreachable content, and a raw
+    // exclusion misses a CRLF classic table.
+    let startxref = source
+        .windows(b"startxref".len())
+        .rposition(|window| window == b"startxref")
+        .expect("fixture has a startxref");
+    let offset: usize = String::from_utf8_lossy(&source[startxref + b"startxref".len()..])
+        .split_whitespace()
+        .next()
+        .expect("startxref carries an offset")
+        .parse()
+        .expect("startxref offset is numeric");
     assert!(
-        source
-            .windows(b"/Type /XRef".len())
-            .any(|window| window == b"/Type /XRef"),
-        "the fixture must carry its cross-reference data in an xref stream"
-    );
-    assert!(
-        !source
-            .windows(b"\nxref\n0 ".len())
-            .any(|window| window == b"\nxref\n0 "),
-        "the fixture must not also carry a classic cross-reference table"
+        !source[offset..].starts_with(b"xref"),
+        "the fixture's last cross-reference section must be a stream, not a classic table"
     );
     let source_pdf = Pdf::open(std::io::Cursor::new(source)).expect("fixture opens");
     assert!(
