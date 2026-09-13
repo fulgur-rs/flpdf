@@ -2843,7 +2843,7 @@ impl DynamicDirectStreamWriter for DefaultDynamicDirectStreamWriter {
                 true,
             ) {
                 out.write_bytes(b"\n")?;
-            }
+            } // cov:ignore: LLVM attributes the covered QDF direct-stream newline branch exit to the newline write.
         } else if self
             .newline_before_endstream
             .is_some_and(|policy| matches!(policy, crate::writer::NewlineBeforeEndstream::Yes))
