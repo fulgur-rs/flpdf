@@ -348,6 +348,64 @@ fn top_level_page_selection_coalesces_contents_like_qpdf() {
 }
 
 #[test]
+fn rewrite_page_operations_apply_appearance_and_flatten_transformations_like_qpdf() {
+    if !qpdf_available() {
+        if std::env::var_os("CI").is_some() {
+            panic!("{EXPECTED_QPDF_VERSION} is required for this parity test on CI");
+        }
+        eprintln!("skipping: {EXPECTED_QPDF_VERSION} is not available");
+        return;
+    }
+
+    let cases = [
+        ("generate-appearances", "--generate-appearances", true),
+        ("flatten-annotations", "--flatten-annotations=all", false),
+    ];
+    for (label, transformation, generate_case) in cases {
+        let tempdir = tempfile::tempdir().unwrap();
+        let input = tempdir.path().join("input.pdf");
+        let qpdf_output = tempdir.path().join("q-output.pdf");
+        let flpdf_output = tempdir.path().join("f-output.pdf");
+        std::fs::write(&input, page_operation_transform_fixture(generate_case)).unwrap();
+        let input = input.to_str().unwrap();
+
+        let qpdf_args = vec![
+            "--qdf".to_owned(),
+            "--static-id".to_owned(),
+            "--no-original-object-ids".to_owned(),
+            transformation.to_owned(),
+            input.to_owned(),
+            "--pages".to_owned(),
+            input.to_owned(),
+            "1-2".to_owned(),
+            "--".to_owned(),
+            qpdf_output.to_str().unwrap().to_owned(),
+        ];
+        let flpdf_args = vec![
+            "rewrite".to_owned(),
+            "--qdf".to_owned(),
+            "--static-id".to_owned(),
+            "--no-original-object-ids".to_owned(),
+            transformation.to_owned(),
+            input.to_owned(),
+            flpdf_output.to_str().unwrap().to_owned(),
+            "--pages".to_owned(),
+            input.to_owned(),
+            "1-2".to_owned(),
+            "--".to_owned(),
+        ];
+        let qpdf = run_qpdf(&qpdf_args);
+        let flpdf = run_flpdf_quiet(&flpdf_args);
+        assert_process_matches(&qpdf, &flpdf, label);
+        assert!(
+            qpdf.status.success(),
+            "qpdf {label} page operation should succeed"
+        );
+        assert_pdf_outputs_match(&qpdf_output, &flpdf_output, false, label);
+    }
+}
+
+#[test]
 fn rewrite_page_selection_coalesces_contents_like_qpdf() {
     if !qpdf_available() {
         if std::env::var_os("CI").is_some() {
