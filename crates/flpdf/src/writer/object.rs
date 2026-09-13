@@ -3156,7 +3156,7 @@ where
                 write_string,
                 direct_stream_writer, // cov:ignore: LLVM attributes the covered dynamic stream-dictionary child argument separately.
             )?; // cov:ignore: the dynamic stream-dictionary child serializer is exercised by the direct-stream policy regression.
-        }
+        } // cov:ignore: LLVM attributes the covered dynamic stream-dictionary branch exit to its child serializer call.
     }
     if let Some(length) = length_value {
         out.write_bytes(b" /Length ")?;

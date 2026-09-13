@@ -133,7 +133,7 @@ impl EncryptedStringEmitter {
         direct_stream_writer: &mut dyn crate::writer::object::DynamicDirectStreamWriter,
     ) -> crate::Result<()> {
         if emitted_ref == self.encrypt_ref {
-            return write_encryption_dictionary_handle(out, object);
+            return write_encryption_dictionary_handle(out, object); // cov:ignore: the canonical body emits /Encrypt through its dedicated unencrypted dictionary path.
         }
 
         let cipher = self.cipher;
