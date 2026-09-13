@@ -71,16 +71,16 @@
 //! zero (`QPDF.hh:1454`), so `Option<NonZeroU64>` preserves the same absent
 //! state without carrying a separate discriminant.
 //!
-//! `ObjectSlot::containment_parents` has no qpdf counterpart at all. qpdf's
-//! containers hold only forward child handles and never maintain an upward
-//! index (`QPDF_Array.cc:33-48,235-286`, `QPDF_Dictionary.cc:10-18,51-56,117-150`);
+//! qpdf's containers hold only forward child handles and never maintain an
+//! upward index (`QPDF_Array.cc:33-48,235-286`, `QPDF_Dictionary.cc:10-18,51-56,117-150`);
 //! `QPDFValue::ChildDescr`'s weak parent is diagnostic description context for
 //! warning text, not a containment lookup (`QPDFValue.hh:41-58,74-84`,
-//! `QPDFObject_private.hh:77-92`). flpdf keeps this reverse edge as a marked
-//! deviation on the field itself: its **lookups** are `cfg(test)`-only
-//! containment-root assertions, while attach/detach **maintain** the edge in
-//! production builds.
-//! Neither decides ownership, warning text, writer scheduling, or output bytes.
+//! `QPDFObject_private.hh:77-92`). Production ObjectHandle state follows that
+//! boundary. Unit-test-only containment-root assertions derive reverse paths
+//! by scanning the registered forward graph and are not part of the value or
+//! slot layout.
+//! Neither ownership, warning text, writer scheduling, nor output bytes needs
+//! a production reverse edge.
 //
 // qpdf-deviation-start: qpdf 11.9.0's default destruction of a sufficiently
 // deep programmatic direct container graph recursively follows the
@@ -1121,289 +1121,23 @@ pub(crate) enum ObjectDescription {
     Child(Box<ChildDescription>),
 }
 
-/// Live slots sharing one qpdf-shaped value. qpdf has no reverse owner list,
-/// but flpdf's containment deviation needs to propagate direct-child edges to
-/// every alias slot. Keep the common single-slot case inline and allocate a
-/// vector only after a value actually gains a second owner.
-#[derive(Default)]
-enum StateOwners {
-    #[default]
-    Empty,
-    One(Weak<RefCell<ObjectSlot>>),
-    // Keep Vec's header out of every SharedValueState; only aliasing values
-    // allocate the reverse-owner collection.
-    #[allow(clippy::box_collection)]
-    Many(Box<Vec<Weak<RefCell<ObjectSlot>>>>),
-}
-
-impl StateOwners {
-    fn retain_live(&mut self) {
-        match self {
-            Self::Empty => {}
-            Self::One(owner) => {
-                if owner.strong_count() == 0 {
-                    *self = Self::Empty;
-                }
-            }
-            Self::Many(owners) => {
-                owners.retain(|owner| owner.strong_count() != 0);
-                if owners.is_empty() {
-                    *self = Self::Empty;
-                } else if owners.len() == 1 {
-                    let owner = owners.pop().expect("one live state owner");
-                    *self = Self::One(owner);
-                }
-            }
-        }
-    }
-
-    fn insert(&mut self, slot: &Rc<RefCell<ObjectSlot>>) {
-        self.retain_live();
-        if self.contains(slot) {
-            return;
-        }
-        match self {
-            Self::Empty => *self = Self::One(Rc::downgrade(slot)),
-            Self::One(owner) => {
-                let existing = owner.clone();
-                *self = Self::Many(Box::new(vec![existing, Rc::downgrade(slot)]));
-            }
-            Self::Many(owners) => owners.push(Rc::downgrade(slot)),
-        }
-    }
-
-    fn contains(&mut self, slot: &Rc<RefCell<ObjectSlot>>) -> bool {
-        self.retain_live();
-        match self {
-            Self::Empty => false,
-            Self::One(owner) => owner
-                .upgrade()
-                .is_some_and(|candidate| Rc::ptr_eq(&candidate, slot)),
-            Self::Many(owners) => owners.iter().any(|owner| {
-                owner
-                    .upgrade()
-                    .is_some_and(|candidate| Rc::ptr_eq(&candidate, slot))
-            }),
-        }
-    }
-
-    fn remove(&mut self, slot: &Rc<RefCell<ObjectSlot>>) {
-        self.retain_live();
-        let remove_single = matches!(self, Self::One(owner) if owner
-            .upgrade()
-            .is_some_and(|candidate| Rc::ptr_eq(&candidate, slot)));
-        if remove_single {
-            *self = Self::Empty;
-            return;
-        }
-        if let Self::Many(owners) = self {
-            owners.retain(|owner| {
-                owner
-                    .upgrade()
-                    .is_some_and(|candidate| !Rc::ptr_eq(&candidate, slot))
-            });
-        }
-        self.retain_live();
-    }
-
-    fn handles(&mut self) -> Vec<ObjectHandle> {
-        self.retain_live();
-        match self {
-            Self::Empty => Vec::new(),
-            Self::One(owner) => owner
-                .upgrade()
-                .map(|slot| vec![ObjectHandle(slot)])
-                .unwrap_or_default(),
-            Self::Many(owners) => owners
-                .iter()
-                .filter_map(Weak::upgrade)
-                .map(ObjectHandle)
-                .collect(),
-        }
-    }
-}
-
-/// Reverse containment is a flpdf-only deviation retained for incremental
-/// writer ownership and test-only root observations. Keep the common empty
-/// and single-parent cases inline; only aliases with multiple live parents
-/// pay for a boxed vector so the ObjectSlot itself does not carry Vec's
-/// three-word allocation header for every value.
-#[derive(Default)]
-enum ContainmentParents {
-    #[default]
-    Empty,
-    One(Weak<RefCell<ObjectSlot>>),
-    // The box keeps Vec's three-word header out of every ObjectSlot. This
-    // flpdf-only alias state is deliberately rare; the common zero/one-parent
-    // cases never allocate this collection.
-    #[allow(clippy::box_collection)]
-    Many(Box<Vec<Weak<RefCell<ObjectSlot>>>>),
-}
-
-impl ContainmentParents {
-    fn retain_live(&mut self) {
-        match self {
-            Self::Empty => {}
-            Self::One(parent) => {
-                if parent.strong_count() == 0 {
-                    *self = Self::Empty;
-                }
-            }
-            Self::Many(parents) => {
-                parents.retain(|parent| parent.strong_count() != 0);
-                if parents.is_empty() {
-                    *self = Self::Empty;
-                } else if parents.len() == 1 {
-                    let parent = parents.pop().expect("one live containment parent");
-                    *self = Self::One(parent);
-                }
-            }
-        }
-    }
-
-    fn push(&mut self, parent: Weak<RefCell<ObjectSlot>>) {
-        self.retain_live();
-        match self {
-            Self::Empty => *self = Self::One(parent),
-            Self::One(existing) => {
-                let existing = existing.clone();
-                *self = Self::Many(Box::new(vec![existing, parent]));
-            }
-            Self::Many(parents) => parents.push(parent),
-        }
-    }
-
-    fn remove(&mut self, parent: &Weak<RefCell<ObjectSlot>>) {
-        self.retain_live();
-        let remove_single = matches!(self, Self::One(existing) if Weak::ptr_eq(existing, parent));
-        if remove_single {
-            *self = Self::Empty;
-            return;
-        }
-        if let Self::Many(parents) = self {
-            if let Some(index) = parents
-                .iter()
-                .position(|candidate| Weak::ptr_eq(candidate, parent))
-            {
-                parents.remove(index);
-            }
-        }
-        self.retain_live();
-    }
-
-    #[cfg(test)]
-    fn live_parents(&mut self) -> Vec<Weak<RefCell<ObjectSlot>>> {
-        self.retain_live();
-        match self {
-            Self::Empty => Vec::new(),
-            Self::One(parent) => vec![parent.clone()],
-            Self::Many(parents) => parents.as_ref().clone(),
-        }
-    }
-
-    #[cfg(test)]
-    fn len(&mut self) -> usize {
-        self.retain_live();
-        match self {
-            Self::Empty => 0,
-            Self::One(_) => 1,
-            Self::Many(parents) => parents.len(),
-        }
-    }
-}
-
 #[cfg(test)]
-mod state_owner_tests {
+mod reverse_containment_layout_tests {
     use super::*;
 
-    fn slot() -> Rc<RefCell<ObjectSlot>> {
-        ObjectHandle::integer(1).0.clone()
+    #[test]
+    fn reverse_containment_state_does_not_live_in_production_slots() {
+        assert!(std::mem::size_of::<ObjectSlot>() < 56);
+        assert!(std::mem::size_of::<SharedValueState>() < 136);
     }
 
     #[test]
-    fn state_owners_cover_inline_alias_and_cleanup_transitions() {
-        let first = slot();
-        let mut owners = StateOwners::default();
-
-        assert!(!owners.contains(&first));
-        owners.insert(&first);
-        owners.insert(&first);
-        assert!(owners.contains(&first));
-        assert_eq!(owners.handles().len(), 1);
-
-        let other = slot();
-        owners.remove(&other);
-        assert_eq!(owners.handles().len(), 1);
-        owners.remove(&first);
-        assert!(owners.handles().is_empty());
-
-        let second = slot();
-        let third = slot();
-        owners.insert(&first);
-        owners.insert(&second);
-        assert!(owners.contains(&first));
-        assert!(!owners.contains(&third));
-        owners.insert(&third);
-        assert_eq!(owners.handles().len(), 3);
-
-        owners.remove(&third);
-        assert_eq!(owners.handles().len(), 2);
-        owners.remove(&first);
-        assert_eq!(owners.handles().len(), 1);
-
-        drop(second);
-        assert!(owners.handles().is_empty());
-    }
-
-    #[test]
-    fn state_owners_discard_dead_many_entries_before_handles() {
-        let first = slot();
-        let second = slot();
-        let mut owners = StateOwners::Many(Box::new(vec![
-            Rc::downgrade(&first),
-            Rc::downgrade(&second),
-        ]));
-
-        drop(first);
-        drop(second);
-        owners.retain_live();
-        assert!(owners.handles().is_empty());
-    }
-
-    #[test]
-    fn containment_parents_promote_and_demote_without_changing_edges() {
-        let first = slot();
-        let second = slot();
-        let third = slot();
-        let first_parent = Rc::downgrade(&first);
-        let second_parent = Rc::downgrade(&second);
-        let third_parent = Rc::downgrade(&third);
-        let mut parents = ContainmentParents::default();
-
-        assert_eq!(parents.len(), 0);
-        parents.push(first_parent.clone());
-        assert_eq!(parents.live_parents().len(), 1);
-        parents.push(second_parent.clone());
-        parents.push(third_parent.clone());
-        assert_eq!(parents.len(), 3);
-
-        parents.remove(&second_parent);
-        assert_eq!(parents.len(), 2);
-        parents.remove(&first_parent);
-        assert_eq!(parents.live_parents().len(), 1);
-
-        drop(third);
-        assert_eq!(parents.len(), 0);
-
-        let dead_first = slot();
-        let dead_second = slot();
-        let mut dead = ContainmentParents::Many(Box::new(vec![
-            Rc::downgrade(&dead_first),
-            Rc::downgrade(&dead_second),
-        ]));
-        drop(dead_first);
-        drop(dead_second);
-        assert!(dead.live_parents().is_empty());
+    fn production_source_has_no_reverse_containment_fields() {
+        let source = include_str!("object_handle.rs");
+        let containment_field = ["containment_", "parents"].concat();
+        let owner_field = ["state_", "owners"].concat();
+        assert!(!source.contains(&containment_field));
+        assert!(!source.contains(&owner_field));
     }
 }
 
@@ -1461,7 +1195,6 @@ struct SharedValueState {
     /// its payload in one Rc allocation per parse call; JSON and child forms
     /// remain boxed to keep their larger shapes out of every value allocation.
     description: Option<ObjectDescription>,
-    state_owners: StateOwners,
 }
 
 impl SharedValueState {
@@ -1528,7 +1261,6 @@ fn new_shared_value_state(
         identity,
         parsed_offset,
         description: None,
-        state_owners: StateOwners::default(),
     }))
 }
 
@@ -1553,10 +1285,37 @@ struct ObjectSlot {
     /// retain the helper's document claim without an extra `Option<u64>`
     /// discriminant.
     tree_pdf_unique_id: Option<NonZeroU64>,
-    // qpdf-deviation: qpdf keeps only forward child handles; this weak reverse
-    // edge has no qpdf counterpart and is retained solely for cfg(test)
-    // containment-root assertions and stack-safe teardown bookkeeping.
-    containment_parents: ContainmentParents,
+}
+
+// Reverse containment is needed only by unit-test diagnostics that assert the
+// current indirect roots of a direct value. Keep that observation out of the
+// production ObjectSlot/SharedValueState layout: tests register live slots and
+// derive parent paths from their forward children instead of maintaining a
+// second ownership graph during every mutation.
+#[cfg(test)]
+thread_local! {
+    static TEST_SLOTS: RefCell<Vec<Weak<RefCell<ObjectSlot>>>> = const { RefCell::new(Vec::new()) };
+}
+
+#[cfg(test)]
+fn register_test_slot(slot: &Rc<RefCell<ObjectSlot>>) {
+    TEST_SLOTS.with(|slots| slots.borrow_mut().push(Rc::downgrade(slot)));
+}
+
+#[cfg(not(test))]
+fn register_test_slot(_slot: &Rc<RefCell<ObjectSlot>>) {}
+
+#[cfg(test)]
+fn registered_test_slots() -> Vec<ObjectHandle> {
+    TEST_SLOTS.with(|slots| {
+        let mut slots = slots.borrow_mut();
+        slots.retain(|candidate| candidate.strong_count() != 0);
+        slots
+            .iter()
+            .filter_map(Weak::upgrade)
+            .map(ObjectHandle)
+            .collect()
+    })
 }
 
 /// The active identity on qpdf's shared QPDFValue (QPDFValue.hh:68-72).
@@ -1682,7 +1441,6 @@ fn empty_object_slot() -> Rc<RefCell<ObjectSlot>> {
         end_before_space: NO_PARSED_OFFSET,
         end_after_space: NO_PARSED_OFFSET,
         tree_pdf_unique_id: None,
-        containment_parents: ContainmentParents::default(),
     }))
 }
 
@@ -1986,7 +1744,7 @@ impl ObjectHandle {
     /// boundary (`include/qpdf/QPDFObjectHandle.hh:325-326`).
     pub fn uninitialized() -> Self {
         let handle = Self(empty_object_slot());
-        handle.register_state_owner();
+        register_test_slot(&handle.0);
         handle
     }
 
@@ -2126,7 +1884,7 @@ impl ObjectHandle {
     /// Neither half is sufficient alone. The resolver is what
     /// [`Self::try_dereference`] upgrades and calls; the identity is what
     /// [`Self::belongs_to_pdf`] answers on. [`Self::set_resolved`] installs
-    /// the resolved value and its live immediate-parent edges independently.
+    /// the resolved value and its forward child graph independently.
     ///
     /// `pdf_unique_id` itself ports qpdf's document-level unique id:
     /// `QPDF::getUniqueId` (`include/qpdf/QPDF.hh:283`,
@@ -2205,9 +1963,8 @@ impl ObjectHandle {
             end_before_space: NO_PARSED_OFFSET,
             end_after_space: NO_PARSED_OFFSET,
             tree_pdf_unique_id: None,
-            containment_parents: ContainmentParents::default(),
         })));
-        handle.register_state_owner();
+        register_test_slot(&handle.0);
         handle
     }
 
@@ -2233,9 +1990,8 @@ impl ObjectHandle {
             end_before_space: NO_PARSED_OFFSET,
             end_after_space: NO_PARSED_OFFSET,
             tree_pdf_unique_id: None,
-            containment_parents: ContainmentParents::default(),
         })));
-        handle.register_state_owner();
+        register_test_slot(&handle.0);
         handle
     }
 
@@ -2243,9 +1999,10 @@ impl ObjectHandle {
     /// but initially without active document metadata. The resolver link is
     /// weak so a surviving handle cannot keep its document alive.
     ///
-    /// Its resolved direct children keep only weak immediate-parent links for
-    /// test-only containment inspection. It neither copies Root metadata to
-    /// children nor records a permanent `None` root. Until this slot is
+    /// Its resolved direct children remain forward handles in the shared
+    /// value. Unit-test containment inspection derives parent paths from the
+    /// registered forward graph; production construction neither copies Root
+    /// metadata to children nor records a permanent `None` root. Until this slot is
     /// promoted, it has no active identity, so [`Self::belongs_to_pdf`] is
     /// false for every document. That makes this the narrower test
     /// constructor, not the
@@ -2302,9 +2059,8 @@ impl ObjectHandle {
             end_before_space: NO_PARSED_OFFSET,
             end_after_space: NO_PARSED_OFFSET,
             tree_pdf_unique_id: None,
-            containment_parents: ContainmentParents::default(),
         })));
-        handle.register_state_owner();
+        register_test_slot(&handle.0);
         handle
     }
 
@@ -2350,75 +2106,24 @@ impl ObjectHandle {
             end_before_space: NO_PARSED_OFFSET,
             end_after_space: NO_PARSED_OFFSET,
             tree_pdf_unique_id: None,
-            containment_parents: ContainmentParents::default(),
         })));
-        handle.register_state_owner();
-        handle.with_value(|value| {
-            if let Some(value) = value {
-                handle.attach_value_children(value);
-            }
-        });
+        register_test_slot(&handle.0);
         handle
-    }
-
-    fn register_state_owner(&self) {
-        let shared = self.0.borrow().shared.clone();
-        let self_slot = self.0.clone();
-        shared.borrow_mut().state_owners.insert(&self_slot);
-    }
-
-    fn remove_state_owner(
-        shared: &Rc<RefCell<SharedValueState>>,
-        slot_to_remove: &Rc<RefCell<ObjectSlot>>,
-    ) {
-        shared.borrow_mut().state_owners.remove(slot_to_remove);
-    }
-
-    fn state_owner_handles(&self) -> Vec<Self> {
-        let shared = self.0.borrow().shared.clone();
-        let handles = shared.borrow_mut().state_owners.handles();
-        handles
-    }
-
-    fn detach_child_from_state_owners(&self, child: &ObjectHandle) {
-        for owner in self.state_owner_handles() {
-            let parent = owner.containment_parent();
-            Self::detach_child_from_parent(child, &parent);
-        }
-    }
-
-    fn attach_child_to_state_owners(&self, child: &ObjectHandle) {
-        for owner in self.state_owner_handles() {
-            let parent = owner.containment_parent();
-            Self::attach_child_to_parent(child, &parent);
-        }
     }
 
     fn state_children(state: &ObjectValue) -> Vec<ObjectHandle> {
         Self::direct_children(state)
     }
 
-    /// Replace the shared payload and keep every slot that owns it in sync
-    /// with the payload's direct-child containment edges.
+    /// Replace the shared payload. Forward children remain owned by the
+    /// shared value itself; no reverse owner list is needed to synchronize
+    /// aliases.
     fn replace_shared_state(&self, new_state: ObjectValue) -> ObjectValue {
         let shared = self.0.borrow().shared.clone();
-        let (old_state, new_children) = {
+        {
             let mut shared = shared.borrow_mut();
-            let old_state = std::mem::replace(&mut shared.value, new_state);
-            let new_children = Self::state_children(&shared.value);
-            (old_state, new_children)
-        };
-        let old_children = Self::state_children(&old_state);
-        for owner in self.state_owner_handles() {
-            let parent = owner.containment_parent();
-            for child in &old_children {
-                Self::detach_child_from_parent(child, &parent);
-            }
-            for child in &new_children {
-                Self::attach_child_to_parent(child, &parent);
-            }
+            std::mem::replace(&mut shared.value, new_state)
         }
-        old_state
     }
 
     /// Swap the value allocations of two distinct indirect object slots while
@@ -2432,14 +2137,14 @@ impl ObjectHandle {
     /// flpdf the shared value identity moves with the payload; only its
     /// object generation is restored. The owning document follows the value,
     /// including when another document has re-promoted one of these objects.
-    /// State-owner and child containment bookkeeping moves with the value;
-    /// the QObject slots and their containment parents retain their identity.
+    /// The QObject slots retain their identity while the shared value and its
+    /// forward children move together.
     pub(crate) fn swap_value_state_with(&self, other: &Self) {
         if Rc::ptr_eq(&self.0, &other.0) {
             return;
         }
 
-        let (left_shared, left_children, right_shared, right_children) = {
+        {
             let left = self.0.borrow();
             let right = other.0.borrow();
             let left_shared = left.shared.clone();
@@ -2447,10 +2152,7 @@ impl ObjectHandle {
             if Rc::ptr_eq(&left_shared, &right_shared) {
                 return;
             }
-            let left_children = Self::state_children(&left_shared.borrow().value);
-            let right_children = Self::state_children(&right_shared.borrow().value);
-            (left_shared, left_children, right_shared, right_children)
-        };
+        }
 
         let left_object_gen = self.qpdf_obj_gen();
         let right_object_gen = other.qpdf_obj_gen();
@@ -2459,17 +2161,6 @@ impl ObjectHandle {
         // parser gate loses identities the Rust `ObjectRef` factory admits.
         let left_object_ref = self.object_ref();
         let right_object_ref = other.object_ref();
-        let left_parent = self.containment_parent();
-        let right_parent = other.containment_parent();
-        Self::remove_state_owner(&left_shared, &self.0);
-        Self::remove_state_owner(&right_shared, &other.0);
-        for child in &left_children {
-            Self::detach_child_from_parent(child, &left_parent);
-        }
-        for child in &right_children {
-            Self::detach_child_from_parent(child, &right_parent);
-        }
-
         {
             let mut left = self.0.borrow_mut();
             let mut right = other.0.borrow_mut();
@@ -2491,15 +2182,6 @@ impl ObjectHandle {
                 .and_then(QpdfObjGen::to_object_ref)
                 .or(right_object_ref);
         }
-
-        self.register_state_owner();
-        other.register_state_owner();
-        for child in &right_children {
-            Self::attach_child_to_parent(child, &left_parent);
-        }
-        for child in &left_children {
-            Self::attach_child_to_parent(child, &right_parent);
-        }
     }
 
     /// Replace only this slot's whole-object state, leaving other slots that
@@ -2508,10 +2190,9 @@ impl ObjectHandle {
     /// `QPDFValue` allocation that a replacement alias still observes.
     fn replace_detached_state(&self, new_state: ObjectValue) {
         let old_shared = self.0.borrow().shared.clone();
-        let (old_children, identity, parsed_offset, description) = {
+        let (identity, parsed_offset, description) = {
             let shared = old_shared.borrow();
             (
-                Self::state_children(&shared.value),
                 shared.identity.clone(),
                 shared.parsed_offset,
                 shared.description.clone(),
@@ -2520,16 +2201,9 @@ impl ObjectHandle {
         let new_shared = new_shared_value_state(new_state, identity, parsed_offset);
         new_shared.borrow_mut().description = description;
 
-        Self::remove_state_owner(&old_shared, &self.0);
         {
             let mut slot = self.0.borrow_mut();
             slot.shared = new_shared;
-        }
-        self.register_state_owner();
-
-        let parent = self.containment_parent();
-        for child in &old_children {
-            Self::detach_child_from_parent(child, &parent);
         }
     }
 
@@ -2566,25 +2240,7 @@ impl ObjectHandle {
             return;
         }
         let source_shared = source.0.borrow().shared.clone();
-        let old_shared = self.0.borrow().shared.clone();
-        let old_children = {
-            let shared = old_shared.borrow();
-            Self::state_children(&shared.value)
-        };
-        let new_children = {
-            let shared = source_shared.borrow();
-            Self::state_children(&shared.value)
-        };
-        Self::remove_state_owner(&old_shared, &self.0);
         self.0.borrow_mut().shared = source_shared;
-        self.register_state_owner();
-        let parent = self.containment_parent();
-        for child in &old_children {
-            Self::detach_child_from_parent(child, &parent);
-        }
-        for child in &new_children {
-            Self::attach_child_to_parent(child, &parent);
-        }
     }
 
     /// Turn an indirect canonical slot into the floating null object qpdf
@@ -2723,22 +2379,15 @@ impl ObjectHandle {
         if Rc::strong_count(&self.0) != 1 {
             return None;
         }
-        let parent = Rc::downgrade(&self.0);
-        let children = {
+        {
             let slot = self.0.borrow();
             let shared = slot.shared.borrow();
-            match &shared.value {
-                value @ (ObjectValue::Unresolved
-                | ObjectValue::Reserved
-                | ObjectValue::Destroyed) => {
-                    let _ = value;
-                    return None;
-                }
-                value => Self::direct_children(value),
+            if matches!(
+                &shared.value,
+                ObjectValue::Unresolved | ObjectValue::Reserved | ObjectValue::Destroyed
+            ) {
+                return None;
             }
-        };
-        for child in children {
-            Self::detach_child_from_parent(&child, &parent);
         }
         let slot = Rc::try_unwrap(std::mem::replace(&mut self.0, empty_object_slot()))
             .ok()?
@@ -4594,18 +4243,11 @@ impl ObjectHandle {
         if self.is_direct_value_alias(&value) {
             return;
         }
-        let replaced = self.with_value_mut(|v| {
+        self.with_value_mut(|v| {
             if let Some(ObjectValue::Dictionary(entries)) = v {
-                return Some(entries.insert(key.to_vec(), value.clone()));
+                entries.insert(key.to_vec(), value.clone());
             }
-            None
         });
-        if let Some(old_value) = replaced {
-            if let Some(old_value) = old_value {
-                self.detach_child_from_state_owners(&old_value);
-            }
-            self.attach_child_to_state_owners(&value);
-        }
     }
 
     /// Resolve this handle and emit qpdf's dictionary type warning when a
@@ -4657,23 +4299,19 @@ impl ObjectHandle {
         }
 
         self.check_array_item_ownership(&value)?;
-        let old_value = self.with_value_mut(|current| {
+        let _old_value = self.with_value_mut(|current| {
             let Some(ObjectValue::Array(items)) = current else {
                 return None; // cov:ignore: prepare_array_mutation fixed the type
             };
             Some(std::mem::replace(&mut items[index], value.clone()))
         });
-        if let Some(old_value) = old_value {
-            self.detach_child_from_state_owners(&old_value);
-            self.attach_child_to_state_owners(&value);
-        }
         Ok(())
     }
 
     /// Replace the live array contents in qpdf's `setFromVector` order
     /// (`libqpdf/QPDFObjectHandle.cc:884-893`, `libqpdf/QPDF_Array.cc:220-243`).
-    /// The old contents are detached before the first ownership check. Items
-    /// are then checked and attached one at a time, so an ownership error at
+    /// The old contents are removed before the first ownership check. Items
+    /// are then checked and inserted one at a time, so an ownership error at
     /// item `n` intentionally leaves the accepted prefix in place, matching
     /// qpdf's non-transactional `resize(0)` plus `push_back` loop.
     /// A direct replacement that would make the array graph cyclic returns
@@ -4700,26 +4338,19 @@ impl ObjectHandle {
             current_items.reserve(expected_len);
             Some(old_items)
         });
-        let Some(old_items) = old_items else {
+        let Some(_old_items) = old_items else {
             return Ok(()); // cov:ignore: prepare_array_mutation fixed the type
         };
-        for old_item in old_items {
-            self.detach_child_from_state_owners(&old_item);
-        }
 
         for item in items {
             self.check_array_item_ownership(&item)?;
-            let child = item.clone();
-            let inserted = self.with_value_mut(|current| {
+            let _ = self.with_value_mut(|current| {
                 let Some(ObjectValue::Array(current_items)) = current else {
                     return false; // cov:ignore: only this method can change the state
                 };
                 current_items.push(item);
                 true
             });
-            if inserted {
-                self.attach_child_to_state_owners(&child);
-            }
         }
         Ok(())
     }
@@ -4749,8 +4380,7 @@ impl ObjectHandle {
         }
 
         self.check_array_item_ownership(&value)?;
-        let child = value.clone();
-        let inserted = self.with_value_mut(|current| {
+        let _ = self.with_value_mut(|current| {
             let Some(ObjectValue::Array(items)) = current else {
                 return false; // cov:ignore: prepare_array_mutation fixed the type
             };
@@ -4761,9 +4391,6 @@ impl ObjectHandle {
             }
             true
         });
-        if inserted {
-            self.attach_child_to_state_owners(&child);
-        }
         Ok(())
     }
 
@@ -4796,17 +4423,13 @@ impl ObjectHandle {
         }
 
         self.check_array_item_ownership(&value)?;
-        let child = value.clone();
-        let appended = self.with_value_mut(|current| {
+        let _ = self.with_value_mut(|current| {
             let Some(ObjectValue::Array(items)) = current else {
                 return false; // cov:ignore: prepare_array_mutation fixed the type
             };
             items.push(value);
             true
         });
-        if appended {
-            self.attach_child_to_state_owners(&child);
-        }
         Ok(())
     }
 
@@ -4855,7 +4478,6 @@ impl ObjectHandle {
         let Some(old_value) = old_value else {
             return Ok(ObjectHandle::null()); // cov:ignore: prepare_array_mutation fixed the type
         };
-        self.detach_child_from_state_owners(&old_value);
         Ok(old_value)
     }
 
@@ -4967,9 +4589,10 @@ impl ObjectHandle {
     /// Port `QPDF_Array::checkOwnership` (`libqpdf/QPDF_Array.cc:10-26`) at
     /// the Rust error boundary. As with
     /// [`Self::check_key_value_ownership`], compare only the receiver's and
-    /// item's own active PDF identities. A programmatic direct value can
-    /// retain propagated containment ids, but those ids are not qpdf ownership
-    /// and must not reject an array insertion; a non-null parser-created direct
+    /// item's own active PDF identities. Containment does not assign a
+    /// document owner to a programmatic direct value, so no propagated
+    /// containment metadata can reject an array insertion; a non-null
+    /// parser-created direct
     /// value carries its source document identity just as qpdf's parsed value
     /// does.
     fn check_array_item_ownership(&self, item: &ObjectHandle) -> Result<()> {
@@ -5029,13 +4652,7 @@ impl ObjectHandle {
             };
             Some(std::mem::replace(item, value.clone()))
         });
-        if let Some(old_value) = old_value {
-            self.detach_child_from_state_owners(&old_value);
-            self.attach_child_to_state_owners(&value);
-            true
-        } else {
-            false
-        }
+        old_value.is_some()
     }
 
     /// Replace every item in this live array while preserving the array
@@ -5055,15 +4672,9 @@ impl ObjectHandle {
             };
             Some(std::mem::replace(current_items, items.clone()))
         });
-        let Some(old_items) = old_items else {
+        let Some(_old_items) = old_items else {
             return false;
         };
-        for item in old_items {
-            self.detach_child_from_state_owners(&item);
-        }
-        for item in &items {
-            self.attach_child_to_state_owners(item);
-        }
         true
     }
 
@@ -5138,7 +4749,6 @@ impl ObjectHandle {
             return Vec::new();
         }
 
-        let parent = Rc::downgrade(slot);
         let children = {
             let slot_ref = slot.borrow();
             if Rc::strong_count(&slot_ref.shared) != 1 {
@@ -5159,9 +4769,6 @@ impl ObjectHandle {
             }
         };
 
-        for child in &children {
-            Self::detach_child_from_parent(child, &parent);
-        }
         children
     }
 
@@ -5177,32 +4784,6 @@ impl ObjectHandle {
         }
     }
 
-    fn containment_parent(&self) -> Weak<RefCell<ObjectSlot>> {
-        Rc::downgrade(&self.0)
-    }
-
-    fn attach_child_to_parent(child: &ObjectHandle, parent: &Weak<RefCell<ObjectSlot>>) {
-        if child.is_indirect() {
-            return;
-        }
-        {
-            let mut slot = child.0.borrow_mut();
-            slot.containment_parents.push(parent.clone());
-        }
-    }
-
-    fn detach_child_from_parent(child: &ObjectHandle, parent: &Weak<RefCell<ObjectSlot>>) {
-        let mut slot = child.0.borrow_mut();
-        slot.containment_parents.remove(parent);
-    }
-
-    fn attach_value_children(&self, value: &ObjectValue) {
-        let parent = self.containment_parent();
-        for child in Self::direct_children(value) {
-            Self::attach_child_to_parent(&child, &parent);
-        }
-    }
-
     #[cfg(test)]
     fn containment_roots(&self) -> BTreeSet<ContainmentOwner> {
         if self.is_indirect() {
@@ -5211,32 +4792,51 @@ impl ObjectHandle {
         let mut roots = BTreeSet::new();
         let mut visited = BTreeSet::new();
         let mut pending = vec![self.clone()];
+        let registered = registered_test_slots();
+        let mut parents_by_child: BTreeMap<usize, Vec<ObjectHandle>> = BTreeMap::new();
+        for parent in &registered {
+            let child_ids = {
+                let slot = parent.0.borrow();
+                let shared = slot.shared.borrow();
+                match &shared.value {
+                    ObjectValue::Array(children) => children
+                        .iter()
+                        .map(|child| Rc::as_ptr(&child.0) as usize)
+                        .collect::<Vec<_>>(),
+                    ObjectValue::Dictionary(entries) => entries
+                        .values()
+                        .map(|child| Rc::as_ptr(&child.0) as usize)
+                        .collect::<Vec<_>>(),
+                    ObjectValue::Stream(stream) => {
+                        vec![Rc::as_ptr(&stream.stream_dict.0) as usize]
+                    }
+                    _ => Vec::new(),
+                }
+            };
+            for child_id in child_ids {
+                parents_by_child
+                    .entry(child_id)
+                    .or_default()
+                    .push(parent.clone());
+            }
+        }
         while let Some(handle) = pending.pop() {
             let identity = Rc::as_ptr(&handle.0) as usize;
             if !visited.insert(identity) {
                 continue;
             }
-            let (object_ref, pdf_unique_id, parents) = {
-                let mut slot = handle.0.borrow_mut();
-                (
-                    slot.object_ref(),
-                    slot.active_pdf_unique_id(),
-                    slot.containment_parents.live_parents(),
-                )
-            };
-            if let Some(object_ref) = object_ref {
-                roots.insert(ContainmentOwner {
-                    pdf_unique_id,
-                    object_ref,
-                });
-                continue;
+            if let Some(parents) = parents_by_child.get(&identity) {
+                for parent in parents {
+                    if let Some(object_ref) = parent.object_ref() {
+                        roots.insert(ContainmentOwner {
+                            pdf_unique_id: parent.owning_pdf_unique_id(),
+                            object_ref,
+                        });
+                    } else {
+                        pending.push(parent.clone());
+                    }
+                }
             }
-            pending.extend(
-                parents
-                    .into_iter()
-                    .filter_map(|parent| parent.upgrade())
-                    .map(ObjectHandle),
-            );
         }
         roots
     }
@@ -5252,15 +4852,12 @@ impl ObjectHandle {
     /// See [`Self::replace_key`]'s doc comment for the same canonical
     /// resolution behavior.
     pub fn remove_key(&self, key: &[u8]) {
-        let removed = self.with_value_mut(|v| {
+        let _removed = self.with_value_mut(|v| {
             if let Some(ObjectValue::Dictionary(entries)) = v {
                 return entries.remove(key);
             }
             None
         });
-        if let Some(removed) = removed {
-            self.detach_child_from_state_owners(&removed);
-        }
     }
 
     /// A fresh, direct handle with a value copied from `self` — mirrors
@@ -6297,8 +5894,9 @@ impl ObjectHandle {
     /// This is qpdf's `QPDF_Stream::replaceDict` boundary
     /// (`libqpdf/QPDF_Stream.cc:688-693`), used by
     /// `QPDF::JSONReactor::dictionaryItem` for `stream.dict`
-    /// (`libqpdf/QPDF_json.cc:629-637`). The replacement is attached through
-    /// the same containment bookkeeping as ordinary dictionary mutations.
+    /// (`libqpdf/QPDF_json.cc:629-637`). The replacement updates the stream's
+    /// forward dictionary child in the same canonical mutation path as
+    /// ordinary dictionary changes.
     pub(crate) fn replace_stream_dict(&self, dictionary: ObjectHandle) -> Result<()> {
         self.try_dereference()?;
         dictionary.try_dereference()?;
@@ -6316,15 +5914,13 @@ impl ObjectHandle {
             )),
             _ => None,
         });
-        let Some(previous) = previous else {
+        let Some(_previous) = previous else {
             let type_name = self.type_name()?;
             return Err(Error::System(format!(
                 "operation for stream attempted on object of type {}",
                 type_name
             )));
         };
-        self.detach_child_from_state_owners(&previous);
-        self.attach_child_to_state_owners(&dictionary);
         Ok(())
     }
 
@@ -8887,8 +8483,7 @@ fn merge_resource_array(this_val: &ObjectHandle, other_val: &ObjectHandle) -> Re
 }
 
 fn append_array_item(handle: &ObjectHandle, item: ObjectHandle) {
-    let child = item.clone();
-    let appended = handle.with_value_mut(|v| {
+    let _ = handle.with_value_mut(|v| {
         if let Some(ObjectValue::Array(items)) = v {
             items.push(item);
             true
@@ -8896,9 +8491,6 @@ fn append_array_item(handle: &ObjectHandle, item: ObjectHandle) {
             false // cov:ignore: merge_resource_array only calls after confirming this_val is an array
         }
     });
-    if appended {
-        ObjectHandle::attach_child_to_parent(&child, &handle.containment_parent());
-    }
 }
 
 // Mirrors `isScalar()` (`libqpdf/QPDFObjectHandle.cc:449-452`): dereference
@@ -11481,7 +11073,7 @@ mod resolution_state_tests {
     }
 
     #[test]
-    fn into_direct_value_leaves_child_edges_attached_when_the_parent_is_shared() {
+    fn into_direct_value_preserves_forward_children_when_the_parent_is_shared() {
         let child = ObjectHandle::integer(1);
         let parent = ObjectHandle::array(vec![child.clone()]);
         let retained_parent = parent.clone();
@@ -16664,12 +16256,7 @@ mod mutation_tests {
     }
 
     #[test]
-    fn expired_direct_parent_edges_are_pruned_on_attach_and_query() {
-        fn parent_count(handle: &ObjectHandle) -> usize {
-            assert!(handle.is_direct());
-            handle.0.borrow_mut().containment_parents.len()
-        }
-
+    fn forward_graph_query_ignores_expired_direct_parents() {
         let child = ObjectHandle::integer(1);
         for _ in 0..64 {
             let transient_parent = ObjectHandle::array(vec![child.clone()]);
@@ -16677,11 +16264,10 @@ mod mutation_tests {
         }
 
         let live_parent = ObjectHandle::array(vec![child.clone()]);
-        assert_eq!(parent_count(&child), 1);
+        assert!(child.containing_object_refs().is_empty());
 
         drop(live_parent);
         assert!(child.containing_object_refs().is_empty());
-        assert_eq!(parent_count(&child), 0);
     }
 
     #[test]
@@ -20270,9 +19856,8 @@ pub(crate) mod warning_emission_tests {
 
     #[test]
     fn programmatic_non_null_child_does_not_borrow_containment_context() {
-        let (parent, recorder) = handle_resolving(ObjectValue::Array(vec![]));
+        let (_, recorder) = handle_resolving(ObjectValue::Array(vec![]));
         let child = ObjectHandle::integer(10);
-        ObjectHandle::attach_child_to_parent(&child, &Rc::downgrade(&parent.0));
 
         assert!(child.context().is_none());
         let (result, captured) =
@@ -20311,9 +19896,8 @@ pub(crate) mod warning_emission_tests {
 
     #[test]
     fn programmatic_non_null_child_keeps_a_contextless_type_warning_route() {
-        let (parent, recorder) = handle_resolving(ObjectValue::Array(vec![]));
+        let (_, recorder) = handle_resolving(ObjectValue::Array(vec![]));
         let child = ObjectHandle::integer(10);
-        ObjectHandle::attach_child_to_parent(&child, &Rc::downgrade(&parent.0));
 
         let error = child
             .type_warning("dictionary", "treating as empty")
@@ -20412,9 +19996,8 @@ pub(crate) mod warning_emission_tests {
 
     #[test]
     fn dictionary_accessors_keep_a_programmatic_direct_child_contextless() {
-        let (parent, recorder) = handle_resolving(ObjectValue::Array(vec![]));
+        let (_, recorder) = handle_resolving(ObjectValue::Array(vec![]));
         let child = ObjectHandle::integer(10);
-        ObjectHandle::attach_child_to_parent(&child, &Rc::downgrade(&parent.0));
 
         let error = child
             .try_get_keys()
@@ -20433,9 +20016,8 @@ pub(crate) mod warning_emission_tests {
         // `warnIfPossible` must use the process-global default error logger
         // (`libqpdf/QPDFObjectHandle.cc:2196-2199`) rather than a containment
         // parent that was never assigned to the value.
-        let (parent, recorder) = handle_resolving(ObjectValue::Array(vec![]));
+        let (_, recorder) = handle_resolving(ObjectValue::Array(vec![]));
         let child = ObjectHandle::integer(10);
-        ObjectHandle::attach_child_to_parent(&child, &Rc::downgrade(&parent.0));
 
         let (result, captured) =
             with_captured_default_error(|| child.warn_if_possible("treating as empty"));
