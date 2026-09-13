@@ -469,3 +469,16 @@ fn overlay_inspection_attributes_donor_open_errors_to_the_donor_path() {
     ];
     assert_matches_qpdf_exact(&args);
 }
+
+#[test]
+fn empty_primary_combined_inspection_uses_the_job_lifecycle() {
+    if !qpdf_available() {
+        return;
+    }
+
+    assert_matches_qpdf_exact(&[
+        "--empty".to_owned(),
+        "--check".to_owned(),
+        "--show-pages".to_owned(),
+    ]);
+}
