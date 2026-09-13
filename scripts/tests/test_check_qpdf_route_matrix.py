@@ -145,6 +145,52 @@ class CheckQpdfRouteMatrixTests(unittest.TestCase):
             self.assertIn("classification", result.stdout)
             self.assertIn("legacy", result.stdout)
 
+    def test_prose_between_classification_rows_is_not_table_end(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary_directory:
+            repo = SyntheticRepository(Path(temporary_directory))
+            repo.write(
+                "a.md",
+                HEADER
+                + "| 1 | x | `libqpdf/QPDF.cc:1` | y | z | canonical | w | - |\n"
+                + "\n"
+                + "The table continues after this explanatory note.\n"
+                + "\n"
+                + "| 2 | x | `libqpdf/QPDF.cc:2` | y | z | mixed | w | - |\n",
+            )
+            result = repo.check()
+            self.assertEqual(0, result.returncode, result.stdout + result.stderr)
+            self.assertIn("2 matrix row(s)", result.stdout)
+
+    def test_nonclassification_table_after_prose_is_not_counted(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary_directory:
+            repo = SyntheticRepository(Path(temporary_directory))
+            repo.write(
+                "a.md",
+                HEADER
+                + "| 1 | x | `libqpdf/QPDF.cc:1` | y | z | canonical | w | - |\n"
+                + "\n"
+                + "A different table follows.\n"
+                + "\n"
+                + "| name | value |\n"
+                + "|---|---|\n"
+                + "| stale | mixed |\n",
+            )
+            result = repo.check()
+            self.assertEqual(0, result.returncode, result.stdout + result.stderr)
+            self.assertIn("1 matrix row(s)", result.stdout)
+
+    def test_combined_zero_one_row_counts_as_two_logical_cases(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary_directory:
+            repo = SyntheticRepository(Path(temporary_directory))
+            repo.write(
+                "a.md",
+                HEADER
+                + "| 0/1 | x | `libqpdf/QPDF.cc:1` | y | z | bridge | w | - |\n",
+            )
+            result = repo.check()
+            self.assertEqual(0, result.returncode, result.stdout + result.stderr)
+            self.assertIn("2 matrix row(s)", result.stdout)
+
     def test_prose_citation_outside_table_is_also_checked(self) -> None:
         with tempfile.TemporaryDirectory() as temporary_directory:
             repo = SyntheticRepository(Path(temporary_directory))
