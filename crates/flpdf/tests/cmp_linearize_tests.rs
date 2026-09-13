@@ -22,6 +22,7 @@
 
 use flpdf::{NewlineBeforeEndstream, Pdf};
 use std::path::Path;
+use std::process::Command;
 
 /// Linearize `fixture` via the public API (mirroring the CLI `--linearize`
 /// path) and return the complete back-patched bytes.
@@ -735,6 +736,27 @@ fn linearized_extra_header_starts_after_qpdf_separator_newline() {
         b"xref\n",
         "qpdf writes xref immediately after extra header's terminating newline"
     );
+}
+
+#[test]
+fn trailer_external_file_keys_linearized_match_qpdf_11_9() {
+    let fixture = "trailer-external-file-keys.pdf";
+    let input = Path::new(env!("CARGO_MANIFEST_DIR"))
+        .join("../../tests/fixtures/compat")
+        .join(fixture);
+    let directory = tempfile::tempdir().expect("tempdir");
+    let expected_path = directory.path().join("qpdf.pdf");
+    let status = Command::new("qpdf")
+        .args(["--linearize", "--deterministic-id"])
+        .arg(&input)
+        .arg(&expected_path)
+        .status()
+        .expect("qpdf runs");
+    assert_eq!(status.code(), Some(0), "qpdf linearization must succeed");
+
+    let actual = flpdf_linearized(fixture);
+    let expected = std::fs::read(&expected_path).expect("qpdf output");
+    assert_eq!(actual, expected, "linearized trailer keys must match qpdf");
 }
 
 /// Extract the page content-stream object body — the single-`/FlateDecode`
