@@ -245,6 +245,7 @@ fn top_level_coalesce_linearize_matches_qpdf() {
 
     let qpdf = run_qpdf(&[
         "--static-id",
+        "--stream-data=uncompress",
         "--coalesce-contents",
         "--linearize",
         input,
@@ -254,6 +255,7 @@ fn top_level_coalesce_linearize_matches_qpdf() {
 
     let flpdf = run_flpdf(&[
         "--static-id",
+        "--stream-data=uncompress",
         "--coalesce-contents",
         "--linearize",
         input,
