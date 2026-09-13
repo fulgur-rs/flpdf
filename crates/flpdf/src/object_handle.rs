@@ -163,13 +163,35 @@ type StreamTokenFilter = Rc<RefCell<dyn TokenFilter>>;
 /// cycle-safe debug representation for the trait objects; it does not add an
 /// ownership cell or another allocation around the vector.
 #[derive(Clone, Default)]
-pub(crate) struct StreamTokenFilterList(Vec<StreamTokenFilter>);
+struct StreamTokenFilters(Vec<StreamTokenFilter>);
+
+#[derive(Clone, Default)]
+pub(crate) struct StreamTokenFilterList(Option<Box<StreamTokenFilters>>);
+
+impl StreamTokenFilterList {
+    fn is_empty(&self) -> bool {
+        self.0.as_ref().is_none_or(|filters| filters.0.is_empty())
+    }
+
+    fn push(&mut self, filter: StreamTokenFilter) {
+        self.0
+            .get_or_insert_with(|| Box::new(StreamTokenFilters::default()))
+            .0
+            .push(filter);
+    }
+}
 
 impl std::fmt::Debug for StreamTokenFilterList {
     fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         formatter
             .debug_list()
-            .entries(self.0.iter().map(|_| "<TokenFilter>"))
+            .entries(
+                self.0
+                    .as_deref()
+                    .into_iter()
+                    .flat_map(|filters| filters.0.iter())
+                    .map(|_| "<TokenFilter>"),
+            )
             .finish()
     }
 }
@@ -6468,7 +6490,7 @@ impl ObjectHandle {
             Some(ObjectValue::Stream {
                 stream_token_filters,
                 ..
-            }) => !stream_token_filters.0.is_empty(),
+            }) => !stream_token_filters.is_empty(),
             _ => false,
         })
     }
@@ -6525,7 +6547,7 @@ impl ObjectHandle {
                 ..
             }) = value
             {
-                stream_token_filters.0.push(filter);
+                stream_token_filters.push(filter);
             }
         });
         Ok(())
@@ -6978,7 +7000,12 @@ impl ObjectHandle {
         // normalization -> encoding. Since `head` is assembled from the
         // sink backwards, token filters are wrapped before the decode stages
         // in reverse registration order (`QPDF_Stream.cc:488-620`).
-        for filter in token_filters.0.into_iter().rev() {
+        for filter in token_filters
+            .0
+            .into_iter()
+            .flat_map(|filters| filters.0)
+            .rev()
+        {
             let tokenizer = QpdfTokenizer::new_shared("stream token filter", filter, Some(head));
             head = PipelineRef::Owned(Box::new(tokenizer));
         }
