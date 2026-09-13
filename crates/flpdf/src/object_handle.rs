@@ -1115,7 +1115,10 @@ enum StateOwners {
     #[default]
     Empty,
     One(Weak<RefCell<ObjectSlot>>),
-    Many(Vec<Weak<RefCell<ObjectSlot>>>),
+    // Keep Vec's header out of every SharedValueState; only aliasing values
+    // allocate the reverse-owner collection.
+    #[allow(clippy::box_collection)]
+    Many(Box<Vec<Weak<RefCell<ObjectSlot>>>>),
 }
 
 impl StateOwners {
@@ -1148,7 +1151,7 @@ impl StateOwners {
             Self::Empty => *self = Self::One(Rc::downgrade(slot)),
             Self::One(owner) => {
                 let existing = owner.clone();
-                *self = Self::Many(vec![existing, Rc::downgrade(slot)]);
+                *self = Self::Many(Box::new(vec![existing, Rc::downgrade(slot)]));
             }
             Self::Many(owners) => owners.push(Rc::downgrade(slot)),
         }
@@ -1341,7 +1344,10 @@ mod state_owner_tests {
     fn state_owners_discard_dead_many_entries_before_handles() {
         let first = slot();
         let second = slot();
-        let mut owners = StateOwners::Many(vec![Rc::downgrade(&first), Rc::downgrade(&second)]);
+        let mut owners = StateOwners::Many(Box::new(vec![
+            Rc::downgrade(&first),
+            Rc::downgrade(&second),
+        ]));
 
         drop(first);
         drop(second);
