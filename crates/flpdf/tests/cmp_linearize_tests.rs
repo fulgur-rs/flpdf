@@ -22,6 +22,7 @@
 
 use flpdf::{NewlineBeforeEndstream, Pdf};
 use std::path::Path;
+use std::process::Command;
 
 /// Linearize `fixture` via the public API (mirroring the CLI `--linearize`
 /// path) and return the complete back-patched bytes.
@@ -160,6 +161,22 @@ fn assert_classic_structurally_byte_identical(fixture: &str, stem: &str) {
             &expected[lo..(off + 16).min(expected.len())],
         );
     }
+}
+
+/// Return the pinned qpdf 11.9.0 binary, or `None` when it is unavailable.
+///
+/// A differently versioned qpdf on `PATH` is deliberately rejected: this
+/// comparison claims 11.9.0 parity, so another release would silently change
+/// the oracle rather than the expectation.
+fn pinned_qpdf() -> Option<&'static str> {
+    let output = Command::new("qpdf").arg("--version").output();
+    output.ok().and_then(|output| {
+        String::from_utf8_lossy(&output.stdout)
+            .lines()
+            .next()
+            .is_some_and(|line| line == "qpdf version 11.9.0")
+            .then_some("qpdf")
+    })
 }
 
 #[test]
@@ -735,6 +752,31 @@ fn linearized_extra_header_starts_after_qpdf_separator_newline() {
         b"xref\n",
         "qpdf writes xref immediately after extra header's terminating newline"
     );
+}
+
+#[test]
+fn trailer_external_file_keys_linearized_match_qpdf_11_9() {
+    let fixture = "trailer-external-file-keys.pdf";
+    let input = Path::new(env!("CARGO_MANIFEST_DIR"))
+        .join("../../tests/fixtures/compat")
+        .join(fixture);
+    let Some(oracle) = pinned_qpdf() else {
+        eprintln!("[SKIP cmp_linearize_tests] qpdf 11.9.0 is unavailable");
+        return;
+    };
+    let directory = tempfile::tempdir().expect("tempdir");
+    let expected_path = directory.path().join("qpdf.pdf");
+    let status = Command::new(oracle)
+        .args(["--linearize", "--deterministic-id"])
+        .arg(&input)
+        .arg(&expected_path)
+        .status()
+        .expect("qpdf runs");
+    assert_eq!(status.code(), Some(0), "qpdf linearization must succeed");
+
+    let actual = flpdf_linearized(fixture);
+    let expected = std::fs::read(&expected_path).expect("qpdf output");
+    assert_eq!(actual, expected, "linearized trailer keys must match qpdf");
 }
 
 /// Extract the page content-stream object body — the single-`/FlateDecode`

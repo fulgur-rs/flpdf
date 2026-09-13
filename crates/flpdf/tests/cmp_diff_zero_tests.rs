@@ -418,6 +418,7 @@ fn qdf_preserve_unreferenced_signature_objstm_matches_qpdf_11_9() {
         "null-visible-preserve-signature.pdf",
         "null-visible-preserve-empty-removed.pdf",
         "null-visible-stale-generation-objstm.pdf",
+        "trailer-external-file-keys.pdf",
     ] {
         let input = Path::new(env!("CARGO_MANIFEST_DIR"))
             .join("../../tests/fixtures/compat")
@@ -499,6 +500,78 @@ fn preserve_external_file_stream_matches_qpdf_11_9() {
             &expected[lo..(off + 16).min(expected.len())],
         );
     }
+}
+
+/// `QPDFWriter::getTrimmedTrailer` removes only xref-structural keys; the
+/// external-file keys `/F`, `/FFilter`, and `/FDecodeParms` remain ordinary
+/// trailer entries and their references participate in qpdf's live walk
+/// (`QPDFWriter.cc:1160-1236,2009-2031`).
+#[test]
+fn trailer_external_file_keys_match_qpdf_11_9() {
+    let Some(oracle) = pinned_qpdf() else {
+        eprintln!("[SKIP cmp_diff_zero_tests] qpdf 11.9.0 is unavailable");
+        return;
+    };
+    let fixture = "trailer-external-file-keys.pdf";
+    let input = Path::new(env!("CARGO_MANIFEST_DIR"))
+        .join("../../tests/fixtures/compat")
+        .join(fixture);
+    let directory = tempfile::tempdir().expect("tempdir");
+    let expected_path = directory.path().join("qpdf.pdf");
+    let status = std::process::Command::new(oracle)
+        .args(["--static-id"])
+        .arg(&input)
+        .arg(&expected_path)
+        .status()
+        .expect("qpdf runs");
+    assert_eq!(status.code(), Some(0), "qpdf rewrite must succeed");
+
+    let actual = rewrite_qpdf_equivalent(fixture);
+    let expected = std::fs::read(&expected_path).expect("qpdf output");
+    assert_eq!(
+        actual, expected,
+        "trailer external-file keys must match qpdf"
+    );
+
+    let mut output = Pdf::open(Cursor::new(actual)).expect("open rewritten output");
+    let trailer = output.trailer();
+    assert_eq!(trailer.try_get_key(b"/F").unwrap().unparse(), b"2 0 R");
+    assert_eq!(
+        trailer.try_get_key(b"/FFilter").unwrap().unparse(),
+        b"/ASCIIHexDecode"
+    );
+    assert_eq!(
+        trailer.try_get_key(b"/FDecodeParms").unwrap().unparse(),
+        b"<< /Columns 1 >>"
+    );
+}
+
+#[test]
+fn trailer_external_file_keys_generate_match_qpdf_11_9() {
+    let Some(oracle) = pinned_qpdf() else {
+        eprintln!("[SKIP cmp_diff_zero_tests] qpdf 11.9.0 is unavailable");
+        return;
+    };
+    let fixture = "trailer-external-file-keys.pdf";
+    let input = Path::new(env!("CARGO_MANIFEST_DIR"))
+        .join("../../tests/fixtures/compat")
+        .join(fixture);
+    let directory = tempfile::tempdir().expect("tempdir");
+    let expected_path = directory.path().join("qpdf.pdf");
+    let status = std::process::Command::new(oracle)
+        .args(["--static-id", "--object-streams=generate"])
+        .arg(&input)
+        .arg(&expected_path)
+        .status()
+        .expect("qpdf runs");
+    assert_eq!(status.code(), Some(0), "qpdf generate rewrite must succeed");
+
+    let actual = rewrite_qpdf_equivalent_mode(fixture, ObjectStreamMode::Generate);
+    let expected = std::fs::read(&expected_path).expect("qpdf output");
+    assert_eq!(
+        actual, expected,
+        "Generate must retain trailer external-file keys like qpdf"
+    );
 }
 
 /// The pinned qpdf 11.9.0 oracle, or `None` when it is unavailable. Comparing

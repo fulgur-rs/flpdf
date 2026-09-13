@@ -3136,9 +3136,6 @@ fn build_writer_trailer_handle<R: Read + Seek>(
     // values, not source trailer metadata to preserve.
     for key in [
         b"/Type".as_slice(),
-        b"/F",
-        b"/FFilter",
-        b"/FDecodeParms",
         b"/W",
         b"/Index",
         b"/Length",
