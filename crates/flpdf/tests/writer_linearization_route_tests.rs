@@ -72,6 +72,38 @@ fn linearization_id_construction_is_handle_native() {
 }
 
 #[test]
+fn linearization_pass_one_is_metadata_only_and_uses_counted_output() {
+    let source = include_str!("../src/linearization/writer.rs").replace("\r\n", "\n");
+    let metadata = source
+        .split_once("struct LinearizedPassOutput")
+        .and_then(|(_, rest)| rest.split_once("/// Perform a complete single-pass write"))
+        .map(|(definition, _)| definition)
+        .expect("linearized pass metadata exists");
+    assert!(
+        !metadata.contains("bytes: Vec<u8>"),
+        "pass metadata must not own the complete pass-1 body"
+    );
+
+    let write_pass = source
+        .split_once("fn do_write_pass")
+        .and_then(|(_, rest)| rest.split_once("/// Compute per-object byte lengths"))
+        .map(|(function, _)| function)
+        .expect("linearized pass writer exists");
+    assert!(
+        write_pass.contains("output: &mut OutputSink<'_>"),
+        "both layout passes must use the counted output boundary"
+    );
+    assert!(
+        !write_pass.contains("let mut bytes: Vec<u8>"),
+        "do_write_pass must not allocate a document-sized body Vec"
+    );
+    assert!(
+        !source.contains("pass1_output.bytes"),
+        "pass-1 consumers must use metadata and incremental digest state"
+    );
+}
+
+#[test]
 fn prepare_file_for_write_is_owned_by_the_common_writer_boundary() {
     let writer_source = include_str!("../src/writer.rs").replace("\r\n", "\n");
     let write = writer_source
