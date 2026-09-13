@@ -707,7 +707,40 @@ traversalで stream辞書の `/Length` edgeだけをpushしない。したがっ
 受入れは qpdf 11.9.0 の Generate 9ケース（1/2/3 page、no-stream、130 reverse、
 force 1.4、missing reference、indirect length variants）の status/bytes比較と、
 progress callbackが setup後に rootへ追加した `/PlainGenerateProgressChild` を live
-queueが発見して出力する regressionで固定する。QDF Generate と normalize Generate
-は route classifierで `Planned` のままにし、source ObjStm-bearing Preserve、
-linearized、その他の暗号化・planned consumerについてはこのsliceから parity完了を
-主張しない。
+queueが発見して出力する regressionで固定する。この時点では QDF Generate と normalize
+Generateを次 sliceへ残していたが、`.48.88` で specialized liveへ cutoverした。
+source ObjStm-bearing Preserve、linearized、その他の暗号化・planned consumerについては
+このsliceから parity完了を主張しない。
+
+## 2026-09-13: QDF/normalize Generate の specialized live cutover (`flpdf-3yn9.48.88`)
+
+`.48.88` は、非 linearized・非PCLm・非暗号・effective/requested mode一致の
+`ObjectStreamMode::Generate` について、QDF または content normalization が有効でも
+`PlainWritePlan` の planned consumerを経由せず、`.48.87` と同じ
+`emit_specialized_standard_live_with_page_context` → `LiveQueue` へ接続する。
+`PlainRoute::OutsidePlain` はこの outer-dispatch境界を表し、Disable/Preserveの
+QDF/normalize live cohortや、force-version suppression後の別 consumerとは混同しない。
+
+Generate membershipは qpdf と同じ setup snapshot（`QPDFWriter.cc:1970-2006`）で
+候補・even split・fresh null containerを確定し、その `ObjectStreamGroup::Generated`
+を live queueへ登録する。container初回発見時の全 member予約、memberの source ObjGen順、
+group境界、progress callback後の child discoveryは通常 Generateと共通である
+（`QPDFWriter.cc:1057-1157,2907-3031`）。DFS候補順を split前に保持し、provenance/order
+調整は各 group内に限定する。
+
+QDFでは `writeObjectStream` の二つの passを live member serializerで実行する。
+各 memberの `%% Object stream: object N, index I` と optional original-object-ID marker、
+page/content commentを marker後に出力し、pair-table offsetは最初の marker直後を基準に
+再構成する。containerは直接 `/Length`、`/N`、`/First` を持ち、QDFでは圧縮しない。
+containerの `endobj` 後の空行も含め、`QPDFWriter.cc:1606-1809` の framingに合わせる。
+member serializerは visible childを queueへ発見・採番してから QDF mapを固定し、rootなら
+ADBE output copyを使う。通常 streamの output-only length holderは従来どおり保持し、
+ObjStm containerには追加しない。
+
+content normalizationでは QDF markerを追加せず、同じ live queueと generated groupを使い、
+`initializeSpecialStreams` の page/content mapだけを normalization policyに適用する。
+qpdf-zlib parityは `cli_pages_objstm_order_qpdf.rs` の multi-source QDF Generate と
+normalize Generate、`cli_qdf.rs` の QDF Generate/batch-cap、`writer_object_emission_tests.rs`
+の callback-child regressionで確認する。source ObjStm-bearing Preserveの QDF/normalize、
+explicit/copy encryption、encrypted input、linearized、PCLm、force-version-suppressed
+Generateはこの cutoverの対象外であり、残る mixed/bridge scopeとして扱う。
