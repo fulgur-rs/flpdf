@@ -350,6 +350,11 @@ fn direct_scalar_uses_at_most_two_allocations_without_a_single_owner_list() {
         "direct scalar retained {} live bytes; description storage is not out-of-line",
         direct_scalar.live_bytes
     );
+    assert!(
+        direct_scalar.live_bytes < 208,
+        "source extents must not remain inline on every ObjectSlot: {} live bytes",
+        direct_scalar.live_bytes
+    );
 
     let child = ObjectHandle::integer(8);
     let (single_parent, single_parent_measurement) =

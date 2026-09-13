@@ -29,7 +29,7 @@
 //! (`libqpdf/QPDF.cc:450-469,516-531`).
 #[cfg(test)]
 use crate::object_handle::StreamValue;
-use crate::object_handle::{DocumentResolver, ObjectValue};
+use crate::object_handle::{DocumentResolver, ObjectValue, SourceExtents};
 use crate::parser::{
     parse_qpdf_direct_object_handle_with_diagnostics,
     parse_qpdf_file_object_handle_with_diagnostics, HandleResolver, ParserDiagnostic,
@@ -188,11 +188,26 @@ fn with_xref_open_diagnostics(
 
 #[derive(Debug, Default)]
 struct BootstrapHandleState {
-    handles: BTreeMap<ObjectRef, ObjectHandle>,
+    handles: BTreeMap<ObjectRef, BootstrapCacheEntry>,
     resolving: BTreeSet<ObjectRef>,
     resolved_object_streams: BTreeSet<u32>,
     diagnostics: Diagnostics,
     reconstruction_trigger: Option<(u64, String)>,
+}
+
+#[derive(Debug, Clone)]
+struct BootstrapCacheEntry {
+    handle: ObjectHandle,
+    source_extents: SourceExtents,
+}
+
+impl BootstrapCacheEntry {
+    fn new(handle: ObjectHandle) -> Self {
+        Self {
+            handle,
+            source_extents: SourceExtents::UNSET,
+        }
+    }
 }
 
 #[derive(Debug, Default)]
@@ -240,7 +255,12 @@ impl Drop for BootstrapCache {
             if Rc::strong_count(&state) != internal_references + 1 {
                 continue;
             }
-            let handles: Vec<_> = state.borrow().handles.values().cloned().collect();
+            let handles: Vec<_> = state
+                .borrow()
+                .handles
+                .values()
+                .map(|entry| entry.handle.clone())
+                .collect();
             for handle in handles {
                 handle.disconnect_and_destroy();
             }
@@ -766,14 +786,14 @@ impl BootstrapHandleDocument {
     }
 
     fn handle_for_reference(&self, object_ref: ObjectRef) -> ObjectHandle {
-        if let Some(handle) = self.state.borrow().handles.get(&object_ref).cloned() {
-            return handle;
+        if let Some(entry) = self.state.borrow().handles.get(&object_ref) {
+            return entry.handle.clone();
         }
         let handle = ObjectHandle::new_indirect_with_resolver(object_ref, self.resolver_weak());
         self.state
             .borrow_mut()
             .handles
-            .insert(object_ref, handle.clone());
+            .insert(object_ref, BootstrapCacheEntry::new(handle.clone()));
         handle
     }
 
@@ -816,7 +836,7 @@ impl BootstrapHandleDocument {
                 self.resolve_length(object_ref)
             })
         });
-        let completed = finish_file_object_handle(input, pending, resolved_length, policy)?;
+        let mut completed = finish_file_object_handle(input, pending, resolved_length, policy)?;
         let absolute_offset = i64::try_from(absolute_offset).unwrap_or(i64::MAX);
         let rebase = |relative: i64| {
             if relative < 0 {
@@ -825,7 +845,10 @@ impl BootstrapHandleDocument {
                 absolute_offset.saturating_add(relative)
             }
         };
-        let (end_before_space, end_after_space) = completed.object.end_offsets();
+        let (end_before_space, end_after_space) = (
+            completed.source_extents.end_before_space,
+            completed.source_extents.end_after_space,
+        );
         let end_before_space = rebase(end_before_space);
         let end_after_space = if end_before_space < 0 {
             rebase(end_after_space)
@@ -837,9 +860,10 @@ impl BootstrapHandleDocument {
                 None => return Err(Error::parse(source_bytes.len(), "EOF after endobj")),
             }
         };
-        completed
-            .object
-            .set_end_offsets(end_before_space, end_after_space);
+        completed.source_extents = SourceExtents {
+            end_before_space,
+            end_after_space,
+        };
         let _ = description;
         Ok(completed)
     }
@@ -1006,7 +1030,10 @@ impl BootstrapHandleDocument {
             })
             .collect();
         let parsed_offset = completed.object.get_parsed_offset();
-        let (end_before_space, end_after_space) = completed.object.end_offsets();
+        let (end_before_space, end_after_space) = (
+            completed.source_extents.end_before_space,
+            completed.source_extents.end_after_space,
+        );
         completed.remove_included_recovery_eol_for_decryption();
         // cov:ignore-start: the handle parser guarantees an exclusively owned direct top-level value
         let value = completed.object.into_direct_value().ok_or_else(|| {
@@ -1259,6 +1286,28 @@ impl HandleResolver for BootstrapHandleParser<'_> {
 }
 
 impl DocumentResolver for BootstrapHandleDocument {
+    fn source_extents(&self, object_gen: QpdfObjGen) -> SourceExtents {
+        object_gen
+            .to_object_ref()
+            .and_then(|object_ref| {
+                self.state
+                    .borrow()
+                    .handles
+                    .get(&object_ref)
+                    .map(|entry| entry.source_extents)
+            })
+            .unwrap_or(SourceExtents::UNSET)
+    }
+
+    fn set_source_extents(&self, object_gen: QpdfObjGen, extents: SourceExtents) {
+        let Some(object_ref) = object_gen.to_object_ref() else {
+            return;
+        };
+        if let Some(entry) = self.state.borrow_mut().handles.get_mut(&object_ref) {
+            entry.source_extents = extents;
+        }
+    }
+
     fn input_description(&self) -> Vec<u8> {
         self.options.description.clone()
     }
@@ -1424,7 +1473,7 @@ impl XrefHandleCache {
             .borrow()
             .handles
             .get(object_ref)
-            .cloned()
+            .map(|entry| entry.handle.clone())
             .filter(|handle| handle.is_resolved())
     }
 
@@ -1434,7 +1483,20 @@ impl XrefHandleCache {
             .handle_state
             .borrow_mut()
             .handles
-            .insert(object_ref, handle);
+            .insert(object_ref, BootstrapCacheEntry::new(handle));
+    }
+
+    fn set_source_extents(&self, object_ref: ObjectRef, extents: SourceExtents) {
+        if let Some(entry) = self
+            .shared
+            .borrow_mut()
+            .handle_state
+            .borrow_mut()
+            .handles
+            .get_mut(&object_ref)
+        {
+            entry.source_extents = extents;
+        }
     }
 
     fn commit(&mut self) {}
@@ -4130,6 +4192,9 @@ fn commit_xref_candidate(
     let value = completed.object.into_direct_value()?.0;
     canonical.set_resolved(value);
     context.cache.insert(object_ref, canonical.clone());
+    context
+        .cache
+        .set_source_extents(object_ref, completed.source_extents);
     Some(canonical)
 }
 
@@ -9693,7 +9758,10 @@ mod final_handle_tests {
 
         let cache = BootstrapCache {
             handle_state: Rc::new(RefCell::new(BootstrapHandleState {
-                handles: BTreeMap::from([(first_ref, first.clone()), (second_ref, second.clone())]),
+                handles: BTreeMap::from([
+                    (first_ref, BootstrapCacheEntry::new(first.clone())),
+                    (second_ref, BootstrapCacheEntry::new(second.clone())),
+                ]),
                 ..BootstrapHandleState::default()
             })),
             handle_document: None,
@@ -9777,5 +9845,29 @@ mod final_handle_tests {
         assert!(registration.raw_entries.is_empty());
         assert!(registration.entries.is_empty());
         assert!(registration.deleted_objects.is_empty());
+    }
+
+    #[test]
+    fn bootstrap_source_extents_ignore_unprojectable_raw_generations() {
+        let state = Rc::new(RefCell::new(BootstrapHandleState::default()));
+        let entries = BTreeMap::new();
+        let document = BootstrapHandleDocument::new_with_state(
+            Some(b""),
+            XrefEntryLookup::Registration(&entries),
+            XrefLoadOptions::default(),
+            state,
+        );
+        let raw_generation = QpdfObjGen::new(7, 65_535);
+        let extents = SourceExtents {
+            end_before_space: 10,
+            end_after_space: 12,
+        };
+
+        document.set_source_extents(raw_generation, extents);
+
+        assert_eq!(
+            document.source_extents(raw_generation),
+            SourceExtents::UNSET
+        );
     }
 }

@@ -463,6 +463,28 @@ struct StreamFilterPlan {
 /// `libqpdf/qpdf/QPDFValue.hh:90-100,149-152`).
 pub(crate) const NO_PARSED_OFFSET: i64 = -1;
 
+/// qpdf's `QPDF::ObjCache` source extent pair
+/// (`include/qpdf/QPDF.hh:868-889`). These positions belong to the
+/// document-owned cache entry, not to every `QPDFValue`/`ObjectSlot`.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) struct SourceExtents {
+    pub(crate) end_before_space: i64,
+    pub(crate) end_after_space: i64,
+}
+
+impl SourceExtents {
+    pub(crate) const UNSET: Self = Self {
+        end_before_space: NO_PARSED_OFFSET,
+        end_after_space: NO_PARSED_OFFSET,
+    };
+}
+
+impl Default for SourceExtents {
+    fn default() -> Self {
+        Self::UNSET
+    }
+}
+
 /// The conflicts-tracking map [`ObjectHandle::merge_resources`] populates:
 /// `rtype -> old_key -> new_key`, mirroring
 /// `QPDFObjectHandle::mergeResources`'s own
@@ -475,6 +497,16 @@ pub type ResourceConflicts =
 /// document implementation can resolve an indirect slot.
 pub(crate) trait DocumentResolver {
     fn resolve_indirect(&self, object_ref: ObjectRef, handle: &ObjectHandle) -> Result<()>;
+
+    /// Return qpdf's source extent pair from the document-owned object cache.
+    /// Direct/contextless values and resolvers without a cache have no extent.
+    fn source_extents(&self, _object_gen: QpdfObjGen) -> SourceExtents {
+        SourceExtents::UNSET
+    }
+
+    /// Update qpdf's source extent pair on the document-owned object cache.
+    /// The default is a no-op for context-only test resolvers.
+    fn set_source_extents(&self, _object_gen: QpdfObjGen, _extents: SourceExtents) {}
 
     /// Resolve the raw qpdf object identity carried by a canonical handle.
     ///
@@ -1089,8 +1121,6 @@ impl std::fmt::Debug for ObjectHandle {
             .field("object_ref", &slot.object_ref())
             .field("state", &state)
             .field("parsed_offset", &parsed_offset)
-            .field("end_before_space", &slot.end_before_space)
-            .field("end_after_space", &slot.end_after_space)
             .finish()
     }
 }
@@ -1138,6 +1168,11 @@ mod reverse_containment_layout_tests {
         let owner_field = ["state_", "owners"].concat();
         assert!(!source.contains(&containment_field));
         assert!(!source.contains(&owner_field));
+    }
+
+    #[test]
+    fn source_extent_state_does_not_live_in_production_slots() {
+        assert!(std::mem::size_of::<ObjectSlot>() < 40);
     }
 }
 
@@ -1274,8 +1309,6 @@ struct ObjectSlot {
     /// state from both an initialized lazy indirect object and a null value.
     initialized: bool,
     shared: Rc<RefCell<SharedValueState>>,
-    end_before_space: i64,
-    end_after_space: i64,
     /// The document identity claimed by a handle-native name/number-tree
     /// wrapper while this shared root is still contextless. qpdf's tree
     /// helper retains its owning `QPDF` alongside the shared object handle;
@@ -1438,8 +1471,6 @@ fn empty_object_slot() -> Rc<RefCell<ObjectSlot>> {
             ValueIdentity::default(),
             NO_PARSED_OFFSET,
         ),
-        end_before_space: NO_PARSED_OFFSET,
-        end_after_space: NO_PARSED_OFFSET,
         tree_pdf_unique_id: None,
     }))
 }
@@ -1960,8 +1991,6 @@ impl ObjectHandle {
                 },
                 NO_PARSED_OFFSET,
             ),
-            end_before_space: NO_PARSED_OFFSET,
-            end_after_space: NO_PARSED_OFFSET,
             tree_pdf_unique_id: None,
         })));
         register_test_slot(&handle.0);
@@ -1987,8 +2016,6 @@ impl ObjectHandle {
                 ValueIdentity::default(),
                 NO_PARSED_OFFSET,
             ),
-            end_before_space: NO_PARSED_OFFSET,
-            end_after_space: NO_PARSED_OFFSET,
             tree_pdf_unique_id: None,
         })));
         register_test_slot(&handle.0);
@@ -2056,8 +2083,6 @@ impl ObjectHandle {
                 },
                 NO_PARSED_OFFSET,
             ),
-            end_before_space: NO_PARSED_OFFSET,
-            end_after_space: NO_PARSED_OFFSET,
             tree_pdf_unique_id: None,
         })));
         register_test_slot(&handle.0);
@@ -2103,8 +2128,6 @@ impl ObjectHandle {
                 },
                 parsed_offset,
             ),
-            end_before_space: NO_PARSED_OFFSET,
-            end_after_space: NO_PARSED_OFFSET,
             tree_pdf_unique_id: None,
         })));
         register_test_slot(&handle.0);
@@ -2249,6 +2272,7 @@ impl ObjectHandle {
         if !self.is_indirect() {
             return;
         }
+        self.set_end_offsets(NO_PARSED_OFFSET, NO_PARSED_OFFSET);
         self.replace_detached_state(ObjectValue::Null);
         let shared = self.0.borrow().shared.clone();
         {
@@ -2260,10 +2284,7 @@ impl ObjectHandle {
             shared.description = None;
             shared.parsed_offset = NO_PARSED_OFFSET;
         }
-        let mut slot = self.0.borrow_mut();
-        slot.tree_pdf_unique_id = None;
-        slot.end_before_space = NO_PARSED_OFFSET;
-        slot.end_after_space = NO_PARSED_OFFSET;
+        self.0.borrow_mut().tree_pdf_unique_id = None;
     }
 
     /// Promote this existing uniform slot to an indirect object in place.
@@ -2441,9 +2462,7 @@ impl ObjectHandle {
                 shared.parsed_offset = NO_PARSED_OFFSET;
                 shared.description = None;
                 drop(shared);
-                let mut slot = self.0.borrow_mut();
-                slot.end_before_space = NO_PARSED_OFFSET;
-                slot.end_after_space = NO_PARSED_OFFSET;
+                self.set_end_offsets(NO_PARSED_OFFSET, NO_PARSED_OFFSET);
             }
         }
     }
@@ -2630,6 +2649,7 @@ impl ObjectHandle {
     /// Resets the parsed offset to the no-offset sentinel only when the
     /// value is destroyed.
     pub(crate) fn disconnect_and_destroy(&self) {
+        self.set_end_offsets(NO_PARSED_OFFSET, NO_PARSED_OFFSET);
         self.disconnect();
         let should_destroy = {
             let shared = self.0.borrow().shared.clone();
@@ -2644,9 +2664,6 @@ impl ObjectHandle {
                 shared.description = None;
                 shared.parsed_offset = NO_PARSED_OFFSET;
             }
-            let mut slot = self.0.borrow_mut();
-            slot.end_before_space = NO_PARSED_OFFSET;
-            slot.end_after_space = NO_PARSED_OFFSET;
         }
     }
 
@@ -3884,20 +3901,42 @@ impl ObjectHandle {
         }
     }
 
-    /// Record qpdf's source extent metadata updated alongside a cache value by
-    /// `QPDF::updateCache` (`libqpdf/QPDF.cc:1843-1858`). These offsets are
-    /// distinct from the value's parsed/token offset: they bracket the
-    /// indirect object's `endobj` token and the whitespace following it.
-    pub(crate) fn set_end_offsets(&self, end_before_space: i64, end_after_space: i64) {
-        let mut slot = self.0.borrow_mut();
-        slot.end_before_space = end_before_space;
-        slot.end_after_space = end_after_space;
+    fn source_extent_route(&self) -> Option<(QpdfObjGen, Rc<dyn DocumentResolver>)> {
+        let (object_gen, resolver) = {
+            let slot = self.0.borrow();
+            let shared = slot.shared.borrow();
+            (shared.qpdf_obj_gen(), shared.identity.resolver.clone())
+        };
+        let object_gen = object_gen?;
+        let resolver = resolver?.upgrade()?;
+        Some((object_gen, resolver))
     }
 
-    /// Return qpdf's cached source extent metadata for this value.
+    /// Record qpdf's source extent metadata on the owning document cache
+    /// entry. These offsets are distinct from the value's parsed/token offset:
+    /// they bracket the indirect object's `endobj` token and following
+    /// whitespace (`libqpdf/QPDF.cc:1641-1692,1843-1858`).
+    pub(crate) fn set_end_offsets(&self, end_before_space: i64, end_after_space: i64) {
+        if let Some((object_gen, resolver)) = self.source_extent_route() {
+            resolver.set_source_extents(
+                object_gen,
+                SourceExtents {
+                    end_before_space,
+                    end_after_space,
+                },
+            );
+        }
+    }
+
+    /// Return qpdf's cached source extent metadata from the owning document
+    /// cache entry. Direct values and contextless handles return `(-1,-1)`.
     pub(crate) fn end_offsets(&self) -> (i64, i64) {
-        let slot = self.0.borrow();
-        (slot.end_before_space, slot.end_after_space)
+        self.source_extent_route()
+            .map(|(object_gen, resolver)| {
+                let extents = resolver.source_extents(object_gen);
+                (extents.end_before_space, extents.end_after_space)
+            })
+            .unwrap_or((NO_PARSED_OFFSET, NO_PARSED_OFFSET))
     }
 
     /// Construct a direct null value.
@@ -8677,6 +8716,20 @@ pub(crate) mod identity_tests {
             handle.set_resolved(self.value.clone());
             Ok(())
         }
+    }
+
+    #[test]
+    fn source_extents_defaults_to_qpdf_unset_for_context_only_resolvers() {
+        assert_eq!(SourceExtents::default(), SourceExtents::UNSET);
+
+        let resolver: Rc<dyn DocumentResolver> = Rc::new(RecordingResolver::default());
+        let handle = ObjectHandle::new_indirect_with_resolver(
+            ObjectRef::new(1, 0),
+            Rc::downgrade(&resolver),
+        );
+        assert_eq!(handle.end_offsets(), (NO_PARSED_OFFSET, NO_PARSED_OFFSET));
+        handle.set_end_offsets(12, 15);
+        assert_eq!(handle.end_offsets(), (NO_PARSED_OFFSET, NO_PARSED_OFFSET));
     }
 
     /// Resolves a stream value but intentionally has no byte source. This
