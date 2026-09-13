@@ -373,7 +373,7 @@ encryption は上記 3 経路すべてで `doWriteSetup` の同一分岐（D-0�
   Generate、QDF、normalize、明示／入力暗号化を同じ live queue／body／xref-trailer
   ownerで処理する。PCLm は初期 seed だけを分け、standard 相当の shared ownerを使う。
   これは qpdf の `QPDFWriter::enqueueObject` / `writeStandard` 境界
-  （`QPDFWriter.cc:1072-1157,2907-3031`）に対応し、旧行の「QDF/normalize Generateは
+  （`libqpdf/QPDFWriter.cc:1072-1157,2907-3031`）に対応し、旧行の「QDF/normalize Generateは
   planned」「source-backed Preserveは未接続」という記述を更新する。
 * `QPDFWriter::generateObjectStreams` の候補・even split・fresh container は
   non-linearized の全 standard mode と linearized Generate setup の双方で
@@ -384,7 +384,7 @@ encryption は上記 3 経路すべてで `doWriteSetup` の同一分岐（D-0�
 * #1857 の streaming refactor 後も、上記の route 分離自体は変わらない。残る
   `mixed` は「未実装」の意味ではなく、qpdf の standard／PCLm／linearized が異なる
   physical layout と setup責務を持つこと、ならびに未着手の別 follow-up を表す。
-  `D1/D2/D3/D5/D8/D11/D12/D14/D25/D26/D28/D29/D31` の classification をこの
+  `D1/D2/D3/D5/D8/D11/D12/D14/D26/D28/D29/D31` の classification をこの
   bounded reconciliationだけで canonicalへ一括変更しない。
 
 この section は上記履歴行の caller／planned wording を current-main の実装へ
