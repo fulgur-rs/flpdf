@@ -2582,17 +2582,26 @@ fn parse_xref_from_start_with_owner_and_build_diagnostics(
         return Ok(loaded);
     }
 
-    parse_xref_stream(
+    match parse_xref_stream(
         bytes,
         xref_pos,
         startxref,
         version.to_string(),
         options.clone(),
         registration,
-        error_diagnostics_sink,
         context_spec,
         canonical_trailer_owner,
-    )
+    ) {
+        Ok(state) => Ok(state),
+        Err(failure) => {
+            if let Some(sink) = error_diagnostics_sink {
+                for diagnostic in failure.diagnostics.entries() {
+                    sink.push(diagnostic.clone());
+                }
+            } // cov:ignore: LLVM maps the covered sink-forwarding condition to this closing branch edge
+            Err(failure.error)
+        }
+    }
 }
 
 /// Validate the first classic trailer exactly where qpdf's
@@ -2842,12 +2851,14 @@ fn merge_xref_stream_from_classic_trailer_with_build_diagnostics(
         loaded.loaded.version.clone(),
         options.clone(),
         registration,
-        Some(&mut hybrid_error_diagnostics),
         hybrid_context_spec,
         canonical_trailer_owner,
     ) {
         Ok(hybrid) => hybrid,
-        Err(error) => {
+        Err(failure) => {
+            for diagnostic in failure.diagnostics.entries() {
+                hybrid_error_diagnostics.push(diagnostic.clone());
+            }
             if let Some(sink) = error_diagnostics_sink.as_mut() {
                 for diagnostic in loaded.loaded.repair_diagnostics.entries() {
                     sink.push(diagnostic.clone());
@@ -2856,7 +2867,7 @@ fn merge_xref_stream_from_classic_trailer_with_build_diagnostics(
                     sink.push(diagnostic.clone());
                 }
             }
-            return Err(error);
+            return Err(failure.error);
         }
     };
     if let Some(sink) = hybrid_build_diagnostics_sink {
@@ -4735,6 +4746,25 @@ fn parse_xref_entry_line(line: &[u8]) -> Option<(u64, i32, u8, bool)> {
     ))
 }
 
+/// An owner-less xref-stream read keeps diagnostics local until its caller
+/// decides where the standalone API should expose them. This mirrors qpdf's
+/// document-owned `QPDF::warn` channel without passing a parser-local sink
+/// through the canonical stream parser.
+#[derive(Debug)]
+struct XrefStreamFailure {
+    error: Error,
+    diagnostics: Diagnostics,
+}
+
+impl XrefStreamFailure {
+    fn new(error: Error) -> Box<Self> {
+        Box::new(Self {
+            error,
+            diagnostics: Diagnostics::default(),
+        })
+    }
+}
+
 #[allow(clippy::too_many_arguments)]
 fn parse_xref_stream(
     bytes: &[u8],
@@ -4743,17 +4773,19 @@ fn parse_xref_stream(
     version: String,
     options: XrefLoadOptions,
     registration: &mut XrefRegistration,
-    error_diagnostics_sink: Option<&mut Diagnostics>,
     context_spec: XrefReadContextSpec<'_>,
     canonical_trailer_owner: Option<&dyn CanonicalTrailerOwner>,
-) -> Result<LoadedXrefState> {
+) -> std::result::Result<LoadedXrefState, Box<XrefStreamFailure>> {
     // qpdf's `read_xrefStream` wraps its whole body in
     // `if (!m->ignore_xref_streams)` and otherwise falls straight through to
     // `throw damagedPDF("", xref_offset, "xref not found")` — the offset is
     // never read, so this precedes the end-of-file check below. The same error
     // is what a non-stream object at the offset produces.
     if options.ignore_xref_streams {
-        return Err(Error::parse(xref_pos, "xref not found"));
+        return Err(XrefStreamFailure::new(Error::parse(
+            xref_pos,
+            "xref not found",
+        )));
     }
     if let Some(owner) = canonical_trailer_owner {
         return parse_xref_stream_with_canonical_owner(
@@ -4763,13 +4795,16 @@ fn parse_xref_stream(
             options,
             registration,
             owner,
-        );
+        )
+        .map_err(XrefStreamFailure::new);
     }
     let allow_repair = options.allow_repair;
-    let tail = bytes
-        .get(xref_pos..)
-        .filter(|slice| !slice.is_empty())
-        .ok_or_else(|| Error::parse(xref_pos, "xref stream offset is beyond end of file"))?;
+    let Some(tail) = bytes.get(xref_pos..).filter(|slice| !slice.is_empty()) else {
+        return Err(XrefStreamFailure::new(Error::parse(
+            xref_pos,
+            "xref stream offset is beyond end of file",
+        )));
+    };
     let policy = if allow_repair {
         RecoveryPolicy::Bounded
     } else {
@@ -4791,12 +4826,10 @@ fn parse_xref_stream(
             Ok(completed) => completed,
             Err(error) => {
                 context.append_diagnostics_to(&mut repair_diagnostics);
-                if let Some(sink) = error_diagnostics_sink {
-                    for diagnostic in repair_diagnostics.entries() {
-                        sink.push(diagnostic.clone());
-                    }
-                }
-                return Err(error.rebase_offset(xref_pos));
+                return Err(Box::new(XrefStreamFailure {
+                    error: error.rebase_offset(xref_pos),
+                    diagnostics: repair_diagnostics,
+                }));
             }
         };
         // Xref streams are not encrypted, but filter decoding still requires
@@ -4872,12 +4905,10 @@ fn parse_xref_stream(
             Ok(built) => built,
             Err(error) => {
                 let error = reconstruction_trigger.unwrap_or(error);
-                if let Some(sink) = error_diagnostics_sink {
-                    for diagnostic in repair_diagnostics.entries() {
-                        sink.push(diagnostic.clone());
-                    }
-                } // cov:ignore: diagnostic forwarding closes only on a sink-backed xref build failure
-                return Err(error);
+                return Err(Box::new(XrefStreamFailure {
+                    error,
+                    diagnostics: repair_diagnostics,
+                }));
             }
         };
 
@@ -4917,12 +4948,10 @@ fn parse_xref_stream(
     };
 
     if let Some(error) = reconstruction_trigger {
-        if let Some(sink) = error_diagnostics_sink {
-            for diagnostic in state.loaded.repair_diagnostics.entries() {
-                sink.push(diagnostic.clone());
-            }
-        }
-        return Err(error);
+        return Err(Box::new(XrefStreamFailure {
+            error,
+            diagnostics: state.loaded.repair_diagnostics.clone(),
+        }));
     }
 
     Ok(state)
@@ -7675,6 +7704,17 @@ mod final_handle_tests {
         bytes
     }
 
+    fn hybrid_xref_with_classic_live_and_builder_failure() -> Vec<u8> {
+        let mut bytes = hybrid_xref_with_classic_and_live_warning();
+        let marker = b"/W [1 2 1]";
+        let start = bytes
+            .windows(marker.len())
+            .position(|window| window == marker)
+            .expect("the hybrid xref stream has qpdf's nonzero /W");
+        bytes[start..start + marker.len()].copy_from_slice(b"/W [0 0 0]");
+        bytes
+    }
+
     fn classic_xref_with_malformed_previous() -> (Vec<u8>, usize) {
         let mut bytes = b"%PDF-1.4\n".to_vec();
         let object_offset = bytes.len();
@@ -7806,24 +7846,22 @@ mod final_handle_tests {
     }
 
     #[test]
-    fn malformed_xref_stream_framing_error_is_forwarded() {
+    fn malformed_xref_stream_framing_error_is_carried_without_parser_sink() {
         let mut registration = XrefRegistration::default();
-        let mut diagnostics = Diagnostics::default();
-        let error = parse_xref_stream(
+        let failure = parse_xref_stream(
             b"not an indirect object",
             0,
             0,
             "1.5".to_owned(),
             XrefLoadOptions::default(),
             &mut registration,
-            Some(&mut diagnostics),
             XrefReadContextSpec::ActiveSection,
             None,
         )
         .expect_err("a malformed xref-stream object header must fail framing");
 
-        assert!(matches!(error, Error::Parse { .. }));
-        assert!(diagnostics.entries().is_empty());
+        assert!(matches!(failure.error, Error::Parse { .. }));
+        assert!(failure.diagnostics.entries().is_empty());
     }
 
     #[test]
@@ -8921,6 +8959,159 @@ mod final_handle_tests {
                 .iter()
                 .any(|message| message.contains("Cross-reference stream data has the wrong size")),
             "builder diagnostics: {messages:?}"
+        );
+    }
+
+    #[test]
+    fn ownerless_xref_stream_failure_carries_read_diagnostics_to_the_outer_sink() {
+        let bytes = hybrid_xref_with_classic_live_and_builder_failure();
+        let xref_stream_pos = bytes
+            .windows(b"5 0 obj\n".len())
+            .position(|window| window == b"5 0 obj\n")
+            .expect("the hybrid fixture has its xref stream object");
+        let filter_pos = bytes
+            .windows(b"4 0 obj\n".len())
+            .position(|window| window == b"4 0 obj\n")
+            .expect("the hybrid fixture has its indirect filter object");
+        let mut registration = XrefRegistration::default();
+        registration.insert_xref_entry(
+            QpdfObjGen::new(4, 0),
+            XrefEntry::Uncompressed {
+                offset: filter_pos as u64,
+            },
+        );
+        registration.insert_xref_entry(
+            QpdfObjGen::new(5, 0),
+            XrefEntry::Uncompressed {
+                offset: xref_stream_pos as u64,
+            },
+        );
+        let mut sink = Diagnostics::default();
+        let error = parse_xref_from_start(
+            &bytes,
+            xref_stream_pos,
+            xref_stream_pos as u64,
+            "1.5",
+            XrefLoadOptions {
+                allow_repair: true,
+                ..XrefLoadOptions::default()
+            },
+            &mut registration,
+            Some(&mut sink),
+            XrefReadContextSpec::ActiveSection,
+            None,
+            false,
+        )
+        .expect_err("a zero-width xref stream must fail after reading its object");
+
+        assert!(matches!(
+            error,
+            Error::QpdfExc(exception)
+                if exception.get_message_detail()
+                    == b"Cross-reference stream's /W indicates entry size of 0"
+        ));
+        assert!(
+            sink.entries()
+                .iter()
+                .any(|diagnostic| diagnostic.get_message_detail() == b"expected endobj"),
+            "the outer owner-less caller must receive diagnostics from the failed stream read"
+        );
+    }
+
+    #[test]
+    fn ownerless_hybrid_failure_carries_stream_read_diagnostics() {
+        let bytes = hybrid_xref_with_classic_live_and_builder_failure();
+        let xref_stream_pos = bytes
+            .windows(b"5 0 obj\n".len())
+            .position(|window| window == b"5 0 obj\n")
+            .expect("the hybrid fixture has its xref stream object");
+        let filter_pos = bytes
+            .windows(b"4 0 obj\n".len())
+            .position(|window| window == b"4 0 obj\n")
+            .expect("the hybrid fixture has its indirect filter object");
+        let mut loaded = loaded_state_with_trailer(ObjectHandle::dictionary(vec![(
+            b"/XRefStm".to_vec(),
+            ObjectHandle::integer(i64::try_from(xref_stream_pos).unwrap()),
+        )]));
+        let mut registration = XrefRegistration::default();
+        registration.insert_xref_entry(
+            QpdfObjGen::new(4, 0),
+            XrefEntry::Uncompressed {
+                offset: filter_pos as u64,
+            },
+        );
+        registration.insert_xref_entry(
+            QpdfObjGen::new(5, 0),
+            XrefEntry::Uncompressed {
+                offset: xref_stream_pos as u64,
+            },
+        );
+        let mut sink = Diagnostics::default();
+        let error = merge_xref_stream_from_classic_trailer(
+            &bytes,
+            0,
+            &mut loaded,
+            XrefLoadOptions {
+                allow_repair: true,
+                ..XrefLoadOptions::default()
+            },
+            &mut registration,
+            Some(&mut sink),
+            XrefReadContextSpec::ActiveSection,
+            None,
+        )
+        .expect_err("the hybrid xref stream must fail its zero-width build");
+
+        assert!(matches!(
+            error,
+            Error::QpdfExc(exception)
+                if exception.get_message_detail()
+                    == b"Cross-reference stream's /W indicates entry size of 0"
+        ));
+        assert!(
+            sink.entries()
+                .iter()
+                .any(|diagnostic| diagnostic.get_message_detail() == b"expected endobj"),
+            "the hybrid caller must receive the carrier's stream-read diagnostics"
+        );
+    }
+
+    #[test]
+    fn ownerless_xref_stream_failure_carries_a_reconstruction_trigger() {
+        let mut bytes = b"1 0 obj\n<< /Type /XRef /W [1 0 0] /Size 1 /Length 2 0 R >>\nstream\n\0\nendstream\nendobj\n".to_vec();
+        let wrong_length_offset = bytes.len();
+        bytes.extend_from_slice(b"3 0 obj\n7\nendobj\n");
+        let mut registration = XrefRegistration::default();
+        registration.insert_xref_entry(
+            QpdfObjGen::new(2, 0),
+            XrefEntry::Uncompressed {
+                offset: wrong_length_offset as u64,
+            },
+        );
+        let failure = parse_xref_stream(
+            &bytes,
+            0,
+            0,
+            "1.4".to_owned(),
+            XrefLoadOptions {
+                allow_repair: true,
+                ..XrefLoadOptions::default()
+            },
+            &mut registration,
+            XrefReadContextSpec::ActiveSection,
+            None,
+        )
+        .expect_err("the indirect /Length header mismatch must trigger recovery");
+
+        assert!(matches!(
+            failure.error,
+            Error::Parse { message, .. } if message == "expected 2 0 obj"
+        ));
+        assert!(
+            failure.diagnostics.entries().iter().any(|diagnostic| {
+                diagnostic.get_message_detail() == b"stream dictionary lacks /Length key"
+            }),
+            "the carrier must retain diagnostics collected before the reconstruction trigger"
         );
     }
 

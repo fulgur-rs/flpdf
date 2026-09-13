@@ -19,6 +19,10 @@ fn xref_stream_production_parses_through_the_handle_route_once() {
 
     assert!(parse_xref_stream.contains("read_file_object_handle("));
     assert!(!parse_xref_stream.contains("read_file_object("));
+    assert!(
+        !parse_xref_stream.contains("error_diagnostics_sink"),
+        "xref stream parser must not carry a parser-local diagnostic sink"
+    );
 }
 
 #[test]
