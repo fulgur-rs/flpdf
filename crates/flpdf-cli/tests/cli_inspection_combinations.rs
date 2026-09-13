@@ -347,3 +347,49 @@ fn combined_show_pages_preserves_qpdf_with_images_output() {
 
     assert_matches_qpdf_path(&["--check", "--show-pages", "--with-images"], &input);
 }
+
+#[test]
+fn check_accepts_create_stage_transformations_like_qpdf() {
+    if !qpdf_available() {
+        return;
+    }
+
+    let form = concat!(
+        env!("CARGO_MANIFEST_DIR"),
+        "/../../tests/fixtures/compat/form-fields-and-annotations.pdf"
+    );
+    for args in [
+        &["--check", "--remove-restrictions"][..],
+        &["--check", "--coalesce-contents"][..],
+        &["--check", "--flatten-annotations=all"][..],
+        &["--check", "--generate-appearances"][..],
+        &["--check", "--flatten-rotation"][..],
+    ] {
+        assert_matches_qpdf(args, form);
+    }
+}
+
+#[test]
+fn check_accepts_overlay_before_inspection_like_qpdf() {
+    if !qpdf_available() {
+        return;
+    }
+
+    let input = concat!(
+        env!("CARGO_MANIFEST_DIR"),
+        "/../../tests/fixtures/compat/three-page.pdf"
+    );
+    let overlay = concat!(
+        env!("CARGO_MANIFEST_DIR"),
+        "/../../tests/fixtures/compat/one-page.pdf"
+    );
+    let args = vec![
+        input.to_owned(),
+        "--overlay".to_owned(),
+        overlay.to_owned(),
+        "--".to_owned(),
+        "--check".to_owned(),
+        "--show-pages".to_owned(),
+    ];
+    assert_matches_qpdf_exact(&args);
+}

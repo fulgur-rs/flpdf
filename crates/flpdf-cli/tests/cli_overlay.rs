@@ -436,9 +436,10 @@ fn overlay_equals_form_without_a_positional_source_is_rejected() {
 }
 
 #[test]
-fn overlay_on_top_level_inspection_is_rejected() {
-    // Top-level inspection mode (--show-npages) with an overlay group must also
-    // fail rather than drop the overlay.
+fn overlay_on_top_level_inspection_is_accepted() {
+    // qpdf applies the overlay during createQPDF before --show-npages. The
+    // qpdf-zlib differential suite checks the transformed page content; this
+    // default-build test pins the accepted top-level inspection surface.
     let one = fixture("one-page.pdf");
     Command::cargo_bin("flpdf")
         .unwrap()
@@ -446,10 +447,8 @@ fn overlay_on_top_level_inspection_is_rejected() {
         .arg(fixture("three-page.pdf"))
         .args(["--overlay", &one, "--"])
         .assert()
-        .failure()
-        .stderr(predicate::str::contains(
-            "can only be used with rewrite output",
-        ));
+        .success()
+        .stdout(predicate::str::contains("3"));
 }
 
 #[test]
