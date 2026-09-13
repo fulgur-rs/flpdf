@@ -4566,7 +4566,19 @@ fn run_job_inspection_on_pdf<R: Read + Seek + 'static>(
     pdf: &mut Pdf<R>,
     transform_options: InspectionTransformOptions,
 ) -> CliResult<()> {
-    apply_inspection_transformations(job, pdf, transform_options, cli.verbose)?;
+    // JSON input and update-from-JSON create the document outside the normal
+    // combined-inspection dispatcher, but qpdf still applies these
+    // create-stage transformations before doInspection
+    // (`QPDFJob.cc:459-489,2138-2194`). Preserve the same flag propagation
+    // here instead of accepting and silently dropping either transformation.
+    apply_top_level_inspection_transformations(
+        job,
+        pdf,
+        transform_options,
+        cli.verbose,
+        cli.remove_restrictions,
+        cli.coalesce_contents,
+    )?;
     job.set_with_images(cli.with_images);
     if cli.check {
         job.set_show_encryption_key(cli.show_encryption_key);
