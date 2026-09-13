@@ -1351,6 +1351,43 @@ fn create_qpdf_status_precedes_show_encryption_on_wrong_password() {
     }
 }
 
+#[test]
+fn create_qpdf_status_handles_wrong_password_without_show_encryption() {
+    let encrypted = Path::new(env!("CARGO_MANIFEST_DIR"))
+        .join("../../tests/fixtures/encrypted/v4-aes-128-r4.pdf");
+    for status_key in ["isEncrypted", "requiresPassword"] {
+        let (logger, info_state) = logger_with_info_sink();
+        let mut job = QPDFJob::new();
+        job.set_logger(logger);
+        let mut configuration = serde_json::Map::new();
+        configuration.insert("inputFile".to_owned(), serde_json::json!(encrypted));
+        configuration.insert(
+            "password".to_owned(),
+            serde_json::Value::String("wrong-password".to_owned()),
+        );
+        configuration.insert(
+            status_key.to_owned(),
+            serde_json::Value::String(String::new()),
+        );
+        job.initialize_from_json_partial(&serde_json::Value::Object(configuration).to_string())
+            .unwrap();
+
+        assert!(job
+            .create_qpdf()
+            .expect("status query should handle the partial open")
+            .is_none());
+        assert_eq!(
+            job.get_exit_code(),
+            JobExitCode::Success,
+            "{status_key} must classify a bad password as a successful status query"
+        );
+        assert!(
+            info_state.lock().unwrap().bytes.is_empty(),
+            "status query must not emit a show-encryption report"
+        );
+    }
+}
+
 /// qpdf keys its opened-source cache by filename alone
 /// (`page_spec_qpdfs.count(page_spec.filename) == 0`, `QPDFJob.cc:2389`),
 /// reusing the same already-open QPDF for a repeated literal path rather
