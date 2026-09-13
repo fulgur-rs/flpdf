@@ -59,6 +59,8 @@
 //! 141-144`); [`SharedValueState::description`] keeps the common template
 //! form inline while boxing the larger JSON and child forms, so the value
 //! layout does not carry their maximum shape.
+//! No extra mutation-generation field is retained; writer modification
+//! decisions remain on the stream-local state.
 //!
 //! `ValueIdentity::active_pdf_unique_id` is a container representation
 //! substitute for qpdf's per-value `QPDF*` back-pointer (`QPDFValue.hh:150`):
@@ -6405,9 +6407,8 @@ impl ObjectHandle {
     /// must not decode, normalize, or recompress the stream, even when the
     /// stream is modified or the writer requests a non-none decode level.
     /// The setting belongs to the canonical stream value, so cloned handles
-    /// observe the same state. It is not serialized; the mutation generation
-    /// is advanced so a writer cache made before this call cannot reuse an
-    /// obsolete filtering result.
+    /// observe the same state. It is not serialized; the canonical stream state
+    /// is updated so the next writer observation uses the new filtering policy.
     pub fn set_filter_on_write(&self, value: bool) -> Result<()> {
         self.try_dereference()?;
         let is_stream = self.with_value_mut(|state| match state {
@@ -11525,6 +11526,13 @@ mod resolution_state_tests {
         assert!(source.contains("struct SharedValueState"));
         assert!(source.contains(&shared_field));
         assert!(source.contains(&value_field));
+    }
+
+    #[test]
+    fn shared_value_state_has_no_unused_counter() {
+        let source = include_str!("object_handle.rs");
+        let field_name = ["mutation", "_generation"].concat();
+        assert!(!source.contains(&field_name));
     }
 
     #[test]
