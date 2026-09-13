@@ -1124,18 +1124,13 @@ struct Cli {
     /// --remove-restrictions`; qpdf `--remove-restrictions` equivalent).
     /// Combine with `--decrypt` to strip encryption too. Does NOT bypass
     /// authentication.
-    // This is a rewrite-path modifier. main()'s dispatch chain runs the
-    // inspection modes (--check / --show-object / --show-*) before the
-    // rewrite branch, so without these conflicts `flpdf --check
-    // --remove-restrictions in out` would silently ignore the flag (and the
-    // OUTPUT positional). Listing the inspection modes as clap conflicts
-    // surfaces the mistake as a usage error instead. (--json already lists
-    // remove_restrictions in its own conflicts_with_all; rewrite/linearize/
-    // static_id/output are compatible rewrite modifiers and intentionally
-    // excluded here.)
+    // qpdf applies this create-stage mutation before `doInspection`, so
+    // `--check --remove-restrictions` is routed through the combined Job
+    // inspection boundary. Other standalone inspection combinations remain
+    // bounded by their existing conflict tables.
     #[arg(long = "remove-restrictions",
           conflicts_with_all = [
-              "check", "show_object",
+              "show_object",
               "show_npages", "show_pages", "show_xref", "show_linearization",
               "show_encryption",
           ])]
@@ -1305,7 +1300,7 @@ struct Cli {
     /// transformation owner.
     #[arg(long = "coalesce-contents",
           conflicts_with_all = [
-              "check", "show_object",
+              "show_object",
               "show_npages", "show_pages", "show_xref", "show_linearization",
               "show_encryption",
               "list_attachments", "show_attachment", "remove_attachment",
@@ -1328,7 +1323,7 @@ struct Cli {
         require_equals = true,
         overrides_with = "flatten_annotations",
         conflicts_with_all = [
-            "check", "show_object",
+            "show_object",
             "show_npages", "show_pages", "show_xref", "show_linearization",
             "show_encryption",
         ],
@@ -3261,7 +3256,9 @@ fn main() {
     // (the rewrite branch is the final `else`, reached only when no inspection,
     // attachment, json, or page-op mode is selected) and must stay in sync with
     // it; page-operation output is dispatched to the page-operation writer
-    // boundary, including when `--linearize` is present.
+    // boundary, including when `--linearize` is present. qpdf also permits
+    // overlay/underlay before an inspection consumer; that case is routed to
+    // the combined QPDFJob inspection path below rather than rejected here.
     if !overlay_specs.is_empty() {
         let target_is_rewrite = match &args.command {
             Some(Commands::Rewrite(_)) => true,
@@ -3283,7 +3280,16 @@ fn main() {
                     && args.copy_attachments_from.is_empty()
             }
         };
-        if !target_is_rewrite {
+        let target_is_inspection = args.check
+            || args.show_object.is_some()
+            || args.show_npages
+            || args.show_pages
+            || args.show_xref
+            || args.check_linearization
+            || args.show_linearization
+            || args.list_attachments
+            || args.show_attachment.is_some();
+        if !target_is_rewrite && !target_is_inspection {
             emit_logger_error(
                 "flpdf: --overlay/--underlay can only be used with rewrite output, \
                  not with inspection or other commands\n",
@@ -3374,8 +3380,12 @@ fn main() {
                 None => Err(missing_input_usage_error().into()),
             }
         }
-    } else if top_level_inspection_combination_requested(&args) {
-        run_combined_top_level_inspection(&args, top_level_inspection_transform_options)
+    } else if top_level_inspection_combination_requested(&args, !overlay_specs.is_empty()) {
+        run_combined_top_level_inspection(
+            &args,
+            top_level_inspection_transform_options,
+            &overlay_specs,
+        )
     } else if let Some(object_ref) = args.show_object.as_deref() {
         run_show_object(
             args.input,
@@ -3870,7 +3880,7 @@ fn new_cli_job(suppress_warnings: bool) -> QPDFJob {
     job
 }
 
-fn top_level_inspection_combination_requested(args: &Cli) -> bool {
+fn top_level_inspection_combination_requested(args: &Cli, overlay_requested: bool) -> bool {
     let inspection_count = [
         args.check,
         args.show_object.is_some(),
@@ -3887,7 +3897,13 @@ fn top_level_inspection_combination_requested(args: &Cli) -> bool {
     .filter(|selected| *selected)
     .count();
 
-    if inspection_count > 1 || (inspection_count == 1 && !args.page_ops.pages.is_empty()) {
+    if overlay_requested && inspection_count > 0 {
+        return true;
+    }
+    if inspection_count > 1
+        || (inspection_count == 1 && !args.page_ops.pages.is_empty())
+        || (inspection_count == 1 && (args.remove_restrictions || args.coalesce_contents))
+    {
         return true;
     }
 
@@ -3957,6 +3973,55 @@ fn configure_top_level_inspection_job(job: &mut QPDFJob, args: &Cli) -> CliResul
     Ok(())
 }
 
+/// Queue parsed CLI underlay/overlay groups on the canonical job
+/// configuration. qpdf opens these sources and runs `handleUnderOverlay` in
+/// `createQPDF` before `handleTransformations` and before the `doInspection`
+/// branch (`QPDFJob.cc:459-489`). Keeping the raw path, password, and range
+/// values on `QPDFJobConfig` lets that same lifecycle own source lifetime,
+/// warning delivery, and page-tree repair for inspection consumers.
+fn configure_cli_overlay_specs(job: &mut QPDFJob, specs: &[OverlaySpec]) -> CliResult<()> {
+    if specs.is_empty() {
+        return Ok(());
+    }
+
+    let mut configuration = job.config();
+    for spec in specs {
+        let from = match spec.from.as_deref() {
+            None => PageRange::all(),
+            Some("") => PageRange::empty(),
+            Some(range) => PageRange::parse_numrange(range)?,
+        };
+        let to = match spec.to.as_deref() {
+            None => PageRange::all(),
+            Some("") => PageRange::empty(),
+            Some(range) => PageRange::parse_numrange(range)?,
+        };
+        let repeat = match spec.repeat.as_deref() {
+            None | Some("") => None,
+            Some(range) => Some(PageRange::parse_numrange(range)?),
+        };
+        let password = spec
+            .raw_password
+            .clone()
+            .or_else(|| {
+                spec.password
+                    .as_ref()
+                    .map(|password| arg_parser::os_bytes(password).to_vec())
+            })
+            .unwrap_or_default();
+        let path = PathBuf::from(spec.file.clone());
+        match spec.kind {
+            OverlayKind::Overlay => {
+                configuration.overlay(path, password, from, to, repeat);
+            }
+            OverlayKind::Underlay => {
+                configuration.underlay(path, password, from, to, repeat);
+            }
+        }
+    }
+    Ok(())
+}
+
 /// Run a top-level `--pages` invocation whose output is a qpdf inspection.
 ///
 /// qpdf still creates and transforms the page-selected document before its
@@ -3967,6 +4032,7 @@ fn configure_top_level_inspection_job(job: &mut QPDFJob, args: &Cli) -> CliResul
 fn run_top_level_page_selection_inspection(
     args: &Cli,
     transform_options: InspectionTransformOptions,
+    overlay_specs: &[OverlaySpec],
 ) -> CliResult<()> {
     let mut job = new_cli_job(args.no_warn);
     let input_options = pdf_open_options(args.repair, &args.password)?;
@@ -3978,6 +4044,7 @@ fn run_top_level_page_selection_inspection(
     job.set_ignore_xref_streams(args.password.recovery.ignore_xref_streams);
     job.set_verbose(args.verbose);
     configure_top_level_inspection_job(&mut job, args)?;
+    configure_cli_overlay_specs(&mut job, overlay_specs)?;
     configure_top_level_inspection_transformations(
         &mut job,
         transform_options,
@@ -4021,13 +4088,15 @@ fn run_top_level_page_selection_inspection(
 fn run_combined_top_level_inspection(
     args: &Cli,
     transform_options: InspectionTransformOptions,
+    overlay_specs: &[OverlaySpec],
 ) -> CliResult<()> {
     if !args.page_ops.pages.is_empty() {
-        return run_top_level_page_selection_inspection(args, transform_options);
+        return run_top_level_page_selection_inspection(args, transform_options, overlay_specs);
     }
 
     let mut job = new_cli_job(args.no_warn);
     configure_top_level_inspection_job(&mut job, args)?;
+    configure_cli_overlay_specs(&mut job, overlay_specs)?;
     if args.show_attachment.is_some() {
         // qpdf reserves the save pipeline during checkConfiguration, before
         // doInspection emits any info output (`QPDFJob.cc:614-626`). The
