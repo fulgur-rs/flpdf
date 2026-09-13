@@ -21,6 +21,7 @@ std::thread_local! {
     static ALLOCATION_TRACKING: Cell<bool> = const { Cell::new(false) };
     static LIVE_BYTES: Cell<usize> = const { Cell::new(0) };
     static PEAK_LIVE_BYTES: Cell<usize> = const { Cell::new(0) };
+    static TOTAL_ALLOCATIONS: Cell<usize> = const { Cell::new(0) };
 }
 
 #[global_allocator]
@@ -38,6 +39,7 @@ fn record_allocation(size: usize) {
                     }
                 });
             });
+            TOTAL_ALLOCATIONS.with(|count| count.set(count.get().saturating_add(1)));
         }
     });
 }
@@ -53,12 +55,18 @@ fn record_deallocation(size: usize) {
 fn start_allocation_measurement_after_fixture_baseline() {
     LIVE_BYTES.with(|live| live.set(0));
     PEAK_LIVE_BYTES.with(|peak| peak.set(0));
+    TOTAL_ALLOCATIONS.with(|count| count.set(0));
     ALLOCATION_TRACKING.with(|tracking| tracking.set(true));
 }
 
 fn finish_allocation_measurement() -> usize {
     ALLOCATION_TRACKING.with(|tracking| tracking.set(false));
     PEAK_LIVE_BYTES.with(Cell::get)
+}
+
+fn finish_allocation_count() -> usize {
+    ALLOCATION_TRACKING.with(|tracking| tracking.set(false));
+    TOTAL_ALLOCATIONS.with(Cell::get)
 }
 
 unsafe impl GlobalAlloc for LiveAllocationTracker {
@@ -1638,5 +1646,49 @@ fn discard_output_peak_growth_is_bounded_by_one_stream_local_buffer() {
     assert!(
         four_stream_peak <= two_stream_peak + ONE_STREAM_LOCAL_BUFFER_BOUND,
         "four streams retained more than one permitted local stream buffer: two={two_stream_peak}, four={four_stream_peak}, bound={ONE_STREAM_LOCAL_BUFFER_BOUND}"
+    );
+}
+
+const SMALL_OBJECT_QUEUE_SIZE: usize = 128;
+const LARGE_OBJECT_QUEUE_SIZE: usize = 2048;
+const OBJECT_QUEUE_MAP_GROWTH_BOUND: usize = 512 * 1024;
+
+fn measure_object_queue_peak(object_count: usize) -> (usize, usize) {
+    let mut pdf = minimal_pdf();
+    let root = pdf.root_handle().expect("resolve live Catalog");
+    for index in 0..object_count {
+        let object = pdf
+            .make_indirect_from_object_handle(ObjectHandle::dictionary(vec![(
+                b"/Value".to_vec(),
+                ObjectHandle::integer(index as i64),
+            )]))
+            .expect("create queue object");
+        root.replace_key(format!("/QueueObject{index:04}").as_bytes(), object)
+            .expect("attach queue object");
+    }
+
+    start_allocation_measurement_after_fixture_baseline();
+    let mut writer = configure_disable_writer(&mut pdf);
+    writer.set_qdf_mode(true);
+    writer
+        .set_output_writer(DiscardWriter)
+        .expect("install discard output");
+    writer.write().expect("queue object rewrite succeeds");
+    let peak = finish_allocation_measurement();
+    let allocations = finish_allocation_count();
+    (peak, allocations)
+}
+
+#[test]
+fn plain_writer_map_lookup_does_not_retain_per_object_renumber_snapshots() {
+    let (small_peak, small_allocations) = measure_object_queue_peak(SMALL_OBJECT_QUEUE_SIZE);
+    let (large_peak, large_allocations) = measure_object_queue_peak(LARGE_OBJECT_QUEUE_SIZE);
+    assert!(
+        large_peak.saturating_sub(small_peak) <= OBJECT_QUEUE_MAP_GROWTH_BOUND,
+        "per-object renumber snapshots grew with the queue map: small={small_peak}, large={large_peak}, bound={OBJECT_QUEUE_MAP_GROWTH_BOUND}"
+    );
+    assert!(
+        large_allocations <= small_allocations.saturating_mul(32),
+        "per-object renumber snapshots caused excessive allocation traffic: small={small_allocations}, large={large_allocations}"
     );
 }
