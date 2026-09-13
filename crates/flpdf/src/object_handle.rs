@@ -1202,6 +1202,9 @@ mod state_owner_tests {
         assert!(owners.contains(&first));
         assert_eq!(owners.handles().len(), 1);
 
+        let other = slot();
+        owners.remove(&other);
+        assert_eq!(owners.handles().len(), 1);
         owners.remove(&first);
         assert!(owners.handles().is_empty());
 
