@@ -307,7 +307,7 @@ fn direct_scalar_uses_at_most_two_allocations_without_a_single_owner_list() {
         direct_scalar.allocations
     );
     assert!(
-        direct_scalar.live_bytes <= 288,
+        direct_scalar.live_bytes <= 272,
         "direct scalar retained {} live bytes; description storage is not out-of-line",
         direct_scalar.live_bytes
     );
