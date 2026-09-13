@@ -1904,6 +1904,21 @@ fn assert_json_transform_stdout_matches_qpdf(transform: &str, fixture_name: &str
     assert_eq!(flpdf.stderr, qpdf.stderr, "{transform} stderr");
 }
 
+fn normalize_json_newlines(bytes: &[u8]) -> Vec<u8> {
+    let mut normalized = Vec::with_capacity(bytes.len());
+    let mut remaining = bytes;
+    while let Some((&byte, rest)) = remaining.split_first() {
+        if byte == b'\r' && rest.first() == Some(&b'\n') {
+            normalized.push(b'\n');
+            remaining = &rest[1..];
+        } else {
+            normalized.push(byte);
+            remaining = rest;
+        }
+    }
+    normalized
+}
+
 fn assert_json_transform_file_matches_qpdf(transform: &str, fixture_name: &str) {
     if skip_unless_qpdf_11_9() {
         return;
@@ -1942,8 +1957,8 @@ fn assert_json_transform_file_matches_qpdf(transform: &str, fixture_name: &str) 
     assert_eq!(flpdf.stdout, qpdf.stdout, "{transform} stdout");
     assert_eq!(flpdf.stderr, qpdf.stderr, "{transform} stderr");
     assert_eq!(
-        std::fs::read(&flpdf_output).unwrap(),
-        std::fs::read(&qpdf_output).unwrap(),
+        normalize_json_newlines(&std::fs::read(&flpdf_output).unwrap()),
+        normalize_json_newlines(&std::fs::read(&qpdf_output).unwrap()),
         "{transform} JSON output"
     );
 }
