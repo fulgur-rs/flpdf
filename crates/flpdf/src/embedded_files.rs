@@ -40,12 +40,14 @@
 //!
 //! # Missing keys
 //!
-//! Any of `/Root`, `/Names`, `/EmbeddedFiles`, or the name-tree root being absent
-//! results in an empty list (`Ok(vec![])`) rather than an error. I/O errors
-//! propagate from canonical ObjectHandle resolution, [`crate::Error::Unsupported`] reports a
-//! structural cycle from the name-tree walker, and [`crate::Error::Internal`]
-//! reports an invalid first name-tree key, matching qpdf's iterator
-//! dereference failure.
+//! qpdf's `QPDF::getRoot` dictionary gate makes a missing, dangling, or
+//! non-dictionary `/Root` a document-level error. The canonical
+//! `Pdf::root_handle()` boundary preserves that error. A valid catalog with
+//! an absent `/Names`, `/EmbeddedFiles`, or name-tree root returns an empty
+//! list (`Ok(vec![])`) instead. I/O errors propagate from canonical
+//! ObjectHandle resolution, [`crate::Error::Unsupported`] reports a structural
+//! cycle from the name-tree walker, and [`crate::Error::Internal`] reports an
+//! invalid first name-tree key, matching qpdf's iterator dereference failure.
 //!
 //! # Value types
 //!
@@ -96,16 +98,9 @@ fn embedded_files_tree_with_options<R: Read + Seek>(
     auto_repair: bool,
     max_depth: Option<usize>,
 ) -> Result<Option<NameTree>> {
-    // cov:ignore-start: helper methods normally receive a parsed catalog root
-    let Some(catalog_ref) = pdf.root_ref() else {
-        return Ok(None); // cov:ignore: helper methods normally receive a parsed catalog root
-    };
-    // cov:ignore-end
-    let catalog = pdf.get_object_handle(catalog_ref);
-    catalog.try_dereference()?;
-    if !catalog.try_is_dictionary()? {
-        return Ok(None);
-    }
+    // qpdf's EmbeddedFileDocumentHelper constructor calls QPDF::getRoot,
+    // whose dictionary gate accepts both direct and indirect /Root values.
+    let catalog = pdf.root_handle()?;
 
     // Keep qpdf's getKey -> terminal-resolution order here. The public
     // has_key facade must resolve the child to test nullness, which would
@@ -146,16 +141,10 @@ impl<'a, R: Read + Seek> EmbeddedFileDocumentHelper<'a, R> {
             return Ok(Some(tree));
         }
 
-        // cov:ignore-start: qpdf always has a catalog root for this mutating helper
-        let Some(catalog_ref) = self.pdf.root_ref() else {
-            return Ok(None); // cov:ignore: qpdf always has a catalog root
-        };
-        // cov:ignore-end
-        let catalog = self.pdf.get_object_handle(catalog_ref);
-        catalog.try_dereference()?;
-        if !catalog.try_is_dictionary()? {
-            return Ok(None);
-        }
+        // This is qpdf's initEmbeddedFiles -> QPDF::getRoot boundary, so a
+        // direct catalog is valid and missing/non-dictionary roots propagate
+        // the document-level root error.
+        let catalog = self.pdf.root_handle()?;
 
         let names = if catalog.try_has_key(b"/Names")? {
             let candidate = catalog.try_get_key(b"/Names")?;
@@ -356,8 +345,9 @@ pub const DEFAULT_MAX_EMBEDDED_FILES_DEPTH: usize = 100;
 ///
 /// Returns entries in depth-first, key-ascending order (the order they appear
 /// in the tree, which the spec requires to be sorted).  An empty list is
-/// returned — without error — when any of `/Root`, `/Names`, or
-/// `/EmbeddedFiles` is absent.
+/// returned — without error — when `/Names` or `/EmbeddedFiles` is absent
+/// from a valid catalog. A missing or non-dictionary `/Root` returns qpdf's
+/// document-level `unable to find /Root dictionary` error.
 ///
 /// **Semantics:** name-tree values that are *direct* `/Filespec` dictionaries
 /// (rather than indirect references) are intentionally **skipped** — this

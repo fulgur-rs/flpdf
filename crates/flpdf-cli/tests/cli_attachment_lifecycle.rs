@@ -229,6 +229,58 @@ fn lifecycle_1_add_then_list_flpdf_and_qpdf() {
     }
 }
 
+#[test]
+fn direct_catalog_root_add_then_list_matches_qpdf() {
+    if !support::is_qpdf_available() {
+        return;
+    }
+
+    let temp = tempfile::tempdir().unwrap();
+    let input = Path::new(env!("CARGO_MANIFEST_DIR"))
+        .join("../../tests/fixtures/compat/direct-root-one-page.pdf");
+    let attachment = temp.path().join("direct-root.txt");
+    std::fs::write(&attachment, b"direct root payload").unwrap();
+    let qpdf_output = temp.path().join("qpdf.pdf");
+    let flpdf_output = temp.path().join("flpdf.pdf");
+
+    let qpdf = ShellCommand::new("qpdf")
+        .args(["--static-id", "--add-attachment"])
+        .arg(&attachment)
+        .arg("--key=direct-root")
+        .args(["--", input.to_str().unwrap(), qpdf_output.to_str().unwrap()])
+        .output()
+        .expect("qpdf direct-root attachment oracle");
+    assert!(
+        qpdf.status.success(),
+        "qpdf direct-root attachment failed: {}",
+        String::from_utf8_lossy(&qpdf.stderr)
+    );
+    CargoCommand::cargo_bin("flpdf")
+        .unwrap()
+        .args([
+            "--static-id",
+            input.to_str().unwrap(),
+            "--add-attachment",
+            attachment.to_str().unwrap(),
+            "--key=direct-root",
+            "--",
+            flpdf_output.to_str().unwrap(),
+        ])
+        .assert()
+        .success();
+
+    let qpdf_listing = qpdf_list_attachments(&qpdf_output).expect("qpdf listing");
+    let flpdf_listing = qpdf_list_attachments(&flpdf_output).expect("flpdf listing");
+    assert!(
+        qpdf_listing.contains("direct-root"),
+        "qpdf listing: {qpdf_listing}"
+    );
+    assert!(
+        flpdf_listing.contains("direct-root"),
+        "flpdf listing: {flpdf_listing}"
+    );
+}
+
 // ---------------------------------------------------------------------------
 // Matrix cell 2: add → show → byte round-trip
 // Text, PNG-like, ZIP-like, and NUL-rich binaries all round-trip byte-identical.
