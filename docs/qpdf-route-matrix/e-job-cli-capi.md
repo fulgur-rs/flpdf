@@ -294,6 +294,7 @@ qpdf の `writeQPDF` → `doSplitPages` → chunk ごとの `setWriterOptions`
 
 2026-09-14（flpdf-1emn follow-up slice）: rewrite の --decrypt を page-operation の writer boundary へ渡し、暗号化3ページfixtureの pages/rotate/split で qpdf の cleartext output と status/stdout/stderr/byte parity を固定した。copy_encryption の guard と、page-selection後の image/overlay 順序は残る。
 2026-09-14（flpdf-1emn follow-up slice）: rewrite の --copy-encryption も page-operation の writer boundaryへ渡し、plaintext three-page fixtureとAES donorの pages/rotate/split で qpdf 11.9.0の復号後JSON parityを固定した。page-selection後の image/overlay 順序は残る。
+2026-09-14（flpdf-1emn follow-up slice）: rewrite page-selection の post-plan 順序を page selection/rotation → underlay/overlay → image transformation に揃え、overlayで導入されたinline imageも optimize-images の対象にした。inline-image overlay fixtureのqpdf 11.9.0 byte parityを overlay_transform_order_route_tests で固定した。
 
 ### E-28 detail: `qpdf/test_driver.cc` case-level classification (P-2)
 
