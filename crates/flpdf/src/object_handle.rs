@@ -1183,6 +1183,91 @@ impl StateOwners {
     }
 }
 
+/// Reverse containment is a flpdf-only deviation retained for incremental
+/// writer ownership and test-only root observations. Keep the common empty
+/// and single-parent cases inline; only aliases with multiple live parents
+/// pay for a boxed vector so the ObjectSlot itself does not carry Vec's
+/// three-word allocation header for every value.
+#[derive(Default)]
+enum ContainmentParents {
+    #[default]
+    Empty,
+    One(Weak<RefCell<ObjectSlot>>),
+    Many(Box<Vec<Weak<RefCell<ObjectSlot>>>>),
+}
+
+impl ContainmentParents {
+    fn retain_live(&mut self) {
+        match self {
+            Self::Empty => {}
+            Self::One(parent) => {
+                if parent.strong_count() == 0 {
+                    *self = Self::Empty;
+                }
+            }
+            Self::Many(parents) => {
+                parents.retain(|parent| parent.strong_count() != 0);
+                if parents.is_empty() {
+                    *self = Self::Empty;
+                } else if parents.len() == 1 {
+                    let parent = parents.pop().expect("one live containment parent");
+                    *self = Self::One(parent);
+                }
+            }
+        }
+    }
+
+    fn push(&mut self, parent: Weak<RefCell<ObjectSlot>>) {
+        self.retain_live();
+        match self {
+            Self::Empty => *self = Self::One(parent),
+            Self::One(existing) => {
+                let existing = existing.clone();
+                *self = Self::Many(Box::new(vec![existing, parent]));
+            }
+            Self::Many(parents) => parents.push(parent),
+        }
+    }
+
+    fn remove(&mut self, parent: &Weak<RefCell<ObjectSlot>>) {
+        self.retain_live();
+        let remove_single = matches!(self, Self::One(existing) if Weak::ptr_eq(existing, parent));
+        if remove_single {
+            *self = Self::Empty;
+            return;
+        }
+        if let Self::Many(parents) = self {
+            if let Some(index) = parents
+                .iter()
+                .position(|candidate| Weak::ptr_eq(candidate, parent))
+            {
+                parents.remove(index);
+            }
+        }
+        self.retain_live();
+    }
+
+    #[cfg(test)]
+    fn live_parents(&mut self) -> Vec<Weak<RefCell<ObjectSlot>>> {
+        self.retain_live();
+        match self {
+            Self::Empty => Vec::new(),
+            Self::One(parent) => vec![parent.clone()],
+            Self::Many(parents) => parents.as_ref().clone(),
+        }
+    }
+
+    #[cfg(test)]
+    fn len(&mut self) -> usize {
+        self.retain_live();
+        match self {
+            Self::Empty => 0,
+            Self::One(_) => 1,
+            Self::Many(parents) => parents.len(),
+        }
+    }
+}
+
 #[cfg(test)]
 mod state_owner_tests {
     use super::*;
@@ -1236,6 +1321,32 @@ mod state_owner_tests {
         drop(second);
         owners.retain_live();
         assert!(owners.handles().is_empty());
+    }
+
+    #[test]
+    fn containment_parents_promote_and_demote_without_changing_edges() {
+        let first = slot();
+        let second = slot();
+        let third = slot();
+        let first_parent = Rc::downgrade(&first);
+        let second_parent = Rc::downgrade(&second);
+        let third_parent = Rc::downgrade(&third);
+        let mut parents = ContainmentParents::default();
+
+        assert_eq!(parents.len(), 0);
+        parents.push(first_parent.clone());
+        assert_eq!(parents.live_parents().len(), 1);
+        parents.push(second_parent.clone());
+        parents.push(third_parent.clone());
+        assert_eq!(parents.len(), 3);
+
+        parents.remove(&second_parent);
+        assert_eq!(parents.len(), 2);
+        parents.remove(&first_parent);
+        assert_eq!(parents.live_parents().len(), 1);
+
+        drop(third);
+        assert_eq!(parents.len(), 0);
     }
 }
 
@@ -1383,7 +1494,7 @@ struct ObjectSlot {
     // qpdf-deviation: qpdf keeps only forward child handles; this weak reverse
     // edge has no qpdf counterpart and is retained solely for cfg(test)
     // containment-root assertions and stack-safe teardown bookkeeping.
-    containment_parents: Vec<Weak<RefCell<ObjectSlot>>>,
+    containment_parents: ContainmentParents,
 }
 
 /// The active identity on qpdf's shared QPDFValue (QPDFValue.hh:68-72).
@@ -1545,7 +1656,7 @@ fn empty_object_slot() -> Rc<RefCell<ObjectSlot>> {
         end_before_space: NO_PARSED_OFFSET,
         end_after_space: NO_PARSED_OFFSET,
         tree_pdf_unique_id: None,
-        containment_parents: Vec::new(),
+        containment_parents: ContainmentParents::default(),
     }))
 }
 
@@ -2068,7 +2179,7 @@ impl ObjectHandle {
             end_before_space: NO_PARSED_OFFSET,
             end_after_space: NO_PARSED_OFFSET,
             tree_pdf_unique_id: None,
-            containment_parents: Vec::new(),
+            containment_parents: ContainmentParents::default(),
         })));
         handle.register_state_owner();
         handle
@@ -2096,7 +2207,7 @@ impl ObjectHandle {
             end_before_space: NO_PARSED_OFFSET,
             end_after_space: NO_PARSED_OFFSET,
             tree_pdf_unique_id: None,
-            containment_parents: Vec::new(),
+            containment_parents: ContainmentParents::default(),
         })));
         handle.register_state_owner();
         handle
@@ -2165,7 +2276,7 @@ impl ObjectHandle {
             end_before_space: NO_PARSED_OFFSET,
             end_after_space: NO_PARSED_OFFSET,
             tree_pdf_unique_id: None,
-            containment_parents: Vec::new(),
+            containment_parents: ContainmentParents::default(),
         })));
         handle.register_state_owner();
         handle
@@ -2213,7 +2324,7 @@ impl ObjectHandle {
             end_before_space: NO_PARSED_OFFSET,
             end_after_space: NO_PARSED_OFFSET,
             tree_pdf_unique_id: None,
-            containment_parents: Vec::new(),
+            containment_parents: ContainmentParents::default(),
         })));
         handle.register_state_owner();
         handle.with_value(|value| {
@@ -5038,38 +5149,19 @@ impl ObjectHandle {
         Rc::downgrade(&self.0)
     }
 
-    fn same_containment_parent(
-        left: &Weak<RefCell<ObjectSlot>>,
-        right: &Weak<RefCell<ObjectSlot>>,
-    ) -> bool {
-        Weak::ptr_eq(left, right)
-    }
-
     fn attach_child_to_parent(child: &ObjectHandle, parent: &Weak<RefCell<ObjectSlot>>) {
         if child.is_indirect() {
             return;
         }
         {
             let mut slot = child.0.borrow_mut();
-            slot.containment_parents
-                .retain(Self::containment_parent_is_live);
             slot.containment_parents.push(parent.clone());
         }
     }
 
-    fn containment_parent_is_live(parent: &Weak<RefCell<ObjectSlot>>) -> bool {
-        Weak::strong_count(parent) != 0
-    }
-
     fn detach_child_from_parent(child: &ObjectHandle, parent: &Weak<RefCell<ObjectSlot>>) {
         let mut slot = child.0.borrow_mut();
-        if let Some(index) = slot
-            .containment_parents
-            .iter()
-            .position(|candidate| Self::same_containment_parent(candidate, parent))
-        {
-            slot.containment_parents.remove(index);
-        }
+        slot.containment_parents.remove(parent);
     }
 
     fn attach_value_children(&self, value: &ObjectValue) {
@@ -5094,12 +5186,10 @@ impl ObjectHandle {
             }
             let (object_ref, pdf_unique_id, parents) = {
                 let mut slot = handle.0.borrow_mut();
-                slot.containment_parents
-                    .retain(Self::containment_parent_is_live);
                 (
                     slot.object_ref(),
                     slot.active_pdf_unique_id(),
-                    slot.containment_parents.clone(),
+                    slot.containment_parents.live_parents(),
                 )
             };
             if let Some(object_ref) = object_ref {
@@ -16566,7 +16656,7 @@ mod mutation_tests {
     fn expired_direct_parent_edges_are_pruned_on_attach_and_query() {
         fn parent_count(handle: &ObjectHandle) -> usize {
             assert!(handle.is_direct());
-            handle.0.borrow().containment_parents.len()
+            handle.0.borrow_mut().containment_parents.len()
         }
 
         let child = ObjectHandle::integer(1);
