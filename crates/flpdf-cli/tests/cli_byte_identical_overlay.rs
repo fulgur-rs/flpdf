@@ -17,6 +17,7 @@
 
 use assert_cmd::Command;
 use std::path::{Path, PathBuf};
+use std::process::Command as ProcessCommand;
 
 fn fixture(name: &str) -> PathBuf {
     Path::new(env!("CARGO_MANIFEST_DIR"))
@@ -72,6 +73,59 @@ fn assert_bytes(actual: &[u8], golden_name: &str) {
         String::from_utf8_lossy(&actual[lo..(off + 24).min(actual.len())]),
         String::from_utf8_lossy(&expected[lo..(off + 24).min(expected.len())]),
     );
+}
+
+fn assert_zero_page_destination_uo_matches_qpdf(option: &str) {
+    let temp = tempfile::tempdir().expect("tempdir");
+    let destination = fixture("one-page-no-ext.pdf");
+    let source = fixture("three-page.pdf");
+    let qpdf_output = temp.path().join(format!("qpdf-{option}.pdf"));
+    let flpdf_output = temp.path().join(format!("flpdf-{option}.pdf"));
+    let common = ["--static-id", "--qdf"];
+
+    let qpdf = ProcessCommand::new("qpdf")
+        .args(common)
+        .arg(&destination)
+        .args([option])
+        .arg(&source)
+        .args(["--"])
+        .arg(&qpdf_output)
+        .output()
+        .expect("qpdf should start");
+    let flpdf = Command::cargo_bin("flpdf")
+        .unwrap()
+        .env("FLPDF_STATIC_ID_QUIET", "1")
+        .args(common)
+        .arg(&destination)
+        .args([option])
+        .arg(&source)
+        .args(["--"])
+        .arg(&flpdf_output)
+        .output()
+        .unwrap();
+
+    assert!(
+        qpdf.status.success(),
+        "qpdf failed: {}",
+        String::from_utf8_lossy(&qpdf.stderr)
+    );
+    assert_eq!(flpdf.status.code(), qpdf.status.code());
+    assert_eq!(flpdf.stdout, qpdf.stdout);
+    assert_eq!(flpdf.stderr, qpdf.stderr);
+    assert_eq!(
+        std::fs::read(flpdf_output).unwrap(),
+        std::fs::read(qpdf_output).unwrap()
+    );
+}
+
+#[test]
+fn cli_overlay_to_zero_page_destination_matches_qpdf() {
+    assert_zero_page_destination_uo_matches_qpdf("--overlay");
+}
+
+#[test]
+fn cli_underlay_to_zero_page_destination_matches_qpdf() {
+    assert_zero_page_destination_uo_matches_qpdf("--underlay");
 }
 
 // ── Plain static-id: three-page dest × one-page source (identity cm) ─────────
