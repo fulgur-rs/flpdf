@@ -187,3 +187,54 @@ fn pclm_direct_root_progress_child_gets_qpdf_late_numbering() {
         .windows(b"3 0 obj\n".len())
         .any(|window| window == b"3 0 obj\n"));
 }
+
+#[test]
+fn pclm_direct_root_does_not_reconcile_adbe() {
+    let mut pdf = Pdf::open(Cursor::new(
+        include_bytes!("../../../tests/fixtures/compat/direct-root-one-page.pdf").to_vec(),
+    ))
+    .unwrap();
+    let root = pdf.root_handle().unwrap();
+    root.replace_key(
+        b"/Extensions",
+        ObjectHandle::dictionary(vec![(
+            b"/ADBE".to_vec(),
+            ObjectHandle::dictionary(vec![
+                (
+                    b"/BaseVersion".to_vec(),
+                    ObjectHandle::name(b"1.4".to_vec()),
+                ),
+                (b"/ExtensionLevel".to_vec(), ObjectHandle::integer(5)),
+            ]),
+        )]),
+    )
+    .unwrap();
+
+    let mut writer = PdfWriter::new(&mut pdf);
+    writer.set_pclm(true);
+    writer.force_pdf_version("1.7", 8);
+    writer.set_static_id(true);
+    writer.set_output_memory().unwrap();
+    writer.write().expect("PCLm direct-root write must succeed");
+
+    let mut output = Pdf::open(Cursor::new(writer.get_buffer().unwrap())).unwrap();
+    assert!(output.root_ref().is_none(), "Catalog must remain direct");
+    let adbe = output
+        .root_handle()
+        .unwrap()
+        .try_get_key(b"/Extensions")
+        .unwrap()
+        .try_get_key(b"/ADBE")
+        .unwrap();
+    assert_eq!(
+        adbe.try_get_key(b"/BaseVersion").unwrap().unparse(),
+        b"/1.4"
+    );
+    assert_eq!(
+        adbe.try_get_key(b"/ExtensionLevel")
+            .unwrap()
+            .try_get_int_value()
+            .unwrap(),
+        5
+    );
+}
