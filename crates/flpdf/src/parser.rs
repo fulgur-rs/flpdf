@@ -43,7 +43,7 @@ pub(crate) trait HandleResolver {
     fn direct_handle_at(&mut self, value: ObjectValue, offset: i64) -> ObjectHandle {
         let handle = self.direct_handle(value);
         if let Some(description) = self.description_template() {
-            handle.set_description(description, offset);
+            handle.set_shared_description(description, offset);
         } else {
             handle.set_parsed_offset_if_unset(offset);
         }
@@ -53,7 +53,7 @@ pub(crate) trait HandleResolver {
     /// Return the one qpdf-style description template shared by this parse
     /// call, if the caller has an observable object-description context.
     /// Detached legacy materialization keeps the default `None`.
-    fn description_template(&self) -> Option<Vec<u8>> {
+    fn description_template(&self) -> Option<Rc<Vec<u8>>> {
         None
     }
 
@@ -168,7 +168,7 @@ impl LiveInput for SliceLiveInput<'_> {
 /// references before returning the value.
 #[derive(Default)]
 struct DetachedHandles {
-    description_template: Option<Vec<u8>>,
+    description_template: Option<Rc<Vec<u8>>>,
     warning_object_description: Option<Vec<u8>>,
 }
 
@@ -177,8 +177,8 @@ impl HandleResolver for DetachedHandles {
         ObjectHandle::new_indirect_unresolved(object_ref, NO_PARSED_OFFSET)
     }
 
-    fn description_template(&self) -> Option<Vec<u8>> {
-        self.description_template.clone()
+    fn description_template(&self) -> Option<Rc<Vec<u8>>> {
+        self.description_template.as_ref().map(Rc::clone)
     }
 
     fn contextless_warning_object_description(&self) -> Option<Vec<u8>> {
@@ -328,9 +328,9 @@ pub(crate) fn parse_explicit_object_handle_with_description(
 ) -> Result<ObjectHandle> {
     let mut input_source = SliceLiveInput::new(input);
     let mut detached_handles = DetachedHandles {
-        description_template: Some(
+        description_template: Some(Rc::new(
             format!("parsed object, {object_description} at offset $PO").into_bytes(),
-        ),
+        )),
         warning_object_description: Some(object_description.as_bytes().to_vec()),
     };
     let parsed =
@@ -1115,7 +1115,7 @@ mod live_input_tests {
     #[test]
     fn detached_and_offset_handle_resolvers_preserve_reference_identity() {
         let mut detached_resolver = super::DetachedHandles {
-            description_template: Some(b"parsed object,  at offset $PO".to_vec()),
+            description_template: Some(Rc::new(b"parsed object,  at offset $PO".to_vec())),
             warning_object_description: None,
         };
         let detached = detached_resolver.indirect_handle(ObjectRef::new(7, 2));
@@ -2022,7 +2022,7 @@ impl HandleResolver for OffsetHandleResolver<'_> {
         self.resolver.direct_handle_at(value, offset)
     }
 
-    fn description_template(&self) -> Option<Vec<u8>> {
+    fn description_template(&self) -> Option<Rc<Vec<u8>>> {
         self.resolver.description_template()
     }
 

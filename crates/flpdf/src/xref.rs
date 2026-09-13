@@ -1210,7 +1210,7 @@ impl HandleResolver for CanonicalTrailerParser<'_> {
         self.owner.direct_handle(value)
     }
 
-    fn description_template(&self) -> Option<Vec<u8>> {
+    fn description_template(&self) -> Option<Rc<Vec<u8>>> {
         None
     }
 
@@ -1236,8 +1236,8 @@ impl HandleResolver for BootstrapHandleParser<'_> {
         ObjectHandle::from_parsed_value_with_resolver(value, self.document.resolver_weak())
     }
 
-    fn description_template(&self) -> Option<Vec<u8>> {
-        Some(match self.description {
+    fn description_template(&self) -> Option<Rc<Vec<u8>>> {
+        Some(Rc::new(match self.description {
             XrefObjectDescription::Ordinary => b"object $OG".to_vec(),
             XrefObjectDescription::XrefStream => b"xref stream: object $OG".to_vec(),
             XrefObjectDescription::ObjStmMember {
@@ -1246,7 +1246,7 @@ impl HandleResolver for BootstrapHandleParser<'_> {
             } => self
                 .document
                 .object_description_template(stream_number, object_ref),
-        })
+        }))
     }
 }
 

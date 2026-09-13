@@ -20044,11 +20044,8 @@ pub(crate) mod warning_emission_tests {
 
     #[test]
     fn parser_values_share_one_description_template_owner() {
-        let parsed = ObjectHandle::parse_with_description(
-            b"[1 [2] << /K 3 >>]",
-            "shared template",
-        )
-        .unwrap();
+        let parsed =
+            ObjectHandle::parse_with_description(b"[1 [2] << /K 3 >>]", "shared template").unwrap();
         let scalar = parsed.try_get_array_item(0).unwrap();
         let nested_scalar = parsed
             .try_get_array_item(1)
