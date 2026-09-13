@@ -37,7 +37,9 @@ fn preserve_without_source_objstm_selects_the_disable_shaped_live_consumer() {
     // stream fixture lives in `cmp_diff_zero_tests`; this contract keeps the
     // intended Preserve branch connected to that live consumer.
     let root = Path::new(env!("CARGO_MANIFEST_DIR")).join("src");
-    let plain = std::fs::read_to_string(root.join("writer/plain/mod.rs")).unwrap();
+    let plain = std::fs::read_to_string(root.join("writer/plain/mod.rs"))
+        .unwrap()
+        .replace("\r\n", "\n");
 
     // Bind each assertion to the construct it claims. Independent substring
     // checks over the whole module would still pass if Preserve were dropped
