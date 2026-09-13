@@ -1084,6 +1084,161 @@ pub(crate) enum ObjectDescription {
     Child(ChildDescription),
 }
 
+/// Live slots sharing one qpdf-shaped value. qpdf has no reverse owner list,
+/// but flpdf's containment deviation needs to propagate direct-child edges to
+/// every alias slot. Keep the common single-slot case inline and allocate a
+/// vector only after a value actually gains a second owner.
+#[derive(Default)]
+enum StateOwners {
+    #[default]
+    Empty,
+    One(Weak<RefCell<ObjectSlot>>),
+    Many(Vec<Weak<RefCell<ObjectSlot>>>),
+}
+
+impl StateOwners {
+    fn retain_live(&mut self) {
+        match self {
+            Self::Empty => {}
+            Self::One(owner) => {
+                if owner.strong_count() == 0 {
+                    *self = Self::Empty;
+                }
+            }
+            Self::Many(owners) => {
+                owners.retain(|owner| owner.strong_count() != 0);
+                if owners.is_empty() {
+                    *self = Self::Empty;
+                } else if owners.len() == 1 {
+                    let owner = owners.pop().expect("one live state owner");
+                    *self = Self::One(owner);
+                }
+            }
+        }
+    }
+
+    fn insert(&mut self, slot: &Rc<RefCell<ObjectSlot>>) {
+        self.retain_live();
+        if self.contains(slot) {
+            return;
+        }
+        match self {
+            Self::Empty => *self = Self::One(Rc::downgrade(slot)),
+            Self::One(owner) => {
+                let existing = owner.clone();
+                *self = Self::Many(vec![existing, Rc::downgrade(slot)]);
+            }
+            Self::Many(owners) => owners.push(Rc::downgrade(slot)),
+        }
+    }
+
+    fn contains(&mut self, slot: &Rc<RefCell<ObjectSlot>>) -> bool {
+        self.retain_live();
+        match self {
+            Self::Empty => false,
+            Self::One(owner) => owner
+                .upgrade()
+                .is_some_and(|candidate| Rc::ptr_eq(&candidate, slot)),
+            Self::Many(owners) => owners.iter().any(|owner| {
+                owner
+                    .upgrade()
+                    .is_some_and(|candidate| Rc::ptr_eq(&candidate, slot))
+            }),
+        }
+    }
+
+    fn remove(&mut self, slot: &Rc<RefCell<ObjectSlot>>) {
+        self.retain_live();
+        let remove_single = matches!(self, Self::One(owner) if owner
+            .upgrade()
+            .is_some_and(|candidate| Rc::ptr_eq(&candidate, slot)));
+        if remove_single {
+            *self = Self::Empty;
+            return;
+        }
+        if let Self::Many(owners) = self {
+            owners.retain(|owner| {
+                owner
+                    .upgrade()
+                    .is_some_and(|candidate| !Rc::ptr_eq(&candidate, slot))
+            });
+        }
+        self.retain_live();
+    }
+
+    fn handles(&mut self) -> Vec<ObjectHandle> {
+        self.retain_live();
+        match self {
+            Self::Empty => Vec::new(),
+            Self::One(owner) => owner
+                .upgrade()
+                .map(|slot| vec![ObjectHandle(slot)])
+                .unwrap_or_default(),
+            Self::Many(owners) => owners
+                .iter()
+                .filter_map(Weak::upgrade)
+                .map(ObjectHandle)
+                .collect(),
+        }
+    }
+}
+
+#[cfg(test)]
+mod state_owner_tests {
+    use super::*;
+
+    fn slot() -> Rc<RefCell<ObjectSlot>> {
+        ObjectHandle::integer(1).0.clone()
+    }
+
+    #[test]
+    fn state_owners_cover_inline_alias_and_cleanup_transitions() {
+        let first = slot();
+        let mut owners = StateOwners::default();
+
+        assert!(!owners.contains(&first));
+        owners.insert(&first);
+        owners.insert(&first);
+        assert!(owners.contains(&first));
+        assert_eq!(owners.handles().len(), 1);
+
+        let other = slot();
+        owners.remove(&other);
+        assert_eq!(owners.handles().len(), 1);
+        owners.remove(&first);
+        assert!(owners.handles().is_empty());
+
+        let second = slot();
+        let third = slot();
+        owners.insert(&first);
+        owners.insert(&second);
+        assert!(owners.contains(&first));
+        assert!(!owners.contains(&third));
+        owners.insert(&third);
+        assert_eq!(owners.handles().len(), 3);
+
+        owners.remove(&third);
+        assert_eq!(owners.handles().len(), 2);
+        owners.remove(&first);
+        assert_eq!(owners.handles().len(), 1);
+
+        drop(second);
+        assert!(owners.handles().is_empty());
+    }
+
+    #[test]
+    fn state_owners_discard_dead_many_entries_before_handles() {
+        let first = slot();
+        let second = slot();
+        let mut owners = StateOwners::Many(vec![Rc::downgrade(&first), Rc::downgrade(&second)]);
+
+        drop(first);
+        drop(second);
+        owners.retain_live();
+        assert!(owners.handles().is_empty());
+    }
+}
+
 fn replace_first(bytes: &mut Vec<u8>, needle: &[u8], replacement: &[u8]) {
     if let Some(position) = bytes
         .windows(needle.len())
@@ -1134,7 +1289,7 @@ struct SharedValueState {
     identity: ValueIdentity,
     parsed_offset: i64,
     description: Option<ObjectDescription>,
-    state_owners: Vec<Weak<RefCell<ObjectSlot>>>,
+    state_owners: StateOwners,
     mutation_generation: u64,
 }
 
@@ -1202,7 +1357,7 @@ fn new_shared_value_state(
         identity,
         parsed_offset,
         description: None,
-        state_owners: Vec::new(),
+        state_owners: StateOwners::default(),
         mutation_generation: 0,
     }))
 }
@@ -2072,42 +2227,19 @@ impl ObjectHandle {
     fn register_state_owner(&self) {
         let shared = self.0.borrow().shared.clone();
         let self_slot = self.0.clone();
-        let mut shared = shared.borrow_mut();
-        shared
-            .state_owners
-            .retain(|owner| owner.strong_count() != 0);
-        if !shared.state_owners.iter().any(|owner| {
-            owner
-                .upgrade()
-                .is_some_and(|slot| Rc::ptr_eq(&slot, &self_slot))
-        }) {
-            shared.state_owners.push(Rc::downgrade(&self_slot));
-        }
+        shared.borrow_mut().state_owners.insert(&self_slot);
     }
 
     fn remove_state_owner(
         shared: &Rc<RefCell<SharedValueState>>,
         slot_to_remove: &Rc<RefCell<ObjectSlot>>,
     ) {
-        let mut shared = shared.borrow_mut();
-        shared.state_owners.retain(|owner| {
-            owner
-                .upgrade()
-                .is_some_and(|slot| !Rc::ptr_eq(&slot, slot_to_remove))
-        });
+        shared.borrow_mut().state_owners.remove(slot_to_remove);
     }
 
     fn state_owner_handles(&self) -> Vec<Self> {
         let shared = self.0.borrow().shared.clone();
-        let mut shared = shared.borrow_mut();
-        let mut handles = Vec::new();
-        shared.state_owners.retain(|owner| {
-            let Some(slot) = owner.upgrade() else {
-                return false;
-            };
-            handles.push(Self(slot));
-            true
-        });
+        let handles = shared.borrow_mut().state_owners.handles();
         handles
     }
 

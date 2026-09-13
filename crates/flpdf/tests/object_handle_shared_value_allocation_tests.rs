@@ -292,7 +292,7 @@ fn measurement_stops_on_unwind() {
 }
 
 #[test]
-fn direct_scalar_uses_at_most_three_allocations() {
+fn direct_scalar_uses_at_most_two_allocations_without_a_single_owner_list() {
     const WIDE_ITEMS: usize = 128;
     const STREAM_BYTES: usize = 64 * 1024;
 
@@ -302,7 +302,7 @@ fn direct_scalar_uses_at_most_three_allocations() {
     assert_eq!(scalar.try_get_int_value().unwrap(), 7);
 
     assert!(
-        direct_scalar.allocations <= 3,
+        direct_scalar.allocations <= 2,
         "direct scalar used {} allocations",
         direct_scalar.allocations
     );
