@@ -1443,7 +1443,6 @@ struct SharedValueState {
     parsed_offset: i64,
     description: Option<ObjectDescription>,
     state_owners: StateOwners,
-    mutation_generation: u64,
 }
 
 impl SharedValueState {
@@ -1511,7 +1510,6 @@ fn new_shared_value_state(
         parsed_offset,
         description: None,
         state_owners: StateOwners::default(),
-        mutation_generation: 0,
     }))
 }
 
@@ -2421,7 +2419,6 @@ impl ObjectHandle {
         let (old_state, new_children) = {
             let mut shared = shared.borrow_mut();
             let old_state = std::mem::replace(&mut shared.value, new_state);
-            shared.mutation_generation = 0;
             let new_children = Self::state_children(&shared.value);
             (old_state, new_children)
         };
@@ -7527,9 +7524,7 @@ impl ObjectHandle {
     fn with_value_mut<T>(&self, f: impl FnOnce(Option<&mut ObjectValue>) -> T) -> T {
         let shared = self.0.borrow().shared.clone();
         let mut shared = shared.borrow_mut();
-        let result = f(Some(&mut shared.value));
-        shared.mutation_generation = shared.mutation_generation.wrapping_add(1);
-        result
+        f(Some(&mut shared.value))
     }
 
     /// This handle's qpdf-syntax unparse form
