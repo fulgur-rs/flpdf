@@ -84,24 +84,12 @@ fn wire_primary_catalog<RS: Read + Seek, RT: Read + Seek>(
     target: &mut Pdf<RT>,
     source_id: u64,
 ) -> Result<()> {
-    let Some(source_catalog_ref) = source.root_ref() else {
-        return Ok(()); // cov:ignore: page selection already requires a readable catalog
-    };
-    let source_catalog_handle = source.get_object_handle(source_catalog_ref);
-    source_catalog_handle.try_dereference()?;
-    let source_catalog = source_catalog_handle;
-    if !source_catalog.try_is_dictionary()? {
-        return Ok(()); // cov:ignore: page selection already requires a dictionary catalog
-    }
-    let Some(target_catalog_ref) = target.root_ref() else {
-        return Ok(()); // cov:ignore: Pdf::empty always supplies a target catalog
-    };
-    let target_catalog_handle = target.get_object_handle(target_catalog_ref);
-    target_catalog_handle.try_dereference()?;
-    let target_catalog = target_catalog_handle;
-    if !target_catalog.try_is_dictionary()? {
-        return Ok(()); // cov:ignore: Pdf::empty always supplies a dictionary catalog
-    }
+    // qpdf's `getRoot()` accepts both an indirect reference and an inline
+    // Catalog. Use the resolved handle for the semantic Catalog operation;
+    // `root_ref()` is only an optional identity projection and cannot represent
+    // a direct trailer value.
+    let source_catalog = source.root_handle()?;
+    let target_catalog = target.root_handle()?;
 
     for key in source_catalog.try_get_keys()? {
         if key == b"/Pages" {
@@ -343,15 +331,7 @@ fn discover_primary_acroform<R: Read + Seek>(source: &mut Pdf<R>) -> Result<Prim
         had_fields_array,
         ..Default::default()
     };
-    let Some(root_ref) = source.root_ref() else {
-        return Ok(out); // cov:ignore: page selection already requires a readable catalog
-    };
-    let root_handle = source.get_object_handle(root_ref);
-    root_handle.try_dereference()?;
-    let root = root_handle;
-    if !root.try_is_dictionary()? {
-        return Ok(out); // cov:ignore: page selection already requires a dictionary catalog
-    }
+    let root = source.root_handle()?;
     let acroform = root.try_get_key(b"/AcroForm")?;
     acroform.try_dereference()?;
     if acroform.try_is_dictionary()? {
@@ -1284,21 +1264,20 @@ fn merge_documents_with_resource_decisions_and_preserve_primary_into_impl<
         let source_id = input.source.unique_id();
         let mut copy_seed = target.take_foreign_object_map(source_id);
         if is_primary {
-            let primary_catalog_ref = input
-                .source
-                .root_ref()
-                .expect("page_refs above already required a resolvable /Root");
             let target_catalog_ref = target
                 .root_ref()
                 .expect("Pdf::empty always populates a root catalog");
-            let primary_catalog_handle = input.source.get_object_handle(primary_catalog_ref);
-            primary_catalog_handle.try_dereference()?;
-            let primary_catalog = primary_catalog_handle;
+            let primary_catalog = input.source.root_handle()?;
             let primary_pages_ref = primary_catalog
                 .try_get_key(b"/Pages")?
                 .object_ref()
                 .expect("page_refs above already required an indirect primary /Pages");
-            copy_seed.insert(primary_catalog_ref, target_catalog_ref);
+            // A direct Catalog has no source-space ObjectRef to reserve. Its
+            // direct child values are copied by `wire_primary_catalog`; only
+            // an indirect Catalog participates in the identity map.
+            if let Some(primary_catalog_ref) = input.source.root_ref() {
+                copy_seed.insert(primary_catalog_ref, target_catalog_ref);
+            }
             copy_seed.insert(primary_pages_ref, pages_root_ref);
         }
         target.set_foreign_object_map(source_id, copy_seed);
