@@ -31,6 +31,19 @@ fn planned_preserve_uses_the_d9_source_membership_owner() {
 }
 
 #[test]
+fn every_plain_mode_forwards_setup_membership_to_the_live_consumer() {
+    let root = Path::new(env!("CARGO_MANIFEST_DIR")).join("src");
+    let plain = std::fs::read_to_string(root.join("writer/plain/mod.rs")).unwrap();
+    let plan = std::fs::read_to_string(root.join("writer/plain/plan.rs")).unwrap();
+
+    assert!(plain.contains("write_plain_live"));
+    assert!(plain.contains("generated_compressible"));
+    assert!(plain.contains("generated_object_stream_sources"));
+    assert!(plain.contains("build_live_object_stream_plan"));
+    assert!(plan.contains("Some(source_object_stream_data)"));
+}
+
+#[test]
 fn plain_disable_reconciles_direct_adbe_before_live_child_enqueue() {
     // qpdf 11.9.0: QPDFWriter.cc:1418-1430 replaces stale /ADBE before
     // unparseChild can enqueue the obsolete indirect /URL value.

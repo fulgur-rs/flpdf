@@ -4315,47 +4315,6 @@ impl ObjectHandle {
         self.type_warning("dictionary", warning)?;
         Ok(false)
     }
-    /// # Errors
-    ///
-    /// Returns [`Error::Internal`] when `value` belongs to a different
-    /// document than the dictionary receiver, matching [`Self::replace_key`]'s
-    /// ownership boundary.
-    pub(crate) fn restore_key_raw(&self, key: &[u8], value: ObjectHandle) -> Result<()> {
-        // cov:ignore-start: both callers (`restore_catalog_extensions` and
-        // `emit_canonical_pdf`'s direct-root path, writer.rs) invoke this
-        // only on a handle already confirmed to be a dictionary via
-        // `try_as_dictionary()`, so the non-dictionary guard below is
-        // defensive, not reachable from either call site.
-        if !self.with_value(|current| matches!(current, Some(ObjectValue::Dictionary(_)))) {
-            return Ok(());
-        }
-        // cov:ignore-end
-        self.check_key_value_ownership(&value)?;
-        // cov:ignore-start: both callers only ever restore a snapshot
-        // captured from this very dictionary's own child, which can never be
-        // a direct alias of the dictionary itself.
-        if self.is_direct_value_alias(&value) {
-            return Ok(());
-        }
-        // cov:ignore-end
-        // cov:ignore-start: the dictionary type was already confirmed above,
-        // so the closure's non-dictionary fallthrough is unreachable here.
-        let replaced = self.with_value_mut(|v| {
-            if let Some(ObjectValue::Dictionary(entries)) = v {
-                return Some(entries.insert(key.to_vec(), value.clone()));
-            }
-            None
-        });
-        // cov:ignore-end
-        if let Some(old_value) = replaced {
-            if let Some(old_value) = old_value {
-                self.detach_child_from_state_owners(&old_value);
-            }
-            self.attach_child_to_state_owners(&value);
-        } // cov:ignore: closing brace has no llvm-cov region after the covered attach_child_to_state_owners call
-        Ok(())
-    }
-
     /// Set one item in the live array, porting qpdf's `setArrayItem`
     /// (`libqpdf/QPDFObjectHandle.cc:871-883`). The receiver is dereferenced
     /// before its array type is inspected, so an unresolved indirect holder

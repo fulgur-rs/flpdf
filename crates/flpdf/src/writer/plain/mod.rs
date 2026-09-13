@@ -13,6 +13,7 @@ pub(crate) mod body;
 pub(crate) mod plan;
 pub(crate) mod xref;
 
+#[allow(clippy::too_many_arguments)]
 pub(crate) fn write_plain<R: Read + Seek>(
     pdf: &mut Pdf<R>,
     out: &mut OutputSink<'_>,
@@ -24,7 +25,6 @@ pub(crate) fn write_plain<R: Read + Seek>(
     generated_compressible: Option<&crate::writer::object_streams::CompressiblePlan>,
     generated_object_stream_sources: &[ObjectRef],
 ) -> crate::Result<WriterResult> {
-    let _ = (generated_compressible, generated_object_stream_sources);
     // qpdf's writeStandard uses one enqueueObject/object_queue walk for every
     // non-linearized object-stream and QDF combination. Membership is fixed
     // during setup; numbering and surviving stream-child discovery remain
@@ -37,9 +37,12 @@ pub(crate) fn write_plain<R: Read + Seek>(
         encryption_parameters,
         source_object_stream_data,
         special_streams,
+        generated_compressible,
+        generated_object_stream_sources,
     )
 }
 
+#[allow(clippy::too_many_arguments)]
 fn write_plain_live<R: Read + Seek>(
     pdf: &mut Pdf<R>,
     out: &mut OutputSink<'_>,
@@ -48,6 +51,8 @@ fn write_plain_live<R: Read + Seek>(
     encryption_parameters: Option<crate::writer::EncryptionParameters>,
     source_object_stream_data: &BTreeMap<u32, u32>,
     special_streams: Option<&crate::writer::SpecialStreams>,
+    generated_compressible: Option<&crate::writer::object_streams::CompressiblePlan>,
+    generated_object_stream_sources: &[ObjectRef],
 ) -> crate::Result<WriterResult> {
     let source_root = pdf.root_ref();
     let direct_root = if source_root.is_none() {
@@ -55,11 +60,20 @@ fn write_plain_live<R: Read + Seek>(
     } else {
         None
     };
+    let initial_id_present = pdf
+        .trailer()
+        .try_as_dictionary()?
+        .is_some_and(|entries| entries.iter().any(|(key, _)| key.as_slice() == b"/ID"));
     // qpdf's removeObject erases the only document cache slot and turns
     // retained aliases into direct null; it does not leave a tombstone for a
     // later writer pass. Keep the writer's operation-local set empty here.
-    let object_stream_plan =
-        plan::build_live_object_stream_plan(pdf, options, source_object_stream_data)?;
+    let object_stream_plan = plan::build_live_object_stream_plan(
+        pdf,
+        options,
+        source_object_stream_data,
+        generated_compressible,
+        generated_object_stream_sources,
+    )?; // cov:ignore: the live membership planner is covered by the focused Generate/Preserve routes; LLVM maps this call terminator separately.
     let removed_refs = object_stream_plan.removed_refs;
     let object_streams = object_stream_plan.groups;
     // qpdf gates both the 1.5 version floor and the cross-reference form on the
@@ -73,7 +87,6 @@ fn write_plain_live<R: Read + Seek>(
     // reached declare 1.5 while emitting a classic table, which qpdf never
     // does.
     let has_object_stream_hint = !object_streams.is_empty();
-    let source_id0 = plan::live_source_id0(pdf)?;
     let source_version = pdf.version().to_string();
     let source_extension_level = pdf.adobe_extension_level()?.unwrap_or(0);
     let (effective_version, final_extension_level) =
@@ -117,8 +130,30 @@ fn write_plain_live<R: Read + Seek>(
         body_encryption_context.as_ref(),
         content_container_refs,
     )?; // cov:ignore: LLVM attributes the live-body call terminator to closure cleanup.
-    let old_to_new = body.old_to_new;
-    let root = source_root.and_then(|source| old_to_new.get(&source).copied());
+    let body_old_to_new = body.old_to_new;
+    let mut trailer_map: HashMap<ObjectRef, ObjectRef> = body_old_to_new
+        .iter()
+        .map(|(&source, &output)| (source, output))
+        .collect();
+    for ignored in body.ignored_refs {
+        trailer_map.insert(ignored, ObjectRef::new(0, 0));
+    }
+    let source_id0 = plan::live_source_id0(pdf)?;
+    // qpdf reads a non-deterministic ID at writeTrailer time. Reuse the
+    // setup-generated value only when the live trailer still describes the
+    // same source ID state; progress callbacks may replace or remove /ID.
+    let live_id = pdf.trailer_key_handle(b"ID");
+    let setup_id0 = generated_id
+        .and_then(|id| id.as_array())
+        .and_then(|values| values.first().and_then(crate::ObjectHandle::as_string));
+    let reuse_setup_id = options.copy_encryption.is_some()
+        || generated_id.is_some()
+            && if live_id.try_is_null()? {
+                !initial_id_present
+            } else {
+                source_id0.is_some() && setup_id0.as_deref() == source_id0.as_deref()
+            };
+    let root = source_root.and_then(|source| trailer_map.get(&source).copied());
     if source_root.is_some() && root.is_none() {
         // cov:ignore-start: root is seeded before emission; this guards only a violated queue invariant.
         return Err(crate::Error::Unsupported(
@@ -174,10 +209,13 @@ fn write_plain_live<R: Read + Seek>(
     // cov:ignore-end
     let generated_id = if deterministic_id {
         None
+    } else if reuse_setup_id {
+        generated_id.cloned()
     } else {
-        Some(generated_id.cloned().unwrap_or_else(|| {
-            crate::writer::generate_id_handle(source_id0.as_deref(), options.static_id)
-        }))
+        Some(crate::writer::generate_id_handle(
+            source_id0.as_deref(),
+            options.static_id,
+        ))
     };
     let trailer_handle = crate::writer::build_writer_trailer_handle(
         pdf,
@@ -199,8 +237,43 @@ fn write_plain_live<R: Read + Seek>(
             value: xref::materialized_id_handle(&trailer_handle.try_get_key(b"/ID")?)?,
         }
     };
-    let mut trailer_map: HashMap<ObjectRef, ObjectRef> =
-        old_to_new.iter().map(|(&a, &b)| (a, b)).collect();
+    let initial_late_trailer_number = u32::try_from(trailer_size).map_err(|_| {
+        // cov:ignore-start: the body queue is bounded by qpdf's u32 object-number domain.
+        crate::Error::Unsupported("plain live writer: late trailer number overflows u32".into())
+        // cov:ignore-end
+    })?;
+    let mut next_late_trailer_number = extend_late_trailer_map(
+        pdf,
+        &mut trailer_map,
+        initial_late_trailer_number,
+        true,
+        options.qdf,
+    )?; // cov:ignore: trailer-before-root late discovery is covered by the live trailer tests; LLVM maps this terminator separately.
+
+    if let Some(direct_root) = direct_root_output.as_ref() {
+        let mut references = Vec::new();
+        crate::writer::rewrite_renumber::collect_canonical_enqueue_refs(
+            pdf,
+            direct_root,
+            0,
+            true,
+            &mut references,
+        )?;
+        next_late_trailer_number = assign_late_references(
+            pdf,
+            &mut trailer_map,
+            references,
+            next_late_trailer_number,
+            options.qdf,
+        )?;
+    }
+    extend_late_trailer_map(
+        pdf,
+        &mut trailer_map,
+        next_late_trailer_number,
+        false,
+        options.qdf,
+    )?;
 
     // Object streams require a cross-reference stream: a classic table has no
     // type-2 row shape (ISO 32000-1 7.5.7). qpdf decides this from the same
@@ -208,12 +281,7 @@ fn write_plain_live<R: Read + Seek>(
     // (`QPDFWriter.cc:3023-3031`), not from what the walk turned out to
     // reach, so a registered-but-unreached container still produces a
     // cross-reference stream with zero type-2 rows.
-    let preserve_source_xref_stream = encryption_context.is_some()
-        && !options.qdf
-        && pdf.last_xref_form == XrefForm::Stream
-        && crate::pdf_version::parse_qpdf_writer_version(&version)
-            .is_some_and(|version| version >= crate::pdf_version::QpdfVersionParts::new(1, 5));
-    let form = if has_object_stream_hint || preserve_source_xref_stream {
+    let form = if has_object_stream_hint {
         XrefForm::Stream
     } else {
         XrefForm::Table
@@ -257,6 +325,81 @@ fn write_plain_live<R: Read + Seek>(
         })
         .collect();
     Ok(WriterResult::new(old_to_new, written_xref))
+}
+
+/// Assign output numbers for trailer references discovered after the body
+/// queue has drained. qpdf's `writeTrailer` performs this walk lazily, so a
+/// progress callback can attach new children without requiring a second full
+/// document-body pass.
+pub(crate) fn extend_late_trailer_map<R: Read + Seek>(
+    pdf: &mut Pdf<R>,
+    map: &mut HashMap<ObjectRef, ObjectRef>,
+    mut next: u32,
+    before_root: bool,
+    qdf: bool,
+) -> crate::Result<u32> {
+    let entries = pdf.trailer().try_as_dictionary()?.unwrap_or_default();
+    for (key, value) in entries {
+        if key.as_slice() == b"/Root" || (key.as_slice() < b"/Root") != before_root {
+            continue;
+        }
+        if matches!(
+            key.as_slice(),
+            b"/ID"
+                | b"/Encrypt"
+                | b"/Prev"
+                | b"/Root"
+                | b"/Size"
+                | b"/Type"
+                | b"/W"
+                | b"/Index"
+                | b"/Length"
+                | b"/Filter"
+                | b"/DecodeParms"
+                | b"/XRefStm"
+        ) || value.try_is_null()?
+        {
+            continue;
+        }
+        let mut references = Vec::new();
+        crate::writer::rewrite_renumber::collect_canonical_enqueue_refs(
+            pdf,
+            &value,
+            0,
+            true,
+            &mut references,
+        )?;
+        next = assign_late_references(pdf, map, references, next, qdf)?;
+    }
+    Ok(next)
+}
+
+fn assign_late_references<R: Read + Seek>(
+    pdf: &mut Pdf<R>,
+    map: &mut HashMap<ObjectRef, ObjectRef>,
+    references: Vec<ObjectRef>,
+    mut next: u32,
+    qdf: bool,
+) -> crate::Result<u32> {
+    for reference in references {
+        if reference.number == 0 || map.contains_key(&reference) {
+            continue;
+        }
+        let handle = pdf.get_object_handle(reference);
+        if qdf && handle.try_is_stream_of_type(b"XRef", b"")? {
+            map.insert(reference, ObjectRef::new(0, 0));
+            continue;
+        }
+        let is_stream = qdf && handle.try_is_stream_of_type(b"", b"")?;
+        map.insert(reference, ObjectRef::new(next, 0));
+        let increment = if is_stream { 2 } else { 1 };
+        next = next.checked_add(increment).ok_or_else(|| {
+            // cov:ignore-start: the qpdf object-number domain cannot be exhausted by a supported in-memory PDF.
+            crate::Error::Unsupported("plain live writer: late trailer number overflows u32".into())
+            // cov:ignore-end
+        })?;
+    }
+    Ok(next)
 }
 
 pub(crate) fn eligible(

@@ -7,7 +7,7 @@ use crate::pages::repair::PreparedPages;
 use crate::pdf_version::{leading_major_minor, PdfVersion};
 use crate::reader::resolver::{ResolverHandle, CLOSED_INPUT_SOURCE_NAME};
 use crate::reader::InputSourceControl;
-use crate::{Error, ObjectHandle, ObjectRef, QpdfErrorCode, QpdfExc, Result, XrefForm};
+use crate::{Error, ObjectHandle, ObjectRef, QpdfErrorCode, QpdfExc, Result};
 use std::cell::RefCell;
 use std::collections::{BTreeMap, BTreeSet};
 use std::io::{Read, Seek};
@@ -141,7 +141,6 @@ pub struct Pdf<R: Read + Seek + 'static> {
     /// `libqpdf/QPDFJob.cc:745-752`).
     pub(crate) check_mode: bool,
     pub(crate) trailer: ObjectHandle,
-    pub(crate) last_xref_form: XrefForm,
     /// qpdf's xref-parser-owned `first_xref_item_offset` used by the
     /// linearization `/T` check; zero preserves qpdf's initialized default
     /// when no parsed xref section contains object 0.

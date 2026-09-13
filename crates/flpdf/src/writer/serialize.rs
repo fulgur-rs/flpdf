@@ -615,7 +615,13 @@ pub(crate) mod xref_stream {
                     if qdf {
                         root.write_object_qdf_with_ref_map_and_removed(out, 0, map, removed_refs)?;
                     } else {
-                        root.write_object_with_ref_map_and_removed(out, map, removed_refs)?;
+                        crate::writer::object::write_object_with_ref_map_and_direct_streams(
+                            root,
+                            out,
+                            map,
+                            removed_refs,
+                            false,
+                        )?; // cov:ignore: live-root serialization is exercised by the direct-root differential; LLVM maps this continuation to the call setup.
                     }
                 } // cov:ignore: LLVM maps the covered live-root branch exit to this line
                 continue; // cov:ignore: every emitted live-root key is handled before the next key
@@ -663,9 +669,6 @@ pub(crate) mod xref_stream {
                 | b"/Root"
                 | b"/Size"
                 | b"/Type"
-                | b"/F"
-                | b"/FFilter"
-                | b"/FDecodeParms"
                 | b"/W"
                 | b"/Index"
                 | b"/Length"

@@ -303,32 +303,66 @@ fn append_classic_xref_and_trailer(
             let mut id_writer = |out: &mut crate::writer::output::OutputSink<'_>| {
                 write_deterministic_id_inline(out, info_suffix, source_id0.as_deref())
             };
-            trailer_handle.write_trailer_with_ref_map_and_kind(
-                out,
-                TrailerKind::Normal {
-                    size: i64::from(size),
-                },
-                false,
-                trailer.qdf,
-                Some(&mut id_writer),
-                &map,
-                removed_refs,
-                true,
-            )?; // cov:ignore: deterministic ID writer call is covered; LLVM maps this multiline terminator to the call setup
+            if let Some(direct_root) = trailer.direct_root.as_ref() {
+                crate::writer::object::write_trailer_with_ref_map_and_kind_and_direct_root(
+                    trailer_handle,
+                    out,
+                    TrailerKind::Normal {
+                        size: i64::from(size),
+                    },
+                    false,
+                    trailer.qdf,
+                    Some(&mut id_writer),
+                    &map,
+                    removed_refs,
+                    true,
+                    direct_root,
+                )?; // cov:ignore: deterministic direct-root trailer serialization is covered by the dedicated writer differential; LLVM maps this continuation separately.
+            } else {
+                trailer_handle.write_trailer_with_ref_map_and_kind(
+                    out,
+                    TrailerKind::Normal {
+                        size: i64::from(size),
+                    },
+                    false,
+                    trailer.qdf,
+                    Some(&mut id_writer),
+                    &map,
+                    removed_refs,
+                    true,
+                )?; // cov:ignore: deterministic ID writer call is covered; LLVM maps this multiline terminator to the call setup
+            }
         }
         IdPlan::Materialized { .. } => {
-            trailer_handle.write_trailer_with_ref_map_and_kind(
-                out,
-                TrailerKind::Normal {
-                    size: i64::from(size),
-                },
-                false,
-                trailer.qdf,
-                None,
-                &map,
-                removed_refs,
-                true,
-            )?; // cov:ignore: materialized ID writer call is covered; LLVM maps this multiline terminator to the call setup
+            if let Some(direct_root) = trailer.direct_root.as_ref() {
+                crate::writer::object::write_trailer_with_ref_map_and_kind_and_direct_root(
+                    trailer_handle,
+                    out,
+                    TrailerKind::Normal {
+                        size: i64::from(size),
+                    },
+                    false,
+                    trailer.qdf,
+                    None,
+                    &map,
+                    removed_refs,
+                    true,
+                    direct_root,
+                )?;
+            } else {
+                trailer_handle.write_trailer_with_ref_map_and_kind(
+                    out,
+                    TrailerKind::Normal {
+                        size: i64::from(size),
+                    },
+                    false,
+                    trailer.qdf,
+                    None,
+                    &map,
+                    removed_refs,
+                    true,
+                )?; // cov:ignore: materialized ID writer call is covered; LLVM maps this multiline terminator to the call setup
+            }
         }
     }
     if trailer.qdf {
@@ -604,6 +638,13 @@ mod tests {
             structural_filtered: false,
             qdf: false,
         }
+    }
+
+    #[test]
+    fn materialized_id_handle_rejects_a_non_array_value() {
+        let error = materialized_id_handle(&ObjectHandle::integer(1))
+            .expect_err("non-array trailer IDs must be rejected");
+        assert!(error.to_string().contains("must be an array"));
     }
 
     #[test]

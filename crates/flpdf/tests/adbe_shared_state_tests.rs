@@ -5,11 +5,14 @@ use std::io::{self, Cursor, Write};
 
 struct FailingOutput;
 impl Write for FailingOutput {
-    fn write(&mut self, _bytes: &[u8]) -> io::Result<usize> {
-        Err(io::Error::other("output failure"))
+    fn write(&mut self, bytes: &[u8]) -> io::Result<usize> {
+        // qpdf's oracle uses a Pipeline whose writes succeed and whose final
+        // finish fails. Let the header and Catalog reach the writer before
+        // surfacing the equivalent segment-flush failure.
+        Ok(bytes.len())
     }
     fn flush(&mut self) -> io::Result<()> {
-        Ok(())
+        Err(io::Error::other("output failure"))
     }
 }
 

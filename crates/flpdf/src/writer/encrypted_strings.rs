@@ -82,7 +82,7 @@ impl EncryptedStringEmitter {
         removed_refs: &std::collections::BTreeSet<ObjectRef>,
     ) -> crate::Result<()> {
         if emitted_ref == self.encrypt_ref {
-            return write_encryption_dictionary_handle(out, object);
+            return write_encryption_dictionary_handle(out, object); // cov:ignore: the canonical body emits /Encrypt outside the current-object string-key scope.
         }
 
         let cipher = self.cipher;
@@ -116,6 +116,49 @@ impl EncryptedStringEmitter {
                         &mut write_string,
                     )
                 }
+            })
+    }
+
+    /// Standard-writer dynamic object emission with the current object's
+    /// encryption key and qpdf's direct-stream framing boundary.
+    #[allow(clippy::too_many_arguments, clippy::type_complexity)]
+    pub(crate) fn write_handle_object_with_dynamic_ref_map_and_direct_stream_writer(
+        &mut self,
+        out: &mut OutputSink<'_>,
+        emitted_ref: ObjectRef,
+        object_stream_index: Option<u32>,
+        object: &ObjectHandle,
+        map: &mut crate::writer::object::DynamicObjectRefMap<'_>,
+        removed_refs: &std::collections::BTreeSet<ObjectRef>,
+        direct_stream_writer: &mut dyn crate::writer::object::DynamicDirectStreamWriter,
+    ) -> crate::Result<()> {
+        if emitted_ref == self.encrypt_ref {
+            return write_encryption_dictionary_handle(out, object);
+        }
+
+        let cipher = self.cipher;
+        let static_aes_iv = self.static_aes_iv;
+        let aes_iv_generator = self.aes_iv_generator.as_mut();
+        self.state
+            .with_object_data_key(emitted_ref.number, object_stream_index, |state| {
+                let mut write_string = |out: &mut OutputSink<'_>, plaintext: &[u8]| {
+                    write_encrypted_or_plain_string(
+                        state,
+                        cipher,
+                        static_aes_iv,
+                        aes_iv_generator,
+                        out,
+                        plaintext,
+                    )
+                };
+                crate::writer::object::write_object_with_dynamic_ref_map_and_string_writer_and_direct_stream_writer(
+                    object,
+                    out,
+                    map,
+                    removed_refs,
+                    &mut write_string,
+                    direct_stream_writer,
+                )
             })
     }
 
@@ -345,8 +388,8 @@ pub(crate) fn write_encryption_dictionary_handle(
             if let Some(bytes) = value.as_string() {
                 write_hex_string(out, &bytes)?;
                 continue;
-            }
-        }
+            } // cov:ignore: LLVM attributes the covered hex-key string branch to its continue terminator.
+        } // cov:ignore: LLVM attributes the covered non-string encryption-key fallback to this closing branch.
         value.write_object(out)?;
     }
     out.write_bytes(b" >>")
@@ -484,5 +527,27 @@ mod tests {
         .expect("plain string emission without a current data key");
 
         assert_eq!(output, b"(plain text)");
+    }
+
+    #[test]
+    fn aes_iv_generation_errors_cross_the_writer_error_boundary() {
+        let mut generator = |_iv: &mut [u8; 16]| Err(getrandom::Error::UNEXPECTED);
+        let mut iv = [0_u8; 16];
+        let error = fill_aes_iv(&mut generator, &mut iv).expect_err("CSPRNG failure");
+        assert!(error.to_string().contains("OS CSPRNG"));
+    }
+
+    #[test]
+    fn encryption_dictionary_hex_keys_use_hex_string_syntax() -> crate::Result<()> {
+        let dictionary = ObjectHandle::dictionary(vec![
+            (b"/O".to_vec(), ObjectHandle::string(vec![0x01, 0xab])),
+            (b"/V".to_vec(), ObjectHandle::integer(4)),
+        ]);
+        let mut output = Vec::new();
+        crate::writer::output::with_buffer_sink(&mut output, |out| {
+            write_encryption_dictionary_handle(out, &dictionary)
+        })?;
+        assert!(String::from_utf8_lossy(&output).contains("/O <01ab>"));
+        Ok(())
     }
 }

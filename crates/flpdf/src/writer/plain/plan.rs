@@ -19,7 +19,7 @@ use crate::writer::rewrite_renumber::{
 };
 use crate::writer::WriterOptions;
 #[cfg(test)]
-use crate::{CompressStreams, XrefEntry, XrefForm};
+use crate::{CompressStreams, XrefForm};
 use crate::{ObjectHandle, ObjectRef, Pdf};
 
 #[cfg(test)]
@@ -70,6 +70,8 @@ pub(crate) fn build_live_object_stream_plan<R: Read + Seek>(
     pdf: &mut Pdf<R>,
     options: &WriterOptions,
     source_object_stream_data: &BTreeMap<u32, u32>,
+    generated_compressible: Option<&object_streams::CompressiblePlan>,
+    generated_object_stream_sources: &[ObjectRef],
 ) -> crate::Result<LiveObjectStreamPlan> {
     let mut plan = match options.object_streams {
         ObjectStreamMode::Disable => LiveObjectStreamPlan {
@@ -88,21 +90,29 @@ pub(crate) fn build_live_object_stream_plan<R: Read + Seek>(
             }
         }
         ObjectStreamMode::Generate => {
-            let compressible = object_streams::compressible_objgens_qpdf_plan(pdf)?;
+            let compressible = if let Some(snapshot) = generated_compressible {
+                snapshot.clone()
+            } else {
+                object_streams::compressible_objgens_qpdf_plan(pdf)?
+            };
             let mut eligible = compressible.eligible;
             let removed_refs = compressible.removed_refs;
             eligible.retain(|member| !removed_refs.contains(member));
             let batches = object_streams::even_split_into_streams(&eligible);
             let mut groups = Vec::with_capacity(batches.len());
-            for members in batches {
-                let container = pdf.make_indirect_object_handle(ObjectHandle::null())?;
-                let source = container.object_ref().ok_or_else(|| {
-                    // cov:ignore-start: make_indirect_object_handle always returns an indirect handle.
-                    crate::Error::Internal(
-                        "generated object-stream container lost its indirect identity".into(),
-                    )
-                    // cov:ignore-end
-                })?; // cov:ignore: LLVM maps the covered generated-container identity continuation to this line
+            for (index, members) in batches.into_iter().enumerate() {
+                let source = if let Some(&source) = generated_object_stream_sources.get(index) {
+                    source
+                } else {
+                    let container = pdf.make_indirect_object_handle(ObjectHandle::null())?;
+                    container.object_ref().ok_or_else(|| {
+                        // cov:ignore-start: make_indirect_object_handle always returns an indirect handle.
+                        crate::Error::Internal(
+                            "generated object-stream container lost its indirect identity".into(),
+                        )
+                        // cov:ignore-end
+                    })? // cov:ignore: LLVM maps the covered generated-container identity continuation to this line
+                };
                 groups.push(ObjectStreamGroup::Generated { source, members });
             }
             LiveObjectStreamPlan {
@@ -983,13 +993,6 @@ fn build_container_aware(
         old_to_new,
         removed_refs,
     })
-}
-
-#[cfg(test)]
-pub(crate) fn source_has_compressed_entries<R: Read + Seek>(pdf: &Pdf<R>) -> bool {
-    pdf.source_xref_entries()
-        .values()
-        .any(|offset| matches!(offset, XrefEntry::Compressed { .. }))
 }
 
 #[cfg(test)]
@@ -2058,7 +2061,8 @@ mod tests {
         let mut pdf =
             Pdf::open(std::io::BufReader::new(std::fs::File::open(path).unwrap())).unwrap();
         let options = write_options(ObjectStreamMode::Generate);
-        let plan = build_live_object_stream_plan(&mut pdf, &options, &BTreeMap::new()).unwrap();
+        let plan =
+            build_live_object_stream_plan(&mut pdf, &options, &BTreeMap::new(), None, &[]).unwrap();
 
         assert!(!plan.groups.is_empty());
         assert!(plan.groups.iter().all(|group| {
@@ -2076,8 +2080,14 @@ mod tests {
         let mut source_object_stream_data = BTreeMap::new();
         pdf.get_object_stream_data(&mut source_object_stream_data);
 
-        let plan = build_live_object_stream_plan(&mut pdf, &options, &source_object_stream_data)
-            .expect("live Preserve membership setup");
+        let plan = build_live_object_stream_plan(
+            &mut pdf,
+            &options,
+            &source_object_stream_data,
+            None,
+            &[],
+        )
+        .expect("live Preserve membership setup");
 
         assert!(plan.groups.iter().any(|group| {
             matches!(group, ObjectStreamGroup::SourceBacked { members, .. } if !members.is_empty())

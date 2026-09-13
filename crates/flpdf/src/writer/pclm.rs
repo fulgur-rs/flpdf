@@ -9,55 +9,9 @@
 
 use std::collections::{BTreeMap, HashMap, VecDeque};
 use std::io::{Read, Seek};
-use std::rc::Rc;
 
 use crate::writer::rewrite_renumber::collect_canonical_enqueue_refs;
 use crate::{ObjectHandle, ObjectRef, Pdf, Result};
-
-/// Return qpdf's initial PCLm queue seeds in enqueue order. Only the
-/// page/Contents/strip/synthetic/root seed differs from standard output; all
-/// descendants are discovered by the shared live writer while those objects
-/// are emitted (`QPDFWriter.cc:2928-2954`).
-pub(crate) fn seed_handles<R: Read + Seek>(pdf: &mut Pdf<R>) -> Result<Vec<ObjectHandle>> {
-    let mut seeds = Vec::new();
-    for page in crate::pages::page_refs(pdf)? {
-        seeds.push(pdf.get_object_handle(page));
-
-        let page_handle = pdf.get_object_handle(page);
-        page_handle.try_dereference()?;
-        let contents = page_handle.try_get_key(b"/Contents")?;
-        if !contents.try_is_null()? {
-            let mut references = Vec::new();
-            collect_canonical_enqueue_refs(pdf, &contents, 0, true, &mut references)?;
-            for reference in references {
-                seeds.push(pdf.get_object_handle(reference));
-            }
-        }
-
-        let resources = page_handle.try_get_key(b"/Resources")?;
-        let xobjects = resources.try_get_key(b"/XObject")?;
-        for key in xobjects.try_get_keys()? {
-            let image = xobjects.try_get_key(&key)?;
-            let mut references = Vec::new();
-            collect_canonical_enqueue_refs(pdf, &image, 0, true, &mut references)?;
-            for reference in references {
-                seeds.push(pdf.get_object_handle(reference));
-            }
-            seeds.push(pdf.new_stream_with_data(Rc::new(b"q /image Do Q\n".to_vec()))?);
-        }
-    }
-
-    let root = pdf.root_handle()?;
-    let mut references = Vec::new();
-    collect_canonical_enqueue_refs(pdf, &root, 0, true, &mut references)?;
-    for reference in references {
-        seeds.push(pdf.get_object_handle(reference));
-    }
-    Ok(seeds)
-}
-
-#[cfg(test)]
-use crate::writer::rewrite_renumber::collect_canonical_children;
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub(crate) enum Item {
@@ -496,10 +450,11 @@ mod tests {
         let mut filter = PassThroughFilter;
         let token = Token::new(TokenType::Word, b"Do".to_vec());
 
-        filter
-            .handle_token(&token, &mut output)
-            .expect("pass-through filter forwards the token");
-        drop(output);
+        {
+            filter
+                .handle_token(&token, &mut output)
+                .expect("pass-through filter forwards the token");
+        }
         buffer.finish().expect("token buffer finish");
         assert_eq!(buffer.take_buffer().expect("token bytes"), b"Do");
     }
@@ -1140,7 +1095,7 @@ mod tests {
                 "flpdf and qpdf PCLm outputs must have the same qpdf --check exit"
             );
             assert!(actual_check.status.success());
-        }
+        } // cov:ignore: LLVM attributes the covered qpdf-check success branch to the nested assertion.
     }
 
     #[test]
@@ -1173,7 +1128,7 @@ mod tests {
                 String::from_utf8_lossy(&check.stderr)
             );
             assert!(check.status.success(), "{check_error}");
-        }
+        } // cov:ignore: LLVM attributes the covered exact-qpdf branch exit to the assertion above.
     }
 
     #[test]

@@ -219,15 +219,6 @@ pub(crate) fn plan_object_streams_with_reachability_and_source_membership<
     }
 }
 
-#[cfg(test)]
-pub(crate) fn plan_object_streams_with_reachability<R: std::io::Read + std::io::Seek>(
-    pdf: &mut crate::Pdf<R>,
-    config: &PlannerConfig,
-    reachable: Option<&BTreeSet<ObjectRef>>,
-) -> crate::Result<PackingPlan> {
-    plan_object_streams_with_reachability_and_source_membership(pdf, config, reachable, None, None)
-}
-
 /// Apply qpdf's output-mode ObjStm exclusions after membership planning.
 ///
 /// This mirrors QPDFWriter.cc:2141-2160: linearized output removes page
@@ -348,7 +339,7 @@ pub(crate) fn plan_qpdf_preserve_object_streams_with_source_membership<
                 retained.push(member);
             }
         }
-        sort_members_qpdf_order(pdf, &mut retained);
+        sort_source_backed_members_qpdf_order(pdf, &mut retained);
         if !retained.is_empty() {
             groups.push(ObjectStreamGroup::SourceBacked {
                 source,
@@ -401,7 +392,7 @@ fn plan_generate<R: std::io::Read + std::io::Seek>(
     // from that candidate sequence (`QPDFWriter.cc:1970-2006`) and only the
     // reverse membership walk sorts members within each group
     // (`QPDFWriter.cc:1621-1758`). A fresh multi-source target's provenance is
-    // therefore applied by `sort_members_qpdf_order` after this split, not to
+    // therefore applied by `sort_source_backed_members_qpdf_order` after this split, not to
     // the full candidate vector before it; sorting here would move objects
     // across the qpdf group boundary.
     let batches = even_split_into_streams_with_cap(&compressible.eligible, config.batch_size_cap);
