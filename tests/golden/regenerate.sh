@@ -1430,6 +1430,28 @@ fi
 #                     numbering; part9 plain is post-container, part8 is the last
 #                     pre-container part, so the mislabeled container lands at the same
 #                     slot) — pins that the drift stays byte-invisible (regression guard).
+#  - otherpage-pages-200-100 (flpdf-lz4a): page 0 is fontless, page 1 owns 200
+#                     private fonts, and page 2 owns 100. The global split produces
+#                     separate part7 containers for page 1 and page 2 with a mixed
+#                     part8 container between them in split order; qpdf emits the
+#                     part7 containers page-by-page.
+#  - part9-categories-74-225 (flpdf-lz4a): the DFS visits 74 outline items before
+#                     the Pages tree and a 225-object /Zzz rest chain. The split
+#                     creates a Pages/rest container, an outline container, and two
+#                     remaining-rest containers; qpdf's part9 order is Pages/rest,
+#                     outlines, remaining rest. This is the category-order boundary
+#                     that requires Generate rest-batch sorting.
+#  - part9-categories-thumb-74-225 (flpdf-lz4a): the same category fixture with
+#                     one thumbnail shared by both pages; its /Meta edge reaches
+#                     /Zzz, so the shared-thumbnail union also has document-other.
+#                     qpdf's thumbs>1 arm still precedes outlines, and the plain
+#                     thumbnail stream itself precedes the ObjStm containers.
+#  - part9-pages-shared-thumb-74-225 (flpdf-lz4a): the same pages/outlines/rest
+#                     shape without /Meta; qpdf keeps the Pages container in
+#                     lc_other, then the plain shared thumbnail, before outlines.
+#  - thumbnail-catalog-other (flpdf-lz4a): one page's thumbnail is also reached
+#                     through Catalog /ZExtra. Its thumbs==1 + others>0 union is
+#                     lc_other, so the plain image belongs after the Pages batch.
 declare -A G6HB2_FIX=(
     [objstm-lin-sharedfonts-100]="gen_shared_fonts.py 100"
     [objstm-lin-cap-boundary-199]="gen_shared_fonts.py 199"
@@ -1449,6 +1471,13 @@ declare -A G6HB2_FIX=(
     [objstm-lin-outlines-otherpage-2-120-20]="gen_outlines_otherpage_shared.py 2 120 20"
     [objstm-lin-outlines-otherpage-0-120-20]="gen_outlines_otherpage_shared.py 0 120 20"
     [objstm-lin-otherpage-others-48-50]="gen_otherpage_others_private.py 48 50"
+    [objstm-lin-otherpage-private-250-0]="gen_otherpage_others_private.py 250 0"
+    [objstm-lin-otherpage-pages-200-100]="gen_otherpage_others_private.py 200 100"
+    [objstm-lin-outlines-multi-1-250]="gen_outlines_gap.py 1 250"
+    [objstm-lin-part9-categories-74-225]="gen_part9_categories.py 74 225"
+    [objstm-lin-part9-categories-thumb-74-225]="gen_part9_categories.py 74 225 1"
+    [objstm-lin-part9-pages-shared-thumb-74-225]="gen_part9_categories.py 74 225 2"
+    [objstm-lin-thumbnail-catalog-other]="gen_thumbnail_catalog_other.py"
     [objstm-lin-otherpage-shared-docother]="gen_otherpage_shared_docother.py 48 53 1 1"
     [objstm-lin-outline-od-shared-stream]="gen_outline_open_action_shared_stream.py"
     [objstm-lin-useoutline-od-shared-stream]="gen_outline_open_action_shared_stream.py --use-outlines"
@@ -2788,6 +2817,13 @@ for stem in objstm-lin-sharedfonts-100 objstm-lin-cap-boundary-199 \
             objstm-lin-outlines-otherpage-2-120-20 \
             objstm-lin-outlines-otherpage-0-120-20 \
             objstm-lin-otherpage-others-48-50 \
+            objstm-lin-otherpage-private-250-0 \
+            objstm-lin-otherpage-pages-200-100 \
+            objstm-lin-outlines-multi-1-250 \
+            objstm-lin-part9-categories-74-225 \
+            objstm-lin-part9-categories-thumb-74-225 \
+            objstm-lin-part9-pages-shared-thumb-74-225 \
+            objstm-lin-thumbnail-catalog-other \
             objstm-lin-otherpage-shared-docother \
             objstm-lin-outline-od-shared-stream \
             objstm-lin-useoutline-od-shared-stream \

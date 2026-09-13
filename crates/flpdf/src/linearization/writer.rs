@@ -64,7 +64,9 @@ use crate::linearization::hint_page::{bits_needed, PageOffsetHintTable};
 use crate::linearization::hint_shared::SharedObjectHintTable;
 use crate::linearization::hint_stream::{encode_hint_stream, OutlineHintTable};
 use crate::linearization::part1::{Part1Bytes, Part1Placeholders};
-use crate::linearization::plan::{ContainerPart, LinearizationPlan, RoutedObjStmBatch};
+use crate::linearization::plan::{
+    part9_category_order_key, ContainerPart, LinearizationPlan, RoutedObjStmBatch,
+};
 use crate::linearization::renumber::{ObjStmRelocation, RenumberMap, SecondHalfContainerAnchor};
 use crate::pipeline::stdio_file::StdioBuffer;
 use crate::writer::encrypted_strings::EncryptedStringEmitter;
@@ -2791,8 +2793,21 @@ fn second_half_container_anchors(
         .flat_map(|batch| batch.members.iter().copied())
         .collect();
 
-    // Second-half plain (non-member) objects in qpdf part order, each tagged with
-    // a qpdf ordering key. In Part 7 each page dictionary is forced first,
+    // Generate containers are fresh objects with no source ObjGen. Preserve
+    // containers retain one, and use the existing source-number anchor rules.
+    // The two modes cannot be mixed in one resolved batch plan.
+    let generate_batches = part4_batches
+        .iter()
+        .all(|batch| batch.source_container_number.is_none());
+    let part9_pages: BTreeSet<ObjectRef> = plan
+        .optimization
+        .as_ref()
+        .map(|optimization| optimization.objects_for_root_key(b"Pages"))
+        .filter(|pages| !pages.is_empty())
+        .unwrap_or_else(|| plan.pages_tree_ref.into_iter().collect());
+
+    // Second-half plain (non-member) objects in qpdf part order, each tagged
+    // with a qpdf ordering key. In Part 7 each page dictionary is forced first,
     // followed by the remaining page-private objects in ObjGen order.
     let mut plain_ranked: Vec<(ObjectRef, (u8, usize, u8, u32))> = Vec::new();
     for (i, privates) in plan.per_page_private_objects.iter().enumerate().skip(1) {
@@ -2811,15 +2826,18 @@ fn second_half_container_anchors(
     }
     for &r in &plan.part4_rest {
         if !member_set.contains(&r) {
-            plain_ranked.push((r, (2, 0, 0, r.number)));
+            if generate_batches {
+                let optimization = plan
+                    .optimization
+                    .as_ref()
+                    .expect("generated ObjStm batches require optimization users");
+                let (category, page) = part9_category_order_key(optimization, &part9_pages, [&r]);
+                plain_ranked.push((r, (2 + category, page as usize, 0, r.number)));
+            } else {
+                plain_ranked.push((r, (2, 0, 0, r.number)));
+            }
         }
     }
-    let part9_pages: BTreeSet<ObjectRef> = plan
-        .optimization
-        .as_ref()
-        .map(|optimization| optimization.objects_for_root_key(b"Pages"))
-        .filter(|pages| !pages.is_empty())
-        .unwrap_or_else(|| plan.pages_tree_ref.into_iter().collect());
 
     let page_private_sets: Vec<BTreeSet<ObjectRef>> = plan
         .per_page_private_objects
@@ -2856,6 +2874,15 @@ fn second_half_container_anchors(
                     // head position rather than sorting by its source object
                     // number (QPDF_linearization.cc:1286-1290).
                     (2, 0, 0, 0)
+                }
+                ContainerPart::Rest if generate_batches => {
+                    let optimization = plan
+                        .optimization
+                        .as_ref()
+                        .expect("generated ObjStm batches require optimization users");
+                    let (category, page) =
+                        part9_category_order_key(optimization, &part9_pages, batch.members.iter());
+                    (2 + category, page as usize, 1, object_number)
                 }
                 ContainerPart::Rest => (2, 0, 0, object_number),
                 // cov:ignore-start: first-half routes cannot enter resolved second-half batches
@@ -3326,10 +3353,12 @@ fn write_linearized_impl<R: Read + Seek>(
         .iter()
         .map(|batch| batch.members.clone())
         .collect();
-    // Part-4 non-member objects (e.g. lc_thumbnail streams, and ineligible
-    // outline streams) must be placed AFTER the second-half ObjStm containers in
-    // the file, not before.  Compute the set of such objects so
-    // place_objstm_members_per_half can emit them in a post-container pass.
+    // Most Part-4 non-member objects (for example ineligible outline streams
+    // and remaining lc_other objects) are placed AFTER the second-half ObjStm
+    // containers. Plain streams that qpdf classifies as private/shared
+    // thumbnails are emitted during the Part-9 thumbnail phase, before the
+    // generated containers that follow; a thumbnail stream demoted to lc_other
+    // remains in the post-container pass. Compute that exact set here.
     //
     // `part9_outline_objects` is included alongside `part4_rest`: its eligible
     // members ride in a second-half ObjStm batch (filtered out by
@@ -3348,6 +3377,31 @@ fn write_linearized_impl<R: Read + Seek>(
         .map(|optimization| optimization.objects_for_root_key(b"Pages"))
         .filter(|pages| !pages.is_empty())
         .unwrap_or_else(|| plan.pages_tree_ref.into_iter().collect());
+    let part9_thumbnail_objects: BTreeSet<ObjectRef> = plan
+        .optimization
+        .as_ref()
+        .map(|optimization| optimization.thumbnail_objects())
+        .unwrap_or_default();
+    let part9_thumbnail_pre_plain: BTreeSet<ObjectRef> =
+        if options.object_streams == crate::writer::ObjectStreamMode::Generate {
+            let optimization = plan
+                .optimization
+                .as_ref()
+                .expect("Generate linearization requires optimization users");
+            plan.part4_rest
+                .iter()
+                .copied()
+                .filter(|object| {
+                    part9_thumbnail_objects.contains(object)
+                        && matches!(
+                            part9_category_order_key(optimization, &part9_pages, [object]).0,
+                            1 | 2
+                        )
+                })
+                .collect()
+        } else {
+            BTreeSet::new()
+        };
     let second_half_post_plain: BTreeSet<ObjectRef> =
         if options.object_streams == crate::writer::ObjectStreamMode::Preserve {
             // Preserve containers retain their source object numbers in qpdf's
@@ -3364,6 +3418,7 @@ fn write_linearized_impl<R: Read + Seek>(
                 .filter(|r| {
                     !part4_member_set.contains(r)
                         && !part9_pages.contains(r)
+                        && !part9_thumbnail_pre_plain.contains(r)
                         && Some(*r) != plan.info_ref
                 })
                 .collect()

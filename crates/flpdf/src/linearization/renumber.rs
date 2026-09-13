@@ -13,7 +13,7 @@
 //! | M+1..N      | part8: other pages' shared objects (qpdf part8). |
 //! | N+1         | Pages tree (qpdf part9 head). Skipped if absent. |
 //! | N+2..O      | part9 outline objects (qpdf `lc_outlines`, classic). Skipped if absent. |
-//! | O+1..P      | Remaining `part4_rest`, object-number sorted — qpdf `lc_other` (includes `/Info` and `lc_thumbnail`). Skipped if absent. |
+//! | O+1..P      | Remaining `part4_rest` / Part-9 tail objects — qpdf `lc_other` (includes `/Info` and thumbnails demoted from a thumbnail category). Skipped if absent. |
 //! | param       | **Reserved** — linearization parameter dictionary (Part 1). |
 //! | catalog     | Catalog (qpdf `lc_root`). Skipped if absent. |
 //! | hint        | **Reserved** — primary hint stream. |
@@ -168,7 +168,7 @@ impl RenumberMap {
     /// 5. **Remaining `part4_rest`**, object-number sorted: qpdf's remaining
     ///    `lc_other` set. This includes `/Info` (`plan.info_ref`) — placed here in
     ///    original-object-number order, NOT in a reserved head slot — and
-    ///    `lc_thumbnail` objects. Refs already placed above (pages tree, outlines)
+    ///    thumbnail objects that qpdf demotes to `lc_other`. Refs already placed above (pages tree, outlines)
     ///    and `plan.root_ref` (kept first-half, promoted at step 7) are skipped so
     ///    each ref maps exactly once.
     /// 6. **Param dict** (reserved sentinel): linearization parameter dict.
@@ -679,9 +679,12 @@ impl RenumberMap {
                 emit_container(bi, &mut new_by_new_number);
             }
         }
-        // lc_thumbnail objects (non-member part4_rest streams) must be emitted
-        // AFTER the ObjStm containers, matching qpdf's part9-tail placement.
-        // Partition second_half_plain into pre- and post-container groups.
+        // Plain objects marked by `second_half_post_plain` belong to qpdf's
+        // post-container tail (for example ineligible outline streams and
+        // remaining lc_other objects). Thumbnail streams are deliberately not
+        // in that set: qpdf emits them in the Part-9 thumbnail phase before the
+        // generated ObjStm containers. Partition second_half_plain into pre-
+        // and post-container groups.
         let mut post_container_plain: Vec<ObjectRef> = Vec::new();
         for &original in &second_half_plain {
             if second_half_post_plain.contains(&original) {
@@ -701,7 +704,7 @@ impl RenumberMap {
         for bi in 0..second_half_batches.len() {
             emit_container(bi, &mut new_by_new_number);
         }
-        // Post-container plain (lc_thumbnail / part9 tail): after all containers.
+        // Post-container plain (part9 tail): after all containers.
         for &original in &post_container_plain {
             new_by_new_number.push(original);
         }

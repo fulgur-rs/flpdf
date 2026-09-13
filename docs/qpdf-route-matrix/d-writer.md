@@ -744,3 +744,33 @@ normalize Generate、`cli_qdf.rs` の QDF Generate/batch-cap、`writer_object_em
 の callback-child regressionで確認する。source ObjStm-bearing Preserveの QDF/normalize、
 explicit/copy encryption、encrypted input、linearized、PCLm、force-version-suppressed
 Generateはこの cutoverの対象外であり、残る mixed/bridge scopeとして扱う。
+
+## 2026-09-13: second-half ObjStm の within-part ordering (`flpdf-lz4a`)
+
+qpdf 11.9.0 の linearized Generate は、global even-split で作った ObjStm
+containerを `filterCompressedObjects` 後の `std::set<QPDFObjGen>` と各 part の
+走査規則で配置する。second half の大枠は `part7 → part8 → part9` で、part7 は
+page-by-page、part9 は Pages tree → private/shared thumbnails → outlines →
+残りの順である（`QPDF_optimization.cc:340-380`、
+`QPDF_linearization.cc:1223-1337`）。Generate container の ObjGen は
+`generateObjectStreams` の split順に新規発行される（`QPDFWriter.cc:1970-2006`）が、
+part7/part9 の category 間ではその順をそのまま使えない。
+
+そのため flpdf は Generate の part4 rest batches を qpdf の category rank
+（Pages、thumbnail private/shared、outlines、remaining `lc_other`）で stable sort し、
+同一 category 内だけ split順を保持する。private thumbnail の page番号も rank に含め、
+shared thumbnail は `others > 0` でも qpdf の `thumbs > 1` 分類を優先する。
+plain thumbnail streamも同じ分類で pre/post-container を決める。
+`second_half_container_anchors` と `RenumberMap::place_objstm_members_per_half` は
+この batch 順を plain object の配置へ反映する。`objstm-lin-otherpage-pages-200-100` は
+異なる非先頭 page の part7 containerを
+固定し、`objstm-lin-otherpage-private-250-0` は同一 page の複数 part7、
+`objstm-lin-outlines-multi-1-250` は同一 part9 category内の複数 containerを固定する。
+さらに `objstm-lin-part9-categories-74-225` は DFS では先に来る outlines containerと
+後続の Pages/rest containerを共存させ、qpdf が Pages/rest → outlines → remaining rest
+と出力する category 間順序を固定する。全 fixture の qpdf 11.9.0 goldenとの strict
+byte parity、container数、round-trip、`qpdf --check-linearization`、`qpdf --check` が
+成功した。shared thumbnail + document-other、Pages + shared thumbnail、single
+thumbnail + Catalog document-other の境界も strict parity で固定した。.48.87 の
+非 linearized pre-split/group境界検証と合わせ、h07n の
+linearized within-part ordering scopeは実装・実測済みである。

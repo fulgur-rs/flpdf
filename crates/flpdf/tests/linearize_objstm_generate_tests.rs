@@ -641,6 +641,137 @@ fn otherpage_others_two_container_generate_round_trips() {
     }
 }
 
+/// A three-container part7/part9 layout. Page 0 is fontless and page 1 owns
+/// 250 private fonts, so the global even split creates one Pages-tree part9
+/// container followed by two pure part7 containers for page 1. The strict
+/// qpdf gate pins the within-part order; this default test pins that the
+/// multi-container shape reaches the writer at all.
+#[test]
+fn otherpage_private_multi_container_generate_round_trips() {
+    let bytes = linearize_generate("objstm-lin-otherpage-private-250-0.pdf");
+    assert_eq!(
+        count_objstm_markers(&bytes),
+        3,
+        "otherpage-private generate must emit three second-half ObjStm containers"
+    );
+
+    let mut pdf = Pdf::open(Cursor::new(bytes)).expect("Pdf::open round-trip");
+    for r in canonical_object_refs(&mut pdf) {
+        pdf.resolve_canonical_object(r)
+            .unwrap_or_else(|e| panic!("object {r} did not resolve: {e}"));
+    }
+}
+
+/// Separate part7 containers for two different non-first pages must be emitted
+/// in page order even when a part8 container lies between them in split order.
+#[test]
+fn otherpage_pages_multi_container_generate_round_trips() {
+    let bytes = linearize_generate("objstm-lin-otherpage-pages-200-100.pdf");
+    assert_eq!(
+        count_objstm_markers(&bytes),
+        4,
+        "otherpage-pages generate must emit four generated ObjStm containers"
+    );
+
+    let mut pdf = Pdf::open(Cursor::new(bytes)).expect("Pdf::open round-trip");
+    for r in canonical_object_refs(&mut pdf) {
+        pdf.resolve_canonical_object(r)
+            .unwrap_or_else(|e| panic!("object {r} did not resolve: {e}"));
+    }
+}
+
+/// A three-container all-part9 layout. The outline chain is large enough to
+/// cross the even-split boundary three times, and outline-user precedence
+/// routes every generated container to qpdf part9.
+#[test]
+fn outlines_multi_container_generate_round_trips() {
+    let bytes = linearize_generate("objstm-lin-outlines-multi-1-250.pdf");
+    assert_eq!(
+        count_objstm_markers(&bytes),
+        3,
+        "outlines-multi generate must emit three part9 ObjStm containers"
+    );
+
+    let mut pdf = Pdf::open(Cursor::new(bytes)).expect("Pdf::open round-trip");
+    for r in canonical_object_refs(&mut pdf) {
+        pdf.resolve_canonical_object(r)
+            .unwrap_or_else(|e| panic!("object {r} did not resolve: {e}"));
+    }
+}
+
+/// Distinct part9 categories must survive a multi-container split. The input
+/// traversal visits outlines before the Pages tree and /Zzz rest chain, but
+/// qpdf's part9 order emits Pages/rest before outlines.
+#[test]
+fn part9_categories_multi_container_generate_round_trips() {
+    let bytes = linearize_generate("objstm-lin-part9-categories-74-225.pdf");
+    assert_eq!(
+        count_objstm_markers(&bytes),
+        4,
+        "part9 category fixture must emit four generated ObjStm containers"
+    );
+
+    let mut pdf = Pdf::open(Cursor::new(bytes)).expect("Pdf::open round-trip");
+    for r in canonical_object_refs(&mut pdf) {
+        pdf.resolve_canonical_object(r)
+            .unwrap_or_else(|e| panic!("object {r} did not resolve: {e}"));
+    }
+}
+
+/// A shared thumbnail can also carry a document-other reference. qpdf's
+/// `thumbs > 1` classification still puts it in the shared-thumbnail phase.
+#[test]
+fn part9_categories_shared_thumbnail_generate_round_trips() {
+    let bytes = linearize_generate("objstm-lin-part9-categories-thumb-74-225.pdf");
+    assert_eq!(
+        count_objstm_markers(&bytes),
+        4,
+        "part9 thumbnail fixture must emit four generated ObjStm containers"
+    );
+
+    let mut pdf = Pdf::open(Cursor::new(bytes)).expect("Pdf::open round-trip");
+    for r in canonical_object_refs(&mut pdf) {
+        pdf.resolve_canonical_object(r)
+            .unwrap_or_else(|e| panic!("object {r} did not resolve: {e}"));
+    }
+}
+
+/// With no /Meta edge, the Pages container is lc_other and the plain shared
+/// thumbnail follows it in qpdf's thumbnail phase.
+#[test]
+fn part9_pages_shared_thumbnail_generate_round_trips() {
+    let bytes = linearize_generate("objstm-lin-part9-pages-shared-thumb-74-225.pdf");
+    assert_eq!(
+        count_objstm_markers(&bytes),
+        4,
+        "part9 Pages/shared-thumbnail fixture must emit four generated ObjStm containers"
+    );
+
+    let mut pdf = Pdf::open(Cursor::new(bytes)).expect("Pdf::open round-trip");
+    for r in canonical_object_refs(&mut pdf) {
+        pdf.resolve_canonical_object(r)
+            .unwrap_or_else(|e| panic!("object {r} did not resolve: {e}"));
+    }
+}
+
+/// A single thumbnail with a Catalog document-other edge is remaining lc_other,
+/// not private-thumbnail; its plain stream must remain after the Pages batch.
+#[test]
+fn thumbnail_catalog_other_generate_round_trips() {
+    let bytes = linearize_generate("objstm-lin-thumbnail-catalog-other.pdf");
+    assert_eq!(
+        count_objstm_markers(&bytes),
+        1,
+        "thumbnail-catalog-other must emit one generated ObjStm container"
+    );
+
+    let mut pdf = Pdf::open(Cursor::new(bytes)).expect("Pdf::open round-trip");
+    for r in canonical_object_refs(&mut pdf) {
+        pdf.resolve_canonical_object(r)
+            .unwrap_or_else(|e| panic!("object {r} did not resolve: {e}"));
+    }
+}
+
 // Linearizing an ObjStm-bearing input must NOT leak the source's
 // /Type /ObjStm and /Type /XRef containers into the body. After the fix the
 // output carries exactly one freshly-generated ObjStm container and the two

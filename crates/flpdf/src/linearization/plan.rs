@@ -2514,13 +2514,12 @@ impl LinearizationPlan {
         // concatenating them (like the part3 regular/outlines split below) reorders only
         // ACROSS parts, leaving within-part even-split arrival order intact.
         //
-        // For part8 that within-part order is provably qpdf's: lc_other_page_shared
-        // is a std::set keyed on container objgen, and a generate-mode container's
-        // objgen comes from makeIndirectObject in even-split order — so set order ==
-        // even-split order. part7 (page order) and part9 (pages-tree / outlines /
-        // lc_other sub-order) only have one container each in the fixtures seen so
-        // far, so their within-part multi-container order has not been exercised;
-        // if such a case arises, a finer per-part sort may be needed.
+        // For part8 that within-part order is qpdf's `std::set<QPDFObjGen>` order:
+        // a generate-mode container's ObjGen comes from makeIndirectObject in
+        // even-split order. Part7 is ordered page by page, while part9 has its
+        // own Pages-tree / thumbnail / outlines / remaining-object sub-order.
+        // The latter two are sorted below after routing; stable ties retain the
+        // even-split order within one qpdf category.
         let mut part4_private: Vec<RoutedObjStmBatch> = Vec::new();
         let mut part4_shared: Vec<RoutedObjStmBatch> = Vec::new();
         let mut part4_rest: Vec<RoutedObjStmBatch> = Vec::new();
@@ -2539,6 +2538,22 @@ impl LinearizationPlan {
                 &mut part4_rest,
             );
         }
+        // qpdf's Part 9 emission is not simply the order in which generated
+        // containers arrive from the global DFS split. It emits the container
+        // carrying the `/Pages` user set first, then private thumbnails in page
+        // order, shared thumbnails, outlines, and finally the remaining
+        // `lc_other` containers (QPDF_linearization.cc:1279-1337). A container
+        // inherits the union of its member users (QPDF_optimization.cc:340-380),
+        // so outline membership has precedence over every later category and a
+        // `/Pages` member has precedence over a thumbnail/rest member in the
+        // `lc_other` category. Keep only the category rank in the key: stable
+        // sorting then preserves qpdf's ObjGen/even-split order within a
+        // category. Preserve mode has its own source-ObjGen anchor path and does
+        // not use this Generate-only ordering.
+        let part9_pages = optimization.objects_for_root_key(b"Pages");
+        part4_rest.sort_by_key(|batch| {
+            part9_category_order_key(optimization, &part9_pages, batch.members.iter())
+        });
         // Concatenate the buckets in part order (part7, part8, part9).
         let mut part4_batches = part4_private;
         part4_batches.extend(part4_shared);
@@ -2865,6 +2880,58 @@ fn is_document_other_user(user: &crate::optimization::ObjectUser) -> bool {
             key != b"Outlines" && !OPEN_DOCUMENT_CATALOG_KEYS.contains(&key.as_slice())
         }
         _ => false,
+    }
+}
+
+/// Return qpdf's Part-9 category and its page secondary key for a plain object
+/// or a generated ObjStm container. The category numbers are ordered as qpdf's
+/// `calculateLinearizationData` emits them: Pages (`0`), private thumbnails
+/// (`1`), shared thumbnails (`2`), outlines (`3`), and remaining `lc_other`
+/// (`4`). The `others == 0` gate belongs only to the private-thumbnail arm;
+/// qpdf's `thumbs > 1` arm still wins when document-other users are present
+/// (QPDF_linearization.cc:1128-1137).
+pub(crate) fn part9_category_order_key<'a>(
+    optimization: &crate::optimization::Optimization,
+    part9_pages: &BTreeSet<ObjectRef>,
+    members: impl IntoIterator<Item = &'a ObjectRef>,
+) -> (u8, u32) {
+    let member_refs: Vec<ObjectRef> = members.into_iter().copied().collect();
+    let users = optimization.users_for_members(member_refs.iter());
+    let has_outline = users.iter().any(is_outline_user);
+    let has_document_other = users.iter().any(is_document_other_user);
+    let thumbnail_pages: BTreeSet<u32> = users
+        .iter()
+        .filter_map(|user| match user {
+            crate::optimization::ObjectUser::Thumbnail(page) => Some(*page),
+            _ => None,
+        })
+        .collect();
+
+    if has_outline {
+        // qpdf categorizes in_outlines before lc_other and all page
+        // categories; this remains true when a container co-locates outline
+        // members with other users.
+        (3, 0)
+    } else if thumbnail_pages.len() == 1 && !has_document_other {
+        // qpdf emits private thumbnail sets page by page, then the
+        // shared-thumbnail set. Use the private page number as the secondary
+        // key; a category-only tie remains stable.
+        (1, *thumbnail_pages.first().expect("thumbnail page exists"))
+    } else if thumbnail_pages.len() > 1 {
+        // qpdf's `thumbs > 1` arm is not gated by `others == 0`. A
+        // thumbnail-shared container can therefore also carry a document-other
+        // member, and still precedes outlines and remaining lc_other.
+        (2, 0)
+    } else if member_refs
+        .iter()
+        .any(|member| part9_pages.contains(member))
+    {
+        // The Pages-tree promotion applies only to qpdf's lc_other category.
+        // A container with both `/Pages` and shared thumbnails was handled
+        // above, just as qpdf's `if (lc_other.count(og))` guard skips it.
+        (0, 0)
+    } else {
+        (4, 0)
     }
 }
 
