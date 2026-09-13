@@ -1351,6 +1351,16 @@ mod state_owner_tests {
 
         drop(third);
         assert_eq!(parents.len(), 0);
+
+        let dead_first = slot();
+        let dead_second = slot();
+        let mut dead = ContainmentParents::Many(Box::new(vec![
+            Rc::downgrade(&dead_first),
+            Rc::downgrade(&dead_second),
+        ]));
+        drop(dead_first);
+        drop(dead_second);
+        assert!(dead.live_parents().is_empty());
     }
 }
 
