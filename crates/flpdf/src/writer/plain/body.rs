@@ -93,11 +93,16 @@ impl LiveQueue {
     /// container instead of numbering the member as a plain indirect object,
     /// matching `QPDFWriter::enqueueObject`'s member branch
     /// (`libqpdf/QPDFWriter.cc:1071-1132`).
-    fn register_object_streams(
+    fn register_object_streams<R: Read + Seek>(
         &mut self,
+        pdf: &Pdf<R>,
         groups: &[crate::writer::object_streams::ObjectStreamGroup],
     ) {
         for group in groups {
+            let source_backed = matches!(
+                group,
+                crate::writer::object_streams::ObjectStreamGroup::SourceBacked { .. }
+            );
             let (source, members) = match group {
                 crate::writer::object_streams::ObjectStreamGroup::SourceBacked {
                     source,
@@ -118,13 +123,16 @@ impl LiveQueue {
             // so it is never treated as a compressed member at all. Mirror
             // that exclusion here rather than letting a later removed-ref
             // check race the eager numbering loop in `enqueue_handle`.
-            let retained: Vec<ObjectRef> = members
+            let mut retained: Vec<ObjectRef> = members
                 .iter()
                 .copied()
                 .filter(|member| !self.removed_refs.contains(member))
                 .collect();
             if retained.is_empty() {
                 continue;
+            }
+            if source_backed {
+                object_streams::sort_source_backed_members_qpdf_order(pdf, &mut retained);
             }
             for member in &retained {
                 self.member_to_container.insert(*member, source);
@@ -489,7 +497,7 @@ fn emit_live_body<R: Read + Seek + 'static>(
     } else {
         LiveQueue::new(removed_refs.clone())
     };
-    queue.register_object_streams(object_streams);
+    queue.register_object_streams(pdf, object_streams);
     if pclm {
         for handle in crate::writer::pclm::seed_handles(pdf)? {
             queue.enqueue_handle(pdf, handle)?;
@@ -3671,10 +3679,13 @@ mod object_emitter_tests {
         let container = ObjectRef::new(5, 0);
         let mut pdf = super::object_emitter_tests::pdf();
         let mut queue = LiveQueue::new(BTreeSet::new());
-        queue.register_object_streams(&[object_streams::ObjectStreamGroup::SourceBacked {
-            source: container,
-            members: vec![container],
-        }]);
+        queue.register_object_streams(
+            &pdf,
+            &[object_streams::ObjectStreamGroup::SourceBacked {
+                source: container,
+                members: vec![container],
+            }],
+        );
 
         let handle = pdf.get_object_handle(container);
         assert_eq!(queue.enqueue_handle(&mut pdf, handle)?, None);
@@ -3683,16 +3694,19 @@ mod object_emitter_tests {
         // A two-container cycle takes the same path one level deeper.
         let other = ObjectRef::new(6, 0);
         let mut queue = LiveQueue::new(BTreeSet::new());
-        queue.register_object_streams(&[
-            object_streams::ObjectStreamGroup::SourceBacked {
-                source: container,
-                members: vec![other],
-            },
-            object_streams::ObjectStreamGroup::SourceBacked {
-                source: other,
-                members: vec![container],
-            },
-        ]);
+        queue.register_object_streams(
+            &pdf,
+            &[
+                object_streams::ObjectStreamGroup::SourceBacked {
+                    source: container,
+                    members: vec![other],
+                },
+                object_streams::ObjectStreamGroup::SourceBacked {
+                    source: other,
+                    members: vec![container],
+                },
+            ],
+        );
         let handle = pdf.get_object_handle(container);
         assert_eq!(queue.enqueue_handle(&mut pdf, handle)?, None);
         assert!(queue.old_to_new.is_empty());
@@ -3703,11 +3717,15 @@ mod object_emitter_tests {
     fn register_object_streams_skips_a_group_whose_members_are_all_removed() {
         let source = ObjectRef::new(3, 0);
         let member = ObjectRef::new(2, 0);
+        let pdf = super::object_emitter_tests::pdf();
         let mut queue = LiveQueue::new([member].into_iter().collect());
-        queue.register_object_streams(&[object_streams::ObjectStreamGroup::SourceBacked {
-            source,
-            members: vec![member],
-        }]);
+        queue.register_object_streams(
+            &pdf,
+            &[object_streams::ObjectStreamGroup::SourceBacked {
+                source,
+                members: vec![member],
+            }],
+        );
         assert!(queue.member_to_container.is_empty());
         assert!(queue.container_to_members.is_empty());
     }
@@ -3718,10 +3736,13 @@ mod object_emitter_tests {
         let member = ObjectRef::new(2, 0);
         let mut pdf = super::object_emitter_tests::pdf();
         let mut queue = LiveQueue::new([container].into_iter().collect());
-        queue.register_object_streams(&[object_streams::ObjectStreamGroup::SourceBacked {
-            source: container,
-            members: vec![member],
-        }]);
+        queue.register_object_streams(
+            &pdf,
+            &[object_streams::ObjectStreamGroup::SourceBacked {
+                source: container,
+                members: vec![member],
+            }],
+        );
 
         let handle = pdf.get_object_handle(container);
         let output = queue
