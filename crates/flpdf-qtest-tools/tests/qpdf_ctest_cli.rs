@@ -54,6 +54,33 @@ fn encrypted_fixture(name: &str) -> std::path::PathBuf {
         .join(name)
 }
 
+fn damaged_encrypted_fixture(directory: &Path) -> PathBuf {
+    let input = directory.join("damaged-encrypted.pdf");
+    let mut bytes = fs::read(encrypted_fixture("v1-rc4-40-r2.pdf"))
+        .expect("read encrypted fixture for damage injection");
+    let marker = b"startxref\n323\n";
+    let marker_offset = bytes
+        .windows(marker.len())
+        .position(|window| window == marker)
+        .expect("encrypted fixture startxref marker");
+    bytes[marker_offset + b"startxref\n".len()..][..3].copy_from_slice(b"0  ");
+    fs::write(&input, bytes).expect("write damaged encrypted fixture");
+    input
+}
+
+fn missing_root_fixture(directory: &Path) -> PathBuf {
+    let input = directory.join("missing-root.pdf");
+    let mut bytes = fs::read(minimal_pdf()).expect("read minimal fixture for root removal");
+    let marker = b"/Root 1 0 R";
+    let marker_offset = bytes
+        .windows(marker.len())
+        .position(|window| window == marker)
+        .expect("minimal fixture root marker");
+    bytes.drain(marker_offset..marker_offset + marker.len());
+    fs::write(&input, bytes).expect("write missing-root fixture");
+    input
+}
+
 fn objstm_fixture() -> std::path::PathBuf {
     std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"))
         .join("../..")
@@ -141,6 +168,171 @@ fn qpdf_ctest_2_reports_invalid_password_through_the_c_api_error_surface() {
         .success()
         .stdout(expected)
         .stderr("");
+    assert!(
+        !output.exists(),
+        "test02 must not initialize a writer after auth failure"
+    );
+}
+
+#[test]
+fn qpdf_ctest_2_reports_input_open_failure_through_the_c_api_error_surface() {
+    let directory = tempfile::tempdir().expect("temporary directory");
+    let input = directory.path().join("missing-input.pdf");
+    let output = directory.path().join("unused.pdf");
+    let input_name = input.to_str().expect("input path is UTF-8");
+
+    let result = Command::cargo_bin("qpdf-ctest")
+        .expect("qpdf-ctest binary")
+        .args(["2", input_name, "", output.to_str().unwrap()])
+        .output()
+        .expect("qpdf-ctest should spawn");
+
+    assert!(result.status.success());
+    let stdout = String::from_utf8_lossy(&result.stdout);
+    assert!(stdout.starts_with("error: "), "{stdout}");
+    assert!(stdout.contains("\n  code: 2\n"), "{stdout}");
+    assert!(stdout.contains("\n  file: \n"), "{stdout}");
+    assert!(stdout.contains("\n  pos: 0\n"), "{stdout}");
+    assert!(
+        stdout.contains(&format!("\n  text: open {input_name}: ")),
+        "{stdout}"
+    );
+    assert!(stdout.ends_with("C test 2 done\n"), "{stdout}");
+    assert!(result.stderr.is_empty());
+    assert!(
+        !output.exists(),
+        "test02 must not create output after input failure"
+    );
+}
+
+#[test]
+fn qpdf_ctest_2_reports_writer_open_failure_through_the_c_api_error_surface() {
+    let directory = tempfile::tempdir().expect("temporary directory");
+    let input = minimal_pdf();
+    let output = directory.path().join("output-directory");
+    fs::create_dir(&output).expect("create output directory");
+    let output_name = output.to_str().expect("output path is UTF-8");
+
+    let result = Command::cargo_bin("qpdf-ctest")
+        .expect("qpdf-ctest binary")
+        .args(["2", input.to_str().unwrap(), "", output_name])
+        .output()
+        .expect("qpdf-ctest should spawn");
+
+    assert!(result.status.success());
+    let stdout = String::from_utf8_lossy(&result.stdout);
+    assert!(stdout.starts_with("error: "), "{stdout}");
+    assert!(stdout.contains("\n  code: 2\n"), "{stdout}");
+    assert!(stdout.contains("\n  file: \n"), "{stdout}");
+    assert!(stdout.contains("\n  pos: 0\n"), "{stdout}");
+    assert!(
+        stdout.contains(&format!("\n  text: open {output_name}: ")),
+        "{stdout}"
+    );
+    assert!(stdout.ends_with("C test 2 done\n"), "{stdout}");
+    assert!(result.stderr.is_empty());
+}
+
+#[test]
+fn qpdf_ctest_2_replays_open_warnings_before_writer_open_failure() {
+    let directory = tempfile::tempdir().expect("temporary directory");
+    let input = repairable_input_fixture();
+    let output = directory.path().join("output-directory");
+    fs::create_dir(&output).expect("create output directory");
+
+    let result = Command::cargo_bin("qpdf-ctest")
+        .expect("qpdf-ctest binary")
+        .args([
+            "2",
+            input.to_str().expect("input path is UTF-8"),
+            "",
+            output.to_str().unwrap(),
+        ])
+        .output()
+        .expect("qpdf-ctest should spawn");
+
+    assert!(result.status.success());
+    let stdout = String::from_utf8_lossy(&result.stdout);
+    assert_eq!(stdout.matches("warning: ").count(), 3, "{stdout}");
+    assert!(stdout.contains("text: file is damaged"), "{stdout}");
+    assert!(stdout.contains("text: can't find startxref"), "{stdout}");
+    assert!(
+        stdout.contains("text: Attempting to reconstruct cross-reference table"),
+        "{stdout}"
+    );
+    let error_start = stdout.find("error: ").expect("writer error report");
+    assert!(
+        stdout[..error_start].contains("warning: "),
+        "warnings must precede writer error: {stdout}"
+    );
+    assert!(stdout[error_start..].contains("  code: 2\n"), "{stdout}");
+    assert!(stdout.ends_with("C test 2 done\n"), "{stdout}");
+    assert!(result.stderr.is_empty());
+}
+
+#[test]
+fn qpdf_ctest_2_reports_writer_failure_through_the_c_api_error_surface() {
+    let directory = tempfile::tempdir().expect("temporary directory");
+    let input = missing_root_fixture(directory.path());
+    let output = directory.path().join("partial-output.pdf");
+    let input_name = input.to_str().expect("input path is UTF-8");
+
+    let result = Command::cargo_bin("qpdf-ctest")
+        .expect("qpdf-ctest binary")
+        .args(["2", input_name, "", output.to_str().unwrap()])
+        .output()
+        .expect("qpdf-ctest should spawn");
+
+    assert!(result.status.success());
+    let stdout = String::from_utf8_lossy(&result.stdout);
+    assert_eq!(
+        stdout,
+        format!(
+            "error: {input_name}: unable to find /Root dictionary\n  code: 5\n  file: {input_name}\n  pos: 0\n  text: unable to find /Root dictionary\nC test 2 done\n"
+        )
+    );
+    assert!(result.stderr.is_empty());
+    assert!(
+        output.is_file(),
+        "qpdf creates the output at init_write time"
+    );
+    assert_eq!(fs::metadata(output).unwrap().len(), 0);
+}
+
+#[test]
+fn qpdf_ctest_2_replays_open_warnings_before_invalid_password() {
+    let directory = tempfile::tempdir().expect("temporary directory");
+    let input = damaged_encrypted_fixture(directory.path());
+    let output = directory.path().join("unused.pdf");
+
+    let result = Command::cargo_bin("qpdf-ctest")
+        .expect("qpdf-ctest binary")
+        .args([
+            "2",
+            input.to_str().expect("input path is UTF-8"),
+            "wrong",
+            output.to_str().unwrap(),
+        ])
+        .output()
+        .expect("qpdf-ctest should spawn");
+
+    assert!(result.status.success());
+    let stdout = String::from_utf8_lossy(&result.stdout);
+    assert_eq!(stdout.matches("warning: ").count(), 3, "{stdout}");
+    assert!(stdout.contains("text: file is damaged"), "{stdout}");
+    assert!(stdout.contains("text: can't find startxref"), "{stdout}");
+    assert!(
+        stdout.contains("text: Attempting to reconstruct cross-reference table"),
+        "{stdout}"
+    );
+    let warning_end = stdout.rfind("warning: ").expect("warning report");
+    let error_start = stdout.find("error: ").expect("error report");
+    assert!(warning_end < error_start, "{stdout}");
+    assert!(stdout.contains("error: "), "{stdout}");
+    assert!(stdout.contains("  code: 4\n"), "{stdout}");
+    assert!(stdout.contains("  text: invalid password\n"), "{stdout}");
+    assert!(stdout.ends_with("C test 2 done\n"), "{stdout}");
+    assert!(result.stderr.is_empty());
     assert!(
         !output.exists(),
         "test02 must not initialize a writer after auth failure"

@@ -2124,6 +2124,25 @@ Rust consumerへ公開し、`qpdfjob_ctest.rs` がこの wrapper の継続順序
 担う。通常の `QPDFJob::run` の `UsageError` contractや、CLIの別の usage
 表示経路は変更しない。
 
+### `qpdf-ctest` test02 の C API 報告境界
+
+qpdf の `test02` は `qpdf_read` → `qpdf_init_write` →
+`qpdf_write` の各呼び出しを `qpdf-c.cc` の `trap_errors`
+境界に置き、最後に `report_errors` で retained warning をすべて drain
+してから terminal error を1件出し、`C test 2 done` を印字する
+（`qpdf/qpdf-ctest.c:35-68,161-170`、`libqpdf/qpdf-c.cc:68-89,266-282`）。
+入力ファイルの open と writer の設定・write 失敗もこの同じ報告境界に含まれる。
+
+`crates/flpdf-qtest-tools/src/bin/qpdf_ctest.rs::run_test2` は、入力 open
+から `PdfWriter` の output 設定・write までを一つの lifecycle result に
+収め、`Test2Failure` が writer failure 時点の `Pdf::repair_diagnostics`
+を保持する。`File::open` と `Error::FileIo` は qpdf の
+`QPDFSystemError` 相当の空の file/pos と `open <path>: <system error>`
+detail に投影し、その他の失敗と `OpenFailure` は既存の `QpdfExc`
+フィールドへ委譲する。これにより bad-password を含むすべての失敗で
+warning → terminal error → completion の順序を保つ。C ABI は実装せず、PDF の
+reader/writer semantics は canonical `Pdf` / `PdfWriter` が所有する。
+
 ## 10. インフラ
 
 | qpdf | 行 | flpdf | 状態 |

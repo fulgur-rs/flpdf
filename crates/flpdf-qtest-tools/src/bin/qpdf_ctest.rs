@@ -10,9 +10,9 @@
 use flpdf::job::{JsonJobOptions, JsonJobOutput, JsonStreamData, QPDFJob};
 use flpdf::json_inspect::{DecodeLevel as JsonDecodeLevel, JsonKey, JsonObjectSelector};
 use flpdf::{
-    DecodeLevel, EncryptMethod, EncryptParams, EncryptedError, Error, Pdf, PdfOpenOptions,
-    PdfWriter, Permissions, PermissionsConfig, PrintPermission, QpdfErrorCode, QpdfExc,
-    R2PermissionsConfig, Result,
+    DecodeLevel, Diagnostics, EncryptMethod, EncryptParams, EncryptedError, Error, Pdf,
+    PdfOpenOptions, PdfWriter, Permissions, PermissionsConfig, PrintPermission, QpdfErrorCode,
+    QpdfExc, R2PermissionsConfig, Result,
 };
 use std::env;
 use std::fs::File;
@@ -138,43 +138,17 @@ fn open_input(input_arg: &std::ffi::OsStr, password_arg: &std::ffi::OsStr) -> Re
     Pdf::open_with_options(File::open(&input)?, read_options(&input, password))
 }
 
-fn is_bad_password(error: &Error) -> bool {
-    match error {
-        Error::Encrypted(EncryptedError::BadPassword) => true,
-        Error::OpenFailure { source, .. } => is_bad_password(source),
-        _ => false,
-    }
-}
-
-/// Write `path`'s raw bytes to `output`, matching `qpdf_get_error_filename`'s
-/// verbatim `argv` filename (`qpdf-ctest.c:40`) rather than a lossy
-/// UTF-8 projection that would replace non-UTF-8 bytes with U+FFFD before
-/// the name ever reaches the terminal.
-#[cfg(unix)]
-fn write_native_path(output: &mut impl Write, path: &std::path::Path) -> Result<()> {
-    output.write_all(std::os::unix::ffi::OsStrExt::as_bytes(path.as_os_str()))?;
-    Ok(())
-}
-
-#[cfg(not(unix))]
-fn write_native_path(output: &mut impl Write, path: &std::path::Path) -> Result<()> {
-    write!(output, "{}", path.display())?;
-    Ok(())
-}
-
-fn report_invalid_password(input: &std::path::Path) -> Result<()> {
-    let stdout = std::io::stdout();
-    let mut stdout = stdout.lock();
-    write!(stdout, "error: ")?;
-    write_native_path(&mut stdout, input)?;
-    writeln!(stdout, ": invalid password")?;
-    writeln!(stdout, "  code: 4")?;
-    write!(stdout, "  file: ")?;
-    write_native_path(&mut stdout, input)?;
-    writeln!(stdout)?;
-    writeln!(stdout, "  pos: 0")?;
-    writeln!(stdout, "  text: invalid password")?;
-    Ok(())
+fn qpdf_system_error_detail(
+    operation: &str,
+    path: &std::path::Path,
+    source: &std::io::Error,
+) -> Vec<u8> {
+    let mut detail = operation.as_bytes().to_vec();
+    detail.push(b' ');
+    detail.extend_from_slice(&path_description(path));
+    detail.extend_from_slice(b": ");
+    detail.extend_from_slice(source.to_string().as_bytes());
+    detail
 }
 
 /// Print qpdf-ctest's portable error object projection. This is the Rust
@@ -242,6 +216,17 @@ fn qpdf_exception_from_error(input: &Path, error: &Error) -> QpdfExc {
             0,
             message.as_bytes(),
         ),
+        Error::FileIo {
+            operation,
+            path,
+            source,
+        } => QpdfExc::new(
+            QpdfErrorCode::System,
+            b"",
+            b"",
+            0,
+            qpdf_system_error_detail(operation, path, source),
+        ),
         // The remaining arms are the ones qpdf never raises as a `QPDFExc`.
         // `trap_errors` rebuilds them from a caught `std::runtime_error` or
         // `std::exception` as `QPDFExc(code, "", "", 0, e.what())`
@@ -277,24 +262,51 @@ fn qpdf_exception_from_error(input: &Path, error: &Error) -> QpdfExc {
 }
 
 fn write_pdf_diagnostics<R: Read + Seek>(pdf: &Pdf<R>, output: &mut impl Write) -> Result<()> {
-    for warning in pdf.repair_diagnostics().entries() {
+    write_diagnostics(&pdf.repair_diagnostics(), output)
+}
+
+fn write_diagnostics(diagnostics: &Diagnostics, output: &mut impl Write) -> Result<()> {
+    for warning in diagnostics.entries() {
         write_c_api_error(output, b"warning", warning)?;
     }
     Ok(())
 }
 
-fn write_open_error_report(input: &Path, error: &Error, output: &mut impl Write) -> Result<()> {
+struct Test2Failure {
+    error: Error,
+    diagnostics: Option<Diagnostics>,
+}
+
+fn write_error_report(
+    input: &Path,
+    error: &Error,
+    diagnostics: Option<&Diagnostics>,
+    output: &mut impl Write,
+) -> Result<()> {
     if let Some((source, diagnostics)) = error.open_failure() {
-        for warning in diagnostics.entries() {
-            write_c_api_error(output, b"warning", warning)?;
-        }
+        write_diagnostics(diagnostics, output)?;
         let terminal = qpdf_exception_from_error(input, source);
         write_c_api_error(output, b"error", &terminal)?;
     } else {
+        if let Some(diagnostics) = diagnostics {
+            write_diagnostics(diagnostics, output)?;
+        }
         let terminal = qpdf_exception_from_error(input, error);
         write_c_api_error(output, b"error", &terminal)?;
     }
     Ok(())
+}
+
+fn write_open_error_report(input: &Path, error: &Error, output: &mut impl Write) -> Result<()> {
+    write_error_report(input, error, None, output)
+}
+
+fn write_test2_error_report(
+    input: &Path,
+    failure: &Test2Failure,
+    output: &mut impl Write,
+) -> Result<()> {
+    write_error_report(input, &failure.error, failure.diagnostics.as_ref(), output)
 }
 
 /// Run qpdf's C API authentication/error case (`qpdf-ctest.c:test02`).
@@ -309,42 +321,65 @@ fn run_test2(
 ) -> Result<()> {
     let input = PathBuf::from(input_arg);
     let password = password_bytes(password_arg);
-    let result = Pdf::open_with_options(
-        File::open(&input)?,
-        PdfOpenOptions {
-            password,
-            suppress_password_recovery: true,
-            suppress_warnings: true,
-            description: path_description(&input),
-            ..PdfOpenOptions::default()
-        },
-    );
-    match result {
-        Ok(mut pdf) => {
-            let mut writer = PdfWriter::new(&mut pdf);
-            writer.set_output_file(PathBuf::from(output_arg))?;
-            writer.set_static_id(true);
-            writer.write()?;
+    // qpdf-ctest.c:test02 calls qpdf_read, qpdf_init_write, and qpdf_write
+    // through the C API's trap_errors boundary. Keep every corresponding
+    // Rust operation inside one result so all PDF and writer failures reach
+    // report_errors' warning/error projection and the helper still returns
+    // process success (`qpdf/qpdf-ctest.c:161-170`, `libqpdf/qpdf-c.cc:68-89`).
+    let result: std::result::Result<Pdf<File>, Box<Test2Failure>> = (|| {
+        let file = File::open(&input).map_err(|error| {
+            Box::new(Test2Failure {
+                error: Error::SystemBytes(qpdf_system_error_detail("open", &input, &error)),
+                diagnostics: None,
+            })
+        })?;
+        let mut pdf = Pdf::open_with_options(
+            file,
+            PdfOpenOptions {
+                password,
+                suppress_password_recovery: true,
+                suppress_warnings: true,
+                description: path_description(&input),
+                ..PdfOpenOptions::default()
+            },
+        )
+        .map_err(|error| {
+            Box::new(Test2Failure {
+                error,
+                diagnostics: None,
+            })
+        })?;
+        let mut writer = PdfWriter::new(&mut pdf);
+        if let Err(error) = writer.set_output_file(PathBuf::from(output_arg)) {
             drop(writer);
-            let stdout = std::io::stdout();
-            let mut stdout = stdout.lock();
+            return Err(Box::new(Test2Failure {
+                error,
+                diagnostics: Some(pdf.repair_diagnostics()),
+            }));
+        }
+        writer.set_static_id(true);
+        if let Err(error) = writer.write() {
+            drop(writer);
+            return Err(Box::new(Test2Failure {
+                error,
+                diagnostics: Some(pdf.repair_diagnostics()),
+            }));
+        }
+        drop(writer);
+        Ok(pdf)
+    })();
+    let stdout = std::io::stdout();
+    let mut stdout = stdout.lock();
+    match result {
+        Ok(pdf) => {
             write_pdf_diagnostics(&pdf, &mut stdout)?;
-            println!("C test 2 done");
-            Ok(())
         }
-        Err(error) if is_bad_password(&error) => {
-            report_invalid_password(&input)?;
-            println!("C test 2 done");
-            Ok(())
-        }
-        Err(error) => {
-            let stdout = std::io::stdout();
-            let mut stdout = stdout.lock();
-            write_open_error_report(&input, &error, &mut stdout)?;
-            println!("C test 2 done");
-            Ok(())
+        Err(failure) => {
+            write_test2_error_report(&input, &failure, &mut stdout)?;
         }
     }
+    writeln!(stdout, "C test 2 done")?;
+    Ok(())
 }
 
 /// Run qpdf-ctest.c:test10. The raw C API disables recovery before reading,
