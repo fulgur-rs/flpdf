@@ -327,8 +327,8 @@ fn object_selected(
                 selector,
                 JsonObjectSelector::Object { number, generation }
                     if zero_object_is_all && *number == 0
-                        || i64::from(*number) == object_gen.get_obj()
-                            && i64::from(*generation) == object_gen.get_gen()
+                        || i64::from(*number) == i64::from(object_gen.get_obj())
+                            && i64::from(*generation) == i64::from(object_gen.get_gen())
             )
         })
 }

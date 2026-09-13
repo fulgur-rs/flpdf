@@ -391,7 +391,7 @@ impl XrefRegistration {
     fn highest_raw_object_number(&self) -> i64 {
         self.raw_entries
             .keys()
-            .map(|key| key.get_obj())
+            .map(|key| i64::from(key.get_obj()))
             .max()
             .unwrap_or(0)
     }

@@ -236,12 +236,7 @@ impl CanonicalCatalogFirstRenumber {
         while let Some(source) = queue.pop_front() {
             let handle = raw_sources
                 .get(&source)
-                .map(|raw| {
-                    pdf.get_object_handle_by_raw_identity(
-                        raw.get_obj() as i32,
-                        raw.get_gen() as i32,
-                    )
-                })
+                .map(|raw| pdf.get_object_handle_by_raw_identity(raw.get_obj(), raw.get_gen()))
                 .unwrap_or_else(|| pdf.get_object_handle(source));
             let mut found = Vec::new();
             collect_canonical_children(pdf, &handle, 0, skip_length, &mut found)?;
@@ -884,10 +879,7 @@ impl ObjectStreamRenumber {
                     let handle = raw_sources
                         .get(&cur)
                         .map(|raw| {
-                            pdf.get_object_handle_by_raw_identity(
-                                raw.get_obj() as i32,
-                                raw.get_gen() as i32,
-                            )
+                            pdf.get_object_handle_by_raw_identity(raw.get_obj(), raw.get_gen())
                         })
                         .unwrap_or_else(|| pdf.get_object_handle(cur));
                     let mut found = Vec::new();
@@ -1090,6 +1082,20 @@ mod tests {
             Some(ObjectRef::new(u32::MAX - 5, 0))
         );
         assert_eq!(pdf.get_all_objects().unwrap().len(), 2);
+    }
+
+    #[test]
+    fn preserve_walk_reuses_raw_qpdf_identity_for_an_ordinary_seed() {
+        let mut pdf = Pdf::open(Cursor::new(raw_stream_pdf())).expect("open raw stream PDF");
+        let local_ref = writer_local_raw_ref(QpdfObjGen::new(5, 65_536)).unwrap();
+
+        let renumber = ObjectStreamRenumber::build(&mut pdf, &[], false, &BTreeSet::new(), true)
+            .expect("preserve walk should resolve raw source seeds");
+
+        assert_eq!(
+            renumber.raw_source_for(local_ref),
+            Some(QpdfObjGen::new(5, 65_536))
+        );
     }
 
     #[test]

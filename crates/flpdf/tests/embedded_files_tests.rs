@@ -510,7 +510,7 @@ fn insert_does_not_allocate_for_direct_names_dictionary() {
         .expect("make Names direct");
     // Register the highest possible identity so any accidental allocation
     // still fails, without using the legacy Object cache setter.
-    let _max_handle = pdf.get_object_handle(ObjectRef::new(u32::MAX, 0));
+    let _max_handle = pdf.get_object_handle(ObjectRef::new(i32::MAX as u32, 0));
 
     assert!(insert_embedded_file(&mut pdf, b"alpha", ObjectRef::new(4, 0)).is_ok());
 }
