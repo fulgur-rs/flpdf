@@ -490,6 +490,13 @@ jobs:
       - name: Install qpdf
         run: bash scripts/ci-apt-install.sh qpdf
 
+      # PCLm's source-backed differential tests use the same pinned qpdf tree
+      # as the local oracle checks. The binary alone is insufficient: without
+      # this read-only source worktree those tests intentionally skip and the
+      # changed PCLm paths disappear from patch coverage.
+      - name: Fetch pinned qpdf source
+        run: bash scripts/fetch-qpdf-source.sh
+
       # Output to target/ (gitignored) so the working tree stays clean for the
       # patch-coverage gate's dirty-tree check.
       #
