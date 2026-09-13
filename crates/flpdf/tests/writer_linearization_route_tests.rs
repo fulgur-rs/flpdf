@@ -120,7 +120,7 @@ fn prepare_file_for_write_is_owned_by_the_common_writer_boundary() {
     let linearization_source = include_str!("../src/linearization/writer.rs").replace("\r\n", "\n");
     let linearization_route = linearization_source
         .split_once("pub(crate) fn write_linearized_for_pdf_writer")
-        .and_then(|(_, rest)| rest.split_once("/// Write the pass-1 body"))
+        .and_then(|(_, rest)| rest.split_once("/// Append qpdf's pass-1 debugging comments"))
         .map(|(function, _)| function)
         .expect("PdfWriter linearization route exists");
     assert!(

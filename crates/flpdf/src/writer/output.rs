@@ -447,7 +447,8 @@ mod tests {
         let mut target = VecOutputTarget::default();
         let mut sink = OutputSink::new(&mut target);
         sink.begin_digest();
-        sink.write_bytes(b"pass-1").expect("pass-1 bytes are accepted");
+        sink.write_bytes(b"pass-1")
+            .expect("pass-1 bytes are accepted");
 
         let digest = sink.take_digest().expect("pass-1 digest is enabled");
         let expected: [u8; 16] = md5::Md5::digest(b"pass-1").into();
