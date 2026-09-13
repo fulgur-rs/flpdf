@@ -76,12 +76,102 @@ use crate::writer::object_streams::{
 };
 use crate::writer::{
     decrement_progress_event, effective_pdf_version_and_ext, effective_stream_policy,
-    report_progress_event, serialize::xref_stream, CompressStreams, NewlineBeforeEndstream,
-    ObjectWriterEmission, WriterOptions, WriterResult,
+    output::{OutputSink, OutputTarget},
+    report_progress_event,
+    serialize::xref_stream,
+    CompressStreams, NewlineBeforeEndstream, ObjectWriterEmission, WriterOptions, WriterResult,
 };
 use crate::{ObjectHandle, ObjectRef, Pdf, Result};
 
 const EBADF_ERRNO: i32 = 9;
+
+/// Forward-only destination for qpdf's linearization pass 1.
+///
+/// qpdf selects either `pushDiscardFilter` or a buffered `Pl_StdioFile` for
+/// this pass (`QPDFWriter.cc:2656-2676`). Keeping the destination separate from
+/// [`OutputSink`] lets the sink count and digest accepted bytes without owning a
+/// second document-sized buffer.
+enum Pass1Destination {
+    Discard,
+    File {
+        path: std::path::PathBuf,
+        writer: std::io::BufWriter<std::fs::File>,
+    },
+}
+
+struct Pass1OutputTarget {
+    destination: Pass1Destination,
+}
+
+impl Pass1OutputTarget {
+    #[cfg(test)]
+    fn discard() -> Self {
+        Self {
+            destination: Pass1Destination::Discard,
+        }
+    }
+
+    fn new(path: Option<&Path>) -> Result<Self> {
+        let destination = match path {
+            Some(path) => {
+                let file = std::fs::File::create(path)
+                    .map_err(|source| crate::Error::file_io("open", path, source))?;
+                Pass1Destination::File {
+                    path: path.to_path_buf(),
+                    writer: std::io::BufWriter::new(file),
+                }
+            }
+            None => Pass1Destination::Discard,
+        };
+        Ok(Self { destination })
+    }
+
+    fn write_debug_comments(&mut self, comments: &[u8]) {
+        if let Pass1Destination::File { writer, .. } = &mut self.destination {
+            write_pass1_debug_comments(writer, comments);
+        }
+    }
+}
+
+impl OutputTarget for Pass1OutputTarget {
+    fn write_chunk(&mut self, bytes: &[u8]) -> std::io::Result<usize> {
+        match &mut self.destination {
+            Pass1Destination::Discard => Ok(bytes.len()),
+            Pass1Destination::File { path, writer } => writer
+                .write_all(bytes)
+                .map(|()| bytes.len())
+                .map_err(|source| {
+                    std::io::Error::new(
+                        source.kind(),
+                        format!("write {}: {source}", path.display()),
+                    )
+                }),
+        }
+    }
+
+    fn finish_segment(&mut self) -> Result<()> {
+        Ok(())
+    }
+
+    fn finish_document(&mut self) -> Result<()> {
+        match &mut self.destination {
+            Pass1Destination::Discard => Ok(()),
+            Pass1Destination::File { writer, .. } => match writer.flush() {
+                // cov:ignore-start: safe Rust cannot manufacture a BufWriter
+                // around a closed descriptor; qpdf's Pl_StdioFile keeps this
+                // EBADF guard for externally closed FILE handles.
+                Err(source) if source.raw_os_error() == Some(EBADF_ERRNO) => {
+                    Err(crate::Error::Internal(
+                        "linearization pass1: Pl_StdioFile::finish: stream already closed"
+                            .to_string(),
+                    ))
+                }
+                // cov:ignore-end
+                Ok(()) | Err(_) => Ok(()),
+            },
+        }
+    }
+}
 
 // ---------------------------------------------------------------------------
 // ObjStm layout
@@ -298,7 +388,7 @@ impl ObjStmLayout {
 /// the live member handles and apply qpdf's global structural-stream
 /// compression policy.
 fn append_objstm_container_object<R: Read + Seek>(
-    bytes: &mut Vec<u8>,
+    out: &mut OutputSink<'_>,
     container: &ObjStmContainer,
     renumber: &RenumberMap,
     pdf: &mut Pdf<R>,
@@ -367,53 +457,39 @@ fn append_objstm_container_object<R: Read + Seek>(
     // only the surrounding order and object-stream framing remain raw layout.
     // Its newline-before-endstream setting applies to this container exactly
     // as it does to ordinary body streams (QPDFWriter.cc:1752-1755).
-    let offset = bytes.len();
-    bytes.extend_from_slice(format!("{} 0 obj\n", container.container_new_num).as_bytes());
-    bytes.extend_from_slice(b"<< /Type ");
-    crate::writer::output::with_buffer_sink(bytes, |out| {
-        stream_dict.try_get_key(b"/Type")?.write_object(out)
-    })?;
-    bytes.extend_from_slice(b" /Length ");
-    crate::writer::output::with_buffer_sink(bytes, |out| {
-        stream_dict.try_get_key(b"/Length")?.write_object(out)
-    })?;
+    let offset = out.position_usize()?;
+    out.write_bytes(format!("{} 0 obj\n", container.container_new_num).as_bytes())?;
+    out.write_bytes(b"<< /Type ")?;
+    stream_dict.try_get_key(b"/Type")?.write_object(out)?;
+    out.write_bytes(b" /Length ")?;
+    stream_dict.try_get_key(b"/Length")?.write_object(out)?;
     if filtered {
-        bytes.extend_from_slice(b" /Filter ");
-        crate::writer::output::with_buffer_sink(bytes, |out| {
-            stream_dict.try_get_key(b"/Filter")?.write_object(out)
-        })?;
+        out.write_bytes(b" /Filter ")?;
+        stream_dict.try_get_key(b"/Filter")?.write_object(out)?;
     }
-    bytes.extend_from_slice(b" /N ");
-    crate::writer::output::with_buffer_sink(bytes, |out| {
-        stream_dict.try_get_key(b"/N")?.write_object(out)
-    })?;
-    bytes.extend_from_slice(b" /First ");
-    crate::writer::output::with_buffer_sink(bytes, |out| {
-        stream_dict.try_get_key(b"/First")?.write_object(out)
-    })?;
-    bytes.extend_from_slice(b" >>");
+    out.write_bytes(b" /N ")?;
+    stream_dict.try_get_key(b"/N")?.write_object(out)?;
+    out.write_bytes(b" /First ")?;
+    stream_dict.try_get_key(b"/First")?.write_object(out)?;
+    out.write_bytes(b" >>")?;
     if let Some(ctx) = encrypt_ctx {
-        crate::writer::output::with_buffer_sink(bytes, |out| {
-            crate::writer::write_stream_payload_with_pipeline(
-                out,
-                &data,
-                options.newline_before_endstream,
-                object_ref,
-                ctx,
-                true,
-                None,
-            )
-        })?;
+        crate::writer::write_stream_payload_with_pipeline(
+            out,
+            &data,
+            options.newline_before_endstream,
+            object_ref,
+            ctx,
+            true,
+            None,
+        )?; // cov:ignore: encrypted ObjStm payload failure is a defensive pipeline continuation
     } else {
-        crate::writer::output::with_buffer_sink(bytes, |out| {
-            crate::writer::serialize::write_stream_payload(
-                out,
-                &data,
-                options.newline_before_endstream,
-            )
-        })?;
+        crate::writer::serialize::write_stream_payload(
+            out,
+            &data,
+            options.newline_before_endstream,
+        )?; // cov:ignore: plain ObjStm payload failure is a defensive pipeline continuation
     }
-    bytes.extend_from_slice(b"\nendobj\n");
+    out.write_bytes(b"\nendobj\n")?;
     Ok(offset)
 }
 
@@ -520,40 +596,36 @@ pub(crate) const PREV_PLACEHOLDER_WIDTH: usize = 22;
 /// [`write_encryption_dictionary_handle`](crate::writer::encrypted_strings::write_encryption_dictionary_handle)
 /// so it remains plaintext.
 fn append_object(
-    bytes: &mut Vec<u8>,
+    out: &mut OutputSink<'_>,
     new_ref: ObjectRef,
     object: &ObjectHandle,
     map: &dyn Fn(ObjectRef) -> Result<ObjectRef>,
     removed_refs: &BTreeSet<ObjectRef>,
     encrypted_string_emitter: Option<&mut EncryptedStringEmitter>,
 ) -> Result<usize> {
-    let offset = bytes.len();
-    bytes.extend_from_slice(format!("{} {} obj\n", new_ref.number, new_ref.generation).as_bytes());
+    let offset = out.position_usize()?;
+    out.write_bytes(format!("{} {} obj\n", new_ref.number, new_ref.generation).as_bytes())?;
     if let Some(emitter) = encrypted_string_emitter {
-        crate::writer::output::with_buffer_sink(bytes, |out| {
-            emitter.write_handle_object_with_ref_map(
-                out,
-                new_ref,
-                None,
-                object,
-                false,
-                map,
-                removed_refs,
-            )
-        })?; // cov:ignore: canonical handle emission only errors for an invalid source graph.
+        emitter.write_handle_object_with_ref_map(
+            out,
+            new_ref,
+            None,
+            object,
+            false,
+            map,
+            removed_refs,
+        )?; // cov:ignore: canonical handle emission only errors for an invalid source graph.
     } else {
-        crate::writer::output::with_buffer_sink(bytes, |out| {
-            object.write_object_with_ref_map_and_removed(out, map, removed_refs)
-        })?;
+        object.write_object_with_ref_map_and_removed(out, map, removed_refs)?;
     }
-    bytes.extend_from_slice(b"\nendobj\n");
+    out.write_bytes(b"\nendobj\n")?;
     Ok(offset)
 }
 
 /// Append one live-handle body object in output-number space.
 #[allow(clippy::too_many_arguments)]
 fn append_body_object(
-    bytes: &mut Vec<u8>,
+    out: &mut OutputSink<'_>,
     new_ref: ObjectRef,
     original_ref: ObjectRef,
     object: &ObjectHandle,
@@ -575,7 +647,7 @@ fn append_body_object(
 
     if object.as_stream_dict().is_none() {
         return append_object(
-            bytes,
+            out,
             new_ref,
             object,
             &map,
@@ -609,64 +681,56 @@ fn append_body_object(
     );
     let dict = ObjectHandle::dictionary(entries.into_iter().collect());
 
-    let offset = bytes.len();
-    bytes.extend_from_slice(format!("{} {} obj\n", new_ref.number, new_ref.generation).as_bytes());
+    let offset = out.position_usize()?;
+    out.write_bytes(format!("{} {} obj\n", new_ref.number, new_ref.generation).as_bytes())?;
     if let Some(emitter) = encrypted_string_emitter {
-        crate::writer::output::with_buffer_sink(bytes, |out| {
-            emitter.write_handle_stream_dict_with_ref_map(
-                out,
-                new_ref,
-                None,
-                &dict,
-                crate::writer::encrypted_strings::StreamDictOptions::new(
-                    false,
-                    dictionary_options,
-                    true,
-                ),
-                &map,
-                removed_refs,
-                None,
-            )
-        })?; // cov:ignore: canonical stream-dictionary emission only errors for an invalid source graph.
-    } else {
-        crate::writer::output::with_buffer_sink(bytes, |out| {
-            dict.write_stream_body_with_ref_map_and_removed_with_options(
-                out,
+        emitter.write_handle_stream_dict_with_ref_map(
+            out,
+            new_ref,
+            None,
+            &dict,
+            crate::writer::encrypted_strings::StreamDictOptions::new(
+                false,
                 dictionary_options,
-                &map,
-                removed_refs,
-            )
-        })?; // cov:ignore: the unencrypted linearized route normally uses the shared string emitter; this direct owner call is validated by the compact writer tests
+                true,
+            ),
+            &map,
+            removed_refs,
+            None,
+        )?; // cov:ignore: canonical stream-dictionary emission only errors for an invalid source graph.
+    } else {
+        dict.write_stream_body_with_ref_map_and_removed_with_options(
+            out,
+            dictionary_options,
+            &map,
+            removed_refs,
+        )?; // cov:ignore: the unencrypted linearized route normally uses the shared string emitter; this direct owner call is validated by the compact writer tests
     }
 
     if let Some(ctx) = payload_ctx.filter(|_| !cleartext_metadata) {
-        crate::writer::output::with_buffer_sink(bytes, |out| {
-            crate::writer::write_stream_payload_with_pipeline(
-                out,
-                &data,
-                options.newline_before_endstream,
-                new_ref,
-                ctx,
-                true,
-                None,
-            )
-        })?; // cov:ignore: stream payload encryption is a validated in-memory writer boundary.
+        crate::writer::write_stream_payload_with_pipeline(
+            out,
+            &data,
+            options.newline_before_endstream,
+            new_ref,
+            ctx,
+            true,
+            None,
+        )?; // cov:ignore: stream payload encryption is a validated in-memory writer boundary.
     } else {
-        crate::writer::output::with_buffer_sink(bytes, |out| {
-            crate::writer::serialize::write_stream_payload(
-                out,
-                &data,
-                options.newline_before_endstream,
-            )
-        })?;
+        crate::writer::serialize::write_stream_payload(
+            out,
+            &data,
+            options.newline_before_endstream,
+        )?; // cov:ignore: plain linearized stream payload failure is a defensive pipeline continuation
     }
-    bytes.extend_from_slice(b"\nendobj\n");
+    out.write_bytes(b"\nendobj\n")?;
     Ok(offset)
 }
 
 #[allow(clippy::too_many_arguments)]
 fn append_body_object_for_ref<R: Read + Seek>(
-    bytes: &mut Vec<u8>,
+    out: &mut OutputSink<'_>,
     pdf: &mut Pdf<R>,
     new_ref: ObjectRef,
     original_ref: ObjectRef,
@@ -679,7 +743,7 @@ fn append_body_object_for_ref<R: Read + Seek>(
 ) -> Result<usize> {
     let object = pdf.get_object_handle(original_ref);
     append_body_object(
-        bytes,
+        out,
         new_ref,
         original_ref,
         &object,
@@ -690,6 +754,23 @@ fn append_body_object_for_ref<R: Read + Seek>(
         removed_refs,
         content_normalize_refs,
     )
+}
+
+/// Write repeated padding through the counted output boundary without creating
+/// a document-sized temporary Vec. The final linearization target is Vec-backed
+/// and may later patch this fixed-width region; pass 1 uses the same forward
+/// bytes for qpdf's discard/file pipeline.
+fn write_repeated_bytes(out: &mut OutputSink<'_>, byte: u8, mut count: usize) -> Result<()> {
+    const CHUNK_SIZE: usize = 4096;
+    let chunk = [byte; CHUNK_SIZE];
+    while count >= CHUNK_SIZE {
+        out.write_bytes(&chunk)?;
+        count -= CHUNK_SIZE;
+    }
+    if count != 0 {
+        out.write_bytes(&chunk[..count])?;
+    } // cov:ignore: LLVM attributes this covered partial-padding branch to the write line
+    Ok(())
 }
 
 /// Byte width of a single classic cross-reference entry:
@@ -754,7 +835,7 @@ struct Part1XrefPatch {
 /// Returns `(xref_keyword_offset, prev_value_byte_range, patch)`.
 #[allow(clippy::too_many_arguments)]
 fn write_part1_xref_and_trailer(
-    bytes: &mut Vec<u8>,
+    out: &mut OutputSink<'_>,
     param_dict_obj_number: u32,
     total_object_count: u32,
     first_page_count: u32,
@@ -766,36 +847,48 @@ fn write_part1_xref_and_trailer(
     removed_refs: &BTreeSet<ObjectRef>,
     id_writer: Option<crate::pdf_syntax::ReborrowableIdWriter>,
     encrypt_ctx: Option<&crate::writer::EncryptionContext>,
-) -> Result<(usize, std::ops::Range<usize>, Part1XrefPatch)> {
+    pass1: bool,
+) -> Result<(usize, std::ops::Range<usize>, Option<Part1XrefPatch>)> {
     // The param-dict object's trailing pad (reserved by `Part1Bytes::build`)
     // ends with spaces; qpdf starts the first-page `xref` on a fresh line, so
     // emit the line-break separator here.  This lands the `xref` keyword at
     // qpdf's fixed offset (216 for the 15-byte header) once the pad width is
     // taken into account.
-    if bytes.last() != Some(&b'\n') {
-        bytes.push(b'\n');
+    if out.last_byte() != Some(b'\n') {
+        out.write_bytes(b"\n")?;
     }
-    let xref_offset = bytes.len();
+    let xref_offset = out.position_usize()?;
 
     // Subsection: the whole first-page section (objects param_slot..total).
-    bytes.extend_from_slice(
-        format!("xref\n{param_dict_obj_number} {first_page_count}\n").as_bytes(),
-    );
+    out.write_bytes(format!("xref\n{param_dict_obj_number} {first_page_count}\n").as_bytes())?;
     // Fixed-width placeholder block: `first_page_count` classic entries, each
     // CLASSIC_XREF_ENTRY_WIDTH bytes.  The offsets are forward references, so
     // patch_part1_xref overwrites this block in place once they are known.
     // Its byte length is invariant (it never depends on the offsets it carries),
     // so no downstream byte shifts.
-    let data_start = bytes.len();
-    bytes.resize(
-        data_start + (first_page_count as usize) * CLASSIC_XREF_ENTRY_WIDTH,
-        b' ',
-    );
-    let data_end = bytes.len();
-    let patch = Part1XrefPatch {
-        start_num: param_dict_obj_number,
-        count: first_page_count,
-        data_range: data_start..data_end,
+    let patch = if pass1 {
+        for _ in 0..first_page_count {
+            out.write_bytes(b"0000000000 00000 n \n")?;
+        }
+        None
+    } else {
+        let data_start = out.position_usize()?;
+        let data_len = (first_page_count as usize)
+            .checked_mul(CLASSIC_XREF_ENTRY_WIDTH)
+            .ok_or_else(|| {
+                // cov:ignore-start: first_page_count is a u32 and supported
+                // targets have enough usize capacity for these fixed entries;
+                // this is defensive overflow handling.
+                crate::Error::Unsupported(
+                    "Part-1 xref placeholder length exceeds usize range".to_string(),
+                )
+            })?; // cov:ignore-end
+        write_repeated_bytes(out, b' ', data_len)?;
+        Some(Part1XrefPatch {
+            start_num: param_dict_obj_number,
+            count: first_page_count,
+            data_range: data_start..data_start + data_len,
+        })
     };
 
     // First-page trailer for Part 1. qpdf emits the live trimmed trailer keys
@@ -803,7 +896,7 @@ fn write_part1_xref_and_trailer(
     // appends `/ID` and `/Encrypt` after the ordinary keys. The values in
     // `canonical_entries` came from the live ObjectHandle graph; raw bytes are
     // limited to this fixed linearization framing and its back-patch field.
-    bytes.extend_from_slice(b"trailer << ");
+    out.write_bytes(b"trailer << ")?;
 
     let mut entries = canonical_entries.to_vec();
     if let Some(info_ref) = info_new_ref {
@@ -828,34 +921,32 @@ fn write_part1_xref_and_trailer(
 
     let mut prev_value_range = None;
     for (key, value) in entries {
-        bytes.push(b'/');
-        crate::writer::output::with_buffer_sink(bytes, |out| {
-            crate::pdf_syntax::write_name_escaped(out, key.strip_prefix(b"/").unwrap_or(&key))
-        })?;
-        bytes.push(b' ');
-        bytes.extend_from_slice(&value);
+        out.write_bytes(b"/")?;
+        crate::pdf_syntax::write_name_escaped(out, key.strip_prefix(b"/").unwrap_or(&key))?;
+        out.write_bytes(b" ")?;
+        out.write_bytes(&value)?;
         if key == b"/Size" {
             // `/Prev` placeholder: left-justified 0, space-padded to the
             // fixed qpdf field width so the final xref offset is patched in
             // place without shifting any body bytes.
-            bytes.extend_from_slice(b" /Prev ");
-            let prev_value_start = bytes.len();
+            out.write_bytes(b" /Prev ")?;
+            let prev_value_start = out.position_usize()?;
             let placeholder = format!("{:<PREV_PLACEHOLDER_WIDTH$}", 0);
-            bytes.extend_from_slice(placeholder.as_bytes());
-            prev_value_range = Some(prev_value_start..bytes.len());
+            out.write_bytes(placeholder.as_bytes())?;
+            prev_value_range = Some(prev_value_start..out.position_usize()?);
         } else {
-            bytes.push(b' ');
+            out.write_bytes(b" ")?;
         }
     }
 
     // No separator space before `/ID`: the fixed-width `/Prev` placeholder's
     // trailing pad already separates the value, exactly as qpdf writes it.
-    bytes.extend_from_slice(b"/ID ");
+    out.write_bytes(b"/ID ")?;
     let id_value = source_trailer.try_get_key(b"/ID")?;
-    crate::writer::output::with_buffer_sink(bytes, |out| match id_writer {
+    match id_writer {
         Some(write_id) => write_id(out),
         None => id_value.write_id_value_with_ref_map(out, map, removed_refs),
-    })?;
+    }?; // cov:ignore: direct trailer ID serialization is validated by canonical handle tests
 
     // /Encrypt — reference to the `/Encrypt` dictionary object, written right
     // after `/ID` (qpdf `writeTrailer` writes `/ID` first, then — for every
@@ -865,23 +956,23 @@ fn write_part1_xref_and_trailer(
     // function that never receives `encrypt_ctx`, so that omission is
     // structural rather than a runtime branch here.
     if let Some(ctx) = encrypt_ctx {
-        bytes.extend_from_slice(
+        out.write_bytes(
             format!(
                 " /Encrypt {} {} R",
                 ctx.encrypt_ref.number, ctx.encrypt_ref.generation
             )
             .as_bytes(),
-        );
+        )?; // cov:ignore: encrypted linearization trailer framing errors are defensive output failures
     }
 
-    bytes.extend_from_slice(b" >>");
+    out.write_bytes(b" >>")?;
     // Per linearized PDF convention (ISO 32000-1 Annex F and qpdf practice),
     // the Part 1 first trailer's startxref value is always 0.  The main xref
     // at the end of the file (Part 6) carries the real byte offset in its own
     // trailing startxref, so readers that follow the tail-startxref path are
     // unaffected.  qpdf uses 0 here to signal "this is the first trailer of a
     // linearized file"; we adopt the same convention for byte-identical output.
-    bytes.extend_from_slice(b"\nstartxref\n0\n%%EOF\n");
+    out.write_bytes(b"\nstartxref\n0\n%%EOF\n")?;
 
     let prev_value_range = prev_value_range.ok_or_else(|| {
         // cov:ignore-start: /Size is inserted unconditionally above.
@@ -909,11 +1000,11 @@ fn write_part1_xref_and_trailer(
 /// otherwise emit a free entry for a live object), or if the patch range lies
 /// outside `bytes`.
 fn patch_part1_xref(
-    bytes: &mut [u8],
+    out: &mut OutputSink<'_>,
     patch: &Part1XrefPatch,
     xref_offsets: &BTreeMap<u32, usize>,
 ) -> Result<()> {
-    if patch.data_range.end > bytes.len() {
+    if patch.data_range.end > out.position_usize()? {
         return Err(crate::Error::Unsupported(
             "Part-1 xref patch range out of bounds".to_string(),
         ));
@@ -935,8 +1026,7 @@ fn patch_part1_xref(
             patch.data_range.len()
         )));
     }
-    bytes[patch.data_range.clone()].copy_from_slice(&data);
-    Ok(())
+    out.patch_bytes(patch.data_range.clone(), &data)
 }
 
 /// Write the main (Part 6) cross-reference table — covering only the
@@ -969,7 +1059,7 @@ fn patch_part1_xref(
 ///   qpdf's linearization checker.
 #[allow(clippy::too_many_arguments)]
 fn write_main_xref_and_trailer(
-    bytes: &mut Vec<u8>,
+    out: &mut OutputSink<'_>,
     xref_offsets: &BTreeMap<u32, usize>,
     param_slot: u32, // /Size of the main subsection — covers objects [0, param_slot)
     first_page_xref_offset: usize,
@@ -978,40 +1068,37 @@ fn write_main_xref_and_trailer(
     removed_refs: &BTreeSet<ObjectRef>,
     id_writer: Option<crate::pdf_syntax::ReborrowableIdWriter>,
 ) -> Result<(usize, usize)> {
-    let xref_start = bytes.len();
+    let xref_start = out.position_usize()?;
 
     // Dense table: objects 0 .. param_slot (the low-numbered "rest" objects).
     let xref_header = format!("xref\n0 {}\n", param_slot);
-    bytes.extend_from_slice(xref_header.as_bytes());
-    let xref_first_entry_offset = bytes.len();
+    out.write_bytes(xref_header.as_bytes())?;
+    let xref_first_entry_offset = out.position_usize()?;
     // Object 0 — free head.
-    bytes.extend_from_slice(b"0000000000 65535 f \n");
+    out.write_bytes(b"0000000000 65535 f \n")?;
     for number in 1..param_slot {
         match xref_offsets.get(&number) {
-            Some(offset) => {
-                bytes.extend_from_slice(format!("{:010} 00000 n \n", offset).as_bytes())
-            }
-            None => bytes.extend_from_slice(b"0000000000 65535 f \n"),
+            Some(offset) => out.write_bytes(format!("{:010} 00000 n \n", offset).as_bytes())?,
+            None => out.write_bytes(b"0000000000 65535 f \n")?,
         }
     }
 
     // Main trailer.  Written as raw bytes (not Dictionary::write_pdf, which
     // alphabetizes) to keep qpdf's key order /Size /ID.  No /Root or /Info —
     // qpdf omits both from the main trailer of a classic linearized file.
-    bytes.extend_from_slice(b"trailer << ");
-    bytes.extend_from_slice(format!("/Size {} ", param_slot).as_bytes());
+    out.write_bytes(b"trailer << ")?;
+    out.write_bytes(format!("/Size {} ", param_slot).as_bytes())?;
     // /ID — emit the file-scoped identifier verbatim (the same value the
     // Part-1 trailer carries), so the trailer a reader resolves via the
     // trailing `startxref` advertises the identifier.
-    bytes.extend_from_slice(b"/ID ");
+    out.write_bytes(b"/ID ")?;
     let id_value = source_trailer.try_get_key(b"/ID")?;
-    crate::writer::output::with_buffer_sink(bytes, |out| match id_writer {
+    match id_writer {
         Some(write_id) => write_id(out),
         None => id_value.write_id_value_with_ref_map(out, map, removed_refs),
-    })?;
-    bytes.extend_from_slice(b" ");
-    bytes.extend_from_slice(b">>");
-    bytes.extend_from_slice(format!("\nstartxref\n{}\n%%EOF\n", first_page_xref_offset).as_bytes());
+    }?; // cov:ignore: direct trailer ID serialization is validated by canonical handle tests
+    out.write_bytes(b" >>")?;
+    out.write_bytes(format!("\nstartxref\n{}\n%%EOF\n", first_page_xref_offset).as_bytes())?;
 
     Ok((xref_start, xref_first_entry_offset))
 }
@@ -1359,7 +1446,8 @@ fn patch_linearized_deterministic_id(
 // also used by the plain writer, whose xref-stream trailer has no such entry.
 #[allow(clippy::too_many_arguments)]
 fn write_first_page_xref_stream(
-    bytes: &mut Vec<u8>,
+    out: &mut OutputSink<'_>,
+    xref_offsets: &mut BTreeMap<u32, usize>,
     relocation: &ObjStmRelocation,
     total_count: u32, // /Size (relocated renumber.len() + 1) — already final
     catalog_new_ref: ObjectRef,
@@ -1370,6 +1458,7 @@ fn write_first_page_xref_stream(
     max_ostream_index: u64,
     filtered: bool,
     encrypt: Option<ObjectRef>,
+    pass1: bool,
 ) -> Result<FirstPageXrefPatch> {
     let final_size = total_count;
     let first_xref_num = relocation.first_xref_slot;
@@ -1422,18 +1511,11 @@ fn write_first_page_xref_stream(
     // with spaces; qpdf starts the first-page xref stream on a fresh line, so emit
     // the line-break separator here (the classic path's analogue is in
     // `write_part1_xref_and_trailer`). This lands the object at qpdf's offset.
-    if bytes.last() != Some(&b'\n') {
-        bytes.push(b'\n');
+    if out.last_byte() != Some(b'\n') {
+        out.write_bytes(b"\n")?;
     }
-    let obj_offset = bytes.len();
-    // Space placeholder of exactly the region length, then the trailing newline
-    // (outside the region, mirroring qpdf). The placeholder content is
-    // irrelevant — `patch_first_page_xref` overwrites the whole region before
-    // the file is finalised.
-    bytes.resize(obj_offset + region_len, b' ');
-    bytes.push(b'\n');
-
-    Ok(FirstPageXrefPatch {
+    let obj_offset = out.position_usize()?;
+    let patch = FirstPageXrefPatch {
         first_xref_num,
         index_start,
         index_count,
@@ -1448,7 +1530,21 @@ fn write_first_page_xref_stream(
         max_ostream_index,
         filtered,
         hint_id,
-    })
+    };
+    xref_offsets.insert(first_xref_num, obj_offset);
+    if pass1 {
+        let (region, _) =
+            build_first_page_xref_region(&patch, xref_offsets, &BTreeMap::new(), 0, 0, true)?;
+        out.write_bytes(&region)?;
+    } else {
+        // Space placeholder of exactly the region length, then the trailing
+        // newline (outside the region, mirroring qpdf). The placeholder is
+        // overwritten after the downstream offsets are known.
+        write_repeated_bytes(out, b' ', region_len)?;
+    }
+    out.write_bytes(b"\n")?;
+
+    Ok(patch)
 }
 
 /// Extract the trailer `/ID`'s two byte strings — the deterministic-`/ID`
@@ -1490,15 +1586,14 @@ fn xref_id_bytes(source_trailer: &ObjectHandle) -> Result<Option<(Vec<u8>, Vec<u
 /// arbitrary custom trailer entries whose serialized bytes could otherwise
 /// coincidentally match the placeholder's fixed byte pattern (see
 /// [`patch_linearized_deterministic_id`]'s doc).
-fn patch_first_page_xref(
-    bytes: &mut [u8],
+fn build_first_page_xref_region(
     patch: &FirstPageXrefPatch,
     xref_offsets: &mut BTreeMap<u32, usize>,
     member_new: &BTreeMap<u32, (u32, u32)>,
     main_xref_offset: usize,
     hint_length: usize,
     pass1: bool,
-) -> Result<Option<std::ops::Range<usize>>> {
+) -> Result<(Vec<u8>, Option<std::ops::Range<usize>>)> {
     // The first-page xref object's own offset is the region start.
     xref_offsets.insert(patch.first_xref_num, patch.region.start);
 
@@ -1613,16 +1708,40 @@ fn patch_first_page_xref(
         &stream_layout,
         patch.region.len(),
     )?; // cov:ignore: see above — unreachable region-overflow error arm.
-    if patch.region.end > bytes.len() {
-        // cov:ignore-start: unreachable invariant — `region` was reserved inside
-        // this same buffer during emission, which only grows afterward.
+    Ok((
+        region,
+        region_id_range.map(|r| patch.region.start + r.start..patch.region.start + r.end),
+    ))
+}
+
+/// Patch the final pass's fixed-size first-page xref region through the
+/// Vec-backed output target.
+fn patch_first_page_xref(
+    out: &mut OutputSink<'_>,
+    patch: &FirstPageXrefPatch,
+    xref_offsets: &mut BTreeMap<u32, usize>,
+    member_new: &BTreeMap<u32, (u32, u32)>,
+    main_xref_offset: usize,
+    hint_length: usize,
+) -> Result<Option<std::ops::Range<usize>>> {
+    let (region, id_range) = build_first_page_xref_region(
+        patch,
+        xref_offsets,
+        member_new,
+        main_xref_offset,
+        hint_length,
+        false,
+    )?; // cov:ignore: the final xref region is validated by qpdf differential tests
+    if patch.region.end > out.position_usize()? {
+        // cov:ignore-start: unreachable invariant — the region was reserved
+        // inside this same output before any later bytes were emitted.
         return Err(crate::Error::Unsupported(
             "first-page xref patch range out of bounds".to_string(),
         ));
         // cov:ignore-end
     }
-    bytes[patch.region.clone()].copy_from_slice(&region);
-    Ok(region_id_range.map(|r| patch.region.start + r.start..patch.region.start + r.end))
+    out.patch_bytes(patch.region.clone(), &region)?;
+    Ok(id_range)
 }
 
 /// Emit the **main (second-half) cross-reference stream** at end-of-body,
@@ -1647,7 +1766,7 @@ fn patch_first_page_xref(
 /// records this exact span rather than the whole object.
 #[allow(clippy::too_many_arguments)]
 fn write_main_xref_stream_and_trailer(
-    bytes: &mut Vec<u8>,
+    out: &mut OutputSink<'_>,
     xref_offsets: &mut BTreeMap<u32, usize>,
     member_new: &BTreeMap<u32, (u32, u32)>,
     relocation: &ObjStmRelocation,
@@ -1657,7 +1776,7 @@ fn write_main_xref_stream_and_trailer(
     max_ostream_index: u64,
     pass1: bool,
     filtered: bool,
-) -> Result<(usize, usize, Option<std::ops::Range<usize>>)> {
+) -> Result<(usize, usize, Option<std::ops::Range<usize>>, usize)> {
     let final_size = total_count;
     let first_xref_num = relocation.first_xref_slot;
     let main_xref_num = relocation.main_xref_slot;
@@ -1666,7 +1785,7 @@ fn write_main_xref_stream_and_trailer(
 
     // Second-half range: objects `[0, second_half_count)`.
     let main_count = relocation.second_half_count;
-    let main_xref_offset = bytes.len();
+    let main_xref_offset = out.position_usize()?;
     xref_offsets.insert(first_xref_num, first_page_obj_offset);
     let stream_layout = xref_stream::prepare_xref_stream(
         xref_offsets,
@@ -1736,20 +1855,26 @@ fn write_main_xref_stream_and_trailer(
     };
     let (region, region_id_range) =
         xref_stream::write_padded_region(main_obj_ref, &dict, &stream_layout, region_len)?;
-    let region_start = bytes.len();
-    bytes.extend_from_slice(&region);
-    bytes.push(b'\n');
+    let region_start = out.position_usize()?;
+    out.write_bytes(&region)?;
+    out.write_bytes(b"\n")?;
     let id_range = region_id_range.map(|r| region_start + r.start..region_start + r.end);
 
     // Trailing `startxref` → the **first-page** xref stream (qpdf's chain leaf).
-    bytes.extend_from_slice(format!("startxref\n{first_page_obj_offset}\n%%EOF\n").as_bytes());
+    let second_xref_end = out.position_usize()?;
+    out.write_bytes(format!("startxref\n{first_page_obj_offset}\n%%EOF\n").as_bytes())?;
 
     // `/T` rule for the split linearized file is the byte just before the
     // **main** cross-reference stream (qpdf's `xref_zero_offset`). The caller
     // computes `/T = second_return.saturating_sub(1)`, so return
     // `main_xref_offset` as the second element. The first element is also the
     // main xref offset (used for layout diagnostics / `last_xref`).
-    Ok((main_xref_offset, main_xref_offset, id_range))
+    Ok((
+        main_xref_offset,
+        main_xref_offset,
+        id_range,
+        second_xref_end,
+    ))
 }
 
 /// Serialize the hint-stream object dictionary + `stream\n` opener exactly as
@@ -2060,7 +2185,6 @@ fn build_pass1_part1(part1: &Part1Bytes) -> Part1Bytes {
 /// coordinates. The final pass contains the exact hint-object buffer generated
 /// from this result.
 struct LinearizedPassOutput {
-    bytes: Vec<u8>,
     xref_offsets: BTreeMap<u32, usize>,
     first_page_xref_offset: Option<usize>,
     hint_stream_offset: usize,
@@ -2068,6 +2192,7 @@ struct LinearizedPassOutput {
     end_of_first_page_offset: usize,
     last_xref_offset: usize,
     last_xref_first_entry_offset: usize,
+    second_xref_end: usize,
     first_trailer_prev_range: std::ops::Range<usize>,
     id_ranges: Vec<std::ops::Range<usize>>,
 }
@@ -2103,6 +2228,7 @@ fn do_write_pass<R: Read + Seek>(
     plan: &LinearizationPlan,
     renumber: &RenumberMap,
     pdf: &mut Pdf<R>,
+    output: &mut OutputSink<'_>,
     part1: &Part1Bytes,
     catalog_new_ref: ObjectRef,
     hint_stream_new_num: u32,
@@ -2122,7 +2248,6 @@ fn do_write_pass<R: Read + Seek>(
     final_pdf_version: &str,
     final_extension_level: i64,
 ) -> Result<LinearizedPassOutput> {
-    let mut bytes: Vec<u8> = Vec::new();
     let mut xref_offsets: BTreeMap<u32, usize> = BTreeMap::new();
 
     // The classic path emits `/ID` at two sites (Part-1 and main trailers).
@@ -2135,7 +2260,7 @@ fn do_write_pass<R: Read + Seek>(
     // Part 1
     let param_dict_obj_number = renumber.param_dict_ref().number;
     let param_dict_absolute_offset = part1.obj1_offset;
-    bytes.extend_from_slice(&part1.bytes);
+    output.write_bytes(&part1.bytes)?;
     // qpdf deliberately writes extra header text after the linearization
     // parameter dictionary, rather than in `writeHeader`, so the dictionary
     // remains within the first 1024 bytes (QPDFWriter.cc:2718-2720). The
@@ -2144,9 +2269,9 @@ fn do_write_pass<R: Read + Seek>(
     // already been normalized with a trailing newline by PdfWriter, matching
     // qpdf's `setExtraHeaderText` contract.
     if !options.extra_header_text.is_empty() {
-        bytes.push(b'\n');
+        output.write_bytes(b"\n")?;
     }
-    bytes.extend_from_slice(options.extra_header_text.as_bytes());
+    output.write_bytes(options.extra_header_text.as_bytes())?;
     xref_offsets.insert(param_dict_obj_number, param_dict_absolute_offset);
 
     // member new-number → (container new-number, index) for the type-2 xref
@@ -2215,9 +2340,9 @@ fn do_write_pass<R: Read + Seek>(
         // count is `total_count − param_slot`. The helper validates the
         // subtraction before any first-page xref bytes are emitted.
         let first_page_count = first_page_xref_object_count(total_count, param_dict_obj_number)?;
-        let section_start = bytes.len();
+        let section_start = output.position_usize()?;
         let (p1_xref_offset, range, patch) = write_part1_xref_and_trailer(
-            &mut bytes,
+            output,
             param_dict_obj_number,
             total_count,
             first_page_count,
@@ -2229,18 +2354,20 @@ fn do_write_pass<R: Read + Seek>(
             &plan.removed_refs,
             id_writer.as_deref_mut(),
             encrypt_ctx,
+            pass1_digest,
         )?; // cov:ignore: the validated linearization plan makes this serializer error path defensive.
         part1_classic_xref_offset = p1_xref_offset;
-        part1_xref_patch = Some(patch);
+        part1_xref_patch = patch;
         // Part-1 first-page trailer `/ID` site.  The main (Part-6) trailer
         // emitted at EOF carries the same `/ID` (its span is captured at
         // the `write_main_xref_and_trailer` call below), so the classic
         // table path has two `/ID` sites — both back-patched together.
-        id_ranges.push(section_start..bytes.len());
+        id_ranges.push(section_start..output.position_usize()?);
         range
     } else {
         let patch = write_first_page_xref_stream(
-            &mut bytes,
+            output,
+            &mut xref_offsets,
             relocation,
             total_count,
             catalog_new_ref,
@@ -2251,6 +2378,7 @@ fn do_write_pass<R: Read + Seek>(
             max_ostream_index,
             structural_streams_filtered,
             encrypt_ctx.map(|ctx| ctx.encrypt_ref),
+            pass1_digest,
         )?;
         // First-page xref stream object carries one `/ID` (the main xref
         // stream below carries the second). This call only reserves the
@@ -2290,7 +2418,7 @@ fn do_write_pass<R: Read + Seek>(
             .get_object_handle(catalog_orig)
             .output_root_copy_with_adbe(final_pdf_version, final_extension_level, true)?;
         let offset = append_body_object(
-            &mut bytes,
+            output,
             catalog_new_ref,
             catalog_orig,
             &catalog,
@@ -2364,7 +2492,7 @@ fn do_write_pass<R: Read + Seek>(
         match emit {
             OpenDocumentEmit::Plain { original, new_ref } => {
                 let offset = append_body_object_for_ref(
-                    &mut bytes,
+                    output,
                     pdf,
                     new_ref,
                     original,
@@ -2380,7 +2508,7 @@ fn do_write_pass<R: Read + Seek>(
             }
             OpenDocumentEmit::Container(container) => {
                 let offset = append_objstm_container_object(
-                    &mut bytes,
+                    output,
                     container,
                     renumber,
                     pdf,
@@ -2418,21 +2546,19 @@ fn do_write_pass<R: Read + Seek>(
     // derive the file key needed to decrypt anything else). Its five binary
     // security-handler strings use the dedicated compact hexadecimal form.
     if let Some(ctx) = encrypt_ctx {
-        let offset = bytes.len();
-        bytes.extend_from_slice(
+        let offset = output.position_usize()?;
+        output.write_bytes(
             format!(
                 "{} {} obj\n",
                 ctx.encrypt_ref.number, ctx.encrypt_ref.generation
             )
             .as_bytes(),
-        );
-        crate::writer::output::with_buffer_sink(&mut bytes, |out| {
-            crate::writer::encrypted_strings::write_encryption_dictionary_handle(
-                out,
-                &ctx.encrypt_dict,
-            )
-        })?; // cov:ignore: LLVM maps this covered encrypted-dictionary continuation to cleanup
-        bytes.extend_from_slice(b"\nendobj\n");
+        )?; // cov:ignore: encrypted linearization dictionary framing errors are defensive output failures
+        crate::writer::encrypted_strings::write_encryption_dictionary_handle(
+            output,
+            &ctx.encrypt_dict,
+        )?; // cov:ignore: LLVM maps this covered encrypted-dictionary continuation to cleanup
+        output.write_bytes(b"\nendobj\n")?;
         xref_offsets.insert(ctx.encrypt_ref.number, offset);
     }
 
@@ -2444,12 +2570,21 @@ fn do_write_pass<R: Read + Seek>(
     // that shift incrementally — no offset arithmetic.  The slot is also kept
     // out of `xref_offsets`: the first-page xref that covers it is written as
     // formatted zero-offset entries below, so the slot needs no real offset.
-    let hint_stream_offset = bytes.len();
+    let hint_stream_offset = output.position_usize()?;
     if let Some(hint_stream_object) = hint_stream_object {
-        bytes.extend_from_slice(hint_stream_object);
+        output.write_bytes(hint_stream_object)?;
         xref_offsets.insert(hint_stream_new_num, hint_stream_offset);
     }
-    let hint_stream_obj_total_len = bytes.len() - hint_stream_offset;
+    let hint_stream_obj_total_len = output
+        .position_usize()?
+        .checked_sub(hint_stream_offset)
+        .ok_or_else(|| {
+            // cov:ignore-start: OutputSink positions are monotonic by
+            // construction, so this underflow is a defensive invariant guard.
+            crate::Error::Unsupported(
+                "linearization hint stream offset moved backwards".to_string(),
+            )
+        })?; // cov:ignore-end
 
     // qpdf orders every first-page plain object and Part-3 ObjStm container by
     // the object number assigned during its linearization setup. In particular,
@@ -2497,7 +2632,7 @@ fn do_write_pass<R: Read + Seek>(
                     .new_for_original(original_ref)
                     .expect("first-page plain object renumber entry checked above");
                 let offset = append_body_object_for_ref(
-                    &mut bytes,
+                    output,
                     pdf,
                     new_ref,
                     original_ref,
@@ -2513,7 +2648,7 @@ fn do_write_pass<R: Read + Seek>(
             }
             FirstPageEmit::Container(container) => {
                 let offset = append_objstm_container_object(
-                    &mut bytes,
+                    output,
                     container,
                     renumber,
                     pdf,
@@ -2537,7 +2672,7 @@ fn do_write_pass<R: Read + Seek>(
 
     // /E: end of first-page section, AFTER Part-2, Part-3, the Part-3
     // ObjStm containers, and Part-6 outline objects (when UseOutlines).
-    let end_of_first_page_offset = bytes.len();
+    let end_of_first_page_offset = output.position_usize()?;
 
     // Part 5 (Annex F): remaining body.  qpdf emits the objects that follow
     // /E (the Pages tree, Info, and any other tail objects) in ascending
@@ -2594,7 +2729,7 @@ fn do_write_pass<R: Read + Seek>(
                     .new_for_original(*original_ref)
                     .expect("part4 plain object renumber entry checked above");
                 let offset = append_body_object_for_ref(
-                    &mut bytes,
+                    output,
                     pdf,
                     new_ref,
                     *original_ref,
@@ -2610,7 +2745,7 @@ fn do_write_pass<R: Read + Seek>(
             }
             Part4Emit::Container(container) => {
                 let offset = append_objstm_container_object(
-                    &mut bytes,
+                    output,
                     container,
                     renumber,
                     pdf,
@@ -2638,7 +2773,9 @@ fn do_write_pass<R: Read + Seek>(
     // members which a classic xref table cannot represent, so Part 6 becomes
     // an xref stream.  With an empty layout the classic table path is kept
     // verbatim — no behavioural change for Disable / no-ObjStm inputs.
-    let (last_xref_offset, last_xref_first_entry_offset) = if objstm_layout.is_empty() {
+    let (last_xref_offset, last_xref_first_entry_offset, second_xref_end) = if objstm_layout
+        .is_empty()
+    {
         // The main (Part-6) xref covers only the low-numbered "rest" objects
         // [0, param_slot); the first-page section [param_slot, total) was
         // recorded by the Part-1 first-page xref above.  qpdf's classic layout
@@ -2650,9 +2787,9 @@ fn do_write_pass<R: Read + Seek>(
         // rewrites the placeholder there too (the push is unconditional,
         // matching the Part-1 site — `id_ranges` is consulted only when
         // `deterministic_id` is set).
-        let main_section_start = bytes.len();
+        let main_section_start = output.position_usize()?;
         let result = write_main_xref_and_trailer(
-            &mut bytes,
+            output,
             &xref_offsets,
             param_dict_obj_number,
             part1_classic_xref_offset,
@@ -2662,42 +2799,27 @@ fn do_write_pass<R: Read + Seek>(
             // Last use of `id_writer` — move it (no reborrow needed).
             id_writer,
         )?; // cov:ignore: the validated linearization plan makes this serializer error path defensive.
-        id_ranges.push(main_section_start..bytes.len());
+        id_ranges.push(main_section_start..output.position_usize()?);
 
-        // Every first-page object offset is now known, so back-patch the
-        // Part-1 first-page xref's placeholder entry block in place. The block
-        // length was reserved exactly, so this shifts no bytes between passes.
-        let patch = part1_xref_patch
-            .as_ref()
-            // cov:ignore-start: unreachable internal invariant — this is the
-            // classic (`objstm_layout.is_empty()`) branch, which always sets
-            // `part1_xref_patch = Some(..)` just above when emitting the Part-1
-            // xref; the guard mirrors the ObjStm path's analogous check.
-            .ok_or_else(|| {
-                crate::Error::Unsupported(
-                    "linearization writer: classic path produced no Part-1 xref patch \
-                     (internal invariant violated)"
-                        .to_string(),
-                )
-            })?;
-        // cov:ignore-end
-        if pass1_digest {
-            // qpdf's pass-1 buffer leaves the first-page xref unresolved:
-            // every covered entry is a formatted zero-offset record
-            // (`0000000000 00000 n `), not the real offsets and not the raw
-            // space placeholder.  Patch the block with an all-zero offsets map
-            // so the encoder emits exactly those bytes (reusing the same
-            // formatter the final pass uses keeps the framing identical).
-            let zero_offsets: BTreeMap<u32, usize> = (patch.start_num
-                ..patch.start_num + patch.count)
-                .map(|n| (n, 0usize))
-                .collect();
-            patch_part1_xref(&mut bytes, patch, &zero_offsets)?;
-        } else {
-            patch_part1_xref(&mut bytes, patch, &xref_offsets)?;
+        // Final output patches the fixed-width first-page xref after every
+        // object offset is known. Pass 1 already emitted qpdf's zero records
+        // directly before the body and therefore has no in-place operation.
+        if !pass1_digest {
+            let patch = part1_xref_patch
+                .as_ref()
+                // cov:ignore-start: final classic output always reserves this patch.
+                .ok_or_else(|| {
+                    crate::Error::Unsupported(
+                        "linearization writer: classic path produced no Part-1 xref patch \
+                         (internal invariant violated)"
+                            .to_string(),
+                    )
+                })?;
+            // cov:ignore-end
+            patch_part1_xref(output, patch, &xref_offsets)?;
         }
 
-        result
+        (result.0, result.1, 0)
     } else {
         // The first-page xref stream was already emitted before /E; record
         // where it landed so the file's trailing `startxref` (qpdf's chain leaf)
@@ -2721,7 +2843,7 @@ fn do_write_pass<R: Read + Seek>(
         );
 
         let result = write_main_xref_stream_and_trailer(
-            &mut bytes,
+            output,
             &mut xref_offsets,
             &member_new,
             relocation,
@@ -2732,7 +2854,7 @@ fn do_write_pass<R: Read + Seek>(
             pass1_digest,
             structural_streams_filtered,
         )?; // cov:ignore: the validated linearization plan makes xref-stream serialization errors defensive.
-        let (main_xref_offset, main_first_entry_offset, main_id_range) = result;
+        let (main_xref_offset, main_first_entry_offset, main_id_range, second_xref_end) = result;
         // Main xref stream object is the second (and last) `/ID` site on the
         // ObjStm path.  Its span extends through the trailing
         // `startxref`/`%%EOF` and is never touched by `patch_first_page_xref`
@@ -2754,24 +2876,24 @@ fn do_write_pass<R: Read + Seek>(
         // xref's reserved region with the real encoded object and `/Prev →
         // main xref`. The region's byte length is fixed (qpdf's pass-1 sizing),
         // so this shifts no bytes between the two layout passes.
-        let first_page_id_range = patch_first_page_xref(
-            &mut bytes,
-            patch,
-            &mut xref_offsets,
-            &member_new,
-            main_xref_offset,
-            hint_stream_obj_total_len,
-            pass1_digest,
-        )?; // cov:ignore: propagates patch_first_page_xref's unreachable region-overflow error arm.
-        if let Some(id_range) = first_page_id_range {
-            id_ranges.push(id_range);
+        if !pass1_digest {
+            let first_page_id_range = patch_first_page_xref(
+                output,
+                patch,
+                &mut xref_offsets,
+                &member_new,
+                main_xref_offset,
+                hint_stream_obj_total_len,
+            )?; // cov:ignore: propagates patch_first_page_xref's unreachable region-overflow error arm.
+            if let Some(id_range) = first_page_id_range {
+                id_ranges.push(id_range);
+            }
         }
 
-        (main_xref_offset, main_first_entry_offset)
+        (main_xref_offset, main_first_entry_offset, second_xref_end)
     };
 
     Ok(LinearizedPassOutput {
-        bytes,
         xref_offsets,
         first_page_xref_offset: first_page_xref_patch
             .as_ref()
@@ -2781,6 +2903,7 @@ fn do_write_pass<R: Read + Seek>(
         end_of_first_page_offset,
         last_xref_offset,
         last_xref_first_entry_offset,
+        second_xref_end,
         first_trailer_prev_range,
         id_ranges,
     })
@@ -3138,46 +3261,6 @@ pub(crate) fn write_linearized_for_pdf_writer<R: Read + Seek>(
     plan_result.and_then(|(plan, renumber)| {
         write_linearized_impl(&plan, &renumber, pdf, options, pass1_path, setup)
     })
-}
-
-/// Write the pass-1 body through qpdf's stdio-shaped buffering boundary.
-///
-/// qpdf writes this body through `Pl_StdioFile` backed by a buffered `FILE*`.
-/// Direct `fwrite` failures are terminal, while `finish()` ignores every
-/// `fflush` failure except `EBADF`, which is a logic error. Keep that behavior
-/// in the core [`crate::Error`] channel instead of allowing a
-/// [`crate::pipeline::PipelineError`] to escape the pipeline boundary.
-fn write_pass1_stdio_body(
-    writer: &mut dyn Write,
-    mut body: &[u8],
-    pass1_path: &Path,
-) -> Result<()> {
-    let mut buffered = StdioBuffer::new(writer);
-    while !body.is_empty() {
-        match buffered.write(body) {
-            Ok(0) => {
-                return Err(crate::Error::file_io(
-                    "write",
-                    pass1_path,
-                    std::io::Error::new(
-                        std::io::ErrorKind::WriteZero,
-                        "failed to write buffered data",
-                    ),
-                ));
-            }
-            Ok(written) => body = &body[written..],
-            Err(source) => {
-                return Err(crate::Error::file_io("write", pass1_path, source));
-            }
-        }
-    }
-
-    match buffered.flush() {
-        Err(source) if source.raw_os_error() == Some(EBADF_ERRNO) => Err(crate::Error::Internal(
-            "linearization pass1: Pl_StdioFile::finish: stream already closed".to_string(),
-        )),
-        Ok(()) | Err(_) => Ok(()),
-    }
 }
 
 /// Append qpdf's pass-1 debugging comments after the body pipeline has been
@@ -3811,18 +3894,16 @@ fn write_linearized_impl<R: Read + Seek>(
         matches!(effective_stream_policy(options), Some(CompressStreams::Yes));
     // ------------------------------------------------------------------
     // Build qpdf's first-pass representation unconditionally. It is the source
-    // for hint-table offsets and lengths, and is also reused for deterministic
-    // ID hashing and explicit pass-1 output. For deterministic IDs, compute
-    // qpdf's content-derived identifier up front, then direct-write it in the
-    // final pass on the classic path (qpdf's 2-pass scheme).
+    // for hint-table offsets and lengths, and is also the source of the
+    // incremental deterministic-ID digest and optional pass-1 artifact.
     //
     // qpdf seeds the linearized `--deterministic-id` from its *first* write pass
     // — a throwaway buffer with an empty parameter dict, no hint stream, and an
     // unresolved first-page xref (`QPDFWriter::writeLinearized` →
     // `computeDeterministicIDData`, qpdf 11.9.0; the hint stream is written only
     // afterwards). That pass-1 buffer is loop-invariant (it carries no hint
-    // stream, so it never depends on a later hint-object splice), so build it once here and
-    // digest it. This pass-1 digest is now computed for *both* paths whenever
+    // stream, so it never depends on a later hint-object splice), so emit it
+    // once here and digest it. This pass-1 digest is now computed for *both* paths whenever
     // `--deterministic-id` is set. The classic (stream-free) path emits it
     // directly at both `/ID` sites in the final pass — no placeholder, no
     // post-write byte scan. The ObjStm / xref-stream path still uses the
@@ -3833,10 +3914,16 @@ fn write_linearized_impl<R: Read + Seek>(
     // `id_writer = None`), exactly as qpdf's pass 1 does, so the digest depends
     // only on the input and is stable.
     let pass1_part1 = build_pass1_part1(&part1);
-    let pass1_output = do_write_pass(
+    let mut pass1_target = Pass1OutputTarget::new(pass1_path)?;
+    let mut pass1_sink = OutputSink::new(&mut pass1_target);
+    if deterministic_id {
+        pass1_sink.begin_digest();
+    }
+    let pass1_result = do_write_pass(
         plan,
         renumber,
         pdf,
+        &mut pass1_sink,
         &pass1_part1,
         catalog_new_ref,
         hint_stream_new_num,
@@ -3855,16 +3942,21 @@ fn write_linearized_impl<R: Read + Seek>(
         encrypted_string_emitter.as_mut(),
         eff_version,
         eff_ext,
-    )?; // cov:ignore: pass-1 mode uses the same write path as the successful final pass while omitting only the hint object.
+    );
+    let pass1_finish = pass1_sink.finish_document();
+    let pass1_digest = if deterministic_id {
+        Some(pass1_sink.take_digest())
+    } else {
+        None
+    };
+    drop(pass1_sink);
+    let pass1_output = pass1_result?; // cov:ignore: pass-1 mode uses the same write path as the successful final pass while omitting only the hint object.
+    pass1_finish?;
+    let pass1_digest = pass1_digest.transpose()?;
 
     let classic_det_id: Option<(Vec<u8>, [u8; 16])> = if deterministic_id {
-        let pass1_bytes = &pass1_output.bytes;
-        // Whole-buffer digest: a linearized file repeats `/ID` at several
-        // sites, so there is no single `[` cutoff; pass the last index as the
-        // inclusive end (matching the prior patch step's digest range).
-        Some(crate::writer::compute_deterministic_id(
-            pass1_bytes,
-            pass1_bytes.len() - 1,
+        Some(crate::writer::compute_deterministic_id_from_digest(
+            pass1_digest.expect("deterministic pass-1 digest is enabled"),
             &det_id_info_suffix,
             det_id_source_id0.as_deref(),
         ))
@@ -4206,6 +4298,22 @@ fn write_linearized_impl<R: Read + Seek>(
         hint_stream_aes_iv,
     )?; // cov:ignore: internally-built hint payload and encryption context make this only a defensive propagation boundary.
 
+    if pass1_path.is_some() {
+        let debug_comments = format!(
+            "% hint_offset={}\n\
+             % hint_length={}\n\
+             % second_xref_offset={}\n\
+             % second_xref_end={}\n",
+            pass1_output.hint_stream_offset,
+            hint_stream_object.len(),
+            pass1_output.last_xref_offset,
+            pass1_output.second_xref_end
+        );
+        // qpdf appends these comments immediately after closing the pass-1
+        // pipeline and before starting pass 2 (`QPDFWriter.cc:2886-2900`).
+        pass1_target.write_debug_comments(debug_comments.as_bytes());
+    }
+
     // Final pass: write the layout with the exact hint object generated
     // above. The pass-1 virtual offsets and the spliced object length are
     // therefore related by qpdf's adjusted-offset rule.
@@ -4238,17 +4346,20 @@ fn write_linearized_impl<R: Read + Seek>(
         }
         None => None,
     };
-    let final_output = do_write_pass(
+    let mut final_bytes = Vec::new();
+    let mut final_sink = OutputSink::new(&mut final_bytes);
+    let final_result = do_write_pass(
         plan,
         renumber,
         pdf,
+        &mut final_sink,
         &part1,
         catalog_new_ref,
         hint_stream_new_num,
         total_count,
         info_new_ref,
         first_page_object_new_num,
-        Some(&hint_stream_object),
+        Some(hint_stream_object.as_slice()),
         structural_streams_filtered,
         &source_trailer_handle,
         &objstm_layout,
@@ -4260,9 +4371,12 @@ fn write_linearized_impl<R: Read + Seek>(
         encrypted_string_emitter.as_mut(),
         eff_version,
         eff_ext,
-    )?; // cov:ignore: pass 2 reuses the validated plan and fixed layout after pass 1 succeeds; this is only defensive error propagation.
+    );
+    let final_finish = final_sink.finish_document();
+    drop(final_sink);
+    let final_output = final_result?; // cov:ignore: pass 2 reuses the validated plan and fixed layout after pass 1 succeeds; this is only defensive error propagation.
+    final_finish?;
     let LinearizedPassOutput {
-        bytes: mut final_bytes,
         xref_offsets: final_xref_offsets,
         first_page_xref_offset: final_first_page_xref_offset,
         hint_stream_offset: final_hint_stream_offset,
@@ -4270,6 +4384,7 @@ fn write_linearized_impl<R: Read + Seek>(
         end_of_first_page_offset: final_end_of_first_page_offset,
         last_xref_offset: final_last_xref_keyword_offset,
         last_xref_first_entry_offset: final_last_xref_first_entry_offset,
+        second_xref_end: _final_second_xref_end,
         first_trailer_prev_range: final_first_trailer_prev_range,
         id_ranges: final_id_ranges,
     } = final_output;
@@ -4294,40 +4409,6 @@ fn write_linearized_impl<R: Read + Seek>(
         // identifier digested from qpdf's pass-1 buffer (byte-identical to qpdf's
         // value). The classic path direct-wrote it via `id_writer` already.
         patch_linearized_deterministic_id(&mut final_bytes, &final_id_ranges, id0, id1);
-    }
-
-    if let Some(pass1_path) = pass1_path {
-        let pass1_bytes = &pass1_output.bytes;
-        let pass1_hint_stream_offset = pass1_output.hint_stream_offset;
-        let pass1_main_xref_offset = pass1_output.last_xref_offset;
-        let second_xref_end = if objstm_layout.is_empty() {
-            0
-        } else {
-            let marker = b"startxref\n";
-            pass1_bytes
-                .windows(marker.len())
-                .rposition(|window| window == marker)
-                // cov:ignore-start: unreachable internal invariant — xref-stream
-                // pass 1 always ends with the startxref marker emitted by do_write_pass.
-                .ok_or_else(|| {
-                    crate::Error::Unsupported(
-                        "linearization writer: pass-1 xref-stream output has no trailing \
-                         startxref marker (internal invariant violated)"
-                            .to_string(),
-                    )
-                })?
-            // cov:ignore-end
-        };
-        let debug_comments = format!(
-            "% hint_offset={pass1_hint_stream_offset}\n\
-             % hint_length={final_hint_stream_obj_total_len}\n\
-             % second_xref_offset={pass1_main_xref_offset}\n\
-             % second_xref_end={second_xref_end}\n"
-        );
-        let mut pass1_file = std::fs::File::create(pass1_path)
-            .map_err(|source| crate::Error::file_io("open", pass1_path, source))?;
-        write_pass1_stdio_body(&mut pass1_file, pass1_bytes, pass1_path)?;
-        write_pass1_debug_comments(&mut pass1_file, debug_comments.as_bytes());
     }
 
     // ------------------------------------------------------------------
@@ -4449,9 +4530,150 @@ fn write_linearized_impl<R: Read + Seek>(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use md5::Digest as _;
     use std::io::Cursor;
+    use std::rc::Rc;
 
-    use crate::writer::ProgressReporter;
+    use crate::writer::{output::OutputSink, ProgressReporter, WriteCipher};
+
+    fn test_encryption_context() -> crate::writer::EncryptionContext {
+        crate::writer::EncryptionContext {
+            encrypt_dict: ObjectHandle::dictionary(Vec::new()),
+            file_key: vec![1; 5],
+            cipher: WriteCipher::PerObject(crate::encryption::standard::ObjectKeyAlg::Rc4),
+            encryption_v: 2,
+            encryption_r: 3,
+            encrypt_ref: ObjectRef::new(99, 0),
+            id0: b"id".to_vec(),
+            static_aes_iv: true,
+            encrypt_metadata: true,
+            metadata_ref: None,
+        }
+    }
+
+    #[test]
+    fn pass1_target_is_forward_only_and_counted() {
+        let mut target = Pass1OutputTarget::discard();
+        let mut sink = OutputSink::new(&mut target);
+        sink.begin_digest();
+        sink.write_bytes(b"pass-1")
+            .expect("pass-1 bytes are accepted");
+
+        let digest = sink.take_digest().expect("pass-1 digest is enabled");
+        let expected: [u8; 16] = md5::Md5::digest(b"pass-1").into();
+        assert_eq!(sink.position(), 6);
+        assert_eq!(digest, expected);
+        assert!(
+            target.patch_bytes(0..1, b"x").is_err(),
+            "pass-1 target must remain forward-only"
+        );
+    }
+
+    #[test]
+    fn repeated_padding_writes_large_and_partial_chunks() {
+        let mut bytes = Vec::new();
+        let mut sink = OutputSink::new(&mut bytes);
+
+        write_repeated_bytes(&mut sink, b' ', 4096 * 2 + 7).expect("padding writes");
+
+        drop(sink);
+        assert_eq!(bytes.len(), 4096 * 2 + 7);
+        assert!(bytes.iter().all(|&byte| byte == b' '));
+    }
+
+    #[test]
+    fn linearization_body_stream_and_objstm_paths_write_through_output_sink() {
+        let stream = ObjectHandle::stream(
+            ObjectHandle::dictionary(Vec::new()),
+            Rc::new(b"stream-data".to_vec()),
+        );
+        let renumber = RenumberMap::from_plan(&LinearizationPlan::default());
+        let mut plain_bytes = Vec::new();
+        let mut plain_sink = OutputSink::new(&mut plain_bytes);
+        append_body_object(
+            &mut plain_sink,
+            ObjectRef::new(1, 0),
+            ObjectRef::new(1, 0),
+            &stream,
+            &WriterOptions::default(),
+            None,
+            None,
+            &renumber,
+            &BTreeSet::new(),
+            &BTreeSet::new(),
+        )
+        .expect("plain stream body writes");
+        drop(plain_sink);
+        assert!(plain_bytes
+            .windows(b"endstream".len())
+            .any(|window| window == b"endstream"));
+
+        let container = ObjStmContainer {
+            container_new_num: 2,
+            members: Vec::new(),
+        };
+        let mut pdf = Pdf::empty().expect("empty PDF for ObjStm output");
+        let mut plain_objstm_bytes = Vec::new();
+        let mut plain_objstm_sink = OutputSink::new(&mut plain_objstm_bytes);
+        append_objstm_container_object(
+            &mut plain_objstm_sink,
+            &container,
+            &renumber,
+            &mut pdf,
+            &BTreeSet::new(),
+            &WriterOptions::default(),
+            None,
+        )
+        .expect("plain ObjStm body writes");
+        drop(plain_objstm_sink);
+
+        let mut encrypted_pdf = Pdf::empty().expect("empty PDF for encrypted ObjStm output");
+        let encryption = test_encryption_context();
+        let mut encrypted_bytes = Vec::new();
+        let mut encrypted_sink = OutputSink::new(&mut encrypted_bytes);
+        append_objstm_container_object(
+            &mut encrypted_sink,
+            &container,
+            &renumber,
+            &mut encrypted_pdf,
+            &BTreeSet::new(),
+            &WriterOptions::default(),
+            Some(&encryption),
+        )
+        .expect("encrypted ObjStm body writes");
+        drop(encrypted_sink);
+        assert!(plain_objstm_bytes.starts_with(b"2 0 obj\n"));
+        assert!(encrypted_bytes.starts_with(b"2 0 obj\n"));
+    }
+
+    #[test]
+    fn classic_main_xref_emits_free_entries_for_missing_offsets() {
+        let trailer = ObjectHandle::dictionary(vec![(
+            b"/ID".to_vec(),
+            ObjectHandle::array(vec![
+                ObjectHandle::new_indirect_unresolved(ObjectRef::new(8, 0), -1),
+                ObjectHandle::string(vec![1; 16]),
+            ]),
+        )]);
+        let mut bytes = Vec::new();
+        let mut sink = OutputSink::new(&mut bytes);
+
+        write_main_xref_and_trailer(
+            &mut sink,
+            &BTreeMap::new(),
+            3,
+            0,
+            &trailer,
+            &|object_ref| Ok(object_ref),
+            &BTreeSet::new(),
+            None,
+        )
+        .expect("classic xref with missing offsets");
+        drop(sink);
+        assert!(bytes
+            .windows(b"0000000000 65535 f \n".len())
+            .any(|window| window == b"0000000000 65535 f \n"));
+    }
 
     fn one_page_pdf_with_direct_outlines() -> Vec<u8> {
         let mut pdf = b"%PDF-1.4\n".to_vec();
@@ -4513,8 +4735,10 @@ mod tests {
         let unresolved = ObjectHandle::new_indirect_unresolved(ObjectRef::new(91, 0), -1);
         let plan = LinearizationPlan::default();
         let renumber = RenumberMap::from_plan(&plan);
+        let mut bytes = Vec::new();
+        let mut sink = OutputSink::new(&mut bytes);
         let error = append_body_object(
-            &mut Vec::new(),
+            &mut sink,
             ObjectRef::new(1, 0),
             ObjectRef::new(91, 0),
             &unresolved,

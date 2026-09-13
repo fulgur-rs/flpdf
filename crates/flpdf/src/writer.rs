@@ -3045,45 +3045,23 @@ pub(crate) fn deterministic_id_info_suffix<R: Read + Seek>(pdf: &mut Pdf<R>) -> 
     suffix
 }
 
-/// Compute qpdf's two-level deterministic `/ID` from the serialized output.
+/// Compute qpdf's two-level deterministic `/ID` from a completed MD5 scope.
 ///
-/// `bytes` is the output written up to and including the `/ID` array's opening
-/// `[`; `id_array_offset` is the inclusive end of the content digest range.
-/// Mirrors `QPDFWriter::computeDeterministicIDData` + `generateID`:
-///
-/// 1. `det_data` = lowercase hex of `md5(bytes[0..=id_array_offset])`. The flat
-///    writers call this from [`write_deterministic_id_inline`] with the offset
-///    of the just-written `[`, so the range is inclusive of the `[` (qpdf
-///    captures the running digest immediately after writing `" /ID ["`). The
-///    linearized writer instead passes `bytes.len() - 1` to digest the whole
-///    output, because a linearized file repeats `/ID` in several
-///    trailers/xref-stream dicts and so has no single `[` cutoff; its all-zero
-///    placeholder makes that whole-buffer digest depend only on the input,
-///    keeping it self-stable across runs. qpdf computes this body digest with
-///    `Pl_MD5`, which hashes the full byte range regardless of any embedded NUL
-///    (unlike the seed in step 3).
-/// 2. `seed` = `det_data` + `" QPDF "` + `info_suffix`.
-/// 3. `/ID[1]` (changing identifier) = `md5(seed)`, but the seed is truncated at
-///    its first NUL byte before hashing. qpdf hashes the seed with
-///    `MD5::encodeString(seed.c_str())`, which treats the seed as a C string and
-///    stops at the first NUL (`strlen`). The hex `det_data` and `" QPDF "` are
-///    NUL-free, so any NUL originates in `info_suffix` (e.g. a UTF-16BE `/Info`
-///    string, whose `00xx` code units carry NUL bytes); everything from the
-///    first NUL onward is excluded from the changing identifier exactly as qpdf
-///    excludes it.
-/// 4. `/ID[0]` (permanent identifier) = `source_id0` (verbatim, any length) when
-///    present, else a copy of `/ID[1]`.
-pub(crate) fn compute_deterministic_id(
-    bytes: &[u8],
-    id_array_offset: usize,
+/// qpdf's linearized writer feeds the complete first-pass output through
+/// `Pl_MD5`, then hashes the lowercase digest plus `" QPDF "` and the `/Info`
+/// suffix. The suffix is treated as a C string for the second MD5, while the
+/// first MD5 covers every accepted output byte. `/ID[0]` remains the source
+/// permanent identifier when one exists, otherwise it copies `/ID[1]`.
+pub(crate) fn compute_deterministic_id_from_digest(
+    det_data: [u8; 16],
     info_suffix: &[u8],
     source_id0: Option<&[u8]>,
 ) -> (Vec<u8>, [u8; 16]) {
     use md5::Digest as _;
-    let det_data = md5::Md5::digest(&bytes[..=id_array_offset]);
+
     // 32 hex chars for the 16-byte digest + " QPDF " (6) + the /Info suffix.
     let mut seed = Vec::with_capacity(32 + 6 + info_suffix.len());
-    push_hex_lower(&mut seed, det_data.as_slice());
+    push_hex_lower(&mut seed, &det_data);
     seed.extend_from_slice(b" QPDF ");
     seed.extend_from_slice(info_suffix);
     // qpdf hashes the seed as a C string (`encodeString(seed.c_str())`), so it
@@ -3101,8 +3079,8 @@ pub(crate) fn compute_deterministic_id(
 /// output position, computing it from the bytes written so far.
 ///
 /// Mirrors `QPDFWriter::generateID`: push `[`, MD5-digest the bytes written so
-/// far (inclusive of the `[`, the range [`compute_deterministic_id`] expects),
-/// compute the two-level identifier, then write `<id0_hex><id1_hex>]`. This
+/// far (inclusive of the `[`), compute the two-level identifier, then write
+/// `<id0_hex><id1_hex>]`. This
 /// replaces the placeholder-then-byte-search scheme on the flat write paths, so
 /// a crafted placeholder-shaped byte run elsewhere can never be mistaken for the
 /// real `/ID`. The emitted bytes are identical to

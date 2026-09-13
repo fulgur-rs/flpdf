@@ -780,7 +780,32 @@ local sink の位置はその buffer 内の座標で、完成した payload を 
 `writer/serialize.rs`、`writer/plain/xref.rs`）。ObjStm body は一 container を書き終えると
 drop され、complete document/body buffer や planned multi-stream payload cache は
 non-linearized route に残さない。一方、linearization の pass buffer/back-patch region は
-この変更の対象外であり、線形化の所有設計を変更したという主張ではない。
+final pass だけが保持し、pass 1 は下記の direct sink route を使う。
+
+### Linearized pass-1 ownership (`flpdf-ymuj.5`, 2026-09-13)
+
+qpdf 11.9.0 の `QPDFWriter::writeLinearized` は pass 1 の開始時に、指定された
+`lin_pass1_filename` なら `Pl_StdioFile`、それ以外なら `pushDiscardFilter` を pipeline
+へ積み、deterministic ID 使用時だけ `Pl_MD5` を重ねる
+（`QPDFWriter.cc:2656-2676`）。pass 1 は header、padding、first-half xref、body、main
+xref をその場で forward-write し、完全な body を `Members` に保持しない。pass 1 の後に
+保持するのは `file_size`、xref位置、hint offset/length と `Pl_Buffer` の hint bytes
+だけであり、`QPDFWriter.hh:688-690` にも pass-1 body member は存在しない。hint buffer は
+`QPDFWriter.cc:2872-2885` で作られ、debug file は `:2886-2900` で4つの offset/length
+コメントを追記する。`--linearize-pass1` 自体は qpdf が「valid PDFではない debugging
+file」と定義する option (`qpdf/auto_job_help.hh:1000-1005`) で、qtest は final file と
+pass-1 file を別々に検査する (`qpdf/qtest/linearize-pass1.test:19-29`)。
+
+flpdf は `Pass1OutputTarget` を discard または `BufWriter<File>` として構築し、既存の
+`writer/output.rs::OutputSink` で accepted-byte position と deterministic-ID MD5 を一つの
+forward boundaryへ統合する。`linearization/writer.rs::do_write_pass` は両 pass とも
+`OutputSink`へ直接 emissionし、`LinearizedPassOutput` は xref/offset/length/range metadata
+だけを返す。pass 1 の classic xref と ObjStm xref stream は qpdf と同じ zero/forward
+representation をその場で書くため、seekable temporary PDFも pass-1 body Vecも不要である。
+final pass は `LinearizedDocument::bytes` のため Vec-backed targetを保持し、qpdf-shaped
+fixed-width xref/ID back-patchだけをその最終 bufferへ限定する。pass-1 artifactの debug
+commentsは metadataから追記し、body再走査による `startxref` 探索やpass-1 body cloneを
+行わない。
 
 qpdf の standard writer は `enqueueObjectsStandard`（`QPDFWriter.cc:2907-2925`）で `/Root`
 と trimmed trailer の seed を queue に積み、`unparseChild` が indirect child を書く直前に
