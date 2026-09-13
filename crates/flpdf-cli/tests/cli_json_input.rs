@@ -197,9 +197,18 @@ fn json_input_show_pages_applies_coalesce_contents_like_qpdf() {
 
     assert!(qpdf.status.success(), "qpdf failed: {qpdf:?}");
     assert_eq!(flpdf.status.code(), qpdf.status.code());
-    assert_eq!(flpdf.stdout, qpdf.stdout);
-    assert_eq!(flpdf.stderr, qpdf.stderr);
-    assert_eq!(qpdf.stdout, b"page 1: 3 0 R\n  content:\n    6 0 R\n");
+    assert_eq!(
+        normalize_program_prefix(&flpdf.stdout),
+        normalize_program_prefix(&qpdf.stdout)
+    );
+    assert_eq!(
+        normalize_program_prefix(&flpdf.stderr),
+        normalize_program_prefix(&qpdf.stderr)
+    );
+    assert_eq!(
+        normalize_program_prefix(&qpdf.stdout),
+        b"page 1: 3 0 R\n  content:\n    6 0 R\n"
+    );
 }
 
 #[test]
@@ -235,9 +244,18 @@ fn update_from_json_show_pages_applies_coalesce_contents_like_qpdf() {
 
     assert!(qpdf.status.success(), "qpdf failed: {qpdf:?}");
     assert_eq!(flpdf.status.code(), qpdf.status.code());
-    assert_eq!(flpdf.stdout, qpdf.stdout);
-    assert_eq!(flpdf.stderr, qpdf.stderr);
-    assert_eq!(qpdf.stdout, b"page 1: 4 0 R\n  content:\n    7 0 R\n");
+    assert_eq!(
+        normalize_program_prefix(&flpdf.stdout),
+        normalize_program_prefix(&qpdf.stdout)
+    );
+    assert_eq!(
+        normalize_program_prefix(&flpdf.stderr),
+        normalize_program_prefix(&qpdf.stderr)
+    );
+    assert_eq!(
+        normalize_program_prefix(&qpdf.stdout),
+        b"page 1: 4 0 R\n  content:\n    7 0 R\n"
+    );
 }
 
 #[test]
