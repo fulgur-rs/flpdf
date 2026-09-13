@@ -50,14 +50,21 @@ fn preserve_without_source_objstm_selects_the_disable_shaped_live_consumer() {
         .and_then(|(_, rest)| rest.split_once("\n}\n"))
         .map(|(body, _)| body)
         .expect("write_plain body");
+    // Pin the complete binding expression, not just the presence of the
+    // Preserve token. A conjunct appended after the `matches!` would sit
+    // outside a slice that stops at the macro's closing paren, and would
+    // silently drop empty-map Preserve from the live consumer.
     let shaped = write_plain
-        .split_once("let is_live_disable_shaped = matches!(")
-        .and_then(|(_, rest)| rest.split_once(");"))
+        .split_once("let is_live_disable_shaped =")
+        .and_then(|(_, rest)| rest.split_once(";"))
         .map(|(binding, _)| binding)
         .expect("is_live_disable_shaped binding");
-    assert!(
-        shaped.contains("ObjectStreamMode::Preserve"),
-        "Preserve must be part of the Disable-shaped live condition"
+    let shaped = shaped.split_whitespace().collect::<Vec<_>>().join(" ");
+    assert_eq!(
+        shaped,
+        "matches!( options.object_streams, ObjectStreamMode::Disable | \
+         ObjectStreamMode::Preserve )",
+        "the Disable-shaped condition must be exactly the object-stream mode test"
     );
     // Pin the complete guard, not just its return. Asserting only the branch
     // body would still pass if a conjunct were added that routes empty-map
