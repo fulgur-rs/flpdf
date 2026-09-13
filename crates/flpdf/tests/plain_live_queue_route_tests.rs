@@ -39,10 +39,42 @@ fn preserve_without_source_objstm_selects_the_disable_shaped_live_consumer() {
     let root = Path::new(env!("CARGO_MANIFEST_DIR")).join("src");
     let plain = std::fs::read_to_string(root.join("writer/plain/mod.rs")).unwrap();
 
-    assert!(plain.contains("ObjectStreamMode::Disable | ObjectStreamMode::Preserve"));
-    assert!(plain.contains("qdf_or_normalize_live_eligible"));
-    assert!(plain.contains("source_object_stream_data.is_empty()"));
-    assert!(plain.contains("return write_plain_live_disable("));
+    // Bind each assertion to the construct it claims. Independent substring
+    // checks over the whole module would still pass if Preserve were dropped
+    // from the branch condition, because the same tokens appear in
+    // `qdf_or_normalize_live_eligible`.
+    let write_plain = plain
+        .split_once("pub(crate) fn write_plain<")
+        .and_then(|(_, rest)| rest.split_once("\n}\n"))
+        .map(|(body, _)| body)
+        .expect("write_plain body");
+    let shaped = write_plain
+        .split_once("let is_live_disable_shaped = matches!(")
+        .and_then(|(_, rest)| rest.split_once(");"))
+        .map(|(binding, _)| binding)
+        .expect("is_live_disable_shaped binding");
+    assert!(
+        shaped.contains("ObjectStreamMode::Preserve"),
+        "Preserve must be part of the Disable-shaped live condition"
+    );
+    let branch = write_plain
+        .split_once("if is_live_disable_shaped")
+        .and_then(|(_, rest)| rest.split_once("\n    }"))
+        .map(|(branch, _)| branch)
+        .expect("is_live_disable_shaped branch");
+    assert!(
+        branch.contains("return write_plain_live_disable("),
+        "the Disable-shaped branch must return the live disable consumer"
+    );
+    let eligible = plain
+        .split_once("pub(crate) fn qdf_or_normalize_live_eligible")
+        .and_then(|(_, rest)| rest.split_once("\n}\n"))
+        .map(|(body, _)| body)
+        .expect("qdf_or_normalize_live_eligible body");
+    assert!(
+        eligible.contains("source_object_stream_data.is_empty()"),
+        "the QDF/normalize live route must key on the empty source membership"
+    );
 }
 
 #[test]
