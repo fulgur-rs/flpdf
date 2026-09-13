@@ -485,6 +485,7 @@ specialized coordinator 内部（`4a2faf5c` の状態）:
 | `D1` / `D25` | `flpdf-3yn9.48.59` | prepareFileForWriteのgraph準備を分岐前に一度だけ実行する |
 | `D25` | `flpdf-3yn9.48.60` | root unparseObjectへADBE出力処理を移しsnapshot/restoreを撤去する |
 | `D14` | `flpdf-nhet` | `getTrimmedTrailer` の xref-structural key と source trailer key の境界を揃え、`/F`・`/FFilter`・`/FDecodeParms` の到達性・late numbering を保持する |
+| `D25` | `flpdf-mcjj` | PCLm の direct `/Root` では qpdf の `is_root` 判定を満たさないため ADBE reconciliation を適用しない |
 | `D26` | `flpdf-3yn9.48.61` | initializeSpecialStreamsのpage/content/normalized mapをsetupで一度生成する |
 | `D16` / `D1` | `flpdf-3yn9.48.62` | encryption設定・doWriteSetupを単一writer stateに揃える |
 | `D3` | `flpdf-3yn9.48.63` | linearizationの採番engineを使ったcache warmup迂回を撤去する |
@@ -619,3 +620,14 @@ Generate、QDF Preserve、linearized の byte/status を比較し、PCLm の pag
 seed後に late-number される trailer reference も専用テストで固定した。これは D14
 の source-key boundary 修正であり、writeTrailer の複数 consumer が残る D14 mixed
 分類や route matrix 全体の parity 完了を意味しない。
+
+`flpdf-mcjj` は PCLm の direct-root semantics を補正する。qpdf の
+`QPDFWriter::Members::root_og` は direct `/Root` では `(-1, 0)` となり、
+`unparseObject` の `old_og == root_og` guard が false のため、source Catalog の
+`/Extensions /ADBE` は final PDF version に調停されない
+（`libqpdf/QPDFWriter.cc:53,1374-1436`）。PCLm の direct-root copy は
+`output_root_copy_with_adbe(..., false)` を使い、indirect Catalog の true 経路は
+変更しない。direct `/Root` に不一致の `/ADBE` を持つ fixture-built document の
+PCLm regression test で、source `/1.4`・level 5 が保持されることを固定する。
+これは direct-root semantics の bounded fixであり、PCLm と writer 全体の parity
+完了を意味しない。
