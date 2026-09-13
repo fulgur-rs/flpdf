@@ -1174,6 +1174,13 @@ mod reverse_containment_layout_tests {
     fn source_extent_state_does_not_live_in_production_slots() {
         assert!(std::mem::size_of::<ObjectSlot>() < 40);
     }
+
+    #[test]
+    fn raw_identity_width_does_not_widen_shared_value_metadata() {
+        assert_eq!(std::mem::size_of::<QpdfObjGen>(), 8);
+        assert_eq!(std::mem::size_of::<Option<QpdfObjGen>>(), 12);
+        assert!(std::mem::size_of::<ValueIdentity>() <= 48);
+    }
 }
 
 fn replace_first(bytes: &mut Vec<u8>, needle: &[u8], replacement: &[u8]) {
@@ -1234,9 +1241,11 @@ struct SharedValueState {
 
 impl SharedValueState {
     fn qpdf_obj_gen(&self) -> Option<QpdfObjGen> {
-        self.identity
-            .qpdf_obj_gen
-            .or_else(|| self.identity.object_ref.map(QpdfObjGen::from_object_ref))
+        self.identity.qpdf_obj_gen.or_else(|| {
+            self.identity
+                .object_ref
+                .map(QpdfObjGen::from_valid_object_ref)
+        })
     }
 
     fn object_ref(&self) -> Option<ObjectRef> {
@@ -1985,7 +1994,7 @@ impl ObjectHandle {
                 ObjectValue::Reserved,
                 ValueIdentity {
                     object_ref: Some(object_ref),
-                    qpdf_obj_gen: Some(QpdfObjGen::from_object_ref(object_ref)),
+                    qpdf_obj_gen: Some(QpdfObjGen::from_valid_object_ref(object_ref)),
                     active_pdf_unique_id: NonZeroU64::new(pdf_unique_id),
                     resolver: Some(resolver),
                 },
@@ -2055,7 +2064,7 @@ impl ObjectHandle {
         resolver: Option<Weak<dyn DocumentResolver>>,
     ) -> Self {
         let handle = Self::new_indirect_unresolved_qpdf_obj_gen_with_identity(
-            QpdfObjGen::from_object_ref(object_ref),
+            QpdfObjGen::from_valid_object_ref(object_ref),
             offset,
             pdf_unique_id,
             resolver,
@@ -2304,7 +2313,7 @@ impl ObjectHandle {
         let shared = self.0.borrow().shared.clone();
         shared.borrow_mut().identity = ValueIdentity {
             object_ref: Some(object_ref),
-            qpdf_obj_gen: Some(QpdfObjGen::from_object_ref(object_ref)),
+            qpdf_obj_gen: Some(QpdfObjGen::from_valid_object_ref(object_ref)),
             active_pdf_unique_id: NonZeroU64::new(pdf_unique_id),
             resolver: Some(resolver),
         };
@@ -6888,16 +6897,16 @@ impl ObjectHandle {
             let mut count = Count::new("stream provider count", pipeline);
             let success = if provider.supports_retry() {
                 provider.provide_stream_data_with_retry_by_qpdf_obj_gen(
-                    object_gen.get_obj(),
-                    object_gen.get_gen(),
+                    i64::from(object_gen.get_obj()),
+                    i64::from(object_gen.get_gen()),
                     &mut count,
                     suppress_warnings,
                     will_retry,
                 )?
             } else {
                 provider.provide_stream_data_by_qpdf_obj_gen(
-                    object_gen.get_obj(),
-                    object_gen.get_gen(),
+                    i64::from(object_gen.get_obj()),
+                    i64::from(object_gen.get_gen()),
                     &mut count,
                 )?;
                 true

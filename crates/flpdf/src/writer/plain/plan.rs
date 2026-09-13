@@ -343,10 +343,7 @@ impl PlainWritePlan {
                     // cov:ignore-start: qdf XRef-stream raw identities are
                     // not representable as a valid input object reference.
                     PlannedIndirectObject::RawSource { raw, .. } => pdf
-                        .get_object_handle_by_raw_identity(
-                            raw.get_obj() as i32,
-                            raw.get_gen() as i32,
-                        )
+                        .get_object_handle_by_raw_identity(raw.get_obj(), raw.get_gen())
                         .try_is_stream_of_type(b"XRef", b"")?,
                     // cov:ignore-end
                     PlannedIndirectObject::ObjectStream { .. } => false,
@@ -779,8 +776,7 @@ fn build_qdf_emission_plan<R: Read + Seek>(
             PlannedIndirectObject::RawSource { source, raw, .. } => {
                 let emission = next_number()?;
                 result.map.insert(*source, ObjectRef::new(emission, 0));
-                let handle = pdf
-                    .get_object_handle_by_raw_identity(raw.get_obj() as i32, raw.get_gen() as i32);
+                let handle = pdf.get_object_handle_by_raw_identity(raw.get_obj(), raw.get_gen());
                 handle.try_dereference()?;
                 if handle.as_stream_dict().is_some()
                     && !handle.try_is_stream_of_type(b"XRef", b"")?

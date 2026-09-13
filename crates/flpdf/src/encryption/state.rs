@@ -106,7 +106,7 @@ impl EncryptionState {
         use_aes: Option<bool>,
     ) -> Result<()> {
         self.decrypt_object_string_qpdf_obj_gen(
-            QpdfObjGen::from_object_ref(object_ref),
+            QpdfObjGen::from_valid_object_ref(object_ref),
             bytes,
             use_aes,
         )
@@ -154,7 +154,7 @@ impl EncryptionState {
     /// object/generation pair; `use_aes` is intentionally omitted.
     #[allow(dead_code)]
     pub(crate) fn key_for_object(&mut self, og: ObjectRef, use_aes: bool) -> &[u8] {
-        self.key_for_qpdf_obj_gen(QpdfObjGen::from_object_ref(og), use_aes)
+        self.key_for_qpdf_obj_gen(QpdfObjGen::from_valid_object_ref(og), use_aes)
     }
 
     pub(crate) fn key_for_qpdf_obj_gen(&mut self, og: QpdfObjGen, use_aes: bool) -> &[u8] {
@@ -162,8 +162,8 @@ impl EncryptionState {
             self.cached_object_encryption_key =
                 crate::encryption::primitives::compute_data_key_qpdf_obj_gen(
                     &self.file_key,
-                    og.get_obj(),
-                    og.get_gen(),
+                    i64::from(og.get_obj()),
+                    i64::from(og.get_gen()),
                     use_aes,
                     self.encryption_v,
                 );
