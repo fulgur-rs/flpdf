@@ -307,7 +307,7 @@ fn direct_scalar_uses_at_most_two_allocations_without_a_single_owner_list() {
         direct_scalar.allocations
     );
     assert!(
-        direct_scalar.live_bytes <= 336,
+        direct_scalar.live_bytes <= 296,
         "direct scalar retained {} live bytes; containment parent storage is not compact",
         direct_scalar.live_bytes
     );
