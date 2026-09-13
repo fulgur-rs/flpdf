@@ -70,3 +70,19 @@ fn pdf_teardown_has_one_canonical_disconnect_owner() {
         "qpdf teardown clears xref_table before disconnecting obj_cache"
     );
 }
+
+#[test]
+fn resolver_has_one_raw_source_xref_owner() {
+    let resolver = production_source("reader/resolver.rs");
+    assert!(
+        !resolver.contains("source_xref_entries: BTreeMap<ObjectRef, XrefEntry>"),
+        "production resolver must not retain a second ObjectRef-keyed source xref map"
+    );
+    assert_eq!(
+        resolver
+            .matches("raw_source_xref_entries: BTreeMap<QpdfObjGen, XrefEntry>")
+            .count(),
+        1,
+        "the resolver must have exactly one raw QPDFObjGen source table"
+    );
+}
