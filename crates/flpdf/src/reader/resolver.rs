@@ -883,7 +883,10 @@ struct ParsedObjectAtOffset {
     /// cache boundary so legacy tree consumers can preserve their error path.
     malformed: bool,
     parsed_offset: i64,
-    description: Vec<u8>,
+    /// The parser-owned description template is transferred into the
+    /// canonical cache without copying its payload. This is qpdf's one
+    /// `QPDFValue::Description` shared across a parse call.
+    description: Rc<Vec<u8>>,
     end_before_space: i64,
     end_after_space: i64,
     /// The tokenizer start of the token after the parsed object value. qpdf's
@@ -2889,7 +2892,7 @@ impl<R: Read + Seek> ResolverHandle<R> {
         handle.set_parsed_offset_if_unset(parsed_offset);
         handle.set_end_offsets(end_before_space, end_after_space);
         if !description.is_empty() {
-            handle.set_description(description, parsed_offset);
+            handle.set_shared_description(description, parsed_offset);
         }
     }
 
@@ -3533,7 +3536,7 @@ impl<R: Read + Seek> ResolverHandle<R> {
             handle.set_parsed_offset_if_unset(parsed_offset);
             handle.set_end_offsets(end_before_space, end_after_space);
             if !description.is_empty() {
-                handle.set_description(description, parsed_offset);
+                handle.set_shared_description(description, parsed_offset);
             }
             return Ok((handle, damage_offset));
         }
@@ -3744,7 +3747,7 @@ impl<R: Read + Seek> ResolverHandle<R> {
                 value,
                 malformed: false,
                 parsed_offset,
-                description: Vec::new(),
+                description: Rc::new(Vec::new()),
                 end_before_space,
                 end_after_space,
                 trailing_start,
@@ -3793,7 +3796,7 @@ impl<R: Read + Seek> ResolverHandle<R> {
                 value,
                 malformed,
                 parsed_offset,
-                description: stream_description,
+                description: Rc::new(stream_description),
                 end_before_space,
                 end_after_space,
                 trailing_start,
@@ -3827,7 +3830,7 @@ impl<R: Read + Seek> ResolverHandle<R> {
                 value,
                 malformed,
                 parsed_offset,
-                description: description.as_ref().clone(),
+                description: Rc::clone(&description),
                 end_before_space,
                 end_after_space,
                 trailing_start,
@@ -6585,6 +6588,38 @@ mod tests {
             ResolverWarningOptions::new(crate::QPDFLogger::create(), true, Vec::new()),
             0,
         )
+    }
+
+    #[test]
+    fn canonical_cache_preserves_the_parser_description_template_owner() {
+        let resolver = resolver_over_named_object(
+            b"\n1 0 obj\n<< /Child 7 >>\nendobj\n%tail\n".to_vec(),
+            ObjectRef::new(1, 0),
+            "input.pdf",
+        );
+        let parsed = resolver
+            .read_object_at_offset_with_description(
+                1,
+                QpdfObjGen::from_object_ref(ObjectRef::new(1, 0)),
+                true,
+                false,
+                None,
+            )
+            .expect("object should parse");
+        let child_template = match &parsed.value {
+            ObjectValue::Dictionary(entries) => entries
+                .get(b"/Child".as_slice())
+                .and_then(|handle| handle.description_template())
+                .expect("child should retain the parser template"),
+            _ => panic!("expected dictionary object"), // cov:ignore: the fixture is constructed as a dictionary
+        };
+
+        resolver.cache_parsed_object(parsed);
+        let root_template = resolver
+            .get_object_handle(ObjectRef::new(1, 0))
+            .description_template()
+            .expect("canonical root should retain the parser template");
+        assert!(Rc::ptr_eq(&child_template, &root_template));
     }
 
     #[test]

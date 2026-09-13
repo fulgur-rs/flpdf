@@ -544,6 +544,12 @@ decoded InputSource 名（`<file> object stream N`、`libqpdf/QPDF.cc:1793-1805`
 伝播だけで、specialized decode、header map、effective xref、bounded reconstruction ownerは
 `.48.14`の責務を変更しない。
 
+`flpdf-x8bje` では残っていた bootstrap parser の per-call template 再生成と
+canonical `ParsedObjectAtOffset` の `Rc`→`Vec` 再コピーを除去した。bootstrap の
+各 parser invocation は一つの `Rc<Vec<u8>>` を保持し、canonical cache は同じ owner を
+`set_shared_description` へ移送する。JSON/Child description variant、`$PO`/`$OG` の
+rendering、parsed offset、warning/output contract は変更しない。
+
 `flpdf-92r5` では、owner-less bootstrap の `BootstrapHandleDocument` も
 qpdf の `QPDF_Stream::warn`（`libqpdf/QPDF_Stream.cc:695-698`）から
 `QPDF::warn`（`libqpdf/QPDF.cc:487-494`）へ渡る stream warningを、parsed
