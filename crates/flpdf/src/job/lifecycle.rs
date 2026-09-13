@@ -1448,6 +1448,11 @@ pub struct QPDFJob {
     primary_copy_encryption: Option<crate::CopyEncryptionSource>,
     /// qpdf's status bits consumed by the side-effect-free exit-code query.
     encryption_status: EncryptionStatus,
+    /// Whether the last create stage returned qpdf's successful null document
+    /// result. `create_qpdf` also uses `None` for errors, so the `run` wrapper
+    /// needs this separate bit to distinguish the `show_encryption`-
+    /// after-bad-password path from an ordinary failed creation.
+    create_qpdf_succeeded_without_document: bool,
     /// Whether this job created its primary document through
     /// [`QPDFJob::create_empty_document`]. qpdf's `Config::emptyInput` keys the
     /// page-spec source map with the empty string while `QPDF::emptyPDF`
@@ -1555,6 +1560,7 @@ impl QPDFJob {
             overlay_sources: Vec::new(),
             primary_copy_encryption: None,
             encryption_status: EncryptionStatus::default(),
+            create_qpdf_succeeded_without_document: false,
             empty_primary_created: false,
             partial_json_initialized: false,
         }
@@ -3113,6 +3119,7 @@ impl QPDFJob {
     /// Create the configured input document, returning `None` after qpdf-style
     /// error reporting for a missing or malformed input.
     pub fn create_qpdf(&mut self) -> Result<Option<JobDocument>> {
+        self.create_qpdf_succeeded_without_document = false;
         match self.check_configuration() {
             Ok(()) => {}
             Err(error @ Error::Usage(_)) => return Err(error),
@@ -3159,11 +3166,40 @@ impl QPDFJob {
                 }
             };
         }
-        match self.open_document_with_description(
-            BufReader::new(file),
-            path_description_bytes(&input),
-            self.configured_open_options(self.configuration.password.clone()),
-        ) {
+        let input_name = path_description_bytes(&input);
+        let open_result: Result<JobDocument> = if self.configuration.show_encryption {
+            // qpdf's createQPDF keeps the partially initialized QPDF when the
+            // password handler throws, but only for the show-encryption
+            // fallback (`libqpdf/QPDFJob.cc:432-448`). Use the existing
+            // inspection opener here so combined `run()` routes retain that
+            // parsed encryption state instead of converting it into the
+            // ordinary invalid-password error.
+            let source: Box<dyn ReadSeek> = Box::new(BufReader::new(file));
+            self.open_for_encryption_inspection_with_description(
+                source,
+                &input_name,
+                self.configured_open_options(self.configuration.password.clone()),
+            )
+        } else {
+            self.open_document_with_description(
+                BufReader::new(file),
+                &input_name,
+                self.configured_open_options(self.configuration.password.clone()),
+            )
+        };
+        match open_result {
+            Ok(mut pdf)
+                if self.configuration.show_encryption
+                    && pdf.is_encrypted()
+                    && pdf.encryption_file_key().is_none() =>
+            {
+                // qpdf reports the encryption parameters from the partial
+                // document and returns nullptr before update/page
+                // transformations or write/inspection continuation.
+                self.show_encryption(&mut pdf, self.configuration.password_is_hex_key)?;
+                self.create_qpdf_succeeded_without_document = true;
+                Ok(None)
+            }
             Ok(pdf) => match self.finish_created_document(pdf) {
                 Ok(pdf) => Ok(Some(pdf)),
                 Err(error) => {
@@ -3491,7 +3527,11 @@ impl QPDFJob {
             return self.run_encryption_status();
         }
         let Some(mut pdf) = self.create_qpdf()? else {
-            return Ok(JobExitCode::Error);
+            return Ok(if self.create_qpdf_succeeded_without_document {
+                self.get_exit_code()
+            } else {
+                JobExitCode::Error
+            });
         };
 
         let status = match self.write_qpdf(&mut pdf) {
