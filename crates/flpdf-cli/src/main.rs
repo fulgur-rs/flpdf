@@ -948,7 +948,6 @@ struct Cli {
               "add_attachment", "remove_attachment", "list_attachments",
               "show_attachment", "copy_attachments_from",
               "no_original_object_ids", "qdf", "coalesce_contents",
-              "flatten_annotations", "generate_appearances",
               "preserve_unreferenced",
           ],
           help = "Generate JSON v2 output (qpdf --json compatible)")]
@@ -1001,11 +1000,10 @@ struct Cli {
             "compress_streams", "recompress_flate", "compression_level",
             "linearize_pass1", "remove_restrictions",
             "decrypt", "encrypt", "copy_encryption",
-            "add_attachment", "remove_attachment", "list_attachments",
-            "show_attachment", "copy_attachments_from",
-            "no_original_object_ids", "qdf", "coalesce_contents",
-            "flatten_annotations", "generate_appearances",
-            "preserve_unreferenced",
+              "add_attachment", "remove_attachment", "list_attachments",
+              "show_attachment", "copy_attachments_from",
+              "no_original_object_ids", "qdf", "coalesce_contents",
+              "preserve_unreferenced",
         ],
         help = "Generate qpdf JSON output; VERSION defaults to 2 and the output file is positional"
     )]
@@ -1319,13 +1317,10 @@ struct Cli {
     /// `rewrite --flatten-annotations`; qpdf `--flatten-annotations`
     /// equivalent). Values are `all`, `screen`, or `print`. qpdf applies this
     /// after page selection when `--pages` is present.
-    // `json_output` has no dedicated dispatch check of its own (unlike
-    // `json`, which lists `flatten_annotations` on its own conflicts_with_all
-    // for the same reason): without it, `--flatten-annotations=all
-    // --json-output=2 in out` exits 0 and silently writes a JSON dump of the
-    // unmodified input while dropping the requested transformation, since
-    // main's dispatch chain routes to run_json before either rewrite path
-    // that consumes flatten_annotations. Confirmed live.
+    // JSON output is a create-stage consumer too. The transformation is
+    // applied by `run_json` before the JSON serializer, so qpdf-compatible
+    // combinations such as `--flatten-annotations=all --json-output=2` must
+    // remain reachable.
     #[arg(
         long = "flatten-annotations",
         value_enum,
@@ -1336,7 +1331,6 @@ struct Cli {
             "check", "show_object",
             "show_npages", "show_pages", "show_xref", "show_linearization",
             "show_encryption",
-            "json_output",
         ],
         help = "Flatten annotations into page content; MODE is all, screen, or print",
         overrides_with = "flatten_annotations"
@@ -1365,7 +1359,7 @@ struct Cli {
     /// inspection and rewrite routes use the same canonical job phase. Combining
     /// with `--linearize` is supported (threaded through the linearize branch
     /// of `run_rewrite`), so it is intentionally absent from this list.
-    #[arg(long = "generate-appearances", conflicts_with_all = ["json_output"])]
+    #[arg(long = "generate-appearances")]
     generate_appearances: bool,
 
     /// Recompress eligible non-JPEG images as DCT/JPEG (qpdf
@@ -3355,7 +3349,7 @@ fn main() {
     } else if args.json.is_some() || args.json_output.is_some() {
         run_json(
             &args,
-            top_level_image_transform_options,
+            top_level_inspection_transform_options,
             args.page_ops.empty,
         )
     } else if let Some(command) = args.command {
@@ -4175,7 +4169,11 @@ fn format_job_json_error(path: &Path, error: impl std::fmt::Display) -> String {
     )
 }
 
-fn run_json(cli: &Cli, image_options: ImageTransformOptions, empty: bool) -> CliResult<()> {
+fn run_json(
+    cli: &Cli,
+    transform_options: InspectionTransformOptions,
+    empty: bool,
+) -> CliResult<()> {
     const QPDF_JSON_KEY_NAMES: &[&str] = &[
         "acroform",
         "attachments",
@@ -4311,7 +4309,7 @@ fn run_json(cli: &Cli, image_options: ImageTransformOptions, empty: bool) -> Cli
 
     if empty {
         let mut pdf = create_empty_primary_document(&mut job, cli.update_from_json.as_deref())?;
-        apply_image_transformations(&mut pdf, image_options, cli.verbose)?;
+        apply_inspection_transformations(&mut job, &mut pdf, transform_options, cli.verbose)?;
         let mut runtime = JsonJobRuntime {
             input_identity: None,
             output_path,
@@ -4353,7 +4351,7 @@ fn run_json(cli: &Cli, image_options: ImageTransformOptions, empty: bool) -> Cli
             .create_from_json_document(input_file, path_description(input))
             .map_err(|error| json_error_with_file(input, Box::new(error)))?;
         apply_json_update_with_job(&mut job, &mut pdf, cli.update_from_json.as_deref())?;
-        apply_image_transformations(&mut pdf, image_options, cli.verbose)?;
+        apply_inspection_transformations(&mut job, &mut pdf, transform_options, cli.verbose)?;
         let mut runtime = JsonJobRuntime {
             input_identity: Some(&input_identity),
             output_path,
@@ -4378,7 +4376,7 @@ fn run_json(cli: &Cli, image_options: ImageTransformOptions, empty: bool) -> Cli
         job.record_document_warnings(&pdf);
         apply_json_update_with_job(&mut job, &mut pdf, cli.update_from_json.as_deref())?;
         apply_json_page_specs(&mut job, &mut pdf, input, &cli.page_ops)?;
-        apply_image_transformations(&mut pdf, image_options, cli.verbose)?;
+        apply_inspection_transformations(&mut job, &mut pdf, transform_options, cli.verbose)?;
         let mut runtime = JsonJobRuntime {
             input_identity: Some(&input_identity),
             output_path,

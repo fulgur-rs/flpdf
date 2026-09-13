@@ -452,9 +452,12 @@ fn add_qpdf_flatten_contents<R: Read + Seek>(
 }
 
 fn add_content_stream<R: Read + Seek>(pdf: &mut Pdf<R>, data: Vec<u8>) -> Result<ObjectHandle> {
-    let object_ref = pdf.next_available_object_ref()?;
-    let stream = ObjectHandle::stream(ObjectHandle::dictionary(Vec::new()), Rc::new(data));
-    pdf.replace_object(object_ref, stream)
+    // qpdf appends flatten wrappers with `QPDF::newStream(std::string)`
+    // (`QPDFPageDocumentHelper.cc:155-156`), whose buffer overload installs
+    // the live `/Length` boundary through `replaceStreamData`. Keep the same
+    // document-owned construction path here so JSON inspection observes the
+    // stream dictionary qpdf created, not a raw stream with a missing length.
+    pdf.new_stream_with_data(Rc::new(data))
 }
 
 /// Flatten eligible annotations on every leaf page in the document.
