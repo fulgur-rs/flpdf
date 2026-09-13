@@ -62,8 +62,10 @@
 //!
 //! `ValueIdentity::active_pdf_unique_id` is a container representation
 //! substitute for qpdf's per-value `QPDF*` back-pointer (`QPDFValue.hh:150`):
-//! a real qpdf counterpart exists, flpdf just projects it to a numeric id
-//! beside a separate `Weak` resolver route.
+//! a real qpdf counterpart exists, flpdf just projects it to a nonzero numeric
+//! id beside a separate `Weak` resolver route. qpdf's default unique id is
+//! zero (`QPDF.hh:1454`), so `Option<NonZeroU64>` preserves the same absent
+//! state without carrying a separate discriminant.
 //!
 //! `ObjectSlot::containment_parents` has no qpdf counterpart at all. qpdf's
 //! containers hold only forward child handles and never maintain an upward
@@ -159,6 +161,7 @@ use crate::{json::Json, Error, ObjectRef, QpdfErrorCode, QpdfExc, Result};
 use std::cell::RefCell;
 use std::collections::{BTreeMap, BTreeSet};
 use std::hash::{Hash, Hasher};
+use std::num::NonZeroU64;
 use std::rc::{Rc, Weak};
 
 type StreamTokenFilter = Rc<RefCell<dyn TokenFilter>>;
@@ -1541,7 +1544,10 @@ struct ObjectSlot {
     /// helper retains its owning `QPDF` alongside the shared object handle;
     /// this token preserves that single-document boundary for flpdf's
     /// per-call `&mut Pdf` API without introducing a raw-object bridge.
-    tree_pdf_unique_id: Option<u64>,
+    /// qpdf's default document unique id is zero; a nonzero tag is enough to
+    /// retain the helper's document claim without an extra `Option<u64>`
+    /// discriminant.
+    tree_pdf_unique_id: Option<NonZeroU64>,
     // qpdf-deviation: qpdf keeps only forward child handles; this weak reverse
     // edge has no qpdf counterpart and is retained solely for cfg(test)
     // containment-root assertions and stack-safe teardown bookkeeping.
@@ -1554,7 +1560,9 @@ struct ObjectSlot {
 struct ValueIdentity {
     object_ref: Option<ObjectRef>,
     qpdf_obj_gen: Option<QpdfObjGen>,
-    active_pdf_unique_id: Option<u64>,
+    /// qpdf's nullable/default document identity (`QPDFValue.hh:149-152` and
+    /// `QPDF.hh:1454`) represented with the zero niche.
+    active_pdf_unique_id: Option<NonZeroU64>,
     resolver: Option<Weak<dyn DocumentResolver>>,
 }
 
@@ -1580,7 +1588,11 @@ impl ObjectSlot {
     }
 
     fn active_pdf_unique_id(&self) -> Option<u64> {
-        self.shared.borrow().identity.active_pdf_unique_id
+        self.shared
+            .borrow()
+            .identity
+            .active_pdf_unique_id
+            .map(NonZeroU64::get)
     }
 
     fn resolver(&self) -> Option<Weak<dyn DocumentResolver>> {
@@ -2222,7 +2234,7 @@ impl ObjectHandle {
                 ValueIdentity {
                     object_ref: Some(object_ref),
                     qpdf_obj_gen: Some(QpdfObjGen::from_object_ref(object_ref)),
-                    active_pdf_unique_id: Some(pdf_unique_id),
+                    active_pdf_unique_id: NonZeroU64::new(pdf_unique_id),
                     resolver: Some(resolver),
                 },
                 NO_PARSED_OFFSET,
@@ -2319,7 +2331,7 @@ impl ObjectHandle {
                 ValueIdentity {
                     object_ref: object_gen.to_object_ref(),
                     qpdf_obj_gen: Some(object_gen),
-                    active_pdf_unique_id: pdf_unique_id,
+                    active_pdf_unique_id: pdf_unique_id.and_then(NonZeroU64::new),
                     resolver,
                 },
                 NO_PARSED_OFFSET,
@@ -2653,7 +2665,7 @@ impl ObjectHandle {
         shared.borrow_mut().identity = ValueIdentity {
             object_ref: Some(object_ref),
             qpdf_obj_gen: Some(QpdfObjGen::from_object_ref(object_ref)),
-            active_pdf_unique_id: Some(pdf_unique_id),
+            active_pdf_unique_id: NonZeroU64::new(pdf_unique_id),
             resolver: Some(resolver),
         };
         self.clone()
@@ -2677,7 +2689,7 @@ impl ObjectHandle {
         // handle already carried rather than dropping it.
         identity.object_ref = object_gen.to_object_ref().or(identity.object_ref);
         identity.qpdf_obj_gen = Some(object_gen);
-        identity.active_pdf_unique_id = Some(pdf_unique_id);
+        identity.active_pdf_unique_id = NonZeroU64::new(pdf_unique_id);
         identity.resolver = Some(resolver);
         self.0.borrow().shared.borrow_mut().identity = identity;
         self.clone()
@@ -2723,7 +2735,7 @@ impl ObjectHandle {
                 .shared
                 .borrow_mut()
                 .identity
-                .active_pdf_unique_id = pdf_unique_id;
+                .active_pdf_unique_id = pdf_unique_id.and_then(NonZeroU64::new);
         }
         handle
     }
@@ -2917,10 +2929,10 @@ impl ObjectHandle {
         let mut slot = self.0.borrow_mut();
         match slot.tree_pdf_unique_id {
             None => {
-                slot.tree_pdf_unique_id = Some(pdf_unique_id);
+                slot.tree_pdf_unique_id = NonZeroU64::new(pdf_unique_id);
                 Ok(())
             }
-            Some(owner) if owner == pdf_unique_id => Ok(()),
+            Some(owner) if owner.get() == pdf_unique_id => Ok(()),
             Some(_) => Err(Error::Unsupported(
                 "name/number tree root belongs to a different Pdf".to_string(),
             )),
@@ -3222,7 +3234,7 @@ impl ObjectHandle {
         let shared = self.0.borrow().shared.clone();
         let mut shared = shared.borrow_mut();
         shared.identity.resolver = Some(resolver);
-        shared.identity.active_pdf_unique_id = Some(pdf.unique_id);
+        shared.identity.active_pdf_unique_id = NonZeroU64::new(pdf.unique_id);
         shared.description = Some(ObjectDescription::Template(description.as_ref().to_vec()));
         Ok(())
     }
@@ -3275,7 +3287,7 @@ impl ObjectHandle {
         let shared = self.0.borrow().shared.clone();
         let mut shared = shared.borrow_mut();
         shared.identity.resolver = resolver;
-        shared.identity.active_pdf_unique_id = active_pdf_unique_id;
+        shared.identity.active_pdf_unique_id = active_pdf_unique_id.and_then(NonZeroU64::new);
         shared.description = Some(ObjectDescription::Child(Box::new(ChildDescription {
             parent: Rc::downgrade(&parent_shared),
             static_descr: static_descr.as_ref().to_vec(),
