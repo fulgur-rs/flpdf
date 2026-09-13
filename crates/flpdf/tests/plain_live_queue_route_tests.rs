@@ -41,59 +41,49 @@ fn preserve_without_source_objstm_selects_the_disable_shaped_live_consumer() {
         .unwrap()
         .replace("\r\n", "\n");
 
-    // Bind each assertion to the construct it claims. Independent substring
-    // checks over the whole module would still pass if Preserve were dropped
-    // from the branch condition, because the same tokens appear in
-    // `qdf_or_normalize_live_eligible`.
+    // Pin the whole routing region as one normalized expression rather than
+    // a set of substring probes. Every narrower form reviewed here could be
+    // stepped around by a mutation just outside the compared slice: a
+    // conjunct appended to the binding, an extra condition on the guard, or
+    // the return wrapped in a nested `if`. Whitespace is collapsed so a
+    // rustfmt reflow is tolerated while any added, removed, or reordered
+    // token fails. The structural alternative -- a route-classification
+    // helper asserted on input combinations -- is tracked separately.
     let write_plain = plain
         .split_once("pub(crate) fn write_plain<")
         .and_then(|(_, rest)| rest.split_once("\n}\n"))
         .map(|(body, _)| body)
         .expect("write_plain body");
-    // Pin the complete binding expression, not just the presence of the
-    // Preserve token. A conjunct appended after the `matches!` would sit
-    // outside a slice that stops at the macro's closing paren, and would
-    // silently drop empty-map Preserve from the live consumer.
-    let shaped = write_plain
-        .split_once("let is_live_disable_shaped =")
-        .and_then(|(_, rest)| rest.split_once(";"))
-        .map(|(binding, _)| binding)
+    let region = write_plain
+        .split_once("    let is_live_disable_shaped =")
+        .map(|(_, rest)| rest)
         .expect("is_live_disable_shaped binding");
-    let shaped = shaped.split_whitespace().collect::<Vec<_>>().join(" ");
-    assert_eq!(
-        shaped,
-        "matches!( options.object_streams, ObjectStreamMode::Disable | \
-         ObjectStreamMode::Preserve )",
-        "the Disable-shaped condition must be exactly the object-stream mode test"
-    );
-    // Pin the complete guard, not just its return. Asserting only the branch
-    // body would still pass if a conjunct were added that routes empty-map
-    // Preserve to the planner instead, which is the regression this contract
-    // exists to catch.
-    let guard = write_plain
-        .split_once("\n    if is_live_disable_shaped")
-        .and_then(|(_, rest)| rest.split_once(" {\n"))
-        .map(|(condition, _)| condition.trim())
-        .expect("is_live_disable_shaped guard");
-    assert_eq!(
-        guard, "&& !options.qdf && !options.content_normalization",
-        "the Disable-shaped guard must split only on QDF/normalization; any \
-         further condition would drop a Preserve case from the live consumer"
-    );
-    let branch = write_plain
+    let (before_branch, branch) = region
         .split_once("if is_live_disable_shaped")
-        .and_then(|(_, rest)| rest.split_once("\n    }"))
-        .map(|(branch, _)| branch)
         .expect("is_live_disable_shaped branch");
-    assert!(
-        branch.contains("return write_plain_live_disable("),
-        "the Disable-shaped branch must return the live disable consumer"
+    let branch = branch
+        .split_once("\n    }")
+        .map(|(body, _)| body)
+        .expect("branch body");
+    let region = format!(
+        "let is_live_disable_shaped ={before_branch}if is_live_disable_shaped{branch}\n    }}"
     );
-    // Pin the whole predicate, whitespace-collapsed so rustfmt reflow is
-    // tolerated but a dropped term is not. Checking only the empty-map token
-    // would still pass if the `qdf || content_normalization` restriction were
-    // removed, which would make this branch swallow ordinary Preserve before
-    // it can reach the Disable-shaped live consumer.
+    let region = region.split_whitespace().collect::<Vec<_>>().join(" ");
+    assert_eq!(
+        region,
+        "let is_live_disable_shaped = matches!( options.object_streams, \
+         ObjectStreamMode::Disable | ObjectStreamMode::Preserve ); if \
+         qdf_or_normalize_live_eligible(options, source_object_stream_data) { let \
+         (page_sequences, contents_sequences, content_container_sequences) = \
+         live_page_context(pdf, special_streams)?; return write_plain_live( pdf, out, options, \
+         generated_id, source_object_stream_data, page_sequences, contents_sequences, \
+         content_container_sequences, ); } if is_live_disable_shaped && !options.qdf && \
+         !options.content_normalization { return write_plain_live_disable( pdf, out, options, \
+         generated_id, source_object_stream_data, ); }",
+        "the plain route decision must stay exactly this shape; an empty-membership Preserve \
+         rewrite has to reach write_plain_live_disable unconditionally"
+    );
+
     let eligible = plain
         .split_once("pub(crate) fn qdf_or_normalize_live_eligible")
         .and_then(|(_, rest)| rest.split_once(") -> bool {"))
