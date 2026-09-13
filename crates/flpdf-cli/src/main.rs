@@ -1299,11 +1299,12 @@ struct Cli {
     /// Coalesce multiple /Contents streams into a single stream per page
     /// (top-level alias of `flpdf rewrite --coalesce-contents`; qpdf
     /// `--coalesce-contents` equivalent). Requires a full rewrite of the
-    /// document. Rejected against inspection, attachment, `--linearize`,
-    /// and page-operation modes: the linearize branch of `run_rewrite`
-    /// and the page-op dispatch never read `args.coalesce_contents`, so
-    /// without these conflicts the flag would be silently dropped and the
-    /// user's requested coalescing would not appear in the output.
+    /// document. It may be combined with `--linearize`; qpdf applies this
+    /// create-stage transformation before constructing its linearized writer.
+    /// It remains rejected against inspection and attachment modes. Top-level
+    /// page-operation routes apply it through the QPDFJob transformation
+    /// boundary, and rewrite page-operation routes use the same post-selection
+    /// transformation owner.
     #[arg(long = "coalesce-contents",
           conflicts_with_all = [
               "check", "show_object",
@@ -1311,7 +1312,6 @@ struct Cli {
               "show_encryption",
               "list_attachments", "show_attachment", "remove_attachment",
               "add_attachment", "copy_attachments_from",
-              "linearize", "pages", "rotate", "split_pages", "empty",
           ])]
     coalesce_contents: bool,
 
@@ -4819,6 +4819,9 @@ fn run_command(command: Commands, overlay_specs: &[OverlaySpec]) -> CliResult<()
                 // including explicit --encrypt and content normalization, are
                 // applied by the final PdfWriter and are therefore accepted
                 // here.
+                // --coalesce-contents is handled separately below: it is a
+                // page transformation with the same post-selection owner as
+                // generate-appearances and flatten-annotations.
                 //
                 // --decrypt is rejected for the same reason: the page-ops
                 // pipeline already rejects encrypted inputs (so a useful
@@ -4834,15 +4837,14 @@ fn run_command(command: Commands, overlay_specs: &[OverlaySpec]) -> CliResult<()
                 // run_rewrite_with_page_ops) already accept and apply it via
                 // `image_transform_options`, mirroring
                 // the top-level --pages/--rotate/--split-pages routes.
-                if coalesce_contents
-                    || cmd.remove_restrictions
+                if cmd.remove_restrictions
                     || cmd.decrypt
                     || cmd.copy_encryption.is_some()
                     || cmd.generate_appearances
                     || cmd.flatten_annotations.is_some()
                 {
                     emit_logger_error(
-                        "flpdf: --coalesce-contents / --remove-restrictions / --decrypt / \
+                        "flpdf: --remove-restrictions / --decrypt / \
                          --copy-encryption / --flatten-annotations / \
                          --generate-appearances are \
                          not applied in the --pages/--rotate/--split-pages/\
@@ -4884,6 +4886,7 @@ fn run_command(command: Commands, overlay_specs: &[OverlaySpec]) -> CliResult<()
                         cmd.linearize,
                         None,
                         image_transform_options,
+                        cmd.coalesce_contents,
                         cmd.generate_appearances,
                         cmd.flatten_annotations,
                         cmd.flatten_rotation,
@@ -4905,6 +4908,7 @@ fn run_command(command: Commands, overlay_specs: &[OverlaySpec]) -> CliResult<()
                         cmd.linearize,
                         None,
                         image_transform_options,
+                        cmd.coalesce_contents,
                         cmd.generate_appearances,
                         cmd.flatten_annotations,
                         cmd.flatten_rotation,
@@ -4925,6 +4929,7 @@ fn run_command(command: Commands, overlay_specs: &[OverlaySpec]) -> CliResult<()
                         cmd.linearize,
                         None,
                         image_transform_options,
+                        cmd.coalesce_contents,
                         cmd.generate_appearances,
                         cmd.flatten_annotations,
                         cmd.flatten_rotation,
@@ -6095,6 +6100,9 @@ fn run_page_operations_with_qpdf_job(
         }
         if let Some(parameter) = args.page_ops.split_pages.as_deref() {
             configuration.split_pages(parameter.as_bytes())?;
+        }
+        if args.coalesce_contents {
+            configuration.coalesce_contents();
         }
         configuration.remove_unreferenced_resources(args.remove_unreferenced_resources.into());
     }
@@ -7357,6 +7365,7 @@ fn run_page_extraction(
     linearize: bool,
     linearize_pass1: Option<&Path>,
     image_options: ImageTransformOptions,
+    coalesce_contents: bool,
     generate_appearances: bool,
     flatten_annotations_mode: Option<CliFlattenMode>,
     flatten_rotation: bool,
@@ -7464,6 +7473,7 @@ fn run_page_extraction(
                 linearize,
                 linearize_pass1,
                 image_options,
+                coalesce_contents,
                 generate_appearances,
                 flatten_annotations_mode,
                 flatten_rotation,
@@ -7486,6 +7496,7 @@ fn run_page_extraction(
                 linearize,
                 linearize_pass1,
                 image_options,
+                coalesce_contents,
                 generate_appearances,
                 flatten_annotations_mode,
                 flatten_rotation,
@@ -7515,6 +7526,7 @@ fn run_page_extraction(
             linearize,
             linearize_pass1,
             image_options,
+            coalesce_contents,
             generate_appearances,
             flatten_annotations_mode,
             flatten_rotation,
@@ -7539,6 +7551,7 @@ fn run_page_extraction(
         linearize,
         linearize_pass1,
         image_options,
+        coalesce_contents,
         generate_appearances,
         flatten_annotations_mode,
         flatten_rotation,
@@ -7570,6 +7583,7 @@ fn run_empty_page_extraction(
     linearize: bool,
     linearize_pass1: Option<&Path>,
     image_options: ImageTransformOptions,
+    coalesce_contents: bool,
     generate_appearances: bool,
     flatten_annotations_mode: Option<CliFlattenMode>,
     flatten_rotation: bool,
@@ -7694,6 +7708,7 @@ fn run_empty_page_extraction(
         None,
         combined_pages,
         image_options,
+        coalesce_contents,
         generate_appearances,
         flatten_annotations_mode,
         flatten_rotation,
@@ -7722,6 +7737,7 @@ fn run_page_extraction_from_multiple_sources(
     linearize: bool,
     linearize_pass1: Option<&Path>,
     image_options: ImageTransformOptions,
+    coalesce_contents: bool,
     generate_appearances: bool,
     flatten_annotations_mode: Option<CliFlattenMode>,
     flatten_rotation: bool,
@@ -7881,6 +7897,7 @@ fn run_page_extraction_from_multiple_sources(
         None,
         combined_pages,
         image_options,
+        coalesce_contents,
         generate_appearances,
         flatten_annotations_mode,
         flatten_rotation,
@@ -7902,6 +7919,7 @@ fn run_page_extraction_from_single_source<R: Read + Seek + 'static>(
     linearize: bool,
     linearize_pass1: Option<&Path>,
     image_options: ImageTransformOptions,
+    coalesce_contents: bool,
     generate_appearances: bool,
     flatten_annotations_mode: Option<CliFlattenMode>,
     flatten_rotation: bool,
@@ -7981,6 +7999,7 @@ fn run_page_extraction_from_single_source<R: Read + Seek + 'static>(
                 Some((result, prune_mode)),
                 combined_pages,
                 image_options,
+                coalesce_contents,
                 generate_appearances,
                 flatten_annotations_mode,
                 flatten_rotation,
@@ -8029,6 +8048,7 @@ fn run_page_extraction_from_single_source<R: Read + Seek + 'static>(
                 None,
                 combined_pages,
                 image_options,
+                coalesce_contents,
                 generate_appearances,
                 flatten_annotations_mode,
                 flatten_rotation,
@@ -8060,6 +8080,7 @@ fn run_page_extraction_after_plan<R: Read + Seek + 'static>(
     page_job_result: Option<(RebuildResult, RemoveUnreferencedResources)>,
     combined_pages: Vec<CombinedPage>,
     image_options: ImageTransformOptions,
+    coalesce_contents: bool,
     generate_appearances: bool,
     flatten_annotations_mode: Option<CliFlattenMode>,
     flatten_rotation: bool,
@@ -8162,7 +8183,11 @@ fn run_page_extraction_after_plan<R: Read + Seek + 'static>(
     // `handleTransformations` option through the canonical Job transformation
     // owner so the same AcroForm/page-helper boundary is used for `--pages` as
     // for ordinary rewrites (`QPDFJob.cc:466-473,2177-2194`).
-    if generate_appearances || flatten_annotations_mode.is_some() || flatten_rotation {
+    if coalesce_contents
+        || generate_appearances
+        || flatten_annotations_mode.is_some()
+        || flatten_rotation
+    {
         let mut transform_job = new_cli_job(no_warn);
         transform_job.set_verbose(verbose);
         {
@@ -8172,6 +8197,9 @@ fn run_page_extraction_after_plan<R: Read + Seek + 'static>(
             }
             if let Some(mode) = flatten_annotations_mode {
                 configuration.flatten_annotations(FlattenAnnotationsMode::from(mode));
+            }
+            if coalesce_contents {
+                configuration.coalesce_contents();
             }
             if flatten_rotation {
                 configuration.flatten_rotation();
@@ -8352,6 +8380,7 @@ fn run_rewrite_with_page_ops(
     linearize: bool,
     linearize_pass1: Option<&Path>,
     image_options: ImageTransformOptions,
+    coalesce_contents: bool,
     generate_appearances: bool,
     flatten_annotations_mode: Option<CliFlattenMode>,
     flatten_rotation: bool,
@@ -8383,7 +8412,7 @@ fn run_rewrite_with_page_ops(
         false,
         false,
         options.content_normalization,
-        false,
+        coalesce_contents,
         generate_appearances,
         image_options,
         flatten_annotations_mode,
