@@ -50,6 +50,12 @@
 //! callback, identity, retry, error, and `/Length` contracts remain the
 //! authority.
 //!
+//! qpdf keeps the token-filter list on `QPDF_Stream`, not on the common
+//! `QPDFValue` base (`libqpdf/qpdf/QPDF_Stream.hh:101-107`). [`ObjectValue::Stream`]
+//! mirrors that boundary: its stream-local filters and the flpdf-only
+//! normalization marker move with the shared stream value, while the common
+//! mutation generation remains on [`SharedValueState`].
+//!
 //! `ValueIdentity::active_pdf_unique_id` is a container representation
 //! substitute for qpdf's per-value `QPDF*` back-pointer (`QPDFValue.hh:150`):
 //! a real qpdf counterpart exists, flpdf just projects it to a numeric id
@@ -152,6 +158,21 @@ use std::hash::{Hash, Hasher};
 use std::rc::{Rc, Weak};
 
 type StreamTokenFilter = Rc<RefCell<dyn TokenFilter>>;
+
+/// The qpdf stream-local token-filter vector. The newtype only supplies a
+/// cycle-safe debug representation for the trait objects; it does not add an
+/// ownership cell or another allocation around the vector.
+#[derive(Clone, Default)]
+pub(crate) struct StreamTokenFilterList(Vec<StreamTokenFilter>);
+
+impl std::fmt::Debug for StreamTokenFilterList {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_list()
+            .entries(self.0.iter().map(|_| "<TokenFilter>"))
+            .finish()
+    }
+}
 
 /// qpdf's `qpdf_ef_compress` bit in `QPDF_Stream::pipeStreamData`, for the
 /// `encode_flags` argument of [`ObjectHandle::pipe_stream_data`].
@@ -1114,8 +1135,6 @@ struct SharedValueState {
     parsed_offset: i64,
     description: Option<ObjectDescription>,
     state_owners: Vec<Weak<RefCell<ObjectSlot>>>,
-    stream_token_filters: Vec<StreamTokenFilter>,
-    content_normalization_applied: bool,
     mutation_generation: u64,
 }
 
@@ -1184,8 +1203,6 @@ fn new_shared_value_state(
         parsed_offset,
         description: None,
         state_owners: Vec::new(),
-        stream_token_filters: Vec::new(),
-        content_normalization_applied: false,
         mutation_generation: 0,
     }))
 }
@@ -1347,6 +1364,18 @@ pub(crate) enum ObjectValue {
         /// `replaceFilterData` updates `/Length` but not this member
         /// (`libqpdf/QPDF_Stream.cc:668-685`).
         stream_length: usize,
+        /// qpdf's stream-local token-filter list
+        /// (`libqpdf/qpdf/QPDF_Stream.hh:106`). It is kept inside the shared
+        /// stream value so aliases observe the same filters without placing
+        /// stream-only state on scalar or container values.
+        stream_token_filters: StreamTokenFilterList,
+        /// flpdf's writer-only record that the current stream bytes already
+        /// passed content normalization. qpdf has no corresponding field;
+        /// keeping it on the stream value prevents it from being carried by
+        /// non-stream values.
+        // qpdf-deviation: no qpdf QPDF_Stream field records an external
+        // consumer's completed content normalization.
+        content_normalization_applied: bool,
     },
 }
 
@@ -2107,8 +2136,6 @@ impl ObjectHandle {
         let (old_state, new_children) = {
             let mut shared = shared.borrow_mut();
             let old_state = std::mem::replace(&mut shared.value, new_state);
-            shared.stream_token_filters.clear();
-            shared.content_normalization_applied = false;
             shared.mutation_generation = 0;
             let new_children = Self::state_children(&shared.value);
             (old_state, new_children)
@@ -2472,12 +2499,15 @@ impl ObjectHandle {
                 stream_provider,
                 filter_on_write,
                 stream_length,
+                ..
             } => ObjectValue::Stream {
                 stream_dict: shallow_copy_child(stream_dict)?,
                 stream_data: stream_data.clone(),
                 stream_provider: stream_provider.clone(),
                 filter_on_write: *filter_on_write,
                 stream_length: *stream_length,
+                stream_token_filters: StreamTokenFilterList::default(),
+                content_normalization_applied: false,
             },
             other => other.clone(),
         }))
@@ -4025,6 +4055,8 @@ impl ObjectHandle {
                 stream_data: Some(data),
                 stream_provider: None,
                 filter_on_write: true,
+                stream_token_filters: Default::default(),
+                content_normalization_applied: false,
                 stream_length: 0,
             },
             NO_PARSED_OFFSET,
@@ -6196,12 +6228,13 @@ impl ObjectHandle {
     /// copying a lone `/FlateDecode` source without running the filter
     /// (`libqpdf/QPDFWriter.cc:1234-1315`).
     pub(crate) fn is_data_modified(&self) -> bool {
-        if !self.with_value(|value| matches!(value, Some(ObjectValue::Stream { .. }))) {
-            return false;
-        }
-        let shared = self.0.borrow().shared.clone();
-        let modified = !shared.borrow().stream_token_filters.is_empty();
-        modified
+        self.with_value(|value| match value {
+            Some(ObjectValue::Stream {
+                stream_token_filters,
+                ..
+            }) => !stream_token_filters.0.is_empty(),
+            _ => false,
+        })
     }
 
     /// Whether the current stream bytes have already passed the explicit
@@ -6209,9 +6242,13 @@ impl ObjectHandle {
     /// from `replaceStreamData`: qpdf's replacement API is also used for
     /// arbitrary caller data that still needs QDF normalization.
     pub(crate) fn content_normalization_applied(&self) -> bool {
-        let shared = self.0.borrow().shared.clone();
-        let applied = shared.borrow().content_normalization_applied;
-        applied
+        self.with_value(|value| match value {
+            Some(ObjectValue::Stream {
+                content_normalization_applied,
+                ..
+            }) => *content_normalization_applied,
+            _ => false,
+        })
     }
 
     /// Mark the current stream bytes as normalized by the content consumer.
@@ -6223,9 +6260,15 @@ impl ObjectHandle {
     }
 
     fn set_content_normalization_applied(&self, applied: bool) {
-        let shared = self.0.borrow().shared.clone();
-        shared.borrow_mut().content_normalization_applied = applied;
-        self.bump_mutation_generation();
+        self.with_value_mut(|value| {
+            if let Some(ObjectValue::Stream {
+                content_normalization_applied: current,
+                ..
+            }) = value
+            {
+                *current = applied;
+            }
+        });
     }
 
     /// Register a qpdf-style lazy token filter on this stream. The original
@@ -6240,9 +6283,15 @@ impl ObjectHandle {
                 type_name
             )));
         }
-        let shared = self.0.borrow().shared.clone();
-        shared.borrow_mut().stream_token_filters.push(filter);
-        self.bump_mutation_generation();
+        self.with_value_mut(|value| {
+            if let Some(ObjectValue::Stream {
+                stream_token_filters,
+                ..
+            }) = value
+            {
+                stream_token_filters.0.push(filter);
+            }
+        });
         Ok(())
     }
 
@@ -6590,20 +6639,17 @@ impl ObjectHandle {
         will_retry: bool,
     ) -> Result<bool> {
         self.try_dereference()?;
-        let token_filters = {
-            let shared = self.0.borrow().shared.clone();
-            let token_filters = shared.borrow().stream_token_filters.clone();
-            token_filters
-        };
-        let Some((stream_dict, stream_data, stream_provider, stream_length)) =
-            self.with_value(|value| match value {
+        let Some((token_filters, stream_dict, stream_data, stream_provider, stream_length)) = self
+            .with_value(|value| match value {
                 Some(ObjectValue::Stream {
                     stream_dict,
                     stream_data,
                     stream_provider,
                     stream_length,
+                    stream_token_filters,
                     ..
                 }) => Some((
+                    stream_token_filters.clone(),
                     stream_dict.clone(),
                     stream_data.clone(),
                     stream_provider.clone(),
@@ -6696,7 +6742,7 @@ impl ObjectHandle {
         // normalization -> encoding. Since `head` is assembled from the
         // sink backwards, token filters are wrapped before the decode stages
         // in reverse registration order (`QPDF_Stream.cc:488-620`).
-        for filter in token_filters.into_iter().rev() {
+        for filter in token_filters.0.into_iter().rev() {
             let tokenizer = QpdfTokenizer::new_shared("stream token filter", filter, Some(head));
             head = PipelineRef::Owned(Box::new(tokenizer));
         }
@@ -7215,12 +7261,6 @@ impl ObjectHandle {
         let result = f(Some(&mut shared.value));
         shared.mutation_generation = shared.mutation_generation.wrapping_add(1);
         result
-    }
-
-    fn bump_mutation_generation(&self) {
-        let shared = self.0.borrow().shared.clone();
-        let mut shared = shared.borrow_mut();
-        shared.mutation_generation = shared.mutation_generation.wrapping_add(1);
     }
 
     /// This handle's qpdf-syntax unparse form
@@ -8028,6 +8068,8 @@ mod object_json_writer_tests {
                 stream_data: None,
                 stream_provider: None,
                 filter_on_write: true,
+                stream_token_filters: Default::default(),
+                content_normalization_applied: false,
                 stream_length: 0,
             });
             Ok(())
@@ -8851,6 +8893,8 @@ pub(crate) mod identity_tests {
                 stream_data: None,
                 stream_provider: None,
                 filter_on_write: true,
+                stream_token_filters: Default::default(),
+                content_normalization_applied: false,
                 stream_length: 3,
             });
             Ok(())
@@ -10375,6 +10419,8 @@ mod uniform_identity_tests {
             stream_data: Some(stream_data.clone()),
             stream_provider: None,
             filter_on_write: true,
+            stream_token_filters: Default::default(),
+            content_normalization_applied: false,
             stream_length: stream_data.len(),
         });
         let root = ObjectHandle::array(vec![array_child.clone(), stream.clone()]);
@@ -10877,6 +10923,26 @@ mod stream_payload_sharing_tests {
         assert!(!scalar.is_data_modified());
     }
 
+    #[test]
+    fn stream_only_state_is_shared_by_aliases() {
+        let stream =
+            ObjectHandle::stream(ObjectHandle::dictionary(vec![]), Rc::new(b"abc".to_vec()));
+        let alias = stream.clone();
+
+        stream.mark_content_normalization_applied();
+        assert!(alias.content_normalization_applied());
+
+        let filter: Rc<RefCell<dyn TokenFilter>> = Rc::new(RefCell::new(NoopTokenFilter));
+        alias.add_token_filter(filter).unwrap();
+        assert!(stream.is_data_modified());
+        let debug = stream.with_value(|value| format!("{value:?}"));
+        assert!(debug.contains("<TokenFilter>"));
+
+        alias.replace_stream_data(Rc::new(b"replacement".to_vec()), None, None);
+        assert!(!stream.content_normalization_applied());
+        assert!(stream.is_data_modified());
+    }
+
     // Every assertion below compares buffer identity against the buffer the
     // test itself created, never bytes: a byte-equality assertion passes for a
     // deep-copying implementation too.
@@ -11052,6 +11118,8 @@ mod stream_payload_sharing_tests {
             stream_data: Some(Rc::new(vec![0x5a; 4096])),
             stream_provider: None,
             filter_on_write: true,
+            stream_token_filters: Default::default(),
+            content_normalization_applied: false,
             stream_length: 4096,
         });
         let dictionary = ObjectHandle::dictionary(vec![(b"Nested".to_vec(), stream.clone())]);
@@ -11642,6 +11710,8 @@ mod type_code_tests {
             stream_data: Some(Rc::new(Vec::new())),
             stream_provider: None,
             filter_on_write: true,
+            stream_token_filters: Default::default(),
+            content_normalization_applied: false,
             stream_length: 0,
         });
         assert_eq!(stream.type_code().expect("type code"), 10);
@@ -11741,6 +11811,8 @@ mod type_code_tests {
             stream_data: Some(Rc::new(Vec::new())),
             stream_provider: None,
             filter_on_write: true,
+            stream_token_filters: Default::default(),
+            content_normalization_applied: false,
             stream_length: 0,
         });
         let inner_dict = ObjectHandle::dictionary(vec![
@@ -11802,6 +11874,8 @@ mod type_code_tests {
             stream_data: Some(Rc::new(Vec::new())),
             stream_provider: None,
             filter_on_write: true,
+            stream_token_filters: Default::default(),
+            content_normalization_applied: false,
             stream_length: 0,
         });
         assert_eq!(handle.unparse(), b"9 0 R");
@@ -11852,6 +11926,8 @@ mod type_code_tests {
             stream_data: Some(Rc::new(b"ab".to_vec())),
             stream_provider: None,
             filter_on_write: true,
+            stream_token_filters: Default::default(),
+            content_normalization_applied: false,
             stream_length: 0,
         });
         assert_eq!(
@@ -11987,6 +12063,8 @@ mod type_code_tests {
             stream_data: None,
             stream_provider: None,
             filter_on_write: true,
+            stream_token_filters: Default::default(),
+            content_normalization_applied: false,
             stream_length: 0,
         });
 
@@ -12038,6 +12116,8 @@ mod unparse_object_tests {
             stream_data: None,
             stream_provider: None,
             filter_on_write: true,
+            stream_token_filters: Default::default(),
+            content_normalization_applied: false,
             stream_length: 0,
         });
 
@@ -12511,6 +12591,8 @@ mod unparse_object_tests {
             stream_data: Some(Rc::new(b"ab".to_vec())),
             stream_provider: None,
             filter_on_write: true,
+            stream_token_filters: Default::default(),
+            content_normalization_applied: false,
             stream_length: 0,
         });
         let mut out = Vec::new();
@@ -12537,6 +12619,8 @@ mod unparse_object_tests {
             stream_data: Some(Rc::new(b"ab".to_vec())),
             stream_provider: None,
             filter_on_write: true,
+            stream_token_filters: Default::default(),
+            content_normalization_applied: false,
             stream_length: 0,
         });
         let mut out = Vec::new();
@@ -12971,6 +13055,8 @@ mod unparse_object_tests {
             stream_data: Some(Rc::new(b"ab".to_vec())),
             stream_provider: None,
             filter_on_write: true,
+            stream_token_filters: Default::default(),
+            content_normalization_applied: false,
             stream_length: 0,
         });
         let mut out = Vec::new();
@@ -13281,6 +13367,8 @@ mod unparse_object_tests {
             stream_data: Some(Rc::new(b"abc".to_vec())),
             stream_provider: None,
             filter_on_write: true,
+            stream_token_filters: Default::default(),
+            content_normalization_applied: false,
             stream_length: 3,
         });
         let mut removed_refs = BTreeSet::new();
@@ -13527,6 +13615,8 @@ mod unparse_object_tests {
             stream_data: Some(Rc::new(b"ab".to_vec())),
             stream_provider: None,
             filter_on_write: true,
+            stream_token_filters: Default::default(),
+            content_normalization_applied: false,
             stream_length: 0,
         });
         let mut out = Vec::new();
@@ -13549,6 +13639,8 @@ mod unparse_object_tests {
             stream_data: Some(Rc::new(b"ab".to_vec())),
             stream_provider: None,
             filter_on_write: true,
+            stream_token_filters: Default::default(),
+            content_normalization_applied: false,
             stream_length: 0,
         });
         let mut out = Vec::new();
@@ -13834,6 +13926,8 @@ mod unparse_object_tests {
             stream_data: Some(Rc::new(b"ab".to_vec())),
             stream_provider: None,
             filter_on_write: true,
+            stream_token_filters: Default::default(),
+            content_normalization_applied: false,
             stream_length: 0,
         });
         let mut out = Vec::new();
@@ -13853,6 +13947,8 @@ mod unparse_object_tests {
             stream_data: Some(Rc::new(b"ab".to_vec())),
             stream_provider: None,
             filter_on_write: true,
+            stream_token_filters: Default::default(),
+            content_normalization_applied: false,
             stream_length: 0,
         });
         let mut out = Vec::new();
@@ -14220,6 +14316,8 @@ mod mutation_tests {
             stream_data: Some(Rc::new(b"salad".to_vec())),
             stream_provider: None,
             filter_on_write: true,
+            stream_token_filters: Default::default(),
+            content_normalization_applied: false,
             stream_length: 0,
         });
         let original = ObjectHandle::dictionary(vec![(b"Stream".to_vec(), stream.clone())]);
@@ -14456,6 +14554,8 @@ mod mutation_tests {
                 stream_data: None,
                 stream_provider: None,
                 filter_on_write: true,
+                stream_token_filters: Default::default(),
+                content_normalization_applied: false,
                 stream_length: encoded.len(),
             },
             bytes: encoded,
@@ -14501,6 +14601,8 @@ mod mutation_tests {
                 stream_data: None,
                 stream_provider: None,
                 filter_on_write: true,
+                stream_token_filters: Default::default(),
+                content_normalization_applied: false,
                 stream_length: raw.len(),
             },
             bytes: raw,
@@ -14549,6 +14651,8 @@ mod mutation_tests {
                 stream_data: None,
                 stream_provider: None,
                 filter_on_write: true,
+                stream_token_filters: Default::default(),
+                content_normalization_applied: false,
                 stream_length: raw.len(),
             },
             bytes: raw,
@@ -14656,6 +14760,8 @@ mod mutation_tests {
                 stream_data: None,
                 stream_provider: None,
                 filter_on_write: true,
+                stream_token_filters: Default::default(),
+                content_normalization_applied: false,
                 stream_length: raw.len(),
             },
             bytes: raw.clone(),
@@ -14752,6 +14858,8 @@ mod mutation_tests {
                 stream_data: None,
                 stream_provider: None,
                 filter_on_write: true,
+                stream_token_filters: Default::default(),
+                content_normalization_applied: false,
                 stream_length: raw.len(),
             },
             bytes: raw.clone(),
@@ -14806,6 +14914,8 @@ mod mutation_tests {
                 stream_data: None,
                 stream_provider: None,
                 filter_on_write: true,
+                stream_token_filters: Default::default(),
+                content_normalization_applied: false,
                 stream_length: raw.len(),
             },
             bytes: raw.clone(),
@@ -14961,6 +15071,8 @@ mod mutation_tests {
                 stream_data: None,
                 stream_provider: None,
                 filter_on_write: true,
+                stream_token_filters: Default::default(),
+                content_normalization_applied: false,
                 stream_length: raw.len(),
             },
             bytes: raw,
@@ -15022,6 +15134,8 @@ mod mutation_tests {
                 stream_data: None,
                 stream_provider: None,
                 filter_on_write: true,
+                stream_token_filters: Default::default(),
+                content_normalization_applied: false,
                 stream_length: raw.len(),
             },
             bytes: raw.clone(),
@@ -15243,6 +15357,8 @@ mod mutation_tests {
                 stream_data: None,
                 stream_provider: None,
                 filter_on_write: true,
+                stream_token_filters: Default::default(),
+                content_normalization_applied: false,
                 stream_length: raw.len(),
             },
             bytes: raw.clone(),
@@ -15294,6 +15410,8 @@ mod mutation_tests {
                 stream_data: None,
                 stream_provider: None,
                 filter_on_write: true,
+                stream_token_filters: Default::default(),
+                content_normalization_applied: false,
                 stream_length: raw.len(),
             },
             bytes: raw.clone(),
@@ -16458,6 +16576,8 @@ mod mutation_tests {
             stream_data: None,
             stream_provider: None,
             filter_on_write: true,
+            stream_token_filters: Default::default(),
+            content_normalization_applied: false,
             stream_length: 0,
         });
         owner.set_resolved(ObjectValue::Dictionary(
@@ -16471,6 +16591,8 @@ mod mutation_tests {
             stream_data: None,
             stream_provider: None,
             filter_on_write: true,
+            stream_token_filters: Default::default(),
+            content_normalization_applied: false,
             stream_length: 0,
         });
         assert!(old_dictionary.containing_object_refs().is_empty());
@@ -17189,6 +17311,8 @@ mod mutation_tests {
             stream_data: None,
             stream_provider: None,
             filter_on_write: true,
+            stream_token_filters: Default::default(),
+            content_normalization_applied: false,
             stream_length: 37,
         });
         stream.replace_stream_data(Rc::new(b"new data".to_vec()), None, None);
@@ -17212,6 +17336,8 @@ mod mutation_tests {
             stream_data: Some(Rc::new(b"old".to_vec())),
             stream_provider: None,
             filter_on_write: true,
+            stream_token_filters: Default::default(),
+            content_normalization_applied: false,
             stream_length: 37,
         });
 
@@ -17228,6 +17354,8 @@ mod mutation_tests {
             stream_data: Some(Rc::new(b"old".to_vec())),
             stream_provider: None,
             filter_on_write: true,
+            stream_token_filters: Default::default(),
+            content_normalization_applied: false,
             stream_length: 3,
         });
 
@@ -17244,6 +17372,8 @@ mod mutation_tests {
             stream_data: Some(Rc::new(b"old".to_vec())),
             stream_provider: None,
             filter_on_write: true,
+            stream_token_filters: Default::default(),
+            content_normalization_applied: false,
             stream_length: 3,
         });
 
@@ -17265,6 +17395,8 @@ mod mutation_tests {
             stream_data: Some(Rc::new(b"old".to_vec())),
             stream_provider: None,
             filter_on_write: true,
+            stream_token_filters: Default::default(),
+            content_normalization_applied: false,
             stream_length: 0,
         });
         let filter = ObjectHandle::name(b"FlateDecode".to_vec());
@@ -17290,6 +17422,8 @@ mod mutation_tests {
             stream_data: Some(Rc::new(b"old".to_vec())),
             stream_provider: None,
             filter_on_write: true,
+            stream_token_filters: Default::default(),
+            content_normalization_applied: false,
             stream_length: 0,
         });
         stream.replace_stream_data(Rc::new(b"new".to_vec()), None, None);
@@ -17313,6 +17447,8 @@ mod mutation_tests {
             stream_data: None,
             stream_provider: None,
             filter_on_write: true,
+            stream_token_filters: Default::default(),
+            content_normalization_applied: false,
             stream_length: 3,
         });
         stream.set_parsed_offset_if_unset(0);
@@ -17340,6 +17476,8 @@ mod mutation_tests {
             stream_data: None,
             stream_provider: None,
             filter_on_write: true,
+            stream_token_filters: Default::default(),
+            content_normalization_applied: false,
             stream_length: 3,
         });
 
@@ -17358,6 +17496,8 @@ mod mutation_tests {
                 stream_data: None,
                 stream_provider: None,
                 filter_on_write: true,
+                stream_token_filters: Default::default(),
+                content_normalization_applied: false,
                 stream_length: 3,
             });
         stream.set_parsed_offset_if_unset(9);
@@ -17565,6 +17705,8 @@ mod mutation_tests {
             stream_data: Some(Rc::new(b"old".to_vec())),
             stream_provider: None,
             filter_on_write: true,
+            stream_token_filters: Default::default(),
+            content_normalization_applied: false,
             stream_length: 0,
         });
 
@@ -18293,6 +18435,8 @@ mod stream_provider_contract_tests {
             Some(ObjectValue::Stream {
                 stream_provider: None,
                 filter_on_write: true,
+                stream_token_filters: _,
+                content_normalization_applied: false,
                 ..
             })
         )));
@@ -18428,6 +18572,8 @@ mod stream_provider_contract_tests {
                 stream_data: None,
                 stream_provider: None,
                 filter_on_write: true,
+                stream_token_filters: Default::default(),
+                content_normalization_applied: false,
                 stream_length: 0,
             });
             Ok(())
@@ -18449,6 +18595,8 @@ mod stream_provider_contract_tests {
             stream_data: None,
             stream_provider: None,
             filter_on_write: true,
+            stream_token_filters: Default::default(),
+            content_normalization_applied: false,
             stream_length: 0,
         });
 
@@ -19528,6 +19676,8 @@ pub(crate) mod warning_emission_tests {
             stream_data: None,
             stream_provider: None,
             filter_on_write: true,
+            stream_token_filters: Default::default(),
+            content_normalization_applied: false,
             stream_length: 0,
         });
 
@@ -19968,6 +20118,8 @@ pub(crate) mod warning_emission_tests {
             stream_data: Some(Rc::new(Vec::new())),
             stream_provider: None,
             filter_on_write: true,
+            stream_token_filters: Default::default(),
+            content_normalization_applied: false,
             stream_length: 0,
         });
         stream.try_dereference().unwrap();
@@ -20135,6 +20287,18 @@ mod qpdf_mutator_api_tests {
 mod filter_on_write_tests {
     use super::*;
     use std::rc::Rc;
+
+    #[test]
+    fn non_stream_values_do_not_carry_stream_normalization_state() {
+        let value = ObjectHandle::integer(7);
+
+        value.mark_content_normalization_applied();
+
+        assert!(
+            !value.content_normalization_applied(),
+            "stream normalization state must not be stored on a scalar value"
+        );
+    }
 
     #[test]
     fn filter_on_write_defaults_true_and_is_shared_by_aliases() {
