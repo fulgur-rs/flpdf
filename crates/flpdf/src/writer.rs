@@ -5645,6 +5645,38 @@ fn emit_specialized_standard_live_with_page_context<R: Read + Seek + 'static, W:
         ctx.encrypt_ref = ObjectRef::new(encrypt_number, 0);
     }
 
+    // qpdf's writeTrailer uses the next object number after the body queue and
+    // the writer-owned encryption dictionary. Reserve that same boundary for
+    // trailer children that a progress callback introduced after the queue was
+    // seeded (`QPDFWriter.cc:3010-3019,1144-1157`).
+    let trailer_size = body
+        .object_count
+        .checked_add(1 + usize::from(encrypt_ctx.is_some()))
+        .ok_or_else(|| {
+            // cov:ignore-start: the queue and output Vec cannot allocate enough objects to overflow usize.
+            Error::Unsupported("specialized live writer: /Size overflows usize".to_string())
+            // cov:ignore-end
+        })?; // cov:ignore: the allocated trailer size fits in usize on supported targets; this overflow arm is defensive.
+    let initial_late_trailer_number = u32::try_from(trailer_size).map_err(|_| {
+        // cov:ignore-start: the body queue is bounded by qpdf's u32 object-number domain
+        Error::Unsupported("specialized live writer: late trailer number overflows u32".to_string())
+        // cov:ignore-end
+    })?; // cov:ignore: checked body-derived late-trailer allocation cannot overflow a supported output
+         // A standard xref-stream write reserves its own object number before it
+         // serializes the trailer (`QPDFWriter.cc:3023-3030`).  Trailer-time
+         // references must start after that reservation; a classic xref table does
+         // not consume an object number.
+    let initial_late_trailer_number = if matches!(effective_xref_form, XrefForm::Stream) {
+        initial_late_trailer_number.checked_add(1).ok_or_else(|| {
+            // cov:ignore-start: a supported output cannot exhaust the u32 object-number space.
+            Error::Unsupported(
+                "specialized live writer: late trailer number overflows u32".to_string(),
+            )
+            // cov:ignore-end
+        })? // cov:ignore: xref-stream reservation cannot overflow for a supported body
+    } else {
+        initial_late_trailer_number
+    };
     // The encryption dictionary is writer-owned and is emitted after the live
     // body queue, exactly as qpdf's `writeStandard` does. Add its physical
     // location before the xref layer computes `/Size` and the xref stream row.
@@ -5663,6 +5695,13 @@ fn emit_specialized_standard_live_with_page_context<R: Read + Seek + 'static, W:
             .insert(ctx.encrypt_ref.number, (0, offset));
     }
 
+    // qpdf walks trailer keys in sorted order while writing the trailer after
+    // the body and encryption dictionary. Keep the two-pass `/Root` boundary
+    // shared with the plain/PCLm live consumers so every route assigns the same
+    // callback-added references (`QPDFWriter.cc:1160-1191`).
+    let mut next_late_trailer_number =
+        plain::extend_late_trailer_map(pdf, &mut body_map, initial_late_trailer_number, true, qdf)?; // cov:ignore: shared late-trailer success continuation is covered by the specialized callback test
+
     let direct_root_output = direct_root
         .as_ref()
         .map(|root| root.output_root_copy_with_adbe(&version, final_extension_level, false))
@@ -5678,11 +5717,22 @@ fn emit_specialized_standard_live_with_page_context<R: Read + Seek + 'static, W:
                             .to_string(),
                     )
                 })?;
-                body_map.get(&object_ref).copied().ok_or_else(|| {
-                    Error::Unsupported(format!(
-                        "specialized live writer: direct /Root reference {object_ref} absent from queue"
-                    ))
-                })
+                if let Some(output) = body_map.get(&object_ref).copied() {
+                    return Ok(output);
+                }
+                // A direct Catalog is serialized from the live trailer after
+                // the body queue has drained.  Its callback-added indirect
+                // children therefore receive a trailer-time number and no
+                // body/xref row, just like qpdf's `unparseChild` path.
+                let output = ObjectRef::new(next_late_trailer_number, 0);
+                next_late_trailer_number =
+                    next_late_trailer_number.checked_add(1).ok_or_else(|| {
+                        Error::Unsupported(
+                            "specialized live writer: late trailer number overflow".to_string(),
+                        )
+                    })?; // cov:ignore: a supported output cannot exhaust the u32 object-number space.
+                body_map.insert(object_ref, output);
+                Ok(output)
                 // cov:ignore-end
             };
             let mut write_string = |out: &mut Vec<u8>, value: &[u8]| {
@@ -5704,14 +5754,7 @@ fn emit_specialized_standard_live_with_page_context<R: Read + Seek + 'static, W:
             Ok::<_, Error>(bytes)
         })
         .transpose()?;
-    let trailer_size = body
-        .object_count
-        .checked_add(1 + usize::from(encrypt_ctx.is_some()))
-        .ok_or_else(|| {
-            // cov:ignore-start: the queue and output Vec cannot allocate enough objects to overflow usize.
-            Error::Unsupported("specialized live writer: /Size overflows usize".to_string())
-            // cov:ignore-end
-        })?; // cov:ignore: the allocated trailer size fits in usize on supported targets; this overflow arm is defensive.
+    plain::extend_late_trailer_map(pdf, &mut body_map, next_late_trailer_number, false, qdf)?; // cov:ignore: shared late-trailer success continuation is covered by the specialized callback test
     let trailer_handle = build_writer_trailer_handle(
         pdf,
         trailer_size,
