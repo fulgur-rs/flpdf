@@ -375,10 +375,6 @@ crates/flpdf/src/writer.rs::source_objstm_container_for_batch: prod 1 (1 files) 
 crates/flpdf/src/writer/object.rs::write_trailer_with_ref_map: prod 8 (1 files) / test 0
     crates/flpdf/src/writer.rs 8
 crates/flpdf/src/linearization/writer.rs::write_linearized: prod 0 (0 files) / test 3
-crates/flpdf/src/writer.rs::snapshot_catalog_extensions: prod 2 (2 files) / test 1
-    crates/flpdf/src/linearization/writer.rs 1, crates/flpdf/src/writer.rs 1
-crates/flpdf/src/writer.rs::restore_catalog_extensions: prod 2 (2 files) / test 1
-    crates/flpdf/src/linearization/writer.rs 1, crates/flpdf/src/writer.rs 1
 crates/flpdf/src/writer.rs::write_qpdf_to_memory: prod 2 (1 files) / test 16
     crates/flpdf-cli/src/main.rs 2
 crates/flpdf/src/writer.rs::PdfWriter::write: prod 328 (74 files) / test 1003
@@ -393,24 +389,20 @@ crates/flpdf/src/writer/object_streams/eligibility.rs::compressible_objgens_qpdf
     crates/flpdf/src/writer/object_streams/planning.rs 3, crates/flpdf/src/linearization/plan.rs 2, crates/flpdf/src/linearization/writer.rs 1, crates/flpdf/src/writer.rs 1, crates/flpdf/src/writer/object_streams/eligibility.rs 1, crates/flpdf/src/writer/plain/plan.rs 1
 crates/flpdf/src/reader/resolver.rs::source_xref_entries: prod 29 (9 files) / test 3
     crates/flpdf/src/reader/resolver.rs 9, crates/flpdf/src/writer.rs 5, crates/flpdf/src/reader.rs 4, crates/flpdf/src/linearization/writer.rs 3, crates/flpdf/src/engine.rs 2, crates/flpdf/src/linearization/plan.rs 2, crates/flpdf/src/writer/object_streams/planning.rs 2, crates/flpdf/src/writer/plain/plan.rs 1, crates/flpdf/src/writer/rewrite_renumber.rs 1
-crates/flpdf/src/writer/plain/body.rs::emit_bodies: prod 1 (1 files) / test 0
-    crates/flpdf/src/writer/plain/mod.rs 1
-crates/flpdf/src/writer/plain/xref.rs::append_xref_and_trailer: prod 2 (2 files) / test 1
-    crates/flpdf/src/writer.rs 1, crates/flpdf/src/writer/plain/mod.rs 1
+crates/flpdf/src/writer/plain/body.rs::emit_live: prod 1 (1 files) / test 12
+    crates/flpdf/src/writer/plain/mod.rs 1, crates/flpdf/src/writer/plain/body.rs 12
+crates/flpdf/src/writer/plain/xref.rs::append_xref_and_trailer: prod 1 (1 files) / test 4
+    crates/flpdf/src/writer/plain/mod.rs 1, crates/flpdf/src/writer/plain/plan.rs 1, crates/flpdf/src/writer/plain/xref.rs 3
 crates/flpdf/src/writer.rs::build_writer_trailer_handle: prod 5 (2 files) / test 0
     crates/flpdf/src/writer.rs 4, crates/flpdf/src/writer/plain/plan.rs 1
 crates/flpdf/src/writer.rs::EncryptionContext: prod 21 (3 files) / test 0
     crates/flpdf/src/writer.rs 12, crates/flpdf/src/linearization/writer.rs 7, crates/flpdf/src/writer/encrypted_strings.rs 2
 crates/flpdf/src/writer/object_streams/planning.rs::filter_objstm_batches_for_output: prod 1 (1 files) / test 0
     crates/flpdf/src/writer.rs 1
-crates/flpdf/src/writer/pclm.rs::Plan: prod 1 (1 files) / test 4
-    crates/flpdf/src/writer.rs 1
+crates/flpdf/src/writer/pclm.rs::Plan: prod 2 (2 files) / test 8
+    crates/flpdf/src/writer.rs 1, crates/flpdf/src/writer/pclm.rs 1
 crates/flpdf/src/writer.rs::write_pclm: prod 1 (1 files) / test 3
     crates/flpdf/src/writer.rs 1
-crates/flpdf/src/writer.rs::inject_adbe_extension: prod 2 (2 files) / test 0
-    crates/flpdf/src/linearization/writer.rs 1, crates/flpdf/src/writer.rs 1
-crates/flpdf/src/writer.rs::strip_adbe_extension: prod 2 (2 files) / test 0
-    crates/flpdf/src/linearization/writer.rs 1, crates/flpdf/src/writer.rs 1
 crates/flpdf/src/writer/plain/plan.rs::retain_reachable_object_stream_members: prod 2 (1 files) / test 0
     crates/flpdf/src/writer/plain/plan.rs 2
 crates/flpdf-cli/src/main.rs::write_with_pdf_writer: prod 8 (1 files) / test 0
