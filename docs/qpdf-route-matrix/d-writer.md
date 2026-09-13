@@ -127,6 +127,11 @@ pinned qpdf 11.9.0 の `libqpdf/QPDFWriter.cc`（3044 行）/ `include/qpdf/QPDF
   `n_object_streams = (eligible+99)/100`、`n_per = eligible/n_object_streams`（割り切れなければ +1）、
   `n_per` 件ごとに `makeIndirectObject(newNull())` で **source QPDF 側に新規 null object を作り、
   その objid を container id とする**。`/Extends` は扱わない。出力番号はやはり D-1 の enqueue 時。
+- 2026-09-13（`flpdf-r96x`）: source-backed Preserve の ObjStm member は、qpdf の
+  `object_stream_to_objects` 内 `std::set<QPDFObjGen>` を `writeObjectStream` が歩く順に合わせる。
+  multi-source の fresh target では local target number が source ObjGen と逆転し得るため、
+  `writer_object_order` に記録した original-object provenance を使って member を並べる。
+  Generate/Synthetic の新規 group はこの規則を使わず、既存の discovery/order policy を維持する。
 - Preserve の source membership emission: `preserve_unreferenced_objects=true` の場合、
   `QPDFWriter::preserveObjectStreams` は `getCompressibleObjGens()` の eligibility intersection を
   適用せず、source ObjStm の `/Type /Sig` + `/ByteRange` + `/Contents` dictionary も

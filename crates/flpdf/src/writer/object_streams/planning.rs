@@ -375,7 +375,7 @@ pub(crate) fn plan_qpdf_preserve_object_streams_with_source_membership<
                 retained.push(member);
             }
         }
-        retained.sort_unstable_by_key(|member| (member.number, member.generation));
+        sort_source_backed_members_qpdf_order(pdf, &mut retained);
         if !retained.is_empty() {
             groups.push(ObjectStreamGroup::SourceBacked {
                 source,
@@ -447,6 +447,22 @@ fn sort_compressible_for_writer_order<R: Read + Seek + 'static>(
 ) {
     if pdf.writer_object_order.is_some() {
         eligible.sort_unstable_by_key(|object_ref| pdf.writer_object_order_key(*object_ref));
+    }
+}
+
+/// Order members of an existing source-backed ObjStm the way qpdf's
+/// `std::set<QPDFObjGen>` orders the source membership. A fresh multi-source
+/// target has new local `ObjectRef`s, so use the recorded original-object
+/// provenance there; an ordinary parsed document has no separate provenance
+/// map and its local source reference is already the qpdf source ObjGen.
+pub(crate) fn sort_source_backed_members_qpdf_order<R: Read + Seek>(
+    pdf: &crate::Pdf<R>,
+    members: &mut [ObjectRef],
+) {
+    if pdf.writer_object_order.is_some() {
+        members.sort_unstable_by_key(|object_ref| pdf.writer_object_order_key(*object_ref));
+    } else {
+        members.sort_unstable_by_key(|object_ref| (object_ref.number, object_ref.generation));
     }
 }
 

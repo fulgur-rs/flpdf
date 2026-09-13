@@ -83,6 +83,36 @@ fn normalize_qdf(input: &Path, output: &Path) -> Vec<u8> {
     std::fs::read(output).expect("normalized QDF should be readable")
 }
 
+fn normalize_qdf_preserve(input: &Path, output: &Path) -> Vec<u8> {
+    let result = run_qpdf(&[
+        "--qdf",
+        "--object-streams=preserve",
+        "--no-original-object-ids",
+        "--preserve-unreferenced",
+        input.to_str().unwrap(),
+        output.to_str().unwrap(),
+    ]);
+    assert!(
+        result.status.success(),
+        "qpdf QDF Preserve normalization failed for {}: {}",
+        input.display(),
+        String::from_utf8_lossy(&result.stderr)
+    );
+    std::fs::read(output).expect("normalized QDF Preserve should be readable")
+}
+
+fn object_stream_marker_values(qdf: &[u8]) -> Vec<String> {
+    String::from_utf8_lossy(qdf)
+        .lines()
+        .filter_map(|line| {
+            line.trim()
+                .strip_prefix("/Marker (")
+                .and_then(|value| value.strip_suffix(')'))
+                .map(str::to_owned)
+        })
+        .collect()
+}
+
 /// Return the normalized object section of a QDF file.
 ///
 /// Multi-source page copying still has an unrelated object-number ordering
@@ -205,6 +235,69 @@ fn multi_source_pages_preserve_primary_unreferenced_objects_like_qpdf() {
     assert!(
         has_primary_orphan_marker(&flpdf_qdf),
         "flpdf preserve output must retain the primary orphan marker"
+    );
+}
+
+/// qpdf emits members of a preserved source ObjStm in source ObjGen order
+/// (`std::set<QPDFObjGen>`), even when a multi-source target assigns their
+/// output numbers in a different discovery order
+/// (`QPDFWriter.cc:1621-1758`).
+#[test]
+fn multi_source_preserve_objstm_members_follow_source_objgen_order() {
+    if !qpdf_available() {
+        if std::env::var_os("CI").is_some() {
+            panic!("qpdf 11.9.0 is required for this parity test on CI");
+        }
+        eprintln!("skipping: qpdf 11.9.0 is not available");
+        return;
+    }
+
+    let temp = tempfile::tempdir().unwrap();
+    let primary = fixture("preserve-pages-source-order-conflict.pdf");
+    let foreign = fixture("one-page.pdf");
+    let qpdf_output = temp.path().join("qpdf.pdf");
+    let flpdf_output = temp.path().join("flpdf.pdf");
+
+    let qpdf_result = run_qpdf(&[
+        "--static-id",
+        "--preserve-unreferenced",
+        primary.to_str().unwrap(),
+        "--pages",
+        foreign.to_str().unwrap(),
+        "1",
+        "--",
+        qpdf_output.to_str().unwrap(),
+    ]);
+    assert!(
+        qpdf_result.status.success(),
+        "qpdf source-order Preserve probe failed: {}",
+        String::from_utf8_lossy(&qpdf_result.stderr)
+    );
+
+    Command::cargo_bin("flpdf")
+        .unwrap()
+        .args(["rewrite", "--preserve-unreferenced", "--pages"])
+        .arg(&foreign)
+        .arg("1")
+        .arg("--")
+        .arg("--static-id")
+        .arg(&primary)
+        .arg(&flpdf_output)
+        .assert()
+        .success();
+
+    let qpdf_qdf = normalize_qdf_preserve(&qpdf_output, &temp.path().join("qpdf.qdf.pdf"));
+    let flpdf_qdf = normalize_qdf_preserve(&flpdf_output, &temp.path().join("flpdf.qdf.pdf"));
+    let qpdf_markers = object_stream_marker_values(&qpdf_qdf);
+    let flpdf_markers = object_stream_marker_values(&flpdf_qdf);
+    assert_eq!(
+        qpdf_markers,
+        ["source-five", "source-six"],
+        "qpdf must preserve source ObjGen order"
+    );
+    assert_eq!(
+        flpdf_markers, qpdf_markers,
+        "flpdf Preserve ObjStm members must use qpdf source ObjGen order"
     );
 }
 

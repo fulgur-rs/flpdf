@@ -1,0 +1,25 @@
+%PDF-1.5
+1 0 obj
+<< /Type /Catalog /Pages 2 0 R /A 6 0 R /B 5 0 R >>
+endobj
+2 0 obj
+<< /Type /Pages /Kids [3 0 R] /Count 1 >>
+endobj
+3 0 obj
+<< /Type /Page /Parent 2 0 R /MediaBox [0 0 10 10] >>
+endobj
+4 0 obj
+<< /Type /ObjStm /N 2 /First 9 /Length 85 >>
+stream
+5 0 6 39 << /Type /Foo /Marker (source-five) >> << /Type /Foo /Marker (source-six) >>
+endstream
+endobj
+7 0 obj
+<< /Type /XRef /Size 8 /Root 1 0 R /W [1 4 2] /Filter /ASCIIHexDecode /Length 113 >>
+stream
+0000000000FFFF01000000090000010000004C00000100000085000001000000CA00000200000004000002000000040001010000016D0000>
+endstream
+endobj
+startxref
+365
+%%EOF

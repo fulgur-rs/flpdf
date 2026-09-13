@@ -19,7 +19,7 @@ pub(crate) use planning::{
     plan_object_streams_with_reachability_and_source_membership,
     plan_qpdf_preserve_object_streams_with_source_membership,
     plan_qpdf_preserve_object_streams_with_unreferenced, planner_config_from_options,
-    ObjectStreamGroup, PlannerConfig,
+    sort_source_backed_members_qpdf_order, ObjectStreamGroup, PlannerConfig,
 };
 
 // ── Tests ────────────────────────────────────────────────────────────────────
