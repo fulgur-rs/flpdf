@@ -145,6 +145,52 @@ class CheckQpdfRouteMatrixTests(unittest.TestCase):
             self.assertIn("classification", result.stdout)
             self.assertIn("legacy", result.stdout)
 
+    def test_prose_between_classification_rows_is_not_table_end(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary_directory:
+            repo = SyntheticRepository(Path(temporary_directory))
+            repo.write(
+                "a.md",
+                HEADER
+                + "| 1 | x | `libqpdf/QPDF.cc:1` | y | z | canonical | w | - |\n"
+                + "\n"
+                + "The table continues after this explanatory note.\n"
+                + "\n"
+                + "| 2 | x | `libqpdf/QPDF.cc:2` | y | z | mixed | w | - |\n",
+            )
+            result = repo.check()
+            self.assertEqual(0, result.returncode, result.stdout + result.stderr)
+            self.assertIn("2 matrix row(s)", result.stdout)
+
+    def test_nonclassification_table_after_prose_is_not_counted(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary_directory:
+            repo = SyntheticRepository(Path(temporary_directory))
+            repo.write(
+                "a.md",
+                HEADER
+                + "| 1 | x | `libqpdf/QPDF.cc:1` | y | z | canonical | w | - |\n"
+                + "\n"
+                + "A different table follows.\n"
+                + "\n"
+                + "| name | value |\n"
+                + "|---|---|\n"
+                + "| stale | mixed |\n",
+            )
+            result = repo.check()
+            self.assertEqual(0, result.returncode, result.stdout + result.stderr)
+            self.assertIn("1 matrix row(s)", result.stdout)
+
+    def test_combined_zero_one_row_counts_as_two_logical_cases(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary_directory:
+            repo = SyntheticRepository(Path(temporary_directory))
+            repo.write(
+                "a.md",
+                HEADER
+                + "| 0/1 | x | `libqpdf/QPDF.cc:1` | y | z | bridge | w | - |\n",
+            )
+            result = repo.check()
+            self.assertEqual(0, result.returncode, result.stdout + result.stderr)
+            self.assertIn("2 matrix row(s)", result.stdout)
+
     def test_prose_citation_outside_table_is_also_checked(self) -> None:
         with tempfile.TemporaryDirectory() as temporary_directory:
             repo = SyntheticRepository(Path(temporary_directory))
@@ -261,6 +307,25 @@ class CheckQpdfRouteMatrixTests(unittest.TestCase):
             self.assertIn("tracked-symbols.txt:6:", result.stdout)
             self.assertNotIn("tracked-symbols.txt:2:", result.stdout)
             self.assertNotIn("tracked-symbols.txt:3:", result.stdout)
+
+    def test_malformed_row_width_is_error_not_a_silent_table_end(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary_directory:
+            repo = SyntheticRepository(Path(temporary_directory))
+            repo.write(
+                "a.md",
+                HEADER
+                + "| 1 | x | `libqpdf/QPDF.cc:1` | y | z | canonical | w | - | extra |\n"
+                "| 2 | x | `libqpdf/QPDF.cc:1` | y | z | bogus | w | - |\n",
+            )
+            result = repo.check()
+            self.assertNotEqual(0, result.returncode, result.stdout + result.stderr)
+            self.assertIn("a.md:3:", result.stdout)
+            self.assertIn("classification row has 9 cell(s), expected 8", result.stdout)
+            # The table must keep going: the row after the malformed one is
+            # still validated, so a stray pipe cannot silently drop the rest
+            # of the table from both the count and the classification check.
+            self.assertIn("a.md:4:", result.stdout)
+            self.assertIn("classification `bogus` is not one of", result.stdout)
 
     def test_missing_matrix_directory_is_error(self) -> None:
         with tempfile.TemporaryDirectory() as temporary_directory:

@@ -191,6 +191,17 @@ def split_markdown_row(row: str) -> list[str]:
     return cells
 
 
+def is_markdown_separator(cells: list[str]) -> bool:
+    return bool(cells) and all(re.fullmatch(r":?-{3,}:?", cell) for cell in cells)
+
+
+def classification_row_weight(cells: list[str]) -> int:
+    # The qtest exception matrix intentionally combines cases 0 and 1 into
+    # one physical row. Keep the aggregate denominator in logical-case units,
+    # as recorded by docs/qpdf-route-matrix/README.md and flpdf-335in.
+    return 2 if cells and cells[0].strip() == "0/1" else 1
+
+
 class Checker:
     def __init__(self, root: Path, qpdf_root: Path | None, report: Report) -> None:
         self.root = root
@@ -292,8 +303,10 @@ class Checker:
 
     def check_document(self, doc: Path) -> None:
         classification_column: int | None = None
+        classification_width: int | None = None
+        lines = doc.read_text(encoding="utf-8").splitlines()
         for line_number, raw_line in enumerate(
-            doc.read_text(encoding="utf-8").splitlines(), start=1
+            lines, start=1
         ):
             for match in QPDF_CITATION_TOKEN_RE.finditer(raw_line):
                 # The checker documentation itself contains illustrative
@@ -316,18 +329,45 @@ class Checker:
 
             stripped = raw_line.strip()
             if not stripped.startswith("|"):
-                classification_column = None
                 continue
             cells = split_markdown_row(stripped)
             lowered = [cell.lower() for cell in cells]
             if "classification" in lowered:
                 classification_column = lowered.index("classification")
+                classification_width = len(cells)
                 continue
             if classification_column is None:
                 continue
-            if all(re.fullmatch(r":?-{3,}:?", cell) for cell in cells):
+            if is_markdown_separator(cells):
                 continue
-            self.report.rows += 1
+            next_line = lines[line_number] if line_number < len(lines) else ""
+            next_cells = (
+                split_markdown_row(next_line.strip())
+                if next_line.strip().startswith("|")
+                else []
+            )
+            # Only a proven header boundary ends the table: a header row is
+            # followed by a Markdown separator. A width mismatch without that
+            # boundary is a malformed data row, and silently ending the table
+            # there would understate the count exactly like the prose reset
+            # this check replaced.
+            if (
+                next_cells
+                and is_markdown_separator(next_cells)
+                and "classification" not in lowered
+            ):
+                classification_column = None
+                classification_width = None
+                continue
+            if len(cells) != classification_width:
+                self.report.error(
+                    doc,
+                    line_number,
+                    f"classification row has {len(cells)} cell(s), "
+                    f"expected {classification_width}",
+                )
+                continue
+            self.report.rows += classification_row_weight(cells)
             if classification_column >= len(cells):
                 self.report.error(
                     doc, line_number, "row has no classification column"
