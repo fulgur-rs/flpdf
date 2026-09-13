@@ -931,9 +931,8 @@ fn candidate_reentry_orders_its_own_read_warning_before_its_build_diagnostic() {
          WARNING: input.pdf (object 1 0, offset 102): expected endobj\n\
          WARNING: input.pdf (xref stream: object 1 0, offset 102): expected endobj\n\
          WARNING: input.pdf (xref stream, offset 9): Cross-reference stream data has the wrong size; expected = 4; actual = 5\n",
-        "the re-entry's own read warning must print before the build diagnostic \
-         parse_xref_stream_with_canonical_owner writes to its sink afterward, \
-         since the read happens first in real call order"
+        "the re-entry's read warning must print before its build diagnostic, \
+         since the read happens first in qpdf's call order"
     );
 }
 
