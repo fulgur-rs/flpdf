@@ -788,6 +788,59 @@ fn specialized_encrypted_live_queue_discovers_callback_children_in_each_mode() {
 }
 
 #[test]
+fn qdf_and_normalize_generate_progress_callbacks_use_live_queue() {
+    for qdf in [true, false] {
+        let mut pdf = Pdf::open(Cursor::new(
+            include_bytes!("../../../tests/fixtures/compat/one-page.pdf").to_vec(),
+        ))
+        .unwrap();
+        let root = pdf.root_handle().unwrap();
+        let child = pdf
+            .make_indirect_object_handle(ObjectHandle::dictionary(vec![(
+                b"/QdfGenerateProgressChild".to_vec(),
+                ObjectHandle::integer(42),
+            )]))
+            .unwrap();
+
+        let mut writer = PdfWriter::new(&mut pdf);
+        writer.set_object_stream_mode(ObjectStreamMode::Generate);
+        writer.set_qdf_mode(qdf);
+        writer.set_content_normalization(!qdf);
+        writer.set_static_id(true);
+        writer.set_output_memory().unwrap();
+        let mut called = false;
+        writer.register_progress_reporter(Box::new(move |_percent| {
+            if !called {
+                called = true;
+                root.replace_key(b"/QdfGenerateProgressProbe", child.clone())?;
+            }
+            Ok(())
+        }));
+        writer
+            .write()
+            .unwrap_or_else(|error| panic!("qdf={qdf} Generate live write failed: {error}"));
+
+        let output = writer.get_buffer().unwrap();
+        let mut rewritten = Pdf::open(Cursor::new(output)).unwrap();
+        let rewritten_root = rewritten.root_handle().unwrap();
+        let child_ref = rewritten_root
+            .try_get_key(b"/QdfGenerateProgressProbe")
+            .unwrap()
+            .object_ref()
+            .expect("QDF/normalize Generate must retain the callback child reference");
+        assert_eq!(
+            rewritten
+                .get_object_handle(child_ref)
+                .try_get_key(b"/QdfGenerateProgressChild")
+                .unwrap()
+                .as_integer(),
+            Some(42),
+            "qdf={qdf} Generate must discover callback children through the live queue"
+        );
+    }
+}
+
+#[test]
 fn plain_generate_progress_callback_discovers_child_through_live_queue() {
     let mut pdf = Pdf::open(Cursor::new(
         include_bytes!("../../../tests/fixtures/compat/one-page-no-ext.pdf").to_vec(),

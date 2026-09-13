@@ -718,7 +718,7 @@ mod tests {
         qdf_generate.qdf = true;
         assert_eq!(
             classify_plain_route(false, &qdf_generate, ObjectStreamMode::Generate, &empty),
-            PlainRoute::Planned
+            PlainRoute::OutsidePlain
         );
 
         let mut normalize_generate = options(ObjectStreamMode::Generate);
@@ -730,7 +730,7 @@ mod tests {
                 ObjectStreamMode::Generate,
                 &empty,
             ),
-            PlainRoute::Planned
+            PlainRoute::OutsidePlain
         );
     }
 
