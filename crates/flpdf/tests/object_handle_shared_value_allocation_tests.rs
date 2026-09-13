@@ -306,6 +306,27 @@ fn direct_scalar_uses_at_most_two_allocations_without_a_single_owner_list() {
         "direct scalar used {} allocations",
         direct_scalar.allocations
     );
+    assert!(
+        direct_scalar.live_bytes <= 352,
+        "direct scalar retained {} live bytes; containment parent storage is not compact",
+        direct_scalar.live_bytes
+    );
+
+    let child = ObjectHandle::integer(8);
+    let (single_parent, single_parent_measurement) =
+        measure_construction(|| ObjectHandle::array(vec![child.clone()]));
+    std::hint::black_box(&single_parent);
+    report_measurement("single-containment-parent", single_parent_measurement);
+    assert!(
+        single_parent_measurement.allocations <= 4,
+        "single containment parent used {} allocations",
+        single_parent_measurement.allocations
+    );
+    assert!(
+        single_parent_measurement.live_bytes <= 360,
+        "single containment parent retained {} live bytes",
+        single_parent_measurement.live_bytes
+    );
 
     // Allocate fixtures before resetting the counters so every reported number
     // covers construction, not test-data preparation. Thread-local measurement
