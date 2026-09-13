@@ -790,11 +790,13 @@ impl std::error::Error for CliPathError {
 // never reaching the JSON branch. Conflicting instead surfaces the
 // ambiguity as a clean usage error.
 #[command(args_conflicts_with_subcommands = true)]
-// The five attachment operations are dispatched by an ordered `else if`
-// chain in `main`, so supplying two at once would silently run only the
-// first. Make them mutually exclusive at the parser level: clap rejects
-// e.g. `--add-attachment … -- --copy-attachments-from …` with a usage
-// error instead of discarding the second operation. (`--verbose` is a
+// The three attachment-mutating operations are dispatched by an ordered
+// `else if` chain in `main`, so supplying two at once would silently run only
+// the first. Make them mutually exclusive at the parser level: clap rejects
+// e.g. `--add-attachment … -- --copy-attachments-from …` with a usage error
+// instead of discarding the second operation. `--list-attachments` and
+// `--show-attachment` are inspection consumers, not mutations; qpdf runs both
+// independently when they are supplied together. (`--verbose` is a
 // sub-modifier, not an operation, so it is intentionally NOT a member of
 // this group.)
 #[command(group(
@@ -803,8 +805,6 @@ impl std::error::Error for CliPathError {
         .args([
             "add_attachment",
             "remove_attachment",
-            "list_attachments",
-            "show_attachment",
             "copy_attachments_from",
         ])
 ))]
@@ -813,7 +813,7 @@ struct Cli {
     command: Option<Commands>,
 
     // Legacy options kept for compatibility.
-    #[arg(long, conflicts_with = "output")]
+    #[arg(long, conflicts_with = "output", overrides_with = "check")]
     check: bool,
     /// Suppress warning delivery while retaining qpdf's warning exit status.
     #[arg(long)]
@@ -825,6 +825,7 @@ struct Cli {
     /// (qpdf --check-linearization).
     #[arg(
         long = "check-linearization",
+        overrides_with = "check_linearization",
         conflicts_with_all = [
             "job_json_file",
             "json",
@@ -854,7 +855,12 @@ struct Cli {
     repair: bool,
     #[command(flatten)]
     password: PasswordArgs,
-    #[arg(long, require_equals = true, conflicts_with = "output")]
+    #[arg(
+        long,
+        require_equals = true,
+        conflicts_with = "output",
+        overrides_with = "show_object"
+    )]
     show_object: Option<String>,
     /// Emit stored stream bytes for `--show-object` (qpdf --raw-stream-data).
     #[arg(long = "raw-stream-data", requires = "show_object")]
@@ -862,18 +868,18 @@ struct Cli {
     /// Emit decoded stream bytes for `--show-object` (qpdf --filtered-stream-data).
     #[arg(long = "filtered-stream-data", requires = "show_object")]
     filtered_stream_data: bool,
-    #[arg(long, conflicts_with = "output")]
+    #[arg(long, conflicts_with = "output", overrides_with = "show_npages")]
     show_npages: bool,
-    #[arg(long, conflicts_with = "output")]
+    #[arg(long, conflicts_with = "output", overrides_with = "show_pages")]
     show_pages: bool,
     /// Include image XObject details in `--show-pages` output (qpdf
     /// `--with-images`). This is a modifier and does not itself select an
     /// inspection mode.
     #[arg(long = "with-images")]
     with_images: bool,
-    #[arg(long, conflicts_with = "output")]
+    #[arg(long, conflicts_with = "output", overrides_with = "show_xref")]
     show_xref: bool,
-    #[arg(long, conflicts_with = "output")]
+    #[arg(long, conflicts_with = "output", overrides_with = "show_linearization")]
     show_linearization: bool,
     /// Show encryption parameters on the qpdf-compatible top-level surface.
     /// This is the argv form used by qtest (`qpdf --show-encryption FILE`);
@@ -885,7 +891,11 @@ struct Cli {
     /// (`QPDFJob.cc:593-594`) rejects an output file argument outright with
     /// "no output file may be given for this option", regardless of what
     /// other flags accompany it.
-    #[arg(long = "show-encryption", conflicts_with = "output")]
+    #[arg(
+        long = "show-encryption",
+        conflicts_with = "output",
+        overrides_with = "show_encryption"
+    )]
     show_encryption: bool,
 
     /// Exit 0 when INPUT is encrypted and 2 otherwise (qpdf
@@ -1482,6 +1492,7 @@ struct Cli {
     #[arg(
         long = "list-attachments",
         conflicts_with = "output",
+        overrides_with = "list_attachments",
         help = "List all embedded-file attachments (qpdf --list-attachments)"
     )]
     list_attachments: bool,
@@ -1507,6 +1518,7 @@ struct Cli {
         conflicts_with = "output",
         value_name = "KEY",
         require_equals = true,
+        overrides_with = "show_attachment",
         help = "Extract the embedded file with the given key to stdout \
                 (qpdf --show-attachment)"
     )]
