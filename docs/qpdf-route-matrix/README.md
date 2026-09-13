@@ -27,13 +27,26 @@ container-above-max だった — `flpdf-hi08` / PR #1486）。本表は残る m
 
 ための preflight である。production semantics・public API はこの文書では変えない。
 
-### 全体集計（160 行）
+### A〜E route matrix aggregate（履歴上の160行）
 
 領域 A〜E の 5 ファイルを合わせた分類の内訳は次の 1 組だけである。以降の節はこの数を再掲しない。
 
 | canonical | bridge | mixed | unknown | 合計 |
 |---|---|---|---|---|
-| 68 | 10 | 81 | 1 | 160 |
+| 95 | 4 | 61 | 0 | 160 |
+
+### checker logical aggregate（259 rows）
+
+`scripts/check-qpdf-route-matrix.py --check` は、A〜E の160行に加えて
+E の qtest exception 表（物理98行を論理99ケースとして数える）を含む259 logical
+rowsを検証する。2026-09-13 の現行 `origin/main` (`ffc782439`) での集計は次のとおり。
+
+| canonical | bridge | mixed | unknown | 合計 |
+|---|---|---|---|---|
+| 119 | 12 | 128 | 0 | 259 |
+
+したがって、160行の領域別表と259 logical rowsの checker 分母は異なる。どちらも
+parity 完了数ではなく、責務／経路の分類数である。
 
 再現コマンド（`\|` でエスケープされたセル内パイプを先に潰してから7列目を読む）:
 
@@ -83,6 +96,13 @@ done | sort | uniq -c
 本表は「その責務に至る **経路が 1 本か**」を問う。✅ の行でも consumer 側に bridge が残っていれば
 本表では mixed / bridge になりうる。
 
+2026-09-13 の current-main audit anchor は `origin/main=ffc782439`、pinned qpdf は
+11.9.0 commit `3b97c9bd266b7c32ea36d3536e22dab77412886d` である。checker の実測は
+1052 qpdf citations / 928 flpdf citations / 259 logical rows、分類は
+canonical 119 / mixed 128 / bridge 12 / unknown 0。A〜E の160行だけを数える
+上の領域別集計は canonical 95 / mixed 61 / bridge 4 / unknown 0 なので、checker
+の259 logical rowsと混同しない。
+
 履歴行の例外: C44はpublic facadeとdeferred blobの責務を分離したmixed ownerとして追跡する。
 D19/D30はcanonical ownerへ委譲するbyte-neutral test scaffolding、D27は当該pre-write sweep撤去完了としてcanonicalに分類する。
 この例外をproduction routeの重複や全体parityの証拠に広げない。
@@ -91,11 +111,11 @@ D19/D30はcanonical ownerへ委譲するbyte-neutral test scaffolding、D27は�
 
 | ファイル | 行数 | canonical | bridge | mixed | unknown |
 |---|---|---|---|---|---|
-| [A. ObjectHandle / Resolver — object identity, lazy resolve, ownership, teardown](a-objecthandle-resolver.md) | 24 | 6 | 5 | 13 | 0 |
-| [B. parser / xref recovery / warning・error・diagnostics](b-parser-recovery-diagnostics.md) | 34 | 13 | 1 | 19 | 1 |
-| [C. stream data provider / decode / retry / filter / encryption / `/Length`](c-stream-pipeline-encryption.md) | 42 | 30 | 2 | 10 | 0 |
-| [D. writer — reachability, ObjStm planning / renumber / emission, xref / trailer, encryption, linearize](d-writer.md) | 31 | 12 | 0 | 19 | 0 |
-| [E. QPDFJob / CLI / C API 相当の consumer・adaptor](e-job-cli-capi.md) | 29 | 5 | 3 | 21 | 0 |
+| [A. ObjectHandle / Resolver — object identity, lazy resolve, ownership, teardown](a-objecthandle-resolver.md) | 24 | 16 | 0 | 8 | 0 |
+| [B. parser / xref recovery / warning・error・diagnostics](b-parser-recovery-diagnostics.md) | 34 | 20 | 0 | 14 | 0 |
+| [C. stream data provider / decode / retry / filter / encryption / `/Length`](c-stream-pipeline-encryption.md) | 42 | 35 | 2 | 5 | 0 |
+| [D. writer — reachability, ObjStm planning / renumber / emission, xref / trailer, encryption, linearize](d-writer.md) | 31 | 15 | 0 | 16 | 0 |
+| [E. QPDFJob / CLI / C API 相当の consumer・adaptor](e-job-cli-capi.md) | 29 | 9 | 2 | 18 | 0 |
 
 ## 5. 責任境界と不変条件
 
