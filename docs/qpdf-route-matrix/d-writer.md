@@ -484,6 +484,7 @@ specialized coordinator 内部（`4a2faf5c` の状態）:
 | `D13` | `flpdf-3yn9.48.58` | writeXRefStreamのlayout契約を共有ownerへ統合する |
 | `D1` / `D25` | `flpdf-3yn9.48.59` | prepareFileForWriteのgraph準備を分岐前に一度だけ実行する |
 | `D25` | `flpdf-3yn9.48.60` | root unparseObjectへADBE出力処理を移しsnapshot/restoreを撤去する |
+| `D14` | `flpdf-nhet` | `getTrimmedTrailer` の xref-structural key と source trailer key の境界を揃え、`/F`・`/FFilter`・`/FDecodeParms` の到達性・late numbering を保持する |
 | `D26` | `flpdf-3yn9.48.61` | initializeSpecialStreamsのpage/content/normalized mapをsetupで一度生成する |
 | `D16` / `D1` | `flpdf-3yn9.48.62` | encryption設定・doWriteSetupを単一writer stateに揃える |
 | `D3` | `flpdf-3yn9.48.63` | linearizationの採番engineを使ったcache warmup迂回を撤去する |
@@ -600,3 +601,21 @@ Root ownershipの切替はD25をcanonicalへ更新するが、Generate/source-Ob
 Preserve、direct Rootのplanned queue、暗号化系の残るchild discovery／ObjStm packingは
 D2/D3/D11のmixed残差である。したがって、このsliceの完了はroute matrix全体の
 bridge/mixed解消や全writer parityを意味しない。
+
+## 2026-09-13: trailer external-file keys (`flpdf-nhet`)
+
+qpdf 11.9.0 の `QPDFWriter::getTrimmedTrailer` は `/ID`・`/Encrypt`・`/Prev` と
+xref stream の10 keyだけを除去し、`/F`・`/FFilter`・`/FDecodeParms` は通常の
+trailer keyとして `writeTrailer` の sorted walk に残す
+（`libqpdf/QPDFWriter.cc:1160-1236,2009-2031`）。従来の flpdf はこの3 keyまで
+writer-owned structural keyとして除去していたため、trailer-only `/F` の indirect
+objectを live queue／planned reachability から落とし、`/Info`・後続 trailer参照の
+番号と `/Size` を qpdf とずらしていた。
+
+`flpdf-nhet` は同じ10 key集合を normal live/planned、QDF/normalize の shared
+late-trailer map、PCLm、linearized trailer-entry serializerへ適用した。repository
+fixture `trailer-external-file-keys.pdf` で、qpdf 11.9.0 との normal Disable、planned
+Generate、QDF Preserve、linearized の byte/status を比較し、PCLm の page/root-only
+seed後に late-number される trailer reference も専用テストで固定した。これは D14
+の source-key boundary 修正であり、writeTrailer の複数 consumer が残る D14 mixed
+分類や route matrix 全体の parity 完了を意味しない。

@@ -187,3 +187,40 @@ fn pclm_direct_root_progress_child_gets_qpdf_late_numbering() {
         .windows(b"3 0 obj\n".len())
         .any(|window| window == b"3 0 obj\n"));
 }
+
+#[test]
+fn pclm_preserves_external_file_trailer_keys() {
+    let mut pdf = Pdf::open(Cursor::new(
+        include_bytes!("../../../tests/fixtures/compat/trailer-external-file-keys.pdf").to_vec(),
+    ))
+    .unwrap();
+    let mut writer = PdfWriter::new(&mut pdf);
+    writer.set_pclm(true);
+    writer.set_static_id(true);
+    writer.set_output_memory().unwrap();
+    writer.write().expect("PCLm write");
+
+    let mut output = Pdf::open(Cursor::new(writer.get_buffer().unwrap())).unwrap();
+    let trailer = output.trailer();
+    let file_ref = trailer
+        .try_get_key(b"/F")
+        .unwrap()
+        .object_ref()
+        .expect("PCLm trailer /F must remain indirect");
+    assert!(file_ref.number > 0);
+    // PCLm's qpdf seed is page/contents/strip/root-only. The trailer is
+    // written after that queue drains, so `unparseChild` assigns this late
+    // reference without adding a body object (`QPDFWriter.cc:2928-2954,
+    // 1144-1157`).
+    let file_object = output.get_object_handle(file_ref);
+    file_object.try_is_scalar().unwrap();
+    assert!(file_object.is_null());
+    assert_eq!(
+        trailer.try_get_key(b"/FFilter").unwrap().unparse(),
+        b"/ASCIIHexDecode"
+    );
+    assert_eq!(
+        trailer.try_get_key(b"/FDecodeParms").unwrap().unparse(),
+        b"<< /Columns 1 >>"
+    );
+}
