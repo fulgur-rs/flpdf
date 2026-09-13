@@ -2639,8 +2639,10 @@ mod final_handle_tests {
         let mut pdf = crate::Pdf::open(std::io::Cursor::new(
             include_bytes!("../../../../../tests/fixtures/compat/one-page.pdf").to_vec(),
         ))?; // cov:ignore: the fixture open succeeds; LLVM attributes this test setup terminator separately.
-        let mut options = WriterOptions::default();
-        options.object_streams = crate::writer::ObjectStreamMode::Generate;
+        let options = WriterOptions {
+            object_streams: crate::writer::ObjectStreamMode::Generate,
+            ..WriterOptions::default()
+        };
         let mut plan = PlainWritePlan::build(&mut pdf, &options)?;
         if let Some(root) = pdf.root_ref() {
             plan.objects.insert(
