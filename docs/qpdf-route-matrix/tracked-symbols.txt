@@ -177,7 +177,7 @@ crates/flpdf/src/writer/plain/body.rs::canonical_stream_output_with_rewrite_poli
 
 # --- (a) deletable route ---
 crates/flpdf/src/writer/rewrite_renumber.rs::CanonicalCatalogFirstRenumber  # D3
-crates/flpdf/src/writer/object_streams/planning.rs::plan_object_streams_with_reachability  # D6 legacy
+crates/flpdf/src/writer/object_streams/planning.rs::plan_object_streams_with_reachability_and_source_membership  # D6 legacy
 crates/flpdf/src/linearization/plan.rs::objstm_membership_linearized_with_eligibility      # D6/D23
 crates/flpdf/src/writer/object_streams/eligibility.rs::get_compressible_objgens            # D8 薄い層
 crates/flpdf/src/writer/object.rs::write_trailer_with_ref_map            # D14 第 2 の trailer 書き出し

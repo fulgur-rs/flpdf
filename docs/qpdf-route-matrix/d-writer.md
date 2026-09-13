@@ -135,6 +135,11 @@ pinned qpdf 11.9.0 の `libqpdf/QPDFWriter.cc`（3044 行）/ `include/qpdf/QPDF
   `cmp_diff_zero_tests::qdf_preserve_unreferenced_signature_objstm_matches_qpdf_11_9` が、
   `--static-id --qdf --preserve-unreferenced` の status と bytes、および既解消済み2 fixtureを
   qpdf 11.9.0 と比較する。
+- 2026-09-13（`flpdf-idd3`）: legacy planned Preserve の object-stream planner と
+  linearized Preserve の source-container mapping は、setup 時に取得した同じ
+  `source_object_stream_data` snapshot を受け取る。writer 内の source-container exclusion
+  helper (`rewrite_renumber`) は別の seed-membership consumerであり、今回の snapshot配管の
+  対象外として残る。
 - linearized: `QPDF::optimize`（`libqpdf/QPDF_optimization.cc:57-118`）が `/Outlines` の indirect 化、
   `pushInheritedAttributesToPage`、各 page / trailer key（`/Root` 以外）/ root key ごとに
   `updateObjectMaps` で `obj_user_to_objects` / `object_to_obj_users` を作り、

@@ -3765,10 +3765,12 @@ fn emit_canonical_pdf_inner<R: Read + Seek, W: Write>(
     } else {
         None
     };
-    let mut plan = object_streams::plan_object_streams_with_reachability(
+    let mut plan = object_streams::plan_object_streams_with_reachability_and_source_membership(
         pdf,
         &planner_config,
         generated_reachable.as_ref(),
+        Some(&source_object_stream_data),
+        generated_compressible.as_ref(),
     )?; // cov:ignore: LLVM attributes this multiline planner-call terminator to the call setup; both reachability branches are exercised by writer tests
 
     // Drop ObjStm members that are not reachable from the trailer seed. The

@@ -3031,7 +3031,11 @@ pub(crate) fn write_linearized_for_pdf_writer<R: Read + Seek>(
 
         let mut plan_options = options.clone();
         plan_options.object_streams = mode;
-        let plan = LinearizationPlan::from_pdf_with_writer_options(pdf, &plan_options)?;
+        let plan = LinearizationPlan::from_pdf_with_writer_options_and_source_membership(
+            pdf,
+            &plan_options,
+            Some(&setup.source_object_stream_data),
+        )?;
         // qpdf allocates generated ObjStm placeholders before it removes page
         // and Catalog members from the mapping (QPDFWriter.cc:1970-2005,
         // 2141-2161). Count those pre-filter containers for progress even
@@ -3142,10 +3146,14 @@ fn write_linearized_impl<R: Read + Seek>(
     let crate::writer::WriterSetupState {
         generated_id,
         encryption_parameters,
-        source_object_stream_data: _,
+        source_object_stream_data,
         generated_compressible: _,
         generated_object_stream_sources: _,
     } = setup;
+    let source_container_by_member: BTreeMap<ObjectRef, u32> = source_object_stream_data
+        .into_iter()
+        .map(|(member, stream)| (ObjectRef::new(member, 0), stream))
+        .collect();
     let deterministic_id = crate::writer::uses_deterministic_id(options);
 
     // Finalize the file identifier exactly once here — before the plan/
@@ -3417,14 +3425,6 @@ fn write_linearized_impl<R: Read + Seek>(
     // from the shifted map.
     let open_document_source_container_numbers: Vec<Option<u32>> =
         if options.object_streams == crate::writer::ObjectStreamMode::Preserve {
-            let source_container_by_member: BTreeMap<ObjectRef, u32> = pdf
-                .source_xref_entries()
-                .into_iter()
-                .filter_map(|(object_ref, entry)| match entry {
-                    crate::XrefEntry::Compressed { stream, .. } => Some((object_ref, stream)),
-                    _ => None,
-                })
-                .collect();
             resolved_batch_plan
                 .open_document_batches
                 .iter()
@@ -3598,14 +3598,6 @@ fn write_linearized_impl<R: Read + Seek>(
         .object_streams
     {
         crate::writer::ObjectStreamMode::Preserve => {
-            let source_container_by_member: std::collections::BTreeMap<ObjectRef, u32> = pdf
-                .source_xref_entries()
-                .into_iter()
-                .filter_map(|(object_ref, offset)| match offset {
-                    crate::XrefEntry::Compressed { stream, .. } => Some((object_ref, stream)),
-                    _ => None,
-                })
-                .collect();
             let mut keys = std::collections::BTreeMap::new();
             for container in objstm_layout
                 .open_document
@@ -4267,14 +4259,6 @@ fn write_linearized_impl<R: Read + Seek>(
     if options.object_streams == crate::writer::ObjectStreamMode::Preserve
         && !objstm_layout.is_empty()
     {
-        let source_container_by_member: BTreeMap<ObjectRef, u32> = pdf
-            .source_xref_entries()
-            .into_iter()
-            .filter_map(|(object_ref, entry)| match entry {
-                crate::XrefEntry::Compressed { stream, .. } => Some((object_ref, stream)),
-                _ => None,
-            })
-            .collect();
         for container in objstm_layout
             .open_document
             .iter()

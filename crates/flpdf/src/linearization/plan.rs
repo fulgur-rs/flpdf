@@ -970,6 +970,14 @@ impl LinearizationPlan {
         pdf: &mut Pdf<R>,
         options: &crate::writer::WriterOptions,
     ) -> crate::Result<Self> {
+        Self::from_pdf_with_writer_options_and_source_membership(pdf, options, None)
+    }
+
+    pub(crate) fn from_pdf_with_writer_options_and_source_membership<R: Read + Seek>(
+        pdf: &mut Pdf<R>,
+        options: &crate::writer::WriterOptions,
+        source_membership_snapshot: Option<&BTreeMap<u32, u32>>,
+    ) -> crate::Result<Self> {
         let object_stream_mode = options.object_streams;
         let use_generate_objstm = matches!(
             object_stream_mode,
@@ -1151,10 +1159,20 @@ impl LinearizationPlan {
         // qpdf classifies them as first-page section objects (Part 2) when reached
         // from the first page, giving them HIGH object numbers. Without this, they
         // land in part4_rest with LOW numbers.
-        let source_had_compressed_objects = pdf
-            .source_xref_entries()
-            .iter()
-            .any(|(_reference, offset)| matches!(offset, crate::XrefEntry::Compressed { .. }));
+        let source_had_compressed_objects = if matches!(
+            object_stream_mode,
+            crate::writer::ObjectStreamMode::Preserve
+        ) {
+            if let Some(snapshot) = source_membership_snapshot {
+                !snapshot.is_empty()
+            } else {
+                let mut source_membership = BTreeMap::new();
+                pdf.get_object_stream_data(&mut source_membership);
+                !source_membership.is_empty()
+            }
+        } else {
+            false
+        };
         let operation_removes_stale_generations = use_generate_objstm
             || (matches!(
                 object_stream_mode,
