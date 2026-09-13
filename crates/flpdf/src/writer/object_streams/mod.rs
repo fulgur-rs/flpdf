@@ -13,12 +13,12 @@ pub(crate) use emission::{
     emit_objstm_body_from_handles_with_writer, emit_objstm_body_from_handles_with_writer_qdf,
     wrap_objstm_body_as_handle, ObjStmBody,
 };
+#[cfg(test)]
+pub(crate) use planning::sort_source_backed_members_qpdf_order;
 pub use planning::ObjectStreamMode;
 pub(crate) use planning::{
-    filter_objstm_batches_for_output, plan_object_streams_with_reachability_and_source_membership,
-    plan_qpdf_preserve_object_streams_with_source_membership,
+    filter_objstm_batches_for_output, plan_qpdf_preserve_object_streams_with_source_membership,
     plan_qpdf_preserve_object_streams_with_unreferenced, planner_config_from_options,
-    sort_members_qpdf_order, ObjectStreamGroup, PlannerConfig,
+    ObjectStreamGroup, PlannerConfig,
 };
-
 // ── Tests ────────────────────────────────────────────────────────────────────

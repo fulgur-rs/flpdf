@@ -28,18 +28,25 @@
 //! - Objects unreachable from the seed never receive a number (qpdf drops them
 //!   by default).
 
-use std::collections::{BTreeSet, HashMap, VecDeque};
+#[cfg(test)]
+use std::collections::HashMap;
+use std::collections::{BTreeSet, VecDeque};
 use std::io::{Read, Seek};
 
 use crate::object_ref::ObjectRef;
 use crate::parser::MAX_PARSE_DEPTH;
+#[cfg(test)]
 use crate::qpdf_obj_gen::QpdfObjGen;
-use crate::writer::object_streams::{sort_members_qpdf_order, ObjectStreamGroup};
+#[cfg(test)]
+use crate::writer::object_streams::sort_source_backed_members_qpdf_order;
+#[cfg(test)]
+use crate::writer::object_streams::ObjectStreamGroup;
 use crate::Error;
 use crate::Pdf;
+#[cfg(test)]
 use crate::XrefEntry;
 
-pub(crate) type StreamParametersRemoved<'a> =
+type LinearizedStreamParameterOmission<'a> =
     Option<&'a dyn Fn(&crate::ObjectHandle) -> crate::Result<bool>>;
 
 /// Maps an original object reference to its assigned new reference.
@@ -48,17 +55,20 @@ pub(crate) type StreamParametersRemoved<'a> =
 /// rewrite, [`ObjectStreamRenumber`] for object-stream output) so that
 /// `renumber_qpdf_refs_in_place` can rewrite an object's internal references
 /// under either numbering without duplication.
+#[cfg(test)]
 pub(crate) trait NewNumberLookup {
     /// Return the new reference assigned to `original`, if it was reachable.
     fn new_for_original(&self, original: ObjectRef) -> Option<ObjectRef>;
 }
 
+#[cfg(test)]
 impl NewNumberLookup for ObjectStreamRenumber {
     fn new_for_original(&self, original: ObjectRef) -> Option<ObjectRef> {
         self.old_to_new.get(&original).copied()
     }
 }
 
+#[cfg(test)]
 impl NewNumberLookup for HashMap<ObjectRef, ObjectRef> {
     fn new_for_original(&self, original: ObjectRef) -> Option<ObjectRef> {
         self.get(&original).copied()
@@ -69,6 +79,7 @@ impl NewNumberLookup for HashMap<ObjectRef, ObjectRef> {
 /// entries. qpdf derives this mapping from its xref table
 /// (`QPDF.cc:2381-2390`), not from an object's dictionary `/Type`; an ordinary
 /// orphan stream merely typed `/ObjStm` remains a preserve-unreferenced object.
+#[cfg(test)]
 fn qpdf_source_objstm_containers<R: Read + Seek>(pdf: &Pdf<R>) -> BTreeSet<ObjectRef> {
     pdf.source_xref_entries()
         .into_values()
@@ -81,6 +92,7 @@ fn qpdf_source_objstm_containers<R: Read + Seek>(pdf: &Pdf<R>) -> BTreeSet<Objec
 
 /// Return a stable writer-local key for a raw qpdf object identity that cannot
 /// be represented by `ObjectRef`. It is never registered in the source Pdf.
+#[cfg(test)]
 fn writer_local_raw_ref(raw: QpdfObjGen) -> Option<ObjectRef> {
     let object = u32::try_from(raw.get_obj()).ok()?;
     if object == 0 {
@@ -96,24 +108,23 @@ fn writer_local_raw_ref(raw: QpdfObjGen) -> Option<ObjectRef> {
 /// creating a separate legacy `Object` snapshot. The enqueue order and
 /// null-visible edge rules mirror `QPDFWriter::enqueueObject` and
 /// `enqueueObjectsStandard` (`QPDFWriter.cc:1072-1141,2916-2924`).
+#[cfg(test)]
 pub(crate) struct CanonicalCatalogFirstRenumber {
     old_to_new: HashMap<ObjectRef, ObjectRef>,
     order: Vec<ObjectRef>,
+    #[cfg(test)]
     raw_sources: HashMap<ObjectRef, QpdfObjGen>,
 }
 
+#[cfg(test)]
 impl NewNumberLookup for CanonicalCatalogFirstRenumber {
     fn new_for_original(&self, original: ObjectRef) -> Option<ObjectRef> {
         self.old_to_new.get(&original).copied()
     }
 }
 
+#[cfg(test)]
 impl CanonicalCatalogFirstRenumber {
-    /// Number of source objects reached by the canonical qpdf-style walk.
-    pub(crate) fn len(&self) -> usize {
-        self.order.len()
-    }
-
     /// Return the new number assigned to an original object reference.
     pub(crate) fn new_for_original(&self, original: ObjectRef) -> Option<ObjectRef> {
         self.old_to_new.get(&original).copied()
@@ -126,16 +137,16 @@ impl CanonicalCatalogFirstRenumber {
             .map(|(index, &source)| (ObjectRef::new(index as u32 + 1, 0), source))
     }
 
+    #[cfg(test)]
     pub(crate) fn raw_source_for(&self, source: ObjectRef) -> Option<QpdfObjGen> {
         self.raw_sources.get(&source).copied()
     }
 
-    pub(crate) fn build_qpdf_with_stream_policy<R: Read + Seek>(
+    pub(crate) fn build_qpdf<R: Read + Seek>(
         pdf: &mut Pdf<R>,
         skip_length: bool,
         preserve_unreferenced_objects: bool,
         removed_refs: &BTreeSet<ObjectRef>,
-        stream_parameters_removed: StreamParametersRemoved<'_>,
     ) -> crate::Result<Self> {
         let root_ref = pdf.root_ref();
         let direct_root = if root_ref.is_none() {
@@ -189,14 +200,8 @@ impl CanonicalCatalogFirstRenumber {
             // qpdf's enqueueObject recurses through a direct Catalog instead
             // of assigning it an object number. Its indirect descendants are
             // nevertheless numbered in the Catalog's dictionary order.
-            collect_canonical_enqueue_refs_with_stream_policy(
-                pdf,
-                root,
-                0,
-                skip_length,
-                &mut seeds,
-                stream_parameters_removed,
-            )?; // cov:ignore: direct-root traversal is exercised by the writer tests; LLVM maps this successful-call terminator to a zero-count continuation region.
+            collect_canonical_enqueue_refs(pdf, root, 0, skip_length, &mut seeds)?;
+            // cov:ignore: direct-root traversal is exercised by the writer tests; LLVM maps this successful-call terminator to a zero-count continuation region.
         } // cov:ignore: direct-root traversal executes above; LLVM places this branch-exit counter on an uninstrumented continuation line.
 
         let trailer = pdf.trailer();
@@ -214,14 +219,8 @@ impl CanonicalCatalogFirstRenumber {
             // array-valued trailer entry still reaches the recursive collector
             // so its null elements retain their positions/identities.
             if !value.try_is_null()? {
-                collect_canonical_enqueue_refs_with_stream_policy(
-                    pdf,
-                    &value,
-                    0,
-                    skip_length,
-                    &mut seeds,
-                    stream_parameters_removed,
-                )?; // cov:ignore: successful trailer traversal is covered; llvm-cov attributes this continuation to the defensive error path
+                collect_canonical_enqueue_refs(pdf, &value, 0, skip_length, &mut seeds)?;
+                // cov:ignore: successful trailer traversal is covered; llvm-cov attributes this continuation to the defensive error path
             }
         }
 
@@ -245,14 +244,7 @@ impl CanonicalCatalogFirstRenumber {
                 })
                 .unwrap_or_else(|| pdf.get_object_handle(source));
             let mut found = Vec::new();
-            collect_canonical_children_with_stream_policy(
-                pdf,
-                &handle,
-                0,
-                skip_length,
-                &mut found,
-                stream_parameters_removed,
-            )?;
+            collect_canonical_children(pdf, &handle, 0, skip_length, &mut found)?;
             for reference in found {
                 if !removed_refs.contains(&reference) {
                     enqueue(reference, &mut old_to_new, &mut order, &mut queue);
@@ -263,6 +255,7 @@ impl CanonicalCatalogFirstRenumber {
         Ok(Self {
             old_to_new,
             order,
+            #[cfg(test)]
             raw_sources,
         })
     }
@@ -275,16 +268,23 @@ pub(crate) fn collect_canonical_enqueue_refs<R: Read + Seek>(
     skip_length: bool,
     found: &mut Vec<ObjectRef>,
 ) -> crate::Result<()> {
-    collect_canonical_enqueue_refs_with_stream_policy(pdf, handle, depth, skip_length, found, None)
+    collect_canonical_enqueue_refs_with_linearized_omission(
+        pdf,
+        handle,
+        depth,
+        skip_length,
+        found,
+        None,
+    )
 }
 
-fn collect_canonical_enqueue_refs_with_stream_policy<R: Read + Seek>(
+fn collect_canonical_enqueue_refs_with_linearized_omission<R: Read + Seek>(
     pdf: &mut Pdf<R>,
     handle: &crate::ObjectHandle,
     depth: usize,
     skip_length: bool,
     found: &mut Vec<ObjectRef>,
-    stream_parameters_removed: StreamParametersRemoved<'_>,
+    stream_parameter_omission: LinearizedStreamParameterOmission<'_>,
 ) -> crate::Result<()> {
     if let Some(object_ref) = handle.object_ref() {
         ensure_canonical_owner(pdf, handle)?;
@@ -295,13 +295,13 @@ fn collect_canonical_enqueue_refs_with_stream_policy<R: Read + Seek>(
         }
         return Ok(());
     }
-    collect_canonical_children_with_stream_policy(
+    collect_canonical_children_with_linearized_omission(
         pdf,
         handle,
         depth,
         skip_length,
         found,
-        stream_parameters_removed,
+        stream_parameter_omission,
     )
 }
 
@@ -313,16 +313,23 @@ pub(crate) fn collect_canonical_children<R: Read + Seek>(
     skip_length: bool,
     found: &mut Vec<ObjectRef>,
 ) -> crate::Result<()> {
-    collect_canonical_children_with_stream_policy(pdf, handle, depth, skip_length, found, None)
+    collect_canonical_children_with_linearized_omission(
+        pdf,
+        handle,
+        depth,
+        skip_length,
+        found,
+        None,
+    )
 }
 
-fn collect_canonical_children_with_stream_policy<R: Read + Seek>(
+fn collect_canonical_children_with_linearized_omission<R: Read + Seek>(
     pdf: &mut Pdf<R>,
     handle: &crate::ObjectHandle,
     depth: usize,
     skip_length: bool,
     found: &mut Vec<ObjectRef>,
-    stream_parameters_removed: StreamParametersRemoved<'_>,
+    stream_parameter_omission: LinearizedStreamParameterOmission<'_>,
 ) -> crate::Result<()> {
     if depth > MAX_PARSE_DEPTH {
         return Err(Error::Unsupported(
@@ -332,13 +339,13 @@ fn collect_canonical_children_with_stream_policy<R: Read + Seek>(
     }
     if let Some(items) = handle.try_as_array()? {
         for item in items {
-            collect_canonical_enqueue_refs_with_stream_policy(
+            collect_canonical_enqueue_refs_with_linearized_omission(
                 pdf,
                 &item,
                 depth + 1,
                 skip_length,
                 found,
-                stream_parameters_removed,
+                stream_parameter_omission,
             )?; // cov:ignore: successful array traversal is covered; llvm-cov attributes this continuation to the defensive error path
         }
         return Ok(());
@@ -346,20 +353,20 @@ fn collect_canonical_children_with_stream_policy<R: Read + Seek>(
     if let Some(entries) = handle.try_as_dictionary()? {
         for (_, value) in entries {
             if !value.try_is_null()? {
-                collect_canonical_enqueue_refs_with_stream_policy(
+                collect_canonical_enqueue_refs_with_linearized_omission(
                     pdf,
                     &value,
                     depth + 1,
                     skip_length,
                     found,
-                    stream_parameters_removed,
+                    stream_parameter_omission,
                 )?; // cov:ignore: successful dictionary traversal is covered; llvm-cov attributes this continuation to the defensive error path
             }
         }
         return Ok(());
     }
     if let Some(stream_dict) = handle.as_stream_dict() {
-        let skip_stream_parameters = stream_parameters_removed
+        let skip_stream_parameters = stream_parameter_omission
             .map(|predicate| predicate(handle))
             .transpose()?
             .unwrap_or(false);
@@ -373,13 +380,13 @@ fn collect_canonical_children_with_stream_policy<R: Read + Seek>(
                     continue;
                 }
                 if !value.try_is_null()? {
-                    collect_canonical_enqueue_refs_with_stream_policy(
+                    collect_canonical_enqueue_refs_with_linearized_omission(
                         pdf,
                         &value,
                         depth + 1,
                         skip_length,
                         found,
-                        stream_parameters_removed,
+                        stream_parameter_omission,
                     )?; // cov:ignore: successful stream traversal is covered; llvm-cov attributes this continuation to the defensive error path
                 }
             }
@@ -451,7 +458,7 @@ pub(crate) fn reachable_object_set_with_stream_parameters<R: Read + Seek>(
         // (e.g. inside a direct `/Info` dict) is seeded, matching qpdf's recursive
         // trailer enqueue. A bare reference yields exactly one seed as before.
         if !value.try_is_null()? {
-            collect_canonical_enqueue_refs_with_stream_policy(
+            collect_canonical_enqueue_refs_with_linearized_omission(
                 pdf,
                 &value,
                 0,
@@ -472,7 +479,7 @@ pub(crate) fn reachable_object_set_with_stream_parameters<R: Read + Seek>(
     while let Some(cur) = queue.pop_front() {
         let handle = pdf.get_object_handle(cur);
         let mut found = Vec::new();
-        collect_canonical_children_with_stream_policy(
+        collect_canonical_children_with_linearized_omission(
             pdf,
             &handle,
             0,
@@ -660,14 +667,17 @@ fn walk_resurrectable_handle(
 /// qpdf's order.
 //
 // Shared by Preserve and Generate plain-writer planning.
+#[cfg(test)]
 pub(crate) struct ObjectStreamRenumber {
     old_to_new: HashMap<ObjectRef, ObjectRef>,
+    #[cfg(test)]
     raw_sources: HashMap<ObjectRef, QpdfObjGen>,
     /// New object number assigned to each input group's container, in group
     /// order. `container_new[i]` is `None` only if group `i` was never reached.
     container_new: Vec<Option<u32>>,
 }
 
+#[cfg(test)]
 impl ObjectStreamRenumber {
     /// The container object number assigned to input group `group_index`, or
     /// `None` if the index is out of range or that group was never reached.
@@ -677,6 +687,7 @@ impl ObjectStreamRenumber {
         self.container_new.get(group_index).copied().flatten()
     }
 
+    #[cfg(test)]
     pub(crate) fn raw_source_for(&self, source: ObjectRef) -> Option<QpdfObjGen> {
         self.raw_sources.get(&source).copied()
     }
@@ -691,13 +702,12 @@ impl ObjectStreamRenumber {
         self.old_to_new.iter().map(|(&old, &new)| (new, old))
     }
 
-    pub(crate) fn build_with_stream_policy<R: Read + Seek>(
+    pub(crate) fn build<R: Read + Seek>(
         pdf: &mut Pdf<R>,
         groups: &[ObjectStreamGroup],
         skip_length: bool,
         removed_refs: &BTreeSet<ObjectRef>,
         preserve_unreferenced_objects: bool,
-        stream_parameters_removed: StreamParametersRemoved<'_>,
     ) -> crate::Result<Self> {
         Self::build_with_seed_policy(
             pdf,
@@ -705,7 +715,6 @@ impl ObjectStreamRenumber {
             skip_length,
             removed_refs,
             preserve_unreferenced_objects,
-            stream_parameters_removed,
         )
     }
 
@@ -715,7 +724,6 @@ impl ObjectStreamRenumber {
         skip_length: bool,
         removed_refs: &BTreeSet<ObjectRef>,
         preserve_unreferenced_objects: bool,
-        stream_parameters_removed: StreamParametersRemoved<'_>,
     ) -> crate::Result<Self> {
         let mut member_to_group: HashMap<ObjectRef, usize> = HashMap::new();
         let mut source_to_group: HashMap<ObjectRef, usize> = HashMap::new();
@@ -732,7 +740,13 @@ impl ObjectStreamRenumber {
             // that set directly (`QPDFWriter.cc:1621-1758`). A multi-source
             // target therefore uses the recorded original-object provenance,
             // while an ordinary source uses its local ObjGen directly.
-            sort_members_qpdf_order(pdf, &mut sorted);
+            if matches!(group, ObjectStreamGroup::SourceBacked { .. }) {
+                sort_source_backed_members_qpdf_order(pdf, &mut sorted);
+            } else if pdf.writer_object_order.is_some() {
+                sorted.sort_unstable_by_key(|object_ref| pdf.writer_object_order_key(*object_ref));
+            } else {
+                sorted.sort_unstable_by_key(|r| (r.number, r.generation));
+            }
             for &m in &sorted {
                 if let Some(previous) = member_to_group.insert(m, gi) {
                     return Err(Error::Unsupported(format!(
@@ -740,14 +754,14 @@ impl ObjectStreamRenumber {
                     )));
                 }
             }
-            if let ObjectStreamGroup::SourceBacked { source, .. }
-            | ObjectStreamGroup::Generated { source, .. } = group
-            {
-                if let Some(previous) = source_to_group.insert(*source, gi) {
-                    return Err(Error::Unsupported(format!(
-                        "object-stream renumber: source container {source} occurs in groups {previous} and {gi}"
-                    )));
-                }
+            let source = match group {
+                ObjectStreamGroup::SourceBacked { source, .. }
+                | ObjectStreamGroup::Generated { source, .. } => *source,
+            };
+            if let Some(previous) = source_to_group.insert(source, gi) {
+                return Err(Error::Unsupported(format!(
+                    "object-stream renumber: source container {source} occurs in groups {previous} and {gi}"
+                )));
             }
             groups_sorted.push(sorted);
         }
@@ -763,9 +777,7 @@ impl ObjectStreamRenumber {
             .iter()
             .filter_map(|group| match group {
                 ObjectStreamGroup::Generated { source, .. } => Some(*source),
-                ObjectStreamGroup::SourceBacked { .. } | ObjectStreamGroup::Synthetic { .. } => {
-                    None
-                }
+                ObjectStreamGroup::SourceBacked { .. } => None,
             })
             .collect();
         let mut old_to_new: HashMap<ObjectRef, ObjectRef> = HashMap::new();
@@ -827,14 +839,9 @@ impl ObjectStreamRenumber {
         if let Some(root) = root_ref {
             seeds.push(root);
         } else if let Some(root) = &direct_root {
-            collect_canonical_enqueue_refs_with_stream_policy(
-                pdf,
-                root,
-                0,
-                skip_length,
-                &mut seeds,
-                stream_parameters_removed,
-            )?; // cov:ignore: direct-root traversal is exercised by the writer tests; LLVM maps this successful-call terminator to a zero-count continuation region.
+            // cov:ignore-start: LLVM maps this covered direct-root call to a zero-count continuation region.
+            collect_canonical_enqueue_refs(pdf, root, 0, skip_length, &mut seeds)?;
+            // cov:ignore-end
         } // cov:ignore: direct-root traversal executes above; LLVM places this branch-exit counter on an uninstrumented continuation line.
         let trailer = pdf.trailer();
         let trailer_entries = trailer.try_as_dictionary()?.unwrap_or_default();
@@ -852,14 +859,8 @@ impl ObjectStreamRenumber {
             // ref is seeded, matching qpdf's recursive trailer enqueue. A bare
             // reference yields exactly one seed as before. The live handle
             // graph applies qpdf's null-visible dictionary rule while walking.
-            collect_canonical_enqueue_refs_with_stream_policy(
-                pdf,
-                &value,
-                0,
-                skip_length,
-                &mut seeds,
-                stream_parameters_removed,
-            )?; // cov:ignore: successful trailer traversal is covered; llvm-cov attributes this continuation to the defensive error path
+            collect_canonical_enqueue_refs(pdf, &value, 0, skip_length, &mut seeds)?;
+            // cov:ignore: successful trailer traversal is covered; llvm-cov attributes this continuation to the defensive error path
         }
         seeds.retain(|reference| !removed_refs.contains(reference));
 
@@ -890,14 +891,7 @@ impl ObjectStreamRenumber {
                         })
                         .unwrap_or_else(|| pdf.get_object_handle(cur));
                     let mut found = Vec::new();
-                    collect_canonical_children_with_stream_policy(
-                        pdf,
-                        &handle,
-                        0,
-                        skip_length,
-                        &mut found,
-                        stream_parameters_removed,
-                    )?; // cov:ignore: successful object-stream traversal is covered; llvm-cov attributes this continuation to the defensive error path
+                    collect_canonical_children(pdf, &handle, 0, skip_length, &mut found)?; // cov:ignore: successful object-stream traversal is covered; llvm-cov attributes this continuation to the defensive error path
                     found.retain(|reference| !removed_refs.contains(reference));
                     for reference in found {
                         enqueue_object_stream(
@@ -955,12 +949,14 @@ impl ObjectStreamRenumber {
         Ok(Self {
             old_to_new,
             container_new,
+            #[cfg(test)]
             raw_sources,
         })
     }
 }
 
 #[derive(Clone, Copy, Debug)]
+#[cfg(test)]
 enum RenumberWork {
     Ordinary(ObjectRef),
     SourceContainer(ObjectRef),
@@ -969,6 +965,7 @@ enum RenumberWork {
 /// Number a plain object directly, or activate its source-backed/synthetic
 /// object-stream group from either the source container or any member.
 #[allow(clippy::too_many_arguments)]
+#[cfg(test)]
 fn enqueue_object_stream(
     r: ObjectRef,
     groups: &[ObjectStreamGroup],
@@ -1001,7 +998,6 @@ fn enqueue_object_stream(
                     old_to_new.insert(*source, ObjectRef::new(container, 0));
                     Some(*source)
                 }
-                ObjectStreamGroup::Synthetic { .. } => None,
             };
             for &m in &groups_sorted[gi] {
                 old_to_new.insert(m, ObjectRef::new(*next, 0));
@@ -1022,6 +1018,7 @@ fn enqueue_object_stream(
 
 /// Assign `original` a new number on first encounter and enqueue it for the BFS
 /// walk. Repeated calls for the same reference are no-ops.
+#[cfg(test)]
 fn enqueue(
     original: ObjectRef,
     old_to_new: &mut HashMap<ObjectRef, ObjectRef>,
@@ -1044,12 +1041,13 @@ fn enqueue(
 mod tests {
     use super::{
         collect_canonical_children, ensure_canonical_owner, walk_resurrectable_handle,
-        writer_local_raw_ref, ResurrectableWalkState,
+        writer_local_raw_ref, NewNumberLookup, ObjectStreamRenumber, ResurrectableWalkState,
     };
     use crate::parser::MAX_PARSE_DEPTH;
     use crate::qpdf_obj_gen::QpdfObjGen;
+    use crate::writer::object_streams::ObjectStreamGroup;
     use crate::{Error, ObjectHandle, ObjectRef, Pdf};
-    use std::collections::BTreeSet;
+    use std::collections::{BTreeMap, BTreeSet};
     use std::io::Cursor;
 
     fn raw_stream_pdf() -> Vec<u8> {
@@ -1108,6 +1106,84 @@ mod tests {
             Error::Internal(message)
                 if message == "QPDFObjectHandle from different QPDF found while writing.  Use QPDF::copyForeignObject to add objects from another file."
         ));
+    }
+
+    #[test]
+    fn object_stream_renumber_rejects_a_duplicate_source_container() {
+        let mut pdf = Pdf::empty().expect("create object-stream owner");
+        let source = pdf
+            .make_indirect_object_handle(ObjectHandle::null())
+            .expect("create source container")
+            .object_ref()
+            .unwrap();
+        let first = pdf
+            .make_indirect_object_handle(ObjectHandle::integer(1))
+            .expect("create first member")
+            .object_ref()
+            .unwrap();
+        let second = pdf
+            .make_indirect_object_handle(ObjectHandle::integer(2))
+            .expect("create second member")
+            .object_ref()
+            .unwrap();
+        let groups = [
+            ObjectStreamGroup::Generated {
+                source,
+                members: vec![first],
+            },
+            ObjectStreamGroup::Generated {
+                source,
+                members: vec![second],
+            },
+        ];
+
+        let error = ObjectStreamRenumber::build(&mut pdf, &groups, false, &BTreeSet::new(), false)
+            .err()
+            .expect("duplicate source containers must fail before traversal");
+
+        assert!(
+            matches!(error, Error::Unsupported(message) if message.contains("source container") && message.contains("groups 0 and 1"))
+        );
+    }
+
+    #[test]
+    fn generated_object_stream_renumber_uses_recorded_writer_order() {
+        let mut pdf = Pdf::empty().expect("create generated object-stream owner");
+        let source = pdf
+            .make_indirect_object_handle(ObjectHandle::null())
+            .expect("create generated source container")
+            .object_ref()
+            .unwrap();
+        let first = pdf
+            .make_indirect_object_handle(ObjectHandle::integer(1))
+            .expect("create first generated member")
+            .object_ref()
+            .unwrap();
+        let second = pdf
+            .make_indirect_object_handle(ObjectHandle::integer(2))
+            .expect("create second generated member")
+            .object_ref()
+            .unwrap();
+        let mut order = BTreeMap::new();
+        order.insert(
+            first,
+            crate::pdf::WriterObjectOrderKey::foreign(ObjectRef::new(2, 0)),
+        );
+        order.insert(
+            second,
+            crate::pdf::WriterObjectOrderKey::foreign(ObjectRef::new(1, 0)),
+        );
+        pdf.set_writer_object_order(order);
+        let groups = [ObjectStreamGroup::Generated {
+            source,
+            members: vec![first, second],
+        }];
+
+        let renumber =
+            ObjectStreamRenumber::build(&mut pdf, &groups, false, &BTreeSet::new(), true)
+                .expect("generated object-stream order must be accepted");
+        assert!(renumber.new_for_original(first).is_some());
+        assert!(renumber.new_for_original(second).is_some());
     }
 
     #[test]

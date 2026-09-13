@@ -1238,6 +1238,27 @@ fn specialized_encrypted_nested_direct_stream_keeps_payload_and_framing() {
 }
 
 #[test]
+fn deterministic_direct_root_uses_the_live_classic_trailer_serializer() {
+    let mut pdf = Pdf::open(Cursor::new(
+        include_bytes!("../../../tests/fixtures/compat/direct-root-one-page.pdf").to_vec(),
+    ))
+    .unwrap();
+    assert!(pdf.root_ref().is_none());
+    let mut writer = PdfWriter::new(&mut pdf);
+    writer.set_object_stream_mode(ObjectStreamMode::Disable);
+    writer.set_deterministic_id(true);
+    writer.set_output_memory().unwrap();
+    writer.write().unwrap();
+    let output = writer.get_buffer().unwrap();
+    assert!(output
+        .windows(b"/Root <<".len())
+        .any(|window| window == b"/Root <<"));
+    assert!(output
+        .windows(b"/ID [<".len())
+        .any(|window| window == b"/ID [<"));
+}
+
+#[test]
 fn specialized_direct_root_nested_stream_keeps_payload_and_framing() {
     let mut pdf = Pdf::open(Cursor::new(
         include_bytes!("../../../tests/fixtures/compat/direct-root-one-page.pdf").to_vec(),

@@ -740,30 +740,73 @@ AES `/Length` 調整を同時に平文化する。dictionary の string serializ
 layout 非対象のため旧 in-place bridge を維持し、canonical full-rewrite と ObjStm
 container は新しい pipeline route を使う。
 
-`flpdf-8f1o` では plain writer の `PlainWritePlan` が、qpdf の
-`willFilterStream` が返す stream data buffer と同じ責務を
-`CachedStreamOutput` に保持し、`plain/body.rs` の emission が再利用する。
-provider を計画時の discard probe と emission で二重に呼ばないため、警告を発行する
-legacy provider に抑制フラグを追加せず、qpdf の一回計算／再利用境界を保つ。
-specialized writer と linearized writer の別経路は、それぞれの qpdf 呼び出し契約を
-別 slice で扱う。
+### Non-linearized `writeStandard` final-sink/queue boundary (`flpdf-ymuj.4`, 2026-09-12)
 
-### Plain Disable live writer queue (`flpdf-3yn9.48.53`, 2026-09-07)
+qpdf 11.9.0 は `initializePipelineStack` の base `Pl_Count` を final target の直前に
+置き（`QPDFWriter.cc:916-931`）、`writeStandard` が optional `Pl_MD5`、header、
+standard/PCLm seed queue、live `writeObject` walk、xref、trailer/EOF の順にその active
+pipeline へ書く（`:2991-3044`）。`PipelinePopper` は stream/filter 専用ではなく、
+`willFilterStream` の `Pl_Buffer`、stream/object-stream/xref/hint の encryption または
+buffer scope、linearization pass の discard scope、そして deterministic-ID の `Pl_MD5`
+scopeを push/pop する共通の nested pipeline-stack lifecycle である
+（`:935-971,965-1034,1288-1292,1553-1558,1639-1655,2433-2437,2667-2675,2875-2880`）。
+その destructor は active nested `Pl_Count` を finish して nested stages を pop し、必要なら
+buffer を返すが、qpdf の base final target を nested popper が finish するという意味ではない。
+deterministic-ID では `computeDeterministicIDData` が ID cutoff で digest を取得して MD5 を
+disable し（`:1027-1033,1213-1217`）、`writeStandard` が ID と EOF を書いた後に
+`pp_md5` を解放してその MD5 scope を閉じる（`:3036-3044`）。これは stream payload の
+`Pl_Buffer`/encryption segment scopeとは別の、文書全体の ID-digest scopeである。
+文書全体の base `m->pipeline->finish()` は `write()` が `writeStandard`/`writeLinearized` の
+後に行う（`:933-956,2187-2205`）。
 
-qpdf の standard writer は `enqueueObjectsStandard`（`QPDFWriter.cc:2907-2925`）で
-`/Root` と trimmed trailer の seed を queue に積み、`writeStandard`
-（`:2991-3044`）が queue の先頭から `writeObject` を呼ぶ。`unparseChild`
-（`:1144-1157`）は indirect child を書く直前に同じ queue へ追加するため、
-object number と emission order は事前 graph copy ではなく first-seen live order になる。
-辞書の null 値は seed/child から除外し、配列の null 要素は位置を保持する。
+flpdf の non-linearized `PdfWriter` は `WriterOutputSink` を final `OutputTarget` とし、
+plain/QDF/Preserve/Generate/暗号化と PCLm を**同じ一つの** `writer::output::OutputSink`
+へ渡す。`OutputSink` は final target が実際に受理した byte だけを checked `u64`
+position と MD5 へ反映する。従って object と xref の位置は final sink の座標であり、
+short write・`Interrupted`・`WriteZero` もこの境界で処理する。`finish_segment` は stream
+payload の境界で呼ばれるが、その意味は qpdf の nested `PipelinePopper` と同一ではなく、
+Rust の `OutputTarget` adapter に依存する。`WriterOutput::Pipeline` target は設定された
+final pipeline の `finish()` を segment boundary で呼ぶことがあり、`WriterOutput::Writer`
+は flush、Memory は no-op である。`finish_document` は全 PDF の emission が EOF まで成功
+した後に呼ばれ、Pipeline adapter では `finish_output` が configured final pipeline を
+finalize する。この adapter lifecycle distinction は qpdf の nested popper が base target を
+finish するという対応付けではない（`writer/output.rs`; `writer.rs::WriterOutputSink`;
+`writer.rs::PdfWriter::write`）。
 
-plain Disable の bounded consumer は `writer/plain/body.rs::LiveQueue` と
-`LiveObjectEmitter` でこの境界を再現する。`WriteObject::write_object` の
-progress → live unparse 順序を保ち、reference-map callback が未採番の child を
-その場で queue へ追加する。body 完了後にだけ trailer handle、canonical trailer
-entries、xref を確定するため、progress callback が Catalog に追加した indirect child
-も同じ出力に現れる。Preserve/Generate、QDF、PCLm、specialized、linearized の
-legacy planner/queue はこの first consumer の範囲外で、後続 consumer slice が所有する。
+stream payload、ObjStm member/pair body、xref-stream encoded payload は `/Length`、`/First`、
+member pair offset、xref encoding を決めるためだけの bounded local `Vec` である。
+local sink の位置はその buffer 内の座標で、完成した payload を final `OutputSink` に消費した
+時点だけ final 座標と digest が進む（`writer/output.rs::with_buffer_sink`、
+`writer/serialize.rs`、`writer/plain/xref.rs`）。ObjStm body は一 container を書き終えると
+drop され、complete document/body buffer や planned multi-stream payload cache は
+non-linearized route に残さない。一方、linearization の pass buffer/back-patch region は
+この変更の対象外であり、線形化の所有設計を変更したという主張ではない。
+
+qpdf の standard writer は `enqueueObjectsStandard`（`QPDFWriter.cc:2907-2925`）で `/Root`
+と trimmed trailer の seed を queue に積み、`unparseChild` が indirect child を書く直前に
+同じ queue へ追加する（`:1072-1157`）。flpdf の `writer/plain/body.rs::LiveQueue` と
+`LiveObjectEmitter` は Preserve/Generate membership setup を先に登録してから、実際の
+object/stream dictionary emission で surviving indirect child を発見し、その場で採番・enqueue
+する。PCLm も `writer/pclm.rs::Plan` の page/content/image/synthetic/root initial order だけを
+保持し、`EmissionQueue::enqueue_handle` が body emission 中に child を発見する。したがって
+順序・採番は事前の完全 child prewalk ではなく first-seen live emission に従う。
+
+PCLm は `doWriteSetup` が強制する decode-none、uncompressed、unencrypted policy
+（`QPDFWriter.cc:2068-2096`）の後にも、通常 writer と同じ `willFilterStream` policy を通す。
+flpdf の `canonical_stream_output_for_rewrite` は data-modified、filter-on-write、metadata
+cleartext、normalization、Flate preserve/recompress、provider の first `will_retry=true` call と
+unfiltered retry を扱い、PCLm は返った一 stream payload を一度だけ final sink に流す
+（`writer/plain/body.rs`; `writer.rs::write_pclm`）。この local payload は qpdf の
+`willFilterStream` 内 `Pl_Buffer` に対応し、PDF 全体を保持する cache ではない。
+
+deterministic ID は qpdf の `pushMD5Pipeline` と `generateID` の cutoff
+（`QPDFWriter.cc:1011-1034,1213-1217,1823-1878`）に合わせ、flpdf の final `OutputSink` が
+header/body/xref/trailer の `/ID [` までを digest し、`write_deterministic_id_inline` が `[` の
+直後に digest を suspend してから ID bytes を出す。よって local stream/ObjStm/xref buffer
+の構築中の bytes、および `/ID` 後の bytes はその digest に入らない
+（`writer/output.rs`; `writer.rs::write_deterministic_id_inline`; `writer/plain/xref.rs`）。
+この documentation slice は crate public API、CLI/qtest scope、または qpdf の object-graph
+ownership modelを変更しない。
 
 ### ObjectHandle emission-time encryption surface (`flpdf-egzr.3.2.15`, 2026-08-15)
 

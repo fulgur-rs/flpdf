@@ -15,7 +15,7 @@ fn pclm_planning_and_emission_do_not_materialize_legacy_objects() {
         "PCLm planning must walk live ObjectHandle values"
     );
 
-    let pclm_writer = include_str!("../src/writer/pclm_live.rs");
+    let pclm_writer = production_source(include_str!("../src/writer.rs"));
     assert!(
         !pclm_writer.contains(".materialize()"),
         "PCLm emission must not rebuild a legacy Object snapshot"

@@ -47,7 +47,7 @@ pub(crate) trait WriteObject {
     fn indicate_progress(&mut self) -> Result<()>;
     fn output_number(&self, object: ObjectRef) -> Result<u32>;
     fn write_bytes(&mut self, bytes: &[u8]) -> Result<()>;
-    fn output_count(&self) -> usize;
+    fn output_count(&self) -> Result<usize>;
     fn xref(&mut self) -> &mut BTreeMap<u32, (u16, usize)>;
     fn lengths(&mut self) -> &mut BTreeMap<u32, usize>;
     fn encryption_state(&mut self) -> &mut WriterEncryptionState;
@@ -65,7 +65,7 @@ pub(crate) trait WriteObject {
 
     /// The already-allocated-id case of qpdf's `openObject`.
     fn open_object(&mut self, object: u32) -> Result<()> {
-        let offset = self.output_count();
+        let offset = self.output_count()?;
         self.xref().insert(object, (0, offset));
         self.write_bytes(object.to_string().as_bytes())?;
         self.write_bytes(b" 0 obj\n")
@@ -76,7 +76,10 @@ pub(crate) trait WriteObject {
         if qdf {
             self.write_bytes(b"\n")?;
         }
-        let length = self.output_count() - self.xref()[&object].1;
+        let length = self
+            .output_count()?
+            .checked_sub(self.xref()[&object].1)
+            .ok_or_else(|| crate::Error::Internal("writer object length underflow".to_string()))?;
         self.lengths().insert(object, length);
         Ok(())
     }
@@ -228,8 +231,8 @@ mod tests {
             Ok(())
         }
 
-        fn output_count(&self) -> usize {
-            self.bytes.len()
+        fn output_count(&self) -> Result<usize> {
+            Ok(self.bytes.len())
         }
         fn xref(&mut self) -> &mut BTreeMap<u32, (u16, usize)> {
             &mut self.xref
@@ -256,35 +259,44 @@ mod tests {
             if object.as_stream_dict().is_some() {
                 let data = object.get_raw_stream_data()?;
                 self.cur_stream_length = data.len();
-                if self.qdf.is_some() {
-                    let length_ref = (!self.direct_stream_lengths).then_some(ObjectRef::new(2, 0));
-                    object.write_stream_body_qdf_with_ref_map_and_removed_and_length_with_options(
-                        &mut self.bytes,
-                        0,
-                        &|object| Ok(object),
-                        &BTreeSet::new(),
-                        length_ref,
-                        crate::writer::StreamDictionaryOptions::preserve(),
-                    )?;
-                } else {
-                    object.write_stream_body(&mut self.bytes, false)?;
-                }
+                let qdf = self.qdf.is_some();
+                crate::writer::output::with_buffer_sink(&mut self.bytes, |out| {
+                    if qdf {
+                        let length_ref =
+                            (!self.direct_stream_lengths).then_some(ObjectRef::new(2, 0));
+                        object
+                            .write_stream_body_qdf_with_ref_map_and_removed_and_length_with_options(
+                                out,
+                                0,
+                                &|object| Ok(object),
+                                &BTreeSet::new(),
+                                length_ref,
+                                crate::writer::StreamDictionaryOptions::preserve(),
+                            )?;
+                    } else {
+                        object.write_stream_body(out, false)?;
+                    }
+                    serialize::write_stream_payload_with_qdf(
+                        out,
+                        &data,
+                        NewlineBeforeEndstream::Never,
+                        qdf,
+                    )
+                })?;
                 self.added_newline = serialize::framing_adds_newline_with_qdf(
                     &data,
                     NewlineBeforeEndstream::Never,
-                    self.qdf.is_some(),
-                );
-                serialize::write_stream_payload_with_qdf(
-                    &mut self.bytes,
-                    &data,
-                    NewlineBeforeEndstream::Never,
-                    self.qdf.is_some(),
+                    qdf,
                 );
                 Ok(())
             } else if self.qdf.is_some() {
-                object.write_object_qdf(&mut self.bytes, 0)
+                crate::writer::output::with_buffer_sink(&mut self.bytes, |out| {
+                    object.write_object_qdf(out, 0)
+                })
             } else {
-                ObjectWriterEmission::write_object(object, &mut self.bytes)
+                crate::writer::output::with_buffer_sink(&mut self.bytes, |out| {
+                    ObjectWriterEmission::write_object(object, out)
+                })
             }
         }
     }

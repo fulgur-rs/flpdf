@@ -4315,7 +4315,6 @@ impl ObjectHandle {
         self.type_warning("dictionary", warning)?;
         Ok(false)
     }
-
     /// Set one item in the live array, porting qpdf's `setArrayItem`
     /// (`libqpdf/QPDFObjectHandle.cc:871-883`). The receiver is dereferenced
     /// before its array type is inspected, so an unresolved indirect holder
@@ -7224,12 +7223,6 @@ impl ObjectHandle {
         shared.mutation_generation = shared.mutation_generation.wrapping_add(1);
     }
 
-    pub(crate) fn mutation_fingerprint(&self) -> (usize, u64) {
-        let shared = self.0.borrow().shared.clone();
-        let generation = shared.borrow().mutation_generation;
-        (Rc::as_ptr(&shared) as usize, generation)
-    }
-
     /// This handle's qpdf-syntax unparse form
     /// (`include/qpdf/QPDFObjectHandle.hh:1159`,
     /// `libqpdf/QPDFObjectHandle.cc:1574-1584`): an indirect handle always
@@ -7413,9 +7406,15 @@ fn unparse_resolved_value(
         }
         ObjectValue::Name(value) => {
             out.push(b'/');
-            crate::pdf_syntax::write_name_escaped(out, &value);
+            crate::writer::output::with_buffer_sink(out, |sink| {
+                crate::pdf_syntax::write_name_escaped(sink, &value)
+            })?;
         }
-        ObjectValue::String(value) => crate::pdf_syntax::write_string_value(out, &value),
+        ObjectValue::String(value) => {
+            crate::writer::output::with_buffer_sink(out, |sink| {
+                crate::pdf_syntax::write_string_value(sink, &value)
+            })?;
+        }
         ObjectValue::Operator(value) | ObjectValue::InlineImage(value) => {
             out.extend_from_slice(&value);
         }
@@ -7433,7 +7432,7 @@ fn unparse_resolved_value(
                 if child.try_is_null()? {
                     continue;
                 }
-                write_unparse_dictionary_key(out, &key);
+                write_unparse_dictionary_key(out, &key)?;
                 out.push(b' ');
                 unparse_resolved_child(&child, out, strict)?;
                 out.push(b' ');
@@ -7465,13 +7464,16 @@ fn write_unparse_reference(object_ref: ObjectRef, out: &mut Vec<u8>) {
     out.extend_from_slice(object_ref.to_string().as_bytes());
 }
 
-fn write_unparse_dictionary_key(out: &mut Vec<u8>, key: &[u8]) {
+fn write_unparse_dictionary_key(out: &mut Vec<u8>, key: &[u8]) -> Result<()> {
     if let Some((&first, tail)) = key.split_first() {
         // QPDF_Name::normalizeName preserves the first byte and escapes only
         // the remainder (`libqpdf/QPDF_Name.cc:27-49`).
         out.push(first);
-        crate::pdf_syntax::write_name_escaped(out, tail);
+        crate::writer::output::with_buffer_sink(out, |sink| {
+            crate::pdf_syntax::write_name_escaped(sink, tail)
+        })?;
     }
+    Ok(())
 }
 
 // Stack growth uses the same red-zone and growth size for direct serialization,
@@ -11461,8 +11463,10 @@ mod internal_state_value_tests {
             ),
         ] {
             let mut out = Vec::new();
-            let unparse_error = unparse_object_value(&value, &mut out)
-                .expect_err("internal qpdf values cannot unparse as PDF values");
+            let unparse_error = crate::writer::output::with_buffer_sink(&mut out, |out| {
+                unparse_object_value(&value, out)
+            })
+            .expect_err("internal qpdf values cannot unparse as PDF values");
             assert!(
                 unparse_error.to_string().contains(expected),
                 "unexpected unparse error: {unparse_error:?}"
@@ -11998,8 +12002,14 @@ mod type_code_tests {
 mod unparse_object_tests {
     use super::identity_tests::{error_resolving_handle, resolver_bearing_handle};
     use super::*;
-    use crate::writer::object::{dict_is_sig_with_byte_range, visible_dict_entries, write_child};
-    use crate::writer::ObjectWriterEmission;
+    use crate::writer::object::{
+        dict_is_sig_with_byte_range, visible_dict_entries, write_child as write_child_to_sink,
+        ObjectWriterEmissionVecTestExt,
+    };
+
+    fn write_child(handle: &ObjectHandle, out: &mut Vec<u8>) -> Result<()> {
+        crate::writer::output::with_buffer_sink(out, |out| write_child_to_sink(handle, out))
+    }
 
     fn compact_string_hook(out: &mut Vec<u8>, value: &[u8]) -> Result<()> {
         out.extend_from_slice(b"<hook:");

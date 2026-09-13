@@ -36,6 +36,11 @@ fn pclm_progress_callback_child_is_discovered_by_the_live_queue() {
         ),
     )
     .unwrap();
+    page.replace_key(
+        b"/PclmDirectLabel",
+        ObjectHandle::string(b"pclm-label".to_vec()),
+    )
+    .unwrap();
 
     let mut writer = PdfWriter::new(&mut pdf);
     writer.set_pclm(true);
@@ -62,6 +67,9 @@ fn pclm_progress_callback_child_is_discovered_by_the_live_queue() {
     assert!(output
         .windows(b"stream\npclm-directendstream".len())
         .any(|window| window == b"stream\npclm-directendstream"));
+    assert!(output
+        .windows(b"/PclmDirectLabel (pclm-label)".len())
+        .any(|window| window == b"/PclmDirectLabel (pclm-label)"));
 }
 
 #[test]

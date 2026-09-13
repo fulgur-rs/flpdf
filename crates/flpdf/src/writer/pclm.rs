@@ -2,67 +2,17 @@
 //!
 //! PCLm does not use the ordinary Catalog-first queue. qpdf reserves output
 //! numbers as it enqueues page objects, their contents, image strips, and the
-//! synthetic image-transform streams. The queue then continues with references
-//! discovered while serializing those objects and ends with the Catalog. The
+//! synthetic image-transform streams, then the Catalog. References discovered
+//! while serializing those initial objects are appended to the live queue. The
 //! direct/indirect root split follows `QPDFWriter.cc:328-333,1160-1236,
 //! 2068-2076,2928-2954` and the `qpdf/qtest/pclm.test` test-driver contract.
 
+use std::collections::{BTreeMap, HashMap, VecDeque};
 use std::io::{Read, Seek};
-use std::rc::Rc;
 
 use crate::writer::rewrite_renumber::collect_canonical_enqueue_refs;
-use crate::{ObjectHandle, Pdf, Result};
+use crate::{ObjectHandle, ObjectRef, Pdf, Result};
 
-/// Return qpdf's initial PCLm queue seeds in enqueue order. Only the
-/// page/Contents/strip/synthetic/root seed differs from standard output; all
-/// descendants are discovered by the shared live writer while those objects
-/// are emitted (`QPDFWriter.cc:2928-2954`).
-pub(crate) fn seed_handles<R: Read + Seek>(pdf: &mut Pdf<R>) -> Result<Vec<ObjectHandle>> {
-    let mut seeds = Vec::new();
-    for page in crate::pages::page_refs(pdf)? {
-        seeds.push(pdf.get_object_handle(page));
-
-        let page_handle = pdf.get_object_handle(page);
-        page_handle.try_dereference()?;
-        let contents = page_handle.try_get_key(b"/Contents")?;
-        if !contents.try_is_null()? {
-            let mut references = Vec::new();
-            collect_canonical_enqueue_refs(pdf, &contents, 0, true, &mut references)?;
-            for reference in references {
-                seeds.push(pdf.get_object_handle(reference));
-            }
-        }
-
-        let resources = page_handle.try_get_key(b"/Resources")?;
-        let xobjects = resources.try_get_key(b"/XObject")?;
-        for key in xobjects.try_get_keys()? {
-            let image = xobjects.try_get_key(&key)?;
-            let mut references = Vec::new();
-            collect_canonical_enqueue_refs(pdf, &image, 0, true, &mut references)?;
-            for reference in references {
-                seeds.push(pdf.get_object_handle(reference));
-            }
-            seeds.push(pdf.new_stream_with_data(Rc::new(b"q /image Do Q\n".to_vec()))?);
-        }
-    }
-
-    let root = pdf.root_handle()?;
-    let mut references = Vec::new();
-    collect_canonical_enqueue_refs(pdf, &root, 0, true, &mut references)?;
-    for reference in references {
-        seeds.push(pdf.get_object_handle(reference));
-    }
-    Ok(seeds)
-}
-
-#[cfg(test)]
-use crate::writer::rewrite_renumber::collect_canonical_children;
-#[cfg(test)]
-use crate::ObjectRef;
-#[cfg(test)]
-use std::collections::HashMap;
-
-#[cfg(test)]
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub(crate) enum Item {
     Source {
@@ -74,13 +24,15 @@ pub(crate) enum Item {
     },
 }
 
-#[cfg(test)]
 #[derive(Clone, Debug)]
 pub(crate) struct Plan {
     pub(crate) items: Vec<Item>,
+    /// Remapped Catalog identity when the source `/Root` is indirect.
+    pub(crate) root: Option<ObjectRef>,
+    /// Canonical Catalog handle when the source `/Root` is direct.
+    pub(crate) direct_root: Option<ObjectHandle>,
 }
 
-#[cfg(test)]
 impl Plan {
     pub(crate) fn build<R: Read + Seek>(pdf: &mut Pdf<R>) -> Result<Self> {
         let root_candidate = pdf.trailer_key_handle(b"Root");
@@ -105,7 +57,7 @@ impl Plan {
         };
 
         for page in crate::pages::page_refs(builder.pdf)? {
-            builder.enqueue_reference(page);
+            let _ = builder.enqueue_reference(page);
 
             let page_handle = builder.pdf.get_object_handle(page);
             page_handle.try_dereference()?;
@@ -124,35 +76,27 @@ impl Plan {
             }
         }
 
-        if let Some(root) = root_ref {
-            builder.enqueue_reference(root);
+        let root = if let Some(root) = root_ref {
+            builder.enqueue_reference(root)
         } else if let Some(root) = direct_root.as_ref() {
             builder.enqueue_handle_with_stream_length_policy(root)?; // cov:ignore: direct-root enqueue is exercised by PCLm integration tests; LLVM maps this continuation to the call setup.
-        } // cov:ignore: direct-root enqueue executes above; LLVM places this branch-exit counter on an uninstrumented continuation line.
-
-        let mut cursor = 0;
-        while cursor < builder.items.len() {
-            let item = builder.items[cursor].clone();
-            cursor += 1;
-            let Item::Source { source, .. } = item else {
-                continue;
-            };
-            let source_handle = builder.pdf.get_object_handle(source);
-            source_handle.try_dereference()?;
-            let mut references = Vec::new();
-            collect_canonical_children(builder.pdf, &source_handle, 0, true, &mut references)?;
-            for reference in references {
-                builder.enqueue_reference(reference);
-            }
+            None
+        } else {
+            // cov:ignore-start: root_handle returns a direct Catalog handle whenever root_ref is absent.
+            None
+            // cov:ignore-end
+        }; // cov:ignore: direct-root enqueue executes above; LLVM places this branch-exit counter on an uninstrumented continuation line.
+        if root_ref.is_some() && root.is_none() {
+            return Err(crate::Error::Missing("/Root")); // cov:ignore: enqueue_reference always inserts an indirect PCLm root before the plan map is read.
         }
-
         Ok(Self {
             items: builder.items,
+            root,
+            direct_root,
         })
     }
 }
 
-#[cfg(test)]
 struct Builder<'pdf, R: Read + Seek + 'static> {
     pdf: &'pdf mut Pdf<R>,
     items: Vec<Item>,
@@ -160,16 +104,16 @@ struct Builder<'pdf, R: Read + Seek + 'static> {
     next_output: u32,
 }
 
-#[cfg(test)]
 impl<R: Read + Seek + 'static> Builder<'_, R> {
-    fn enqueue_reference(&mut self, source: ObjectRef) {
+    fn enqueue_reference(&mut self, source: ObjectRef) -> Option<ObjectRef> {
         if source.number == 0 || self.old_to_new.contains_key(&source) {
-            return;
+            return self.old_to_new.get(&source).copied();
         }
         let output = ObjectRef::new(self.next_output, 0);
         self.next_output = self.next_output.saturating_add(1);
         self.old_to_new.insert(source, output);
         self.items.push(Item::Source { source, output });
+        Some(output)
     }
 
     fn enqueue_synthetic(&mut self) {
@@ -187,7 +131,7 @@ impl<R: Read + Seek + 'static> Builder<'_, R> {
         let mut references = Vec::new();
         collect_canonical_enqueue_refs(self.pdf, value, 0, true, &mut references)?;
         for reference in references {
-            self.enqueue_reference(reference);
+            let _ = self.enqueue_reference(reference);
         }
         Ok(())
     }
@@ -203,10 +147,95 @@ impl<R: Read + Seek + 'static> Builder<'_, R> {
     }
 }
 
+/// qpdf's mutable `object_queue` after the PCLm-only initial enqueue pass.
+///
+/// The plan above reserves only page/content/image/synthetic/root numbers.
+/// Indirect children encountered while serializing those values are appended
+/// here, at the same `unparseChild` boundary that grows qpdf's queue.
+pub(crate) struct EmissionQueue {
+    pending: VecDeque<Item>,
+    old_to_new: BTreeMap<ObjectRef, ObjectRef>,
+    next_output: u32,
+}
+
+impl EmissionQueue {
+    pub(crate) fn from_plan(plan: &Plan) -> Result<Self> {
+        let mut old_to_new = BTreeMap::new();
+        let mut next_output = 1_u32;
+        for item in &plan.items {
+            let output = match *item {
+                Item::Source { source, output } => {
+                    old_to_new.insert(source, output);
+                    output
+                }
+                Item::Synthetic { output } => output,
+            };
+            next_output = output.number.checked_add(1).ok_or_else(|| {
+                crate::Error::Unsupported("PCLm object number overflows u32".to_string())
+            })?;
+        }
+        Ok(Self {
+            pending: plan.items.iter().cloned().collect(),
+            old_to_new,
+            next_output,
+        })
+    }
+
+    pub(crate) fn pop(&mut self) -> Option<Item> {
+        self.pending.pop_front()
+    }
+
+    pub(crate) fn enqueue_handle<R: Read + Seek>(
+        &mut self,
+        pdf: &Pdf<R>,
+        handle: ObjectHandle,
+    ) -> Result<ObjectRef> {
+        if handle.owning_pdf_unique_id() != Some(pdf.unique_id()) {
+            return Err(crate::Error::Internal(
+                "QPDFObjectHandle from different QPDF found while writing.  Use QPDF::copyForeignObject to add objects from another file."
+                    .to_string(),
+            ));
+        }
+        let source = handle.object_ref().ok_or_else(|| {
+            crate::Error::Internal("PCLm dynamic child has no indirect identity".to_string())
+        })?;
+        if let Some(output) = self.old_to_new.get(&source).copied() {
+            return Ok(output);
+        }
+        let output = ObjectRef::new(self.next_output, 0);
+        self.next_output = self.next_output.checked_add(1).ok_or_else(|| {
+            crate::Error::Unsupported("PCLm object number overflows u32".to_string())
+        })?;
+        self.old_to_new.insert(source, output);
+        self.pending.push_back(Item::Source { source, output });
+        Ok(output)
+    }
+
+    pub(crate) fn object_count(&self) -> Result<usize> {
+        // cov:ignore-start: the PCLm queue uses a u32 counter and supported targets represent it in usize.
+        usize::try_from(self.next_output).map_err(|_| {
+            crate::Error::Unsupported("PCLm object count does not fit in usize".to_string())
+        })
+        // cov:ignore-end
+    }
+
+    pub(crate) fn into_old_to_new(self) -> BTreeMap<ObjectRef, ObjectRef> {
+        self.old_to_new
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::io::{Cursor, Read, Seek, SeekFrom};
+    use crate::pipeline::{Pipeline, PipelineError, PipelineResult};
+    use crate::token_filter::{TokenFilter, TokenFilterOutput};
+    use crate::tokenizer::{Token, TokenType};
+    use crate::{Error, PdfWriter, StreamDataProvider};
+    use std::cell::RefCell;
+    use std::io::{self, Cursor, Read, Seek, SeekFrom, Write};
+    use std::path::PathBuf;
+    use std::process::Command;
+    use std::rc::Rc;
 
     struct ReadFailingCursor {
         inner: Cursor<Vec<u8>>,
@@ -257,6 +286,851 @@ mod tests {
         pdf
     }
 
+    #[derive(Clone)]
+    struct Events(Rc<RefCell<Vec<&'static str>>>);
+
+    impl Events {
+        fn new() -> Self {
+            Self(Rc::new(RefCell::new(Vec::new())))
+        }
+
+        fn record(&self, event: &'static str) {
+            self.0.borrow_mut().push(event);
+        }
+
+        fn snapshot(&self) -> Vec<&'static str> {
+            self.0.borrow().clone()
+        }
+    }
+
+    struct EventProvider {
+        event: &'static str,
+        payload: &'static [u8],
+        events: Events,
+    }
+
+    struct SuccessfulUnfilteredRetryProvider {
+        calls: Rc<RefCell<Vec<(bool, bool)>>>,
+    }
+
+    struct PassThroughFilter;
+
+    impl TokenFilter for PassThroughFilter {
+        fn handle_token(
+            &mut self,
+            token: &Token,
+            output: &mut TokenFilterOutput<'_>,
+        ) -> PipelineResult<()> {
+            output.write_token(token)
+        }
+    }
+
+    impl StreamDataProvider for SuccessfulUnfilteredRetryProvider {
+        fn supports_retry(&self) -> bool {
+            true
+        }
+
+        fn provide_stream_data_with_retry_by_id(
+            &self,
+            _object_number: u32,
+            _generation: u16,
+            pipeline: &mut dyn Pipeline,
+            suppress_warnings: bool,
+            will_retry: bool,
+        ) -> crate::Result<bool> {
+            self.calls
+                .borrow_mut()
+                .push((suppress_warnings, will_retry));
+            pipeline
+                .write(b"PCLm-unfiltered-success")
+                .map_err(Error::from)?;
+            pipeline.finish().map_err(Error::from)?;
+            Ok(true)
+        }
+    }
+
+    impl StreamDataProvider for EventProvider {
+        fn provide_stream_data_by_id(
+            &self,
+            _object_number: u32,
+            _generation: u16,
+            pipeline: &mut dyn Pipeline,
+        ) -> crate::Result<()> {
+            self.events.record(self.event);
+            pipeline.write(self.payload).map_err(Error::from)?;
+            pipeline.finish().map_err(Error::from)
+        }
+    }
+
+    struct SegmentFailureProvider {
+        events: Events,
+    }
+
+    struct SegmentFailure<'a> {
+        next: &'a mut dyn Pipeline,
+    }
+
+    impl Pipeline for SegmentFailure<'_> {
+        fn identifier(&self) -> &str {
+            "PCLm provider segment"
+        }
+
+        fn write(&mut self, data: &[u8]) -> PipelineResult<()> {
+            self.next.write(data)
+        }
+
+        fn finish(&mut self) -> PipelineResult<()> {
+            Err(PipelineError::runtime(
+                "PCLm provider segment finish failure",
+            ))
+        }
+    }
+
+    impl StreamDataProvider for SegmentFailureProvider {
+        fn provide_stream_data_by_id(
+            &self,
+            _object_number: u32,
+            _generation: u16,
+            pipeline: &mut dyn Pipeline,
+        ) -> crate::Result<()> {
+            self.events.record("provider:A");
+            let mut segment = SegmentFailure { next: pipeline };
+            assert_eq!(segment.identifier(), "PCLm provider segment");
+            segment.write(b"PCLm-provider-A").map_err(Error::from)?;
+            segment.finish().map_err(Error::from)
+        }
+    }
+
+    struct EventWriter {
+        events: Events,
+        bytes: Rc<RefCell<Vec<u8>>>,
+    }
+
+    impl Write for EventWriter {
+        fn write(&mut self, data: &[u8]) -> io::Result<usize> {
+            self.events.record("sink-write");
+            self.bytes.borrow_mut().extend_from_slice(data);
+            Ok(data.len())
+        }
+
+        fn flush(&mut self) -> io::Result<()> {
+            Ok(())
+        }
+    }
+
+    struct PayloadRejectingWriter {
+        events: Events,
+    }
+
+    impl Write for PayloadRejectingWriter {
+        fn write(&mut self, data: &[u8]) -> io::Result<usize> {
+            if data
+                .windows(b"PCLm-provider-A".len())
+                .any(|window| window == b"PCLm-provider-A")
+            {
+                self.events.record("sink-error:A");
+                return Err(io::Error::other("PCLm sink rejected provider A"));
+            }
+            Ok(data.len())
+        }
+
+        fn flush(&mut self) -> io::Result<()> {
+            Ok(())
+        }
+    }
+
+    struct FinishRejectingPipeline {
+        events: Events,
+    }
+
+    #[test]
+    fn pass_through_filter_forwards_a_token_to_its_pipeline_output() {
+        let mut buffer = crate::pipeline::buffer::Buffer::new("PCLm token buffer", None);
+        let mut output = TokenFilterOutput::new(Some(&mut buffer));
+        let mut filter = PassThroughFilter;
+        let token = Token::new(TokenType::Word, b"Do".to_vec());
+
+        {
+            filter
+                .handle_token(&token, &mut output)
+                .expect("pass-through filter forwards the token");
+        }
+        buffer.finish().expect("token buffer finish");
+        assert_eq!(buffer.take_buffer().expect("token bytes"), b"Do");
+    }
+
+    impl Pipeline for FinishRejectingPipeline {
+        fn identifier(&self) -> &str {
+            "PCLm final sink"
+        }
+
+        fn write(&mut self, _data: &[u8]) -> PipelineResult<()> {
+            Ok(())
+        }
+
+        fn finish(&mut self) -> PipelineResult<()> {
+            self.events.record("sink-finish-error");
+            Err(PipelineError::runtime("PCLm final sink finish failure"))
+        }
+    }
+
+    fn provider_stream(
+        pdf: &Pdf<Cursor<Vec<u8>>>,
+        provider: impl StreamDataProvider + 'static,
+    ) -> ObjectHandle {
+        let stream = pdf.new_stream().expect("create PCLm provider stream");
+        stream
+            .replace_stream_data_provider(Rc::new(provider), None, None)
+            .expect("register PCLm provider");
+        stream
+    }
+
+    fn attach_root_streams(
+        pdf: &mut Pdf<Cursor<Vec<u8>>>,
+        first: ObjectHandle,
+        second: ObjectHandle,
+    ) {
+        let root = pdf.root_handle().expect("resolve PCLm Catalog");
+        root.replace_key(b"/PclmProviderA", first)
+            .expect("attach first PCLm provider");
+        root.replace_key(b"/PclmProviderB", second)
+            .expect("attach second PCLm provider");
+    }
+
+    fn configure_pclm_writer<'pdf>(
+        pdf: &'pdf mut Pdf<Cursor<Vec<u8>>>,
+    ) -> PdfWriter<'pdf, Cursor<Vec<u8>>> {
+        let mut writer = PdfWriter::new(pdf);
+        writer.set_pclm(true);
+        writer.set_static_id(true);
+        writer
+    }
+
+    fn exact_qpdf_11_9() -> bool {
+        Command::new("qpdf")
+            .arg("--version")
+            .output()
+            .ok()
+            .and_then(|output| {
+                String::from_utf8(output.stdout)
+                    .ok()
+                    .and_then(|stdout| stdout.lines().next().map(str::to_owned))
+            })
+            .is_some_and(|line| line == "qpdf version 11.9.0")
+    }
+
+    fn pinned_qpdf_source_from(command: &std::path::Path) -> Option<PathBuf> {
+        let output = Command::new(command).arg("--print-path").output().ok()?;
+        if !output.status.success() {
+            return None;
+        }
+        let path = String::from_utf8(output.stdout).ok()?;
+        Some(PathBuf::from(path.trim()))
+    }
+
+    fn pinned_qpdf_source() -> Option<PathBuf> {
+        let workspace = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../..");
+        pinned_qpdf_source_from(&workspace.join("scripts/fetch-qpdf-source.sh"))
+    }
+
+    fn oracle_source_for(
+        label: &str,
+        qpdf_available: bool,
+        source: Option<PathBuf>,
+    ) -> Option<PathBuf> {
+        if !qpdf_available {
+            eprintln!("qpdf 11.9.0 is unavailable; skipping {label} oracle");
+            return None;
+        }
+        let Some(source) = source else {
+            eprintln!("pinned qpdf source is unavailable; skipping {label} oracle");
+            return None;
+        };
+        Some(source)
+    }
+
+    fn pclm_oracle_source(label: &str) -> Option<PathBuf> {
+        let qpdf_available = exact_qpdf_11_9();
+        let source = qpdf_available.then(pinned_qpdf_source).flatten();
+        oracle_source_for(label, qpdf_available, source)
+    }
+
+    fn first_page_content(path: &std::path::Path) -> Vec<u8> {
+        let pages = Command::new("qpdf")
+            .arg("--show-pages")
+            .arg(path)
+            .output()
+            .expect("inspect page content references");
+        let pages_error = format!(
+            "qpdf --show-pages failed: {}",
+            String::from_utf8_lossy(&pages.stderr)
+        );
+        assert!(pages.status.success(), "{pages_error}");
+        let pages = String::from_utf8(pages.stdout).expect("qpdf page listing is UTF-8");
+        let content = pages
+            .split_once("  content:\n")
+            .and_then(|(_, rest)| rest.lines().next())
+            .expect("qpdf page listing has a content stream");
+        let object = content
+            .split_whitespace()
+            .next()
+            .expect("content stream has an object number");
+        let stream = Command::new("qpdf")
+            .arg(format!("--show-object={object}"))
+            .arg("--raw-stream-data")
+            .arg(path)
+            .output()
+            .expect("read qpdf content stream");
+        let stream_error = format!(
+            "qpdf --show-object failed: {}",
+            String::from_utf8_lossy(&stream.stderr)
+        );
+        assert!(stream.status.success(), "{stream_error}");
+        stream.stdout
+    }
+
+    #[test]
+    fn pclm_oracle_helpers_cover_unavailable_and_failed_command_paths() {
+        assert!(oracle_source_for("test", false, Some(PathBuf::from("/tmp/source"))).is_none());
+        assert!(oracle_source_for("test", true, None).is_none());
+        let source = PathBuf::from("/tmp/source");
+        assert_eq!(
+            oracle_source_for("test", true, Some(source.clone())),
+            Some(source)
+        );
+        assert!(pinned_qpdf_source_from(std::path::Path::new("/bin/false")).is_none());
+    }
+
+    #[test]
+    fn plan_retains_only_qpdfs_initial_pclm_enqueue_order() {
+        let mut pdf = one_page_fixture_pdf();
+        let child = pdf
+            .make_indirect_from_object_handle(ObjectHandle::string(b"late-child".to_vec()))
+            .expect("allocate a Catalog child");
+        let child_ref = child.object_ref().expect("indirect child identity");
+        pdf.root_handle()
+            .expect("resolve Catalog")
+            .replace_key(b"/LateChild", child)
+            .expect("attach Catalog child");
+
+        let plan = Plan::build(&mut pdf).expect("build initial PCLm enqueue plan");
+
+        assert!(
+            !plan
+                .items
+                .iter()
+                .any(|item| matches!(item, Item::Source { source, .. } if *source == child_ref)),
+            "a Catalog child belongs to emission-time discovery, not the initial PCLm plan"
+        );
+    }
+
+    #[test]
+    fn builder_deduplicates_references_and_ignores_object_zero() {
+        let mut pdf = one_page_fixture_pdf();
+        let source = pdf.root_ref().expect("fixture Catalog");
+        let mut builder = Builder {
+            pdf: &mut pdf,
+            items: Vec::new(),
+            old_to_new: HashMap::new(),
+            next_output: 1,
+        };
+
+        assert_eq!(builder.enqueue_reference(ObjectRef::new(0, 0)), None);
+        let first = builder
+            .enqueue_reference(source)
+            .expect("first reference gets a number");
+        assert_eq!(builder.enqueue_reference(source), Some(first));
+        assert_eq!(builder.items.len(), 1);
+    }
+
+    #[test]
+    fn emission_queue_reports_invalid_dynamic_children_and_number_overflow() {
+        let overflowing_plan = Plan {
+            items: vec![Item::Synthetic {
+                output: ObjectRef::new(u32::MAX, 0),
+            }],
+            root: None,
+            direct_root: None,
+        };
+        let error = EmissionQueue::from_plan(&overflowing_plan)
+            .err()
+            .expect("a plan ending at u32::MAX cannot reserve a next object");
+        assert!(
+            matches!(error, Error::Unsupported(message) if message.contains("object number overflows"))
+        );
+
+        let mut local_pdf = one_page_fixture_pdf();
+        let mut foreign_pdf = one_page_fixture_pdf();
+        let mut queue = EmissionQueue::from_plan(&Plan {
+            items: Vec::new(),
+            root: None,
+            direct_root: None,
+        })
+        .expect("empty emission queue");
+        let error = queue
+            .enqueue_handle(
+                &local_pdf,
+                foreign_pdf.root_handle().expect("foreign Catalog"),
+            )
+            .expect_err("foreign dynamic children must be rejected");
+        assert!(matches!(error, Error::Internal(message) if message.contains("different QPDF")));
+
+        let direct_child = local_pdf
+            .root_handle()
+            .expect("local Catalog")
+            .try_get_key(b"/Type")
+            .expect("direct Catalog type");
+        let error = queue
+            .enqueue_handle(&local_pdf, direct_child)
+            .expect_err("dynamic queue entries must be indirect");
+        assert!(
+            matches!(error, Error::Internal(message) if message.contains("no indirect identity"))
+        );
+
+        let child = local_pdf
+            .make_indirect_from_object_handle(ObjectHandle::integer(7))
+            .expect("local dynamic child");
+        queue.next_output = u32::MAX;
+        let error = queue
+            .enqueue_handle(&local_pdf, child)
+            .expect_err("dynamic object numbering must not wrap");
+        assert!(
+            matches!(error, Error::Unsupported(message) if message.contains("object number overflows"))
+        );
+    }
+
+    #[test]
+    fn pclm_reaches_the_final_sink_before_requesting_the_next_provider() {
+        let events = Events::new();
+        let bytes = Rc::new(RefCell::new(Vec::new()));
+        let mut pdf = one_page_fixture_pdf();
+        let first = provider_stream(
+            &pdf,
+            EventProvider {
+                event: "provider:A",
+                payload: b"PCLm-provider-A",
+                events: events.clone(),
+            },
+        );
+        let second = provider_stream(
+            &pdf,
+            EventProvider {
+                event: "provider:B",
+                payload: b"PCLm-provider-B",
+                events: events.clone(),
+            },
+        );
+        attach_root_streams(&mut pdf, first, second);
+
+        let mut writer = configure_pclm_writer(&mut pdf);
+        writer
+            .set_output_writer(EventWriter {
+                events: events.clone(),
+                bytes: Rc::clone(&bytes),
+            })
+            .expect("install PCLm event sink");
+        writer.write().expect("PCLm writer succeeds");
+
+        assert!(!bytes.borrow().is_empty());
+        let events = events.snapshot();
+        let provider_a = events
+            .iter()
+            .position(|event| *event == "provider:A")
+            .expect("provider A event");
+        let provider_b = events
+            .iter()
+            .position(|event| *event == "provider:B")
+            .expect("provider B event");
+        assert!(
+            events[provider_a + 1..provider_b].contains(&"sink-write"),
+            "PCLm must emit A before requesting B; events: {events:?}"
+        );
+    }
+
+    #[test]
+    fn pclm_forced_uncompressed_successful_first_call_retries_on_filter_result() {
+        let mut pdf = one_page_fixture_pdf();
+        let calls = Rc::new(RefCell::new(Vec::new()));
+        let stream = provider_stream(
+            &pdf,
+            SuccessfulUnfilteredRetryProvider {
+                calls: Rc::clone(&calls),
+            },
+        );
+        stream
+            .add_token_filter(Rc::new(RefCell::new(PassThroughFilter)))
+            .expect("mark the provider stream as modified");
+        pdf.root_handle()
+            .expect("resolve Catalog")
+            .replace_key(b"/PclmProvider", stream)
+            .expect("attach PCLm provider");
+
+        let mut writer = configure_pclm_writer(&mut pdf);
+        writer.set_output_memory().expect("install memory output");
+        writer
+            .write()
+            .expect("PCLm raw retry after an unfiltered success");
+
+        assert_eq!(*calls.borrow(), vec![(false, true), (false, false)]);
+    }
+
+    #[test]
+    fn pclm_progress_failure_happens_before_current_object_bytes_reach_sink() {
+        let events = Events::new();
+        let bytes = Rc::new(RefCell::new(Vec::new()));
+        let mut pdf = one_page_fixture_pdf();
+        let mut writer = configure_pclm_writer(&mut pdf);
+        writer
+            .set_output_writer(EventWriter {
+                events,
+                bytes: Rc::clone(&bytes),
+            })
+            .expect("install PCLm event sink");
+        writer.register_progress_reporter(Box::new(|percent| {
+            assert_eq!(percent, 0);
+            Err(Error::System("PCLm progress failure".to_owned()))
+        }));
+
+        let error = writer
+            .write()
+            .expect_err("PCLm progress failure must escape before object output");
+
+        assert!(error.to_string().contains("PCLm progress failure"));
+        let bytes = bytes.borrow();
+        assert!(bytes.starts_with(b"%PDF-"));
+        assert!(
+            !bytes
+                .windows(b"1 0 obj\n".len())
+                .any(|window| window == b"1 0 obj\n"),
+            "progress failure must not leave the current PCLm object in the sink"
+        );
+    }
+
+    #[test]
+    fn pclm_content_normalization_matches_qpdf_11_9() {
+        if let Some(source) = pclm_oracle_source("PCLm normalization") {
+            let input = source.join("qpdf/qtest/qpdf/good7.pdf");
+            let temporary = tempfile::tempdir().expect("PCLm normalization tempdir");
+            let normalized = temporary.path().join("qpdf-normalized.pdf");
+            let qpdf = Command::new("qpdf")
+                .args([
+                    "--normalize-content=y",
+                    "--stream-data=uncompress",
+                    "--object-streams=disable",
+                    "--static-id",
+                ])
+                .arg(&input)
+                .arg(&normalized)
+                .output()
+                .expect("run qpdf content normalization");
+            let qpdf_error = format!(
+                "qpdf normalization failed: {}",
+                String::from_utf8_lossy(&qpdf.stderr)
+            );
+            assert!(qpdf.status.success(), "{qpdf_error}");
+
+            let mut pdf = Pdf::open(Cursor::new(
+                std::fs::read(&input).expect("read qpdf normalization input"),
+            ))
+            .expect("open qpdf normalization input");
+            let mut writer = PdfWriter::new(&mut pdf);
+            writer.set_pclm(true);
+            writer.set_content_normalization(true);
+            writer.set_static_id(true);
+            writer
+                .set_output_memory()
+                .expect("install PCLm memory output");
+            writer.write().expect("write normalized PCLm output");
+            let actual = writer.get_buffer().expect("read normalized PCLm output");
+            let actual_path = temporary.path().join("pclm-normalized.pdf");
+            std::fs::write(&actual_path, actual).expect("write PCLm normalization output");
+
+            assert_eq!(
+                first_page_content(&actual_path),
+                first_page_content(&normalized),
+                "PCLm page content normalization must match qpdf 11.9.0"
+            );
+        } // cov:ignore: LLVM maps the covered PCLm normalization branch exit to this line
+    }
+
+    #[test]
+    fn pclm_filtering_disabled_false_uses_the_first_retryable_attempt_once() {
+        let mut pdf = one_page_fixture_pdf();
+        let calls = Rc::new(RefCell::new(Vec::new()));
+        let calls_for_provider = Rc::clone(&calls);
+        let stream = pdf.new_stream().expect("create retry-aware PCLm stream");
+        stream
+            .replace_stream_data_with_retry_callback(
+                move |pipeline, suppress_warnings, will_retry| {
+                    calls_for_provider
+                        .borrow_mut()
+                        .push((suppress_warnings, will_retry));
+                    pipeline
+                        .write(b"PCLm-disabled-filter")
+                        .map_err(Error::from)?;
+                    pipeline.finish().map_err(Error::from)?;
+                    Ok(false)
+                },
+                None,
+                None,
+            )
+            .expect("register retry-aware PCLm stream");
+        stream
+            .set_filter_on_write(false)
+            .expect("disable filtering on PCLm stream");
+        pdf.root_handle()
+            .expect("resolve Catalog")
+            .replace_key(b"/PclmProvider", stream)
+            .expect("attach PCLm provider");
+
+        let mut writer = configure_pclm_writer(&mut pdf);
+        writer.set_output_memory().expect("install memory output");
+        writer
+            .write()
+            .expect("filter-disabled false keeps the first source buffer");
+        let output = writer.get_buffer().expect("PCLm memory output");
+
+        assert_eq!(*calls.borrow(), vec![(false, true)]);
+        assert!(output
+            .windows(b"PCLm-disabled-filter".len())
+            .any(|window| window == b"PCLm-disabled-filter"));
+    }
+
+    #[test]
+    fn pclm_recoverable_filter_failure_retries_only_the_same_stream() {
+        let mut pdf = one_page_fixture_pdf();
+        let calls = Rc::new(RefCell::new(Vec::new()));
+        let calls_for_provider = Rc::clone(&calls);
+        let stream = pdf.new_stream().expect("create retry-aware PCLm stream");
+        stream
+            .replace_stream_data_with_retry_callback(
+                move |pipeline, suppress_warnings, will_retry| {
+                    calls_for_provider
+                        .borrow_mut()
+                        .push((suppress_warnings, will_retry));
+                    if will_retry {
+                        return Ok(false);
+                    }
+                    pipeline.write(b"PCLm-retry-payload").map_err(Error::from)?;
+                    pipeline.finish().map_err(Error::from)?;
+                    Ok(true)
+                },
+                None,
+                None,
+            )
+            .expect("register retry-aware PCLm stream");
+        stream
+            .add_token_filter(Rc::new(RefCell::new(PassThroughFilter)))
+            .expect("mark the retrying stream as modified");
+        pdf.root_handle()
+            .expect("resolve Catalog")
+            .replace_key(b"/PclmProvider", stream)
+            .expect("attach PCLm provider");
+
+        let mut writer = configure_pclm_writer(&mut pdf);
+        writer.set_output_memory().expect("install memory output");
+        writer.write().expect("PCLm raw retry succeeds");
+
+        assert_eq!(*calls.borrow(), vec![(false, true), (false, false)]);
+        assert!(writer
+            .get_buffer()
+            .expect("PCLm memory output")
+            .windows(b"PCLm-retry-payload".len())
+            .any(|window| window == b"PCLm-retry-payload"));
+    }
+
+    #[test]
+    fn pclm_provider_segment_failure_never_requests_a_later_provider() {
+        let events = Events::new();
+        let mut pdf = one_page_fixture_pdf();
+        let first = provider_stream(
+            &pdf,
+            SegmentFailureProvider {
+                events: events.clone(),
+            },
+        );
+        let second = provider_stream(
+            &pdf,
+            EventProvider {
+                event: "provider:B",
+                payload: b"PCLm-provider-B",
+                events: events.clone(),
+            },
+        );
+        attach_root_streams(&mut pdf, first, second);
+
+        let mut writer = configure_pclm_writer(&mut pdf);
+        writer.set_output_memory().expect("install memory output");
+        let error = writer
+            .write()
+            .expect_err("PCLm provider segment failure must escape");
+
+        assert!(error
+            .to_string()
+            .contains("PCLm provider segment finish failure"));
+        assert_eq!(events.snapshot(), vec!["provider:A"]);
+    }
+
+    #[test]
+    fn pclm_sink_write_failure_never_requests_a_later_provider() {
+        let events = Events::new();
+        let mut pdf = one_page_fixture_pdf();
+        let first = provider_stream(
+            &pdf,
+            EventProvider {
+                event: "provider:A",
+                payload: b"PCLm-provider-A",
+                events: events.clone(),
+            },
+        );
+        let second = provider_stream(
+            &pdf,
+            EventProvider {
+                event: "provider:B",
+                payload: b"PCLm-provider-B",
+                events: events.clone(),
+            },
+        );
+        attach_root_streams(&mut pdf, first, second);
+
+        let mut writer = configure_pclm_writer(&mut pdf);
+        writer
+            .set_output_writer(PayloadRejectingWriter {
+                events: events.clone(),
+            })
+            .expect("install rejecting PCLm sink");
+        let error = writer.write().expect_err("PCLm sink failure must escape");
+
+        assert!(error.to_string().contains("PCLm sink rejected provider A"));
+        let events = events.snapshot();
+        assert!(events.contains(&"provider:A"));
+        assert!(events.contains(&"sink-error:A"));
+        assert!(
+            !events.contains(&"provider:B"),
+            "a terminal PCLm sink failure must stop the live queue: {events:?}"
+        );
+    }
+
+    #[test]
+    fn pclm_final_sink_finish_failure_never_requests_a_later_provider() {
+        let events = Events::new();
+        let mut pdf = one_page_fixture_pdf();
+        let page = crate::pages::page_refs(&mut pdf).expect("PCLm page refs")[0];
+        pdf.get_object_handle(page)
+            .replace_key(b"/Contents", ObjectHandle::null())
+            .expect("remove the fixture content stream");
+        let first = provider_stream(
+            &pdf,
+            EventProvider {
+                event: "provider:A",
+                payload: b"PCLm-provider-A",
+                events: events.clone(),
+            },
+        );
+        let second = provider_stream(
+            &pdf,
+            EventProvider {
+                event: "provider:B",
+                payload: b"PCLm-provider-B",
+                events: events.clone(),
+            },
+        );
+        attach_root_streams(&mut pdf, first, second);
+
+        let mut writer = configure_pclm_writer(&mut pdf);
+        let final_sink = FinishRejectingPipeline {
+            events: events.clone(),
+        };
+        assert_eq!(final_sink.identifier(), "PCLm final sink");
+        writer
+            .set_output_pipeline(final_sink)
+            .expect("install finish-rejecting PCLm pipeline");
+        let error = writer
+            .write()
+            .expect_err("PCLm final sink finish failure must escape");
+
+        assert!(error.to_string().contains("PCLm final sink finish failure"));
+        let events = events.snapshot();
+        assert!(events.contains(&"provider:A"));
+        assert!(events.contains(&"sink-finish-error"));
+        assert!(
+            !events.contains(&"provider:B"),
+            "a PCLm segment finish failure must stop the live queue: {events:?}"
+        );
+    }
+
+    #[test]
+    fn pclm_static_id_bytes_and_check_exit_match_qpdf_11_9() {
+        if let Some(source) = pclm_oracle_source("PCLm byte") {
+            let fixture = source.join("qpdf/qtest/qpdf/pclm-in.pdf");
+            let oracle = source.join("qpdf/qtest/qpdf/pclm-out.pdf");
+            let mut pdf = Pdf::open(Cursor::new(
+                std::fs::read(&fixture).expect("read qpdf PCLm input"),
+            ))
+            .expect("open qpdf PCLm input");
+            let mut writer = configure_pclm_writer(&mut pdf);
+            writer.set_output_memory().expect("install memory output");
+            writer.write().expect("write qpdf PCLm fixture");
+            let actual = writer.get_buffer().expect("PCLm output bytes");
+            let expected = std::fs::read(&oracle).expect("read qpdf 11.9.0 PCLm output");
+
+            assert_eq!(actual, expected, "PCLm output must be byte-identical");
+
+            let temporary = tempfile::tempdir().expect("PCLm oracle tempdir");
+            let actual_path = temporary.path().join("actual.pdf");
+            std::fs::write(&actual_path, &actual).expect("write PCLm output for qpdf check");
+            let actual_check = Command::new("qpdf")
+                .arg("--check")
+                .arg(&actual_path)
+                .output()
+                .expect("check flpdf PCLm output");
+            let oracle_check = Command::new("qpdf")
+                .arg("--check")
+                .arg(&oracle)
+                .output()
+                .expect("check qpdf PCLm output");
+            assert_eq!(
+                actual_check.status.code(),
+                oracle_check.status.code(),
+                "flpdf and qpdf PCLm outputs must have the same qpdf --check exit"
+            );
+            assert!(actual_check.status.success());
+        } // cov:ignore: LLVM attributes the covered qpdf-check success branch to the nested assertion.
+    }
+
+    #[test]
+    fn pclm_deterministic_id_output_is_repeatable_and_qpdf_readable() {
+        fn write() -> Vec<u8> {
+            let mut pdf = one_page_fixture_pdf();
+            let mut writer = PdfWriter::new(&mut pdf);
+            writer.set_pclm(true);
+            writer.set_deterministic_id(true);
+            writer.set_output_memory().expect("install memory output");
+            writer.write().expect("write deterministic PCLm output");
+            writer.get_buffer().expect("deterministic PCLm bytes")
+        }
+
+        let first = write();
+        let second = write();
+        assert_eq!(first, second, "PCLm deterministic IDs must be repeatable");
+
+        if exact_qpdf_11_9() {
+            let temporary = tempfile::tempdir().expect("deterministic PCLm tempdir");
+            let output = temporary.path().join("deterministic-pclm.pdf");
+            std::fs::write(&output, first).expect("write deterministic PCLm output");
+            let check = Command::new("qpdf")
+                .arg("--check")
+                .arg(output)
+                .output()
+                .expect("check deterministic PCLm output");
+            let check_error = format!(
+                "qpdf rejected deterministic PCLm output: {}",
+                String::from_utf8_lossy(&check.stderr)
+            );
+            assert!(check.status.success(), "{check_error}");
+        } // cov:ignore: LLVM attributes the covered exact-qpdf branch exit to the assertion above.
+    }
+
     #[test]
     fn plan_rejects_a_missing_root() {
         let mut pdf = Pdf::open(Cursor::new(
@@ -290,7 +1164,7 @@ mod tests {
     }
 
     #[test]
-    fn plan_skips_a_page_that_resolves_to_a_non_dictionary() {
+    fn plan_does_not_resurrect_a_non_page_through_a_root_prewalk() {
         let mut pdf = fixture_pdf();
         let page = crate::pages::page_refs(&mut pdf).unwrap()[0];
         pdf.replace_object(page, ObjectHandle::integer(42))
@@ -298,7 +1172,7 @@ mod tests {
 
         let plan = Plan::build(&mut pdf).expect("a scalar page is ignored by the PCLm planner");
 
-        assert!(plan
+        assert!(!plan
             .items
             .iter()
             .any(|item| { matches!(item, Item::Source { source, .. } if *source == page) }));
@@ -377,7 +1251,9 @@ mod tests {
             ..crate::writer::WriterOptions::default()
         };
         let mut output = Vec::new();
-        let result = crate::writer::pclm_live::write_pclm(&mut pdf, &mut output, &options);
+        let result = crate::writer::output::with_buffer_sink(&mut output, |out| {
+            crate::writer::write_pclm(&mut pdf, out, &options, None)
+        });
 
         assert!(result.is_ok(), "qpdf-compatible PCLm output: {result:?}");
         let output = String::from_utf8_lossy(&output);
@@ -397,7 +1273,9 @@ mod tests {
             ..crate::writer::WriterOptions::default()
         };
         let mut output = Vec::new();
-        let result = crate::writer::pclm_live::write_pclm(&mut pdf, &mut output, &options);
+        let result = crate::writer::output::with_buffer_sink(&mut output, |out| {
+            crate::writer::write_pclm(&mut pdf, out, &options, None)
+        });
 
         assert!(result.is_ok(), "qpdf-compatible PCLm output: {result:?}");
         let output = String::from_utf8_lossy(&output);
