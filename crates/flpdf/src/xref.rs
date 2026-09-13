@@ -808,10 +808,7 @@ impl BootstrapHandleDocument {
         description: XrefObjectDescription,
         source_bytes: &[u8],
     ) -> Result<HandleFileObjectRead> {
-        let mut parser = BootstrapHandleParser {
-            document: self,
-            description,
-        };
+        let mut parser = BootstrapHandleParser::new(self, description);
         let pending = parse_file_object_handle_syntax(input, &mut parser)?;
         let resolved_length = pending.indirect_length_ref().map(|object_ref| {
             self.ensure_source_bytes(source_bytes);
@@ -1095,13 +1092,13 @@ impl BootstrapHandleDocument {
             // EOF/empty-object result (`QPDF.cc:1825-1828`).
             let diagnostic_start = member_start.min(decoded.len());
             let member_data = decoded.get(diagnostic_start..).unwrap_or_default();
-            let mut parser = BootstrapHandleParser {
-                document: self,
-                description: XrefObjectDescription::ObjStmMember {
+            let mut parser = BootstrapHandleParser::new(
+                self,
+                XrefObjectDescription::ObjStmMember {
                     stream_number,
                     object_ref,
                 },
-            };
+            );
             let (value, parsed_offset, diagnostics) =
                 match parse_qpdf_direct_object_handle_with_diagnostics(
                     member_data,
@@ -1194,7 +1191,27 @@ impl BootstrapHandleDocument {
 
 struct BootstrapHandleParser<'document> {
     document: &'document BootstrapHandleDocument,
-    description: XrefObjectDescription,
+    description_template: Rc<Vec<u8>>,
+}
+
+impl<'document> BootstrapHandleParser<'document> {
+    fn new(
+        document: &'document BootstrapHandleDocument,
+        description: XrefObjectDescription,
+    ) -> Self {
+        let description_template = match description {
+            XrefObjectDescription::Ordinary => b"object $OG".to_vec(),
+            XrefObjectDescription::XrefStream => b"xref stream: object $OG".to_vec(),
+            XrefObjectDescription::ObjStmMember {
+                stream_number,
+                object_ref,
+            } => document.object_description_template(stream_number, object_ref),
+        };
+        Self {
+            document,
+            description_template: Rc::new(description_template),
+        }
+    }
 }
 
 struct CanonicalTrailerParser<'document> {
@@ -1237,16 +1254,7 @@ impl HandleResolver for BootstrapHandleParser<'_> {
     }
 
     fn description_template(&self) -> Option<Rc<Vec<u8>>> {
-        Some(Rc::new(match self.description {
-            XrefObjectDescription::Ordinary => b"object $OG".to_vec(),
-            XrefObjectDescription::XrefStream => b"xref stream: object $OG".to_vec(),
-            XrefObjectDescription::ObjStmMember {
-                stream_number,
-                object_ref,
-            } => self
-                .document
-                .object_description_template(stream_number, object_ref),
-        }))
+        Some(Rc::clone(&self.description_template))
     }
 }
 
@@ -2424,13 +2432,13 @@ fn parse_xref_from_start_with_owner_and_build_diagnostics(
                 &mut trailer_parser,
             )?
         } else {
-            let mut trailer_parser = BootstrapHandleParser {
-                document: &trailer_context
+            let mut trailer_parser = BootstrapHandleParser::new(
+                &trailer_context
                     .as_ref()
                     .expect("owner-less classic trailer has a bootstrap context")
                     .document,
-                description: XrefObjectDescription::Ordinary,
-            };
+                XrefObjectDescription::Ordinary,
+            );
             read_trailer(
                 bytes,
                 trailer_start,
@@ -9739,6 +9747,23 @@ mod final_handle_tests {
                 .as_integer(),
             Some(0)
         );
+    }
+
+    #[test]
+    fn bootstrap_parser_values_share_one_description_template_owner() {
+        let state = Rc::new(RefCell::new(BootstrapHandleState::default()));
+        let entries = BTreeMap::new();
+        let document = BootstrapHandleDocument::new_with_state(
+            Some(b""),
+            XrefEntryLookup::Registration(&entries),
+            XrefLoadOptions::default(),
+            state,
+        );
+        let parser = BootstrapHandleParser::new(&document, XrefObjectDescription::Ordinary);
+
+        let first = parser.description_template().expect("description template");
+        let second = parser.description_template().expect("description template");
+        assert!(Rc::ptr_eq(&first, &second));
     }
 
     #[test]
