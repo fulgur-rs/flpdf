@@ -725,4 +725,33 @@ mod tests {
             PlainRoute::OutsidePlain
         );
     }
+
+    #[test]
+    fn write_plain_rejects_a_route_owned_by_another_consumer() {
+        let mut pdf = Pdf::open(std::io::Cursor::new(
+            include_bytes!("../../../../../tests/fixtures/compat/one-page-no-ext.pdf").to_vec(),
+        ))
+        .unwrap();
+        let mut options = options(ObjectStreamMode::Disable);
+        options.extra_header_text = "% specialized\n".to_string();
+
+        let error = match write_plain(
+            &mut pdf,
+            Vec::new(),
+            &options,
+            None,
+            None,
+            &BTreeMap::new(),
+            None,
+            &[],
+        ) {
+            Ok(_) => panic!("write_plain must reject an outside route"),
+            Err(error) => error,
+        };
+        assert!(matches!(
+            error,
+            crate::Error::Unsupported(message)
+                if message == "plain writer route is not applicable to this writer cohort"
+        ));
+    }
 }
