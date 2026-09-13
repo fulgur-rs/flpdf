@@ -291,6 +291,45 @@ fn measurement_stops_on_unwind() {
     assert_eq!(measurement.live_bytes, 32);
 }
 
+fn scalar_array_input(count: usize) -> Vec<u8> {
+    let values = (0..count)
+        .map(|value| value.to_string())
+        .collect::<Vec<_>>()
+        .join(" ");
+    format!("[{values}]").into_bytes()
+}
+
+#[test]
+fn parser_description_payload_does_not_scale_with_value_count() {
+    const VALUE_COUNT: usize = 128;
+
+    let input = scalar_array_input(VALUE_COUNT);
+    let short_description = "short";
+    let long_description = format!("long {}", "x".repeat(1024));
+
+    let (short_value, short_measurement) = measure_construction(|| {
+        ObjectHandle::parse_with_description(&input, short_description).unwrap()
+    });
+    let (long_value, long_measurement) = measure_construction(|| {
+        ObjectHandle::parse_with_description(&input, &long_description).unwrap()
+    });
+    std::hint::black_box(&short_value);
+    std::hint::black_box(&long_value);
+    report_measurement("parsed-short-description", short_measurement);
+    report_measurement("parsed-long-description", long_measurement);
+
+    assert_eq!(short_value.try_get_array_n_items().unwrap(), VALUE_COUNT);
+    assert_eq!(long_value.try_get_array_n_items().unwrap(), VALUE_COUNT);
+    let description_delta = long_measurement
+        .allocated_bytes
+        .saturating_sub(short_measurement.allocated_bytes);
+    assert!(
+        description_delta < long_description.len() * 4 + 4096,
+        "description payload scaled with parsed values: delta={description_delta}, long_template_bytes={}",
+        long_description.len()
+    );
+}
+
 #[test]
 fn direct_scalar_uses_at_most_two_allocations_without_a_single_owner_list() {
     const WIDE_ITEMS: usize = 128;
