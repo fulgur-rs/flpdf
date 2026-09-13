@@ -560,6 +560,19 @@ fn map_queued_output(
         })
 }
 
+/// Look up a queued output reference without snapshotting the whole live map.
+/// qpdf's `unparseChild` reads `Members::obj_renumber` directly while the
+/// queue remains live (`QPDFWriter.cc:1144-1157`); cloning both maps for every
+/// object makes the Rust writer's allocation traffic quadratic in queue size.
+fn live_queue_output_map(
+    queue: &RefCell<LiveQueue>,
+) -> impl Fn(ObjectRef) -> crate::Result<ObjectRef> + '_ {
+    move |object| {
+        let queue = queue.borrow();
+        map_queued_output(&queue.old_to_new, &queue.qdf_ignored_refs, object)
+    }
+}
+
 #[cfg(test)]
 fn planned_object_stream_groups(
     plan: &PlainWritePlan,
@@ -806,9 +819,7 @@ impl<'pdf, 'output, 'sink, R: Read + Seek + 'static> crate::writer::write_object
             .is_some_and(|source| self.content_container_refs.contains(&source))
         {
             self.enqueue_surviving_children(object)?;
-            let queued_map = self.queue.borrow().old_to_new.clone();
-            let ignored_refs = self.queue.borrow().qdf_ignored_refs.clone();
-            let static_map = |object_ref| map_queued_output(&queued_map, &ignored_refs, object_ref);
+            let static_map = live_queue_output_map(&self.queue);
             let output = self.output_number(object.object_ref().unwrap_or(ObjectRef::new(0, 0)))?;
             if let Some(emitter) = self.encrypted_strings.as_mut() {
                 emitter.write_handle_content_container_with_ref_map(
@@ -839,10 +850,7 @@ impl<'pdf, 'output, 'sink, R: Read + Seek + 'static> crate::writer::write_object
                     true,
                 )?; // cov:ignore: LLVM maps the covered root-copy call continuation to this line
                 self.enqueue_surviving_children(&root)?; // cov:ignore: LLVM maps the covered root-child discovery continuation to this line
-                let queued_map = self.queue.borrow().old_to_new.clone();
-                let ignored_refs = self.queue.borrow().qdf_ignored_refs.clone();
-                let static_map =
-                    |object_ref| map_queued_output(&queued_map, &ignored_refs, object_ref);
+                let static_map = live_queue_output_map(&self.queue);
                 let output =
                     self.output_number(object.object_ref().unwrap_or(ObjectRef::new(0, 0)))?; // cov:ignore: LLVM maps the covered root output-number continuation to this line
                 if let Some(emitter) = self.encrypted_strings.as_mut() {
@@ -963,9 +971,7 @@ impl<'pdf, 'output, 'sink, R: Read + Seek + 'static> crate::writer::write_object
                     })?), // cov:ignore: LLVM maps the covered stream-length conversion continuation to this line
                 )?; // cov:ignore: LLVM maps the covered stream dictionary replacement continuation to this line
             }
-            let queued_map = self.queue.borrow().old_to_new.clone();
-            let ignored_refs = self.queue.borrow().qdf_ignored_refs.clone();
-            let static_map = |object_ref| map_queued_output(&queued_map, &ignored_refs, object_ref);
+            let static_map = live_queue_output_map(&self.queue);
             if self.options.qdf {
                 let holder = self
                     .queue
@@ -1073,9 +1079,7 @@ impl<'pdf, 'output, 'sink, R: Read + Seek + 'static> crate::writer::write_object
             }
         } else if self.encrypted_strings.is_some() || self.options.qdf {
             self.enqueue_surviving_children(object)?;
-            let queued_map = self.queue.borrow().old_to_new.clone();
-            let ignored_refs = self.queue.borrow().qdf_ignored_refs.clone();
-            let static_map = |object_ref| map_queued_output(&queued_map, &ignored_refs, object_ref);
+            let static_map = live_queue_output_map(&self.queue);
             let output = self.output_number(object.object_ref().unwrap_or(ObjectRef::new(0, 0)))?;
             if let Some(emitter) = self.encrypted_strings.as_mut() {
                 if self.options.qdf {
@@ -1511,10 +1515,7 @@ impl<'pdf, 'output, 'sink, R: Read + Seek + 'static> LiveObjectEmitter<'pdf, 'ou
                     true,
                 )?; // cov:ignore: LLVM maps the covered QDF ObjStm root-copy continuation to this line
                 self.enqueue_surviving_children(&root)?; // cov:ignore: LLVM maps the covered QDF ObjStm root-child discovery continuation to this line
-                let queued_map = self.queue.borrow().old_to_new.clone();
-                let ignored_refs = self.queue.borrow().qdf_ignored_refs.clone();
-                let static_map =
-                    |object_ref| map_queued_output(&queued_map, &ignored_refs, object_ref);
+                let static_map = live_queue_output_map(&self.queue);
                 crate::writer::output::with_buffer_sink(out, |out| {
                     root.write_object_qdf_with_ref_map_and_removed(
                         out,
@@ -1524,10 +1525,7 @@ impl<'pdf, 'output, 'sink, R: Read + Seek + 'static> LiveObjectEmitter<'pdf, 'ou
                     )
                 }) // cov:ignore: LLVM maps the covered QDF ObjStm root serializer continuation to this line
             } else {
-                let queued_map = self.queue.borrow().old_to_new.clone();
-                let ignored_refs = self.queue.borrow().qdf_ignored_refs.clone();
-                let static_map =
-                    |object_ref| map_queued_output(&queued_map, &ignored_refs, object_ref);
+                let static_map = live_queue_output_map(&self.queue);
                 crate::writer::output::with_buffer_sink(out, |out| {
                     handle_to_write.write_object_qdf_with_ref_map_and_removed(
                         out,
