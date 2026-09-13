@@ -1323,6 +1323,28 @@ mod tests {
         .expect("open three-page fixture")
     }
 
+    fn direct_root_pdf() -> Pdf<Cursor<Vec<u8>>> {
+        Pdf::open_mem_owned(
+            include_bytes!("../../../../tests/fixtures/compat/direct-root-one-page.pdf").to_vec(),
+        )
+        .expect("open direct-root fixture")
+    }
+
+    fn direct_root_with_acroform_pdf() -> Pdf<Cursor<Vec<u8>>> {
+        let mut pdf = direct_root_pdf();
+        pdf.root_handle()
+            .expect("direct Catalog")
+            .replace_key(
+                b"/AcroForm",
+                ObjectHandle::dictionary(vec![(
+                    b"/NeedAppearances".to_vec(),
+                    ObjectHandle::boolean(true),
+                )]),
+            )
+            .expect("install direct AcroForm");
+        pdf
+    }
+
     fn acroform_pdf() -> Pdf<Cursor<Vec<u8>>> {
         Pdf::open_mem_owned(
             include_bytes!("../../../../tests/fixtures/compat/acroform-sig-widget.pdf").to_vec(),
@@ -1430,6 +1452,65 @@ mod tests {
             )
             .expect("multi-source page job");
         assert!(matches!(output, PageSpecJobOutput::Merged(_)));
+    }
+
+    #[test]
+    fn page_spec_job_accepts_a_direct_root_primary_with_a_secondary_source() {
+        let primary = direct_root_pdf();
+        let secondary = three_page_pdf();
+        let range = PageRange::parse_numrange("1").expect("one-page range");
+        let specs = [
+            PageSpecInput::new(0, range.clone()),
+            PageSpecInput::new(1, range),
+        ];
+        let mut sources = [primary, secondary];
+        let mut job = QPDFJob::new();
+
+        let mut merged = handle_page_specs_into(
+            &mut job,
+            &mut sources,
+            &specs,
+            None,
+            RemoveUnreferencedResources::Auto,
+            false,
+            Pdf::empty().expect("empty merge target"),
+        )
+        .expect("direct-root primary must not panic during page merge");
+        assert_eq!(crate::pages::page_refs(&mut merged).unwrap().len(), 2);
+    }
+
+    #[test]
+    fn page_spec_job_copies_catalog_values_from_a_direct_root_primary() {
+        let primary = direct_root_with_acroform_pdf();
+        let secondary = three_page_pdf();
+        let range = PageRange::parse_numrange("1").expect("one-page range");
+        let specs = [
+            PageSpecInput::new(0, range.clone()),
+            PageSpecInput::new(1, range),
+        ];
+        let mut sources = [primary, secondary];
+        let mut job = QPDFJob::new();
+
+        let mut merged = handle_page_specs_into(
+            &mut job,
+            &mut sources,
+            &specs,
+            None,
+            RemoveUnreferencedResources::Auto,
+            false,
+            Pdf::empty().expect("empty merge target"),
+        )
+        .expect("direct-root Catalog values must be copied");
+        let catalog = merged.root_handle().expect("merged Catalog");
+        let acroform = catalog.try_get_key(b"/AcroForm").expect("copied /AcroForm");
+        assert!(acroform.try_is_dictionary().unwrap());
+        assert_eq!(
+            acroform
+                .try_get_key(b"/NeedAppearances")
+                .unwrap()
+                .as_boolean(),
+            Some(true)
+        );
     }
 
     fn labelled_pdf() -> Pdf<Cursor<Vec<u8>>> {
