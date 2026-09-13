@@ -2164,9 +2164,10 @@ fn canonical_stream_filter_probe(
             handle,
             options,
             apply_full_rewrite_metadata_policy,
+            // cov:ignore-start: LLVM maps this covered multiline filter-plan continuation to the call opening line.
             normalize_content,
         )?
-    // cov:ignore: LLVM maps the covered canonical stream filter-plan continuation to the call opening line.
+    // cov:ignore-end
     else {
         return Ok(false);
     };
