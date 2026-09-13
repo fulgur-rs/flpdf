@@ -149,6 +149,8 @@ def measure(command, directory, name, timeout):
             try:
                 os.killpg(process.pid, signal.SIGKILL)
             except ProcessLookupError:
+                # The child already exited, so there is no process group left
+                # to signal and the interruption below is the only outcome.
                 pass
             try:
                 process.wait()
@@ -311,6 +313,13 @@ def benchmark_case(source, operation, binaries, args, out):
                              directory, f"{name}-{phase}-{index}", args.timeout)
             sample["validation"] = validate_sample(sample, operation, output, binaries["qpdf"],
                                                    source["pages"], source["family"], args.timeout)
+            # Validation already recorded the artifact's size and digest, so the
+            # bytes are no longer needed. Without this the fresh-path scheme
+            # above would retain one output per phase per tool -- 14 PDFs per
+            # case -- and large `qdf` / `streams-uncompress` outputs would
+            # dominate the run directory. A failed sample stays for diagnosis.
+            if sample["validation"]["ok"] and output.exists():
+                output.unlink()
             if phase == "first":
                 row["samples"][name][phase] = sample
             else:

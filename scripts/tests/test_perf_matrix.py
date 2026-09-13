@@ -234,6 +234,27 @@ class LiveContracts(unittest.TestCase):
             self.assertEqual(report["status"], "validation-failed")
             self.assertTrue(any(not case["validation"]["ok"] for case in report["cases"]))
 
+    def test_validated_phase_outputs_are_not_retained(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            out = root / "perf"
+            result = subprocess.run(
+                [sys.executable, str(SCRIPT), "--output", str(out),
+                 "--sizes", "2", "--stream-mib", "1",
+                 "--operations", "rewrite", "--runs", "2", "--warmups", "1",
+                 "--skip-qtest"],
+                capture_output=True, text=True)
+            self.assertEqual(result.returncode, 0, result.stderr)
+            report = json.loads((out / "results.json").read_text())
+            self.assertTrue(all(case["validation"]["ok"] for case in report["cases"]))
+            self.assertNotEqual(report["cases"], [])
+            # Each case runs four phases per tool. Keeping every artifact would
+            # leave those PDFs behind; validation already stored size and digest.
+            # Generated inputs live outside `cases/` and are still expected.
+            retained = sorted(str(path.relative_to(out))
+                              for path in (out / "cases").rglob("*.pdf"))
+            self.assertEqual(retained, [], "validated phase outputs were retained")
+
     def test_failed_validation_preserves_report_and_exits_nonzero(self):
         with tempfile.TemporaryDirectory() as tmp:
             out = Path(tmp) / "invalid"
