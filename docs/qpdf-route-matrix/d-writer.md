@@ -127,6 +127,14 @@ pinned qpdf 11.9.0 の `libqpdf/QPDFWriter.cc`（3044 行）/ `include/qpdf/QPDF
   `n_object_streams = (eligible+99)/100`、`n_per = eligible/n_object_streams`（割り切れなければ +1）、
   `n_per` 件ごとに `makeIndirectObject(newNull())` で **source QPDF 側に新規 null object を作り、
   その objid を container id とする**。`/Extends` は扱わない。出力番号はやはり D-1 の enqueue 時。
+- Preserve の source membership emission: `preserve_unreferenced_objects=true` の場合、
+  `QPDFWriter::preserveObjectStreams` は `getCompressibleObjGens()` の eligibility intersection を
+  適用せず、source ObjStm の `/Type /Sig` + `/ByteRange` + `/Contents` dictionary も
+  `writeObjectStream` でそのまま member として出力する（`libqpdf/QPDFWriter.cc:1939-1967,1621-1758`）。
+  signature の除外は通常の eligibility walk に限定する。`flpdf-lhzo` の
+  `cmp_diff_zero_tests::qdf_preserve_unreferenced_signature_objstm_matches_qpdf_11_9` が、
+  `--static-id --qdf --preserve-unreferenced` の status と bytes、および既解消済み2 fixtureを
+  qpdf 11.9.0 と比較する。
 - linearized: `QPDF::optimize`（`libqpdf/QPDF_optimization.cc:57-118`）が `/Outlines` の indirect 化、
   `pushInheritedAttributesToPage`、各 page / trailer key（`/Root` 以外）/ root key ごとに
   `updateObjectMaps` で `obj_user_to_objects` / `object_to_obj_users` を作り、

@@ -3085,14 +3085,20 @@ fn validate_objstm_member_bodies<R: Read + Seek>(
         for member in members {
             let member_handle = pdf.get_object_handle(member.source);
             member_handle.try_dereference()?;
-            let is_signature = object_streams::is_qpdf_signature_dict(&member_handle)?;
+            // qpdf applies the signature-dictionary exclusion only while
+            // computing the ordinary compressible eligibility set. Its
+            // `preserve-unreferenced` source-membership route deliberately
+            // skips that filter (`QPDFWriter.cc:1939-1967`) and emits the
+            // retained dictionary through `writeObjectStream`
+            // (`QPDFWriter.cc:1621-1758`). Validate only body shapes that the
+            // ObjStm format itself cannot represent here; reapplying the
+            // signature predicate would reject a qpdf-valid preserved member.
             let violation = planned_member_body_violation(
                 member.source,
                 member.output,
                 &member_handle,
                 &context,
-            )? // cov:ignore: trailing `)?` on a multi-line validation call — llvm-cov attributes the validated continuation to the Err path
-            .or(is_signature.then_some("signature dictionary"));
+            )?; // cov:ignore: trailing `)?` on a multi-line validation call — llvm-cov attributes the validated continuation to the Err path
             if let Some(kind) = violation {
                 return Err(crate::Error::Unsupported(format!(
                     "plain writer body invariant: source {} planned as ObjStm member {} \

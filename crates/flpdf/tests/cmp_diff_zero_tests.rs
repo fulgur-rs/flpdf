@@ -399,6 +399,64 @@ fn preserve_unreferenced_with_source_object_streams_matches_qpdf_11_9() {
     }
 }
 
+/// The QDF form of the source-backed Preserve route must admit the same
+/// signature dictionary that qpdf keeps when `preserve-unreferenced` disables
+/// the ordinary compressible-object eligibility filter.
+///
+/// Keep the two already-fixed damaged ObjStm fixtures in this exact-option
+/// comparison as regression controls. The signature fixture was the RED case
+/// for `flpdf-lhzo`: qpdf succeeded and emitted the member, while the old body
+/// validator rejected it before emission.
+#[test]
+fn qdf_preserve_unreferenced_signature_objstm_matches_qpdf_11_9() {
+    let Some(oracle) = pinned_qpdf() else {
+        eprintln!("[SKIP cmp_diff_zero_tests] qpdf 11.9.0 is unavailable");
+        return;
+    };
+    let directory = tempfile::tempdir().expect("tempdir");
+    for fixture in [
+        "null-visible-preserve-signature.pdf",
+        "null-visible-preserve-empty-removed.pdf",
+        "null-visible-stale-generation-objstm.pdf",
+    ] {
+        let input = Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("../../tests/fixtures/compat")
+            .join(fixture);
+        let expected_path = directory.path().join(format!("{fixture}.qpdf"));
+        let status = std::process::Command::new(oracle)
+            .args(["--static-id", "--qdf", "--preserve-unreferenced"])
+            .arg(&input)
+            .arg(&expected_path)
+            .status()
+            .expect("qpdf runs");
+        if fixture == "null-visible-preserve-signature.pdf" {
+            assert_eq!(
+                status.code(),
+                Some(0),
+                "{fixture}: qpdf signature rewrite must succeed without warnings"
+            );
+        }
+        assert!(
+            matches!(status.code(), Some(0 | 3)),
+            "{fixture}: qpdf --qdf --preserve-unreferenced must produce output, got {:?}",
+            status.code()
+        );
+
+        let actual = rewrite_qdf_preserve_unreferenced(fixture).unwrap_or_else(|error| {
+            panic!("{fixture}: flpdf --qdf --preserve-unreferenced must succeed like qpdf: {error}")
+        });
+        let expected = std::fs::read(&expected_path).expect("qpdf output");
+        if let Some(off) = first_diff(&actual, &expected) {
+            panic!(
+                "{fixture}: --qdf --preserve-unreferenced output diverged from qpdf 11.9.0 \
+                 (flpdf={} bytes, qpdf={} bytes, first diff at byte {off})",
+                actual.len(),
+                expected.len(),
+            );
+        }
+    }
+}
+
 /// qpdf's `QPDF_Stream::pipeStreamData` reads the parsed in-body payload even
 /// when the stream dictionary also carries the external-file keys `/F`,
 /// `/FFilter`, and `/FDecodeParms`; `QPDFWriter::unparseObject` preserves those
@@ -477,6 +535,27 @@ fn rewrite_qpdf_equivalent_preserve_unreferenced(fixture: &str) -> Vec<u8> {
     let mut out = Vec::new();
     write_with_settings(&mut pdf, &mut out, &opts).unwrap();
     out
+}
+
+fn rewrite_qdf_preserve_unreferenced(fixture: &str) -> flpdf::Result<Vec<u8>> {
+    let path = Path::new(env!("CARGO_MANIFEST_DIR"))
+        .join("../../tests/fixtures/compat")
+        .join(fixture);
+    let file = std::fs::File::open(&path).unwrap_or_else(|e| panic!("open {path:?}: {e}"));
+    let mut pdf = Pdf::open(std::io::BufReader::new(file))?;
+
+    let opts = WriterTestSettings {
+        object_streams: ObjectStreamMode::Preserve,
+        qdf: true,
+        static_id: true,
+        preserve_unreferenced_objects: true,
+        newline_before_endstream: flpdf::NewlineBeforeEndstream::Never,
+        ..WriterTestSettings::default()
+    };
+
+    let mut out = Vec::new();
+    write_with_settings(&mut pdf, &mut out, &opts)?;
+    Ok(out)
 }
 
 /// Preserve mode on a source with no object streams has nothing to preserve:
