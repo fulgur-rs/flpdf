@@ -1041,13 +1041,13 @@ fn enqueue(
 mod tests {
     use super::{
         collect_canonical_children, ensure_canonical_owner, walk_resurrectable_handle,
-        writer_local_raw_ref, ObjectStreamRenumber, ResurrectableWalkState,
+        writer_local_raw_ref, NewNumberLookup, ObjectStreamRenumber, ResurrectableWalkState,
     };
     use crate::parser::MAX_PARSE_DEPTH;
     use crate::qpdf_obj_gen::QpdfObjGen;
     use crate::writer::object_streams::ObjectStreamGroup;
     use crate::{Error, ObjectHandle, ObjectRef, Pdf};
-    use std::collections::BTreeSet;
+    use std::collections::{BTreeMap, BTreeSet};
     use std::io::Cursor;
 
     fn raw_stream_pdf() -> Vec<u8> {
@@ -1144,6 +1144,46 @@ mod tests {
         assert!(
             matches!(error, Error::Unsupported(message) if message.contains("source container") && message.contains("groups 0 and 1"))
         );
+    }
+
+    #[test]
+    fn generated_object_stream_renumber_uses_recorded_writer_order() {
+        let mut pdf = Pdf::empty().expect("create generated object-stream owner");
+        let source = pdf
+            .make_indirect_object_handle(ObjectHandle::null())
+            .expect("create generated source container")
+            .object_ref()
+            .unwrap();
+        let first = pdf
+            .make_indirect_object_handle(ObjectHandle::integer(1))
+            .expect("create first generated member")
+            .object_ref()
+            .unwrap();
+        let second = pdf
+            .make_indirect_object_handle(ObjectHandle::integer(2))
+            .expect("create second generated member")
+            .object_ref()
+            .unwrap();
+        let mut order = BTreeMap::new();
+        order.insert(
+            first,
+            crate::pdf::WriterObjectOrderKey::foreign(ObjectRef::new(2, 0)),
+        );
+        order.insert(
+            second,
+            crate::pdf::WriterObjectOrderKey::foreign(ObjectRef::new(1, 0)),
+        );
+        pdf.set_writer_object_order(order);
+        let groups = [ObjectStreamGroup::Generated {
+            source,
+            members: vec![first, second],
+        }];
+
+        let renumber =
+            ObjectStreamRenumber::build(&mut pdf, &groups, false, &BTreeSet::new(), true)
+                .expect("generated object-stream order must be accepted");
+        assert!(renumber.new_for_original(first).is_some());
+        assert!(renumber.new_for_original(second).is_some());
     }
 
     #[test]

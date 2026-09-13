@@ -412,7 +412,7 @@ fn sort_compressible_for_writer_order<R: Read + Seek + 'static>(
 ) {
     if pdf.writer_object_order.is_some() {
         eligible.sort_unstable_by_key(|object_ref| pdf.writer_object_order_key(*object_ref));
-    }
+    } // cov:ignore: generated_merge_members_use_primary_then_foreign_writer_order exercises this qpdf provenance sort; LLVM attributes the closure body to the condition line.
 }
 
 /// Order members of an existing source-backed ObjStm the way qpdf's
