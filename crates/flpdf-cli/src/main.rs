@@ -4105,55 +4105,45 @@ fn run_combined_top_level_inspection(
         job.logger().save_to_standard_output(true)?;
     }
 
-    if args.page_ops.empty {
-        reject_empty_inspection_output(args.input.as_deref())?;
-        let mut pdf = create_empty_primary_document(&mut job, None)?;
-        apply_top_level_inspection_transformations(
-            &mut job,
-            &mut pdf,
-            transform_options,
-            args.verbose,
-            args.remove_restrictions,
-            args.coalesce_contents,
-        )?;
-        return finish_check_job(job.inspect_configured(&mut pdf));
-    }
-
-    let input = args.input.as_ref().ok_or_else(missing_input_usage_error)?;
-    let file = File::open(input).map_err(|error| open_error_with_file(input, error.into()))?;
-    let mut options = pdf_open_options(args.repair, &args.password)?;
-    options.suppress_warnings = args.no_warn;
-    let mut pdf = if args.show_encryption {
-        job.open_for_encryption_inspection_with_description(
-            BufReader::new(file),
-            path_description(input),
-            options,
-        )
-    } else {
-        job.open_with_description(BufReader::new(file), path_description(input), options)
-    }
-    .map_err(|error| error_with_file(input, actionable_password_error(error)))?;
-
-    // qpdf's createQPDF catches a password error for --show-encryption,
-    // emits that report, and returns before handleTransformations or
-    // doInspection (`QPDFJob.cc:437-448`). Preserve that early boundary when
-    // this flag is combined with other inspection selectors.
-    if args.show_encryption && pdf.is_encrypted() && pdf.encryption_file_key().is_none() {
-        job.show_encryption(&mut pdf, args.password.password_is_hex_key)?;
-        job.record_document_warnings(&pdf);
-        job.complete(false)?;
-        return finish_job_exit_status(job.get_exit_code());
-    }
-
-    apply_top_level_inspection_transformations(
+    configure_top_level_inspection_transformations(
         &mut job,
-        &mut pdf,
         transform_options,
         args.verbose,
         args.remove_restrictions,
         args.coalesce_contents,
-    )?;
-    finish_check_job(job.inspect_configured(&mut pdf))
+    );
+
+    if args.page_ops.empty {
+        reject_empty_inspection_output(args.input.as_deref())?;
+        job.config().empty_input()?;
+    } else {
+        let input = args.input.as_ref().ok_or_else(missing_input_usage_error)?;
+        let input_options = pdf_open_options(args.repair, &args.password)?;
+        job.set_password(input_options.password);
+        job.set_password_mode(args.password.password_mode.into());
+        job.set_password_is_hex_key(args.password.password_is_hex_key);
+        job.set_suppress_password_recovery(args.password.suppress_password_recovery);
+        job.set_suppress_recovery(args.password.recovery.suppress_recovery);
+        job.set_ignore_xref_streams(args.password.recovery.ignore_xref_streams);
+        job.config().input_file(input.clone())?;
+    }
+
+    // qpdf applies rotations before underlay/overlay and both before the
+    // create-stage transformations (`QPDFJob.cc:466-473`). Queue the raw
+    // parameters on the same job so the inspection consumer observes the
+    // fully prepared document rather than a manually opened primary.
+    {
+        let mut configuration = job.config();
+        for parameter in &args.page_ops.rotate {
+            configuration.rotate(arg_parser::os_bytes(parameter.as_os_str()))?;
+        }
+    }
+
+    // `QPDFJob::run` owns primary/donor opening, create-stage ordering, and
+    // the final configured inspection completion. This is the same lifecycle
+    // used by rewrite and page-selection routes, including donor-specific
+    // open options and path-scoped errors.
+    finish_job_exit_status(job.run()?)
 }
 
 fn create_empty_primary_document(

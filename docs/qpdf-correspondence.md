@@ -2958,3 +2958,14 @@ and content normalization still use the old snapshot/restore helpers because
 their pre-emission planning boundary has not yet moved; `flpdf-ay5b` owns that
 remaining residual. D25 remains mixed until that root consumer migrates; the
 full helper-removal condition is not met here.
+
+### Top-level inspection overlay lifecycle (`flpdf-p4og4`)
+
+Top-level inspection commands that accept `--overlay`/`--underlay` now use the
+same `QPDFJob::createQPDF` → `writeQPDF` lifecycle as rewrite and page-selection
+jobs. This preserves qpdf's `handleRotations` → `handleUnderOverlay` →
+`handleTransformations` ordering (`libqpdf/QPDFJob.cc:466-473`), applies the
+job's password and recovery policy to every donor (`libqpdf/QPDFJob.cc:1818-1845`),
+and keeps donor path attribution at the job error boundary. The CLI regression
+cases compare rotation, segment password mode, and donor-password failure
+against qpdf 11.9.0.

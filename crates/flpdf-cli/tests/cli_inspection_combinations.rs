@@ -393,3 +393,92 @@ fn check_accepts_overlay_before_inspection_like_qpdf() {
     ];
     assert_matches_qpdf_exact(&args);
 }
+
+#[test]
+fn overlay_inspection_applies_rotation_before_the_consumer() {
+    if !qpdf_available() {
+        return;
+    }
+
+    let input = concat!(
+        env!("CARGO_MANIFEST_DIR"),
+        "/../../tests/fixtures/compat/three-page.pdf"
+    );
+    let overlay = concat!(
+        env!("CARGO_MANIFEST_DIR"),
+        "/../../tests/fixtures/compat/one-page.pdf"
+    );
+    let args = vec![
+        input.to_owned(),
+        "--rotate=90:1".to_owned(),
+        "--overlay".to_owned(),
+        overlay.to_owned(),
+        "--".to_owned(),
+        "--show-object=3".to_owned(),
+    ];
+    assert_matches_qpdf_exact(&args);
+}
+
+#[test]
+fn overlay_inspection_uses_segment_password_options_for_the_donor() {
+    if !qpdf_available() {
+        return;
+    }
+
+    let input = concat!(
+        env!("CARGO_MANIFEST_DIR"),
+        "/../../tests/fixtures/compat/three-page.pdf"
+    );
+    let overlay = concat!(
+        env!("CARGO_MANIFEST_DIR"),
+        "/../../tests/fixtures/compat/one-page-enc-u.pdf"
+    );
+    let args = vec![
+        "--password-mode=hex-bytes".to_owned(),
+        input.to_owned(),
+        "--overlay".to_owned(),
+        overlay.to_owned(),
+        "--password=75".to_owned(),
+        "--".to_owned(),
+        "--show-npages".to_owned(),
+    ];
+    assert_matches_qpdf_exact(&args);
+}
+
+#[test]
+fn overlay_inspection_attributes_donor_open_errors_to_the_donor_path() {
+    if !qpdf_available() {
+        return;
+    }
+
+    let input = concat!(
+        env!("CARGO_MANIFEST_DIR"),
+        "/../../tests/fixtures/compat/three-page.pdf"
+    );
+    let overlay = concat!(
+        env!("CARGO_MANIFEST_DIR"),
+        "/../../tests/fixtures/compat/encrypted-r4-three-page.pdf"
+    );
+    let args = vec![
+        input.to_owned(),
+        "--overlay".to_owned(),
+        overlay.to_owned(),
+        "--password=wrong".to_owned(),
+        "--".to_owned(),
+        "--show-npages".to_owned(),
+    ];
+    assert_matches_qpdf_exact(&args);
+}
+
+#[test]
+fn empty_primary_combined_inspection_uses_the_job_lifecycle() {
+    if !qpdf_available() {
+        return;
+    }
+
+    assert_matches_qpdf_exact(&[
+        "--empty".to_owned(),
+        "--check".to_owned(),
+        "--show-pages".to_owned(),
+    ]);
+}
