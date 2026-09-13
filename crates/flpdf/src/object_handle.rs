@@ -20031,6 +20031,44 @@ pub(crate) mod warning_emission_tests {
     }
 
     #[test]
+    fn parser_values_share_one_description_template_owner() {
+        let parsed = ObjectHandle::parse_with_description(
+            b"[1 [2] << /K 3 >>]",
+            "shared template",
+        )
+        .unwrap();
+        let scalar = parsed.try_get_array_item(0).unwrap();
+        let nested_scalar = parsed
+            .try_get_array_item(1)
+            .unwrap()
+            .try_get_array_item(0)
+            .unwrap();
+        let dictionary_value = parsed
+            .try_get_array_item(2)
+            .unwrap()
+            .try_get_key(b"/K")
+            .unwrap();
+
+        let first = scalar.description_template_owner().unwrap();
+        let second = nested_scalar.description_template_owner().unwrap();
+        let third = dictionary_value.description_template_owner().unwrap();
+        assert!(Rc::ptr_eq(&first, &second));
+        assert!(Rc::ptr_eq(&first, &third));
+        assert_eq!(
+            scalar.description(),
+            b"parsed object, shared template at offset 1"
+        );
+        assert_eq!(
+            nested_scalar.description(),
+            b"parsed object, shared template at offset 4"
+        );
+        assert_eq!(
+            dictionary_value.description(),
+            b"parsed object, shared template at offset 13"
+        );
+    }
+
+    #[test]
     fn object_description_template_placeholders_and_offset_shifts() {
         let dict = ObjectHandle::dictionary(vec![]);
         dict.set_description("object $OG at offset $PO", 100);
