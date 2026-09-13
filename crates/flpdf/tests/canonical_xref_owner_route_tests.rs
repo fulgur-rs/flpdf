@@ -50,9 +50,11 @@ fn pdf_teardown_has_one_canonical_disconnect_owner() {
     // added earlier in the file would silently satisfy `clear < walk` and the
     // ordering contract would stop being tested.
     assert_eq!(
-        resolver.matches("core.source_xref_entries.clear()").count(),
+        resolver
+            .matches("core.raw_source_xref_entries.clear()")
+            .count(),
         1,
-        "the xref-table clear must stay a single production site"
+        "the raw xref-table clear must stay a single production site"
     );
     assert_eq!(
         resolver.matches("core.object_cache.values()").count(),
@@ -60,7 +62,7 @@ fn pdf_teardown_has_one_canonical_disconnect_owner() {
         "the object-cache walk must stay a single production site"
     );
     let clear = resolver
-        .find("core.source_xref_entries.clear()")
+        .find("core.raw_source_xref_entries.clear()")
         .expect("teardown clears the canonical xref table");
     let walk = resolver
         .find("core.object_cache.values()")
