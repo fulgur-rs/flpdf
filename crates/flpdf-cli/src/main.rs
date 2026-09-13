@@ -4837,9 +4837,9 @@ fn run_command(command: Commands, overlay_specs: &[OverlaySpec]) -> CliResult<()
                 // run_rewrite_with_page_ops) already accept and apply it via
                 // `image_transform_options`, mirroring
                 // the top-level --pages/--rotate/--split-pages routes.
-                if cmd.remove_restrictions || cmd.decrypt || cmd.copy_encryption.is_some() {
+                if cmd.decrypt || cmd.copy_encryption.is_some() {
                     emit_logger_error(
-                        "flpdf: --remove-restrictions / --decrypt / \
+                        "flpdf: --decrypt / \
                          --copy-encryption are \
                          not applied in the --pages/--rotate/--split-pages/\
                          --collate pipeline; rerun without them or without \
@@ -4876,6 +4876,7 @@ fn run_command(command: Commands, overlay_specs: &[OverlaySpec]) -> CliResult<()
                         &cmd.page_ops,
                         overlay_specs,
                         remove_unref,
+                        cmd.remove_restrictions,
                         options,
                         cmd.linearize,
                         None,
@@ -4898,6 +4899,7 @@ fn run_command(command: Commands, overlay_specs: &[OverlaySpec]) -> CliResult<()
                         &cmd.page_ops,
                         overlay_specs,
                         remove_unref,
+                        cmd.remove_restrictions,
                         options,
                         cmd.linearize,
                         None,
@@ -4919,6 +4921,7 @@ fn run_command(command: Commands, overlay_specs: &[OverlaySpec]) -> CliResult<()
                         None,
                         &cmd.page_ops,
                         remove_unref,
+                        cmd.remove_restrictions,
                         options,
                         cmd.linearize,
                         None,
@@ -7355,6 +7358,7 @@ fn run_page_extraction(
     page_ops: &PageOpArgs,
     overlay_specs: &[OverlaySpec],
     remove_unref: CliRemoveUnreferencedResources,
+    remove_restrictions: bool,
     options: WriterOptions,
     linearize: bool,
     linearize_pass1: Option<&Path>,
@@ -7463,6 +7467,7 @@ fn run_page_extraction(
                 page_ops,
                 overlay_specs,
                 remove_unref,
+                remove_restrictions,
                 options,
                 linearize,
                 linearize_pass1,
@@ -7486,6 +7491,7 @@ fn run_page_extraction(
                 page_ops,
                 overlay_specs,
                 remove_unref,
+                remove_restrictions,
                 options,
                 linearize,
                 linearize_pass1,
@@ -7516,6 +7522,7 @@ fn run_page_extraction(
             page_ops,
             overlay_specs,
             remove_unref,
+            remove_restrictions,
             options,
             linearize,
             linearize_pass1,
@@ -7541,6 +7548,7 @@ fn run_page_extraction(
         page_ops,
         overlay_specs,
         remove_unref,
+        remove_restrictions,
         options,
         linearize,
         linearize_pass1,
@@ -7573,6 +7581,7 @@ fn run_empty_page_extraction(
     page_ops: &PageOpArgs,
     overlay_specs: &[OverlaySpec],
     remove_unref: CliRemoveUnreferencedResources,
+    remove_restrictions: bool,
     options: WriterOptions,
     linearize: bool,
     linearize_pass1: Option<&Path>,
@@ -7690,6 +7699,7 @@ fn run_empty_page_extraction(
         page_ops,
         overlay_specs,
         remove_unref,
+        remove_restrictions,
         options,
         linearize,
         linearize_pass1,
@@ -7727,6 +7737,7 @@ fn run_page_extraction_from_multiple_sources(
     page_ops: &PageOpArgs,
     overlay_specs: &[OverlaySpec],
     remove_unref: CliRemoveUnreferencedResources,
+    remove_restrictions: bool,
     options: WriterOptions,
     linearize: bool,
     linearize_pass1: Option<&Path>,
@@ -7879,6 +7890,7 @@ fn run_page_extraction_from_multiple_sources(
         // preflight; the post-copy completion boundary itself remains a
         // no-op for resource pruning.
         remove_unref,
+        remove_restrictions,
         options,
         linearize,
         linearize_pass1,
@@ -7909,6 +7921,7 @@ fn run_page_extraction_from_single_source<R: Read + Seek + 'static>(
     page_ops: &PageOpArgs,
     overlay_specs: &[OverlaySpec],
     remove_unref: CliRemoveUnreferencedResources,
+    remove_restrictions: bool,
     options: WriterOptions,
     linearize: bool,
     linearize_pass1: Option<&Path>,
@@ -7981,6 +7994,7 @@ fn run_page_extraction_from_single_source<R: Read + Seek + 'static>(
                 page_ops,
                 overlay_specs,
                 remove_unref,
+                remove_restrictions,
                 options,
                 linearize,
                 linearize_pass1,
@@ -8030,6 +8044,7 @@ fn run_page_extraction_from_single_source<R: Read + Seek + 'static>(
                 // later doSplitPages preflight; post-copy completion remains
                 // a no-op for resource pruning.
                 remove_unref,
+                remove_restrictions,
                 options,
                 linearize,
                 linearize_pass1,
@@ -8062,6 +8077,7 @@ fn run_page_extraction_after_plan<R: Read + Seek + 'static>(
     page_ops: &PageOpArgs,
     overlay_specs: &[OverlaySpec],
     remove_unref: CliRemoveUnreferencedResources,
+    remove_restrictions: bool,
     options: WriterOptions,
     linearize: bool,
     linearize_pass1: Option<&Path>,
@@ -8177,7 +8193,8 @@ fn run_page_extraction_after_plan<R: Read + Seek + 'static>(
     // `handleTransformations` option through the canonical Job transformation
     // owner so the same AcroForm/page-helper boundary is used for `--pages` as
     // for ordinary rewrites (`QPDFJob.cc:466-473,2177-2194`).
-    if coalesce_contents
+    if remove_restrictions
+        || coalesce_contents
         || generate_appearances
         || flatten_annotations_mode.is_some()
         || flatten_rotation
@@ -8186,6 +8203,9 @@ fn run_page_extraction_after_plan<R: Read + Seek + 'static>(
         transform_job.set_verbose(verbose);
         {
             let mut configuration = transform_job.config();
+            if remove_restrictions {
+                configuration.remove_restrictions();
+            }
             if generate_appearances {
                 configuration.generate_appearances();
             }
@@ -8370,6 +8390,7 @@ fn run_rewrite_with_page_ops(
     update_from_json: Option<&Path>,
     page_ops: &PageOpArgs,
     remove_unref: CliRemoveUnreferencedResources,
+    remove_restrictions: bool,
     options: WriterOptions,
     linearize: bool,
     linearize_pass1: Option<&Path>,
@@ -8403,7 +8424,7 @@ fn run_rewrite_with_page_ops(
         update_from_json,
         linearize,
         linearize_pass1,
-        false,
+        remove_restrictions,
         false,
         options.content_normalization,
         coalesce_contents,
