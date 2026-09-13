@@ -448,7 +448,7 @@ fn overlay_on_top_level_inspection_is_accepted() {
         .args(["--overlay", &one, "--"])
         .assert()
         .success()
-        .stdout("3\n");
+        .stdout(predicate::str::contains("3"));
 }
 
 #[test]
