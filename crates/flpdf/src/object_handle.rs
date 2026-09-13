@@ -11528,6 +11528,13 @@ mod resolution_state_tests {
     }
 
     #[test]
+    fn shared_value_state_has_no_unused_counter() {
+        let source = include_str!("object_handle.rs");
+        let field_name = ["mutation", "_generation"].concat();
+        assert!(!source.contains(&field_name));
+    }
+
+    #[test]
     fn direct_handle_is_always_resolved() {
         // A direct handle has no resolution state to wait on — its value was
         // known at construction time.
