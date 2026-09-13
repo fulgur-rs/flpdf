@@ -144,6 +144,103 @@ fn json_input_inspection_modes_match_qpdf_11_9() {
 }
 
 #[test]
+fn json_input_show_pages_applies_coalesce_contents_like_qpdf() {
+    if skip_if_qpdf_missing() {
+        return;
+    }
+
+    let temp = tempfile::tempdir().unwrap();
+    let input = temp.path().join("multi-content.json");
+    fs::write(
+        &input,
+        r#"{
+  "qpdf": [
+    {
+      "jsonversion": 2,
+      "pdfversion": "1.3",
+      "calledgetallpages": true,
+      "pushedinheritedpageresources": true
+    },
+    {
+      "obj:1 0 R": {"value": {"/Pages": "2 0 R", "/Type": "/Catalog"}},
+      "obj:2 0 R": {"value": {"/Count": 1, "/Kids": ["3 0 R"], "/Type": "/Pages"}},
+      "obj:3 0 R": {
+        "value": {
+          "/Contents": ["4 0 R", "5 0 R"],
+          "/MediaBox": [0, 0, 612, 792],
+          "/Parent": "2 0 R",
+          "/Resources": {},
+          "/Type": "/Page"
+        }
+      },
+      "obj:4 0 R": {"stream": {"dict": {}, "data": "QSA="}},
+      "obj:5 0 R": {"stream": {"dict": {}, "data": "UQo="}},
+      "trailer": {"value": {"/Root": "1 0 R", "/Size": 6}}
+    }
+  ]
+}"#,
+    )
+    .unwrap();
+
+    let args = ["--json-input", "--show-pages", "--coalesce-contents"];
+    let qpdf = ShellCommand::new("qpdf")
+        .args(args)
+        .arg(&input)
+        .output()
+        .unwrap();
+    let flpdf = ShellCommand::new(assert_cmd::cargo_bin!("flpdf"))
+        .env("FLPDF_PROGNAME", "qpdf")
+        .args(args)
+        .arg(&input)
+        .output()
+        .unwrap();
+
+    assert!(qpdf.status.success(), "qpdf failed: {qpdf:?}");
+    assert_eq!(flpdf.status.code(), qpdf.status.code());
+    assert_eq!(flpdf.stdout, qpdf.stdout);
+    assert_eq!(flpdf.stderr, qpdf.stderr);
+    assert_eq!(qpdf.stdout, b"page 1: 3 0 R\n  content:\n    6 0 R\n");
+}
+
+#[test]
+fn update_from_json_show_pages_applies_coalesce_contents_like_qpdf() {
+    if skip_if_qpdf_missing() {
+        return;
+    }
+
+    let temp = tempfile::tempdir().unwrap();
+    let update = temp.path().join("no-op-update.json");
+    fs::write(
+        &update,
+        r#"{
+  "qpdf": [
+    {"jsonversion": 2},
+    {}
+  ]
+}"#,
+    )
+    .unwrap();
+
+    let update_arg = format!("--update-from-json={}", update.display());
+    let input = "../../tests/fixtures/compat/multi-contents-one-page.pdf";
+    let qpdf = ShellCommand::new("qpdf")
+        .args([&update_arg, "--show-pages", "--coalesce-contents", input])
+        .output()
+        .unwrap();
+    let flpdf = ShellCommand::new(assert_cmd::cargo_bin!("flpdf"))
+        .env("FLPDF_PROGNAME", "qpdf")
+        .args([&update_arg, "--show-pages", "--coalesce-contents", input])
+        .output()
+        .unwrap();
+
+    assert!(qpdf.status.success(), "qpdf failed: {qpdf:?}");
+    assert_eq!(flpdf.status.code(), qpdf.status.code());
+    assert_eq!(flpdf.stdout, qpdf.stdout);
+    assert_eq!(flpdf.stderr, qpdf.stderr);
+    assert_eq!(qpdf.stdout, b"page 1: 4 0 R\n  content:\n    7 0 R\n");
+}
+
+#[test]
 fn update_from_json_check_matches_qpdf_11_9() {
     if skip_if_qpdf_missing() {
         return;
