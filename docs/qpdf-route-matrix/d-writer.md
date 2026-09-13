@@ -486,6 +486,7 @@ specialized coordinator 内部（`4a2faf5c` の状態）:
 | `D25` | `flpdf-3yn9.48.60` | root unparseObjectへADBE出力処理を移しsnapshot/restoreを撤去する |
 | `D14` | `flpdf-nhet` | `getTrimmedTrailer` の xref-structural key と source trailer key の境界を揃え、`/F`・`/FFilter`・`/FDecodeParms` の到達性・late numbering を保持する |
 | `D14` | `flpdf-53t8k` | specialized standard live の body 後 trailer walk に `/Root` 前後の late indirect-reference numbering を接続する |
+| `D1` / `D2` / `D3` | `flpdf-pphb7` | plain writer の outer dispatch と内部 consumer選択を `PlainRoute` の挙動分類へ集約し、text-slice route contractを撤去する |
 | `D25` | `flpdf-mcjj` | PCLm の direct `/Root` では qpdf の `is_root` 判定を満たさないため ADBE reconciliation を適用しない |
 | `D26` | `flpdf-3yn9.48.61` | initializeSpecialStreamsのpage/content/normalized mapをsetupで一度生成する |
 | `D16` / `D1` | `flpdf-3yn9.48.62` | encryption設定・doWriteSetupを単一writer stateに揃える |
@@ -647,3 +648,25 @@ mixed/bridge 解消を意味しない。
 PCLm regression test で、source `/1.4`・level 5 が保持されることを固定する。
 これは direct-root semantics の bounded fixであり、PCLm と writer 全体の parity
 完了を意味しない。
+
+## 2026-09-13: plain route behavior classification (`flpdf-pphb7`)
+
+`PlainRoute` は qpdf の plain consumer境界を `QdfOrNormalizeLive`、
+`LiveDisableShaped`、`Planned`、`OutsidePlain` の入力分類として持つ。
+`writer.rs` の outer dispatch と `writer/plain/mod.rs::write_plain` は同じ
+`classify_plain_route` を使い、QDF/normalization、Disable/Preserve live、
+planned object-stream packing、specialized/legacy 外部 route の判定を二重に
+保持しない。qpdf は QDF/normalization の mode dispatch と object-stream setupを
+独立に扱う（`libqpdf/QPDFWriter.cc:2038-2140`）ため、この抽出は出力 semanticsを
+変えず、既存の consumerを分類結果へ接続するだけである。
+
+入力組み合わせの unit behavior tests は Disable／Preserve（source membershipの
+有無を含む）、QDF、Generate、extra header、encrypted input、requested/effective
+mode不一致を直接判定する。これにより Preserveを外す、source membership条件を
+後置する、QDF条件を落とす、outer dispatchだけを変える mutationを、production
+source textの切り出し範囲に依存せず検出する。`plain_live_queue_route_tests.rs`
+からは当該 route-selection text checksを削除し、D9 source-membership ownerの
+qpdf correspondence checkと実出力のADBE regressionだけを残した。
+
+これは route classification／testability の bounded sliceであり、各 consumerの
+qpdf parityや route matrix 全体の mixed/bridge 解消を意味しない。
