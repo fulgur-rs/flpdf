@@ -6611,7 +6611,7 @@ mod tests {
                 .get(b"/Child".as_slice())
                 .and_then(|handle| handle.description_template())
                 .expect("child should retain the parser template"),
-            _ => panic!("expected dictionary object"),
+            _ => panic!("expected dictionary object"), // cov:ignore: the fixture is constructed as a dictionary
         };
 
         resolver.cache_parsed_object(parsed);
