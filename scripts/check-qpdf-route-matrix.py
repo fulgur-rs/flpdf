@@ -346,13 +346,26 @@ class Checker:
                 if next_line.strip().startswith("|")
                 else []
             )
-            if len(cells) != classification_width or (
+            # Only a proven header boundary ends the table: a header row is
+            # followed by a Markdown separator. A width mismatch without that
+            # boundary is a malformed data row, and silently ending the table
+            # there would understate the count exactly like the prose reset
+            # this check replaced.
+            if (
                 next_cells
                 and is_markdown_separator(next_cells)
                 and "classification" not in lowered
             ):
                 classification_column = None
                 classification_width = None
+                continue
+            if len(cells) != classification_width:
+                self.report.error(
+                    doc,
+                    line_number,
+                    f"classification row has {len(cells)} cell(s), "
+                    f"expected {classification_width}",
+                )
                 continue
             self.report.rows += classification_row_weight(cells)
             if classification_column >= len(cells):

@@ -308,6 +308,25 @@ class CheckQpdfRouteMatrixTests(unittest.TestCase):
             self.assertNotIn("tracked-symbols.txt:2:", result.stdout)
             self.assertNotIn("tracked-symbols.txt:3:", result.stdout)
 
+    def test_malformed_row_width_is_error_not_a_silent_table_end(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary_directory:
+            repo = SyntheticRepository(Path(temporary_directory))
+            repo.write(
+                "a.md",
+                HEADER
+                + "| 1 | x | `libqpdf/QPDF.cc:1` | y | z | canonical | w | - | extra |\n"
+                "| 2 | x | `libqpdf/QPDF.cc:1` | y | z | bogus | w | - |\n",
+            )
+            result = repo.check()
+            self.assertNotEqual(0, result.returncode, result.stdout + result.stderr)
+            self.assertIn("a.md:3:", result.stdout)
+            self.assertIn("classification row has 9 cell(s), expected 8", result.stdout)
+            # The table must keep going: the row after the malformed one is
+            # still validated, so a stray pipe cannot silently drop the rest
+            # of the table from both the count and the classification check.
+            self.assertIn("a.md:4:", result.stdout)
+            self.assertIn("classification `bogus` is not one of", result.stdout)
+
     def test_missing_matrix_directory_is_error(self) -> None:
         with tempfile.TemporaryDirectory() as temporary_directory:
             repo = SyntheticRepository(Path(temporary_directory))
