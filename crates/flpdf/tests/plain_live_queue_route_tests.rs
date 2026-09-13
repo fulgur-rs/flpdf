@@ -59,6 +59,20 @@ fn preserve_without_source_objstm_selects_the_disable_shaped_live_consumer() {
         shaped.contains("ObjectStreamMode::Preserve"),
         "Preserve must be part of the Disable-shaped live condition"
     );
+    // Pin the complete guard, not just its return. Asserting only the branch
+    // body would still pass if a conjunct were added that routes empty-map
+    // Preserve to the planner instead, which is the regression this contract
+    // exists to catch.
+    let guard = write_plain
+        .split_once("\n    if is_live_disable_shaped")
+        .and_then(|(_, rest)| rest.split_once(" {\n"))
+        .map(|(condition, _)| condition.trim())
+        .expect("is_live_disable_shaped guard");
+    assert_eq!(
+        guard, "&& !options.qdf && !options.content_normalization",
+        "the Disable-shaped guard must split only on QDF/normalization; any \
+         further condition would drop a Preserve case from the live consumer"
+    );
     let branch = write_plain
         .split_once("if is_live_disable_shaped")
         .and_then(|(_, rest)| rest.split_once("\n    }"))

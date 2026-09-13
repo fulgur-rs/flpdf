@@ -599,32 +599,18 @@ fn preserve_with_no_source_object_streams_matches_disable_byte_for_byte() {
 /// comparison against a shared golden.
 #[test]
 fn preserve_no_source_objstm_xref_stream_matches_qpdf_11_9() {
-    let Some(oracle) = pinned_qpdf() else {
-        eprintln!("[SKIP cmp_diff_zero_tests] qpdf 11.9.0 is unavailable");
-        return;
-    };
     let fixture = "preserve-no-source-objstm-xref.pdf";
-    let input = Path::new(env!("CARGO_MANIFEST_DIR"))
-        .join("../../tests/fixtures/compat")
-        .join(fixture);
-    let directory = tempfile::tempdir().expect("tempdir");
-    let expected_path = directory.path().join("qpdf.pdf");
-    let status = std::process::Command::new(oracle)
-        .args(["--static-id", "--object-streams=preserve"])
-        .arg(&input)
-        .arg(&expected_path)
-        .status()
-        .expect("qpdf runs");
-    assert_eq!(status.code(), Some(0), "qpdf preserve rewrite must succeed");
 
+    // The local mode and output-form assertions do not need the oracle, so
+    // they run everywhere. Only the byte comparison against qpdf is gated;
+    // otherwise an environment without the pinned binary would silently stop
+    // checking that a source xref stream is not carried into the rewrite.
     let preserve = rewrite_qpdf_equivalent_mode(fixture, ObjectStreamMode::Preserve);
     let disable = rewrite_qpdf_equivalent_mode(fixture, ObjectStreamMode::Disable);
-    let expected = std::fs::read(&expected_path).expect("qpdf output");
     assert_eq!(
         preserve, disable,
         "empty source membership must produce the Disable-equivalent bytes"
     );
-    assert_eq!(preserve, expected, "Preserve output must match qpdf 11.9.0");
     assert!(
         preserve
             .windows(b"xref\n".len())
@@ -637,6 +623,25 @@ fn preserve_no_source_objstm_xref_stream_matches_qpdf_11_9() {
             .any(|window| window == b"/Type /XRef"),
         "the source xref stream must not be carried into the rewritten output"
     );
+
+    let Some(oracle) = pinned_qpdf() else {
+        eprintln!("[SKIP cmp_diff_zero_tests] qpdf 11.9.0 is unavailable for the byte comparison");
+        return;
+    };
+    let input = Path::new(env!("CARGO_MANIFEST_DIR"))
+        .join("../../tests/fixtures/compat")
+        .join(fixture);
+    let directory = tempfile::tempdir().expect("tempdir");
+    let expected_path = directory.path().join("qpdf.pdf");
+    let status = std::process::Command::new(oracle)
+        .args(["--static-id", "--object-streams=preserve"])
+        .arg(&input)
+        .arg(&expected_path)
+        .status()
+        .expect("qpdf runs");
+    assert_eq!(status.code(), Some(0), "qpdf preserve rewrite must succeed");
+    let expected = std::fs::read(&expected_path).expect("qpdf output");
+    assert_eq!(preserve, expected, "Preserve output must match qpdf 11.9.0");
 }
 
 #[test]
