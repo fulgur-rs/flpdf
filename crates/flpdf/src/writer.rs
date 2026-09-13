@@ -3798,65 +3798,6 @@ fn emit_canonical_pdf_inner<R: Read + Seek>(
             "encrypt and copy_encryption are mutually exclusive".to_string(),
         ));
     }
-    let plain_route = plain::classify_plain_route(
-        pdf.is_encrypted(),
-        options,
-        requested_object_streams,
-        &source_object_stream_data,
-    );
-    let qdf_or_normalize_live = matches!(plain_route, plain::PlainRoute::QdfOrNormalizeLive);
-    // The live body already owns encryption-aware object and stream emission.
-    // Extend the QDF/normalize live boundary to the indirect-Root encrypted
-    // cohort, while keeping direct-Root trailer serialization, source-backed
-    // Preserve containers, and generated ObjStm packing on their existing
-    // planned consumers.
-    let encrypted_qdf_or_normalize_live = (options.qdf || options.content_normalization)
-        && pdf.root_ref().is_some()
-        && !options.pclm
-        && (encryption_parameters.is_some()
-            || (pdf.is_encrypted()
-                && options.encrypt.is_none()
-                && options.copy_encryption.is_none()))
-        && matches!(
-            options.object_streams,
-            ObjectStreamMode::Disable | ObjectStreamMode::Preserve
-        )
-        && (options.object_streams == ObjectStreamMode::Disable
-            || source_object_stream_data.is_empty());
-    let qdf_or_normalize_generate_live = options.object_streams == ObjectStreamMode::Generate
-        && (options.qdf || options.content_normalization)
-        && !pdf.is_encrypted()
-        && options.encrypt.is_none()
-        && options.copy_encryption.is_none()
-        && !options.pclm;
-    let specialized_standard_live = matches!(plain_route, plain::PlainRoute::OutsidePlain)
-        && !qdf_or_normalize_live
-        && !encrypted_qdf_or_normalize_live
-        && !options.pclm;
-    let specialized_standard_live = specialized_standard_live
-        && ((!options.qdf && !options.content_normalization) || qdf_or_normalize_generate_live);
-    if specialized_standard_live || encrypted_qdf_or_normalize_live {
-        let (page_sequences, contents_sequences, content_container_sequences) =
-            if encrypted_qdf_or_normalize_live || qdf_or_normalize_generate_live {
-                plain::live_page_context(pdf, special_streams)?
-            } else {
-                (BTreeMap::new(), BTreeMap::new(), BTreeMap::new())
-            };
-        return emit_specialized_standard_live_with_page_context(
-            pdf,
-            out,
-            options,
-            generated_id.as_ref(),
-            encryption_parameters,
-            &source_object_stream_data,
-            generated_compressible.as_ref(),
-            &generated_object_stream_sources,
-            options.qdf,
-            page_sequences,
-            contents_sequences,
-            content_container_sequences,
-        );
-    }
     if options.pclm {
         return write_pclm(pdf, out, options, special_streams);
     }

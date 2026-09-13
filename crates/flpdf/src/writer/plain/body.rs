@@ -1,5 +1,5 @@
 //! qpdf correspondence: QPDFWriter.cc plain object-body emission split from planning and xref output.
-use std::cell::RefCell;
+use std::cell::{Cell, RefCell};
 use std::collections::{BTreeMap, BTreeSet, VecDeque};
 use std::io::{Read, Seek};
 use std::rc::Rc;
@@ -462,7 +462,7 @@ fn emit_live_body<R: Read + Seek + 'static>(
         page_sequences,
         contents_sequences,
         current_stream_length: None,
-        two_pass_object_streams: !options.qdf && !object_streams.is_empty(),
+        two_pass_object_streams: !object_streams.is_empty(),
     };
     loop {
         let source = emitter.queue.borrow_mut().pop();
@@ -1193,6 +1193,7 @@ impl<'pdf, 'output, 'sink, R: Read + Seek + 'static> LiveObjectEmitter<'pdf, 'ou
     ) -> crate::Result<()> {
         if decrement {
             crate::writer::decrement_progress_event(self.options)?;
+            crate::writer::report_progress_event(self.options)?;
         }
         if report_before {
             crate::writer::report_progress_event(self.options)?;
@@ -1446,6 +1447,7 @@ impl<'pdf, 'output, 'sink, R: Read + Seek + 'static> LiveObjectEmitter<'pdf, 'ou
 
         let root_source = self.root_source;
         let removed_refs = self.removed_refs.clone();
+        let first_pass = Cell::new(true);
         let mut marker_starts = Vec::with_capacity(handles.len());
         let mut marker_lengths = Vec::with_capacity(handles.len());
         let body_writer = &mut |out: &mut Vec<u8>,
@@ -1476,10 +1478,19 @@ impl<'pdf, 'output, 'sink, R: Read + Seek + 'static> LiveObjectEmitter<'pdf, 'ou
                 }
             } // cov:ignore: LLVM maps the covered QDF ObjStm original-ID branch exit to this line
             out.push(b'\n');
-            marker_starts.push(marker_start);
-            marker_lengths.push(out.len() - marker_start);
+            if first_pass.get() {
+                marker_starts.push(marker_start);
+                marker_lengths.push(out.len() - marker_start);
+            }
             if let Some(sequence) = self.page_sequences.get(&source_member) {
                 out.extend_from_slice(format!("%% Page {sequence}\n").as_bytes());
+            }
+
+            if first_pass.get() {
+                crate::writer::decrement_progress_event(self.options)?;
+                crate::writer::report_progress_event(self.options)?;
+            } else {
+                crate::writer::report_progress_event(self.options)?;
             }
 
             handle.try_dereference()?;
@@ -1526,11 +1537,11 @@ impl<'pdf, 'output, 'sink, R: Read + Seek + 'static> LiveObjectEmitter<'pdf, 'ou
                     )
                 }) // cov:ignore: LLVM maps the covered QDF ObjStm member serializer continuation to this line
             };
-            if result.is_ok() {
-                crate::writer::report_progress_event(self.options)?; // cov:ignore: qpdf's QDF ObjStm member progress event is exercised by the live QDF test; LLVM attributes this call to the callback merge.
-            } // cov:ignore: LLVM attributes the covered QDF member progress branch to the callback body.
             result
         };
+        let _ =
+            object_streams::emit_objstm_body_from_handles_with_writer_qdf(&handles, body_writer)?; // cov:ignore: LLVM maps the covered QDF ObjStm body-emitter continuation to this line
+        first_pass.set(false);
         let body =
             object_streams::emit_objstm_body_from_handles_with_writer_qdf(&handles, body_writer)?; // cov:ignore: LLVM maps the covered QDF ObjStm body-emitter continuation to this line
         let first_marker_len = marker_lengths.first().copied().ok_or_else(|| {
