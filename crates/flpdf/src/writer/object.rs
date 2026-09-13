@@ -1285,15 +1285,17 @@ impl ObjectWriterEmission for ObjectHandle {
                     .iter()
                     .map(|(k, v)| (k.clone(), v.clone()))
                     .collect(),
-                Some(ObjectValue::Stream { stream_dict, .. }) => {
-                    stream_dict.try_dereference()?;
-                    stream_dict.with_value(|dict_value| match dict_value {
-                        Some(ObjectValue::Dictionary(entries)) => entries
-                            .iter()
-                            .map(|(k, v)| (k.clone(), v.clone()))
-                            .collect(),
-                        _ => Vec::new(),
-                    })
+                Some(ObjectValue::Stream(stream)) => {
+                    stream.stream_dict.try_dereference()?;
+                    stream
+                        .stream_dict
+                        .with_value(|dict_value| match dict_value {
+                            Some(ObjectValue::Dictionary(entries)) => entries
+                                .iter()
+                                .map(|(k, v)| (k.clone(), v.clone()))
+                                .collect(),
+                            _ => Vec::new(),
+                        })
                 }
                 _ => Vec::new(),
             };
@@ -1877,7 +1879,7 @@ fn stream_dictionary_entries_for_emission(
     }
 
     let Some(stream_dict) = handle.with_value(|value| match value {
-        Some(ObjectValue::Stream { stream_dict, .. }) => Some(stream_dict.clone()),
+        Some(ObjectValue::Stream(stream)) => Some(stream.stream_dict.clone()),
         _ => None,
     }) else {
         return Ok(Vec::new());
@@ -2483,9 +2485,7 @@ fn snapshot_unparse_container(value: &ObjectValue) -> Option<UnparseContainer> {
                 .map(|(key, value)| (key.clone(), value.clone()))
                 .collect(),
         )),
-        ObjectValue::Stream { stream_dict, .. } => {
-            Some(UnparseContainer::Stream(stream_dict.clone()))
-        }
+        ObjectValue::Stream(stream) => Some(UnparseContainer::Stream(stream.stream_dict.clone())),
         _ => None,
     }
 }
@@ -2588,7 +2588,7 @@ pub(crate) fn unparse_object_value(value: &ObjectValue, out: &mut OutputSink<'_>
                 .collect();
             unparse_dict_entries(&entries, out)?;
         }
-        ObjectValue::Stream { stream_dict, .. } => {
+        ObjectValue::Stream(stream) => {
             // Reachable two ways, not just one: a *direct* Stream value (no
             // qpdf counterpart -- a real QPDFObjectHandle's resolved value
             // is never itself a stream outside an indirect object), and an
@@ -2611,7 +2611,7 @@ pub(crate) fn unparse_object_value(value: &ObjectValue, out: &mut OutputSink<'_>
             // scoped responsibility -- this generic dispatch does not
             // implement qpdf's real
             // stream-writing path for the indirect case either.
-            unparse_object_walk(stream_dict, out)?;
+            unparse_object_walk(&stream.stream_dict, out)?;
             // cov:ignore-end
         }
     }
@@ -2739,8 +2739,8 @@ fn unparse_object_value_with_ref_map(
                 .collect();
             unparse_dict_entries_with_ref_map(&entries, out, map, removed_refs)?;
         }
-        ObjectValue::Stream { stream_dict, .. } => {
-            unparse_object_walk_with_ref_map(stream_dict, out, map, removed_refs)?;
+        ObjectValue::Stream(stream) => {
+            unparse_object_walk_with_ref_map(&stream.stream_dict, out, map, removed_refs)?;
             // cov:ignore-end
         }
         _ => unparse_object_value(value, out)?,
@@ -3633,7 +3633,7 @@ fn unparse_object_value_qdf(
                 .collect();
             unparse_dict_entries_qdf(&entries, indent, out)?;
         }
-        ObjectValue::Stream { stream_dict, .. } => {
+        ObjectValue::Stream(stream) => {
             // Same reachability and "inlines only the dictionary" caveat as
             // `unparse_object_value`'s own `Stream` arm (see its doc) --
             // but note that arm's doc names `write_stream_body` (the
@@ -3649,7 +3649,7 @@ fn unparse_object_value_qdf(
             // `Stream` arm calls `stream.dict.write_pdf_qdf(out, indent)` at
             // the unincremented indent before appending its
             // `stream`/`endstream` framing.
-            unparse_object_walk_qdf(stream_dict, indent, out)?;
+            unparse_object_walk_qdf(&stream.stream_dict, indent, out)?;
             // cov:ignore-end
         }
         // Every remaining scalar variant has no QDF-specific

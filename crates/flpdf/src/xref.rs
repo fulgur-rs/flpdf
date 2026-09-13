@@ -27,6 +27,8 @@
 //! enter the canonical cache as a speculative xref read before
 //! `reconstruct_xref` chooses the effective occurrence
 //! (`libqpdf/QPDF.cc:450-469,516-531`).
+#[cfg(test)]
+use crate::object_handle::StreamValue;
 use crate::object_handle::{DocumentResolver, ObjectValue};
 use crate::parser::{
     parse_qpdf_direct_object_handle_with_diagnostics,
@@ -1804,22 +1806,12 @@ fn detach_bootstrap_handle(source: &ObjectHandle) -> Result<ObjectHandle> {
                 .map(|(key, child)| Ok((key, detach_bootstrap_handle(&child)?)))
                 .collect::<Result<BTreeMap<_, _>>>()?,
         ),
-        ObjectValue::Stream {
-            stream_dict,
-            stream_data,
-            stream_provider,
-            filter_on_write,
-            stream_length,
-            ..
-        } => ObjectValue::Stream {
-            stream_dict: detach_bootstrap_handle(&stream_dict)?,
-            stream_data,
-            stream_provider,
-            filter_on_write,
-            stream_length,
-            stream_token_filters: Default::default(),
-            content_normalization_applied: false,
-        },
+        ObjectValue::Stream(mut stream) => {
+            stream.stream_dict = detach_bootstrap_handle(&stream.stream_dict)?;
+            stream.stream_token_filters = Default::default();
+            stream.content_normalization_applied = false;
+            ObjectValue::Stream(stream)
+        }
         other => other,
     };
     Ok(ObjectHandle::from_value(value))
@@ -6016,7 +6008,7 @@ mod final_handle_tests {
             Rc::clone(&state),
         );
         let stream = document.handle_for_reference(ObjectRef::new(4, 0));
-        stream.set_resolved(ObjectValue::Stream {
+        stream.set_resolved(ObjectValue::Stream(Box::new(StreamValue {
             stream_dict: ObjectHandle::dictionary(vec![
                 (b"/Type".to_vec(), ObjectHandle::name(b"ObjStm".to_vec())),
                 (b"/N".to_vec(), ObjectHandle::integer(1)),
@@ -6036,7 +6028,7 @@ mod final_handle_tests {
             stream_token_filters: Default::default(),
             content_normalization_applied: false,
             stream_length: decoded.len(),
-        });
+        })));
         stream.set_parsed_offset_if_unset(90);
 
         document
@@ -6075,7 +6067,7 @@ mod final_handle_tests {
             Rc::clone(&state),
         );
         let stream = document.handle_for_reference(ObjectRef::new(4, 0));
-        stream.set_resolved(ObjectValue::Stream {
+        stream.set_resolved(ObjectValue::Stream(Box::new(StreamValue {
             stream_dict: ObjectHandle::dictionary(vec![(
                 b"/Filter".to_vec(),
                 ObjectHandle::integer(1),
@@ -6086,7 +6078,7 @@ mod final_handle_tests {
             stream_token_filters: Default::default(),
             content_normalization_applied: false,
             stream_length: 1,
-        });
+        })));
 
         let error = stream
             .get_stream_data(DecodeLevel::Specialized)
@@ -6479,7 +6471,7 @@ mod final_handle_tests {
             .document
             .read_uncompressed_object(first_ref, 0)
             .expect("the fallback window must recover a valid stream");
-        let ObjectValue::Stream { stream_data, .. } = value else {
+        let ObjectValue::Stream(stream) = value else {
             panic!("expected a recovered stream, got {value:?}"); // cov:ignore: the preceding expect already guarantees a Stream value from this fixture
         };
         // The narrow window truncates before `endstream`, which
@@ -6488,7 +6480,7 @@ mod final_handle_tests {
         // check alone would pass even if the retry never widened the
         // window. Assert the full 27-byte payload was actually recovered.
         assert_eq!(
-            stream_data.as_deref().map(Vec::len),
+            stream.stream_data.as_deref().map(Vec::len),
             Some(stream_length),
             "the fallback window must recover the stream's real content, not an empty placeholder"
         );
@@ -6711,11 +6703,11 @@ mod final_handle_tests {
             .document
             .read_uncompressed_object(first_ref, 0)
             .expect("the fallback window must recover a valid stream");
-        let ObjectValue::Stream { stream_data, .. } = value else {
+        let ObjectValue::Stream(stream) = value else {
             panic!("expected a recovered stream, got {value:?}"); // cov:ignore: the preceding expect already guarantees a Stream value from this fixture
         };
         assert_eq!(
-            stream_data.as_deref().map(Vec::len),
+            stream.stream_data.as_deref().map(Vec::len),
             Some(payload.len()),
             "a narrow window's false, non-empty terminator match must not be \
              accepted over the wider window's real declared-length boundary"
@@ -6819,7 +6811,7 @@ mod final_handle_tests {
             .document
             .read_uncompressed_object(object_ref, 0)
             .expect("a missing /Length recovers through the endstream scan");
-        assert!(matches!(value, ObjectValue::Stream { .. }));
+        assert!(matches!(value, ObjectValue::Stream(_)));
 
         let mut collected = Diagnostics::default();
         context.append_diagnostics_to(&mut collected);
@@ -9724,7 +9716,7 @@ mod final_handle_tests {
         drop(state);
         drop(cache);
 
-        let stream = ObjectHandle::from_value(ObjectValue::Stream {
+        let stream = ObjectHandle::from_value(ObjectValue::Stream(Box::new(StreamValue {
             stream_dict: ObjectHandle::dictionary(vec![(
                 b"/Length".to_vec(),
                 ObjectHandle::integer(0),
@@ -9735,7 +9727,7 @@ mod final_handle_tests {
             stream_token_filters: Default::default(),
             content_normalization_applied: false,
             stream_length: 0,
-        });
+        })));
         let detached = detach_bootstrap_handle(&stream).expect("stream detaches");
         assert!(detached.get_filter_on_write().expect("stream flag"));
         assert_eq!(

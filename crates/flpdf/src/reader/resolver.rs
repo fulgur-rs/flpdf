@@ -86,7 +86,9 @@
 
 use crate::encryption::crypt_filters::interpret_cf_from_handle;
 use crate::encryption::state::{EncryptionMode, EncryptionState};
-use crate::object_handle::{DocumentResolver, ObjectValue, StreamDataProvider, NO_PARSED_OFFSET};
+use crate::object_handle::{
+    DocumentResolver, ObjectValue, StreamDataProvider, StreamValue, NO_PARSED_OFFSET,
+};
 use crate::parser::{
     parse_live_file_object_with_decrypter, parse_object_handle_with_context,
     parse_qpdf_direct_object_handle_with_diagnostics, trailing_data_error, LiveInput,
@@ -1012,7 +1014,7 @@ impl<R: Read + Seek> ResolverHandle<R> {
     /// generation-zero identity; keeping the allocation and registration here
     /// lets `ObjectHandle::copy_stream` use the same path as `Pdf::new_stream`.
     pub(crate) fn new_stream_handle(&self) -> Result<ObjectHandle> {
-        let stream = self.direct_object_handle(ObjectValue::Stream {
+        let stream = self.direct_object_handle(ObjectValue::Stream(Box::new(StreamValue {
             stream_dict: ObjectHandle::dictionary(Vec::new()),
             stream_data: None,
             stream_length: 0,
@@ -1020,7 +1022,7 @@ impl<R: Read + Seek> ResolverHandle<R> {
             filter_on_write: true,
             stream_token_filters: Default::default(),
             content_normalization_applied: false,
-        });
+        })));
         stream.set_parsed_offset_if_unset(0);
         self.make_indirect_from_object_handle(stream)
     }
@@ -3971,7 +3973,7 @@ impl<R: Read + Seek> ResolverHandle<R> {
             dict.set_description(dict_description, dict_offset);
         }
         Ok((
-            ObjectValue::Stream {
+            ObjectValue::Stream(Box::new(StreamValue {
                 stream_dict: dict,
                 stream_data: None,
                 stream_length: length,
@@ -3979,7 +3981,7 @@ impl<R: Read + Seek> ResolverHandle<R> {
                 filter_on_write: true,
                 stream_token_filters: Default::default(),
                 content_normalization_applied: false,
-            },
+            })),
             i64::try_from(stream_offset).unwrap_or(i64::MAX),
         ))
     }
@@ -5418,7 +5420,7 @@ mod tests {
     use super::CLOSED_INPUT_SOURCE_ERROR;
     use super::REENTRANT_PARSE_ERROR;
     use crate::encryption::state::{EncryptionMode, EncryptionState};
-    use crate::object_handle::{DocumentResolver, ObjectValue, NO_PARSED_OFFSET};
+    use crate::object_handle::{DocumentResolver, ObjectValue, StreamValue, NO_PARSED_OFFSET};
     use crate::qpdf_obj_gen::QpdfObjGen;
     use crate::{
         Diagnostics, Error, ObjectHandle, ObjectRef, Pdf, QpdfErrorCode, QpdfExc, XrefEntry,
@@ -5738,7 +5740,7 @@ mod tests {
     fn foreign_copy_stream_requires_an_owning_source_resolver() {
         let resolver = bare_resolver();
         let destination = resolver.new_stream_handle().expect("destination stream");
-        let source = ObjectHandle::from_value(ObjectValue::Stream {
+        let source = ObjectHandle::from_value(ObjectValue::Stream(Box::new(StreamValue {
             stream_dict: ObjectHandle::dictionary(Vec::new()),
             stream_data: None,
             stream_provider: None,
@@ -5746,7 +5748,7 @@ mod tests {
             stream_token_filters: Default::default(),
             content_normalization_applied: false,
             stream_length: 0,
-        });
+        })));
 
         let error = resolver
             .copy_stream_data(&destination, &source)
@@ -5759,7 +5761,7 @@ mod tests {
     fn foreign_original_stream_provider_reports_invalid_source_shapes() {
         let resolver = bare_resolver();
         let destination_dict = ObjectHandle::dictionary(Vec::new());
-        let direct_stream = ObjectHandle::from_value(ObjectValue::Stream {
+        let direct_stream = ObjectHandle::from_value(ObjectValue::Stream(Box::new(StreamValue {
             stream_dict: destination_dict.clone(),
             stream_data: None,
             stream_provider: None,
@@ -5767,7 +5769,7 @@ mod tests {
             stream_token_filters: Default::default(),
             content_normalization_applied: false,
             stream_length: 0,
-        });
+        })));
         let error = resolver
             .original_stream_data_provider(&direct_stream, &destination_dict)
             .expect_err("a direct stream has no source object identity");
@@ -5836,15 +5838,16 @@ mod tests {
             ResolverWarningOptions::new(crate::QPDFLogger::create(), true, b"source.pdf".to_vec()),
             0,
         );
-        let source_stream = source.direct_object_handle(ObjectValue::Stream {
-            stream_dict: ObjectHandle::dictionary(Vec::new()),
-            stream_data: None,
-            stream_length: declared_length,
-            stream_provider: None,
-            filter_on_write: true,
-            stream_token_filters: Default::default(),
-            content_normalization_applied: false,
-        });
+        let source_stream =
+            source.direct_object_handle(ObjectValue::Stream(Box::new(StreamValue {
+                stream_dict: ObjectHandle::dictionary(Vec::new()),
+                stream_data: None,
+                stream_length: declared_length,
+                stream_provider: None,
+                filter_on_write: true,
+                stream_token_filters: Default::default(),
+                content_normalization_applied: false,
+            })));
         source_stream.set_parsed_offset_if_unset(parsed_offset);
         let source_stream = source
             .make_indirect_from_object_handle(source_stream)
@@ -9206,7 +9209,7 @@ mod tests {
             .set_last_qpdf_obj_gen_description(QpdfObjGen::new(1, 0), None);
         pdf.resolver
             .get_object_handle(stream_ref)
-            .set_resolved(ObjectValue::Stream {
+            .set_resolved(ObjectValue::Stream(Box::new(StreamValue {
                 stream_dict: ObjectHandle::dictionary(vec![(
                     b"/Type".to_vec(),
                     ObjectHandle::name(b"NotObjStm".to_vec()),
@@ -9217,7 +9220,7 @@ mod tests {
                 stream_token_filters: Default::default(),
                 content_normalization_applied: false,
                 stream_length: 0,
-            });
+            })));
 
         let member = pdf.get_object_handle(member_ref);
         member
@@ -9420,7 +9423,7 @@ mod tests {
         );
         resolver
             .get_object_handle(stream_ref)
-            .set_resolved(ObjectValue::Stream {
+            .set_resolved(ObjectValue::Stream(Box::new(StreamValue {
                 stream_dict,
                 stream_data: Some(Rc::new(stream_data)),
                 stream_length: 0,
@@ -9428,7 +9431,7 @@ mod tests {
                 filter_on_write: true,
                 stream_token_filters: Default::default(),
                 content_normalization_applied: false,
-            });
+            })));
 
         let member = resolver.get_object_handle(member_ref);
         member
@@ -9523,7 +9526,7 @@ mod tests {
         );
         resolver
             .get_object_handle(stream_ref)
-            .set_resolved(ObjectValue::Stream {
+            .set_resolved(ObjectValue::Stream(Box::new(StreamValue {
                 stream_dict,
                 stream_data: Some(Rc::new(stream_data)),
                 stream_length: 0,
@@ -9531,7 +9534,7 @@ mod tests {
                 filter_on_write: true,
                 stream_token_filters: Default::default(),
                 content_normalization_applied: false,
-            });
+            })));
 
         resolver
             .get_object_handle(member_ref)
@@ -9599,7 +9602,7 @@ mod tests {
         );
         resolver
             .get_object_handle(stream_ref)
-            .set_resolved(ObjectValue::Stream {
+            .set_resolved(ObjectValue::Stream(Box::new(StreamValue {
                 stream_dict,
                 stream_data: Some(Rc::new(stream_data)),
                 stream_length: 0,
@@ -9607,7 +9610,7 @@ mod tests {
                 filter_on_write: true,
                 stream_token_filters: Default::default(),
                 content_normalization_applied: false,
-            });
+            })));
 
         resolver
             .get_object_handle(member_ref)
@@ -9666,7 +9669,7 @@ mod tests {
         );
         resolver
             .get_object_handle(stream_ref)
-            .set_resolved(ObjectValue::Stream {
+            .set_resolved(ObjectValue::Stream(Box::new(StreamValue {
                 stream_dict,
                 stream_data: Some(Rc::new(stream_data)),
                 stream_length: 0,
@@ -9674,7 +9677,7 @@ mod tests {
                 filter_on_write: true,
                 stream_token_filters: Default::default(),
                 content_normalization_applied: false,
-            });
+            })));
 
         let member = resolver.get_object_handle(member_ref);
         member
@@ -9727,7 +9730,7 @@ mod tests {
             0,
         );
         let stream = resolver.get_object_handle(stream_ref);
-        stream.set_resolved(ObjectValue::Stream {
+        stream.set_resolved(ObjectValue::Stream(Box::new(StreamValue {
             stream_dict,
             stream_data: None,
             stream_length: stream_data.len(),
@@ -9735,7 +9738,7 @@ mod tests {
             filter_on_write: true,
             stream_token_filters: Default::default(),
             content_normalization_applied: false,
-        });
+        })));
         stream.set_parsed_offset_if_unset(1);
 
         let member = resolver.get_object_handle(member_ref);
@@ -9791,7 +9794,7 @@ mod tests {
         );
         resolver
             .get_object_handle(stream_ref)
-            .set_resolved(ObjectValue::Stream {
+            .set_resolved(ObjectValue::Stream(Box::new(StreamValue {
                 stream_dict,
                 stream_data: None,
                 stream_length: 0,
@@ -9799,7 +9802,7 @@ mod tests {
                 filter_on_write: true,
                 stream_token_filters: Default::default(),
                 content_normalization_applied: false,
-            });
+            })));
 
         let member = resolver.get_object_handle(member_ref);
         member
@@ -9850,7 +9853,7 @@ mod tests {
         );
         resolver
             .get_object_handle(stream_ref)
-            .set_resolved(ObjectValue::Stream {
+            .set_resolved(ObjectValue::Stream(Box::new(StreamValue {
                 stream_dict,
                 stream_data: Some(Rc::new(stream_data)),
                 stream_length: 0,
@@ -9858,7 +9861,7 @@ mod tests {
                 filter_on_write: true,
                 stream_token_filters: Default::default(),
                 content_normalization_applied: false,
-            });
+            })));
 
         resolver
             .get_object_handle(member_ref)
@@ -9919,7 +9922,7 @@ mod tests {
         );
         resolver
             .get_object_handle(stream_ref)
-            .set_resolved(ObjectValue::Stream {
+            .set_resolved(ObjectValue::Stream(Box::new(StreamValue {
                 stream_dict,
                 stream_data: Some(Rc::new(stream_data)),
                 stream_length: 0,
@@ -9927,7 +9930,7 @@ mod tests {
                 filter_on_write: true,
                 stream_token_filters: Default::default(),
                 content_normalization_applied: false,
-            });
+            })));
 
         let member = resolver.get_object_handle(member_ref);
         member
@@ -10013,7 +10016,7 @@ mod tests {
         );
         resolver
             .get_object_handle(stream_ref)
-            .set_resolved(ObjectValue::Stream {
+            .set_resolved(ObjectValue::Stream(Box::new(StreamValue {
                 stream_dict,
                 stream_data: Some(Rc::new(stream_data)),
                 stream_length: 0,
@@ -10021,7 +10024,7 @@ mod tests {
                 filter_on_write: true,
                 stream_token_filters: Default::default(),
                 content_normalization_applied: false,
-            });
+            })));
 
         resolver
             .get_object_handle(member_ref)
@@ -10064,7 +10067,7 @@ mod tests {
         );
         resolver
             .get_object_handle(stream_ref)
-            .set_resolved(ObjectValue::Stream {
+            .set_resolved(ObjectValue::Stream(Box::new(StreamValue {
                 stream_dict,
                 stream_data: Some(Rc::new(stream_data)),
                 stream_length: 0,
@@ -10072,7 +10075,7 @@ mod tests {
                 filter_on_write: true,
                 stream_token_filters: Default::default(),
                 content_normalization_applied: false,
-            });
+            })));
 
         resolver
             .get_object_handle(member_ref)
@@ -10128,7 +10131,7 @@ mod tests {
         );
         resolver
             .get_object_handle(stream_ref)
-            .set_resolved(ObjectValue::Stream {
+            .set_resolved(ObjectValue::Stream(Box::new(StreamValue {
                 stream_dict,
                 stream_data: Some(Rc::new(stream_data)),
                 stream_length: 0,
@@ -10136,7 +10139,7 @@ mod tests {
                 filter_on_write: true,
                 stream_token_filters: Default::default(),
                 content_normalization_applied: false,
-            });
+            })));
 
         resolver
             .get_object_handle(member_ref)
@@ -10250,7 +10253,7 @@ mod tests {
         );
         resolver
             .get_object_handle(stream_ref)
-            .set_resolved(ObjectValue::Stream {
+            .set_resolved(ObjectValue::Stream(Box::new(StreamValue {
                 stream_dict,
                 stream_data: Some(Rc::new(stream_data)),
                 stream_length: 0,
@@ -10258,7 +10261,7 @@ mod tests {
                 filter_on_write: true,
                 stream_token_filters: Default::default(),
                 content_normalization_applied: false,
-            });
+            })));
 
         let requested = resolver.get_object_handle(requested_ref);
         requested
@@ -10318,7 +10321,7 @@ mod tests {
         );
         resolver
             .get_object_handle(stream_ref)
-            .set_resolved(ObjectValue::Stream {
+            .set_resolved(ObjectValue::Stream(Box::new(StreamValue {
                 stream_dict,
                 stream_data: Some(Rc::new(stream_data)),
                 stream_length: 0,
@@ -10326,7 +10329,7 @@ mod tests {
                 filter_on_write: true,
                 stream_token_filters: Default::default(),
                 content_normalization_applied: false,
-            });
+            })));
 
         resolver
             .get_object_handle(member_ref)
@@ -10381,7 +10384,7 @@ mod tests {
         );
         resolver
             .get_object_handle(stream_ref)
-            .set_resolved(ObjectValue::Stream {
+            .set_resolved(ObjectValue::Stream(Box::new(StreamValue {
                 stream_dict,
                 stream_data: Some(Rc::new(stream_data)),
                 stream_length: 0,
@@ -10389,7 +10392,7 @@ mod tests {
                 filter_on_write: true,
                 stream_token_filters: Default::default(),
                 content_normalization_applied: false,
-            });
+            })));
 
         let member = resolver.get_object_handle(member_ref);
         member
@@ -10609,7 +10612,7 @@ mod tests {
         );
         resolver
             .get_object_handle(stream_ref)
-            .set_resolved(ObjectValue::Stream {
+            .set_resolved(ObjectValue::Stream(Box::new(StreamValue {
                 stream_dict,
                 stream_data: Some(Rc::new(stream_data)),
                 stream_length: 0,
@@ -10617,7 +10620,7 @@ mod tests {
                 filter_on_write: true,
                 stream_token_filters: Default::default(),
                 content_normalization_applied: false,
-            });
+            })));
 
         resolver
             .get_object_handle(member_ref)
@@ -10767,7 +10770,7 @@ mod tests {
         );
         *resolver.encryption_parameters().borrow_mut() = Some(encryption);
         let stream = resolver.get_object_handle(stream_ref);
-        stream.set_resolved(ObjectValue::Stream {
+        stream.set_resolved(ObjectValue::Stream(Box::new(StreamValue {
             stream_dict,
             stream_data: None,
             stream_length: ciphertext.len(),
@@ -10775,7 +10778,7 @@ mod tests {
             filter_on_write: true,
             stream_token_filters: Default::default(),
             content_normalization_applied: false,
-        });
+        })));
         stream.set_parsed_offset_if_unset(1);
 
         let member = resolver.get_object_handle(member_ref);
@@ -11318,7 +11321,7 @@ mod tests {
         // `QPDF::Pipe::pipeStreamData`'s false result when a later caller has
         // a length exceeding the input, rather than mistaking it for an eager
         // parse-time failure or rereading /Length from the dictionary.
-        stream.set_resolved(ObjectValue::Stream {
+        stream.set_resolved(ObjectValue::Stream(Box::new(StreamValue {
             stream_dict,
             stream_data: None,
             stream_length: 1_000,
@@ -11326,7 +11329,7 @@ mod tests {
             filter_on_write: true,
             stream_token_filters: Default::default(),
             content_normalization_applied: false,
-        });
+        })));
 
         let error = stream
             .get_raw_stream_data()

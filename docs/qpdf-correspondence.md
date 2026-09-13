@@ -295,6 +295,12 @@ qpdf 11.9.0 と full-byte 比較し、container-before-plain の part4 順序を
 
 ## 1. オブジェクトモデル
 
+`QPDF_Stream` の stream-local fields (`libqpdf/qpdf/QPDF_Stream.hh:101-107`) は
+共通の `QPDFValue` subclass payload ではないため、flpdf の `StreamValue` として
+`ObjectValue::Stream(Box<StreamValue>)` に分離する。これにより scalar と
+container の共通 enum layout は stream subclass の 56-byte shape を inline
+で保持せず、stream value だけがその payload allocation を負担する。
+
 | qpdf | 行 | flpdf | 状態 |
 |---|---|---|---|
 | `QPDFObjectHandle::makeResourcesIndirect` | `include/qpdf/QPDFObjectHandle.hh:789-793`; `libqpdf/QPDFObjectHandle.cc:1042-1060` | `object_handle.rs::make_resources_indirect` + `acroform_document_helper.rs::prepare_foreign_resource_plan` | ✅ direct second-level resource values are promoted in place through the canonical resolver before `mergeResources`; category dictionaries are not promoted and the walk is non-recursive. Tests cover direct/indirect categories, already-indirect values, non-dictionary top-level entries, alias identity, and the foreign AcroForm caller |

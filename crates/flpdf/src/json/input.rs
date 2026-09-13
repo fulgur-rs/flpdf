@@ -25,7 +25,7 @@ use std::rc::Rc;
 use super::value::format_qpdf_real;
 use super::{Json, Reactor};
 use crate::filespec_helper::qpdf_style_open_error;
-use crate::object_handle::{DocumentResolver, ObjectValue, StreamDataProvider};
+use crate::object_handle::{DocumentResolver, ObjectValue, StreamDataProvider, StreamValue};
 use crate::pipeline::{Base64Action, Pipeline, PlBase64};
 use crate::qutil::{qpdf_string_to_int_checked, QpdfIntParse};
 use crate::{Error, ObjectHandle, ObjectRef, Pdf, Result};
@@ -611,15 +611,17 @@ where
             .pdf
             .resolver
             .direct_object_handle(ObjectValue::Dictionary(BTreeMap::new()));
-        self.pdf.resolver.direct_object_handle(ObjectValue::Stream {
-            stream_dict: dictionary,
-            stream_data: None,
-            stream_length: 0,
-            stream_provider: None,
-            filter_on_write: true,
-            stream_token_filters: Default::default(),
-            content_normalization_applied: false,
-        })
+        self.pdf
+            .resolver
+            .direct_object_handle(ObjectValue::Stream(Box::new(StreamValue {
+                stream_dict: dictionary,
+                stream_data: None,
+                stream_length: 0,
+                stream_provider: None,
+                filter_on_write: true,
+                stream_token_filters: Default::default(),
+                content_normalization_applied: false,
+            })))
     }
 
     fn make_object(&mut self, value: &Json) -> ObjectHandle {

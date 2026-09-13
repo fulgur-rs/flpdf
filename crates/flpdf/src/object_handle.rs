@@ -53,7 +53,9 @@
 //! qpdf keeps the token-filter list on `QPDF_Stream`, not on the common
 //! `QPDFValue` base (`libqpdf/qpdf/QPDF_Stream.hh:101-107`). [`ObjectValue::Stream`]
 //! mirrors that boundary: its stream-local filters and the flpdf-only
-//! normalization marker move with the shared stream value. qpdf also stores
+//! normalization marker move with the shared stream value, which is boxed as
+//! `ObjectValue::Stream(Box<StreamValue>)` so scalar/container values do not
+//! carry the concrete stream subclass layout. qpdf also stores
 //! `QPDFValue::Description` through an optional `std::shared_ptr` rather than
 //! embedding its largest variant (`libqpdf/qpdf/QPDFValue.hh:29-58,60-82,
 //! 141-144`); [`SharedValueState::description`] keeps the common template
@@ -1426,7 +1428,7 @@ fn expand_description_template(
         .map(|object_ref| format!("{} {}", object_ref.number, object_ref.generation).into_bytes())
         .unwrap_or_default();
     let shift = match state {
-        ObjectValue::Dictionary(_) | ObjectValue::Stream { .. } => 2,
+        ObjectValue::Dictionary(_) | ObjectValue::Stream(_) => 2,
         ObjectValue::Array(_) => 1,
         _ => 0,
     };
@@ -1606,6 +1608,26 @@ impl ObjectSlot {
     }
 }
 
+/// The stream-specific payload of a direct `ObjectHandle`, mirroring qpdf's
+/// `QPDF_Stream` derived value (`libqpdf/qpdf/QPDF_Stream.hh`).
+#[derive(Debug, Clone)]
+pub(crate) struct StreamValue {
+    pub(crate) stream_dict: ObjectHandle,
+    /// `None` means original source bytes; `Some` is replacement data.
+    pub(crate) stream_data: Option<Rc<Vec<u8>>>,
+    /// A deferred replacement source, mutually exclusive with `stream_data`.
+    pub(crate) stream_provider: Option<Rc<dyn StreamDataProvider>>,
+    /// Whether qpdf's writer may decode, normalize, or recompress this stream.
+    pub(crate) filter_on_write: bool,
+    /// Parse-time length for the original-source branch.
+    pub(crate) stream_length: usize,
+    /// qpdf's stream-local token-filter list.
+    pub(crate) stream_token_filters: StreamTokenFilterList,
+    /// flpdf's writer-only completed content-normalization marker.
+    // qpdf-deviation: no qpdf QPDF_Stream field records this external marker.
+    pub(crate) content_normalization_applied: bool,
+}
+
 /// The value payload of a direct `ObjectHandle`, mirroring qpdf's
 /// `QPDFValue` type family (`libqpdf/qpdf/QPDFValue.hh`).
 ///
@@ -1643,71 +1665,9 @@ pub(crate) enum ObjectValue {
     InlineImage(Vec<u8>),
     Array(Vec<ObjectHandle>),
     Dictionary(std::collections::BTreeMap<Vec<u8>, ObjectHandle>),
-    /// A stream's own value: its dictionary (a separately parsed handle
-    /// carrying its own `<<`-start parsed offset) and its optional replacement
-    /// buffer. The stream value's own parsed offset (see
-    /// [`ObjectHandle::get_parsed_offset`]) is the encoded stream-data
-    /// start, distinct from the dictionary's.
-    ///
-    /// `stream_data: None` is qpdf's original-source state: no payload is
-    /// retained at parse time, and `QPDF_Stream::pipeStreamData`
-    /// (`libqpdf/QPDF_Stream.cc:571-620`) reads the owning document at this
-    /// value's parsed offset instead. `Some` is the shared replacement buffer,
-    /// mirroring qpdf's `std::shared_ptr<Buffer> stream_data`
-    /// (`libqpdf/qpdf/QPDF_Stream.hh:104`).
-    /// The sharing is observable behaviour, not a micro-optimization:
-    /// `QPDF::copyStreamData` (`libqpdf/QPDF.cc:2240,2256-2258`) hands one
-    /// stream's buffer to a second stream — in a different document — with no
-    /// byte copy, and qpdf refuses to duplicate a stream payload at all
-    /// (`QPDF_Stream::copy` throws, `libqpdf/QPDF_Stream.cc:141-144`).
-    ///
-    /// Sharing is sound here because the payload is never written through:
-    /// [`ObjectHandle::replace_stream_data`] swaps the whole buffer rather
-    /// than editing bytes in place, and nothing in this crate reaches inside
-    /// one. Two streams holding one buffer therefore cannot become visible to
-    /// each other, and no path needs `Rc::make_mut`'s silent copy-on-write.
-    ///
-    /// `Rc<Vec<u8>>` rather than `Rc<[u8]>`: `Rc::<[u8]>::from(vec)` cannot
-    /// retrofit its refcount header onto an allocation `Vec` already made, so
-    /// it memcpys the whole payload (the same trap `page_split`'s
-    /// `SharedSource` documents), and every payload arrives as a `Vec`.
-    /// `Rc::new(vec)` moves the `Vec`'s three words and copies nothing. That
-    /// this happens to be two levels of indirection like `shared_ptr<Buffer>`
-    /// is coincidence, not correspondence: qpdf needs a `Buffer` object
-    /// because C++ cannot say borrow-or-own in the type system, so `Buffer`
-    /// carries a runtime flag for it (`include/qpdf/Buffer.hh:35-46` offers
-    /// both an owning and a non-owning constructor). `Rc` rather than `Arc`
-    /// because [`ObjectHandle`] itself is `Rc`-based, so this value is `!Send`
-    /// regardless.
-    Stream {
-        stream_dict: ObjectHandle,
-        /// `None` means original source bytes; `Some` is replacement data.
-        stream_data: Option<Rc<Vec<u8>>>,
-        /// A deferred replacement source. This is mutually exclusive with
-        /// `stream_data`, matching qpdf's `stream_provider` slot.
-        stream_provider: Option<Rc<dyn StreamDataProvider>>,
-        /// Whether qpdf's writer may decode, normalize, or recompress this
-        /// stream. qpdf's `QPDF_Stream` initializes this to true and keeps it
-        /// as stream state rather than as a serialized dictionary entry
-        /// (`libqpdf/QPDF_Stream.cc:114-118,154-164`).
-        filter_on_write: bool,
-        /// Parse-time length for the original-source branch. qpdf's
-        /// `replaceFilterData` updates `/Length` but not this member
-        /// (`libqpdf/QPDF_Stream.cc:668-685`).
-        stream_length: usize,
-        /// qpdf's stream-local token-filter list
-        /// (`libqpdf/qpdf/QPDF_Stream.hh:106`). It is kept inside the shared
-        /// stream value so aliases observe the same filters without placing
-        /// stream-only state on scalar or container values.
-        stream_token_filters: StreamTokenFilterList,
-        /// flpdf's writer-only record that the current stream bytes already
-        /// passed content normalization. qpdf has no corresponding field;
-        /// keeping it on the stream value prevents it from being carried by
-        /// non-stream values.
-        // qpdf-deviation: no qpdf QPDF_Stream field records an external
-        // consumer's completed content normalization.
-        content_normalization_applied: bool,
-    },
+    /// The stream payload is boxed so scalar/container values do not carry
+    /// qpdf's stream subclass layout. The box is paid only by stream values.
+    Stream(Box<StreamValue>),
 }
 
 fn empty_object_slot() -> Rc<RefCell<ObjectSlot>> {
@@ -1745,7 +1705,7 @@ impl ObjectValue {
             Self::Name(_) => 7,
             Self::Array(_) => 8,
             Self::Dictionary(_) => 9,
-            Self::Stream { .. } => 10,
+            Self::Stream(_) => 10,
             Self::Operator(_) => 11,
             Self::InlineImage(_) => 12,
         }
@@ -1769,7 +1729,7 @@ impl ObjectValue {
             Self::Name(_) => "name",
             Self::Array(_) => "array",
             Self::Dictionary(_) => "dictionary",
-            Self::Stream { .. } => "stream",
+            Self::Stream(_) => "stream",
             Self::Operator(_) => "operator",
             Self::InlineImage(_) => "inline-image",
         }
@@ -2800,22 +2760,15 @@ impl ObjectHandle {
         Ok(Some(match &shared.value {
             ObjectValue::Reserved => return Err(reserved_clone_error()),
             ObjectValue::Unresolved | ObjectValue::Destroyed => return Ok(None),
-            ObjectValue::Stream {
-                stream_dict,
-                stream_data,
-                stream_provider,
-                filter_on_write,
-                stream_length,
-                ..
-            } => ObjectValue::Stream {
-                stream_dict: shallow_copy_child(stream_dict)?,
-                stream_data: stream_data.clone(),
-                stream_provider: stream_provider.clone(),
-                filter_on_write: *filter_on_write,
-                stream_length: *stream_length,
+            ObjectValue::Stream(stream) => ObjectValue::Stream(Box::new(StreamValue {
+                stream_dict: shallow_copy_child(&stream.stream_dict)?,
+                stream_data: stream.stream_data.clone(),
+                stream_provider: stream.stream_provider.clone(),
+                filter_on_write: stream.filter_on_write,
+                stream_length: stream.stream_length,
                 stream_token_filters: StreamTokenFilterList::default(),
                 content_normalization_applied: false,
-            },
+            })),
             other => other.clone(),
         }))
     }
@@ -4357,7 +4310,7 @@ impl ObjectHandle {
     /// to a second stream shares it; nothing here copies the bytes.
     pub fn stream(dict: ObjectHandle, data: Rc<Vec<u8>>) -> Self {
         Self::new_direct(
-            ObjectValue::Stream {
+            ObjectValue::Stream(Box::new(StreamValue {
                 stream_dict: dict,
                 stream_data: Some(data),
                 stream_provider: None,
@@ -4365,7 +4318,7 @@ impl ObjectHandle {
                 stream_token_filters: Default::default(),
                 content_normalization_applied: false,
                 stream_length: 0,
-            },
+            })),
             NO_PARSED_OFFSET,
         )
     }
@@ -5155,7 +5108,7 @@ impl ObjectHandle {
         match value {
             ObjectValue::Array(children) => children.clone(),
             ObjectValue::Dictionary(entries) => entries.values().cloned().collect(),
-            ObjectValue::Stream { stream_dict, .. } => vec![stream_dict.clone()],
+            ObjectValue::Stream(stream) => vec![stream.stream_dict.clone()],
             _ => Vec::new(),
         }
     }
@@ -5184,8 +5137,11 @@ impl ObjectHandle {
             match &mut shared.value {
                 ObjectValue::Array(children) => std::mem::take(children),
                 ObjectValue::Dictionary(entries) => std::mem::take(entries).into_values().collect(),
-                ObjectValue::Stream { stream_dict, .. } => {
-                    vec![std::mem::replace(stream_dict, ObjectHandle::null())]
+                ObjectValue::Stream(stream) => {
+                    vec![std::mem::replace(
+                        &mut stream.stream_dict,
+                        ObjectHandle::null(),
+                    )]
                 }
                 _ => Vec::new(),
             }
@@ -5476,7 +5432,7 @@ impl ObjectHandle {
                     NO_PARSED_OFFSET,
                 ))
             }
-            ObjectValue::Stream { .. } => {
+            ObjectValue::Stream(_) => {
                 if allow_streams {
                     Ok(self.clone())
                 } else {
@@ -6233,14 +6189,9 @@ impl ObjectHandle {
         self.set_content_normalization_applied(false);
         let length = data.len();
         self.with_value_mut(|v| {
-            if let Some(ObjectValue::Stream {
-                stream_data: existing,
-                stream_provider,
-                ..
-            }) = v
-            {
-                *existing = Some(data);
-                *stream_provider = None;
+            if let Some(ObjectValue::Stream(stream)) = v {
+                stream.stream_data = Some(data);
+                stream.stream_provider = None;
             }
         });
         self.replace_filter_data(filter, decode_parms, length);
@@ -6270,7 +6221,7 @@ impl ObjectHandle {
         decode_parms: Option<ObjectHandle>,
     ) -> Result<()> {
         self.try_dereference()?;
-        if !self.with_value(|value| matches!(value, Some(ObjectValue::Stream { .. }))) {
+        if !self.with_value(|value| matches!(value, Some(ObjectValue::Stream(_)))) {
             let type_name = self.type_name()?;
             return Err(Error::System(format!(
                 "operation for stream attempted on object of type {}",
@@ -6284,14 +6235,9 @@ impl ObjectHandle {
             ));
         }
         self.with_value_mut(|value| {
-            if let Some(ObjectValue::Stream {
-                stream_data,
-                stream_provider: existing,
-                ..
-            }) = value
-            {
-                *stream_data = None;
-                *existing = Some(provider);
+            if let Some(ObjectValue::Stream(stream)) = value {
+                stream.stream_data = None;
+                stream.stream_provider = Some(provider);
             }
         });
         self.replace_filter_data(filter, decode_parms, 0);
@@ -6352,9 +6298,10 @@ impl ObjectHandle {
         self.check_key_value_ownership(&dictionary)?;
 
         let previous = self.with_value_mut(|value| match value {
-            Some(ObjectValue::Stream { stream_dict, .. }) => {
-                Some(std::mem::replace(stream_dict, dictionary.clone()))
-            }
+            Some(ObjectValue::Stream(stream)) => Some(std::mem::replace(
+                &mut stream.stream_dict,
+                dictionary.clone(),
+            )),
             _ => None,
         });
         let Some(previous) = previous else {
@@ -6406,7 +6353,7 @@ impl ObjectHandle {
     /// than copying its subtree.
     pub fn as_stream_dict(&self) -> Option<ObjectHandle> {
         self.with_value(|value| match value {
-            Some(ObjectValue::Stream { stream_dict, .. }) => Some(stream_dict.clone()),
+            Some(ObjectValue::Stream(stream)) => Some(stream.stream_dict.clone()),
             _ => None,
         })
     }
@@ -6424,10 +6371,8 @@ impl ObjectHandle {
     pub fn set_filter_on_write(&self, value: bool) -> Result<()> {
         self.try_dereference()?;
         let is_stream = self.with_value_mut(|state| match state {
-            Some(ObjectValue::Stream {
-                filter_on_write, ..
-            }) => {
-                *filter_on_write = value;
+            Some(ObjectValue::Stream(stream)) => {
+                stream.filter_on_write = value;
                 true
             }
             _ => false,
@@ -6450,9 +6395,7 @@ impl ObjectHandle {
     pub fn get_filter_on_write(&self) -> Result<bool> {
         self.try_dereference()?;
         let value = self.with_value(|state| match state {
-            Some(ObjectValue::Stream {
-                filter_on_write, ..
-            }) => Some(*filter_on_write),
+            Some(ObjectValue::Stream(stream)) => Some(stream.filter_on_write),
             _ => None,
         });
         if let Some(value) = value {
@@ -6476,7 +6419,7 @@ impl ObjectHandle {
     /// `std::shared_ptr<Buffer>` itself.
     pub fn as_stream_data(&self) -> Option<Rc<Vec<u8>>> {
         self.with_value(|value| match value {
-            Some(ObjectValue::Stream { stream_data, .. }) => stream_data.clone(),
+            Some(ObjectValue::Stream(stream)) => stream.stream_data.clone(),
             _ => None,
         })
     }
@@ -6488,9 +6431,7 @@ impl ObjectHandle {
     /// streams.
     pub(crate) fn has_stream_data_provider(&self) -> bool {
         self.with_value(|value| match value {
-            Some(ObjectValue::Stream {
-                stream_provider, ..
-            }) => stream_provider.is_some(),
+            Some(ObjectValue::Stream(stream)) => stream.stream_provider.is_some(),
             _ => false,
         })
     }
@@ -6501,7 +6442,7 @@ impl ObjectHandle {
     /// without retaining the source `ObjectHandle` itself.
     pub(crate) fn stream_source_length(&self) -> Option<usize> {
         self.with_value(|value| match value {
-            Some(ObjectValue::Stream { stream_length, .. }) => Some(*stream_length),
+            Some(ObjectValue::Stream(stream)) => Some(stream.stream_length),
             _ => None,
         })
     }
@@ -6514,10 +6455,7 @@ impl ObjectHandle {
     /// (`libqpdf/QPDFWriter.cc:1234-1315`).
     pub(crate) fn is_data_modified(&self) -> bool {
         self.with_value(|value| match value {
-            Some(ObjectValue::Stream {
-                stream_token_filters,
-                ..
-            }) => !stream_token_filters.is_empty(),
+            Some(ObjectValue::Stream(stream)) => !stream.stream_token_filters.is_empty(),
             _ => false,
         })
     }
@@ -6528,10 +6466,7 @@ impl ObjectHandle {
     /// arbitrary caller data that still needs QDF normalization.
     pub(crate) fn content_normalization_applied(&self) -> bool {
         self.with_value(|value| match value {
-            Some(ObjectValue::Stream {
-                content_normalization_applied,
-                ..
-            }) => *content_normalization_applied,
+            Some(ObjectValue::Stream(stream)) => stream.content_normalization_applied,
             _ => false,
         })
     }
@@ -6546,12 +6481,8 @@ impl ObjectHandle {
 
     fn set_content_normalization_applied(&self, applied: bool) {
         self.with_value_mut(|value| {
-            if let Some(ObjectValue::Stream {
-                content_normalization_applied: current,
-                ..
-            }) = value
-            {
-                *current = applied;
+            if let Some(ObjectValue::Stream(stream)) = value {
+                stream.content_normalization_applied = applied;
             }
         });
     }
@@ -6561,7 +6492,7 @@ impl ObjectHandle {
     /// stream pipeline only when a filtering pipe is requested.
     pub fn add_token_filter(&self, filter: Rc<RefCell<dyn TokenFilter>>) -> Result<()> {
         self.try_dereference()?;
-        if !self.with_value(|value| matches!(value, Some(ObjectValue::Stream { .. }))) {
+        if !self.with_value(|value| matches!(value, Some(ObjectValue::Stream(_)))) {
             let type_name = self.type_name()?;
             return Err(Error::System(format!(
                 "operation for stream attempted on object of type {}",
@@ -6569,12 +6500,8 @@ impl ObjectHandle {
             )));
         }
         self.with_value_mut(|value| {
-            if let Some(ObjectValue::Stream {
-                stream_token_filters,
-                ..
-            }) = value
-            {
-                stream_token_filters.push(filter);
+            if let Some(ObjectValue::Stream(stream)) = value {
+                stream.stream_token_filters.push(filter);
             }
         });
         Ok(())
@@ -6672,7 +6599,7 @@ impl ObjectHandle {
     pub(crate) fn stream_data_filterable(&self, decode_level: DecodeLevel) -> Result<bool> {
         self.try_dereference()?;
         let Some(stream_dict) = self.with_value(|value| match value {
-            Some(ObjectValue::Stream { stream_dict, .. }) => Some(stream_dict.clone()),
+            Some(ObjectValue::Stream(stream)) => Some(stream.stream_dict.clone()),
             _ => None,
         }) else {
             return Err(Error::Internal(
@@ -6926,19 +6853,12 @@ impl ObjectHandle {
         self.try_dereference()?;
         let Some((token_filters, stream_dict, stream_data, stream_provider, stream_length)) = self
             .with_value(|value| match value {
-                Some(ObjectValue::Stream {
-                    stream_dict,
-                    stream_data,
-                    stream_provider,
-                    stream_length,
-                    stream_token_filters,
-                    ..
-                }) => Some((
-                    stream_token_filters.clone(),
-                    stream_dict.clone(),
-                    stream_data.clone(),
-                    stream_provider.clone(),
-                    *stream_length,
+                Some(ObjectValue::Stream(stream)) => Some((
+                    stream.stream_token_filters.clone(),
+                    stream.stream_dict.clone(),
+                    stream.stream_data.clone(),
+                    stream.stream_provider.clone(),
+                    stream.stream_length,
                 )),
                 _ => None,
             })
@@ -7253,17 +7173,11 @@ impl ObjectHandle {
         self.try_dereference()?;
         let Some((stream_dict, stream_data, stream_provider, stream_length)) =
             self.with_value(|value| match value {
-                Some(ObjectValue::Stream {
-                    stream_dict,
-                    stream_data,
-                    stream_provider,
-                    stream_length,
-                    ..
-                }) => Some((
-                    stream_dict.clone(),
-                    stream_data.clone(),
-                    stream_provider.clone(),
-                    *stream_length,
+                Some(ObjectValue::Stream(stream)) => Some((
+                    stream.stream_dict.clone(),
+                    stream.stream_data.clone(),
+                    stream.stream_provider.clone(),
+                    stream.stream_length,
                 )),
                 _ => None,
             })
@@ -7660,7 +7574,7 @@ fn unparse_resolved_into(handle: &ObjectHandle, out: &mut Vec<u8>, strict: bool)
             .with_value(|value| value.cloned())
             .expect("every ObjectHandle carries a value state");
 
-        if handle.is_indirect() && matches!(value, ObjectValue::Stream { .. }) {
+        if handle.is_indirect() && matches!(value, ObjectValue::Stream(_)) {
             if let Some(object_ref) = handle.object_ref() {
                 write_unparse_reference(object_ref, out);
             } else if let Some(object_gen) = handle.qpdf_obj_gen() {
@@ -7767,18 +7681,14 @@ fn unparse_resolved_value(
             }
             out.extend_from_slice(b">>");
         }
-        ObjectValue::Stream {
-            stream_dict,
-            stream_data,
-            ..
-        } => {
+        ObjectValue::Stream(stream) => {
             // qpdf owns streams as indirect objects. This direct-stream arm
             // retains the existing Rust-only factory behavior for a value
             // without an object number.
-            unparse_resolved_into(&stream_dict, out, strict)?;
+            unparse_resolved_into(&stream.stream_dict, out, strict)?;
             out.extend_from_slice(b"\nstream\n");
-            let data = match stream_data {
-                Some(data) => data,
+            let data = match &stream.stream_data {
+                Some(data) => data.clone(),
                 None => handle.get_raw_stream_data()?,
             };
             out.extend_from_slice(&data);
@@ -8351,7 +8261,7 @@ mod object_json_writer_tests {
 
     impl DocumentResolver for AlwaysFailStreamResolver {
         fn resolve_indirect(&self, _object_ref: ObjectRef, handle: &ObjectHandle) -> Result<()> {
-            handle.set_resolved(ObjectValue::Stream {
+            handle.set_resolved(ObjectValue::Stream(Box::new(StreamValue {
                 stream_dict: ObjectHandle::dictionary(Vec::new()),
                 stream_data: None,
                 stream_provider: None,
@@ -8359,7 +8269,7 @@ mod object_json_writer_tests {
                 stream_token_filters: Default::default(),
                 content_normalization_applied: false,
                 stream_length: 0,
-            });
+            })));
             Ok(())
         }
 
@@ -8848,7 +8758,7 @@ fn shallow_copy_value(value: &ObjectValue) -> Result<ObjectValue> {
                 .map(|(k, v)| Ok((k.clone(), shallow_copy_child(v)?)))
                 .collect::<Result<std::collections::BTreeMap<_, _>>>()?,
         ),
-        ObjectValue::Stream { .. } => {
+        ObjectValue::Stream(_) => {
             return Err(Error::System("stream objects cannot be cloned".to_string()))
         }
         other => other.clone(),
@@ -8872,7 +8782,7 @@ fn unsafe_shallow_copy_value(value: &ObjectValue) -> Result<ObjectValue> {
     Ok(match value {
         ObjectValue::Unresolved => return Err(unresolved_copy_error()),
         ObjectValue::Destroyed => return Err(destroyed_copy_error()),
-        ObjectValue::Stream { .. } => {
+        ObjectValue::Stream(_) => {
             return Err(Error::System("stream objects cannot be cloned".to_string()))
         }
         ObjectValue::Array(items) => ObjectValue::Array(items.clone()),
@@ -9176,7 +9086,7 @@ pub(crate) mod identity_tests {
             _object_ref: ObjectRef,
             handle: &ObjectHandle,
         ) -> crate::Result<()> {
-            handle.set_resolved(ObjectValue::Stream {
+            handle.set_resolved(ObjectValue::Stream(Box::new(StreamValue {
                 stream_dict: ObjectHandle::dictionary(vec![]),
                 stream_data: None,
                 stream_provider: None,
@@ -9184,7 +9094,7 @@ pub(crate) mod identity_tests {
                 stream_token_filters: Default::default(),
                 content_normalization_applied: false,
                 stream_length: 3,
-            });
+            })));
             Ok(())
         }
     }
@@ -10702,7 +10612,7 @@ mod uniform_identity_tests {
         let array_child = ObjectHandle::dictionary(vec![]);
         let stream_dict = ObjectHandle::dictionary(vec![]);
         let stream_data = Rc::new(b"shared stream data".to_vec());
-        let stream = ObjectHandle::from_value(ObjectValue::Stream {
+        let stream = ObjectHandle::from_value(ObjectValue::Stream(Box::new(StreamValue {
             stream_dict: stream_dict.clone(),
             stream_data: Some(stream_data.clone()),
             stream_provider: None,
@@ -10710,7 +10620,7 @@ mod uniform_identity_tests {
             stream_token_filters: Default::default(),
             content_normalization_applied: false,
             stream_length: stream_data.len(),
-        });
+        })));
         let root = ObjectHandle::array(vec![array_child.clone(), stream.clone()]);
 
         let promoted =
@@ -10721,7 +10631,11 @@ mod uniform_identity_tests {
         assert!(children[1].is_same_object_as(&stream));
         let promoted_dict = children[1].as_stream_dict().expect("stream dictionary");
         assert!(promoted_dict.is_same_object_as(&stream_dict));
-        assert!(children[1].with_value(|value| matches!(value, Some(ObjectValue::Stream { stream_data: Some(actual), .. }) if Rc::ptr_eq(actual, &stream_data))));
+        assert!(children[1].with_value(|value| matches!(
+            value,
+            Some(ObjectValue::Stream(stream))
+                if stream.stream_data.as_ref().is_some_and(|actual| Rc::ptr_eq(actual, &stream_data))
+        )));
     }
 
     #[test]
@@ -11401,7 +11315,7 @@ mod stream_payload_sharing_tests {
     #[test]
     fn shallow_copy_keeps_an_indirect_stream_child_shared() {
         let stream = ObjectHandle::new_indirect_unresolved(ObjectRef::new(1, 0), -1);
-        stream.set_resolved(ObjectValue::Stream {
+        stream.set_resolved(ObjectValue::Stream(Box::new(StreamValue {
             stream_dict: length_dict(4096),
             stream_data: Some(Rc::new(vec![0x5a; 4096])),
             stream_provider: None,
@@ -11409,7 +11323,7 @@ mod stream_payload_sharing_tests {
             stream_token_filters: Default::default(),
             content_normalization_applied: false,
             stream_length: 4096,
-        });
+        })));
         let dictionary = ObjectHandle::dictionary(vec![(b"Nested".to_vec(), stream.clone())]);
 
         let copy = dictionary
@@ -12000,7 +11914,7 @@ mod type_code_tests {
     #[test]
     fn stream_handle_type_code_is_stream() {
         let dict = ObjectHandle::dictionary(vec![]);
-        let stream = ObjectHandle::from_value(ObjectValue::Stream {
+        let stream = ObjectHandle::from_value(ObjectValue::Stream(Box::new(StreamValue {
             stream_dict: dict,
             stream_data: Some(Rc::new(Vec::new())),
             stream_provider: None,
@@ -12008,9 +11922,17 @@ mod type_code_tests {
             stream_token_filters: Default::default(),
             content_normalization_applied: false,
             stream_length: 0,
-        });
+        })));
         assert_eq!(stream.type_code().expect("type code"), 10);
         assert_eq!(stream.type_name().expect("type name"), "stream");
+    }
+
+    #[test]
+    fn stream_subclass_layout_is_not_carried_by_common_values() {
+        assert!(
+            std::mem::size_of::<ObjectValue>() < std::mem::size_of::<StreamValue>(),
+            "the common value enum must not inline the stream subclass payload"
+        );
     }
 
     #[test]
@@ -12098,7 +12020,7 @@ mod type_code_tests {
         // container arm (Array, Dictionary, Stream) without relying on the
         // legacy raw-object tree or its recursive Drop implementation.
         let stream = ObjectHandle::new_indirect_unresolved(ObjectRef::new(9, 0), 0);
-        stream.set_resolved(ObjectValue::Stream {
+        stream.set_resolved(ObjectValue::Stream(Box::new(StreamValue {
             stream_dict: ObjectHandle::dictionary(vec![(
                 b"Length".to_vec(),
                 ObjectHandle::integer(0),
@@ -12109,7 +12031,7 @@ mod type_code_tests {
             stream_token_filters: Default::default(),
             content_normalization_applied: false,
             stream_length: 0,
-        });
+        })));
         let inner_dict = ObjectHandle::dictionary(vec![
             (b"A".to_vec(), ObjectHandle::null()),
             (b"B".to_vec(), ObjectHandle::integer(2)),
@@ -12164,7 +12086,7 @@ mod type_code_tests {
         // stream's dictionary/data.
         let dict = ObjectHandle::dictionary(vec![(b"Length".to_vec(), ObjectHandle::integer(0))]);
         let handle = ObjectHandle::new_indirect_unresolved(ObjectRef::new(9, 0), 0);
-        handle.set_resolved(ObjectValue::Stream {
+        handle.set_resolved(ObjectValue::Stream(Box::new(StreamValue {
             stream_dict: dict,
             stream_data: Some(Rc::new(Vec::new())),
             stream_provider: None,
@@ -12172,7 +12094,7 @@ mod type_code_tests {
             stream_token_filters: Default::default(),
             content_normalization_applied: false,
             stream_length: 0,
-        });
+        })));
         assert_eq!(handle.unparse(), b"9 0 R");
         assert_eq!(handle.unparse_resolved(), b"9 0 R");
     }
@@ -12216,7 +12138,7 @@ mod type_code_tests {
         // case has no qpdf output contract; retain the existing explicit
         // factory behavior without introducing another representation.
         let dict = ObjectHandle::dictionary(vec![(b"Length".to_vec(), ObjectHandle::integer(2))]);
-        let handle = ObjectHandle::from_value(ObjectValue::Stream {
+        let handle = ObjectHandle::from_value(ObjectValue::Stream(Box::new(StreamValue {
             stream_dict: dict,
             stream_data: Some(Rc::new(b"ab".to_vec())),
             stream_provider: None,
@@ -12224,7 +12146,7 @@ mod type_code_tests {
             stream_token_filters: Default::default(),
             content_normalization_applied: false,
             stream_length: 0,
-        });
+        })));
         assert_eq!(
             handle.unparse_resolved(),
             b"<< /Length 2 >>\nstream\nab\nendstream"
@@ -12353,7 +12275,7 @@ mod type_code_tests {
 
     #[test]
     fn try_unparse_resolved_reports_missing_original_data_for_a_direct_stream() {
-        let handle = ObjectHandle::from_value(ObjectValue::Stream {
+        let handle = ObjectHandle::from_value(ObjectValue::Stream(Box::new(StreamValue {
             stream_dict: ObjectHandle::dictionary(Vec::new()),
             stream_data: None,
             stream_provider: None,
@@ -12361,7 +12283,7 @@ mod type_code_tests {
             stream_token_filters: Default::default(),
             content_normalization_applied: false,
             stream_length: 0,
-        });
+        })));
 
         assert!(handle
             .try_unparse_resolved()
@@ -12406,7 +12328,7 @@ mod unparse_object_tests {
             None,
             None,
         );
-        handle.set_resolved(ObjectValue::Stream {
+        handle.set_resolved(ObjectValue::Stream(Box::new(StreamValue {
             stream_dict: ObjectHandle::dictionary(Vec::new()),
             stream_data: None,
             stream_provider: None,
@@ -12414,7 +12336,7 @@ mod unparse_object_tests {
             stream_token_filters: Default::default(),
             content_normalization_applied: false,
             stream_length: 0,
-        });
+        })));
 
         assert_eq!(handle.try_unparse_resolved().unwrap(), b"5 65536 R");
     }
@@ -12881,7 +12803,7 @@ mod unparse_object_tests {
         // `write_stream_body` is separately responsible, and stays consistent with
         // that primitive's scope rather than reproducing framing logic here.
         let dict = ObjectHandle::dictionary(vec![(b"Length".to_vec(), ObjectHandle::integer(2))]);
-        let handle = ObjectHandle::from_value(ObjectValue::Stream {
+        let handle = ObjectHandle::from_value(ObjectValue::Stream(Box::new(StreamValue {
             stream_dict: dict,
             stream_data: Some(Rc::new(b"ab".to_vec())),
             stream_provider: None,
@@ -12889,7 +12811,7 @@ mod unparse_object_tests {
             stream_token_filters: Default::default(),
             content_normalization_applied: false,
             stream_length: 0,
-        });
+        })));
         let mut out = Vec::new();
         handle.write_object(&mut out).unwrap();
         assert_eq!(out, b"<< /Length 2 >>");
@@ -12909,15 +12831,16 @@ mod unparse_object_tests {
         // behavior; `write_stream_body` is the primitive that implements the
         // real stream-writing path.
         let dict = ObjectHandle::dictionary(vec![(b"Length".to_vec(), ObjectHandle::integer(2))]);
-        let (indirect, _resolver) = resolver_bearing_handle(ObjectValue::Stream {
-            stream_dict: dict,
-            stream_data: Some(Rc::new(b"ab".to_vec())),
-            stream_provider: None,
-            filter_on_write: true,
-            stream_token_filters: Default::default(),
-            content_normalization_applied: false,
-            stream_length: 0,
-        });
+        let (indirect, _resolver) =
+            resolver_bearing_handle(ObjectValue::Stream(Box::new(StreamValue {
+                stream_dict: dict,
+                stream_data: Some(Rc::new(b"ab".to_vec())),
+                stream_provider: None,
+                filter_on_write: true,
+                stream_token_filters: Default::default(),
+                content_normalization_applied: false,
+                stream_length: 0,
+            })));
         let mut out = Vec::new();
         indirect.write_object(&mut out).unwrap();
         assert_eq!(out, b"<< /Length 2 >>");
@@ -13345,15 +13268,16 @@ mod unparse_object_tests {
         // exercises unparse_object_value_qdf's Stream arm, unreached by the
         // four plan-specified literals above.
         let dict = ObjectHandle::dictionary(vec![(b"Length".to_vec(), ObjectHandle::integer(2))]);
-        let (indirect, _resolver) = resolver_bearing_handle(ObjectValue::Stream {
-            stream_dict: dict,
-            stream_data: Some(Rc::new(b"ab".to_vec())),
-            stream_provider: None,
-            filter_on_write: true,
-            stream_token_filters: Default::default(),
-            content_normalization_applied: false,
-            stream_length: 0,
-        });
+        let (indirect, _resolver) =
+            resolver_bearing_handle(ObjectValue::Stream(Box::new(StreamValue {
+                stream_dict: dict,
+                stream_data: Some(Rc::new(b"ab".to_vec())),
+                stream_provider: None,
+                filter_on_write: true,
+                stream_token_filters: Default::default(),
+                content_normalization_applied: false,
+                stream_length: 0,
+            })));
         let mut out = Vec::new();
         indirect.write_object_qdf(&mut out, 0).unwrap();
         assert_eq!(out, b"<<\n  /Length 2\n>>");
@@ -13644,7 +13568,7 @@ mod unparse_object_tests {
         kept.set_resolved(ObjectValue::Integer(7));
         let removed = ObjectHandle::new_indirect_unresolved(ObjectRef::new(31, 0), 0);
         removed.set_resolved(ObjectValue::Integer(8));
-        let stream = ObjectHandle::from_value(ObjectValue::Stream {
+        let stream = ObjectHandle::from_value(ObjectValue::Stream(Box::new(StreamValue {
             stream_dict: ObjectHandle::dictionary(vec![
                 (b"ByteRange".to_vec(), ObjectHandle::array(vec![])),
                 (b"Contents".to_vec(), ObjectHandle::string(b"sig".to_vec())),
@@ -13665,7 +13589,7 @@ mod unparse_object_tests {
             stream_token_filters: Default::default(),
             content_normalization_applied: false,
             stream_length: 3,
-        });
+        })));
         let mut removed_refs = BTreeSet::new();
         removed_refs.insert(ObjectRef::new(31, 0));
         let map = |object_ref: ObjectRef| {
@@ -13905,7 +13829,7 @@ mod unparse_object_tests {
         // primitive's behalf (`write_stream_body` is separately responsible
         // for this).
         let dict = ObjectHandle::dictionary(vec![(b"Length".to_vec(), ObjectHandle::integer(2))]);
-        let handle = ObjectHandle::from_value(ObjectValue::Stream {
+        let handle = ObjectHandle::from_value(ObjectValue::Stream(Box::new(StreamValue {
             stream_dict: dict,
             stream_data: Some(Rc::new(b"ab".to_vec())),
             stream_provider: None,
@@ -13913,7 +13837,7 @@ mod unparse_object_tests {
             stream_token_filters: Default::default(),
             content_normalization_applied: false,
             stream_length: 0,
-        });
+        })));
         let mut out = Vec::new();
         handle.write_stream_body(&mut out, false).unwrap();
         assert_eq!(out, b"<< /Length 2 >>");
@@ -13929,15 +13853,16 @@ mod unparse_object_tests {
         // would; `stream_dict`'s own entries must still surface here rather
         // than the non-dictionary-self `<< >>` degrade.
         let dict = ObjectHandle::dictionary(vec![(b"Length".to_vec(), ObjectHandle::integer(2))]);
-        let (indirect, _resolver) = resolver_bearing_handle(ObjectValue::Stream {
-            stream_dict: dict,
-            stream_data: Some(Rc::new(b"ab".to_vec())),
-            stream_provider: None,
-            filter_on_write: true,
-            stream_token_filters: Default::default(),
-            content_normalization_applied: false,
-            stream_length: 0,
-        });
+        let (indirect, _resolver) =
+            resolver_bearing_handle(ObjectValue::Stream(Box::new(StreamValue {
+                stream_dict: dict,
+                stream_data: Some(Rc::new(b"ab".to_vec())),
+                stream_provider: None,
+                filter_on_write: true,
+                stream_token_filters: Default::default(),
+                content_normalization_applied: false,
+                stream_length: 0,
+            })));
         let mut out = Vec::new();
         indirect.write_stream_body(&mut out, false).unwrap();
         assert_eq!(out, b"<< /Length 2 >>");
@@ -14216,7 +14141,7 @@ mod unparse_object_tests {
         // primitive must still use its `stream_dict`'s entries rather than
         // falling into the non-dictionary-self `<< >>` degrade below.
         let dict = ObjectHandle::dictionary(vec![(b"Length".to_vec(), ObjectHandle::integer(2))]);
-        let handle = ObjectHandle::from_value(ObjectValue::Stream {
+        let handle = ObjectHandle::from_value(ObjectValue::Stream(Box::new(StreamValue {
             stream_dict: dict,
             stream_data: Some(Rc::new(b"ab".to_vec())),
             stream_provider: None,
@@ -14224,7 +14149,7 @@ mod unparse_object_tests {
             stream_token_filters: Default::default(),
             content_normalization_applied: false,
             stream_length: 0,
-        });
+        })));
         let mut out = Vec::new();
         handle.write_stream_body_qdf(&mut out, 0).unwrap();
         assert_eq!(out, b"<<\n  /Length 2\n>>");
@@ -14237,15 +14162,16 @@ mod unparse_object_tests {
         // value is a stream (e.g. a production reader's own resolution of a
         // stream object).
         let dict = ObjectHandle::dictionary(vec![(b"Length".to_vec(), ObjectHandle::integer(2))]);
-        let (indirect, _resolver) = resolver_bearing_handle(ObjectValue::Stream {
-            stream_dict: dict,
-            stream_data: Some(Rc::new(b"ab".to_vec())),
-            stream_provider: None,
-            filter_on_write: true,
-            stream_token_filters: Default::default(),
-            content_normalization_applied: false,
-            stream_length: 0,
-        });
+        let (indirect, _resolver) =
+            resolver_bearing_handle(ObjectValue::Stream(Box::new(StreamValue {
+                stream_dict: dict,
+                stream_data: Some(Rc::new(b"ab".to_vec())),
+                stream_provider: None,
+                filter_on_write: true,
+                stream_token_filters: Default::default(),
+                content_normalization_applied: false,
+                stream_length: 0,
+            })));
         let mut out = Vec::new();
         indirect.write_stream_body_qdf(&mut out, 0).unwrap();
         assert_eq!(out, b"<<\n  /Length 2\n>>");
@@ -14606,7 +14532,7 @@ mod mutation_tests {
     #[test]
     fn make_direct_stops_at_streams_only_when_allowed() {
         let stream = ObjectHandle::new_indirect_unresolved(ObjectRef::new(12, 0), -1);
-        stream.set_resolved(ObjectValue::Stream {
+        stream.set_resolved(ObjectValue::Stream(Box::new(StreamValue {
             stream_dict: ObjectHandle::dictionary(vec![]),
             stream_data: Some(Rc::new(b"salad".to_vec())),
             stream_provider: None,
@@ -14614,7 +14540,7 @@ mod mutation_tests {
             stream_token_filters: Default::default(),
             content_normalization_applied: false,
             stream_length: 0,
-        });
+        })));
         let original = ObjectHandle::dictionary(vec![(b"Stream".to_vec(), stream.clone())]);
 
         let mut rejects_stream = original.clone();
@@ -14844,7 +14770,7 @@ mod mutation_tests {
             0x78, 0x9c, 0xcb, 0x48, 0xcd, 0xc9, 0xc9, 0x07, 0x00, 0x06, 0x2c, 0x02, 0x15,
         ];
         let resolver = Rc::new(SourcePipeResolver {
-            value: ObjectValue::Stream {
+            value: ObjectValue::Stream(Box::new(StreamValue {
                 stream_dict: dict,
                 stream_data: None,
                 stream_provider: None,
@@ -14852,7 +14778,7 @@ mod mutation_tests {
                 stream_token_filters: Default::default(),
                 content_normalization_applied: false,
                 stream_length: encoded.len(),
-            },
+            })),
             bytes: encoded,
             calls: RefCell::new(Vec::new()),
             warnings: RefCell::new(Vec::new()),
@@ -14888,7 +14814,7 @@ mod mutation_tests {
     fn pipe_stream_data_propagates_a_filtered_source_error() {
         let raw = b"source error".to_vec();
         let resolver = Rc::new(SourcePipeResolver {
-            value: ObjectValue::Stream {
+            value: ObjectValue::Stream(Box::new(StreamValue {
                 stream_dict: ObjectHandle::dictionary(vec![(
                     b"Filter".to_vec(),
                     ObjectHandle::name(b"FlateDecode".to_vec()),
@@ -14899,7 +14825,7 @@ mod mutation_tests {
                 stream_token_filters: Default::default(),
                 content_normalization_applied: false,
                 stream_length: raw.len(),
-            },
+            })),
             bytes: raw,
             calls: RefCell::new(Vec::new()),
             warnings: RefCell::new(Vec::new()),
@@ -14938,7 +14864,7 @@ mod mutation_tests {
     fn get_stream_data_maps_a_filtered_source_retry_to_an_error() {
         let raw = b"source error".to_vec();
         let resolver = Rc::new(SourcePipeResolver {
-            value: ObjectValue::Stream {
+            value: ObjectValue::Stream(Box::new(StreamValue {
                 stream_dict: ObjectHandle::dictionary(vec![(
                     b"Filter".to_vec(),
                     ObjectHandle::name(b"FlateDecode".to_vec()),
@@ -14949,7 +14875,7 @@ mod mutation_tests {
                 stream_token_filters: Default::default(),
                 content_normalization_applied: false,
                 stream_length: raw.len(),
-            },
+            })),
             bytes: raw,
             calls: RefCell::new(Vec::new()),
             warnings: RefCell::new(Vec::new()),
@@ -15050,7 +14976,7 @@ mod mutation_tests {
         )]);
         let raw = vec![1, 2, 3, 4];
         let resolver = Rc::new(SourcePipeResolver {
-            value: ObjectValue::Stream {
+            value: ObjectValue::Stream(Box::new(StreamValue {
                 stream_dict: dict,
                 stream_data: None,
                 stream_provider: None,
@@ -15058,7 +14984,7 @@ mod mutation_tests {
                 stream_token_filters: Default::default(),
                 content_normalization_applied: false,
                 stream_length: raw.len(),
-            },
+            })),
             bytes: raw.clone(),
             calls: RefCell::new(Vec::new()),
             warnings: RefCell::new(Vec::new()),
@@ -15139,7 +15065,7 @@ mod mutation_tests {
     fn pipe_stream_data_checks_unknown_factory_before_decode_parms_shape() {
         let raw = b"raw unknown".to_vec();
         let resolver = Rc::new(SourcePipeResolver {
-            value: ObjectValue::Stream {
+            value: ObjectValue::Stream(Box::new(StreamValue {
                 stream_dict: ObjectHandle::dictionary(vec![
                     (
                         b"Filter".to_vec(),
@@ -15156,7 +15082,7 @@ mod mutation_tests {
                 stream_token_filters: Default::default(),
                 content_normalization_applied: false,
                 stream_length: raw.len(),
-            },
+            })),
             bytes: raw.clone(),
             calls: RefCell::new(Vec::new()),
             warnings: RefCell::new(Vec::new()),
@@ -15192,7 +15118,7 @@ mod mutation_tests {
     fn pipe_stream_data_warns_for_mismatched_decode_parms_before_source() {
         let raw = b"raw mismatch".to_vec();
         let resolver = Rc::new(SourcePipeResolver {
-            value: ObjectValue::Stream {
+            value: ObjectValue::Stream(Box::new(StreamValue {
                 stream_dict: ObjectHandle::dictionary(vec![
                     (
                         b"Filter".to_vec(),
@@ -15212,7 +15138,7 @@ mod mutation_tests {
                 stream_token_filters: Default::default(),
                 content_normalization_applied: false,
                 stream_length: raw.len(),
-            },
+            })),
             bytes: raw.clone(),
             calls: RefCell::new(Vec::new()),
             warnings: RefCell::new(Vec::new()),
@@ -15358,7 +15284,7 @@ mod mutation_tests {
     fn pipe_stream_data_reports_flate_warnings_through_stream_data_sink() {
         let raw = vec![0x78];
         let resolver = Rc::new(SourcePipeResolver {
-            value: ObjectValue::Stream {
+            value: ObjectValue::Stream(Box::new(StreamValue {
                 stream_dict: ObjectHandle::dictionary(vec![(
                     b"Filter".to_vec(),
                     ObjectHandle::name(b"FlateDecode".to_vec()),
@@ -15369,7 +15295,7 @@ mod mutation_tests {
                 stream_token_filters: Default::default(),
                 content_normalization_applied: false,
                 stream_length: raw.len(),
-            },
+            })),
             bytes: raw,
             calls: RefCell::new(Vec::new()),
             warnings: RefCell::new(Vec::new()),
@@ -15424,7 +15350,7 @@ mod mutation_tests {
     fn pipe_stream_data_reports_normalizer_warnings_only_after_source_success() {
         let raw = b"<0g".to_vec();
         let resolver = Rc::new(SourcePipeResolver {
-            value: ObjectValue::Stream {
+            value: ObjectValue::Stream(Box::new(StreamValue {
                 stream_dict: ObjectHandle::dictionary(vec![]),
                 stream_data: None,
                 stream_provider: None,
@@ -15432,7 +15358,7 @@ mod mutation_tests {
                 stream_token_filters: Default::default(),
                 content_normalization_applied: false,
                 stream_length: raw.len(),
-            },
+            })),
             bytes: raw.clone(),
             calls: RefCell::new(Vec::new()),
             warnings: RefCell::new(Vec::new()),
@@ -15644,7 +15570,7 @@ mod mutation_tests {
     fn pipe_stream_data_warns_and_retries_raw_for_a_malformed_filter_shape() {
         let raw = b"raw malformed".to_vec();
         let resolver = Rc::new(SourcePipeResolver {
-            value: ObjectValue::Stream {
+            value: ObjectValue::Stream(Box::new(StreamValue {
                 stream_dict: ObjectHandle::dictionary(vec![(
                     b"Filter".to_vec(),
                     ObjectHandle::integer(7),
@@ -15655,7 +15581,7 @@ mod mutation_tests {
                 stream_token_filters: Default::default(),
                 content_normalization_applied: false,
                 stream_length: raw.len(),
-            },
+            })),
             bytes: raw.clone(),
             calls: RefCell::new(Vec::new()),
             warnings: RefCell::new(Vec::new()),
@@ -15694,7 +15620,7 @@ mod mutation_tests {
     fn pipe_stream_data_warns_for_a_non_name_filter_array_item() {
         let raw = b"raw malformed array".to_vec();
         let resolver = Rc::new(SourcePipeResolver {
-            value: ObjectValue::Stream {
+            value: ObjectValue::Stream(Box::new(StreamValue {
                 stream_dict: ObjectHandle::dictionary(vec![(
                     b"Filter".to_vec(),
                     ObjectHandle::array(vec![
@@ -15708,7 +15634,7 @@ mod mutation_tests {
                 stream_token_filters: Default::default(),
                 content_normalization_applied: false,
                 stream_length: raw.len(),
-            },
+            })),
             bytes: raw.clone(),
             calls: RefCell::new(Vec::new()),
             warnings: RefCell::new(Vec::new()),
@@ -16866,7 +16792,7 @@ mod mutation_tests {
         let owner_ref = ObjectRef::new(7, 0);
         let owner = ObjectHandle::new_indirect_unresolved(owner_ref, NO_PARSED_OFFSET);
         let old_dictionary = ObjectHandle::dictionary(vec![]);
-        let stream = ObjectHandle::from_value(ObjectValue::Stream {
+        let stream = ObjectHandle::from_value(ObjectValue::Stream(Box::new(StreamValue {
             stream_dict: old_dictionary.clone(),
             stream_data: None,
             stream_provider: None,
@@ -16874,14 +16800,14 @@ mod mutation_tests {
             stream_token_filters: Default::default(),
             content_normalization_applied: false,
             stream_length: 0,
-        });
+        })));
         owner.set_resolved(ObjectValue::Dictionary(
             [(b"Stream".to_vec(), stream.clone())].into_iter().collect(),
         ));
         assert_eq!(old_dictionary.containing_object_refs(), vec![owner_ref]);
 
         let new_dictionary = ObjectHandle::dictionary(vec![]);
-        stream.replace_direct_value(ObjectValue::Stream {
+        stream.replace_direct_value(ObjectValue::Stream(Box::new(StreamValue {
             stream_dict: new_dictionary.clone(),
             stream_data: None,
             stream_provider: None,
@@ -16889,7 +16815,7 @@ mod mutation_tests {
             stream_token_filters: Default::default(),
             content_normalization_applied: false,
             stream_length: 0,
-        });
+        })));
         assert!(old_dictionary.containing_object_refs().is_empty());
         assert_eq!(new_dictionary.containing_object_refs(), vec![owner_ref]);
 
@@ -17601,7 +17527,7 @@ mod mutation_tests {
     #[test]
     fn replace_stream_data_updates_data_and_length() {
         let dict = ObjectHandle::dictionary(vec![]);
-        let stream = ObjectHandle::from_value(ObjectValue::Stream {
+        let stream = ObjectHandle::from_value(ObjectValue::Stream(Box::new(StreamValue {
             stream_dict: dict.clone(),
             stream_data: None,
             stream_provider: None,
@@ -17609,13 +17535,13 @@ mod mutation_tests {
             stream_token_filters: Default::default(),
             content_normalization_applied: false,
             stream_length: 37,
-        });
+        })));
         stream.replace_stream_data(Rc::new(b"new data".to_vec()), None, None);
         assert_eq!(stream.as_stream_data(), Some(Rc::new(b"new data".to_vec())));
         assert_eq!(dict.try_get_key(b"/Length").unwrap().as_integer(), Some(8));
         assert_eq!(
             stream.with_value(|value| match value {
-                Some(ObjectValue::Stream { stream_length, .. }) => Some(*stream_length),
+                Some(ObjectValue::Stream(stream)) => Some(stream.stream_length),
                 _ => None, // cov:ignore: this test constructs a stream above
             }),
             Some(37),
@@ -17626,7 +17552,7 @@ mod mutation_tests {
     #[test]
     fn replace_stream_data_empty_buffer_removes_an_existing_length() {
         let dict = ObjectHandle::dictionary(vec![(b"Length".to_vec(), ObjectHandle::integer(37))]);
-        let stream = ObjectHandle::from_value(ObjectValue::Stream {
+        let stream = ObjectHandle::from_value(ObjectValue::Stream(Box::new(StreamValue {
             stream_dict: dict.clone(),
             stream_data: Some(Rc::new(b"old".to_vec())),
             stream_provider: None,
@@ -17634,7 +17560,7 @@ mod mutation_tests {
             stream_token_filters: Default::default(),
             content_normalization_applied: false,
             stream_length: 37,
-        });
+        })));
 
         stream.replace_stream_data(Rc::new(Vec::new()), None, None);
 
@@ -17644,7 +17570,7 @@ mod mutation_tests {
     #[test]
     fn replace_stream_data_empty_buffer_keeps_a_missing_length_absent() {
         let dict = ObjectHandle::dictionary(vec![]);
-        let stream = ObjectHandle::from_value(ObjectValue::Stream {
+        let stream = ObjectHandle::from_value(ObjectValue::Stream(Box::new(StreamValue {
             stream_dict: dict.clone(),
             stream_data: Some(Rc::new(b"old".to_vec())),
             stream_provider: None,
@@ -17652,7 +17578,7 @@ mod mutation_tests {
             stream_token_filters: Default::default(),
             content_normalization_applied: false,
             stream_length: 3,
-        });
+        })));
 
         stream.replace_stream_data(Rc::new(Vec::new()), None, None);
 
@@ -17662,7 +17588,7 @@ mod mutation_tests {
     #[test]
     fn replace_stream_data_repeated_empty_and_nonempty_calls_follow_the_length_boundary() {
         let dict = ObjectHandle::dictionary(vec![(b"Length".to_vec(), ObjectHandle::integer(3))]);
-        let stream = ObjectHandle::from_value(ObjectValue::Stream {
+        let stream = ObjectHandle::from_value(ObjectValue::Stream(Box::new(StreamValue {
             stream_dict: dict.clone(),
             stream_data: Some(Rc::new(b"old".to_vec())),
             stream_provider: None,
@@ -17670,7 +17596,7 @@ mod mutation_tests {
             stream_token_filters: Default::default(),
             content_normalization_applied: false,
             stream_length: 3,
-        });
+        })));
 
         stream.replace_stream_data(Rc::new(Vec::new()), None, None);
         assert!(!dict.try_has_key(b"/Length").unwrap());
@@ -17685,7 +17611,7 @@ mod mutation_tests {
     #[test]
     fn replace_stream_data_sets_filter_and_decode_parms_when_given() {
         let dict = ObjectHandle::dictionary(vec![]);
-        let stream = ObjectHandle::from_value(ObjectValue::Stream {
+        let stream = ObjectHandle::from_value(ObjectValue::Stream(Box::new(StreamValue {
             stream_dict: dict.clone(),
             stream_data: Some(Rc::new(b"old".to_vec())),
             stream_provider: None,
@@ -17693,7 +17619,7 @@ mod mutation_tests {
             stream_token_filters: Default::default(),
             content_normalization_applied: false,
             stream_length: 0,
-        });
+        })));
         let filter = ObjectHandle::name(b"FlateDecode".to_vec());
         let parms =
             ObjectHandle::dictionary(vec![(b"Predictor".to_vec(), ObjectHandle::integer(12))]);
@@ -17712,7 +17638,7 @@ mod mutation_tests {
             b"Filter".to_vec(),
             ObjectHandle::name(b"FlateDecode".to_vec()),
         )]);
-        let stream = ObjectHandle::from_value(ObjectValue::Stream {
+        let stream = ObjectHandle::from_value(ObjectValue::Stream(Box::new(StreamValue {
             stream_dict: dict.clone(),
             stream_data: Some(Rc::new(b"old".to_vec())),
             stream_provider: None,
@@ -17720,7 +17646,7 @@ mod mutation_tests {
             stream_token_filters: Default::default(),
             content_normalization_applied: false,
             stream_length: 0,
-        });
+        })));
         stream.replace_stream_data(Rc::new(b"new".to_vec()), None, None);
         assert_eq!(
             dict.try_get_key(b"/Filter").unwrap().as_name(),
@@ -17737,7 +17663,7 @@ mod mutation_tests {
 
     #[test]
     fn raw_stream_data_rejects_an_original_stream_with_parsed_offset_zero() {
-        let stream = ObjectHandle::from_value(ObjectValue::Stream {
+        let stream = ObjectHandle::from_value(ObjectValue::Stream(Box::new(StreamValue {
             stream_dict: ObjectHandle::dictionary(vec![]),
             stream_data: None,
             stream_provider: None,
@@ -17745,7 +17671,7 @@ mod mutation_tests {
             stream_token_filters: Default::default(),
             content_normalization_applied: false,
             stream_length: 3,
-        });
+        })));
         stream.set_parsed_offset_if_unset(0);
 
         let error = stream
@@ -17766,7 +17692,7 @@ mod mutation_tests {
 
     #[test]
     fn raw_stream_data_rejects_an_original_direct_stream() {
-        let stream = ObjectHandle::from_value(ObjectValue::Stream {
+        let stream = ObjectHandle::from_value(ObjectValue::Stream(Box::new(StreamValue {
             stream_dict: ObjectHandle::dictionary(vec![]),
             stream_data: None,
             stream_provider: None,
@@ -17774,7 +17700,7 @@ mod mutation_tests {
             stream_token_filters: Default::default(),
             content_normalization_applied: false,
             stream_length: 3,
-        });
+        })));
 
         let error = stream
             .get_raw_stream_data()
@@ -17785,8 +17711,8 @@ mod mutation_tests {
 
     #[test]
     fn raw_stream_data_rejects_a_dropped_original_stream_owner() {
-        let (stream, resolver) =
-            super::identity_tests::resolver_bearing_handle(ObjectValue::Stream {
+        let (stream, resolver) = super::identity_tests::resolver_bearing_handle(
+            ObjectValue::Stream(Box::new(StreamValue {
                 stream_dict: ObjectHandle::dictionary(vec![]),
                 stream_data: None,
                 stream_provider: None,
@@ -17794,7 +17720,8 @@ mod mutation_tests {
                 stream_token_filters: Default::default(),
                 content_normalization_applied: false,
                 stream_length: 3,
-            });
+            })),
+        );
         stream.set_parsed_offset_if_unset(9);
         stream
             .try_dereference()
@@ -17995,7 +17922,7 @@ mod mutation_tests {
         // resolved value is a stream reaches `QPDF_Stream::copy`'s throw just
         // as a direct one does — the resolution state changes nothing.
         let indirect = ObjectHandle::new_indirect_unresolved(ObjectRef::new(1, 0), -1);
-        indirect.set_resolved(ObjectValue::Stream {
+        indirect.set_resolved(ObjectValue::Stream(Box::new(StreamValue {
             stream_dict: ObjectHandle::dictionary(vec![]),
             stream_data: Some(Rc::new(b"old".to_vec())),
             stream_provider: None,
@@ -18003,7 +17930,7 @@ mod mutation_tests {
             stream_token_filters: Default::default(),
             content_normalization_applied: false,
             stream_length: 0,
-        });
+        })));
 
         let error = indirect
             .shallow_copy()
@@ -18349,10 +18276,7 @@ mod stream_provider_contract_tests {
         );
         assert!(stream.with_value(|value| matches!(
             value,
-            Some(ObjectValue::Stream {
-                stream_provider: Some(_),
-                ..
-            })
+            Some(ObjectValue::Stream(stream)) if stream.stream_provider.is_some()
         )));
 
         drop(provider);
@@ -18377,10 +18301,7 @@ mod stream_provider_contract_tests {
         assert!(stream.as_stream_data().is_none());
         assert!(stream.with_value(|value| matches!(
             value,
-            Some(ObjectValue::Stream {
-                stream_provider: Some(_),
-                ..
-            })
+            Some(ObjectValue::Stream(stream)) if stream.stream_provider.is_some()
         )));
     }
 
@@ -18727,13 +18648,11 @@ mod stream_provider_contract_tests {
         );
         assert!(stream.with_value(|value| matches!(
             value,
-            Some(ObjectValue::Stream {
-                stream_provider: None,
-                filter_on_write: true,
-                stream_token_filters: _,
-                content_normalization_applied: false,
-                ..
-            })
+            Some(ObjectValue::Stream(stream))
+                if stream.stream_provider.is_none()
+                    && stream.filter_on_write
+                    && stream.stream_token_filters.is_empty()
+                    && !stream.content_normalization_applied
         )));
     }
 
@@ -18862,7 +18781,7 @@ mod stream_provider_contract_tests {
     // test; the test intentionally exercises the default raw-identity route.
     impl DocumentResolver for RawDefaultResolver {
         fn resolve_indirect(&self, _object_ref: ObjectRef, handle: &ObjectHandle) -> Result<()> {
-            handle.set_resolved(ObjectValue::Stream {
+            handle.set_resolved(ObjectValue::Stream(Box::new(StreamValue {
                 stream_dict: ObjectHandle::dictionary(vec![]),
                 stream_data: None,
                 stream_provider: None,
@@ -18870,7 +18789,7 @@ mod stream_provider_contract_tests {
                 stream_token_filters: Default::default(),
                 content_normalization_applied: false,
                 stream_length: 0,
-            });
+            })));
             Ok(())
         }
     }
@@ -18885,7 +18804,7 @@ mod stream_provider_contract_tests {
             0,
             Rc::downgrade(&resolver),
         );
-        stream.set_resolved(ObjectValue::Stream {
+        stream.set_resolved(ObjectValue::Stream(Box::new(StreamValue {
             stream_dict: ObjectHandle::dictionary(vec![]),
             stream_data: None,
             stream_provider: None,
@@ -18893,7 +18812,7 @@ mod stream_provider_contract_tests {
             stream_token_filters: Default::default(),
             content_normalization_applied: false,
             stream_length: 0,
-        });
+        })));
 
         let error = stream
             .get_raw_stream_data()
@@ -18909,14 +18828,9 @@ mod stream_provider_contract_tests {
     fn provider_backed_direct_stream_rejects_missing_qpdf_identity() {
         let stream = ObjectHandle::stream(ObjectHandle::dictionary(vec![]), Rc::new(Vec::new()));
         stream.with_value_mut(|value| {
-            if let Some(ObjectValue::Stream {
-                stream_data,
-                stream_provider,
-                ..
-            }) = value
-            {
-                *stream_data = None;
-                *stream_provider = Some(Rc::new(LegacyProvider::default()));
+            if let Some(ObjectValue::Stream(stream)) = value {
+                stream.stream_data = None;
+                stream.stream_provider = Some(Rc::new(LegacyProvider::default()));
             }
         });
 
@@ -18939,10 +18853,11 @@ mod stream_provider_contract_tests {
 
     fn registered_provider(value: Option<&ObjectValue>) -> Rc<dyn StreamDataProvider> {
         match value {
-            Some(ObjectValue::Stream {
-                stream_provider: Some(provider),
-                ..
-            }) => provider.clone(),
+            Some(ObjectValue::Stream(stream)) => stream
+                .stream_provider
+                .as_ref()
+                .expect("callback test stream must retain its provider")
+                .clone(),
             _ => unreachable!("callback test stream must retain its provider"), // cov:ignore: test fixture always registers a provider-backed stream
         }
     }
@@ -19038,10 +18953,10 @@ mod stream_provider_contract_tests {
 
         fn is_retry_provider(value: Option<&ObjectValue>) -> bool {
             match value {
-                Some(ObjectValue::Stream {
-                    stream_provider: Some(provider),
-                    ..
-                }) => provider.supports_retry(),
+                Some(ObjectValue::Stream(stream)) => stream
+                    .stream_provider
+                    .as_ref()
+                    .is_some_and(|provider| provider.supports_retry()),
                 _ => false,
             }
         }
@@ -19963,7 +19878,7 @@ pub(crate) mod warning_emission_tests {
         // `asDictionary()` is null for a stream just as it is for a scalar
         // (`libqpdf/QPDFObjectHandle.cc:999-1003`), so the dictionary
         // accessors reach this warning with `stream` as the actual type.
-        let (handle, recorder) = handle_resolving(ObjectValue::Stream {
+        let (handle, recorder) = handle_resolving(ObjectValue::Stream(Box::new(StreamValue {
             stream_dict: ObjectHandle::dictionary(vec![(
                 b"Length".to_vec(),
                 ObjectHandle::integer(0),
@@ -19974,7 +19889,7 @@ pub(crate) mod warning_emission_tests {
             stream_token_filters: Default::default(),
             content_normalization_applied: false,
             stream_length: 0,
-        });
+        })));
 
         handle
             .type_warning("dictionary", "treating as empty")
@@ -20408,15 +20323,19 @@ pub(crate) mod warning_emission_tests {
                     == b"operation for dictionary attempted on object of type null: treating as empty"
         ));
 
-        let (stream, stream_recorder) = handle_resolving(ObjectValue::Stream {
-            stream_dict: ObjectHandle::dictionary(vec![(b"/Null".to_vec(), ObjectHandle::null())]),
-            stream_data: Some(Rc::new(Vec::new())),
-            stream_provider: None,
-            filter_on_write: true,
-            stream_token_filters: Default::default(),
-            content_normalization_applied: false,
-            stream_length: 0,
-        });
+        let (stream, stream_recorder) =
+            handle_resolving(ObjectValue::Stream(Box::new(StreamValue {
+                stream_dict: ObjectHandle::dictionary(vec![(
+                    b"/Null".to_vec(),
+                    ObjectHandle::null(),
+                )]),
+                stream_data: Some(Rc::new(Vec::new())),
+                stream_provider: None,
+                filter_on_write: true,
+                stream_token_filters: Default::default(),
+                content_normalization_applied: false,
+                stream_length: 0,
+            })));
         stream.try_dereference().unwrap();
         let stream_null = stream
             .as_stream_dict()
