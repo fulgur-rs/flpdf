@@ -484,6 +484,7 @@ specialized coordinator 内部（`4a2faf5c` の状態）:
 | `D13` | `flpdf-3yn9.48.58` | writeXRefStreamのlayout契約を共有ownerへ統合する |
 | `D1` / `D25` | `flpdf-3yn9.48.59` | prepareFileForWriteのgraph準備を分岐前に一度だけ実行する |
 | `D25` | `flpdf-3yn9.48.60` | root unparseObjectへADBE出力処理を移しsnapshot/restoreを撤去する |
+| `D25` | `flpdf-mcjj` | PCLm の direct `/Root` では qpdf の `is_root` 判定を満たさないため ADBE reconciliation を適用しない |
 | `D26` | `flpdf-3yn9.48.61` | initializeSpecialStreamsのpage/content/normalized mapをsetupで一度生成する |
 | `D16` / `D1` | `flpdf-3yn9.48.62` | encryption設定・doWriteSetupを単一writer stateに揃える |
 | `D3` | `flpdf-3yn9.48.63` | linearizationの採番engineを使ったcache warmup迂回を撤去する |
@@ -600,3 +601,14 @@ Root ownershipの切替はD25をcanonicalへ更新するが、Generate/source-Ob
 Preserve、direct Rootのplanned queue、暗号化系の残るchild discovery／ObjStm packingは
 D2/D3/D11のmixed残差である。したがって、このsliceの完了はroute matrix全体の
 bridge/mixed解消や全writer parityを意味しない。
+
+`flpdf-mcjj` は PCLm の direct-root semantics を補正する。qpdf の
+`QPDFWriter::Members::root_og` は direct `/Root` では `(-1, 0)` となり、
+`unparseObject` の `old_og == root_og` guard が false のため、source Catalog の
+`/Extensions /ADBE` は final PDF version に調停されない
+（`libqpdf/QPDFWriter.cc:53,1374-1436`）。PCLm の direct-root copy は
+`output_root_copy_with_adbe(..., false)` を使い、indirect Catalog の true 経路は
+変更しない。direct `/Root` に不一致の `/ADBE` を持つ fixture-built document の
+PCLm regression test で、source `/1.4`・level 5 が保持されることを固定する。
+これは direct-root semantics の bounded fixであり、PCLm と writer 全体の parity
+完了を意味しない。

@@ -84,9 +84,13 @@ pub(crate) fn write_pclm<R: Read + Seek + 'static, W: Write>(
         false,
     )?; // cov:ignore: shared late-trailer success continuation is covered by the PCLm live tests
 
+    // qpdf's `Members::root_og` is an invalid `(-1, 0)` identity when the
+    // source root is direct, so `unparseObject`'s `old_og == root_og` ADBE
+    // reconciliation guard is false for this Catalog
+    // (`QPDFWriter.cc:53,1374-1436`).
     let direct_root_output = direct_root
         .as_ref()
-        .map(|root| root.output_root_copy_with_adbe(version, final_extension_level, true))
+        .map(|root| root.output_root_copy_with_adbe(version, final_extension_level, false))
         .transpose()?;
     let direct_root_bytes = direct_root_output
         .as_ref()
