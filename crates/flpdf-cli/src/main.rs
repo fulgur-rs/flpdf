@@ -4822,14 +4822,6 @@ fn run_command(command: Commands, overlay_specs: &[OverlaySpec]) -> CliResult<()
                 // --coalesce-contents is handled separately below: it is a
                 // page transformation with the same post-selection owner as
                 // generate-appearances and flatten-annotations.
-                //
-                // --decrypt is rejected for the same reason: the page-ops
-                // pipeline already rejects encrypted inputs (so a useful
-                // --decrypt + page-ops combination is impossible), and on
-                // plaintext input --decrypt is a silent no-op anyway —
-                // rejecting upfront surfaces the unsupported combination
-                // instead of leaving the user wondering whether decryption
-                // happened.
                 // --optimize-images and --externalize-inline-images are NOT in
                 // this list: unlike the other
                 // rewrite-only mutation passes above, the page-operation
@@ -4837,15 +4829,8 @@ fn run_command(command: Commands, overlay_specs: &[OverlaySpec]) -> CliResult<()
                 // run_rewrite_with_page_ops) already accept and apply it via
                 // `image_transform_options`, mirroring
                 // the top-level --pages/--rotate/--split-pages routes.
-                if cmd.copy_encryption.is_some() {
-                    emit_logger_error(
-                        "flpdf: --copy-encryption is \
-                         not applied in the --pages/--rotate/--split-pages/\
-                         --collate pipeline; rerun without them or without \
-                         the page operation\n",
-                    );
-                    std::process::exit(1);
-                }
+                // --copy-encryption is carried in WriterOptions and applied
+                // by the final writer for each page-operation output.
                 // The decorate path (--rotate/--split-pages without --pages)
                 // does not thread remove_unreferenced_resources; an explicit
                 // Yes/No would be silently dropped, so reject it. Auto (the
