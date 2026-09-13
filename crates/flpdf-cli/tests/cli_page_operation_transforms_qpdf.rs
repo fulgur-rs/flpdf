@@ -43,6 +43,15 @@ fn run_flpdf(args: &[String]) -> Output {
         .expect("flpdf should spawn")
 }
 
+fn run_flpdf_quiet(args: &[String]) -> Output {
+    Command::cargo_bin("flpdf")
+        .expect("flpdf binary should build")
+        .env("FLPDF_STATIC_ID_QUIET", "1")
+        .args(args)
+        .output()
+        .expect("flpdf should spawn")
+}
+
 fn assemble_pdf(objects: &[&[u8]]) -> Vec<u8> {
     let mut bytes = b"%PDF-1.7\n".to_vec();
     let mut offsets = Vec::with_capacity(objects.len());
@@ -293,4 +302,191 @@ fn top_level_page_operations_apply_appearance_and_flatten_transformations_like_q
         assert!(qpdf.status.success(), "{label}: qpdf failed");
         assert_pdf_outputs_match(&qpdf_output, &flpdf_output, split, label);
     }
+}
+
+#[test]
+fn top_level_page_selection_coalesces_contents_like_qpdf() {
+    if !qpdf_available() {
+        if std::env::var_os("CI").is_some() {
+            panic!("{EXPECTED_QPDF_VERSION} is required for this parity test on CI");
+        }
+        eprintln!("skipping: {EXPECTED_QPDF_VERSION} is not available");
+        return;
+    }
+
+    let tempdir = tempfile::tempdir().unwrap();
+    let input = Path::new(env!("CARGO_MANIFEST_DIR"))
+        .join("../../tests/fixtures/compat/multi-contents-one-page.pdf");
+    let qpdf_output = tempdir.path().join("q-output.pdf");
+    let flpdf_output = tempdir.path().join("f-output.pdf");
+    let input = input.to_str().unwrap();
+
+    let make_args = |output: &Path| {
+        vec![
+            "--static-id".to_owned(),
+            "--coalesce-contents".to_owned(),
+            input.to_owned(),
+            "--pages".to_owned(),
+            input.to_owned(),
+            "1".to_owned(),
+            "--".to_owned(),
+            output.to_str().unwrap().to_owned(),
+        ]
+    };
+    let qpdf_args = make_args(&qpdf_output);
+    let flpdf_args = make_args(&flpdf_output);
+    let qpdf = run_qpdf(&qpdf_args);
+    let flpdf = run_flpdf_quiet(&flpdf_args);
+    assert_process_matches(&qpdf, &flpdf, "top-level --pages --coalesce-contents");
+    assert!(qpdf.status.success(), "qpdf page selection should succeed");
+    assert_pdf_outputs_match(
+        &qpdf_output,
+        &flpdf_output,
+        false,
+        "top-level --pages --coalesce-contents",
+    );
+}
+
+#[test]
+fn rewrite_page_selection_coalesces_contents_like_qpdf() {
+    if !qpdf_available() {
+        if std::env::var_os("CI").is_some() {
+            panic!("{EXPECTED_QPDF_VERSION} is required for this parity test on CI");
+        }
+        eprintln!("skipping: {EXPECTED_QPDF_VERSION} is not available");
+        return;
+    }
+
+    let tempdir = tempfile::tempdir().unwrap();
+    let input = Path::new(env!("CARGO_MANIFEST_DIR"))
+        .join("../../tests/fixtures/compat/multi-contents-one-page.pdf");
+    let qpdf_output = tempdir.path().join("q-output.pdf");
+    let flpdf_output = tempdir.path().join("f-output.pdf");
+    let input = input.to_str().unwrap();
+
+    let qpdf_args = vec![
+        "--static-id".to_owned(),
+        "--coalesce-contents".to_owned(),
+        input.to_owned(),
+        "--pages".to_owned(),
+        input.to_owned(),
+        "1".to_owned(),
+        "--".to_owned(),
+        qpdf_output.to_str().unwrap().to_owned(),
+    ];
+    let flpdf_args = vec![
+        "rewrite".to_owned(),
+        "--static-id".to_owned(),
+        "--coalesce-contents".to_owned(),
+        input.to_owned(),
+        flpdf_output.to_str().unwrap().to_owned(),
+        "--pages".to_owned(),
+        input.to_owned(),
+        "1".to_owned(),
+        "--".to_owned(),
+    ];
+    let qpdf = run_qpdf(&qpdf_args);
+    let flpdf = run_flpdf_quiet(&flpdf_args);
+    assert_process_matches(&qpdf, &flpdf, "rewrite --pages --coalesce-contents");
+    assert!(
+        qpdf.status.success(),
+        "qpdf rewrite page selection should succeed"
+    );
+    assert_pdf_outputs_match(
+        &qpdf_output,
+        &flpdf_output,
+        false,
+        "rewrite --pages --coalesce-contents",
+    );
+}
+
+#[test]
+fn rewrite_rotate_coalesces_contents_like_qpdf() {
+    if !qpdf_available() {
+        if std::env::var_os("CI").is_some() {
+            panic!("{EXPECTED_QPDF_VERSION} is required for this parity test on CI");
+        }
+        eprintln!("skipping: {EXPECTED_QPDF_VERSION} is not available");
+        return;
+    }
+
+    let tempdir = tempfile::tempdir().unwrap();
+    let input = Path::new(env!("CARGO_MANIFEST_DIR"))
+        .join("../../tests/fixtures/compat/multi-contents-one-page.pdf");
+    let qpdf_output = tempdir.path().join("q-output.pdf");
+    let flpdf_output = tempdir.path().join("f-output.pdf");
+    let input = input.to_str().unwrap();
+    let qpdf_args = vec![
+        "--static-id".to_owned(),
+        "--coalesce-contents".to_owned(),
+        "--rotate=+90".to_owned(),
+        input.to_owned(),
+        qpdf_output.to_str().unwrap().to_owned(),
+    ];
+    let flpdf_args = vec![
+        "rewrite".to_owned(),
+        "--static-id".to_owned(),
+        "--coalesce-contents".to_owned(),
+        "--rotate=+90".to_owned(),
+        input.to_owned(),
+        flpdf_output.to_str().unwrap().to_owned(),
+    ];
+
+    let qpdf = run_qpdf(&qpdf_args);
+    let flpdf = run_flpdf_quiet(&flpdf_args);
+    assert_process_matches(&qpdf, &flpdf, "rewrite --rotate --coalesce-contents");
+    assert!(qpdf.status.success(), "qpdf rotate rewrite should succeed");
+    assert_pdf_outputs_match(
+        &qpdf_output,
+        &flpdf_output,
+        false,
+        "rewrite --rotate --coalesce-contents",
+    );
+}
+
+#[test]
+fn rewrite_split_coalesces_contents_like_qpdf() {
+    if !qpdf_available() {
+        if std::env::var_os("CI").is_some() {
+            panic!("{EXPECTED_QPDF_VERSION} is required for this parity test on CI");
+        }
+        eprintln!("skipping: {EXPECTED_QPDF_VERSION} is not available");
+        return;
+    }
+
+    let tempdir = tempfile::tempdir().unwrap();
+    let input = Path::new(env!("CARGO_MANIFEST_DIR"))
+        .join("../../tests/fixtures/compat/multi-contents-one-page.pdf");
+    let qpdf_output = tempdir.path().join("q-output.pdf");
+    let flpdf_output = tempdir.path().join("f-output.pdf");
+    let input = input.to_str().unwrap();
+    let qpdf_args = vec![
+        "--static-id".to_owned(),
+        "--coalesce-contents".to_owned(),
+        "--split-pages=1".to_owned(),
+        input.to_owned(),
+        qpdf_output.to_str().unwrap().to_owned(),
+    ];
+    let flpdf_args = vec![
+        "rewrite".to_owned(),
+        "--static-id".to_owned(),
+        "--coalesce-contents".to_owned(),
+        "--split-pages=1".to_owned(),
+        input.to_owned(),
+        flpdf_output.to_str().unwrap().to_owned(),
+    ];
+
+    let qpdf = run_qpdf(&qpdf_args);
+    let flpdf = run_flpdf_quiet(&flpdf_args);
+    assert_process_matches(&qpdf, &flpdf, "rewrite --split-pages --coalesce-contents");
+    assert!(qpdf.status.success(), "qpdf split rewrite should succeed");
+    let qpdf_chunk = qpdf_output.with_file_name("q-output-1.pdf");
+    let flpdf_chunk = flpdf_output.with_file_name("f-output-1.pdf");
+    assert!(qpdf_chunk.is_file(), "qpdf split output must exist");
+    assert!(flpdf_chunk.is_file(), "flpdf split output must exist");
+    assert_eq!(
+        std::fs::read(&flpdf_chunk).unwrap(),
+        std::fs::read(&qpdf_chunk).unwrap(),
+        "rewrite --split-pages --coalesce-contents output must match qpdf"
+    );
 }

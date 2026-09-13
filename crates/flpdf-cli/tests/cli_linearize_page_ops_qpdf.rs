@@ -233,6 +233,43 @@ fn top_level_flatten_rotation_linearize_matches_qpdf() {
 }
 
 #[test]
+fn top_level_coalesce_linearize_matches_qpdf() {
+    if skip_if_qpdf_missing() {
+        return;
+    }
+    let temp = tempfile::tempdir().unwrap();
+    let input = fixture("multi-contents-one-page.pdf");
+    let qpdf_output = temp.path().join("qpdf-coalesce.pdf");
+    let flpdf_output = temp.path().join("flpdf-coalesce.pdf");
+    let input = input.to_str().unwrap();
+
+    let qpdf = run_qpdf(&[
+        "--static-id",
+        "--coalesce-contents",
+        "--linearize",
+        input,
+        qpdf_output.to_str().unwrap(),
+    ]);
+    assert_success(&qpdf, "qpdf --coalesce-contents --linearize");
+
+    let flpdf = run_flpdf(&[
+        "--static-id",
+        "--coalesce-contents",
+        "--linearize",
+        input,
+        flpdf_output.to_str().unwrap(),
+    ]);
+    assert_success(&flpdf, "flpdf --coalesce-contents --linearize");
+    assert_linearized(&qpdf_output, "qpdf coalesced output");
+    assert_linearized(&flpdf_output, "flpdf coalesced output");
+    assert_eq!(
+        std::fs::read(&flpdf_output).unwrap(),
+        std::fs::read(&qpdf_output).unwrap(),
+        "top-level coalesce+linearize output must match qpdf"
+    );
+}
+
+#[test]
 fn top_level_split_pages_linearizes_every_chunk_like_qpdf() {
     if skip_if_qpdf_missing() {
         return;
