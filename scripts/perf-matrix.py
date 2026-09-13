@@ -141,6 +141,22 @@ def measure(command, directory, name, timeout):
         try:
             # wait(timeout=...) polls in Python and can add tens of milliseconds.
             status = process.wait()
+        except BaseException:
+            # start_new_session=True deliberately isolates the child from
+            # terminal signals. If this wait is interrupted, clean up that
+            # process group before propagating the interruption so it cannot
+            # outlive the harness.
+            try:
+                os.killpg(process.pid, signal.SIGKILL)
+            except ProcessLookupError:
+                pass
+            try:
+                process.wait()
+            except BaseException:
+                # Preserve the original interruption even if the cleanup
+                # wait is itself interrupted or the child was already gone.
+                pass
+            raise
         finally:
             timer.cancel()
             timer.join()
@@ -220,12 +236,28 @@ def require_markers(serialized, family):
         raise ValueError("output dropped benchmark objects: " + ",".join(missing))
 
 
+def validate_check_output(artifact):
+    """Require the qpdf-shaped document summary from a successful check."""
+    text = artifact.read_text(errors="replace")
+    missing = []
+    if "PDF Version:" not in text:
+        missing.append("PDF Version:")
+    if not ("File is encrypted" in text or "File is not encrypted" in text):
+        missing.append("File is [not] encrypted")
+    if not ("File is linearized" in text or "File is not linearized" in text):
+        missing.append("File is [not] linearized")
+    if missing:
+        raise ValueError("check output missing qpdf summary: " + ",".join(missing))
+
+
 def validate_sample(sample, operation, output, qpdf, expected_pages, family, timeout):
     if sample["exit_status"] or sample.get("timeout") or not sample["max_rss_kib"]:
         return {"ok": False, "reason": "command failed or metrics missing"}
     try:
         artifact = Path(sample["stdout"]) if operation in ("check", "npages", "json") else output
-        if operation == "npages":
+        if operation == "check":
+            validate_check_output(artifact)
+        elif operation == "npages":
             if int(artifact.read_text().strip()) != expected_pages:
                 raise ValueError("page count mismatch")
         elif operation == "json":
@@ -271,7 +303,10 @@ def benchmark_case(source, operation, binaries, args, out):
         # Alternate pair order; no concurrent measurements compete for RAM/CPU.
         names = list(binaries) if round_number % 2 == 0 else list(reversed(binaries))
         for name in names:
-            output = directory / f"{name}.pdf"
+            # Every invocation gets a fresh path. A stateful external binary
+            # must not pass by leaving a valid PDF from an earlier phase in
+            # the path that validation is about to inspect.
+            output = directory / f"{name}-{phase}-{index}.pdf"
             sample = measure(command_for(binaries[name], operation, source["path"], output),
                              directory, f"{name}-{phase}-{index}", args.timeout)
             sample["validation"] = validate_sample(sample, operation, output, binaries["qpdf"],

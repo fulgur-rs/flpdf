@@ -2,11 +2,13 @@
 import importlib.util
 import json
 from pathlib import Path
+import signal
 import shutil
 import subprocess
 import sys
 import tempfile
 import unittest
+from unittest import mock
 
 
 SCRIPT = Path(__file__).resolve().parents[1] / "perf-matrix.py"
@@ -75,6 +77,35 @@ class MeasurementContracts(unittest.TestCase):
             self.assertLess(sample["wall_seconds"], 5)
             self.assertFalse(perf.validate_sample(sample, "check", None, None, 1, "pages", 10)["ok"])
 
+    @unittest.skipUnless(Path("/usr/bin/time").exists(), "GNU time required")
+    def test_measure_kills_process_group_when_wait_is_interrupted(self):
+        class InterruptedProcess:
+            pid = 12345
+
+            def __init__(self):
+                self.wait_calls = 0
+
+            def wait(self):
+                self.wait_calls += 1
+                if self.wait_calls == 1:
+                    raise KeyboardInterrupt
+                return -signal.SIGKILL
+
+        process = InterruptedProcess()
+        timer = mock.Mock()
+        with tempfile.TemporaryDirectory() as tmp:
+            with mock.patch.object(perf.subprocess, "Popen", return_value=process):
+                with mock.patch.object(perf.threading, "Timer", return_value=timer):
+                    with mock.patch.object(perf.os, "killpg") as killpg:
+                        with self.assertRaises(KeyboardInterrupt):
+                            perf.measure([sys.executable, "-c", "pass"],
+                                         Path(tmp), "interrupt", 10)
+        killpg.assert_called_once_with(process.pid, perf.signal.SIGKILL)
+        self.assertEqual(process.wait_calls, 2)
+        timer.start.assert_called_once_with()
+        timer.cancel.assert_called_once_with()
+        timer.join.assert_called_once_with()
+
     def test_successful_exit_with_invalid_json_is_rejected(self):
         with tempfile.TemporaryDirectory() as tmp:
             output = Path(tmp) / "output"
@@ -138,6 +169,23 @@ class MeasurementContracts(unittest.TestCase):
         sample = {"exit_status": 0, "max_rss_kib": 0}
         self.assertFalse(perf.validate_sample(sample, "check", None, None, 1, "pages", 10)["ok"])
 
+    def test_check_requires_qpdf_check_summary_output(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            output = Path(tmp) / "check.stdout"
+            sample = {"exit_status": 0, "max_rss_kib": 100, "stdout": str(output)}
+            output.write_text("fake checker succeeded\\n")
+            self.assertFalse(
+                perf.validate_sample(sample, "check", None, None, 1, "pages", 10)["ok"]
+            )
+            output.write_text(
+                "PDF Version: 1.7\\n"
+                "File is not encrypted\\n"
+                "File is not linearized\\n"
+            )
+            self.assertTrue(
+                perf.validate_sample(sample, "check", None, None, 1, "pages", 10)["ok"]
+            )
+
     def test_pdf_recipe_offsets_and_reachability(self):
         with tempfile.TemporaryDirectory() as tmp:
             path = Path(tmp) / "input.pdf"
@@ -154,6 +202,38 @@ class MeasurementContracts(unittest.TestCase):
 
 @unittest.skipUnless(pinned_qpdf_available(), "qpdf 11.9.0 required for live harness contracts")
 class LiveContracts(unittest.TestCase):
+    def test_stateful_noop_writer_cannot_reuse_a_previous_output(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            fake = root / "fake-flpdf"
+            fake.write_text(
+                "#!/usr/bin/env python3\n"
+                "from pathlib import Path\n"
+                "import shutil\n"
+                "import sys\n"
+                "if len(sys.argv) == 2 and sys.argv[1] == '--version':\n"
+                "    print('qpdf version 11.9.0')\n"
+                "    raise SystemExit\n"
+                "source = Path(sys.argv[1])\n"
+                "output = Path(sys.argv[-1])\n"
+                "seen = source.with_suffix('.seen')\n"
+                "if not seen.exists():\n"
+                "    seen.write_text('seen')\n"
+                "    shutil.copyfile(source, output)\n"
+            )
+            fake.chmod(0o755)
+            out = root / "perf"
+            result = subprocess.run(
+                [sys.executable, str(SCRIPT), "--output", str(out),
+                 "--flpdf", str(fake), "--sizes", "2", "--stream-mib", "1",
+                 "--operations", "rewrite", "--runs", "1", "--warmups", "0",
+                 "--skip-qtest"],
+                capture_output=True, text=True)
+            self.assertEqual(result.returncode, 1, result.stderr)
+            report = json.loads((out / "results.json").read_text())
+            self.assertEqual(report["status"], "validation-failed")
+            self.assertTrue(any(not case["validation"]["ok"] for case in report["cases"]))
+
     def test_failed_validation_preserves_report_and_exits_nonzero(self):
         with tempfile.TemporaryDirectory() as tmp:
             out = Path(tmp) / "invalid"
