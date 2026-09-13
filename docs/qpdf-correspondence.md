@@ -2969,3 +2969,17 @@ job's password and recovery policy to every donor (`libqpdf/QPDFJob.cc:1818-1845
 and keeps donor path attribution at the job error boundary. The CLI regression
 cases compare rotation, segment password mode, and donor-password failure
 against qpdf 11.9.0.
+
+### Combined show-encryption partial-open lifecycle (`flpdf-hy1g2`)
+
+The combined top-level inspection route now also preserves qpdf's
+`createQPDF` password-error boundary. When `show_encryption` is configured,
+`QPDFJob::create_qpdf` uses the existing partial encryption-inspection opener;
+an encrypted document without a derived file key emits the parsed
+`showEncryption` report and returns the successful null-document result before
+update, transformation, or `writeQPDF` continuation. Ordinary open failures
+remain errors, while successful authentication continues through the existing
+create-stage and combined-inspection lifecycle. This corresponds to
+`libqpdf/QPDFJob.cc:432-448,459-480,513-520` and is covered by the six
+wrong-password combined-inspection cases plus a missing-input differential in
+`cli_inspection_combinations.rs`.

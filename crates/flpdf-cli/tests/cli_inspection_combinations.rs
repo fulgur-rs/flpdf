@@ -284,6 +284,41 @@ fn inspection_flags_run_in_qpdf_do_inspection_order() {
 }
 
 #[test]
+fn combined_show_encryption_preserves_qpdf_partial_open_boundary() {
+    if !qpdf_available() {
+        return;
+    }
+
+    let input = concat!(
+        env!("CARGO_MANIFEST_DIR"),
+        "/../../tests/fixtures/compat/encrypted-r4-three-page.pdf"
+    );
+    for inspection in [
+        "--check",
+        "--show-pages",
+        "--show-npages",
+        "--show-xref",
+        "--show-linearization",
+        "--list-attachments",
+    ] {
+        let args = vec![
+            inspection.to_owned(),
+            "--show-encryption".to_owned(),
+            "--password=wrong".to_owned(),
+            input.to_owned(),
+        ];
+        assert_matches_qpdf_exact(&args);
+    }
+}
+
+#[test]
+fn combined_show_encryption_keeps_open_errors_as_errors() {
+    let directory = tempfile::tempdir().expect("temporary missing-input directory");
+    let input = directory.path().join("missing.pdf");
+    assert_matches_qpdf_path(&["--check", "--show-encryption"], &input);
+}
+
+#[test]
 fn page_selection_precedes_single_page_inspection() {
     if !qpdf_available() {
         return;
