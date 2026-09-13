@@ -53,8 +53,12 @@
 //! qpdf keeps the token-filter list on `QPDF_Stream`, not on the common
 //! `QPDFValue` base (`libqpdf/qpdf/QPDF_Stream.hh:101-107`). [`ObjectValue::Stream`]
 //! mirrors that boundary: its stream-local filters and the flpdf-only
-//! normalization marker move with the shared stream value, while the common
-//! mutation generation remains on [`SharedValueState`].
+//! normalization marker move with the shared stream value. qpdf also stores
+//! `QPDFValue::Description` through an optional `std::shared_ptr` rather than
+//! embedding its largest variant (`libqpdf/qpdf/QPDFValue.hh:29-58,60-82,
+//! 141-144`); [`SharedValueState::description`] keeps the common template
+//! form inline while boxing the larger JSON and child forms, so the value
+//! layout does not carry their maximum shape.
 //!
 //! `ValueIdentity::active_pdf_unique_id` is a container representation
 //! substitute for qpdf's per-value `QPDF*` back-pointer (`QPDFValue.hh:150`):
@@ -1102,8 +1106,11 @@ pub(crate) struct JsonDescription {
 /// arbitrary byte sequence rather than a UTF-8 contract.
 pub(crate) enum ObjectDescription {
     Template(Vec<u8>),
-    Json(JsonDescription),
-    Child(ChildDescription),
+    /// Keep the larger qpdf description shapes out of every common value
+    /// allocation without adding a wrapper allocation to the usual template
+    /// description installed by the parser.
+    Json(Box<JsonDescription>),
+    Child(Box<ChildDescription>),
 }
 
 /// Live slots sharing one qpdf-shaped value. qpdf has no reverse owner list,
@@ -1441,6 +1448,10 @@ struct SharedValueState {
     value: ObjectValue,
     identity: ValueIdentity,
     parsed_offset: i64,
+    /// qpdf keeps `Description` behind an optional shared pointer
+    /// (`libqpdf/qpdf/QPDFValue.hh:58-82,141-144`). The template form already
+    /// owns its byte buffer, so it stays inline; the larger JSON and child
+    /// forms are boxed to keep their shapes out of every value allocation.
     description: Option<ObjectDescription>,
     state_owners: StateOwners,
 }
@@ -3134,10 +3145,10 @@ impl ObjectHandle {
     ) {
         let shared = self.0.borrow().shared.clone();
         let mut shared = shared.borrow_mut();
-        shared.description = Some(ObjectDescription::Json(JsonDescription {
+        shared.description = Some(ObjectDescription::Json(Box::new(JsonDescription {
             input: input.as_ref().to_vec(),
             object: object.as_ref().to_vec(),
-        }));
+        })));
         // qpdf writes the description offset through the same set-once guard
         // as any other parsed offset (`QPDFValue::setDescription` calls
         // `setParsedOffset`, `libqpdf/qpdf/QPDFValue.hh:60-65,90-100`), so a
@@ -3265,11 +3276,11 @@ impl ObjectHandle {
         let mut shared = shared.borrow_mut();
         shared.identity.resolver = resolver;
         shared.identity.active_pdf_unique_id = active_pdf_unique_id;
-        shared.description = Some(ObjectDescription::Child(ChildDescription {
+        shared.description = Some(ObjectDescription::Child(Box::new(ChildDescription {
             parent: Rc::downgrade(&parent_shared),
             static_descr: static_descr.as_ref().to_vec(),
             var_descr: var_descr.as_ref().to_vec(),
-        }));
+        })));
     }
 
     /// Report that an accessor expecting `expected_type` ran on this handle.
