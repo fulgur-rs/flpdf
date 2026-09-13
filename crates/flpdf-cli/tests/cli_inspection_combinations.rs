@@ -313,6 +313,10 @@ fn combined_show_encryption_preserves_qpdf_partial_open_boundary() {
 
 #[test]
 fn combined_show_encryption_keeps_open_errors_as_errors() {
+    if !qpdf_available() {
+        return;
+    }
+
     let directory = tempfile::tempdir().expect("temporary missing-input directory");
     let input = directory.path().join("missing.pdf");
     assert_matches_qpdf_path(&["--check", "--show-encryption"], &input);
