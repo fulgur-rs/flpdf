@@ -550,6 +550,14 @@ where
     // qpdf's overlay job obtains the repaired destination page list before
     // resolving any source ranges or performing placement.
     let n_dest = u32_len(PageDocumentHelper::new(dest).get_all_pages()?.len());
+    // qpdf still validates/opens the configured source documents, but its
+    // page loop has no work when the destination has no pages
+    // (`QPDFJob.cc:1970-1978`). Do not feed the zero count into the ordinary
+    // page-range parser: that parser correctly rejects zero-page bounds for
+    // page-selection callers, while underlay/overlay is a no-op here.
+    if n_dest == 0 {
+        return Ok(());
+    }
     let mut entries: Vec<(u32, OverlaySource)> = Vec::new();
     for (spec_index, spec) in specs.iter_mut().enumerate() {
         let sources = spec_page_sources(
