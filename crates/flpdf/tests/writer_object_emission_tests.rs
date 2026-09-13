@@ -1,6 +1,8 @@
 //! qpdf writeObject progress precedes unparse of the live object.
 
+use flpdf::ObjectRef;
 use flpdf::{EncryptParams, ObjectHandle, ObjectStreamMode, Pdf, PdfOpenOptions, PdfWriter};
+use std::cell::Cell;
 use std::io::Cursor;
 use std::rc::Rc;
 
@@ -1054,6 +1056,97 @@ fn specialized_objstm_member_progress_mutation_is_visible_on_the_second_pass() {
             .windows(b"/MemberProgressProbe 42".len())
             .any(|window| window == b"/MemberProgressProbe 42"),
         "a member mutation made before the second-pass unparse must be emitted"
+    );
+}
+
+#[test]
+fn qdf_objstm_pair_offsets_reuse_first_pass_positions_after_member_mutation() {
+    let mut pdf = Pdf::open(Cursor::new(
+        include_bytes!("../../../tests/fixtures/compat/one-page-no-ext.pdf").to_vec(),
+    ))
+    .unwrap();
+    let root = pdf.root_handle().unwrap();
+    let calls = Rc::new(Cell::new(0_u8));
+    let callback_calls = calls.clone();
+    let mut writer = PdfWriter::new(&mut pdf);
+    writer.set_object_stream_mode(ObjectStreamMode::Generate);
+    writer.set_qdf_mode(true);
+    writer.set_compress_streams(false);
+    writer.set_static_id(true);
+    writer.set_output_memory().unwrap();
+    writer.register_progress_reporter(Box::new(move |_percent| {
+        let call = callback_calls.get().saturating_add(1);
+        callback_calls.set(call);
+        match call {
+            // The Catalog is the first member in this fixture. Making it
+            // longer changes the second member's first-pass offset.
+            1 => root.replace_key(
+                b"/FirstPassOnlyLongMutation",
+                ObjectHandle::string(vec![b'x'; 256]),
+            )?,
+            // The first progress callback after the first pass is the final
+            // pass's first member in this fixture. Remove the mutation there
+            // so first- and second-pass body positions intentionally differ.
+            2 => {
+                root.remove_key(b"/FirstPassOnlyLongMutation");
+            }
+            _ => {}
+        }
+        Ok(())
+    }));
+    writer
+        .write()
+        .expect("QDF Generate must preserve qpdf's first-pass ObjStm offsets");
+    assert!(
+        calls.get() >= 4,
+        "the generated ObjStm must run both passes"
+    );
+
+    let output = writer.get_buffer().unwrap();
+    let mut rewritten = Pdf::open(Cursor::new(output)).unwrap();
+    let container = rewritten.get_object_handle(ObjectRef::new(1, 0));
+    let _ = container.get_raw_stream_data().unwrap();
+    let container_dict = container
+        .as_stream_dict()
+        .expect("generated ObjStm is a stream");
+    let first = container_dict
+        .try_get_key(b"/First")
+        .unwrap()
+        .as_integer()
+        .expect("generated QDF ObjStm has /First") as usize;
+    let data = container.get_raw_stream_data().unwrap();
+    let marker = b"%% Object stream: object ";
+    let first_marker_start = data
+        .windows(marker.len())
+        .position(|window| window == marker)
+        .expect("QDF ObjStm has a first member marker");
+    let first_marker_len = data[first_marker_start..]
+        .iter()
+        .position(|byte| *byte == b'\n')
+        .expect("QDF ObjStm marker is newline terminated")
+        + 1;
+    assert_eq!(first, first_marker_start + first_marker_len);
+    let second_marker_start = data[first_marker_start + first_marker_len..]
+        .windows(marker.len())
+        .position(|window| window == marker)
+        .map(|offset| offset + first_marker_start + first_marker_len)
+        .expect("QDF ObjStm has a second member marker");
+    let second_marker_len = data[second_marker_start..]
+        .iter()
+        .position(|byte| *byte == b'\n')
+        .expect("QDF ObjStm second marker is newline terminated")
+        + 1;
+    let pair_table = std::str::from_utf8(&data[..first_marker_start]).unwrap();
+    let second_pass_offset = pair_table
+        .lines()
+        .nth(1)
+        .and_then(|line| line.split_whitespace().nth(1))
+        .and_then(|offset| offset.parse::<usize>().ok())
+        .expect("QDF ObjStm has a second pair-table offset");
+    let final_pass_offset = second_marker_start + second_marker_len - first;
+    assert!(
+        second_pass_offset > final_pass_offset,
+        "the pair table must retain qpdf's first-pass offset when the final member body shrinks"
     );
 }
 

@@ -37,10 +37,11 @@ impl PlainRoute {
 /// qpdf's standard writer selects QDF/normalization state independently from
 /// object-stream packing (`QPDFWriter.cc:2038-2140`), while the plain live
 /// queue owns Disable and Preserve when the writer cohort is otherwise plain.
-/// Plain non-QDF/non-normalize Generate is owned by the specialized standard
-/// live coordinator after its setup snapshot; QDF/normalization Generate,
-/// encryption, PCLm, extra headers, encrypted input, or a requested mode that
-/// no longer matches the effective option set belong to another consumer.
+/// Every eligible Generate mode is owned by the specialized standard live
+/// coordinator after its setup snapshot; QDF/normalization formatting is
+/// selected inside that coordinator. Encryption, PCLm, extra headers, encrypted
+/// input, or a requested mode that no longer matches the effective option set
+/// belong to another consumer.
 pub(crate) fn classify_plain_route(
     pdf_is_encrypted: bool,
     options: &WriterOptions,
@@ -60,13 +61,10 @@ pub(crate) fn classify_plain_route(
     }
     // qpdf computes Generate membership and fresh null containers during setup,
     // then emits them through the same live standard queue as Disable/Preserve
-    // (`QPDFWriter.cc:1970-2006,2907-3031`). The specialized live coordinator
-    // consumes that setup snapshot; only QDF/normalization still needs the
-    // planned consumer because its formatting/length-holder state is distinct.
-    if options.object_streams == ObjectStreamMode::Generate
-        && !options.qdf
-        && !options.content_normalization
-    {
+    // (`QPDFWriter.cc:1970-2006,2907-3031`). Every eligible Generate cohort is
+    // therefore owned by the outer specialized coordinator; its QDF and
+    // normalization formatting are writer dimensions inside that consumer.
+    if options.object_streams == ObjectStreamMode::Generate {
         return PlainRoute::OutsidePlain;
     }
     if matches!(
@@ -107,10 +105,10 @@ pub(crate) fn write_plain<R: Read + Seek, W: Write>(
     // (`assignCompressedObjectNumbers`, `:1057-1069`). Both are the same
     // `enqueueObject`/`writeStandard` live walk, just with container-aware
     // numbering in the second case, so Preserve routes through the live queue
-    // either way. Plain non-QDF/non-normalize Generate now follows that same
+    // either way. Every eligible Generate mode now follows that same
     // specialized live coordinator after setup has registered its fresh
-    // containers; Generate with QDF/normalization remains plan-based because
-    // its formatting and length-holder state is a separate consumer.
+    // containers; QDF/normalization formatting is selected inside that
+    // coordinator rather than by a separate planned consumer.
     let route = classify_plain_route(
         pdf.is_encrypted(),
         options,
@@ -159,10 +157,9 @@ pub(crate) fn write_plain<R: Read + Seek, W: Write>(
 
 /// Return whether the QDF/normalization route can use the live queue without
 /// having to rebuild source or generated ObjStm containers. A source Preserve
-/// map makes the container-membership boundary observable, and QDF/normalize
-/// Generate has fresh packing plus formatting decisions; those cases remain
-/// on the plan-based consumer. Plain non-QDF/non-normalize Generate is set up
-/// before the live coordinator and is classified outside this consumer.
+/// map makes the container-membership boundary observable. Generate has fresh
+/// packing decisions and is set up before the specialized live coordinator;
+/// this consumer is used for the Disable/Preserve QDF/normalize cohort only.
 pub(crate) fn qdf_or_normalize_live_eligible(
     options: &WriterOptions,
     source_object_stream_data: &BTreeMap<u32, u32>,

@@ -3544,15 +3544,21 @@ fn emit_canonical_pdf_inner<R: Read + Seek, W: Write>(
         )
         && (options.object_streams == ObjectStreamMode::Disable
             || source_object_stream_data.is_empty());
+    let qdf_or_normalize_generate_live = options.object_streams == ObjectStreamMode::Generate
+        && (options.qdf || options.content_normalization)
+        && !pdf.is_encrypted()
+        && options.encrypt.is_none()
+        && options.copy_encryption.is_none()
+        && !options.pclm;
     let specialized_standard_live = matches!(plain_route, plain::PlainRoute::OutsidePlain)
         && !qdf_or_normalize_live
         && !encrypted_qdf_or_normalize_live
-        && !options.qdf
-        && !options.content_normalization
         && !options.pclm;
+    let specialized_standard_live = specialized_standard_live
+        && ((!options.qdf && !options.content_normalization) || qdf_or_normalize_generate_live);
     if specialized_standard_live || encrypted_qdf_or_normalize_live {
         let (page_sequences, contents_sequences, content_container_sequences) =
-            if encrypted_qdf_or_normalize_live {
+            if encrypted_qdf_or_normalize_live || qdf_or_normalize_generate_live {
                 plain::live_page_context(pdf, special_streams)?
             } else {
                 (BTreeMap::new(), BTreeMap::new(), BTreeMap::new())

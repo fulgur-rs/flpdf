@@ -575,6 +575,17 @@ fn duplicate_page_after_foreign_qdf_generated_objstm_matches_qpdf() {
 }
 
 #[test]
+fn duplicate_page_after_foreign_normalize_generated_objstm_matches_qpdf() {
+    if skip_if_qpdf_missing() {
+        return;
+    }
+    assert_duplicate_after_foreign_matches_qpdf(
+        &["--normalize-content=y", "--object-streams=generate"],
+        "content-normalization Generate must preserve qpdf's live ObjStm route",
+    );
+}
+
+#[test]
 fn duplicate_page_after_foreign_linearized_generated_objstm_matches_qpdf() {
     if skip_if_qpdf_missing() {
         return;

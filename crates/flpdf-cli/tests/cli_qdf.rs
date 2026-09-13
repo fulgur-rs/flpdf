@@ -371,6 +371,49 @@ fn qdf_object_streams_generate_matches_qpdf() {
 }
 
 #[test]
+fn qdf_generate_preserves_nonzero_original_generation_marker() {
+    if skip_if_qpdf_missing() {
+        return;
+    }
+    let input = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+        .join("../../tests/fixtures/compat/null-visible-stale-generation.pdf");
+    let temp = tempfile::tempdir().unwrap();
+    let qpdf_output = temp.path().join("qpdf.pdf");
+    let flpdf_output = temp.path().join("flpdf.pdf");
+
+    let qpdf = ShellCommand::new("qpdf")
+        .args([
+            "--qdf",
+            "--object-streams=generate",
+            "--static-id",
+            input.to_str().unwrap(),
+            qpdf_output.to_str().unwrap(),
+        ])
+        .status()
+        .expect("failed to spawn qpdf");
+    assert!(qpdf.success(), "qpdf QDF generation failed");
+
+    Command::cargo_bin("flpdf")
+        .unwrap()
+        .args([
+            "rewrite",
+            "--qdf",
+            "--object-streams=generate",
+            "--static-id",
+            input.to_str().unwrap(),
+            flpdf_output.to_str().unwrap(),
+        ])
+        .assert()
+        .success();
+
+    assert_eq!(
+        std::fs::read(&flpdf_output).unwrap(),
+        std::fs::read(&qpdf_output).unwrap(),
+        "QDF Generate must preserve non-zero original object generations"
+    );
+}
+
+#[test]
 fn qdf_object_streams_generate_matches_qpdf_at_the_batch_cap_boundary() {
     if skip_if_qpdf_missing() {
         return;
