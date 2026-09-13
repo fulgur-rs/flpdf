@@ -395,6 +395,34 @@ fn check_accepts_overlay_before_inspection_like_qpdf() {
 }
 
 #[test]
+fn inspection_accepts_remaining_create_stage_transformations_like_qpdf() {
+    if !qpdf_available() {
+        return;
+    }
+
+    let form = concat!(
+        env!("CARGO_MANIFEST_DIR"),
+        "/../../tests/fixtures/compat/form-fields-and-annotations.pdf"
+    );
+    let transformations = [
+        "--remove-restrictions",
+        "--coalesce-contents",
+        "--flatten-annotations=all",
+    ];
+    for inspection in [
+        "--show-pages",
+        "--show-npages",
+        "--show-xref",
+        "--show-linearization",
+    ] {
+        for transformation in transformations {
+            assert_matches_qpdf(&[inspection, transformation], form);
+        }
+    }
+    assert_matches_qpdf(&["--list-attachments", "--coalesce-contents"], form);
+}
+
+#[test]
 fn overlay_inspection_applies_rotation_before_the_consumer() {
     if !qpdf_available() {
         return;
