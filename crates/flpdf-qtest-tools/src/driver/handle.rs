@@ -6,32 +6,10 @@ use flpdf::{Error, ObjectHandle, ObjectRef, Pdf};
 pub(crate) struct DecodeParamTypeWarning {
     pub(crate) filter_index: usize,
     pub(crate) object_type: &'static str,
-    pub(crate) source: DecodeParmsWarningSource,
-    /// The offending value's own parsed offset
-    /// ([`ObjectHandle::try_get_parsed_offset`]), captured at the moment this
-    /// warning is generated rather than re-derived later.
-    ///
-    /// This mirrors qpdf's `QPDFObjectHandle::typeWarning`
-    /// (`libqpdf/QPDFObjectHandle.cc:2168-2187`), which reports the
-    /// dereferenced offending handle's own recorded parse position — the
-    /// same field `getParsedOffset()` exposes — not a separately re-derived
-    /// byte offset.
-    pub(crate) offset: Option<u64>,
-}
-
-/// Where a `/DecodeParms` type-warning's object/offset attribution comes
-/// from, mirroring qpdf's `QPDFObjectHandle::typeWarning` description:
-/// whichever object's own bytes physically hold the offending value.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub(crate) enum DecodeParmsWarningSource {
-    /// The value sits directly in the stream dictionary itself (no reference
-    /// was followed at or above this filter position).
-    StreamDictionary,
-    /// The value is the entire body of this indirect object.
-    ObjectBody(ObjectRef),
-    /// The value is a direct item at this array index inside an indirect
-    /// object's own array body.
-    ArrayItem(ObjectRef, usize),
+    /// The offending handle's already-rendered qpdf description. qpdf puts
+    /// the source filename, ObjStm context, object identity, and decoded
+    /// member offset here and passes zero as the exception offset.
+    pub(crate) description: Vec<u8>,
 }
 
 /// The resolved stream-dictionary view consumed by qtest's filter diagnostics
@@ -144,15 +122,9 @@ pub(crate) fn resolve_stream_dictionary_handle<R: Read + Seek>(
         .is_none_or(|names| names.iter().all(|name| qpdf_filter_factory_exists(name)));
 
     let decode_params_value = source.try_get_key(b"/DecodeParms")?;
-    let mut decode_parms_sources = Vec::new();
     let resolved_decode_params = if filterable {
         match filter_names.as_deref() {
-            Some(names) => {
-                let (value, sources) =
-                    resolve_decode_params_handle(pdf, names, &decode_params_value)?;
-                decode_parms_sources = sources;
-                value
-            }
+            Some(names) => resolve_decode_params_handle(pdf, names, &decode_params_value)?,
             None => decode_params_value.clone(),
         }
     } else {
@@ -184,15 +156,10 @@ pub(crate) fn resolve_stream_dictionary_handle<R: Read + Seek>(
                     && matches!(normalized, b"Crypt" | b"FlateDecode" | b"LZWDecode")
                 {
                     let params = params.as_ref().expect("non-null DecodeParms");
-                    let offset = params.try_get_parsed_offset()?;
                     warnings.push(DecodeParamTypeWarning {
                         filter_index,
                         object_type: params.type_name().unwrap_or("unresolved"),
-                        source: decode_parms_sources
-                            .get(filter_index)
-                            .copied()
-                            .unwrap_or(DecodeParmsWarningSource::StreamDictionary),
-                        offset: u64::try_from(offset).ok(),
+                        description: params.description(),
                     });
                 }
                 if normalized == b"Crypt"
@@ -331,50 +298,35 @@ fn resolve_decode_param_for_filters_handle<R: Read + Seek>(
     pdf: &mut Pdf<R>,
     filters: &[Vec<u8>],
     value: &ObjectHandle,
-) -> flpdf::Result<(ObjectHandle, Option<ObjectRef>)> {
-    let (value, _, terminal_ref) = resolve_handle(pdf, value)?;
+) -> flpdf::Result<ObjectHandle> {
+    let (value, _, _) = resolve_handle(pdf, value)?;
     let value = if let Some(entries) = value.as_dictionary() {
         resolve_decode_param_dict_handle(pdf, filters, entries)?
     } else {
         value
     };
-    Ok((value, terminal_ref))
+    Ok(value)
 }
 
 fn resolve_decode_params_handle<R: Read + Seek>(
     pdf: &mut Pdf<R>,
     filters: &[Vec<u8>],
     value: &ObjectHandle,
-) -> flpdf::Result<(ObjectHandle, Vec<DecodeParmsWarningSource>)> {
-    let (value, _, container_ref) = resolve_handle(pdf, value)?;
+) -> flpdf::Result<ObjectHandle> {
+    let (value, _, _) = resolve_handle(pdf, value)?;
     let Some(values) = value.as_array() else {
-        let (value, _) = resolve_decode_param_for_filters_handle(pdf, filters, &value)?;
-        let source = container_ref
-            .map(DecodeParmsWarningSource::ObjectBody)
-            .unwrap_or(DecodeParmsWarningSource::StreamDictionary);
-        return Ok((value, vec![source; filters.len()]));
+        return resolve_decode_param_for_filters_handle(pdf, filters, &value);
     };
     if values.len() != filters.len() {
-        return Ok((
-            value,
-            vec![DecodeParmsWarningSource::StreamDictionary; values.len()],
-        ));
+        return Ok(value);
     }
     let mut resolved_values = Vec::with_capacity(values.len());
-    let mut sources = Vec::with_capacity(values.len());
-    for (index, (value, filter)) in values.into_iter().zip(filters.iter()).enumerate() {
-        let (value, item_ref) =
+    for (value, filter) in values.into_iter().zip(filters.iter()) {
+        let value =
             resolve_decode_param_for_filters_handle(pdf, std::slice::from_ref(filter), &value)?;
         resolved_values.push(value);
-        sources.push(match (item_ref, container_ref) {
-            (Some(item_ref), _) => DecodeParmsWarningSource::ObjectBody(item_ref),
-            (None, Some(container_ref)) => {
-                DecodeParmsWarningSource::ArrayItem(container_ref, index)
-            }
-            (None, None) => DecodeParmsWarningSource::StreamDictionary,
-        });
     }
-    Ok((ObjectHandle::array(resolved_values), sources))
+    Ok(ObjectHandle::array(resolved_values))
 }
 
 fn remove_identity_crypt_stages_handle(
@@ -891,14 +843,12 @@ mod tests {
                 DecodeParamTypeWarning {
                     filter_index: 0,
                     object_type: "integer",
-                    source: DecodeParmsWarningSource::StreamDictionary,
-                    offset: None,
+                    description: Vec::new(),
                 },
                 DecodeParamTypeWarning {
                     filter_index: 1,
                     object_type: "integer",
-                    source: DecodeParmsWarningSource::StreamDictionary,
-                    offset: None,
+                    description: Vec::new(),
                 },
             ]
         );
@@ -930,19 +880,12 @@ mod tests {
                 DecodeParamTypeWarning {
                     filter_index: 0,
                     object_type: "integer",
-                    source: DecodeParmsWarningSource::ArrayItem(ObjectRef::new(5, 0), 0),
-                    // Real token position of the first `9` in `[ 9 9 ]`
-                    // (object 5's body in `handle_pdf`'s synthetic source),
-                    // captured from the value's own parsed offset rather
-                    // than a fixed sentinel, since this fixture is a
-                    // genuinely parsed object.
-                    offset: Some(121),
+                    description: b", object 5 0 at offset 121".to_vec(),
                 },
                 DecodeParamTypeWarning {
                     filter_index: 1,
                     object_type: "integer",
-                    source: DecodeParmsWarningSource::ArrayItem(ObjectRef::new(5, 0), 1),
-                    offset: Some(123),
+                    description: b", object 5 0 at offset 123".to_vec(),
                 },
             ]
         );

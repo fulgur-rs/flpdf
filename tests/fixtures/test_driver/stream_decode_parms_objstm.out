@@ -1,0 +1,12 @@
+/QTest is indirect and has type stream (10)
+/QTest is a stream.  Dictionary: << /DecodeParms [ null 4 0 R ] /Filter [ /ASCIIHexDecode /FlateDecode ] /Length 23 >>
+Raw stream data:
+789c4b4c4a0600024d0127>
+Uncompressed stream data:
+WARNING: stream_decode_parms_objstm.pdf object stream 3, object 4 0 at offset 4: operation for dictionary attempted on object of type integer: treating as empty
+WARNING: stream_decode_parms_objstm.pdf object stream 3, object 4 0 at offset 4: operation for dictionary attempted on object of type integer: treating as empty
+abc
+End of stream data
+unparse: 6 0 R
+unparseResolved: 6 0 R
+test 1 done

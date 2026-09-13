@@ -2812,7 +2812,16 @@ impl ObjectHandle {
         }
     }
 
-    pub(crate) fn description(&self) -> Vec<u8> {
+    /// Return the rendered qpdf diagnostic description carried by this handle.
+    ///
+    /// qpdf keeps the same description on the shared `QPDFValue` and consumes
+    /// it from `QPDFObjectHandle::typeWarning` rather than reconstructing a
+    /// filename/object/offset tuple (`libqpdf/QPDFValue.cc:14-61`,
+    /// `libqpdf/QPDFObjectHandle.cc:2168-2188`). This accessor exposes that
+    /// already-rendered byte string to cross-crate qpdf compatibility
+    /// consumers; it does not resolve the handle or create a second source
+    /// location model.
+    pub fn description(&self) -> Vec<u8> {
         self.0.borrow().get_description()
     }
 

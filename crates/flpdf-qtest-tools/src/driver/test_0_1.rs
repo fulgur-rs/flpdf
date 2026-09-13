@@ -3,10 +3,7 @@ use std::io::{Read, Seek, Write};
 use flpdf::filters::{DecodeLimits, StreamDecodeEvent};
 use flpdf::{Error, ObjectHandle, ObjectRef, Pdf, QpdfErrorCode, QpdfExc};
 
-use super::handle::{
-    resolve_handle, resolve_stream_dictionary_handle, write_qpdf_object_handle,
-    DecodeParmsWarningSource,
-};
+use super::handle::{resolve_handle, resolve_stream_dictionary_handle, write_qpdf_object_handle};
 use super::{emit_new_diagnostics, write_warning};
 use crate::output::write_bytes;
 
@@ -22,27 +19,27 @@ fn stream_decode_error_detail(error: Error) -> String {
 }
 
 fn write_decode_param_type_warning(
-    filename: &[u8],
-    object_ref: flpdf::ObjectRef,
-    offset: Option<u64>,
+    description: &[u8],
     object_type: &str,
     stdout: &mut dyn Write,
     stderr: &mut dyn Write,
 ) -> flpdf::Result<()> {
-    let mut warning = b"WARNING: ".to_vec();
-    warning.extend_from_slice(filename);
-    warning.extend_from_slice(
-        format!(", object {} {}", object_ref.number, object_ref.generation).as_bytes(),
-    );
-    if let Some(offset) = offset {
-        warning.extend_from_slice(format!(" at offset {offset}").as_bytes());
+    if description.is_empty() {
+        return Err(Error::System(
+            "stream DecodeParms warning has no terminal indirect object".to_owned(),
+        ));
     }
-    warning.extend_from_slice(b": operation for dictionary attempted on object of type ");
-    warning.extend_from_slice(object_type.as_bytes());
-    warning.extend_from_slice(b": treating as empty\n");
-    stdout.flush()?;
-    stderr.write_all(&warning)?;
-    Ok(())
+    let diagnostic = QpdfExc::new(
+        QpdfErrorCode::Object,
+        b"",
+        description,
+        0,
+        format!(
+            "operation for dictionary attempted on object of type {object_type}: treating as empty"
+        )
+        .as_bytes(),
+    );
+    Ok(write_warning(b"", &diagnostic, stdout, stderr)?)
 }
 
 pub(crate) fn run_test_0_1<R: Read + Seek>(
@@ -229,40 +226,18 @@ fn write_object_details<R: Read + Seek>(
             writeln!(stdout)?;
             writeln!(stdout, "Uncompressed stream data:")?;
 
-            let stream_ref = terminal_ref;
-            // Each warning already carries the offending value's own parsed
-            // offset (`ObjectHandle::try_get_parsed_offset`), captured once
-            // when `resolve_stream_dictionary_handle` first inspected it
-            // (`driver/handle.rs::DecodeParamTypeWarning::offset`). qpdf's own
+            // Each warning carries the offending value's rendered qpdf
+            // description from the canonical handle. qpdf's own
             // `QPDFObjectHandle::typeWarning` (`libqpdf/QPDFObjectHandle.cc:
-            // 2168-2187`) reports that same recorded parse position on the
-            // dereferenced offending handle, so no separate source re-read is
-            // needed to attribute a warning to its byte offset.
+            // 2168-2188`) passes that description as the exception's object
+            // field and passes zero as its separate offset, so the ObjStm
+            // source context is never reconstructed from a PDF filename and
+            // a decoded-member offset here.
             let warnings = decode_dictionary.decode_param_type_warnings();
-            let decode_param_warnings = warnings
-                .iter()
-                .map(|warning| {
-                    let object_ref = match warning.source {
-                        DecodeParmsWarningSource::StreamDictionary => {
-                            stream_ref.ok_or_else(|| {
-                                Error::System(
-                                    "stream DecodeParms warning has no terminal indirect object"
-                                        .to_string(),
-                                )
-                            })?
-                        }
-                        DecodeParmsWarningSource::ObjectBody(object_ref)
-                        | DecodeParmsWarningSource::ArrayItem(object_ref, _) => object_ref,
-                    };
-                    Ok((object_ref, warning.object_type, warning.offset))
-                })
-                .collect::<flpdf::Result<Vec<_>>>()?;
-            for (object_ref, object_type, offset) in &decode_param_warnings {
+            for warning in warnings {
                 write_decode_param_type_warning(
-                    filename,
-                    *object_ref,
-                    *offset,
-                    object_type,
+                    &warning.description,
+                    warning.object_type,
                     stdout,
                     stderr,
                 )?;
@@ -273,12 +248,10 @@ fn write_object_details<R: Read + Seek>(
                 return Ok(());
             }
 
-            for (object_ref, object_type, offset) in &decode_param_warnings {
+            for warning in warnings {
                 write_decode_param_type_warning(
-                    filename,
-                    *object_ref,
-                    *offset,
-                    object_type,
+                    &warning.description,
+                    warning.object_type,
                     stdout,
                     stderr,
                 )?;
@@ -892,6 +865,7 @@ mod tests {
         let value_offset = marker_start + b"/DecodeParms ".len();
         let options = PdfOpenOptions {
             repair: true,
+            description: b"fixture.pdf".to_vec(),
             ..PdfOpenOptions::default()
         };
         let mut pdf =
@@ -932,7 +906,14 @@ mod tests {
             .expect("DecodeParms array")
             + b"[ ".len();
         let second = first + b"42 ".len();
-        let mut pdf = Pdf::open_mem_owned(bytes).expect("open indirect DecodeParms array");
+        let mut pdf = Pdf::open_mem_owned_with_options(
+            bytes,
+            PdfOpenOptions {
+                description: b"fixture.pdf".to_vec(),
+                ..PdfOpenOptions::default()
+            },
+        )
+        .expect("open indirect DecodeParms array");
         let mut stdout = Vec::new();
         let mut stderr = Vec::new();
         let mut diagnostics_written = pdf.repair_diagnostics().entries().len();
@@ -978,7 +959,14 @@ mod tests {
             .position(|window| window == b"8 0 obj")
             .expect("DecodeParms scalar")
             + b"8 0 obj".len();
-        let mut pdf = Pdf::open_mem_owned(bytes).expect("open indirect DecodeParms scalar");
+        let mut pdf = Pdf::open_mem_owned_with_options(
+            bytes,
+            PdfOpenOptions {
+                description: b"fixture.pdf".to_vec(),
+                ..PdfOpenOptions::default()
+            },
+        )
+        .expect("open indirect DecodeParms scalar");
         let mut stdout = Vec::new();
         let mut stderr = Vec::new();
         let mut diagnostics_written = pdf.repair_diagnostics().entries().len();
@@ -1136,23 +1124,19 @@ mod tests {
     }
 
     #[test]
-    fn decode_param_warning_formats_offsets_and_unknown_offsets() {
+    fn decode_param_warning_formats_rendered_descriptions() {
         let mut stdout = Vec::new();
         let mut stderr = Vec::new();
 
         write_decode_param_type_warning(
-            b"fixture.pdf",
-            ObjectRef::new(7, 0),
-            Some(42),
+            b"fixture.pdf, object 7 0 at offset 42",
             "integer",
             &mut stdout,
             &mut stderr,
         )
         .expect("warning with offset");
         write_decode_param_type_warning(
-            b"fixture.pdf",
-            ObjectRef::new(8, 1),
-            None,
+            b"fixture.pdf, object 8 1",
             "array",
             &mut stdout,
             &mut stderr,

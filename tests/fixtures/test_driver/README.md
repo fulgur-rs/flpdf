@@ -44,6 +44,12 @@ payload.
 `stream_lzw_nondict_decode_parms_array` pin qpdf's two type warnings at the
 non-dictionary parameter token before decoded output.
 
+`stream_decode_parms_objstm` places the non-dictionary `/DecodeParms` value in
+an ObjStm. Its golden fixes qpdf's description ownership: the warning retains
+the source filename, `object stream N`, object identity, and decoded-member
+offset from the canonical value description rather than rebuilding an
+offset-relative prefix in the driver.
+
 `missing_pdf_header`, `leading_material_pdf_header`, `missing_startxref`, and
 `dict_indirect_value_warning` pin repair-warning lifecycle and the lazy
 dictionary-child diagnostic boundary. The leading-material fixture keeps xref

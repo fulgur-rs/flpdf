@@ -98,6 +98,60 @@ def stream(dictionary: bytes, payload: bytes) -> bytes:
     )
 
 
+def stream_decode_parms_objstm_pdf() -> bytes:
+    data = bytearray(b"%PDF-1.5\n")
+    offsets: dict[int, int] = {}
+
+    def add_object(number: int, body: bytes) -> None:
+        offsets[number] = len(data)
+        data.extend(f"{number} 0 obj\n".encode("ascii"))
+        data.extend(body)
+        data.extend(b"\nendobj\n")
+
+    add_object(1, b"<< /Type /Catalog /Pages 2 0 R >>")
+    add_object(2, b"<< /Type /Pages /Count 0 /Kids [ ] >>")
+    add_object(
+        3,
+        b"<< /Type /ObjStm /N 1 /First 4 /Length 6 >>\n"
+        b"stream\n4 0 42\nendstream",
+    )
+    add_object(
+        6,
+        b"<< /Filter [ /ASCIIHexDecode /FlateDecode ] "
+        b"/DecodeParms [ null 4 0 R ] /Length 23 >>\n"
+        b"stream\n789c4b4c4a0600024d0127>\nendstream",
+    )
+
+    xref_offset = len(data)
+
+    def xref_entry(kind: int, field2: int, field3: int) -> bytes:
+        return bytes([kind]) + field2.to_bytes(4, "big") + field3.to_bytes(2, "big")
+
+    xref_data = b"".join(
+        [
+            xref_entry(0, 0, 65535),
+            xref_entry(1, offsets[1], 0),
+            xref_entry(1, offsets[2], 0),
+            xref_entry(1, offsets[3], 0),
+            xref_entry(2, 3, 0),
+            xref_entry(0, 0, 0),
+            xref_entry(1, offsets[6], 0),
+            xref_entry(1, xref_offset, 0),
+        ]
+    )
+    xref_payload = xref_data.hex().encode("ascii") + b">"
+    add_object(
+        7,
+        b"<< /Type /XRef /W [ 1 4 2 ] /Size 8 /Root 1 0 R /QTest 6 0 R /Length "
+        + str(len(xref_payload)).encode("ascii")
+        + b" /Filter /ASCIIHexDecode >>\nstream\n"
+        + xref_payload
+        + b"\nendstream",
+    )
+    data.extend(f"startxref\n{xref_offset}\n%%EOF\n".encode("ascii"))
+    return bytes(data)
+
+
 def write(name: str, data: bytes) -> None:
     with open(os.path.join(out_dir, name + ".pdf"), "wb") as output:
         output.write(data)
@@ -320,6 +374,7 @@ write(
         },
     ),
 )
+write("stream_decode_parms_objstm", stream_decode_parms_objstm_pdf())
 write(
     "stream_decode_parms_indirect_nondict_array",
     build_pdf(
