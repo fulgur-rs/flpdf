@@ -1810,12 +1810,15 @@ fn detach_bootstrap_handle(source: &ObjectHandle) -> Result<ObjectHandle> {
             stream_provider,
             filter_on_write,
             stream_length,
+            ..
         } => ObjectValue::Stream {
             stream_dict: detach_bootstrap_handle(&stream_dict)?,
             stream_data,
             stream_provider,
             filter_on_write,
             stream_length,
+            stream_token_filters: Default::default(),
+            content_normalization_applied: false,
         },
         other => other,
     };
@@ -6001,6 +6004,8 @@ mod final_handle_tests {
             stream_data: Some(Rc::new(compressed)),
             stream_provider: None,
             filter_on_write: true,
+            stream_token_filters: Default::default(),
+            content_normalization_applied: false,
             stream_length: decoded.len(),
         });
         stream.set_parsed_offset_if_unset(90);
@@ -6049,6 +6054,8 @@ mod final_handle_tests {
             stream_data: Some(Rc::new(vec![0])),
             stream_provider: None,
             filter_on_write: true,
+            stream_token_filters: Default::default(),
+            content_normalization_applied: false,
             stream_length: 1,
         });
 
@@ -9534,6 +9541,8 @@ mod final_handle_tests {
             stream_data: Some(Rc::new(Vec::new())),
             stream_provider: None,
             filter_on_write: true,
+            stream_token_filters: Default::default(),
+            content_normalization_applied: false,
             stream_length: 0,
         });
         let detached = detach_bootstrap_handle(&stream).expect("stream detaches");

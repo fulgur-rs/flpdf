@@ -1018,6 +1018,8 @@ impl<R: Read + Seek> ResolverHandle<R> {
             stream_length: 0,
             stream_provider: None,
             filter_on_write: true,
+            stream_token_filters: Default::default(),
+            content_normalization_applied: false,
         });
         stream.set_parsed_offset_if_unset(0);
         self.make_indirect_from_object_handle(stream)
@@ -3975,6 +3977,8 @@ impl<R: Read + Seek> ResolverHandle<R> {
                 stream_length: length,
                 stream_provider: None,
                 filter_on_write: true,
+                stream_token_filters: Default::default(),
+                content_normalization_applied: false,
             },
             i64::try_from(stream_offset).unwrap_or(i64::MAX),
         ))
@@ -5739,6 +5743,8 @@ mod tests {
             stream_data: None,
             stream_provider: None,
             filter_on_write: true,
+            stream_token_filters: Default::default(),
+            content_normalization_applied: false,
             stream_length: 0,
         });
 
@@ -5758,6 +5764,8 @@ mod tests {
             stream_data: None,
             stream_provider: None,
             filter_on_write: true,
+            stream_token_filters: Default::default(),
+            content_normalization_applied: false,
             stream_length: 0,
         });
         let error = resolver
@@ -5834,6 +5842,8 @@ mod tests {
             stream_length: declared_length,
             stream_provider: None,
             filter_on_write: true,
+            stream_token_filters: Default::default(),
+            content_normalization_applied: false,
         });
         source_stream.set_parsed_offset_if_unset(parsed_offset);
         let source_stream = source
@@ -9204,6 +9214,8 @@ mod tests {
                 stream_data: Some(Rc::new(Vec::new())),
                 stream_provider: None,
                 filter_on_write: true,
+                stream_token_filters: Default::default(),
+                content_normalization_applied: false,
                 stream_length: 0,
             });
 
@@ -9414,6 +9426,8 @@ mod tests {
                 stream_length: 0,
                 stream_provider: None,
                 filter_on_write: true,
+                stream_token_filters: Default::default(),
+                content_normalization_applied: false,
             });
 
         let member = resolver.get_object_handle(member_ref);
@@ -9515,6 +9529,8 @@ mod tests {
                 stream_length: 0,
                 stream_provider: None,
                 filter_on_write: true,
+                stream_token_filters: Default::default(),
+                content_normalization_applied: false,
             });
 
         resolver
@@ -9589,6 +9605,8 @@ mod tests {
                 stream_length: 0,
                 stream_provider: None,
                 filter_on_write: true,
+                stream_token_filters: Default::default(),
+                content_normalization_applied: false,
             });
 
         resolver
@@ -9654,6 +9672,8 @@ mod tests {
                 stream_length: 0,
                 stream_provider: None,
                 filter_on_write: true,
+                stream_token_filters: Default::default(),
+                content_normalization_applied: false,
             });
 
         let member = resolver.get_object_handle(member_ref);
@@ -9713,6 +9733,8 @@ mod tests {
             stream_length: stream_data.len(),
             stream_provider: None,
             filter_on_write: true,
+            stream_token_filters: Default::default(),
+            content_normalization_applied: false,
         });
         stream.set_parsed_offset_if_unset(1);
 
@@ -9775,6 +9797,8 @@ mod tests {
                 stream_length: 0,
                 stream_provider: Some(Rc::new(FailingProvider)),
                 filter_on_write: true,
+                stream_token_filters: Default::default(),
+                content_normalization_applied: false,
             });
 
         let member = resolver.get_object_handle(member_ref);
@@ -9832,6 +9856,8 @@ mod tests {
                 stream_length: 0,
                 stream_provider: None,
                 filter_on_write: true,
+                stream_token_filters: Default::default(),
+                content_normalization_applied: false,
             });
 
         resolver
@@ -9899,6 +9925,8 @@ mod tests {
                 stream_length: 0,
                 stream_provider: None,
                 filter_on_write: true,
+                stream_token_filters: Default::default(),
+                content_normalization_applied: false,
             });
 
         let member = resolver.get_object_handle(member_ref);
@@ -9991,6 +10019,8 @@ mod tests {
                 stream_length: 0,
                 stream_provider: None,
                 filter_on_write: true,
+                stream_token_filters: Default::default(),
+                content_normalization_applied: false,
             });
 
         resolver
@@ -10040,6 +10070,8 @@ mod tests {
                 stream_length: 0,
                 stream_provider: None,
                 filter_on_write: true,
+                stream_token_filters: Default::default(),
+                content_normalization_applied: false,
             });
 
         resolver
@@ -10102,6 +10134,8 @@ mod tests {
                 stream_length: 0,
                 stream_provider: None,
                 filter_on_write: true,
+                stream_token_filters: Default::default(),
+                content_normalization_applied: false,
             });
 
         resolver
@@ -10222,6 +10256,8 @@ mod tests {
                 stream_length: 0,
                 stream_provider: None,
                 filter_on_write: true,
+                stream_token_filters: Default::default(),
+                content_normalization_applied: false,
             });
 
         let requested = resolver.get_object_handle(requested_ref);
@@ -10288,6 +10324,8 @@ mod tests {
                 stream_length: 0,
                 stream_provider: None,
                 filter_on_write: true,
+                stream_token_filters: Default::default(),
+                content_normalization_applied: false,
             });
 
         resolver
@@ -10349,6 +10387,8 @@ mod tests {
                 stream_length: 0,
                 stream_provider: None,
                 filter_on_write: true,
+                stream_token_filters: Default::default(),
+                content_normalization_applied: false,
             });
 
         let member = resolver.get_object_handle(member_ref);
@@ -10575,6 +10615,8 @@ mod tests {
                 stream_length: 0,
                 stream_provider: None,
                 filter_on_write: true,
+                stream_token_filters: Default::default(),
+                content_normalization_applied: false,
             });
 
         resolver
@@ -10731,6 +10773,8 @@ mod tests {
             stream_length: ciphertext.len(),
             stream_provider: None,
             filter_on_write: true,
+            stream_token_filters: Default::default(),
+            content_normalization_applied: false,
         });
         stream.set_parsed_offset_if_unset(1);
 
@@ -11280,6 +11324,8 @@ mod tests {
             stream_length: 1_000,
             stream_provider: None,
             filter_on_write: true,
+            stream_token_filters: Default::default(),
+            content_normalization_applied: false,
         });
 
         let error = stream

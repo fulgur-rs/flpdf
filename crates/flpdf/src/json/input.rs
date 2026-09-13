@@ -617,6 +617,8 @@ where
             stream_length: 0,
             stream_provider: None,
             filter_on_write: true,
+            stream_token_filters: Default::default(),
+            content_normalization_applied: false,
         })
     }
 
