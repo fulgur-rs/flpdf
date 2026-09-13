@@ -126,7 +126,11 @@ impl<'a> OutputSink<'a> {
 
     pub(crate) fn position_usize(&self) -> Result<usize> {
         usize::try_from(self.position).map_err(|_| {
+            // cov:ignore-start: a 64-bit process can represent every usize
+            // value in u64; this defensive narrowing error is only reachable
+            // on a 32-bit process after an externally supplied u64 position.
             Error::Unsupported("writer output position exceeds usize range".to_string())
+            // cov:ignore-end
         })
     }
 
@@ -440,6 +444,30 @@ mod tests {
         assert!(matches!(error, Error::Unsupported(message) if message.contains("width")));
         drop(sink);
         assert_eq!(bytes, b"aXYdef");
+    }
+
+    #[test]
+    fn vec_target_rejects_an_out_of_bounds_patch() {
+        let mut bytes = b"abcdef".to_vec();
+        let mut sink = OutputSink::new(&mut bytes);
+
+        let error = sink
+            .patch_bytes(5..7, b"XY")
+            .expect_err("patch outside the target must fail");
+
+        assert!(matches!(error, Error::Unsupported(message) if message.contains("bounds")));
+    }
+
+    #[test]
+    fn position_usize_accepts_the_current_output_position() {
+        let mut target = VecOutputTarget::default();
+        let sink = OutputSink::new(&mut target);
+
+        let error = sink
+            .position_usize()
+            .expect("a zero output position fits every supported platform");
+
+        assert_eq!(error, 0);
     }
 
     #[test]
