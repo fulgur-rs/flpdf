@@ -411,6 +411,12 @@ C44 は public facade と deferred blob provider の責務を追跡する行と�
   今回は維持する。`flpdf-qtest-tools/src/driver/test_0_1.rs:332` の手製 `/DecodeParms` 診断と
   recovering event 列を canonical pipe/logger に移すまでは、C28 の公開 wrapper、`DecodeLimits`、
   test 0/1 caller を撤去済みとは扱わない。
+- **C28 warning attribution**: `flpdf-hpq1` で、qtest test 0/1 の非辞書
+  `/DecodeParms` warningは値自身のparsed offsetを再合成せず、canonical
+  `ObjectHandle::description`をqpdfの`QPDFExc` object fieldとして使う形に揃えた。
+  qpdfのexception offsetは0で、ObjStmの`object stream N`とdecoded-member offsetは
+  description側に含まれる（`libqpdf/QPDFObjectHandle.cc:2168-2188`、
+  `libqpdf/QPDFValue.cc:14-61`）。recovering API、`DecodeLimits`、C28のbridge分類は残る。
 - **C29**: appearance consumer の owner は `QPDFJob::handleUnderOverlay` ではなく
   **`QPDFAcroFormDocumentHelper::adjustAppearanceStream`**
   （`QPDFAcroFormDocumentHelper.cc:615-696`）。qpdf は `parseAsContents` の後に

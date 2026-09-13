@@ -266,6 +266,15 @@ production caller 0 になった（残る参照は `tests/qpdf_route_hygiene_tes
 残る参照は `crates/flpdf/tests/qpdf_route_hygiene_tests.rs` がこれらの不在を検査する
 hygiene テストだけで、qtest-only の offset boundary 自体が無くなった。
 
+`flpdf-hpq1` では、値自身の `try_get_parsed_offset` をwarningのsource prefixとして
+再構成する経路も撤去した。qpdfの`typeWarning`はrendered descriptionをQPDFExcの
+object fieldへ渡し、exception offsetは0のまま保持する
+（`libqpdf/QPDFObjectHandle.cc:2168-2188`; `libqpdf/QPDFValue.cc:14-61`）。
+したがってObjStm memberの`object stream N`とdecoded-member offsetはcanonical
+`ObjectHandle::description`から一度だけ取得し、`qtest-tools`の2回のfilter probeへ
+同じ説明を渡す。`stream_decode_parms_objstm` fixtureと`driver_goldens`がこの
+warning prefix/orderをpinned qpdf 11.9.0とbyte-identicalに固定する。
+
 ### qtest renumber consumer (2026-08-31)
 
 `qpdf/test_renumber.cc:14-22,24-117,119-166,168-259` is ported by
