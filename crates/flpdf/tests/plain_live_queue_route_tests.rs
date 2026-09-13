@@ -82,14 +82,25 @@ fn preserve_without_source_objstm_selects_the_disable_shaped_live_consumer() {
         branch.contains("return write_plain_live_disable("),
         "the Disable-shaped branch must return the live disable consumer"
     );
+    // Pin the whole predicate, whitespace-collapsed so rustfmt reflow is
+    // tolerated but a dropped term is not. Checking only the empty-map token
+    // would still pass if the `qdf || content_normalization` restriction were
+    // removed, which would make this branch swallow ordinary Preserve before
+    // it can reach the Disable-shaped live consumer.
     let eligible = plain
         .split_once("pub(crate) fn qdf_or_normalize_live_eligible")
-        .and_then(|(_, rest)| rest.split_once("\n}\n"))
+        .and_then(|(_, rest)| rest.split_once(") -> bool {"))
+        .and_then(|(_, rest)| rest.split_once("\n}"))
         .map(|(body, _)| body)
         .expect("qdf_or_normalize_live_eligible body");
-    assert!(
-        eligible.contains("source_object_stream_data.is_empty()"),
-        "the QDF/normalize live route must key on the empty source membership"
+    let eligible = eligible.split_whitespace().collect::<Vec<_>>().join(" ");
+    assert_eq!(
+        eligible,
+        "(options.qdf || options.content_normalization) && matches!( options.object_streams, \
+         ObjectStreamMode::Disable | ObjectStreamMode::Preserve ) && (options.object_streams == \
+         ObjectStreamMode::Disable || source_object_stream_data.is_empty())",
+        "the QDF/normalize live route must stay restricted to QDF or normalization with an \
+         empty source membership"
     );
 }
 

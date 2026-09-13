@@ -611,10 +611,14 @@ fn preserve_no_source_objstm_xref_stream_matches_qpdf_11_9() {
         preserve, disable,
         "empty source membership must produce the Disable-equivalent bytes"
     );
+    // `startxref\n` also contains `xref\n`, so anchor on a standalone section
+    // header followed by its first subsection. Without the leading newline and
+    // the `0 ` subsection start, an output with no xref section at all would
+    // still satisfy this assertion.
     assert!(
         preserve
-            .windows(b"xref\n".len())
-            .any(|window| window == b"xref\n"),
+            .windows(b"\nxref\n0 ".len())
+            .any(|window| window == b"\nxref\n0 "),
         "an empty source membership must use a classic xref table"
     );
     assert!(
