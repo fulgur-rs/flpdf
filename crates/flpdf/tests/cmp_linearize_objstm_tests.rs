@@ -1258,6 +1258,84 @@ fn otherpage_others_two_container_objstm_byte_identical_to_qpdf() {
     );
 }
 
+// otherpage-private-250-0: three generated containers, with two pure
+// part7 containers for the same non-first page and one part9 container carrying
+// the Pages tree. This pins within-part part7 order rather than only the
+// part7-before-part9 bucket order.
+#[test]
+fn otherpage_private_multi_container_objstm_byte_identical_to_qpdf() {
+    assert_strict(
+        "objstm-lin-otherpage-private-250-0.pdf",
+        "objstm-lin-otherpage-private-250-0",
+    );
+}
+
+// otherpage-pages-200-100: separate part7 containers belong to page 1 and
+// page 2, with a part8 mixed container between them in the even-split order.
+// qpdf must still emit the part7 containers in page order.
+#[test]
+fn otherpage_pages_multi_container_objstm_byte_identical_to_qpdf() {
+    assert_strict(
+        "objstm-lin-otherpage-pages-200-100.pdf",
+        "objstm-lin-otherpage-pages-200-100",
+    );
+}
+
+// outlines-multi-1-250: three generated containers all routed to part9 by the
+// outline-user precedence. This pins the part9 within-part order and outline
+// hint-table range across more than one container.
+#[test]
+fn outlines_all_part9_multi_container_objstm_byte_identical_to_qpdf() {
+    assert_strict(
+        "objstm-lin-outlines-multi-1-250.pdf",
+        "objstm-lin-outlines-multi-1-250",
+    );
+}
+
+// part9-categories-74-225: the first generated container is outline-only,
+// while later containers include the Pages tree and the ordinary /Zzz chain.
+// qpdf must emit the Pages/rest category before the outline category in part9.
+#[test]
+fn part9_categories_multi_container_objstm_byte_identical_to_qpdf() {
+    assert_strict(
+        "objstm-lin-part9-categories-74-225.pdf",
+        "objstm-lin-part9-categories-74-225",
+    );
+}
+
+// part9-categories-thumb-74-225: the /Zzz chain is reached by the same
+// thumbnail from both pages and also by a document-other root key. qpdf keeps
+// the shared-thumbnail category before outlines even though others is present.
+#[test]
+fn part9_categories_shared_thumbnail_objstm_byte_identical_to_qpdf() {
+    assert_strict(
+        "objstm-lin-part9-categories-thumb-74-225.pdf",
+        "objstm-lin-part9-categories-thumb-74-225",
+    );
+}
+
+// part9-pages-shared-thumb-74-225: the shared thumbnail has no /Meta edge,
+// so qpdf keeps the Pages container in lc_other and emits the plain shared
+// thumbnail in the following thumbnail phase.
+#[test]
+fn part9_pages_shared_thumbnail_objstm_byte_identical_to_qpdf() {
+    assert_strict(
+        "objstm-lin-part9-pages-shared-thumb-74-225.pdf",
+        "objstm-lin-part9-pages-shared-thumb-74-225",
+    );
+}
+
+// A single thumbnail also reached through Catalog /ZExtra is lc_other because
+// qpdf's private-thumbnail arm requires others==0; the plain image stays in
+// the remaining part9 tail after the Pages container.
+#[test]
+fn thumbnail_catalog_other_objstm_byte_identical_to_qpdf() {
+    assert_strict(
+        "objstm-lin-thumbnail-catalog-other.pdf",
+        "objstm-lin-thumbnail-catalog-other",
+    );
+}
+
 // otherpage-shared-docother: a drift-trigger fixture proving that
 // `route_objstm_containers` and `second_half_container_anchors` disagree on ONE
 // container's part WITHOUT any byte divergence from qpdf. Page 0 is fontless;
