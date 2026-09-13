@@ -1435,7 +1435,7 @@ struct SharedValueState {
     value: ObjectValue,
     identity: ValueIdentity,
     parsed_offset: i64,
-    description: Option<Box<ObjectDescription>>,
+    description: Option<ObjectDescription>,
     state_owners: StateOwners,
     mutation_generation: u64,
 }
@@ -1455,7 +1455,7 @@ impl SharedValueState {
 
     fn get_description(&self) -> Vec<u8> {
         if let Some(desc) = &self.description {
-            match desc.as_ref() {
+            match desc {
                 ObjectDescription::Template(tmpl) => expand_description_template(
                     tmpl,
                     self.object_ref(),
@@ -3099,7 +3099,7 @@ impl ObjectHandle {
             let (resolver, parent) = {
                 let shared = current.borrow();
                 let resolver = shared.identity.resolver.as_ref().and_then(Weak::upgrade);
-                let parent = match shared.description.as_deref() {
+                let parent = match &shared.description {
                     Some(ObjectDescription::Child(child)) => child.parent.upgrade(),
                     _ => None,
                 };
@@ -3131,10 +3131,10 @@ impl ObjectHandle {
     ) {
         let shared = self.0.borrow().shared.clone();
         let mut shared = shared.borrow_mut();
-        shared.description = Some(Box::new(ObjectDescription::Json(JsonDescription {
+        shared.description = Some(ObjectDescription::Json(JsonDescription {
             input: input.as_ref().to_vec(),
             object: object.as_ref().to_vec(),
-        })));
+        }));
         // qpdf writes the description offset through the same set-once guard
         // as any other parsed offset (`QPDFValue::setDescription` calls
         // `setParsedOffset`, `libqpdf/qpdf/QPDFValue.hh:60-65,90-100`), so a
@@ -3175,7 +3175,7 @@ impl ObjectHandle {
     /// the next render.
     pub(crate) fn description_template(&self) -> Option<Vec<u8>> {
         let shared = self.0.borrow().shared.clone();
-        let description = match shared.borrow().description.as_deref() {
+        let description = match shared.borrow().description.as_ref() {
             Some(ObjectDescription::Template(template)) => Some(template.clone()),
             Some(ObjectDescription::Json(_) | ObjectDescription::Child(_)) | None => None,
         };
@@ -3209,18 +3209,14 @@ impl ObjectHandle {
         let mut shared = shared.borrow_mut();
         shared.identity.resolver = Some(resolver);
         shared.identity.active_pdf_unique_id = Some(pdf.unique_id);
-        shared.description = Some(Box::new(ObjectDescription::Template(
-            description.as_ref().to_vec(),
-        )));
+        shared.description = Some(ObjectDescription::Template(description.as_ref().to_vec()));
         Ok(())
     }
 
     pub(crate) fn set_description(&self, description: impl AsRef<[u8]>, offset: i64) {
         let shared = self.0.borrow().shared.clone();
         let mut shared = shared.borrow_mut();
-        shared.description = Some(Box::new(ObjectDescription::Template(
-            description.as_ref().to_vec(),
-        )));
+        shared.description = Some(ObjectDescription::Template(description.as_ref().to_vec()));
         // Set-once, matching qpdf's `setParsedOffset` guard that
         // `QPDFValue::setDescription` calls through
         // (`libqpdf/qpdf/QPDFValue.hh:60-65,90-100`). `QPDF_Stream::setDescription`
@@ -3266,11 +3262,11 @@ impl ObjectHandle {
         let mut shared = shared.borrow_mut();
         shared.identity.resolver = resolver;
         shared.identity.active_pdf_unique_id = active_pdf_unique_id;
-        shared.description = Some(Box::new(ObjectDescription::Child(ChildDescription {
+        shared.description = Some(ObjectDescription::Child(ChildDescription {
             parent: Rc::downgrade(&parent_shared),
             static_descr: static_descr.as_ref().to_vec(),
             var_descr: var_descr.as_ref().to_vec(),
-        })));
+        }));
     }
 
     /// Report that an accessor expecting `expected_type` ran on this handle.
