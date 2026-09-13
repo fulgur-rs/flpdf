@@ -88,7 +88,7 @@ pub struct AttachmentInfo {
 /// sink boundary here lets the CLI preserve output already written when a
 /// later verbose metadata accessor throws (for example, the `creation date:`
 /// prefix before `getDict()` rejects a non-stream `/EF` value).
-pub fn format_attachment_list_with_sink<R, F>(
+pub(crate) fn format_attachment_list_with_sink<R, F>(
     pdf: &mut Pdf<R>,
     verbose: bool,
     mut sink: F,

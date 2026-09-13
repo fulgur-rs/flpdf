@@ -19,7 +19,7 @@ fn attachment_consumers_use_canonical_handle_routes() {
         .expect("attachment_list.rs must be readable");
     let listing = function_body(
         &attachment_list,
-        "pub fn format_attachment_list_with_sink",
+        "pub(crate) fn format_attachment_list_with_sink",
         "struct ListingOutput",
     );
     for forbidden in [
@@ -59,4 +59,37 @@ fn attachment_consumers_use_canonical_handle_routes() {
     assert!(page_mode.contains("pdf.root_handle()?"));
     assert!(page_mode.contains("try_get_key(b\"/PageMode\")?"));
     assert!(page_mode.contains("try_is_null()?"));
+}
+
+#[test]
+fn internal_job_helpers_are_not_publicly_reexported() {
+    let job = fs::read_to_string(source_root().join("job/mod.rs")).expect("job/mod.rs");
+    let lib = fs::read_to_string(source_root().join("lib.rs")).expect("lib.rs");
+    let prune = fs::read_to_string(source_root().join("job/acroform_field_prune.rs"))
+        .expect("acroform_field_prune.rs");
+    let listing = fs::read_to_string(source_root().join("job/attachment_list.rs"))
+        .expect("attachment_list.rs");
+
+    assert!(
+        !job.contains("pub use json::{write_json"),
+        "job JSON free writer must be reached through QPDFJob"
+    );
+    assert!(
+        !job.contains("pub use acroform_field_prune::{"),
+        "AcroForm free helpers must remain crate-internal"
+    );
+    assert!(
+        !job.contains("pub use attachment_list::{format_attachment_list_with_sink"),
+        "attachment sink must remain crate-internal"
+    );
+    assert!(
+        !lib.contains("format_attachment_list_with_sink")
+            && !lib.contains("prune_acroform_after_subset"),
+        "internal job helpers must not be re-exported from the crate root"
+    );
+    assert!(
+        prune.contains("pub(crate) fn prune_acroform_after_subset<")
+            && prune.contains("pub(crate) fn prune_acroform_after_subset_with_max_depth<")
+    );
+    assert!(listing.contains("pub(crate) fn format_attachment_list_with_sink<R"));
 }

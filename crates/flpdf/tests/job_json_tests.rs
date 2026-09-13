@@ -1,9 +1,18 @@
-use flpdf::job::{write_json, JsonJobError, JsonJobOptions, JsonJobOutput, JsonStreamData};
+use flpdf::job::{JsonJobError, JsonJobOptions, JsonJobOutput, JsonStreamData, QPDFJob};
 use flpdf::json_inspect::{DecodeLevel, JsonKey};
 use flpdf::Pdf;
 use std::fs::File;
-use std::io::BufReader;
+use std::io::{BufReader, Read, Seek};
 use std::path::{Path, PathBuf};
+
+fn write_json<R: Read + Seek>(
+    pdf: &mut Pdf<R>,
+    options: JsonJobOptions<'_>,
+    output: JsonJobOutput<'_>,
+) -> Result<(), JsonJobError> {
+    let mut job = QPDFJob::new();
+    job.write_json(pdf, options, output).map(|_| ())
+}
 
 fn fixture() -> PathBuf {
     Path::new(env!("CARGO_MANIFEST_DIR")).join("../../tests/fixtures/compat/one-page.pdf")
