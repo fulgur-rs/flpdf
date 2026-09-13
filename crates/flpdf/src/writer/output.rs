@@ -3,6 +3,7 @@
 use crate::{Error, Result};
 use md5::{Digest as _, Md5};
 use std::io::{self, ErrorKind, Write};
+use std::ops::Range;
 
 /// Final-output destination for the writer's counted pipeline boundary.
 ///
@@ -12,6 +13,17 @@ pub(crate) trait OutputTarget {
     fn write_chunk(&mut self, bytes: &[u8]) -> io::Result<usize>;
     fn finish_segment(&mut self) -> Result<()>;
     fn finish_document(&mut self) -> Result<()>;
+
+    /// Patch an equal-width region after all forward output has been emitted.
+    ///
+    /// qpdf's linearization pass writes its xref regions forward and does not
+    /// need this operation. The final flpdf linearization pass retains a Vec so
+    /// its existing fixed-width back-patches can remain local to that buffer.
+    fn patch_bytes(&mut self, _range: Range<usize>, _bytes: &[u8]) -> Result<()> {
+        Err(Error::Unsupported(
+            "output target does not support in-place patching".to_string(),
+        ))
+    }
 }
 
 /// Target adapter for bounded writer-owned buffers.
@@ -31,6 +43,21 @@ impl OutputTarget for Vec<u8> {
     }
 
     fn finish_document(&mut self) -> Result<()> {
+        Ok(())
+    }
+
+    fn patch_bytes(&mut self, range: Range<usize>, bytes: &[u8]) -> Result<()> {
+        if range.start > range.end || range.end > self.len() {
+            return Err(Error::Unsupported(
+                "writer output patch range is out of bounds".to_string(),
+            ));
+        }
+        if range.len() != bytes.len() {
+            return Err(Error::Unsupported(
+                "writer output patch changes byte width".to_string(),
+            ));
+        }
+        self[range].copy_from_slice(bytes);
         Ok(())
     }
 }
@@ -97,7 +124,12 @@ impl<'a> OutputSink<'a> {
         self.position
     }
 
-    #[cfg(test)]
+    pub(crate) fn position_usize(&self) -> Result<usize> {
+        usize::try_from(self.position).map_err(|_| {
+            Error::Unsupported("writer output position exceeds usize range".to_string())
+        })
+    }
+
     pub(crate) const fn last_byte(&self) -> Option<u8> {
         self.last_byte
     }
@@ -137,6 +169,11 @@ impl<'a> OutputSink<'a> {
 
     pub(crate) fn finish_document(&mut self) -> Result<()> {
         self.target.finish_document()
+    }
+
+    /// Apply a fixed-width patch owned by the output target.
+    pub(crate) fn patch_bytes(&mut self, range: Range<usize>, bytes: &[u8]) -> Result<()> {
+        self.target.patch_bytes(range, bytes)
     }
 
     fn write_bytes_inner(&mut self, mut bytes: &[u8]) -> std::result::Result<(), WriteFailure> {
@@ -387,6 +424,37 @@ mod tests {
 
         drop(sink);
         assert_eq!(bytes, b"prefix-suffix");
+    }
+
+    #[test]
+    fn vec_target_accepts_only_fixed_width_in_place_patches() {
+        let mut bytes = b"abcdef".to_vec();
+        let mut sink = OutputSink::new(&mut bytes);
+
+        sink.patch_bytes(1..3, b"XY")
+            .expect("equal-width patch is accepted");
+        let error = sink
+            .patch_bytes(3..5, b"Q")
+            .expect_err("variable-width patch is rejected");
+
+        assert!(matches!(error, Error::Unsupported(message) if message.contains("width")));
+        drop(sink);
+        assert_eq!(bytes, b"aXYdef");
+    }
+
+    #[test]
+    fn pass1_digest_counts_forward_bytes_without_requiring_a_body_buffer() {
+        let mut target = VecOutputTarget::default();
+        let mut sink = OutputSink::new(&mut target);
+        sink.begin_digest();
+        sink.write_bytes(b"pass-1").expect("pass-1 bytes are accepted");
+
+        let digest = sink.take_digest().expect("pass-1 digest is enabled");
+        let expected: [u8; 16] = md5::Md5::digest(b"pass-1").into();
+        assert_eq!(sink.position(), 6);
+        assert_eq!(digest, expected);
+        drop(sink);
+        assert_eq!(target.bytes, b"pass-1");
     }
 
     #[test]

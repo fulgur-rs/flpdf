@@ -76,12 +76,95 @@ use crate::writer::object_streams::{
 };
 use crate::writer::{
     decrement_progress_event, effective_pdf_version_and_ext, effective_stream_policy,
-    report_progress_event, serialize::xref_stream, CompressStreams, NewlineBeforeEndstream,
-    ObjectWriterEmission, WriterOptions, WriterResult,
+    output::{OutputSink, OutputTarget}, report_progress_event, serialize::xref_stream,
+    CompressStreams, NewlineBeforeEndstream, ObjectWriterEmission, WriterOptions, WriterResult,
 };
 use crate::{ObjectHandle, ObjectRef, Pdf, Result};
 
 const EBADF_ERRNO: i32 = 9;
+
+/// Forward-only destination for qpdf's linearization pass 1.
+///
+/// qpdf selects either `pushDiscardFilter` or a buffered `Pl_StdioFile` for
+/// this pass (`QPDFWriter.cc:2656-2676`). Keeping the destination separate from
+/// [`OutputSink`] lets the sink count and digest accepted bytes without owning a
+/// second document-sized buffer.
+enum Pass1Destination {
+    Discard,
+    File {
+        path: std::path::PathBuf,
+        writer: std::io::BufWriter<std::fs::File>,
+    },
+}
+
+struct Pass1OutputTarget {
+    destination: Pass1Destination,
+}
+
+impl Pass1OutputTarget {
+    fn discard() -> Self {
+        Self {
+            destination: Pass1Destination::Discard,
+        }
+    }
+
+    fn new(path: Option<&Path>) -> Result<Self> {
+        let destination = match path {
+            Some(path) => {
+                let file = std::fs::File::create(path)
+                    .map_err(|source| crate::Error::file_io("open", path, source))?;
+                Pass1Destination::File {
+                    path: path.to_path_buf(),
+                    writer: std::io::BufWriter::new(file),
+                }
+            }
+            None => Pass1Destination::Discard,
+        };
+        Ok(Self { destination })
+    }
+
+    fn write_debug_comments(&mut self, comments: &[u8]) {
+        if let Pass1Destination::File { writer, .. } = &mut self.destination {
+            write_pass1_debug_comments(writer, comments);
+        }
+    }
+}
+
+impl OutputTarget for Pass1OutputTarget {
+    fn write_chunk(&mut self, bytes: &[u8]) -> std::io::Result<usize> {
+        match &mut self.destination {
+            Pass1Destination::Discard => Ok(bytes.len()),
+            Pass1Destination::File { path, writer } => writer
+                .write_all(bytes)
+                .map(|()| bytes.len())
+                .map_err(|source| {
+                    std::io::Error::new(
+                        source.kind(),
+                        format!("write {}: {source}", path.display()),
+                    )
+                }),
+        }
+    }
+
+    fn finish_segment(&mut self) -> Result<()> {
+        Ok(())
+    }
+
+    fn finish_document(&mut self) -> Result<()> {
+        match &mut self.destination {
+            Pass1Destination::Discard => Ok(()),
+            Pass1Destination::File { writer, .. } => match writer.flush() {
+                Err(source) if source.raw_os_error() == Some(EBADF_ERRNO) => {
+                    Err(crate::Error::Internal(
+                        "linearization pass1: Pl_StdioFile::finish: stream already closed"
+                            .to_string(),
+                    ))
+                }
+                Ok(()) | Err(_) => Ok(()),
+            },
+        }
+    }
+}
 
 // ---------------------------------------------------------------------------
 // ObjStm layout
@@ -4449,9 +4532,26 @@ fn write_linearized_impl<R: Read + Seek>(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use md5::Digest as _;
     use std::io::Cursor;
 
-    use crate::writer::ProgressReporter;
+    use crate::writer::{output::OutputSink, ProgressReporter};
+
+    #[test]
+    fn pass1_target_is_forward_only_and_counted() {
+        let mut target = Pass1OutputTarget::discard();
+        let mut sink = OutputSink::new(&mut target);
+        sink.begin_digest();
+        sink.write_bytes(b"pass-1").expect("pass-1 bytes are accepted");
+
+        let digest = sink.take_digest().expect("pass-1 digest is enabled");
+        let expected: [u8; 16] = md5::Md5::digest(b"pass-1").into();
+        assert_eq!(sink.position(), 6);
+        assert_eq!(digest, expected);
+        assert!(target
+            .patch_bytes(0..1, b"x")
+            .is_err(), "pass-1 target must remain forward-only");
+    }
 
     fn one_page_pdf_with_direct_outlines() -> Vec<u8> {
         let mut pdf = b"%PDF-1.4\n".to_vec();
