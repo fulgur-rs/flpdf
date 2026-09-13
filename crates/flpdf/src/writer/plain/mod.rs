@@ -745,7 +745,7 @@ mod tests {
             None,
             &[],
         ) {
-            Ok(_) => panic!("write_plain must reject an outside route"),
+            Ok(_) => panic!("write_plain must reject an outside route"), // cov:ignore: the route classifier rejects this cohort before the plain consumer can return Ok
             Err(error) => error,
         };
         assert!(matches!(
