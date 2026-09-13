@@ -27,7 +27,7 @@ fn xref_parsers_do_not_carry_dead_diagnostic_sink_arguments() {
     let table = slice_between(source, "fn parse_xref_table(", "fn parse_xref_stream(");
     assert!(
         !table.contains("error_diagnostics_sink"),
-        "classic xref table parser must return diagnostics rather than accept a dead sink"
+        "classic xref table parser must not accept the removed diagnostic sink"
     );
 
     let canonical_stream = slice_between(
