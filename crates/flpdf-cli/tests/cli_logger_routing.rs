@@ -260,56 +260,65 @@ fn qpdf_differential_matches_linearize_pass1_artifact() {
     }
 
     let directory = tempfile::tempdir().unwrap();
-    let qpdf_final = directory.path().join("qpdf-final.pdf");
-    let qpdf_pass1 = directory.path().join("qpdf-pass1.pdf");
-    let flpdf_final = directory.path().join("flpdf-final.pdf");
-    let flpdf_pass1 = directory.path().join("flpdf-pass1.pdf");
-    let qpdf_pass1_arg = format!("--linearize-pass1={}", qpdf_pass1.display());
-    let flpdf_pass1_arg = format!("--linearize-pass1={}", flpdf_pass1.display());
+    for (name, input, object_streams) in [
+        ("classic", ONE_PAGE, false),
+        ("objstm", LARGE_LINEARIZED, true),
+    ] {
+        let qpdf_final = directory.path().join(format!("qpdf-{name}-final.pdf"));
+        let qpdf_pass1 = directory.path().join(format!("qpdf-{name}-pass1.pdf"));
+        let flpdf_final = directory.path().join(format!("flpdf-{name}-final.pdf"));
+        let flpdf_pass1 = directory.path().join(format!("flpdf-{name}-pass1.pdf"));
+        let qpdf_pass1_arg = format!("--linearize-pass1={}", qpdf_pass1.display());
+        let flpdf_pass1_arg = format!("--linearize-pass1={}", flpdf_pass1.display());
 
-    let qpdf = ProcessCommand::new("qpdf")
-        .args([
-            "--linearize",
-            "--static-id",
-            "--compress-streams=n",
-            &qpdf_pass1_arg,
-            ONE_PAGE,
-        ])
-        .arg(&qpdf_final)
-        .output()
-        .unwrap();
-    let flpdf = ProcessCommand::new(assert_cmd::cargo::cargo_bin!("flpdf"))
-        .env("FLPDF_STATIC_ID_QUIET", "1")
-        .args([
-            "--linearize",
-            "--static-id",
-            "--compress-streams=n",
-            &flpdf_pass1_arg,
-            ONE_PAGE,
-        ])
-        .arg(&flpdf_final)
-        .output()
-        .unwrap();
+        let mut qpdf_args = vec!["--linearize", "--static-id", "--compress-streams=n"];
+        if object_streams {
+            qpdf_args.push("--object-streams=generate");
+        }
+        qpdf_args.push(qpdf_pass1_arg.as_str());
+        qpdf_args.push(input);
+        let qpdf = ProcessCommand::new("qpdf")
+            .args(&qpdf_args)
+            .arg(&qpdf_final)
+            .output()
+            .unwrap();
 
-    assert!(qpdf.status.success(), "qpdf failed: {:?}", qpdf);
-    assert!(flpdf.status.success(), "flpdf failed: {:?}", flpdf);
-    assert_eq!(
-        std::fs::read(&qpdf_final).unwrap(),
-        std::fs::read(&flpdf_final).unwrap(),
-        "final linearized bytes must remain qpdf-identical"
-    );
+        let mut flpdf_args = vec!["--linearize", "--static-id", "--compress-streams=n"];
+        if object_streams {
+            flpdf_args.push("--object-streams=generate");
+        }
+        flpdf_args.push(flpdf_pass1_arg.as_str());
+        flpdf_args.push(input);
+        let flpdf = ProcessCommand::new(assert_cmd::cargo::cargo_bin!("flpdf"))
+            .env("FLPDF_STATIC_ID_QUIET", "1")
+            .args(&flpdf_args)
+            .arg(&flpdf_final)
+            .output()
+            .unwrap();
 
-    let qpdf_pass1_bytes = std::fs::read(&qpdf_pass1).unwrap();
-    let flpdf_pass1_bytes = std::fs::read(&flpdf_pass1).unwrap();
-    let (qpdf_body, qpdf_comments) = split_at_marker(&qpdf_pass1_bytes, b"% hint_offset=")
-        .expect("qpdf pass-1 debug comments are present");
-    let (flpdf_body, flpdf_comments) = split_at_marker(&flpdf_pass1_bytes, b"% hint_offset=")
-        .expect("flpdf pass-1 debug comments are present");
-    assert_eq!(flpdf_body, qpdf_body, "pass-1 body must be qpdf-identical");
-    assert_eq!(
-        flpdf_comments, qpdf_comments,
-        "pass-1 debug comments must retain qpdf values"
-    );
+        assert!(qpdf.status.success(), "{name}: qpdf failed: {qpdf:?}");
+        assert!(flpdf.status.success(), "{name}: flpdf failed: {flpdf:?}");
+        assert_eq!(
+            std::fs::read(&qpdf_final).unwrap(),
+            std::fs::read(&flpdf_final).unwrap(),
+            "{name}: final linearized bytes must remain qpdf-identical"
+        );
+
+        let qpdf_pass1_bytes = std::fs::read(&qpdf_pass1).unwrap();
+        let flpdf_pass1_bytes = std::fs::read(&flpdf_pass1).unwrap();
+        let (qpdf_body, qpdf_comments) = split_at_marker(&qpdf_pass1_bytes, b"% hint_offset=")
+            .expect("qpdf pass-1 debug comments are present");
+        let (flpdf_body, flpdf_comments) = split_at_marker(&flpdf_pass1_bytes, b"% hint_offset=")
+            .expect("flpdf pass-1 debug comments are present");
+        assert_eq!(
+            flpdf_body, qpdf_body,
+            "{name}: pass-1 body must be qpdf-identical"
+        );
+        assert_eq!(
+            flpdf_comments, qpdf_comments,
+            "{name}: pass-1 debug comments must retain qpdf values"
+        );
+    }
 }
 
 #[test]

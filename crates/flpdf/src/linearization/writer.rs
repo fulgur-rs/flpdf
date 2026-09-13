@@ -4289,6 +4289,22 @@ fn write_linearized_impl<R: Read + Seek>(
         hint_stream_aes_iv,
     )?; // cov:ignore: internally-built hint payload and encryption context make this only a defensive propagation boundary.
 
+    if pass1_path.is_some() {
+        let debug_comments = format!(
+            "% hint_offset={}\n\
+             % hint_length={}\n\
+             % second_xref_offset={}\n\
+             % second_xref_end={}\n",
+            pass1_output.hint_stream_offset,
+            hint_stream_object.len(),
+            pass1_output.last_xref_offset,
+            pass1_output.second_xref_end
+        );
+        // qpdf appends these comments immediately after closing the pass-1
+        // pipeline and before starting pass 2 (`QPDFWriter.cc:2886-2900`).
+        pass1_target.write_debug_comments(debug_comments.as_bytes());
+    }
+
     // Final pass: write the layout with the exact hint object generated
     // above. The pass-1 virtual offsets and the spliced object length are
     // therefore related by qpdf's adjusted-offset rule.
@@ -4384,19 +4400,6 @@ fn write_linearized_impl<R: Read + Seek>(
         // identifier digested from qpdf's pass-1 buffer (byte-identical to qpdf's
         // value). The classic path direct-wrote it via `id_writer` already.
         patch_linearized_deterministic_id(&mut final_bytes, &final_id_ranges, id0, id1);
-    }
-
-    if pass1_path.is_some() {
-        let pass1_hint_stream_offset = pass1_output.hint_stream_offset;
-        let pass1_main_xref_offset = pass1_output.last_xref_offset;
-        let debug_comments = format!(
-            "% hint_offset={pass1_hint_stream_offset}\n\
-             % hint_length={final_hint_stream_obj_total_len}\n\
-             % second_xref_offset={pass1_main_xref_offset}\n\
-             % second_xref_end={}\n",
-            pass1_output.second_xref_end
-        );
-        pass1_target.write_debug_comments(debug_comments.as_bytes());
     }
 
     // ------------------------------------------------------------------
