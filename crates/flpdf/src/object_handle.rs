@@ -10935,6 +10935,8 @@ mod stream_payload_sharing_tests {
         let filter: Rc<RefCell<dyn TokenFilter>> = Rc::new(RefCell::new(NoopTokenFilter));
         alias.add_token_filter(filter).unwrap();
         assert!(stream.is_data_modified());
+        let debug = stream.with_value(|value| format!("{value:?}"));
+        assert!(debug.contains("<TokenFilter>"));
 
         alias.replace_stream_data(Rc::new(b"replacement".to_vec()), None, None);
         assert!(!stream.content_normalization_applied());
