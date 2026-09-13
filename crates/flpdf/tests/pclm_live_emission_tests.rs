@@ -233,6 +233,95 @@ fn pclm_preserves_external_file_trailer_keys() {
     );
 }
 
+fn indirect_root_adbe_pdf() -> Pdf<Cursor<Vec<u8>>> {
+    let mut pdf = Pdf::open(Cursor::new(
+        include_bytes!("../../../tests/fixtures/compat/one-page-stale-adbe-no-ext.pdf").to_vec(),
+    ))
+    .unwrap();
+    pdf.root_handle()
+        .unwrap()
+        .replace_key(
+            b"/Extensions",
+            ObjectHandle::dictionary(vec![(
+                b"/ADBE".to_vec(),
+                ObjectHandle::dictionary(vec![
+                    (
+                        b"/BaseVersion".to_vec(),
+                        ObjectHandle::name(b"1.4".to_vec()),
+                    ),
+                    (b"/ExtensionLevel".to_vec(), ObjectHandle::integer(5)),
+                ]),
+            )]),
+        )
+        .unwrap();
+    pdf
+}
+
+/// PCLm keeps qpdf's indirect-root ADBE reconciliation. qpdf records the
+/// source Catalog ObjGen in `root_og` and applies the same `unparseObject`
+/// root branch for PCLm as for ordinary standard output
+/// (`QPDFWriter.cc:53,1374,1396-1436`).
+#[test]
+fn pclm_indirect_root_reconciles_adbe_to_the_forced_extension_level() {
+    let mut pdf = indirect_root_adbe_pdf();
+    let mut writer = PdfWriter::new(&mut pdf);
+    writer.set_pclm(true);
+    writer.force_pdf_version("1.7", 8);
+    writer.set_static_id(true);
+    writer.set_output_memory().unwrap();
+    writer
+        .write()
+        .expect("PCLm indirect-root ADBE reconciliation must succeed");
+
+    let mut output = Pdf::open(Cursor::new(writer.get_buffer().unwrap())).unwrap();
+    assert!(
+        output.root_ref().is_some(),
+        "PCLm Catalog root must remain indirect"
+    );
+    let adbe = output
+        .root_handle()
+        .unwrap()
+        .try_get_key(b"/Extensions")
+        .unwrap()
+        .try_get_key(b"/ADBE")
+        .unwrap();
+    assert_eq!(
+        adbe.try_get_key(b"/BaseVersion").unwrap().unparse(),
+        b"/1.7"
+    );
+    assert_eq!(
+        adbe.try_get_key(b"/ExtensionLevel")
+            .unwrap()
+            .try_get_int_value()
+            .unwrap(),
+        8
+    );
+}
+
+#[test]
+fn pclm_indirect_root_removes_adbe_only_extensions_at_level_zero() {
+    let mut pdf = indirect_root_adbe_pdf();
+    let mut writer = PdfWriter::new(&mut pdf);
+    writer.set_pclm(true);
+    writer.force_pdf_version("1.7", 0);
+    writer.set_static_id(true);
+    writer.set_output_memory().unwrap();
+    writer
+        .write()
+        .expect("PCLm indirect-root ADBE removal must succeed");
+
+    let mut output = Pdf::open(Cursor::new(writer.get_buffer().unwrap())).unwrap();
+    let extensions = output
+        .root_handle()
+        .unwrap()
+        .try_get_key(b"/Extensions")
+        .unwrap();
+    assert!(
+        extensions.is_null(),
+        "ADBE-only /Extensions must be removed when final extension level is zero"
+    );
+}
+
 #[test]
 fn pclm_direct_root_does_not_reconcile_adbe() {
     let mut pdf = Pdf::open(Cursor::new(

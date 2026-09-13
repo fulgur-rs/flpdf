@@ -3550,9 +3550,13 @@ fn write_pclm<R: Read + Seek>(
     let deterministic_id = uses_deterministic_id(options);
     let plan = pclm::Plan::build(pdf)?;
     let root = plan.root;
+    let source_root = pdf.root_ref();
     let direct_root = plan.direct_root.clone();
     let mut queue = pclm::EmissionQueue::from_plan(&plan)?;
-    let version = effective_pdf_version(pdf.version(), options, false, false);
+    let source_extension_level = pdf.adobe_extension_level()?.unwrap_or(0);
+    let (version, final_extension_level) =
+        effective_pdf_version_and_ext(pdf.version(), source_extension_level, options, false, false);
+    let version = version.to_owned();
     if deterministic_id {
         out.begin_digest();
     }
@@ -3574,6 +3578,19 @@ fn write_pclm<R: Read + Seek>(
             pclm::Item::Source { source, output } => {
                 let source_handle = pdf.get_object_handle(source);
                 source_handle.try_dereference()?;
+                // qpdf records the indirect Catalog ObjGen in `root_og` and
+                // applies its root-only /Extensions reconciliation from the
+                // shared `unparseObject` path even when PCLm selected the
+                // initial enqueue order (`QPDFWriter.cc:53,1374,1396-1436`).
+                let source_handle = if source_root == Some(source) {
+                    source_handle.output_root_copy_with_adbe(
+                        &version,
+                        final_extension_level,
+                        true,
+                    )? // cov:ignore: indirect-root reconciliation success is covered by pclm_live_emission_tests; LLVM assigns this fallible call terminator to an uncovered continuation.
+                } else {
+                    source_handle
+                };
                 let offset = out.position();
                 out.write_bytes(format!("{} 0 obj\n", output.number).as_bytes())?;
                 if source_handle.as_stream_dict().is_some() {
