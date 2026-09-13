@@ -2884,6 +2884,13 @@ document-neutralなエラーを、qpdfの`QPDFExc::createWhat`
 boundaryに限定している。Pinned qpdfで非dictionary `/Root`を与えたtest93は、
 修復警告3行の後に`<filename>: unable to find /Root dictionary`を返す。
 
+`flpdf-tdf8` では、`EmbeddedFileDocumentHelper` の読み取り・挿入・削除の
+catalog acquisition を `Pdf::root_handle()` へ統一した。これにより qpdf の
+`QPDFEmbeddedFileDocumentHelper.cc:33-70` と同じく direct/indirect 両方の
+`/Root` dictionary を受け付け、missing/non-dictionary root は
+`unable to find /Root dictionary` として伝播する。valid catalog の
+`/Names` / `/EmbeddedFiles` 欠損は従来どおり空の name tree として扱う。
+
 `flpdf-3yn9.48.20`ではpublic `Pdf::make_indirect_object_handle`のclone/独自採番を撤去し、
 `QPDF.cc:1872-1897`のinitialized検査、canonical count、同じQObjectのcache登録、
 `newIndirect`の順に統一した。`ValueIdentity`は`QPDFValue.hh:68-72`の共有objgen/owning QPDFを

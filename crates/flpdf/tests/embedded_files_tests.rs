@@ -7,7 +7,7 @@
 //!   3. `/Limits` present → still works (limits are non-destructive).
 //!   4. `/EmbeddedFiles` absent → empty list, no error.
 //!   5. `/Names` catalog key absent → empty list, no error.
-//!   6. `/Root` absent → empty list, no error.
+//!   6. Missing or non-dictionary `/Root` → qpdf root error.
 //!
 //! Writer tests (insert/delete/rebuild):
 //!   W1. Insert into empty tree → single entry, sorted.
@@ -408,6 +408,26 @@ fn no_names_key_returns_empty() {
     assert!(entries.is_empty(), "expected empty list when /Names absent");
 }
 
+#[test]
+fn direct_catalog_root_accepts_attachment_mutation() {
+    let fixture = include_bytes!("../../../tests/fixtures/compat/direct-root-one-page.pdf");
+    let mut pdf = open(fixture.to_vec());
+    let filespec = make_filespec(&mut pdf, b"direct-root.txt");
+
+    pdf.embedded_files()
+        .replace_embedded_file(b"direct-root.txt", filespec)
+        .expect("direct catalog root must accept attachment insertion");
+
+    let entries = list_embedded_files(&mut pdf).expect("list direct-root attachment");
+    assert_eq!(
+        entries
+            .iter()
+            .map(|(key, _)| key.as_slice())
+            .collect::<Vec<_>>(),
+        vec![b"direct-root.txt".as_slice()]
+    );
+}
+
 fn build_no_root_pdf() -> Vec<u8> {
     let mut out = b"%PDF-1.7\n".to_vec();
     let object_offset = out.len() as u64;
@@ -435,13 +455,32 @@ fn build_non_dict_root_pdf() -> Vec<u8> {
 #[test]
 fn writer_handles_missing_and_malformed_catalog_paths() {
     let mut no_root = open(build_no_root_pdf());
-    insert_embedded_file(&mut no_root, b"x", ObjectRef::new(1, 0)).expect("insert no root");
-    assert!(!delete_embedded_file(&mut no_root, b"x").expect("delete no root"));
+    assert!(matches!(
+        insert_embedded_file(&mut no_root, b"x", ObjectRef::new(1, 0)),
+        Err(Error::QpdfExc(error))
+            if error.get_error_code() == QpdfErrorCode::DamagedPdf
+                && error.get_message_detail() == b"unable to find /Root dictionary"
+    ));
+    assert!(matches!(
+        delete_embedded_file(&mut no_root, b"x"),
+        Err(Error::QpdfExc(error))
+            if error.get_error_code() == QpdfErrorCode::DamagedPdf
+                && error.get_message_detail() == b"unable to find /Root dictionary"
+    ));
 
     let mut non_dict_root = open(build_non_dict_root_pdf());
-    insert_embedded_file(&mut non_dict_root, b"x", ObjectRef::new(1, 0))
-        .expect("insert non-dict root");
-    assert!(!delete_embedded_file(&mut non_dict_root, b"x").expect("delete non-dict root"));
+    assert!(matches!(
+        insert_embedded_file(&mut non_dict_root, b"x", ObjectRef::new(1, 0)),
+        Err(Error::QpdfExc(error))
+            if error.get_error_code() == QpdfErrorCode::DamagedPdf
+                && error.get_message_detail() == b"unable to find /Root dictionary"
+    ));
+    assert!(matches!(
+        delete_embedded_file(&mut non_dict_root, b"x"),
+        Err(Error::QpdfExc(error))
+            if error.get_error_code() == QpdfErrorCode::DamagedPdf
+                && error.get_message_detail() == b"unable to find /Root dictionary"
+    ));
 
     let mut non_dict_names = open(build_non_dict_names_pdf());
     assert!(!delete_embedded_file(&mut non_dict_names, b"x").expect("non-dict Names"));
@@ -1265,23 +1304,31 @@ fn helper_absent_tree_has_no_entries_or_lookup() {
 }
 
 #[test]
-fn helper_treats_missing_or_malformed_catalog_paths_as_absent() {
+fn helper_reports_invalid_roots_and_treats_missing_tree_paths_as_absent() {
     let mut no_root = open(build_no_root_pdf());
-    assert!(!no_root
-        .embedded_files()
-        .has_embedded_files()
-        .expect("missing root"));
+    assert!(matches!(
+        no_root.embedded_files().has_embedded_files(),
+        Err(Error::QpdfExc(error))
+            if error.get_error_code() == QpdfErrorCode::DamagedPdf
+                && error.get_message_detail() == b"unable to find /Root dictionary"
+    ));
 
     let mut non_dict_catalog = open(build_non_dict_root_pdf());
     let filespec = make_filespec(&mut non_dict_catalog, b"ignored.txt");
-    non_dict_catalog
-        .embedded_files()
-        .replace_embedded_file(b"ignored", filespec)
-        .expect("non-dictionary catalog is a qpdf no-op");
-    assert!(!non_dict_catalog
-        .embedded_files()
-        .has_embedded_files()
-        .expect("non-dict catalog"));
+    assert!(matches!(
+        non_dict_catalog
+            .embedded_files()
+            .replace_embedded_file(b"ignored", filespec),
+        Err(Error::QpdfExc(error))
+            if error.get_error_code() == QpdfErrorCode::DamagedPdf
+                && error.get_message_detail() == b"unable to find /Root dictionary"
+    ));
+    assert!(matches!(
+        non_dict_catalog.embedded_files().has_embedded_files(),
+        Err(Error::QpdfExc(error))
+            if error.get_error_code() == QpdfErrorCode::DamagedPdf
+                && error.get_message_detail() == b"unable to find /Root dictionary"
+    ));
 
     let mut non_dict_names = open(build_non_dict_names_pdf());
     assert!(!non_dict_names
