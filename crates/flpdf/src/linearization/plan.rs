@@ -963,8 +963,9 @@ fn raw_refs_with_extras_preserving_first(
 ) -> Vec<QpdfObjGen> {
     let mut result = raw_refs_from_object_refs(refs);
     let first = result.first().copied();
-    result.extend(extras);
-    if result.len() > 1 {
+    let extras: Vec<_> = extras.into_iter().collect();
+    result.extend(extras.iter().copied());
+    if !extras.is_empty() && result.len() > 1 {
         result[1..].sort_unstable();
     }
     if let Some(first) = first {
