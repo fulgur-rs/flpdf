@@ -2235,12 +2235,11 @@ fn payload_decodes_a_dct_stream_through_the_canonical_pipeline() {
     assert_ne!(decoded.as_slice(), jpeg.as_slice());
 }
 
-/// A filter chain longer than the whole-buffer decoder's `MAX_FILTER_CHAIN_LEN`
-/// (16) now decodes instead of failing: the canonical pipeline carries no
-/// chain-length budget, matching qpdf, which imposes no such limit
-/// (`DecodeLimits` is a flpdf-only hardening budget with no qpdf counterpart --
-/// see route-matrix C27/C28). This is the second observable delta of routing
-/// `payload()` through `pipe_stream_data`, alongside token-filter application.
+/// A filter chain longer than the former whole-buffer compatibility budget now
+/// decodes instead of failing: the canonical pipeline carries no chain-length
+/// budget, matching qpdf, which imposes no such limit. This is the second
+/// observable delta of routing `payload()` through `pipe_stream_data`, alongside
+/// token-filter application.
 #[test]
 fn payload_decodes_a_filter_chain_longer_than_the_whole_buffer_budget() {
     /// Encode one ASCIIHex stage, including qpdf's `>` end-of-data marker.

@@ -26,9 +26,10 @@ fn dead_qpdf_routes_are_removed_and_canonical_owners_remain() {
     assert!(!read_source("encryption/state.rs").contains("fn compute_data_key("));
     assert!(!read_source("writer/encryption_state.rs").contains("fn compute_data_key("));
 
-    let filters = read_source("filters.rs");
-    assert!(!filters.contains("fn decode_stream_data_with_limits("));
-    assert!(!filters.contains("fn decode_stream_data_from_handle("));
+    assert!(
+        !source_root().join("filters.rs").exists(),
+        "qpdf-less filters.rs compatibility module remains"
+    );
     assert!(read_source("object_handle.rs").contains("pub fn get_stream_data("));
 
     let reader = read_source("reader.rs");
@@ -73,21 +74,10 @@ fn dead_qpdf_routes_are_removed_and_canonical_owners_remain() {
 
 #[test]
 fn stream_whole_buffer_bridges_are_removed_after_canonical_cutover() {
-    let filters = read_source("filters.rs");
-    for dead in [
-        "pub fn decode_stream_data(",
-        "pub fn encode_stream_data(",
-        "fn decode_stream_data_from_handle(",
-        "fn encode_stream_data_from_handle(",
-        "fn encode_stream_data_from_specs(",
-        "fn apply_encode_params(",
-        "fn apply_single_filter_encode(",
-    ] {
-        assert!(
-            !filters.contains(dead),
-            "legacy materialized stream bridge remains: {dead}"
-        );
-    }
+    assert!(
+        !source_root().join("filters.rs").exists(),
+        "legacy materialized stream bridge module remains"
+    );
 
     let xref = read_source("xref.rs");
     assert!(

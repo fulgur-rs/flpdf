@@ -11,28 +11,16 @@ fn production_source(path: &str) -> String {
 
 #[test]
 fn filter_public_boundaries_are_object_handle_native() {
-    let filters = production_source(concat!(env!("CARGO_MANIFEST_DIR"), "/src/filters.rs"));
-    for forbidden in [
-        "pub fn decode_stream_data(dict: &Dictionary",
-        "pub fn decode_stream_data_recovering(\n    dict: &Dictionary",
-        "pub fn decode_stream_data_with_limits(\n    dict: &Dictionary",
-        "pub fn encode_stream_data(dict: &Dictionary",
-    ] {
-        assert!(
-            !filters.contains(forbidden),
-            "filters.rs still exposes legacy Dictionary boundary: {forbidden}"
-        );
-    }
+    assert!(
+        !std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("src/filters.rs")
+            .exists(),
+        "filters.rs still exposes a legacy public boundary"
+    );
 }
 
 #[test]
 fn passthrough_codec_label_bridge_is_removed() {
-    let filters = production_source(concat!(env!("CARGO_MANIFEST_DIR"), "/src/filters.rs"));
-    assert!(
-        !filters.contains("pub fn passthrough_codec_label("),
-        "filters.rs still exposes the removed public passthrough label bridge"
-    );
-
     let stream_filter =
         production_source(concat!(env!("CARGO_MANIFEST_DIR"), "/src/stream_filter.rs"));
     for forbidden in [
@@ -42,6 +30,40 @@ fn passthrough_codec_label_bridge_is_removed() {
         assert!(
             !stream_filter.contains(forbidden),
             "stream_filter.rs still contains C43 bridge text: {forbidden}"
+        );
+    }
+}
+
+#[test]
+fn qpdf_less_recovering_filter_api_is_removed() {
+    let crate_root = std::path::Path::new(env!("CARGO_MANIFEST_DIR"));
+    assert!(
+        !crate_root.join("src/filters.rs").exists(),
+        "qpdf-less filters.rs module remains"
+    );
+    assert!(
+        !crate_root
+            .join("tests/tiff_predictor_memory_tests.rs")
+            .exists(),
+        "qpdf-less TIFF hardening test remains"
+    );
+    let lib = std::fs::read_to_string(crate_root.join("src/lib.rs")).unwrap();
+    assert!(!lib.contains("pub mod filters;"));
+    for (relative, forbidden) in [
+        ("src/stream_filter.rs", "pipe_decode_recovering"),
+        ("src/stream_filter.rs", "FilterDecodeOutcome"),
+        ("src/stream_filter.rs", "FilterDecodePhase"),
+        ("src/stream_filter.rs", "decode_filter_specs_from_handle"),
+        ("src/stream_filter.rs", "set_tiff_memory_limit"),
+        ("src/pipeline/dct.rs", "DecodeLimits"),
+        ("src/pipeline/dct.rs", "with_max_output"),
+        ("src/pipeline/tiff_predictor.rs", "new_with_memory_limit"),
+        ("src/pipeline/tiff_predictor.rs", "max_memory"),
+    ] {
+        let source = std::fs::read_to_string(crate_root.join(relative)).unwrap();
+        assert!(
+            !source.contains(forbidden),
+            "{relative} retains qpdf-less C28 API/implementation: {forbidden}"
         );
     }
 }

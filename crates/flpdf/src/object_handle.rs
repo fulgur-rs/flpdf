@@ -3413,8 +3413,8 @@ impl ObjectHandle {
     /// non-array (`libqpdf/QPDFObjectHandle.cc:763-766`), so qpdf reads a
     /// non-array as an empty one. This returns `None`, matching
     /// [`Self::try_as_array`], and leaves the meaning of "not an array" to the
-    /// caller — for [`crate::stream_filter::decode_filter_specs_from_handle`]
-    /// that is the "stream filter type is not name or array" error. That
+    /// caller — for the canonical stream filter planning route that is the
+    /// "stream filter type is not name or array" error. That
     /// divergence predates this accessor and is not widened by it; folding
     /// qpdf's treat-as-empty in here would silently turn a rejected `/Filter`
     /// into an accepted unfiltered stream.
@@ -9936,8 +9936,8 @@ pub(crate) mod identity_tests {
         // Deliberately *not* qpdf's non-array answer. `getArrayNItems` warns
         // `typeWarning("array", "treating as empty")` and returns 0
         // (`libqpdf/QPDFObjectHandle.cc:763-766`); returning `Some(0)` here
-        // would make `stream_filter::decode_filter_specs_from_handle` read a
-        // scalar `/Filter` as an empty chain — an accepted unfiltered stream —
+        // would make the canonical stream filter planner read a scalar
+        // `/Filter` as an empty chain — an accepted unfiltered stream —
         // instead of raising its type error.
         for non_array in [
             ObjectHandle::null(),
@@ -14457,6 +14457,47 @@ mod mutation_tests {
         assert!(success);
         assert!(filtering_attempted);
         assert_eq!(sink.take_buffer().unwrap(), b"hello");
+    }
+
+    #[test]
+    fn pipe_stream_data_decodes_a_tiff_predictor_through_the_canonical_chain() {
+        let dict = ObjectHandle::dictionary(vec![
+            (
+                b"Filter".to_vec(),
+                ObjectHandle::name(b"FlateDecode".to_vec()),
+            ),
+            (
+                b"DecodeParms".to_vec(),
+                ObjectHandle::dictionary(vec![
+                    (b"Predictor".to_vec(), ObjectHandle::integer(2)),
+                    (b"Columns".to_vec(), ObjectHandle::integer(4)),
+                    (b"Colors".to_vec(), ObjectHandle::integer(1)),
+                    (b"BitsPerComponent".to_vec(), ObjectHandle::integer(8)),
+                ]),
+            ),
+        ]);
+        let stream = ObjectHandle::stream(
+            dict,
+            Rc::new(vec![
+                0x78, 0x9c, 0xe3, 0xe2, 0xe2, 0xe2, 0x02, 0x00, 0x00, 0x68, 0x00, 0x29,
+            ]),
+        );
+        let mut sink = crate::pipeline::buffer::Buffer::new("sink", None);
+        let mut filtering_attempted = false;
+
+        assert!(stream
+            .pipe_stream_data(
+                &mut sink,
+                &mut filtering_attempted,
+                0,
+                crate::writer::DecodeLevel::Generalized,
+                false,
+                false,
+            )
+            .unwrap());
+
+        assert!(filtering_attempted);
+        assert_eq!(sink.take_buffer().unwrap(), [10, 20, 30, 40]);
     }
 
     #[test]
