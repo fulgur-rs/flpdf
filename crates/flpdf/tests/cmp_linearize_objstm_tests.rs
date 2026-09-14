@@ -67,6 +67,16 @@ fn qpdf_linearized_objstm_at(path: &Path) -> Vec<u8> {
         .status()
         .expect("qpdf runs");
     assert_eq!(status.code(), Some(0), "qpdf linearization must succeed");
+    let check_status = Command::new("qpdf")
+        .args(["--check-linearization"])
+        .arg(&output)
+        .status()
+        .expect("qpdf linearization check runs");
+    assert_eq!(
+        check_status.code(),
+        Some(0),
+        "qpdf linearization check must be clean"
+    );
     std::fs::read(output).expect("qpdf output")
 }
 
@@ -211,6 +221,23 @@ fn assert_structural(fixture: &str, stem: &str) {
 fn assert_strict(fixture: &str, stem: &str) {
     let actual = flpdf_linearized_objstm(fixture);
     let expected = golden(stem);
+    report(fixture, &actual, &expected, "full bytes");
+}
+
+fn assert_structural_live(fixture: &str) {
+    let actual = mask_id1(&flpdf_linearized_objstm(fixture));
+    let expected = mask_id1(&qpdf_linearized_objstm(fixture));
+    report(
+        fixture,
+        &actual,
+        &expected,
+        "structural layout (ignoring /ID[1])",
+    );
+}
+
+fn assert_strict_live(fixture: &str) {
+    let actual = flpdf_linearized_objstm(fixture);
+    let expected = qpdf_linearized_objstm(fixture);
     report(fixture, &actual, &expected, "full bytes");
 }
 
@@ -791,6 +818,16 @@ fn shared_stream_objstm_byte_identical_to_qpdf() {
 #[test]
 fn nonid_id0_linearized_objstm_is_byte_identical_to_qpdf() {
     assert_strict("nonid-id0.pdf", "nonid-id0");
+}
+
+#[test]
+fn one_page_objstm_structurally_byte_identical_to_qpdf() {
+    assert_structural_live("one-page.pdf");
+}
+
+#[test]
+fn one_page_objstm_byte_identical_to_qpdf() {
+    assert_strict_live("one-page.pdf");
 }
 
 #[test]
