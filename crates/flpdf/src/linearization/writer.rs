@@ -2970,11 +2970,22 @@ fn second_half_container_anchors(
         }
     }
 
-    let page_private_sets: Vec<BTreeSet<ObjectRef>> = plan
-        .per_page_private_objects
-        .iter()
-        .map(|v| v.iter().copied().collect())
-        .collect();
+    let page_private_owner = |member: ObjectRef| -> Option<usize> {
+        if let Some(optimization) = plan.optimization.as_ref() {
+            return optimization
+                .page_users(member)
+                .find(|&page| page != 0)
+                .map(|page| page as usize);
+        }
+        // Manually constructed plans have no canonical object-user map. Keep
+        // their bounded fallback without imposing this second ownership table
+        // on the production qpdf route.
+        plan.per_page_private_objects
+            .iter()
+            .enumerate()
+            .skip(1)
+            .find_map(|(page, members)| members.contains(&member).then_some(page))
+    };
     part4_batches
         .iter()
         .map(|batch| {
@@ -2984,13 +2995,10 @@ fn second_half_container_anchors(
             let object_number = batch.source_container_number.unwrap_or(u32::MAX);
             let batch_rank: (u8, usize, u8, u32) = match batch.route {
                 ContainerPart::OtherPagePrivate => {
-                    let owner = (1..page_private_sets.len())
-                        .find(|&i| {
-                            batch
-                                .members
-                                .iter()
-                                .any(|m| page_private_sets[i].contains(m))
-                        })
+                    let owner = batch
+                        .members
+                        .iter()
+                        .find_map(|member| page_private_owner(*member))
                         .expect("Part-7 ObjStm route must have one non-first-page owner");
                     (0, owner, 1, object_number)
                 }
