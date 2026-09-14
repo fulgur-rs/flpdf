@@ -5,6 +5,7 @@ use crate::encryption::state::{EncryptionInspectionState, EncryptionState};
 use crate::object_handle::DocumentResolver;
 use crate::pages::repair::PreparedPages;
 use crate::pdf_version::{leading_major_minor, PdfVersion};
+use crate::qpdf_obj_gen::QpdfObjGen;
 use crate::reader::resolver::{ResolverHandle, CLOSED_INPUT_SOURCE_NAME};
 use crate::reader::InputSourceControl;
 use crate::{Error, ObjectHandle, ObjectRef, QpdfErrorCode, QpdfExc, Result};
@@ -157,8 +158,9 @@ pub struct Pdf<R: Read + Seek + 'static> {
     // `R: Send`/`Sync`. This is an accepted, intentional consequence of that
     // deviation, not a regression to fix — qpdf's own `QPDF` is likewise not
     // thread-safe for concurrent access to one document.
-    /// qpdf's `m->object_copiers[source unique_id].object_map` equivalent.
-    pub(crate) foreign_object_maps: BTreeMap<u64, BTreeMap<ObjectRef, ObjectRef>>,
+    /// qpdf's `m->object_copiers[source unique_id].object_map` equivalent,
+    /// keyed by the source's raw `QpdfObjGen` identity.
+    pub(crate) foreign_object_maps: BTreeMap<u64, BTreeMap<QpdfObjGen, ObjectRef>>,
     /// Source-page copy groups in the order qpdf allocates them. The grouped
     /// page merge keeps one copier per source, but page-spec provenance must
     /// still interleave each unique page graph at its occurrence boundary.
@@ -170,7 +172,8 @@ pub struct Pdf<R: Read + Seek + 'static> {
     /// retain their target allocation order as a fallback. The same key feeds
     /// linearization and generated ObjStm planning.
     pub(crate) writer_object_order: Option<BTreeMap<ObjectRef, WriterObjectOrderKey>>,
-    /// qpdf's `m->object_copiers[source unique_id].visiting` equivalent
+    /// qpdf's `m->object_copiers[source unique_id].visiting` equivalent,
+    /// keyed by raw source `QpdfObjGen` identities
     /// (`include/qpdf/QPDF.hh:891-897`). qpdf never rolls back
     /// `ObjCopier::object_map`/`visiting` when `copyForeignObject` fails
     /// partway (`libqpdf/QPDF.cc:2019-2093`): a `reserveObjects` traversal
@@ -182,7 +185,7 @@ pub struct Pdf<R: Read + Seek + 'static> {
     /// one bundled per-source struct, so map persistence and failure poisoning
     /// remain independently tracked by the canonical `copy_foreign_object`
     /// port.
-    pub(crate) foreign_object_visiting: BTreeMap<u64, BTreeSet<ObjectRef>>,
+    pub(crate) foreign_object_visiting: BTreeMap<u64, BTreeSet<QpdfObjGen>>,
     /// qpdf's per-source AcroForm helper cache (`QPDFJob::get_afdh_for_qpdf`,
     /// `QPDFJob.cc:1847-1856`). It stores only canonical ObjectHandle
     /// identities, so sequential helper facades can share it without a
@@ -270,10 +273,12 @@ impl<R: Read + Seek> Pdf<R> {
     pub(crate) fn record_primary_writer_object_refs(&mut self, source_id: u64) {
         let mappings = self.foreign_object_map_snapshot(source_id);
         let order = self.writer_object_order.get_or_insert_with(BTreeMap::new);
-        for (source_ref, target_ref) in mappings {
-            order
-                .entry(target_ref)
-                .or_insert_with(|| WriterObjectOrderKey::primary(source_ref));
+        for (source_object_gen, target_ref) in mappings {
+            if let Some(source_ref) = source_object_gen.to_object_ref() {
+                order
+                    .entry(target_ref)
+                    .or_insert_with(|| WriterObjectOrderKey::primary(source_ref));
+            }
         }
     }
 

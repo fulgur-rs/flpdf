@@ -14,6 +14,7 @@
 //! the complete pruning walk.
 
 use crate::page_object_helper::PageObjectHelper;
+use crate::qpdf_obj_gen::QpdfObjGen;
 use crate::resource_finder::{ResourceFinder, ResourceNamesByType};
 use crate::{Error, ObjectHandle, ObjectRef, Pdf, Result};
 use std::collections::{BTreeMap, BTreeSet, VecDeque};
@@ -279,15 +280,20 @@ fn remove_unreferenced_resources_in_form_xobjects<R: Read + Seek>(
         return Ok((BTreeSet::new(), false));
     }
     let mut pending = VecDeque::from(form_xobjects_in_resources(&page_resources)?);
-    let mut visited = BTreeSet::new();
+    let mut visited: BTreeSet<QpdfObjGen> = BTreeSet::new();
     let mut unresolved = BTreeSet::new();
     let mut any_failures = false;
 
-    while let Some(form_ref) = pending.pop_front() {
-        if !visited.insert(form_ref) {
+    while let Some(holder_handle) = pending.pop_front() {
+        let Some(object_gen) = holder_handle
+            .qpdf_obj_gen()
+            .filter(|object_gen| object_gen.is_indirect())
+        else {
+            continue;
+        };
+        if !visited.insert(object_gen) {
             continue;
         }
-        let holder_handle = pdf.get_object_handle(form_ref);
         // Resolve the canonical form handle before inspecting its stream type.
         holder_handle.try_dereference()?;
         let form_handle = holder_handle;
@@ -410,8 +416,9 @@ fn unresolved_resource_names(
     Ok(unresolved)
 }
 
-/// Return direct indirect Form XObjects listed in a resource dictionary.
-fn form_xobjects_in_resources(resources: &ObjectHandle) -> Result<Vec<ObjectRef>> {
+/// Return indirect Form XObjects listed in a resource dictionary, retaining
+/// each handle's raw qpdf identity for the caller's traversal seen set.
+fn form_xobjects_in_resources(resources: &ObjectHandle) -> Result<Vec<ObjectHandle>> {
     let xobjects = resources.try_get_key(b"/XObject")?;
     xobjects.try_dereference()?;
     let Some(xobjects) = xobjects.try_as_dictionary()? else {
@@ -419,7 +426,11 @@ fn form_xobjects_in_resources(resources: &ObjectHandle) -> Result<Vec<ObjectRef>
     };
     let mut forms = Vec::new();
     for value in xobjects.values() {
-        if !value.is_indirect() {
+        if value
+            .qpdf_obj_gen()
+            .filter(|object_gen| object_gen.is_indirect())
+            .is_none()
+        {
             continue;
         }
         // Resolve the live XObject value before applying the form predicate.
@@ -427,9 +438,7 @@ fn form_xobjects_in_resources(resources: &ObjectHandle) -> Result<Vec<ObjectRef>
         if !value.is_form_xobject()? {
             continue;
         }
-        if let Some(reference) = value.object_ref() {
-            forms.push(reference);
-        }
+        forms.push(value.clone());
     }
     Ok(forms)
 }
@@ -531,9 +540,10 @@ fn form_stream_dict(handle: &ObjectHandle) -> Result<ObjectHandle> {
 #[cfg(test)]
 mod final_handle_tests {
     use super::{
-        remove_unreferenced_resources_in_form_xobjects, remove_unreferenced_resources_on_form,
+        form_xobjects_in_resources, remove_unreferenced_resources_in_form_xobjects,
+        remove_unreferenced_resources_on_form,
     };
-    use crate::{ObjectHandle, Pdf};
+    use crate::{ObjectHandle, ObjectRef, Pdf};
     use std::io::Cursor;
     use std::rc::Rc;
 
@@ -611,6 +621,28 @@ mod final_handle_tests {
                 .expect("form resource prepass");
         assert!(unresolved.is_empty());
         assert!(!failures);
+    }
+
+    #[test]
+    fn form_resource_prepass_does_not_drop_a_raw_generation_form() {
+        let mut pdf = fixture();
+        let raw_ref = ObjectRef::new(50, 65_535);
+        let form = ObjectHandle::stream(
+            ObjectHandle::dictionary(vec![
+                (b"/Type".to_vec(), ObjectHandle::name(b"XObject".to_vec())),
+                (b"/Subtype".to_vec(), ObjectHandle::name(b"Form".to_vec())),
+            ]),
+            Rc::new(Vec::new()),
+        );
+        pdf.replace_object(raw_ref, form).expect("install raw form");
+        let resources = ObjectHandle::dictionary(vec![(
+            b"/XObject".to_vec(),
+            ObjectHandle::dictionary(vec![(b"/Fm0".to_vec(), pdf.get_object_handle(raw_ref))]),
+        )]);
+
+        let forms = form_xobjects_in_resources(&resources).expect("find raw form");
+
+        assert_eq!(forms.len(), 1);
     }
 
     #[test]

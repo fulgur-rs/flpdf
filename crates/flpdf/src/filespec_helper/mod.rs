@@ -279,6 +279,27 @@ mod tests {
     }
 
     #[test]
+    fn create_filespec_preserves_an_already_indirect_raw_generation_stream() {
+        let mut pdf = open_minimal();
+        let raw_ref = ObjectRef::new(5, 65_535);
+        pdf.replace_object(
+            raw_ref,
+            ObjectHandle::stream(
+                ObjectHandle::dictionary(Vec::new()),
+                std::rc::Rc::new(b"data".to_vec()),
+            ),
+        )
+        .unwrap();
+        let raw_stream = pdf.get_object_handle(raw_ref);
+
+        let filespec = FileSpec::create_file_spec(&mut pdf, b"raw.bin", raw_stream).unwrap();
+        let ef = filespec.try_get_key(b"/EF").unwrap();
+        let embedded = ef.try_get_key(b"/F").unwrap();
+
+        assert_eq!(embedded.unparse(), b"5 65535 R");
+    }
+
+    #[test]
     fn create_filespec_accepts_a_direct_value_with_a_foreign_descendant() {
         let mut source = open_minimal();
         let foreign = source.get_object_handle(ObjectRef::new(99, 0));

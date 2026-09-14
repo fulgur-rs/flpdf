@@ -192,6 +192,31 @@ fn typed_inheritable_values_follow_terminal_holder_chains_without_losing_raw_ide
 }
 
 #[test]
+fn top_level_field_rejects_an_unprojectable_raw_parent_explicitly() {
+    let mut pdf = open(doc(vec![(10, "<< /FT /Tx >>".into())]));
+    let raw_ref = ObjectRef::new(11, 65_535);
+    pdf.replace_object(
+        raw_ref,
+        ObjectHandle::dictionary(vec![(
+            b"/T".to_vec(),
+            ObjectHandle::string(b"top".to_vec()),
+        )]),
+    )
+    .unwrap();
+    let field = pdf.get_object_handle(ObjectRef::new(10, 0));
+    field.try_is_scalar().unwrap();
+    field
+        .replace_key(b"/Parent", pdf.get_object_handle(raw_ref))
+        .unwrap();
+
+    let error = FormFieldObjectHelper::new(ObjectRef::new(10, 0), &mut pdf)
+        .get_top_level_field()
+        .expect_err("raw parent identity cannot be returned as ObjectRef");
+
+    assert!(error.to_string().contains("11 65535"));
+}
+
+#[test]
 fn field_name_accessors_follow_terminal_holder_chains() {
     let bytes = doc(vec![
         (10, "<< /T 20 0 R /TU 23 0 R /TM 26 0 R >>".into()),

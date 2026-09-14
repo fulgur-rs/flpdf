@@ -46,8 +46,13 @@ fn matching_out_of_range_stream_header_pdf() -> Vec<u8> {
 fn matching_out_of_range_object_header_is_not_damaged() {
     let mut pdf = Pdf::open_mem_owned(matching_out_of_range_header_pdf()).expect("open PDF");
 
-    pdf.get_all_objects()
+    let objects = pdf
+        .get_all_objects()
         .expect("qpdf reads the matching raw object header");
+
+    assert!(objects
+        .iter()
+        .any(|object| object.unparse() == b"5 65536 R"));
 
     assert!(
         pdf.repair_diagnostics().entries().is_empty(),

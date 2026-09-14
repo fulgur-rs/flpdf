@@ -7,8 +7,8 @@
 //! object graph that every other handle in the document observes.
 //!
 //! Parent-chain cycle detection follows qpdf's `QPDFObjGen::set`: indirect
-//! object identities are keyed by `ObjectRef` in a `BTreeSet` (O(log n) per
-//! check), while direct handles are not inserted
+//! object identities are keyed by raw `QpdfObjGen` in a `BTreeSet` (O(log n)
+//! per check), while direct handles are not inserted
 //! (`include/qpdf/QPDFObjGen.hh:105-124`). This mirrors qpdf exactly for
 //! indirect cycles, but qpdf's own guard has the same gap flpdf would
 //! otherwise inherit: a direct object's `QPDFObjGen` is always `(0, 0)`, so
@@ -34,6 +34,7 @@
 //! already avoid via the `BTreeSet`.
 
 use crate::object_handle::ObjectHandle;
+use crate::qpdf_obj_gen::QpdfObjGen;
 use crate::{Error, ObjectRef, Pdf, Result};
 use std::collections::BTreeSet;
 use std::io::{Read, Seek};
@@ -50,16 +51,17 @@ const BROKEN_CHECKBOX_WARNING: &str = "unable to set the value of this checkbox"
 #[path = "form_field_object_helper/rendering.rs"]
 mod rendering;
 
-fn mark_field_node_seen(seen: &mut BTreeSet<ObjectRef>, current: &ObjectHandle) -> bool {
+fn mark_field_node_seen(seen: &mut BTreeSet<QpdfObjGen>, current: &ObjectHandle) -> bool {
     current
-        .object_ref()
-        .map(|object_ref| seen.insert(object_ref))
+        .qpdf_obj_gen()
+        .filter(|object_gen| object_gen.is_indirect())
+        .map(|object_gen| seen.insert(object_gen))
         .unwrap_or(true)
 }
 
 /// Detect an actual repeat among **direct** `/Parent` nodes by live handle
 /// identity. Indirect nodes are ignored here (they are already turned into
-/// termination by the `ObjectRef` `seen` set); a direct node not yet seen is
+/// termination by the raw `QpdfObjGen` seen set); a direct node not yet seen is
 /// recorded and the walk continues. See the module doc for why direct nodes
 /// need this separate, identity-based guard.
 fn mark_direct_node_seen(direct_seen: &mut Vec<ObjectHandle>, current: &ObjectHandle) -> bool {
@@ -154,11 +156,10 @@ impl<'a, R: Read + Seek> FormFieldObjectHelper<'a, R> {
     /// until a cycle or a terminal node with no upper bound on depth (its
     /// guard is `QPDFObjGen::set`, a pure cycle detector). This walk shares
     /// that same cycle-only termination via `mark_field_node_seen` --
-    /// unlike `resolve_inherited_handle_from`, `current` here is always
-    /// indirect (this function stops rather than climbs into a direct
-    /// `/Parent`, since its `ObjectRef`-typed return cannot represent a
-    /// direct top field), so the module's separate direct-handle cycle guard
-    /// does not apply.
+    /// unlike `resolve_inherited_handle_from`, a direct `/Parent` stops here
+    /// because this method's return type is `ObjectRef`. An indirect parent
+    /// that cannot cross the valid `ObjectRef` projection is rejected
+    /// explicitly at that public boundary.
     pub fn get_top_level_field(&mut self) -> Result<(ObjectRef, bool)> {
         let Some(field_ref) = self.field_ref else {
             return Err(Error::Unsupported(
@@ -181,9 +182,19 @@ impl<'a, R: Read + Seek> FormFieldObjectHelper<'a, R> {
             if parent.try_is_null()? {
                 break;
             }
-            let Some(parent_ref) = parent.object_ref() else {
+            if !parent.is_indirect() {
                 break;
-            };
+            }
+            let parent_object_gen = parent.qpdf_obj_gen().ok_or_else(|| {
+                Error::Internal("indirect field parent lost its identity".to_owned())
+            })?;
+            let parent_ref = parent_object_gen.to_object_ref().ok_or_else(|| {
+                Error::Unsupported(format!(
+                    "field parent object {} {} cannot be represented as a valid ObjectRef",
+                    parent_object_gen.get_obj(),
+                    parent_object_gen.get_gen()
+                ))
+            })?;
             top = parent_ref;
             current = parent;
             is_different = true;
@@ -905,6 +916,15 @@ mod tests {
         let same_object = ObjectHandle::new_indirect_unresolved(ObjectRef::new(10, 0), -1);
         assert!(mark_field_node_seen(&mut seen, &first));
         assert!(!mark_field_node_seen(&mut seen, &same_object));
+    }
+
+    #[test]
+    fn qpdf_seen_set_tracks_a_raw_generation_identity() {
+        let mut seen = BTreeSet::new();
+        let raw = ObjectHandle::new_indirect_unresolved(ObjectRef::new(10, 65_535), -1);
+
+        assert!(mark_field_node_seen(&mut seen, &raw));
+        assert!(!mark_field_node_seen(&mut seen, &raw));
     }
 
     #[test]

@@ -23,6 +23,7 @@ use crate::page_label_document_helper::{
 };
 use crate::pages::tree_rebuild::RebuildResult;
 use crate::pdf::WriterObjectOrderKey;
+use crate::qpdf_obj_gen::QpdfObjGen;
 use crate::{
     AcroFormDocumentHelper, Error, Matrix, ObjectHandle, ObjectRef, PageObjectHelper, PageRange,
     Pdf, Result, UsageError,
@@ -748,7 +749,9 @@ fn rebuild_acroform_in_final_page_order<R: Read + Seek + 'static, T: Read + Seek
         }
         let source_id = sources[source_index].unique_id();
         let mut object_map = merged.take_foreign_object_map(source_id);
-        object_map.extend(mappings.iter().map(|(&source, &target)| (source, target)));
+        for (&source, &target) in mappings {
+            object_map.insert(QpdfObjGen::try_from_object_ref(source)?, target);
+        }
         merged.set_foreign_object_map(source_id, object_map);
     }
 

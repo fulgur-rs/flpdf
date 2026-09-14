@@ -1207,12 +1207,12 @@ fn replace_first(bytes: &mut Vec<u8>, needle: &[u8], replacement: &[u8]) {
 
 fn expand_description_template(
     template: &[u8],
-    object_ref: Option<ObjectRef>,
+    object_gen: Option<QpdfObjGen>,
     state: &ObjectValue,
     parsed_offset: i64,
 ) -> Vec<u8> {
-    let og = object_ref
-        .map(|object_ref| format!("{} {}", object_ref.number, object_ref.generation).into_bytes())
+    let og = object_gen
+        .map(|object_gen| format!("{} {}", object_gen.get_obj(), object_gen.get_gen()).into_bytes())
         .unwrap_or_default();
     let shift = match state {
         ObjectValue::Dictionary(_) | ObjectValue::Stream(_) => 2,
@@ -1263,7 +1263,7 @@ impl SharedValueState {
             match desc {
                 ObjectDescription::Template(tmpl) => expand_description_template(
                     tmpl.as_slice(),
-                    self.object_ref(),
+                    self.qpdf_obj_gen(),
                     &self.value,
                     self.parsed_offset,
                 ),
@@ -8449,7 +8449,7 @@ fn merge_resource_subdict(
     rtype: &[u8],
     mut conflicts: Option<&mut ResourceConflicts>,
 ) -> Result<()> {
-    let mut og_to_name: Option<std::collections::HashMap<ObjectRef, Vec<u8>>> = None;
+    let mut og_to_name: Option<std::collections::HashMap<QpdfObjGen, Vec<u8>>> = None;
     let mut rnames: std::collections::BTreeSet<Vec<u8>> = std::collections::BTreeSet::new();
     let mut min_suffix: usize = 1;
     let Some(other_sub_entries) = other_val.as_dictionary() else {
@@ -8472,9 +8472,11 @@ fn merge_resource_subdict(
             og_to_name = Some(build_og_to_name(this_val));
             rnames = try_get_resource_names(this_val)?;
         }
-        let reused = rval
-            .object_ref()
-            .and_then(|r| og_to_name.as_ref().and_then(|m| m.get(&r).cloned()));
+        let reused = rval.qpdf_obj_gen().and_then(|object_gen| {
+            og_to_name
+                .as_ref()
+                .and_then(|m| m.get(&object_gen).cloned())
+        });
         if let Some(existing_key) = reused {
             if existing_key != key {
                 conflicts_map
@@ -8549,12 +8551,14 @@ pub(crate) fn is_scalar(handle: &ObjectHandle) -> Result<bool> {
 // Mirrors `mergeResources`'s local `make_og_to_name` lambda
 // (`libqpdf/QPDFObjectHandle.cc:1071-1078`): every currently-indirect
 // entry in `dict`, keyed by object identity.
-fn build_og_to_name(dict: &ObjectHandle) -> std::collections::HashMap<ObjectRef, Vec<u8>> {
+fn build_og_to_name(dict: &ObjectHandle) -> std::collections::HashMap<QpdfObjGen, Vec<u8>> {
     let mut map = std::collections::HashMap::new();
     if let Some(entries) = dict.as_dictionary() {
         for (key, value) in entries {
-            if let Some(object_ref) = value.object_ref() {
-                map.insert(object_ref, key);
+            if value.is_indirect() {
+                if let Some(object_gen) = value.qpdf_obj_gen() {
+                    map.insert(object_gen, key);
+                }
             }
         }
     } // cov:ignore: control-flow marker — llvm-cov instrumentation artifact; the body above is exercised by merge_resources_reuses_an_existing_key_for_the_same_indirect_object
@@ -8585,8 +8589,9 @@ fn try_get_resource_names(dict: &ObjectHandle) -> Result<std::collections::BTree
 
 fn object_generation_description(handle: &ObjectHandle) -> String {
     handle
-        .object_ref()
-        .map(|object_ref| format!("{} {}", object_ref.number, object_ref.generation))
+        .qpdf_obj_gen()
+        .filter(|object_gen| object_gen.is_indirect())
+        .map(|object_gen| format!("{} {}", object_gen.get_obj(), object_gen.get_gen()))
         .unwrap_or_else(|| "0 0".to_owned())
 }
 
@@ -17029,6 +17034,27 @@ mod mutation_tests {
     }
 
     #[test]
+    fn merge_resources_reuses_a_raw_generation_identity() {
+        let shared = ObjectHandle::new_indirect_unresolved(ObjectRef::new(9, 65_535), -1);
+        shared.set_resolved(ObjectValue::Name(b"Shared".to_vec()));
+        let this_font = ObjectHandle::dictionary(vec![(b"F1".to_vec(), shared.clone())]);
+        let dest = ObjectHandle::dictionary(vec![(b"Font".to_vec(), this_font)]);
+        let other_font = ObjectHandle::dictionary(vec![(b"F1".to_vec(), shared)]);
+        let other = ObjectHandle::dictionary(vec![(b"Font".to_vec(), other_font)]);
+        let mut conflicts = std::collections::BTreeMap::new();
+
+        dest.merge_resources(&other, Some(&mut conflicts))
+            .expect("merge");
+
+        assert!(conflicts.is_empty());
+        assert!(!dest
+            .try_get_key(b"/Font")
+            .unwrap()
+            .try_has_key(b"/F1_1")
+            .unwrap());
+    }
+
+    #[test]
     fn merge_resources_reuse_records_a_conflict_when_the_reused_name_differs() {
         let shared = ObjectHandle::new_indirect_unresolved(ObjectRef::new(9, 0), -1);
         shared.set_resolved(ObjectValue::Name(b"Shared".to_vec()));
@@ -19804,6 +19830,20 @@ pub(crate) mod warning_emission_tests {
         let scalar = ObjectHandle::integer(42);
         scalar.set_description("scalar at offset $PO", 300);
         assert_eq!(scalar.description(), b"scalar at offset 300");
+    }
+
+    #[test]
+    fn object_description_template_uses_raw_qpdf_identity() {
+        let handle = ObjectHandle::integer(42);
+        handle.set_description("object $OG at offset $PO", 100);
+        let resolver: Rc<dyn DocumentResolver> = Rc::new(SinklessResolver);
+        handle.promote_to_indirect_qpdf_obj_gen(
+            QpdfObjGen::new(5, 65_536),
+            1,
+            Rc::downgrade(&resolver),
+        );
+
+        assert_eq!(handle.description(), b"object 5 65536 at offset 100");
     }
 
     #[test]

@@ -48,7 +48,8 @@
 
 use crate::nntree::NameTree;
 use crate::outline_object_helper::{OutlineId, OutlineItem, OutlineTree};
-use crate::{Error, ObjectHandle, ObjectRef, Pdf, Result};
+use crate::qpdf_obj_gen::QpdfObjGen;
+use crate::{Error, ObjectHandle, Pdf, Result};
 use std::collections::BTreeSet;
 use std::io::{Read, Seek};
 
@@ -65,13 +66,12 @@ fn object_key(object: &ObjectHandle, key: &[u8]) -> Result<Option<ObjectHandle>>
 
 /// Detect an actual repeat among **direct** outline sibling handles by live
 /// identity, mirroring `form_field_object_helper.rs`'s
-/// `mark_direct_node_seen` (`ObjectRef`-keyed seen sets never terminate a
-/// `/Next` cycle built entirely from direct dictionaries: a direct handle's
-/// `object_ref()` is always `None`, the same `QPDFObjGen::set` gap
-/// documented there). Real PDF bytes cannot produce two direct dictionaries
-/// that reciprocally reference each other, but it is reachable in memory
+/// `mark_direct_node_seen`. The raw `QpdfObjGen` set handles indirect
+/// identities, while a direct handle has no qpdf identity to insert. Real PDF
+/// bytes cannot produce two direct dictionaries that reciprocally reference
+/// each other, but it is reachable in memory
 /// through the public [`ObjectHandle::replace_key`] API. Unlike that helper
-/// (which raises an error), this returns a bool like the existing `ObjectRef`
+/// (which raises an error), this returns a bool like the existing raw
 /// seen-set checks in [`OutlineDocumentHelper::chase_and_mark_seen`] (used by
 /// both `get_tree`'s and `build_item`'s sibling walks), so a cycle here
 /// silently stops the walk the same way a repeated indirect reference
@@ -93,7 +93,7 @@ fn mark_direct_sibling_seen(direct_seen: &mut Vec<ObjectHandle>, current: &Objec
 
 /// The two "already visited" trackers a single outline sibling walk needs,
 /// bundled into one value so [`OutlineDocumentHelper::chase_and_mark_seen`]
-/// takes one seen-state argument instead of two: an `ObjectRef`-keyed set
+/// takes one seen-state argument instead of two: a raw `QpdfObjGen`-keyed set
 /// for indirect targets, and a direct-identity `Vec` (see
 /// [`mark_direct_sibling_seen`]) for direct ones. Both `get_tree`'s
 /// top-level walk and `build_item`'s per-frame sibling walk need exactly
@@ -102,7 +102,7 @@ fn mark_direct_sibling_seen(direct_seen: &mut Vec<ObjectHandle>, current: &Objec
 /// bundling them is a Rust-side container choice, not a qpdf structure.
 #[derive(Default)]
 struct SiblingSeen {
-    seen: BTreeSet<ObjectRef>,
+    seen: BTreeSet<QpdfObjGen>,
     direct_seen: Vec<ObjectHandle>,
 }
 
@@ -213,8 +213,11 @@ impl<'a, R: Read + Seek> OutlineDocumentHelper<'a, R> {
         seen: &mut SiblingSeen,
     ) -> Result<Option<ObjectHandle>> {
         let cursor = self.resolve_value_handle(cursor)?;
-        if let Some(reference) = cursor.object_ref() {
-            if !seen.seen.insert(reference) {
+        if let Some(object_gen) = cursor
+            .qpdf_obj_gen()
+            .filter(|object_gen| object_gen.is_indirect())
+        {
+            if !seen.seen.insert(object_gen) {
                 return Ok(None);
             }
         } else if !mark_direct_sibling_seen(&mut seen.direct_seen, &cursor) {
@@ -305,13 +308,17 @@ impl<'a, R: Read + Seek> OutlineDocumentHelper<'a, R> {
         cursor: ObjectHandle,
         parent: Option<OutlineId>,
         tree: &mut OutlineTree,
-        constructor_seen: &mut BTreeSet<ObjectRef>,
+        constructor_seen: &mut BTreeSet<QpdfObjGen>,
     ) -> Result<Option<OutlineId>> {
         let Some(root) = self.materialize_item(cursor, parent, tree)? else {
             return Ok(None);
         };
-        if let Some(reference) = tree[root].source_ref {
-            if !constructor_seen.insert(reference) {
+        if let Some(object_gen) = tree[root]
+            .object
+            .qpdf_obj_gen()
+            .filter(|object_gen| object_gen.is_indirect())
+        {
+            if !constructor_seen.insert(object_gen) {
                 return Ok(Some(root));
             }
         }
@@ -363,8 +370,12 @@ impl<'a, R: Read + Seek> OutlineDocumentHelper<'a, R> {
 
             let expand_child = if child_depth > QPDF_MAX_EXPANDED_OUTLINE_DEPTH {
                 false
-            } else if let Some(reference) = tree[child].source_ref {
-                constructor_seen.insert(reference)
+            } else if let Some(object_gen) = tree[child]
+                .object
+                .qpdf_obj_gen()
+                .filter(|object_gen| object_gen.is_indirect())
+            {
+                constructor_seen.insert(object_gen)
             } else {
                 true
             };
@@ -403,7 +414,7 @@ impl<'a, R: Read + Seek> OutlineDocumentHelper<'a, R> {
         // calling here. Resolve once more so this function's own `source_ref`
         // capture remains correct when it is called independently. The
         // canonical handle identity is captured AFTER resolution so cycle
-        // detection (`source_ref`, used by `build_item`'s
+        // detection (`ObjectHandle::qpdf_obj_gen`, used by `build_item`'s
         // `constructor_seen`) keys off the terminal identity, not the
         // pre-chase holder.
         let cursor = self.resolve_value_handle(cursor)?;
@@ -638,5 +649,22 @@ mod tests {
 
         let other_direct = ObjectHandle::dictionary(Vec::new());
         assert!(mark_direct_sibling_seen(&mut direct_seen, &other_direct));
+    }
+
+    #[test]
+    fn sibling_seen_set_tracks_a_raw_generation_identity() {
+        let mut pdf = Pdf::open(Cursor::new(minimal_pdf_bytes())).unwrap();
+        let raw = pdf.get_object_handle(ObjectRef::new(5, 65_535));
+        let mut seen = super::SiblingSeen::default();
+        let mut helper = pdf.outline();
+
+        assert!(helper
+            .chase_and_mark_seen(raw.clone(), &mut seen)
+            .unwrap()
+            .is_some());
+        assert!(helper
+            .chase_and_mark_seen(raw, &mut seen)
+            .unwrap()
+            .is_none());
     }
 }

@@ -6,6 +6,7 @@ use std::collections::{BTreeSet, HashSet};
 use std::io::{Read, Seek};
 
 use crate::object_handle::{ObjectHandle, ObjectHandleIdentity};
+use crate::qpdf_obj_gen::QpdfObjGen;
 use crate::ObjectRef;
 use crate::{Error, Pdf, QpdfErrorCode, QpdfExc, Result};
 
@@ -95,10 +96,10 @@ fn prepare_for_optimization_canonical<R: Read + Seek>(
     let mut pages = catalog.try_get_key(b"/Pages")?;
 
     // qpdf corrects a catalog that points into the tree by following
-    // `/Parent` until the true root (`QPDF_pages.cc:50-67`). Track canonical
-    // handle identity so the guard covers both indirect ObjGen slots and
-    // direct dictionaries that share the same live allocation.
-    let mut seen_parent: BTreeSet<ObjectRef> = BTreeSet::new();
+    // `/Parent` until the true root (`QPDF_pages.cc:50-67`). Track raw
+    // `QpdfObjGen` identity for indirect slots and canonical handle identity
+    // for direct dictionaries that share the same live allocation.
+    let mut seen_parent: BTreeSet<QpdfObjGen> = BTreeSet::new();
     // The key hashes only the canonical slot pointer; its Rc is retained so
     // that an allocation cannot be dropped and reused while it is tracked.
     #[allow(
@@ -109,8 +110,11 @@ fn prepare_for_optimization_canonical<R: Read + Seek>(
     let mut changed_pages = false;
     let mut warned = false;
     loop {
-        let repeated = if let Some(object_ref) = pages.object_ref() {
-            !seen_parent.insert(object_ref)
+        let repeated = if let Some(object_gen) = pages
+            .qpdf_obj_gen()
+            .filter(|object_gen| object_gen.is_indirect())
+        {
+            !seen_parent.insert(object_gen)
         } else {
             !seen_parent_direct.insert(pages.identity_key())
         };
@@ -162,8 +166,11 @@ fn prepare_for_optimization_canonical<R: Read + Seek>(
         repair_page_tree_handle(pdf, pages.clone(), &mut state, 0, false, max_depth)?;
     }
 
-    let root = match pages.object_ref() {
-        Some(object_ref) => PageTreeRoot::Indirect(object_ref),
+    let root = match pages
+        .qpdf_obj_gen()
+        .filter(|object_gen| object_gen.is_indirect())
+    {
+        Some(object_gen) => PageTreeRoot::Indirect(project_page_object_ref(object_gen)?),
         None => match catalog.object_ref() {
             Some(catalog_ref) => PageTreeRoot::Direct {
                 catalog: catalog_ref,
@@ -182,8 +189,8 @@ fn prepare_for_optimization_canonical<R: Read + Seek>(
 }
 
 struct CanonicalRepairState {
-    seen: BTreeSet<ObjectRef>,
-    visited: BTreeSet<ObjectRef>,
+    seen: BTreeSet<QpdfObjGen>,
+    visited: BTreeSet<QpdfObjGen>,
     visited_direct: HashSet<ObjectHandleIdentity>,
     pages: Vec<ObjectRef>,
 }
@@ -273,13 +280,19 @@ fn repair_page_tree_handle<R: Read + Seek>(
                 format!("kid {index} (from 0) is direct; converting to indirect").as_str(),
             )?; // cov:ignore: warning-sink failure is not injectable through the qpdf success oracle
             kid = promote_page_handle(pdf, kid)?;
-            let promoted_ref = kid
-                .object_ref()
-                .expect("promote_page_handle returns an indirect handle");
-            state.seen.insert(promoted_ref);
+            let promoted_object_gen = kid
+                .qpdf_obj_gen()
+                .filter(|object_gen| object_gen.is_indirect())
+                .ok_or_else(|| {
+                    Error::Internal("promoted page lost its indirect identity".to_owned())
+                })?;
+            state.seen.insert(promoted_object_gen);
             kids.set_array_item(index, kid.clone())?;
-        } else if let Some(object_ref) = kid.object_ref() {
-            if !state.seen.insert(object_ref) {
+        } else if let Some(object_gen) = kid
+            .qpdf_obj_gen()
+            .filter(|object_gen| object_gen.is_indirect())
+        {
+            if !state.seen.insert(object_gen) {
                 parent.warn_if_possible(
                     format!(
                         "kid {index} (from 0) appears more than once in the pages tree; creating a new page object as a copy"
@@ -288,10 +301,13 @@ fn repair_page_tree_handle<R: Read + Seek>(
                 )?; // cov:ignore: LLVM maps this covered duplicate-repair warning terminator separately
                 let copied = kid.shallow_copy()?;
                 kid = promote_page_handle(pdf, copied)?;
-                let copied_ref = kid
-                    .object_ref()
-                    .expect("promote_page_handle returns an indirect handle");
-                state.seen.insert(copied_ref);
+                let copied_object_gen = kid
+                    .qpdf_obj_gen()
+                    .filter(|object_gen| object_gen.is_indirect())
+                    .ok_or_else(|| {
+                        Error::Internal("copied page lost its indirect identity".to_owned())
+                    })?;
+                state.seen.insert(copied_object_gen);
                 kids.set_array_item(index, kid.clone())?;
             }
         }
@@ -300,9 +316,13 @@ fn repair_page_tree_handle<R: Read + Seek>(
             kid.warn_if_possible("/Type key should be /Page but is not; overriding")?;
             replace_handle_key(&kid, b"/Type", ObjectHandle::name(b"Page".to_vec()))?;
         }
-        let page_ref = kid
-            .object_ref()
-            .expect("every qpdf page-tree leaf is indirect after repair");
+        let page_ref = project_page_object_ref(
+            kid.qpdf_obj_gen()
+                .filter(|object_gen| object_gen.is_indirect())
+                .ok_or_else(|| {
+                    Error::Internal("page-tree leaf lost its indirect identity".to_owned())
+                })?,
+        )?;
         state.pages.push(page_ref);
     }
     Ok(())
@@ -318,15 +338,22 @@ fn repair_page_tree_frame<R: Read + Seek>(
 ) -> Result<Option<RepairFrame>> {
     if max_depth.is_some_and(|max_depth| depth >= max_depth) {
         let location = node
-            .object_ref()
-            .map_or_else(|| "direct /Pages node".to_owned(), |r| r.to_string());
+            .qpdf_obj_gen()
+            .filter(|object_gen| object_gen.is_indirect())
+            .map_or_else(
+                || "direct /Pages node".to_owned(),
+                |object_gen| format!("{} {}", object_gen.get_obj(), object_gen.get_gen()),
+            );
         return Err(Error::Unsupported(format!(
             "page tree depth exceeds maximum of {} at {location}",
             max_depth.expect("checked above")
         )));
     }
-    if let Some(object_ref) = node.object_ref() {
-        if !state.visited.insert(object_ref) {
+    if let Some(object_gen) = node
+        .qpdf_obj_gen()
+        .filter(|object_gen| object_gen.is_indirect())
+    {
+        if !state.visited.insert(object_gen) {
             return Err(page_tree_cycle_error(pdf));
         }
     } else if !state.visited_direct.insert(node.identity_key()) {
@@ -392,6 +419,19 @@ fn promote_page_handle<R: Read + Seek>(
 ) -> Result<ObjectHandle> {
     let promoted = pdf.make_indirect_from_object_handle(handle)?;
     Ok(promoted)
+}
+
+fn project_page_object_ref(object_gen: QpdfObjGen) -> Result<ObjectRef> {
+    // `PreparedPages` is an existing ObjectRef-valued public projection. Raw
+    // page identities are still traversed and diagnosed by their qpdf key, but
+    // cannot be silently narrowed to a different valid N G R reference here.
+    object_gen.to_object_ref().ok_or_else(|| {
+        Error::Unsupported(format!(
+            "page object {} {} cannot be represented as a valid ObjectRef",
+            object_gen.get_obj(),
+            object_gen.get_gen()
+        ))
+    })
 }
 
 fn replace_handle_key(holder: &ObjectHandle, key: &[u8], value: ObjectHandle) -> Result<()> {

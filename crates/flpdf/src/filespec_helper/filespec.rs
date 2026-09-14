@@ -36,7 +36,7 @@ impl<'a, R: Read + Seek> FileSpec<'a, R> {
         embedded_file: ObjectHandle,
     ) -> Result<ObjectHandle> {
         let name = new_unicode_string(filename.as_ref());
-        let embedded_file = if embedded_file.object_ref().is_some() {
+        let embedded_file = if embedded_file.is_indirect() {
             // qpdf's `QPDFObjectHandle::checkOwnership` compares the owning
             // QPDF of the value being inserted. It does not look up that
             // value by object number in the destination, since doing so would
