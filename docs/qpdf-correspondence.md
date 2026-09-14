@@ -3388,3 +3388,21 @@ same ObjStm member qpdf emits after Catalog directization. The linearized
 two-pass layout and emission remain dedicated consumers; only the Generate
 membership boundary was changed. The live regression is
 `cmp_linearize_objstm_tests.rs::indirect_extensions_linearized_objstm_is_byte_identical_to_qpdf`.
+
+### Direct outline first-half ordering (`flpdf-oqz1e`, 2026-09-15)
+
+qpdf promotes a direct Catalog `/Outlines` dictionary during
+`QPDF::optimize`, before `calculateLinearizationData` builds the part6
+sequence. `pushOutlinesToPart` then emits the plain outline root before the
+remaining `lc_outlines` set; when that set contains a generated ObjStm
+container, the root therefore precedes the container
+(`libqpdf/QPDF_optimization.cc:57-82`; `libqpdf/QPDF_linearization.cc:1188-1216,1406-1432`).
+
+flpdf's first-half placement now carries the outline-batch boundary and the
+plain outline-root identity into `RenumberMap::place_objstm_members_per_half`.
+It emits ordinary first-page containers, the outline root, outline containers,
+and then ineligible outline streams, preserving the existing q9o3 stream
+ordering. The strict live regression is
+`cmp_linearize_objstm_tests.rs::direct_outlines_linearized_objstm_is_byte_identical_to_qpdf`,
+with a default-feature root/container ordering guard in
+`linearize_objstm_generate_tests.rs`.

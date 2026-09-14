@@ -754,10 +754,12 @@ impl RenumberMap {
     ///    then the remaining first-half non-members compacted in order (type-1);
     /// 8. every first-half (Part-3 / qpdf part6) ObjStm container, batch-ordered
     ///    (type-1);
-    /// 8b. the first-half post-container plain objects in `first_half_post_plain`
+    /// 8b. when supplied, the plain qpdf `/Outlines` root between the ordinary
+    ///    first-page containers and the outline-routed containers (type-1);
+    /// 8c. the first-half post-container plain objects in `first_half_post_plain`
     ///    (an ineligible OD+outline stream routed to qpdf part6 under
-    ///    `/PageMode /UseOutlines`) — emitted AFTER the part6 container, mirroring
-    ///    the second half's `second_half_post_plain` (type-1);
+    ///    `/PageMode /UseOutlines`) — emitted AFTER the part6 containers,
+    ///    mirroring the second half's `second_half_post_plain` (type-1);
     /// 9. the open-document (qpdf part4) ObjStm members, then the first-page
     ///    (qpdf part6) ObjStm members, batch-ordered (type-2) — qpdf numbers
     ///    part4 members before part6 (`vecs1 = {part4, part6}`).
@@ -797,6 +799,8 @@ impl RenumberMap {
         second_half_anchors: &[SecondHalfContainerAnchor],
         second_half_post_plain: &BTreeSet<ObjectRef>,
         first_half_post_plain: &BTreeSet<ObjectRef>,
+        first_half_outline_batch_count: usize,
+        first_half_outline_root: Option<ObjectRef>,
     ) -> ObjStmRelocation {
         // Fast path: nothing to place — leave the map byte-identical.
         let no_open = open_document_batches.iter().all(|b| b.is_empty());
@@ -821,6 +825,8 @@ impl RenumberMap {
             .iter()
             .filter_map(|object_ref| QpdfObjGen::try_from_object_ref(*object_ref).ok())
             .collect();
+        let first_half_outline_root_raw = first_half_outline_root
+            .and_then(|object_ref| QpdfObjGen::try_from_object_ref(object_ref).ok());
 
         // The half boundary in `from_plan`'s output: slots `1..old_param_slot`
         // are the second half (part7/part8 + promoted Pages/Info), and
@@ -908,6 +914,33 @@ impl RenumberMap {
                 numbers.push(original.to_object_ref().unwrap_or(SENTINEL));
                 raw.push(original);
             };
+
+        // Part-3 (first-page) containers are split at the outline boundary.
+        // qpdf's part6 order is ordinary first-page private/shared objects,
+        // then the plain `/Outlines` root, then the remaining `lc_outlines`
+        // objects (including containers). Keep the batch vectors in their
+        // existing private/shared/outline order, but emit the two ranges at
+        // the root anchor when that root is not itself an ObjStm member.
+        let first_half_outline_batch_start = first_half_batches
+            .len()
+            .saturating_sub(first_half_outline_batch_count);
+        let emit_first_half_batch_range =
+            |start: usize,
+             end: usize,
+             table: &mut Vec<ObjectRef>,
+             raw_table: &mut Vec<QpdfObjGen>,
+             container_numbers: &mut Vec<u32>| {
+                for batch in &first_half_batches[start..end] {
+                    if batch.is_empty() {
+                        continue;
+                    }
+                    let container_num = table.len() as u32;
+                    table.push(SENTINEL); // container: a plain indirect, no original
+                    raw_table.push(RAW_SENTINEL);
+                    container_numbers.push(container_num);
+                }
+            };
+        let mut outline_root_emitted = false;
 
         // --- Second half ---
         // (1)+(2) second-half non-members (type-1) with each ObjStm container
@@ -1089,6 +1122,25 @@ impl RenumberMap {
                     &mut open_document_container_numbers,
                 );
             }
+            if Some(original) == first_half_outline_root_raw {
+                emit_first_half_batch_range(
+                    0,
+                    first_half_outline_batch_start,
+                    &mut new_by_new_number,
+                    &mut new_by_new_raw,
+                    &mut first_half_container_numbers,
+                );
+                push_original(original, &mut new_by_new_number, &mut new_by_new_raw);
+                emit_first_half_batch_range(
+                    first_half_outline_batch_start,
+                    first_half_batches.len(),
+                    &mut new_by_new_number,
+                    &mut new_by_new_raw,
+                    &mut first_half_container_numbers,
+                );
+                outline_root_emitted = true;
+                continue;
+            }
             if first_half_post_plain_raw.contains(&original) {
                 first_half_post_container_plain.push(original);
                 continue;
@@ -1117,22 +1169,18 @@ impl RenumberMap {
             new_by_new_raw.push(RAW_SENTINEL);
         }
         // cov:ignore-end
-        // (8) Part-3 (first-page) ObjStm containers, batch-ordered (type-1) —
-        //     last uncompressed objects of the first half (qpdf part6 containers).
-        for batch in first_half_batches {
-            if batch.is_empty() {
-                continue;
-            }
-            let container_num = new_by_new_number.len() as u32;
-            new_by_new_number.push(SENTINEL); // container: a plain indirect, no original
-            new_by_new_raw.push(RAW_SENTINEL);
-            first_half_container_numbers.push(container_num);
+        if !outline_root_emitted {
+            emit_first_half_batch_range(
+                0,
+                first_half_batches.len(),
+                &mut new_by_new_number,
+                &mut new_by_new_raw,
+                &mut first_half_container_numbers,
+            );
         }
-        // (8b) First-half post-container plain objects (ineligible part6 outline
-        //      streams): after the part6 container(s), before the compressed
-        //      members — qpdf numbers the ineligible OD+outline stream AFTER its
-        //      part6 ObjStm container (the first-half analogue of the second
-        //      half's post-container plain pass).
+        // First-half post-container plain objects (ineligible part6 outline
+        // streams): after the part6 containers, before the compressed members
+        // — qpdf's first-half analogue of the second-half post-container pass.
         for &original in &first_half_post_container_plain {
             push_original(original, &mut new_by_new_number, &mut new_by_new_raw);
         }
@@ -1785,6 +1833,8 @@ mod tests {
             &[],
             &BTreeSet::new(),
             &BTreeSet::new(),
+            0,
+            None,
         );
 
         assert_eq!(
@@ -1870,6 +1920,8 @@ mod tests {
             &[SecondHalfContainerAnchor::BeforeFirst],
             &BTreeSet::new(),
             &BTreeSet::new(),
+            0,
+            None,
         );
 
         assert!(relocation.container_numbers[0] < rn.new_for_original(later_plain).unwrap().number);
@@ -1895,6 +1947,8 @@ mod tests {
             &[],
             &BTreeSet::new(),
             &BTreeSet::new(),
+            0,
+            None,
         );
 
         assert_eq!(
@@ -1967,6 +2021,8 @@ mod tests {
             &[],
             &BTreeSet::new(),
             &BTreeSet::new(),
+            0,
+            None,
         );
 
         // Empty batches contribute no container numbers: one open-document + one
@@ -2156,6 +2212,8 @@ mod tests {
             &[],
             &BTreeSet::new(),
             &BTreeSet::new(),
+            0,
+            None,
         );
 
         assert_eq!(relocation.container_numbers, vec![5, 8]);
