@@ -8247,6 +8247,11 @@ fn run_page_extraction_after_plan<R: Read + Seek + 'static>(
         }
 
         let mut overlay_job = new_cli_job(no_warn);
+        overlay_job.set_password_mode(password.password_mode.into());
+        overlay_job.set_password_is_hex_key(password.password_is_hex_key);
+        overlay_job.set_suppress_password_recovery(password.suppress_password_recovery);
+        overlay_job.set_suppress_recovery(password.recovery.suppress_recovery);
+        overlay_job.set_ignore_xref_streams(password.recovery.ignore_xref_streams);
         overlay_job.set_verbose(verbose);
         configure_cli_overlay_specs(&mut overlay_job, overlay_specs)?;
         overlay_job.apply_transformations(pdf)?;
