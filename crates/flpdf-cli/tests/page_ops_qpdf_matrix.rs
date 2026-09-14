@@ -41,6 +41,7 @@ const THREE_PAGE: &str = "../../tests/fixtures/compat/three-page.pdf";
 const ONE_PAGE: &str = "../../tests/fixtures/compat/one-page.pdf";
 const TWO_PAGE: &str = "../../tests/fixtures/compat/two-page.pdf";
 const ONE_PAGE_V17: &str = "../../tests/fixtures/compat/one-page-v17.pdf";
+const ENCRYPTED_OVERLAY: &str = "../../tests/fixtures/compat/one-page-enc-u.pdf";
 const ENCRYPTED_R4_EMPTY_PASSWORD: &str = "../../tests/fixtures/compat/encrypted-r4-three-page.pdf";
 const PRIMARY_CATALOG_METADATA: &str =
     "../../tests/fixtures/compat/catalog-otherpage-other-info-two-page.pdf";
@@ -3345,6 +3346,68 @@ fn pages_then_overlay_is_byte_identical_to_qpdf_without_deflate() {
         std::fs::read(&f).unwrap(),
         std::fs::read(&q).unwrap(),
         "page selection followed by overlay must retain qpdf writer bytes"
+    );
+}
+
+#[test]
+fn pages_then_encrypted_overlay_uses_the_segment_password_and_version_floor() {
+    // The encrypted donor is opened by the canonical post-plan job. Keep the
+    // password in qpdf's hex-bytes mode so this exercises the same policy
+    // setters that a page-operation overlay must carry to its donor open.
+    if !qpdf_available() {
+        eprintln!(
+            "qpdf {EXPECTED_QPDF_VERSION} unavailable; skipping encrypted pages-overlay differential"
+        );
+        return;
+    }
+    let tmp = tempfile::tempdir().unwrap();
+    let primary = fixture_abs(THREE_PAGE);
+    let overlay = fixture_abs(ENCRYPTED_OVERLAY);
+    let q = tmp.path().join("q-pages-encrypted-overlay.pdf");
+    let f = tmp.path().join("f-pages-encrypted-overlay.pdf");
+
+    let qpdf_args = [
+        "--static-id",
+        "--stream-data=uncompress",
+        "--password-mode=hex-bytes",
+        primary.to_str().unwrap(),
+        "--overlay",
+        overlay.to_str().unwrap(),
+        "--password=75",
+        "--",
+        "--pages",
+        ".",
+        "1",
+        "--",
+        q.to_str().unwrap(),
+    ];
+    let (qpdf_ok, qpdf_stdout) = run_qpdf(&qpdf_args);
+    assert!(
+        qpdf_ok,
+        "qpdf encrypted pages-overlay differential failed: {qpdf_stdout}"
+    );
+
+    flpdf_ok(&[
+        "rewrite",
+        primary.to_str().unwrap(),
+        f.to_str().unwrap(),
+        "--static-id",
+        "--stream-data=uncompress",
+        "--password-mode=hex-bytes",
+        "--overlay",
+        overlay.to_str().unwrap(),
+        "--password=75",
+        "--",
+        "--pages",
+        ".",
+        "1",
+        "--",
+    ]);
+
+    assert_eq!(
+        std::fs::read(&f).unwrap(),
+        std::fs::read(&q).unwrap(),
+        "encrypted page-operation overlay must use the segment password and qpdf version floor"
     );
 }
 

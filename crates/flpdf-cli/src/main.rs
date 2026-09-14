@@ -7268,6 +7268,7 @@ fn build_overlay_specs(
     build_overlay_specs_with_suppression(specs, repair, password, false)
 }
 
+#[cfg(test)]
 fn build_overlay_specs_with_suppression(
     specs: &[OverlaySpec],
     repair: bool,
@@ -7516,7 +7517,6 @@ fn run_page_extraction(
                 pdf,
                 primary_input,
                 output,
-                repair,
                 password,
                 page_ops,
                 overlay_specs,
@@ -7541,7 +7541,6 @@ fn run_page_extraction(
                 pdf,
                 primary_input,
                 output,
-                repair,
                 password,
                 page_ops,
                 overlay_specs,
@@ -7600,7 +7599,6 @@ fn run_page_extraction(
         open_pdf_with_suppression(&primary_input.to_path_buf(), repair, password, no_warn)?,
         primary_input,
         output,
-        repair,
         password,
         page_ops,
         overlay_specs,
@@ -7753,7 +7751,6 @@ fn run_empty_page_extraction(
         &mut merged,
         output,
         Path::new("<empty>"),
-        repair,
         password,
         page_ops,
         overlay_specs,
@@ -7941,7 +7938,6 @@ fn run_page_extraction_from_multiple_sources(
         &mut merged,
         output,
         primary_input,
-        repair,
         password,
         page_ops,
         overlay_specs,
@@ -7978,7 +7974,6 @@ fn run_page_extraction_from_single_source<R: Read + Seek + 'static>(
     mut pdf: Pdf<R>,
     primary_input: &Path,
     output: &Path,
-    repair: bool,
     password: &PasswordArgs,
     page_ops: &PageOpArgs,
     overlay_specs: &[OverlaySpec],
@@ -8052,7 +8047,6 @@ fn run_page_extraction_from_single_source<R: Read + Seek + 'static>(
                 pdf,
                 output,
                 primary_input,
-                repair,
                 password,
                 page_ops,
                 overlay_specs,
@@ -8099,7 +8093,6 @@ fn run_page_extraction_from_single_source<R: Read + Seek + 'static>(
                 &mut merged,
                 output,
                 primary_input,
-                repair,
                 password,
                 page_ops,
                 overlay_specs,
@@ -8137,7 +8130,6 @@ fn run_page_extraction_after_plan<R: Read + Seek + 'static>(
     pdf: &mut Pdf<R>,
     output: &Path,
     input_path: &Path,
-    repair: bool,
     password: &PasswordArgs,
     page_ops: &PageOpArgs,
     overlay_specs: &[OverlaySpec],
@@ -8234,17 +8226,11 @@ fn run_page_extraction_after_plan<R: Read + Seek + 'static>(
     // `copyForeignObject` copies a Form XObject whose data comes from a
     // `StreamDataProvider` (`libqpdf/QPDF.cc:2248-2257`). Retain the canonical
     // Job and its opened overlay sources through the in-memory writer for the
-    // same reason. The small preflight below only captures the source version
-    // floor needed by this page-operation writer; its warnings are suppressed
-    // because the canonical Job performs the real donor open and owns the
-    // observable warning delivery.
+    // same reason. The job records the overlay source version floor while it
+    // performs that one canonical open (`QPDFJob.cc:1695-1716`); the final
+    // page-operation writer consumes the exposed snapshot below.
     let _overlay_job = if !overlay_specs.is_empty() {
-        let mut version_sources =
-            build_overlay_specs_with_suppression(overlay_specs, repair, password, true)?;
         update_input_version_floor(&mut options.input_version_floor, pdf)?;
-        for spec in version_sources.iter_mut() {
-            update_input_version_floor(&mut options.input_version_floor, &mut spec.source)?;
-        }
 
         let mut overlay_job = new_cli_job(no_warn);
         overlay_job.set_password_mode(password.password_mode.into());
@@ -8255,6 +8241,13 @@ fn run_page_extraction_after_plan<R: Read + Seek + 'static>(
         overlay_job.set_verbose(verbose);
         configure_cli_overlay_specs(&mut overlay_job, overlay_specs)?;
         overlay_job.apply_transformations(pdf)?;
+        if let Some(floor) = overlay_job.input_version_floor() {
+            options.input_version_floor = Some(
+                options
+                    .input_version_floor
+                    .map_or(floor, |current| current.max(floor)),
+            );
+        }
         Some(overlay_job)
     } else {
         None

@@ -142,6 +142,7 @@ fn page_selection_overlay_uses_the_canonical_job_owner() {
     for forbidden in [
         "flpdf::handle_under_overlay(",
         "flpdf::overlay_verbose_report(",
+        "build_overlay_specs_with_suppression(",
     ] {
         assert!(
             !after_plan.contains(forbidden),
@@ -151,6 +152,10 @@ fn page_selection_overlay_uses_the_canonical_job_owner() {
     assert!(
         after_plan.contains("configure_cli_overlay_specs("),
         "page-selection post-plan route must configure overlays on QPDFJob"
+    );
+    assert!(
+        after_plan.contains("input_version_floor()"),
+        "page-selection post-plan route must carry the canonical job's version floor"
     );
 }
 

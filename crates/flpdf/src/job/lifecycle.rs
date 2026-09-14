@@ -26,8 +26,8 @@ use crate::pipeline::{Pipeline, PipelineHandle, PipelineResult};
 use crate::qutil::{qpdf_string_to_int_checked, QpdfIntParse};
 use crate::{
     AcroFormDocumentHelper, Error, ObjectHandle, ObjectRef, ObjectStreamMode, PageDocumentHelper,
-    PageObjectHelper, Pdf, PdfOpenOptions, PdfWriter, QPDFLogger, ReadSeek, Result, UsageError,
-    WriterConfiguration,
+    PageObjectHelper, Pdf, PdfOpenOptions, PdfVersion, PdfWriter, QPDFLogger, ReadSeek, Result,
+    UsageError, WriterConfiguration,
 };
 use std::cell::RefCell;
 use std::collections::{BTreeMap, BTreeSet};
@@ -1634,6 +1634,24 @@ impl QPDFJob {
     pub fn set_input_name_bytes(&mut self, input_name: impl AsRef<[u8]>) {
         self.input_name_bytes = input_name.as_ref().to_vec();
         self.input_name = String::from_utf8_lossy(&self.input_name_bytes).into_owned();
+    }
+
+    /// Return the greatest PDF version observed on a source opened by this job.
+    ///
+    /// qpdf accumulates `max_input_version` while `doProcessOnce` opens each
+    /// input (`libqpdf/QPDFJob.cc:1695-1716`) and applies it to the writer in
+    /// `setWriterOptions` (`libqpdf/QPDFJob.cc:2847-2918`). A caller that owns
+    /// the final writer outside [`Self::write_qpdf`] can use this snapshot to
+    /// preserve that same floor without reopening a source document.
+    #[must_use]
+    pub fn input_version_floor(&self) -> Option<PdfVersion> {
+        let (version, extension_level) = self.configuration.max_input_version.as_ref()?;
+        let version = crate::parse_pdf_version(version)?;
+        Some(PdfVersion::new(
+            version.major(),
+            version.minor(),
+            *extension_level,
+        ))
     }
 
     /// Supply an input filename from the surrounding argv boundary before or
@@ -5427,6 +5445,28 @@ mod tests {
         job.config().normalize_content(true);
 
         assert!(job.content_normalization_enabled());
+    }
+
+    #[test]
+    fn input_version_floor_exposes_the_highest_opened_source_version() {
+        let bytes = std::fs::read(
+            std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+                .join("../../tests/fixtures/compat/one-page-v17.pdf"),
+        )
+        .expect("committed versioned fixture");
+        let mut job = QPDFJob::new();
+        job.open_document(
+            Cursor::new(bytes),
+            "one-page-v17.pdf",
+            PdfOpenOptions::default(),
+        )
+        .expect("versioned fixture opens");
+
+        assert_eq!(
+            job.input_version_floor(),
+            Some(PdfVersion::new(1, 7, 0)),
+            "the public floor must expose qpdf's accumulated max_input_version"
+        );
     }
 
     #[test]
