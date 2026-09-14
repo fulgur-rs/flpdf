@@ -2091,7 +2091,7 @@ fn classic_trailer_dictionary_end(bytes: &[u8], xref_start: usize) -> Option<usi
             {
                 return trailer_dictionary_end(bytes, first + b"trailer".len());
             }
-        }
+        } // cov:ignore: LLVM maps the non-trailer line arm's closing edge to the branch condition
         line_start = if line_end == bytes.len() {
             bytes.len()
         } else {
@@ -2137,17 +2137,12 @@ fn read_live_xref_window(owner: &dyn CanonicalTrailerOwner, offset: u64) -> Resu
             return Ok(bytes);
         };
         if let Some(end) = classic_trailer_dictionary_end(&bytes, xref_start) {
-            let Some(after_trailer) = bytes.get(end..) else {
-                return Ok(bytes);
-            };
+            let after_trailer = &bytes[end..];
             if let Some(line_end) = after_trailer
                 .iter()
                 .position(|byte| matches!(byte, b'\n' | b'\r'))
             {
                 bytes.truncate(end + line_end + 1);
-                return Ok(bytes);
-            }
-            if target == available {
                 return Ok(bytes);
             }
         }
@@ -4156,7 +4151,7 @@ fn recover_xref_entries_from_source(
                     trailer = Some(candidate);
                     trailer_diagnostics.extend(diagnostics);
                 }
-            }
+            } // cov:ignore: LLVM maps the successful trailer-candidate edge to the inner dictionary branch
             owner.source_seek(next_line_start)?;
         } else if let Some((object_ref, offset)) =
             scan_object_header_after_first_token(line, &first_token)?
@@ -9530,6 +9525,19 @@ mod final_handle_tests {
             .expect("EOF-terminated classic xref window");
         assert_eq!(window, no_following);
 
+        let mut large = b"xref\n".to_vec();
+        large.extend(std::iter::repeat_n(b' ', LIVE_XREF_PROBE_SIZE + 1));
+        large.extend_from_slice(b"\ntrailer\n<< /Size 1 >>\n");
+        let resolver = canonical_test_resolver(large, BTreeMap::new(), true, 25);
+        let window = read_live_xref_window(resolver.as_ref(), 0)
+            .expect("classic xref window should grow past the probe");
+        assert!(window.ends_with(b"<< /Size 1 >>\n"));
+
+        let resolver = canonical_test_resolver(b"short".to_vec(), BTreeMap::new(), true, 26);
+        assert!(read_live_xref_window(resolver.as_ref(), 99)
+            .expect("an xref offset beyond EOF is an empty window")
+            .is_empty());
+
         assert_eq!(classic_xref_start(b"  xref\n"), Some(2));
         assert!(classic_xref_start(b"% comment\n").is_none());
         assert!(classic_trailer_dictionary_end(b"xref\nnot-a-trailer\n", 0).is_none());
@@ -9554,6 +9562,21 @@ mod final_handle_tests {
         let recovered = recover_xref_entries_from_source(resolver.as_ref(), true, b"input.pdf")
             .expect("live reconstruction scanner should parse the trailer");
         assert!(recovered.trailer.is_some());
+    }
+
+    #[test]
+    fn canonical_source_window_retries_a_failed_repair_window() {
+        let bytes = b"%PDF-1.4\n1 0 obj\n<< /Type /XRef /W [0 0 0] /Size 1 /Length 1 >>\nstream\n\x00\nendstream\nendobj\nstartxref\n9\n%%EOF\n".to_vec();
+        let resolver = canonical_test_resolver(bytes, BTreeMap::new(), true, 27);
+        let error = load_xref_state_from_source(
+            resolver.as_ref(),
+            XrefLoadOptions {
+                allow_repair: true,
+                ..XrefLoadOptions::default()
+            },
+        )
+        .expect_err("a failed xref-stream repair must reach the live retry");
+        assert!(error.to_string().contains("recovering damaged file"));
     }
 
     #[test]
