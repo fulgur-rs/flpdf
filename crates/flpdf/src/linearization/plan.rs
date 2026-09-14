@@ -1448,17 +1448,6 @@ impl LinearizationPlan {
         // count objects exclusive to one page (it walks the file body forward
         // from the page object and stops at the first non-exclusive object),
         // so we mirror that by checking page-reach-count == 1.
-        let mut all_closures: Vec<Vec<ObjectRef>> = Vec::with_capacity(page_refs.len());
-        all_closures.push(first_page_closure.clone());
-        all_closures.extend(other_page_closures.iter().cloned());
-        let mut page_reach: BTreeMap<ObjectRef, u32> = BTreeMap::new();
-        for closure in &all_closures {
-            let unique: BTreeSet<ObjectRef> = closure.iter().copied().collect();
-            for r in unique {
-                *page_reach.entry(r).or_insert(0) += 1;
-            }
-        }
-
         for (i, closure) in other_page_closures.into_iter().enumerate() {
             let page_idx = i + 1; // skip(1) above started page indexing at 1
             let private: Vec<ObjectRef> = closure
@@ -1504,7 +1493,7 @@ impl LinearizationPlan {
                     if thumbnail_user_set.contains(r) {
                         return false;
                     }
-                    page_reach.get(r).copied() == Some(1)
+                    optimization.page_users(*r).count() == 1
                 })
                 .collect();
             if page_idx < page_hints.len() {
@@ -1531,11 +1520,11 @@ impl LinearizationPlan {
         // writer (which iterates `part4_objects`) emits bytes in the same
         // order as the renumber map.
 
-        // page_reach counts how many of (first_page_closure, other_page_closures...)
-        // contain the object.  For an object NOT in first_page_set:
-        //   - page_reach == 1 → exactly one other page → part7
-        //   - page_reach >= 2 → two or more other pages → part8
-        //   - page_reach == 0 → no page closure → part9
+        // qpdf's canonical object-user map counts page reach directly. For an
+        // object NOT in first_page_set:
+        //   - one page user → exactly one other page → part7
+        //   - two or more page users → part8
+        //   - no page users → part9
         let provisional_set: BTreeSet<ObjectRef> = part4_provisional.iter().copied().collect();
         // `all_outline_refs` (qpdf's `in_outlines` set) was computed in Step 1c and
         // already peeled out of part2/part3 (Step 5) and the per-page-private sets
@@ -1574,7 +1563,7 @@ impl LinearizationPlan {
                 part4_rest.push(r);
                 continue;
             }
-            let reach = page_reach.get(&r).copied().unwrap_or(0);
+            let reach = optimization.page_users(r).count() as u32;
             // OD+first-page objects were peeled out of Part 2/3 by Step 5 in
             // every mode, so they ARE present in part4_provisional and must not be
             // treated as first-page here — they flow to the OD routing below. A
