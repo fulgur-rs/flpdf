@@ -1352,7 +1352,9 @@ raw label copies register their foreign-map provenance as
 foreign/split-page labels preserve indirect handles so the canonical writer
 ownership check reports qpdf's error. The source/probe basis is
 `QPDFJob.cc:2511-2593,2960-3010` and `QPDFWriter.cc:1072-1082,1774-1787`;
-typed `LabelRange` cleanup remains the separate `flpdf-1j3p` issue.
+typed `LabelRange` inspection projection remains the bounded compatibility view from
+`flpdf-1j3p`; the qpdf-less rendered display-string bridge was removed by
+`flpdf-3yn9.48.101`.
 
 | `QPDFNameTreeObjectHelper` / `QPDFNumberTreeObjectHelper` / `NNTree.cc` | 1394 (`34-75,106-168,216-390,391-520,560-700`) | `nntree.rs`（shared canonical `ObjectHandle` engine + handle-native public `NameTree`/`NameTreeCursor` and `NumberTree`/`NumberTreeCursor`）+ consumer adapters。qpdf の live `QPDFObjectHandle`/`QPDF_Array` mutation（`NNTree.cc:34-75` の iterator value 更新、`:106-168` の limits、`:216-390` の split/insert、`:391-520` の remove/deepen、`:560-700` の find）に対応し、`ResolvedArray` は `ObjectHandle::set_array_items` で alias を保持したまま更新、direct kid の indirect 化は `Pdf::make_indirect_from_object_handle`、root split は既存 root slot を維持する。canonical handle graph の live mutation を writer がそのまま観測する。public NameTree/NumberTree helpers now keep root・key/value・cursor mutation on live handles; the shared engine is entirely handle-native; no raw Object fixture, projection, or bare-reference compatibility route remains | 🔀 |
 | `QPDFEmbeddedFileDocumentHelper.cc` | 122 | `embedded_files.rs`(678) | ✅ D1 完成（`flpdf-jzy7`）: `has_embedded_files`/`get_embedded_files`/`get_embedded_file`/`replace_embedded_file`/`remove_embedded_file` が `QPDFEmbeddedFileDocumentHelper.hh` の公開 API と 1:1 対応。モジュール doc の自己申告も更新済み。D2 は未達のまま — `job/json_sections.rs` の `build_attachments_section` はこのヘルパーを経由せず `NameTree` を直接歩く（`flpdf-q2fo` で解消予定） |

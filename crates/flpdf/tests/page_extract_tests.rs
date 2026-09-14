@@ -2030,8 +2030,8 @@ fn four_page_pdf_with_labels() -> Vec<u8> {
 
 #[test]
 fn extract_pages_reconstructs_labels_in_selection_order_with_duplicates() {
-    // Selection order 2,0,2 (0-based): src page2 (decimal "1"), src page0
-    // (roman "i"), src page2 again (duplicate -> decimal "1" again).
+    // Selection order 2,0,2 (0-based): src page2 (decimal /St 1), src page0
+    // (roman /St 1), src page2 again (duplicate -> decimal /St 1 again).
     // Verified byte-for-byte against qpdf 11.9.0 (`--empty --pages src.pdf
     // 3,1,3 -- out.pdf`), which reconstructs the identical 3-entry /Nums.
     let src = four_page_pdf_with_labels();
@@ -2040,17 +2040,38 @@ fn extract_pages_reconstructs_labels_in_selection_order_with_duplicates() {
     let mut out = extract_pages(&mut source, &[2, 0, 2]).unwrap();
 
     let mut h = out.page_labels();
-    assert_eq!(h.label_string_for_page(0).unwrap(), "1");
-    assert_eq!(h.label_string_for_page(1).unwrap(), "i");
-    assert_eq!(h.label_string_for_page(2).unwrap(), "1");
+    let signatures: Vec<(Vec<u8>, i64)> = (0..3)
+        .map(|page_idx| {
+            let label = h
+                .get_label_for_page(page_idx)
+                .unwrap()
+                .expect("reconstructed raw label");
+            let style = label
+                .try_get_key(b"/S")
+                .unwrap()
+                .as_name()
+                .expect("label style");
+            let start = label
+                .try_get_key(b"/St")
+                .unwrap()
+                .as_integer()
+                .expect("label start");
+            (style, start)
+        })
+        .collect();
+    assert_eq!(
+        signatures,
+        vec![(b"D".to_vec(), 1), (b"r".to_vec(), 1), (b"D".to_vec(), 1)]
+    );
     let ranges = h.ranges().unwrap();
     assert_eq!(ranges.len(), 3, "no fold: styles alternate, got {ranges:?}");
 }
 
 #[test]
 fn extract_pages_folds_redundant_sequential_labels() {
-    // Identity selection: labels continue exactly as in the source (roman i,
-    // ii, then decimal 1, 2), so the reconstructed tree folds down to the 2
+    // Identity selection: labels continue exactly as in the source (roman
+    // /St 1, /St 2, then decimal /St 1, /St 2), so the reconstructed tree
+    // folds down to the 2
     // real range starts (0 and 2) rather than one entry per page. Verified
     // against qpdf 11.9.0 (`--empty --pages src.pdf 1,2,3,4 -- out.pdf`).
     let src = four_page_pdf_with_labels();
@@ -2065,10 +2086,34 @@ fn extract_pages_folds_redundant_sequential_labels() {
         2,
         "sequential/continuous entries fold to the 2 real range starts, got {ranges:?}"
     );
-    assert_eq!(h.label_string_for_page(0).unwrap(), "i");
-    assert_eq!(h.label_string_for_page(1).unwrap(), "ii");
-    assert_eq!(h.label_string_for_page(2).unwrap(), "1");
-    assert_eq!(h.label_string_for_page(3).unwrap(), "2");
+    let signatures: Vec<(Vec<u8>, i64)> = (0..4)
+        .map(|page_idx| {
+            let label = h
+                .get_label_for_page(page_idx)
+                .unwrap()
+                .expect("reconstructed raw label");
+            let style = label
+                .try_get_key(b"/S")
+                .unwrap()
+                .as_name()
+                .expect("label style");
+            let start = label
+                .try_get_key(b"/St")
+                .unwrap()
+                .as_integer()
+                .expect("label start");
+            (style, start)
+        })
+        .collect();
+    assert_eq!(
+        signatures,
+        vec![
+            (b"r".to_vec(), 1),
+            (b"r".to_vec(), 2),
+            (b"D".to_vec(), 1),
+            (b"D".to_vec(), 2),
+        ]
+    );
 }
 
 #[test]
