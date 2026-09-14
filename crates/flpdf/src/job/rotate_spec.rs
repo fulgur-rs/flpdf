@@ -10,20 +10,20 @@ use crate::{Error, Result};
 
 /// qpdf's private `QPDFJob::RotationSpec` (`include/qpdf/QPDFJob.hh:426-435`).
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub struct RotationSpec {
+pub(crate) struct RotationSpec {
     /// Rotation angle in degrees; `-` parameters retain a negative angle.
-    pub angle: i32,
+    pub(crate) angle: i32,
     /// Whether qpdf adds the angle to the inherited page rotation.
-    pub relative: bool,
+    pub(crate) relative: bool,
 }
 
 /// Parsed `QPDFJob::parseRotationParameter` result before map insertion.
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub struct RotationParameter {
+pub(crate) struct RotationParameter {
     /// qpdf's raw range map key; defaulted to `1-z` when omitted or empty.
-    pub range: Vec<u8>,
+    pub(crate) range: Vec<u8>,
     /// The qpdf rotation state stored under `range`.
-    pub spec: RotationSpec,
+    pub(crate) spec: RotationSpec,
 }
 
 /// Parse one qpdf rotation parameter.
@@ -32,7 +32,7 @@ pub struct RotationParameter {
 /// is validated with `QUtil::parse_numrange(..., 0)` exactly as qpdf does;
 /// resolution against the real page count belongs to each consumer's
 /// `handleRotations` boundary.
-pub fn parse_rotation_parameter(parameter: &[u8]) -> Result<RotationParameter> {
+pub(crate) fn parse_rotation_parameter(parameter: &[u8]) -> Result<RotationParameter> {
     let Some(colon) = parameter.iter().position(|&byte| byte == b':') else {
         return parse_rotation_parts(parameter, parameter, None);
     };

@@ -12,8 +12,6 @@ use flpdf::job::{
     JsonStreamData, PageSpecInput, PageSpecJobOutput, QPDFJob, RemoveUnreferencedResources,
     SplitPageOptions,
 };
-#[cfg(test)]
-use flpdf::parse_rotation_parameter;
 use flpdf::pipeline::{FlateAction, Pipeline, PipelineHandle, PlFlate, PlStdioFile};
 use flpdf::qutil::same_file as qpdf_same_file;
 use flpdf::writer::DecodeLevel as StreamDecodeLevel;
@@ -8343,18 +8341,6 @@ fn run_page_extraction_after_plan<R: Read + Seek + 'static>(
     finish_operation_warnings_with_prior(pdf, creates_output, prior_warnings)
 }
 
-#[cfg(test)]
-fn parse_rotate_specs(
-    rotate_args: &[OsString],
-) -> CliResult<std::collections::BTreeMap<Vec<u8>, flpdf::RotationSpec>> {
-    let mut rotations = std::collections::BTreeMap::new();
-    for raw in rotate_args {
-        let parameter = parse_rotation_parameter(&arg_parser::os_bytes(raw))?;
-        rotations.insert(parameter.range, parameter.spec);
-    }
-    Ok(rotations)
-}
-
 /// Parse `--split-pages[=n]` (default 1; qpdf-compatible).
 fn parse_split_n(raw: &str) -> CliResult<usize> {
     let n: usize = raw
@@ -10645,34 +10631,6 @@ mod tests {
         assert_eq!(
             CliFlattenMode::Print.flags(),
             FlattenAnnotationsMode::Print.qpdf_flags()
-        );
-    }
-
-    #[test]
-    fn rotate_specs_use_qpdf_map_overwrite_and_lexical_order() {
-        let specs = parse_rotate_specs(&os_strs(&["90:1-3", "+90:2", "90:1-3"]))
-            .expect("rotation parameters should parse");
-        let keys: Vec<&[u8]> = specs.keys().map(Vec::as_slice).collect();
-        assert_eq!(keys, [b"1-3".as_slice(), b"2".as_slice()]);
-        assert_eq!(specs[b"1-3".as_slice()].angle, 90);
-        assert!(!specs[b"1-3".as_slice()].relative);
-        assert_eq!(specs[b"2".as_slice()].angle, 90);
-        assert!(specs[b"2".as_slice()].relative);
-    }
-
-    #[cfg(unix)]
-    #[test]
-    fn rotate_specs_retain_raw_parameter_bytes() {
-        use std::os::unix::ffi::OsStringExt;
-        let raw = OsString::from_vec(b"90:1-\xff".to_vec());
-        let error = parse_rotate_specs(&[raw]).unwrap_err();
-        let error = error
-            .downcast_ref::<flpdf::Error>()
-            .expect("rotation parser should preserve qpdf error bytes");
-        assert!(matches!(error, flpdf::Error::Usage(_)));
-        assert_eq!(
-            error.raw_message(),
-            Some(b"invalid parameter to rotate: 90:1-\xff".as_slice())
         );
     }
 

@@ -6945,6 +6945,35 @@ mod tests {
     }
 
     #[test]
+    fn config_rotation_replaces_duplicate_ranges_in_lexical_order() {
+        let mut job = QPDFJob::new();
+        {
+            let mut configuration = job.config();
+            configuration
+                .rotate(b"90:1-3")
+                .expect("first rotation parameter should parse");
+            configuration
+                .rotate(b"+90:2")
+                .expect("relative rotation parameter should parse");
+            configuration
+                .rotate(b"90:1-3")
+                .expect("duplicate rotation parameter should parse");
+        }
+
+        let keys: Vec<&[u8]> = job
+            .configuration
+            .rotations
+            .keys()
+            .map(Vec::as_slice)
+            .collect();
+        assert_eq!(keys, [b"1-3".as_slice(), b"2".as_slice()]);
+        assert_eq!(job.configuration.rotations[b"1-3".as_slice()].angle, 90);
+        assert!(!job.configuration.rotations[b"1-3".as_slice()].relative);
+        assert_eq!(job.configuration.rotations[b"2".as_slice()].angle, 90);
+        assert!(job.configuration.rotations[b"2".as_slice()].relative);
+    }
+
+    #[test]
     fn job_json_nested_dispatch_appends_attachment_operations() {
         let tempdir = tempfile::tempdir().unwrap();
         let nested = tempdir.path().join("nested.json");

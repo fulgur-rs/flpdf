@@ -68,3 +68,50 @@ fn dead_batch_rotate_helper_and_types_are_removed_after_cli_cutover() {
         .replace("\r\n", "\n");
     assert!(!page_helper.contains("crate::job::apply_rotate_to_pages"));
 }
+
+#[test]
+fn rotation_parser_state_is_job_internal_after_cli_cutover() {
+    let src = source_root();
+    let rotate_spec =
+        fs::read_to_string(src.join("job/rotate_spec.rs")).expect("rotate_spec.rs must exist");
+    assert!(
+        rotate_spec.contains("pub(crate) struct RotationSpec"),
+        "qpdf-private RotationSpec must not be a public library type"
+    );
+    assert!(
+        rotate_spec.contains("pub(crate) struct RotationParameter"),
+        "qpdf-private parsed rotation state must not be a public library type"
+    );
+    assert!(
+        rotate_spec.contains("pub(crate) fn parse_rotation_parameter"),
+        "qpdf-private rotation parser must stay crate-internal"
+    );
+
+    let job = fs::read_to_string(src.join("job/mod.rs")).expect("job/mod.rs must be readable");
+    assert!(
+        !job.contains("pub use rotate_spec::{parse_rotation_parameter")
+            && !job.contains("pub use rotate_spec::{RotationParameter")
+            && !job.contains("pub use rotate_spec::{RotationSpec"),
+        "qpdf-private rotation parser/state must not be re-exported by job"
+    );
+    let lib = fs::read_to_string(src.join("lib.rs")).expect("lib.rs must be readable");
+    assert!(
+        !lib.contains("parse_rotation_parameter")
+            && !lib.contains("RotationParameter")
+            && !lib.contains("RotationSpec"),
+        "qpdf-private rotation parser/state must not be re-exported at crate root"
+    );
+
+    let cli = fs::read_to_string(src.join("../../flpdf-cli/src/main.rs"))
+        .expect("flpdf-cli main.rs must be readable")
+        .replace("\r\n", "\n");
+    assert!(
+        !cli.contains("use flpdf::parse_rotation_parameter")
+            && !cli.contains("fn parse_rotate_specs"),
+        "CLI must not retain a test-only cross-crate parser bridge"
+    );
+    assert!(
+        cli.contains("configuration.rotate(arg_parser::os_bytes(parameter.as_os_str()))?"),
+        "CLI rotation must continue to configure the canonical Job owner"
+    );
+}

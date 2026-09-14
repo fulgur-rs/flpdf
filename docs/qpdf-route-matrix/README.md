@@ -33,17 +33,17 @@ container-above-max だった — `flpdf-hi08` / PR #1486）。本表は残る m
 
 | canonical | bridge | mixed | unknown | 合計 |
 |---|---|---|---|---|
-| 105 | 0 | 55 | 0 | 160 |
+| 107 | 0 | 53 | 0 | 160 |
 
 ### checker logical aggregate（259 rows）
 
 `scripts/check-qpdf-route-matrix.py --check` は、A〜E の160行に加えて
 E の qtest exception 表（物理98行を論理99ケースとして数える）を含む259 logical
-rowsを検証する。2026-09-14 の現行 `origin/main` (`ad724fd08`) での集計は次のとおり。
+rowsを検証する。2026-09-15 の現行 `origin/main` (`af99d4af4`) での集計は次のとおり。
 
 | canonical | bridge | mixed | unknown | 合計 |
 |---|---|---|---|---|
-| 131 | 6 | 122 | 0 | 259 |
+| 133 | 6 | 120 | 0 | 259 |
 
 したがって、160行の領域別表と259 logical rowsの checker 分母は異なる。どちらも
 parity 完了数ではなく、責務／経路の分類数である。
@@ -96,12 +96,12 @@ done | sort | uniq -c
 本表は「その責務に至る **経路が 1 本か**」を問う。✅ の行でも consumer 側に bridge が残っていれば
 本表では mixed / bridge になりうる。
 
-2026-09-14 の current-main audit anchor は `origin/main=ad724fd08`、pinned qpdf は
+2026-09-15 の current-main audit anchor は `origin/main=af99d4af4`、pinned qpdf は
 11.9.0 commit `3b97c9bd266b7c32ea36d3536e22dab77412886d` である。checker の実測は
-**この revision を適用した tree で** 1235 qpdf citations / 906 flpdf citations /
+**この revision を適用した tree で** 1244 qpdf citations / 904 flpdf citations /
 259 logical rows、分類は
-canonical 131 / mixed 122 / bridge 6 / unknown 0。A〜E の160行だけを数える
-上の領域別集計は canonical 105 / mixed 55 / bridge 0 / unknown 0 なので、checker
+canonical 133 / mixed 120 / bridge 6 / unknown 0。A〜E の160行だけを数える
+上の領域別集計は canonical 107 / mixed 53 / bridge 0 / unknown 0 なので、checker
 の259 logical rowsと混同しない。
 
 履歴行の例外: C44はpublic facadeとdeferred blobの責務を分離したmixed ownerとして追跡する。
@@ -112,11 +112,11 @@ D19/D30はcanonical ownerへ委譲するbyte-neutral test scaffolding、D27は�
 
 | ファイル | 行数 | canonical | bridge | mixed | unknown |
 |---|---|---|---|---|---|
-| [A. ObjectHandle / Resolver — object identity, lazy resolve, ownership, teardown](a-objecthandle-resolver.md) | 24 | 16 | 0 | 8 | 0 |
+| [A. ObjectHandle / Resolver — object identity, lazy resolve, ownership, teardown](a-objecthandle-resolver.md) | 24 | 17 | 0 | 7 | 0 |
 | [B. parser / xref recovery / warning・error・diagnostics](b-parser-recovery-diagnostics.md) | 34 | 20 | 0 | 14 | 0 |
 | [C. stream data provider / decode / retry / filter / encryption / `/Length`](c-stream-pipeline-encryption.md) | 42 | 39 | 0 | 3 | 0 |
 | [D. writer — reachability, ObjStm planning / renumber / emission, xref / trailer, encryption, linearize](d-writer.md) | 31 | 15 | 0 | 16 | 0 |
-| [E. QPDFJob / CLI / C API 相当の consumer・adaptor](e-job-cli-capi.md) | 29 | 14 | 0 | 15 | 0 |
+| [E. QPDFJob / CLI / C API 相当の consumer・adaptor](e-job-cli-capi.md) | 29 | 15 | 0 | 14 | 0 |
 
 ## 5. 責任境界と不変条件
 
@@ -465,8 +465,8 @@ crates/flpdf/src/job/lifecycle.rs::apply_configured_rotations: prod 4 (1 files) 
     crates/flpdf/src/job/lifecycle.rs 4
 crates/flpdf/src/job/rotate.rs::apply_rotate_to_pages: absent (prod 0 / test 0; removed by flpdf-v55s)
     production and test callers removed after the CLI cutover
-crates/flpdf/src/job/rotate_spec.rs::parse_rotation_parameter: prod 3 (2 files) / test 11
-    crates/flpdf-cli/src/main.rs 2, crates/flpdf/src/job/lifecycle.rs 1
+crates/flpdf/src/job/rotate_spec.rs::parse_rotation_parameter: prod 2 (1 files) / test 11
+    crates/flpdf/src/job/lifecycle.rs 2
 crates/flpdf/src/qutil.rs::parse_numrange: prod 4 (3 files) / test 24
     crates/flpdf-cli/src/main.rs 1, crates/flpdf/src/job/lifecycle.rs 1, crates/flpdf/src/job/rotate_spec.rs 1
 crates/flpdf/src/job/page_range.rs::PageRange: prod 35 (6 files) / test 70
@@ -518,7 +518,7 @@ crates/flpdf/src/job/lifecycle.rs::QPDFJob::open: prod 63 (28 files) / test 1283
 | E-12 | `optimize_images` | 6 | 23 | 同上（`crates/flpdf-cli/src/main.rs` 19 件 = `flpdf::optimize_images` の 6 呼び出し + `--optimize-images` の引数処理、`crates/flpdf/src/job/lifecycle.rs` 4 件 = configuration フィールド） | 行（leaf が曖昧） |
 | E-19 | `complete` / `has_warnings` | 13 / 8 | 22 / 12 | 行は `QPDFJob::complete()` / `QPDFJob::has_warnings()` の **呼び出しだけ**を数え、型位置・フィールド参照・同名の別項目を含めていない | tracker（分母として。`QPDFJob` メソッドの呼び出し数だけが要るときは行の数を使う） |
 | E-24 | free job/json writers | 0（free declarations removed） | 0 | `flpdf-xsq1` で integration test callers を `QPDFJob::write_json` に移行し、job/json.rs の free entrypoints と re-export を撤去 | tracker |
-| E-14 / E-15 | `parse_rotation_parameter` / `parse_numrange` | 3 / 3 | — | rotation consumer sliceではqpdf parserとsigned `QUtil::parse_numrange`を共有化。旧`RotateSpec::parse`のPageRange AST依存は削除したが、CLI適用ownerと他PageRange consumerは後続issueに残るため行全体はmixed | 行 |
+| E-14 / E-15（2026-09-05履歴） | `parse_rotation_parameter` / `parse_numrange` | 3 / 3 | — | **履歴値:** rotation consumer sliceではqpdf parserとsigned `QUtil::parse_numrange`を共有化し、当時は行全体をmixedとして記録した。2026-09-15の現行値はE-14がprod 2 / test 11でcanonical、E-15がprod 4 / test 24でmixed。旧`RotateSpec::parse`のPageRange AST依存は削除済み | 現行分類はE-14/E-15のmatrix行と§6.2の再計測値を正とする |
 
 領域 D は他の 4 領域より tracker との乖離が多い。原因は §8 X-6 に書いたとおり、D ファイルが
 「モジュール直下の最初の `#[cfg(test)] mod` より前＝prod」という単純化を採ったのに対し、
