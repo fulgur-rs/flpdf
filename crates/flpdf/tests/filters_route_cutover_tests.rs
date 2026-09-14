@@ -26,7 +26,7 @@ fn filter_public_boundaries_are_object_handle_native() {
 }
 
 #[test]
-fn passthrough_codec_label_has_no_public_filters_bridge() {
+fn passthrough_codec_label_bridge_is_removed() {
     let filters = production_source(concat!(env!("CARGO_MANIFEST_DIR"), "/src/filters.rs"));
     assert!(
         !filters.contains("pub fn passthrough_codec_label("),
@@ -35,10 +35,15 @@ fn passthrough_codec_label_has_no_public_filters_bridge() {
 
     let stream_filter =
         production_source(concat!(env!("CARGO_MANIFEST_DIR"), "/src/stream_filter.rs"));
-    assert!(
-        stream_filter.contains("pub(crate) fn passthrough_codec_label("),
-        "stream_filter.rs must still hold C43's single internal label owner, which stays until the bridge is removed"
-    );
+    for forbidden in [
+        "pub(crate) fn passthrough_codec_label(",
+        "passthrough codec {label}: image/binary stream data is not decoded by flpdf",
+    ] {
+        assert!(
+            !stream_filter.contains(forbidden),
+            "stream_filter.rs still contains C43 bridge text: {forbidden}"
+        );
+    }
 }
 
 #[test]

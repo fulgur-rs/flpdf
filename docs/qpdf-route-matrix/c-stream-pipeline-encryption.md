@@ -365,7 +365,7 @@ qtest parity harness 専用であることを注記する。
 | C40 | `QPDFObjectHandle::coalesceContentStreams` / `CoalesceProvider` / `pipeContentStreams` / `filterAsContents` | `libqpdf/QPDFObjectHandle.cc:92-118,1549-1572,1708-1730,1761-1767` | `crates/flpdf/src/object_handle.rs::coalesce_content_streams` / `::pipe_content_streams` / `::filter_as_contents`（すべて `pub`） | `coalesce_content_streams` prod: 5 (4 files, flpdf-cli `main.rs:4405` 含む) / test: 7。`pipe_content_streams` prod: 4 (3 files) / test: 1。`filter_as_contents` prod: 1 (`crates/flpdf/src/page_object_helper.rs:1247`) / test: 2 | canonical | `crates/flpdf/src/object_handle.rs::coalesce_content_streams` | provider 経路の内部利用（`replaceStreamData(provider, newNull(), newNull())`）まで写している。Form の `pipeContents`/`filterAsContents` は legacy overload の false を無視し、provider/source/sink の例外だけを伝播する。page `pipeContentStreams` の false→typed error は維持する（`flpdf-3yn9.48.66`）。 |
 | C41 | `QPDF::readStream` の `/Length` 検証 + `endstream` 確認 | `libqpdf/QPDF.cc:1361-1399` | `crates/flpdf/src/reader/resolver.rs::read_stream`（private, `crates/flpdf/src/reader/resolver.rs:3246-3332`） | prod: 1 (`crates/flpdf/src/reader/resolver.rs:3156`) / test: 0 | canonical | `crates/flpdf/src/reader/resolver.rs::read_stream` | 3 つのメッセージ（"stream dictionary lacks /Length key" / "/Length key in stream dictionary is not an integer" / "expected endstream"）と `attempt_recovery` 分岐が 1:1（`crates/flpdf/src/reader/resolver.rs:3335-3348`） |
 | C42 | `QPDF::recoverStreamLength` | `libqpdf/QPDF.cc:1482-1530` | `crates/flpdf/src/reader/resolver.rs::recover_stream_length`（private） | prod: canonical resolver の stream recovery 呼び出し / test: recovery fixture | canonical | `crates/flpdf/src/reader/resolver.rs::recover_stream_length` | warning 3 種、`endobj` 巻き戻し、全 recovered length の計算は 1:1。C12のAES/RC4 pipeとshow-objectのraw/filtered payloadはqpdfと同じく `length` の全spanをそのまま渡し、表示専用の framing metadata は持たない（`flpdf-zvjf`, `flpdf-hj7v`）。 |
-| C43 | （なし — flpdf 固有の分類 helper） | 対応物なし | `crates/flpdf/src/stream_filter.rs::passthrough_codec_label`（`pub(crate)`） | `passthrough_codec_label` prod: 1 (`stream_filter.rs::undecodable_filter_error`) / test: 0 | bridge | `absent` | qpdf に対応する label API はない。flpdf 固有の補助経路として bridge (ii) に分類する。`undecodable_filter_error` 内の単一 internal owner は残るが、旧 `filters.rs` public forwarding wrapper は `flpdf-3yn9.48.91` で caller-zero 後に撤去した。 |
+| C43 | （なし — flpdf 固有の分類 helper） | 対応物なし | 撤去済み（旧 `stream_filter.rs` の codec label helper） | prod: 0 / test: 0 | canonical | `absent` | qpdf に対応する label API と専用診断は存在しないため、`.48.95` で helper と専用メッセージを削除。残る filter factory の generic unsupported 境界、DCT decode、writer の raw passthrough は別の canonical route として保持する。 |
 
 | # | qpdf responsibility owner | qpdf evidence | flpdf current entrypoint | callers (prod / test) | classification | canonical owner | remaining bridge callers / notes |
 |---|---|---|---|---|---|---|---|
@@ -437,9 +437,9 @@ C44 は public facade と deferred blob provider の責務を追跡する行と�
 - **C29 の harness consumer**: `.45` で `driver/test_02_09.rs:529` を
   qpdf `test_driver.cc:465-469` の direct `Pl_Flate(a_deflate)` pipeline に移行した。
 - **C42 / C43**: C42 は qpdf の recovered length を canonical pipe へそのまま渡し、
-  表示専用の EOL metadata や framing extension は持たない。C43 は qpdf に対応物のない
-  flpdf 固有の codec 分類を `stream_filter.rs` の内部 owner だけに残し、公開 wrapper は
-  caller-zero 後に撤去した。qpdf `QPDFJob.cc:806-832` は stream dictionary 表示と pipe を使い、
+  表示専用の EOL metadata や framing extension は持たない。C43 の qpdf に対応物のない
+  codec 分類 helper と専用メッセージは `.48.95` で撤去し、generic unsupported filter
+  境界へ統合した。qpdf `QPDFJob.cc:806-832` は stream dictionary 表示と pipe を使い、
   shortcut を持たない。
 
 C7 の `prepare_stream_filter_plan` は `.48.37` で `object_warning` から
@@ -470,9 +470,9 @@ C10のcanonicalはbuilt-in lookupに限定し、runtime登録の公開契約は�
 
 | 分類 | 件数 | 行 |
 |---|---|---|
-| canonical | 35 | C1, C2, C3, C4, C5, C6, C8, C10, C12, C13, C14, C15, C16, C17, C18, C20, C21, C24, C25, C26, C27, C29, C30, C31, C32, C33, C34, C35, C36, C37, C38, C39, C40, C41, C42 |
+| canonical | 36 | C1, C2, C3, C4, C5, C6, C8, C10, C12, C13, C14, C15, C16, C17, C18, C20, C21, C24, C25, C26, C27, C29, C30, C31, C32, C33, C34, C35, C36, C37, C38, C39, C40, C41, C42, C43 |
 | mixed | 5 | C7, C9, C11, C22, C44 |
-| bridge | 2 | C28, C43 |
+| bridge | 1 | C28 |
 | unknown | 0 | なし（C42 の pipe-side EOL subtraction は `flpdf-zvjf` と `flpdf-hj7v` で qpdf parity として解決） |
 
 U3 は「分類は決まっているが、残る実装差と出力への影響を検証する」項目なので
@@ -483,8 +483,9 @@ C44 はその API を追跡する枠で、既存 C24 の不一致とは扱わな
 
 `bridge` の判定基準は README §3 の通り **経路（route）に qpdf 対応物が無いこと** で、
 責務（responsibility）に qpdf 対応物があるかどうかとは別に問う。本領域の 2 行はこの区別で読む:
-C28 / C43 は責務のレベルでも qpdf に対応物が無い。
-qpdf 側にも実装にも対応物がある複数実装は `bridge` ではなく `mixed` に置く。旧C19は`.42`で削除した。
+C28 は責務のレベルでも qpdf に対応物が無く、公開 hardening extension が残る。
+C43 は `.48.95` で qpdf-less helper ごと撤去済みである。qpdf 側にも実装にも対応物が
+ある複数実装は `bridge` ではなく `mixed` に置く。旧C19は`.42`で削除した。
 
 
 ## 2026-09-06 再監査の issue 対応
@@ -508,7 +509,7 @@ qpdf 側にも実装にも対応物がある複数実装は `bridge` ではな�
 | `C10` | `flpdf-3yn9.48.46` | runtime registerStreamFilter の公開registry契約を移植する |
 | `C44` | `flpdf-3yn9.48.47` | public getStreamJSONとdeferred StreamBlobProviderを忠実移植する |
 | `C42` | `flpdf-3yn9.48.48` | CLI専用 inspection framing を canonical routeへ統合して撤去する |
-| `C43` | `flpdf-3yn9.48.91` | dead な public passthrough codec-label forwarding wrapper を caller-zero 後に撤去する |
+| `C43` | `flpdf-3yn9.48.91` / `flpdf-3yn9.48.95` | public forwarding wrapper と残存 internal codec-label helper／専用メッセージを caller-zero 後に撤去する |
 | `C9` / `C26` / `C28` / `C29` | `flpdf-3yn9.48.49` | whole-buffer decoder/encoderとrecovering compatibility経路を最後のcaller移行後に撤去する |
 | `C21` / `C22` | `flpdf-3yn9.48.64` | unparseObjectのrefiltered stream辞書処理をqpdfの責務に揃える |
 | `C29` | `flpdf-1far` | adjustAppearanceStream のtoken-filter正本とoracle試験 |

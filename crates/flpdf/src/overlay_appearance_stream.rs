@@ -1322,8 +1322,7 @@ mod tests {
         // recorded under dr_map for F1->F1_1 could never have matched this
         // stream's content even if it decoded successfully. Its content uses
         // CCITTFaxDecode: a real ISO 32000 stream filter, but one flpdf
-        // intentionally never decodes (stream_filter::passthrough_codec_label
-        // — an image/binary passthrough codec, preserved verbatim). Real
+        // intentionally does not decode. Real
         // qpdf's AcroForm::adjustAppearanceStream wraps the equivalent
         // content-parse step in a try/catch that turns exactly this kind of
         // failure into a warning, not a hard error, so it must not propagate
@@ -1381,7 +1380,7 @@ mod tests {
         // Unlike the CCITT test above, this stream's own /Resources/Font
         // DOES have "F1" — a REAL collision, so the /Resources rename
         // (steps 1-4) is not a no-op this time. The content still cannot
-        // be decoded (same CCITTFaxDecode passthrough codec), so step 5's
+        // be decoded (same unsupported CCITTFaxDecode filter), so step 5's
         // content rewrite cannot run at all. This asserts flpdf's ACTUAL
         // (verified) qpdf-matching behavior: qpdf performs the /Resources
         // rename BEFORE its own try/catch'd tokenize step
