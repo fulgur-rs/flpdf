@@ -34,52 +34,12 @@
 //!
 //! Absent values render as an empty string after the label — the label and its
 //! single trailing space are still written, as in the `mime type:` line above.
-//!
-//! The structured [`AttachmentInfo`] type remains for the separate public API
-//! visibility decision tracked by `flpdf-xsq1`; the qpdf job listing itself is
-//! intentionally the only supported inspection consumer here.
 
 use super::checksum_to_hex;
 use crate::filespec_helper::{EmbeddedFileStream, FileSpec};
 use crate::object_handle::ObjectHandle;
-use crate::{ObjectRef, Pdf, Result};
+use crate::{Pdf, Result};
 use std::io::{Read, Seek};
-
-// ── AttachmentInfo ────────────────────────────────────────────────────────────
-
-/// Structured metadata for a single PDF attachment.
-///
-/// Fields are `Option<Vec<u8>>` (or `Option<i64>` for `size`) because any
-/// field may be absent in a well-formed or partially-formed PDF.
-///
-/// `key` and `filespec_ref` are always present — they come from the
-/// `/Names /EmbeddedFiles` name tree and are required to have found the entry
-/// in the first place.
-#[derive(Debug, Clone, PartialEq)]
-pub struct AttachmentInfo {
-    /// Raw name-tree key (the bytes used to look up this attachment).
-    pub key: Vec<u8>,
-    /// Object reference of the `/Filespec` dictionary.
-    pub filespec_ref: ObjectRef,
-    /// Display name: decoded `/UF` (preferred) or decoded `/F`.  `None` when
-    /// both are absent.
-    pub display_name: Option<String>,
-    /// Uncompressed file size from `/Params /Size`.
-    pub size: Option<i64>,
-    /// MIME type from `/EmbeddedFile /Subtype` (raw bytes from PDF Name).
-    pub mimetype: Option<Vec<u8>>,
-    /// Raw PDF date string from `/Params /CreationDate`.
-    pub creation_date: Option<Vec<u8>>,
-    /// Raw PDF date string from `/Params /ModDate`.
-    pub modification_date: Option<Vec<u8>>,
-    // ── verbose-only fields ───────────────────────────────────────────────
-    /// Human-readable description from `/Filespec /Desc`.
-    pub description: Option<Vec<u8>>,
-    /// Associated-file relationship from `/Filespec /AFRelationship`.
-    pub af_relationship: Option<Vec<u8>>,
-    /// MD5 checksum from `/Params /CheckSum` (raw bytes; displayed as hex).
-    pub checksum: Option<Vec<u8>>,
-}
 
 /// Format the attachment list while forwarding each emitted fragment to a
 /// caller-owned sink.

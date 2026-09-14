@@ -424,7 +424,7 @@ crates/flpdf-cli/src/main.rs::write_with_pdf_writer: prod 8 (1 files) / test 0
     crates/flpdf-cli/src/main.rs 8
 crates/flpdf/src/job/attachment_list.rs::format_attachment_list_with_sink: prod 1 (1 files) / test 0
     crates/flpdf/src/job/attachments.rs 1
-crates/flpdf/src/job/attachment_list.rs::AttachmentInfo: prod 0 (0 files) / test 0
+`AttachmentInfo` public projection: absent after `flpdf-3yn9.48.97` (prod 0 / test 0 before removal)
 job/json.rs free `write_json` / `write_json_with_version`: removed by `flpdf-xsq1`; tests now use the canonical `QPDFJob::write_json` method
 crates/flpdf/src/job/acroform_field_prune.rs::prune_acroform_after_subset: prod 2 (1 files) / test 17
     crates/flpdf/src/job/page_specs.rs 2
@@ -873,7 +873,7 @@ A14 を完了した。D27 の後続 cutover も完了し、D27 と独立に進�
 | 位置づけ | 内容 | issue ID |
 |---|---|---|
 | 完了（hygiene、ゼロリスク） | §6.4 (a-i) の prod 0 かつ test 0 だったC19/C28/E-27のdead route 4 symbolを削除し、`crates/flpdf/src/encryption/keys.rs` の `#![allow(dead_code)]` を外した。ゲートは各 leaf の `--expect-zero` | `flpdf-3yn9.42` |
-| 完了（hygiene、test 移行あり） | §6.4 (a-ii) の C23/E-9 test-only route を canonical `PdfWriter`/`QPDFJob::list_attachments` 経由へ移して削除。`flpdf-xsq1` の第1 slice で `format_attachment_list_with_sink` の内部化、AcroForm free helper の内部化、job/json free writer の撤去も完了。`AttachmentInfo` の public type 判断と CLI callers は残る | `flpdf-3yn9.43` / `flpdf-xsq1` |
+| 完了（hygiene、test 移行あり） | §6.4 (a-ii) の C23/E-9 test-only route を canonical `PdfWriter`/`QPDFJob::list_attachments` 経由へ移して削除。`flpdf-xsq1` の第1 slice で `format_attachment_list_with_sink` の内部化、AcroForm free helper の内部化、job/json free writer の撤去も完了。caller-zero の `AttachmentInfo` public projection も `flpdf-3yn9.48.97` で撤去済み | `flpdf-3yn9.43` / `flpdf-xsq1` / `flpdf-3yn9.48.97` |
 | 本体 | 最初の bounded cutover（§7.3）。D27 の pre-write sweep 撤去 | `flpdf-3yn9.44` |
 | 完了（D27 の multi-source follow-up） | `sweep_unreachable_objects_except` とその module を撤去。D3/D11 の採番差が残るため、`--preserve-unreferenced` multi-source `--pages` は object 数・内容 control で検証し、byte gate は採番統合後に行う。A14 の着手条件を満たす | `flpdf-3yn9.45`（`flpdf-3yn9.44` に依存） |
 | 完了 | A14 `Pdf::delete_object` の撤去と `replaceObject(og, newNull())` への cutover。§7.2.1 の 4 | `flpdf-3yn9.46`（`flpdf-3yn9.45` に依存） |
