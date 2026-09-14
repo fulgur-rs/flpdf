@@ -3290,6 +3290,64 @@ fn pages_then_overlay_min_version_preserves_qpdf_raw_spelling() {
     );
 }
 
+/// `--pages` must apply overlay through the same create-stage owner without
+/// changing the resulting writer bytes. Uncompressed stream data removes the
+/// only expected zlib implementation difference, while static IDs make the
+/// two independent writes directly comparable.
+#[test]
+fn pages_then_overlay_is_byte_identical_to_qpdf_without_deflate() {
+    if !qpdf_available() {
+        eprintln!(
+            "qpdf {EXPECTED_QPDF_VERSION} unavailable; skipping pages-overlay byte differential"
+        );
+        return;
+    }
+    let tmp = tempfile::tempdir().unwrap();
+    let primary = fixture_abs(THREE_PAGE);
+    let overlay = fixture_abs(ONE_PAGE);
+    let q = tmp.path().join("q-pages-overlay.pdf");
+    let f = tmp.path().join("f-pages-overlay.pdf");
+
+    let (q_ok, qpdf_stdout) = run_qpdf(&[
+        "--static-id",
+        "--stream-data=uncompress",
+        primary.to_str().unwrap(),
+        "--overlay",
+        overlay.to_str().unwrap(),
+        "--",
+        "--pages",
+        ".",
+        "1-2",
+        "--",
+        q.to_str().unwrap(),
+    ]);
+    assert!(
+        q_ok,
+        "qpdf pages-overlay byte differential failed: {qpdf_stdout}"
+    );
+
+    flpdf_ok(&[
+        "rewrite",
+        primary.to_str().unwrap(),
+        f.to_str().unwrap(),
+        "--static-id",
+        "--stream-data=uncompress",
+        "--overlay",
+        overlay.to_str().unwrap(),
+        "--",
+        "--pages",
+        ".",
+        "1-2",
+        "--",
+    ]);
+
+    assert_eq!(
+        std::fs::read(&f).unwrap(),
+        std::fs::read(&q).unwrap(),
+        "page selection followed by overlay must retain qpdf writer bytes"
+    );
+}
+
 #[test]
 fn pages_preserves_primary_catalog_and_trailer_metadata() {
     // QPDFJob mutates the authenticated primary in place

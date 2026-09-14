@@ -197,6 +197,47 @@ fn verbose_pages_single_source_reports_the_real_preflight() {
 }
 
 #[test]
+fn verbose_pages_overlay_diagnostics_match_qpdf() {
+    if !qpdf_available() {
+        return;
+    }
+
+    let temp = tempfile::tempdir().expect("temporary directory");
+    let primary = fixture("three-page.pdf");
+    let overlay = fixture("one-page.pdf");
+    let output = temp.path().join("pages-overlay.pdf");
+    let args = vec![
+        "--verbose".to_owned(),
+        "--static-id".to_owned(),
+        primary.to_str().unwrap().to_owned(),
+        "--overlay".to_owned(),
+        overlay.to_str().unwrap().to_owned(),
+        "--".to_owned(),
+        "--pages".to_owned(),
+        ".".to_owned(),
+        "1-2".to_owned(),
+        "--".to_owned(),
+        output.to_str().unwrap().to_owned(),
+    ];
+
+    let qpdf = run_qpdf(&args);
+    assert_success(&qpdf, "qpdf verbose pages overlay");
+    let flpdf = run_flpdf(&args);
+    assert_success(&flpdf, "flpdf verbose pages overlay");
+
+    assert_eq!(
+        normalize_text_newlines(&flpdf.stdout),
+        normalize_text_newlines(&qpdf.stdout),
+        "verbose --pages --overlay stdout must match qpdf"
+    );
+    assert_eq!(
+        normalize_text_newlines(&flpdf.stderr),
+        normalize_text_newlines(&qpdf.stderr),
+        "verbose --pages --overlay stderr must match qpdf"
+    );
+}
+
+#[test]
 fn verbose_pages_split_reports_merge_and_split_preflights_like_qpdf() {
     if !qpdf_available() {
         return;
