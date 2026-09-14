@@ -1453,13 +1453,14 @@ impl LinearizationPlan {
         pdf: &mut Pdf<R>,
         options: &crate::writer::WriterOptions,
     ) -> crate::Result<Self> {
-        Self::from_pdf_with_writer_options_and_source_membership(pdf, options, None)
+        Self::from_pdf_with_writer_options_and_source_membership(pdf, options, None, None)
     }
 
     pub(crate) fn from_pdf_with_writer_options_and_source_membership<R: Read + Seek>(
         pdf: &mut Pdf<R>,
         options: &crate::writer::WriterOptions,
         source_membership_snapshot: Option<&BTreeMap<u32, u32>>,
+        generated_compressible_snapshot: Option<&crate::writer::object_streams::CompressiblePlan>,
     ) -> crate::Result<Self> {
         let object_stream_mode = options.object_streams;
         let use_generate_objstm = matches!(
@@ -1473,9 +1474,19 @@ impl LinearizationPlan {
         // QPDFWriter::doWriteSetup fixes Generate's eligible object set before
         // writeLinearized calls QPDF::optimize. The latter may mint indirect
         // inherited-attribute objects, which must remain plain in the output.
-        let generate_objstm_eligible = use_generate_objstm
-            .then(|| crate::writer::object_streams::get_compressible_objgens(pdf))
-            .transpose()?;
+        // A live PdfWriter passes the exact setup-time snapshot; direct plan
+        // callers retain the pre-existing fallback for compatibility.
+        let generate_compressible_plan = if use_generate_objstm {
+            Some(match generated_compressible_snapshot {
+                Some(snapshot) => snapshot.clone(),
+                None => compressible_objgens_qpdf_plan(pdf)?,
+            })
+        } else {
+            None
+        };
+        let generate_objstm_eligible = generate_compressible_plan
+            .as_ref()
+            .map(|plan| plan.eligible.clone());
         // qpdf optimization performs direct-outline normalization, page-tree
         // preparation, inherited-attribute push, and object-user traversal in
         // this order. It must run before object-ref capture because those
@@ -1662,10 +1673,24 @@ impl LinearizationPlan {
                 crate::writer::ObjectStreamMode::Preserve
             ) && source_had_compressed_objects);
         let removed_refs = if operation_removes_stale_generations {
-            crate::writer::object_streams::compressible_objgens_qpdf_plan(pdf)?.removed_refs
+            if let Some(plan) = generate_compressible_plan.as_ref() {
+                plan.removed_refs.clone()
+            } else {
+                crate::writer::object_streams::compressible_objgens_qpdf_plan(pdf)?.removed_refs
+            }
         } else {
             BTreeSet::new()
         };
+        if let Some(plan) = generate_compressible_plan.as_ref() {
+            // qpdf may directize an indirect Catalog value in
+            // `prepareFileForWrite` after Generate membership has already
+            // been assigned. Keep those setup-time members in the linearized
+            // object universe even when the post-prepare reachability walk no
+            // longer sees their old edge (QPDFWriter.cc:2034-2055).
+            all_refs.extend(plan.eligible.iter().copied());
+            all_refs.sort_unstable();
+            all_refs.dedup();
+        }
         all_refs.retain(|reference| !removed_refs.contains(reference));
         let resurrectable =
             crate::writer::rewrite_renumber::resurrectable_null_refs_excluding(pdf, &removed_refs)?;

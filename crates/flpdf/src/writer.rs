@@ -864,17 +864,20 @@ impl<'pdf, R: Read + Seek + 'static> PdfWriter<'pdf, R> {
             && !options.content_normalization
             && !options.pclm
             && !plain::eligible(self.pdf.is_encrypted(), &options, effective_object_streams);
-        if effective_object_streams == ObjectStreamMode::Generate
-            && !self.settings.linearization
+        let capture_generate_setup = effective_object_streams == ObjectStreamMode::Generate
             && !options.pclm
-            && (plain_generate_setup || specialized_standard_live)
-        {
+            && (self.settings.linearization || plain_generate_setup || specialized_standard_live);
+        if capture_generate_setup {
             // qpdf initializes special streams before Generate computes its
             // compressible membership (`QPDFWriter.cc:2114-2135`). Capture
             // this snapshot at the same boundary, still before the common
             // `prepareFileForWrite` call below. Its fresh ObjStm placeholders
             // are also allocated before getObjectCount so they contribute to
             // the progress denominator (`QPDFWriter.cc:1998-2004,2189-2195`).
+            // Linearized Generate consumes this same setup-time membership
+            // after `prepareFileForWrite`; that preserves objects such as an
+            // indirect `/Extensions` dictionary that qpdf directizes during
+            // preparation but has already assigned to an ObjStm.
             let compressible = object_streams::compressible_objgens_qpdf_plan(self.pdf)?;
             let generated_object_stream_count =
                 object_streams::even_split_into_streams(&compressible.eligible).len();
@@ -2631,10 +2634,9 @@ pub(crate) struct WriterSetupState {
     /// qpdf captures source ObjStm membership during `doWriteSetup`, before
     /// the later `getObjectCount` xref walk can reconstruct damaged input.
     pub(crate) source_object_stream_data: BTreeMap<u32, u32>,
-    /// qpdf's standard Generate membership is also computed before
-    /// `prepareFileForWrite`; specialized live output consumes this snapshot
-    /// so output-time root reconciliation cannot feed a stale post-prepare
-    /// graph into the planner.
+    /// qpdf's Generate membership is computed before `prepareFileForWrite`;
+    /// standard and linearized output consume this snapshot so preparation's
+    /// directization cannot feed a stale post-prepare graph into the planner.
     pub(crate) generated_compressible: Option<object_streams::CompressiblePlan>,
     /// Fresh qpdf null placeholders allocated during setup for specialized
     /// Generate groups. Their source identities must survive into the live

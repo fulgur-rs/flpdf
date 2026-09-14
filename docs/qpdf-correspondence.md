@@ -3370,3 +3370,21 @@ create-stage and combined-inspection lifecycle. This corresponds to
 `libqpdf/QPDFJob.cc:432-448,459-480,513-520` and is covered by the six
 wrong-password combined-inspection cases plus a missing-input differential in
 `cli_inspection_combinations.rs`.
+
+### Linearized Generate setup snapshot (`flpdf-9zbro`, 2026-09-15)
+
+qpdf computes Generate ObjStm membership during writer setup, before
+`prepareFileForWrite` directizes indirect Catalog `/Extensions` values
+(`libqpdf/QPDFWriter.cc:1970-2006,2034-2055`). The subsequent linearized plan
+consumes that membership while assigning the part layout
+(`libqpdf/QPDFWriter.cc:2537-2645`); it does not replace it with a
+post-preparation reachability walk.
+
+flpdf's `PdfWriter::WriterSetupState::generated_compressible` is now passed to
+`LinearizationPlan`. The plan keeps setup-time eligible references in its
+linearized object universe and uses the setup stale-generation set and
+even-split count. This preserves an indirect `/Extensions` dictionary as the
+same ObjStm member qpdf emits after Catalog directization. The linearized
+two-pass layout and emission remain dedicated consumers; only the Generate
+membership boundary was changed. The live regression is
+`cmp_linearize_objstm_tests.rs::indirect_extensions_linearized_objstm_is_byte_identical_to_qpdf`.

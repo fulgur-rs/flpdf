@@ -3539,6 +3539,7 @@ pub(crate) fn write_linearized_for_pdf_writer<R: Read + Seek>(
             pdf,
             &plan_options,
             Some(&setup.source_object_stream_data),
+            setup.generated_compressible.as_ref(),
         )?;
         // qpdf allocates generated ObjStm placeholders before it removes page
         // and Catalog members from the mapping (QPDFWriter.cc:1970-2005,
@@ -3546,8 +3547,18 @@ pub(crate) fn write_linearized_for_pdf_writer<R: Read + Seek>(
         // when a later filter leaves one empty and therefore absent from the
         // emitted layout.
         let generated_object_stream_count = if mode == crate::writer::ObjectStreamMode::Generate {
-            let compressible = crate::writer::object_streams::compressible_objgens_qpdf_plan(pdf)?;
-            crate::writer::object_streams::even_split_into_streams(&compressible.eligible).len()
+            match setup.generated_compressible.as_ref() {
+                Some(compressible) => {
+                    crate::writer::object_streams::even_split_into_streams(&compressible.eligible)
+                        .len()
+                }
+                None => {
+                    let compressible =
+                        crate::writer::object_streams::compressible_objgens_qpdf_plan(pdf)?;
+                    crate::writer::object_streams::even_split_into_streams(&compressible.eligible)
+                        .len()
+                }
+            }
         } else {
             0
         };
@@ -5221,6 +5232,29 @@ mod tests {
             .as_bytes(),
         );
         pdf
+    }
+
+    #[test]
+    fn linearized_generate_falls_back_without_a_setup_snapshot() {
+        let mut pdf = Pdf::open(std::io::Cursor::new(
+            include_bytes!("../../../../tests/fixtures/compat/one-page.pdf").to_vec(),
+        ))
+        .expect("open linearized Generate fixture");
+        let options = WriterOptions {
+            object_streams: crate::writer::ObjectStreamMode::Generate,
+            static_id: true,
+            ..WriterOptions::default()
+        };
+        // Direct callers of this lower-level route may not have the common
+        // PdfWriter setup snapshot. Keep the fallback exercised separately
+        // from the production path, which always supplies one for Generate.
+        let setup = crate::writer::build_writer_setup(&mut pdf, &options).unwrap();
+        let mut bytes = Vec::new();
+        write_linearized_for_pdf_writer(&mut pdf, &options, None, setup, &mut bytes)
+            .expect("linearized Generate fallback succeeds");
+        assert!(bytes
+            .windows(b"/Type /ObjStm".len())
+            .any(|window| { window == b"/Type /ObjStm" }));
     }
 
     #[test]

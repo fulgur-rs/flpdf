@@ -19,6 +19,7 @@ use flpdf::linearization::LinearizationPlan;
 use flpdf::{ObjectRef, ObjectStreamMode, Pdf};
 use std::io::Cursor;
 use std::path::Path;
+use std::process::Command;
 
 /// Linearize `fixture` with `--object-streams=generate` via the public API
 /// (mirroring the CLI path) and return the complete back-patched bytes.
@@ -35,6 +36,31 @@ fn flpdf_linearized_objstm(fixture: &str) -> Vec<u8> {
         ..WriterTestSettings::default()
     };
     write_linearized_with_settings(&mut pdf, &opts).unwrap()
+}
+
+/// Linearize `fixture` with the pinned qpdf CLI using the same Generate options
+/// as [`flpdf_linearized_objstm`]. The temporary output keeps this regression
+/// independent from a committed golden while still comparing the complete
+/// qpdf-owned layout and `/ID` bytes.
+fn qpdf_linearized_objstm(fixture: &str) -> Vec<u8> {
+    let path = Path::new(env!("CARGO_MANIFEST_DIR"))
+        .join("../../tests/fixtures/compat")
+        .join(fixture);
+    let directory = tempfile::tempdir().expect("qpdf output tempdir");
+    let output = directory.path().join("qpdf.pdf");
+    let status = Command::new("qpdf")
+        .args([
+            "--linearize",
+            "--object-streams=generate",
+            "--deterministic-id",
+            "--warning-exit-0",
+        ])
+        .arg(&path)
+        .arg(&output)
+        .status()
+        .expect("qpdf runs");
+    assert_eq!(status.code(), Some(0), "qpdf linearization must succeed");
+    std::fs::read(output).expect("qpdf output")
 }
 
 /// Linearize one fixture with the exact stream-data policy used by the d3eo9
@@ -758,6 +784,21 @@ fn shared_stream_objstm_byte_identical_to_qpdf() {
 #[test]
 fn nonid_id0_linearized_objstm_is_byte_identical_to_qpdf() {
     assert_strict("nonid-id0.pdf", "nonid-id0");
+}
+
+#[test]
+fn indirect_extensions_linearized_objstm_is_byte_identical_to_qpdf() {
+    let fixture = "linearize-indirect-extensions.pdf";
+    let actual = flpdf_linearized_objstm(fixture);
+    let expected = qpdf_linearized_objstm(fixture);
+    if let Some(offset) = first_diff(&actual, &expected) {
+        panic!(
+            "{fixture}: linearized Generate output differs from qpdf \
+             (flpdf={} bytes, qpdf={} bytes, first diff at byte {offset})",
+            actual.len(),
+            expected.len(),
+        );
+    }
 }
 
 // ---- >cap global even-split + part routing -------------------------------
