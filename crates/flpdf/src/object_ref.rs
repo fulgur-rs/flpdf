@@ -3,7 +3,10 @@
 use std::fmt;
 use std::str::FromStr;
 
-/// Indirect-object identity (N G R in PDF syntax).
+/// Object number/generation pair used for qpdf identity projections.
+///
+/// qpdf treats object number 0 as a raw non-indirect identity; canonical
+/// [`crate::ObjectHandle`] projections never expose it as `N G R`.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub struct ObjectRef {
     /// Object number.
