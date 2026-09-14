@@ -3161,7 +3161,7 @@ pub(crate) fn write_linearized<R: Read + Seek>(
     options: &WriterOptions,
 ) -> Result<LinearizedDocument> {
     let setup = crate::writer::build_writer_setup(pdf, options)?;
-    let output = write_linearized_impl(plan, renumber, pdf, options, None, setup, None)?;
+    let output = write_linearized_impl(plan, renumber.clone(), pdf, options, None, setup, None)?;
     // cov:ignore-start: the memory helper always selects the Vec-backed output mode
     output.document.ok_or_else(|| {
         crate::Error::Internal(
@@ -3223,7 +3223,7 @@ pub(crate) fn write_linearized_for_pdf_writer<R: Read + Seek>(
     plan_result.and_then(|(plan, renumber)| {
         let output = write_linearized_impl(
             &plan,
-            &renumber,
+            renumber,
             pdf,
             options,
             pass1_path,
@@ -3269,7 +3269,7 @@ fn validate_per_page_private_objects(plan: &LinearizationPlan) -> Result<()> {
 
 fn write_linearized_impl<R: Read + Seek>(
     plan: &LinearizationPlan,
-    renumber: &RenumberMap,
+    renumber: RenumberMap,
     pdf: &mut Pdf<R>,
     options: &WriterOptions,
     pass1_path: Option<&Path>,
@@ -3395,10 +3395,11 @@ fn write_linearized_impl<R: Read + Seek>(
     } else {
         None
     };
-    let (plan, renumber) = match rebuilt.as_ref() {
-        Some((rebuilt_plan, rebuilt_renumber)) => (rebuilt_plan, rebuilt_renumber),
-        None => (plan, renumber),
+    let (rebuilt_plan, renumber) = match rebuilt {
+        Some((rebuilt_plan, rebuilt_renumber)) => (Some(rebuilt_plan), rebuilt_renumber),
+        None => (None, renumber),
     };
+    let plan = rebuilt_plan.as_ref().unwrap_or(plan);
     let options = normalized_options.as_ref().unwrap_or(options);
 
     // qpdf's linearization maps discard generations only after asserting that
@@ -3448,7 +3449,7 @@ fn write_linearized_impl<R: Read + Seek>(
         || !resolved_batch_plan.part3_batches.is_empty()
         || !resolved_batch_plan.part4_batches.is_empty();
 
-    let mut local_renumber = renumber.clone();
+    let mut local_renumber = renumber;
     // Per Part-4 batch, the second-half plain object after which its container is
     // emitted (its part-group's last plain object) so each second-half container
     // lands at its qpdf part position: a part7 container at the END of its owning
