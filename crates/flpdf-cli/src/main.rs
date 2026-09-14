@@ -6025,6 +6025,9 @@ fn run_page_operations_with_qpdf_job(
             )
             .into());
         }
+        if args.replace_input {
+            return Err(UsageError::new("--replace-input may not be used with --empty").into());
+        }
         match (args.input.clone(), args.output.clone()) {
             (Some(output), None) | (None, Some(output)) => (None, output),
             (Some(_), Some(_)) => {
@@ -8734,11 +8737,8 @@ fn reject_same_json_output(input: &Path, output: &Path) -> CliResult<()> {
 
 /// Reject a job whose main input and output resolve to the same file
 /// (qpdf's `QUtil::same_file` guard in `checkConfiguration()`,
-/// `QPDFJob.cc:627-630`). qpdf's own message references `--replace-input`,
-/// a dedicated escape hatch flpdf does not implement; this instead follows
-/// the existing `--json-output` guard's wording (a different output path is
-/// the only way out today), the same way that guard already departs from
-/// qpdf's exact text for the same reason.
+/// `QPDFJob.cc:627-630`). Keep qpdf's `--replace-input` guidance because
+/// flpdf supports the same escape hatch on the write routes.
 ///
 /// This is a job-wide guard, not one scoped to `--json-input`/
 /// `--update-from-json`: qpdf's check is unconditional, and an ordinary
@@ -8749,7 +8749,7 @@ fn reject_same_job_output(input: &Path, output: &Path) -> CliResult<()> {
     reject_same_file(
         input,
         output,
-        "input file and output file are the same; use a different output path",
+        "input file and output file are the same; use --replace-input to intentionally overwrite the input file",
         "output",
     )
 }
@@ -8766,7 +8766,7 @@ fn reject_same_file(
             // fails, the real input open below owns its path-specific error.
             // Output metadata failures remain fail-closed in the next arm.
             if qpdf_same_file(input, output) {
-                return Err(same_file_message.into());
+                return Err(UsageError::new(same_file_message).into());
             }
         }
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
