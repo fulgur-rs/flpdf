@@ -6,7 +6,10 @@ set -euo pipefail
 #
 # Requirements: qpdf 11.9.0 (exact version) installed on PATH — golden bytes
 # are tied to a specific upstream zlib/encoder flavour so a different qpdf
-# would silently drift the references.
+# would silently drift the references. One golden is produced through the
+# qpdf C++ API rather than the CLI, so the pinned qpdf *source* tree is also
+# required; install it with scripts/fetch-qpdf-source.sh (--print-path never
+# clones and fails when the cache is absent).
 # Usage: bash tests/golden/regenerate.sh
 
 ROOT="$(git rev-parse --show-toplevel)"
@@ -25,6 +28,15 @@ if [[ "$ACTUAL_QPDF_VERSION" != "$REQUIRED_QPDF_VERSION" ]]; then
     exit 1
 fi
 echo ""
+
+# The C++ API golden below needs the pinned source tree, not just the binary.
+# Check it up front so a missing cache fails here with a fixable message
+# instead of part-way through generation.
+if ! "$ROOT/scripts/fetch-qpdf-source.sh" --print-path >/dev/null 2>&1; then
+    echo "ERROR: the pinned qpdf source tree is required for the C++ API golden" >&2
+    echo "       but is not installed. Run scripts/fetch-qpdf-source.sh first." >&2
+    exit 1
+fi
 
 # ---------------------------------------------------------------------------
 # Phase 1: Derive new fixtures from existing base fixtures (skip if present)
