@@ -45,6 +45,11 @@ class SyntheticRepository:
             body, encoding="utf-8"
         )
 
+    def write_correspondence(self, body: str) -> None:
+        (self.root / "docs" / "qpdf-correspondence.md").write_text(
+            body, encoding="utf-8"
+        )
+
     def check(self, *extra: str) -> subprocess.CompletedProcess[str]:
         args = [
             sys.executable,
@@ -78,6 +83,26 @@ class CheckQpdfRouteMatrixTests(unittest.TestCase):
             result = repo.check()
             self.assertEqual(0, result.returncode, result.stdout + result.stderr)
             self.assertIn("OK", result.stdout)
+
+    def test_correspondence_document_citations_are_checked(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary_directory:
+            repo = SyntheticRepository(Path(temporary_directory))
+            repo.write("a.md", HEADER)
+            repo.write_correspondence("See `qpdf/Missing.cc:1` for details.\n")
+            result = repo.check()
+            self.assertNotEqual(0, result.returncode)
+            self.assertIn("qpdf-correspondence.md", result.stdout)
+            self.assertIn("qpdf/Missing.cc", result.stdout)
+
+    def test_no_qpdf_still_checks_correspondence_citation_syntax(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary_directory:
+            repo = SyntheticRepository(Path(temporary_directory))
+            repo.write("a.md", HEADER)
+            repo.write_correspondence("See `qpdf/QPDF.cc:bogus` for details.\n")
+            result = repo.check("--no-qpdf")
+            self.assertNotEqual(0, result.returncode)
+            self.assertIn("qpdf-correspondence.md", result.stdout)
+            self.assertIn("malformed qpdf citation", result.stdout)
 
     def test_line_range_past_end_of_file_is_error(self) -> None:
         with tempfile.TemporaryDirectory() as temporary_directory:

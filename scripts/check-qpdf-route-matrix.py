@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Validate the citations in ``docs/qpdf-route-matrix/*.md``.
+"""Validate citations in docs/qpdf-route-matrix and docs/qpdf-correspondence.md.
 
 The route matrix records, per qpdf responsibility, which flpdf entry points
 implement it and how they are classified (canonical / bridge / mixed /
@@ -432,7 +432,11 @@ def main(argv: list[str] | None = None) -> int:
 
     report = Report()
     checker = Checker(root, qpdf_root, report)
-    for doc in sorted(matrix_dir.glob("*.md")):
+    documents = set(matrix_dir.glob("*.md"))
+    correspondence_doc = root / "docs" / "qpdf-correspondence.md"
+    if correspondence_doc.is_file():
+        documents.add(correspondence_doc)
+    for doc in sorted(documents):
         checker.check_document(doc)
     for manifest in sorted(matrix_dir.glob("*.txt")):
         checker.check_manifest(manifest)
