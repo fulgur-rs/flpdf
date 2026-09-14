@@ -9447,11 +9447,46 @@ mod final_handle_tests {
             let _ = owner.direct_handle(ObjectValue::Integer(1));
             owner.install_xref_entries(BTreeMap::new());
             owner.set_header_offset(0);
+            owner.source_seek(0).expect("synthetic source seek");
+            assert_eq!(owner.source_tell().expect("synthetic source tell"), 0);
+            assert_eq!(owner.source_length().expect("synthetic source length"), 0);
+            let mut source_buffer = [0u8; 1];
+            assert_eq!(
+                owner
+                    .source_read(&mut source_buffer)
+                    .expect("synthetic source read"),
+                0
+            );
             owner.begin_parse().expect("synthetic parse guard");
             owner.end_parse();
             assert!(owner
                 .read_object_at_offset(0, ObjectRef::new(1, 0), None)
                 .is_err());
+            let buffered = BufferedCanonicalTrailerOwner::new(&owner);
+            buffered.set_header_offset(0);
+            buffered.source_seek(0).expect("buffered source seek");
+            assert_eq!(buffered.source_tell().expect("buffered source tell"), 0);
+            assert_eq!(buffered.source_length().expect("buffered source length"), 0);
+            assert_eq!(
+                buffered
+                    .source_read(&mut source_buffer)
+                    .expect("buffered source read"),
+                0
+            );
+            buffered
+                .read_object_at_offset(0, ObjectRef::new(1, 0), None)
+                .expect_err("buffered object read must forward the owner failure");
+            buffered
+                .read_xref_stream_at_offset(0, None)
+                .expect_err("buffered xref read must forward the owner failure");
+            buffered.begin_parse().expect("buffered parse guard");
+            buffered.end_parse();
+            buffered
+                .push_warning(damaged_warning(b"synthetic.pdf", b"", "buffered", Some(0)))
+                .expect("buffered warning sink");
+            assert_eq!(buffered.repair_diagnostics().entries().len(), 1);
+            buffered.flush().expect("flush buffered warning");
+            let diagnostics_before_parse = owner.repair_diagnostics().entries().len();
             let mut registration = XrefRegistration::default();
             let error = parse_xref_stream_with_canonical_owner(
                 0,
@@ -9474,8 +9509,106 @@ mod final_handle_tests {
             // `push_qpdf_warning` both logs it and records it, and `engine.rs`
             // installs the owner sink onto that same document. This delivers
             // one repair warning, matching qpdf (`QPDF.cc:518-522`).
-            assert_eq!(owner.repair_diagnostics().entries().len(), 1);
+            assert_eq!(
+                owner.repair_diagnostics().entries().len(),
+                diagnostics_before_parse + 1
+            );
         }
+    }
+
+    #[test]
+    fn live_xref_window_stops_after_the_classic_trailer_and_lookahead() {
+        let trailing = b"xref\n\ntrailer << /Nested << /Size 1 >> >> stream\nignored tail\n";
+        let resolver = canonical_test_resolver(trailing.to_vec(), BTreeMap::new(), true, 20);
+        let window = read_live_xref_window(resolver.as_ref(), 0).expect("classic xref window");
+        assert!(window.ends_with(b"stream\n"));
+        assert!(!window.ends_with(b"ignored tail\n"));
+
+        let no_following = b"xref\ntrailer\n<< /Size 1 >>";
+        let resolver = canonical_test_resolver(no_following.to_vec(), BTreeMap::new(), true, 21);
+        let window = read_live_xref_window(resolver.as_ref(), 0)
+            .expect("EOF-terminated classic xref window");
+        assert_eq!(window, no_following);
+
+        assert_eq!(classic_xref_start(b"  xref\n"), Some(2));
+        assert!(classic_xref_start(b"% comment\n").is_none());
+        assert!(classic_trailer_dictionary_end(b"xref\nnot-a-trailer\n", 0).is_none());
+        assert!(trailer_dictionary_end(b"<< ", 0).is_none());
+    }
+
+    #[test]
+    fn live_source_range_reports_an_unexpected_eof_and_uses_tell() {
+        let resolver = canonical_test_resolver(Vec::new(), BTreeMap::new(), false, 22);
+        let error = read_live_source_range(resolver.as_ref(), 0, 1)
+            .expect_err("a nonempty read from an empty source must fail");
+        assert!(matches!(
+            error,
+            Error::Parse { message, .. } if message == "unexpected end of input source"
+        ));
+    }
+
+    #[test]
+    fn live_recovery_source_parses_a_trailer_candidate() {
+        let bytes = b"trailer\n<< /Size 1 >>\n".to_vec();
+        let resolver = canonical_test_resolver(bytes, BTreeMap::new(), true, 23);
+        let recovered = recover_xref_entries_from_source(resolver.as_ref(), true, b"input.pdf")
+            .expect("live reconstruction scanner should parse the trailer");
+        assert!(recovered.trailer.is_some());
+    }
+
+    #[test]
+    fn canonical_trailer_candidate_uses_the_live_parser_owner() {
+        let resolver = canonical_test_resolver(Vec::new(), BTreeMap::new(), true, 24);
+        let (trailer, diagnostics) =
+            parse_trailer_candidate(b"<< /Size 1 >>", 0, b"input.pdf", Some(resolver.as_ref()));
+        assert!(trailer.is_some());
+        assert!(diagnostics.is_empty());
+    }
+
+    #[test]
+    fn xref_window_and_byte_cursor_keep_their_defensive_error_boundaries() {
+        let recovered = load_xref_state_from_window(
+            &[],
+            10,
+            "1.4".to_owned(),
+            0,
+            5,
+            XrefLoadOptions {
+                allow_repair: true,
+                ..XrefLoadOptions::default()
+            },
+            Diagnostics::default(),
+            Vec::new(),
+            None,
+        );
+        assert!(recovered.is_err());
+
+        let strict = load_xref_state_from_window(
+            &[],
+            10,
+            "1.4".to_owned(),
+            0,
+            5,
+            XrefLoadOptions::default(),
+            Diagnostics::default(),
+            Vec::new(),
+            None,
+        );
+        assert!(strict.is_err());
+
+        let mut cursor = ByteCursor::with_base(&[], 10, 0);
+        assert!(matches!(
+            cursor.read_be_u64(1),
+            Err(Error::Parse { message, .. }) if message == "unexpected end of stream field"
+        ));
+
+        let error =
+            load_xref_state_from_bytes(b"%PDF-1.4\n%%EOF\n", XrefLoadOptions::default(), None)
+                .expect_err("strict owner-less loading must reject a missing startxref");
+        assert!(matches!(
+            error,
+            Error::Parse { message, .. } if message == "can't find startxref"
+        ));
     }
 
     #[test]
