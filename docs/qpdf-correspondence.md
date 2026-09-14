@@ -824,10 +824,13 @@ forward boundaryへ統合する。`linearization/writer.rs::do_write_pass` は�
 `OutputSink`へ直接 emissionし、`LinearizedPassOutput` は xref/offset/length/range metadata
 だけを返す。pass 1 の classic xref と ObjStm xref stream は qpdf と同じ zero/forward
 representation をその場で書くため、seekable temporary PDFも pass-1 body Vecも不要である。
-final pass は `LinearizedDocument::bytes` のため Vec-backed targetを保持し、qpdf-shaped
-fixed-width xref/ID back-patchだけをその最終 bufferへ限定する。pass-1 artifactの debug
-commentsは metadataから追記し、body再走査による `startxref` 探索やpass-1 body cloneを
-行わない。
+final pass は pass-1 のxref mapへhint object長を適用し、最終Part-1辞書、first-page xref、
+`/Prev`、`/ID`、main xrefを先に確定してから、設定済み `Writer`/`Pipeline` の
+`OutputTarget`へforward-writeする。従ってcanonical routeは完全なfinal PDF Vecを保持せず、
+memory sinkを選んだ場合だけsink自身が契約どおり最終bytesを保持する。pass-1 artifactの
+debug commentsはmetadataから追記し、body再走査による`startxref`探索やpass-1 body cloneを
+行わない。`LinearizedDocument::back_patch` は既存のin-memory inspection/helper契約のため
+残すが、canonical sink routeの出力後修正には使わない。
 
 qpdf の standard writer は `enqueueObjectsStandard`（`QPDFWriter.cc:2907-2925`）で `/Root`
 と trimmed trailer の seed を queue に積み、`unparseChild` が indirect child を書く直前に

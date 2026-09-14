@@ -1,8 +1,10 @@
-//! qpdf correspondence: QPDFWriter.cc linearization back-patching split from the writer.
-//! Back-patcher for Part 1 linearization parameter dictionary.
+//! qpdf correspondence: QPDFWriter.cc linearization parameter-dictionary compatibility helper.
+//! The canonical sink writer now renders these values
+//! before its forward final pass; this module remains for the lower-level
+//! `LinearizedDocument` inspection contract and its focused tests.
 //!
-//! After layout is complete and all byte offsets are known, this module
-//! rewrites the linearization parameter dictionary with **variable-width**
+//! After layout is complete and all byte offsets are known, this module can
+//! rewrite the linearization parameter dictionary with **variable-width**
 //! decimal values (qpdf byte format):
 //!
 //! | Param dict key | Source field in [`LinearizedOffsets`]       |

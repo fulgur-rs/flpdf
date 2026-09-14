@@ -7,7 +7,9 @@
 
 use flpdf::pipeline::{Pipeline, PipelineError, PipelineResult};
 use flpdf::{Error, Pdf, PdfWriter};
+use std::cell::RefCell;
 use std::io::{Cursor, Write};
+use std::rc::Rc;
 
 fn minimal_pdf() -> Vec<u8> {
     std::fs::read(concat!(
@@ -15,6 +17,14 @@ fn minimal_pdf() -> Vec<u8> {
         "/../../tests/fixtures/minimal.pdf"
     ))
     .expect("read the minimal fixture")
+}
+
+fn one_page_pdf() -> Vec<u8> {
+    std::fs::read(concat!(
+        env!("CARGO_MANIFEST_DIR"),
+        "/../../tests/fixtures/compat/one-page.pdf"
+    ))
+    .expect("read the one-page fixture")
 }
 
 struct FailOnFinish;
@@ -64,6 +74,55 @@ fn get_buffer_rejects_a_writer_sink() {
         .expect_err("only a memory output can hand back a buffer");
     assert!(matches!(&error, Error::Unsupported(message)
         if message.contains("requires a successful memory output")));
+}
+
+struct RecordingWriter {
+    bytes: Rc<RefCell<Vec<u8>>>,
+    write_lengths: Rc<RefCell<Vec<usize>>>,
+}
+
+impl Write for RecordingWriter {
+    fn write(&mut self, data: &[u8]) -> std::io::Result<usize> {
+        self.write_lengths.borrow_mut().push(data.len());
+        self.bytes.borrow_mut().extend_from_slice(data);
+        Ok(data.len())
+    }
+
+    fn flush(&mut self) -> std::io::Result<()> {
+        Ok(())
+    }
+}
+
+#[test]
+fn linearized_writer_streams_final_pass_to_writer_sink() {
+    let bytes = Rc::new(RefCell::new(Vec::new()));
+    let write_lengths = Rc::new(RefCell::new(Vec::new()));
+    let sink = RecordingWriter {
+        bytes: Rc::clone(&bytes),
+        write_lengths: Rc::clone(&write_lengths),
+    };
+    let mut pdf = Pdf::open(Cursor::new(one_page_pdf())).expect("open the fixture");
+    let mut writer = PdfWriter::new(&mut pdf);
+    writer
+        .set_output_writer(sink)
+        .expect("configure a recording writer sink");
+    writer.set_linearization(true);
+    writer.set_static_id(true);
+    writer
+        .write()
+        .expect("linearized output must reach the writer sink");
+
+    let output_len = bytes.borrow().len();
+    let writes = write_lengths.borrow();
+    assert!(output_len > 0, "linearized writer must emit bytes");
+    assert!(
+        writes.len() > 1,
+        "linearized final pass must stream multiple chunks, got {writes:?}"
+    );
+    assert!(
+        writes.iter().any(|&length| length < output_len),
+        "no single sink write should own the complete final PDF: {writes:?}"
+    );
 }
 
 struct FailOnFlush;
