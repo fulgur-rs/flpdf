@@ -832,6 +832,20 @@ debug commentsはmetadataから追記し、body再走査による`startxref`探�
 行わない。`LinearizedDocument::back_patch` は既存のin-memory inspection/helper契約のため
 残すが、canonical sink routeの出力後修正には使わない。
 
+### Linearized xref offset-map ownership (`flpdf-ymuj.6.7`, 2026-09-14)
+
+qpdf の `QPDFWriter::Members::xref` は writer-owned の単一 map
+（`include/qpdf/QPDFWriter.hh:668-670`）であり、`writeXRefTable` と
+`writeXRefStream` は同じ map を読む。linearization の hint 補正は row を出力する
+境界で行う（`libqpdf/QPDFWriter.cc:2361-2373,2407-2462`）。
+
+flpdf の canonical linearization route も、pass-1 の `xref_offsets` map を最終物理
+offsetへ更新し、Part-1 metadata・first-page xref・main xref・WriterResult が同じ
+ownerを借用する。first-page xref のvirtual座標は全map cloneではなく、boundedな
+xref entry payloadを作る時だけ導出する。resolverのsource xref table
+（`flpdf-ymuj.8`）とxref payload stage owner（closed `flpdf-3yn9.48.58`/
+`flpdf-qynx.5.4.1`）は別責務である。
+
 qpdf の standard writer は `enqueueObjectsStandard`（`QPDFWriter.cc:2907-2925`）で `/Root`
 と trimmed trailer の seed を queue に積み、`unparseChild` が indirect child を書く直前に
 同じ queue へ追加する（`:1072-1157`）。flpdf の `writer/plain/body.rs::LiveQueue` と

@@ -1174,14 +1174,11 @@ struct FirstPageXrefPatch {
     max_ostream_index: u64,
     /// Whether the generated xref stream uses predictor + Flate filtering.
     filtered: bool,
-    /// Object number reserved for qpdf's primary hint stream.
-    hint_id: u32,
 }
 
 struct FinalFirstPageXref<'a> {
     member_new: &'a BTreeMap<u32, (u32, u32)>,
     main_xref_offset: usize,
-    hint_length: usize,
 }
 
 /// Return the live trailer entries that the linearization xref dictionary may
@@ -1384,7 +1381,6 @@ fn write_first_page_xref_stream(
     info_new_ref: Option<ObjectRef>,
     source_trailer: &ObjectHandle,
     canonical_entries: &[(Vec<u8>, Vec<u8>)],
-    hint_id: u32,
     max_ostream_index: u64,
     filtered: bool,
     encrypt: Option<ObjectRef>,
@@ -1460,7 +1456,6 @@ fn write_first_page_xref_stream(
         max_id,
         max_ostream_index,
         filtered,
-        hint_id,
     };
     xref_offsets.insert(first_xref_num, obj_offset);
     if pass1 {
@@ -1476,7 +1471,7 @@ fn write_first_page_xref_stream(
             xref_offsets,
             final_layout.member_new,
             final_layout.main_xref_offset,
-            final_layout.hint_length,
+            0,
             false,
         )?; // cov:ignore: pass-1 sizing guarantees the final region fits
         out.write_bytes(&region)?;
@@ -1532,7 +1527,7 @@ fn build_first_page_xref_region(
     xref_offsets: &mut BTreeMap<u32, usize>,
     member_new: &BTreeMap<u32, (u32, u32)>,
     main_xref_offset: usize,
-    hint_length: usize,
+    _hint_length: usize,
     pass1: bool,
 ) -> Result<(Vec<u8>, Option<std::ops::Range<usize>>)> {
     // The first-page xref object's own offset is the region start.
@@ -1570,56 +1565,20 @@ fn build_first_page_xref_region(
         )?; // cov:ignore: pass-1 layout errors are defensive pipeline failures.
         (stream_layout, 0u64)
     } else {
-        // qpdf's second pass keeps xref offsets in the pass-1 coordinate
-        // system and applies the hint length while encoding first-half rows.
-        // The linearized body map is physical, so remove the inserted hint
-        // bytes in this private view before the shared owner applies qpdf's
-        // correction. The live map itself remains physical for later callers.
-        // cov:ignore-start: the planner always reserves and records the hint stream slot.
-        let hint_offset = xref_offsets.get(&patch.hint_id).copied().ok_or_else(|| {
-            crate::Error::Unsupported(
-                "linearization first-page xref has no hint-stream offset".to_string(),
-            )
-        })? as u64;
-        // cov:ignore-end
-        let hint_length = hint_length as u64;
-        let mut virtual_offsets = xref_offsets.clone();
-        if hint_length > 0 {
-            for (&number, &offset) in xref_offsets.iter() {
-                if number != patch.hint_id && (offset as u64) >= hint_offset {
-                    virtual_offsets.insert(
-                        number,
-                        // cov:ignore-start: physical offsets at or after the hint contain its full length.
-                        offset.checked_sub(hint_length as usize).ok_or_else(|| {
-                            crate::Error::Unsupported(
-                                "linearization hint offset underflows".to_string(),
-                            )
-                        })?,
-                        // cov:ignore-end
-                    );
-                }
-            } // cov:ignore: the pass-2 map always carries a hint-backed offset.
-        } // cov:ignore: the planner always provides a nonzero pass-2 hint length.
-        let max_offset = xref_stream::max_offset_for_range(
-            &virtual_offsets,
-            patch.index_start,
-            patch.index_count,
-        );
-        let stream_layout = xref_stream::prepare_xref_stream(
-            &mut virtual_offsets,
+        // qpdf's second pass keeps one physical xref map and applies the hint
+        // correction while encoding first-half rows. The serializer derives
+        // virtual row values in its bounded entry payload; the writer-owned
+        // map remains physical and is not cloned.
+        let stream_layout = xref_stream::prepare_xref_stream_from_physical_offsets(
+            xref_offsets,
             member_new,
             patch.index_start,
             patch.index_count,
             patch.first_xref_num,
             patch.region.start,
-            max_offset,
             patch.max_id,
             patch.max_ostream_index,
-            hint_length,
-            Some((patch.hint_id, hint_offset, hint_length)),
             patch.filtered,
-            false,
-            false,
         )?; // cov:ignore: pass-2 layout errors are defensive pipeline failures.
         (stream_layout, main_xref_offset as u64)
     };
@@ -2145,10 +2104,9 @@ struct LinearizedPassOutput {
 /// lets the final pass write its first-page xref and parameter dictionary
 /// forward, without reserving a region that must be repaired after the body
 /// has already reached a non-seekable sink.
-struct FinalLinearizedLayout {
-    xref_offsets: BTreeMap<u32, usize>,
+struct FinalLinearizedLayout<'a> {
+    xref_offsets: &'a mut BTreeMap<u32, usize>,
     main_xref_offset: usize,
-    hint_length: usize,
 }
 
 /// Perform a complete single-pass write of the linearized PDF body.
@@ -2201,11 +2159,15 @@ fn do_write_pass<R: Read + Seek>(
     mut encrypted_string_emitter: Option<&mut EncryptedStringEmitter>,
     final_pdf_version: &str,
     final_extension_level: i64,
-    final_layout: Option<&FinalLinearizedLayout>,
+    final_layout: Option<FinalLinearizedLayout<'_>>,
 ) -> Result<LinearizedPassOutput> {
-    let mut xref_offsets = final_layout
-        .map(|layout| layout.xref_offsets.clone())
-        .unwrap_or_default();
+    let is_final = final_layout.is_some();
+    let final_main_xref_offset = final_layout.as_ref().map(|layout| layout.main_xref_offset);
+    let mut local_xref_offsets = BTreeMap::new();
+    let xref_offsets: &mut BTreeMap<u32, usize> = match final_layout {
+        Some(layout) => layout.xref_offsets,
+        None => &mut local_xref_offsets,
+    };
 
     // The classic path emits `/ID` at two sites (Part-1 and main trailers).
     // A `&mut dyn FnMut` cannot be moved into both calls, so reborrow it for the
@@ -2312,8 +2274,8 @@ fn do_write_pass<R: Read + Seek>(
             id_writer.as_deref_mut(),
             encrypt_ctx,
             pass1_digest,
-            final_layout.map(|_| &xref_offsets),
-            final_layout.map(|layout| layout.main_xref_offset),
+            is_final.then_some(&*xref_offsets),
+            final_main_xref_offset,
         )?; // cov:ignore: the validated linearization plan makes this serializer error path defensive.
         part1_classic_xref_offset = p1_xref_offset;
         part1_xref_patch = patch;
@@ -2324,25 +2286,34 @@ fn do_write_pass<R: Read + Seek>(
         id_ranges.push(section_start..output.position_usize()?);
         range
     } else {
+        let final_first_page_layout = if is_final {
+            Some(FinalFirstPageXref {
+                member_new: &member_new,
+                main_xref_offset: final_main_xref_offset.ok_or_else(|| {
+                    // cov:ignore-start: final layout always supplies the main xref coordinate
+                    crate::Error::Unsupported(
+                        "final linearization layout has no main xref offset".to_string(),
+                    )
+                    // cov:ignore-end
+                })?, // cov:ignore: final layout always supplies the main xref coordinate
+            })
+        } else {
+            None
+        };
         let patch = write_first_page_xref_stream(
             output,
-            &mut xref_offsets,
+            xref_offsets,
             relocation,
             total_count,
             catalog_new_ref,
             info_new_ref,
             source_trailer,
             &canonical_entries,
-            hint_stream_new_num,
             max_ostream_index,
             structural_streams_filtered,
             encrypt_ctx.map(|ctx| ctx.encrypt_ref),
             pass1_digest,
-            final_layout.map(|layout| FinalFirstPageXref {
-                member_new: &member_new,
-                main_xref_offset: layout.main_xref_offset,
-                hint_length: layout.hint_length,
-            }),
+            final_first_page_layout,
         )?;
         // First-page xref stream object carries one `/ID` (the main xref
         // stream below carries the second). This call only reserves the
@@ -2731,13 +2702,13 @@ fn do_write_pass<R: Read + Seek>(
         }
     }
 
-    if let Some(layout) = final_layout {
+    if let Some(expected) = final_main_xref_offset {
         let actual = output.position_usize()?;
-        if actual != layout.main_xref_offset {
+        if actual != expected {
             // cov:ignore-start: final offsets are derived from the same pass-1 layout
             return Err(crate::Error::Unsupported(format!(
                 "linearization final main xref offset drifted: expected {}, got {}",
-                layout.main_xref_offset, actual
+                expected, actual
             )));
             // cov:ignore-end
         }
@@ -2766,7 +2737,7 @@ fn do_write_pass<R: Read + Seek>(
         let main_section_start = output.position_usize()?;
         let result = write_main_xref_and_trailer(
             output,
-            &xref_offsets,
+            &*xref_offsets,
             param_dict_obj_number,
             part1_classic_xref_offset,
             source_trailer,
@@ -2780,7 +2751,7 @@ fn do_write_pass<R: Read + Seek>(
         // Final output patches the fixed-width first-page xref after every
         // object offset is known. Pass 1 already emitted qpdf's zero records
         // directly before the body and therefore has no in-place operation.
-        if !pass1_digest && final_layout.is_none() {
+        if !pass1_digest && !is_final {
             let patch = part1_xref_patch
                 .as_ref()
                 // cov:ignore-start: final classic output always reserves this patch.
@@ -2792,7 +2763,7 @@ fn do_write_pass<R: Read + Seek>(
                     )
                 })?;
             // cov:ignore-end
-            patch_part1_xref(output, patch, &xref_offsets)?;
+            patch_part1_xref(output, patch, &*xref_offsets)?; // cov:ignore: legacy patch fallback is not used by the forward final route
         }
 
         (result.0, result.1, 0)
@@ -2820,7 +2791,7 @@ fn do_write_pass<R: Read + Seek>(
 
         let result = write_main_xref_stream_and_trailer(
             output,
-            &mut xref_offsets,
+            xref_offsets,
             &member_new,
             relocation,
             total_count,
@@ -2852,11 +2823,11 @@ fn do_write_pass<R: Read + Seek>(
         // xref's reserved region with the real encoded object and `/Prev →
         // main xref`. The region's byte length is fixed (qpdf's pass-1 sizing),
         // so this shifts no bytes between the two layout passes.
-        if !pass1_digest && final_layout.is_none() {
+        if !pass1_digest && !is_final {
             let first_page_id_range = patch_first_page_xref(
                 output,
                 patch,
-                &mut xref_offsets,
+                xref_offsets, // cov:ignore: legacy patch fallback is not used by the forward final route
                 &member_new,
                 main_xref_offset,
                 hint_stream_obj_total_len,
@@ -2869,18 +2840,13 @@ fn do_write_pass<R: Read + Seek>(
         (main_xref_offset, main_first_entry_offset, second_xref_end)
     };
 
-    if let Some(layout) = final_layout {
-        if xref_offsets != layout.xref_offsets {
-            // cov:ignore-start: emission order is validated against the qpdf pass-1 map
-            return Err(crate::Error::Unsupported(
-                "linearization final xref offsets diverged from pass-1 layout".to_string(),
-            ));
-            // cov:ignore-end
-        }
-    }
-
+    let pass_xref_offsets = if is_final {
+        BTreeMap::new()
+    } else {
+        std::mem::take(xref_offsets)
+    };
     Ok(LinearizedPassOutput {
-        xref_offsets,
+        xref_offsets: pass_xref_offsets,
         first_page_xref_offset: first_page_xref_patch
             .as_ref()
             .map(|patch| patch.region.start),
@@ -3953,7 +3919,7 @@ fn write_linearized_impl<R: Read + Seek>(
         None
     };
     drop(pass1_sink);
-    let pass1_output = pass1_result?; // cov:ignore: pass-1 mode uses the same write path as the successful final pass while omitting only the hint object.
+    let mut pass1_output = pass1_result?; // cov:ignore: pass-1 mode uses the same write path as the successful final pass while omitting only the hint object.
     pass1_finish?;
     let pass1_digest = pass1_digest.transpose()?;
 
@@ -4324,20 +4290,22 @@ fn write_linearized_impl<R: Read + Seek>(
     // lets the first-page xref and the compact Part-1 dictionary be written
     // forward instead of repaired after a non-seekable sink has consumed them.
     let hint_stream_length = hint_stream_object.len();
-    let mut final_xref_offsets = pass1_output.xref_offsets.clone();
-    for (&number, &offset) in &pass1_output.xref_offsets {
-        if number != hint_stream_new_num && offset >= pass1_output.hint_stream_offset {
-            let adjusted = offset.checked_add(hint_stream_length).ok_or_else(|| {
+    let hint_stream_offset = pass1_output.hint_stream_offset;
+    for (&number, offset) in pass1_output.xref_offsets.iter_mut() {
+        if number != hint_stream_new_num && *offset >= hint_stream_offset {
+            let adjusted = (*offset).checked_add(hint_stream_length).ok_or_else(|| {
                 // cov:ignore-start: supported PDF offsets fit in usize
                 crate::Error::Unsupported(
                     "linearization final xref offset exceeds usize range".to_string(),
                 )
                 // cov:ignore-end
             })?; // cov:ignore: supported PDF offsets fit in usize
-            final_xref_offsets.insert(number, adjusted);
+            *offset = adjusted;
         }
     }
-    final_xref_offsets.insert(hint_stream_new_num, pass1_output.hint_stream_offset);
+    pass1_output
+        .xref_offsets
+        .insert(hint_stream_new_num, hint_stream_offset);
 
     let final_main_xref_offset = pass1_output
         .last_xref_offset
@@ -4390,7 +4358,7 @@ fn write_linearized_impl<R: Read + Seek>(
         last_xref_offset: final_last_xref_first_entry_offset.saturating_sub(1),
         page_count,
         part1_placeholders: part1_placeholders.clone(),
-        xref_offsets: final_xref_offsets.clone(),
+        xref_offsets: BTreeMap::new(),
         first_trailer_prev_range: 0..0,
         dict_writable_region: part1_dict_region.clone(),
     };
@@ -4400,9 +4368,8 @@ fn write_linearized_impl<R: Read + Seek>(
         &mut final_part1_offsets,
     )?; // cov:ignore: final values are bounded by the fixed Part-1 reserve
     let final_layout = FinalLinearizedLayout {
-        xref_offsets: final_xref_offsets,
+        xref_offsets: &mut pass1_output.xref_offsets,
         main_xref_offset: final_main_xref_offset,
-        hint_length: hint_stream_length,
     };
 
     // The deterministic ID is known now, before the final pass. Install it in
@@ -4459,7 +4426,7 @@ fn write_linearized_impl<R: Read + Seek>(
         encrypted_string_emitter.as_mut(),
         eff_version,
         eff_ext,
-        Some(&final_layout),
+        Some(final_layout),
     );
     let final_finish = final_sink.finish_document();
     let final_output_length = final_sink.position_usize()?;
@@ -4467,7 +4434,7 @@ fn write_linearized_impl<R: Read + Seek>(
     let final_output = final_result?; // cov:ignore: pass 2 reuses the validated plan and fixed layout after pass 1 succeeds; this is only defensive error propagation.
     final_finish?;
     let LinearizedPassOutput {
-        xref_offsets: final_xref_offsets,
+        xref_offsets: _final_xref_offsets,
         first_page_xref_offset: final_first_page_xref_offset,
         hint_stream_offset: final_hint_stream_offset,
         hint_stream_obj_total_len: final_hint_stream_obj_total_len,
@@ -4478,26 +4445,6 @@ fn write_linearized_impl<R: Read + Seek>(
         first_trailer_prev_range: final_first_trailer_prev_range,
         id_ranges: _final_id_ranges,
     } = final_output;
-
-    // ------------------------------------------------------------------
-    // Assemble offsets
-    // ------------------------------------------------------------------
-    let offsets = LinearizedOffsets {
-        file_length: final_output_length,
-        hint_stream_offset: final_hint_stream_offset,
-        hint_stream_length: final_hint_stream_obj_total_len,
-        first_page_object_new_num,
-        end_of_first_page_offset: final_end_of_first_page_offset,
-        last_xref_keyword_offset: final_last_xref_keyword_offset,
-        // /T = first_entry_pos - 1, matching qpdf's convention.
-        // qpdf's check validates: file_T == first_entry_pos - 1.
-        last_xref_offset: final_last_xref_first_entry_offset.saturating_sub(1),
-        page_count,
-        part1_placeholders: final_part1_offsets.part1_placeholders.clone(),
-        xref_offsets: final_xref_offsets.clone(),
-        first_trailer_prev_range: final_first_trailer_prev_range,
-        dict_writable_region: part1_dict_region,
-    };
 
     let mut old_to_new: BTreeMap<ObjectRef, ObjectRef> = renumber
         .iter_in_layout_order()
@@ -4529,7 +4476,8 @@ fn write_linearized_impl<R: Read + Seek>(
         }
     }
 
-    let mut written_xref = final_xref_offsets
+    let mut written_xref = pass1_output
+        .xref_offsets
         .iter()
         .map(|(&number, &offset)| {
             (
@@ -4578,6 +4526,25 @@ fn write_linearized_impl<R: Read + Seek>(
             }
         }
     }
+
+    // Move the one writer-owned final xref map into the in-memory inspection
+    // metadata after all WriterResult consumers have read it.
+    let offsets = LinearizedOffsets {
+        file_length: final_output_length,
+        hint_stream_offset: final_hint_stream_offset,
+        hint_stream_length: final_hint_stream_obj_total_len,
+        first_page_object_new_num,
+        end_of_first_page_offset: final_end_of_first_page_offset,
+        last_xref_keyword_offset: final_last_xref_keyword_offset,
+        // /T = first_entry_pos - 1, matching qpdf's convention.
+        // qpdf's check validates: file_T == first_entry_pos - 1.
+        last_xref_offset: final_last_xref_first_entry_offset.saturating_sub(1),
+        page_count,
+        part1_placeholders: final_part1_offsets.part1_placeholders.clone(),
+        xref_offsets: pass1_output.xref_offsets,
+        first_trailer_prev_range: final_first_trailer_prev_range,
+        dict_writable_region: part1_dict_region,
+    };
 
     let writer_result = WriterResult::new(old_to_new, written_xref);
     let document = if streaming_output {

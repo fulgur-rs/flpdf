@@ -116,6 +116,39 @@ fn linearization_pass_one_is_metadata_only_and_uses_counted_output() {
 }
 
 #[test]
+fn linearization_final_route_does_not_clone_complete_xref_maps() {
+    let source = production_source(
+        include_str!("../src/linearization/writer.rs"),
+        "\n#[cfg(test)]\nmod tests {",
+    );
+    let implementation = source
+        .split_once("fn write_linearized_impl")
+        .map(|(_, rest)| rest)
+        .expect("linearization implementation exists");
+    assert!(
+        !implementation.contains("pass1_output.xref_offsets.clone()"),
+        "the final layout must reuse the pass-1 xref owner"
+    );
+    assert!(
+        !implementation.contains("xref_offsets: final_xref_offsets.clone()"),
+        "Part-1 metadata must not clone the complete final xref map"
+    );
+    let pass = source
+        .split_once("fn do_write_pass")
+        .and_then(|(_, rest)| rest.split_once("/// Compute per-object byte lengths"))
+        .map(|(function, _)| function)
+        .expect("linearized pass writer exists");
+    assert!(
+        !pass.contains("layout.xref_offsets.clone()"),
+        "the final pass must borrow the writer-owned xref map"
+    );
+    assert!(
+        !source.contains("let mut virtual_offsets = xref_offsets.clone()"),
+        "first-page xref encoding must not clone the complete physical xref map"
+    );
+}
+
+#[test]
 fn prepare_file_for_write_is_owned_by_the_common_writer_boundary() {
     let writer_source = include_str!("../src/writer.rs").replace("\r\n", "\n");
     let write = writer_source
