@@ -14460,6 +14460,47 @@ mod mutation_tests {
     }
 
     #[test]
+    fn pipe_stream_data_decodes_a_tiff_predictor_through_the_canonical_chain() {
+        let dict = ObjectHandle::dictionary(vec![
+            (
+                b"Filter".to_vec(),
+                ObjectHandle::name(b"FlateDecode".to_vec()),
+            ),
+            (
+                b"DecodeParms".to_vec(),
+                ObjectHandle::dictionary(vec![
+                    (b"Predictor".to_vec(), ObjectHandle::integer(2)),
+                    (b"Columns".to_vec(), ObjectHandle::integer(4)),
+                    (b"Colors".to_vec(), ObjectHandle::integer(1)),
+                    (b"BitsPerComponent".to_vec(), ObjectHandle::integer(8)),
+                ]),
+            ),
+        ]);
+        let stream = ObjectHandle::stream(
+            dict,
+            Rc::new(vec![
+                0x78, 0x9c, 0xe3, 0xe2, 0xe2, 0xe2, 0x02, 0x00, 0x00, 0x68, 0x00, 0x29,
+            ]),
+        );
+        let mut sink = crate::pipeline::buffer::Buffer::new("sink", None);
+        let mut filtering_attempted = false;
+
+        assert!(stream
+            .pipe_stream_data(
+                &mut sink,
+                &mut filtering_attempted,
+                0,
+                crate::writer::DecodeLevel::Generalized,
+                false,
+                false,
+            )
+            .unwrap());
+
+        assert!(filtering_attempted);
+        assert_eq!(sink.take_buffer().unwrap(), [10, 20, 30, 40]);
+    }
+
+    #[test]
     fn pipe_stream_data_builds_reverse_decoder_chain() {
         let dict = ObjectHandle::dictionary(vec![
             (
