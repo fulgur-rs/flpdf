@@ -2043,6 +2043,28 @@ fn read_live_source_range(
     Ok(bytes)
 }
 
+fn window_has_previous_before_base(bytes: &[u8], base: u64) -> bool {
+    let marker = b"/Prev";
+    bytes.windows(marker.len()).enumerate().any(|(index, window)| {
+        if window != marker {
+            return false;
+        }
+        let mut pos = index.saturating_add(marker.len());
+        while bytes.get(pos).copied().is_some_and(is_pdf_space) {
+            pos += 1;
+        }
+        let digit_start = pos;
+        while bytes.get(pos).is_some_and(u8::is_ascii_digit) {
+            pos += 1;
+        }
+        digit_start != pos
+            && std::str::from_utf8(&bytes[digit_start..pos])
+                .ok()
+                .and_then(|text| text.parse::<u64>().ok())
+                .is_some_and(|offset| offset < base)
+    })
+}
+
 /// Canonical `Pdf::open` xref loading through qpdf's live input-source
 /// boundary. The initial implementation keeps bounded prefix/tail/xref
 /// windows; owner-less tests continue to use the byte-slice loader above.
@@ -2053,7 +2075,18 @@ pub(crate) fn load_xref_state_from_source(
 ) -> Result<LoadedXrefState> {
     let physical_length = owner.source_length()?;
     let prefix_length = usize::try_from(physical_length.min(1024)).unwrap_or(1024);
-    let prefix = read_live_source_range(owner, 0, prefix_length)?;
+    let prefix = match read_live_source_range(owner, 0, prefix_length) {
+        Err(Error::QpdfExc(exception))
+            if exception.get_error_code() == QpdfErrorCode::System => {
+            // qpdf's processFile C wrapper catches the initial FileInputSource
+            // runtime error rather than a QPDFExc (`qpdf-c.cc:70-79`), so this
+            // bootstrap read retains its empty-location SystemBytes shape.
+            let mut message = options.description.clone();
+            message.extend_from_slice(b": read 1024 bytes");
+            return Err(Error::SystemBytes(message));
+        }
+        other => other?,
+    };
     let mut initial_diagnostics = Diagnostics::default();
     let (version, header_offset) = match find_qpdf_header(&prefix) {
         Some((offset, version)) => (version, offset),
@@ -2068,7 +2101,6 @@ pub(crate) fn load_xref_state_from_source(
         }
     };
     owner.set_header_offset(header_offset);
-    deliver_canonical_diagnostics(Some(owner), &mut initial_diagnostics)?;
 
     let logical_length = physical_length.saturating_sub(header_offset as u64);
     let tail_length = usize::try_from(logical_length.min(1054)).unwrap_or(1054);
@@ -2080,16 +2112,28 @@ pub(crate) fn load_xref_state_from_source(
             // Recovery still needs the existing byte-slice scanner until its
             // source-window port lands; retain the qpdf error boundary while
             // keeping the normal valid-xref route snapshot-free.
-            let _ = error;
             let all = read_live_source_range(
                 owner,
                 0,
                 usize::try_from(logical_length)
                     .map_err(|_| Error::parse(0, "input source is too large for this target"))?,
             )?;
-            return load_xref_state_from_bytes(&all, options, Some(owner));
+            return load_xref_state_from_window(
+                &all,
+                0,
+                version,
+                header_offset,
+                0,
+                options,
+                initial_diagnostics,
+                vec![error],
+                Some(owner),
+            );
         }
-        Err(error) => return Err(error),
+        Err(error) => {
+            deliver_canonical_diagnostics(Some(owner), &mut initial_diagnostics)?;
+            return Err(error);
+        }
     };
     let Some(xref_end) = logical_length.checked_sub(startxref) else {
         if options.allow_repair {
@@ -2099,9 +2143,20 @@ pub(crate) fn load_xref_state_from_source(
                 usize::try_from(logical_length)
                     .map_err(|_| Error::parse(0, "input source is too large for this target"))?,
             )?;
-            return load_xref_state_from_bytes(&all, options, Some(owner));
+            return load_xref_state_from_window(
+                &all,
+                0,
+                version,
+                header_offset,
+                startxref,
+                options,
+                initial_diagnostics,
+                vec![Error::parse(0, "xref not found")],
+                Some(owner),
+            );
         }
-        return Err(Error::parse(0, "startxref is beyond the input source"));
+        deliver_canonical_diagnostics(Some(owner), &mut initial_diagnostics)?;
+        return Err(Error::parse(0, "xref not found"));
     };
     let xref_window = read_live_source_range(
         owner,
@@ -2124,20 +2179,39 @@ pub(crate) fn load_xref_state_from_source(
                 .windows(b"/Type /XRef".len())
                 .any(|bytes| bytes == b"/Type /XRef")
         });
-    if options.allow_repair && !starts_classic_xref && !looks_like_xref_stream {
+    if options.allow_repair
+        && (window_has_previous_before_base(&xref_window, startxref)
+            || (!starts_classic_xref && !looks_like_xref_stream))
+    {
         let all = read_live_source_range(
             owner,
             0,
             usize::try_from(logical_length)
                 .map_err(|_| Error::parse(0, "input source is too large for this target"))?,
         )?;
-        return load_xref_state_from_bytes(&all, options, Some(owner));
+        deliver_canonical_diagnostics(Some(owner), &mut initial_diagnostics)?;
+        return load_xref_state_from_window(
+            &all,
+            0,
+            version,
+            header_offset,
+            startxref,
+            options,
+            Diagnostics::default(),
+            Vec::new(),
+            Some(owner),
+        );
     }
     let buffered_owner = BufferedCanonicalTrailerOwner::new(owner);
+    let mut window_initial_diagnostics = initial_diagnostics.clone();
+    deliver_canonical_diagnostics(
+        Some(&buffered_owner),
+        &mut window_initial_diagnostics,
+    )?;
     let window_result = load_xref_state_from_window(
         &xref_window,
         startxref,
-        version,
+        version.clone(),
         header_offset,
         startxref,
         options.clone(),
@@ -2160,10 +2234,23 @@ pub(crate) fn load_xref_state_from_source(
                 usize::try_from(logical_length)
                     .map_err(|_| Error::parse(0, "input source is too large for this target"))?,
             )?;
-            let _ = error;
-            load_xref_state_from_bytes(&all, options, Some(owner))
+            deliver_canonical_diagnostics(Some(owner), &mut initial_diagnostics)?;
+            load_xref_state_from_window(
+                &all,
+                0,
+                version,
+                header_offset,
+                startxref,
+                options,
+                Diagnostics::default(),
+                vec![error],
+                Some(owner),
+            )
         }
-        Err(error) => Err(error),
+        Err(error) => {
+            buffered_owner.flush()?;
+            Err(error)
+        }
     }
 }
 
@@ -2172,6 +2259,7 @@ pub(crate) fn load_xref_state_from_source(
 /// trailer is parsed directly into that owner instead of being rebuilt through
 /// the short-lived bootstrap cache.
 #[allow(clippy::too_many_arguments)]
+#[cfg(test)]
 pub(crate) fn load_xref_state_from_bytes(
     source_bytes: &[u8],
     options: XrefLoadOptions,
@@ -3368,6 +3456,15 @@ fn merge_previous_xref_sections_with_observer(
     }
 
     while let Some(offset) = previous_offset {
+        if canonical_trailer_owner.is_some() && offset < source_base {
+            // The bounded window begins at the newest xref section. A /Prev
+            // target before that boundary needs the full-source recovery path
+            // so it cannot be mistaken for offset zero.
+            return Err(Error::parse(
+                usize::try_from(offset).unwrap_or(usize::MAX),
+                "xref /Prev precedes the live source window",
+            ));
+        }
         let previous_pos = usize::try_from(offset.saturating_sub(source_base))
             .map_err(|_| Error::parse(0, "xref /Prev does not fit usize"))?;
 
