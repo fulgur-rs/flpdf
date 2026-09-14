@@ -18,6 +18,12 @@
 //! its `Rc<[u8]>` source snapshot is initialized only for an actual indirect
 //! object or stream-length resolution.
 //!
+//! The canonical `Pdf::open` route uses `load_xref_state_from_source`: it keeps
+//! only the header/tail and current xref-section windows, fetches `/Prev`
+//! sections from the same live source when they fall outside the window, and
+//! performs reconstruction as a chunked live-source scan. The complete
+//! byte-slice loader below is test-only and is not part of canonical ownership.
+//!
 //! qpdf's `xref_offset == 0` check (`libqpdf/QPDF.cc:450-452`) throws
 //! `damagedPDF("can't find startxref")` immediately and never calls
 //! `read_xref` at all, whether the zero came from a missing/malformed
