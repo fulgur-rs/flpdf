@@ -17,6 +17,8 @@ use crate::pipeline::run_length::{RunLength, RunLengthAction};
 use crate::pipeline::tiff_predictor::{TiffPredictor, TiffPredictorAction};
 use crate::pipeline::{Pipeline, PipelineError, PipelineRef, PipelineResult};
 use crate::{Error, Result};
+use std::collections::BTreeMap;
+use std::sync::{Arc, Mutex, MutexGuard, OnceLock};
 
 type FilterWarningCallback = Box<dyn FnMut(&str, i32) -> PipelineResult<()> + 'static>;
 
@@ -42,11 +44,12 @@ pub(crate) const FILTER_TYPE_ERROR: &str = "stream filter type is not name or ar
 /// inconsistent with filters")` (`libqpdf/QPDF_Stream.cc:459`), raised as an
 /// error rather than a warning just as [`FILTER_TYPE_ERROR`] is.
 ///
-/// qpdf validates every filter name against `filter_factories` first and
-/// returns on an unknown one (`QPDF_Stream.cc:433-435`), so `:459`'s condition
-/// is never evaluated for a stream whose `/Filter` names an unimplemented
-/// codec. The canonical handle reader makes the same factory decision before
-/// reading `/DecodeParms`, through `prepare_stream_filter_plan`.
+/// qpdf validates every filter name against `filter_factories` first, keeps
+/// constructing the known factories after an unknown one, and returns false
+/// after that pass (`QPDF_Stream.cc:425-435`). Thus `:459`'s condition is never
+/// evaluated for a stream whose `/Filter` names an unimplemented codec. The
+/// canonical handle reader makes the same factory decision before reading
+/// `/DecodeParms`, through `prepare_stream_filter_plan`.
 pub(crate) const DECODE_PARMS_LENGTH_ERROR: &str =
     "stream /DecodeParms length is inconsistent with filters";
 fn map_pipeline_error(error: PipelineError) -> Error {
@@ -57,7 +60,7 @@ fn map_pipeline_error(error: PipelineError) -> Error {
 ///
 /// Ordinary stream consumers use `ObjectHandle::pipe_stream_data` directly;
 /// this trait only supplies qpdf's filter construction and classification hooks.
-pub(crate) trait StreamFilter {
+pub trait StreamFilter: 'static {
     /// Port of `QPDFStreamFilter::setDecodeParms`
     /// (`libqpdf/QPDFStreamFilter.cc:3-7`), whose whole body is
     /// `return decode_parms.isNull();` — documented at
@@ -71,14 +74,8 @@ pub(crate) trait StreamFilter {
     /// Construct the same stage with a downstream pipeline that may already
     /// own inner stages. This is the Rust ownership seam used by
     /// `QPDF_Stream::pipeStreamData`'s reverse chain construction.
-    fn decode_pipeline_owned<'a>(
-        &mut self,
-        next: PipelineRef<'a>,
-    ) -> Result<OwnedDecodePipeline<'a>>;
-
-    /// Install the qpdf `QPDF_Stream::pipeStreamData` warning callback on a
-    /// filter that constructs a Flate stage. Other filters ignore it.
-    fn set_warning_callback(&mut self, _callback: FilterWarningCallback) {}
+    fn get_decode_pipeline<'a>(&mut self, next: PipelineRef<'a>)
+        -> Result<OwnedDecodePipeline<'a>>;
 
     /// Whether this filter is a specialized compression codec for qpdf's
     /// stream capability classification.
@@ -96,7 +93,7 @@ pub(crate) trait StreamFilter {
 /// Result of constructing a stage around a downstream pipeline that may
 /// already own inner stages. `NoStage` returns the downstream slot so the
 /// caller can keep threading it through a filter such as qpdf's `Crypt`.
-pub(crate) enum OwnedDecodePipeline<'a> {
+pub enum OwnedDecodePipeline<'a> {
     Stage(Box<dyn Pipeline + 'a>),
     NoStage(PipelineRef<'a>),
 }
@@ -223,16 +220,12 @@ impl StreamFilter for FlateLzwStreamFilter {
         Ok(filterable)
     }
 
-    fn set_warning_callback(&mut self, callback: FilterWarningCallback) {
-        self.warning_callback = Some(callback);
-    }
-
     /// Mirrors `SF_FlateLzwDecode::getDecodePipeline`
     /// (`libqpdf/SF_FlateLzwDecode.cc:75-110`): a predictor stage first when
     /// the parameters call for one, with `next` reassigned to it, then the
     /// codec wrapping whichever `next` resulted. The codec is what the caller
     /// receives.
-    fn decode_pipeline_owned<'a>(
+    fn get_decode_pipeline<'a>(
         &mut self,
         next: PipelineRef<'a>,
     ) -> Result<OwnedDecodePipeline<'a>> {
@@ -260,6 +253,10 @@ impl StreamFilter for FlateLzwStreamFilter {
 }
 
 impl FlateLzwStreamFilter {
+    fn set_warning_callback(&mut self, callback: FilterWarningCallback) {
+        self.warning_callback = Some(callback);
+    }
+
     /// Resolve the predictor geometry the decode chain needs, if any.
     ///
     /// This reproduces the failures `SF_FlateLzwDecode::getDecodePipeline`
@@ -347,7 +344,7 @@ struct Ascii85StreamFilter;
 impl StreamFilter for Ascii85StreamFilter {
     /// Mirrors `SF_ASCII85Decode::getDecodePipeline`
     /// (`libqpdf/qpdf/SF_ASCII85Decode.hh:14-19`), a single `Pl_ASCII85Decoder`.
-    fn decode_pipeline_owned<'a>(
+    fn get_decode_pipeline<'a>(
         &mut self,
         next: PipelineRef<'a>,
     ) -> Result<OwnedDecodePipeline<'a>> {
@@ -364,7 +361,7 @@ impl StreamFilter for AsciiHexStreamFilter {
     /// Mirrors `SF_ASCIIHexDecode::getDecodePipeline`
     /// (`libqpdf/qpdf/SF_ASCIIHexDecode.hh:14-19`), a single
     /// `Pl_ASCIIHexDecoder`.
-    fn decode_pipeline_owned<'a>(
+    fn get_decode_pipeline<'a>(
         &mut self,
         next: PipelineRef<'a>,
     ) -> Result<OwnedDecodePipeline<'a>> {
@@ -381,7 +378,7 @@ impl StreamFilter for RunLengthStreamFilter {
     /// Mirrors `SF_RunLengthDecode::getDecodePipeline`
     /// (`libqpdf/qpdf/SF_RunLengthDecode.hh:14-20`), a single `Pl_RunLength`
     /// in its decode action.
-    fn decode_pipeline_owned<'a>(
+    fn get_decode_pipeline<'a>(
         &mut self,
         next: PipelineRef<'a>,
     ) -> Result<OwnedDecodePipeline<'a>> {
@@ -402,7 +399,7 @@ struct DctStreamFilter;
 impl StreamFilter for DctStreamFilter {
     /// Mirrors `SF_DCTDecode::getDecodePipeline`
     /// (`libqpdf/qpdf/SF_DCTDecode.hh:14-19`), a single `Pl_DCT` decode stage.
-    fn decode_pipeline_owned<'a>(
+    fn get_decode_pipeline<'a>(
         &mut self,
         next: PipelineRef<'a>,
     ) -> Result<OwnedDecodePipeline<'a>> {
@@ -476,7 +473,7 @@ impl StreamFilter for CryptStreamFilter {
     /// absent but wrong, and silently so — ciphertext would pass through as
     /// plaintext with neither an error nor a warning, which is why the
     /// decode route below refuses instead of returning the bytes.
-    fn decode_pipeline_owned<'a>(
+    fn get_decode_pipeline<'a>(
         &mut self,
         _next: PipelineRef<'a>,
     ) -> Result<OwnedDecodePipeline<'a>> {
@@ -484,29 +481,220 @@ impl StreamFilter for CryptStreamFilter {
     }
 }
 
+pub(crate) trait RegisteredStreamFilter {
+    fn set_decode_params(&mut self, decode_params: &ObjectHandle) -> Result<bool>;
+
+    fn get_decode_pipeline<'a>(&mut self, next: PipelineRef<'a>)
+        -> Result<OwnedDecodePipeline<'a>>;
+
+    fn set_warning_callback(&mut self, _callback: FilterWarningCallback) {}
+
+    fn is_specialized_compression(&self) -> bool;
+
+    fn is_lossy_compression(&self) -> bool;
+}
+
+struct CustomStreamFilter {
+    inner: Box<dyn StreamFilter>,
+}
+
+impl RegisteredStreamFilter for CustomStreamFilter {
+    fn set_decode_params(&mut self, decode_params: &ObjectHandle) -> Result<bool> {
+        self.inner.set_decode_params(decode_params)
+    }
+
+    fn get_decode_pipeline<'a>(
+        &mut self,
+        next: PipelineRef<'a>,
+    ) -> Result<OwnedDecodePipeline<'a>> {
+        self.inner.get_decode_pipeline(next)
+    }
+
+    fn is_specialized_compression(&self) -> bool {
+        self.inner.is_specialized_compression()
+    }
+
+    fn is_lossy_compression(&self) -> bool {
+        self.inner.is_lossy_compression()
+    }
+}
+
+struct BuiltinStreamFilter<T> {
+    inner: T,
+}
+
+impl<T: StreamFilter> RegisteredStreamFilter for BuiltinStreamFilter<T> {
+    fn set_decode_params(&mut self, decode_params: &ObjectHandle) -> Result<bool> {
+        self.inner.set_decode_params(decode_params)
+    }
+
+    fn get_decode_pipeline<'a>(
+        &mut self,
+        next: PipelineRef<'a>,
+    ) -> Result<OwnedDecodePipeline<'a>> {
+        self.inner.get_decode_pipeline(next)
+    }
+
+    fn is_specialized_compression(&self) -> bool {
+        self.inner.is_specialized_compression()
+    }
+
+    fn is_lossy_compression(&self) -> bool {
+        self.inner.is_lossy_compression()
+    }
+}
+
+struct BuiltinFlateStreamFilter {
+    inner: FlateLzwStreamFilter,
+}
+
+impl RegisteredStreamFilter for BuiltinFlateStreamFilter {
+    fn set_decode_params(&mut self, decode_params: &ObjectHandle) -> Result<bool> {
+        self.inner.set_decode_params(decode_params)
+    }
+
+    fn get_decode_pipeline<'a>(
+        &mut self,
+        next: PipelineRef<'a>,
+    ) -> Result<OwnedDecodePipeline<'a>> {
+        self.inner.get_decode_pipeline(next)
+    }
+
+    fn set_warning_callback(&mut self, callback: FilterWarningCallback) {
+        self.inner.set_warning_callback(callback);
+    }
+
+    fn is_specialized_compression(&self) -> bool {
+        self.inner.is_specialized_compression()
+    }
+
+    fn is_lossy_compression(&self) -> bool {
+        self.inner.is_lossy_compression()
+    }
+}
+
+type CustomFilterFactory = Arc<dyn Fn() -> Result<Box<dyn StreamFilter>> + Send + Sync + 'static>;
+
+#[derive(Clone)]
+enum FilterFactory {
+    Builtin(fn() -> Box<dyn RegisteredStreamFilter>),
+    Custom(CustomFilterFactory),
+}
+
+static FILTER_FACTORIES: OnceLock<Mutex<BTreeMap<Vec<u8>, FilterFactory>>> = OnceLock::new();
+
+fn filter_factories() -> &'static Mutex<BTreeMap<Vec<u8>, FilterFactory>> {
+    FILTER_FACTORIES.get_or_init(|| {
+        Mutex::new(BTreeMap::from([
+            (
+                b"/Crypt".to_vec(),
+                FilterFactory::Builtin(|| {
+                    Box::new(BuiltinStreamFilter {
+                        inner: CryptStreamFilter,
+                    })
+                }),
+            ),
+            (
+                b"/FlateDecode".to_vec(),
+                FilterFactory::Builtin(|| {
+                    Box::new(BuiltinFlateStreamFilter {
+                        inner: FlateLzwStreamFilter::new(false),
+                    })
+                }),
+            ),
+            (
+                b"/LZWDecode".to_vec(),
+                FilterFactory::Builtin(|| {
+                    Box::new(BuiltinFlateStreamFilter {
+                        inner: FlateLzwStreamFilter::new(true),
+                    })
+                }),
+            ),
+            (
+                b"/ASCII85Decode".to_vec(),
+                FilterFactory::Builtin(|| {
+                    Box::new(BuiltinStreamFilter {
+                        inner: Ascii85StreamFilter,
+                    })
+                }),
+            ),
+            (
+                b"/ASCIIHexDecode".to_vec(),
+                FilterFactory::Builtin(|| {
+                    Box::new(BuiltinStreamFilter {
+                        inner: AsciiHexStreamFilter,
+                    })
+                }),
+            ),
+            (
+                b"/RunLengthDecode".to_vec(),
+                FilterFactory::Builtin(|| {
+                    Box::new(BuiltinStreamFilter {
+                        inner: RunLengthStreamFilter,
+                    })
+                }),
+            ),
+            (
+                b"/DCTDecode".to_vec(),
+                FilterFactory::Builtin(|| {
+                    Box::new(BuiltinStreamFilter {
+                        inner: DctStreamFilter,
+                    })
+                }),
+            ),
+        ]))
+    })
+}
+
+fn registry_guard() -> MutexGuard<'static, BTreeMap<Vec<u8>, FilterFactory>> {
+    filter_factories()
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+}
+
+/// Register a qpdf-shaped decode filter factory for the canonical internal name.
+///
+/// The name is stored exactly as supplied, including its leading slash. qpdf's
+/// `QPDF::registerStreamFilter` is process-global and replaces an existing
+/// factory with the same key (`include/qpdf/QPDF.hh:186-194`,
+/// `libqpdf/QPDF.cc:295-300`). The factory is cloned out of the registry before
+/// invocation, so user code may register another filter while a factory runs.
+pub fn register_stream_filter<F, S>(name: impl AsRef<[u8]>, factory: F)
+where
+    F: Fn() -> Result<S> + Send + Sync + 'static,
+    S: StreamFilter + 'static,
+{
+    let factory =
+        Arc::new(move || factory().map(|filter| Box::new(filter) as Box<dyn StreamFilter>));
+    let key = name.as_ref().to_vec();
+    let previous = {
+        let mut registry = registry_guard();
+        registry.insert(key, FilterFactory::Custom(factory))
+    };
+    drop(previous);
+}
+
 /// Construct the filter registered under `filter_name`, if any.
 ///
-/// **Recorded deviation (CLAUDE.md class (B)):** qpdf holds the same registry
-/// in a `std::map`, `QPDF_Stream::filter_factories` (`QPDF_Stream.cc:85-94`).
-/// Nothing iterates that map — the only read is a lookup by name
-/// (`QPDF_Stream.cc:425-426`) — so a `match` carries a name-to-factory
-/// mapping just as faithfully. What a `match` cannot carry is
-/// `QPDF_Stream::registerStreamFilter` (`QPDF_Stream.cc:148-151`), which lets
-/// a library user add a factory at run time; flpdf exposes no counterpart, and
-/// adding one would mean replacing this `match`.
-///
-/// The container and qpdf's registered production codecs are represented here;
-/// the DCT stage itself is the qpdf-shaped streaming primitive.
-pub(crate) fn stream_filter_for(filter_name: &[u8]) -> Option<Box<dyn StreamFilter>> {
-    match filter_name {
-        b"Crypt" => Some(Box::new(CryptStreamFilter)),
-        b"FlateDecode" => Some(Box::new(FlateLzwStreamFilter::new(false))),
-        b"LZWDecode" => Some(Box::new(FlateLzwStreamFilter::new(true))),
-        b"ASCII85Decode" => Some(Box::new(Ascii85StreamFilter)),
-        b"ASCIIHexDecode" => Some(Box::new(AsciiHexStreamFilter)),
-        b"RunLengthDecode" => Some(Box::new(RunLengthStreamFilter)),
-        b"DCTDecode" => Some(Box::new(DctStreamFilter)),
-        _ => None,
+/// The PDF object model stores decoded name bytes without its separator slash;
+/// a decoded slash is therefore part of the payload and must not be mistaken
+/// for that separator. qpdf's registry stores canonical internal names with
+/// one separator slash. Alias expansion is performed before this lookup,
+/// matching `QPDF_Stream::filterable`.
+pub(crate) fn stream_filter_for(
+    filter_name: &[u8],
+) -> Result<Option<Box<dyn RegisteredStreamFilter>>> {
+    let normalized = normalize_filter_name(filter_name);
+    let mut key = Vec::with_capacity(normalized.len() + 1);
+    key.push(b'/');
+    key.extend_from_slice(normalized);
+    let factory = registry_guard().get(&key).cloned();
+    match factory {
+        None => Ok(None),
+        Some(FilterFactory::Builtin(factory)) => Ok(Some(factory())),
+        Some(FilterFactory::Custom(factory)) => {
+            Ok(Some(Box::new(CustomStreamFilter { inner: factory()? })))
+        }
     }
 }
 
@@ -542,7 +730,7 @@ fn predictor_encode_geometry(
     // non-Flate filter here so encoding cannot produce bytes for a stream that
     // the inverse decode path rejects.
     if !matches!(filter_name, b"FlateDecode" | b"LZWDecode") {
-        let Some(mut filter) = stream_filter_for(filter_name) else {
+        let Some(mut filter) = stream_filter_for(filter_name)? else {
             // Let the codec encoder report an unknown or passthrough filter.
             return Ok(None);
         };
@@ -778,6 +966,14 @@ mod tests {
         assert_eq!(
             super::encode_predictor(&[10, 20], b"FlateDecode", &params).unwrap(),
             [10, 10]
+        );
+    }
+
+    #[test]
+    fn encode_predictor_leaves_unknown_filter_data_unchanged() {
+        assert_eq!(
+            super::encode_predictor(b"payload", b"UnknownFilter", &ObjectHandle::null()).unwrap(),
+            b"payload"
         );
     }
 }

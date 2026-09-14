@@ -153,7 +153,7 @@ pub trait Pipeline {
 /// `stream_filter::encode_flate` directly. Both deflate byte paths are pinned
 /// against qpdf goldens by `cmp_generate_objstm_tests` under the
 /// `qpdf-zlib-compat` feature.
-pub(crate) enum PipelineRef<'a> {
+pub enum PipelineRef<'a> {
     Borrowed(&'a mut dyn Pipeline),
     Owned(Box<dyn Pipeline + 'a>),
 }

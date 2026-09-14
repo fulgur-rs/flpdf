@@ -156,7 +156,7 @@ use crate::{
         Discard, Pipeline, PipelineError, PipelineRef, PlString,
     },
     stream_filter::{
-        normalize_filter_name, stream_filter_for, OwnedDecodePipeline, StreamFilter,
+        normalize_filter_name, stream_filter_for, OwnedDecodePipeline, RegisteredStreamFilter,
         DECODE_PARMS_LENGTH_ERROR, FILTER_TYPE_ERROR,
     },
     writer::DecodeLevel,
@@ -452,7 +452,7 @@ impl StreamDataProvider for CoalesceContentProvider {
 }
 
 struct StreamFilterPlan {
-    filters: Vec<Box<dyn StreamFilter>>,
+    filters: Vec<Box<dyn RegisteredStreamFilter>>,
     specialized_compression: bool,
     lossy_compression: bool,
 }
@@ -6598,7 +6598,7 @@ impl ObjectHandle {
                     }
                 }
             }));
-            head = match filter.decode_pipeline_owned(head)? {
+            head = match filter.get_decode_pipeline(head)? {
                 OwnedDecodePipeline::Stage(stage) => PipelineRef::Owned(stage),
                 OwnedDecodePipeline::NoStage(next) => next,
             };
@@ -6713,12 +6713,17 @@ impl ObjectHandle {
         // this ordering is observable for an unknown filter paired with a
         // dangling or mismatched parameter object.
         let mut filters = Vec::with_capacity(filter_names.len());
+        let mut filters_okay = true;
         for name in &filter_names {
             let normalized_name = normalize_filter_name(name);
-            let Some(filter) = stream_filter_for(normalized_name) else {
-                return Ok(None);
+            if let Some(filter) = stream_filter_for(normalized_name)? {
+                filters.push(filter);
+            } else {
+                filters_okay = false;
             };
-            filters.push(filter);
+        }
+        if !filters_okay {
+            return Ok(None);
         }
 
         let decode_params = stream_dict.try_get_key(b"/DecodeParms")?;
