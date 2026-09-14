@@ -82,10 +82,19 @@ codegen-units = 1
 # integration test binaries) without paying opt-level 3's expensive
 # inlining/vectorization passes on every PR. It inherits every other
 # `[profile.release]` setting (debug-assertions off, overflow-checks off) and
-# only lowers opt-level, so release-mode panic/overflow semantics are
-# unchanged; only codegen effort is reduced. This profile is CI-only — it
-# never affects `cargo build --release`/`cargo install`/`release-plz`
-# packaging, all of which use the untouched `[profile.release]` above.
+# only lowers codegen effort, so release-mode panic/overflow semantics are
+# unchanged. This profile is CI-only — it never affects `cargo build
+# --release`/`cargo install`/`release-plz` packaging, all of which use the
+# untouched `[profile.release]` above.
+#
+# `lto` and `codegen-units` are overridden back to Cargo's defaults rather
+# than inherited: fat LTO plus a single codegen unit is a whole-program link
+# per artifact, and this job links 105+ integration-test executables, not one
+# CLI. Inheriting them took the required Release job from 7m10s to 17m5s
+# (measured on PR #1959 vs #1960), which is the cost this profile exists to
+# avoid.
 [profile.release-ci]
 inherits = "release"
 opt-level = 1
+lto = false
+codegen-units = 16
