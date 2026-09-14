@@ -304,6 +304,17 @@ qpdfの `getDict`（`QPDFObjectHandle.cc:1257-1262`）に相当する
 `page_merge.rs`、`rotate.rs`、`page_split.rs`、`json_sections.rs`外のJSON/CLI
 caller等）は次の限定sliceで再計測する。
 
+2026-09-14（`flpdf-wkunn`）: `job/json_sections.rs` の pages section は、
+qpdf の `QPDFJob::doJSONPages` が使う
+`QPDFPageObjectHelper::getPageContents` / `QPDFObjectHandle::getPageContents`
+へ接続した。旧 `collect_content_refs` は削除し、返された canonical stream
+handle を既存の non-dereferencing JSON serializer へ渡すことで、
+`arrayOrStreamToStreamArray` の不正 `/Contents` warning と stream/array/null
+正規化を JSON 経路でも共有する。pinned qpdf 11.9.0 の
+`chained-indirect-contents.pdf` で warning、stdout、終了コードを比較する
+regression test を追加した（`QPDFObjectHandle.cc:1438-1493`、
+`QPDFJob.cc:1030-1077`）。
+
 ### A6/A7/A8 page-object-helper residual cohort `flpdf-3yn9.48.23.1` (2026-09-08)
 
 The bounded non-qtest `crates/flpdf/src/page_object_helper.rs` cutover now has

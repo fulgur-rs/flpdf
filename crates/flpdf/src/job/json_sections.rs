@@ -13,71 +13,10 @@ use crate::json_inspect::{
 };
 use crate::object_handle::ObjectHandle;
 use crate::pipeline::Discard;
-use crate::{EmbeddedFileStream, FileSpec, ObjectRef, PageObjectHelper, Pdf};
+use crate::{EmbeddedFileStream, FileSpec, PageObjectHelper, Pdf};
 use std::io::{Read, Seek};
 
 // ── build_pages_section ───────────────────────────────────────────────────────
-
-/// Flatten a `/Contents` entry into a list of indirect-reference strings.
-/// Handles three forms:
-/// - an indirect reference handle → `["N M R"]`
-/// - an array of reference handles → each element as `"N M R"` (direct
-///   streams in the array are silently skipped — they carry no ref string)
-/// - a null handle or an absent key → `[]`
-///
-/// Direct inline Streams outside an array have no object number and are
-/// therefore skipped (spec-compliant PDFs use indirect refs for /Contents).
-/// Collect the page's `/Contents` references as `"N M R"` strings.
-///
-/// PDF allows `/Contents` in several shapes:
-///
-/// 1. A direct Stream (rare; no ref to emit, returns `[]`).
-/// 2. A `Reference` to a Stream → one entry.
-/// 3. A `Reference` to an Array (`/Contents 12 0 R` where `12 0 obj [4 0 R 5 0 R]`)
-///    → resolve the indirect array and recurse over its elements.
-/// 4. A direct `Array` of References → one entry per Reference element.
-///
-/// In every variant the function emits the *original* reference strings, not
-/// the wrapper array's ref number — that matches qpdf's `contents` output.
-pub(crate) fn collect_content_refs(
-    content_handle: &ObjectHandle,
-) -> Result<Vec<String>, ConvertError> {
-    fn ref_string(r: ObjectRef) -> String {
-        format!("{} {} R", r.number, r.generation)
-    }
-
-    // Direct array elements never get a further resolve pass here — only the
-    // top-level indirect case below unwraps one level of indirection, so a
-    // reference nested deeper inside an already-direct array is emitted as
-    // its own ref string rather than followed.
-    fn refs_in_direct_array(elems: &[ObjectHandle]) -> Vec<String> {
-        elems
-            .iter()
-            .filter_map(|e| e.object_ref().map(ref_string))
-            .collect()
-    }
-
-    if let Some(r) = content_handle.object_ref() {
-        // Resolve to see whether the indirect object is a Stream (in which
-        // case this ref itself is the content) or an Array of Stream refs
-        // (in which case its elements are the content).
-        content_handle.try_dereference()?;
-        if content_handle.as_stream_dict().is_some() {
-            return Ok(vec![ref_string(r)]);
-        }
-        return match content_handle.try_as_array()? {
-            Some(elems) => Ok(refs_in_direct_array(&elems)),
-            // /Contents pointing at anything else (Null, missing) → empty.
-            None => Ok(vec![]),
-        };
-    }
-
-    match content_handle.try_as_array()? {
-        Some(elems) => Ok(refs_in_direct_array(&elems)),
-        // Null, missing, or direct Stream — emit empty list.
-        None => Ok(vec![]),
-    }
-}
 
 fn image_to_json(
     name: &[u8],
@@ -256,16 +195,16 @@ pub(crate) fn build_pages_section_with_options<R: Read + Seek>(
         let pageposfrom1 = (idx as i64) + 1;
         let object_str = format!("{} {} R", page_ref.number, page_ref.generation);
 
-        // Resolve the page dict to extract /Contents.
-        let page_handle = pdf.get_object_handle(page_ref);
-        let page_dict = page_handle.try_as_dictionary()?.unwrap_or_default();
-        let contents_handle = page_dict.get(b"/Contents".as_slice());
-        let contents: Vec<Json> = match contents_handle {
-            Some(c) => collect_content_refs(c)?
+        // qpdf obtains page contents through QPDFPageObjectHelper::getPageContents,
+        // which also owns malformed /Contents warning delivery. Serialize each
+        // canonical stream handle without dereferencing it, matching qpdf's
+        // QPDFObjectHandle::getJSON(..., false) call.
+        let contents: Vec<Json> = {
+            let mut page = PageObjectHelper::new(page_ref, pdf);
+            page.get_page_contents()?
                 .into_iter()
-                .map(Json::make_string)
-                .collect(),
-            None => vec![],
+                .map(|stream| pdf_object_to_json_with_version(&stream, version))
+                .collect::<Result<Vec<_>, ConvertError>>()?
         };
 
         // qpdf emits a complete image descriptor for every direct image
@@ -1252,22 +1191,6 @@ mod tests {
                 "JSON section production must not use non-resolving {forbidden}"
             );
         }
-    }
-
-    #[test]
-    fn content_refs_resolve_an_indirect_array_without_resolving_children() {
-        let mut pdf = one_page_pdf();
-        let contents_ref = ObjectRef::new(99, 0);
-        let child_ref = ObjectRef::new(100, 0);
-        let child = pdf.get_object_handle(child_ref);
-        pdf.replace_object(contents_ref, ObjectHandle::array(vec![child]))
-            .expect("install indirect contents array");
-
-        let contents = pdf.get_object_handle(contents_ref);
-        assert_eq!(
-            collect_content_refs(&contents).expect("collect indirect contents"),
-            vec!["100 0 R"]
-        );
     }
 
     #[test]
