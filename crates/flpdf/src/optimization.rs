@@ -3,6 +3,7 @@
 pub(crate) mod inherited_attrs;
 
 use crate::parser::MAX_PARSE_DEPTH;
+use crate::qpdf_obj_gen::QpdfObjGen;
 use crate::{ObjectHandle, ObjectRef, Pdf};
 use std::collections::{BTreeMap, BTreeSet};
 use std::io::{Read, Seek};
@@ -111,6 +112,13 @@ impl CompactObjectUserSet {
 
 #[derive(Debug, Clone, Default)]
 pub(crate) struct Optimization {
+    /// Canonical qpdf object-user map.  The checked `ObjectRef` maps below are
+    /// projections for consumers whose API is limited to PDF `N G R` values;
+    /// all traversal and identity decisions start from this raw map.
+    raw_user_to_objects: BTreeMap<ObjectUser, BTreeSet<QpdfObjGen>>,
+    raw_object_to_users: BTreeMap<QpdfObjGen, CompactObjectUserSet>,
+    /// Checked projections of the raw maps.  A raw generation outside the
+    /// parser's indirect-reference range is intentionally absent here.
     user_to_objects: BTreeMap<ObjectUser, BTreeSet<ObjectRef>>,
     object_to_users: BTreeMap<ObjectRef, CompactObjectUserSet>,
     /// qpdf's Generate object-stream eligibility captured before optimization
@@ -140,6 +148,73 @@ impl Optimization {
         self.object_to_users
             .iter()
             .map(|(&object, users)| (object, users))
+    }
+
+    pub(crate) fn raw_objects_for(&self, user: &ObjectUser) -> &BTreeSet<QpdfObjGen> {
+        match self.raw_user_to_objects.get(user) {
+            Some(objects) => objects,
+            None => empty_qpdf_obj_gens(),
+        }
+    }
+
+    pub(crate) fn raw_users_for(&self, object: QpdfObjGen) -> &CompactObjectUserSet {
+        match self.raw_object_to_users.get(&object) {
+            Some(users) => users,
+            None => empty_object_users(),
+        }
+    }
+
+    pub(crate) fn raw_object_users(
+        &self,
+    ) -> impl Iterator<Item = (QpdfObjGen, &CompactObjectUserSet)> {
+        self.raw_object_to_users
+            .iter()
+            .map(|(&object, users)| (object, users))
+    }
+
+    pub(crate) fn raw_page_users(&self, object: QpdfObjGen) -> impl Iterator<Item = u32> + '_ {
+        self.raw_users_for(object)
+            .iter()
+            .filter_map(|user| match user {
+                ObjectUser::Page(page_number) => Some(*page_number),
+                _ => None,
+            })
+    }
+
+    pub(crate) fn raw_other_page_private_owner(&self, object: QpdfObjGen) -> Option<u32> {
+        let mut owner = None;
+        for user in self.raw_users_for(object).iter() {
+            match user {
+                ObjectUser::Page(page) if *page != 0 => {
+                    if owner.replace(*page).is_some() {
+                        return None;
+                    }
+                }
+                _ => return None,
+            }
+        }
+        owner
+    }
+
+    pub(crate) fn raw_thumbnail_objects(&self) -> BTreeSet<QpdfObjGen> {
+        self.raw_user_to_objects
+            .iter()
+            .filter_map(|(user, objects)| match user {
+                ObjectUser::Thumbnail(_) => Some(objects),
+                _ => None,
+            })
+            .flat_map(|objects| objects.iter().copied())
+            .collect()
+    }
+
+    pub(crate) fn raw_objects_for_root_key(&self, key: &[u8]) -> BTreeSet<QpdfObjGen> {
+        self.raw_objects_for(&ObjectUser::RootKey(key.to_vec()))
+            .clone()
+    }
+
+    pub(crate) fn raw_objects_for_trailer_key(&self, key: &[u8]) -> BTreeSet<QpdfObjGen> {
+        self.raw_objects_for(&ObjectUser::TrailerKey(key.to_vec()))
+            .clone()
     }
 
     pub(crate) fn set_generate_objstm_eligible(&mut self, eligible: Vec<ObjectRef>) {
@@ -207,12 +282,35 @@ impl Optimization {
             .clone()
     }
 
-    fn record(&mut self, user: ObjectUser, object: ObjectRef) {
-        self.user_to_objects
+    fn record_raw(&mut self, user: ObjectUser, object: QpdfObjGen) {
+        self.raw_user_to_objects
             .entry(user.clone())
             .or_default()
             .insert(object);
-        self.object_to_users.entry(object).or_default().insert(user);
+        self.raw_object_to_users
+            .entry(object)
+            .or_default()
+            .insert(user.clone());
+
+        // This is an explicit checked projection, not the identity store.  A
+        // raw generation such as 65536 has no ObjectRef representation and
+        // must remain available through the raw maps above.
+        if let Some(object_ref) = object.to_object_ref() {
+            self.user_to_objects
+                .entry(user.clone())
+                .or_default()
+                .insert(object_ref);
+            self.object_to_users
+                .entry(object_ref)
+                .or_default()
+                .insert(user);
+        }
+    }
+
+    fn record(&mut self, user: ObjectUser, object: ObjectRef) {
+        let object = QpdfObjGen::try_from_object_ref(object)
+            .expect("ObjectRef must fit qpdf's signed object-number range");
+        self.record_raw(user, object);
     }
 
     #[cfg(test)]
@@ -228,7 +326,7 @@ impl Optimization {
     ) -> crate::Result<Self>
     where
         R: Read + Seek,
-        F: FnMut(Option<ObjectRef>, &ObjectHandle) -> crate::Result<u8>,
+        F: FnMut(Option<QpdfObjGen>, &ObjectHandle) -> crate::Result<u8>,
     {
         let prepared = Self::prepare_pdf(pdf, allow_changes)?;
         let page_refs = prepared
@@ -274,13 +372,14 @@ impl Optimization {
             return;
         }
         let mut filtered = Self::default();
-        for (user, objects) in &self.user_to_objects {
+        for (user, objects) in &self.raw_user_to_objects {
             for &object in objects {
-                let target = object_stream_data
-                    .get(&object.number)
-                    .map(|&stream| ObjectRef::new(stream, 0))
+                let target = u32::try_from(object.get_obj())
+                    .ok()
+                    .and_then(|number| object_stream_data.get(&number).copied())
+                    .map(|stream| QpdfObjGen::new(stream as i32, 0))
                     .unwrap_or(object);
-                filtered.record(user.clone(), target);
+                filtered.record_raw(user.clone(), target);
             }
         }
         *self = filtered;
@@ -304,7 +403,7 @@ impl Optimization {
     ) -> crate::Result<Self>
     where
         R: Read + Seek,
-        F: FnMut(Option<ObjectRef>, &ObjectHandle) -> crate::Result<u8>,
+        F: FnMut(Option<QpdfObjGen>, &ObjectHandle) -> crate::Result<u8>,
     {
         let mut maps = Self::default();
 
@@ -352,7 +451,7 @@ impl Optimization {
         skip_stream_parameters: &mut F,
     ) -> crate::Result<()>
     where
-        F: FnMut(Option<ObjectRef>, &ObjectHandle) -> crate::Result<u8>,
+        F: FnMut(Option<QpdfObjGen>, &ObjectHandle) -> crate::Result<u8>,
     {
         let mut visited = BTreeSet::new();
         let mut stack = vec![Pending {
@@ -373,9 +472,9 @@ impl Optimization {
             pending.object.try_dereference()?;
             if pending.object.try_is_null()? {
                 if pending.via_array {
-                    if let Some(object_ref) = pending.object.object_ref() {
-                        if object_ref.number > 0 && visited.insert(object_ref) {
-                            self.record(pending.user, object_ref);
+                    if let Some(object_gen) = pending.object.qpdf_obj_gen() {
+                        if object_gen.get_obj() > 0 && visited.insert(object_gen) {
+                            self.record_raw(pending.user, object_gen);
                         }
                     }
                 }
@@ -385,11 +484,11 @@ impl Optimization {
             if is_page(&pending.object)? && !pending.top {
                 continue;
             }
-            if let Some(object_ref) = pending.object.object_ref() {
-                if !visited.insert(object_ref) {
+            if let Some(object_gen) = pending.object.qpdf_obj_gen() {
+                if !visited.insert(object_gen) {
                     continue;
                 }
-                self.record(pending.user.clone(), object_ref);
+                self.record_raw(pending.user.clone(), object_gen);
             }
             // The inline-depth guard counts only direct container nesting.
             // Crossing an indirect handle resets that count, matching the
@@ -415,7 +514,7 @@ impl Optimization {
 
             if let Some(stream_dict) = pending.object.as_stream_dict() {
                 let skip_level =
-                    skip_stream_parameters(pending.object.object_ref(), &pending.object)?;
+                    skip_stream_parameters(pending.object.qpdf_obj_gen(), &pending.object)?;
                 for key in stream_dict.try_get_keys()?.into_iter().rev() {
                     if (skip_level >= 1 && key == b"/Length")
                         || (skip_level >= 2
@@ -486,6 +585,11 @@ fn empty_object_refs() -> &'static BTreeSet<ObjectRef> {
     EMPTY.get_or_init(BTreeSet::new)
 }
 
+fn empty_qpdf_obj_gens() -> &'static BTreeSet<QpdfObjGen> {
+    static EMPTY: OnceLock<BTreeSet<QpdfObjGen>> = OnceLock::new();
+    EMPTY.get_or_init(BTreeSet::new)
+}
+
 fn empty_object_users() -> &'static CompactObjectUserSet {
     static EMPTY: OnceLock<CompactObjectUserSet> = OnceLock::new();
     EMPTY.get_or_init(CompactObjectUserSet::default)
@@ -496,7 +600,8 @@ mod tests {
     use super::{CompactObjectUserSet, ObjectUser, Optimization};
     use crate::object_handle::ObjectHandle;
     use crate::parser::MAX_PARSE_DEPTH;
-    use crate::{ObjectRef, Result};
+    use crate::qpdf_obj_gen::QpdfObjGen;
+    use crate::{ObjectRef, Pdf, Result};
     use std::collections::BTreeSet;
     use std::rc::Rc;
 
@@ -509,7 +614,7 @@ mod tests {
     }
 
     fn no_stream_parameter_skip(
-        _object_ref: Option<ObjectRef>,
+        _object_ref: Option<QpdfObjGen>,
         _handle: &ObjectHandle,
     ) -> Result<u8> {
         Ok(0)
@@ -583,6 +688,31 @@ mod tests {
             optimization.page_users(object).collect::<Vec<_>>(),
             vec![0, 2]
         );
+    }
+
+    #[test]
+    fn object_user_map_retains_a_projectionless_raw_generation() {
+        let mut pdf = Pdf::empty().expect("create raw identity owner");
+        let raw = pdf.get_object_handle_by_raw_identity(5, 65_536);
+        let root = ObjectHandle::array(vec![raw]);
+        let mut optimization = Optimization::default();
+
+        optimization
+            .update_object_maps(ObjectUser::Root, root, &mut no_stream_parameter_skip)
+            .expect("walk raw child");
+
+        let raw = QpdfObjGen::new(5, 65_536);
+        assert!(optimization
+            .raw_objects_for(&ObjectUser::Root)
+            .contains(&raw));
+        assert!(!optimization
+            .objects_for(&ObjectUser::Root)
+            .contains(&ObjectRef::new(5, 65_534)));
+        assert!(optimization
+            .raw_users_for(QpdfObjGen::new(99, 0))
+            .iter()
+            .next()
+            .is_none());
     }
 
     #[test]

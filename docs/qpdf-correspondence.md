@@ -1033,6 +1033,40 @@ header/body/xref/trailer の `/ID [` までを digest し、`write_deterministic
 この documentation slice は crate public API、CLI/qtest scope、または qpdf の object-graph
 ownership modelを変更しない。
 
+### Linearized raw ObjGen identity (`flpdf-474u8`, 2026-09-14)
+
+qpdf の linearization でも `QPDFWriter::Members::obj_renumber` は
+`std::map<QPDFObjGen, int>` のままであり、`enqueueObject` / `unparseChild` の全 pass が
+object number と generation の組を同じキーとして使う
+（`include/qpdf/QPDFWriter.hh:668-670`; `libqpdf/QPDFWriter.cc:1057-1157`）。
+`calculateLinearizationData` の part 分類・hint 用の page/object-user 関係も
+`QPDFObjGen` を保持し、`discardGeneration` は hint の object-number-only view を作る
+直前の限定された変換である（`libqpdf/QPDFWriter.cc:2510-2654,2858`）。
+
+flpdf は `optimization.rs` の正準 object-user/inverse map、linearization plan の private
+part view、`linearization/renumber.rs` の forward/reverse slot table を
+`QpdfObjGen` で保持する。`ObjectRef` の plan fields と既存 hint API は、PDF の `N G R`
+境界を要求する caller 用の checked projection に限定した。projection できない raw
+generation は sentinel identity に置き換えず、raw slot と `RenumberMap::new_for_raw` を
+通じて出力 generation-zero object number へ割り当てる。page/trailer/root-key の user
+分類と open-document/outline precedence は `QPDF_optimization.cc:57-118,264-381` および
+`QPDF_linearization.cc:963-1064,1173-1449` に合わせる。
+
+linearized の compact/QDF/stream/暗号化 serializer は、object、stream dictionary、
+trailer `/ID`、ObjStm member の全 child walk に raw map を渡す。したがって
+`5 65536 obj` のような header-only raw identity は dictionary に埋め込まれず、通常の
+indirect child と同じく output map の参照 token になる。Generate/Preserve の ObjStm
+再配置でも raw reverse table を同時に更新し、raw member 自体は gen-0 ObjStm eligibility
+へ投影しない。stale generation の removed set は writer 境界で一度だけ raw set にし、
+pass 1、hint、pass 2、ObjStm body が同じ借用 set を使う。`qpdf_obj_gen_map_from_object_ref_map`
+および `qpdf_obj_gen_set_from_object_ref_set` は、明示的に checked projection を受ける
+非-linearized/test adapter のみの責務として残る。
+
+`qpdf_obj_gen_header_tests.rs` は raw Catalog/page child、page-shared child、raw stream、
+ObjStm併用、encrypted linearized write を実出力で検証し、raw writer unit test は
+dictionary-key omission と array-position `null` を確認する。 pinned qpdf 11.9.0 の
+`--check-linearization` でもこれらの追加ケースは警告なしで通過する。
+
 ### ObjectHandle emission-time encryption surface (`flpdf-egzr.3.2.15`, 2026-08-15)
 
 qpdf の暗号化は Object tree を事前に書き換えない。`QPDFWriter.cc:842-847`

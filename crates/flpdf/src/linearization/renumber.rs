@@ -56,6 +56,7 @@
 //!   into Part 3 / first-page section) — that is a partition-level decision
 //!   for [`LinearizationPlan`].
 
+use crate::qpdf_obj_gen::QpdfObjGen;
 use crate::ObjectRef;
 
 use super::plan::LinearizationPlan;
@@ -85,8 +86,14 @@ pub struct RenumberMap {
     /// `new_number → original_ref`. Sentinels (number == 0) mark the two
     /// reserved slots (param dict, hint stream) and slot 0 (unused).
     by_new_number: Vec<ObjectRef>,
+    /// Raw source identity for each new object number.  The checked
+    /// `by_new_number` view stores the sentinel for a raw generation that has
+    /// no `ObjectRef` projection; this table is the canonical reverse index.
+    by_new_raw: Vec<QpdfObjGen>,
     /// `original_ref → new_ref`.
     by_original: BTreeMap<ObjectRef, ObjectRef>,
+    /// Raw source identity to output reference.
+    by_original_raw: BTreeMap<QpdfObjGen, ObjectRef>,
     /// Slot reserved for the linearization parameter dictionary (Part 1).
     /// The writer emits this object number on its `1 0 obj`-equivalent line
     /// when serialising Part 1.
@@ -102,6 +109,8 @@ const SENTINEL: ObjectRef = ObjectRef {
     number: 0,
     generation: 0,
 };
+
+const RAW_SENTINEL: QpdfObjGen = QpdfObjGen::new(0, 0);
 
 /// Insertion point for a second-half ObjStm container among plain objects.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -208,42 +217,163 @@ impl RenumberMap {
             + plan.part4_open_document_plain.len();
         let capacity = total_parts + 3; // slots 0, param dict, hint stream
 
-        let mut by_new_number: Vec<ObjectRef> = Vec::with_capacity(capacity);
+        let has_raw_plan = plan.raw.root.is_some()
+            || !plan.raw.part2_objects.is_empty()
+            || !plan.raw.part3_objects.is_empty()
+            || !plan.raw.part4_other_pages_private.is_empty()
+            || !plan.raw.part4_other_pages_shared.is_empty()
+            || !plan.raw.part4_rest.is_empty()
+            || !plan.raw.part4_open_document_plain.is_empty();
+        let raw_part2 = if has_raw_plan {
+            plan.raw.part2_objects.clone()
+        } else {
+            plan.part2_objects
+                .iter()
+                .filter_map(|object_ref| QpdfObjGen::try_from_object_ref(*object_ref).ok())
+                .collect()
+        };
+        let raw_part3 = if has_raw_plan {
+            plan.raw.part3_objects.clone()
+        } else {
+            plan.part3_objects
+                .iter()
+                .filter_map(|object_ref| QpdfObjGen::try_from_object_ref(*object_ref).ok())
+                .collect()
+        };
+        let raw_part4_private = if has_raw_plan {
+            plan.raw.part4_other_pages_private.clone()
+        } else {
+            plan.part4_other_pages_private
+                .iter()
+                .filter_map(|object_ref| QpdfObjGen::try_from_object_ref(*object_ref).ok())
+                .collect()
+        };
+        let raw_part4_shared = if has_raw_plan {
+            plan.raw.part4_other_pages_shared.clone()
+        } else {
+            plan.part4_other_pages_shared
+                .iter()
+                .filter_map(|object_ref| QpdfObjGen::try_from_object_ref(*object_ref).ok())
+                .collect()
+        };
+        let raw_part4_rest = if has_raw_plan {
+            plan.raw.part4_rest.clone()
+        } else {
+            plan.part4_rest
+                .iter()
+                .filter_map(|object_ref| QpdfObjGen::try_from_object_ref(*object_ref).ok())
+                .collect()
+        };
+        let raw_open_document = if has_raw_plan {
+            plan.raw.part4_open_document_plain.clone()
+        } else {
+            plan.part4_open_document_plain
+                .iter()
+                .filter_map(|object_ref| QpdfObjGen::try_from_object_ref(*object_ref).ok())
+                .collect()
+        };
+        let raw_part9_outline = if has_raw_plan {
+            plan.raw.part9_outline_objects.clone()
+        } else {
+            plan.part9_outline_objects
+                .iter()
+                .filter_map(|object_ref| QpdfObjGen::try_from_object_ref(*object_ref).ok())
+                .collect()
+        };
+        let raw_part6_outline = if has_raw_plan {
+            plan.raw.part6_outline_objects.clone()
+        } else {
+            plan.part6_outline_objects
+                .iter()
+                .filter_map(|object_ref| QpdfObjGen::try_from_object_ref(*object_ref).ok())
+                .collect()
+        };
+        let raw_part9_pages: BTreeSet<QpdfObjGen> = if has_raw_plan {
+            plan.optimization
+                .as_ref()
+                .map(|optimization| optimization.raw_objects_for_root_key(b"Pages"))
+                .filter(|pages| !pages.is_empty())
+                .unwrap_or_else(|| plan.raw.pages_tree.into_iter().collect())
+        } else {
+            plan.optimization
+                .as_ref()
+                .map(|optimization| {
+                    optimization
+                        .objects_for_root_key(b"Pages")
+                        .into_iter()
+                        .filter_map(|object_ref| QpdfObjGen::try_from_object_ref(object_ref).ok())
+                        .collect()
+                })
+                .filter(|pages: &BTreeSet<QpdfObjGen>| !pages.is_empty())
+                .unwrap_or_else(|| {
+                    plan.pages_tree_ref
+                        .and_then(|object_ref| QpdfObjGen::try_from_object_ref(object_ref).ok())
+                        .into_iter()
+                        .collect()
+                })
+        };
+
+        let raw_capacity = raw_part2.len()
+            + raw_part3.len()
+            + raw_part4_private.len()
+            + raw_part4_shared.len()
+            + raw_part9_outline.len()
+            + raw_part6_outline.len()
+            + raw_part4_rest.len()
+            + raw_open_document.len()
+            + 3;
+        let mut by_new_number: Vec<ObjectRef> = Vec::with_capacity(capacity.max(raw_capacity));
+        let mut by_new_raw: Vec<QpdfObjGen> = Vec::with_capacity(raw_capacity.max(capacity));
         let mut by_original: BTreeMap<ObjectRef, ObjectRef> = BTreeMap::new();
+        let mut by_original_raw: BTreeMap<QpdfObjGen, ObjectRef> = BTreeMap::new();
 
         // Slot 0: unused (PDF object numbers start at 1).
         by_new_number.push(SENTINEL);
+        by_new_raw.push(RAW_SENTINEL);
 
-        let push_real = |original: ObjectRef,
-                         by_new_number: &mut Vec<ObjectRef>,
-                         by_original: &mut BTreeMap<ObjectRef, ObjectRef>| {
-            let new_number = by_new_number.len() as u32;
-            let new_ref = ObjectRef::new(new_number, 0);
-            by_new_number.push(original);
-            assert!(
-                by_original.insert(original, new_ref).is_none(),
-                "duplicate original ObjectRef in LinearizationPlan: {original:?}"
-            );
-        };
+        let push_raw =
+            |original: QpdfObjGen,
+             by_new_number: &mut Vec<ObjectRef>,
+             by_new_raw: &mut Vec<QpdfObjGen>,
+             by_original: &mut BTreeMap<ObjectRef, ObjectRef>,
+             by_original_raw: &mut BTreeMap<QpdfObjGen, ObjectRef>| {
+                let new_number = by_new_number.len() as u32;
+                let new_ref = ObjectRef::new(new_number, 0);
+                by_new_number.push(original.to_object_ref().unwrap_or(SENTINEL));
+                by_new_raw.push(original);
+                assert!(
+                    by_original_raw.insert(original, new_ref).is_none(),
+                    "duplicate raw identity in LinearizationPlan: {original:?}"
+                );
+                if let Some(object_ref) = original.to_object_ref() {
+                    assert!(
+                        by_original.insert(object_ref, new_ref).is_none(),
+                        "duplicate original ObjectRef in LinearizationPlan: {object_ref:?}"
+                    );
+                }
+            };
 
         // Promotion targets (pages tree, info, catalog) must come from
         // part4_rest to avoid double-counting with part7/part8 objects.
-        let part4_rest_membership: BTreeSet<ObjectRef> = plan.part4_rest.iter().copied().collect();
-        let part9_pages: BTreeSet<ObjectRef> = plan
-            .optimization
-            .as_ref()
-            .map(|optimization| optimization.objects_for_root_key(b"Pages"))
-            .filter(|pages| !pages.is_empty())
-            .unwrap_or_else(|| plan.pages_tree_ref.into_iter().collect());
-        let promote = |slot_owner: Option<ObjectRef>,
-                       by_new_number: &mut Vec<ObjectRef>,
-                       by_original: &mut BTreeMap<ObjectRef, ObjectRef>| {
-            if let Some(r) = slot_owner {
-                if part4_rest_membership.contains(&r) && !by_original.contains_key(&r) {
-                    push_real(r, by_new_number, by_original);
-                }
-            }
+        let part4_rest_membership: BTreeSet<QpdfObjGen> = raw_part4_rest.iter().copied().collect();
+        let raw_root = if has_raw_plan {
+            plan.raw.root
+        } else {
+            plan.root_ref
+                .and_then(|object_ref| QpdfObjGen::try_from_object_ref(object_ref).ok())
         };
+        let promote =
+            |slot_owner: Option<QpdfObjGen>,
+             by_new_number: &mut Vec<ObjectRef>,
+             by_new_raw: &mut Vec<QpdfObjGen>,
+             by_original: &mut BTreeMap<ObjectRef, ObjectRef>,
+             by_original_raw: &mut BTreeMap<QpdfObjGen, ObjectRef>| {
+                if let Some(r) = slot_owner {
+                    if part4_rest_membership.contains(&r) && !by_original_raw.contains_key(&r) {
+                        push_raw(r, by_new_number, by_new_raw, by_original, by_original_raw);
+                    }
+                }
+            };
 
         // Second-half renumber order (qpdf slot assignment):
         //
@@ -262,13 +392,25 @@ impl RenumberMap {
         //  slot ..     part6 outline objects (classic, UseOutlines) — qpdf lc_outlines
 
         // 1. part7 (other pages' private) in plan order.
-        for &original in &plan.part4_other_pages_private {
-            push_real(original, &mut by_new_number, &mut by_original);
+        for &original in &raw_part4_private {
+            push_raw(
+                original,
+                &mut by_new_number,
+                &mut by_new_raw,
+                &mut by_original,
+                &mut by_original_raw,
+            );
         }
 
         // 2. part8 (other pages' shared) in plan order.
-        for &original in &plan.part4_other_pages_shared {
-            push_real(original, &mut by_new_number, &mut by_original);
+        for &original in &raw_part4_shared {
+            push_raw(
+                original,
+                &mut by_new_number,
+                &mut by_new_raw,
+                &mut by_original,
+                &mut by_original_raw,
+            );
         }
 
         // 3. pages_tree — the part9 head promotion from part4_rest. qpdf's
@@ -281,16 +423,28 @@ impl RenumberMap {
         // `for (auto const& og: lc_other)` over a std::set<QPDFObjGen>), so it flows
         // through the part4_rest loop below (step 3c) in original-object-number
         // order — behind any lc_other sibling with a lower object number.
-        for pages_tree in part9_pages {
-            promote(Some(pages_tree), &mut by_new_number, &mut by_original);
+        for pages_tree in raw_part9_pages {
+            promote(
+                Some(pages_tree),
+                &mut by_new_number,
+                &mut by_new_raw,
+                &mut by_original,
+                &mut by_original_raw,
+            );
         }
 
         // 3b. part9 outline objects (classic, !UseOutlines).
         // qpdf places lc_outlines after the pages tree / thumbnails and before the
         // remaining lc_other set (QPDF_linearization.cc:1331 then :1335), so they
         // precede the number-sorted part4_rest remainder (which includes /Info).
-        for &original in &plan.part9_outline_objects {
-            push_real(original, &mut by_new_number, &mut by_original);
+        for &original in &raw_part9_outline {
+            push_raw(
+                original,
+                &mut by_new_number,
+                &mut by_new_raw,
+                &mut by_original,
+                &mut by_original_raw,
+            );
         }
 
         // 3c. Remaining part4_rest objects go to the second half, after the pages
@@ -300,22 +454,35 @@ impl RenumberMap {
         // other lc_other sibling land here in original-object-number order.
         // root_ref (catalog) is excluded — it is a first-half standalone object
         // that gets its slot via the promote() call at step 6 below.
-        for &original in &plan.part4_rest {
-            if by_original.contains_key(&original) {
+        for &original in &raw_part4_rest {
+            if by_original_raw.contains_key(&original) {
                 continue; // already placed: pages_tree or outline objects
             }
-            if plan.root_ref == Some(original) {
+            if raw_root == Some(original) {
                 continue; // catalog stays first-half; promoted at step 6
             }
-            push_real(original, &mut by_new_number, &mut by_original);
+            push_raw(
+                original,
+                &mut by_new_number,
+                &mut by_new_raw,
+                &mut by_original,
+                &mut by_original_raw,
+            );
         }
 
         // 5. Param dict (reserved).
         let param_dict_slot = by_new_number.len() as u32;
         by_new_number.push(SENTINEL);
+        by_new_raw.push(RAW_SENTINEL);
 
         // 6. Catalog (promoted from part4_rest).
-        promote(plan.root_ref, &mut by_new_number, &mut by_original);
+        promote(
+            raw_root,
+            &mut by_new_number,
+            &mut by_new_raw,
+            &mut by_original,
+            &mut by_original_raw,
+        );
 
         // 6b. Open-document plain objects (qpdf part4 = lc_open_document).
         // In disable/preserve mode this is the FULL open-document set (every
@@ -326,34 +493,61 @@ impl RenumberMap {
         // and the OD ObjStm containers (generate) / hint stream (disable), so
         // they occupy object numbers immediately after the Catalog and before the
         // hint stream sentinel in every mode.
-        for &original in &plan.part4_open_document_plain {
-            push_real(original, &mut by_new_number, &mut by_original);
+        for &original in &raw_open_document {
+            push_raw(
+                original,
+                &mut by_new_number,
+                &mut by_new_raw,
+                &mut by_original,
+                &mut by_original_raw,
+            );
         }
 
         // 7. Hint stream (reserved).
         let hint_stream_slot = by_new_number.len() as u32;
         by_new_number.push(SENTINEL);
+        by_new_raw.push(RAW_SENTINEL);
 
         // 8. Part 2 in plan order.
-        for &original in &plan.part2_objects {
-            push_real(original, &mut by_new_number, &mut by_original);
+        for &original in &raw_part2 {
+            push_raw(
+                original,
+                &mut by_new_number,
+                &mut by_new_raw,
+                &mut by_original,
+                &mut by_original_raw,
+            );
         }
 
         // 9. Part 3 in plan order.
-        for &original in &plan.part3_objects {
-            push_real(original, &mut by_new_number, &mut by_original);
+        for &original in &raw_part3 {
+            push_raw(
+                original,
+                &mut by_new_number,
+                &mut by_new_raw,
+                &mut by_original,
+                &mut by_original_raw,
+            );
         }
 
         // 9b. part6 outline objects (classic, UseOutlines).
         // These go into the first-half section before /E, between Part 3 and
         // the hint stream, matching qpdf's lc_outlines (part6) order.
-        for &original in &plan.part6_outline_objects {
-            push_real(original, &mut by_new_number, &mut by_original);
+        for &original in &raw_part6_outline {
+            push_raw(
+                original,
+                &mut by_new_number,
+                &mut by_new_raw,
+                &mut by_original,
+                &mut by_original_raw,
+            );
         }
 
         Self {
             by_new_number,
+            by_new_raw,
             by_original,
+            by_original_raw,
             param_dict_slot,
             hint_stream_slot,
         }
@@ -367,6 +561,13 @@ impl RenumberMap {
     /// original was not part of the plan.
     pub fn new_for_original(&self, original: ObjectRef) -> Option<ObjectRef> {
         self.by_original.get(&original).copied()
+    }
+
+    /// Return the output reference assigned to qpdf's complete raw identity.
+    /// This is the canonical linearization lookup; `new_for_original` is only
+    /// its checked `ObjectRef` projection.
+    pub(crate) fn new_for_raw(&self, original: QpdfObjGen) -> Option<ObjectRef> {
+        self.by_original_raw.get(&original).copied()
     }
 
     // -----------------------------------------------------------------------
@@ -469,7 +670,13 @@ impl RenumberMap {
             "param_dict_slot must precede hint_stream_slot (from_plan invariant)"
         );
         self.by_new_number.insert(insert_at, SENTINEL);
+        self.by_new_raw.insert(insert_at, RAW_SENTINEL);
         for new_ref in self.by_original.values_mut() {
+            if new_ref.number as usize >= insert_at {
+                new_ref.number += 1;
+            }
+        }
+        for new_ref in self.by_original_raw.values_mut() {
             if new_ref.number as usize >= insert_at {
                 new_ref.number += 1;
             }
@@ -572,11 +779,20 @@ impl RenumberMap {
             return ObjStmRelocation::default();
         }
 
-        let member_set: BTreeSet<ObjectRef> = open_document_batches
+        let member_set: BTreeSet<QpdfObjGen> = open_document_batches
             .iter()
             .chain(first_half_batches)
             .chain(second_half_batches)
             .flat_map(|b| b.iter().copied())
+            .filter_map(|object_ref| QpdfObjGen::try_from_object_ref(object_ref).ok())
+            .collect();
+        let second_half_post_plain_raw: BTreeSet<QpdfObjGen> = second_half_post_plain
+            .iter()
+            .filter_map(|object_ref| QpdfObjGen::try_from_object_ref(*object_ref).ok())
+            .collect();
+        let first_half_post_plain_raw: BTreeSet<QpdfObjGen> = first_half_post_plain
+            .iter()
+            .filter_map(|object_ref| QpdfObjGen::try_from_object_ref(*object_ref).ok())
             .collect();
 
         // The half boundary in `from_plan`'s output: slots `1..old_param_slot`
@@ -593,12 +809,12 @@ impl RenumberMap {
         // /Pages tree and /Info are promoted to the second half by `from_plan`
         // but are first-half ObjStm members under the qpdf member set); they
         // are re-placed in their batch's half below.
-        let mut second_half_plain: Vec<ObjectRef> = Vec::new();
-        let mut first_half_plain: Vec<ObjectRef> = Vec::new();
+        let mut second_half_plain: Vec<QpdfObjGen> = Vec::new();
+        let mut first_half_plain: Vec<QpdfObjGen> = Vec::new();
         // Index into `first_half_plain` at which the hint sentinel belongs
         // (i.e. how many first-half plain objects precede it).
         let mut hint_index_in_first_half: u32 = 0;
-        for (old_idx, &original) in self.by_new_number.iter().enumerate().skip(1) {
+        for (old_idx, &original) in self.by_new_raw.iter().enumerate().skip(1) {
             let old_idx = old_idx as u32;
             if old_idx == old_param_slot {
                 // The param dict is the first-half head — handled explicitly
@@ -612,7 +828,7 @@ impl RenumberMap {
                 hint_index_in_first_half = first_half_plain.len() as u32;
                 continue;
             }
-            if original.number == 0 {
+            if original == RAW_SENTINEL {
                 // An unexpected sentinel (defence-in-depth) — drop it; it
                 // carries no object and the two real sentinels are handled
                 // above.
@@ -643,17 +859,28 @@ impl RenumberMap {
 
         // Helper: append a half's container slots (type-1) then member slots
         // (type-2), recording the container numbers in batch order.
-        let assert_member = |member: ObjectRef, by_original: &BTreeMap<ObjectRef, ObjectRef>| {
-            assert!(
-                by_original.contains_key(&member),
-                "place_objstm_members_per_half: member {member:?} not present in \
+        let assert_member =
+            |member: ObjectRef, by_original_raw: &BTreeMap<QpdfObjGen, ObjectRef>| {
+                let member = QpdfObjGen::try_from_object_ref(member)
+                    .expect("ObjStm members must fit qpdf's raw identity");
+                assert!(
+                    by_original_raw.contains_key(&member),
+                    "place_objstm_members_per_half: member {member:?} not present in \
                  RenumberMap (planner / renumber inconsistency)"
-            );
-        };
+                );
+            };
 
         // Rebuild the table in per-half compressed-last order.
         let mut new_by_new_number: Vec<ObjectRef> = Vec::with_capacity(self.by_new_number.len());
         new_by_new_number.push(SENTINEL); // slot 0
+        let mut new_by_new_raw: Vec<QpdfObjGen> = Vec::with_capacity(self.by_new_raw.len());
+        new_by_new_raw.push(RAW_SENTINEL); // slot 0
+
+        let push_original =
+            |original: QpdfObjGen, numbers: &mut Vec<ObjectRef>, raw: &mut Vec<QpdfObjGen>| {
+                numbers.push(original.to_object_ref().unwrap_or(SENTINEL));
+                raw.push(original);
+            };
 
         // --- Second half ---
         // (1)+(2) second-half non-members (type-1) with each ObjStm container
@@ -666,17 +893,19 @@ impl RenumberMap {
         //     plain object in the same part.
         let mut second_half_container_slot: Vec<Option<u32>> =
             vec![None; second_half_batches.len()];
-        let mut emit_container = |bi: usize, table: &mut Vec<ObjectRef>| {
-            if second_half_batches[bi].is_empty() || second_half_container_slot[bi].is_some() {
-                return;
-            }
-            let container_num = table.len() as u32;
-            table.push(SENTINEL); // container: a plain indirect, no original
-            second_half_container_slot[bi] = Some(container_num);
-        };
+        let mut emit_container =
+            |bi: usize, table: &mut Vec<ObjectRef>, raw_table: &mut Vec<QpdfObjGen>| {
+                if second_half_batches[bi].is_empty() || second_half_container_slot[bi].is_some() {
+                    return;
+                }
+                let container_num = table.len() as u32;
+                table.push(SENTINEL); // container: a plain indirect, no original
+                raw_table.push(RAW_SENTINEL);
+                second_half_container_slot[bi] = Some(container_num);
+            };
         for bi in 0..second_half_batches.len() {
             if second_half_anchors.get(bi) == Some(&SecondHalfContainerAnchor::BeforeFirst) {
-                emit_container(bi, &mut new_by_new_number);
+                emit_container(bi, &mut new_by_new_number, &mut new_by_new_raw);
             }
         }
         // Plain objects marked by `second_half_post_plain` belong to qpdf's
@@ -685,28 +914,33 @@ impl RenumberMap {
         // in that set: qpdf emits them in the Part-9 thumbnail phase before the
         // generated ObjStm containers. Partition second_half_plain into pre-
         // and post-container groups.
-        let mut post_container_plain: Vec<ObjectRef> = Vec::new();
+        let mut post_container_plain: Vec<QpdfObjGen> = Vec::new();
         for &original in &second_half_plain {
-            if second_half_post_plain.contains(&original) {
+            if second_half_post_plain_raw.contains(&original) {
                 post_container_plain.push(original);
                 continue;
             }
-            new_by_new_number.push(original);
+            push_original(original, &mut new_by_new_number, &mut new_by_new_raw);
             for bi in 0..second_half_batches.len() {
-                if second_half_anchors.get(bi) == Some(&SecondHalfContainerAnchor::After(original))
-                {
-                    emit_container(bi, &mut new_by_new_number);
+                let after_anchor = second_half_anchors.get(bi).and_then(|anchor| match anchor {
+                    SecondHalfContainerAnchor::After(object_ref) => {
+                        QpdfObjGen::try_from_object_ref(*object_ref).ok()
+                    }
+                    _ => None,
+                });
+                if after_anchor == Some(original) {
+                    emit_container(bi, &mut new_by_new_number, &mut new_by_new_raw);
                 }
             }
         }
         // Containers with no anchor (or whose anchor is a post-container object)
         // go after all pre-container plain objects, in batch order.
         for bi in 0..second_half_batches.len() {
-            emit_container(bi, &mut new_by_new_number);
+            emit_container(bi, &mut new_by_new_number, &mut new_by_new_raw);
         }
         // Post-container plain (part9 tail): after all containers.
         for &original in &post_container_plain {
-            new_by_new_number.push(original);
+            push_original(original, &mut new_by_new_number, &mut new_by_new_raw);
         }
         // Record container numbers in batch order (the writer maps batch ->
         // container by position).
@@ -723,11 +957,17 @@ impl RenumberMap {
         //     uncompressed object (plain + containers), before the members.
         let main_xref_slot = new_by_new_number.len() as u32;
         new_by_new_number.push(SENTINEL);
+        new_by_new_raw.push(RAW_SENTINEL);
         // (4) Part-4 ObjStm members, batch-ordered (type-2) — last of the half.
         for batch in second_half_batches {
             for &member in batch {
-                assert_member(member, &self.by_original);
-                new_by_new_number.push(member);
+                assert_member(member, &self.by_original_raw);
+                push_original(
+                    QpdfObjGen::try_from_object_ref(member)
+                        .expect("ObjStm members must fit qpdf's raw identity"),
+                    &mut new_by_new_number,
+                    &mut new_by_new_raw,
+                );
             }
         }
 
@@ -739,9 +979,11 @@ impl RenumberMap {
         // (5) linearization parameter dictionary (type-1, reserved).
         let new_param_slot = new_by_new_number.len() as u32;
         new_by_new_number.push(SENTINEL);
+        new_by_new_raw.push(RAW_SENTINEL);
         // (6) first-page (first-half) xref stream slot (type-1).
         let first_xref_slot = new_by_new_number.len() as u32;
         new_by_new_number.push(SENTINEL);
+        new_by_new_raw.push(RAW_SENTINEL);
         // Open-document (qpdf part4) ObjStm container slots, recorded as they
         // are emitted at the hint-insertion point below.
         let mut open_document_container_numbers: Vec<u32> =
@@ -754,7 +996,10 @@ impl RenumberMap {
         // open-document object with a larger source number.
         let mut next_open_document_batch = 0usize;
         let mut emit_open_document_containers_before =
-            |plain_source_number: Option<u32>, table: &mut Vec<ObjectRef>, nums: &mut Vec<u32>| {
+            |plain_source_number: Option<u32>,
+             table: &mut Vec<ObjectRef>,
+             raw_table: &mut Vec<QpdfObjGen>,
+             nums: &mut Vec<u32>| {
                 while next_open_document_batch < open_document_batches.len() {
                     let batch_index = next_open_document_batch;
                     if open_document_batches[batch_index].is_empty() {
@@ -776,6 +1021,7 @@ impl RenumberMap {
                     }
                     let container_num = table.len() as u32;
                     table.push(SENTINEL); // container: a plain indirect, no original
+                    raw_table.push(RAW_SENTINEL);
                     nums.push(container_num);
                     next_open_document_batch += 1;
                 }
@@ -793,7 +1039,7 @@ impl RenumberMap {
         // hint-index check still uses the un-filtered enumerate index because
         // `from_plan` always places these (part6 outline objects, step 9b) after
         // the hint slot, so collecting them here never shifts the hint position.
-        let mut first_half_post_container_plain: Vec<ObjectRef> = Vec::new();
+        let mut first_half_post_container_plain: Vec<QpdfObjGen> = Vec::new();
         let source_ordered_open_document = open_document_source_container_numbers
             .iter()
             .any(Option::is_some);
@@ -802,24 +1048,27 @@ impl RenumberMap {
                 emit_open_document_containers_before(
                     None,
                     &mut new_by_new_number,
+                    &mut new_by_new_raw,
                     &mut open_document_container_numbers,
                 );
                 open_document_emitted = true;
                 new_hint_slot = new_by_new_number.len() as u32;
                 new_by_new_number.push(SENTINEL);
+                new_by_new_raw.push(RAW_SENTINEL);
             }
             if source_ordered_open_document && i > 0 && (i as u32) < hint_index_in_first_half {
                 emit_open_document_containers_before(
-                    Some(original.number),
+                    Some(u32::try_from(original.get_obj()).unwrap_or(u32::MAX)),
                     &mut new_by_new_number,
+                    &mut new_by_new_raw,
                     &mut open_document_container_numbers,
                 );
             }
-            if first_half_post_plain.contains(&original) {
+            if first_half_post_plain_raw.contains(&original) {
                 first_half_post_container_plain.push(original);
                 continue;
             }
-            new_by_new_number.push(original);
+            push_original(original, &mut new_by_new_number, &mut new_by_new_raw);
         }
         // Hint sentinel sits after the last first-half plain object when its
         // recorded index equals the first-half length (e.g. nothing follows it).
@@ -834,11 +1083,13 @@ impl RenumberMap {
                 emit_open_document_containers_before(
                     None,
                     &mut new_by_new_number,
+                    &mut new_by_new_raw,
                     &mut open_document_container_numbers,
                 );
             }
             new_hint_slot = new_by_new_number.len() as u32;
             new_by_new_number.push(SENTINEL);
+            new_by_new_raw.push(RAW_SENTINEL);
         }
         // cov:ignore-end
         // (8) Part-3 (first-page) ObjStm containers, batch-ordered (type-1) —
@@ -849,6 +1100,7 @@ impl RenumberMap {
             }
             let container_num = new_by_new_number.len() as u32;
             new_by_new_number.push(SENTINEL); // container: a plain indirect, no original
+            new_by_new_raw.push(RAW_SENTINEL);
             first_half_container_numbers.push(container_num);
         }
         // (8b) First-half post-container plain objects (ineligible part6 outline
@@ -857,21 +1109,31 @@ impl RenumberMap {
         //      part6 ObjStm container (the first-half analogue of the second
         //      half's post-container plain pass).
         for &original in &first_half_post_container_plain {
-            new_by_new_number.push(original);
+            push_original(original, &mut new_by_new_number, &mut new_by_new_raw);
         }
         // (9) ObjStm members, batch-ordered (type-2) — last of all. qpdf numbers
         //     the part4 (open-document) members before the part6 (first-page)
         //     members (`vecs1 = {part4, part6}`), so emit open-document first.
         for batch in open_document_batches {
             for &member in batch {
-                assert_member(member, &self.by_original);
-                new_by_new_number.push(member);
+                assert_member(member, &self.by_original_raw);
+                push_original(
+                    QpdfObjGen::try_from_object_ref(member)
+                        .expect("ObjStm members must fit qpdf's raw identity"),
+                    &mut new_by_new_number,
+                    &mut new_by_new_raw,
+                );
             }
         }
         for batch in first_half_batches {
             for &member in batch {
-                assert_member(member, &self.by_original);
-                new_by_new_number.push(member);
+                assert_member(member, &self.by_original_raw);
+                push_original(
+                    QpdfObjGen::try_from_object_ref(member)
+                        .expect("ObjStm members must fit qpdf's raw identity"),
+                    &mut new_by_new_number,
+                    &mut new_by_new_raw,
+                );
             }
         }
 
@@ -883,19 +1145,30 @@ impl RenumberMap {
 
         // Rebuild the forward index from the placed table.
         let mut new_by_original: BTreeMap<ObjectRef, ObjectRef> = BTreeMap::new();
-        for (idx, &original) in new_by_new_number.iter().enumerate().skip(1) {
-            if original.number == 0 {
+        let mut new_by_original_raw: BTreeMap<QpdfObjGen, ObjectRef> = BTreeMap::new();
+        for (idx, &original) in new_by_new_raw.iter().enumerate().skip(1) {
+            if original == RAW_SENTINEL {
                 continue;
             }
-            let prev = new_by_original.insert(original, ObjectRef::new(idx as u32, 0));
+            let new_ref = ObjectRef::new(idx as u32, 0);
+            let prev = new_by_original_raw.insert(original, new_ref);
             assert!(
                 prev.is_none(),
                 "place_objstm_members_per_half: duplicate original {original:?} after placement"
             );
+            if let Some(object_ref) = original.to_object_ref() {
+                let prev = new_by_original.insert(object_ref, new_ref);
+                assert!(
+                    prev.is_none(),
+                    "place_objstm_members_per_half: duplicate original {object_ref:?} after placement"
+                );
+            }
         }
 
         self.by_new_number = new_by_new_number;
+        self.by_new_raw = new_by_new_raw;
         self.by_original = new_by_original;
+        self.by_original_raw = new_by_original_raw;
         self.param_dict_slot = new_param_slot;
         self.hint_stream_slot = new_hint_slot;
 
@@ -930,6 +1203,23 @@ impl RenumberMap {
                 }
             })
     }
+
+    /// Iterate over all non-sentinel raw source identities in output layout
+    /// order.  Unlike the checked projection, this includes generations such
+    /// as `65536` that cannot be written as source `ObjectRef` values.
+    #[allow(dead_code)]
+    pub(crate) fn iter_in_raw_layout_order(
+        &self,
+    ) -> impl Iterator<Item = (ObjectRef, QpdfObjGen)> + '_ {
+        self.by_new_raw
+            .iter()
+            .enumerate()
+            .skip(1)
+            .filter_map(|(new_number, &original)| {
+                (original != RAW_SENTINEL)
+                    .then_some((ObjectRef::new(new_number as u32, 0), original))
+            })
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -939,7 +1229,7 @@ impl RenumberMap {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::linearization::plan::{LinearizationPlan, PageHintEntry};
+    use crate::linearization::plan::{LinearizationPlan, PageHintEntry, RawLinearizationPlan};
 
     // -----------------------------------------------------------------------
     // Fixture helpers
@@ -999,6 +1289,43 @@ mod tests {
             root_ref: Some(ObjectRef::new(1, 0)),
             ..Default::default()
         }
+    }
+
+    #[test]
+    fn raw_generation_receives_a_real_linearization_slot_without_projection() {
+        let raw = QpdfObjGen::new(5, 65_536);
+        let plan = LinearizationPlan {
+            raw: RawLinearizationPlan {
+                part4_rest: vec![raw],
+                ..Default::default()
+            },
+            ..Default::default()
+        };
+
+        let renumber = RenumberMap::from_plan(&plan);
+
+        assert!(raw.to_object_ref().is_none());
+        let new_ref = renumber
+            .new_for_raw(raw)
+            .expect("raw identity must be in the linearization map");
+        assert_eq!(new_ref, ObjectRef::new(1, 0));
+        assert_eq!(renumber.original_for_new(new_ref), None);
+        assert_eq!(
+            renumber.iter_in_raw_layout_order().collect::<Vec<_>>(),
+            vec![(new_ref, raw)]
+        );
+    }
+
+    #[test]
+    fn renumber_assigned_raw_projects_a_legacy_object_ref_plan() {
+        let plan = single_page_plan();
+        let expected: BTreeSet<_> = plan
+            .renumber_assigned_refs()
+            .into_iter()
+            .map(|object_ref| QpdfObjGen::try_from_object_ref(object_ref).unwrap())
+            .collect();
+
+        assert_eq!(plan.renumber_assigned_raw(), expected);
     }
 
     // -----------------------------------------------------------------------

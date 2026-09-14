@@ -60,6 +60,7 @@ impl StreamDictionaryOptions {
 /// the removed handle-owned emission route. All implementations and callers
 /// live at the writer boundary, while the handle itself retains only graph
 /// identity, payload, and mutation responsibilities.
+#[allow(dead_code)]
 pub(crate) trait ObjectWriterEmission {
     fn write_object(&self, out: &mut OutputSink<'_>) -> Result<()>;
     #[cfg(test)]
@@ -100,6 +101,12 @@ pub(crate) trait ObjectWriterEmission {
         out: &mut OutputSink<'_>,
         map: &dyn Fn(ObjectRef) -> Result<ObjectRef>,
         removed_refs: &BTreeSet<ObjectRef>,
+    ) -> Result<()>;
+    fn write_object_with_qpdf_obj_gen_map_and_removed(
+        &self,
+        out: &mut OutputSink<'_>,
+        map: &dyn Fn(QpdfObjGen) -> Result<ObjectRef>,
+        removed_refs: &BTreeSet<QpdfObjGen>,
     ) -> Result<()>;
     #[cfg(test)]
     fn write_root_object_with_ref_map_and_removed(
@@ -436,6 +443,12 @@ pub(crate) trait ObjectWriterEmission {
         out: &mut OutputSink<'_>,
         map: &dyn Fn(ObjectRef) -> Result<ObjectRef>,
         removed_refs: &BTreeSet<ObjectRef>,
+    ) -> Result<()>;
+    fn write_id_value_with_qpdf_obj_gen_map(
+        &self,
+        out: &mut OutputSink<'_>,
+        map: &dyn Fn(QpdfObjGen) -> Result<ObjectRef>,
+        removed_refs: &BTreeSet<QpdfObjGen>,
     ) -> Result<()>;
 }
 
@@ -945,6 +958,15 @@ impl ObjectWriterEmission for ObjectHandle {
         let map = qpdf_obj_gen_map_from_object_ref_map(map);
         let removed_refs = qpdf_obj_gen_set_from_object_ref_set(removed_refs)?;
         unparse_object_walk_with_ref_map(self, out, &map, &removed_refs)
+    }
+
+    fn write_object_with_qpdf_obj_gen_map_and_removed(
+        &self,
+        out: &mut OutputSink<'_>,
+        map: &dyn Fn(QpdfObjGen) -> Result<ObjectRef>,
+        removed_refs: &BTreeSet<QpdfObjGen>,
+    ) -> Result<()> {
+        unparse_object_walk_with_ref_map(self, out, map, removed_refs)
     }
 
     /// Emit the root through qpdf's output-only `unparseObject` mutation.
@@ -1890,6 +1912,15 @@ impl ObjectWriterEmission for ObjectHandle {
         let map = qpdf_obj_gen_map_from_object_ref_map(map);
         let removed_refs = qpdf_obj_gen_set_from_object_ref_set(removed_refs)?;
         write_id_style_value_handle_with_ref_map(self, out, &map, &removed_refs)
+    }
+
+    fn write_id_value_with_qpdf_obj_gen_map(
+        &self,
+        out: &mut OutputSink<'_>,
+        map: &dyn Fn(QpdfObjGen) -> Result<ObjectRef>,
+        removed_refs: &BTreeSet<QpdfObjGen>,
+    ) -> Result<()> {
+        write_id_style_value_handle_with_ref_map(self, out, map, removed_refs)
     }
 }
 
@@ -5251,6 +5282,39 @@ mod tests {
         assert!(error
             .to_string()
             .contains("cannot be used by an ObjectRef map"));
+    }
+
+    #[test]
+    fn raw_object_writer_keeps_array_null_and_drops_removed_dictionary_key() -> Result<()> {
+        let mut pdf = Pdf::empty()?;
+        let kept = pdf.get_object_handle_by_raw_identity(6, 65_536);
+        kept.set_resolved(ObjectValue::Integer(7));
+        let removed = pdf.get_object_handle_by_raw_identity(5, 65_536);
+        let value = ObjectHandle::dictionary(vec![
+            (
+                b"/Array".to_vec(),
+                ObjectHandle::array(vec![removed.clone()]),
+            ),
+            (b"/Kept".to_vec(), kept.clone()),
+            (b"/Removed".to_vec(), removed.clone()),
+        ]);
+        let removed_refs = BTreeSet::from([QpdfObjGen::new(5, 65_536)]);
+        let mut output = Vec::new();
+
+        super::super::output::with_buffer_sink(&mut output, |out| {
+            ObjectWriterEmission::write_object_with_qpdf_obj_gen_map_and_removed(
+                &value,
+                out,
+                &|object_gen| {
+                    assert_eq!(object_gen, QpdfObjGen::new(6, 65_536));
+                    Ok(ObjectRef::new(7, 0))
+                },
+                &removed_refs,
+            )
+        })?;
+
+        assert_eq!(output, b"<< /Array [ null ] /Kept 7 0 R >>");
+        Ok(())
     }
 
     #[test]

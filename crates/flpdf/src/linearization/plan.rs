@@ -35,6 +35,7 @@ use crate::linearization::renumber::RenumberMap;
 use crate::object_handle::ObjectHandle;
 use crate::parser::MAX_PARSE_DEPTH;
 use crate::pdf::WriterObjectOrderKey;
+use crate::qpdf_obj_gen::QpdfObjGen;
 use crate::writer::object_streams::{
     compressible_objgens_qpdf_plan, eligibility_context, is_eligible_for_objstm_handle,
     ObjectStreamMode, PlannerConfig,
@@ -154,7 +155,7 @@ fn stream_has_indirect_parameter_edge(handle: &ObjectHandle) -> Result<bool> {
 /// report whether `/Filter` and `/DecodeParms` will be removed.
 fn stream_parameters_removed_for_linearization(
     handle: &ObjectHandle,
-    stream_ref: Option<ObjectRef>,
+    stream_ref: Option<QpdfObjGen>,
     options: &crate::writer::WriterOptions,
     content_normalize_refs: &BTreeSet<ObjectRef>,
 ) -> Result<bool> {
@@ -164,8 +165,9 @@ fn stream_parameters_removed_for_linearization(
     // for modified streams so the first body pass sees qpdf's already-consumed
     // filter. Unmodified streams use the linearized writer-policy probe below
     // to decide whether parameter edges disappear.
-    let normalize_content =
-        stream_ref.is_some_and(|object_ref| content_normalize_refs.contains(&object_ref));
+    let normalize_content = stream_ref
+        .and_then(QpdfObjGen::to_object_ref)
+        .is_some_and(|object_ref| content_normalize_refs.contains(&object_ref));
     if handle.is_data_modified() {
         crate::writer::plain::body::canonical_stream_filter_probe_for_linearization(
             handle,
@@ -729,6 +731,38 @@ fn compute_closure_with_stream_parameters<R: Read + Seek>(
 // LinearizationPlan
 // ---------------------------------------------------------------------------
 
+/// Raw identity backing for [`LinearizationPlan`].  The public plan fields
+/// below are checked `ObjectRef` projections; this is the writer-facing source
+/// of truth and therefore keeps object generations that cannot be represented
+/// by an indirect PDF reference.
+#[allow(dead_code)]
+#[derive(Debug, Clone, Default)]
+pub(crate) struct RawLinearizationPlan {
+    pub(crate) part2_objects: Vec<QpdfObjGen>,
+    pub(crate) part3_objects: Vec<QpdfObjGen>,
+    pub(crate) part4_other_pages_private: Vec<QpdfObjGen>,
+    pub(crate) part4_other_pages_shared: Vec<QpdfObjGen>,
+    pub(crate) part4_rest: Vec<QpdfObjGen>,
+    pub(crate) part4_open_document_plain: Vec<QpdfObjGen>,
+    pub(crate) root: Option<QpdfObjGen>,
+    pub(crate) pages_tree: Option<QpdfObjGen>,
+    pub(crate) info: Option<QpdfObjGen>,
+    pub(crate) per_page_private_objects: Vec<Vec<QpdfObjGen>>,
+    pub(crate) outline_first_page_members: Vec<QpdfObjGen>,
+    pub(crate) part9_outline_objects: Vec<QpdfObjGen>,
+    pub(crate) part6_outline_objects: Vec<QpdfObjGen>,
+    pub(crate) content_normalize_refs: BTreeSet<QpdfObjGen>,
+    pub(crate) removed_refs: BTreeSet<QpdfObjGen>,
+    pub(crate) shared_hints: Vec<RawSharedObjectHintEntry>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct RawSharedObjectHintEntry {
+    pub(crate) object: Option<QpdfObjGen>,
+    pub(crate) container: Option<u32>,
+    pub(crate) referencing_pages: Vec<u32>,
+}
+
 /// Partition of a PDF document's objects into the four linearization parts
 /// defined by ISO 32000-1 Annex F, together with the raw inputs for the
 /// page-offset and shared-object hint tables.
@@ -884,11 +918,13 @@ pub struct LinearizationPlan {
     /// and its real emission agree on whether content normalization
     /// applies, mirroring qpdf's single `m->normalized_streams` set shared
     /// between `willFilterStream` and emission (`QPDFWriter.cc:1277`).
+    #[allow(dead_code)]
     pub(crate) content_normalize_refs: BTreeSet<ObjectRef>,
 
     /// Live source generations that qpdf drops while planning generated or
     /// preserved object streams. References to these objects are rewritten as
     /// qpdf-null values even though the source xref entry itself is live.
+    #[allow(dead_code)]
     pub(crate) removed_refs: BTreeSet<ObjectRef>,
 
     /// Object-stream mode whose traversal and stale-generation rules produced
@@ -896,6 +932,292 @@ pub struct LinearizationPlan {
     /// [`WriterOptions`](crate::writer::WriterOptions) mode before using the plan's
     /// partitions and renumbering.
     pub(crate) object_stream_mode: crate::writer::ObjectStreamMode,
+
+    /// Raw qpdf identity plan consumed by linearization serialization.
+    pub(crate) raw: RawLinearizationPlan,
+}
+
+fn raw_refs_from_object_refs(refs: impl IntoIterator<Item = ObjectRef>) -> Vec<QpdfObjGen> {
+    refs.into_iter()
+        .filter_map(|object_ref| QpdfObjGen::try_from_object_ref(object_ref).ok())
+        .collect()
+}
+
+fn raw_refs_with_extras(
+    refs: impl IntoIterator<Item = ObjectRef>,
+    extras: impl IntoIterator<Item = QpdfObjGen>,
+    sort: bool,
+) -> Vec<QpdfObjGen> {
+    let extras: Vec<_> = extras.into_iter().collect();
+    let mut result = raw_refs_from_object_refs(refs);
+    result.extend(extras.iter().copied());
+    if sort && !extras.is_empty() {
+        result.sort_unstable();
+    }
+    result
+}
+
+fn raw_refs_with_extras_preserving_first(
+    refs: impl IntoIterator<Item = ObjectRef>,
+    extras: impl IntoIterator<Item = QpdfObjGen>,
+) -> Vec<QpdfObjGen> {
+    let mut result = raw_refs_from_object_refs(refs);
+    let first = result.first().copied();
+    let extras: Vec<_> = extras.into_iter().collect();
+    result.extend(extras.iter().copied());
+    if !extras.is_empty() && result.len() > 1 {
+        result[1..].sort_unstable();
+    }
+    if let Some(first) = first {
+        if let Some(position) = result.iter().position(|object| *object == first) {
+            result.remove(position);
+            result.insert(0, first);
+        }
+    } // cov:ignore: the first projected identity is inserted before the optional raw extras, so LLVM attributes this identity-preservation closing brace to an uncovered branch
+    result
+}
+
+#[allow(clippy::too_many_arguments)]
+fn build_raw_linearization_plan<R: Read + Seek>(
+    pdf: &mut Pdf<R>,
+    optimization: &crate::optimization::Optimization,
+    part2_objects: &[ObjectRef],
+    part3_objects: &[ObjectRef],
+    part4_other_pages_private: &[ObjectRef],
+    part4_other_pages_shared: &[ObjectRef],
+    part4_rest: &[ObjectRef],
+    part4_open_document_plain: &[ObjectRef],
+    per_page_private_objects: &[Vec<ObjectRef>],
+    outline_first_page_members: &[ObjectRef],
+    part9_outline_objects: &[ObjectRef],
+    part6_outline_objects: &[ObjectRef],
+    root_ref: Option<ObjectRef>,
+    pages_tree_ref: Option<ObjectRef>,
+    info_ref: Option<ObjectRef>,
+    content_normalize_refs: &BTreeSet<ObjectRef>,
+    removed_refs: &BTreeSet<ObjectRef>,
+    outlines_in_first_page: bool,
+) -> Result<RawLinearizationPlan> {
+    let raw_removed_refs: BTreeSet<QpdfObjGen> = removed_refs
+        .iter()
+        .filter_map(|object_ref| QpdfObjGen::try_from_object_ref(*object_ref).ok())
+        .collect();
+
+    let outline_refs = optimization.raw_objects_for_root_key(b"Outlines");
+    let open_document_refs: BTreeSet<QpdfObjGen> = optimization
+        .raw_objects_for_trailer_key(b"Encrypt")
+        .into_iter()
+        .chain(
+            OPEN_DOCUMENT_CATALOG_KEYS
+                .into_iter()
+                .flat_map(|key| optimization.raw_objects_for_root_key(key)),
+        )
+        .collect();
+    let thumbnail_refs = optimization.raw_thumbnail_objects();
+
+    let mut raw_part2_extra = Vec::new();
+    let mut raw_part3_extra = Vec::new();
+    let mut raw_part4_private_extra = Vec::new();
+    let mut raw_part4_shared_extra = Vec::new();
+    let mut raw_part4_rest_extra = Vec::new();
+    let mut raw_open_document_plain_extra = Vec::new();
+    let mut raw_private_by_page: BTreeMap<u32, Vec<QpdfObjGen>> = BTreeMap::new();
+
+    // `Optimization` has already traversed every qpdf user root.  Its raw
+    // inverse is therefore the authoritative reachable universe for source
+    // identities that have no checked `ObjectRef` projection.  Structural
+    // stream objects are writer-owned xref/ObjStm machinery, not body objects.
+    for (object_gen, users) in optimization.raw_object_users() {
+        if object_gen.to_object_ref().is_some()
+            || object_gen.get_obj() <= 0
+            || raw_removed_refs.contains(&object_gen)
+        {
+            continue;
+        }
+        let object =
+            pdf.get_object_handle_by_raw_identity(object_gen.get_obj(), object_gen.get_gen());
+        // cov:ignore-start: linearization object-user maps do not admit writer-owned structural streams as raw body identities
+        if object.try_is_stream_of_type(b"XRef", b"")?
+            || object.try_is_stream_of_type(b"ObjStm", b"")?
+        {
+            continue;
+        }
+        // cov:ignore-end
+
+        let page_users: Vec<u32> = optimization.raw_page_users(object_gen).collect();
+        let in_first_page = page_users.contains(&0);
+        let in_other_page = page_users.iter().any(|page| *page != 0);
+        let in_outline = outline_refs.contains(&object_gen);
+        let in_open_document = open_document_refs.contains(&object_gen);
+        let in_document_other = users.iter().any(is_document_other_user);
+        let in_thumbnail = thumbnail_refs.contains(&object_gen);
+
+        if in_outline {
+            raw_part4_rest_extra.push(object_gen);
+        } else if in_open_document {
+            // Raw generations cannot cross the ObjStm member boundary, so the
+            // open-document raw object always remains a plain object before
+            // the hint stream.
+            raw_open_document_plain_extra.push(object_gen);
+        } else if in_first_page {
+            if in_other_page || in_document_other || in_thumbnail {
+                raw_part3_extra.push(object_gen);
+            } else {
+                raw_part2_extra.push(object_gen);
+            }
+        } else if let Some(page) = optimization.raw_other_page_private_owner(object_gen) {
+            raw_part4_private_extra.push(object_gen);
+            raw_private_by_page
+                .entry(page)
+                .or_default()
+                .push(object_gen);
+        } else if page_users.len() >= 2 {
+            raw_part4_shared_extra.push(object_gen);
+        } else {
+            raw_part4_rest_extra.push(object_gen);
+        }
+    }
+
+    raw_part4_private_extra.sort_unstable();
+    raw_part4_shared_extra.sort_unstable();
+    raw_part4_rest_extra.sort_unstable();
+    raw_open_document_plain_extra.sort_unstable();
+
+    let mut raw_per_page_private_objects = per_page_private_objects
+        .iter()
+        .map(|objects| raw_refs_from_object_refs(objects.iter().copied()))
+        .collect::<Vec<_>>();
+    for (page, objects) in raw_private_by_page {
+        if let Some(destination) = raw_per_page_private_objects.get_mut(page as usize) {
+            destination.extend(objects);
+        }
+    }
+
+    let raw_part6_outline_extra: Vec<_> = if outlines_in_first_page {
+        raw_part4_rest_extra
+            .iter()
+            .copied()
+            .filter(|object_gen| outline_refs.contains(object_gen))
+            .collect()
+    } else {
+        Vec::new()
+    };
+    let raw_part9_outline_extra: Vec<_> = if outlines_in_first_page {
+        Vec::new()
+    } else {
+        raw_part4_rest_extra
+            .iter()
+            .copied()
+            .filter(|object_gen| outline_refs.contains(object_gen))
+            .collect()
+    };
+    raw_part4_rest_extra.retain(|object_gen| !outline_refs.contains(object_gen));
+
+    let raw_shared_hints = raw_part2_objects_for_hints(
+        &raw_refs_with_extras_preserving_first(
+            part2_objects.iter().copied(),
+            raw_part2_extra.clone(),
+        ),
+        &raw_refs_with_extras(part3_objects.iter().copied(), raw_part3_extra.clone(), true),
+        &raw_refs_with_extras(
+            part6_outline_objects.iter().copied(),
+            raw_part6_outline_extra.clone(),
+            true,
+        ),
+        &raw_refs_with_extras(
+            part4_other_pages_shared.iter().copied(),
+            raw_part4_shared_extra.clone(),
+            true,
+        ),
+        optimization,
+    );
+
+    Ok(RawLinearizationPlan {
+        part2_objects: raw_refs_with_extras_preserving_first(
+            part2_objects.iter().copied(),
+            raw_part2_extra,
+        ),
+        part3_objects: raw_refs_with_extras(part3_objects.iter().copied(), raw_part3_extra, true),
+        part4_other_pages_private: raw_refs_with_extras(
+            part4_other_pages_private.iter().copied(),
+            raw_part4_private_extra,
+            false,
+        ),
+        part4_other_pages_shared: raw_refs_with_extras(
+            part4_other_pages_shared.iter().copied(),
+            raw_part4_shared_extra,
+            true,
+        ),
+        part4_rest: raw_refs_with_extras(part4_rest.iter().copied(), raw_part4_rest_extra, true),
+        part4_open_document_plain: raw_refs_with_extras(
+            part4_open_document_plain.iter().copied(),
+            raw_open_document_plain_extra,
+            true,
+        ),
+        root: root_ref.and_then(|object_ref| QpdfObjGen::try_from_object_ref(object_ref).ok()),
+        pages_tree: pages_tree_ref
+            .and_then(|object_ref| QpdfObjGen::try_from_object_ref(object_ref).ok()),
+        info: info_ref.and_then(|object_ref| QpdfObjGen::try_from_object_ref(object_ref).ok()),
+        per_page_private_objects: raw_per_page_private_objects,
+        outline_first_page_members: raw_refs_with_extras(
+            outline_first_page_members.iter().copied(),
+            raw_part6_outline_extra.clone(),
+            true,
+        ),
+        part9_outline_objects: raw_refs_with_extras(
+            part9_outline_objects.iter().copied(),
+            raw_part9_outline_extra,
+            true,
+        ),
+        part6_outline_objects: raw_refs_with_extras(
+            part6_outline_objects.iter().copied(),
+            raw_part6_outline_extra,
+            true,
+        ),
+        content_normalize_refs: content_normalize_refs
+            .iter()
+            .filter_map(|object_ref| QpdfObjGen::try_from_object_ref(*object_ref).ok())
+            .collect(),
+        removed_refs: raw_removed_refs,
+        shared_hints: raw_shared_hints,
+    })
+}
+
+fn raw_shared_hints_for_objects(
+    objects: &[QpdfObjGen],
+    optimization: &crate::optimization::Optimization,
+    include_first_page: bool,
+) -> Vec<RawSharedObjectHintEntry> {
+    objects
+        .iter()
+        .copied()
+        .map(|object| RawSharedObjectHintEntry {
+            object: Some(object),
+            container: None,
+            referencing_pages: optimization
+                .raw_page_users(object)
+                .filter(|page| include_first_page || *page != 0)
+                .collect(),
+        })
+        .collect()
+}
+
+fn raw_part2_objects_for_hints(
+    part2: &[QpdfObjGen],
+    part3: &[QpdfObjGen],
+    outline: &[QpdfObjGen],
+    part4_shared: &[QpdfObjGen],
+    optimization: &crate::optimization::Optimization,
+) -> Vec<RawSharedObjectHintEntry> {
+    let mut entries = raw_shared_hints_for_objects(part2, optimization, false);
+    entries.extend(raw_shared_hints_for_objects(part3, optimization, false));
+    entries.extend(raw_shared_hints_for_objects(outline, optimization, false));
+    entries.extend(raw_shared_hints_for_objects(
+        part4_shared,
+        optimization,
+        true,
+    ));
+    entries
 }
 
 impl LinearizationPlan {
@@ -998,7 +1320,8 @@ impl LinearizationPlan {
         // redundant with that traversal rather than compensating for a real
         // gap in it.
         let content_normalize_refs = linearization_content_normalize_refs(pdf, options)?;
-        let mut skipped_stream_parameter_streams = BTreeSet::new();
+        let mut skipped_stream_parameter_streams: BTreeSet<ObjectRef> = BTreeSet::new();
+        let mut skipped_raw_stream_parameter_streams: BTreeSet<QpdfObjGen> = BTreeSet::new();
         let mut optimization = crate::optimization::Optimization::optimize(
             pdf,
             &BTreeMap::new(),
@@ -1008,8 +1331,8 @@ impl LinearizationPlan {
                 // reachable from a page, trailer key, or root key. Keep the
                 // stream-parameter probe inside that callback so an orphaned
                 // stream cannot make linearization read its source data.
-                if stream_ref.is_some_and(|object_ref| {
-                    skipped_stream_parameter_streams.contains(&object_ref)
+                if stream_ref.is_some_and(|object_gen| {
+                    skipped_raw_stream_parameter_streams.contains(&object_gen)
                 }) {
                     // A stream can be visited by more than one object user.
                     // Preserve the old prepass's one-probe state boundary:
@@ -1036,13 +1359,17 @@ impl LinearizationPlan {
                         stream,
                         options,
                         stream_ref
+                            .and_then(QpdfObjGen::to_object_ref)
                             .is_some_and(|object_ref| content_normalize_refs.contains(&object_ref)),
                     )? // cov:ignore: LLVM attributes this covered reachable-stream branch continuation to the call opening line
                 };
                 if refiltered {
                     if has_indirect_parameter {
-                        if let Some(object_ref) = stream_ref {
-                            skipped_stream_parameter_streams.insert(object_ref);
+                        if let Some(object_gen) = stream_ref {
+                            skipped_raw_stream_parameter_streams.insert(object_gen);
+                            if let Some(object_ref) = object_gen.to_object_ref() {
+                                skipped_stream_parameter_streams.insert(object_ref);
+                            }
                         }
                     }
                     // The probe above already consumed qpdf's stateful filter
@@ -1730,6 +2057,42 @@ impl LinearizationPlan {
             vec![]
         };
 
+        let raw = build_raw_linearization_plan(
+            pdf,
+            &optimization,
+            &part2_objects,
+            &part3_objects,
+            &part4_other_pages_private,
+            &part4_other_pages_shared,
+            &part4_rest,
+            &part4_open_document_plain,
+            &per_page_private_objects,
+            &outline_first_page_members,
+            &part9_outline_objects,
+            &part6_outline_objects,
+            root_ref,
+            pages_tree_ref,
+            info_ref,
+            &content_normalize_refs,
+            &removed_refs,
+            outlines_in_first_page,
+        )?; // cov:ignore: the raw plan builder consumes this qpdf outline-routing predicate; LLVM attributes the continuation to the call terminator
+
+        // Object counts are scalar hint inputs rather than source identities,
+        // so they may include raw-only objects even though the public object
+        // vectors are checked projections. Keep the public hint record
+        // accurate for both the classic and ObjStm-folded page-offset paths.
+        if let Some(first_hint) = page_hints.first_mut() {
+            first_hint.object_count = (raw.part2_objects.len()
+                + raw.part3_objects.len()
+                + raw.part6_outline_objects.len()) as u32;
+        }
+        for (page_index, hint) in page_hints.iter_mut().enumerate().skip(1) {
+            if let Some(private) = raw.per_page_private_objects.get(page_index) {
+                hint.object_count = private.len().max(1) as u32;
+            }
+        }
+
         let part2_entries = part2_objects.iter().map(|&obj_ref| SharedObjectHintEntry {
             object_ref: obj_ref,
             referencing_pages: vec![],
@@ -1801,6 +2164,7 @@ impl LinearizationPlan {
             removed_refs,
             optimization: Some(optimization),
             content_normalize_refs,
+            raw,
         })
     }
 
@@ -2183,6 +2547,150 @@ impl LinearizationPlan {
         out
     }
 
+    /// Return the shared-hint inputs without narrowing raw source identities.
+    /// The public `canonical_shared_hints` view remains available to callers
+    /// that expose `SharedObjectHintEntry`; linearization hint encoders use
+    /// this raw view so a first-page or Part-8 object with generation 65536 is
+    /// still counted and looked up through `RenumberMap::new_for_raw`.
+    pub(crate) fn canonical_raw_shared_hints(
+        &self,
+        member_to_container: &BTreeMap<ObjectRef, (u32, u32)>,
+        renumber: &RenumberMap,
+        second_half_container_nums: &BTreeSet<u32>,
+        open_document_container_nums: &BTreeSet<u32>,
+    ) -> Vec<RawSharedObjectHintEntry> {
+        let has_raw_plan = self.has_raw_projection_gap();
+        if member_to_container.is_empty() {
+            if has_raw_plan {
+                return self.raw.shared_hints.clone();
+            }
+            return self
+                .shared_hints
+                .iter()
+                .filter_map(|entry| {
+                    QpdfObjGen::try_from_object_ref(entry.object_ref)
+                        .ok()
+                        .map(|object| RawSharedObjectHintEntry {
+                            object: Some(object),
+                            container: None,
+                            referencing_pages: entry.referencing_pages.clone(),
+                        })
+                })
+                .collect();
+        }
+
+        let public = self.canonical_shared_hints(
+            member_to_container,
+            renumber,
+            second_half_container_nums,
+            open_document_container_nums,
+        );
+        let mut result: Vec<RawSharedObjectHintEntry> = public
+            .into_iter()
+            .filter_map(|entry| {
+                if entry.object_ref.generation == u16::MAX {
+                    Some(RawSharedObjectHintEntry {
+                        object: None,
+                        container: Some(entry.object_ref.number),
+                        referencing_pages: entry.referencing_pages,
+                    })
+                } else {
+                    QpdfObjGen::try_from_object_ref(entry.object_ref)
+                        .ok()
+                        .map(|object| RawSharedObjectHintEntry {
+                            object: Some(object),
+                            container: None,
+                            referencing_pages: entry.referencing_pages,
+                        })
+                }
+            })
+            .collect();
+        if !has_raw_plan {
+            return result;
+        }
+
+        let first_page_input = self.part2_objects.len()
+            + self.part3_objects.len()
+            + self.outline_first_page_members.len();
+        let mut first_page_count = 0usize;
+        let mut folded_containers = BTreeSet::new();
+        for entry in self.shared_hints.iter().take(first_page_input) {
+            if let Some(&(container_num, _)) = member_to_container.get(&entry.object_ref) {
+                if open_document_container_nums.contains(&container_num)
+                    || second_half_container_nums.contains(&container_num)
+                {
+                    continue; // cov:ignore: raw-only additions cannot be ObjStm members; this is the projected-container exclusion guard
+                }
+                if folded_containers.insert(container_num) {
+                    first_page_count += 1;
+                }
+            } else {
+                first_page_count += 1;
+            }
+        }
+
+        let first_page_raw: BTreeSet<QpdfObjGen> = self
+            .raw
+            .part2_objects
+            .iter()
+            .chain(&self.raw.part3_objects)
+            .chain(&self.raw.part6_outline_objects)
+            .filter(|object| object.to_object_ref().is_none())
+            .copied()
+            .collect();
+        let part8_raw: BTreeSet<QpdfObjGen> = self
+            .raw
+            .part4_other_pages_shared
+            .iter()
+            .filter(|object| object.to_object_ref().is_none())
+            .copied()
+            .collect();
+        let mut first_extra = Vec::new();
+        let mut part8_extra = Vec::new();
+        for entry in &self.raw.shared_hints {
+            let Some(object) = entry.object else {
+                continue; // cov:ignore: raw shared-hint records contain source identities only; synthetic containers come from the public folded view
+            };
+            if first_page_raw.contains(&object) {
+                first_extra.push(entry.clone());
+            } else if part8_raw.contains(&object) {
+                part8_extra.push(entry.clone());
+            }
+        }
+        let raw_number = |entry: &RawSharedObjectHintEntry| {
+            entry.container.unwrap_or_else(|| {
+                entry
+                    .object
+                    .and_then(|object| renumber.new_for_raw(object))
+                    .map_or(u32::MAX, |object_ref| object_ref.number)
+            })
+        };
+        first_extra.sort_unstable_by_key(&raw_number);
+        let first_extra_count = first_extra.len();
+        result.splice(first_page_count..first_page_count, first_extra);
+        result[..first_page_count + first_extra_count].sort_unstable_by_key(&raw_number);
+        // `result` already has the canonical first-page/Part-8 split; the
+        // insertion above only changes its first-page prefix. Keep the suffix
+        // order stable and sort the explicit raw Part-8 entries by output
+        // number after the existing canonical suffix.
+        result.extend(part8_extra);
+        result
+    }
+
+    pub(crate) fn has_raw_projection_gap(&self) -> bool {
+        self.raw
+            .part2_objects
+            .iter()
+            .chain(&self.raw.part3_objects)
+            .chain(&self.raw.part4_other_pages_private)
+            .chain(&self.raw.part4_other_pages_shared)
+            .chain(&self.raw.part4_rest)
+            .chain(&self.raw.part4_open_document_plain)
+            .chain(&self.raw.part6_outline_objects)
+            .chain(&self.raw.part9_outline_objects)
+            .any(|object_gen| object_gen.to_object_ref().is_none())
+    }
+
     /// Useful for callers that want to verify the disjoint invariant.
     /// Uses the three fine-grained Part-4 sub-partitions as the canonical
     /// source of truth.
@@ -2243,6 +2751,39 @@ impl LinearizationPlan {
             .collect()
     }
 
+    /// Raw source identities that receive linearization slots.  This is the
+    /// generation-preserving counterpart to `renumber_assigned_refs`; the
+    /// latter intentionally remains a checked projection for ObjStm planner
+    /// APIs that can only accept valid PDF references.
+    pub(crate) fn renumber_assigned_raw(&self) -> BTreeSet<QpdfObjGen> {
+        let has_raw_plan = self.raw.root.is_some()
+            || !self.raw.part2_objects.is_empty()
+            || !self.raw.part3_objects.is_empty()
+            || !self.raw.part4_other_pages_private.is_empty()
+            || !self.raw.part4_other_pages_shared.is_empty()
+            || !self.raw.part4_rest.is_empty()
+            || !self.raw.part4_open_document_plain.is_empty();
+        if has_raw_plan {
+            self.raw
+                .part2_objects
+                .iter()
+                .chain(&self.raw.part3_objects)
+                .chain(&self.raw.part4_other_pages_private)
+                .chain(&self.raw.part4_other_pages_shared)
+                .chain(&self.raw.part4_rest)
+                .chain(&self.raw.part6_outline_objects)
+                .chain(&self.raw.part9_outline_objects)
+                .chain(&self.raw.part4_open_document_plain)
+                .copied()
+                .collect()
+        } else {
+            self.renumber_assigned_refs()
+                .into_iter()
+                .filter_map(|object_ref| QpdfObjGen::try_from_object_ref(object_ref).ok())
+                .collect()
+        }
+    }
+
     /// Return `true` if every object appears in **at most** one part.
     /// Uses the three fine-grained Part-4 sub-partitions as the canonical
     /// source of truth.
@@ -2298,6 +2839,7 @@ impl Default for LinearizationPlan {
             removed_refs: BTreeSet::new(),
             object_stream_mode: crate::writer::ObjectStreamMode::Disable,
             content_normalize_refs: BTreeSet::new(),
+            raw: RawLinearizationPlan::default(),
         }
     }
 }
