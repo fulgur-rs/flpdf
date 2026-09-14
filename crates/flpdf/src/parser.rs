@@ -313,11 +313,17 @@ impl<'input, I: LiveInput> LiveTokenSource<'input, I> {
                 // cov:ignore-end
             }
 
-            if let Some(pushed) = self.tokenizer.get_integer()? {
+            if let Some(pushed) = self.tokenizer.get_integer() {
+                // Settle the delimiter unread and the last-token offset before
+                // raising a conversion failure. qpdf finishes both inside
+                // `QPDFTokenizer::nextToken` (`QPDFTokenizer.cc:961-968`) and
+                // only throws the `QUtil::string_to_ll` range error afterwards,
+                // from `QPDFParser::parse` (`QPDFParser.cc:87-88`), so a caught
+                // overflow leaves the input where the next read expects it.
                 let (start, end) = self.set_token_offsets(pushed.raw_len, pushed.unread)?;
                 self.last_offset = start;
                 return Ok(LiveToken::Integer {
-                    value: pushed.value,
+                    value: pushed.value?,
                     start,
                     end,
                 });
@@ -1544,6 +1550,38 @@ mod live_input_tests {
             tokens.next_live_token().expect("reference marker"),
             super::LiveToken::Owned(token)
                 if token.token_type == TokenType::Word && token.value == b"R"
+        ));
+    }
+
+    // An integer whose digits overflow `i64` must still leave the input where
+    // the next read expects it. qpdf unreads the delimiter and calls
+    // `setLastOffset` inside `QPDFTokenizer::nextToken`
+    // (`QPDFTokenizer.cc:961-968`), and only raises the `QUtil::string_to_ll`
+    // range error afterwards from `QPDFParser::parse` (`QPDFParser.cc:87-88`).
+    // `QPDF::resolve` catches it and resolves the object to null
+    // (`QPDF.cc:1737-1748`), so the bookkeeping has to already be settled.
+    #[test]
+    fn live_token_source_settles_input_bookkeeping_before_integer_overflow() {
+        let mut input = CountingInput::new(b"99999999999999999999 /A");
+        let mut tokens = LiveTokenSource::new(&mut input);
+
+        let error = tokens
+            .next_live_token()
+            .expect_err("overflowing integer conversion");
+        assert!(
+            matches!(&error, Error::System(message) if message
+                == "overflow/underflow converting 99999999999999999999 to 64-bit integer"),
+            "{error:?}"
+        );
+        assert_eq!(tokens.tell().unwrap(), 20);
+        assert_eq!(tokens.last_offset(), 0);
+
+        // The delimiter was unread rather than consumed, so the following name
+        // is still readable from the same source.
+        assert!(matches!(
+            tokens.next_live_token().expect("token after the failure"),
+            super::LiveToken::Owned(token)
+                if token.token_type == TokenType::Name && token.value == b"/A"
         ));
     }
 

@@ -166,7 +166,12 @@ pub(crate) struct PushedToken {
 /// result allocation-free; the general [`PushedToken`] path remains owned for
 /// consumers that need token bytes after the tokenizer is reset.
 pub(crate) struct PushedInteger {
-    pub(crate) value: i64,
+    /// Outcome of converting the raw digits, carried rather than raised so the
+    /// caller can settle the input bookkeeping first. `QPDFTokenizer::nextToken`
+    /// unreads the delimiter and calls `setLastOffset` before any conversion
+    /// runs (`QPDFTokenizer.cc:961-968`); the `QUtil::string_to_ll` range error
+    /// is thrown later, from `QPDFParser::parse` (`QPDFParser.cc:87-88`).
+    pub(crate) value: Result<i64>,
     pub(crate) raw_len: usize,
     pub(crate) unread: Option<u8>,
 }
@@ -340,9 +345,9 @@ impl<'a> Tokenizer<'a> {
     /// keeps the two integer candidates as numeric values and offsets while
     /// `QPDFTokenizer::nextToken` reuses `raw_val` on the next token
     /// (`QPDFParser.cc:140-175`, `QPDFTokenizer.cc:921-925`).
-    pub(crate) fn get_integer(&mut self) -> Result<Option<PushedInteger>> {
+    pub(crate) fn get_integer(&mut self) -> Option<PushedInteger> {
         if self.state != State::TokenReady || self.token_type != TokenType::Integer {
-            return Ok(None);
+            return None;
         }
 
         let raw_len = self.raw.len();
@@ -351,14 +356,12 @@ impl<'a> Tokenizer<'a> {
         } else {
             None
         };
-        let result = parse_integer_bytes(&self.raw, self.token_start);
+        let value = parse_integer_bytes(&self.raw, self.token_start);
         self.reset();
-        result.map(|value| {
-            Some(PushedInteger {
-                value,
-                raw_len,
-                unread,
-            })
+        Some(PushedInteger {
+            value,
+            raw_len,
+            unread,
         })
     }
 
