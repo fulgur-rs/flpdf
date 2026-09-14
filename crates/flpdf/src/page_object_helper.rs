@@ -1499,10 +1499,10 @@ impl<'a, R: Read + Seek> PageObjectHelper<'a, R> {
     /// qpdf's raw `getAttribute("/Rotate", false)` passthrough
     /// (`QPDFPageObjectHelper.cc:670`) -- normalization to
     /// `{0, 90, 180, 270}` only happens as part of a *mutation* via
-    /// [`crate::job::apply_rotate_to_pages`].
+    /// [`Self::rotate_page`].
     ///
-    /// This is a **getter** — it does not mutate the document. To rotate pages,
-    /// use [`crate::job::apply_rotate_to_pages`].
+    /// This is a **getter** — it does not mutate the document. To rotate this
+    /// page, use [`Self::rotate_page`].
     ///
     /// # Errors
     ///

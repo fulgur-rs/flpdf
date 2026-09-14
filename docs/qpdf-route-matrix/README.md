@@ -463,8 +463,8 @@ crates/flpdf/src/job/rotate.rs::flatten_rotation_on_pages: prod 3 (2 files) / te
     crates/flpdf-cli/src/main.rs 2, crates/flpdf/src/job/lifecycle.rs 1
 crates/flpdf/src/job/lifecycle.rs::apply_configured_rotations: prod 4 (1 files) / test 0
     crates/flpdf/src/job/lifecycle.rs 4
-crates/flpdf/src/job/rotate.rs::apply_rotate_to_pages: prod 0 (0 files) / test 16
-    test-only callers remain in crates/flpdf/src/job/rotate.rs
+crates/flpdf/src/job/rotate.rs::apply_rotate_to_pages: absent (prod 0 / test 0; removed by flpdf-v55s)
+    production and test callers removed after the CLI cutover
 crates/flpdf/src/job/rotate_spec.rs::parse_rotation_parameter: prod 3 (2 files) / test 11
     crates/flpdf-cli/src/main.rs 2, crates/flpdf/src/job/lifecycle.rs 1
 crates/flpdf/src/qutil.rs::parse_numrange: prod 4 (3 files) / test 24

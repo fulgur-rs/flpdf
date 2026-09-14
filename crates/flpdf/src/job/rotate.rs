@@ -1,18 +1,6 @@
 //! qpdf correspondence: QPDFJob.cc page rotation plus QPDFPageObjectHelper.cc matrix responsibilities.
 //! `/Rotate` manipulation for PDF pages.
 //!
-//! Applies rotation to a set of leaf `Page` objects in two modes:
-//!
-//! - **Assign** — replaces the existing `/Rotate` value (or the inherited one) with
-//!   the supplied angle.
-//! - **Add** — adds the supplied angle to the resolved (inherited) `/Rotate` value.
-//!
-//! All results are *normalized* to one of `{0, 90, 180, 270}` (modulo 360).
-//! Inheritance is resolved before writing: if a leaf page has no `/Rotate` entry of
-//! its own, the value is read from the first ancestor `Pages` node that carries one,
-//! and then the computed value is *materialized* (written explicitly on the leaf),
-//! so the leaf no longer depends on inheritance.
-//!
 //! ISO 32000-1 §7.7.3.4 lists `/Rotate` as an inheritable page attribute; its default
 //! when absent at every level is `0` (§7.7.3.3 Table 30).
 //!
@@ -29,96 +17,8 @@ use crate::page_object_helper::PageObjectHelper;
 use crate::page_object_helper::{
     resolve_inherited_rotate, resolve_inherited_rotate_with_max_depth,
 };
-use crate::{Error, ObjectRef, Pdf, Result};
+use crate::{ObjectRef, Pdf, Result};
 use std::io::{Read, Seek};
-
-// ---------------------------------------------------------------------------
-// Public types
-// ---------------------------------------------------------------------------
-
-/// Whether to replace or add to the existing `/Rotate` value.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum RotateMode {
-    /// Replace the (resolved, inherited) `/Rotate` with the supplied angle.
-    Assign,
-    /// Add the supplied angle to the (resolved, inherited) `/Rotate`.
-    Add,
-}
-
-/// A rotation operation: mode plus angle in degrees.
-///
-/// `degrees` must be a multiple of 90, matching qpdf's own `--rotate`
-/// parsing; [`apply_rotate_to_pages`] rejects any other value.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub struct RotateOp {
-    /// Whether this is an assignment or an additive rotation.
-    pub mode: RotateMode,
-    /// Angle in degrees, a multiple of 90 (positive = clockwise per PDF
-    /// convention). May be negative or exceed 360; the final `/Rotate` is
-    /// normalized to one of `{0, 90, 180, 270}`.
-    pub degrees: i32,
-}
-
-// ---------------------------------------------------------------------------
-// Main mutating entry point
-// ---------------------------------------------------------------------------
-
-/// Apply `op` to each `ObjectRef` in `pages`, materializing the resulting
-/// `/Rotate` explicitly on every leaf page dictionary.
-///
-/// Ports `QPDFPageObjectHelper::rotatePage`/`QPDFObjectHandle::rotatePage`
-/// (`libqpdf/QPDFPageObjectHelper.cc:468-470`,
-/// `libqpdf/QPDFObjectHandle.cc:1517-1546`): for an additive rotation, the
-/// existing `/Rotate` is read by walking `/Parent` on the live handle (an
-/// existing value that is not itself a multiple of 90 is treated as `0`,
-/// matching qpdf), and the combined angle is written directly on the leaf,
-/// so the leaf no longer depends on the parent's value. This walk has no
-/// depth bound — only cycle detection — matching qpdf's own unbounded
-/// `/Parent` walk in `rotatePage`.
-///
-/// # Errors
-///
-/// Returns [`Error::Unsupported`] if any of the supplied `ObjectRef`s does not
-/// resolve to a dictionary, or does not resolve to a leaf `/Page` object (e.g.
-/// it points at a `/Pages` tree node). Returns [`Error::System`] if
-/// `op.degrees` is not a multiple of 90.
-pub fn apply_rotate_to_pages<R: Read + Seek>(
-    pdf: &mut Pdf<R>,
-    pages: &[ObjectRef],
-    op: &RotateOp,
-) -> Result<()> {
-    for &page_ref in pages {
-        // qpdf's QPDFPageObjectHelper::rotatePage operates on the live handle,
-        // not a materialized Object snapshot. Dereference and validate the
-        // page through the same canonical handle before mutating it.
-        let page = pdf.get_object_handle(page_ref);
-        page.try_dereference()?;
-        if !page.try_is_dictionary()? {
-            return Err(Error::Unsupported(format!(
-                "object {page_ref} is not a dictionary, cannot set /Rotate"
-            )));
-        }
-
-        // Guard: only leaf `/Page` objects are valid targets. Writing /Rotate
-        // onto a `/Pages` tree node (or any non-Page dict) would change the
-        // inherited rotation of every descendant page, violating the
-        // per-leaf-page contract.
-        let page_type = page.try_get_key(b"/Type")?;
-        match page_type.try_as_name()? {
-            Some(name) if name.as_slice() == b"Page" => {}
-            _ => {
-                return Err(Error::Unsupported(format!(
-                    "object {page_ref} is not a leaf /Page (missing or non-/Page /Type), cannot set /Rotate"
-                )));
-            }
-        }
-
-        // `relative` selects qpdf's inherited-parent walk; both modes make
-        // the result explicit even when it is zero.
-        page.rotate_page(op.degrees, matches!(op.mode, RotateMode::Add))?;
-    }
-    Ok(())
-}
 
 // ---------------------------------------------------------------------------
 // Public API: flatten_rotation_on_pages
@@ -157,7 +57,7 @@ pub fn flatten_rotation_on_pages<R: Read + Seek>(
 mod tests {
     use super::*;
     use crate::writer::write_qpdf_to_memory;
-    use crate::{pages, ObjectHandle, PageBox, Pdf};
+    use crate::{pages, Error, ObjectHandle, PageBox, Pdf};
     use std::io::Cursor;
 
     fn handle_to_pagebox(obj: &ObjectHandle) -> Option<PageBox> {
@@ -205,6 +105,18 @@ mod tests {
         let rotate = page.try_get_key(b"/Rotate").unwrap();
         rotate.try_is_scalar().expect("/Rotate resolves");
         rotate.as_integer()
+    }
+
+    fn rotate_pages(
+        pdf: &mut Pdf<Cursor<Vec<u8>>>,
+        pages: &[ObjectRef],
+        degrees: i32,
+        relative: bool,
+    ) -> Result<()> {
+        for &page_ref in pages {
+            PageObjectHelper::new(page_ref, pdf).rotate_page(degrees, relative)?;
+        }
+        Ok(())
     }
 
     /// True when the page dictionary carries no `/Rotate` key at all.
@@ -423,19 +335,13 @@ mod tests {
     }
 
     // -----------------------------------------------------------------------
-    // apply_rotate_to_pages tests
-    // -----------------------------------------------------------------------
-
     #[test]
-    fn apply_rejects_a_non_multiple_angle_like_qpdf() {
+    fn rotate_page_rejects_a_non_multiple_angle_like_qpdf() {
         let bytes = build_single_page_pdf(None, None);
         let mut pdf = Pdf::open(Cursor::new(bytes)).unwrap();
-        let op = RotateOp {
-            mode: RotateMode::Assign,
-            degrees: 45,
-        };
 
-        let error = apply_rotate_to_pages(&mut pdf, &[ObjectRef::new(3, 0)], &op)
+        let error = PageObjectHelper::new(ObjectRef::new(3, 0), &mut pdf)
+            .rotate_page(45, false)
             .expect_err("qpdf rejects direct rotation angles that are not multiples of 90");
         assert!(matches!(
             error,
@@ -450,11 +356,7 @@ mod tests {
         let mut pdf = Pdf::open(Cursor::new(bytes)).unwrap();
         let page_ref = ObjectRef::new(3, 0);
 
-        let op = RotateOp {
-            mode: RotateMode::Assign,
-            degrees: 180,
-        };
-        apply_rotate_to_pages(&mut pdf, &[page_ref], &op).unwrap();
+        rotate_pages(&mut pdf, &[page_ref], 180, false).unwrap();
 
         // The leaf should now carry /Rotate 180 explicitly.
         assert_eq!(rotate_value(&mut pdf, page_ref), Some(180));
@@ -466,11 +368,7 @@ mod tests {
         let mut pdf = Pdf::open(Cursor::new(bytes)).unwrap();
         let page_ref = ObjectRef::new(3, 0);
 
-        let op = RotateOp {
-            mode: RotateMode::Add,
-            degrees: 90,
-        };
-        apply_rotate_to_pages(&mut pdf, &[page_ref], &op).unwrap();
+        rotate_pages(&mut pdf, &[page_ref], 90, true).unwrap();
 
         assert_eq!(rotate_value(&mut pdf, page_ref), Some(180));
     }
@@ -481,11 +379,7 @@ mod tests {
         let mut pdf = Pdf::open(Cursor::new(bytes)).unwrap();
         let page_ref = ObjectRef::new(3, 0);
 
-        let op = RotateOp {
-            mode: RotateMode::Add,
-            degrees: 90,
-        };
-        apply_rotate_to_pages(&mut pdf, &[page_ref], &op).unwrap();
+        rotate_pages(&mut pdf, &[page_ref], 90, true).unwrap();
 
         assert_eq!(rotate_value(&mut pdf, page_ref), Some(0));
     }
@@ -498,11 +392,7 @@ mod tests {
         let mut pdf = Pdf::open(Cursor::new(bytes)).unwrap();
         let page_ref = ObjectRef::new(3, 0);
 
-        let op = RotateOp {
-            mode: RotateMode::Add,
-            degrees: 90,
-        };
-        apply_rotate_to_pages(&mut pdf, &[page_ref], &op).unwrap();
+        rotate_pages(&mut pdf, &[page_ref], 90, true).unwrap();
 
         assert_eq!(rotate_value(&mut pdf, page_ref), Some(90));
     }
@@ -525,11 +415,7 @@ mod tests {
         page.replace_key(b"/Rotate", ObjectHandle::integer(2_147_483_700))
             .expect("page must be mutable");
 
-        let op = RotateOp {
-            mode: RotateMode::Add,
-            degrees: 90,
-        };
-        apply_rotate_to_pages(&mut pdf, &[page_ref], &op).unwrap();
+        rotate_pages(&mut pdf, &[page_ref], 90, true).unwrap();
 
         assert_eq!(rotate_value(&mut pdf, page_ref), Some(90));
     }
@@ -550,11 +436,7 @@ mod tests {
         page.replace_key(b"/Rotate", ObjectHandle::integer(-2_147_483_700))
             .expect("page must be mutable");
 
-        let op = RotateOp {
-            mode: RotateMode::Add,
-            degrees: 90,
-        };
-        apply_rotate_to_pages(&mut pdf, &[page_ref], &op).unwrap();
+        rotate_pages(&mut pdf, &[page_ref], 90, true).unwrap();
 
         assert_eq!(rotate_value(&mut pdf, page_ref), Some(90));
     }
@@ -575,11 +457,7 @@ mod tests {
         page.replace_key(b"/Rotate", ObjectHandle::integer(9_223_372_036_854_775_800))
             .expect("page must be mutable");
 
-        let op = RotateOp {
-            mode: RotateMode::Add,
-            degrees: 90,
-        };
-        apply_rotate_to_pages(&mut pdf, &[page_ref], &op).unwrap();
+        rotate_pages(&mut pdf, &[page_ref], 90, true).unwrap();
 
         assert_eq!(rotate_value(&mut pdf, page_ref), Some(90));
     }
@@ -592,11 +470,7 @@ mod tests {
         let mut pdf = Pdf::open(Cursor::new(bytes)).unwrap();
         let page_ref = ObjectRef::new(3, 0);
 
-        let op = RotateOp {
-            mode: RotateMode::Assign,
-            degrees: 180,
-        };
-        apply_rotate_to_pages(&mut pdf, &[page_ref], &op).unwrap();
+        rotate_pages(&mut pdf, &[page_ref], 180, false).unwrap();
 
         // The leaf itself must now carry /Rotate explicitly.
         assert_eq!(rotate_value(&mut pdf, page_ref), Some(180));
@@ -610,11 +484,7 @@ mod tests {
         let mut pdf = Pdf::open(Cursor::new(bytes)).unwrap();
         let page_ref = ObjectRef::new(3, 0);
 
-        let op = RotateOp {
-            mode: RotateMode::Add,
-            degrees: 90,
-        };
-        apply_rotate_to_pages(&mut pdf, &[page_ref], &op).unwrap();
+        rotate_pages(&mut pdf, &[page_ref], 90, true).unwrap();
 
         assert_eq!(rotate_value(&mut pdf, page_ref), Some(180));
     }
@@ -626,11 +496,7 @@ mod tests {
         let mut pdf = Pdf::open(Cursor::new(bytes)).unwrap();
         let page_ref = ObjectRef::new(3, 0);
 
-        let op = RotateOp {
-            mode: RotateMode::Assign,
-            degrees: 0,
-        };
-        apply_rotate_to_pages(&mut pdf, &[page_ref], &op).unwrap();
+        rotate_pages(&mut pdf, &[page_ref], 0, false).unwrap();
 
         assert_eq!(rotate_value(&mut pdf, page_ref), Some(0));
     }
@@ -640,59 +506,10 @@ mod tests {
         let bytes = build_single_page_pdf(Some(90), None);
         let mut pdf = Pdf::open(Cursor::new(bytes)).unwrap();
 
-        let op = RotateOp {
-            mode: RotateMode::Assign,
-            degrees: 270,
-        };
-        apply_rotate_to_pages(&mut pdf, &[], &op).unwrap();
+        rotate_pages(&mut pdf, &[], 270, false).unwrap();
 
         // Page should still be 90.
         assert_eq!(rotate_value(&mut pdf, ObjectRef::new(3, 0)), Some(90));
-    }
-
-    #[test]
-    fn rejects_pages_tree_node_target() {
-        // Passing the intermediate /Pages node (2 0 R) must error rather than
-        // silently writing /Rotate onto it (which would change inherited
-        // rotation for every descendant page).
-        let bytes = build_single_page_pdf(None, None);
-        let mut pdf = Pdf::open(Cursor::new(bytes)).unwrap();
-        let pages_ref = ObjectRef::new(2, 0);
-
-        let op = RotateOp {
-            mode: RotateMode::Assign,
-            degrees: 90,
-        };
-        let err = apply_rotate_to_pages(&mut pdf, &[pages_ref], &op).unwrap_err();
-        assert!(
-            matches!(err, Error::Unsupported(_)),
-            "expected Unsupported for /Pages node, got {err:?}"
-        );
-
-        // The /Pages node must remain untouched (no /Rotate written).
-        assert_eq!(
-            rotate_value(&mut pdf, pages_ref),
-            None,
-            "/Pages node must not gain /Rotate"
-        );
-    }
-
-    #[test]
-    fn rejects_an_unresolved_page_handle_without_panicking() {
-        let bytes = build_single_page_pdf(None, None);
-        let mut pdf = Pdf::open(Cursor::new(bytes)).unwrap();
-        let missing_page = ObjectRef::new(4096, 0);
-        let op = RotateOp {
-            mode: RotateMode::Assign,
-            degrees: 90,
-        };
-
-        let error = apply_rotate_to_pages(&mut pdf, &[missing_page], &op)
-            .expect_err("an unresolved page handle must be rejected");
-        assert!(
-            matches!(&error, Error::Unsupported(message) if message.contains("not a dictionary")),
-            "unexpected unresolved-page error: {error:?}"
-        );
     }
 
     // -----------------------------------------------------------------------
@@ -706,11 +523,7 @@ mod tests {
         let mut pdf = Pdf::open(Cursor::new(bytes)).unwrap();
         let page_ref = ObjectRef::new(3, 0);
 
-        let op = RotateOp {
-            mode: RotateMode::Assign,
-            degrees: 270,
-        };
-        apply_rotate_to_pages(&mut pdf, &[page_ref], &op).unwrap();
+        rotate_pages(&mut pdf, &[page_ref], 270, false).unwrap();
 
         // Serialize.
         let out = write_qpdf_to_memory(&mut pdf, |_| {}).unwrap();
@@ -736,11 +549,7 @@ mod tests {
         let page_refs_before = pages::page_refs(&mut pdf).unwrap();
         let page_ref = page_refs_before[0];
 
-        let op = RotateOp {
-            mode: RotateMode::Add,
-            degrees: 90,
-        };
-        apply_rotate_to_pages(&mut pdf, &[page_ref], &op).unwrap();
+        rotate_pages(&mut pdf, &[page_ref], 90, true).unwrap();
 
         // Serialize and re-open.
         let out = write_qpdf_to_memory(&mut pdf, |_| {}).unwrap();
@@ -820,11 +629,7 @@ mod tests {
         let page1 = ObjectRef::new(3, 0);
         let page2 = ObjectRef::new(4, 0);
 
-        let op = RotateOp {
-            mode: RotateMode::Add,
-            degrees: 90,
-        };
-        apply_rotate_to_pages(&mut pdf, &[page1, page2], &op).unwrap();
+        rotate_pages(&mut pdf, &[page1, page2], 90, true).unwrap();
 
         assert_eq!(rotate_value(&mut pdf, page1), Some(180), "page 1");
         assert_eq!(rotate_value(&mut pdf, page2), Some(90), "page 2");

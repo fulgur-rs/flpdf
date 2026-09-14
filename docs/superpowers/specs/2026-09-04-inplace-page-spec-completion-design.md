@@ -68,7 +68,7 @@ The helper returns the same `Result<()>` and uses the existing error/warning
 boundaries. Both `run_document_erased` and
 `run_page_extraction_after_plan` call it exactly once for `InPlace`. Both
 apply rotation only after this helper, using their existing configuration
-parsers and the shared `apply_rotate_to_pages` primitive. No callback-based
+parsers and the canonical `PageObjectHelper::rotate_page` route. No callback-based
 stage injection, proxy object, sentinel, or compatibility route is added.
 
 The core QPDFJob route continues directly from the shared helper to its
