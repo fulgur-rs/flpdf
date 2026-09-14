@@ -30,7 +30,9 @@ pub(crate) struct EligibilityContext {
 /// 2. `object` is a stream — streams cannot be embedded in ObjStm.
 /// 3. The object is a dictionary with `/Type /ObjStm` — no nested ObjStm.
 /// 4. The object is a dictionary with `/Type /XRef` — xref streams must be direct.
-/// 5. `object_ref` is the encryption dictionary reference.
+/// 5. The object is a signed signature dictionary with `/ByteRange` and
+///    `/Contents` — qpdf keeps signed values outside ObjStm.
+/// 6. `object_ref` is the encryption dictionary reference.
 pub(crate) fn is_eligible_for_objstm_handle(
     object_ref: ObjectRef,
     object: &ObjectHandle,
@@ -54,7 +56,14 @@ pub(crate) fn is_eligible_for_objstm_handle(
         return Ok(false);
     }
 
-    // 5. Encryption dictionary must not be embedded.
+    // 5. qpdf's getCompressibleObjGens excludes signed value dictionaries
+    // (QPDF.cc:2437-2443). Keep this in the shared predicate as well because
+    // linearization uses it to route non-member open-document objects.
+    if is_qpdf_signature_dict(object)? {
+        return Ok(false);
+    }
+
+    // 6. Encryption dictionary must not be embedded.
     if Some(object_ref) == ctx.encryption_ref {
         return Ok(false);
     }
@@ -321,6 +330,25 @@ trailer\n<< /Size 4 /Root 1 0 R >>\nstartxref\n0\n%%EOF\n";
         assert!(
             !super::is_qpdf_signature_dict(&signature).expect("signature eligibility"),
             "an indirect-null /Type must not satisfy qpdf's /Sig predicate"
+        );
+    }
+
+    #[test]
+    fn signed_signature_dictionary_is_not_objstm_eligible() {
+        let bytes = b"%PDF-1.5\n\
+1 0 obj\n<< /Type /Catalog /Sig 2 0 R >>\nendobj\n\
+2 0 obj\n<< /Type /Sig /ByteRange [0 1 2 3] /Contents <00> >>\nendobj\n\
+trailer\n<< /Size 3 /Root 1 0 R >>\nstartxref\n0\n%%EOF\n";
+        let mut pdf = Pdf::open(Cursor::new(bytes.as_slice())).expect("open signature fixture");
+        let signature_ref = ObjectRef::new(2, 0);
+        let signature = pdf.get_object_handle(signature_ref);
+        let ctx = super::EligibilityContext {
+            encryption_ref: None,
+        };
+        assert!(
+            !super::is_eligible_for_objstm_handle(signature_ref, &signature, &ctx)
+                .expect("signature eligibility"),
+            "a signed /Sig dictionary must stay outside an ObjStm"
         );
     }
 }

@@ -2963,6 +2963,23 @@ for stem in objstm-lin-od-indirect-length objstm-lin-od-indirect-length-flate \
     echo "$stem/linearize-classic.pdf"
 done
 
+# --- flpdf-d3eo9: signed AcroForm values stay plain in the open-document part ---
+# qpdf excludes signed value dictionaries from ObjStm membership, but their
+# /AcroForm object-user classification still places them before /O. Keep the
+# linearized Generate goldens beside the source fixtures so the library byte
+# gate covers every signature graph shape in the issue.
+for stem in acroform-sig-field-only acroform-sig-widget \
+            acroform-sig-nonterminal-parent acroform-sig-nonannotation-terminal \
+            acroform-sig-parent-pure-widget-kid acroform-sig-dss-shared \
+            acroform-sig-indirect-fields; do
+    mkdir -p "$REF/$stem"
+    qpdf --linearize --object-streams=generate --stream-data=uncompress \
+        --deterministic-id --warning-exit-0 \
+        "$FIX/$stem.pdf" "$REF/$stem/linearize-objstm.pdf"
+    qpdf --check-linearization "$REF/$stem/linearize-objstm.pdf"
+    echo "$stem/linearize-objstm.pdf"
+done
+
 # --- hn1g.15: qpdf --remove-restrictions == disableDigitalSignatures oracle ---
 for stem in perms-docmdp-one-page acroform-sig-field-only acroform-sig-widget \
             acroform-sig-nonterminal-parent acroform-sig-nonannotation-terminal \
