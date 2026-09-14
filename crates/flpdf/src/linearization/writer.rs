@@ -1920,7 +1920,7 @@ fn next_test_hint_stream_aes_iv(default: [u8; 16]) -> [u8; 16] {
 /// slot is reserved by inserting immediately before the (then-current) hint
 /// slot and shifting the latter by one (`RenumberMap::reserve_encrypt_dict_slot`)
 /// — so no self-skip check is needed here, unlike [`append_object`] and
-/// [`append_body_object`].
+/// [`append_body_object_with_raw_identity`].
 ///
 /// `hint_stream_aes_iv` is used only while constructing this one complete
 /// buffer. qpdf encrypts the hint stream once and replays the exact framed

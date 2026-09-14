@@ -141,11 +141,10 @@ fn matching_out_of_range_three_page_pdf() -> Vec<u8> {
     }
     // Rewrite the object headers for pages 4 and 5 in place while preserving
     // the explicit offsets used by the xref rows.
-    let mut page_number = 3u32;
-    for &offset in &page_offsets {
+    for (page_index, &offset) in page_offsets.iter().enumerate() {
+        let page_number = page_index as u32 + 3;
         let header = format!("{page_number} 0 obj\n");
         bytes[offset..offset + header.len()].copy_from_slice(header.as_bytes());
-        page_number += 1;
     }
     let object_offset = bytes.len();
     bytes.extend_from_slice(b"8 65536 obj\n45\nendobj\n");
