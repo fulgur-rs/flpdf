@@ -44,6 +44,16 @@ fn missing_root_fixture(directory: &Path) -> PathBuf {
     input
 }
 
+fn writer_open_error_detail() -> &'static str {
+    if cfg!(windows) {
+        // qpdf-ctest.c uses fopen_s/strerror_s on Windows; opening a
+        // directory reports the CRT's permission error there.
+        "Permission denied"
+    } else {
+        "Is a directory"
+    }
+}
+
 fn stream_pdf_without_trailing_payload_newline() -> Vec<u8> {
     let mut pdf = b"%PDF-1.3\n".to_vec();
     let mut offsets = vec![0usize];
@@ -313,7 +323,9 @@ fn qpdf_ctest_2_reports_writer_open_failure_through_the_c_api_error_surface() {
 
     assert!(result.status.success());
     let expected = format!(
-        "error: open {output_name}: Is a directory\n  code: 2\n  file: \n  pos: 0\n  text: open {output_name}: Is a directory\nC test 2 done\n"
+        "error: open {output_name}: {}\n  code: 2\n  file: \n  pos: 0\n  text: open {output_name}: {}\nC test 2 done\n",
+        writer_open_error_detail(),
+        writer_open_error_detail(),
     );
     assert_eq!(String::from_utf8_lossy(&result.stdout), expected);
     assert!(result.stderr.is_empty());
@@ -341,7 +353,9 @@ fn qpdf_ctest_2_replays_open_warnings_before_writer_open_failure() {
     let input_name = input.to_str().expect("input path is UTF-8");
     let output_name = output.to_str().expect("output path is UTF-8");
     let expected = format!(
-        "warning: {input_name}: file is damaged\n  code: 5\n  file: {input_name}\n  pos: 0\n  text: file is damaged\nwarning: {input_name}: can't find startxref\n  code: 5\n  file: {input_name}\n  pos: 0\n  text: can't find startxref\nwarning: {input_name}: Attempting to reconstruct cross-reference table\n  code: 5\n  file: {input_name}\n  pos: 0\n  text: Attempting to reconstruct cross-reference table\nerror: open {output_name}: Is a directory\n  code: 2\n  file: \n  pos: 0\n  text: open {output_name}: Is a directory\nC test 2 done\n"
+        "warning: {input_name}: file is damaged\n  code: 5\n  file: {input_name}\n  pos: 0\n  text: file is damaged\nwarning: {input_name}: can't find startxref\n  code: 5\n  file: {input_name}\n  pos: 0\n  text: can't find startxref\nwarning: {input_name}: Attempting to reconstruct cross-reference table\n  code: 5\n  file: {input_name}\n  pos: 0\n  text: Attempting to reconstruct cross-reference table\nerror: open {output_name}: {}\n  code: 2\n  file: \n  pos: 0\n  text: open {output_name}: {}\nC test 2 done\n",
+        writer_open_error_detail(),
+        writer_open_error_detail(),
     );
     assert_eq!(String::from_utf8_lossy(&result.stdout), expected);
     assert!(result.stderr.is_empty());
