@@ -29,7 +29,6 @@
 | `crates/flpdf/src/filespec_helper/filespec.rs` | correspondence | QPDFFileSpecObjectHelper.cc |
 | `crates/flpdf/src/filespec_helper/mod.rs` | correspondence | QPDFFileSpecObjectHelper.cc and QPDFEFStreamObjectHelper.cc |
 | `crates/flpdf/src/filespec_helper/shared.rs` | correspondence | shared QPDFFileSpecObjectHelper/QPDFEFStreamObjectHelper support primitives |
-| `crates/flpdf/src/filters.rs` | correspondence | QPDF_Stream filter-chain orchestration; QPDFStreamFilter dispatch, codec construction, and Pipeline execution are delegated to stream_filter |
 | `crates/flpdf/src/form_field_object_helper.rs` | correspondence | \`QPDFFormFieldObjectHelper.cc\` |
 | `crates/flpdf/src/form_field_object_helper/rendering.rs` | correspondence | \`QPDFFormFieldObjectHelper.cc\` rendering primitives |
 | `crates/flpdf/src/job/acroform_field_prune.rs` | correspondence | QPDFJob.cc removal of unreferenced form fields after page selection |
