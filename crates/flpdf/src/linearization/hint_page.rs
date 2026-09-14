@@ -295,18 +295,27 @@ pub(crate) fn non_page_owned_containers(
 ) -> std::collections::BTreeSet<u32> {
     use std::collections::{BTreeMap, BTreeSet};
 
-    let page_private_sets: Vec<BTreeSet<ObjectRef>> = plan
-        .per_page_private_objects
-        .iter()
-        .map(|v| v.iter().copied().collect())
-        .collect();
+    let page_private_owner = |member: ObjectRef| -> Option<usize> {
+        if let Some(optimization) = plan.optimization.as_ref() {
+            return optimization
+                .other_page_private_owner(member)
+                .map(|page| page as usize);
+        }
+        // Manually constructed plans have no canonical object-user map. Keep
+        // their fallback without materializing a production page-owner table.
+        plan.per_page_private_objects
+            .iter()
+            .enumerate()
+            .skip(1)
+            .find_map(|(page, members)| members.contains(&member).then_some(page))
+    };
 
     let mut container_pages: BTreeMap<u32, BTreeSet<usize>> = BTreeMap::new();
     let mut has_nonpage_member: BTreeSet<u32> = BTreeSet::new();
     let mut all_containers: BTreeSet<u32> = BTreeSet::new();
     for (member, &(cnum, _)) in member_to_container {
         all_containers.insert(cnum);
-        match (1..page_private_sets.len()).find(|&i| page_private_sets[i].contains(member)) {
+        match page_private_owner(*member) {
             Some(i) => {
                 container_pages.entry(cnum).or_default().insert(i);
             }

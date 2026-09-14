@@ -214,6 +214,46 @@ fn linearization_page_reach_uses_the_canonical_object_user_map() {
 }
 
 #[test]
+fn objstm_page_ownership_uses_the_canonical_object_user_map() {
+    let writer_source = production_source(
+        include_str!("../src/linearization/writer.rs"),
+        "\n#[cfg(test)]\nmod tests {",
+    );
+    let anchors = writer_source
+        .split_once("fn second_half_container_anchors")
+        .and_then(|(_, rest)| rest.split_once("fn write_linearized_impl"))
+        .map(|(section, _)| section)
+        .expect("second-half container anchor route exists");
+    assert!(
+        anchors.contains("part7_owner_for_plan"),
+        "part7 ObjStm ownership must use qpdf-shaped object-user ownership"
+    );
+    assert!(
+        writer_source.contains("other_page_private_owner"),
+        "the part7 owner helper must consult qpdf user gates"
+    );
+    assert!(
+        !anchors.contains("let page_private_sets: Vec<BTreeSet<ObjectRef>>"),
+        "writer must not materialize a second page-private ownership table"
+    );
+
+    let hint_source = include_str!("../src/linearization/hint_page.rs").replace("\r\n", "\n");
+    let container_filter = hint_source
+        .split_once("pub(crate) fn non_page_owned_containers")
+        .and_then(|(_, rest)| rest.split_once("/// Count the objects a page contributes"))
+        .map(|(section, _)| section)
+        .expect("page-owned container route exists");
+    assert!(
+        container_filter.contains("other_page_private_owner"),
+        "page-owned container filtering must use canonical object users"
+    );
+    assert!(
+        !container_filter.contains("let page_private_sets: Vec<BTreeSet<ObjectRef>>"),
+        "hint construction must not materialize a second page-private ownership table"
+    );
+}
+
+#[test]
 fn optimization_reverse_user_sets_use_compact_ordered_storage() {
     let source = include_str!("../src/optimization.rs").replace("\r\n", "\n");
     assert!(

@@ -169,6 +169,24 @@ impl Optimization {
         })
     }
 
+    /// Return the unique non-first page owner for qpdf's Part 7 predicate.
+    /// Any first-page, thumbnail, document-level, root, or second-page user
+    /// disqualifies the object from `lc_other_page_private`.
+    pub(crate) fn other_page_private_owner(&self, object: ObjectRef) -> Option<u32> {
+        let mut owner = None;
+        for user in self.users_for(object).iter() {
+            match user {
+                ObjectUser::Page(page) if *page != 0 => {
+                    if owner.replace(*page).is_some() {
+                        return None;
+                    }
+                }
+                _ => return None,
+            }
+        }
+        owner
+    }
+
     pub(crate) fn thumbnail_objects(&self) -> BTreeSet<ObjectRef> {
         self.user_to_objects
             .iter()
@@ -565,6 +583,31 @@ mod tests {
             optimization.page_users(object).collect::<Vec<_>>(),
             vec![0, 2]
         );
+    }
+
+    #[test]
+    fn other_page_private_owner_applies_qpdf_user_gates() {
+        let private = ObjectRef::new(8, 0);
+        let shared = ObjectRef::new(9, 0);
+        let first_page = ObjectRef::new(10, 0);
+        let thumbnail = ObjectRef::new(11, 0);
+        let document_other = ObjectRef::new(12, 0);
+        let mut optimization = Optimization::default();
+        optimization.record(ObjectUser::Page(2), private);
+        optimization.record(ObjectUser::Page(2), shared);
+        optimization.record(ObjectUser::Page(3), shared);
+        optimization.record(ObjectUser::Page(0), first_page);
+        optimization.record(ObjectUser::Page(2), first_page);
+        optimization.record(ObjectUser::Page(2), thumbnail);
+        optimization.record(ObjectUser::Thumbnail(1), thumbnail);
+        optimization.record(ObjectUser::Page(2), document_other);
+        optimization.record(ObjectUser::RootKey(b"Metadata".to_vec()), document_other);
+
+        assert_eq!(optimization.other_page_private_owner(private), Some(2));
+        assert_eq!(optimization.other_page_private_owner(shared), None);
+        assert_eq!(optimization.other_page_private_owner(first_page), None);
+        assert_eq!(optimization.other_page_private_owner(thumbnail), None);
+        assert_eq!(optimization.other_page_private_owner(document_other), None);
     }
 
     #[test]
