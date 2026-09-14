@@ -1236,6 +1236,71 @@ fn missing_input_prefixes_the_native_open_error() {
         .stderr(expected);
 }
 
+#[test]
+fn qtest_tree_and_mutation_cases_do_not_use_explicit_pdf_resolve() {
+    let tree_source = fs::read_to_string(concat!(
+        env!("CARGO_MANIFEST_DIR"),
+        "/src/driver/test_42_49.rs"
+    ))
+    .expect("read tree-driver source");
+    let mutation_source = fs::read_to_string(concat!(
+        env!("CARGO_MANIFEST_DIR"),
+        "/src/driver/test_88_98.rs"
+    ))
+    .expect("read mutation-driver source");
+
+    assert!(tree_source.contains("value.try_get_string_value()"));
+
+    fn section<'a>(source: &'a str, start: &str, end: &str) -> &'a str {
+        let start = source.find(start).expect("source section start");
+        let end = source[start..]
+            .find(end)
+            .map(|offset| start + offset)
+            .expect("source section end");
+        &source[start..end]
+    }
+
+    for (name, source, start, end) in [
+        (
+            "test 46",
+            tree_source.as_str(),
+            "pub(crate) fn run_test_46",
+            "pub(crate) fn run_test_47",
+        ),
+        (
+            "test 48",
+            tree_source.as_str(),
+            "pub(crate) fn run_test_48",
+            "pub(crate) fn run_test_49",
+        ),
+        (
+            "test 89",
+            mutation_source.as_str(),
+            "pub(crate) fn run_test_89",
+            "pub(crate) fn run_test_90",
+        ),
+    ] {
+        let body = section(source, start, end);
+        assert!(
+            !body.contains("pdf.resolve("),
+            "{name} retains the qpdf-less explicit Pdf::resolve bridge"
+        );
+    }
+
+    assert!(section(
+        tree_source.as_str(),
+        "pub(crate) fn run_test_48",
+        "pub(crate) fn run_test_49"
+    )
+    .contains("try_get_utf8_value"));
+    assert!(section(
+        mutation_source.as_str(),
+        "pub(crate) fn run_test_89",
+        "pub(crate) fn run_test_90"
+    )
+    .contains("replace_key"));
+}
+
 fn test_driver_fixture_dir() -> std::path::PathBuf {
     std::path::PathBuf::from(concat!(
         env!("CARGO_MANIFEST_DIR"),
