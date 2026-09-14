@@ -19,9 +19,9 @@ fn open() -> Pdf<std::io::Cursor<Vec<u8>>> {
     Pdf::open(std::io::Cursor::new(bytes)).expect("open")
 }
 
-/// Identities outside the `N G R` parser range, plus object number 0, which the
-/// public `ObjectRef` factory admits but `QpdfObjGen::to_object_ref` rejects.
-const UNPROJECTABLE: [(u32, u16); 2] = [(9, 65535), (0, 0)];
+/// Identities outside the `N G R` parser range, which the public `ObjectRef`
+/// factory admits but `QpdfObjGen::to_object_ref` rejects.
+const UNPROJECTABLE: [(u32, u16); 1] = [(9, 65535)];
 
 /// Identities the parser range does cover, as the control.
 const PROJECTABLE: [(u32, u16); 2] = [(7, 0), (5, 65534)];
@@ -72,4 +72,13 @@ fn swapping_objects_preserves_handle_identities() {
         assert_eq!(other.object_ref(), Some(other_ref));
         assert!(other.is_indirect());
     }
+}
+
+#[test]
+fn object_number_zero_is_not_an_indirect_object_handle_projection() {
+    let mut pdf = open();
+    let handle = pdf.get_object_handle(ObjectRef::new(0, 17));
+
+    assert!(!handle.is_indirect());
+    assert_eq!(handle.object_ref(), None);
 }

@@ -1694,18 +1694,24 @@ mod compressible_owner_tests {
         let zero = pdf.get_object_handle(ObjectRef::new(0, 0));
         let max_generation = pdf.get_object_handle(ObjectRef::new(1, u16::MAX));
 
+        assert!(!zero.is_indirect());
+        assert_eq!(zero.object_ref(), None);
+        assert!(max_generation.is_indirect());
+        assert_eq!(
+            max_generation.object_ref(),
+            Some(ObjectRef::new(1, u16::MAX)),
+            "the existing public ObjectRef projection remains for a raw indirect identity"
+        );
+        assert!(!pdf.canonical_object_refs().contains(&ObjectRef::new(0, 0)));
         assert!(!pdf
             .canonical_object_refs()
-            .contains(&zero.object_ref().unwrap()));
-        assert!(!pdf
-            .canonical_object_refs()
-            .contains(&max_generation.object_ref().unwrap()));
+            .contains(&ObjectRef::new(1, u16::MAX)));
         assert!(!pdf
             .canonical_live_object_refs()
-            .contains(&zero.object_ref().unwrap()));
+            .contains(&ObjectRef::new(0, 0)));
         assert!(!pdf
             .canonical_live_object_refs()
-            .contains(&max_generation.object_ref().unwrap()));
+            .contains(&ObjectRef::new(1, u16::MAX)));
     }
 
     #[test]

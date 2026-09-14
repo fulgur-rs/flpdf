@@ -1251,7 +1251,11 @@ impl SharedValueState {
     fn object_ref(&self) -> Option<ObjectRef> {
         self.qpdf_obj_gen()
             .and_then(QpdfObjGen::to_object_ref)
-            .or(self.identity.object_ref)
+            .or_else(|| {
+                self.identity
+                    .object_ref
+                    .filter(|object_ref| object_ref.number != 0)
+            })
     }
 
     fn get_description(&self) -> Vec<u8> {
@@ -1387,10 +1391,10 @@ impl ObjectSlot {
             .identity
             .qpdf_obj_gen
             .is_some_and(QpdfObjGen::is_indirect)
-            // Keep the pre-existing synthetic `ObjectRef(0, generation)`
-            // mutation surface isolated from parsed qpdf identities. Its
-            // invariant is tracked separately by flpdf-3sbf.
-            || shared.identity.object_ref.is_some()
+            || shared
+                .identity
+                .object_ref
+                .is_some_and(|object_ref| object_ref.number != 0)
     }
 
     fn active_pdf_unique_id(&self) -> Option<u64> {
@@ -2341,11 +2345,14 @@ impl ObjectHandle {
     ) -> Self {
         let mut identity = { self.0.borrow().shared.borrow().identity.clone() };
         // `to_object_ref` applies qpdf's `N G R` parser gate, so it is not the
-        // inverse of `from_object_ref`: an identity that entered through the
-        // Rust `ObjectRef` factory (which admits generation 65535 and object
-        // number 0) has no projection to fall back on. Keep the projection the
-        // handle already carried rather than dropping it.
-        identity.object_ref = object_gen.to_object_ref().or(identity.object_ref);
+        // inverse of `from_object_ref`: retain an existing nonzero public
+        // projection for a raw indirect identity such as generation 65535,
+        // while qpdf's non-indirect object number 0 must lose its projection.
+        identity.object_ref = object_gen.to_object_ref().or_else(|| {
+            identity
+                .object_ref
+                .filter(|object_ref| object_ref.number != 0)
+        });
         identity.qpdf_obj_gen = Some(object_gen);
         identity.active_pdf_unique_id = NonZeroU64::new(pdf_unique_id);
         identity.resolver = Some(resolver);
@@ -2722,6 +2729,12 @@ impl ObjectHandle {
             let Some(object_gen) = shared.qpdf_obj_gen() else {
                 return Ok(());
             };
+            if !object_gen.is_indirect() {
+                // qpdf reserves object number 0 for the raw xref/free identity;
+                // it is never an indirect ObjectHandle reference. Do not send
+                // a synthetic ObjectRef(0, generation) through the resolver.
+                return Ok(());
+            }
             if !matches!(&shared.value, ObjectValue::Unresolved) {
                 return Ok(());
             }
@@ -8757,6 +8770,24 @@ pub(crate) mod identity_tests {
         assert_eq!(handle.end_offsets(), (NO_PARSED_OFFSET, NO_PARSED_OFFSET));
         handle.set_end_offsets(12, 15);
         assert_eq!(handle.end_offsets(), (NO_PARSED_OFFSET, NO_PARSED_OFFSET));
+    }
+
+    #[test]
+    fn object_number_zero_does_not_drive_indirect_resolution() {
+        let calls: ResolutionLog = Rc::new(RefCell::new(Vec::new()));
+        let value = ObjectValue::Integer(7);
+        let resolver: Rc<dyn DocumentResolver> =
+            Rc::new(RecordingResolver::logging_into(Rc::clone(&calls), value));
+        let handle = ObjectHandle::new_indirect_with_resolver(
+            ObjectRef::new(0, 17),
+            Rc::downgrade(&resolver),
+        );
+
+        assert!(!handle.is_indirect());
+        assert_eq!(handle.object_ref(), None);
+        assert!(!handle.try_is_scalar().expect("direct object zero is inert"));
+        assert!(calls.borrow().is_empty());
+        assert!(!handle.is_resolved());
     }
 
     /// Resolves a stream value but intentionally has no byte source. This
