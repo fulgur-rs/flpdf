@@ -9,7 +9,10 @@
 use std::collections::BTreeMap;
 
 use super::encryption_state::WriterEncryptionState;
-use crate::{ObjectHandle, ObjectRef, Result};
+use crate::qpdf_obj_gen::QpdfObjGen;
+#[cfg(test)]
+use crate::ObjectRef;
+use crate::{ObjectHandle, Result};
 
 /// QDF fields read for the object currently being written.
 #[derive(Clone, Copy)]
@@ -20,7 +23,7 @@ pub(crate) struct QdfObjectInfo {
     /// Source ObjGen to display in the QDF provenance comment. A fresh merge
     /// target may have a different local reference from qpdf's in-place
     /// primary document; `None` falls back to the current object identity.
-    pub(crate) original_object_id: Option<ObjectRef>,
+    pub(crate) original_object_id: Option<QpdfObjGen>,
 }
 
 /// Current stream fields used when `direct_stream_lengths` is false.
@@ -38,14 +41,14 @@ pub(crate) struct IndirectStreamLength {
 pub(crate) trait WriteObject {
     type ObjectStreamContainer;
 
-    fn object_stream_container(&self, object: ObjectRef) -> Option<Self::ObjectStreamContainer>;
+    fn object_stream_container(&self, object: QpdfObjGen) -> Option<Self::ObjectStreamContainer>;
     fn write_object_stream(
         &mut self,
         object: &ObjectHandle,
         container: Self::ObjectStreamContainer,
     ) -> Result<()>;
     fn indicate_progress(&mut self) -> Result<()>;
-    fn output_number(&self, object: ObjectRef) -> Result<u32>;
+    fn output_number(&self, object: QpdfObjGen) -> Result<u32>;
     fn write_bytes(&mut self, bytes: &[u8]) -> Result<()>;
     fn output_count(&self) -> Result<usize>;
     fn xref(&mut self) -> &mut BTreeMap<u32, (u16, usize)>;
@@ -54,9 +57,11 @@ pub(crate) trait WriteObject {
     fn unparse_object(&mut self, object: &ObjectHandle, in_object_stream: bool) -> Result<()>;
 
     /// `None` represents qpdf's default `qdf_mode == false`.
-    fn qdf_object_info(&self, _object: ObjectRef) -> Option<QdfObjectInfo> {
+    // cov:ignore-start: the live writer supplies QDF metadata; this default is retained only for non-QDF test-only WriteObject implementations.
+    fn qdf_object_info(&self, _object: QpdfObjGen) -> Option<QdfObjectInfo> {
         None
     }
+    // cov:ignore-end
 
     /// `None` represents qpdf's default `direct_stream_lengths == true`.
     fn indirect_stream_length(&self) -> Option<IndirectStreamLength> {
@@ -93,8 +98,8 @@ pub(crate) trait WriteObject {
         // qpdf getObjGen returns (0, 0) for a direct object. Normal queue and
         // ObjStm callers supply indirect objects; preserve the accessor's
         // actual value rather than inventing an identity for a direct value.
-        let old_og = object.object_ref().unwrap_or(ObjectRef::new(0, 0));
-        if object_stream_index.is_none() && old_og.generation == 0 {
+        let old_og = object.qpdf_obj_gen().unwrap_or(QpdfObjGen::new(0, 0));
+        if object_stream_index.is_none() && old_og.get_gen() == 0 {
             if let Some(container) = self.object_stream_container(old_og) {
                 return self.write_object_stream(object, container);
             }
@@ -123,7 +128,8 @@ pub(crate) trait WriteObject {
                     .unwrap_or(old_og);
                 let comment = format!(
                     "%% Original object ID: {} {}\n",
-                    original_object.number, original_object.generation
+                    original_object.get_obj(),
+                    original_object.get_gen()
                 );
                 self.write_bytes(comment.as_bytes())?;
             }
@@ -199,7 +205,7 @@ mod tests {
     impl WriteObject for MemoryWriter {
         type ObjectStreamContainer = ();
 
-        fn object_stream_container(&self, _object: ObjectRef) -> Option<()> {
+        fn object_stream_container(&self, _object: QpdfObjGen) -> Option<()> {
             self.container.then_some(())
         }
 
@@ -216,7 +222,7 @@ mod tests {
             Ok(())
         }
 
-        fn output_number(&self, _object: ObjectRef) -> Result<u32> {
+        fn output_number(&self, _object: QpdfObjGen) -> Result<u32> {
             Ok(1)
         }
 
@@ -243,7 +249,7 @@ mod tests {
         fn encryption_state(&mut self) -> &mut WriterEncryptionState {
             &mut self.encryption
         }
-        fn qdf_object_info(&self, _object: ObjectRef) -> Option<QdfObjectInfo> {
+        fn qdf_object_info(&self, _object: QpdfObjGen) -> Option<QdfObjectInfo> {
             self.qdf
         }
         fn indirect_stream_length(&self) -> Option<IndirectStreamLength> {
