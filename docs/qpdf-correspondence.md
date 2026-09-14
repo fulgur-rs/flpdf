@@ -2552,6 +2552,10 @@ flpdf が「dict キーは drop / 配列要素は null 保持」という非対�
 `QPDFJob::shouldRemoveUnreferencedResources` 相当の `auto|yes|no` policy を分離した。
 後者は `QPDFJob.cc:2251-2339` の共有リソース探索だけを所有し、前者の
 `/Font`・`/XObject` pruning algorithmを再実装しない。
+`.48.99` では qpdf の private heuristicに対応するflpdfのsilent free wrapperを
+`job/resource_pruning.rs` の `pub(crate)` 境界へ狭め、job/rootのpublic re-exportを撤去した。
+publicな `RemoveUnreferencedResources` enumと `QPDFJobConfig` の設定setterは、qpdfの
+public Config設定面に対応するため保持する。
 `.18` では `QPDFJob.cc:2251-2337,2442-2455,2520-2555` の
 `--remove-unreferenced-resources={auto,yes,no}` を `job/page_specs.rs` から
 `job/page_merge.rs` の初回 foreign-page copy 境界へ渡す。Auto は source ごとに

@@ -5,7 +5,7 @@
 //! and prunes only its `/Font` and `/XObject` dictionaries. Document-level
 //! callers own the page iteration; the `Auto` decision is the separate qpdf
 //! job-level `shouldRemoveUnreferencedResources` heuristic in
-//! [`crate::job::should_remove_unreferenced_resources`]. Both the Form pre-pass
+//! `should_remove_unreferenced_resources`. Both the Form pre-pass
 //! and the ResourceReplacer name scan use the canonical
 //! `ObjectHandleParserCallbacks` content route.
 //!

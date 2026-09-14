@@ -39,7 +39,7 @@ container-above-max だった — `flpdf-hi08` / PR #1486）。本表は残る m
 
 `scripts/check-qpdf-route-matrix.py --check` は、A〜E の160行に加えて
 E の qtest exception 表（物理98行を論理99ケースとして数える）を含む259 logical
-rowsを検証する。2026-09-15 の現行 `origin/main` (`af99d4af4`) での集計は次のとおり。
+rowsを検証する。2026-09-15 の現行 `origin/main` (`98804b9e1`) での集計は次のとおり。
 
 | canonical | bridge | mixed | unknown | 合計 |
 |---|---|---|---|---|
@@ -96,9 +96,9 @@ done | sort | uniq -c
 本表は「その責務に至る **経路が 1 本か**」を問う。✅ の行でも consumer 側に bridge が残っていれば
 本表では mixed / bridge になりうる。
 
-2026-09-15 の current-main audit anchor は `origin/main=af99d4af4`、pinned qpdf は
+2026-09-15 の current-main audit anchor は `origin/main=98804b9e1`、pinned qpdf は
 11.9.0 commit `3b97c9bd266b7c32ea36d3536e22dab77412886d` である。checker の実測は
-**この revision を適用した tree で** 1244 qpdf citations / 904 flpdf citations /
+**この revision を適用した tree で** 1248 qpdf citations / 906 flpdf citations /
 259 logical rows、分類は
 canonical 133 / mixed 120 / bridge 6 / unknown 0。A〜E の160行だけを数える
 上の領域別集計は canonical 107 / mixed 53 / bridge 0 / unknown 0 なので、checker
@@ -471,8 +471,8 @@ crates/flpdf/src/qutil.rs::parse_numrange: prod 4 (3 files) / test 24
     crates/flpdf-cli/src/main.rs 1, crates/flpdf/src/job/lifecycle.rs 1, crates/flpdf/src/job/rotate_spec.rs 1
 crates/flpdf/src/job/page_range.rs::PageRange: prod 35 (6 files) / test 70
     crates/flpdf-cli/src/main.rs 13, crates/flpdf/src/job/overlay.rs 9, crates/flpdf/src/job/lifecycle.rs 6, crates/flpdf/src/job/page_combine.rs 4, crates/flpdf/src/job/page_specs.rs 2, crates/flpdf/src/job/page_plan.rs 1
-crates/flpdf/src/job/resource_pruning.rs::should_remove_unreferenced_resources: prod 2 (2 files) / test 10
-    crates/flpdf-cli/src/main.rs 1, crates/flpdf/src/job/page_merge.rs 1
+crates/flpdf/src/job/resource_pruning.rs::should_remove_unreferenced_resources: prod 1 (1 files) / test 9
+    crates/flpdf/src/job/page_merge.rs 1
 crates/flpdf/src/job/lifecycle.rs::QPDFJob::initialize_from_argv: prod 3 (1 files) / test 16
     crates/flpdf-qtest-tools/src/bin/qpdfjob_ctest.rs 3
 crates/flpdf/src/job/lifecycle.rs::QPDFJob::complete: prod 22 (7 files) / test 15

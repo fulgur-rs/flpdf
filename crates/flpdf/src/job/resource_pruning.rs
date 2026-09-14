@@ -93,7 +93,9 @@ pub(crate) fn shared_resource_finding_message(finding: SharedResourceFinding) ->
 ///
 /// Returns an error when resolving the catalog, page tree, resources, or a
 /// nested Form XObject fails while evaluating the heuristic.
-pub fn should_remove_unreferenced_resources<R: Read + Seek>(pdf: &mut Pdf<R>) -> Result<bool> {
+pub(crate) fn should_remove_unreferenced_resources<R: Read + Seek>(
+    pdf: &mut Pdf<R>,
+) -> Result<bool> {
     should_remove_unreferenced_resources_with_report(pdf, |_| Ok(()))
 }
 
