@@ -823,17 +823,6 @@ pub struct LinearizationPlan {
     /// and `least_page_length` fields.
     pub per_page_private_objects: Vec<Vec<ObjectRef>>,
 
-    /// Full object → referencing-page inverse map: `all_referenced_pages[r]` is
-    /// the set of 0-based page users assigned to `r` by qpdf's ordered
-    /// `updateObjectMaps` traversal.
-    ///
-    /// Used to compute a shared ObjStm container's referencing pages from its
-    /// FULL membership — the global even split can place a page's *private*
-    /// object inside a container in another section (the first-page part6
-    /// container or a part8 shared container), and the page then references that
-    /// container as a shared object. Keyed by original ref.
-    pub all_referenced_pages: BTreeMap<ObjectRef, BTreeSet<u32>>,
-
     /// Outline objects routed to the first-page section (part6) when the catalog
     /// specifies `/PageMode /UseOutlines`, in emitted order (root first, then items
     /// in traversal order). Empty when the predicate is false.
@@ -1225,13 +1214,6 @@ impl LinearizationPlan {
         // once so the per-page `compute_closure` calls below do not each re-scan
         // the whole xref table (which would be O(pages × objects)).
         let live: BTreeSet<ObjectRef> = pdf.canonical_live_object_refs().into_iter().collect();
-        let mut all_referenced_pages: BTreeMap<ObjectRef, BTreeSet<u32>> = BTreeMap::new();
-        for (object_ref, _) in optimization.object_users() {
-            let pages = optimization.referenced_pages(object_ref);
-            if !pages.is_empty() {
-                all_referenced_pages.insert(object_ref, pages);
-            }
-        }
         let first_page_users = optimization
             .objects_for(&crate::optimization::ObjectUser::Page(0))
             .clone();
@@ -1292,10 +1274,9 @@ impl LinearizationPlan {
         //
         // `shared_page_indices` retains the old semantics for Part 3 partitioning
         // (only first-page-set objects that also appear in other pages).
-        // `all_referenced_pages` was derived above from the exact qpdf-style
-        // page-user traversal and is the sole retained object-to-page inverse
-        // map. Closures here remain the authoritative ordered inputs for page
-        // partitioning and hint construction.
+        // The retained qpdf-shaped object-user map remains the sole source of
+        // page-user relationships. Closures here remain the authoritative
+        // ordered inputs for page partitioning and hint construction.
         let mut shared_page_indices: BTreeMap<ObjectRef, BTreeSet<u32>> = BTreeMap::new();
         let mut other_page_closures: Vec<Vec<ObjectRef>> =
             Vec::with_capacity(page_refs.len().saturating_sub(1));
@@ -1783,10 +1764,10 @@ impl LinearizationPlan {
         // table and adds identifiers for later-page users
         // (QPDF_linearization.cc:1354-1356,1388-1400).
         let outline_entries = outline_first_page_members.iter().map(|&obj_ref| {
-            let pages: Vec<u32> = all_referenced_pages
-                .get(&obj_ref)
-                .map(|set| set.iter().copied().filter(|&page| page != 0).collect())
-                .unwrap_or_default();
+            let pages: Vec<u32> = optimization
+                .page_users(obj_ref)
+                .filter(|&page| page != 0)
+                .collect();
             SharedObjectHintEntry {
                 object_ref: obj_ref,
                 referencing_pages: pages,
@@ -1796,10 +1777,7 @@ impl LinearizationPlan {
         // first-page closure.  These live after /E (not physically owned
         // by any page via layout), so ALL referencing pages are listed.
         let part4_shared_entries = part4_other_pages_shared.iter().map(|&obj_ref| {
-            let pages: Vec<u32> = all_referenced_pages
-                .get(&obj_ref)
-                .map(|s| s.iter().copied().collect())
-                .unwrap_or_default();
+            let pages: Vec<u32> = optimization.page_users(obj_ref).collect();
             SharedObjectHintEntry {
                 object_ref: obj_ref,
                 referencing_pages: pages,
@@ -1827,7 +1805,6 @@ impl LinearizationPlan {
             page_hints,
             shared_hints,
             per_page_private_objects,
-            all_referenced_pages,
             outline_first_page_members,
             part9_outline_objects,
             part6_outline_objects,
@@ -1946,16 +1923,16 @@ impl LinearizationPlan {
                 has_first_page_member.insert(cnum);
             }
             // A reach-≥2 (part4_other_pages_shared) member makes the container a
-            // shared object directly — used when `all_referenced_pages` is absent
+            // shared object directly — used when optimization data is absent
             // (e.g. manually-built plans) and as a robust signal otherwise.
             if part4_shared.contains(member) {
                 has_shared_member.insert(cnum);
             }
-            if let Some(pages) = self.all_referenced_pages.get(member) {
+            if let Some(optimization) = self.optimization.as_ref() {
                 container_pages
                     .entry(cnum)
                     .or_default()
-                    .extend(pages.iter().copied().filter(|&p| p != 0));
+                    .extend(optimization.page_users(*member).filter(|&p| p != 0));
             }
         }
         // A container is part8 when no member is a first-page object AND it is
@@ -2174,8 +2151,8 @@ impl LinearizationPlan {
         out[boundary..].sort_unstable_by_key(&new_number);
 
         // Recompute each entry's referencing pages from its FULL membership via
-        // `all_referenced_pages` (excluding page 0, which owns the first-page
-        // section and lists no shared identifiers). The fold above unions only
+        // the retained qpdf-shaped object-user map (excluding page 0, which
+        // owns the first-page section and lists no shared identifiers). The fold above unions only
         // the `shared_hints` inputs (part2/part3/part4_shared); the global even
         // split can also place a page's PRIVATE object inside a shared container
         // (the first-page part6 container, or a part8 container co-locating two
@@ -2183,7 +2160,13 @@ impl LinearizationPlan {
         // the private object — a reference the input entries do not record. This
         // is a no-op for documents whose containers hold only shared_hints
         // objects (the union is identical).
-        if !self.all_referenced_pages.is_empty() {
+        if let Some(optimization) = self.optimization.as_ref().filter(|optimization| {
+            optimization.object_users().any(|(_, users)| {
+                users
+                    .iter()
+                    .any(|user| matches!(user, crate::optimization::ObjectUser::Page(_)))
+            })
+        }) {
             let mut container_members: BTreeMap<u32, Vec<ObjectRef>> = BTreeMap::new();
             for (&member, &(cnum, _)) in member_to_container {
                 container_members.entry(cnum).or_default().push(member);
@@ -2191,9 +2174,7 @@ impl LinearizationPlan {
             let pages_excluding_first = |refs: &mut dyn Iterator<Item = ObjectRef>| -> Vec<u32> {
                 let mut pages: BTreeSet<u32> = BTreeSet::new();
                 for r in refs {
-                    if let Some(ps) = self.all_referenced_pages.get(&r) {
-                        pages.extend(ps.iter().copied().filter(|&p| p != 0));
-                    }
+                    pages.extend(optimization.page_users(r).filter(|&p| p != 0));
                 }
                 pages.into_iter().collect()
             };
@@ -2321,7 +2302,6 @@ impl Default for LinearizationPlan {
             page_hints: Vec::new(),
             shared_hints: Vec::new(),
             per_page_private_objects: Vec::new(),
-            all_referenced_pages: BTreeMap::new(),
             outline_first_page_members: Vec::new(),
             part9_outline_objects: Vec::new(),
             part6_outline_objects: Vec::new(),

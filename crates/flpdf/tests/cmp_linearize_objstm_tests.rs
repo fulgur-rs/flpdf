@@ -1541,8 +1541,9 @@ fn acroform_widget_page1_only_objstm_byte_identical_to_qpdf() {
 // acroform-widget-page1-page2: AcroForm widget
 // shared by pages 1 AND 2 (page_reach==2, in open_document_set). OD routing
 // sends the widget to part4_rest. Its OD ObjStm container spans pages {1,2}
-// in all_referenced_pages, satisfying part8_container_nums' container_pages
-// criterion. Without the fix, canonical_shared_hints appends the OD container
+// in the retained qpdf-shaped page-user map, satisfying
+// part8_container_nums' `container_pages` criterion. Without the fix,
+// canonical_shared_hints appends the OD container
 // as a spurious Part-8 SOHT entry (nshared_total > oracle). With the fix the
 // open_document_container_nums filter skips it and nshared_total==2.
 #[test]

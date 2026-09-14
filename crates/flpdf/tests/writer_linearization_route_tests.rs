@@ -149,6 +149,26 @@ fn linearization_final_route_does_not_clone_complete_xref_maps() {
 }
 
 #[test]
+fn linearization_plan_does_not_retain_a_derived_page_user_inverse_map() {
+    let source = production_source(
+        include_str!("../src/linearization/plan.rs"),
+        "\n#[cfg(test)]\nmod tests {",
+    );
+    assert!(
+        source.contains("optimization.page_users("),
+        "linearization planning must consume a borrowed view of the retained qpdf-shaped object-user map"
+    );
+    assert!(
+        !source.contains("all_referenced_pages"),
+        "the plan must not retain a second object-to-page inverse map"
+    );
+    assert!(
+        !source.contains("referenced_pages("),
+        "planning must not clone a page set for every object"
+    );
+}
+
+#[test]
 fn prepare_file_for_write_is_owned_by_the_common_writer_boundary() {
     let writer_source = include_str!("../src/writer.rs").replace("\r\n", "\n");
     let write = writer_source

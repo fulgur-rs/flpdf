@@ -1250,7 +1250,7 @@ fn acroform_widget_page1_only_routes_to_od_not_part7() {
 ///
 /// Fixture: 3-page PDF, AcroForm widget (obj 6) in BOTH page 1 AND page 2
 /// /Annots.  Widget has page_reach==2 and is in open_document_set.  OD routing
-/// sends it to part4_rest.  Its container's all_referenced_pages spans {1, 2},
+/// sends it to part4_rest.  Its retained qpdf-shaped page-user map spans {1, 2},
 /// which satisfies part8_container_nums' `container_pages.len()>=2` criterion.
 ///
 /// Bug path without the fix:
