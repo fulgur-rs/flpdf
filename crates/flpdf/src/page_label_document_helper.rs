@@ -1,10 +1,9 @@
 //! qpdf correspondence: `QPDFPageLabelDocumentHelper.cc` canonical page-label access and reconstruction.
 //!
-//! [`PageLabelDocumentHelper`] reads, reconstructs, and renders (ISO 32000-1
-//! §12.4.2) the catalog `/PageLabels` number tree. The qpdf-shaped read
-//! methods retain live [`ObjectHandle`] values for raw `/S`, `/P`, and `/St`
-//! semantics; [`LabelRange`] is the typed view used by reconstruction and
-//! display APIs.
+//! [`PageLabelDocumentHelper`] reads and reconstructs (ISO 32000-1 §12.4.2)
+//! the catalog `/PageLabels` number tree. The qpdf-shaped read methods retain
+//! live [`ObjectHandle`] values for raw `/S`, `/P`, and `/St` semantics;
+//! [`LabelRange`] is the typed view used by reconstruction and inspection APIs.
 
 use crate::nntree::DEFAULT_MAX_TREE_DEPTH;
 use crate::{Error, ObjectHandle, Pdf, Result};
@@ -111,29 +110,6 @@ impl LabelRange {
             start,
         }))
     }
-
-    /// Render the display label for `value` (§12.4.2): `prefix` followed by the
-    /// style-formatted number. [`LabelStyle::None`] and non-positive numeric
-    /// values contribute no numeric portion.
-    // qpdf-deviation-start: page-label rendering to a display string
-    // (roman/alpha/decimal, ISO 32000-1 §12.4.2) has no qpdf counterpart --
-    // QPDFPageLabelDocumentHelper.cc only produces/consumes the raw
-    // /S,/P,/St dictionary and qpdf never computes a rendered numeral
-    // string anywhere in its source (doJSONPageLabels emits the raw dict
-    // via getJSON, never a rendered label).
-    pub fn format(&self, value: i64) -> String {
-        let mut s = self.prefix.clone();
-        match self.style {
-            LabelStyle::Decimal => s.push_str(&value.to_string()),
-            LabelStyle::RomanUpper => s.push_str(&to_roman(value, true)),
-            LabelStyle::RomanLower => s.push_str(&to_roman(value, false)),
-            LabelStyle::AlphaUpper => s.push_str(&to_alpha(value, true)),
-            LabelStyle::AlphaLower => s.push_str(&to_alpha(value, false)),
-            LabelStyle::None => {}
-        }
-        s
-    }
-    // qpdf-deviation-end
 }
 
 /// Compare reconstructed raw label dictionaries using qpdf's unparse
@@ -248,64 +224,6 @@ pub(crate) fn record_primary_label_provenance<R: Read + Seek>(
         }
     }
 }
-
-// qpdf-deviation-start: page-label rendering (this const and the two
-// functions below) has no qpdf counterpart -- see the marker on
-// LabelRange::format for the full citation.
-/// Upper bound on the numeric value [`to_roman`]/[`to_alpha`] will render.
-///
-/// Values above this produce an empty numeric portion — a defensive cap against
-/// CPU/memory exhaustion from a hostile `/St`: without it the roman subtraction
-/// loop and the alphabetic repeat both scale with `value`, so an `i64::MAX`
-/// `/St` would spin/allocate unboundedly. 100 000 is far beyond any real page
-/// label yet keeps the rendered string short.
-const MAX_RENDERABLE_LABEL_VALUE: i64 = 100_000;
-
-/// Format `value` as a roman numeral (`upper` → uppercase). Empty for
-/// `value <= 0` or `value > MAX_RENDERABLE_LABEL_VALUE`.
-fn to_roman(value: i64, upper: bool) -> String {
-    if value <= 0 || value > MAX_RENDERABLE_LABEL_VALUE {
-        return String::new();
-    }
-    const TABLE: &[(i64, &str, &str)] = &[
-        (1000, "M", "m"),
-        (900, "CM", "cm"),
-        (500, "D", "d"),
-        (400, "CD", "cd"),
-        (100, "C", "c"),
-        (90, "XC", "xc"),
-        (50, "L", "l"),
-        (40, "XL", "xl"),
-        (10, "X", "x"),
-        (9, "IX", "ix"),
-        (5, "V", "v"),
-        (4, "IV", "iv"),
-        (1, "I", "i"),
-    ];
-    let mut v = value;
-    let mut out = String::new();
-    for &(n, up, lo) in TABLE {
-        while v >= n {
-            out.push_str(if upper { up } else { lo });
-            v -= n;
-        }
-    }
-    out
-}
-
-/// Format `value` as repeating letters (§12.4.2): 1→A … 26→Z, 27→AA, 53→AAA.
-/// Empty for `value <= 0` or `value > MAX_RENDERABLE_LABEL_VALUE`.
-fn to_alpha(value: i64, upper: bool) -> String {
-    if value <= 0 || value > MAX_RENDERABLE_LABEL_VALUE {
-        return String::new();
-    }
-    let v = value - 1;
-    let letter = (v % 26) as u8;
-    let count = (v / 26) + 1;
-    let ch = if upper { b'A' + letter } else { b'a' + letter } as char;
-    (0..count).map(|_| ch).collect()
-}
-// qpdf-deviation-end
 
 /// High-level helper for a document's `/PageLabels` number tree.
 ///
@@ -571,25 +489,6 @@ impl<'a, R: Read + Seek> PageLabelDocumentHelper<'a, R> {
         result.replace_key(b"/St", ObjectHandle::integer(start))?;
         Ok(Some(result))
     }
-
-    /// The rendered display string for a 0-based page index. Falls back to
-    /// 1-based decimal (`(page_idx + 1)`) when no range applies — matching the
-    /// "default 1-based numeric labels" requirement.
-    ///
-    /// # Errors
-    ///
-    /// - [`crate::Error::Unsupported`] when the number-tree depth limit is
-    ///   exceeded.
-    /// - Any error from canonical ObjectHandle resolution.
-    // qpdf-deviation-start: page-label rendering has no qpdf counterpart --
-    // see the marker on LabelRange::format for the full citation.
-    pub fn label_string_for_page(&mut self, page_idx: i64) -> Result<String> {
-        match self.label_for_page(page_idx)? {
-            Some(effective) => Ok(effective.format(effective.start)),
-            None => Ok((page_idx + 1).to_string()),
-        }
-    }
-    // qpdf-deviation-end
 
     /// qpdf `getLabelsForPageRange` compatibility view: collect the label entries needed to
     /// reproduce the labels of pages `start_idx..=end_idx` if they were
@@ -996,28 +895,6 @@ mod tests {
             entries.push((b"/P".to_vec(), ObjectHandle::string(p.as_bytes().to_vec())));
         }
         ObjectHandle::dictionary(entries)
-    }
-
-    #[test]
-    fn label_string_multi_range_matches_spec() {
-        // /Nums [0 <</S /r>> 3 <</S /D /St 1>> 6 <</S /D /P "A-" /St 1>>]
-        let mut pdf = pdf_with_pagelabels(vec![
-            ObjectHandle::integer(0),
-            label_dict("r", None, None),
-            ObjectHandle::integer(3),
-            label_dict("D", Some(1), None),
-            ObjectHandle::integer(6),
-            label_dict("D", Some(1), Some("A-")),
-        ]);
-        let mut h = pdf.page_labels();
-        assert!(h.has_page_labels().unwrap());
-        assert_eq!(h.label_string_for_page(0).unwrap(), "i");
-        assert_eq!(h.label_string_for_page(1).unwrap(), "ii");
-        assert_eq!(h.label_string_for_page(2).unwrap(), "iii");
-        assert_eq!(h.label_string_for_page(3).unwrap(), "1");
-        assert_eq!(h.label_string_for_page(5).unwrap(), "3");
-        assert_eq!(h.label_string_for_page(6).unwrap(), "A-1");
-        assert_eq!(h.label_string_for_page(8).unwrap(), "A-3");
     }
 
     #[test]
@@ -1493,8 +1370,7 @@ mod tests {
     fn no_pagelabels_defaults_to_decimal() {
         let mut pdf = pdf_with_pagelabels(vec![]); // empty /Nums -> ranges empty
         let mut h = pdf.page_labels();
-        assert_eq!(h.label_string_for_page(0).unwrap(), "1");
-        assert_eq!(h.label_string_for_page(4).unwrap(), "5");
+        assert!(h.ranges().unwrap().is_empty());
         assert!(h.label_for_page(0).unwrap().is_none());
     }
 
@@ -1505,7 +1381,6 @@ mod tests {
 
         assert!(!helper.has_page_labels().unwrap());
         assert!(helper.get_label_for_page(0).unwrap().is_none());
-        assert_eq!(helper.label_string_for_page(0).unwrap(), "1");
         assert!(helper.ranges().unwrap().is_empty());
     }
 
@@ -1520,23 +1395,18 @@ mod tests {
 
         assert!(!helper.has_page_labels().unwrap());
         assert!(helper.get_label_for_page(0).unwrap().is_none());
-        assert_eq!(helper.label_string_for_page(0).unwrap(), "1");
         assert!(helper.ranges().unwrap().is_empty());
     }
 
     #[test]
-    fn page_before_first_range_defaults_to_decimal() {
+    fn page_before_first_range_has_no_effective_label() {
         let mut pdf = pdf_with_pagelabels(vec![
             ObjectHandle::integer(3),
             label_dict("R", Some(1), None),
         ]);
         let mut h = pdf.page_labels();
-        assert_eq!(
-            h.label_string_for_page(0).unwrap(),
-            "1",
-            "page before first range"
-        );
-        assert_eq!(h.label_string_for_page(3).unwrap(), "I");
+        assert!(h.get_label_for_page(0).unwrap().is_none());
+        assert!(h.get_label_for_page(3).unwrap().is_some());
     }
 
     #[test]
@@ -1558,68 +1428,6 @@ mod tests {
         assert!(out
             .iter()
             .any(|(idx, r)| *idx == 2 && r.style == LabelStyle::Decimal));
-    }
-
-    #[test]
-    fn roman_matches_spec() {
-        assert_eq!(to_roman(1, true), "I");
-        assert_eq!(to_roman(4, true), "IV");
-        assert_eq!(to_roman(9, false), "ix");
-        assert_eq!(to_roman(40, true), "XL");
-        assert_eq!(to_roman(90, false), "xc");
-        assert_eq!(to_roman(400, true), "CD");
-        assert_eq!(to_roman(900, true), "CM");
-        assert_eq!(to_roman(3888, true), "MMMDCCCLXXXVIII");
-        assert_eq!(to_roman(0, true), "");
-        assert_eq!(to_roman(-3, false), "");
-    }
-
-    #[test]
-    fn formatters_cap_huge_values() {
-        // DoS guard: at the cap the formatters still render; above it (incl.
-        // i64::MAX) they return empty instead of spinning/allocating unboundedly.
-        assert!(!to_roman(MAX_RENDERABLE_LABEL_VALUE, true).is_empty());
-        assert_eq!(to_roman(MAX_RENDERABLE_LABEL_VALUE + 1, true), "");
-        assert_eq!(to_roman(i64::MAX, true), "");
-        assert!(!to_alpha(MAX_RENDERABLE_LABEL_VALUE, true).is_empty());
-        assert_eq!(to_alpha(MAX_RENDERABLE_LABEL_VALUE + 1, true), "");
-        assert_eq!(to_alpha(i64::MAX, true), "");
-    }
-
-    #[test]
-    fn alpha_repeating_letters() {
-        assert_eq!(to_alpha(1, true), "A");
-        assert_eq!(to_alpha(26, true), "Z");
-        assert_eq!(to_alpha(27, true), "AA");
-        assert_eq!(to_alpha(52, false), "zz");
-        assert_eq!(to_alpha(53, true), "AAA");
-        assert_eq!(to_alpha(0, true), "");
-    }
-
-    #[test]
-    fn label_range_format_prefix_and_styles() {
-        let d = LabelRange {
-            style: LabelStyle::Decimal,
-            prefix: "A-".into(),
-            start: 1,
-        };
-        assert_eq!(d.format(5), "A-5");
-        let r = LabelRange {
-            style: LabelStyle::RomanLower,
-            prefix: String::new(),
-            start: 1,
-        };
-        assert_eq!(r.format(3), "iii");
-        let none = LabelRange {
-            style: LabelStyle::None,
-            prefix: "Cover".into(),
-            start: 1,
-        };
-        assert_eq!(
-            none.format(9),
-            "Cover",
-            "None style => prefix only, no number"
-        );
     }
 
     #[test]
@@ -1660,22 +1468,6 @@ mod tests {
         // Unrecognised /S name -> None (from_name `_` arm); None has no name.
         assert_eq!(LabelStyle::from_name(b"Z"), LabelStyle::None);
         assert_eq!(LabelStyle::None.to_name(), None);
-    }
-
-    #[test]
-    fn format_alpha_styles() {
-        let up = LabelRange {
-            style: LabelStyle::AlphaUpper,
-            prefix: String::new(),
-            start: 1,
-        };
-        assert_eq!(up.format(27), "AA");
-        let lo = LabelRange {
-            style: LabelStyle::AlphaLower,
-            prefix: "x".into(),
-            start: 1,
-        };
-        assert_eq!(lo.format(2), "xb");
     }
 
     #[test]
