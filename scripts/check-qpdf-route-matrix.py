@@ -434,8 +434,12 @@ def main(argv: list[str] | None = None) -> int:
     checker = Checker(root, qpdf_root, report)
     documents = set(matrix_dir.glob("*.md"))
     correspondence_doc = root / "docs" / "qpdf-correspondence.md"
-    if correspondence_doc.is_file():
-        documents.add(correspondence_doc)
+    if not correspondence_doc.is_file():
+        # Skipping it silently would let a delete or rename pass CI while
+        # leaving every citation in it unchecked.
+        print(f"{correspondence_doc}: required citation document not found")
+        return 1
+    documents.add(correspondence_doc)
     for doc in sorted(documents):
         checker.check_document(doc)
     for manifest in sorted(matrix_dir.glob("*.txt")):
