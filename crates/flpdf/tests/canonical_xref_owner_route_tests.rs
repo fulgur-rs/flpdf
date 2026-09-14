@@ -14,6 +14,7 @@ fn production_source(path: &str) -> String {
             .join(path),
     )
     .unwrap_or_else(|error| panic!("unable to read {path}: {error}"));
+    let source = source.replace("\r\n", "\n");
     source
         .split_once("\n#[cfg(test)]")
         .map_or(source.clone(), |(production, _)| production.to_owned())
@@ -159,7 +160,8 @@ fn production_open_always_supplies_the_canonical_xref_owner() {
             .join("src")
             .join("xref.rs"),
     )
-    .expect("read xref source");
+    .expect("read xref source")
+    .replace("\r\n", "\n");
     assert!(
         xref.contains("#[cfg(test)]\npub(crate) fn load_xref_state_with_options"),
         "the ownerless standalone xref loader must remain test-only"
