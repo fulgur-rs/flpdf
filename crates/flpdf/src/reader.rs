@@ -884,9 +884,13 @@ impl<R: Read + Seek> Pdf<R> {
         Ok(handles
             .into_iter()
             .filter(|handle| {
+                // cov:ignore-start: ResolverCore::object_cache stores only
+                // handles carrying a qpdf object generation, and
+                // get_all_objects enumerates that cache directly.
                 let Some(object_gen) = handle.qpdf_obj_gen() else {
                     return false;
                 };
+                // cov:ignore-end
                 object_gen.is_indirect()
                     && (raw_xref.contains_key(&object_gen)
                         || self.resolver.is_allocated_qpdf_obj_gen(object_gen))

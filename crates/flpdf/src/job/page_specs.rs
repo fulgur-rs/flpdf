@@ -1796,11 +1796,19 @@ mod tests {
             raw_orphans
                 .iter()
                 .any(|handle| { handle.qpdf_obj_gen() == Some(QpdfObjGen::new(5, 65_536)) }),
-            "canonical live handles must retain raw-generation source objects: {:?}",
-            raw_orphans
+            "canonical live handles must retain raw-generation source objects"
+        );
+        let mut allocated_raw = three_page_pdf();
+        allocated_raw
+            .replace_object(ObjectRef::new(9, 65_535), ObjectHandle::integer(45))
+            .expect("install document-allocated raw identity");
+        assert!(
+            allocated_raw
+                .canonical_live_object_handles()
+                .expect("enumerate allocated raw object")
                 .iter()
-                .filter_map(ObjectHandle::qpdf_obj_gen)
-                .collect::<Vec<_>>()
+                .any(|handle| { handle.qpdf_obj_gen() == Some(QpdfObjGen::new(9, 65_535)) }),
+            "canonical live handles must retain allocated raw identities"
         );
         let specs = [
             PageSpecInput::new(0, PageRange::parse_numrange("1").unwrap()),
