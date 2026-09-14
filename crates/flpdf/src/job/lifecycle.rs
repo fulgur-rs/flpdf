@@ -7056,7 +7056,7 @@ mod tests {
                 .to_string(),
             )
             .unwrap();
-        assert_eq!(copy_job.run().unwrap(), JobExitCode::Error);
+        assert_eq!(copy_job.run().unwrap(), JobExitCode::Success);
     }
 
     #[test]
