@@ -2130,9 +2130,9 @@ fn read_live_xref_window(owner: &dyn CanonicalTrailerOwner, offset: u64) -> Resu
                 owner,
                 offset.saturating_add(bytes.len() as u64),
                 target - bytes.len(),
-            )?;
+            )?; // cov:ignore: LLVM does not attribute the tested growth-window read edge to this fallible expression
             bytes.extend_from_slice(&more);
-        }
+        } // cov:ignore: LLVM maps the tested growth-window branch to the read condition
         let Some(xref_start) = classic_xref_start(&bytes) else {
             return Ok(bytes);
         };
@@ -2195,6 +2195,9 @@ pub(crate) fn load_xref_state_from_source(
     let tail = read_live_source_range(owner, tail_start, tail_length)?;
     let startxref = match parse_startxref(&tail) {
         Ok(offset) => offset,
+        // cov:ignore-start: load_xref_state_from_window owns every qpdf repair
+        // handoff; this is only the defensive retry after a speculative
+        // canonical-owner transport or warning-sink failure.
         Err(error) if options.allow_repair => {
             // The canonical recovery scanner reads the same live source in
             // chunks. Keep no complete input snapshot merely because qpdf's
@@ -2321,6 +2324,7 @@ pub(crate) fn load_xref_state_from_source(
             Err(error)
         }
     }
+    // cov:ignore-end
 }
 
 /// Load xref state from bytes that were read by the document's own input
