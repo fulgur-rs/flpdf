@@ -2341,8 +2341,16 @@ where
 // recursed-into direct child alike -- this function does not need its own
 // copy of that check to get the same result.
 pub(crate) fn write_child(handle: &ObjectHandle, out: &mut OutputSink<'_>) -> Result<()> {
-    if let Some(object_ref) = handle.object_ref() {
-        out.write_bytes(object_ref.to_string().as_bytes())?;
+    // `QPDFWriter::unparseChild` branches on `isIndirect()`
+    // (`libqpdf/QPDFWriter.cc:1148`), which is `obj != 0`
+    // (`include/qpdf/QPDFObjGen.hh:78-81`) and never inspects the generation.
+    // Read the raw identity so a generation outside the `N G R` projection
+    // range still emits a reference instead of being inlined.
+    if let Some(object_gen) = handle
+        .qpdf_obj_gen()
+        .filter(|object_gen| object_gen.is_indirect())
+    {
+        out.write_bytes(format!("{} {} R", object_gen.get_obj(), object_gen.get_gen()).as_bytes())?;
         return Ok(());
     }
     unparse_object_walk(handle, out)
@@ -3516,8 +3524,13 @@ fn push_spaces(out: &mut OutputSink<'_>, n: usize) -> Result<()> {
 // by `unparse_object_walk_qdf`'s own `is_reserved` check on whatever
 // handle the `None` branch below recurses into.
 fn write_child_qdf(handle: &ObjectHandle, indent: usize, out: &mut OutputSink<'_>) -> Result<()> {
-    if let Some(object_ref) = handle.object_ref() {
-        out.write_bytes(object_ref.to_string().as_bytes())?;
+    // Same raw-identity boundary as `write_child` above: QDF changes the
+    // formatting, not which children are written as references.
+    if let Some(object_gen) = handle
+        .qpdf_obj_gen()
+        .filter(|object_gen| object_gen.is_indirect())
+    {
+        out.write_bytes(format!("{} {} R", object_gen.get_obj(), object_gen.get_gen()).as_bytes())?;
         return Ok(());
     }
     unparse_object_walk_qdf(handle, indent, out)
