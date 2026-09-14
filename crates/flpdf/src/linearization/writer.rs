@@ -3275,33 +3275,21 @@ fn second_half_container_anchors(
     let member_is_in_route = |member: ObjectRef, route: ContainerPart| -> bool {
         let object_gen = QpdfObjGen::try_from_object_ref(member)
             .expect("ObjStm members must fit qpdf raw identity");
-        if plan.has_raw_projection_gap() {
-            match route {
-                ContainerPart::OtherPagePrivate => plan
-                    .raw
-                    .per_page_private_objects
-                    .iter()
-                    .skip(1)
-                    .any(|objects| objects.contains(&object_gen)),
-                ContainerPart::OtherPageShared => {
-                    plan.raw.part4_other_pages_shared.contains(&object_gen)
-                }
-                ContainerPart::Rest => {
-                    plan.raw.part4_rest.contains(&object_gen)
-                        || plan.raw.part9_outline_objects.contains(&object_gen)
-                }
-                _ => false,
+        match route {
+            ContainerPart::OtherPagePrivate => plan
+                .raw
+                .per_page_private_objects
+                .iter()
+                .skip(1)
+                .any(|objects| objects.contains(&object_gen)),
+            ContainerPart::OtherPageShared => {
+                plan.raw.part4_other_pages_shared.contains(&object_gen)
             }
-        } else {
-            match route {
-                ContainerPart::OtherPagePrivate => part7_owner_for_plan(plan, member).is_some(),
-                ContainerPart::OtherPageShared => plan.part4_other_pages_shared.contains(&member),
-                ContainerPart::Rest => {
-                    plan.part4_rest.contains(&member)
-                        || plan.part9_outline_objects.contains(&member)
-                }
-                _ => false,
+            ContainerPart::Rest => {
+                plan.raw.part4_rest.contains(&object_gen)
+                    || plan.raw.part9_outline_objects.contains(&object_gen)
             }
+            _ => false,
         }
     };
 
@@ -3333,15 +3321,7 @@ fn second_half_container_anchors(
                     })
                     .map(qpdf_object_number)
                     .min()
-                    .or_else(|| {
-                        batch
-                            .members
-                            .iter()
-                            .filter_map(|member| QpdfObjGen::try_from_object_ref(*member).ok())
-                            .map(qpdf_object_number)
-                            .min()
-                    })
-                    .expect("resolved ObjStm batches are non-empty")
+                    .expect("raw ObjStm batch must have a member in its second-half route")
             } else {
                 u32::MAX
             };
@@ -5021,6 +5001,47 @@ mod tests {
 
         assert_eq!(part7_owner_for_plan(&plan, member), Some(1));
         assert_eq!(part7_owner_for_plan(&plan, other), None);
+    }
+
+    #[test]
+    fn raw_second_half_anchor_sees_raw_part7_plain_peers() {
+        let member = ObjectRef::new(7, 0);
+        let page = ObjectRef::new(2, 0);
+        let plan = LinearizationPlan {
+            page_hints: vec![
+                crate::linearization::plan::PageHintEntry::placeholder(ObjectRef::new(1, 0)),
+                crate::linearization::plan::PageHintEntry::placeholder(page),
+            ],
+            per_page_private_objects: vec![vec![], vec![page, member]],
+            raw: crate::linearization::plan::RawLinearizationPlan {
+                per_page_private_objects: vec![
+                    vec![],
+                    vec![
+                        QpdfObjGen::new(2, 0),
+                        QpdfObjGen::new(7, 0),
+                        QpdfObjGen::new(8, 65_536),
+                    ],
+                ],
+                part4_other_pages_private: vec![
+                    QpdfObjGen::new(2, 0),
+                    QpdfObjGen::new(7, 0),
+                    QpdfObjGen::new(8, 65_536),
+                ],
+                ..Default::default()
+            },
+            ..LinearizationPlan::default()
+        };
+        let batches = vec![RoutedObjStmBatch {
+            members: vec![member],
+            route: ContainerPart::OtherPagePrivate,
+            source_container_number: None,
+        }];
+
+        let anchors = second_half_container_anchors(&plan, &batches);
+        assert_eq!(
+            anchors,
+            vec![SecondHalfContainerAnchor::After(QpdfObjGen::new(2, 0))]
+        );
     }
 
     #[test]
