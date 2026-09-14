@@ -157,3 +157,20 @@ fn handle_only_helpers_do_not_carry_dead_pdf_parameters() {
         );
     }
 }
+
+#[test]
+fn canonical_pdf_open_does_not_snapshot_the_complete_source_for_xref() {
+    let engine = read_source("engine.rs");
+    let production = engine
+        .split_once("\n#[cfg(test)]\nmod tests")
+        .map_or(engine.as_str(), |(production, _)| production);
+
+    assert!(
+        !production.contains("read_initial_source(&mut reader"),
+        "canonical Pdf::open must not materialize the complete source before xref loading"
+    );
+    assert!(
+        !production.contains("load_xref_state_from_bytes("),
+        "canonical Pdf::open must load xref state through the live source boundary"
+    );
+}
