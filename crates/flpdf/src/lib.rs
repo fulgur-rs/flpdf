@@ -184,7 +184,7 @@ pub use job::{
     overlay_verbose_report, parse_rotation_parameter, write_attachment, AttachmentInfo,
     CombinedPage, CombinedPlan, Endpoint, InputSpec, MergeInput, OverlayKind, OverlaySpec,
     OverlayVerbosePage, OverlayVerboseSource, PagePlan, PageRange, PageRangeEntry,
-    PageSpecJobOutput, Parity, RotateMode, RotateOp, RotationParameter, RotationSpec, SelectedPage,
+    PageSpecJobOutput, Parity, RotationParameter, RotationSpec, SelectedPage,
     DEFAULT_MAX_ACROFORM_DEPTH,
 };
 pub use job::{
