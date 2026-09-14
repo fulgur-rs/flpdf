@@ -2443,6 +2443,14 @@ same Job configuration for the `show-pages` and `show-object` consumers
 (`QPDFJob_config.cc:414-417,654-656`; `QPDFJob.cc:816-829`). qtest exceptions
 and unrelated transformation/page-operation routes remain outside this row.
 
+2026-09-15 (`flpdf-7vov`): top-level `--check-linearization` no longer rejects
+`--add-attachment`, `--remove-attachment`, or `--copy-attachments-from` at the
+Clap boundary. These mutations are queued on the same `QPDFJob` and therefore
+run in `createQPDF` before the output-free inspection column. An explicit output
+path is rejected with qpdf's single `no output file may be given for this option`
+usage error; the three mutation-operation flags remain mutually exclusive with
+one another.
+
 `flpdf-5qbs` closes the remaining argv-surface mismatch in this inspection row.
 qpdf accepts repeated `doInspection` selectors: the boolean Config setters are
 idempotent, while `Config::showObject` and `Config::showAttachment` overwrite

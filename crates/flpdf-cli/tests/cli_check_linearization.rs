@@ -39,6 +39,22 @@ fn run_flpdf(args: &[&str]) -> Output {
         .expect("flpdf should spawn")
 }
 
+fn run_qpdf_owned(args: &[String]) -> Output {
+    ProcessCommand::new("/usr/bin/qpdf")
+        .args(args)
+        .output()
+        .expect("qpdf 11.9.0 should spawn")
+}
+
+fn run_flpdf_owned(args: &[String]) -> Output {
+    Command::cargo_bin("flpdf")
+        .expect("flpdf binary should exist")
+        .env("FLPDF_PROGNAME", "qpdf")
+        .args(args)
+        .output()
+        .expect("flpdf should spawn")
+}
+
 fn assert_output_matches(actual: &Output, expected: &Output) {
     assert_eq!(actual.status.code(), expected.status.code());
     assert_eq!(actual.stdout, expected.stdout);
@@ -236,6 +252,100 @@ fn top_level_show_linearization_hint_stream_warning_is_emitted_once() {
     assert_output_matches(&actual, &expected);
     assert_eq!(warning_lines(&actual).len(), 1);
     assert!(String::from_utf8_lossy(&actual.stderr).contains("expected endobj"));
+}
+
+#[test]
+fn top_level_check_linearization_attachment_mutations_match_qpdf() {
+    if !qpdf_available() {
+        return;
+    }
+
+    let temp = tempfile::tempdir().expect("temporary directory should exist");
+    let input_with_attachment = fixture("attachment-two-page.pdf");
+    let plain_input = fixture("one-page.pdf");
+    let payload = Path::new(env!("CARGO_MANIFEST_DIR"))
+        .join("../../tests/fixtures/test_driver/fixture-names.txt");
+    let donor = input_with_attachment.clone();
+
+    let cases = [
+        (
+            "remove",
+            vec![
+                "--check-linearization".to_owned(),
+                "--list-attachments".to_owned(),
+                "--remove-attachment=attachment.txt".to_owned(),
+                input_with_attachment.display().to_string(),
+            ],
+            temp.path().join("remove-output.pdf"),
+        ),
+        (
+            "add",
+            vec![
+                "--check-linearization".to_owned(),
+                "--list-attachments".to_owned(),
+                "--add-attachment".to_owned(),
+                payload.display().to_string(),
+                "--".to_owned(),
+                plain_input.display().to_string(),
+            ],
+            temp.path().join("add-output.pdf"),
+        ),
+        (
+            "copy",
+            vec![
+                "--check-linearization".to_owned(),
+                "--list-attachments".to_owned(),
+                "--copy-attachments-from".to_owned(),
+                donor.display().to_string(),
+                "--".to_owned(),
+                plain_input.display().to_string(),
+            ],
+            temp.path().join("copy-output.pdf"),
+        ),
+    ];
+
+    for (name, args, output) in cases {
+        let expected = run_qpdf_owned(&args);
+        let actual = run_flpdf_owned(&args);
+        assert_eq!(
+            expected.status.code(),
+            Some(0),
+            "qpdf output-free {name} case failed: {expected:?}"
+        );
+        assert_eq!(
+            actual.status.code(),
+            expected.status.code(),
+            "output-free {name} exit status"
+        );
+        assert_eq!(actual.stdout, expected.stdout, "output-free {name} stdout");
+        assert_eq!(actual.stderr, expected.stderr, "output-free {name} stderr");
+
+        let mut route_args = args.clone();
+        route_args.retain(|argument| argument != "--list-attachments");
+        let expected = run_qpdf_owned(&route_args);
+        let actual = run_flpdf_owned(&route_args);
+        assert_eq!(expected.status.code(), Some(0));
+        assert_eq!(actual.status.code(), expected.status.code());
+        assert_eq!(actual.stdout, expected.stdout, "combined {name} stdout");
+        assert_eq!(actual.stderr, expected.stderr, "combined {name} stderr");
+
+        let mut output_args = route_args;
+        output_args.push(output.display().to_string());
+        let expected = run_qpdf_owned(&output_args);
+        let actual = run_flpdf_owned(&output_args);
+        assert_eq!(
+            expected.status.code(),
+            Some(2),
+            "qpdf output {name} case must be a usage error: {expected:?}"
+        );
+        assert_eq!(
+            actual.status.code(),
+            expected.status.code(),
+            "output {name} exit status"
+        );
+        assert_eq!(actual.stdout, expected.stdout, "output {name} stdout");
+        assert_eq!(actual.stderr, expected.stderr, "output {name} stderr");
+    }
 }
 
 #[test]
