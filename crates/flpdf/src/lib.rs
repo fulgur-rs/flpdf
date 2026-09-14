@@ -206,10 +206,7 @@ pub use outline_document_helper::OutlineDocumentHelper;
 pub use outline_object_helper::{OutlineId, OutlineItem, OutlineTree, OutlineTreeIter};
 pub use page_document_helper::{PageDocumentHelper, PageInput};
 pub use page_extract::{extract_page, extract_pages};
-pub use page_label_document_helper::{
-    merge_adjacent_ranges, merge_adjacent_ranges_with_prefix_presence, LabelRange, LabelStyle,
-    PageLabelDocumentHelper,
-};
+pub use page_label_document_helper::{LabelRange, LabelStyle, PageLabelDocumentHelper};
 pub use page_object_helper::{PageBox, PageObjectHelper};
 pub use page_splice::{splice_pages, splice_pages_with_max_depth};
 pub use pages::tree_rebuild::{rebuild_page_tree, rebuild_page_tree_with_max_depth, RebuildResult};

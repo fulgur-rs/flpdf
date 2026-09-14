@@ -39,3 +39,58 @@ fn label_prefix_read_stays_on_the_silent_string_accessor() {
         "the warning-emitting getStringValue port must not read /P"
     );
 }
+
+#[test]
+fn typed_reconstruction_helpers_are_test_only_after_raw_cutover() {
+    let helper_path =
+        PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("src/page_label_document_helper.rs");
+    let helper = fs::read_to_string(helper_path)
+        .expect("page_label_document_helper.rs must be readable")
+        .replace("\r\n", "\n");
+    for function in [
+        "labels_for_page_range",
+        "labels_for_selection_with_prefix_presence",
+        "label_prefix_is_present",
+        "write_reconstructed_labels_with_prefix_presence",
+    ] {
+        let declaration = format!("#[cfg(test)]\n    pub fn {function}");
+        assert!(
+            helper.contains(&declaration),
+            "typed helper {function} must be compiled only for tests"
+        );
+    }
+    for function in [
+        "merge_adjacent_ranges",
+        "merge_adjacent_ranges_with_prefix_presence",
+    ] {
+        assert!(
+            !helper.contains(&format!("fn {function}")),
+            "obsolete typed merge helper {function} must be removed"
+        );
+    }
+
+    let lib_path = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("src/lib.rs");
+    let lib = fs::read_to_string(lib_path)
+        .expect("lib.rs must be readable")
+        .replace("\r\n", "\n");
+    assert!(
+        !lib.contains("merge_adjacent_ranges"),
+        "typed range merge helpers must not remain crate-root API"
+    );
+
+    let production = production_source();
+    assert!(
+        production.contains("pub fn labels_for_selection")
+            && production.contains("self.labels_for_selection_raw(src_indices, out_start_idx)"),
+        "public selection labels must project the raw canonical route"
+    );
+    let selection_body = helper
+        .split_once("pub fn labels_for_selection(")
+        .and_then(|(_, remainder)| remainder.split_once("\n    /// Batch variant of"))
+        .map(|(body, _)| body)
+        .expect("labels_for_selection body must be present");
+    assert!(
+        !selection_body.contains("labels_for_selection_with_prefix_presence("),
+        "production selection labels must not call the test-only prefix helper"
+    );
+}

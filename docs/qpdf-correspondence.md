@@ -2525,7 +2525,7 @@ qpdf と同じ shallow page copy とし、汎用 `merge_documents` の library-l
 処理を正本とし、completion後の document-wide resource passを二重適用しない。
 `doSplitPages`（`QPDFJob.cc:2940-3027`）とwriter/output命名は `job/page_split.rs` に移設済み。
 `PageDocumentHelper::add_page(PageInput::Foreign)`、`PageObjectHelper::copy_annotations_from`、
-`PageLabelDocumentHelper::write_reconstructed_labels_with_prefix_presence` を通る fresh chunk
+`PageLabelDocumentHelper::write_reconstructed_labels_raw` を通る fresh chunk
 生成を実装し、CLI の単一入力・複数入力 split 出力を同じ job route に切り替えた。
 `flpdf-h0a9` では、page-spec の verbose diagnostics も `QPDFJob` の canonical route へ接続した。
 qpdf は `Config::verbose` (`QPDFJob_config.cc:637-645`) を job に保持し、

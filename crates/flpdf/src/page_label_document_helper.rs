@@ -136,82 +136,6 @@ impl LabelRange {
     // qpdf-deviation-end
 }
 
-/// Collapse a later `(first_page_idx, LabelRange)` entry into its
-/// predecessor when the later entry is redundant — its style, prefix, and
-/// `/St` are exactly what the predecessor's own numbering would already
-/// produce at that page index. Dropping such an entry does not change any
-/// page's rendered label; it only removes a needless explicit tree node.
-///
-/// `ranges` must be sorted ascending by index (the shape [`PageLabelDocumentHelper::ranges`]
-/// and [`PageLabelDocumentHelper::labels_for_page_range`] already produce);
-/// only consecutive pairs are compared.
-///
-/// # Examples
-///
-/// ```
-/// use flpdf::{merge_adjacent_ranges, LabelRange, LabelStyle};
-///
-/// let a = LabelRange { style: LabelStyle::Decimal, prefix: String::new(), start: 1 };
-/// // Index 5 continues `a`'s numbering exactly (1 + 5 == 6): redundant, dropped.
-/// let b = LabelRange { start: 6, ..a.clone() };
-/// let merged = merge_adjacent_ranges(vec![(0, a), (5, b)]);
-/// assert_eq!(merged.len(), 1);
-/// ```
-pub fn merge_adjacent_ranges(ranges: Vec<(i64, LabelRange)>) -> Vec<(i64, LabelRange)> {
-    let mut out: Vec<(i64, LabelRange)> = Vec::with_capacity(ranges.len());
-    for (idx, range) in ranges {
-        if let Some((prev_idx, prev_range)) = out.last() {
-            let expected_start = idx
-                .checked_sub(*prev_idx)
-                .and_then(|gap| prev_range.start.checked_add(gap));
-            if let Some(expected_start) = expected_start {
-                if prev_range.style == range.style
-                    && prev_range.prefix == range.prefix
-                    && range.start == expected_start
-                {
-                    continue; // redundant with the predecessor — drop the explicit entry
-                }
-            }
-            // Overflow signals either an unsorted input (checked_sub
-            // underflow) or a pathological i64::MAX-adjacent start (checked_add
-            // overflow); adversarial input or a caller bug. Safety first —
-            // keep the explicit entry rather than trust a synthetic
-            // "expected_start" that could accidentally match. Redundant
-            // entries never break correctness, only compactness.
-        }
-        out.push((idx, range));
-    }
-    out
-}
-
-/// qpdf's page-selection fold, retaining the raw presence of `/P` in each
-/// reconstructed label dictionary. An explicitly empty `/P` is not redundant
-/// with an absent `/P`: qpdf compares the raw handles while deciding whether
-/// to skip a subsequent entry (`QPDFPageLabelDocumentHelper.cc:57-79`).
-pub fn merge_adjacent_ranges_with_prefix_presence(
-    ranges: Vec<(i64, LabelRange, bool)>,
-) -> Vec<(i64, LabelRange, bool)> {
-    let mut out: Vec<(i64, LabelRange, bool)> = Vec::with_capacity(ranges.len());
-    for (idx, range, prefix_present) in ranges {
-        if let Some((prev_idx, prev_range, prev_prefix_present)) = out.last() {
-            let expected_start = idx
-                .checked_sub(*prev_idx)
-                .and_then(|gap| prev_range.start.checked_add(gap));
-            if let Some(expected_start) = expected_start {
-                if prev_range.style == range.style
-                    && prev_range.prefix == range.prefix
-                    && *prev_prefix_present == prefix_present
-                    && range.start == expected_start
-                {
-                    continue;
-                }
-            }
-        }
-        out.push((idx, range, prefix_present));
-    }
-    out
-}
-
 /// Compare reconstructed raw label dictionaries using qpdf's unparse
 /// comparison for `/S` and `/P` plus checked `/St` arithmetic
 /// (`QPDFPageLabelDocumentHelper.cc:57-79`).
@@ -667,7 +591,7 @@ impl<'a, R: Read + Seek> PageLabelDocumentHelper<'a, R> {
     }
     // qpdf-deviation-end
 
-    /// qpdf `getLabelsForPageRange` port: collect the label entries needed to
+    /// qpdf `getLabelsForPageRange` compatibility view: collect the label entries needed to
     /// reproduce the labels of pages `start_idx..=end_idx` if they were
     /// renumbered to begin at `new_start_idx`. Returns `(new_index, LabelRange)`
     /// pairs (the first entry plus every explicit entry in the source range),
@@ -698,6 +622,7 @@ impl<'a, R: Read + Seek> PageLabelDocumentHelper<'a, R> {
     /// - [`crate::Error::Unsupported`] when the number-tree depth limit is
     ///   exceeded.
     /// - Any error from canonical ObjectHandle resolution.
+    #[cfg(test)]
     pub fn labels_for_page_range(
         &mut self,
         start_idx: i64,
@@ -726,13 +651,9 @@ impl<'a, R: Read + Seek> PageLabelDocumentHelper<'a, R> {
             .collect()
     }
 
-    /// Batch variant of [`Self::labels_for_page_range`] for
-    /// page-selection/split/merge callers that would otherwise re-parse the
-    /// `/PageLabels` tree once per selected page. Fetches the tree ONCE and
-    /// emits one entry per input index (in input order); each entry's output
-    /// index is `out_start_idx + i`, so multi-input mergers can pass a
-    /// running base. Pair with [`merge_adjacent_ranges`] to fold away
-    /// redundant tail entries before writing.
+    /// Batch typed compatibility view for inspection callers. Page-job
+    /// reconstruction uses the raw canonical route internally so `/S` and `/P`
+    /// handles retain qpdf's exact presence and value semantics.
     ///
     /// # Errors
     ///
@@ -744,13 +665,17 @@ impl<'a, R: Read + Seek> PageLabelDocumentHelper<'a, R> {
         src_indices: &[i64],
         out_start_idx: i64,
     ) -> Result<Vec<(i64, LabelRange)>> {
-        self.labels_for_selection_with_prefix_presence(src_indices, out_start_idx)
-            .map(|entries| {
-                entries
-                    .into_iter()
-                    .map(|(index, label, _prefix_present)| (index, label))
-                    .collect()
+        self.labels_for_selection_raw(src_indices, out_start_idx)?
+            .into_iter()
+            .map(|(index, label)| {
+                LabelRange::from_handle(&label)?
+                    .map(|label| (index, label))
+                    .ok_or_else(|| {
+                        // cov:ignore-start: labels_for_selection_raw always emits dictionaries.
+                        Error::Unsupported("page label selection is not a dictionary".to_string())
+                    }) // cov:ignore-end
             })
+            .collect()
     }
 
     /// Batch variant of [`Self::labels_for_selection`] that also returns
@@ -763,6 +688,7 @@ impl<'a, R: Read + Seek> PageLabelDocumentHelper<'a, R> {
     /// This follows qpdf's `getLabelForPage` raw-dictionary construction
     /// (`QPDFPageLabelDocumentHelper.cc:23-51`), which retains `/P` key
     /// presence while projecting the effective `/St` value.
+    #[cfg(test)]
     pub fn labels_for_selection_with_prefix_presence(
         &mut self,
         src_indices: &[i64],
@@ -850,6 +776,7 @@ impl<'a, R: Read + Seek> PageLabelDocumentHelper<'a, R> {
     /// that distinction when `getLabelsForPageRange` copies raw label
     /// dictionaries; the JSON representation renders an empty Unicode prefix
     /// as `u:` while an absent prefix is omitted.
+    #[cfg(test)]
     pub fn label_prefix_is_present(&mut self, page_idx: i64) -> Result<bool> {
         let Some(mut tree) = self.pagelabels_tree()? else {
             return Ok(false);
@@ -871,8 +798,9 @@ impl<'a, R: Read + Seek> PageLabelDocumentHelper<'a, R> {
     /// subset or split (`QPDFJob::handlePageSpecs`, `QPDFJob::doSplitPages`):
     /// it always unconditionally replaces the catalog's `/PageLabels` with a
     /// freshly built flat array — never merging with, or preserving the
-    /// shape of, any prior value. Pair with [`Self::labels_for_page_range`] /
-    /// [`Self::label_for_page`], which produce the `entries` this expects.
+    /// shape of, any prior value. Pair with [`Self::label_for_page`] or a
+    /// caller-provided typed compatibility view, which produce the `entries`
+    /// this expects.
     /// A no-op when the document has no catalog, or the catalog is not a
     /// dictionary.
     ///
@@ -903,6 +831,7 @@ impl<'a, R: Read + Seek> PageLabelDocumentHelper<'a, R> {
     /// explicit empty `/P` prefix. This is the raw-handle distinction qpdf's
     /// `getLabelsForPageRange` preserves and the compact [`LabelRange`] value
     /// intentionally does not expose in its public three-field shape.
+    #[cfg(test)]
     pub fn write_reconstructed_labels_with_prefix_presence(
         &mut self,
         entries: &[(i64, LabelRange, bool)],
@@ -2097,8 +2026,8 @@ mod tests {
     // `getLabelsForPageRange`'s `skip_first` redundancy-skip branch needs a
     // non-empty accumulator from a prior call, which `doJSONPageLabels`
     // never provides (it always starts from an empty `Vec`) — so no oracle
-    // here exercises it. It stays covered by the existing hand-derived
-    // `merge_adjacent_ranges`/`labels_for_page_range_*` unit tests above.
+    // here exercises it. The raw redundancy rule stays covered by the existing
+    // hand-derived raw-label and get_labels_for_page_range unit tests above.
 
     use std::path::{Path, PathBuf};
     use std::process::Command;
