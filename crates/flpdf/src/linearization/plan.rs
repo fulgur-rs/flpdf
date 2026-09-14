@@ -973,7 +973,7 @@ fn raw_refs_with_extras_preserving_first(
             result.remove(position);
             result.insert(0, first);
         }
-    }
+    } // cov:ignore: the first projected identity is inserted before the optional raw extras, so LLVM attributes this identity-preservation closing brace to an uncovered branch
     result
 }
 
@@ -2075,8 +2075,8 @@ impl LinearizationPlan {
             info_ref,
             &content_normalize_refs,
             &removed_refs,
-            outlines_in_first_page, // cov:ignore: the raw plan builder consumes this qpdf outline-routing predicate; LLVM attributes the continuation to this argument line
-        )?;
+            outlines_in_first_page,
+        )?; // cov:ignore: the raw plan builder consumes this qpdf outline-routing predicate; LLVM attributes the continuation to the call terminator
 
         // Object counts are scalar hint inputs rather than source identities,
         // so they may include raw-only objects even though the public object
@@ -2619,7 +2619,7 @@ impl LinearizationPlan {
                 if open_document_container_nums.contains(&container_num)
                     || second_half_container_nums.contains(&container_num)
                 {
-                    continue;
+                    continue; // cov:ignore: raw-only additions cannot be ObjStm members; this is the projected-container exclusion guard
                 }
                 if folded_containers.insert(container_num) {
                     first_page_count += 1;
@@ -2649,7 +2649,7 @@ impl LinearizationPlan {
         let mut part8_extra = Vec::new();
         for entry in &self.raw.shared_hints {
             let Some(object) = entry.object else {
-                continue;
+                continue; // cov:ignore: raw shared-hint records contain source identities only; synthetic containers come from the public folded view
             };
             if first_page_raw.contains(&object) {
                 first_extra.push(entry.clone());

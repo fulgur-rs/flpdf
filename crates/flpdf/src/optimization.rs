@@ -708,6 +708,11 @@ mod tests {
         assert!(!optimization
             .objects_for(&ObjectUser::Root)
             .contains(&ObjectRef::new(5, 65_534)));
+        assert!(optimization
+            .raw_users_for(QpdfObjGen::new(99, 0))
+            .iter()
+            .next()
+            .is_none());
     }
 
     #[test]

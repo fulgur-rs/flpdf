@@ -146,8 +146,10 @@ fn matching_out_of_range_three_page_pdf() -> Vec<u8> {
     }
     let object_offset = bytes.len();
     bytes.extend_from_slice(b"8 65536 obj\n45\nendobj\n");
+    let second_object_offset = bytes.len();
+    bytes.extend_from_slice(b"9 65536 obj\n46\nendobj\n");
     let xref_offset = bytes.len();
-    bytes.extend_from_slice(b"xref\n0 9\n0000000000 65535 f \n");
+    bytes.extend_from_slice(b"xref\n0 10\n0000000000 65535 f \n");
     bytes.extend_from_slice(format!("{catalog_offset:010} 00000 n \n").as_bytes());
     bytes.extend_from_slice(format!("{pages_offset:010} 00000 n \n").as_bytes());
     for offset in page_offsets {
@@ -155,8 +157,10 @@ fn matching_out_of_range_three_page_pdf() -> Vec<u8> {
     }
     bytes.extend_from_slice(b"0000000000 00000 f \n0000000000 00000 f \n");
     bytes.extend_from_slice(format!("{object_offset:010} 65536 n \n").as_bytes());
+    bytes.extend_from_slice(format!("{second_object_offset:010} 65536 n \n").as_bytes());
     bytes.extend_from_slice(
-        format!("trailer\n<< /Size 9 /Root 1 0 R >>\nstartxref\n{xref_offset}\n%%EOF\n").as_bytes(),
+        format!("trailer\n<< /Size 10 /Root 1 0 R >>\nstartxref\n{xref_offset}\n%%EOF\n")
+            .as_bytes(),
     );
     bytes
 }
@@ -536,10 +540,13 @@ fn linearized_routes_a_raw_child_private_to_a_later_page() {
 fn linearized_routes_a_raw_child_shared_by_later_pages_to_part8() {
     let mut pdf = Pdf::open_mem_owned(matching_out_of_range_three_page_pdf()).expect("open PDF");
     let raw_child = pdf.get_object_handle_by_raw_identity(8, 65_536);
+    let second_raw_child = pdf.get_object_handle_by_raw_identity(9, 65_536);
     for page_number in [4, 5] {
-        pdf.get_object_handle(flpdf::ObjectRef::new(page_number, 0))
-            .replace_key(b"/RawChild", raw_child.clone())
+        let page = pdf.get_object_handle(flpdf::ObjectRef::new(page_number, 0));
+        page.replace_key(b"/RawChild", raw_child.clone())
             .expect("attach raw child to later page");
+        page.replace_key(b"/SecondRawChild", second_raw_child.clone())
+            .expect("attach second raw child to later page");
     }
 
     let mut writer = PdfWriter::new(&mut pdf);
