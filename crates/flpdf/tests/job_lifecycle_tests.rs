@@ -4009,6 +4009,28 @@ fn json_page_specs_reject_a_config_pages_group_after_json_pages() {
 }
 
 #[test]
+fn config_plaintext_copy_encryption_is_a_noop_for_an_encrypted_primary() {
+    let tempdir = tempfile::tempdir().unwrap();
+    let input = Path::new(env!("CARGO_MANIFEST_DIR"))
+        .join("../../tests/fixtures/encrypted/v4-aes-128-r4.pdf");
+    let donor = Path::new(env!("CARGO_MANIFEST_DIR")).join("../../tests/fixtures/minimal.pdf");
+    let output = tempdir.path().join("plaintext-output.pdf");
+
+    let mut job = QPDFJob::new();
+    job.set_password(b"user-v4-aes".to_vec());
+    job.config()
+        .input_file(&input)
+        .unwrap()
+        .output_file(&output)
+        .unwrap()
+        .copy_encryption(&donor, Vec::new());
+
+    assert_eq!(job.run().unwrap(), JobExitCode::Success);
+    let pdf = Pdf::open(BufReader::new(File::open(output).unwrap())).unwrap();
+    assert!(!pdf.is_encrypted());
+}
+
+#[test]
 fn json_page_spec_uses_copy_encryption_password_when_page_password_is_unspecified() {
     let tempdir = tempfile::tempdir().unwrap();
     let plaintext =

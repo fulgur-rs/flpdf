@@ -3282,7 +3282,13 @@ impl QPDFJob {
         }
         if let Some(path) = self.configuration.copy_encryption.clone() {
             match self.copy_encryption_source(&path) {
-                Ok(source) => writer_configuration.copy_encryption_parameters(source),
+                Ok(Some(source)) => writer_configuration.copy_encryption_parameters(source),
+                Ok(None) => {
+                    // qpdf's QPDFWriter::copyEncryptionParameters clears
+                    // implicit source-encryption preservation even when the
+                    // donor has no `/Encrypt` key (`QPDFWriter.cc:651-658`).
+                    writer_configuration.set_preserve_encryption(false);
+                }
                 Err(error) => {
                     self.report_job_error(&error)?;
                     return Err(error);
@@ -4058,16 +4064,14 @@ impl QPDFJob {
         Ok(())
     }
 
-    fn copy_encryption_source(&mut self, path: &Path) -> Result<crate::CopyEncryptionSource> {
+    fn copy_encryption_source(
+        &mut self,
+        path: &Path,
+    ) -> Result<Option<crate::CopyEncryptionSource>> {
         let password = self.configuration.encryption_file_password.clone();
         let mut donor = self.open_job_source(path, &password)?;
         self.record_document_warnings(&donor);
-        donor.writer_copy_encryption_source()?.ok_or_else(|| {
-            Error::Usage(UsageError::new(format!(
-                "copyEncryption donor {} is not encrypted",
-                path.display()
-            )))
-        })
+        donor.writer_copy_encryption_source()
     }
 
     fn write_configured_json<R>(

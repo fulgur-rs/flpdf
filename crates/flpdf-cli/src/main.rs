@@ -5181,7 +5181,14 @@ fn apply_encryption_options(options: &mut WriterOptions, inputs: EncryptionCliOp
                     suppress_warnings,
                 ) {
                     Ok(src) => {
-                        options.copy_encryption = Some(src);
+                        if let Some(src) = src {
+                            options.copy_encryption = Some(src);
+                        } else {
+                            // qpdf's QPDFWriter::copyEncryptionParameters
+                            // clears implicit source-encryption preservation
+                            // before inspecting the donor (`QPDFWriter.cc:651-658`).
+                            options.preserve_encryption = false;
+                        }
                     }
                     Err(e) => {
                         emit_logger_error(format!("flpdf: {e}\n"));
@@ -5198,9 +5205,9 @@ fn apply_encryption_options(options: &mut WriterOptions, inputs: EncryptionCliOp
 /// information needed to copy its encryption to a new output file
 /// (`--copy-encryption`).
 ///
-/// Returns a [`CopyEncryptionSource`] ready to be stored in
-/// [`WriterOptions::copy_encryption`] or an error string suitable for printing
-/// to stderr before `exit(2)`.
+/// Returns the donor's [`CopyEncryptionSource`], or `None` for qpdf's explicit
+/// plaintext-donor no-op, or an error string suitable for printing to stderr
+/// before `exit(2)`.
 ///
 /// The accepted Standard-handler matrix is V=1/V=2 RC4, V=4 canonicalized to
 /// AESV2, and V=5 AESV3, matching qpdf's `copyEncryptionParameters` path.
@@ -5209,7 +5216,7 @@ fn build_copy_encryption_source(
     password: Option<&[u8]>,
     password_args: &PasswordArgs,
     suppress_warnings: bool,
-) -> CliResult<CopyEncryptionSource> {
+) -> CliResult<Option<CopyEncryptionSource>> {
     let file =
         File::open(path).map_err(|e| format!("--copy-encryption: cannot open {:?}: {e}", path))?;
     let reader = BufReader::new(file);
@@ -5232,9 +5239,12 @@ fn build_copy_encryption_source(
 
     // Validate the donor is encrypted using qpdf's individual encryption
     // projections rather than a crate-specific aggregate information object.
-    let version = donor
-        .encryption_version()
-        .ok_or_else(|| format!("--copy-encryption: donor {:?} is not encrypted", path))?;
+    let Some(version) = donor.encryption_version() else {
+        // qpdf's copyEncryptionParameters leaves the writer unencrypted when
+        // the donor trailer has no `/Encrypt`; absence is an explicit no-op,
+        // not a malformed donor (`QPDFWriter.cc:651-658`).
+        return Ok(None);
+    };
     let length_bits = donor.encryption_length_bits().ok_or_else(|| {
         format!(
             "--copy-encryption: donor {:?} has no encryption key length",
@@ -5281,16 +5291,16 @@ fn build_copy_encryption_source(
     // The reader owns the authenticated qpdf copy-encryption boundary. It
     // snapshots the live /Encrypt and /ID[0] handles without exposing the
     // legacy Object route to this external CLI crate.
-    let mut source = donor
-        .writer_copy_encryption_source()?
-        .ok_or_else(|| format!("--copy-encryption: donor {:?} is not encrypted", path))?;
+    let Some(mut source) = donor.writer_copy_encryption_source()? else {
+        return Ok(None);
+    };
     source.file_key = file_key;
     source.object_key_alg = if version >= 4 {
         ObjectKeyAlg::Aes
     } else {
         ObjectKeyAlg::Rc4
     };
-    Ok(source)
+    Ok(Some(source))
 }
 
 /// Parse the qpdf-shaped `--encrypt USER-PW OWNER-PW KEY-LEN [sub-flags]`
@@ -8202,7 +8212,8 @@ fn run_page_extraction_after_plan<R: Read + Seek + 'static>(
         .map(parse_split_n)
         .transpose()?;
     let split_pages_active = split_pages.is_some_and(|size| size > 0);
-    options.preserve_encryption = primary_encrypted && !split_pages_active && !decrypt;
+    options.preserve_encryption =
+        options.preserve_encryption && primary_encrypted && !split_pages_active && !decrypt;
     // qpdf keeps the authenticated primary input as the output/base document
     // for `--pages` (libqpdf/QPDFJob.cc:2360-2633). The multi-source job has
     // already copied selected pages into a fresh plaintext Pdf, so its writer
@@ -8227,7 +8238,8 @@ fn run_page_extraction_after_plan<R: Read + Seek + 'static>(
     // clears `encryption_parameters` (`writer.rs:451-453`) -- so letting the
     // carryover run here would silently drop the requested passwords and leave
     // the output openable with the source credentials instead.
-    if !split_pages_active
+    if options.preserve_encryption
+        && !split_pages_active
         && options.encrypt.is_none()
         && options.copy_encryption.is_none()
         && !options.qdf
