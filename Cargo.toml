@@ -73,6 +73,12 @@ cc = "1"
 # changing Rust-level behavior; keep this as Cargo profile state so release
 # and local builds use the same reproducible settings.
 [profile.release]
+# Full-matrix RSS measurements on the qpdf-shaped fat-LTO binary show that
+# opt-level 2 shrinks the executed code image further than opt-level 3 while
+# keeping the qpdf 11.9.0 wall-time ratio within the measured variation. Keep
+# this explicit so shipped release builds and local measurements share one
+# reproducible profile.
+opt-level = 2
 lto = "fat"
 codegen-units = 1
 
