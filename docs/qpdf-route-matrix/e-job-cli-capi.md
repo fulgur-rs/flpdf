@@ -660,6 +660,25 @@ output無しの inspection routeへ進む。writer output を新たに作る変�
 分岐 `:484-491` より前）。本 slice は受理境界のみを揃えたもので、image option を
 inspection route へ配線するのは `flpdf-w2fk` の範囲である。
 
+`--generate-appearances` は create-stage の AcroForm 変換だけを有効にし、writer の
+stream decode level を暗黙には変更しない。qpdf の `Members::decode_level` の初期値は
+`generalized` だが、`QPDFJob::setWriterOptions` が `QPDFWriter::setDecodeLevel` を呼ぶのは
+`decode_level_set` が真のときだけである（`include/qpdf/QPDFJob.hh:632-637`、
+`libqpdf/QPDFJob.cc:2847-2875`）。従って `--generate-appearances` 単独では
+`QPDFWriter::doWriteSetup` の `stream_decode_level` 起点の
+`initializeSpecialStreams`／page-tree walk（`libqpdf/QPDFWriter.cc:2114-2116`）を
+発生させない。その writer 設定を変える経路は 3 つある——`--decode-level` の明示指定、
+`--stream-data` の明示指定、そして **QDF の暗黙既定**である。qpdf は
+`initializeSpecialStreams` を `m->qdf_mode || m->normalize_content ||
+m->stream_decode_level` で起動するため（`libqpdf/QPDFWriter.cc:2114-2116`）、
+`--qdf` は decode level の明示なしに page-tree walk を起こす。flpdf 側も
+`WriterSettings::to_write_options` が `qdf_mode && !decode_level_set` のとき
+`DecodeLevel::Generalized` を既定に置く（`crates/flpdf/src/writer/settings.rs:123-128`）。
+実測でも `--qdf` 単独で qpdf・flpdf とも `direct; converting to indirect` 警告を出す。
+この区別は `crates/flpdf-cli/src/main.rs` の writer configuration consumer と
+D26 の page-repair trigger の両方で維持する。QDF を除外し忘れると D26 の
+trigger 一覧が不完全になる。
+
 ### option 別対応表
 
 `yes` は該当箇所に実装ありと確認済み、空欄は未確認/未実装。`main.rs` 列の性質は上記の

@@ -335,6 +335,60 @@ fn top_level_page_operations_apply_appearance_and_flatten_transformations_like_q
 }
 
 #[test]
+fn rewrite_generate_appearances_does_not_repair_page_tree_like_qpdf() {
+    if !qpdf_available() {
+        if std::env::var_os("CI").is_some() {
+            panic!("{EXPECTED_QPDF_VERSION} is required for this parity test on CI");
+        }
+        eprintln!("skipping: {EXPECTED_QPDF_VERSION} is not available");
+        return;
+    }
+
+    let fixture_dir = Path::new(env!("CARGO_MANIFEST_DIR")).join("../../tests/fixtures/compat");
+    let fixtures = [
+        "direct-leaf-kid.pdf",
+        "shared-page-two-parents.pdf",
+        "shared-page-two-parents-reconstructed.pdf",
+        "shared-page-two-parents-pushmint.pdf",
+        "shared-leaf-mediabox-default.pdf",
+        "mistyped-page-tree.pdf",
+        "missing-mediabox-leaf.pdf",
+        "root-pages-points-into-tree.pdf",
+    ];
+
+    for fixture in fixtures {
+        let tempdir = tempfile::tempdir().unwrap();
+        let input = fixture_dir.join(fixture);
+        let qpdf_output = tempdir.path().join("qpdf.pdf");
+        let flpdf_output = tempdir.path().join("flpdf.pdf");
+        let input = input.to_str().unwrap().to_owned();
+
+        let qpdf_args = vec![
+            "--generate-appearances".to_owned(),
+            "--static-id".to_owned(),
+            "--no-warn".to_owned(),
+            "--warning-exit-0".to_owned(),
+            input.clone(),
+            qpdf_output.to_str().unwrap().to_owned(),
+        ];
+        let flpdf_args = vec![
+            "--generate-appearances".to_owned(),
+            "--static-id".to_owned(),
+            "--no-warn".to_owned(),
+            "--warning-exit-0".to_owned(),
+            input,
+            flpdf_output.to_str().unwrap().to_owned(),
+        ];
+        let qpdf = run_qpdf(&qpdf_args);
+        let flpdf = run_flpdf_quiet(&flpdf_args);
+        let label = format!("rewrite --generate-appearances {fixture}");
+        assert_process_matches(&qpdf, &flpdf, &label);
+        assert!(qpdf.status.success(), "{label}: qpdf failed");
+        assert_pdf_outputs_match(&qpdf_output, &flpdf_output, false, &label);
+    }
+}
+
+#[test]
 fn top_level_page_selection_coalesces_contents_like_qpdf() {
     if !qpdf_available() {
         if std::env::var_os("CI").is_some() {

@@ -483,8 +483,7 @@ fn writer_configuration(
     linearize: bool,
     linearize_pass1: Option<&Path>,
 ) -> CliResult<WriterConfiguration> {
-    let mut configuration =
-        writer_configuration_unnormalized(options, linearize, linearize_pass1, false)?;
+    let mut configuration = writer_configuration_unnormalized(options, linearize, linearize_pass1)?;
     normalize_and_check_writer_configuration(&mut configuration, options)?;
     Ok(configuration)
 }
@@ -506,7 +505,6 @@ fn writer_configuration_unnormalized(
     options: &WriterOptions,
     linearize: bool,
     linearize_pass1: Option<&Path>,
-    force_generalized_decode: bool,
 ) -> CliResult<WriterConfiguration> {
     let mut configuration = WriterConfiguration::default();
     configuration.set_object_stream_mode(options.object_streams);
@@ -516,14 +514,12 @@ fn writer_configuration_unnormalized(
     if let Some(mode) = options.compress_streams {
         configuration.set_compress_streams(matches!(mode, CompressStreams::Yes));
     }
+    // qpdf keeps the job's generalized decode default for inspection consumers,
+    // but only forwards it to QPDFWriter when decode_level_set is true
+    // (`QPDFJob.cc:2847-2875`). Do not infer a writer decode request from the
+    // create-stage --generate-appearances transformation.
     if options.decode_level_set {
         configuration.set_decode_level(options.decode_level);
-    } else if force_generalized_decode && options.stream_data.is_none() {
-        // QPDFJob::Members defaults the writer decode level to generalized
-        // (`include/qpdf/QPDFJob.hh:635-637`), even when compression is
-        // disabled. Generated appearances need that same pipe so their
-        // ValueSetter token filter is applied at write time.
-        configuration.set_decode_level(StreamDecodeLevel::Generalized);
     }
     configuration.set_recompress_flate(options.recompress_flate);
     if let Some(level) = options.compression_level {
@@ -6181,7 +6177,6 @@ fn run_page_operations_with_qpdf_job(
         &job_options,
         args.linearize,
         args.linearize_pass1.as_deref(),
-        args.generate_appearances,
     )?;
     job.set_writer_configuration(writer_configuration);
 
@@ -6327,7 +6322,6 @@ fn run_rewrite_with_qpdf_job(
         &writer_options,
         linearize,
         linearize_pass1,
-        generate_appearances,
     )?);
     match job.write_qpdf(&mut pdf) {
         Ok(()) => finish_job_exit_status(job.get_exit_code()),
@@ -6532,7 +6526,6 @@ fn run_rewrite_opened<R: Read + Seek + 'static>(
         &writer_options,
         linearize,
         linearize_pass1,
-        generate_appearances,
     )?);
     match job.write_qpdf(&mut pdf) {
         Ok(()) => finish_job_exit_status(job.get_exit_code()),
@@ -10247,7 +10240,6 @@ fn run_configured_attachment_job(
     writer_options: &WriterOptions,
     linearize: bool,
     linearize_pass1: Option<&Path>,
-    generate_appearances: bool,
 ) -> CliResult<()> {
     let mut pdf = match job.create_qpdf()? {
         Some(pdf) => pdf,
@@ -10262,7 +10254,6 @@ fn run_configured_attachment_job(
         writer_options,
         linearize,
         linearize_pass1,
-        generate_appearances,
     )?);
     match job.write_qpdf(&mut pdf) {
         Ok(()) => finish_job_exit_status(job.get_exit_code()),
@@ -10338,13 +10329,7 @@ fn run_add_attachment(
             configuration.add_attachment(option);
         }
     }
-    run_configured_attachment_job(
-        job,
-        &writer_options,
-        linearize,
-        linearize_pass1,
-        transform_options.generate_appearances,
-    )
+    run_configured_attachment_job(job, &writer_options, linearize, linearize_pass1)
 }
 
 /// `--remove-attachment KEY [input] [output]`
@@ -10388,13 +10373,7 @@ fn run_remove_attachment(
             configuration.remove_attachment(arg_parser::os_bytes(key));
         }
     }
-    run_configured_attachment_job(
-        job,
-        &writer_options,
-        linearize,
-        linearize_pass1,
-        transform_options.generate_appearances,
-    )
+    run_configured_attachment_job(job, &writer_options, linearize, linearize_pass1)
 }
 
 /// `--list-attachments [--verbose] input`
@@ -10529,13 +10508,7 @@ fn run_copy_attachments_from(
             );
         }
     }
-    run_configured_attachment_job(
-        job,
-        &writer_options,
-        linearize,
-        linearize_pass1,
-        transform_options.generate_appearances,
-    )
+    run_configured_attachment_job(job, &writer_options, linearize, linearize_pass1)
 }
 
 #[cfg(test)]
