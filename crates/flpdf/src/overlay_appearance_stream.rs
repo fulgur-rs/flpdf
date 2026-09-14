@@ -1322,7 +1322,7 @@ mod tests {
         // recorded under dr_map for F1->F1_1 could never have matched this
         // stream's content even if it decoded successfully. Its content uses
         // CCITTFaxDecode: a real ISO 32000 stream filter, but one flpdf
-        // intentionally never decodes (crate::filters::passthrough_codec_label
+        // intentionally never decodes (stream_filter::passthrough_codec_label
         // — an image/binary passthrough codec, preserved verbatim). Real
         // qpdf's AcroForm::adjustAppearanceStream wraps the equivalent
         // content-parse step in a try/catch that turns exactly this kind of

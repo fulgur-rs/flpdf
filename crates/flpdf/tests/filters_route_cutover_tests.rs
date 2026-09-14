@@ -26,6 +26,22 @@ fn filter_public_boundaries_are_object_handle_native() {
 }
 
 #[test]
+fn passthrough_codec_label_has_no_public_filters_bridge() {
+    let filters = production_source(concat!(env!("CARGO_MANIFEST_DIR"), "/src/filters.rs"));
+    assert!(
+        !filters.contains("pub fn passthrough_codec_label("),
+        "filters.rs still exposes the removed public passthrough label bridge"
+    );
+
+    let stream_filter =
+        production_source(concat!(env!("CARGO_MANIFEST_DIR"), "/src/stream_filter.rs"));
+    assert!(
+        stream_filter.contains("pub(crate) fn passthrough_codec_label("),
+        "stream_filter.rs must retain the canonical internal label owner"
+    );
+}
+
+#[test]
 fn object_shape_filter_reader_is_test_only() {
     let source =
         std::fs::read_to_string(concat!(env!("CARGO_MANIFEST_DIR"), "/src/stream_filter.rs"))

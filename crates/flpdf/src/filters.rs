@@ -3,9 +3,8 @@ use std::borrow::Cow;
 
 use crate::object_handle::ObjectHandle;
 use crate::stream_filter::{
-    decode_filter_specs_from_handle, passthrough_codec_label as stream_passthrough_codec_label,
-    stream_filter_for, undecodable_filter_error, FilterDecodePhase, FilterSpec,
-    CRYPT_STAGE_UNSUPPORTED,
+    decode_filter_specs_from_handle, stream_filter_for, undecodable_filter_error,
+    FilterDecodePhase, FilterSpec, CRYPT_STAGE_UNSUPPORTED,
 };
 use crate::{Error, Result};
 
@@ -16,22 +15,6 @@ use crate::{Error, Result};
 /// outright; this is an intentional divergence, not a compatibility target.
 /// The encode path (writer output, not untrusted) is not capped.
 const MAX_FILTER_CHAIN_LEN: usize = 16;
-
-/// Return a human-readable codec label if `filter_name` is one of the four
-/// image/binary codecs (`DCTDecode`, `JBIG2Decode`, `JPXDecode`,
-/// `CCITTFaxDecode`) that the writer always emits verbatim rather than
-/// re-encoding.
-///
-/// This is an **encode-side** classification: it does not indicate whether
-/// [`ObjectHandle::get_stream_data`] can decode the codec. `DCTDecode` streams,
-/// for example, are still reported here (the writer never re-encodes JPEG
-/// data) even though the canonical stream pipe decodes them.
-///
-/// Comparison is **byte-exact** (PDF names are case-sensitive per spec).
-/// Returns `None` for any other filter name.
-pub fn passthrough_codec_label(filter_name: &[u8]) -> Option<&'static str> {
-    stream_passthrough_codec_label(filter_name)
-}
 
 /// A non-fatal warning emitted while decoding a stream codec.
 ///
