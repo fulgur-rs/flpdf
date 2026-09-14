@@ -511,6 +511,55 @@ fn job_json_file_copy_encryption_reaches_the_writer() {
 }
 
 #[test]
+fn job_json_plaintext_copy_encryption_is_a_noop_and_disables_primary_preservation() {
+    if !qpdf_available() {
+        return;
+    }
+    let directory = tempfile::tempdir().unwrap();
+    let input = directory.path().join("encrypted-input.pdf");
+    let donor = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../tests/fixtures/minimal.pdf");
+    let encrypted_fixture = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+        .join("../../tests/fixtures/encrypted/v4-aes-128-r4.pdf");
+    let output = directory.path().join("output.pdf");
+    fs::copy(encrypted_fixture, &input).unwrap();
+    fs::write(
+        directory.path().join("job.json"),
+        format!(
+            r#"{{"inputFile":"{}","password":"user-v4-aes","outputFile":"{}","copyEncryption":"{}","staticId":""}}"#,
+            input.display(),
+            output.display(),
+            donor.display()
+        ),
+    )
+    .unwrap();
+
+    Command::cargo_bin("flpdf")
+        .unwrap()
+        .current_dir(directory.path())
+        .arg("--job-json-file=job.json")
+        .assert()
+        .success();
+
+    let show = ProcessCommand::new("/usr/bin/qpdf")
+        .arg("--show-encryption")
+        .arg(&output)
+        .output()
+        .unwrap();
+    assert!(show.status.success(), "qpdf must inspect output: {show:?}");
+    assert_eq!(
+        String::from_utf8_lossy(&show.stdout),
+        format!("File is not encrypted{EOL}")
+    );
+
+    let check = ProcessCommand::new("/usr/bin/qpdf")
+        .arg("--check")
+        .arg(&output)
+        .output()
+        .unwrap();
+    assert!(check.status.success(), "qpdf must check output: {check:?}");
+}
+
+#[test]
 fn job_json_file_password_mode_reaches_encryption_writer() {
     if !qpdf_available() {
         return;

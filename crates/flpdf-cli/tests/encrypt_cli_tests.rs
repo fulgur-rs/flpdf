@@ -132,6 +132,35 @@ fn ensure_qpdf_or_skip() -> bool {
     false
 }
 
+fn assert_unencrypted_output(output: &Path) {
+    let show = ShellCommand::new("qpdf")
+        .arg("--show-encryption")
+        .arg(output)
+        .output()
+        .expect("run qpdf --show-encryption");
+    assert!(
+        show.status.success(),
+        "qpdf --show-encryption failed: {}",
+        String::from_utf8_lossy(&show.stderr)
+    );
+    assert_eq!(
+        normalize_text_newlines(&show.stdout),
+        b"File is not encrypted\n"
+    );
+
+    let check = ShellCommand::new("qpdf")
+        .arg("--check")
+        .arg(output)
+        .output()
+        .expect("run qpdf --check");
+    assert!(
+        check.status.success(),
+        "qpdf --check failed: stdout={} stderr={}",
+        String::from_utf8_lossy(&check.stdout),
+        String::from_utf8_lossy(&check.stderr)
+    );
+}
+
 fn assert_qdf_encrypted_output(output: &Path, password: &str) {
     let bytes = std::fs::read(output).expect("read encrypted QDF output");
     assert!(
@@ -2616,14 +2645,19 @@ fn copy_encryption_floors_pdf_header_to_1_6() {
     );
 }
 
-/// `--copy-encryption` applied to a plaintext donor is rejected with a
-/// clear "not encrypted" diagnostic.
+/// `QPDFWriter::copyEncryptionParameters` clears source-encryption
+/// preservation before checking the donor's `/Encrypt` key, so a plaintext
+/// donor is an explicit no-op rather than an error (`QPDFWriter.cc:651-658`).
 #[test]
-fn copy_encryption_unencrypted_donor_is_rejected() {
+fn copy_encryption_unencrypted_donor_is_a_noop() {
+    if !ensure_qpdf_or_skip() {
+        return;
+    }
     let tmp = tempfile::tempdir().unwrap();
     let out = tmp.path().join("out.pdf");
     Command::cargo_bin("flpdf")
         .unwrap()
+        .arg("--static-id")
         .arg(format!(
             "--copy-encryption={}",
             fixture(UNENCRYPTED_FIXTURE).display()
@@ -2631,8 +2665,56 @@ fn copy_encryption_unencrypted_donor_is_rejected() {
         .arg(fixture(UNENCRYPTED_FIXTURE))
         .arg(&out)
         .assert()
-        .failure()
-        .stderr(predicates::str::contains("not encrypted"));
+        .success()
+        .stdout("")
+        .stderr("");
+    assert_unencrypted_output(&out);
+}
+
+#[test]
+fn rewrite_copy_encryption_unencrypted_donor_is_a_noop() {
+    if !ensure_qpdf_or_skip() {
+        return;
+    }
+    let tmp = tempfile::tempdir().unwrap();
+    let out = tmp.path().join("rewrite-out.pdf");
+    Command::cargo_bin("flpdf")
+        .unwrap()
+        .arg("rewrite")
+        .arg(format!(
+            "--copy-encryption={}",
+            fixture(UNENCRYPTED_FIXTURE).display()
+        ))
+        .arg(fixture(UNENCRYPTED_FIXTURE))
+        .arg(&out)
+        .assert()
+        .success()
+        .stdout("")
+        .stderr("");
+    assert_unencrypted_output(&out);
+}
+
+#[test]
+fn pages_copy_encryption_unencrypted_donor_is_a_noop() {
+    if !ensure_qpdf_or_skip() {
+        return;
+    }
+    let tmp = tempfile::tempdir().unwrap();
+    let out = tmp.path().join("pages-out.pdf");
+    Command::cargo_bin("flpdf")
+        .unwrap()
+        .arg(format!(
+            "--copy-encryption={}",
+            fixture(UNENCRYPTED_FIXTURE).display()
+        ))
+        .arg(fixture(ONE_PAGE_FIXTURE))
+        .args(["--pages", ".", "1", "--"])
+        .arg(&out)
+        .assert()
+        .success()
+        .stdout("")
+        .stderr("");
+    assert_unencrypted_output(&out);
 }
 
 /// `--copy-encryption` accepts qpdf's V=5 AES-256 Standard-handler donor.
