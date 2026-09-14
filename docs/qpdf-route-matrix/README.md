@@ -98,7 +98,7 @@ done | sort | uniq -c
 
 2026-09-14 の current-main audit anchor は `origin/main=c94aad9bc`、pinned qpdf は
 11.9.0 commit `3b97c9bd266b7c32ea36d3536e22dab77412886d` である。checker の実測は
-**この revision を適用した tree で** 1054 qpdf citations / 907 flpdf citations /
+**この revision を適用した tree で** 1055 qpdf citations / 909 flpdf citations /
 259 logical rows、分類は
 canonical 122 / mixed 127 / bridge 10 / unknown 0。A〜E の160行だけを数える
 上の領域別集計は canonical 98 / mixed 60 / bridge 2 / unknown 0 なので、checker
@@ -662,7 +662,7 @@ warning collectionやtoken primitiveの移植を、領域A全体の統合完了�
 #### 7.2.3 stream（領域 C）
 
 1. **hygiene**（§7.4）— C19 / C28 の dead route 削除は `.42` で完了。C23 の `pub` 撤去は `.43` で完了。
-2. **C21 の辞書差** — `/F` `/FFilter` `/FDecodeParms` 削除の到達条件をoracle fixtureで固定し、qpdfの責務に沿って修正する。逸脱マーカーは修正完了の代替にしない。
+2. ~~**C21 の辞書差**~~ — 完了。`/F` `/FFilter` `/FDecodeParms` は `writer/object.rs::prepare_stream_dict_entries`（`crates/flpdf/src/writer/object.rs:1709-1712`）が全分岐で触らない契約を doc comment（`libqpdf/QPDFWriter.cc:1440-1485` 引用）と `tests/oracle/qpdf_refiltered_stream_dictionary_probe.cc` で固定済み。行分類も canonical。
 3. **C22** — C-U3 library harnessでplain/QDF cacheとlinearized probeの挙動を照合する。非対称だけで早期return撤去を決めない。
 4. **C42 / B11** — recovered length を qpdf 同様に全 span で pipe する経路として完了。表示専用の EOL metadata や framing extension は持たない。前提: probe C-U1。
 5. ~~**C27**~~ — `.48.49` で canonical 化済み（§10 X-4 参照）。bootstrap-context decode は `ObjectHandle::get_stream_data(DecodeLevel::Specialized)` へ移行した。B17 の xref entry 構文処理の正本とは別責務である点は変わらない。
@@ -670,7 +670,7 @@ warning collectionやtoken primitiveの移植を、領域A全体の統合完了�
 7. **C8 / C9 / C25 / C28、E-27 / E-28** — provider/copy/decodeの不足primitiveを明示し、xrefとdriver test 0/1など既知consumerからbounded cutoverする。C4 / C26 / C27 / C29 は行レベルで canonical 化済みのため本 step から外した。C43 の dead public wrapper は `flpdf-3yn9.48.91` で撤去済みだが、内部 owner が残るため行は bridge (ii) のまま（`flpdf-w5pjs`）。
 
 qpdf 呼び出し順を壊さない理由: §5.C 第 4 行（`willFilterStream` の判定順序）が 2 と 3 を
-C20 / C21 の**後ろ**に置く理由 — 判定順序の canonical owner が確定していない状態で早期 return を
+C20 の**後ろ**に置く理由 — 判定順序の canonical owner が確定していない状態で早期 return を
 外すと、veto → metadata / normalize / compress の排他 chain が経路ごとに別の結果になる。
 §5.C 第 1 行（stream の復号は pipe 時、文字列の復号は parse 時）が 4 と 5 の境界で、
 decode 経路を canonical `pipe_stream_data` へ寄せても復号のタイミングは動かないことを保証する。
