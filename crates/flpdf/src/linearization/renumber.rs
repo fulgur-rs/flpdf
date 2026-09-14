@@ -312,7 +312,6 @@ impl RenumberMap {
                 .map(|optimization| {
                     optimization
                         .objects_for_root_key(b"Pages")
-                        .into_iter()
                         .filter_map(|object_ref| QpdfObjGen::try_from_object_ref(object_ref).ok())
                         .collect()
                 })
