@@ -840,13 +840,9 @@ struct Cli {
             "split_pages",
             "overlay",
             "underlay",
-            "add_attachment",
-            "remove_attachment",
-            "copy_attachments_from",
             "encrypt",
             "copy_encryption",
             "encryption_file_password",
-            "output",
         ]
     )]
     check_linearization: bool,
@@ -3347,6 +3343,14 @@ fn main() {
     // such as --check and --show-pages on that same object.
     // For ordinary JSON output, the separate --json branch remains first among
     // the non-inspection modes and retains its existing validation boundary.
+    if args.check_linearization && args.output.is_some() {
+        usage_exit(&no_output_file_for_inspection_error());
+    }
+
+    let attachment_mutation_requested = !attachment_segments.is_empty()
+        || !args.remove_attachment.is_empty()
+        || !args.copy_attachments_from.is_empty();
+
     let result = if args.replace_input && (args.json.is_some() || args.json_output.is_some()) {
         Err(UsageError::new("--json may not be used with --replace-input").into())
     } else if !args.job_json_file.is_empty() {
@@ -3388,11 +3392,16 @@ fn main() {
                 None => Err(missing_input_usage_error().into()),
             }
         }
-    } else if top_level_inspection_combination_requested(&args, !overlay_specs.is_empty()) {
+    } else if top_level_inspection_combination_requested(
+        &args,
+        !overlay_specs.is_empty(),
+        attachment_mutation_requested,
+    ) {
         run_combined_top_level_inspection(
             &args,
             top_level_inspection_transform_options,
             &overlay_specs,
+            &attachment_segments,
         )
     } else if let Some(object_ref) = args.show_object.as_deref() {
         run_show_object(
@@ -3888,7 +3897,11 @@ fn new_cli_job(suppress_warnings: bool) -> QPDFJob {
     job
 }
 
-fn top_level_inspection_combination_requested(args: &Cli, overlay_requested: bool) -> bool {
+fn top_level_inspection_combination_requested(
+    args: &Cli,
+    overlay_requested: bool,
+    attachment_mutation_requested: bool,
+) -> bool {
     let inspection_count = [
         args.check,
         args.show_object.is_some(),
@@ -3912,6 +3925,10 @@ fn top_level_inspection_combination_requested(args: &Cli, overlay_requested: boo
         || (inspection_count == 1 && !args.page_ops.pages.is_empty())
         || (inspection_count == 1 && (args.remove_restrictions || args.coalesce_contents))
     {
+        return true;
+    }
+
+    if args.check_linearization && attachment_mutation_requested {
         return true;
     }
 
@@ -3977,6 +3994,46 @@ fn configure_top_level_inspection_job(job: &mut QPDFJob, args: &Cli) -> CliResul
     }
     if let Some(key) = args.show_attachment.as_ref() {
         configuration.show_attachment(arg_parser::os_bytes(key.as_os_str()).to_vec());
+    }
+    Ok(())
+}
+
+/// Queue top-level attachment mutations on the same job that owns
+/// `--check-linearization` inspection. qpdf applies these mutations inside
+/// `handleTransformations` before `doInspection`, even when no output file is
+/// requested (`libqpdf/QPDFJob.cc:473,2230-2247`).
+fn configure_top_level_attachment_mutations(
+    job: &mut QPDFJob,
+    args: &Cli,
+    attachment_segments: &[Vec<Vec<u8>>],
+) -> CliResult<()> {
+    let mut configuration = job.config();
+    for tokens in attachment_segments.iter().cloned() {
+        let attachment = parse_add_attachment_segment(tokens)?;
+        let basename = path_basename(&attachment.file)?;
+        configuration.add_attachment(AttachmentAddOptions {
+            path: attachment.file,
+            key: attachment.key.unwrap_or_else(|| basename.clone()),
+            filename: attachment.filename.unwrap_or(basename),
+            mimetype: attachment.mimetype,
+            description: attachment.description,
+            creation_date: attachment.creation_date,
+            modification_date: attachment.mod_date,
+            replace: attachment.replace,
+            verbose: args.verbose,
+        });
+    }
+    for key in &args.remove_attachment {
+        configuration.remove_attachment(arg_parser::os_bytes(key));
+    }
+
+    for tokens in args.raw_copy_attachments_from.clone().unwrap_or_default() {
+        let donor = parse_copy_attachments_segment(tokens)?;
+        configuration.copy_attachments_from(
+            donor.file,
+            donor.password,
+            donor.prefix.unwrap_or_default(),
+        );
     }
     Ok(())
 }
@@ -4097,6 +4154,7 @@ fn run_combined_top_level_inspection(
     args: &Cli,
     transform_options: InspectionTransformOptions,
     overlay_specs: &[OverlaySpec],
+    attachment_segments: &[Vec<Vec<u8>>],
 ) -> CliResult<()> {
     if !args.page_ops.pages.is_empty() {
         return run_top_level_page_selection_inspection(args, transform_options, overlay_specs);
@@ -4120,6 +4178,7 @@ fn run_combined_top_level_inspection(
         args.remove_restrictions,
         args.coalesce_contents,
     );
+    configure_top_level_attachment_mutations(&mut job, args, attachment_segments)?;
 
     if args.page_ops.empty {
         reject_empty_inspection_output(args.input.as_deref())?;
