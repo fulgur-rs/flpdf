@@ -753,5 +753,13 @@ mod tests {
             pdf.writer_object_order_key(target),
             WriterObjectOrderKey::primary(ObjectRef::new(3, 0))
         );
+
+        let raw_only = ObjectRef::new(8, 0);
+        pdf.set_foreign_object_map(42, BTreeMap::from([(QpdfObjGen::new(3, 65_535), raw_only)]));
+        pdf.record_primary_writer_object_refs(42);
+        assert_eq!(
+            pdf.writer_object_order_key(raw_only),
+            WriterObjectOrderKey::fresh(raw_only)
+        );
     }
 }
