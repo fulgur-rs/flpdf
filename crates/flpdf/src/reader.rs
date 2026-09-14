@@ -1699,8 +1699,8 @@ mod compressible_owner_tests {
         assert!(max_generation.is_indirect());
         assert_eq!(
             max_generation.object_ref(),
-            Some(ObjectRef::new(1, u16::MAX)),
-            "the existing public ObjectRef projection remains for a raw indirect identity"
+            None,
+            "generation 65535 remains raw but is outside qpdf's N G R projection"
         );
         assert!(!pdf.canonical_object_refs().contains(&ObjectRef::new(0, 0)));
         assert!(!pdf
