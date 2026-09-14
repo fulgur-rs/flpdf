@@ -8,7 +8,7 @@ mod common;
 use std::fs::File;
 use std::io::BufReader;
 
-use flpdf::{pages::page_refs, rebuild_page_tree, ObjectRef, PagePlan, Pdf, PdfWriter};
+use flpdf::{pages::page_refs, rebuild_page_tree, ObjectRef, PageRange, Pdf, PdfWriter};
 
 fn main() -> Result<(), Box<dyn std::error::Error>> {
     // A 5-page source document (all pages share one font object).
@@ -18,9 +18,14 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     // Open the source for reading.
     let mut pdf = Pdf::open(BufReader::new(File::open(&src_path)?))?;
 
-    // Plan the 1-based selection 1, 3, 5 (resolves to concrete page ObjectRefs).
-    let plan = PagePlan::from_1based_indices(&mut pdf, &[1, 3, 5])?;
-    let selected: Vec<ObjectRef> = plan.pages().iter().map(|p| p.page_ref).collect();
+    // Resolve the qpdf page-range syntax 1,3,5 to concrete page ObjectRefs.
+    let all_pages = page_refs(&mut pdf)?;
+    let page_count = u32::try_from(all_pages.len())?;
+    let selected_indices = PageRange::parse_numrange("1,3,5")?.resolve(page_count)?;
+    let selected: Vec<ObjectRef> = selected_indices
+        .into_iter()
+        .map(|index| all_pages[(index - 1) as usize])
+        .collect();
 
     // Rebuild the page tree so only the selected pages remain (flattened /Pages).
     rebuild_page_tree(&mut pdf, &selected)?;

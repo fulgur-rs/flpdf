@@ -9,28 +9,16 @@
 //! page-tree-rebuild layers. It does **not** perform
 //! any rewriting; it only computes what pages are selected and in which order.
 //!
-//! # Example
-//!
-//! ```no_run
-//! use std::fs::File;
-//! use std::io::BufReader;
-//! use flpdf::{PagePlan, PageRange, Pdf};
-//!
-//! let mut pdf = Pdf::open(BufReader::new(File::open("input.pdf")?))?;
-//! let range = PageRange::parse_numrange("1,3,5")?;
-//! let plan = PagePlan::build(&mut pdf, &range)?;
-//! for entry in plan.pages() {
-//!     println!("page {}: {:?}", entry.index_1based, entry.page_ref);
-//! }
-//! # Ok::<(), Box<dyn std::error::Error>>(())
-//! ```
+//! The plan is consumed by the internal Job page-selection, split, and
+//! page-tree-rebuild routes. Public callers should use the corresponding
+//! `QPDFJobConfig` page-spec methods or higher-level page operations.
 
 use crate::pages::page_refs;
 use crate::{Error, ObjectRef, PageRange, Pdf, Result};
 use std::io::{Read, Seek};
 
 // ---------------------------------------------------------------------------
-// Public types
+// Job-internal types
 // ---------------------------------------------------------------------------
 
 /// A single page in a selection plan.
@@ -44,18 +32,17 @@ use std::io::{Read, Seek};
 /// - `index_1based` is used by split-pages for output file naming and
 ///   by the rotate layer for per-page diagnostics.
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub struct SelectedPage {
+pub(crate) struct SelectedPage {
     /// 1-based page number in the source document.
-    pub index_1based: u32,
+    pub(crate) index_1based: u32,
     /// Indirect reference to the `/Page` object.
-    pub page_ref: ObjectRef,
+    pub(crate) page_ref: ObjectRef,
 }
 
 /// An ordered selection of pages from a single document.
 ///
-/// Constructed via [`PagePlan::build`] (from a [`PageRange`]) or
-/// [`PagePlan::from_1based_indices`] (from a pre-resolved slice of 1-based
-/// page numbers). The ordering is deterministic: it reflects the input
+/// Constructed via [`PagePlan::build`] from a [`PageRange`]. The ordering is
+/// deterministic: it reflects the input
 /// expression order, including duplicates preserved by [`PageRange::resolve`].
 ///
 /// The selected page refs it produces feed directly into
@@ -63,7 +50,7 @@ pub struct SelectedPage {
 /// rewrites the document's `/Pages` tree to contain exactly those pages. For an
 /// end-to-end extraction walkthrough see the runnable `examples/extract_pages.rs`.
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub struct PagePlan {
+pub(crate) struct PagePlan {
     /// Number of pages in the source document.
     pub(crate) page_count: u32,
     /// The selected pages, in selection order.
@@ -86,7 +73,7 @@ impl PagePlan {
     ///   [`PageRange::resolve`] when a page number or `rN` endpoint is out of
     ///   range.
     /// - Any I/O or structural error from resolving the page tree.
-    pub fn build<R: Read + Seek>(pdf: &mut Pdf<R>, range: &PageRange) -> Result<Self> {
+    pub(crate) fn build<R: Read + Seek>(pdf: &mut Pdf<R>, range: &PageRange) -> Result<Self> {
         let all_refs = page_refs(pdf)?;
         let page_count = u32::try_from(all_refs.len()).map_err(|_| {
             Error::Unsupported(format!(
@@ -137,7 +124,11 @@ impl PagePlan {
     /// - [`Error::Missing`] when the document has no pages.
     /// - [`Error::Unsupported`] when any index is 0 or exceeds the page count.
     /// - Any I/O or structural error from [`page_refs`].
-    pub fn from_1based_indices<R: Read + Seek>(pdf: &mut Pdf<R>, indices: &[u32]) -> Result<Self> {
+    #[cfg(test)]
+    pub(crate) fn from_1based_indices<R: Read + Seek>(
+        pdf: &mut Pdf<R>,
+        indices: &[u32],
+    ) -> Result<Self> {
         let all_refs = page_refs(pdf)?;
         let page_count = u32::try_from(all_refs.len()).map_err(|_| {
             Error::Unsupported(format!(
@@ -180,29 +171,20 @@ impl PagePlan {
     }
 
     /// The selected pages in selection order.
-    pub fn pages(&self) -> &[SelectedPage] {
+    pub(crate) fn pages(&self) -> &[SelectedPage] {
         &self.pages
     }
 
     /// Number of pages in the source document (not the selection size).
-    pub fn source_page_count(&self) -> u32 {
+    #[cfg(test)]
+    pub(crate) fn source_page_count(&self) -> u32 {
         self.page_count
     }
 
     /// Number of pages in this selection.
-    pub fn len(&self) -> usize {
+    #[cfg(test)]
+    pub(crate) fn len(&self) -> usize {
         self.pages.len()
-    }
-
-    /// `true` when the selection is empty (no pages selected).
-    ///
-    /// This can only happen when `from_1based_indices` is called with an
-    /// empty slice on a document that has been found to have pages — in
-    /// practice the empty-slice path redirects to all-pages, so this method
-    /// will return `false` for any valid plan built from a real document.
-    /// It is provided for completeness.
-    pub fn is_empty(&self) -> bool {
-        self.pages.is_empty()
     }
 }
 

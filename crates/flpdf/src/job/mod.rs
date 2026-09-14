@@ -25,6 +25,7 @@ mod lifecycle;
 pub(crate) use lifecycle::qpdf_file_io_source_message;
 mod outline_dest_remap;
 mod overlay;
+#[cfg(test)]
 mod page_combine;
 mod page_merge;
 mod page_plan;
@@ -55,9 +56,7 @@ pub use overlay::{
     handle_under_overlay, overlay_verbose_report, OverlayKind, OverlaySpec, OverlayVerbosePage,
     OverlayVerboseSource,
 };
-pub use page_combine::{CombinedPage, CombinedPlan, InputSpec};
 pub use page_merge::{merge_documents, MergeInput};
-pub use page_plan::{PagePlan, SelectedPage};
 pub use page_range::{Endpoint, PageRange, PageRangeEntry, Parity};
 pub use page_specs::{copy_duplicate_page_annotations, PageSpecInput, PageSpecJobOutput};
 pub use page_split::SplitPageOptions;

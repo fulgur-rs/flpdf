@@ -9,7 +9,7 @@ use std::fs::File;
 use std::io::BufReader;
 
 use flpdf::{
-    pages::page_refs, rebuild_page_tree, ObjectRef, PageObjectHelper, PagePlan, Pdf, PdfWriter,
+    pages::page_refs, rebuild_page_tree, ObjectRef, PageObjectHelper, PageRange, Pdf, PdfWriter,
 };
 
 fn main() -> Result<(), Box<dyn std::error::Error>> {
@@ -19,9 +19,14 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     let mut pdf = Pdf::open(BufReader::new(File::open(&src_path)?))?;
 
-    // Select the first five pages (1-based 1..=5).
-    let plan = PagePlan::from_1based_indices(&mut pdf, &[1, 2, 3, 4, 5])?;
-    let selected: Vec<ObjectRef> = plan.pages().iter().map(|p| p.page_ref).collect();
+    // Resolve the qpdf page-range syntax 1-5 to concrete page ObjectRefs.
+    let all_pages = page_refs(&mut pdf)?;
+    let page_count = u32::try_from(all_pages.len())?;
+    let selected_indices = PageRange::parse_numrange("1-5")?.resolve(page_count)?;
+    let selected: Vec<ObjectRef> = selected_indices
+        .into_iter()
+        .map(|index| all_pages[(index - 1) as usize])
+        .collect();
 
     rebuild_page_tree(&mut pdf, &selected)?;
 

@@ -1,57 +1,12 @@
-//! qpdf correspondence: QPDFJob.cc handlePageSpecs multi-input combination split into a page-operation module.
-//! Multi-input page list combiner.
+//! qpdf correspondence: `QPDFJob.cc` `handlePageSpecs` multi-input selection support used by the internal page-operation tests.
 //!
-//! [`CombinedPlan`] opens multiple input documents (each with an optional
-//! password), applies each input's [`PageRange`], and concatenates the
-//! resulting [`PagePlan`]s in input order — matching qpdf's `--pages` semantics.
-//!
-//! # Ownership model
-//!
-//! The low-level entry point, [`CombinedPlan::build`], accepts a slice of
-//! already-opened `(Pdf<R>, PageRange)` pairs so that:
-//!
-//! - Tests can use in-memory readers (as in `page_plan.rs`'s tests).
-//! - No concrete `R` is fixed at the API boundary — callers supply whatever
-//!   reader they have.
-//!
-//! The path-based convenience helper [`CombinedPlan::from_specs`] takes a
-//! [`Vec<InputSpec>`], opens every file with the right password, and calls
-//! [`CombinedPlan::build`] internally.
-//!
-//! # qpdf semantics
-//!
-//! - Concatenation order equals input order; within each input the range
-//!   resolution order is preserved.
-//! - The **first input is the base**: its catalog and Info dictionary are the
-//!   ones that downstream rewrite layers must preserve. [`CombinedPlan::base_index`]
-//!   always returns `0`; the field is exposed explicitly so callers are not
-//!   relying on an implicit convention.
-//!
-//! # Example (low-level)
-//!
-//! ```no_run
-//! use std::fs::File;
-//! use std::io::BufReader;
-//! use flpdf::{CombinedPlan, PageRange, Pdf};
-//!
-//! let mut a = Pdf::open(BufReader::new(File::open("a.pdf")?))?;
-//! let mut b = Pdf::open(BufReader::new(File::open("b.pdf")?))?;
-//! let range_a = PageRange::parse_numrange("1-5")?;
-//! let range_b = PageRange::all();
-//!
-//! let plan = CombinedPlan::build(vec![
-//!     (&mut a, range_a),
-//!     (&mut b, range_b),
-//! ])?;
-//!
-//! println!("base input index: {}", plan.base_index()); // 0
-//! for entry in plan.flat_pages() {
-//!     println!("  input {}, page {}", entry.source_index, entry.page.index_1based);
-//! }
-//! # Ok::<(), Box<dyn std::error::Error>>(())
-//! ```
+//! The plan is an internal implementation of the Job page-selection route.
+//! External callers configure page selection through the public
+//! `QPDFJobConfig` page-spec methods instead of constructing this intermediate
+//! representation. The module is compiled only for the crate's unit tests.
 
-use crate::{Error, PagePlan, PageRange, Pdf, PdfOpenOptions, Result};
+use super::page_plan::PagePlan;
+use crate::{Error, PageRange, Pdf, PdfOpenOptions, Result};
 use std::io::{BufReader, Read, Seek};
 use std::path::PathBuf;
 
@@ -62,26 +17,30 @@ fn open_failure_source(error: &Error) -> &Error {
 }
 
 // ---------------------------------------------------------------------------
-// Public types
+// Job-internal types
 // ---------------------------------------------------------------------------
 
 /// Specification for one input document to the combiner.
 ///
 /// Used by the convenience path-based constructor [`CombinedPlan::from_specs`].
 #[derive(Debug, Clone)]
-pub struct InputSpec {
+pub(crate) struct InputSpec {
     /// Path to the PDF file on disk.
-    pub path: PathBuf,
+    pub(crate) path: PathBuf,
     /// Optional password to decrypt the file.
     /// The bytes are passed verbatim to [`PdfOpenOptions::password`].
-    pub password: Option<Vec<u8>>,
+    pub(crate) password: Option<Vec<u8>>,
     /// Which pages to include from this input.
-    pub range: PageRange,
+    pub(crate) range: PageRange,
 }
 
 impl InputSpec {
     /// Convenience constructor.
-    pub fn new(path: impl Into<PathBuf>, password: Option<Vec<u8>>, range: PageRange) -> Self {
+    pub(crate) fn new(
+        path: impl Into<PathBuf>,
+        password: Option<Vec<u8>>,
+        range: PageRange,
+    ) -> Self {
         Self {
             path: path.into(),
             password,
@@ -92,12 +51,12 @@ impl InputSpec {
 
 /// An entry in the combined flat page list, carrying the per-input source index.
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub struct CombinedPage {
+pub(crate) struct CombinedPage {
     /// 0-based index into the original input slice (identifies which `Pdf` the
     /// page belongs to).
-    pub source_index: usize,
+    pub(crate) source_index: usize,
     /// The selected page from that input.
-    pub page: super::page_plan::SelectedPage,
+    pub(crate) page: super::page_plan::SelectedPage,
 }
 
 /// Concatenated page selection from multiple input documents.
@@ -116,7 +75,7 @@ pub struct CombinedPage {
 /// `examples/extract_pages.rs` shows the related single-document selection path
 /// via [`PagePlan`].
 #[derive(Debug, Clone)]
-pub struct CombinedPlan {
+pub(crate) struct CombinedPlan {
     /// Per-input plans, in input order.
     per_input: Vec<PagePlan>,
     /// Flat concatenated view: `(source_index, SelectedPage)` pairs.
@@ -138,7 +97,7 @@ impl CombinedPlan {
     /// - [`Error::Unsupported`] when `inputs` is empty.
     /// - Any error from [`PagePlan::build`] — notably range-out-of-bounds or
     ///   missing pages — attributed to the relevant input by index.
-    pub fn build<R: Read + Seek>(inputs: Vec<(&mut Pdf<R>, PageRange)>) -> Result<Self> {
+    pub(crate) fn build<R: Read + Seek>(inputs: Vec<(&mut Pdf<R>, PageRange)>) -> Result<Self> {
         if inputs.is_empty() {
             return Err(Error::Unsupported(
                 "at least one input document is required; got an empty input list".into(),
@@ -179,7 +138,7 @@ impl CombinedPlan {
     /// - [`Error::Encrypted`] (possibly wrapped by [`Error::OpenFailure`]) when
     ///   a password is wrong or encryption is unsupported.
     /// - Any error from [`PagePlan::build`].
-    pub fn from_specs(specs: Vec<InputSpec>) -> Result<Self> {
+    pub(crate) fn from_specs(specs: Vec<InputSpec>) -> Result<Self> {
         if specs.is_empty() {
             return Err(Error::Unsupported(
                 "at least one input document is required; got an empty input list".into(),
@@ -250,7 +209,7 @@ impl CombinedPlan {
 
     /// Index of the base input whose catalog and Info dictionary downstream
     /// rewrite layers should preserve. Always `0`.
-    pub fn base_index(&self) -> usize {
+    pub(crate) fn base_index(&self) -> usize {
         0
     }
 
@@ -258,7 +217,7 @@ impl CombinedPlan {
     ///
     /// The caller can index into this slice with a `source_index` value from
     /// [`CombinedPage`] to retrieve the matching [`PagePlan`].
-    pub fn per_input_plans(&self) -> &[PagePlan] {
+    pub(crate) fn per_input_plans(&self) -> &[PagePlan] {
         &self.per_input
     }
 
@@ -266,17 +225,17 @@ impl CombinedPlan {
     ///
     /// Each entry carries `source_index` so that downstream layers can
     /// determine which input `Pdf` a page belongs to.
-    pub fn flat_pages(&self) -> &[CombinedPage] {
+    pub(crate) fn flat_pages(&self) -> &[CombinedPage] {
         &self.flat
     }
 
     /// Total number of selected pages across all inputs.
-    pub fn total_page_count(&self) -> usize {
+    pub(crate) fn total_page_count(&self) -> usize {
         self.flat.len()
     }
 
     /// Number of input documents in this plan.
-    pub fn input_count(&self) -> usize {
+    pub(crate) fn input_count(&self) -> usize {
         self.per_input.len()
     }
 }

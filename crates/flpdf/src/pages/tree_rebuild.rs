@@ -2,9 +2,9 @@
 //! Page-tree rebuild after extraction / merge / rotate.
 //!
 //! Given an open [`Pdf`] and an ordered list of selected leaf `/Page`
-//! `ObjectRef`s (the output of [`crate::PagePlan`] /
-//! [`crate::CombinedPlan`] for a **single** document), this
-//! module rebuilds the document's `/Pages` tree so that:
+//! `ObjectRef`s (the output of the internal page-selection planner for a
+//! **single** document), this module rebuilds the document's `/Pages` tree so
+//! that:
 //!
 //! - The root `/Pages` node's `/Kids` enumerates exactly the selected pages,
 //!   in selection order.
@@ -59,9 +59,9 @@
 //! # Scope (single document only)
 //!
 //! This layer operates on **one** [`Pdf`]. Rebuilding across multiple input
-//! documents ([`crate::CombinedPlan`] with >1 input) additionally
-//! requires cross-document object copying (renumbering, encryption-boundary
-//! handling, name-conflict resolution) and is a separate future layer. The
+//! documents with >1 input additionally requires cross-document object copying
+//! (renumbering, encryption-boundary handling, name-conflict resolution) and is
+//! a separate future layer. The
 //! single-input CLI wiring, outline/dest remap, and AcroForm
 //! handling all operate over a single document and can build on the
 //! [`RebuildResult`] returned here.
@@ -395,10 +395,9 @@ fn remove_inheritable_keys_from_page_tree<R: Read + Seek>(
 
 /// Rebuild the document's `/Pages` tree from `selected` leaf page refs.
 ///
-/// `selected` is the ordered list of source `/Page` `ObjectRef`s (from
-/// [`crate::PagePlan::pages`] / a single-input
-/// [`crate::CombinedPlan`]). Duplicate refs are permitted and
-/// produce duplicate output pages, matching qpdf.
+/// `selected` is the ordered list of source `/Page` `ObjectRef`s from the
+/// internal page-selection route. Duplicate refs are permitted and produce
+/// duplicate output pages, matching qpdf.
 ///
 /// On success the in-memory document is mutated so that its root `/Pages`
 /// value lists exactly the selected pages, each with inheritable attributes
@@ -406,10 +405,9 @@ fn remove_inheritable_keys_from_page_tree<R: Read + Seek>(
 /// its object reference; a direct catalog root remains direct. Serialize the
 /// result with [`crate::PdfWriter`].
 ///
-/// The `selected` refs it consumes are produced by
-/// [`PagePlan`](crate::PagePlan) (single document) or a single-input
-/// [`CombinedPlan`](crate::CombinedPlan). For an end-to-end
-/// extraction walkthrough see the runnable `examples/extract_pages.rs`.
+/// The `selected` refs it consumes are produced by the internal single-document
+/// or page-spec selection route. For an end-to-end extraction walkthrough see
+/// the runnable `examples/extract_pages.rs`.
 ///
 /// # Errors
 ///
