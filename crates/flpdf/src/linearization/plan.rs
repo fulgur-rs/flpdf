@@ -1276,7 +1276,7 @@ fn part9_thumbnail_category(
             user if is_outline_user(user) => has_outline = true,
             user if is_open_document_user(user) => has_open_document = true,
             user if is_document_other_user(user) => has_document_other = true,
-            _ => {}
+            _ => {} // cov:ignore: ObjectUser is a closed qpdf user enum; every current variant is handled above
         }
     }
 
@@ -1284,10 +1284,10 @@ fn part9_thumbnail_category(
         return None;
     }
     if other_pages.len() > 1 {
-        return None;
+        return None; // cov:ignore: qpdf routes objects with multiple non-first page users to Part 8 before part4_rest metadata is built
     }
     if other_pages.len() == 1 && thumbnail_pages.is_empty() && !has_document_other {
-        return None;
+        return None; // cov:ignore: qpdf routes this single-page object to Part 7 before part4_rest metadata is built
     }
     if thumbnail_pages.len() == 1 && !has_document_other {
         return Some(Part9ThumbnailCategory::Private(
