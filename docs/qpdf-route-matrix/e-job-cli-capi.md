@@ -660,6 +660,17 @@ output無しの inspection routeへ進む。writer output を新たに作る変�
 分岐 `:484-491` より前）。本 slice は受理境界のみを揃えたもので、image option を
 inspection route へ配線するのは `flpdf-w2fk` の範囲である。
 
+`--generate-appearances` は create-stage の AcroForm 変換だけを有効にし、writer の
+stream decode level を暗黙には変更しない。qpdf の `Members::decode_level` の初期値は
+`generalized` だが、`QPDFJob::setWriterOptions` が `QPDFWriter::setDecodeLevel` を呼ぶのは
+`decode_level_set` が真のときだけである（`include/qpdf/QPDFJob.hh:632-637`、
+`libqpdf/QPDFJob.cc:2847-2875`）。従って `--generate-appearances` 単独では
+`QPDFWriter::doWriteSetup` の `stream_decode_level` 起点の
+`initializeSpecialStreams`／page-tree walk（`libqpdf/QPDFWriter.cc:2114-2116`）を
+発生させず、`--decode-level` または `--stream-data` の明示指定だけがその writer
+設定を変える。この区別は `crates/flpdf-cli/src/main.rs` の writer configuration
+consumer と D26 の page-repair trigger の両方で維持する。
+
 ### option 別対応表
 
 `yes` は該当箇所に実装ありと確認済み、空欄は未確認/未実装。`main.rs` 列の性質は上記の

@@ -17,10 +17,12 @@
 //! - flatten=print: two annotations — one with Print bit (0x4 in /F), one
 //!   without — only the Print-bit one is removed.
 //!
-//! Tests that inspect raw page or appearance bytes use `--compress-streams=n`.
-//! The existing-appearance reuse test intentionally uses `--compress-streams=y`
-//! and decodes through the canonical `ObjectHandle` API so the token-filter
-//! writer path is exercised.
+//! Tests that inspect raw page or unfiltered appearance bytes use
+//! `--compress-streams=n`. Appearance-generation tests that assert the
+//! token-filtered content use `--stream-data=uncompress`, which is qpdf's
+//! explicit generalized-decode request. The existing-appearance reuse test
+//! intentionally uses `--compress-streams=y` and decodes through the canonical
+//! `ObjectHandle` API so the token-filter writer path is exercised.
 //!
 //! # qpdf divergence
 //!
@@ -603,7 +605,11 @@ fn generate_appearances_tx_ap_n_contains_tj() {
 
     Command::cargo_bin("flpdf")
         .unwrap()
-        .args(["rewrite", "--generate-appearances", "--compress-streams=n"])
+        .args([
+            "rewrite",
+            "--generate-appearances",
+            "--stream-data=uncompress",
+        ])
         .arg(&input)
         .arg(&output)
         .assert()
@@ -621,7 +627,8 @@ fn generate_appearances_tx_ap_n_contains_tj() {
         .expect("Tx widget should have /AP/N after --generate-appearances");
 
     // The uncompressed content stream must contain "Tj" (the text-show operator).
-    // We use --compress-streams=n so the stream data is the raw uncompressed bytes.
+    // --stream-data=uncompress both requests the token-filter pass and leaves
+    // the resulting stream data uncompressed, matching qpdf's option contract.
     assert!(
         data.windows(2).any(|w| w == b"Tj"),
         "/AP/N content stream must contain Tj operator (observable: value rendered); \
@@ -875,7 +882,11 @@ fn generate_appearances_combo_ap_n_contains_tj() {
 
     Command::cargo_bin("flpdf")
         .unwrap()
-        .args(["rewrite", "--generate-appearances", "--compress-streams=n"])
+        .args([
+            "rewrite",
+            "--generate-appearances",
+            "--stream-data=uncompress",
+        ])
         .arg(&input)
         .arg(&output)
         .assert()
