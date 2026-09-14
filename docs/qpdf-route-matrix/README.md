@@ -39,7 +39,8 @@ container-above-max だった — `flpdf-hi08` / PR #1486）。本表は残る m
 
 `scripts/check-qpdf-route-matrix.py --check` は、A〜E の160行に加えて
 E の qtest exception 表（物理98行を論理99ケースとして数える）を含む259 logical
-rowsを検証する。2026-09-15 の現行 `origin/main` (`aa5d22094`) での集計は次のとおり。
+rowsを検証する。2026-09-15 の現行 `origin/main` (`aa5d22094`) を基準に、
+今回の変更を適用した tree での集計は次のとおり。
 
 | canonical | bridge | mixed | unknown | 合計 |
 |---|---|---|---|---|
@@ -98,7 +99,7 @@ done | sort | uniq -c
 
 2026-09-15 の current-main audit anchor は `origin/main=aa5d22094`、pinned qpdf は
 11.9.0 commit `3b97c9bd266b7c32ea36d3536e22dab77412886d` である。checker の実測は
-**この revision を適用した tree で** 1263 qpdf citations / 907 flpdf citations /
+**今回の変更を適用した tree で** 1263 qpdf citations / 907 flpdf citations /
 259 logical rows、分類は
 canonical 136 / mixed 120 / bridge 3 / unknown 0。A〜E の160行だけを数える
 上の領域別集計は canonical 107 / mixed 53 / bridge 0 / unknown 0 なので、checker

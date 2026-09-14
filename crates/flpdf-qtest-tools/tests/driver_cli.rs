@@ -1260,6 +1260,30 @@ fn qtest_tree_and_mutation_cases_do_not_use_explicit_pdf_resolve() {
         &source[start..end]
     }
 
+    for (name, body) in [
+        (
+            "tree string helper",
+            section(
+                tree_source.as_str(),
+                "fn tree_string_value",
+                "/// Resolve `handle`",
+            ),
+        ),
+        (
+            "Bad3 kids helper",
+            section(
+                tree_source.as_str(),
+                "fn kids_item_0_is_indirect",
+                "pub(crate) fn run_test_47",
+            ),
+        ),
+    ] {
+        assert!(
+            !body.contains("pdf.resolve("),
+            "{name} retains the qpdf-less explicit Pdf::resolve bridge"
+        );
+    }
+
     for (name, source, start, end) in [
         (
             "test 46",
