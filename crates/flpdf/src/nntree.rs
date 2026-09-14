@@ -1070,7 +1070,6 @@ impl<K: TreeKey> NNTree<K> {
         let pdf_id = pdf.unique_id();
         ensure_tree_root_pdf(&self.root, self.root_pdf_id, pdf_id)?;
         if self.root_pdf_id.is_none() {
-            self.root.claim_tree_pdf(pdf_id)?;
             self.root_pdf_id = Some(pdf_id);
         }
         Ok(self.root.clone())

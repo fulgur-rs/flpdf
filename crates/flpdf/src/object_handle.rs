@@ -1176,6 +1176,16 @@ mod reverse_containment_layout_tests {
     }
 
     #[test]
+    fn tree_document_claim_does_not_live_in_production_slots() {
+        let source = include_str!("object_handle.rs");
+        let tree_claim_field = ["tree_", "pdf_", "unique_id"].concat();
+        assert!(
+            !source.contains(&tree_claim_field),
+            "name/number-tree ownership belongs to NNTree, not every ObjectSlot"
+        );
+    }
+
+    #[test]
     fn raw_identity_width_does_not_widen_shared_value_metadata() {
         assert_eq!(std::mem::size_of::<QpdfObjGen>(), 8);
         assert_eq!(std::mem::size_of::<Option<QpdfObjGen>>(), 12);
@@ -1312,15 +1322,6 @@ struct ObjectSlot {
     /// state from both an initialized lazy indirect object and a null value.
     initialized: bool,
     shared: Rc<RefCell<SharedValueState>>,
-    /// The document identity claimed by a handle-native name/number-tree
-    /// wrapper while this shared root is still contextless. qpdf's tree
-    /// helper retains its owning `QPDF` alongside the shared object handle;
-    /// this token preserves that single-document boundary for flpdf's
-    /// per-call `&mut Pdf` API without introducing a raw-object bridge.
-    /// qpdf's default document unique id is zero; a nonzero tag is enough to
-    /// retain the helper's document claim without an extra `Option<u64>`
-    /// discriminant.
-    tree_pdf_unique_id: Option<NonZeroU64>,
 }
 
 // Reverse containment is needed only by unit-test diagnostics that assert the
@@ -1471,7 +1472,6 @@ fn empty_object_slot() -> Rc<RefCell<ObjectSlot>> {
             ValueIdentity::default(),
             NO_PARSED_OFFSET,
         ),
-        tree_pdf_unique_id: None,
     }))
 }
 
@@ -1994,7 +1994,6 @@ impl ObjectHandle {
                 },
                 NO_PARSED_OFFSET,
             ),
-            tree_pdf_unique_id: None,
         })));
         register_test_slot(&handle.0);
         handle
@@ -2019,7 +2018,6 @@ impl ObjectHandle {
                 ValueIdentity::default(),
                 NO_PARSED_OFFSET,
             ),
-            tree_pdf_unique_id: None,
         })));
         register_test_slot(&handle.0);
         handle
@@ -2086,7 +2084,6 @@ impl ObjectHandle {
                 },
                 NO_PARSED_OFFSET,
             ),
-            tree_pdf_unique_id: None,
         })));
         register_test_slot(&handle.0);
         handle
@@ -2131,7 +2128,6 @@ impl ObjectHandle {
                 },
                 parsed_offset,
             ),
-            tree_pdf_unique_id: None,
         })));
         register_test_slot(&handle.0);
         handle
@@ -2275,7 +2271,6 @@ impl ObjectHandle {
             shared.description = None;
             shared.parsed_offset = NO_PARSED_OFFSET;
         }
-        self.0.borrow_mut().tree_pdf_unique_id = None;
     }
 
     /// Promote this existing uniform slot to an indirect object in place.
@@ -2537,25 +2532,6 @@ impl ObjectHandle {
         true
     }
 
-    /// Claim this shared handle as the root of a name/number tree in one
-    /// document. A wrapper stores its own fast-path claim, but clones of the
-    /// same contextless root must observe the first wrapper's claim as well.
-    /// This is the Rust-side equivalent of qpdf's helper retaining its owning
-    /// `QPDF` next to the shared `QPDFObjectHandle`.
-    pub(crate) fn claim_tree_pdf(&self, pdf_unique_id: u64) -> Result<()> {
-        let mut slot = self.0.borrow_mut();
-        match slot.tree_pdf_unique_id {
-            None => {
-                slot.tree_pdf_unique_id = NonZeroU64::new(pdf_unique_id);
-                Ok(())
-            }
-            Some(owner) if owner.get() == pdf_unique_id => Ok(()),
-            Some(_) => Err(Error::Unsupported(
-                "name/number tree root belongs to a different Pdf".to_string(),
-            )),
-        }
-    }
-
     /// Recursively remove this handle's association with its owning
     /// document, without changing its value.
     ///
@@ -2627,7 +2603,6 @@ impl ObjectHandle {
                 );
             }
             shared.borrow_mut().identity = ValueIdentity::default();
-            handle.0.borrow_mut().tree_pdf_unique_id = None;
         }
     }
 
