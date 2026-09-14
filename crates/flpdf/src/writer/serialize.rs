@@ -994,6 +994,7 @@ pub(crate) mod xref_stream {
     /// Maximum offset in an encoded object-number range, used for qpdf's
     /// caller-supplied `max_offset` argument when the range is assembled from
     /// a live offset map rather than a completed row vector.
+    #[allow(dead_code)]
     pub(crate) fn max_offset_for_range(
         offsets: &BTreeMap<u32, usize>,
         start: u32,
@@ -1046,6 +1047,37 @@ pub(crate) mod xref_stream {
             second_pass_widths(max_offset, hint_length, max_id, max_ostream_index)
         };
         let payload = encode_payload_for_policy(&entries, widths, filtered, skip_compression)?;
+        Ok(XrefStreamLayout { widths, payload })
+    }
+
+    /// Prepare a linearization first-page xref stream from the writer-owned
+    /// physical offset map without cloning that map into a virtual-offset
+    /// table. qpdf keeps one xref map and applies the hint correction while it
+    /// encodes rows (`QPDFWriter.cc:2437-2454`); the caller has already applied
+    /// that correction to the writer-owned physical map, so this helper only
+    /// materializes the bounded xref entry payload.
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) fn prepare_xref_stream_from_physical_offsets(
+        offsets: &mut BTreeMap<u32, usize>,
+        member_new: &BTreeMap<u32, (u32, u32)>,
+        start: u32,
+        count: u32,
+        xref_id: u32,
+        xref_offset: usize,
+        max_id: u32,
+        max_ostream_index: u64,
+        filtered: bool,
+    ) -> Result<XrefStreamLayout> {
+        let entries =
+            build_entries_with_self(offsets, member_new, start, count, xref_id, xref_offset);
+        let max_physical_offset = entries
+            .iter()
+            .filter(|entry| entry.entry_type == 1)
+            .map(|entry| entry.field2)
+            .max()
+            .unwrap_or(0);
+        let widths = second_pass_widths(max_physical_offset, 0, max_id, max_ostream_index);
+        let payload = encode_payload_for_policy(&entries, widths, filtered, false)?;
         Ok(XrefStreamLayout { widths, payload })
     }
 
