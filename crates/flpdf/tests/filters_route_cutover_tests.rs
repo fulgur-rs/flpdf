@@ -87,3 +87,25 @@ fn object_shape_filter_reader_is_test_only() {
         );
     }
 }
+
+#[test]
+fn runtime_stream_filter_registry_is_public_and_single_canonical_lookup() {
+    let crate_root = std::path::Path::new(env!("CARGO_MANIFEST_DIR"));
+    let lib = std::fs::read_to_string(crate_root.join("src/lib.rs")).unwrap();
+    assert!(lib.contains("pub mod stream_filter;"));
+    assert!(lib.contains(
+        "pub use stream_filter::{register_stream_filter, OwnedDecodePipeline, StreamFilter};"
+    ));
+    assert!(std::fs::read_to_string(crate_root.join("src/pipeline.rs"))
+        .unwrap()
+        .contains("pub enum PipelineRef"));
+
+    let stream_filter =
+        production_source(concat!(env!("CARGO_MANIFEST_DIR"), "/src/stream_filter.rs"));
+    assert!(stream_filter.contains("pub trait StreamFilter: 'static"));
+    assert!(stream_filter.contains("static FILTER_FACTORIES"));
+    assert!(stream_filter.contains("pub fn register_stream_filter"));
+    assert!(stream_filter.contains("fn get_decode_pipeline<'a>"));
+    assert!(!stream_filter.contains("decode_pipeline_owned"));
+    assert!(!stream_filter.contains("match filter_name"));
+}

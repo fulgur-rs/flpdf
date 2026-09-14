@@ -141,7 +141,7 @@ mod resource_finder;
 mod resource_replacer;
 pub mod resources;
 pub mod signatures;
-pub(crate) mod stream_filter;
+pub mod stream_filter;
 pub mod struct_tree_pg;
 pub mod thread_bead_p;
 pub mod token_filter;
@@ -215,7 +215,7 @@ pub use page_splice::{splice_pages, splice_pages_with_max_depth};
 pub use pages::tree_rebuild::{rebuild_page_tree, rebuild_page_tree_with_max_depth, RebuildResult};
 pub use pdf::Pdf;
 pub use pdf_version::{parse_pdf_version, parse_pdf_version_spec, PdfVersion};
-pub use pipeline::{Pipeline, PipelineError, PipelineHandle, PipelineResult};
+pub use pipeline::{Pipeline, PipelineError, PipelineHandle, PipelineRef, PipelineResult};
 pub use qdf_fix::fix_qdf;
 pub use reader::{PdfOpenOptions, ReadSeek};
 pub use signatures::{
@@ -223,6 +223,7 @@ pub use signatures::{
     strip_signature_values, SignatureInfo, DEFAULT_MAX_SIGNATURE_FIELD_DEPTH,
     SIG_FLAGS_APPEND_ONLY, SIG_FLAGS_SIGNATURES_EXIST,
 };
+pub use stream_filter::{register_stream_filter, OwnedDecodePipeline, StreamFilter};
 pub use struct_tree_pg::{
     drop_struct_elem_dangling_pg, drop_struct_elem_dangling_pg_with_max_depth,
     DEFAULT_MAX_STRUCT_TREE_DEPTH,
