@@ -37,6 +37,23 @@ use std::path::PathBuf;
 /// The only qpdf JSON version whose serialization is defined here.
 const SUPPORTED_JSON_VERSION: i32 = 2;
 
+/// Parse qpdf's raw JSON object selectors at the object-output boundary.
+///
+/// `QPDFJob::getWantedJSONObjects` is called by `doJSONObjects`, after all
+/// earlier JSON sections have been sent to the output pipeline
+/// (`libqpdf/QPDFJob.cc:958-997`). Keep this conversion separate from argv/job
+/// configuration so an overflow retains qpdf's partial-output behavior.
+pub(crate) fn parse_object_selectors(
+    raw_selectors: &[String],
+) -> Result<Vec<JsonObjectSelector>, JsonOutputError> {
+    raw_selectors
+        .iter()
+        .map(|selector| {
+            JsonObjectSelector::parse(selector).map_err(JsonOutputError::ObjectSelector)
+        })
+        .collect()
+}
+
 /// Write qpdf JSON v1's top-level `objects` map into an already-open document.
 ///
 /// qpdf writes object references in object-number order and appends the
@@ -47,21 +64,22 @@ pub(crate) fn write_json_v1_objects_key<R: Read + Seek>(
     pdf: &mut Pdf<R>,
     out: &mut dyn Pipeline,
     first: &mut bool,
-    wanted_objects: &[JsonObjectSelector],
+    wanted_objects: &[String],
 ) -> Result<(), JsonOutputError> {
     Json::write_dictionary_key(out, first, b"objects", 1)?;
     let mut object_first = true;
     Json::write_dictionary_open(out, &mut object_first, 1)?;
+    let wanted_objects = parse_object_selectors(wanted_objects)?;
     for handle in pdf.get_all_objects().map_err(ConvertError::from)? {
         let object_gen = object_map_identity(&handle);
-        if !object_selected(wanted_objects, object_gen, false) {
+        if !object_selected(&wanted_objects, object_gen, false) {
             continue;
         }
         let key = format!("{} {} R", object_gen.get_obj(), object_gen.get_gen());
         Json::write_dictionary_key(out, &mut object_first, key.as_bytes(), 2)?;
         handle.write_json(1, out, true, 2)?;
     }
-    if trailer_selected(wanted_objects, false) {
+    if trailer_selected(&wanted_objects, false) {
         Json::write_dictionary_key(out, &mut object_first, b"trailer", 2)?;
         pdf.trailer().write_json(1, out, true, 2)?; // cov:ignore: llvm-cov attributes this successful trailer serialization to its opening write expressions
     } // cov:ignore: llvm-cov attributes the successful trailer branch continuation to its write expressions
@@ -75,14 +93,15 @@ pub(crate) fn write_json_v1_objectinfo_key<R: Read + Seek>(
     pdf: &mut Pdf<R>,
     out: &mut dyn Pipeline,
     first: &mut bool,
-    wanted_objects: &[JsonObjectSelector],
+    wanted_objects: &[String],
 ) -> Result<(), JsonOutputError> {
     Json::write_dictionary_key(out, first, b"objectinfo", 1)?;
     let mut object_first = true;
     Json::write_dictionary_open(out, &mut object_first, 1)?;
+    let wanted_objects = parse_object_selectors(wanted_objects)?;
     for handle in pdf.get_all_objects().map_err(ConvertError::from)? {
         let object_gen = object_map_identity(&handle);
-        if !object_selected(wanted_objects, object_gen, false) {
+        if !object_selected(&wanted_objects, object_gen, false) {
             continue;
         }
 
