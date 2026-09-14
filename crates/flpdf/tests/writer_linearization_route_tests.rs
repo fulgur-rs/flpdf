@@ -149,6 +149,26 @@ fn linearization_final_route_does_not_clone_complete_xref_maps() {
 }
 
 #[test]
+fn linearization_moves_the_writer_owned_renumber_map_into_the_two_pass_route() {
+    let source = production_source(
+        include_str!("../src/linearization/writer.rs"),
+        "\n#[cfg(test)]\nmod tests {",
+    );
+    let implementation = source
+        .split_once("fn write_linearized_impl")
+        .map(|(_, rest)| rest)
+        .expect("linearization implementation exists");
+    assert!(
+        implementation.contains("renumber: RenumberMap"),
+        "the canonical two-pass writer must own the qpdf-shaped renumber map"
+    );
+    assert!(
+        !implementation.contains("let mut local_renumber = renumber.clone()"),
+        "linearization must not clone the complete renumber map before pass 1"
+    );
+}
+
+#[test]
 fn linearization_plan_does_not_retain_a_derived_page_user_inverse_map() {
     let source = production_source(
         include_str!("../src/linearization/plan.rs"),
