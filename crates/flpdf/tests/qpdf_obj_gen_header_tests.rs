@@ -1,4 +1,4 @@
-use flpdf::{EncryptMethod, EncryptParams, Pdf, PdfWriter};
+use flpdf::{EncryptMethod, EncryptParams, ObjectStreamMode, Pdf, PdfWriter};
 
 fn matching_out_of_range_header_pdf() -> Vec<u8> {
     let mut bytes = b"%PDF-1.4\n".to_vec();
@@ -34,6 +34,31 @@ fn matching_out_of_range_stream_header_pdf() -> Vec<u8> {
     bytes.extend_from_slice(format!("{catalog_offset:010} 00000 n \n").as_bytes());
     bytes.extend_from_slice(format!("{pages_offset:010} 00000 n \n").as_bytes());
     bytes.extend_from_slice(b"0000000000 00000 f \n");
+    bytes.extend_from_slice(b"0000000000 00000 f \n");
+    bytes.extend_from_slice(format!("{object_offset:010} 65536 n \n").as_bytes());
+    bytes.extend_from_slice(
+        format!("trailer\n<< /Size 6 /Root 1 0 R >>\nstartxref\n{xref_offset}\n%%EOF\n").as_bytes(),
+    );
+    bytes
+}
+
+fn matching_out_of_range_one_page_pdf() -> Vec<u8> {
+    let mut bytes = b"%PDF-1.4\n".to_vec();
+    let catalog_offset = bytes.len();
+    bytes.extend_from_slice(b"1 0 obj\n<< /Type /Catalog /Pages 2 0 R >>\nendobj\n");
+    let pages_offset = bytes.len();
+    bytes.extend_from_slice(b"2 0 obj\n<< /Type /Pages /Kids [3 0 R] /Count 1 >>\nendobj\n");
+    let page_offset = bytes.len();
+    bytes.extend_from_slice(
+        b"3 0 obj\n<< /Type /Page /Parent 2 0 R /MediaBox [0 0 612 792] >>\nendobj\n",
+    );
+    let object_offset = bytes.len();
+    bytes.extend_from_slice(b"5 65536 obj\n45\nendobj\n");
+    let xref_offset = bytes.len();
+    bytes.extend_from_slice(b"xref\n0 6\n0000000000 65535 f \n");
+    bytes.extend_from_slice(format!("{catalog_offset:010} 00000 n \n").as_bytes());
+    bytes.extend_from_slice(format!("{pages_offset:010} 00000 n \n").as_bytes());
+    bytes.extend_from_slice(format!("{page_offset:010} 00000 n \n").as_bytes());
     bytes.extend_from_slice(b"0000000000 00000 f \n");
     bytes.extend_from_slice(format!("{object_offset:010} 65536 n \n").as_bytes());
     bytes.extend_from_slice(
@@ -119,6 +144,38 @@ fn rewrite_renumber_keeps_a_raw_generation_child_as_a_reference_in_compact_mode(
     assert!(
         text.contains("3 0 obj\n45\nendobj"),
         "the raw child must be emitted at its assigned output number: {text}"
+    );
+}
+
+#[test]
+fn linearized_renumber_keeps_a_raw_generation_child_as_a_reference() {
+    let mut pdf = Pdf::open_mem_owned(matching_out_of_range_one_page_pdf()).expect("open PDF");
+    let raw_child = pdf.get_object_handle_by_raw_identity(5, 65_536);
+    pdf.root_handle()
+        .expect("resolve Catalog")
+        .replace_key(b"/RawChild", raw_child)
+        .expect("attach raw child to Catalog");
+
+    let mut writer = PdfWriter::new(&mut pdf);
+    writer.set_linearization(true);
+    writer.set_object_stream_mode(ObjectStreamMode::Disable);
+    writer.set_static_id(true);
+    writer.set_output_memory().expect("install memory output");
+    writer.write().expect("write linearized output");
+    let output = writer.get_buffer().expect("read linearized output");
+    let text = String::from_utf8_lossy(&output);
+
+    assert!(
+        text.contains("/RawChild "),
+        "linearized Catalog must retain the raw child key: {text}"
+    );
+    assert!(
+        !text.contains("/RawChild 45"),
+        "the raw indirect child must not be inlined: {text}"
+    );
+    assert!(
+        text.contains("\n45\nendobj"),
+        "the raw child must be emitted as a linearized object: {text}"
     );
 }
 
