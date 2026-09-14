@@ -147,6 +147,129 @@ fn qpdf_ctest_2_reports_invalid_password_through_the_c_api_error_surface() {
     );
 }
 
+#[test]
+fn qpdf_ctest_2_reports_a_missing_input_through_the_c_api_error_surface() {
+    let directory = tempfile::tempdir().expect("temporary directory");
+    let input = directory.path().join("missing-input.pdf");
+    let output = directory.path().join("unused.pdf");
+    let input_name = input.to_str().expect("input path is UTF-8");
+
+    let result = Command::cargo_bin("qpdf-ctest")
+        .expect("qpdf-ctest binary")
+        .args(["2", input_name, "", output.to_str().unwrap()])
+        .output()
+        .expect("qpdf-ctest should spawn");
+
+    assert!(result.status.success());
+    let stdout = String::from_utf8_lossy(&result.stdout);
+    assert!(
+        stdout.starts_with(&format!("error: open {input_name}:")),
+        "{stdout}"
+    );
+    assert!(stdout.contains("\n  code: 2\n"), "{stdout}");
+    assert!(stdout.contains("\n  file: \n"), "{stdout}");
+    assert!(stdout.contains("\n  pos: 0\n"), "{stdout}");
+    assert!(
+        stdout.contains(&format!("\n  text: open {input_name}:")),
+        "{stdout}"
+    );
+    assert!(stdout.ends_with("C test 2 done\n"), "{stdout}");
+    assert!(result.stderr.is_empty());
+    assert!(
+        !output.exists(),
+        "test02 must not initialize a writer after read failure"
+    );
+}
+
+#[test]
+fn qpdf_ctest_2_reports_an_output_open_failure_through_the_c_api_error_surface() {
+    let directory = tempfile::tempdir().expect("temporary directory");
+    let input = minimal_pdf();
+    let output = directory.path().join("missing-parent").join("output.pdf");
+    let input_name = input.to_str().expect("input path is UTF-8");
+    let output_name = output.to_str().expect("output path is UTF-8");
+
+    let result = Command::cargo_bin("qpdf-ctest")
+        .expect("qpdf-ctest binary")
+        .args(["2", input_name, "", output_name])
+        .output()
+        .expect("qpdf-ctest should spawn");
+
+    assert!(result.status.success());
+    let stdout = String::from_utf8_lossy(&result.stdout);
+    assert!(
+        stdout.starts_with(&format!("error: open {output_name}:")),
+        "{stdout}"
+    );
+    assert!(stdout.contains("\n  code: 2\n"), "{stdout}");
+    assert!(stdout.contains("\n  file: \n"), "{stdout}");
+    assert!(stdout.contains("\n  pos: 0\n"), "{stdout}");
+    assert!(
+        stdout.contains(&format!("\n  text: open {output_name}:")),
+        "{stdout}"
+    );
+    assert!(stdout.ends_with("C test 2 done\n"), "{stdout}");
+    assert!(result.stderr.is_empty());
+    assert!(
+        !output.exists(),
+        "failed writer initialization must not create output"
+    );
+}
+
+#[test]
+fn qpdf_ctest_2_replays_repair_warnings_before_a_bad_password_error() {
+    let mut input_bytes =
+        fs::read(encrypted_fixture("v5-aes-256-r6.pdf")).expect("read encrypted fixture");
+    let xref_header = input_bytes
+        .windows(b"xref\n0 4\n".len())
+        .position(|window| window == b"xref\n0 4\n")
+        .expect("xref header");
+    input_bytes[xref_header + b"xref\n0 ".len()] = b'X';
+
+    let directory = tempfile::tempdir().expect("temporary directory");
+    let input = directory.path().join("damaged-encrypted.pdf");
+    let output = directory.path().join("unused.pdf");
+    fs::write(&input, input_bytes).expect("write damaged encrypted input");
+    let input_name = input.to_str().expect("input path is UTF-8");
+
+    let result = Command::cargo_bin("qpdf-ctest")
+        .expect("qpdf-ctest binary")
+        .args(["2", input_name, "wrong", output.to_str().unwrap()])
+        .output()
+        .expect("qpdf-ctest should spawn");
+
+    assert!(result.status.success());
+    let stdout = String::from_utf8_lossy(&result.stdout);
+    assert_eq!(stdout.matches("warning: ").count(), 3, "{stdout}");
+    assert!(
+        stdout.contains(&format!("warning: {input_name}: file is damaged")),
+        "{stdout}"
+    );
+    assert!(
+        stdout.contains(&format!("warning: {input_name} (xref table, offset ")),
+        "{stdout}"
+    );
+    assert!(stdout.contains("text: xref syntax invalid"), "{stdout}");
+    assert!(
+        stdout.contains(&format!(
+            "warning: {input_name}: Attempting to reconstruct cross-reference table"
+        )),
+        "{stdout}"
+    );
+    let terminal = format!("error: {input_name}: invalid password\n");
+    let terminal_position = stdout.find(&terminal).expect("bad-password error");
+    assert!(
+        stdout[..terminal_position].contains("warning: "),
+        "warnings must precede the terminal error: {stdout}"
+    );
+    assert!(stdout.ends_with("C test 2 done\n"), "{stdout}");
+    assert!(result.stderr.is_empty());
+    assert!(
+        !output.exists(),
+        "test02 must not initialize a writer after auth failure"
+    );
+}
+
 /// `qpdf_get_error_filename` (`qpdf-ctest.c:40`) reports the raw `argv`
 /// filename qpdf was given, byte for byte, so a non-UTF-8 name must survive
 /// into the "invalid password" error report unchanged rather than being
