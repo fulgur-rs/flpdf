@@ -199,6 +199,51 @@ pub(crate) struct LiveTokenSource<'input, I: LiveInput> {
     last_offset: usize,
 }
 
+/// Token result used by the qpdf-shaped live parser. Integer candidates are
+/// consumed from the tokenizer's reusable buffers and retain only the parsed
+/// value plus their source range. Other token kinds keep the existing owned
+/// representation because names, strings, diagnostics, and replayed tokens
+/// may outlive the tokenizer call.
+#[derive(Clone, Debug)]
+enum LiveToken {
+    Integer {
+        value: i64,
+        start: usize,
+        end: usize,
+    },
+    Owned(Token),
+}
+
+impl LiveToken {
+    fn token_type(&self) -> TokenType {
+        match self {
+            Self::Integer { .. } => TokenType::Integer,
+            Self::Owned(token) => token.token_type,
+        }
+    }
+
+    fn start(&self) -> usize {
+        match self {
+            Self::Integer { start, .. } => *start,
+            Self::Owned(token) => token.start,
+        }
+    }
+
+    fn end(&self) -> usize {
+        match self {
+            Self::Integer { end, .. } => *end,
+            Self::Owned(token) => token.end,
+        }
+    }
+
+    fn is_word_value(&self, value: &[u8]) -> bool {
+        matches!(
+            self,
+            Self::Owned(token) if token.is_word_value(value)
+        )
+    }
+}
+
 impl<'input, I: LiveInput> LiveTokenSource<'input, I> {
     pub(crate) fn new(input: &'input mut I) -> Self {
         let mut tokenizer = Tokenizer::push();
@@ -229,6 +274,30 @@ impl<'input, I: LiveInput> LiveTokenSource<'input, I> {
     pub(crate) fn next_token(&mut self) -> Result<Token> {
         loop {
             match self.input.read_byte()? {
+                Some(byte) => self.tokenizer.present_character(byte).map_err(|error| {
+                    Error::Internal(format!("live tokenizer state error: {error:?}"))
+                })?,
+                None => self.tokenizer.present_eof().map_err(|error| {
+                    Error::Internal(format!("live tokenizer state error: {error:?}"))
+                })?,
+            }
+
+            let Some(pushed) = self.tokenizer.get_token() else {
+                continue;
+            };
+            let (start, end) = self.set_token_offsets(pushed.token.raw.len(), pushed.unread)?;
+            let mut token = pushed.token;
+            token.start = start;
+            token.error_offset = start;
+            token.end = end;
+            self.last_offset = start;
+            return Ok(token);
+        }
+    }
+
+    fn next_live_token(&mut self) -> Result<LiveToken> {
+        loop {
+            match self.input.read_byte()? {
                 // cov:ignore-start: each loop drains a ready token before the next input byte.
                 Some(byte) => self.tokenizer.present_character(byte).map_err(|error| {
                     Error::Internal(format!("live tokenizer state error: {error:?}"))
@@ -239,25 +308,40 @@ impl<'input, I: LiveInput> LiveTokenSource<'input, I> {
                 // cov:ignore-end
             }
 
+            if let Some(pushed) = self.tokenizer.get_integer()? {
+                let (start, end) = self.set_token_offsets(pushed.raw_len, pushed.unread)?;
+                self.last_offset = start;
+                return Ok(LiveToken::Integer {
+                    value: pushed.value,
+                    start,
+                    end,
+                });
+            }
+
             let Some(pushed) = self.tokenizer.get_token() else {
                 continue;
             };
 
-            if pushed.unread.is_some() {
-                self.input.unread_byte()?;
-            }
-            let end = self.input.tell()?;
-            let start = end.saturating_sub(pushed.token.raw.len() as u64);
-            let start = usize::try_from(start).unwrap_or(usize::MAX);
-            let end = usize::try_from(end).unwrap_or(usize::MAX);
+            let (start, end) = self.set_token_offsets(pushed.token.raw.len(), pushed.unread)?;
             let mut token = pushed.token;
             token.start = start;
             token.error_offset = start;
             token.end = end;
             self.last_offset = start;
-            self.input.set_last_offset(start as u64);
-            return Ok(token);
+            return Ok(LiveToken::Owned(token));
         }
+    }
+
+    fn set_token_offsets(&mut self, raw_len: usize, unread: Option<u8>) -> Result<(usize, usize)> {
+        if unread.is_some() {
+            self.input.unread_byte()?;
+        }
+        let end = self.input.tell()?;
+        let start = end.saturating_sub(raw_len as u64);
+        let start = usize::try_from(start).unwrap_or(usize::MAX);
+        let end = usize::try_from(end).unwrap_or(usize::MAX);
+        self.input.set_last_offset(start as u64);
+        Ok((start, end))
     }
 }
 
@@ -429,7 +513,7 @@ fn parse_live_object_with_context<I: LiveInput>(
 struct LiveFileParser<'tokens, 'input, 'decrypter, I: LiveInput> {
     tokens: &'tokens mut LiveTokenSource<'input, I>,
     resolver: &'tokens mut dyn HandleResolver,
-    buffered: VecDeque<Token>,
+    buffered: VecDeque<LiveToken>,
     diagnostics: Vec<ParserDiagnostic>,
     /// qpdf's `good_count` / `bad_count` recovery guard. These counters apply
     /// after the outer container has entered `parseRemainder`.
@@ -488,30 +572,30 @@ impl<I: LiveInput> LiveFileParser<'_, '_, '_, I> {
         // `endobj` shortcut below: an EOF as the content stream's very first
         // token leaves the object uninitialized with no warning
         // (`QPDFParser.cc:44-47`), unlike file-object EOF's warned Null.
-        if self.content_stream && token.token_type == TokenType::Eof {
+        if self.content_stream && token.token_type() == TokenType::Eof {
             return Ok(LiveParsedObject {
                 value: ObjectHandle::uninitialized(),
                 parsed_offset: NO_PARSED_OFFSET,
                 last_offset: self.tokens.last_offset(),
-                next_offset: token.start,
+                next_offset: token.start(),
                 empty: None,
                 diagnostics: std::mem::take(&mut self.diagnostics),
             });
         }
 
         if !self.content_stream && token.is_word_value(b"endobj") {
-            self.tokens.seek(token.start as u64)?;
+            self.tokens.seek(token.start() as u64)?;
             return Ok(LiveParsedObject {
                 value: ObjectHandle::null(),
                 parsed_offset: NO_PARSED_OFFSET,
                 last_offset: self.tokens.last_offset(),
-                next_offset: token.start,
-                empty: Some(token.start as u64),
+                next_offset: token.start(),
+                empty: Some(token.start() as u64),
                 diagnostics: std::mem::take(&mut self.diagnostics),
             });
         }
 
-        let value = match token.token_type {
+        let value = match token.token_type() {
             TokenType::ArrayOpen | TokenType::DictOpen => {
                 let mut frames = Vec::new();
                 self.push_frame(&mut frames, token)?;
@@ -539,7 +623,7 @@ impl<I: LiveInput> LiveFileParser<'_, '_, '_, I> {
             let token = self.next_token()?;
             self.good_count += 1;
 
-            match token.token_type {
+            match token.token_type() {
                 TokenType::ArrayOpen | TokenType::DictOpen => {
                     if !self.push_frame(frames, token)? {
                         return Ok(ObjectHandle::null());
@@ -564,7 +648,7 @@ impl<I: LiveInput> LiveFileParser<'_, '_, '_, I> {
                     self.add_to_top_frame(frames, value)?;
                 }
                 TokenType::Eof => {
-                    self.warn(token.start, "parse error while reading object")?;
+                    self.warn(token.start(), "parse error while reading object")?;
                     if self.content_stream {
                         // qpdf leaves the object uninitialized here too, but
                         // only after the shared warning above
@@ -572,7 +656,7 @@ impl<I: LiveInput> LiveFileParser<'_, '_, '_, I> {
                         // check unwinds every open frame in `frames`.
                         return Ok(ObjectHandle::uninitialized());
                     }
-                    self.warn(token.start, "unexpected EOF")?;
+                    self.warn(token.start(), "unexpected EOF")?;
                     return Ok(ObjectHandle::null());
                 }
                 TokenType::Name => {
@@ -581,18 +665,21 @@ impl<I: LiveInput> LiveFileParser<'_, '_, '_, I> {
                             // qpdf keeps dictionary keys as canonical name
                             // strings, including `/` and tokenizer-decoded
                             // `#xx` bytes (`QPDFTokenizer.cc:317-320,430-445`).
+                            let LiveToken::Owned(ref token) = token else {
+                                unreachable!("integer tokens cannot be dictionary names")
+                            };
                             *pending_key = Some(token.value.clone());
                             continue;
                         }
                     }
-                    let value =
-                        self.parse_scalar_token(token.clone(), token.start as i64, false)?;
+                    let start = token.start();
+                    let value = self.parse_scalar_token(token, start as i64, false)?;
                     self.add_to_top_frame(frames, value)?;
                 }
                 _ => {
                     self.capture_raw_signature_contents(frames, &token);
-                    let value =
-                        self.parse_scalar_token(token.clone(), token.start as i64, false)?;
+                    let start = token.start();
+                    let value = self.parse_scalar_token(token, start as i64, false)?;
                     if self.give_up {
                         return Ok(ObjectHandle::null());
                     }
@@ -606,28 +693,28 @@ impl<I: LiveInput> LiveFileParser<'_, '_, '_, I> {
         }
     }
 
-    fn push_frame(&mut self, frames: &mut Vec<LiveFrame>, token: Token) -> Result<bool> {
+    fn push_frame(&mut self, frames: &mut Vec<LiveFrame>, token: LiveToken) -> Result<bool> {
         // qpdf checks its existing `stack` before it emplaces a new frame:
         // exactly 500 containers are accepted and the 501st recovers as null.
         if frames.len() >= MAX_PARSE_DEPTH {
             let warning = "ignoring excessively deeply nested data structure";
-            self.warn(token.start, warning)?;
+            self.warn(token.start(), warning)?;
             self.give_up = true;
             return Ok(false);
         }
 
-        match token.token_type {
+        match token.token_type() {
             TokenType::ArrayOpen => frames.push(LiveFrame::Array {
                 values: Vec::new(),
-                start: token.start,
+                start: token.start(),
             }),
             TokenType::DictOpen => frames.push(LiveFrame::Dictionary {
                 values: std::collections::BTreeMap::new(),
                 orphan_values: Vec::new(),
                 pending_key: None,
                 contents: None,
-                start: token.start,
-                frame_offset: token.end,
+                start: token.start(),
+                frame_offset: token.end(),
             }),
             _ => unreachable!("only container tokens create live parser frames"), // cov:ignore: callers dispatch only opening container tokens
         }
@@ -639,7 +726,10 @@ impl<I: LiveInput> LiveFileParser<'_, '_, '_, I> {
         self.add_to_frame(frame, value)
     }
 
-    fn capture_raw_signature_contents(&self, frames: &mut [LiveFrame], token: &Token) {
+    fn capture_raw_signature_contents(&self, frames: &mut [LiveFrame], token: &LiveToken) {
+        let LiveToken::Owned(token) = token else {
+            return;
+        };
         if self.decrypter.is_none() || token.token_type != TokenType::String {
             return;
         }
@@ -755,9 +845,22 @@ impl<I: LiveInput> LiveFileParser<'_, '_, '_, I> {
 
     fn parse_scalar_token(
         &mut self,
-        token: Token,
+        token: LiveToken,
         scalar_offset: i64,
         top_level: bool,
+    ) -> Result<ObjectHandle> {
+        match token {
+            LiveToken::Integer { value, start, .. } => {
+                self.integer_or_ref(value, start, scalar_offset, top_level)
+            }
+            LiveToken::Owned(token) => self.parse_owned_scalar_token(token, scalar_offset),
+        }
+    }
+
+    fn parse_owned_scalar_token(
+        &mut self,
+        token: Token,
+        scalar_offset: i64,
     ) -> Result<ObjectHandle> {
         match token.token_type {
             TokenType::Name => {
@@ -776,7 +879,7 @@ impl<I: LiveInput> LiveFileParser<'_, '_, '_, I> {
             // qpdf gives parsed null no description, so its parsed offset is
             // always -1 (`QPDFParser.cc:81-82,308-310`).
             TokenType::Null => Ok(ObjectHandle::null()),
-            TokenType::Integer => self.integer_or_ref(token, scalar_offset, top_level),
+            TokenType::Integer => unreachable!("live integer tokens use the compact path"),
             TokenType::Real => self.real(token, scalar_offset),
             TokenType::Word => {
                 // qpdf's content-stream branch takes every bare word as an
@@ -847,11 +950,11 @@ impl<I: LiveInput> LiveFileParser<'_, '_, '_, I> {
 
     fn integer_or_ref(
         &mut self,
-        token: Token,
+        first: i64,
+        first_start: usize,
         offset: i64,
         top_level: bool,
     ) -> Result<ObjectHandle> {
-        let first = parse_integer_token(&token)?;
         // qpdf's content-stream branch never buffers an integer as a possible
         // indirect-reference prefix -- it always emits a plain `QPDF_Integer`
         // immediately (`QPDFParser.cc:313-320`), since content-stream operands
@@ -861,11 +964,13 @@ impl<I: LiveInput> LiveFileParser<'_, '_, '_, I> {
         }
 
         let second_token = self.next_token()?;
-        if second_token.token_type != TokenType::Integer {
-            self.unread_token(second_token);
-            return Ok(self.direct_at(ObjectValue::Integer(first), offset));
-        }
-        let second = parse_integer_token(&second_token)?;
+        let (second, second_start) = match second_token {
+            LiveToken::Integer { value, start, .. } => (value, start),
+            token => {
+                self.unread_token(token);
+                return Ok(self.direct_at(ObjectValue::Integer(first), offset));
+            }
+        };
         let third = self.next_token()?;
         if third.is_word_value(b"R") {
             // The two lookahead tokens are consumed only for a complete
@@ -878,8 +983,8 @@ impl<I: LiveInput> LiveFileParser<'_, '_, '_, I> {
                 ));
             }
             self.good_count += 2;
-            let number = qpdf_int(first, &token)?;
-            let generation = qpdf_int(second, &second_token)?;
+            let number = qpdf_int(first, first_start)?;
+            let generation = qpdf_int(second, second_start)?;
             if number >= 1 && (0..65535).contains(&generation) {
                 return Ok(self
                     .resolver
@@ -910,22 +1015,24 @@ impl<I: LiveInput> LiveFileParser<'_, '_, '_, I> {
         self.resolver.direct_handle_at(value, offset)
     }
 
-    fn next_token(&mut self) -> Result<Token> {
+    fn next_token(&mut self) -> Result<LiveToken> {
         let mut token = if let Some(token) = self.buffered.pop_front() {
             token
         } else {
-            self.tokens.next_token()?
+            self.tokens.next_live_token()?
         };
         // qpdf reports a tokenizer error when it reads the physical token
         // (`QPDFParser.cc:140-143`). Buffered lookahead is parser-local, so
         // consume that one-shot diagnostic before the token can be replayed.
-        if let Some(message) = token.error_message.take() {
-            self.warn(token.start, message)?;
+        if let LiveToken::Owned(token) = &mut token {
+            if let Some(message) = token.error_message.take() {
+                self.warn(token.start, message)?;
+            }
         }
         Ok(token)
     }
 
-    fn unread_token(&mut self, token: Token) {
+    fn unread_token(&mut self, token: LiveToken) {
         self.buffered.push_front(token);
     }
 
@@ -1399,6 +1506,47 @@ mod live_input_tests {
 
         drop(tokens);
         assert_eq!(input.reads, vec![1, 1, 2, 1, 1]);
+    }
+
+    #[test]
+    fn live_token_source_keeps_integer_tokens_in_qpdf_sized_representation() {
+        let mut input = CountingInput::new(b"12 34 R");
+        let mut tokens = LiveTokenSource::new(&mut input);
+
+        assert!(matches!(
+            tokens.next_live_token().expect("first integer"),
+            super::LiveToken::Integer {
+                value: 12,
+                start: 0,
+                end: 2,
+            }
+        ));
+        assert!(matches!(
+            tokens.next_live_token().expect("second integer"),
+            super::LiveToken::Integer {
+                value: 34,
+                start: 3,
+                end: 5,
+            }
+        ));
+        assert!(matches!(
+            tokens.next_live_token().expect("reference marker"),
+            super::LiveToken::Owned(token)
+                if token.token_type == TokenType::Word && token.value == b"R"
+        ));
+    }
+
+    #[test]
+    fn live_token_source_keeps_repeated_integer_candidates_allocation_free() {
+        let mut input = CountingInput::new(b"1 2 3 4 5");
+        let mut tokens = LiveTokenSource::new(&mut input);
+
+        for expected in [1, 2, 3, 4, 5] {
+            assert!(matches!(
+                tokens.next_live_token().expect("integer"),
+                super::LiveToken::Integer { value, .. } if value == expected
+            ));
+        }
     }
 
     // This catches the production regression where file-object parsing falls
@@ -2123,6 +2271,7 @@ fn classify_real(token: Token) -> Result<RealClassification> {
 /// (`QPDFParser.cc:151-157,314-319`; `QUtil.cc:373-385`). An i64 overflow is
 /// a runtime error, not a damaged-PDF parser error, so the resolver can apply
 /// `QPDF::resolve`'s `std::exception` warning reframe.
+#[cfg(test)]
 fn parse_integer_token(token: &Token) -> Result<i64> {
     let text = std::str::from_utf8(&token.value)
         .map_err(|_| Error::parse(token.start, "invalid integer"))?;
@@ -2145,10 +2294,10 @@ fn parse_integer_token(token: &Token) -> Result<i64> {
 /// qpdf converts indirect-reference components from its `long long` token
 /// buffer to signed `int` before testing whether the object/generation pair
 /// is valid (`QPDFParser.cc:166-175`, `QIntC.hh:87-108`).
-fn qpdf_int(value: i64, token: &Token) -> Result<i32> {
+fn qpdf_int(value: i64, offset: usize) -> Result<i32> {
     i32::try_from(value).map_err(|_| {
         Error::parse(
-            token.start,
+            offset,
             format!(
                 "integer out of range converting {value} from a 8-byte signed type to a 4-byte signed type"
             ),

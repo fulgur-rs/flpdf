@@ -161,6 +161,16 @@ pub(crate) struct PushedToken {
     pub(crate) unread: Option<u8>,
 }
 
+/// qpdf's live parser consumes integer candidates from the tokenizer's
+/// current buffers and retains only their numeric value. Keep this push-mode
+/// result allocation-free; the general [`PushedToken`] path remains owned for
+/// consumers that need token bytes after the tokenizer is reset.
+pub(crate) struct PushedInteger {
+    pub(crate) value: i64,
+    pub(crate) raw_len: usize,
+    pub(crate) unread: Option<u8>,
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum State {
     InHexString,
@@ -323,6 +333,33 @@ impl<'a> Tokenizer<'a> {
         let token = self.take_ready_token();
         self.reset();
         Some(PushedToken { token, unread })
+    }
+
+    /// Consume a ready integer without moving its tokenizer-owned byte
+    /// buffers into an owned [`Token`]. qpdf's `QPDFParser::parseRemainder`
+    /// keeps the two integer candidates as numeric values and offsets while
+    /// `QPDFTokenizer::nextToken` reuses `raw_val` on the next token
+    /// (`QPDFParser.cc:140-175`, `QPDFTokenizer.cc:921-925`).
+    pub(crate) fn get_integer(&mut self) -> Result<Option<PushedInteger>> {
+        if self.state != State::TokenReady || self.token_type != TokenType::Integer {
+            return Ok(None);
+        }
+
+        let raw_len = self.raw.len();
+        let unread = if !self.in_token && !self.before_token {
+            self.char_to_unread
+        } else {
+            None
+        };
+        let result = parse_integer_bytes(&self.raw, self.token_start);
+        self.reset();
+        result.map(|value| {
+            Some(PushedInteger {
+                value,
+                raw_len,
+                unread,
+            })
+        })
     }
 
     fn reset(&mut self) {
@@ -706,6 +743,24 @@ impl<'a> Tokenizer<'a> {
             self.inline_image_bytes = 0;
             self.state = State::TokenReady;
         }
+    }
+}
+
+fn parse_integer_bytes(bytes: &[u8], offset: usize) -> Result<i64> {
+    let text = std::str::from_utf8(bytes).map_err(|_| Error::parse(offset, "invalid integer"))?;
+    match text.parse::<i64>() {
+        Ok(value) => Ok(value),
+        Err(error)
+            if matches!(
+                error.kind(),
+                std::num::IntErrorKind::PosOverflow | std::num::IntErrorKind::NegOverflow
+            ) =>
+        {
+            Err(Error::System(format!(
+                "overflow/underflow converting {text} to 64-bit integer"
+            )))
+        }
+        Err(_) => Err(Error::parse(offset, "invalid integer")),
     }
 }
 
