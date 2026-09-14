@@ -3289,7 +3289,7 @@ fn second_half_container_anchors(
                 plan.raw.part4_rest.contains(&object_gen)
                     || plan.raw.part9_outline_objects.contains(&object_gen)
             }
-            _ => false,
+            _ => false, // cov:ignore: only second-half routes reach this raw membership helper
         }
     };
 
@@ -5041,6 +5041,39 @@ mod tests {
         assert_eq!(
             anchors,
             vec![SecondHalfContainerAnchor::After(QpdfObjGen::new(2, 0))]
+        );
+    }
+
+    #[test]
+    fn raw_second_half_anchor_covers_part9_outline_and_preserve_modes() {
+        let plan = LinearizationPlan {
+            raw: crate::linearization::plan::RawLinearizationPlan {
+                part4_rest: vec![QpdfObjGen::new(8, 65_536)],
+                part9_outline_objects: vec![QpdfObjGen::new(7, 0)],
+                ..Default::default()
+            },
+            ..LinearizationPlan::default()
+        };
+        let batches = vec![
+            RoutedObjStmBatch {
+                members: vec![ObjectRef::new(7, 0)],
+                route: ContainerPart::Rest,
+                source_container_number: None,
+            },
+            RoutedObjStmBatch {
+                members: vec![ObjectRef::new(9, 0)],
+                route: ContainerPart::Rest,
+                source_container_number: Some(99),
+            },
+        ];
+
+        let anchors = second_half_container_anchors(&plan, &batches);
+        assert_eq!(
+            anchors,
+            vec![
+                SecondHalfContainerAnchor::BeforeFirst,
+                SecondHalfContainerAnchor::After(QpdfObjGen::new(8, 65_536)),
+            ]
         );
     }
 

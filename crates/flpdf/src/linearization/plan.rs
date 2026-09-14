@@ -1163,7 +1163,7 @@ fn build_raw_linearization_plan<R: Read + Seek>(
             .qpdf_obj_gen()
             .filter(|object_gen| object_gen.is_indirect())
     } else {
-        None
+        None // cov:ignore: every production linearization plan has a trailer /Root
     };
     let raw_part6_outline_objects = raw_refs_with_extras_root_first(
         part6_outline_objects.iter().copied(),

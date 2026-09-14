@@ -636,7 +636,7 @@ fn linearized_normalizes_a_raw_page_content_and_drops_its_parameters() {
         .expect("open raw content stream PDF");
     let raw_content = pdf.get_object_handle_by_raw_identity(5, 65_536);
     pdf.get_object_handle(flpdf::ObjectRef::new(3, 0))
-        .replace_key(b"/Contents", raw_content)
+        .replace_key(b"/Contents", ObjectHandle::array(vec![raw_content]))
         .expect("attach raw content stream");
 
     let mut writer = PdfWriter::new(&mut pdf);
