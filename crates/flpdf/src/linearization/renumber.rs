@@ -1316,6 +1316,18 @@ mod tests {
         );
     }
 
+    #[test]
+    fn renumber_assigned_raw_projects_a_legacy_object_ref_plan() {
+        let plan = single_page_plan();
+        let expected: BTreeSet<_> = plan
+            .renumber_assigned_refs()
+            .into_iter()
+            .map(|object_ref| QpdfObjGen::try_from_object_ref(object_ref).unwrap())
+            .collect();
+
+        assert_eq!(plan.renumber_assigned_raw(), expected);
+    }
+
     // -----------------------------------------------------------------------
     // 1. param_dict_ref reflects the dynamic param-dict slot
     // -----------------------------------------------------------------------

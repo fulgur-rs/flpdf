@@ -1036,12 +1036,13 @@ fn build_raw_linearization_plan<R: Read + Seek>(
         }
         let object =
             pdf.get_object_handle_by_raw_identity(object_gen.get_obj(), object_gen.get_gen());
+        // cov:ignore-start: linearization object-user maps do not admit writer-owned structural streams as raw body identities
         if object.try_is_stream_of_type(b"XRef", b"")?
             || object.try_is_stream_of_type(b"ObjStm", b"")?
-        // cov:ignore: raw structural objects are excluded before body emission
         {
             continue;
         }
+        // cov:ignore-end
 
         let page_users: Vec<u32> = optimization.raw_page_users(object_gen).collect();
         let in_first_page = page_users.contains(&0);
@@ -2074,7 +2075,7 @@ impl LinearizationPlan {
             info_ref,
             &content_normalize_refs,
             &removed_refs,
-            outlines_in_first_page,
+            outlines_in_first_page, // cov:ignore: the raw plan builder consumes this qpdf outline-routing predicate; LLVM attributes the continuation to this argument line
         )?;
 
         // Object counts are scalar hint inputs rather than source identities,

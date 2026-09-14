@@ -403,12 +403,14 @@ fn append_objstm_container_object<R: Read + Seek>(
     let filtered = matches!(effective_stream_policy(options), Some(CompressStreams::Yes));
     let map = |object_gen| {
         renumber.new_for_raw(object_gen).ok_or_else(|| {
+            // cov:ignore-start: the planner and ObjStm member map are built together, so a missing member identity is an internal invariant failure
             crate::Error::Unsupported(format!(
                 "linearization writer: ObjStm member raw reference {} {} has no renumber entry",
                 object_gen.get_obj(),
                 object_gen.get_gen()
             ))
         })
+        // cov:ignore-end
     };
     let mut members: Vec<(ObjectRef, ObjectHandle)> = Vec::with_capacity(container.members.len());
     for &(orig, new_ref) in &container.members {
@@ -654,12 +656,14 @@ fn append_body_object_with_raw_identity(
     object.try_dereference()?;
     let map = |object_gen| {
         renumber.new_for_raw(object_gen).ok_or_else(|| {
+            // cov:ignore-start: every serialized body identity comes from the same raw RenumberMap that assigned its slot
             crate::Error::Unsupported(format!(
                 "linearization writer: raw reference {} {} has no renumber entry",
                 object_gen.get_obj(),
                 object_gen.get_gen()
             ))
         })
+        // cov:ignore-end
     };
 
     if object.as_stream_dict().is_none() {
@@ -2501,12 +2505,14 @@ fn do_write_pass<R: Read + Seek>(
             continue;
         }
         let Some(new_ref) = renumber.new_for_raw(original_gen) else {
+            // cov:ignore-start: raw plan construction and RenumberMap::from_plan share this vector; absence is an internal invariant failure
             return Err(crate::Error::Unsupported(format!(
                 "raw open-document identity {} {} has no renumber entry",
                 original_gen.get_obj(),
                 original_gen.get_gen()
             )));
         };
+        // cov:ignore-end
         open_document_emits.push((
             new_ref.number,
             OpenDocumentEmit::Raw {
@@ -2678,12 +2684,14 @@ fn do_write_pass<R: Read + Seek>(
         .filter(|object_gen| object_gen.to_object_ref().is_none())
     {
         let Some(new_ref) = renumber.new_for_raw(original_gen) else {
+            // cov:ignore-start: raw plan construction and RenumberMap::from_plan share this vector; absence is an internal invariant failure
             return Err(crate::Error::Unsupported(format!(
                 "raw first-page identity {} {} has no renumber entry",
                 original_gen.get_obj(),
                 original_gen.get_gen()
             )));
         };
+        // cov:ignore-end
         first_page_emits.push((new_ref.number, FirstPageEmit::Raw(original_gen)));
     }
     for container in &objstm_layout.part3 {
@@ -2818,12 +2826,14 @@ fn do_write_pass<R: Read + Seek>(
         .filter(|object_gen| object_gen.to_object_ref().is_none())
     {
         let Some(new_ref) = renumber.new_for_raw(original_gen) else {
+            // cov:ignore-start: raw plan construction and RenumberMap::from_plan share this vector; absence is an internal invariant failure
             return Err(crate::Error::Unsupported(format!(
                 "raw Part-4 identity {} {} has no renumber entry",
                 original_gen.get_obj(),
                 original_gen.get_gen()
             )));
         };
+        // cov:ignore-end
         part4_emits.push((new_ref.number, Part4Emit::Raw(original_gen)));
     }
     for container in &objstm_layout.part4 {
