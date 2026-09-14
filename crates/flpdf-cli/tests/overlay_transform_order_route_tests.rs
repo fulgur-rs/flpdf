@@ -131,6 +131,30 @@ fn ordinary_rewrite_uses_the_canonical_job_transform_and_output_routes() {
 }
 
 #[test]
+fn page_selection_overlay_uses_the_canonical_job_owner() {
+    let source = production_main_source();
+    let after_plan = source
+        .split_once("fn run_page_extraction_after_plan")
+        .and_then(|(_, tail)| tail.split_once("/// Apply qpdf's rotation map"))
+        .map(|(body, _)| body)
+        .expect("page-selection post-plan route");
+
+    for forbidden in [
+        "flpdf::handle_under_overlay(",
+        "flpdf::overlay_verbose_report(",
+    ] {
+        assert!(
+            !after_plan.contains(forbidden),
+            "page-selection post-plan route retains a direct overlay helper: {forbidden}"
+        );
+    }
+    assert!(
+        after_plan.contains("configure_cli_overlay_specs("),
+        "page-selection post-plan route must configure overlays on QPDFJob"
+    );
+}
+
+#[test]
 fn direct_rewrite_overlay_images_match_qpdf_after_externalization() {
     if !qpdf_available() {
         return;

@@ -7164,28 +7164,6 @@ fn parse_overlay_segment<T: RawCliArg>(kind: OverlayKind, tokens: &[T]) -> CliRe
     parser.finish()
 }
 
-fn overlay_verbose_message(report: &[flpdf::OverlayVerbosePage], specs: &[OverlaySpec]) -> Vec<u8> {
-    let mut message = b"flpdf: processing underlay/overlay\n".to_vec();
-    for page in report {
-        message.extend_from_slice(format!("  page {}\n", page.dest_page).as_bytes());
-        for source in &page.sources {
-            let file = &specs[source.spec_index].file;
-            let kind = match source.kind {
-                flpdf::OverlayKind::Underlay => "underlay",
-                flpdf::OverlayKind::Overlay => "overlay",
-            };
-            message.extend_from_slice(b"    ");
-            message.extend_from_slice(&arg_parser::os_bytes(file));
-            message.push(b' ');
-            message.extend_from_slice(kind.as_bytes());
-            message.push(b' ');
-            message.extend_from_slice(source.src_page.to_string().as_bytes());
-            message.push(b'\n');
-        }
-    }
-    message
-}
-
 #[cfg(test)]
 fn parse_test_args(args: Vec<String>) -> CliResult<arg_parser::ParsedArgs> {
     let has_program = args.first().is_some_and(|arg| !arg.starts_with('-'));
@@ -8254,23 +8232,25 @@ fn run_page_extraction_after_plan<R: Read + Seek + 'static>(
     }
     // qpdf keeps a provider-backed source QPDF alive when
     // `copyForeignObject` copies a Form XObject whose data comes from a
-    // `StreamDataProvider` (`libqpdf/QPDF.cc:2248-2257`). Retain the opened
-    // source documents through the in-memory writer for the same reason.
-    let _built_overlay_specs = if !overlay_specs.is_empty() {
-        let mut built =
-            build_overlay_specs_with_suppression(overlay_specs, repair, password, no_warn)?;
+    // `StreamDataProvider` (`libqpdf/QPDF.cc:2248-2257`). Retain the canonical
+    // Job and its opened overlay sources through the in-memory writer for the
+    // same reason. The small preflight below only captures the source version
+    // floor needed by this page-operation writer; its warnings are suppressed
+    // because the canonical Job performs the real donor open and owns the
+    // observable warning delivery.
+    let _overlay_job = if !overlay_specs.is_empty() {
+        let mut version_sources =
+            build_overlay_specs_with_suppression(overlay_specs, repair, password, true)?;
         update_input_version_floor(&mut options.input_version_floor, pdf)?;
-        for spec in built.iter_mut() {
+        for spec in version_sources.iter_mut() {
             update_input_version_floor(&mut options.input_version_floor, &mut spec.source)?;
         }
 
-        if verbose {
-            let report = flpdf::overlay_verbose_report(pdf, &mut built)?;
-            logger_info(overlay_verbose_message(&report, overlay_specs))?;
-        }
-
-        flpdf::handle_under_overlay(pdf, &mut built)?;
-        Some(built)
+        let mut overlay_job = new_cli_job(no_warn);
+        overlay_job.set_verbose(verbose);
+        configure_cli_overlay_specs(&mut overlay_job, overlay_specs)?;
+        overlay_job.apply_transformations(pdf)?;
+        Some(overlay_job)
     } else {
         None
     };
