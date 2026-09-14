@@ -2085,6 +2085,23 @@ need at their boundary; plans without a populated page-user map retain their
 manual-fixture fallback. The qpdf object-user map, page ordering, page-0
 exclusion, hint payload, and ObjStm routing responsibilities are unchanged.
 
+### Compact object-user set representation `flpdf-ymuj.6.9` (2026-09-14)
+
+qpdf's `QPDF::Members::object_to_obj_users` value is an ordered
+`std::set<ObjUser>` (`include/qpdf/QPDF.hh:1515-1517`). Its comparator orders
+user kind, page number, and key (`libqpdf/QPDF_optimization.cc:32-53`), and
+both `updateObjectMapsInternal` and `filterCompressedObjects` rely on set
+deduplication while preserving that order (`libqpdf/QPDF_optimization.cc:282-
+296,340-380`).
+
+flpdf keeps the same qpdf-shaped table and semantics in
+`Optimization::object_to_users`. `flpdf-ymuj.6.9` changes only the Rust value
+representation: tiny ordered user sets use a compact sorted form and promote
+to a tree-backed ordered set at higher cardinality. `users_for`, borrowed
+iteration, `contains`, object-user classification, ObjStm folding, page hints,
+and output/error behavior remain on the same canonical responsibility boundary;
+no unordered hash or second user table is introduced.
+
 ### A6/A7/A8 standard writer accessor slice `flpdf-3yn9.48.23.21` (2026-09-10)
 
 The remaining standard-writer observations in `crates/flpdf/src/writer.rs` now

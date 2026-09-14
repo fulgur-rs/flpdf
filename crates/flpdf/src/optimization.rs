@@ -17,10 +17,102 @@ pub(crate) enum ObjectUser {
     Root,
 }
 
+const COMPACT_OBJECT_USER_SET_TREE_THRESHOLD: usize = 8;
+
+/// Ordered, duplicate-free object-user values with a compact representation
+/// for the one- and two-user case that dominates parsed PDF objects.
+///
+/// qpdf owns this responsibility as `std::set<ObjUser>`. The small sorted
+/// vector is an allocation-conscious Rust representation of the same
+/// ordered-set contract; larger sets promote to the tree-backed representation
+/// so insert and lookup behavior remains bounded for high-cardinality objects.
+#[derive(Debug, Clone)]
+pub(crate) enum CompactObjectUserSet {
+    Small(Vec<ObjectUser>),
+    Tree(BTreeSet<ObjectUser>),
+}
+
+impl Default for CompactObjectUserSet {
+    fn default() -> Self {
+        Self::Small(Vec::new())
+    }
+}
+
+pub(crate) enum CompactObjectUserIter<'a> {
+    Small(std::slice::Iter<'a, ObjectUser>),
+    Tree(std::collections::btree_set::Iter<'a, ObjectUser>),
+}
+
+impl<'a> Iterator for CompactObjectUserIter<'a> {
+    type Item = &'a ObjectUser;
+
+    fn next(&mut self) -> Option<Self::Item> {
+        match self {
+            Self::Small(values) => values.next(),
+            Self::Tree(values) => values.next(),
+        }
+    }
+}
+
+impl<'a> IntoIterator for &'a CompactObjectUserSet {
+    type Item = &'a ObjectUser;
+    type IntoIter = CompactObjectUserIter<'a>;
+
+    fn into_iter(self) -> Self::IntoIter {
+        self.iter()
+    }
+}
+
+impl CompactObjectUserSet {
+    fn insert(&mut self, user: ObjectUser) -> bool {
+        match self {
+            Self::Small(values) => {
+                let index = match values.binary_search(&user) {
+                    Ok(_) => return false,
+                    Err(index) => index,
+                };
+                values.insert(index, user);
+                if values.len() > COMPACT_OBJECT_USER_SET_TREE_THRESHOLD {
+                    let values = std::mem::take(values);
+                    *self = Self::Tree(values.into_iter().collect());
+                }
+                true
+            }
+            Self::Tree(values) => values.insert(user),
+        }
+    }
+
+    pub(crate) fn iter(&self) -> CompactObjectUserIter<'_> {
+        match self {
+            Self::Small(values) => CompactObjectUserIter::Small(values.iter()),
+            Self::Tree(values) => CompactObjectUserIter::Tree(values.iter()),
+        }
+    }
+
+    pub(crate) fn contains(&self, user: &ObjectUser) -> bool {
+        match self {
+            Self::Small(values) => values.binary_search(user).is_ok(),
+            Self::Tree(values) => values.contains(user),
+        }
+    }
+
+    pub(crate) fn len(&self) -> usize {
+        match self {
+            Self::Small(values) => values.len(),
+            Self::Tree(values) => values.len(),
+        }
+    }
+
+    #[cfg(test)]
+    fn is_tree(&self) -> bool {
+        matches!(self, Self::Tree(_))
+    }
+}
+
 #[derive(Debug, Clone, Default)]
 pub(crate) struct Optimization {
     user_to_objects: BTreeMap<ObjectUser, BTreeSet<ObjectRef>>,
-    object_to_users: BTreeMap<ObjectRef, BTreeSet<ObjectUser>>,
+    object_to_users: BTreeMap<ObjectRef, CompactObjectUserSet>,
     /// qpdf's Generate object-stream eligibility captured before optimization
     /// can mint inherited-attribute objects.
     generate_objstm_eligible: Option<Vec<ObjectRef>>,
@@ -37,14 +129,14 @@ impl Optimization {
         }
     }
 
-    pub(crate) fn users_for(&self, object: ObjectRef) -> &BTreeSet<ObjectUser> {
+    pub(crate) fn users_for(&self, object: ObjectRef) -> &CompactObjectUserSet {
         match self.object_to_users.get(&object) {
             Some(users) => users,
             None => empty_object_users(),
         }
     }
 
-    pub(crate) fn object_users(&self) -> impl Iterator<Item = (ObjectRef, &BTreeSet<ObjectUser>)> {
+    pub(crate) fn object_users(&self) -> impl Iterator<Item = (ObjectRef, &CompactObjectUserSet)> {
         self.object_to_users
             .iter()
             .map(|(&object, users)| (object, users))
@@ -376,17 +468,18 @@ fn empty_object_refs() -> &'static BTreeSet<ObjectRef> {
     EMPTY.get_or_init(BTreeSet::new)
 }
 
-fn empty_object_users() -> &'static BTreeSet<ObjectUser> {
-    static EMPTY: OnceLock<BTreeSet<ObjectUser>> = OnceLock::new();
-    EMPTY.get_or_init(BTreeSet::new)
+fn empty_object_users() -> &'static CompactObjectUserSet {
+    static EMPTY: OnceLock<CompactObjectUserSet> = OnceLock::new();
+    EMPTY.get_or_init(CompactObjectUserSet::default)
 }
 
 #[cfg(test)]
 mod tests {
-    use super::{ObjectUser, Optimization};
+    use super::{CompactObjectUserSet, ObjectUser, Optimization};
     use crate::object_handle::ObjectHandle;
     use crate::parser::MAX_PARSE_DEPTH;
     use crate::{ObjectRef, Result};
+    use std::collections::BTreeSet;
     use std::rc::Rc;
 
     fn nested_direct_array(depth: usize) -> ObjectHandle {
@@ -409,6 +502,56 @@ mod tests {
         assert_eq!(ObjectUser::Root.page_number(), 0);
         assert_eq!(ObjectUser::RootKey(b"Root".to_vec()).page_number(), 0);
         assert_eq!(ObjectUser::TrailerKey(b"Info".to_vec()).page_number(), 0);
+    }
+
+    #[test]
+    fn compact_object_user_set_preserves_qpdf_order_and_deduplicates() {
+        let users = [
+            ObjectUser::Root,
+            ObjectUser::Page(2),
+            ObjectUser::TrailerKey(b"Info".to_vec()),
+            ObjectUser::Page(0),
+            ObjectUser::RootKey(b"Outlines".to_vec()),
+            ObjectUser::Thumbnail(1),
+            ObjectUser::Page(2),
+        ];
+        let mut set = CompactObjectUserSet::default();
+        for user in users.iter().cloned() {
+            set.insert(user);
+        }
+        let expected: Vec<_> = users
+            .iter()
+            .cloned()
+            .collect::<BTreeSet<_>>()
+            .into_iter()
+            .collect();
+        assert_eq!(set.iter().cloned().collect::<Vec<_>>(), expected);
+        assert_eq!(set.len(), 6);
+        assert!(!set.is_tree());
+    }
+
+    #[test]
+    fn compact_object_user_set_promotes_large_cardinality_to_tree() {
+        let mut set = CompactObjectUserSet::default();
+        for page in 0..=8 {
+            assert!(set.insert(ObjectUser::Page(page)));
+        }
+        assert!(set.is_tree());
+        assert_eq!(set.len(), 9);
+        assert!(set.contains(&ObjectUser::Page(4)));
+        assert!(!set.contains(&ObjectUser::Page(99)));
+        assert!(set.insert(ObjectUser::Root));
+        assert_eq!(
+            set.iter()
+                .filter_map(|user| match user {
+                    ObjectUser::Page(page) => Some(*page),
+                    _ => None,
+                })
+                .collect::<Vec<_>>(),
+            (0..=8).collect::<Vec<_>>()
+        );
+        assert!(!set.insert(ObjectUser::Page(4)));
+        assert_eq!(set.len(), 10);
     }
 
     #[test]
