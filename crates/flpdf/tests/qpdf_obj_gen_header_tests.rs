@@ -541,17 +541,22 @@ fn linearized_routes_a_raw_child_shared_by_later_pages_to_part8() {
     let mut pdf = Pdf::open_mem_owned(matching_out_of_range_three_page_pdf()).expect("open PDF");
     let raw_child = pdf.get_object_handle_by_raw_identity(8, 65_536);
     let second_raw_child = pdf.get_object_handle_by_raw_identity(9, 65_536);
+    let ordinary = pdf
+        .make_indirect_from_object_handle(ObjectHandle::integer(99))
+        .expect("allocate ordinary ObjStm member");
     for page_number in [4, 5] {
         let page = pdf.get_object_handle(flpdf::ObjectRef::new(page_number, 0));
         page.replace_key(b"/RawChild", raw_child.clone())
             .expect("attach raw child to later page");
         page.replace_key(b"/SecondRawChild", second_raw_child.clone())
             .expect("attach second raw child to later page");
+        page.replace_key(b"/Ordinary", ordinary.clone())
+            .expect("attach ordinary ObjStm member to later page");
     }
 
     let mut writer = PdfWriter::new(&mut pdf);
     writer.set_linearization(true);
-    writer.set_object_stream_mode(ObjectStreamMode::Disable);
+    writer.set_object_stream_mode(ObjectStreamMode::Generate);
     writer.set_compress_streams(false);
     writer.set_static_id(true);
     writer.set_output_memory().expect("install memory output");
