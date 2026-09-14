@@ -11,9 +11,7 @@
 //! | `writeJSON` output destination and side-file prefix | [`crate::job::QPDFJob::write_json`] |
 
 use crate::json::Json;
-use crate::json_inspect::{
-    DecodeLevel, JsonKey, JsonObjectSelector, JsonOutput, JsonOutputError, StreamDataMode,
-};
+use crate::json_inspect::{DecodeLevel, JsonKey, JsonOutput, JsonOutputError, StreamDataMode};
 use crate::pipeline::stdio_file::StdioBuffer;
 use crate::pipeline::{Pipeline, PipelineHandle, PlOStream, PlStdioFile};
 use crate::{Pdf, QPDFLogger, UsageError};
@@ -64,7 +62,7 @@ pub fn write_qpdf_json_selected_objects_with_options<R: Read + Seek>(
     decode_level: DecodeLevel,
     stream_mode: &StreamDataMode,
     keys: &[JsonKey],
-    objects: &[JsonObjectSelector],
+    objects: &[String],
     out: &mut dyn Pipeline,
 ) -> Result<(), JsonOutputError> {
     let mut first = true;
@@ -133,7 +131,11 @@ pub fn write_qpdf_json_selected_objects_with_options<R: Read + Seek>(
     } else if json_section_selected(keys, JsonKey::Qpdf) {
         // qpdf's doJSONObjects delegates the whole "qpdf" key to
         // QPDF::writeJSON with complete=false, letting it continue the
-        // dictionary this function opened.
+        // dictionary this function opened. qpdf parses the raw object
+        // selectors immediately before entering that delegated writer
+        // (`QPDFJob.cc:982-997`), after all earlier JSON sections have already
+        // reached the output pipeline.
+        let objects = crate::document_json::parse_object_selectors(objects)?;
         crate::document_json::write_json_key(
             pdf,
             version,
@@ -142,7 +144,7 @@ pub fn write_qpdf_json_selected_objects_with_options<R: Read + Seek>(
             &mut first,
             decode_level,
             stream_mode,
-            objects,
+            &objects,
         )?;
     }
     Json::write_dictionary_close(out, first, 0)?;
@@ -166,7 +168,7 @@ pub fn write_qpdf_json_selected_objects_to_output_with_options<R: Read + Seek>(
     decode_level: DecodeLevel,
     stream_mode: &StreamDataMode,
     keys: &[JsonKey],
-    objects: &[JsonObjectSelector],
+    objects: &[String],
     output: JsonOutput<'_>,
     schema_error_output: &PipelineHandle,
 ) -> Result<(), JsonOutputError> {
@@ -541,8 +543,13 @@ pub struct JsonJobOptions<'a> {
     pub stream_prefix: Option<&'a [u8]>,
     /// Requested top-level qpdf JSON v2 keys.
     pub keys: &'a [JsonKey],
-    /// Requested object selectors for the JSON `objects` section.
-    pub objects: &'a [JsonObjectSelector],
+    /// Raw object selectors for the JSON object section.
+    ///
+    /// qpdf stores these strings on `QPDFJob` and parses them only when the
+    /// object section is emitted (`QPDFJob.cc:929-997`). Keeping the raw
+    /// spelling here preserves qpdf's partial-output behavior for a selector
+    /// that overflows after earlier sections have already been written.
+    pub objects: &'a [String],
 }
 
 /// Destination for JSON output at the command boundary.
@@ -770,13 +777,7 @@ mod tests {
         let mut pdf = Pdf::open(BufReader::new(File::open(fixture()).unwrap())).unwrap();
         let mut bytes = Vec::new();
         let keys = [JsonKey::Objects, JsonKey::Objectinfo];
-        let selectors = [
-            JsonObjectSelector::Object {
-                number: 1,
-                generation: 0,
-            },
-            JsonObjectSelector::Trailer,
-        ];
+        let selectors = ["1,0".to_owned(), "trailer".to_owned()];
         let mut output = PlString::new("job json v1 selected", None, &mut bytes);
 
         write_qpdf_json_selected_objects_with_options(

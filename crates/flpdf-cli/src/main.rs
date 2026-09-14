@@ -54,6 +54,20 @@ impl Write for PipelineWriter {
     }
 }
 
+impl PipelineWriter {
+    /// Finish the logger's save pipeline after a JSON serializer returns.
+    ///
+    /// The JSON command must flush a partial document even when qpdf's
+    /// deferred object-selector parse fails. `Write::flush` intentionally
+    /// remains a no-op for the PDF writer, whose pipeline lifetime is owned by
+    /// its own output boundary.
+    fn finish_pipeline(&mut self) -> CliResult<()> {
+        self.pipeline
+            .finish()
+            .map_err(|error| Box::new(error) as Box<dyn std::error::Error>)
+    }
+}
+
 /// CLI-owned writer configuration. The library's lower-level option bridge is
 /// intentionally private; all CLI output is configured through PdfWriter.
 #[derive(Debug, Clone)]
@@ -4304,17 +4318,11 @@ fn run_json(
         }
     }
 
-    // 2. Validate --json-object selectors before doing any I/O.
-    let mut json_objects: Vec<JsonObjectSelector> = Vec::new();
-    for raw in &cli.json_object {
-        match JsonObjectSelector::parse(raw.as_str()) {
-            Ok(s) => json_objects.push(s),
-            Err(message) => {
-                emit_logger_error(format!("flpdf: {message}\n"));
-                std::process::exit(2);
-            }
-        }
-    }
+    // 2. Retain --json-object selectors in their raw qpdf spelling. qpdf
+    // parses them from `getWantedJSONObjects` only when the object section is
+    // emitted (`QPDFJob.cc:929-997`), after earlier JSON sections have reached
+    // stdout. The JSON job boundary owns that deferred conversion.
+    let json_objects = cli.json_object.clone();
 
     // 3. Resolve stream-data mode.
     //
@@ -4626,7 +4634,7 @@ fn run_json_document<R: Read + Seek>(
     json_output_mode: bool,
     stream_data: JsonStreamData,
     json_keys: &[JsonKey],
-    json_objects: &[JsonObjectSelector],
+    json_objects: &[String],
 ) -> CliResult<()> {
     // `decode_level` governs both inline `data` payloads and file-mode side
     // files emitted by the job-owned JSON output pipeline.
@@ -4686,6 +4694,20 @@ fn run_json_document<R: Read + Seek>(
             ),
         )
     };
+    // `PipelineWriter::flush` is intentionally a no-op for the general PDF
+    // writer, but JSON's qpdf save pipeline must be finished even when its
+    // deferred object selector fails after writing a prefix.
+    let stdout_finish = if output_path.is_none() {
+        Some(
+            runtime
+                .standard_output
+                .as_mut()
+                .expect("stdout writer prepared for JSON stdout")
+                .finish_pipeline(),
+        )
+    } else {
+        None
+    };
     match json_result {
         Ok(JobExitCode::Success) => {}
         Ok(JobExitCode::Error) => {
@@ -4703,6 +4725,9 @@ fn run_json_document<R: Read + Seek>(
         Err(JsonJobError::Output(error)) => return Err(Box::new(Error::from(error))),
         Err(JsonJobError::Usage(error)) => return Err(Box::new(error)),
         Err(JsonJobError::Completion(error)) => return Err(Box::new(error)),
+    }
+    if let Some(result) = stdout_finish {
+        result?;
     }
     Ok(())
 }
