@@ -190,6 +190,7 @@ pub(crate) trait ObjectWriterEmission {
         map: &mut dyn FnMut(&ObjectHandle) -> Result<ObjectRef>,
         removed_refs: &BTreeSet<ObjectRef>,
         write_string: &mut F,
+        direct_stream_writer: &mut dyn DynamicDirectStreamWriter,
     ) -> Result<()>
     where
         F: FnMut(&mut OutputSink<'_>, &[u8]) -> Result<()> + ?Sized;
@@ -1056,14 +1057,11 @@ impl ObjectWriterEmission for ObjectHandle {
         map: &mut dyn FnMut(&ObjectHandle) -> Result<ObjectRef>,
         removed_refs: &BTreeSet<ObjectRef>,
         write_string: &mut F,
+        direct_stream_writer: &mut dyn DynamicDirectStreamWriter,
     ) -> Result<()>
     where
         F: FnMut(&mut OutputSink<'_>, &[u8]) -> Result<()> + ?Sized,
     {
-        let mut direct_stream_writer = DefaultDynamicDirectStreamWriter {
-            newline_before_endstream: None,
-            qdf_mode: false,
-        };
         let entries = stream_dictionary_entries_for_emission(self)?;
         unparse_stream_dict_entries_with_dynamic_ref_map_and_string_writer(
             &entries,
@@ -1072,7 +1070,7 @@ impl ObjectWriterEmission for ObjectHandle {
             map,
             removed_refs,
             write_string,
-            &mut direct_stream_writer,
+            direct_stream_writer,
         )
     }
 
@@ -5676,6 +5674,7 @@ mod tests {
                     &mut dynamic_string_map,
                     &removed,
                     &mut dynamic_string_writer,
+                    &mut direct_stream_writer,
                 )
         })?;
         let dynamic_string_text = String::from_utf8_lossy(&dynamic_string_output);
@@ -5689,7 +5688,7 @@ mod tests {
         let mut pdf = Pdf::empty()?;
         let child = pdf.make_indirect_object_handle(ObjectHandle::integer(7))?;
         let child_ref = child.object_ref().expect("direct stream child identity");
-        let stream = ObjectHandle::stream(
+        let inner = ObjectHandle::stream(
             ObjectHandle::dictionary(vec![
                 (b"/Length".to_vec(), ObjectHandle::integer(99)),
                 (
@@ -5699,6 +5698,13 @@ mod tests {
                 (b"/Child".to_vec(), child),
             ]),
             Rc::new(b"direct-payload".to_vec()),
+        );
+        let stream = ObjectHandle::stream(
+            ObjectHandle::dictionary(vec![(
+                b"/Nested".to_vec(),
+                ObjectHandle::array(vec![inner]),
+            )]),
+            Rc::new(b"outer-payload".to_vec()),
         );
 
         for (qdf_mode, newline_before_endstream) in [

@@ -747,6 +747,7 @@ impl crate::writer::object::DynamicDirectStreamWriter for LiveDirectStreamWriter
             map,
             removed_refs,
             write_string,
+            self,
         )?; // cov:ignore: the live direct-stream dictionary serializer is exercised by the nested direct-stream regression.
         if let Some(context) = self.encryption_context {
             crate::writer::write_stream_payload_with_pipeline(
@@ -3031,6 +3032,8 @@ mod final_handle_tests {
 #[cfg(test)]
 mod object_emitter_tests {
     use super::*;
+    use crate::writer::object::DynamicDirectStreamWriter;
+    use crate::writer::NewlineBeforeEndstream;
     use std::io::Cursor;
 
     fn pdf() -> Pdf<Cursor<Vec<u8>>> {
@@ -3234,6 +3237,108 @@ mod object_emitter_tests {
             encrypt_metadata: true,
             metadata_ref: None,
         }
+    }
+
+    #[test]
+    fn direct_stream_policy_reaches_nested_dictionary_and_array_streams() -> crate::Result<()> {
+        let inner = ObjectHandle::stream(
+            ObjectHandle::dictionary(vec![(b"/Length".to_vec(), ObjectHandle::integer(5))]),
+            Rc::new(b"inner".to_vec()),
+        );
+        let outer = ObjectHandle::stream(
+            ObjectHandle::dictionary(vec![(
+                b"/Nested".to_vec(),
+                ObjectHandle::array(vec![inner]),
+            )]),
+            Rc::new(b"outer".to_vec()),
+        );
+        let options = WriterOptions {
+            compress_streams: CompressStreams::No,
+            newline_before_endstream: NewlineBeforeEndstream::Yes,
+            ..WriterOptions::default()
+        };
+        let mut direct_stream_writer = LiveDirectStreamWriter {
+            options: &options,
+            output: ObjectRef::new(7, 0),
+            encryption_context: None,
+        };
+        let mut map = |_handle: &ObjectHandle| Ok(ObjectRef::new(8, 0));
+        let mut write_string = |out: &mut OutputSink<'_>, value: &[u8]| out.write_bytes(value);
+        let mut output = Vec::new();
+        crate::writer::output::with_buffer_sink(&mut output, |out| {
+            direct_stream_writer.write_direct_stream(
+                &outer,
+                out,
+                &mut map,
+                &BTreeSet::new(),
+                &mut write_string,
+            )
+        })?;
+
+        let text = String::from_utf8(output).expect("direct stream output is text");
+        assert!(
+            text.contains("inner\nendstream"),
+            "nested direct stream must inherit NewlineBeforeEndstream::Yes: {text:?}"
+        );
+        assert!(text.contains("outer\nendstream"));
+        Ok(())
+    }
+
+    #[test]
+    fn encrypted_direct_stream_policy_reaches_nested_streams() -> crate::Result<()> {
+        let inner = ObjectHandle::stream(
+            ObjectHandle::dictionary(vec![(b"/Length".to_vec(), ObjectHandle::integer(12))]),
+            Rc::new(b"inner-secret".to_vec()),
+        );
+        let outer = ObjectHandle::stream(
+            ObjectHandle::dictionary(vec![(
+                b"/Nested".to_vec(),
+                ObjectHandle::dictionary(vec![(
+                    b"/Array".to_vec(),
+                    ObjectHandle::array(vec![inner]),
+                )]),
+            )]),
+            Rc::new(b"outer-secret".to_vec()),
+        );
+        let options = WriterOptions {
+            compress_streams: CompressStreams::No,
+            newline_before_endstream: NewlineBeforeEndstream::Yes,
+            ..WriterOptions::default()
+        };
+        let context = encryption_context();
+        let mut direct_stream_writer = LiveDirectStreamWriter {
+            options: &options,
+            output: ObjectRef::new(7, 0),
+            encryption_context: Some(&context),
+        };
+        let mut map = |_handle: &ObjectHandle| Ok(ObjectRef::new(8, 0));
+        let mut write_string = |out: &mut OutputSink<'_>, value: &[u8]| out.write_bytes(value);
+        let mut output = Vec::new();
+        crate::writer::output::with_buffer_sink(&mut output, |out| {
+            direct_stream_writer.write_direct_stream(
+                &outer,
+                out,
+                &mut map,
+                &BTreeSet::new(),
+                &mut write_string,
+            )
+        })?;
+
+        assert!(!output
+            .windows(b"inner-secret".len())
+            .any(|window| window == b"inner-secret"));
+        assert!(!output
+            .windows(b"outer-secret".len())
+            .any(|window| window == b"outer-secret"));
+        assert_eq!(
+            output
+                .windows(b"\nendstream".len())
+                .filter(|window| *window == b"\nendstream")
+                .count(),
+            2,
+            "outer and inner encrypted streams must both use the inherited framing policy"
+        );
+        Ok(())
     }
 
     #[test]
