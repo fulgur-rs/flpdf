@@ -6245,7 +6245,7 @@ impl ObjectHandle {
     /// `libqpdf/QPDF_Stream.cc:488-512`). The probe validates filters and
     /// decode parameters but never reads source bytes, matching qpdf's
     /// `QPDFJob::doShowObj` preflight.
-    pub(crate) fn stream_data_filterable(&self, decode_level: DecodeLevel) -> Result<bool> {
+    pub fn stream_data_filterable(&self, decode_level: DecodeLevel) -> Result<bool> {
         self.try_dereference()?;
         let Some(stream_dict) = self.with_value(|value| match value {
             Some(ObjectValue::Stream(stream)) => Some(stream.stream_dict.clone()),
