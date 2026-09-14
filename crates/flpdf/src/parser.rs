@@ -671,8 +671,9 @@ impl<I: LiveInput> LiveFileParser<'_, '_, '_, I> {
                             // strings, including `/` and tokenizer-decoded
                             // `#xx` bytes (`QPDFTokenizer.cc:317-320,430-445`).
                             let LiveToken::Owned(ref token) = token else {
-                                unreachable!("integer tokens cannot be dictionary names")
-                                // cov:ignore: TokenType::Name is represented only by owned tokenizer tokens
+                                // cov:ignore-start: TokenType::Name is represented only by owned tokenizer tokens.
+                                unreachable!("integer tokens cannot be dictionary names");
+                                // cov:ignore-end
                             };
                             *pending_key = Some(token.value.clone());
                             continue;
