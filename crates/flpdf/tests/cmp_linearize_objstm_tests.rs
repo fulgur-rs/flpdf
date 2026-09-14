@@ -37,6 +37,25 @@ fn flpdf_linearized_objstm(fixture: &str) -> Vec<u8> {
     write_linearized_with_settings(&mut pdf, &opts).unwrap()
 }
 
+/// Linearize one fixture with the exact stream-data policy used by the d3eo9
+/// qpdf oracle sweep. The existing helper intentionally keeps the historical
+/// default for its older goldens.
+fn flpdf_linearized_objstm_uncompress(fixture: &str) -> Vec<u8> {
+    let path = Path::new(env!("CARGO_MANIFEST_DIR"))
+        .join("../../tests/fixtures/compat")
+        .join(fixture);
+
+    let f1 = std::fs::File::open(&path).unwrap_or_else(|e| panic!("open {path:?}: {e}"));
+    let mut pdf = Pdf::open(std::io::BufReader::new(f1)).unwrap();
+    let opts = WriterTestSettings {
+        object_streams: ObjectStreamMode::Generate,
+        deterministic_id: true,
+        stream_data: Some(flpdf::StreamDataMode::Uncompress),
+        ..WriterTestSettings::default()
+    };
+    write_linearized_with_settings(&mut pdf, &opts).unwrap()
+}
+
 fn golden(stem: &str) -> Vec<u8> {
     let path = Path::new(env!("CARGO_MANIFEST_DIR"))
         .join("../../tests/golden/references")
@@ -158,6 +177,23 @@ fn assert_structural(fixture: &str, stem: &str) {
 
 fn assert_strict(fixture: &str, stem: &str) {
     let actual = flpdf_linearized_objstm(fixture);
+    let expected = golden(stem);
+    report(fixture, &actual, &expected, "full bytes");
+}
+
+fn assert_structural_uncompressed(fixture: &str, stem: &str) {
+    let actual = mask_id1(&flpdf_linearized_objstm_uncompress(fixture));
+    let expected = mask_id1(&golden(stem));
+    report(
+        fixture,
+        &actual,
+        &expected,
+        "structural layout (ignoring /ID[1])",
+    );
+}
+
+fn assert_strict_uncompressed(fixture: &str, stem: &str) {
+    let actual = flpdf_linearized_objstm_uncompress(fixture);
     let expected = golden(stem);
     report(fixture, &actual, &expected, "full bytes");
 }
@@ -1524,6 +1560,105 @@ fn acroform_widget_page1_page2_objstm_byte_identical_to_qpdf() {
         "objstm-lin-acroform-widget-page1-page2.pdf",
         "objstm-lin-acroform-widget-page1-page2",
     );
+}
+
+// Signed AcroForm value dictionaries are not ObjStm members, but they remain
+// open-document objects and therefore must be emitted as plain objects before
+// /O. These fixtures cover the field-only, widget, non-terminal, indirect-
+// Fields, parent/widget, and DSS-shared graph shapes. The shared eligibility
+// predicate and the linearization planner must agree on that boundary.
+#[test]
+fn acroform_sig_dss_shared_objstm_structurally_byte_identical_to_qpdf() {
+    assert_structural_uncompressed("acroform-sig-dss-shared.pdf", "acroform-sig-dss-shared");
+}
+
+#[test]
+fn acroform_sig_dss_shared_objstm_byte_identical_to_qpdf() {
+    assert_strict_uncompressed("acroform-sig-dss-shared.pdf", "acroform-sig-dss-shared");
+}
+
+#[test]
+fn acroform_sig_field_only_objstm_structurally_byte_identical_to_qpdf() {
+    assert_structural_uncompressed("acroform-sig-field-only.pdf", "acroform-sig-field-only");
+}
+
+#[test]
+fn acroform_sig_field_only_objstm_byte_identical_to_qpdf() {
+    assert_strict_uncompressed("acroform-sig-field-only.pdf", "acroform-sig-field-only");
+}
+
+#[test]
+fn acroform_sig_indirect_fields_objstm_structurally_byte_identical_to_qpdf() {
+    assert_structural_uncompressed(
+        "acroform-sig-indirect-fields.pdf",
+        "acroform-sig-indirect-fields",
+    );
+}
+
+#[test]
+fn acroform_sig_indirect_fields_objstm_byte_identical_to_qpdf() {
+    assert_strict_uncompressed(
+        "acroform-sig-indirect-fields.pdf",
+        "acroform-sig-indirect-fields",
+    );
+}
+
+#[test]
+fn acroform_sig_nonannotation_terminal_objstm_structurally_byte_identical_to_qpdf() {
+    assert_structural_uncompressed(
+        "acroform-sig-nonannotation-terminal.pdf",
+        "acroform-sig-nonannotation-terminal",
+    );
+}
+
+#[test]
+fn acroform_sig_nonannotation_terminal_objstm_byte_identical_to_qpdf() {
+    assert_strict_uncompressed(
+        "acroform-sig-nonannotation-terminal.pdf",
+        "acroform-sig-nonannotation-terminal",
+    );
+}
+
+#[test]
+fn acroform_sig_nonterminal_parent_objstm_structurally_byte_identical_to_qpdf() {
+    assert_structural_uncompressed(
+        "acroform-sig-nonterminal-parent.pdf",
+        "acroform-sig-nonterminal-parent",
+    );
+}
+
+#[test]
+fn acroform_sig_nonterminal_parent_objstm_byte_identical_to_qpdf() {
+    assert_strict_uncompressed(
+        "acroform-sig-nonterminal-parent.pdf",
+        "acroform-sig-nonterminal-parent",
+    );
+}
+
+#[test]
+fn acroform_sig_parent_pure_widget_kid_objstm_structurally_byte_identical_to_qpdf() {
+    assert_structural_uncompressed(
+        "acroform-sig-parent-pure-widget-kid.pdf",
+        "acroform-sig-parent-pure-widget-kid",
+    );
+}
+
+#[test]
+fn acroform_sig_parent_pure_widget_kid_objstm_byte_identical_to_qpdf() {
+    assert_strict_uncompressed(
+        "acroform-sig-parent-pure-widget-kid.pdf",
+        "acroform-sig-parent-pure-widget-kid",
+    );
+}
+
+#[test]
+fn acroform_sig_widget_objstm_structurally_byte_identical_to_qpdf() {
+    assert_structural_uncompressed("acroform-sig-widget.pdf", "acroform-sig-widget");
+}
+
+#[test]
+fn acroform_sig_widget_objstm_byte_identical_to_qpdf() {
+    assert_strict_uncompressed("acroform-sig-widget.pdf", "acroform-sig-widget");
 }
 
 // thumbnail-private-shared: a 4-page fixture where other pages carry /Thumb
