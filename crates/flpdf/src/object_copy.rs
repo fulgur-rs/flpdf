@@ -172,6 +172,7 @@ fn copy_foreign_with_source_id<R: Read + Seek>(
             "obj_copier.visiting is not empty at the beginning of copyForeignObject".to_owned(),
         ));
     }
+    let to_copy = target.take_foreign_object_to_copy(source_id);
     let mut copier = ForeignObjectCopier {
         target,
         source_id,
@@ -179,7 +180,7 @@ fn copy_foreign_with_source_id<R: Read + Seek>(
         visiting,
         direct_visiting: Vec::new(),
         stop_at_page_tree,
-        to_copy: Vec::new(),
+        to_copy,
     };
     let result = if require_indirect {
         copier.run(foreign)
@@ -188,10 +189,12 @@ fn copy_foreign_with_source_id<R: Read + Seek>(
     };
     let object_map = copier.object_map;
     let visiting = copier.visiting;
+    let to_copy = copier.to_copy;
     copier.target.set_foreign_object_map(source_id, object_map);
     copier
         .target
         .set_foreign_object_visiting(source_id, visiting);
+    copier.target.set_foreign_object_to_copy(source_id, to_copy);
     result
 }
 
@@ -258,7 +261,9 @@ impl<R: Read + Seek + 'static> ForeignObjectCopier<'_, R> {
             ));
         }
 
-        for source in std::mem::take(&mut self.to_copy) {
+        let pending = self.to_copy.len();
+        for index in 0..pending {
+            let source = self.to_copy[index].clone();
             let source_object_gen = source
                 .qpdf_obj_gen()
                 .filter(|object_gen| object_gen.is_indirect())
@@ -281,6 +286,7 @@ impl<R: Read + Seek + 'static> ForeignObjectCopier<'_, R> {
                     .replace_object(target_ref, replacement)?;
             }
         }
+        self.to_copy.clear();
 
         if let Some(source_object_gen) = foreign
             .qpdf_obj_gen()
@@ -1110,6 +1116,34 @@ mod tests {
             .copy_foreign_object(&root)
             .expect_err("a direct stream has no qpdf foreign-copy route");
         assert!(matches!(error, Error::System(message)
+            if message == "QPDF::copyForeign encountered a direct stream object"));
+    }
+
+    #[test]
+    fn copy_foreign_object_retries_a_failed_stream_replacement() {
+        let mut source = minimal_pdf();
+        let mut target = minimal_pdf();
+        let direct_stream = ObjectHandle::stream(
+            ObjectHandle::dictionary(Vec::new()),
+            Rc::new(b"direct stream".to_vec()),
+        );
+        let root = source
+            .make_indirect_object_handle(ObjectHandle::dictionary(vec![(
+                b"/Stream".to_vec(),
+                direct_stream,
+            )]))
+            .expect("root");
+
+        let first_error = target
+            .copy_foreign_object(&root)
+            .expect_err("the direct stream must fail during replacement");
+        assert!(matches!(&first_error, Error::System(message)
+            if message == "QPDF::copyForeign encountered a direct stream object"));
+
+        let retry_error = target
+            .copy_foreign_object(&root)
+            .expect_err("the failed stream replacement must remain queued for retry");
+        assert!(matches!(retry_error, Error::System(message)
             if message == "QPDF::copyForeign encountered a direct stream object"));
     }
 

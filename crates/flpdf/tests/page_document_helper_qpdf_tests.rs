@@ -216,12 +216,10 @@ fn raw_generation_page_tree_leaf_does_not_panic_at_the_object_ref_boundary() {
         PageDocumentHelper::new(&mut pdf).get_all_pages()
     }));
 
-    assert!(
-        result.is_ok(),
-        "raw-generation page handling must not panic"
-    );
-    assert!(
-        result.expect("catch_unwind result").is_err(),
-        "an unprojectable raw page must cross the public ObjectRef boundary explicitly"
-    );
+    let result = result.expect("raw-generation page handling must not panic");
+    assert!(matches!(
+        result,
+        Err(Error::Unsupported(message))
+            if message == "page object 5 65535 cannot be represented as a valid ObjectRef"
+    ));
 }

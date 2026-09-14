@@ -873,6 +873,27 @@ impl<R: Read + Seek> Pdf<R> {
         self.canonical_object_ref_set(true).into_iter().collect()
     }
 
+    /// Return qpdf's live preserve-unreferenced seed handles while retaining
+    /// their raw cache identities. The writer calls `getAllObjects()` before
+    /// its standard enqueue walk (`libqpdf/QPDFWriter.cc:2907-2913`), so this
+    /// route must not narrow a raw source generation such as `5 65536` through
+    /// the public `ObjectRef` projection.
+    pub(crate) fn canonical_live_object_handles(&self) -> Result<Vec<ObjectHandle>> {
+        let handles = self.resolver.get_all_objects()?;
+        let raw_xref = self.resolver.raw_xref_entries();
+        Ok(handles
+            .into_iter()
+            .filter(|handle| {
+                let Some(object_gen) = handle.qpdf_obj_gen() else {
+                    return false;
+                };
+                object_gen.is_indirect()
+                    && (raw_xref.contains_key(&object_gen)
+                        || self.resolver.is_allocated_qpdf_obj_gen(object_gen))
+            })
+            .collect())
+    }
+
     fn canonical_object_ref_set(&self, live_only: bool) -> BTreeSet<ObjectRef> {
         let mut refs: BTreeSet<_> = self
             .resolver
@@ -1306,6 +1327,20 @@ impl<R: Read + Seek> Pdf<R> {
         map: BTreeMap<QpdfObjGen, ObjectRef>,
     ) {
         self.foreign_object_maps.insert(source_id, map);
+    }
+
+    pub(crate) fn take_foreign_object_to_copy(&mut self, source_id: u64) -> Vec<ObjectHandle> {
+        self.foreign_object_to_copy
+            .remove(&source_id)
+            .unwrap_or_default()
+    }
+
+    pub(crate) fn set_foreign_object_to_copy(
+        &mut self,
+        source_id: u64,
+        to_copy: Vec<ObjectHandle>,
+    ) {
+        self.foreign_object_to_copy.insert(source_id, to_copy);
     }
 
     /// qpdf's `ObjCopier::visiting` equivalent (see

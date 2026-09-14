@@ -1268,7 +1268,7 @@ mod tests {
     use crate::job::QPDFJob;
     use crate::page_label_document_helper::LabelStyle;
     use crate::pipeline::{Pipeline, PipelineHandle, PipelineResult};
-    use crate::{ObjectHandle, QPDFLogger};
+    use crate::{ObjectHandle, ObjectStreamMode, PdfWriter, QPDFLogger};
     use std::io::Cursor;
     use std::sync::{Arc, Mutex};
 
@@ -1548,6 +1548,32 @@ mod tests {
         bytes
     }
 
+    fn raw_generation_orphan_pdf() -> Pdf<Cursor<Vec<u8>>> {
+        let mut bytes = b"%PDF-1.4\n".to_vec();
+        let catalog_offset = bytes.len();
+        bytes.extend_from_slice(b"1 0 obj\n<< /Type /Catalog /Pages 2 0 R >>\nendobj\n");
+        let pages_offset = bytes.len();
+        bytes.extend_from_slice(b"2 0 obj\n<< /Type /Pages /Count 1 /Kids [3 0 R] >>\nendobj\n");
+        let page_offset = bytes.len();
+        bytes.extend_from_slice(
+            b"3 0 obj\n<< /Type /Page /Parent 2 0 R /MediaBox [0 0 612 792] >>\nendobj\n",
+        );
+        let orphan_offset = bytes.len();
+        bytes.extend_from_slice(b"5 65536 obj\n45\nendobj\n");
+        let xref_offset = bytes.len();
+        bytes.extend_from_slice(b"xref\n0 6\n0000000000 65535 f \n");
+        bytes.extend_from_slice(format!("{catalog_offset:010} 00000 n \n").as_bytes());
+        bytes.extend_from_slice(format!("{pages_offset:010} 00000 n \n").as_bytes());
+        bytes.extend_from_slice(format!("{page_offset:010} 00000 n \n").as_bytes());
+        bytes.extend_from_slice(b"0000000000 00000 f \n");
+        bytes.extend_from_slice(format!("{orphan_offset:010} 65536 n \n").as_bytes());
+        bytes.extend_from_slice(
+            format!("trailer\n<< /Size 6 /Root 1 0 R >>\nstartxref\n{xref_offset}\n%%EOF\n")
+                .as_bytes(),
+        );
+        Pdf::open_mem_owned(bytes).expect("open raw-generation orphan fixture")
+    }
+
     /// Single-page PDF whose `/AcroForm` has `/NeedAppearances` but no
     /// `/Fields` key at all (qpdf's `had_fields_array` gate is false).
     fn acroform_no_fields_array_pdf() -> Pdf<Cursor<Vec<u8>>> {
@@ -1758,6 +1784,53 @@ mod tests {
                 "qpdf --pages default copies inherited /Resources directly onto the page"
             );
         }
+    }
+
+    #[test]
+    fn handle_page_specs_preserve_unreferenced_keeps_raw_generation_objects() {
+        let mut sources = vec![raw_generation_orphan_pdf(), three_page_pdf()];
+        let raw_orphans = sources[0]
+            .canonical_live_object_handles()
+            .expect("enumerate raw-generation live objects");
+        assert!(
+            raw_orphans
+                .iter()
+                .any(|handle| { handle.qpdf_obj_gen() == Some(QpdfObjGen::new(5, 65_536)) }),
+            "canonical live handles must retain raw-generation source objects: {:?}",
+            raw_orphans
+                .iter()
+                .filter_map(ObjectHandle::qpdf_obj_gen)
+                .collect::<Vec<_>>()
+        );
+        let specs = [
+            PageSpecInput::new(0, PageRange::parse_numrange("1").unwrap()),
+            PageSpecInput::new(1, PageRange::parse_numrange("1").unwrap()),
+        ];
+        let mut merged = handle_page_specs(
+            &mut QPDFJob::new(),
+            &mut sources,
+            &specs,
+            None,
+            RemoveUnreferencedResources::Auto,
+            true,
+        )
+        .expect("preserve-unreferenced page merge");
+
+        let mut writer = PdfWriter::new(&mut merged);
+        writer.set_static_id(true);
+        writer.set_object_stream_mode(ObjectStreamMode::Disable);
+        writer.set_preserve_unreferenced_objects(true);
+        writer.set_output_memory().expect("configure memory output");
+        writer.write().expect("preserve-unreferenced merge write");
+        let output = writer.get_buffer().expect("writer output");
+        assert_eq!(
+            output
+                .windows(b"\n45\n".len())
+                .filter(|window| *window == b"\n45\n")
+                .count(),
+            1,
+            "raw-generation primary orphan must be copied into the preserve target"
+        );
     }
 
     #[test]

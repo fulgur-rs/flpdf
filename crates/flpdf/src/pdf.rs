@@ -161,6 +161,12 @@ pub struct Pdf<R: Read + Seek + 'static> {
     /// qpdf's `m->object_copiers[source unique_id].object_map` equivalent,
     /// keyed by the source's raw `QpdfObjGen` identity.
     pub(crate) foreign_object_maps: BTreeMap<u64, BTreeMap<QpdfObjGen, ObjectRef>>,
+    /// qpdf's `m->object_copiers[source unique_id].to_copy` equivalent.
+    /// Entries remain queued until the complete replacement pass succeeds, so
+    /// a failed foreign copy can retry the reserved graph rather than treating
+    /// its partially replaced root as complete (`QPDF.hh:891-897`,
+    /// `QPDF.cc:2066-2093`).
+    pub(crate) foreign_object_to_copy: BTreeMap<u64, Vec<ObjectHandle>>,
     /// Source-page copy groups in the order qpdf allocates them. The grouped
     /// page merge keeps one copier per source, but page-spec provenance must
     /// still interleave each unique page graph at its occurrence boundary.

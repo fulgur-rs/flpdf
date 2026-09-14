@@ -322,16 +322,16 @@ fn repair_page_tree_handle<R: Read + Seek>(
             kid.warn_if_possible("/Type key should be /Page but is not; overriding")?;
             replace_handle_key(&kid, b"/Type", ObjectHandle::name(b"Page".to_vec()))?;
         }
+        let page_object_gen = kid
+            .qpdf_obj_gen()
+            .filter(|object_gen| object_gen.is_indirect());
         // cov:ignore-start: every direct leaf is promoted above and every
         // remaining leaf is an indirect handle with its QpdfObjGen identity.
-        let page_ref = project_page_object_ref(
-            kid.qpdf_obj_gen()
-                .filter(|object_gen| object_gen.is_indirect())
-                .ok_or_else(|| {
-                    Error::Internal("page-tree leaf lost its indirect identity".to_owned())
-                })?,
-        )?;
+        let page_object_gen = page_object_gen.ok_or_else(|| {
+            Error::Internal("page-tree leaf lost its indirect identity".to_owned())
+        })?;
         // cov:ignore-end
+        let page_ref = project_page_object_ref(page_object_gen)?;
         state.pages.push(page_ref);
     }
     Ok(())

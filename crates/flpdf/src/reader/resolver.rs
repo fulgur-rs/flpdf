@@ -1537,6 +1537,10 @@ impl<R: Read + Seek> ResolverHandle<R> {
         let Ok(object_gen) = QpdfObjGen::try_from_object_ref(object_ref) else {
             return false;
         };
+        self.is_allocated_qpdf_obj_gen(object_gen)
+    }
+
+    pub(crate) fn is_allocated_qpdf_obj_gen(&self, object_gen: QpdfObjGen) -> bool {
         self.core
             .borrow()
             .allocated_object_refs

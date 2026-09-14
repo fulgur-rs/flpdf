@@ -452,6 +452,17 @@ boundary as an explicit error rather than a panic. The public
 `Pdf::get_all_objects` route already returns raw cache handles, and its
 regression test asserts that a matching `5 65536 obj` entry is retained.
 
+The foreign copier also retains qpdf's per-source `to_copy` queue across a
+failed replacement pass and clears it only after every reserved object has
+been replaced (`include/qpdf/QPDF.hh:891-897`, `libqpdf/QPDF.cc:2066-2093`).
+This keeps a retry from treating a partially replaced reservation as a
+completed copy. The page-selection preserve route applies the same raw-cache
+rule before copying primary unreferenced objects: `QPDFWriter::enqueueObjectsStandard`
+seeds directly from `getAllObjects` (`libqpdf/QPDFWriter.cc:2907-2913`), so
+`canonical_live_object_handles` keeps a raw generation such as `5 65536`
+through the copy boundary and only narrows destination writer references where
+the consumer explicitly requires `ObjectRef`.
+
 ### `flpdf-ymuj.6.10` single raw ValueIdentity (2026-09-14)
 
 qpdf's `QPDFValue` owns one raw `QPDFObjGen` (`libqpdf/qpdf/QPDFValue.hh:149-152`);
