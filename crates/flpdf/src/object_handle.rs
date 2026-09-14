@@ -3413,8 +3413,8 @@ impl ObjectHandle {
     /// non-array (`libqpdf/QPDFObjectHandle.cc:763-766`), so qpdf reads a
     /// non-array as an empty one. This returns `None`, matching
     /// [`Self::try_as_array`], and leaves the meaning of "not an array" to the
-    /// caller — for [`crate::stream_filter::decode_filter_specs_from_handle`]
-    /// that is the "stream filter type is not name or array" error. That
+    /// caller — for the canonical stream filter planning route that is the
+    /// "stream filter type is not name or array" error. That
     /// divergence predates this accessor and is not widened by it; folding
     /// qpdf's treat-as-empty in here would silently turn a rejected `/Filter`
     /// into an accepted unfiltered stream.
@@ -9936,8 +9936,8 @@ pub(crate) mod identity_tests {
         // Deliberately *not* qpdf's non-array answer. `getArrayNItems` warns
         // `typeWarning("array", "treating as empty")` and returns 0
         // (`libqpdf/QPDFObjectHandle.cc:763-766`); returning `Some(0)` here
-        // would make `stream_filter::decode_filter_specs_from_handle` read a
-        // scalar `/Filter` as an empty chain — an accepted unfiltered stream —
+        // would make the canonical stream filter planner read a scalar
+        // `/Filter` as an empty chain — an accepted unfiltered stream —
         // instead of raising its type error.
         for non_array in [
             ObjectHandle::null(),

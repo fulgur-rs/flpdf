@@ -93,19 +93,14 @@ Change comments naming `stream_filter::decode_filter_specs_from_handle` to descr
 
 - [ ] **Step 1: Keep only the canonical StreamFilter contract**
 
-Retain `set_decode_params`, `preflight_decode_pipeline`, `decode_pipeline_owned`, `set_warning_callback`, `is_specialized_compression`, and `is_lossy_compression`. Delete `set_tiff_memory_limit`, `pipe_decode_recovering`, and types/functions used only by them: `FilterSpec`, `validate_filter_chain_count`, `FilterDecodeOutcome`, `FilterDecodeError`, `FilterDecodePhase`, `OutputBuffer`, `StagePipelineError`, `write_and_finish`, `map_stage_error`, `filter_decode_phase`, and whole-buffer decode helpers.
+Retain `set_decode_params`, `decode_pipeline_owned`, `set_warning_callback`, `is_specialized_compression`, and `is_lossy_compression`. Delete the unused `preflight_decode_pipeline`, `set_tiff_memory_limit`, `pipe_decode_recovering`, and types/functions used only by them: `FilterSpec`, `validate_filter_factories`, `validate_filter_chain_count`, `FilterDecodeOutcome`, `FilterDecodeError`, `FilterDecodePhase`, `OutputBuffer`, `StagePipelineError`, `write_and_finish`, `map_stage_error`, `filter_decode_phase`, and whole-buffer decode helpers.
 
 - [ ] **Step 2: Preserve canonical predictor construction without a limit argument**
 
-Use a normal `Buffer` sink in canonical preflight and change predictor construction to:
+Canonical construction already uses `decode_pipeline_owned` with the downstream pipeline. Keep that ownership seam and remove the unused legacy preflight sink; no separate predictor preflight or limit argument is needed.
 
 ```rust
-let mut sink = Buffer::new("stream data buffer", None);
-let _predictor = make_predictor_pipeline(
-    geometry,
-    &mut sink,
-    PredictorAction::Decode,
-)?;
+let next = make_predictor_pipeline(geometry, next, PredictorAction::Decode)?;
 ```
 
 Remove `tiff_max_memory` from `FlateLzwStreamFilter` and all calls to `make_predictor_pipeline`. Remove recovery implementations from Ascii85, ASCIIHex, RunLength, DCT, and Crypt filters; retain their canonical pipeline/classification methods.
@@ -135,7 +130,7 @@ Set C28 to `canonical`, `absent`, `prod: 0 / test: 0`, recording `.48.96` remova
 
 - [ ] **Step 2: Recompute same-run classifications**
 
-Preserve all denominators and update expected counts to C canonical 38 / bridge 0 / mixed 4, A-E canonical 103 / bridge 0 / mixed 57, and checker logical canonical 129 / bridge 6 / mixed 124. Use the actual checker citation count in README after deleting the symbols and manifest entries.
+Preserve all denominators and update expected counts to C canonical 39 / bridge 0 / mixed 3, A-E canonical 104 / bridge 0 / mixed 56, and checker logical canonical 130 / bridge 6 / mixed 123. Use the actual checker citation count in README after deleting the symbols and manifest entries.
 
 Remove C9/C28 deleted symbols from `tracked-symbols.txt`; do not leave a manifest entry for a removed declaration.
 

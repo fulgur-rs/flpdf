@@ -1959,9 +1959,8 @@ mod tests {
     /// bits wide because so few codes are emitted the table never reaches
     /// the first width-bump threshold (511 entries under the default
     /// EarlyChange). flpdf has no LZW encoder (decision flpdf-9hc.7.2), so a
-    /// test needing LZW-encoded *input* must synthesize it directly —
-    /// mirrors `filters::tests::pack_lzw_9bit`, which cannot be reused here
-    /// since it is private to that module.
+    /// test needing LZW-encoded *input* must synthesize it directly; there is
+    /// no production LZW encoder to reuse.
     fn pack_lzw_9bit_literal(bytes: &[u8]) -> Vec<u8> {
         let mut out = Vec::new();
         let mut buf: u32 = 0;

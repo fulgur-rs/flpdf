@@ -1,18 +1,9 @@
 //! qpdf correspondence: `QPDFStreamFilter.cc` and `QPDF_Stream.cc` filter names, full `/DecodeParms` handles, and reverse decode-pipeline construction (`libqpdf/QPDF_Stream.cc:380-482`).
 //!
-//! Each [`FilterSpec`] retains the native [`ObjectHandle`] supplied by the
-//! stream dictionary. This mirrors qpdf's shared `QPDFObjectHandle` across
-//! the filter chain: setters inspect the live handle in qpdf order, rather
-//! than through a reduced snapshot or copied parameter-value enum. In
-//! particular, the Flate/LZW and Crypt setters below perform their own
-//! qpdf-shaped key walks and validation, while filters inheriting the base
-//! setter only test whether the handle is null.
-//!
 //! Crypt decryption remains owned by
 //! `reader::resolver::inspect_stream_encryption` and
-//! `reader::resolver::pipe_stream_data_from_input`; this module only preserves
-//! qpdf's filterability and no-stage pipeline contract. The `filters` layer
-//! supplies the non-decrypting rejection provider at that boundary.
+//! `reader::resolver::pipe_stream_data_from_input`; this module preserves
+//! qpdf's filterability and no-stage pipeline contract.
 
 use crate::object_handle::ObjectHandle;
 use crate::pipeline::ascii85_decoder::Ascii85Decoder;
@@ -26,34 +17,8 @@ use crate::pipeline::run_length::{RunLength, RunLengthAction};
 use crate::pipeline::tiff_predictor::{TiffPredictor, TiffPredictorAction};
 use crate::pipeline::{Pipeline, PipelineError, PipelineRef, PipelineResult};
 use crate::{Error, Result};
-use std::cell::Cell;
-use std::rc::Rc;
-
-pub(crate) const DECODE_OUTPUT_LIMIT_PREFIX: &str = "decoded output exceeds configured limit of";
-
-/// The message a refused `Crypt` stage reports, wherever the refusal happens.
-///
-/// Two routes can produce it: `filters::reject_crypt_stage`, the crypt provider
-/// every non-decrypting decode entry point installs, and
-/// [`CryptStreamFilter`]'s `pipe_decode_recovering`, the registry-side route
-/// nothing reaches today. One definition rather than one literal per route is
-/// what makes the public error genuinely fixed if a `Crypt` stage is ever
-/// routed through the registry — two literals could only ever happen to agree.
-pub(crate) const CRYPT_STAGE_UNSUPPORTED: &str = "unsupported stream filter: Crypt";
 
 type FilterWarningCallback = Box<dyn FnMut(&str, i32) -> PipelineResult<()> + 'static>;
-
-#[derive(Debug)]
-pub(crate) struct FilterSpec {
-    pub(crate) name: Vec<u8>,
-    pub(crate) decode_params: ObjectHandle,
-}
-
-impl FilterSpec {
-    pub(crate) fn normalized_name(&self) -> &[u8] {
-        normalize_filter_name(&self.name)
-    }
-}
 
 pub(crate) fn normalize_filter_name(name: &[u8]) -> &[u8] {
     match name {
@@ -68,29 +33,6 @@ pub(crate) fn normalize_filter_name(name: &[u8]) -> &[u8] {
     }
 }
 
-/// Report why a filter name has no decode factory.
-pub(crate) fn undecodable_filter_error(filter_name: &[u8]) -> Error {
-    Error::Unsupported(format!(
-        "unsupported stream filter: {}",
-        std::str::from_utf8(filter_name).unwrap_or("<binary>")
-    ))
-}
-
-/// Validate `/Filter` names at the same stage as qpdf's `filter_factories`
-/// lookup (`QPDF_Stream.cc:419-435`), before `/DecodeParms` is inspected.
-pub(crate) fn validate_filter_factories<'a, I>(names: I) -> Result<()>
-where
-    I: IntoIterator<Item = &'a [u8]>,
-{
-    for name in names {
-        let normalized = normalize_filter_name(name);
-        if stream_filter_for(normalized).is_none() {
-            return Err(undecodable_filter_error(normalized));
-        }
-    }
-    Ok(())
-}
-
 /// `QPDF_Stream::filterable`'s `warn("stream filter type is not name or
 /// array")` (`libqpdf/QPDF_Stream.cc:413`). flpdf raises the same text as an
 /// error instead of a warning; see plan decision D3 of `flpdf-25kg.3.4`.
@@ -103,272 +45,18 @@ pub(crate) const FILTER_TYPE_ERROR: &str = "stream filter type is not name or ar
 /// qpdf validates every filter name against `filter_factories` first and
 /// returns on an unknown one (`QPDF_Stream.cc:433-435`), so `:459`'s condition
 /// is never evaluated for a stream whose `/Filter` names an unimplemented
-/// codec. The handle reader makes the same factory decision before reading
-/// `/DecodeParms`, through [`validate_filter_factories`].
+/// codec. The canonical handle reader makes the same factory decision before
+/// reading `/DecodeParms`, through `prepare_stream_filter_plan`.
 pub(crate) const DECODE_PARMS_LENGTH_ERROR: &str =
     "stream /DecodeParms length is inconsistent with filters";
-
-/// Reject a `/Filter` chain longer than `maximum`.
-///
-/// Unlike qpdf, which caps nothing here, flpdf refuses pathological chains on
-/// the decode path; `filters::MAX_FILTER_CHAIN_LEN` documents that divergence.
-///
-/// The handle reader calls this before it copies an array, so the cap's
-/// *body* — the comparison and the message — has exactly one definition.
-pub(crate) fn validate_filter_chain_count(count: usize, maximum: Option<usize>) -> Result<()> {
-    if let Some(maximum) = maximum.filter(|maximum| count > *maximum) {
-        return Err(Error::Unsupported(format!(
-            "filter chain length {count} exceeds maximum of {maximum}"
-        )));
-    }
-    Ok(())
-}
-
-/// Read `/Filter` and `/DecodeParms` through the resolving `try_*` accessors.
-///
-/// `QPDF_Stream::filterable` reaches `/Filter` and `/DecodeParms` through
-/// `stream_dict.getKey` (`libqpdf/QPDF_Stream.cc:386`, `:441`) and their
-/// members through `getArrayItem` (`:400`, `:448`), then inspects each with
-/// `isNull`/`isName`/`isArray`/`isInteger` — every one of which dereferences
-/// through the owning `QPDF` first. So an indirect child is read as the object
-/// it points at, which a `&Object` walk cannot do and which the 2026-08-03
-/// live-qpdf probe recorded in plan decision D1 of `flpdf-25kg.3.4`.
-///
-/// That is unconditional for `/Filter`, each `/Filter` array item, the
-/// `/DecodeParms` handle, and each `/DecodeParms` array item — every position
-/// `QPDF_Stream::filterable` itself inspects. It is *conditional* one level
-/// deeper: a `/DecodeParms` dictionary **value** is reached only by
-/// `SF_FlateLzwDecode::setDecodeParms`, so this reader preserves the native
-/// handle and lets that setter resolve its values at the qpdf boundary.
-///
-/// A missing key arrives here as a null handle, exactly as `getKey` hands one
-/// back (`libqpdf/QPDFObjectHandle.cc:979-988`), so absent and null share the
-/// `isNull` branch just as they do in qpdf.
-///
-/// This is the canonical production reader for filter metadata. The former
-/// Dictionary/value adapters and object-shaped production reader were removed
-/// with the legacy object-model route (`d18ce346`). Everything downstream of
-/// [`FilterSpec`] — the codec stack, predictor geometry, limits, and warning
-/// ordering — stays a single copy.
-pub(crate) fn decode_filter_specs_from_handle(
-    filter: &ObjectHandle,
-    decode_params: &ObjectHandle,
-    max_filter_chain: Option<usize>,
-) -> Result<Vec<FilterSpec>> {
-    let names: Vec<Vec<u8>> = if filter.try_is_null()? {
-        return Ok(Vec::new());
-    } else if let Some(name) = filter.try_as_name()? {
-        vec![name]
-    } else if let Some(count) = filter.try_array_len()? {
-        // Counted through `try_array_len`, not `try_as_array`, so a chain the
-        // cap is about to reject is never copied — qpdf sizes this loop
-        // with `getArrayNItems` (`libqpdf/QPDF_Stream.cc:398`), which reads
-        // the length off the borrowed array in place. The copy below
-        // therefore only happens once the count is known to be acceptable.
-        validate_filter_chain_count(count, max_filter_chain)?;
-        // `try_array_len` already answered `Some`, so this cannot be `None`;
-        // `flatten` states that without a panicking `expect`.
-        filter
-            .try_as_array()?
-            .into_iter()
-            .flatten()
-            .map(|item| {
-                item.try_as_name()?
-                    .ok_or_else(|| Error::Unsupported(FILTER_TYPE_ERROR.to_string()))
-            })
-            .collect::<Result<_>>()?
-    } else {
-        return Err(Error::Unsupported(FILTER_TYPE_ERROR.to_string()));
-    };
-
-    if names.is_empty() {
-        return Ok(Vec::new());
-    }
-
-    validate_filter_factories(names.iter().map(Vec::as_slice))?;
-
-    let params: Vec<ObjectHandle> = if decode_params.try_is_null()? {
-        (0..names.len()).map(|_| ObjectHandle::null()).collect()
-    } else if let Some(count) = decode_params.try_array_len()? {
-        // Same length-before-copy shape as the `/Filter` arm: qpdf sizes
-        // this loop with `getArrayNItems` as well (`libqpdf/QPDF_Stream.cc:443`
-        // for the empty-array reduction, `:447` for the per-index walk), and
-        // both the empty reduction and the length mismatch are decided from
-        // the count alone — so a mismatched array is rejected without being
-        // copied.
-        if count == 0 {
-            (0..names.len()).map(|_| ObjectHandle::null()).collect()
-        } else {
-            if count != names.len() {
-                return Err(Error::Unsupported(DECODE_PARMS_LENGTH_ERROR.to_string()));
-            }
-            decode_params
-                .try_as_array()?
-                .into_iter()
-                .flatten()
-                .collect()
-        }
-    } else {
-        // One handle replicated across the chain, exactly as qpdf pushes the
-        // same `QPDFObjectHandle` per filter (`QPDF_Stream.cc:450-454`).
-        (0..names.len()).map(|_| decode_params.clone()).collect()
-    };
-
-    validate_filter_chain_count(names.len(), max_filter_chain)?;
-
-    Ok(names
-        .into_iter()
-        .zip(params)
-        .map(|(name, decode_params)| FilterSpec {
-            name,
-            decode_params,
-        })
-        .collect())
-}
-
-struct OutputBuffer {
-    data: Vec<u8>,
-    max_output: Option<usize>,
-    cleanup_data_start: Option<usize>,
-    finish_phase: Rc<Cell<bool>>,
-    output_position: Rc<Cell<usize>>,
-}
-
-impl OutputBuffer {
-    fn new(max_output: Option<usize>) -> Self {
-        Self {
-            data: Vec::new(),
-            max_output,
-            cleanup_data_start: None,
-            finish_phase: Rc::new(Cell::new(false)),
-            output_position: Rc::new(Cell::new(0)),
-        }
-    }
-
-    fn finish_phase(&self) -> Rc<Cell<bool>> {
-        Rc::clone(&self.finish_phase)
-    }
-
-    fn output_position(&self) -> Rc<Cell<usize>> {
-        Rc::clone(&self.output_position)
-    }
-
-    fn cleanup_data_start(&self) -> usize {
-        self.cleanup_data_start.unwrap_or(self.data.len())
-    }
-}
-
-impl Pipeline for OutputBuffer {
-    fn identifier(&self) -> &str {
-        "stream data buffer"
-    }
-
-    fn write(&mut self, data: &[u8]) -> PipelineResult<()> {
-        if self.finish_phase.get() && self.cleanup_data_start.is_none() {
-            self.cleanup_data_start = Some(self.data.len());
-        }
-        if let Some(limit) = self.max_output {
-            let remaining = limit.saturating_sub(self.data.len());
-            if data.len() > remaining {
-                self.data.extend_from_slice(&data[..remaining]);
-                self.output_position.set(self.data.len());
-                return Err(PipelineError::runtime(format!(
-                    "{DECODE_OUTPUT_LIMIT_PREFIX} {limit} bytes"
-                )));
-            }
-        }
-        self.data.extend_from_slice(data);
-        self.output_position.set(self.data.len());
-        Ok(())
-    }
-
-    fn finish(&mut self) -> PipelineResult<()> {
-        Ok(())
-    }
-}
-
 fn map_pipeline_error(error: PipelineError) -> Error {
     Error::Unsupported(error.into_string_lossy())
 }
 
-pub(crate) struct FilterDecodeOutcome {
-    pub(crate) data: Vec<u8>,
-    pub(crate) cleanup_data_start: usize,
-    pub(crate) error: Option<FilterDecodeError>,
-}
-
-pub(crate) struct FilterDecodeError {
-    pub(crate) error: Error,
-    pub(crate) during_write: bool,
-    pub(crate) output_offset: usize,
-}
-
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub(crate) enum FilterDecodePhase {
-    Write,
-    Finish,
-}
-
-/// Pipe one complete encoded buffer through a stage with qpdf's error cleanup.
-///
-/// `QPDF::pipeStreamData` calls `finish` after a failed `write`, ignores that
-/// secondary result, and keeps the original exception. The stage's sink remains
-/// owned by its caller, so bytes forwarded before the failure stay accessible.
-struct StagePipelineError {
-    error: PipelineError,
-    during_write: bool,
-    output_offset: usize,
-}
-
-fn write_and_finish(
-    stage: &mut dyn Pipeline,
-    data: &[u8],
-    finish_phase: Option<&Cell<bool>>,
-    output_position: &Cell<usize>,
-) -> Option<StagePipelineError> {
-    if let Some(finish_phase) = finish_phase {
-        finish_phase.set(false);
-    }
-    match stage.write(data) {
-        Ok(()) => {
-            if let Some(finish_phase) = finish_phase {
-                finish_phase.set(true);
-            }
-            stage.finish().err().map(|error| StagePipelineError {
-                error,
-                during_write: false,
-                output_offset: output_position.get(),
-            })
-        }
-        Err(error) => {
-            let output_offset = output_position.get();
-            if let Some(finish_phase) = finish_phase {
-                finish_phase.set(true);
-            }
-            let _ = stage.finish();
-            Some(StagePipelineError {
-                error,
-                during_write: true,
-                output_offset,
-            })
-        }
-    }
-}
-
-fn map_stage_error(error: StagePipelineError) -> FilterDecodeError {
-    FilterDecodeError {
-        error: map_pipeline_error(error.error),
-        during_write: error.during_write,
-        output_offset: error.output_offset,
-    }
-}
-
 /// Rust equivalent of qpdf's `QPDFStreamFilter` extension boundary.
 ///
-/// `pipe_decode_recovering` owns construction and completion of the filter's
-/// decode pipeline for the explicit qtest exception boundary. The result is
-/// assembled from incremental `Pipeline` stages; ordinary stream consumers use
-/// `ObjectHandle::pipe_stream_data` directly.
+/// Ordinary stream consumers use `ObjectHandle::pipe_stream_data` directly;
+/// this trait only supplies qpdf's filter construction and classification hooks.
 pub(crate) trait StreamFilter {
     /// Port of `QPDFStreamFilter::setDecodeParms`
     /// (`libqpdf/QPDFStreamFilter.cc:3-7`), whose whole body is
@@ -379,20 +67,6 @@ pub(crate) trait StreamFilter {
     fn set_decode_params(&mut self, decode_params: &ObjectHandle) -> Result<bool> {
         decode_params.try_is_null()
     }
-
-    /// Build the filter's decode pipeline without decoding anything.
-    ///
-    /// `QPDF_Stream::pipeStreamData` constructs every filter's decode pipeline
-    /// before it writes the first byte, so a stage whose parameters cannot form
-    /// a pipeline is rejected even when an earlier stage would have failed on
-    /// the data itself.
-    fn preflight_decode_pipeline(&self) -> Result<()> {
-        Ok(())
-    }
-
-    /// Install the optional qpdf-head TIFF row-memory budget before preflight
-    /// and execution. Other filters ignore this setting.
-    fn set_tiff_memory_limit(&mut self, _limit: Option<usize>) {}
 
     /// Construct the same stage with a downstream pipeline that may already
     /// own inner stages. This is the Rust ownership seam used by
@@ -405,13 +79,6 @@ pub(crate) trait StreamFilter {
     /// Install the qpdf `QPDF_Stream::pipeStreamData` warning callback on a
     /// filter that constructs a Flate stage. Other filters ignore it.
     fn set_warning_callback(&mut self, _callback: FilterWarningCallback) {}
-
-    fn pipe_decode_recovering(
-        &mut self,
-        data: &[u8],
-        max_output: Option<usize>,
-        warn: &mut dyn FnMut(&str, i32, usize, FilterDecodePhase) -> PipelineResult<()>,
-    ) -> Result<FilterDecodeOutcome>;
 
     /// Whether this filter is a specialized compression codec for qpdf's
     /// stream capability classification.
@@ -446,7 +113,6 @@ struct FlateLzwStreamFilter {
     bits_per_component: i32,
     early_code_change: bool,
     warning_callback: Option<FilterWarningCallback>,
-    tiff_max_memory: Option<usize>,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -481,7 +147,6 @@ impl FlateLzwStreamFilter {
             bits_per_component: 8,
             early_code_change: true,
             warning_callback: None,
-            tiff_max_memory: None,
         }
     }
 }
@@ -562,23 +227,6 @@ impl StreamFilter for FlateLzwStreamFilter {
         self.warning_callback = Some(callback);
     }
 
-    fn preflight_decode_pipeline(&self) -> Result<()> {
-        if let Some(geometry) = self.decode_predictor_geometry()? {
-            let mut sink = OutputBuffer::new(None);
-            let _predictor = make_predictor_pipeline(
-                geometry,
-                &mut sink,
-                PredictorAction::Decode,
-                self.tiff_max_memory,
-            )?;
-        }
-        Ok(())
-    }
-
-    fn set_tiff_memory_limit(&mut self, limit: Option<usize>) {
-        self.tiff_max_memory = limit;
-    }
-
     /// Mirrors `SF_FlateLzwDecode::getDecodePipeline`
     /// (`libqpdf/SF_FlateLzwDecode.cc:75-110`): a predictor stage first when
     /// the parameters call for one, with `next` reassigned to it, then the
@@ -589,12 +237,7 @@ impl StreamFilter for FlateLzwStreamFilter {
         next: PipelineRef<'a>,
     ) -> Result<OwnedDecodePipeline<'a>> {
         let next: PipelineRef<'a> = match self.decode_predictor_geometry()? {
-            Some(geometry) => make_predictor_pipeline(
-                geometry,
-                next,
-                PredictorAction::Decode,
-                self.tiff_max_memory,
-            )?,
+            Some(geometry) => make_predictor_pipeline(geometry, next, PredictorAction::Decode)?,
             None => next,
         };
         let stage: Box<dyn Pipeline + 'a> = if self.lzw {
@@ -613,41 +256,6 @@ impl StreamFilter for FlateLzwStreamFilter {
             Box::new(flate)
         };
         Ok(OwnedDecodePipeline::Stage(stage))
-    }
-
-    fn pipe_decode_recovering(
-        &mut self,
-        data: &[u8],
-        max_output: Option<usize>,
-        warn: &mut dyn FnMut(&str, i32, usize, FilterDecodePhase) -> PipelineResult<()>,
-    ) -> Result<FilterDecodeOutcome> {
-        let geometry = self.decode_predictor_geometry()?;
-        let mut sink = OutputBuffer::new(max_output);
-        let finish_phase = sink.finish_phase();
-        let output_position = sink.output_position();
-        // SF_FlateLzwDecode::getDecodePipeline builds the chain from the sink
-        // outward, so the predictor stage is constructed before the codec and
-        // any construction failure precedes every codec write.
-        let error = match geometry {
-            Some(geometry) => {
-                let mut predictor = make_predictor_pipeline(
-                    geometry,
-                    &mut sink,
-                    PredictorAction::Decode,
-                    self.tiff_max_memory,
-                )?;
-                let phase = Some(finish_phase.as_ref());
-                self.pipe_codec(&mut predictor, data, warn, phase, &output_position)?
-            }
-            None => {
-                self.pipe_codec(&mut sink, data, warn, Some(&finish_phase), &output_position)?
-            }
-        };
-        Ok(FilterDecodeOutcome {
-            cleanup_data_start: sink.cleanup_data_start(),
-            data: sink.data,
-            error,
-        })
     }
 }
 
@@ -675,62 +283,12 @@ impl FlateLzwStreamFilter {
         })
         .transpose()
     }
-
-    /// Run the codec stage of the recovering materialized qtest route over
-    /// `data`.
-    ///
-    /// **Recorded deviation:** the `Pl_Flate` warn callback is installed here,
-    /// on the stage this function constructs, where qpdf installs it at the
-    /// `getDecodePipeline` caller (`QPDF_Stream.cc:564-567`). Every `Pl_Flate`
-    /// this route builds still receives the callback qpdf would install at
-    /// that filter's own iteration, so warning text and order are unchanged.
-    /// What installing it here cannot reproduce is qpdf's other case: the cast
-    /// runs once per filter rather than once per constructed stage, so an
-    /// iteration whose filter builds nothing lands it on a stage constructed
-    /// elsewhere — see qpdf's `getDecodePipeline` boundary. Both that case and
-    /// the placement belong with the port of `QPDF_Stream::pipeStreamData`.
-    ///
-    /// Nothing today can observe the difference: this route decodes each
-    /// filter's whole buffer in one call, constructing and finishing that
-    /// filter's stages within it, so no chain head survives into the next
-    /// filter — and `Crypt`, the only filter whose `decode_pipeline` builds
-    /// nothing, never reaches this function at all, because
-    /// `filters::prepare_decode_filters` routes its spec to
-    /// `PreparedStage::Crypt` instead of to a codec adapter.
-    fn pipe_codec(
-        &self,
-        next: &mut dyn Pipeline,
-        data: &[u8],
-        warn: &mut dyn FnMut(&str, i32, usize, FilterDecodePhase) -> PipelineResult<()>,
-        finish_phase: Option<&Cell<bool>>,
-        output_position: &Cell<usize>,
-    ) -> Result<Option<FilterDecodeError>> {
-        let error = if self.lzw {
-            let mut stage = LzwDecoder::new("lzw decode", next, self.early_code_change);
-            write_and_finish(&mut stage, data, finish_phase, output_position)
-        } else {
-            let mut stage = Flate::new(
-                "stream inflate",
-                next,
-                FlateAction::Inflate,
-                DEFAULT_OUT_BUFFER_SIZE,
-            )
-            .map_err(map_pipeline_error)?;
-            stage.set_warn_callback(|message, code| {
-                let phase = filter_decode_phase(finish_phase);
-                warn(message, code, output_position.get(), phase)
-            });
-            write_and_finish(&mut stage, data, finish_phase, output_position)
-        };
-        Ok(error.map(map_stage_error))
-    }
 }
 
 fn make_predictor_pipeline<'a>(
     geometry: PredictorGeometry,
     next: impl Into<PipelineRef<'a>>,
     action: PredictorAction,
-    tiff_max_memory: Option<usize>,
 ) -> Result<PipelineRef<'a>> {
     let next = next.into();
     let pipeline = match (geometry.kind, action) {
@@ -759,39 +317,29 @@ fn make_predictor_pipeline<'a>(
         ) as Box<dyn Pipeline + 'a>,
         #[cfg(test)]
         (PredictorKind::Tiff, PredictorAction::Encode) => Box::new(
-            TiffPredictor::new_with_memory_limit(
+            TiffPredictor::new(
                 "tiff encode",
                 next,
                 TiffPredictorAction::Encode,
                 geometry.columns,
                 geometry.colors,
                 geometry.bits_per_component,
-                tiff_max_memory,
             )
             .map_err(map_pipeline_error)?,
         ) as Box<dyn Pipeline + 'a>,
         (PredictorKind::Tiff, PredictorAction::Decode) => Box::new(
-            TiffPredictor::new_with_memory_limit(
+            TiffPredictor::new(
                 "tiff decode",
                 next,
                 TiffPredictorAction::Decode,
                 geometry.columns,
                 geometry.colors,
                 geometry.bits_per_component,
-                tiff_max_memory,
             )
             .map_err(map_pipeline_error)?,
         ) as Box<dyn Pipeline + 'a>,
     };
     Ok(PipelineRef::Owned(pipeline))
-}
-
-fn filter_decode_phase(finish_phase: Option<&Cell<bool>>) -> FilterDecodePhase {
-    if finish_phase.is_some_and(Cell::get) {
-        FilterDecodePhase::Finish
-    } else {
-        FilterDecodePhase::Write
-    }
 }
 
 struct Ascii85StreamFilter;
@@ -807,15 +355,6 @@ impl StreamFilter for Ascii85StreamFilter {
             "ascii85 decode",
             next,
         ))))
-    }
-
-    fn pipe_decode_recovering(
-        &mut self,
-        data: &[u8],
-        max_output: Option<usize>,
-        _warn: &mut dyn FnMut(&str, i32, usize, FilterDecodePhase) -> PipelineResult<()>,
-    ) -> Result<FilterDecodeOutcome> {
-        decode_ascii85(data, max_output)
     }
 }
 
@@ -833,15 +372,6 @@ impl StreamFilter for AsciiHexStreamFilter {
             "asciiHex decode",
             next,
         ))))
-    }
-
-    fn pipe_decode_recovering(
-        &mut self,
-        data: &[u8],
-        max_output: Option<usize>,
-        _warn: &mut dyn FnMut(&str, i32, usize, FilterDecodePhase) -> PipelineResult<()>,
-    ) -> Result<FilterDecodeOutcome> {
-        decode_ascii_hex(data, max_output)
     }
 }
 
@@ -862,15 +392,6 @@ impl StreamFilter for RunLengthStreamFilter {
         ))))
     }
 
-    fn pipe_decode_recovering(
-        &mut self,
-        data: &[u8],
-        max_output: Option<usize>,
-        _warn: &mut dyn FnMut(&str, i32, usize, FilterDecodePhase) -> PipelineResult<()>,
-    ) -> Result<FilterDecodeOutcome> {
-        decode_run_length(data, max_output)
-    }
-
     fn is_specialized_compression(&self) -> bool {
         true
     }
@@ -889,33 +410,6 @@ impl StreamFilter for DctStreamFilter {
             "DCT decode",
             next,
         ))))
-    }
-
-    fn pipe_decode_recovering(
-        &mut self,
-        data: &[u8],
-        max_output: Option<usize>,
-        _warn: &mut dyn FnMut(&str, i32, usize, FilterDecodePhase) -> PipelineResult<()>,
-    ) -> Result<FilterDecodeOutcome> {
-        let mut sink = OutputBuffer::new(max_output);
-        let finish_phase = sink.finish_phase();
-        let output_position = sink.output_position();
-        let error = {
-            let mut stage = PlDct::new("DCT decode", &mut sink).with_max_output(max_output);
-            write_and_finish(
-                &mut stage,
-                data,
-                Some(finish_phase.as_ref()),
-                &output_position,
-            )
-            .map(map_stage_error)
-        };
-        let cleanup_data_start = sink.cleanup_data_start();
-        Ok(FilterDecodeOutcome {
-            data: sink.data,
-            cleanup_data_start,
-            error,
-        })
     }
 
     fn is_specialized_compression(&self) -> bool {
@@ -988,31 +482,6 @@ impl StreamFilter for CryptStreamFilter {
     ) -> Result<OwnedDecodePipeline<'a>> {
         Ok(OwnedDecodePipeline::NoStage(_next))
     }
-
-    /// Refuse to decode, reporting [`CRYPT_STAGE_UNSUPPORTED`].
-    ///
-    /// qpdf has no counterpart to mirror: `SF_Crypt` contributes no pipeline
-    /// and decryption is `decryptStream`'s job, so this route is flpdf's
-    /// alone. Nothing reaches it today —
-    /// `filters::prepare_decode_filters` routes a `Crypt` spec to
-    /// `PreparedStage::Crypt` before the registry is consulted, and the crypt
-    /// provider every non-decrypting entry point installs is
-    /// `filters::reject_crypt_stage`. Sharing that provider's message — the
-    /// same constant, not a second copy of it — is what keeps the public error
-    /// unchanged if decoding is ever routed here instead.
-    // qpdf-deviation: no qpdf counterpart -- QPDFStreamFilter has no
-    // execute-time decode call (only setDecodeParms/getDecodePipeline), so
-    // this call shape (invoking a Crypt stage's decode step directly) is one
-    // qpdf can never produce; this refusal guards flpdf's own registry route
-    // rather than reproducing any qpdf behavior.
-    fn pipe_decode_recovering(
-        &mut self,
-        _data: &[u8],
-        _max_output: Option<usize>,
-        _warn: &mut dyn FnMut(&str, i32, usize, FilterDecodePhase) -> PipelineResult<()>,
-    ) -> Result<FilterDecodeOutcome> {
-        Err(Error::Unsupported(CRYPT_STAGE_UNSUPPORTED.to_string()))
-    }
 }
 
 /// Construct the filter registered under `filter_name`, if any.
@@ -1027,9 +496,7 @@ impl StreamFilter for CryptStreamFilter {
 /// adding one would mean replacing this `match`.
 ///
 /// The container and qpdf's registered production codecs are represented here;
-/// the DCT stage itself is the qpdf-shaped streaming primitive, and the
-/// recovering qtest adapter below drives that same stage only at its explicit
-/// compatibility boundary.
+/// the DCT stage itself is the qpdf-shaped streaming primitive.
 pub(crate) fn stream_filter_for(filter_name: &[u8]) -> Option<Box<dyn StreamFilter>> {
     match filter_name {
         b"Crypt" => Some(Box::new(CryptStreamFilter)),
@@ -1041,54 +508,6 @@ pub(crate) fn stream_filter_for(filter_name: &[u8]) -> Option<Box<dyn StreamFilt
         b"DCTDecode" => Some(Box::new(DctStreamFilter)),
         _ => None,
     }
-}
-
-fn decode_ascii85(data: &[u8], max_output: Option<usize>) -> Result<FilterDecodeOutcome> {
-    let mut sink = OutputBuffer::new(max_output);
-    let finish_phase = sink.finish_phase();
-    let output_position = sink.output_position();
-    let error = {
-        let mut stage = Ascii85Decoder::new("ascii85 decode", &mut sink);
-        write_and_finish(&mut stage, data, Some(&finish_phase), &output_position)
-            .map(map_stage_error)
-    };
-    Ok(FilterDecodeOutcome {
-        cleanup_data_start: sink.cleanup_data_start(),
-        data: sink.data,
-        error,
-    })
-}
-
-fn decode_ascii_hex(data: &[u8], max_output: Option<usize>) -> Result<FilterDecodeOutcome> {
-    let mut sink = OutputBuffer::new(max_output);
-    let finish_phase = sink.finish_phase();
-    let output_position = sink.output_position();
-    let error = {
-        let mut stage = AsciiHexDecoder::new("asciiHex decode", &mut sink);
-        write_and_finish(&mut stage, data, Some(&finish_phase), &output_position)
-            .map(map_stage_error)
-    };
-    Ok(FilterDecodeOutcome {
-        cleanup_data_start: sink.cleanup_data_start(),
-        data: sink.data,
-        error,
-    })
-}
-
-fn decode_run_length(data: &[u8], max_output: Option<usize>) -> Result<FilterDecodeOutcome> {
-    let mut sink = OutputBuffer::new(max_output);
-    let finish_phase = sink.finish_phase();
-    let output_position = sink.output_position();
-    let error = {
-        let mut stage = RunLength::new("runlength decode", &mut sink, RunLengthAction::Decode);
-        write_and_finish(&mut stage, data, Some(&finish_phase), &output_position)
-            .map(map_stage_error)
-    };
-    Ok(FilterDecodeOutcome {
-        cleanup_data_start: sink.cleanup_data_start(),
-        data: sink.data,
-        error,
-    })
 }
 
 pub(crate) fn encode_flate(data: &[u8]) -> Result<Vec<u8>> {
@@ -1163,8 +582,7 @@ pub(crate) fn encode_predictor(
 fn encode_predictor_stage(data: &[u8], geometry: PredictorGeometry) -> Result<Vec<u8>> {
     let mut sink = Buffer::new("stream data buffer", None);
     {
-        let mut predictor =
-            make_predictor_pipeline(geometry, &mut sink, PredictorAction::Encode, None)?;
+        let mut predictor = make_predictor_pipeline(geometry, &mut sink, PredictorAction::Encode)?;
         predictor.write(data).map_err(map_pipeline_error)?;
         predictor.finish().map_err(map_pipeline_error)?;
     }
@@ -1174,18 +592,7 @@ fn encode_predictor_stage(data: &[u8], geometry: PredictorGeometry) -> Result<Ve
 #[cfg(test)]
 mod tests {
     use super::{FlateLzwStreamFilter, StreamFilter};
-    use crate::pipeline::test_support::RecordingSink;
-    use crate::pipeline::PipelineRef;
     use crate::ObjectHandle;
-
-    fn wide_tiff_decode_params() -> ObjectHandle {
-        ObjectHandle::dictionary(vec![
-            (b"/Predictor".to_vec(), ObjectHandle::integer(2)),
-            (b"/Columns".to_vec(), ObjectHandle::integer(536_870_911)),
-            (b"/Colors".to_vec(), ObjectHandle::integer(1)),
-            (b"/BitsPerComponent".to_vec(), ObjectHandle::integer(8)),
-        ])
-    }
 
     #[test]
     fn flate_filter_consumes_qpdf_canonical_slash_prefixed_keys() {
@@ -1260,103 +667,6 @@ mod tests {
             crate::object_handle::warning_emission_tests::warnings(&recorder),
             vec!["object 3 0: requested value of integer is too big; returning INT_MAX"]
         );
-    }
-
-    #[test]
-    fn filter_specs_keep_scalar_and_array_parameter_handle_mutations() {
-        let filter = ObjectHandle::name(b"FlateDecode".to_vec());
-        let scalar_params =
-            ObjectHandle::dictionary(vec![(b"Predictor".to_vec(), ObjectHandle::integer(1))]);
-        let scalar_specs =
-            super::decode_filter_specs_from_handle(&filter, &scalar_params, None).unwrap();
-        scalar_params
-            .replace_key(b"/Predictor", ObjectHandle::integer(2))
-            .unwrap();
-        let mut scalar_filter = FlateLzwStreamFilter::new(false);
-        assert!(scalar_filter
-            .set_decode_params(&scalar_specs[0].decode_params)
-            .unwrap());
-        assert_eq!(scalar_filter.predictor, 2);
-
-        let array_item =
-            ObjectHandle::dictionary(vec![(b"Predictor".to_vec(), ObjectHandle::integer(1))]);
-        let filter_array = ObjectHandle::array(vec![filter]);
-        let params_array = ObjectHandle::array(vec![array_item.clone()]);
-        let array_specs =
-            super::decode_filter_specs_from_handle(&filter_array, &params_array, None).unwrap();
-        array_item
-            .replace_key(b"/Predictor", ObjectHandle::integer(2))
-            .unwrap();
-        let mut array_filter = FlateLzwStreamFilter::new(false);
-        assert!(array_filter
-            .set_decode_params(&array_specs[0].decode_params)
-            .unwrap());
-        assert_eq!(array_filter.predictor, 2);
-    }
-
-    #[test]
-    fn filter_specs_expand_an_empty_decode_parameter_array_to_null_handles() {
-        let filters = ObjectHandle::array(vec![
-            ObjectHandle::name(b"FlateDecode".to_vec()),
-            ObjectHandle::name(b"LZWDecode".to_vec()),
-        ]);
-        let decode_params = ObjectHandle::array(vec![]);
-        let specs = super::decode_filter_specs_from_handle(&filters, &decode_params, None).unwrap();
-
-        assert_eq!(specs.len(), 2);
-        assert!(specs.iter().all(|spec| spec.decode_params.is_null()));
-    }
-
-    #[test]
-    fn filter_specs_preserve_unknown_stream_array_and_indirect_handles() {
-        let unknown_stream = ObjectHandle::stream(
-            ObjectHandle::dictionary(vec![]),
-            std::rc::Rc::new(vec![1, 2, 3]),
-        );
-        let unknown_array = ObjectHandle::array(vec![ObjectHandle::integer(1)]);
-        let unknown_indirect =
-            ObjectHandle::new_indirect_unresolved(crate::ObjectRef::new(90, 0), 0);
-        let params = ObjectHandle::dictionary(vec![
-            (b"UnknownStream".to_vec(), unknown_stream.clone()),
-            (b"UnknownArray".to_vec(), unknown_array.clone()),
-            (b"UnknownIndirect".to_vec(), unknown_indirect.clone()),
-        ]);
-        let filter = ObjectHandle::name(b"FlateDecode".to_vec());
-        let specs = super::decode_filter_specs_from_handle(&filter, &params, None).unwrap();
-        let retained = &specs[0].decode_params;
-
-        let retained_stream = retained.try_get_key(b"/UnknownStream").unwrap();
-        assert!(retained_stream.is_same_object_as(&unknown_stream));
-        let retained_array = retained.try_get_key(b"/UnknownArray").unwrap();
-        assert!(retained_array.is_same_object_as(&unknown_array));
-        unknown_array
-            .append_array_item(ObjectHandle::integer(2))
-            .unwrap();
-        assert_eq!(retained_array.try_array_len().unwrap(), Some(2));
-
-        let retained_indirect = retained.try_get_key(b"/UnknownIndirect").unwrap();
-        assert!(retained_indirect.is_same_object_as(&unknown_indirect));
-        unknown_indirect.set_resolved(crate::object_handle::ObjectValue::Integer(7));
-        assert_eq!(retained_indirect.try_get_int_value().unwrap(), 7);
-    }
-
-    #[test]
-    fn undecodable_filters_use_the_generic_unsupported_boundary() {
-        for name in [
-            b"CCITTFaxDecode".as_slice(),
-            b"JBIG2Decode".as_slice(),
-            b"JPXDecode".as_slice(),
-            b"BogusDecode".as_slice(),
-        ] {
-            let expected = format!(
-                "unsupported stream filter: {}",
-                std::str::from_utf8(name).expect("test filter name is UTF-8")
-            );
-            assert!(matches!(
-                super::undecodable_filter_error(name),
-                crate::Error::Unsupported(message) if message == expected
-            ));
-        }
     }
 
     #[test]
@@ -1454,40 +764,6 @@ mod tests {
         let mut flate_filter = FlateLzwStreamFilter::new(false);
         assert!(flate_filter.set_decode_params(&flate).unwrap());
         assert!(flate_filter.early_code_change);
-    }
-
-    fn wide_tiff_filter() -> FlateLzwStreamFilter {
-        let mut filter = FlateLzwStreamFilter::new(false);
-        assert!(filter
-            .set_decode_params(&wide_tiff_decode_params())
-            .unwrap());
-        filter.set_tiff_memory_limit(Some(1 << 20));
-        filter
-    }
-
-    #[test]
-    fn owned_decode_pipeline_applies_tiff_memory_limit_before_codec_construction() {
-        let mut filter = wide_tiff_filter();
-        let mut sink = RecordingSink::new(&[], &[]);
-        let result = filter.decode_pipeline_owned(PipelineRef::from(&mut sink));
-        assert!(result.is_err());
-        let error = result.err().unwrap();
-
-        assert!(error
-            .to_string()
-            .contains("TIFFPredictor memory limit exceeded"));
-    }
-
-    #[test]
-    fn recovering_decode_pipeline_applies_tiff_memory_limit_before_codec_writes() {
-        let mut filter = wide_tiff_filter();
-        let result = filter.pipe_decode_recovering(&[], None, &mut |_, _, _, _| Ok(()));
-        assert!(result.is_err());
-        let error = result.err().unwrap();
-
-        assert!(error
-            .to_string()
-            .contains("TIFFPredictor memory limit exceeded"));
     }
 
     #[test]
