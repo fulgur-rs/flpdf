@@ -117,8 +117,9 @@ const RAW_SENTINEL: QpdfObjGen = QpdfObjGen::new(0, 0);
 pub(crate) enum SecondHalfContainerAnchor {
     /// The container precedes every second-half plain object.
     BeforeFirst,
-    /// The container immediately follows this plain object.
-    After(ObjectRef),
+    /// The container immediately follows this plain object, identified by its
+    /// complete source `QpdfObjGen`.
+    After(QpdfObjGen),
     /// The container follows every pre-container plain object.
     AfterLast,
 }
@@ -923,9 +924,7 @@ impl RenumberMap {
             push_original(original, &mut new_by_new_number, &mut new_by_new_raw);
             for bi in 0..second_half_batches.len() {
                 let after_anchor = second_half_anchors.get(bi).and_then(|anchor| match anchor {
-                    SecondHalfContainerAnchor::After(object_ref) => {
-                        QpdfObjGen::try_from_object_ref(*object_ref).ok()
-                    }
+                    SecondHalfContainerAnchor::After(object_gen) => Some(*object_gen),
                     _ => None,
                 });
                 if after_anchor == Some(original) {

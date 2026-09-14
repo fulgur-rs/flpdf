@@ -623,8 +623,7 @@ impl PageOffsetHintTable {
                     ids.sort_unstable_by_key(|&shared_idx| {
                         shared_hints[shared_idx as usize]
                             .object
-                            .and_then(|object| renumber.new_for_raw(object))
-                            .map_or(u32::MAX, |object_ref| object_ref.number)
+                            .expect("raw shared hint entry must retain its qpdf object identity")
                     });
                 } else {
                     ids.sort_unstable_by_key(|&shared_idx| {
@@ -733,8 +732,12 @@ impl PageOffsetHintTable {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::linearization::plan::{LinearizationPlan, PageHintEntry, SharedObjectHintEntry};
+    use crate::linearization::plan::{
+        LinearizationPlan, PageHintEntry, RawLinearizationPlan, RawSharedObjectHintEntry,
+        SharedObjectHintEntry,
+    };
     use crate::linearization::renumber::RenumberMap;
+    use crate::qpdf_obj_gen::QpdfObjGen;
     use crate::ObjectRef;
 
     // -----------------------------------------------------------------------
@@ -820,6 +823,64 @@ mod tests {
             ],
             ..Default::default()
         }
+    }
+
+    #[test]
+    fn raw_shared_identifiers_follow_qpdf_objgen_order_across_linearization_parts() {
+        let checked_first = QpdfObjGen::new(6, 0);
+        let raw_second = QpdfObjGen::new(20, 65_536);
+        let plan = LinearizationPlan {
+            part2_objects: vec![ObjectRef::new(1, 0)],
+            part3_objects: vec![ObjectRef::new(6, 0)],
+            page_hints: vec![
+                PageHintEntry {
+                    page_ref: ObjectRef::new(1, 0),
+                    first_object_index: 0,
+                    object_count: 1,
+                    byte_length: 0,
+                },
+                PageHintEntry {
+                    page_ref: ObjectRef::new(2, 0),
+                    first_object_index: 0,
+                    object_count: 1,
+                    byte_length: 0,
+                },
+            ],
+            raw: RawLinearizationPlan {
+                part2_objects: vec![QpdfObjGen::new(1, 0)],
+                part3_objects: vec![checked_first],
+                part4_other_pages_shared: vec![raw_second],
+                shared_hints: vec![
+                    RawSharedObjectHintEntry {
+                        object: Some(checked_first),
+                        container: None,
+                        referencing_pages: vec![1],
+                    },
+                    RawSharedObjectHintEntry {
+                        object: Some(raw_second),
+                        container: None,
+                        referencing_pages: vec![1],
+                    },
+                ],
+                ..Default::default()
+            },
+            ..Default::default()
+        };
+        let renumber = RenumberMap::from_plan(&plan);
+        let table = PageOffsetHintTable::from_plan(
+            &plan,
+            &renumber,
+            &Default::default(),
+            &Default::default(),
+            &Default::default(),
+            &Default::default(),
+        );
+
+        assert_eq!(
+            table.entries[1].shared_object_ids,
+            vec![0, 1],
+            "qpdf walks page shared users by raw object identity, even when output slots reverse the order"
+        );
     }
 
     // -----------------------------------------------------------------------
