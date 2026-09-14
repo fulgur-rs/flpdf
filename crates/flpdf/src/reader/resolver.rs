@@ -306,7 +306,11 @@ fn raw_xref_entries_from_object_refs(
 ) -> BTreeMap<QpdfObjGen, XrefEntry> {
     entries
         .into_iter()
-        .map(|(object_ref, entry)| (QpdfObjGen::from_valid_object_ref(object_ref), entry))
+        .filter_map(|(object_ref, entry)| {
+            QpdfObjGen::try_from_object_ref(object_ref)
+                .ok()
+                .map(|object_gen| (object_gen, entry))
+        })
         .collect()
 }
 
@@ -1076,7 +1080,7 @@ impl<R: Read + Seek> ResolverHandle<R> {
         let resolver: Weak<dyn DocumentResolver> = self.self_weak.clone();
         let reserved =
             ObjectHandle::new_reserved_for_pdf(object_ref, self.pdf_unique_id.get(), resolver);
-        let object_gen = QpdfObjGen::from_valid_object_ref(object_ref);
+        let object_gen = QpdfObjGen::try_from_object_ref(object_ref)?;
         let mut core = self.core.borrow_mut();
         let previous = core
             .object_cache
@@ -1235,7 +1239,9 @@ impl<R: Read + Seek> ResolverHandle<R> {
     /// Borrow discipline: the `borrow_mut()` spans only the map lookup and
     /// the `ObjectHandle` construction, neither of which resolves anything.
     pub(crate) fn get_object_handle(&self, object_ref: ObjectRef) -> ObjectHandle {
-        let object_gen = QpdfObjGen::from_valid_object_ref(object_ref);
+        let Ok(object_gen) = QpdfObjGen::try_from_object_ref(object_ref) else {
+            return ObjectHandle::uninitialized();
+        };
         let handle = self.get_object_handle_qpdf_obj_gen(object_gen);
         handle.promote_to_indirect(object_ref, self.pdf_unique_id.get(), self.self_weak.clone())
     }
@@ -1285,6 +1291,9 @@ impl<R: Read + Seek> ResolverHandle<R> {
     /// null when no object definition replaces it
     /// (`libqpdf/QPDF.cc:1935-1943`).
     pub(crate) fn reserve_object_if_not_exists(&self, object_ref: ObjectRef) -> ObjectHandle {
+        let Ok(object_gen) = QpdfObjGen::try_from_object_ref(object_ref) else {
+            return ObjectHandle::uninitialized();
+        };
         if self.registered_handle(object_ref).is_some()
             || self.xref_entry(object_ref).is_some()
             || self.has_default_xref_entry(object_ref)
@@ -1295,7 +1304,6 @@ impl<R: Read + Seek> ResolverHandle<R> {
         let resolver: Weak<dyn DocumentResolver> = self.self_weak.clone();
         let reserved =
             ObjectHandle::new_reserved_for_pdf(object_ref, self.pdf_unique_id.get(), resolver);
-        let object_gen = QpdfObjGen::from_valid_object_ref(object_ref);
         let mut core = self.core.borrow_mut();
         let previous = core
             .object_cache
@@ -1506,7 +1514,7 @@ impl<R: Read + Seek> ResolverHandle<R> {
     /// The read-only counterpart of [`Self::get_object_handle`], for the
     /// `&self` callers that ask whether a reference has a handle at all.
     pub(crate) fn registered_handle(&self, object_ref: ObjectRef) -> Option<ObjectHandle> {
-        let object_gen = QpdfObjGen::from_valid_object_ref(object_ref);
+        let object_gen = QpdfObjGen::try_from_object_ref(object_ref).ok()?;
         self.registered_qpdf_obj_gen_handle(object_gen)
     }
 
@@ -1526,7 +1534,9 @@ impl<R: Read + Seek> ResolverHandle<R> {
     /// This is the provenance distinction required when both cases currently
     /// hold a resolved null in the same canonical object cache.
     pub(crate) fn is_allocated_object(&self, object_ref: ObjectRef) -> bool {
-        let object_gen = QpdfObjGen::from_valid_object_ref(object_ref);
+        let Ok(object_gen) = QpdfObjGen::try_from_object_ref(object_ref) else {
+            return false;
+        };
         self.core
             .borrow()
             .allocated_object_refs
@@ -1770,7 +1780,7 @@ impl<R: Read + Seek> ResolverHandle<R> {
             ));
         }
         let object_ref = self.next_obj_gen()?;
-        let object_gen = QpdfObjGen::from_valid_object_ref(object_ref);
+        let object_gen = QpdfObjGen::try_from_object_ref(object_ref)?;
         {
             let mut core = self.core.borrow_mut();
             core.object_cache
@@ -1820,6 +1830,7 @@ impl<R: Read + Seek> ResolverHandle<R> {
         // `get_object_handle`: a failed replacement
         // must not leave an absent target in the canonical object cache.
         replacement.validate_replacement_source()?;
+        let object_gen = QpdfObjGen::try_from_object_ref(object_ref)?;
 
         replacement.promote_to_indirect(
             object_ref,
@@ -1830,19 +1841,17 @@ impl<R: Read + Seek> ResolverHandle<R> {
             target.assign_value_state(&replacement);
             target
         } else {
-            self.core.borrow_mut().object_cache.insert(
-                QpdfObjGen::from_valid_object_ref(object_ref),
-                ObjectCacheEntry::new(replacement.clone()),
-            );
+            self.core
+                .borrow_mut()
+                .object_cache
+                .insert(object_gen, ObjectCacheEntry::new(replacement.clone()));
             replacement
         };
         target.clear_description();
         target.reset_parsed_offset();
         target.set_end_offsets(NO_PARSED_OFFSET, NO_PARSED_OFFSET);
         if self.xref_entry(object_ref).is_none() {
-            self.core
-                .borrow_mut()
-                .record_allocated_object(QpdfObjGen::from_valid_object_ref(object_ref));
+            self.core.borrow_mut().record_allocated_object(object_gen);
         }
         Ok(target)
     }
@@ -1855,6 +1864,8 @@ impl<R: Read + Seek> ResolverHandle<R> {
     /// their value allocations. Unknown object generations therefore resolve
     /// to qpdf's ordinary null object before the swap.
     pub(crate) fn swap_objects(&self, first: ObjectRef, second: ObjectRef) -> Result<()> {
+        let first_gen = QpdfObjGen::try_from_object_ref(first)?;
+        let second_gen = QpdfObjGen::try_from_object_ref(second)?;
         let first_handle = self
             .registered_handle(first)
             .unwrap_or_else(|| self.get_object_handle(first));
@@ -1874,11 +1885,9 @@ impl<R: Read + Seek> ResolverHandle<R> {
         // (`libqpdf/QPDF.cc:1286-1294`). Record the same document-owned
         // provenance `replace_object` records, or the writer's live view drops
         // the value that was just swapped in.
-        for object_ref in [first, second] {
+        for (object_ref, object_gen) in [(first, first_gen), (second, second_gen)] {
             if self.xref_entry(object_ref).is_none() {
-                self.core
-                    .borrow_mut()
-                    .record_allocated_object(QpdfObjGen::from_valid_object_ref(object_ref));
+                self.core.borrow_mut().record_allocated_object(object_gen);
             }
         }
         Ok(())
@@ -1890,7 +1899,9 @@ impl<R: Read + Seek> ResolverHandle<R> {
     /// that do not have an effective xref row.
     pub(crate) fn has_newer_cached_generation(&self, object_ref: ObjectRef) -> bool {
         use std::ops::Bound::{Excluded, Unbounded};
-        let object_gen = QpdfObjGen::from_valid_object_ref(object_ref);
+        let Ok(object_gen) = QpdfObjGen::try_from_object_ref(object_ref) else {
+            return false;
+        };
         self.core
             .borrow()
             .object_cache
@@ -1905,7 +1916,7 @@ impl<R: Read + Seek> ResolverHandle<R> {
     /// cached object does not invalidate qpdf's already-completed dangling
     /// reference preparation. No resolver borrow spans value destruction.
     pub(crate) fn remove_object(&self, object_ref: ObjectRef) -> Result<()> {
-        let object_gen = QpdfObjGen::from_valid_object_ref(object_ref);
+        let object_gen = QpdfObjGen::try_from_object_ref(object_ref)?;
         let cached = {
             let mut core = self.core.borrow_mut();
             // `QPDF::removeObject` erases the one raw-keyed row every consumer reads.
@@ -2412,18 +2423,22 @@ impl<R: Read + Seek> ResolverHandle<R> {
     /// This document's cross-reference entry for `object_ref`, if the source
     /// declared one.
     pub(crate) fn xref_entry(&self, object_ref: ObjectRef) -> Option<XrefEntry> {
+        let object_gen = QpdfObjGen::try_from_object_ref(object_ref).ok()?;
         self.core
             .borrow()
             .raw_source_xref_entries
-            .get(&QpdfObjGen::from_valid_object_ref(object_ref))
+            .get(&object_gen)
             .copied()
     }
 
     fn insert_default_xref_entry(&self, object_ref: ObjectRef) {
+        let Ok(object_gen) = QpdfObjGen::try_from_object_ref(object_ref) else {
+            return;
+        };
         self.core
             .borrow_mut()
             .default_xref_entries
-            .insert(QpdfObjGen::from_valid_object_ref(object_ref));
+            .insert(object_gen);
     }
 
     /// Deliver warnings for qpdf's non-indirect default xref rows at the
@@ -2467,7 +2482,9 @@ impl<R: Read + Seek> ResolverHandle<R> {
     }
 
     fn has_default_xref_entry(&self, object_ref: ObjectRef) -> bool {
-        let object_gen = QpdfObjGen::from_valid_object_ref(object_ref);
+        let Some(object_gen) = QpdfObjGen::try_from_object_ref(object_ref).ok() else {
+            return false;
+        };
         self.core
             .borrow()
             .default_xref_entries
@@ -2982,7 +2999,7 @@ impl<R: Read + Seek> ResolverHandle<R> {
         will_retry: bool,
     ) -> Result<bool> {
         self.pipe_stream_data_qpdf_obj_gen(
-            QpdfObjGen::from_valid_object_ref(object_ref),
+            QpdfObjGen::try_from_object_ref(object_ref)?,
             offset,
             length,
             stream_dict,
@@ -3047,11 +3064,13 @@ impl<R: Read + Seek> ResolverHandle<R> {
     /// `QPDF::getObjectStreamData`'s existing counterpart without resolving
     /// the members (`QPDFWriter.cc:1939-1967`).
     pub(crate) fn insert_source_xref_entry(&self, object_ref: ObjectRef, entry: XrefEntry) {
+        let Ok(object_gen) = QpdfObjGen::try_from_object_ref(object_ref) else {
+            return;
+        };
         let mut core = self.core.borrow_mut();
         // qpdf keeps one table, so a row added after open is the same row
         // `showXRefTable` walks (`QPDF.cc:1149-1184,1213-1236`).
-        core.raw_source_xref_entries
-            .insert(QpdfObjGen::from_valid_object_ref(object_ref), entry);
+        core.raw_source_xref_entries.insert(object_gen, entry);
     }
 
     /// Test-only: install a cross-reference entry the source did not declare,
@@ -4057,7 +4076,7 @@ impl<R: Read + Seek> ResolverHandle<R> {
         self.warn_stream_failure_qpdf_obj_gen(
             error,
             object_header_offset,
-            QpdfObjGen::from_valid_object_ref(object_ref),
+            QpdfObjGen::from_valid_object_ref_for_test(object_ref),
             read_description,
         )
     }
@@ -4105,7 +4124,7 @@ impl<R: Read + Seek> ResolverHandle<R> {
     ) -> Result<usize> {
         self.recover_stream_length_qpdf_obj_gen(
             stream_offset,
-            QpdfObjGen::from_valid_object_ref(object_ref),
+            QpdfObjGen::from_valid_object_ref_for_test(object_ref),
             read_description,
         )
     }
@@ -4222,7 +4241,7 @@ impl<R: Read + Seek> ResolverHandle<R> {
         read_description: Option<&[u8]>,
     ) -> Result<()> {
         self.push_stream_warning_with_current_description_qpdf_obj_gen(
-            QpdfObjGen::from_valid_object_ref(object_ref),
+            QpdfObjGen::from_valid_object_ref_for_test(object_ref),
             offset,
             message,
             read_description,
@@ -4490,7 +4509,7 @@ fn pipe_stream_data_from_input<R: Read + Seek + 'static>(
         encryption_parameters,
         warning_sink,
         description_override,
-        QpdfObjGen::from_valid_object_ref(object_ref),
+        QpdfObjGen::from_valid_object_ref_for_test(object_ref),
         offset,
         length,
         stream_dict,
@@ -5292,7 +5311,7 @@ impl<R: Read + Seek> DocumentResolver for ResolverHandle<R> {
     /// `parser.rs` wraps `Parser::object`: this is the frame that appears
     /// exactly once per level, so protecting it protects every level.
     fn resolve_indirect(&self, object_ref: ObjectRef, handle: &ObjectHandle) -> Result<()> {
-        self.resolve_qpdf_obj_gen(QpdfObjGen::from_valid_object_ref(object_ref), handle)
+        self.resolve_qpdf_obj_gen(QpdfObjGen::try_from_object_ref(object_ref)?, handle)
     }
 
     fn resolve_qpdf_obj_gen(&self, object_gen: QpdfObjGen, handle: &ObjectHandle) -> Result<()> {
@@ -5640,6 +5659,24 @@ mod tests {
             ResolverWarningOptions::new(crate::QPDFLogger::create(), true, Vec::new()),
             0,
         )
+    }
+
+    #[test]
+    fn out_of_range_object_refs_are_rejected_at_every_non_resolving_cache_boundary() {
+        let resolver = bare_resolver();
+        let object_ref = ObjectRef::new(u32::MAX, 0);
+
+        assert!(resolver.registered_handle(object_ref).is_none());
+        assert!(!resolver.is_allocated_object(object_ref));
+        assert!(!resolver.has_newer_cached_generation(object_ref));
+        assert!(resolver.xref_entry(object_ref).is_none());
+        assert!(!resolver.has_default_xref_entry(object_ref));
+        assert!(!resolver
+            .reserve_object_if_not_exists(object_ref)
+            .is_initialized());
+        resolver.insert_default_xref_entry_for_test(object_ref);
+        resolver.insert_source_xref_entry(object_ref, XrefEntry::Free { next: 0 });
+        assert!(resolver.xref_entry(object_ref).is_none());
     }
 
     // qpdf's `QPDF::inParse` (`libqpdf/QPDF.cc:475-485`) throws when the flag
@@ -6652,7 +6689,7 @@ mod tests {
         let parsed = resolver
             .read_object_at_offset_with_description(
                 1,
-                QpdfObjGen::from_valid_object_ref(ObjectRef::new(1, 0)),
+                QpdfObjGen::from_valid_object_ref_for_test(ObjectRef::new(1, 0)),
                 true,
                 false,
                 None,
@@ -9175,7 +9212,7 @@ mod tests {
         handle.set_parsed_offset_if_unset(100);
 
         let resolver = Rc::clone(&pdf.resolver);
-        let object_gen = QpdfObjGen::from_valid_object_ref(object_ref);
+        let object_gen = QpdfObjGen::from_valid_object_ref_for_test(object_ref);
         let outer = ResolveMark::begin(&resolver.core, object_gen)
             .expect("the first mark for a reference must be recorded, not reported as a loop");
 
@@ -10909,7 +10946,7 @@ mod tests {
         resolver.set_last_offset(42);
         let outer = ResolveMark::begin(
             &resolver.core,
-            QpdfObjGen::from_valid_object_ref(object_ref),
+            QpdfObjGen::from_valid_object_ref_for_test(object_ref),
         )
         .expect("first mark");
         handle.try_is_scalar().expect("a loop is not an error");
@@ -10943,7 +10980,7 @@ mod tests {
         let resolver = Rc::clone(&pdf.resolver);
         let outer = ResolveMark::begin(
             &resolver.core,
-            QpdfObjGen::from_valid_object_ref(object_ref),
+            QpdfObjGen::from_valid_object_ref_for_test(object_ref),
         )
         .unwrap();
         assert!(matches!(
@@ -10971,7 +11008,7 @@ mod tests {
         let resolver = Rc::clone(&pdf.resolver);
         let outer = ResolveMark::begin(
             &resolver.core,
-            QpdfObjGen::from_valid_object_ref(object_ref),
+            QpdfObjGen::from_valid_object_ref_for_test(object_ref),
         )
         .expect("first mark");
         handle.try_is_scalar().expect("a loop is not an error");
@@ -11014,7 +11051,7 @@ mod tests {
         let unwound = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
             let _mark = ResolveMark::begin(
                 &pdf.resolver.core,
-                QpdfObjGen::from_valid_object_ref(object_ref),
+                QpdfObjGen::from_valid_object_ref_for_test(object_ref),
             )
             .expect("first mark");
             panic!("simulated failure part-way through a resolution");
@@ -11026,7 +11063,7 @@ mod tests {
                 .core
                 .borrow()
                 .resolving
-                .contains(&QpdfObjGen::from_valid_object_ref(object_ref)),
+                .contains(&QpdfObjGen::from_valid_object_ref_for_test(object_ref)),
             "an unwind must leave the reference resolvable, not permanently marked in progress"
         );
     }

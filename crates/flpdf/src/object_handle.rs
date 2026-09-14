@@ -1244,7 +1244,7 @@ impl SharedValueState {
         self.identity.qpdf_obj_gen.or_else(|| {
             self.identity
                 .object_ref
-                .map(QpdfObjGen::from_valid_object_ref)
+                .and_then(|object_ref| QpdfObjGen::try_from_object_ref(object_ref).ok())
         })
     }
 
@@ -1988,13 +1988,16 @@ impl ObjectHandle {
         pdf_unique_id: u64,
         resolver: Weak<dyn DocumentResolver>,
     ) -> Self {
+        let Some(qpdf_obj_gen) = QpdfObjGen::try_from_object_ref(object_ref).ok() else {
+            return Self::uninitialized();
+        };
         let handle = Self(Rc::new(RefCell::new(ObjectSlot {
             initialized: true,
             shared: new_shared_value_state(
                 ObjectValue::Reserved,
                 ValueIdentity {
                     object_ref: Some(object_ref),
-                    qpdf_obj_gen: Some(QpdfObjGen::from_valid_object_ref(object_ref)),
+                    qpdf_obj_gen: Some(qpdf_obj_gen),
                     active_pdf_unique_id: NonZeroU64::new(pdf_unique_id),
                     resolver: Some(resolver),
                 },
@@ -2063,8 +2066,11 @@ impl ObjectHandle {
         pdf_unique_id: Option<u64>,
         resolver: Option<Weak<dyn DocumentResolver>>,
     ) -> Self {
+        let Some(qpdf_obj_gen) = QpdfObjGen::try_from_object_ref(object_ref).ok() else {
+            return Self::uninitialized();
+        };
         let handle = Self::new_indirect_unresolved_qpdf_obj_gen_with_identity(
-            QpdfObjGen::from_valid_object_ref(object_ref),
+            qpdf_obj_gen,
             offset,
             pdf_unique_id,
             resolver,
@@ -2310,10 +2316,13 @@ impl ObjectHandle {
         pdf_unique_id: u64,
         resolver: Weak<dyn DocumentResolver>,
     ) -> Self {
+        let Some(qpdf_obj_gen) = QpdfObjGen::try_from_object_ref(object_ref).ok() else {
+            return Self::uninitialized();
+        };
         let shared = self.0.borrow().shared.clone();
         shared.borrow_mut().identity = ValueIdentity {
             object_ref: Some(object_ref),
-            qpdf_obj_gen: Some(QpdfObjGen::from_valid_object_ref(object_ref)),
+            qpdf_obj_gen: Some(qpdf_obj_gen),
             active_pdf_unique_id: NonZeroU64::new(pdf_unique_id),
             resolver: Some(resolver),
         };
@@ -10212,6 +10221,24 @@ mod uniform_identity_tests {
         Rc::new(NoopResolver {
             calls: Rc::new(std::cell::Cell::new(0)),
         })
+    }
+
+    #[test]
+    fn out_of_range_object_ref_constructors_return_uninitialized_handles() {
+        let resolver = resolver();
+        let object_ref = ObjectRef::new(u32::MAX, 0);
+
+        assert!(
+            !ObjectHandle::new_reserved_for_pdf(object_ref, 1, Rc::downgrade(&resolver))
+                .is_initialized()
+        );
+        assert!(
+            !ObjectHandle::new_indirect_with_resolver(object_ref, Rc::downgrade(&resolver))
+                .is_initialized()
+        );
+        assert!(!ObjectHandle::integer(1)
+            .promote_to_indirect(object_ref, 1, Rc::downgrade(&resolver))
+            .is_initialized());
     }
 
     fn recording_noop_resolver() -> (Rc<dyn DocumentResolver>, Rc<std::cell::Cell<usize>>) {

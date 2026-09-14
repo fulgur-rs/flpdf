@@ -1,6 +1,7 @@
 //! qpdf makeIndirectObject promotes the existing QObject allocation.
 
-use flpdf::{ObjectHandle, Pdf};
+use flpdf::{ObjectHandle, ObjectRef, Pdf};
+use std::panic::{catch_unwind, AssertUnwindSafe};
 
 #[test]
 fn public_factory_promotes_the_retained_direct_alias_in_place() {
@@ -66,6 +67,31 @@ fn uninitialized_is_rejected_before_allocation_and_maximum_id_leaves_input_direc
         matches!(error, flpdf::Error::Unsupported(ref message) if message == "max object id is too high to create new objects")
     );
     assert!(source.is_direct());
+}
+
+#[test]
+fn out_of_range_object_handle_lookup_returns_qpdf_uninitialized_state() {
+    let mut pdf = Pdf::empty().unwrap();
+    let result = catch_unwind(AssertUnwindSafe(|| {
+        pdf.get_object_handle(ObjectRef::new(u32::MAX, 0))
+    }));
+    let handle = result.expect("object lookup must not panic on qpdf integer overflow");
+    assert!(!handle.is_initialized());
+    assert_eq!(handle.type_name().unwrap(), "uninitialized");
+}
+
+#[test]
+fn out_of_range_object_replacement_returns_a_qpdf_integer_error() {
+    let mut pdf = Pdf::empty().unwrap();
+    let result = catch_unwind(AssertUnwindSafe(|| {
+        pdf.replace_object(ObjectRef::new(u32::MAX, 0), ObjectHandle::null())
+    }));
+    let error = result.expect("object replacement must not panic on qpdf integer overflow");
+    assert!(matches!(
+        error,
+        Err(flpdf::Error::System(message))
+            if message.contains("integer out of range converting")
+    ));
 }
 
 #[test]
