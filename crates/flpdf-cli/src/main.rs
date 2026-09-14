@@ -26,7 +26,7 @@ use flpdf::{
 use flpdf::{
     pages::tree_rebuild::{rebuild_page_tree, RebuildResult},
     qutil::parse_numrange,
-    CombinedPage, InputSpec, PageRange,
+    PageRange,
 };
 use std::collections::HashSet;
 use std::ffi::{OsStr, OsString};
@@ -36,6 +36,24 @@ use std::path::{Path, PathBuf};
 use std::sync::OnceLock;
 
 type CliResult<T> = Result<T, Box<dyn std::error::Error>>;
+
+/// CLI-local page-spec input. qpdf keeps this state inside `QPDFJob::Config`;
+/// it is not a library-facing page-plan type.
+struct CliInputSpec {
+    path: PathBuf,
+    password: Option<Vec<u8>>,
+    range: PageRange,
+}
+
+impl CliInputSpec {
+    fn new(path: impl Into<PathBuf>, password: Option<Vec<u8>>, range: PageRange) -> Self {
+        Self {
+            path: path.into(),
+            password,
+            range,
+        }
+    }
+}
 
 struct PipelineWriter {
     pipeline: PipelineHandle,
@@ -6760,13 +6778,13 @@ fn configured_page_specs(page_ops: &PageOpArgs) -> CliResult<Vec<PageSegmentSpec
         .map_or_else(|| parse_pages_segment(&raw_page_tokens(page_ops)), Ok)
 }
 
-/// Resolve `--pages` specs into [`InputSpec`]s, mapping the `.` shorthand to
+/// Resolve `--pages` specs into CLI-local inputs, mapping the `.` shorthand to
 /// the primary input path while preserving the literal filename identity used
 /// by qpdf's page-spec source heap.
 fn resolve_page_specs(
     specs: &[PageSegmentSpec],
     primary_input: &std::path::Path,
-) -> CliResult<Vec<InputSpec>> {
+) -> CliResult<Vec<CliInputSpec>> {
     let mut out = Vec::with_capacity(specs.len());
     for s in specs {
         let path: PathBuf = if s.file_token == OsStr::new(".") {
@@ -6788,7 +6806,7 @@ fn resolve_page_specs(
                 Box::new(Error::SystemBytes(what)) as Box<dyn std::error::Error>
             })?
         };
-        out.push(InputSpec::new(
+        out.push(CliInputSpec::new(
             path,
             s.raw_password.clone().or_else(|| {
                 s.password
@@ -7720,21 +7738,7 @@ fn run_empty_page_extraction(
     let PageSpecJobOutput::Merged(mut merged) = page_output else {
         return Err("--empty --pages unexpectedly returned an in-place document".into());
     };
-    let selected = pages::page_refs(&mut merged)?;
-    let combined_pages = selected
-        .iter()
-        .enumerate()
-        .map(|(index, &page_ref)| {
-            Ok(CombinedPage {
-                source_index: 0,
-                page: flpdf::SelectedPage {
-                    index_1based: u32::try_from(index + 1)
-                        .map_err(|_| "--pages: too many output pages")?,
-                    page_ref,
-                },
-            })
-        })
-        .collect::<CliResult<Vec<_>>>()?;
+    let selected_pages = pages::page_refs(&mut merged)?;
 
     run_page_extraction_after_plan(
         &mut merged,
@@ -7756,7 +7760,7 @@ fn run_empty_page_extraction(
         None,
         source_warnings,
         None,
-        combined_pages,
+        selected_pages,
         image_options,
         coalesce_contents,
         generate_appearances,
@@ -7797,7 +7801,7 @@ fn run_page_extraction_from_multiple_sources(
     no_warn: bool,
     standard_output: Option<PipelineWriter>,
     creates_output: bool,
-    inputs: Vec<InputSpec>,
+    inputs: Vec<CliInputSpec>,
 ) -> CliResult<()> {
     // qpdf inherits output encryption from the primary input for page
     // operations. Keep this probe separate from the mutable source vector so
@@ -7907,21 +7911,7 @@ fn run_page_extraction_from_multiple_sources(
     // as a local selection so the shared post-selection consumer can apply
     // rotate, cleanup, overlays, split naming, and writer options without
     // reintroducing source-document ObjectRefs.
-    let selected = pages::page_refs(&mut merged)?;
-    let combined_pages: Vec<CombinedPage> = selected
-        .iter()
-        .enumerate()
-        .map(|(index, &page_ref)| {
-            Ok(CombinedPage {
-                source_index: 0,
-                page: flpdf::SelectedPage {
-                    index_1based: u32::try_from(index + 1)
-                        .map_err(|_| "--pages: too many output pages")?,
-                    page_ref,
-                },
-            })
-        })
-        .collect::<CliResult<Vec<_>>>()?;
+    let selected_pages = pages::page_refs(&mut merged)?;
 
     run_page_extraction_after_plan(
         &mut merged,
@@ -7948,7 +7938,7 @@ fn run_page_extraction_from_multiple_sources(
         primary_copy_encryption,
         source_warnings,
         None,
-        combined_pages,
+        selected_pages,
         image_options,
         coalesce_contents,
         generate_appearances,
@@ -7980,7 +7970,7 @@ fn run_page_extraction_from_single_source<R: Read + Seek + 'static>(
     verbose: bool,
     standard_output: Option<PipelineWriter>,
     creates_output: bool,
-    inputs: &[InputSpec],
+    inputs: &[CliInputSpec],
     no_warn: bool,
 ) -> CliResult<()> {
     let primary_encrypted = pdf.is_encrypted();
@@ -8016,21 +8006,7 @@ fn run_page_extraction_from_single_source<R: Read + Seek + 'static>(
             result,
             prune_mode,
         } => {
-            let combined_pages: Vec<CombinedPage> = result
-                .new_kids
-                .iter()
-                .enumerate()
-                .map(|(index, &page_ref)| {
-                    Ok(CombinedPage {
-                        source_index: 0,
-                        page: flpdf::SelectedPage {
-                            index_1based: u32::try_from(index + 1)
-                                .map_err(|_| "--pages: too many output pages")?,
-                            page_ref,
-                        },
-                    })
-                })
-                .collect::<CliResult<Vec<_>>>()?;
+            let selected_pages = result.new_kids.clone();
 
             run_page_extraction_after_plan(
                 pdf,
@@ -8052,7 +8028,7 @@ fn run_page_extraction_from_single_source<R: Read + Seek + 'static>(
                 primary_copy_encryption,
                 source_warnings,
                 Some((result, prune_mode)),
-                combined_pages,
+                selected_pages,
                 image_options,
                 coalesce_contents,
                 generate_appearances,
@@ -8062,21 +8038,7 @@ fn run_page_extraction_from_single_source<R: Read + Seek + 'static>(
             )
         }
         PageSpecJobOutput::Merged(mut merged) => {
-            let selected = pages::page_refs(&mut merged)?;
-            let combined_pages: Vec<CombinedPage> = selected
-                .iter()
-                .enumerate()
-                .map(|(index, &page_ref)| {
-                    Ok(CombinedPage {
-                        source_index: 0,
-                        page: flpdf::SelectedPage {
-                            index_1based: u32::try_from(index + 1)
-                                .map_err(|_| "--pages: too many output pages")?,
-                            page_ref,
-                        },
-                    })
-                })
-                .collect::<CliResult<Vec<_>>>()?;
+            let selected_pages = pages::page_refs(&mut merged)?;
 
             run_page_extraction_after_plan(
                 &mut merged,
@@ -8102,7 +8064,7 @@ fn run_page_extraction_from_single_source<R: Read + Seek + 'static>(
                 primary_copy_encryption,
                 source_warnings,
                 None,
-                combined_pages,
+                selected_pages,
                 image_options,
                 coalesce_contents,
                 generate_appearances,
@@ -8135,7 +8097,7 @@ fn run_page_extraction_after_plan<R: Read + Seek + 'static>(
     primary_copy_encryption: Option<CopyEncryptionSource>,
     prior_warnings: bool,
     page_job_result: Option<(RebuildResult, RemoveUnreferencedResources)>,
-    combined_pages: Vec<CombinedPage>,
+    selected_pages: Vec<ObjectRef>,
     image_options: ImageTransformOptions,
     coalesce_contents: bool,
     generate_appearances: bool,
@@ -8144,7 +8106,7 @@ fn run_page_extraction_after_plan<R: Read + Seek + 'static>(
     no_warn: bool,
 ) -> CliResult<()> {
     pdf.set_suppress_warnings(no_warn);
-    let selected: Vec<ObjectRef> = combined_pages.iter().map(|cp| cp.page.page_ref).collect();
+    let selected = selected_pages;
 
     let (result, prune_mode) = if let Some((result, prune_mode)) = page_job_result {
         (result, prune_mode)

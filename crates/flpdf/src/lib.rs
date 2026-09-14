@@ -181,9 +181,9 @@ pub use form_field_object_helper::FormFieldObjectHelper;
 pub use job::{
     add_attachment_from_path, ascii_filename_fallback, copy_duplicate_page_annotations,
     extract_attachment, extract_attachment_to_path, handle_under_overlay, merge_documents,
-    overlay_verbose_report, write_attachment, CombinedPage, CombinedPlan, Endpoint, InputSpec,
-    MergeInput, OverlayKind, OverlaySpec, OverlayVerbosePage, OverlayVerboseSource, PagePlan,
-    PageRange, PageRangeEntry, PageSpecJobOutput, Parity, SelectedPage, DEFAULT_MAX_ACROFORM_DEPTH,
+    overlay_verbose_report, write_attachment, Endpoint, MergeInput, OverlayKind, OverlaySpec,
+    OverlayVerbosePage, OverlayVerboseSource, PageRange, PageRangeEntry, PageSpecJobOutput, Parity,
+    DEFAULT_MAX_ACROFORM_DEPTH,
 };
 pub use job::{optimize_images, ImageOptimizationOptions, RemoveUnreferencedResources};
 pub use matrix::{Matrix, Rectangle};
