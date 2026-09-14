@@ -27,8 +27,11 @@ fn flpdf_linearized_objstm(fixture: &str) -> Vec<u8> {
     let path = Path::new(env!("CARGO_MANIFEST_DIR"))
         .join("../../tests/fixtures/compat")
         .join(fixture);
+    flpdf_linearized_objstm_at(&path)
+}
 
-    let f1 = std::fs::File::open(&path).unwrap_or_else(|e| panic!("open {path:?}: {e}"));
+fn flpdf_linearized_objstm_at(path: &Path) -> Vec<u8> {
+    let f1 = std::fs::File::open(path).unwrap_or_else(|e| panic!("open {path:?}: {e}"));
     let mut pdf = Pdf::open(std::io::BufReader::new(f1)).unwrap();
     let opts = WriterTestSettings {
         object_streams: ObjectStreamMode::Generate,
@@ -46,6 +49,10 @@ fn qpdf_linearized_objstm(fixture: &str) -> Vec<u8> {
     let path = Path::new(env!("CARGO_MANIFEST_DIR"))
         .join("../../tests/fixtures/compat")
         .join(fixture);
+    qpdf_linearized_objstm_at(&path)
+}
+
+fn qpdf_linearized_objstm_at(path: &Path) -> Vec<u8> {
     let directory = tempfile::tempdir().expect("qpdf output tempdir");
     let output = directory.path().join("qpdf.pdf");
     let status = Command::new("qpdf")
@@ -55,7 +62,7 @@ fn qpdf_linearized_objstm(fixture: &str) -> Vec<u8> {
             "--deterministic-id",
             "--warning-exit-0",
         ])
-        .arg(&path)
+        .arg(path)
         .arg(&output)
         .status()
         .expect("qpdf runs");
@@ -794,6 +801,22 @@ fn indirect_extensions_linearized_objstm_is_byte_identical_to_qpdf() {
     if let Some(offset) = first_diff(&actual, &expected) {
         panic!(
             "{fixture}: linearized Generate output differs from qpdf \
+             (flpdf={} bytes, qpdf={} bytes, first diff at byte {offset})",
+            actual.len(),
+            expected.len(),
+        );
+    }
+}
+
+#[test]
+fn direct_outlines_linearized_objstm_is_byte_identical_to_qpdf() {
+    let path = Path::new(env!("CARGO_MANIFEST_DIR"))
+        .join("../../tests/fixtures/json-diff/direct-outlines.pdf");
+    let actual = flpdf_linearized_objstm_at(&path);
+    let expected = qpdf_linearized_objstm_at(&path);
+    if let Some(offset) = first_diff(&actual, &expected) {
+        panic!(
+            "direct-outlines.pdf: linearized Generate output differs from qpdf \
              (flpdf={} bytes, qpdf={} bytes, first diff at byte {offset})",
             actual.len(),
             expected.len(),

@@ -32,8 +32,11 @@ fn linearize_generate(fixture: &str) -> Vec<u8> {
     let path = Path::new(env!("CARGO_MANIFEST_DIR"))
         .join("../../tests/fixtures/compat")
         .join(fixture);
+    linearize_generate_at(&path)
+}
 
-    let f1 = std::fs::File::open(&path).unwrap_or_else(|e| panic!("open {path:?}: {e}"));
+fn linearize_generate_at(path: &Path) -> Vec<u8> {
+    let f1 = std::fs::File::open(path).unwrap_or_else(|e| panic!("open {path:?}: {e}"));
     let mut pdf = Pdf::open(std::io::BufReader::new(f1)).unwrap();
     let opts = WriterTestSettings {
         object_streams: ObjectStreamMode::Generate,
@@ -853,6 +856,22 @@ fn useoutlines_generate_routes_outlines_to_first_page_and_round_trips() {
     assert!(
         dump.contains("nobjects: 4"),
         "page-0 nobjects must be 4 when outlines route to first-page section:\n{dump}"
+    );
+}
+
+#[test]
+fn direct_outlines_root_precedes_its_first_half_objstm_container() {
+    let path = Path::new(env!("CARGO_MANIFEST_DIR"))
+        .join("../../tests/fixtures/json-diff/direct-outlines.pdf");
+    let bytes = linearize_generate_at(&path);
+    let outline_offset = bytes
+        .windows(b"/Type /Outlines".len())
+        .position(|window| window == b"/Type /Outlines")
+        .expect("plain /Outlines root is emitted");
+    let objstm_offset = first_objstm_marker_offset(&bytes).expect("ObjStm is emitted");
+    assert!(
+        outline_offset < objstm_offset,
+        "qpdf part6 order requires the plain outline root before its ObjStm container"
     );
 }
 

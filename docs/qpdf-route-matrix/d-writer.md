@@ -868,3 +868,21 @@ ObjStm memberを保持する。専用の linearization two-pass layout、hint、
 回帰を `cmp_linearize_objstm_tests.rs` に追加した。対象を含む linearized ObjStm 152 tests、
 linearization 63 tests、Generate 34 testsは qpdf-zlib-compat で成功し、qpdf-deviation
 markerは追加していない。
+
+## 2026-09-15: direct `/Outlines` root-first ordering (`flpdf-oqz1e`)
+
+qpdf の `QPDF::optimize` は direct な `/Outlines` dictionary を
+`makeIndirectObject` で indirect 化する。その後の `pushOutlinesToPart` は、part6 の
+first-page private/shared objects の後に plain outline root を置き、続けて
+`lc_outlines` に含まれる ObjStm container と outline objects を置く
+（`QPDF_optimization.cc:57-82`、`QPDF_linearization.cc:1188-1216,1406-1432`）。
+
+flpdf は `RenumberMap::place_objstm_members_per_half` に first-half の outline batch 境界と
+ObjStm member ではない outline root を渡し、通常 first-page containers → outline root →
+outline containers → ineligible outline streams の順を保持する。既存の q9o3 境界である
+ineligible outline stream の container 後置は変更しない。
+
+`tests/fixtures/json-diff/direct-outlines.pdf` の Generate linearizationについて、
+qpdf 11.9.0 との strict byte parity と default-feature の root/container order guardを
+追加した。qpdf-zlib-compat の linearized ObjStm 153 tests、linearization 63 tests、
+Generate structural 35 testsが成功し、qpdf-deviation markerは追加していない。

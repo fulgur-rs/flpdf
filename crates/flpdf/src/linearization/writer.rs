@@ -3905,6 +3905,30 @@ fn write_linearized_impl<R: Read + Seek>(
         .copied()
         .filter(|object| !first_half_member_set.contains(object))
         .collect();
+    // qpdf's pushOutlinesToPart always emits the plain `/Outlines` root first
+    // within the outline category. It is the only plain outline object that
+    // must be pulled back before the first-half containers; ineligible outline
+    // streams remain in the post-container set (q9o3).
+    let first_half_outline_root = plan
+        .part6_outline_objects
+        .first()
+        .copied()
+        .filter(|root| !first_half_member_set.contains(root));
+    if let Some(root) = first_half_outline_root {
+        first_half_post_plain.remove(&root);
+    }
+    // `part3_batches` is assembled as private, shared, then outline batches in
+    // `LinearizationPlan::objstm_batches_generate`/`..._preserve`; retain that
+    // qpdf category boundary for the first-half placement anchor.
+    let first_half_outline_batch_count = resolved_batch_plan
+        .part3_batches
+        .iter()
+        .filter(|batch| {
+            batch
+                .iter()
+                .any(|member| plan.part6_outline_objects.contains(member))
+        })
+        .count();
     if let Some(pre_objects) = plan
         .optimization
         .as_ref()
@@ -3981,6 +4005,8 @@ fn write_linearized_impl<R: Read + Seek>(
             &second_half_anchors,
             &second_half_post_plain,
             &first_half_post_plain,
+            first_half_outline_batch_count,
+            first_half_outline_root,
         )
     } else {
         ObjStmRelocation::default()
