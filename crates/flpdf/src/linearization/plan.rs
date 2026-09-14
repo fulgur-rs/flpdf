@@ -1811,10 +1811,17 @@ impl LinearizationPlan {
                 &resurrectable,
                 &skipped_raw_stream_parameter_streams,
             )?; // cov:ignore: LLVM maps this covered later-page closure call terminator to a zero-count continuation region
+
+            // Query the inverse user map per object. Re-deriving
+            // `objects_for(Page(i))` inside `retain` rebuilds the iterator and
+            // scans it from the start for every closure entry, which is
+            // quadratic in the closure size for object-heavy pages.
+            let page_user = crate::optimization::ObjectUser::Page(page_idx as u32);
             closure.retain(|object_ref| {
                 optimization
-                    .objects_for(&crate::optimization::ObjectUser::Page(page_idx as u32))
-                    .any(|candidate| candidate == *object_ref)
+                    .users_for(*object_ref)
+                    .iter()
+                    .any(|user| *user == page_user)
             });
             for obj_ref in &closure {
                 // Track cross-page sharing for first-page objects (used by Part 3 partition).
