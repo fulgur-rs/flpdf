@@ -1088,7 +1088,7 @@ fn token_description(token: &Token) -> String {
 
 #[cfg(test)]
 mod tests {
-    use super::Tokenizer;
+    use super::{parse_integer_bytes, Tokenizer};
     use crate::Error;
 
     #[test]
@@ -1101,6 +1101,27 @@ mod tests {
             error,
             Error::Parse { message, .. }
                 if message == "expected integer in object stream header"
+        ));
+    }
+
+    #[test]
+    fn compact_integer_parser_preserves_qpdf_overflow_failure() {
+        let error = parse_integer_bytes(b"99999999999999999999", 17)
+            .expect_err("overflow must remain a system conversion failure");
+        assert!(matches!(
+            error,
+            Error::System(message)
+                if message == "overflow/underflow converting 99999999999999999999 to 64-bit integer"
+        ));
+    }
+
+    #[test]
+    fn compact_integer_parser_preserves_qpdf_invalid_token_failure() {
+        let error = parse_integer_bytes(b"not-an-integer", 23)
+            .expect_err("non-UTF-8 or non-numeric bytes must remain a parse failure");
+        assert!(matches!(
+            error,
+            Error::Parse { offset: 23, message } if message == "invalid integer"
         ));
     }
 }

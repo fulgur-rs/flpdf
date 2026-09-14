@@ -277,9 +277,14 @@ impl<'input, I: LiveInput> LiveTokenSource<'input, I> {
                 Some(byte) => self.tokenizer.present_character(byte).map_err(|error| {
                     Error::Internal(format!("live tokenizer state error: {error:?}"))
                 })?,
-                None => self.tokenizer.present_eof().map_err(|error| {
-                    Error::Internal(format!("live tokenizer state error: {error:?}"))
-                })?,
+                None => {
+                    // cov:ignore-start: push-mode EOF presentation is infallible for every
+                    // tokenizer state; this is defensive propagation for a future state.
+                    self.tokenizer.present_eof().map_err(|error| {
+                        Error::Internal(format!("live tokenizer state error: {error:?}"))
+                    })?
+                    // cov:ignore-end
+                }
             }
 
             let Some(pushed) = self.tokenizer.get_token() else {
@@ -667,6 +672,7 @@ impl<I: LiveInput> LiveFileParser<'_, '_, '_, I> {
                             // `#xx` bytes (`QPDFTokenizer.cc:317-320,430-445`).
                             let LiveToken::Owned(ref token) = token else {
                                 unreachable!("integer tokens cannot be dictionary names")
+                                // cov:ignore: TokenType::Name is represented only by owned tokenizer tokens
                             };
                             *pending_key = Some(token.value.clone());
                             continue;
@@ -879,7 +885,9 @@ impl<I: LiveInput> LiveFileParser<'_, '_, '_, I> {
             // qpdf gives parsed null no description, so its parsed offset is
             // always -1 (`QPDFParser.cc:81-82,308-310`).
             TokenType::Null => Ok(ObjectHandle::null()),
-            TokenType::Integer => unreachable!("live integer tokens use the compact path"),
+            TokenType::Integer => {
+                unreachable!("live integer tokens use the compact path") // cov:ignore: LiveToken removes integers before the owned-token parser boundary
+            }
             TokenType::Real => self.real(token, scalar_offset),
             TokenType::Word => {
                 // qpdf's content-stream branch takes every bare word as an
@@ -1513,8 +1521,10 @@ mod live_input_tests {
         let mut input = CountingInput::new(b"12 34 R");
         let mut tokens = LiveTokenSource::new(&mut input);
 
+        let first = tokens.next_live_token().expect("first integer");
+        assert_eq!(first.end(), 2);
         assert!(matches!(
-            tokens.next_live_token().expect("first integer"),
+            first,
             super::LiveToken::Integer {
                 value: 12,
                 start: 0,
@@ -1547,6 +1557,21 @@ mod live_input_tests {
                 super::LiveToken::Integer { value, .. } if value == expected
             ));
         }
+    }
+
+    #[test]
+    fn owned_live_token_source_reports_a_ready_token_state_error() {
+        let mut input = CountingInput::new(b"1");
+        let mut tokens = LiveTokenSource::new(&mut input);
+        tokens
+            .tokenizer
+            .present_eof()
+            .expect("EOF should make the push tokenizer ready");
+
+        assert!(matches!(
+            tokens.next_token(),
+            Err(Error::Internal(message)) if message == "live tokenizer state error: TokenWaiting"
+        ));
     }
 
     // This catches the production regression where file-object parsing falls
