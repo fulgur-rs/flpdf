@@ -33,17 +33,17 @@ container-above-max だった — `flpdf-hi08` / PR #1486）。本表は残る m
 
 | canonical | bridge | mixed | unknown | 合計 |
 |---|---|---|---|---|
-| 98 | 1 | 61 | 0 | 160 |
+| 97 | 2 | 61 | 0 | 160 |
 
 ### checker logical aggregate（259 rows）
 
 `scripts/check-qpdf-route-matrix.py --check` は、A〜E の160行に加えて
 E の qtest exception 表（物理98行を論理99ケースとして数える）を含む259 logical
-rowsを検証する。2026-09-14 の現行 `origin/main` (`4bd6626e6`) での集計は次のとおり。
+rowsを検証する。2026-09-14 の現行 `origin/main` (`42856189e7`) での集計は次のとおり。
 
 | canonical | bridge | mixed | unknown | 合計 |
 |---|---|---|---|---|
-| 122 | 9 | 128 | 0 | 259 |
+| 121 | 10 | 128 | 0 | 259 |
 
 したがって、160行の領域別表と259 logical rowsの checker 分母は異なる。どちらも
 parity 完了数ではなく、責務／経路の分類数である。
@@ -96,11 +96,11 @@ done | sort | uniq -c
 本表は「その責務に至る **経路が 1 本か**」を問う。✅ の行でも consumer 側に bridge が残っていれば
 本表では mixed / bridge になりうる。
 
-2026-09-14 の current-main audit anchor は `origin/main=4bd6626e6`、pinned qpdf は
+2026-09-14 の current-main audit anchor は `origin/main=42856189e7`、pinned qpdf は
 11.9.0 commit `3b97c9bd266b7c32ea36d3536e22dab77412886d` である。checker の実測は
 1054 qpdf citations / 906 flpdf citations / 259 logical rows、分類は
-canonical 122 / mixed 128 / bridge 9 / unknown 0。A〜E の160行だけを数える
-上の領域別集計は canonical 98 / mixed 61 / bridge 1 / unknown 0 なので、checker
+canonical 121 / mixed 128 / bridge 10 / unknown 0。A〜E の160行だけを数える
+上の領域別集計は canonical 97 / mixed 61 / bridge 2 / unknown 0 なので、checker
 の259 logical rowsと混同しない。
 
 履歴行の例外: C44はpublic facadeとdeferred blobの責務を分離したmixed ownerとして追跡する。
@@ -113,7 +113,7 @@ D19/D30はcanonical ownerへ委譲するbyte-neutral test scaffolding、D27は�
 |---|---|---|---|---|---|
 | [A. ObjectHandle / Resolver — object identity, lazy resolve, ownership, teardown](a-objecthandle-resolver.md) | 24 | 16 | 0 | 8 | 0 |
 | [B. parser / xref recovery / warning・error・diagnostics](b-parser-recovery-diagnostics.md) | 34 | 20 | 0 | 14 | 0 |
-| [C. stream data provider / decode / retry / filter / encryption / `/Length`](c-stream-pipeline-encryption.md) | 42 | 36 | 1 | 5 | 0 |
+| [C. stream data provider / decode / retry / filter / encryption / `/Length`](c-stream-pipeline-encryption.md) | 42 | 35 | 2 | 5 | 0 |
 | [D. writer — reachability, ObjStm planning / renumber / emission, xref / trailer, encryption, linearize](d-writer.md) | 31 | 15 | 0 | 16 | 0 |
 | [E. QPDFJob / CLI / C API 相当の consumer・adaptor](e-job-cli-capi.md) | 29 | 11 | 0 | 18 | 0 |
 
@@ -190,7 +190,7 @@ D19/D30はcanonical ownerへ委譲するbyte-neutral test scaffolding、D27は�
 ## 6. 二重正本トラッカー
 
 追跡対象の symbol manifest は [tracked-symbols.txt](tracked-symbols.txt)。この matrix revision の
-classified row は 259 行で、canonical 122 / mixed 128 / bridge 9 / unknown 0（bridge + mixed は137行）である。
+classified row は 259 行で、canonical 121 / mixed 128 / bridge 10 / unknown 0（bridge + mixed は138行）である。
 内訳は A=24 / B=34 / C=42 / D=31 / E=128（E 表 29 行 + qtest exception 表 99 行）。
 `scripts/check-qpdf-route-matrix.py` も259行を報告する。classification tableの途中に散文行が
 入っても同じtableの状態を保持し、qtest exception tableの物理1行 `0/1` は論理2 caseとして数える。

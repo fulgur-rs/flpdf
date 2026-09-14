@@ -365,7 +365,7 @@ qtest parity harness 専用であることを注記する。
 | C40 | `QPDFObjectHandle::coalesceContentStreams` / `CoalesceProvider` / `pipeContentStreams` / `filterAsContents` | `libqpdf/QPDFObjectHandle.cc:92-118,1549-1572,1708-1730,1761-1767` | `crates/flpdf/src/object_handle.rs::coalesce_content_streams` / `::pipe_content_streams` / `::filter_as_contents`（すべて `pub`） | `coalesce_content_streams` prod: 5 (4 files, flpdf-cli `main.rs:4405` 含む) / test: 7。`pipe_content_streams` prod: 4 (3 files) / test: 1。`filter_as_contents` prod: 1 (`crates/flpdf/src/page_object_helper.rs:1247`) / test: 2 | canonical | `crates/flpdf/src/object_handle.rs::coalesce_content_streams` | provider 経路の内部利用（`replaceStreamData(provider, newNull(), newNull())`）まで写している。Form の `pipeContents`/`filterAsContents` は legacy overload の false を無視し、provider/source/sink の例外だけを伝播する。page `pipeContentStreams` の false→typed error は維持する（`flpdf-3yn9.48.66`）。 |
 | C41 | `QPDF::readStream` の `/Length` 検証 + `endstream` 確認 | `libqpdf/QPDF.cc:1361-1399` | `crates/flpdf/src/reader/resolver.rs::read_stream`（private, `crates/flpdf/src/reader/resolver.rs:3246-3332`） | prod: 1 (`crates/flpdf/src/reader/resolver.rs:3156`) / test: 0 | canonical | `crates/flpdf/src/reader/resolver.rs::read_stream` | 3 つのメッセージ（"stream dictionary lacks /Length key" / "/Length key in stream dictionary is not an integer" / "expected endstream"）と `attempt_recovery` 分岐が 1:1（`crates/flpdf/src/reader/resolver.rs:3335-3348`） |
 | C42 | `QPDF::recoverStreamLength` | `libqpdf/QPDF.cc:1482-1530` | `crates/flpdf/src/reader/resolver.rs::recover_stream_length`（private） | prod: canonical resolver の stream recovery 呼び出し / test: recovery fixture | canonical | `crates/flpdf/src/reader/resolver.rs::recover_stream_length` | warning 3 種、`endobj` 巻き戻し、全 recovered length の計算は 1:1。C12のAES/RC4 pipeとshow-objectのraw/filtered payloadはqpdfと同じく `length` の全spanをそのまま渡し、表示専用の framing metadata は持たない（`flpdf-zvjf`, `flpdf-hj7v`）。 |
-| C43 | （なし — flpdf 固有の分類 helper） | 対応物なし | `crates/flpdf/src/stream_filter.rs::passthrough_codec_label`（`pub(crate)`） | `passthrough_codec_label` external prod: 0 / test: 0 | canonical | `crates/flpdf/src/stream_filter.rs::passthrough_codec_label` | qpdf に対応する label API はない。`undecodable_filter_error` 内の単一 internal owner だけを保持し、旧 `filters.rs` public forwarding wrapper は `flpdf-3yn9.48.91` で caller-zero 後に撤去した。 |
+| C43 | （なし — flpdf 固有の分類 helper） | 対応物なし | `crates/flpdf/src/stream_filter.rs::passthrough_codec_label`（`pub(crate)`） | `passthrough_codec_label` external prod: 0 / test: 0 | bridge | `crates/flpdf/src/stream_filter.rs::passthrough_codec_label` | qpdf に対応する label API はない。flpdf 固有の補助経路として bridge (ii) に分類する。`undecodable_filter_error` 内の単一 internal owner は残るが、旧 `filters.rs` public forwarding wrapper は `flpdf-3yn9.48.91` で caller-zero 後に撤去した。 |
 
 | # | qpdf responsibility owner | qpdf evidence | flpdf current entrypoint | callers (prod / test) | classification | canonical owner | remaining bridge callers / notes |
 |---|---|---|---|---|---|---|---|
@@ -467,9 +467,9 @@ C10のcanonicalはbuilt-in lookupに限定し、runtime登録の公開契約は�
 
 | 分類 | 件数 | 行 |
 |---|---|---|
-| canonical | 31 | C1, C2, C3, C5, C6, C8, C10, C12, C13, C14, C15, C16, C17, C18, C20, C24, C25, C30, C31, C32, C33, C34, C35, C36, C37, C38, C39, C40, C41, C42, C43 |
+| canonical | 30 | C1, C2, C3, C5, C6, C8, C10, C12, C13, C14, C15, C16, C17, C18, C20, C24, C25, C30, C31, C32, C33, C34, C35, C36, C37, C38, C39, C40, C41, C42 |
 | mixed | 10 | C4, C7, C9, C11, C21, C22, C26, C27, C29, C44 |
-| bridge | 1 | C28 |
+| bridge | 2 | C28, C43 |
 | unknown | 0 | なし（C42 の pipe-side EOL subtraction は `flpdf-zvjf` と `flpdf-hj7v` で qpdf parity として解決） |
 
 U3 は「分類は決まっているが、残る実装差と出力への影響を検証する」項目なので
@@ -480,8 +480,7 @@ C44 はその API を追跡する枠で、既存 C24 の不一致とは扱わな
 
 `bridge` の判定基準は README §3 の通り **経路（route）に qpdf 対応物が無いこと** で、
 責務（responsibility）に qpdf 対応物があるかどうかとは別に問う。本領域の 2 行はこの区別で読む:
-C28 は責務のレベルでも qpdf に対応物が無い。C43 も qpdf 固有 API ではないが、
-旧 public forwarding bridge の撤去後は flpdf 内部 owner が一本になったため canonical とする。
+C28 / C43 は責務のレベルでも qpdf に対応物が無い。
 qpdf 側にも実装にも対応物がある複数実装は `bridge` ではなく `mixed` に置く。旧C19は`.42`で削除した。
 
 
