@@ -109,25 +109,12 @@ are not treated as vulnerabilities on their own:
   - some operations read the whole file or whole streams into memory.
   Callers that process untrusted input should run flpdf under external
   resource limits (container memory limits, `ulimit`/rlimits, timeouts).
-  The ordinary decode APIs cap `/Filter` chains at 16 stages by default through
-  `DecodeLimits::default()`. Callers must explicitly set
-  `DecodeLimits::max_filter_chain` to `None` to opt out; the qpdf compatibility
-  test driver does so to reproduce qpdf's uncapped `qpdf_dl_all` behavior.
-  An opt-in decode-output limit comparable to qpdf's
-  `Pl_Flate::setMemoryLimit` is available via `filters::DecodeLimits` /
-  `filters::decode_stream_data_recovering_with_limits` (default unbounded; embedders set
-  `max_output` to bound each `FlateDecode` / `LZWDecode` stage). qpdf's CLI has
-  no corresponding flag, so `flpdf-cli` does not expose this cap either; a
-  content stream that exceeds a caller-supplied limit is reported as a
-  warning, not as corruption. The cap is only reachable by calling
-  `filters::decode_stream_data_recovering_with_limits`
-  directly with a caller-supplied `DecodeLimits`; the ordinary document
-  paths (`ObjectHandle::try_*` accessors, the page/resource/attachment helpers, `PdfWriter`,
-  and `job::QPDFJob::check` / the `--check` route) all hard-code
-  `DecodeLimits::default()` (`max_output: None`) internally and expose no
-  way to set the cap, so they decode unbounded regardless of this opt-in —
-  matching qpdf's own uncapped `qpdf_dl_all` traversal for the check pass.
-  flpdf's other document paths still place no output cap by default.
+  There is no `/Filter` chain length cap and no decode-output cap, by
+  default or as an opt-in. qpdf 11.9.0 has neither: its filter factory
+  lookup either constructs a registered filter or marks the stream
+  unfilterable (`QPDF_Stream.cc:419-435`), and `Pl_Flate` exposes no memory
+  limit. External resource limits are the only mitigation available to
+  embedders.
 - **PDF permission enforcement.** Owner-password usage restrictions
   (printing, copying, …) are advisory metadata under the PDF specification.
   flpdf, like qpdf, can remove them (`--remove-restrictions`); this is a
@@ -202,7 +189,7 @@ by the 2026-06-11 audit. IDs refer to the in-repo beads tracker
 | Object parser recursion (`Parser::object` → `dictionary`/`array`) has no depth limit; deeply nested input (`<</A <</B …>>>>`, `[[[…]]]`) can overflow the stack and abort. Same shape as qpdf CVE-2018-9918. | (b) no panic/abort | `flpdf-hn1g.1` |
 | No fuzz harness exists; guarantees (b)/(c) are asserted but not continuously exercised. | verification | `flpdf-hn1g.2` |
 | `inherited_field_value` `/Parent` walks in `signatures.rs` and `json_inspect.rs` rely on visited sets only (terminating, but no depth cap unlike their `annotation_object_helper.rs` counterpart). | (c) bounded traversal | `flpdf-hn1g.3` |
-| Decode-side resource-exhaustion mitigations are now in place (was: no opt-in decode-output limit and no `/Filter` chain length cap). The ordinary decode APIs cap `/Filter` chains at 16 stages by default through `DecodeLimits::default()`. Callers must explicitly set `DecodeLimits::max_filter_chain` to `None` to opt out; the qpdf compatibility test driver does so to reproduce qpdf's uncapped `qpdf_dl_all` behavior. An opt-in output limit is provided via `filters::DecodeLimits` / `decode_stream_data_recovering_with_limits` (default unbounded). Compression bombs remain out of scope by default per §4. | §4 mitigation (delivered) | `flpdf-hn1g.4` |
+| No decode-output limit and no `/Filter` chain length cap. Matches qpdf 11.9.0, which has neither, so this is a deliberate parity position rather than a gap to close. Compression bombs remain out of scope by default per §4; embedders must apply external resource limits. | §4 scope (not mitigated) | `flpdf-hn1g.4` |
 | `#![forbid(unsafe_code)]` not yet declared (no `unsafe` exists in `crates/flpdf/src/`; the attribute would make that mechanical). | (a) enforcement | `flpdf-hn1g.6` |
 
 ## Appendix A: attack surface inventory
