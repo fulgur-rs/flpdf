@@ -112,15 +112,11 @@ impl CompactObjectUserSet {
 
 #[derive(Debug, Clone, Default)]
 pub(crate) struct Optimization {
-    /// Canonical qpdf object-user map.  The checked `ObjectRef` maps below are
-    /// projections for consumers whose API is limited to PDF `N G R` values;
-    /// all traversal and identity decisions start from this raw map.
+    /// Canonical qpdf object-user map. Keep the raw QpdfObjGen identity all
+    /// the way through linearization; qpdf has no second ObjectRef projection
+    /// pair (`QPDF.hh:1516-1517`).
     raw_user_to_objects: BTreeMap<ObjectUser, BTreeSet<QpdfObjGen>>,
     raw_object_to_users: BTreeMap<QpdfObjGen, CompactObjectUserSet>,
-    /// Checked projections of the raw maps.  A raw generation outside the
-    /// parser's indirect-reference range is intentionally absent here.
-    user_to_objects: BTreeMap<ObjectUser, BTreeSet<ObjectRef>>,
-    object_to_users: BTreeMap<ObjectRef, CompactObjectUserSet>,
     /// qpdf's Generate object-stream eligibility captured before optimization
     /// can mint inherited-attribute objects.
     generate_objstm_eligible: Option<Vec<ObjectRef>>,
@@ -130,24 +126,25 @@ pub(crate) struct Optimization {
 }
 
 impl Optimization {
-    pub(crate) fn objects_for(&self, user: &ObjectUser) -> &BTreeSet<ObjectRef> {
-        match self.user_to_objects.get(user) {
-            Some(objects) => objects,
-            None => empty_object_refs(),
-        }
+    /// Project the canonical raw map at the consumer boundary. The iterator
+    /// does not retain a second ObjectRef-keyed map and intentionally omits
+    /// raw generations that cannot be represented by ObjectRef.
+    pub(crate) fn objects_for(&self, user: &ObjectUser) -> impl Iterator<Item = ObjectRef> + '_ {
+        self.raw_objects_for(user)
+            .iter()
+            .filter_map(|object| object.to_object_ref())
     }
 
     pub(crate) fn users_for(&self, object: ObjectRef) -> &CompactObjectUserSet {
-        match self.object_to_users.get(&object) {
-            Some(users) => users,
-            None => empty_object_users(),
-        }
+        let Ok(object) = QpdfObjGen::try_from_object_ref(object) else {
+            return empty_object_users();
+        };
+        self.raw_users_for(object)
     }
 
     pub(crate) fn object_users(&self) -> impl Iterator<Item = (ObjectRef, &CompactObjectUserSet)> {
-        self.object_to_users
-            .iter()
-            .map(|(&object, users)| (object, users))
+        self.raw_object_users()
+            .filter_map(|(object, users)| object.to_object_ref().map(|object| (object, users)))
     }
 
     pub(crate) fn raw_objects_for(&self, user: &ObjectUser) -> &BTreeSet<QpdfObjGen> {
@@ -217,6 +214,45 @@ impl Optimization {
             .clone()
     }
 
+    pub(crate) fn page_users(&self, object: ObjectRef) -> impl Iterator<Item = u32> + '_ {
+        self.users_for(object).iter().filter_map(|user| match user {
+            ObjectUser::Page(page_number) => Some(*page_number),
+            _ => None,
+        })
+    }
+
+    pub(crate) fn other_page_private_owner(&self, object: ObjectRef) -> Option<u32> {
+        let mut owner = None;
+        for user in self.users_for(object).iter() {
+            match user {
+                ObjectUser::Page(page) if *page != 0 => {
+                    if owner.replace(*page).is_some() {
+                        return None;
+                    }
+                }
+                _ => return None,
+            }
+        }
+        owner
+    }
+
+    pub(crate) fn thumbnail_objects(&self) -> impl Iterator<Item = ObjectRef> + '_ {
+        self.raw_thumbnail_objects()
+            .into_iter()
+            .filter_map(|object| object.to_object_ref())
+    }
+
+    pub(crate) fn objects_for_root_key(&self, key: &[u8]) -> impl Iterator<Item = ObjectRef> + '_ {
+        self.objects_for(&ObjectUser::RootKey(key.to_vec()))
+    }
+
+    pub(crate) fn objects_for_trailer_key(
+        &self,
+        key: &[u8],
+    ) -> impl Iterator<Item = ObjectRef> + '_ {
+        self.objects_for(&ObjectUser::TrailerKey(key.to_vec()))
+    }
+
     pub(crate) fn set_generate_objstm_eligible(&mut self, eligible: Vec<ObjectRef>) {
         self.generate_objstm_eligible = Some(eligible);
     }
@@ -233,55 +269,6 @@ impl Optimization {
         self.pre_optimization_object_refs.as_ref()
     }
 
-    /// Return the qpdf page users for an object without materializing a second
-    /// object-to-page map. `object_to_users` is the canonical qpdf-owned
-    /// inverse; callers collect only the page numbers they need at the
-    /// consumer boundary.
-    pub(crate) fn page_users(&self, object: ObjectRef) -> impl Iterator<Item = u32> + '_ {
-        self.users_for(object).iter().filter_map(|user| match user {
-            ObjectUser::Page(page_number) => Some(*page_number),
-            _ => None,
-        })
-    }
-
-    /// Return the unique non-first page owner for qpdf's Part 7 predicate.
-    /// Any first-page, thumbnail, document-level, root, or second-page user
-    /// disqualifies the object from `lc_other_page_private`.
-    pub(crate) fn other_page_private_owner(&self, object: ObjectRef) -> Option<u32> {
-        let mut owner = None;
-        for user in self.users_for(object).iter() {
-            match user {
-                ObjectUser::Page(page) if *page != 0 => {
-                    if owner.replace(*page).is_some() {
-                        return None;
-                    }
-                }
-                _ => return None,
-            }
-        }
-        owner
-    }
-
-    pub(crate) fn thumbnail_objects(&self) -> BTreeSet<ObjectRef> {
-        self.user_to_objects
-            .iter()
-            .filter_map(|(user, objects)| match user {
-                ObjectUser::Thumbnail(_) => Some(objects),
-                _ => None,
-            })
-            .flat_map(|objects| objects.iter().copied())
-            .collect()
-    }
-
-    pub(crate) fn objects_for_root_key(&self, key: &[u8]) -> BTreeSet<ObjectRef> {
-        self.objects_for(&ObjectUser::RootKey(key.to_vec())).clone()
-    }
-
-    pub(crate) fn objects_for_trailer_key(&self, key: &[u8]) -> BTreeSet<ObjectRef> {
-        self.objects_for(&ObjectUser::TrailerKey(key.to_vec()))
-            .clone()
-    }
-
     fn record_raw(&mut self, user: ObjectUser, object: QpdfObjGen) {
         self.raw_user_to_objects
             .entry(user.clone())
@@ -290,21 +277,7 @@ impl Optimization {
         self.raw_object_to_users
             .entry(object)
             .or_default()
-            .insert(user.clone());
-
-        // This is an explicit checked projection, not the identity store.  A
-        // raw generation such as 65536 has no ObjectRef representation and
-        // must remain available through the raw maps above.
-        if let Some(object_ref) = object.to_object_ref() {
-            self.user_to_objects
-                .entry(user.clone())
-                .or_default()
-                .insert(object_ref);
-            self.object_to_users
-                .entry(object_ref)
-                .or_default()
-                .insert(user);
-        }
+            .insert(user);
     }
 
     fn record(&mut self, user: ObjectUser, object: ObjectRef) {
@@ -580,11 +553,6 @@ fn is_page(object: &ObjectHandle) -> crate::Result<bool> {
     object.try_is_dictionary_of_type(b"Page", b"")
 }
 
-fn empty_object_refs() -> &'static BTreeSet<ObjectRef> {
-    static EMPTY: OnceLock<BTreeSet<ObjectRef>> = OnceLock::new();
-    EMPTY.get_or_init(BTreeSet::new)
-}
-
 fn empty_qpdf_obj_gens() -> &'static BTreeSet<QpdfObjGen> {
     static EMPTY: OnceLock<BTreeSet<QpdfObjGen>> = OnceLock::new();
     EMPTY.get_or_init(BTreeSet::new)
@@ -602,7 +570,7 @@ mod tests {
     use crate::parser::MAX_PARSE_DEPTH;
     use crate::qpdf_obj_gen::QpdfObjGen;
     use crate::{ObjectRef, Pdf, Result};
-    use std::collections::BTreeSet;
+    use std::collections::{BTreeMap, BTreeSet};
     use std::rc::Rc;
 
     fn nested_direct_array(depth: usize) -> ObjectHandle {
@@ -678,6 +646,19 @@ mod tests {
     }
 
     #[test]
+    fn optimization_does_not_retain_a_second_object_user_projection_pair() {
+        // The qpdf-shaped state is two bidirectional maps plus the two
+        // existing optional setup snapshots. Persistent ObjectRef projections
+        // would add another two map-sized fields and defeat the ownership
+        // convergence this type is meant to provide.
+        let map_size = std::mem::size_of::<BTreeMap<ObjectUser, BTreeSet<QpdfObjGen>>>();
+        assert!(
+            std::mem::size_of::<Optimization>() <= map_size * 5,
+            "Optimization retains a second persistent object-user projection pair"
+        );
+    }
+
+    #[test]
     fn page_users_view_filters_non_page_users_without_cloning_a_set() {
         let object = ObjectRef::new(7, 0);
         let mut optimization = Optimization::default();
@@ -707,7 +688,7 @@ mod tests {
             .contains(&raw));
         assert!(!optimization
             .objects_for(&ObjectUser::Root)
-            .contains(&ObjectRef::new(5, 65_534)));
+            .any(|object| object == ObjectRef::new(5, 65_534)));
         assert!(optimization
             .raw_users_for(QpdfObjGen::new(99, 0))
             .iter()
