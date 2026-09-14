@@ -2012,6 +2012,25 @@ error instead of falling through to a fallback.
 initialized handleのresolver errorは変更しない。既存のA6/A7 consumer移行、
 canonical owner、qtest exceptionsは対象外である。
 
+### JSON pages content normalization and warning route `flpdf-wkunn` (2026-09-14)
+
+`QPDFJob::doJSONPages` calls `QPDFPageObjectHelper::getPageContents` for each
+page (`libqpdf/QPDFJob.cc:1030-1077`). That public helper delegates to
+`QPDFObjectHandle::getPageContents`, whose `getKey("/Contents")` result is
+normalized by `arrayOrStreamToStreamArray` (`libqpdf/QPDFObjectHandle.cc:1438-1493`).
+The normalization owns both the stream list and the `qpdf_e_damaged_pdf` warning
+for a non-stream array member or a non-null value that is neither a stream nor an
+array; null and missing values remain empty without warning.
+
+The former `job/json_sections.rs::collect_content_refs` projection bypassed that
+ObjectHandle boundary and silently discarded malformed `/Contents` values. The
+JSON pages consumer now uses `PageObjectHelper::get_page_contents` and serializes
+each returned handle through the existing non-dereferencing JSON object route.
+This preserves qpdf's direct/array/null normalization, canonical stream identity,
+and document-owned warning sink without adding a JSON-only diagnostic or a legacy
+bridge. The regression is covered by the pinned qpdf 11.9.0 CLI comparison on
+`tests/fixtures/compat/chained-indirect-contents.pdf`.
+
 ### A6/A7/A8 Job/page/resource/JSON consumer slice `flpdf-3yn9.48.23.8` (2026-09-10)
 
 The remaining production consumers in the Job page-selection, page-tree,

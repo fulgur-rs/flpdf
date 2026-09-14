@@ -711,6 +711,50 @@ fn lazy_object_failure_matches_qpdf_null_fallback() {
     assert_eq!(flpdf.stdout, qpdf.stdout);
 }
 
+#[test]
+fn json_pages_reports_non_stream_contents_warning_like_qpdf() {
+    if skip_unless_qpdf_11_9() {
+        return;
+    }
+
+    let input = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+        .join("../../tests/fixtures/compat/chained-indirect-contents.pdf");
+    let args = ["--json=2", "--json-key=pages"];
+    let qpdf = ShellCommand::new("qpdf")
+        .args(args)
+        .arg(&input)
+        .output()
+        .expect("run qpdf JSON pages oracle");
+    assert_eq!(
+        qpdf.status.code(),
+        Some(3),
+        "qpdf warning status changed: {qpdf:?}"
+    );
+
+    let flpdf = Command::cargo_bin("flpdf")
+        .expect("flpdf binary")
+        .args(args)
+        .arg(&input)
+        .output()
+        .expect("run flpdf JSON pages");
+
+    assert_eq!(flpdf.status, qpdf.status);
+    assert_eq!(flpdf.stdout, qpdf.stdout);
+    let warning_lines = |stderr: &[u8]| {
+        String::from_utf8_lossy(stderr)
+            .lines()
+            .filter(|line| line.starts_with("WARNING: "))
+            .map(str::to_owned)
+            .collect::<Vec<_>>()
+    };
+    let qpdf_warnings = warning_lines(&qpdf.stderr);
+    let flpdf_warnings = warning_lines(&flpdf.stderr);
+    assert_eq!(flpdf_warnings, qpdf_warnings);
+    assert!(qpdf_warnings.iter().any(|line| {
+        line == "WARNING: page object 3 0:  object is supposed to be a stream or an array of streams but is neither"
+    }));
+}
+
 fn assert_same_json_output_is_rejected_without_modifying_input(
     input_arg: &str,
     output_arg: &str,
