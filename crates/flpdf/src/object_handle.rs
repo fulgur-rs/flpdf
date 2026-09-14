@@ -1179,7 +1179,7 @@ mod reverse_containment_layout_tests {
     fn raw_identity_width_does_not_widen_shared_value_metadata() {
         assert_eq!(std::mem::size_of::<QpdfObjGen>(), 8);
         assert_eq!(std::mem::size_of::<Option<QpdfObjGen>>(), 12);
-        assert!(std::mem::size_of::<ValueIdentity>() <= 48);
+        assert!(std::mem::size_of::<ValueIdentity>() <= 40);
     }
 }
 
@@ -1241,21 +1241,11 @@ struct SharedValueState {
 
 impl SharedValueState {
     fn qpdf_obj_gen(&self) -> Option<QpdfObjGen> {
-        self.identity.qpdf_obj_gen.or_else(|| {
-            self.identity
-                .object_ref
-                .and_then(|object_ref| QpdfObjGen::try_from_object_ref(object_ref).ok())
-        })
+        self.identity.qpdf_obj_gen
     }
 
     fn object_ref(&self) -> Option<ObjectRef> {
-        self.qpdf_obj_gen()
-            .and_then(QpdfObjGen::to_object_ref)
-            .or_else(|| {
-                self.identity
-                    .object_ref
-                    .filter(|object_ref| object_ref.number != 0)
-            })
+        self.qpdf_obj_gen().and_then(QpdfObjGen::to_object_ref)
     }
 
     fn get_description(&self) -> Vec<u8> {
@@ -1365,10 +1355,11 @@ fn registered_test_slots() -> Vec<ObjectHandle> {
 }
 
 /// The active identity on qpdf's shared QPDFValue (QPDFValue.hh:68-72).
-/// The document back-pointer is represented by its unique id and weak resolver.
+/// One raw ObjGen is the canonical object identity; the valid ObjectRef view
+/// is derived only at the parser/public projection boundary. The document
+/// back-pointer is represented by its unique id and weak resolver.
 #[derive(Clone, Default)]
 struct ValueIdentity {
-    object_ref: Option<ObjectRef>,
     qpdf_obj_gen: Option<QpdfObjGen>,
     /// qpdf's nullable/default document identity (`QPDFValue.hh:149-152` and
     /// `QPDF.hh:1454`) represented with the zero niche.
@@ -1391,10 +1382,6 @@ impl ObjectSlot {
             .identity
             .qpdf_obj_gen
             .is_some_and(QpdfObjGen::is_indirect)
-            || shared
-                .identity
-                .object_ref
-                .is_some_and(|object_ref| object_ref.number != 0)
     }
 
     fn active_pdf_unique_id(&self) -> Option<u64> {
@@ -1873,14 +1860,15 @@ impl ObjectHandle {
         self.with_value(|value| matches!(value, Some(ObjectValue::Reserved)))
     }
 
-    /// The object number/generation for an indirect handle, or `None` for a
-    /// direct one.
+    /// The valid PDF `N G R` projection for an indirect handle, or `None` for
+    /// a direct handle and for a raw qpdf identity outside the valid reference
+    /// syntax (for example generation 65535).
     pub fn object_ref(&self) -> Option<ObjectRef> {
         self.0.borrow().object_ref()
     }
 
-    /// The qpdf raw object identity carried by this handle, if it is
-    /// indirect. Unlike [`Self::object_ref`], this preserves generations that
+    /// The qpdf raw object identity carried by this handle, if it has one.
+    /// Unlike [`Self::object_ref`], this preserves generations that
     /// qpdf accepts in an object header but rejects in an `N G R` reference.
     pub(crate) fn qpdf_obj_gen(&self) -> Option<QpdfObjGen> {
         self.0.borrow().qpdf_obj_gen()
@@ -2000,7 +1988,6 @@ impl ObjectHandle {
             shared: new_shared_value_state(
                 ObjectValue::Reserved,
                 ValueIdentity {
-                    object_ref: Some(object_ref),
                     qpdf_obj_gen: Some(qpdf_obj_gen),
                     active_pdf_unique_id: NonZeroU64::new(pdf_unique_id),
                     resolver: Some(resolver),
@@ -2073,14 +2060,12 @@ impl ObjectHandle {
         let Some(qpdf_obj_gen) = QpdfObjGen::try_from_object_ref(object_ref).ok() else {
             return Self::uninitialized();
         };
-        let handle = Self::new_indirect_unresolved_qpdf_obj_gen_with_identity(
+        Self::new_indirect_unresolved_qpdf_obj_gen_with_identity(
             qpdf_obj_gen,
             offset,
             pdf_unique_id,
             resolver,
-        );
-        handle.0.borrow().shared.borrow_mut().identity.object_ref = Some(object_ref);
-        handle
+        )
     }
 
     fn new_indirect_unresolved_qpdf_obj_gen_with_identity(
@@ -2095,7 +2080,6 @@ impl ObjectHandle {
             shared: new_shared_value_state(
                 ObjectValue::Unresolved,
                 ValueIdentity {
-                    object_ref: object_gen.to_object_ref(),
                     qpdf_obj_gen: Some(object_gen),
                     active_pdf_unique_id: pdf_unique_id.and_then(NonZeroU64::new),
                     resolver,
@@ -2198,11 +2182,6 @@ impl ObjectHandle {
 
         let left_object_gen = self.qpdf_obj_gen();
         let right_object_gen = other.qpdf_obj_gen();
-        // Carry the existing projections across the swap for the same reason
-        // `promote_to_indirect_qpdf_obj_gen` does: re-deriving them through the
-        // parser gate loses identities the Rust `ObjectRef` factory admits.
-        let left_object_ref = self.object_ref();
-        let right_object_ref = other.object_ref();
         {
             let mut left = self.0.borrow_mut();
             let mut right = other.0.borrow_mut();
@@ -2212,17 +2191,11 @@ impl ObjectHandle {
             let shared = self.0.borrow().shared.clone();
             let mut shared = shared.borrow_mut();
             shared.identity.qpdf_obj_gen = left_object_gen;
-            shared.identity.object_ref = left_object_gen
-                .and_then(QpdfObjGen::to_object_ref)
-                .or(left_object_ref);
         }
         {
             let shared = other.0.borrow().shared.clone();
             let mut shared = shared.borrow_mut();
             shared.identity.qpdf_obj_gen = right_object_gen;
-            shared.identity.object_ref = right_object_gen
-                .and_then(QpdfObjGen::to_object_ref)
-                .or(right_object_ref);
         }
     }
 
@@ -2296,7 +2269,6 @@ impl ObjectHandle {
         let shared = self.0.borrow().shared.clone();
         {
             let mut shared = shared.borrow_mut();
-            shared.identity.object_ref = None;
             shared.identity.qpdf_obj_gen = None;
             shared.identity.active_pdf_unique_id = None;
             shared.identity.resolver = None;
@@ -2325,7 +2297,6 @@ impl ObjectHandle {
         };
         let shared = self.0.borrow().shared.clone();
         shared.borrow_mut().identity = ValueIdentity {
-            object_ref: Some(object_ref),
             qpdf_obj_gen: Some(qpdf_obj_gen),
             active_pdf_unique_id: NonZeroU64::new(pdf_unique_id),
             resolver: Some(resolver),
@@ -2344,15 +2315,6 @@ impl ObjectHandle {
         resolver: Weak<dyn DocumentResolver>,
     ) -> Self {
         let mut identity = { self.0.borrow().shared.borrow().identity.clone() };
-        // `to_object_ref` applies qpdf's `N G R` parser gate, so it is not the
-        // inverse of `from_object_ref`: retain an existing nonzero public
-        // projection for a raw indirect identity such as generation 65535,
-        // while qpdf's non-indirect object number 0 must lose its projection.
-        identity.object_ref = object_gen.to_object_ref().or_else(|| {
-            identity
-                .object_ref
-                .filter(|object_ref| object_ref.number != 0)
-        });
         identity.qpdf_obj_gen = Some(object_gen);
         identity.active_pdf_unique_id = NonZeroU64::new(pdf_unique_id);
         identity.resolver = Some(resolver);
@@ -7280,15 +7242,18 @@ fn unparse_resolved_into(handle: &ObjectHandle, out: &mut Vec<u8>, strict: bool)
 // generation identity (`item.second->resolve(); auto og =
 // item.second->getObjGen();`, `libqpdf/QPDF_Array.cc:130-132`), but that
 // identity is a property of the *handle itself*, not of whatever it resolves
-// to — an indirect handle already carries its object/generation number
-// before resolution ever runs. Checking `object_ref()` first, the same way
-// `ObjectRef` is already known on this handle, avoids resolving a dangling or
-// malformed indirect child purely to report its own indirectness; qpdf's own
-// array unparse never needs that resolution to succeed to emit `N G R` for
-// such a child.
+// to — an indirect handle already carries its object/generation number before
+// resolution ever runs. Read the raw qpdf identity first, so a dangling or
+// malformed indirect child still emits its own `N G R` form without requiring
+// resolution to succeed.
 fn unparse_resolved_child(handle: &ObjectHandle, out: &mut Vec<u8>, strict: bool) -> Result<()> {
-    if let Some(object_ref) = handle.object_ref() {
-        write_unparse_reference(object_ref, out);
+    if let Some(object_gen) = handle
+        .qpdf_obj_gen()
+        .filter(|object_gen| object_gen.is_indirect())
+    {
+        out.extend_from_slice(
+            format!("{} {} R", object_gen.get_obj(), object_gen.get_gen()).as_bytes(),
+        );
         Ok(())
     } else {
         unparse_resolved_into(handle, out, strict)
@@ -7529,9 +7494,12 @@ impl<'a> ObjectJsonWriter<'a> {
         if !handle.is_initialized() {
             return Err(ObjectJsonError::Uninitialized);
         }
-        if let Some(object_ref) = handle.object_ref() {
+        if let Some(object_gen) = handle
+            .qpdf_obj_gen()
+            .filter(|object_gen| object_gen.is_indirect())
+        {
             if !dereference_indirect {
-                return self.write_reference(object_ref);
+                return self.write_qpdf_obj_gen_reference(object_gen);
             }
             if handle.is_reserved() {
                 return Err(ObjectJsonError::Reserved);
@@ -7790,12 +7758,12 @@ impl<'a> ObjectJsonWriter<'a> {
         self.write(b"\"")
     }
 
-    fn write_reference(
+    fn write_qpdf_obj_gen_reference(
         &mut self,
-        object_ref: ObjectRef,
+        object_gen: QpdfObjGen,
     ) -> std::result::Result<(), ObjectJsonError> {
         self.write(b"\"")?;
-        self.write(format!("{} {}", object_ref.number, object_ref.generation).as_bytes())?;
+        self.write(format!("{} {}", object_gen.get_obj(), object_gen.get_gen()).as_bytes())?;
         self.write(b" R\"")
     }
 
@@ -7990,6 +7958,23 @@ mod object_json_writer_tests {
             assert_eq!(original.is_resolved(), dereference);
             assert!(original.is_same_object_as(&promoted));
         }
+    }
+
+    #[test]
+    fn json_writer_emits_a_raw_generation_without_an_object_ref_projection() {
+        let (handle, resolver) = identity_tests::resolver_bearing_handle(ObjectValue::Integer(5));
+        let raw = handle.promote_to_indirect_qpdf_obj_gen(
+            QpdfObjGen::new(9, 65_535),
+            20,
+            Rc::downgrade(&resolver),
+        );
+        let mut bytes = Vec::new();
+        let mut output = PlString::new("raw-generation-json", None, &mut bytes);
+
+        raw.write_json(2, &mut output, false, 0)
+            .expect("raw qpdf identity is sufficient for a JSON reference");
+
+        assert_eq!(bytes, b"\"9 65535 R\"");
     }
 
     #[test]
@@ -11861,10 +11846,9 @@ mod type_code_tests {
         // 130-132`) -- that identity is already known on the handle before
         // resolution ever runs, so qpdf never needs resolution to SUCCEED to
         // emit `N G R` for a dangling or otherwise unresolvable child. Drop
-        // the child's resolver to force `try_dereference` to fail. Eagerly
-        // dereferencing before the
-        // `object_ref()` check let a single unresolvable element fail the
-        // whole array.
+        // the child's resolver to force `try_dereference` to fail. Reading the
+        // raw qpdf identity before trying to resolve it keeps one unresolvable
+        // element from failing the whole array.
         let (child, resolver) = identity_tests::resolver_bearing_handle(ObjectValue::Integer(5));
         drop(resolver);
         let array = ObjectHandle::array(vec![ObjectHandle::integer(1), child]);
@@ -11874,6 +11858,25 @@ mod type_code_tests {
                 .try_unparse_resolved()
                 .expect("an unresolvable indirect child must not fail the whole array"),
             b"[ 1 20 0 R ]"
+        );
+    }
+
+    #[test]
+    fn unparse_resolved_writes_a_raw_generation_without_an_object_ref_projection() {
+        let (handle, resolver) = identity_tests::resolver_bearing_handle(ObjectValue::Integer(5));
+        let raw = handle.promote_to_indirect_qpdf_obj_gen(
+            QpdfObjGen::new(9, 65_535),
+            20,
+            Rc::downgrade(&resolver),
+        );
+        assert_eq!(raw.object_ref(), None);
+
+        let array = ObjectHandle::array(vec![raw]);
+        assert_eq!(
+            array
+                .try_unparse_resolved()
+                .expect("raw qpdf identity is sufficient for a reference form"),
+            b"[ 9 65535 R ]"
         );
     }
 

@@ -32,14 +32,15 @@ fn get_all_objects_preserves_handle_identities() {
         let mut pdf = open();
         let object_ref = ObjectRef::new(number, generation);
         let handle = pdf.get_object_handle(object_ref);
-        assert_eq!(handle.object_ref(), Some(object_ref));
+        let expected_projection = (generation < u16::MAX).then_some(object_ref);
+        assert_eq!(handle.object_ref(), expected_projection);
         assert!(handle.is_indirect());
 
         pdf.get_all_objects().expect("get_all_objects");
 
         assert_eq!(
             handle.object_ref(),
-            Some(object_ref),
+            expected_projection,
             "enumeration dropped the projection for {number} {generation}"
         );
         assert!(
@@ -57,12 +58,13 @@ fn swapping_objects_preserves_handle_identities() {
         let other_ref = ObjectRef::new(3, 0);
         let handle = pdf.get_object_handle(object_ref);
         let other = pdf.get_object_handle(other_ref);
+        let expected_projection = (generation < u16::MAX).then_some(object_ref);
 
         pdf.swap_objects(object_ref, other_ref).expect("swap");
 
         assert_eq!(
             handle.object_ref(),
-            Some(object_ref),
+            expected_projection,
             "swap dropped the projection for {number} {generation}"
         );
         assert!(
