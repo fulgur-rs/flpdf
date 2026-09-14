@@ -2091,9 +2091,18 @@ pub(crate) fn load_xref_state_from_source(
         }
         Err(error) => return Err(error),
     };
-    let xref_end = logical_length
-        .checked_sub(startxref)
-        .ok_or_else(|| Error::parse(0, "startxref is beyond the input source"))?;
+    let Some(xref_end) = logical_length.checked_sub(startxref) else {
+        if options.allow_repair {
+            let all = read_live_source_range(
+                owner,
+                0,
+                usize::try_from(logical_length)
+                    .map_err(|_| Error::parse(0, "input source is too large for this target"))?,
+            )?;
+            return load_xref_state_from_bytes(&all, options, Some(owner));
+        }
+        return Err(Error::parse(0, "startxref is beyond the input source"));
+    };
     let xref_window = read_live_source_range(
         owner,
         startxref,
@@ -8975,6 +8984,22 @@ mod final_handle_tests {
         fn install_xref_entries(&self, _entries: BTreeMap<ObjectRef, XrefEntry>) {}
 
         fn set_header_offset(&self, _offset: usize) {}
+
+        fn source_seek(&self, _offset: u64) -> Result<()> {
+            Ok(())
+        }
+
+        fn source_tell(&self) -> Result<u64> {
+            Ok(0)
+        }
+
+        fn source_length(&self) -> Result<u64> {
+            Ok(0)
+        }
+
+        fn source_read(&self, _buffer: &mut [u8]) -> Result<usize> {
+            Ok(0)
+        }
 
         fn begin_parse(&self) -> Result<()> {
             Ok(())
