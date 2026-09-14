@@ -5661,6 +5661,24 @@ mod tests {
         )
     }
 
+    #[test]
+    fn out_of_range_object_refs_are_rejected_at_every_non_resolving_cache_boundary() {
+        let resolver = bare_resolver();
+        let object_ref = ObjectRef::new(u32::MAX, 0);
+
+        assert!(resolver.registered_handle(object_ref).is_none());
+        assert!(!resolver.is_allocated_object(object_ref));
+        assert!(!resolver.has_newer_cached_generation(object_ref));
+        assert!(resolver.xref_entry(object_ref).is_none());
+        assert!(!resolver.has_default_xref_entry(object_ref));
+        assert!(!resolver
+            .reserve_object_if_not_exists(object_ref)
+            .is_initialized());
+        resolver.insert_default_xref_entry_for_test(object_ref);
+        resolver.insert_source_xref_entry(object_ref, XrefEntry::Free { next: 0 });
+        assert!(resolver.xref_entry(object_ref).is_none());
+    }
+
     // qpdf's `QPDF::inParse` (`libqpdf/QPDF.cc:475-485`) throws when the flag
     // already holds the value it is being set to, in either direction. This
     // is the primitive `QPDF::ParseGuard`'s constructor/destructor rely on;

@@ -10223,6 +10223,24 @@ mod uniform_identity_tests {
         })
     }
 
+    #[test]
+    fn out_of_range_object_ref_constructors_return_uninitialized_handles() {
+        let resolver = resolver();
+        let object_ref = ObjectRef::new(u32::MAX, 0);
+
+        assert!(
+            !ObjectHandle::new_reserved_for_pdf(object_ref, 1, Rc::downgrade(&resolver))
+                .is_initialized()
+        );
+        assert!(
+            !ObjectHandle::new_indirect_with_resolver(object_ref, Rc::downgrade(&resolver))
+                .is_initialized()
+        );
+        assert!(!ObjectHandle::integer(1)
+            .promote_to_indirect(object_ref, 1, Rc::downgrade(&resolver))
+            .is_initialized());
+    }
+
     fn recording_noop_resolver() -> (Rc<dyn DocumentResolver>, Rc<std::cell::Cell<usize>>) {
         let calls = Rc::new(std::cell::Cell::new(0));
         (
