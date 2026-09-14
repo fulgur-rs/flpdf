@@ -565,6 +565,7 @@ slice.
 | `E-17` / `E-21` | `flpdf-3yn9.48.6` | QPDFJob argv→Config を qpdf の正本として完成させ通常CLI入口を接続する |
 | `E-4` / `E-11` / `E-12` / `E-21` | `flpdf-3yn9.48.7` | CLI ordinary/rewrite 変換consumerを canonical QPDFJob に移行する |
 | `E-4` / `E-5` / `E-10` / `E-11` / `E-13` / `E-14` / `E-16` / `E-21` / `E-29` | `flpdf-3yn9.48.8` | CLI pages/collate/rotate/split のsource・plan・output orchestrationをJobへ移行する |
+| `E-11` | `flpdf-3yn9.48.92` | `--pages` post-plan overlay/underlay consumerをcanonical QPDFJob ownerへ移行する |
 | `E-6` / `E-7` / `E-8` / `E-21` | `flpdf-3yn9.48.9` | CLI combined inspection・JSON consumer を canonical writeQPDF に移行する |
 | `E-9` / `E-21` / `E-29` | `flpdf-3yn9.48.10` | CLI attachment mutation入口を canonical Job lifecycle に移行する |
 | `E-28` | `flpdf-3yn9.48.11` | qtest test_driver consumerをcase・API責務単位でcanonical ownerに対応付ける |
