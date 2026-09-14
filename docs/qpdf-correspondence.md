@@ -1886,6 +1886,14 @@ flpdf CLIもこのmutationを保持し、`--remove-restrictions` による `remo
 `QPDF::warn` のcollectionと通常のcompletion summaryへ進み、`--no-warn` はその表示だけを
 抑止する（`QPDF.cc:487-504`）。
 
+`flpdf-3yn9.48.102` では、qpdf の public `QPDF::removeSecurityRestrictions` と
+`QPDFAcroFormDocumentHelper::disableDigitalSignatures` がともに `void` であること
+（`include/qpdf/QPDF.hh:603-607`; `include/qpdf/QPDFAcroFormDocumentHelper.hh:166-170`）に合わせ、flpdf の `Result<bool>` を
+`Result<()>` へ狭めた。変更有無を観測する qpdf-less projection と `changed` の追跡は
+撤去し、Rust 固有に必要なエラー伝播だけを残している。`/Perms`・`/SigFlags`・署名
+フィールドの mutation 順序は変更せず、既存の10 fixture byte differentialで qpdf
+11.9.0 との一致を再確認した。
+
 `flpdf-innn` では、`WriterConfiguration::normalize_encryption_passwords` が
 `maybeFixWritePassword` の user→owner 順を `PasswordWriteNotice` の列として保持し、
 CLI と `QPDFJob::write_qpdf` が各noticeをその場で対応する logger pipeline へ fallibly
