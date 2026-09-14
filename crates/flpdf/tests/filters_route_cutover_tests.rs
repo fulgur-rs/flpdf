@@ -37,7 +37,7 @@ fn passthrough_codec_label_has_no_public_filters_bridge() {
         production_source(concat!(env!("CARGO_MANIFEST_DIR"), "/src/stream_filter.rs"));
     assert!(
         stream_filter.contains("pub(crate) fn passthrough_codec_label("),
-        "stream_filter.rs must retain the canonical internal label owner"
+        "stream_filter.rs must still hold C43's single internal label owner, which stays until the bridge is removed"
     );
 }
 
