@@ -12,6 +12,8 @@ use flpdf::job::{
     JsonStreamData, PageSpecInput, PageSpecJobOutput, QPDFJob, RemoveUnreferencedResources,
     SplitPageOptions,
 };
+#[cfg(test)]
+use flpdf::parse_rotation_parameter;
 use flpdf::pipeline::{FlateAction, Pipeline, PipelineHandle, PlFlate, PlStdioFile};
 use flpdf::qutil::same_file as qpdf_same_file;
 use flpdf::writer::DecodeLevel as StreamDecodeLevel;
@@ -19,15 +21,13 @@ use flpdf::{
     json_inspect::{DecodeLevel, JsonKey, JsonObjectSelector},
     normalize_content_stream, pages, parse_pdf_version, CompressStreams, CopyEncryptionSource,
     EncryptMethod, EncryptParams, Error, NewlineBeforeEndstream, ObjectHandle, ObjectKeyAlg,
-    ObjectRef, ObjectStreamMode, PageDocumentHelper, PageObjectHelper, PasswordMode,
-    PasswordWriteNotice, Pdf, PdfOpenOptions, PdfVersion, PdfWriter, PermissionsConfig,
-    PrintPermission, QPDFLogger, R2PermissionsConfig, StreamDataMode, UsageError,
-    WriterConfiguration,
+    ObjectRef, ObjectStreamMode, PasswordMode, PasswordWriteNotice, Pdf, PdfOpenOptions,
+    PdfVersion, PdfWriter, PermissionsConfig, PrintPermission, QPDFLogger, R2PermissionsConfig,
+    StreamDataMode, UsageError, WriterConfiguration,
 };
 use flpdf::{
     pages::tree_rebuild::{rebuild_page_tree, RebuildResult},
-    parse_rotation_parameter,
-    qutil::{parse_numrange, qpdf_size_to_int},
+    qutil::parse_numrange,
     CombinedPage, InputSpec, PageRange,
 };
 use std::collections::HashSet;
@@ -382,33 +382,6 @@ fn image_optimization_options(
     }
     options.keep_inline_images = keep_inline_images;
     Ok(options)
-}
-
-/// Apply qpdf's image transformation phase at the shared CLI/job boundary.
-/// Explicit inline-image externalization is kept distinct from the optimizer,
-/// but qpdf runs it first and gives the explicit request precedence over
-/// `keepInlineImages` when both are enabled
-/// (`libqpdf/QPDFJob.cc:2151-2174`).
-fn apply_image_transformations<R: Read + Seek + 'static>(
-    pdf: &mut Pdf<R>,
-    options: ImageTransformOptions,
-    verbose: bool,
-) -> CliResult<()> {
-    let mut image_options = options.image_options;
-    if options.externalize_inline_images {
-        image_options.keep_inline_images = false;
-    }
-
-    if options.optimize_images {
-        flpdf::optimize_images(pdf, &cli_logger(), &progname(), verbose, image_options)?;
-    } else if options.externalize_inline_images {
-        let page_refs = PageDocumentHelper::new(pdf).get_all_pages()?;
-        for page_ref in page_refs {
-            PageObjectHelper::new(page_ref, pdf)
-                .externalize_inline_images(image_options.inline_min_bytes, false)?;
-        }
-    }
-    Ok(())
 }
 
 /// Apply qpdf's canonical create-stage transformations before a top-level
@@ -8173,7 +8146,6 @@ fn run_page_extraction_after_plan<R: Read + Seek + 'static>(
         (result, RemoveUnreferencedResources::No)
     };
     QPDFJob::complete_in_place_page_selection(pdf, &result, prune_mode)?;
-    apply_rotate_specs(pdf, &page_ops.rotate, &result.new_kids)?;
 
     let mut options = options;
     let split_pages = page_ops
@@ -8224,56 +8196,48 @@ fn run_page_extraction_after_plan<R: Read + Seek + 'static>(
     }
     // qpdf keeps a provider-backed source QPDF alive when
     // `copyForeignObject` copies a Form XObject whose data comes from a
-    // `StreamDataProvider` (`libqpdf/QPDF.cc:2248-2257`). Retain the canonical
-    // Job and its opened overlay sources through the in-memory writer for the
-    // same reason. The job records the overlay source version floor while it
-    // performs that one canonical open (`QPDFJob.cc:1695-1716`); the final
-    // page-operation writer consumes the exposed snapshot below.
-    let _overlay_job = if !overlay_specs.is_empty() {
-        update_input_version_floor(&mut options.input_version_floor, pdf)?;
-
-        let mut overlay_job = new_cli_job(no_warn);
-        overlay_job.set_password_mode(password.password_mode.into());
-        overlay_job.set_password_is_hex_key(password.password_is_hex_key);
-        overlay_job.set_suppress_password_recovery(password.suppress_password_recovery);
-        overlay_job.set_suppress_recovery(password.recovery.suppress_recovery);
-        overlay_job.set_ignore_xref_streams(password.recovery.ignore_xref_streams);
-        overlay_job.set_verbose(verbose);
-        configure_cli_overlay_specs(&mut overlay_job, overlay_specs)?;
-        overlay_job.apply_transformations(pdf)?;
-        if let Some(floor) = overlay_job.input_version_floor() {
-            options.input_version_floor = Some(
-                options
-                    .input_version_floor
-                    .map_or(floor, |current| current.max(floor)),
-            );
-        }
-        Some(overlay_job)
-    } else {
-        None
-    };
-
-    // qpdf runs image externalization/optimization after page selection,
-    // rotation, and underlay/overlay (`QPDFJob.cc:2151-2174`). Keeping this
-    // after the overlay block makes images introduced by a copied overlay
-    // page visible to the same transformation pass.
-    apply_image_transformations(pdf, image_options, verbose)?;
-
-    // The page-selection consumer has already completed qpdf's page copy,
-    // rotation, and underlay/overlay phases. Run every remaining
-    // `handleTransformations` option through the canonical Job transformation
-    // owner so the same AcroForm/page-helper boundary is used for `--pages` as
-    // for ordinary rewrites (`QPDFJob.cc:466-473,2177-2194`).
-    if remove_restrictions
+    // `StreamDataProvider` (`libqpdf/QPDF.cc:2248-2257`). Retain one
+    // canonical Job and its opened overlay sources through the in-memory
+    // writer for the same reason. The job records the overlay source version
+    // floor while it performs that one canonical open (`QPDFJob.cc:1695-1716`);
+    // the final page-operation writer consumes the exposed snapshot below.
+    let has_transformations = !overlay_specs.is_empty()
+        || !page_ops.rotate.is_empty()
+        || image_options.externalize_inline_images
+        || image_options.optimize_images
+        || remove_restrictions
         || coalesce_contents
         || generate_appearances
         || flatten_annotations_mode.is_some()
-        || flatten_rotation
-    {
-        let mut transform_job = new_cli_job(no_warn);
-        transform_job.set_verbose(verbose);
+        || flatten_rotation;
+    let mut transform_job = if has_transformations {
+        if !overlay_specs.is_empty() {
+            update_input_version_floor(&mut options.input_version_floor, pdf)?;
+        }
+
+        let mut job = new_cli_job(no_warn);
+        job.set_password_mode(password.password_mode.into());
+        job.set_password_is_hex_key(password.password_is_hex_key);
+        job.set_suppress_password_recovery(password.suppress_password_recovery);
+        job.set_suppress_recovery(password.recovery.suppress_recovery);
+        job.set_ignore_xref_streams(password.recovery.ignore_xref_streams);
+        job.set_verbose(verbose);
+        configure_cli_overlay_specs(&mut job, overlay_specs)?;
         {
-            let mut configuration = transform_job.config();
+            let mut configuration = job.config();
+            for parameter in &page_ops.rotate {
+                configuration.rotate(arg_parser::os_bytes(parameter.as_os_str()))?;
+            }
+            if image_options.optimize_images {
+                let mut optimization = image_options.image_options;
+                if image_options.externalize_inline_images {
+                    optimization.keep_inline_images = false;
+                }
+                configuration.optimize_images(optimization);
+            } else if image_options.externalize_inline_images {
+                configuration
+                    .externalize_inline_images(image_options.image_options.inline_min_bytes);
+            }
             if remove_restrictions {
                 configuration.remove_restrictions();
             }
@@ -8290,7 +8254,22 @@ fn run_page_extraction_after_plan<R: Read + Seek + 'static>(
                 configuration.flatten_rotation();
             }
         }
-        transform_job.apply_transformations(pdf)?;
+        Some(job)
+    } else {
+        None
+    };
+    if let Some(job) = transform_job.as_mut() {
+        // QPDFJob applies rotations before its underlay/overlay stage and then
+        // runs image, appearance, annotation, coalesce, and flatten-rotation
+        // transformations in qpdf order (`QPDFJob.cc:466-473,2137-2194`).
+        job.apply_transformations(pdf)?;
+        if let Some(floor) = job.input_version_floor() {
+            options.input_version_floor = Some(
+                options
+                    .input_version_floor
+                    .map_or(floor, |current| current.max(floor)),
+            );
+        }
     }
 
     let split_progress = split_pages_active && options.progress;
@@ -8339,34 +8318,7 @@ fn run_page_extraction_after_plan<R: Read + Seek + 'static>(
     finish_operation_warnings_with_prior(pdf, creates_output, prior_warnings)
 }
 
-/// Apply qpdf's rotation map to `target_pages`, resolving each raw range
-/// against the number of target pages.
-fn apply_rotate_specs<R: std::io::Read + std::io::Seek>(
-    pdf: &mut Pdf<R>,
-    rotate_args: &[OsString],
-    target_pages: &[ObjectRef],
-) -> CliResult<()> {
-    if rotate_args.is_empty() {
-        return Ok(());
-    }
-    let page_count = qpdf_size_to_int(target_pages.len())?;
-    let rotations = parse_rotate_specs(rotate_args)?;
-    for (range, spec) in rotations {
-        // qpdf's handleRotations resolves each range against the real page
-        // count and then filters `0 <= pageno < npages` before touching
-        // `pages`, so an empty document rotates nothing without erroring
-        // (confirmed live: `--collate=0 --rotate=90` exits 0).
-        for page in parse_numrange(&range, page_count)? {
-            let index = page.wrapping_sub(1);
-            if index >= 0 && index < page_count {
-                let mut page = PageObjectHelper::new(target_pages[index as usize], pdf);
-                page.rotate_page(spec.angle, spec.relative)?;
-            }
-        }
-    }
-    Ok(())
-}
-
+#[cfg(test)]
 fn parse_rotate_specs(
     rotate_args: &[OsString],
 ) -> CliResult<std::collections::BTreeMap<Vec<u8>, flpdf::RotationSpec>> {

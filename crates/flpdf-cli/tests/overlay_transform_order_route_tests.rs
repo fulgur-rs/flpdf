@@ -135,7 +135,7 @@ fn page_selection_overlay_uses_the_canonical_job_owner() {
     let source = production_main_source();
     let after_plan = source
         .split_once("fn run_page_extraction_after_plan")
-        .and_then(|(_, tail)| tail.split_once("/// Apply qpdf's rotation map"))
+        .and_then(|(_, tail)| tail.split_once("/// Parse `--split-pages[=n]`"))
         .map(|(body, _)| body)
         .expect("page-selection post-plan route");
 
@@ -156,6 +156,32 @@ fn page_selection_overlay_uses_the_canonical_job_owner() {
     assert!(
         after_plan.contains("input_version_floor()"),
         "page-selection post-plan route must carry the canonical job's version floor"
+    );
+}
+
+#[test]
+fn page_selection_post_plan_rotation_and_images_use_the_canonical_job_owner() {
+    let source = production_main_source();
+    let after_plan = source
+        .split_once("fn run_page_extraction_after_plan")
+        .and_then(|(_, tail)| tail.split_once("/// Parse `--split-pages[=n]`"))
+        .map(|(body, _)| body)
+        .expect("page-selection post-plan route");
+
+    for forbidden in ["apply_rotate_specs(", "apply_image_transformations("] {
+        assert!(
+            !after_plan.contains(forbidden),
+            "page-selection post-plan route retains a direct transform helper: {forbidden}"
+        );
+    }
+    assert!(
+        after_plan.contains("configuration.rotate("),
+        "page-selection post-plan route must queue rotations on QPDFJob"
+    );
+    assert!(
+        after_plan.contains("configuration.optimize_images(")
+            || after_plan.contains("configuration.externalize_inline_images("),
+        "page-selection post-plan route must queue image transformations on QPDFJob"
     );
 }
 

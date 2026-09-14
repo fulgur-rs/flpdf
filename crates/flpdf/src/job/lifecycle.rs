@@ -3515,6 +3515,7 @@ impl QPDFJob {
         // error instead of consuming the stream the PDF itself needs.
         self.reserve_standard_output()?;
         let configuration = self.configuration.clone();
+        self.apply_configured_rotations(pdf, &configuration)?;
         self.prepare_document_transformations(pdf, &configuration)
     }
 
