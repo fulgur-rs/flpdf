@@ -546,7 +546,10 @@ fn job_json_plaintext_copy_encryption_is_a_noop_and_disables_primary_preservatio
         .output()
         .unwrap();
     assert!(show.status.success(), "qpdf must inspect output: {show:?}");
-    assert_eq!(show.stdout, b"File is not encrypted\n");
+    assert_eq!(
+        String::from_utf8_lossy(&show.stdout),
+        format!("File is not encrypted{EOL}")
+    );
 
     let check = ProcessCommand::new("/usr/bin/qpdf")
         .arg("--check")

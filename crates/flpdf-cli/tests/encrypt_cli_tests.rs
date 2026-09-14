@@ -143,7 +143,10 @@ fn assert_unencrypted_output(output: &Path) {
         "qpdf --show-encryption failed: {}",
         String::from_utf8_lossy(&show.stderr)
     );
-    assert_eq!(show.stdout, b"File is not encrypted\n");
+    assert_eq!(
+        normalize_text_newlines(&show.stdout),
+        b"File is not encrypted\n"
+    );
 
     let check = ShellCommand::new("qpdf")
         .arg("--check")
