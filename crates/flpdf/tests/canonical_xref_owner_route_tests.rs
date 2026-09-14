@@ -36,7 +36,7 @@ fn qpdf_available() -> bool {
 /// line-start false object headers. qpdf's `reconstruct_xref` resolves the
 /// candidate to EOF (`libqpdf/QPDF.cc:577-608`), while the owner-less test
 /// scaffolding's bounded retry would stop after 64 offset positions.
-fn candidate_with_more_than_64_false_headers() -> (Vec<u8>, usize) {
+fn candidate_with_more_than_64_false_headers() -> (Vec<u8>, usize, usize) {
     const CANDIDATE: u32 = 1_000;
     const FALSE_HEADER_COUNT: u32 = 65;
 
@@ -65,7 +65,7 @@ fn candidate_with_more_than_64_false_headers() -> (Vec<u8>, usize) {
     bytes.extend_from_slice(&payload);
     bytes.extend_from_slice(b"\nendstream\nendobj\nstartxref\n0\n%%EOF\n");
 
-    (bytes, candidate_offset as usize)
+    (bytes, candidate_offset as usize, payload.len())
 }
 
 #[test]
@@ -168,12 +168,7 @@ fn production_open_always_supplies_the_canonical_xref_owner() {
 
 #[test]
 fn canonical_open_reads_a_candidate_past_64_false_headers_like_qpdf() {
-    if !qpdf_available() {
-        eprintln!("skipping: qpdf 11.9.0 is not available");
-        return;
-    }
-
-    let (fixture, candidate_offset) = candidate_with_more_than_64_false_headers();
+    let (fixture, candidate_offset, payload_len) = candidate_with_more_than_64_false_headers();
     let pdf = Pdf::open_with_options(
         Cursor::new(fixture.clone()),
         PdfOpenOptions {
@@ -197,10 +192,17 @@ fn canonical_open_reads_a_candidate_past_64_false_headers_like_qpdf() {
     assert!(
         pdf.repair_diagnostics().entries().iter().any(|diagnostic| {
             String::from_utf8_lossy(diagnostic.get_message_detail())
-                .contains("Cross-reference stream data has the wrong size; expected = 10; actual =")
+                == format!(
+                    "Cross-reference stream data has the wrong size; expected = 10; actual = {payload_len}"
+                )
         }),
         "canonical open must keep qpdf's candidate size warning"
     );
+
+    if !qpdf_available() {
+        eprintln!("qpdf 11.9.0 is not available; skipping only the oracle comparison");
+        return;
+    }
 
     let directory = tempfile::tempdir().expect("create qpdf fixture directory");
     let input = directory.path().join("candidate-over-64-false-headers.pdf");
@@ -216,8 +218,9 @@ fn canonical_open_reads_a_candidate_past_64_false_headers_like_qpdf() {
         String::from_utf8_lossy(&qpdf.stderr)
     );
     assert!(
-        String::from_utf8_lossy(&qpdf.stderr)
-            .contains("Cross-reference stream data has the wrong size; expected = 10; actual ="),
+        String::from_utf8_lossy(&qpdf.stderr).contains(&format!(
+            "Cross-reference stream data has the wrong size; expected = 10; actual = {payload_len}"
+        )),
         "qpdf must report the fixture's intentionally extra xref-stream data: {}",
         String::from_utf8_lossy(&qpdf.stderr)
     );
