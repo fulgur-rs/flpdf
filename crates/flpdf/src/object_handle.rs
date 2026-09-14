@@ -515,13 +515,13 @@ pub(crate) trait DocumentResolver {
     /// parsed object header whose generation is outside the `N G R` parser
     /// range still reaches qpdf's `QPDFObjGen`-keyed cache.
     fn resolve_qpdf_obj_gen(&self, object_gen: QpdfObjGen, handle: &ObjectHandle) -> Result<()> {
-        let object_ref = object_gen.to_object_ref().ok_or_else(|| {
-            Error::System(format!(
-                "object {} {} is not a valid indirect reference",
-                object_gen.get_obj(),
-                object_gen.get_gen()
-            ))
-        })?;
+        let Some(object_ref) = object_gen.to_object_ref() else {
+            // No `ObjectRef` projection means qpdf's null fallback, not an
+            // error: an identity absent from the xref resolves to null
+            // (`libqpdf/QPDF.cc:1745-1748`).
+            handle.set_resolved(ObjectValue::Null);
+            return Ok(());
+        };
         self.resolve_indirect(object_ref, handle)
     }
 
@@ -2476,7 +2476,13 @@ impl ObjectHandle {
     /// provenance before a parser can install a real offset for a parsed
     /// literal null (`libqpdf/QPDF.cc:1706-1749,1843-1858`).
     pub(crate) fn set_resolved(&self, value: ObjectValue) {
-        if self.is_indirect() {
+        // Gate on carrying a qpdf identity, not on `is_indirect()`. Object
+        // number zero has an identity but is not an indirect reference
+        // (`include/qpdf/QPDFObjGen.hh:78-81`), and qpdf still settles it:
+        // `QPDF::resolve` ends at
+        // `updateCache(og, QPDF_Null::create(), -1, -1)`
+        // (`libqpdf/QPDF.cc:1745-1748`).
+        if self.0.borrow().shared.borrow().qpdf_obj_gen().is_some() {
             self.0.borrow_mut().initialized = true;
             let value = canonicalize_object_value(value);
             let is_null = matches!(value, ObjectValue::Null);
@@ -2729,12 +2735,6 @@ impl ObjectHandle {
             let Some(object_gen) = shared.qpdf_obj_gen() else {
                 return Ok(());
             };
-            if !object_gen.is_indirect() {
-                // qpdf reserves object number 0 for the raw xref/free identity;
-                // it is never an indirect ObjectHandle reference. Do not send
-                // a synthetic ObjectRef(0, generation) through the resolver.
-                return Ok(());
-            }
             if !matches!(&shared.value, ObjectValue::Unresolved) {
                 return Ok(());
             }
@@ -8773,7 +8773,7 @@ pub(crate) mod identity_tests {
     }
 
     #[test]
-    fn object_number_zero_does_not_drive_indirect_resolution() {
+    fn object_number_zero_is_not_indirect_but_settles_as_null() {
         let calls: ResolutionLog = Rc::new(RefCell::new(Vec::new()));
         let value = ObjectValue::Integer(7);
         let resolver: Rc<dyn DocumentResolver> =
@@ -8783,11 +8783,21 @@ pub(crate) mod identity_tests {
             Rc::downgrade(&resolver),
         );
 
+        // `isIndirect()` is `obj != 0` (`include/qpdf/QPDFObjGen.hh:78-81`), so
+        // object zero is not an indirect reference and has no `ObjectRef`.
         assert!(!handle.is_indirect());
         assert_eq!(handle.object_ref(), None);
-        assert!(!handle.try_is_scalar().expect("direct object zero is inert"));
+        // It still settles, as qpdf's null fallback: the identity has no xref
+        // row, so `QPDF::resolve` caches `QPDF_Null` for it
+        // (`libqpdf/QPDF.cc:1745-1748`). The default `resolve_qpdf_obj_gen`
+        // takes that path directly, so the recording resolver is never reached.
+        // `is_resolved` / `is_null` read the slot without driving resolution,
+        // so dereference explicitly first — that is the step qpdf performs on
+        // first access through `QPDFObjectHandle::dereference`.
+        handle.try_dereference().expect("object zero settles");
+        assert!(handle.is_resolved());
+        assert!(handle.is_null());
         assert!(calls.borrow().is_empty());
-        assert!(!handle.is_resolved());
     }
 
     /// Resolves a stream value but intentionally has no byte source. This
@@ -10093,13 +10103,13 @@ pub(crate) mod identity_tests {
     }
 
     #[test]
-    fn a_non_document_resolver_rejects_a_raw_generation_without_a_valid_projection() {
+    fn a_non_document_resolver_settles_a_raw_generation_without_a_valid_projection() {
         struct ValidProjectionOnlyResolver;
 
         impl DocumentResolver for ValidProjectionOnlyResolver {
             // cov:ignore-start: this valid-reference hook is required by the
-            // trait but the test intentionally exercises the raw projection
-            // failure before a valid resolver call can occur.
+            // trait but a generation outside the `N G R` range never produces
+            // an `ObjectRef` for it to receive.
             fn resolve_indirect(
                 &self,
                 _object_ref: ObjectRef,
@@ -10118,12 +10128,16 @@ pub(crate) mod identity_tests {
             Rc::downgrade(&resolver),
         );
 
+        // qpdf accepts any `QPDFObjGen` without range-checking the generation —
+        // `QPDF::getObject` (`libqpdf/QPDF.cc:1952-1959`) caches an unresolved
+        // value for it, and `QPDF::resolve` settles an identity with no xref
+        // row as null (`libqpdf/QPDF.cc:1745-1748`). An identity that the
+        // `N G R` parser range cannot express is that case, not an error.
         assert_eq!(handle.object_ref(), None);
-        assert!(matches!(
-            handle.try_dereference(),
-            Err(Error::System(message))
-                if message == "object 5 65536 is not a valid indirect reference"
-        ));
+        handle
+            .try_dereference()
+            .expect("an unprojectable generation settles as null");
+        assert!(handle.is_null());
     }
 
     #[test]
