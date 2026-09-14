@@ -343,9 +343,10 @@ fn write_object_details<R: Read + Seek>(
 #[cfg(test)]
 mod tests {
     use std::rc::Rc;
+    use std::sync::{Arc, Mutex};
 
     use super::{run_test_0_1, write_object_details};
-    use flpdf::{ObjectHandle, ObjectRef, Pdf, PdfOpenOptions};
+    use flpdf::{ObjectHandle, ObjectRef, Pdf, PdfOpenOptions, Pipeline};
     use std::io::{self, Write};
 
     struct WriteFailure;
@@ -369,6 +370,31 @@ mod tests {
             "write failed"
         );
         writer.flush().expect("flush remains independently usable");
+    }
+
+    #[test]
+    fn ordered_stream_sinks_replay_data_and_warnings_in_order() {
+        let events = Arc::new(Mutex::new(Vec::new()));
+        let mut output = super::OrderedStreamOutput {
+            events: Arc::clone(&events),
+        };
+        assert_eq!(output.identifier(), "qtest stream output");
+        output.write(b"decoded").expect("record stream data");
+        output.finish().expect("finish stream output");
+
+        let mut warning = super::OrderedStreamWarning {
+            events: Arc::clone(&events),
+        };
+        assert_eq!(warning.identifier(), "qtest stream warnings");
+        warning.write(b"warning\n").expect("record stream warning");
+        warning.finish().expect("finish stream warning");
+
+        let mut stdout = Vec::new();
+        let mut stderr = Vec::new();
+        super::replay_stream_events(&events, &mut stdout, &mut stderr)
+            .expect("replay ordered stream events");
+        assert_eq!(stdout, b"decoded");
+        assert_eq!(stderr, b"warning\n");
     }
 
     fn pdf_with_qtest(qtest: &[u8], extras: &[(u32, Vec<u8>)]) -> Vec<u8> {
