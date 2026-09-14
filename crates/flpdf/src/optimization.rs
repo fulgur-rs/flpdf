@@ -694,7 +694,7 @@ mod tests {
             .iter()
             .next()
             .is_none());
-        assert!(optimization.users_for(ObjectRef::new(u32::MAX, 0)).is_empty());
+        assert_eq!(optimization.users_for(ObjectRef::new(u32::MAX, 0)).len(), 0);
     }
 
     #[test]
