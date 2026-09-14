@@ -66,6 +66,16 @@ stacker = "0.1.24"
 libjpeg-turbo-rs = "=0.8.0"
 cc = "1"
 
+# The shipped CLI is compared with qpdf's resident RSS. qpdf keeps most of
+# its implementation in a shared libqpdf image, while a default Rust release
+# build leaves more monomorphized code in the executable's mapped image. Fat
+# LTO with one codegen unit reduces that file-backed footprint without
+# changing Rust-level behavior; keep this as Cargo profile state so release
+# and local builds use the same reproducible settings.
+[profile.release]
+lto = "fat"
+codegen-units = 1
+
 # CI-only profile for the "Release" job's `cargo test --workspace --profile
 # release-ci` run. It exists to catch release-mode-only behavior (no
 # debug_assertions, no overflow-checks) across flpdf's large test suite (105+
