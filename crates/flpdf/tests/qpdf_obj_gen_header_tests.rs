@@ -636,7 +636,10 @@ fn linearized_normalizes_a_raw_page_content_and_drops_its_parameters() {
         .expect("open raw content stream PDF");
     let raw_content = pdf.get_object_handle_by_raw_identity(5, 65_536);
     pdf.get_object_handle(flpdf::ObjectRef::new(3, 0))
-        .replace_key(b"/Contents", ObjectHandle::array(vec![raw_content]))
+        .replace_key(
+            b"/Contents",
+            ObjectHandle::array(vec![raw_content, ObjectHandle::integer(7)]),
+        )
         .expect("attach raw content stream");
 
     let mut writer = PdfWriter::new(&mut pdf);
@@ -665,6 +668,40 @@ fn linearized_normalizes_a_raw_page_content_and_drops_its_parameters() {
     assert!(
         !text.contains("/DecodeParms"),
         "normalized content must not retain the source parameter edge: {text}"
+    );
+}
+
+#[test]
+fn linearized_normalizes_a_raw_direct_page_content() {
+    let mut pdf = Pdf::open_mem_owned(matching_out_of_range_content_stream_with_parameters_pdf())
+        .expect("open raw content stream PDF");
+    let raw_content = pdf.get_object_handle_by_raw_identity(5, 65_536);
+    pdf.get_object_handle(flpdf::ObjectRef::new(3, 0))
+        .replace_key(b"/Contents", raw_content)
+        .expect("attach raw direct content stream");
+
+    let mut writer = PdfWriter::new(&mut pdf);
+    writer.set_linearization(true);
+    writer.set_object_stream_mode(ObjectStreamMode::Disable);
+    writer.set_content_normalization(true);
+    writer.set_compress_streams(false);
+    writer.set_static_id(true);
+    writer.set_output_memory().expect("install memory output");
+    writer
+        .write()
+        .expect("write normalized raw direct content linearization");
+    let output = writer
+        .get_buffer()
+        .expect("read normalized raw direct content linearization");
+    let text = String::from_utf8_lossy(&output);
+
+    assert!(
+        text.contains("q 1 0 0 1 0 0 cm Q"),
+        "raw direct page content must be normalized: {text}"
+    );
+    assert!(
+        !text.contains("parameter-only"),
+        "a parameter object removed by refiltering must not remain reachable: {text}"
     );
 }
 
