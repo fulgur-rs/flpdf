@@ -7,7 +7,7 @@
 use crate::error::EncryptedError;
 use crate::reader::resolver::{ResolverHandle, ResolverWarningOptions};
 use crate::reader::{PdfOpenOptions, ReopenableFile};
-use crate::xref::{load_xref_state_from_bytes, XrefLoadOptions};
+use crate::xref::{load_xref_state_from_source, XrefLoadOptions};
 #[allow(unused_imports)]
 use crate::{Error, ObjectHandle, QpdfErrorCode, QpdfExc, XrefForm};
 use crate::{Pdf, Result};
@@ -18,50 +18,6 @@ use std::path::Path;
 use std::rc::Rc;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
-
-/// Track whether a bootstrap source has reached its first read operation.
-/// `load_xref_state_with_options` seeks to the beginning before reading the
-/// whole source, so the caller must distinguish a seek failure from a failed
-/// read before applying qpdf's `FileInputSource::read` wording.
-struct BootstrapReadTracker<'a, R> {
-    reader: &'a mut R,
-    read_attempted: bool,
-}
-
-impl<R> BootstrapReadTracker<'_, R> {
-    fn new(reader: &mut R) -> BootstrapReadTracker<'_, R> {
-        BootstrapReadTracker {
-            reader,
-            read_attempted: false,
-        }
-    }
-}
-
-impl<R: Read> Read for BootstrapReadTracker<'_, R> {
-    fn read(&mut self, buffer: &mut [u8]) -> std::io::Result<usize> {
-        self.read_attempted = true;
-        self.reader.read(buffer)
-    }
-}
-
-impl<R: Seek> Seek for BootstrapReadTracker<'_, R> {
-    fn seek(&mut self, position: std::io::SeekFrom) -> std::io::Result<u64> {
-        self.reader.seek(position)
-    }
-}
-
-/// qpdf's initial `findFirst` scan asks its `FileInputSource` for 1024 bytes
-/// (`libqpdf/QPDF.cc:430-438`). A file-backed Rust bootstrap currently reads
-/// the source eagerly, so convert an I/O failure from that read into the same
-/// `QPDFExc` message before the generic `Error::Io` display adds platform text.
-fn qpdf_initial_read_error(description: &[u8], read_attempted: bool, error: Error) -> Error {
-    if description.is_empty() || !read_attempted || !matches!(&error, Error::Io(_)) {
-        return error;
-    }
-    let mut message = description.to_vec();
-    message.extend_from_slice(b": read 1024 bytes");
-    Error::SystemBytes(message)
-}
 
 /// Convert a terminal canonical open parse failure into qpdf's public
 /// `QPDFExc` shape before attaching the warnings collected by `QPDF::warn`.
@@ -87,19 +43,6 @@ fn qpdf_open_parse_error(description: &[u8], error: Error) -> Error {
         i64::try_from(offset).unwrap_or(i64::MAX),
         message.into_bytes(),
     ))
-}
-
-fn read_initial_source<R: Read + Seek>(reader: &mut R, description: &[u8]) -> Result<Vec<u8>> {
-    let mut tracked = BootstrapReadTracker::new(reader);
-    let result = (|| {
-        tracked.seek(std::io::SeekFrom::Start(0))?;
-        let mut bytes = Vec::new();
-        tracked.read_to_end(&mut bytes)?;
-        Ok(bytes)
-    })();
-    result.map_err(|error: std::io::Error| {
-        qpdf_initial_read_error(description, tracked.read_attempted, error.into())
-    })
 }
 
 static NEXT_PDF_ID: AtomicU64 = AtomicU64::new(1);
@@ -244,7 +187,7 @@ impl<R: Read + Seek> Pdf<R> {
     /// identity rather than a fresh one; `None` allocates a new identity for
     /// the ordinary factory functions.
     fn open_with_repair_mode_as(
-        mut reader: R,
+        reader: R,
         options: PdfOpenOptions,
         allow_bad_password: bool,
         unique_id: Option<u64>,
@@ -257,11 +200,6 @@ impl<R: Read + Seek> Pdf<R> {
             options.suppress_warnings,
             options.description.clone(),
         );
-        // Read the source through the same input boundary that will be owned
-        // by the document resolver.  The document itself is constructed before
-        // xref parsing below; only this byte snapshot is a scan aid for the
-        // existing xref/recovery code.
-        let source_bytes = read_initial_source(&mut reader, &options.description)?;
         let unique_id = unique_id.unwrap_or_else(|| NEXT_PDF_ID.fetch_add(1, Ordering::Relaxed));
         let resolver = ResolverHandle::new_shared(
             reader,
@@ -273,14 +211,13 @@ impl<R: Read + Seek> Pdf<R> {
             warning_options.clone(),
             unique_id,
         );
-        let loaded_state = match load_xref_state_from_bytes(
-            &source_bytes,
+        let loaded_state = match load_xref_state_from_source(
+            resolver.as_ref(),
             XrefLoadOptions {
                 allow_repair: options.repair,
                 ignore_xref_streams: options.ignore_xref_streams,
                 description: options.description.clone(),
             },
-            Some(resolver.as_ref()),
         ) {
             Ok(state) => state,
             Err(error @ Error::Parse { .. }) => {

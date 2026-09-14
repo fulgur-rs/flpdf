@@ -82,6 +82,13 @@ pub(crate) trait CanonicalTrailerOwner {
     fn direct_handle(&self, value: ObjectValue) -> ObjectHandle;
     fn install_xref_entries(&self, entries: BTreeMap<ObjectRef, XrefEntry>);
     fn set_header_offset(&self, offset: usize);
+    /// qpdf's live `m->file` source boundary (`QPDF.hh:67-97,1453-1457`).
+    /// Canonical xref loading uses these operations instead of a complete
+    /// input snapshot; the owner-less loader remains byte-slice based.
+    fn source_seek(&self, offset: u64) -> Result<()>;
+    fn source_tell(&self) -> Result<u64>;
+    fn source_length(&self) -> Result<u64>;
+    fn source_read(&self, buffer: &mut [u8]) -> Result<usize>;
     /// Enter the document's parse guard, mirroring qpdf's `QPDF::readTrailer`
     /// constructing its parser with `this` as the context
     /// (`libqpdf/QPDF.cc:1317`), which is what arms `QPDF::ParseGuard`.
@@ -104,7 +111,117 @@ pub(crate) trait CanonicalTrailerOwner {
     fn repair_diagnostics(&self) -> Diagnostics;
 }
 
+/// Buffer warnings while a bounded source-window parse is speculative.
+/// qpdf retries a failed xref read through one document warning collection; a
+/// failed window must therefore not deliver warnings before the full-source
+/// recovery fallback gets its chance to own the same sequence.
+struct BufferedCanonicalTrailerOwner<'a> {
+    owner: &'a dyn CanonicalTrailerOwner,
+    warnings: RefCell<Diagnostics>,
+}
+
+impl<'a> BufferedCanonicalTrailerOwner<'a> {
+    fn new(owner: &'a dyn CanonicalTrailerOwner) -> Self {
+        Self {
+            owner,
+            warnings: RefCell::new(Diagnostics::default()),
+        }
+    }
+
+    fn flush(self) -> Result<()> {
+        for warning in self.warnings.into_inner().entries() {
+            self.owner.push_warning(warning.clone())?;
+        }
+        Ok(())
+    }
+}
+
+impl CanonicalTrailerOwner for BufferedCanonicalTrailerOwner<'_> {
+    fn indirect_handle(&self, object_ref: ObjectRef) -> ObjectHandle {
+        self.owner.indirect_handle(object_ref)
+    }
+
+    fn direct_handle(&self, value: ObjectValue) -> ObjectHandle {
+        self.owner.direct_handle(value)
+    }
+
+    fn install_xref_entries(&self, entries: BTreeMap<ObjectRef, XrefEntry>) {
+        self.owner.install_xref_entries(entries);
+    }
+
+    fn set_header_offset(&self, offset: usize) {
+        self.owner.set_header_offset(offset);
+    }
+
+    fn source_seek(&self, offset: u64) -> Result<()> {
+        self.owner.source_seek(offset)
+    }
+
+    fn source_tell(&self) -> Result<u64> {
+        self.owner.source_tell()
+    }
+
+    fn source_length(&self) -> Result<u64> {
+        self.owner.source_length()
+    }
+
+    fn source_read(&self, buffer: &mut [u8]) -> Result<usize> {
+        self.owner.source_read(buffer)
+    }
+
+    fn begin_parse(&self) -> Result<()> {
+        self.owner.begin_parse()
+    }
+
+    fn end_parse(&self) {
+        self.owner.end_parse();
+    }
+
+    fn read_object_at_offset(
+        &self,
+        offset: u64,
+        expected: ObjectRef,
+        description: Option<Vec<u8>>,
+    ) -> Result<(ObjectHandle, Option<u64>)> {
+        self.owner
+            .read_object_at_offset(offset, expected, description)
+    }
+
+    fn read_xref_stream_at_offset(
+        &self,
+        offset: u64,
+        description: Option<Vec<u8>>,
+    ) -> Result<(ObjectHandle, Option<u64>)> {
+        self.owner.read_xref_stream_at_offset(offset, description)
+    }
+
+    fn push_warning(&self, warning: QpdfExc) -> Result<()> {
+        self.warnings.borrow_mut().push(warning);
+        Ok(())
+    }
+
+    fn repair_diagnostics(&self) -> Diagnostics {
+        self.owner.repair_diagnostics()
+    }
+}
+
 impl<R: Read + Seek + 'static> CanonicalTrailerOwner for ResolverHandle<R> {
+    fn source_seek(&self, offset: u64) -> Result<()> {
+        self.seek(offset)
+    }
+
+    fn source_tell(&self) -> Result<u64> {
+        self.tell()
+    }
+
+    fn source_length(&self) -> Result<u64> {
+        ResolverHandle::source_length(self)
+    }
+
+    fn source_read(&self, buffer: &mut [u8]) -> Result<usize> {
+        self.read(buffer)
+    }
+
     fn begin_parse(&self) -> crate::Result<()> {
         self.in_parse(true)
     }
@@ -1899,6 +2016,148 @@ pub(crate) fn load_xref_state_with_options<R: Read + Seek>(
     load_xref_state_from_bytes(&source_bytes, options, None)
 }
 
+fn read_live_source_range(
+    owner: &dyn CanonicalTrailerOwner,
+    offset: u64,
+    length: usize,
+) -> Result<Vec<u8>> {
+    owner.source_seek(offset)?;
+    let mut bytes = Vec::with_capacity(length);
+    let mut chunk = vec![0u8; 64 * 1024];
+    while bytes.len() < length {
+        let requested = (length - bytes.len()).min(chunk.len());
+        let read = owner.source_read(&mut chunk[..requested])?;
+        if read == 0 {
+            return Err(Error::parse(
+                usize::try_from(
+                    owner
+                        .source_tell()
+                        .unwrap_or(offset.saturating_add(bytes.len() as u64)),
+                )
+                .unwrap_or(usize::MAX),
+                "unexpected end of input source",
+            ));
+        }
+        bytes.extend_from_slice(&chunk[..read]);
+    }
+    Ok(bytes)
+}
+
+/// Canonical `Pdf::open` xref loading through qpdf's live input-source
+/// boundary. The initial implementation keeps bounded prefix/tail/xref
+/// windows; owner-less tests continue to use the byte-slice loader above.
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn load_xref_state_from_source(
+    owner: &dyn CanonicalTrailerOwner,
+    options: XrefLoadOptions,
+) -> Result<LoadedXrefState> {
+    let physical_length = owner.source_length()?;
+    let prefix_length = usize::try_from(physical_length.min(1024)).unwrap_or(1024);
+    let prefix = read_live_source_range(owner, 0, prefix_length)?;
+    let mut initial_diagnostics = Diagnostics::default();
+    let (version, header_offset) = match find_qpdf_header(&prefix) {
+        Some((offset, version)) => (version, offset),
+        None => {
+            initial_diagnostics.push(damaged_warning(
+                &options.description,
+                b"",
+                "can't find PDF header",
+                None,
+            ));
+            ("1.2".to_string(), 0)
+        }
+    };
+    owner.set_header_offset(header_offset);
+    deliver_canonical_diagnostics(Some(owner), &mut initial_diagnostics)?;
+
+    let logical_length = physical_length.saturating_sub(header_offset as u64);
+    let tail_length = usize::try_from(logical_length.min(1054)).unwrap_or(1054);
+    let tail_start = logical_length.saturating_sub(tail_length as u64);
+    let tail = read_live_source_range(owner, tail_start, tail_length)?;
+    let startxref = match parse_startxref(&tail) {
+        Ok(offset) => offset,
+        Err(error) if options.allow_repair => {
+            // Recovery still needs the existing byte-slice scanner until its
+            // source-window port lands; retain the qpdf error boundary while
+            // keeping the normal valid-xref route snapshot-free.
+            let _ = error;
+            let all = read_live_source_range(
+                owner,
+                0,
+                usize::try_from(logical_length)
+                    .map_err(|_| Error::parse(0, "input source is too large for this target"))?,
+            )?;
+            return load_xref_state_from_bytes(&all, options, Some(owner));
+        }
+        Err(error) => return Err(error),
+    };
+    let xref_end = logical_length
+        .checked_sub(startxref)
+        .ok_or_else(|| Error::parse(0, "startxref is beyond the input source"))?;
+    let xref_window = read_live_source_range(
+        owner,
+        startxref,
+        usize::try_from(xref_end)
+            .map_err(|_| Error::parse(0, "xref window is too large for this target"))?,
+    )?;
+    // A classic xref section must expose the literal `xref` keyword before
+    // any document-owned handles are installed. If the keyword itself is
+    // corrupt, skip the speculative canonical attempt so recovery starts from
+    // a clean resolver state.
+    let first_non_space = xref_window.iter().position(|byte| !is_pdf_space(*byte));
+    let starts_classic_xref = first_non_space
+        .and_then(|pos| xref_window.get(pos..))
+        .is_some_and(|tail| tail.starts_with(b"xref"));
+    let looks_like_xref_stream = first_non_space
+        .and_then(|pos| xref_window.get(pos..pos.saturating_add(1024)))
+        .is_some_and(|window| {
+            window
+                .windows(b"/Type /XRef".len())
+                .any(|bytes| bytes == b"/Type /XRef")
+        });
+    if options.allow_repair && !starts_classic_xref && !looks_like_xref_stream {
+        let all = read_live_source_range(
+            owner,
+            0,
+            usize::try_from(logical_length)
+                .map_err(|_| Error::parse(0, "input source is too large for this target"))?,
+        )?;
+        return load_xref_state_from_bytes(&all, options, Some(owner));
+    }
+    let buffered_owner = BufferedCanonicalTrailerOwner::new(owner);
+    let window_result = load_xref_state_from_window(
+        &xref_window,
+        startxref,
+        version,
+        header_offset,
+        startxref,
+        options.clone(),
+        Diagnostics::default(),
+        Vec::new(),
+        Some(&buffered_owner),
+    );
+    match window_result {
+        Ok(state) => {
+            buffered_owner.flush()?;
+            Ok(state)
+        }
+        Err(error) if options.allow_repair => {
+            // A malformed initial section can require the full-document line
+            // scan. Keep that recovery fallback source-correct until the
+            // streaming reconstruction scanner is migrated as its own slice.
+            let all = read_live_source_range(
+                owner,
+                0,
+                usize::try_from(logical_length)
+                    .map_err(|_| Error::parse(0, "input source is too large for this target"))?,
+            )?;
+            let _ = error;
+            load_xref_state_from_bytes(&all, options, Some(owner))
+        }
+        Err(error) => Err(error),
+    }
+}
+
 /// Load xref state from bytes that were read by the document's own input
 /// source.  When `canonical_trailer_owner` is present, the initial classic
 /// trailer is parsed directly into that owner instead of being rebuilt through
@@ -1909,8 +2168,6 @@ pub(crate) fn load_xref_state_from_bytes(
     options: XrefLoadOptions,
     canonical_trailer_owner: Option<&dyn CanonicalTrailerOwner>,
 ) -> Result<LoadedXrefState> {
-    let allow_repair = options.allow_repair;
-
     let mut initial_diagnostics = Diagnostics::default();
     // qpdf's QPDF::parse always calls findHeader before it considers
     // attempt_recovery (`QPDF.cc:429-438`). A missing or malformed header is a
@@ -1934,7 +2191,60 @@ pub(crate) fn load_xref_state_from_bytes(
     }
     deliver_canonical_diagnostics(canonical_trailer_owner, &mut initial_diagnostics)?;
     let bytes = &source_bytes[header_offset..];
-    let mut parse_errors = Vec::new();
+    let startxref = match parse_startxref(bytes) {
+        Ok(offset) => offset,
+        Err(error) if options.allow_repair => {
+            return load_xref_state_from_window(
+                bytes,
+                0,
+                version,
+                header_offset,
+                0,
+                options,
+                std::mem::take(&mut initial_diagnostics),
+                vec![error],
+                canonical_trailer_owner,
+            );
+        }
+        Err(error) => return Err(error),
+    };
+    load_xref_state_from_window(
+        bytes,
+        0,
+        version,
+        header_offset,
+        startxref,
+        options,
+        initial_diagnostics,
+        Vec::new(),
+        canonical_trailer_owner,
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
+fn load_xref_state_from_window(
+    bytes: &[u8],
+    source_base: u64,
+    version: String,
+    header_offset: usize,
+    startxref: u64,
+    options: XrefLoadOptions,
+    mut initial_diagnostics: Diagnostics,
+    mut parse_errors: Vec<Error>,
+    canonical_trailer_owner: Option<&dyn CanonicalTrailerOwner>,
+) -> Result<LoadedXrefState> {
+    let allow_repair = options.allow_repair;
+    let xref_pos = match startxref
+        .checked_sub(source_base)
+        .and_then(|offset| usize::try_from(offset).ok())
+    {
+        Some(xref_pos) => xref_pos,
+        None if allow_repair => {
+            parse_errors.push(Error::parse(0, "startxref does not fit source window"));
+            0
+        }
+        None => return Err(Error::parse(0, "startxref does not fit source window")),
+    };
     // qpdf-deviation-start: qpdf's xref_offset == 0 check
     // (`QPDF.cc:450-452`) throws damagedPDF("can't find startxref")
     // immediately and never calls read_xref at all -- whether xref_offset is
@@ -1947,26 +2257,6 @@ pub(crate) fn load_xref_state_from_bytes(
     // remaining owner-less recovery path is entered only after this qpdf
     // guard has classified the zero offset as the `can't find startxref`
     // trigger; no route reads a speculative xref at logical offset zero.
-    let startxref = match parse_startxref(bytes) {
-        Ok(offset) => offset,
-        Err(error) if allow_repair => {
-            parse_errors.push(error);
-            0
-        }
-        Err(error) => return Err(error),
-    };
-    let xref_pos = match usize::try_from(startxref) {
-        Ok(xref_pos) => xref_pos,
-        // cov:ignore-start: converting the u64 startxref offset can overflow
-        // only on a 32-bit target; the supported CI target is 64-bit.
-        Err(_) if allow_repair => {
-            parse_errors.push(Error::parse(0, "startxref does not fit usize"));
-            0
-        }
-        // cov:ignore-end
-        Err(_) => return Err(Error::parse(0, "startxref does not fit usize")), // cov:ignore: the same u64-to-usize overflow is unrepresentable on the supported target
-    };
-
     if startxref == 0 {
         if !allow_repair {
             return Err(Error::parse(0, "can't find startxref"));
@@ -2027,6 +2317,7 @@ pub(crate) fn load_xref_state_from_bytes(
             parse_xref_from_start_with_owner(
                 bytes,
                 xref_pos,
+                source_base,
                 startxref,
                 &version,
                 options.clone(),
@@ -2124,6 +2415,7 @@ pub(crate) fn load_xref_state_from_bytes(
     let mut previous_parse_diagnostics = Diagnostics::default();
     if let Err(error) = merge_previous_xref_sections_with_observer(
         bytes,
+        source_base,
         &version,
         &mut loaded,
         options.clone(),
@@ -2342,6 +2634,7 @@ fn parse_xref_from_start(
     parse_xref_from_start_with_owner(
         bytes,
         xref_pos,
+        0,
         startxref,
         version,
         options,
@@ -2358,6 +2651,7 @@ fn parse_xref_from_start(
 fn parse_xref_from_start_with_owner(
     bytes: &[u8],
     xref_pos: usize,
+    source_base: u64,
     startxref: u64,
     version: &str,
     options: XrefLoadOptions,
@@ -2371,6 +2665,7 @@ fn parse_xref_from_start_with_owner(
     parse_xref_from_start_with_owner_and_build_diagnostics(
         bytes,
         xref_pos,
+        source_base,
         startxref,
         version,
         options,
@@ -2388,6 +2683,7 @@ fn parse_xref_from_start_with_owner(
 fn parse_xref_from_start_with_owner_and_build_diagnostics(
     bytes: &[u8],
     xref_pos: usize,
+    source_base: u64,
     startxref: u64,
     version: &str,
     options: XrefLoadOptions,
@@ -2435,7 +2731,12 @@ fn parse_xref_from_start_with_owner_and_build_diagnostics(
                 None,
             )
         });
-        let mut cursor = ByteCursor::new(bytes, xref_pos + skip);
+        let base = usize::try_from(source_base).unwrap_or(usize::MAX);
+        let mut cursor = ByteCursor::with_base(
+            bytes,
+            base,
+            base.saturating_add(xref_pos).saturating_add(skip),
+        );
         let table = parse_xref_table(
             &mut cursor,
             bytes,
@@ -2490,6 +2791,7 @@ fn parse_xref_from_start_with_owner_and_build_diagnostics(
             read_trailer(
                 bytes,
                 trailer_start,
+                base,
                 &options.description,
                 &mut trailer_parser,
             )?
@@ -2504,6 +2806,7 @@ fn parse_xref_from_start_with_owner_and_build_diagnostics(
             read_trailer(
                 bytes,
                 trailer_start,
+                base,
                 &options.description,
                 &mut trailer_parser,
             )?
@@ -2644,9 +2947,13 @@ fn parse_xref_from_start_with_owner_and_build_diagnostics(
         return Ok(loaded);
     }
 
+    let absolute_xref_pos = source_base
+        .saturating_add(xref_pos as u64)
+        .try_into()
+        .unwrap_or(usize::MAX);
     match parse_xref_stream(
         bytes,
-        xref_pos,
+        absolute_xref_pos,
         startxref,
         version.to_string(),
         options.clone(),
@@ -2976,6 +3283,7 @@ fn merge_xref_stream_from_classic_trailer_with_build_diagnostics(
 #[allow(clippy::too_many_arguments)]
 fn merge_previous_xref_sections(
     bytes: &[u8],
+    source_base: u64,
     version: &str,
     loaded: &mut LoadedXrefState,
     options: XrefLoadOptions,
@@ -2986,6 +3294,7 @@ fn merge_previous_xref_sections(
 ) -> Result<()> {
     merge_previous_xref_sections_with_observer(
         bytes,
+        source_base,
         version,
         loaded,
         options.clone(),
@@ -3000,6 +3309,7 @@ fn merge_previous_xref_sections(
 #[allow(clippy::too_many_arguments)]
 fn merge_previous_xref_sections_with_observer(
     bytes: &[u8],
+    source_base: u64,
     version: &str,
     loaded: &mut LoadedXrefState,
     options: XrefLoadOptions,
@@ -3049,7 +3359,7 @@ fn merge_previous_xref_sections_with_observer(
     }
 
     while let Some(offset) = previous_offset {
-        let previous_pos = usize::try_from(offset)
+        let previous_pos = usize::try_from(offset.saturating_sub(source_base))
             .map_err(|_| Error::parse(0, "xref /Prev does not fit usize"))?;
 
         if !visited.insert(offset) {
@@ -3061,6 +3371,7 @@ fn merge_previous_xref_sections_with_observer(
         let previous_result = parse_xref_from_start_with_owner_and_build_diagnostics(
             bytes,
             previous_pos,
+            source_base,
             offset,
             version,
             options.clone(),
@@ -3750,6 +4061,7 @@ fn recover_trailer_from_xref_stream_candidate(
     let reentry_result = parse_xref_from_start_with_owner(
         bytes,
         max_offset as usize,
+        0,
         max_offset,
         version,
         options.clone(),
@@ -3798,6 +4110,7 @@ fn recover_trailer_from_xref_stream_candidate(
     let mut previous_failure_diagnostics = Diagnostics::default();
     if merge_previous_xref_sections(
         bytes,
+        0,
         version,
         &mut reentry,
         options.clone(),
@@ -4344,11 +4657,13 @@ fn is_classic_trailer_validation_message(message: &str) -> bool {
 fn read_trailer(
     input: &[u8],
     start: usize,
+    base: usize,
     filename: &[u8],
     resolver: &mut dyn HandleResolver,
 ) -> Result<(ObjectHandle, Vec<QpdfExc>)> {
+    let local_start = start.checked_sub(base).unwrap_or(input.len());
     let slice = input
-        .get(start..)
+        .get(local_start..)
         .ok_or_else(|| Error::parse(start, "trailer is not a dictionary"))?;
     let parsed = parse_qpdf_file_object_handle_with_diagnostics(
         slice,
@@ -4401,10 +4716,10 @@ fn parse_trailer_candidate(
     // dictionary, a different object, or an error.
     let result = if let Some(owner) = canonical_trailer_owner {
         let mut resolver = CanonicalTrailerParser { owner };
-        read_trailer(bytes, start, filename, &mut resolver)
+        read_trailer(bytes, start, 0, filename, &mut resolver)
     } else {
         let mut resolver = XrefDetachedHandles;
-        read_trailer(bytes, start, filename, &mut resolver)
+        read_trailer(bytes, start, 0, filename, &mut resolver)
     };
     let (trailer, diagnostics) = match result {
         Ok((handle, diagnostics)) => (
@@ -5197,7 +5512,7 @@ fn parse_xref_stream_with_canonical_owner(
     owner.install_xref_entries(registration.snapshot());
     let mut context = CanonicalXrefContext::new(owner, options.description.clone());
     let (handle_object, _) =
-        match owner.read_xref_stream_at_offset(xref_pos as u64, Some(b"xref stream".to_vec())) {
+        match owner.read_xref_stream_at_offset(startxref, Some(b"xref stream".to_vec())) {
             Ok(read) => read,
             Err(error) => {
                 let mut diagnostics = Diagnostics::default();
@@ -5573,16 +5888,30 @@ fn parse_startxref(bytes: &[u8]) -> Result<u64> {
 
 struct ByteCursor<'a> {
     bytes: &'a [u8],
+    base: usize,
     pos: usize,
 }
 
 impl<'a> ByteCursor<'a> {
     fn new(bytes: &'a [u8], pos: usize) -> Self {
-        Self { bytes, pos }
+        Self::with_base(bytes, 0, pos)
+    }
+
+    fn with_base(bytes: &'a [u8], base: usize, pos: usize) -> Self {
+        Self { bytes, base, pos }
+    }
+
+    fn local_pos(&self) -> Option<usize> {
+        self.pos.checked_sub(self.base)
     }
 
     fn skip_ws(&mut self) {
-        while self.bytes.get(self.pos).copied().is_some_and(is_pdf_space) {
+        while self
+            .local_pos()
+            .and_then(|pos| self.bytes.get(pos))
+            .copied()
+            .is_some_and(is_pdf_space)
+        {
             self.pos += 1;
         }
     }
@@ -5590,47 +5919,53 @@ impl<'a> ByteCursor<'a> {
     fn read_token(&mut self) -> Result<Token> {
         let mut tokenizer = Tokenizer::new(self.bytes);
         tokenizer.allow_eof();
-        tokenizer.set_position(self.pos)?;
-        let token = tokenizer.read_token(false, 0)?;
-        self.pos = tokenizer.position();
+        tokenizer.set_position(self.local_pos().unwrap_or(self.bytes.len()))?;
+        let mut token = tokenizer.read_token(false, 0)?;
+        self.pos = self.base.saturating_add(tokenizer.position());
+        token.start = token.start.saturating_add(self.base);
+        token.end = token.end.saturating_add(self.base);
+        token.error_offset = token.error_offset.saturating_add(self.base);
         Ok(token)
     }
 
     fn peek_word(&self, word: &[u8]) -> bool {
-        self.bytes
-            .get(self.pos..)
+        self.local_pos()
+            .and_then(|pos| self.bytes.get(pos..))
             .is_some_and(|tail| tail.starts_with(word))
             && self
-                .bytes
-                .get(self.pos + word.len())
+                .local_pos()
+                .and_then(|pos| self.bytes.get(pos.saturating_add(word.len())))
                 .is_none_or(|byte| is_pdf_delimiter(*byte))
     }
 
     fn read_be_u64(&mut self, width: usize) -> Result<u64> {
-        if self.pos + width > self.bytes.len() {
+        let Some(local) = self.local_pos() else {
+            return Err(Error::parse(self.pos, "unexpected end of stream field"));
+        };
+        if local + width > self.bytes.len() {
             return Err(Error::parse(self.pos, "unexpected end of stream field"));
         }
 
         let mut value = 0u64;
-        for _ in 0..width {
-            value = (value << 8) | u64::from(self.bytes[self.pos]);
-            self.pos += 1;
+        for index in local..local + width {
+            value = (value << 8) | u64::from(self.bytes[index]);
         }
+        self.pos = self.pos.saturating_add(width);
         Ok(value)
     }
 
     fn read_line(&mut self, max_len: usize) -> Vec<u8> {
-        let start = self.pos;
-        let mut end = start;
+        let local_start = self.local_pos().unwrap_or(self.bytes.len());
+        let mut end = local_start;
         while end < self.bytes.len() && !matches!(self.bytes[end], b'\n' | b'\r') {
             end += 1;
         }
-        let line_end = (start + max_len).min(end);
-        let line = self.bytes[start..line_end].to_vec();
-        self.pos = end;
+        let line_end = (local_start + max_len).min(end);
+        let line = self.bytes[local_start..line_end].to_vec();
+        self.pos = self.base.saturating_add(end);
         while self
             .bytes
-            .get(self.pos)
+            .get(self.local_pos().unwrap_or(self.bytes.len()))
             .is_some_and(|byte| matches!(byte, b'\n' | b'\r'))
         {
             self.pos += 1;
@@ -5639,9 +5974,9 @@ impl<'a> ByteCursor<'a> {
     }
 
     fn read_bytes(&mut self, max_len: usize) -> Vec<u8> {
-        let start = self.pos;
+        let start = self.local_pos().unwrap_or(self.bytes.len());
         let end = start.saturating_add(max_len).min(self.bytes.len());
-        self.pos = end;
+        self.pos = self.base.saturating_add(end);
         self.bytes[start..end].to_vec()
     }
 }
@@ -7323,6 +7658,7 @@ mod final_handle_tests {
         parse_xref_from_start_with_owner(
             &bytes,
             xref,
+            0,
             xref as u64,
             "1.7",
             XrefLoadOptions::default(),
@@ -7623,6 +7959,7 @@ mod final_handle_tests {
         let error = parse_xref_from_start_with_owner(
             &bytes,
             xref,
+            0,
             xref as u64,
             "1.4",
             XrefLoadOptions {
@@ -8038,6 +8375,7 @@ mod final_handle_tests {
 
         let error = merge_previous_xref_sections(
             b"",
+            0,
             "1.4",
             &mut loaded,
             XrefLoadOptions::default(),
@@ -8083,6 +8421,7 @@ mod final_handle_tests {
 
         let error = merge_previous_xref_sections(
             &bytes,
+            0,
             "1.4",
             &mut loaded,
             XrefLoadOptions {
@@ -8114,6 +8453,7 @@ mod final_handle_tests {
 
         merge_previous_xref_sections(
             &bytes,
+            0,
             "1.5",
             &mut loaded,
             XrefLoadOptions {
@@ -8163,6 +8503,7 @@ mod final_handle_tests {
 
         merge_previous_xref_sections(
             &bytes,
+            0,
             "1.5",
             &mut loaded,
             XrefLoadOptions {
@@ -8215,6 +8556,7 @@ mod final_handle_tests {
 
         merge_previous_xref_sections(
             &bytes,
+            0,
             "1.4",
             &mut loaded,
             XrefLoadOptions {
@@ -8252,6 +8594,7 @@ mod final_handle_tests {
 
         let error = merge_previous_xref_sections(
             &bytes,
+            0,
             "1.4",
             &mut loaded,
             XrefLoadOptions {
@@ -8291,6 +8634,7 @@ mod final_handle_tests {
         let mut registration = XrefRegistration::default();
         merge_previous_xref_sections(
             b"",
+            0,
             "1.4",
             &mut previous_loaded,
             XrefLoadOptions::default(),
