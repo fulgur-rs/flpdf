@@ -507,8 +507,6 @@ fn linearized_keeps_a_raw_generation_child_shared_by_pages() {
     writer.set_output_memory().expect("install memory output");
     writer.write().expect("write shared raw-child output");
     let output = writer.get_buffer().expect("read shared raw-child output");
-    std::fs::write("/tmp/flpdf-474u8-linearized-shared.pdf", &output)
-        .expect("save shared raw-child output for qpdf check");
     let text = String::from_utf8_lossy(&output);
 
     assert!(text.contains("/RawChild "));
