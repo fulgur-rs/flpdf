@@ -125,6 +125,7 @@ pub(crate) enum HintStreamMode {
 
 /// The canonical writer result. Unlike [`HintStreamBytes`], this value owns
 /// only the representation selected by the writer's stream policy.
+#[derive(Debug)]
 pub(crate) struct SelectedHintStream {
     pub(crate) payload: Vec<u8>,
     pub(crate) shared_section_offset_in_uncompressed: usize,
@@ -899,6 +900,24 @@ mod tests {
                 dual.outline_section_offset_in_uncompressed
             );
         }
+    }
+
+    #[test]
+    fn selected_compressed_hint_reports_flate_setup_failure() {
+        let tables = minimal_tables();
+        let err = encode_hint_stream_selected_with_out_buffer_size(
+            &tables.0,
+            &tables.1,
+            None,
+            HintStreamMode::Compressed,
+            0,
+        )
+        .expect_err("zero selected output buffer must fail");
+        assert!(matches!(
+            err,
+            crate::Error::System(ref message)
+                if message == "Pl_Flate: output buffer size must be greater than zero"
+        ));
     }
 
     #[test]
