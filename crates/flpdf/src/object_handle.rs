@@ -1244,7 +1244,7 @@ impl SharedValueState {
         self.identity.qpdf_obj_gen.or_else(|| {
             self.identity
                 .object_ref
-                .map(QpdfObjGen::from_valid_object_ref)
+                .and_then(|object_ref| QpdfObjGen::try_from_object_ref(object_ref).ok())
         })
     }
 
@@ -1988,13 +1988,16 @@ impl ObjectHandle {
         pdf_unique_id: u64,
         resolver: Weak<dyn DocumentResolver>,
     ) -> Self {
+        let Some(qpdf_obj_gen) = QpdfObjGen::try_from_object_ref(object_ref).ok() else {
+            return Self::uninitialized();
+        };
         let handle = Self(Rc::new(RefCell::new(ObjectSlot {
             initialized: true,
             shared: new_shared_value_state(
                 ObjectValue::Reserved,
                 ValueIdentity {
                     object_ref: Some(object_ref),
-                    qpdf_obj_gen: Some(QpdfObjGen::from_valid_object_ref(object_ref)),
+                    qpdf_obj_gen: Some(qpdf_obj_gen),
                     active_pdf_unique_id: NonZeroU64::new(pdf_unique_id),
                     resolver: Some(resolver),
                 },
@@ -2063,8 +2066,11 @@ impl ObjectHandle {
         pdf_unique_id: Option<u64>,
         resolver: Option<Weak<dyn DocumentResolver>>,
     ) -> Self {
+        let Some(qpdf_obj_gen) = QpdfObjGen::try_from_object_ref(object_ref).ok() else {
+            return Self::uninitialized();
+        };
         let handle = Self::new_indirect_unresolved_qpdf_obj_gen_with_identity(
-            QpdfObjGen::from_valid_object_ref(object_ref),
+            qpdf_obj_gen,
             offset,
             pdf_unique_id,
             resolver,
@@ -2310,10 +2316,13 @@ impl ObjectHandle {
         pdf_unique_id: u64,
         resolver: Weak<dyn DocumentResolver>,
     ) -> Self {
+        let Some(qpdf_obj_gen) = QpdfObjGen::try_from_object_ref(object_ref).ok() else {
+            return Self::uninitialized();
+        };
         let shared = self.0.borrow().shared.clone();
         shared.borrow_mut().identity = ValueIdentity {
             object_ref: Some(object_ref),
-            qpdf_obj_gen: Some(QpdfObjGen::from_valid_object_ref(object_ref)),
+            qpdf_obj_gen: Some(qpdf_obj_gen),
             active_pdf_unique_id: NonZeroU64::new(pdf_unique_id),
             resolver: Some(resolver),
         };

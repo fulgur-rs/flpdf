@@ -29,6 +29,11 @@ impl ObjectRef {
         let number = parts[0]
             .parse::<u32>()
             .map_err(|_| ParseObjectRefError::new(format!("invalid object number in '{input}'")))?;
+        if number > i32::MAX as u32 {
+            return Err(ParseObjectRefError::new(format!(
+                "integer out of range converting {number} from a 4-byte unsigned type to a 4-byte signed type"
+            )));
+        }
         let generation = parts[1].parse::<u16>().map_err(|_| {
             ParseObjectRefError::new(format!("invalid object generation in '{input}'"))
         })?;
@@ -80,5 +85,12 @@ mod tests {
     fn malformed_reference_error_displays_its_qpdf_style_message() {
         let error = ObjectRef::parse("7 nope").expect_err("generation must be numeric");
         assert_eq!(error.to_string(), "invalid object generation in '7 nope'");
+    }
+
+    #[test]
+    fn object_number_parse_rejects_qpdf_signed_integer_overflow() {
+        let error = ObjectRef::parse("2147483648 0 R")
+            .expect_err("object numbers above qpdf's signed-int range must be rejected");
+        assert!(error.to_string().contains("out of range"));
     }
 }

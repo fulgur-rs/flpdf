@@ -27,12 +27,6 @@ impl QpdfObjGen {
         Self { object, generation }
     }
 
-    /// Construct an identity after qpdf signed-int validation.
-    pub(crate) fn from_valid_object_ref(object_ref: ObjectRef) -> Self {
-        Self::try_from_object_ref(object_ref)
-            .expect("a canonical qpdf object identity must fit qpdf signed int")
-    }
-
     /// Convert a Rust object reference through qpdf's checked `int` boundary
     /// (`QIntC::to_int`, `include/qpdf/QPDF.hh:1429-1444`).
     pub(crate) fn try_from_object_ref(object_ref: ObjectRef) -> crate::Result<Self> {
@@ -43,6 +37,11 @@ impl QpdfObjGen {
             ))
         })?;
         Ok(Self::new(object, i32::from(object_ref.generation)))
+    }
+
+    #[cfg(test)]
+    pub(crate) fn from_valid_object_ref_for_test(object_ref: ObjectRef) -> Self {
+        Self::try_from_object_ref(object_ref).expect("test object reference must fit qpdf int")
     }
 
     /// Match `QPDFObjGen::isIndirect`: only object number zero is non-indirect.
