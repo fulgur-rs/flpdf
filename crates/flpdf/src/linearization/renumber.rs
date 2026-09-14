@@ -12,8 +12,9 @@
 //! | 1..M        | part7: other pages' private objects (qpdf part7). |
 //! | M+1..N      | part8: other pages' shared objects (qpdf part8). |
 //! | N+1         | Pages tree (qpdf part9 head). Skipped if absent. |
-//! | N+2..O      | part9 outline objects (qpdf `lc_outlines`, classic). Skipped if absent. |
-//! | O+1..P      | Remaining `part4_rest` / Part-9 tail objects — qpdf `lc_other` (includes `/Info` and thumbnails demoted from a thumbnail category). Skipped if absent. |
+//! | N+2..O      | Part-9 thumbnail objects (private by page, then shared). Skipped if absent. |
+//! | O+1..P      | part9 outline objects (qpdf `lc_outlines`, classic). Skipped if absent. |
+//! | P+1..Q      | Remaining `part4_rest` / Part-9 tail objects — qpdf `lc_other` (includes `/Info` and thumbnails demoted from a thumbnail category). Skipped if absent. |
 //! | param       | **Reserved** — linearization parameter dictionary (Part 1). |
 //! | catalog     | Catalog (qpdf `lc_root`). Skipped if absent. |
 //! | hint        | **Reserved** — primary hint stream. |
@@ -173,19 +174,21 @@ impl RenumberMap {
     /// 2. **part8**: `plan.part4_other_pages_shared` in plan order.
     /// 3. **pages tree**: `plan.pages_tree_ref` when in `part4_rest` (qpdf places
     ///    the pages tree first in part9, ahead of the remaining `lc_other` set).
-    /// 4. **part9 outline objects**: `plan.part9_outline_objects` (classic,
+    /// 4. **Part-9 thumbnail objects**: `plan.part9_thumbnail_objects`, with
+    ///    private objects grouped by page and shared objects after them.
+    /// 5. **part9 outline objects**: `plan.part9_outline_objects` (classic,
     ///    `!UseOutlines`).
-    /// 5. **Remaining `part4_rest`**, object-number sorted: qpdf's remaining
+    /// 6. **Remaining `part4_rest`**, object-number sorted: qpdf's remaining
     ///    `lc_other` set. This includes `/Info` (`plan.info_ref`) — placed here in
     ///    original-object-number order, NOT in a reserved head slot — and
     ///    thumbnail objects that qpdf demotes to `lc_other`. Refs already placed above (pages tree, outlines)
     ///    and `plan.root_ref` (kept first-half, promoted at step 7) are skipped so
     ///    each ref maps exactly once.
-    /// 6. **Param dict** (reserved sentinel): linearization parameter dict.
-    /// 7. **Catalog**: `plan.root_ref` when in `part4_rest`.
-    /// 8. **Hint stream** (reserved sentinel): primary hint stream.
-    /// 9. Part 2 objects in plan order.
-    /// 10. Part 3 objects in plan order.
+    /// 7. **Param dict** (reserved sentinel): linearization parameter dict.
+    /// 8. **Catalog**: `plan.root_ref` when in `part4_rest`.
+    /// 9. **Hint stream** (reserved sentinel): primary hint stream.
+    /// 10. Part 2 objects in plan order.
+    /// 11. Part 3 objects in plan order.
     ///
     /// A ref counts as *promotable* when the [`Option`] is `Some(r)` and `r`
     /// is a member of `plan.part4_rest`. Absent or non-`part4_rest` refs are
@@ -269,6 +272,14 @@ impl RenumberMap {
             plan.raw.part4_open_document_plain.clone()
         } else {
             plan.part4_open_document_plain
+                .iter()
+                .filter_map(|object_ref| QpdfObjGen::try_from_object_ref(*object_ref).ok())
+                .collect()
+        };
+        let raw_part9_thumbnail = if has_raw_plan {
+            plan.raw.part9_thumbnail_objects.clone()
+        } else {
+            plan.part9_thumbnail_objects
                 .iter()
                 .filter_map(|object_ref| QpdfObjGen::try_from_object_ref(*object_ref).ok())
                 .collect()
@@ -381,6 +392,7 @@ impl RenumberMap {
         //  slot 1..    part7 (other pages' private) in plan order
         //  slot N+1..  part8 (other pages' shared) in plan order
         //  slot ..     pages_tree (if in part4_rest) — qpdf places it first in part9
+        //  slot ..     Part-9 thumbnails (private by page, then shared)
         //  slot ..     part9 outline objects (classic, !UseOutlines) — qpdf lc_outlines
         //  slot ..     part4_rest remaining, number-sorted (qpdf lc_other, incl /Info)
         //  slot ..     <param dict reserved>
@@ -434,7 +446,21 @@ impl RenumberMap {
             );
         }
 
-        // 3b. part9 outline objects (classic, !UseOutlines).
+        // 3b. Part-9 thumbnail objects (classic). qpdf places private
+        // thumbnails page-by-page and shared thumbnails as one sorted group
+        // after the Pages tree and before outlines
+        // (QPDF_linearization.cc:1293-1327).
+        for &original in &raw_part9_thumbnail {
+            push_raw(
+                original,
+                &mut by_new_number,
+                &mut by_new_raw,
+                &mut by_original,
+                &mut by_original_raw,
+            );
+        }
+
+        // 3c. part9 outline objects (classic, !UseOutlines).
         // qpdf places lc_outlines after the pages tree / thumbnails and before the
         // remaining lc_other set (QPDF_linearization.cc:1331 then :1335), so they
         // precede the number-sorted part4_rest remainder (which includes /Info).
@@ -448,7 +474,7 @@ impl RenumberMap {
             );
         }
 
-        // 3c. Remaining part4_rest objects go to the second half, after the pages
+        // 3d. Remaining part4_rest objects go to the second half, after the pages
         // tree / outline promotions and before the param dict. This is qpdf's
         // number-sorted remaining lc_other set: part4_rest is object-number sorted
         // (part4_provisional derives from the sorted all_refs), so /Info and any

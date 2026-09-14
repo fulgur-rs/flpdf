@@ -267,6 +267,9 @@ initialization, graph preparation, and dispatch ordering. qtest exceptions
    `need_xref_stream = !object_to_object_stream.empty()` なら second_half_xref、part7/8/9 の
    container に `assignCompressedObjectNumbers`；first half は lindict → first_half_xref →
    part4 範囲 → encryption dict（encrypted 時）→ hint → part6 範囲 → part4/6 の container メンバー。
+   ObjStm を生成しない classic 経路の second-half `RenumberMap` も、part7 → part8 →
+   Pages tree → private/shared thumbnails → outlines → `lc_other` の順で予約する
+   （`QPDF_linearization.cc:1280-1338`）。
 5. `enqueuePart(part4)` / `(part6)` / `(part7,8,9)` を `next_objid` を各 part 先頭にリセットして実行し、
    各 part 後に `next_objid` が期待値でなければ `std::runtime_error`。
 6. **2 パス**: pass 1 は `pushDiscardFilter`（または `lin_pass1_filename`）+ deterministic なら MD5；

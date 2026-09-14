@@ -764,6 +764,9 @@ pub(crate) struct RawLinearizationPlan {
     pub(crate) pages_tree: Option<QpdfObjGen>,
     pub(crate) info: Option<QpdfObjGen>,
     pub(crate) per_page_private_objects: Vec<Vec<QpdfObjGen>>,
+    /// qpdf Part-9 thumbnail objects in emitted order: private thumbnails
+    /// grouped by page, followed by shared thumbnails.
+    pub(crate) part9_thumbnail_objects: Vec<QpdfObjGen>,
     pub(crate) outline_first_page_members: Vec<QpdfObjGen>,
     pub(crate) part9_outline_objects: Vec<QpdfObjGen>,
     pub(crate) part6_outline_objects: Vec<QpdfObjGen>,
@@ -872,6 +875,12 @@ pub struct LinearizationPlan {
     /// and to populate the Page Offset Hint Table's `page_length_minus_least`
     /// and `least_page_length` fields.
     pub per_page_private_objects: Vec<Vec<ObjectRef>>,
+
+    /// qpdf Part-9 thumbnail objects in emitted order: private thumbnails
+    /// grouped by page, followed by shared thumbnails. These objects remain in
+    /// `part4_rest`; this vector is ordering metadata consumed by the classic
+    /// renumberer, not a second membership list.
+    pub(crate) part9_thumbnail_objects: Vec<ObjectRef>,
 
     /// Outline objects routed to the first-page section (part6) when the catalog
     /// specifies `/PageMode /UseOutlines`, in emitted order (root first, then items
@@ -1020,6 +1029,7 @@ fn build_raw_linearization_plan<R: Read + Seek>(
     part4_rest: &[ObjectRef],
     part4_open_document_plain: &[ObjectRef],
     per_page_private_objects: &[Vec<ObjectRef>],
+    page_refs: &[ObjectRef],
     part9_outline_objects: &[ObjectRef],
     part6_outline_objects: &[ObjectRef],
     root_ref: Option<ObjectRef>,
@@ -1175,6 +1185,11 @@ fn build_raw_linearization_plan<R: Read + Seek>(
         raw_part9_outline_extra.clone(),
         outline_root,
     );
+    let raw_part4_rest =
+        raw_refs_with_extras(part4_rest.iter().copied(), raw_part4_rest_extra, true);
+    let raw_part4_rest_set: BTreeSet<QpdfObjGen> = raw_part4_rest.iter().copied().collect();
+    let raw_part9_thumbnail_objects =
+        part9_thumbnail_objects(pdf, optimization, page_refs, &raw_part4_rest_set)?;
 
     let raw_shared_hints = raw_part2_objects_for_hints(
         &raw_refs_with_extras_preserving_first(
@@ -1203,7 +1218,7 @@ fn build_raw_linearization_plan<R: Read + Seek>(
             raw_part4_shared_extra,
             true,
         ),
-        part4_rest: raw_refs_with_extras(part4_rest.iter().copied(), raw_part4_rest_extra, true),
+        part4_rest: raw_part4_rest,
         part4_open_document_plain: raw_refs_with_extras(
             part4_open_document_plain.iter().copied(),
             raw_open_document_plain_extra,
@@ -1214,6 +1229,7 @@ fn build_raw_linearization_plan<R: Read + Seek>(
             .and_then(|object_ref| QpdfObjGen::try_from_object_ref(object_ref).ok()),
         info: info_ref.and_then(|object_ref| QpdfObjGen::try_from_object_ref(object_ref).ok()),
         per_page_private_objects: raw_per_page_private_objects,
+        part9_thumbnail_objects: raw_part9_thumbnail_objects,
         outline_first_page_members: raw_part6_outline_objects.clone(),
         part9_outline_objects: raw_part9_outline_objects,
         part6_outline_objects: raw_part6_outline_objects,
@@ -1221,6 +1237,122 @@ fn build_raw_linearization_plan<R: Read + Seek>(
         removed_refs: raw_removed_refs,
         shared_hints: raw_shared_hints,
     })
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Part9ThumbnailCategory {
+    Private(u32),
+    Shared,
+}
+
+/// Classify one object using qpdf's Part-9 precedence, limited to the two
+/// thumbnail categories that are emitted by the classic linearization path.
+/// `users` is the post-optimization object-user set; its values already carry
+/// the shared-visited semantics of `QPDF::updateObjectMapsInternal`.
+fn part9_thumbnail_category(
+    users: &crate::optimization::CompactObjectUserSet,
+) -> Option<Part9ThumbnailCategory> {
+    let mut other_pages = BTreeSet::new();
+    let mut thumbnail_pages = BTreeSet::new();
+    let mut has_page_zero = false;
+    let mut has_root = false;
+    let mut has_outline = false;
+    let mut has_open_document = false;
+    let mut has_document_other = false;
+
+    for user in users.iter() {
+        match user {
+            crate::optimization::ObjectUser::Page(page) => {
+                if *page == 0 {
+                    has_page_zero = true;
+                } else {
+                    other_pages.insert(*page);
+                }
+            }
+            crate::optimization::ObjectUser::Thumbnail(page) => {
+                thumbnail_pages.insert(*page);
+            }
+            crate::optimization::ObjectUser::Root => has_root = true,
+            user if is_outline_user(user) => has_outline = true,
+            user if is_open_document_user(user) => has_open_document = true,
+            user if is_document_other_user(user) => has_document_other = true,
+            _ => {} // cov:ignore: ObjectUser is a closed qpdf user enum; every current variant is handled above
+        }
+    }
+
+    if has_page_zero || has_root || has_outline || has_open_document {
+        return None;
+    }
+    if other_pages.len() > 1 {
+        return None; // cov:ignore: qpdf routes objects with multiple non-first page users to Part 8 before part4_rest metadata is built
+    }
+    if other_pages.len() == 1 && thumbnail_pages.is_empty() && !has_document_other {
+        return None; // cov:ignore: qpdf routes this single-page object to Part 7 before part4_rest metadata is built
+    }
+    if thumbnail_pages.len() == 1 && !has_document_other {
+        return Some(Part9ThumbnailCategory::Private(
+            *thumbnail_pages.first().expect("thumbnail page exists"),
+        ));
+    }
+    if thumbnail_pages.len() > 1 {
+        return Some(Part9ThumbnailCategory::Shared);
+    }
+    None
+}
+
+/// Return the raw source identities that qpdf emits in the Part-9 thumbnail
+/// phase. Private thumbnail objects are emitted page-by-page with the `/Thumb`
+/// root first and its `ou_thumb` descendants in object-generation order;
+/// shared thumbnail objects follow as one object-generation-sorted group
+/// (`QPDF_linearization.cc:1293-1327`).
+fn part9_thumbnail_objects<R: Read + Seek>(
+    pdf: &mut Pdf<R>,
+    optimization: &crate::optimization::Optimization,
+    page_refs: &[ObjectRef],
+    part4_rest: &BTreeSet<QpdfObjGen>,
+) -> Result<Vec<QpdfObjGen>> {
+    let mut ordered = Vec::new();
+    let mut placed = BTreeSet::new();
+
+    for (page_index, page_ref) in page_refs.iter().enumerate() {
+        let page_number = page_index as u32;
+        let page = pdf.get_object_handle(*page_ref);
+        let thumb_root = page.try_get_key(b"/Thumb")?.qpdf_obj_gen();
+        let is_private = |object: QpdfObjGen| {
+            part4_rest.contains(&object)
+                && matches!(
+                    part9_thumbnail_category(optimization.raw_users_for(object)),
+                    Some(Part9ThumbnailCategory::Private(page)) if page == page_number
+                )
+        };
+
+        if let Some(object) = thumb_root.filter(|object| is_private(*object)) {
+            if placed.insert(object) {
+                ordered.push(object);
+            }
+        }
+        for &object in
+            optimization.raw_objects_for(&crate::optimization::ObjectUser::Thumbnail(page_number))
+        {
+            if is_private(object) && placed.insert(object) {
+                ordered.push(object);
+            }
+        }
+    }
+
+    let mut shared: Vec<QpdfObjGen> = part4_rest
+        .iter()
+        .copied()
+        .filter(|object| {
+            matches!(
+                part9_thumbnail_category(optimization.raw_users_for(*object)),
+                Some(Part9ThumbnailCategory::Shared)
+            )
+        })
+        .collect();
+    shared.sort_unstable();
+    ordered.extend(shared);
+    Ok(ordered)
 }
 
 fn raw_shared_hints_for_objects(
@@ -2101,6 +2233,7 @@ impl LinearizationPlan {
             &part4_rest,
             &part4_open_document_plain,
             &per_page_private_objects,
+            &page_refs,
             &part9_outline_objects,
             &part6_outline_objects,
             root_ref,
@@ -2125,6 +2258,12 @@ impl LinearizationPlan {
                 hint.object_count = private.len().max(1) as u32;
             }
         }
+
+        let part9_thumbnail_objects: Vec<ObjectRef> = raw
+            .part9_thumbnail_objects
+            .iter()
+            .filter_map(|object| object.to_object_ref())
+            .collect();
 
         let part2_entries = part2_objects.iter().map(|&obj_ref| SharedObjectHintEntry {
             object_ref: obj_ref,
@@ -2190,6 +2329,7 @@ impl LinearizationPlan {
             page_hints,
             shared_hints,
             per_page_private_objects,
+            part9_thumbnail_objects,
             outline_first_page_members,
             part9_outline_objects,
             part6_outline_objects,
@@ -2871,6 +3011,7 @@ impl Default for LinearizationPlan {
             page_hints: Vec::new(),
             shared_hints: Vec::new(),
             per_page_private_objects: Vec::new(),
+            part9_thumbnail_objects: Vec::new(),
             outline_first_page_members: Vec::new(),
             part9_outline_objects: Vec::new(),
             part6_outline_objects: Vec::new(),

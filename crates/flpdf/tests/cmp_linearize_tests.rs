@@ -371,6 +371,43 @@ fn direct_leaf_kid_byte_identical_to_qpdf() {
     assert_linearize_byte_identical("direct-leaf-kid.pdf", "direct-leaf-kid");
 }
 
+#[test]
+fn classic_thumbnail_part9_order_matches_qpdf() {
+    let Some(oracle) = pinned_qpdf() else {
+        eprintln!("[SKIP cmp_linearize_tests] qpdf 11.9.0 is unavailable");
+        return;
+    };
+    for fixture in [
+        "objstm-lin-part9-categories-thumb-74-225.pdf",
+        "objstm-lin-part9-pages-shared-thumb-74-225.pdf",
+        "objstm-lin-thumbnail-private-shared.pdf",
+    ] {
+        let input = Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("../../tests/fixtures/compat")
+            .join(fixture);
+        let directory = tempfile::tempdir().expect("tempdir");
+        let expected_path = directory.path().join("qpdf.pdf");
+        let status = Command::new(oracle)
+            .args(["--linearize", "--deterministic-id", "--warning-exit-0"])
+            .arg(&input)
+            .arg(&expected_path)
+            .status()
+            .expect("qpdf runs");
+        assert_eq!(status.code(), Some(0), "qpdf linearization must succeed");
+
+        let actual = flpdf_linearized(fixture);
+        let expected = std::fs::read(&expected_path).expect("qpdf output");
+        if let Some(off) = first_diff(&actual, &expected) {
+            panic!(
+                "{fixture}: classic thumbnail order differs from qpdf \
+                 (flpdf={} bytes, qpdf={} bytes, first diff at byte {off})",
+                actual.len(),
+                expected.len(),
+            );
+        }
+    }
+}
+
 /// A catalog whose /Pages points INTO the page tree (at the first page) instead
 /// of at the true root. qpdf 11.9.0's getAllPages walks /Parent up to the real
 /// root and rewrites the catalog /Pages (QPDF_pages.cc:50-67), matching qpdf's repair behavior.
