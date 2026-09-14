@@ -602,6 +602,15 @@ indirect `/Length` の実解決時だけ初期化する。direct-only の traile
 metadata path は入力全体を複製しない。これは qpdf の object/stream lazy read
 を generic `Read + Seek` の static resolver lifetime に合わせるための内部
 ownership 実装であり、PDF bytes、warning、xref/cache identity は変更しない。
+2026-09-14（`flpdf-ymuj.6.20`）: canonical `Pdf::open` の xref loading は
+`engine.rs` の complete-source read を撤去し、`ResolverHandle` の live
+`Read + Seek` boundary から header、tail、current xref section を必要な範囲
+だけ読む。`/Prev` が現在の section window の外にある場合も、その section
+だけを同じ source から取得し、reconstruction は chunked live scan として
+実行する。offset 0 の qpdf guard、linearized file の前後両方向の `/Prev`、
+warning order、canonical cache identity は変更しない。byte-slice loader は
+ownerless test-only path に限定され、canonical route に complete input
+snapshot は残らない。
 | `QPDF_pages.cc` | 319 | `pages/repair.rs`（`QPDF_pages.cc:39-75` の `getAllPages` root correction と `:77-150` の `getAllPagesInternal` repair/enumeration を canonical `ObjectHandle` graph 上で実装） + `optimization/inherited_attrs.rs`（canonical page promotion/clone と衝突しない `Pdf::next_obj_gen` allocation） + `pages.rs` / `pages/tree_rebuild.rs`（flatten/insert/remove と legacy consumer の残り） | 🔀 `flpdf-25kg.3.7` で repair/enumeration の canonical route を追加。`.3.2.6.15` では `QPDFPageObjectHelper::getAttribute` の bottom-up `/Parent` climb（`QPDFPageObjectHelper.cc:217-263`。`QPDF_optimization.cc:121-245`/`QPDF_pages.cc:154-180,205-248` は top-down push とツリー変異のオラクル）を、共有 `PageParentCursor` / `resolve_inherited_handle_with_max_depth` として live `ObjectHandle` で切り出した。直接親の identity、間接親の canonical `ObjectRef`、null/非辞書親、cycle/depth guard をこの境界で保持し、`/Rotate` の未指定を合成しない。`.3.2.6.16` では `tree_rebuild` の単一文書 consumer を canonical handle route に切り替え、選択ページの inherited `/MediaBox`・`/CropBox`・`/Resources`・`/Rotate` を再親子付け前に push、直接 non-scalar は `make_indirect_from_object_handle` で共有 allocation を in-place 昇格、既存 indirect 値は identity を保持し、duplicate は `shallow_copy`、root `/Kids`・`/Count`・各 leaf `/Parent` は live handle を replace/remove する。qpdf の absent `/Rotate` は合成しない。`QPDFObjectHandle.cc:1199-1209,2072-2079` の live replace/remove・shallow-copy がこの consumerの mutation oracleである。`QPDFJob.cc:2360-2632` の page-selection orchestration はこの境界の外であり、`page_extract` uses canonical `copyForeignObject`/`ObjectHandle`; `page_merge` / `page_label` remain separate consumers |
 `flpdf-mkyw` replaces the Rust recursion in the page-tree repair, inherited-attribute,
 and tree-rebuild walks with explicit heap frames. This is category (B): qpdf's
