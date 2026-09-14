@@ -114,6 +114,23 @@ pub struct HintStreamBytes {
     pub outline_section_offset_in_uncompressed: Option<usize>,
 }
 
+/// Selects the one payload representation retained by the canonical
+/// linearization writer. qpdf's `generateHintStream` takes the same choice
+/// before it constructs its single `Pl_Buffer` (`QPDF_linearization.cc:1758-1795`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum HintStreamMode {
+    Uncompressed,
+    Compressed,
+}
+
+/// The canonical writer result. Unlike [`HintStreamBytes`], this value owns
+/// only the representation selected by the writer's stream policy.
+pub(crate) struct SelectedHintStream {
+    pub(crate) payload: Vec<u8>,
+    pub(crate) shared_section_offset_in_uncompressed: usize,
+    pub(crate) outline_section_offset_in_uncompressed: Option<usize>,
+}
+
 /// Outlines (generic) hint table — qpdf's `HGeneric` (Annex F.3.4).
 ///
 /// Emitted after the Shared Object Hint Table when the document has outlines.
@@ -530,6 +547,63 @@ pub fn encode_hint_stream(
     )
 }
 
+/// Encode the canonical writer payload while retaining only the selected raw
+/// or Flate representation. The byte positions counted before Flate remain
+/// the uncompressed `/S` and `/O` offsets in both modes.
+pub(crate) fn encode_hint_stream_selected(
+    page_offset: &PageOffsetHintTable,
+    shared_object: &SharedObjectHintTable,
+    outline: Option<&OutlineHintTable>,
+    mode: HintStreamMode,
+) -> crate::Result<SelectedHintStream> {
+    encode_hint_stream_selected_with_out_buffer_size(
+        page_offset,
+        shared_object,
+        outline,
+        mode,
+        DEFAULT_OUT_BUFFER_SIZE,
+    )
+}
+
+fn encode_hint_stream_selected_with_out_buffer_size(
+    page_offset: &PageOffsetHintTable,
+    shared_object: &SharedObjectHintTable,
+    outline: Option<&OutlineHintTable>,
+    mode: HintStreamMode,
+    out_buffer_size: usize,
+) -> crate::Result<SelectedHintStream> {
+    let mut payload_sink = Buffer::new("selected hint stream", None);
+    let (shared_section_offset, outline_section_offset) = match mode {
+        HintStreamMode::Uncompressed => {
+            let mut count = Count::new("count hint stream", &mut payload_sink);
+            let offsets =
+                encode_hint_sections_into(&mut count, page_offset, shared_object, outline)?;
+            count.finish()?;
+            offsets
+        }
+        HintStreamMode::Compressed => {
+            let mut flate = Flate::new(
+                "compress hint stream",
+                &mut payload_sink,
+                FlateAction::Deflate,
+                out_buffer_size,
+            )?;
+            let mut count = Count::new("count hint stream", &mut flate);
+            let offsets =
+                encode_hint_sections_into(&mut count, page_offset, shared_object, outline)?;
+            count.finish()?;
+            offsets
+        }
+    };
+    let payload = payload_sink.take_buffer()?;
+
+    Ok(SelectedHintStream {
+        payload,
+        shared_section_offset_in_uncompressed: shared_section_offset,
+        outline_section_offset_in_uncompressed: outline_section_offset,
+    })
+}
+
 fn encode_hint_stream_with_out_buffer_size(
     page_offset: &PageOffsetHintTable,
     shared_object: &SharedObjectHintTable,
@@ -537,10 +611,7 @@ fn encode_hint_stream_with_out_buffer_size(
     out_buffer_size: usize,
 ) -> crate::Result<HintStreamBytes> {
     let mut compressed_sink = Buffer::new("compressed hint stream", None);
-    let uncompressed;
-    let shared_section_offset;
-    let outline_section_offset;
-    {
+    let (uncompressed, shared_section_offset, outline_section_offset) = {
         let mut flate = Flate::new(
             "compress hint stream",
             &mut compressed_sink,
@@ -548,32 +619,13 @@ fn encode_hint_stream_with_out_buffer_size(
             out_buffer_size,
         )?;
         let mut raw = Buffer::new("raw hint stream", Some(&mut flate));
-        {
-            let mut count = Count::new("count hint stream", &mut raw);
-            {
-                let mut writer = BitWriter::new(&mut count);
-                encode_page_section(&mut writer, page_offset)?;
-                writer.flush()?;
-            }
-            shared_section_offset = checked_hint_offset(count.count(), "/S")?;
-            {
-                let mut writer = BitWriter::new(&mut count);
-                encode_shared_section(&mut writer, shared_object)?;
-                writer.flush()?;
-            }
-            outline_section_offset = if let Some(outline) = outline {
-                let offset = checked_hint_offset(count.count(), "/O")?;
-                let mut writer = BitWriter::new(&mut count);
-                encode_outline_section(&mut writer, outline)?;
-                writer.flush()?;
-                Some(offset)
-            } else {
-                None
-            };
-            count.finish()?;
-        }
-        uncompressed = raw.take_buffer()?;
-    }
+        let mut count = Count::new("count hint stream", &mut raw);
+        let (shared_section_offset, outline_section_offset) =
+            encode_hint_sections_into(&mut count, page_offset, shared_object, outline)?;
+        count.finish()?;
+        let uncompressed = raw.take_buffer()?;
+        (uncompressed, shared_section_offset, outline_section_offset)
+    };
     let compressed = compressed_sink.take_buffer()?;
 
     Ok(HintStreamBytes {
@@ -582,6 +634,35 @@ fn encode_hint_stream_with_out_buffer_size(
         shared_section_offset_in_uncompressed: shared_section_offset,
         outline_section_offset_in_uncompressed: outline_section_offset,
     })
+}
+
+fn encode_hint_sections_into(
+    count: &mut Count<'_>,
+    page_offset: &PageOffsetHintTable,
+    shared_object: &SharedObjectHintTable,
+    outline: Option<&OutlineHintTable>,
+) -> crate::Result<(usize, Option<usize>)> {
+    {
+        let mut writer = BitWriter::new(count);
+        encode_page_section(&mut writer, page_offset)?;
+        writer.flush()?;
+    }
+    let shared_section_offset = checked_hint_offset(count.count(), "/S")?;
+    {
+        let mut writer = BitWriter::new(count);
+        encode_shared_section(&mut writer, shared_object)?;
+        writer.flush()?;
+    }
+    let outline_section_offset = if let Some(outline) = outline {
+        let offset = checked_hint_offset(count.count(), "/O")?;
+        let mut writer = BitWriter::new(count);
+        encode_outline_section(&mut writer, outline)?;
+        writer.flush()?;
+        Some(offset)
+    } else {
+        None
+    };
+    Ok((shared_section_offset, outline_section_offset))
 }
 
 // ---------------------------------------------------------------------------
@@ -794,6 +875,30 @@ mod tests {
             crate::Error::System(ref message)
                 if message == "Pl_Flate: output buffer size must be greater than zero"
         ));
+    }
+
+    #[test]
+    fn selected_hint_payload_matches_the_qpdf_single_buffer_modes() {
+        let tables = minimal_tables();
+        let dual = encode_hint_stream(&tables.0, &tables.1, None).expect("dual oracle");
+
+        for mode in [HintStreamMode::Uncompressed, HintStreamMode::Compressed] {
+            let selected = encode_hint_stream_selected(&tables.0, &tables.1, None, mode)
+                .expect("selected hint payload");
+            let expected = match mode {
+                HintStreamMode::Uncompressed => &dual.uncompressed,
+                HintStreamMode::Compressed => &dual.compressed,
+            };
+            assert_eq!(&selected.payload, expected);
+            assert_eq!(
+                selected.shared_section_offset_in_uncompressed,
+                dual.shared_section_offset_in_uncompressed
+            );
+            assert_eq!(
+                selected.outline_section_offset_in_uncompressed,
+                dual.outline_section_offset_in_uncompressed
+            );
+        }
     }
 
     #[test]

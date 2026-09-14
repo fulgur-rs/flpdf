@@ -63,7 +63,9 @@ use std::path::Path;
 
 use crate::linearization::hint_page::{bits_needed, PageOffsetHintTable};
 use crate::linearization::hint_shared::SharedObjectHintTable;
-use crate::linearization::hint_stream::{encode_hint_stream, OutlineHintTable};
+use crate::linearization::hint_stream::{
+    encode_hint_stream_selected, HintStreamMode, OutlineHintTable,
+};
 use crate::linearization::part1::{Part1Bytes, Part1Placeholders};
 use crate::linearization::plan::{
     part9_category_order_key, ContainerPart, LinearizationPlan, RoutedObjStmBatch,
@@ -4243,14 +4245,15 @@ fn write_linearized_impl<R: Read + Seek>(
         .transpose()?;
 
     // Re-encode hint stream with patched tables.
-    let new_hint_bytes = encode_hint_stream(&po_table, &so_table, outline_table.as_ref())?;
-    let new_hint_payload = if structural_streams_filtered {
-        new_hint_bytes.compressed
+    let hint_mode = if structural_streams_filtered {
+        HintStreamMode::Compressed
     } else {
-        new_hint_bytes.uncompressed
+        HintStreamMode::Uncompressed
     };
-    let new_shared_s = new_hint_bytes.shared_section_offset_in_uncompressed;
-    let new_outline_o = new_hint_bytes.outline_section_offset_in_uncompressed;
+    let new_hint =
+        encode_hint_stream_selected(&po_table, &so_table, outline_table.as_ref(), hint_mode)?;
+    let new_shared_s = new_hint.shared_section_offset_in_uncompressed;
+    let new_outline_o = new_hint.outline_section_offset_in_uncompressed;
 
     // qpdf frames and encrypts the complete hint object once after pass 1.
     // Pass 2 receives this exact buffer and splices it without re-encoding
@@ -4259,7 +4262,7 @@ fn write_linearized_impl<R: Read + Seek>(
     append_hint_stream_object(
         &mut hint_stream_object,
         ObjectRef::new(hint_stream_new_num, 0),
-        &new_hint_payload,
+        &new_hint.payload,
         new_shared_s,
         new_outline_o,
         structural_streams_filtered,
