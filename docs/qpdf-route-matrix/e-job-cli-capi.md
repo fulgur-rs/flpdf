@@ -489,7 +489,7 @@ qtest exceptionsとrootは対象外。
 
 | 項目 | 宣言 | `main.rs` での prod 呼び出し | 備考 |
 |---|---|---|---|
-| `apply_rotate_to_pages` | absent（旧 `crates/flpdf/src/job/rotate.rs`） | なし（prod 0、test 0） | E-13。Job/CLIは`PageObjectHelper::rotate_page`へ直接移行済み。qpdfにない事前 validation と dead public batch helper、専用 `RotateMode`/`RotateOp`、16件の旧helper testを `flpdf-v55s` で撤去した。 |
+| `apply_rotate_to_pages` | absent（旧 `crates/flpdf/src/job/rotate.rs`） | なし（prod 0、test 0） | E-13。Job/CLIは`PageObjectHelper::rotate_page`へ直接移行済み。qpdfにない事前 validation と dead public batch helper、専用 `RotateMode`/`RotateOp` を `flpdf-v55s` で撤去し、旧helperへのテスト呼び出しを解消して有効動作テストをcanonical helperへ移行、専用invalid-targetテスト2件を削除した。 |
 | `flatten_rotation_on_pages` | `crates/flpdf/src/job/rotate.rs` | `crates/flpdf/src/job/lifecycle.rs::prepare_document_transformations` | E-12。CLIのproduction direct callerは削除済み（qtest-v7vrのbounded cutover）。 |
 | `optimize_images` | `crates/flpdf/src/job/image_optimization.rs` | `crates/flpdf-cli/src/main.rs:3043,3073,4292,4348,5725,5995` | E-12。6 箇所と本領域最多 |
 | `should_remove_unreferenced_resources` | `crates/flpdf/src/job/resource_pruning.rs` | `crates/flpdf-cli/src/main.rs:5707` | E-16 |
