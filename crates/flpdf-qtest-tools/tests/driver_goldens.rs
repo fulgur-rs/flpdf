@@ -95,3 +95,28 @@ fn empty_reconstructed_xref_matches_qpdf_output_and_exit_zero() {
     assert_eq!(status, Some(0));
     assert_eq!(actual, expected);
 }
+
+#[test]
+fn test_0_1_stream_route_uses_the_canonical_object_pipe() {
+    let source = fs::read_to_string(concat!(
+        env!("CARGO_MANIFEST_DIR"),
+        "/src/driver/test_0_1.rs"
+    ))
+    .expect("read test_0_1 source");
+
+    for forbidden in [
+        "DecodeLimits",
+        "StreamDecodeEvent",
+        "decode_stream_data_recovering",
+        "resolve_stream_dictionary_handle",
+    ] {
+        assert!(
+            !source.contains(forbidden),
+            "test_0_1 retains the recovering stream bridge: {forbidden}"
+        );
+    }
+    assert!(
+        source.contains("pipe_stream_data"),
+        "test_0_1 must call the canonical ObjectHandle pipe"
+    );
+}

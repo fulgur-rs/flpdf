@@ -1,45 +1,91 @@
 use std::io::{Read, Seek, Write};
+use std::sync::{Arc, Mutex};
 
-use flpdf::filters::{DecodeLimits, StreamDecodeEvent};
-use flpdf::{Error, ObjectHandle, ObjectRef, Pdf, QpdfErrorCode, QpdfExc};
+use flpdf::{
+    DecodeLevel, Error, ObjectHandle, ObjectRef, Pdf, Pipeline, PipelineError, PipelineHandle,
+    PipelineResult, QPDFLogger,
+};
 
-use super::handle::{resolve_handle, resolve_stream_dictionary_handle, write_qpdf_object_handle};
-use super::{emit_new_diagnostics, write_warning};
+use super::emit_new_diagnostics;
+use super::handle::{resolve_handle, write_qpdf_object_handle};
 use crate::output::write_bytes;
 
-fn stream_decode_error_detail(error: Error) -> String {
-    let detail = match error {
-        Error::Unsupported(message) | Error::Internal(message) | Error::System(message) => message,
-        error => error.to_string(),
-    };
-    detail
-        .strip_prefix("DCT decode: ")
-        .unwrap_or(&detail)
-        .to_owned()
+#[derive(Clone, Debug)]
+enum OrderedStreamEvent {
+    Stdout(Vec<u8>),
+    Stderr(Vec<u8>),
 }
 
-fn write_decode_param_type_warning(
-    description: &[u8],
-    object_type: &str,
+type OrderedStreamEvents = Arc<Mutex<Vec<OrderedStreamEvent>>>;
+
+fn record_stream_event(
+    events: &OrderedStreamEvents,
+    event: OrderedStreamEvent,
+) -> PipelineResult<()> {
+    events
+        .lock()
+        .map_err(|_| PipelineError::runtime("ordered stream event mutex poisoned"))?
+        .push(event);
+    Ok(())
+}
+
+struct OrderedStreamOutput {
+    events: OrderedStreamEvents,
+}
+
+impl Pipeline for OrderedStreamOutput {
+    fn identifier(&self) -> &str {
+        "qtest stream output"
+    }
+
+    fn write(&mut self, data: &[u8]) -> PipelineResult<()> {
+        record_stream_event(&self.events, OrderedStreamEvent::Stdout(data.to_vec()))
+    }
+
+    fn finish(&mut self) -> PipelineResult<()> {
+        Ok(())
+    }
+}
+
+struct OrderedStreamWarning {
+    events: OrderedStreamEvents,
+}
+
+impl Pipeline for OrderedStreamWarning {
+    fn identifier(&self) -> &str {
+        "qtest stream warnings"
+    }
+
+    fn write(&mut self, data: &[u8]) -> PipelineResult<()> {
+        record_stream_event(&self.events, OrderedStreamEvent::Stderr(data.to_vec()))
+    }
+
+    fn finish(&mut self) -> PipelineResult<()> {
+        Ok(())
+    }
+}
+
+fn replay_stream_events(
+    events: &OrderedStreamEvents,
     stdout: &mut dyn Write,
     stderr: &mut dyn Write,
 ) -> flpdf::Result<()> {
-    if description.is_empty() {
-        return Err(Error::System(
-            "stream DecodeParms warning has no terminal indirect object".to_owned(),
-        ));
+    let events = events
+        .lock()
+        .map_err(|_| Error::System("ordered stream event mutex poisoned".to_owned()))?
+        .clone();
+    stdout.flush()?;
+    for event in events {
+        match event {
+            OrderedStreamEvent::Stdout(data) => stdout.write_all(&data)?,
+            OrderedStreamEvent::Stderr(data) => {
+                stdout.flush()?;
+                stderr.write_all(&data)?;
+            }
+        }
     }
-    let diagnostic = QpdfExc::new(
-        QpdfErrorCode::Object,
-        b"",
-        description,
-        0,
-        format!(
-            "operation for dictionary attempted on object of type {object_type}: treating as empty"
-        )
-        .as_bytes(),
-    );
-    Ok(write_warning(b"", &diagnostic, stdout, stderr)?)
+    stdout.flush()?;
+    Ok(())
 }
 
 pub(crate) fn run_test_0_1<R: Read + Seek>(
@@ -139,6 +185,52 @@ fn dictionary_items<R: Read + Seek>(
     Ok(items)
 }
 
+fn pipe_stream_data_with_ordered_diagnostics<R: Read + Seek>(
+    pdf: &mut Pdf<R>,
+    stream: &ObjectHandle,
+    stdout: &mut dyn Write,
+    stderr: &mut dyn Write,
+    diagnostics_written: &mut usize,
+) -> flpdf::Result<bool> {
+    let events = Arc::new(Mutex::new(Vec::new()));
+    let logger = QPDFLogger::create();
+    logger.set_warn(Some(PipelineHandle::new(OrderedStreamWarning {
+        events: Arc::clone(&events),
+    })));
+
+    let previous_logger = pdf.logger();
+    let previous_suppression = pdf.suppress_warnings();
+    pdf.set_logger(logger);
+    pdf.set_suppress_warnings(false);
+
+    let result: flpdf::Result<bool> = (|| -> flpdf::Result<bool> {
+        let filterable = stream.stream_data_filterable(DecodeLevel::All)?;
+        if filterable {
+            let mut output = OrderedStreamOutput {
+                events: Arc::clone(&events),
+            };
+            let mut filtering_attempted = false;
+            let _ = stream.pipe_stream_data(
+                &mut output,
+                &mut filtering_attempted,
+                0,
+                DecodeLevel::All,
+                false,
+                false,
+            )?;
+        }
+        Ok(filterable)
+    })();
+
+    pdf.set_logger(previous_logger);
+    pdf.set_suppress_warnings(previous_suppression);
+    replay_stream_events(&events, stdout, stderr)?;
+
+    let filterable = result?;
+    *diagnostics_written = pdf.repair_diagnostics().entries().len();
+    Ok(filterable)
+}
+
 #[allow(clippy::too_many_arguments)]
 fn write_object_details<R: Read + Seek>(
     pdf: &mut Pdf<R>,
@@ -147,7 +239,7 @@ fn write_object_details<R: Read + Seek>(
     stderr: &mut dyn Write,
     diagnostics_written: &mut usize,
     chased: &ObjectHandle,
-    terminal_ref: Option<ObjectRef>,
+    _terminal_ref: Option<ObjectRef>,
 ) -> flpdf::Result<()> {
     match chased.type_code()? {
         2 => writeln!(stdout, "/QTest is null")?,
@@ -215,7 +307,6 @@ fn write_object_details<R: Read + Seek>(
             let data = chased.get_raw_stream_data()?;
             write!(stdout, "/QTest is a stream.  Dictionary: ")?;
             let dictionary = write_qpdf_object_handle(pdf, &dict_handle)?;
-            let decode_dictionary = resolve_stream_dictionary_handle(pdf, &dict_handle)?;
             emit_new_diagnostics(pdf, diagnostics_written, filename, stdout, stderr)?;
             write_bytes(stdout, &dictionary)?;
             writeln!(stdout)?;
@@ -226,120 +317,19 @@ fn write_object_details<R: Read + Seek>(
             writeln!(stdout)?;
             writeln!(stdout, "Uncompressed stream data:")?;
 
-            // Each warning carries the offending value's rendered qpdf
-            // description from the canonical handle. qpdf's own
-            // `QPDFObjectHandle::typeWarning` (`libqpdf/QPDFObjectHandle.cc:
-            // 2168-2188`) passes that description as the exception's object
-            // field and passes zero as its separate offset, so the ObjStm
-            // source context is never reconstructed from a PDF filename and
-            // a decoded-member offset here.
-            let warnings = decode_dictionary.decode_param_type_warnings();
-            for warning in warnings {
-                write_decode_param_type_warning(
-                    &warning.description,
-                    warning.object_type,
-                    stdout,
-                    stderr,
-                )?;
-            }
-
-            if !decode_dictionary.is_filterable() {
+            let filterable = pipe_stream_data_with_ordered_diagnostics(
+                pdf,
+                chased,
+                stdout,
+                stderr,
+                diagnostics_written,
+            )?;
+            if !filterable {
                 writeln!(stdout, "Stream data is not filterable.")?;
                 return Ok(());
             }
-
-            for warning in warnings {
-                write_decode_param_type_warning(
-                    &warning.description,
-                    warning.object_type,
-                    stdout,
-                    stderr,
-                )?;
-            }
-
-            let decode_dictionary_handle = decode_dictionary.filter_input_handle();
-            match flpdf::filters::decode_stream_data_recovering_with_limits(
-                &decode_dictionary_handle,
-                &data,
-                DecodeLimits {
-                    max_output: None,
-                    max_tiff_memory: None,
-                    max_filter_chain: None,
-                },
-            ) {
-                Ok(decoded) => {
-                    let offset = u64::try_from(chased.try_get_parsed_offset()?).ok();
-                    stdout.flush()?;
-                    for event in decoded.events {
-                        match event {
-                            StreamDecodeEvent::Data(data) => write_bytes(stdout, &data)?,
-                            StreamDecodeEvent::Warning(warning) => {
-                                write_warning(
-                                    filename,
-                                    &QpdfExc::new(
-                                        QpdfErrorCode::DamagedPdf,
-                                        filename,
-                                        b"",
-                                        offset
-                                            .and_then(|offset| i64::try_from(offset).ok())
-                                            .unwrap_or(0),
-                                        warning.message.as_bytes(),
-                                    ),
-                                    stdout,
-                                    stderr,
-                                )?;
-                            }
-                            StreamDecodeEvent::Error(error) => {
-                                let object_ref = terminal_ref.ok_or_else(|| {
-                                    Error::System(
-                                        "decoded stream has no terminal indirect object"
-                                            .to_string(),
-                                    )
-                                })?;
-                                let detail = stream_decode_error_detail(error);
-                                write_warning(
-                                    filename,
-                                    &QpdfExc::new(
-                                        QpdfErrorCode::DamagedPdf,
-                                        filename,
-                                        b"",
-                                        offset
-                                            .and_then(|offset| i64::try_from(offset).ok())
-                                            .unwrap_or(0),
-                                        format!(
-                                            "error decoding stream data for object {} {}: {detail}",
-                                            object_ref.number, object_ref.generation
-                                        )
-                                        .as_bytes(),
-                                    ),
-                                    stdout,
-                                    stderr,
-                                )?;
-                            }
-                        }
-                    }
-                    writeln!(stdout)?;
-                    writeln!(stdout, "End of stream data")?;
-                }
-                Err(Error::Unsupported(message))
-                    if message == "stream filter type is not name or array"
-                        || message == "stream /DecodeParms length is inconsistent with filters" =>
-                {
-                    let offset = u64::try_from(chased.try_get_parsed_offset()?).ok();
-                    let diagnostic = QpdfExc::new(
-                        QpdfErrorCode::DamagedPdf,
-                        filename,
-                        b"",
-                        offset
-                            .and_then(|offset| i64::try_from(offset).ok())
-                            .unwrap_or(0),
-                        message.as_bytes(),
-                    );
-                    write_warning(filename, &diagnostic, stdout, stderr)?;
-                    writeln!(stdout, "Stream data is not filterable.")?;
-                }
-                Err(_) => writeln!(stdout, "Stream data is not filterable.")?,
-            }
+            writeln!(stdout)?;
+            writeln!(stdout, "End of stream data")?;
         }
         // 11 = operator, 12 = inline-image, 13 = unresolved. Parsed PDF
         // objects cannot carry a bare reference as their whole object value.
@@ -353,12 +343,10 @@ fn write_object_details<R: Read + Seek>(
 #[cfg(test)]
 mod tests {
     use std::rc::Rc;
+    use std::sync::{Arc, Mutex};
 
-    use super::{
-        run_test_0_1, stream_decode_error_detail, write_decode_param_type_warning,
-        write_object_details,
-    };
-    use flpdf::{Error, ObjectHandle, ObjectRef, Pdf, PdfOpenOptions};
+    use super::{run_test_0_1, write_object_details};
+    use flpdf::{ObjectHandle, ObjectRef, Pdf, PdfOpenOptions, Pipeline};
     use std::io::{self, Write};
 
     struct WriteFailure;
@@ -382,6 +370,31 @@ mod tests {
             "write failed"
         );
         writer.flush().expect("flush remains independently usable");
+    }
+
+    #[test]
+    fn ordered_stream_sinks_replay_data_and_warnings_in_order() {
+        let events = Arc::new(Mutex::new(Vec::new()));
+        let mut output = super::OrderedStreamOutput {
+            events: Arc::clone(&events),
+        };
+        assert_eq!(output.identifier(), "qtest stream output");
+        output.write(b"decoded").expect("record stream data");
+        output.finish().expect("finish stream output");
+
+        let mut warning = super::OrderedStreamWarning {
+            events: Arc::clone(&events),
+        };
+        assert_eq!(warning.identifier(), "qtest stream warnings");
+        warning.write(b"warning\n").expect("record stream warning");
+        warning.finish().expect("finish stream warning");
+
+        let mut stdout = Vec::new();
+        let mut stderr = Vec::new();
+        super::replay_stream_events(&events, &mut stdout, &mut stderr)
+            .expect("replay ordered stream events");
+        assert_eq!(stdout, b"decoded");
+        assert_eq!(stderr, b"warning\n");
     }
 
     fn pdf_with_qtest(qtest: &[u8], extras: &[(u32, Vec<u8>)]) -> Vec<u8> {
@@ -803,7 +816,7 @@ mod tests {
     }
 
     #[test]
-    fn crypt_decode_params_follow_qpdf_validation_without_weakening_core_decode() {
+    fn crypt_decode_params_follow_qpdf_validation() {
         let compressed = b"\x78\x9c\x4b\x4c\x4a\x06\x00\x02\x4d\x01\x27";
         let mut stream = b"<< /Filter [ /Crypt /FlateDecode ] \
                            /DecodeParms [ << /Type /CryptFilterDecodeParms /Name 42 >> null ] \
@@ -817,15 +830,6 @@ mod tests {
         assert!(actual
             .windows(b"\nUncompressed stream data:\nabc\nEnd of stream data\n".len())
             .any(|line| line == b"\nUncompressed stream data:\nabc\nEnd of stream data\n"));
-
-        let core_dictionary_handle = ObjectHandle::dictionary(vec![(
-            b"/Filter".to_vec(),
-            ObjectHandle::name(b"Crypt".to_vec()),
-        )]);
-        assert!(
-            flpdf::filters::decode_stream_data_recovering(&core_dictionary_handle, b"abc").is_err(),
-            "ordinary library decode must continue rejecting identity Crypt"
-        );
     }
 
     #[test]
@@ -1059,7 +1063,7 @@ mod tests {
     }
 
     #[test]
-    fn direct_stream_runtime_error_requires_a_terminal_object_reference() {
+    fn direct_stream_runtime_error_uses_the_canonical_pipeline_error() {
         let bytes = pdf_with_qtest(b"null", &[]);
         let mut pdf = Pdf::open_mem_owned(bytes).expect("open direct stream fixture");
         let dict = ObjectHandle::dictionary(vec![(
@@ -1084,13 +1088,13 @@ mod tests {
 
         assert_eq!(
             error.to_string(),
-            "decoded stream has no terminal indirect object"
+            "stream inflate: inflate: data: incorrect header check"
         );
         assert!(stderr.is_empty());
     }
 
     #[test]
-    fn direct_stream_decode_param_warning_requires_a_terminal_object_reference() {
+    fn direct_stream_decode_param_warning_uses_the_canonical_type_warning() {
         let bytes = pdf_with_qtest(b"null", &[]);
         let mut pdf = Pdf::open_mem_owned(bytes).expect("open direct stream fixture");
         let dict = ObjectHandle::dictionary(vec![
@@ -1118,103 +1122,9 @@ mod tests {
 
         assert_eq!(
             error.to_string(),
-            "stream DecodeParms warning has no terminal indirect object"
+            "operation for dictionary attempted on object of type integer: treating as empty"
         );
         assert!(stderr.is_empty());
-    }
-
-    #[test]
-    fn decode_param_warning_formats_rendered_descriptions() {
-        let mut stdout = Vec::new();
-        let mut stderr = Vec::new();
-
-        write_decode_param_type_warning(
-            b"fixture.pdf, object 7 0 at offset 42",
-            "integer",
-            &mut stdout,
-            &mut stderr,
-        )
-        .expect("warning with offset");
-        write_decode_param_type_warning(
-            b"fixture.pdf, object 8 1",
-            "array",
-            &mut stdout,
-            &mut stderr,
-        )
-        .expect("warning without offset");
-
-        assert!(stdout.is_empty());
-        assert_eq!(
-            stderr,
-            b"WARNING: fixture.pdf, object 7 0 at offset 42: operation for dictionary attempted \
-              on object of type integer: treating as empty\n\
-              WARNING: fixture.pdf, object 8 1: operation for dictionary attempted on object of \
-              type array: treating as empty\n"
-        );
-    }
-
-    #[test]
-    fn decode_param_warning_write_failures_propagate_from_both_emissions() {
-        for fail_on in [1, 2] {
-            let bytes = pdf_with_qtest(
-                b"7 0 R",
-                &[(
-                    7,
-                    b"<< /Filter /FlateDecode /DecodeParms 42 /Length 0 >>\n\
-                      stream\n\nendstream"
-                        .to_vec(),
-                )],
-            );
-            let marker = b"/DecodeParms 42";
-            let marker_start = bytes
-                .windows(marker.len())
-                .position(|window| window == marker)
-                .expect("DecodeParms source token");
-            let value_offset = marker_start + b"/DecodeParms ".len();
-            let first_warning_len = format!(
-                "WARNING: fixture.pdf, object 7 0 at offset {value_offset}: \
-                 operation for dictionary attempted on object of type integer: treating as empty\n"
-            )
-            .len();
-            let mut pdf = Pdf::open_mem_owned(bytes).expect("open DecodeParms warning fixture");
-            let original = pdf.trailer_key_handle(b"QTest");
-            pdf.resolve(&original).expect("resolve qtest");
-            let qtest = original.clone();
-            let terminal_ref = original.object_ref();
-            let mut stdout = Vec::new();
-            let capacity = if fail_on == 1 { 0 } else { first_warning_len };
-            let mut storage = vec![0; capacity];
-            let mut stderr = io::Cursor::new(storage.as_mut_slice());
-            let mut diagnostics_written = 0;
-
-            let error = write_object_details(
-                &mut pdf,
-                b"fixture.pdf",
-                &mut stdout,
-                &mut stderr,
-                &mut diagnostics_written,
-                &qtest,
-                terminal_ref,
-            )
-            .unwrap_err();
-
-            assert_eq!(error.to_string(), "I/O error: failed to write whole buffer");
-            assert_eq!(stderr.position(), capacity as u64);
-        }
-    }
-
-    #[test]
-    fn stream_decode_error_detail_formats_every_match_arm() {
-        let cases = [
-            (Error::Unsupported("unsupported".to_string()), "unsupported"),
-            (Error::Internal("internal".to_string()), "internal"),
-            (Error::System("system".to_string()), "system"),
-            (Error::parse(4, "parse"), "parse error at byte 4: parse"),
-        ];
-
-        for (error, expected) in cases {
-            assert_eq!(stream_decode_error_detail(error), expected);
-        }
     }
 
     #[test]

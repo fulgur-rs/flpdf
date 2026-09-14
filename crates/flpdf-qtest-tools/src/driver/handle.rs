@@ -1,7 +1,11 @@
 use std::io::{Read, Seek};
 
-use flpdf::{Error, ObjectHandle, ObjectRef, Pdf};
+use flpdf::{ObjectHandle, ObjectRef, Pdf};
 
+#[cfg(test)]
+use flpdf::Error;
+
+#[cfg(test)]
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub(crate) struct DecodeParamTypeWarning {
     pub(crate) filter_index: usize,
@@ -15,12 +19,14 @@ pub(crate) struct DecodeParamTypeWarning {
 /// The resolved stream-dictionary view consumed by qtest's filter diagnostics
 /// and decode path. The dictionary remains a live handle graph; no owned raw
 /// object snapshot is retained.
+#[cfg(test)]
 pub(crate) struct ResolvedStreamDictionary {
     dictionary: ObjectHandle,
     filterable: bool,
     decode_param_type_warnings: Vec<DecodeParamTypeWarning>,
 }
 
+#[cfg(test)]
 impl ResolvedStreamDictionary {
     pub(crate) fn is_filterable(&self) -> bool {
         self.filterable
@@ -104,6 +110,7 @@ fn write_qpdf_handle_into<R: Read + Seek>(
     Ok(())
 }
 
+#[cfg(test)]
 pub(crate) fn resolve_stream_dictionary_handle<R: Read + Seek>(
     pdf: &mut Pdf<R>,
     source: &ObjectHandle,
@@ -178,6 +185,7 @@ pub(crate) fn resolve_stream_dictionary_handle<R: Read + Seek>(
     })
 }
 
+#[cfg(test)]
 fn resolved_filter_names_handle(filter: &ObjectHandle) -> Option<Vec<Vec<u8>>> {
     if filter.is_null() {
         return Some(Vec::new());
@@ -192,6 +200,7 @@ fn resolved_filter_names_handle(filter: &ObjectHandle) -> Option<Vec<Vec<u8>>> {
         .collect()
 }
 
+#[cfg(test)]
 fn resolve_filter_structure_handle<R: Read + Seek>(
     pdf: &mut Pdf<R>,
     value: &ObjectHandle,
@@ -211,6 +220,7 @@ fn resolve_filter_structure_handle<R: Read + Seek>(
     Ok(value)
 }
 
+#[cfg(test)]
 fn aligned_decode_params_handle<R: Read + Seek>(
     pdf: &mut Pdf<R>,
     decode_params: &ObjectHandle,
@@ -239,6 +249,7 @@ fn aligned_decode_params_handle<R: Read + Seek>(
         .collect()
 }
 
+#[cfg(test)]
 fn crypt_decode_params_filterable_handle<R: Read + Seek>(
     pdf: &mut Pdf<R>,
     decode_params: Option<&ObjectHandle>,
@@ -271,6 +282,7 @@ fn crypt_decode_params_filterable_handle<R: Read + Seek>(
             .all(|(key, _)| matches!(key.as_slice(), b"/Type" | b"/Name")))
 }
 
+#[cfg(test)]
 fn resolve_decode_param_dict_handle<R: Read + Seek>(
     pdf: &mut Pdf<R>,
     filters: &[Vec<u8>],
@@ -294,6 +306,7 @@ fn resolve_decode_param_dict_handle<R: Read + Seek>(
     Ok(ObjectHandle::dictionary(resolved))
 }
 
+#[cfg(test)]
 fn resolve_decode_param_for_filters_handle<R: Read + Seek>(
     pdf: &mut Pdf<R>,
     filters: &[Vec<u8>],
@@ -308,6 +321,7 @@ fn resolve_decode_param_for_filters_handle<R: Read + Seek>(
     Ok(value)
 }
 
+#[cfg(test)]
 fn resolve_decode_params_handle<R: Read + Seek>(
     pdf: &mut Pdf<R>,
     filters: &[Vec<u8>],
@@ -329,6 +343,7 @@ fn resolve_decode_params_handle<R: Read + Seek>(
     Ok(ObjectHandle::array(resolved_values))
 }
 
+#[cfg(test)]
 fn remove_identity_crypt_stages_handle(
     dictionary: &ObjectHandle,
     filters: &[Vec<u8>],
@@ -371,6 +386,7 @@ fn remove_identity_crypt_stages_handle(
     Ok(())
 }
 
+#[cfg(test)]
 fn normalized_filter_name(name: &[u8]) -> &[u8] {
     match name {
         b"AHx" => b"ASCIIHexDecode",
@@ -384,6 +400,7 @@ fn normalized_filter_name(name: &[u8]) -> &[u8] {
     }
 }
 
+#[cfg(test)]
 fn qpdf_filter_factory_exists(name: &[u8]) -> bool {
     matches!(
         normalized_filter_name(name),
@@ -397,6 +414,7 @@ fn qpdf_filter_factory_exists(name: &[u8]) -> bool {
     )
 }
 
+#[cfg(test)]
 fn filter_consumes_decode_key(filter: &[u8], key: &[u8]) -> bool {
     match normalized_filter_name(filter) {
         b"FlateDecode" => matches!(
