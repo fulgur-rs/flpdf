@@ -144,14 +144,14 @@ fn resolver_has_one_raw_source_xref_owner() {
 fn production_open_always_supplies_the_canonical_xref_owner() {
     let engine = production_source("engine.rs");
     let load_call = engine
-        .split_once("let loaded_state = match load_xref_state_from_bytes(")
+        .split_once("let loaded_state = match load_xref_state_from_source(")
         .and_then(|(_, rest)| rest.split_once("        ) {"))
         .map_or_else(
-            || panic!("Pdf::open must call load_xref_state_from_bytes"),
+            || panic!("Pdf::open must call load_xref_state_from_source"),
             |(call, _)| call,
         );
     assert!(
-        load_call.contains("Some(resolver.as_ref())"),
+        load_call.contains("resolver.as_ref()"),
         "Pdf::open must pass ResolverHandle as the xref owner: {load_call}"
     );
 

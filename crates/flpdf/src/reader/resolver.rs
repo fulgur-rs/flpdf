@@ -198,7 +198,7 @@ impl<R: Read + Seek + 'static> StreamInput<R> {
         self.reader.is_none()
     }
 
-    fn seek(&self, offset: u64) -> Result<()> {
+    pub(crate) fn seek(&self, offset: u64) -> Result<()> {
         let physical = (self.header_offset.get() as u64).saturating_add(offset);
         self.active_reader()?
             .borrow_mut()
@@ -206,7 +206,7 @@ impl<R: Read + Seek + 'static> StreamInput<R> {
         Ok(())
     }
 
-    fn tell(&self) -> Result<u64> {
+    pub(crate) fn tell(&self) -> Result<u64> {
         Ok(self
             .active_reader()?
             .borrow_mut()
@@ -3094,7 +3094,7 @@ impl<R: Read + Seek> ResolverHandle<R> {
     // position that a nested resolution can actually disturb.
 
     /// See [`ResolverCore::seek`].
-    fn seek(&self, offset: u64) -> Result<()> {
+    pub(crate) fn seek(&self, offset: u64) -> Result<()> {
         self.core.borrow_mut().seek(offset)
     }
 
@@ -3104,12 +3104,12 @@ impl<R: Read + Seek> ResolverHandle<R> {
     }
 
     /// See [`ResolverCore::tell`].
-    fn tell(&self) -> Result<u64> {
+    pub(crate) fn tell(&self) -> Result<u64> {
         self.core.borrow_mut().tell()
     }
 
     /// See [`ResolverCore::read`].
-    fn read(&self, buf: &mut [u8]) -> Result<usize> {
+    pub(crate) fn read(&self, buf: &mut [u8]) -> Result<usize> {
         self.core.borrow_mut().read(buf)
     }
 
