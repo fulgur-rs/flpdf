@@ -1,9 +1,18 @@
+fn normalize_source(source: &str) -> String {
+    source.replace("\r\n", "\n")
+}
+
+#[test]
+fn normalize_source_handles_windows_line_endings() {
+    assert_eq!(normalize_source("first\r\nsecond\r\n"), "first\nsecond\n");
+}
+
 #[test]
 fn qpdf_less_page_plan_adapters_are_not_publicly_reexported() {
-    let job_module = include_str!("../src/job/mod.rs");
-    let crate_root = include_str!("../src/lib.rs");
-    let cli = include_str!("../../flpdf-cli/src/main.rs");
-    let example = include_str!("../examples/extract_pages.rs");
+    let job_module = normalize_source(include_str!("../src/job/mod.rs"));
+    let crate_root = normalize_source(include_str!("../src/lib.rs"));
+    let cli = normalize_source(include_str!("../../flpdf-cli/src/main.rs"));
+    let example = normalize_source(include_str!("../examples/extract_pages.rs"));
 
     assert!(job_module.contains("#[cfg(test)]\nmod page_combine;"));
     assert!(!job_module.contains("pub use page_combine::{CombinedPage, CombinedPlan, InputSpec}"));
@@ -29,7 +38,7 @@ fn qpdf_less_page_plan_adapters_are_not_publicly_reexported() {
     assert!(!cli.contains("\n        out.push(InputSpec::new("));
     assert!(!example.contains("PagePlan"));
 
-    let page_plan = include_str!("../src/job/page_plan.rs");
+    let page_plan = normalize_source(include_str!("../src/job/page_plan.rs"));
     assert!(page_plan.contains("#[cfg(test)]\n    pub(crate) fn from_1based_indices"));
     assert!(page_plan.contains("#[cfg(test)]\n    pub(crate) fn source_page_count"));
     assert!(page_plan.contains("#[cfg(test)]\n    pub(crate) fn len"));
