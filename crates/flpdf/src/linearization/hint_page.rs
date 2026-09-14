@@ -298,8 +298,7 @@ pub(crate) fn non_page_owned_containers(
     let page_private_owner = |member: ObjectRef| -> Option<usize> {
         if let Some(optimization) = plan.optimization.as_ref() {
             return optimization
-                .page_users(member)
-                .find(|&page| page != 0)
+                .other_page_private_owner(member)
                 .map(|page| page as usize);
         }
         // Manually constructed plans have no canonical object-user map. Keep

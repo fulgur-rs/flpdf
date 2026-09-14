@@ -225,7 +225,7 @@ fn objstm_page_ownership_uses_the_canonical_object_user_map() {
         .map(|(section, _)| section)
         .expect("second-half container anchor route exists");
     assert!(
-        anchors.contains("page_users"),
+        anchors.contains("other_page_private_owner"),
         "part7 ObjStm ownership must use qpdf-shaped object-user ownership"
     );
     assert!(
@@ -240,7 +240,7 @@ fn objstm_page_ownership_uses_the_canonical_object_user_map() {
         .map(|(section, _)| section)
         .expect("page-owned container route exists");
     assert!(
-        container_filter.contains("page_users"),
+        container_filter.contains("other_page_private_owner"),
         "page-owned container filtering must use canonical object users"
     );
     assert!(
