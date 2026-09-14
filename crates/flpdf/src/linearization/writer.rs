@@ -4605,8 +4605,10 @@ mod tests {
     fn part7_owner_uses_the_manual_plan_fallback_without_a_set_table() {
         let member = ObjectRef::new(7, 0);
         let other = ObjectRef::new(8, 0);
-        let mut plan = LinearizationPlan::default();
-        plan.per_page_private_objects = vec![vec![], vec![member]];
+        let plan = LinearizationPlan {
+            per_page_private_objects: vec![vec![], vec![member]],
+            ..LinearizationPlan::default()
+        };
 
         assert_eq!(part7_owner_for_plan(&plan, member), Some(1));
         assert_eq!(part7_owner_for_plan(&plan, other), None);
