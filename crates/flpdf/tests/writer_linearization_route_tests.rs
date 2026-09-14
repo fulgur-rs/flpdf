@@ -169,6 +169,23 @@ fn linearization_plan_does_not_retain_a_derived_page_user_inverse_map() {
 }
 
 #[test]
+fn optimization_reverse_user_sets_use_compact_ordered_storage() {
+    let source = include_str!("../src/optimization.rs").replace("\r\n", "\n");
+    assert!(
+        source.contains("CompactObjectUserSet {"),
+        "object-user reverse values need a compact ordered-set owner"
+    );
+    assert!(
+        source.contains("BTreeSet<ObjectUser>"),
+        "large object-user cardinalities must retain a tree-backed ordered fallback"
+    );
+    assert!(
+        !source.contains("object_to_users: BTreeMap<ObjectRef, BTreeSet<ObjectUser>>"),
+        "the reverse table must not allocate a full BTreeSet value for every object"
+    );
+}
+
+#[test]
 fn prepare_file_for_write_is_owned_by_the_common_writer_boundary() {
     let writer_source = include_str!("../src/writer.rs").replace("\r\n", "\n");
     let write = writer_source
