@@ -33,17 +33,17 @@ container-above-max だった — `flpdf-hi08` / PR #1486）。本表は残る m
 
 | canonical | bridge | mixed | unknown | 合計 |
 |---|---|---|---|---|
-| 97 | 2 | 61 | 0 | 160 |
+| 98 | 2 | 60 | 0 | 160 |
 
 ### checker logical aggregate（259 rows）
 
 `scripts/check-qpdf-route-matrix.py --check` は、A〜E の160行に加えて
 E の qtest exception 表（物理98行を論理99ケースとして数える）を含む259 logical
-rowsを検証する。2026-09-14 の現行 `origin/main` (`42856189e7`) での集計は次のとおり。
+rowsを検証する。2026-09-14 の現行 `origin/main` (`c94aad9bc`) での集計は次のとおり。
 
 | canonical | bridge | mixed | unknown | 合計 |
 |---|---|---|---|---|
-| 121 | 10 | 128 | 0 | 259 |
+| 122 | 10 | 127 | 0 | 259 |
 
 したがって、160行の領域別表と259 logical rowsの checker 分母は異なる。どちらも
 parity 完了数ではなく、責務／経路の分類数である。
@@ -96,11 +96,12 @@ done | sort | uniq -c
 本表は「その責務に至る **経路が 1 本か**」を問う。✅ の行でも consumer 側に bridge が残っていれば
 本表では mixed / bridge になりうる。
 
-2026-09-14 の current-main audit anchor は `origin/main=42856189e7`、pinned qpdf は
+2026-09-14 の current-main audit anchor は `origin/main=c94aad9bc`、pinned qpdf は
 11.9.0 commit `3b97c9bd266b7c32ea36d3536e22dab77412886d` である。checker の実測は
-1054 qpdf citations / 906 flpdf citations / 259 logical rows、分類は
-canonical 121 / mixed 128 / bridge 10 / unknown 0。A〜E の160行だけを数える
-上の領域別集計は canonical 97 / mixed 61 / bridge 2 / unknown 0 なので、checker
+**この revision を適用した tree で** 1055 qpdf citations / 909 flpdf citations /
+259 logical rows、分類は
+canonical 122 / mixed 127 / bridge 10 / unknown 0。A〜E の160行だけを数える
+上の領域別集計は canonical 98 / mixed 60 / bridge 2 / unknown 0 なので、checker
 の259 logical rowsと混同しない。
 
 履歴行の例外: C44はpublic facadeとdeferred blobの責務を分離したmixed ownerとして追跡する。
@@ -115,7 +116,7 @@ D19/D30はcanonical ownerへ委譲するbyte-neutral test scaffolding、D27は�
 | [B. parser / xref recovery / warning・error・diagnostics](b-parser-recovery-diagnostics.md) | 34 | 20 | 0 | 14 | 0 |
 | [C. stream data provider / decode / retry / filter / encryption / `/Length`](c-stream-pipeline-encryption.md) | 42 | 35 | 2 | 5 | 0 |
 | [D. writer — reachability, ObjStm planning / renumber / emission, xref / trailer, encryption, linearize](d-writer.md) | 31 | 15 | 0 | 16 | 0 |
-| [E. QPDFJob / CLI / C API 相当の consumer・adaptor](e-job-cli-capi.md) | 29 | 11 | 0 | 18 | 0 |
+| [E. QPDFJob / CLI / C API 相当の consumer・adaptor](e-job-cli-capi.md) | 29 | 12 | 0 | 17 | 0 |
 
 ## 5. 責任境界と不変条件
 
@@ -190,7 +191,7 @@ D19/D30はcanonical ownerへ委譲するbyte-neutral test scaffolding、D27は�
 ## 6. 二重正本トラッカー
 
 追跡対象の symbol manifest は [tracked-symbols.txt](tracked-symbols.txt)。この matrix revision の
-classified row は 259 行で、canonical 121 / mixed 128 / bridge 10 / unknown 0（bridge + mixed は138行）である。
+classified row は 259 行で、canonical 122 / mixed 127 / bridge 10 / unknown 0（bridge + mixed は137行）である。
 内訳は A=24 / B=34 / C=42 / D=31 / E=128（E 表 29 行 + qtest exception 表 99 行）。
 `scripts/check-qpdf-route-matrix.py` も259行を報告する。classification tableの途中に散文行が
 入っても同じtableの状態を保持し、qtest exception tableの物理1行 `0/1` は論理2 caseとして数える。
@@ -596,7 +597,7 @@ primitive新設には既存consumerのRED、dead route削除には0 callerと移
 | **D27** pre-write reachability routes (完了) | 0 / 0 | **完了。** qpdf の `QPDFWriter::enqueueObject` / `enqueueObjectsStandard` を writer の emission boundary として採用し、single-source の旧 `sweep_unreachable_objects` と multi-source `--pages` の `_except` sweep をともに撤去した。single-source の qpdf-zlib byte gate と、multi-source の preserve control を維持する | A14（`.46` で完了）、D2/D3/D11（採番・body loop）は非対象 | **完了**（§7.3） |
 | A14 `Pdf::replace_object` → `ResolverHandle::replace_object` | 0 / 0 | **完了。** qpdf の public deletion 相当 `replaceObject(og, newNull())` に route を統合し、signature value stripping は eager deletion を行わず writer の到達性に委ねる。`--remove-restrictions --preserve-unreferenced` の qpdf byte compare も GREEN | A2 / A15 / A24 / A13（legacy cache/tombstone は別 slice） | `.46` で `Pdf::delete_object` と全 production/test caller を撤去した |
 | B14 `crates/flpdf/src/xref.rs::parse_xref_from_start` | 3 / 6 | **観測できず。** `probe:` 自分の startxref を指す `/Prev` を持つ 1 section PDF で `qpdf --check` / `flpdf --check` → 双方とも `file is damaged` / `loop detected following xref tables` / `Attempting to reconstruct cross-reference table` の 3 行・同順・exit 3。B14 が予測する診断の二重 push は現れない | なし（単一ファイル `crates/flpdf/src/xref.rs`） | 保留。RED が立たない。B-P1 は「二重 push は起きない」で決着させ、行の主張を弱める（§7.4 の後続 issue） |
-| C22 `crates/flpdf/src/writer/plain/body.rs::canonical_stream_filter_probe` | 初回2 / 0 | **観測できず（CLI 経路では）。** `probe: qpdf --static-id --normalize-content=y [--linearize] two.pdf` と flpdf 同等 → plain / `--linearize` の双方で byte 一致。早期 return を踏むには token filter 登録が要り、それは CLI から到達しない（C-U3 は library harness を要求する） | C20 canonical / C21 mixed（判定順序と責務境界を保つ） | 保留。harness を先に作る（§7.2 stream family の3） |
+| C22 `crates/flpdf/src/writer/plain/body.rs::canonical_stream_filter_probe` | 初回2 / 0 | **観測できず（CLI 経路では）。** `probe: qpdf --static-id --normalize-content=y [--linearize] two.pdf` と flpdf 同等 → plain / `--linearize` の双方で byte 一致。早期 return を踏むには token filter 登録が要り、それは CLI から到達しない（C-U3 は library harness を要求する） | C20 canonical / C21 canonical（判定順序と責務境界を保つ） | 保留。harness を先に作る（§7.2 stream family の3） |
 | D3 `crates/flpdf/src/writer/rewrite_renumber.rs::CanonicalCatalogFirstRenumber` | 初回5 / 0 | `flpdf-hi08` / PR #1486のencrypted Preserve修正はmerge済み。残る先行walkとemission統合は別責務 | D2 / D5 / D6 / D11 / D12 | 初回は保留。現在はD12共有primitive等を独立sliceにできる（§7.2.5） |
 
 E-29 は `.47` で完了したため候補表から除外した。`--no-warn` の open-time delivery は
@@ -661,15 +662,15 @@ warning collectionやtoken primitiveの移植を、領域A全体の統合完了�
 #### 7.2.3 stream（領域 C）
 
 1. **hygiene**（§7.4）— C19 / C28 の dead route 削除は `.42` で完了。C23 の `pub` 撤去は `.43` で完了。
-2. **C21 の辞書差** — `/F` `/FFilter` `/FDecodeParms` 削除の到達条件をoracle fixtureで固定し、qpdfの責務に沿って修正する。逸脱マーカーは修正完了の代替にしない。
+2. ~~**C21 の辞書差**~~ — 完了。`/F` `/FFilter` `/FDecodeParms` は `writer/object.rs::prepare_stream_dict_entries`（`crates/flpdf/src/writer/object.rs:1709-1712`）が全分岐で触らない契約を doc comment（`libqpdf/QPDFWriter.cc:1440-1485` 引用）と `tests/oracle/qpdf_refiltered_stream_dictionary_probe.cc` で固定済み。行分類も canonical。
 3. **C22** — C-U3 library harnessでplain/QDF cacheとlinearized probeの挙動を照合する。非対称だけで早期return撤去を決めない。
 4. **C42 / B11** — recovered length を qpdf 同様に全 span で pipe する経路として完了。表示専用の EOL metadata や framing extension は持たない。前提: probe C-U1。
-5. **C27** — bootstrapのdocument/source ownerを整えてからxref stream payloadのdecodeをcanonical pipeへ移す（`flpdf-3yn9.48.43`）。B17のxref entry構文処理の正本とは別責務である。
+5. ~~**C27**~~ — `.48.49` で canonical 化済み（§10 X-4 参照）。bootstrap-context decode は `ObjectHandle::get_stream_data(DecodeLevel::Specialized)` へ移行した。B17 の xref entry 構文処理の正本とは別責務である点は変わらない。
 6. **C44** — public `getStreamJSON` facade と deferred `StreamBlobProvider` 相当は `.48.47` で実装済み。残る C-U2 は provider 回数と lifetime を C++ harness で固定する probe。canonical C24 `write_stream_json` を二重pipeへ変更しない。
-7. **C4 / C8 / C9 / C25〜C29、E-27 / E-28** — provider/copy/decodeの不足primitiveを明示し、xrefとdriver test 0/1など既知consumerからbounded cutoverする。C43 の dead public wrapper は `flpdf-3yn9.48.91` で撤去済み。
+7. **C8 / C9 / C25 / C28、E-27 / E-28** — provider/copy/decodeの不足primitiveを明示し、xrefとdriver test 0/1など既知consumerからbounded cutoverする。C4 / C26 / C27 / C29 は行レベルで canonical 化済みのため本 step から外した。C43 の dead public wrapper は `flpdf-3yn9.48.91` で撤去済みだが、内部 owner が残るため行は bridge (ii) のまま（`flpdf-w5pjs`）。
 
 qpdf 呼び出し順を壊さない理由: §5.C 第 4 行（`willFilterStream` の判定順序）が 2 と 3 を
-C20 / C21 の**後ろ**に置く理由 — 判定順序の canonical owner が確定していない状態で早期 return を
+C20 の**後ろ**に置く理由 — 判定順序の canonical owner が確定していない状態で早期 return を
 外すと、veto → metadata / normalize / compress の排他 chain が経路ごとに別の結果になる。
 §5.C 第 1 行（stream の復号は pipe 時、文字列の復号は parse 時）が 4 と 5 の境界で、
 decode 経路を canonical `pipe_stream_data` へ寄せても復号のタイミングは動かないことを保証する。

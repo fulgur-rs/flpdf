@@ -452,8 +452,9 @@ not name or array` まで一致することを確認済み。
 の spec 読み取りを C9 の `stream_filter.rs::decode_filter_specs_from_handle` が
 production 経路として別実装で持つ。C9 の consumer が C7 へ寄るまで `mixed` のまま。
 C10 の runtime `registerStreamFilter` 欠落は、`match` という入れ物だけでは説明できない
-public 契約の欠落。C21 の `/F` / `/FFilter` / `/FDecodeParms` 削除も現在
-`writer/plain/body.rs:861-865` に残る。C21 はこの診断分裂・責務混在により `mixed` へ訂正した（C7 は上記のとおり、診断分裂の解消後も C9 との責務重複で `mixed` を維持）。
+public 契約の欠落。C21 は `writer/object.rs::prepare_stream_dict_entries`（`crates/flpdf/src/writer/object.rs:1709-1712`）が
+`/F` / `/FFilter` / `/FDecodeParms` を全分岐で触らない契約を doc comment と
+`tests/oracle/qpdf_refiltered_stream_dictionary_probe.cc` で固定しており、`canonical`（C7 は上記のとおり、診断分裂の解消後も C9 との責務重複で `mixed` を維持）。
 C10のcanonicalはbuilt-in lookupに限定し、runtime登録の公開契約は別issueで移植する。
 
 ## unknown / probe
@@ -463,12 +464,12 @@ C10のcanonicalはbuilt-in lookupに限定し、runtime登録の公開契約は�
 | U3 | C22 の caller ごとの callback timing と出力保持が qpdf の writer 責務に一致するか | plain / QDF は現在全 indirect stream の完成出力を cache する（`writer/plain/plan.rs:135-158`, `writer.rs:3847-3875`、closed `flpdf-25kg.2.2.15`）。qpdf の linearized optimizer は `QPDFWriter.cc:2543-2553` で明示的に事前 probe する。したがって early return の有無だけでは不一致とは言えない。stateful token filter / retry-aware provider の call order・warning・bytes を plain / QDF / linearize それぞれの qpdf owner と比較し、残る planner 分岐を確認する |
 | U4 | C17-C18 の reader/writer consumer が共有 primitive と同じ key を返すか | 完了。pinned qpdf headerをincludeしたC++ probeで、`objid=0x010203`、`generation=0x0405`、V={1,2,4,5}、R=6固定、key長={5,16,24,32}、AES/RC4を全組合せ確認し、`encryption_R` は qpdf原典でも未使用であることを確認した。結果を `crates/flpdf/src/encryption/primitives.rs` の32固定vectorで検証。qpdf側は1実装なので、reader/writerの旧2実装差分テストは不要になった |
 
-## 分類集計（2026-09-06 再監査時点）
+## 分類集計（current-main anchor 時点。README §1 の A〜E 集計と同じ tree で数える）
 
 | 分類 | 件数 | 行 |
 |---|---|---|
-| canonical | 30 | C1, C2, C3, C5, C6, C8, C10, C12, C13, C14, C15, C16, C17, C18, C20, C24, C25, C30, C31, C32, C33, C34, C35, C36, C37, C38, C39, C40, C41, C42 |
-| mixed | 10 | C4, C7, C9, C11, C21, C22, C26, C27, C29, C44 |
+| canonical | 35 | C1, C2, C3, C4, C5, C6, C8, C10, C12, C13, C14, C15, C16, C17, C18, C20, C21, C24, C25, C26, C27, C29, C30, C31, C32, C33, C34, C35, C36, C37, C38, C39, C40, C41, C42 |
+| mixed | 5 | C7, C9, C11, C22, C44 |
 | bridge | 2 | C28, C43 |
 | unknown | 0 | なし（C42 の pipe-side EOL subtraction は `flpdf-zvjf` と `flpdf-hj7v` で qpdf parity として解決） |
 
