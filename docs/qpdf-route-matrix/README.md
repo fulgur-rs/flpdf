@@ -98,7 +98,7 @@ done | sort | uniq -c
 
 2026-09-14 の current-main audit anchor は `origin/main=4bd6626e6`、pinned qpdf は
 11.9.0 commit `3b97c9bd266b7c32ea36d3536e22dab77412886d` である。checker の実測は
-1054 qpdf citations / 906 flpdf citations / 259 logical rows、分類は
+1054 qpdf citations / 909 flpdf citations / 259 logical rows、分類は
 canonical 122 / mixed 128 / bridge 9 / unknown 0。A〜E の160行だけを数える
 上の領域別集計は canonical 98 / mixed 61 / bridge 1 / unknown 0 なので、checker
 の259 logical rowsと混同しない。

@@ -467,8 +467,8 @@ C10のcanonicalはbuilt-in lookupに限定し、runtime登録の公開契約は�
 
 | 分類 | 件数 | 行 |
 |---|---|---|
-| canonical | 31 | C1, C2, C3, C5, C6, C8, C10, C12, C13, C14, C15, C16, C17, C18, C20, C24, C25, C30, C31, C32, C33, C34, C35, C36, C37, C38, C39, C40, C41, C42, C43 |
-| mixed | 10 | C4, C7, C9, C11, C21, C22, C26, C27, C29, C44 |
+| canonical | 36 | C1, C2, C3, C4, C5, C6, C8, C10, C12, C13, C14, C15, C16, C17, C18, C20, C21, C24, C25, C26, C27, C29, C30, C31, C32, C33, C34, C35, C36, C37, C38, C39, C40, C41, C42, C43 |
+| mixed | 5 | C7, C9, C11, C22, C44 |
 | bridge | 1 | C28 |
 | unknown | 0 | なし（C42 の pipe-side EOL subtraction は `flpdf-zvjf` と `flpdf-hj7v` で qpdf parity として解決） |
 
@@ -479,7 +479,7 @@ shared primitive 統合と oracle vector 検証が完了しているため、未
 C44 はその API を追跡する枠で、既存 C24 の不一致とは扱わない。`.48.47` で public `get_stream_json` と deferred blob が実装され API 欠落は解消したため、C-U2 に残るのは provider 回数と lifetime の harness probe のみである。
 
 `bridge` の判定基準は README §3 の通り **経路（route）に qpdf 対応物が無いこと** で、
-責務（responsibility）に qpdf 対応物があるかどうかとは別に問う。本領域の 2 行はこの区別で読む:
+責務（responsibility）に qpdf 対応物があるかどうかとは別に問う。本領域で残る bridge は C28 の 1 行であり、
 C28 は責務のレベルでも qpdf に対応物が無い。C43 も qpdf 固有 API ではないが、
 旧 public forwarding bridge の撤去後は flpdf 内部 owner が一本になったため canonical とする。
 qpdf 側にも実装にも対応物がある複数実装は `bridge` ではなく `mixed` に置く。旧C19は`.42`で削除した。
