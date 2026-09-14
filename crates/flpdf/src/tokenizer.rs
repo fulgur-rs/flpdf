@@ -161,6 +161,21 @@ pub(crate) struct PushedToken {
     pub(crate) unread: Option<u8>,
 }
 
+/// qpdf's live parser consumes integer candidates from the tokenizer's
+/// current buffers and retains only their numeric value. Keep this push-mode
+/// result allocation-free; the general [`PushedToken`] path remains owned for
+/// consumers that need token bytes after the tokenizer is reset.
+pub(crate) struct PushedInteger {
+    /// Outcome of converting the raw digits, carried rather than raised so the
+    /// caller can settle the input bookkeeping first. `QPDFTokenizer::nextToken`
+    /// unreads the delimiter and calls `setLastOffset` before any conversion
+    /// runs (`QPDFTokenizer.cc:961-968`); the `QUtil::string_to_ll` range error
+    /// is thrown later, from `QPDFParser::parse` (`QPDFParser.cc:87-88`).
+    pub(crate) value: Result<i64>,
+    pub(crate) raw_len: usize,
+    pub(crate) unread: Option<u8>,
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum State {
     InHexString,
@@ -323,6 +338,31 @@ impl<'a> Tokenizer<'a> {
         let token = self.take_ready_token();
         self.reset();
         Some(PushedToken { token, unread })
+    }
+
+    /// Consume a ready integer without moving its tokenizer-owned byte
+    /// buffers into an owned [`Token`]. qpdf's `QPDFParser::parseRemainder`
+    /// keeps the two integer candidates as numeric values and offsets while
+    /// `QPDFTokenizer::nextToken` reuses `raw_val` on the next token
+    /// (`QPDFParser.cc:140-175`, `QPDFTokenizer.cc:921-925`).
+    pub(crate) fn get_integer(&mut self) -> Option<PushedInteger> {
+        if self.state != State::TokenReady || self.token_type != TokenType::Integer {
+            return None;
+        }
+
+        let raw_len = self.raw.len();
+        let unread = if !self.in_token && !self.before_token {
+            self.char_to_unread
+        } else {
+            None
+        };
+        let value = parse_integer_bytes(&self.raw, self.token_start);
+        self.reset();
+        Some(PushedInteger {
+            value,
+            raw_len,
+            unread,
+        })
     }
 
     fn reset(&mut self) {
@@ -709,6 +749,24 @@ impl<'a> Tokenizer<'a> {
     }
 }
 
+fn parse_integer_bytes(bytes: &[u8], offset: usize) -> Result<i64> {
+    let text = std::str::from_utf8(bytes).map_err(|_| Error::parse(offset, "invalid integer"))?;
+    match text.parse::<i64>() {
+        Ok(value) => Ok(value),
+        Err(error)
+            if matches!(
+                error.kind(),
+                std::num::IntErrorKind::PosOverflow | std::num::IntErrorKind::NegOverflow
+            ) =>
+        {
+            Err(Error::System(format!(
+                "overflow/underflow converting {text} to 64-bit integer"
+            )))
+        }
+        Err(_) => Err(Error::parse(offset, "invalid integer")),
+    }
+}
+
 impl<'a> Tokenizer<'a> {
     pub fn position(&self) -> usize {
         self.pos
@@ -1033,7 +1091,7 @@ fn token_description(token: &Token) -> String {
 
 #[cfg(test)]
 mod tests {
-    use super::Tokenizer;
+    use super::{parse_integer_bytes, Tokenizer};
     use crate::Error;
 
     #[test]
@@ -1046,6 +1104,27 @@ mod tests {
             error,
             Error::Parse { message, .. }
                 if message == "expected integer in object stream header"
+        ));
+    }
+
+    #[test]
+    fn compact_integer_parser_preserves_qpdf_overflow_failure() {
+        let error = parse_integer_bytes(b"99999999999999999999", 17)
+            .expect_err("overflow must remain a system conversion failure");
+        assert!(matches!(
+            error,
+            Error::System(message)
+                if message == "overflow/underflow converting 99999999999999999999 to 64-bit integer"
+        ));
+    }
+
+    #[test]
+    fn compact_integer_parser_preserves_qpdf_invalid_token_failure() {
+        let error = parse_integer_bytes(b"not-an-integer", 23)
+            .expect_err("non-UTF-8 or non-numeric bytes must remain a parse failure");
+        assert!(matches!(
+            error,
+            Error::Parse { offset: 23, message } if message == "invalid integer"
         ));
     }
 }
