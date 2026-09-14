@@ -189,6 +189,31 @@ fn linearization_plan_does_not_retain_a_derived_page_user_inverse_map() {
 }
 
 #[test]
+fn linearization_page_reach_uses_the_canonical_object_user_map() {
+    let source = production_source(
+        include_str!("../src/linearization/plan.rs"),
+        "\n#[cfg(test)]\nmod tests {",
+    );
+    let page_partition = source
+        .split_once("let mut page_hints")
+        .and_then(|(_, rest)| rest.split_once("let provisional_set"))
+        .map(|(section, _)| section)
+        .expect("page partition route exists");
+    assert!(
+        page_partition.contains("optimization.page_users"),
+        "page reach must come from qpdf-shaped object-user ownership"
+    );
+    assert!(
+        !page_partition.contains("all_closures"),
+        "page partition must not clone all page closures for reach counts"
+    );
+    assert!(
+        !page_partition.contains("page_reach"),
+        "page partition must not retain a second object-to-page map"
+    );
+}
+
+#[test]
 fn optimization_reverse_user_sets_use_compact_ordered_storage() {
     let source = include_str!("../src/optimization.rs").replace("\r\n", "\n");
     assert!(
