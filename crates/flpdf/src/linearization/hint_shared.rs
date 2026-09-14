@@ -202,7 +202,7 @@ impl SharedObjectHintTable {
         // Fold first-page ObjStm members into their container (one shared entry
         // per container) so the table matches qpdf's positional shared list.
         // With no ObjStm packing this equals `plan.shared_hints`.
-        let shared_hints = plan.canonical_shared_hints(
+        let shared_hints = plan.canonical_raw_shared_hints(
             member_to_container,
             renumber,
             second_half_container_nums,
@@ -285,11 +285,22 @@ impl SharedObjectHintTable {
                 !open_document_container_nums.contains(cnum) && !rest_container_nums.contains(cnum)
             })
             .collect();
-        let part8_plain = plan
-            .part4_other_pages_shared
-            .iter()
-            .filter(|r| !member_to_container.contains_key(r))
-            .count() as u32;
+        let part8_plain = if plan.has_raw_projection_gap() {
+            plan.raw
+                .part4_other_pages_shared
+                .iter()
+                .filter(|object_gen| {
+                    object_gen
+                        .to_object_ref()
+                        .is_none_or(|object_ref| !member_to_container.contains_key(&object_ref))
+                })
+                .count() as u32
+        } else {
+            plan.part4_other_pages_shared
+                .iter()
+                .filter(|r| !member_to_container.contains_key(r))
+                .count() as u32
+        };
         let part8_entries = part8_containers.len() as u32 + part8_plain;
         let first_page_entries = shared_count.saturating_sub(part8_entries);
 
@@ -312,11 +323,11 @@ impl SharedObjectHintTable {
             shared_hints
                 .get(first_page_entries as usize)
                 .map_or(0, |e| {
-                    if e.object_ref.generation == u16::MAX {
-                        e.object_ref.number
+                    if let Some(container) = e.container {
+                        container
                     } else {
-                        renumber
-                            .new_for_original(e.object_ref)
+                        e.object
+                            .and_then(|object| renumber.new_for_raw(object))
                             .map_or(0, |r| r.number)
                     }
                 });

@@ -788,3 +788,31 @@ byte parity、container数、round-trip、`qpdf --check-linearization`、`qpdf -
 thumbnail + Catalog document-other の境界も strict parity で固定した。.48.87 の
 非 linearized pre-split/group境界検証と合わせ、h07n の
 linearized within-part ordering scopeは実装・実測済みである。
+
+## 2026-09-14: linearized raw QpdfObjGen identity (`flpdf-474u8`)
+
+qpdf 11.9.0 の `QPDFWriter::Members::obj_renumber` は linearization pass でも
+`std::map<QPDFObjGen, int>` を正本にし、`enqueueObject`、`unparseChild`、
+`assignCompressedObjectNumbers`、`calculateLinearizationData` の各境界で
+generation を含む identity を保持する（`include/qpdf/QPDFWriter.hh:668-670`;
+`libqpdf/QPDFWriter.cc:1057-1157,2510-2654,2858`）。`discardGeneration` は hint の
+object-number-only view を作る箇所に限られ、writer の canonical key ではない。
+
+flpdf の linearized plan/renumber/writer は、`Optimization` の raw object-user map と
+private raw part vectorsを `QpdfObjGen` で保持し、既存 `ObjectRef` fields は checked
+projection として残す。`QpdfObjGen::to_object_ref()` が拒否する `5 65536` も raw slotへ
+generation-zero output referenceを持ち、Catalog/page/trailer の child serializer は
+同じ raw lookupを使う。ObjStm の eligibility は qpdf と同じく valid gen-0 memberの境界に
+限定し、raw object を synthetic `ObjectRef` にして ObjStmへ押し込まない。
+
+linearized compact/QDF、stream dictionary、encrypted string、trailer `/ID`、ObjStm
+memberの両 passには `Fn(QpdfObjGen) -> ObjectRef` と raw removed setを渡す。stale
+generationの removed setは一度だけ writer boundaryで構築して借用し、per-objectの
+`ObjectRef` set再生成を行わない。hintの page/shared inputsもraw identityを使って
+object count、shared index、pass-1 byte lengthを計算するため、raw childの first-page、
+Part-8、ObjStm併用ケースで `qpdf --check-linearization` の警告を出さない。
+
+対象は `crates/flpdf/src/optimization.rs`、`linearization/{plan,renumber,hint_page,hint_shared,writer}.rs`、
+`writer/{object,encrypted_strings}.rs` と raw header regressionである。これは既存の
+non-linearized raw writer routeを変更せず、linearizationだけに残っていた
+`ObjectRef` narrowing gapを埋める bounded sliceである。

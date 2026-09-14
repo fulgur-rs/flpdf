@@ -43,7 +43,7 @@
 
   Expected: `Unsupported("qpdf raw object identity 5 65536 cannot be used by an ObjectRef map")` from the linearization writer.
 
-- [ ] **Step 3: Keep the test as the first implementation gate**
+- [x] **Step 3: Keep the test as the first implementation gate**
 
   Do not weaken the assertions to accept an inlined `45` or a missing Catalog key.
 
@@ -59,27 +59,27 @@
 - Consumes: `ObjectHandle::qpdf_obj_gen()`, `ResolverCore::object_cache`, and valid page references from `PageDocumentHelper`.
 - Produces: raw-keyed `Optimization` user/object maps, raw reachability and null-resurrection sets, and raw linearization plan partitions. Existing public plan fields are populated only through checked projections; private raw fields are the writer source of truth.
 
-- [ ] **Step 1: Write focused raw-plan tests**
+- [x] **Step 1: Write focused raw-plan tests**
 
   Extend the raw-generation test or a plan unit test to assert that the raw Catalog child is present in the plan's internal part-4 universe and receives a `RenumberMap` slot, without manufacturing an `ObjectRef` for `5 65536`.
 
-- [ ] **Step 2: Run the focused RED tests**
+- [x] **Step 2: Run the focused RED tests**
 
   Run the raw header test and the relevant linearization plan tests. Expected failure is either the existing ObjectRef conversion error or an absent raw plan slot, not a panic.
 
-- [ ] **Step 3: Implement raw user/object maps**
+- [x] **Step 3: Implement raw user/object maps**
 
   Change `Optimization` identity maps and callback stream identities to `QpdfObjGen`. Convert valid page roots to raw keys at the boundary, and record every indirect child from `qpdf_obj_gen()` regardless of `to_object_ref()`.
 
-- [ ] **Step 4: Implement raw reachability**
+- [x] **Step 4: Implement raw reachability**
 
   Change the linearization reachability and resurrectable-null walks to carry `QpdfObjGen`; keep object number zero non-indirect and keep stream `/Length` omission and array-vs-dictionary null visibility unchanged.
 
-- [ ] **Step 5: Build raw plan partitions and checked public projections**
+- [x] **Step 5: Build raw plan partitions and checked public projections**
 
   Keep the qpdf part ordering and outline/open-document precedence identical. Store raw part vectors, raw root/pages/info identities, raw page-private lists, raw shared hints, raw content-normalization set, and raw removed set. Populate existing `ObjectRef` views with `filter_map(QpdfObjGen::to_object_ref)` only at the documented public projection boundary.
 
-- [ ] **Step 6: Run GREEN tests and existing plan suites**
+- [x] **Step 6: Run GREEN tests and existing plan suites**
 
   Run:
 
@@ -102,23 +102,23 @@
 - Consumes: raw plan partitions and raw optimization user maps from Task 2.
 - Produces: `RenumberMap` keyed by `QpdfObjGen` with output `ObjectRef` values, raw lookup methods for writer/hint consumers, and an explicit `ObjectRef` lookup adapter only for existing public/test projection callers.
 
-- [ ] **Step 1: Write raw renumber and raw removed-set tests**
+- [x] **Step 1: Write raw renumber and raw removed-set tests**
 
   Add tests that map `QpdfObjGen::new(5, 65536)` to an output generation-zero reference, reject an absent raw key, and verify a raw removed identity is written as `null` without converting the set per object.
 
-- [ ] **Step 2: Run RED**
+- [x] **Step 2: Run RED**
 
   Run the new renumber tests and the linearized raw-child test. Expected failure is the missing raw lookup or ObjectRef-map conversion error.
 
-- [ ] **Step 3: Implement raw `RenumberMap` lookup and partition placement**
+- [x] **Step 3: Implement raw `RenumberMap` lookup and partition placement**
 
   Replace internal `BTreeMap<ObjectRef, ObjectRef>` identity keys with `BTreeMap<QpdfObjGen, ObjectRef>`. Keep the qpdf duplicate-object-number error when `discardGeneration` would collapse two generations. Ensure gen-0 ObjStm members are projected only where the qpdf ObjStm contract requires gen 0.
 
-- [ ] **Step 4: Update hint builders**
+- [x] **Step 4: Update hint builders**
 
   Make page/shared hint consumers query raw plan identities through raw renumber lookups; retain physical output object numbers and existing container sentinel representation only for generated hint-table entries, never as source identities.
 
-- [ ] **Step 5: Run GREEN renumber and hint suites**
+- [x] **Step 5: Run GREEN renumber and hint suites**
 
   Run:
 
@@ -141,23 +141,23 @@
 - Consumes: raw `RenumberMap`, raw plan partitions, raw removed set, and `ObjectHandle` lookup by raw identity.
 - Produces: `append_object`/`append_body_object` paths accepting `Fn(QpdfObjGen) -> Result<ObjectRef>` and `&BTreeSet<QpdfObjGen>`, with one raw removed set borrowed by pass 1, hint construction, and pass 2.
 
-- [ ] **Step 1: Write encrypted and stream raw-child coverage**
+- [x] **Step 1: Write encrypted and stream raw-child coverage**
 
   Extend the raw-child fixture to cover a raw stream child under linearization and an encrypted linearized write. Add a focused test for the raw removed set to assert dictionary-key omission and array-position null behavior.
 
-- [ ] **Step 2: Run RED**
+- [x] **Step 2: Run RED**
 
   Run the focused raw header and serializer tests. Expected failure is the ObjectRef conversion error or a missing raw serializer method.
 
-- [ ] **Step 3: Add/use raw writer emission methods**
+- [x] **Step 3: Add/use raw writer emission methods**
 
   Use the existing qpdf-keyed writer walkers where available and add only the missing non-QDF/encrypted raw wrapper. Remove linearization calls to `qpdf_obj_gen_map_from_object_ref_map` and `qpdf_obj_gen_set_from_object_ref_set`; those helpers remain for non-linearization callers that explicitly accept an ObjectRef boundary.
 
-- [ ] **Step 4: Construct removed state once**
+- [x] **Step 4: Construct removed state once**
 
   Build the raw removed set once in `write_linearized_for_pdf_writer`, pass it by reference through `do_write_pass` and both body/trailer serializers, and clear no per-object temporary set. Preserve qpdf's single `discardGeneration` check and pass-2 reuse.
 
-- [ ] **Step 5: Run GREEN linearization coverage**
+- [x] **Step 5: Run GREEN linearization coverage**
 
   Run:
 
@@ -179,7 +179,7 @@
 - Consumes: final raw implementation and qpdf source evidence.
 - Produces: source-faithful correspondence describing raw linearization identity and the one-time removed-set boundary.
 
-- [ ] **Step 1: Update correspondence and route matrix**
+- [x] **Step 1: Update correspondence and route matrix**
 
   Cite `QPDFWriter.hh:668`, `QPDFWriter.cc:1057-1157,2510-2654,2858`, `QPDF_optimization.cc:57-118,264-381`, and `QPDF_linearization.cc:963-1064,1173-1449`. State that `ObjectRef` is projection-only and that `discardGeneration` is intentional qpdf logic, not a raw identity store.
 
@@ -203,4 +203,3 @@
 - [ ] **Step 4: Create and deliver the Draft PR**
 
   Create the PR as Draft with the qpdf source evidence and verification summary. Inspect exact base/head SHA and every required CI check; only after all checks are successful and merge state is CLEAN mark it Ready. Immediately close `flpdf-474u8`, run `bd dep cycles`, `bd dolt push` and verify `Push complete.`, then push git. Do not merge.
-

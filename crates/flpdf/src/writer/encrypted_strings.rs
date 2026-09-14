@@ -44,6 +44,7 @@ pub(crate) struct EncryptedStringEmitter {
     encrypt_ref: ObjectRef,
 }
 
+#[allow(dead_code)]
 impl EncryptedStringEmitter {
     pub(crate) fn from_context(ctx: &EncryptionContext) -> Self {
         Self::from_context_with_boxed_iv_generator(ctx, Box::new(|iv| getrandom::fill(iv)))
@@ -135,6 +136,32 @@ impl EncryptedStringEmitter {
         map: &dyn Fn(QpdfObjGen) -> crate::Result<ObjectRef>,
         removed_refs: &std::collections::BTreeSet<QpdfObjGen>,
     ) -> crate::Result<()> {
+        self.write_handle_object_with_qpdf_obj_gen_map_and_mode(
+            out,
+            emitted_ref,
+            object_stream_index,
+            object,
+            true,
+            map,
+            removed_refs,
+        )
+    }
+
+    /// Raw-identity object emission for either compact or QDF output. The
+    /// linearization writer uses this for ordinary non-QDF objects as well as
+    /// QDF objects, so an out-of-range source generation is never narrowed to
+    /// `ObjectRef` during serialization.
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) fn write_handle_object_with_qpdf_obj_gen_map_and_mode(
+        &mut self,
+        out: &mut OutputSink<'_>,
+        emitted_ref: ObjectRef,
+        object_stream_index: Option<u32>,
+        object: &ObjectHandle,
+        qdf: bool,
+        map: &dyn Fn(QpdfObjGen) -> crate::Result<ObjectRef>,
+        removed_refs: &std::collections::BTreeSet<QpdfObjGen>,
+    ) -> crate::Result<()> {
         if emitted_ref == self.encrypt_ref {
             return write_encryption_dictionary_handle(out, object); // cov:ignore: the canonical body emits /Encrypt through its dedicated unencrypted dictionary path
         }
@@ -154,13 +181,22 @@ impl EncryptedStringEmitter {
                         plaintext,
                     )
                 };
-                object.write_object_qdf_with_qpdf_obj_gen_map_and_removed_with_string_writer(
-                    out,
-                    0,
-                    map,
-                    removed_refs,
-                    &mut write_string,
-                )
+                if qdf {
+                    object.write_object_qdf_with_qpdf_obj_gen_map_and_removed_with_string_writer(
+                        out,
+                        0,
+                        map,
+                        removed_refs,
+                        &mut write_string,
+                    )
+                } else {
+                    object.write_object_with_qpdf_obj_gen_map_and_removed_with_string_writer(
+                        out,
+                        map,
+                        removed_refs,
+                        &mut write_string,
+                    )
+                }
             })
     }
 

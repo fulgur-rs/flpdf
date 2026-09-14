@@ -72,6 +72,7 @@ use crate::linearization::plan::{
 };
 use crate::linearization::renumber::{ObjStmRelocation, RenumberMap, SecondHalfContainerAnchor};
 use crate::pipeline::stdio_file::StdioBuffer;
+use crate::qpdf_obj_gen::QpdfObjGen;
 use crate::writer::encrypted_strings::EncryptedStringEmitter;
 use crate::writer::object_streams::{
     emit_objstm_body_from_handles_with_writer, planner_config_from_options,
@@ -395,15 +396,17 @@ fn append_objstm_container_object<R: Read + Seek>(
     container: &ObjStmContainer,
     renumber: &RenumberMap,
     pdf: &mut Pdf<R>,
-    removed_refs: &BTreeSet<ObjectRef>,
+    removed_refs: &BTreeSet<QpdfObjGen>,
     options: &WriterOptions,
     encrypt_ctx: Option<&crate::writer::EncryptionContext>,
 ) -> Result<usize> {
     let filtered = matches!(effective_stream_policy(options), Some(CompressStreams::Yes));
-    let map = |object_ref| {
-        renumber.new_for_original(object_ref).ok_or_else(|| {
+    let map = |object_gen| {
+        renumber.new_for_raw(object_gen).ok_or_else(|| {
             crate::Error::Unsupported(format!(
-                "linearization writer: ObjStm member reference {object_ref} has no renumber entry"
+                "linearization writer: ObjStm member raw reference {} {} has no renumber entry",
+                object_gen.get_obj(),
+                object_gen.get_gen()
             ))
         })
     };
@@ -426,7 +429,7 @@ fn append_objstm_container_object<R: Read + Seek>(
         &members,
         &mut |out, _member_index, _object_ref, handle| {
             crate::writer::output::with_buffer_sink(out, |out| {
-                handle.write_object_with_ref_map_and_removed(out, &map, removed_refs)
+                handle.write_object_with_qpdf_obj_gen_map_and_removed(out, &map, removed_refs)
             })
         },
     )?;
@@ -611,14 +614,14 @@ fn append_object(
     out: &mut OutputSink<'_>,
     new_ref: ObjectRef,
     object: &ObjectHandle,
-    map: &dyn Fn(ObjectRef) -> Result<ObjectRef>,
-    removed_refs: &BTreeSet<ObjectRef>,
+    map: &dyn Fn(QpdfObjGen) -> Result<ObjectRef>,
+    removed_refs: &BTreeSet<QpdfObjGen>,
     encrypted_string_emitter: Option<&mut EncryptedStringEmitter>,
 ) -> Result<usize> {
     let offset = out.position_usize()?;
     out.write_bytes(format!("{} {} obj\n", new_ref.number, new_ref.generation).as_bytes())?;
     if let Some(emitter) = encrypted_string_emitter {
-        emitter.write_handle_object_with_ref_map(
+        emitter.write_handle_object_with_qpdf_obj_gen_map_and_mode(
             out,
             new_ref,
             None,
@@ -628,7 +631,7 @@ fn append_object(
             removed_refs,
         )?; // cov:ignore: canonical handle emission only errors for an invalid source graph.
     } else {
-        object.write_object_with_ref_map_and_removed(out, map, removed_refs)?;
+        object.write_object_with_qpdf_obj_gen_map_and_removed(out, map, removed_refs)?;
     }
     out.write_bytes(b"\nendobj\n")?;
     Ok(offset)
@@ -636,23 +639,25 @@ fn append_object(
 
 /// Append one live-handle body object in output-number space.
 #[allow(clippy::too_many_arguments)]
-fn append_body_object(
+fn append_body_object_with_raw_identity(
     out: &mut OutputSink<'_>,
     new_ref: ObjectRef,
-    original_ref: ObjectRef,
+    original_ref: QpdfObjGen,
     object: &ObjectHandle,
     options: &WriterOptions,
     encrypt_ctx: Option<&crate::writer::EncryptionContext>,
     encrypted_string_emitter: Option<&mut EncryptedStringEmitter>,
     renumber: &RenumberMap,
-    removed_refs: &BTreeSet<ObjectRef>,
-    content_normalize_refs: &BTreeSet<ObjectRef>,
+    removed_refs: &BTreeSet<QpdfObjGen>,
+    content_normalize_refs: &BTreeSet<QpdfObjGen>,
 ) -> Result<usize> {
     object.try_dereference()?;
-    let map = |object_ref| {
-        renumber.new_for_original(object_ref).ok_or_else(|| {
+    let map = |object_gen| {
+        renumber.new_for_raw(object_gen).ok_or_else(|| {
             crate::Error::Unsupported(format!(
-                "linearization writer: reference {object_ref} has no renumber entry"
+                "linearization writer: raw reference {} {} has no renumber entry",
+                object_gen.get_obj(),
+                object_gen.get_gen()
             ))
         })
     };
@@ -676,8 +681,9 @@ fn append_body_object(
         )?; // cov:ignore: LLVM maps this covered stream-output call terminator to a zero-count continuation region
     let mut entries = dict.try_as_dictionary()?.unwrap_or_default();
     let payload_ctx = encrypt_ctx.filter(|ctx| new_ref != ctx.encrypt_ref);
-    let cleartext_metadata = payload_ctx
-        .is_some_and(|ctx| !ctx.encrypt_metadata && ctx.metadata_ref == Some(original_ref));
+    let cleartext_metadata = payload_ctx.is_some_and(|ctx| {
+        !ctx.encrypt_metadata && ctx.metadata_ref == original_ref.to_object_ref()
+    });
     // qpdf clears the active data key for cleartext metadata and leaves the
     // stream dictionary's ordinary filter policy to `unparseObject`; it does
     // not inject a synthetic `/Crypt /Identity` stage here
@@ -696,7 +702,7 @@ fn append_body_object(
     let offset = out.position_usize()?;
     out.write_bytes(format!("{} {} obj\n", new_ref.number, new_ref.generation).as_bytes())?;
     if let Some(emitter) = encrypted_string_emitter {
-        emitter.write_handle_stream_dict_with_ref_map(
+        emitter.write_handle_stream_dict_with_qpdf_obj_gen_map(
             out,
             new_ref,
             None,
@@ -711,7 +717,7 @@ fn append_body_object(
             None,
         )?; // cov:ignore: canonical stream-dictionary emission only errors for an invalid source graph.
     } else {
-        dict.write_stream_body_with_ref_map_and_removed_with_options(
+        dict.write_stream_body_with_qpdf_obj_gen_map_and_removed_with_options(
             out,
             dictionary_options,
             &map,
@@ -750,14 +756,81 @@ fn append_body_object_for_ref<R: Read + Seek>(
     encrypt_ctx: Option<&crate::writer::EncryptionContext>,
     encrypted_string_emitter: Option<&mut EncryptedStringEmitter>,
     renumber: &RenumberMap,
+    removed_refs: &BTreeSet<QpdfObjGen>,
+    content_normalize_refs: &BTreeSet<QpdfObjGen>,
+) -> Result<usize> {
+    let object = pdf.get_object_handle(original_ref);
+    append_body_object_with_raw_identity(
+        out,
+        new_ref,
+        QpdfObjGen::try_from_object_ref(original_ref)?,
+        &object,
+        options,
+        encrypt_ctx,
+        encrypted_string_emitter,
+        renumber,
+        removed_refs,
+        content_normalize_refs,
+    )
+}
+
+/// Compatibility adapter for the test-only helper surface and callers that
+/// already own a checked `ObjectRef`. The linearization production path uses
+/// [`append_body_object_with_raw_identity`] so its removed set is prepared at
+/// the writer boundary rather than rebuilt for each object.
+#[cfg(test)]
+#[allow(clippy::too_many_arguments)]
+fn append_body_object(
+    out: &mut OutputSink<'_>,
+    new_ref: ObjectRef,
+    original_ref: ObjectRef,
+    object: &ObjectHandle,
+    options: &WriterOptions,
+    encrypt_ctx: Option<&crate::writer::EncryptionContext>,
+    encrypted_string_emitter: Option<&mut EncryptedStringEmitter>,
+    renumber: &RenumberMap,
     removed_refs: &BTreeSet<ObjectRef>,
     content_normalize_refs: &BTreeSet<ObjectRef>,
 ) -> Result<usize> {
-    let object = pdf.get_object_handle(original_ref);
-    append_body_object(
+    let raw_removed_refs =
+        crate::writer::object::qpdf_obj_gen_set_from_object_ref_set(removed_refs)?;
+    let raw_content_normalize_refs = content_normalize_refs
+        .iter()
+        .filter_map(|object_ref| QpdfObjGen::try_from_object_ref(*object_ref).ok())
+        .collect();
+    append_body_object_with_raw_identity(
         out,
         new_ref,
-        original_ref,
+        QpdfObjGen::try_from_object_ref(original_ref)?,
+        object,
+        options,
+        encrypt_ctx,
+        encrypted_string_emitter,
+        renumber,
+        &raw_removed_refs,
+        &raw_content_normalize_refs,
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
+fn append_body_object_for_raw<R: Read + Seek>(
+    out: &mut OutputSink<'_>,
+    pdf: &mut Pdf<R>,
+    new_ref: ObjectRef,
+    original_gen: QpdfObjGen,
+    options: &WriterOptions,
+    encrypt_ctx: Option<&crate::writer::EncryptionContext>,
+    encrypted_string_emitter: Option<&mut EncryptedStringEmitter>,
+    renumber: &RenumberMap,
+    removed_refs: &BTreeSet<QpdfObjGen>,
+    content_normalize_refs: &BTreeSet<QpdfObjGen>,
+) -> Result<usize> {
+    let object =
+        pdf.get_object_handle_by_raw_identity(original_gen.get_obj(), original_gen.get_gen());
+    append_body_object_with_raw_identity(
+        out,
+        new_ref,
+        original_gen,
         &object,
         options,
         encrypt_ctx,
@@ -855,8 +928,8 @@ fn write_part1_xref_and_trailer(
     info_new_ref: Option<ObjectRef>,
     source_trailer: &ObjectHandle,
     canonical_entries: &[(Vec<u8>, Vec<u8>)],
-    map: &dyn Fn(ObjectRef) -> Result<ObjectRef>,
-    removed_refs: &BTreeSet<ObjectRef>,
+    map: &dyn Fn(QpdfObjGen) -> Result<ObjectRef>,
+    removed_refs: &BTreeSet<QpdfObjGen>,
     id_writer: Option<crate::pdf_syntax::ReborrowableIdWriter>,
     encrypt_ctx: Option<&crate::writer::EncryptionContext>,
     pass1: bool,
@@ -974,7 +1047,7 @@ fn write_part1_xref_and_trailer(
     let id_value = source_trailer.try_get_key(b"/ID")?;
     match id_writer {
         Some(write_id) => write_id(out),
-        None => id_value.write_id_value_with_ref_map(out, map, removed_refs),
+        None => id_value.write_id_value_with_qpdf_obj_gen_map(out, map, removed_refs),
     }?; // cov:ignore: direct trailer ID serialization is validated by canonical handle tests
 
     // /Encrypt — reference to the `/Encrypt` dictionary object, written right
@@ -1097,8 +1170,8 @@ fn write_main_xref_and_trailer(
     param_slot: u32, // /Size of the main subsection — covers objects [0, param_slot)
     first_page_xref_offset: usize,
     source_trailer: &ObjectHandle,
-    map: &dyn Fn(ObjectRef) -> Result<ObjectRef>,
-    removed_refs: &BTreeSet<ObjectRef>,
+    map: &dyn Fn(QpdfObjGen) -> Result<ObjectRef>,
+    removed_refs: &BTreeSet<QpdfObjGen>,
     id_writer: Option<crate::pdf_syntax::ReborrowableIdWriter>,
 ) -> Result<(usize, usize)> {
     let xref_start = out.position_usize()?;
@@ -1128,7 +1201,7 @@ fn write_main_xref_and_trailer(
     let id_value = source_trailer.try_get_key(b"/ID")?;
     match id_writer {
         Some(write_id) => write_id(out),
-        None => id_value.write_id_value_with_ref_map(out, map, removed_refs),
+        None => id_value.write_id_value_with_qpdf_obj_gen_map(out, map, removed_refs),
     }?; // cov:ignore: direct trailer ID serialization is validated by canonical handle tests
     out.write_bytes(b" >>")?;
     out.write_bytes(format!("\nstartxref\n{}\n%%EOF\n", first_page_xref_offset).as_bytes())?;
@@ -1204,8 +1277,8 @@ struct FinalFirstPageXref<'a> {
 /// (`crates/flpdf/src/writer/plain/plan.rs`).
 fn canonical_linearization_trailer_entries(
     trailer: &ObjectHandle,
-    map: &dyn Fn(ObjectRef) -> Result<ObjectRef>,
-    removed_refs: &BTreeSet<ObjectRef>,
+    map: &dyn Fn(QpdfObjGen) -> Result<ObjectRef>,
+    removed_refs: &BTreeSet<QpdfObjGen>,
 ) -> Result<Vec<(Vec<u8>, Vec<u8>)>> {
     let entries = trailer.try_as_dictionary()?.unwrap_or_default();
     let mut serialized = Vec::with_capacity(entries.len());
@@ -1228,22 +1301,19 @@ fn canonical_linearization_trailer_entries(
         ) {
             continue;
         }
-        let removed = value
-            .object_ref()
-            .is_some_and(|object_ref| object_ref.number == 0 || removed_refs.contains(&object_ref))
-            || value.object_ref().is_some_and(|object_ref| {
-                object_ref.number == 0 || removed_refs.contains(&object_ref)
-            });
+        let removed = value.qpdf_obj_gen().is_some_and(|object_gen| {
+            !object_gen.is_indirect() || removed_refs.contains(&object_gen)
+        });
         if removed || value.try_is_null()? {
             continue;
         }
         let mut value_bytes = Vec::new();
-        if let Some(object_ref) = value.object_ref() {
-            let mapped = map(object_ref)?;
+        if let Some(object_gen) = value.qpdf_obj_gen() {
+            let mapped = map(object_gen)?;
             value_bytes.extend_from_slice(mapped.to_string().as_bytes());
         } else {
             crate::writer::output::with_buffer_sink(&mut value_bytes, |out| {
-                value.write_object_with_ref_map_and_removed(out, map, removed_refs)
+                value.write_object_with_qpdf_obj_gen_map_and_removed(out, map, removed_refs)
             })?;
         }
         serialized.push((key, value_bytes));
@@ -2141,6 +2211,8 @@ struct FinalLinearizedLayout<'a> {
 fn do_write_pass<R: Read + Seek>(
     plan: &LinearizationPlan,
     renumber: &RenumberMap,
+    raw_removed_refs: &BTreeSet<QpdfObjGen>,
+    raw_content_normalize_refs: &BTreeSet<QpdfObjGen>,
     pdf: &mut Pdf<R>,
     output: &mut OutputSink<'_>,
     part1: &Part1Bytes,
@@ -2217,17 +2289,19 @@ fn do_write_pass<R: Read + Seek>(
         .max()
         .unwrap_or(0);
 
-    let trailer_map = |object_ref| {
+    let trailer_map = |object_gen| {
         // cov:ignore-start: planner reachability and renumber placement cover every live trailer reference.
-        renumber.new_for_original(object_ref).ok_or_else(|| {
+        renumber.new_for_raw(object_gen).ok_or_else(|| {
             crate::Error::Unsupported(format!(
-                "linearization writer: trailer reference {object_ref} has no renumber entry"
+                "linearization writer: trailer raw reference {} {} has no renumber entry",
+                object_gen.get_obj(),
+                object_gen.get_gen()
             ))
         })
         // cov:ignore-end
     }; // cov:ignore: planner-produced trailer map is complete by construction.
     let canonical_entries =
-        canonical_linearization_trailer_entries(source_trailer, &trailer_map, &plan.removed_refs)?;
+        canonical_linearization_trailer_entries(source_trailer, &trailer_map, raw_removed_refs)?;
 
     // The classic Part-1 mini-xref + first trailer is only emitted on the
     // non-ObjStm path.  For ObjStm-bearing output the first-page (Part-1)
@@ -2272,7 +2346,7 @@ fn do_write_pass<R: Read + Seek>(
             source_trailer,
             &canonical_entries,
             &trailer_map,
-            &plan.removed_refs,
+            raw_removed_refs,
             id_writer.as_deref_mut(),
             encrypt_ctx,
             pass1_digest,
@@ -2354,17 +2428,17 @@ fn do_write_pass<R: Read + Seek>(
         let catalog = pdf
             .get_object_handle(catalog_orig)
             .output_root_copy_with_adbe(final_pdf_version, final_extension_level, true)?;
-        let offset = append_body_object(
+        let offset = append_body_object_with_raw_identity(
             output,
             catalog_new_ref,
-            catalog_orig,
+            QpdfObjGen::try_from_object_ref(catalog_orig)?,
             &catalog,
             options,
             encrypt_ctx,
             encrypted_string_emitter.as_deref_mut(),
             renumber,
-            &plan.removed_refs,
-            &plan.content_normalize_refs,
+            raw_removed_refs,
+            raw_content_normalize_refs,
         )?; // cov:ignore: planner-produced Catalog references are valid by construction.
         xref_offsets.insert(catalog_new_ref.number, offset);
         catalog_emitted_early = true;
@@ -2382,6 +2456,10 @@ fn do_write_pass<R: Read + Seek>(
     enum OpenDocumentEmit<'a> {
         Plain {
             original: ObjectRef,
+            new_ref: ObjectRef,
+        },
+        Raw {
+            original: QpdfObjGen,
             new_ref: ObjectRef,
         },
         Container(&'a ObjStmContainer),
@@ -2418,6 +2496,25 @@ fn do_write_pass<R: Read + Seek>(
             },
         ));
     }
+    for &original_gen in &plan.raw.part4_open_document_plain {
+        if original_gen.to_object_ref().is_some() {
+            continue;
+        }
+        let Some(new_ref) = renumber.new_for_raw(original_gen) else {
+            return Err(crate::Error::Unsupported(format!(
+                "raw open-document identity {} {} has no renumber entry",
+                original_gen.get_obj(),
+                original_gen.get_gen()
+            )));
+        };
+        open_document_emits.push((
+            new_ref.number,
+            OpenDocumentEmit::Raw {
+                original: original_gen,
+                new_ref,
+            },
+        ));
+    }
     for container in &objstm_layout.open_document {
         open_document_emits.push((
             container.container_new_num,
@@ -2437,9 +2534,25 @@ fn do_write_pass<R: Read + Seek>(
                     encrypt_ctx,
                     encrypted_string_emitter.as_deref_mut(),
                     renumber,
-                    &plan.removed_refs,
-                    &plan.content_normalize_refs,
+                    raw_removed_refs,
+                    raw_content_normalize_refs,
                 )?; // cov:ignore: planner-produced open-document references are valid by construction.
+                xref_offsets.insert(new_ref.number, offset);
+                report_progress_event(options)?;
+            }
+            OpenDocumentEmit::Raw { original, new_ref } => {
+                let offset = append_body_object_for_raw(
+                    output,
+                    pdf,
+                    new_ref,
+                    original,
+                    options,
+                    encrypt_ctx,
+                    encrypted_string_emitter.as_deref_mut(),
+                    renumber,
+                    raw_removed_refs,
+                    raw_content_normalize_refs,
+                )?; // cov:ignore: planner-produced raw open-document identities are valid by construction.
                 xref_offsets.insert(new_ref.number, offset);
                 report_progress_event(options)?;
             }
@@ -2449,7 +2562,7 @@ fn do_write_pass<R: Read + Seek>(
                     container,
                     renumber,
                     pdf,
-                    &plan.removed_refs,
+                    raw_removed_refs,
                     options,
                     encrypt_ctx,
                 )?; // cov:ignore: error requires an internal planner/renumber inconsistency.
@@ -2530,6 +2643,7 @@ fn do_write_pass<R: Read + Seek>(
     // order agrees with RenumberMap and the hint table.
     enum FirstPageEmit<'a> {
         Plain(ObjectRef),
+        Raw(QpdfObjGen),
         Container(&'a ObjStmContainer),
     }
     let mut first_page_emits: Vec<(u32, FirstPageEmit<'_>)> = Vec::new();
@@ -2554,6 +2668,24 @@ fn do_write_pass<R: Read + Seek>(
         // cov:ignore-end
         first_page_emits.push((new_ref.number, FirstPageEmit::Plain(*original_ref)));
     }
+    for original_gen in plan
+        .raw
+        .part2_objects
+        .iter()
+        .chain(&plan.raw.part3_objects)
+        .chain(&plan.raw.part6_outline_objects)
+        .copied()
+        .filter(|object_gen| object_gen.to_object_ref().is_none())
+    {
+        let Some(new_ref) = renumber.new_for_raw(original_gen) else {
+            return Err(crate::Error::Unsupported(format!(
+                "raw first-page identity {} {} has no renumber entry",
+                original_gen.get_obj(),
+                original_gen.get_gen()
+            )));
+        };
+        first_page_emits.push((new_ref.number, FirstPageEmit::Raw(original_gen)));
+    }
     for container in &objstm_layout.part3 {
         first_page_emits.push((
             container.container_new_num,
@@ -2577,9 +2709,28 @@ fn do_write_pass<R: Read + Seek>(
                     encrypt_ctx,
                     encrypted_string_emitter.as_deref_mut(),
                     renumber,
-                    &plan.removed_refs,
-                    &plan.content_normalize_refs,
+                    raw_removed_refs,
+                    raw_content_normalize_refs,
                 )?; // cov:ignore: planner-produced first-page references are valid by construction.
+                xref_offsets.insert(new_ref.number, offset);
+                report_progress_event(options)?;
+            }
+            FirstPageEmit::Raw(original_gen) => {
+                let new_ref = renumber
+                    .new_for_raw(original_gen)
+                    .expect("raw first-page object renumber entry checked above");
+                let offset = append_body_object_for_raw(
+                    output,
+                    pdf,
+                    new_ref,
+                    original_gen,
+                    options,
+                    encrypt_ctx,
+                    encrypted_string_emitter.as_deref_mut(),
+                    renumber,
+                    raw_removed_refs,
+                    raw_content_normalize_refs,
+                )?; // cov:ignore: planner-produced raw first-page identities are valid by construction.
                 xref_offsets.insert(new_ref.number, offset);
                 report_progress_event(options)?;
             }
@@ -2589,7 +2740,7 @@ fn do_write_pass<R: Read + Seek>(
                     container,
                     renumber,
                     pdf,
-                    &plan.removed_refs,
+                    raw_removed_refs,
                     options,
                     encrypt_ctx,
                 )?; // cov:ignore: error requires an internal planner/renumber inconsistency.
@@ -2631,6 +2782,7 @@ fn do_write_pass<R: Read + Seek>(
     // are written inside their container; the early-written catalog is skipped.
     enum Part4Emit<'a> {
         Plain(ObjectRef),
+        Raw(QpdfObjGen),
         Container(&'a ObjStmContainer),
     }
     let mut part4_emits: Vec<(u32, Part4Emit)> = Vec::new();
@@ -2655,6 +2807,25 @@ fn do_write_pass<R: Read + Seek>(
         };
         part4_emits.push((new_ref.number, Part4Emit::Plain(original_ref)));
     }
+    for original_gen in plan
+        .raw
+        .part4_other_pages_private
+        .iter()
+        .chain(&plan.raw.part4_other_pages_shared)
+        .chain(&plan.raw.part4_rest)
+        .chain(&plan.raw.part9_outline_objects)
+        .copied()
+        .filter(|object_gen| object_gen.to_object_ref().is_none())
+    {
+        let Some(new_ref) = renumber.new_for_raw(original_gen) else {
+            return Err(crate::Error::Unsupported(format!(
+                "raw Part-4 identity {} {} has no renumber entry",
+                original_gen.get_obj(),
+                original_gen.get_gen()
+            )));
+        };
+        part4_emits.push((new_ref.number, Part4Emit::Raw(original_gen)));
+    }
     for container in &objstm_layout.part4 {
         part4_emits.push((container.container_new_num, Part4Emit::Container(container)));
     }
@@ -2674,9 +2845,28 @@ fn do_write_pass<R: Read + Seek>(
                     encrypt_ctx,
                     encrypted_string_emitter.as_deref_mut(),
                     renumber,
-                    &plan.removed_refs,
-                    &plan.content_normalize_refs,
+                    raw_removed_refs,
+                    raw_content_normalize_refs,
                 )?; // cov:ignore: planner-produced Part-4 references are valid by construction.
+                xref_offsets.insert(new_ref.number, offset);
+                report_progress_event(options)?;
+            }
+            Part4Emit::Raw(original_gen) => {
+                let new_ref = renumber
+                    .new_for_raw(*original_gen)
+                    .expect("raw Part-4 object renumber entry checked above");
+                let offset = append_body_object_for_raw(
+                    output,
+                    pdf,
+                    new_ref,
+                    *original_gen,
+                    options,
+                    encrypt_ctx,
+                    encrypted_string_emitter.as_deref_mut(),
+                    renumber,
+                    raw_removed_refs,
+                    raw_content_normalize_refs,
+                )?; // cov:ignore: planner-produced raw Part-4 identities are valid by construction.
                 xref_offsets.insert(new_ref.number, offset);
                 report_progress_event(options)?;
             }
@@ -2686,7 +2876,7 @@ fn do_write_pass<R: Read + Seek>(
                     container,
                     renumber,
                     pdf,
-                    &plan.removed_refs,
+                    raw_removed_refs,
                     options,
                     encrypt_ctx,
                 )?; // cov:ignore: error requires an internal planner/renumber inconsistency.
@@ -2744,7 +2934,7 @@ fn do_write_pass<R: Read + Seek>(
             part1_classic_xref_offset,
             source_trailer,
             &trailer_map,
-            &plan.removed_refs,
+            raw_removed_refs,
             // Last use of `id_writer` — move it (no reborrow needed).
             id_writer,
         )?; // cov:ignore: the validated linearization plan makes this serializer error path defensive.
@@ -3087,8 +3277,9 @@ fn preserved_source_container_number(
 /// planning already collapses stale generations before this point.
 fn reject_multiple_generations(plan: &LinearizationPlan) -> Result<()> {
     let mut previous_number = None;
-    for object_ref in plan.renumber_assigned_refs() {
-        if previous_number == Some(object_ref.number) {
+    for object_gen in plan.renumber_assigned_raw() {
+        let object_number = object_gen.get_obj();
+        if previous_number == Some(object_number) {
             return Err(crate::Error::Unsupported(
                 "QPDF cannot currently linearize files that contain multiple objects with the \
                  same object ID and different generations.  If you see this error message, \
@@ -3098,7 +3289,7 @@ fn reject_multiple_generations(plan: &LinearizationPlan) -> Result<()> {
                     .to_string(),
             ));
         }
-        previous_number = Some(object_ref.number);
+        previous_number = Some(object_number);
     }
     Ok(())
 }
@@ -3827,10 +4018,16 @@ fn write_linearized_impl<R: Read + Seek>(
             )
         })?;
 
-    let info_new_ref: Option<ObjectRef> = source_trailer_handle
-        .try_get_key(b"/Info")?
-        .object_ref()
-        .and_then(|orig| renumber.new_for_original(orig));
+    let info_handle = source_trailer_handle.try_get_key(b"/Info")?;
+    let info_new_ref: Option<ObjectRef> = plan
+        .raw
+        .info
+        .and_then(|object_gen| renumber.new_for_raw(object_gen))
+        .or_else(|| {
+            info_handle
+                .qpdf_obj_gen()
+                .and_then(|object_gen| renumber.new_for_raw(object_gen))
+        });
 
     let first_page_object_new_num: u32 = {
         let first_page_hint = plan.page_hints.first().ok_or_else(|| {
@@ -3873,6 +4070,12 @@ fn write_linearized_impl<R: Read + Seek>(
     // without `/Filter`; Compress emits `/FlateDecode`.
     let structural_streams_filtered =
         matches!(effective_stream_policy(options), Some(CompressStreams::Yes));
+    let raw_removed_refs: BTreeSet<QpdfObjGen> = plan
+        .removed_refs
+        .iter()
+        .filter_map(|object_ref| QpdfObjGen::try_from_object_ref(*object_ref).ok())
+        .collect();
+    let raw_content_normalize_refs = &plan.raw.content_normalize_refs;
     // ------------------------------------------------------------------
     // Build qpdf's first-pass representation unconditionally. It is the source
     // for hint-table offsets and lengths, and is also the source of the
@@ -3900,6 +4103,8 @@ fn write_linearized_impl<R: Read + Seek>(
     let pass1_result = do_write_pass(
         plan,
         renumber,
+        &raw_removed_refs,
+        raw_content_normalize_refs,
         pdf,
         &mut pass1_sink,
         &pass1_part1,
@@ -3985,12 +4190,25 @@ fn write_linearized_impl<R: Read + Seek>(
                 .unwrap_or(0) as u64
         })
         .sum();
+    let raw_plain_byte_len = |orig: &QpdfObjGen| -> u64 {
+        renumber
+            .new_for_raw(*orig)
+            .and_then(|new_ref| byte_lengths.get(&new_ref.number).copied())
+            .unwrap_or(0) as u64
+    };
+    let raw_part3_plain_len: u64 = plan
+        .raw
+        .part3_objects
+        .iter()
+        .filter(|object_gen| object_gen.to_object_ref().is_none())
+        .map(raw_plain_byte_len)
+        .sum();
     let part3_container_len: u64 = objstm_layout
         .part3
         .iter()
         .map(|c| byte_lengths.get(&c.container_new_num).copied().unwrap_or(0) as u64)
         .sum();
-    let part3_byte_len: u64 = part3_plain_len + part3_container_len;
+    let part3_byte_len: u64 = part3_plain_len + raw_part3_plain_len + part3_container_len;
 
     // Manually-constructed plans must keep `per_page_private_objects`
     // aligned with `page_hints` (one entry per page).
@@ -4022,14 +4240,28 @@ fn write_linearized_impl<R: Read + Seek>(
                 // + Part 6 outline plain objects (UseOutlines, classic path).
                 // ObjStm outline members are already counted inside Part-3
                 // containers (part3_container_len), so only plain ones are added.
-                let part2_len: u64 = privates.iter().map(plain_byte_len).sum();
+                let part2_len: u64 = privates.iter().map(plain_byte_len).sum::<u64>()
+                    + plan
+                        .raw
+                        .part2_objects
+                        .iter()
+                        .filter(|object_gen| object_gen.to_object_ref().is_none())
+                        .map(raw_plain_byte_len)
+                        .sum::<u64>();
                 let part6_plain_len: u64 = plan
+                    .raw
+                    .outline_first_page_members
+                    .iter()
+                    .filter(|object_gen| object_gen.to_object_ref().is_none())
+                    .map(raw_plain_byte_len)
+                    .sum();
+                let part6_public_plain_len: u64 = plan
                     .part6_outline_objects
                     .iter()
                     .filter(|orig| !objstm_layout.member_to_container.contains_key(*orig))
                     .map(plain_byte_len)
                     .sum();
-                part2_len + part3_byte_len + part6_plain_len
+                part2_len + part3_byte_len + part6_public_plain_len + part6_plain_len
             } else {
                 // Pages 1..N: a private compressed into this page's own part7
                 // ObjStm has no standalone bytes — its physical contribution is
@@ -4049,6 +4281,15 @@ fn write_linearized_impl<R: Read + Seek>(
                         None => len += plain_byte_len(orig),
                     }
                 }
+                len += plan
+                    .raw
+                    .per_page_private_objects
+                    .get(page_idx)
+                    .into_iter()
+                    .flatten()
+                    .filter(|object_gen| object_gen.to_object_ref().is_none())
+                    .map(raw_plain_byte_len)
+                    .sum::<u64>();
                 len + containers
                     .iter()
                     .map(|c| byte_lengths.get(c).copied().unwrap_or(0) as u64)
@@ -4141,7 +4382,7 @@ fn write_linearized_impl<R: Read + Seek>(
     // real original ref whose number happens to coincide with a
     // container's new number can never be mistaken for a container (and
     // vice versa).
-    let folded_shared = plan.canonical_shared_hints(
+    let folded_shared = plan.canonical_raw_shared_hints(
         &objstm_layout.member_to_container,
         renumber,
         &second_half_container_nums,
@@ -4153,20 +4394,16 @@ fn write_linearized_impl<R: Read + Seek>(
             // Folded container entry: the synthetic ref's sentinel
             // generation identifies it. Use the container object's
             // own byte length.
-            if h.object_ref.generation == u16::MAX {
+            if let Some(container) = h.container {
                 // cov:ignore-start: unreachable — a first-half
                 // container is always emitted (and probed) before
                 // this back-patch, so its byte length is present; the
                 // guard defends against a layout/probe mismatch.
-                let len = byte_lengths
-                    .get(&h.object_ref.number)
-                    .copied()
-                    .ok_or_else(|| {
-                        crate::Error::Unsupported(format!(
-                            "shared hint container (new #{}) has no probed byte length",
-                            h.object_ref.number
-                        ))
-                    })?;
+                let len = byte_lengths.get(&container).copied().ok_or_else(|| {
+                    crate::Error::Unsupported(format!(
+                        "shared hint container (new #{container}) has no probed byte length",
+                    ))
+                })?;
                 // cov:ignore-end
                 return Ok(len as u64);
             }
@@ -4175,16 +4412,24 @@ fn write_linearized_impl<R: Read + Seek>(
             // plain shared object is emitted (and probed) before this
             // back-patch; absence signals a planner/renumber/probe
             // inconsistency.
-            let new_ref = renumber.new_for_original(h.object_ref).ok_or_else(|| {
+            let object = h.object.ok_or_else(|| {
+                crate::Error::Unsupported(
+                    "shared hint entry has neither a raw object nor a container".to_string(),
+                )
+            })?;
+            let new_ref = renumber.new_for_raw(object).ok_or_else(|| {
                 crate::Error::Unsupported(format!(
-                    "shared hint object {} has no renumber entry",
-                    h.object_ref
+                    "shared hint raw object {} {} has no renumber entry",
+                    object.get_obj(),
+                    object.get_gen()
                 ))
             })?;
             let len = byte_lengths.get(&new_ref.number).copied().ok_or_else(|| {
                 crate::Error::Unsupported(format!(
-                    "shared hint object {} (new #{}) has no probed byte length",
-                    h.object_ref, new_ref.number
+                    "shared hint raw object {} {} (new #{}) has no probed byte length",
+                    object.get_obj(),
+                    object.get_gen(),
+                    new_ref.number
                 ))
             })?;
             // cov:ignore-end
@@ -4418,6 +4663,8 @@ fn write_linearized_impl<R: Read + Seek>(
     let final_result = do_write_pass(
         plan,
         renumber,
+        &raw_removed_refs,
+        raw_content_normalize_refs,
         pdf,
         &mut final_sink,
         &final_part1,
@@ -4727,7 +4974,7 @@ mod tests {
             3,
             0,
             &trailer,
-            &|object_ref| Ok(object_ref),
+            &|object_gen| Ok(object_gen.to_object_ref().expect("test ID ref is valid")),
             &BTreeSet::new(),
             None,
         )
@@ -4844,15 +5091,17 @@ mod tests {
             (b"/Null".to_vec(), ObjectHandle::null()),
             (b"/Size".to_vec(), ObjectHandle::integer(99)),
         ]);
-        let map = |object_ref| {
-            assert_eq!(object_ref, indirect_ref);
+        let map = |object_gen: QpdfObjGen| {
+            assert_eq!(object_gen.to_object_ref(), Some(indirect_ref));
             Ok(ObjectRef::new(21, 0))
         };
 
         let entries = canonical_linearization_trailer_entries(
             &trailer,
             &map,
-            &[removed_ref].into_iter().collect(),
+            &[QpdfObjGen::try_from_object_ref(removed_ref).unwrap()]
+                .into_iter()
+                .collect(),
         )
         .expect("serialize canonical linearization trailer entries");
 

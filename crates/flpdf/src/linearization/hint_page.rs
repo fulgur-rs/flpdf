@@ -425,7 +425,7 @@ impl PageOffsetHintTable {
         // that references a compressed first-page shared object points at the
         // container's index, and page 0's object_count counts the container —
         // not its members.  With no ObjStm packing this is `plan.shared_hints`.
-        let shared_hints = plan.canonical_shared_hints(
+        let shared_hints = plan.canonical_raw_shared_hints(
             member_to_container,
             renumber,
             second_half_container_nums,
@@ -449,6 +449,19 @@ impl PageOffsetHintTable {
                 second_half_container_nums,
                 open_document_container_nums,
             );
+            // Raw-generation body objects cannot be ObjStm members (the
+            // eligibility API is intentionally bounded by valid PDF
+            // references), so they remain standalone and must be added to the
+            // folded scalar count even though they are absent from the public
+            // ObjectRef vectors.
+            object_counts[0] += plan
+                .raw
+                .part2_objects
+                .iter()
+                .chain(&plan.raw.part3_objects)
+                .chain(&plan.raw.part6_outline_objects)
+                .filter(|object_gen| object_gen.to_object_ref().is_none())
+                .count() as u32;
             // Pages 1..N: fold each page's private objects into their containers
             // too. A page whose private resources are compressed into a part7
             // ObjStm holds the container (one object) in its section, not the
@@ -469,6 +482,14 @@ impl PageOffsetHintTable {
                     *count =
                         objstm_folded_count(privates.iter(), member_to_container, &non_page_owned);
                 }
+                *count += plan
+                    .raw
+                    .per_page_private_objects
+                    .get(i)
+                    .into_iter()
+                    .flatten()
+                    .filter(|object_gen| object_gen.to_object_ref().is_none())
+                    .count() as u32;
             }
         }
 
@@ -499,7 +520,7 @@ impl PageOffsetHintTable {
                 assert!(
                     idx < page_count,
                     "shared hint object {:?} references out-of-range page index {} (page_count={})",
-                    shared_hint.object_ref,
+                    shared_hint.object,
                     page_idx,
                     page_count
                 );
@@ -527,14 +548,20 @@ impl PageOffsetHintTable {
                 .and_then(|optimization| optimization.pre_optimization_object_refs());
             let shared_sort_key = |shared_idx: u32| -> (u8, u32) {
                 let entry = &shared_hints[shared_idx as usize];
-                if entry.object_ref.generation == u16::MAX {
+                if let Some(container) = entry.container {
                     container_shared_sort_key
-                        .get(&entry.object_ref.number)
+                        .get(&container)
                         .copied()
                         .unwrap_or((1, 0))
                 } else {
-                    let phase = post_optimization_plain
-                        .is_some_and(|refs| !refs.contains(&entry.object_ref));
+                    let object = entry
+                        .object
+                        .expect("raw shared hint entry must have an object or container");
+                    let phase = post_optimization_plain.is_some_and(|refs| {
+                        object
+                            .to_object_ref()
+                            .is_none_or(|object_ref| !refs.contains(&object_ref))
+                    });
                     // qpdf's obj_user_to_objects is keyed by the object's number
                     // BEFORE writer renumbering (QPDF_linearization.cc:1354-1402
                     // populates it from `oh.getObjectID()` during
@@ -547,10 +574,10 @@ impl PageOffsetHintTable {
                     // compared against folded containers in output-number space.
                     let output_number = if phase {
                         renumber
-                            .new_for_original(entry.object_ref)
+                            .new_for_raw(object)
                             .map_or(u32::MAX, |object_ref| object_ref.number)
                     } else {
-                        entry.object_ref.number
+                        u32::try_from(object.get_obj()).unwrap_or(u32::MAX)
                     };
                     (if phase { 2 } else { 0 }, output_number)
                 }
@@ -566,18 +593,20 @@ impl PageOffsetHintTable {
                     .iter()
                     .filter_map(|&shared_idx| {
                         let entry = &shared_hints[shared_idx as usize];
-                        (entry.object_ref.generation != u16::MAX).then_some(entry.object_ref.number)
+                        entry
+                            .object
+                            .map(|object| u32::try_from(object.get_obj()).unwrap_or(u32::MAX))
                     })
                     .collect();
                 ids.sort_by_key(|&shared_idx| {
                     let entry = &shared_hints[shared_idx as usize];
                     let key = shared_sort_key(shared_idx);
-                    if entry.object_ref.generation == u16::MAX
-                        && key.0 == 0
-                        && plain_aliases.contains(&entry.object_ref.number)
+                    if let Some(container) = entry.container {
+                        if key.0 == 0 && plain_aliases.contains(&container) {
+                            return (key.0, key.1.max(container).saturating_add(1));
+                        }
+                    }
                     {
-                        (key.0, key.1.max(entry.object_ref.number).saturating_add(1))
-                    } else {
                         key
                     }
                 });
@@ -590,9 +619,23 @@ impl PageOffsetHintTable {
             // plan's provenance key projects that qpdf destination order
             // without reviving target-number sorting (flpdf-pz5h).
             for ids in &mut shared_ids_per_page {
-                ids.sort_unstable_by_key(|&shared_idx| {
-                    plan.writer_object_order_key(shared_hints[shared_idx as usize].object_ref)
-                });
+                if plan.has_raw_projection_gap() {
+                    ids.sort_unstable_by_key(|&shared_idx| {
+                        shared_hints[shared_idx as usize]
+                            .object
+                            .and_then(|object| renumber.new_for_raw(object))
+                            .map_or(u32::MAX, |object_ref| object_ref.number)
+                    });
+                } else {
+                    ids.sort_unstable_by_key(|&shared_idx| {
+                        plan.writer_object_order_key(
+                            shared_hints[shared_idx as usize]
+                                .object
+                                .and_then(|object| object.to_object_ref())
+                                .expect("checked shared hint must project to ObjectRef"),
+                        )
+                    });
+                }
             }
         }
 
