@@ -685,6 +685,14 @@ surfaceを削除し、in-tree inspection callersを `Pdf::open` + `get_xref_tabl
 detachは owner-less test scaffolding として残る bounded reconstruction testsを除き、
 production caller 0 を確認した。canonical warning sinkの責務は `.48.73` で完了済み。
 
+`flpdf-8q38` では、65個の行頭偽 object headerを候補 xref streamの余剰payloadへ置いた
+fixtureを qpdf 11.9.0 と canonical `Pdf::open` へ入力した。qpdfのEOFまでの候補read
+（`QPDF.cc:577-608,1542-1697`）と同様に、canonical routeは候補 `1000/0` と size warning
+を保持した。production `engine.rs` の xref loader callerは canonical ownerを必ず渡し、
+ownerless loaderは `#[cfg(test)]` のみなので、bounded candidate/reference windowは
+通常openのbridgeではない。残るtest-only scaffoldingはこのissueでは変更せず、qpdfに対応物
+のない性能hardeningは `flpdf-qwh0` で別途扱う。
+
 `flpdf-1f9f` では、owner-less bootstrap の ObjStm member parser にも member の description
 context を渡すようにした。そのため member 本体だけでなく、辞書・配列内の nested direct value も
 同じ `ObjectDescription::Template` を持つ。qpdf は member の警告を 3 つの断片から組み立てる —
