@@ -626,50 +626,30 @@ impl<R: Read + Seek> Pdf<R> {
     /// [`crate::AcroFormDocumentHelper::disable_digital_signatures`], matching
     /// qpdf's split between `QPDF` and `QPDFAcroFormDocumentHelper`.
     ///
-    /// The boolean is an flpdf convenience for callers that need to report
-    /// whether the in-memory document changed; qpdf's corresponding method is
-    /// `void`.
+    /// The qpdf method returns `void`; this Rust port returns `Result<()>` only
+    /// to propagate failures from live-handle resolution and mutation.
     ///
     /// # Errors
     ///
     /// Returns the same root-resolution and live-handle errors as
     /// [`Pdf::root_handle`], and propagates failures while resolving the
     /// `/AcroForm` or `/SigFlags` values.
-    pub fn remove_security_restrictions(&mut self) -> Result<bool> {
+    pub fn remove_security_restrictions(&mut self) -> Result<()> {
         let catalog = self.root_handle()?;
-        let mut changed = false;
 
         // qpdf calls removeKey unconditionally. A present null-valued key is
         // still removed even though QPDF_Dictionary::hasKey treats it as
         // absent (`libqpdf/QPDF_Dictionary.cc:98-101,150-153`).
-        if catalog
-            .as_dictionary()
-            .is_some_and(|entries| entries.keys().any(|key| key == b"/Perms"))
-        {
-            catalog.remove_key(b"/Perms");
-            changed = true;
-        }
+        catalog.remove_key(b"/Perms");
 
         let acroform = catalog.try_get_key(b"/AcroForm")?;
         if acroform.try_is_dictionary()? && acroform.try_has_key(b"/SigFlags")? {
             // qpdf replaces the key whenever its visible hasKey test
-            // succeeds, including an already-zero direct integer. The
-            // changed result is a crate-specific observation of structural
-            // change, since qpdf's operation returns void.
-            // qpdf-deviation-start: `changed` has no qpdf counterpart --
-            // QPDF::removeSecurityRestrictions is void, so nothing classifies
-            // the prior /SigFlags value.
-            let previous = acroform.try_get_key(b"/SigFlags")?;
-            let already_zero =
-                previous.object_ref().is_none() && previous.try_as_integer()? == Some(0);
-            // qpdf-deviation-end
+            // succeeds, including an already-zero direct integer.
             acroform.replace_key(b"/SigFlags", ObjectHandle::integer(0))?;
-            if !already_zero {
-                changed = true;
-            }
         }
 
-        Ok(changed)
+        Ok(())
     }
 
     pub(crate) fn authenticate_if_encrypted(&mut self, options: &PdfOpenOptions) -> Result<()> {

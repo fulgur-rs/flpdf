@@ -113,6 +113,34 @@ fn canonical_acroform_analysis_warns_for_a_non_array_fields_value() {
 }
 
 #[test]
+fn disable_digital_signatures_ignores_a_non_array_fields_value_like_qpdf() {
+    let mut pdf = Pdf::open_mem_owned_with_options(
+        build_non_array_fields_pdf(),
+        PdfOpenOptions {
+            suppress_warnings: true,
+            description: b"non-array-fields.pdf".to_vec(),
+            ..PdfOpenOptions::default()
+        },
+    )
+    .unwrap();
+
+    AcroFormDocumentHelper::new(&mut pdf)
+        .unwrap()
+        .disable_digital_signatures()
+        .unwrap();
+
+    let fields = pdf
+        .root_handle()
+        .unwrap()
+        .try_get_key(b"/AcroForm")
+        .unwrap()
+        .try_get_key(b"/Fields")
+        .unwrap();
+    assert_eq!(fields.type_name().unwrap(), "integer");
+    assert_eq!(fields.as_integer(), Some(42));
+}
+
+#[test]
 fn canonical_acroform_analysis_propagates_a_warning_sink_failure() {
     let mut pdf = Pdf::open_mem_owned_with_options(
         build_non_array_fields_pdf(),

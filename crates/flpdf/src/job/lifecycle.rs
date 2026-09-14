@@ -3751,7 +3751,7 @@ impl QPDFJob {
         // CLI's separate rewrite policy.
         if configuration.remove_restrictions {
             let mut acroform = AcroFormDocumentHelper::new(pdf)?;
-            let _ = acroform.disable_digital_signatures()?;
+            acroform.disable_digital_signatures()?;
         }
 
         // qpdf's `handleTransformations` externalizes inline images before

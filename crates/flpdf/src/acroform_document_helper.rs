@@ -745,16 +745,16 @@ impl<'a, R: Read + Seek> AcroFormDocumentHelper<'a, R> {
     /// is not deleted eagerly; the writer's reachability pass drops it only
     /// when no other reference, such as catalog `/DSS`, keeps it alive.
     ///
-    /// The boolean is an flpdf convenience reporting whether the document
-    /// changed; qpdf's corresponding helper returns `void`, and the CLI emits
-    /// no diagnostic from it (qpdf's `--remove-restrictions` is silent).
+    /// The qpdf helper returns `void`; this Rust port returns `Result<()>` only
+    /// to propagate errors, and the CLI emits no diagnostic from it (qpdf's
+    /// `--remove-restrictions` is silent).
     ///
     /// # Errors
     ///
     /// Propagates errors from the document mutation, AcroForm analysis, field
     /// type resolution, live-handle mutation, and field-array update.
-    pub fn disable_digital_signatures(&mut self) -> Result<bool> {
-        let mut changed = self.pdf.remove_security_restrictions()?;
+    pub fn disable_digital_signatures(&mut self) -> Result<()> {
+        self.pdf.remove_security_restrictions()?;
         let form_fields = self.form_field_handles()?;
         let mut to_remove = BTreeSet::new();
 
@@ -772,7 +772,6 @@ impl<'a, R: Read + Seek> AcroFormDocumentHelper<'a, R> {
             // field tree when it has no signature keys of its own.
             to_remove.insert(field_ref);
 
-            let mut field_changed = false;
             // qpdf's removeKey erases raw entries unconditionally, including
             // entries whose stored value is null. Do not use hasKey here,
             // because QPDF_Dictionary::hasKey intentionally collapses null.
@@ -783,18 +782,12 @@ impl<'a, R: Read + Seek> AcroFormDocumentHelper<'a, R> {
                     .is_some_and(|entries| entries.keys().any(|entry| entry.as_slice() == key));
                 if present {
                     field.remove_key(key);
-                    field_changed = true;
                 }
-            }
-            if field_changed {
-                changed = true;
             }
         }
 
-        if self.remove_form_fields(&to_remove)? {
-            changed = true;
-        }
-        Ok(changed)
+        self.remove_form_fields(&to_remove)?;
+        Ok(())
     }
 
     fn remove_cached_fields(&mut self, to_remove: &BTreeSet<ObjectRef>) {
@@ -857,16 +850,17 @@ impl<'a, R: Read + Seek> AcroFormDocumentHelper<'a, R> {
     /// array, mirroring qpdf's `removeFormFields`
     /// (`libqpdf/QPDFAcroFormDocumentHelper.cc:112-151`).
     ///
-    /// The array handle is mutated in place. This preserves an indirect
-    /// `/Fields` holder and keeps a direct array nested in an indirect
-    /// `/AcroForm` object live.
-    pub(crate) fn remove_form_fields(&mut self, to_remove: &BTreeSet<ObjectRef>) -> Result<bool> {
+    /// The qpdf helper returns `void`; this Rust helper returns `Result<()>`
+    /// only to propagate live-handle errors. The array handle is mutated in
+    /// place. This preserves an indirect `/Fields` holder and keeps a direct
+    /// array nested in an indirect `/AcroForm` object live.
+    pub(crate) fn remove_form_fields(&mut self, to_remove: &BTreeSet<ObjectRef>) -> Result<()> {
         let Some(acroform) = self.canonical_acroform()? else {
-            return Ok(false);
+            return Ok(());
         };
         let fields = acroform.try_get_key(b"/Fields")?;
         let Some(items) = fields.try_as_array()? else {
-            return Ok(false);
+            return Ok(());
         };
 
         let indexes: Vec<usize> = items
@@ -880,13 +874,13 @@ impl<'a, R: Read + Seek> AcroFormDocumentHelper<'a, R> {
             .collect();
         self.remove_cached_fields(to_remove);
         if indexes.is_empty() {
-            return Ok(false);
+            return Ok(());
         }
 
         for index in indexes.iter().rev().copied() {
             fields.erase_array_item(index)?;
         }
-        Ok(true)
+        Ok(())
     }
 
     /// Copy annotations into fresh indirect objects and transform their
