@@ -2043,26 +2043,119 @@ fn read_live_source_range(
     Ok(bytes)
 }
 
-fn window_has_previous_before_base(bytes: &[u8], base: u64) -> bool {
-    let marker = b"/Prev";
-    bytes.windows(marker.len()).enumerate().any(|(index, window)| {
-        if window != marker {
-            return false;
+const LIVE_XREF_PROBE_SIZE: usize = 4 * 1024;
+const LIVE_XREF_GROWTH_SIZE: usize = 64 * 1024;
+
+fn classic_xref_start(bytes: &[u8]) -> Option<usize> {
+    let position = bytes.iter().position(|byte| !is_pdf_space(*byte))?;
+    bytes
+        .get(position..)
+        .is_some_and(|tail| tail.starts_with(b"xref"))
+        .then_some(position)
+}
+
+fn trailer_dictionary_end(bytes: &[u8], trailer_keyword_end: usize) -> Option<usize> {
+    let mut tokenizer = Tokenizer::new(bytes);
+    tokenizer.allow_eof();
+    tokenizer.set_position(trailer_keyword_end).ok()?;
+    let mut depth = 0usize;
+    loop {
+        let token = tokenizer.read_token(false, 0).ok()?;
+        match token.token_type {
+            TokenType::DictOpen => depth = depth.saturating_add(1),
+            TokenType::DictClose if depth == 1 => return Some(tokenizer.position()),
+            TokenType::DictClose if depth > 1 => depth -= 1,
+            TokenType::Eof => return None,
+            _ => {}
         }
-        let mut pos = index.saturating_add(marker.len());
-        while bytes.get(pos).copied().is_some_and(is_pdf_space) {
-            pos += 1;
+    }
+}
+
+fn classic_trailer_dictionary_end(bytes: &[u8], xref_start: usize) -> Option<usize> {
+    let mut line_start = xref_start;
+    while line_start < bytes.len() {
+        let line_end = bytes[line_start..]
+            .iter()
+            .position(|byte| matches!(byte, b'\n' | b'\r'))
+            .map_or(bytes.len(), |offset| line_start + offset);
+        let first = bytes[line_start..line_end]
+            .iter()
+            .position(|byte| !is_pdf_space(*byte))
+            .map(|offset| line_start + offset);
+        if let Some(first) = first {
+            let tail = &bytes[first..line_end];
+            if tail.starts_with(b"trailer")
+                && tail
+                    .get(b"trailer".len())
+                    .is_none_or(|byte| is_pdf_delimiter(*byte))
+            {
+                return trailer_dictionary_end(bytes, first + b"trailer".len());
+            }
         }
-        let digit_start = pos;
-        while bytes.get(pos).is_some_and(u8::is_ascii_digit) {
-            pos += 1;
+        line_start = if line_end == bytes.len() {
+            bytes.len()
+        } else {
+            line_end + 1
+        };
+        while bytes
+            .get(line_start.saturating_sub(1))
+            .is_some_and(|byte| matches!(byte, b'\n' | b'\r'))
+            && bytes
+                .get(line_start)
+                .is_some_and(|byte| matches!(byte, b'\n' | b'\r'))
+        {
+            line_start += 1;
         }
-        digit_start != pos
-            && std::str::from_utf8(&bytes[digit_start..pos])
-                .ok()
-                .and_then(|text| text.parse::<u64>().ok())
-                .is_some_and(|offset| offset < base)
-    })
+    }
+    None
+}
+
+/// Read only the current xref section from a canonical live source. Xref
+/// streams need a small probe because their object body is read by the
+/// resolver owner; classic tables grow until their trailer dictionary closes,
+/// so trailing file bytes never become part of the xref-loading buffer.
+fn read_live_xref_window(owner: &dyn CanonicalTrailerOwner, offset: u64) -> Result<Vec<u8>> {
+    let source_length = owner.source_length()?;
+    let available = source_length.saturating_sub(offset);
+    if available == 0 {
+        return Ok(Vec::new());
+    }
+    let available = usize::try_from(available)
+        .map_err(|_| Error::parse(0, "xref source is too large for this target"))?;
+    let mut target = available.min(LIVE_XREF_PROBE_SIZE);
+    let mut bytes = Vec::with_capacity(target);
+    loop {
+        if bytes.len() < target {
+            let more = read_live_source_range(
+                owner,
+                offset.saturating_add(bytes.len() as u64),
+                target - bytes.len(),
+            )?;
+            bytes.extend_from_slice(&more);
+        }
+        let Some(xref_start) = classic_xref_start(&bytes) else {
+            return Ok(bytes);
+        };
+        if let Some(end) = classic_trailer_dictionary_end(&bytes, xref_start) {
+            let Some(after_trailer) = bytes.get(end..) else {
+                return Ok(bytes);
+            };
+            if let Some(line_end) = after_trailer
+                .iter()
+                .position(|byte| matches!(byte, b'\n' | b'\r'))
+            {
+                bytes.truncate(end + line_end + 1);
+                return Ok(bytes);
+            }
+            if target == available {
+                return Ok(bytes);
+            }
+        }
+        if target == available {
+            return Ok(bytes);
+        }
+        target = target.saturating_add(LIVE_XREF_GROWTH_SIZE).min(available);
+    }
 }
 
 /// Canonical `Pdf::open` xref loading through qpdf's live input-source
@@ -2076,8 +2169,7 @@ pub(crate) fn load_xref_state_from_source(
     let physical_length = owner.source_length()?;
     let prefix_length = usize::try_from(physical_length.min(1024)).unwrap_or(1024);
     let prefix = match read_live_source_range(owner, 0, prefix_length) {
-        Err(Error::QpdfExc(exception))
-            if exception.get_error_code() == QpdfErrorCode::System => {
+        Err(Error::QpdfExc(exception)) if exception.get_error_code() == QpdfErrorCode::System => {
             // qpdf's processFile C wrapper catches the initial FileInputSource
             // runtime error rather than a QPDFExc (`qpdf-c.cc:70-79`), so this
             // bootstrap read retains its empty-location SystemBytes shape.
@@ -2109,17 +2201,11 @@ pub(crate) fn load_xref_state_from_source(
     let startxref = match parse_startxref(&tail) {
         Ok(offset) => offset,
         Err(error) if options.allow_repair => {
-            // Recovery still needs the existing byte-slice scanner until its
-            // source-window port lands; retain the qpdf error boundary while
-            // keeping the normal valid-xref route snapshot-free.
-            let all = read_live_source_range(
-                owner,
-                0,
-                usize::try_from(logical_length)
-                    .map_err(|_| Error::parse(0, "input source is too large for this target"))?,
-            )?;
+            // The canonical recovery scanner reads the same live source in
+            // chunks. Keep no complete input snapshot merely because qpdf's
+            // `read_xref` handoff failed at `startxref`.
             return load_xref_state_from_window(
-                &all,
+                &[],
                 0,
                 version,
                 header_offset,
@@ -2135,16 +2221,10 @@ pub(crate) fn load_xref_state_from_source(
             return Err(error);
         }
     };
-    let Some(xref_end) = logical_length.checked_sub(startxref) else {
+    if startxref > logical_length {
         if options.allow_repair {
-            let all = read_live_source_range(
-                owner,
-                0,
-                usize::try_from(logical_length)
-                    .map_err(|_| Error::parse(0, "input source is too large for this target"))?,
-            )?;
             return load_xref_state_from_window(
-                &all,
+                &[],
                 0,
                 version,
                 header_offset,
@@ -2157,17 +2237,25 @@ pub(crate) fn load_xref_state_from_source(
         }
         deliver_canonical_diagnostics(Some(owner), &mut initial_diagnostics)?;
         return Err(Error::parse(0, "xref not found"));
-    };
-    let xref_window = read_live_source_range(
-        owner,
-        startxref,
-        usize::try_from(xref_end)
-            .map_err(|_| Error::parse(0, "xref window is too large for this target"))?,
-    )?;
-    // A classic xref section must expose the literal `xref` keyword before
-    // any document-owned handles are installed. If the keyword itself is
-    // corrupt, skip the speculative canonical attempt so recovery starts from
-    // a clean resolver state.
+    }
+    if startxref == 0 {
+        // qpdf's `xref_offset == 0` guard skips `read_xref` entirely
+        // (`QPDF.cc:450-452`). Do not put the direct reconstruction handoff
+        // behind the speculative warning buffer: live candidate reads must
+        // follow the already-delivered reconstruction trio.
+        return load_xref_state_from_window(
+            &[],
+            0,
+            version,
+            header_offset,
+            0,
+            options,
+            initial_diagnostics,
+            Vec::new(),
+            Some(owner),
+        );
+    }
+    let xref_window = read_live_xref_window(owner, startxref)?;
     let first_non_space = xref_window.iter().position(|byte| !is_pdf_space(*byte));
     let starts_classic_xref = first_non_space
         .and_then(|pos| xref_window.get(pos..))
@@ -2179,35 +2267,27 @@ pub(crate) fn load_xref_state_from_source(
                 .windows(b"/Type /XRef".len())
                 .any(|bytes| bytes == b"/Type /XRef")
         });
-    if options.allow_repair
-        && (window_has_previous_before_base(&xref_window, startxref)
-            || (!starts_classic_xref && !looks_like_xref_stream))
-    {
-        let all = read_live_source_range(
-            owner,
-            0,
-            usize::try_from(logical_length)
-                .map_err(|_| Error::parse(0, "input source is too large for this target"))?,
-        )?;
-        deliver_canonical_diagnostics(Some(owner), &mut initial_diagnostics)?;
+    if options.allow_repair && !starts_classic_xref && !looks_like_xref_stream {
+        // qpdf's outer parse does not make a speculative live object read when
+        // the startxref bytes are visibly neither a classic table nor an xref
+        // stream. Enter the one recovery path directly so its diagnostics are
+        // emitted once, not once by the speculative attempt and once again by
+        // the recovery retry.
         return load_xref_state_from_window(
-            &all,
-            0,
+            &xref_window,
+            startxref,
             version,
             header_offset,
             startxref,
             options,
-            Diagnostics::default(),
+            initial_diagnostics,
             Vec::new(),
             Some(owner),
         );
     }
     let buffered_owner = BufferedCanonicalTrailerOwner::new(owner);
     let mut window_initial_diagnostics = initial_diagnostics.clone();
-    deliver_canonical_diagnostics(
-        Some(&buffered_owner),
-        &mut window_initial_diagnostics,
-    )?;
+    deliver_canonical_diagnostics(Some(&buffered_owner), &mut window_initial_diagnostics)?;
     let window_result = load_xref_state_from_window(
         &xref_window,
         startxref,
@@ -2225,19 +2305,13 @@ pub(crate) fn load_xref_state_from_source(
             Ok(state)
         }
         Err(error) if options.allow_repair => {
-            // A malformed initial section can require the full-document line
-            // scan. Keep that recovery fallback source-correct until the
-            // streaming reconstruction scanner is migrated as its own slice.
-            let all = read_live_source_range(
-                owner,
-                0,
-                usize::try_from(logical_length)
-                    .map_err(|_| Error::parse(0, "input source is too large for this target"))?,
-            )?;
-            deliver_canonical_diagnostics(Some(owner), &mut initial_diagnostics)?;
+            // A malformed initial section is recovered by the canonical live
+            // line scanner. Flush only the speculative window diagnostics;
+            // the recovery handoff itself reads the source through `owner`.
+            buffered_owner.flush()?;
             load_xref_state_from_window(
-                &all,
-                0,
+                &xref_window,
+                startxref,
                 version,
                 header_offset,
                 startxref,
@@ -3456,17 +3530,28 @@ fn merge_previous_xref_sections_with_observer(
     }
 
     while let Some(offset) = previous_offset {
-        if canonical_trailer_owner.is_some() && offset < source_base {
-            // The bounded window begins at the newest xref section. A /Prev
-            // target before that boundary needs the full-source recovery path
-            // so it cannot be mistaken for offset zero.
-            return Err(Error::parse(
-                usize::try_from(offset).unwrap_or(usize::MAX),
-                "xref /Prev precedes the live source window",
-            ));
-        }
-        let previous_pos = usize::try_from(offset.saturating_sub(source_base))
-            .map_err(|_| Error::parse(0, "xref /Prev does not fit usize"))?;
+        // A canonical xref window starts at the newest section. For an older
+        // `/Prev`, fetch only that section from the same live source rather
+        // than falling back to a complete input snapshot. The owner-less
+        // loader continues to use its one byte-slice window.
+        let source_window_end = source_base.saturating_add(bytes.len() as u64);
+        let live_previous_window = if let Some(owner) =
+            canonical_trailer_owner.filter(|_| offset < source_base || offset >= source_window_end)
+        {
+            Some(read_live_xref_window(owner, offset)?)
+        } else {
+            None
+        };
+        let previous_bytes = live_previous_window.as_deref().unwrap_or(bytes);
+        let previous_source_base = live_previous_window
+            .as_ref()
+            .map_or(source_base, |_| offset);
+        let previous_pos = if live_previous_window.is_some() {
+            0
+        } else {
+            usize::try_from(offset.saturating_sub(previous_source_base))
+                .map_err(|_| Error::parse(0, "xref /Prev does not fit usize"))?
+        };
 
         if !visited.insert(offset) {
             return Err(Error::parse(0, "loop detected following xref tables"));
@@ -3475,9 +3560,9 @@ fn merge_previous_xref_sections_with_observer(
         let mut previous_error_diagnostics = Diagnostics::default();
         let mut previous_build_diagnostics = Diagnostics::default();
         let previous_result = parse_xref_from_start_with_owner_and_build_diagnostics(
-            bytes,
+            previous_bytes,
             previous_pos,
-            source_base,
+            previous_source_base,
             offset,
             version,
             options.clone(),
@@ -3514,7 +3599,7 @@ fn merge_previous_xref_sections_with_observer(
                 previous
             }
             Err(error) => {
-                let classic_section = bytes
+                let classic_section = previous_bytes
                     .get(previous_pos..)
                     .is_some_and(|tail| tail.starts_with(b"xref"));
                 let append_ordered = |target: &mut Diagnostics| {
