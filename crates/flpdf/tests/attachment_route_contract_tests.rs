@@ -93,3 +93,26 @@ fn internal_job_helpers_are_not_publicly_reexported() {
     );
     assert!(listing.contains("pub(crate) fn format_attachment_list_with_sink<R"));
 }
+
+#[test]
+fn dead_attachment_info_projection_is_removed_after_job_cutover() {
+    let src = source_root();
+    let listing = fs::read_to_string(src.join("job/attachment_list.rs"))
+        .expect("attachment_list.rs must be readable");
+    let job = fs::read_to_string(src.join("job/mod.rs")).expect("job/mod.rs");
+    let lib = fs::read_to_string(src.join("lib.rs")).expect("lib.rs");
+    let attachments = fs::read_to_string(src.join("job/attachments.rs"))
+        .expect("attachments.rs must be readable");
+
+    assert!(
+        !listing.contains("AttachmentInfo")
+            && !job.contains("AttachmentInfo")
+            && !lib.contains("AttachmentInfo"),
+        "dead AttachmentInfo projection must not remain in the public surface"
+    );
+    assert!(
+        listing.contains("pub(crate) fn format_attachment_list_with_sink<R")
+            && attachments.contains("pub fn list_attachments<R"),
+        "canonical sink and QPDFJob listing owners must remain"
+    );
+}

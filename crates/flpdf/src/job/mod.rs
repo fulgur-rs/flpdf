@@ -37,7 +37,6 @@ mod rotate;
 mod rotate_spec;
 
 pub use acroform_field_prune::DEFAULT_MAX_ACROFORM_DEPTH;
-pub use attachment_list::AttachmentInfo;
 #[allow(deprecated)]
 pub use attachments::{
     add_attachment_from_path, ascii_filename_fallback, extract_attachment,
