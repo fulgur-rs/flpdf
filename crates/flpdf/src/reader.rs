@@ -873,6 +873,31 @@ impl<R: Read + Seek> Pdf<R> {
         self.canonical_object_ref_set(true).into_iter().collect()
     }
 
+    /// Return qpdf's live preserve-unreferenced seed handles while retaining
+    /// their raw cache identities. The writer calls `getAllObjects()` before
+    /// its standard enqueue walk (`libqpdf/QPDFWriter.cc:2907-2913`), so this
+    /// route must not narrow a raw source generation such as `5 65536` through
+    /// the public `ObjectRef` projection.
+    pub(crate) fn canonical_live_object_handles(&self) -> Result<Vec<ObjectHandle>> {
+        let handles = self.resolver.get_all_objects()?;
+        let raw_xref = self.resolver.raw_xref_entries();
+        Ok(handles
+            .into_iter()
+            .filter(|handle| {
+                // cov:ignore-start: ResolverCore::object_cache stores only
+                // handles carrying a qpdf object generation, and
+                // get_all_objects enumerates that cache directly.
+                let Some(object_gen) = handle.qpdf_obj_gen() else {
+                    return false;
+                };
+                // cov:ignore-end
+                object_gen.is_indirect()
+                    && (raw_xref.contains_key(&object_gen)
+                        || self.resolver.is_allocated_qpdf_obj_gen(object_gen))
+            })
+            .collect())
+    }
+
     fn canonical_object_ref_set(&self, live_only: bool) -> BTreeSet<ObjectRef> {
         let mut refs: BTreeSet<_> = self
             .resolver
@@ -1279,20 +1304,21 @@ impl<R: Read + Seek> Pdf<R> {
     pub(crate) fn take_foreign_object_map(
         &mut self,
         source_id: u64,
-    ) -> BTreeMap<ObjectRef, ObjectRef> {
+    ) -> BTreeMap<QpdfObjGen, ObjectRef> {
         self.foreign_object_maps
             .remove(&source_id)
             .unwrap_or_default()
     }
 
     /// Return a snapshot of qpdf's persistent per-source foreign-object map
-    /// without taking ownership of it. Page merge uses this boundary to keep
-    /// selected-page membership distinct from later primary Catalog metadata
-    /// copying while the same map remains live for subsequent copies.
+    /// without taking ownership of it. The map is keyed by the source's raw
+    /// `QpdfObjGen`; page merge projects only its parser-valid source keys at
+    /// its `ObjectRef`-typed consumer boundaries while the same raw map remains
+    /// live for subsequent copies.
     pub(crate) fn foreign_object_map_snapshot(
         &self,
         source_id: u64,
-    ) -> BTreeMap<ObjectRef, ObjectRef> {
+    ) -> BTreeMap<QpdfObjGen, ObjectRef> {
         self.foreign_object_maps
             .get(&source_id)
             .cloned()
@@ -1302,15 +1328,29 @@ impl<R: Read + Seek> Pdf<R> {
     pub(crate) fn set_foreign_object_map(
         &mut self,
         source_id: u64,
-        map: BTreeMap<ObjectRef, ObjectRef>,
+        map: BTreeMap<QpdfObjGen, ObjectRef>,
     ) {
         self.foreign_object_maps.insert(source_id, map);
+    }
+
+    pub(crate) fn take_foreign_object_to_copy(&mut self, source_id: u64) -> Vec<ObjectHandle> {
+        self.foreign_object_to_copy
+            .remove(&source_id)
+            .unwrap_or_default()
+    }
+
+    pub(crate) fn set_foreign_object_to_copy(
+        &mut self,
+        source_id: u64,
+        to_copy: Vec<ObjectHandle>,
+    ) {
+        self.foreign_object_to_copy.insert(source_id, to_copy);
     }
 
     /// qpdf's `ObjCopier::visiting` equivalent (see
     /// [`Pdf::foreign_object_visiting`]'s own doc). Used only by the
     /// canonical `copy_foreign_object` port.
-    pub(crate) fn take_foreign_object_visiting(&mut self, source_id: u64) -> BTreeSet<ObjectRef> {
+    pub(crate) fn take_foreign_object_visiting(&mut self, source_id: u64) -> BTreeSet<QpdfObjGen> {
         self.foreign_object_visiting
             .remove(&source_id)
             .unwrap_or_default()
@@ -1319,7 +1359,7 @@ impl<R: Read + Seek> Pdf<R> {
     pub(crate) fn set_foreign_object_visiting(
         &mut self,
         source_id: u64,
-        visiting: BTreeSet<ObjectRef>,
+        visiting: BTreeSet<QpdfObjGen>,
     ) {
         self.foreign_object_visiting.insert(source_id, visiting);
     }
@@ -1361,7 +1401,7 @@ impl<R: Read + Seek> Pdf<R> {
         Ok(())
     }
 
-    /// Return qpdf's complete canonical object cache in `ObjectRef` order.
+    /// Return qpdf's complete canonical object cache in raw `QpdfObjGen` order.
     ///
     /// `QPDF::getAllObjects` first calls `fixDanglingReferences` and then
     /// walks `m->obj_cache` (`libqpdf/QPDF.cc:1258-1294`). The canonical
@@ -1371,16 +1411,7 @@ impl<R: Read + Seek> Pdf<R> {
     /// effective source table, matching qpdf's `insertFreeXrefEntry` split
     /// between `xref_table` and `deleted_objects`.
     pub fn get_all_objects(&mut self) -> Result<Vec<ObjectHandle>> {
-        Ok(self
-            .resolver
-            .get_all_objects()?
-            .into_iter()
-            .filter(|handle| {
-                handle.object_ref().is_none_or(|object_ref| {
-                    object_ref.number != 0 && object_ref.generation != u16::MAX
-                })
-            })
-            .collect())
+        self.resolver.get_all_objects()
     }
 
     /// Prepare the canonical object cache through qpdf's

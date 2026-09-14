@@ -1,4 +1,6 @@
-use flpdf::{Error, ObjectRef, PageDocumentHelper, Pdf, PdfOpenOptions, QpdfErrorCode};
+use flpdf::{
+    Error, ObjectHandle, ObjectRef, PageDocumentHelper, Pdf, PdfOpenOptions, QpdfErrorCode,
+};
 use std::io::Cursor;
 
 mod common;
@@ -169,4 +171,55 @@ fn page_tree_cycle_raises_qpdf_pages_exception_with_last_object_description() {
         exception.what_bytes(),
         b"pages-loop.pdf (object 3 0): Loop detected in /Pages structure (getAllPages)"
     );
+}
+
+#[test]
+fn raw_generation_page_tree_leaf_does_not_panic_at_the_object_ref_boundary() {
+    let bytes = build_pdf(
+        &[
+            (1, "<< /Type /Catalog /Pages 2 0 R >>".to_owned()),
+            (2, "<< /Type /Pages /Count 1 /Kids [3 0 R] >>".to_owned()),
+            (
+                3,
+                "<< /Type /Page /Parent 2 0 R /MediaBox [0 0 612 792] >>".to_owned(),
+            ),
+        ],
+        1,
+    );
+    let mut pdf = Pdf::open(Cursor::new(bytes)).expect("page fixture should open");
+    let raw_ref = ObjectRef::new(5, 65_535);
+    pdf.replace_object(
+        raw_ref,
+        ObjectHandle::dictionary(vec![
+            (b"/Type".to_vec(), ObjectHandle::name(b"Page".to_vec())),
+            (
+                b"/MediaBox".to_vec(),
+                ObjectHandle::array(vec![
+                    ObjectHandle::integer(0),
+                    ObjectHandle::integer(0),
+                    ObjectHandle::integer(612),
+                    ObjectHandle::integer(792),
+                ]),
+            ),
+        ]),
+    )
+    .expect("install raw-generation page");
+    let pages = pdf.get_object_handle(ObjectRef::new(2, 0));
+    pages
+        .replace_key(
+            b"/Kids",
+            ObjectHandle::array(vec![pdf.get_object_handle(raw_ref)]),
+        )
+        .expect("attach raw-generation page");
+
+    let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        PageDocumentHelper::new(&mut pdf).get_all_pages()
+    }));
+
+    let result = result.expect("raw-generation page handling must not panic");
+    assert!(matches!(
+        result,
+        Err(Error::Unsupported(message))
+            if message == "page object 5 65535 cannot be represented as a valid ObjectRef"
+    ));
 }

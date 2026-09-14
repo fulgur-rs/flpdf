@@ -420,6 +420,49 @@ the pages or other preceding sections has been written leaves the same partial
 JSON prefix on stdout; the CLI then explicitly finishes the logger's save
 pipeline even on this error path, matching qpdf's observable process output.
 
+### `flpdf-fo71t` raw identity consumer cutover (2026-09-14)
+
+qpdf treats `QPDFObjGen` as the identity of an indirect object, independently
+of whether that pair can be written as a parser-valid `N G R` reference.
+`QPDFValue::getDescription` expands `$OG` and default descriptions from its
+raw `og` (`libqpdf/QPDFValue.cc:14-61`); `copyForeignObject` keeps its
+per-source `ObjCopier` map and loop set keyed by raw `QPDFObjGen`
+(`libqpdf/QPDF.cc:2018-2213`); and `mergeResources` reuses resource values
+through a raw `QPDFObjGen` map (`libqpdf/QPDFObjectHandle.cc:1063-1128`).
+
+The same boundary applies to the higher-level consumers. `getAllObjects`
+walks the raw `obj_cache` (`libqpdf/QPDF.cc:1285-1294`), FileSpec creation
+inserts the embedded-file handle without re-projecting it
+(`libqpdf/QPDFFileSpecObjectHelper.cc:85-107`), and page, outline, and form
+walks use `QPDFObjGen::set` for their indirect seen state
+(`libqpdf/QPDF_pages.cc:39-138`,
+`libqpdf/QPDFOutlineDocumentHelper.cc:5-23`,
+`libqpdf/QPDFFormFieldObjectHelper.cc:35-131`). Form-XObject resource
+traversal likewise retains raw handle identity in qpdf's `forEachXObject`
+queue (`libqpdf/QPDFPageObjectHelper.cc:317-349`).
+
+flpdf now uses `ObjectHandle::qpdf_obj_gen()` and
+`QpdfObjGen::is_indirect()` for these identity/discriminator decisions:
+description expansion, persistent foreign-copy maps and visited sets,
+resource reuse, FileSpec embedded-stream preservation, Form-XObject resource
+traversal, and page/outline/form cycle guards. `ObjectRef` remains only the
+checked valid `N G R` projection and the existing public APIs whose return
+type is explicitly `ObjectRef`; an unprojectable page identity crosses that
+boundary as an explicit error rather than a panic. The public
+`Pdf::get_all_objects` route already returns raw cache handles, and its
+regression test asserts that a matching `5 65536 obj` entry is retained.
+
+The foreign copier also retains qpdf's per-source `to_copy` queue across a
+failed replacement pass and clears it only after every reserved object has
+been replaced (`include/qpdf/QPDF.hh:891-897`, `libqpdf/QPDF.cc:2066-2093`).
+This keeps a retry from treating a partially replaced reservation as a
+completed copy. The page-selection preserve route applies the same raw-cache
+rule before copying primary unreferenced objects: `QPDFWriter::enqueueObjectsStandard`
+seeds directly from `getAllObjects` (`libqpdf/QPDFWriter.cc:2907-2913`), so
+`canonical_live_object_handles` keeps a raw generation such as `5 65536`
+through the copy boundary and only narrows destination writer references where
+the consumer explicitly requires `ObjectRef`.
+
 ### `flpdf-ymuj.6.10` single raw ValueIdentity (2026-09-14)
 
 qpdf's `QPDFValue` owns one raw `QPDFObjGen` (`libqpdf/qpdf/QPDFValue.hh:149-152`);

@@ -34,6 +34,7 @@
 //! document identity.
 
 use crate::object_handle::{ObjectHandle, ObjectValue};
+use crate::qpdf_obj_gen::QpdfObjGen;
 use crate::{Error, ObjectRef, Pdf, Result};
 use std::collections::{BTreeMap, BTreeSet};
 use std::io::{Read, Seek};
@@ -171,6 +172,7 @@ fn copy_foreign_with_source_id<R: Read + Seek>(
             "obj_copier.visiting is not empty at the beginning of copyForeignObject".to_owned(),
         ));
     }
+    let to_copy = target.take_foreign_object_to_copy(source_id);
     let mut copier = ForeignObjectCopier {
         target,
         source_id,
@@ -178,7 +180,7 @@ fn copy_foreign_with_source_id<R: Read + Seek>(
         visiting,
         direct_visiting: Vec::new(),
         stop_at_page_tree,
-        to_copy: Vec::new(),
+        to_copy,
     };
     let result = if require_indirect {
         copier.run(foreign)
@@ -187,10 +189,12 @@ fn copy_foreign_with_source_id<R: Read + Seek>(
     };
     let object_map = copier.object_map;
     let visiting = copier.visiting;
+    let to_copy = copier.to_copy;
     copier.target.set_foreign_object_map(source_id, object_map);
     copier
         .target
         .set_foreign_object_visiting(source_id, visiting);
+    copier.target.set_foreign_object_to_copy(source_id, to_copy);
     result
 }
 
@@ -198,7 +202,7 @@ struct ForeignObjectCopier<'a, R: Read + Seek + 'static> {
     target: &'a mut Pdf<R>,
     /// The root's owning document identity (qpdf's `other.m->unique_id`,
     /// `libqpdf/QPDF.cc:2060-2065`) -- `object_map`/`visiting` are keyed by
-    /// bare source `ObjectRef` numbers under the assumption that every
+    /// raw source `QpdfObjGen` identities under the assumption that every
     /// indirect node encountered belongs to this one document, the same
     /// assumption qpdf's own `reserveObjects`/`replaceForeignIndirectObjects`
     /// make. [`ObjectHandle::replace_key`]/`QPDF_Array`'s mutators run the
@@ -216,8 +220,8 @@ struct ForeignObjectCopier<'a, R: Read + Seek + 'static> {
     /// `replaceForeignIndirectObjects`, `QPDF.cc:2101-2213`, have no such
     /// check; see `docs/qpdf-correspondence.md`).
     source_id: u64,
-    object_map: BTreeMap<ObjectRef, ObjectRef>,
-    visiting: BTreeSet<ObjectRef>,
+    object_map: BTreeMap<QpdfObjGen, ObjectRef>,
+    visiting: BTreeSet<QpdfObjGen>,
     // Separable at field granularity, so CLAUDE.md's marker policy calls for
     // #[deprecated] here rather than a comment marker: qpdf's
     // reserveObjects/replaceForeignIndirectObjects (`QPDF.cc:2101-2213`) have
@@ -257,16 +261,21 @@ impl<R: Read + Seek + 'static> ForeignObjectCopier<'_, R> {
             ));
         }
 
-        for source in std::mem::take(&mut self.to_copy) {
-            let source_ref = source.object_ref().ok_or_else(|| {
-                Error::Internal("foreign copier queued a direct object".to_owned())
-            })?;
+        let pending = self.to_copy.len();
+        for index in 0..pending {
+            let source = self.to_copy[index].clone();
+            let source_object_gen = source
+                .qpdf_obj_gen()
+                .filter(|object_gen| object_gen.is_indirect())
+                .ok_or_else(|| {
+                    Error::Internal("foreign copier queued a direct object".to_owned())
+                })?;
             let replacement = self.replace_foreign_indirect_objects(source.clone(), true)?;
             if source.as_stream_dict().is_none() {
                 // cov:ignore-start: `reserve_objects` inserts every `to_copy` entry's
                 // reservation into `object_map` before queuing it; this guards that
                 // invariant instead of indexing and panicking if it is ever broken.
-                let target_ref = *self.object_map.get(&source_ref).ok_or_else(|| {
+                let target_ref = *self.object_map.get(&source_object_gen).ok_or_else(|| {
                     Error::Internal(
                         "foreign copier reservation missing for a queued object".to_owned(),
                     )
@@ -277,9 +286,13 @@ impl<R: Read + Seek + 'static> ForeignObjectCopier<'_, R> {
                     .replace_object(target_ref, replacement)?;
             }
         }
+        self.to_copy.clear();
 
-        if let Some(source_ref) = foreign.object_ref() {
-            let Some(&target_ref) = self.object_map.get(&source_ref) else {
+        if let Some(source_object_gen) = foreign
+            .qpdf_obj_gen()
+            .filter(|object_gen| object_gen.is_indirect())
+        {
+            let Some(&target_ref) = self.object_map.get(&source_object_gen) else {
                 self.target.resolver.push_damaged_warning(
                     "unexpected reference to /Pages object while copying foreign object; replacing with null",
                 )?;
@@ -354,14 +367,17 @@ impl<R: Read + Seek + 'static> ForeignObjectCopier<'_, R> {
             return Ok(());
         }
 
-        if let Some(source_ref) = foreign.object_ref() {
+        if let Some(source_object_gen) = foreign
+            .qpdf_obj_gen()
+            .filter(|object_gen| object_gen.is_indirect())
+        {
             let is_page = foreign.try_is_dictionary_of_type(b"Page", b"")?;
             let is_stream = foreign.as_stream_dict().is_some();
-            if self.visiting.contains(&source_ref) {
+            if self.visiting.contains(&source_object_gen) {
                 return Ok(());
             }
 
-            if let Some(&existing_target_ref) = self.object_map.get(&source_ref) {
+            if let Some(&existing_target_ref) = self.object_map.get(&source_object_gen) {
                 let mapped = self.target.get_object_handle(existing_target_ref);
                 if !(top && is_page && mapped.is_null()) {
                     return Ok(());
@@ -382,10 +398,10 @@ impl<R: Read + Seek + 'static> ForeignObjectCopier<'_, R> {
                     Error::Internal("foreign copier created a direct reservation".to_owned())
                 })?;
                 // cov:ignore-end
-                self.object_map.insert(source_ref, target_ref);
+                self.object_map.insert(source_object_gen, target_ref);
             }
 
-            self.visiting.insert(source_ref);
+            self.visiting.insert(source_object_gen);
             if !top && is_page {
                 // A nested `/Page` reservation never enters `to_copy` (qpdf's
                 // own `reserveObjects` returns without queuing it too,
@@ -393,12 +409,12 @@ impl<R: Read + Seek + 'static> ForeignObjectCopier<'_, R> {
                 // other call site that schedules a freshly reserved object --
                 // never reaches it. The canonical live writer still discovers
                 // this indirect null placeholder through the copied ancestor.
-                self.visiting.remove(&source_ref);
+                self.visiting.remove(&source_object_gen);
                 return Ok(());
             }
             self.to_copy.push(foreign.clone());
             self.reserve_children(&foreign)?;
-            self.visiting.remove(&source_ref);
+            self.visiting.remove(&source_object_gen);
             return Ok(());
         }
 
@@ -465,10 +481,13 @@ impl<R: Read + Seek + 'static> ForeignObjectCopier<'_, R> {
     ) -> Result<ObjectHandle> {
         foreign.try_dereference()?;
         if !top {
-            if let Some(source_ref) = foreign.object_ref() {
+            if let Some(source_object_gen) = foreign
+                .qpdf_obj_gen()
+                .filter(|object_gen| object_gen.is_indirect())
+            {
                 return Ok(self
                     .object_map
-                    .get(&source_ref)
+                    .get(&source_object_gen)
                     .map(|target_ref| self.target.get_object_handle(*target_ref))
                     .unwrap_or_else(ObjectHandle::null));
             }
@@ -487,7 +506,11 @@ impl<R: Read + Seek + 'static> ForeignObjectCopier<'_, R> {
         // stop descending because the enclosing frame is already reserving
         // that subtree, while replacement is still mid-construction of the
         // ancestor's copy and has no finite value to hand back for the cycle.
-        if foreign.object_ref().is_none() {
+        if foreign
+            .qpdf_obj_gen()
+            .filter(|object_gen| object_gen.is_indirect())
+            .is_none()
+        {
             if self
                 .direct_visiting
                 .iter()
@@ -523,10 +546,13 @@ impl<R: Read + Seek + 'static> ForeignObjectCopier<'_, R> {
             // `object_map` before queuing it in `to_copy`; these guard those two
             // invariants instead of unwrapping/indexing and panicking if either is
             // ever broken.
-            let source_ref = foreign.object_ref().ok_or_else(|| {
-                Error::Internal("foreign stream has no object reference".to_owned())
-            })?;
-            let target_ref = *self.object_map.get(&source_ref).ok_or_else(|| {
+            let source_object_gen = foreign
+                .qpdf_obj_gen()
+                .filter(|object_gen| object_gen.is_indirect())
+                .ok_or_else(|| {
+                    Error::Internal("foreign stream has no indirect identity".to_owned())
+                })?;
+            let target_ref = *self.object_map.get(&source_object_gen).ok_or_else(|| {
                 Error::Internal("foreign stream reservation is missing".to_owned())
             })?;
             // cov:ignore-end
@@ -734,6 +760,52 @@ mod tests {
     }
 
     #[test]
+    fn copy_foreign_object_preserves_a_raw_generation_identity() {
+        let raw_ref = ObjectRef::new(5, 65_535);
+        let mut source = minimal_pdf();
+        source
+            .replace_object(raw_ref, ObjectHandle::integer(45))
+            .expect("install raw-generation source value");
+        let raw = source.get_object_handle(raw_ref);
+        let mut target = minimal_pdf();
+
+        let copied = target
+            .copy_foreign_object(&raw)
+            .expect("raw-generation foreign object is indirect to qpdf");
+        let copied_again = target
+            .copy_foreign_object(&raw)
+            .expect("raw-generation map entry is persistent");
+
+        assert!(copied.is_indirect());
+        assert!(copied.is_same_object_as(&copied_again));
+        assert_eq!(copied.try_as_integer().unwrap(), Some(45));
+    }
+
+    #[test]
+    fn copy_foreign_stream_preserves_a_raw_generation_identity() {
+        let raw_ref = ObjectRef::new(5, 65_535);
+        let mut source = minimal_pdf();
+        source
+            .replace_object(
+                raw_ref,
+                ObjectHandle::stream(
+                    ObjectHandle::dictionary(vec![(b"/Length".to_vec(), ObjectHandle::integer(4))]),
+                    Rc::new(b"data".to_vec()),
+                ),
+            )
+            .expect("install raw-generation source stream");
+        let raw = source.get_object_handle(raw_ref);
+        let mut target = minimal_pdf();
+
+        let copied = target
+            .copy_foreign_object(&raw)
+            .expect("raw-generation foreign stream is indirect to qpdf");
+
+        assert!(copied.is_indirect());
+        assert!(copied.as_stream_dict().is_some());
+    }
+
+    #[test]
     fn preserve_copy_allows_page_tree_containers_without_pages_boundary_warning() {
         let mut source = minimal_pdf();
         let mut target = minimal_pdf();
@@ -865,8 +937,10 @@ mod tests {
         let target_value = target
             .make_indirect_object_handle(ObjectHandle::integer(7))
             .expect("target replacement");
-        let source_stream_ref = source_stream.object_ref().expect("source stream identity");
-        let source_null_ref = indirect_null.object_ref().expect("source null identity");
+        let source_stream_ref = source_stream
+            .qpdf_obj_gen()
+            .expect("source stream identity");
+        let source_null_ref = indirect_null.qpdf_obj_gen().expect("source null identity");
         let target_stream_ref = target_stream.object_ref().expect("target stream identity");
         let target_value_ref = target_value.object_ref().expect("target value identity");
 
@@ -936,7 +1010,7 @@ mod tests {
         let error = {
             let mut target = minimal_pdf();
             let mut copier = empty_copier(&mut target);
-            copier.visiting.insert(ObjectRef::new(900, 0));
+            copier.visiting.insert(QpdfObjGen::new(900, 0));
             copier
                 .run(&ObjectHandle::integer(1))
                 .expect_err("a stale visiting set must be rejected")
@@ -1046,11 +1120,41 @@ mod tests {
     }
 
     #[test]
+    fn copy_foreign_object_retries_a_failed_stream_replacement() {
+        let mut source = minimal_pdf();
+        let mut target = minimal_pdf();
+        let direct_stream = ObjectHandle::stream(
+            ObjectHandle::dictionary(Vec::new()),
+            Rc::new(b"direct stream".to_vec()),
+        );
+        let root = source
+            .make_indirect_object_handle(ObjectHandle::dictionary(vec![(
+                b"/Stream".to_vec(),
+                direct_stream,
+            )]))
+            .expect("root");
+
+        let first_error = target
+            .copy_foreign_object(&root)
+            .expect_err("the direct stream must fail during replacement");
+        assert!(matches!(&first_error, Error::System(message)
+            if message == "QPDF::copyForeign encountered a direct stream object"));
+
+        let retry_error = target
+            .copy_foreign_object(&root)
+            .expect_err("the failed stream replacement must remain queued for retry");
+        assert!(matches!(retry_error, Error::System(message)
+            if message == "QPDF::copyForeign encountered a direct stream object"));
+    }
+
+    #[test]
     #[allow(deprecated)]
     fn foreign_copier_rejects_a_non_stream_destination_reservation() {
         let source = minimal_pdf();
         let source_stream = source.new_stream().expect("source stream");
-        let source_ref = source_stream.object_ref().expect("source stream identity");
+        let source_ref = source_stream
+            .qpdf_obj_gen()
+            .expect("source stream identity");
         let mut target = minimal_pdf();
         let wrong_destination = target
             .make_indirect_object_handle(ObjectHandle::integer(7))

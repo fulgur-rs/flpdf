@@ -46,6 +46,7 @@ use crate::page_label_document_helper::{
 use crate::pages::page_refs;
 use crate::pdf::WriterObjectOrderKey;
 use crate::pdf_string::{new_unicode_string, utf8_value};
+use crate::qpdf_obj_gen::QpdfObjGen;
 use crate::{
     AcroFormDocumentHelper, Error, ObjectHandle, ObjectRef, PageDocumentHelper, PageObjectHelper,
     Pdf, Result, XrefEntry,
@@ -69,6 +70,23 @@ pub struct MergeInput<'a, R: Read + Seek + 'static> {
     pub source: &'a mut Pdf<R>,
     /// 0-based page indices to copy, in output order.
     pub pages: Vec<usize>,
+}
+
+/// Project the persistent qpdf raw foreign-copy map at the page-merge
+/// consumers that operate on parser-valid source references. Raw entries stay
+/// in the canonical map owned by Pdf; this view is deliberately lossy only at
+/// the public page/field ObjectRef boundary.
+fn project_foreign_object_map(
+    raw_map: &BTreeMap<QpdfObjGen, ObjectRef>,
+) -> BTreeMap<ObjectRef, ObjectRef> {
+    raw_map
+        .iter()
+        .filter_map(|(object_gen, target_ref)| {
+            object_gen
+                .to_object_ref()
+                .map(|source_ref| (source_ref, *target_ref))
+        })
+        .collect()
 }
 
 // Primary Catalog and trailer values are copied directly through the canonical
@@ -1276,9 +1294,15 @@ fn merge_documents_with_resource_decisions_and_preserve_primary_into_impl<
             // direct child values are copied by `wire_primary_catalog`; only
             // an indirect Catalog participates in the identity map.
             if let Some(primary_catalog_ref) = input.source.root_ref() {
-                copy_seed.insert(primary_catalog_ref, target_catalog_ref);
+                copy_seed.insert(
+                    QpdfObjGen::try_from_object_ref(primary_catalog_ref)?,
+                    target_catalog_ref,
+                );
             }
-            copy_seed.insert(primary_pages_ref, pages_root_ref);
+            copy_seed.insert(
+                QpdfObjGen::try_from_object_ref(primary_pages_ref)?,
+                pages_root_ref,
+            );
         }
         target.set_foreign_object_map(source_id, copy_seed);
         for &page_ref in &unique {
@@ -1308,7 +1332,8 @@ fn merge_documents_with_resource_decisions_and_preserve_primary_into_impl<
                     .push((page_ref, new_objects));
             }
         }
-        let page_copy_map = target.foreign_object_map_snapshot(source_id);
+        let page_copy_map =
+            project_foreign_object_map(&target.foreign_object_map_snapshot(source_id));
         // qpdf keeps the primary Catalog and trailer in the same QPDF while
         // `handlePageSpecs` mutates its page tree. Copy their values through
         // the destination-owned ObjectHandle copier, reusing the selected-page
@@ -1328,8 +1353,7 @@ fn merge_documents_with_resource_decisions_and_preserve_primary_into_impl<
         // target writer rather than copied as source streams
         // (`QPDFWriter.cc:1093-1103,1955-2003`).
         if is_primary && preserve_primary_unreferenced {
-            for object_ref in input.source.canonical_live_object_refs() {
-                let source_object = input.source.get_object_handle(object_ref);
+            for source_object in input.source.canonical_live_object_handles()? {
                 if source_object.try_is_stream_of_type(b"ObjStm", b"")? {
                     continue;
                 }
@@ -1340,7 +1364,8 @@ fn merge_documents_with_resource_decisions_and_preserve_primary_into_impl<
         // Keep the completed source map as the local identity view for field
         // trimming, removed-page nulling, and page-tree assembly. The map has
         // been populated only by the canonical foreign copier above.
-        let map = target.take_foreign_object_map(source_id);
+        let raw_map = target.take_foreign_object_map(source_id);
+        let map = project_foreign_object_map(&raw_map);
 
         if is_primary {
             install_primary_object_stream_membership(
@@ -1494,7 +1519,7 @@ fn merge_documents_with_resource_decisions_and_preserve_primary_into_impl<
         // graph map on the target until the job-level AcroForm replay has
         // finished; retaining only the page-ref projection would copy every
         // field, annotation, appearance stream, and resource a second time.
-        target.set_foreign_object_map(source_id, map);
+        target.set_foreign_object_map(source_id, raw_map);
 
         if is_primary && !preserve_primary_unreferenced && !all.is_empty() {
             // qpdf keeps the primary QPDF's complete xref object-number
