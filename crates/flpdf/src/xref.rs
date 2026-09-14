@@ -117,100 +117,6 @@ pub(crate) trait CanonicalTrailerOwner {
     fn repair_diagnostics(&self) -> Diagnostics;
 }
 
-/// Buffer warnings while a bounded source-window parse is speculative.
-/// qpdf retries a failed xref read through one document warning collection; a
-/// failed window must therefore not deliver warnings before the full-source
-/// recovery fallback gets its chance to own the same sequence.
-struct BufferedCanonicalTrailerOwner<'a> {
-    owner: &'a dyn CanonicalTrailerOwner,
-    warnings: RefCell<Diagnostics>,
-}
-
-impl<'a> BufferedCanonicalTrailerOwner<'a> {
-    fn new(owner: &'a dyn CanonicalTrailerOwner) -> Self {
-        Self {
-            owner,
-            warnings: RefCell::new(Diagnostics::default()),
-        }
-    }
-
-    fn flush(self) -> Result<()> {
-        for warning in self.warnings.into_inner().entries() {
-            self.owner.push_warning(warning.clone())?;
-        }
-        Ok(())
-    }
-}
-
-impl CanonicalTrailerOwner for BufferedCanonicalTrailerOwner<'_> {
-    fn indirect_handle(&self, object_ref: ObjectRef) -> ObjectHandle {
-        self.owner.indirect_handle(object_ref)
-    }
-
-    fn direct_handle(&self, value: ObjectValue) -> ObjectHandle {
-        self.owner.direct_handle(value)
-    }
-
-    fn install_xref_entries(&self, entries: BTreeMap<ObjectRef, XrefEntry>) {
-        self.owner.install_xref_entries(entries);
-    }
-
-    fn set_header_offset(&self, offset: usize) {
-        self.owner.set_header_offset(offset);
-    }
-
-    fn source_seek(&self, offset: u64) -> Result<()> {
-        self.owner.source_seek(offset)
-    }
-
-    fn source_tell(&self) -> Result<u64> {
-        self.owner.source_tell()
-    }
-
-    fn source_length(&self) -> Result<u64> {
-        self.owner.source_length()
-    }
-
-    fn source_read(&self, buffer: &mut [u8]) -> Result<usize> {
-        self.owner.source_read(buffer)
-    }
-
-    fn begin_parse(&self) -> Result<()> {
-        self.owner.begin_parse()
-    }
-
-    fn end_parse(&self) {
-        self.owner.end_parse();
-    }
-
-    fn read_object_at_offset(
-        &self,
-        offset: u64,
-        expected: ObjectRef,
-        description: Option<Vec<u8>>,
-    ) -> Result<(ObjectHandle, Option<u64>)> {
-        self.owner
-            .read_object_at_offset(offset, expected, description)
-    }
-
-    fn read_xref_stream_at_offset(
-        &self,
-        offset: u64,
-        description: Option<Vec<u8>>,
-    ) -> Result<(ObjectHandle, Option<u64>)> {
-        self.owner.read_xref_stream_at_offset(offset, description)
-    }
-
-    fn push_warning(&self, warning: QpdfExc) -> Result<()> {
-        self.warnings.borrow_mut().push(warning);
-        Ok(())
-    }
-
-    fn repair_diagnostics(&self) -> Diagnostics {
-        self.owner.repair_diagnostics()
-    }
-}
-
 impl<R: Read + Seek + 'static> CanonicalTrailerOwner for ResolverHandle<R> {
     fn source_seek(&self, offset: u64) -> Result<()> {
         self.seek(offset)
@@ -2064,13 +1970,18 @@ fn trailer_dictionary_end(bytes: &[u8], trailer_keyword_end: usize) -> Option<us
     let mut tokenizer = Tokenizer::new(bytes);
     tokenizer.allow_eof();
     tokenizer.set_position(trailer_keyword_end).ok()?;
-    let mut depth = 0usize;
+    let mut dictionary_depth = 0usize;
+    let mut array_depth = 0usize;
     loop {
         let token = tokenizer.read_token(false, 0).ok()?;
         match token.token_type {
-            TokenType::DictOpen => depth = depth.saturating_add(1),
-            TokenType::DictClose if depth == 1 => return Some(tokenizer.position()),
-            TokenType::DictClose if depth > 1 => depth -= 1,
+            TokenType::DictOpen => dictionary_depth = dictionary_depth.saturating_add(1),
+            TokenType::DictClose if dictionary_depth == 1 && array_depth == 0 => {
+                return Some(tokenizer.position())
+            }
+            TokenType::DictClose if dictionary_depth > 1 => dictionary_depth -= 1,
+            TokenType::ArrayOpen => array_depth = array_depth.saturating_add(1),
+            TokenType::ArrayClose if array_depth > 0 => array_depth -= 1,
             TokenType::Eof => return None,
             _ => {}
         }
@@ -2194,6 +2105,7 @@ pub(crate) fn load_xref_state_from_source(
         }
     };
     owner.set_header_offset(header_offset);
+    deliver_canonical_diagnostics(Some(owner), &mut initial_diagnostics)?;
 
     let logical_length = physical_length.saturating_sub(header_offset as u64);
     let tail_length = usize::try_from(logical_length.min(1054)).unwrap_or(1054);
@@ -2201,9 +2113,6 @@ pub(crate) fn load_xref_state_from_source(
     let tail = read_live_source_range(owner, tail_start, tail_length)?;
     let startxref = match parse_startxref(&tail) {
         Ok(offset) => offset,
-        // cov:ignore-start: load_xref_state_from_window owns every qpdf repair
-        // handoff; this is only the defensive retry after a speculative
-        // canonical-owner transport or warning-sink failure.
         Err(error) if options.allow_repair => {
             // The canonical recovery scanner reads the same live source in
             // chunks. Keep no complete input snapshot merely because qpdf's
@@ -2215,7 +2124,7 @@ pub(crate) fn load_xref_state_from_source(
                 header_offset,
                 0,
                 options,
-                initial_diagnostics,
+                Diagnostics::default(),
                 vec![error],
                 Some(owner),
             );
@@ -2225,23 +2134,6 @@ pub(crate) fn load_xref_state_from_source(
             return Err(error);
         }
     };
-    if startxref > logical_length {
-        if options.allow_repair {
-            return load_xref_state_from_window(
-                &[],
-                0,
-                version,
-                header_offset,
-                startxref,
-                options,
-                initial_diagnostics,
-                vec![Error::parse(0, "xref not found")],
-                Some(owner),
-            );
-        }
-        deliver_canonical_diagnostics(Some(owner), &mut initial_diagnostics)?;
-        return Err(Error::parse(0, "xref not found"));
-    }
     if startxref == 0 {
         // qpdf's `xref_offset == 0` guard skips `read_xref` entirely
         // (`QPDF.cc:450-452`). Do not put the direct reconstruction handoff
@@ -2254,12 +2146,16 @@ pub(crate) fn load_xref_state_from_source(
             header_offset,
             0,
             options,
-            initial_diagnostics,
+            Diagnostics::default(),
             Vec::new(),
             Some(owner),
         );
     }
-    let xref_window = read_live_xref_window(owner, startxref)?;
+    let xref_window = if startxref >= logical_length {
+        Vec::new()
+    } else {
+        read_live_xref_window(owner, startxref)?
+    };
     let first_non_space = xref_window.iter().position(|byte| !is_pdf_space(*byte));
     let starts_classic_xref = first_non_space
         .and_then(|pos| xref_window.get(pos..))
@@ -2289,48 +2185,17 @@ pub(crate) fn load_xref_state_from_source(
             Some(owner),
         );
     }
-    let buffered_owner = BufferedCanonicalTrailerOwner::new(owner);
-    let mut window_initial_diagnostics = initial_diagnostics.clone();
-    deliver_canonical_diagnostics(Some(&buffered_owner), &mut window_initial_diagnostics)?;
-    let window_result = load_xref_state_from_window(
+    load_xref_state_from_window(
         &xref_window,
         startxref,
-        version.clone(),
+        version,
         header_offset,
         startxref,
-        options.clone(),
+        options,
         Diagnostics::default(),
         Vec::new(),
-        Some(&buffered_owner),
-    );
-    match window_result {
-        Ok(state) => {
-            buffered_owner.flush()?;
-            Ok(state)
-        }
-        Err(error) if options.allow_repair => {
-            // A malformed initial section is recovered by the canonical live
-            // line scanner. Flush only the speculative window diagnostics;
-            // the recovery handoff itself reads the source through `owner`.
-            buffered_owner.flush()?;
-            load_xref_state_from_window(
-                &xref_window,
-                startxref,
-                version,
-                header_offset,
-                startxref,
-                options,
-                Diagnostics::default(),
-                vec![error],
-                Some(owner),
-            )
-        }
-        Err(error) => {
-            buffered_owner.flush()?;
-            Err(error)
-        }
-    }
-    // cov:ignore-end
+        Some(owner),
+    )
 }
 
 /// Load xref state from bytes that were read by the document's own input
@@ -4157,9 +4022,13 @@ fn recover_xref_entries_from_source(
                 )
             };
             if let Ok((candidate, diagnostics)) = result {
+                // qpdf's reconstruct_xref emits parser warnings even when
+                // readTrailer returns a non-dictionary candidate
+                // (`QPDF.cc:565-568`). The candidate is discarded, but the
+                // warning side effects remain on the document.
+                trailer_diagnostics.extend(diagnostics);
                 if candidate.try_is_dictionary().unwrap_or(false) {
                     trailer = Some(candidate);
-                    trailer_diagnostics.extend(diagnostics);
                 }
             } // cov:ignore: LLVM maps the successful trailer-candidate edge to the inner dictionary branch
             owner.source_seek(next_line_start)?;
@@ -9467,31 +9336,6 @@ mod final_handle_tests {
             assert!(owner
                 .read_object_at_offset(0, ObjectRef::new(1, 0), None)
                 .is_err());
-            let buffered = BufferedCanonicalTrailerOwner::new(&owner);
-            buffered.set_header_offset(0);
-            buffered.source_seek(0).expect("buffered source seek");
-            assert_eq!(buffered.source_tell().expect("buffered source tell"), 0);
-            assert_eq!(buffered.source_length().expect("buffered source length"), 0);
-            assert_eq!(
-                buffered
-                    .source_read(&mut source_buffer)
-                    .expect("buffered source read"),
-                0
-            );
-            buffered
-                .read_object_at_offset(0, ObjectRef::new(1, 0), None)
-                .expect_err("buffered object read must forward the owner failure");
-            buffered
-                .read_xref_stream_at_offset(0, None)
-                .expect_err("buffered xref read must forward the owner failure");
-            buffered.begin_parse().expect("buffered parse guard");
-            buffered.end_parse();
-            buffered
-                .push_warning(damaged_warning(b"synthetic.pdf", b"", "buffered", Some(0)))
-                .expect("buffered warning sink");
-            assert_eq!(buffered.repair_diagnostics().entries().len(), 1);
-            buffered.flush().expect("flush buffered warning");
-            let diagnostics_before_parse = owner.repair_diagnostics().entries().len();
             let mut registration = XrefRegistration::default();
             let error = parse_xref_stream_with_canonical_owner(
                 0,
@@ -9514,10 +9358,7 @@ mod final_handle_tests {
             // `push_qpdf_warning` both logs it and records it, and `engine.rs`
             // installs the owner sink onto that same document. This delivers
             // one repair warning, matching qpdf (`QPDF.cc:518-522`).
-            assert_eq!(
-                owner.repair_diagnostics().entries().len(),
-                diagnostics_before_parse + 1
-            );
+            assert_eq!(owner.repair_diagnostics().entries().len(), 1);
         }
     }
 
@@ -9528,6 +9369,19 @@ mod final_handle_tests {
         let window = read_live_xref_window(resolver.as_ref(), 0).expect("classic xref window");
         assert!(window.ends_with(b"stream\n"));
         assert!(!window.ends_with(b"ignored tail\n"));
+
+        let nested_array = b"xref\ntrailer << /Items [ << /Size 1 >> ] >> stream\nignored tail\n";
+        let resolver = canonical_test_resolver(nested_array.to_vec(), BTreeMap::new(), true, 20);
+        let window = read_live_xref_window(resolver.as_ref(), 0)
+            .expect("array contents must not end the trailer dictionary");
+        assert!(window.ends_with(b"stream\n"));
+        assert!(!window.ends_with(b"ignored tail\n"));
+
+        let malformed_array = b"xref\ntrailer\n<< /Items [ >>\n>>\nstartxref\n0\n";
+        let resolver = canonical_test_resolver(malformed_array.to_vec(), BTreeMap::new(), true, 20);
+        let window = read_live_xref_window(resolver.as_ref(), 0)
+            .expect("an unclosed array keeps the full bounded probe");
+        assert_eq!(window, malformed_array);
 
         let no_following = b"xref\ntrailer\n<< /Size 1 >>";
         let resolver = canonical_test_resolver(no_following.to_vec(), BTreeMap::new(), true, 21);
