@@ -116,14 +116,31 @@ impl SharedObjectHintEntry {
 fn linearization_content_normalize_refs<R: Read + Seek>(
     pdf: &mut Pdf<R>,
     options: &crate::writer::WriterOptions,
-) -> Result<BTreeSet<ObjectRef>> {
+) -> Result<BTreeSet<QpdfObjGen>> {
     if !options.content_normalization {
         return Ok(BTreeSet::new());
     }
     let mut refs = BTreeSet::new();
     for page_ref in crate::pages::page_refs(pdf)? {
-        for content_ref in crate::writer::collect_content_stream_refs(pdf, page_ref)? {
-            refs.insert(content_ref);
+        let page = pdf.get_object_handle(page_ref);
+        let contents = page.try_get_key(b"/Contents")?;
+        let mut record_stream = |stream: &ObjectHandle| -> Result<()> {
+            if stream.type_code()? == 10 {
+                if let Some(object_gen) = stream
+                    .qpdf_obj_gen()
+                    .filter(|object_gen| object_gen.is_indirect())
+                {
+                    refs.insert(object_gen);
+                }
+            }
+            Ok(())
+        };
+        if contents.type_code()? == 10 {
+            record_stream(&contents)?;
+        } else if let Some(items) = contents.try_as_array()? {
+            for item in items {
+                record_stream(&item)?;
+            }
         }
     }
     Ok(refs)
@@ -157,7 +174,7 @@ fn stream_parameters_removed_for_linearization(
     handle: &ObjectHandle,
     stream_ref: Option<QpdfObjGen>,
     options: &crate::writer::WriterOptions,
-    content_normalize_refs: &BTreeSet<ObjectRef>,
+    content_normalize_refs: &BTreeSet<QpdfObjGen>,
 ) -> Result<bool> {
     // qpdf's linearization optimizer probes a token-filtered stream even when
     // its /Filter and /DecodeParms entries are direct. That probe is
@@ -165,9 +182,8 @@ fn stream_parameters_removed_for_linearization(
     // for modified streams so the first body pass sees qpdf's already-consumed
     // filter. Unmodified streams use the linearized writer-policy probe below
     // to decide whether parameter edges disappear.
-    let normalize_content = stream_ref
-        .and_then(QpdfObjGen::to_object_ref)
-        .is_some_and(|object_ref| content_normalize_refs.contains(&object_ref));
+    let normalize_content =
+        stream_ref.is_some_and(|object_gen| content_normalize_refs.contains(&object_gen));
     if handle.is_data_modified() {
         crate::writer::plain::body::canonical_stream_filter_probe_for_linearization(
             handle,
@@ -212,7 +228,7 @@ fn collect_direct_handle_refs_with_stream_parameters(
     handle: &ObjectHandle,
     depth: usize,
     out: &mut Vec<ObjectRef>,
-    skipped_stream_parameter_streams: &BTreeSet<ObjectRef>,
+    skipped_stream_parameter_streams: &BTreeSet<QpdfObjGen>,
 ) -> Result<()> {
     let mut contextual = Vec::new();
     collect_direct_handle_refs_with_stream_parameters_context(
@@ -260,7 +276,7 @@ fn collect_direct_handle_refs_with_stream_parameters_context(
     depth: usize,
     in_array: bool,
     out: &mut Vec<(ObjectRef, bool)>,
-    skipped_stream_parameter_streams: &BTreeSet<ObjectRef>,
+    skipped_stream_parameter_streams: &BTreeSet<QpdfObjGen>,
 ) -> Result<()> {
     if depth > MAX_PARSE_DEPTH {
         return Err(crate::Error::Unsupported(format!(
@@ -312,7 +328,7 @@ fn collect_direct_handle_children_with_stream_parameters<F>(
     handle: &ObjectHandle,
     depth: usize,
     _parent_in_array: bool,
-    skipped_stream_parameter_streams: &BTreeSet<ObjectRef>,
+    skipped_stream_parameter_streams: &BTreeSet<QpdfObjGen>,
     visit: &mut F,
 ) -> Result<()>
 where
@@ -352,18 +368,18 @@ where
 
 fn handle_has_stream_parameter_skip(
     handle: &ObjectHandle,
-    skipped_stream_parameter_streams: &BTreeSet<ObjectRef>,
+    skipped_stream_parameter_streams: &BTreeSet<QpdfObjGen>,
 ) -> Result<bool> {
     Ok(handle
-        .object_ref()
-        .is_some_and(|object_ref| skipped_stream_parameter_streams.contains(&object_ref)))
+        .qpdf_obj_gen()
+        .is_some_and(|object_gen| skipped_stream_parameter_streams.contains(&object_gen)))
 }
 
 fn collect_handle_children_with_stream_parameters(
     handle: &ObjectHandle,
     depth: usize,
     out: &mut Vec<(ObjectRef, bool)>,
-    skipped_stream_parameter_streams: &BTreeSet<ObjectRef>,
+    skipped_stream_parameter_streams: &BTreeSet<QpdfObjGen>,
 ) -> Result<()> {
     collect_direct_handle_children_with_stream_parameters(
         handle,
@@ -393,7 +409,7 @@ fn compute_closure_with_stream_parameters<R: Read + Seek>(
     root: ObjectRef,
     live: &BTreeSet<ObjectRef>,
     resurrectable: &BTreeSet<ObjectRef>,
-    skipped_stream_parameter_streams: &BTreeSet<ObjectRef>,
+    skipped_stream_parameter_streams: &BTreeSet<QpdfObjGen>,
 ) -> crate::Result<Vec<ObjectRef>> {
     let mut visited: BTreeSet<ObjectRef> = BTreeSet::new();
     let mut order: Vec<ObjectRef> = Vec::new();
@@ -977,24 +993,39 @@ fn raw_refs_with_extras_preserving_first(
     result
 }
 
+fn raw_refs_with_extras_root_first(
+    refs: impl IntoIterator<Item = ObjectRef>,
+    extras: impl IntoIterator<Item = QpdfObjGen>,
+    root: Option<QpdfObjGen>,
+) -> Vec<QpdfObjGen> {
+    let mut result = raw_refs_from_object_refs(refs);
+    result.extend(extras);
+    result.sort_unstable();
+    if let Some(root) = root {
+        if let Some(position) = result.iter().position(|object| *object == root) {
+            result.remove(position);
+            result.insert(0, root);
+        }
+    }
+    result
+}
+
 #[allow(clippy::too_many_arguments)]
 fn build_raw_linearization_plan<R: Read + Seek>(
     pdf: &mut Pdf<R>,
     optimization: &crate::optimization::Optimization,
     part2_objects: &[ObjectRef],
     part3_objects: &[ObjectRef],
-    part4_other_pages_private: &[ObjectRef],
     part4_other_pages_shared: &[ObjectRef],
     part4_rest: &[ObjectRef],
     part4_open_document_plain: &[ObjectRef],
     per_page_private_objects: &[Vec<ObjectRef>],
-    outline_first_page_members: &[ObjectRef],
     part9_outline_objects: &[ObjectRef],
     part6_outline_objects: &[ObjectRef],
     root_ref: Option<ObjectRef>,
     pages_tree_ref: Option<ObjectRef>,
     info_ref: Option<ObjectRef>,
-    content_normalize_refs: &BTreeSet<ObjectRef>,
+    content_normalize_refs: &BTreeSet<QpdfObjGen>,
     removed_refs: &BTreeSet<ObjectRef>,
     outlines_in_first_page: bool,
 ) -> Result<RawLinearizationPlan> {
@@ -1017,7 +1048,6 @@ fn build_raw_linearization_plan<R: Read + Seek>(
 
     let mut raw_part2_extra = Vec::new();
     let mut raw_part3_extra = Vec::new();
-    let mut raw_part4_private_extra = Vec::new();
     let mut raw_part4_shared_extra = Vec::new();
     let mut raw_part4_rest_extra = Vec::new();
     let mut raw_open_document_plain_extra = Vec::new();
@@ -1066,7 +1096,6 @@ fn build_raw_linearization_plan<R: Read + Seek>(
                 raw_part2_extra.push(object_gen);
             }
         } else if let Some(page) = optimization.raw_other_page_private_owner(object_gen) {
-            raw_part4_private_extra.push(object_gen);
             raw_private_by_page
                 .entry(page)
                 .or_default()
@@ -1078,7 +1107,6 @@ fn build_raw_linearization_plan<R: Read + Seek>(
         }
     }
 
-    raw_part4_private_extra.sort_unstable();
     raw_part4_shared_extra.sort_unstable();
     raw_part4_rest_extra.sort_unstable();
     raw_open_document_plain_extra.sort_unstable();
@@ -1092,6 +1120,22 @@ fn build_raw_linearization_plan<R: Read + Seek>(
             destination.extend(objects);
         }
     }
+    // qpdf emits Part 7 one page at a time. The page dictionary is the explicit
+    // head of each page group; every remaining member comes from that page's
+    // `std::set<QPDFObjGen>` user set. Merge raw-only members into the owning
+    // page before sorting the tail so a raw identity cannot be appended after
+    // all checked private objects from every page.
+    for objects in raw_per_page_private_objects.iter_mut().skip(1) {
+        if objects.len() > 1 {
+            objects[1..].sort_unstable();
+        }
+    }
+    let raw_part4_private: Vec<QpdfObjGen> = raw_per_page_private_objects
+        .iter()
+        .skip(1)
+        .flatten()
+        .copied()
+        .collect();
 
     let raw_part6_outline_extra: Vec<_> = if outlines_in_first_page {
         raw_part4_rest_extra
@@ -1113,17 +1157,32 @@ fn build_raw_linearization_plan<R: Read + Seek>(
     };
     raw_part4_rest_extra.retain(|object_gen| !outline_refs.contains(object_gen));
 
+    let outline_root = if let Some(root_ref) = pdf.root_ref() {
+        pdf.get_object_handle(root_ref)
+            .try_get_key(b"/Outlines")?
+            .qpdf_obj_gen()
+            .filter(|object_gen| object_gen.is_indirect())
+    } else {
+        None
+    };
+    let raw_part6_outline_objects = raw_refs_with_extras_root_first(
+        part6_outline_objects.iter().copied(),
+        raw_part6_outline_extra.clone(),
+        outline_root,
+    );
+    let raw_part9_outline_objects = raw_refs_with_extras_root_first(
+        part9_outline_objects.iter().copied(),
+        raw_part9_outline_extra.clone(),
+        outline_root,
+    );
+
     let raw_shared_hints = raw_part2_objects_for_hints(
         &raw_refs_with_extras_preserving_first(
             part2_objects.iter().copied(),
             raw_part2_extra.clone(),
         ),
         &raw_refs_with_extras(part3_objects.iter().copied(), raw_part3_extra.clone(), true),
-        &raw_refs_with_extras(
-            part6_outline_objects.iter().copied(),
-            raw_part6_outline_extra.clone(),
-            true,
-        ),
+        &raw_part6_outline_objects,
         &raw_refs_with_extras(
             part4_other_pages_shared.iter().copied(),
             raw_part4_shared_extra.clone(),
@@ -1138,11 +1197,7 @@ fn build_raw_linearization_plan<R: Read + Seek>(
             raw_part2_extra,
         ),
         part3_objects: raw_refs_with_extras(part3_objects.iter().copied(), raw_part3_extra, true),
-        part4_other_pages_private: raw_refs_with_extras(
-            part4_other_pages_private.iter().copied(),
-            raw_part4_private_extra,
-            false,
-        ),
+        part4_other_pages_private: raw_part4_private,
         part4_other_pages_shared: raw_refs_with_extras(
             part4_other_pages_shared.iter().copied(),
             raw_part4_shared_extra,
@@ -1159,25 +1214,10 @@ fn build_raw_linearization_plan<R: Read + Seek>(
             .and_then(|object_ref| QpdfObjGen::try_from_object_ref(object_ref).ok()),
         info: info_ref.and_then(|object_ref| QpdfObjGen::try_from_object_ref(object_ref).ok()),
         per_page_private_objects: raw_per_page_private_objects,
-        outline_first_page_members: raw_refs_with_extras(
-            outline_first_page_members.iter().copied(),
-            raw_part6_outline_extra.clone(),
-            true,
-        ),
-        part9_outline_objects: raw_refs_with_extras(
-            part9_outline_objects.iter().copied(),
-            raw_part9_outline_extra,
-            true,
-        ),
-        part6_outline_objects: raw_refs_with_extras(
-            part6_outline_objects.iter().copied(),
-            raw_part6_outline_extra,
-            true,
-        ),
-        content_normalize_refs: content_normalize_refs
-            .iter()
-            .filter_map(|object_ref| QpdfObjGen::try_from_object_ref(*object_ref).ok())
-            .collect(),
+        outline_first_page_members: raw_part6_outline_objects.clone(),
+        part9_outline_objects: raw_part9_outline_objects,
+        part6_outline_objects: raw_part6_outline_objects,
+        content_normalize_refs: content_normalize_refs.clone(),
         removed_refs: raw_removed_refs,
         shared_hints: raw_shared_hints,
     })
@@ -1320,7 +1360,6 @@ impl LinearizationPlan {
         // redundant with that traversal rather than compensating for a real
         // gap in it.
         let content_normalize_refs = linearization_content_normalize_refs(pdf, options)?;
-        let mut skipped_stream_parameter_streams: BTreeSet<ObjectRef> = BTreeSet::new();
         let mut skipped_raw_stream_parameter_streams: BTreeSet<QpdfObjGen> = BTreeSet::new();
         let mut optimization = crate::optimization::Optimization::optimize(
             pdf,
@@ -1359,17 +1398,13 @@ impl LinearizationPlan {
                         stream,
                         options,
                         stream_ref
-                            .and_then(QpdfObjGen::to_object_ref)
-                            .is_some_and(|object_ref| content_normalize_refs.contains(&object_ref)),
+                            .is_some_and(|object_gen| content_normalize_refs.contains(&object_gen)),
                     )? // cov:ignore: LLVM attributes this covered reachable-stream branch continuation to the call opening line
                 };
                 if refiltered {
                     if has_indirect_parameter {
                         if let Some(object_gen) = stream_ref {
                             skipped_raw_stream_parameter_streams.insert(object_gen);
-                            if let Some(object_ref) = object_gen.to_object_ref() {
-                                skipped_stream_parameter_streams.insert(object_ref);
-                            }
                         }
                     }
                     // The probe above already consumed qpdf's stateful filter
@@ -1426,7 +1461,7 @@ impl LinearizationPlan {
             crate::writer::rewrite_renumber::reachable_object_set_with_stream_parameters(
                 pdf,
                 true,
-                &skipped_stream_parameter_streams,
+                &skipped_raw_stream_parameter_streams,
             )?;
         let object_refs = pdf.canonical_object_refs();
         let mut all_refs: Vec<ObjectRef> = Vec::with_capacity(object_refs.len());
@@ -1576,7 +1611,7 @@ impl LinearizationPlan {
                 first_page,
                 &live,
                 &resurrectable,
-                &skipped_stream_parameter_streams,
+                &skipped_raw_stream_parameter_streams,
             )? // cov:ignore: LLVM maps this covered first-page closure call terminator to a zero-count continuation region
         } else {
             Vec::new()
@@ -1614,7 +1649,7 @@ impl LinearizationPlan {
                 page_ref,
                 &live,
                 &resurrectable,
-                &skipped_stream_parameter_streams,
+                &skipped_raw_stream_parameter_streams,
             )?; // cov:ignore: LLVM maps this covered later-page closure call terminator to a zero-count continuation region
             let page_users =
                 optimization.objects_for(&crate::optimization::ObjectUser::Page(page_idx as u32));
@@ -2062,12 +2097,10 @@ impl LinearizationPlan {
             &optimization,
             &part2_objects,
             &part3_objects,
-            &part4_other_pages_private,
             &part4_other_pages_shared,
             &part4_rest,
             &part4_open_document_plain,
             &per_page_private_objects,
-            &outline_first_page_members,
             &part9_outline_objects,
             &part6_outline_objects,
             root_ref,
@@ -2163,7 +2196,10 @@ impl LinearizationPlan {
             object_stream_mode,
             removed_refs,
             optimization: Some(optimization),
-            content_normalize_refs,
+            content_normalize_refs: content_normalize_refs
+                .iter()
+                .filter_map(|object_gen| object_gen.to_object_ref())
+                .collect(),
             raw,
         })
     }
@@ -2668,12 +2704,15 @@ impl LinearizationPlan {
         first_extra.sort_unstable_by_key(&raw_number);
         let first_extra_count = first_extra.len();
         result.splice(first_page_count..first_page_count, first_extra);
-        result[..first_page_count + first_extra_count].sort_unstable_by_key(&raw_number);
-        // `result` already has the canonical first-page/Part-8 split; the
-        // insertion above only changes its first-page prefix. Keep the suffix
-        // order stable and sort the explicit raw Part-8 entries by output
-        // number after the existing canonical suffix.
+        let first_page_end = first_page_count + first_extra_count;
+        result[..first_page_end].sort_unstable_by_key(&raw_number);
+        // `result` already has the canonical first-page/Part-8 split. Raw
+        // Part-8 entries must join the existing suffix at the physical output
+        // position assigned by the same `RenumberMap`, rather than being
+        // appended after every checked entry. This preserves the order that
+        // qpdf's shared-hint checker derives from its emitted object units.
         result.extend(part8_extra);
+        result[first_page_end..].sort_unstable_by_key(&raw_number);
         result
     }
 

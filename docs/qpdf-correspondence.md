@@ -1084,6 +1084,43 @@ ObjStm併用、encrypted linearized write を実出力で検証し、raw writer 
 dictionary-key omission と array-position `null` を確認する。 pinned qpdf 11.9.0 の
 `--check-linearization` でもこれらの追加ケースは警告なしで通過する。
 
+### Linearized raw identity follow-ups (`flpdf-pwyo2`, 2026-09-15)
+
+`flpdf-474u8` の raw slot移行後に残っていた八つの linearization consumer gapを、
+qpdf 11.9.0 の責務境界へ再接続した。`QPDFWriter::willFilterStream` は
+Catalog `/Metadata` の参照同一性ではなく、各 stream dictionary の
+`/Type /Metadata` を判定し、`!encrypt_metadata` のときだけ data keyを外す
+（`libqpdf/QPDFWriter.cc:1234-1314,1537-1556`）。flpdf の
+`linearization/writer.rs::append_body_object_with_raw_identity` も同じ raw stream
+dictionary判定を使い、`metadata_ref` を `None == None` の代替identityとして使わない。
+
+content normalization と stream-parameter omission は同じ raw setを共有する。
+qpdf は `initializeSpecialStreams` で各 page の `/Contents` の直接の stream/array
+memberから `getObjGen()` を記録し（`QPDFWriter.cc:1912-1936`）、
+`QPDF::optimize` の `skip_stream_parameters` がその streamを再filterすると
+`/Filter` と `/DecodeParms` を走査対象から外す
+（`QPDF_optimization.cc:261-333`）。flpdf は
+`linearization/plan.rs` の `BTreeSet<QpdfObjGen>` でこれを保持し、raw streamにも
+正規化を適用し、raw identityで parameter edgeをclosure/reachabilityから外す。
+
+Part 7/8 のraw追加はglobal suffixではなく、qpdfの page-by-page／raw set順へ mergeする。
+Part 8 の既存 hint entryとraw entryは `RenumberMap` のphysical output unit順に統合し、
+page shared identifiersは出力番号ではなく qpdfの `obj_user_to_objects` の
+`QPDFObjGen`順を使う。second-half generated ObjStm containerのanchorも、raw plain
+peerを含む該当partの最初のcompressed member位置から決める。根拠は
+`QPDF_linearization.cc:1228-1270,1351-1402` と
+`QPDFWriter.cc:1057-1118,2579-2654` である。
+
+Outlinesは raw `/Outlines` root identityを `RenumberMap::new_for_raw` へ渡し、
+`pushOutlinesToPart` のroot-first順を保持して `/O` hint table の first object/countを
+計算する（`QPDF_linearization.cc:1406-1432,1614-1631`）。これにより raw-only outline
+でも hint keyが欠落せず、子itemを含む連続 output unitを指す。
+
+回帰は `qpdf_obj_gen_header_tests.rs` の raw metadata、raw page content、Part 7/8、
+raw outline、ObjStm anchorケースと、`hint_page` の跨ぎpart shared-ID unit testで固定した。
+Part 8/ObjStmケースは live qpdf 11.9.0 の `--check-linearization` でも警告なしで通過する。
+今回の変更は qpdf が定義する挙動の不足を埋めるもので、qpdf-deviation markerを追加しない。
+
 ### ObjectHandle emission-time encryption surface (`flpdf-egzr.3.2.15`, 2026-08-15)
 
 qpdf の暗号化は Object tree を事前に書き換えない。`QPDFWriter.cc:842-847`

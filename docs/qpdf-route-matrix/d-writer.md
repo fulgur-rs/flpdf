@@ -816,3 +816,32 @@ Part-8、ObjStm併用ケースで `qpdf --check-linearization` の警告を出�
 `writer/{object,encrypted_strings}.rs` と raw header regressionである。これは既存の
 non-linearized raw writer routeを変更せず、linearizationだけに残っていた
 `ObjectRef` narrowing gapを埋める bounded sliceである。
+
+## 2026-09-15: linearized raw identity follow-ups (`flpdf-pwyo2`)
+
+`flpdf-474u8` 後に残っていた linearization の raw-only consumerを、qpdf 11.9.0
+の同一責務へ接続した。
+
+- D16/D17 の stream encryptionは、`QPDFWriter::willFilterStream` の
+  `/Type /Metadata` 判定（`QPDFWriter.cc:1234-1314,1537-1556`）を
+  `linearization/writer.rs::append_body_object_with_raw_identity` で使う。
+  `metadata_ref` の checked projection比較はraw linearizationでは使わず、raw non-metadata
+  streamを誤ってcleartextにしない。
+- D26 の `initializeSpecialStreams` 相当は `/Contents` の直接stream memberを
+  `QpdfObjGen` で記録し、D11/D26の `skip_stream_parameters` は同じraw identityで
+  `/Filter`/`/DecodeParms`をclosureから除外する。対応するqpdf箇所は
+  `QPDFWriter.cc:1912-1936` と `QPDF_optimization.cc:261-333`。
+- D31 のlinearization part orderは、raw Part 7をpageごとの`QPDFObjGen`集合へ
+  mergeし、Part 8 shared hint entryをphysical output unit順に統合する。generated
+  second-half ObjStm anchorはraw plain peerを含めた最初のcompressed member位置を使い、
+  page shared identifiersはoutput番号ではなく raw `obj_user_to_objects` 順にする。
+  `QPDF_linearization.cc:1228-1270,1351-1402`、`QPDFWriter.cc:1057-1118,2579-2654`。
+- D20/D31 のoutline hintはraw `/Outlines` rootを `RenumberMap::new_for_raw` で解決し、
+  root-firstのoutline partと連続unit countを保持する。`QPDF_linearization.cc:1406-1432,1614-1631`。
+
+`crates/flpdf/tests/qpdf_obj_gen_header_tests.rs` と
+`linearization/hint_page.rs` のraw regressionは、raw metadata、content normalizationと
+parameter omission、Part 7/8 order、outline `/O`、ObjStm anchor、跨ぎpart shared-IDを
+固定する。Part 8/ObjStmの生成物は pinned qpdf 11.9.0 の
+`--check-linearization` を警告なしで通過する。今回の行は既存 qpdf semantics の不足を
+埋めるものであり、qpdf-deviation markerを追加しない。

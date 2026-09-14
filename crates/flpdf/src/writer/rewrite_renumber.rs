@@ -431,7 +431,7 @@ fn ensure_canonical_owner<R: Read + Seek>(
 pub(crate) fn reachable_object_set_with_stream_parameters<R: Read + Seek>(
     pdf: &mut Pdf<R>,
     skip_length: bool,
-    skipped_stream_parameter_streams: &BTreeSet<ObjectRef>,
+    skipped_stream_parameter_streams: &BTreeSet<crate::qpdf_obj_gen::QpdfObjGen>,
 ) -> crate::Result<BTreeSet<ObjectRef>> {
     let root = pdf
         .root_ref()
@@ -440,8 +440,8 @@ pub(crate) fn reachable_object_set_with_stream_parameters<R: Read + Seek>(
     let trailer_entries = pdf.trailer().try_as_dictionary()?.unwrap_or_default();
     let skip_stream_parameters = |handle: &crate::ObjectHandle| -> crate::Result<bool> {
         Ok(handle
-            .object_ref()
-            .is_some_and(|object_ref| skipped_stream_parameter_streams.contains(&object_ref)))
+            .qpdf_obj_gen()
+            .is_some_and(|object_gen| skipped_stream_parameter_streams.contains(&object_gen)))
     };
     for (key, value) in trailer_entries {
         // /Encrypt is intentionally NOT skipped: it is part of the live universe.

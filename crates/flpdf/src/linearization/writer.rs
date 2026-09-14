@@ -685,9 +685,9 @@ fn append_body_object_with_raw_identity(
         )?; // cov:ignore: LLVM maps this covered stream-output call terminator to a zero-count continuation region
     let mut entries = dict.try_as_dictionary()?.unwrap_or_default();
     let payload_ctx = encrypt_ctx.filter(|ctx| new_ref != ctx.encrypt_ref);
-    let cleartext_metadata = payload_ctx.is_some_and(|ctx| {
-        !ctx.encrypt_metadata && ctx.metadata_ref == original_ref.to_object_ref()
-    });
+    let is_metadata_stream = dict.try_is_dictionary_of_type(b"Metadata", b"")?;
+    let cleartext_metadata =
+        payload_ctx.is_some_and(|ctx| !ctx.encrypt_metadata && is_metadata_stream);
     // qpdf clears the active data key for cleartext metadata and leaves the
     // stream dictionary's ordinary filter policy to `unparseObject`; it does
     // not inject a synthetic `/Crypt /Identity` stage here
@@ -2019,7 +2019,7 @@ struct OutlineHintInfo {
 ///
 /// Propagates reader errors from catalog resolution.
 fn compute_outline_hint_info<R: Read + Seek>(
-    outlines: &std::collections::BTreeSet<ObjectRef>,
+    outlines: &std::collections::BTreeSet<QpdfObjGen>,
     pdf: &mut Pdf<R>,
     renumber: &RenumberMap,
     objstm_layout: &ObjStmLayout,
@@ -2037,7 +2037,9 @@ fn compute_outline_hint_info<R: Read + Seek>(
             None // cov:ignore: catalog is always a dict when outlines exist
         } else {
             let outlines = root.try_get_key(b"/Outlines")?;
-            outlines.object_ref()
+            outlines
+                .qpdf_obj_gen()
+                .filter(|object_gen| object_gen.is_indirect())
         }
     } else {
         None // cov:ignore: a non-empty retained outline set has a Catalog root
@@ -2051,14 +2053,20 @@ fn compute_outline_hint_info<R: Read + Seek>(
     // when compressed, else its own renumbered number. The objstm corpus
     // compresses all outline objects, so the plain branch (uncompressed outline,
     // i.e. the deferred plain --linearize path) is not exercised here.
-    let unit_of = |r: ObjectRef| -> Option<u32> {
-        match objstm_layout.member_to_container.get(&r) {
-            Some(&(container_num, _)) => Some(container_num),
-            None => renumber.new_for_original(r).map(|nr| nr.number),
+    let unit_of = |object_gen: QpdfObjGen| -> Option<u32> {
+        if let Some(object_ref) = object_gen.to_object_ref() {
+            if let Some(&(container_num, _)) = objstm_layout.member_to_container.get(&object_ref) {
+                return Some(container_num);
+            }
         }
+        renumber
+            .new_for_raw(object_gen)
+            .map(|new_ref| new_ref.number)
     };
-    let units: std::collections::BTreeSet<u32> =
-        outlines.iter().filter_map(|&r| unit_of(r)).collect();
+    let units: std::collections::BTreeSet<u32> = outlines
+        .iter()
+        .filter_map(|&object_gen| unit_of(object_gen))
+        .collect();
     let Some(first_object) = unit_of(outlines_ref) else {
         // Defensive: the /Outlines dict is part of the closure and the plan, so it
         // always has a unit.
@@ -3131,13 +3139,21 @@ fn part7_owner_for_plan(plan: &LinearizationPlan, member: ObjectRef) -> Option<u
         .find_map(|(page, members)| members.contains(&member).then_some(page))
 }
 
+fn qpdf_object_number(object_gen: QpdfObjGen) -> u32 {
+    u32::try_from(object_gen.get_obj()).unwrap_or(u32::MAX)
+}
+
+type SecondHalfPlainRank = (u8, usize, u8, u32);
+type SecondHalfPlainObject = (QpdfObjGen, SecondHalfPlainRank);
+
 fn second_half_container_anchors(
     plan: &LinearizationPlan,
     part4_batches: &[RoutedObjStmBatch],
 ) -> Vec<SecondHalfContainerAnchor> {
-    let member_set: BTreeSet<ObjectRef> = part4_batches
+    let member_set: BTreeSet<QpdfObjGen> = part4_batches
         .iter()
         .flat_map(|batch| batch.members.iter().copied())
+        .filter_map(|object_ref| QpdfObjGen::try_from_object_ref(object_ref).ok())
         .collect();
 
     // Generate containers are fresh objects with no source ObjGen. Preserve
@@ -3154,37 +3170,140 @@ fn second_half_container_anchors(
         .unwrap_or_else(|| plan.pages_tree_ref.into_iter().collect());
 
     // Second-half plain (non-member) objects in qpdf part order, each tagged
-    // with a qpdf ordering key. In Part 7 each page dictionary is forced first,
-    // followed by the remaining page-private objects in ObjGen order.
-    let mut plain_ranked: Vec<(ObjectRef, (u8, usize, u8, u32))> = Vec::new();
-    for (i, privates) in plan.per_page_private_objects.iter().enumerate().skip(1) {
-        let page_ref = plan.page_hints.get(i).map(|hint| hint.page_ref);
-        for &r in privates {
-            if !member_set.contains(&r) {
-                let page_head_rank = u8::from(Some(r) != page_ref);
-                plain_ranked.push((r, (0, i, page_head_rank, r.number)));
+    // with a qpdf ordering key. The identity in this list is deliberately
+    // `QpdfObjGen`, not `ObjectRef`: a raw plain object can be the object that
+    // separates a generated container from its previous peer.
+    let mut plain_ranked: Vec<SecondHalfPlainObject> = Vec::new();
+    let push_page_private = |plain_ranked: &mut Vec<SecondHalfPlainObject>,
+                             page: usize,
+                             page_head: Option<QpdfObjGen>,
+                             objects: &[QpdfObjGen]| {
+        for &object_gen in objects {
+            if !member_set.contains(&object_gen) {
+                let page_head_rank = u8::from(Some(object_gen) != page_head);
+                plain_ranked.push((
+                    object_gen,
+                    (0, page, page_head_rank, qpdf_object_number(object_gen)),
+                ));
+            }
+        }
+    };
+
+    if plan.has_raw_projection_gap() {
+        for (page, objects) in plan.raw.per_page_private_objects.iter().enumerate().skip(1) {
+            let page_head = plan
+                .page_hints
+                .get(page)
+                .and_then(|hint| QpdfObjGen::try_from_object_ref(hint.page_ref).ok());
+            push_page_private(&mut plain_ranked, page, page_head, objects);
+        }
+        for &object_gen in &plan.raw.part4_other_pages_shared {
+            if !member_set.contains(&object_gen) {
+                plain_ranked.push((object_gen, (1, 0, 0, qpdf_object_number(object_gen))));
+            }
+        }
+        for &object_gen in &plan.raw.part4_rest {
+            if !member_set.contains(&object_gen) {
+                let (category, page) = if generate_batches {
+                    object_gen
+                        .to_object_ref()
+                        .zip(plan.optimization.as_ref())
+                        .map(|(object_ref, optimization)| {
+                            part9_category_order_key(optimization, &part9_pages, [&object_ref])
+                        })
+                        .unwrap_or((0, 0))
+                } else {
+                    (0, 0)
+                };
+                plain_ranked.push((
+                    object_gen,
+                    (
+                        2 + category,
+                        page as usize,
+                        0,
+                        qpdf_object_number(object_gen),
+                    ),
+                ));
+            }
+        }
+    } else {
+        for (i, privates) in plan.per_page_private_objects.iter().enumerate().skip(1) {
+            let page_head = plan
+                .page_hints
+                .get(i)
+                .and_then(|hint| QpdfObjGen::try_from_object_ref(hint.page_ref).ok());
+            let objects: Vec<QpdfObjGen> = privates
+                .iter()
+                .filter_map(|object_ref| QpdfObjGen::try_from_object_ref(*object_ref).ok())
+                .collect();
+            push_page_private(&mut plain_ranked, i, page_head, &objects);
+        }
+        for &object_ref in &plan.part4_other_pages_shared {
+            let object_gen = QpdfObjGen::try_from_object_ref(object_ref)
+                .expect("checked Part-8 object must fit qpdf raw identity");
+            if !member_set.contains(&object_gen) {
+                plain_ranked.push((object_gen, (1, 0, 0, qpdf_object_number(object_gen))));
+            }
+        }
+        for &object_ref in &plan.part4_rest {
+            let object_gen = QpdfObjGen::try_from_object_ref(object_ref)
+                .expect("checked Part-9 object must fit qpdf raw identity");
+            if !member_set.contains(&object_gen) {
+                if generate_batches {
+                    let optimization = plan
+                        .optimization
+                        .as_ref()
+                        .expect("generated ObjStm batches require optimization users");
+                    let (category, page) =
+                        part9_category_order_key(optimization, &part9_pages, [&object_ref]);
+                    plain_ranked.push((
+                        object_gen,
+                        (
+                            2 + category,
+                            page as usize,
+                            0,
+                            qpdf_object_number(object_gen),
+                        ),
+                    ));
+                } else {
+                    plain_ranked.push((object_gen, (2, 0, 0, qpdf_object_number(object_gen))));
+                }
             }
         }
     }
-    for &r in &plan.part4_other_pages_shared {
-        if !member_set.contains(&r) {
-            plain_ranked.push((r, (1, 0, 0, r.number)));
-        }
-    }
-    for &r in &plan.part4_rest {
-        if !member_set.contains(&r) {
-            if generate_batches {
-                let optimization = plan
-                    .optimization
-                    .as_ref()
-                    .expect("generated ObjStm batches require optimization users");
-                let (category, page) = part9_category_order_key(optimization, &part9_pages, [&r]);
-                plain_ranked.push((r, (2 + category, page as usize, 0, r.number)));
-            } else {
-                plain_ranked.push((r, (2, 0, 0, r.number)));
+
+    let member_is_in_route = |member: ObjectRef, route: ContainerPart| -> bool {
+        let object_gen = QpdfObjGen::try_from_object_ref(member)
+            .expect("ObjStm members must fit qpdf raw identity");
+        if plan.has_raw_projection_gap() {
+            match route {
+                ContainerPart::OtherPagePrivate => plan
+                    .raw
+                    .per_page_private_objects
+                    .iter()
+                    .skip(1)
+                    .any(|objects| objects.contains(&object_gen)),
+                ContainerPart::OtherPageShared => {
+                    plan.raw.part4_other_pages_shared.contains(&object_gen)
+                }
+                ContainerPart::Rest => {
+                    plan.raw.part4_rest.contains(&object_gen)
+                        || plan.raw.part9_outline_objects.contains(&object_gen)
+                }
+                _ => false,
+            }
+        } else {
+            match route {
+                ContainerPart::OtherPagePrivate => part7_owner_for_plan(plan, member).is_some(),
+                ContainerPart::OtherPageShared => plan.part4_other_pages_shared.contains(&member),
+                ContainerPart::Rest => {
+                    plan.part4_rest.contains(&member)
+                        || plan.part9_outline_objects.contains(&member)
+                }
+                _ => false,
             }
         }
-    }
+    };
 
     part4_batches
         .iter()
@@ -3192,7 +3311,40 @@ fn second_half_container_anchors(
             if batch.members.is_empty() {
                 return SecondHalfContainerAnchor::AfterLast; // cov:ignore: resolved batches are non-empty
             }
-            let object_number = batch.source_container_number.unwrap_or(u32::MAX);
+            // A generated container is first encountered when qpdf enqueues
+            // the first compressed member in this part. Its position is
+            // therefore determined by that member's raw source order, not by
+            // an invented maximum source number. Preserve mode keeps its
+            // existing source-container ordering key because qpdf's preserved
+            // container itself carries that source identity.
+            let object_number = if let Some(source_container_number) = batch.source_container_number
+            {
+                source_container_number
+            } else if plan.has_raw_projection_gap() {
+                batch
+                    .members
+                    .iter()
+                    .filter_map(|member| QpdfObjGen::try_from_object_ref(*member).ok())
+                    .filter(|object_gen| {
+                        batch.members.iter().any(|member| {
+                            QpdfObjGen::try_from_object_ref(*member).ok() == Some(*object_gen)
+                                && member_is_in_route(*member, batch.route)
+                        })
+                    })
+                    .map(qpdf_object_number)
+                    .min()
+                    .or_else(|| {
+                        batch
+                            .members
+                            .iter()
+                            .filter_map(|member| QpdfObjGen::try_from_object_ref(*member).ok())
+                            .map(qpdf_object_number)
+                            .min()
+                    })
+                    .expect("resolved ObjStm batches are non-empty")
+            } else {
+                u32::MAX
+            };
             let batch_rank: (u8, usize, u8, u32) = match batch.route {
                 ContainerPart::OtherPagePrivate => {
                     let owner = batch
@@ -4072,7 +4224,7 @@ fn write_linearized_impl<R: Read + Seek>(
     let outlines = plan
         .optimization
         .as_ref()
-        .map(|optimization| optimization.objects_for_root_key(b"Outlines"))
+        .map(|optimization| optimization.raw_objects_for_root_key(b"Outlines"))
         .unwrap_or_default();
     let outline_info = compute_outline_hint_info(&outlines, pdf, renumber, &objstm_layout)?;
     // qpdf routes the primary hint stream through its global stream-compression
