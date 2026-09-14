@@ -3617,12 +3617,19 @@ fn recover_xref_from_linear_scan(
     );
     deliver_canonical_diagnostics(canonical_trailer_owner, &mut repair_diagnostics)?;
 
-    let recovered = recover_xref_entries_with_owner(
-        bytes,
-        fallback_trailer.is_none(),
-        &options.description,
-        canonical_trailer_owner,
-    )
+    let recovered = match canonical_trailer_owner {
+        Some(owner) => recover_xref_entries_from_source(
+            owner,
+            fallback_trailer.is_none(),
+            &options.description,
+        ),
+        None => recover_xref_entries_with_owner(
+            bytes,
+            fallback_trailer.is_none(),
+            &options.description,
+            None,
+        ),
+    }
     .map_err(|error| {
         // cov:ignore-start: defensive open-failure wrapper after a line-scan parser error; the live sink boundary is covered by Pdf open failure tests
         with_xref_open_diagnostics(error, repair_diagnostics.clone(), canonical_trailer_owner)
@@ -3910,6 +3917,88 @@ fn recover_xref_entries_with_owner(
             }
         }
         line_start = next_line_start;
+    }
+
+    Ok(RecoveredXref {
+        entries,
+        trailer,
+        trailer_diagnostics,
+    })
+}
+
+fn recover_xref_entries_from_source(
+    owner: &dyn CanonicalTrailerOwner,
+    capture_trailer: bool,
+    filename: &[u8],
+) -> Result<RecoveredXref> {
+    let source_length = owner.source_length()?;
+    owner.source_seek(0)?;
+    let mut entries = BTreeMap::new();
+    let mut trailer = None;
+    let mut trailer_diagnostics = Vec::new();
+    let mut line = Vec::new();
+    let mut line_start = 0u64;
+    let mut position = 0u64;
+    let mut chunk = [0u8; 8192];
+
+    let mut process_line = |line: &[u8], line_start: u64, next_line_start: u64| {
+        let Some(first_token) = read_scan_token(line, 0, line.len()) else {
+            return Ok::<(), Error>(());
+        };
+        if capture_trailer && trailer.is_none() && first_token.is_word_value(b"trailer") {
+            let trailer_start = line_start.saturating_add(first_token.end as u64);
+            let remaining = source_length.saturating_sub(trailer_start);
+            let window_length = usize::try_from(remaining.min(64 * 1024)).unwrap_or(64 * 1024);
+            let window = read_live_source_range(owner, trailer_start, window_length)?;
+            let result = {
+                let mut resolver = CanonicalTrailerParser { owner };
+                read_trailer(
+                    &window,
+                    trailer_start as usize,
+                    trailer_start as usize,
+                    filename,
+                    &mut resolver,
+                )
+            };
+            if let Ok((candidate, diagnostics)) = result {
+                if candidate.try_is_dictionary().unwrap_or(false) {
+                    trailer = Some(candidate);
+                    trailer_diagnostics.extend(diagnostics);
+                }
+            }
+            owner.source_seek(next_line_start)?;
+        } else if let Some((object_ref, offset)) =
+            scan_object_header_after_first_token(line, &first_token)?
+        {
+            entries.insert(
+                object_ref,
+                XrefEntry::Uncompressed {
+                    offset: line_start.saturating_add(offset),
+                },
+            );
+        }
+        Ok(())
+    };
+
+    loop {
+        owner.source_seek(position)?;
+        let read = owner.source_read(&mut chunk)?;
+        if read == 0 {
+            break;
+        }
+        for &byte in &chunk[..read] {
+            position = position.saturating_add(1);
+            if matches!(byte, b'\n' | b'\r') {
+                process_line(&line, line_start, position)?;
+                line.clear();
+                line_start = position;
+            } else {
+                line.push(byte);
+            }
+        }
+    }
+    if !line.is_empty() {
+        process_line(&line, line_start, position)?;
     }
 
     Ok(RecoveredXref {
