@@ -1179,19 +1179,22 @@ mod tests {
     fn od_container_spanning_two_later_pages_not_counted_as_part8_entry() {
         use std::collections::{BTreeMap, BTreeSet};
 
+        use crate::optimization::{ObjectUser, Optimization};
+
         let font = ObjectRef::new(7, 0);
         let widget = ObjectRef::new(6, 0);
         let fh_cnum: u32 = 20; // first-half ObjStm container
         let od_cnum: u32 = 21; // OD ObjStm container
 
-        let mut all_referenced_pages: BTreeMap<ObjectRef, BTreeSet<u32>> = BTreeMap::new();
+        let mut optimization = Optimization::default();
         // Widget reaches pages 1 and 2 (not page 0), which makes od_cnum
         // eligible for part8_container_nums via container_pages.len() >= 2.
-        all_referenced_pages.insert(widget, BTreeSet::from([1u32, 2]));
+        optimization.record_for_test(ObjectUser::Page(1), widget);
+        optimization.record_for_test(ObjectUser::Page(2), widget);
 
         let plan = LinearizationPlan {
             part3_objects: vec![font],
-            all_referenced_pages,
+            optimization: Some(optimization),
             shared_hints: vec![SharedObjectHintEntry {
                 object_ref: font,
                 referencing_pages: vec![0, 1, 2],

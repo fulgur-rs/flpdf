@@ -66,14 +66,15 @@ impl Optimization {
         self.pre_optimization_object_refs.as_ref()
     }
 
-    pub(crate) fn referenced_pages(&self, object: ObjectRef) -> BTreeSet<u32> {
-        self.users_for(object)
-            .iter()
-            .filter_map(|user| match user {
-                ObjectUser::Page(page_number) => Some(*page_number),
-                _ => None,
-            })
-            .collect()
+    /// Return the qpdf page users for an object without materializing a second
+    /// object-to-page map. `object_to_users` is the canonical qpdf-owned
+    /// inverse; callers collect only the page numbers they need at the
+    /// consumer boundary.
+    pub(crate) fn page_users(&self, object: ObjectRef) -> impl Iterator<Item = u32> + '_ {
+        self.users_for(object).iter().filter_map(|user| match user {
+            ObjectUser::Page(page_number) => Some(*page_number),
+            _ => None,
+        })
     }
 
     pub(crate) fn thumbnail_objects(&self) -> BTreeSet<ObjectRef> {
@@ -102,6 +103,11 @@ impl Optimization {
             .or_default()
             .insert(object);
         self.object_to_users.entry(object).or_default().insert(user);
+    }
+
+    #[cfg(test)]
+    pub(crate) fn record_for_test(&mut self, user: ObjectUser, object: ObjectRef) {
+        self.record(user, object);
     }
 
     pub(crate) fn optimize<R, F>(
@@ -403,6 +409,19 @@ mod tests {
         assert_eq!(ObjectUser::Root.page_number(), 0);
         assert_eq!(ObjectUser::RootKey(b"Root".to_vec()).page_number(), 0);
         assert_eq!(ObjectUser::TrailerKey(b"Info".to_vec()).page_number(), 0);
+    }
+
+    #[test]
+    fn page_users_view_filters_non_page_users_without_cloning_a_set() {
+        let object = ObjectRef::new(7, 0);
+        let mut optimization = Optimization::default();
+        optimization.record(ObjectUser::Page(2), object);
+        optimization.record(ObjectUser::Root, object);
+        optimization.record(ObjectUser::Page(0), object);
+        assert_eq!(
+            optimization.page_users(object).collect::<Vec<_>>(),
+            vec![0, 2]
+        );
     }
 
     #[test]

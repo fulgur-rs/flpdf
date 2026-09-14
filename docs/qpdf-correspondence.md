@@ -2063,6 +2063,28 @@ target functions and checks stream-observation ordering, while
 emission. qtest and qtest-exceptions routes, active `.48.7/.48.10/.48.49`
 sessions, linearization planning/check/show, shared emission redesign, and
 unrelated hint/Part 2/3 semantics remain outside this bounded row.
+
+### Linearization page-user view ownership `flpdf-ymuj.6.8` (2026-09-14)
+
+qpdf retains one bidirectional object-user relationship in `QPDF::Members`:
+`obj_user_to_objects` and `object_to_obj_users` are declared at
+`include/qpdf/QPDF.hh:1515-1517`, populated together by
+`QPDF_optimization.cc:289-296`, and consumed directly by
+`QPDF_linearization.cc:1063-1105,1350-1410` for page/document classification
+and shared-object identifiers. qpdf does not build a second resident
+object-to-page map for linearization.
+
+flpdf's `Optimization::user_to_objects/object_to_users` at
+`crates/flpdf/src/optimization.rs:21-23` is the corresponding canonical
+owner. `LinearizationPlan::all_referenced_pages` and
+`Optimization::referenced_pages` were a flpdf-only derived map and per-object
+set materialization. `flpdf-ymuj.6.8` removes those copies and exposes a
+borrowed `page_users` view over the retained object-user set. Outline/shared
+hint and ObjStm-container consumers collect only the sorted page values they
+need at their boundary; plans without a populated page-user map retain their
+manual-fixture fallback. The qpdf object-user map, page ordering, page-0
+exclusion, hint payload, and ObjStm routing responsibilities are unchanged.
+
 ### A6/A7/A8 standard writer accessor slice `flpdf-3yn9.48.23.21` (2026-09-10)
 
 The remaining standard-writer observations in `crates/flpdf/src/writer.rs` now
