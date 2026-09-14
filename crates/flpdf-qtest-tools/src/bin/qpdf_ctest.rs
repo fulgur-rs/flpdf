@@ -8,7 +8,7 @@
 //! `flpdf::Pdf`, `flpdf::PdfWriter`, and JSON job APIs.
 
 use flpdf::job::{JsonJobOptions, JsonJobOutput, JsonStreamData, QPDFJob};
-use flpdf::json_inspect::{DecodeLevel as JsonDecodeLevel, JsonKey, JsonObjectSelector};
+use flpdf::json_inspect::{DecodeLevel as JsonDecodeLevel, JsonKey};
 use flpdf::{
     DecodeLevel, EncryptMethod, EncryptParams, EncryptedError, Error, Pdf, PdfOpenOptions,
     PdfWriter, Permissions, PermissionsConfig, PrintPermission, QpdfErrorCode, QpdfExc,
@@ -732,7 +732,7 @@ fn write_json_test_output<R: Read + Seek>(
     decode_level: JsonDecodeLevel,
     stream_data: JsonStreamData,
     stream_prefix: Option<&[u8]>,
-    objects: &[JsonObjectSelector],
+    objects: &[String],
 ) -> Result<()> {
     let output = PathBuf::from(output_arg);
     let mut file = File::create(&output)?;
@@ -788,13 +788,7 @@ fn run_test47(
     prefix_arg: &std::ffi::OsStr,
 ) -> Result<()> {
     let prefix = path_description(Path::new(prefix_arg));
-    let objects = [
-        JsonObjectSelector::Object {
-            number: 4,
-            generation: 0,
-        },
-        JsonObjectSelector::Trailer,
-    ];
+    let objects = ["4,0".to_owned(), "trailer".to_owned()];
     let mut pdf = open_input(input_arg, password_arg)?;
     write_json_test_output(
         &mut pdf,

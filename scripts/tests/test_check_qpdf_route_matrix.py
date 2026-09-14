@@ -39,9 +39,18 @@ class SyntheticRepository:
             encoding="utf-8",
         )
         (root / "docs" / "qpdf-route-matrix").mkdir(parents=True)
+        # The checker requires this document, so every synthetic repository
+        # starts with an empty one; tests that care about its contents call
+        # write_correspondence, and the missing-file case removes it.
+        (root / "docs" / "qpdf-correspondence.md").write_text("", encoding="utf-8")
 
     def write(self, name: str, body: str) -> None:
         (self.root / "docs" / "qpdf-route-matrix" / name).write_text(
+            body, encoding="utf-8"
+        )
+
+    def write_correspondence(self, body: str) -> None:
+        (self.root / "docs" / "qpdf-correspondence.md").write_text(
             body, encoding="utf-8"
         )
 
@@ -78,6 +87,26 @@ class CheckQpdfRouteMatrixTests(unittest.TestCase):
             result = repo.check()
             self.assertEqual(0, result.returncode, result.stdout + result.stderr)
             self.assertIn("OK", result.stdout)
+
+    def test_correspondence_document_citations_are_checked(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary_directory:
+            repo = SyntheticRepository(Path(temporary_directory))
+            repo.write("a.md", HEADER)
+            repo.write_correspondence("See `qpdf/Missing.cc:1` for details.\n")
+            result = repo.check()
+            self.assertNotEqual(0, result.returncode)
+            self.assertIn("qpdf-correspondence.md", result.stdout)
+            self.assertIn("qpdf/Missing.cc", result.stdout)
+
+    def test_no_qpdf_still_checks_correspondence_citation_syntax(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary_directory:
+            repo = SyntheticRepository(Path(temporary_directory))
+            repo.write("a.md", HEADER)
+            repo.write_correspondence("See `qpdf/QPDF.cc:bogus` for details.\n")
+            result = repo.check("--no-qpdf")
+            self.assertNotEqual(0, result.returncode)
+            self.assertIn("qpdf-correspondence.md", result.stdout)
+            self.assertIn("malformed qpdf citation", result.stdout)
 
     def test_line_range_past_end_of_file_is_error(self) -> None:
         with tempfile.TemporaryDirectory() as temporary_directory:
@@ -326,6 +355,17 @@ class CheckQpdfRouteMatrixTests(unittest.TestCase):
             # of the table from both the count and the classification check.
             self.assertIn("a.md:4:", result.stdout)
             self.assertIn("classification `bogus` is not one of", result.stdout)
+
+    def test_missing_correspondence_document_is_error(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary_directory:
+            repo = SyntheticRepository(Path(temporary_directory))
+            repo.write_correspondence("See `libqpdf/QPDF.cc:1` for details.\n")
+            (repo.root / "docs" / "qpdf-correspondence.md").unlink()
+            result = repo.check()
+            # Skipping it silently would let a delete or rename pass CI with
+            # every citation in that document unchecked.
+            self.assertNotEqual(0, result.returncode)
+            self.assertIn("qpdf-correspondence.md", result.stdout + result.stderr)
 
     def test_missing_matrix_directory_is_error(self) -> None:
         with tempfile.TemporaryDirectory() as temporary_directory:

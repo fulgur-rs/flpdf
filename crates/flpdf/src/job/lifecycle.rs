@@ -20,7 +20,7 @@ use super::resource_pruning::RemoveUnreferencedResources;
 use super::rotate::flatten_rotation_on_pages;
 use super::rotate_spec::{parse_rotation_parameter, RotationSpec};
 use crate::encryption::{EncryptMethod, EncryptParams, PasswordMode};
-use crate::json_inspect::{DecodeLevel as JsonDecodeLevel, JsonKey, JsonObjectSelector};
+use crate::json_inspect::{DecodeLevel as JsonDecodeLevel, JsonKey};
 use crate::linearization::{show_linearization_pdf_with_warnings, ShowLinearizationError};
 use crate::pipeline::{Pipeline, PipelineHandle, PipelineResult};
 use crate::qutil::{qpdf_string_to_int_checked, QpdfIntParse};
@@ -254,7 +254,7 @@ struct JobConfiguration {
     json_decode_level: crate::writer::DecodeLevel,
     json_decode_level_set: bool,
     json_keys: Vec<JsonKey>,
-    json_objects: Vec<JsonObjectSelector>,
+    json_objects: Vec<String>,
     json_stream_data: JsonStreamData,
     json_stream_data_set: bool,
     json_stream_prefix: Option<Vec<u8>>,
@@ -2595,11 +2595,9 @@ impl QPDFJob {
                 let item = item.get_string().ok_or_else(|| {
                     Error::Usage(UsageError::new(".jsonObject: value must be a string"))
                 })?;
-                let item = String::from_utf8_lossy(&item);
-                let selector = JsonObjectSelector::parse(&item).map_err(|message| {
-                    Error::Usage(UsageError::new(format!(".jsonObject: {message}")))
-                })?;
-                configuration.json_objects.push(selector);
+                configuration
+                    .json_objects
+                    .push(String::from_utf8_lossy(&item).into_owned());
             }
         }
         if job_json_bare(&members, b"testJsonSchema")? {
@@ -3515,6 +3513,7 @@ impl QPDFJob {
         // error instead of consuming the stream the PDF itself needs.
         self.reserve_standard_output()?;
         let configuration = self.configuration.clone();
+        self.apply_configured_rotations(pdf, &configuration)?;
         self.prepare_document_transformations(pdf, &configuration)
     }
 
@@ -6812,7 +6811,7 @@ mod tests {
             .expect_err("jsonObject entries must be strings");
         let mut job = QPDFJob::new();
         job.initialize_from_json_partial(r#"{"jsonObject":["2147483648"]}"#)
-            .expect_err("jsonObject selector integer overflow must be rejected");
+            .expect("jsonObject selector parsing is deferred until JSON output");
         let mut job = QPDFJob::new();
         job.initialize_from_json_partial(r#"{"removeAttachment":[1]}"#)
             .expect_err("attachment names must be strings");

@@ -988,6 +988,68 @@ fn json_object_selector_matches_qpdf_parse_object_id_prefix_rules() {
 }
 
 #[test]
+fn json_object_integer_overflow_preserves_qpdf_partial_stdout() {
+    if skip_unless_qpdf_11_9() {
+        return;
+    }
+    let input = write_temp_pdf(&one_page_pdf_with_stream());
+    let selector_arg = "--json-object=99999999999999999999";
+
+    let qpdf = ShellCommand::new("qpdf")
+        .args(["--json=2", selector_arg])
+        .arg(input.path())
+        .output()
+        .unwrap();
+    let flpdf = Command::cargo_bin("flpdf")
+        .unwrap()
+        .env("FLPDF_PROGNAME", "qpdf")
+        .args(["--json=2", selector_arg])
+        .arg(input.path())
+        .output()
+        .unwrap();
+
+    assert_eq!(qpdf.status.code(), Some(2));
+    assert_eq!(flpdf.status.code(), qpdf.status.code());
+    assert_eq!(flpdf.stdout, qpdf.stdout);
+    assert_eq!(flpdf.stderr, qpdf.stderr);
+    assert!(
+        !qpdf.stdout.is_empty(),
+        "qpdf 11.9.0 must emit the JSON prefix before deferred selector parsing"
+    );
+}
+
+#[test]
+fn json_object_selector_is_deferred_until_the_object_section() {
+    if skip_unless_qpdf_11_9() {
+        return;
+    }
+    let input = write_temp_pdf(&one_page_pdf_with_stream());
+    let args = [
+        "--json=2",
+        "--json-key=pages",
+        "--json-object=99999999999999999999",
+    ];
+
+    let qpdf = ShellCommand::new("qpdf")
+        .args(args)
+        .arg(input.path())
+        .output()
+        .unwrap();
+    let flpdf = Command::cargo_bin("flpdf")
+        .unwrap()
+        .env("FLPDF_PROGNAME", "qpdf")
+        .args(args)
+        .arg(input.path())
+        .output()
+        .unwrap();
+
+    assert!(qpdf.status.success());
+    assert_eq!(flpdf.status.code(), qpdf.status.code());
+    assert_eq!(flpdf.stdout, qpdf.stdout);
+    assert_eq!(flpdf.stderr, qpdf.stderr);
+}
+
+#[test]
 fn json_v1_zero_object_selector_keeps_object_maps_empty_like_qpdf() {
     if skip_unless_qpdf_11_9() {
         return;

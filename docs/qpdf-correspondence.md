@@ -410,6 +410,16 @@ preserve-unreferenced seeds copy a raw-generation orphan into a fresh
 generation-zero output identity because no valid in-file `N G R` edge can name
 the source header; the output graph and qpdf-visible orphan value are retained.
 
+`QPDFJob::parse_object_id` is also an output-time operation, not an argv
+validation step: `doJSONObjects` writes the v1 object-map opener before calling
+`getWantedJSONObjects`, while the v2 path constructs that selector set before
+delegating to `QPDF::writeJSON` (`libqpdf/QPDFJob.cc:929-997`). flpdf therefore
+keeps raw `jsonObject`/`--json-object` strings on the job boundary and parses
+them only when the selected object section begins. A selector overflow after
+the pages or other preceding sections has been written leaves the same partial
+JSON prefix on stdout; the CLI then explicitly finishes the logger's save
+pipeline even on this error path, matching qpdf's observable process output.
+
 ### `flpdf-ymuj.6.10` single raw ValueIdentity (2026-09-14)
 
 qpdf's `QPDFValue` owns one raw `QPDFObjGen` (`libqpdf/qpdf/QPDFValue.hh:149-152`);
@@ -842,7 +852,7 @@ xref をその場で forward-write し、完全な body を `Members` に保持�
 だけであり、`QPDFWriter.hh:688-690` にも pass-1 body member は存在しない。hint buffer は
 `QPDFWriter.cc:2872-2885` で作られ、debug file は `:2886-2900` で4つの offset/length
 コメントを追記する。`--linearize-pass1` 自体は qpdf が「valid PDFではない debugging
-file」と定義する option (`qpdf/auto_job_help.hh:1000-1005`) で、qtest は final file と
+file」と定義する option (`libqpdf/qpdf/auto_job_help.hh:1000-1005`) で、qtest は final file と
 pass-1 file を別々に検査する (`qpdf/qtest/linearize-pass1.test:19-29`)。
 
 flpdf は `Pass1OutputTarget` を discard または `BufWriter<File>` として構築し、既存の
@@ -1160,7 +1170,7 @@ qpdfのwarn()コールバックはwrite()実行中も同期的に出力するた
 | `JSONHandler.cc` | 189 | `json/` | ✅ |
 | `QPDF_json.cc` 入力側（`QPDF_json.cc:1-833`: `JSONReactor` / `createFromJSON` / `updateFromJSON` / `importJSON` / `test_json_validators`） | 833 | `json/input.rs`（reactor・validators・provider・value factory） + `json/document.rs`（rootless seed・create/update/import 境界） + `tests/json_document_tests.rs`（flpdf-authored fixture と qpdf 11.9.0 differential） | ✅ `.15.4` で入力境界を実装。create は `QPDF_json.cc:54-63` の rootless seed、update は omitted object を保持し、parser/semantic error の境界と update page flags を qpdf どおりに分離する。⚪ (B) `validate_pdf_version` は `QPDF::validatePDFVersion`（`QPDF.cc:366-384`）の byte-slice 置換で、`QPDF_json.cc:503-518` の全入力消費条件を保持する。⚪ (B) `JsonDescription` は `QPDFValue::Description` の共有 mutation（`QPDF_json.cc:721-730`）を per-handle Rust value で置換するが、input/object/offset の観測契約は不変 |
 | `QPDF_json.cc` 出力側（`QPDF_json.cc:834-946`: free function `writeJSONStreamFile`(834-849) + `QPDF::writeJSON` ×2 overload(851-946)） | 113 | `document_json.rs`(361: `write_json` = 6 引数 overload(851-861)、`write_json_key` = `complete`/`first_key` overload(863-946)、`write_json_stream_file` = `writeJSONStreamFile`。side file は `PlStdioFile` explicit finish) | ✅ 入出力とも qpdf の別責務境界に対応。`qpdf --json-output=2` は complete overload と同一バイトを書くため、`crates/flpdf/tests/document_json_tests.rs` が 7 fixture で qpdf 出力と直接照合する |
-| `QPDFObjectHandle::getJSON` / `QPDFObjectHandle::writeJSON`（行数は §1 の `QPDFObjectHandle.cc` に計上済み。ここは所在の相互参照） | — | `object_handle.rs` の `ObjectHandle::get_json` / `ObjectHandle::write_json`（`QPDFObjectHandle.cc:1613-1647` の外側 dispatch と `qpdf/JSON_writer.hh:16-135` の pipeline 境界）、`json_inspect.rs` の `pdf_object_to_json`（getJSON false の consumer） | 🔀 canonical ObjectHandle writer は移送済み。`false` は間接 identity を先に検査して `"N G R"` を出力し、array/dictionary child は非再帰の reference dispatch、stream は `QPDF_Stream::writeJSON` と同じく dictionary のみを出力する。`true` の一段解決 primitive も writer に実装済みで、document-level `QPDF::writeJSON` の object-map は `flpdf-25kg.3.37` で cutover 済み。`.3` では `json_inspect.rs::qpdf_resolve_top_level_object` と historical stream payload が canonical handle を直接返す。`ordered_qpdf_*` は本番 bridge ではなく、既存の pipeline-write 境界テスト専用で保持する |
+| `QPDFObjectHandle::getJSON` / `QPDFObjectHandle::writeJSON`（行数は §1 の `QPDFObjectHandle.cc` に計上済み。ここは所在の相互参照） | — | `object_handle.rs` の `ObjectHandle::get_json` / `ObjectHandle::write_json`（`QPDFObjectHandle.cc:1613-1647` の外側 dispatch と `libqpdf/qpdf/JSON_writer.hh:16-135` の pipeline 境界）、`json_inspect.rs` の `pdf_object_to_json`（getJSON false の consumer） | 🔀 canonical ObjectHandle writer は移送済み。`false` は間接 identity を先に検査して `"N G R"` を出力し、array/dictionary child は非再帰の reference dispatch、stream は `QPDF_Stream::writeJSON` と同じく dictionary のみを出力する。`true` の一段解決 primitive も writer に実装済みで、document-level `QPDF::writeJSON` の object-map は `flpdf-25kg.3.37` で cutover 済み。`.3` では `json_inspect.rs::qpdf_resolve_top_level_object` と historical stream payload が canonical handle を直接返す。`ordered_qpdf_*` は本番 bridge ではなく、既存の pipeline-write 境界テスト専用で保持する |
 | `QPDF_Stream::writeStreamJSON`（行数は §1 の `QPDF_Stream.cc` に計上済み。ここは所在の相互参照） | — | `object_handle.rs` の `ObjectHandle::write_stream_json`（`QPDF_Stream.cc:207-295` の mode validation、`no_data_key`、二重試行、dict normalization、payload routing、effective decode level） + `document_json.rs` の object-map framing / side-file ownership | ✅ `flpdf-3yn9.9` で qpdf の 1 関数責務へ統合。旧 `Object/Stream` payload/dict bridge は本番経路から外し、`QPDF_json.cc:917-925` 相当の consumer は canonical handle を呼ぶ。`.40` で残存していたtest-only JSON payload helperも撤去した。非 file entry は既存 flpdf の変換失敗時接頭辞を保つため canonical 結果を先に buffer 化する |
 
 `.40` で `json_inspect.rs::qpdf_resolve_top_level_object` と historical stream payload helper は
@@ -1370,7 +1380,7 @@ page-spec の source だけは qpdf の close/reopen 相当の reopenable reader
 `--encrypt` の引数表も qpdf と同じ遷移を保つ。qpdf は3番目の positional
 引数または `--bits` を消費した時点で `40-bit encryption`、`128-bit encryption`、
 `256-bit encryption` の option tableへ切り替え、未知・非対応引数の診断にその名前を
-含める（`QPDFJob_argv.cc:173-228`, `qpdf/auto_job_init.hh:133-163`,
+含める（`QPDFJob_argv.cc:173-228`, `libqpdf/qpdf/auto_job_init.hh:133-163`,
 `QPDFArgParser.cc:496-502`）。flpdf は `parse_encrypt_segment` で同じ時点に key lengthを
 確定し、`unrecognized_encrypt_argument` から同じ suffixを生成する。key length確定前は
 qpdfの `encryption options must be terminated with --` を維持する。
@@ -1431,8 +1441,13 @@ consumerも `QPDFJobConfig::rotate` / `split_pages` へ raw parameterを渡し�
 canonical境界へ接続した。これにより `--rotate` と `--flatten-rotation` は qpdf の
 `handleRotations` → `handleTransformations` 順で同じ live documentへ適用される。
 旧 `run_rewrite_with_page_ops_opened` の direct `PdfWriter` routeはcaller closure後に
-削除した。`--pages` extractionのpost-plan rotate consumerは別の残存mixed routeとして
-維持し、今回のbounded cutoverへ混ぜていない。
+削除した。`--pages` extractionのpost-plan rotate/image consumerも
+`flpdf-3yn9.48.94` で page-selection completion後の
+`QPDFJob::apply_transformations`へ接続し、rotationを先行させてから
+underlay/overlayとimage transformationを同じJob ownerへ渡すようにした。
+旧 `apply_rotate_specs` / `apply_image_transformations` のproduction callerは0である。
+E-12/E-13の責務はこのbounded cutoverでcanonicalへ更新したが、E-4/E-10/E-21や
+qtest exceptions、route-wide parity closureは別スコープとして残る。
 
 `--set-page-labels` / `--remove-page-labels` は、`QPDFJob_argv.cc:375-392` の
 option-table、`QPDFJob_config.cc:1101-1151` の文法・typed Config、
@@ -2473,7 +2488,7 @@ message prefix/logger へ渡し、`get_all_pages` と resource mutation より�
 `cli_split_pages_verbose_qpdf.rs` が qpdf 11.9.0 の stdout/stderr と chunk report の
 順序を比較する。
 
-`.u3iq` では、qpdf の main option table (`qpdf/auto_job_init.hh:124`) に登録される
+`.u3iq` では、qpdf の main option table (`libqpdf/qpdf/auto_job_init.hh:124`) に登録される
 `--remove-unreferenced-resources=auto|yes|no` を flpdf-cli の top-level `Cli` にも
 公開する。選択値は `--pages` の `QPDFJob::handlePageSpecs` 相当と
 `--split-pages` の `doSplitPages` 相当へそのまま渡し、plain rewrite では qpdf と同じく

@@ -341,6 +341,9 @@ pub enum JsonOutputError {
     Convert(#[from] ConvertError),
     #[error(transparent)]
     Pipeline(#[from] PipelineError),
+    /// A raw `--json-object` selector failed at qpdf's object-output boundary.
+    #[error("{0}")]
+    ObjectSelector(String),
     #[error("{operation} {path}: {message}")]
     SideFileIo {
         operation: &'static str,
@@ -389,6 +392,7 @@ impl From<JsonOutputError> for crate::Error {
         match error {
             JsonOutputError::Convert(error) => crate::Error::System(error.to_string()),
             JsonOutputError::Pipeline(error) => crate::Error::from(error),
+            JsonOutputError::ObjectSelector(message) => crate::Error::System(message),
             JsonOutputError::SideFileIo {
                 operation,
                 raw_path,
@@ -551,6 +555,13 @@ mod tests {
         assert!(matches!(
             piped,
             crate::Error::System(message) if message == "pipeline"
+        ));
+
+        let selector: crate::Error =
+            JsonOutputError::ObjectSelector("selector overflow".to_owned()).into();
+        assert!(matches!(
+            selector,
+            crate::Error::System(message) if message == "selector overflow"
         ));
 
         let unsupported: crate::Error = JsonOutputError::UnsupportedVersion.into();

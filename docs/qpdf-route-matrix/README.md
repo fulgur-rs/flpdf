@@ -33,17 +33,17 @@ container-above-max だった — `flpdf-hi08` / PR #1486）。本表は残る m
 
 | canonical | bridge | mixed | unknown | 合計 |
 |---|---|---|---|---|
-| 98 | 2 | 60 | 0 | 160 |
+| 100 | 2 | 58 | 0 | 160 |
 
 ### checker logical aggregate（259 rows）
 
 `scripts/check-qpdf-route-matrix.py --check` は、A〜E の160行に加えて
 E の qtest exception 表（物理98行を論理99ケースとして数える）を含む259 logical
-rowsを検証する。2026-09-14 の現行 `origin/main` (`c94aad9bc`) での集計は次のとおり。
+rowsを検証する。2026-09-14 の現行 `origin/main` (`d190763a6`) での集計は次のとおり。
 
 | canonical | bridge | mixed | unknown | 合計 |
 |---|---|---|---|---|
-| 122 | 10 | 127 | 0 | 259 |
+| 124 | 10 | 125 | 0 | 259 |
 
 したがって、160行の領域別表と259 logical rowsの checker 分母は異なる。どちらも
 parity 完了数ではなく、責務／経路の分類数である。
@@ -96,12 +96,12 @@ done | sort | uniq -c
 本表は「その責務に至る **経路が 1 本か**」を問う。✅ の行でも consumer 側に bridge が残っていれば
 本表では mixed / bridge になりうる。
 
-2026-09-14 の current-main audit anchor は `origin/main=c94aad9bc`、pinned qpdf は
+2026-09-14 の current-main audit anchor は `origin/main=d190763a6`、pinned qpdf は
 11.9.0 commit `3b97c9bd266b7c32ea36d3536e22dab77412886d` である。checker の実測は
 **この revision を適用した tree で** 1055 qpdf citations / 909 flpdf citations /
 259 logical rows、分類は
-canonical 122 / mixed 127 / bridge 10 / unknown 0。A〜E の160行だけを数える
-上の領域別集計は canonical 98 / mixed 60 / bridge 2 / unknown 0 なので、checker
+canonical 124 / mixed 125 / bridge 10 / unknown 0。A〜E の160行だけを数える
+上の領域別集計は canonical 100 / mixed 58 / bridge 2 / unknown 0 なので、checker
 の259 logical rowsと混同しない。
 
 履歴行の例外: C44はpublic facadeとdeferred blobの責務を分離したmixed ownerとして追跡する。
@@ -116,7 +116,7 @@ D19/D30はcanonical ownerへ委譲するbyte-neutral test scaffolding、D27は�
 | [B. parser / xref recovery / warning・error・diagnostics](b-parser-recovery-diagnostics.md) | 34 | 20 | 0 | 14 | 0 |
 | [C. stream data provider / decode / retry / filter / encryption / `/Length`](c-stream-pipeline-encryption.md) | 42 | 35 | 2 | 5 | 0 |
 | [D. writer — reachability, ObjStm planning / renumber / emission, xref / trailer, encryption, linearize](d-writer.md) | 31 | 15 | 0 | 16 | 0 |
-| [E. QPDFJob / CLI / C API 相当の consumer・adaptor](e-job-cli-capi.md) | 29 | 12 | 0 | 17 | 0 |
+| [E. QPDFJob / CLI / C API 相当の consumer・adaptor](e-job-cli-capi.md) | 29 | 14 | 0 | 15 | 0 |
 
 ## 5. 責任境界と不変条件
 
@@ -181,7 +181,7 @@ D19/D30はcanonical ownerへ委譲するbyte-neutral test scaffolding、D27は�
 |---|---|---|---|
 | **`run()` は `createQPDF()` → `writeQPDF()` の 2 呼び出しだけ**（この 2 段構成は「QPDF を作ってから書き出す前に改変できるようにするため」に意図的に公開されている） | `libqpdf/QPDFJob.cc:513-520` / `include/qpdf/QPDFJob.hh:371-373` | E-1 canonical。flpdf の通常 `run` は `create_qpdf` → `write_qpdf` → `get_exit_code` を通り、旧 `run_document_erased` / `run_document_stages` は撤去済み。暗号 status queryは qpdf の認証例外を保つため専用早期分岐 | public 2 段の間で返却文書を変更でき、通常の `--pages` / `--rotate` / overlay も create stageで完了する |
 | **「検査するか / 分割するか / 書くか」の判断は `writeQPDF` の内側にあり、判定は `createsOutput()` 1 個** | `libqpdf/QPDFJob.cc:483-511` / `libqpdf/QPDFJob.cc:528-532` | E-3 canonical。flpdf の `write_qpdf` が output/replace-input/JSON暗黙stdoutを含む `creates_output` を判定し、inspection・split・JSON/ordinary writeを選択する | 出力指定と inspection フラグの qpdf 優先順位を write stage内で保持し、report helperと完了を分離する |
-| **`createQPDF` の変換は固定順序**（`updateFromJSON` → `handlePageSpecs` → `handleRotations` → `handleUnderOverlay` → `handleTransformations`。`addAttachments` / `copyAttachments` は `handleTransformations` の内側） | `libqpdf/QPDFJob.cc:428-481` / `libqpdf/QPDFJob.cc:2242-2247` | E-12 mixed。flpdf の `prepare_document` / `prepare_document_transformations` がこの順序を `create_qpdf` 内で実行し、`flpdf-8uuw` で通常 non-linearized direct rewrite の overlay → image/appearance/annotation 順も揃えた。CLI の QPDFJob owner統合、linearized/page-operation別 route は retained consumer として残る | QPDFJob JSON lifecycle と通常 rewrite の変換順序は固定され、残るCLI direct orchestrationは owner統合の後続対象 |
+| **`createQPDF` の変換は固定順序**（`updateFromJSON` → `handlePageSpecs` → `handleRotations` → `handleUnderOverlay` → `handleTransformations`。`addAttachments` / `copyAttachments` は `handleTransformations` の内側） | `libqpdf/QPDFJob.cc:428-481` / `libqpdf/QPDFJob.cc:2242-2247` | E-12 canonical。flpdf の `prepare_document` / `prepare_document_transformations` がこの順序を `create_qpdf` 内で実行し、`.94` で `--pages` post-plan の rotation/imageも `QPDFJob::apply_transformations` へ接続した。 | rotation → underlay/overlay → image/appearance/annotation/coalesce/flatten の順序と、page-selection後の同じ transformation ownerを共有する。E-4/E-10/E-21のCLI全体移行とroute-wide parity closureは別スコープ |
 | **入力は必ず `doProcessOnce` 経由で開き、`QPDF` 構築直後に `setQPDFOptions`（`noWarn` → `setSuppressWarnings`）を適用してから読む** | `libqpdf/QPDFJob.cc:1695-1716` / `libqpdf/QPDFJob.cc:650-666` / `libqpdf/QPDFJob.cc:663-665` | E-29 mixed。`crates/flpdf/src/job/lifecycle.rs::QPDFJob::open_with_description`、`open_document_with_description`、`open_for_encryption_inspection_with_description`、`open_job_source` は job suppression を open 前に適用済み。CLI の通常入力・overlay/underlay・copy-encryption・encryption probe・attachment copy・page source・JSON input も同じ policy を使用する（reopenable page source は `crates/flpdf-cli/src/main.rs::open_page_source`）。 | `--no-warn` で open-time warning の stderr delivery を抑止し、warning collection と qpdf の exit status は保持する。reopenable source の separate implementation は構造上残るが suppression policy は共通 |
 | **CLI 実行ファイルは `QPDFJob` の public surface しか触らない**（`initializeFromArgv` → `run` → `getExitCode` の 3 呼び出し、62 行） | `qpdf/qpdf.cc:26-44` / `libqpdf/qpdfjob-c.cc:19-161` | E-21 mixed（`crates/flpdf-cli/src/main.rs::main` は 9313 行で `run()` は `--job-json-file` の 1 箇所のみ）。E-22 / E-23 canonical — C API 相当の 2 consumer だけが qpdf の構造を正しく踏襲している | `QPDFJob` の private orchestration を直しても CLI の挙動が追随しない（逆も同じ）。argv 解釈の正本が CLI 側と library 側の 2 本になる（E-17） |
 | **exit code は状態を溜めて `getExitCode()` で 1 回だけ判定する** | `libqpdf/QPDFJob.cc:522-564` / `libqpdf/QPDFJob.cc:534-564` | E-19 mixed。`complete(creates_output)` を各ステージが個別に呼び、CLI からも 6 箇所呼ぶ。E-7 — inspection の個別 public メソッドはその場で `complete` するが `doInspection` 相当の経路は `*_report`（完了しない）を使う | 複数の inspection フラグを同時指定したときの warning 集計と exit code が qpdf と食い違う。probe E-P3 |
@@ -461,14 +461,14 @@ crates/flpdf/src/job/overlay.rs::handle_under_overlay: prod 3 (2 files) / test 0
     crates/flpdf-cli/src/main.rs 2, crates/flpdf/src/job/lifecycle.rs 1
 crates/flpdf/src/job/overlay.rs::overlay_verbose_report: prod 2 (1 files) / test 0
     crates/flpdf-cli/src/main.rs 2
-crates/flpdf/src/job/lifecycle.rs::prepare_document_transformations: prod 3 (1 files) / test 0
-    crates/flpdf/src/job/lifecycle.rs 3
+crates/flpdf/src/job/lifecycle.rs::prepare_document_transformations: prod 4 (1 files) / test 0
+    crates/flpdf/src/job/lifecycle.rs 4
 crates/flpdf/src/job/image_optimization.rs::optimize_images: prod 23 (2 files) / test 2
     crates/flpdf-cli/src/main.rs 20, crates/flpdf/src/job/lifecycle.rs 3
 crates/flpdf/src/job/rotate.rs::flatten_rotation_on_pages: prod 3 (2 files) / test 10
     crates/flpdf-cli/src/main.rs 2, crates/flpdf/src/job/lifecycle.rs 1
-crates/flpdf/src/job/lifecycle.rs::apply_configured_rotations: prod 3 (1 files) / test 0
-    crates/flpdf/src/job/lifecycle.rs 3
+crates/flpdf/src/job/lifecycle.rs::apply_configured_rotations: prod 4 (1 files) / test 0
+    crates/flpdf/src/job/lifecycle.rs 4
 crates/flpdf/src/job/rotate.rs::apply_rotate_to_pages: prod 0 (0 files) / test 16
     test-only callers remain in crates/flpdf/src/job/rotate.rs
 crates/flpdf/src/job/rotate_spec.rs::parse_rotation_parameter: prod 3 (2 files) / test 11
