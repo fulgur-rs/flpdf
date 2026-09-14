@@ -280,12 +280,15 @@ fn repair_page_tree_handle<R: Read + Seek>(
                 format!("kid {index} (from 0) is direct; converting to indirect").as_str(),
             )?; // cov:ignore: warning-sink failure is not injectable through the qpdf success oracle
             kid = promote_page_handle(pdf, kid)?;
+            // cov:ignore-start: make_indirect_from_object_handle always
+            // returns a handle carrying the newly allocated QpdfObjGen.
             let promoted_object_gen = kid
                 .qpdf_obj_gen()
                 .filter(|object_gen| object_gen.is_indirect())
                 .ok_or_else(|| {
                     Error::Internal("promoted page lost its indirect identity".to_owned())
                 })?;
+            // cov:ignore-end
             state.seen.insert(promoted_object_gen);
             kids.set_array_item(index, kid.clone())?;
         } else if let Some(object_gen) = kid
@@ -301,12 +304,15 @@ fn repair_page_tree_handle<R: Read + Seek>(
                 )?; // cov:ignore: LLVM maps this covered duplicate-repair warning terminator separately
                 let copied = kid.shallow_copy()?;
                 kid = promote_page_handle(pdf, copied)?;
+                // cov:ignore-start: make_indirect_from_object_handle always
+                // returns a handle carrying the newly allocated QpdfObjGen.
                 let copied_object_gen = kid
                     .qpdf_obj_gen()
                     .filter(|object_gen| object_gen.is_indirect())
                     .ok_or_else(|| {
                         Error::Internal("copied page lost its indirect identity".to_owned())
                     })?;
+                // cov:ignore-end
                 state.seen.insert(copied_object_gen);
                 kids.set_array_item(index, kid.clone())?;
             }
@@ -316,6 +322,8 @@ fn repair_page_tree_handle<R: Read + Seek>(
             kid.warn_if_possible("/Type key should be /Page but is not; overriding")?;
             replace_handle_key(&kid, b"/Type", ObjectHandle::name(b"Page".to_vec()))?;
         }
+        // cov:ignore-start: every direct leaf is promoted above and every
+        // remaining leaf is an indirect handle with its QpdfObjGen identity.
         let page_ref = project_page_object_ref(
             kid.qpdf_obj_gen()
                 .filter(|object_gen| object_gen.is_indirect())
@@ -323,6 +331,7 @@ fn repair_page_tree_handle<R: Read + Seek>(
                     Error::Internal("page-tree leaf lost its indirect identity".to_owned())
                 })?,
         )?;
+        // cov:ignore-end
         state.pages.push(page_ref);
     }
     Ok(())
@@ -458,4 +467,34 @@ fn is_rectangle_handle(value: &ObjectHandle) -> Result<bool> {
         }
     }
     Ok(true)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::prepare_for_optimization_with_max_depth;
+    use crate::Pdf;
+    use std::io::Cursor;
+
+    #[test]
+    fn direct_pages_root_depth_error_keeps_its_explicit_location() {
+        let mut bytes = b"%PDF-1.4\n".to_vec();
+        let object_offset = bytes.len();
+        bytes.extend_from_slice(
+            b"1 0 obj\n<< /Type /Catalog /Pages << /Type /Pages /Kids [] /Count 0 >> >>\nendobj\n",
+        );
+        let xref_offset = bytes.len();
+        bytes.extend_from_slice(
+            format!("xref\n0 2\n0000000000 65535 f \n{object_offset:010} 00000 n \n").as_bytes(),
+        );
+        bytes.extend_from_slice(
+            format!("trailer\n<< /Size 2 /Root 1 0 R >>\nstartxref\n{xref_offset}\n%%EOF\n")
+                .as_bytes(),
+        );
+        let mut pdf = Pdf::open(Cursor::new(bytes)).expect("direct-pages fixture should open");
+
+        let error = prepare_for_optimization_with_max_depth(&mut pdf, 0)
+            .expect_err("the explicit depth bound should stop at the direct root");
+
+        assert!(error.to_string().contains("direct /Pages node"));
+    }
 }

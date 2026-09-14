@@ -285,12 +285,15 @@ fn remove_unreferenced_resources_in_form_xobjects<R: Read + Seek>(
     let mut any_failures = false;
 
     while let Some(holder_handle) = pending.pop_front() {
+        // cov:ignore-start: form_xobjects_in_resources enqueues only indirect
+        // handles, so this is a defensive invariant guard.
         let Some(object_gen) = holder_handle
             .qpdf_obj_gen()
             .filter(|object_gen| object_gen.is_indirect())
         else {
             continue;
         };
+        // cov:ignore-end
         if !visited.insert(object_gen) {
             continue;
         }

@@ -185,9 +185,12 @@ impl<'a, R: Read + Seek> FormFieldObjectHelper<'a, R> {
             if !parent.is_indirect() {
                 break;
             }
+            // cov:ignore-start: ObjectHandle::is_indirect is derived from this
+            // same QpdfObjGen, so the identity cannot be absent here.
             let parent_object_gen = parent.qpdf_obj_gen().ok_or_else(|| {
                 Error::Internal("indirect field parent lost its identity".to_owned())
             })?;
+            // cov:ignore-end
             let parent_ref = parent_object_gen.to_object_ref().ok_or_else(|| {
                 Error::Unsupported(format!(
                     "field parent object {} {} cannot be represented as a valid ObjectRef",

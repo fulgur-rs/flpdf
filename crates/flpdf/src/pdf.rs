@@ -606,6 +606,7 @@ impl<R: Read + Seek> Pdf<R> {
 #[cfg(test)]
 mod tests {
     use super::{Pdf, WriterObjectOrderKey};
+    use crate::qpdf_obj_gen::QpdfObjGen;
     use crate::{ObjectRef, PdfOpenOptions};
     use std::collections::BTreeMap;
 
@@ -736,6 +737,21 @@ mod tests {
         assert!(
             first_occurrence < second_occurrence,
             "foreign writer ordering must follow occurrence rank before target reference"
+        );
+    }
+
+    #[test]
+    fn raw_foreign_map_projection_records_valid_source_identity_for_writer_order() {
+        let mut pdf = Pdf::<std::io::Cursor<Vec<u8>>>::uninitialized();
+        let source = QpdfObjGen::new(3, 0);
+        let target = ObjectRef::new(7, 0);
+        pdf.set_foreign_object_map(41, BTreeMap::from([(source, target)]));
+
+        pdf.record_primary_writer_object_refs(41);
+
+        assert_eq!(
+            pdf.writer_object_order_key(target),
+            WriterObjectOrderKey::primary(ObjectRef::new(3, 0))
         );
     }
 }
