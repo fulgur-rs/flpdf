@@ -391,12 +391,29 @@ routeへ移行した。`load_xref_state_with_options` と BootstrapHandle state�
 bounded reconstruction unit tests用にのみ残り、production callerは0である。
 canonical warning live sinkは sibling `.48.73` で完了済み。
 
+### 2026-09-14 `flpdf-8q38` ownerless candidate reachability audit
+
+qpdf 11.9.0 の `QPDF::reconstruct_xref` は候補 object を EOF まで読む
+（`libqpdf/QPDF.cc:577-608,1542-1697`）。`canonical_xref_owner_route_tests.rs` の
+fixture builder は、候補 xref stream に qpdf の expected data の後ろへ 65 個の行頭偽
+object headerを置く。qpdf `--warning-exit-0 --show-xref` と canonical `Pdf::open` は
+ともに size warning を保持し、候補 `1000/0` を同じ offset の uncompressed entry として
+残した。
+
+source caller census では、production `engine.rs` は
+`load_xref_state_from_bytes(..., Some(resolver.as_ref()))` のみを呼び、
+`load_xref_state_with_options` は `#[cfg(test)]` の standalone loaderである。したがって
+8q38の元の「通常openが64-position windowで候補を失う」という前提は成立しない。
+BootstrapHandle state、ownerless loader、bounded candidate/reference windowは bounded
+reconstruction unit-test scaffoldingとして残し、qpdfに対応物がない性能用windowの整理は
+別issue `flpdf-qwh0` のスコープとする。
+
 | probe | 対象行 | 必要な確認 |
 |---|---|---|
 | P1 | B14 | **解消（2026-09-08、`flpdf-3yn9.48.18`）**: `/Prev` が初段 startxref を指す classic PDFを qpdf 11.9.0 と flpdfで比較した。両方とも `file is damaged` / `loop detected following xref tables` / `Attempting to reconstruct cross-reference table` の3行・同順・exit 3で、既存の三連warningは一度だけ。追加した stream-token fixtureでは qpdf/flpdfとも `stream keyword found in trailer` が一度だけで、`merge_previous_xref_sections_with_observer` の seeded visitorが初段を再parseしないことを回帰テストで固定した。二重warningをbugとして扱わない。 |
 | P2 | B20 | **2026-09-08 probe 継続（`flpdf-3yn9.48.19`）**: `load_xref_state_from_bytes` の初段 parse 失敗 handoff がこの filter を飛ばす経路自体は現存する（未変更）が、`registration.deleted_objects` へ free entry が実際にコミットされる箇所（`parse_xref_from_start_with_owner` のクラシック分岐は `deferred_free` を `merge_xref_stream_from_classic_trailer` 成功後にのみ適用、`parse_xref_stream` は自身の `build_result` が `Ok` の場合のみ free entry ループへ到達）と、`reconstruction_trigger` を立てる唯一の生成箇所（`read_uncompressed_object_with_end`、`crates/flpdf/src/xref.rs:794-799`）が同じ呼び出しで必ず `Err` を即時返す（`?` で伝播）ことを突き合わせると、「free entry が committed 済みかつ trigger も立っている」状態を作る経路が見当たらなかった——trigger が立つ呼び出しは常にその場で失敗し、free entry ループより先に return する。この分析はソースの読み合わせのみで、実際に壊れた fixture を作って `qpdf --show-xref` / flpdf `get_xref_table` を突き合わせる実証はまだ行っていない。次に着手する際は実証を先にすること（分析だけで確定と扱わない）  **到達可能な経路が判明したため「非issue」の暫定判断は撤回する**: owner-less の hybrid xref 経路では trigger と非空 deleted set が共存しうる。xref stream の間接 `/Length` が食い違う classic entry を介して解決されると `resolve_length` はそのエラーを `Missing` へ落としつつ `reconstruction_trigger` を保持したままにするため、stream recovery と `build_result` が成功しうる。その場合 `parse_xref_stream` はデコード済みの free 行を `registration.insert_free_xref_entry`（`crates/flpdf/src/xref.rs:4302-4310`）でコミットしてから、保持していた trigger を `Err` として返す（`:4336-4342`）。初段 parse 失敗の handoff は`registration.entries` しか渡さない（`:1915-1949`）ので、この filter は依然として落ちる。**hybrid fixture での qpdf 比較を実施するまで、この probe は開いたままにする。** |
 | P3 | B22 | **2026-09-08 部分解消・probe は継続（`flpdf-3yn9.48.19`）**: `reconstruct_xref_and_retry` の compressed 分岐を `Ok(None)`（`Free`/`None` と同じ warn+null）へ統一し、`qpdf --check` 相当の `object N G not found in file after regenerating cross reference table` 警告と null 解決を再構築後の compressed entry でも再現するようにした。新規ユニットテスト `reconstruct_xref_and_retry_treats_a_post_reconstruction_compressed_entry_as_not_found`（`crates/flpdf/src/reader/resolver.rs`）で `Ok(None)` を直接検証。呼び出し元にあった `Error::Unsupported` 捕捉からの `resolve_object_stream_or_null` 再ルーティング（未カバーで `cov:ignore` 済みだった箇所）は削除した  **未確認として残す部分**: 本番経路ではこの分岐に到達できない。`resolve_indirect` が `reconstruct_xref_and_retry` を呼ぶのは `Uncompressed` アームだけで、再構築は `install_source_xref_entries`（`crates/flpdf/src/reader/resolver.rs:2890`）がテーブルを丸ごと置換する形で行われ、`recover_xref_entries`（`crates/flpdf/src/xref.rs:3111`）は`XrefEntry::Uncompressed` しか挿入しない。qpdf 側も同じで、`reconstruct_xref` が削除するのはtype 1 のみ（`libqpdf/QPDF.cc:531-540`）だが、要求 objgen は 1 エントリしか持てないためtype 1 を消した後にその objgen が type 2 として残ることはなく、`getType() == 1`（`:1618`）の compressed 側は qpdf でも防御的な分岐である。したがって新規ユニットテストは`source_xref_entries` に `Compressed` 行を直接注入して分岐だけを固定しており、警告文言と null 解決を end-to-end で通したわけではない。**この probe は「再構築後に compressed entry が残る実 fixture を構成できるか」の確認として開いたままにする**。 |
-| P4 | B27 | **production sink cutover済み（`.48.73`）**。canonical `Pdf::open` は bootstrap handle/replayを使わず、`ResolverHandle::push_qpdf_warning`へqpdfの呼出順で配送する。残るtest-only `BootstrapHandleState` の warning順は、bounded reconstruction unit scaffolding内で `qpdf --check` の warning 順序と `repair_diagnostics().entries()` を必要に応じて比較する。 |
+| P4 | B27 | **production sink cutover済み（`.48.73`）**。canonical `Pdf::open` は bootstrap handle/replayを使わず、`ResolverHandle::push_qpdf_warning`へqpdfの呼出順で配送する。`flpdf-8q38`（2026-09-14）の65偽header fixtureで、canonical openとqpdf 11.9.0が候補を保持することも確認した。残るtest-only `BootstrapHandleState` の warning順は、bounded reconstruction unit scaffolding内で `qpdf --check` の warning 順序と `repair_diagnostics().entries()` を必要に応じて比較する。 |
 | P5 | B5 | **解消済み（2026-09-07、`flpdf-3yn9.48.17`）**: 2026-09-06時点ではparserのresolver呼出はhandle生成/description取得のみで通常のparseが解決しないことを確認していたが、qpdf自身もparse中にresolveしない前提でParseGuardを持つ（`libqpdf/QPDFParser.cc:29-34`）ため「不要guard」とは結論しなかった。実際の再入triggerは無い（`context->getObject`相当は解決しない）ため、`ResolverHandle::in_parse`の対称チェック両方向を直接probeで固定し、`LiveFileParser::parse`が失敗return時もguardを復元することをmockリゾルバで検証した。B5行を参照。 |
 | P6 | B29 | **owner確認済み（2026-09-06）**: qpdf `libqpdf/QPDFJob.cc:493,796,1690` はJob処理完了でgetWarningsをdrainし、`:476,2116,3071` はanyWarningsを使う。`libqpdf/QPDF.cc:345-363` のdrain/non-drain契約を同じdocument collectionへ移植し、Job完了consumerから移す。現Rustのnum_warningsは既存であり再実装対象ではない。 |
 | P7 | B7 | **解消（2026-09-08、`flpdf-3yn9.48.14`）**: canonical/bootstrapのObjStm headerを専用 `Tokenizer::next_object_stream_integer`（`read_token(true, 0)` を2回呼ぶconsumer）へ移行し、qpdf `libqpdf/QPDF.cc:1801-1814` の token読取→integer検査順を固定した。汎用 `next_integer` と xref ByteCursorの `read_token(false)` はclassic readLine/parse_xrefEntry責務として変更していない。 |
