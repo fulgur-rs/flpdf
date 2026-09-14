@@ -225,8 +225,12 @@ fn objstm_page_ownership_uses_the_canonical_object_user_map() {
         .map(|(section, _)| section)
         .expect("second-half container anchor route exists");
     assert!(
-        anchors.contains("other_page_private_owner"),
+        anchors.contains("part7_owner_for_plan"),
         "part7 ObjStm ownership must use qpdf-shaped object-user ownership"
+    );
+    assert!(
+        writer_source.contains("other_page_private_owner"),
+        "the part7 owner helper must consult qpdf user gates"
     );
     assert!(
         !anchors.contains("let page_private_sets: Vec<BTreeSet<ObjectRef>>"),
