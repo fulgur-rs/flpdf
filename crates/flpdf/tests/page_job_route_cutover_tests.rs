@@ -30,8 +30,8 @@ fn in_place_page_specs_share_the_qpdf_completion_boundary() {
         .find("complete_in_place_page_selection(")
         .expect("CLI InPlace page path must call the shared completion boundary");
     let cli_rotation = cli_body
-        .find("apply_rotate_specs(")
-        .expect("CLI InPlace page path must apply rotation");
+        .find("configuration.rotate(")
+        .expect("CLI InPlace page path must queue rotation on QPDFJob");
     assert!(
         cli_completion < cli_rotation,
         "CLI InPlace page path must apply rotation after shared completion"

@@ -1414,8 +1414,13 @@ consumerも `QPDFJobConfig::rotate` / `split_pages` へ raw parameterを渡し�
 canonical境界へ接続した。これにより `--rotate` と `--flatten-rotation` は qpdf の
 `handleRotations` → `handleTransformations` 順で同じ live documentへ適用される。
 旧 `run_rewrite_with_page_ops_opened` の direct `PdfWriter` routeはcaller closure後に
-削除した。`--pages` extractionのpost-plan rotate consumerは別の残存mixed routeとして
-維持し、今回のbounded cutoverへ混ぜていない。
+削除した。`--pages` extractionのpost-plan rotate/image consumerも
+`flpdf-3yn9.48.94` で page-selection completion後の
+`QPDFJob::apply_transformations`へ接続し、rotationを先行させてから
+underlay/overlayとimage transformationを同じJob ownerへ渡すようにした。
+旧 `apply_rotate_specs` / `apply_image_transformations` のproduction callerは0である。
+E-12/E-13の責務はこのbounded cutoverでcanonicalへ更新したが、E-4/E-10/E-21や
+qtest exceptions、route-wide parity closureは別スコープとして残る。
 
 `--set-page-labels` / `--remove-page-labels` は、`QPDFJob_argv.cc:375-392` の
 option-table、`QPDFJob_config.cc:1101-1151` の文法・typed Config、
