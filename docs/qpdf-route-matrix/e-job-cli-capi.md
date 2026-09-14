@@ -494,7 +494,7 @@ qtest exceptionsとrootは対象外。
 | `optimize_images` | `crates/flpdf/src/job/image_optimization.rs` | `crates/flpdf-cli/src/main.rs:3043,3073,4292,4348,5725,5995` | E-12。6 箇所と本領域最多 |
 | `should_remove_unreferenced_resources` | `crates/flpdf/src/job/resource_pruning.rs` | `crates/flpdf-cli/src/main.rs:5707` | E-16 |
 | `copy_duplicate_page_annotations` | `crates/flpdf/src/job/page_specs.rs` | `crates/flpdf-cli/src/main.rs:5714` | qpdf 側は `handlePageSpecs` 内のインラインコード（`libqpdf/QPDFJob.cc:2359-2633`）で個別識別子なし → 7 の「独自命名は逸脱でない」に該当するが、`pub` の根拠は別途要る |
-| `OverlaySpec` / `OverlayKind` | `crates/flpdf/src/job/overlay.rs` | `handle_under_overlay` の引数型（`crates/flpdf-cli/src/main.rs:4463,5792`） | 8 (E) が挙げた `handle_under_overlay` の**支援型**。第 4 の根拠が働くのは「legitimate な `pub` メソッドのシグネチャ」に対してであり、`handle_under_overlay` 自身が debt である以上こちらも従属 debt |
+| `OverlaySpec` / `OverlayKind` | `crates/flpdf/src/job/overlay.rs` | `handle_under_overlay` の引数型（`crates/flpdf-cli/src/main.rs:3991,4710` で `&[OverlaySpec]` として渡る） | 8 (E) が挙げた `handle_under_overlay` の**支援型**。第 4 の根拠が働くのは「legitimate な `pub` メソッドのシグネチャ」に対してであり、`handle_under_overlay` 自身が debt である以上こちらも従属 debt |
 | `CombinedPage` / `InputSpec` | `crates/flpdf/src/job/page_combine.rs` | `crates/flpdf-cli/src/main.rs` の `--pages` 経路 | `PageRange`（根拠 1）と違い qpdf 側に対応 public 識別子なし |
 | `SelectedPage` | `crates/flpdf/src/job/page_plan.rs` | 同上 | 同上 |
 | `ImageOptimizationOptions` / `RemoveUnreferencedResources` | `crates/flpdf/src/job/image_optimization.rs` / `crates/flpdf/src/job/resource_pruning.rs` | `optimize_images` / `should_remove_unreferenced_resources` の引数型 | 従属 debt（上と同じ理由） |

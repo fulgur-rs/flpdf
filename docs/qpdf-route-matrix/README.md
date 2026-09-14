@@ -665,9 +665,9 @@ warning collectionやtoken primitiveの移植を、領域A全体の統合完了�
 2. **C21 の辞書差** — `/F` `/FFilter` `/FDecodeParms` 削除の到達条件をoracle fixtureで固定し、qpdfの責務に沿って修正する。逸脱マーカーは修正完了の代替にしない。
 3. **C22** — C-U3 library harnessでplain/QDF cacheとlinearized probeの挙動を照合する。非対称だけで早期return撤去を決めない。
 4. **C42 / B11** — recovered length を qpdf 同様に全 span で pipe する経路として完了。表示専用の EOL metadata や framing extension は持たない。前提: probe C-U1。
-5. **C27** — bootstrapのdocument/source ownerを整えてからxref stream payloadのdecodeをcanonical pipeへ移す（`flpdf-3yn9.48.43`）。B17のxref entry構文処理の正本とは別責務である。
+5. ~~**C27**~~ — `.48.49` で canonical 化済み（§10 X-4 参照）。bootstrap-context decode は `ObjectHandle::get_stream_data(DecodeLevel::Specialized)` へ移行した。B17 の xref entry 構文処理の正本とは別責務である点は変わらない。
 6. **C44** — public `getStreamJSON` facade と deferred `StreamBlobProvider` 相当は `.48.47` で実装済み。残る C-U2 は provider 回数と lifetime を C++ harness で固定する probe。canonical C24 `write_stream_json` を二重pipeへ変更しない。
-7. **C4 / C8 / C9 / C25〜C29、E-27 / E-28** — provider/copy/decodeの不足primitiveを明示し、xrefとdriver test 0/1など既知consumerからbounded cutoverする。C43 の dead public wrapper は `flpdf-3yn9.48.91` で撤去済み。
+7. **C8 / C9 / C25 / C28、E-27 / E-28** — provider/copy/decodeの不足primitiveを明示し、xrefとdriver test 0/1など既知consumerからbounded cutoverする。C4 / C26 / C27 / C29 は行レベルで canonical 化済みのため本 step から外した。C43 の dead public wrapper は `flpdf-3yn9.48.91` で撤去済みだが、内部 owner が残るため行は bridge (ii) のまま（`flpdf-w5pjs`）。
 
 qpdf 呼び出し順を壊さない理由: §5.C 第 4 行（`willFilterStream` の判定順序）が 2 と 3 を
 C20 / C21 の**後ろ**に置く理由 — 判定順序の canonical owner が確定していない状態で早期 return を

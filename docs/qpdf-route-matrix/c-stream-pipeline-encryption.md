@@ -464,7 +464,7 @@ C10のcanonicalはbuilt-in lookupに限定し、runtime登録の公開契約は�
 | U3 | C22 の caller ごとの callback timing と出力保持が qpdf の writer 責務に一致するか | plain / QDF は現在全 indirect stream の完成出力を cache する（`writer/plain/plan.rs:135-158`, `writer.rs:3847-3875`、closed `flpdf-25kg.2.2.15`）。qpdf の linearized optimizer は `QPDFWriter.cc:2543-2553` で明示的に事前 probe する。したがって early return の有無だけでは不一致とは言えない。stateful token filter / retry-aware provider の call order・warning・bytes を plain / QDF / linearize それぞれの qpdf owner と比較し、残る planner 分岐を確認する |
 | U4 | C17-C18 の reader/writer consumer が共有 primitive と同じ key を返すか | 完了。pinned qpdf headerをincludeしたC++ probeで、`objid=0x010203`、`generation=0x0405`、V={1,2,4,5}、R=6固定、key長={5,16,24,32}、AES/RC4を全組合せ確認し、`encryption_R` は qpdf原典でも未使用であることを確認した。結果を `crates/flpdf/src/encryption/primitives.rs` の32固定vectorで検証。qpdf側は1実装なので、reader/writerの旧2実装差分テストは不要になった |
 
-## 分類集計（2026-09-06 再監査時点）
+## 分類集計（current-main anchor 時点。README §1 の A〜E 集計と同じ tree で数える）
 
 | 分類 | 件数 | 行 |
 |---|---|---|
