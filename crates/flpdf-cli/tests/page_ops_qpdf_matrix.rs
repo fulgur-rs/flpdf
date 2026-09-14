@@ -3321,7 +3321,10 @@ fn pages_then_overlay_is_byte_identical_to_qpdf_without_deflate() {
         "--",
         q.to_str().unwrap(),
     ]);
-    assert!(q_ok, "qpdf pages-overlay byte differential failed: {qpdf_stdout}");
+    assert!(
+        q_ok,
+        "qpdf pages-overlay byte differential failed: {qpdf_stdout}"
+    );
 
     flpdf_ok(&[
         "rewrite",
