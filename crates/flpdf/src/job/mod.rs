@@ -61,5 +61,5 @@ pub use page_plan::{PagePlan, SelectedPage};
 pub use page_range::{Endpoint, PageRange, PageRangeEntry, Parity};
 pub use page_specs::{copy_duplicate_page_annotations, PageSpecInput, PageSpecJobOutput};
 pub use page_split::SplitPageOptions;
-pub use resource_pruning::{should_remove_unreferenced_resources, RemoveUnreferencedResources};
+pub use resource_pruning::RemoveUnreferencedResources;
 pub use rotate::flatten_rotation_on_pages;

@@ -185,10 +185,7 @@ pub use job::{
     MergeInput, OverlayKind, OverlaySpec, OverlayVerbosePage, OverlayVerboseSource, PagePlan,
     PageRange, PageRangeEntry, PageSpecJobOutput, Parity, SelectedPage, DEFAULT_MAX_ACROFORM_DEPTH,
 };
-pub use job::{
-    optimize_images, should_remove_unreferenced_resources, ImageOptimizationOptions,
-    RemoveUnreferencedResources,
-};
+pub use job::{optimize_images, ImageOptimizationOptions, RemoveUnreferencedResources};
 pub use matrix::{Matrix, Rectangle};
 pub use nntree::{
     NameTree, NameTreeCursor, NumberTree, NumberTreeCursor, DEFAULT_MAX_TREE_DEPTH, LEAF_MAX,
