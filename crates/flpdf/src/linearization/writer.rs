@@ -1,9 +1,10 @@
 //! qpdf correspondence: QPDFWriter.cc linearized write path split from the standard writer.
 //! Layout writer — orchestrates the full linearized PDF output.
 //!
-//! This module assembles the six-part Annex F layout in correct order, tracks
-//! byte offsets for back-patching, and returns the finished bytes together with
-//! all offset information that the back-patcher needs.
+//! This module assembles the six-part Annex F layout in correct order and
+//! tracks qpdf's pass-1 and final-pass byte coordinates. The canonical writer
+//! streams the final pass through its configured sink; the test/inspection
+//! helper may additionally return the finished bytes.
 //!
 //! # Part ordering (Annex F)
 //!
@@ -52,9 +53,9 @@
 //!
 //! # Scope
 //!
-//! Back-patching the placeholder values is the responsibility of a later step.
-//! This module returns `LinearizedOffsets` containing all information required
-//! for that step.
+//! The canonical sink route derives the final parameter dictionary and xref
+//! coordinates before final emission. `LinearizedOffsets` remains available to
+//! the in-memory inspection helper and its compatibility back-patch API.
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::io::{Read, Seek, Write};
@@ -571,6 +572,15 @@ pub struct LinearizedDocument {
     pub offsets: LinearizedOffsets,
 }
 
+/// Result shared by the memory-backed inspection helper and the canonical
+/// sink-backed writer route. The latter deliberately does not retain a
+/// document-sized byte vector after it has reached the configured sink.
+struct LinearizedWriteResult {
+    #[allow(dead_code)]
+    document: Option<LinearizedDocument>,
+    writer_result: WriterResult,
+}
+
 // ---------------------------------------------------------------------------
 // Constants
 // ---------------------------------------------------------------------------
@@ -848,6 +858,8 @@ fn write_part1_xref_and_trailer(
     id_writer: Option<crate::pdf_syntax::ReborrowableIdWriter>,
     encrypt_ctx: Option<&crate::writer::EncryptionContext>,
     pass1: bool,
+    final_xref_offsets: Option<&BTreeMap<u32, usize>>,
+    final_prev: Option<usize>,
 ) -> Result<(usize, std::ops::Range<usize>, Option<Part1XrefPatch>)> {
     // The param-dict object's trailing pad (reserved by `Part1Bytes::build`)
     // ends with spaces; qpdf starts the first-page `xref` on a fresh line, so
@@ -870,6 +882,18 @@ fn write_part1_xref_and_trailer(
         for _ in 0..first_page_count {
             out.write_bytes(b"0000000000 00000 n \n")?;
         }
+        None
+    } else if let Some(xref_offsets) = final_xref_offsets {
+        // cov:ignore-start: validated final layout contains every first-page object offset
+        for number in param_dict_obj_number..param_dict_obj_number + first_page_count {
+            let offset = xref_offsets.get(&number).copied().ok_or_else(|| {
+                crate::Error::Unsupported(format!(
+                    "Part-1 xref: covered object {number} has no final offset"
+                ))
+            })?;
+            out.write_bytes(format!("{offset:010} 00000 n \n").as_bytes())?;
+        }
+        // cov:ignore-end
         None
     } else {
         let data_start = out.position_usize()?;
@@ -926,14 +950,17 @@ fn write_part1_xref_and_trailer(
         out.write_bytes(b" ")?;
         out.write_bytes(&value)?;
         if key == b"/Size" {
-            // `/Prev` placeholder: left-justified 0, space-padded to the
-            // fixed qpdf field width so the final xref offset is patched in
-            // place without shifting any body bytes.
+            // `/Prev` is known from qpdf's pass-1 second-xref coordinate in
+            // the forward final pass. The placeholder remains only for the
+            // in-memory compatibility path that still exercises the legacy
+            // back-patcher directly.
             out.write_bytes(b" /Prev ")?;
             let prev_value_start = out.position_usize()?;
-            let placeholder = format!("{:<PREV_PLACEHOLDER_WIDTH$}", 0);
+            let placeholder = format!("{:<PREV_PLACEHOLDER_WIDTH$}", final_prev.unwrap_or(0));
             out.write_bytes(placeholder.as_bytes())?;
-            prev_value_range = Some(prev_value_start..out.position_usize()?);
+            if final_prev.is_none() {
+                prev_value_range = Some(prev_value_start..out.position_usize()?);
+            }
         } else {
             out.write_bytes(b" ")?;
         }
@@ -974,13 +1001,17 @@ fn write_part1_xref_and_trailer(
     // linearized file"; we adopt the same convention for byte-identical output.
     out.write_bytes(b"\nstartxref\n0\n%%EOF\n")?;
 
-    let prev_value_range = prev_value_range.ok_or_else(|| {
-        // cov:ignore-start: /Size is inserted unconditionally above.
-        crate::Error::Unsupported(
-            "linearization first trailer has no /Size entry for /Prev patch".to_string(),
-        )
-        // cov:ignore-end
-    })?; // cov:ignore: /Size is inserted unconditionally above.
+    let prev_value_range = match (prev_value_range, final_prev) {
+        (Some(range), _) => range,
+        (None, Some(_)) => 0..0,
+        (None, None) => {
+            // cov:ignore-start: /Size is inserted unconditionally above.
+            return Err(crate::Error::Unsupported(
+                "linearization first trailer has no /Size entry for /Prev patch".to_string(),
+            ));
+            // cov:ignore-end
+        }
+    };
     Ok((xref_offset, prev_value_range, patch))
 }
 
@@ -1147,6 +1178,12 @@ struct FirstPageXrefPatch {
     hint_id: u32,
 }
 
+struct FinalFirstPageXref<'a> {
+    member_new: &'a BTreeMap<u32, (u32, u32)>,
+    main_xref_offset: usize,
+    hint_length: usize,
+}
+
 /// Return the live trailer entries that the linearization xref dictionary may
 /// carry in addition to its writer-owned structural fields.
 ///
@@ -1250,11 +1287,10 @@ pub(crate) fn first_page_xref_object_count(
 ///     a digest over a reconstruction of qpdf's first write pass. The classic
 ///     (stream-free) path then **direct-writes** that identifier at every `/ID`
 ///     site in the final pass (qpdf's 2-pass scheme), so the placeholder never
-///     reaches the finished output. The ObjStm / xref-stream path instead
-///     back-patches the placeholder in place afterwards (see
-///     [`patch_linearized_deterministic_id`]). Either way the identifier is the
-///     same width as the placeholder, so every later byte offset (`startxref`,
-///     hint stream, xref offsets) is unchanged.
+///     reaches the finished output. The ObjStm / xref-stream path also emits
+///     the computed identifier directly from the final trailer view. The
+///     identifier has the same width as the placeholder, so every later byte
+///     offset (`startxref`, hint stream, xref offsets) is unchanged.
 ///   - `--static-id`: `[source_id0_or_π, π_const]`, with an empty source
 ///     `/ID[0]` falling back to the same pi value
 ///     (when both flags are set, this static form takes precedence)
@@ -1312,112 +1348,6 @@ fn linearization_pass1_id(source_id0: Option<&[u8]>) -> ObjectHandle {
     ])
 }
 
-/// Overwrite every all-zero deterministic `/ID` placeholder in the finished
-/// linearized output with the final two-level qpdf identifier.
-///
-/// Used by the ObjStm / xref-stream path only. (The classic, stream-free path
-/// direct-writes the identifier in its final write pass — qpdf's 2-pass scheme,
-/// see [`finalize_linearized_id`] — so it never reaches this function.)
-///
-/// A linearized file repeats `/ID` across the first-page xref-stream dict and
-/// the main xref-stream dict; a file identifier is file-scoped, so both must
-/// carry the *same* value. This function does **not** compute the identifier:
-/// `id0`/`id1` are precomputed by [`write_linearized_for_pdf_writer`] from a digest over a
-/// reconstruction of qpdf's first write pass (the `det_id` computation; the
-/// pass-1 buffer is built by [`build_pass1_part1`] with qpdf's `writePad`
-/// length-stabilisation). That reconstruction is what reproduces qpdf's
-/// deterministic `/ID` byte-for-byte. Here we only overwrite the all-zero
-/// placeholders the final pass wrote at the xref-stream dict sites. Because the
-/// replacement is the same width as the placeholder, no byte offset shifts.
-///
-/// The placeholder is replaced **only inside `id_ranges`** — the absolute byte
-/// span of each emitted `/ID [<hex0><hex1>]` array *token itself*, reported by
-/// [`xref_stream::write_object`] at the point it writes that token (see
-/// [`patch_first_page_xref`] and `write_main_xref_stream_and_trailer`, the two
-/// producers). Each range is exactly as wide as the placeholder
-/// ([`crate::writer::deterministic_id_array_len`]), so at most one position in
-/// it can ever match.
-///
-/// An earlier revision instead recorded the whole *section* containing a
-/// `/ID` site (the full xref-stream object, including its stream payload and
-/// — on the first-page xref stream — arbitrary custom (non-writer-owned)
-/// trailer entries preserved verbatim from the source trailer). A custom
-/// trailer value serialized as a PDF literal string does not escape `[`, `<`,
-/// digits, `>`, or `]`, so a source document engineering such a value could
-/// make that broader scan see a second, spurious match — tripping the
-/// `debug_assert_eq!` below in debug builds and, in release builds,
-/// corrupting that trailer entry's bytes. Tracking the exact token span
-/// instead of the containing section removes that failure mode structurally:
-/// a range this narrow has only one possible match position. Regression test:
-/// `deterministic_id_objstm_survives_custom_trailer_placeholder_lookalike`.
-///
-/// The classic (stream-free) table path also pushes onto an `id_ranges`
-/// vector inside the same `do_write_pass`, but with the old whole-section
-/// span (`write_part1_xref_and_trailer` / `write_main_xref_and_trailer`).
-/// That is harmless: `objstm_layout.is_empty()` picks one branch or the
-/// other for the *entire* pass (both first-page and main-trailer sites), so
-/// a classic-path run never produces the ObjStm-path pushes this function
-/// consumes, and this function itself is only ever invoked when
-/// `objstm_layout.is_empty()` is `false` (see the call site's guard). The
-/// classic path's own `/ID` is direct-written via `id_writer` and never
-/// reaches a placeholder at all, so it has no need of a precise span.
-///
-/// # Panics
-///
-/// Panics (via `debug_assert!`) in debug builds if any `/ID` range does not
-/// contain exactly one placeholder — an internal invariant, since
-/// [`finalize_linearized_id`] installs exactly one placeholder per `/ID` site
-/// whenever `deterministic_id` is set, and the writer records one range per
-/// emitted site.
-fn patch_linearized_deterministic_id(
-    bytes: &mut [u8],
-    id_ranges: &[std::ops::Range<usize>],
-    id0: &[u8],
-    id1: &[u8; 16],
-) {
-    use crate::writer::{deterministic_id_array_len, write_deterministic_id_array};
-
-    // The placeholder and final value are the same width:
-    // `deterministic_id_array_len(id0.len())`, where id0 is the (possibly
-    // non-16-byte) permanent identifier preserved from the source `/ID[0]`.
-    // qpdf copies `/ID[0]` verbatim regardless of length, so the placeholder
-    // emitted at every `/ID` site (a zero id0 of the SAME length) and the final
-    // value share that width and no later byte offset shifts.
-    let len = deterministic_id_array_len(id0.len());
-    // The identifier is precomputed from qpdf's pass-1 buffer (see the `det_id`
-    // computation in `write_linearized`); here we only overwrite the all-zero
-    // `/ID` placeholders the final pass wrote at the xref-stream dict sites.
-    let mut placeholder = Vec::with_capacity(len);
-    write_deterministic_id_array(&mut placeholder, &vec![0u8; id0.len()], &[0u8; 16]);
-    let mut final_id = Vec::with_capacity(len);
-    write_deterministic_id_array(&mut final_id, id0, id1);
-
-    // Patch each known `/ID` section in isolation. Body bytes outside these
-    // spans are never inspected, so a placeholder-shaped byte run in user data
-    // can never be mistaken for a `/ID`.
-    for range in id_ranges {
-        // Clamp defensively: a recorded range must lie within the buffer.
-        let start = range.start.min(bytes.len());
-        let end = range.end.min(bytes.len());
-        let mut patched = 0usize;
-        let mut i = start;
-        while i + len <= end {
-            if &bytes[i..i + len] == placeholder.as_slice() {
-                bytes[i..i + len].copy_from_slice(&final_id);
-                patched += 1;
-                i += len;
-            } else {
-                i += 1;
-            }
-        }
-        debug_assert_eq!(
-            patched, 1,
-            "each /ID section must contain exactly one deterministic /ID placeholder \
-             (0 or >1 indicates a linearization writer bug)"
-        );
-    }
-}
-
 /// Reserve the **first-page (Part-1) cross-reference stream**'s fixed byte
 /// region at its proper position — physically inside the first-page region,
 /// *before* `/E`, in the slot where the classic Part-1 mini-xref + first trailer
@@ -1459,6 +1389,7 @@ fn write_first_page_xref_stream(
     filtered: bool,
     encrypt: Option<ObjectRef>,
     pass1: bool,
+    final_layout: Option<FinalFirstPageXref<'_>>,
 ) -> Result<FirstPageXrefPatch> {
     let final_size = total_count;
     let first_xref_num = relocation.first_xref_slot;
@@ -1536,6 +1467,19 @@ fn write_first_page_xref_stream(
         let (region, _) =
             build_first_page_xref_region(&patch, xref_offsets, &BTreeMap::new(), 0, 0, true)?;
         out.write_bytes(&region)?;
+    } else if let Some(final_layout) = final_layout {
+        // The final xref coordinates are known from pass 1 plus the framed
+        // hint length. Emit the qpdf-shaped region directly; a non-seekable
+        // Writer/Pipeline must never receive a later in-place repair.
+        let (region, _) = build_first_page_xref_region(
+            &patch,
+            xref_offsets,
+            final_layout.member_new,
+            final_layout.main_xref_offset,
+            final_layout.hint_length,
+            false,
+        )?; // cov:ignore: pass-1 sizing guarantees the final region fits
+        out.write_bytes(&region)?;
     } else {
         // Space placeholder of exactly the region length, then the trailing
         // newline (outside the region, mirroring qpdf). The placeholder is
@@ -1549,7 +1493,7 @@ fn write_first_page_xref_stream(
 
 /// Extract the trailer `/ID`'s two byte strings — the deterministic-`/ID`
 /// all-zero placeholder while writing — for the rebuilt xref-stream dicts. The
-/// real identifier is patched in afterwards by [`patch_linearized_deterministic_id`].
+/// final-pass trailer view supplies the real identifier directly.
 fn xref_id_bytes(source_trailer: &ObjectHandle) -> Result<Option<(Vec<u8>, Vec<u8>)>> {
     let id = source_trailer.try_get_key(b"/ID")?;
     let Some(values) = id.try_as_array()? else {
@@ -1575,17 +1519,14 @@ fn xref_id_bytes(source_trailer: &ObjectHandle) -> Result<Option<(Vec<u8>, Vec<u
 /// `/Prev → main xref` — then space-padded to the region's fixed byte length
 /// ([`xref_stream::write_padded_region`]). Because the region length is fixed
 /// (qpdf's pass-1 sizing), this shifts no later offset while the hint object is
-/// spliced. The rebuilt dict carries the all-zero `/ID`
-/// placeholder, which [`patch_linearized_deterministic_id`] overwrites later.
+/// spliced. The final-pass trailer view carries the final `/ID` bytes directly.
 ///
 /// Returns the absolute byte range (within `bytes`) of the emitted `/ID`
 /// array token, translated from [`xref_stream::write_padded_region`]'s
 /// region-relative range by `patch.region.start`. The caller records this
 /// exact span in `id_ranges` instead of the whole region — the region also
 /// carries this object's stream payload and, via `patch.canonical_entries`,
-/// arbitrary custom trailer entries whose serialized bytes could otherwise
-/// coincidentally match the placeholder's fixed byte pattern (see
-/// [`patch_linearized_deterministic_id`]'s doc).
+/// arbitrary custom trailer entries without scanning their serialized bytes.
 fn build_first_page_xref_region(
     patch: &FirstPageXrefPatch,
     xref_offsets: &mut BTreeMap<u32, usize>,
@@ -2197,6 +2138,19 @@ struct LinearizedPassOutput {
     id_ranges: Vec<std::ops::Range<usize>>,
 }
 
+/// Final-pass coordinates derived from qpdf's pass-1 measurements.
+///
+/// qpdf keeps the xref map from the first pass and applies the framed hint
+/// object's length when it writes the second pass. Keeping that same map here
+/// lets the final pass write its first-page xref and parameter dictionary
+/// forward, without reserving a region that must be repaired after the body
+/// has already reached a non-seekable sink.
+struct FinalLinearizedLayout {
+    xref_offsets: BTreeMap<u32, usize>,
+    main_xref_offset: usize,
+    hint_length: usize,
+}
+
 /// Perform a complete single-pass write of the linearized PDF body.
 ///
 /// `hint_stream_object` is the complete qpdf-shaped indirect hint object. `None`
@@ -2247,8 +2201,11 @@ fn do_write_pass<R: Read + Seek>(
     mut encrypted_string_emitter: Option<&mut EncryptedStringEmitter>,
     final_pdf_version: &str,
     final_extension_level: i64,
+    final_layout: Option<&FinalLinearizedLayout>,
 ) -> Result<LinearizedPassOutput> {
-    let mut xref_offsets: BTreeMap<u32, usize> = BTreeMap::new();
+    let mut xref_offsets = final_layout
+        .map(|layout| layout.xref_offsets.clone())
+        .unwrap_or_default();
 
     // The classic path emits `/ID` at two sites (Part-1 and main trailers).
     // A `&mut dyn FnMut` cannot be moved into both calls, so reborrow it for the
@@ -2330,7 +2287,7 @@ fn do_write_pass<R: Read + Seek>(
     // Absolute byte spans of every section that carries a `/ID`.  The
     // deterministic-`/ID` back-patch scans *only* inside these spans so it can
     // never overwrite a body byte sequence that happens to equal the all-zero
-    // `/ID` placeholder (see `patch_linearized_deterministic_id`).  Each span is
+    // `/ID` token. Each span is
     // captured as `start..bytes.len()` around the call that emits its `/ID`.
     let mut id_ranges: Vec<std::ops::Range<usize>> = Vec::new();
     let first_trailer_prev_range = if objstm_layout.is_empty() {
@@ -2355,6 +2312,8 @@ fn do_write_pass<R: Read + Seek>(
             id_writer.as_deref_mut(),
             encrypt_ctx,
             pass1_digest,
+            final_layout.map(|_| &xref_offsets),
+            final_layout.map(|layout| layout.main_xref_offset),
         )?; // cov:ignore: the validated linearization plan makes this serializer error path defensive.
         part1_classic_xref_offset = p1_xref_offset;
         part1_xref_patch = patch;
@@ -2379,6 +2338,11 @@ fn do_write_pass<R: Read + Seek>(
             structural_streams_filtered,
             encrypt_ctx.map(|ctx| ctx.encrypt_ref),
             pass1_digest,
+            final_layout.map(|layout| FinalFirstPageXref {
+                member_new: &member_new,
+                main_xref_offset: layout.main_xref_offset,
+                hint_length: layout.hint_length,
+            }),
         )?;
         // First-page xref stream object carries one `/ID` (the main xref
         // stream below carries the second). This call only reserves the
@@ -2767,6 +2731,18 @@ fn do_write_pass<R: Read + Seek>(
         }
     }
 
+    if let Some(layout) = final_layout {
+        let actual = output.position_usize()?;
+        if actual != layout.main_xref_offset {
+            // cov:ignore-start: final offsets are derived from the same pass-1 layout
+            return Err(crate::Error::Unsupported(format!(
+                "linearization final main xref offset drifted: expected {}, got {}",
+                layout.main_xref_offset, actual
+            )));
+            // cov:ignore-end
+        }
+    }
+
     // Part 6: main cross-reference + trailer.
     //
     // When ObjStm containers are present the body holds compressed (type-2)
@@ -2804,7 +2780,7 @@ fn do_write_pass<R: Read + Seek>(
         // Final output patches the fixed-width first-page xref after every
         // object offset is known. Pass 1 already emitted qpdf's zero records
         // directly before the body and therefore has no in-place operation.
-        if !pass1_digest {
+        if !pass1_digest && final_layout.is_none() {
             let patch = part1_xref_patch
                 .as_ref()
                 // cov:ignore-start: final classic output always reserves this patch.
@@ -2876,7 +2852,7 @@ fn do_write_pass<R: Read + Seek>(
         // xref's reserved region with the real encoded object and `/Prev →
         // main xref`. The region's byte length is fixed (qpdf's pass-1 sizing),
         // so this shifts no bytes between the two layout passes.
-        if !pass1_digest {
+        if !pass1_digest && final_layout.is_none() {
             let first_page_id_range = patch_first_page_xref(
                 output,
                 patch,
@@ -2892,6 +2868,16 @@ fn do_write_pass<R: Read + Seek>(
 
         (main_xref_offset, main_first_entry_offset, second_xref_end)
     };
+
+    if let Some(layout) = final_layout {
+        if xref_offsets != layout.xref_offsets {
+            // cov:ignore-start: emission order is validated against the qpdf pass-1 map
+            return Err(crate::Error::Unsupported(
+                "linearization final xref offsets diverged from pass-1 layout".to_string(),
+            ));
+            // cov:ignore-end
+        }
+    }
 
     Ok(LinearizedPassOutput {
         xref_offsets,
@@ -3207,7 +3193,14 @@ pub(crate) fn write_linearized<R: Read + Seek>(
     options: &WriterOptions,
 ) -> Result<LinearizedDocument> {
     let setup = crate::writer::build_writer_setup(pdf, options)?;
-    Ok(write_linearized_impl(plan, renumber, pdf, options, None, setup)?.0)
+    let output = write_linearized_impl(plan, renumber, pdf, options, None, setup, None)?;
+    // cov:ignore-start: the memory helper always selects the Vec-backed output mode
+    output.document.ok_or_else(|| {
+        crate::Error::Internal(
+            "linearization memory helper returned no in-memory document".to_string(),
+        )
+    })
+    // cov:ignore-end
 }
 
 /// Write linearized output through the canonical [`crate::PdfWriter`] route.
@@ -3222,7 +3215,8 @@ pub(crate) fn write_linearized_for_pdf_writer<R: Read + Seek>(
     options: &WriterOptions,
     pass1_path: Option<&Path>,
     setup: crate::writer::WriterSetupState,
-) -> Result<(LinearizedDocument, WriterResult)> {
+    output: &mut dyn OutputTarget,
+) -> Result<WriterResult> {
     let plan_result = (|| {
         let mode = if crate::writer::force_version_below_1_5(options) {
             crate::writer::ObjectStreamMode::Disable
@@ -3259,7 +3253,16 @@ pub(crate) fn write_linearized_for_pdf_writer<R: Read + Seek>(
     })();
 
     plan_result.and_then(|(plan, renumber)| {
-        write_linearized_impl(&plan, &renumber, pdf, options, pass1_path, setup)
+        let output = write_linearized_impl(
+            &plan,
+            &renumber,
+            pdf,
+            options,
+            pass1_path,
+            setup,
+            Some(output),
+        )?;
+        Ok(output.writer_result)
     })
 }
 
@@ -3303,7 +3306,8 @@ fn write_linearized_impl<R: Read + Seek>(
     options: &WriterOptions,
     pass1_path: Option<&Path>,
     setup: crate::writer::WriterSetupState,
-) -> Result<(LinearizedDocument, WriterResult)> {
+    final_output: Option<&mut dyn OutputTarget>,
+) -> Result<LinearizedWriteResult> {
     let crate::writer::WriterSetupState {
         generated_id,
         encryption_parameters,
@@ -3903,14 +3907,11 @@ fn write_linearized_impl<R: Read + Seek>(
     // `computeDeterministicIDData`, qpdf 11.9.0; the hint stream is written only
     // afterwards). That pass-1 buffer is loop-invariant (it carries no hint
     // stream, so it never depends on a later hint-object splice), so emit it
-    // once here and digest it. This pass-1 digest is now computed for *both* paths whenever
-    // `--deterministic-id` is set. The classic (stream-free) path emits it
-    // directly at both `/ID` sites in the final pass — no placeholder, no
-    // post-write byte scan. The ObjStm / xref-stream path still uses the
-    // placeholder-then-patch scheme ([`patch_linearized_deterministic_id`]
-    // overwrites the all-zero placeholders below), but with this same value, so
-    // both paths reach byte-parity with qpdf's `/ID`. The pass-1 buffer itself
-    // keeps the all-zero `/ID` placeholder (its trailer writers get
+    // once here and digest it. This pass-1 digest is computed for every
+    // deterministic-ID route. The final pass receives a trailer view with the
+    // computed identifier and emits it directly at every `/ID` site, so no
+    // post-write scan or seekable output buffer is needed. The pass-1 buffer
+    // itself keeps the all-zero `/ID` placeholder (its trailer writers get
     // `id_writer = None`), exactly as qpdf's pass 1 does, so the digest depends
     // only on the input and is stable.
     let pass1_part1 = build_pass1_part1(&part1);
@@ -3942,8 +3943,10 @@ fn write_linearized_impl<R: Read + Seek>(
         encrypted_string_emitter.as_mut(),
         eff_version,
         eff_ext,
+        None,
     );
     let pass1_finish = pass1_sink.finish_document();
+    let pass1_file_length = pass1_sink.position_usize()?;
     let pass1_digest = if deterministic_id {
         Some(pass1_sink.take_digest())
     } else {
@@ -4314,46 +4317,131 @@ fn write_linearized_impl<R: Read + Seek>(
         pass1_target.write_debug_comments(debug_comments.as_bytes());
     }
 
+    // qpdf's second pass uses the pass-1 coordinates as its source of truth:
+    // the framed hint object is inserted at its recorded slot, so every later
+    // offset receives exactly one hint-length adjustment. Build that physical
+    // final map before emitting anything to the configured sink. This is what
+    // lets the first-page xref and the compact Part-1 dictionary be written
+    // forward instead of repaired after a non-seekable sink has consumed them.
+    let hint_stream_length = hint_stream_object.len();
+    let mut final_xref_offsets = pass1_output.xref_offsets.clone();
+    for (&number, &offset) in &pass1_output.xref_offsets {
+        if number != hint_stream_new_num && offset >= pass1_output.hint_stream_offset {
+            let adjusted = offset.checked_add(hint_stream_length).ok_or_else(|| {
+                // cov:ignore-start: supported PDF offsets fit in usize
+                crate::Error::Unsupported(
+                    "linearization final xref offset exceeds usize range".to_string(),
+                )
+                // cov:ignore-end
+            })?; // cov:ignore: supported PDF offsets fit in usize
+            final_xref_offsets.insert(number, adjusted);
+        }
+    }
+    final_xref_offsets.insert(hint_stream_new_num, pass1_output.hint_stream_offset);
+
+    let final_main_xref_offset = pass1_output
+        .last_xref_offset
+        .checked_add(hint_stream_length)
+        .ok_or_else(|| {
+            // cov:ignore-start: supported PDF offsets fit in usize
+            crate::Error::Unsupported(
+                "linearization final main xref offset exceeds usize range".to_string(),
+            )
+            // cov:ignore-end
+        })?; // cov:ignore: supported PDF offsets fit in usize
+    let final_end_of_first_page_offset = pass1_output
+        .end_of_first_page_offset
+        .checked_add(hint_stream_length)
+        .ok_or_else(|| {
+            // cov:ignore-start: supported PDF offsets fit in usize
+            crate::Error::Unsupported(
+                "linearization final first-page end exceeds usize range".to_string(),
+            )
+            // cov:ignore-end
+        })?; // cov:ignore: supported PDF offsets fit in usize
+    let final_last_xref_first_entry_offset = pass1_output
+        .last_xref_first_entry_offset
+        .checked_add(hint_stream_length)
+        .ok_or_else(|| {
+            // cov:ignore-start: supported PDF offsets fit in usize
+            crate::Error::Unsupported(
+                "linearization final xref entry offset exceeds usize range".to_string(),
+            )
+            // cov:ignore-end
+        })?; // cov:ignore: supported PDF offsets fit in usize
+    let final_file_length = pass1_file_length
+        .checked_add(hint_stream_length)
+        .ok_or_else(|| {
+            // cov:ignore-start: supported PDF offsets fit in usize
+            crate::Error::Unsupported(
+                "linearization final file length exceeds usize range".to_string(),
+            )
+            // cov:ignore-end
+        })?; // cov:ignore: supported PDF offsets fit in usize
+    let page_count = plan.page_hints.len() as u32;
+
+    let mut final_part1_offsets = LinearizedOffsets {
+        file_length: final_file_length,
+        hint_stream_offset: pass1_output.hint_stream_offset,
+        hint_stream_length,
+        first_page_object_new_num,
+        end_of_first_page_offset: final_end_of_first_page_offset,
+        last_xref_keyword_offset: final_main_xref_offset,
+        last_xref_offset: final_last_xref_first_entry_offset.saturating_sub(1),
+        page_count,
+        part1_placeholders: part1_placeholders.clone(),
+        xref_offsets: final_xref_offsets.clone(),
+        first_trailer_prev_range: 0..0,
+        dict_writable_region: part1_dict_region.clone(),
+    };
+    let mut final_part1 = part1.clone();
+    crate::linearization::back_patch::back_patch_param_dict(
+        &mut final_part1.bytes,
+        &mut final_part1_offsets,
+    )?; // cov:ignore: final values are bounded by the fixed Part-1 reserve
+    let final_layout = FinalLinearizedLayout {
+        xref_offsets: final_xref_offsets,
+        main_xref_offset: final_main_xref_offset,
+        hint_length: hint_stream_length,
+    };
+
+    // The deterministic ID is known now, before the final pass. Install it in
+    // the final trailer view so both classic and xref-stream trailers emit it
+    // directly; only pass 1 keeps the all-zero qpdf placeholder.
+    let final_source_trailer = if let Some((id0, id1)) = &classic_det_id {
+        let trailer = source_trailer_handle.shallow_copy()?;
+        trailer.replace_key(
+            b"/ID",
+            ObjectHandle::array(vec![
+                ObjectHandle::string(id0.clone()),
+                ObjectHandle::string(id1.to_vec()),
+            ]),
+        )?; // cov:ignore: final trailer clone accepts the validated ID handle
+        trailer
+    } else {
+        source_trailer_handle.shallow_copy()?
+    };
+
     // Final pass: write the layout with the exact hint object generated
     // above. The pass-1 virtual offsets and the spliced object length are
     // therefore related by qpdf's adjusted-offset rule.
     //
-    // On the classic deterministic-`/ID` path, direct-write the
-    // identifier computed above at both `/ID` sites (qpdf's 2-pass
-    // scheme): the closure emits the fixed-width hex form, the same
-    // width as the placeholder, so every downstream offset is
-    // unchanged. When `--deterministic-id` is off, `classic_det_id` is
-    // `None`, so `id_writer` is `None` and the stored value is emitted.
-    // On the ObjStm deterministic path `id_writer` is `Some` here too,
-    // but only the classic trailer writers consume it (the xref-stream
-    // writers ignore it), so that path's `/ID` stays an all-zero
-    // placeholder and is patched afterwards.
-    let mut det_id_closure;
-    let id_writer: Option<crate::pdf_syntax::TrailerIdWriter> = match &classic_det_id {
-        Some((id0, id1)) => {
-            // Clone the identifier into the `move` closure so
-            // `classic_det_id` stays available for the ObjStm patch below
-            // (the permanent id0 is now an owned `Vec`, not `Copy`).
-            let id0 = id0.clone();
-            let id1 = *id1;
-            det_id_closure = move |out: &mut crate::writer::output::OutputSink<'_>| {
-                out.write_bytes(b"[")?;
-                crate::pdf_syntax::write_hex_string(out, &id0)?;
-                crate::pdf_syntax::write_hex_string(out, &id1)?;
-                out.write_bytes(b"]")
-            };
-            Some(&mut det_id_closure)
-        }
-        None => None,
-    };
+    // The final trailer view already contains the computed identifier, so
+    // both classic and ObjStm/xref-stream routes write the final `/ID` bytes
+    // directly while the sink remains forward-only.
+    let streaming_output = final_output.is_some();
     let mut final_bytes = Vec::new();
-    let mut final_sink = OutputSink::new(&mut final_bytes);
+    let target: &mut dyn OutputTarget = match final_output {
+        Some(target) => target,
+        None => &mut final_bytes,
+    };
+    let mut final_sink = OutputSink::new(target);
     let final_result = do_write_pass(
         plan,
         renumber,
         pdf,
         &mut final_sink,
-        &part1,
+        &final_part1,
         catalog_new_ref,
         hint_stream_new_num,
         total_count,
@@ -4361,18 +4449,20 @@ fn write_linearized_impl<R: Read + Seek>(
         first_page_object_new_num,
         Some(hint_stream_object.as_slice()),
         structural_streams_filtered,
-        &source_trailer_handle,
+        &final_source_trailer,
         &objstm_layout,
         &relocation,
         options,
         false,
-        id_writer,
+        None,
         encrypt_ctx.as_ref(),
         encrypted_string_emitter.as_mut(),
         eff_version,
         eff_ext,
+        Some(&final_layout),
     );
     let final_finish = final_sink.finish_document();
+    let final_output_length = final_sink.position_usize()?;
     drop(final_sink);
     let final_output = final_result?; // cov:ignore: pass 2 reuses the validated plan and fixed layout after pass 1 succeeds; this is only defensive error propagation.
     final_finish?;
@@ -4386,39 +4476,14 @@ fn write_linearized_impl<R: Read + Seek>(
         last_xref_first_entry_offset: final_last_xref_first_entry_offset,
         second_xref_end: _final_second_xref_end,
         first_trailer_prev_range: final_first_trailer_prev_range,
-        id_ranges: final_id_ranges,
+        id_ranges: _final_id_ranges,
     } = final_output;
-
-    // ------------------------------------------------------------------
-    // Deterministic /ID, ObjStm / xref-stream path: back-patch the all-zero
-    // placeholder in place.
-    //
-    // The classic (stream-free) path already direct-wrote the identifier in the
-    // final pass (qpdf's 2-pass scheme; see `classic_det_id` above), so nothing
-    // remains to patch there. The ObjStm / xref-stream path still uses the
-    // placeholder-then-patch scheme: its `/ID` lives in the xref-stream dicts,
-    // which the final pass emits with all-zero placeholders. We overwrite them
-    // with the pass-1 digest computed above (`classic_det_id`) — the same value
-    // the classic path direct-wrote — so this path reaches byte-parity with
-    // qpdf's `/ID` too. The placeholders are fixed-width, so the overwrite
-    // shifts no byte offset.
-    // ------------------------------------------------------------------
-    if let (false, Some((id0, id1))) = (objstm_layout.is_empty(), &classic_det_id) {
-        // ObjStm / xref-stream path: the final pass wrote the all-zero `/ID`
-        // placeholder at both xref-stream dict sites; overwrite them with the
-        // identifier digested from qpdf's pass-1 buffer (byte-identical to qpdf's
-        // value). The classic path direct-wrote it via `id_writer` already.
-        patch_linearized_deterministic_id(&mut final_bytes, &final_id_ranges, id0, id1);
-    }
 
     // ------------------------------------------------------------------
     // Assemble offsets
     // ------------------------------------------------------------------
-    let file_length = final_bytes.len();
-    let page_count = plan.page_hints.len() as u32;
-
     let offsets = LinearizedOffsets {
-        file_length,
+        file_length: final_output_length,
         hint_stream_offset: final_hint_stream_offset,
         hint_stream_length: final_hint_stream_obj_total_len,
         first_page_object_new_num,
@@ -4428,7 +4493,7 @@ fn write_linearized_impl<R: Read + Seek>(
         // qpdf's check validates: file_T == first_entry_pos - 1.
         last_xref_offset: final_last_xref_first_entry_offset.saturating_sub(1),
         page_count,
-        part1_placeholders,
+        part1_placeholders: final_part1_offsets.part1_placeholders.clone(),
         xref_offsets: final_xref_offsets.clone(),
         first_trailer_prev_range: final_first_trailer_prev_range,
         dict_writable_region: part1_dict_region,
@@ -4514,13 +4579,19 @@ fn write_linearized_impl<R: Read + Seek>(
         }
     }
 
-    Ok((
-        LinearizedDocument {
+    let writer_result = WriterResult::new(old_to_new, written_xref);
+    let document = if streaming_output {
+        None
+    } else {
+        Some(LinearizedDocument {
             bytes: final_bytes,
-            offsets,
-        },
-        WriterResult::new(old_to_new, written_xref),
-    ))
+            offsets: offsets.clone(),
+        })
+    };
+    Ok(LinearizedWriteResult {
+        document,
+        writer_result,
+    })
 }
 
 // ---------------------------------------------------------------------------
@@ -4713,7 +4784,8 @@ mod tests {
             ..WriterOptions::default()
         };
         let setup = crate::writer::build_writer_setup(&mut pdf, &options).unwrap();
-        let error = write_linearized_for_pdf_writer(&mut pdf, &options, None, setup)
+        let mut bytes = Vec::new();
+        let error = write_linearized_for_pdf_writer(&mut pdf, &options, None, setup, &mut bytes)
             .expect_err("canonical progress reporter failure must abort writing");
         assert!(
             error.to_string().contains("test progress failure"),

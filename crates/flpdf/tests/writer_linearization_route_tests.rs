@@ -57,7 +57,7 @@ fn linearization_id_construction_is_handle_native() {
 
     let pass1 = source
         .split_once("fn linearization_pass1_id")
-        .and_then(|(_, rest)| rest.split_once("/// Overwrite every all-zero deterministic"))
+        .and_then(|(_, rest)| rest.split_once("/// Reserve the **first-page (Part-1)"))
         .map(|(function, _)| function)
         .expect("linearization pass-1 ID helper exists");
     assert!(pass1.contains("-> ObjectHandle"));
@@ -69,6 +69,18 @@ fn linearization_id_construction_is_handle_native() {
         .map(|(_, rest)| rest)
         .expect("linearization implementation exists");
     assert!(!implementation.contains("id_object_to_handle"));
+    assert!(
+        implementation.contains("FinalLinearizedLayout"),
+        "final linearization coordinates must be derived from pass-1 metadata"
+    );
+    assert!(
+        implementation.contains("final_source_trailer"),
+        "final IDs must be emitted through the final trailer view"
+    );
+    assert!(
+        !implementation.contains("patch_linearized_deterministic_id"),
+        "canonical final pass must not scan and patch an output buffer"
+    );
 }
 
 #[test]

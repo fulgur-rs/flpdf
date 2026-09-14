@@ -224,32 +224,6 @@ impl Write for WriterOutputSink<'_> {
 }
 
 impl WriterOutput {
-    fn write_complete(&mut self, bytes: Vec<u8>) -> Result<()> {
-        match self {
-            Self::Memory(buffer) => {
-                *buffer = Some(bytes);
-                Ok(())
-            }
-            Self::Writer { identifier, writer } => {
-                let mut written = writer.write_all(&bytes);
-                if written.is_ok() {
-                    written = writer.flush();
-                }
-                match written {
-                    Ok(()) => Ok(()),
-                    Err(error) => {
-                        Err(stdio_sink_failure(*identifier, &error).unwrap_or(Error::Io(error)))
-                    }
-                }
-            }
-            Self::Pipeline(pipeline) => {
-                pipeline.write(&bytes)?;
-                pipeline.finish()?;
-                Ok(())
-            }
-        }
-    }
-
     fn take_memory(&mut self) -> Result<Vec<u8>> {
         match self {
             Self::Memory(buffer) => buffer.take().ok_or_else(|| {
@@ -942,14 +916,21 @@ impl<'pdf, R: Read + Seek + 'static> PdfWriter<'pdf, R> {
         let result = if self.settings.linearization {
             options.qdf = false;
             let pass1_path = self.settings.linearization_pass1_filename.as_deref();
-            let (mut document, result) =
-                write_linearized_for_pdf_writer(self.pdf, &options, pass1_path, setup)?;
-            document.back_patch()?;
-            self.output
+            let output = self
+                .output
                 .as_mut()
-                .expect("output was checked before writing")
-                .write_complete(document.bytes)?;
-            result
+                .expect("output was checked before writing");
+            let mut target = WriterOutputSink::new(output);
+            match write_linearized_for_pdf_writer(
+                self.pdf,
+                &options,
+                pass1_path,
+                setup,
+                &mut target,
+            ) {
+                Ok(result) => result,
+                Err(error) => return Err(target.take_failure().unwrap_or(error)),
+            }
         } else {
             let output = self
                 .output
@@ -2902,34 +2883,6 @@ fn push_hex_lower(out: &mut Vec<u8>, bytes: &[u8]) {
     }
 }
 
-/// Byte length of the serialized deterministic `/ID` array `[<id0_hex><id1_hex>]`
-/// for an id0 of `id0_len` bytes: `[` + (`<` + 2*id0_len hex + `>`) + (`<` + 32 hex + `>`) + `]`.
-pub(crate) const fn deterministic_id_array_len(id0_len: usize) -> usize {
-    1 + (1 + 2 * id0_len + 1) + (1 + 32 + 1) + 1
-}
-/// Serialize a deterministic `/ID` array as the fixed-width hex form qpdf emits:
-/// `[<id0_hex><id1_hex>]`, with no inner spaces. The permanent identifier `id0`
-/// may be any length (qpdf preserves a source `/ID[0]` verbatim regardless of
-/// length); the changing identifier `id1` is always a 16-byte md5. The serialized
-/// length is [`deterministic_id_array_len`]`(id0.len())`. Building the bytes by
-/// hand (rather than via a generic value serializer) guarantees the hex form even when
-/// a digest happens to be all-printable, so the value is always the same fixed
-/// width regardless of its bytes. The classic linearized writer calls this
-/// directly to emit the final identifier at each `/ID` site in its last write
-/// pass (qpdf's 2-pass scheme); the ObjStm linearized writer uses it for both the
-/// all-zero placeholder and the patched-in final value, whose equal width leaves
-/// every later byte offset intact. (The flat write paths instead direct-write the
-/// final value via [`write_deterministic_id_inline`].)
-pub(crate) fn write_deterministic_id_array(out: &mut Vec<u8>, id0: &[u8], id1: &[u8; 16]) {
-    out.push(b'[');
-    for id in [id0, &id1[..]] {
-        out.push(b'<');
-        push_hex_lower(out, id);
-        out.push(b'>');
-    }
-    out.push(b']');
-}
-
 /// Extract the source trailer's non-empty `/ID[0]` through the live qpdf-shaped
 /// handle graph for writer paths whose caller has already crossed the
 /// `QPDF::getTrailer` boundary.
@@ -3084,7 +3037,7 @@ pub(crate) fn compute_deterministic_id_from_digest(
 /// replaces the placeholder-then-byte-search scheme on the flat write paths, so
 /// a crafted placeholder-shaped byte run elsewhere can never be mistaken for the
 /// real `/ID`. The emitted bytes are identical to
-/// [`write_deterministic_id_array`] for the same computed id.
+/// the same computed identifier.
 pub(crate) fn write_deterministic_id_inline(
     out: &mut OutputSink<'_>,
     info_suffix: &[u8],
