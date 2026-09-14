@@ -452,8 +452,9 @@ not name or array` まで一致することを確認済み。
 の spec 読み取りを C9 の `stream_filter.rs::decode_filter_specs_from_handle` が
 production 経路として別実装で持つ。C9 の consumer が C7 へ寄るまで `mixed` のまま。
 C10 の runtime `registerStreamFilter` 欠落は、`match` という入れ物だけでは説明できない
-public 契約の欠落。C21 の `/F` / `/FFilter` / `/FDecodeParms` 削除も現在
-`writer/plain/body.rs:861-865` に残る。C21 はこの診断分裂・責務混在により `mixed` へ訂正した（C7 は上記のとおり、診断分裂の解消後も C9 との責務重複で `mixed` を維持）。
+public 契約の欠落。C21 は `writer/object.rs::prepare_stream_dict_entries`（`crates/flpdf/src/writer/object.rs:1709-1712`）が
+`/F` / `/FFilter` / `/FDecodeParms` を全分岐で触らない契約を doc comment と
+`tests/oracle/qpdf_refiltered_stream_dictionary_probe.cc` で固定しており、`canonical`（C7 は上記のとおり、診断分裂の解消後も C9 との責務重複で `mixed` を維持）。
 C10のcanonicalはbuilt-in lookupに限定し、runtime登録の公開契約は別issueで移植する。
 
 ## unknown / probe

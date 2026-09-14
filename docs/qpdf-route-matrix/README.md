@@ -96,9 +96,10 @@ done | sort | uniq -c
 本表は「その責務に至る **経路が 1 本か**」を問う。✅ の行でも consumer 側に bridge が残っていれば
 本表では mixed / bridge になりうる。
 
-2026-09-14 の current-main audit anchor は `origin/main=42856189e7`、pinned qpdf は
+2026-09-14 の current-main audit anchor は `origin/main=3d01361f5`、pinned qpdf は
 11.9.0 commit `3b97c9bd266b7c32ea36d3536e22dab77412886d` である。checker の実測は
-1054 qpdf citations / 906 flpdf citations / 259 logical rows、分類は
+**この revision を適用した tree で** 1054 qpdf citations / 910 flpdf citations /
+259 logical rows、分類は
 canonical 121 / mixed 128 / bridge 10 / unknown 0。A〜E の160行だけを数える
 上の領域別集計は canonical 97 / mixed 61 / bridge 2 / unknown 0 なので、checker
 の259 logical rowsと混同しない。
@@ -596,7 +597,7 @@ primitive新設には既存consumerのRED、dead route削除には0 callerと移
 | **D27** pre-write reachability routes (完了) | 0 / 0 | **完了。** qpdf の `QPDFWriter::enqueueObject` / `enqueueObjectsStandard` を writer の emission boundary として採用し、single-source の旧 `sweep_unreachable_objects` と multi-source `--pages` の `_except` sweep をともに撤去した。single-source の qpdf-zlib byte gate と、multi-source の preserve control を維持する | A14（`.46` で完了）、D2/D3/D11（採番・body loop）は非対象 | **完了**（§7.3） |
 | A14 `Pdf::replace_object` → `ResolverHandle::replace_object` | 0 / 0 | **完了。** qpdf の public deletion 相当 `replaceObject(og, newNull())` に route を統合し、signature value stripping は eager deletion を行わず writer の到達性に委ねる。`--remove-restrictions --preserve-unreferenced` の qpdf byte compare も GREEN | A2 / A15 / A24 / A13（legacy cache/tombstone は別 slice） | `.46` で `Pdf::delete_object` と全 production/test caller を撤去した |
 | B14 `crates/flpdf/src/xref.rs::parse_xref_from_start` | 3 / 6 | **観測できず。** `probe:` 自分の startxref を指す `/Prev` を持つ 1 section PDF で `qpdf --check` / `flpdf --check` → 双方とも `file is damaged` / `loop detected following xref tables` / `Attempting to reconstruct cross-reference table` の 3 行・同順・exit 3。B14 が予測する診断の二重 push は現れない | なし（単一ファイル `crates/flpdf/src/xref.rs`） | 保留。RED が立たない。B-P1 は「二重 push は起きない」で決着させ、行の主張を弱める（§7.4 の後続 issue） |
-| C22 `crates/flpdf/src/writer/plain/body.rs::canonical_stream_filter_probe` | 初回2 / 0 | **観測できず（CLI 経路では）。** `probe: qpdf --static-id --normalize-content=y [--linearize] two.pdf` と flpdf 同等 → plain / `--linearize` の双方で byte 一致。早期 return を踏むには token filter 登録が要り、それは CLI から到達しない（C-U3 は library harness を要求する） | C20 canonical / C21 mixed（判定順序と責務境界を保つ） | 保留。harness を先に作る（§7.2 stream family の3） |
+| C22 `crates/flpdf/src/writer/plain/body.rs::canonical_stream_filter_probe` | 初回2 / 0 | **観測できず（CLI 経路では）。** `probe: qpdf --static-id --normalize-content=y [--linearize] two.pdf` と flpdf 同等 → plain / `--linearize` の双方で byte 一致。早期 return を踏むには token filter 登録が要り、それは CLI から到達しない（C-U3 は library harness を要求する） | C20 canonical / C21 canonical（判定順序と責務境界を保つ） | 保留。harness を先に作る（§7.2 stream family の3） |
 | D3 `crates/flpdf/src/writer/rewrite_renumber.rs::CanonicalCatalogFirstRenumber` | 初回5 / 0 | `flpdf-hi08` / PR #1486のencrypted Preserve修正はmerge済み。残る先行walkとemission統合は別責務 | D2 / D5 / D6 / D11 / D12 | 初回は保留。現在はD12共有primitive等を独立sliceにできる（§7.2.5） |
 
 E-29 は `.47` で完了したため候補表から除外した。`--no-warn` の open-time delivery は
