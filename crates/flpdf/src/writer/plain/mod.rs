@@ -136,7 +136,9 @@ fn write_plain_live<R: Read + Seek>(
         .map(|(&source, &output)| (source, output))
         .collect();
     for ignored in body.ignored_refs {
-        trailer_map.insert(ignored, ObjectRef::new(0, 0));
+        if let Some(ignored) = ignored.to_object_ref() {
+            trailer_map.insert(ignored, ObjectRef::new(0, 0));
+        }
     }
     let source_id0 = plan::live_source_id0(pdf)?;
     // qpdf reads a non-deterministic ID at writeTrailer time. Reuse the

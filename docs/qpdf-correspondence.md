@@ -877,6 +877,22 @@ object/stream dictionary emission で surviving indirect child を発見し、�
 保持し、`EmissionQueue::enqueue_handle` が body emission 中に child を発見する。したがって
 順序・採番は事前の完全 child prewalk ではなく first-seen live emission に従う。
 
+### Writer raw ObjGen renumber boundary (`flpdf-kod35`, 2026-09-14)
+
+qpdf's `QPDFWriter::enqueueObject` and `unparseChild` key the writer-owned
+`obj_renumber` table by the complete `QPDFObjGen`, including generations that
+are valid in an object header but cannot be written as a parsed `N G R`
+projection (`libqpdf/QPDFWriter.cc:1072-1157`). flpdf's `LiveQueue` therefore
+keeps `raw_old_to_new: BTreeMap<QpdfObjGen, ObjectRef>` alongside the public
+projection map, and the live static/dynamic child serializers consult the raw
+identity before deciding whether to recurse. The `ObjectRef` callbacks remain
+legacy adapters for projection-only callers; they convert at the writer
+boundary and never manufacture an `ObjectRef` for an out-of-range generation.
+`WriteObject` also receives the raw identity, preserving QDF original-object
+comments and top-level output lookup for the same handles. The regression is
+covered by `qpdf_obj_gen_header_tests.rs` for compact, QDF, and encrypted-QDF
+output.
+
 PCLm は `doWriteSetup` が強制する decode-none、uncompressed、unencrypted policy
 （`QPDFWriter.cc:2068-2096`）の後にも、通常 writer と同じ `willFilterStream` policy を通す。
 flpdf の `canonical_stream_output_for_rewrite` は data-modified、filter-on-write、metadata

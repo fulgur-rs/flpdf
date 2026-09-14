@@ -3,6 +3,7 @@
 use crate::encryption::standard::{encrypt_cipher_bytes, ObjectKeyAlg, StringEncryptCipher};
 use crate::object_handle::ObjectHandle;
 use crate::pdf_syntax::{write_hex_string, write_name_escaped, write_string_value};
+use crate::qpdf_obj_gen::QpdfObjGen;
 use crate::writer::encryption_state::WriterEncryptionState;
 use crate::writer::output::OutputSink;
 use crate::writer::{
@@ -119,6 +120,50 @@ impl EncryptedStringEmitter {
             })
     }
 
+    /// QDF object emission variant keyed by qpdf's complete raw source
+    /// identity. The ordinary `ObjectRef` sibling remains available for
+    /// callers whose source graph is already inside the `N G R` projection;
+    /// QDF live emission must use this route so out-of-range generations are
+    /// still references rather than inlined values.
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) fn write_handle_object_with_qpdf_obj_gen_map(
+        &mut self,
+        out: &mut OutputSink<'_>,
+        emitted_ref: ObjectRef,
+        object_stream_index: Option<u32>,
+        object: &ObjectHandle,
+        map: &dyn Fn(QpdfObjGen) -> crate::Result<ObjectRef>,
+        removed_refs: &std::collections::BTreeSet<QpdfObjGen>,
+    ) -> crate::Result<()> {
+        if emitted_ref == self.encrypt_ref {
+            return write_encryption_dictionary_handle(out, object); // cov:ignore: the canonical body emits /Encrypt through its dedicated unencrypted dictionary path
+        }
+
+        let cipher = self.cipher;
+        let static_aes_iv = self.static_aes_iv;
+        let aes_iv_generator = self.aes_iv_generator.as_mut();
+        self.state
+            .with_object_data_key(emitted_ref.number, object_stream_index, |state| {
+                let mut write_string = |out: &mut OutputSink<'_>, plaintext: &[u8]| {
+                    write_encrypted_or_plain_string(
+                        state,
+                        cipher,
+                        static_aes_iv,
+                        aes_iv_generator,
+                        out,
+                        plaintext,
+                    )
+                };
+                object.write_object_qdf_with_qpdf_obj_gen_map_and_removed_with_string_writer(
+                    out,
+                    0,
+                    map,
+                    removed_refs,
+                    &mut write_string,
+                )
+            })
+    }
+
     /// Standard-writer dynamic object emission with the current object's
     /// encryption key and qpdf's direct-stream framing boundary.
     #[allow(clippy::too_many_arguments, clippy::type_complexity)]
@@ -167,6 +212,7 @@ impl EncryptedStringEmitter {
     /// deliberately handled by the content-container helper's raw-stream
     /// route; only dictionary strings use this callback, matching the legacy
     /// direct-stream writer's encryption boundary.
+    #[allow(dead_code)] // legacy ObjectRef adapter remains covered by serializer tests
     #[allow(clippy::too_many_arguments)]
     pub(crate) fn write_handle_content_container_with_ref_map(
         &mut self,
@@ -198,6 +244,51 @@ impl EncryptedStringEmitter {
                     )
                 };
                 crate::writer::plain::body::emit_content_container_from_handle_with_ref_map_and_string_writer(
+                    object,
+                    options,
+                    out,
+                    map,
+                    removed_refs,
+                    &mut write_string,
+                )
+            })
+    }
+
+    /// Content-container emission keyed by qpdf's raw source identity. This
+    /// is the live QDF/compact counterpart of the legacy `ObjectRef` wrapper;
+    /// direct stream framing and string encryption remain at the same writer
+    /// boundary.
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) fn write_handle_content_container_with_qpdf_obj_gen_map(
+        &mut self,
+        out: &mut OutputSink<'_>,
+        emitted_ref: ObjectRef,
+        object_stream_index: Option<u32>,
+        object: &ObjectHandle,
+        options: &WriterOptions,
+        map: &dyn Fn(QpdfObjGen) -> crate::Result<ObjectRef>,
+        removed_refs: &std::collections::BTreeSet<QpdfObjGen>,
+    ) -> crate::Result<()> {
+        if emitted_ref == self.encrypt_ref {
+            return write_encryption_dictionary_handle(out, object); // cov:ignore: the pre-scanned page-content container cannot be the /Encrypt object
+        }
+
+        let cipher = self.cipher;
+        let static_aes_iv = self.static_aes_iv;
+        let aes_iv_generator = self.aes_iv_generator.as_mut();
+        self.state
+            .with_object_data_key(emitted_ref.number, object_stream_index, |state| {
+                let mut write_string = |out: &mut OutputSink<'_>, plaintext: &[u8]| {
+                    write_encrypted_or_plain_string(
+                        state,
+                        cipher,
+                        static_aes_iv,
+                        aes_iv_generator,
+                        out,
+                        plaintext,
+                    )
+                };
+                crate::writer::plain::body::emit_content_container_from_handle_with_qpdf_obj_gen_map_and_string_writer(
                     object,
                     options,
                     out,
@@ -270,6 +361,77 @@ impl EncryptedStringEmitter {
                     )
                 } else {
                     dict.write_stream_body_with_ref_map_and_removed_with_options_and_string_writer(
+                        out,
+                        options.dictionary,
+                        map,
+                        removed_refs,
+                        &mut write_string,
+                    )
+                }
+            })
+    }
+
+    /// QDF stream-dictionary emission keyed by qpdf's raw object identity.
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) fn write_handle_stream_dict_with_qpdf_obj_gen_map(
+        &mut self,
+        out: &mut OutputSink<'_>,
+        emitted_ref: ObjectRef,
+        object_stream_index: Option<u32>,
+        dict: &ObjectHandle,
+        options: StreamDictOptions,
+        map: &dyn Fn(QpdfObjGen) -> crate::Result<ObjectRef>,
+        removed_refs: &std::collections::BTreeSet<QpdfObjGen>,
+        length_ref: Option<ObjectRef>,
+    ) -> crate::Result<()> {
+        if options.qdf && !options.encrypt_strings {
+            return dict
+                .write_stream_body_qdf_with_qpdf_obj_gen_map_and_removed_and_length_with_options(
+                    out,
+                    0,
+                    map,
+                    removed_refs,
+                    length_ref,
+                    options.dictionary,
+                );
+        }
+
+        if !options.qdf && !options.encrypt_strings {
+            return dict.write_stream_body_with_qpdf_obj_gen_map_and_removed_with_options(
+                out,
+                options.dictionary,
+                map,
+                removed_refs,
+            );
+        }
+
+        let cipher = self.cipher;
+        let static_aes_iv = self.static_aes_iv;
+        let aes_iv_generator = self.aes_iv_generator.as_mut();
+        self.state
+            .with_object_data_key(emitted_ref.number, object_stream_index, |state| {
+                let mut write_string = |out: &mut OutputSink<'_>, plaintext: &[u8]| {
+                    write_encrypted_or_plain_string(
+                        state,
+                        cipher,
+                        static_aes_iv,
+                        aes_iv_generator,
+                        out,
+                        plaintext,
+                    )
+                };
+                if options.qdf {
+                    dict.write_stream_body_qdf_with_qpdf_obj_gen_map_and_removed_and_length_with_string_writer_with_options(
+                        out,
+                        0,
+                        map,
+                        removed_refs,
+                        length_ref,
+                        options.dictionary,
+                        &mut write_string,
+                    )
+                } else {
+                    dict.write_stream_body_with_qpdf_obj_gen_map_and_removed_with_options_and_string_writer(
                         out,
                         options.dictionary,
                         map,
@@ -430,13 +592,19 @@ mod tests {
         );
         let mut output = Vec::new();
         crate::writer::output::with_buffer_sink(&mut output, |out| {
-            emitter.write_handle_stream_dict_with_ref_map(
+            emitter.write_handle_stream_dict_with_qpdf_obj_gen_map(
                 out,
                 ObjectRef::new(3, 0),
                 None,
                 &dict,
                 StreamDictOptions::new(true, StreamDictionaryOptions::new(true, true), false),
-                &|object_ref| Ok(object_ref), // cov:ignore: identity reference map callback is a test-only no-op closure; the writer branch is covered below
+                // cov:ignore-start: the direct test stream dictionary has no indirect child, so this callback is not invoked.
+                &|object_gen| {
+                    Ok(object_gen
+                        .to_object_ref()
+                        .expect("direct test dictionary has no raw child"))
+                },
+                // cov:ignore-end
                 &BTreeSet::new(),
                 None,
             )

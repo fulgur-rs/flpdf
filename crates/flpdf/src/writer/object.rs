@@ -9,6 +9,7 @@
 
 use super::output::OutputSink;
 use crate::object_handle::{ObjectHandle, ObjectValue};
+use crate::qpdf_obj_gen::QpdfObjGen;
 use crate::{Error, ObjectRef, Result};
 use std::collections::BTreeSet;
 
@@ -77,6 +78,13 @@ pub(crate) trait ObjectWriterEmission {
         indent: usize,
         map: &dyn Fn(ObjectRef) -> Result<ObjectRef>,
         removed_refs: &BTreeSet<ObjectRef>,
+    ) -> Result<()>;
+    fn write_object_qdf_with_qpdf_obj_gen_map_and_removed(
+        &self,
+        out: &mut OutputSink<'_>,
+        indent: usize,
+        map: &dyn Fn(QpdfObjGen) -> Result<ObjectRef>,
+        removed_refs: &BTreeSet<QpdfObjGen>,
     ) -> Result<()>;
     #[cfg(test)]
     fn write_object_qdf_with_string_writer<F>(
@@ -188,12 +196,31 @@ pub(crate) trait ObjectWriterEmission {
     ) -> Result<()>
     where
         F: FnMut(&mut OutputSink<'_>, &[u8]) -> Result<()>;
+    fn write_object_with_qpdf_obj_gen_map_and_removed_with_string_writer<F>(
+        &self,
+        out: &mut OutputSink<'_>,
+        map: &dyn Fn(QpdfObjGen) -> Result<ObjectRef>,
+        removed_refs: &BTreeSet<QpdfObjGen>,
+        write_string: &mut F,
+    ) -> Result<()>
+    where
+        F: FnMut(&mut OutputSink<'_>, &[u8]) -> Result<()>;
     fn write_object_qdf_with_ref_map_and_removed_with_string_writer<F>(
         &self,
         out: &mut OutputSink<'_>,
         indent: usize,
         map: &dyn Fn(ObjectRef) -> Result<ObjectRef>,
         removed_refs: &BTreeSet<ObjectRef>,
+        write_string: &mut F,
+    ) -> Result<()>
+    where
+        F: FnMut(&mut OutputSink<'_>, &[u8]) -> Result<()>;
+    fn write_object_qdf_with_qpdf_obj_gen_map_and_removed_with_string_writer<F>(
+        &self,
+        out: &mut OutputSink<'_>,
+        indent: usize,
+        map: &dyn Fn(QpdfObjGen) -> Result<ObjectRef>,
+        removed_refs: &BTreeSet<QpdfObjGen>,
         write_string: &mut F,
     ) -> Result<()>
     where
@@ -229,6 +256,15 @@ pub(crate) trait ObjectWriterEmission {
         length_ref: Option<ObjectRef>,
         options: StreamDictionaryOptions,
     ) -> Result<()>;
+    fn write_stream_body_qdf_with_qpdf_obj_gen_map_and_removed_and_length_with_options(
+        &self,
+        out: &mut OutputSink<'_>,
+        indent: usize,
+        map: &dyn Fn(QpdfObjGen) -> Result<ObjectRef>,
+        removed_refs: &BTreeSet<QpdfObjGen>,
+        length_ref: Option<ObjectRef>,
+        options: StreamDictionaryOptions,
+    ) -> Result<()>;
     #[cfg(test)]
     fn write_stream_body_qdf_with_ref_map_and_removed_and_length_with_string_writer<F>(
         &self,
@@ -237,6 +273,21 @@ pub(crate) trait ObjectWriterEmission {
         map: &dyn Fn(ObjectRef) -> Result<ObjectRef>,
         removed_refs: &BTreeSet<ObjectRef>,
         length_ref: Option<ObjectRef>,
+        write_string: &mut F,
+    ) -> Result<()>
+    where
+        F: FnMut(&mut OutputSink<'_>, &[u8]) -> Result<()>;
+    #[allow(clippy::too_many_arguments)]
+    fn write_stream_body_qdf_with_qpdf_obj_gen_map_and_removed_and_length_with_string_writer_with_options<
+        F,
+    >(
+        &self,
+        out: &mut OutputSink<'_>,
+        indent: usize,
+        map: &dyn Fn(QpdfObjGen) -> Result<ObjectRef>,
+        removed_refs: &BTreeSet<QpdfObjGen>,
+        length_ref: Option<ObjectRef>,
+        options: StreamDictionaryOptions,
         write_string: &mut F,
     ) -> Result<()>
     where
@@ -280,6 +331,13 @@ pub(crate) trait ObjectWriterEmission {
         map: &dyn Fn(ObjectRef) -> Result<ObjectRef>,
         removed_refs: &BTreeSet<ObjectRef>,
     ) -> Result<()>;
+    fn write_stream_body_with_qpdf_obj_gen_map_and_removed_with_options(
+        &self,
+        out: &mut OutputSink<'_>,
+        options: StreamDictionaryOptions,
+        map: &dyn Fn(QpdfObjGen) -> Result<ObjectRef>,
+        removed_refs: &BTreeSet<QpdfObjGen>,
+    ) -> Result<()>;
     /// Stream-dictionary emission with a direct output `/Length` override.
     /// The source handle remains unchanged; this mirrors qpdf's stream writer,
     /// which computes the emitted length from the bytes supplied to its pipe.
@@ -318,6 +376,16 @@ pub(crate) trait ObjectWriterEmission {
         options: StreamDictionaryOptions,
         map: &dyn Fn(ObjectRef) -> Result<ObjectRef>,
         removed_refs: &BTreeSet<ObjectRef>,
+        write_string: &mut F,
+    ) -> Result<()>
+    where
+        F: FnMut(&mut OutputSink<'_>, &[u8]) -> Result<()>;
+    fn write_stream_body_with_qpdf_obj_gen_map_and_removed_with_options_and_string_writer<F>(
+        &self,
+        out: &mut OutputSink<'_>,
+        options: StreamDictionaryOptions,
+        map: &dyn Fn(QpdfObjGen) -> Result<ObjectRef>,
+        removed_refs: &BTreeSet<QpdfObjGen>,
         write_string: &mut F,
     ) -> Result<()>
     where
@@ -833,6 +901,18 @@ impl ObjectWriterEmission for ObjectHandle {
         map: &dyn Fn(ObjectRef) -> Result<ObjectRef>,
         removed_refs: &BTreeSet<ObjectRef>,
     ) -> Result<()> {
+        let map = qpdf_obj_gen_map_from_object_ref_map(map);
+        let removed_refs = qpdf_obj_gen_set_from_object_ref_set(removed_refs)?;
+        unparse_object_walk_qdf_with_ref_map(self, indent, out, &map, &removed_refs)
+    }
+
+    fn write_object_qdf_with_qpdf_obj_gen_map_and_removed(
+        &self,
+        out: &mut OutputSink<'_>,
+        indent: usize,
+        map: &dyn Fn(QpdfObjGen) -> Result<ObjectRef>,
+        removed_refs: &BTreeSet<QpdfObjGen>,
+    ) -> Result<()> {
         unparse_object_walk_qdf_with_ref_map(self, indent, out, map, removed_refs)
     }
 
@@ -862,7 +942,9 @@ impl ObjectWriterEmission for ObjectHandle {
         map: &dyn Fn(ObjectRef) -> Result<ObjectRef>,
         removed_refs: &BTreeSet<ObjectRef>,
     ) -> Result<()> {
-        unparse_object_walk_with_ref_map(self, out, map, removed_refs)
+        let map = qpdf_obj_gen_map_from_object_ref_map(map);
+        let removed_refs = qpdf_obj_gen_set_from_object_ref_set(removed_refs)?;
+        unparse_object_walk_with_ref_map(self, out, &map, &removed_refs)
     }
 
     /// Emit the root through qpdf's output-only `unparseObject` mutation.
@@ -888,7 +970,9 @@ impl ObjectWriterEmission for ObjectHandle {
             final_extension_level,
             apply_adbe_reconciliation,
         )?; // cov:ignore: LLVM attributes this fallible root-copy call terminator to an uncovered continuation; the helper's success and error paths are covered by the root emission tests.
-        unparse_object_walk_with_ref_map(&root, out, map, removed_refs)
+        let map = qpdf_obj_gen_map_from_object_ref_map(map);
+        let removed_refs = qpdf_obj_gen_set_from_object_ref_set(removed_refs)?;
+        unparse_object_walk_with_ref_map(&root, out, &map, &removed_refs)
     }
 
     fn write_object_with_dynamic_ref_map(
@@ -984,6 +1068,27 @@ impl ObjectWriterEmission for ObjectHandle {
     where
         F: FnMut(&mut OutputSink<'_>, &[u8]) -> Result<()>,
     {
+        let map = qpdf_obj_gen_map_from_object_ref_map(map);
+        let removed_refs = qpdf_obj_gen_set_from_object_ref_set(removed_refs)?;
+        unparse_object_walk_with_ref_map_and_string_writer(
+            self,
+            out,
+            &map,
+            &removed_refs,
+            write_string,
+        )
+    }
+
+    fn write_object_with_qpdf_obj_gen_map_and_removed_with_string_writer<F>(
+        &self,
+        out: &mut OutputSink<'_>,
+        map: &dyn Fn(QpdfObjGen) -> Result<ObjectRef>,
+        removed_refs: &BTreeSet<QpdfObjGen>,
+        write_string: &mut F,
+    ) -> Result<()>
+    where
+        F: FnMut(&mut OutputSink<'_>, &[u8]) -> Result<()>,
+    {
         unparse_object_walk_with_ref_map_and_string_writer(
             self,
             out,
@@ -1001,6 +1106,29 @@ impl ObjectWriterEmission for ObjectHandle {
         indent: usize,
         map: &dyn Fn(ObjectRef) -> Result<ObjectRef>,
         removed_refs: &BTreeSet<ObjectRef>,
+        write_string: &mut F,
+    ) -> Result<()>
+    where
+        F: FnMut(&mut OutputSink<'_>, &[u8]) -> Result<()>,
+    {
+        let map = qpdf_obj_gen_map_from_object_ref_map(map);
+        let removed_refs = qpdf_obj_gen_set_from_object_ref_set(removed_refs)?;
+        unparse_object_walk_qdf_with_ref_map_and_string_writer(
+            self,
+            indent,
+            out,
+            &map,
+            &removed_refs,
+            write_string,
+        )
+    }
+
+    fn write_object_qdf_with_qpdf_obj_gen_map_and_removed_with_string_writer<F>(
+        &self,
+        out: &mut OutputSink<'_>,
+        indent: usize,
+        map: &dyn Fn(QpdfObjGen) -> Result<ObjectRef>,
+        removed_refs: &BTreeSet<QpdfObjGen>,
         write_string: &mut F,
     ) -> Result<()>
     where
@@ -1193,6 +1321,32 @@ impl ObjectWriterEmission for ObjectHandle {
             return Err(reserved_unparse_error());
         }
         let entries = stream_dictionary_entries_for_emission(self)?;
+        let map = qpdf_obj_gen_map_from_object_ref_map(map);
+        let removed_refs = qpdf_obj_gen_set_from_object_ref_set(removed_refs)?;
+        unparse_stream_dict_entries_qdf_with_ref_map(
+            &entries,
+            indent,
+            out,
+            &map,
+            &removed_refs,
+            length_ref,
+            options,
+        )
+    }
+
+    fn write_stream_body_qdf_with_qpdf_obj_gen_map_and_removed_and_length_with_options(
+        &self,
+        out: &mut OutputSink<'_>,
+        indent: usize,
+        map: &dyn Fn(QpdfObjGen) -> Result<ObjectRef>,
+        removed_refs: &BTreeSet<QpdfObjGen>,
+        length_ref: Option<ObjectRef>,
+        options: StreamDictionaryOptions,
+    ) -> Result<()> {
+        if self.is_reserved() {
+            return Err(reserved_unparse_error());
+        }
+        let entries = stream_dictionary_entries_for_emission(self)?;
         unparse_stream_dict_entries_qdf_with_ref_map(
             &entries,
             indent,
@@ -1239,6 +1393,39 @@ impl ObjectWriterEmission for ObjectHandle {
         indent: usize,
         map: &dyn Fn(ObjectRef) -> Result<ObjectRef>,
         removed_refs: &BTreeSet<ObjectRef>,
+        length_ref: Option<ObjectRef>,
+        options: StreamDictionaryOptions,
+        write_string: &mut F,
+    ) -> Result<()>
+    where
+        F: FnMut(&mut OutputSink<'_>, &[u8]) -> Result<()>,
+    {
+        if self.is_reserved() {
+            return Err(reserved_unparse_error());
+        }
+        let entries = stream_dictionary_entries_for_emission(self)?;
+        let map = qpdf_obj_gen_map_from_object_ref_map(map);
+        let removed_refs = qpdf_obj_gen_set_from_object_ref_set(removed_refs)?;
+        unparse_stream_dict_entries_qdf_with_ref_map_and_string_writer(
+            &entries,
+            indent,
+            out,
+            &map,
+            &removed_refs,
+            length_ref,
+            options,
+            write_string,
+        )
+    }
+
+    fn write_stream_body_qdf_with_qpdf_obj_gen_map_and_removed_and_length_with_string_writer_with_options<
+        F,
+    >(
+        &self,
+        out: &mut OutputSink<'_>,
+        indent: usize,
+        map: &dyn Fn(QpdfObjGen) -> Result<ObjectRef>,
+        removed_refs: &BTreeSet<QpdfObjGen>,
         length_ref: Option<ObjectRef>,
         options: StreamDictionaryOptions,
         write_string: &mut F,
@@ -1332,6 +1519,22 @@ impl ObjectWriterEmission for ObjectHandle {
             return Err(reserved_unparse_error());
         }
         let entries = stream_dictionary_entries_for_emission(self)?;
+        let map = qpdf_obj_gen_map_from_object_ref_map(map);
+        let removed_refs = qpdf_obj_gen_set_from_object_ref_set(removed_refs)?;
+        unparse_stream_dict_entries_with_ref_map(&entries, options, out, &map, &removed_refs)
+    }
+
+    fn write_stream_body_with_qpdf_obj_gen_map_and_removed_with_options(
+        &self,
+        out: &mut OutputSink<'_>,
+        options: StreamDictionaryOptions,
+        map: &dyn Fn(QpdfObjGen) -> Result<ObjectRef>,
+        removed_refs: &BTreeSet<QpdfObjGen>,
+    ) -> Result<()> {
+        if self.is_reserved() {
+            return Err(reserved_unparse_error());
+        }
+        let entries = stream_dictionary_entries_for_emission(self)?;
         unparse_stream_dict_entries_with_ref_map(&entries, options, out, map, removed_refs)
     }
 
@@ -1366,12 +1569,14 @@ impl ObjectWriterEmission for ObjectHandle {
             return Err(reserved_unparse_error());
         }
         let entries = stream_dictionary_entries_for_emission(self)?;
+        let map = qpdf_obj_gen_map_from_object_ref_map(map);
+        let removed_refs = qpdf_obj_gen_set_from_object_ref_set(removed_refs)?;
         unparse_stream_dict_entries_with_ref_map_and_length(
             &entries,
             options,
             out,
-            map,
-            removed_refs,
+            &map,
+            &removed_refs,
             Some(length),
         )
     }
@@ -1405,6 +1610,33 @@ impl ObjectWriterEmission for ObjectHandle {
         options: StreamDictionaryOptions,
         map: &dyn Fn(ObjectRef) -> Result<ObjectRef>,
         removed_refs: &BTreeSet<ObjectRef>,
+        write_string: &mut F,
+    ) -> Result<()>
+    where
+        F: FnMut(&mut OutputSink<'_>, &[u8]) -> Result<()>,
+    {
+        if self.is_reserved() {
+            return Err(reserved_unparse_error());
+        }
+        let entries = stream_dictionary_entries_for_emission(self)?;
+        let map = qpdf_obj_gen_map_from_object_ref_map(map);
+        let removed_refs = qpdf_obj_gen_set_from_object_ref_set(removed_refs)?;
+        unparse_stream_dict_entries_with_ref_map_and_string_writer(
+            &entries,
+            options,
+            out,
+            &map,
+            &removed_refs,
+            write_string,
+        )
+    }
+
+    fn write_stream_body_with_qpdf_obj_gen_map_and_removed_with_options_and_string_writer<F>(
+        &self,
+        out: &mut OutputSink<'_>,
+        options: StreamDictionaryOptions,
+        map: &dyn Fn(QpdfObjGen) -> Result<ObjectRef>,
+        removed_refs: &BTreeSet<QpdfObjGen>,
         write_string: &mut F,
     ) -> Result<()>
     where
@@ -1655,7 +1887,9 @@ impl ObjectWriterEmission for ObjectHandle {
         map: &dyn Fn(ObjectRef) -> Result<ObjectRef>,
         removed_refs: &BTreeSet<ObjectRef>,
     ) -> Result<()> {
-        write_id_style_value_handle_with_ref_map(self, out, map, removed_refs)
+        let map = qpdf_obj_gen_map_from_object_ref_map(map);
+        let removed_refs = qpdf_obj_gen_set_from_object_ref_set(removed_refs)?;
+        write_id_style_value_handle_with_ref_map(self, out, &map, &removed_refs)
     }
 }
 
@@ -2018,8 +2252,8 @@ fn unparse_stream_dict_entries_qdf_with_ref_map(
     entries: &[(Vec<u8>, ObjectHandle)],
     indent: usize,
     out: &mut OutputSink<'_>,
-    map: &ObjectRefMap<'_>,
-    removed_refs: &BTreeSet<ObjectRef>,
+    map: &QpdfObjGenMap<'_>,
+    removed_refs: &BTreeSet<QpdfObjGen>,
     length_ref: Option<ObjectRef>,
     options: StreamDictionaryOptions,
 ) -> Result<()> {
@@ -2027,7 +2261,10 @@ fn unparse_stream_dict_entries_qdf_with_ref_map(
     out.write_bytes(b"<<\n")?;
     let mut length_value: Option<&ObjectHandle> = None;
     for (key, value) in visible_dict_entries(&entries)? {
-        if is_removed_reference(value, removed_refs) {
+        if value
+            .qpdf_obj_gen()
+            .is_some_and(|object_gen| removed_refs.contains(&object_gen))
+        {
             continue;
         }
         if key.as_slice() == b"/Length" {
@@ -2069,8 +2306,8 @@ fn unparse_stream_dict_entries_qdf_with_ref_map_and_string_writer<F>(
     entries: &[(Vec<u8>, ObjectHandle)],
     indent: usize,
     out: &mut OutputSink<'_>,
-    map: &ObjectRefMap<'_>,
-    removed_refs: &BTreeSet<ObjectRef>,
+    map: &QpdfObjGenMap<'_>,
+    removed_refs: &BTreeSet<QpdfObjGen>,
     length_ref: Option<ObjectRef>,
     options: StreamDictionaryOptions,
     write_string: &mut F,
@@ -2082,7 +2319,10 @@ where
     out.write_bytes(b"<<\n")?;
     let mut length_value: Option<&ObjectHandle> = None;
     for (key, value) in visible_dict_entries(&entries)? {
-        if is_removed_reference(value, removed_refs) {
+        if value
+            .qpdf_obj_gen()
+            .is_some_and(|object_gen| removed_refs.contains(&object_gen))
+        {
             continue;
         }
         if key.as_slice() == b"/Length" {
@@ -2220,8 +2460,8 @@ fn unparse_stream_dict_entries_with_ref_map(
     entries: &[(Vec<u8>, ObjectHandle)],
     options: StreamDictionaryOptions,
     out: &mut OutputSink<'_>,
-    map: &ObjectRefMap<'_>,
-    removed_refs: &BTreeSet<ObjectRef>,
+    map: &QpdfObjGenMap<'_>,
+    removed_refs: &BTreeSet<QpdfObjGen>,
 ) -> Result<()> {
     unparse_stream_dict_entries_with_ref_map_and_length(
         entries,
@@ -2237,15 +2477,18 @@ fn unparse_stream_dict_entries_with_ref_map_and_length(
     entries: &[(Vec<u8>, ObjectHandle)],
     options: StreamDictionaryOptions,
     out: &mut OutputSink<'_>,
-    map: &ObjectRefMap<'_>,
-    removed_refs: &BTreeSet<ObjectRef>,
+    map: &QpdfObjGenMap<'_>,
+    removed_refs: &BTreeSet<QpdfObjGen>,
     length_override: Option<usize>,
 ) -> Result<()> {
     let entries = prepare_stream_dict_entries(entries, options)?;
     out.write_bytes(b"<<")?;
     let mut length_value: Option<&ObjectHandle> = None;
     for (key, value) in visible_dict_entries(&entries)? {
-        if is_removed_reference(value, removed_refs) {
+        if value
+            .qpdf_obj_gen()
+            .is_some_and(|object_gen| removed_refs.contains(&object_gen))
+        {
             continue;
         }
         if key.as_slice() == b"/Length" {
@@ -2279,8 +2522,8 @@ fn unparse_stream_dict_entries_with_ref_map_and_string_writer<F>(
     entries: &[(Vec<u8>, ObjectHandle)],
     options: StreamDictionaryOptions,
     out: &mut OutputSink<'_>,
-    map: &ObjectRefMap<'_>,
-    removed_refs: &BTreeSet<ObjectRef>,
+    map: &QpdfObjGenMap<'_>,
+    removed_refs: &BTreeSet<QpdfObjGen>,
     write_string: &mut F,
 ) -> Result<()>
 where
@@ -2290,7 +2533,10 @@ where
     out.write_bytes(b"<<")?;
     let mut length_value: Option<&ObjectHandle> = None;
     for (key, value) in visible_dict_entries(&entries)? {
-        if is_removed_reference(value, removed_refs) {
+        if value
+            .qpdf_obj_gen()
+            .is_some_and(|object_gen| removed_refs.contains(&object_gen))
+        {
             continue;
         }
         if key.as_slice() == b"/Length" {
@@ -2626,7 +2872,32 @@ pub(crate) fn unparse_object_value(value: &ObjectValue, out: &mut OutputSink<'_>
     Ok(())
 }
 
-type ObjectRefMap<'a> = dyn Fn(ObjectRef) -> Result<ObjectRef> + 'a;
+type QpdfObjGenMap<'a> = dyn Fn(QpdfObjGen) -> Result<ObjectRef> + 'a;
+
+pub(crate) fn qpdf_obj_gen_map_from_object_ref_map<'a>(
+    map: &'a dyn Fn(ObjectRef) -> Result<ObjectRef>,
+) -> impl Fn(QpdfObjGen) -> Result<ObjectRef> + 'a {
+    move |object_gen| {
+        let object_ref = object_gen.to_object_ref().ok_or_else(|| {
+            Error::Unsupported(format!(
+                "qpdf raw object identity {} {} cannot be used by an ObjectRef map",
+                object_gen.get_obj(),
+                object_gen.get_gen()
+            ))
+        })?;
+        map(object_ref)
+    }
+}
+
+pub(crate) fn qpdf_obj_gen_set_from_object_ref_set(
+    object_refs: &BTreeSet<ObjectRef>,
+) -> Result<BTreeSet<QpdfObjGen>> {
+    object_refs
+        .iter()
+        .copied()
+        .map(QpdfObjGen::try_from_object_ref)
+        .collect()
+}
 
 // Ref-map sibling of `write_child` above -- same reference-vs-recurse split
 // on `handle.object_ref()` alone, so the same reasoning applies: an
@@ -2643,18 +2914,18 @@ type ObjectRefMap<'a> = dyn Fn(ObjectRef) -> Result<ObjectRef> + 'a;
 fn write_child_with_ref_map(
     handle: &ObjectHandle,
     out: &mut OutputSink<'_>,
-    map: &ObjectRefMap<'_>,
-    removed_refs: &BTreeSet<ObjectRef>,
+    map: &QpdfObjGenMap<'_>,
+    removed_refs: &BTreeSet<QpdfObjGen>,
 ) -> Result<()> {
-    if let Some(object_ref) = handle.object_ref() {
-        if object_ref.number == 0 || removed_refs.contains(&object_ref) {
+    if let Some(object_gen) = handle.qpdf_obj_gen() {
+        if !object_gen.is_indirect() || removed_refs.contains(&object_gen) {
             // qpdf's direct-null identity is object number zero, not an
             // output reference (QPDFObjectHandle.cc:344-350). A removed
             // identity follows the same null path in the qpdf rewrite.
             out.write_bytes(b"null")?;
             return Ok(());
         }
-        let mapped = map(object_ref)?;
+        let mapped = map(object_gen)?;
         out.write_bytes(mapped.to_string().as_bytes())?;
         return Ok(());
     }
@@ -2664,8 +2935,8 @@ fn write_child_with_ref_map(
 fn unparse_object_walk_with_ref_map(
     handle: &ObjectHandle,
     out: &mut OutputSink<'_>,
-    map: &ObjectRefMap<'_>,
-    removed_refs: &BTreeSet<ObjectRef>,
+    map: &QpdfObjGenMap<'_>,
+    removed_refs: &BTreeSet<QpdfObjGen>,
 ) -> Result<()> {
     stacker::maybe_grow(UNPARSE_STACK_RED_ZONE, UNPARSE_STACK_GROWTH_SIZE, || {
         if handle.is_reserved() {
@@ -2700,8 +2971,8 @@ fn unparse_object_walk_with_ref_map(
 fn unparse_container_with_ref_map(
     container: UnparseContainer,
     out: &mut OutputSink<'_>,
-    map: &ObjectRefMap<'_>,
-    removed_refs: &BTreeSet<ObjectRef>,
+    map: &QpdfObjGenMap<'_>,
+    removed_refs: &BTreeSet<QpdfObjGen>,
 ) -> Result<()> {
     match container {
         UnparseContainer::Array(children) => {
@@ -2725,8 +2996,8 @@ fn unparse_container_with_ref_map(
 fn unparse_object_value_with_ref_map(
     value: &ObjectValue,
     out: &mut OutputSink<'_>,
-    map: &ObjectRefMap<'_>,
-    removed_refs: &BTreeSet<ObjectRef>,
+    map: &QpdfObjGenMap<'_>,
+    removed_refs: &BTreeSet<QpdfObjGen>,
 ) -> Result<()> {
     match value {
         ObjectValue::Array(children) => {
@@ -2759,12 +3030,15 @@ fn unparse_object_value_with_ref_map(
 fn unparse_dict_entries_with_ref_map(
     entries: &[(Vec<u8>, ObjectHandle)],
     out: &mut OutputSink<'_>,
-    map: &ObjectRefMap<'_>,
-    removed_refs: &BTreeSet<ObjectRef>,
+    map: &QpdfObjGenMap<'_>,
+    removed_refs: &BTreeSet<QpdfObjGen>,
 ) -> Result<()> {
     out.write_bytes(b"<<")?;
     for (key, value) in visible_dict_entries(entries)? {
-        if is_removed_reference(value, removed_refs) {
+        if value
+            .qpdf_obj_gen()
+            .is_some_and(|object_gen| removed_refs.contains(&object_gen))
+        {
             continue;
         }
         out.write_bytes(b" ")?;
@@ -2961,15 +3235,12 @@ fn write_child_with_dynamic_ref_map_and_string_writer<F>(
 where
     F: FnMut(&mut OutputSink<'_>, &[u8]) -> Result<()> + ?Sized,
 {
-    if handle
-        .qpdf_obj_gen()
-        .is_some_and(|object_gen| object_gen.get_obj() == 0)
-    {
-        out.write_bytes(b"null")?;
-        return Ok(());
-    }
-    if let Some(object_ref) = handle.object_ref() {
-        if object_ref.number == 0 || removed_refs.contains(&object_ref) {
+    if let Some(object_gen) = handle.qpdf_obj_gen() {
+        if !object_gen.is_indirect()
+            || object_gen
+                .to_object_ref()
+                .is_some_and(|object_ref| removed_refs.contains(&object_ref))
+        {
             out.write_bytes(b"null")?;
             return Ok(());
         }
@@ -3192,15 +3463,12 @@ fn write_child_with_dynamic_ref_map(
     // qpdf's writer treats raw object number 0 as its null placeholder even
     // when the handle cannot cross the normal ObjectRef generation boundary;
     // do not send that placeholder into the live queue's discovery callback.
-    if handle
-        .qpdf_obj_gen()
-        .is_some_and(|object_gen| object_gen.get_obj() == 0)
-    {
-        out.write_bytes(b"null")?;
-        return Ok(());
-    }
-    if let Some(object_ref) = handle.object_ref() {
-        if object_ref.number == 0 || removed_refs.contains(&object_ref) {
+    if let Some(object_gen) = handle.qpdf_obj_gen() {
+        if !object_gen.is_indirect()
+            || object_gen
+                .to_object_ref()
+                .is_some_and(|object_ref| removed_refs.contains(&object_ref))
+        {
             out.write_bytes(b"null")?;
             return Ok(());
         }
@@ -3453,7 +3721,11 @@ fn try_write_sig_contents_hex_string(
     force_hex_string: bool,
     out: &mut OutputSink<'_>,
 ) -> Result<bool> {
-    if !force_hex_string || handle.object_ref().is_some() {
+    if !force_hex_string
+        || handle
+            .qpdf_obj_gen()
+            .is_some_and(|object_gen| object_gen.is_indirect())
+    {
         return Ok(false);
     }
     handle.try_dereference()?;
@@ -3727,14 +3999,14 @@ fn write_child_qdf_with_ref_map(
     handle: &ObjectHandle,
     indent: usize,
     out: &mut OutputSink<'_>,
-    map: &ObjectRefMap<'_>,
-    removed_refs: &BTreeSet<ObjectRef>,
+    map: &QpdfObjGenMap<'_>,
+    removed_refs: &BTreeSet<QpdfObjGen>,
 ) -> Result<()> {
-    if let Some(object_ref) = handle.object_ref() {
-        if object_ref.number == 0 || removed_refs.contains(&object_ref) {
+    if let Some(object_gen) = handle.qpdf_obj_gen() {
+        if !object_gen.is_indirect() || removed_refs.contains(&object_gen) {
             out.write_bytes(b"null")?;
         } else {
-            out.write_bytes(map(object_ref)?.to_string().as_bytes())?;
+            out.write_bytes(map(object_gen)?.to_string().as_bytes())?;
         }
         return Ok(());
     }
@@ -3745,8 +4017,8 @@ fn unparse_object_walk_qdf_with_ref_map(
     handle: &ObjectHandle,
     indent: usize,
     out: &mut OutputSink<'_>,
-    map: &ObjectRefMap<'_>,
-    removed_refs: &BTreeSet<ObjectRef>,
+    map: &QpdfObjGenMap<'_>,
+    removed_refs: &BTreeSet<QpdfObjGen>,
 ) -> Result<()> {
     stacker::maybe_grow(UNPARSE_STACK_RED_ZONE, UNPARSE_STACK_GROWTH_SIZE, || {
         if handle.is_reserved() {
@@ -3782,8 +4054,8 @@ fn unparse_container_qdf_with_ref_map(
     container: UnparseContainer,
     indent: usize,
     out: &mut OutputSink<'_>,
-    map: &ObjectRefMap<'_>,
-    removed_refs: &BTreeSet<ObjectRef>,
+    map: &QpdfObjGenMap<'_>,
+    removed_refs: &BTreeSet<QpdfObjGen>,
 ) -> Result<()> {
     match container {
         UnparseContainer::Array(children) => {
@@ -3811,8 +4083,8 @@ fn unparse_object_value_qdf_with_ref_map(
     value: &ObjectValue,
     _indent: usize,
     out: &mut OutputSink<'_>,
-    _map: &ObjectRefMap<'_>,
-    _removed_refs: &BTreeSet<ObjectRef>,
+    _map: &QpdfObjGenMap<'_>,
+    _removed_refs: &BTreeSet<QpdfObjGen>,
 ) -> Result<()> {
     // `unparse_object_walk_qdf_with_ref_map` snapshots every array,
     // dictionary, and stream before entering this borrow-scoped fallback.
@@ -3826,12 +4098,15 @@ fn unparse_dict_entries_qdf_with_ref_map(
     entries: &[(Vec<u8>, ObjectHandle)],
     indent: usize,
     out: &mut OutputSink<'_>,
-    map: &ObjectRefMap<'_>,
-    removed_refs: &BTreeSet<ObjectRef>,
+    map: &QpdfObjGenMap<'_>,
+    removed_refs: &BTreeSet<QpdfObjGen>,
 ) -> Result<()> {
     out.write_bytes(b"<<\n")?;
     for (key, value) in visible_dict_entries(entries)? {
-        if is_removed_reference(value, removed_refs) {
+        if value
+            .qpdf_obj_gen()
+            .is_some_and(|object_gen| removed_refs.contains(&object_gen))
+        {
             continue;
         }
         push_spaces(out, indent + 2)?;
@@ -3852,18 +4127,18 @@ fn unparse_dict_entries_qdf_with_ref_map(
 fn write_child_with_ref_map_and_string_writer<F>(
     handle: &ObjectHandle,
     out: &mut OutputSink<'_>,
-    map: &ObjectRefMap<'_>,
-    removed_refs: &BTreeSet<ObjectRef>,
+    map: &QpdfObjGenMap<'_>,
+    removed_refs: &BTreeSet<QpdfObjGen>,
     write_string: &mut F,
 ) -> Result<()>
 where
     F: FnMut(&mut OutputSink<'_>, &[u8]) -> Result<()>,
 {
-    if let Some(object_ref) = handle.object_ref() {
-        if object_ref.number == 0 || removed_refs.contains(&object_ref) {
+    if let Some(object_gen) = handle.qpdf_obj_gen() {
+        if !object_gen.is_indirect() || removed_refs.contains(&object_gen) {
             out.write_bytes(b"null")?;
         } else {
-            out.write_bytes(map(object_ref)?.to_string().as_bytes())?;
+            out.write_bytes(map(object_gen)?.to_string().as_bytes())?;
         }
         return Ok(());
     }
@@ -3873,8 +4148,8 @@ where
 fn unparse_object_walk_with_ref_map_and_string_writer<F>(
     handle: &ObjectHandle,
     out: &mut OutputSink<'_>,
-    map: &ObjectRefMap<'_>,
-    removed_refs: &BTreeSet<ObjectRef>,
+    map: &QpdfObjGenMap<'_>,
+    removed_refs: &BTreeSet<QpdfObjGen>,
     write_string: &mut F,
 ) -> Result<()>
 where
@@ -3923,8 +4198,8 @@ where
 fn unparse_container_with_ref_map_and_string_writer<F>(
     container: UnparseContainer,
     out: &mut OutputSink<'_>,
-    map: &ObjectRefMap<'_>,
-    removed_refs: &BTreeSet<ObjectRef>,
+    map: &QpdfObjGenMap<'_>,
+    removed_refs: &BTreeSet<QpdfObjGen>,
     write_string: &mut F,
 ) -> Result<()>
 where
@@ -3972,8 +4247,8 @@ where
 fn unparse_object_value_with_ref_map_and_string_writer<F>(
     value: &ObjectValue,
     out: &mut OutputSink<'_>,
-    _map: &ObjectRefMap<'_>,
-    _removed_refs: &BTreeSet<ObjectRef>,
+    _map: &QpdfObjGenMap<'_>,
+    _removed_refs: &BTreeSet<QpdfObjGen>,
     write_string: &mut F,
 ) -> Result<()>
 where
@@ -3988,8 +4263,8 @@ where
 fn unparse_dict_entries_with_ref_map_and_string_writer<F>(
     entries: &[(Vec<u8>, ObjectHandle)],
     out: &mut OutputSink<'_>,
-    map: &ObjectRefMap<'_>,
-    removed_refs: &BTreeSet<ObjectRef>,
+    map: &QpdfObjGenMap<'_>,
+    removed_refs: &BTreeSet<QpdfObjGen>,
     write_string: &mut F,
 ) -> Result<()>
 where
@@ -3997,7 +4272,10 @@ where
 {
     out.write_bytes(b"<<")?;
     for (key, value) in visible_dict_entries(entries)? {
-        if is_removed_reference(value, removed_refs) {
+        if value
+            .qpdf_obj_gen()
+            .is_some_and(|object_gen| removed_refs.contains(&object_gen))
+        {
             continue;
         }
         out.write_bytes(b" ")?;
@@ -4018,18 +4296,18 @@ fn write_child_qdf_with_ref_map_and_string_writer<F>(
     handle: &ObjectHandle,
     indent: usize,
     out: &mut OutputSink<'_>,
-    map: &ObjectRefMap<'_>,
-    removed_refs: &BTreeSet<ObjectRef>,
+    map: &QpdfObjGenMap<'_>,
+    removed_refs: &BTreeSet<QpdfObjGen>,
     write_string: &mut F,
 ) -> Result<()>
 where
     F: FnMut(&mut OutputSink<'_>, &[u8]) -> Result<()>,
 {
-    if let Some(object_ref) = handle.object_ref() {
-        if object_ref.number == 0 || removed_refs.contains(&object_ref) {
+    if let Some(object_gen) = handle.qpdf_obj_gen() {
+        if !object_gen.is_indirect() || removed_refs.contains(&object_gen) {
             out.write_bytes(b"null")?;
         } else {
-            out.write_bytes(map(object_ref)?.to_string().as_bytes())?;
+            out.write_bytes(map(object_gen)?.to_string().as_bytes())?;
         }
         return Ok(());
     }
@@ -4047,8 +4325,8 @@ fn unparse_object_walk_qdf_with_ref_map_and_string_writer<F>(
     handle: &ObjectHandle,
     indent: usize,
     out: &mut OutputSink<'_>,
-    map: &ObjectRefMap<'_>,
-    removed_refs: &BTreeSet<ObjectRef>,
+    map: &QpdfObjGenMap<'_>,
+    removed_refs: &BTreeSet<QpdfObjGen>,
     write_string: &mut F,
 ) -> Result<()>
 where
@@ -4101,8 +4379,8 @@ fn unparse_container_qdf_with_ref_map_and_string_writer<F>(
     container: UnparseContainer,
     indent: usize,
     out: &mut OutputSink<'_>,
-    map: &ObjectRefMap<'_>,
-    removed_refs: &BTreeSet<ObjectRef>,
+    map: &QpdfObjGenMap<'_>,
+    removed_refs: &BTreeSet<QpdfObjGen>,
     write_string: &mut F,
 ) -> Result<()>
 where
@@ -4157,8 +4435,8 @@ fn unparse_object_value_qdf_with_ref_map_and_string_writer<F>(
     value: &ObjectValue,
     _indent: usize,
     out: &mut OutputSink<'_>,
-    _map: &ObjectRefMap<'_>,
-    _removed_refs: &BTreeSet<ObjectRef>,
+    _map: &QpdfObjGenMap<'_>,
+    _removed_refs: &BTreeSet<QpdfObjGen>,
     write_string: &mut F,
 ) -> Result<()>
 where
@@ -4174,8 +4452,8 @@ fn unparse_dict_entries_qdf_with_ref_map_and_string_writer<F>(
     entries: &[(Vec<u8>, ObjectHandle)],
     indent: usize,
     out: &mut OutputSink<'_>,
-    map: &ObjectRefMap<'_>,
-    removed_refs: &BTreeSet<ObjectRef>,
+    map: &QpdfObjGenMap<'_>,
+    removed_refs: &BTreeSet<QpdfObjGen>,
     write_string: &mut F,
 ) -> Result<()>
 where
@@ -4183,7 +4461,10 @@ where
 {
     out.write_bytes(b"<<\n")?;
     for (key, value) in visible_dict_entries(entries)? {
-        if is_removed_reference(value, removed_refs) {
+        if value
+            .qpdf_obj_gen()
+            .is_some_and(|object_gen| removed_refs.contains(&object_gen))
+        {
             continue;
         }
         push_spaces(out, indent + 2)?;
@@ -4559,6 +4840,8 @@ fn unparse_trailer_entries_with_ref_map(
     suppress_null_values: bool,
     out: &mut OutputSink<'_>,
 ) -> Result<()> {
+    let qpdf_map = qpdf_obj_gen_map_from_object_ref_map(map);
+    let qpdf_removed_refs = qpdf_obj_gen_set_from_object_ref_set(removed_refs)?;
     if qdf {
         out.write_bytes(b"trailer <<\n")?;
     } else if !xref_stream {
@@ -4611,9 +4894,9 @@ fn unparse_trailer_entries_with_ref_map(
             // `unparseChild` recurses into that direct dictionary, so preserve
             // the direct `/Root` shape while applying the caller's map below.
             if qdf {
-                write_child_qdf_with_ref_map(value, 2, out, map, removed_refs)?;
+                write_child_qdf_with_ref_map(value, 2, out, &qpdf_map, &qpdf_removed_refs)?;
             } else {
-                write_child_with_ref_map(value, out, map, removed_refs)?;
+                write_child_with_ref_map(value, out, &qpdf_map, &qpdf_removed_refs)?;
             }
         } else if matches!(key.as_slice(), b"/Root" | b"/Encrypt") {
             // An indirect `/Root` or `/Encrypt` installed by the writer already
@@ -4624,9 +4907,9 @@ fn unparse_trailer_entries_with_ref_map(
                 write_child(value, out)?;
             }
         } else if qdf {
-            write_child_qdf_with_ref_map(value, 2, out, map, removed_refs)?;
+            write_child_qdf_with_ref_map(value, 2, out, &qpdf_map, &qpdf_removed_refs)?;
         } else {
-            write_child_with_ref_map(value, out, map, removed_refs)?;
+            write_child_with_ref_map(value, out, &qpdf_map, &qpdf_removed_refs)?;
         }
         if qdf {
             out.write_bytes(b"\n")?;
@@ -4641,7 +4924,9 @@ fn unparse_trailer_entries_with_ref_map(
         }
         match id_writer.as_mut() {
             Some(write_id) => write_id(out)?,
-            None => write_id_style_value_handle_with_ref_map(value, out, map, removed_refs)?,
+            None => {
+                write_id_style_value_handle_with_ref_map(value, out, &qpdf_map, &qpdf_removed_refs)?
+            }
         }
     }
     if let Some(value) = encrypt_value {
@@ -4673,6 +4958,8 @@ fn unparse_trailer_entries_with_ref_map_and_kind(
     direct_root: Option<&ObjectHandle>,
     out: &mut OutputSink<'_>,
 ) -> Result<()> {
+    let qpdf_map = qpdf_obj_gen_map_from_object_ref_map(map);
+    let qpdf_removed_refs = qpdf_obj_gen_set_from_object_ref_set(removed_refs)?;
     let (size, prev, second_half) = match kind {
         TrailerKind::Normal { size } => (size, None, false),
         TrailerKind::LinearizedFirst { size, prev } => (size, Some(prev), false),
@@ -4747,7 +5034,7 @@ fn unparse_trailer_entries_with_ref_map_and_kind(
         out.write_bytes(b" ")?;
         if key.as_slice() == b"/Root" && value.object_ref().is_none() {
             if qdf {
-                write_child_qdf_with_ref_map(value, 2, out, map, removed_refs)?;
+                write_child_qdf_with_ref_map(value, 2, out, &qpdf_map, &qpdf_removed_refs)?;
             } else if let Some(direct_root) = direct_root {
                 write_object_with_ref_map_and_direct_streams(
                     direct_root,
@@ -4757,7 +5044,7 @@ fn unparse_trailer_entries_with_ref_map_and_kind(
                     false,
                 )?; // cov:ignore: LLVM maps this covered direct-root serializer continuation to the call setup.
             } else {
-                write_child_with_ref_map(value, out, map, removed_refs)?;
+                write_child_with_ref_map(value, out, &qpdf_map, &qpdf_removed_refs)?;
             }
         } else if key.as_slice() == b"/Root" {
             if qdf {
@@ -4766,9 +5053,9 @@ fn unparse_trailer_entries_with_ref_map_and_kind(
                 write_child(value, out)?;
             }
         } else if qdf {
-            write_child_qdf_with_ref_map(value, 2, out, map, removed_refs)?;
+            write_child_qdf_with_ref_map(value, 2, out, &qpdf_map, &qpdf_removed_refs)?;
         } else {
-            write_child_with_ref_map(value, out, map, removed_refs)?;
+            write_child_with_ref_map(value, out, &qpdf_map, &qpdf_removed_refs)?;
         }
         if qdf {
             out.write_bytes(b"\n")?;
@@ -4783,7 +5070,9 @@ fn unparse_trailer_entries_with_ref_map_and_kind(
         }
         match id_writer.as_mut() {
             Some(write_id) => write_id(out)?,
-            None => write_id_style_value_handle_with_ref_map(value, out, map, removed_refs)?,
+            None => {
+                write_id_style_value_handle_with_ref_map(value, out, &qpdf_map, &qpdf_removed_refs)?
+            }
         }
     }
     if let Some(value) = encrypt_value {
@@ -4810,6 +5099,8 @@ fn unparse_dictionary_entries_with_ref_map_and_id_writer(
     suppress_null_values: bool,
     out: &mut OutputSink<'_>,
 ) -> Result<()> {
+    let qpdf_map = qpdf_obj_gen_map_from_object_ref_map(map);
+    let qpdf_removed_refs = qpdf_obj_gen_set_from_object_ref_set(removed_refs)?;
     out.write_bytes(b"<<")?;
     for (key, value) in entries {
         // qpdf's writeTrailer always emits the writer-owned /Root
@@ -4831,12 +5122,17 @@ fn unparse_dictionary_entries_with_ref_map_and_id_writer(
         if key.as_slice() == b"/ID" {
             match id_writer.as_mut() {
                 Some(write_id) => write_id(out)?,
-                None => write_id_style_value_handle_with_ref_map(value, out, map, removed_refs)?,
+                None => write_id_style_value_handle_with_ref_map(
+                    value,
+                    out,
+                    &qpdf_map,
+                    &qpdf_removed_refs,
+                )?, // cov:ignore: llvm-cov does not attribute this test-only /ID fallback continuation to the exercised call.
             }
         } else if matches!(key.as_slice(), b"/Root" | b"/Encrypt") {
             write_child(value, out)?; // cov:ignore: test-only dictionary serializer receives writer-owned indirect references only in defensive unit shapes.
         } else {
-            write_child_with_ref_map(value, out, map, removed_refs)?;
+            write_child_with_ref_map(value, out, &qpdf_map, &qpdf_removed_refs)?;
         }
     }
     out.write_bytes(b" >>")?;
@@ -4892,10 +5188,13 @@ fn write_id_style_value_handle(value: &ObjectHandle, out: &mut OutputSink<'_>) -
 fn write_id_style_value_handle_with_ref_map(
     value: &ObjectHandle,
     out: &mut OutputSink<'_>,
-    map: &dyn Fn(ObjectRef) -> Result<ObjectRef>,
-    removed_refs: &BTreeSet<ObjectRef>,
+    map: &QpdfObjGenMap<'_>,
+    removed_refs: &BTreeSet<QpdfObjGen>,
 ) -> Result<()> {
-    if value.object_ref().is_some() {
+    if value
+        .qpdf_obj_gen()
+        .is_some_and(|object_gen| object_gen.is_indirect())
+    {
         return write_child_with_ref_map(value, out, map, removed_refs);
     }
     let compact: Option<(Vec<u8>, Vec<u8>)> = value.with_value(|v| match v {
@@ -4941,6 +5240,33 @@ mod tests {
         })
         .unwrap();
         assert_eq!(out, b"/Canonical Raw");
+    }
+
+    #[test]
+    fn object_ref_map_adapter_rejects_an_unprojectable_raw_identity() {
+        let map = |object_ref: ObjectRef| Ok::<ObjectRef, Error>(object_ref);
+        let raw_map = super::qpdf_obj_gen_map_from_object_ref_map(&map);
+        let error = raw_map(QpdfObjGen::new(5, 65_536))
+            .expect_err("an ObjectRef adapter must reject an out-of-range generation");
+        assert!(error
+            .to_string()
+            .contains("cannot be used by an ObjectRef map"));
+    }
+
+    #[test]
+    fn compact_stream_ref_map_rejects_a_reserved_object() {
+        let reserved = ObjectHandle::new_reserved_direct();
+        let error = super::super::output::with_buffer_sink(&mut Vec::new(), |out| {
+            ObjectWriterEmission::write_stream_body_with_ref_map_and_removed_with_options(
+                &reserved,
+                out,
+                StreamDictionaryOptions::preserve(),
+                &|_| Ok(ObjectRef::new(1, 0)), // cov:ignore: reserved validation returns before invoking the map callback.
+                &BTreeSet::new(),
+            )
+        })
+        .expect_err("reserved stream objects must be rejected");
+        assert!(error.to_string().contains("reserved object"));
     }
 
     #[test]
@@ -5495,8 +5821,10 @@ mod tests {
     fn mapped_id_writer_falls_back_to_general_object_emission() -> Result<()> {
         let value = ObjectHandle::integer(7);
         let mut output = Vec::new();
-        let map = |object_ref| Ok::<ObjectRef, Error>(object_ref);
-        assert_eq!(map(ObjectRef::new(1, 0))?, ObjectRef::new(1, 0));
+        let map = |object_gen: QpdfObjGen| {
+            Ok::<ObjectRef, Error>(object_gen.to_object_ref().expect("valid test identity"))
+        };
+        assert_eq!(map(QpdfObjGen::new(1, 0))?, ObjectRef::new(1, 0));
         super::super::output::with_buffer_sink(&mut output, |out| {
             super::write_id_style_value_handle_with_ref_map(&value, out, &map, &BTreeSet::new())
         })?;
@@ -5556,7 +5884,12 @@ mod tests {
             super::write_id_style_value_handle_with_ref_map(
                 &indirect,
                 out,
-                &|object_ref| Ok(ObjectRef::new(object_ref.number + 1, 0)),
+                &|object_gen| {
+                    Ok(ObjectRef::new(
+                        u32::try_from(object_gen.get_obj()).unwrap() + 1,
+                        0,
+                    ))
+                },
                 &BTreeSet::new(),
             )
         })?;
@@ -5571,7 +5904,7 @@ mod tests {
             super::write_id_style_value_handle_with_ref_map(
                 &malformed,
                 out,
-                &|object_ref| Ok(object_ref), // cov:ignore: malformed direct /ID values use generic emission without mapping a reference.
+                &|_: QpdfObjGen| Ok(ObjectRef::new(1, 0)), // cov:ignore: malformed direct /ID values use generic emission without mapping a reference.
                 &BTreeSet::new(),
             )
         })?;
