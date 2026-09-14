@@ -43,7 +43,7 @@ rowsを検証する。2026-09-14 の現行 `origin/main` (`d190763a6`) での集
 
 | canonical | bridge | mixed | unknown | 合計 |
 |---|---|---|---|---|
-| 124 | 10 | 125 | 0 | 259 |
+| 125 | 10 | 125 | 0 | 259 |
 
 したがって、160行の領域別表と259 logical rowsの checker 分母は異なる。どちらも
 parity 完了数ではなく、責務／経路の分類数である。
@@ -98,9 +98,9 @@ done | sort | uniq -c
 
 2026-09-14 の current-main audit anchor は `origin/main=d190763a6`、pinned qpdf は
 11.9.0 commit `3b97c9bd266b7c32ea36d3536e22dab77412886d` である。checker の実測は
-**この revision を適用した tree で** 1055 qpdf citations / 909 flpdf citations /
+**この revision を適用した tree で** 1053 qpdf citations / 910 flpdf citations /
 259 logical rows、分類は
-canonical 124 / mixed 125 / bridge 10 / unknown 0。A〜E の160行だけを数える
+canonical 125 / mixed 125 / bridge 10 / unknown 0。A〜E の160行だけを数える
 上の領域別集計は canonical 100 / mixed 58 / bridge 2 / unknown 0 なので、checker
 の259 logical rowsと混同しない。
 
@@ -191,7 +191,7 @@ D19/D30はcanonical ownerへ委譲するbyte-neutral test scaffolding、D27は�
 ## 6. 二重正本トラッカー
 
 追跡対象の symbol manifest は [tracked-symbols.txt](tracked-symbols.txt)。この matrix revision の
-classified row は 259 行で、canonical 122 / mixed 127 / bridge 10 / unknown 0（bridge + mixed は137行）である。
+classified row は 259 行で、canonical 123 / mixed 125 / bridge 10 / unknown 0（bridge + mixed は135行）である。
 内訳は A=24 / B=34 / C=42 / D=31 / E=128（E 表 29 行 + qtest exception 表 99 行）。
 `scripts/check-qpdf-route-matrix.py` も259行を報告する。classification tableの途中に散文行が
 入っても同じtableの状態を保持し、qtest exception tableの物理1行 `0/1` は論理2 caseとして数える。
