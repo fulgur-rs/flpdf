@@ -115,10 +115,14 @@ Expected: the symbol is absent or has zero production and test callers. This pro
 **Files:**
 - Modify: `docs/qpdf-route-matrix/c-stream-pipeline-encryption.md:368`
 - Modify: `docs/qpdf-route-matrix/README.md:44-46,99-105`
+- Modify: `docs/qpdf-route-matrix/tracked-symbols.txt:160`
 
 - [ ] **Step 1: Record C43 as removed**
 
 Update the C43 row to show `canonical`, `absent`, and the fresh zero-caller result. Keep C28's residual bridge row and note separate. Recompute the same-run aggregates to C canonical 36 / bridge 1 / mixed 5, A-E canonical 101 / bridge 1 / mixed 58, and checker logical canonical 127 / bridge 7 / mixed 125; preserve all denominators and the no-route-wide-parity wording.
+
+Remove the deleted C43 symbol from `tracked-symbols.txt`; the manifest must not
+retain a symbol that no longer has a declaration.
 
 - [ ] **Step 2: Run format, Rust, qpdf, and route checks**
 

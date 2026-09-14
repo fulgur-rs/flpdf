@@ -68,33 +68,8 @@ pub(crate) fn normalize_filter_name(name: &[u8]) -> &[u8] {
     }
 }
 
-/// Return a human-readable codec label if `filter_name` is one of the four
-/// image/binary codecs (`DCTDecode`, `JBIG2Decode`, `JPXDecode`,
-/// `CCITTFaxDecode`) that the writer always emits verbatim rather than
-/// re-encoding.
-///
-/// This is an **encode-side** classification, independent of whether flpdf's
-/// decode path can currently decode the codec. Keeping this classification
-/// beside the filter registry lets the qpdf-shaped factory check use the same
-/// diagnostic that the later decode stage would have produced for a codec with
-/// no decode factory at all.
-pub(crate) fn passthrough_codec_label(filter_name: &[u8]) -> Option<&'static str> {
-    match filter_name {
-        b"DCTDecode" => Some("DCTDecode"),
-        b"JBIG2Decode" => Some("JBIG2Decode"),
-        b"JPXDecode" => Some("JPXDecode"),
-        b"CCITTFaxDecode" => Some("CCITTFaxDecode"),
-        _ => None,
-    }
-}
-
 /// Report why a filter name has no decode factory.
 pub(crate) fn undecodable_filter_error(filter_name: &[u8]) -> Error {
-    if let Some(label) = passthrough_codec_label(filter_name) {
-        return Error::Unsupported(format!(
-            "passthrough codec {label}: image/binary stream data is not decoded by flpdf (preserved verbatim)"
-        ));
-    }
     Error::Unsupported(format!(
         "unsupported stream filter: {}",
         std::str::from_utf8(filter_name).unwrap_or("<binary>")
@@ -1363,6 +1338,25 @@ mod tests {
         assert!(retained_indirect.is_same_object_as(&unknown_indirect));
         unknown_indirect.set_resolved(crate::object_handle::ObjectValue::Integer(7));
         assert_eq!(retained_indirect.try_get_int_value().unwrap(), 7);
+    }
+
+    #[test]
+    fn undecodable_filters_use_the_generic_unsupported_boundary() {
+        for name in [
+            b"CCITTFaxDecode".as_slice(),
+            b"JBIG2Decode".as_slice(),
+            b"JPXDecode".as_slice(),
+            b"BogusDecode".as_slice(),
+        ] {
+            let expected = format!(
+                "unsupported stream filter: {}",
+                std::str::from_utf8(name).expect("test filter name is UTF-8")
+            );
+            assert!(matches!(
+                super::undecodable_filter_error(name),
+                crate::Error::Unsupported(message) if message == expected
+            ));
+        }
     }
 
     #[test]
