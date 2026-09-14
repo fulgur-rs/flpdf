@@ -15,14 +15,10 @@ use crate::output::write_bytes;
 
 /// Read a name/number tree value through its canonical `ObjectHandle` route.
 /// qpdf's tree iterators keep the value handle live until the consumer asks
-/// for a typed value, so this helper resolves the handle once and applies the
-/// empty-string fallback used by the corresponding qpdf accessor.
-fn tree_string_value<R: Read + Seek>(
-    pdf: &mut Pdf<R>,
-    value: &ObjectHandle,
-) -> flpdf::Result<Vec<u8>> {
-    pdf.resolve(value)?;
-    Ok(value.as_string().unwrap_or_default())
+/// for a typed value, and `getStringValue` performs that lazy dereference as
+/// part of the public accessor (`libqpdf/QPDFObjectHandle.cc:659-677`).
+fn tree_string_value(value: &ObjectHandle) -> flpdf::Result<Vec<u8>> {
+    value.try_get_string_value()
 }
 
 /// Resolve `handle`, then read `key` from it — `ObjectHandle::get_key`
@@ -603,7 +599,7 @@ pub(crate) fn run_test_46<R: Read + Seek>(
     let mut cursor = ntoh.begin(pdf)?;
     emit_new_diagnostics(pdf, diagnostics_written, filename, stdout, stderr)?;
     while let Some((key, value)) = cursor.current() {
-        let text = tree_string_value(pdf, &value)?;
+        let text = tree_string_value(&value)?;
         write!(stdout, "{key} ")?;
         write_bytes(stdout, &text)?;
         writeln!(stdout)?;
@@ -613,7 +609,7 @@ pub(crate) fn run_test_46<R: Read + Seek>(
     let ntoh_map = ntoh.as_map(pdf)?;
     emit_new_diagnostics(pdf, diagnostics_written, filename, stdout, stderr)?;
     for (key, value) in &ntoh_map {
-        let text = tree_string_value(pdf, value)?;
+        let text = tree_string_value(value)?;
         write!(stdout, "{key} ")?;
         write_bytes(stdout, &text)?;
         writeln!(stdout)?;
@@ -625,12 +621,12 @@ pub(crate) fn run_test_46<R: Read + Seek>(
     assert!(!ntoh.has_index(pdf, 500)?);
     assert!(ntoh.find_object(pdf, 4)?.is_none());
     let three = ntoh.find_object(pdf, 3)?.expect("index 3 present");
-    assert_eq!(tree_string_value(pdf, &three)?, b"three");
+    assert_eq!(tree_string_value(&three)?, b"three");
     assert!(ntoh.find_object_at_or_below(pdf, 0)?.is_none());
     let (six, offset) = ntoh
         .find_object_at_or_below(pdf, 8)?
         .expect("index at or below 8 present");
-    assert_eq!(tree_string_value(pdf, &six)?, b"six");
+    assert_eq!(tree_string_value(&six)?, b"six");
     assert_eq!(2, offset);
 
     let mut new1 = NumberTree::new_empty(pdf, true)?;
@@ -718,28 +714,28 @@ pub(crate) fn run_test_46<R: Read + Seek>(
         let inserted = empty.insert(pdf, 5, ObjectHandle::string(b"5".to_vec()))?;
         let (inserted_key, inserted_value) = inserted.current().expect("index 5 present");
         assert_eq!(inserted_key, 5);
-        assert_eq!(tree_string_value(pdf, &inserted_value)?, b"5");
+        assert_eq!(tree_string_value(&inserted_value)?, b"5");
         assert_eq!(empty.begin(pdf)?.current().expect("begin at 5").0, 5);
         assert_eq!(empty.last(pdf)?.current().expect("last at 5").0, 5);
         let begin_value = empty.begin(pdf)?.current().expect("begin value at 5").1;
-        assert_eq!(tree_string_value(pdf, &begin_value)?, b"5");
+        assert_eq!(tree_string_value(&begin_value)?, b"5");
 
         let inserted = empty.insert(pdf, 5, ObjectHandle::string(b"5+".to_vec()))?;
         let (inserted_key, inserted_value) = inserted.current().expect("index 5 present");
         assert_eq!(inserted_key, 5);
-        assert_eq!(tree_string_value(pdf, &inserted_value)?, b"5+");
+        assert_eq!(tree_string_value(&inserted_value)?, b"5+");
         let begin_value = empty.begin(pdf)?.current().expect("begin value at 5+").1;
-        assert_eq!(tree_string_value(pdf, &begin_value)?, b"5+");
+        assert_eq!(tree_string_value(&begin_value)?, b"5+");
 
         let inserted = empty.insert(pdf, 6, ObjectHandle::string(b"6".to_vec()))?;
         let (inserted_key, inserted_value) = inserted.current().expect("index 6 present");
         assert_eq!(inserted_key, 6);
-        assert_eq!(tree_string_value(pdf, &inserted_value)?, b"6");
+        assert_eq!(tree_string_value(&inserted_value)?, b"6");
         let begin_value = empty.begin(pdf)?.current().expect("begin still at 5+").1;
-        assert_eq!(tree_string_value(pdf, &begin_value)?, b"5+");
+        assert_eq!(tree_string_value(&begin_value)?, b"5+");
         assert_eq!(empty.last(pdf)?.current().expect("last at 6").0, 6);
         let last_value = empty.last(pdf)?.current().expect("last value at 6").1;
-        assert_eq!(tree_string_value(pdf, &last_value)?, b"6");
+        assert_eq!(tree_string_value(&last_value)?, b"6");
     }
 
     writeln!(stdout, "Insert into invalid")?;
@@ -762,7 +758,7 @@ pub(crate) fn run_test_46<R: Read + Seek>(
         cursor.next(&mut bad3, pdf)?;
         emit_new_diagnostics(pdf, diagnostics_written, filename, stdout, stderr)?;
     }
-    assert!(!kids_item_0_is_indirect(pdf, &bad3_object)?);
+    assert!(!kids_item_0_is_indirect(&bad3_object)?);
 
     writeln!(stdout, "/Bad3, repair")?;
     let mut bad3 = NumberTree::new(bad3_object.clone(), true);
@@ -775,7 +771,7 @@ pub(crate) fn run_test_46<R: Read + Seek>(
         cursor.next(&mut bad3, pdf)?;
         emit_new_diagnostics(pdf, diagnostics_written, filename, stdout, stderr)?;
     }
-    assert!(kids_item_0_is_indirect(pdf, &bad3_object)?);
+    assert!(kids_item_0_is_indirect(&bad3_object)?);
 
     writeln!(stdout, "/Bad4 -- missing limits")?;
     let mut bad4 = NumberTree::new(pdf.trailer_key_handle(b"Bad4"), true);
@@ -814,24 +810,10 @@ fn write_nntree_error(
 
 /// Whether the root's `/Kids` array's first item is stored indirectly --
 /// qpdf's `bad3_oh.getKey("/Kids").getArrayItem(0).isIndirect()`.
-fn kids_item_0_is_indirect<R: Read + Seek>(
-    pdf: &mut Pdf<R>,
-    root: &ObjectHandle,
-) -> flpdf::Result<bool> {
-    pdf.resolve(root)?;
-    let root = root.clone();
-    let Some(dict) = root.as_dictionary() else {
-        return Ok(false);
-    };
-    let Some(kids) = dict.get(b"/Kids".as_slice()) else {
-        return Ok(false);
-    };
-    pdf.resolve(kids)?;
-    let kids = kids.clone();
-    let Some(items) = kids.as_array() else {
-        return Ok(false);
-    };
-    Ok(items.first().is_some_and(ObjectHandle::is_indirect))
+fn kids_item_0_is_indirect(root: &ObjectHandle) -> flpdf::Result<bool> {
+    let kids = root.try_get_key(b"/Kids")?;
+    let first_item = kids.try_get_array_item(0)?;
+    Ok(first_item.is_indirect())
 }
 
 pub(crate) fn run_test_47<R: Read + Seek>(
@@ -891,7 +873,7 @@ pub(crate) fn run_test_48<R: Read + Seek>(
     while let Some((key, value)) = cursor.current() {
         write_bytes(stdout, &key)?;
         write!(stdout, " -> ")?;
-        let text = tree_string_value(pdf, &value)?;
+        let text = tree_string_value(&value)?;
         write_bytes(stdout, &text)?;
         writeln!(stdout)?;
         cursor.next(&mut ntoh, pdf)?;
@@ -902,7 +884,7 @@ pub(crate) fn run_test_48<R: Read + Seek>(
     for (key, value) in &ntoh_map {
         write_bytes(stdout, key)?;
         write!(stdout, " -> ")?;
-        let text = tree_string_value(pdf, value)?;
+        let text = tree_string_value(value)?;
         write_bytes(stdout, &text)?;
         writeln!(stdout)?;
     }
@@ -914,15 +896,13 @@ pub(crate) fn run_test_48<R: Read + Seek>(
     let seven = ntoh
         .find_object(pdf, "07 sev\u{2022}n")?
         .expect("07 sev*n present");
-    assert_eq!(tree_string_value(pdf, &seven)?, b"seven!");
+    assert_eq!(tree_string_value(&seven)?, b"seven!");
     let (last_key, last_value) = ntoh
         .last(pdf)?
         .current()
         .expect("name tree has a last entry");
     assert_eq!(last_key, b"29 twenty-nine");
-    pdf.resolve(&last_value)?;
-    let last_raw = last_value.as_string().unwrap_or_default();
-    assert_eq!(flpdf::pdf_string::utf8_value(&last_raw), b"twenty-nine!");
+    assert_eq!(last_value.try_get_utf8_value()?, b"twenty-nine!");
 
     let mut new1 = NameTree::new_empty(pdf, true)?;
     let mut iter1 = new1.begin(pdf)?;
@@ -984,31 +964,31 @@ pub(crate) fn run_test_48<R: Read + Seek>(
         let inserted = empty.insert(pdf, "five", ObjectHandle::string(b"5".to_vec()))?;
         let (inserted_key, inserted_value) = inserted.current().expect("key five present");
         assert_eq!(inserted_key, b"five");
-        assert_eq!(tree_string_value(pdf, &inserted_value)?, b"5");
+        assert_eq!(tree_string_value(&inserted_value)?, b"5");
         assert_eq!(
             empty.begin(pdf)?.current().expect("begin at five").0,
             b"five"
         );
         assert_eq!(empty.last(pdf)?.current().expect("last at five").0, b"five");
         let begin_value = empty.begin(pdf)?.current().expect("begin value at five").1;
-        assert_eq!(tree_string_value(pdf, &begin_value)?, b"5");
+        assert_eq!(tree_string_value(&begin_value)?, b"5");
 
         let inserted = empty.insert(pdf, "five", ObjectHandle::string(b"5+".to_vec()))?;
         let (inserted_key, inserted_value) = inserted.current().expect("key five present");
         assert_eq!(inserted_key, b"five");
-        assert_eq!(tree_string_value(pdf, &inserted_value)?, b"5+");
+        assert_eq!(tree_string_value(&inserted_value)?, b"5+");
         let begin_value = empty.begin(pdf)?.current().expect("begin value at 5+").1;
-        assert_eq!(tree_string_value(pdf, &begin_value)?, b"5+");
+        assert_eq!(tree_string_value(&begin_value)?, b"5+");
 
         let inserted = empty.insert(pdf, "six", ObjectHandle::string(b"6".to_vec()))?;
         let (inserted_key, inserted_value) = inserted.current().expect("key six present");
         assert_eq!(inserted_key, b"six");
-        assert_eq!(tree_string_value(pdf, &inserted_value)?, b"6");
+        assert_eq!(tree_string_value(&inserted_value)?, b"6");
         let begin_value = empty.begin(pdf)?.current().expect("begin still at 5+").1;
-        assert_eq!(tree_string_value(pdf, &begin_value)?, b"5+");
+        assert_eq!(tree_string_value(&begin_value)?, b"5+");
         assert_eq!(empty.last(pdf)?.current().expect("last at six").0, b"six");
         let last_value = empty.last(pdf)?.current().expect("last value at six").1;
-        assert_eq!(tree_string_value(pdf, &last_value)?, b"6");
+        assert_eq!(tree_string_value(&last_value)?, b"6");
     }
 
     writeln!(stdout, "/Bad1 -- wrong key type")?;
@@ -1451,7 +1431,7 @@ mod tests {
     fn tree_helpers_resolve_canonical_handles_one_hop() {
         let mut pdf = minimal_pdf();
         let value = ObjectHandle::string(b"value".to_vec());
-        assert_eq!(tree_string_value(&mut pdf, &value).unwrap(), b"value");
+        assert_eq!(tree_string_value(&value).unwrap(), b"value");
 
         let root = pdf.trailer_key_handle(b"Root");
         let pages = chase_key(&mut pdf, &root, b"/Pages").expect("resolve /Pages");
@@ -1758,7 +1738,7 @@ Set field value: group.child -> 3.14 \xc3\xb7 0\n"
         let mut pdf = minimal_pdf();
         let root = pdf.trailer_key_handle(b"Root");
         let pages = chase_key(&mut pdf, &root, b"/Pages").expect("resolve /Pages");
-        assert!(!kids_item_0_is_indirect(&mut pdf, &pages).expect("inspect /Kids"));
+        assert!(!kids_item_0_is_indirect(&pages).expect("inspect /Kids"));
     }
 
     #[test]

@@ -198,9 +198,7 @@ pub(crate) fn run_test_89<R: Read + Seek>(
     root.append_array_item(null.clone())?;
     emit_new_diagnostics(pdf, diagnostics_written, filename, stdout, stderr)?;
 
-    let object5_ref = pdf.get_object_handle(ObjectRef::new(5, 0));
-    pdf.resolve(&object5_ref)?;
-    let object5 = object5_ref.clone();
+    let object5 = pdf.get_object_handle(ObjectRef::new(5, 0));
     emit_new_diagnostics(pdf, diagnostics_written, filename, stdout, stderr)?;
     object5.replace_key(b"/X", null.clone())?;
     emit_new_diagnostics(pdf, diagnostics_written, filename, stdout, stderr)?;
@@ -1007,7 +1005,7 @@ mod tests {
     }
 
     #[test]
-    fn test_89_resolves_root_and_unknown_object_handles_once() {
+    fn test_89_mutates_root_and_unknown_object_handles_through_canonical_accessors() {
         let mut pdf = minimal_pdf();
         pdf.replace_object(
             ObjectRef::new(5, 0),

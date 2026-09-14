@@ -3336,6 +3336,30 @@ source route contract は
 `/home/ubuntu/.cache/flpdf/qpdf-11.9.0`（pinned HEAD
 `3b97c9bd266b7c32ea36d3536e22dab77412886d`）である。
 
+### qtest E-28 tree/mutation accessor cutover `flpdf-3yn9.48.103` (2026-09-15)
+
+qpdf 11.9.0 の test 46/48/89（`qpdf/test_driver.cc:1645-1921,3162-3172`）
+には document-level の明示 `QPDF::resolve` 呼び出しがなく、tree value の
+typed read は public `QPDFObjectHandle::getStringValue` /
+`getUTF8Value`、type-mismatch mutation は public `replaceKey` が内部の
+`dereference()` 境界を処理する。根拠は
+`libqpdf/QPDFObjectHandle.cc:659-689` と
+`libqpdf/QPDFObjectHandle.cc:1197-1209` である。
+
+flpdf-qtest-tools は number/name-tree の値を
+`ObjectHandle::try_get_string_value` /
+`try_get_utf8_value`、Bad3 の `/Kids` を
+`try_get_key` → `try_get_array_item`、test 89 の object 5 mutation を
+`ObjectHandle::replace_key` へ移し、qpdf にない caller-side
+`Pdf::resolve` を対象 3 ケースから撤去した。挙動は qpdf の
+`getKey("/Kids").getArrayItem(0).isIndirect()` と一致し、full qtest
+survey は同一 run の `harness.log` + `qtest-results.xml` で
+regressions 0、parity verdict OK を確認した。
+
+case 31/42/98 の明示 resolve は別の残差である。特に case 42/98 の
+stream dictionary 読み出しは qpdf の public `getDict` に対応する
+flpdf の resolving primitive が未確定のため、本 slice では混ぜない。
+
 ### Linearized root ADBE output ownership (`flpdf-3yn9.48.60`)
 
 `linearization/writer.rs::do_write_pass` emits each pass's Catalog through
