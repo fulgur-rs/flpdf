@@ -1567,7 +1567,8 @@ impl LinearizationPlan {
         if pdf.root_ref().is_some()
             && optimization
                 .objects_for(&crate::optimization::ObjectUser::Page(0))
-                .is_empty()
+                .next()
+                .is_none()
         {
             return Err(crate::Error::Unsupported(
                 "no pages found while calculating linearization data".to_string(),
@@ -1735,15 +1736,17 @@ impl LinearizationPlan {
         let live: BTreeSet<ObjectRef> = pdf.canonical_live_object_refs().into_iter().collect();
         let first_page_users = optimization
             .objects_for(&crate::optimization::ObjectUser::Page(0))
-            .clone();
+            .collect::<BTreeSet<_>>();
         let root_objects = optimization
             .objects_for(&crate::optimization::ObjectUser::Root)
-            .clone();
-        let mut open_document_objects = optimization.objects_for_trailer_key(b"Encrypt");
+            .collect::<BTreeSet<_>>();
+        let mut open_document_objects: BTreeSet<ObjectRef> =
+            optimization.objects_for_trailer_key(b"Encrypt").collect();
         for key in OPEN_DOCUMENT_CATALOG_KEYS {
             open_document_objects.extend(optimization.objects_for_root_key(key));
         }
-        let all_outline_refs = optimization.objects_for_root_key(b"Outlines");
+        let all_outline_refs: BTreeSet<ObjectRef> =
+            optimization.objects_for_root_key(b"Outlines").collect();
         let document_other_objects: BTreeSet<ObjectRef> = optimization
             .object_users()
             .filter_map(|(object_ref, users)| {
@@ -1808,9 +1811,18 @@ impl LinearizationPlan {
                 &resurrectable,
                 &skipped_raw_stream_parameter_streams,
             )?; // cov:ignore: LLVM maps this covered later-page closure call terminator to a zero-count continuation region
-            let page_users =
-                optimization.objects_for(&crate::optimization::ObjectUser::Page(page_idx as u32));
-            closure.retain(|object_ref| page_users.contains(object_ref));
+
+            // Query the inverse user map per object. Re-deriving
+            // `objects_for(Page(i))` inside `retain` rebuilds the iterator and
+            // scans it from the start for every closure entry, which is
+            // quadratic in the closure size for object-heavy pages.
+            let page_user = crate::optimization::ObjectUser::Page(page_idx as u32);
+            closure.retain(|object_ref| {
+                optimization
+                    .users_for(*object_ref)
+                    .iter()
+                    .any(|user| *user == page_user)
+            });
             for obj_ref in &closure {
                 // Track cross-page sharing for first-page objects (used by Part 3 partition).
                 if first_page_set.contains(obj_ref) {
@@ -1830,7 +1842,7 @@ impl LinearizationPlan {
         // while sharing the page traversal's one ordered `visited` set
         // (QPDF_optimization.cc:261-337). The same exact map supplies ordinary
         // page membership above and thumbnail membership here.
-        let thumbnail_user_set = optimization.thumbnail_objects();
+        let thumbnail_user_set: BTreeSet<ObjectRef> = optimization.thumbnail_objects().collect();
 
         // ----------------------------------------------------------------
         // Step 5: partition into Part 2 (exclusive) and Part 3 (shared)
@@ -2394,7 +2406,11 @@ impl LinearizationPlan {
         let part9_pages: BTreeSet<ObjectRef> = self
             .optimization
             .as_ref()
-            .map(|optimization| optimization.objects_for_root_key(b"Pages"))
+            .map(|optimization| {
+                optimization
+                    .objects_for_root_key(b"Pages")
+                    .collect::<BTreeSet<ObjectRef>>()
+            })
             .filter(|pages| !pages.is_empty())
             .unwrap_or_else(|| self.pages_tree_ref.into_iter().collect());
         for pages_tree in part9_pages.iter().copied() {
@@ -3266,7 +3282,8 @@ impl LinearizationPlan {
         // sorting then preserves qpdf's ObjGen/even-split order within a
         // category. Preserve mode has its own source-ObjGen anchor path and does
         // not use this Generate-only ordering.
-        let part9_pages = optimization.objects_for_root_key(b"Pages");
+        let part9_pages: BTreeSet<ObjectRef> =
+            optimization.objects_for_root_key(b"Pages").collect();
         part4_rest.sort_by_key(|batch| {
             part9_category_order_key(optimization, &part9_pages, batch.members.iter())
         });

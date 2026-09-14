@@ -555,9 +555,8 @@ fn compute_hint_data<R: Read + Seek>(
         let page_object = uncompressed_object_ref(*page_ref, &xref);
         let private_count = optimization
             .objects_for(&ObjectUser::Page(page_number as u32))
-            .iter()
             .filter(|object_ref| {
-                **object_ref != page_object && other_page_private.contains(object_ref)
+                *object_ref != page_object && other_page_private.contains(object_ref)
             })
             .count();
         page_object_counts.push((private_count + 1) as u32);
@@ -575,12 +574,10 @@ fn compute_hint_data<R: Read + Seek>(
     for page_number in 1..pages.len() {
         let shared = optimization
             .objects_for(&ObjectUser::Page(page_number as u32))
-            .iter()
             .filter(|object_ref| {
-                optimization.users_for(**object_ref).len() > 1
+                optimization.users_for(*object_ref).len() > 1
                     && shared_object_numbers.contains(&object_ref.number)
             })
-            .copied()
             .collect();
         page_shared_objects.push(shared);
     }

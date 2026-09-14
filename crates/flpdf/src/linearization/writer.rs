@@ -3165,7 +3165,11 @@ fn second_half_container_anchors(
     let part9_pages: BTreeSet<ObjectRef> = plan
         .optimization
         .as_ref()
-        .map(|optimization| optimization.objects_for_root_key(b"Pages"))
+        .map(|optimization| {
+            optimization
+                .objects_for_root_key(b"Pages")
+                .collect::<BTreeSet<ObjectRef>>()
+        })
         .filter(|pages| !pages.is_empty())
         .unwrap_or_else(|| plan.pages_tree_ref.into_iter().collect());
 
@@ -3836,13 +3840,21 @@ fn write_linearized_impl<R: Read + Seek>(
     let part9_pages: BTreeSet<ObjectRef> = plan
         .optimization
         .as_ref()
-        .map(|optimization| optimization.objects_for_root_key(b"Pages"))
+        .map(|optimization| {
+            optimization
+                .objects_for_root_key(b"Pages")
+                .collect::<BTreeSet<ObjectRef>>()
+        })
         .filter(|pages| !pages.is_empty())
         .unwrap_or_else(|| plan.pages_tree_ref.into_iter().collect());
     let part9_thumbnail_objects: BTreeSet<ObjectRef> = plan
         .optimization
         .as_ref()
-        .map(|optimization| optimization.thumbnail_objects())
+        .map(|optimization| {
+            optimization
+                .thumbnail_objects()
+                .collect::<BTreeSet<ObjectRef>>()
+        })
         .unwrap_or_default();
     let part9_thumbnail_pre_plain: BTreeSet<ObjectRef> =
         if options.object_streams == crate::writer::ObjectStreamMode::Generate {
