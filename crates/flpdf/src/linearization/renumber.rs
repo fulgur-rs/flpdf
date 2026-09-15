@@ -579,7 +579,9 @@ impl RenumberMap {
                     members, ..
                 } = group
                 else {
+                    // cov:ignore-start: the Preserve plan contains SourceBacked groups only
                     continue;
+                    // cov:ignore-end
                 };
                 for &member in members {
                     let raw = QpdfObjGen::try_from_object_ref(member)

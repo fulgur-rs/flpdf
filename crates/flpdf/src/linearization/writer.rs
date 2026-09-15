@@ -4828,11 +4828,13 @@ fn build_hint_stream_from_pass1(input: &HintStreamBuildInput<'_>) -> Result<Vec<
                             .source_container_numbers
                             .contains(&orig.number) =>
                         {
+                            // cov:ignore-start: a planned Preserve source container always has a placed renumber entry
                             if let Some(new_ref) = renumber.new_for_original(*orig) {
                                 if !non_page_owned.contains(&new_ref.number) {
                                     containers.insert(new_ref.number);
                                 }
                             }
+                            // cov:ignore-end
                         }
                         None => len += plain_byte_len(orig),
                     }

@@ -1574,7 +1574,7 @@ impl LinearizationPlan {
         if let Some(plan) = preserve_objstm_plan.as_mut() {
             crate::writer::object_streams::filter_preserve_object_stream_plan_for_output(
                 pdf, plan, true, false,
-            )?;
+            )?; // cov:ignore: LLVM attributes this multiline Preserve filter terminator to an uncovered continuation line
         }
         let preserve_object_stream_data: BTreeMap<u32, u32> = preserve_objstm_plan
             .as_ref()
@@ -1586,7 +1586,9 @@ impl LinearizationPlan {
                             source,
                             members,
                         } => Some((source, members)),
+                        // cov:ignore-start: this plan is built only by the Preserve planner
                         crate::writer::object_streams::ObjectStreamGroup::Generated { .. } => None,
+                        // cov:ignore-end
                     })
                     .flat_map(|(source, members)| {
                         members
