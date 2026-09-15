@@ -3472,3 +3472,18 @@ flpdfはtop-level `Cli` の該当conflicts_withを除去し、JSON routeでは�
 attachmentのadd/remove/copy、encrypt/decrypt/linearizeとJSON、encrypt/decryptと
 check/show-npagesの10通りをpinned qpdf 11.9.0とstatus/stdout/stderr比較する。
 qpdfに対応する独自compatibility bridgeやdeviation markerは追加しない。
+
+### Top-level attachment mutation with a single inspection (`flpdf-awthm`, 2026-09-15)
+
+qpdf's `createQPDF` always completes `handleTransformations`, including
+attachment remove/add/copy, before `writeQPDF` chooses the output-free
+`doInspection` column (`libqpdf/QPDFJob.cc:428-489,1646-1693,2046-2248`). The
+top-level flpdf CLI now sends any single inspection selector combined with an
+attachment mutation through the existing `QPDFJob` configuration and
+completion boundary. `--check`, `--list-attachments`, and `--show-npages`
+therefore inspect the mutated document and preserve mutation-stage exit-2
+errors. The page-selection inspection route receives the same attachment
+configuration before `QPDFJob::run`, so its selected document follows the
+same transformation/inspection order. qpdf 11.9.0 status/stdout/stderr
+differential coverage is in
+`crates/flpdf-cli/tests/cli_inspection_combinations.rs`.
