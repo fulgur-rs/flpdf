@@ -1724,12 +1724,50 @@ impl LinearizationPlan {
         // dangling reference — so a stream's indirect `/Length` edge is dead in the
         // output regardless of object-stream mode. Not following it drops a holder
         // reachable only through it, matching qpdf's reachability GC.
-        let reachable =
-            crate::writer::rewrite_renumber::reachable_object_set_with_stream_parameters(
-                pdf,
-                true,
-                &skipped_raw_stream_parameter_streams,
-            )?;
+        // Collect page references before choosing the fast universe route. A
+        // malformed or detached page /Parent is deliberately ignored by
+        // qpdf's object-user map but remains reachable for the writer's
+        // Part-9 universe, so that shape must retain the exact fallback walk.
+        let page_refs: Vec<ObjectRef> = crate::pages::page_refs(pdf)?;
+        let page_parent_users_are_complete =
+            page_refs
+                .iter()
+                .try_fold(true, |complete, page_ref| -> Result<bool> {
+                    if !complete {
+                        return Ok(false);
+                    }
+                    let page = pdf.get_object_handle(*page_ref);
+                    let parent = page.try_get_key(b"/Parent")?;
+                    if parent.try_is_null()? {
+                        return Ok(true);
+                    }
+                    let Some(parent_gen) = parent.qpdf_obj_gen() else {
+                        return Ok(false);
+                    };
+                    Ok(optimization
+                        .raw_users_for(parent_gen)
+                        .iter()
+                        .next()
+                        .is_some())
+                })?;
+
+        // qpdf's Optimization object-user map is already the reachability
+        // traversal consumed by calculateLinearizationData. Reuse it when
+        // no source ObjStm member projection has replaced raw members with
+        // container identities and all page-parent edges are represented.
+        // Preserve mode with source containers keeps the explicit fallback
+        // walk because the filtered map no longer has the original member
+        // identities required by the writer universe.
+        let reachable: BTreeSet<ObjectRef> =
+            if preserve_object_stream_data.is_empty() && page_parent_users_are_complete {
+                optimization.linearization_reachable_object_refs().collect()
+            } else {
+                crate::writer::rewrite_renumber::reachable_object_set_with_stream_parameters(
+                    pdf,
+                    true,
+                    &skipped_raw_stream_parameter_streams,
+                )?
+            };
         let object_refs = pdf.canonical_object_refs();
         let mut all_refs: Vec<ObjectRef> = Vec::with_capacity(object_refs.len());
         for r in object_refs {
@@ -1843,13 +1881,6 @@ impl LinearizationPlan {
         } else {
             None // cov:ignore: reachable_object_set rejects a rootless document before this successful-plan path
         };
-
-        // ----------------------------------------------------------------
-        // Step 2: collect page references.
-        // Propagate page-tree errors so a malformed /Pages does not silently
-        // produce an empty page_hints (which would corrupt downstream hint tables).
-        // ----------------------------------------------------------------
-        let page_refs: Vec<ObjectRef> = crate::pages::page_refs(pdf)?;
 
         // The live object set is invariant across every page's closure; compute it
         // once so the per-page `compute_closure` calls below do not each re-scan
