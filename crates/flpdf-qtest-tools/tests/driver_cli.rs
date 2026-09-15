@@ -1243,6 +1243,11 @@ fn qtest_accessor_cases_do_not_use_explicit_pdf_resolve() {
         "/src/driver/test_02_09.rs"
     ))
     .expect("read early-driver source");
+    let middle_source = fs::read_to_string(concat!(
+        env!("CARGO_MANIFEST_DIR"),
+        "/src/driver/test_10_17.rs"
+    ))
+    .expect("read middle-driver source");
     let tree_source = fs::read_to_string(concat!(
         env!("CARGO_MANIFEST_DIR"),
         "/src/driver/test_42_49.rs"
@@ -1310,6 +1315,26 @@ fn qtest_accessor_cases_do_not_use_explicit_pdf_resolve() {
             && test_3.contains("try_get_array_item(")
             && !test_3.contains("try_get_array_as_vector()"),
         "test 3 must iterate /QStreams through the canonical qpdf-shaped count/item accessors"
+    );
+    let test_11 = section(
+        middle_source.as_str(),
+        "pub(crate) fn run_test_11",
+        "pub(crate) fn run_test_12",
+    );
+    assert!(
+        test_11.contains("pdf.root_handle()?")
+            && !test_11.contains("root_ref()")
+            && !test_11.contains("get_object_handle("),
+        "test 11 must use the canonical resolving root handle, not the identity projection"
+    );
+    assert!(
+        section(
+            middle_source.as_str(),
+            "pub(crate) fn run_test_16",
+            "pub(crate) fn run_test_17",
+        )
+        .contains("root_ref()"),
+        "test 16 lost the root_ref identity route retained for its out-of-scope mutation"
     );
     assert!(
         section(

@@ -3464,6 +3464,22 @@ stream 7の先頭は同じ`A %here is a comment` bytesだった。flpdf driver�
 `-- stream 0 --`から同じstream prefixを出力し、normalize warningをqpdf-compatibleな
 filename/offset付きで排出する。case 3は`canonical`へ再分類した。
 
+### qtest E-28 test 11 canonical root cutover `flpdf-3yn9.48.110` (2026-09-15)
+
+qpdfの`test_11`はpublic `QPDF::getRoot()`でtrailerの`/Root`を取得し、辞書でなければ
+`damagedPDF`を投げ、check modeではCatalog `/Type`を検査・修復してlive Catalog handleを
+返す（`qpdf/test_driver.cc:538-550`、`include/qpdf/QPDF.hh:311-313`、
+`libqpdf/QPDF.cc:2354-2367`）。そのhandleから`getKey("/QStream")`を呼び、公開の
+`getStreamData()`と`getRawStreamData()`へ渡す（`libqpdf/QPDFObjectHandle.cc:1288-1298`、
+`libqpdf/QPDF_Stream.cc:362-376`）。
+
+flpdfの`run_test_11`は従来、semantic Catalog accessにqpdf対応物のない
+`root_ref()` → `get_object_handle()` identity projectionを挟んでいた。既存canonicalの
+`Pdf::root_handle()`へ切り替え、qpdfと同じdirect/indirect `/Root` dictionary boundaryを
+使うようにした。`try_get_key`、`get_stream_data(DecodeLevel::Generalized)`、
+`get_raw_stream_data`は変更せず、`stream-data.pdf`のflpdf driver outputとqpdfの
+`test11.out`を`cmp`で比較して一致を確認した。case 11は`canonical`へ再分類した。
+
 ### qtest E-28 test 31 lazy null accessor cutover `flpdf-3yn9.48.104` (2026-09-15)
 
 qpdf の `QPDFObjectHandle::isNull()` は public accessor であり、実装は
