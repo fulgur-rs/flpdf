@@ -4431,6 +4431,11 @@ fn run_json(
     if let Some(input) = input {
         job.set_input_name_bytes(path_description(input));
     }
+    // qpdf gates its attachment reports on the job's own verbosity
+    // (`QPDFJob::doIfVerbose`, `libqpdf/QPDFJob.cc:340-345`, used by the
+    // attach report at `:2067-2070`). The inspection-transformation
+    // configurator sets it only when it has a transformation to install.
+    job.set_verbose(cli.verbose);
     configure_top_level_attachment_mutations(&mut job, cli, attachment_segments)?;
 
     if empty {
