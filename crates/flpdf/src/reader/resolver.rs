@@ -935,6 +935,21 @@ impl ReadObjectAtOffsetError {
     }
 }
 
+/// Return qpdf's object-count bound from the greatest ordered cache key.
+///
+/// `QPDF::getObjectCount` reads `m->obj_cache.rbegin()->first` after cache
+/// preparation (`libqpdf/QPDF.cc:1271-1283`). `QpdfObjGen` has the same
+/// object-number-major, generation-minor ordering as qpdf's `QPDFObjGen`
+/// (`include/qpdf/QPDFObjGen.hh:48-52`), so the reverse key bound avoids
+/// scanning the complete cache.
+fn max_object_number_from_ordered_keys<'a, I>(mut keys: I) -> Option<u32>
+where
+    I: DoubleEndedIterator<Item = &'a QpdfObjGen>,
+{
+    keys.next_back()
+        .and_then(|object_gen| u32::try_from(object_gen.get_obj()).ok())
+}
+
 impl<R: Read + Seek> ResolverHandle<R> {
     /// Build the resolver already inside its `Rc`.
     ///
@@ -1604,12 +1619,7 @@ impl<R: Read + Seek> ResolverHandle<R> {
 
     /// The largest object *number* any canonical handle occupies.
     pub(crate) fn max_object_number(&self) -> Option<u32> {
-        self.core
-            .borrow()
-            .object_cache
-            .keys()
-            .filter_map(|object_gen| u32::try_from(object_gen.get_obj()).ok())
-            .max()
+        max_object_number_from_ordered_keys(self.core.borrow().object_cache.keys())
     }
 
     /// Resolve every unresolved entry in the effective xref table, matching
@@ -15520,6 +15530,25 @@ mod tests {
             "a fixed preparation must not resolve the xref table again"
         );
         assert!(reads_after_first > reads_before);
+    }
+
+    #[test]
+    fn max_object_number_from_ordered_keys_uses_qpdfs_reverse_cache_bound() {
+        let ordered_keys = [
+            QpdfObjGen::new(-1, 0),
+            QpdfObjGen::new(7, 0),
+            QpdfObjGen::new(7, 2),
+            QpdfObjGen::new(9, 1),
+        ];
+
+        assert_eq!(
+            super::max_object_number_from_ordered_keys(ordered_keys.iter()),
+            Some(9)
+        );
+        assert_eq!(
+            super::max_object_number_from_ordered_keys([QpdfObjGen::new(-1, 0)].iter()),
+            None
+        );
     }
 
     #[test]
