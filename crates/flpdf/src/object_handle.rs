@@ -5977,6 +5977,12 @@ impl ObjectHandle {
     /// Unlike [`Self::as_stream_dict`], this is fallible and resolving: a
     /// non-stream or uninitialized handle returns qpdf's runtime-error
     /// equivalent, while resolver failures propagate unchanged.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`Error::System`] for a non-stream or uninitialized handle and
+    /// propagates any resolver error encountered while dereferencing an
+    /// indirect handle.
     pub fn try_get_stream_dict(&self) -> Result<ObjectHandle> {
         if !self.is_initialized() {
             return Err(Error::System(
