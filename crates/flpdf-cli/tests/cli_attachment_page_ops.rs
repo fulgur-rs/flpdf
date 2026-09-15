@@ -557,3 +557,78 @@ fn add_attachment_lets_a_later_encrypt_win_over_copy_encryption() {
         "--bits=256 must win over the AES-128 copy-encryption donor"
     );
 }
+
+/// Build an AES-128 encrypted single-page donor with qpdf. Returns `None` when
+/// qpdf is unavailable.
+fn encrypted_paged_donor(directory: &Path) -> Option<std::path::PathBuf> {
+    let source = one_page_pdf();
+    let donor = directory.join("donor.pdf");
+    let status = std::process::Command::new("qpdf")
+        .args([
+            "--static-id",
+            "--allow-weak-crypto",
+            "--encrypt",
+            "--user-password=dpw",
+            "--owner-password=dow",
+            "--bits=128",
+            "--use-aes=y",
+            "--",
+        ])
+        .arg(source.path())
+        .arg(&donor)
+        .status()
+        .ok()?;
+    status.success().then_some(donor)
+}
+
+#[test]
+fn add_attachment_keeps_donor_credentials_for_page_sources() {
+    if !qpdf_available() {
+        eprintln!("qpdf not available; skipping the page-source credential check");
+        return;
+    }
+    let temp = tempfile::tempdir().unwrap();
+    let input = one_page_pdf();
+    let attachment = attachment_temp(temp.path());
+    let donor = encrypted_paged_donor(temp.path()).expect("qpdf builds the encrypted donor");
+    let output = temp.path().join("out.pdf");
+
+    // qpdf keeps `encryption_file` and its password for the page-spec fallback
+    // even when a later --encrypt takes over the output mode: only the
+    // `copy_encryption` flag that gates the writer is cleared
+    // (`libqpdf/QPDFJob_config.cc:146-148,1164-1166`,
+    // `QPDFJob.cc:2405-2410,2891-2900`). Selecting a page from the donor
+    // without a per-spec password must therefore still authenticate.
+    CargoCommand::cargo_bin("flpdf")
+        .unwrap()
+        .args([
+            "--static-id",
+            input.path().to_str().unwrap(),
+            &format!("--copy-encryption={}", donor.to_str().unwrap()),
+            "--encryption-file-password=dow",
+            "--pages",
+            donor.to_str().unwrap(),
+            "1",
+            "--",
+            "--encrypt",
+            "--user-password=newu",
+            "--owner-password=newo",
+            "--bits=256",
+            "--",
+            "--add-attachment",
+            attachment.to_str().unwrap(),
+            "--creationdate=D:20200102030405Z",
+            "--moddate=D:20200102030405Z",
+            "--",
+            output.to_str().unwrap(),
+        ])
+        .assert()
+        .success();
+
+    assert_eq!(
+        encryption_revision(&output, "newo"),
+        6,
+        "the later --encrypt must own the output mode while the donor \
+         credentials stay available to the page source"
+    );
+}

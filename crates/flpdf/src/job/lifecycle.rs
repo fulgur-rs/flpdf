@@ -186,6 +186,12 @@ struct JobConfiguration {
     output_file: Option<PathBuf>,
     password: Vec<u8>,
     copy_encryption: Option<PathBuf>,
+    /// Whether `copy_encryption` still governs the output encryption.
+    ///
+    /// qpdf's `--decrypt`/`--encrypt` clear the `copy_encryption` flag but
+    /// keep `encryption_file` for the page-spec password fallback
+    /// (`libqpdf/QPDFJob_config.cc:146-148,155-157,1164-1166`).
+    copy_encryption_applies_to_writer: bool,
     encryption_file_password: Vec<u8>,
     password_mode: PasswordMode,
     ignore_xref_streams: bool,
@@ -3304,7 +3310,12 @@ impl QPDFJob {
         if let Some((version, extension_level)) = self.configuration.max_input_version.clone() {
             writer_configuration.set_minimum_pdf_version(version, extension_level);
         }
-        if let Some(path) = self.configuration.copy_encryption.clone() {
+        let writer_donor = self
+            .configuration
+            .copy_encryption_applies_to_writer
+            .then(|| self.configuration.copy_encryption.clone())
+            .flatten();
+        if let Some(path) = writer_donor {
             match self.copy_encryption_source(&path) {
                 Ok(Some(source)) => writer_configuration.copy_encryption_parameters(source),
                 Ok(None) => {
@@ -4968,8 +4979,27 @@ impl QPDFJobConfig<'_> {
         password: impl Into<Vec<u8>>,
     ) -> &mut Self {
         self.job.configuration.copy_encryption = Some(path.into());
+        self.job.configuration.copy_encryption_applies_to_writer = true;
         self.job.configuration.encryption_file_password = password.into();
         self.job.configuration.writer.clear_encryption_parameters();
+        self
+    }
+
+    /// Drop the writer side of a previous [`copy_encryption`] call while
+    /// keeping the donor filename and password for page-specification
+    /// authentication.
+    ///
+    /// qpdf holds these separately: `--decrypt` and `--encrypt` clear only the
+    /// `copy_encryption` flag that gates
+    /// `QPDFWriter::copyEncryptionParameters`
+    /// (`libqpdf/QPDFJob_config.cc:155-157,1164-1166`, applied at
+    /// `QPDFJob.cc:2891-2900`), while `encryption_file` and
+    /// `encryption_file_password` are never cleared and remain available to
+    /// the page-specification password fallback at `QPDFJob.cc:2405-2410`.
+    ///
+    /// [`copy_encryption`]: Self::copy_encryption
+    pub fn clear_copy_encryption_for_writer(&mut self) -> &mut Self {
+        self.job.configuration.copy_encryption_applies_to_writer = false;
         self
     }
 

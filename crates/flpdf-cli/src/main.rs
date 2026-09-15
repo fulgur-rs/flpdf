@@ -3542,11 +3542,11 @@ fn main() {
             top_level_compression_level,
             &top_level_version_options,
         );
-        let copy_encryption_for_attachment =
-            cli_copy_encryption(&args).map(|(path, password)| (path.to_path_buf(), password));
+        let copy_encryption_for_attachment = cli_copy_encryption(&args)
+            .map(|(path, password, wins)| (path.to_path_buf(), password, wins));
         let copy_encryption_for_attachment = copy_encryption_for_attachment
             .as_ref()
-            .map(|(path, password)| (path.as_path(), password.clone()));
+            .map(|(path, password, wins)| (path.as_path(), password.clone(), *wins));
         run_remove_attachment(
             args.input,
             args.output,
@@ -3572,11 +3572,11 @@ fn main() {
             top_level_compression_level,
             &top_level_version_options,
         );
-        let copy_encryption_for_attachment =
-            cli_copy_encryption(&args).map(|(path, password)| (path.to_path_buf(), password));
+        let copy_encryption_for_attachment = cli_copy_encryption(&args)
+            .map(|(path, password, wins)| (path.to_path_buf(), password, wins));
         let copy_encryption_for_attachment = copy_encryption_for_attachment
             .as_ref()
-            .map(|(path, password)| (path.as_path(), password.clone()));
+            .map(|(path, password, wins)| (path.as_path(), password.clone(), *wins));
         run_add_attachment(
             args.input,
             args.output,
@@ -3606,11 +3606,11 @@ fn main() {
             top_level_compression_level,
             &top_level_version_options,
         );
-        let copy_encryption_for_attachment =
-            cli_copy_encryption(&args).map(|(path, password)| (path.to_path_buf(), password));
+        let copy_encryption_for_attachment = cli_copy_encryption(&args)
+            .map(|(path, password, wins)| (path.to_path_buf(), password, wins));
         let copy_encryption_for_attachment = copy_encryption_for_attachment
             .as_ref()
-            .map(|(path, password)| (path.as_path(), password.clone()));
+            .map(|(path, password, wins)| (path.as_path(), password.clone(), *wins));
         run_copy_attachments_from(
             args.input,
             args.output,
@@ -10290,7 +10290,7 @@ fn configure_attachment_job(
     input: &Path,
     output: Option<&Path>,
     page_ops: &PageOpArgs,
-    copy_encryption: Option<(&Path, Vec<u8>)>,
+    copy_encryption: Option<(&Path, Vec<u8>, bool)>,
     remove_unreferenced_resources: CliRemoveUnreferencedResources,
     replace_input: bool,
     repair: bool,
@@ -10340,8 +10340,14 @@ fn configure_attachment_job(
         // qpdf falls back to --encryption-file-password for a page source that
         // names the copy-encryption file without its own password, so the job
         // needs these fields, not only the already-opened writer source.
-        if let Some((path, password)) = copy_encryption {
+        if let Some((path, password, wins)) = copy_encryption {
             configuration.copy_encryption(path.to_path_buf(), password);
+            if !wins {
+                // The credentials must stay for the page-spec fallback, but a
+                // later --encrypt/--decrypt owns the output mode: undo the
+                // writer side that `copy_encryption` cleared and installed.
+                configuration.clear_copy_encryption_for_writer();
+            }
         }
         configuration.remove_unreferenced_resources(remove_unreferenced_resources.into());
         for spec in raw_specs {
@@ -10423,21 +10429,25 @@ fn run_configured_attachment_job(
 /// `--encryption-file-password`, so the job needs these fields even when the
 /// writer already holds the opened encryption source.
 ///
-/// Only forward them when copy-encryption is the winning encryption mode: a
-/// later `--encrypt` or `--decrypt` overrides it, and `write_qpdf` would
-/// otherwise reapply the donor source over the effective writer options.
-fn cli_copy_encryption(args: &Cli) -> Option<(&Path, Vec<u8>)> {
+/// qpdf keeps the two uses apart: `--decrypt` and `--encrypt` clear only the
+/// `copy_encryption` flag that gates the writer
+/// (`libqpdf/QPDFJob_config.cc:146-148,155-157,1164-1166`), while
+/// `encryption_file` and its password are never cleared and stay available to
+/// the page-spec fallback. The third element reports whether copy-encryption
+/// is still the winning output mode, so the caller can keep the credentials
+/// without reapplying the donor's parameters to the writer.
+fn cli_copy_encryption(args: &Cli) -> Option<(&Path, Vec<u8>, bool)> {
     let path = args.copy_encryption.as_deref()?;
-    let winner = args.last_encryption_mode.or({
-        if args.raw_encrypt_segments.is_some() {
-            Some(EncryptionMode::Encrypt)
-        } else {
-            Some(EncryptionMode::CopyEncryption)
-        }
-    });
-    if !matches!(winner, Some(EncryptionMode::CopyEncryption)) {
-        return None;
-    }
+    let wins = matches!(
+        args.last_encryption_mode.or({
+            if args.raw_encrypt_segments.is_some() {
+                Some(EncryptionMode::Encrypt)
+            } else {
+                Some(EncryptionMode::CopyEncryption)
+            }
+        }),
+        Some(EncryptionMode::CopyEncryption)
+    );
     let password = args
         .raw_encryption_file_password
         .clone()
@@ -10447,7 +10457,7 @@ fn cli_copy_encryption(args: &Cli) -> Option<(&Path, Vec<u8>)> {
                 .map(|password| arg_parser::os_bytes(password))
         })
         .unwrap_or_default();
-    Some((path, password))
+    Some((path, password, wins))
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -10455,7 +10465,7 @@ fn run_add_attachment(
     input: Option<PathBuf>,
     output: Option<PathBuf>,
     page_ops: &PageOpArgs,
-    copy_encryption: Option<(&Path, Vec<u8>)>,
+    copy_encryption: Option<(&Path, Vec<u8>, bool)>,
     remove_unreferenced_resources: CliRemoveUnreferencedResources,
     replace_input: bool,
     repair: bool,
@@ -10529,7 +10539,7 @@ fn run_remove_attachment(
     input: Option<PathBuf>,
     output: Option<PathBuf>,
     page_ops: &PageOpArgs,
-    copy_encryption: Option<(&Path, Vec<u8>)>,
+    copy_encryption: Option<(&Path, Vec<u8>, bool)>,
     remove_unreferenced_resources: CliRemoveUnreferencedResources,
     replace_input: bool,
     repair: bool,
@@ -10658,7 +10668,7 @@ fn run_copy_attachments_from(
     input: Option<PathBuf>,
     output: Option<PathBuf>,
     page_ops: &PageOpArgs,
-    copy_encryption: Option<(&Path, Vec<u8>)>,
+    copy_encryption: Option<(&Path, Vec<u8>, bool)>,
     remove_unreferenced_resources: CliRemoveUnreferencedResources,
     replace_input: bool,
     repair: bool,
