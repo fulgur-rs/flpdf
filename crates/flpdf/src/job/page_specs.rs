@@ -897,6 +897,11 @@ fn handle_page_specs_into<R: Read + Seek + 'static, T: Read + Seek + 'static>(
             ))
         })?;
         let source_name = source.input_source_description();
+        // qpdf's QPDFPageData constructor repairs and enumerates the source
+        // before resolving its page range (`QPDFJob.cc:259-269`). The
+        // multi-source path must establish that same canonical page list
+        // before PagePlan observes the live page-tree graph.
+        crate::PageDocumentHelper::new(source).get_all_pages()?;
         let plan = PagePlan::build(source, &spec.range)
             .map_err(|error| page_spec_error(&source_name, spec.source_index, spec_index, error))?;
         plans.push(plan);

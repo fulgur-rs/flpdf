@@ -1049,6 +1049,88 @@ fn pages_cross_document_merge_matches_qpdf() {
 }
 
 #[test]
+fn pages_malformed_primary_tree_repair_matches_qpdf() {
+    if !qpdf_available() {
+        eprintln!("qpdf 11.9.0 is unavailable; skipping malformed page-tree parity");
+        return;
+    }
+
+    let fixture_dir = Path::new(env!("CARGO_MANIFEST_DIR")).join("../../tests/fixtures/compat");
+    let secondary = fixture_dir.join("three-page.pdf");
+    for fixture in ["direct-leaf-kid.pdf", "mistyped-page-tree.pdf"] {
+        let primary = fixture_dir.join(fixture);
+        for collate in [None, Some("--collate=2")] {
+            let stem = collate.map_or("concat", |_| "collate");
+            let temporary = tempfile::tempdir().unwrap();
+            let qpdf_output = temporary.path().join(format!("qpdf-{stem}.pdf"));
+            let flpdf_output = temporary.path().join(format!("flpdf-{stem}.pdf"));
+
+            let mut qpdf_args = vec![
+                "--qdf".to_owned(),
+                "--static-id".to_owned(),
+                "--no-original-object-ids".to_owned(),
+                primary.display().to_string(),
+                "--pages".to_owned(),
+                ".".to_owned(),
+                "1".to_owned(),
+                secondary.display().to_string(),
+                "1-3".to_owned(),
+                "--".to_owned(),
+            ];
+            if let Some(collate) = collate {
+                qpdf_args.push(collate.to_owned());
+            }
+            qpdf_args.push(qpdf_output.display().to_string());
+            let qpdf = Shell::new(QPDF)
+                .args(&qpdf_args)
+                .output()
+                .expect("qpdf should spawn");
+
+            let mut flpdf_args = vec![
+                "--qdf".to_owned(),
+                "--static-id".to_owned(),
+                "--no-original-object-ids".to_owned(),
+                primary.display().to_string(),
+                "--pages".to_owned(),
+                ".".to_owned(),
+                "1".to_owned(),
+                secondary.display().to_string(),
+                "1-3".to_owned(),
+                "--".to_owned(),
+            ];
+            if let Some(collate) = collate {
+                flpdf_args.push(collate.to_owned());
+            }
+            flpdf_args.push(flpdf_output.display().to_string());
+            let flpdf = Command::cargo_bin("flpdf")
+                .unwrap()
+                .env("FLPDF_PROGNAME", "qpdf")
+                .args(&flpdf_args)
+                .output()
+                .expect("flpdf should spawn");
+
+            assert_eq!(
+                qpdf.status.code(),
+                Some(3),
+                "qpdf failed for {fixture}/{stem}"
+            );
+            assert_eq!(
+                flpdf.status.code(),
+                qpdf.status.code(),
+                "status for {fixture}/{stem}"
+            );
+            assert_eq!(flpdf.stdout, qpdf.stdout, "stdout for {fixture}/{stem}");
+            assert_eq!(flpdf.stderr, qpdf.stderr, "stderr for {fixture}/{stem}");
+            assert_eq!(
+                std::fs::read(&flpdf_output).unwrap(),
+                std::fs::read(&qpdf_output).unwrap(),
+                "output bytes for {fixture}/{stem}"
+            );
+        }
+    }
+}
+
+#[test]
 fn pages_duplicate_after_foreign_matches_qpdf_qdf_bytes() {
     // qpdf processes page-spec occurrences in order: the primary page is
     // copied, the foreign page is copied, and only then the repeated primary
