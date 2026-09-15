@@ -773,6 +773,11 @@ pub(crate) struct RawLinearizationPlan {
     pub(crate) content_normalize_refs: BTreeSet<QpdfObjGen>,
     pub(crate) removed_refs: BTreeSet<QpdfObjGen>,
     pub(crate) shared_hints: Vec<RawSharedObjectHintEntry>,
+    /// Whether any raw part list contains an identity that cannot be projected
+    /// to the checked `ObjectRef` representation.  qpdf keeps ObjGen as its
+    /// only identity; flpdf's checked views retain this one plan-time route
+    /// decision for the bounded migration surface that still exposes them.
+    pub(crate) projection_gap: bool,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -1206,7 +1211,7 @@ fn build_raw_linearization_plan<R: Read + Seek>(
         optimization,
     );
 
-    Ok(RawLinearizationPlan {
+    let mut raw = RawLinearizationPlan {
         part2_objects: raw_refs_with_extras_preserving_first(
             part2_objects.iter().copied(),
             raw_part2_extra,
@@ -1236,7 +1241,25 @@ fn build_raw_linearization_plan<R: Read + Seek>(
         content_normalize_refs: content_normalize_refs.clone(),
         removed_refs: raw_removed_refs,
         shared_hints: raw_shared_hints,
-    })
+        projection_gap: false,
+    };
+    raw.projection_gap = raw.compute_projection_gap();
+    Ok(raw)
+}
+
+impl RawLinearizationPlan {
+    fn compute_projection_gap(&self) -> bool {
+        self.part2_objects
+            .iter()
+            .chain(&self.part3_objects)
+            .chain(&self.part4_other_pages_private)
+            .chain(&self.part4_other_pages_shared)
+            .chain(&self.part4_rest)
+            .chain(&self.part4_open_document_plain)
+            .chain(&self.part6_outline_objects)
+            .chain(&self.part9_outline_objects)
+            .any(|object_gen| object_gen.to_object_ref().is_none())
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -2898,17 +2921,7 @@ impl LinearizationPlan {
     }
 
     pub(crate) fn has_raw_projection_gap(&self) -> bool {
-        self.raw
-            .part2_objects
-            .iter()
-            .chain(&self.raw.part3_objects)
-            .chain(&self.raw.part4_other_pages_private)
-            .chain(&self.raw.part4_other_pages_shared)
-            .chain(&self.raw.part4_rest)
-            .chain(&self.raw.part4_open_document_plain)
-            .chain(&self.raw.part6_outline_objects)
-            .chain(&self.raw.part9_outline_objects)
-            .any(|object_gen| object_gen.to_object_ref().is_none())
+        self.raw.projection_gap
     }
 
     /// Useful for callers that want to verify the disjoint invariant.
@@ -3797,6 +3810,7 @@ mod tests {
     use super::{
         collect_direct_handle_refs, collect_direct_handle_refs_with_context,
         collect_direct_handle_refs_with_stream_parameters_context, LinearizationPlan,
+        RawLinearizationPlan,
     };
     use crate::acroform_document_helper::AcroFormDocumentHelper;
     use crate::object_handle::ObjectHandle;
@@ -3809,6 +3823,19 @@ mod tests {
     use std::collections::{BTreeMap, BTreeSet};
     use std::io::{Cursor, Write};
     use std::rc::Rc;
+
+    #[test]
+    fn raw_projection_route_is_materialized_at_plan_construction() {
+        let plan = LinearizationPlan {
+            raw: RawLinearizationPlan {
+                projection_gap: true,
+                ..Default::default()
+            },
+            ..Default::default()
+        };
+
+        assert!(plan.has_raw_projection_gap());
+    }
 
     fn flate(data: &[u8]) -> Vec<u8> {
         let mut encoder = ZlibEncoder::new(Vec::new(), Compression::default());

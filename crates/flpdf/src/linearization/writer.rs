@@ -5140,6 +5140,7 @@ mod tests {
                     QpdfObjGen::new(7, 0),
                     QpdfObjGen::new(8, 65_536),
                 ],
+                projection_gap: true,
                 ..Default::default()
             },
             ..LinearizationPlan::default()
@@ -5163,6 +5164,7 @@ mod tests {
             raw: crate::linearization::plan::RawLinearizationPlan {
                 part4_rest: vec![QpdfObjGen::new(8, 65_536)],
                 part9_outline_objects: vec![QpdfObjGen::new(7, 0)],
+                projection_gap: true,
                 ..Default::default()
             },
             ..LinearizationPlan::default()

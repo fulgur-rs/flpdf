@@ -1369,6 +1369,7 @@ mod tests {
         let plan = LinearizationPlan {
             raw: RawLinearizationPlan {
                 part4_rest: vec![raw],
+                projection_gap: true,
                 ..Default::default()
             },
             ..Default::default()

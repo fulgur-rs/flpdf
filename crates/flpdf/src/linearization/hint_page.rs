@@ -862,6 +862,7 @@ mod tests {
                         referencing_pages: vec![1],
                     },
                 ],
+                projection_gap: true,
                 ..Default::default()
             },
             ..Default::default()
