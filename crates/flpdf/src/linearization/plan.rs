@@ -1056,6 +1056,7 @@ fn raw_refs_with_extras_root_first(
 }
 
 #[allow(clippy::too_many_arguments)]
+#[inline(never)]
 fn build_raw_linearization_plan<R: Read + Seek>(
     pdf: &mut Pdf<R>,
     optimization: &crate::optimization::Optimization,
@@ -1530,6 +1531,7 @@ impl LinearizationPlan {
         Self::from_pdf_with_writer_options_and_source_membership(pdf, options, None, None)
     }
 
+    #[inline(never)]
     pub(crate) fn from_pdf_with_writer_options_and_source_membership<R: Read + Seek>(
         pdf: &mut Pdf<R>,
         options: &crate::writer::WriterOptions,

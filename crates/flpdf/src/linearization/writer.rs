@@ -3638,6 +3638,7 @@ fn validate_per_page_private_objects(plan: &LinearizationPlan) -> Result<()> {
 }
 // qpdf-deviation-end
 
+#[inline(never)]
 fn write_linearized_impl<R: Read + Seek>(
     plan: &LinearizationPlan,
     renumber: RenumberMap,
