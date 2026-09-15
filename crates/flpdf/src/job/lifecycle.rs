@@ -4155,10 +4155,8 @@ impl QPDFJob {
         R: Read + Seek,
     {
         if configuration.remove_page_labels {
-            if let Some(root_ref) = pdf.root_ref() {
-                let root = pdf.get_object_handle(root_ref);
-                root.remove_key(b"/PageLabels");
-            } // cov:ignore: llvm-cov attributes this successful page-label removal continuation to its root mutation expressions
+            let root = pdf.root_handle()?;
+            root.remove_key(b"/PageLabels"); // cov:ignore: the validated Catalog mutation has no qpdf failure branch
         }
         let Some(specs) = configuration.set_page_labels.as_deref() else {
             return Ok(());
@@ -4170,19 +4168,10 @@ impl QPDFJob {
         if specs.is_empty() {
             return Ok(());
         }
-        // cov:ignore-start: defensive catalog guards. A document that opens
-        // successfully always has a dictionary `/Root` (a missing or
-        // non-dictionary catalog fails earlier, during open), and the empty-spec
-        // early return above no longer routes the no-op case through them.
-        let Some(root_ref) = pdf.root_ref() else {
-            return Ok(());
-        };
-        let root = pdf.get_object_handle(root_ref);
-        root.try_dereference()?;
-        if !root.try_is_dictionary()? {
-            return Ok(());
-        }
-        // cov:ignore-end
+        // qpdf's `getRoot()` is the semantic Catalog boundary here: direct and
+        // indirect trailer `/Root` values are both valid, while a missing,
+        // dangling, or non-dictionary root is a document-level error.
+        let root = pdf.root_handle()?;
         let page_count = crate::page_document_helper::PageDocumentHelper::new(pdf)
             .get_all_pages()?
             .len();

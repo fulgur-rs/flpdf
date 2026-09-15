@@ -1364,6 +1364,17 @@ typed `LabelRange` inspection projection remains the bounded compatibility view 
 `flpdf-1j3p`; the qpdf-less rendered display-string bridge was removed by
 `flpdf-3yn9.48.101`.
 
+2026-09-15（`flpdf-hzv1w`）では、qpdf の `QPDF::getRoot`（`QPDF.cc:2355-2368`）が
+要求するのは Catalog 辞書であり indirect identity ではないことを反映し、page-label
+の semantic Catalog read/write（`page_label_document_helper.rs` の
+`hasPageLabels`/再構成、raw 再構成）と `QPDFJob::handleTransformations` 相当の
+`--set-page-labels`/`--remove-page-labels` を `Pdf::root_handle()` 経由へ揃えた。
+これにより direct `/Root` でも live Catalog を変更できる。`root_ref()` は
+identity/numbering 用の参照取得に限って残し、全 caller inventory（production 99、
+24 files / test 196）は consumer/identity residual として分類した。fixture
+`compat/direct-root-one-page.pdf` の `1:D`・`1:r`・`1:A` は qpdf 11.9.0 と
+status/stdout/stderr および output bytes が一致する。
+
 | `QPDFNameTreeObjectHelper` / `QPDFNumberTreeObjectHelper` / `NNTree.cc` | 1394 (`34-75,106-168,216-390,391-520,560-700`) | `nntree.rs`（shared canonical `ObjectHandle` engine + handle-native public `NameTree`/`NameTreeCursor` and `NumberTree`/`NumberTreeCursor`）+ consumer adapters。qpdf の live `QPDFObjectHandle`/`QPDF_Array` mutation（`NNTree.cc:34-75` の iterator value 更新、`:106-168` の limits、`:216-390` の split/insert、`:391-520` の remove/deepen、`:560-700` の find）に対応し、`ResolvedArray` は `ObjectHandle::set_array_items` で alias を保持したまま更新、direct kid の indirect 化は `Pdf::make_indirect_from_object_handle`、root split は既存 root slot を維持する。canonical handle graph の live mutation を writer がそのまま観測する。public NameTree/NumberTree helpers now keep root・key/value・cursor mutation on live handles; the shared engine is entirely handle-native; no raw Object fixture, projection, or bare-reference compatibility route remains | 🔀 |
 | `QPDFEmbeddedFileDocumentHelper.cc` | 122 | `embedded_files.rs`(678) | ✅ D1 完成（`flpdf-jzy7`）: `has_embedded_files`/`get_embedded_files`/`get_embedded_file`/`replace_embedded_file`/`remove_embedded_file` が `QPDFEmbeddedFileDocumentHelper.hh` の公開 API と 1:1 対応。モジュール doc の自己申告も更新済み。D2 は未達のまま — `job/json_sections.rs` の `build_attachments_section` はこのヘルパーを経由せず `NameTree` を直接歩く（`flpdf-q2fo` で解消予定） |
 | `QPDFFileSpecObjectHelper` / `QPDFEFStreamObjectHelper` | 280 | `filespec_helper/filespec.rs` + `filespec_helper/embedded_file_stream.rs` + `filespec_helper/shared.rs` | ✅ D1 完成（`flpdf-d9sq`）。2026-08-23 の `flpdf-3yn9.34` で qpdf の2 helper責務へ物理分割し、high-level attachment file I/O は `job/attachments.rs` に移設した。FileSpec/EFの読み書き・stream decodeはcanonical `ObjectHandle`とprovider pathを維持する。D2 は未達のまま — `job/json_sections.rs::filespec_dict_to_json` が `FileSpec`/`EmbeddedFileStream` を経由せず同じ Mac/DOS 優先順位ロジックを再実装している（`flpdf-q2fo` で解消予定）。旧 `copy_attachments_from`（`copyForeignObject` 以前の独自 `sanitize_imported_object` walk）は `flpdf-s5cw.7` で `QPDFJob::copy_attachments`（`job/attachments.rs`）へ置き換えられ削除済み |
