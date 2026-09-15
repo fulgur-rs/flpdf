@@ -722,11 +722,11 @@ pub(crate) fn run_test_97<R: Read + Seek>(
     // (`libqpdf/QPDFObjectHandle.cc:770-785`), so no separate resolve of
     // `container` is needed before indexing.
     let first_item = container.try_get_array_item(0)?;
-    pdf.resolve(&first_item)?;
-    let items = first_item
-        .as_array()
-        .expect("many-nulls.pdf's /Nulls[0] is a large direct array of nulls");
-    assert!(items.len() > 10000);
+    // qpdf's isArray() resolves the returned receiver before the short-
+    // circuiting getArrayNItems() call (`QPDFObjectHandle.hh:337`,
+    // `QPDFObjectHandle.cc:426-429,
+    // 758-768`). This preserves qpdf's no-warning path for a non-array item.
+    assert!(first_item.try_is_array()? && first_item.try_get_array_n_items()? > 10000);
     let nulls2 = first_item.shallow_copy()?;
     assert_eq!(first_item.unparse(), nulls2.unparse());
     Ok(())
@@ -811,6 +811,7 @@ pub(crate) fn run_test_98<R: Read + Seek>(
 mod test_97_tests {
     use super::run_test_97;
     use flpdf::{ObjectHandle, Pdf};
+    use std::panic::{catch_unwind, AssertUnwindSafe};
 
     fn many_nulls_pdf() -> Pdf<std::io::Cursor<Vec<u8>>> {
         let mut pdf = Pdf::empty().expect("create empty PDF");
@@ -822,6 +823,21 @@ mod test_97_tests {
         let top = ObjectHandle::array(vec![inner]);
         let top = pdf
             .make_indirect_from_object_handle(top)
+            .expect("promote /Nulls container");
+        pdf.trailer()
+            .replace_key(b"/Nulls", top)
+            .expect("install /Nulls trailer entry");
+        pdf
+    }
+
+    fn non_array_nulls_pdf() -> Pdf<std::io::Cursor<Vec<u8>>> {
+        let mut pdf = Pdf::empty().expect("create empty PDF");
+        let item = pdf
+            .make_indirect_object_handle(ObjectHandle::integer(1))
+            .expect("promote non-array item");
+        let inner = ObjectHandle::array(vec![item]);
+        let top = pdf
+            .make_indirect_from_object_handle(inner)
             .expect("promote /Nulls container");
         pdf.trailer()
             .replace_key(b"/Nulls", top)
@@ -848,6 +864,34 @@ mod test_97_tests {
 
         assert!(stdout.is_empty());
         assert!(stderr.is_empty());
+    }
+
+    #[test]
+    fn test_97_short_circuits_array_count_for_a_non_array_item() {
+        let mut pdf = non_array_nulls_pdf();
+        let mut stdout = Vec::new();
+        let mut stderr = Vec::new();
+        let mut diagnostics_written = 0;
+
+        let result = catch_unwind(AssertUnwindSafe(|| {
+            run_test_97(
+                &mut pdf,
+                b"non-array-nulls.pdf",
+                None,
+                &mut stdout,
+                &mut stderr,
+                &mut diagnostics_written,
+            )
+        }));
+
+        assert!(
+            result.is_err(),
+            "qpdf's assert must reject a non-array item"
+        );
+        assert!(
+            pdf.repair_diagnostics().entries().is_empty(),
+            "qpdf's short-circuit must not call getArrayNItems on a non-array"
+        );
     }
 }
 
