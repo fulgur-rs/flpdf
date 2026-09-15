@@ -1967,9 +1967,20 @@ impl LinearizationPlan {
             // ObjStm projections and malformed page shapes whose raw map is not
             // the writer's object universe.
             let closure: Vec<ObjectRef> = if use_optimization_page_user_map {
-                optimization
-                    .objects_for(&crate::optimization::ObjectUser::Page(page_idx as u32))
-                    .collect()
+                // qpdf places the page object itself before iterating the map
+                // (`QPDF_linearization.cc:1231-1238` pushes `pages.at(i)` and
+                // erases it from `lc_other_page_private`, so the loop at
+                // `:1249-1255` can no longer emit it). The map alone is sorted
+                // by object id, which would emit the page dictionary in the
+                // middle of its own descendants.
+                let mut closure = Vec::new();
+                closure.push(page_ref);
+                closure.extend(
+                    optimization
+                        .objects_for(&crate::optimization::ObjectUser::Page(page_idx as u32))
+                        .filter(|object_ref| *object_ref != page_ref),
+                );
+                closure
             } else {
                 let mut closure = compute_closure_with_stream_parameters(
                     pdf,

@@ -352,6 +352,10 @@ jobs:
           # (structural + strict, incl. the in_open_document openaction oracles
           # and the multi-container OD ordering discriminator flpdf-699x).
           cargo test -p flpdf --features qpdf-zlib-compat --test cmp_linearize_objstm_tests
+          # Pins later-page part7 ordering: qpdf places the page object before
+          # iterating its object-user map, so the page dictionary precedes its
+          # own descendants even though that map is sorted by object id.
+          cargo test -p flpdf --features qpdf-zlib-compat --test cmp_linearize_later_page_order_tests
           # Pins overlay copy-annotations output byte-identity vs committed qpdf
           # goldens. The placement families run through the CLI gate below; this
           # family has no CLI counterpart and lives in lib unit tests
