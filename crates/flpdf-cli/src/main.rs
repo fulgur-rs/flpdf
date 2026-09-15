@@ -3542,10 +3542,17 @@ fn main() {
             top_level_compression_level,
             &top_level_version_options,
         );
+        let copy_encryption_for_attachment =
+            cli_copy_encryption(&args).map(|(path, password)| (path.to_path_buf(), password));
+        let copy_encryption_for_attachment = copy_encryption_for_attachment
+            .as_ref()
+            .map(|(path, password)| (path.as_path(), password.clone()));
         run_remove_attachment(
             args.input,
             args.output,
             &args.page_ops,
+            copy_encryption_for_attachment,
+            args.remove_unreferenced_resources,
             args.replace_input,
             args.repair,
             &args.password,
@@ -3565,10 +3572,17 @@ fn main() {
             top_level_compression_level,
             &top_level_version_options,
         );
+        let copy_encryption_for_attachment =
+            cli_copy_encryption(&args).map(|(path, password)| (path.to_path_buf(), password));
+        let copy_encryption_for_attachment = copy_encryption_for_attachment
+            .as_ref()
+            .map(|(path, password)| (path.as_path(), password.clone()));
         run_add_attachment(
             args.input,
             args.output,
             &args.page_ops,
+            copy_encryption_for_attachment,
+            args.remove_unreferenced_resources,
             args.replace_input,
             args.repair,
             &args.password,
@@ -3592,10 +3606,17 @@ fn main() {
             top_level_compression_level,
             &top_level_version_options,
         );
+        let copy_encryption_for_attachment =
+            cli_copy_encryption(&args).map(|(path, password)| (path.to_path_buf(), password));
+        let copy_encryption_for_attachment = copy_encryption_for_attachment
+            .as_ref()
+            .map(|(path, password)| (path.as_path(), password.clone()));
         run_copy_attachments_from(
             args.input,
             args.output,
             &args.page_ops,
+            copy_encryption_for_attachment,
+            args.remove_unreferenced_resources,
             args.replace_input,
             args.repair,
             &args.password,
@@ -10269,6 +10290,8 @@ fn configure_attachment_job(
     input: &Path,
     output: Option<&Path>,
     page_ops: &PageOpArgs,
+    copy_encryption: Option<(&Path, Vec<u8>)>,
+    remove_unreferenced_resources: CliRemoveUnreferencedResources,
     replace_input: bool,
     repair: bool,
     password: &PasswordArgs,
@@ -10303,6 +10326,7 @@ fn configure_attachment_job(
     // handleTransformations, which is where addAttachments/copyAttachments
     // live (`libqpdf/QPDFJob.cc:465-474,2243,2246`). Queue both on the job so
     // the attachment routes observe the same ordering the rewrite route does.
+    configure_keep_files_open(&mut job, page_ops)?;
     {
         // qpdf calls handlePageSpecs only when page_specs is non-empty
         // (`libqpdf/QPDFJob.cc:466`); an empty list must not initialize the
@@ -10313,6 +10337,13 @@ fn configure_attachment_job(
             configured_page_specs(page_ops)?
         };
         let mut configuration = job.config();
+        // qpdf falls back to --encryption-file-password for a page source that
+        // names the copy-encryption file without its own password, so the job
+        // needs these fields, not only the already-opened writer source.
+        if let Some((path, password)) = copy_encryption {
+            configuration.copy_encryption(path.to_path_buf(), password);
+        }
+        configuration.remove_unreferenced_resources(remove_unreferenced_resources.into());
         for spec in raw_specs {
             let password = spec.raw_password.or_else(|| {
                 spec.password
@@ -10359,6 +10390,15 @@ fn run_configured_attachment_job(
     linearize: bool,
     linearize_pass1: Option<&Path>,
 ) -> CliResult<()> {
+    // The page merge inside `create_qpdf` consults the writer configuration
+    // (for instance `preserves_unreferenced_objects`), so it has to be
+    // installed first -- otherwise the merge runs against the defaults and
+    // silently discards orphans despite an explicit `--preserve-unreferenced`.
+    job.set_writer_configuration(writer_configuration_unnormalized(
+        writer_options,
+        linearize,
+        linearize_pass1,
+    )?);
     let mut pdf = match job.create_qpdf()? {
         Some(pdf) => pdf,
         None => {
@@ -10368,11 +10408,6 @@ fn run_configured_attachment_job(
             }))
         }
     };
-    job.set_writer_configuration(writer_configuration_unnormalized(
-        writer_options,
-        linearize,
-        linearize_pass1,
-    )?);
     match job.write_qpdf(&mut pdf) {
         Ok(()) => finish_job_exit_status(job.get_exit_code()),
         Err(_) => Err(Box::new(CliExitError {
@@ -10384,10 +10419,29 @@ fn run_configured_attachment_job(
 
 /// `--add-attachment FILE [sub-flags] -- output.pdf`
 #[allow(clippy::too_many_arguments)]
+/// qpdf lets a page spec that names the `--copy-encryption` file fall back to
+/// `--encryption-file-password`, so the job needs these fields even when the
+/// writer already holds the opened encryption source.
+fn cli_copy_encryption(args: &Cli) -> Option<(&Path, Vec<u8>)> {
+    let path = args.copy_encryption.as_deref()?;
+    let password = args
+        .raw_encryption_file_password
+        .clone()
+        .or_else(|| {
+            args.encryption_file_password
+                .as_ref()
+                .map(|password| arg_parser::os_bytes(password))
+        })
+        .unwrap_or_default();
+    Some((path, password))
+}
+
 fn run_add_attachment(
     input: Option<PathBuf>,
     output: Option<PathBuf>,
     page_ops: &PageOpArgs,
+    copy_encryption: Option<(&Path, Vec<u8>)>,
+    remove_unreferenced_resources: CliRemoveUnreferencedResources,
     replace_input: bool,
     repair: bool,
     password: &PasswordArgs,
@@ -10432,6 +10486,8 @@ fn run_add_attachment(
         &input,
         output.as_deref(),
         page_ops,
+        copy_encryption,
+        remove_unreferenced_resources,
         replace_input,
         repair,
         password,
@@ -10458,6 +10514,8 @@ fn run_remove_attachment(
     input: Option<PathBuf>,
     output: Option<PathBuf>,
     page_ops: &PageOpArgs,
+    copy_encryption: Option<(&Path, Vec<u8>)>,
+    remove_unreferenced_resources: CliRemoveUnreferencedResources,
     replace_input: bool,
     repair: bool,
     password: &PasswordArgs,
@@ -10478,6 +10536,8 @@ fn run_remove_attachment(
         &input,
         output.as_deref(),
         page_ops,
+        copy_encryption,
+        remove_unreferenced_resources,
         replace_input,
         repair,
         password,
@@ -10583,6 +10643,8 @@ fn run_copy_attachments_from(
     input: Option<PathBuf>,
     output: Option<PathBuf>,
     page_ops: &PageOpArgs,
+    copy_encryption: Option<(&Path, Vec<u8>)>,
+    remove_unreferenced_resources: CliRemoveUnreferencedResources,
     replace_input: bool,
     repair: bool,
     password: &PasswordArgs,
@@ -10611,6 +10673,8 @@ fn run_copy_attachments_from(
         &input,
         output.as_deref(),
         page_ops,
+        copy_encryption,
+        remove_unreferenced_resources,
         replace_input,
         repair,
         password,
