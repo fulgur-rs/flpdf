@@ -951,13 +951,18 @@ fn handle_page_specs_into<R: Read + Seek + 'static, T: Read + Seek + 'static>(
     // See the sibling guard removal above: qpdf has no empty-selection check.
     let remove_resources = report_page_spec_diagnostics(job, sources, specs, resource_mode)?;
 
-    // qpdf's label accumulator is populated in final output order, not in
-    // source-group order. Capture it before borrowing all sources for the
-    // merge. When any source has labels, sources without labels still
-    // contribute qpdf's default decimal label for their selected pages.
+    // qpdf constructs QPDFPageLabelDocumentHelper only for each parsed page
+    // specification, not for every opened source. Keep unused secondary
+    // sources on that fast path, especially when they are an empty document
+    // without a Catalog. The label accumulator is populated in final output
+    // order, not in source-group order. When any referenced source has labels,
+    // referenced sources without labels still contribute qpdf's default
+    // decimal label for their selected pages.
     let mut any_page_labels = false;
-    for source in sources.iter_mut() {
-        any_page_labels |= source.page_labels().has_page_labels()?;
+    let referenced_source_indices: BTreeSet<_> =
+        specs.iter().map(|spec| spec.source_index).collect();
+    for source_index in referenced_source_indices {
+        any_page_labels |= sources[source_index].page_labels().has_page_labels()?;
     }
 
     let mut label_entries: Vec<RawPageLabelEntry> = Vec::new();

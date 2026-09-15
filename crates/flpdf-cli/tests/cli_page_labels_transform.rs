@@ -83,6 +83,59 @@ fn top_level_set_page_labels_matches_qpdf_raw_catalog_shape() {
 }
 
 #[test]
+fn direct_root_set_page_labels_matches_qpdf_bytes() {
+    if !qpdf_available() {
+        eprintln!("[SKIP cli_page_labels_transform] qpdf 11.9.0 is unavailable");
+        return;
+    }
+    let input = fixture("compat/direct-root-one-page.pdf");
+
+    for spec in ["1:D", "1:r", "1:A"] {
+        let tempdir = tempfile::tempdir().expect("temporary directory");
+        let qpdf_output = tempdir.path().join("qpdf.pdf");
+        let flpdf_output = tempdir.path().join("flpdf.pdf");
+        let qpdf = run_qpdf(&[
+            Path::new("--static-id"),
+            &input,
+            &qpdf_output,
+            Path::new("--set-page-labels"),
+            Path::new(spec),
+            Path::new("--"),
+        ]);
+        let flpdf = Command::cargo_bin("flpdf")
+            .expect("flpdf binary")
+            .args(["--static-id", "--set-page-labels", spec, "--"])
+            .arg(&input)
+            .arg(&flpdf_output)
+            .output()
+            .expect("run flpdf");
+
+        assert_eq!(
+            flpdf.status.code(),
+            qpdf.status.code(),
+            "status differs for direct-root spec {spec}: qpdf stderr: {}\nflpdf stderr: {}",
+            String::from_utf8_lossy(&qpdf.stderr),
+            String::from_utf8_lossy(&flpdf.stderr)
+        );
+        assert_eq!(
+            flpdf.stdout, qpdf.stdout,
+            "stdout differs for direct-root spec {spec}"
+        );
+        assert_eq!(
+            flpdf.stderr, qpdf.stderr,
+            "stderr differs for direct-root spec {spec}"
+        );
+        assert!(qpdf.status.success(), "qpdf failed for {spec}");
+        assert!(flpdf.status.success(), "flpdf failed for {spec}");
+        assert_eq!(
+            std::fs::read(&flpdf_output).expect("read flpdf output"),
+            std::fs::read(&qpdf_output).expect("read qpdf output"),
+            "output bytes differ for direct-root spec {spec}"
+        );
+    }
+}
+
+#[test]
 fn top_level_remove_page_labels_removes_catalog_key() {
     if !qpdf_available() {
         eprintln!("[SKIP cli_page_labels_transform] qpdf 11.9.0 is unavailable");

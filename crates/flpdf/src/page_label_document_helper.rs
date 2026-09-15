@@ -243,14 +243,7 @@ impl<'a, R: Read + Seek> PageLabelDocumentHelper<'a, R> {
     /// graph. Values that resolve to null are absent, matching qpdf's
     /// `QPDF_Dictionary::hasKey` visibility rule.
     fn pagelabels_root_handle(&mut self) -> Result<Option<ObjectHandle>> {
-        let Some(catalog_ref) = self.pdf.root_ref() else {
-            return Ok(None);
-        };
-        let catalog = self.pdf.get_object_handle(catalog_ref);
-        catalog.try_dereference()?;
-        if !catalog.try_is_dictionary()? {
-            return Ok(None);
-        }
+        let catalog = self.pdf.root_handle()?;
         // qpdf's QPDF_Dictionary::hasKey hides values that are null, including
         // an indirect reference that resolves to null (QPDF_Dictionary.cc:98-101).
         if !catalog.try_has_key(b"/PageLabels")? {
@@ -700,21 +693,17 @@ impl<'a, R: Read + Seek> PageLabelDocumentHelper<'a, R> {
     /// shape of, any prior value. Pair with [`Self::label_for_page`] or a
     /// caller-provided typed compatibility view, which produce the `entries`
     /// this expects.
-    /// A no-op when the document has no catalog, or the catalog is not a
-    /// dictionary.
+    ///
+    /// The catalog is resolved through qpdf's `QPDF::getRoot`-shaped
+    /// dictionary gate, so a missing, dangling, or non-dictionary `/Root` is
+    /// an error rather than a silent no-op.
     ///
     /// # Errors
     ///
-    /// Any error from canonical ObjectHandle resolution.
+    /// Any error from canonical ObjectHandle resolution, including qpdf's
+    /// `unable to find /Root dictionary` error.
     pub fn write_reconstructed_labels(&mut self, entries: &[(i64, LabelRange)]) -> Result<()> {
-        let Some(catalog_ref) = self.pdf.root_ref() else {
-            return Ok(());
-        };
-        let catalog = self.pdf.get_object_handle(catalog_ref);
-        catalog.try_dereference()?;
-        if !catalog.try_is_dictionary()? {
-            return Ok(());
-        }
+        let catalog = self.pdf.root_handle()?;
         let mut nums = Vec::with_capacity(entries.len() * 2);
         for (idx, range) in entries {
             nums.push(ObjectHandle::integer(*idx));
@@ -735,14 +724,7 @@ impl<'a, R: Read + Seek> PageLabelDocumentHelper<'a, R> {
         &mut self,
         entries: &[(i64, LabelRange, bool)],
     ) -> Result<()> {
-        let Some(catalog_ref) = self.pdf.root_ref() else {
-            return Ok(());
-        };
-        let catalog = self.pdf.get_object_handle(catalog_ref);
-        catalog.try_dereference()?;
-        if !catalog.try_is_dictionary()? {
-            return Ok(());
-        }
+        let catalog = self.pdf.root_handle()?;
         let mut nums = Vec::with_capacity(entries.len() * 2);
         for (idx, range, prefix_present) in entries {
             nums.push(ObjectHandle::integer(*idx));
@@ -761,14 +743,7 @@ impl<'a, R: Read + Seek> PageLabelDocumentHelper<'a, R> {
         &mut self,
         entries: &[(i64, ObjectHandle)],
     ) -> Result<()> {
-        let Some(catalog_ref) = self.pdf.root_ref() else {
-            return Ok(());
-        };
-        let catalog = self.pdf.get_object_handle(catalog_ref);
-        catalog.try_dereference()?;
-        if !catalog.try_is_dictionary()? {
-            return Ok(());
-        }
+        let catalog = self.pdf.root_handle()?;
         let mut nums = Vec::with_capacity(entries.len() * 2);
         for (index, label) in entries {
             nums.push(ObjectHandle::integer(*index));
@@ -854,6 +829,27 @@ mod tests {
             .as_bytes(),
         );
         Pdf::open(Cursor::new(bytes)).expect("open")
+    }
+
+    /// A minimal one-page PDF whose trailer contains the Catalog directly in
+    /// `/Root`, matching qpdf's accepted direct-root form.
+    fn direct_root_one_page_pdf() -> Pdf<Cursor<Vec<u8>>> {
+        let mut bytes = Vec::new();
+        bytes.extend_from_slice(b"%PDF-1.4\n");
+        let off1 = bytes.len() as u64;
+        bytes.extend_from_slice(b"1 0 obj\n<< /Type /Pages /Count 1 /Kids [2 0 R] >>\nendobj\n");
+        let off2 = bytes.len() as u64;
+        bytes.extend_from_slice(
+            b"2 0 obj\n<< /Type /Page /Parent 1 0 R /MediaBox [0 0 612 792] >>\nendobj\n",
+        );
+        let xref = bytes.len() as u64;
+        bytes.extend_from_slice(
+            format!(
+                "xref\n0 3\n0000000000 65535 f \n{off1:010} 00000 n \n{off2:010} 00000 n \ntrailer\n<< /Size 3 /Root << /Type /Catalog /Pages 1 0 R >> >>\nstartxref\n{xref}\n%%EOF\n"
+            )
+            .as_bytes(),
+        );
+        Pdf::open(Cursor::new(bytes)).expect("open direct-root fixture")
     }
 
     fn install_page_labels(pdf: &mut Pdf<Cursor<Vec<u8>>>, value: ObjectHandle) {
@@ -1554,23 +1550,22 @@ mod tests {
     }
 
     #[test]
-    fn helper_tolerates_non_dict_catalog() {
+    fn helper_rejects_non_dict_catalog() {
         let mut pdf = pdf_with_pagelabels(vec![]);
         let catalog_ref = pdf.root_ref().unwrap();
         pdf.replace_object(catalog_ref, ObjectHandle::integer(0))
             .unwrap(); // catalog no longer a dict
         let mut h = pdf.page_labels();
-        assert!(
-            !h.has_page_labels().unwrap(),
-            "non-dict catalog => no labels"
-        );
-        assert_eq!(h.ranges().unwrap(), vec![]);
+        let error = h
+            .has_page_labels()
+            .expect_err("qpdf getRoot rejects a non-dictionary Catalog");
+        assert_eq!(error.to_string(), "unable to find /Root dictionary");
     }
 
     #[test]
-    fn helper_tolerates_missing_root() {
-        // A trailer without /Root makes root_ref() return None; the helper must
-        // degrade gracefully (no labels, reconstruction is a no-op).
+    fn helper_rejects_missing_root() {
+        // QPDFPageLabelDocumentHelper calls QPDF::getRoot, so a trailer
+        // without /Root is a document-level error, not a missing-label case.
         let mut bytes = Vec::new();
         bytes.extend_from_slice(b"%PDF-1.7\n");
         let off1 = bytes.len() as u64;
@@ -1585,8 +1580,10 @@ mod tests {
         let mut pdf = Pdf::open(Cursor::new(bytes)).expect("rootless trailer still opens");
         assert!(pdf.root_ref().is_none(), "rootless trailer => no root_ref");
         let mut h = pdf.page_labels();
-        assert!(!h.has_page_labels().unwrap());
-        assert_eq!(h.ranges().unwrap(), vec![]);
+        let error = h
+            .has_page_labels()
+            .expect_err("qpdf getRoot rejects a missing Catalog");
+        assert_eq!(error.to_string(), "unable to find /Root dictionary");
     }
 
     /// Shorthand for a plain decimal range starting at `start`, no prefix.
@@ -1653,6 +1650,42 @@ mod tests {
         assert_eq!(ranges.len(), 2);
         assert_eq!(ranges[0].0, 0);
         assert_eq!(ranges[1].0, 3);
+    }
+
+    #[test]
+    fn direct_catalog_root_supports_page_label_reconstruction_and_readback() {
+        let mut pdf = direct_root_one_page_pdf();
+        pdf.page_labels()
+            .write_reconstructed_labels(&[(0, dec(1))])
+            .expect("direct Catalog must accept reconstructed labels");
+
+        let mut helper = pdf.page_labels();
+        assert!(helper
+            .has_page_labels()
+            .expect("read direct Catalog labels"));
+        assert_eq!(
+            helper.ranges().expect("read reconstructed labels"),
+            vec![(0, dec(1))]
+        );
+    }
+
+    #[test]
+    fn direct_catalog_root_supports_raw_page_label_reconstruction() {
+        let mut pdf = direct_root_one_page_pdf();
+        pdf.page_labels()
+            .write_reconstructed_labels_raw(&[(0, label_dict("A", Some(1), None))])
+            .expect("direct Catalog must accept raw reconstructed labels");
+
+        let root = pdf.root_handle().expect("direct Catalog root");
+        let page_labels = root.try_get_key(b"/PageLabels").expect("PageLabels key");
+        assert_eq!(
+            page_labels
+                .try_get_key(b"/Nums")
+                .expect("Nums key")
+                .try_array_len()
+                .expect("Nums array"),
+            Some(2)
+        );
     }
 
     #[test]
@@ -1769,9 +1802,8 @@ mod tests {
     }
 
     #[test]
-    fn write_reconstructed_labels_noop_without_root() {
-        // A trailer without /Root must degrade gracefully, matching the same
-        // tolerant style as the other reconstruction helper.
+    fn write_reconstructed_labels_rejects_missing_root() {
+        // All qpdf reconstruction paths first call QPDF::getRoot.
         let mut bytes = Vec::new();
         bytes.extend_from_slice(b"%PDF-1.7\n");
         let off1 = bytes.len() as u64;
@@ -1785,25 +1817,23 @@ mod tests {
         );
         let mut pdf = Pdf::open(Cursor::new(bytes)).expect("rootless trailer still opens");
         let mut h = pdf.page_labels();
-        h.write_reconstructed_labels(&[(0, none_range(1))]).unwrap();
-        h.write_reconstructed_labels_with_prefix_presence(&[(0, none_range(1), false)])
-            .unwrap();
-        h.write_reconstructed_labels_raw(&[(0, ObjectHandle::dictionary(Vec::new()))])
-            .unwrap();
+        let error = h
+            .write_reconstructed_labels(&[(0, none_range(1))])
+            .expect_err("qpdf getRoot rejects a missing Catalog");
+        assert_eq!(error.to_string(), "unable to find /Root dictionary");
     }
 
     #[test]
-    fn write_reconstructed_labels_noop_on_non_dict_catalog() {
+    fn write_reconstructed_labels_rejects_non_dict_catalog() {
         let mut pdf = bare_one_page_pdf();
         let catalog_ref = pdf.root_ref().unwrap();
         pdf.replace_object(catalog_ref, ObjectHandle::integer(0))
             .unwrap(); // catalog no longer a dict
         let mut h = pdf.page_labels();
-        h.write_reconstructed_labels(&[(0, none_range(1))]).unwrap();
-        h.write_reconstructed_labels_with_prefix_presence(&[(0, none_range(1), false)])
-            .unwrap();
-        h.write_reconstructed_labels_raw(&[(0, ObjectHandle::dictionary(Vec::new()))])
-            .unwrap();
+        let error = h
+            .write_reconstructed_labels(&[(0, none_range(1))])
+            .expect_err("qpdf getRoot rejects a non-dictionary Catalog");
+        assert_eq!(error.to_string(), "unable to find /Root dictionary");
     }
 
     // ---- live-qpdf 11.9.0 oracle: get_label_for_page / get_labels_for_page_range ----
