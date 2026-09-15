@@ -2615,6 +2615,14 @@ flpdf が「dict キーは drop / 配列要素は null 保持」という非対�
 
 `job/page_specs.rs` がqpdfのjob-level orchestration（`QPDFJob.cc:2360-2632`）を所有し、
 `job/page_merge.rs` と `PageDocumentHelper` がforeign page copy/page-tree primitiveを所有する。
+2026-09-15（`flpdf-kiou0`）: qpdf の `QPDFPageData` は各 page spec の range 解決前に
+`getAllPages()` を呼び、既存 `/Pages` graph の `/Type` 修復・direct kid 昇格結果を
+その spec に渡す（`QPDFJob.cc:259-269`, `QPDF_pages.cc:39-138`）。flpdf の
+multi-source `handle_page_specs_into` も各 `PagePlan::build` の前に
+`PageDocumentHelper::get_all_pages` を通すようにし、direct leaf と mistyped page-tree
+fixture の warning、page count、QDF output bytes を qpdf 11.9.0 と一致させる。
+これは fixture 固有分岐や別の page walker を追加せず、既存 canonical repair owner の
+呼び出し順を qpdf に合わせる修正である。
 `.40` では `resources.rs` に残る `QPDFPageObjectHelper::removeUnreferencedResources`
 相当の page/Form mutation と、`job/resource_pruning.rs` に移した
 `QPDFJob::shouldRemoveUnreferencedResources` 相当の `auto|yes|no` policy を分離した。
