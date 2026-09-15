@@ -5968,6 +5968,31 @@ impl ObjectHandle {
         }
     }
 
+    /// Return the live dictionary owned by a stream after lazily resolving the
+    /// receiver. This is qpdf's public `QPDFObjectHandle::getDict()` boundary
+    /// (`include/qpdf/QPDFObjectHandle.hh:968-970`), whose implementation calls
+    /// `asStreamWithAssert()` and therefore dereferences before asserting the
+    /// stream type (`libqpdf/QPDFObjectHandle.cc:313-324,1257-1262`).
+    ///
+    /// Unlike [`Self::as_stream_dict`], this is fallible and resolving: a
+    /// non-stream or uninitialized handle returns qpdf's runtime-error
+    /// equivalent, while resolver failures propagate unchanged.
+    pub fn try_get_stream_dict(&self) -> Result<ObjectHandle> {
+        if !self.is_initialized() {
+            return Err(Error::System(
+                "operation for stream attempted on object of type uninitialized".to_owned(),
+            ));
+        }
+        self.try_dereference()?;
+        if let Some(dictionary) = self.as_stream_dict() {
+            return Ok(dictionary);
+        }
+        let type_name = self.type_name()?;
+        Err(Error::System(format!(
+            "operation for stream attempted on object of type {type_name}"
+        )))
+    }
+
     /// The stream's own dictionary handle if this handle's value — its own
     /// if direct, or its already-resolved value if indirect — is a stream,
     /// or `None` otherwise. This never performs resolution itself: an
