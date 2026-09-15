@@ -2298,6 +2298,7 @@ impl QPDFJob {
         }
         if let Some(copy_encryption) = job_json_string(&members, b"copyEncryption")? {
             configuration.copy_encryption = Some(path_from_qpdf_json_bytes(&copy_encryption));
+            configuration.copy_encryption_applies_to_writer = true;
             configuration.writer.clear_encryption_parameters();
         }
         if members.contains_key(b"encryptionFilePassword".as_slice()) {
@@ -2422,7 +2423,10 @@ impl QPDFJob {
         if job_json_bare(&members, b"decrypt")? {
             configuration.writer.set_preserve_encryption(false);
             configuration.writer.clear_encryption_parameters();
-            configuration.copy_encryption = None;
+            // qpdf clears only the `copy_encryption` flag; `encryption_file`
+            // and its password stay for the page-spec fallback
+            // (`QPDFJob_config.cc:155-157`, `QPDFJob.cc:2405-2410`).
+            configuration.copy_encryption_applies_to_writer = false;
         }
         if job_json_bare(&members, b"deterministicId")? {
             configuration.writer.set_deterministic_id(true);
@@ -2692,7 +2696,7 @@ impl QPDFJob {
             // decrypt state (`QPDFJob_config.cc:1158-1167`). The generated
             // handler visits `copyEncryption` before `encrypt`, so preserve
             // that precedence in the configuration snapshot.
-            configuration.copy_encryption = None;
+            configuration.copy_encryption_applies_to_writer = false;
             configuration
                 .writer
                 .set_encryption_parameters(parse_job_encrypt(
