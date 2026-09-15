@@ -4425,6 +4425,12 @@ fn run_json(
     job.set_logger(cli_logger());
     job.set_message_prefix(progname());
     job.set_suppress_warnings(cli.no_warn);
+    // qpdf builds this diagnostic from `pdf.getFilename()`
+    // (`libqpdf/QPDFJob.cc:2129-2130`), so the create-stage job needs the
+    // same input name the write routes already set.
+    if let Some(input) = input {
+        job.set_input_name_bytes(path_description(input));
+    }
     configure_top_level_attachment_mutations(&mut job, cli, attachment_segments)?;
 
     if empty {
