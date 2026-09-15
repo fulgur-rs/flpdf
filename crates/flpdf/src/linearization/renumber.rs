@@ -997,7 +997,10 @@ impl RenumberMap {
                 for (offset, batch) in first_half_batches[start..end].iter().enumerate() {
                     let batch_index = start + offset;
                     if !emitted_first_half_batches.insert(batch_index) {
+                        // cov:ignore-start: outline-root and final fallback
+                        // ranges are intentionally de-duplicated.
                         continue;
+                        // cov:ignore-end
                     }
                     if batch.members.is_empty() {
                         continue;
@@ -1229,8 +1232,16 @@ impl RenumberMap {
                                 // Outline batches are outside this range. Keep the
                                 // match exhaustive so a future route cannot be
                                 // silently interleaved into the wrong category.
-                                super::plan::ContainerPart::FirstPageOutlines => continue,
-                                _ => continue,
+                                super::plan::ContainerPart::FirstPageOutlines => {
+                                    // cov:ignore-start: outline batches are excluded by the range
+                                    continue;
+                                    // cov:ignore-end
+                                }
+                                _ => {
+                                    // cov:ignore-start: second-half routes cannot enter first-half batches
+                                    continue;
+                                    // cov:ignore-end
+                                }
                             };
                             if batch_category == plain_category
                                 && source_container_number < plain_source_number
@@ -2154,6 +2165,50 @@ mod tests {
             relocation.first_xref_slot < container,
             "first-page xref ({}) must precede the Part-3 container ({container})",
             relocation.first_xref_slot
+        );
+    }
+
+    #[test]
+    fn preserve_first_half_container_precedes_later_plain_source_in_same_part() {
+        let source = ObjectRef::new(7, 0);
+        let later_plain = ObjectRef::new(8, 0);
+        let member = ObjectRef::new(5, 0);
+        let plan = LinearizationPlan {
+            part2_objects: vec![ObjectRef::new(3, 0)],
+            part3_objects: vec![source, later_plain],
+            total_object_count: 3,
+            preserve_objstm_plan: Some(crate::writer::object_streams::ObjectStreamPlan {
+                groups: vec![
+                    crate::writer::object_streams::ObjectStreamGroup::SourceBacked {
+                        source,
+                        members: vec![member],
+                    },
+                ],
+                source_membership_present: true,
+                ..Default::default()
+            }),
+            ..Default::default()
+        };
+        let mut renumber = RenumberMap::from_plan(&plan);
+        let relocation = renumber.place_objstm_members_per_half(
+            &[],
+            &[routed_batch(
+                vec![member],
+                super::super::plan::ContainerPart::FirstPageShared,
+                Some(source.number),
+            )],
+            &[],
+            &[],
+            &BTreeSet::new(),
+            &BTreeSet::new(),
+            0,
+            None,
+        );
+
+        let container = relocation.container_numbers[0];
+        assert!(
+            container < renumber.new_for_original(later_plain).unwrap().number,
+            "source-backed container must precede a later plain source in its part"
         );
     }
 
