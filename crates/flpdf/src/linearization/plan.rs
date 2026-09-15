@@ -1758,16 +1758,17 @@ impl LinearizationPlan {
         // Preserve mode with source containers keeps the explicit fallback
         // walk because the filtered map no longer has the original member
         // identities required by the writer universe.
-        let reachable: BTreeSet<ObjectRef> =
-            if preserve_object_stream_data.is_empty() && page_parent_users_are_complete {
-                optimization.linearization_reachable_object_refs().collect()
-            } else {
-                crate::writer::rewrite_renumber::reachable_object_set_with_stream_parameters(
-                    pdf,
-                    true,
-                    &skipped_raw_stream_parameter_streams,
-                )? // cov:ignore: LLVM maps the covered fallback call's Result terminator to a zero-count continuation line
-            };
+        let use_optimization_page_user_map =
+            preserve_object_stream_data.is_empty() && page_parent_users_are_complete;
+        let reachable: BTreeSet<ObjectRef> = if use_optimization_page_user_map {
+            optimization.linearization_reachable_object_refs().collect()
+        } else {
+            crate::writer::rewrite_renumber::reachable_object_set_with_stream_parameters(
+                pdf,
+                true,
+                &skipped_raw_stream_parameter_streams,
+            )? // cov:ignore: LLVM maps the covered fallback call's Result terminator to a zero-count continuation line
+        };
         let object_refs = pdf.canonical_object_refs();
         let mut all_refs: Vec<ObjectRef> = Vec::with_capacity(object_refs.len());
         for r in object_refs {
@@ -1958,27 +1959,41 @@ impl LinearizationPlan {
             Vec::with_capacity(page_refs.len().saturating_sub(1));
 
         for (page_idx, &page_ref) in page_refs.iter().enumerate().skip(1) {
-            let mut closure = compute_closure_with_stream_parameters(
-                pdf,
-                page_ref,
-                &live,
-                &resurrectable,
-                &skipped_raw_stream_parameter_streams,
-            )?; // cov:ignore: LLVM maps this covered later-page closure call terminator to a zero-count continuation region
-
-            closure = canonicalize_preserve_refs(&preserve_source_container_by_member, closure);
-
-            // Query the inverse user map per object. Re-deriving
-            // `objects_for(Page(i))` inside `retain` rebuilds the iterator and
-            // scans it from the start for every closure entry, which is
-            // quadratic in the closure size for object-heavy pages.
-            let page_user = crate::optimization::ObjectUser::Page(page_idx as u32);
-            closure.retain(|object_ref| {
+            // qpdf's `obj_user_to_objects[ou_page(i)]` is already the exact
+            // later-page object set, and its std::set iteration order is the
+            // order consumed by calculateLinearizationData (QPDF_linearization.cc:
+            // 1224-1258). Reuse that canonical map instead of walking every
+            // page graph a second time. Keep the explicit walk for source
+            // ObjStm projections and malformed page shapes whose raw map is not
+            // the writer's object universe.
+            let closure: Vec<ObjectRef> = if use_optimization_page_user_map {
                 optimization
-                    .users_for(*object_ref)
-                    .iter()
-                    .any(|user| *user == page_user)
-            });
+                    .objects_for(&crate::optimization::ObjectUser::Page(page_idx as u32))
+                    .collect()
+            } else {
+                let mut closure = compute_closure_with_stream_parameters(
+                    pdf,
+                    page_ref,
+                    &live,
+                    &resurrectable,
+                    &skipped_raw_stream_parameter_streams,
+                )?; // cov:ignore: LLVM maps this covered later-page closure call terminator to a zero-count continuation region
+
+                closure = canonicalize_preserve_refs(&preserve_source_container_by_member, closure);
+
+                // Query the inverse user map per object. Re-deriving
+                // `objects_for(Page(i))` inside `retain` rebuilds the iterator and
+                // scans it from the start for every closure entry, which is
+                // quadratic in the closure size for object-heavy pages.
+                let page_user = crate::optimization::ObjectUser::Page(page_idx as u32);
+                closure.retain(|object_ref| {
+                    optimization
+                        .users_for(*object_ref)
+                        .iter()
+                        .any(|user| *user == page_user)
+                });
+                closure
+            };
             for obj_ref in &closure {
                 // Track cross-page sharing for first-page objects (used by Part 3 partition).
                 if first_page_set.contains(obj_ref) {
