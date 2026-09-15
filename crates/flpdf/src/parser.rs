@@ -839,17 +839,27 @@ impl<I: LiveInput> LiveFileParser<'_, '_, '_, I> {
             values.insert(key, value);
         }
 
-        let is_signature = values
-            .get(b"/Type".as_slice())
-            .and_then(ObjectHandle::as_name)
-            .as_deref()
-            == Some(b"Sig".as_slice());
-        let has_byte_range = values.contains_key(b"/ByteRange".as_slice());
-        let has_string_contents = values
-            .get(b"/Contents".as_slice())
-            .and_then(ObjectHandle::as_string)
-            .is_some();
-        if is_signature && has_byte_range && has_string_contents {
+        let restore_signature_contents = if contents.is_some() {
+            let is_signature = values
+                .get(b"/Type".as_slice())
+                .map(|value| value.try_is_name_and_equals(b"Sig"))
+                .transpose()?
+                .unwrap_or(false);
+            let has_byte_range = values.contains_key(b"/ByteRange".as_slice());
+            let has_string_contents = if is_signature && has_byte_range {
+                values
+                    .get(b"/Contents".as_slice())
+                    .map(ObjectHandle::try_is_string)
+                    .transpose()?
+                    .unwrap_or(false)
+            } else {
+                false
+            };
+            is_signature && has_byte_range && has_string_contents
+        } else {
+            false
+        };
+        if restore_signature_contents {
             if let Some((raw_contents, offset)) = contents {
                 let contents = self.direct_at(ObjectValue::String(raw_contents), offset);
                 values.insert(b"/Contents".to_vec(), contents);
@@ -1102,7 +1112,7 @@ mod live_input_tests {
     use crate::object_handle::{DocumentResolver, ObjectHandle, ObjectValue};
     use crate::tokenizer::{Token, TokenType};
     use crate::{Error, ObjectRef, QpdfExc, Result};
-    use std::cell::RefCell;
+    use std::cell::{Cell, RefCell};
     use std::collections::VecDeque;
     use std::rc::{Rc, Weak};
 
@@ -1196,6 +1206,102 @@ mod live_input_tests {
         fn direct_handle(&mut self, value: ObjectValue) -> ObjectHandle {
             ObjectHandle::from_value_with_resolver(value, self.resolver.clone())
         }
+    }
+
+    struct SignatureProbeDocument {
+        calls: RefCell<Vec<ObjectRef>>,
+        parse_active: Rc<Cell<bool>>,
+    }
+
+    impl DocumentResolver for SignatureProbeDocument {
+        fn resolve_indirect(&self, object_ref: ObjectRef, handle: &ObjectHandle) -> Result<()> {
+            self.calls.borrow_mut().push(object_ref);
+            if self.parse_active.get() {
+                return Err(Error::Internal(
+                    "QPDF: re-entrant parsing detected. This is a qpdf bug. Please report at https://github.com/qpdf/qpdf/issues."
+                        .into(),
+                ));
+            }
+            let value = if object_ref == ObjectRef::new(2, 0) {
+                ObjectValue::Name(b"Sig".to_vec())
+            } else if object_ref == ObjectRef::new(3, 0) {
+                ObjectValue::String(b"indirect".to_vec())
+            } else {
+                return Err(Error::Internal(
+                    "unexpected signature probe reference".into(),
+                ));
+            };
+            handle.set_resolved(value);
+            Ok(())
+        }
+    }
+
+    struct SignatureProbeResolver {
+        resolver: Weak<dyn DocumentResolver>,
+        parse_active: Rc<Cell<bool>>,
+    }
+
+    impl HandleResolver for SignatureProbeResolver {
+        fn indirect_handle(&mut self, object_ref: ObjectRef) -> ObjectHandle {
+            ObjectHandle::new_indirect_with_resolver(object_ref, self.resolver.clone())
+        }
+
+        fn begin_parse(&self) -> Result<()> {
+            if self.parse_active.replace(true) {
+                return Err(Error::Internal(
+                    "QPDF: re-entrant parsing detected. This is a qpdf bug. Please report at https://github.com/qpdf/qpdf/issues."
+                        .into(),
+                ));
+            }
+            Ok(())
+        }
+
+        fn end_parse(&self) {
+            self.parse_active.set(false);
+        }
+    }
+
+    fn signature_probe_resolver() -> (SignatureProbeResolver, Rc<SignatureProbeDocument>) {
+        let parse_active = Rc::new(Cell::new(false));
+        let document = Rc::new(SignatureProbeDocument {
+            calls: RefCell::new(Vec::new()),
+            parse_active: parse_active.clone(),
+        });
+        let erased: Rc<dyn DocumentResolver> = document.clone();
+        (
+            SignatureProbeResolver {
+                resolver: Rc::downgrade(&erased),
+                parse_active,
+            },
+            document,
+        )
+    }
+
+    #[test]
+    fn signature_probe_resolver_rejects_a_nested_parse_guard_entry() {
+        let (resolver, _document) = signature_probe_resolver();
+        resolver.begin_parse().unwrap();
+        assert!(matches!(
+            resolver.begin_parse(),
+            Err(Error::Internal(message)) if message.starts_with("QPDF: re-entrant parsing detected")
+        ));
+        resolver.end_parse();
+    }
+
+    #[test]
+    fn signature_probe_document_covers_indirect_string_and_unknown_reference() {
+        let (mut resolver, _document) = signature_probe_resolver();
+        let indirect_name = resolver.indirect_handle(ObjectRef::new(2, 0));
+        assert!(indirect_name.try_is_name_and_equals(b"Sig").unwrap());
+
+        let indirect_string = resolver.indirect_handle(ObjectRef::new(3, 0));
+        assert!(indirect_string.try_is_string().unwrap());
+
+        let unknown = resolver.indirect_handle(ObjectRef::new(99, 0));
+        assert_eq!(
+            unknown.try_is_string().unwrap_err().to_string(),
+            "unexpected signature probe reference"
+        );
     }
 
     struct WarningSink {
@@ -1432,6 +1538,70 @@ mod live_input_tests {
 
         assert!(matches!(&error, Error::Internal(message) if message == "decrypter failure"));
         assert_eq!(*resolver.events.borrow(), vec!["begin", "end"]);
+    }
+
+    #[test]
+    fn live_file_parser_signature_probe_reports_qpdf_reentrant_parse_for_indirect_type() {
+        let mut input =
+            CountingInput::new(b"<< /Type 2 0 R /ByteRange [0 10 20 30] /Contents (cipher) >>");
+        let (mut resolver, document) = signature_probe_resolver();
+        let mut decrypter = RecordingDecrypter {
+            calls: Vec::new(),
+            fail: false,
+        };
+
+        let error =
+            parse_live_file_object_with_decrypter(&mut input, &mut resolver, Some(&mut decrypter))
+                .expect_err("qpdf rejects resolving an indirect type during parse");
+        assert!(matches!(
+            error,
+            Error::Internal(message) if message.starts_with("QPDF: re-entrant parsing detected")
+        ));
+        assert_eq!(document.calls.borrow().as_slice(), [ObjectRef::new(2, 0)]);
+    }
+
+    #[test]
+    fn live_file_parser_signature_probe_short_circuits_indirect_contents_without_raw_capture() {
+        let mut input = CountingInput::new(b"<< /Type /Sig /ByteRange [] /Contents 3 0 R >>");
+        let (mut resolver, document) = signature_probe_resolver();
+
+        let parsed =
+            parse_live_file_object(&mut input, &mut resolver).expect("signature dictionary");
+        let values = parsed.value.as_dictionary().expect("dictionary");
+        let contents = values
+            .get(b"/Contents".as_slice())
+            .expect("indirect contents");
+
+        assert!(!contents.is_resolved());
+        assert!(document.calls.borrow().is_empty());
+    }
+
+    #[test]
+    fn live_file_parser_signature_probe_short_circuits_indirect_type_without_raw_capture() {
+        let mut input = CountingInput::new(b"<< /Type 2 0 R /Contents (plain) >>");
+        let (mut resolver, document) = signature_probe_resolver();
+
+        let parsed = parse_live_file_object(&mut input, &mut resolver).expect("page dictionary");
+        let values = parsed.value.as_dictionary().expect("dictionary");
+        let type_value = values.get(b"/Type".as_slice()).expect("indirect type");
+
+        assert!(!type_value.is_resolved());
+        assert!(document.calls.borrow().is_empty());
+    }
+
+    #[test]
+    fn live_file_parser_signature_probe_short_circuits_non_signature_contents_type() {
+        let mut input = CountingInput::new(b"<< /Type /Page /Contents 3 0 R >>");
+        let (mut resolver, document) = signature_probe_resolver();
+
+        let parsed = parse_live_file_object(&mut input, &mut resolver).expect("page dictionary");
+        let values = parsed.value.as_dictionary().expect("dictionary");
+        let contents = values
+            .get(b"/Contents".as_slice())
+            .expect("indirect contents");
+
+        assert!(!contents.is_resolved());
+        assert!(document.calls.borrow().is_empty());
     }
 
     // This catches a production regression where a completed signature
