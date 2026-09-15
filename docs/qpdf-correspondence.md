@@ -3445,6 +3445,25 @@ flpdfの `ObjectHandle::type_code`（`object_handle.rs:7013`）はqpdfのresolve
 今回の対象外として保持した。metadata fixtureでdecode level noneの出力契約を確認し、case 6を
 `canonical`へ再分類した。
 
+### qtest E-28 test 3 qpdf array accessor cutover `flpdf-3yn9.48.109` (2026-09-15)
+
+qpdfの`test_3`は、trailerから`/QStreams`を取得した後、公開`getArrayNItems()`で件数を
+取り、公開`getArrayItem()`を各indexへ順に呼び出して各streamを処理する
+（`qpdf/test_driver.cc:311-322`、宣言は`include/qpdf/QPDFObjectHandle.hh:725-733`、
+実装は`libqpdf/QPDFObjectHandle.cc:758-785`）。非配列receiverではcount accessorが
+qpdfのtype warningを記録して0件として扱う。各itemのstream dataはその後
+`pipeStreamData(..., qpdf_ef_normalize, qpdf_dl_generalized)`へ渡される。
+
+flpdfの`run_test_3`は、配列全体を先にsnapshot化する`try_get_array_as_vector`をやめ、
+既存canonicalの`try_get_array_n_items` → `try_get_array_item`を同じcount/item順で呼ぶように
+した。count後のdiagnostic drain、各header/normalize pipe、pipe後のdiagnostic drainは
+変更していない。focused testsで正常出力、非配列warning、pipeline failureを確認した。
+さらにqpdf live probeの`good14.pdf` trailerは
+`/QStreams [ 7 0 R 8 0 R 10 0 R 11 0 R 12 0 R 13 0 R ]`を返し、qpdfのraw/filtered
+stream 7の先頭は同じ`A %here is a comment` bytesだった。flpdf driverも同fixtureで
+`-- stream 0 --`から同じstream prefixを出力し、normalize warningをqpdf-compatibleな
+filename/offset付きで排出する。case 3は`canonical`へ再分類した。
+
 ### qtest E-28 test 31 lazy null accessor cutover `flpdf-3yn9.48.104` (2026-09-15)
 
 qpdf の `QPDFObjectHandle::isNull()` は public accessor であり、実装は
