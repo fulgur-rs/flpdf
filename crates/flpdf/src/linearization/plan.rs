@@ -1007,6 +1007,9 @@ fn canonicalize_preserve_refs(
     source_container_by_member: &BTreeMap<ObjectRef, ObjectRef>,
     refs: Vec<ObjectRef>,
 ) -> Vec<ObjectRef> {
+    if source_container_by_member.is_empty() {
+        return refs;
+    }
     let mut seen = BTreeSet::new();
     refs.into_iter()
         .map(|object_ref| canonical_preserve_ref(source_container_by_member, object_ref))
@@ -1758,8 +1761,10 @@ impl LinearizationPlan {
                 r,
             ));
         }
-        all_refs.sort_unstable();
-        all_refs.dedup();
+        if object_stream_mode == crate::writer::ObjectStreamMode::Preserve {
+            all_refs.sort_unstable();
+            all_refs.dedup();
+        }
 
         // Resurrect null-resolving references reached via a surviving (array)
         // edge that have NO xref entry (truly missing). Free entries are already
