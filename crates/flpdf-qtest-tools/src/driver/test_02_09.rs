@@ -439,7 +439,10 @@ pub(crate) fn run_test_6<R: Read + Seek>(
     let trailer = pdf.trailer();
     let root = trailer.try_get_key(b"/Root")?;
     let metadata = root.try_get_key(b"/Metadata")?;
-    resolve_handle(pdf, &metadata)?;
+    // qpdf's public isStream() resolves its receiver before checking the
+    // value type (`libqpdf/QPDFObjectHandle.cc:437-440`). The canonical
+    // type_code() accessor owns that resolving boundary in flpdf, so this
+    // caller does not add a qpdf-less Pdf::resolve step.
     if metadata.type_code()? != 10 {
         return Err(Error::Internal(
             "test 6 run on file with no metadata".to_string(),

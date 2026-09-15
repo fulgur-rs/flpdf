@@ -1287,6 +1287,28 @@ fn qtest_accessor_cases_do_not_use_explicit_pdf_resolve() {
         .contains("resolve_handle("),
         "test 4 lost the explicit resolution required by its non-accessor path"
     );
+    let test_6 = section(
+        early_source.as_str(),
+        "pub(crate) fn run_test_6",
+        "pub(crate) fn run_test_7",
+    );
+    assert!(
+        !test_6.contains("resolve_handle("),
+        "test 6 retains the qpdf-less explicit resolve_handle bridge"
+    );
+    assert!(
+        test_6.contains("type_code()") && test_6.contains("pipe_stream_data("),
+        "test 6 must use the canonical resolving type and stream accessors"
+    );
+    assert!(
+        section(
+            early_source.as_str(),
+            "pub(crate) fn run_test_7",
+            "struct LengthBugProvider",
+        )
+        .contains("resolve_handle("),
+        "test 7 lost the explicit resolution retained for the out-of-scope path"
+    );
 
     for (name, body) in [
         (
