@@ -3430,6 +3430,21 @@ caller-side `resolve_handle` 3箇所を削除し、間接暗号値の `unparse` 
 qtest/workspace gatesで、case 2を`canonical`へ再分類した。E-28全体は他のmixed caseが
 残るためmixedのままである。
 
+### qtest E-28 test 6 caller-side resolve cutover `flpdf-3yn9.48.108` (2026-09-15)
+
+qpdf test 6（`qpdf/test_driver.cc:422-439`）は、`root.getKey("/Metadata")` で得た値を
+public `isStream()`で解決して型確認し、その後 `pipeStreamData(..., 0, qpdf_dl_none)`へ
+渡す。`isStream()`は `dereference()` 後にstream型を判定し
+（`libqpdf/QPDFObjectHandle.cc:437-440`）、`pipeStreamData`もstream accessor側で解決する
+（`libqpdf/QPDFObjectHandle.cc:1300-1341`）。decode level noneではfilterを実行せず、
+暗号化されていれば復号だけを行う。
+
+flpdfの `ObjectHandle::type_code`（`object_handle.rs:7013`）はqpdfのresolve付き型確認を、
+`ObjectHandle::pipe_stream_data`（`object_handle.rs:6191`）はstream pipelineを担う。
+`run_test_6`からcaller-side `resolve_handle` 1箇所を削除し、test 7〜9の既存明示解決は
+今回の対象外として保持した。metadata fixtureでdecode level noneの出力契約を確認し、case 6を
+`canonical`へ再分類した。
+
 ### qtest E-28 test 31 lazy null accessor cutover `flpdf-3yn9.48.104` (2026-09-15)
 
 qpdf の `QPDFObjectHandle::isNull()` は public accessor であり、実装は
