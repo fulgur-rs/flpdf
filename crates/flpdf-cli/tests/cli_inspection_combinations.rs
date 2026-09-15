@@ -462,6 +462,178 @@ fn inspection_accepts_remaining_create_stage_transformations_like_qpdf() {
 }
 
 #[test]
+fn attachment_mutations_reach_single_inspection_job_like_qpdf() {
+    if !qpdf_available() {
+        return;
+    }
+
+    let tempdir = tempfile::tempdir().expect("temporary attachment directory");
+    let payload = tempdir.path().join("added.txt");
+    fs::write(&payload, b"added attachment\n").expect("write attachment payload");
+
+    let cases = vec![
+        (
+            "remove-existing-list",
+            vec![
+                "--remove-attachment=attachment.txt".to_owned(),
+                "--list-attachments".to_owned(),
+                ATTACHMENT.to_owned(),
+            ],
+        ),
+        (
+            "add-list",
+            vec![
+                "--add-attachment".to_owned(),
+                payload.display().to_string(),
+                "--key=added".to_owned(),
+                "--creationdate=D:20260101000000Z".to_owned(),
+                "--moddate=D:20260101000000Z".to_owned(),
+                "--".to_owned(),
+                "--list-attachments".to_owned(),
+                ATTACHMENT.to_owned(),
+            ],
+        ),
+        (
+            "remove-missing-check",
+            vec![
+                "--remove-attachment=missing".to_owned(),
+                "--check".to_owned(),
+                ATTACHMENT.to_owned(),
+            ],
+        ),
+        (
+            "remove-missing-list",
+            vec![
+                "--remove-attachment=missing".to_owned(),
+                "--list-attachments".to_owned(),
+                ATTACHMENT.to_owned(),
+            ],
+        ),
+        (
+            "remove-missing-show-npages",
+            vec![
+                "--remove-attachment=missing".to_owned(),
+                "--show-npages".to_owned(),
+                ATTACHMENT.to_owned(),
+            ],
+        ),
+        (
+            "copy-conflict-check",
+            vec![
+                "--copy-attachments-from".to_owned(),
+                ATTACHMENT.to_owned(),
+                "--".to_owned(),
+                "--check".to_owned(),
+                ATTACHMENT.to_owned(),
+            ],
+        ),
+        (
+            "copy-conflict-list",
+            vec![
+                "--copy-attachments-from".to_owned(),
+                ATTACHMENT.to_owned(),
+                "--".to_owned(),
+                "--list-attachments".to_owned(),
+                ATTACHMENT.to_owned(),
+            ],
+        ),
+        (
+            "copy-conflict-show-npages",
+            vec![
+                "--copy-attachments-from".to_owned(),
+                ATTACHMENT.to_owned(),
+                "--".to_owned(),
+                "--show-npages".to_owned(),
+                ATTACHMENT.to_owned(),
+            ],
+        ),
+    ];
+
+    for (name, args) in cases {
+        let qpdf = run_qpdf_exact(&args);
+        let flpdf = run_flpdf_exact(&args);
+        assert_eq!(
+            flpdf.status.code(),
+            qpdf.status.code(),
+            "{name} exit status; qpdf={qpdf:?}; flpdf={flpdf:?}"
+        );
+        assert_eq!(
+            normalize_text_newlines(&flpdf.stdout),
+            normalize_text_newlines(&qpdf.stdout),
+            "{name} stdout"
+        );
+        assert_eq!(
+            normalize_text_newlines(&flpdf.stderr),
+            normalize_text_newlines(&qpdf.stderr),
+            "{name} stderr"
+        );
+    }
+}
+
+#[test]
+fn attachment_mutations_reach_page_selection_inspection_job_like_qpdf() {
+    if !qpdf_available() {
+        return;
+    }
+
+    let tempdir = tempfile::tempdir().expect("temporary attachment directory");
+    let payload = tempdir.path().join("added.txt");
+    fs::write(&payload, b"added attachment\n").expect("write attachment payload");
+
+    let cases = vec![
+        (
+            "page-remove-existing-list",
+            vec![
+                ATTACHMENT.to_owned(),
+                "--remove-attachment=attachment.txt".to_owned(),
+                "--pages".to_owned(),
+                ".".to_owned(),
+                "1".to_owned(),
+                "--".to_owned(),
+                "--list-attachments".to_owned(),
+            ],
+        ),
+        (
+            "page-add-list",
+            vec![
+                "--add-attachment".to_owned(),
+                payload.display().to_string(),
+                "--key=added".to_owned(),
+                "--creationdate=D:20260101000000Z".to_owned(),
+                "--moddate=D:20260101000000Z".to_owned(),
+                "--".to_owned(),
+                ATTACHMENT.to_owned(),
+                "--pages".to_owned(),
+                ".".to_owned(),
+                "1".to_owned(),
+                "--".to_owned(),
+                "--list-attachments".to_owned(),
+            ],
+        ),
+    ];
+
+    for (name, args) in cases {
+        let qpdf = run_qpdf_exact(&args);
+        let flpdf = run_flpdf_exact(&args);
+        assert_eq!(
+            flpdf.status.code(),
+            qpdf.status.code(),
+            "{name} exit status; qpdf={qpdf:?}; flpdf={flpdf:?}"
+        );
+        assert_eq!(
+            normalize_text_newlines(&flpdf.stdout),
+            normalize_text_newlines(&qpdf.stdout),
+            "{name} stdout"
+        );
+        assert_eq!(
+            normalize_text_newlines(&flpdf.stderr),
+            normalize_text_newlines(&qpdf.stderr),
+            "{name} stderr"
+        );
+    }
+}
+
+#[test]
 fn overlay_inspection_applies_rotation_before_the_consumer() {
     if !qpdf_available() {
         return;

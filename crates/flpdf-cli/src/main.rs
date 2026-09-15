@@ -3922,11 +3922,8 @@ fn top_level_inspection_combination_requested(
     if inspection_count > 1
         || (inspection_count == 1 && !args.page_ops.pages.is_empty())
         || (inspection_count == 1 && (args.remove_restrictions || args.coalesce_contents))
+        || (inspection_count == 1 && attachment_mutation_requested)
     {
-        return true;
-    }
-
-    if args.check_linearization && attachment_mutation_requested {
         return true;
     }
 
@@ -4096,6 +4093,7 @@ fn run_top_level_page_selection_inspection(
     args: &Cli,
     transform_options: InspectionTransformOptions,
     overlay_specs: &[OverlaySpec],
+    attachment_segments: &[Vec<Vec<u8>>],
 ) -> CliResult<()> {
     let mut job = new_cli_job(args.no_warn);
     let input_options = pdf_open_options(args.repair, &args.password)?;
@@ -4108,6 +4106,7 @@ fn run_top_level_page_selection_inspection(
     job.set_verbose(args.verbose);
     configure_top_level_inspection_job(&mut job, args)?;
     configure_cli_overlay_specs(&mut job, overlay_specs)?;
+    configure_top_level_attachment_mutations(&mut job, args, attachment_segments)?;
     configure_top_level_inspection_transformations(
         &mut job,
         transform_options,
@@ -4155,7 +4154,12 @@ fn run_combined_top_level_inspection(
     attachment_segments: &[Vec<Vec<u8>>],
 ) -> CliResult<()> {
     if !args.page_ops.pages.is_empty() {
-        return run_top_level_page_selection_inspection(args, transform_options, overlay_specs);
+        return run_top_level_page_selection_inspection(
+            args,
+            transform_options,
+            overlay_specs,
+            attachment_segments,
+        );
     }
 
     let mut job = new_cli_job(args.no_warn);

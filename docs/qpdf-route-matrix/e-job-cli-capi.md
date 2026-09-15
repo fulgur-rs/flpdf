@@ -549,6 +549,22 @@ it is not routed through `job.open_with_description`. The qtest exception
 routes and the separate page-operation replace-input issue remain outside this
 slice.
 
+### E-9 / E-12 single inspection with attachment mutation (`flpdf-awthm`, 2026-09-15)
+
+qpdf applies attachment remove/add/copy during `createQPDF` before
+`writeQPDF` selects its output-free `doInspection` column
+(`libqpdf/QPDFJob.cc:428-489,1646-1693,2046-2248`). The top-level CLI now
+routes any single inspection selector accompanied by an attachment mutation
+through the same combined `QPDFJob` configuration, so `--check`,
+`--list-attachments`, and `--show-npages` observe the mutated document and
+receive mutation errors before emitting inspection output. The `--pages`
+combined route receives the same attachment configuration before `run()`,
+preserving qpdf's page-selection → transformation → inspection lifecycle.
+The qpdf 11.9.0 status/stdout/stderr matrix is covered by
+`cli_inspection_combinations.rs` (eight non-page cases and two page-selection
+cases). The JSON conflict cells remain the separately scoped
+`flpdf-urjhr` slice.
+
 ## unknown / probe
 
 | ID | 決められないこと | 必要な source / probe |
