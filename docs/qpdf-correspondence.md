@@ -988,6 +988,24 @@ drop され、complete document/body buffer や planned multi-stream payload cac
 non-linearized route に残さない。一方、linearization の pass buffer/back-patch region は
 final pass だけが保持し、pass 1 は下記の direct sink route を使う。
 
+### Linearized ObjStm payload ownership (`flpdf-ymuj.6.39`, 2026-09-16)
+
+qpdf の `QPDFWriter::writeObjectStream` は pass 2 で ObjStm の pair/body を 1 本の
+`std::shared_ptr<Buffer> stream_buffer` に受け、同じ buffer から `/Length`・暗号化後の
+payload・最終 pipeline への書き出しを行う（`libqpdf/QPDFWriter.cc:1636-1750`）。
+`PipelinePopper` が `Pl_Buffer` の shared pointer を回収するため、container の
+`QPDF_Stream` と writer の sink の間で payload を深く複製しない
+（`libqpdf/QPDFWriter.cc:881-884,925-965`、`include/qpdf/Pl_Buffer.hh:50-58`）。
+
+flpdf の linearized ObjStm consumer も `writer/object_streams/emission.rs::wrap_objstm_body_as_handle`
+で `ObjStmBody` の所有権を移し、非圧縮なら元の `Vec<u8>` を、圧縮なら一度だけ生成した
+Flate の `Vec<u8>` を `Rc<Vec<u8>>` にする。`ObjectHandle` と linearization writer は同じ
+`Rc` を共有し、後者はその payload を `/Length` 計算、暗号化 pipeline、または通常の
+stream serializerへ渡す。従って従来の `data.clone()` による container handle と sink 用
+payload の二重保持を除去し、出力 bytes・dictionary・暗号化境界は変えない。所有権共有は
+`ObjectHandle::stream` / `as_stream_data` の既存 qpdf対応（`QPDF_Stream::stream_data` の
+`shared_ptr<Buffer>`）を利用し、回帰は圧縮・非圧縮の両モードで同一 allocation を検査する。
+
 ### Linearized pass-1 ownership (`flpdf-ymuj.5`, 2026-09-13)
 
 qpdf 11.9.0 の `QPDFWriter::writeLinearized` は pass 1 の開始時に、指定された

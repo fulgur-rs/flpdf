@@ -5,6 +5,7 @@
 //!
 
 use std::collections::HashSet;
+use std::rc::Rc;
 
 use crate::stream_filter::encode_flate;
 use crate::ObjectHandle;
@@ -156,7 +157,7 @@ where
 
 // ── ObjStm stream wrapper ────────────────────────────────────────────────────
 
-/// Wrap an [`ObjStmBody`] and build the complete `/Type /ObjStm` stream
+/// Consume an [`ObjStmBody`] and build the complete `/Type /ObjStm` stream
 /// dictionary (ISO 32000-1 §7.5.7).
 ///
 /// The returned stream handle is ready to be written as an indirect object.
@@ -167,31 +168,42 @@ where
 /// (`CompressStreams::No`).  Passing the same [`crate::writer::CompressStreams`]
 /// value that drives the surrounding full-rewrite loop ensures the ObjStm
 /// container uses the same policy as every other stream in the document.
-/// Build the synthetic ObjStm container as an ObjectHandle while retaining
-/// the raw payload separately for the stream pipeline. The container has no
-/// source object identity, but its dictionary is still emitted through the
+/// Build the synthetic ObjStm container as an ObjectHandle while retaining the
+/// same reference-counted payload for the stream pipeline. The container has
+/// no source object identity, but its dictionary is still emitted through the
 /// same live-handle serializer as ordinary streams; `/Extends`, when present,
 /// is already in output-number space and is therefore stored as a reference
 /// token rather than a legacy `Object` value.
+///
+/// Taking ownership of the body lets the uncompressed path transfer its
+/// allocation directly into the stream payload. The compressed path allocates
+/// its encoded payload once; the returned handle and the caller share that
+/// allocation, matching qpdf's `shared_ptr<Buffer>` ownership at
+/// `QPDFWriter.cc:1636-1750`.
 pub(crate) fn wrap_objstm_body_as_handle(
-    body: &ObjStmBody,
+    body: ObjStmBody,
     compress: crate::writer::CompressStreams,
     extends: Option<crate::ObjectRef>,
-) -> crate::Result<(ObjectHandle, Vec<u8>)> {
+) -> crate::Result<(ObjectHandle, Rc<Vec<u8>>)> {
+    let ObjStmBody {
+        bytes,
+        first_offset,
+        n_members,
+    } = body;
     let (data, filter) = match compress {
-        crate::writer::CompressStreams::Yes => (encode_flate(&body.bytes)?, true),
-        crate::writer::CompressStreams::No => (body.bytes.clone(), false),
+        crate::writer::CompressStreams::Yes => (Rc::new(encode_flate(&bytes)?), true),
+        crate::writer::CompressStreams::No => (Rc::new(bytes), false),
     };
 
     let mut entries = vec![
         (b"Type".to_vec(), ObjectHandle::name(b"ObjStm".to_vec())),
         (
             b"N".to_vec(),
-            ObjectHandle::integer(i64::try_from(body.n_members).unwrap_or(i64::MAX)),
+            ObjectHandle::integer(i64::try_from(n_members).unwrap_or(i64::MAX)),
         ),
         (
             b"First".to_vec(),
-            ObjectHandle::integer(i64::try_from(body.first_offset).unwrap_or(i64::MAX)),
+            ObjectHandle::integer(i64::try_from(first_offset).unwrap_or(i64::MAX)),
         ),
         (
             b"Length".to_vec(),
@@ -210,10 +222,7 @@ pub(crate) fn wrap_objstm_body_as_handle(
             ObjectHandle::new_indirect_unresolved(extends, -1),
         ));
     }
-    let handle = ObjectHandle::stream(
-        ObjectHandle::dictionary(entries),
-        std::rc::Rc::new(data.clone()),
-    );
+    let handle = ObjectHandle::stream(ObjectHandle::dictionary(entries), Rc::clone(&data));
     Ok((handle, data))
 }
 
@@ -231,7 +240,7 @@ mod final_handle_tests {
             n_members: 1,
         };
         let (stream, _) =
-            wrap_objstm_body_as_handle(&body, CompressStreams::No, Some(ObjectRef::new(9, 0)))
+            wrap_objstm_body_as_handle(body, CompressStreams::No, Some(ObjectRef::new(9, 0)))
                 .expect("object stream wrapper");
         assert_eq!(
             stream
@@ -242,5 +251,25 @@ mod final_handle_tests {
                 .object_ref(),
             Some(ObjectRef::new(9, 0))
         );
+    }
+
+    #[test]
+    fn object_stream_wrapper_shares_payload_with_returned_data() {
+        for compress in [CompressStreams::No, CompressStreams::Yes] {
+            let body = ObjStmBody {
+                bytes: vec![b'x'; 4096],
+                first_offset: 4,
+                n_members: 1,
+            };
+            let (stream, data) =
+                wrap_objstm_body_as_handle(body, compress, None).expect("object stream wrapper");
+            let stored = stream.as_stream_data().expect("stream data");
+
+            assert_eq!(
+                stored.as_ref().as_ptr(),
+                data.as_ptr(),
+                "{compress:?} payload must have one allocation"
+            );
+        }
     }
 }
