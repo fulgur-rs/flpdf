@@ -1613,6 +1613,16 @@ page-spec の source だけは qpdf の close/reopen 相当の reopenable reader
 `PdfOpenOptions::suppress_warnings` を設定する。qpdf の suppression は logger への配送だけを
 止め、warning collection と completion/exit status は保持する（`QPDF.cc:328-331,488-504`）。
 
+2026-09-15（`flpdf-rer4k`）では、JSON output route の create-stage jobにも
+`passwordMode`、`passwordIsHexKey`、`suppressPasswordRecovery`、`suppressRecovery`、
+`ignoreXrefStreams` を設定した。JSONのprimaryは既存どおり直接開くが、
+`--copy-attachments-from` の各donorは `QPDFJob::copyAttachments` の
+`processFile` 相当として `open_job_source` を通るため、これらの設定がdonorにも
+適用される（`QPDFJob.cc:650-666,1695-1711,2089-2135`）。qpdf 11.9.0との
+`cli_json_donor_policy.rs` differential は、4つのissue対象flagに加えて
+`--password-is-hex-key`も、終了コード・stdout・stderrまで確認する。
+donor認証失敗の診断は qpdf と同じく donor path 付きの `invalid password` とする。
+
 `--encrypt` の引数表も qpdf と同じ遷移を保つ。qpdf は3番目の positional
 引数または `--bits` を消費した時点で `40-bit encryption`、`128-bit encryption`、
 `256-bit encryption` の option tableへ切り替え、未知・非対応引数の診断にその名前を

@@ -4437,6 +4437,16 @@ fn run_json(
     job.set_logger(cli_logger());
     job.set_message_prefix(progname());
     job.set_suppress_warnings(cli.no_warn);
+    // qpdf applies these global input policies to every QPDF created by the
+    // job, including attachment donors opened by copyAttachments
+    // (`QPDFJob.cc:651-665,1695-1711`). The JSON route opens its primary
+    // document directly, but its donors still cross `open_job_source`, which
+    // reads these values from the job configuration.
+    job.set_password_mode(cli.password.password_mode.into());
+    job.set_password_is_hex_key(cli.password.password_is_hex_key);
+    job.set_suppress_password_recovery(cli.password.suppress_password_recovery);
+    job.set_suppress_recovery(cli.password.recovery.suppress_recovery);
+    job.set_ignore_xref_streams(cli.password.recovery.ignore_xref_streams);
     // qpdf builds this diagnostic from `pdf.getFilename()`
     // (`libqpdf/QPDFJob.cc:2129-2130`), so the create-stage job needs the
     // same input name the write routes already set.
