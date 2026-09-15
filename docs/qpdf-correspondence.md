@@ -3751,6 +3751,27 @@ qpdf と同じ donor-path 診断を出して既存の exit-2 sentinel で終了�
 `crates/flpdf-cli/tests/cli_json_donor_policy.rs` の通常/JSON differential
 で固定し、独自 error variant や deviation marker は追加しない。
 
+### JSON rotation consumer (`flpdf-lvvvk`, 2026-09-16)
+
+qpdf は `createQPDF` で page selection の後に `handleRotations` を実行し、
+その後に underlay/overlay と `handleTransformations` を続ける
+（`libqpdf/QPDFJob.cc:459-480`）。`Config::rotate` は raw parameter を検証して
+rotation mapへ保存し（`libqpdf/QPDFJob.cc:368-415`;
+`libqpdf/QPDFJob_config.cc:786-790`）、`handleRotations` は canonicalな
+page列挙へ各 rangeの `rotatePage` を適用する
+（`libqpdf/QPDFJob.cc:2635-2652`）。JSON serializer はこの create-stage
+完了後の document を読む。
+
+flpdf の JSON route は `cli.page_ops.rotate` を既存の
+`QPDFJob::Config::rotate` へ積み、`apply_transformations` が所有する
+`apply_configured_rotations` 境界を通してから JSON stdout/file serializerを
+呼ぶ。これにより `--pages` がある場合も page selection後の output-page
+numberingと、qpdfの rotation → transformation orderを共有する。対象の
+`--rotate=90/180/270` × `--json`/`--json=2` 6組と JSON file 3組を
+qpdf 11.9.0とstatus/stdout/stderr/bytes比較し、coalesce部分は統合済み
+`flpdf-p50gt`（PR #2002）として別責務で維持する。独自の JSON rotation
+routeやdeviation markerは追加しない。
+
 ### Top-level attachment mutation with a single inspection (`flpdf-awthm`, 2026-09-15)
 
 qpdf's `createQPDF` always completes `handleTransformations`, including

@@ -987,6 +987,24 @@ compares all nine cells with qpdf 11.9.0 for exit status, stdout, stderr, and
 JSON output bytes. This is a bounded E-17/E-21 correction and does not claim
 route-wide removal of other conflict edges.
 
+### E-13 / E-21 JSON rotation consumer (`flpdf-lvvvk`, 2026-09-16)
+
+qpdf applies page selection, then `handleRotations`, then underlay/overlay and
+the remaining `handleTransformations` before JSON serialization
+(`libqpdf/QPDFJob.cc:459-480,2635-2652`). Its `Config::rotate` stores the
+validated raw rotation parameter before that create-stage lifecycle
+(`libqpdf/QPDFJob.cc:368-415`; `libqpdf/QPDFJob_config.cc:786-790`).
+
+The flpdf JSON route now queues every `cli.page_ops.rotate` parameter on the
+existing `QPDFJob::Config::rotate` before opening its input branches. The
+existing `QPDFJob::apply_transformations` boundary then applies the rotation
+after JSON page selection and before the JSON writer, preserving qpdf output
+page numbering and transformation order. The qpdf differential tests cover
+`--rotate=90/180/270` with both `--json` and `--json=2`, plus the corresponding
+`--json-output=2` file outputs. The coalesce JSON overlap was resolved by the
+merged `flpdf-p50gt` PR #2002; this issue owns rotation only and makes no
+route-wide JSON parity claim.
+
 ## E-10 primary document graph retention in distinct-secondary `--pages` (`flpdf-lrm3u`, 2026-09-15)
 
 qpdf keeps the primary `QPDF` as the page-job base while
