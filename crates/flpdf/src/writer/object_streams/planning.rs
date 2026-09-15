@@ -241,7 +241,13 @@ pub(crate) fn filter_objstm_batches_for_output<R: std::io::Read + std::io::Seek>
         .then(|| pdf.root_ref())
         .flatten();
     let page_refs: BTreeSet<ObjectRef> = if output_linearized {
-        crate::pages::page_refs(pdf)?.into_iter().collect()
+        // QPDFWriter filters page dictionaries after Preserve/Generate setup
+        // and obtains them through getAllPages
+        // (QPDFWriter.cc:2125-2149). Seed or reuse the same repaired cache so
+        // this output filter does not start a second PageWalk.
+        crate::pages::repair::prepare_for_optimization(pdf)?
+            .map(|prepared| prepared.pages.into_iter().collect())
+            .unwrap_or_default()
     } else {
         BTreeSet::new()
     };
@@ -482,6 +488,7 @@ pub(crate) fn sort_source_backed_members_qpdf_order<R: Read + Seek>(
 #[cfg(test)]
 mod tests {
     use super::{
+        filter_objstm_batches_for_output,
         plan_object_streams_with_reachability_and_source_membership,
         sort_compressible_for_writer_order, ObjectStreamMode, PlannerConfig,
         DEFAULT_BATCH_SIZE_CAP,
@@ -532,5 +539,30 @@ mod tests {
             vec![Some(ObjectRef::new(1, 0))],
             "specialized Preserve must carry the source ObjStm identity from qpdf's map"
         );
+    }
+
+    #[test]
+    fn linearized_output_filter_prepares_the_page_cache_before_filtering() {
+        let mut pdf = Pdf::open_mem_owned(
+            include_bytes!("../../../../../tests/fixtures/compat/one-page.pdf").to_vec(),
+        )
+        .expect("open one-page fixture");
+        let mut batches = vec![vec![ObjectRef::new(3, 0)]];
+        let mut source_containers = vec![None];
+        let before = crate::pages::page_walk_visits_for_test();
+
+        filter_objstm_batches_for_output(
+            &mut pdf,
+            &mut batches,
+            &mut source_containers,
+            true,
+            false,
+        )
+        .expect("filter page dictionary from linearized batch");
+
+        assert!(batches.is_empty());
+        assert!(source_containers.is_empty());
+        assert_eq!(crate::pages::page_walk_visits_for_test(), before);
+        assert!(pdf.cached_page_list().is_some());
     }
 }

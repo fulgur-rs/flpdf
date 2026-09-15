@@ -22,6 +22,19 @@ use std::collections::{BTreeSet, HashSet};
 use std::fmt;
 use std::io::{Read, Seek};
 
+#[cfg(test)]
+use std::cell::Cell;
+
+#[cfg(test)]
+thread_local! {
+    static PAGE_WALK_VISITS: Cell<usize> = const { Cell::new(0) };
+}
+
+#[cfg(test)]
+pub(crate) fn page_walk_visits_for_test() -> usize {
+    PAGE_WALK_VISITS.with(Cell::get)
+}
+
 /// Default recursion limit for [`page_refs`].
 ///
 /// Real-world PDFs almost always fit within a couple of dozen levels; the limit is
@@ -205,6 +218,10 @@ pub(crate) fn resolve_inherited_handle_with_max_depth<R: Read + Seek>(
 /// # Ok::<(), Box<dyn std::error::Error>>(())
 /// ```
 pub fn page_refs<R: Read + Seek>(pdf: &mut Pdf<R>) -> Result<Vec<ObjectRef>> {
+    if let Some(prepared) = pdf.cached_page_list() {
+        pdf.mark_get_all_pages_called();
+        return Ok(prepared.pages);
+    }
     pdf.mark_get_all_pages_called();
     PageWalk::new(pdf)?.collect()
 }
@@ -510,6 +527,9 @@ impl<'a, R: Read + Seek> Iterator for PageWalk<'a, R> {
         loop {
             let (node, depth) = self.stack.pop()?;
 
+            #[cfg(test)]
+            PAGE_WALK_VISITS.with(|visits| visits.set(visits.get() + 1));
+
             if self.max_depth.is_some_and(|max_depth| depth >= max_depth) {
                 self.done = true;
                 return Some(Err(Error::Unsupported(format!(
@@ -572,6 +592,23 @@ mod tests {
             .expect("bounded walk must report an error")
             .unwrap_err();
         assert!(error.to_string().contains("depth exceeds maximum of 0"));
+    }
+
+    #[test]
+    fn page_refs_reuses_the_nonempty_prepared_page_cache() {
+        let mut pdf = Pdf::open_mem_owned(
+            include_bytes!("../../../tests/fixtures/compat/one-page.pdf").to_vec(),
+        )
+        .expect("one-page fixture");
+        let prepared = crate::pages::repair::prepare_for_optimization(&mut pdf)
+            .expect("prepare pages")
+            .expect("prepared page list");
+        let before = page_walk_visits_for_test();
+
+        let actual = page_refs(&mut pdf).expect("cached page refs");
+
+        assert_eq!(actual, prepared.pages);
+        assert_eq!(page_walk_visits_for_test(), before);
     }
 
     #[test]
