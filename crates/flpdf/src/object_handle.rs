@@ -4883,21 +4883,20 @@ impl ObjectHandle {
     /// name, this recursively copies through every *direct* array/dictionary
     /// descendant (each direct child is itself shallow-copied), stopping
     /// only at an *indirect* child, which keeps its existing shared
-    /// identity rather than being copied — "shallow" describes not
-    /// resolving/duplicating through indirection, not a single-level-only
-    /// copy. A scalar value is cloned outright. Always returns a direct
-    /// handle regardless of whether `self` is indirect. Never performs
-    /// resolution itself: shallow-copying an unresolved/destroyed
-    /// indirect handle produces a direct null handle, matching every other
-    /// accessor's "no hidden I/O" rule.
+    /// identity rather than being copied — "shallow" describes stopping at
+    /// indirect children after resolving the receiver, not a single-level-
+    /// only copy. A scalar value is cloned outright. Always returns a direct
+    /// handle regardless of whether `self` is indirect. The receiver is
+    /// resolved before the copy, matching qpdf's `dereference()` boundary.
+    /// A contextless unresolved or destroyed value still reaches the
+    /// corresponding copy error after that no-op resolution attempt.
     ///
     /// A reserved handle (see [`crate::Pdf::new_reserved`]) is the one
-    /// exception to that null fallback: `QPDF_Reserved::copy(bool shallow)`
+    /// exception to that resolution boundary: `QPDF_Reserved::copy(bool shallow)`
     /// (`libqpdf/QPDF_Reserved.cc:14-19`) ignores its `shallow` argument and
     /// unconditionally returns `create()`, a brand-new `QPDF_Reserved`
-    /// instance, never null and never a throw — resolving a reserved
-    /// handle's state costs no I/O, so the "no hidden I/O" rationale above
-    /// does not apply to it. This method mirrors that: a fresh, direct,
+    /// instance, never null and never a throw. This method mirrors that: a
+    /// fresh, direct,
     /// independent reserved sentinel, sharing no identity with `self`.
     ///
     /// # Errors
@@ -4916,9 +4915,15 @@ impl ObjectHandle {
     /// buffer instead of duplicating this one in place; the buffer-sharing
     /// half of that is available here through [`Self::replace_stream_data`].
     pub fn shallow_copy(&self) -> Result<ObjectHandle> {
+        if !self.is_initialized() {
+            return Err(Error::Internal(
+                "operation attempted on uninitialized QPDFObjectHandle".to_owned(),
+            ));
+        }
         if self.is_reserved() {
             return Ok(ObjectHandle::new_reserved_direct());
         }
+        self.try_dereference()?;
         stacker::maybe_grow(UNPARSE_STACK_RED_ZONE, UNPARSE_STACK_GROWTH_SIZE, || {
             self.with_value(|value| match value {
                 Some(v) => Ok(ObjectHandle::new_direct_preserving_dictionary_keys(
@@ -16682,6 +16687,38 @@ mod mutation_tests {
     }
 
     #[test]
+    fn shallow_copy_resolves_an_indirect_receiver_before_copying() {
+        let (indirect, _resolver) =
+            super::identity_tests::resolver_bearing_handle(ObjectValue::Dictionary(
+                [(b"/Value".to_vec(), ObjectHandle::integer(7))]
+                    .into_iter()
+                    .collect(),
+            ));
+        assert!(!indirect.is_resolved());
+
+        let copy = indirect
+            .shallow_copy()
+            .expect("qpdf shallowCopy resolves its receiver before copying");
+
+        assert!(indirect.is_resolved());
+        assert!(copy.is_direct());
+        assert_eq!(copy.try_get_key(b"/Value").unwrap().as_integer(), Some(7));
+    }
+
+    #[test]
+    fn shallow_copy_of_an_uninitialized_handle_reports_qpdf_error() {
+        let error = ObjectHandle::uninitialized()
+            .shallow_copy()
+            .expect_err("qpdf shallowCopy rejects an uninitialized handle");
+
+        assert!(matches!(
+            error,
+            Error::Internal(message)
+                if message == "operation attempted on uninitialized QPDFObjectHandle"
+        ));
+    }
+
+    #[test]
     fn shallow_copy_mutation_does_not_affect_the_source() {
         let original = ObjectHandle::dictionary(vec![(b"A".to_vec(), ObjectHandle::integer(1))]);
         let copy = original.shallow_copy().expect("dictionary copy");
@@ -16896,8 +16933,8 @@ mod mutation_tests {
         // (`QPDFObjectHandle.cc:2073-2079`), so the missing-category branch
         // (`replaceKey(rtype, other_val.shallowCopy())`,
         // `QPDFObjectHandle.cc:1150-1152`) never installs an unresolved
-        // placeholder. flpdf's non-forcing `shallow_copy` must resolve
-        // `other_val` itself first to match.
+        // placeholder. The canonical flpdf primitive now owns that
+        // resolution boundary too.
         let destination = ObjectHandle::dictionary(vec![]);
         let (other_font, other_font_resolver) =
             identity_tests::resolver_bearing_handle(ObjectValue::Dictionary(
@@ -17656,8 +17693,8 @@ mod mutation_tests {
     }
 
     #[test]
-    fn shallow_copy_of_an_unresolved_indirect_handle_reports_qpdf_error() {
-        let indirect = ObjectHandle::new_indirect_unresolved(ObjectRef::new(1, 0), -1);
+    fn shallow_copy_of_a_contextless_unresolved_handle_reports_qpdf_error() {
+        let indirect = ObjectHandle::from_value(ObjectValue::Unresolved);
         let error = indirect
             .shallow_copy()
             .expect_err("QPDF_Unresolved::copy is a logic error");

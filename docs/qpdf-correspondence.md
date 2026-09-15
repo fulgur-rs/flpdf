@@ -2247,11 +2247,25 @@ dictionary receiver at entry (`libqpdf/QPDFObjectHandle.cc:1200-1208`), while
 
 The scoped production route had two explicit `Pdf::resolve` callers. The
 `extract_pages` `/Parent` write now relies on canonical `ObjectHandle::replace_key`
-resolution, and the duplicate-page path uses `try_dereference` immediately
-before flpdf's intentionally non-resolving `shallow_copy`. Selection order,
+resolution, and the duplicate-page path relies on canonical
+`ObjectHandle::shallow_copy` receiver resolution. Selection order,
 duplicate shallow-clone identity, shared child handles, PageLabels, and the
 page-merge writer-order provenance remain unchanged. qtest exceptions and the
 separate merge/drop semantic issue remain outside this bounded row.
+
+### QPDFObjectHandle shallowCopy receiver-resolution primitive (`flpdf-3yn9.48.112`, 2026-09-15)
+
+Pinned qpdf 11.9.0 makes `QPDFObjectHandle::shallowCopy` own the receiver
+resolution boundary: `libqpdf/QPDFObjectHandle.cc:2073-2079` calls
+`dereference()` before dispatching to `obj->copy()`. The existing flpdf
+`ObjectHandle::shallow_copy` previously copied an unresolved indirect slot
+without entering its document resolver, which forced callers to add an
+out-of-band `try_dereference`/`Pdf::resolve` step. It now performs the same
+canonical receiver resolution while retaining qpdf's indirect-child stop rule,
+reserved-object copy, and `QPDF_Stream::copy` runtime error
+(`libqpdf/QPDF_Stream.cc:141-145`). The page-splice duplicate-page consumer
+therefore no longer performs a redundant caller-side dereference. E-28
+test21's qtest consumer cutover remains the dependent `.48.113` slice.
 
 ### A6/A7 AcroForm appearance renderer accessor slice `flpdf-3yn9.48.23.16` (2026-09-10)
 

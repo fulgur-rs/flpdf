@@ -21,7 +21,11 @@ fn production_page_splice_uses_canonical_resolving_routes() {
         );
     }
     assert!(
-        production.contains(".try_dereference()?"),
-        "shallow_copy prerequisites must use the canonical handle resolver"
+        !production.contains(".try_dereference()?"),
+        "shallow_copy must own the canonical receiver-resolution boundary"
+    );
+    assert!(
+        production.contains(".shallow_copy()?"),
+        "page duplication must use the canonical shallow-copy primitive"
     );
 }
