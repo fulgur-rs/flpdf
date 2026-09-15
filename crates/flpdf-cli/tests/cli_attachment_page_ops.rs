@@ -211,3 +211,50 @@ fn attachment_route_without_page_ops_still_writes() {
     assert_eq!(page_count(&output), 2);
     assert!(rotate_values(&output).iter().all(|value| *value == 0));
 }
+
+#[test]
+fn add_attachment_applies_collate() {
+    let temp = tempfile::tempdir().unwrap();
+    let input = two_page_pdf();
+    let donor = two_page_pdf();
+    let attachment = attachment_temp(temp.path());
+    let collated = temp.path().join("collated.pdf");
+    let sequential = temp.path().join("sequential.pdf");
+
+    // `--collate` is consumed inside handlePageSpecs itself
+    // (`libqpdf/QPDFJob.cc:2474-2502`), so it has to reach the job alongside
+    // the specs. Interleaved and sequential runs over the same two sources
+    // hold the same pages in a different order, so byte-inequality is what
+    // proves the flag arrived.
+    for (output, collate) in [(&collated, true), (&sequential, false)] {
+        let mut command = CargoCommand::cargo_bin("flpdf").unwrap();
+        command.arg("--static-id");
+        if collate {
+            command.arg("--collate");
+        }
+        command
+            .args([
+                input.path().to_str().unwrap(),
+                "--pages",
+                ".",
+                "1-z",
+                donor.path().to_str().unwrap(),
+                "1-z",
+                "--",
+                "--add-attachment",
+                attachment.to_str().unwrap(),
+                "--",
+                output.to_str().unwrap(),
+            ])
+            .assert()
+            .success();
+    }
+
+    assert_eq!(page_count(&collated), 4);
+    assert_eq!(page_count(&sequential), 4);
+    assert_ne!(
+        std::fs::read(&collated).unwrap(),
+        std::fs::read(&sequential).unwrap(),
+        "--collate must reorder the selected pages"
+    );
+}

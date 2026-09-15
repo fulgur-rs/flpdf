@@ -10324,6 +10324,12 @@ fn configure_attachment_job(
         for parameter in &page_ops.rotate {
             configuration.rotate(arg_parser::os_bytes(parameter.as_os_str()))?;
         }
+        // `--collate` is consumed inside handlePageSpecs itself
+        // (`libqpdf/QPDFJob.cc:2474-2502`), so it has to reach the job
+        // alongside the specs rather than with the later transformations.
+        for parameter in &page_ops.collate {
+            configuration.collate(parameter.as_bytes())?;
+        }
     }
 
     let input_options = pdf_open_options(repair, password)?;
