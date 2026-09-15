@@ -103,6 +103,10 @@ pub struct RenumberMap {
     /// The linearization writer allocates this number for the hint stream
     /// object it emits between Part 4 head and Part 6 (first-page section).
     hint_stream_slot: u32,
+    /// qpdf first-half category for each plain source identity: 0 for Part 2
+    /// private, 1 for Part 3 shared, and 2 for UseOutlines objects. Preserve
+    /// containers use this to interleave with the correct plain category.
+    first_half_category: BTreeMap<QpdfObjGen, u8>,
 }
 
 /// Sentinel value stored at slots 0 and 1 in `by_new_number`.
@@ -598,6 +602,17 @@ impl RenumberMap {
             }
         }
 
+        let mut first_half_category = BTreeMap::new();
+        for object in &raw_part2 {
+            first_half_category.insert(*object, 0);
+        }
+        for object in &raw_part3 {
+            first_half_category.insert(*object, 1);
+        }
+        for object in &raw_part6_outline {
+            first_half_category.insert(*object, 2);
+        }
+
         Self {
             by_new_number,
             by_new_raw,
@@ -605,6 +620,7 @@ impl RenumberMap {
             by_original_raw,
             param_dict_slot,
             hint_stream_slot,
+            first_half_category,
         }
     }
 
@@ -971,13 +987,18 @@ impl RenumberMap {
         let first_half_outline_batch_start = first_half_batches
             .len()
             .saturating_sub(first_half_outline_batch_count);
-        let emit_first_half_batch_range =
+        let mut emitted_first_half_batches = BTreeSet::new();
+        let mut emit_first_half_batch_range =
             |start: usize,
              end: usize,
              table: &mut Vec<ObjectRef>,
              raw_table: &mut Vec<QpdfObjGen>,
              container_numbers: &mut Vec<u32>| {
-                for batch in &first_half_batches[start..end] {
+                for (offset, batch) in first_half_batches[start..end].iter().enumerate() {
+                    let batch_index = start + offset;
+                    if !emitted_first_half_batches.insert(batch_index) {
+                        continue;
+                    }
                     if batch.members.is_empty() {
                         continue;
                     }
@@ -1181,6 +1202,47 @@ impl RenumberMap {
                     &mut new_by_new_raw,
                     &mut open_document_container_numbers,
                 );
+            }
+            // qpdf assigns first-half source-backed ObjStm containers in the
+            // same source-object order as the surrounding plain first-page
+            // objects. The container is physically emitted after the hint
+            // stream, but its object number must precede a later plain source
+            // object (QPDF_linearization.cc's set-ordered lc_first_page_*).
+            // Without this interleave, a Generate -> Preserve pass can swap
+            // the source container and a plain object; the next Preserve pass
+            // then observes a different source identity and changes hints.
+            if i as u32 >= hint_index_in_first_half {
+                if let Ok(plain_source_number) = u32::try_from(original.get_obj()) {
+                    if let Some(plain_category) = self.first_half_category.get(&original).copied() {
+                        for batch_index in 0..first_half_outline_batch_start {
+                            let Some(source_container_number) =
+                                first_half_batches[batch_index].source_container_number
+                            else {
+                                continue;
+                            };
+                            let batch_category = match first_half_batches[batch_index].route {
+                                super::plan::ContainerPart::FirstPagePrivate => 0,
+                                super::plan::ContainerPart::FirstPageShared => 1,
+                                // Outline batches are outside this range. Keep the
+                                // match exhaustive so a future route cannot be
+                                // silently interleaved into the wrong category.
+                                super::plan::ContainerPart::FirstPageOutlines => continue,
+                                _ => continue,
+                            };
+                            if batch_category == plain_category
+                                && source_container_number < plain_source_number
+                            {
+                                emit_first_half_batch_range(
+                                    batch_index,
+                                    batch_index + 1,
+                                    &mut new_by_new_number,
+                                    &mut new_by_new_raw,
+                                    &mut first_half_container_numbers,
+                                );
+                            }
+                        }
+                    }
+                }
             }
             if Some(original) == first_half_outline_root_raw {
                 emit_first_half_batch_range(

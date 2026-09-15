@@ -1829,10 +1829,7 @@ impl LinearizationPlan {
         let info_handle = pdf.trailer().try_get_key(b"/Info")?;
         let info_ref = info_handle
             .object_ref()
-            .or_else(|| info_handle.object_ref())
-            .map(|object_ref| {
-                canonical_preserve_ref(&preserve_source_container_by_member, object_ref)
-            });
+            .or_else(|| info_handle.object_ref());
         let pages_tree_ref = if let Some(root_ref) = root_ref {
             let root_handle = pdf.get_object_handle(root_ref);
             let pages_handle = root_handle.try_get_key(b"/Pages")?;
