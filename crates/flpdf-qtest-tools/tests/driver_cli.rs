@@ -1514,6 +1514,19 @@ fn qtest_accessor_cases_do_not_use_explicit_pdf_resolve() {
         "#[cfg(test)]"
     )
     .contains("try_get_stream_dict"));
+
+    let test_97 = section(
+        mutation_source.as_str(),
+        "pub(crate) fn run_test_97",
+        "pub(crate) fn run_test_98",
+    );
+    assert!(
+        test_97.contains("first_item.try_is_array()?")
+            && test_97.contains("first_item.try_get_array_n_items()")
+            && !test_97.contains("pdf.resolve(&first_item)")
+            && !test_97.contains(".as_array()"),
+        "test 97 must use the canonical resolving array-count accessor without a caller-side bridge"
+    );
 }
 
 fn test_driver_fixture_dir() -> std::path::PathBuf {
