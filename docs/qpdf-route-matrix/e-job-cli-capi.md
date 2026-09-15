@@ -563,6 +563,19 @@ it is not routed through `job.open_with_description`. The qtest exception
 routes and the separate page-operation replace-input issue remain outside this
 slice.
 
+### E-9 / E-29 JSON donor input-policy propagation (`flpdf-rer4k`, 2026-09-15)
+
+The JSON output route now sets the same global donor-open policies as the
+ordinary attachment job: `passwordMode`, `passwordIsHexKey`,
+`suppressPasswordRecovery`, `suppressRecovery`, and `ignoreXrefStreams`.
+`QPDFJob::copyAttachments` opens each donor through the configured job policy,
+so `open_job_source` receives the qpdf 11.9.0 interpretation and recovery
+boundary (`QPDFJob.cc:650-666,1695-1711,2089-2135`). The focused
+`cli_json_donor_policy.rs` matrix compares qpdf/flpdf exit status, JSON stdout,
+and diagnostics for damaged, xref-stream, hex-password, password-recovery,
+and hex-key donors. Donor authentication failures retain qpdf's donor-path
+`invalid password` diagnostic.
+
 ### E-9 / E-12 single inspection with attachment mutation (`flpdf-awthm`, 2026-09-15)
 
 qpdf applies attachment remove/add/copy during `createQPDF` before
