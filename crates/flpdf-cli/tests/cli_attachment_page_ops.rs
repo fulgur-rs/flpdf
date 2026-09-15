@@ -480,18 +480,38 @@ fn encrypted_donor() -> tempfile::NamedTempFile {
     file
 }
 
-/// Report the `R = N` revision qpdf sees, or `None` when qpdf is unavailable
-/// or the file is not encrypted.
-fn encryption_revision(path: &Path, password: &str) -> Option<u32> {
+/// Whether a qpdf binary can be run at all. Kept separate from
+/// [`encryption_revision`] so a missing `R = ...` line -- which is exactly what
+/// the regression under test produces -- can never be mistaken for an absent
+/// oracle.
+fn qpdf_available() -> bool {
+    std::process::Command::new("qpdf")
+        .arg("--version")
+        .output()
+        .is_ok_and(|output| output.status.success())
+}
+
+/// Report the `R = N` revision qpdf sees. Panics when the inspection itself
+/// fails or prints no revision: both mean the output is not the encrypted
+/// document the caller asked for.
+fn encryption_revision(path: &Path, password: &str) -> u32 {
     let output = std::process::Command::new("qpdf")
         .args([&format!("--password={password}"), "--show-encryption"])
         .arg(path)
         .output()
-        .ok()?;
-    let text = String::from_utf8_lossy(&output.stdout);
-    text.lines()
+        .expect("qpdf runs");
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    assert!(
+        output.status.success(),
+        "qpdf --show-encryption must succeed; status={:?}\nstdout: {stdout}\nstderr: {}",
+        output.status.code(),
+        String::from_utf8_lossy(&output.stderr)
+    );
+    stdout
+        .lines()
         .find_map(|line| line.strip_prefix("R = "))
         .and_then(|value| value.trim().parse().ok())
+        .unwrap_or_else(|| panic!("qpdf reported no encryption revision\nstdout: {stdout}"))
 }
 
 #[test]
@@ -527,11 +547,13 @@ fn add_attachment_lets_a_later_encrypt_win_over_copy_encryption() {
         .assert()
         .success();
 
-    match encryption_revision(&output, "newo") {
-        Some(revision) => assert_eq!(
-            revision, 6,
-            "--bits=256 must win over the AES-128 copy-encryption donor"
-        ),
-        None => eprintln!("qpdf not available; skipping the revision check"),
+    if !qpdf_available() {
+        eprintln!("qpdf not available; skipping the revision check");
+        return;
     }
+    assert_eq!(
+        encryption_revision(&output, "newo"),
+        6,
+        "--bits=256 must win over the AES-128 copy-encryption donor"
+    );
 }
