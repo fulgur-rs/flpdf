@@ -190,10 +190,11 @@ pub(crate) fn run_test_11<R: Read + Seek>(
     _stderr: &mut dyn Write,
     _diagnostics_written: &mut usize,
 ) -> flpdf::Result<()> {
-    let root_ref = pdf
-        .root_ref()
-        .ok_or_else(|| Error::Internal("test 11 requires a document catalog".to_string()))?;
-    let root = pdf.get_object_handle(root_ref);
+    // qpdf's public getRoot() resolves the trailer's /Root value and applies
+    // the Catalog dictionary gate before returning the live handle
+    // (`libqpdf/QPDF.cc:2354-2367`). Keep that semantic boundary in Pdf rather
+    // than projecting the root to an ObjectRef and rebuilding a handle here.
+    let root = pdf.root_handle()?;
     let qstream = root.try_get_key(b"/QStream")?;
 
     let filtered = qstream.get_stream_data(DecodeLevel::Generalized)?;
