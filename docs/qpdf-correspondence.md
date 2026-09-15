@@ -3862,3 +3862,9 @@ trailer graph order, including `/Info` before `/F`. The sweep is bounded to
 primary document-graph retention; the unrelated
 `null-visible-stale-generation-objstm` member-order difference and the
 `flpdf-x267z` page-count issue remain separate.
+
+### QPDFObjectHandle getValueAs family
+
+| qpdf | 行 | flpdf | 状態 |
+|---|---|---|---|
+| `QPDFObjectHandle::getValueAsBool` / `getValueAsInt` / `getValueAsUInt` / `getValueAsReal` / `getValueAsNumber` / `getValueAsName` / `getValueAsString` / `getValueAsUTF8` / `getValueAsOperator` / `getValueAsInlineImage` | `include/qpdf/QPDFObjectHandle.hh:601-606,640-711`; `libqpdf/QPDFObjectHandle.cc:484-748`; `qpdf/test_driver.cc:2973-3062` | `object_handle.rs::ObjectHandle::try_get_value_as_bool` / `try_get_value_as_int` / `try_get_value_as_int_as_int` / `try_get_value_as_uint` / `try_get_value_as_uint_as_uint` / `try_get_value_as_real` / `try_get_value_as_number` / `try_get_value_as_name` / `try_get_value_as_string` / `try_get_value_as_utf8` / `try_get_value_as_operator` / `try_get_value_as_inline_image` | ✅ the receiver resolves before a silent type check; wrong-type values return `None` without `typeWarning`; names retain qpdf's slash-prefixed canonical spelling; UTF-8 conversion uses the string value boundary; integer and unsigned-integer saturation retains qpdf's `warnIfPossible` messages. This is distinct from the warning-producing `try_get_*_value` getXValue family above. |

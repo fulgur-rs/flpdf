@@ -3282,7 +3282,105 @@ impl ObjectHandle {
         })
     }
 
-    fn try_get_value_as_number(&self) -> Result<Option<f64>> {
+    /// Return qpdf's warning-free `getValueAsBool` result.
+    ///
+    /// The receiver is resolved before the silent type check, while an
+    /// uninitialized or wrong-type handle returns `None` without a warning
+    /// (`include/qpdf/QPDFObjectHandle.hh:601-606`;
+    /// `libqpdf/QPDFObjectHandle.cc:484-498`).
+    pub fn try_get_value_as_bool(&self) -> Result<Option<bool>> {
+        if !self.is_initialized() {
+            return Ok(None);
+        }
+        self.try_dereference()?;
+        Ok(self.as_boolean())
+    }
+
+    /// Return qpdf's warning-free `getValueAsInt(long long&)` result.
+    ///
+    /// `None` represents qpdf's false return for a wrong type; it is not a
+    /// zero fallback and does not emit a type warning
+    /// (`libqpdf/QPDFObjectHandle.cc:516-524`).
+    pub fn try_get_value_as_int(&self) -> Result<Option<i64>> {
+        if !self.is_initialized() {
+            return Ok(None);
+        }
+        self.try_dereference()?;
+        Ok(self.as_integer())
+    }
+
+    /// Return qpdf's `getValueAsInt(int&)` result, including its saturation
+    /// warning for values outside the i32 range
+    /// (`libqpdf/QPDFObjectHandle.cc:535-553`).
+    pub fn try_get_value_as_int_as_int(&self) -> Result<Option<i32>> {
+        let Some(value) = self.try_get_value_as_int()? else {
+            return Ok(None);
+        };
+        if value < i64::from(i32::MIN) {
+            self.warn_if_possible("requested value of integer is too small; returning INT_MIN")?;
+            Ok(Some(i32::MIN))
+        } else if value > i64::from(i32::MAX) {
+            self.warn_if_possible("requested value of integer is too big; returning INT_MAX")?;
+            Ok(Some(i32::MAX))
+        } else {
+            Ok(Some(value as i32))
+        }
+    }
+
+    /// Return qpdf's warning-free `getValueAsUInt(unsigned long long&)`
+    /// result. Negative integers use qpdf's zero conversion and warning
+    /// (`libqpdf/QPDFObjectHandle.cc:563-577`).
+    pub fn try_get_value_as_uint(&self) -> Result<Option<u64>> {
+        let Some(value) = self.try_get_value_as_int()? else {
+            return Ok(None);
+        };
+        if value < 0 {
+            self.warn_if_possible("unsigned value request for negative number; returning 0")?;
+            Ok(Some(0))
+        } else {
+            Ok(Some(value as u64))
+        }
+    }
+
+    /// Return qpdf's `getValueAsUInt(unsigned int&)` result, including its
+    /// negative and upper-bound warnings
+    /// (`libqpdf/QPDFObjectHandle.cc:588-606`).
+    pub fn try_get_value_as_uint_as_uint(&self) -> Result<Option<u32>> {
+        let Some(value) = self.try_get_value_as_int()? else {
+            return Ok(None);
+        };
+        if value < 0 {
+            self.warn_if_possible(
+                "unsigned integer value request for negative number; returning 0",
+            )?;
+            Ok(Some(0))
+        } else if value > i64::from(u32::MAX) {
+            self.warn_if_possible(
+                "requested value of unsigned integer is too big; returning UINT_MAX",
+            )?;
+            Ok(Some(u32::MAX))
+        } else {
+            Ok(Some(value as u32))
+        }
+    }
+
+    /// Return qpdf's warning-free `getValueAsReal` source spelling
+    /// (`libqpdf/QPDFObjectHandle.cc:623-630`).
+    pub fn try_get_value_as_real(&self) -> Result<Option<Vec<u8>>> {
+        if !self.is_initialized() {
+            return Ok(None);
+        }
+        self.try_dereference()?;
+        Ok(self.with_value(|value| match value {
+            Some(ObjectValue::RealLiteral { literal, .. }) => Some(literal.clone()),
+            Some(ObjectValue::Real(value)) => Some(value.to_string().into_bytes()),
+            _ => None,
+        }))
+    }
+
+    /// Return qpdf's warning-free `getValueAsNumber` result
+    /// (`libqpdf/QPDFObjectHandle.cc:391-399`).
+    pub fn try_get_value_as_number(&self) -> Result<Option<f64>> {
         if !self.is_initialized() {
             return Ok(None);
         }
@@ -3293,6 +3391,59 @@ impl ObjectHandle {
             Some(ObjectValue::RealLiteral { value, .. }) => Some(*value),
             _ => None,
         }))
+    }
+
+    /// Return qpdf's canonical warning-free name string, including its
+    /// leading slash (`libqpdf/QPDFObjectHandle.cc:647-654`).
+    pub fn try_get_value_as_name(&self) -> Result<Option<Vec<u8>>> {
+        if !self.is_initialized() {
+            return Ok(None);
+        }
+        self.try_dereference()?;
+        Ok(self.as_name().map(|name| {
+            let mut result = Vec::with_capacity(name.len() + 1);
+            result.push(b'/');
+            result.extend_from_slice(&name);
+            result
+        }))
+    }
+
+    /// Return qpdf's warning-free raw string bytes
+    /// (`libqpdf/QPDFObjectHandle.cc:671-678`).
+    pub fn try_get_value_as_string(&self) -> Result<Option<Vec<u8>>> {
+        if !self.is_initialized() {
+            return Ok(None);
+        }
+        self.try_dereference()?;
+        Ok(self.as_string())
+    }
+
+    /// Return qpdf's warning-free UTF-8 string view
+    /// (`libqpdf/QPDFObjectHandle.cc:694-702`).
+    pub fn try_get_value_as_utf8(&self) -> Result<Option<Vec<u8>>> {
+        Ok(self
+            .try_get_value_as_string()?
+            .map(|value| utf8_value(&value)))
+    }
+
+    /// Return qpdf's warning-free operator bytes
+    /// (`libqpdf/QPDFObjectHandle.cc:719-726`).
+    pub fn try_get_value_as_operator(&self) -> Result<Option<Vec<u8>>> {
+        if !self.is_initialized() {
+            return Ok(None);
+        }
+        self.try_dereference()?;
+        Ok(self.as_operator())
+    }
+
+    /// Return qpdf's warning-free inline-image bytes
+    /// (`libqpdf/QPDFObjectHandle.cc:741-748`).
+    pub fn try_get_value_as_inline_image(&self) -> Result<Option<Vec<u8>>> {
+        if !self.is_initialized() {
+            return Ok(None);
+        }
+        self.try_dereference()?;
+        Ok(self.as_inline_image())
     }
 
     /// Construct a four-item rectangle array owned by this canonical handle
@@ -19344,6 +19495,214 @@ pub(crate) mod warning_emission_tests {
         assert_eq!(items.current().key, b"/A");
         items.next();
         assert!(items.is_end());
+    }
+
+    #[test]
+    fn qpdf_get_value_as_accessors_have_a_canonical_object_handle_boundary() {
+        let source = include_str!("object_handle.rs");
+        for method in [
+            "try_get_value_as_bool",
+            "try_get_value_as_int",
+            "try_get_value_as_int_as_int",
+            "try_get_value_as_uint",
+            "try_get_value_as_uint_as_uint",
+            "try_get_value_as_real",
+            "try_get_value_as_number",
+            "try_get_value_as_name",
+            "try_get_value_as_string",
+            "try_get_value_as_utf8",
+            "try_get_value_as_operator",
+            "try_get_value_as_inline_image",
+        ] {
+            assert!(
+                source.contains(&format!("pub fn {method}")),
+                "missing qpdf getValueAs primitive {method}"
+            );
+        }
+    }
+
+    #[test]
+    fn qpdf_get_value_as_accessors_are_silent_on_wrong_types_and_resolve_indirect_values() {
+        let (integer, recorder) = handle_resolving(ObjectValue::Integer(7));
+
+        assert!(!integer.is_resolved());
+        assert_eq!(integer.try_get_value_as_bool().unwrap(), None);
+        assert_eq!(integer.try_get_value_as_int().unwrap(), Some(7));
+        assert!(integer.is_resolved());
+        assert!(warnings(&recorder).is_empty());
+
+        let (name, recorder) = handle_resolving(ObjectValue::Name(b"WrongType".to_vec()));
+        assert_eq!(name.try_get_value_as_int().unwrap(), None);
+        assert_eq!(name.try_get_value_as_real().unwrap(), None);
+        assert_eq!(name.try_get_value_as_string().unwrap(), None);
+        assert!(warnings(&recorder).is_empty());
+    }
+
+    #[test]
+    fn qpdf_get_value_as_accessors_treat_uninitialized_handles_as_absent() {
+        let handle = ObjectHandle::uninitialized();
+
+        assert_eq!(handle.try_get_value_as_bool().unwrap(), None);
+        assert_eq!(handle.try_get_value_as_int().unwrap(), None);
+        assert_eq!(handle.try_get_value_as_int_as_int().unwrap(), None);
+        assert_eq!(handle.try_get_value_as_uint().unwrap(), None);
+        assert_eq!(handle.try_get_value_as_uint_as_uint().unwrap(), None);
+        assert_eq!(handle.try_get_value_as_real().unwrap(), None);
+        assert_eq!(handle.try_get_value_as_number().unwrap(), None);
+        assert_eq!(handle.try_get_value_as_name().unwrap(), None);
+        assert_eq!(handle.try_get_value_as_string().unwrap(), None);
+        assert_eq!(handle.try_get_value_as_utf8().unwrap(), None);
+        assert_eq!(handle.try_get_value_as_operator().unwrap(), None);
+        assert_eq!(handle.try_get_value_as_inline_image().unwrap(), None);
+    }
+
+    #[test]
+    fn qpdf_get_value_as_accessors_preserve_literals_and_type_specific_values() {
+        assert_eq!(
+            ObjectHandle::boolean(false)
+                .try_get_value_as_bool()
+                .unwrap(),
+            Some(false)
+        );
+        assert_eq!(
+            ObjectHandle::integer(1).try_get_value_as_int().unwrap(),
+            Some(1)
+        );
+        assert_eq!(
+            ObjectHandle::integer(1)
+                .try_get_value_as_int_as_int()
+                .unwrap(),
+            Some(1)
+        );
+        assert_eq!(
+            ObjectHandle::integer(1).try_get_value_as_uint().unwrap(),
+            Some(1)
+        );
+        assert_eq!(
+            ObjectHandle::integer(1)
+                .try_get_value_as_uint_as_uint()
+                .unwrap(),
+            Some(1)
+        );
+        assert_eq!(
+            ObjectHandle::real_literal(42.0, b"42.0".to_vec())
+                .try_get_value_as_real()
+                .unwrap(),
+            Some(b"42.0".to_vec())
+        );
+        assert_eq!(
+            ObjectHandle::real(1.25).try_get_value_as_real().unwrap(),
+            Some(b"1.25".to_vec())
+        );
+        assert_eq!(
+            ObjectHandle::integer(1).try_get_value_as_number().unwrap(),
+            Some(1.0)
+        );
+        assert_eq!(
+            ObjectHandle::name(b"Test".to_vec())
+                .try_get_value_as_name()
+                .unwrap(),
+            Some(b"/Test".to_vec())
+        );
+        assert_eq!(
+            ObjectHandle::string(b"/Test".to_vec())
+                .try_get_value_as_string()
+                .unwrap(),
+            Some(b"/Test".to_vec())
+        );
+        assert_eq!(
+            ObjectHandle::string(b"/Test".to_vec())
+                .try_get_value_as_utf8()
+                .unwrap(),
+            Some(b"/Test".to_vec())
+        );
+        assert_eq!(
+            ObjectHandle::operator(b"/Test".to_vec())
+                .try_get_value_as_operator()
+                .unwrap(),
+            Some(b"/Test".to_vec())
+        );
+        assert_eq!(
+            ObjectHandle::inline_image(b"/Test".to_vec())
+                .try_get_value_as_inline_image()
+                .unwrap(),
+            Some(b"/Test".to_vec())
+        );
+    }
+
+    #[test]
+    fn qpdf_get_value_as_integer_clamps_only_with_qpdf_warnings() {
+        let (too_large, large_recorder) =
+            handle_resolving(ObjectValue::Integer(i64::from(i32::MAX) + 1));
+        assert_eq!(
+            too_large.try_get_value_as_int_as_int().unwrap(),
+            Some(i32::MAX)
+        );
+        assert_eq!(
+            warnings(&large_recorder),
+            ["object 3 0: requested value of integer is too big; returning INT_MAX"]
+        );
+
+        let (too_small, small_recorder) =
+            handle_resolving(ObjectValue::Integer(i64::from(i32::MIN) - 1));
+        assert_eq!(
+            too_small.try_get_value_as_int_as_int().unwrap(),
+            Some(i32::MIN)
+        );
+        assert_eq!(
+            warnings(&small_recorder),
+            ["object 3 0: requested value of integer is too small; returning INT_MIN"]
+        );
+
+        let (too_large_unsigned, unsigned_recorder) =
+            handle_resolving(ObjectValue::Integer(i64::from(u32::MAX) + 1));
+        assert_eq!(
+            too_large_unsigned.try_get_value_as_uint_as_uint().unwrap(),
+            Some(u32::MAX)
+        );
+        assert_eq!(
+            warnings(&unsigned_recorder),
+            ["object 3 0: requested value of unsigned integer is too big; returning UINT_MAX"]
+        );
+
+        let (negative, negative_recorder) = handle_resolving(ObjectValue::Integer(-1));
+        assert_eq!(negative.try_get_value_as_uint().unwrap(), Some(0));
+        assert_eq!(negative.try_get_value_as_uint_as_uint().unwrap(), Some(0));
+        assert_eq!(
+            warnings(&negative_recorder),
+            [
+                "object 3 0: unsigned value request for negative number; returning 0",
+                "object 3 0: unsigned integer value request for negative number; returning 0",
+            ]
+        );
+    }
+
+    #[test]
+    fn qpdf_get_value_as_unsigned_clamp_warning_sink_failures_propagate() {
+        let resolver: Rc<dyn DocumentResolver> = Rc::new(SinklessResolver);
+        let too_large = ObjectHandle::new_indirect_with_resolver(
+            ObjectRef::new(3, 0),
+            Rc::downgrade(&resolver),
+        );
+        too_large.set_resolved(ObjectValue::Integer(i64::from(u32::MAX) + 1));
+        let error = too_large.try_get_value_as_uint_as_uint().unwrap_err();
+        assert!(matches!(
+            error,
+            crate::Error::Internal(ref message)
+                if message.contains("returning UINT_MAX")
+        ));
+
+        let negative = ObjectHandle::new_indirect_with_resolver(
+            ObjectRef::new(3, 0),
+            Rc::downgrade(&resolver),
+        );
+        negative.set_resolved(ObjectValue::Integer(-1));
+        let error = negative.try_get_value_as_uint_as_uint().unwrap_err();
+        assert!(matches!(
+            error,
+            crate::Error::Internal(ref message)
+                if message.contains("unsigned integer value request for negative number")
+        ));
     }
 
     #[test]
