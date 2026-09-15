@@ -10436,6 +10436,7 @@ fn cli_copy_encryption(args: &Cli) -> Option<(&Path, Vec<u8>)> {
     Some((path, password))
 }
 
+#[allow(clippy::too_many_arguments)]
 fn run_add_attachment(
     input: Option<PathBuf>,
     output: Option<PathBuf>,

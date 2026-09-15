@@ -354,14 +354,6 @@ fn object_numbers(bytes: &[u8]) -> Vec<u32> {
     numbers
 }
 
-fn object_count(path: &Path) -> usize {
-    let bytes = std::fs::read(path).unwrap();
-    bytes
-        .windows(b" 0 obj".len())
-        .filter(|window| *window == b" 0 obj")
-        .count()
-}
-
 #[test]
 fn add_attachment_honors_preserve_unreferenced() {
     let temp = tempfile::tempdir().unwrap();
