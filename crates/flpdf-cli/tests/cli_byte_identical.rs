@@ -56,6 +56,26 @@ fn run_cli(stem: &str, extra: &[&str]) -> Vec<u8> {
     std::fs::read(&out).unwrap_or_else(|e| panic!("read flpdf output for {stem}: {e}"))
 }
 
+/// Run the top-level qpdf-shaped linearization surface with warnings treated
+/// as exit-zero, and return the written bytes.
+fn run_cli_top_level_linearized(stem: &str, extra: &[&str]) -> Vec<u8> {
+    let outdir = tempfile::tempdir().unwrap();
+    let out = outdir.path().join("out.pdf");
+    let input = fixture(stem);
+
+    Command::cargo_bin("flpdf")
+        .unwrap()
+        .args(["--warning-exit-0", "--linearize"])
+        .args(extra)
+        .arg("--deterministic-id")
+        .arg(&input)
+        .arg(&out)
+        .assert()
+        .success();
+
+    std::fs::read(&out).unwrap_or_else(|e| panic!("read flpdf output for {stem}: {e}"))
+}
+
 /// The pinned qpdf release these byte-parity assertions are derived from. A
 /// different qpdf on `PATH` is treated as unavailable (and as an error on CI)
 /// so its output is never mistaken for the 11.9.0 oracle.
@@ -93,6 +113,7 @@ fn run_qpdf(stem: &str, extra: &[&str]) -> Option<Vec<u8>> {
     let status = StdCommand::new("qpdf")
         .arg("--deterministic-id")
         .arg("--linearize")
+        .arg("--warning-exit-0")
         .args(extra)
         .arg(&input)
         .arg(&out)
@@ -196,6 +217,30 @@ fn assert_linearize_newline_byte_identical(stem: &str, extra: &[&str]) {
     );
 }
 
+fn assert_linearize_normalize_content_byte_identical(stem: &str) {
+    let Some(expected) = run_qpdf(stem, &["--normalize-content=y"]) else {
+        return;
+    };
+    let actual = run_cli_top_level_linearized(stem, &["--normalize-content=y"]);
+    if actual == expected {
+        return;
+    }
+    let common = actual.len().min(expected.len());
+    let off = (0..common)
+        .find(|&i| actual[i] != expected[i])
+        .unwrap_or(common);
+    let lo = off.saturating_sub(24);
+    panic!(
+        "{stem} (linearize --normalize-content=y): CLI output diverged from qpdf 11.9.0 \
+         (flpdf={} bytes, qpdf={} bytes, first diff at byte {off})\n\
+         flpdf: {:?}\nqpdf: {:?}",
+        actual.len(),
+        expected.len(),
+        String::from_utf8_lossy(&actual[lo..(off + 24).min(actual.len())]),
+        String::from_utf8_lossy(&expected[lo..(off + 24).min(expected.len())]),
+    );
+}
+
 #[test]
 fn cli_one_page_linearize_newline_before_endstream_matches_qpdf() {
     assert_linearize_newline_byte_identical("one-page", &["--newline-before-endstream"]);
@@ -253,6 +298,18 @@ fn cli_two_page_linearize_byte_identical() {
 #[test]
 fn cli_three_page_linearize_byte_identical() {
     assert_byte_identical("three-page", "linearize", &[]);
+}
+
+#[test]
+fn cli_linearize_normalize_content_is_byte_identical_to_qpdf() {
+    for stem in [
+        "one-page",
+        "multi-contents-one-page",
+        "shared-stream-objstm",
+        "direct-leaf-kid",
+    ] {
+        assert_linearize_normalize_content_byte_identical(stem);
+    }
 }
 
 // ── Plain full rewrite + static-id (no linearize) ─────────────────────────────
