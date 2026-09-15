@@ -2637,6 +2637,20 @@ qpdf --check-linearization \
 qpdf --check-linearization \
     "$REF/encrypted-recovered-eol/linearize-objstm.pdf"
 
+# --- later-page object ordering with source ObjStm written out plainly.
+# qpdf places the page object itself into part7 before iterating
+# obj_user_to_objects[ou_page(i)] (QPDF_linearization.cc:1231-1255), so the page
+# dictionary precedes its own descendants even though the map is sorted by
+# object id. --object-streams=disable is what exposes the order: under preserve
+# these members stay inside the source ObjStm and the sequence is unobservable.
+for stem in primary-objstm-exclusive-font untyped-objstm-container; do
+    mkdir -p "$REF/$stem"
+    qpdf --linearize --object-streams=disable --deterministic-id --warning-exit-0 \
+        "$FIX/$stem.pdf" "$REF/$stem/linearize-disable.pdf"
+    qpdf --check-linearization "$REF/$stem/linearize-disable.pdf" >/dev/null
+    echo "$stem/linearize-disable.pdf"
+done
+
 # --- attachment-two-page: plain, static-id ---
 qpdf --deterministic-id --warning-exit-0 \
     "$FIX/attachment-two-page.pdf" "$REF/attachment-two-page/plain.pdf"
