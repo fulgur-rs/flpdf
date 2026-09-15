@@ -262,7 +262,7 @@ fn overlay_with_rotate_alone_still_rejected() {
 }
 
 #[test]
-fn overlay_with_linearize_is_rejected() {
+fn overlay_with_linearize_is_accepted() {
     let one = fixture("one-page.pdf");
     let tmp = tempfile::tempdir().unwrap();
     let out = tmp.path().join("o.pdf");
@@ -274,8 +274,8 @@ fn overlay_with_linearize_is_rejected() {
         .args(["--overlay", &one, "--"])
         .arg(out.to_str().unwrap())
         .assert()
-        .failure()
-        .stderr(predicate::str::contains("--linearize"));
+        .success();
+    assert!(out.is_file(), "linearized overlay output must be written");
 }
 
 #[test]

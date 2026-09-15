@@ -6449,9 +6449,6 @@ fn configure_rewrite_job(
     no_warn: bool,
     options: &WriterOptions,
 ) -> CliResult<QPDFJob> {
-    if linearize && !overlay_specs.is_empty() {
-        return Err("--overlay/--underlay cannot be combined with --linearize".into());
-    }
     let mut job = new_cli_job(no_warn);
     job.set_input_name_bytes(path_description(input));
     if replace_input {
