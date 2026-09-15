@@ -323,7 +323,6 @@ impl RenumberMap {
                         .collect()
                 })
         };
-
         let raw_capacity = raw_part2.len()
             + raw_part3.len()
             + raw_part4_private.len()
@@ -567,6 +566,34 @@ impl RenumberMap {
                 &mut by_original,
                 &mut by_original_raw,
             );
+        }
+
+        // Preserve source members are canonicalized to their source
+        // containers in the plan's parts, but the downstream ObjStm layout
+        // still needs a raw slot for each type-2 member before per-half
+        // placement rebuilds the final table. Keep these entries hidden from
+        // ordinary layout until that relocation step.
+        if let Some(preserve_plan) = plan.preserve_objstm_plan.as_ref() {
+            for group in &preserve_plan.groups {
+                let crate::writer::object_streams::ObjectStreamGroup::SourceBacked {
+                    members, ..
+                } = group
+                else {
+                    continue;
+                };
+                for &member in members {
+                    let raw = QpdfObjGen::try_from_object_ref(member)
+                        .expect("Preserve ObjStm members must fit qpdf raw identity");
+                    if by_original_raw.contains_key(&raw) {
+                        continue;
+                    }
+                    let new_ref = ObjectRef::new(by_new_number.len() as u32, 0);
+                    by_new_number.push(SENTINEL);
+                    by_new_raw.push(raw);
+                    by_original_raw.insert(raw, new_ref);
+                    by_original.insert(member, new_ref);
+                }
+            }
         }
 
         Self {
@@ -821,6 +848,13 @@ impl RenumberMap {
             .flat_map(|batch| batch.members.iter().copied())
             .filter_map(|object_ref| QpdfObjGen::try_from_object_ref(object_ref).ok())
             .collect();
+        let source_container_set: BTreeSet<QpdfObjGen> = open_document_batches
+            .iter()
+            .chain(first_half_batches)
+            .chain(second_half_batches)
+            .filter_map(|batch| batch.source_container_number)
+            .map(|number| QpdfObjGen::new(number as i32, 0))
+            .collect();
         let second_half_post_plain_raw: BTreeSet<QpdfObjGen> = second_half_post_plain
             .iter()
             .filter_map(|object_ref| QpdfObjGen::try_from_object_ref(*object_ref).ok())
@@ -873,6 +907,9 @@ impl RenumberMap {
             }
             if member_set.contains(&original) {
                 continue; // re-placed as an ObjStm member in its half below
+            }
+            if source_container_set.contains(&original) {
+                continue; // re-emitted as the reconstructed Preserve container below
             }
             if old_idx < old_param_slot {
                 second_half_plain.push(original);

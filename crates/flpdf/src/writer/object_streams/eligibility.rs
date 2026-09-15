@@ -9,8 +9,26 @@
 use std::collections::BTreeSet;
 use std::num::NonZeroUsize;
 
+#[cfg(test)]
+use std::cell::Cell;
+
 use crate::ObjectHandle;
 use crate::ObjectRef;
+
+#[cfg(test)]
+thread_local! {
+    static COMPRESSIBLE_PLAN_CALLS: Cell<usize> = const { Cell::new(0) };
+}
+
+#[cfg(test)]
+pub(crate) fn reset_compressible_plan_call_count() {
+    COMPRESSIBLE_PLAN_CALLS.with(|calls| calls.set(0));
+}
+
+#[cfg(test)]
+pub(crate) fn compressible_plan_call_count() -> usize {
+    COMPRESSIBLE_PLAN_CALLS.with(Cell::get)
+}
 // ── Public types ─────────────────────────────────────────────────────────────
 
 /// Context resolved once per document, used to identify objects that must stay
@@ -112,6 +130,8 @@ pub(crate) struct CompressiblePlan {
 pub(crate) fn compressible_objgens_qpdf_plan<R: std::io::Read + std::io::Seek>(
     pdf: &mut crate::Pdf<R>,
 ) -> crate::Result<CompressiblePlan> {
+    #[cfg(test)]
+    COMPRESSIBLE_PLAN_CALLS.with(|calls| calls.set(calls.get() + 1));
     let mut visited: BTreeSet<u32> = BTreeSet::new();
     let mut result: Vec<ObjectRef> = Vec::new();
     let mut removed_refs = BTreeSet::new();

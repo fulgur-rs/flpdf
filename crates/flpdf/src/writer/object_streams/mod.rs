@@ -9,6 +9,8 @@ pub(crate) use eligibility::{
     get_compressible_objgens, is_eligible_for_objstm_handle, is_qpdf_signature_dict,
     CompressiblePlan, EligibilityContext,
 };
+#[cfg(test)]
+pub(crate) use eligibility::{compressible_plan_call_count, reset_compressible_plan_call_count};
 pub(crate) use emission::{
     emit_objstm_body_from_handles_with_writer, emit_objstm_body_from_handles_with_writer_qdf,
     wrap_objstm_body_as_handle, ObjStmBody,
