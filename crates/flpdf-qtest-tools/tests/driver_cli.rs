@@ -1248,6 +1248,11 @@ fn qtest_accessor_cases_do_not_use_explicit_pdf_resolve() {
         "/src/driver/test_10_17.rs"
     ))
     .expect("read middle-driver source");
+    let late_source = fs::read_to_string(concat!(
+        env!("CARGO_MANIFEST_DIR"),
+        "/src/driver/test_72_79.rs"
+    ))
+    .expect("read late-driver source");
     let page_source = fs::read_to_string(concat!(
         env!("CARGO_MANIFEST_DIR"),
         "/src/driver/test_18_25.rs"
@@ -1351,8 +1356,28 @@ fn qtest_accessor_cases_do_not_use_explicit_pdf_resolve() {
             && test_17.contains("page_kids.try_get_array_item(0)?")
             && test_17.contains("page_kids.try_get_array_item(1)?")
             && !test_17.contains("root_ref()")
-            && !test_17.contains(".as_array()"),
+        && !test_17.contains(".as_array()"),
         "test 17 must use resolving root/key/array accessors without identity or non-resolving bridges"
+    );
+    let test_73 = section(
+        late_source.as_str(),
+        "pub(crate) fn run_test_73",
+        "pub(crate) fn run_test_74",
+    );
+    assert!(
+        test_73.contains("pages_seed.try_unparse_resolved()?")
+            && !test_73.contains("resolve_once(")
+            && !test_73.contains(".unparse_resolved()"),
+        "test 73 must let unparseResolved own /Pages resolution without a Pdf::resolve bridge"
+    );
+    assert!(
+        section(
+            late_source.as_str(),
+            "pub(crate) fn run_test_75",
+            "pub(crate) fn run_test_76",
+        )
+        .contains("resolve_once("),
+        "test 75 lost the explicit chained resolution retained for its separate scope"
     );
     let test_19 = section(
         page_source.as_str(),

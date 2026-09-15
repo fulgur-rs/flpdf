@@ -3560,6 +3560,26 @@ pinned qpdf 11.9.0 と flpdf の`page_api_2.pdf` test driver出力は、両方ex
 resolving array accessorを通る回帰テストと対象関数のsource guardを追加し、case 17を
 `canonical`へ再分類した。
 
+### qtest E-28 test 73 resolving unparse cutover `flpdf-3yn9.48.115` (2026-09-15)
+
+qpdfの`test_73`は`closeInputSource()`後に`getRoot().getKey("/Pages").unparseResolved()`を
+直接呼ぶ（`qpdf/test_driver.cc:2489-2500`）。`QPDFObjectHandle::unparseResolved`は自身の
+receiverを`dereference()`してから値の`unparse()`へ委譲するため、caller側に別の
+`QPDF::resolve`は存在しない（`include/qpdf/QPDFObjectHandle.hh:1159-1161`、
+`libqpdf/QPDFObjectHandle.cc:1574-1593`）。source closeの責務は
+`QPDF::closeInputSource`（`include/qpdf/QPDF.hh:162-166`、`libqpdf/QPDF.cc:278-281`）である。
+
+flpdfの`run_test_73`は従来、canonical `root_handle`/`try_get_key`後にqpdfに対応物のない
+`resolve_once`（`Pdf::resolve`）を`/Pages`へ前置し、非fallible `unparse_resolved`を呼んでいた。
+既存のfallible `ObjectHandle::try_unparse_resolved`へ直接移し、qpdfのreceiver-resolutionと
+エラー境界を同じaccessorへ戻した。`Pdf::uninitialized`、`close_input_source`、warning
+drain、closed-source error/statusは変更していない。test75など別のchained accessorが
+`resolve_once`を必要とするconsumerはこのsliceの対象外である。
+
+pinned qpdf 11.9.0 と flpdf の`invalid-objects` test73は、どちらもexit 2、350 bytesで
+`cmp`一致した。cached root/pagesをclose前に解決する回帰テストとtest73専用source guardを
+追加し、case 73を`canonical`へ再分類した。
+
 ### qtest E-28 test 31 lazy null accessor cutover `flpdf-3yn9.48.104` (2026-09-15)
 
 qpdf の `QPDFObjectHandle::isNull()` は public accessor であり、実装は
