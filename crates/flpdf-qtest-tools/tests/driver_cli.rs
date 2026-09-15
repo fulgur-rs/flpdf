@@ -1527,6 +1527,26 @@ fn qtest_accessor_cases_do_not_use_explicit_pdf_resolve() {
             && !test_97.contains(".as_array()"),
         "test 97 must use the canonical resolving array-count accessor without a caller-side bridge"
     );
+
+    let test_92 = section(
+        mutation_source.as_str(),
+        "pub(crate) fn run_test_92",
+        "pub(crate) fn run_test_93",
+    );
+    assert!(
+        test_92.contains("qpdf.root_handle()?")
+            && test_92.contains("root.try_get_key(")
+            && test_92.contains("try_get_array_item(")
+            && test_92.contains("try_get_stream_dict()")
+            && test_92.contains("try_unparse_resolved()")
+            && !test_92.contains("resolved_key(")
+            && !test_92.contains("qpdf.resolve(")
+            && !test_92.contains(".as_array()")
+            && !test_92.contains(".as_dictionary()")
+            && !test_92.contains(".as_stream_dict()")
+            && !test_92.contains("is_scalar(&"),
+        "test 92 must use canonical resolving ownership/type/unparse accessors without helper bridges"
+    );
 }
 
 fn test_driver_fixture_dir() -> std::path::PathBuf {
