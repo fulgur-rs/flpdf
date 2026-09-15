@@ -2270,7 +2270,7 @@ canonical receiver resolution while retaining qpdf's indirect-child stop rule,
 reserved-object copy, and `QPDF_Stream::copy` runtime error
 (`libqpdf/QPDF_Stream.cc:141-145`). The page-splice duplicate-page consumer
 therefore no longer performs a redundant caller-side dereference. E-28
-test21's qtest consumer cutover remains the dependent `.48.113` slice.
+test21's qtest consumer cutover is completed in the dependent `.48.113` slice.
 
 ### A6/A7 AcroForm appearance renderer accessor slice `flpdf-3yn9.48.23.16` (2026-09-10)
 
@@ -3513,6 +3513,22 @@ flpdfの`run_test_19`は、既存のPageDocumentHelper snapshotをmutation後に
 戻し、test 21のshallow-copy error用explicit `Pdf::resolve`は別scopeとして残した。
 qpdf `page_api_1.pdf`の`test 19` outputとflpdf driver outputを比較し、focused unit
 testとsource guardも通過した。case 19は`canonical`へ再分類した。
+
+### qtest E-28 test 21 resolving shallow-copy cutover `flpdf-3yn9.48.113` (2026-09-15)
+
+qpdfの`test_21`はpage listの先頭pageからpublic resolving `getKey("/Contents")`を取得し、
+その結果へreceiverを解決するpublic `shallowCopy`を適用する。qpdfの
+`QPDFObjectHandle::getKey`は`include/qpdf/QPDFObjectHandle.hh:762-768`/
+`libqpdf/QPDFObjectHandle.cc:978-989`、`shallowCopy`のreceiver解決は
+`include/qpdf/QPDFObjectHandle.hh:874-881`/
+`libqpdf/QPDFObjectHandle.cc:2073-2079`、stream拒否は
+`libqpdf/QPDF_Stream.cc:141-145`が責務を持つ。
+
+flpdfの`run_test_21`は`get_key`とcaller-side `Pdf::resolve`を撤去し、`.48.112`でreceiver解決を
+持たせたcanonical `shallow_copy`へ`try_get_key`の結果を直接渡した。未到達の
+`you can't see this` footerと`stream objects cannot be cloned`のError::System境界は保持した。
+`shallow_array.pdf`に対するqpdf `shallow_stream.out`とflpdf driver stderrのexit 2出力、focused
+error-contract test、source guardを比較し、case 21を`canonical`へ再分類した。
 
 ### qtest E-28 test 31 lazy null accessor cutover `flpdf-3yn9.48.104` (2026-09-15)
 
