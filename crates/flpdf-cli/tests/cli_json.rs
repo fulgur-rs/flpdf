@@ -1801,7 +1801,6 @@ fn json_flag_conflicts_with_compress_streams() {
 fn json_output_conflicts_with_the_json_exclusive_flag_set() {
     let cases: &[&[&str]] = &[
         &["--check"],
-        &["--linearize"],
         &["--static-id"],
         &["--deterministic-id"],
         &["--static-aes-iv"],
@@ -1816,14 +1815,9 @@ fn json_output_conflicts_with_the_json_exclusive_flag_set() {
         &["--compress-streams=n"],
         &["--linearize-pass1=pass1"],
         &["--remove-restrictions"],
-        &["--decrypt"],
-        &["--encrypt", "u", "o", "128", "--"],
         &["--copy-encryption=donor.pdf"],
-        &["--add-attachment", "file.bin", "--"],
-        &["--remove-attachment=key"],
         &["--list-attachments"],
         &["--show-attachment=key"],
-        &["--copy-attachments-from", "donor.pdf", "--"],
         &["--no-original-object-ids"],
         &["--qdf"],
         &["--coalesce-contents"],

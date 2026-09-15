@@ -1648,17 +1648,67 @@ fn encrypt_invalid_key_len_value_is_rejected() {
 }
 
 #[test]
-fn encrypt_conflicts_with_check_inspection_path() {
-    let tmp = tempfile::tempdir().unwrap();
-    let output = tmp.path().join("nope.pdf");
-    Command::cargo_bin("flpdf")
+fn encrypt_with_check_inspection_matches_qpdf() {
+    if !ensure_qpdf_or_skip() {
+        return;
+    }
+
+    let input = fixture(UNENCRYPTED_FIXTURE);
+    let args = ["--check", "--encrypt", "u", "o", "128", "--use-aes=y", "--"];
+    let qpdf = ShellCommand::new("qpdf")
+        .args(args)
+        .arg(&input)
+        .output()
+        .unwrap();
+    let flpdf = Command::cargo_bin("flpdf")
         .unwrap()
-        .args(["--check", "--encrypt", "u", "o", "128", "--use-aes=y", "--"])
-        .arg(fixture(UNENCRYPTED_FIXTURE))
-        .arg(&output)
-        .assert()
-        .failure()
-        .stderr(predicates::str::contains("cannot be used"));
+        .args(args)
+        .arg(&input)
+        .output()
+        .unwrap();
+
+    assert_eq!(flpdf.status.code(), qpdf.status.code());
+    assert_eq!(
+        normalize_text_newlines(&flpdf.stdout),
+        normalize_text_newlines(&qpdf.stdout)
+    );
+    assert_eq!(
+        normalize_text_newlines(&flpdf.stderr),
+        normalize_text_newlines(&qpdf.stderr)
+    );
+}
+
+#[test]
+fn encrypt_with_show_npages_matches_qpdf() {
+    if !ensure_qpdf_or_skip() {
+        return;
+    }
+
+    let input = fixture(ONE_PAGE_FIXTURE);
+    let args = [
+        "--show-npages",
+        "--encrypt",
+        "u",
+        "o",
+        "128",
+        "--use-aes=y",
+        "--",
+    ];
+    let qpdf = ShellCommand::new("qpdf")
+        .args(args)
+        .arg(&input)
+        .output()
+        .unwrap();
+    let flpdf = Command::cargo_bin("flpdf")
+        .unwrap()
+        .args(args)
+        .arg(&input)
+        .output()
+        .unwrap();
+
+    assert_eq!(flpdf.status.code(), qpdf.status.code());
+    assert_eq!(flpdf.stdout, qpdf.stdout);
+    assert_eq!(flpdf.stderr, qpdf.stderr);
 }
 
 /// `--encrypt` combined with `--pages` must reach the canonical writer after

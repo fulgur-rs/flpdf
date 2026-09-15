@@ -932,26 +932,24 @@ struct Cli {
     /// Enable qpdf JSON output mode. Pass `--json` alone or `--json=1|2`.
     /// The value, when given, must be supplied with an equals sign to avoid
     /// ambiguity with the positional input argument.
-    // JSON mode is exclusive with the other top-level inspection / write
-    // modes and with the OUTPUT positional. Without these conflicts, e.g.
-    // `flpdf --json --check in` or `flpdf --json in out` would silently
-    // ignore the second mode (run_json wins in main's dispatch chain).
-    // Listing them as clap conflicts surfaces the mistake as a usage error
-    // instead of doing one thing while the user asked for two.
+    // JSON mode remains exclusive with inspection modes that claim the
+    // no-output branch and with the OUTPUT positional contract. qpdf still
+    // accepts the writer/attachment combinations covered below: writer-only
+    // settings are ignored by JSON, while attachment mutations are applied
+    // by the same create-stage Job before serialization.
     #[arg(long, num_args = 0..=1, default_missing_value = "2",
           require_equals = true,
           value_name = "VERSION", value_parser = ["1", "2", "latest"],
           conflicts_with_all = [
-              "check", "linearize", "static_id", "deterministic_id", "static_aes_iv",
+              "check", "static_id", "deterministic_id", "static_aes_iv",
               "show_object",
               "show_npages", "show_pages", "show_xref", "show_linearization",
               "show_encryption",
               "is_encrypted", "requires_password",
               "compress_streams", "recompress_flate", "compression_level",
               "linearize_pass1", "remove_restrictions",
-              "decrypt", "encrypt", "copy_encryption",
-              "add_attachment", "remove_attachment", "list_attachments",
-              "show_attachment", "copy_attachments_from",
+              "copy_encryption",
+              "list_attachments", "show_attachment",
               "no_original_object_ids", "qdf", "coalesce_contents",
               "preserve_unreferenced",
           ],
@@ -997,18 +995,17 @@ struct Cli {
         value_name = "VERSION",
         value_parser = ["1", "2", "latest"],
         conflicts_with_all = [
-            "check", "linearize", "static_id", "deterministic_id", "static_aes_iv",
+            "check", "static_id", "deterministic_id", "static_aes_iv",
             "show_object",
             "show_npages", "show_pages", "show_xref", "show_linearization",
             "show_encryption",
             "is_encrypted", "requires_password",
             "compress_streams", "recompress_flate", "compression_level",
             "linearize_pass1", "remove_restrictions",
-            "decrypt", "encrypt", "copy_encryption",
-              "add_attachment", "remove_attachment", "list_attachments",
-              "show_attachment", "copy_attachments_from",
-              "no_original_object_ids", "qdf", "coalesce_contents",
-              "preserve_unreferenced",
+            "copy_encryption",
+            "list_attachments", "show_attachment",
+            "no_original_object_ids", "qdf", "coalesce_contents",
+            "preserve_unreferenced",
         ],
         help = "Generate qpdf JSON output; VERSION defaults to 2 and the output file is positional"
     )]
@@ -1161,14 +1158,14 @@ struct Cli {
     /// Relationship with `--remove-restrictions`: this flag removes source
     /// encryption, while `--remove-restrictions` preserves it and only removes
     /// digital-signature restrictions. Neither flag invents a success diagnostic.
-    // Same conflict semantics as --remove-restrictions: this is a
-    // rewrite-path modifier and must be rejected against the inspection
-    // subcommands so `flpdf --check --decrypt in out` is a usage error
-    // rather than silently ignoring the flag (and OUTPUT).
+    // qpdf accepts --decrypt with the output-free --check and --show-npages
+    // consumers; those writer settings are ignored when no output is created.
+    // The remaining bounded inspection conflicts are kept for their existing
+    // consumer scopes.
     #[arg(long = "decrypt",
           conflicts_with_all = [
-              "check", "show_object",
-              "show_npages", "show_pages", "show_xref", "show_linearization",
+              "show_object",
+              "show_pages", "show_xref", "show_linearization",
               "show_encryption",
           ])]
     decrypt: bool,
@@ -1553,17 +1550,17 @@ struct Cli {
         allow_hyphen_values = true,
         value_name = "USER-PW OWNER-PW KEY-LEN [sub-flags]",
         // Reject combinations that don't make sense on the rewrite path.
-        // --remove-restrictions overlaps with --encrypt and is rejected
-        // because it implies a contradictory output form; --check /
-        // --show-object / --show-* are inspection paths that don't produce an
-        // output file at all. --linearize is NOT rejected: qpdf itself
+        // --check and --show-npages are inspection paths that qpdf accepts
+        // alongside writer encryption settings; when no output is created,
+        // those settings are simply not consumed. --linearize is NOT rejected:
+        // qpdf itself
         // supports `--linearize --encrypt ...` (verified: `qpdf --linearize
         // --encrypt "" "" 128 --use-aes=y --` produces a valid,
         // `qpdf --check`-clean linearized+encrypted file), and
         // `write_linearized` threads `options.encrypt` through correctly.
         conflicts_with_all = [
-            "check", "show_object",
-            "show_npages", "show_pages", "show_xref", "show_linearization",
+            "show_object",
+            "show_pages", "show_xref", "show_linearization",
             "show_encryption",
             "remove_restrictions",
         ],
@@ -3368,6 +3365,7 @@ fn main() {
         run_json(
             &args,
             top_level_inspection_transform_options,
+            &attachment_segments,
             args.page_ops.empty,
         )
     } else if let Some(command) = args.command {
@@ -4298,6 +4296,7 @@ fn format_job_json_error(path: &Path, error: impl std::fmt::Display) -> String {
 fn run_json(
     cli: &Cli,
     transform_options: InspectionTransformOptions,
+    attachment_segments: &[Vec<Vec<u8>>],
     empty: bool,
 ) -> CliResult<()> {
     const QPDF_JSON_KEY_NAMES: &[&str] = &[
@@ -4426,6 +4425,18 @@ fn run_json(
     job.set_logger(cli_logger());
     job.set_message_prefix(progname());
     job.set_suppress_warnings(cli.no_warn);
+    // qpdf builds this diagnostic from `pdf.getFilename()`
+    // (`libqpdf/QPDFJob.cc:2129-2130`), so the create-stage job needs the
+    // same input name the write routes already set.
+    if let Some(input) = input {
+        job.set_input_name_bytes(path_description(input));
+    }
+    // qpdf gates its attachment reports on the job's own verbosity
+    // (`QPDFJob::doIfVerbose`, `libqpdf/QPDFJob.cc:340-345`, used by the
+    // attach report at `:2067-2070`). The inspection-transformation
+    // configurator sets it only when it has a transformation to install.
+    job.set_verbose(cli.verbose);
+    configure_top_level_attachment_mutations(&mut job, cli, attachment_segments)?;
 
     if empty {
         let mut pdf = create_empty_primary_document(&mut job, cli.update_from_json.as_deref())?;

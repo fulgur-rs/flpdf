@@ -261,7 +261,7 @@ E-10 page-merge inherited-attribute note (`flpdf-k4bp`, 2026-09-10): the primary
 2026-09-14（`flpdf-1emn` follow-up slice）: `rewrite` の `--pages` page-operation でも `--generate-appearances` / `--flatten-annotations=all` を拒否せず、page selection 後の qpdf transformation ownerへ渡すようにした。2 fixtureのlive differential（status/stdout/stderr/bytes）を `cli_page_operation_transforms_qpdf.rs` へ追加。`remove_restrictions`、`decrypt`、`copy_encryption` のguardと、page-selection後のimage/overlay順序は残る。 |
 2026-09-14（`flpdf-1emn` follow-up slice）: `rewrite` の `--remove-restrictions` も page selection 後の同じ transformation ownerへ渡し、通常/rotate/pages/split の各経路で qpdf の署名制限除去を適用するようにした。署名fixtureのstatus/stdout/stderr/byte differentialを `cli_page_operation_transforms_qpdf.rs` で固定。`decrypt`、`copy_encryption` のguardと、page-selection後のimage/overlay順序は残る。 |
 2026-09-14（`flpdf-ydwg` bounded slice）: `--json` / `--json-output` も top-level `InspectionTransformOptions` を `QPDFJob::apply_transformations` へ渡し、JSON serializerの前に qpdf の create-stage 順序（image → appearance → annotation → rotation）を実行するようにした。`inherited-rotate-one-page.pdf` と `form-fields-and-annotations.pdf` の stdout/file JSON を qpdf 11.9.0 と比較し、status/stdout/stderr/file bytes を固定。既存の page-selection post-plan consumer と E-11 の overlay direct caller は残るため、E-12/E-11 の行全体は mixed のまま。flatten wrapper stream は qpdf `newStream` 相当の `new_stream_with_data` に揃えた。 |
-2026-09-14（`flpdf-ca9zm` bounded slice）: `--show-pages`/`--show-npages`/`--show-xref`/`--show-linearization` と `--remove-restrictions`/`--coalesce-contents`/`--flatten-annotations=all` の12組、および `--list-attachments`＋`--coalesce-contents` を受理し、既存の combined QPDFJob inspection boundary または InspectionTransformOptions へ接続した。qpdf 11.9.0 の13組 status/stdout/stderr differentialを追加。`--show-object`/`--show-encryption`、`--check-linearization`、JSON、rewrite/page-operation の残る別組合せはこのsliceの外側で、E-12行全体はmixedのまま。 |
+2026-09-14（`flpdf-ca9zm` bounded slice）: `--show-pages`/`--show-npages`/`--show-xref`/`--show-linearization` と `--remove-restrictions`/`--coalesce-contents`/`--flatten-annotations=all` の12組、および `--list-attachments`＋`--coalesce-contents` を受理し、既存の combined QPDFJob inspection boundary または InspectionTransformOptions へ接続した。qpdf 11.9.0 の13組 status/stdout/stderr differentialを追加。`--show-object`/`--show-encryption`、`--check-linearization`、JSONの未接続transform、rewrite/page-operation の残る別組合せはこのsliceの外側で、E-12行全体はmixedのまま。 |
 2026-09-14（`flpdf-jq40m` bounded slice）: `--json-input` と `--update-from-json` の inspection routeも `remove_restrictions`/`coalesce_contents` を `run_job_inspection_on_pdf` から canonical create-stage transformation ownerへ渡すようにした。qpdf 11.9.0 と multi-content JSON inputの `--show-pages --coalesce-contents`、および update-from-JSONの同組合せを比較し、coalesced content streamの出力を固定した。JSON/page-operationの残る別consumerと、E-12全体の mixed 判定は維持する。
 2026-09-14（`flpdf-5qbs` bounded slice）: qpdf `doInspection` の同一argv再指定（boolは冪等、`showObject`/`showAttachment`は最後の値）を top-level clap の self-override で受理し、`--list-attachments`＋`--show-attachment` は独立consumerとして qpdf順に両方実行するようにした。qpdf 11.9.0 の repeated inspection / selector last-wins / list-plus-show を `cli_inspection_argv.rs` で status/stdout/stderr differential 固定。mutation attachment operation の相互排他と page-operation 後の別consumerは対象外。 |
 2026-09-15（`flpdf-3yn9.48.102`）: qpdf の public `removeSecurityRestrictions()` / `disableDigitalSignatures()` はいずれも `void`（`include/qpdf/QPDF.hh:603-607`; `include/qpdf/QPDFAcroFormDocumentHelper.hh:166-170`）であり、flpdf の変更有無を返す `Result<bool>` は対応しない projection だった。両 API を `Result<()>` に狭め、Job の捨てられていた `changed` 値と deviation marker を撤去した。`/Perms`、`/SigFlags`、署名フィールドの mutation と byte differential は維持する。 |
@@ -835,3 +835,23 @@ trigger 一覧が不完全になる。
 | attachment | replace |  | yes |
 | copy attachment | password | yes | yes |
 | copy attachment | prefix |  | yes |
+
+## 2026-09-15: qpdf-accepted writer and attachment inspection combinations (`flpdf-urjhr`)
+
+qpdf 11.9.0 の `QPDFJob::checkConfiguration` は、output-free inspection と
+`--encrypt` / `--decrypt` / `--linearize` の組み合わせを拒否しない。
+`createQPDF` の `handleTransformations` と `writeQPDF` の
+`!createsOutput() -> doInspection` 分岐が責務を分けているためである
+（`libqpdf/QPDFJob.cc:428-520,567-642`）。JSON outputも同じく、
+`writeOutfile` 内でJSON serializerを選択する前にcreate-stageを完了する
+（`libqpdf/QPDFJob_config.cc:311-324`; `libqpdf/QPDFJob.cc:3030-3057`）。
+
+flpdf はこのqpdf境界に合わせ、top-level `Cli` の qpdfに存在しない
+conflicts_withを、10通り（attachment mutation/JSON、encrypt・decrypt・linearizeと
+JSON、encrypt・decryptとcheck/show-npages）から除去した。attachment mutationを伴う
+JSONは既存の `QPDFJob::apply_transformations` に設定を渡してから
+`QPDFJob::write_json_with_version` を呼び、独自の検査前mutation routeを追加しない。
+
+`crates/flpdf-cli/tests/cli_qpdf_conflict_matrix.rs::qpdf_writer_and_attachment_conflicts_match_qpdf`
+がpinned qpdf 11.9.0とのstatus/stdout/stderrを10通り比較する。`flpdf-awthm` の
+list/check/show-attachment mutation consumerは別のbounded sliceとして残る。
