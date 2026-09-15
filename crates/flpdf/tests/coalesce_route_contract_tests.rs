@@ -14,7 +14,8 @@ fn production_consumers_call_the_canonical_coalesce_owner() {
 
     assert!(!cli.contains("coalesce_page_contents"));
     assert!(!flatten.contains("coalesce_page_contents"));
-    assert!(cli.contains("job.apply_transformations(&mut pdf)?"));
+    assert!(cli.contains("apply_transformations_for_cli(job, pdf)?"));
+    assert!(cli.contains("match job.apply_transformations(pdf)"));
     assert!(cli.contains("job.write_qpdf(&mut pdf)"));
     assert!(lifecycle.contains("PageObjectHelper::new(page_ref, pdf).coalesce_content_streams()?"));
     assert!(flatten.contains("PageObjectHelper::new(page_ref, pdf).coalesce_content_streams()?"));

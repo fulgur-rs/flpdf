@@ -5,7 +5,8 @@ use flpdf::job::{
 use flpdf::json_inspect::DecodeLevel;
 use flpdf::pipeline::{Pipeline, PipelineError, PipelineHandle, PipelineResult};
 use flpdf::{
-    EncryptParams, Error, ObjectHandle, PageRange, Pdf, PdfOpenOptions, PdfWriter, QPDFLogger,
+    EncryptParams, EncryptedError, Error, ObjectHandle, PageRange, Pdf, PdfOpenOptions, PdfWriter,
+    QPDFLogger,
 };
 use std::fs::File;
 use std::io::{BufReader, Cursor};
@@ -4083,6 +4084,36 @@ fn json_page_spec_uses_copy_encryption_password_when_page_password_is_unspecifie
         explicit_empty_job.run().unwrap(),
         JobExitCode::Error,
         "an explicit empty page password must bypass the encryption-file fallback"
+    );
+}
+
+#[test]
+fn apply_transformations_preserves_typed_copy_donor_password_error() {
+    let input = Path::new(env!("CARGO_MANIFEST_DIR")).join("../../tests/fixtures/minimal.pdf");
+    let donor = Path::new(env!("CARGO_MANIFEST_DIR"))
+        .join("../../tests/fixtures/encrypted/v4-aes-128-r4.pdf");
+    let mut primary = Pdf::open(BufReader::new(File::open(&input).unwrap())).unwrap();
+
+    let mut job = QPDFJob::new();
+    job.config()
+        .copy_attachments_from(donor, b"wrong-password".to_vec(), Vec::new());
+    let error = job
+        .apply_transformations(&mut primary)
+        .expect_err("the encrypted donor must reject the wrong password");
+
+    let typed_bad_password = match &error {
+        Error::Encrypted(EncryptedError::BadPassword) => true,
+        Error::OpenFailure { source, .. } => {
+            matches!(
+                source.as_ref(),
+                Error::Encrypted(EncryptedError::BadPassword)
+            )
+        }
+        _ => false,
+    };
+    assert!(
+        typed_bad_password,
+        "copy donor authentication must remain typed, got {error:?}"
     );
 }
 

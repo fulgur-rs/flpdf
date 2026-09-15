@@ -316,3 +316,35 @@ fn json_copy_password_is_hex_key_matches_qpdf() {
     let (qpdf, _) = assert_pair("JSON donor --password-is-hex-key", &args);
     assert!(qpdf.status.success());
 }
+
+#[test]
+fn copy_donor_wrong_password_matches_qpdf_for_normal_and_json_routes() {
+    if skip_without_qpdf() {
+        return;
+    }
+
+    let temp = tempfile::tempdir().unwrap();
+    let donor = temp.path().join("wrong-password-donor.pdf");
+    fs::write(
+        &donor,
+        encrypted_attachment_fixture_with_raw_password(b"correct-password"),
+    )
+    .unwrap();
+    let input = fixture("three-page.pdf");
+
+    let normal_output = temp.path().join("normal-output.pdf");
+    let normal_args = vec![
+        OsString::from("--copy-attachments-from"),
+        donor.as_os_str().to_owned(),
+        OsString::from("--password=wrong-password"),
+        OsString::from("--"),
+        input.as_os_str().to_owned(),
+        normal_output.as_os_str().to_owned(),
+    ];
+    let (qpdf, _) = assert_pair("wrong donor password + normal output", &normal_args);
+    assert_eq!(qpdf.status.code(), Some(2));
+
+    let json_args = json_copy_args(&[], &donor, &[OsString::from("--password=wrong-password")]);
+    let (qpdf, _) = assert_pair("wrong donor password + JSON output", &json_args);
+    assert_eq!(qpdf.status.code(), Some(2));
+}

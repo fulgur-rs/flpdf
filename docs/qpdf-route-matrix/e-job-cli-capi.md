@@ -596,6 +596,23 @@ and diagnostics for damaged, xref-stream, hex-password, password-recovery,
 and hex-key donors. Donor authentication failures retain qpdf's donor-path
 `invalid password` diagnostic.
 
+### E-9 / E-21 donor password error ownership (`flpdf-ghk8d`, 2026-09-15)
+
+qpdf's `QPDFJob::copyAttachments` opens each donor with `processFile` and lets
+the password exception escape the copy loop (`libqpdf/QPDFJob.cc:2089-2100`).
+The qpdf CLI catches that `std::exception` at its outer boundary and renders
+`qpdf: <what()>` (`qpdf/qpdf.cc:32-43`). The library error classification is
+therefore kept separate from the path-bearing CLI diagnostic.
+
+flpdf no longer converts a donor `BadPassword` to `SystemBytes` inside
+`prepare_document_transformations`. The public `QPDFJob::apply_transformations`
+returns the typed `Encrypted(BadPassword)` source, while the CLI transformation
+boundary calls `QPDFJob::report_job_error` using the failed donor name already
+retained by `open_job_source`, then returns the existing exit-2 sentinel. Both
+normal copy output and JSON copy output compare their donor-path stderr with
+qpdf in `cli_json_donor_policy.rs`; this bounded ownership correction adds no
+bridge or qpdf-deviation marker.
+
 ### E-9 / E-12 single inspection with attachment mutation (`flpdf-awthm`, 2026-09-15)
 
 qpdf applies attachment remove/add/copy during `createQPDF` before
