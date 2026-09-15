@@ -3,6 +3,7 @@
 
 use assert_cmd::Command;
 use std::ffi::OsString;
+use std::fs;
 use std::path::{Path, PathBuf};
 use std::process::{Command as ShellCommand, Output};
 
@@ -61,6 +62,7 @@ fn run_qpdf_and_flpdf(args: &[OsString]) -> (Output, Output) {
         .expect("qpdf should spawn");
     let flpdf = Command::cargo_bin("flpdf")
         .expect("flpdf binary should build")
+        .env("FLPDF_PROGNAME", "qpdf")
         .args(args)
         .output()
         .expect("flpdf should spawn");
@@ -99,6 +101,60 @@ fn json_args(extra: &[OsString], input: &Path) -> Vec<OsString> {
     args.push(input.as_os_str().to_owned());
     args.push(OsString::from("-"));
     args
+}
+
+fn assert_json_output_pair(label: &str, extra: &[OsString], input: &Path) {
+    let temp = tempfile::tempdir().expect("temporary JSON output directory");
+    let qpdf_output = temp.path().join("qpdf.json");
+    let flpdf_output = temp.path().join("flpdf.json");
+
+    let mut qpdf_args = vec![OsString::from("--json-output=2")];
+    qpdf_args.extend_from_slice(extra);
+    qpdf_args.push(input.as_os_str().to_owned());
+    qpdf_args.push(qpdf_output.as_os_str().to_owned());
+    let qpdf = ShellCommand::new("qpdf")
+        .args(&qpdf_args)
+        .output()
+        .expect("qpdf should spawn");
+
+    let mut flpdf_args = vec![OsString::from("--json-output=2")];
+    flpdf_args.extend_from_slice(extra);
+    flpdf_args.push(input.as_os_str().to_owned());
+    flpdf_args.push(flpdf_output.as_os_str().to_owned());
+    let flpdf = Command::cargo_bin("flpdf")
+        .expect("flpdf binary should build")
+        .env("FLPDF_PROGNAME", "qpdf")
+        .args(&flpdf_args)
+        .output()
+        .expect("flpdf should spawn");
+
+    assert_eq!(
+        flpdf.status.code(),
+        qpdf.status.code(),
+        "{label}: exit status differs; qpdf stderr={} flpdf stderr={}",
+        String::from_utf8_lossy(&qpdf.stderr),
+        String::from_utf8_lossy(&flpdf.stderr)
+    );
+    assert_eq!(
+        normalize_text_newlines(&flpdf.stdout),
+        normalize_text_newlines(&qpdf.stdout),
+        "{label}: stdout differs"
+    );
+    assert_eq!(
+        normalize_text_newlines(&flpdf.stderr),
+        normalize_text_newlines(&qpdf.stderr),
+        "{label}: stderr differs"
+    );
+    assert!(
+        qpdf.status.success(),
+        "{label}: qpdf must accept the combination; stderr={}",
+        String::from_utf8_lossy(&qpdf.stderr)
+    );
+    assert_eq!(
+        normalize_text_newlines(&fs::read(&flpdf_output).expect("flpdf JSON output")),
+        normalize_text_newlines(&fs::read(&qpdf_output).expect("qpdf JSON output")),
+        "{label}: JSON output differs"
+    );
 }
 
 #[test]
@@ -156,9 +212,27 @@ fn qpdf_writer_and_attachment_conflicts_match_qpdf() {
     encrypt_check.push(three_page.as_os_str().to_owned());
     assert_pair("encrypt + check", &encrypt_check);
     let mut encrypt_npages = vec![OsString::from("--show-npages")];
-    encrypt_npages.extend(encrypt);
+    encrypt_npages.extend(encrypt.clone());
     encrypt_npages.push(three_page.as_os_str().to_owned());
     assert_pair("encrypt + show-npages", &encrypt_npages);
+
+    let mut encrypt_check_linearization = vec![OsString::from("--check-linearization")];
+    encrypt_check_linearization.extend(encrypt.clone());
+    encrypt_check_linearization.push(three_page.as_os_str().to_owned());
+    assert_pair(
+        "encrypt + check-linearization",
+        &encrypt_check_linearization,
+    );
+
+    let mut encrypt_show_encryption = vec![OsString::from("--show-encryption")];
+    encrypt_show_encryption.extend(encrypt.clone());
+    encrypt_show_encryption.push(three_page.as_os_str().to_owned());
+    assert_pair("encrypt + show-encryption", &encrypt_show_encryption);
+
+    let mut encrypt_show_pages = vec![OsString::from("--show-pages")];
+    encrypt_show_pages.extend(encrypt);
+    encrypt_show_pages.push(three_page.as_os_str().to_owned());
+    assert_pair("encrypt + show-pages", &encrypt_show_pages);
 
     assert_pair(
         "linearize + json",
@@ -185,4 +259,55 @@ fn qpdf_writer_and_attachment_conflicts_match_qpdf() {
             three_page.as_os_str().to_owned(),
         ],
     );
+    assert_pair(
+        "decrypt + show-encryption",
+        &[
+            OsString::from("--show-encryption"),
+            OsString::from("--decrypt"),
+            three_page.as_os_str().to_owned(),
+        ],
+    );
+    assert_pair(
+        "decrypt + show-pages",
+        &[
+            OsString::from("--show-pages"),
+            OsString::from("--decrypt"),
+            three_page.as_os_str().to_owned(),
+        ],
+    );
+
+    assert_pair(
+        "compress-streams=n + json",
+        &json_args(&[OsString::from("--compress-streams=n")], &three_page),
+    );
+    assert_pair(
+        "qdf + json",
+        &json_args(&[OsString::from("--qdf")], &three_page),
+    );
+    assert_pair(
+        "rotate + check-linearization",
+        &[
+            OsString::from("--check-linearization"),
+            OsString::from("--rotate=90"),
+            three_page.as_os_str().to_owned(),
+        ],
+    );
+    assert_pair(
+        "pages + check-linearization",
+        &[
+            three_page.as_os_str().to_owned(),
+            OsString::from("--pages"),
+            OsString::from("."),
+            OsString::from("1"),
+            OsString::from("--"),
+            OsString::from("--check-linearization"),
+        ],
+    );
+
+    assert_json_output_pair(
+        "compress-streams=n + json-output",
+        &[OsString::from("--compress-streams=n")],
+        &three_page,
+    );
+    assert_json_output_pair("qdf + json-output", &[OsString::from("--qdf")], &three_page);
 }

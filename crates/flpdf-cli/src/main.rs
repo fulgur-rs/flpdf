@@ -835,12 +835,9 @@ struct Cli {
             "json_object",
             "json_stream_data",
             "json_stream_prefix",
-            "pages",
-            "rotate",
             "split_pages",
             "overlay",
             "underlay",
-            "encrypt",
             "copy_encryption",
             "encryption_file_password",
         ]
@@ -946,11 +943,11 @@ struct Cli {
               "show_npages", "show_pages", "show_xref", "show_linearization",
               "show_encryption",
               "is_encrypted", "requires_password",
-              "compress_streams", "recompress_flate", "compression_level",
+              "recompress_flate", "compression_level",
               "linearize_pass1", "remove_restrictions",
               "copy_encryption",
               "list_attachments", "show_attachment",
-              "no_original_object_ids", "qdf", "coalesce_contents",
+              "no_original_object_ids", "coalesce_contents",
               "preserve_unreferenced",
           ],
           help = "Generate JSON v2 output (qpdf --json compatible)")]
@@ -1000,11 +997,11 @@ struct Cli {
             "show_npages", "show_pages", "show_xref", "show_linearization",
             "show_encryption",
             "is_encrypted", "requires_password",
-            "compress_streams", "recompress_flate", "compression_level",
+            "recompress_flate", "compression_level",
             "linearize_pass1", "remove_restrictions",
             "copy_encryption",
             "list_attachments", "show_attachment",
-            "no_original_object_ids", "qdf", "coalesce_contents",
+            "no_original_object_ids", "coalesce_contents",
             "preserve_unreferenced",
         ],
         help = "Generate qpdf JSON output; VERSION defaults to 2 and the output file is positional"
@@ -1165,8 +1162,7 @@ struct Cli {
     #[arg(long = "decrypt",
           conflicts_with_all = [
               "show_object",
-              "show_pages", "show_xref", "show_linearization",
-              "show_encryption",
+              "show_xref", "show_linearization",
           ])]
     decrypt: bool,
     /// `qpdf --compress-streams=y|n` compatibility flag.  Accepted but
@@ -1560,8 +1556,7 @@ struct Cli {
         // `write_linearized` threads `options.encrypt` through correctly.
         conflicts_with_all = [
             "show_object",
-            "show_pages", "show_xref", "show_linearization",
-            "show_encryption",
+            "show_xref", "show_linearization",
             "remove_restrictions",
         ],
         help = "Encrypt output (qpdf --encrypt compatible): \
@@ -3941,6 +3936,7 @@ fn top_level_inspection_combination_requested(
             || args.qdf
             || args.coalesce_contents
             || args.remove_restrictions
+            || !args.page_ops.rotate.is_empty()
             || !args.page_ops.collate.is_empty())
 }
 

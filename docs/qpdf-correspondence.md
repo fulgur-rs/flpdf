@@ -3544,6 +3544,24 @@ attachmentのadd/remove/copy、encrypt/decrypt/linearizeとJSON、encrypt/decryp
 check/show-npagesの10通りをpinned qpdf 11.9.0とstatus/stdout/stderr比較する。
 qpdfに対応する独自compatibility bridgeやdeviation markerは追加しない。
 
+### QPDFJob remaining writer/inspection conflict acceptance (`flpdf-zet2u`, 2026-09-15)
+
+qpdf 11.9.0の同じ `checkConfiguration` / `createQPDF` / `writeQPDF` 境界に対し、
+top-level clapが残していた9組の誤った相互排他を除去した。対象は
+`--encrypt` と `--check-linearization`/`--show-encryption`/`--show-pages`、
+`--decrypt` と `--show-encryption`/`--show-pages`、
+`--compress-streams=n`/`--qdf` と `--json`、および
+`--rotate=90`/`--pages . 1 --` と `--check-linearization` である。
+writer-only設定はqpdfと同じくoutput-free inspectionまたはJSON serializerでは
+writerを起動せず、inspection/JSONの処理を継続する。`--json-output`も
+`Config::jsonOutput`が`json`を設定する同一責務のため、最後の2つのwriter-option
+受理を対称に適用した（`QPDFJob_config.cc:311-324`）。
+
+`crates/flpdf-cli/tests/cli_qpdf_conflict_matrix.rs` は既存10組にこの9組と
+`--json-output`の2組を加え、qpdf 11.9.0との終了コード・stdout・stderr・JSON
+出力を比較する。別のinspection consumerの未移行conflictをこのbounded sliceへ
+取り込まず、qpdfに対応するbridgeやdeviation markerも追加しない。
+
 ### Top-level attachment mutation with a single inspection (`flpdf-awthm`, 2026-09-15)
 
 qpdf's `createQPDF` always completes `handleTransformations`, including
