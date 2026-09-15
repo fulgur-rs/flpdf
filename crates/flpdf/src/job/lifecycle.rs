@@ -3876,10 +3876,10 @@ impl QPDFJob {
         self.copy_attachments_with_opener(pdf, &copy_options, |job, option| {
             // qpdf's `copyAttachments` lets the donor's `processFile`
             // exception escape directly (`QPDFJob.cc:2100`), so a password
-            // failure is reported with the donor path, rather than the
-            // path-scoped primary-open diagnostic owned by this job.
+            // failure remains typed here. The CLI adds the donor path at its
+            // reporting boundary, while library callers retain the original
+            // `Encrypted(BadPassword)` classification.
             job.open_job_source(&option.path, &option.password)
-                .map_err(|error| qpdf_copy_attachment_open_error(error, &option.path))
         })?;
 
         Ok(())
@@ -5402,22 +5402,6 @@ impl QPDFJobConfig<'_> {
     }
 }
 
-fn qpdf_copy_attachment_open_error(error: Error, path: &Path) -> Error {
-    if matches!(&error, Error::Encrypted(crate::EncryptedError::BadPassword))
-        || matches!(
-            &error,
-            Error::OpenFailure { source, .. }
-                if matches!(source.as_ref(), Error::Encrypted(crate::EncryptedError::BadPassword))
-        )
-    {
-        let mut message = path_description_bytes(path);
-        message.extend_from_slice(b": invalid password");
-        Error::SystemBytes(message)
-    } else {
-        error
-    }
-}
-
 fn map_show_linearization_error(error: ShowLinearizationError) -> Error {
     match error {
         ShowLinearizationError::Io(error) => match error.downcast::<Error>() {
@@ -5568,32 +5552,6 @@ mod tests {
             QPDFJob::job_error_message(&fallback),
             b"open output.pdf: native fallback"
         );
-    }
-
-    #[test]
-    fn copy_attachment_bad_password_uses_the_donor_path() {
-        let path = Path::new("donor.pdf");
-        let expected = b"donor.pdf: invalid password";
-        let direct = qpdf_copy_attachment_open_error(
-            Error::Encrypted(crate::EncryptedError::BadPassword),
-            path,
-        );
-        assert_eq!(direct.raw_message(), Some(expected.as_slice()));
-
-        let wrapped = qpdf_copy_attachment_open_error(
-            Error::OpenFailure {
-                source: Box::new(Error::Encrypted(crate::EncryptedError::BadPassword)),
-                diagnostics: crate::Diagnostics::default(),
-            },
-            path,
-        );
-        assert_eq!(wrapped.raw_message(), Some(expected.as_slice()));
-
-        let other = Error::System("other".to_owned());
-        assert!(matches!(
-            qpdf_copy_attachment_open_error(other, path),
-            Error::System(message) if message == "other"
-        ));
     }
 
     #[test]

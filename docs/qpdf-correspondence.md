@@ -3711,6 +3711,26 @@ optionを除去し、3分岐の JSON route で `coalesce_contents` を既存の
 bytes を比較する。未監査の route-specific conflict はこの issue の範囲に
 含めず、独自 bridge や qpdf-deviation marker は追加しない。
 
+### Donor password error ownership (`flpdf-ghk8d`, 2026-09-15)
+
+qpdf の `QPDFJob::copyAttachments` は各 donor を `processFile` で開き、
+password exception をそのまま copy loop の外へ伝播させる
+（`libqpdf/QPDFJob.cc:2089-2100`）。CLI の `qpdf/qpdf.cc` はこの
+`std::exception` を最上位で `qpdf: <what()>` として表示する
+（`qpdf/qpdf.cc:32-43`）。従って donor 認証失敗の分類は job/library
+境界で保持し、donor path の文字列化は CLI reporting 境界に限定する。
+
+flpdf は `prepare_document_transformations` で donor path を job の入力名に
+保持し、public `QPDFJob::apply_transformations` からは
+`Error::Encrypted(BadPassword)`（または diagnostics を伴う同じ source）を
+返す。CLI は typed bad-password だけを `QPDFJob::report_job_error` へ渡し、
+qpdf と同じ donor-path 診断を出して既存の exit-2 sentinel で終了する。
+この分離により通常書き出しと JSON の表示を変えず、ライブラリ利用者が
+`Error::Encrypted` を pattern-match できる。回帰は
+`crates/flpdf/tests/job_lifecycle_tests.rs` の public API テストと
+`crates/flpdf-cli/tests/cli_json_donor_policy.rs` の通常/JSON differential
+で固定し、独自 error variant や deviation marker は追加しない。
+
 ### Top-level attachment mutation with a single inspection (`flpdf-awthm`, 2026-09-15)
 
 qpdf's `createQPDF` always completes `handleTransformations`, including

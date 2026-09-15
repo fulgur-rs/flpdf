@@ -427,6 +427,30 @@ fn apply_inspection_transformations<R: Read + Seek + 'static>(
     apply_top_level_inspection_transformations(job, pdf, options, verbose, false, false)
 }
 
+/// Report donor authentication failures at the CLI boundary while preserving
+/// the typed error returned by the library's public job API. qpdf's copy
+/// attachment loop lets the donor `processFile` exception escape
+/// (`libqpdf/QPDFJob.cc:2089-2100`); `open_job_source` has already retained the
+/// failed donor path on the job, so `report_job_error` can render qpdf's
+/// path-qualified message without changing `Error::Encrypted` into a byte
+/// string for library callers.
+fn apply_transformations_for_cli<R: Read + Seek + 'static>(
+    job: &mut QPDFJob,
+    pdf: &mut Pdf<R>,
+) -> CliResult<()> {
+    match job.apply_transformations(pdf) {
+        Ok(()) => Ok(()),
+        Err(error) if is_bad_password_error(&error) => {
+            job.report_job_error(&error)?;
+            Err(Box::new(CliExitError {
+                code: ExitCode::Errors,
+                message: String::new(),
+            }))
+        }
+        Err(error) => Err(Box::new(error)),
+    }
+}
+
 /// Apply every create-stage transformation that can accompany a top-level
 /// inspection. qpdf performs these mutations before `doInspection`, even
 /// though the inspection branch creates no output (`QPDFJob.cc:459-489,
@@ -446,7 +470,7 @@ fn apply_top_level_inspection_transformations<R: Read + Seek + 'static>(
         remove_restrictions,
         coalesce_contents,
     );
-    job.apply_transformations(pdf)?;
+    apply_transformations_for_cli(job, pdf)?;
     Ok(())
 }
 
@@ -6617,7 +6641,7 @@ fn run_rewrite_opened<R: Read + Seek + 'static>(
         no_warn,
         &job_options,
     )?;
-    job.apply_transformations(&mut pdf)?;
+    apply_transformations_for_cli(&mut job, &mut pdf)?;
     if linearize_normalization {
         let warnings = normalize_page_contents(&mut pdf)?;
         if !warnings.is_empty() {
@@ -8341,7 +8365,7 @@ fn run_page_extraction_after_plan<R: Read + Seek + 'static>(
         // QPDFJob applies rotations before its underlay/overlay stage and then
         // runs image, appearance, annotation, coalesce, and flatten-rotation
         // transformations in qpdf order (`QPDFJob.cc:466-473,2137-2194`).
-        job.apply_transformations(pdf)?;
+        apply_transformations_for_cli(job, pdf)?;
         if let Some(floor) = job.input_version_floor() {
             options.input_version_floor = Some(
                 options
