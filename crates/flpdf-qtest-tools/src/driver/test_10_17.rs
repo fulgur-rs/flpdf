@@ -703,14 +703,15 @@ pub(crate) fn run_test_17<R: Read + Seek>(
 #[cfg(test)]
 mod tests {
     use super::{
-        append_show_warnings, captured_bytes, captured_logger, run_test_12, run_test_13,
-        run_test_16, run_test_17, CapturedPipeline,
+        append_show_warnings, captured_bytes, captured_logger, run_test_11, run_test_12,
+        run_test_13, run_test_16, run_test_17, CapturedPipeline,
     };
     use flpdf::{
-        linearization::show_linearization_bytes, DecodeLevel, PageDocumentHelper, Pdf,
-        PdfOpenOptions, Pipeline,
+        linearization::show_linearization_bytes, DecodeLevel, ObjectHandle, PageDocumentHelper,
+        Pdf, PdfOpenOptions, Pipeline,
     };
     use std::path::PathBuf;
+    use std::rc::Rc;
     use std::sync::{Arc, Mutex};
 
     struct CurrentDirGuard(PathBuf);
@@ -806,6 +807,39 @@ mod tests {
         test(&mut pdf, &mut stdout, &mut stderr, &mut diagnostics_written)
             .expect("run output redirection test");
         (stdout, stderr)
+    }
+
+    #[test]
+    fn test_11_reads_stream_data_through_the_canonical_root_boundary() {
+        let mut pdf = Pdf::empty().expect("create empty PDF");
+        let stream = pdf
+            .new_stream_with_data(Rc::new(b"706F7461746F0A\n".to_vec()))
+            .expect("create QStream");
+        stream
+            .try_get_stream_dict()
+            .expect("get QStream dictionary")
+            .replace_key(b"/Filter", ObjectHandle::name(b"ASCIIHexDecode".to_vec()))
+            .expect("install ASCIIHex filter");
+        pdf.root_handle()
+            .expect("get Catalog through the canonical root boundary")
+            .replace_key(b"/QStream", stream)
+            .expect("install QStream");
+
+        let mut stdout = Vec::new();
+        let mut stderr = Vec::new();
+        let mut diagnostics_written = 0;
+        run_test_11(
+            &mut pdf,
+            b"stream-data.pdf",
+            None,
+            &mut stdout,
+            &mut stderr,
+            &mut diagnostics_written,
+        )
+        .expect("run test 11");
+
+        assert_eq!(stdout, b"filtered stream data okay\nraw stream data okay\n");
+        assert!(stderr.is_empty());
     }
 
     #[test]
