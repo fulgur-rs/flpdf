@@ -127,11 +127,15 @@ pub(crate) fn run_test_2<R: Read + Seek>(
 ///
 /// qpdf source: `qpdf/test_driver.cc:311-322` (`test_3`).
 ///
-/// qpdf flushes each stream header, then pipes the corresponding `/QStreams`
-/// member through `qpdf_ef_normalize` and `qpdf_dl_generalized`. The canonical
-/// ObjectHandle pipe owns both the decode chain and the ContentNormalizer; the
-/// driver only supplies qpdf's output pipeline and drains diagnostics after the
-/// pipe returns so warning bytes appear after the already-written stream data.
+/// qpdf obtains the `/QStreams` count and then fetches each member by index
+/// (`qpdf/test_driver.cc:311-322`, `libqpdf/QPDFObjectHandle.cc:758-801`).
+/// This keeps the count/item resolution boundary and warning timing visible in
+/// the driver instead of snapshotting the whole array. It then flushes each
+/// stream header and pipes the corresponding member through
+/// `qpdf_ef_normalize` and `qpdf_dl_generalized`. The canonical ObjectHandle
+/// pipe owns both the decode chain and the ContentNormalizer; the driver only
+/// supplies qpdf's output pipeline and drains diagnostics after the pipe
+/// returns so warning bytes appear after the already-written stream data.
 pub(crate) fn run_test_3<R: Read + Seek>(
     pdf: &mut Pdf<R>,
     filename: &[u8],
@@ -142,13 +146,16 @@ pub(crate) fn run_test_3<R: Read + Seek>(
 ) -> flpdf::Result<()> {
     let trailer = pdf.trailer();
     let streams = trailer.try_get_key(b"/QStreams")?;
-    let items = streams.try_get_array_as_vector()?;
+    let stream_count = streams.try_get_array_n_items()?;
     // qpdf's `getArrayNItems()` (`libqpdf/QPDFObjectHandle.cc:758-767`) warns
     // for a non-array receiver before any stream output, matching this
-    // drain's position ahead of the per-stream loop below.
+    // drain's position ahead of the per-stream loop below. Each item is then
+    // fetched through qpdf's `getArrayItem()` (`:771-801`) rather than through
+    // a driver-side array snapshot.
     emit_new_diagnostics(pdf, diagnostics_written, filename, stdout, stderr)
         .map_err(Error::from)?;
-    for (index, stream) in items.iter().enumerate() {
+    for index in 0..stream_count {
+        let stream = streams.try_get_array_item(index as i64)?;
         writeln!(stdout, "-- stream {index} --")?;
         stdout.flush()?;
         {

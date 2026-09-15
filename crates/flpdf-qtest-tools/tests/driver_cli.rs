@@ -1300,6 +1300,17 @@ fn qtest_accessor_cases_do_not_use_explicit_pdf_resolve() {
         test_6.contains("type_code()") && test_6.contains("pipe_stream_data("),
         "test 6 must use the canonical resolving type and stream accessors"
     );
+    let test_3 = section(
+        early_source.as_str(),
+        "pub(crate) fn run_test_3",
+        "struct StdoutPipeline",
+    );
+    assert!(
+        test_3.contains("try_get_array_n_items()")
+            && test_3.contains("try_get_array_item(")
+            && !test_3.contains("try_get_array_as_vector()"),
+        "test 3 must iterate /QStreams through the canonical qpdf-shaped count/item accessors"
+    );
     assert!(
         section(
             early_source.as_str(),
