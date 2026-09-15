@@ -5,7 +5,7 @@
 `scripts/check-qpdf-route-matrix.py --check` でファイル・行範囲・識別子の実在を検証する。
 **関連:** [`docs/qpdf-correspondence.md`](../qpdf-correspondence.md)（責務対応表。本表はその上に
 「経路（route）」軸を足したもので、対応表の行を置き換えない）/ Beads `flpdf-3yn9.41`（親 epic `flpdf-3yn9`）
-**調査日:** 2026-09-15（再監査 `flpdf-3yn9.48`、文書更新 `flpdf-3yn9.48.110`）。
+**調査日:** 2026-09-15（再監査 `flpdf-3yn9.48`、文書更新 `flpdf-3yn9.48.111`）。
 現行 `origin/main=a6a5bed4cff3f116f993639e0fea0504a98f7976` と pinned qpdf source に基づき、領域別表の分類・責務境界・既存issueとの対応を更新した。
 160行は履歴上の行集合を維持している。今回の分類更新は全行の parity テスト合格を意味しない。
 未更新の行番号は過去snapshotを含む。
@@ -44,7 +44,7 @@ rowsを検証する。2026-09-15 の現行 `origin/main` (`a6a5bed4cff3f116f9936
 
 | canonical | bridge | mixed | unknown | 合計 |
 |---|---|---|---|---|
-| 143 | 0 | 116 | 0 | 259 |
+| 144 | 0 | 115 | 0 | 259 |
 
 したがって、160行の領域別表と259 logical rowsの checker 分母は異なる。どちらも
 parity 完了数ではなく、責務／経路の分類数である。
@@ -99,9 +99,9 @@ done | sort | uniq -c
 
 2026-09-15 の current-main audit anchor は `origin/main=a6a5bed4cff3f116f993639e0fea0504a98f7976`、pinned qpdf は
 11.9.0 commit `3b97c9bd266b7c32ea36d3536e22dab77412886d` である。checker の実測は
-**今回の変更を適用した tree で** 1311 qpdf citations / 912 flpdf citations /
+**今回の変更を適用した tree で** 1317 qpdf citations / 912 flpdf citations /
 259 logical rows、分類は
-canonical 143 / mixed 116 / bridge 0 / unknown 0。A〜E の160行だけを数える
+canonical 144 / mixed 115 / bridge 0 / unknown 0。A〜E の160行だけを数える
 上の領域別集計は canonical 107 / mixed 53 / bridge 0 / unknown 0 なので、checker
 の259 logical rowsと混同しない。
 
@@ -192,7 +192,7 @@ D19/D30はcanonical ownerへ委譲するbyte-neutral test scaffolding、D27は�
 ## 6. 二重正本トラッカー
 
 追跡対象の symbol manifest は [tracked-symbols.txt](tracked-symbols.txt)。この matrix revision の
-classified row は 259 行で、canonical 143 / mixed 116 / bridge 0 / unknown 0（bridge + mixed は116行）である。
+classified row は 259 行で、canonical 144 / mixed 115 / bridge 0 / unknown 0（bridge + mixed は115行）である。
 内訳は A=24 / B=34 / C=42 / D=31 / E=128（E 表 29 行 + qtest exception 表 99 行）。
 `scripts/check-qpdf-route-matrix.py` も259行を報告する。classification tableの途中に散文行が
 入っても同じtableの状態を保持し、qtest exception tableの物理1行 `0/1` は論理2 caseとして数える。
@@ -664,7 +664,7 @@ warning collectionやtoken primitiveの移植を、領域A全体の統合完了�
 4. **C42 / B11** — recovered length を qpdf 同様に全 span で pipe する経路として完了。表示専用の EOL metadata や framing extension は持たない。前提: probe C-U1。
 5. ~~**C27**~~ — `.48.49` で canonical 化済み（§10 X-4 参照）。bootstrap-context decode は `ObjectHandle::get_stream_data(DecodeLevel::Specialized)` へ移行した。B17 の xref entry 構文処理の正本とは別責務である点は変わらない。
 6. **C44** — public `getStreamJSON` facade と deferred `StreamBlobProvider` 相当は `.48.47` で実装済み。残る C-U2 は provider 回数と lifetime を C++ harness で固定する probe。canonical C24 `write_stream_json` を二重pipeへ変更しない。
-7. **C4 / C8 / C9 / C25〜C29、E-27 / E-28** — provider/copy/decodeの不足primitiveを明示し、xrefとdriver test 0/1など既知consumerからbounded cutoverする。C28 の test 0/1 cutoverとqpdf-less public hardening/module撤去は `.48.93` / `.48.96` で完了した。C43 の qpdf-less public wrapperとinternal label helperは `.48.91` / `.48.95` で撤去した。E-28のtest 2/3/6/11 caller-side resolve/accessor bridgeは `.48.107` / `.48.108` / `.48.109` / `.48.110` で撤去した。
+7. **C4 / C8 / C9 / C25〜C29、E-27 / E-28** — provider/copy/decodeの不足primitiveを明示し、xrefとdriver test 0/1など既知consumerからbounded cutoverする。C28 の test 0/1 cutoverとqpdf-less public hardening/module撤去は `.48.93` / `.48.96` で完了した。C43 の qpdf-less public wrapperとinternal label helperは `.48.91` / `.48.95` で撤去した。E-28のtest 2/3/6/11/19 caller-side resolve/accessor bridgeは `.48.107` / `.48.108` / `.48.109` / `.48.110` / `.48.111` で撤去した。
 
 qpdf 呼び出し順を壊さない理由: §5.C 第 4 行（`willFilterStream` の判定順序）が 2 と 3 を
 C20 の**後ろ**に置く理由 — 判定順序の canonical owner が確定していない状態で早期 return を
@@ -729,7 +729,7 @@ D27の全pre-write sweepとfollow-upは完了済み。D19 / D30はbyte-neutral t
 4. **E-4 / E-10 / E-21** — CLIの出力・page/source orchestrationを `QPDFJob` へ寄せる。`flpdf-hxmj` の限定sliceはclosedで、残consumerの完了を意味しない。前提: probe E-P4。
 5. **E-15 / E-17** — argv/Configのrange syntax検証を共有 `parse_numrange(max=0)` へ寄せ、page count判明後に実値を展開する。qpdfにもsyntax-only modeがある（`libqpdf/QPDFJob_argv.cc:240-272`）。
 6. **E-9 / E-24 / E-26 / E-14** — 可視性と命名をconsumer移行とともに整理する。closedの既存sliceを未完了前提に戻さず、残るsurfaceを区別する。
-7. **E-27 / E-28** — `.48.93` で test 0/1 の既知stream warning bridgeを canonical pipe/loggerへ、`.48.107` / `.48.108` / `.48.109` / `.48.110` で test 2 / 3 / 6 / 11 のcaller-side resolve/accessor bridgeを canonical accessorへ移行済み。残る mixed case/APIだけを追加調査し、A〜D全行の確定を待たない。
+7. **E-27 / E-28** — `.48.93` で test 0/1 の既知stream warning bridgeを canonical pipe/loggerへ、`.48.107` / `.48.108` / `.48.109` / `.48.110` / `.48.111` で test 2 / 3 / 6 / 11 / 19 のcaller-side resolve/accessor bridgeを canonical accessorへ移行済み。残る mixed case/APIだけを追加調査し、A〜D全行の確定を待たない。
 
 qpdf 呼び出し順を壊さない理由: §5.E 第 4 行（入力は必ず `doProcessOnce` 経由で開き、
 `QPDF` 構築直後に `setQPDFOptions` を適用してから読む）が 1 を最初に置く理由で、
