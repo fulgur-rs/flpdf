@@ -1779,16 +1779,8 @@ fn json_flag_conflicts_with_linearize_pass1() {
 }
 
 #[test]
-fn json_flag_conflicts_with_compress_streams() {
-    let input = write_temp_pdf(&one_page_pdf_with_stream());
-    let mut cmd = Command::cargo_bin("flpdf").unwrap();
-    cmd.args([
-        "--json",
-        "--compress-streams=n",
-        input.path().to_str().unwrap(),
-    ])
-    .assert()
-    .code(2);
+fn json_flag_accepts_compress_streams_like_qpdf() {
+    assert_json_transform_stdout_matches_qpdf("--compress-streams=n", "one-page.pdf");
 }
 
 /// `--json-output` dispatches through the same `run_json` boundary as
@@ -1812,14 +1804,12 @@ fn json_output_conflicts_with_the_json_exclusive_flag_set() {
         &["--show-encryption"],
         &["--is-encrypted"],
         &["--requires-password"],
-        &["--compress-streams=n"],
         &["--linearize-pass1=pass1"],
         &["--remove-restrictions"],
         &["--copy-encryption=donor.pdf"],
         &["--list-attachments"],
         &["--show-attachment=key"],
         &["--no-original-object-ids"],
-        &["--qdf"],
         &["--coalesce-contents"],
         &["--preserve-unreferenced"],
     ];

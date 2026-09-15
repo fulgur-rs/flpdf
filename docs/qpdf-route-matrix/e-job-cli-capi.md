@@ -912,3 +912,20 @@ JSONは既存の `QPDFJob::apply_transformations` に設定を渡してから
 `crates/flpdf-cli/tests/cli_qpdf_conflict_matrix.rs::qpdf_writer_and_attachment_conflicts_match_qpdf`
 がpinned qpdf 11.9.0とのstatus/stdout/stderrを10通り比較する。`flpdf-awthm` の
 list/check/show-attachment mutation consumerは別のbounded sliceとして残る。
+
+### E-17 / E-21 remaining writer/inspection conflict acceptance (`flpdf-zet2u`, 2026-09-15)
+
+The top-level CLI no longer rejects the nine qpdf-accepted writer/inspection
+combinations left after `flpdf-urjhr`: encryption with linearization or page/
+encryption inspection, decryption with encryption/page inspection,
+`compress-streams=n` or `qdf` with JSON, and rotation/page selection with
+`check-linearization`. The change removes only clap conflict edges; qpdf's
+existing `QPDFJob::createQPDF` -> `writeQPDF`/`doInspection` ordering remains the
+owner (`libqpdf/QPDFJob.cc:428-520,566-641,1646-1693`). Since qpdf's
+`Config::jsonOutput` calls `json`, the `qdf` and `compress-streams=n` acceptance
+is covered for `--json-output` as well.
+
+The expanded `cli_qpdf_conflict_matrix.rs` compares the original ten cells, the
+nine remaining cells, and two JSON-output symmetry cells against qpdf 11.9.0,
+including exit status, stdout, stderr, and JSON output bytes. Other
+inspection-route conflict edges remain outside this bounded E-17/E-21 slice.
