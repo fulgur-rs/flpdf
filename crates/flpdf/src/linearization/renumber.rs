@@ -103,6 +103,10 @@ pub struct RenumberMap {
     /// The linearization writer allocates this number for the hint stream
     /// object it emits between Part 4 head and Part 6 (first-page section).
     hint_stream_slot: u32,
+    /// qpdf first-half category for each plain source identity: 0 for Part 2
+    /// private, 1 for Part 3 shared, and 2 for UseOutlines objects. Preserve
+    /// containers use this to interleave with the correct plain category.
+    first_half_category: BTreeMap<QpdfObjGen, u8>,
 }
 
 /// Sentinel value stored at slots 0 and 1 in `by_new_number`.
@@ -323,7 +327,6 @@ impl RenumberMap {
                         .collect()
                 })
         };
-
         let raw_capacity = raw_part2.len()
             + raw_part3.len()
             + raw_part4_private.len()
@@ -569,6 +572,47 @@ impl RenumberMap {
             );
         }
 
+        // Preserve source members are canonicalized to their source
+        // containers in the plan's parts, but the downstream ObjStm layout
+        // still needs a raw slot for each type-2 member before per-half
+        // placement rebuilds the final table. Keep these entries hidden from
+        // ordinary layout until that relocation step.
+        if let Some(preserve_plan) = plan.preserve_objstm_plan.as_ref() {
+            for group in &preserve_plan.groups {
+                let crate::writer::object_streams::ObjectStreamGroup::SourceBacked {
+                    members, ..
+                } = group
+                else {
+                    // cov:ignore-start: the Preserve plan contains SourceBacked groups only
+                    continue;
+                    // cov:ignore-end
+                };
+                for &member in members {
+                    let raw = QpdfObjGen::try_from_object_ref(member)
+                        .expect("Preserve ObjStm members must fit qpdf raw identity");
+                    if by_original_raw.contains_key(&raw) {
+                        continue;
+                    }
+                    let new_ref = ObjectRef::new(by_new_number.len() as u32, 0);
+                    by_new_number.push(SENTINEL);
+                    by_new_raw.push(raw);
+                    by_original_raw.insert(raw, new_ref);
+                    by_original.insert(member, new_ref);
+                }
+            }
+        }
+
+        let mut first_half_category = BTreeMap::new();
+        for object in &raw_part2 {
+            first_half_category.insert(*object, 0);
+        }
+        for object in &raw_part3 {
+            first_half_category.insert(*object, 1);
+        }
+        for object in &raw_part6_outline {
+            first_half_category.insert(*object, 2);
+        }
+
         Self {
             by_new_number,
             by_new_raw,
@@ -576,6 +620,7 @@ impl RenumberMap {
             by_original_raw,
             param_dict_slot,
             hint_stream_slot,
+            first_half_category,
         }
     }
 
@@ -821,6 +866,13 @@ impl RenumberMap {
             .flat_map(|batch| batch.members.iter().copied())
             .filter_map(|object_ref| QpdfObjGen::try_from_object_ref(object_ref).ok())
             .collect();
+        let source_container_set: BTreeSet<QpdfObjGen> = open_document_batches
+            .iter()
+            .chain(first_half_batches)
+            .chain(second_half_batches)
+            .filter_map(|batch| batch.source_container_number)
+            .map(|number| QpdfObjGen::new(number as i32, 0))
+            .collect();
         let second_half_post_plain_raw: BTreeSet<QpdfObjGen> = second_half_post_plain
             .iter()
             .filter_map(|object_ref| QpdfObjGen::try_from_object_ref(*object_ref).ok())
@@ -873,6 +925,9 @@ impl RenumberMap {
             }
             if member_set.contains(&original) {
                 continue; // re-placed as an ObjStm member in its half below
+            }
+            if source_container_set.contains(&original) {
+                continue; // re-emitted as the reconstructed Preserve container below
             }
             if old_idx < old_param_slot {
                 second_half_plain.push(original);
@@ -932,13 +987,21 @@ impl RenumberMap {
         let first_half_outline_batch_start = first_half_batches
             .len()
             .saturating_sub(first_half_outline_batch_count);
-        let emit_first_half_batch_range =
+        let mut emitted_first_half_batches = BTreeSet::new();
+        let mut emit_first_half_batch_range =
             |start: usize,
              end: usize,
              table: &mut Vec<ObjectRef>,
              raw_table: &mut Vec<QpdfObjGen>,
              container_numbers: &mut Vec<u32>| {
-                for batch in &first_half_batches[start..end] {
+                for (offset, batch) in first_half_batches[start..end].iter().enumerate() {
+                    let batch_index = start + offset;
+                    if !emitted_first_half_batches.insert(batch_index) {
+                        // cov:ignore-start: outline-root and final fallback
+                        // ranges are intentionally de-duplicated.
+                        continue;
+                        // cov:ignore-end
+                    }
                     if batch.members.is_empty() {
                         continue;
                     }
@@ -1142,6 +1205,58 @@ impl RenumberMap {
                     &mut new_by_new_raw,
                     &mut open_document_container_numbers,
                 );
+            }
+            // qpdf assigns first-half source-backed ObjStm containers in the
+            // same source-object order as the surrounding plain first-page
+            // objects. The container is physically emitted after the hint
+            // stream, but its object number must precede a later plain source
+            // object (QPDF_linearization.cc's set-ordered lc_first_page_*).
+            // Without this interleave, a Generate -> Preserve pass can swap
+            // the source container and a plain object; the next Preserve pass
+            // then observes a different source identity and changes hints.
+            if i as u32 >= hint_index_in_first_half {
+                if let Ok(plain_source_number) = u32::try_from(original.get_obj()) {
+                    if let Some(plain_category) = self.first_half_category.get(&original).copied() {
+                        for (batch_index, batch) in first_half_batches
+                            .iter()
+                            .enumerate()
+                            .take(first_half_outline_batch_start)
+                        {
+                            let Some(source_container_number) = batch.source_container_number
+                            else {
+                                continue;
+                            };
+                            let batch_category = match batch.route {
+                                super::plan::ContainerPart::FirstPagePrivate => 0,
+                                super::plan::ContainerPart::FirstPageShared => 1,
+                                // Outline batches are outside this range. Keep the
+                                // match exhaustive so a future route cannot be
+                                // silently interleaved into the wrong category.
+                                super::plan::ContainerPart::FirstPageOutlines => {
+                                    // cov:ignore-start: outline batches are excluded by the range
+                                    continue;
+                                    // cov:ignore-end
+                                }
+                                _ => {
+                                    // cov:ignore-start: second-half routes cannot enter first-half batches
+                                    continue;
+                                    // cov:ignore-end
+                                }
+                            };
+                            if batch_category == plain_category
+                                && source_container_number < plain_source_number
+                            {
+                                emit_first_half_batch_range(
+                                    batch_index,
+                                    batch_index + 1,
+                                    &mut new_by_new_number,
+                                    &mut new_by_new_raw,
+                                    &mut first_half_container_numbers,
+                                );
+                            }
+                        }
+                    } // cov:ignore: LLVM attributes this nested category guard terminator to its branch opening
+                } // cov:ignore: LLVM attributes this first-half interleave guard terminator to its branch opening
             }
             if Some(original) == first_half_outline_root_raw {
                 emit_first_half_batch_range(
@@ -2050,6 +2165,50 @@ mod tests {
             relocation.first_xref_slot < container,
             "first-page xref ({}) must precede the Part-3 container ({container})",
             relocation.first_xref_slot
+        );
+    }
+
+    #[test]
+    fn preserve_first_half_container_precedes_later_plain_source_in_same_part() {
+        let source = ObjectRef::new(7, 0);
+        let later_plain = ObjectRef::new(8, 0);
+        let member = ObjectRef::new(5, 0);
+        let plan = LinearizationPlan {
+            part2_objects: vec![ObjectRef::new(3, 0)],
+            part3_objects: vec![source, later_plain],
+            total_object_count: 3,
+            preserve_objstm_plan: Some(crate::writer::object_streams::ObjectStreamPlan {
+                groups: vec![
+                    crate::writer::object_streams::ObjectStreamGroup::SourceBacked {
+                        source,
+                        members: vec![member],
+                    },
+                ],
+                source_membership_present: true,
+                ..Default::default()
+            }),
+            ..Default::default()
+        };
+        let mut renumber = RenumberMap::from_plan(&plan);
+        let relocation = renumber.place_objstm_members_per_half(
+            &[],
+            &[routed_batch(
+                vec![member],
+                super::super::plan::ContainerPart::FirstPageShared,
+                Some(source.number),
+            )],
+            &[],
+            &[],
+            &BTreeSet::new(),
+            &BTreeSet::new(),
+            0,
+            None,
+        );
+
+        let container = relocation.container_numbers[0];
+        assert!(
+            container < renumber.new_for_original(later_plain).unwrap().number,
+            "source-backed container must precede a later plain source in its part"
         );
     }
 

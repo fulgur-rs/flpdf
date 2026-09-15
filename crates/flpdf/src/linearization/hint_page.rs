@@ -295,10 +295,16 @@ pub(crate) fn non_page_owned_containers(
 ) -> std::collections::BTreeSet<u32> {
     use std::collections::{BTreeMap, BTreeSet};
 
+    let preserve_source_membership = plan.preserve_source_membership();
     let page_private_owner = |member: ObjectRef| -> Option<usize> {
         if let Some(optimization) = plan.optimization.as_ref() {
+            let owner = preserve_source_membership
+                .as_ref()
+                .and_then(|membership| membership.get(&member.number).copied())
+                .map(|source| ObjectRef::new(source, 0))
+                .unwrap_or(member);
             return optimization
-                .other_page_private_owner(member)
+                .other_page_private_owner(owner)
                 .map(|page| page as usize);
         }
         // Manually constructed plans have no canonical object-user map. Keep

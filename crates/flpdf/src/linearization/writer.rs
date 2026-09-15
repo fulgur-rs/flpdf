@@ -217,6 +217,10 @@ struct ObjStmLayout {
     /// object that lives inside an ObjStm.  Drives type-2 xref entries and
     /// the skip-from-plain-emission decision.
     member_to_container: BTreeMap<ObjectRef, (u32, u32)>,
+    /// Source ObjStm container identities represented by the reconstructed
+    /// containers. Preserve plan identities must not be emitted as plain body
+    /// objects a second time.
+    source_container_numbers: BTreeSet<u32>,
 }
 
 impl ObjStmLayout {
@@ -295,6 +299,13 @@ impl ObjStmLayout {
         }
 
         let mut member_to_container = BTreeMap::new();
+        let source_container_numbers: BTreeSet<u32> = batch_plan
+            .open_document_batches
+            .iter()
+            .chain(&batch_plan.part3_batches)
+            .chain(&batch_plan.part4_batches)
+            .filter_map(|batch| batch.source_container_number)
+            .collect();
 
         let take = |batches: &[RoutedObjStmBatch],
                     out: &mut Vec<ObjStmContainer>,
@@ -363,6 +374,7 @@ impl ObjStmLayout {
             part3,
             part4,
             member_to_container,
+            source_container_numbers,
         })
     }
 }
@@ -2465,7 +2477,11 @@ fn do_write_pass<R: Read + Seek>(
         // (QPDFWriter.cc:1097-1105); apply the same ownership decision at the
         // final emission boundary. Generate-mode members are not in this list
         // because its planner already separates eligible members from streams.
-        if objstm_layout.member_to_container.contains_key(original_ref) {
+        if objstm_layout.member_to_container.contains_key(original_ref)
+            || objstm_layout
+                .source_container_numbers
+                .contains(&original_ref.number)
+        {
             continue;
         }
         if catalog_emitted_early && plan.root_ref == Some(*original_ref) {
@@ -2647,6 +2663,9 @@ fn do_write_pass<R: Read + Seek>(
         .chain(&plan.part6_outline_objects)
     {
         if objstm_layout.member_to_container.contains_key(original_ref)
+            || objstm_layout
+                .source_container_numbers
+                .contains(&original_ref.number)
             || (catalog_emitted_early && plan.root_ref == Some(*original_ref))
         {
             continue;
@@ -2785,6 +2804,9 @@ fn do_write_pass<R: Read + Seek>(
         if objstm_layout
             .member_to_container
             .contains_key(&original_ref)
+            || objstm_layout
+                .source_container_numbers
+                .contains(&original_ref.number)
         {
             continue;
         }
@@ -3104,8 +3126,13 @@ fn compute_byte_lengths(
 /// precede a plain object in the same group.
 fn part7_owner_for_plan(plan: &LinearizationPlan, member: ObjectRef) -> Option<usize> {
     if let Some(optimization) = plan.optimization.as_ref() {
+        let owner = plan
+            .preserve_source_membership()
+            .and_then(|membership| membership.get(&member.number).copied())
+            .map(|source| ObjectRef::new(source, 0))
+            .unwrap_or(member);
         return optimization
-            .other_page_private_owner(member)
+            .other_page_private_owner(owner)
             .map(|page| page as usize);
     }
     // Manually constructed plans have no canonical object-user map. Keep
@@ -3133,6 +3160,11 @@ fn second_half_container_anchors(
         .iter()
         .flat_map(|batch| batch.members.iter().copied())
         .filter_map(|object_ref| QpdfObjGen::try_from_object_ref(object_ref).ok())
+        .collect();
+    let source_container_set: BTreeSet<QpdfObjGen> = part4_batches
+        .iter()
+        .filter_map(|batch| batch.source_container_number)
+        .map(|number| QpdfObjGen::new(number as i32, 0))
         .collect();
 
     // Generate containers are fresh objects with no source ObjGen. Preserve
@@ -3162,7 +3194,7 @@ fn second_half_container_anchors(
                              page_head: Option<QpdfObjGen>,
                              objects: &[QpdfObjGen]| {
         for &object_gen in objects {
-            if !member_set.contains(&object_gen) {
+            if !member_set.contains(&object_gen) && !source_container_set.contains(&object_gen) {
                 let page_head_rank = u8::from(Some(object_gen) != page_head);
                 plain_ranked.push((
                     object_gen,
@@ -3181,12 +3213,12 @@ fn second_half_container_anchors(
             push_page_private(&mut plain_ranked, page, page_head, objects);
         }
         for &object_gen in &plan.raw.part4_other_pages_shared {
-            if !member_set.contains(&object_gen) {
+            if !member_set.contains(&object_gen) && !source_container_set.contains(&object_gen) {
                 plain_ranked.push((object_gen, (1, 0, 0, qpdf_object_number(object_gen))));
             }
         }
         for &object_gen in &plan.raw.part4_rest {
-            if !member_set.contains(&object_gen) {
+            if !member_set.contains(&object_gen) && !source_container_set.contains(&object_gen) {
                 let (category, page) = if generate_batches {
                     object_gen
                         .to_object_ref()
@@ -3224,14 +3256,14 @@ fn second_half_container_anchors(
         for &object_ref in &plan.part4_other_pages_shared {
             let object_gen = QpdfObjGen::try_from_object_ref(object_ref)
                 .expect("checked Part-8 object must fit qpdf raw identity");
-            if !member_set.contains(&object_gen) {
+            if !member_set.contains(&object_gen) && !source_container_set.contains(&object_gen) {
                 plain_ranked.push((object_gen, (1, 0, 0, qpdf_object_number(object_gen))));
             }
         }
         for &object_ref in &plan.part4_rest {
             let object_gen = QpdfObjGen::try_from_object_ref(object_ref)
                 .expect("checked Part-9 object must fit qpdf raw identity");
-            if !member_set.contains(&object_gen) {
+            if !member_set.contains(&object_gen) && !source_container_set.contains(&object_gen) {
                 if generate_batches {
                     let optimization = plan
                         .optimization
@@ -3276,7 +3308,7 @@ fn second_half_container_anchors(
         }
     };
 
-    part4_batches
+    let anchors: Vec<_> = part4_batches
         .iter()
         .map(|batch| {
             if batch.members.is_empty() {
@@ -3320,7 +3352,9 @@ fn second_half_container_anchors(
                 ContainerPart::OtherPageShared => (1, 0, 0, object_number),
                 ContainerPart::Rest
                     if batch.source_container_number.is_some()
-                        && batch.members.iter().any(|m| part9_pages.contains(m)) =>
+                        && (batch.source_container_number.is_some_and(|source| {
+                            part9_pages.contains(&ObjectRef::new(source, 0))
+                        }) || batch.members.iter().any(|m| part9_pages.contains(m))) =>
                 {
                     // qpdf places the complete /Pages user set before the
                     // remaining lc_other set. If that user set is folded into
@@ -3357,7 +3391,8 @@ fn second_half_container_anchors(
                 None => SecondHalfContainerAnchor::BeforeFirst,
             }
         })
-        .collect()
+        .collect();
+    anchors
 }
 
 fn preserved_source_container_number(
@@ -4674,7 +4709,12 @@ fn build_hint_stream_from_pass1(input: &HintStreamBuildInput<'_>) -> Result<Vec<
     let part3_plain_len: u64 = plan
         .part3_objects
         .iter()
-        .filter(|orig| !objstm_layout.member_to_container.contains_key(orig))
+        .filter(|orig| {
+            !objstm_layout.member_to_container.contains_key(orig)
+                && !objstm_layout
+                    .source_container_numbers
+                    .contains(&orig.number)
+        })
         .map(|orig| {
             renumber
                 .new_for_original(*orig)
@@ -4732,7 +4772,16 @@ fn build_hint_stream_from_pass1(input: &HintStreamBuildInput<'_>) -> Result<Vec<
                 // + Part 6 outline plain objects (UseOutlines, classic path).
                 // ObjStm outline members are already counted inside Part-3
                 // containers (part3_container_len), so only plain ones are added.
-                let part2_len: u64 = privates.iter().map(plain_byte_len).sum::<u64>()
+                let part2_len: u64 = privates
+                    .iter()
+                    .filter(|orig| {
+                        !objstm_layout.member_to_container.contains_key(*orig)
+                            && !objstm_layout
+                                .source_container_numbers
+                                .contains(&orig.number)
+                    })
+                    .map(plain_byte_len)
+                    .sum::<u64>()
                     + plan
                         .raw
                         .part2_objects
@@ -4750,7 +4799,12 @@ fn build_hint_stream_from_pass1(input: &HintStreamBuildInput<'_>) -> Result<Vec<
                 let part6_public_plain_len: u64 = plan
                     .part6_outline_objects
                     .iter()
-                    .filter(|orig| !objstm_layout.member_to_container.contains_key(*orig))
+                    .filter(|orig| {
+                        !objstm_layout.member_to_container.contains_key(*orig)
+                            && !objstm_layout
+                                .source_container_numbers
+                                .contains(&orig.number)
+                    })
                     .map(plain_byte_len)
                     .sum();
                 part2_len + part3_byte_len + part6_public_plain_len + part6_plain_len
@@ -4769,6 +4823,18 @@ fn build_hint_stream_from_pass1(input: &HintStreamBuildInput<'_>) -> Result<Vec<
                             if !non_page_owned.contains(&container_num) {
                                 containers.insert(container_num);
                             }
+                        }
+                        None if objstm_layout
+                            .source_container_numbers
+                            .contains(&orig.number) =>
+                        {
+                            // cov:ignore-start: a planned Preserve source container always has a placed renumber entry
+                            if let Some(new_ref) = renumber.new_for_original(*orig) {
+                                if !non_page_owned.contains(&new_ref.number) {
+                                    containers.insert(new_ref.number);
+                                }
+                            }
+                            // cov:ignore-end
                         }
                         None => len += plain_byte_len(orig),
                     }
