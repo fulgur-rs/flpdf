@@ -1547,6 +1547,56 @@ fn qtest_accessor_cases_do_not_use_explicit_pdf_resolve() {
             && !test_92.contains("is_scalar(&"),
         "test 92 must use canonical resolving ownership/type/unparse accessors without helper bridges"
     );
+
+    let test_85 = section(
+        late_80_87_source.as_str(),
+        "pub(crate) fn run_test_85",
+        "pub(crate) fn run_test_86",
+    );
+    for method in [
+        "try_get_value_as_bool",
+        "try_get_value_as_int",
+        "try_get_value_as_int_as_int",
+        "try_get_value_as_uint",
+        "try_get_value_as_uint_as_uint",
+        "try_get_value_as_real",
+        "try_get_value_as_number",
+        "try_get_value_as_name",
+        "try_get_value_as_utf8",
+        "try_get_value_as_operator",
+        "try_get_value_as_inline_image",
+    ] {
+        assert!(
+            test_85.contains(method),
+            "test 85 must use the canonical {method} accessor"
+        );
+    }
+    for old_route in [
+        "value_as_bool(&",
+        "value_as_int_i64(&",
+        "value_as_int_i32(&",
+        "value_as_uint_u64(&",
+        "value_as_uint_u32(&",
+        "value_as_real(&",
+        "value_as_number(&",
+        "value_as_name(&",
+        "value_as_utf8(&",
+        "value_as_operator(&",
+        "value_as_inline_image(&",
+        ".as_boolean()",
+        ".as_integer()",
+        ".as_real_literal()",
+        ".as_real()",
+        ".as_name()",
+        ".as_string()",
+        ".as_operator()",
+        ".as_inline_image()",
+    ] {
+        assert!(
+            !test_85.contains(old_route),
+            "test 85 retains the qpdf-less local route {old_route}"
+        );
+    }
 }
 
 fn test_driver_fixture_dir() -> std::path::PathBuf {
