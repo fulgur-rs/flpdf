@@ -498,6 +498,15 @@ pub type ResourceConflicts =
 pub(crate) trait DocumentResolver {
     fn resolve_indirect(&self, object_ref: ObjectRef, handle: &ObjectHandle) -> Result<()>;
 
+    /// Return whether qpdf's live object cache contains a newer generation for
+    /// this object number. A lower-generation handle removed by qpdf's
+    /// xref-chain cleanup has no remaining indirect identity when it resolves
+    /// to null (`QPDF.cc:710-718,1996-2005`); foreign-copy replacement must
+    /// therefore emit a direct null rather than reserve that stale identity.
+    fn has_newer_cached_generation(&self, _object_gen: QpdfObjGen) -> bool {
+        false
+    }
+
     /// Return qpdf's source extent pair from the document-owned object cache.
     /// Direct/contextless values and resolvers without a cache have no extent.
     fn source_extents(&self, _object_gen: QpdfObjGen) -> SourceExtents {
@@ -1872,6 +1881,19 @@ impl ObjectHandle {
     /// qpdf accepts in an object header but rejects in an `N G R` reference.
     pub(crate) fn qpdf_obj_gen(&self) -> Option<QpdfObjGen> {
         self.0.borrow().qpdf_obj_gen()
+    }
+
+    /// Return whether this null-resolved handle is a lower generation that
+    /// qpdf has already superseded in the owning document's live cache.
+    /// Foreign-copy uses this at the array-element boundary where qpdf emits
+    /// a direct null after `removeObject`, while a genuinely absent object
+    /// number remains an indirect null reference.
+    pub(crate) fn has_newer_cached_generation(&self) -> bool {
+        let Some(object_gen) = self.qpdf_obj_gen() else {
+            return false;
+        };
+        self.context()
+            .is_some_and(|resolver| resolver.has_newer_cached_generation(object_gen))
     }
 
     /// The owning document identity carried by this canonical handle, if it
@@ -8767,8 +8789,10 @@ pub(crate) mod identity_tests {
     #[test]
     fn source_extents_defaults_to_qpdf_unset_for_context_only_resolvers() {
         assert_eq!(SourceExtents::default(), SourceExtents::UNSET);
+        assert!(!ObjectHandle::integer(1).has_newer_cached_generation());
 
         let resolver: Rc<dyn DocumentResolver> = Rc::new(RecordingResolver::default());
+        assert!(!resolver.has_newer_cached_generation(QpdfObjGen::new(1, 0)));
         let handle = ObjectHandle::new_indirect_with_resolver(
             ObjectRef::new(1, 0),
             Rc::downgrade(&resolver),

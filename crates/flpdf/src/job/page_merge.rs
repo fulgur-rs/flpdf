@@ -38,7 +38,10 @@
 
 use super::acroform_field_prune::DEFAULT_MAX_ACROFORM_DEPTH;
 use super::resource_pruning::{should_remove_unreferenced_resources, RemoveUnreferencedResources};
-use crate::object_copy::copy_foreign_object_for_preserve;
+use crate::object_copy::{
+    copy_foreign_object_for_preserve, copy_foreign_object_with_stale_generation_policy,
+    copy_foreign_value_with_stale_generation_policy,
+};
 use crate::page_extract::{append_selection_kids, null_copied_removed_pages, target_pages_root};
 use crate::page_label_document_helper::{
     copy_raw_page_label_entries, merge_adjacent_raw_page_labels, record_primary_label_provenance,
@@ -49,8 +52,8 @@ use crate::pdf::WriterObjectOrderKey;
 use crate::pdf_string::{new_unicode_string, utf8_value};
 use crate::qpdf_obj_gen::QpdfObjGen;
 use crate::{
-    AcroFormDocumentHelper, Error, ObjectHandle, ObjectRef, PageDocumentHelper, PageObjectHelper,
-    Pdf, Result, XrefEntry,
+    AcroFormDocumentHelper, Error, ObjectHandle, ObjectRef, ObjectStreamMode, PageDocumentHelper,
+    PageObjectHelper, Pdf, Result, XrefEntry,
 };
 use std::collections::{BTreeMap, BTreeSet};
 use std::io::{Cursor, Read, Seek};
@@ -102,6 +105,7 @@ fn wire_primary_catalog<RS: Read + Seek, RT: Read + Seek>(
     source: &mut Pdf<RS>,
     target: &mut Pdf<RT>,
     source_id: u64,
+    remove_stale_generations: bool,
 ) -> Result<()> {
     // qpdf's `getRoot()` accepts both an indirect reference and an inline
     // Catalog. Use the resolved handle for the semantic Catalog operation;
@@ -115,9 +119,81 @@ fn wire_primary_catalog<RS: Read + Seek, RT: Read + Seek>(
             continue;
         }
         let value = source_catalog.try_get_key(&key)?;
-        let copied = target.copy_foreign_value(source_id, &value)?;
+        let copied = copy_foreign_value_with_stale_generation_policy(
+            target,
+            source_id,
+            &value,
+            remove_stale_generations,
+        )?; // cov:ignore: qpdf primary Catalog copy is exercised by the edge differential; LLVM maps this multiline call continuation separately.
         target_catalog.replace_key(&key, copied)?;
     }
+    Ok(())
+}
+
+/// Copy the primary root `/Pages` dictionary's non-structural values into the
+/// fresh target root. qpdf keeps this root in place while `removePage` and
+/// `addPage` replace only `/Kids` and `/Count`; unknown root keys therefore
+/// remain visible to the writer (`QPDF_pages.cc:166-177,239-250`).
+fn wire_primary_pages_root<RS: Read + Seek, RT: Read + Seek>(
+    source: &mut Pdf<RS>,
+    target: &mut Pdf<RT>,
+    source_id: u64,
+    target_pages_ref: ObjectRef,
+    remove_stale_generations: bool,
+) -> Result<()> {
+    let source_catalog = source.root_handle()?;
+    let source_pages = source_catalog.try_get_key(b"/Pages")?;
+    source_pages.try_dereference()?;
+    let target_pages = target.get_object_handle(target_pages_ref);
+    target_pages.try_dereference()?;
+
+    for key in source_pages.try_get_keys()? {
+        if matches!(
+            key.as_slice(),
+            b"/Type"
+                | b"/Parent"
+                | b"/Kids"
+                | b"/Count"
+                | b"/MediaBox"
+                | b"/CropBox"
+                | b"/Resources"
+                | b"/Rotate"
+        ) {
+            continue;
+        }
+        let value = source_pages.try_get_key(&key)?;
+        let copied = copy_foreign_value_with_stale_generation_policy(
+            target,
+            source_id,
+            &value,
+            remove_stale_generations,
+        )?; // cov:ignore: qpdf primary /Pages copy is exercised by the edge differential; LLVM maps this multiline call continuation separately.
+        target_pages.replace_key(&key, copied)?;
+    }
+    Ok(())
+}
+
+/// Preserve a direct primary trailer `/Root` after the fresh target has
+/// finished its Catalog mutations. qpdf writes a direct Catalog value
+/// directly from the trailer, while `Pdf::empty()` starts with an indirect
+/// Catalog; remove that temporary target slot so preserve-unreferenced cannot
+/// emit an extra unreachable Catalog (`QPDF.cc:2349-2358`; `QPDFWriter.cc:
+/// 1144-1155,2907-2925`).
+fn preserve_primary_root_shape<RS: Read + Seek, RT: Read + Seek>(
+    source: &mut Pdf<RS>,
+    target: &mut Pdf<RT>,
+) -> Result<()> {
+    if source.root_ref().is_some() {
+        return Ok(());
+    }
+    let temporary_root_ref = target.root_ref();
+    let target_root = target.root_handle()?;
+    target_root.try_dereference()?;
+    let direct_root = target_root.shallow_copy()?;
+    target.trailer().replace_key(b"/Root", direct_root)?;
+    if let Some(temporary_root_ref) = temporary_root_ref {
+        target.remove_object_handle(temporary_root_ref)?; // cov:ignore: direct-root unit and CLI tests execute this cleanup; LLVM attributes the generic call body to reader.rs.
+    } // cov:ignore: the direct-root cleanup branch is exercised; LLVM maps its generic call terminator to the block exit.
     Ok(())
 }
 
@@ -129,6 +205,7 @@ fn wire_primary_trailer<RS: Read + Seek, RT: Read + Seek>(
     source: &mut Pdf<RS>,
     target: &mut Pdf<RT>,
     source_id: u64,
+    remove_stale_generations: bool,
 ) -> Result<()> {
     let source_trailer = source.trailer();
     let target_trailer = target.trailer();
@@ -152,14 +229,16 @@ fn wire_primary_trailer<RS: Read + Seek, RT: Read + Seek>(
                 | b"/Length"
                 | b"/Filter"
                 | b"/DecodeParms"
-                | b"/F"
-                | b"/FFilter"
-                | b"/FDecodeParms"
         ) {
             continue;
         }
         let value = source_trailer.try_get_key(&key)?;
-        let copied = target.copy_foreign_value(source_id, &value)?;
+        let copied = copy_foreign_value_with_stale_generation_policy(
+            target,
+            source_id,
+            &value,
+            remove_stale_generations,
+        )?; // cov:ignore: qpdf primary trailer copy is exercised by the edge differential; LLVM maps this multiline call continuation separately.
         target_trailer.replace_key(&key, copied)?;
     }
     target_trailer.replace_key(b"/Root", target.get_object_handle(root_ref))?;
@@ -1019,6 +1098,7 @@ pub(crate) fn merge_documents_with_resource_decisions_and_preserve_primary_into<
         preserve_primary_unreferenced,
         target,
         false,
+        ObjectStreamMode::Preserve,
     )
 }
 
@@ -1035,6 +1115,7 @@ pub(crate) fn merge_documents_for_page_specs_into<R: Read + Seek, T: Read + Seek
     remove_resources: &[bool],
     preserve_primary_unreferenced: bool,
     target: Pdf<T>,
+    object_stream_mode: ObjectStreamMode,
 ) -> Result<Pdf<T>> {
     merge_documents_with_resource_decisions_and_preserve_primary_into_impl(
         inputs,
@@ -1042,6 +1123,7 @@ pub(crate) fn merge_documents_for_page_specs_into<R: Read + Seek, T: Read + Seek
         preserve_primary_unreferenced,
         target,
         true,
+        object_stream_mode,
     )
 }
 
@@ -1054,6 +1136,7 @@ fn merge_documents_with_resource_decisions_and_preserve_primary_into_impl<
     preserve_primary_unreferenced: bool,
     mut target: Pdf<T>,
     defer_foreign_acroform_fields: bool,
+    object_stream_mode: ObjectStreamMode,
 ) -> Result<Pdf<T>> {
     if inputs.is_empty() {
         return Err(Error::Unsupported(
@@ -1152,6 +1235,20 @@ fn merge_documents_with_resource_decisions_and_preserve_primary_into_impl<
         } else {
             BTreeMap::new()
         };
+        let source_has_object_streams = primary_source_xref_entries
+            .values()
+            .any(|entry| matches!(entry, XrefEntry::Compressed { .. }));
+        // qpdf's `getCompressibleObjGens` runs during Generate for every
+        // source and during Preserve only when source ObjStms are retained.
+        // Disable and Preserve+`--preserve-unreferenced` skip that walk, so a
+        // missing lower generation remains an indirect null in those modes.
+        let remove_stale_generations = is_primary
+            && (!preserve_primary_unreferenced || object_stream_mode == ObjectStreamMode::Generate)
+            && match object_stream_mode {
+                ObjectStreamMode::Disable => false,
+                ObjectStreamMode::Preserve => source_has_object_streams,
+                ObjectStreamMode::Generate => true,
+            };
 
         // Capture qpdf's original page list before the primary page tree is
         // cleared. `handlePageSpecs` calls `removePage` for every primary page
@@ -1316,7 +1413,15 @@ fn merge_documents_with_resource_decisions_and_preserve_primary_into_impl<
             // the exact discovery order for QDF Original object IDs.
             let allocation_checkpoint = target.allocation_checkpoint();
             let source_page = input.source.get_object_handle(page_ref);
-            let copied_page = target.copy_foreign_object(&source_page)?;
+            let copied_page = if is_primary {
+                copy_foreign_object_with_stale_generation_policy(
+                    &mut target,
+                    &source_page,
+                    remove_stale_generations,
+                )? // cov:ignore: qpdf primary page copy is exercised by the edge differential; LLVM maps this multiline call continuation separately.
+            } else {
+                target.copy_foreign_object(&source_page)?
+            };
             // cov:ignore-start: QPDF::copyForeignObject returns an indirect
             // destination handle for an indirect page root; this guard protects
             // the contract if the allocator ever regresses.
@@ -1333,7 +1438,7 @@ fn merge_documents_with_resource_decisions_and_preserve_primary_into_impl<
                     .push((page_ref, new_objects));
             }
         }
-        let page_copy_map =
+        let page_copy_map_before_catalog =
             project_foreign_object_map(&target.foreign_object_map_snapshot(source_id));
         // qpdf keeps the primary Catalog and trailer in the same QPDF while
         // `handlePageSpecs` mutates its page tree. Copy their values through
@@ -1341,9 +1446,31 @@ fn merge_documents_with_resource_decisions_and_preserve_primary_into_impl<
         // map and preserving direct arrays/dictionaries without materializing
         // a legacy Object snapshot.
         if is_primary {
-            wire_primary_catalog(input.source, &mut target, source_id)?;
-            wire_primary_trailer(input.source, &mut target, source_id)?;
+            wire_primary_catalog(
+                input.source,
+                &mut target,
+                source_id,
+                remove_stale_generations,
+            )?; // cov:ignore: qpdf primary Catalog copy is exercised by the edge differential; LLVM maps this multiline call continuation separately.
+            wire_primary_pages_root(
+                input.source,
+                &mut target,
+                source_id,
+                pages_root_ref,
+                remove_stale_generations,
+            )?; // cov:ignore: qpdf primary /Pages copy is exercised by the edge differential; LLVM maps this multiline call continuation separately.
+            wire_primary_trailer(
+                input.source,
+                &mut target,
+                source_id,
+                remove_stale_generations,
+            )?; // cov:ignore: qpdf primary trailer copy is exercised by the edge differential; LLVM maps this multiline call continuation separately.
         }
+        let page_copy_map = if is_primary && defer_foreign_acroform_fields {
+            project_foreign_object_map(&target.foreign_object_map_snapshot(source_id))
+        } else {
+            page_copy_map_before_catalog
+        };
 
         // `--preserve-unreferenced` mirrors qpdf's writer-side
         // `enqueueObjectsStandard` over the primary's complete live object
@@ -1594,6 +1721,8 @@ fn merge_documents_with_resource_decisions_and_preserve_primary_into_impl<
             .write_reconstructed_labels_raw(&copied)?;
     }
 
+    preserve_primary_root_shape(inputs[0].source, &mut target)?;
+
     Ok(target)
 }
 
@@ -1604,9 +1733,9 @@ mod tests {
         collect_retained_widget_refs, discover_primary_acroform, field_kid_refs,
         install_primary_object_stream_membership, merge_documents,
         merge_documents_with_resource_decisions_and_preserve_primary,
-        merge_documents_with_resource_mode_and_preserve_primary, resolve_field_partial_name,
-        rewrite_field_kids, trim_field_kids, unique_field_name, widget_page_ref, MergeInput,
-        DEFAULT_MAX_ACROFORM_DEPTH,
+        merge_documents_with_resource_mode_and_preserve_primary, preserve_primary_root_shape,
+        resolve_field_partial_name, rewrite_field_kids, trim_field_kids, unique_field_name,
+        widget_page_ref, MergeInput, DEFAULT_MAX_ACROFORM_DEPTH,
     };
     use crate::{Error, ObjectHandle, ObjectRef, Pdf};
     use std::collections::{BTreeMap, BTreeSet};
@@ -1692,6 +1821,28 @@ mod tests {
             .object_ref()
             .expect("source ObjStm /Extends must remain indirect");
         assert_ne!(ObjectRef::new(target_container, 0), extends);
+    }
+
+    #[test]
+    fn direct_primary_root_removes_the_temporary_target_catalog() {
+        let mut source = Pdf::open_mem_owned(
+            include_bytes!("../../../../tests/fixtures/compat/direct-root-one-page.pdf").to_vec(),
+        )
+        .expect("open direct-root source");
+        assert_eq!(source.root_ref(), None);
+
+        let mut target = Pdf::empty().expect("empty merge target");
+        assert!(target.root_ref().is_some());
+
+        preserve_primary_root_shape(&mut source, &mut target)
+            .expect("preserve direct primary root shape");
+
+        assert_eq!(target.root_ref(), None);
+        assert!(target
+            .root_handle()
+            .expect("direct target Catalog")
+            .try_has_key(b"/Pages")
+            .expect("direct target Catalog keys"));
     }
 
     #[test]

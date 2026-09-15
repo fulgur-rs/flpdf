@@ -359,7 +359,20 @@ fn initialize_live_queue<R: Read + Seek>(
     let mut queue = LiveQueue::new(removed_refs, options.qdf);
     queue.register_object_streams(pdf, object_streams)?;
     if options.preserve_unreferenced_objects {
-        for handle in pdf.get_all_objects()? {
+        let mut all_objects = pdf.get_all_objects()?;
+        if pdf.writer_object_order.is_some() {
+            // qpdf's `getAllObjects()` is ordered by the primary source cache,
+            // not by the fresh merge target's local allocation order
+            // (`QPDF.cc:1285-1294`). Re-sort imported handles by their recorded
+            // source identity before the preserve queue assigns output numbers.
+            all_objects.sort_by_key(|handle| {
+                handle.object_ref().map_or_else(
+                    || pdf.writer_object_order_key(ObjectRef::new(u32::MAX, 0)),
+                    |object_ref| pdf.writer_object_order_key(object_ref),
+                )
+            });
+        }
+        for handle in all_objects {
             if handle
                 .object_ref()
                 .is_some_and(|source| queue.generated_container_sources.contains(&source))
@@ -3630,6 +3643,39 @@ mod object_emitter_tests {
             )
         })?; // cov:ignore: LLVM attributes the live-body test call terminator to callback cleanup.
         assert!(!bytes.is_empty());
+        Ok(())
+    }
+
+    #[test]
+    fn preserve_queue_orders_raw_generation_handles_after_mapped_handles() -> crate::Result<()> {
+        let mut bytes = b"%PDF-1.4\n".to_vec();
+        let catalog_offset = bytes.len();
+        bytes.extend_from_slice(b"1 0 obj\n<< /Type /Catalog /Pages 2 0 R >>\nendobj\n");
+        let pages_offset = bytes.len();
+        bytes.extend_from_slice(b"2 0 obj\n<< /Type /Pages /Count 0 /Kids [] >>\nendobj\n");
+        let orphan_offset = bytes.len();
+        bytes.extend_from_slice(b"5 65536 obj\n45\nendobj\n");
+        let xref_offset = bytes.len();
+        bytes.extend_from_slice(b"xref\n0 6\n0000000000 65535 f \n");
+        bytes.extend_from_slice(format!("{catalog_offset:010} 00000 n \n").as_bytes());
+        bytes.extend_from_slice(format!("{pages_offset:010} 00000 n \n").as_bytes());
+        bytes.extend_from_slice(b"0000000000 00000 f \n0000000000 00000 f \n");
+        bytes.extend_from_slice(format!("{orphan_offset:010} 65536 n \n").as_bytes());
+        bytes.extend_from_slice(
+            format!("trailer\n<< /Size 6 /Root 1 0 R >>\nstartxref\n{xref_offset}\n%%EOF\n")
+                .as_bytes(),
+        );
+        let mut pdf = Pdf::open(Cursor::new(bytes))?;
+        pdf.set_writer_object_order(BTreeMap::new());
+        let options = WriterOptions {
+            preserve_unreferenced_objects: true,
+            ..WriterOptions::default()
+        };
+
+        let queue = initialize_live_queue(&mut pdf, &options, BTreeSet::new(), &[])?;
+        assert!(queue
+            .raw_old_to_new
+            .contains_key(&QpdfObjGen::new(5, 65_536)));
         Ok(())
     }
 
