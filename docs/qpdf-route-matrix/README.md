@@ -99,10 +99,10 @@ done | sort | uniq -c
 
 2026-09-15 の current-main audit anchor は `origin/main=8f68515d20d19304c129e96e80a4206ddd796d11`、pinned qpdf は
 11.9.0 commit `3b97c9bd266b7c32ea36d3536e22dab77412886d` である。checker の実測は
-**今回の変更を適用した tree で** 1349 qpdf citations / 914 flpdf citations /
+**今回の変更を適用した tree で** 1360 qpdf citations / 914 flpdf citations /
 259 logical rows、分類は
 canonical 146 / mixed 113 / bridge 0 / unknown 0。A〜E の160行だけを数える
-上の領域別集計は canonical 108 / mixed 52 / bridge 0 / unknown 0 なので、checker
+上の領域別集計は canonical 107 / mixed 53 / bridge 0 / unknown 0 なので、checker
 の259 logical rowsと混同しない。
 
 履歴行の例外: C44はpublic facadeとdeferred blobの責務を分離したmixed ownerとして追跡する。
