@@ -659,21 +659,18 @@ pub(crate) fn run_test_17<R: Read + Seek>(
     stderr: &mut dyn Write,
     diagnostics_written: &mut usize,
 ) -> flpdf::Result<()> {
-    let root_ref = pdf
-        .root_ref()
-        .ok_or_else(|| Error::Internal("test 17 requires a document catalog".to_string()))?;
-    let root = pdf.get_object_handle(root_ref);
+    // qpdf's public getRoot() resolves the trailer's /Root value and applies
+    // the Catalog dictionary gate before getKey("/Pages") and getKey("/Kids")
+    // (`libqpdf/QPDF.cc:2354-2367`). Keep this semantic boundary instead of
+    // projecting the Catalog to an ObjectRef, which has no qpdf counterpart.
+    let root = pdf.root_handle()?;
     let pages_dict = root.try_get_key(b"/Pages")?;
     let page_kids = pages_dict.try_get_key(b"/Kids")?;
-    let kids_items = page_kids
-        .as_array()
-        .ok_or_else(|| Error::Internal("test 17 /Pages /Kids is not an array".to_string()))?;
-    let kid0 = kids_items
-        .first()
-        .ok_or_else(|| Error::Internal("test 17 /Kids has no first item".to_string()))?;
-    let kid1 = kids_items
-        .get(1)
-        .ok_or_else(|| Error::Internal("test 17 /Kids has no second item".to_string()))?;
+    // qpdf's getArrayItem() resolves the array receiver at entry
+    // (`libqpdf/QPDFObjectHandle.cc:758-785`); use the corresponding fallible
+    // accessor so an indirect /Kids value follows the same boundary.
+    let kid0 = page_kids.try_get_array_item(0)?;
+    let kid1 = page_kids.try_get_array_item(1)?;
     assert_eq!(kid0.object_ref(), kid1.object_ref());
 
     let mut pages = PageDocumentHelper::new(pdf).get_all_pages()?;
@@ -980,6 +977,42 @@ mod tests {
         bytes
     }
 
+    fn duplicate_page_pdf_with_indirect_kids() -> Vec<u8> {
+        let objects: &[(u32, &[u8])] = &[
+            (1, b"<< /Type /Catalog /Pages 2 0 R >>"),
+            (2, b"<< /Type /Pages /Kids 7 0 R /Count 3 >>"),
+            (
+                3,
+                b"<< /Type /Page /Parent 2 0 R /MediaBox [0 0 612 792] /Contents 5 0 R >>",
+            ),
+            (
+                4,
+                b"<< /Type /Page /Parent 2 0 R /MediaBox [0 0 612 792] /Contents 6 0 R >>",
+            ),
+            (5, b"<< /Length 7 >>\nstream\npage 0\nendstream"),
+            (6, b"<< /Length 7 >>\nstream\npage 2\nendstream"),
+            (7, b"[3 0 R 3 0 R 4 0 R]"),
+        ];
+        let mut bytes = b"%PDF-1.7\n".to_vec();
+        let mut offsets = BTreeMap::new();
+        for (number, body) in objects {
+            offsets.insert(*number, bytes.len());
+            bytes.extend_from_slice(format!("{number} 0 obj\n").as_bytes());
+            bytes.extend_from_slice(body);
+            bytes.extend_from_slice(b"\nendobj\n");
+        }
+        let xref_offset = bytes.len();
+        bytes.extend_from_slice(b"xref\n0 8\n0000000000 65535 f \n");
+        for number in 1..=7 {
+            bytes.extend_from_slice(format!("{:010} 00000 n \n", offsets[&number]).as_bytes());
+        }
+        bytes.extend_from_slice(
+            format!("trailer\n<< /Size 8 /Root 1 0 R >>\nstartxref\n{xref_offset}\n%%EOF\n")
+                .as_bytes(),
+        );
+        bytes
+    }
+
     #[test]
     fn test_17_reports_the_canonical_duplicate_page_warning() {
         let mut pdf = Pdf::open_mem_owned_with_options(
@@ -1012,6 +1045,39 @@ mod tests {
             warning.starts_with("WARNING: page_api_2.pdf, object 2 0 at offset "),
             "unexpected warning: {warning:?}"
         );
+        assert!(warning.ends_with(
+            ": kid 1 (from 0) appears more than once in the pages tree; creating a new page object as a copy\n"
+        ));
+    }
+
+    #[test]
+    fn test_17_resolves_an_indirect_kids_array_at_the_accessor_boundary() {
+        let mut pdf = Pdf::open_mem_owned_with_options(
+            duplicate_page_pdf_with_indirect_kids(),
+            PdfOpenOptions {
+                suppress_warnings: true,
+                description: b"page_api_2-indirect-kids.pdf".to_vec(),
+                ..PdfOpenOptions::default()
+            },
+        )
+        .expect("open duplicate-page fixture with indirect Kids");
+        let mut stdout = Vec::new();
+        let mut stderr = Vec::new();
+        let mut diagnostics_written = 0;
+
+        run_test_17(
+            &mut pdf,
+            b"page_api_2-indirect-kids.pdf",
+            None,
+            &mut stdout,
+            &mut stderr,
+            &mut diagnostics_written,
+        )
+        .expect("run test 17 with indirect Kids");
+
+        assert!(stdout.is_empty());
+        let warning = String::from_utf8(stderr).expect("warning is UTF-8");
+        assert_eq!(warning.matches("appears more than once").count(), 1);
         assert!(warning.ends_with(
             ": kid 1 (from 0) appears more than once in the pages tree; creating a new page object as a copy\n"
         ));

@@ -1341,6 +1341,19 @@ fn qtest_accessor_cases_do_not_use_explicit_pdf_resolve() {
         .contains("root_ref()"),
         "test 16 lost the root_ref identity route retained for its out-of-scope mutation"
     );
+    let test_17 = section(
+        middle_source.as_str(),
+        "pub(crate) fn run_test_17",
+        "\n#[cfg(test)]",
+    );
+    assert!(
+        test_17.contains("pdf.root_handle()?")
+            && test_17.contains("page_kids.try_get_array_item(0)?")
+            && test_17.contains("page_kids.try_get_array_item(1)?")
+            && !test_17.contains("root_ref()")
+            && !test_17.contains(".as_array()"),
+        "test 17 must use resolving root/key/array accessors without identity or non-resolving bridges"
+    );
     let test_19 = section(
         page_source.as_str(),
         "pub(crate) fn run_test_19",

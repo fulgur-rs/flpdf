@@ -3530,6 +3530,28 @@ flpdfの`run_test_21`は`get_key`とcaller-side `Pdf::resolve`を撤去し、`.4
 `shallow_array.pdf`に対するqpdf `shallow_stream.out`とflpdf driver stderrのexit 2出力、focused
 error-contract test、source guardを比較し、case 21を`canonical`へ再分類した。
 
+### qtest E-28 test 17 resolving root and array cutover `flpdf-3yn9.48.114` (2026-09-15)
+
+qpdfの`test_17`は`QPDF::getRoot()`でCatalogを取得し、public `getKey("/Pages")` →
+`getKey("/Kids")`を通してから、public `getArrayItem(0/1)`で重複したpage object identityを
+確認する（`qpdf/test_driver.cc:776-793`、`include/qpdf/QPDF.hh:311-313`、
+`libqpdf/QPDF.cc:2354-2367`、`include/qpdf/QPDFObjectHandle.hh:725-728,762-768`）。
+`getKey`はreceiverの`dereference()`を経由し（`libqpdf/QPDFObjectHandle.cc:253-267,978-989`）、
+`getArrayItem`もarray receiverを解決してから子handleを返す
+（`libqpdf/QPDFObjectHandle.cc:758-785`）。
+
+flpdfの`run_test_17`は従来、Catalogを`root_ref()` → `get_object_handle()`へ投影し、
+`/Kids`を非解決の`as_array()`で取り出していた。これはCatalogのsemantic root boundaryと
+indirect `/Kids` arrayのresolution orderのいずれもqpdfと一致しない。既存canonicalの
+`Pdf::root_handle()`、`ObjectHandle::try_get_key`、`ObjectHandle::try_get_array_item`へ
+切り替え、PageDocumentHelperのduplicate-page repair、warning drain、page removal、
+`/Contents` identity、filtered stream assertionは変更しなかった。
+
+pinned qpdf 11.9.0 と flpdf の`page_api_2.pdf` test driver出力は、両方exit 0、結合出力
+158 bytesで`cmp`一致した。さらにindirect `/Kids`を持つqpdf-shaped fixtureで同じ
+resolving array accessorを通る回帰テストと対象関数のsource guardを追加し、case 17を
+`canonical`へ再分類した。
+
 ### qtest E-28 test 31 lazy null accessor cutover `flpdf-3yn9.48.104` (2026-09-15)
 
 qpdf の `QPDFObjectHandle::isNull()` は public accessor であり、実装は
