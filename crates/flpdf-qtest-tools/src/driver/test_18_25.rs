@@ -170,18 +170,17 @@ pub(crate) fn run_test_21<R: Read + Seek + 'static>(
     // this function (caught only by `main`'s top-level handler,
     // `test_driver.cc:3585-3593`). Mirrored here by `shallow_copy`'s own
     // `Err(Error::System("stream objects cannot be cloned"))`
-    // (`object_handle.rs:3509-3524`'s doc) and `?` -- the `writeln!` below
-    // it is real translated source text, but the preceding `?` is where
-    // qpdf's exception leaves this function, so it never executes.
+    // (the qpdf correspondence in `object_handle.rs`) and `?` -- the
+    // `writeln!` below it is real translated source text, but the preceding
+    // `?` is where qpdf's exception leaves this function, so it never executes.
     let mut helper = PageDocumentHelper::new(pdf);
     let pages = helper.get_all_pages()?;
     let page = pages[0];
     let page_handle = pdf.get_object_handle(page);
-    let contents = page_handle.get_key(b"/Contents");
+    let contents = page_handle.try_get_key(b"/Contents")?;
 
     emit_new_diagnostics(pdf, diagnostics_written, filename, stdout, stderr)?;
 
-    pdf.resolve(&contents)?;
     contents.shallow_copy()?;
     writeln!(stdout, "you can't see this")?;
     Ok(())

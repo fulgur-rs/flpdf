@@ -1352,14 +1352,16 @@ fn qtest_accessor_cases_do_not_use_explicit_pdf_resolve() {
             && !test_19.contains(".get_key("),
         "test 19 must use the canonical resolving key accessor for both Contents lookups"
     );
+    let test_21 = section(
+        page_source.as_str(),
+        "pub(crate) fn run_test_21",
+        "pub(crate) fn run_test_22",
+    );
     assert!(
-        section(
-            page_source.as_str(),
-            "pub(crate) fn run_test_21",
-            "pub(crate) fn run_test_22",
-        )
-        .contains("pdf.resolve("),
-        "test 21 lost the explicit resolution retained for the shallow-copy error contract"
+        test_21.contains("page_handle.try_get_key(")
+            && !test_21.contains(".get_key(")
+            && !test_21.contains("pdf.resolve("),
+        "test 21 must use resolving getKey and shallowCopy without a caller-side resolve bridge"
     );
     assert!(
         section(
