@@ -1291,6 +1291,9 @@ mod live_input_tests {
     #[test]
     fn signature_probe_document_covers_indirect_string_and_unknown_reference() {
         let (mut resolver, _document) = signature_probe_resolver();
+        let indirect_name = resolver.indirect_handle(ObjectRef::new(2, 0));
+        assert!(indirect_name.try_is_name_and_equals(b"Sig").unwrap());
+
         let indirect_string = resolver.indirect_handle(ObjectRef::new(3, 0));
         assert!(indirect_string.try_is_string().unwrap());
 
