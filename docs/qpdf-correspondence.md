@@ -3411,6 +3411,25 @@ qpdf の `getDict` の public boundary と lazy assertion 順序は
 `as_stream_dict` は代用しない。type-checks の test-driver 42、qpdf-json survey、Rust focused
 tests を確認し、case 42/98 の route classification を `canonical` へ更新した。
 
+### qtest E-28 test 2 caller-side resolve cutover `flpdf-3yn9.48.107` (2026-09-15)
+
+qpdf test 2（`qpdf/test_driver.cc:286-308`）は、`getKey` の連鎖で `/Info`、`/Encrypt`、
+`/Root`、`/Pages`、`/Kids`、`/Contents` を取得し、暗号辞書の `/O`・`/U` はそのまま
+`unparse`、content stream は `pipeStreamData` へ渡す。`QPDFObjectHandle::getKey` は
+receiverを解決して辞書値を返す（public declaration `include/qpdf/QPDFObjectHandle.hh:768-773`、
+implementation `libqpdf/QPDFObjectHandle.cc:979-989`）。`unparse` は間接値を参照形のまま
+返し（`libqpdf/QPDFObjectHandle.cc:1575-1593`）、`pipeStreamData` はstream accessor側で
+解決する（`libqpdf/QPDFObjectHandle.cc:1300-1341`）。
+
+flpdf の `ObjectHandle::try_get_key`（`object_handle.rs:3742`）と
+`ObjectHandle::get_stream_data`（`object_handle.rs:6218`）はそれぞれ qpdf の resolving
+accessor boundaryを担い、後者はqpdfのpipe結果をbufferへ集める。したがって `run_test_2` から `/O`・`/U`・`/Contents` 前の
+caller-side `resolve_handle` 3箇所を削除し、間接暗号値の `unparse` と stream read の
+解決責務を正本へ戻した。共有 `resolve_handle` は test 4〜9 の `type_code`、
+`pipe_stream_data`、`is_null` 用に保持する。source guard、test 2 differential、focused
+qtest/workspace gatesで、case 2を`canonical`へ再分類した。E-28全体は他のmixed caseが
+残るためmixedのままである。
+
 ### qtest E-28 test 31 lazy null accessor cutover `flpdf-3yn9.48.104` (2026-09-15)
 
 qpdf の `QPDFObjectHandle::isNull()` は public accessor であり、実装は

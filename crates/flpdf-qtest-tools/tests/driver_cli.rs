@@ -1237,7 +1237,12 @@ fn missing_input_prefixes_the_native_open_error() {
 }
 
 #[test]
-fn qtest_tree_and_mutation_cases_do_not_use_explicit_pdf_resolve() {
+fn qtest_accessor_cases_do_not_use_explicit_pdf_resolve() {
+    let early_source = fs::read_to_string(concat!(
+        env!("CARGO_MANIFEST_DIR"),
+        "/src/driver/test_02_09.rs"
+    ))
+    .expect("read early-driver source");
     let tree_source = fs::read_to_string(concat!(
         env!("CARGO_MANIFEST_DIR"),
         "/src/driver/test_42_49.rs"
@@ -1259,6 +1264,29 @@ fn qtest_tree_and_mutation_cases_do_not_use_explicit_pdf_resolve() {
             .expect("source section end");
         &source[start..end]
     }
+
+    let test_2 = section(
+        early_source.as_str(),
+        "pub(crate) fn run_test_2",
+        "pub(crate) fn run_test_3",
+    );
+    assert!(
+        !test_2.contains("resolve_handle("),
+        "test 2 retains the qpdf-less explicit resolve_handle bridge"
+    );
+    assert!(
+        early_source.contains("fn resolve_handle"),
+        "the shared resolve_handle helper was removed with test 2's caller"
+    );
+    assert!(
+        section(
+            early_source.as_str(),
+            "pub(crate) fn run_test_4",
+            "pub(crate) fn run_test_5",
+        )
+        .contains("resolve_handle("),
+        "test 4 lost the explicit resolution required by its non-accessor path"
+    );
 
     for (name, body) in [
         (

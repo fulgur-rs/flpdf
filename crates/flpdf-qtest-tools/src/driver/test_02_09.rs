@@ -12,13 +12,13 @@ use flpdf::{
 use crate::driver::emit_new_diagnostics;
 use crate::output::write_bytes;
 
-// This file ports qpdf's `test_2` through `test_9` (`qpdf/test_driver.cc:287-519`).
+// This file ports qpdf's `test_2` through `test_9` (`qpdf/test_driver.cc:286-519`).
 //
 // `ObjectHandle::get_key` never resolves its receiver -- it returns a
 // direct null handle for a not-yet-resolved indirect handle, the same as
 // for a genuinely missing key (`ObjectHandle::get_key`'s own doc). qpdf's
-// `QPDFObjectHandle` methods, by contrast, all call `dereference()` on
-// entry (`libqpdf/QPDFObjectHandle.cc`'s accessor bodies), so a chain like
+// dictionary/value accessors, by contrast, call `dereference()` on entry
+// (`libqpdf/QPDFObjectHandle.cc`'s accessor bodies), so a chain like
 // `trailer.getKey("/Info").getKey("/CreationDate")` transparently
 // dereferences at every hop. `ObjectHandle::try_get_key` (`pub`) already
 // resolves its own receiver before reading `key` off it, so dictionary-key
@@ -39,7 +39,7 @@ use crate::output::write_bytes;
 // those directly wherever qpdf's test driver calls their qpdf counterpart.
 // `resolve_handle` below is still needed for the handful of sites that read
 // a handle through an accessor with no warning-emitting counterpart at all
-// (`unparse`, `type_code`, `pipe_stream_data`) or that merely gate on a
+// (`type_code`, `pipe_stream_data`) or that merely gate on a
 // non-throwing `isX()`-shaped check (`is_null`), where qpdf's own
 // dereference-before-use has no separate warning to reproduce.
 //
@@ -90,7 +90,10 @@ pub(crate) fn run_test_2<R: Read + Seek>(
 
     let encrypt = trailer.try_get_key(b"/Encrypt")?;
     let o = encrypt.try_get_key(b"/O")?;
-    resolve_handle(pdf, &o)?;
+    // qpdf's getKey returns the value handle without dereferencing that
+    // value, and unparse() intentionally preserves an indirect value as a
+    // reference (`libqpdf/QPDFObjectHandle.cc:1575-1593`). Keep this direct
+    // call aligned with qpdf rather than resolving the handle in the caller.
     // qpdf delivers a lazy-resolution warning the instant `warn()` records it
     // (`libqpdf/QPDF.cc:487-494`), so it belongs before this value's own line
     // rather than after both encrypted-string lines.
@@ -99,7 +102,6 @@ pub(crate) fn run_test_2<R: Read + Seek>(
     write_bytes(stdout, &o.unparse())?;
     writeln!(stdout)?;
     let u = encrypt.try_get_key(b"/U")?;
-    resolve_handle(pdf, &u)?;
     emit_new_diagnostics(pdf, diagnostics_written, filename, stdout, stderr)
         .map_err(Error::from)?;
     write_bytes(stdout, &u.unparse())?;
@@ -112,7 +114,10 @@ pub(crate) fn run_test_2<R: Read + Seek>(
     emit_new_diagnostics(pdf, diagnostics_written, filename, stdout, stderr)
         .map_err(Error::from)?;
     let contents = page.try_get_key(b"/Contents")?;
-    resolve_handle(pdf, &contents)?;
+    // qpdf's pipeStreamData resolves its receiver through the public stream
+    // accessor (`libqpdf/QPDFObjectHandle.cc:1300-1341`); the canonical
+    // ObjectHandle get_stream_data wrapper uses that same pipe path and owns
+    // the resolution too.
     let data = contents.get_stream_data(DecodeLevel::Generalized)?;
     write_bytes(stdout, &data)?;
     Ok(())
