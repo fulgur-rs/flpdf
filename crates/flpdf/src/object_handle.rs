@@ -2999,7 +2999,7 @@ impl ObjectHandle {
     /// value-demanding error boundary, matching `isNull`'s
     /// `dereference() && ...` implementation
     /// (`libqpdf/QPDFObjectHandle.cc:353-356`).
-    pub(crate) fn try_is_null(&self) -> Result<bool> {
+    pub fn try_is_null(&self) -> Result<bool> {
         if !self.is_initialized() {
             return Ok(false);
         }

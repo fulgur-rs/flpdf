@@ -496,7 +496,7 @@ pub(crate) fn run_test_31<R: Read + Seek>(
     writeln!(stdout, "trailing data: {exception}")?;
 
     // qpdf's context-taking overload inserts unresolved references into the
-    // owning canonical cache. `try_is_integer` and `resolve` reproduce the
+    // owning canonical cache. `try_is_integer` and `try_is_null` reproduce the
     // following qpdf type/null predicates at their normal lazy boundary.
     let first = ObjectHandle::parse_with_context(pdf, b"[5 0 R]", "")?;
     let first_item = first.try_get_array_item(0)?;
@@ -525,8 +525,7 @@ pub(crate) fn run_test_31<R: Read + Seek>(
 
     let null_reference = ObjectHandle::parse_with_context(pdf, b"[7 0 R]", "")?;
     let null_item = null_reference.try_get_array_item(0)?;
-    pdf.resolve(&null_item)?;
-    assert!(null_item.is_null());
+    assert!(null_item.try_is_null()?);
     assert!(!null_item.is_direct());
     emit_new_diagnostics(pdf, diagnostics_written, filename, stdout, stderr)?;
 

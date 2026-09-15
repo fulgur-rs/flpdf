@@ -120,3 +120,26 @@ fn test_0_1_stream_route_uses_the_canonical_object_pipe() {
         "test_0_1 must call the canonical ObjectHandle pipe"
     );
 }
+
+#[test]
+fn test_31_uses_the_canonical_lazy_null_accessor() {
+    let source = fs::read_to_string(concat!(
+        env!("CARGO_MANIFEST_DIR"),
+        "/src/driver/test_26_33.rs"
+    ))
+    .expect("read test_26_33 source");
+    let test_31 = source
+        .split("/// test_31 ")
+        .nth(1)
+        .and_then(|rest| rest.split("/// test_32 ").next())
+        .expect("test_31 source section");
+
+    assert!(
+        !test_31.contains("pdf.resolve("),
+        "test_31 must not bridge lazy accessor resolution through Pdf::resolve"
+    );
+    assert!(
+        test_31.contains("try_is_null()"),
+        "test_31 must use the canonical lazy null accessor"
+    );
+}
