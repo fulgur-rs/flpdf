@@ -3545,6 +3545,7 @@ fn main() {
         run_remove_attachment(
             args.input,
             args.output,
+            &args.page_ops,
             args.replace_input,
             args.repair,
             &args.password,
@@ -3567,6 +3568,7 @@ fn main() {
         run_add_attachment(
             args.input,
             args.output,
+            &args.page_ops,
             args.replace_input,
             args.repair,
             &args.password,
@@ -3593,6 +3595,7 @@ fn main() {
         run_copy_attachments_from(
             args.input,
             args.output,
+            &args.page_ops,
             args.replace_input,
             args.repair,
             &args.password,
@@ -10265,6 +10268,7 @@ fn path_basename(path: &std::path::Path) -> CliResult<Vec<u8>> {
 fn configure_attachment_job(
     input: &Path,
     output: Option<&Path>,
+    page_ops: &PageOpArgs,
     replace_input: bool,
     repair: bool,
     password: &PasswordArgs,
@@ -10293,6 +10297,33 @@ fn configure_attachment_job(
         job.config().replace_input()?;
     } else {
         job.set_output_file(output.ok_or_else(missing_output_usage_error)?.to_path_buf())?;
+    }
+
+    // qpdf runs handlePageSpecs and handleRotations before
+    // handleTransformations, which is where addAttachments/copyAttachments
+    // live (`libqpdf/QPDFJob.cc:465-474,2243,2246`). Queue both on the job so
+    // the attachment routes observe the same ordering the rewrite route does.
+    {
+        // qpdf calls handlePageSpecs only when page_specs is non-empty
+        // (`libqpdf/QPDFJob.cc:466`); an empty list must not initialize the
+        // page-selection machinery at all.
+        let raw_specs = if page_ops.parsed_page_specs.is_none() {
+            Vec::new()
+        } else {
+            configured_page_specs(page_ops)?
+        };
+        let mut configuration = job.config();
+        for spec in raw_specs {
+            let password = spec.raw_password.or_else(|| {
+                spec.password
+                    .as_ref()
+                    .map(|password| arg_parser::os_bytes(password.as_os_str()))
+            });
+            configuration.add_page_spec(PathBuf::from(spec.file_token), &spec.range, password)?;
+        }
+        for parameter in &page_ops.rotate {
+            configuration.rotate(arg_parser::os_bytes(parameter.as_os_str()))?;
+        }
     }
 
     let input_options = pdf_open_options(repair, password)?;
@@ -10350,6 +10381,7 @@ fn run_configured_attachment_job(
 fn run_add_attachment(
     input: Option<PathBuf>,
     output: Option<PathBuf>,
+    page_ops: &PageOpArgs,
     replace_input: bool,
     repair: bool,
     password: &PasswordArgs,
@@ -10393,6 +10425,7 @@ fn run_add_attachment(
     let mut job = configure_attachment_job(
         &input,
         output.as_deref(),
+        page_ops,
         replace_input,
         repair,
         password,
@@ -10418,6 +10451,7 @@ fn run_add_attachment(
 fn run_remove_attachment(
     input: Option<PathBuf>,
     output: Option<PathBuf>,
+    page_ops: &PageOpArgs,
     replace_input: bool,
     repair: bool,
     password: &PasswordArgs,
@@ -10437,6 +10471,7 @@ fn run_remove_attachment(
     let mut job = configure_attachment_job(
         &input,
         output.as_deref(),
+        page_ops,
         replace_input,
         repair,
         password,
@@ -10541,6 +10576,7 @@ fn run_show_attachment(
 fn run_copy_attachments_from(
     input: Option<PathBuf>,
     output: Option<PathBuf>,
+    page_ops: &PageOpArgs,
     replace_input: bool,
     repair: bool,
     password: &PasswordArgs,
@@ -10568,6 +10604,7 @@ fn run_copy_attachments_from(
     let mut job = configure_attachment_job(
         &input,
         output.as_deref(),
+        page_ops,
         replace_input,
         repair,
         password,
