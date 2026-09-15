@@ -660,7 +660,7 @@ page-dictionary filter likewise obtains its sequence through the repair/cache
 boundary after object-stream setup (`QPDFWriter.cc:2125-2149`). The Rust
 consumer still receives an owned `Vec<ObjectRef>` projection rather than qpdf's
 const vector reference; no second page-tree traversal is performed, and
-`update_all_pages_cache`/tree-rebuild invalidation remains authoritative
+`update_all_pages_cache`/tree-rebuild/page-splice invalidation remains authoritative
 (`QPDF_pages.cc:39-75,141-150`).
 
 `QPDF::removePage` first delegates membership lookup to `findPage`, which
