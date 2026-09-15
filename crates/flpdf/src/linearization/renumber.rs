@@ -1255,8 +1255,8 @@ impl RenumberMap {
                                 );
                             }
                         }
-                    }
-                }
+                    } // cov:ignore: LLVM attributes this nested category guard terminator to its branch opening
+                } // cov:ignore: LLVM attributes this first-half interleave guard terminator to its branch opening
             }
             if Some(original) == first_half_outline_root_raw {
                 emit_first_half_batch_range(
