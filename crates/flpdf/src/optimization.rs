@@ -172,6 +172,21 @@ impl Optimization {
             .map(|(&object, users)| (object, users))
     }
 
+    /// Return the projectable identities reached by qpdf's optimization walk.
+    ///
+    /// `QPDF::optimize` records every object reached from pages, trailer keys,
+    /// and root keys in `object_to_obj_users` and the linearization classifier
+    /// consumes that map directly (`QPDF_optimization.cc:57-118,261-338`;
+    /// `QPDF_linearization.cc:963-1155`). The linearization plan uses this
+    /// view when no source ObjStm member-to-container projection has replaced
+    /// those raw keys.
+    pub(crate) fn linearization_reachable_object_refs(
+        &self,
+    ) -> impl Iterator<Item = ObjectRef> + '_ {
+        self.raw_object_users()
+            .filter_map(|(object, _)| object.to_object_ref())
+    }
+
     pub(crate) fn raw_page_users(&self, object: QpdfObjGen) -> impl Iterator<Item = u32> + '_ {
         self.raw_users_for(object)
             .iter()
@@ -671,6 +686,20 @@ mod tests {
         assert_eq!(
             optimization.page_users(object).collect::<Vec<_>>(),
             vec![0, 2]
+        );
+    }
+
+    #[test]
+    fn linearization_reachable_object_refs_projects_the_canonical_user_map() {
+        let mut optimization = Optimization::default();
+        optimization.record(ObjectUser::Page(0), ObjectRef::new(7, 0));
+        optimization.record(ObjectUser::Root, ObjectRef::new(9, 0));
+
+        assert_eq!(
+            optimization
+                .linearization_reachable_object_refs()
+                .collect::<Vec<_>>(),
+            vec![ObjectRef::new(7, 0), ObjectRef::new(9, 0)]
         );
     }
 

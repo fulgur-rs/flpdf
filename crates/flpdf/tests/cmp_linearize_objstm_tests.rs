@@ -413,6 +413,28 @@ fn non_dictionary_leaf_parent_is_ignored_by_user_traversal() {
 }
 
 #[test]
+fn direct_page_parent_keeps_the_exact_reachability_fallback() {
+    let bytes = pdf_from_object_bodies(&[
+        "<< /Type /Catalog /Pages 2 0 R >>".to_owned(),
+        "<< /Type /Pages /Count 1 /Kids [3 0 R] >>".to_owned(),
+        "<< /Type /Page /Parent << /Type /Pages /Count 1 /Kids [3 0 R] >> /MediaBox [0 0 612 792] >>".to_owned(),
+    ]);
+    let mut pdf = Pdf::open(Cursor::new(bytes)).unwrap();
+    LinearizationPlan::from_pdf(&mut pdf, false)
+        .expect("a direct page /Parent must use the exact writer reachability walk");
+}
+
+#[test]
+fn preserve_source_objstm_keeps_the_exact_reachability_fallback() {
+    let path = Path::new(env!("CARGO_MANIFEST_DIR"))
+        .join("../../tests/fixtures/compat/objstm-lin-firstpage-private-before-shared-bearing.pdf");
+    let file = std::fs::File::open(path).unwrap();
+    let mut pdf = Pdf::open(std::io::BufReader::new(file)).unwrap();
+    LinearizationPlan::from_pdf_with_object_stream_mode(&mut pdf, ObjectStreamMode::Preserve)
+        .expect("source-backed Preserve must use the exact writer reachability walk");
+}
+
+#[test]
 fn deeply_nested_direct_page_value_is_accepted_by_optimization_up_to_parser_limit() {
     let nested = format!("{}{}", "[".repeat(257), "]".repeat(257));
     let bytes = pdf_from_object_bodies(&[
