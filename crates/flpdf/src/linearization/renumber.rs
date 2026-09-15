@@ -60,7 +60,7 @@
 use crate::qpdf_obj_gen::QpdfObjGen;
 use crate::ObjectRef;
 
-use super::plan::LinearizationPlan;
+use super::plan::{LinearizationPlan, RoutedObjStmBatch};
 use std::collections::{BTreeMap, BTreeSet};
 
 // ---------------------------------------------------------------------------
@@ -791,10 +791,9 @@ impl RenumberMap {
     #[allow(clippy::too_many_arguments)]
     pub(crate) fn place_objstm_members_per_half(
         &mut self,
-        open_document_batches: &[Vec<ObjectRef>],
-        open_document_source_container_numbers: &[Option<u32>],
-        first_half_batches: &[Vec<ObjectRef>],
-        second_half_batches: &[Vec<ObjectRef>],
+        open_document_batches: &[RoutedObjStmBatch],
+        first_half_batches: &[RoutedObjStmBatch],
+        second_half_batches: &[RoutedObjStmBatch],
         second_half_anchors: &[SecondHalfContainerAnchor],
         second_half_post_plain: &BTreeSet<ObjectRef>,
         first_half_post_plain: &BTreeSet<ObjectRef>,
@@ -802,9 +801,15 @@ impl RenumberMap {
         first_half_outline_root: Option<ObjectRef>,
     ) -> ObjStmRelocation {
         // Fast path: nothing to place — leave the map byte-identical.
-        let no_open = open_document_batches.iter().all(|b| b.is_empty());
-        let no_first = first_half_batches.iter().all(|b| b.is_empty());
-        let no_second = second_half_batches.iter().all(|b| b.is_empty());
+        let no_open = open_document_batches
+            .iter()
+            .all(|batch| batch.members.is_empty());
+        let no_first = first_half_batches
+            .iter()
+            .all(|batch| batch.members.is_empty());
+        let no_second = second_half_batches
+            .iter()
+            .all(|batch| batch.members.is_empty());
         if no_open && no_first && no_second {
             return ObjStmRelocation::default();
         }
@@ -813,7 +818,7 @@ impl RenumberMap {
             .iter()
             .chain(first_half_batches)
             .chain(second_half_batches)
-            .flat_map(|b| b.iter().copied())
+            .flat_map(|batch| batch.members.iter().copied())
             .filter_map(|object_ref| QpdfObjGen::try_from_object_ref(object_ref).ok())
             .collect();
         let second_half_post_plain_raw: BTreeSet<QpdfObjGen> = second_half_post_plain
@@ -882,8 +887,12 @@ impl RenumberMap {
         // Part-4 in the SECOND half (low numbers), so the returned vector is NOT
         // ascending; the writer maps each batch to its container by position,
         // not by value.
-        let count_nonempty =
-            |batches: &[Vec<ObjectRef>]| batches.iter().filter(|b| !b.is_empty()).count();
+        let count_nonempty = |batches: &[RoutedObjStmBatch]| {
+            batches
+                .iter()
+                .filter(|batch| !batch.members.is_empty())
+                .count()
+        };
         let mut first_half_container_numbers: Vec<u32> =
             Vec::with_capacity(count_nonempty(first_half_batches));
         let mut second_half_container_numbers: Vec<u32> =
@@ -930,12 +939,17 @@ impl RenumberMap {
              raw_table: &mut Vec<QpdfObjGen>,
              container_numbers: &mut Vec<u32>| {
                 for batch in &first_half_batches[start..end] {
-                    if batch.is_empty() {
+                    if batch.members.is_empty() {
                         continue;
                     }
                     let container_num = table.len() as u32;
-                    table.push(SENTINEL); // container: a plain indirect, no original
-                    raw_table.push(RAW_SENTINEL);
+                    table.push(SENTINEL); // container: emitted from the reconstructed ObjStm
+                    raw_table.push(
+                        batch
+                            .source_container_number
+                            .map(|number| QpdfObjGen::new(number as i32, 0))
+                            .unwrap_or(RAW_SENTINEL),
+                    );
                     container_numbers.push(container_num);
                 }
             };
@@ -954,12 +968,19 @@ impl RenumberMap {
             vec![None; second_half_batches.len()];
         let mut emit_container =
             |bi: usize, table: &mut Vec<ObjectRef>, raw_table: &mut Vec<QpdfObjGen>| {
-                if second_half_batches[bi].is_empty() || second_half_container_slot[bi].is_some() {
+                if second_half_batches[bi].members.is_empty()
+                    || second_half_container_slot[bi].is_some()
+                {
                     return;
                 }
                 let container_num = table.len() as u32;
-                table.push(SENTINEL); // container: a plain indirect, no original
-                raw_table.push(RAW_SENTINEL);
+                table.push(SENTINEL); // container: emitted from the reconstructed ObjStm
+                raw_table.push(
+                    second_half_batches[bi]
+                        .source_container_number
+                        .map(|number| QpdfObjGen::new(number as i32, 0))
+                        .unwrap_or(RAW_SENTINEL),
+                );
                 second_half_container_slot[bi] = Some(container_num);
             };
         for bi in 0..second_half_batches.len() {
@@ -1017,7 +1038,7 @@ impl RenumberMap {
         new_by_new_raw.push(RAW_SENTINEL);
         // (4) Part-4 ObjStm members, batch-ordered (type-2) — last of the half.
         for batch in second_half_batches {
-            for &member in batch {
+            for &member in &batch.members {
                 assert_member(member, &self.by_original_raw);
                 push_original(
                     QpdfObjGen::try_from_object_ref(member)
@@ -1059,14 +1080,11 @@ impl RenumberMap {
              nums: &mut Vec<u32>| {
                 while next_open_document_batch < open_document_batches.len() {
                     let batch_index = next_open_document_batch;
-                    if open_document_batches[batch_index].is_empty() {
+                    if open_document_batches[batch_index].members.is_empty() {
                         next_open_document_batch += 1;
                         continue;
                     }
-                    let source_number = open_document_source_container_numbers
-                        .get(batch_index)
-                        .copied()
-                        .flatten();
+                    let source_number = open_document_batches[batch_index].source_container_number;
                     let emit = match plain_source_number {
                         Some(plain_source_number) => {
                             source_number.is_some_and(|source| source < plain_source_number)
@@ -1077,8 +1095,12 @@ impl RenumberMap {
                         break;
                     }
                     let container_num = table.len() as u32;
-                    table.push(SENTINEL); // container: a plain indirect, no original
-                    raw_table.push(RAW_SENTINEL);
+                    table.push(SENTINEL); // container: emitted from the reconstructed ObjStm
+                    raw_table.push(
+                        source_number
+                            .map(|number| QpdfObjGen::new(number as i32, 0))
+                            .unwrap_or(RAW_SENTINEL),
+                    );
                     nums.push(container_num);
                     next_open_document_batch += 1;
                 }
@@ -1097,9 +1119,9 @@ impl RenumberMap {
         // `from_plan` always places these (part6 outline objects, step 9b) after
         // the hint slot, so collecting them here never shifts the hint position.
         let mut first_half_post_container_plain: Vec<QpdfObjGen> = Vec::new();
-        let source_ordered_open_document = open_document_source_container_numbers
+        let source_ordered_open_document = open_document_batches
             .iter()
-            .any(Option::is_some);
+            .any(|batch| batch.source_container_number.is_some());
         for (i, &original) in first_half_plain.iter().enumerate() {
             if i as u32 == hint_index_in_first_half {
                 emit_open_document_containers_before(
@@ -1187,7 +1209,7 @@ impl RenumberMap {
         //     the part4 (open-document) members before the part6 (first-page)
         //     members (`vecs1 = {part4, part6}`), so emit open-document first.
         for batch in open_document_batches {
-            for &member in batch {
+            for &member in &batch.members {
                 assert_member(member, &self.by_original_raw);
                 push_original(
                     QpdfObjGen::try_from_object_ref(member)
@@ -1198,7 +1220,7 @@ impl RenumberMap {
             }
         }
         for batch in first_half_batches {
-            for &member in batch {
+            for &member in &batch.members {
                 assert_member(member, &self.by_original_raw);
                 push_original(
                     QpdfObjGen::try_from_object_ref(member)
@@ -1302,6 +1324,18 @@ impl RenumberMap {
 mod tests {
     use super::*;
     use crate::linearization::plan::{LinearizationPlan, PageHintEntry, RawLinearizationPlan};
+
+    fn routed_batch(
+        members: Vec<ObjectRef>,
+        route: super::super::plan::ContainerPart,
+        source_container_number: Option<u32>,
+    ) -> RoutedObjStmBatch {
+        RoutedObjStmBatch {
+            members,
+            route,
+            source_container_number,
+        }
+    }
 
     // -----------------------------------------------------------------------
     // Fixture helpers
@@ -1822,11 +1856,18 @@ mod tests {
         // refs are present in the map (part3_objects / part4_other_pages_private
         // of two_page_plan).
         let second_half_batches = vec![
-            vec![ObjectRef::new(5, 0)],
-            vec![ObjectRef::new(4, 0), ObjectRef::new(7, 0)],
+            routed_batch(
+                vec![ObjectRef::new(5, 0)],
+                super::super::plan::ContainerPart::OtherPagePrivate,
+                Some(90),
+            ),
+            routed_batch(
+                vec![ObjectRef::new(4, 0), ObjectRef::new(7, 0)],
+                super::super::plan::ContainerPart::OtherPagePrivate,
+                Some(91),
+            ),
         ];
         let relocation = rn.place_objstm_members_per_half(
-            &[],
             &[],
             &[],
             &second_half_batches,
@@ -1844,9 +1885,11 @@ mod tests {
         );
         let c0 = relocation.container_numbers[0];
         let c1 = relocation.container_numbers[1];
+        assert_eq!(rn.new_for_raw(QpdfObjGen::new(90, 0)).unwrap().number, c0);
+        assert_eq!(rn.new_for_raw(QpdfObjGen::new(91, 0)).unwrap().number, c1);
         let members: Vec<u32> = second_half_batches
             .iter()
-            .flatten()
+            .flat_map(|batch| batch.members.iter())
             .map(|&m| rn.new_for_original(m).unwrap().number)
             .collect();
 
@@ -1915,8 +1958,11 @@ mod tests {
         let relocation = rn.place_objstm_members_per_half(
             &[],
             &[],
-            &[],
-            &[vec![member]],
+            &[routed_batch(
+                vec![member],
+                super::super::plan::ContainerPart::OtherPagePrivate,
+                None,
+            )],
             &[SecondHalfContainerAnchor::BeforeFirst],
             &BTreeSet::new(),
             &BTreeSet::new(),
@@ -1938,9 +1984,12 @@ mod tests {
         let mut rn = RenumberMap::from_plan(&plan);
 
         // One Part-3 (first-half) batch: 5 0 R + 8 0 R (both part3_objects).
-        let first_half_batches = vec![vec![ObjectRef::new(5, 0), ObjectRef::new(8, 0)]];
+        let first_half_batches = vec![routed_batch(
+            vec![ObjectRef::new(5, 0), ObjectRef::new(8, 0)],
+            super::super::plan::ContainerPart::FirstPageShared,
+            Some(90),
+        )];
         let relocation = rn.place_objstm_members_per_half(
-            &[],
             &[],
             &first_half_batches,
             &[],
@@ -1957,9 +2006,13 @@ mod tests {
             "one non-empty Part-3 batch yields one container number"
         );
         let container = relocation.container_numbers[0];
-        let members: Vec<u32> = first_half_batches
+        assert_eq!(
+            rn.new_for_raw(QpdfObjGen::new(90, 0)).unwrap().number,
+            container
+        );
+        let members: Vec<u32> = first_half_batches[0]
+            .members
             .iter()
-            .flatten()
             .map(|&m| rn.new_for_original(m).unwrap().number)
             .collect();
 
@@ -2010,12 +2063,44 @@ mod tests {
         let mut rn = RenumberMap::from_plan(&plan);
 
         // Each batch list carries one empty and one non-empty batch.
-        let open_document_batches = vec![vec![], vec![ObjectRef::new(8, 0)]];
-        let first_half_batches = vec![vec![], vec![ObjectRef::new(5, 0)]];
-        let second_half_batches = vec![vec![], vec![ObjectRef::new(4, 0)]];
+        let open_document_batches = vec![
+            routed_batch(
+                vec![],
+                super::super::plan::ContainerPart::OpenDocument,
+                None,
+            ),
+            routed_batch(
+                vec![ObjectRef::new(8, 0)],
+                super::super::plan::ContainerPart::OpenDocument,
+                None,
+            ),
+        ];
+        let first_half_batches = vec![
+            routed_batch(
+                vec![],
+                super::super::plan::ContainerPart::FirstPageShared,
+                None,
+            ),
+            routed_batch(
+                vec![ObjectRef::new(5, 0)],
+                super::super::plan::ContainerPart::FirstPageShared,
+                None,
+            ),
+        ];
+        let second_half_batches = vec![
+            routed_batch(
+                vec![],
+                super::super::plan::ContainerPart::OtherPagePrivate,
+                None,
+            ),
+            routed_batch(
+                vec![ObjectRef::new(4, 0)],
+                super::super::plan::ContainerPart::OtherPagePrivate,
+                None,
+            ),
+        ];
         let relocation = rn.place_objstm_members_per_half(
             &open_document_batches,
-            &[],
             &first_half_batches,
             &second_half_batches,
             &[],
@@ -2204,9 +2289,20 @@ mod tests {
             ..Default::default()
         };
         let mut rn = RenumberMap::from_plan(&plan);
+        let open_document_batches = vec![
+            routed_batch(
+                vec![ObjectRef::new(6, 0)],
+                super::super::plan::ContainerPart::OpenDocument,
+                Some(1),
+            ),
+            routed_batch(
+                vec![ObjectRef::new(23, 0)],
+                super::super::plan::ContainerPart::OpenDocument,
+                Some(19),
+            ),
+        ];
         let relocation = rn.place_objstm_members_per_half(
-            &[vec![ObjectRef::new(6, 0)], vec![ObjectRef::new(23, 0)]],
-            &[Some(1), Some(19)],
+            &open_document_batches,
             &[],
             &[],
             &[],
@@ -2228,6 +2324,16 @@ mod tests {
         assert_eq!(
             rn.new_for_original(ObjectRef::new(21, 0)).unwrap().number,
             9
+        );
+        assert_eq!(
+            rn.new_for_raw(QpdfObjGen::new(1, 0)).unwrap().number,
+            5,
+            "Preserve source container must resolve to its reconstructed ObjStm slot"
+        );
+        assert_eq!(
+            rn.new_for_raw(QpdfObjGen::new(19, 0)).unwrap().number,
+            8,
+            "each Preserve source container must retain its own canonical identity"
         );
         assert_eq!(rn.hint_stream_slot(), 10);
     }

@@ -17,8 +17,9 @@ pub(crate) use emission::{
 pub(crate) use planning::sort_source_backed_members_qpdf_order;
 pub use planning::ObjectStreamMode;
 pub(crate) use planning::{
-    filter_objstm_batches_for_output, plan_qpdf_preserve_object_streams_with_source_membership,
+    filter_objstm_batches_for_output, filter_preserve_object_stream_plan_for_output,
+    plan_qpdf_preserve_object_streams_with_source_membership,
     plan_qpdf_preserve_object_streams_with_unreferenced, planner_config_from_options,
-    ObjectStreamGroup, PlannerConfig,
+    ObjectStreamGroup, ObjectStreamPlan, PlannerConfig,
 };
 // ── Tests ────────────────────────────────────────────────────────────────────
