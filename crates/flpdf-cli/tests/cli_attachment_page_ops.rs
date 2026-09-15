@@ -632,3 +632,84 @@ fn add_attachment_keeps_donor_credentials_for_page_sources() {
          credentials stay available to the page source"
     );
 }
+
+#[test]
+fn add_attachment_opens_the_copy_encryption_donor_once() {
+    if !qpdf_available() {
+        eprintln!("qpdf not available; skipping the donor reopen check");
+        return;
+    }
+    let temp = tempfile::tempdir().unwrap();
+    let input = one_page_pdf();
+    let attachment = attachment_temp(temp.path());
+    let donor = encrypted_paged_donor(temp.path()).expect("qpdf builds the encrypted donor");
+
+    // Break startxref so opening the donor emits repair warnings. The writer
+    // configuration this route installs already carries the opened donor, so
+    // letting the job reopen it would parse the file twice and repeat every
+    // warning.
+    let mut bytes = std::fs::read(&donor).unwrap();
+    let marker = b"startxref";
+    let start = bytes
+        .windows(marker.len())
+        .rposition(|window| window == marker)
+        .expect("donor has startxref")
+        + marker.len();
+    let end = bytes[start..]
+        .iter()
+        .position(|byte| *byte == b'\n' && start + 1 < bytes.len())
+        .map(|offset| start + offset)
+        .expect("startxref is followed by a newline");
+    bytes.splice(start..end, b"\n999999".iter().copied());
+    let broken = temp.path().join("donor-broken.pdf");
+    std::fs::write(&broken, &bytes).unwrap();
+
+    let output = temp.path().join("out.pdf");
+    let assert = CargoCommand::cargo_bin("flpdf")
+        .unwrap()
+        .args([
+            "--static-id",
+            input.path().to_str().unwrap(),
+            &format!("--copy-encryption={}", broken.to_str().unwrap()),
+            "--encryption-file-password=dow",
+            "--add-attachment",
+            attachment.to_str().unwrap(),
+            "--creationdate=D:20200102030405Z",
+            "--moddate=D:20200102030405Z",
+            "--",
+            output.to_str().unwrap(),
+        ])
+        .assert()
+        .success();
+    let stderr = String::from_utf8_lossy(&assert.get_output().stderr).into_owned();
+    let flpdf_warnings = stderr
+        .lines()
+        .filter(|line| line.contains("WARNING"))
+        .count();
+
+    let oracle = std::process::Command::new("qpdf")
+        .args([
+            "--static-id",
+            input.path().to_str().unwrap(),
+            &format!("--copy-encryption={}", broken.to_str().unwrap()),
+            "--encryption-file-password=dow",
+            "--add-attachment",
+            attachment.to_str().unwrap(),
+            "--creationdate=D:20200102030405Z",
+            "--moddate=D:20200102030405Z",
+            "--",
+        ])
+        .arg(temp.path().join("oracle.pdf"))
+        .output()
+        .expect("qpdf runs");
+    let qpdf_warnings = String::from_utf8_lossy(&oracle.stderr)
+        .lines()
+        .filter(|line| line.contains("WARNING"))
+        .count();
+
+    assert!(qpdf_warnings > 0, "the broken donor must warn at all");
+    assert_eq!(
+        flpdf_warnings, qpdf_warnings,
+        "the donor must be opened once, like qpdf\nflpdf stderr:\n{stderr}"
+    );
+}
