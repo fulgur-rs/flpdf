@@ -8786,6 +8786,7 @@ pub(crate) mod identity_tests {
         assert_eq!(SourceExtents::default(), SourceExtents::UNSET);
 
         let resolver: Rc<dyn DocumentResolver> = Rc::new(RecordingResolver::default());
+        assert!(!resolver.has_newer_cached_generation(QpdfObjGen::new(1, 0)));
         let handle = ObjectHandle::new_indirect_with_resolver(
             ObjectRef::new(1, 0),
             Rc::downgrade(&resolver),

@@ -1669,9 +1669,9 @@ mod tests {
         collect_retained_widget_refs, discover_primary_acroform, field_kid_refs,
         install_primary_object_stream_membership, merge_documents,
         merge_documents_with_resource_decisions_and_preserve_primary,
-        merge_documents_with_resource_mode_and_preserve_primary, resolve_field_partial_name,
-        rewrite_field_kids, trim_field_kids, unique_field_name, widget_page_ref, MergeInput,
-        DEFAULT_MAX_ACROFORM_DEPTH,
+        merge_documents_with_resource_mode_and_preserve_primary, preserve_primary_root_shape,
+        resolve_field_partial_name, rewrite_field_kids, trim_field_kids, unique_field_name,
+        widget_page_ref, MergeInput, DEFAULT_MAX_ACROFORM_DEPTH,
     };
     use crate::{Error, ObjectHandle, ObjectRef, Pdf};
     use std::collections::{BTreeMap, BTreeSet};
@@ -1757,6 +1757,28 @@ mod tests {
             .object_ref()
             .expect("source ObjStm /Extends must remain indirect");
         assert_ne!(ObjectRef::new(target_container, 0), extends);
+    }
+
+    #[test]
+    fn direct_primary_root_removes_the_temporary_target_catalog() {
+        let mut source = Pdf::open_mem_owned(
+            include_bytes!("../../../../tests/fixtures/compat/direct-root-one-page.pdf").to_vec(),
+        )
+        .expect("open direct-root source");
+        assert_eq!(source.root_ref(), None);
+
+        let mut target = Pdf::empty().expect("empty merge target");
+        assert!(target.root_ref().is_some());
+
+        preserve_primary_root_shape(&mut source, &mut target)
+            .expect("preserve direct primary root shape");
+
+        assert_eq!(target.root_ref(), None);
+        assert!(target
+            .root_handle()
+            .expect("direct target Catalog")
+            .try_has_key(b"/Pages")
+            .expect("direct target Catalog keys"));
     }
 
     #[test]
