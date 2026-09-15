@@ -3480,6 +3480,21 @@ flpdfの`run_test_11`は従来、semantic Catalog accessにqpdf対応物のな�
 `get_raw_stream_data`は変更せず、`stream-data.pdf`のflpdf driver outputとqpdfの
 `test11.out`を`cmp`で比較して一致を確認した。case 11は`canonical`へ再分類した。
 
+### qtest E-28 test 19 resolving key cutover `flpdf-3yn9.48.111` (2026-09-15)
+
+qpdfの`test_19`はpage listからduplicate pageを追加した後、両pageの`/Contents`を
+public `getKey()`で取得し、返されたstream referenceの`getObjGen()`を比較する
+（`qpdf/test_driver.cc:818-832`、`include/qpdf/QPDFObjectHandle.hh:762-768`、
+`libqpdf/QPDFObjectHandle.cc:978-989`）。`getKey()`はreceiverを解決してから辞書値を
+返すため、caller側で別のresolve経路を挟まない。
+
+flpdfの`run_test_19`は、既存のPageDocumentHelper snapshotをmutation後に再取得する
+境界を保持したまま、`last_handle.get_key` / `newpage_handle.get_key`を
+`try_get_key`へ切り替えた。これでqpdfのresolving key accessor責務をcanonical handleへ
+戻し、test 21のshallow-copy error用explicit `Pdf::resolve`は別scopeとして残した。
+qpdf `page_api_1.pdf`の`test 19` outputとflpdf driver outputを比較し、focused unit
+testとsource guardも通過した。case 19は`canonical`へ再分類した。
+
 ### qtest E-28 test 31 lazy null accessor cutover `flpdf-3yn9.48.104` (2026-09-15)
 
 qpdf の `QPDFObjectHandle::isNull()` は public accessor であり、実装は

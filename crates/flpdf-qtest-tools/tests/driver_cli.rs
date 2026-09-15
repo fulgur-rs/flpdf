@@ -1248,6 +1248,11 @@ fn qtest_accessor_cases_do_not_use_explicit_pdf_resolve() {
         "/src/driver/test_10_17.rs"
     ))
     .expect("read middle-driver source");
+    let page_source = fs::read_to_string(concat!(
+        env!("CARGO_MANIFEST_DIR"),
+        "/src/driver/test_18_25.rs"
+    ))
+    .expect("read page-driver source");
     let tree_source = fs::read_to_string(concat!(
         env!("CARGO_MANIFEST_DIR"),
         "/src/driver/test_42_49.rs"
@@ -1335,6 +1340,26 @@ fn qtest_accessor_cases_do_not_use_explicit_pdf_resolve() {
         )
         .contains("root_ref()"),
         "test 16 lost the root_ref identity route retained for its out-of-scope mutation"
+    );
+    let test_19 = section(
+        page_source.as_str(),
+        "pub(crate) fn run_test_19",
+        "pub(crate) fn run_test_20",
+    );
+    assert!(
+        test_19.contains("last_handle.try_get_key(")
+            && test_19.contains("newpage_handle.try_get_key(")
+            && !test_19.contains(".get_key("),
+        "test 19 must use the canonical resolving key accessor for both Contents lookups"
+    );
+    assert!(
+        section(
+            page_source.as_str(),
+            "pub(crate) fn run_test_21",
+            "pub(crate) fn run_test_22",
+        )
+        .contains("pdf.resolve("),
+        "test 21 lost the explicit resolution retained for the shallow-copy error contract"
     );
     assert!(
         section(

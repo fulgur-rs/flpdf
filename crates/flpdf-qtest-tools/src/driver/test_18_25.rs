@@ -113,10 +113,11 @@ pub(crate) fn run_test_19<R: Read + Seek + 'static>(
     // The shallow copy duplicates the page dictionary itself but keeps its
     // indirect `/Contents` reference shared with the original, matching
     // qpdf's `last.getKey("/Contents").getObjGen() ==
-    // newpage.getKey("/Contents").getObjGen()`.
+    // newpage.getKey("/Contents").getObjGen()`. qpdf's public getKey resolves
+    // the receiver first, so use the canonical resolving key accessor here.
     assert_eq!(
-        last_handle.get_key(b"/Contents").object_ref(),
-        newpage_handle.get_key(b"/Contents").object_ref()
+        last_handle.try_get_key(b"/Contents")?.object_ref(),
+        newpage_handle.try_get_key(b"/Contents")?.object_ref()
     );
 
     emit_new_diagnostics(pdf, diagnostics_written, filename, stdout, stderr)?;
@@ -597,6 +598,37 @@ mod test_21_tests {
         .expect_err("test 21 must fail while copying a stream");
 
         assert_eq!(error.to_string(), "stream objects cannot be cloned");
+        assert!(stdout.is_empty());
+        assert!(stderr.is_empty());
+    }
+}
+
+#[cfg(test)]
+mod test_19_tests {
+    use super::run_test_19;
+    use flpdf::{Pdf, PdfOpenOptions};
+
+    #[test]
+    fn duplicate_page_reads_contents_through_resolving_key_accessors() {
+        let mut pdf = Pdf::open_mem_owned_with_options(
+            include_bytes!("../../../../tests/fixtures/json-diff/direct-outlines.pdf").to_vec(),
+            PdfOpenOptions::default(),
+        )
+        .expect("open six-page fixture");
+        let mut stdout = Vec::new();
+        let mut stderr = Vec::new();
+        let mut diagnostics_written = 0;
+
+        run_test_19(
+            &mut pdf,
+            b"direct-outlines.pdf",
+            None,
+            &mut stdout,
+            &mut stderr,
+            &mut diagnostics_written,
+        )
+        .expect("test 19 should complete");
+
         assert!(stdout.is_empty());
         assert!(stderr.is_empty());
     }
