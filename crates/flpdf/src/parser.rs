@@ -841,14 +841,15 @@ impl<I: LiveInput> LiveFileParser<'_, '_, '_, I> {
 
         let is_signature = values
             .get(b"/Type".as_slice())
-            .and_then(ObjectHandle::as_name)
-            .as_deref()
-            == Some(b"Sig".as_slice());
+            .map(|value| value.try_is_name_and_equals(b"Sig"))
+            .transpose()?
+            .unwrap_or(false);
         let has_byte_range = values.contains_key(b"/ByteRange".as_slice());
         let has_string_contents = values
             .get(b"/Contents".as_slice())
-            .and_then(ObjectHandle::as_string)
-            .is_some();
+            .map(ObjectHandle::try_is_string)
+            .transpose()?
+            .unwrap_or(false);
         if is_signature && has_byte_range && has_string_contents {
             if let Some((raw_contents, offset)) = contents {
                 let contents = self.direct_at(ObjectValue::String(raw_contents), offset);
@@ -1198,6 +1199,50 @@ mod live_input_tests {
         }
     }
 
+    struct SignatureProbeDocument {
+        calls: RefCell<Vec<ObjectRef>>,
+    }
+
+    impl DocumentResolver for SignatureProbeDocument {
+        fn resolve_indirect(&self, object_ref: ObjectRef, handle: &ObjectHandle) -> Result<()> {
+            self.calls.borrow_mut().push(object_ref);
+            let value = if object_ref == ObjectRef::new(2, 0) {
+                ObjectValue::Name(b"Sig".to_vec())
+            } else if object_ref == ObjectRef::new(3, 0) {
+                ObjectValue::String(b"indirect".to_vec())
+            } else {
+                return Err(Error::Internal(
+                    "unexpected signature probe reference".into(),
+                ));
+            };
+            handle.set_resolved(value);
+            Ok(())
+        }
+    }
+
+    struct SignatureProbeResolver {
+        resolver: Weak<dyn DocumentResolver>,
+    }
+
+    impl HandleResolver for SignatureProbeResolver {
+        fn indirect_handle(&mut self, object_ref: ObjectRef) -> ObjectHandle {
+            ObjectHandle::new_indirect_with_resolver(object_ref, self.resolver.clone())
+        }
+    }
+
+    fn signature_probe_resolver() -> (SignatureProbeResolver, Rc<SignatureProbeDocument>) {
+        let document = Rc::new(SignatureProbeDocument {
+            calls: RefCell::new(Vec::new()),
+        });
+        let erased: Rc<dyn DocumentResolver> = document.clone();
+        (
+            SignatureProbeResolver {
+                resolver: Rc::downgrade(&erased),
+            },
+            document,
+        )
+    }
+
     struct WarningSink {
         warnings: RefCell<Vec<String>>,
     }
@@ -1432,6 +1477,45 @@ mod live_input_tests {
 
         assert!(matches!(&error, Error::Internal(message) if message == "decrypter failure"));
         assert_eq!(*resolver.events.borrow(), vec!["begin", "end"]);
+    }
+
+    #[test]
+    fn live_file_parser_signature_probe_resolves_an_indirect_type_without_copying_contents() {
+        let mut input =
+            CountingInput::new(b"<< /Type 2 0 R /ByteRange [0 10 20 30] /Contents (cipher) >>");
+        let (mut resolver, document) = signature_probe_resolver();
+        let mut decrypter = RecordingDecrypter {
+            calls: Vec::new(),
+            fail: false,
+        };
+
+        let parsed =
+            parse_live_file_object_with_decrypter(&mut input, &mut resolver, Some(&mut decrypter))
+                .expect("signature dictionary");
+        let values = parsed.value.as_dictionary().expect("dictionary");
+        let contents = values
+            .get(b"/Contents".as_slice())
+            .expect("signature contents");
+
+        assert_eq!(contents.as_string(), Some(b"cipher".to_vec()));
+        assert_eq!(document.calls.borrow().as_slice(), [ObjectRef::new(2, 0)]);
+    }
+
+    #[test]
+    fn live_file_parser_signature_probe_resolves_an_indirect_contents_type() {
+        let mut input = CountingInput::new(b"<< /Type /Sig /ByteRange [] /Contents 3 0 R >>");
+        let (mut resolver, document) = signature_probe_resolver();
+
+        let parsed =
+            parse_live_file_object(&mut input, &mut resolver).expect("signature dictionary");
+        let values = parsed.value.as_dictionary().expect("dictionary");
+        let contents = values
+            .get(b"/Contents".as_slice())
+            .expect("indirect contents");
+
+        assert!(contents.is_resolved());
+        assert_eq!(contents.as_string(), Some(b"indirect".to_vec()));
+        assert_eq!(document.calls.borrow().as_slice(), [ObjectRef::new(3, 0)]);
     }
 
     // This catches a production regression where a completed signature

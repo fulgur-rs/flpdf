@@ -33,3 +33,26 @@ fn parser_dictionary_warnings_use_canonical_raw_key_bytes() {
     }
     assert!(duplicate.contains("key.as_slice()"));
 }
+
+#[test]
+fn parser_signature_probe_uses_type_only_handle_predicates() {
+    let source = parser_source();
+    let finish_dictionary = function_body(&source, "fn finish_dictionary", "fn parse_scalar_token");
+
+    assert!(
+        finish_dictionary.contains("try_is_name_and_equals(b\"Sig\")"),
+        "signature type detection must use the resolving name predicate"
+    );
+    assert!(
+        finish_dictionary.contains("map(ObjectHandle::try_is_string)"),
+        "signature contents detection must use the type-only string predicate"
+    );
+    assert!(
+        !finish_dictionary.contains("and_then(ObjectHandle::as_name)"),
+        "signature type detection must not clone name payloads"
+    );
+    assert!(
+        !finish_dictionary.contains("and_then(ObjectHandle::as_string)"),
+        "signature contents detection must not clone string payloads"
+    );
+}

@@ -29,9 +29,9 @@
 //! [`ObjectHandle::disconnect`] clears the same slot's indirect metadata and
 //! state-sensitive value.
 //!
-//! `QPDFObjectHandle.cc:456-471,759-785,869-955,1027-1039` supplies the
+//! `QPDFObjectHandle.cc:327-471,759-785,869-955,1027-1039` supplies the
 //! name/dictionary/stream/array inspection and live array mutation mirrored
-//! by `try_is_name_and_equals`, `try_is_dictionary_of_type`,
+//! by `try_is_name_and_equals`, `try_is_string`, `try_is_dictionary_of_type`,
 //! `try_is_stream_of_type`, `try_array_len`, `try_array_item`, `set_array_item`, `set_array_items`,
 //! `insert_array_item`, `append_array_item`, and `erase_array_item`.
 //!
@@ -3235,6 +3235,17 @@ impl ObjectHandle {
         }
         self.try_dereference()?;
         Ok(self.as_name().is_some())
+    }
+
+    /// Test whether the resolved value is a string without copying its bytes.
+    /// This mirrors qpdf's `isString`, which dereferences and checks only the
+    /// value type code (`libqpdf/QPDFObjectHandle.cc:327-330,408-410`).
+    pub fn try_is_string(&self) -> Result<bool> {
+        if !self.is_initialized() {
+            return Ok(false);
+        }
+        self.try_dereference()?;
+        Ok(self.with_value(|value| matches!(value, Some(ObjectValue::String(_)))))
     }
 
     /// Test whether the resolved value is a scalar in qpdf's sense: boolean,
@@ -9695,6 +9706,34 @@ pub(crate) mod identity_tests {
         assert!(!handle.is_resolved());
         assert!(handle.try_is_name_and_equals(b"Crypt").unwrap());
         assert!(handle.is_resolved());
+    }
+
+    #[test]
+    fn try_is_string_checks_type_without_copying_and_resolves_indirect_value() {
+        let direct = ObjectHandle::string(vec![b'x'; 4096]);
+        assert!(direct.try_is_string().unwrap());
+        assert!(!ObjectHandle::integer(1).try_is_string().unwrap());
+        assert!(!ObjectHandle::uninitialized().try_is_string().unwrap());
+
+        let (indirect, _resolver) =
+            resolver_bearing_handle(ObjectValue::String(b"indirect".to_vec()));
+        assert!(!indirect.is_resolved());
+        assert!(indirect.try_is_string().unwrap());
+        assert!(indirect.is_resolved());
+    }
+
+    #[test]
+    fn try_is_string_propagates_resolver_errors() {
+        let resolver: Rc<dyn DocumentResolver> = Rc::new(ErrorResolver);
+        let handle = ObjectHandle::new_indirect_with_resolver(
+            ObjectRef::new(23, 0),
+            Rc::downgrade(&resolver),
+        );
+
+        assert_eq!(
+            handle.try_is_string().unwrap_err().to_string(),
+            "resolver failed"
+        );
     }
 
     #[test]
