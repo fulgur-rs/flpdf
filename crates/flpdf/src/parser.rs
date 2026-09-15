@@ -845,11 +845,15 @@ impl<I: LiveInput> LiveFileParser<'_, '_, '_, I> {
             .transpose()?
             .unwrap_or(false);
         let has_byte_range = values.contains_key(b"/ByteRange".as_slice());
-        let has_string_contents = values
-            .get(b"/Contents".as_slice())
-            .map(ObjectHandle::try_is_string)
-            .transpose()?
-            .unwrap_or(false);
+        let has_string_contents = if is_signature && has_byte_range {
+            values
+                .get(b"/Contents".as_slice())
+                .map(ObjectHandle::try_is_string)
+                .transpose()?
+                .unwrap_or(false)
+        } else {
+            false
+        };
         if is_signature && has_byte_range && has_string_contents {
             if let Some((raw_contents, offset)) = contents {
                 let contents = self.direct_at(ObjectValue::String(raw_contents), offset);
@@ -1516,6 +1520,21 @@ mod live_input_tests {
         assert!(contents.is_resolved());
         assert_eq!(contents.as_string(), Some(b"indirect".to_vec()));
         assert_eq!(document.calls.borrow().as_slice(), [ObjectRef::new(3, 0)]);
+    }
+
+    #[test]
+    fn live_file_parser_signature_probe_short_circuits_non_signature_contents_type() {
+        let mut input = CountingInput::new(b"<< /Type /Page /Contents 3 0 R >>");
+        let (mut resolver, document) = signature_probe_resolver();
+
+        let parsed = parse_live_file_object(&mut input, &mut resolver).expect("page dictionary");
+        let values = parsed.value.as_dictionary().expect("dictionary");
+        let contents = values
+            .get(b"/Contents".as_slice())
+            .expect("indirect contents");
+
+        assert!(!contents.is_resolved());
+        assert!(document.calls.borrow().is_empty());
     }
 
     // This catches a production regression where a completed signature
