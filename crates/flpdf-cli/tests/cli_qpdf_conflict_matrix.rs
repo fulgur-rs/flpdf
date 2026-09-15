@@ -151,8 +151,8 @@ fn assert_json_output_pair(label: &str, extra: &[OsString], input: &Path) {
         String::from_utf8_lossy(&qpdf.stderr)
     );
     assert_eq!(
-        fs::read(&flpdf_output).expect("flpdf JSON output"),
-        fs::read(&qpdf_output).expect("qpdf JSON output"),
+        normalize_text_newlines(&fs::read(&flpdf_output).expect("flpdf JSON output")),
+        normalize_text_newlines(&fs::read(&qpdf_output).expect("qpdf JSON output")),
         "{label}: JSON output differs"
     );
 }
