@@ -3375,6 +3375,22 @@ case 31/42/98 の明示 resolve は別の残差である。特に case 42/98 の
 stream dictionary 読み出しは qpdf の public `getDict` に対応する
 flpdf の resolving primitive が未確定のため、本 slice では混ぜない。
 
+### qtest E-28 test 31 lazy null accessor cutover `flpdf-3yn9.48.104` (2026-09-15)
+
+qpdf の `QPDFObjectHandle::isNull()` は public accessor であり、実装は
+`dereference()` 後に `ot_null` を判定する（`include/qpdf/QPDFObjectHandle.hh:318-325`、
+`libqpdf/QPDFObjectHandle.cc:353-356`）。qpdf test 31 も
+`parse(&pdf, "[7 0 R]").getArrayItem(0).isNull()` を呼び、caller が
+`QPDF::resolve` を先に呼ぶ構造ではない（`qpdf/test_driver.cc:1174-1214`）。
+
+flpdf の既存 canonical 実装 `ObjectHandle::try_is_null` を public API
+（`crates/flpdf/src/object_handle.rs:2996-3008`）として公開し、
+`run_test_31` の null item 判定を `try_is_null` へ移した。これにより
+`crates/flpdf-qtest-tools/src/driver/test_26_33.rs::run_test_31` の
+caller-side `Pdf::resolve` はゼロになり、既存の indirect/direct assertion
+と parse error の検証は保持される。case 42/98 の stream dictionary
+`getDict` 相当はこの bounded slice の対象外である。
+
 ### Linearized root ADBE output ownership (`flpdf-3yn9.48.60`)
 
 `linearization/writer.rs::do_write_pass` emits each pass's Catalog through
