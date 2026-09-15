@@ -1961,6 +1961,10 @@ fn one_page_pdf_with_unsupported_stream(content: &[u8]) -> Vec<u8> {
 }
 
 fn assert_json_transform_stdout_matches_qpdf(transform: &str, fixture_name: &str) {
+    assert_json_transform_stdout_matches_qpdf_mode("--json=2", transform, fixture_name);
+}
+
+fn assert_json_transform_stdout_matches_qpdf_mode(mode: &str, transform: &str, fixture_name: &str) {
     if skip_unless_qpdf_11_9() {
         return;
     }
@@ -1968,7 +1972,7 @@ fn assert_json_transform_stdout_matches_qpdf(transform: &str, fixture_name: &str
     let fixture = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
         .join("../../tests/fixtures/compat")
         .join(fixture_name);
-    let args = [transform, "--json=2", "--json-key=qpdf"];
+    let args = [transform, mode, "--json-key=qpdf"];
     let qpdf = ShellCommand::new("qpdf")
         .args(args)
         .arg(&fixture)
@@ -2064,6 +2068,24 @@ fn json_transformations_apply_before_stdout_serialization() {
         "--flatten-annotations=all",
         "form-fields-and-annotations.pdf",
     );
+}
+
+#[test]
+fn json_rotate_angles_apply_before_stdout_serialization() {
+    for mode in ["--json", "--json=2"] {
+        for angle in [90, 180, 270] {
+            let transform = format!("--rotate={angle}");
+            assert_json_transform_stdout_matches_qpdf_mode(mode, &transform, "three-page.pdf");
+        }
+    }
+}
+
+#[test]
+fn json_rotate_angles_apply_before_file_serialization() {
+    for angle in [90, 180, 270] {
+        let transform = format!("--rotate={angle}");
+        assert_json_transform_file_matches_qpdf(&transform, "three-page.pdf");
+    }
 }
 
 #[test]

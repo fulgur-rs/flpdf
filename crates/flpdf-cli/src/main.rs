@@ -4480,6 +4480,17 @@ fn run_json(
     job.set_verbose(cli.verbose);
     configure_top_level_attachment_mutations(&mut job, cli, attachment_segments)?;
 
+    // qpdf applies rotations after page selection and before underlay/overlay
+    // and the remaining create-stage transformations
+    // (`libqpdf/QPDFJob.cc:466-473`). Queue the raw parameters on this job so
+    // every JSON input branch observes the same canonical rotation boundary.
+    {
+        let mut configuration = job.config();
+        for parameter in &cli.page_ops.rotate {
+            configuration.rotate(arg_parser::os_bytes(parameter.as_os_str()))?;
+        }
+    }
+
     if empty {
         let mut pdf = create_empty_primary_document(&mut job, cli.update_from_json.as_deref())?;
         apply_top_level_inspection_transformations(
