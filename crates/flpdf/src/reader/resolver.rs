@@ -5080,6 +5080,12 @@ impl<R: Read + Seek> crate::parser::HandleResolver for ChildHandles<'_, R> {
 }
 
 impl<R: Read + Seek> DocumentResolver for ResolverHandle<R> {
+    fn has_newer_cached_generation(&self, object_gen: QpdfObjGen) -> bool {
+        object_gen
+            .to_object_ref()
+            .is_some_and(|object_ref| ResolverHandle::has_newer_cached_generation(self, object_ref))
+    }
+
     fn source_extents(&self, object_gen: QpdfObjGen) -> SourceExtents {
         self.core
             .borrow()

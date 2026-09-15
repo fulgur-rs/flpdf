@@ -937,3 +937,34 @@ The expanded `cli_qpdf_conflict_matrix.rs` compares the original ten cells, the
 nine remaining cells, and two JSON-output symmetry cells against qpdf 11.9.0,
 including exit status, stdout, stderr, and JSON output bytes. Other
 inspection-route conflict edges remain outside this bounded E-17/E-21 slice.
+
+## E-10 primary document graph retention in distinct-secondary `--pages` (`flpdf-lrm3u`, 2026-09-15)
+
+qpdf keeps the primary `QPDF` as the page-job base while
+`QPDFJob::handlePageSpecs` removes and re-adds pages
+(`libqpdf/QPDFJob.cc:2462-2472`). Its later page loop changes PageLabels and
+AcroForm field ownership, but does not replace the primary Catalog or trailer
+(`libqpdf/QPDFJob.cc:2514-2632`). The writer retains all trailer keys outside
+the exact `getTrimmedTrailer` set, including `/F`, `/FFilter`, and
+`/FDecodeParms`, and enqueues their referenced graph
+(`libqpdf/QPDFWriter.cc:2009-2031,2907-2925`). Direct `/Root` remains a direct
+Catalog value through `getRoot` and `unparseChild`
+(`libqpdf/QPDF.cc:2349-2358`; `libqpdf/QPDFWriter.cc:1144-1155`).
+
+`job/page_merge.rs` owns the fresh-target handoff for this route. It copies
+primary Catalog siblings and root `/Pages` non-structural values through the
+canonical foreign copier, preserves qpdf's trailer key boundary, and restores
+the source direct/indirect `/Root` shape after shared page and AcroForm
+mutations. The `object_copy.rs` reservation boundary removes stale lower
+generation identities only when qpdf's live cache has a newer generation; an
+unrelated absent object remains an indirect null. Generic `merge_documents`
+and the qpdf job consumer retain their separate field-selection boundaries.
+
+The qpdf differential regression
+`crates/flpdf-cli/tests/page_ops_qpdf_matrix.rs::pages_preserves_primary_document_graph_edge_fixtures`
+covers `acroform-sig-parent-pure-widget-kid`,
+`null-visible-preserve-empty-removed`,
+`pages-ext-firstpage-shared-one-page`,
+`trailer-external-file-keys`, and `direct-root-one-page`, plus the existing
+primary metadata test. This is a bounded E-10 primary-graph slice; shared-page
+page loss and ObjStm member-order differences are not folded into it.

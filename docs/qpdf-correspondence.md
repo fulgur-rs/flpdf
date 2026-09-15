@@ -3641,3 +3641,36 @@ configuration before `QPDFJob::run`, so its selected document follows the
 same transformation/inspection order. qpdf 11.9.0 status/stdout/stderr
 differential coverage is in
 `crates/flpdf-cli/tests/cli_inspection_combinations.rs`.
+
+### Multi-source primary document graph retention (`flpdf-lrm3u`, 2026-09-15)
+
+qpdf's `QPDFJob::handlePageSpecs` keeps the primary `QPDF` in place while it
+removes and re-adds the primary pages (`libqpdf/QPDFJob.cc:2462-2472`). The
+same job then updates only selected-page labels and AcroForm field ownership
+(`libqpdf/QPDFJob.cc:2514-2632`). Consequently, the primary Catalog, the
+non-structural values on its root `/Pages` dictionary, and the non-writer-owned
+trailer entries remain part of the writer graph. `QPDFWriter::getTrimmedTrailer`
+removes only `/ID`, `/Encrypt`, `/Prev`, and the seven xref-structural keys;
+`/F`, `/FFilter`, and `/FDecodeParms` are retained and enqueued
+(`libqpdf/QPDFWriter.cc:2009-2031,2907-2925`). A direct trailer `/Root` is
+also emitted directly by `unparseChild` rather than being promoted to an
+indirect Catalog (`libqpdf/QPDF.cc:2349-2358`; `libqpdf/QPDFWriter.cc:1144-1155`).
+
+flpdf's fresh `Pdf::empty()` merge target now copies the primary root
+`/Pages` non-structural graph through `object_copy::copy_foreign_value`, aligns
+the page-merge trailer skip list with qpdf, and restores a direct primary
+`/Root` shape after the shared Catalog mutation boundary. The field-map snapshot
+is taken after Catalog copying only for the qpdf job consumer; the generic
+`merge_documents` path keeps its page-graph-only field selection semantics.
+Foreign-copy reservation distinguishes a null lower generation superseded by a
+newer cached generation from a genuinely absent object, matching qpdf's
+`removeObject` identity cleanup (`libqpdf/QPDF.cc:710-718,1996-2005`). No legacy
+closure bridge or qpdf-deviation marker was added.
+
+`crates/flpdf-cli/tests/page_ops_qpdf_matrix.rs::pages_preserves_primary_document_graph_edge_fixtures`
+compares qpdf 11.9.0 with flpdf for the four original fixtures plus
+`direct-root-one-page`, including Catalog `/AcroForm` and `/Candidates`, root
+`/Pages /Ext`, trailer external-file keys, and direct `/Root`. The sweep is
+bounded to primary document-graph retention; the unrelated
+`null-visible-stale-generation-objstm` member-order difference and the
+`flpdf-x267z` page-count issue remain separate.

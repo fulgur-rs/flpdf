@@ -120,6 +120,67 @@ fn wire_primary_catalog<RS: Read + Seek, RT: Read + Seek>(
     Ok(())
 }
 
+/// Copy the primary root `/Pages` dictionary's non-structural values into the
+/// fresh target root. qpdf keeps this root in place while `removePage` and
+/// `addPage` replace only `/Kids` and `/Count`; unknown root keys therefore
+/// remain visible to the writer (`QPDF_pages.cc:166-177,239-250`).
+fn wire_primary_pages_root<RS: Read + Seek, RT: Read + Seek>(
+    source: &mut Pdf<RS>,
+    target: &mut Pdf<RT>,
+    source_id: u64,
+    target_pages_ref: ObjectRef,
+) -> Result<()> {
+    let source_catalog = source.root_handle()?;
+    let source_pages = source_catalog.try_get_key(b"/Pages")?;
+    source_pages.try_dereference()?;
+    let target_pages = target.get_object_handle(target_pages_ref);
+    target_pages.try_dereference()?;
+
+    for key in source_pages.try_get_keys()? {
+        if matches!(
+            key.as_slice(),
+            b"/Type"
+                | b"/Parent"
+                | b"/Kids"
+                | b"/Count"
+                | b"/MediaBox"
+                | b"/CropBox"
+                | b"/Resources"
+                | b"/Rotate"
+        ) {
+            continue;
+        }
+        let value = source_pages.try_get_key(&key)?;
+        let copied = target.copy_foreign_value(source_id, &value)?;
+        target_pages.replace_key(&key, copied)?;
+    }
+    Ok(())
+}
+
+/// Preserve a direct primary trailer `/Root` after the fresh target has
+/// finished its Catalog mutations. qpdf writes a direct Catalog value
+/// directly from the trailer, while `Pdf::empty()` starts with an indirect
+/// Catalog; remove that temporary target slot so preserve-unreferenced cannot
+/// emit an extra unreachable Catalog (`QPDF.cc:2349-2358`; `QPDFWriter.cc:
+/// 1144-1155,2907-2925`).
+fn preserve_primary_root_shape<RS: Read + Seek, RT: Read + Seek>(
+    source: &mut Pdf<RS>,
+    target: &mut Pdf<RT>,
+) -> Result<()> {
+    if source.root_ref().is_some() {
+        return Ok(());
+    }
+    let temporary_root_ref = target.root_ref();
+    let target_root = target.root_handle()?;
+    target_root.try_dereference()?;
+    let direct_root = target_root.shallow_copy()?;
+    target.trailer().replace_key(b"/Root", direct_root)?;
+    if let Some(temporary_root_ref) = temporary_root_ref {
+        target.remove_object_handle(temporary_root_ref)?;
+    }
+    Ok(())
+}
+
 /// Copy the primary trailer's non-writer-owned values through the same
 /// persistent foreign copier. qpdf rebuilds `/Root`, `/Size`, encryption,
 /// and xref-history keys at the writer boundary; `/Info`, `/ID`, and unknown
@@ -151,9 +212,6 @@ fn wire_primary_trailer<RS: Read + Seek, RT: Read + Seek>(
                 | b"/Length"
                 | b"/Filter"
                 | b"/DecodeParms"
-                | b"/F"
-                | b"/FFilter"
-                | b"/FDecodeParms"
         ) {
             continue;
         }
@@ -1332,7 +1390,7 @@ fn merge_documents_with_resource_decisions_and_preserve_primary_into_impl<
                     .push((page_ref, new_objects));
             }
         }
-        let page_copy_map =
+        let page_copy_map_before_catalog =
             project_foreign_object_map(&target.foreign_object_map_snapshot(source_id));
         // qpdf keeps the primary Catalog and trailer in the same QPDF while
         // `handlePageSpecs` mutates its page tree. Copy their values through
@@ -1341,8 +1399,14 @@ fn merge_documents_with_resource_decisions_and_preserve_primary_into_impl<
         // a legacy Object snapshot.
         if is_primary {
             wire_primary_catalog(input.source, &mut target, source_id)?;
+            wire_primary_pages_root(input.source, &mut target, source_id, pages_root_ref)?;
             wire_primary_trailer(input.source, &mut target, source_id)?;
         }
+        let page_copy_map = if is_primary && defer_foreign_acroform_fields {
+            project_foreign_object_map(&target.foreign_object_map_snapshot(source_id))
+        } else {
+            page_copy_map_before_catalog
+        };
 
         // `--preserve-unreferenced` mirrors qpdf's writer-side
         // `enqueueObjectsStandard` over the primary's complete live object
@@ -1592,6 +1656,8 @@ fn merge_documents_with_resource_decisions_and_preserve_primary_into_impl<
             .page_labels()
             .write_reconstructed_labels_raw(&copied)?;
     }
+
+    preserve_primary_root_shape(inputs[0].source, &mut target)?;
 
     Ok(target)
 }

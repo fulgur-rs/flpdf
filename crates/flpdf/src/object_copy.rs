@@ -336,6 +336,13 @@ impl<R: Read + Seek + 'static> ForeignObjectCopier<'_, R> {
     #[allow(deprecated)]
     fn reserve_objects_inner(&mut self, foreign: ObjectHandle, top: bool) -> Result<()> {
         foreign.try_dereference()?;
+        if !top && foreign.is_null() && foreign.has_newer_cached_generation() {
+            // qpdf's xref-chain cleanup removes a lower generation's cached
+            // object and clears its identity (`QPDF.cc:710-718,1996-2005`).
+            // The corresponding array element is therefore a direct null;
+            // do not reserve the stale raw identity in the destination map.
+            return Ok(());
+        }
         if foreign.is_reserved() {
             return Err(Error::System(
                 "QPDF: attempting to copy a foreign reserved object".to_owned(),
