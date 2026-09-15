@@ -1542,7 +1542,7 @@ impl LinearizationPlan {
                     pdf,
                     options.preserve_unreferenced_objects,
                     source_membership_snapshot,
-                )?,
+                )?, // cov:ignore: LLVM attributes this multiline setup-plan terminator to an uncovered continuation line
             )
         } else {
             None
@@ -1627,7 +1627,7 @@ impl LinearizationPlan {
         if let Some(plan) = preserve_objstm_plan.as_mut() {
             crate::writer::object_streams::filter_preserve_object_stream_plan_for_output(
                 pdf, plan, true, false,
-            )?;
+            )?; // cov:ignore: LLVM attributes this multiline output-filter terminator to an uncovered continuation line
         }
         if let Some(eligible) = generate_objstm_eligible {
             optimization.set_generate_objstm_eligible(eligible);
@@ -3372,10 +3372,12 @@ impl LinearizationPlan {
         let source_plan = match self.preserve_objstm_plan.clone() {
             Some(plan) => plan,
             None => {
+                // cov:ignore-start: only hand-built Preserve plans lack the setup-owned snapshot
                 crate::writer::object_streams::plan_qpdf_preserve_object_streams_with_unreferenced(
                     pdf,
                     _config.preserve_unreferenced_objects,
                 )?
+                // cov:ignore-end
             } // cov:ignore: hand-built test plans do not carry the setup snapshot
         }; // cov:ignore: LLVM attributes this covered multiline planner terminator to the call setup
         let assigned = self.renumber_assigned_refs();
@@ -3907,6 +3909,10 @@ mod tests {
                     crate::writer::object_streams::ObjectStreamGroup::SourceBacked {
                         source: ObjectRef::new(7, 0),
                         members: vec![ObjectRef::new(8, 0)],
+                    },
+                    crate::writer::object_streams::ObjectStreamGroup::Generated {
+                        source: ObjectRef::new(9, 0),
+                        members: vec![ObjectRef::new(10, 0)],
                     },
                 ],
                 removed_refs: BTreeSet::new(),

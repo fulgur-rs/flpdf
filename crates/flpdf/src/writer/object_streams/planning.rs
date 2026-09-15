@@ -274,11 +274,12 @@ pub(crate) fn filter_preserve_object_stream_plan_for_output<R: std::io::Read + s
                 batches.push(members);
                 source_containers.push(Some(source));
             }
+            // cov:ignore-start: this Preserve-only helper rejects a generated group as an internal invariant
             ObjectStreamGroup::Generated { source, .. } => {
                 return Err(crate::Error::Internal(format!(
                     "Preserve plan contains generated ObjStm source {source}"
                 )));
-            }
+            } // cov:ignore-end
         }
     }
     filter_objstm_batches_for_output(
@@ -287,7 +288,7 @@ pub(crate) fn filter_preserve_object_stream_plan_for_output<R: std::io::Read + s
         &mut source_containers,
         output_linearized,
         output_encrypted,
-    )?;
+    )?; // cov:ignore: LLVM attributes this multiline output-filter terminator to an uncovered continuation line
     plan.groups = batches
         .into_iter()
         .zip(source_containers)
