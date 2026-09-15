@@ -1766,7 +1766,7 @@ impl LinearizationPlan {
                     pdf,
                     true,
                     &skipped_raw_stream_parameter_streams,
-                )?
+                )? // cov:ignore: LLVM maps the covered fallback call's Result terminator to a zero-count continuation line
             };
         let object_refs = pdf.canonical_object_refs();
         let mut all_refs: Vec<ObjectRef> = Vec::with_capacity(object_refs.len());
