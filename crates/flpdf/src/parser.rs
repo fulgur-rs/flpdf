@@ -1252,6 +1252,19 @@ mod live_input_tests {
         )
     }
 
+    #[test]
+    fn signature_probe_document_covers_indirect_string_and_unknown_reference() {
+        let (mut resolver, _document) = signature_probe_resolver();
+        let indirect_string = resolver.indirect_handle(ObjectRef::new(3, 0));
+        assert!(indirect_string.try_is_string().unwrap());
+
+        let unknown = resolver.indirect_handle(ObjectRef::new(99, 0));
+        assert_eq!(
+            unknown.try_is_string().unwrap_err().to_string(),
+            "unexpected signature probe reference"
+        );
+    }
+
     struct WarningSink {
         warnings: RefCell<Vec<String>>,
     }
