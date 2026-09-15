@@ -1409,7 +1409,7 @@ fn qtest_accessor_cases_do_not_use_explicit_pdf_resolve() {
     let test_87 = section(
         late_80_87_source.as_str(),
         "pub(crate) fn run_test_87",
-        "\n}\n",
+        "\n}",
     );
     assert!(
         test_87.contains("dict.try_get_keys()?")
