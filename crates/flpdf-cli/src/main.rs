@@ -4106,6 +4106,14 @@ fn run_top_level_page_selection_inspection(
     job.set_verbose(args.verbose);
     configure_top_level_inspection_job(&mut job, args)?;
     configure_cli_overlay_specs(&mut job, overlay_specs)?;
+    if args.show_attachment.is_some() {
+        // qpdf reserves the save pipeline inside checkConfiguration
+        // (`QPDFJob.cc:621-626`), before any page-selection or mutation info
+        // output can claim standard output. The attachment report repeats the
+        // idempotent reservation, but it must not be the first call after an
+        // earlier info report.
+        job.logger().save_to_standard_output(true)?;
+    }
     configure_top_level_attachment_mutations(&mut job, args, attachment_segments)?;
     configure_top_level_inspection_transformations(
         &mut job,
