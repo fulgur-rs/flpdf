@@ -3125,11 +3125,18 @@ fn compute_byte_lengths(
 /// Generate containers have fresh high object numbers and therefore sort at the
 /// end of their group. Preserve containers retain their source ObjGen and may
 /// precede a plain object in the same group.
-fn part7_owner_for_plan(plan: &LinearizationPlan, member: ObjectRef) -> Option<usize> {
+fn part7_owner_for_plan(
+    plan: &LinearizationPlan,
+    member: ObjectRef,
+    source_container_by_member: &BTreeMap<u32, u32>,
+) -> Option<usize> {
+    // qpdf's Preserve source membership is captured during writer setup and
+    // consumed by linearization; do not reconstruct the complete relation from
+    // the filtered plan for each Part-7 member.
     if let Some(optimization) = plan.optimization.as_ref() {
-        let owner = plan
-            .preserve_source_membership()
-            .and_then(|membership| membership.get(&member.number).copied())
+        let owner = source_container_by_member
+            .get(&member.number)
+            .copied()
             .map(|source| ObjectRef::new(source, 0))
             .unwrap_or(member);
         return optimization
@@ -3156,7 +3163,18 @@ type SecondHalfPlainObject = (QpdfObjGen, SecondHalfPlainRank);
 fn second_half_container_anchors(
     plan: &LinearizationPlan,
     part4_batches: &[RoutedObjStmBatch],
+    source_container_by_member: &BTreeMap<u32, u32>,
 ) -> Vec<SecondHalfContainerAnchor> {
+    let fallback_source_membership = if source_container_by_member.is_empty() {
+        plan.preserve_source_membership().unwrap_or_default()
+    } else {
+        BTreeMap::new()
+    };
+    let source_container_by_member = if source_container_by_member.is_empty() {
+        &fallback_source_membership
+    } else {
+        source_container_by_member
+    };
     let member_set: BTreeSet<QpdfObjGen> = part4_batches
         .iter()
         .flat_map(|batch| batch.members.iter().copied())
@@ -3346,7 +3364,9 @@ fn second_half_container_anchors(
                     let owner = batch
                         .members
                         .iter()
-                        .find_map(|member| part7_owner_for_plan(plan, *member))
+                        .find_map(|member| {
+                            part7_owner_for_plan(plan, *member, source_container_by_member)
+                        })
                         .expect("Part-7 ObjStm route must have one non-first-page owner");
                     (0, owner, 1, object_number)
                 }
@@ -3398,12 +3418,20 @@ fn second_half_container_anchors(
 
 fn preserved_source_container_number(
     container: &ObjStmContainer,
-    source_container_by_member: &BTreeMap<ObjectRef, u32>,
+    source_container_by_member: &BTreeMap<u32, u32>,
 ) -> Result<u32> {
     let source_container_number = container
         .members
         .first()
-        .and_then(|(original_ref, _)| source_container_by_member.get(original_ref).copied())
+        .and_then(|(original_ref, _)| {
+            (original_ref.generation == 0)
+                .then(|| {
+                    source_container_by_member
+                        .get(&original_ref.number)
+                        .copied()
+                })
+                .flatten()
+        })
         .ok_or_else(|| {
             crate::Error::Unsupported(format!(
                 "preserved ObjStm container {} has no source container",
@@ -3411,7 +3439,11 @@ fn preserved_source_container_number(
             ))
         })?;
     if container.members.iter().any(|(original_ref, _)| {
-        source_container_by_member.get(original_ref).copied() != Some(source_container_number)
+        original_ref.generation != 0
+            || source_container_by_member
+                .get(&original_ref.number)
+                .copied()
+                != Some(source_container_number)
     }) {
         return Err(crate::Error::Unsupported(format!(
             "preserved ObjStm container {} combines multiple source containers",
@@ -3655,10 +3687,10 @@ fn write_linearized_impl<R: Read + Seek>(
         generated_compressible: _,
         generated_object_stream_sources: _,
     } = setup;
-    let source_container_by_member: BTreeMap<ObjectRef, u32> = source_object_stream_data
-        .into_iter()
-        .map(|(member, stream)| (ObjectRef::new(member, 0), stream))
-        .collect();
+    // Keep qpdf's setup-owned object-number mapping directly. The previous
+    // ObjectRef-keyed conversion allocated a second relation before the
+    // linearization consumers used it.
+    let source_container_by_member = source_object_stream_data;
     let deterministic_id = crate::writer::uses_deterministic_id(options);
 
     // Finalize the file identifier exactly once here — before the plan/
@@ -3828,8 +3860,11 @@ fn write_linearized_impl<R: Read + Seek>(
     // page's group, a part8 container after the last part8 plain object, etc.
     // `None` (no preceding plain) appends after all plain — equivalent when the
     // container's group is the last one (the single-second-half-container case).
-    let second_half_anchors =
-        second_half_container_anchors(plan, &resolved_batch_plan.part4_batches);
+    let second_half_anchors = second_half_container_anchors(
+        plan,
+        &resolved_batch_plan.part4_batches,
+        &source_container_by_member,
+    );
     let part4_members: Vec<Vec<ObjectRef>> = resolved_batch_plan
         .part4_batches
         .iter()
@@ -4328,6 +4363,7 @@ fn write_linearized_impl<R: Read + Seek>(
         plan,
         renumber,
         objstm_layout: &objstm_layout,
+        source_container_by_member: &source_container_by_member,
         container_shared_sort_key: &container_shared_sort_key,
         pass1_output: &pass1_output,
         hint_stream_new_num,
@@ -4644,6 +4680,7 @@ struct HintStreamBuildInput<'a> {
     plan: &'a LinearizationPlan,
     renumber: &'a RenumberMap,
     objstm_layout: &'a ObjStmLayout,
+    source_container_by_member: &'a BTreeMap<u32, u32>,
     container_shared_sort_key: &'a BTreeMap<u32, (u8, u32)>,
     pass1_output: &'a LinearizedPassOutput,
     hint_stream_new_num: u32,
@@ -4668,6 +4705,7 @@ fn build_hint_stream_from_pass1(input: &HintStreamBuildInput<'_>) -> Result<Vec<
     let plan = input.plan;
     let renumber = input.renumber;
     let objstm_layout = input.objstm_layout;
+    let source_container_by_member = input.source_container_by_member;
     let container_shared_sort_key = input.container_shared_sort_key;
     let pass1_output = input.pass1_output;
     let hint_stream_new_num = input.hint_stream_new_num;
@@ -4757,6 +4795,7 @@ fn build_hint_stream_from_pass1(input: &HintStreamBuildInput<'_>) -> Result<Vec<
     let non_page_owned = crate::linearization::hint_page::non_page_owned_containers(
         plan,
         &objstm_layout.member_to_container,
+        source_container_by_member,
     );
     let plain_byte_len = |orig: &ObjectRef| -> u64 {
         renumber
@@ -4861,13 +4900,14 @@ fn build_hint_stream_from_pass1(input: &HintStreamBuildInput<'_>) -> Result<Vec<
     // ------------------------------------------------------------------
     // Patch hint tables.
     // ------------------------------------------------------------------
-    let mut po_table = PageOffsetHintTable::from_plan(
+    let mut po_table = PageOffsetHintTable::from_plan_with_source_membership(
         plan,
         renumber,
         &objstm_layout.member_to_container,
         container_shared_sort_key,
         second_half_container_nums,
         open_document_container_nums,
+        source_container_by_member,
     );
     let mut so_table = SharedObjectHintTable::from_plan(
         plan,
@@ -5123,8 +5163,77 @@ mod tests {
             ..LinearizationPlan::default()
         };
 
-        assert_eq!(part7_owner_for_plan(&plan, member), Some(1));
-        assert_eq!(part7_owner_for_plan(&plan, other), None);
+        let source_membership = BTreeMap::new();
+        assert_eq!(
+            part7_owner_for_plan(&plan, member, &source_membership),
+            Some(1)
+        );
+        assert_eq!(part7_owner_for_plan(&plan, other, &source_membership), None);
+    }
+
+    #[test]
+    fn part7_owner_prefers_setup_membership_over_plan_reconstruction() {
+        let member = ObjectRef::new(7, 0);
+        let setup_source = ObjectRef::new(70, 0);
+        let plan_source = ObjectRef::new(71, 0);
+        let mut optimization = crate::optimization::Optimization::default();
+        optimization.record_for_test(crate::optimization::ObjectUser::Page(2), setup_source);
+        let plan = LinearizationPlan {
+            optimization: Some(optimization),
+            preserve_objstm_plan: Some(crate::writer::object_streams::ObjectStreamPlan {
+                groups: vec![
+                    crate::writer::object_streams::ObjectStreamGroup::SourceBacked {
+                        source: plan_source,
+                        members: vec![member],
+                    },
+                ],
+                removed_refs: BTreeSet::new(),
+                source_membership_present: true,
+            }),
+            ..LinearizationPlan::default()
+        };
+        let source_membership = BTreeMap::from([(member.number, setup_source.number)]);
+
+        assert_eq!(
+            part7_owner_for_plan(&plan, member, &source_membership),
+            Some(2)
+        );
+    }
+
+    #[test]
+    fn preserve_setup_membership_covers_filtered_plan_members() {
+        let mut pdf = Pdf::open(Cursor::new(include_bytes!(
+            "../../../../tests/fixtures/compat/objstm-lin-cap-boundary-199-bearing.pdf"
+        )))
+        .expect("open Preserve ObjStm fixture");
+        let options = WriterOptions {
+            object_streams: crate::writer::ObjectStreamMode::Preserve,
+            ..WriterOptions::default()
+        };
+        let setup =
+            crate::writer::build_writer_setup(&mut pdf, &options).expect("build writer setup");
+        let plan = LinearizationPlan::from_pdf_with_writer_options_and_source_membership(
+            &mut pdf,
+            &options,
+            Some(&setup.source_object_stream_data),
+            None,
+        )
+        .expect("build Preserve linearization plan");
+
+        let preserve_plan = plan
+            .preserve_objstm_plan
+            .as_ref()
+            .expect("fixture must retain source ObjStm groups");
+        for group in &preserve_plan.groups {
+            if let crate::writer::object_streams::ObjectStreamGroup::SourceBacked {
+                members, ..
+            } = group
+            {
+                assert!(members
+                    .iter()
+                    .all(|member| setup.source_object_stream_data.contains_key(&member.number)));
+            } // cov:ignore: LLVM attributes this test-only if-let terminator to an uncovered continuation line
+        }
     }
 
     #[test]
@@ -5162,7 +5271,7 @@ mod tests {
             source_container_number: None,
         }];
 
-        let anchors = second_half_container_anchors(&plan, &batches);
+        let anchors = second_half_container_anchors(&plan, &batches, &BTreeMap::new());
         assert_eq!(
             anchors,
             vec![SecondHalfContainerAnchor::After(QpdfObjGen::new(2, 0))]
@@ -5193,7 +5302,7 @@ mod tests {
             },
         ];
 
-        let anchors = second_half_container_anchors(&plan, &batches);
+        let anchors = second_half_container_anchors(&plan, &batches, &BTreeMap::new());
         assert_eq!(
             anchors,
             vec![
@@ -5227,6 +5336,7 @@ mod tests {
             plan: &plan,
             renumber: &renumber,
             objstm_layout: &ObjStmLayout::default(),
+            source_container_by_member: &BTreeMap::new(),
             container_shared_sort_key: &container_shared_sort_key,
             pass1_output: &pass1_output,
             hint_stream_new_num: 2,
