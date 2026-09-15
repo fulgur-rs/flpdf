@@ -8784,6 +8784,7 @@ pub(crate) mod identity_tests {
     #[test]
     fn source_extents_defaults_to_qpdf_unset_for_context_only_resolvers() {
         assert_eq!(SourceExtents::default(), SourceExtents::UNSET);
+        assert!(!ObjectHandle::integer(1).has_newer_cached_generation());
 
         let resolver: Rc<dyn DocumentResolver> = Rc::new(RecordingResolver::default());
         assert!(!resolver.has_newer_cached_generation(QpdfObjGen::new(1, 0)));

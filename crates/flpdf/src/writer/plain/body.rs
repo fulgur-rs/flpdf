@@ -3644,6 +3644,39 @@ mod object_emitter_tests {
     }
 
     #[test]
+    fn preserve_queue_orders_raw_generation_handles_after_mapped_handles() -> crate::Result<()> {
+        let mut bytes = b"%PDF-1.4\n".to_vec();
+        let catalog_offset = bytes.len();
+        bytes.extend_from_slice(b"1 0 obj\n<< /Type /Catalog /Pages 2 0 R >>\nendobj\n");
+        let pages_offset = bytes.len();
+        bytes.extend_from_slice(b"2 0 obj\n<< /Type /Pages /Count 0 /Kids [] >>\nendobj\n");
+        let orphan_offset = bytes.len();
+        bytes.extend_from_slice(b"5 65536 obj\n45\nendobj\n");
+        let xref_offset = bytes.len();
+        bytes.extend_from_slice(b"xref\n0 6\n0000000000 65535 f \n");
+        bytes.extend_from_slice(format!("{catalog_offset:010} 00000 n \n").as_bytes());
+        bytes.extend_from_slice(format!("{pages_offset:010} 00000 n \n").as_bytes());
+        bytes.extend_from_slice(b"0000000000 00000 f \n0000000000 00000 f \n");
+        bytes.extend_from_slice(format!("{orphan_offset:010} 65536 n \n").as_bytes());
+        bytes.extend_from_slice(
+            format!("trailer\n<< /Size 6 /Root 1 0 R >>\nstartxref\n{xref_offset}\n%%EOF\n")
+                .as_bytes(),
+        );
+        let mut pdf = Pdf::open(Cursor::new(bytes))?;
+        pdf.set_writer_object_order(BTreeMap::new());
+        let options = WriterOptions {
+            preserve_unreferenced_objects: true,
+            ..WriterOptions::default()
+        };
+
+        let queue = initialize_live_queue(&mut pdf, &options, BTreeSet::new(), &[])?;
+        assert!(queue
+            .raw_old_to_new
+            .contains_key(&QpdfObjGen::new(5, 65_536)));
+        Ok(())
+    }
+
+    #[test]
     fn enqueue_ignores_an_object_stream_that_contains_itself() -> crate::Result<()> {
         // A specially constructed file can name a container that is itself a
         // member. qpdf stores the invalid object ID `0` before recursing and

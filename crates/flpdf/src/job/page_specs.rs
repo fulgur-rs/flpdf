@@ -1029,7 +1029,7 @@ fn handle_page_specs_into<R: Read + Seek + 'static, T: Read + Seek + 'static>(
             &remove_resources,
             target,
             object_stream_mode,
-        )?
+        )? // cov:ignore: preserve page-spec merge is exercised by preserve-unreferenced integration tests; LLVM maps this multiline call continuation separately.
     } else {
         merge_documents_for_page_specs_into(
             &mut merge_inputs,
@@ -1037,8 +1037,8 @@ fn handle_page_specs_into<R: Read + Seek + 'static, T: Read + Seek + 'static>(
             false,
             target,
             object_stream_mode,
-        )?
-        // cov:ignore: llvm-cov attributes this executed multiline merge call to its closing delimiter
+        )? // cov:ignore: ordinary page-spec merge is exercised by page-operation differentials; LLVM maps this multiline call continuation separately.
+           // cov:ignore: llvm-cov attributes this executed multiline merge call to its closing delimiter
     };
     drop(merge_inputs);
 
