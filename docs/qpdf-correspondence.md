@@ -1138,11 +1138,13 @@ flpdf の `second_half_container_anchors` は、second-half batch だけでな�
 と first-half を含む全 routed ObjStm member set を plain anchor 候補から除外する。
 これにより encrypted input の Generate でも、page-private container はその page の
 plain object の直後に採番・出力され、page-offset hint が `lengthNextN` と一致する。
-`objstm-lin-disc-2-250-2.pdf` を qpdf 11.9.0 で暗号化した回帰は RC4-128 の top-level/
-rewrite 両 surface で `qpdf --check-linearization` の warning なしを確認し、暗号化なしの
-Generate、既存の ObjStm byte-parity、Part 7/8、multiple-container、progress/sink error
-経路は変更しない。これは qpdf の既存 user/part precedence を補うもので、
-qpdf-deviation marker は追加しない。
+`objstm-lin-disc-2-250-2.pdf` を qpdf 11.9.0 で暗号化した回帰は RC4-128、AES-128、
+AES-256 の各方式で top-level/rewrite 両 surfaceを通し、`qpdf --check-linearization` の
+warning なしを確認する。対象 fixture の最終 live audit では、固定 ID/IV の qpdf 出力と
+flpdf 出力が 3 方式・2 surface の全 6 組で byte-identical になり、暗号化なしの Generate、
+既存の ObjStm byte-parity、Part 7/8、multiple-container、progress/sink error 経路は
+変更しない。これは qpdf の既存 user/part precedence を補うもので、qpdf-deviation marker
+は追加しない。
 
 ### Linearized raw identity follow-ups (`flpdf-pwyo2`, 2026-09-15)
 
