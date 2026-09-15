@@ -273,9 +273,11 @@ pub(crate) fn run_test_73<R: Read + Seek>(
         }
     };
     let pages_seed = root.try_get_key(b"/Pages")?;
-    let pages = resolve_once(pdf, &pages_seed)?;
+    // qpdf's unparseResolved owns the receiver dereference after getKey
+    // (`libqpdf/QPDFObjectHandle.cc:1586-1593`); do not add the qpdf-less
+    // Pdf::resolve hop that this consumer used to perform.
+    let _ = pages_seed.try_unparse_resolved()?;
     emit_new_diagnostics(pdf, diagnostics_written, filename, stdout, stderr)?;
-    let _ = pages.unparse_resolved();
     Ok(())
 }
 
@@ -893,6 +895,40 @@ mod tests {
             stderr,
             b"getRoot: attempted to dereference an uninitialized QPDFObjectHandle\n\
 WARNING: closed input source: object 1/0: error reading object: QPDF operation attempted on a QPDF object with no input source. QPDF operations are invalid before processFile (or another process method) or after closeInputSource\n"
+        );
+    }
+
+    #[test]
+    fn test_73_unparse_resolved_uses_cached_pages_after_input_close() {
+        let mut pdf = minimal_pdf();
+        let root = pdf
+            .root_handle()
+            .expect("resolve root before closing input");
+        let pages = root
+            .try_get_key(b"/Pages")
+            .expect("get /Pages before closing input");
+        pages
+            .try_unparse_resolved()
+            .expect("resolve /Pages before closing input");
+        pdf.close_input_source();
+
+        let mut stdout = Vec::new();
+        let mut stderr = Vec::new();
+        let mut diagnostics_written = 0;
+        run_test_73(
+            &mut pdf,
+            b"minimal-cached.pdf",
+            None,
+            &mut stdout,
+            &mut stderr,
+            &mut diagnostics_written,
+        )
+        .expect("cached root and pages should let unparseResolved complete");
+
+        assert!(stdout.is_empty());
+        assert_eq!(
+            stderr,
+            b"getRoot: attempted to dereference an uninitialized QPDFObjectHandle\n"
         );
     }
 
