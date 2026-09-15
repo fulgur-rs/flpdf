@@ -757,7 +757,6 @@ pub(crate) fn run_test_98<R: Read + Seek>(
 
     for i in 1..=6 {
         let oh = pdf.get_object_handle(ObjectRef::new(i, 0));
-        pdf.resolve(&oh)?;
 
         let mut written = Vec::new();
         {
@@ -783,10 +782,7 @@ pub(crate) fn run_test_98<R: Read + Seek>(
     }
 
     let stream = pdf.get_object_handle(ObjectRef::new(4, 0));
-    pdf.resolve(&stream)?;
-    let dict = stream
-        .as_stream_dict()
-        .expect("minimal.pdf object 4 is the page's content stream");
+    let dict = stream.try_get_stream_dict()?;
     dict.replace_key(b"/Test", ObjectHandle::integer(42))?;
 
     let json = stream

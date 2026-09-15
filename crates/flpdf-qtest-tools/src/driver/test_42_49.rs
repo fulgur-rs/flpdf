@@ -54,16 +54,11 @@ pub(crate) fn run_test_42<R: Read + Seek>(
     // so copied handles stay stable and later positions use fresh `current()`
     // calls.
     let qtest = pdf.trailer_key_handle(b"QTest");
-    pdf.resolve(&qtest)?;
     let qtest = qtest.clone();
-    let dictionary = qtest.get_key(b"/Dictionary");
-    pdf.resolve(&dictionary)?;
-    let dictionary = dictionary.clone();
-    let key2 = dictionary.get_key(b"/Key2");
-    pdf.resolve(&key2)?;
+    let dictionary = qtest.try_get_key(b"/Dictionary")?;
+    let key2 = dictionary.try_get_key(b"/Key2")?;
     let array = key2.clone();
-    let integer = qtest.get_key(b"/Integer");
-    pdf.resolve(&integer)?;
+    let integer = qtest.try_get_key(b"/Integer")?;
 
     assert!(array.try_is_array()?);
     {
@@ -216,13 +211,8 @@ pub(crate) fn run_test_42<R: Read + Seek>(
         .next()
         .expect("qpdf test_42 requires one page");
     let page = pdf.get_object_handle(page_ref);
-    pdf.resolve(&page)?;
     let contents = page.try_get_key(b"/Contents")?;
-    pdf.resolve(&contents)?;
-    let stream_dictionary = contents
-        .as_stream_dict()
-        .expect("qpdf test_42 requires a stream contents object");
-    pdf.resolve(&stream_dictionary)?;
+    let stream_dictionary = contents.try_get_stream_dict()?;
     assert_eq!(
         stream_dictionary.try_get_key(b"/Potato")?.try_get_name()?,
         b"/QPDFFakeName"
