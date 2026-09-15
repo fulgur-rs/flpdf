@@ -1447,10 +1447,14 @@ fn raw_part2_objects_for_hints(
 }
 
 impl LinearizationPlan {
-    /// Return the setup-owned, output-filtered Preserve member-to-container
-    /// mapping in the same object-number form consumed by qpdf's
-    /// `object_to_object_stream_no_gen` map.
-    #[allow(dead_code)]
+    /// Return the Preserve member-to-container mapping for a manually
+    /// constructed plan.
+    ///
+    /// Production plans use the setup-owned source membership map passed by
+    /// the writer. This allocation is only the bounded fallback for plans
+    /// that do not have that setup snapshot, and deliberately preserves the
+    /// old object-number-only lookup behavior (qpdf's existing ObjStm members
+    /// are generation zero).
     pub(crate) fn preserve_source_membership(&self) -> Option<BTreeMap<u32, u32>> {
         let plan = self.preserve_objstm_plan.as_ref()?;
         let mut membership = BTreeMap::new();
@@ -4083,6 +4087,33 @@ mod tests {
         assert_eq!(
             plan.preserve_source_membership(),
             Some(BTreeMap::from([(2, 1), (3, 1), (8, 7)]))
+        );
+    }
+
+    #[test]
+    fn preserve_source_membership_keeps_last_duplicate_group() {
+        let member = ObjectRef::new(2, 0);
+        let plan = LinearizationPlan {
+            preserve_objstm_plan: Some(crate::writer::object_streams::ObjectStreamPlan {
+                groups: vec![
+                    crate::writer::object_streams::ObjectStreamGroup::SourceBacked {
+                        source: ObjectRef::new(1, 0),
+                        members: vec![member],
+                    },
+                    crate::writer::object_streams::ObjectStreamGroup::SourceBacked {
+                        source: ObjectRef::new(7, 0),
+                        members: vec![member],
+                    },
+                ],
+                removed_refs: BTreeSet::new(),
+                source_membership_present: true,
+            }),
+            ..LinearizationPlan::default()
+        };
+
+        assert_eq!(
+            plan.preserve_source_membership(),
+            Some(BTreeMap::from([(2, 7)]))
         );
     }
 

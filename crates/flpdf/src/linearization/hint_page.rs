@@ -290,18 +290,31 @@ fn page0_object_count_with_objstm(
 /// any non-page member (a first-page part2/part3 object, a part8-shared, or a
 /// part9 object). Page 0 is handled separately (it owns its first-page
 /// containers) and is not consulted here.
+/// `source_container_by_member` is the writer-setup snapshot of qpdf's
+/// source-backed ObjStm membership. An empty map is used only by the public
+/// plan helper, where the bounded manual-plan fallback is built once.
 pub(crate) fn non_page_owned_containers(
     plan: &LinearizationPlan,
     member_to_container: &std::collections::BTreeMap<ObjectRef, (u32, u32)>,
+    source_container_by_member: &std::collections::BTreeMap<u32, u32>,
 ) -> std::collections::BTreeSet<u32> {
     use std::collections::{BTreeMap, BTreeSet};
 
-    let preserve_source_membership = plan.preserve_source_membership();
+    let fallback_source_membership = if source_container_by_member.is_empty() {
+        plan.preserve_source_membership().unwrap_or_default()
+    } else {
+        BTreeMap::new()
+    };
+    let source_container_by_member = if source_container_by_member.is_empty() {
+        &fallback_source_membership
+    } else {
+        source_container_by_member
+    };
     let page_private_owner = |member: ObjectRef| -> Option<usize> {
         if let Some(optimization) = plan.optimization.as_ref() {
-            let owner = preserve_source_membership
-                .as_ref()
-                .and_then(|membership| membership.get(&member.number).copied())
+            let owner = source_container_by_member
+                .get(&member.number)
+                .copied()
                 .map(|source| ObjectRef::new(source, 0))
                 .unwrap_or(member);
             return optimization
@@ -414,6 +427,28 @@ impl PageOffsetHintTable {
         second_half_container_nums: &std::collections::BTreeSet<u32>,
         open_document_container_nums: &std::collections::BTreeSet<u32>,
     ) -> Self {
+        Self::from_plan_with_source_membership(
+            plan,
+            renumber,
+            member_to_container,
+            container_shared_sort_key,
+            second_half_container_nums,
+            open_document_container_nums,
+            &std::collections::BTreeMap::new(),
+        )
+    }
+
+    /// Build the page-offset table with the writer-setup source membership
+    /// snapshot used by the canonical linearization route.
+    pub(crate) fn from_plan_with_source_membership(
+        plan: &LinearizationPlan,
+        renumber: &RenumberMap,
+        member_to_container: &std::collections::BTreeMap<ObjectRef, (u32, u32)>,
+        container_shared_sort_key: &std::collections::BTreeMap<u32, (u8, u32)>,
+        second_half_container_nums: &std::collections::BTreeSet<u32>,
+        open_document_container_nums: &std::collections::BTreeSet<u32>,
+        source_container_by_member: &std::collections::BTreeMap<u32, u32>,
+    ) -> Self {
         assert!(
             !plan.page_hints.is_empty(),
             "PageOffsetHintTable::from_plan requires at least one page in the plan"
@@ -483,7 +518,8 @@ impl PageOffsetHintTable {
             // in one container that qpdf then routes to part8 (shared). Neither
             // belongs to this page's section, so exclude every container that is
             // not owned by a single non-first page.
-            let non_page_owned = non_page_owned_containers(plan, member_to_container);
+            let non_page_owned =
+                non_page_owned_containers(plan, member_to_container, source_container_by_member);
             for (i, count) in object_counts.iter_mut().enumerate().skip(1) {
                 if let Some(privates) = plan.per_page_private_objects.get(i) {
                     *count =
@@ -1415,6 +1451,39 @@ mod tests {
             vec![3, 2],
             "the folded container must sort before the post-optimization mint"
         );
+    }
+
+    #[test]
+    fn non_page_owned_containers_use_setup_source_membership() {
+        let member = ObjectRef::new(7, 0);
+        let setup_source = ObjectRef::new(70, 0);
+        let plan_source = ObjectRef::new(71, 0);
+        let mut optimization = crate::optimization::Optimization::default();
+        optimization.record_for_test(crate::optimization::ObjectUser::Page(2), setup_source);
+        let plan = LinearizationPlan {
+            optimization: Some(optimization),
+            preserve_objstm_plan: Some(crate::writer::object_streams::ObjectStreamPlan {
+                groups: vec![
+                    crate::writer::object_streams::ObjectStreamGroup::SourceBacked {
+                        source: plan_source,
+                        members: vec![member],
+                    },
+                ],
+                removed_refs: std::collections::BTreeSet::new(),
+                source_membership_present: true,
+            }),
+            ..LinearizationPlan::default()
+        };
+        let member_to_container = std::collections::BTreeMap::from([(member, (99, 0))]);
+        let source_container_by_member =
+            std::collections::BTreeMap::from([(member.number, setup_source.number)]);
+
+        assert!(non_page_owned_containers(
+            &plan,
+            &member_to_container,
+            &source_container_by_member,
+        )
+        .is_empty());
     }
 
     #[test]
