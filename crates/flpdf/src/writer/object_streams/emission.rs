@@ -185,14 +185,11 @@ pub(crate) fn wrap_objstm_body_as_handle(
     compress: crate::writer::CompressStreams,
     extends: Option<crate::ObjectRef>,
 ) -> crate::Result<(ObjectHandle, Rc<Vec<u8>>)> {
-    let ObjStmBody {
-        bytes,
-        first_offset,
-        n_members,
-    } = body;
+    let first_offset = body.first_offset;
+    let n_members = body.n_members;
     let (data, filter) = match compress {
-        crate::writer::CompressStreams::Yes => (Rc::new(encode_flate(&bytes)?), true),
-        crate::writer::CompressStreams::No => (Rc::new(bytes), false),
+        crate::writer::CompressStreams::Yes => (Rc::new(encode_flate(&body.bytes)?), true),
+        crate::writer::CompressStreams::No => (Rc::new(body.bytes), false),
     };
 
     let mut entries = vec![
