@@ -1833,8 +1833,10 @@ create→write→`get_exit_code` の合成だけを担う。multi-source page se
 （`flpdf-8uuw`）では、通常 non-linearized rewrite の direct CLI route も
 `handle_under_overlay` を image/appearance/annotation transformations より前へ移し、
 qpdf の `handleUnderOverlay` → `handleTransformations` 順を repository-owned inline-image
-probe と qpdf-zlib-compat byte comparison で固定した。linearized overlay は既存の明示拒否、
-page-operation別 route と QPDFJob ownerへの完全統合は残る。
+probe と qpdf-zlib-compat byte comparison で固定した。page-operation別 route と
+QPDFJob ownerへの完全統合は残る。2026-09-15
+（`flpdf-tgpv7`）では、qpdf にこの拒否が存在しないことを再確認し、linearized
+rewrite でも同じ canonical Job の overlay → transformation → writer route を使うようにした。
 
 2026-09-10（`flpdf-m6kt`）: top-level no-`--pages` の `--rotate` / `--split-pages` も
 `--generate-appearances` / `--flatten-annotations` を `run_rewrite_with_qpdf_job` の

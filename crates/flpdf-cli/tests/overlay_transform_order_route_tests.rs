@@ -313,3 +313,84 @@ fn rewrite_page_selection_overlay_images_match_qpdf_after_externalization() {
         "page-selection overlay image rewrite must be byte-identical"
     );
 }
+
+#[cfg(feature = "qpdf-zlib-compat")]
+#[test]
+fn linearized_overlay_and_underlay_rewrites_match_qpdf() {
+    if !qpdf_available() {
+        return;
+    }
+
+    let directory = tempfile::tempdir().expect("temporary directory");
+    let primary =
+        Path::new(env!("CARGO_MANIFEST_DIR")).join("../../tests/fixtures/compat/three-page.pdf");
+    let source =
+        Path::new(env!("CARGO_MANIFEST_DIR")).join("../../tests/fixtures/compat/one-page.pdf");
+
+    let cases = [
+        ("overlay", "--overlay"),
+        ("underlay", "--underlay"),
+        ("linearize-before-overlay", "--overlay"),
+    ];
+    for (name, placement) in cases {
+        let qpdf_output = directory.path().join(format!("{name}-qpdf.pdf"));
+        let flpdf_output = directory.path().join(format!("{name}-flpdf.pdf"));
+        let args = if name == "linearize-before-overlay" {
+            vec![
+                "--static-id".to_owned(),
+                "--linearize".to_owned(),
+                placement.to_owned(),
+                source.display().to_string(),
+                "--".to_owned(),
+                primary.display().to_string(),
+                qpdf_output.display().to_string(),
+            ]
+        } else {
+            vec![
+                "--static-id".to_owned(),
+                placement.to_owned(),
+                source.display().to_string(),
+                "--".to_owned(),
+                "--linearize".to_owned(),
+                primary.display().to_string(),
+                qpdf_output.display().to_string(),
+            ]
+        };
+
+        let mut flpdf_args = args.clone();
+        *flpdf_args.last_mut().expect("flpdf output argument") = flpdf_output.display().to_string();
+
+        let qpdf = ProcessCommand::new("/usr/bin/qpdf")
+            .args(&args)
+            .output()
+            .expect("run qpdf linearized overlay oracle");
+        let flpdf = Command::cargo_bin("flpdf")
+            .expect("flpdf binary")
+            .env("FLPDF_STATIC_ID_QUIET", "1")
+            .args(flpdf_args.iter().map(String::as_str))
+            .output()
+            .expect("run flpdf linearized overlay route");
+
+        assert_eq!(flpdf.status.code(), qpdf.status.code(), "{name} status");
+        assert_eq!(flpdf.stdout, qpdf.stdout, "{name} stdout");
+        assert_eq!(flpdf.stderr, qpdf.stderr, "{name} stderr");
+        assert!(qpdf.status.success(), "qpdf {name} failed: {qpdf:?}");
+        assert!(flpdf.status.success(), "flpdf {name} failed: {flpdf:?}");
+        assert_eq!(
+            fs::read(&flpdf_output).expect("read flpdf output"),
+            fs::read(&qpdf_output).expect("read qpdf output"),
+            "{name} output must be byte-identical"
+        );
+
+        let check = ProcessCommand::new("/usr/bin/qpdf")
+            .args(["--check"])
+            .arg(&flpdf_output)
+            .output()
+            .expect("check linearized output");
+        assert!(check.status.success(), "{name} output must pass qpdf check");
+        assert!(
+            String::from_utf8_lossy(&check.stdout).contains("File is linearized"),
+            "{name} output must be linearized"
+        );
+    }
+}

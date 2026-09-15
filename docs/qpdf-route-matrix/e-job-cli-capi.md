@@ -567,6 +567,18 @@ The qpdf 11.9.0 status/stdout/stderr matrix is covered by
 cases). The JSON conflict cells remain the separately scoped
 `flpdf-urjhr` slice.
 
+### E-11 / E-12 linearized rewrite with overlay or underlay (`flpdf-tgpv7`, 2026-09-15)
+
+qpdf has no configuration conflict between underlay/overlay and linearized
+output. `createQPDF` applies `handleUnderOverlay` before
+`handleTransformations`, while `writeQPDF` configures the linearized writer
+after the create stage (`libqpdf/QPDFJob.cc:428-507,1937-2043,2835-2920`).
+The rewrite CLI now keeps those options on the existing `QPDFJob` instead of
+returning a local conflict error. Overlay, underlay, and linearize-before-
+overlay argument order are compared byte-for-byte with qpdf 11.9.0 under
+`qpdf-zlib-compat` in `overlay_transform_order_route_tests.rs`; each output
+also passes `qpdf --check` as linearized.
+
 ## unknown / probe
 
 | ID | 決められないこと | 必要な source / probe |
