@@ -1298,10 +1298,22 @@ fn qtest_tree_and_mutation_cases_do_not_use_explicit_pdf_resolve() {
             "pub(crate) fn run_test_49",
         ),
         (
+            "test 42",
+            tree_source.as_str(),
+            "pub(crate) fn run_test_42",
+            "pub(crate) fn run_test_43",
+        ),
+        (
             "test 89",
             mutation_source.as_str(),
             "pub(crate) fn run_test_89",
             "pub(crate) fn run_test_90",
+        ),
+        (
+            "test 98",
+            mutation_source.as_str(),
+            "pub(crate) fn run_test_98",
+            "#[cfg(test)]",
         ),
     ] {
         let body = section(source, start, end);
@@ -1318,11 +1330,23 @@ fn qtest_tree_and_mutation_cases_do_not_use_explicit_pdf_resolve() {
     )
     .contains("try_get_utf8_value"));
     assert!(section(
+        tree_source.as_str(),
+        "pub(crate) fn run_test_42",
+        "pub(crate) fn run_test_43"
+    )
+    .contains("try_get_stream_dict"));
+    assert!(section(
         mutation_source.as_str(),
         "pub(crate) fn run_test_89",
         "pub(crate) fn run_test_90"
     )
     .contains("replace_key"));
+    assert!(section(
+        mutation_source.as_str(),
+        "pub(crate) fn run_test_98",
+        "#[cfg(test)]"
+    )
+    .contains("try_get_stream_dict"));
 }
 
 fn test_driver_fixture_dir() -> std::path::PathBuf {
