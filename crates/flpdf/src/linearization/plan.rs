@@ -941,6 +941,12 @@ pub struct LinearizationPlan {
     /// and preserved ObjStm containers without re-reading the PDF.
     pub(crate) optimization: Option<crate::optimization::Optimization>,
 
+    /// Setup-owned Preserve source membership, retained through linearization
+    /// planning so the source-container identity is not reconstructed by a
+    /// later batch consumer. qpdf captures this map before optimization and
+    /// then folds object users onto the same containers.
+    pub(crate) preserve_objstm_plan: Option<crate::writer::object_streams::ObjectStreamPlan>,
+
     /// Terminal indirect page-content stream refs, matching the plain
     /// writer's `contents_seq` identity gate. Empty when
     /// `options.content_normalization` was off. The writer must reuse this
@@ -1416,6 +1422,26 @@ fn raw_part2_objects_for_hints(
 }
 
 impl LinearizationPlan {
+    /// Return the setup-owned, output-filtered Preserve member-to-container
+    /// mapping in the same object-number form consumed by qpdf's
+    /// `object_to_object_stream_no_gen` map.
+    #[allow(dead_code)]
+    pub(crate) fn preserve_source_membership(&self) -> Option<BTreeMap<u32, u32>> {
+        let plan = self.preserve_objstm_plan.as_ref()?;
+        let mut membership = BTreeMap::new();
+        for group in &plan.groups {
+            let crate::writer::object_streams::ObjectStreamGroup::SourceBacked { source, members } =
+                group
+            else {
+                continue;
+            };
+            for member in members {
+                membership.insert(member.number, source.number);
+            }
+        }
+        Some(membership)
+    }
+
     /// Construct a `LinearizationPlan` from a parsed PDF document.
     ///
     /// This method:
@@ -1507,6 +1533,23 @@ impl LinearizationPlan {
         } else {
             None
         };
+        let mut preserve_objstm_plan = if matches!(
+            object_stream_mode,
+            crate::writer::ObjectStreamMode::Preserve
+        ) {
+            Some(
+                crate::writer::object_streams::plan_qpdf_preserve_object_streams_with_source_membership(
+                    pdf,
+                    options.preserve_unreferenced_objects,
+                    source_membership_snapshot,
+                )?, // cov:ignore: LLVM attributes this multiline setup-plan terminator to an uncovered continuation line
+            )
+        } else {
+            None
+        };
+        let source_had_compressed_objects = preserve_objstm_plan
+            .as_ref()
+            .is_some_and(|plan| plan.source_membership_present);
         let generate_objstm_eligible = generate_compressible_plan
             .as_ref()
             .map(|plan| plan.eligible.clone());
@@ -1581,6 +1624,11 @@ impl LinearizationPlan {
                 }
             },
         )?;
+        if let Some(plan) = preserve_objstm_plan.as_mut() {
+            crate::writer::object_streams::filter_preserve_object_stream_plan_for_output(
+                pdf, plan, true, false,
+            )?; // cov:ignore: LLVM attributes this multiline output-filter terminator to an uncovered continuation line
+        }
         if let Some(eligible) = generate_objstm_eligible {
             optimization.set_generate_objstm_eligible(eligible);
         }
@@ -1677,20 +1725,6 @@ impl LinearizationPlan {
         // qpdf classifies them as first-page section objects (Part 2) when reached
         // from the first page, giving them HIGH object numbers. Without this, they
         // land in part4_rest with LOW numbers.
-        let source_had_compressed_objects = if matches!(
-            object_stream_mode,
-            crate::writer::ObjectStreamMode::Preserve
-        ) {
-            if let Some(snapshot) = source_membership_snapshot {
-                !snapshot.is_empty()
-            } else {
-                let mut source_membership = BTreeMap::new();
-                pdf.get_object_stream_data(&mut source_membership);
-                !source_membership.is_empty()
-            }
-        } else {
-            false
-        };
         let operation_removes_stale_generations = use_generate_objstm
             || (matches!(
                 object_stream_mode,
@@ -1698,6 +1732,8 @@ impl LinearizationPlan {
             ) && source_had_compressed_objects);
         let removed_refs = if operation_removes_stale_generations {
             if let Some(plan) = generate_compressible_plan.as_ref() {
+                plan.removed_refs.clone()
+            } else if let Some(plan) = preserve_objstm_plan.as_ref() {
                 plan.removed_refs.clone()
             } else {
                 crate::writer::object_streams::compressible_objgens_qpdf_plan(pdf)?.removed_refs
@@ -2396,6 +2432,7 @@ impl LinearizationPlan {
             object_stream_mode,
             removed_refs,
             optimization: Some(optimization),
+            preserve_objstm_plan,
             content_normalize_refs: content_normalize_refs
                 .iter()
                 .filter_map(|object_gen| object_gen.to_object_ref())
@@ -3070,6 +3107,7 @@ impl Default for LinearizationPlan {
             part9_outline_objects: Vec::new(),
             part6_outline_objects: Vec::new(),
             optimization: None,
+            preserve_objstm_plan: None,
             removed_refs: BTreeSet::new(),
             object_stream_mode: crate::writer::ObjectStreamMode::Disable,
             content_normalize_refs: BTreeSet::new(),
@@ -3110,9 +3148,9 @@ impl Default for LinearizationPlan {
 pub(crate) struct ObjStmBatchPlan {
     /// ObjStm batches for qpdf part4 (open-document objects). Numbered and
     /// emitted in the first half, before the first-page section.
-    pub(crate) open_document_batches: Vec<Vec<ObjectRef>>,
+    pub(crate) open_document_batches: Vec<RoutedObjStmBatch>,
     /// ObjStm batches for Part 3 (shared/catalog) objects.
-    pub(crate) part3_batches: Vec<Vec<ObjectRef>>,
+    pub(crate) part3_batches: Vec<RoutedObjStmBatch>,
     /// ObjStm batches for Part 4 (rest-of-document) objects.
     pub(crate) part4_batches: Vec<RoutedObjStmBatch>,
 }
@@ -3244,12 +3282,12 @@ impl LinearizationPlan {
             !self.outline_first_page_members.is_empty(),
             &containers,
         );
-        let mut open_document_batches: Vec<Vec<ObjectRef>> = Vec::new();
+        let mut open_document_batches: Vec<RoutedObjStmBatch> = Vec::new();
         // qpdf part 6 is private, shared, then outline containers. Preserve
         // first-encounter order within each bucket.
-        let mut part3_private: Vec<Vec<ObjectRef>> = Vec::new();
-        let mut part3_shared: Vec<Vec<ObjectRef>> = Vec::new();
-        let mut part3_outlines: Vec<Vec<ObjectRef>> = Vec::new();
+        let mut part3_private: Vec<RoutedObjStmBatch> = Vec::new();
+        let mut part3_shared: Vec<RoutedObjStmBatch> = Vec::new();
+        let mut part3_outlines: Vec<RoutedObjStmBatch> = Vec::new();
         // Second-half containers, grouped by part so they can be emitted in qpdf's
         // strict part order (part7, then part8, then part9 — QPDF_linearization.cc:1342).
         // qpdf's file layout writes lc_other_page_private, lc_other_page_shared, then
@@ -3331,11 +3369,17 @@ impl LinearizationPlan {
         // applies preserve-unreferenced policy, and retains source-container
         // identity for every group. Linearization only adds its output-sensitive
         // page/Catalog/signature/assigned filtering and part routing below.
-        let source_plan =
-            crate::writer::object_streams::plan_qpdf_preserve_object_streams_with_unreferenced(
-                pdf,
-                _config.preserve_unreferenced_objects,
-            )?; // cov:ignore: LLVM attributes this covered multiline planner terminator to the call setup
+        let source_plan = match self.preserve_objstm_plan.clone() {
+            Some(plan) => plan,
+            None => {
+                // cov:ignore-start: only hand-built Preserve plans lack the setup-owned snapshot
+                crate::writer::object_streams::plan_qpdf_preserve_object_streams_with_unreferenced(
+                    pdf,
+                    _config.preserve_unreferenced_objects,
+                )?
+                // cov:ignore-end
+            } // cov:ignore: hand-built test plans do not carry the setup snapshot
+        }; // cov:ignore: LLVM attributes this covered multiline planner terminator to the call setup
         let assigned = self.renumber_assigned_refs();
         let mut containers: Vec<Vec<ObjectRef>> = Vec::new();
         let mut source_container_refs: Vec<Option<ObjectRef>> = Vec::new();
@@ -3489,19 +3533,35 @@ fn push_routed_objstm_batch(
     members: Vec<ObjectRef>,
     route: ContainerPart,
     source_container_number: Option<u32>,
-    open_document_batches: &mut Vec<Vec<ObjectRef>>,
-    part3_private: &mut Vec<Vec<ObjectRef>>,
-    part3_shared: &mut Vec<Vec<ObjectRef>>,
-    part3_outlines: &mut Vec<Vec<ObjectRef>>,
+    open_document_batches: &mut Vec<RoutedObjStmBatch>,
+    part3_private: &mut Vec<RoutedObjStmBatch>,
+    part3_shared: &mut Vec<RoutedObjStmBatch>,
+    part3_outlines: &mut Vec<RoutedObjStmBatch>,
     part4_private: &mut Vec<RoutedObjStmBatch>,
     part4_shared: &mut Vec<RoutedObjStmBatch>,
     part4_rest: &mut Vec<RoutedObjStmBatch>,
 ) {
     match route {
-        ContainerPart::OpenDocument => open_document_batches.push(members),
-        ContainerPart::FirstPagePrivate => part3_private.push(members),
-        ContainerPart::FirstPageShared => part3_shared.push(members),
-        ContainerPart::FirstPageOutlines => part3_outlines.push(members),
+        ContainerPart::OpenDocument => open_document_batches.push(RoutedObjStmBatch {
+            members,
+            route,
+            source_container_number,
+        }),
+        ContainerPart::FirstPagePrivate => part3_private.push(RoutedObjStmBatch {
+            members,
+            route,
+            source_container_number,
+        }),
+        ContainerPart::FirstPageShared => part3_shared.push(RoutedObjStmBatch {
+            members,
+            route,
+            source_container_number,
+        }),
+        ContainerPart::FirstPageOutlines => part3_outlines.push(RoutedObjStmBatch {
+            members,
+            route,
+            source_container_number,
+        }),
         ContainerPart::OtherPagePrivate => part4_private.push(RoutedObjStmBatch {
             members,
             route,
@@ -3835,6 +3895,36 @@ mod tests {
         };
 
         assert!(plan.has_raw_projection_gap());
+    }
+
+    #[test]
+    fn preserve_source_membership_keeps_one_canonical_container_per_group() {
+        let plan = LinearizationPlan {
+            preserve_objstm_plan: Some(crate::writer::object_streams::ObjectStreamPlan {
+                groups: vec![
+                    crate::writer::object_streams::ObjectStreamGroup::SourceBacked {
+                        source: ObjectRef::new(1, 0),
+                        members: vec![ObjectRef::new(2, 0), ObjectRef::new(3, 0)],
+                    },
+                    crate::writer::object_streams::ObjectStreamGroup::SourceBacked {
+                        source: ObjectRef::new(7, 0),
+                        members: vec![ObjectRef::new(8, 0)],
+                    },
+                    crate::writer::object_streams::ObjectStreamGroup::Generated {
+                        source: ObjectRef::new(9, 0),
+                        members: vec![ObjectRef::new(10, 0)],
+                    },
+                ],
+                removed_refs: BTreeSet::new(),
+                source_membership_present: true,
+            }),
+            ..Default::default()
+        };
+
+        assert_eq!(
+            plan.preserve_source_membership(),
+            Some(BTreeMap::from([(2, 1), (3, 1), (8, 7)]))
+        );
     }
 
     fn flate(data: &[u8]) -> Vec<u8> {

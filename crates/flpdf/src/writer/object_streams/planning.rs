@@ -114,6 +114,9 @@ impl ObjectStreamGroup {
 pub(crate) struct ObjectStreamPlan {
     pub(crate) groups: Vec<ObjectStreamGroup>,
     pub(crate) removed_refs: BTreeSet<ObjectRef>,
+    /// Whether setup observed any source type-2 xref membership, even when
+    /// output eligibility later removes every member from the retained groups.
+    pub(crate) source_membership_present: bool,
 }
 
 /// Convert public [`WriterOptions`] into an internal
@@ -255,6 +258,48 @@ pub(crate) fn filter_objstm_batches_for_output<R: std::io::Read + std::io::Seek>
     Ok(())
 }
 
+/// Apply qpdf's linearized page/Catalog exclusion to a Preserve object-stream
+/// plan without discarding its source-container identity.
+pub(crate) fn filter_preserve_object_stream_plan_for_output<R: std::io::Read + std::io::Seek>(
+    pdf: &mut crate::Pdf<R>,
+    plan: &mut ObjectStreamPlan,
+    output_linearized: bool,
+    output_encrypted: bool,
+) -> crate::Result<()> {
+    let mut batches = Vec::with_capacity(plan.groups.len());
+    let mut source_containers = Vec::with_capacity(plan.groups.len());
+    for group in plan.groups.drain(..) {
+        match group {
+            ObjectStreamGroup::SourceBacked { source, members } => {
+                batches.push(members);
+                source_containers.push(Some(source));
+            }
+            // cov:ignore-start: this Preserve-only helper rejects a generated group as an internal invariant
+            ObjectStreamGroup::Generated { source, .. } => {
+                return Err(crate::Error::Internal(format!(
+                    "Preserve plan contains generated ObjStm source {source}"
+                )));
+            } // cov:ignore-end
+        }
+    }
+    filter_objstm_batches_for_output(
+        pdf,
+        &mut batches,
+        &mut source_containers,
+        output_linearized,
+        output_encrypted,
+    )?; // cov:ignore: LLVM attributes this multiline output-filter terminator to an uncovered continuation line
+    plan.groups = batches
+        .into_iter()
+        .zip(source_containers)
+        .map(|(members, source)| ObjectStreamGroup::SourceBacked {
+            source: source.expect("Preserve source container must be present"),
+            members,
+        })
+        .collect();
+    Ok(())
+}
+
 /// Reconstruct Preserve-mode source containers after filtering their members
 /// through qpdf's compressible-object walk.
 ///
@@ -353,6 +398,7 @@ pub(crate) fn plan_qpdf_preserve_object_streams_with_source_membership<
         removed_refs: compressible
             .map(|plan| plan.removed_refs)
             .unwrap_or_default(),
+        source_membership_present: true,
     })
 }
 

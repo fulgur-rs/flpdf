@@ -250,23 +250,7 @@ impl ObjStmLayout {
         // carried a page dict.
         let page_dicts: std::collections::BTreeSet<ObjectRef> =
             crate::pages::page_refs(pdf)?.into_iter().collect();
-        let filter_batches = |batches: Vec<Vec<ObjectRef>>| -> Vec<Vec<ObjectRef>> {
-            batches
-                .into_iter()
-                .filter_map(|batch| {
-                    let kept: Vec<ObjectRef> = batch
-                        .into_iter()
-                        .filter(|r| !page_dicts.contains(r))
-                        .collect();
-                    if kept.is_empty() {
-                        None
-                    } else {
-                        Some(kept)
-                    }
-                })
-                .collect()
-        };
-        let filter_routed_batches = |batches: Vec<RoutedObjStmBatch>| -> Vec<RoutedObjStmBatch> {
+        let filter_batches = |batches: Vec<RoutedObjStmBatch>| -> Vec<RoutedObjStmBatch> {
             batches
                 .into_iter()
                 .filter_map(|batch| {
@@ -286,7 +270,7 @@ impl ObjStmLayout {
         Ok(crate::linearization::plan::ObjStmBatchPlan {
             open_document_batches: filter_batches(batch_plan.open_document_batches),
             part3_batches: filter_batches(batch_plan.part3_batches),
-            part4_batches: filter_routed_batches(batch_plan.part4_batches),
+            part4_batches: filter_batches(batch_plan.part4_batches),
         })
     }
 
@@ -312,13 +296,13 @@ impl ObjStmLayout {
 
         let mut member_to_container = BTreeMap::new();
 
-        let take = |batches: &[Vec<ObjectRef>],
+        let take = |batches: &[RoutedObjStmBatch],
                     out: &mut Vec<ObjStmContainer>,
                     map: &mut BTreeMap<ObjectRef, (u32, u32)>,
                     container_iter: &mut std::vec::IntoIter<u32>|
          -> Result<()> {
             for batch in batches {
-                if batch.is_empty() {
+                if batch.members.is_empty() {
                     continue;
                 }
                 let container_new_num = container_iter.next().ok_or_else(|| {
@@ -328,8 +312,8 @@ impl ObjStmLayout {
                             .to_string(),
                     )
                 })?;
-                let mut members = Vec::with_capacity(batch.len());
-                for (idx, &orig) in batch.iter().enumerate() {
+                let mut members = Vec::with_capacity(batch.members.len());
+                for (idx, &orig) in batch.members.iter().enumerate() {
                     let new_ref = renumber.new_for_original(orig).ok_or_else(|| {
                         crate::Error::Unsupported(format!(
                             "linearization writer: ObjStm member {orig} has no renumber \
@@ -352,11 +336,6 @@ impl ObjStmLayout {
         let mut open_document = Vec::new();
         let mut part3 = Vec::new();
         let mut part4 = Vec::new();
-        let part4_members: Vec<Vec<ObjectRef>> = batch_plan
-            .part4_batches
-            .iter()
-            .map(|batch| batch.members.clone())
-            .collect();
         // Consumption order MUST match `place_objstm_members_per_half`'s
         // `container_numbers` order: open-document, then Part-3, then Part-4.
         take(
@@ -372,7 +351,7 @@ impl ObjStmLayout {
             &mut container_iter,
         )?;
         take(
-            &part4_members,
+            &batch_plan.part4_batches,
             &mut part4,
             &mut member_to_container,
             &mut container_iter,
@@ -3908,8 +3887,7 @@ fn write_linearized_impl<R: Read + Seek>(
         .open_document_batches
         .iter()
         .chain(&resolved_batch_plan.part3_batches)
-        .flatten()
-        .copied()
+        .flat_map(|batch| batch.members.iter().copied())
         .collect();
     let mut first_half_post_plain: BTreeSet<ObjectRef> = plan
         .part6_outline_objects
@@ -3937,6 +3915,7 @@ fn write_linearized_impl<R: Read + Seek>(
         .iter()
         .filter(|batch| {
             batch
+                .members
                 .iter()
                 .any(|member| plan.part6_outline_objects.contains(member))
         })
@@ -3973,47 +3952,11 @@ fn write_linearized_impl<R: Read + Seek>(
     // before the `/Encrypt` slot is inserted; the slot reservation below then
     // shifts the placed map and the derived ObjStm layout is built afterwards
     // from the shifted map.
-    let open_document_source_container_numbers: Vec<Option<u32>> =
-        if options.object_streams == crate::writer::ObjectStreamMode::Preserve {
-            resolved_batch_plan
-                .open_document_batches
-                .iter()
-                .map(|members| {
-                    let source = members
-                        .first()
-                        .and_then(|member| source_container_by_member.get(member).copied())
-                        .ok_or_else(|| {
-                            // cov:ignore-start: resolved Preserve batches come directly from source xref compressed-member groups; every non-empty batch therefore has a source container.
-                            crate::Error::Unsupported(
-                                "linearization writer: preserved open-document ObjStm batch \
-                                 has no source container"
-                                    .to_string(),
-                            )
-                        })?; // cov:ignore-end
-                    if members.iter().any(|member| {
-                        source_container_by_member.get(member).copied() != Some(source)
-                        // cov:ignore: objstm_batches_preserve groups each non-empty batch by one source container
-                    }) {
-                        // cov:ignore-start: source-container homogeneity is guaranteed by objstm_batches_preserve's per-container grouping.
-                        return Err(crate::Error::Unsupported(
-                            "linearization writer: preserved open-document ObjStm batch \
-                             combines multiple source containers"
-                                .to_string(),
-                        ));
-                        // cov:ignore-end
-                    }
-                    Ok(Some(source))
-                })
-                .collect::<Result<Vec<_>>>()?
-        } else {
-            vec![None; resolved_batch_plan.open_document_batches.len()]
-        };
     let relocation = if emits_object_streams {
         local_renumber.place_objstm_members_per_half(
             &resolved_batch_plan.open_document_batches,
-            &open_document_source_container_numbers,
             &resolved_batch_plan.part3_batches,
-            &part4_members,
+            &resolved_batch_plan.part4_batches,
             &second_half_anchors,
             &second_half_post_plain,
             &first_half_post_plain,
