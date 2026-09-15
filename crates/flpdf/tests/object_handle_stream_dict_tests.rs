@@ -60,7 +60,7 @@ fn non_stream_and_uninitialized_handles_use_qpdf_stream_error_boundary() {
 }
 
 #[test]
-fn dropped_document_resolution_failure_is_propagated() {
+fn destroyed_document_handle_uses_qpdf_stream_type_error_boundary() {
     let stream = {
         let mut pdf = Pdf::open_mem_owned(
             include_bytes!("../../../tests/fixtures/qpdf-test98-minimal.pdf").to_vec(),

@@ -9470,6 +9470,10 @@ pub(crate) mod identity_tests {
             handle.try_as_name().unwrap_err().to_string(),
             "resolver failed"
         );
+        assert!(matches!(
+            handle.try_get_stream_dict().unwrap_err(),
+            Error::System(message) if message == "resolver failed"
+        ));
         assert_eq!(
             handle.try_as_array().unwrap_err().to_string(),
             "resolver failed"
