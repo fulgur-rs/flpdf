@@ -955,16 +955,25 @@ Catalog value through `getRoot` and `unparseChild`
 primary Catalog siblings and root `/Pages` non-structural values through the
 canonical foreign copier, preserves qpdf's trailer key boundary, and restores
 the source direct/indirect `/Root` shape after shared page and AcroForm
-mutations. The `object_copy.rs` reservation boundary removes stale lower
-generation identities only when qpdf's live cache has a newer generation; an
-unrelated absent object remains an indirect null. Generic `merge_documents`
-and the qpdf job consumer retain their separate field-selection boundaries.
+mutations. The primary copier receives the writer-mode boundary: qpdf's
+stale-generation removal is enabled only when Preserve has source ObjStms
+without `--preserve-unreferenced`, or when Generate invokes
+`getCompressibleObjGens`; Disable, Preserve+`--preserve-unreferenced`, and
+ordinary foreign-copy calls retain an absent lower generation as an indirect
+null (`libqpdf/QPDF.cc:1952-1959,2392-2433`; `libqpdf/QPDFWriter.cc:1939-1983`).
+The preserve-unreferenced queue orders imported handles by primary source
+identity before assigning output numbers, matching qpdf's `getAllObjects`
+seed order (`libqpdf/QPDF.cc:1285-1294`; `libqpdf/QPDFWriter.cc:2907-2925`).
+Generic `merge_documents` and the qpdf job consumer retain their separate
+field-selection boundaries.
 
 The qpdf differential regression
 `crates/flpdf-cli/tests/page_ops_qpdf_matrix.rs::pages_preserves_primary_document_graph_edge_fixtures`
 covers `acroform-sig-parent-pure-widget-kid`,
 `null-visible-preserve-empty-removed`,
+`null-visible-stale-generation`,
 `pages-ext-firstpage-shared-one-page`,
 `trailer-external-file-keys`, and `direct-root-one-page`, plus the existing
-primary metadata test. This is a bounded E-10 primary-graph slice; shared-page
+primary metadata test. The preserve-unreferenced order regression is kept in
+the same test module. This is a bounded E-10 primary-graph slice; shared-page
 page loss and ObjStm member-order differences are not folded into it.

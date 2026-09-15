@@ -3662,15 +3662,23 @@ the page-merge trailer skip list with qpdf, and restores a direct primary
 `/Root` shape after the shared Catalog mutation boundary. The field-map snapshot
 is taken after Catalog copying only for the qpdf job consumer; the generic
 `merge_documents` path keeps its page-graph-only field selection semantics.
-Foreign-copy reservation distinguishes a null lower generation superseded by a
-newer cached generation from a genuinely absent object, matching qpdf's
-`removeObject` identity cleanup (`libqpdf/QPDF.cc:710-718,1996-2005`). No legacy
-closure bridge or qpdf-deviation marker was added.
+Foreign-copy reservation applies the qpdf writer's stale-generation cleanup
+only to the primary page-merge graph when `getCompressibleObjGens` actually runs:
+Preserve with source ObjStms and no `--preserve-unreferenced`, or Generate. It
+leaves a missing lower generation as an indirect null for Disable, Preserve with
+`--preserve-unreferenced`, and ordinary `copyForeignObject` calls, matching
+`getObject` and `removeObject` (`libqpdf/QPDF.cc:1952-1959,1996-2005`;
+`libqpdf/QPDFWriter.cc:1939-1983`). The preserve-unreferenced live queue also
+sorts imported handles by the recorded primary source identity before assigning
+output numbers, matching `getAllObjects` (`libqpdf/QPDF.cc:1285-1294` and
+`libqpdf/QPDFWriter.cc:2907-2925`). No legacy closure bridge or qpdf-deviation
+marker was added.
 
 `crates/flpdf-cli/tests/page_ops_qpdf_matrix.rs::pages_preserves_primary_document_graph_edge_fixtures`
 compares qpdf 11.9.0 with flpdf for the four original fixtures plus
-`direct-root-one-page`, including Catalog `/AcroForm` and `/Candidates`, root
-`/Pages /Ext`, trailer external-file keys, and direct `/Root`. The sweep is
-bounded to primary document-graph retention; the unrelated
+`direct-root-one-page` and the unindexed stale-generation fixture across its
+writer-mode exceptions. A separate regression covers preserve-unreferenced
+trailer graph order, including `/Info` before `/F`. The sweep is bounded to
+primary document-graph retention; the unrelated
 `null-visible-stale-generation-objstm` member-order difference and the
 `flpdf-x267z` page-count issue remain separate.
