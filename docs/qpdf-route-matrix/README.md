@@ -39,7 +39,7 @@ container-above-max だった — `flpdf-hi08` / PR #1486）。本表は残る m
 
 `scripts/check-qpdf-route-matrix.py --check` は、A〜E の160行に加えて
 E の qtest exception 表（物理98行を論理99ケースとして数える）を含む259 logical
-rowsを検証する。2026-09-16 の現行 `origin/main` (`ce342c87c36ea1f8e7f2739577262d6cdcb037fa`) を基準に、
+rowsを検証する。2026-09-16 の現行 `origin/main` (`ebc26e01fc7f9b6e89f9b33142af2684149d2a2c`) を基準に、
 今回の変更を適用した tree での集計は次のとおり。
 
 | canonical | bridge | mixed | unknown | 合計 |
