@@ -432,7 +432,7 @@ fn append_objstm_container_object<R: Read + Seek>(
     } else {
         CompressStreams::No
     };
-    let (stream_handle, data) = wrap_objstm_body_as_handle(&body, compress, None)?;
+    let (stream_handle, data) = wrap_objstm_body_as_handle(body, compress, None)?;
     let stream_dict = stream_handle.as_stream_dict().ok_or_else(|| {
         // cov:ignore-start: wrap_objstm_body_as_handle always returns a stream handle.
         crate::Error::Internal("linearization ObjStm wrapper produced a non-stream handle".into())
@@ -475,7 +475,7 @@ fn append_objstm_container_object<R: Read + Seek>(
     if let Some(ctx) = encrypt_ctx {
         crate::writer::write_stream_payload_with_pipeline(
             out,
-            &data,
+            data.as_slice(),
             options.newline_before_endstream,
             object_ref,
             ctx,
@@ -485,7 +485,7 @@ fn append_objstm_container_object<R: Read + Seek>(
     } else {
         crate::writer::serialize::write_stream_payload(
             out,
-            &data,
+            data.as_slice(),
             options.newline_before_endstream,
         )?; // cov:ignore: plain ObjStm payload failure is a defensive pipeline continuation
     }

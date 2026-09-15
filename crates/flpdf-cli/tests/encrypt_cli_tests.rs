@@ -53,6 +53,8 @@ const QDF_ENCRYPTION_FIXTURE: &str = ONE_PAGE_FIXTURE;
 const TWO_PAGE_FIXTURE: &str = "../../tests/fixtures/compat/two-page.pdf";
 #[cfg(feature = "qpdf-zlib-compat")]
 const THREE_PAGE_FIXTURE: &str = "../../tests/fixtures/compat/three-page.pdf";
+#[cfg(feature = "qpdf-zlib-compat")]
+const OBJSTM_LINEARIZE_FIXTURE: &str = "../../tests/fixtures/compat/objstm-gen-nostream-130rev.pdf";
 
 /// All direct Standard-handler revisions exposed by the CLI. The boolean
 /// records qpdf's write-time weak-crypto opt-in; it is also passed to qpdf
@@ -3603,6 +3605,114 @@ fn rewrite_linearize_encrypt_object_streams_generate_produces_valid_output() {
             && stdout.contains("Supplied password is user password"),
         "qpdf must report a valid linearized object-stream encrypted output: {stdout}"
     );
+}
+
+/// A non-empty ObjStm must remain byte-identical to qpdf when linearized under
+/// AES-128. Exercise both direct Flate and raw payload ownership, and both CLI
+/// write surfaces, so the container handle and encrypted sink are checked with
+/// the same non-empty member set.
+#[cfg(feature = "qpdf-zlib-compat")]
+#[test]
+fn linearize_encrypt_nonempty_objstm_is_byte_identical_to_qpdf() {
+    if !ensure_qpdf_or_skip() {
+        return;
+    }
+    let tmp = tempfile::tempdir().unwrap();
+    let source = tmp.path().join("source-objstm.pdf");
+    let prepared = ShellCommand::new("qpdf")
+        .args([
+            "--object-streams=generate",
+            "--static-id",
+            "--warning-exit-0",
+        ])
+        .arg(fixture(OBJSTM_LINEARIZE_FIXTURE))
+        .arg(&source)
+        .output()
+        .unwrap();
+    assert!(
+        prepared.status.success(),
+        "qpdf ObjStm preparation failed: {}",
+        String::from_utf8_lossy(&prepared.stderr)
+    );
+
+    for (mode, compress_arg) in [
+        ("compressed", None),
+        ("uncompressed", Some("--compress-streams=n")),
+    ] {
+        let mut qpdf_args = vec![
+            "--linearize",
+            "--object-streams=generate",
+            "--static-id",
+            "--static-aes-iv",
+        ];
+        if let Some(arg) = compress_arg {
+            qpdf_args.push(arg);
+        }
+        qpdf_args.extend(["--encrypt", "", "", "128", "--use-aes=y", "--"]);
+
+        let qpdf_output = tmp.path().join(format!("{mode}-qpdf.pdf"));
+        let qpdf = ShellCommand::new("qpdf")
+            .args(&qpdf_args)
+            .arg(&source)
+            .arg(&qpdf_output)
+            .output()
+            .unwrap();
+        assert!(
+            qpdf.status.success(),
+            "{mode}: qpdf encrypted linearization failed: {}",
+            String::from_utf8_lossy(&qpdf.stderr)
+        );
+        let reference = std::fs::read(&qpdf_output).unwrap();
+
+        for (surface, rewrite) in [("top-level", false), ("rewrite", true)] {
+            let output = tmp.path().join(format!("{mode}-{surface}.pdf"));
+            let mut command = Command::cargo_bin("flpdf").unwrap();
+            if rewrite {
+                command.arg("rewrite");
+            }
+            command
+                .args(&qpdf_args)
+                .arg(&source)
+                .arg(&output)
+                .assert()
+                .success();
+
+            let actual = std::fs::read(&output).unwrap();
+            assert_eq!(
+                actual, reference,
+                "{mode}/{surface}: non-empty encrypted ObjStm linearization must match qpdf"
+            );
+
+            let check = ShellCommand::new("qpdf")
+                .args(["--password=", "--check"])
+                .arg(&output)
+                .output()
+                .unwrap();
+            assert!(
+                check.status.success(),
+                "{mode}/{surface}: qpdf --check failed: stdout={} stderr={}",
+                String::from_utf8_lossy(&check.stdout),
+                String::from_utf8_lossy(&check.stderr)
+            );
+            let check_stdout = String::from_utf8_lossy(&check.stdout);
+            assert!(
+                check_stdout.contains("File is linearized"),
+                "{mode}/{surface}: output must remain linearized: {check_stdout}"
+            );
+
+            let xref = ShellCommand::new("qpdf")
+                .args(["--password=", "--show-xref"])
+                .arg(&output)
+                .output()
+                .unwrap();
+            let xref_stdout = String::from_utf8_lossy(&xref.stdout);
+            assert!(
+                xref.status.success()
+                    && xref_stdout.lines().any(|line| line.contains("compressed")),
+                "{mode}/{surface}: output must contain non-empty ObjStm members: {xref_stdout}"
+            );
+        }
+    }
 }
 
 /// Whole-document byte parity for linearized AES-128 (V=4/AESV2) encrypted
