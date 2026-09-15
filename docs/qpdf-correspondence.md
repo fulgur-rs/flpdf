@@ -647,6 +647,22 @@ walk, `PageDocumentHelper` consumers reuse it across JSON sections, and
 `QPDF::updateAllPagesCache` and the mutation-owned cache invalidation contract
 (`QPDF_pages.cc:141-150`; `QPDF.hh:671-704`).
 
+`flpdf-ymuj.6.38` extends that existing cache to the linearization and ObjStm
+planning consumers. `pages::page_refs` returns the prepared non-empty sequence
+when the cache is valid; an unprepared document and qpdf's empty
+`m->all_pages` sentinel retain the bounded `PageWalk` fallback. When the
+linearization content-normalization probe is active, it first obtains the page
+sequence through the same `initializeSpecialStreams`-ordered preparation;
+writer-side QDF/decode triggers already seed the cache in
+`initialize_special_streams`. This preserves qpdf's direct-outline and
+`optimize` call order (`QPDFWriter.cc:1911-1935,2114-2116`). The linearized
+page-dictionary filter likewise obtains its sequence through the repair/cache
+boundary after object-stream setup (`QPDFWriter.cc:2125-2149`). The Rust
+consumer still receives an owned `Vec<ObjectRef>` projection rather than qpdf's
+const vector reference; no second page-tree traversal is performed, and
+`update_all_pages_cache`/tree-rebuild/page-splice invalidation remains authoritative
+(`QPDF_pages.cc:39-75,141-150`).
+
 `QPDF::removePage` first delegates membership lookup to `findPage`, which
 flattens the page tree and throws a `qpdf_e_pages` `QPDFExc` for a non-member
 page. Its exception uses the input source name, the `page object` description,

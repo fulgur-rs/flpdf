@@ -117,13 +117,14 @@ impl SharedObjectHintEntry {
 fn linearization_content_normalize_refs<R: Read + Seek>(
     pdf: &mut Pdf<R>,
     options: &crate::writer::WriterOptions,
+    page_refs: &[ObjectRef],
 ) -> Result<BTreeSet<QpdfObjGen>> {
     if !options.content_normalization {
         return Ok(BTreeSet::new());
     }
     let mut refs = BTreeSet::new();
-    for page_ref in crate::pages::page_refs(pdf)? {
-        let page = pdf.get_object_handle(page_ref);
+    for page_ref in page_refs {
+        let page = pdf.get_object_handle(*page_ref);
         let contents = page.try_get_key(b"/Contents")?;
         let mut record_stream = |stream: &ObjectHandle| -> Result<()> {
             if stream.type_code()? == 10 {
@@ -1627,7 +1628,22 @@ impl LinearizationPlan {
         // pass; a prior CanonicalCatalogFirstRenumber pre-pass here was
         // redundant with that traversal rather than compensating for a real
         // gap in it.
-        let content_normalize_refs = linearization_content_normalize_refs(pdf, options)?;
+        // QPDFWriter::initializeSpecialStreams calls getAllPages before
+        // QPDF::optimize (QPDFWriter.cc:1911-1935,2114-2116). Seed the
+        // canonical page cache through the same repair boundary, then let the
+        // content-normalization probe consume that stable sequence. Empty
+        // page lists intentionally remain uncached, matching qpdf's
+        // `m->all_pages.empty()` sentinel in QPDF_pages.cc:42-44.
+        let prepared_page_sequence = if options.content_normalization {
+            crate::pages::repair::prepare_for_optimization(pdf)?
+        } else {
+            None
+        };
+        let prepared_page_refs = prepared_page_sequence
+            .as_ref()
+            .map_or(&[][..], |prepared| prepared.pages.as_slice());
+        let content_normalize_refs =
+            linearization_content_normalize_refs(pdf, options, prepared_page_refs)?;
         let mut skipped_raw_stream_parameter_streams: BTreeSet<QpdfObjGen> = BTreeSet::new();
         let mut optimization = crate::optimization::Optimization::optimize(
             pdf,

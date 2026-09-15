@@ -87,6 +87,13 @@ pub fn splice_pages_with_max_depth<R: Read + Seek>(
     }
 
     let pages_ref = pages_ref(pdf)?;
+    // qpdf requires direct /Pages-tree edits to invalidate its page cache
+    // (`QPDF.hh:695-704`). The preflight walk below can promote direct leaves,
+    // duplicate repeated
+    // pages, and repair page-tree dictionaries before the splice itself
+    // mutates /Kids and /Count.  Any prepared page snapshot is therefore no
+    // longer authoritative once this non-no-op operation starts.
+    pdf.invalidate_page_list_cache();
     let existing_pages = page_refs_for_splice(pdf, pages_ref, max_depth)?;
     let page_count = existing_pages.len();
 
@@ -877,6 +884,22 @@ mod tests {
         assert!(!pdf.ever_called_get_all_pages());
         splice_pages(&mut pdf, 0..1, &[]).unwrap();
         assert!(pdf.ever_called_get_all_pages());
+    }
+
+    #[test]
+    fn splice_invalidates_a_prepared_page_cache_before_mutating_the_tree() {
+        let mut pdf = open(build_flat_pdf());
+        let prepared = crate::pages::repair::prepare_for_optimization(&mut pdf)
+            .unwrap()
+            .expect("flat page tree should be prepared");
+        assert_eq!(prepared.pages, page_list(&mut pdf));
+
+        splice_pages(&mut pdf, 0..1, &[]).unwrap();
+
+        assert_eq!(
+            page_list(&mut pdf),
+            vec![ObjectRef::new(4, 0), ObjectRef::new(5, 0)]
+        );
     }
 
     #[test]
