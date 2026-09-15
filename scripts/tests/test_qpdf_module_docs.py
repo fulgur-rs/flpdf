@@ -892,12 +892,16 @@ class RepositoryPolicyTests(unittest.TestCase):
                     paragraph.append(text)
 
                 self.assertTrue(paragraph, f"{source_path}: missing module summary")
-                summary = " ".join(paragraph)
-                self.assertFalse(
-                    summary.startswith("qpdf correspondence:")
-                    or summary.startswith("Mirrors qpdf "),
-                    f"{source_path}: qpdf classification is the module summary",
-                )
+                # rustdoc's Modules list shows the whole first paragraph, so a
+                # classification anywhere inside it lands in the summary --
+                # not only when it is the opening sentence. Checking each line
+                # keeps the blank separator itself load-bearing.
+                for line in paragraph:
+                    self.assertFalse(
+                        line.startswith("qpdf correspondence:")
+                        or line.startswith("Mirrors qpdf "),
+                        f"{source_path}: qpdf classification is inside the module summary",
+                    )
 
     def test_only_d1_d2_audited_module_is_declared_as_mirror(self):
         repo_root = SCRIPT_PATH.parent.parent
