@@ -25,25 +25,15 @@ use super::{
 // Shared helpers
 // ---------------------------------------------------------------------------
 
-/// qpdf's `QPDF::getRoot` (`libqpdf/QPDF.cc:2355-2368`) additionally throws
-/// `damagedPDF` when `/Root` does not resolve to a dictionary and, under
-/// `check_mode`, repairs a missing/invalid `/Type`. This port only reaches
-/// for the handle itself; a caller that needs the dictionary type checked
-/// resolves it through [`resolved_key`]/`Pdf::resolve_handle`
-/// and inspects it directly -- the same substitute this crate's own
-/// `test_34_41.rs` uses via its own (non-shared, so not reused here) private
-/// `root_handle`.
-fn root_handle<R: Read + Seek>(pdf: &mut Pdf<R>) -> ObjectHandle {
-    pdf.trailer_key_handle(b"Root")
-}
-
-/// qpdf's `getKey` dereferences its result internally -- every
+/// qpdf's `getKey` resolves its receiver before inspecting the dictionary and
+/// returns the child handle without resolving that child -- every
 /// `QPDFObjectHandle.cc` dictionary accessor reaches `asDictionary()` /
-/// `dereference()` before inspecting a child's type -- while
+/// `dereference()` on its receiver before inspecting a child's type -- while
 /// `ObjectHandle::get_key` explicitly does not ("never performs resolution
-/// itself", `get_key`'s own doc). Every multi-hop qpdf
-/// `getKey(...).getKey(...)` chain ported in this file resolves each hop
-/// through this helper instead of a bare `get_key`.
+/// itself", `get_key`'s own doc). The remaining qtest exception paths in this
+/// file resolve each required hop through this helper instead of a bare
+/// `get_key`; bounded canonical cutovers may remove it from individual
+/// consumers without changing those distinct paths.
 fn resolved_key<R: Read + Seek>(
     pdf: &mut Pdf<R>,
     parent: &ObjectHandle,
@@ -374,38 +364,26 @@ pub(crate) fn run_test_92<R: Read + Seek>(
     let mut qpdf = Pdf::open(std::io::BufReader::new(file))?;
     let qpdf_unique_id = qpdf.unique_id();
 
-    let root_h = root_handle(&mut qpdf);
-    qpdf.resolve(&root_h)?;
-    let root = root_h.clone();
+    let root = qpdf.root_handle()?;
     assert_eq!(root.owning_pdf_unique_id(), Some(qpdf_unique_id));
     assert!(root.is_indirect());
-    assert!(root.as_dictionary().is_some());
+    assert!(root.try_is_dictionary()?);
 
-    let page1 = resolved_key(&mut qpdf, &root, b"/Pages")?;
-    let kids = resolved_key(&mut qpdf, &page1, b"/Kids")?;
-    let kid_items = kids
-        .as_array()
-        .expect("minimal.pdf's /Pages/Kids is a direct array");
-    let first_kid = kid_items
-        .first()
-        .cloned()
-        .expect("minimal.pdf's /Kids has at least one page");
-    qpdf.resolve(&first_kid)?;
-    let page1 = first_kid.clone();
+    let pages = root.try_get_key(b"/Pages")?;
+    let kids = pages.try_get_key(b"/Kids")?;
+    let page1 = kids.try_get_array_item(0)?;
     assert_eq!(page1.owning_pdf_unique_id(), Some(qpdf_unique_id));
     assert!(page1.is_indirect());
-    assert!(page1.as_dictionary().is_some());
+    assert!(page1.try_is_dictionary()?);
 
-    let resources = resolved_key(&mut qpdf, &page1, b"/Resources")?;
+    let resources = page1.try_get_key(b"/Resources")?;
     assert_eq!(resources.owning_pdf_unique_id(), Some(qpdf_unique_id));
-    assert!(resources.as_dictionary().is_some());
+    assert!(resources.try_is_dictionary()?);
     assert!(!resources.is_indirect());
 
-    let contents = resolved_key(&mut qpdf, &page1, b"/Contents")?;
-    assert!(!is_scalar(&contents)?);
-    let contents_dict = contents
-        .as_stream_dict()
-        .expect("minimal.pdf's page /Contents is a stream");
+    let contents = page1.try_get_key(b"/Contents")?;
+    assert!(!contents.try_is_scalar()?);
+    let contents_dict = contents.try_get_stream_dict()?;
 
     drop(qpdf);
 
@@ -426,20 +404,25 @@ pub(crate) fn run_test_92<R: Read + Seek>(
     // (`resources`, `contents_dict`) retain their old values instead
     // (test_driver.cc:3227-3235).
     assert!(is_destroyed(&root)?);
-    assert!(!is_scalar(&root)?);
+    assert!(!root.try_is_scalar()?);
     assert!(is_destroyed(&page1)?);
     assert!(is_destroyed(&contents)?);
-    assert!(resources.as_dictionary().is_some());
-    assert!(contents_dict.as_dictionary().is_some());
+    assert!(resources.try_is_dictionary()?);
+    assert!(contents_dict.try_is_dictionary()?);
 
-    // GAP(QPDFObjectHandle::unparse, throwing `std::logic_error` for a
-    // destroyed handle, `libqpdf/QPDF_Destroyed.cc:24-29`):
-    // `ObjectHandle::unparse` returns `Vec<u8>`, not `Result`, and its own
-    // doc documents falling back to a `null` unparse for a `Destroyed`
-    // handle rather than raising an error -- there is no exception channel
-    // here to assert against, so the `try { root.unparse(); assert(false);
-    // } catch (std::logic_error&) {}` block (test_driver.cc:3236-3241) is
-    // not ported.
+    // qpdf's `unparse()` sees the destroyed root as no longer indirect and
+    // delegates to `unparseResolved`, whose destroyed value throws the
+    // logic_error below (`QPDFObjectHandle.cc:1575-1593`,
+    // `QPDF_Destroyed.cc:24-29`). The fallible Rust accessor preserves that
+    // qpdf error boundary rather than the non-fallible null fallback.
+    let error = root
+        .try_unparse_resolved()
+        .expect_err("destroyed qpdf object must reject unparse");
+    assert!(matches!(
+        error,
+        Error::Internal(message)
+            if message == "attempted to unparse a QPDFObjectHandle from a destroyed QPDF"
+    ));
     Ok(())
 }
 
