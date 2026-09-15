@@ -3,6 +3,21 @@ use predicates::prelude::*;
 use std::path::{Path, PathBuf};
 use std::process::Command as ShellCommand;
 
+fn normalize_text_newlines(bytes: &[u8]) -> Vec<u8> {
+    let mut normalized = Vec::with_capacity(bytes.len());
+    let mut remaining = bytes;
+    while let Some((&byte, rest)) = remaining.split_first() {
+        if byte == b'\r' && rest.first() == Some(&b'\n') {
+            normalized.push(b'\n');
+            remaining = &rest[1..];
+        } else {
+            normalized.push(byte);
+            remaining = rest;
+        }
+    }
+    normalized
+}
+
 const ENCRYPTED_FIXTURES: &[(&str, &str, bool)] = &[
     ("v1-rc4-40-r2.pdf", "user-v1", true),
     ("v2-rc4-128-r3.pdf", "user-v2", true),
@@ -493,24 +508,33 @@ fn decrypt_combined_with_remove_restrictions_is_silent() {
 }
 
 #[test]
-fn decrypt_conflicts_with_inspection_subcommands() {
-    // The conflicts_with_all on the top-level --decrypt must reject
-    // combinations with --check (and the rest of the inspection group) as
-    // usage errors. Without this, `flpdf --check --decrypt in out` would
-    // silently take the inspection path and ignore the flag (and OUTPUT).
-    let input = Path::new(env!("CARGO_MANIFEST_DIR")).join(UNENCRYPTED_FIXTURE);
-    let tmp = tempfile::tempdir().unwrap();
-    let output = tmp.path().join("conflict.pdf");
+fn decrypt_with_check_inspection_matches_qpdf() {
+    if !ensure_qpdf_or_skip() {
+        return;
+    }
 
-    Command::cargo_bin("flpdf")
+    let input = Path::new(env!("CARGO_MANIFEST_DIR")).join(UNENCRYPTED_FIXTURE);
+    let qpdf = ShellCommand::new("qpdf")
+        .args(["--check", "--decrypt"])
+        .arg(&input)
+        .output()
+        .unwrap();
+    let flpdf = Command::cargo_bin("flpdf")
         .unwrap()
         .args(["--check", "--decrypt"])
         .arg(&input)
-        .arg(&output)
-        .assert()
-        .failure()
-        // clap emits an "argument cannot be used with" diagnostic on conflicts.
-        .stderr(predicates::str::contains("cannot be used"));
+        .output()
+        .unwrap();
+
+    assert_eq!(flpdf.status.code(), qpdf.status.code());
+    assert_eq!(
+        normalize_text_newlines(&flpdf.stdout),
+        normalize_text_newlines(&qpdf.stdout)
+    );
+    assert_eq!(
+        normalize_text_newlines(&flpdf.stderr),
+        normalize_text_newlines(&qpdf.stderr)
+    );
 }
 
 /// `--decrypt` is applied at qpdf's writer boundary after page selection and

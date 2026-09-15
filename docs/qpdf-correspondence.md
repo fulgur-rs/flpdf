@@ -3455,3 +3455,20 @@ ordering. The strict live regression is
 `cmp_linearize_objstm_tests.rs::direct_outlines_linearized_objstm_is_byte_identical_to_qpdf`,
 with a default-feature root/container ordering guard in
 `linearize_objstm_generate_tests.rs`.
+
+### QPDFJob writer/inspection option acceptance (`flpdf-urjhr`, 2026-09-15)
+
+qpdf 11.9.0 の `QPDFJob::checkConfiguration` は、output-free inspection と
+`--encrypt` / `--decrypt` / `--linearize` の組み合わせを相互排他にしない。
+`createQPDF` が先に `handleTransformations` を実行し、`writeQPDF` が
+`createsOutput()` に応じて `doInspection` または `writeOutfile` を選ぶためである
+（`libqpdf/QPDFJob.cc:428-520,567-642`）。JSON outputでも同じcreate-stage順序を
+保ち、attachment mutationはJSON serialization前に適用される
+（`libqpdf/QPDFJob.cc:2044-2248,3030-3057`; `libqpdf/QPDFJob_config.cc:311-324`）。
+
+flpdfはtop-level `Cli` の該当conflicts_withを除去し、JSON routeでは既存の
+`QPDFJob::apply_transformations`へattachment設定を渡してから
+`QPDFJob::write_json_with_version`を呼ぶ。`cli_qpdf_conflict_matrix.rs` は、
+attachmentのadd/remove/copy、encrypt/decrypt/linearizeとJSON、encrypt/decryptと
+check/show-npagesの10通りをpinned qpdf 11.9.0とstatus/stdout/stderr比較する。
+qpdfに対応する独自compatibility bridgeやdeviation markerは追加しない。
