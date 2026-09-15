@@ -61,6 +61,19 @@ pub(crate) fn copy_foreign_object<R: Read + Seek>(
     target: &mut Pdf<R>,
     foreign: &ObjectHandle,
 ) -> Result<ObjectHandle> {
+    copy_foreign_object_with_stale_generation_policy(target, foreign, false)
+}
+
+/// Copy one foreign page graph while optionally applying qpdf's writer-side
+/// stale-generation removal to nested references. The policy is enabled only
+/// by the primary page-merge route, whose source document remains qpdf's live
+/// writer document; ordinary `copyForeignObject` callers must preserve a
+/// missing lower generation as an indirect null.
+pub(crate) fn copy_foreign_object_with_stale_generation_policy<R: Read + Seek>(
+    target: &mut Pdf<R>,
+    foreign: &ObjectHandle,
+    remove_stale_generations: bool,
+) -> Result<ObjectHandle> {
     if !foreign.is_indirect() {
         return Err(Error::System(
             "QPDF::copyForeign called with direct object handle".to_owned(),
@@ -74,7 +87,14 @@ pub(crate) fn copy_foreign_object<R: Read + Seek>(
             "QPDF::copyForeign called with object from this QPDF".to_owned(),
         ));
     }
-    copy_foreign_with_source_id(target, source_id, foreign, true, true)
+    copy_foreign_with_source_id(
+        target,
+        source_id,
+        foreign,
+        true,
+        true,
+        remove_stale_generations,
+    )
 }
 
 /// Copy one primary object for the fresh page-merge target's
@@ -103,7 +123,7 @@ pub(crate) fn copy_foreign_object_for_preserve<R: Read + Seek>(
             "QPDF::copyForeign called with object from this QPDF".to_owned(),
         ));
     }
-    copy_foreign_with_source_id(target, source_id, foreign, true, false)
+    copy_foreign_with_source_id(target, source_id, foreign, true, false, false)
 }
 
 /// Copy a direct or indirect value from a foreign document while retaining the
@@ -121,6 +141,17 @@ pub(crate) fn copy_foreign_value<R: Read + Seek>(
     source_id: u64,
     foreign: &ObjectHandle,
 ) -> Result<ObjectHandle> {
+    copy_foreign_value_with_stale_generation_policy(target, source_id, foreign, false)
+}
+
+/// Copy a Catalog/trailer value while optionally applying the primary page
+/// merge's qpdf writer stale-generation policy to nested array references.
+pub(crate) fn copy_foreign_value_with_stale_generation_policy<R: Read + Seek>(
+    target: &mut Pdf<R>,
+    source_id: u64,
+    foreign: &ObjectHandle,
+    remove_stale_generations: bool,
+) -> Result<ObjectHandle> {
     if source_id == target.unique_id() {
         return Err(Error::System(
             "QPDF::copyForeign called with object from this QPDF".to_owned(),
@@ -133,7 +164,14 @@ pub(crate) fn copy_foreign_value<R: Read + Seek>(
             ));
         }
     }
-    copy_foreign_with_source_id(target, source_id, foreign, false, true)
+    copy_foreign_with_source_id(
+        target,
+        source_id,
+        foreign,
+        false,
+        true,
+        remove_stale_generations,
+    )
 }
 
 #[allow(deprecated)]
@@ -143,6 +181,7 @@ fn copy_foreign_with_source_id<R: Read + Seek>(
     foreign: &ObjectHandle,
     require_indirect: bool,
     stop_at_page_tree: bool,
+    remove_stale_generations: bool,
 ) -> Result<ObjectHandle> {
     let object_map = target.take_foreign_object_map(source_id);
     let visiting = target.take_foreign_object_visiting(source_id);
@@ -180,6 +219,7 @@ fn copy_foreign_with_source_id<R: Read + Seek>(
         visiting,
         direct_visiting: Vec::new(),
         stop_at_page_tree,
+        remove_stale_generations,
         to_copy,
     };
     let result = if require_indirect {
@@ -237,6 +277,9 @@ struct ForeignObjectCopier<'a, R: Read + Seek + 'static> {
     /// The writer-preservation traversal disables the boundary so otherwise
     /// unreferenced `/Pages` containers can be carried to a fresh merge target.
     stop_at_page_tree: bool,
+    /// Whether qpdf's primary writer setup removes stale lower generations
+    /// while this foreign graph is copied into a fresh page-merge target.
+    remove_stale_generations: bool,
     to_copy: Vec<ObjectHandle>,
 }
 
@@ -336,7 +379,11 @@ impl<R: Read + Seek + 'static> ForeignObjectCopier<'_, R> {
     #[allow(deprecated)]
     fn reserve_objects_inner(&mut self, foreign: ObjectHandle, top: bool) -> Result<()> {
         foreign.try_dereference()?;
-        if !top && foreign.is_null() && foreign.has_newer_cached_generation() {
+        if self.remove_stale_generations
+            && !top
+            && foreign.is_null()
+            && foreign.has_newer_cached_generation()
+        {
             // qpdf's xref-chain cleanup removes a lower generation's cached
             // object and clears its identity (`QPDF.cc:710-718,1996-2005`).
             // The corresponding array element is therefore a direct null;
@@ -962,6 +1009,7 @@ mod tests {
                 visiting: BTreeSet::new(),
                 direct_visiting: Vec::new(),
                 stop_at_page_tree: true,
+                remove_stale_generations: false,
                 to_copy: Vec::new(),
             };
             copier
@@ -1008,6 +1056,7 @@ mod tests {
             visiting: BTreeSet::new(),
             direct_visiting: Vec::new(),
             stop_at_page_tree: true,
+            remove_stale_generations: false,
             to_copy: Vec::new(),
         }
     }
@@ -1177,6 +1226,7 @@ mod tests {
                 visiting: BTreeSet::new(),
                 direct_visiting: Vec::new(),
                 stop_at_page_tree: true,
+                remove_stale_generations: false,
                 to_copy: Vec::new(),
             };
             copier

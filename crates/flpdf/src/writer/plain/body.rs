@@ -356,7 +356,20 @@ fn initialize_live_queue<R: Read + Seek>(
     let mut queue = LiveQueue::new(removed_refs, options.qdf);
     queue.register_object_streams(pdf, object_streams)?;
     if options.preserve_unreferenced_objects {
-        for handle in pdf.get_all_objects()? {
+        let mut all_objects = pdf.get_all_objects()?;
+        if pdf.writer_object_order.is_some() {
+            // qpdf's `getAllObjects()` is ordered by the primary source cache,
+            // not by the fresh merge target's local allocation order
+            // (`QPDF.cc:1285-1294`). Re-sort imported handles by their recorded
+            // source identity before the preserve queue assigns output numbers.
+            all_objects.sort_by_key(|handle| {
+                handle.object_ref().map_or_else(
+                    || pdf.writer_object_order_key(ObjectRef::new(u32::MAX, 0)),
+                    |object_ref| pdf.writer_object_order_key(object_ref),
+                )
+            });
+        }
+        for handle in all_objects {
             if handle
                 .object_ref()
                 .is_some_and(|source| queue.generated_container_sources.contains(&source))

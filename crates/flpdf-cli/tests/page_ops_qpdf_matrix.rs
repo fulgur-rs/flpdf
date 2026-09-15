@@ -113,11 +113,12 @@ fn show_qpdf_object(path: &Path, object: &str) -> String {
     stdout
 }
 
-fn run_primary_document_graph_merge(
+fn run_primary_document_graph_merge_with_flags(
     primary: &Path,
     secondary: &Path,
     tmp: &Path,
     stem: &str,
+    flags: &[&str],
 ) -> (String, String, String, String) {
     let qpdf_output = tmp.join(format!("qpdf-{stem}.pdf"));
     let flpdf_output = tmp.join(format!("flpdf-{stem}.pdf"));
@@ -125,28 +126,16 @@ fn run_primary_document_graph_merge(
     let secondary = secondary.to_str().unwrap();
     let qpdf_output_name = qpdf_output.to_str().unwrap();
     let flpdf_output_name = flpdf_output.to_str().unwrap();
-    let args = [
-        "--static-id",
-        "--pages",
-        ".",
-        secondary,
-        "--",
-        primary,
-        qpdf_output_name,
-    ];
+    let mut args = vec!["--static-id"];
+    args.extend_from_slice(flags);
+    args.extend_from_slice(&["--pages", ".", secondary, "--", primary, qpdf_output_name]);
     let (qpdf_ok, qpdf_stdout) = run_qpdf(&args);
     assert!(qpdf_ok, "qpdf primary graph merge failed: {qpdf_stdout}");
     Command::cargo_bin("flpdf")
         .unwrap()
-        .args([
-            "--static-id",
-            "--pages",
-            ".",
-            secondary,
-            "--",
-            primary,
-            flpdf_output_name,
-        ])
+        .args(["--static-id"])
+        .args(flags)
+        .args(["--pages", ".", secondary, "--", primary, flpdf_output_name])
         .assert()
         .success();
 
@@ -156,6 +145,15 @@ fn run_primary_document_graph_merge(
         show_qpdf_object(&qpdf_output, "trailer"),
         show_qpdf_object(&flpdf_output, "trailer"),
     )
+}
+
+fn run_primary_document_graph_merge(
+    primary: &Path,
+    secondary: &Path,
+    tmp: &Path,
+    stem: &str,
+) -> (String, String, String, String) {
+    run_primary_document_graph_merge_with_flags(primary, secondary, tmp, stem, &[])
 }
 
 fn object_selector_after_key(output: &str, key: &str) -> String {
@@ -3655,6 +3653,33 @@ fn pages_preserves_primary_document_graph_edge_fixtures() {
     assert!(q_trailer.contains("/Root"));
     assert!(f_trailer.contains("/Root"));
 
+    for (flags, label) in [
+        (&[][..], "default"),
+        (&["--object-streams=disable"][..], "disable"),
+        (&["--preserve-unreferenced"][..], "preserve-unreferenced"),
+    ] {
+        let (q_catalog, f_catalog, q_trailer, f_trailer) =
+            run_primary_document_graph_merge_with_flags(
+                &fixture_abs("../../tests/fixtures/compat/null-visible-stale-generation.pdf"),
+                &secondary,
+                tmp.path(),
+                &format!("stale-generation-{label}"),
+                flags,
+            );
+        assert_eq!(
+            q_catalog, f_catalog,
+            "stale-generation Catalog must match qpdf in {label} mode"
+        );
+        assert_eq!(
+            q_trailer, f_trailer,
+            "stale-generation trailer must match qpdf in {label} mode"
+        );
+        assert!(
+            q_catalog.contains("/Candidates [") && !q_catalog.contains("/Candidates [ null"),
+            "qpdf must retain the missing lower generation as an indirect null in {label} mode"
+        );
+    }
+
     let (q_catalog, f_catalog, q_trailer, f_trailer) = run_primary_document_graph_merge(
         &fixture_abs("../../tests/fixtures/compat/pages-ext-firstpage-shared-one-page.pdf"),
         &secondary,
@@ -3702,6 +3727,36 @@ fn pages_preserves_primary_document_graph_edge_fixtures() {
         f_trailer.contains("/Root <<"),
         "primary direct /Root must remain direct in distinct-secondary merge"
     );
+}
+
+#[test]
+fn pages_preserve_unreferenced_primary_trailer_graph_order_matches_qpdf() {
+    if !qpdf_available() {
+        eprintln!(
+            "qpdf {EXPECTED_QPDF_VERSION} unavailable; skipping preserve-unreferenced graph order differential"
+        );
+        return;
+    }
+    let tmp = tempfile::tempdir().unwrap();
+    let secondary = fixture_abs(THREE_PAGE);
+    let (q_catalog, f_catalog, q_trailer, f_trailer) = run_primary_document_graph_merge_with_flags(
+        &fixture_abs("../../tests/fixtures/compat/trailer-external-file-keys.pdf"),
+        &secondary,
+        tmp.path(),
+        "trailer-external-preserve-unreferenced",
+        &["--preserve-unreferenced"],
+    );
+
+    assert_eq!(
+        q_catalog, f_catalog,
+        "preserve-unreferenced primary Catalog must retain qpdf object identities"
+    );
+    assert_eq!(
+        q_trailer, f_trailer,
+        "preserve-unreferenced trailer graph numbering/order must match qpdf"
+    );
+    assert!(q_trailer.contains("/F 5 0 R"));
+    assert!(q_trailer.contains("/Info 4 0 R"));
 }
 
 #[test]

@@ -1802,6 +1802,12 @@ impl QPDFJob {
         })
     }
 
+    /// Return the configured qpdf object-stream mode for page selection.
+    #[must_use]
+    pub(crate) fn object_stream_mode_for_page_specs(&self) -> crate::ObjectStreamMode {
+        self.configuration.writer.object_stream_mode()
+    }
+
     /// Emit qpdf's automatic keep-open selection line for a page-spec job.
     ///
     /// qpdf reports this before opening foreign page sources and only when the

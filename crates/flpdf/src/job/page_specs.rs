@@ -25,8 +25,8 @@ use crate::pages::tree_rebuild::RebuildResult;
 use crate::pdf::WriterObjectOrderKey;
 use crate::qpdf_obj_gen::QpdfObjGen;
 use crate::{
-    AcroFormDocumentHelper, Error, Matrix, ObjectHandle, ObjectRef, PageObjectHelper, PageRange,
-    Pdf, Result, UsageError,
+    AcroFormDocumentHelper, Error, Matrix, ObjectHandle, ObjectRef, ObjectStreamMode,
+    PageObjectHelper, PageRange, Pdf, Result, UsageError,
 };
 use std::collections::{BTreeMap, BTreeSet};
 use std::io::{Cursor, Read, Seek};
@@ -367,8 +367,9 @@ fn merge_preserving_primary_into<R: Read + Seek, T: Read + Seek>(
     inputs: &mut [MergeInput<'_, R>],
     remove_resources: &[bool],
     target: Pdf<T>,
+    object_stream_mode: ObjectStreamMode,
 ) -> Result<Pdf<T>> {
-    merge_documents_for_page_specs_into(inputs, remove_resources, true, target)
+    merge_documents_for_page_specs_into(inputs, remove_resources, true, target, object_stream_mode)
 }
 
 /// A selected page represented by its source and its occurrence within the
@@ -850,6 +851,7 @@ fn handle_page_specs<R: Read + Seek + 'static>(
         resource_mode,
         preserve_unreferenced,
         Pdf::empty()?,
+        ObjectStreamMode::Preserve,
     )
 }
 
@@ -859,6 +861,7 @@ fn handle_page_specs<R: Read + Seek + 'static>(
 /// its erased job document so the complete create boundary can return one
 /// `JobDocument` regardless of whether page selection copied pages across
 /// source documents.
+#[allow(clippy::too_many_arguments)]
 fn handle_page_specs_into<R: Read + Seek + 'static, T: Read + Seek + 'static>(
     job: &mut super::QPDFJob,
     sources: &mut [Pdf<R>],
@@ -867,6 +870,7 @@ fn handle_page_specs_into<R: Read + Seek + 'static, T: Read + Seek + 'static>(
     resource_mode: RemoveUnreferencedResources,
     preserve_unreferenced: bool,
     target: Pdf<T>,
+    object_stream_mode: ObjectStreamMode,
 ) -> Result<Pdf<T>> {
     if sources.is_empty() {
         return Err(Error::Unsupported(
@@ -1020,9 +1024,20 @@ fn handle_page_specs_into<R: Read + Seek + 'static, T: Read + Seek + 'static>(
         })
         .collect();
     let mut merged = if preserve_unreferenced {
-        merge_preserving_primary_into(&mut merge_inputs, &remove_resources, target)?
+        merge_preserving_primary_into(
+            &mut merge_inputs,
+            &remove_resources,
+            target,
+            object_stream_mode,
+        )?
     } else {
-        merge_documents_for_page_specs_into(&mut merge_inputs, &remove_resources, false, target)?
+        merge_documents_for_page_specs_into(
+            &mut merge_inputs,
+            &remove_resources,
+            false,
+            target,
+            object_stream_mode,
+        )?
         // cov:ignore: llvm-cov attributes this executed multiline merge call to its closing delimiter
     };
     drop(merge_inputs);
@@ -1262,6 +1277,7 @@ impl super::QPDFJob {
             resource_mode,
             preserve_unreferenced,
             target,
+            self.object_stream_mode_for_page_specs(),
         )
         .map(|merged| PageSpecJobOutput::Merged(Box::new(merged)))
     }
@@ -1482,6 +1498,7 @@ mod tests {
             RemoveUnreferencedResources::Auto,
             false,
             Pdf::empty().expect("empty merge target"),
+            ObjectStreamMode::Preserve,
         )
         .expect("direct-root primary must not panic during page merge");
         assert_eq!(crate::pages::page_refs(&mut merged).unwrap().len(), 2);
@@ -1507,6 +1524,7 @@ mod tests {
             RemoveUnreferencedResources::Auto,
             false,
             Pdf::empty().expect("empty merge target"),
+            ObjectStreamMode::Preserve,
         )
         .expect("direct-root Catalog values must be copied");
         let catalog = merged.root_handle().expect("merged Catalog");

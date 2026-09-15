@@ -511,6 +511,12 @@ impl WriterConfiguration {
     pub const fn preserves_unreferenced_objects(&self) -> bool {
         self.settings.preserve_unreferenced_objects
     }
+
+    /// Return qpdf's requested object-stream mode for job page selection.
+    #[must_use]
+    pub(crate) const fn object_stream_mode(&self) -> ObjectStreamMode {
+        self.settings.object_stream_mode
+    }
 }
 
 pub(crate) fn update_minimum_pdf_version(
