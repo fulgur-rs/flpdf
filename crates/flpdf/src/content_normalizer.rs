@@ -1,4 +1,7 @@
+//! Content-stream normalization for qpdf-compatible output.
+//!
 //! Mirrors qpdf 11.9.0 libqpdf/ContentNormalizer.cc.
+//!
 
 use crate::{
     pipeline::{

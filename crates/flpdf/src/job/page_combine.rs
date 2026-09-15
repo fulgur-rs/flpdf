@@ -1,9 +1,11 @@
-//! qpdf correspondence: `QPDFJob.cc` `handlePageSpecs` multi-input selection support used by the internal page-operation tests.
-//!
 //! The plan is an internal implementation of the Job page-selection route.
 //! External callers configure page selection through the public
 //! `QPDFJobConfig` page-spec methods instead of constructing this intermediate
 //! representation. The module is compiled only for the crate's unit tests.
+//!
+//! qpdf correspondence: `QPDFJob.cc` `handlePageSpecs` multi-input selection support used by the internal page-operation tests.
+//!
+//!
 
 use super::page_plan::PagePlan;
 use crate::{Error, PageRange, Pdf, PdfOpenOptions, Result};

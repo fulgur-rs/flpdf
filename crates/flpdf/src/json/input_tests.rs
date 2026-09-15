@@ -1,4 +1,7 @@
+//! Regression tests for JSON input boundaries.
+//!
 //! qpdf correspondence: tests for the JSON input value and deferred stream provider boundaries.
+//!
 //! (`libqpdf/QPDF_json.cc:65-231, 732-793`; `libqpdf/QUtil.cc:642-663`).
 
 use super::input::{

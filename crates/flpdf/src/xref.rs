@@ -1,5 +1,3 @@
-//! qpdf correspondence: QPDF.cc xref loading and repair.
-//!
 //! The xref loader follows qpdf 11.9.0's
 //! `QPDF::read_xref`/`read_xrefStream`/`processXRefStream` ordering
 //! (`libqpdf/QPDF.cc:626-710,846-1148`): the xref stream is parsed as a live
@@ -10,6 +8,10 @@
 //! reads use qpdf's live `readObjectAtOffset`/`readStream` route. The
 //! short-lived `BootstrapHandleDocument` remains only for the owner-less
 //! standalone xref loader and its reconstruction-only bounded-read tests.
+//!
+//! qpdf correspondence: QPDF.cc xref loading and repair.
+//!
+//!
 //!
 //! qpdf keeps its shared `QPDF::Members::file` input source and does not read
 //! PDF objects until they are needed (`include/qpdf/QPDF.hh:67-97,1453-1457`,

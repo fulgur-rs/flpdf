@@ -1,7 +1,9 @@
-//! qpdf correspondence: QPDFJob.cc removed-page nulling plus QPDFWriter.cc null-key visibility specialized for OBJR annotations.
 //! Annotation `/P` reference drop for annotations kept alive only through a
 //! structure-tree object reference (`/Type /OBJR`) `/Obj`, after page
 //! extraction.
+//!
+//! qpdf correspondence: QPDFJob.cc removed-page nulling plus QPDFWriter.cc null-key visibility specialized for OBJR annotations.
+//!
 //!
 //! After [`crate::pages::tree_rebuild::rebuild_page_tree`] has rebuilt the page
 //! tree for a subset extraction, an annotation on a removed page is normally

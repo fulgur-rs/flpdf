@@ -1,4 +1,7 @@
+//! qpdf-compatible PDF date and time utilities.
+//!
 //! qpdf correspondence: `QUtil::QPDFTime`, `get_current_qpdf_time`, and `qpdf_time_to_pdf_time`.
+//!
 //! Source details: `include/qpdf/QUtil.hh:227-261`, `libqpdf/QUtil.cc:868-934`.
 
 use std::sync::OnceLock;

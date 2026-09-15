@@ -1,5 +1,6 @@
-//! qpdf correspondence: `QPDFAnnotationObjectHelper.cc`.
 //! Typed accessor helpers for annotation objects.
+//!
+//! qpdf correspondence: `QPDFAnnotationObjectHelper.cc`.
 //!
 //! [`AnnotationObjectHelper`] wraps an annotation [`ObjectRef`] together with
 //! a `&mut Pdf<R>` and exposes typed, fail-soft read-only accessors for the

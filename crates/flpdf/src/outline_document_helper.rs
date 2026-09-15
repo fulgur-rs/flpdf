@@ -1,5 +1,6 @@
-//! qpdf correspondence: QPDFOutlineDocumentHelper.cc — construction, `hasOutlines`, and `resolveNamedDest`; `QPDFOutlineObjectHelper.cc` accessors live in outline_object_helper.rs.
 //! High-level outline (`/Outlines`) document helper.
+//!
+//! qpdf correspondence: QPDFOutlineDocumentHelper.cc — construction, `hasOutlines`, and `resolveNamedDest`; `QPDFOutlineObjectHelper.cc` accessors live in outline_object_helper.rs.
 //!
 //! [`OutlineDocumentHelper`] wraps a `&mut Pdf<R>` and materializes the document
 //! outline (bookmarks) into an arena-backed [`crate::OutlineTree`], mirroring

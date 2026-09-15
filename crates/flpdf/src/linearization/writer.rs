@@ -1,5 +1,6 @@
-//! qpdf correspondence: QPDFWriter.cc linearized write path split from the standard writer.
 //! Layout writer — orchestrates the full linearized PDF output.
+//!
+//! qpdf correspondence: QPDFWriter.cc linearized write path split from the standard writer.
 //!
 //! This module assembles the six-part Annex F layout in correct order and
 //! tracks qpdf's pass-1 and final-pass byte coordinates. The canonical writer

@@ -1,6 +1,8 @@
-//! qpdf correspondence: QPDFWriter.cc object-stream body and container emission.
 //! The emitter builds the pair table and member bodies, then wraps them in the
 //! `/Type /ObjStm` stream container used by the writer.
+//!
+//! qpdf correspondence: QPDFWriter.cc object-stream body and container emission.
+//!
 
 use std::collections::HashSet;
 

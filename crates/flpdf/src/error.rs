@@ -1,4 +1,7 @@
+//! Error types and result aliases for PDF processing.
+//!
 //! qpdf correspondence: QPDFExc.cc and QPDFSystemError.cc concepts combined with flpdf-specific errors; public APIs are incomplete.
+//!
 use crate::encryption::primitives::PrimitiveError;
 use thiserror::Error;
 

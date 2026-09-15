@@ -1,8 +1,10 @@
-//! qpdf correspondence: `QPDFJob::doCheck` and `QPDFJob::doInspection` (`libqpdf/QPDFJob.cc:745-803,1646-1693`).
-//!
 //! The document-check consumer owns the full read-only traversal performed by
 //! qpdf. The CLI only selects this operation; it does not own a second check
 //! report or warning-completion path.
+//!
+//! qpdf correspondence: `QPDFJob::doCheck` and `QPDFJob::doInspection` (`libqpdf/QPDFJob.cc:745-803,1646-1693`).
+//!
+//!
 
 use super::lifecycle::{JobExitCode, QPDFJob};
 use crate::content_stream::{ObjectHandleParserCallbacks, ParseControl};

@@ -1,5 +1,6 @@
-//! qpdf correspondence: QPDF_encryption.cc password normalization.
 //! Password input mode handling and normalization for Standard security handler.
+//!
+//! qpdf correspondence: QPDF_encryption.cc password normalization.
 //!
 //! qpdf exposes `--password-mode={auto,bytes,hex-bytes,unicode}` to control how
 //! a CLI-supplied password is interpreted when writing an encrypted file.

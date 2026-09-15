@@ -1,5 +1,6 @@
-//! qpdf correspondence: QPDF_linearization.cc object classification and layout planning.
 //! `LinearizationPlan` — pure data model for PDF linearization layout.
+//!
+//! qpdf correspondence: QPDF_linearization.cc object classification and layout planning.
 //!
 //! A `LinearizationPlan` partitions all objects in a document into the four
 //! body parts defined by ISO 32000-1 Annex F, and carries the raw inputs needed

@@ -1,4 +1,7 @@
+//! Object-stream planning and emission.
+//!
 //! qpdf correspondence: QPDF.cc getCompressibleObjGens and QPDFWriter.cc ObjStm planning and emission.
+//!
 
 mod eligibility;
 mod emission;

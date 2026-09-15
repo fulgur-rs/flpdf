@@ -1,4 +1,7 @@
+//! Helpers for PDF `/Filespec` dictionaries.
+//!
 //! qpdf correspondence: QPDFFileSpecObjectHelper.cc.
+//!
 
 use super::embedded_file_stream::EmbeddedFileStream;
 use super::shared::{ensure_indirect_handle_belongs_to_pdf, format_pdf_date, NAME_KEYS};

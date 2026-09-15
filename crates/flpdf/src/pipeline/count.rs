@@ -1,4 +1,7 @@
+//! Byte-counting pipeline stage.
+//!
 //! qpdf correspondence: Pl_Count.cc byte-count, last-byte, forwarding, and finish responsibilities.
+//!
 
 use super::{Pipeline, PipelineError, PipelineResult};
 

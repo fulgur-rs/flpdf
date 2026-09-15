@@ -1,4 +1,7 @@
+//! Shared helpers for file specifications and embedded-file streams.
+//!
 //! qpdf correspondence: shared QPDFFileSpecObjectHelper/QPDFEFStreamObjectHelper support primitives.
+//!
 
 use crate::pipeline::md5::PlMd5;
 use crate::pipeline::{Discard, Pipeline};

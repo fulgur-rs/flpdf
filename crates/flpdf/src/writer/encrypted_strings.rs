@@ -1,4 +1,7 @@
+//! Writer-side encryption and serialization of PDF strings.
+//!
 //! qpdf correspondence: QPDFWriter.cc:785-803 encryption-dictionary binary-key hex selection, QPDFWriter.cc:1567-1599 string-unparse, QPDFWriter.cc:1761-1796 object data-key lifecycle, and QPDFWriter.cc:2244-2256 encryption-dictionary emission responsibilities.
+//!
 
 use crate::encryption::standard::{encrypt_cipher_bytes, ObjectKeyAlg, StringEncryptCipher};
 use crate::object_handle::ObjectHandle;

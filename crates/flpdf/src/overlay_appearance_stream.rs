@@ -1,10 +1,12 @@
-//! qpdf correspondence: QPDFAcroFormDocumentHelper.cc adjustAppearanceStream consuming resource_replacer.rs.
 //! Port of qpdf's `AcroForm::adjustAppearanceStream`, consuming the shared
 //! `ResourceReplacer` / `ResourceFinder` resource-replacement pipeline
 //! (`libqpdf/QPDFAcroFormDocumentHelper.cc:628-849`, `libqpdf/ResourceFinder.cc`),
 //! called from [`crate::AcroFormDocumentHelper::transform_annotations`] once
 //! per copied `/AP` appearance stream whenever an AcroForm placement's
 //! [`crate::acroform_document_helper::DrMap`] is non-empty.
+//!
+//! qpdf correspondence: QPDFAcroFormDocumentHelper.cc adjustAppearanceStream consuming resource_replacer.rs.
+//!
 //!
 //! An appearance stream copied from another document may reference resource
 //! names (a font, an `ExtGState`, ...) through its own `/Resources`

@@ -1,5 +1,6 @@
-//! qpdf correspondence: Rust crypto-crate substitution for qpdf's MD5 native implementation.
 //! Low-level cryptographic primitives used by the PDF security handler.
+//!
+//! qpdf correspondence: Rust crypto-crate substitution for qpdf's MD5 native implementation.
 //!
 //! All functions are `pub(crate)`; no dependency types from RustCrypto crates
 //! are exposed through the `flpdf` public API.

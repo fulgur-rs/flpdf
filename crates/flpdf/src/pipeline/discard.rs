@@ -1,4 +1,7 @@
+//! Terminal pipeline stage that discards output.
+//!
 //! qpdf correspondence: include/qpdf/Pl_Discard.hh:22-38 and libqpdf/Pl_Discard.cc:5-22 — terminal identifier, no-op writes and finishes, and reuse after finish.
+//!
 
 use super::{Pipeline, PipelineResult};
 

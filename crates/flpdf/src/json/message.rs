@@ -1,4 +1,7 @@
+//! JSON diagnostic message values.
+//!
 //! qpdf correspondence: JSON.cc and JSONHandler.cc use byte-oriented std::string diagnostics.
+//!
 
 use std::fmt;
 

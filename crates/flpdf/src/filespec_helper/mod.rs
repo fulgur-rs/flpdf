@@ -1,6 +1,8 @@
-//! qpdf correspondence: QPDFFileSpecObjectHelper.cc and QPDFEFStreamObjectHelper.cc.
 //! Typed wrappers for `/Filespec` dictionaries and `/EmbeddedFile` streams,
 //! plus a builder for constructing them.
+//!
+//! qpdf correspondence: QPDFFileSpecObjectHelper.cc and QPDFEFStreamObjectHelper.cc.
+//!
 //!
 //! [`FileSpec`] wraps a `/Filespec` dictionary and exposes ergonomic, typed
 //! accessors for all common fields (filename, description, embedded file

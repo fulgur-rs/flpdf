@@ -1,10 +1,12 @@
-//! qpdf correspondence: QPDF.cc getCompressibleObjGens eligibility traversal and predicate.
 //! ObjStm eligibility predicate — decides whether an indirect object may be
 //! stored inside an object stream (PDF 1.5+, ISO 32000-1 §7.5.7).
 //! The traversal preserves qpdf's depth-first eligibility order and records
 //! stale generations that the writer must serialize as null. It also records
 //! indirect `/Length` targets from the same reachable walk; it never scans the
 //! full xref/object universe just to compute an ObjStm planning exclusion.
+//!
+//! qpdf correspondence: QPDF.cc getCompressibleObjGens eligibility traversal and predicate.
+//!
 
 use std::collections::BTreeSet;
 use std::num::NonZeroUsize;

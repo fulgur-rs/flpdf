@@ -1,4 +1,7 @@
+//! Bit-level reader for linearization hint tables.
+//!
 //! qpdf correspondence: BitStream.cc and bits_functions.hh MSB-first bit reading with Rust error values.
+//!
 
 use std::cmp::min;
 

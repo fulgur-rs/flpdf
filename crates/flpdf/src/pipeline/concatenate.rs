@@ -1,4 +1,7 @@
+//! Pipeline stage for forwarding writes without ordinary finish calls.
+//!
 //! qpdf correspondence: Pl_Concatenate.cc forwards writes while suppressing ordinary finish calls.
+//!
 
 use super::{Pipeline, PipelineResult};
 

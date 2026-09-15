@@ -1,10 +1,12 @@
-//! qpdf correspondence: `QPDFJob` shared state and completion boundary.
-//!
 //! This module owns the state that qpdf keeps on `QPDFJob` itself rather than
 //! on an individual CLI route: the message prefix, logger, progress callback,
 //! warning aggregation, and the single warning-completion summary. JSON and
 //! ordinary page-inspection dispatch are layered on top of this state; write,
 //! page-transform, and remaining inspection consumers are later job slices.
+//!
+//! qpdf correspondence: `QPDFJob` shared state and completion boundary.
+//!
+//!
 
 use super::attachments::AttachmentAddOptions;
 use super::attachments::AttachmentCopyOptions;

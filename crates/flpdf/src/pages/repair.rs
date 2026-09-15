@@ -1,6 +1,8 @@
-//! qpdf correspondence: QPDF_pages.cc page-tree preparation responsibilities.
 //! Repairs the page tree before optimization and returns qpdf's effective page
 //! order. The normal non-linearized writer does not call this path.
+//!
+//! qpdf correspondence: QPDF_pages.cc page-tree preparation responsibilities.
+//!
 
 use std::collections::{BTreeSet, HashSet};
 use std::io::{Read, Seek};

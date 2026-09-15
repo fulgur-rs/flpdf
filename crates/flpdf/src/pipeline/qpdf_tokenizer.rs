@@ -1,4 +1,7 @@
+//! QPDF tokenization pipeline adapter.
+//!
 //! qpdf correspondence: Pl_QPDFTokenizer.cc buffered token-filter pipeline.
+//!
 
 use crate::{
     pipeline::{Pipeline, PipelineError, PipelineRef, PipelineResult},

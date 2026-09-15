@@ -1,5 +1,6 @@
-//! qpdf correspondence: `QPDFObjectHandle::getJSON` / `writeJSON` object serialization and `QPDF_Stream::writeStreamJSON` payload/dictionary normalization.
 //! qpdf JSON v2 value conversion and canonical object/stream serialization.
+//!
+//! qpdf correspondence: `QPDFObjectHandle::getJSON` / `writeJSON` object serialization and `QPDF_Stream::writeStreamJSON` payload/dictionary normalization.
 //!
 //! Provides the generic value-conversion frame for qpdf `--json` output.
 //! Section builders and command-boundary output selection are owned by

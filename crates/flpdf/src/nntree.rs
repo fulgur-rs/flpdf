@@ -1,7 +1,9 @@
-//! qpdf correspondence: NNTree.cc behavior implemented with Rust-specific storage, error, and ownership boundaries.
-//!
 //! This module provides the shared engine plus public wrappers corresponding
 //! to `QPDFNameTreeObjectHelper` and `QPDFNumberTreeObjectHelper`.
+//!
+//! qpdf correspondence: NNTree.cc behavior implemented with Rust-specific storage, error, and ownership boundaries.
+//!
+//!
 //!
 //! The traversal/mutation path is canonical `ObjectHandle` graph state: qpdf's
 //! `QPDFObjectHandle` nodes and arrays are kept live through lookup, cursor

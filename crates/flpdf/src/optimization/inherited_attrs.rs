@@ -1,10 +1,12 @@
-//! qpdf correspondence: QPDF_optimization.cc inherited-page-attribute push.
-//!
 //! Inheritable values are inspected through the canonical resolving handle
 //! accessors, so indirect values follow qpdf's lazy resolution and null-as-
 //! absent behavior without introducing a second value snapshot route. See
 //! `pages.rs`'s `resolve_inherited_handle_with_max_depth` for the corresponding
 //! compensation in the sibling bottom-up attribute climb.
+//!
+//! qpdf correspondence: QPDF_optimization.cc inherited-page-attribute push.
+//!
+//!
 //!
 //! Deviation: the descendant walk holds its suspended frames on the heap
 //! instead of the native call stack. qpdf recurses in

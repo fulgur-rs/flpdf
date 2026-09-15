@@ -1,4 +1,7 @@
+//! ASCIIHex decoding pipeline stage.
+//!
 //! qpdf correspondence: Pl_ASCIIHexDecoder.cc incremental decode state, output, error, and finish semantics.
+//!
 
 use super::{Pipeline, PipelineError, PipelineRef, PipelineResult};
 

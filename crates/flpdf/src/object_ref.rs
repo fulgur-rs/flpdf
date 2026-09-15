@@ -1,4 +1,7 @@
+//! PDF object-reference identity and parsing.
+//!
 //! qpdf correspondence: `QPDFObjGen` identity and command-line object-reference parsing.
+//!
 
 use std::fmt;
 use std::str::FromStr;

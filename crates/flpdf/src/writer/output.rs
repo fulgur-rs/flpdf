@@ -1,4 +1,7 @@
+//! Writer output sinks and deterministic-ID accounting.
+//!
 //! qpdf correspondence: QPDFWriter.cc pipeline ownership, Pl_Count accepted-byte accounting, PipelinePopper segment scopes, and deterministic-ID digest boundaries.
+//!
 
 use crate::{Error, Result};
 use md5::{Digest as _, Md5};

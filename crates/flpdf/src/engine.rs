@@ -1,6 +1,7 @@
+//! Rust splits QPDF.cc construction into `engine.rs` while retaining the single `Pdf<R>` type.
+//!
 //! qpdf correspondence: QPDF.cc document-construction entry points (`emptyPDF()`, `processFile()`, and `processMemoryFile()`) and their shared construction orchestration.
 //!
-//! Rust splits QPDF.cc construction into `engine.rs` while retaining the single `Pdf<R>` type.
 
 // Used by the public factory API's intra-doc links.
 #[allow(unused_imports)]

@@ -1,5 +1,6 @@
-//! qpdf correspondence: QPDFWriter.cc first-part linearized output split from the writer.
 //! Part 1 emitter — file header + linearization parameter dictionary.
+//!
+//! qpdf correspondence: QPDFWriter.cc first-part linearized output split from the writer.
 //!
 //! ISO 32000-1 Annex F §F.2 specifies that the first body section of a
 //! linearized PDF contains:

@@ -1,4 +1,7 @@
+//! Parse qpdf JSON values and callback events.
+//!
 //! qpdf correspondence: JSON.cc parser state machine and Reactor event responsibilities.
+//!
 
 use std::io::{BufRead, BufReader, Cursor, ErrorKind, Read};
 

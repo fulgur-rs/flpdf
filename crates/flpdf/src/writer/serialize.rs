@@ -1,4 +1,7 @@
+//! Shared writer serialization primitives.
+//!
 //! qpdf correspondence: QPDFWriter.cc shared object, stream, trailer, and xref serialization primitives.
+//!
 use super::{
     object_streams, output::OutputSink, CompressStreams, NewlineBeforeEndstream,
     ObjectWriterEmission,

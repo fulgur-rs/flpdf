@@ -1,5 +1,6 @@
-//! qpdf correspondence: QPDF_linearization.cc shared-object hint planning split into a data module.
 //! Shared Object Hint Table data structure (ISO 32000-1 Annex F.3.2).
+//!
+//! qpdf correspondence: QPDF_linearization.cc shared-object hint planning split into a data module.
 //!
 //! This module builds the **data** for the Shared Object Hint Table.  It does
 //! **not** encode the table as bits/bytes — that is the responsibility of the

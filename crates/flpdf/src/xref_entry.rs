@@ -1,4 +1,7 @@
+//! PDF cross-reference entry representation.
+//!
 //! qpdf correspondence: QPDFXRefEntry.cc cross-reference entry value representation.
+//!
 
 /// A PDF cross-reference entry.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]

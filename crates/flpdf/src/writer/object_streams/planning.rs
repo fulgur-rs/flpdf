@@ -1,6 +1,8 @@
-//! qpdf correspondence: QPDFWriter.cc object-stream planning and source-container preservation.
 //! The planner chooses generated batches, reconstructs source-backed Preserve
 //! groups, and applies writer reachability and output-placement policies.
+//!
+//! qpdf correspondence: QPDFWriter.cc object-stream planning and source-container preservation.
+//!
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::io::{Read, Seek};

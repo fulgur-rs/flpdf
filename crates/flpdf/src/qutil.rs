@@ -1,5 +1,3 @@
-//! qpdf correspondence: `QUtil.cc` integer conversion, filesystem identity, and UTF-8 single-byte encoding primitives.
-//!
 //! This module owns the qpdf `QUtil::string_to_int`, `QUtil::safe_fopen`,
 //! `QUtil::int_to_string_base`, `QUtil::toUTF8`, `QUtil::utf8_to_ascii`,
 //! `QUtil::utf8_to_win_ansi`, `QUtil::utf8_to_mac_roman`, and
@@ -9,6 +7,10 @@
 //! `libqpdf/QPDFFormFieldObjectHelper.cc:811-849`). It converts invalid or
 //! unrepresentable input to `?`, matching qpdf's default replacement argument.
 //! It does not own PDF resource lookup, font selection, or password policy.
+//!
+//! qpdf correspondence: `QUtil.cc` integer conversion, filesystem identity, and UTF-8 single-byte encoding primitives.
+//!
+//!
 
 use std::fs::{File, OpenOptions};
 use std::path::Path;

@@ -1,4 +1,7 @@
+//! PDF coordinate matrices and rectangle transforms.
+//!
 //! Mirrors qpdf 11.9.0 libqpdf/QPDFMatrix.cc.
+//!
 //! Public API: qpdf 11.9.0 include/qpdf/QPDFMatrix.hh.
 
 /// An axis-aligned rectangle represented by its lower-left and upper-right corners.

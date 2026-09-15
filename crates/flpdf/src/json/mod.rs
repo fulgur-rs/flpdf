@@ -1,4 +1,7 @@
+//! JSON parsing, callbacks, and serialization for qpdf-compatible values.
+//!
 //! qpdf correspondence: JSON.cc and JSONHandler.cc pipeline-native value, parse, callback, and serialization responsibilities.
+//!
 //! Public APIs: qpdf 11.9.0 `include/qpdf/JSON.hh` and
 //! `libqpdf/qpdf/JSONHandler.hh`.
 //!

@@ -1,10 +1,12 @@
-//! qpdf correspondence: `QPDFJob::handlePageSpecs` page-selection boundary.
-//!
 //! This module owns the part of qpdf's page operation that sits above the
 //! page-document helpers: it resolves each page specification against its
 //! source document, applies qpdf's spec-level collate order, and delegates
 //! object copying to the canonical multi-document merge primitive. The source
 //! documents stay alive for the whole operation, matching qpdf's page heap.
+//!
+//! qpdf correspondence: `QPDFJob::handlePageSpecs` page-selection boundary.
+//!
+//!
 
 use super::page_merge::{
     merge_documents_for_page_specs_into, source_top_level_field_names, MergeInput,

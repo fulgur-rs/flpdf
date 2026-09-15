@@ -1,5 +1,6 @@
-//! qpdf correspondence: QPDF_linearization.cc `isLinearized` detection and structural validation represented as a standalone checker.
 //! Linearization detector and structural checker.
+//!
+//! qpdf correspondence: QPDF_linearization.cc `isLinearized` detection and structural validation represented as a standalone checker.
 //!
 //! This module validates that a PDF file conforms to the linearization layout
 //! described in ISO 32000-1 Annex F.  It is invoked by the `check-linearization`

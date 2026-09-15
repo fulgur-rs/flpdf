@@ -1,5 +1,6 @@
-//! qpdf correspondence: `QPDFObjectHandle::ParserCallbacks` and `QPDFParser::warn` content boundary.
 //! Content-stream object callbacks (ISO 32000-1 §7.8.2).
+//!
+//! qpdf correspondence: `QPDFObjectHandle::ParserCallbacks` and `QPDFParser::warn` content boundary.
 //!
 //! A PDF content stream is a sequence of operands followed by an operator,
 //! interleaved with inline images and comments. This module routes the shared

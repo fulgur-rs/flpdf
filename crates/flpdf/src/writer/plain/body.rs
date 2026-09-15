@@ -1,4 +1,7 @@
+//! Plain-writer object-body emission.
+//!
 //! qpdf correspondence: QPDFWriter.cc plain object-body emission split from planning and xref output.
+//!
 use std::cell::{Cell, RefCell};
 use std::collections::{BTreeMap, BTreeSet, VecDeque};
 use std::io::{Read, Seek};

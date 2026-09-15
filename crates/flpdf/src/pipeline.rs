@@ -1,4 +1,7 @@
+//! Streaming pipeline traits and lifecycle errors.
+//!
 //! qpdf correspondence: Pipeline.cc write/finish chaining lifecycle represented by a public Rust trait; PipelineError models qpdf's logic_error/runtime_error exception channel.
+//!
 
 use std::borrow::Cow;
 use std::fmt;

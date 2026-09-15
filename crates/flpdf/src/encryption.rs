@@ -1,10 +1,12 @@
-//! qpdf correspondence: `QPDF_encryption.cc` encryption facade and domain configuration.
-//!
 //! This is the only crate-level encryption route. The child modules group the
 //! qpdf-owned state, Standard handler, key derivation, crypt-filter
 //! interpretation, password normalization, permission projection, and crypto
 //! primitives under one source-equivalent tree. Writer emission lifecycle and
 //! Pipeline stages remain in their corresponding QPDFWriter/Pl_* modules.
+//!
+//! qpdf correspondence: `QPDF_encryption.cc` encryption facade and domain configuration.
+//!
+//!
 //!
 //! Callers populate [`EncryptParams`] from CLI flags (or library API
 //! arguments) and pass it through [`crate::PdfWriter::set_encryption_parameters`]; the

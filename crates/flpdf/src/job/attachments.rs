@@ -1,4 +1,7 @@
+//! Attachment copying and inspection operations.
+//!
 //! qpdf correspondence: `QPDFJob::copyAttachments`, `QPDFJob::addAttachments`, `QPDFJob::doListAttachments`, and `QPDFJob::doShowAttachment`.
+//!
 //! (`libqpdf/QPDFJob.cc:876-927,2046-2135`).
 
 use super::attachment_list::format_attachment_list_with_sink;

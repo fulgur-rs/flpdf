@@ -1,4 +1,7 @@
+//! Base64 encoding and decoding pipeline stage.
+//!
 //! qpdf correspondence: Pl_Base64.cc streaming encode/decode, aliases, padding, and lifecycle.
+//!
 
 use super::{Pipeline, PipelineError, PipelineResult};
 

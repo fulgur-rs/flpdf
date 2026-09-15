@@ -1,5 +1,6 @@
-//! qpdf correspondence: QPDF::emptyPDF plus QPDFPageDocumentHelper.cc addPage, library level only.
 //! Page extraction into a fresh document.
+//!
+//! qpdf correspondence: QPDF::emptyPDF plus QPDFPageDocumentHelper.cc addPage, library level only.
 //!
 //! [`extract_pages`] builds a brand-new [`Pdf`] (via [`Pdf::empty`])
 //! containing the selected pages from `source` plus their reachable object

@@ -1,6 +1,8 @@
+//! Surgical in-place mutation of the `/Pages` tree.
+//!
 //! qpdf correspondence: `QPDFPageDocumentHelper.cc:37-52` delegates page insertion/removal to the page-tree owner.
+//!
 //! `QPDF_pages.cc:81-188,203-304` normalizes page-tree types, direct/duplicate kids, and maintains `/Kids`, `/Count`, and `/Parent` during those mutations.
-//! Surgical in-place splice of the `/Pages` tree.
 //!
 //! Unlike [`crate::pages::tree_rebuild`], which always produces a flat single-level
 //! tree, [`splice_pages`] preserves the existing multi-level `/Pages` structure

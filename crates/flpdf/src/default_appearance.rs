@@ -1,5 +1,6 @@
-//! qpdf correspondence: QPDFFormFieldObjectHelper.cc default-appearance parsing split from the form-field helper.
 //! Parser for the PDF `/DA` (default appearance) string.
+//!
+//! qpdf correspondence: QPDFFormFieldObjectHelper.cc default-appearance parsing split from the form-field helper.
 //!
 //! A `/DA` value is a small content-stream fragment such as
 //! `/Helv 0 Tf 0 g` that sets the font, size, and colour used to render

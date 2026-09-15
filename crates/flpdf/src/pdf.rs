@@ -1,4 +1,7 @@
+//! Central PDF document state and object-handle ownership.
+//!
 //! qpdf correspondence: QPDF's central document container, direct document-state accessors, and teardown (`include/qpdf/QPDF.hh:1438-1518`; `libqpdf/QPDF.cc:215-232,2323-2358,2647-2651`).
+//!
 
 use crate::acroform_document_helper::AcroFormCache;
 use crate::encryption::state::{EncryptionInspectionState, EncryptionState};

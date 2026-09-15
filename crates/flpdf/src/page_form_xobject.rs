@@ -1,6 +1,8 @@
-//! qpdf correspondence: QPDFPageObjectHelper.cc page-to-Form-XObject conversion split from the page helper.
 //! Convert a page into a Form XObject, mirroring qpdf's
 //! `QPDFPageObjectHelper::getFormXObjectForPage`.
+//!
+//! qpdf correspondence: QPDFPageObjectHelper.cc page-to-Form-XObject conversion split from the page helper.
+//!
 //!
 //! This is the building block beneath qpdf's overlay/underlay feature: each
 //! destination page is wrapped into a Form XObject (its content moves inside

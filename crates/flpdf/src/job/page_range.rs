@@ -1,5 +1,6 @@
-//! qpdf correspondence: QPDFJob.cc page-range parsing split from page-operation orchestration.
 //! Page-range value owned by qpdf's `QUtil::parse_numrange` primitive.
+//!
+//! qpdf correspondence: QPDFJob.cc page-range parsing split from page-operation orchestration.
 //!
 //! # Syntax
 //!

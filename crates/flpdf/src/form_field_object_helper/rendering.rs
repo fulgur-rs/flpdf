@@ -1,5 +1,6 @@
-//! qpdf correspondence: `QPDFFormFieldObjectHelper.cc` rendering primitives.
 //! Appearance-stream generators for AcroForm widgets.
+//!
+//! qpdf correspondence: `QPDFFormFieldObjectHelper.cc` rendering primitives.
 //!
 //! This module builds the `/AP/N` (normal-appearance) Form XObject for
 //! AcroForm **Tx** and **Ch** widgets. Button appearance generation is not

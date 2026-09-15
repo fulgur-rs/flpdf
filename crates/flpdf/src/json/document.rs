@@ -1,8 +1,10 @@
-//! qpdf correspondence: QPDF_json.cc document input boundary for `createFromJSON`, `updateFromJSON`, and `importJSON` (`libqpdf/QPDF_json.cc:54-63,795-832`).
-//!
 //! The document boundary intentionally stays separate from [`super::input`]:
 //! the reactor owns JSON state and object mutation, while this module owns the
 //! qpdf rootless bootstrap, source lifetime, and exception/error boundary.
+//!
+//! qpdf correspondence: QPDF_json.cc document input boundary for `createFromJSON`, `updateFromJSON`, and `importJSON` (`libqpdf/QPDF_json.cc:54-63,795-832`).
+//!
+//!
 
 use super::input::JsonReactor;
 use super::{parse_reader, JsonError};

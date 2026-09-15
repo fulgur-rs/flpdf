@@ -1,4 +1,7 @@
+//! PDF writer orchestration and shared writer modules.
+//!
 //! qpdf correspondence: QPDFWriter.cc writer lifecycle and responsibilities shared with writer submodules and linearization.
+//!
 #[path = "writer/encrypted_strings.rs"]
 pub(crate) mod encrypted_strings;
 #[path = "writer/encryption_state.rs"]

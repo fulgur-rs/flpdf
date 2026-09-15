@@ -1,4 +1,7 @@
+//! Writer optimization helpers for page attributes, reachability, and object streams.
+//!
 //! qpdf correspondence: QPDF_optimization.cc optimization orchestration, inherited-page preparation, object-user maps, and compressed-object folding.
+//!
 
 pub(crate) mod inherited_attrs;
 

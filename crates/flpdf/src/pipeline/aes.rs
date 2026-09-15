@@ -1,3 +1,5 @@
+//! AES encryption pipeline stage.
+//!
 //! qpdf correspondence: Pl_AES_PDF.cc AES-128/192/256 CBC with the PDF block padding of ISO 32000-1 section 7.6.2, streamed one 16-byte block at a time.
 //!
 //! qpdf reaches AES through `QPDFCryptoImpl::rijndael_init`/`rijndael_process`

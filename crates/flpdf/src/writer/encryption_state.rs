@@ -1,4 +1,7 @@
+//! Writer-owned encryption parameters and per-object data-key state.
+//!
 //! qpdf correspondence: QPDFWriter.hh:641-663 and QPDFWriter.cc:842-847 current data-key state.
+//!
 
 use crate::encryption::primitives::compute_data_key;
 

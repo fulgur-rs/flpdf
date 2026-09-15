@@ -1,5 +1,6 @@
-//! qpdf correspondence: QPDFPageObjectHelper.cc responsibilities shared with page form, resource, flatten, and overlay modules.
 //! Per-page typed accessor helper, mirroring qpdf's `QPDFPageObjectHelper`.
+//!
+//! qpdf correspondence: QPDFPageObjectHelper.cc responsibilities shared with page form, resource, flatten, and overlay modules.
 //!
 //! [`PageObjectHelper`] wraps a single leaf `/Page` [`ObjectRef`] together with
 //! a `&mut Pdf<R>` and exposes ergonomic, typed accessors for the most common

@@ -1,5 +1,6 @@
-//! qpdf correspondence: QPDFJob.cc page rotation plus QPDFPageObjectHelper.cc matrix responsibilities.
 //! `/Rotate` manipulation for PDF pages.
+//!
+//! qpdf correspondence: QPDFJob.cc page rotation plus QPDFPageObjectHelper.cc matrix responsibilities.
 //!
 //! ISO 32000-1 §7.7.3.4 lists `/Rotate` as an inheritable page attribute; its default
 //! when absent at every level is `0` (§7.7.3.3 Table 30).

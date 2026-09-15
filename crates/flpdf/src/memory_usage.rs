@@ -1,4 +1,7 @@
+//! Platform memory-usage reporting utilities.
+//!
 //! qpdf correspondence: `QUtil::get_max_memory_usage`.
+//!
 //! (`libqpdf/QUtil.cc:1941-2002`).
 //!
 //! qpdf uses glibc's `malloc_info` XML on Linux and returns zero when that

@@ -1,4 +1,7 @@
+//! Test-only instrumentation for pipeline behavior.
+//!
 //! qpdf correspondence: flpdf-only test instrumentation for observable Pipeline downstream calls and failures.
+//!
 
 use std::cell::RefCell;
 use std::rc::Rc;

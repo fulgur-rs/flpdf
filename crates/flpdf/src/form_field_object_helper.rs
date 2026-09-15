@@ -1,10 +1,12 @@
-//! qpdf correspondence: `QPDFFormFieldObjectHelper.cc`.
-//!
 //! This module keeps form-field lookup and mutation on qpdf-shaped live
 //! [`ObjectHandle`] values. In particular, a field helper never snapshots a
 //! dictionary and writes a reconstructed value back through a legacy reader
 //! cache: qpdf's helper owns the selected handle and mutates the
 //! object graph that every other handle in the document observes.
+//!
+//! qpdf correspondence: `QPDFFormFieldObjectHelper.cc`.
+//!
+//!
 //!
 //! Parent-chain cycle detection follows qpdf's `QPDFObjGen::set`: indirect
 //! object identities are keyed by raw `QpdfObjGen` in a `BTreeSet` (O(log n)

@@ -1,5 +1,6 @@
-//! qpdf correspondence: QPDFPageDocumentHelper.cc responsibilities split with page extraction.
 //! High-level page-document helper, mirroring qpdf's `QPDFPageDocumentHelper`.
+//!
+//! qpdf correspondence: QPDFPageDocumentHelper.cc responsibilities split with page extraction.
 //!
 //! The public surface mirrors qpdf 11.9.0's seven
 //! `QPDFPageDocumentHelper` operations: page enumeration, inherited-attribute

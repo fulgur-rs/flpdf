@@ -1,3 +1,5 @@
+//! JPEG/DCT decoding and encoding pipeline stage.
+//!
 //! qpdf correspondence: `Pl_DCT` buffers compressed input and decodes it on `finish`, emitting one decoded scanline at a time to the next pipeline.
 //!
 //! The default backend validates the entropy boundary of baseline single-scan

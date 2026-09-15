@@ -1,4 +1,7 @@
+//! Import qpdf JSON into the live PDF object graph.
+//!
 //! qpdf correspondence: `QPDF_json.cc` JSONReactor state machine, validators, deferred stream providers, and `makeObject` value construction.
+//!
 //! (`libqpdf/QPDF_json.cc:233-832`; `libqpdf/QUtil.cc:642-663`).
 //!
 //! This is the canonical value boundary for the JSON input importer. It builds

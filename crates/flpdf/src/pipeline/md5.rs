@@ -1,4 +1,7 @@
+//! MD5 digest pipeline stage.
+//!
 //! qpdf correspondence: libqpdf/Pl_MD5.cc:5-65 and libqpdf/qpdf/Pl_MD5.hh:4-33 — unchanged forwarding, enable/persist state, reusable finish lifecycle, and hexadecimal digest retrieval.
+//!
 
 use super::{Pipeline, PipelineError, PipelineResult};
 use md5::{Digest, Md5};

@@ -1,5 +1,6 @@
-//! qpdf correspondence: QPDF_pages.cc traversal responsibilities shared with page-tree rebuild and linearization repair.
 //! Page-tree traversal helpers.
+//!
+//! qpdf correspondence: QPDF_pages.cc traversal responsibilities shared with page-tree rebuild and linearization repair.
 //!
 //! Iterates the document's `/Pages` tree in the order described by ISO 32000-1 §7.7.3.2
 //! and yields the `ObjectRef` of every leaf `Page` node. The walker tolerates broken
