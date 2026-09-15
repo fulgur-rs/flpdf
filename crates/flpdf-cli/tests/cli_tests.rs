@@ -9560,8 +9560,9 @@ fn no_original_object_ids_default_behavior_unchanged() {
 
 #[test]
 fn no_original_object_ids_conflicts_with_json() {
-    // Mirrors how `--static-id` conflicts with `--json`: combining a QDF/rewrite
-    // modifier with --json is a usage error, not a silently-ignored flag.
+    // `--no-original-object-ids` remains a JSON-incompatible QDF modifier;
+    // unlike the writer-only ID settings covered by the qpdf conflict matrix,
+    // this route-specific conflict is intentionally outside flpdf-p50gt.
     Command::cargo_bin("flpdf")
         .unwrap()
         .args([

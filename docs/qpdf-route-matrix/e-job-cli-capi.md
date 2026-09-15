@@ -948,6 +948,26 @@ nine remaining cells, and two JSON-output symmetry cells against qpdf 11.9.0,
 including exit status, stdout, stderr, and JSON output bytes. Other
 inspection-route conflict edges remain outside this bounded E-17/E-21 slice.
 
+### E-17 / E-21 JSON writer-option conflict acceptance (`flpdf-p50gt`, 2026-09-15)
+
+qpdf 11.9.0 also accepts the nine combinations formed by
+`--static-id`, `--deterministic-id`, or `--coalesce-contents` with each of
+`--json-output=2`, `--json`, and `--json=2`. These options are not rejected by
+`QPDFJob::checkConfiguration`; qpdf completes create-stage transformations
+before selecting JSON serialization (`libqpdf/QPDFJob.cc:459-480,567-642,3030-3057`;
+`libqpdf/QPDFJob_config.cc:88-92,162-166,247-325,619-623`).
+
+The top-level flpdf JSON declarations now retain their unrelated bounded
+inspection conflicts but remove the six clap conflict entries that caused
+these nine combinations. The three JSON input branches pass
+`coalesce_contents` through the existing
+`QPDFJob::apply_transformations` boundary before
+`QPDFJob::write_json_with_version`; the ID flags remain writer-only settings
+for JSON. `cli_qpdf_conflict_matrix.rs::qpdf_id_and_coalesce_json_conflicts_match_qpdf`
+compares all nine cells with qpdf 11.9.0 for exit status, stdout, stderr, and
+JSON output bytes. This is a bounded E-17/E-21 correction and does not claim
+route-wide removal of other conflict edges.
+
 ## E-10 primary document graph retention in distinct-secondary `--pages` (`flpdf-lrm3u`, 2026-09-15)
 
 qpdf keeps the primary `QPDF` as the page-job base while

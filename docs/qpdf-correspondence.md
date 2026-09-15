@@ -3692,6 +3692,25 @@ writerを起動せず、inspection/JSONの処理を継続する。`--json-output
 出力を比較する。別のinspection consumerの未移行conflictをこのbounded sliceへ
 取り込まず、qpdfに対応するbridgeやdeviation markerも追加しない。
 
+### QPDFJob JSON writer-option conflict acceptance (`flpdf-p50gt`, 2026-09-15)
+
+qpdf 11.9.0 は `--static-id`、`--deterministic-id`、
+`--coalesce-contents` を JSON stdout/file output と相互排他にしない。
+`checkConfiguration` にこの9組の検査はなく、`createQPDF` が create-stage
+変換を終えてから `writeQPDF` の JSON consumer を選ぶためである
+（`libqpdf/QPDFJob.cc:459-480,567-642,3030-3057`;
+`libqpdf/QPDFJob_config.cc:88-92,162-166,247-325,619-623`）。
+ID の2設定は JSON serializer では writer-only のため出力処理を妨げず、
+`coalesce-contents` は JSON serialization 前の create-stage で適用される。
+
+flpdf は top-level `--json` / `--json-output` の clap conflict からこの3
+optionを除去し、3分岐の JSON route で `coalesce_contents` を既存の
+`QPDFJob::apply_transformations` 境界へ渡してから
+`QPDFJob::write_json_with_version` を呼ぶ。テストは3 option × 3 JSON mode
+の9組について qpdf 11.9.0 と exit status・stdout・stderr・JSON output
+bytes を比較する。未監査の route-specific conflict はこの issue の範囲に
+含めず、独自 bridge や qpdf-deviation marker は追加しない。
+
 ### Top-level attachment mutation with a single inspection (`flpdf-awthm`, 2026-09-15)
 
 qpdf's `createQPDF` always completes `handleTransformations`, including

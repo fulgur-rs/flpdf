@@ -1784,17 +1784,15 @@ fn json_flag_accepts_compress_streams_like_qpdf() {
 }
 
 /// `--json-output` dispatches through the same `run_json` boundary as
-/// `--json`. Every exclusive rewrite or inspection flag that the latter
-/// rejects must be rejected here too; create-stage transformations are
-/// intentionally absent because `run_json` applies them before serialization.
+/// `--json`. Every route-specific rewrite or inspection flag that the latter
+/// rejects must be rejected here too; qpdf-accepted create-stage combinations
+/// are covered by the differential conflict matrix instead.
 /// Keep this table aligned with `Cli::json`'s `conflicts_with_all` list,
 /// including the later-added encryption checks.
 #[test]
 fn json_output_conflicts_with_the_json_exclusive_flag_set() {
     let cases: &[&[&str]] = &[
         &["--check"],
-        &["--static-id"],
-        &["--deterministic-id"],
         &["--static-aes-iv"],
         &["--show-object=trailer"],
         &["--show-npages"],
@@ -1810,7 +1808,6 @@ fn json_output_conflicts_with_the_json_exclusive_flag_set() {
         &["--list-attachments"],
         &["--show-attachment=key"],
         &["--no-original-object-ids"],
-        &["--coalesce-contents"],
         &["--preserve-unreferenced"],
     ];
 

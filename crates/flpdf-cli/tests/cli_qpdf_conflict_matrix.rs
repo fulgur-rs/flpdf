@@ -103,6 +103,14 @@ fn json_args(extra: &[OsString], input: &Path) -> Vec<OsString> {
     args
 }
 
+fn json_mode_args(mode: &str, extra: &[OsString], input: &Path) -> Vec<OsString> {
+    let mut args = vec![OsString::from(mode)];
+    args.extend_from_slice(extra);
+    args.push(input.as_os_str().to_owned());
+    args.push(OsString::from("-"));
+    args
+}
+
 fn assert_json_output_pair(label: &str, extra: &[OsString], input: &Path) {
     let temp = tempfile::tempdir().expect("temporary JSON output directory");
     let qpdf_output = temp.path().join("qpdf.json");
@@ -310,4 +318,39 @@ fn qpdf_writer_and_attachment_conflicts_match_qpdf() {
         &three_page,
     );
     assert_json_output_pair("qdf + json-output", &[OsString::from("--qdf")], &three_page);
+}
+
+#[test]
+fn qpdf_id_and_coalesce_json_conflicts_match_qpdf() {
+    if skip_without_qpdf() {
+        return;
+    }
+
+    let three_page = fixture("three-page.pdf");
+    let multiple_contents = fixture("qdf-contents-ref-array.pdf");
+    let transforms = [
+        OsString::from("--static-id"),
+        OsString::from("--deterministic-id"),
+        OsString::from("--coalesce-contents"),
+    ];
+    let json_modes = ["--json-output=2", "--json", "--json=2"];
+
+    for transform in &transforms {
+        let input = if transform == &transforms[2] {
+            &multiple_contents
+        } else {
+            &three_page
+        };
+        for mode in json_modes {
+            let label = format!("{transform:?} + {mode}");
+            if mode == "--json-output=2" {
+                assert_json_output_pair(&label, std::slice::from_ref(transform), input);
+            } else {
+                assert_pair(
+                    &label,
+                    &json_mode_args(mode, std::slice::from_ref(transform), input),
+                );
+            }
+        }
+    }
 }
