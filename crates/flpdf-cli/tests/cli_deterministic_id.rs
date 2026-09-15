@@ -291,9 +291,11 @@ fn static_and_deterministic_id_remain_incompatible_with_encryption() {
 }
 
 #[test]
-fn deterministic_id_conflicts_with_json() {
-    // --json is dispatched before any rewrite path; without the conflict the
-    // flag would be silently ignored. clap must reject the combination.
+fn deterministic_id_is_accepted_with_json() {
+    // qpdf accepts this writer-only setting with JSON inspection. The
+    // differential conflict matrix checks the complete qpdf output, while
+    // this regression keeps the top-level parser from reintroducing the old
+    // clap-only rejection.
     let input = fixture_path("one-page.pdf");
 
     CargoCommand::cargo_bin("flpdf")
@@ -301,8 +303,8 @@ fn deterministic_id_conflicts_with_json() {
         .args(["--json", "--deterministic-id"])
         .arg(&input)
         .assert()
-        .failure()
-        .stderr(predicate::str::contains("cannot be used with"));
+        .success()
+        .stdout(predicate::str::contains("\"version\": 2"));
 }
 
 fn run_rewrite_linearize_det_id(input: &Path, output: &Path) {

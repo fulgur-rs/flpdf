@@ -932,13 +932,13 @@ struct Cli {
     // JSON mode remains exclusive with inspection modes that claim the
     // no-output branch and with the OUTPUT positional contract. qpdf still
     // accepts the writer/attachment combinations covered below: writer-only
-    // settings are ignored by JSON, while attachment mutations are applied
-    // by the same create-stage Job before serialization.
+    // settings are ignored by JSON, while create-stage transformations and
+    // attachment mutations are applied by the same Job before serialization.
     #[arg(long, num_args = 0..=1, default_missing_value = "2",
           require_equals = true,
           value_name = "VERSION", value_parser = ["1", "2", "latest"],
           conflicts_with_all = [
-              "check", "static_id", "deterministic_id", "static_aes_iv",
+              "check", "static_aes_iv",
               "show_object",
               "show_npages", "show_pages", "show_xref", "show_linearization",
               "show_encryption",
@@ -947,7 +947,7 @@ struct Cli {
               "linearize_pass1", "remove_restrictions",
               "copy_encryption",
               "list_attachments", "show_attachment",
-              "no_original_object_ids", "coalesce_contents",
+              "no_original_object_ids",
               "preserve_unreferenced",
           ],
           help = "Generate JSON v2 output (qpdf --json compatible)")]
@@ -992,7 +992,7 @@ struct Cli {
         value_name = "VERSION",
         value_parser = ["1", "2", "latest"],
         conflicts_with_all = [
-            "check", "static_id", "deterministic_id", "static_aes_iv",
+            "check", "static_aes_iv",
             "show_object",
             "show_npages", "show_pages", "show_xref", "show_linearization",
             "show_encryption",
@@ -1001,7 +1001,7 @@ struct Cli {
             "linearize_pass1", "remove_restrictions",
             "copy_encryption",
             "list_attachments", "show_attachment",
-            "no_original_object_ids", "coalesce_contents",
+            "no_original_object_ids",
             "preserve_unreferenced",
         ],
         help = "Generate qpdf JSON output; VERSION defaults to 2 and the output file is positional"
@@ -1291,10 +1291,10 @@ struct Cli {
     /// `--coalesce-contents` equivalent). Requires a full rewrite of the
     /// document. It may be combined with `--linearize`; qpdf applies this
     /// create-stage transformation before constructing its linearized writer.
-    /// The bounded inspection combinations tracked by flpdf-ca9zm are routed
-    /// through the combined QPDFJob transformation boundary; other standalone
-    /// inspection conflicts remain explicit until their own consumer scope is
-    /// audited.
+    /// The top-level JSON route also applies this create-stage transformation
+    /// before serializing, matching qpdf's `createQPDF`/`writeQPDF` boundary.
+    /// Other standalone inspection conflicts remain explicit until their own
+    /// consumer scope is audited.
     #[arg(long = "coalesce-contents",
           conflicts_with_all = [
               "show_object",
@@ -4458,7 +4458,14 @@ fn run_json(
 
     if empty {
         let mut pdf = create_empty_primary_document(&mut job, cli.update_from_json.as_deref())?;
-        apply_inspection_transformations(&mut job, &mut pdf, transform_options, cli.verbose)?;
+        apply_top_level_inspection_transformations(
+            &mut job,
+            &mut pdf,
+            transform_options,
+            cli.verbose,
+            false,
+            cli.coalesce_contents,
+        )?;
         let mut runtime = JsonJobRuntime {
             input_identity: None,
             output_path,
@@ -4500,7 +4507,14 @@ fn run_json(
             .create_from_json_document(input_file, path_description(input))
             .map_err(|error| json_error_with_file(input, Box::new(error)))?;
         apply_json_update_with_job(&mut job, &mut pdf, cli.update_from_json.as_deref())?;
-        apply_inspection_transformations(&mut job, &mut pdf, transform_options, cli.verbose)?;
+        apply_top_level_inspection_transformations(
+            &mut job,
+            &mut pdf,
+            transform_options,
+            cli.verbose,
+            false,
+            cli.coalesce_contents,
+        )?;
         let mut runtime = JsonJobRuntime {
             input_identity: Some(&input_identity),
             output_path,
@@ -4525,7 +4539,14 @@ fn run_json(
         job.record_document_warnings(&pdf);
         apply_json_update_with_job(&mut job, &mut pdf, cli.update_from_json.as_deref())?;
         apply_json_page_specs(&mut job, &mut pdf, input, &cli.page_ops)?;
-        apply_inspection_transformations(&mut job, &mut pdf, transform_options, cli.verbose)?;
+        apply_top_level_inspection_transformations(
+            &mut job,
+            &mut pdf,
+            transform_options,
+            cli.verbose,
+            false,
+            cli.coalesce_contents,
+        )?;
         let mut runtime = JsonJobRuntime {
             input_identity: Some(&input_identity),
             output_path,
