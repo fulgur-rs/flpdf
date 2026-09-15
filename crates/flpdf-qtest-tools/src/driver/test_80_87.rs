@@ -431,172 +431,10 @@ pub(crate) fn run_test_84<R: Read + Seek>(
     Ok(())
 }
 
-// getValueAsBool (`libqpdf/QPDFObjectHandle.cc:489-498`): the out-parameter
-// is only ever written on success, matching `asBool()`'s type-checked
-// `Option`.
-fn value_as_bool(handle: &ObjectHandle, out: &mut bool) -> bool {
-    match handle.as_boolean() {
-        Some(value) => {
-            *out = value;
-            true
-        }
-        None => false,
-    }
-}
-
-// getValueAsInt(long long&) (`libqpdf/QPDFObjectHandle.cc:515-524`): no
-// clamping at this width.
-fn value_as_int_i64(handle: &ObjectHandle, out: &mut i64) -> bool {
-    match handle.as_integer() {
-        Some(value) => {
-            *out = value;
-            true
-        }
-        None => false,
-    }
-}
-
-// getValueAsInt(int&) (`libqpdf/QPDFObjectHandle.cc:545-553`) defers to
-// getIntValueAsInt's clamp (`:526-543`). Use the canonical ObjectHandle
-// accessor so qpdf's contextless clamp warnings reach the default logger.
-fn value_as_int_i32(handle: &ObjectHandle, out: &mut i32) -> flpdf::Result<bool> {
-    // qpdf's guard is `isInteger()`, which dereferences
-    // (`libqpdf/QPDFObjectHandle.cc:359-362` via `dereference()`), so an
-    // indirect integer succeeds and clamps rather than reporting failure.
-    if !handle.try_is_integer()? {
-        return Ok(false);
-    }
-    *out = handle.try_get_int_value_as_int()?;
-    Ok(true)
-}
-
-// getValueAsUInt(unsigned long long&) (`libqpdf/QPDFObjectHandle.cc:569-577`),
-// deferring to getUIntValue (`:555-567`). Use the canonical accessor so the
-// negative-to-zero warning is emitted by ObjectHandle::warn_if_possible.
-fn value_as_uint_u64(handle: &ObjectHandle, out: &mut u64) -> flpdf::Result<bool> {
-    // qpdf's guard is `isInteger()`, which dereferences
-    // (`libqpdf/QPDFObjectHandle.cc:359-362` via `dereference()`), so an
-    // indirect integer succeeds and clamps rather than reporting failure.
-    if !handle.try_is_integer()? {
-        return Ok(false);
-    }
-    *out = handle.try_get_uint_value()?;
-    Ok(true)
-}
-
-// getValueAsUInt(unsigned int&) (`libqpdf/QPDFObjectHandle.cc:598-606`),
-// deferring to getUIntValueAsUInt's clamp (`:579-596`): a negative integer
-// clamps to 0, and a value above `UINT_MAX` clamps to `UINT_MAX`. Use the
-// canonical accessor so both clamp warnings retain qpdf's call order.
-fn value_as_uint_u32(handle: &ObjectHandle, out: &mut u32) -> flpdf::Result<bool> {
-    // qpdf's guard is `isInteger()`, which dereferences
-    // (`libqpdf/QPDFObjectHandle.cc:359-362` via `dereference()`), so an
-    // indirect integer succeeds and clamps rather than reporting failure.
-    if !handle.try_is_integer()? {
-        return Ok(false);
-    }
-    *out = handle.try_get_uint_value_as_uint()?;
-    Ok(true)
-}
-
-// getValueAsReal (`libqpdf/QPDFObjectHandle.cc:622-630`): only a real value
-// succeeds, yielding `QPDF_Real`'s own stored source string. This crate's
-// `ObjectValue::RealLiteral` keeps that exact source string alongside the
-// parsed `f64` (the handle's preserved-literal invariant: the literal differs
-// from `value.to_string()`, which is exactly why `42.0` -- whose
-// `f64::to_string()` is `"42"` -- must be built via `real_literal` here
-// rather than the literal-free `ObjectHandle::real` constructor, whose
-// stored string this helper does not attempt to recover).
-fn value_as_real(handle: &ObjectHandle, out: &mut Vec<u8>) -> bool {
-    match handle.as_real_literal() {
-        Some((_, literal)) => {
-            *out = literal;
-            true
-        }
-        None => false,
-    }
-}
-
-// getValueAsNumber (`libqpdf/QPDFObjectHandle.cc:391-399`): succeeds for
-// either an integer or a real value, converting to `f64`.
-fn value_as_number(handle: &ObjectHandle, out: &mut f64) -> bool {
-    if let Some(value) = handle.as_integer() {
-        *out = value as f64;
-        true
-    } else if let Some(value) = handle.as_real() {
-        *out = value;
-        true
-    } else {
-        false
-    }
-}
-
-// getValueAsName (`libqpdf/QPDFObjectHandle.cc:646-654`): returns
-// `QPDF_Name`'s raw internal string, which always includes the leading `/`
-// (`libqpdf/QPDF_Name.cc`) -- unlike this crate's `ObjectValue::Name`, whose
-// public `ObjectHandle::as_name` stores and returns the decoded bytes
-// *without* the leading slash (the same convention `test_0_1.rs`'s
-// `write_object_details` relies on, re-adding the slash only at the print
-// site). Re-add it here to match qpdf's string byte-for-byte.
-fn value_as_name(handle: &ObjectHandle, out: &mut Vec<u8>) -> bool {
-    match handle.as_name() {
-        Some(name) => {
-            let mut value = Vec::with_capacity(name.len() + 1);
-            value.push(b'/');
-            value.extend_from_slice(&name);
-            *out = value;
-            true
-        }
-        None => false,
-    }
-}
-
-// getValueAsUTF8 (`libqpdf/QPDFObjectHandle.cc:693-702`): succeeds only for
-// a string value, converting its stored bytes with `QPDF_String::getUTF8Val`
-// -- ported publicly as `pdf_string::utf8_value`.
-fn value_as_utf8(handle: &ObjectHandle, out: &mut Vec<u8>) -> bool {
-    match handle.as_string() {
-        Some(bytes) => {
-            *out = flpdf::pdf_string::utf8_value(&bytes);
-            true
-        }
-        None => false,
-    }
-}
-
-// getValueAsOperator (`libqpdf/QPDFObjectHandle.cc:718-726`): the stored
-// token bytes are used verbatim.
-fn value_as_operator(handle: &ObjectHandle, out: &mut Vec<u8>) -> bool {
-    match handle.as_operator() {
-        Some(bytes) => {
-            *out = bytes;
-            true
-        }
-        None => false,
-    }
-}
-
-// getValueAsInlineImage (`libqpdf/QPDFObjectHandle.cc:740-748`): the stored
-// payload bytes are used verbatim.
-fn value_as_inline_image(handle: &ObjectHandle, out: &mut Vec<u8>) -> bool {
-    match handle.as_inline_image() {
-        Some(bytes) => {
-            *out = bytes;
-            true
-        }
-        None => false,
-    }
-}
-
 /// qpdf's test_85 (`test_driver.cc:2973-3062`) exercises the
-/// `QPDFObjectHandle::getValueAs...` out-parameter accessor family across
-/// every scalar type, including `int`/`unsigned int` clamping at the
-/// `INT_MIN`/`INT_MAX`/`UINT_MAX` boundaries. No stdout is printed; only
-/// internal assertions. Every accessor in this family is warning-free (it
-/// simply reports success or failure), so it is fully expressible with this
-/// crate's public, infallible `as_*` accessors plus the clamp/UTF-8 logic
-/// above -- unlike test_81's single-value `getIntValue`, which warns (or, for
-/// a document-less handle, throws).
+/// `QPDFObjectHandle::getValueAs...` family in qpdf call order. The canonical
+/// Rust accessors resolve the receiver, return `None` without a type warning
+/// for a wrong type, and retain qpdf's integer clamp warnings.
 pub(crate) fn run_test_85<R: Read + Seek>(
     _pdf: &mut Pdf<R>,
     _filename: &[u8],
@@ -617,92 +455,53 @@ pub(crate) fn run_test_85<R: Read + Seek>(
     let oh_o = ObjectHandle::operator(b"/Test".to_vec());
     let oh_ii = ObjectHandle::inline_image(b"/Test".to_vec());
 
-    let mut b = true;
-    assert!(value_as_bool(&oh_b, &mut b));
-    assert!(!b);
-    assert!(!value_as_bool(&oh_i, &mut b));
-    assert!(!b);
+    assert_eq!(oh_b.try_get_value_as_bool()?, Some(false));
+    assert_eq!(oh_i.try_get_value_as_bool()?, None);
+    assert_eq!(oh_i.try_get_value_as_int()?, Some(1));
+    assert_eq!(oh_b.try_get_value_as_int()?, None);
+    assert_eq!(oh_i.try_get_value_as_int_as_int()?, Some(1));
+    assert_eq!(oh_b.try_get_value_as_int_as_int()?, None);
+    assert_eq!(oh_i_maxplus.try_get_value_as_int_as_int()?, Some(i32::MAX));
+    assert_eq!(oh_i_minminus.try_get_value_as_int_as_int()?, Some(i32::MIN));
 
-    let mut li: i64 = 0;
-    assert!(value_as_int_i64(&oh_i, &mut li));
-    assert_eq!(li, 1);
-    assert!(!value_as_int_i64(&oh_b, &mut li));
-    assert_eq!(li, 1);
+    assert_eq!(oh_i.try_get_value_as_uint()?, Some(1));
+    assert_eq!(oh_b.try_get_value_as_uint()?, None);
+    assert_eq!(oh_i_neg.try_get_value_as_uint()?, Some(0));
+    assert_eq!(oh_i.try_get_value_as_uint_as_uint()?, Some(1));
+    assert_eq!(oh_b.try_get_value_as_uint_as_uint()?, None);
+    assert_eq!(oh_i_neg.try_get_value_as_uint_as_uint()?, Some(0));
+    assert_eq!(
+        oh_i_umaxplus.try_get_value_as_uint_as_uint()?,
+        Some(u32::MAX)
+    );
 
-    let mut i: i32 = 0;
-    assert!(value_as_int_i32(&oh_i, &mut i)?);
-    assert_eq!(i, 1);
-    assert!(!value_as_int_i32(&oh_b, &mut i)?);
-    assert_eq!(i, 1);
-    assert!(value_as_int_i32(&oh_i_maxplus, &mut i)?);
-    assert_eq!(i, i32::MAX);
-    assert!(value_as_int_i32(&oh_i_minminus, &mut i)?);
-    assert_eq!(i, i32::MIN);
+    assert_eq!(oh_r.try_get_value_as_real()?, Some(b"42.0".to_vec()));
+    assert_eq!(oh_i.try_get_value_as_real()?, None);
 
-    let mut uli: u64 = 0;
-    assert!(value_as_uint_u64(&oh_i, &mut uli)?);
-    assert_eq!(uli, 1);
-    assert!(!value_as_uint_u64(&oh_b, &mut uli)?);
-    assert_eq!(uli, 1);
-    assert!(value_as_uint_u64(&oh_i_neg, &mut uli)?);
-    assert_eq!(uli, 0);
-
-    let mut ui: u32 = 0;
-    assert!(value_as_uint_u32(&oh_i, &mut ui)?);
-    assert_eq!(ui, 1);
-    assert!(!value_as_uint_u32(&oh_b, &mut ui)?);
-    assert_eq!(ui, 1);
-    assert!(value_as_uint_u32(&oh_i_neg, &mut ui)?);
-    assert_eq!(ui, 0);
-    assert!(value_as_uint_u32(&oh_i_umaxplus, &mut ui)?);
-    assert_eq!(ui, u32::MAX);
-
-    let mut s: Vec<u8> = b"0".to_vec();
-    assert!(value_as_real(&oh_r, &mut s));
-    assert_eq!(s, b"42.0");
-    assert!(!value_as_real(&oh_i, &mut s));
-    assert_eq!(s, b"42.0");
-
-    let mut num: f64 = 0.0;
-    assert!(value_as_number(&oh_i, &mut num));
+    let num = oh_i.try_get_value_as_number()?.expect("integer number");
     assert!((num - 1.0) < 1e-6 && (num - 1.0) > -1e-6);
-    assert!(value_as_number(&oh_r, &mut num));
+    let num = oh_r.try_get_value_as_number()?.expect("real number");
     assert!((num - 42.0) < 1e-6 && (num - 42.0) > -1e-6);
-    assert!(!value_as_number(&oh_b, &mut num));
-    assert!((num - 42.0) < 1e-6 && (num - 42.0) > -1e-6);
+    assert_eq!(oh_b.try_get_value_as_number()?, None);
 
-    s = Vec::new();
-    assert!(value_as_name(&oh_n, &mut s));
-    assert_eq!(s, b"/Test");
-    assert!(!value_as_name(&oh_r, &mut s));
-    assert_eq!(s, b"/Test");
-
-    s = Vec::new();
-    assert!(value_as_utf8(&oh_s, &mut s));
-    assert_eq!(s, b"/Test");
-    assert!(!value_as_utf8(&oh_r, &mut s));
-    assert_eq!(s, b"/Test");
+    assert_eq!(oh_n.try_get_value_as_name()?, Some(b"/Test".to_vec()));
+    assert_eq!(oh_r.try_get_value_as_name()?, None);
+    assert_eq!(oh_s.try_get_value_as_utf8()?, Some(b"/Test".to_vec()));
+    assert_eq!(oh_r.try_get_value_as_utf8()?, None);
 
     // qpdf's own source repeats this exact `getValueAsUTF8` block twice in a
     // row (`test_driver.cc:3047-3051`, identical to the block immediately
-    // above it); preserved verbatim rather than de-duplicated.
-    s = Vec::new();
-    assert!(value_as_utf8(&oh_s, &mut s));
-    assert_eq!(s, b"/Test");
-    assert!(!value_as_utf8(&oh_r, &mut s));
-    assert_eq!(s, b"/Test");
+    // above it); preserve the call order rather than de-duplicating it.
+    assert_eq!(oh_s.try_get_value_as_utf8()?, Some(b"/Test".to_vec()));
+    assert_eq!(oh_r.try_get_value_as_utf8()?, None);
 
-    s = Vec::new();
-    assert!(value_as_operator(&oh_o, &mut s));
-    assert_eq!(s, b"/Test");
-    assert!(!value_as_operator(&oh_r, &mut s));
-    assert_eq!(s, b"/Test");
-
-    s = Vec::new();
-    assert!(value_as_inline_image(&oh_ii, &mut s));
-    assert_eq!(s, b"/Test");
-    assert!(!value_as_inline_image(&oh_r, &mut s));
-    assert_eq!(s, b"/Test");
+    assert_eq!(oh_o.try_get_value_as_operator()?, Some(b"/Test".to_vec()));
+    assert_eq!(oh_r.try_get_value_as_operator()?, None);
+    assert_eq!(
+        oh_ii.try_get_value_as_inline_image()?,
+        Some(b"/Test".to_vec())
+    );
+    assert_eq!(oh_r.try_get_value_as_inline_image()?, None);
 
     Ok(())
 }
