@@ -6123,13 +6123,11 @@ fn run_page_operations_with_qpdf_job(
     let page_labels = page_label_options(args.set_page_labels.as_deref(), args.remove_page_labels);
     let linearize_normalization =
         args.linearize && options.content_normalization_set && options.content_normalization;
-    let mut job_options = options;
-    if linearize_normalization {
-        // qpdf's linearized writer clears its implicit writer-side normalization
-        // before the two-pass route; the explicit normalization pass remains
-        // between createQPDF and writeQPDF.
-        job_options.content_normalization = false;
-    }
+    // Keep the writer-side normalization state enabled after the explicit
+    // create-stage pass. The live stream marker makes the canonical writer
+    // skip a second tokenizer pass while still selecting qpdf's
+    // normalization-before-compression policy for linearization.
+    let job_options = options;
 
     let mut job = configure_rewrite_job(
         &input_name,
@@ -6317,15 +6315,13 @@ fn run_rewrite_with_qpdf_job(
     remove_unreferenced_resources: RemoveUnreferencedResources,
 ) -> CliResult<()> {
     // qpdf's createQPDF owns input creation and all document transformations;
-    // only writer configuration is deferred until writeQPDF. Keep the
-    // linearized normalization exception in the same position as the former
-    // staged caller, after createQPDF and before writeQPDF.
+    // only writer configuration is deferred until writeQPDF. The explicit
+    // normalization pass remains after createQPDF and before writeQPDF, while
+    // its writer-side option stays enabled so linearization can consume the
+    // normalized-stream membership.
     let linearize_normalization =
         linearize && normalize_content && options.content_normalization_set;
-    let mut job_options = options.clone();
-    if linearize_normalization {
-        job_options.content_normalization = false;
-    }
+    let job_options = options.clone();
 
     let mut job = configure_rewrite_job(
         input,
@@ -6548,17 +6544,13 @@ fn run_rewrite_opened<R: Read + Seek + 'static>(
     no_warn: bool,
     options: WriterOptions,
 ) -> CliResult<()> {
-    // The linearized writer has pass-one and final emission phases. qpdf's
-    // normalization warning is produced once before those phases, so perform
-    // the existing canonical content pass here and keep it disabled in both
-    // writer passes. Ordinary rewrites leave normalization on the writer,
-    // which owns the single non-linearized pass.
+    // The linearized writer has pass-one and final emission phases. Perform
+    // the explicit canonical content pass once before those phases, but keep
+    // the writer-side normalization state enabled: the stream marker avoids a
+    // second tokenizer pass and preserves qpdf's compression precedence.
     let linearize_normalization =
         linearize && normalize_content && options.content_normalization_set;
-    let mut job_options = options.clone();
-    if linearize_normalization {
-        job_options.content_normalization = false;
-    }
+    let job_options = options.clone();
     let mut job = configure_rewrite_job(
         input,
         output,

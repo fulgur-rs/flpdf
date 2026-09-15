@@ -1103,6 +1103,13 @@ memberから `getObjGen()` を記録し（`QPDFWriter.cc:1912-1936`）、
 `linearization/plan.rs` の `BTreeSet<QpdfObjGen>` でこれを保持し、raw streamにも
 正規化を適用し、raw identityで parameter edgeをclosure/reachabilityから外す。
 
+CLIのcreate-stageで既に正規化したstreamも同じwriter-side
+`content_normalization` stateを有効なままlinearized consumerへ渡すため、
+`content_normalization_applied` markerは二重tokenizeを防ぎながらqpdfの
+非圧縮normalize policyを選択できる。`flpdf-0s1ey` の
+`cli_linearize_normalize_content_is_byte_identical_to_qpdf` が通常stream、
+multi-contents、shared ObjStm、direct page leafをfull-byte比較する。
+
 Part 7/8 のraw追加はglobal suffixではなく、qpdfの page-by-page／raw set順へ mergeする。
 Part 8 の既存 hint entryとraw entryは `RenumberMap` のphysical output unit順に統合し、
 page shared identifiersは出力番号ではなく qpdfの `obj_user_to_objects` の

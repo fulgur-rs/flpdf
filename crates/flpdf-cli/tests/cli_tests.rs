@@ -2070,6 +2070,11 @@ fn top_level_linearize_normalize_content_y_mutates_before_planning() {
         .success();
 
     assert_eq!(first_page_content(&output), b"q\nQ");
+    assert_eq!(
+        first_page_content_filter(&output),
+        None,
+        "normalized linearized page content must remain unfiltered"
+    );
     Command::cargo_bin("flpdf")
         .unwrap()
         .arg("check-linearization")
