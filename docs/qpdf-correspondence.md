@@ -993,8 +993,8 @@ final pass だけが保持し、pass 1 は下記の direct sink route を使う�
 qpdf の `QPDFWriter::writeObjectStream` は pass 2 で ObjStm の pair/body を 1 本の
 `std::shared_ptr<Buffer> stream_buffer` に受け、同じ buffer から `/Length`・暗号化後の
 payload・最終 pipeline への書き出しを行う（`libqpdf/QPDFWriter.cc:1636-1750`）。
-`PipelinePopper` が `Pl_Buffer` の shared pointer を回収するため、container の
-`QPDF_Stream` と writer の sink の間で payload を深く複製しない
+`PipelinePopper` が `Pl_Buffer` の shared pointer を回収するため、writer の
+`stream_buffer` と sink の間で payload を深く複製しない
 （`libqpdf/QPDFWriter.cc:881-884,925-965`、`include/qpdf/Pl_Buffer.hh:50-58`）。
 
 flpdf の linearized ObjStm consumer も `writer/object_streams/emission.rs::wrap_objstm_body_as_handle`
