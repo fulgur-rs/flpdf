@@ -10422,8 +10422,22 @@ fn run_configured_attachment_job(
 /// qpdf lets a page spec that names the `--copy-encryption` file fall back to
 /// `--encryption-file-password`, so the job needs these fields even when the
 /// writer already holds the opened encryption source.
+///
+/// Only forward them when copy-encryption is the winning encryption mode: a
+/// later `--encrypt` or `--decrypt` overrides it, and `write_qpdf` would
+/// otherwise reapply the donor source over the effective writer options.
 fn cli_copy_encryption(args: &Cli) -> Option<(&Path, Vec<u8>)> {
     let path = args.copy_encryption.as_deref()?;
+    let winner = args.last_encryption_mode.or({
+        if args.raw_encrypt_segments.is_some() {
+            Some(EncryptionMode::Encrypt)
+        } else {
+            Some(EncryptionMode::CopyEncryption)
+        }
+    });
+    if !matches!(winner, Some(EncryptionMode::CopyEncryption)) {
+        return None;
+    }
     let password = args
         .raw_encryption_file_password
         .clone()

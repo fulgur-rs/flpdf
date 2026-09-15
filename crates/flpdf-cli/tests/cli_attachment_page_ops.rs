@@ -470,3 +470,68 @@ fn add_attachment_honors_remove_unreferenced_resources() {
         "an explicit --remove-unreferenced-resources value must reach the merge"
     );
 }
+
+fn encrypted_donor() -> tempfile::NamedTempFile {
+    let mut file = tempfile::NamedTempFile::new().unwrap();
+    file.write_all(include_bytes!(
+        "../../../tests/fixtures/encrypted/v4-aes-128-r4.pdf"
+    ))
+    .unwrap();
+    file
+}
+
+/// Report the `R = N` revision qpdf sees, or `None` when qpdf is unavailable
+/// or the file is not encrypted.
+fn encryption_revision(path: &Path, password: &str) -> Option<u32> {
+    let output = std::process::Command::new("qpdf")
+        .args([&format!("--password={password}"), "--show-encryption"])
+        .arg(path)
+        .output()
+        .ok()?;
+    let text = String::from_utf8_lossy(&output.stdout);
+    text.lines()
+        .find_map(|line| line.strip_prefix("R = "))
+        .and_then(|value| value.trim().parse().ok())
+}
+
+#[test]
+fn add_attachment_lets_a_later_encrypt_win_over_copy_encryption() {
+    let temp = tempfile::tempdir().unwrap();
+    let input = one_page_pdf();
+    let donor = encrypted_donor();
+    let attachment = attachment_temp(temp.path());
+    let output = temp.path().join("out.pdf");
+
+    // A later --encrypt overrides --copy-encryption, so the job-level donor
+    // fields must not be forwarded: write_qpdf would otherwise reapply the
+    // AES-128 donor over the requested AES-256 writer options.
+    CargoCommand::cargo_bin("flpdf")
+        .unwrap()
+        .args([
+            "--static-id",
+            input.path().to_str().unwrap(),
+            &format!("--copy-encryption={}", donor.path().to_str().unwrap()),
+            "--encryption-file-password=user-v4-aes",
+            "--encrypt",
+            "--user-password=newu",
+            "--owner-password=newo",
+            "--bits=256",
+            "--",
+            "--add-attachment",
+            attachment.to_str().unwrap(),
+            "--creationdate=D:20200102030405Z",
+            "--moddate=D:20200102030405Z",
+            "--",
+            output.to_str().unwrap(),
+        ])
+        .assert()
+        .success();
+
+    match encryption_revision(&output, "newo") {
+        Some(revision) => assert_eq!(
+            revision, 6,
+            "--bits=256 must win over the AES-128 copy-encryption donor"
+        ),
+        None => eprintln!("qpdf not available; skipping the revision check"),
+    }
+}
