@@ -1263,6 +1263,11 @@ fn qtest_accessor_cases_do_not_use_explicit_pdf_resolve() {
         "/src/driver/test_42_49.rs"
     ))
     .expect("read tree-driver source");
+    let late_source = fs::read_to_string(concat!(
+        env!("CARGO_MANIFEST_DIR"),
+        "/src/driver/test_80_87.rs"
+    ))
+    .expect("read late-driver source");
     let mutation_source = fs::read_to_string(concat!(
         env!("CARGO_MANIFEST_DIR"),
         "/src/driver/test_88_98.rs"
@@ -1400,6 +1405,13 @@ fn qtest_accessor_cases_do_not_use_explicit_pdf_resolve() {
             && !test_21.contains(".get_key(")
             && !test_21.contains("pdf.resolve("),
         "test 21 must use resolving getKey and shallowCopy without a caller-side resolve bridge"
+    );
+    let test_87 = section(late_source.as_str(), "pub(crate) fn run_test_87", "\n}\n");
+    assert!(
+        test_87.contains("dict.try_get_keys()?")
+            && !test_87.contains("direct_non_null_keys")
+            && !test_87.contains("as_dictionary()"),
+        "test 87 must enumerate keys through the canonical resolving accessor"
     );
     assert!(
         section(

@@ -3580,6 +3580,25 @@ pinned qpdf 11.9.0 と flpdf の`invalid-objects` test73は、どちらもexit 2
 `cmp`一致した。cached root/pagesをclose前に解決する回帰テストとtest73専用source guardを
 追加し、case 73を`canonical`へ再分類した。
 
+### qtest E-28 test 87 canonical key enumeration cutover `flpdf-3yn9.48.116` (2026-09-16)
+
+qpdfの`test_87`は、dictionaryのnull-valued entryをmissing keyと同一視し、`unparse()`、
+`getKeys()`、`getJSON(JSON::LATEST)`の全てで除外する（`qpdf/test_driver.cc:3086-3103`）。
+public `QPDFObjectHandle::getKeys`はreceiverを解決してからdictionaryへ委譲し
+（`include/qpdf/QPDFObjectHandle.hh:777-780`、`libqpdf/QPDFObjectHandle.cc:998-1009`）、
+`QPDF_Dictionary::getKeys`は各valueをresolving `isNull()`で判定してnull相当のkeyを除外する
+（`libqpdf/QPDF_Dictionary.cc:59-78,118-125`）。
+
+flpdfの`run_test_87`は従来、qpdfに対応物のない`direct_non_null_keys`でraw dictionaryを
+走査し、direct-only fixture上で非解決`is_null()`を呼んでいた。既存public canonical
+`ObjectHandle::try_get_keys`（`crates/flpdf/src/object_handle.rs:3068-3085`）はreceiverと
+全childを解決し、null除外・辞書順・resolver error propagationを担うため、3つのgetKeys
+assertionをこのaccessorへ移し、local helperを削除した。unparse/replace/JSONのassertionは
+qpdfの順序とまま保持した。
+
+source guardと`test 87 done` driver smokeを確認し、qpdf 11.9.0との差分検証でstatus/stdout/
+stderrを一致させた。case 87を`mixed`から`canonical`へ再分類した。
+
 ### qtest E-28 test 31 lazy null accessor cutover `flpdf-3yn9.48.104` (2026-09-15)
 
 qpdf の `QPDFObjectHandle::isNull()` は public accessor であり、実装は

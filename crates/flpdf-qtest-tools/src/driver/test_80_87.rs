@@ -763,25 +763,6 @@ pub(crate) fn run_test_86<R: Read + Seek>(
     Ok(())
 }
 
-// `QPDFObjectHandle::getKeys` (`libqpdf/QPDFObjectHandle.cc:929-940`,
-// `QPDF_Dictionary::getKeys`, `libqpdf/QPDF_Dictionary.cc:98-125`), scoped to
-// this test's own direct-only dictionaries: an entry equal to a *direct*
-// null is omitted, matching qpdf's equivalence of a null-valued key with a
-// missing one -- the same rule `test_0_1::dictionary_items` applies for the
-// general, possibly-indirect case.
-// `ObjectHandle::try_get_keys` already ports this generally
-// (object_handle.rs:2245) but is `pub(crate)`-only, unreachable from this
-// crate; every dictionary this test builds holds only direct children, so
-// checking direct nullness alone (no resolution) is sufficient here.
-fn direct_non_null_keys(dict: &ObjectHandle) -> BTreeSet<Vec<u8>> {
-    dict.as_dictionary()
-        .unwrap_or_default()
-        .into_iter()
-        .filter(|(_, value)| !value.is_null())
-        .map(|(key, _)| key)
-        .collect()
-}
-
 /// qpdf's test_87 (`test_driver.cc:3085-3103`) demonstrates that a
 /// dictionary entry resolving to null is equivalent to a missing key across
 /// `unparse()`, `getKeys()`, and `getJSON()`. No stdout is printed; only
@@ -796,24 +777,18 @@ pub(crate) fn run_test_87<R: Read + Seek>(
 ) -> flpdf::Result<()> {
     let dict = ObjectHandle::parse(b"<< /A 1 /B null >>")?;
     assert_eq!(dict.unparse(), b"<< /A 1 >>");
-    assert_eq!(
-        direct_non_null_keys(&dict),
-        BTreeSet::from([b"/A".to_vec()])
-    );
+    assert_eq!(dict.try_get_keys()?, BTreeSet::from([b"/A".to_vec()]));
 
     dict.replace_key(b"/A", ObjectHandle::null())?;
     assert_eq!(dict.unparse(), b"<< >>");
-    assert_eq!(direct_non_null_keys(&dict), BTreeSet::new());
+    assert_eq!(dict.try_get_keys()?, BTreeSet::new());
 
     let dict = ObjectHandle::dictionary(vec![
         (b"A".to_vec(), ObjectHandle::parse(b"2")?),
         (b"B".to_vec(), ObjectHandle::null()),
     ]);
     assert_eq!(dict.unparse(), b"<< /A 2 >>");
-    assert_eq!(
-        direct_non_null_keys(&dict),
-        BTreeSet::from([b"/A".to_vec()])
-    );
+    assert_eq!(dict.try_get_keys()?, BTreeSet::from([b"/A".to_vec()]));
 
     // `dict.getJSON(JSON::LATEST)` (qpdf 11.9.0's latest schema is v2,
     // matching `json_inspect::QPDF_JSON_VERSION`) followed by `JSON::unparse`
