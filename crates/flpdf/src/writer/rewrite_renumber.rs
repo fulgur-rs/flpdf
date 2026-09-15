@@ -391,7 +391,7 @@ fn collect_canonical_children_with_linearized_omission<R: Read + Seek>(
     Ok(())
 }
 
-fn ensure_canonical_owner<R: Read + Seek>(
+pub(crate) fn ensure_canonical_owner<R: Read + Seek>(
     pdf: &Pdf<R>,
     handle: &crate::ObjectHandle,
 ) -> crate::Result<()> {

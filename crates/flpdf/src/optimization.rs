@@ -401,6 +401,7 @@ impl Optimization {
         for (page_number, &page_ref) in page_refs.iter().enumerate() {
             let page = pdf.get_object_handle(page_ref);
             maps.update_object_maps(
+                pdf,
                 ObjectUser::Page(page_number as u32),
                 page,
                 &mut skip_stream_parameters,
@@ -412,6 +413,7 @@ impl Optimization {
             if key != b"/Root" {
                 let user_key = key.strip_prefix(b"/").unwrap_or(&key).to_vec();
                 maps.update_object_maps(
+                    pdf,
                     ObjectUser::TrailerKey(user_key),
                     trailer.try_get_key(&key)?,
                     &mut skip_stream_parameters,
@@ -424,6 +426,7 @@ impl Optimization {
             for key in root.try_get_keys()? {
                 let user_key = key.strip_prefix(b"/").unwrap_or(&key).to_vec();
                 maps.update_object_maps(
+                    pdf,
                     ObjectUser::RootKey(user_key),
                     root.try_get_key(&key)?,
                     &mut skip_stream_parameters,
@@ -435,13 +438,15 @@ impl Optimization {
         Ok(maps)
     }
 
-    fn update_object_maps<F>(
+    fn update_object_maps<R, F>(
         &mut self,
+        pdf: &Pdf<R>,
         user: ObjectUser,
         object: ObjectHandle,
         skip_stream_parameters: &mut F,
     ) -> crate::Result<()>
     where
+        R: Read + Seek,
         F: FnMut(Option<QpdfObjGen>, &ObjectHandle) -> crate::Result<u8>,
     {
         let mut visited = BTreeSet::new();
@@ -460,6 +465,15 @@ impl Optimization {
                 )));
             }
 
+            if pending.object.is_indirect() {
+                // qpdf's QPDFWriter::enqueueObject checks the owning QPDF
+                // before it accepts any indirect handle
+                // (libqpdf/QPDFWriter.cc:1072-1083). The direct-container
+                // mutation boundary intentionally remains shallow, so this
+                // is the first traversal point that can see a foreign
+                // indirect descendant.
+                crate::writer::rewrite_renumber::ensure_canonical_owner(pdf, &pending.object)?;
+            }
             pending.object.try_dereference()?;
             if pending.object.try_is_null()? {
                 if pending.via_array {
@@ -711,7 +725,7 @@ mod tests {
         let mut optimization = Optimization::default();
 
         optimization
-            .update_object_maps(ObjectUser::Root, root, &mut no_stream_parameter_skip)
+            .update_object_maps(&pdf, ObjectUser::Root, root, &mut no_stream_parameter_skip)
             .expect("walk raw child");
 
         let raw = QpdfObjGen::new(5, 65_536);
@@ -756,9 +770,11 @@ mod tests {
 
     #[test]
     fn object_user_walk_rejects_programmatic_depth_beyond_parser_limit() {
+        let pdf = Pdf::empty().expect("create owner for direct test values");
         let mut optimization = Optimization::default();
         optimization
             .update_object_maps(
+                &pdf,
                 ObjectUser::Root,
                 ObjectHandle::stream(ObjectHandle::dictionary(Vec::new()), Rc::new(Vec::new())),
                 &mut no_stream_parameter_skip,
@@ -766,6 +782,7 @@ mod tests {
             .expect("the test callback must be exercised by a stream");
         let error = optimization
             .update_object_maps(
+                &pdf,
                 ObjectUser::Root,
                 nested_direct_array(MAX_PARSE_DEPTH + 1),
                 &mut no_stream_parameter_skip,
