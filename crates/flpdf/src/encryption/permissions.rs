@@ -1,5 +1,6 @@
-//! qpdf correspondence: `QPDF_encryption.cc` permission projection and `/P` encoding.
 //! Typed permission configuration for writer-side `/Encrypt` `/P` encoding.
+//!
+//! qpdf correspondence: `QPDF_encryption.cc` permission projection and `/P` encoding.
 //!
 //! [`Permissions`] is the read-only view of an already-encrypted document's
 //! `/P` bitfield, with one accessor per capability bit. This module also owns

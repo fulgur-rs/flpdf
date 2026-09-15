@@ -1,4 +1,7 @@
+//! Parse and format PDF version identifiers.
+//!
 //! Mirrors qpdf 11.9.0 libqpdf/PDFVersion.cc.
+//!
 //! Public API: qpdf 11.9.0 include/qpdf/PDFVersion.hh.
 
 use crate::qutil::{qpdf_string_to_int_checked, QpdfIntParse};

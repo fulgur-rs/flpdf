@@ -1,9 +1,11 @@
-//! qpdf correspondence: `QPDFPageLabelDocumentHelper.cc` canonical page-label access and reconstruction.
-//!
 //! [`PageLabelDocumentHelper`] reads and reconstructs (ISO 32000-1 §12.4.2)
 //! the catalog `/PageLabels` number tree. The qpdf-shaped read methods retain
 //! live [`ObjectHandle`] values for raw `/S`, `/P`, and `/St` semantics;
 //! [`LabelRange`] is the typed view used by reconstruction and inspection APIs.
+//!
+//! qpdf correspondence: `QPDFPageLabelDocumentHelper.cc` canonical page-label access and reconstruction.
+//!
+//!
 
 use crate::nntree::DEFAULT_MAX_TREE_DEPTH;
 use crate::{Error, ObjectHandle, Pdf, Result};

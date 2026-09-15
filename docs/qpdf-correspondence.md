@@ -146,8 +146,13 @@ Phase 2 進行に伴う新規モジュール分割（`job/`, `document_json.rs`,
 `optimization/inherited_attrs.rs` 等）が主因。
 
 **機械可読なモジュール索引:** [`qpdf-module-doc-index.md`](qpdf-module-doc-index.md) は
-各 source module 先頭の対応行から生成する。この索引は注釈の欠落と drift を検査する
-ためのものであり、本書の責務分類・状態・実装判断を置き換えない。
+各 source module の先頭 doc ブロック内にある対応行から生成する。この索引は注釈の欠落と
+drift を検査するためのものであり、本書の責務分類・状態・実装判断を置き換えない。
+
+Rustdoc の Modules 一覧では doc ブロックの最初の段落が summary になるため、module の
+目的説明を対応行より前に置くこと。`qpdf correspondence:` / `Mirrors qpdf` の対応行を
+先頭段落にすると、対応分類だけが summary として表示される。この順序は
+`scripts/tests/test_qpdf_module_docs.py` でも検査する。
 
 規模比較: qpdf `libqpdf/*.cc` = 41,459 行 / flpdf 実装部 = **68,504 行**
 

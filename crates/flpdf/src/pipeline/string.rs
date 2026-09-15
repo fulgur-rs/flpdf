@@ -1,4 +1,7 @@
+//! String accumulation pipeline stage.
+//!
 //! qpdf correspondence: Pl_String.cc accumulation, optional pass-through, and finish forwarding.
+//!
 
 use super::{Pipeline, PipelineResult};
 

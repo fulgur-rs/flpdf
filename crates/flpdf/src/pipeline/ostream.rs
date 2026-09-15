@@ -1,4 +1,7 @@
+//! Output-stream pipeline adapter.
+//!
 //! qpdf correspondence: Pl_OStream.cc terminal adapter for a writer.
+//!
 
 use std::io::Write;
 

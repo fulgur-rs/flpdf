@@ -1,4 +1,7 @@
+//! Back-patch linearization parameter dictionaries for inspection and tests.
+//!
 //! qpdf correspondence: QPDFWriter.cc linearization parameter-dictionary compatibility helper.
+//!
 //! The canonical sink writer now renders these values
 //! before its forward final pass; this module remains for the lower-level
 //! `LinearizedDocument` inspection contract and its focused tests.

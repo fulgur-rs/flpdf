@@ -1,4 +1,7 @@
+//! PDF input loading, resolution, recovery, and authentication.
+//!
 //! qpdf correspondence: QPDF.cc object resolution, recovery, diagnostics, and authentication responsibilities.
+//!
 pub(crate) mod file_object;
 pub(crate) mod resolver;
 

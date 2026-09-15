@@ -1,5 +1,6 @@
-//! qpdf correspondence: QPDFJob.cc page-selection merge pipeline split across page-operation modules.
 //! Multi-document page merge (qpdf `--pages` parity).
+//!
+//! qpdf correspondence: QPDFJob.cc page-selection merge pipeline split across page-operation modules.
 //!
 //! [`merge_documents`] copies selected pages from N source documents into one
 //! fresh target. `inputs[0]` is the primary: its Catalog/trailer state is the

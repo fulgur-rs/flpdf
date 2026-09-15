@@ -1,4 +1,7 @@
+//! TIFF predictor decoding pipeline stage.
+//!
 //! qpdf correspondence: `Pl_TIFFPredictor.cc` incremental TIFF predictor.
+//!
 //! It covers horizontal differencing, row buffering, packed samples, and
 //! finish-time padding.
 //!

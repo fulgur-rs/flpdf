@@ -1,4 +1,7 @@
+//! RunLength encoding and decoding pipeline stage.
+//!
 //! qpdf correspondence: Pl_RunLength.cc incremental encode and decode state, output, error, and finish semantics.
+//!
 
 #[cfg(test)]
 use super::PipelineError;

@@ -1,3 +1,5 @@
+//! Flate compression pipeline stage.
+//!
 //! qpdf correspondence: Pl_Flate.cc streaming inflate, deflate, warning callback, compression-level, and finish responsibilities via flate2.
 //!
 //! qpdf's `QPDFJob::setWriterOptions` applies the process-wide compression

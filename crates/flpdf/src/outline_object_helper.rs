@@ -1,6 +1,8 @@
-//! qpdf correspondence: QPDFOutlineObjectHelper.cc getTitle/getCount/getDest/getDestPage, split from the document helper's QPDFOutlineDocumentHelper.cc responsibilities.
 //! The pre-1.0 flat, configurable-depth outline API was removed in favor of
 //! qpdf-compatible [`OutlineTree`] materialization.
+//!
+//! qpdf correspondence: QPDFOutlineObjectHelper.cc getTitle/getCount/getDest/getDestPage, split from the document helper's QPDFOutlineDocumentHelper.cc responsibilities.
+//!
 //!
 //! [`OutlineItem::get_title`], [`OutlineItem::get_count`],
 //! [`OutlineItem::get_dest`], and [`OutlineItem::get_dest_page`] recompute

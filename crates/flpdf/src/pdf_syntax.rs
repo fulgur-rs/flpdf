@@ -1,4 +1,7 @@
+//! Shared PDF token and value serialization helpers.
+//!
 //! qpdf correspondence: shared PDF token serialization helpers used by canonical handle writers.
+//!
 
 /// Return whether a parsed real literal is safe to emit verbatim.
 pub(crate) fn real_literal_is_safe(literal: &[u8], value: f64) -> bool {

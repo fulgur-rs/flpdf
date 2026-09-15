@@ -1,9 +1,11 @@
-//! qpdf correspondence: `ResourceFinder.cc`.
-//!
 //! Records the last name before resource-consuming content operators. This is
 //! intentionally a direct `ObjectHandleParserCallbacks` consumer, rather than
 //! an operation accumulator, to preserve qpdf's parser event semantics
 //! (`libqpdf/ResourceFinder.cc:3-56`).
+//!
+//! qpdf correspondence: `ResourceFinder.cc`.
+//!
+//!
 
 use std::collections::{BTreeMap, BTreeSet};
 

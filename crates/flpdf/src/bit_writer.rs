@@ -1,4 +1,7 @@
+//! Bit-level writer for linearization hint tables.
+//!
 //! qpdf correspondence: BitWriter.cc and bits_functions.hh MSB-first bit packing into a Pipeline stage.
+//!
 
 use std::cmp::min;
 

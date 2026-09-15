@@ -1,4 +1,7 @@
+//! Token-filter callbacks and content rewriting.
+//!
 //! qpdf correspondence: QPDFObjectHandle::TokenFilter callback boundary.
+//!
 
 use crate::{
     pipeline::{Pipeline, PipelineResult},

@@ -1,4 +1,7 @@
+//! Classic and stream cross-reference emission.
+//!
 //! qpdf correspondence: QPDFWriter.cc classic and stream xref emission for the plain writer.
+//!
 use std::collections::{BTreeMap, BTreeSet, HashMap};
 
 use crate::writer::{

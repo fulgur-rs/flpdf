@@ -1,3 +1,5 @@
+//! Serialize PDF objects with writer-owned emission state.
+//!
 //! qpdf correspondence: `QPDFWriter::unparseObject`, `unparseChild`, `writeTrailer`, and the writer-owned live-handle emission boundary.
 //!
 //! qpdf sources: `libqpdf/QPDFWriter.cc:1072-1810,2236-2376,2907-3035`.

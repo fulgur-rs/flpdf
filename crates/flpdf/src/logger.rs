@@ -1,3 +1,5 @@
+//! Shared logger sinks for info, warning, error, and binary-save output.
+//!
 //! qpdf correspondence: QPDFLogger.cc shared info, warning, error, and binary-save pipeline routing.
 //!
 //! qpdf's standard output and error logger sinks use C++ text streams

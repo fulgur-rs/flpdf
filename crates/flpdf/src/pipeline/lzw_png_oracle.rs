@@ -1,4 +1,7 @@
+//! Differential probes for LZW and PNG filter behavior.
+//!
 //! qpdf correspondence: live differential instrumentation for Pl_LZWDecoder.cc and Pl_PNGFilter.cc.
+//!
 
 use std::fmt::Write as _;
 use std::path::Path;

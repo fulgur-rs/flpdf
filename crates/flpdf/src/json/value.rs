@@ -1,4 +1,7 @@
+//! Shared JSON value model and typed accessors.
+//!
 //! qpdf correspondence: JSON.cc shared value model and mutation and accessor responsibilities.
+//!
 
 use std::cell::RefCell;
 use std::collections::{BTreeMap, BTreeSet};

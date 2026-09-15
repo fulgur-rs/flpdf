@@ -1,9 +1,11 @@
-//! qpdf correspondence: `QPDFJob::doShowObj`, `doShowPages`, and object/stream inspection helpers (`libqpdf/QPDFJob.cc:805-874`).
-//!
 //! The CLI owns argument parsing, while this module owns the live
 //! `ObjectHandle` inspection and the shared job completion boundary. Keeping
 //! this code here prevents an external binary crate from falling back to the
 //! legacy `Object` materialization route for read-only inspection.
+//!
+//! qpdf correspondence: `QPDFJob::doShowObj`, `doShowPages`, and object/stream inspection helpers (`libqpdf/QPDFJob.cc:805-874`).
+//!
+//!
 
 use super::lifecycle::{JobExitCode, QPDFJob};
 use crate::writer::DecodeLevel;

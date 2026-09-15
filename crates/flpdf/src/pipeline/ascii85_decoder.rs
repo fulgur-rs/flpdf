@@ -1,4 +1,7 @@
+//! ASCII85 decoding pipeline stage.
+//!
 //! qpdf correspondence: Pl_ASCII85Decoder.cc incremental decode state, output, error, and finish semantics.
+//!
 
 use super::{Pipeline, PipelineError, PipelineRef, PipelineResult};
 

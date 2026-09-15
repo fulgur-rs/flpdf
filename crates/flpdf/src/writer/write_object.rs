@@ -1,3 +1,5 @@
+//! Write individual PDF objects through the canonical writer state.
+//!
 //! qpdf correspondence: `QPDFWriter::writeObject`, `openObject`, and `closeObject`.
 //!
 //! qpdf sources: `libqpdf/QPDFWriter.cc:1036-1054,1761-1809`.

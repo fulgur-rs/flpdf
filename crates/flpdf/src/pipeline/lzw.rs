@@ -1,4 +1,7 @@
+//! LZW decoding pipeline stage.
+//!
 //! qpdf correspondence: Pl_LZWDecoder.cc bit accumulation, table growth, code-width transitions, end-of-data latching, output boundaries, and error text.
+//!
 
 use super::{Pipeline, PipelineError, PipelineRef, PipelineResult};
 

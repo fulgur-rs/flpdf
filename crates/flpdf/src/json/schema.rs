@@ -1,4 +1,7 @@
+//! Validate qpdf JSON value structure.
+//!
 //! qpdf correspondence: JSON.cc schema validation responsibilities.
+//!
 
 use std::collections::BTreeMap;
 

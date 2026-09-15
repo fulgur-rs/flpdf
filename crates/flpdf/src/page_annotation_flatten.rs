@@ -1,5 +1,6 @@
-//! qpdf correspondence: QPDFPageObjectHelper.cc annotation flattening split from the page helper.
 //! Annotation flattening: burn annotation appearances into page content.
+//!
+//! qpdf correspondence: QPDFPageObjectHelper.cc annotation flattening split from the page helper.
 //!
 //! [`flatten_annotations_on_page`] processes every eligible annotation on a
 //! single leaf page:

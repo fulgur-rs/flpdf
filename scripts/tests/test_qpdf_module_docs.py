@@ -873,6 +873,32 @@ class RepositoryPolicyTests(unittest.TestCase):
     def setUpClass(cls):
         cls.module = load_checker()
 
+    def test_module_summary_does_not_start_with_qpdf_classification(self):
+        repo_root = SCRIPT_PATH.parent.parent
+        entries = self.module.scan_modules(repo_root / "crates/flpdf/src", repo_root)
+
+        for source_path, _classification in entries:
+            with self.subTest(source_path=source_path):
+                source = (repo_root / source_path).read_text(encoding="utf-8")
+                paragraph: list[str] = []
+                for line in source.splitlines():
+                    if not line.startswith("//!"):
+                        continue
+                    text = line[3:].lstrip()
+                    if not text:
+                        if paragraph:
+                            break
+                        continue
+                    paragraph.append(text)
+
+                self.assertTrue(paragraph, f"{source_path}: missing module summary")
+                summary = " ".join(paragraph)
+                self.assertFalse(
+                    summary.startswith("qpdf correspondence:")
+                    or summary.startswith("Mirrors qpdf "),
+                    f"{source_path}: qpdf classification is the module summary",
+                )
+
     def test_only_d1_d2_audited_module_is_declared_as_mirror(self):
         repo_root = SCRIPT_PATH.parent.parent
         entries = self.module.scan_modules(repo_root / "crates/flpdf/src", repo_root)

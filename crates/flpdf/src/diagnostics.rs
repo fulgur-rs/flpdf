@@ -1,3 +1,5 @@
+//! Ordered warnings and diagnostics for PDF processing.
+//!
 //! qpdf correspondence: `QPDF::Members::warnings` represented as Rust values.
 //!
 //! qpdf stores warnings as a single ordered `std::vector<QPDFExc>` and copies

@@ -1,4 +1,7 @@
+//! RC4 encryption pipeline stage.
+//!
 //! qpdf correspondence: Pl_RC4.cc bounded streaming over one retained RC4 state.
+//!
 
 use super::{Pipeline, PipelineError, PipelineResult};
 use crate::encryption::rc4::Rc4;

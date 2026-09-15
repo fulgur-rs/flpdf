@@ -1,5 +1,3 @@
-//! qpdf correspondence: `QPDFJob::doSplitPages` (`QPDFJob.cc:2940-3027`).
-//!
 //! The job owns split output lifecycle: every chunk starts from qpdf's
 //! `emptyPDF()`, receives pages through the page-document helper, fixes copied
 //! form annotations, reconstructs chunk-local labels, and is written as a
@@ -10,6 +8,10 @@
 //! `shouldRemoveUnreferencedResources` Auto|Yes|No decision and sends its
 //! verbose finding messages through the same job logger
 //! (`QPDFJob.cc:2251-2340`; `QPDFJob.cc:340-345`).
+//!
+//! qpdf correspondence: `QPDFJob::doSplitPages` (`QPDFJob.cc:2940-3027`).
+//!
+//!
 //!
 //! # Naming convention
 //!

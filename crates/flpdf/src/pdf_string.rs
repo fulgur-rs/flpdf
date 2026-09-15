@@ -1,7 +1,9 @@
-//! qpdf correspondence: `libqpdf/QPDF_String.cc` PDF string semantics.
-//!
 //! This module owns PDFDocEncoding decoding, qpdf-compatible Unicode-string
 //! construction, and forced binary serialization for all flpdf consumers.
+//!
+//! qpdf correspondence: `libqpdf/QPDF_String.cc` PDF string semantics.
+//!
+//!
 
 /// PDFDocEncoding lookup table per ISO 32000-1 Annex D.3.
 const PDFDOC_ENCODING: [Option<char>; 256] = build_pdfdoc_table();

@@ -1,9 +1,11 @@
-//! qpdf correspondence: `QPDFJob::shouldRemoveUnreferencedResources`.
-//!
 //! This module owns the job-level `--remove-unreferenced-resources` policy:
 //! the `auto|yes|no` mode and qpdf's shared-resource heuristic. The page/Form
 //! mutation itself remains in [`crate::resources`] and is exposed through
 //! [`crate::PageObjectHelper::remove_unreferenced_resources`].
+//!
+//! qpdf correspondence: `QPDFJob::shouldRemoveUnreferencedResources`.
+//!
+//!
 //!
 //! qpdf keeps these responsibilities separate. `QPDFJob` decides whether the
 //! expensive page-level pass is worthwhile (`libqpdf/QPDFJob.cc:2251-2339`),

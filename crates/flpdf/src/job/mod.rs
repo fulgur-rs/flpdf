@@ -1,5 +1,6 @@
-//! qpdf correspondence: QPDFJob.cc command and JSON section orchestration.
 //! Command-level operations corresponding to qpdf's `QPDFJob` layer.
+//!
+//! qpdf correspondence: QPDFJob.cc command and JSON section orchestration.
 //!
 //! The module contains the shared qpdf 11.9.0 job lifecycle state and the JSON
 //! output-selection responsibility from `QPDFJob::writeJSON`, the staged

@@ -1,5 +1,6 @@
-//! qpdf correspondence: QPDFJob.cc page selection and QPDFWriter.cc null visibility specialized for surviving destinations.
 //! Outline and named-destination remapping after page extraction.
+//!
+//! qpdf correspondence: QPDFJob.cc page selection and QPDFWriter.cc null visibility specialized for surviving destinations.
 //!
 //! After [`crate::pages::tree_rebuild::rebuild_page_tree`] has rebuilt the page tree
 //! for a subset extraction, this module updates the document's `/Outlines` tree,

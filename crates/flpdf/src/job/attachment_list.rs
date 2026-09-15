@@ -1,5 +1,6 @@
-//! qpdf correspondence: QPDFJob.cc attachment enumeration and display formatting.
 //! Structured enumeration and formatted display of PDF attachments.
+//!
+//! qpdf correspondence: QPDFJob.cc attachment enumeration and display formatting.
 //!
 //! `QPDFJob::list_attachments` owns the public inspection route. It delegates
 //! the qpdf-compatible byte rendering to [`format_attachment_list_with_sink`],

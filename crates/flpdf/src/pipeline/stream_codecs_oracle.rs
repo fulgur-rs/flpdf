@@ -1,4 +1,7 @@
+//! Differential probes for ASCII85, ASCIIHex, and RunLength codecs.
+//!
 //! qpdf correspondence: live differential instrumentation for Pl_ASCII85Decoder.cc, Pl_ASCIIHexDecoder.cc, and Pl_RunLength.cc.
+//!
 
 use std::fmt::Write as _;
 use std::path::Path;

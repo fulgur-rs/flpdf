@@ -1,5 +1,6 @@
-//! qpdf correspondence: the canonical `QPDF::copyForeignObject` graph copy lives here.
 //! Cross-document deep object copier (identity-preserving reservation + cycle handling).
+//!
+//! qpdf correspondence: the canonical `QPDF::copyForeignObject` graph copy lives here.
 //!
 //! `copy_foreign_object` is the qpdf-shaped `ObjectHandle` route. It owns
 //! the live foreign graph traversal, per-source identity map, `/Pages`

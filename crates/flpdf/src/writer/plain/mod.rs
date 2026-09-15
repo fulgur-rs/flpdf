@@ -1,4 +1,7 @@
+//! Standard full-rewrite writer pipeline.
+//!
 //! qpdf correspondence: QPDFWriter.cc standard write pipeline split across plain writer modules.
+//!
 use std::io::{Read, Seek};
 
 use crate::writer::output::OutputSink;

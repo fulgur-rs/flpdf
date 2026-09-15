@@ -1,5 +1,6 @@
-//! qpdf correspondence: QPDF_linearization.cc page-offset hint planning split into a data module.
 //! Page Offset Hint Table data structure (ISO 32000-1 Annex F.3.1).
+//!
+//! qpdf correspondence: QPDF_linearization.cc page-offset hint planning split into a data module.
 //!
 //! This module builds the **data** for the Page Offset Hint Table.  It does
 //! **not** encode the table as bits/bytes — that is the responsibility of the

@@ -1,4 +1,7 @@
+//! PDF object and content-stream parsing.
+//!
 //! qpdf correspondence: QPDFParser.cc live file-object parsing plus slice object/content consumer boundaries.
+//!
 use std::collections::VecDeque;
 
 use crate::object_handle::{DocumentResolver, ObjectHandle, ObjectValue, NO_PARSED_OFFSET};

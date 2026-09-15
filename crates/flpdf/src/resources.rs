@@ -1,4 +1,7 @@
+//! Remove unreferenced resources from page and Form content.
+//!
 //! qpdf correspondence: `QPDFPageObjectHelper::removeUnreferencedResources`.
+//!
 //! (`QPDFPageObjectHelper.cc:539-649`) split into page/Form traversal helpers.
 //!
 //! The canonical route parses one page or Form at a time, then shallow-copies

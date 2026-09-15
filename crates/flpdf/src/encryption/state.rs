@@ -1,4 +1,7 @@
+//! Shared encryption state for crypt-filter dispatch and object-key caching.
+//!
 //! qpdf correspondence: `QPDF.hh:899-923` and `QPDF_encryption.cc:700-1205` encryption state, crypt-filter dispatch, object-key cache, and inspection projection.
+//!
 
 use super::crypt_filters::{
     crypt_filter_method_from_handle, crypt_filter_modes_from_handle,

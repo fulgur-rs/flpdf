@@ -1,5 +1,7 @@
-//! qpdf correspondence: QPDFWriter.cc standard-write object placement and renumber planning.
 //! Logical object placements for the qpdf-shaped plain writer pipeline.
+//!
+//! qpdf correspondence: QPDFWriter.cc standard-write object placement and renumber planning.
+//!
 
 #[cfg(test)]
 use std::collections::HashMap;

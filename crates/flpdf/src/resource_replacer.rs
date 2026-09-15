@@ -1,10 +1,12 @@
-//! qpdf correspondence: `QPDFAcroFormDocumentHelper.cc` `ResourceReplacer`.
 //! Resource-name discovery uses the live `ObjectHandle` content callback route
 //! (`QPDFObjectHandle.cc:1776-1847`, `ResourceFinder.cc:3-56`) before the
 //! exact-byte token filter rewrites source names. A document-owned scan keeps
 //! errors for the qpdf caller's catch-and-re-warn boundary; only the detached
 //! in-memory route converts a structural failure to the byte-preserving
 //! `Ok(None)` fallback.
+//!
+//! qpdf correspondence: `QPDFAcroFormDocumentHelper.cc` `ResourceReplacer`.
+//!
 
 use std::collections::BTreeMap;
 

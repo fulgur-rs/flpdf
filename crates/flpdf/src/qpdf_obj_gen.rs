@@ -1,3 +1,5 @@
+//! PDF object and generation identity values.
+//!
 //! qpdf correspondence: QPDFObjGen.hh/QPDF.cc raw xref identity and valid indirect-reference boundary.
 //!
 //! This is intentionally separate from [`crate::ObjectRef`]. qpdf keeps the

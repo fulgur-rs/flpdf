@@ -1,4 +1,7 @@
+//! PDF lexical tokenization.
+//!
 //! Mirrors qpdf 11.9.0 libqpdf/QPDFTokenizer.cc.
+//!
 
 use std::ops::Range;
 

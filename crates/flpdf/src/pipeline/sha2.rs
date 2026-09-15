@@ -1,9 +1,11 @@
-//! qpdf correspondence: Pl_SHA2.cc reusable streaming SHA-256/384/512 digest with next-pipeline passthrough.
-//!
 //! qpdf's native SHA2 close functions reinitialize the selected context after finalize
 //! (`sha2.c:670-673`, `sha2big.c:209-228`). This port mirrors that lifecycle with
 //! `Digest::finalize_reset`: a repeated `finish()` digests an empty cycle, and the first
 //! `write()` after `finish()` starts a fresh cycle with the same bit size.
+//!
+//! qpdf correspondence: Pl_SHA2.cc reusable streaming SHA-256/384/512 digest with next-pipeline passthrough.
+//!
+//!
 //!
 //! The uncommitted `bits=0` write/finish paths would dereference qpdf's null crypto
 //! provider, and digest access before the first `finish()` would read its uninitialized

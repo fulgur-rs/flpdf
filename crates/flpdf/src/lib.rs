@@ -1,5 +1,6 @@
-//! qpdf correspondence: crate root aggregating multiple qpdf library components and flpdf-only APIs.
 //! `flpdf` is a pure-Rust PDF toolkit modeled on the qpdf workflow.
+//!
+//! qpdf correspondence: crate root aggregating multiple qpdf library components and flpdf-only APIs.
 //!
 //! The crate is organised as a few small layers that you can mix as needed:
 //!

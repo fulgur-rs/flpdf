@@ -1,4 +1,7 @@
+//! PNG predictor decoding pipeline stage.
+//!
 //! qpdf correspondence: Pl_PNGFilter.cc row geometry, buffer rotation, per-filter decoding, hard-coded Up encoding, partial-row finish, and constructor validation.
+//!
 
 use super::{Pipeline, PipelineError, PipelineRef, PipelineResult};
 

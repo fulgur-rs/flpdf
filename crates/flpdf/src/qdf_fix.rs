@@ -1,4 +1,7 @@
+//! Repair QDF cross-reference offsets after manual edits.
+//!
 //! qpdf correspondence: qpdf/fix-qdf.cc tool behavior outside libqpdf.
+//!
 //! `fix_qdf`: the flpdf equivalent of qpdf's `fix-qdf` tool.
 //!
 //! After a human edits a QDF-form PDF (the flat, normalized layout produced by

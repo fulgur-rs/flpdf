@@ -1,4 +1,7 @@
+//! Interpret PDF crypt filters and construct the `/CF` table.
+//!
 //! qpdf correspondence: `QPDF_encryption.cc:700-716,860-904` crypt-filter interpretation and `/CF` table construction.
+//!
 #![allow(dead_code)]
 
 use super::state::{EncryptionMode, EncryptionState};

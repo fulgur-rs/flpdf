@@ -1,4 +1,7 @@
+//! Helpers for `/EmbeddedFile` stream dictionaries.
+//!
 //! qpdf correspondence: QPDFEFStreamObjectHelper.cc.
+//!
 
 use super::shared::{ensure_indirect_handle_belongs_to_pdf, qpdf_style_open_error};
 use crate::object_handle::{canonical_dictionary_key, StreamDataProvider};

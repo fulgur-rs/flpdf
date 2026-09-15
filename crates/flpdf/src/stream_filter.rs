@@ -1,3 +1,5 @@
+//! Decode and re-encode PDF stream filters.
+//!
 //! qpdf correspondence: `QPDFStreamFilter.cc` and `QPDF_Stream.cc` filter names, full `/DecodeParms` handles, and reverse decode-pipeline construction (`libqpdf/QPDF_Stream.cc:380-482`).
 //!
 //! Crypt decryption remains owned by
