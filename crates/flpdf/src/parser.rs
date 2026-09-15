@@ -839,22 +839,27 @@ impl<I: LiveInput> LiveFileParser<'_, '_, '_, I> {
             values.insert(key, value);
         }
 
-        let is_signature = values
-            .get(b"/Type".as_slice())
-            .map(|value| value.try_is_name_and_equals(b"Sig"))
-            .transpose()?
-            .unwrap_or(false);
-        let has_byte_range = values.contains_key(b"/ByteRange".as_slice());
-        let has_string_contents = if is_signature && has_byte_range {
-            values
-                .get(b"/Contents".as_slice())
-                .map(ObjectHandle::try_is_string)
+        let restore_signature_contents = if contents.is_some() {
+            let is_signature = values
+                .get(b"/Type".as_slice())
+                .map(|value| value.try_is_name_and_equals(b"Sig"))
                 .transpose()?
-                .unwrap_or(false)
+                .unwrap_or(false);
+            let has_byte_range = values.contains_key(b"/ByteRange".as_slice());
+            let has_string_contents = if is_signature && has_byte_range {
+                values
+                    .get(b"/Contents".as_slice())
+                    .map(ObjectHandle::try_is_string)
+                    .transpose()?
+                    .unwrap_or(false)
+            } else {
+                false
+            };
+            is_signature && has_byte_range && has_string_contents
         } else {
             false
         };
-        if is_signature && has_byte_range && has_string_contents {
+        if restore_signature_contents {
             if let Some((raw_contents, offset)) = contents {
                 let contents = self.direct_at(ObjectValue::String(raw_contents), offset);
                 values.insert(b"/Contents".to_vec(), contents);
@@ -1506,7 +1511,7 @@ mod live_input_tests {
     }
 
     #[test]
-    fn live_file_parser_signature_probe_resolves_an_indirect_contents_type() {
+    fn live_file_parser_signature_probe_short_circuits_indirect_contents_without_raw_capture() {
         let mut input = CountingInput::new(b"<< /Type /Sig /ByteRange [] /Contents 3 0 R >>");
         let (mut resolver, document) = signature_probe_resolver();
 
@@ -1517,9 +1522,21 @@ mod live_input_tests {
             .get(b"/Contents".as_slice())
             .expect("indirect contents");
 
-        assert!(contents.is_resolved());
-        assert_eq!(contents.as_string(), Some(b"indirect".to_vec()));
-        assert_eq!(document.calls.borrow().as_slice(), [ObjectRef::new(3, 0)]);
+        assert!(!contents.is_resolved());
+        assert!(document.calls.borrow().is_empty());
+    }
+
+    #[test]
+    fn live_file_parser_signature_probe_short_circuits_indirect_type_without_raw_capture() {
+        let mut input = CountingInput::new(b"<< /Type 2 0 R /Contents (plain) >>");
+        let (mut resolver, document) = signature_probe_resolver();
+
+        let parsed = parse_live_file_object(&mut input, &mut resolver).expect("page dictionary");
+        let values = parsed.value.as_dictionary().expect("dictionary");
+        let type_value = values.get(b"/Type".as_slice()).expect("indirect type");
+
+        assert!(!type_value.is_resolved());
+        assert!(document.calls.borrow().is_empty());
     }
 
     #[test]
