@@ -354,10 +354,9 @@ fn normalize_insert_pages<R: Read + Seek>(
         }
 
         let page = pdf.get_object_handle(page_ref);
-        // qpdf's shallowCopy dereferences before copying
-        // (QPDFObjectHandle.cc:2073-2079). Rust's shallow_copy intentionally
-        // remains non-resolving, so use the canonical handle resolver here.
-        page.try_dereference()?;
+        // qpdf's shallowCopy owns receiver resolution before copying
+        // (QPDFObjectHandle.cc:2073-2079); the canonical primitive performs
+        // that boundary here.
         let copy = page.shallow_copy()?;
         let indirect = pdf.make_indirect_object_handle(copy)?;
         // cov:ignore-start: make_indirect_object_handle guarantees a fresh indirect identity
