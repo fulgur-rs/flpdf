@@ -1124,6 +1124,26 @@ ObjStm併用、encrypted linearized write を実出力で検証し、raw writer 
 dictionary-key omission と array-position `null` を確認する。 pinned qpdf 11.9.0 の
 `--check-linearization` でもこれらの追加ケースは警告なしで通過する。
 
+### Encrypted-input generated ObjStm placement (`flpdf-0msjh`, 2026-09-16)
+
+qpdf は `generateObjectStreams` の global even-split で選んだ member を
+`filterCompressedObjects` により一度だけ container の user 集合へ折りたたみ、
+`calculateLinearizationData` の page-by-page `lc_other_page_private` 順に従って
+container を各 page group の末尾へ置く（`libqpdf/QPDFWriter.cc:1970-2006`、
+`libqpdf/QPDF_optimization.cc:340-380`、`libqpdf/QPDF_linearization.cc:1223-1264`）。
+そのため、ある member が first-page 側の ObjStm に入っていても、後続 page の closure
+に現れたことだけで second-half の plain anchor として扱ってはならない。
+
+flpdf の `second_half_container_anchors` は、second-half batch だけでなく open-document
+と first-half を含む全 routed ObjStm member set を plain anchor 候補から除外する。
+これにより encrypted input の Generate でも、page-private container はその page の
+plain object の直後に採番・出力され、page-offset hint が `lengthNextN` と一致する。
+`objstm-lin-disc-2-250-2.pdf` を qpdf 11.9.0 で暗号化した回帰は RC4-128 の top-level/
+rewrite 両 surface で `qpdf --check-linearization` の warning なしを確認し、暗号化なしの
+Generate、既存の ObjStm byte-parity、Part 7/8、multiple-container、progress/sink error
+経路は変更しない。これは qpdf の既存 user/part precedence を補うもので、
+qpdf-deviation marker は追加しない。
+
 ### Linearized raw identity follow-ups (`flpdf-pwyo2`, 2026-09-15)
 
 `flpdf-474u8` の raw slot移行後に残っていた八つの linearization consumer gapを、

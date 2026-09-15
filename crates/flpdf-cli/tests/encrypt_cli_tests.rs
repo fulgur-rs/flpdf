@@ -47,6 +47,8 @@ const ONE_PAGE_FIXTURE: &str = "../../tests/fixtures/compat/one-page.pdf";
 // `minimal.pdf` has an empty page tree; qpdf 12.3.0--12.3.2 crashes on it
 // during `--check` (qpdf#1674) before reaching the QDF/AES properties.
 const QDF_ENCRYPTION_FIXTURE: &str = ONE_PAGE_FIXTURE;
+const LINEARIZE_OBJSTM_ENCRYPTION_FIXTURE: &str =
+    "../../tests/fixtures/compat/objstm-lin-disc-2-250-2.pdf";
 // Only referenced by the qpdf-zlib-compat-gated byte-identical oracle test
 // below; under default features they'd otherwise be dead code.
 #[cfg(feature = "qpdf-zlib-compat")]
@@ -3710,6 +3712,84 @@ fn linearize_encrypt_nonempty_objstm_is_byte_identical_to_qpdf() {
                 xref.status.success()
                     && xref_stdout.lines().any(|line| line.contains("compressed")),
                 "{mode}/{surface}: output must contain non-empty ObjStm members: {xref_stdout}"
+            );
+        }
+    }
+}
+
+/// Encrypted input keeps the linearization hint page groups valid when
+/// generated ObjStm containers are present. qpdf emits each page-private
+/// container at the end of its owning page group; a misplaced container makes
+/// qpdf compute a shorter page range than the hint table records.
+#[test]
+fn linearize_encrypted_input_with_generated_objstm_has_valid_hint_table() {
+    if !ensure_qpdf_or_skip() {
+        return;
+    }
+    let tmp = tempfile::tempdir().unwrap();
+    for (mode, encryption_args) in [
+        ("rc4-128", &["--bits=128", "--use-aes=n"][..]),
+        ("aes-128", &["--bits=128", "--use-aes=y"][..]),
+        ("aes-256", &["--bits=256"][..]),
+    ] {
+        let encrypted = tmp.path().join(format!("{mode}-encrypted.pdf"));
+        let encrypt = ShellCommand::new("qpdf")
+            .args([
+                "--static-id",
+                "--allow-weak-crypto",
+                "--encrypt",
+                "--user-password=",
+                "--owner-password=o",
+            ])
+            .args(encryption_args)
+            .arg("--")
+            .arg(fixture(LINEARIZE_OBJSTM_ENCRYPTION_FIXTURE))
+            .arg(&encrypted)
+            .output()
+            .unwrap();
+        assert!(
+            encrypt.status.success(),
+            "{mode}: qpdf encryption fixture preparation failed: {}",
+            String::from_utf8_lossy(&encrypt.stderr)
+        );
+
+        for (surface, rewrite) in [("top-level", false), ("rewrite", true)] {
+            let output = tmp.path().join(format!("{mode}-{surface}-linearized.pdf"));
+            let mut command = Command::cargo_bin("flpdf").unwrap();
+            if rewrite {
+                command.arg("rewrite");
+            }
+            command
+                .args([
+                    "--static-id",
+                    "--password=o",
+                    "--linearize",
+                    "--object-streams=generate",
+                    "--",
+                ])
+                .arg(&encrypted)
+                .arg(&output)
+                .assert()
+                .success();
+
+            let check = ShellCommand::new("qpdf")
+                .args(["--password=o", "--check-linearization"])
+                .arg(&output)
+                .output()
+                .unwrap();
+            assert!(
+                check.status.success(),
+                "{mode}/{surface}: qpdf --check-linearization failed: stdout={} stderr={}",
+                String::from_utf8_lossy(&check.stdout),
+                String::from_utf8_lossy(&check.stderr)
+            );
+            let check_stdout = String::from_utf8_lossy(&check.stdout);
+            let check_stderr = String::from_utf8_lossy(&check.stderr);
+            assert!(
+                check_stdout.contains("no linearization errors")
+                    && !check_stdout.contains("WARNING:")
+                    && !check_stderr.contains("WARNING:"),
+                "{mode}/{surface}: qpdf must report clean linearization: stdout={check_stdout} stderr={check_stderr}"
             );
         }
     }
