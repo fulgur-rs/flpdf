@@ -1214,13 +1214,16 @@ impl RenumberMap {
             if i as u32 >= hint_index_in_first_half {
                 if let Ok(plain_source_number) = u32::try_from(original.get_obj()) {
                     if let Some(plain_category) = self.first_half_category.get(&original).copied() {
-                        for batch_index in 0..first_half_outline_batch_start {
-                            let Some(source_container_number) =
-                                first_half_batches[batch_index].source_container_number
+                        for (batch_index, batch) in first_half_batches
+                            .iter()
+                            .enumerate()
+                            .take(first_half_outline_batch_start)
+                        {
+                            let Some(source_container_number) = batch.source_container_number
                             else {
                                 continue;
                             };
-                            let batch_category = match first_half_batches[batch_index].route {
+                            let batch_category = match batch.route {
                                 super::plan::ContainerPart::FirstPagePrivate => 0,
                                 super::plan::ContainerPart::FirstPageShared => 1,
                                 // Outline batches are outside this range. Keep the
