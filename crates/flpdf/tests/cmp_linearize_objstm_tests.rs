@@ -271,9 +271,104 @@ fn source_objstm_part9_order_pdf() -> Vec<u8> {
     pdf
 }
 
+fn source_objstm_thumbnail_before_plain_rest_pdf() -> Vec<u8> {
+    let mut pdf = Vec::new();
+    pdf.extend_from_slice(b"%PDF-1.5\n");
+    let mut offsets = [0u64; 12];
+
+    let append_object = |pdf: &mut Vec<u8>, offsets: &mut [u64], number: usize, body: &[u8]| {
+        offsets[number] = pdf.len() as u64;
+        pdf.extend_from_slice(format!("{number} 0 obj\n").as_bytes());
+        pdf.extend_from_slice(body);
+        pdf.extend_from_slice(b"\nendobj\n");
+    };
+
+    append_object(
+        &mut pdf,
+        &mut offsets,
+        1,
+        b"<< /Type /Catalog /Pages 2 0 R /Zzz 5 0 R >>",
+    );
+    append_object(
+        &mut pdf,
+        &mut offsets,
+        2,
+        b"<< /Type /Pages /Count 2 /Kids [3 0 R 4 0 R] >>",
+    );
+    append_object(
+        &mut pdf,
+        &mut offsets,
+        3,
+        b"<< /Type /Page /Parent 2 0 R /MediaBox [0 0 10 10] /Contents 6 0 R >>",
+    );
+    append_object(
+        &mut pdf,
+        &mut offsets,
+        4,
+        b"<< /Type /Page /Parent 2 0 R /MediaBox [0 0 10 10] /Contents 9 0 R /Thumb 8 0 R >>",
+    );
+    append_object(&mut pdf, &mut offsets, 5, b"<< /Kind /DocumentOther >>");
+    append_object(
+        &mut pdf,
+        &mut offsets,
+        6,
+        b"<< /Length 0 >>\nstream\n\nendstream",
+    );
+    append_objstm(
+        &mut pdf,
+        &mut offsets,
+        10,
+        &[(
+            8,
+            b"<< /Type /XObject /Subtype /Image /Width 1 /Height 1 >>",
+        )],
+    );
+    append_object(
+        &mut pdf,
+        &mut offsets,
+        9,
+        b"<< /Length 0 >>\nstream\n\nendstream",
+    );
+
+    let xref_offset = pdf.len() as u64;
+    let mut xref_entries = Vec::with_capacity(12 * 7);
+    let push_xref_entry = |entries: &mut Vec<u8>, entry_type: u8, field2: u32, field3: u16| {
+        entries.push(entry_type);
+        entries.extend_from_slice(&field2.to_be_bytes());
+        entries.extend_from_slice(&field3.to_be_bytes());
+    };
+    for number in 0..=11 {
+        match number {
+            0 | 7 => push_xref_entry(&mut xref_entries, 0, 0, u16::MAX),
+            8 => push_xref_entry(&mut xref_entries, 2, 10, 0),
+            number => push_xref_entry(
+                &mut xref_entries,
+                1,
+                u32::try_from(if number == 11 {
+                    xref_offset
+                } else {
+                    offsets[number]
+                })
+                .expect("fixture xref offset fits u32"),
+                0,
+            ),
+        }
+    }
+    let xref_dict = format!(
+        "<< /Type /XRef /Size 12 /W [1 4 2] /Root 1 0 R /ID [<31415926535897932384626433832795><31415926535897932384626433832795>] /Length {} >>\nstream\n",
+        xref_entries.len()
+    );
+    let mut xref_body = xref_dict.into_bytes();
+    xref_body.extend_from_slice(&xref_entries);
+    xref_body.extend_from_slice(b"\nendstream");
+    append_object(&mut pdf, &mut offsets, 11, &xref_body);
+    pdf.extend_from_slice(format!("startxref\n{xref_offset}\n%%EOF\n").as_bytes());
+    pdf
+}
+
 fn append_objstm(
     pdf: &mut Vec<u8>,
-    offsets: &mut [u64; 11],
+    offsets: &mut [u64],
     number: usize,
     members: &[(usize, &[u8])],
 ) {
@@ -608,6 +703,29 @@ fn preserve_part9_objstm_containers_follow_qpdf_category_order() {
         &actual,
         &expected,
         "Preserve part9 container order",
+    );
+}
+
+#[test]
+fn preserve_part9_thumbnail_container_precedes_plain_rest_object() {
+    let directory = tempfile::tempdir().expect("thumbnail anchor tempdir");
+    let input = directory.path().join("input.pdf");
+    std::fs::write(&input, source_objstm_thumbnail_before_plain_rest_pdf())
+        .expect("write thumbnail anchor source input");
+
+    let expected = qpdf_linearized_objstm_preserve_at(&input);
+    let actual = flpdf_linearized_objstm_preserve_at(&input);
+    report(
+        "preserved private thumbnail ObjStm before plain lc_other",
+        &mask_id1(&actual),
+        &mask_id1(&expected),
+        "Preserve thumbnail anchor order (ignoring /ID[1])",
+    );
+    report(
+        "preserved private thumbnail ObjStm before plain lc_other",
+        &actual,
+        &expected,
+        "Preserve thumbnail anchor order",
     );
 }
 

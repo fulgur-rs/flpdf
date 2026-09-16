@@ -3424,21 +3424,33 @@ fn second_half_container_anchors(
                     (0, owner, 1, object_number)
                 }
                 ContainerPart::OtherPageShared => (1, 0, 0, object_number),
-                ContainerPart::Rest
-                    if batch.source_container_number.is_some()
-                        && (batch.source_container_number.is_some_and(|source| {
-                            part9_pages.contains(&ObjectRef::new(source, 0))
-                        }) || batch.members.iter().any(|m| part9_pages.contains(m))) =>
-                {
-                    // qpdf places the complete /Pages user set before the
-                    // remaining lc_other set. If that user set is folded into
-                    // a preserved ObjStm, the container joins the head group
-                    // rather than the remaining set, and keeps its source
-                    // object number as the within-group key: qpdf walks the
-                    // page-tree set as a std::set<QPDFObjGen>, so the head
-                    // group stays in source order
-                    // (QPDF_linearization.cc:1281-1290).
-                    (2, 0, 0, object_number)
+                ContainerPart::Rest if batch.source_container_number.is_some() => {
+                    // Preserve containers retain qpdf's folded object-user
+                    // entry on the source container. Use the same Part-9
+                    // category key as the batch ordering above so the anchor
+                    // places thumbnails and outlines before the remaining
+                    // `lc_other` plain objects, even when their source number
+                    // is larger. Hand-built test plans may omit optimization;
+                    // retain the historical catch-all fallback for those
+                    // plans rather than inventing user classifications.
+                    let (category, page) = plan
+                        .optimization
+                        .as_ref()
+                        .map(|optimization| {
+                            let source_container = ObjectRef::new(
+                                batch
+                                    .source_container_number
+                                    .expect("Preserve Rest batch has a source container"),
+                                0,
+                            );
+                            part9_category_order_key(
+                                optimization,
+                                &part9_pages,
+                                [&source_container],
+                            )
+                        })
+                        .unwrap_or((4, 0));
+                    (2 + category, page as usize, 0, object_number)
                 }
                 ContainerPart::Rest if generate_batches => {
                     let optimization = plan

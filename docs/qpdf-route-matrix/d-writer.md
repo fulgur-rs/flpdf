@@ -321,7 +321,10 @@ remaining `lc_other` の順で、同一集合内は `QPDFObjGen` 昇順となる
 flpdf の `objstm_batches_preserve` は source-container-number 順を初期順として保持し、
 folded `Optimization` map を source container identity で問い合わせて上記 category key
 へ stable sortする。`RenumberMap::place_objstm_members_per_half` と `ObjStmLayout` は
-同じ batch orderを消費するため、container番号・xref・hintの順序が一つの計画から決まる。
+同じ batch orderを消費する。さらに `second_half_container_anchors` も source container
+identity の folded category key を使うため、private/shared thumbnail や `lc_outlines` の
+containerが plain `lc_other` object の後ろへ固定されない。container番号・xref・hintの
+順序が一つの計画から決まる。
 Generate の even-split membershipとDisable/classic pathは変更しない。qpdf 11.9.0の
 手書き type-2 xref regression と外部 qtestの2 fixtureで full-byte parity、
 `--check-linearization` cleanを確認する。
