@@ -310,6 +310,22 @@ flpdf の `linearization/plan.rs::first_page_is_private` は、既存 canonical
 fixture では、従来の Part 2 placementと byte outputを保持する。残りの stopOnError call
 site は親 `flpdf-rbyc6` の別 sliceであり、この route entryでは混ぜない。
 
+### Linearized Preserve Part-9 ObjStm container order (`flpdf-psgss`, 2026-09-17)
+
+qpdf の Preserve は source ObjStm の membership と container 境界を保持したまま、
+`filterCompressedObjects` 後の folded container user を `calculateLinearizationData` が
+Part 9 の順序へ並べる。`/Pages` user set、private/shared thumbnails、`lc_outlines`、
+remaining `lc_other` の順で、同一集合内は `QPDFObjGen` 昇順となる
+（`QPDF_optimization.cc:340-381`、`QPDF_linearization.cc:1279-1337,1408-1432`）。
+
+flpdf の `objstm_batches_preserve` は source-container-number 順を初期順として保持し、
+folded `Optimization` map を source container identity で問い合わせて上記 category key
+へ stable sortする。`RenumberMap::place_objstm_members_per_half` と `ObjStmLayout` は
+同じ batch orderを消費するため、container番号・xref・hintの順序が一つの計画から決まる。
+Generate の even-split membershipとDisable/classic pathは変更しない。qpdf 11.9.0の
+手書き type-2 xref regression と外部 qtestの2 fixtureで full-byte parity、
+`--check-linearization` cleanを確認する。
+
 ### D-7. public / private 境界（`include/qpdf/QPDFWriter.hh`）
 
 - public（`include/qpdf/QPDFWriter.hh:55-439`）: constructor 3 種、出力設定

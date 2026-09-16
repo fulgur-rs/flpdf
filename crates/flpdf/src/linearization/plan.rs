@@ -3325,7 +3325,7 @@ impl LinearizationPlan {
     /// |------|--------|
     /// | `Disable` | Both batch lists are empty (no ObjStms emitted). |
     /// | `Generate` | Eligible Part-3 (first-page shared) objects are packed into `part3_batches`; eligible Part-4 objects are packed into `part4_batches`. The membership is qpdf-canonical by construction (a global even split with the page dictionaries and `/Catalog` erased), so no post-packing reshape is applied. |
-    /// | `Preserve` | Each surviving source ObjStm is retained as one container and routed once from the union of its members' users. Page dictionaries, the `/Catalog`, unassigned objects, and ineligible members are removed; `/Pages` and `/Info` stay with their source container. The configured Generate batch cap is ignored because qpdf Preserve neither splits nor re-chunks source containers. If the source document contained no ObjStms, all batch lists are empty. |
+    /// | `Preserve` | Each surviving source ObjStm is retained as one container and routed once from the union of its members' users. Page dictionaries, the `/Catalog`, unassigned objects, and ineligible members are removed; `/Pages` and `/Info` stay with their source container. Part-9 containers are ordered as qpdf emits them: `/Pages`, thumbnails, outlines, then remaining `lc_other`, with source-container order as the tie-break. The configured Generate batch cap is ignored because qpdf Preserve neither splits nor re-chunks source containers. If the source document contained no ObjStms, all batch lists are empty. |
     ///
     /// **Note:** the `/Pages` tree and `/Info` dictionary are not relocated.
     /// qpdf's `preserveObjectStreams` copies the source object->stream
@@ -3632,6 +3632,24 @@ impl LinearizationPlan {
         part3_batches.extend(part3_outlines);
         let mut part4_batches = part4_private;
         part4_batches.extend(part4_shared);
+        // qpdf's Part 9 is not source-container order. After the Pages user set,
+        // it places private/shared thumbnail groups, outlines, and only then the
+        // remaining lc_other containers (QPDF_linearization.cc:1279-1337).
+        // Preserve retains source container boundaries, so apply that category
+        // order to the containers while retaining source-number order within a
+        // category. The folded Optimization map must be queried with the source
+        // container itself, not with its compressed members.
+        let part9_pages: BTreeSet<ObjectRef> =
+            optimization.objects_for_root_key(b"Pages").collect();
+        part4_rest.sort_by_key(|batch| {
+            let source_container_number = batch
+                .source_container_number
+                .expect("Preserve Part-9 batch must retain its source container");
+            let source_container = ObjectRef::new(source_container_number, 0);
+            let (category, page) =
+                part9_category_order_key(optimization, &part9_pages, [&source_container]);
+            (category, page, source_container_number)
+        });
         part4_batches.extend(part4_rest);
 
         Ok(ObjStmBatchPlan {
