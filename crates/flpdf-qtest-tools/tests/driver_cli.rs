@@ -64,6 +64,16 @@ fn test_86_uses_canonical_unicode_string_handle_accessors() {
     );
 }
 
+#[test]
+fn test_86_executes_canonical_unicode_string_route() {
+    driver()
+        .args(["86", "-"])
+        .assert()
+        .code(0)
+        .stdout("test 86 done\n")
+        .stderr("");
+}
+
 fn minimal_pdf() -> &'static str {
     concat!(
         env!("CARGO_MANIFEST_DIR"),
