@@ -2206,7 +2206,11 @@ impl QPDFJob {
                 || configuration.show_attachment.is_some()
                 || configuration.show_encryption
                 || configuration.is_encrypted
-                || configuration.requires_password)
+                || configuration.requires_password
+                // `--json` keeps `require_outfile` set but defaults the output
+                // name to standard output (`QPDFJob.cc:582-586`), so restoring
+                // the requirement here would reject an invocation qpdf accepts.
+                || configuration.json_version.is_some())
             {
                 // A newly constructed QPDFJob stores the library's optional
                 // output default, but qpdf's partial job-JSON CLI boundary
