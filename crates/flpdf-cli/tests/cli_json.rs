@@ -1155,10 +1155,18 @@ fn json_v2_rejects_v1_only_object_keys_before_input_io() {
             .code(2);
         let output = assert.get_output();
         assert!(output.stdout.is_empty(), "{key}");
+        // qpdf raises this from `checkConfiguration` through its usage exit
+        // (`QPDFJob.cc:633-641`), so the message carries the blank line, the
+        // program name and the `For help:` block. Verified against qpdf 11.9.0
+        // with this same missing input path.
         assert_eq!(
             String::from_utf8_lossy(&output.stderr),
             format!(
-                "flpdf: json keys \"objects\" and \"objectinfo\" are only valid for json version 1{EOL}"
+                "{EOL}flpdf: json keys \"objects\" and \"objectinfo\" are only valid for json version 1{EOL}{EOL}\
+                 For help:{EOL}  flpdf --help=usage       usage information{EOL}\
+                 \u{20} flpdf --help=topic       help on a topic{EOL}\
+                 \u{20} flpdf --help=--option    help on an option{EOL}\
+                 \u{20} flpdf --help             general help and a topic list{EOL}{EOL}"
             ),
             "{key}"
         );
@@ -2382,4 +2390,64 @@ fn json_output_pages_selection_rebuilds_the_live_page_tree() {
     assert!(json["qpdf"][1]["obj:7 0 R"]["value"]
         .get("/Resources")
         .is_some());
+}
+
+/// `QPDFJob::checkConfiguration` rejects a `--json-key` that does not belong to
+/// the selected JSON version (`QPDFJob.cc:633-641`), and the argument parser
+/// rejects a `--json-output` outside its registered choices
+/// (`auto_job_init.hh:23,127`). All three go through qpdf's usage exit, so the
+/// stderr is the blank line, the program name, the message, and the four-line
+/// `For help:` block — not a bare one-line message.
+#[test]
+fn json_usage_errors_match_qpdf_usage_exit() {
+    if skip_unless_qpdf_11_9() {
+        return;
+    }
+    let temp = tempfile::tempdir().unwrap();
+    let input_path = temp.path().join("input.pdf");
+    std::fs::write(&input_path, one_page_pdf_with_stream()).unwrap();
+
+    // The last two mix an invalid `--json-output` with a route that dispatches
+    // before the JSON one, so they also pin that the choice error wins over
+    // `--replace-input`'s conflict and over opening the job-JSON file.
+    for args in [
+        vec!["--json=1", "--json-key=qpdf"],
+        vec!["--json=2", "--json-key=objects"],
+        vec!["--json-output=1", "--json=2"],
+        vec!["--json-output=1", "--replace-input"],
+        vec![
+            "--json-output=1",
+            "--job-json-file=/definitely/missing.json",
+        ],
+    ] {
+        let expected = ShellCommand::new("qpdf")
+            .args(&args)
+            .arg(&input_path)
+            .output()
+            .expect("qpdf runs");
+        assert_eq!(
+            expected.status.code(),
+            Some(2),
+            "{args:?}: qpdf must reject this combination"
+        );
+
+        let actual = Command::cargo_bin("flpdf")
+            .unwrap()
+            .env("FLPDF_PROGNAME", "qpdf")
+            .args(&args)
+            .arg(&input_path)
+            .output()
+            .unwrap();
+
+        assert_eq!(
+            actual.status.code(),
+            expected.status.code(),
+            "{args:?}: exit code must match qpdf"
+        );
+        assert_eq!(
+            String::from_utf8_lossy(&actual.stderr),
+            String::from_utf8_lossy(&expected.stderr),
+            "{args:?}: stderr must match qpdf byte for byte"
+        );
+    }
 }
