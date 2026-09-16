@@ -1878,6 +1878,22 @@ flpdf の top-level / `rewrite` page-operation route も、ページ選択後の
 で固定した。`--copy-encryption`、`--decrypt`、`--coalesce-contents` など別の未対応組合せは
 この変更の対象外である。
 
+### Attachment mutation with split-pages output dispatch (`flpdf-8q13h`, 2026-09-16)
+
+qpdf は attachment の add/remove/copy を `handleTransformations` 内で完了した後、
+`writeQPDF` の `split_pages` 分岐から `doSplitPages` を呼ぶ。split の output path は
+literal な出力先ではなく、各 chunk の番号を挿入する template として使われ、各 fresh
+chunk writer に同じ writer options が設定される（`libqpdf/QPDFJob.cc:2138-2247`,
+`libqpdf/QPDFJob.cc:483-492,2847-2903,2940-3027`; `libqpdf/QPDFJob_config.cc:598-609`）。
+
+flpdf の attachment 3 経路は既に同じ `QPDFJob` の create/write boundary と canonical
+attachment transformation を使っていたが、共有 `configure_attachment_job` が
+`PageOpArgs::split_pages` を job configuration へ渡していなかった。既存の
+`QPDFJob::write_qpdf` / `QPDFJob::split_pages` を再利用してこの設定だけを接続し、
+add/remove/copy と `--pages . 1` + add の qdf whole-file parity test で qpdf の numbered
+chunk output を固定する。新しい attachment-specific split writer、filename rewrite、
+compatibility bridge、qpdf-deviation marker は追加しない。
+
 `QPDF::initializeEncryption` (`QPDF_encryption.cc:718-751`) は、`/ID` が無い、配列でない、
 要素数が2でない、または第1要素が文字列でない場合に `invalid /ID in trailer dictionary` を
 warning として記録し、空の `id1` で暗号鍵導出を継続する。`flpdf-ez48` で
