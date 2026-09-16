@@ -26,31 +26,6 @@ use crate::output::write_bytes;
 // Shared helpers
 // ---------------------------------------------------------------------------
 
-/// Resolve one canonical handle hop, matching qpdf's lazy accessor
-/// dereference without following the flpdf-only reference-as-value redirect.
-fn resolve_once<R: Read + Seek>(
-    pdf: &mut Pdf<R>,
-    handle: &ObjectHandle,
-) -> flpdf::Result<ObjectHandle> {
-    pdf.resolve(handle)?;
-    Ok(handle.clone())
-}
-
-/// `handle.getKey(key)` plus the implicit dereference of the *returned*
-/// child that qpdf's next accessor call on it would perform
-/// (`QPDFObjectHandle::getKey`, `libqpdf/QPDFObjectHandle.cc:979-988`).
-/// Mirrors `chase_key` in `driver/test_42_49.rs` (module-private there, so
-/// reimplemented here rather than imported).
-fn chase_key<R: Read + Seek>(
-    pdf: &mut Pdf<R>,
-    handle: &ObjectHandle,
-    key: &[u8],
-) -> flpdf::Result<ObjectHandle> {
-    let chased = resolve_once(pdf, handle)?;
-    let child = chased.get_key(key);
-    resolve_once(pdf, &child)
-}
-
 /// `QUtil::hex_encode` (`libqpdf/QUtil.cc:720-731`): lowercase hex, two
 /// characters per byte, no separators. Mirrors the identical local helper in
 /// `driver/test_34_41.rs`.
@@ -726,7 +701,7 @@ pub(crate) fn run_test_79<R: Read + Seek>(
 
     let page_refs = PageDocumentHelper::new(pdf).get_all_pages()?;
     let page = pdf.get_object_handle(page_refs[0]);
-    let s1 = chase_key(pdf, &page, b"/Contents")?;
+    let s1 = page.try_get_key(b"/Contents")?;
 
     let s2 = pdf.new_stream()?;
     s2.replace_stream_data(
