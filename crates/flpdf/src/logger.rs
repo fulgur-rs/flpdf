@@ -102,13 +102,21 @@ impl<W> LineBufferedWriter<W> {
 
 impl<W: Write> Write for LineBufferedWriter<W> {
     fn write(&mut self, data: &[u8]) -> io::Result<usize> {
-        self.buffer.extend_from_slice(data);
+        let mut remaining = data;
+        while !remaining.is_empty() || self.buffer.len() >= STDOUT_LINE_BUFFER_CAPACITY {
+            if self.buffer.len() >= STDOUT_LINE_BUFFER_CAPACITY {
+                self.flush_prefix(STDOUT_LINE_BUFFER_CAPACITY)?;
+                continue;
+            }
 
-        if let Some(newline) = self.buffer.iter().rposition(|&byte| byte == b'\n') {
-            self.flush_prefix(newline + 1)?;
-        }
-        while self.buffer.len() >= STDOUT_LINE_BUFFER_CAPACITY {
-            self.flush_prefix(STDOUT_LINE_BUFFER_CAPACITY)?;
+            let available = STDOUT_LINE_BUFFER_CAPACITY - self.buffer.len();
+            let chunk_length = remaining.len().min(available);
+            self.buffer.extend_from_slice(&remaining[..chunk_length]);
+            remaining = &remaining[chunk_length..];
+
+            if let Some(newline) = self.buffer.iter().rposition(|&byte| byte == b'\n') {
+                self.flush_prefix(newline + 1)?;
+            }
         }
 
         Ok(data.len())
@@ -444,6 +452,24 @@ mod tests {
             sink.writes,
             [vec![b'x'; super::STDOUT_LINE_BUFFER_CAPACITY], vec![b'x'],]
         );
+    }
+
+    #[test]
+    fn standard_output_writer_does_not_grow_pending_buffer_for_large_write() {
+        let text_mode = Arc::new(AtomicBool::new(false));
+        let mut writer = super::standard_output_writer(RecordingWriter::default(), text_mode);
+        let data = vec![b'x'; super::STDOUT_LINE_BUFFER_CAPACITY * 16 + 1];
+
+        writer.write_all(&data).unwrap();
+
+        assert!(
+            writer.writer.buffer.capacity() <= super::STDOUT_LINE_BUFFER_CAPACITY,
+            "large writes must not grow the pending line buffer"
+        );
+
+        writer.flush().unwrap();
+        let sink = writer.writer.into_inner();
+        assert_eq!(sink.writes.iter().map(Vec::len).sum::<usize>(), data.len());
     }
 
     #[test]
