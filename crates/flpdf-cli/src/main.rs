@@ -2059,7 +2059,8 @@ struct RewriteCommand {
     min_version: Option<String>,
     /// Force the output PDF version header to exactly this value.
     ///
-    /// Overrides source version and the linearize 1.2 floor.
+    /// Overrides the source version and every computed minimum, even when the
+    /// file uses features that version does not cover.
     /// Mirrors `qpdf --force-version`.
     #[arg(long = "force-version", require_equals = true)]
     force_version: Option<String>,
