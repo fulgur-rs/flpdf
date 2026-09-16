@@ -2,6 +2,26 @@
 //!
 //! qpdf correspondence: `QPDF.hh:899-923` and `QPDF_encryption.cc:700-1205` encryption state, crypt-filter dispatch, object-key cache, and inspection projection.
 //!
+//! Deviation: qpdf's AES providers map every key length other than 24 and 32
+//! to AES-128 and hand the cipher 16 bytes from the key buffer
+//! (`QPDFCrypto_gnutls.cc:197-213`, `QPDFCrypto_openssl.cc:225-241`), so an
+//! *object* key shorter than 16 bytes is read past its end. What reaches the
+//! provider is the per-object key, not the document key: for `V` below 5
+//! [`super::primitives::compute_data_key_qpdf_obj_gen`] appends the object and
+//! generation bytes plus `sAlT` and truncates the digest to that input's
+//! length, so a document key of 7 bytes already yields a full 16, while for
+//! `V` 5 and above the document key is used unchanged. Such a key is
+//! reachable through `--password-is-hex-key`, which uses the decoded bytes
+//! without a length check (`QPDF_encryption.cc:933-934`).
+//!
+//! The bytes qpdf reads past the end are undefined, so
+//! [`aes128_object_key`] rejects the key instead of fabricating them. Against
+//! the qpdf 11.9.0 build used here the two agreed on the exit code and
+//! differed only in the diagnostic, but an out-of-bounds read has no
+//! guaranteed outcome, so that is an observation rather than part of the
+//! deviation's contract. See `docs/qpdf-correspondence.md` for the
+//! corresponding row.
+//!
 
 use super::crypt_filters::{
     crypt_filter_method_from_handle, crypt_filter_modes_from_handle,
