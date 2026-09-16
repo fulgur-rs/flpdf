@@ -51,9 +51,14 @@ pub(crate) fn write_name_escaped(
     raw: &[u8],
 ) -> crate::Result<()> {
     const HEX: &[u8; 16] = b"0123456789abcdef";
-    for &byte in raw {
+    let mut safe_start = 0;
+    for (index, &byte) in raw.iter().enumerate() {
         if byte == 0 {
+            if safe_start < index {
+                out.write_bytes(&raw[safe_start..index])?;
+            }
             out.write_bytes(b"#")?;
+            safe_start = index + 1;
             continue;
         }
         let needs_escape = !(0x21..=0x7e).contains(&byte)
@@ -62,10 +67,16 @@ pub(crate) fn write_name_escaped(
                 b'(' | b')' | b'<' | b'>' | b'[' | b']' | b'{' | b'}' | b'/' | b'%' | b'#'
             );
         if needs_escape {
-            out.write_bytes(&[b'#', HEX[(byte >> 4) as usize], HEX[(byte & 0x0f) as usize]])?;
-        } else {
-            out.write_bytes(&[byte])?;
+            if safe_start < index {
+                out.write_bytes(&raw[safe_start..index])?;
+            }
+            let escaped = [b'#', HEX[(byte >> 4) as usize], HEX[(byte & 0x0f) as usize]];
+            out.write_bytes(&escaped)?;
+            safe_start = index + 1;
         }
+    }
+    if safe_start < raw.len() {
+        out.write_bytes(&raw[safe_start..])?;
     }
     Ok(())
 }
@@ -156,6 +167,27 @@ pub(crate) type ReborrowableIdWriter<'r, 'd> =
 #[cfg(test)]
 mod tests {
     use super::{real_literal_is_safe, write_name_escaped};
+    use crate::writer::output::{OutputSink, OutputTarget};
+    use std::io;
+
+    struct RecordingTarget {
+        chunks: Vec<Vec<u8>>,
+    }
+
+    impl OutputTarget for RecordingTarget {
+        fn write_chunk(&mut self, bytes: &[u8]) -> io::Result<usize> {
+            self.chunks.push(bytes.to_vec());
+            Ok(bytes.len())
+        }
+
+        fn finish_segment(&mut self) -> crate::Result<()> {
+            Ok(())
+        }
+
+        fn finish_document(&mut self) -> crate::Result<()> {
+            Ok(())
+        }
+    }
 
     #[test]
     fn real_literal_rejects_non_utf8_source_bytes() {
@@ -185,5 +217,24 @@ mod tests {
         })
         .unwrap();
         assert_eq!(output, b"a#1x");
+    }
+
+    #[test]
+    fn name_escaping_batches_safe_runs_but_keeps_escape_bytes_exact() {
+        let mut target = RecordingTarget { chunks: Vec::new() };
+        {
+            let mut sink = OutputSink::new(&mut target);
+            write_name_escaped(&mut sink, b"safe#/tail").unwrap();
+        }
+
+        assert_eq!(
+            target.chunks,
+            vec![
+                b"safe".to_vec(),
+                b"#23".to_vec(),
+                b"#2f".to_vec(),
+                b"tail".to_vec(),
+            ]
+        );
     }
 }
