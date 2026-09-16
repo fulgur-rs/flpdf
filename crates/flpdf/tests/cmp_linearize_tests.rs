@@ -31,7 +31,13 @@ fn flpdf_linearized(fixture: &str) -> Vec<u8> {
         .join("../../tests/fixtures/compat")
         .join(fixture);
 
-    let file = std::fs::File::open(&path).unwrap_or_else(|e| panic!("open {path:?}: {e}"));
+    flpdf_linearized_at(&path)
+}
+
+/// As [`flpdf_linearized`], but for an input written during the test rather
+/// than a committed fixture.
+fn flpdf_linearized_at(path: &Path) -> Vec<u8> {
+    let file = std::fs::File::open(path).unwrap_or_else(|e| panic!("open {path:?}: {e}"));
     let mut pdf = Pdf::open(std::io::BufReader::new(file)).unwrap();
     let opts = WriterTestSettings {
         deterministic_id: true,
@@ -177,6 +183,58 @@ fn pinned_qpdf() -> Option<&'static str> {
             .is_some_and(|line| line == "qpdf version 11.9.0")
             .then_some("qpdf")
     })
+}
+
+/// qpdf writes the complete `/Pages` user set at the head of part 9, ahead of
+/// thumbnails, outlines and the remaining `lc_other` set, by erasing each
+/// page-tree node from `lc_other` and pushing it first
+/// (`QPDF_linearization.cc:1279-1290`). A page-tree node therefore precedes a
+/// preserved object stream even when that stream's source object number is
+/// lower.
+///
+/// The committed fixture does not reach the conflicting layout on its own: its
+/// page tree already outranks the object stream. qpdf's own rewrite renumbers
+/// the page tree above the stream, so the input is produced here rather than
+/// committed.
+#[test]
+fn part9_pages_precede_lower_numbered_preserved_objstm() {
+    let Some(oracle) = pinned_qpdf() else {
+        eprintln!("[SKIP cmp_linearize_tests] qpdf 11.9.0 is unavailable");
+        return;
+    };
+    let fixture = Path::new(env!("CARGO_MANIFEST_DIR"))
+        .join("../../tests/fixtures/compat")
+        .join("preserve-pages-source-order-conflict.pdf");
+    let directory = tempfile::tempdir().expect("tempdir");
+
+    let rewritten = directory.path().join("rewritten.pdf");
+    let status = Command::new(oracle)
+        .args(["--static-id", "--warning-exit-0"])
+        .arg(&fixture)
+        .arg(&rewritten)
+        .status()
+        .expect("qpdf runs");
+    assert_eq!(status.code(), Some(0), "qpdf rewrite must succeed");
+
+    let expected_path = directory.path().join("qpdf.pdf");
+    let status = Command::new(oracle)
+        .args(["--linearize", "--deterministic-id", "--warning-exit-0"])
+        .arg(&rewritten)
+        .arg(&expected_path)
+        .status()
+        .expect("qpdf runs");
+    assert_eq!(status.code(), Some(0), "qpdf linearization must succeed");
+
+    let actual = flpdf_linearized_at(&rewritten);
+    let expected = std::fs::read(&expected_path).expect("qpdf output");
+    if let Some(off) = first_diff(&actual, &expected) {
+        panic!(
+            "the page tree must precede the lower-numbered preserved object \
+             stream (flpdf={} bytes, qpdf={} bytes, first diff at byte {off})",
+            actual.len(),
+            expected.len(),
+        );
+    }
 }
 
 #[test]
