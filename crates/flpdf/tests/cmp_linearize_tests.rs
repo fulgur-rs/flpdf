@@ -254,6 +254,35 @@ fn preserved_container_anchors_after_lc_other_not_the_promoted_page_tree() {
     );
 }
 
+/// qpdf walks the page-tree user set as a `std::set<QPDFObjGen>` and writes it
+/// at the head of part 9 (`QPDF_linearization.cc:1281-1290`), so that group
+/// keeps its source object order even when one of its nodes lives inside a
+/// preserved object stream.
+///
+/// `objstm-lin-part9-head-tiebreak.pdf` nests its page tree so the intermediate
+/// node (obj 6) sits in the container (obj 2) while the root node (obj 8) stays
+/// plain. Collapsing the head group to a single rank loses that order and emits
+/// the root node before the container.
+#[test]
+fn part9_head_group_keeps_source_order_across_a_preserved_container() {
+    assert_linearize_byte_identical(
+        "objstm-lin-part9-head-tiebreak.pdf",
+        "objstm-lin-part9-head-tiebreak",
+    );
+}
+
+/// As above, but with plain page-tree nodes on both sides of the preserved
+/// container: obj 5 and obj 12 stay plain while obj 7 holds obj 6, so qpdf's
+/// `std::set` walk emits obj 5, then the container, then obj 12. A single
+/// collapsed head rank puts the container ahead of obj 5 instead.
+#[test]
+fn part9_head_group_places_a_preserved_container_by_its_source_number() {
+    assert_linearize_byte_identical(
+        "objstm-lin-part9-head-container-order.pdf",
+        "objstm-lin-part9-head-container-order",
+    );
+}
+
 #[test]
 fn one_page_linearized_is_byte_identical_to_qpdf() {
     assert_linearize_byte_identical("one-page.pdf", "one-page");
