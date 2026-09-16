@@ -627,26 +627,23 @@ pub(crate) fn run_test_37<R: Read + Seek>(
 
 pub(crate) fn run_test_38<R: Read + Seek>(
     pdf: &mut Pdf<R>,
-    filename: &[u8],
+    _filename: &[u8],
     _arg2: Option<&OsStr>,
     stdout: &mut dyn Write,
-    stderr: &mut dyn Write,
-    diagnostics_written: &mut usize,
+    _stderr: &mut dyn Write,
+    _diagnostics_written: &mut usize,
 ) -> flpdf::Result<()> {
-    let root = root_handle(pdf, filename, diagnostics_written, stdout, stderr)?;
-    let qtest = resolved_key(
-        pdf,
-        &root,
-        b"/QTest",
-        filename,
-        diagnostics_written,
-        stdout,
-        stderr,
-    )?;
-    for item in qtest.as_array().unwrap_or_default() {
-        let resolved =
-            resolved_terminal(pdf, &item, filename, diagnostics_written, stdout, stderr)?;
-        write_bytes(stdout, &resolved.unparse_resolved())?;
+    // qpdf resolves the Catalog, QTest array, each array item, and the final
+    // unparse at their respective public accessor boundaries
+    // (`qpdf/test_driver.cc:1351-1358`). Keep the same order with the
+    // canonical ObjectHandle accessors instead of the driver-local resolution
+    // helpers.
+    let root = pdf.root_handle()?;
+    let qtest = root.try_get_key(b"/QTest")?;
+    let count = qtest.try_get_array_n_items()?;
+    for index in 0..count {
+        let item = qtest.try_get_array_item(index as i64)?;
+        write_bytes(stdout, &item.try_unparse_resolved()?)?;
         writeln!(stdout)?;
     }
     Ok(())
