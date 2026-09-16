@@ -1132,6 +1132,23 @@ JSON前 selectorとの重複は従来どおり job-json fileへ帰属する。
 input/output 4ケースを qpdf 11.9.0 と status/stdout/stderrで固定する。
 新しい bridgeや deviation markerは追加しない。
 
+### E-12 follow-up: job-json file-open error attribution (`flpdf-tyu7s`, 2026-09-16)
+
+qpdfの `Config::jobJsonFile` は `read_file_into_string` と
+`initializeFromJson(..., true)`を同じ例外境界で処理し、file path付きの
+job-json errorへ変換する（`libqpdf/QPDFJob_config.cc:774-784`）。
+argv parserのusage境界とCLIの `usageExit` により、`Run --job-json-help` と
+`For help:` blockも同じ診断へ含まれる（`libqpdf/QPDFJob_argv.cc:408-415`;
+`qpdf/qpdf.cc:11-23,32-41`）。
+
+flpdfは `JobJsonFile` の read failureを既存の
+`qpdf_json_input_open_error`で `open <path>` とportableな strerrorへ正規化し、
+`job_json_event_error`へ渡すようにした。JSON parse/config failureと同じ
+job-json attributionを保持し、Rust固有の `(os error N)`を出さない。
+`cli_job_json.rs::job_json_file_missing_reports_job_json_context_and_usage`で
+missing job-jsonのexit/stdout/stderrをqpdf 11.9.0と比較する。新しいbridgeや
+deviation markerは追加しない。
+
 ## E-10 primary document graph retention in distinct-secondary `--pages` (`flpdf-lrm3u`, 2026-09-15)
 
 qpdf keeps the primary `QPDF` as the page-job base while

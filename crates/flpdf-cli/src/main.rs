@@ -4314,7 +4314,7 @@ fn run_job_json_files(raw_args: &[arg_parser::RawArg], suppress_warnings: bool) 
         match event {
             JobJsonCliEvent::JobJsonFile(path) => {
                 let json = std::fs::read(&path).map_err(|error| {
-                    error_with_file(&path, Box::new(error) as Box<dyn std::error::Error>)
+                    job_json_event_error(Some(&path), qpdf_json_input_open_error(&path, error))
                 })?;
                 job.initialize_from_json_partial_bytes(&json)
                     .map_err(|error| job_json_event_error(Some(&path), error))?;

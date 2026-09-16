@@ -641,6 +641,34 @@ fn job_json_file_with_malformed_json_prints_error_and_exits_2() {
 }
 
 #[test]
+fn job_json_file_missing_reports_job_json_context_and_usage() {
+    if !qpdf_available() {
+        return;
+    }
+
+    let directory = tempfile::tempdir().unwrap();
+    let missing = directory.path().join("missing.json");
+    let argument = format!("--job-json-file={}", missing.display());
+
+    let qpdf = ProcessCommand::new("/usr/bin/qpdf")
+        .current_dir(directory.path())
+        .arg(&argument)
+        .output()
+        .unwrap();
+    let flpdf = Command::cargo_bin("flpdf")
+        .unwrap()
+        .current_dir(directory.path())
+        .env("FLPDF_PROGNAME", "qpdf")
+        .arg(&argument)
+        .output()
+        .unwrap();
+
+    assert_eq!(flpdf.status.code(), qpdf.status.code());
+    assert_eq!(flpdf.stdout, qpdf.stdout);
+    assert_eq!(flpdf.stderr, qpdf.stderr);
+}
+
+#[test]
 fn job_json_file_show_npages_matches_qpdf_without_output_file() {
     if !qpdf_available() {
         return;
