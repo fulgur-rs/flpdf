@@ -4461,9 +4461,19 @@ fn job_json_event_error(
 
 fn run_job_json_files(preflight: QpdfCliPreflight, suppress_warnings: bool) -> CliResult<()> {
     let QpdfCliPreflight { mut job } = preflight;
-    job.set_warnings_exit_zero(cli_warning_exit_zero());
+    // The retained job has already parsed the JSON, and qpdf's JSON handlers
+    // for these two are bare setters -- `addBare([this]() { c_main->noWarn(); })`
+    // (`auto_job_json_init.hh:287-289`) and the `warningExit0` entry at `:469`
+    // -- so neither source can ever clear the flag. Setting the CLI value
+    // unconditionally would let its `false` default erase what the JSON asked
+    // for. Only turn the flag on, never off.
+    if cli_warning_exit_zero() {
+        job.set_warnings_exit_zero(true);
+    }
     job.set_logger(cli_logger());
-    job.set_suppress_warnings(suppress_warnings);
+    if suppress_warnings {
+        job.set_suppress_warnings(true);
+    }
     // The library JSON entry point uses qpdfjob's C-helper prefix while the
     // CLI's QPDFJob caller uses the ordinary qpdf prefix. Set the CLI
     // boundary after initialization, before any input warning or completion

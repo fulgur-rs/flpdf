@@ -3648,3 +3648,81 @@ fn assemble_pdf(objects: &[&[u8]]) -> Vec<u8> {
     );
     bytes
 }
+
+/// qpdf's JSON handlers for these two are bare setters -- `noWarn`
+/// (`auto_job_json_init.hh:287-289`) and `warningExit0` (`:469`) can only turn
+/// the flag on, never clear it. The CLI must therefore not push its own
+/// `false` default over a value the job JSON asked for.
+#[test]
+fn job_json_warning_exit_zero_survives_the_cli_default() {
+    if !qpdf_available() {
+        return;
+    }
+    let directory = tempfile::tempdir().unwrap();
+    let fixture = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+        .join("../../tests/fixtures/compat/chained-indirect-contents.pdf");
+    fs::copy(fixture, directory.path().join("input.pdf")).unwrap();
+    fs::write(
+        directory.path().join("job.json"),
+        br#"{"inputFile":"input.pdf","outputFile":"out.pdf","staticId":"","warningExit0":""}"#,
+    )
+    .unwrap();
+
+    let qpdf = ProcessCommand::new("/usr/bin/qpdf")
+        .current_dir(directory.path())
+        .arg("--job-json-file=job.json")
+        .output()
+        .unwrap();
+    let flpdf = Command::cargo_bin("flpdf")
+        .unwrap()
+        .current_dir(directory.path())
+        .env("FLPDF_PROGNAME", "qpdf")
+        .arg("--job-json-file=job.json")
+        .output()
+        .unwrap();
+
+    // The input warns, so without warningExit0 this would be exit 3.
+    assert!(
+        String::from_utf8_lossy(&qpdf.stderr).contains("WARNING"),
+        "fixture must still warn for this test to mean anything: {qpdf:?}"
+    );
+    assert_eq!(qpdf.status.code(), Some(0), "qpdf fixture: {qpdf:?}");
+    assert_eq!(flpdf.status.code(), Some(0));
+    assert_eq!(flpdf.stderr, qpdf.stderr);
+}
+
+#[test]
+fn job_json_no_warn_survives_the_cli_default() {
+    if !qpdf_available() {
+        return;
+    }
+    let directory = tempfile::tempdir().unwrap();
+    let fixture = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+        .join("../../tests/fixtures/compat/chained-indirect-contents.pdf");
+    fs::copy(fixture, directory.path().join("input.pdf")).unwrap();
+    fs::write(
+        directory.path().join("job.json"),
+        br#"{"inputFile":"input.pdf","outputFile":"out.pdf","staticId":"","noWarn":""}"#,
+    )
+    .unwrap();
+
+    let qpdf = ProcessCommand::new("/usr/bin/qpdf")
+        .current_dir(directory.path())
+        .arg("--job-json-file=job.json")
+        .output()
+        .unwrap();
+    let flpdf = Command::cargo_bin("flpdf")
+        .unwrap()
+        .current_dir(directory.path())
+        .env("FLPDF_PROGNAME", "qpdf")
+        .arg("--job-json-file=job.json")
+        .output()
+        .unwrap();
+
+    assert!(
+        !String::from_utf8_lossy(&qpdf.stderr).contains("WARNING"),
+        "qpdf must suppress the warnings for this test to mean anything: {qpdf:?}"
+    );
+    assert_eq!(flpdf.status.code(), qpdf.status.code());
+    assert_eq!(flpdf.stderr, qpdf.stderr);
+}
