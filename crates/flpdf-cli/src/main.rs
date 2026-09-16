@@ -156,14 +156,15 @@ impl ImageTransformOptions {
 /// `doInspection` or attachment mutation (`libqpdf/QPDFJob.cc:473,484-491,
 /// 2046-2247`).
 #[derive(Debug, Clone, Copy)]
-struct InspectionTransformOptions {
+struct InspectionTransformOptions<'a> {
     image: ImageTransformOptions,
     generate_appearances: bool,
     flatten_annotations: Option<CliFlattenMode>,
     flatten_rotation: bool,
+    rotations: &'a [OsString],
 }
 
-impl InspectionTransformOptions {
+impl<'a> InspectionTransformOptions<'a> {
     fn new(
         image: ImageTransformOptions,
         generate_appearances: bool,
@@ -174,13 +175,20 @@ impl InspectionTransformOptions {
             generate_appearances,
             flatten_annotations,
             flatten_rotation: false,
+            rotations: &[],
         }
+    }
+
+    fn with_rotations(mut self, rotations: &'a [OsString]) -> Self {
+        self.rotations = rotations;
+        self
     }
 
     fn is_empty(self) -> bool {
         !self.generate_appearances
             && self.flatten_annotations.is_none()
             && !self.flatten_rotation
+            && self.rotations.is_empty()
             && !self.image.externalize_inline_images
             && !self.image.optimize_images
     }
@@ -419,7 +427,7 @@ fn image_optimization_options(
 fn apply_inspection_transformations<R: Read + Seek + 'static>(
     job: &mut QPDFJob,
     pdf: &mut Pdf<R>,
-    options: InspectionTransformOptions,
+    options: InspectionTransformOptions<'_>,
     verbose: bool,
 ) -> CliResult<()> {
     apply_top_level_inspection_transformations(job, pdf, options, verbose, false, false)
@@ -456,7 +464,7 @@ fn apply_transformations_for_cli<R: Read + Seek + 'static>(
 fn apply_top_level_inspection_transformations<R: Read + Seek + 'static>(
     job: &mut QPDFJob,
     pdf: &mut Pdf<R>,
-    options: InspectionTransformOptions,
+    options: InspectionTransformOptions<'_>,
     verbose: bool,
     remove_restrictions: bool,
     coalesce_contents: bool,
@@ -467,7 +475,7 @@ fn apply_top_level_inspection_transformations<R: Read + Seek + 'static>(
         verbose,
         remove_restrictions,
         coalesce_contents,
-    );
+    )?;
     apply_transformations_for_cli(job, pdf)?;
     Ok(())
 }
@@ -478,18 +486,21 @@ fn apply_top_level_inspection_transformations<R: Read + Seek + 'static>(
 /// well as already-open standalone documents.
 fn configure_top_level_inspection_transformations(
     job: &mut QPDFJob,
-    options: InspectionTransformOptions,
+    options: InspectionTransformOptions<'_>,
     verbose: bool,
     remove_restrictions: bool,
     coalesce_contents: bool,
-) {
+) -> CliResult<()> {
     if options.is_empty() && !remove_restrictions && !coalesce_contents {
-        return;
+        return Ok(());
     }
 
     job.set_verbose(verbose);
     {
         let mut configuration = job.config();
+        for parameter in options.rotations {
+            configuration.rotate(arg_parser::os_bytes(parameter.as_os_str()))?;
+        }
         if remove_restrictions {
             configuration.remove_restrictions();
         }
@@ -512,6 +523,7 @@ fn configure_top_level_inspection_transformations(
             configuration.optimize_images(options.image.image_options);
         }
     }
+    Ok(())
 }
 
 /// Translate the CLI's effective writer options into the reusable library
@@ -3211,11 +3223,13 @@ fn main() {
         args.optimize_images,
         top_level_image_options,
     );
+    let top_level_rotation_parameters = args.page_ops.rotate.clone();
     let mut top_level_inspection_transform_options = InspectionTransformOptions::new(
         top_level_image_transform_options,
         args.generate_appearances,
         args.flatten_annotations,
-    );
+    )
+    .with_rotations(&top_level_rotation_parameters);
     top_level_inspection_transform_options.flatten_rotation = args.flatten_rotation;
     // QPDFWriter::doWriteSetup clears QDF before deriving QDF's implicit
     // normalization defaults for linearized output (`QPDFWriter.cc:2068-2080`).
@@ -4023,7 +4037,7 @@ fn configure_cli_overlay_specs(job: &mut QPDFJob, specs: &[OverlaySpec]) -> CliR
 /// helper.
 fn run_top_level_page_selection_inspection(
     args: &Cli,
-    transform_options: InspectionTransformOptions,
+    transform_options: InspectionTransformOptions<'_>,
     overlay_specs: &[OverlaySpec],
     attachment_segments: &[Vec<Vec<u8>>],
 ) -> CliResult<()> {
@@ -4053,7 +4067,7 @@ fn run_top_level_page_selection_inspection(
         args.verbose,
         args.remove_restrictions,
         args.coalesce_contents,
-    );
+    )?;
     configure_keep_files_open(&mut job, &args.page_ops)?;
 
     if args.page_ops.empty {
@@ -4089,7 +4103,7 @@ fn run_top_level_page_selection_inspection(
 
 fn run_combined_top_level_inspection(
     args: &Cli,
-    transform_options: InspectionTransformOptions,
+    transform_options: InspectionTransformOptions<'_>,
     overlay_specs: &[OverlaySpec],
     attachment_segments: &[Vec<Vec<u8>>],
 ) -> CliResult<()> {
@@ -4119,7 +4133,7 @@ fn run_combined_top_level_inspection(
         args.verbose,
         args.remove_restrictions,
         args.coalesce_contents,
-    );
+    )?;
     configure_top_level_attachment_mutations(&mut job, args, attachment_segments)?;
 
     if args.page_ops.empty {
@@ -4256,7 +4270,7 @@ fn format_job_json_error(path: &Path, error: impl std::fmt::Display) -> String {
 
 fn run_json(
     cli: &Cli,
-    transform_options: InspectionTransformOptions,
+    transform_options: InspectionTransformOptions<'_>,
     attachment_segments: &[Vec<Vec<u8>>],
     empty: bool,
 ) -> CliResult<()> {
@@ -4581,7 +4595,7 @@ fn apply_json_page_specs<R: Read + Seek + 'static>(
 
 fn run_json_input_inspection(
     cli: &Cli,
-    transform_options: InspectionTransformOptions,
+    transform_options: InspectionTransformOptions<'_>,
     overlay_specs: &[OverlaySpec],
     attachment_segments: &[Vec<Vec<u8>>],
 ) -> CliResult<()> {
@@ -4596,7 +4610,7 @@ fn run_json_input_inspection(
             cli.verbose,
             cli.remove_restrictions,
             cli.coalesce_contents,
-        );
+        )?;
         if cli.show_attachment.is_some() {
             job.logger().save_to_standard_output(true)?;
         }
@@ -4619,7 +4633,7 @@ fn run_json_input_inspection(
         cli.verbose,
         cli.remove_restrictions,
         cli.coalesce_contents,
-    );
+    )?;
     if cli.show_attachment.is_some() {
         job.logger().save_to_standard_output(true)?;
     }
@@ -5129,7 +5143,7 @@ fn run_check(
     no_warn: bool,
     show_encryption_key: bool,
     empty: bool,
-    transform_options: InspectionTransformOptions,
+    transform_options: InspectionTransformOptions<'_>,
     verbose: bool,
 ) -> CliResult<()> {
     if empty {
@@ -5167,7 +5181,7 @@ fn run_check_linearization(
     password: &PasswordArgs,
     no_warn: bool,
     empty: bool,
-    transform_options: InspectionTransformOptions,
+    transform_options: InspectionTransformOptions<'_>,
     verbose: bool,
 ) -> CliResult<()> {
     if empty {
@@ -8978,7 +8992,7 @@ fn run_show_object(
     normalize_content: bool,
     suppress_warnings: bool,
     empty: bool,
-    transform_options: InspectionTransformOptions,
+    transform_options: InspectionTransformOptions<'_>,
     verbose: bool,
 ) -> CliResult<()> {
     // qpdf's Config::showObject callback parses the selector during argv
@@ -9051,7 +9065,7 @@ fn run_show_npages(
     password: &PasswordArgs,
     suppress_warnings: bool,
     empty: bool,
-    transform_options: InspectionTransformOptions,
+    transform_options: InspectionTransformOptions<'_>,
     verbose: bool,
 ) -> CliResult<()> {
     if empty {
@@ -9076,7 +9090,7 @@ fn run_show_pages(
     with_images: bool,
     suppress_warnings: bool,
     empty: bool,
-    transform_options: InspectionTransformOptions,
+    transform_options: InspectionTransformOptions<'_>,
     verbose: bool,
 ) -> CliResult<()> {
     if empty {
@@ -9101,7 +9115,7 @@ fn run_show_xref(
     password: &PasswordArgs,
     suppress_warnings: bool,
     empty: bool,
-    transform_options: InspectionTransformOptions,
+    transform_options: InspectionTransformOptions<'_>,
     verbose: bool,
 ) -> CliResult<()> {
     if empty {
@@ -9124,7 +9138,7 @@ fn run_show_linearization(
     password: &PasswordArgs,
     no_warn: bool,
     empty: bool,
-    transform_options: InspectionTransformOptions,
+    transform_options: InspectionTransformOptions<'_>,
     verbose: bool,
 ) -> CliResult<()> {
     if empty {
@@ -9350,7 +9364,7 @@ fn run_show_encryption(
     no_warn: bool,
     show_encryption_key: bool,
     empty: bool,
-    transform_options: InspectionTransformOptions,
+    transform_options: InspectionTransformOptions<'_>,
     verbose: bool,
 ) -> CliResult<()> {
     if empty {
@@ -10214,7 +10228,7 @@ fn configure_attachment_job(
     linearize: bool,
     linearize_pass1: Option<&Path>,
     writer_options: &WriterOptions,
-    transform_options: InspectionTransformOptions,
+    transform_options: InspectionTransformOptions<'_>,
 ) -> CliResult<QPDFJob> {
     let mut job = new_cli_job(suppress_warnings);
     if page_ops.empty {
@@ -10310,7 +10324,7 @@ fn configure_attachment_job(
         verbose,
         remove_restrictions,
         false,
-    );
+    )?;
     Ok(job)
 }
 
@@ -10414,7 +10428,7 @@ fn run_all_attachment_mutations(
     overlay_specs: &[OverlaySpec],
     attachment_segments: &[Vec<Vec<u8>>],
     writer_options: WriterOptions,
-    transform_options: InspectionTransformOptions,
+    transform_options: InspectionTransformOptions<'_>,
 ) -> CliResult<()> {
     let (input, output) = attachment_input_output(
         args.input.clone(),
@@ -10488,7 +10502,7 @@ fn run_list_attachments(
     verbose: bool,
     suppress_warnings: bool,
     empty: bool,
-    transform_options: InspectionTransformOptions,
+    transform_options: InspectionTransformOptions<'_>,
 ) -> CliResult<()> {
     if empty {
         reject_empty_inspection_output(input.as_deref())?;
@@ -10527,7 +10541,7 @@ fn run_show_attachment(
     verbose: bool,
     suppress_warnings: bool,
     empty: bool,
-    transform_options: InspectionTransformOptions,
+    transform_options: InspectionTransformOptions<'_>,
 ) -> CliResult<()> {
     // qpdf latches standard output for `--show-attachment` in
     // `checkConfiguration` (`QPDFJob.cc:621-625`), before it opens the document

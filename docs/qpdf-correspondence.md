@@ -3880,6 +3880,28 @@ qpdf 11.9.0とstatus/stdout/stderr/bytes比較し、coalesce部分は統合済�
 `flpdf-p50gt`（PR #2002）として別責務で維持する。独自の JSON rotation
 routeやdeviation markerは追加しない。
 
+### Standalone inspection rotation consumer (`flpdf-9r7ti`, 2026-09-16)
+
+qpdf の `createQPDF` は page selection後に `handleRotations` を呼び、
+`writeQPDF` の `doInspection` が同じ準備済みdocumentを読む
+（`libqpdf/QPDFJob.cc:459-480,483-490`）。`doInspection` の
+`doShowObj`分岐もこの順序の後段にあるため、`--rotate` と
+`--show-object` の組み合わせは回転後のページ辞書を出力する
+（`libqpdf/QPDFJob.cc:1645-1689,806-835`）。
+
+flpdf の `QPDFJob::Config::rotate` / `apply_configured_rotations` は既に
+同じrange parser・page helper責務を持っていたが、standalone inspectionの
+`InspectionTransformOptions`がrotationを運ばず、`run_show_object`等の
+manual-open consumerが回転前documentを表示していた。`flpdf-9r7ti` はraw
+`OsString` rotation parameter sliceを共通inspection configuratorへ渡し、
+既存の `QPDFJob::apply_transformations` 境界でrotationを他の変換より前に
+適用する。個別show-object分岐や別parserは追加していない。
+
+`crates/flpdf-cli/tests/cli_inspection_combinations.rs::standalone_show_object_inspection_applies_rotation_before_the_consumer`
+が `--rotate=90/180/270 --show-object=3,0` の qpdf 11.9.0
+status/stdout/stderrを比較し、既存のJSON/output/overlay rotation consumerは
+それぞれのcanonical Job routeを継続利用する。
+
 ### QPDFJob conflict inventory and canonical CLI routing (`flpdf-sg6tu`, 2026-09-16)
 
 qpdf 11.9.0 の最終 configuration check は、`--replace-input` と
