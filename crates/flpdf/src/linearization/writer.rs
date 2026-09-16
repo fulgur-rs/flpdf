@@ -3435,9 +3435,15 @@ fn second_half_container_anchors(
                     unreachable!("first-half route in second-half ObjStm batches")
                 } // cov:ignore-end
             };
+            // `plain_ranked` is built group by group, so its entries are not
+            // globally rank-ordered: a Part-9 head object ranks below an
+            // ordinary `lc_other` object pushed before it. Pick the greatest
+            // qualifying rank rather than the last qualifying entry, which
+            // would otherwise depend on push order.
             let previous = plain_ranked
                 .iter()
-                .rfind(|(_, rank)| *rank <= batch_rank)
+                .filter(|(_, rank)| *rank <= batch_rank)
+                .max_by_key(|(_, rank)| *rank)
                 .map(|(r, _)| *r);
             match previous {
                 Some(r) => SecondHalfContainerAnchor::After(r),
