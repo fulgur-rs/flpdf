@@ -51,26 +51,6 @@ fn chase_key<R: Read + Seek>(
     resolve_once(pdf, &child)
 }
 
-/// `handle.getArrayItem(index)` plus the same implicit dereference as
-/// [`chase_key`], for the next accessor call qpdf's own chained
-/// `getArrayItem(i).getKey(...)` performs. A missing/out-of-range item
-/// resolves the same way qpdf's own out-of-bounds `getArrayItem` does: as a
-/// null handle (`QPDFObjectHandle::getArrayItem`,
-/// `libqpdf/QPDFObjectHandle.cc:1091-1100`, which warns and returns
-/// `newNull()`; the warning itself is not reproduced here).
-fn chase_array_item<R: Read + Seek>(
-    pdf: &mut Pdf<R>,
-    handle: &ObjectHandle,
-    index: usize,
-) -> flpdf::Result<ObjectHandle> {
-    let chased = resolve_once(pdf, handle)?;
-    let item = chased
-        .as_array()
-        .and_then(|items| items.get(index).cloned())
-        .unwrap_or_else(ObjectHandle::null);
-    resolve_once(pdf, &item)
-}
-
 /// `QUtil::hex_encode` (`libqpdf/QUtil.cc:720-731`): lowercase hex, two
 /// characters per byte, no separators. Mirrors the identical local helper in
 /// `driver/test_34_41.rs`.
@@ -391,11 +371,7 @@ pub(crate) fn run_test_75<R: Read + Seek>(
     assert!(erase1.remove(pdf, b"1X")?.is_none());
     let removed = erase1.remove(pdf, b"1C")?.expect("1C must be present");
     emit_new_diagnostics(pdf, diagnostics_written, filename, stdout, stderr)?;
-    let removed_text = removed
-        .as_string()
-        .as_deref()
-        .map(flpdf::pdf_string::utf8_value)
-        .unwrap_or_default();
+    let removed_text = removed.try_get_utf8_value()?;
     assert_eq!(removed_text, b"c");
     let mut iter1 = erase1.find(pdf, b"1B", false)?;
     iter1.remove(&mut erase1, pdf)?;
@@ -430,14 +406,13 @@ pub(crate) fn run_test_75<R: Read + Seek>(
             .0,
         240
     );
-    let kids = chase_key(pdf, &erase2_handle, b"/Kids")?;
-    let kid1 = chase_array_item(pdf, &kids, 1)?;
-    let limits1 = chase_key(pdf, &kid1, b"/Limits")?;
-    let limits1_items = limits1.as_array().unwrap_or_default();
-    let limit1_low = resolve_once(pdf, &limits1_items[0])?;
-    let limit1_high = resolve_once(pdf, &limits1_items[1])?;
-    assert_eq!(limit1_low.as_integer(), Some(230));
-    assert_eq!(limit1_high.as_integer(), Some(240));
+    let kids = erase2_handle.try_get_key(b"/Kids")?;
+    let kid1 = kids.try_get_array_item(1)?;
+    let limits1 = kid1.try_get_key(b"/Limits")?;
+    let limit1_low = limits1.try_get_array_item(0)?.try_get_int_value()?;
+    let limit1_high = limits1.try_get_array_item(1)?.try_get_int_value()?;
+    assert_eq!(limit1_low, 230);
+    assert_eq!(limit1_high, 240);
 
     let mut iter2b = erase2.find(pdf, 210, false)?;
     iter2b.remove(&mut erase2, pdf)?;
@@ -448,16 +423,15 @@ pub(crate) fn run_test_75<R: Read + Seek>(
             .0,
         220
     );
-    let kids = chase_key(pdf, &erase2_handle, b"/Kids")?;
-    let kid0 = chase_array_item(pdf, &kids, 0)?;
-    let limits0 = chase_key(pdf, &kid0, b"/Limits")?;
-    let limits0_items = limits0.as_array().unwrap_or_default();
-    let limit0_low = resolve_once(pdf, &limits0_items[0])?;
-    let limit0_high = resolve_once(pdf, &limits0_items[1])?;
-    assert_eq!(limit0_low.as_integer(), Some(220));
-    assert_eq!(limit0_high.as_integer(), Some(220));
-    let kid0_kids = chase_key(pdf, &kid0, b"/Kids")?;
-    assert_eq!(kid0_kids.as_array().unwrap_or_default().len(), 1);
+    let kids = erase2_handle.try_get_key(b"/Kids")?;
+    let kid0 = kids.try_get_array_item(0)?;
+    let limits0 = kid0.try_get_key(b"/Limits")?;
+    let limit0_low = limits0.try_get_array_item(0)?.try_get_int_value()?;
+    let limit0_high = limits0.try_get_array_item(1)?.try_get_int_value()?;
+    assert_eq!(limit0_low, 220);
+    assert_eq!(limit0_high, 220);
+    let kid0_kids = kid0.try_get_key(b"/Kids")?;
+    assert_eq!(kid0_kids.try_get_array_n_items()?, 1);
 
     let mut erase3 = NumberTree::new(pdf.trailer_key_handle(b"Erase3"), true);
     let mut iter3 = erase3.find(pdf, 320, false)?;
@@ -825,7 +799,7 @@ pub(crate) fn run_test_79<R: Read + Seek>(
 
 #[cfg(test)]
 mod tests {
-    use super::{chase_array_item, chase_key, resolve_once, run_test_73, run_test_78, run_test_79};
+    use super::{run_test_73, run_test_78, run_test_79};
     use flpdf::{ObjectHandle, Pdf, PdfOpenOptions};
 
     fn minimal_pdf() -> Pdf<std::io::Cursor<Vec<u8>>> {
@@ -841,13 +815,10 @@ mod tests {
     }
 
     #[test]
-    fn canonical_helpers_resolve_one_hop_and_preserve_handles() {
+    fn canonical_accessors_resolve_one_hop_and_preserve_handles() {
         let mut pdf = minimal_pdf();
         let root = pdf.trailer_key_handle(b"Root");
-        let resolved = resolve_once(&mut pdf, &root).expect("resolve root");
-        assert_eq!(resolved.object_ref(), root.object_ref());
-
-        let pages = chase_key(&mut pdf, &root, b"/Pages").expect("resolve /Pages");
+        let pages = root.try_get_key(b"/Pages").expect("resolve /Pages");
         assert_eq!(
             pages.object_ref().map(|object_ref| object_ref.number),
             Some(2)
@@ -855,14 +826,13 @@ mod tests {
 
         let array = ObjectHandle::array(vec![ObjectHandle::integer(7)]);
         assert_eq!(
-            chase_array_item(&mut pdf, &array, 0)
+            array
+                .try_get_array_item(0)
                 .expect("resolve array item")
-                .as_integer(),
-            Some(7)
+                .try_get_int_value()
+                .expect("read array item"),
+            7
         );
-        assert!(chase_array_item(&mut pdf, &array, 1)
-            .expect("resolve missing array item")
-            .is_null());
     }
 
     #[test]
