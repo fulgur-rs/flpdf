@@ -241,20 +241,15 @@ pub(crate) fn run_test_4<R: Read + Seek>(
     }
 
     let mut qtest2 = trailer.try_get_key(b"/QTest2")?;
-    // qpdf's `isNull()` dereferences before checking
-    // (`libqpdf/QPDFObjectHandle.cc:240-249`); `try_get_key` above resolves
-    // only its receiver, so `qtest2` itself is resolved explicitly here --
-    // otherwise an unresolved indirect `/QTest2` would read as non-null
-    // regardless of what it actually resolves to (`ObjectHandle::is_null`'s
-    // own doc).
-    resolve_handle(pdf, &qtest2)?;
-    // A lazy resolution here can raise a recoverable repair warning. qpdf
-    // delivers it the instant `warn()` records it (`libqpdf/QPDF.cc:487-494`),
-    // so drain before the next output rather than letting it surface after a
-    // later accessor's drain -- or, for `run_test_4`, never.
+    // qpdf's public `isNull()` dereferences before checking
+    // (`libqpdf/QPDFObjectHandle.cc:353-356`), so the canonical predicate owns
+    // `/QTest2` receiver resolution. Capture its result before draining: a
+    // lazy resolution can record a repair warning and then fail, and qpdf's
+    // synchronous warning logger emits that warning before the error.
+    let qtest2_is_null = qtest2.try_is_null();
     emit_new_diagnostics(pdf, diagnostics_written, filename, stdout, stderr)
         .map_err(Error::from)?;
-    if !qtest2.is_null() {
+    if !qtest2_is_null? {
         qtest2.make_direct(true)?;
         trailer.replace_key(b"/QTest2", qtest2)?;
     }

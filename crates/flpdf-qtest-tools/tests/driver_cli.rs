@@ -1477,14 +1477,16 @@ fn qtest_accessor_cases_do_not_use_explicit_pdf_resolve() {
         early_source.contains("fn resolve_handle"),
         "the shared resolve_handle helper was removed with test 2's caller"
     );
+    let test_4 = section(
+        early_source.as_str(),
+        "pub(crate) fn run_test_4",
+        "pub(crate) fn run_test_5",
+    );
     assert!(
-        section(
-            early_source.as_str(),
-            "pub(crate) fn run_test_4",
-            "pub(crate) fn run_test_5",
-        )
-        .contains("resolve_handle("),
-        "test 4 lost the explicit resolution required by its non-accessor path"
+        test_4.contains("try_is_null()")
+            && !test_4.contains("resolve_handle(")
+            && !test_4.contains(".is_null()"),
+        "test 4 must use the canonical resolving null predicate without a caller-side bridge"
     );
     let test_6 = section(
         early_source.as_str(),
