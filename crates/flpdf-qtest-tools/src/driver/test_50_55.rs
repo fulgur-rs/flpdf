@@ -120,27 +120,34 @@ pub(crate) fn run_test_51<R: Read + Seek>(
     // resolve their receivers at each accessor boundary
     // (`qpdf/test_driver.cc:1955-1997`). Keep that order and flush the shared
     // diagnostic collection before any subsequent observable output.
-    let root = pdf.root_handle()?;
+    let root = pdf.root_handle();
     emit_new_diagnostics(pdf, diagnostics_written, filename, stdout, stderr)?;
-    let acroform = root.try_get_key(b"/AcroForm")?;
+    let root = root?;
+    let acroform = root.try_get_key(b"/AcroForm");
     emit_new_diagnostics(pdf, diagnostics_written, filename, stdout, stderr)?;
-    let fields = acroform.try_get_key(b"/Fields")?;
+    let acroform = acroform?;
+    let fields = acroform.try_get_key(b"/Fields");
     emit_new_diagnostics(pdf, diagnostics_written, filename, stdout, stderr)?;
-    let count = fields.try_get_array_n_items()?;
+    let fields = fields?;
+    let count = fields.try_get_array_n_items();
     emit_new_diagnostics(pdf, diagnostics_written, filename, stdout, stderr)?;
+    let count = count?;
 
     for index in 0..count {
-        let field = fields.try_get_array_item(index as i64)?;
+        let field = fields.try_get_array_item(index as i64);
         emit_new_diagnostics(pdf, diagnostics_written, filename, stdout, stderr)?;
-        let t = field.try_get_key(b"/T")?;
+        let field = field?;
+        let t = field.try_get_key(b"/T");
         emit_new_diagnostics(pdf, diagnostics_written, filename, stdout, stderr)?;
+        let t = t?;
         if !t.try_is_string()? {
             emit_new_diagnostics(pdf, diagnostics_written, filename, stdout, stderr)?;
             continue;
         }
         emit_new_diagnostics(pdf, diagnostics_written, filename, stdout, stderr)?;
-        let utf8 = t.try_get_utf8_value()?;
+        let utf8 = t.try_get_utf8_value();
         emit_new_diagnostics(pdf, diagnostics_written, filename, stdout, stderr)?;
+        let utf8 = utf8?;
 
         if utf8 == b"r1" {
             writeln!(stdout, "setting r1 via parent")?;
@@ -149,10 +156,12 @@ pub(crate) fn run_test_51<R: Read + Seek>(
             emit_new_diagnostics(pdf, diagnostics_written, filename, stdout, stderr)?;
         } else if utf8 == b"r2" {
             writeln!(stdout, "setting r2 via child")?;
-            let kids = field.try_get_key(b"/Kids")?;
+            let kids = field.try_get_key(b"/Kids");
             emit_new_diagnostics(pdf, diagnostics_written, filename, stdout, stderr)?;
-            let kid = kids.try_get_array_item(1)?;
+            let kids = kids?;
+            let kid = kids.try_get_array_item(1);
             emit_new_diagnostics(pdf, diagnostics_written, filename, stdout, stderr)?;
+            let kid = kid?;
             let mut foh = FormFieldObjectHelper::from_object_handle(kid, pdf);
             foh.set_value(ObjectHandle::name(b"3".to_vec()), true)?;
             emit_new_diagnostics(pdf, diagnostics_written, filename, stdout, stderr)?;

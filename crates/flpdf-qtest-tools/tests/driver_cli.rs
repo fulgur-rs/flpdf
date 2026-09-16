@@ -1372,12 +1372,12 @@ fn qtest_accessor_cases_do_not_use_explicit_pdf_resolve() {
         "pub(crate) fn run_test_52",
     );
     assert!(
-        test_51.contains("pdf.root_handle()?")
+        test_51.contains("pdf.root_handle()")
             && test_51.contains("try_get_key(")
-            && test_51.contains("try_get_array_n_items()?")
+            && test_51.contains("try_get_array_n_items()")
             && test_51.contains("try_get_array_item(")
-            && test_51.contains("try_is_string()?")
-            && test_51.contains("try_get_utf8_value()?")
+            && test_51.contains("try_is_string()")
+            && test_51.contains("try_get_utf8_value()")
             && test_51.contains("FormFieldObjectHelper::from_object_handle(")
             && test_51.matches("emit_new_diagnostics(").count() >= 8
             && !test_51.contains("resolve_and_drain(")
@@ -1388,6 +1388,20 @@ fn qtest_accessor_cases_do_not_use_explicit_pdf_resolve() {
             && !test_51.contains("FIELD_MUST_BE_INDIRECT"),
         "test 51 must use canonical resolving accessors and handle-native form helpers"
     );
+    // qpdf's warning logger is synchronous, so an accessor that records a
+    // repair warning and *then* fails must have that warning printed first.
+    // `X()?;` straight before emit_new_diagnostics loses it (see test 34).
+    for call in [
+        "pdf.root_handle()",
+        "try_get_array_n_items()",
+        "try_is_string()",
+        "try_get_utf8_value()",
+    ] {
+        assert!(
+            !test_51.contains(&format!("{call}?;")),
+            "test 51 must flush diagnostics before propagating `{call}`"
+        );
+    }
 
     let test_2 = section(
         early_source.as_str(),
