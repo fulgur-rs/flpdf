@@ -1528,6 +1528,7 @@ fn qtest_accessor_cases_do_not_use_explicit_pdf_resolve() {
             && test_38.contains("try_get_array_n_items()?")
             && test_38.contains("try_get_array_item(")
             && test_38.contains("try_unparse_resolved()?")
+            && test_38.matches("emit_new_diagnostics(").count() >= 5
             && !test_38.contains("root_handle(pdf")
             && !test_38.contains("resolved_key(")
             && !test_38.contains("resolved_terminal(")
