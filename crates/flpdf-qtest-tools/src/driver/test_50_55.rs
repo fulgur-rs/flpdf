@@ -181,7 +181,13 @@ pub(crate) fn run_test_52<R: Read + Seek>(
     // resolve their receivers at each accessor boundary
     // (`qpdf/test_driver.cc:1999-2022`). Keep that order and flush the shared
     // diagnostic collection before any subsequent observable output.
-    let root = pdf.root_handle()?;
+    let root = match pdf.root_handle() {
+        Ok(root) => root,
+        Err(error) => {
+            emit_new_diagnostics(pdf, diagnostics_written, filename, stdout, stderr)?;
+            return Err(error);
+        }
+    };
     emit_new_diagnostics(pdf, diagnostics_written, filename, stdout, stderr)?;
     let acroform = root.try_get_key(b"/AcroForm")?;
     emit_new_diagnostics(pdf, diagnostics_written, filename, stdout, stderr)?;

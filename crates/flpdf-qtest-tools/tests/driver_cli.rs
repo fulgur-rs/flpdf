@@ -615,6 +615,26 @@ fn test_93_drains_the_repair_warning_from_resolving_a_malformed_root() {
 }
 
 #[test]
+fn test_52_drains_the_repair_warning_before_a_terminal_root_error() {
+    let directory = tempfile::tempdir().expect("temporary directory");
+    let input = directory.path().join("recoverable-bad-root.pdf");
+    fs::write(&input, recoverable_non_dictionary_root_pdf())
+        .expect("write recoverable malformed root fixture");
+    let input = input.to_str().expect("utf-8 temporary path");
+    let expected = format!(
+        "WARNING: {input} (object 1 0, offset 19): expected endobj\n\
+         {input}: unable to find /Root dictionary\n"
+    );
+
+    driver()
+        .args(["52", input, "-"])
+        .assert()
+        .code(2)
+        .stdout("")
+        .stderr(expected);
+}
+
+#[test]
 fn test_53_emits_all_objects_and_writes_dangling_output() {
     let directory = tempfile::tempdir().expect("temporary directory");
 
@@ -1409,7 +1429,7 @@ fn qtest_accessor_cases_do_not_use_explicit_pdf_resolve() {
         "pub(crate) fn run_test_53",
     );
     assert!(
-        test_52.contains("pdf.root_handle()?")
+        test_52.contains("pdf.root_handle()")
             && test_52.contains("try_get_key(")
             && test_52.contains("try_get_array_n_items()?")
             && test_52.contains("try_get_array_item(")
@@ -1417,6 +1437,8 @@ fn qtest_accessor_cases_do_not_use_explicit_pdf_resolve() {
             && test_52.contains("try_get_utf8_value()?")
             && test_52.contains("FormFieldObjectHelper::from_object_handle(")
             && test_52.matches("emit_new_diagnostics(").count() >= 8
+            && test_52.contains("let root = match pdf.root_handle()")
+            && test_52.contains("return Err(error);")
             && !test_52.contains("resolve_and_drain(")
             && !test_52.contains("pdf.resolve(")
             && !test_52.contains(".get_key(")
