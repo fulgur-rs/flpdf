@@ -1500,6 +1500,23 @@ fn qtest_accessor_cases_do_not_use_explicit_pdf_resolve() {
         !tree_source.contains("fn chase_key"),
         "test 42-49 retains the qpdf-less chase_key helper after case47 cutover"
     );
+    let test_39 = section(
+        resolve_source.as_str(),
+        "pub(crate) fn run_test_39",
+        "pub(crate) fn run_test_40",
+    );
+    assert!(
+        test_39.contains("get_images()")
+            && test_39.contains("try_get_stream_dict()")
+            && test_39.contains("try_get_key(")
+            && test_39.contains("try_unparse_resolved()")
+            && !test_39.contains("get_resources(false)")
+            && !test_39.contains("resolve_once(")
+            && !test_39.contains("as_stream_dict()")
+            && !test_39.contains(".get_key(")
+            && !test_39.contains(".unparse_resolved()"),
+        "test 39 must use the canonical image and stream accessors"
+    );
     let test_21 = section(
         page_source.as_str(),
         "pub(crate) fn run_test_21",
