@@ -1543,11 +1543,11 @@ fn qtest_accessor_cases_do_not_use_explicit_pdf_resolve() {
         "// ---------------------------------------------------------------------------\n// test_35 / test_36",
     );
     assert!(
-        test_34.contains("pdf.get_extension_level()?")
-            && test_34.contains("pdf.root_handle()?")
-            && test_34.contains("root.try_get_key(b\"/Extensions\")?")
+        test_34.contains("pdf.get_extension_level()")
+            && test_34.contains("pdf.root_handle()")
+            && test_34.contains("root.try_get_key(b\"/Extensions\")")
             && test_34.contains("extensions.unparse()")
-            && test_34.contains("pdf.get_version_as_pdf_version()?")
+            && test_34.contains("pdf.get_version_as_pdf_version()")
             && test_34.matches("emit_new_diagnostics(").count() >= 4
             && !test_34.contains("catalog_extension_level(")
             && !test_34.contains("root_handle(pdf")
@@ -1556,6 +1556,21 @@ fn qtest_accessor_cases_do_not_use_explicit_pdf_resolve() {
             && !test_34.contains(".get_key("),
         "test 34 must use canonical version/root/key accessors and retain qpdf unparse"
     );
+    // qpdf's warning logger is synchronous: a call that records a repair
+    // warning and then fails must have that warning printed before the error.
+    // Each fallible accessor must therefore hold its result, drain
+    // diagnostics, and only then propagate -- never `X()?` straight through.
+    for call in [
+        "pdf.get_extension_level()",
+        "pdf.root_handle()",
+        "root.try_get_key(b\"/Extensions\")",
+        "pdf.get_version_as_pdf_version()",
+    ] {
+        assert!(
+            !test_34.contains(&format!("{call}?;")),
+            "test 34 must flush diagnostics before propagating `{call}`"
+        );
+    }
     let test_21 = section(
         page_source.as_str(),
         "pub(crate) fn run_test_21",
