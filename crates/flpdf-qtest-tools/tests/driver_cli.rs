@@ -1536,6 +1536,25 @@ fn qtest_accessor_cases_do_not_use_explicit_pdf_resolve() {
             && !test_38.contains(".unparse_resolved()"),
         "test 38 must use canonical resolving root, array, and unparse accessors"
     );
+    let test_34 = section(
+        resolve_source.as_str(),
+        "pub(crate) fn run_test_34",
+        "// ---------------------------------------------------------------------------\n// test_35 / test_36",
+    );
+    assert!(
+        test_34.contains("pdf.get_extension_level()?")
+            && test_34.contains("pdf.root_handle()?")
+            && test_34.contains("root.try_get_key(b\"/Extensions\")?")
+            && test_34.contains("extensions.unparse()")
+            && test_34.contains("pdf.get_version_as_pdf_version()?")
+            && test_34.matches("emit_new_diagnostics(").count() >= 4
+            && !test_34.contains("catalog_extension_level(")
+            && !test_34.contains("root_handle(pdf")
+            && !test_34.contains("resolved_key(")
+            && !test_34.contains("resolved_terminal(")
+            && !test_34.contains(".get_key("),
+        "test 34 must use canonical version/root/key accessors and retain qpdf unparse"
+    );
     let test_21 = section(
         page_source.as_str(),
         "pub(crate) fn run_test_21",
