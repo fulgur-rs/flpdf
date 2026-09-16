@@ -3,7 +3,7 @@
 //! qpdf correspondence: QPDFParser.cc live file-object parsing plus slice object/content consumer boundaries.
 //!
 use crate::object_handle::{DocumentResolver, ObjectHandle, ObjectValue, NO_PARSED_OFFSET};
-use crate::tokenizer::{is_delimiter, is_ws, Token, TokenType, Tokenizer};
+use crate::tokenizer::{is_delimiter, is_ws, PushedSimpleToken, Token, TokenType, Tokenizer};
 use crate::{Error, ObjectRef, QpdfErrorCode, QpdfExc, Result};
 use std::rc::{Rc, Weak};
 
@@ -212,6 +212,16 @@ enum LiveToken {
         start: usize,
         end: usize,
     },
+    Bool {
+        value: bool,
+        start: usize,
+        end: usize,
+    },
+    Simple {
+        token_type: TokenType,
+        start: usize,
+        end: usize,
+    },
     Owned(Token),
 }
 
@@ -225,6 +235,8 @@ impl LiveToken {
     fn token_type(&self) -> TokenType {
         match self {
             Self::Integer { .. } => TokenType::Integer,
+            Self::Bool { .. } => TokenType::Bool,
+            Self::Simple { token_type, .. } => *token_type,
             Self::Owned(token) => token.token_type,
         }
     }
@@ -232,6 +244,7 @@ impl LiveToken {
     fn start(&self) -> usize {
         match self {
             Self::Integer { start, .. } => *start,
+            Self::Bool { start, .. } | Self::Simple { start, .. } => *start,
             Self::Owned(token) => token.start,
         }
     }
@@ -239,6 +252,7 @@ impl LiveToken {
     fn end(&self) -> usize {
         match self {
             Self::Integer { end, .. } => *end,
+            Self::Bool { end, .. } | Self::Simple { end, .. } => *end,
             Self::Owned(token) => token.end,
         }
     }
@@ -334,6 +348,33 @@ impl<'input, I: LiveInput> LiveTokenSource<'input, I> {
                     start,
                     end,
                 });
+            }
+
+            if let Some(pushed) = self.tokenizer.get_simple() {
+                match pushed {
+                    PushedSimpleToken::Bool {
+                        value,
+                        raw_len,
+                        unread,
+                    } => {
+                        let (start, end) = self.set_token_offsets(raw_len, unread)?;
+                        self.last_offset = start;
+                        return Ok(LiveToken::Bool { value, start, end });
+                    }
+                    PushedSimpleToken::Simple {
+                        token_type,
+                        raw_len,
+                        unread,
+                    } => {
+                        let (start, end) = self.set_token_offsets(raw_len, unread)?;
+                        self.last_offset = start;
+                        return Ok(LiveToken::Simple {
+                            token_type,
+                            start,
+                            end,
+                        });
+                    }
+                }
             }
 
             let Some(pushed) = self.tokenizer.get_token() else {
@@ -989,6 +1030,22 @@ impl<I: LiveInput> LiveFileParser<'_, '_, '_, I> {
         match token {
             LiveToken::Integer { value, .. } => {
                 Ok(self.direct_at(ObjectValue::Integer(value), scalar_offset))
+            }
+            LiveToken::Bool { value, .. } => {
+                Ok(self.direct_at(ObjectValue::Boolean(value), scalar_offset))
+            }
+            LiveToken::Simple {
+                token_type,
+                start,
+                end,
+            } => {
+                if token_type == TokenType::Null {
+                    return Ok(ObjectHandle::null());
+                }
+                self.parse_owned_scalar_token(
+                    Token::from_parts(token_type, Vec::new(), Vec::new(), None, start..end),
+                    scalar_offset,
+                )
             }
             LiveToken::Owned(token) => self.parse_owned_scalar_token(token, scalar_offset),
         }
@@ -1815,6 +1872,93 @@ mod live_input_tests {
             tokens.next_live_token().expect("reference marker"),
             super::LiveToken::Owned(token)
                 if token.token_type == TokenType::Word && token.value == b"R"
+        ));
+    }
+
+    #[test]
+    fn live_token_source_compacts_qpdf_scalar_tokens_without_owned_buffers() {
+        let mut input = CountingInput::new(b"[true false null] <<>> {}");
+        let mut tokens = LiveTokenSource::new(&mut input);
+
+        assert!(matches!(
+            tokens.next_live_token().expect("array open"),
+            super::LiveToken::Simple {
+                token_type: TokenType::ArrayOpen,
+                start: 0,
+                end: 1,
+            }
+        ));
+        assert!(matches!(
+            tokens.next_live_token().expect("boolean"),
+            super::LiveToken::Bool {
+                value: true,
+                start: 1,
+                end: 5,
+            }
+        ));
+        assert!(matches!(
+            tokens.next_live_token().expect("false boolean"),
+            super::LiveToken::Bool {
+                value: false,
+                start: 6,
+                end: 11,
+            }
+        ));
+        assert!(matches!(
+            tokens.next_live_token().expect("null"),
+            super::LiveToken::Simple {
+                token_type: TokenType::Null,
+                start: 12,
+                end: 16,
+            }
+        ));
+        assert!(matches!(
+            tokens.next_live_token().expect("array close"),
+            super::LiveToken::Simple {
+                token_type: TokenType::ArrayClose,
+                start: 16,
+                end: 17,
+            }
+        ));
+        assert!(matches!(
+            tokens.next_live_token().expect("dictionary open"),
+            super::LiveToken::Simple {
+                token_type: TokenType::DictOpen,
+                start: 18,
+                end: 20,
+            }
+        ));
+        assert!(matches!(
+            tokens.next_live_token().expect("dictionary close"),
+            super::LiveToken::Simple {
+                token_type: TokenType::DictClose,
+                start: 20,
+                end: 22,
+            }
+        ));
+        assert!(matches!(
+            tokens.next_live_token().expect("brace open"),
+            super::LiveToken::Simple {
+                token_type: TokenType::BraceOpen,
+                start: 23,
+                end: 24,
+            }
+        ));
+        assert!(matches!(
+            tokens.next_live_token().expect("brace close"),
+            super::LiveToken::Simple {
+                token_type: TokenType::BraceClose,
+                start: 24,
+                end: 25,
+            }
+        ));
+        assert!(matches!(
+            tokens.next_live_token().expect("EOF"),
+            super::LiveToken::Simple {
+                token_type: TokenType::Eof,
+                start: 25,
+                end: 25,
+            }
         ));
     }
 

@@ -179,6 +179,22 @@ pub(crate) struct PushedInteger {
     pub(crate) unread: Option<u8>,
 }
 
+/// qpdf's live parser does not need owned bytes for short structural and
+/// boolean/null tokens. Keep their token type (and boolean value) while the
+/// tokenizer reuses its internal buffers for the next token.
+pub(crate) enum PushedSimpleToken {
+    Bool {
+        value: bool,
+        raw_len: usize,
+        unread: Option<u8>,
+    },
+    Simple {
+        token_type: TokenType,
+        raw_len: usize,
+        unread: Option<u8>,
+    },
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum State {
     InHexString,
@@ -366,6 +382,44 @@ impl<'a> Tokenizer<'a> {
             raw_len,
             unread,
         })
+    }
+
+    /// Consume a live token whose parser meaning is fully represented by its
+    /// type. This is the allocation-free counterpart to [`Self::get_token`]
+    /// for qpdf's short booleans, nulls, delimiters, and EOF.
+    pub(crate) fn get_simple(&mut self) -> Option<PushedSimpleToken> {
+        if self.state != State::TokenReady {
+            return None;
+        }
+
+        let raw_len = self.raw.len();
+        let unread = if !self.in_token && !self.before_token {
+            self.char_to_unread
+        } else {
+            None
+        };
+        let simple = match self.token_type {
+            TokenType::Bool => PushedSimpleToken::Bool {
+                value: self.raw == b"true",
+                raw_len,
+                unread,
+            },
+            TokenType::ArrayClose
+            | TokenType::ArrayOpen
+            | TokenType::BraceClose
+            | TokenType::BraceOpen
+            | TokenType::DictClose
+            | TokenType::DictOpen
+            | TokenType::Eof
+            | TokenType::Null => PushedSimpleToken::Simple {
+                token_type: self.token_type,
+                raw_len,
+                unread,
+            },
+            _ => return None,
+        };
+        self.reset();
+        Some(simple)
     }
 
     fn reset(&mut self) {

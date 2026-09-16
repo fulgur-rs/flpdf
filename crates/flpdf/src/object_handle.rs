@@ -8292,13 +8292,17 @@ impl<'a> ObjectJsonWriter<'a> {
 
 impl Drop for ObjectHandle {
     fn drop(&mut self) {
-        Self::drain_owned_descendants(&self.0);
+        if Rc::strong_count(&self.0) == 1 {
+            Self::drain_owned_descendants(&self.0);
+        }
     }
 }
 
 impl Drop for ObjectHandleIdentity {
     fn drop(&mut self) {
-        ObjectHandle::drain_owned_descendants(&self.0);
+        if Rc::strong_count(&self.0) == 1 {
+            ObjectHandle::drain_owned_descendants(&self.0);
+        }
     }
 }
 
