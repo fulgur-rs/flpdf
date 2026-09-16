@@ -526,6 +526,111 @@ fn job_json_file_selector_errors_follow_argv_order() {
 }
 
 #[test]
+fn top_level_parse_errors_follow_qpdf_argv_order() {
+    if !qpdf_available() {
+        return;
+    }
+
+    let directory = tempfile::tempdir().unwrap();
+    fs::copy(
+        PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../tests/fixtures/minimal.pdf"),
+        directory.path().join("input.pdf"),
+    )
+    .unwrap();
+    let missing_job = directory.path().join("missing.json");
+    let missing_job_argument = format!("--job-json-file={}", missing_job.display());
+    let cases = vec![
+        (
+            "rotate-before-json-output",
+            vec![
+                "--rotate=91".to_owned(),
+                "--json-output=1".to_owned(),
+                "input.pdf".to_owned(),
+            ],
+        ),
+        (
+            "json-output-before-rotate",
+            vec![
+                "--json-output=1".to_owned(),
+                "--rotate=91".to_owned(),
+                "input.pdf".to_owned(),
+            ],
+        ),
+        (
+            "rotate-before-json",
+            vec![
+                "--rotate=91".to_owned(),
+                "--json=0".to_owned(),
+                "input.pdf".to_owned(),
+            ],
+        ),
+        (
+            "json-before-rotate",
+            vec![
+                "--json=0".to_owned(),
+                "--rotate=91".to_owned(),
+                "input.pdf".to_owned(),
+            ],
+        ),
+        (
+            "rotate-before-collate",
+            vec![
+                "--rotate=91".to_owned(),
+                "--collate=1,".to_owned(),
+                "input.pdf".to_owned(),
+            ],
+        ),
+        (
+            "collate-before-rotate",
+            vec![
+                "--collate=1,".to_owned(),
+                "--rotate=91".to_owned(),
+                "input.pdf".to_owned(),
+            ],
+        ),
+        (
+            "job-json-before-rotate",
+            vec![
+                missing_job_argument.clone(),
+                "--rotate=91".to_owned(),
+                "input.pdf".to_owned(),
+            ],
+        ),
+        (
+            "rotate-before-job-json",
+            vec![
+                "--rotate=91".to_owned(),
+                missing_job_argument,
+                "input.pdf".to_owned(),
+            ],
+        ),
+    ];
+
+    for (name, args) in cases {
+        let qpdf = ProcessCommand::new("/usr/bin/qpdf")
+            .current_dir(directory.path())
+            .args(&args)
+            .output()
+            .unwrap();
+        let flpdf = Command::cargo_bin("flpdf")
+            .unwrap()
+            .current_dir(directory.path())
+            .env("FLPDF_PROGNAME", "qpdf")
+            .args(&args)
+            .output()
+            .unwrap();
+
+        assert_eq!(
+            flpdf.status.code(),
+            qpdf.status.code(),
+            "status differs for {name}: qpdf={qpdf:?}, flpdf={flpdf:?}"
+        );
+        assert_eq!(flpdf.stdout, qpdf.stdout, "stdout differs for {name}");
+        assert_eq!(flpdf.stderr, qpdf.stderr, "stderr differs for {name}");
+    }
+}
+
+#[test]
 fn job_json_file_preserves_input_encryption_when_compression_is_disabled() {
     if !qpdf_available() {
         return;
@@ -716,6 +821,51 @@ fn job_json_file_missing_preserves_non_utf8_path_bytes() {
             .any(|window| window == b"\xef\xbf\xbd"),
         "flpdf must not replace the raw path with U+FFFD: {:?}",
         flpdf.stderr
+    );
+}
+
+#[cfg(target_os = "linux")]
+#[test]
+fn job_json_file_directory_keeps_the_portable_flpdf_diagnostic() {
+    if !qpdf_available() {
+        return;
+    }
+
+    let directory = tempfile::tempdir().unwrap();
+    let argument = format!("--job-json-file={}", directory.path().display());
+
+    let qpdf = ProcessCommand::new("/usr/bin/qpdf")
+        .current_dir(directory.path())
+        .arg(&argument)
+        .output()
+        .unwrap();
+    let flpdf = Command::cargo_bin("flpdf")
+        .unwrap()
+        .current_dir(directory.path())
+        .env("FLPDF_PROGNAME", "qpdf")
+        .arg(&argument)
+        .output()
+        .unwrap();
+
+    assert_eq!(qpdf.status.code(), Some(2));
+    assert_eq!(flpdf.status.code(), Some(2));
+    assert_eq!(flpdf.stdout, qpdf.stdout);
+    assert_ne!(flpdf.stderr, qpdf.stderr);
+    assert!(
+        qpdf.stderr
+            .windows(b"basic_string::_M_create".len())
+            .any(|window| window == b"basic_string::_M_create"),
+        "qpdf's directory diagnostic should expose the libstdc++ artifact: {:?}",
+        qpdf.stderr
+    );
+    let flpdf_stderr = String::from_utf8(flpdf.stderr).unwrap();
+    assert!(
+        flpdf_stderr.contains(&format!(
+            "error with job-json file {}: open {}: Is a directory",
+            directory.path().display(),
+            directory.path().display()
+        )),
+        "flpdf should retain its portable directory diagnostic: {flpdf_stderr}"
     );
 }
 

@@ -402,7 +402,7 @@ canonical になったため `mixed` に戻った。）
 | 44 | `qpdf/test_driver.cc:1612-1631` | `crates/flpdf-qtest-tools/src/driver/test_42_49.rs::run_test_44` | mixed | `AcroFormDocumentHelper::get_form_fields`、`FormFieldObjectHelper::set_value_string`/`field_type`/`fully_qualified_name`/`value_as_string`、`PdfWriter`（QDF/static-id/suppress-original-ids）。既知の逸脱なし。。本表の分類規則（A〜D の既存行が `mixed`/`bridge` と判定した entrypoint に触れるケースはそれに従う）により、`writer.write()`（D1 mixed） を呼ぶため `mixed`。 |
 | 45 | `qpdf/test_driver.cc:1632-1645` | `crates/flpdf-qtest-tools/src/driver/test_42_49.rs::run_test_45` | mixed | `PdfWriter::write` は canonical だが、既知・追跡済みギャップ: `Pdf::repair_diagnostics()` は open 時診断に限らず、writer の stream warning も各ハンドルの resolver 経由で同じ collection に入る（`writer.rs:6540-6592` の `pdf_writer_reprocesses_an_invalid_compression_level_without_filtering` が `write()` 後に両方の write 時 warning を確認している）。case 45 は `getWarnings()` が非空かを見るだけなので現行 API で移植可能。残るギャップは write 時 warning による `exit(3)` ゲートで、E-19 と `flpdf-3yn9.48.26` が追跡する。 |
 | 46 | `qpdf/test_driver.cc:1646-1784` | `crates/flpdf-qtest-tools/src/driver/test_42_49.rs::run_test_46` | canonical | `NumberTree`/`NumberTreeCursor`（`nntree.rs`）— `QPDFNumberTreeObjectHelper`/その iterator の直接 port（wrap 挙動・値エイリアシングまで一致、doc comment 明記）。値の消費は qpdf の public `getStringValue`（`libqpdf/QPDFObjectHandle.cc:659-677`）に対応する `ObjectHandle::try_get_string_value`、`/Kids` 判定は `getKey("/Kids").getArrayItem(0).isIndirect()` に対応する `try_get_key` → `try_get_array_item` へ `.48.103` で移行し、明示 `Pdf::resolve` は残らない。 |
-| 47 | `qpdf/test_driver.cc:1785-1798` | `crates/flpdf-qtest-tools/src/driver/test_42_49.rs::run_test_47` | canonical | `PageLabelDocumentHelper::get_labels_for_page_range` — pair 型の戻り値により qpdf の flat-vector 等価性チェックが tautological（逸脱ではない）。`checked_sub` は qpdf の unguarded だが等価な underflow 形状に一致。 |
+| 47 | `qpdf/test_driver.cc:1785-1798` | `crates/flpdf-qtest-tools/src/driver/test_42_49.rs::run_test_47` | canonical | qpdfの`getRoot` → `getKey("/Pages")` → `getKey("/Count")` → `getIntValue`を、`Pdf::root_handle` → `try_get_key` → `try_get_key` → `try_get_int_value`でreceiver境界ごとに再現してから`PageLabelDocumentHelper::get_labels_for_page_range`へ渡す。pair 型の戻り値により qpdf の flat-vector 等価性チェックが tautological（逸脱ではない）。`checked_sub` は qpdf の unguarded だが等価な underflow 形状に一致。 |
 | 48 | `qpdf/test_driver.cc:1799-1923` | `crates/flpdf-qtest-tools/src/driver/test_42_49.rs::run_test_48` | canonical | `NameTree`/`NameTreeCursor` — `QPDFNameTreeObjectHelper`/その iterator の直接 port、case 46 と同じ wrap/エイリアシングパターン。文字列値は qpdf の public `getStringValue`/`getUTF8Value`（`libqpdf/QPDFObjectHandle.cc:659-689`）に対応する `try_get_string_value`/`try_get_utf8_value` へ `.48.103` で移行し、明示 `Pdf::resolve` は残らない。 |
 | 49 | `qpdf/test_driver.cc:1924-1939` | `crates/flpdf-qtest-tools/src/driver/test_42_49.rs::run_test_49` | canonical | `OutlineDocumentHelper::get_tree`/`OutlineItem::get_title`/`get_dest` — tree 構築の副作用順序（qpdf コンストラクタ時 `/Outlines` walk）を `get_tree` を page listing 前に呼ぶことで保存（`outline_object_helper.rs:266-285` 引用、doc comment 明記）。 |
 | 50 | `qpdf/test_driver.cc:1939-1953`; public `getKey` / `mergeResources` / `getResourceNames`: `include/qpdf/QPDFObjectHandle.hh:762-768,794-835`, `libqpdf/QPDFObjectHandle.cc:978-989,1063-1153,1156-1170` | `crates/flpdf-qtest-tools/src/driver/test_50_55.rs::run_test_50` | canonical | qpdf の `getTrailer().getKey` → `mergeResources` → non-resolving top-level `getJSON` → type-mismatch `mergeResources(getKey("/k1"))` → `getResourceNames` の順を、`trailer_key_handle` → `merge_resources` → `pdf_object_to_json` → resolving `try_get_key` → `merge_resources` → `get_resource_names` で再現する。qpdf-less caller-side `Pdf::resolve` 3箇所と hidden direct `get_key` routeを撤去し、merge/get-resource primitive自身の解決・診断境界へ戻した。pinned qpdf/flpdf `merge-dict.pdf` は双方 exit 0、stdout/stderr byte-identical。 |
@@ -434,7 +434,7 @@ canonical になったため `mixed` に戻った。）
 | 76 | `qpdf/test_driver.cc:2606-2650` | `crates/flpdf-qtest-tools/src/driver/test_72_79.rs::run_test_76` | mixed | D1 のみ（`.resolve()` 呼び出しなし）。`FileSpec`/`EmbeddedFileStream`/`EmbeddedFileDocumentHelper`（C 領域隣接の `filespec_helper`、本パスでは個別未検証 — 次回 case 監査 slice での確認候補）。 |
 | 77 | `qpdf/test_driver.cc:2651-2663` | `crates/flpdf-qtest-tools/src/driver/test_72_79.rs::run_test_77` | mixed | D1 のみ。`EmbeddedFileDocumentHelper::remove_embedded_file`、case 76 と同じ留保。 |
 | 78 | `qpdf/test_driver.cc:2664-2704` | `crates/flpdf-qtest-tools/src/driver/test_72_79.rs::run_test_78` | mixed | D1 のみ。`replace_stream_data_with_callback`/`replace_stream_data_with_retry_callback`（C38 canonical）+ `pipe_stream_data`（C1/C3 canonical）— 概ね canonical。 |
-| 79 | `qpdf/test_driver.cc:2705-2760` | `crates/flpdf-qtest-tools/src/driver/test_72_79.rs::run_test_79` | mixed | A7（`chase_key`）+ D1（A18 は `flpdf-3yn9.48.24` で撤去済み）。`copy_stream`（C36 canonical）、`replace_stream_data`（C38 canonical）、`get_stream_data`（C5 canonical）— stream mutation 面自体は canonical。 |
+| 79 | `qpdf/test_driver.cc:2705-2760` | `crates/flpdf-qtest-tools/src/driver/test_72_79.rs::run_test_79` | mixed | D1 のみ（A7 の qpdf-less `chase_key`/`resolve_once` は `.48.129` でcase79から撤去）。`copy_stream`（C36 canonical）、`replace_stream_data`（C38 canonical）、`get_stream_data`（C5 canonical）— stream mutation 面自体は canonical。 |
 | 80 | `qpdf/test_driver.cc:2761-2807` | `crates/flpdf-qtest-tools/src/driver/test_80_87.rs::run_test_80` | mixed | `PageDocumentHelper::get_all_pages`/`resolve`/`try_get_key`、`AcroFormDocumentHelper::transform_annotations`/`add_and_rename_form_fields`、`PageObjectHelper::copy_annotations_from`（対象範囲外）。`PdfWriter::write` は D1 mixed。 |
 | 81 | `qpdf/test_driver.cc:2808-2819` | `crates/flpdf-qtest-tools/src/driver/test_80_87.rs::run_test_81` | canonical | `ObjectHandle::try_get_int_value` → `Error::QpdfExc`/`QpdfErrorCode::Object`。A6/A8 は領域行としては mixed だが、本ケースの実使用は resolving `try_*` family で個別逸脱なし。 |
 | 82 | `qpdf/test_driver.cc:2820-2863` | `crates/flpdf-qtest-tools/src/driver/test_80_87.rs::run_test_82` | canonical | `try_is_name_and_equals`/`try_is_dictionary_of_type`/`try_is_stream_of_type`/`try_is_or_has_name`、全て resolving `try_*` family。case 81 と同じ A6/A8 の背景注記。 |
@@ -510,6 +510,10 @@ canonical になったため `mixed` に戻った。）
 2026-09-16（`flpdf-3yn9.48.127`）: qpdf test 68（`qpdf/test_driver.cc:2367-2388`）は`getRoot`でCatalogを得て`getKey("/QStream")`、最初の`getStreamData`だけを広いexception catchで処理し、その後のAll/raw readを独立して実行する。flpdfの`run_test_68`からqpdfにないcaller-side `dict_key`/`resolve_handle` x2を撤去し、`Pdf::root_handle` → `try_get_key` → `get_stream_data`/`get_raw_stream_data`へ移行した。local helperは`rg -n 'dict_key|resolve_handle' crates/flpdf-qtest-tools/src/driver/test_64_71.rs`でcaller-zeroを確認して削除した。pinned qpdf/flpdfの`stream_dct.pdf`は双方exit 2、stdout 79 bytes・stderr 54 bytesでbyte-identical、case 68を`canonical`へ再分類した。
 
 2026-09-16（`flpdf-3yn9.48.128`）: qpdf test 75（`qpdf/test_driver.cc:2548-2605`）はNameTree/NumberTree mutation後のlive handleへ`getKey`、`getArrayItem`、`getIntValue`、`getArrayNItems`を各receiverのaccessor境界で適用する。flpdfの`run_test_75`を`try_get_utf8_value`/`try_get_key`/`try_get_array_item`/`try_get_int_value`/`try_get_array_n_items`へ移し、qpdf-less `chase_key`/`chase_array_item`/`resolve_once`、非解決array snapshotを撤去した。`chase_key`/`resolve_once`はcase79の別スコープのため保持し、`chase_array_item`はcaller-zero確認後に削除した。canonical helper unit testも`try_*` accessorsへ更新した。pinned qpdf/flpdfの`erase-nntree.pdf`は双方exit 0、stdout 13 bytes・stderr空、生成`a.pdf` 2377 bytesでbyte-identical、case 75を`canonical`へ再分類した。
+
+2026-09-16（`flpdf-3yn9.48.129`）: qpdf test 79（`qpdf/test_driver.cc:2705-2758`）はpageの`getKey("/Contents")`をreceiverのaccessor境界で解決してからstream copyへ進む。flpdfの`run_test_79`を`page.try_get_key(b"/Contents")`へ移し、qpdf-less `chase_key`/`resolve_once`を`test_72_79.rs`からcaller-zero確認後に撤去した。`copy_stream`/stream mutation/QDF static-ID writerは保持し、case79はD1 writer routeだけが残るmixedとして記録する。pinned qpdf/flpdfの`minimal.pdf` test79は双方exit 0、stdout 13 bytes・stderr空、生成`a.pdf` 2370 bytesでbyte-identical、case79のA7 caller-side bridgeを撤去した。
+
+2026-09-16（`flpdf-3yn9.48.130`）: qpdf test 47（`qpdf/test_driver.cc:1784-1796`）はpublic `getRoot` → `getKey("/Pages")` → `getKey("/Count")` → `getIntValue`を各receiverのaccessor境界で適用する。flpdfの`run_test_47`を`Pdf::root_handle` → `try_get_key` → `try_get_key` → `try_get_int_value`へ移し、qpdf-less `root_ref`/`chase_key`/非解決`as_integer`を撤去した。local `chase_key`のcase47/unit-test callerはzeroになりhelper自体を削除、PageLabelDocumentHelperとunderflow/output順序は保持した。pinned qpdf/flpdfの`name-tree.pdf` test47は双方exit 0、stdout 27 bytes・stderr空でbyte-identical、case47のstale bridge evidenceを修正した。
 
 2026-09-08（`flpdf-thb2`）: qpdfの `checkConfiguration` が JSON の暗黙stdout
 出力先を先に `-` として確定する順序（`libqpdf/QPDFJob.cc:572-591`）を、
@@ -1124,7 +1128,7 @@ qpdfの argv parserは各callbackを入力順に実行し
 一度だけ消費する（`libqpdf/QPDFJob.cc:428-480,513-520`）。
 
 `flpdf-u40ck` は `arg_parser.rs` のraw residual argvを
-`main.rs::job_json_cli_events`へ渡し、`run_job_json_files`でJSON file、
+`main.rs::qpdf_cli_events`へ渡し、`run_job_json_files`でJSON file、
 input/output selector、password/password-file、password mode/hex-key/recovery、
 check-linearizationをoccurrence順に同じ `QPDFJob`へ適用する。partial JSONの初回も
 既存configurationを保持するため、argv前置のCLI stateがJSON handlerで失われない。
@@ -1166,6 +1170,39 @@ job-json attributionを保持し、Rust固有の `(os error N)`を出さない�
 `cli_job_json.rs::job_json_file_missing_reports_job_json_context_and_usage`で
 missing job-jsonのexit/stdout/stderrをqpdf 11.9.0と比較する。新しいbridgeや
 deviation markerは追加しない。
+
+
+### E-17 / E-21 argv-order parse validation (`flpdf-godwa`, 2026-09-16)
+
+qpdfの `QPDFArgParser::parseArgs` は required parameter / choices と各 callbackを
+argv occurrence順に処理する（`libqpdf/QPDFArgParser.cc:433-551`）。
+`rotate`、optional `collate`、`json`、`json-output`はmain option tableで
+それぞれ登録され、`Config::rotate` / `Config::collate` / `Config::jobJsonFile`は
+callback内で直ちに検証・readを行う（`libqpdf/qpdf/auto_job_init.hh:108,113,126-127`;
+`libqpdf/QPDFJob_config.cc:95-125,253-263,312-325,774-784`）。
+
+flpdfは既存raw residual argv eventを拡張し、parse-time optionsとJobJsonFile/selector
+stateを一つのpreflightで左から処理する。validなjob-JSON bytesは実行側へ引き渡し、
+二重readを避ける。これにより先行した rotate/json/json-output/collateまたは
+missing job-json fileの診断が後続の固定順 validationに追い越されない。
+`cli_job_json.rs::top_level_parse_errors_follow_qpdf_argv_order`で8つの相対順を
+qpdf 11.9.0とexit/stdout/stderr比較する。job-JSON transformation wiringは
+`flpdf-uwu7`の別責務であり、新しいbridgeやdeviation markerは追加しない。
+
+### E-12 follow-up: job-json directory read diagnostic (`flpdf-jhaqf`, 2026-09-16)
+
+qpdf の `Config::jobJsonFile` は `read_file_into_string` の例外を job-json
+contextへ包むが、directory専用の意味論やエラーメッセージは定義しない
+（`libqpdf/QPDFJob_config.cc:774-784`; `libqpdf/QUtil.cc:490-525,1167-1214`）。
+Linux の qpdf 11.9.0 が返す `basic_string::_M_create` は pinned qpdf sourceに
+存在しない libstdc++ `std::string` allocation artifactであり、Rust側で
+hardcodeしない。
+
+flpdf は `IsADirectory` を `open <path>: Is a directory`として報告する。
+directory-only branchには `qpdf-deviation` markerを置き、通常の missing/
+permission wordingとは分離する。`cli_job_json.rs::job_json_file_directory_keeps_the_portable_flpdf_diagnostic`
+は qpdf の artifactとflpdfのportable診断を Linux でcharacterizeし、exit 2・
+stdout・各内側メッセージを検証する。新しいparserやbridgeは追加しない。
 
 ### E-12 follow-up: job-json non-UTF-8 fatal path (`flpdf-ktd5p`, 2026-09-16)
 

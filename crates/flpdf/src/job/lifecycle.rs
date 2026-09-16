@@ -3200,6 +3200,7 @@ impl QPDFJob {
             let pdf = self.create_empty_document()?;
             return match self.finish_created_document(pdf) {
                 Ok(pdf) => Ok(Some(pdf)),
+                Err(error @ Error::Usage(_)) => Err(error),
                 Err(error) => {
                     self.report_job_error(&error)?;
                     Ok(None)
@@ -3223,6 +3224,7 @@ impl QPDFJob {
             return match self.create_from_json_document(file, path_description_bytes(&input)) {
                 Ok(pdf) => match self.finish_created_document(pdf) {
                     Ok(pdf) => Ok(Some(pdf)),
+                    Err(error @ Error::Usage(_)) => Err(error),
                     Err(error) => {
                         self.report_job_error(&error)?;
                         Ok(None)
@@ -3284,6 +3286,11 @@ impl QPDFJob {
             }
             Ok(pdf) => match self.finish_created_document(pdf) {
                 Ok(pdf) => Ok(Some(pdf)),
+                // A usage error belongs to qpdf's `QPDFUsage` path, which the
+                // CLI renders through `usageExit` (`qpdf/qpdf.cc:12-22,37-38`).
+                // Reporting it here would print the bare message instead, so
+                // propagate it the way `check_configuration` already does.
+                Err(error @ Error::Usage(_)) => Err(error),
                 Err(error) => {
                     self.report_job_error(&error)?;
                     Ok(None)
