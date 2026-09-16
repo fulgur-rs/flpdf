@@ -134,8 +134,11 @@ fn self_referential_stream_linearization_matches_qpdf() {
         .expect("flpdf must linearize issue-117 fixture");
 
     assert_eq!(flpdf.status.code(), qpdf.status.code());
+    // qpdf's redirected text-mode stderr can carry CRLF on Windows while flpdf
+    // emits LF, so compare the same way the preceding differential does.
     assert_eq!(
-        flpdf.stderr, qpdf.stderr,
+        normalize_text_newlines(&flpdf.stderr),
+        normalize_text_newlines(&qpdf.stderr),
         "linearization diagnostics differ"
     );
     assert!(qpdf_output.exists(), "qpdf must write output");

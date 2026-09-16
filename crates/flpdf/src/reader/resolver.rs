@@ -3020,8 +3020,12 @@ impl<R: Read + Seek> ResolverHandle<R> {
     /// re-enter this read through an indirect stream `/Length`; if that
     /// re-entry detects a loop, it has already installed the permanent null
     /// in the same slot and the outer parse must not overwrite it
-    /// (`QPDF.cc:1641-1644,1706-1712`). ObjStm member parsing deliberately
-    /// uses the unconditional [`Self::cache_parsed_object`] boundary instead.
+    /// (`QPDF.cc:1641-1644,1706-1712`). The gate lives inside qpdf's
+    /// `readObjectAtOffset`, so every offset read goes through it — the type-1
+    /// resolve path, the raw-xref path, the linearization hint routes and the
+    /// xref-stream read alike. Only `resolveObjectsInStream` bypasses it with
+    /// its own unconditional `updateCache` (`QPDF.cc:1828`), and ObjStm members
+    /// do not reach this function at all.
     fn cache_parsed_object_if_unresolved(&self, parsed: ParsedObjectAtOffset) {
         let object_gen = parsed.object_gen;
         let already_resolved = self
@@ -3608,7 +3612,7 @@ impl<R: Read + Seek> ResolverHandle<R> {
             .trailing_start
             .or_else(|| u64::try_from(parsed.end_after_space).ok());
         let object_gen = parsed.object_gen;
-        self.cache_parsed_object(parsed);
+        self.cache_parsed_object_if_unresolved(parsed);
         Ok((
             self.get_object_handle_qpdf_obj_gen(object_gen),
             damage_offset,
@@ -3678,7 +3682,7 @@ impl<R: Read + Seek> ResolverHandle<R> {
             }
             return Ok((handle, damage_offset));
         }
-        self.cache_parsed_object(parsed);
+        self.cache_parsed_object_if_unresolved(parsed);
         Ok((
             self.get_object_handle_qpdf_obj_gen(object_gen),
             damage_offset,
