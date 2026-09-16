@@ -2,6 +2,17 @@
 //!
 //! qpdf correspondence: `QPDF.hh:899-923` and `QPDF_encryption.cc:700-1205` encryption state, crypt-filter dispatch, object-key cache, and inspection projection.
 //!
+//! Deviation: qpdf's AES providers map every key length other than 24 and 32
+//! to AES-128 and hand the cipher 16 bytes from the key buffer
+//! (`QPDFCrypto_gnutls.cc:197-213`, `QPDFCrypto_openssl.cc:225-241`), so a raw
+//! key shorter than 16 bytes — reachable through `--password-is-hex-key`,
+//! which uses the decoded bytes without a length check
+//! (`QPDF_encryption.cc:933-934`) — is read past its end. Those bytes are
+//! undefined, so [`aes128_object_key`] rejects the key instead of fabricating
+//! them. The rejection changes only the diagnostic text for that input; the
+//! exit code still matches qpdf. See `docs/qpdf-correspondence.md` for the
+//! corresponding row.
+//!
 
 use super::crypt_filters::{
     crypt_filter_method_from_handle, crypt_filter_modes_from_handle,
