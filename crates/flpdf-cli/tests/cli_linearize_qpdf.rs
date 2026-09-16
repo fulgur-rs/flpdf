@@ -685,3 +685,69 @@ fn linearize_populates_per_page_content_length() {
         }
     }
 }
+
+// ---------------------------------------------------------------------------
+// (d) Failure-path stderr parity
+// ---------------------------------------------------------------------------
+
+/// qpdf reaches these two linearization failures through different C++ paths,
+/// and each shapes its message differently.
+///
+/// * `QPDF_linearization.cc:1190` calls `stopOnError`, which raises a
+///   `qpdf_e_damaged_pdf` exception carrying the input name and the source's
+///   last read offset (`QPDF.cc:2590-2592,2625-2628`), so the line reads
+///   `qpdf: <file> (offset N): <message>`.
+/// * `QPDFWriter.cc:2524` throws a plain `std::runtime_error`, which carries
+///   no source context and no category prefix, so the message stands alone.
+///
+/// Compare the whole stderr against qpdf, normalising only the program name.
+#[test]
+fn linearize_failure_stderr_matches_qpdf() {
+    if skip_if_qpdf_missing() {
+        return;
+    }
+    let tmp = tempdir().unwrap();
+    for fixture in [
+        // stopOnError: input name and offset
+        "adbe-orphan-url.pdf",
+        "compressible-stale-generation-alias.pdf",
+        // std::runtime_error: bare message
+        "null-visible-stale-generation.pdf",
+    ] {
+        let input = fixture_path(fixture);
+        let theirs = tmp.path().join("qpdf-out.pdf");
+        let ours = tmp.path().join("flpdf-out.pdf");
+
+        let expected = ShellCommand::new("qpdf")
+            .args(["--deterministic-id", "--linearize"])
+            .arg(&input)
+            .arg(&theirs)
+            .output()
+            .expect("qpdf runs");
+        assert_eq!(
+            expected.status.code(),
+            Some(2),
+            "{fixture}: qpdf must fail to linearize this fixture"
+        );
+
+        let actual = CargoCommand::cargo_bin("flpdf")
+            .unwrap()
+            .args(["--deterministic-id", "--linearize"])
+            .arg(&input)
+            .arg(&ours)
+            .output()
+            .expect("flpdf runs");
+
+        assert_eq!(
+            actual.status.code(),
+            expected.status.code(),
+            "{fixture}: exit code must match qpdf"
+        );
+        let expected_stderr = String::from_utf8_lossy(&expected.stderr).replace("qpdf:", "<prog>:");
+        let actual_stderr = String::from_utf8_lossy(&actual.stderr).replace("flpdf:", "<prog>:");
+        assert_eq!(
+            actual_stderr, expected_stderr,
+            "{fixture}: stderr must match qpdf apart from the program name"
+        );
+    }
+}
