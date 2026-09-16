@@ -114,7 +114,7 @@
 | `crates/flpdf/src/pipeline/count.rs` | correspondence | Pl_Count.cc byte-count, last-byte, forwarding, and finish responsibilities |
 | `crates/flpdf/src/pipeline/dct.rs` | correspondence | \`Pl_DCT\` buffers compressed input and decodes it on \`finish\`, emitting one decoded scanline at a time to the next pipeline |
 | `crates/flpdf/src/pipeline/discard.rs` | correspondence | include/qpdf/Pl_Discard.hh:22-38 and libqpdf/Pl_Discard.cc:5-22 — terminal identifier, no-op writes and finishes, and reuse after finish |
-| `crates/flpdf/src/pipeline/flate.rs` | correspondence | Pl_Flate.cc streaming inflate, deflate, warning callback, compression-level, and finish responsibilities via flate2 |
+| `crates/flpdf/src/pipeline/flate.rs` | correspondence | Pl_Flate.cc streaming inflate, deflate, warning callback, compression-level, and finish responsibilities |
 | `crates/flpdf/src/pipeline/lzw.rs` | correspondence | Pl_LZWDecoder.cc bit accumulation, table growth, code-width transitions, end-of-data latching, output boundaries, and error text |
 | `crates/flpdf/src/pipeline/lzw_png_oracle.rs` | correspondence | live differential instrumentation for Pl_LZWDecoder.cc and Pl_PNGFilter.cc |
 | `crates/flpdf/src/pipeline/md5.rs` | correspondence | libqpdf/Pl_MD5.cc:5-65 and libqpdf/qpdf/Pl_MD5.hh:4-33 — unchanged forwarding, enable/persist state, reusable finish lifecycle, and hexadecimal digest retrieval |
