@@ -3,7 +3,9 @@
 //! qpdf correspondence: QPDFParser.cc live file-object parsing plus slice object/content consumer boundaries.
 //!
 use crate::object_handle::{DocumentResolver, ObjectHandle, ObjectValue, NO_PARSED_OFFSET};
-use crate::tokenizer::{is_delimiter, is_ws, PushedSimpleToken, Token, TokenType, Tokenizer};
+use crate::tokenizer::{
+    is_delimiter, is_ws, PushedLiveToken, PushedSimpleToken, Token, TokenType, Tokenizer,
+};
 use crate::{Error, ObjectRef, QpdfErrorCode, QpdfExc, Result};
 use std::rc::{Rc, Weak};
 
@@ -334,46 +336,49 @@ impl<'input, I: LiveInput> LiveTokenSource<'input, I> {
                 // cov:ignore-end
             }
 
-            if let Some(pushed) = self.tokenizer.get_integer() {
-                // Settle the delimiter unread and the last-token offset before
-                // raising a conversion failure. qpdf finishes both inside
-                // `QPDFTokenizer::nextToken` (`QPDFTokenizer.cc:961-968`) and
-                // only throws the `QUtil::string_to_ll` range error afterwards,
-                // from `QPDFParser::parse` (`QPDFParser.cc:87-88`), so a caught
-                // overflow leaves the input where the next read expects it.
-                let (start, end) = self.set_token_offsets(pushed.raw_len, pushed.unread)?;
-                self.last_offset = start;
-                return Ok(LiveToken::Integer {
-                    value: pushed.value?,
-                    start,
-                    end,
-                });
-            }
-
-            if let Some(pushed) = self.tokenizer.get_simple() {
+            if let Some(pushed) = self.tokenizer.get_live_compact() {
                 match pushed {
-                    PushedSimpleToken::Bool {
-                        value,
-                        raw_len,
-                        unread,
-                    } => {
-                        let (start, end) = self.set_token_offsets(raw_len, unread)?;
+                    PushedLiveToken::Integer(pushed) => {
+                        // Settle the delimiter unread and the last-token
+                        // offset before raising a conversion failure. qpdf
+                        // finishes both inside `QPDFTokenizer::nextToken`
+                        // (`QPDFTokenizer.cc:961-968`) and only throws the
+                        // `QUtil::string_to_ll` range error afterwards, from
+                        // `QPDFParser::parse` (`QPDFParser.cc:87-88`), so a
+                        // caught overflow leaves the input where the next
+                        // read expects it.
+                        let (start, end) = self.set_token_offsets(pushed.raw_len, pushed.unread)?;
                         self.last_offset = start;
-                        return Ok(LiveToken::Bool { value, start, end });
-                    }
-                    PushedSimpleToken::Simple {
-                        token_type,
-                        raw_len,
-                        unread,
-                    } => {
-                        let (start, end) = self.set_token_offsets(raw_len, unread)?;
-                        self.last_offset = start;
-                        return Ok(LiveToken::Simple {
-                            token_type,
+                        return Ok(LiveToken::Integer {
+                            value: pushed.value?,
                             start,
                             end,
                         });
                     }
+                    PushedLiveToken::Simple(pushed) => match pushed {
+                        PushedSimpleToken::Bool {
+                            value,
+                            raw_len,
+                            unread,
+                        } => {
+                            let (start, end) = self.set_token_offsets(raw_len, unread)?;
+                            self.last_offset = start;
+                            return Ok(LiveToken::Bool { value, start, end });
+                        }
+                        PushedSimpleToken::Simple {
+                            token_type,
+                            raw_len,
+                            unread,
+                        } => {
+                            let (start, end) = self.set_token_offsets(raw_len, unread)?;
+                            self.last_offset = start;
+                            return Ok(LiveToken::Simple {
+                                token_type,
+                                start,
+                                end,
+                            });
+                        }
+                    },
                 }
             }
 

@@ -195,6 +195,11 @@ pub(crate) enum PushedSimpleToken {
     },
 }
 
+pub(crate) enum PushedLiveToken {
+    Integer(PushedInteger),
+    Simple(PushedSimpleToken),
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum State {
     InHexString,
@@ -359,35 +364,13 @@ impl<'a> Tokenizer<'a> {
         Some(PushedToken { token, unread })
     }
 
-    /// Consume a ready integer without moving its tokenizer-owned byte
-    /// buffers into an owned [`Token`]. qpdf's `QPDFParser::parseRemainder`
-    /// keeps the two integer candidates as numeric values and offsets while
-    /// `QPDFTokenizer::nextToken` reuses `raw_val` on the next token
-    /// (`QPDFParser.cc:140-175`, `QPDFTokenizer.cc:921-925`).
-    pub(crate) fn get_integer(&mut self) -> Option<PushedInteger> {
-        if self.state != State::TokenReady || self.token_type != TokenType::Integer {
-            return None;
-        }
-
-        let raw_len = self.raw.len();
-        let unread = if !self.in_token && !self.before_token {
-            self.char_to_unread
-        } else {
-            None
-        };
-        let value = parse_integer_bytes(&self.raw, self.token_start);
-        self.reset();
-        Some(PushedInteger {
-            value,
-            raw_len,
-            unread,
-        })
-    }
-
-    /// Consume a live token whose parser meaning is fully represented by its
-    /// type. This is the allocation-free counterpart to [`Self::get_token`]
-    /// for qpdf's short booleans, nulls, delimiters, and EOF.
-    pub(crate) fn get_simple(&mut self) -> Option<PushedSimpleToken> {
+    /// Consume a live integer or a short token without moving its
+    /// tokenizer-owned byte buffers into an owned [`Token`]. qpdf's
+    /// `QPDFParser::parseRemainder` keeps the two integer candidates as
+    /// numeric values and offsets while `QPDFTokenizer::nextToken` reuses
+    /// `raw_val` on the next token (`QPDFParser.cc:140-175`,
+    /// `QPDFTokenizer.cc:921-925`).
+    pub(crate) fn get_live_compact(&mut self) -> Option<PushedLiveToken> {
         if self.state != State::TokenReady {
             return None;
         }
@@ -398,12 +381,17 @@ impl<'a> Tokenizer<'a> {
         } else {
             None
         };
-        let simple = match self.token_type {
-            TokenType::Bool => PushedSimpleToken::Bool {
+        let compact = match self.token_type {
+            TokenType::Integer => PushedLiveToken::Integer(PushedInteger {
+                value: parse_integer_bytes(&self.raw, self.token_start),
+                raw_len,
+                unread,
+            }),
+            TokenType::Bool => PushedLiveToken::Simple(PushedSimpleToken::Bool {
                 value: self.raw == b"true",
                 raw_len,
                 unread,
-            },
+            }),
             TokenType::ArrayClose
             | TokenType::ArrayOpen
             | TokenType::BraceClose
@@ -411,15 +399,15 @@ impl<'a> Tokenizer<'a> {
             | TokenType::DictClose
             | TokenType::DictOpen
             | TokenType::Eof
-            | TokenType::Null => PushedSimpleToken::Simple {
+            | TokenType::Null => PushedLiveToken::Simple(PushedSimpleToken::Simple {
                 token_type: self.token_type,
                 raw_len,
                 unread,
-            },
+            }),
             _ => return None,
         };
         self.reset();
-        Some(simple)
+        Some(compact)
     }
 
     fn reset(&mut self) {
