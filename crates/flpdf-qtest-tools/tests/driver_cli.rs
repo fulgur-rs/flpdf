@@ -1444,14 +1444,14 @@ fn qtest_accessor_cases_do_not_use_explicit_pdf_resolve() {
             && !test_73.contains(".unparse_resolved()"),
         "test 73 must let unparseResolved own /Pages resolution without a Pdf::resolve bridge"
     );
+    let test_79 = section(
+        late_source.as_str(),
+        "pub(crate) fn run_test_79",
+        "\n#[cfg(test)]",
+    );
     assert!(
-        section(
-            late_source.as_str(),
-            "pub(crate) fn run_test_75",
-            "pub(crate) fn run_test_76",
-        )
-        .contains("resolve_once("),
-        "test 75 lost the explicit chained resolution retained for its separate scope"
+        test_79.contains("chase_key(") && late_source.contains("fn resolve_once"),
+        "test 79 lost the explicit chained resolution retained for its separate scope"
     );
     let test_19 = section(
         page_source.as_str(),
@@ -1542,6 +1542,27 @@ fn qtest_accessor_cases_do_not_use_explicit_pdf_resolve() {
             && test_72.contains("resources.try_get_key(")
             && test_72.contains("xobject.try_get_key("),
         "test 72 must use canonical resolving key accessors for the Fx1 chain"
+    );
+
+    let test_75 = section(
+        late_source.as_str(),
+        "pub(crate) fn run_test_75",
+        "pub(crate) fn run_test_76",
+    );
+    assert!(
+        !test_75.contains("chase_key(")
+            && !test_75.contains("chase_array_item(")
+            && !test_75.contains("resolve_once("),
+        "test 75 retains the qpdf-less chained tree resolution bridge"
+    );
+    assert!(
+        test_75.contains("try_get_key(")
+            && test_75.contains("try_get_array_item(")
+            && test_75.contains("try_get_int_value()")
+            && test_75.contains("try_get_utf8_value()")
+            && test_75.contains("try_get_array_n_items()")
+            && !test_75.contains(".as_array()"),
+        "test 75 must use canonical resolving tree accessors"
     );
 
     for (name, body) in [
