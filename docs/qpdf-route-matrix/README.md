@@ -5,7 +5,7 @@
 `scripts/check-qpdf-route-matrix.py --check` でファイル・行範囲・識別子の実在を検証する。
 **関連:** [`docs/qpdf-correspondence.md`](../qpdf-correspondence.md)（責務対応表。本表はその上に
 「経路（route）」軸を足したもので、対応表の行を置き換えない）/ Beads `flpdf-3yn9.41`（親 epic `flpdf-3yn9`）
-**調査日:** 2026-09-16（再監査 `flpdf-3yn9.48`、文書更新 `flpdf-3yn9.48.129`）。
+**調査日:** 2026-09-16（再監査 `flpdf-3yn9.48`、文書更新 `flpdf-3yn9.48.130`）。
 現行 `origin/main=e5a988b0c7bc8483ba8a446c5118edfbf88a9077` と pinned qpdf source に基づき、領域別表の分類・責務境界・既存issueとの対応を更新した。
 160行は履歴上の行集合を維持している。今回の分類更新は全行の parity テスト合格を意味しない。
 未更新の行番号は過去snapshotを含む。
