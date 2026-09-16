@@ -435,6 +435,21 @@ def write_report(report, out):
     (out / "summary.md").write_text("\n".join(lines) + "\n")
 
 
+def resolve_artifact_directory(requested):
+    """Resolve a new benchmark directory below the worktree-local artifact root."""
+    artifact_root = (ROOT / "target" / "perf-artifacts").resolve()
+    artifact_root.mkdir(parents=True, exist_ok=True)
+    if requested is None:
+        return Path(tempfile.mkdtemp(prefix="flpdf-perf-", dir=artifact_root))
+
+    out = requested.resolve()
+    if out.exists():
+        raise ValueError(f"output already exists: {out}")
+    if out == artifact_root or not out.is_relative_to(artifact_root):
+        raise ValueError(f"artifact directory must be below {artifact_root}")
+    return out
+
+
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--output", type=Path, help="new artifact directory (must not exist)")
@@ -464,21 +479,10 @@ def main():
         parser.error("Linux GNU time is required")
     if args.heaptrack_case and not all(shutil.which(t) for t in ("heaptrack", "heaptrack_print")):
         parser.error("heaptrack and heaptrack_print are required for --heaptrack-case")
-    if args.output:
-        out = args.output.resolve()
-        if out.exists():
-            parser.error(f"output already exists: {out}")
-    else:
-        out = Path(tempfile.mkdtemp(prefix="flpdf-perf-"))
-    # Keep upstream fixtures AND generated outputs outside the repository.
-    if out.is_relative_to(ROOT):
-        parser.error("artifact directory must be outside the repository (qtest license isolation)")
-    ancestor = out
-    while not ancestor.exists():
-        ancestor = ancestor.parent
-    if subprocess.run(["git", "-C", str(ancestor), "rev-parse", "--show-toplevel"],
-                      capture_output=True, env=ENV).returncode == 0:
-        parser.error("artifact directory must be outside all Git worktrees (qtest license isolation)")
+    try:
+        out = resolve_artifact_directory(args.output)
+    except ValueError as error:
+        parser.error(str(error))
     out.mkdir(parents=True, exist_ok=True)
     print(f"Artifacts: {out}", flush=True)
     source = None

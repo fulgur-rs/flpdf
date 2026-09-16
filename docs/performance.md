@@ -20,7 +20,9 @@ python3 scripts/perf-matrix.py
 
 This single command builds the release CLI with `--locked`, generates and checks
 the inputs, runs the complete matrix, validates results, and writes `results.json`
-and `summary.md` to a fresh `/tmp/flpdf-perf-*` directory printed at startup.
+and `summary.md` to a fresh `target/perf-artifacts/flpdf-perf-*` directory printed
+at startup. The artifact directory is ignored build output owned by this
+worktree, so repeated measurements do not accumulate under `/tmp`.
 It uses a separate `target/perf-default` build directory to avoid feature mixing.
 It does not run benchmarks concurrently. Avoid other builds, profiling sessions,
 or benchmarks on the same machine during collection. Artifacts are retained for
@@ -63,9 +65,10 @@ Writer cases use `--static-id` identically for both programs.
 
 The generation recipe is original to flpdf, with explicit offsets and a valid
 xref/trailer. All extra objects and embedded streams are reachable from the
-Catalog. Preparation uses qpdf outside the measured region. Upstream fixtures
-are never copied into flpdf. The artifact directory must be outside this
-checkout because it also contains outputs derived from upstream fixtures.
+Catalog. Preparation uses qpdf outside the measured region. The pinned upstream
+fixture remains in the external qpdf source tree and is never copied into the
+repository; only untracked diagnostic outputs are retained below the active
+worktree's `target/perf-artifacts/` directory.
 
 The stream family intentionally separates input file size from decoded size.
 It exercises retained decoded/output buffers; it is not a representative
@@ -132,7 +135,8 @@ python3 scripts/perf-matrix.py --operations rewrite --heaptrack-case pages-1000/
 `--operations` accepts a comma-separated subset. `--sizes`, `--stream-mib`,
 `--runs`, `--warmups`, and `--timeout` control diagnostic runs. `--skip-qtest`
 allows local smoke tests without the external source, marking the matrix partial.
-`--output` selects a new artifact directory and refuses existing directories.
+`--output` selects a new, non-existing artifact directory below
+`target/perf-artifacts/`; arbitrary source-tree paths are rejected.
 
 `--heaptrack-case INPUT/OPERATION` is repeatable and requires `heaptrack` and
 `heaptrack_print`. It profiles both programs in **additional** runs, keeping
