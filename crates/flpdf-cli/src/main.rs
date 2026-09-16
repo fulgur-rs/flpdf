@@ -526,29 +526,6 @@ fn configure_top_level_inspection_transformations(
     Ok(())
 }
 
-/// Validate top-level rotation parameters at the argv boundary, before any
-/// input consumer is allowed to open a file. qpdf's `Config::rotate` callback
-/// parses through `QPDFJob::parseRotationParameter` during argv
-/// initialization (`QPDFJob_config.cc:786-790`, `QPDFJob.cc:368-415`), while
-/// standalone flpdf inspection routes apply the already-validated state to a
-/// separately opened document later. Reuse the same Config setter here so an
-/// invalid parameter retains qpdf's typed usage boundary and raw-byte parser.
-fn validate_top_level_rotation_parameters(parameters: &[OsString]) -> Result<(), UsageError> {
-    let mut job = QPDFJob::new();
-    for parameter in parameters {
-        if let Err(error) = job
-            .config()
-            .rotate(arg_parser::os_bytes(parameter.as_os_str()))
-        {
-            return Err(match error {
-                Error::Usage(error) => error,
-                error => UsageError::new(error.to_string()),
-            });
-        }
-    }
-    Ok(())
-}
-
 /// Translate the CLI's effective writer options into the reusable library
 /// configuration that qpdf reapplies to every split-page output writer.
 fn writer_configuration(
@@ -3199,6 +3176,14 @@ fn main() {
         raw_overrides,
         ..
     } = preprocessed;
+    let qpdf_preflight = if native_subcommand_mode {
+        None
+    } else {
+        Some(match preflight_qpdf_cli_events(&raw_residual_args) {
+            Ok(preflight) => preflight,
+            Err(error) => exit_qpdf_parse_error(error),
+        })
+    };
     let mut args = cli_parse_from_mode(residual_args, native_subcommand_mode);
     apply_raw_overrides(&mut args, raw_overrides);
     let _ = CLI_WARNING_EXIT_ZERO.set(args.warning_exit_zero);
@@ -3208,21 +3193,6 @@ fn main() {
     // helper so the qpdf retry diagnostic is emitted before the alternate
     // candidate is attempted.
     args.password.verbose = args.verbose;
-    // qpdf registers --json-output with the choices {2, latest}
-    // (`auto_job_init.hh:23,127`), so its argument parser rejects an
-    // out-of-set value while reading the option — ahead of every
-    // `checkConfiguration` guard and every route. Check it before the other
-    // post-parse validations so a combination such as
-    // `--json-output=1 --replace-input --split-pages=2` still reports the
-    // choice error rather than a later conflict.
-    if let Some(version) = args.json_output.as_deref() {
-        if !matches!(version, "2" | "latest") {
-            usage_exit(&UsageError::new(
-                "--json-output must be given as --json-output={2,latest}",
-            ));
-        }
-    }
-    validate_collate_values(&args.page_ops.collate);
     if let Err(error) = validate_keep_files_open_threshold(&args.page_ops) {
         emit_logger_error(format!("flpdf: {error}\n"));
         std::process::exit(2);
@@ -3263,9 +3233,6 @@ fn main() {
         top_level_image_options,
     );
     let top_level_rotation_parameters = args.page_ops.rotate.clone();
-    if let Err(error) = validate_top_level_rotation_parameters(&top_level_rotation_parameters) {
-        usage_exit(&error);
-    }
     let mut top_level_inspection_transform_options = InspectionTransformOptions::new(
         top_level_image_transform_options,
         args.generate_appearances,
@@ -3388,7 +3355,10 @@ fn main() {
     let result = if args.replace_input && (args.json.is_some() || args.json_output.is_some()) {
         Err(UsageError::new("--json may not be used with --replace-input").into())
     } else if !args.job_json_file.is_empty() {
-        run_job_json_files(&raw_residual_args, args.no_warn)
+        run_job_json_files(
+            qpdf_preflight.expect("flat qpdf job-json route requires its preflight"),
+            args.no_warn,
+        )
     } else if json_input_inspection {
         run_json_input_inspection(
             &args,
@@ -3844,6 +3814,20 @@ fn usage_exit(error: &UsageError) -> ! {
     std::process::exit(2);
 }
 
+fn exit_qpdf_parse_error(error: Box<dyn std::error::Error>) -> ! {
+    if let Some(exit_error) = error.downcast_ref::<CliExitError>() {
+        if !exit_error.message.is_empty() {
+            emit_logger_error(format!("\n{}: {}\n", progname(), exit_error.message));
+        }
+        std::process::exit(exit_error.code.as_i32());
+    }
+    if let Some(usage_error) = find_usage_error(error.as_ref()) {
+        usage_exit(usage_error);
+    }
+    emit_logger_error(format!("{}: {error}\n", progname()));
+    std::process::exit(2);
+}
+
 fn missing_input_usage_error() -> UsageError {
     UsageError::new("an input file name is required")
 }
@@ -4227,6 +4211,10 @@ enum JobJsonCliEvent {
     SuppressRecovery,
     IgnoreXrefStreams,
     CheckLinearization,
+    Rotate(Vec<u8>),
+    Json(Option<Vec<u8>>),
+    JsonOutput(Option<Vec<u8>>),
+    Collate(Vec<u8>),
 }
 
 fn raw_option_equals_value<'a>(argument: &'a [u8], name: &[u8]) -> Option<&'a [u8]> {
@@ -4251,7 +4239,7 @@ fn job_json_password_mode(value: &[u8]) -> CliResult<PasswordMode> {
 /// route. Clap retains the final value of many options but qpdf invokes each
 /// callback while scanning argv, so the partial JSON files and their sibling
 /// selectors must be replayed from the raw residual tokens instead.
-fn job_json_cli_events(args: &[arg_parser::RawArg]) -> CliResult<Vec<JobJsonCliEvent>> {
+fn qpdf_cli_events(args: &[arg_parser::RawArg]) -> CliResult<Vec<JobJsonCliEvent>> {
     let mut events = Vec::new();
     let mut gave_input = false;
     let mut gave_output = false;
@@ -4278,6 +4266,20 @@ fn job_json_cli_events(args: &[arg_parser::RawArg]) -> CliResult<Vec<JobJsonCliE
             events.push(JobJsonCliEvent::JobJsonFile(PathBuf::from(
                 arg_parser::os_string_from_bytes(value),
             )));
+        } else if bytes == b"--json" {
+            events.push(JobJsonCliEvent::Json(None));
+        } else if let Some(value) = raw_option_equals_value(bytes, b"json") {
+            events.push(JobJsonCliEvent::Json(Some(value.to_vec())));
+        } else if bytes == b"--json-output" {
+            events.push(JobJsonCliEvent::JsonOutput(None));
+        } else if let Some(value) = raw_option_equals_value(bytes, b"json-output") {
+            events.push(JobJsonCliEvent::JsonOutput(Some(value.to_vec())));
+        } else if let Some(value) = raw_option_equals_value(bytes, b"rotate") {
+            events.push(JobJsonCliEvent::Rotate(value.to_vec()));
+        } else if bytes == b"--collate" {
+            events.push(JobJsonCliEvent::Collate(Vec::new()));
+        } else if let Some(value) = raw_option_equals_value(bytes, b"collate") {
+            events.push(JobJsonCliEvent::Collate(value.to_vec()));
         } else if bytes == b"--empty" {
             events.push(JobJsonCliEvent::EmptyInput);
             gave_input = true;
@@ -4316,15 +4318,95 @@ fn job_json_cli_events(args: &[arg_parser::RawArg]) -> CliResult<Vec<JobJsonCliE
         index += 1;
     }
 
-    if events
-        .iter()
-        .all(|event| !matches!(event, JobJsonCliEvent::JobJsonFile(_)))
-    {
-        return Err(Box::new(Error::Internal(
-            "job-json argv sequence did not contain a job-json file".to_owned(),
-        )));
-    }
     Ok(events)
+}
+
+struct QpdfCliPreflight {
+    events: Vec<JobJsonCliEvent>,
+    job_json_contents: Vec<Vec<u8>>,
+}
+
+fn qpdf_optional_choice_error(
+    option: &str,
+    value: Option<&[u8]>,
+    choices: &[&str],
+) -> CliResult<()> {
+    let Some(value) = value else {
+        return Ok(());
+    };
+    if choices.iter().any(|choice| value == choice.as_bytes()) {
+        return Ok(());
+    }
+    let choices = choices.join(",");
+    Err(Box::new(UsageError::new(format!(
+        "--{option} must be given as --{option}={{{choices}}}"
+    ))))
+}
+
+/// Replay the qpdf callbacks whose validation must happen before clap's
+/// post-parse route selection. Keeping job-JSON reads in this sequence also
+/// preserves the first failing callback when it is interleaved with another
+/// parse-time error. Successful JSON bytes are handed to the actual job so
+/// this preflight does not read or parse a file twice.
+fn preflight_qpdf_cli_events(args: &[arg_parser::RawArg]) -> CliResult<QpdfCliPreflight> {
+    let events = qpdf_cli_events(args)?;
+    let mut validation_job = QPDFJob::new();
+    let mut job_json_contents = Vec::new();
+
+    for event in &events {
+        match event {
+            JobJsonCliEvent::JobJsonFile(path) => {
+                let json = std::fs::read(path).map_err(|error| {
+                    job_json_event_error(Some(path), qpdf_json_input_open_error(path, error))
+                })?;
+                validation_job
+                    .initialize_from_json_partial_bytes(&json)
+                    .map_err(|error| job_json_event_error(Some(path), error))?;
+                job_json_contents.push(json);
+            }
+            JobJsonCliEvent::EmptyInput => {
+                validation_job.config().empty_input()?;
+            }
+            JobJsonCliEvent::Input(path) => {
+                validation_job.set_input_file(path.clone())?;
+            }
+            JobJsonCliEvent::Output(path) => {
+                validation_job.set_output_file(path.clone())?;
+            }
+            JobJsonCliEvent::ReplaceInput => {
+                validation_job.config().replace_input()?;
+            }
+            JobJsonCliEvent::Password(password) => validation_job.set_password(password.clone()),
+            JobJsonCliEvent::PasswordFile(_) => {}
+            JobJsonCliEvent::PasswordMode(mode) => validation_job.set_password_mode(*mode),
+            JobJsonCliEvent::PasswordIsHexKey => validation_job.set_password_is_hex_key(true),
+            JobJsonCliEvent::SuppressPasswordRecovery => {
+                validation_job.set_suppress_password_recovery(true)
+            }
+            JobJsonCliEvent::SuppressRecovery => validation_job.set_suppress_recovery(true),
+            JobJsonCliEvent::IgnoreXrefStreams => validation_job.set_ignore_xref_streams(true),
+            JobJsonCliEvent::CheckLinearization => {
+                validation_job.config().check_linearization();
+            }
+            JobJsonCliEvent::Rotate(parameter) => {
+                validation_job.config().rotate(parameter)?;
+            }
+            JobJsonCliEvent::Collate(parameter) => {
+                validation_job.config().collate(parameter)?;
+            }
+            JobJsonCliEvent::Json(value) => {
+                qpdf_optional_choice_error("json", value.as_deref(), &["1", "2", "latest"])?;
+            }
+            JobJsonCliEvent::JsonOutput(value) => {
+                qpdf_optional_choice_error("json-output", value.as_deref(), &["2", "latest"])?;
+            }
+        }
+    }
+
+    Ok(QpdfCliPreflight {
+        events,
+        job_json_contents,
+    })
 }
 
 fn job_json_event_error(
@@ -4344,18 +4426,23 @@ fn job_json_event_error(
     }
 }
 
-fn run_job_json_files(raw_args: &[arg_parser::RawArg], suppress_warnings: bool) -> CliResult<()> {
+fn run_job_json_files(preflight: QpdfCliPreflight, suppress_warnings: bool) -> CliResult<()> {
     let mut job = QPDFJob::new();
     job.set_warnings_exit_zero(cli_warning_exit_zero());
     job.set_logger(cli_logger());
     job.set_suppress_warnings(suppress_warnings);
 
-    for event in job_json_cli_events(raw_args)? {
+    let QpdfCliPreflight {
+        events,
+        job_json_contents,
+    } = preflight;
+    let mut job_json_contents = job_json_contents.into_iter();
+    for event in events {
         match event {
             JobJsonCliEvent::JobJsonFile(path) => {
-                let json = std::fs::read(&path).map_err(|error| {
-                    job_json_event_error(Some(&path), qpdf_json_input_open_error(&path, error))
-                })?;
+                let json = job_json_contents
+                    .next()
+                    .expect("job-json preflight must cache every JSON file");
                 job.initialize_from_json_partial_bytes(&json)
                     .map_err(|error| job_json_event_error(Some(&path), error))?;
             }
@@ -4382,6 +4469,14 @@ fn run_job_json_files(raw_args: &[arg_parser::RawArg], suppress_warnings: bool) 
             JobJsonCliEvent::IgnoreXrefStreams => job.set_ignore_xref_streams(true),
             JobJsonCliEvent::CheckLinearization => {
                 job.config().check_linearization();
+            }
+            JobJsonCliEvent::Rotate(_)
+            | JobJsonCliEvent::Json(_)
+            | JobJsonCliEvent::JsonOutput(_)
+            | JobJsonCliEvent::Collate(_) => {
+                // These options are validated in the shared argv preflight.
+                // Their job-JSON application remains the separate
+                // transformation/configuration surface tracked by flpdf-uwu7.
             }
         }
     }
@@ -10825,7 +10920,7 @@ mod tests {
         .expect("qpdf preprocessing should preserve the top-level sequence");
 
         assert_eq!(
-            job_json_cli_events(&preprocessed.raw_residual_args).unwrap(),
+            qpdf_cli_events(&preprocessed.raw_residual_args).unwrap(),
             vec![
                 JobJsonCliEvent::Password(b"first".to_vec()),
                 JobJsonCliEvent::Input(PathBuf::from("input.pdf")),
@@ -10854,7 +10949,7 @@ mod tests {
         .expect("qpdf preprocessing should preserve empty and replace selectors");
 
         assert_eq!(
-            job_json_cli_events(&preprocessed.raw_residual_args).unwrap(),
+            qpdf_cli_events(&preprocessed.raw_residual_args).unwrap(),
             vec![
                 JobJsonCliEvent::EmptyInput,
                 JobJsonCliEvent::ReplaceInput,

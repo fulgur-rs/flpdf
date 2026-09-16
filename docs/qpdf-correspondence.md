@@ -1638,12 +1638,12 @@ option callbackをその場で呼ぶ（`libqpdf/QPDFArgParser.cc:433-555`）。
 （`libqpdf/QPDFJob.cc:428-480,513-520`）。
 
 flpdf は `arg_parser.rs` が保持する raw residual argv を
-`main.rs::job_json_cli_events` として投影し、`run_job_json_files` が
+`main.rs::qpdf_cli_events` として投影し、`run_job_json_files` が
 `JobJsonFile`、empty/input/output/replace-input、password/password-file、
 password interpretation、recovery、check-linearizationを同じ `QPDFJob` へ
 左から適用する。`QPDFJob::initialize_from_json_partial_bytes` も partial 呼出し
 の既存configurationを保持し、qpdfの共有Config責務を維持する
-（`crates/flpdf-cli/src/main.rs::job_json_cli_events` / `run_job_json_files`、
+（`crates/flpdf-cli/src/main.rs::qpdf_cli_events` / `run_job_json_files`、
 `crates/flpdf/src/job/lifecycle.rs::initialize_from_json_with_partial`）。
 新しいargv parser、JSON schema、qpdf非対応bridgeは追加していない。
 
@@ -1692,6 +1692,30 @@ flpdf の `JobJsonFile` event は従来、read failureだけを一般の
 job-json reporting boundaryへ揃えた。`cli_job_json.rs::job_json_file_missing_reports_job_json_context_and_usage`
 が missing fileの exit/stdout/stderrを qpdf 11.9.0と比較する。新しい
 file-error wrapper、bridge、qpdf-deviation markerは追加しない。
+
+### argv-order parse validation (`flpdf-godwa`, 2026-09-16)
+
+qpdf の `QPDFArgParser::parseArgs` は argv を左から一度だけ走査し、各 option の
+required parameter / choices 検証と callbackをその occurrenceで実行する
+（`libqpdf/QPDFArgParser.cc:433-551`）。main option tableでは `rotate`、
+optional `collate`、`json`、`json-output` がそれぞれ callbackまたはchoicesとして
+登録されている（`libqpdf/qpdf/auto_job_init.hh:108,113,126-127`）。
+`Config::rotate` と `Config::collate` は setter内で直ちに usageを投げ、
+`Config::jobJsonFile` はファイルreadとpartial JSON初期化をその場で実行する
+（`libqpdf/QPDFJob_config.cc:95-125,253-263,312-325,774-784`）。
+
+flpdf は既存の raw residual argv projectionを拡張し、これらの parse-time eventを
+`JobJsonFile`・selector stateと同じ順序で preflightする。optional JSON choicesは
+qpdfの choice errorを作り、rotate/collateは既存の `QPDFJob::Config` parserへ渡す。
+有効な job-JSON bytesはこのpreflight結果を実行側へ渡すため、qpdfと同様に一度だけ
+read/parseされる。これにより `--rotate=91 --json-output=1`、
+`--job-json-file=<missing> --rotate=91`、JSON/collateとの順序逆転で、最初に
+失敗する qpdf callbackの診断境界を保持する。対象は argv parse validationであり、
+job-JSONの変換オプション適用は別issue `flpdf-uwu7`に残る。
+
+`cli_job_json.rs::top_level_parse_errors_follow_qpdf_argv_order` が8ケースの
+exit/stdout/stderrをqpdf 11.9.0と比較する。新しいargv parser、bridge、
+qpdf-deviation markerは追加しない。
 
 | `QPDFLogger.cc` | 255 | `logger.rs`（private stdout tracker、shared info/warn/error/save routes、standard stdout/stderr/discard、reset/following、save collision、custom sink ownership）+ `reader/resolver.rs` / `reader.rs`（文書 warning の append-then-route、suppression、live logger replacement）+ `flpdf-cli/src/main.rs`（下記 qpdf-equivalent consumers） | ✅ `QPDFLogger.cc:9-40,43-51,80-254`。`diagnostics.rs` は logger ではなく collection-only value store として維持する |
 

@@ -1126,7 +1126,7 @@ qpdfの argv parserは各callbackを入力順に実行し
 一度だけ消費する（`libqpdf/QPDFJob.cc:428-480,513-520`）。
 
 `flpdf-u40ck` は `arg_parser.rs` のraw residual argvを
-`main.rs::job_json_cli_events`へ渡し、`run_job_json_files`でJSON file、
+`main.rs::qpdf_cli_events`へ渡し、`run_job_json_files`でJSON file、
 input/output selector、password/password-file、password mode/hex-key/recovery、
 check-linearizationをoccurrence順に同じ `QPDFJob`へ適用する。partial JSONの初回も
 既存configurationを保持するため、argv前置のCLI stateがJSON handlerで失われない。
@@ -1168,6 +1168,23 @@ job-json attributionを保持し、Rust固有の `(os error N)`を出さない�
 `cli_job_json.rs::job_json_file_missing_reports_job_json_context_and_usage`で
 missing job-jsonのexit/stdout/stderrをqpdf 11.9.0と比較する。新しいbridgeや
 deviation markerは追加しない。
+
+### E-17 / E-21 argv-order parse validation (`flpdf-godwa`, 2026-09-16)
+
+qpdfの `QPDFArgParser::parseArgs` は required parameter / choices と各 callbackを
+argv occurrence順に処理する（`libqpdf/QPDFArgParser.cc:433-551`）。
+`rotate`、optional `collate`、`json`、`json-output`はmain option tableで
+それぞれ登録され、`Config::rotate` / `Config::collate` / `Config::jobJsonFile`は
+callback内で直ちに検証・readを行う（`libqpdf/qpdf/auto_job_init.hh:108,113,126-127`;
+`libqpdf/QPDFJob_config.cc:95-125,253-263,312-325,774-784`）。
+
+flpdfは既存raw residual argv eventを拡張し、parse-time optionsとJobJsonFile/selector
+stateを一つのpreflightで左から処理する。validなjob-JSON bytesは実行側へ引き渡し、
+二重readを避ける。これにより先行した rotate/json/json-output/collateまたは
+missing job-json fileの診断が後続の固定順 validationに追い越されない。
+`cli_job_json.rs::top_level_parse_errors_follow_qpdf_argv_order`で8つの相対順を
+qpdf 11.9.0とexit/stdout/stderr比較する。job-JSON transformation wiringは
+`flpdf-uwu7`の別責務であり、新しいbridgeやdeviation markerは追加しない。
 
 ## E-10 primary document graph retention in distinct-secondary `--pages` (`flpdf-lrm3u`, 2026-09-15)
 
