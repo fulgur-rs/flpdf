@@ -23,7 +23,33 @@ def pinned_qpdf_available():
             .stdout.startswith("qpdf version 11.9.0\n"))
 
 
+def worktree_artifact_temporary_directory():
+    root = perf.ROOT / "target" / "perf-artifacts"
+    root.mkdir(parents=True, exist_ok=True)
+    return tempfile.TemporaryDirectory(dir=root)
+
+
 class MeasurementContracts(unittest.TestCase):
+    def test_default_artifact_directory_is_worktree_local(self):
+        output = perf.resolve_artifact_directory(None)
+        try:
+            artifact_root = (perf.ROOT / "target" / "perf-artifacts").resolve()
+            self.assertTrue(output.is_relative_to(artifact_root), output)
+        finally:
+            shutil.rmtree(output)
+
+    def test_explicit_worktree_artifact_directory_is_accepted(self):
+        artifact_root = perf.ROOT / "target" / "perf-artifacts"
+        artifact_root.mkdir(parents=True, exist_ok=True)
+        output = artifact_root / "contract-accepted"
+        self.assertFalse(output.exists())
+        self.assertEqual(perf.resolve_artifact_directory(output), output.resolve())
+
+    def test_arbitrary_source_tree_artifact_directory_is_rejected(self):
+        output = perf.ROOT / "scripts" / "contract-rejected"
+        with self.assertRaisesRegex(ValueError, "target/perf-artifacts"):
+            perf.resolve_artifact_directory(output)
+
     def test_statistics_keep_spread_and_do_not_divide_by_zero(self):
         self.assertEqual(perf.statistics_for([10, 12, 11]),
                          {"median": 11, "min": 10, "max": 12, "relative_range": 2 / 11})
@@ -203,7 +229,7 @@ class MeasurementContracts(unittest.TestCase):
 @unittest.skipUnless(pinned_qpdf_available(), "qpdf 11.9.0 required for live harness contracts")
 class LiveContracts(unittest.TestCase):
     def test_stateful_noop_writer_cannot_reuse_a_previous_output(self):
-        with tempfile.TemporaryDirectory() as tmp:
+        with worktree_artifact_temporary_directory() as tmp:
             root = Path(tmp)
             fake = root / "fake-flpdf"
             fake.write_text(
@@ -235,7 +261,7 @@ class LiveContracts(unittest.TestCase):
             self.assertTrue(any(not case["validation"]["ok"] for case in report["cases"]))
 
     def test_validated_phase_outputs_are_not_retained(self):
-        with tempfile.TemporaryDirectory() as tmp:
+        with worktree_artifact_temporary_directory() as tmp:
             root = Path(tmp)
             out = root / "perf"
             result = subprocess.run(
@@ -256,7 +282,7 @@ class LiveContracts(unittest.TestCase):
             self.assertEqual(retained, [], "validated phase outputs were retained")
 
     def test_failed_validation_preserves_report_and_exits_nonzero(self):
-        with tempfile.TemporaryDirectory() as tmp:
+        with worktree_artifact_temporary_directory() as tmp:
             out = Path(tmp) / "invalid"
             result = subprocess.run(
                 [sys.executable, str(SCRIPT), "--output", str(out),
@@ -282,7 +308,7 @@ class LiveContracts(unittest.TestCase):
                     self.assertEqual(checked.returncode, 0, checked.stderr)
 
     def test_end_to_end_incomplete_matrix_cannot_claim_epic_success(self):
-        with tempfile.TemporaryDirectory() as tmp:
+        with worktree_artifact_temporary_directory() as tmp:
             out = Path(tmp) / "results with spaces"
             command = [sys.executable, str(SCRIPT), "--output", str(out),
                        "--flpdf", shutil.which("qpdf"), "--sizes", "2", "--stream-mib", "1",
