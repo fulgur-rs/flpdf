@@ -2778,10 +2778,13 @@ impl ObjectHandle {
             if !matches!(&shared.value, ObjectValue::Unresolved) {
                 return Ok(());
             }
-            (object_gen, shared.identity.resolver.clone())
+            (
+                object_gen,
+                shared.identity.resolver.as_ref().and_then(Weak::upgrade),
+            )
         };
 
-        let Some(resolver) = resolver.and_then(|resolver| resolver.upgrade()) else {
+        let Some(resolver) = resolver else {
             return Err(Error::Internal(format!(
                 "object {} {} belongs to a dropped PDF",
                 object_gen.get_obj(),
