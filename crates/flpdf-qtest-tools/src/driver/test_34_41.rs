@@ -633,20 +633,23 @@ pub(crate) fn run_test_38<R: Read + Seek>(
     stderr: &mut dyn Write,
     diagnostics_written: &mut usize,
 ) -> flpdf::Result<()> {
-    let root = root_handle(pdf, filename, diagnostics_written, stdout, stderr)?;
-    let qtest = resolved_key(
-        pdf,
-        &root,
-        b"/QTest",
-        filename,
-        diagnostics_written,
-        stdout,
-        stderr,
-    )?;
-    for item in qtest.as_array().unwrap_or_default() {
-        let resolved =
-            resolved_terminal(pdf, &item, filename, diagnostics_written, stdout, stderr)?;
-        write_bytes(stdout, &resolved.unparse_resolved())?;
+    // qpdf resolves the Catalog, QTest array, each array item, and the final
+    // unparse at their respective public accessor boundaries
+    // (`qpdf/test_driver.cc:1351-1358`). Keep the same order with the
+    // canonical ObjectHandle accessors instead of the driver-local resolution
+    // helpers.
+    let root = pdf.root_handle()?;
+    emit_new_diagnostics(pdf, diagnostics_written, filename, stdout, stderr)?;
+    let qtest = root.try_get_key(b"/QTest")?;
+    emit_new_diagnostics(pdf, diagnostics_written, filename, stdout, stderr)?;
+    let count = qtest.try_get_array_n_items()?;
+    emit_new_diagnostics(pdf, diagnostics_written, filename, stdout, stderr)?;
+    for index in 0..count {
+        let item = qtest.try_get_array_item(index as i64)?;
+        emit_new_diagnostics(pdf, diagnostics_written, filename, stdout, stderr)?;
+        let rendered = item.try_unparse_resolved()?;
+        emit_new_diagnostics(pdf, diagnostics_written, filename, stdout, stderr)?;
+        write_bytes(stdout, &rendered)?;
         writeln!(stdout)?;
     }
     Ok(())
@@ -778,7 +781,7 @@ pub(crate) fn run_test_41<R: Read + Seek>(
 
 #[cfg(test)]
 mod tests {
-    use super::{inflate_with_pipeline, resolved_terminal, run_test_37, run_test_39};
+    use super::{inflate_with_pipeline, resolved_terminal, run_test_37, run_test_38, run_test_39};
     use flpdf::{Pdf, PdfOpenOptions};
 
     #[test]
@@ -865,6 +868,41 @@ mod tests {
         bytes
     }
 
+    fn pdf_with_lazy_qtest_item() -> Vec<u8> {
+        let mut bytes = b"%PDF-1.4\n".to_vec();
+        let objects = [
+            (
+                1,
+                b"<< /Type /Catalog /Pages 2 0 R /QTest [4 0 R] >>".as_slice(),
+            ),
+            (2, b"<< /Type /Pages /Kids [3 0 R] /Count 1 >>".as_slice()),
+            (
+                3,
+                b"<< /Type /Page /Parent 2 0 R /MediaBox [0 0 100 100] >>".as_slice(),
+            ),
+        ];
+        let mut offsets = [0usize; 5];
+        for &(number, body) in &objects {
+            offsets[number as usize] = bytes.len();
+            bytes.extend_from_slice(format!("{number} 0 obj\n").as_bytes());
+            bytes.extend_from_slice(body);
+            bytes.extend_from_slice(b"\nendobj\n");
+        }
+        offsets[4] = bytes.len();
+        bytes.extend_from_slice(b"4 0 obj\n42\nendobx\n");
+
+        let xref_offset = bytes.len();
+        bytes.extend_from_slice(b"xref\n0 5\n0000000000 65535 f \n");
+        for offset in offsets.into_iter().skip(1) {
+            bytes.extend_from_slice(format!("{offset:010} 00000 n \n").as_bytes());
+        }
+        bytes.extend_from_slice(
+            format!("trailer\n<< /Size 5 /Root 1 0 R >>\nstartxref\n{xref_offset}\n%%EOF\n")
+                .as_bytes(),
+        );
+        bytes
+    }
+
     #[test]
     fn resolved_terminal_uses_the_canonical_one_hop_resolver() {
         let mut pdf = Pdf::open_mem_owned_with_options(
@@ -913,6 +951,38 @@ mod tests {
 
         assert_eq!(stdout, b"page 1\nfilter: null, color space: /DeviceRGB\n");
         assert!(stderr.is_empty());
+    }
+
+    #[test]
+    fn test_38_flushes_warnings_from_lazy_array_item_resolution() {
+        let mut pdf = Pdf::open_mem_owned_with_options(
+            pdf_with_lazy_qtest_item(),
+            PdfOpenOptions {
+                description: b"lazy-item.pdf".to_vec(),
+                suppress_warnings: true,
+                ..PdfOpenOptions::default()
+            },
+        )
+        .expect("open lazy QTest fixture");
+        let mut stdout = Vec::new();
+        let mut stderr = Vec::new();
+        let mut diagnostics_written = 0;
+
+        run_test_38(
+            &mut pdf,
+            b"lazy-item.pdf",
+            None,
+            &mut stdout,
+            &mut stderr,
+            &mut diagnostics_written,
+        )
+        .expect("run test 38");
+
+        assert_eq!(stdout, b"42\n");
+        assert_eq!(
+            stderr,
+            b"WARNING: lazy-item.pdf (object 4 0, offset 212): expected endobj\n"
+        );
     }
 
     #[test]

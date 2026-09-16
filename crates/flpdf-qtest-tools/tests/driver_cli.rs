@@ -1517,6 +1517,25 @@ fn qtest_accessor_cases_do_not_use_explicit_pdf_resolve() {
             && !test_39.contains(".unparse_resolved()"),
         "test 39 must use the canonical image and stream accessors"
     );
+    let test_38 = section(
+        resolve_source.as_str(),
+        "pub(crate) fn run_test_38",
+        "pub(crate) fn run_test_39",
+    );
+    assert!(
+        test_38.contains("pdf.root_handle()?")
+            && test_38.contains("try_get_key(b\"/QTest\")?")
+            && test_38.contains("try_get_array_n_items()?")
+            && test_38.contains("try_get_array_item(")
+            && test_38.contains("try_unparse_resolved()?")
+            && test_38.matches("emit_new_diagnostics(").count() >= 5
+            && !test_38.contains("root_handle(pdf")
+            && !test_38.contains("resolved_key(")
+            && !test_38.contains("resolved_terminal(")
+            && !test_38.contains(".as_array()")
+            && !test_38.contains(".unparse_resolved()"),
+        "test 38 must use canonical resolving root, array, and unparse accessors"
+    );
     let test_21 = section(
         page_source.as_str(),
         "pub(crate) fn run_test_21",
