@@ -139,7 +139,11 @@ fn flpdf_linearized_objstm_preserve(fixture: &str) -> Vec<u8> {
     let path = Path::new(env!("CARGO_MANIFEST_DIR"))
         .join("../../tests/fixtures/compat")
         .join(fixture);
-    let f1 = std::fs::File::open(&path).unwrap_or_else(|e| panic!("open {path:?}: {e}"));
+    flpdf_linearized_objstm_preserve_at(&path)
+}
+
+fn flpdf_linearized_objstm_preserve_at(path: &Path) -> Vec<u8> {
+    let f1 = std::fs::File::open(path).unwrap_or_else(|e| panic!("open {path:?}: {e}"));
     let mut pdf = Pdf::open(std::io::BufReader::new(f1)).unwrap();
     let opts = WriterTestSettings {
         object_streams: ObjectStreamMode::Preserve,
@@ -147,6 +151,157 @@ fn flpdf_linearized_objstm_preserve(fixture: &str) -> Vec<u8> {
         ..WriterTestSettings::default()
     };
     write_linearized_with_settings(&mut pdf, &opts).unwrap()
+}
+
+fn qpdf_linearized_objstm_preserve_at(path: &Path) -> Vec<u8> {
+    let directory = tempfile::tempdir().expect("qpdf output tempdir");
+    let output = directory.path().join("qpdf.pdf");
+    let status = Command::new("qpdf")
+        .args([
+            "--linearize",
+            "--object-streams=preserve",
+            "--deterministic-id",
+            "--warning-exit-0",
+        ])
+        .arg(path)
+        .arg(&output)
+        .status()
+        .expect("qpdf runs");
+    assert_eq!(
+        status.code(),
+        Some(0),
+        "qpdf Preserve linearization must succeed"
+    );
+    let check_status = Command::new("qpdf")
+        .args(["--check-linearization"])
+        .arg(&output)
+        .status()
+        .expect("qpdf linearization check runs");
+    assert_eq!(
+        check_status.code(),
+        Some(0),
+        "qpdf Preserve linearization check must be clean"
+    );
+    std::fs::read(output).expect("qpdf output")
+}
+
+fn source_objstm_part9_order_pdf() -> Vec<u8> {
+    let mut pdf = Vec::new();
+    pdf.extend_from_slice(b"%PDF-1.5\n");
+    let mut offsets = [0u64; 11];
+
+    let append_object = |pdf: &mut Vec<u8>, offsets: &mut [u64; 11], number: usize, body: &[u8]| {
+        offsets[number] = pdf.len() as u64;
+        pdf.extend_from_slice(format!("{number} 0 obj\n").as_bytes());
+        pdf.extend_from_slice(body);
+        pdf.extend_from_slice(b"\nendobj\n");
+    };
+
+    append_object(
+        &mut pdf,
+        &mut offsets,
+        1,
+        b"<< /Type /Catalog /Pages 7 0 R /Names 8 0 R >>",
+    );
+    append_objstm(
+        &mut pdf,
+        &mut offsets,
+        2,
+        &[(3, b"<< /Producer (source) >>")],
+    );
+    append_object(
+        &mut pdf,
+        &mut offsets,
+        4,
+        b"<< /Type /Page /Parent 7 0 R /MediaBox [0 0 10 10] /Contents 5 0 R >>",
+    );
+    append_object(
+        &mut pdf,
+        &mut offsets,
+        5,
+        b"<< /Length 0 >>\nstream\n\nendstream",
+    );
+    append_objstm(
+        &mut pdf,
+        &mut offsets,
+        6,
+        &[
+            (7, b"<< /Type /Pages /Count 1 /Kids [4 0 R] >>"),
+            (8, b"<< /Names [(file.txt) 9 0 R] >>"),
+            (9, b"<< /Type /Filespec /F (file.txt) >>"),
+        ],
+    );
+
+    let xref_offset = pdf.len() as u64;
+    let mut xref_entries = Vec::with_capacity(11 * 7);
+    let push_xref_entry = |entries: &mut Vec<u8>, entry_type: u8, field2: u32, field3: u16| {
+        entries.push(entry_type);
+        entries.extend_from_slice(&field2.to_be_bytes());
+        entries.extend_from_slice(&field3.to_be_bytes());
+    };
+    for number in 0..=10 {
+        match number {
+            0 => push_xref_entry(&mut xref_entries, 0, 0, u16::MAX),
+            3 => push_xref_entry(&mut xref_entries, 2, 2, 0),
+            7 => push_xref_entry(&mut xref_entries, 2, 6, 0),
+            8 => push_xref_entry(&mut xref_entries, 2, 6, 1),
+            9 => push_xref_entry(&mut xref_entries, 2, 6, 2),
+            number => push_xref_entry(
+                &mut xref_entries,
+                1,
+                u32::try_from(if number == 10 {
+                    xref_offset
+                } else {
+                    offsets[number]
+                })
+                .expect("fixture xref offset fits u32"),
+                0,
+            ),
+        }
+    }
+    let xref_dict = format!(
+        "<< /Type /XRef /Size 11 /W [1 4 2] /Root 1 0 R /Info 3 0 R /ID [<31415926535897932384626433832795><31415926535897932384626433832795>] /Length {} >>\nstream\n",
+        xref_entries.len()
+    );
+    let mut xref_body = xref_dict.into_bytes();
+    xref_body.extend_from_slice(&xref_entries);
+    xref_body.extend_from_slice(b"\nendstream");
+    append_object(&mut pdf, &mut offsets, 10, &xref_body);
+    pdf.extend_from_slice(format!("startxref\n{xref_offset}\n%%EOF\n").as_bytes());
+    pdf
+}
+
+fn append_objstm(
+    pdf: &mut Vec<u8>,
+    offsets: &mut [u64; 11],
+    number: usize,
+    members: &[(usize, &[u8])],
+) {
+    let mut header = String::new();
+    let mut body_offset = 0usize;
+    let mut body = Vec::new();
+    for &(member_number, member_body) in members {
+        header.push_str(&format!("{member_number} {body_offset} "));
+        body.extend_from_slice(member_body);
+        body.push(b'\n');
+        body_offset += member_body.len() + 1;
+    }
+    let first = header.len();
+    let mut stream_data = header.into_bytes();
+    stream_data.extend_from_slice(&body);
+    let mut object = format!(
+        "<< /Type /ObjStm /N {} /First {} /Length {} >>\nstream\n",
+        members.len(),
+        first,
+        stream_data.len()
+    )
+    .into_bytes();
+    object.extend_from_slice(&stream_data);
+    object.extend_from_slice(b"\nendstream");
+    offsets[number] = pdf.len() as u64;
+    pdf.extend_from_slice(format!("{number} 0 obj\n").as_bytes());
+    pdf.extend_from_slice(&object);
+    pdf.extend_from_slice(b"\nendobj\n");
 }
 
 fn golden_preserve(stem: &str) -> Vec<u8> {
@@ -432,6 +587,28 @@ fn preserve_source_objstm_keeps_the_exact_reachability_fallback() {
     let mut pdf = Pdf::open(std::io::BufReader::new(file)).unwrap();
     LinearizationPlan::from_pdf_with_object_stream_mode(&mut pdf, ObjectStreamMode::Preserve)
         .expect("source-backed Preserve must use the exact writer reachability walk");
+}
+
+#[test]
+fn preserve_part9_objstm_containers_follow_qpdf_category_order() {
+    let directory = tempfile::tempdir().expect("source ObjStm tempdir");
+    let input = directory.path().join("input.pdf");
+    std::fs::write(&input, source_objstm_part9_order_pdf()).expect("write source input");
+
+    let expected = qpdf_linearized_objstm_preserve_at(&input);
+    let actual = flpdf_linearized_objstm_preserve_at(&input);
+    report(
+        "generated source with Pages and Info in different ObjStms",
+        &mask_id1(&actual),
+        &mask_id1(&expected),
+        "Preserve part9 container order (ignoring /ID[1])",
+    );
+    report(
+        "generated source with Pages and Info in different ObjStms",
+        &actual,
+        &expected,
+        "Preserve part9 container order",
+    );
 }
 
 #[test]
