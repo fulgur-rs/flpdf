@@ -1030,6 +1030,21 @@ page numbering and transformation order. The qpdf differential tests cover
 merged `flpdf-p50gt` PR #2002; this issue owns rotation only and makes no
 route-wide JSON parity claim.
 
+### E-13 / E-21 standalone inspection rotation consumer (`flpdf-9r7ti`, 2026-09-16)
+
+qpdfの `createQPDF` applies `handleRotations` before `writeQPDF` selects the
+`doInspection` consumer, including `doShowObj`
+（`libqpdf/QPDFJob.cc:459-480,483-490,1645-1689,2635-2652`）。従って
+`--rotate`と`--show-object`は回転後のページ辞書を観測する。
+
+flpdfのstandalone inspection callersは、`InspectionTransformOptions`が保持する
+raw rotation parametersを共通 `configure_top_level_inspection_transformations`
+へ渡し、既存の `QPDFJob::apply_transformations` / `apply_configured_rotations`
+で処理する。これにより `run_show_object`を含む各inspection routeが同じ
+rotation-before-consumer境界を共有する。qpdf differential testは
+`cli_inspection_combinations.rs::standalone_show_object_inspection_applies_rotation_before_the_consumer`
+で90/180/270度を固定し、個別show-object用のrotation parserやbridgeは追加しない。
+
 ### E-17 / E-21 full conflict declaration audit (`flpdf-sg6tu`, 2026-09-16)
 
 qpdf 11.9.0 の `QPDFJob::checkConfiguration` は

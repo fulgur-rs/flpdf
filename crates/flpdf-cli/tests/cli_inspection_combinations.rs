@@ -659,6 +659,26 @@ fn overlay_inspection_applies_rotation_before_the_consumer() {
 }
 
 #[test]
+fn standalone_show_object_inspection_applies_rotation_before_the_consumer() {
+    if !qpdf_available() {
+        return;
+    }
+
+    let input = concat!(
+        env!("CARGO_MANIFEST_DIR"),
+        "/../../tests/fixtures/compat/three-page.pdf"
+    );
+    for angle in [90, 180, 270] {
+        let args = vec![
+            format!("--rotate={angle}"),
+            "--show-object=3,0".to_owned(),
+            input.to_owned(),
+        ];
+        assert_matches_qpdf_exact(&args);
+    }
+}
+
+#[test]
 fn overlay_inspection_uses_segment_password_options_for_the_donor() {
     if !qpdf_available() {
         return;
