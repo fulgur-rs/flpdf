@@ -3213,6 +3213,27 @@ type SecondHalfPlainObject = (QpdfObjGen, SecondHalfPlainRank);
 /// apart, which is the distinction the head promotion needs: a page-tree node
 /// takes the head category and everything else takes the catch-all category
 /// `part9_category_order_key` gives the remaining set.
+/// Part-9 category key for one plain Preserve object.
+///
+/// The container branch of `second_half_container_anchors` reads the folded
+/// Optimization user map, so a plain object must read the same map or a
+/// thumbnail held in a container would outrank a plain thumbnail that qpdf
+/// orders first (`QPDF_linearization.cc:1279-1340` keeps both in the thumbnail
+/// category, ordered by page then object number). Plans built by hand carry no
+/// optimization; those keep the coarse page-tree/catch-all split.
+fn preserve_part9_category_with_users(
+    object_gen: QpdfObjGen,
+    part9_pages: &BTreeSet<ObjectRef>,
+    optimization: Option<&crate::optimization::Optimization>,
+) -> (u8, u32) {
+    match (object_gen.to_object_ref(), optimization) {
+        (Some(object_ref), Some(optimization)) => {
+            part9_category_order_key(optimization, part9_pages, [&object_ref])
+        }
+        _ => preserve_part9_category(object_gen, part9_pages),
+    }
+}
+
 fn preserve_part9_category(object_gen: QpdfObjGen, part9_pages: &BTreeSet<ObjectRef>) -> (u8, u32) {
     if object_gen
         .to_object_ref()
@@ -3355,7 +3376,11 @@ fn second_half_container_anchors(
                         })
                         .unwrap_or((0, 0))
                 } else {
-                    preserve_part9_category(object_gen, &part9_pages)
+                    preserve_part9_category_with_users(
+                        object_gen,
+                        &part9_pages,
+                        plan.optimization.as_ref(),
+                    )
                 };
                 plain_ranked.push((
                     object_gen,
@@ -3393,7 +3418,11 @@ fn second_half_container_anchors(
                         .expect("generated ObjStm batches require optimization users");
                     part9_category_order_key(optimization, &part9_pages, [&object_ref])
                 } else {
-                    preserve_part9_category(object_gen, &part9_pages)
+                    preserve_part9_category_with_users(
+                        object_gen,
+                        &part9_pages,
+                        plan.optimization.as_ref(),
+                    )
                 };
                 plain_ranked.push((
                     object_gen,
