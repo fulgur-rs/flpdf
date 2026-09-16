@@ -1052,10 +1052,19 @@ fn write_part1_xref_and_trailer(
         )
         .into_bytes(),
     ));
-    entries.push((
-        b"/Size".to_vec(),
-        total_object_count.to_string().into_bytes(),
-    ));
+    // qpdf's `writeTrailer` walks the *input* trailer's keys and substitutes the
+    // object count only for a key literally named `/Size`
+    // (`QPDFWriter.cc:1174-1191`); it never adds one. A trailer whose size key is
+    // misspelled therefore keeps the misspelling and gains neither `/Size` nor
+    // the `t_lin_first` `/Prev` that the same branch appends. Only the
+    // second-half trailer (`t_lin_second`) writes `/Size` unconditionally, and
+    // that is a different call site.
+    if source_trailer.try_has_key(b"/Size")? {
+        entries.push((
+            b"/Size".to_vec(),
+            total_object_count.to_string().into_bytes(),
+        ));
+    }
     entries.sort_by(|left, right| left.0.cmp(&right.0));
 
     let mut prev_value_range = None;
@@ -1116,17 +1125,12 @@ fn write_part1_xref_and_trailer(
     // linearized file"; we adopt the same convention for byte-identical output.
     out.write_bytes(b"\nstartxref\n0\n%%EOF\n")?;
 
-    let prev_value_range = match (prev_value_range, final_prev) {
-        (Some(range), _) => range,
-        (None, Some(_)) => 0..0,
-        (None, None) => {
-            // cov:ignore-start: /Size is inserted unconditionally above.
-            return Err(crate::Error::Unsupported(
-                "linearization first trailer has no /Size entry for /Prev patch".to_string(),
-            ));
-            // cov:ignore-end
-        }
-    };
+    // An empty range means "no `/Prev` placeholder to back-patch". That happens
+    // when the value was already known (`final_prev`), and also when the input
+    // trailer carries no `/Size` key: qpdf writes `/Prev` only inside the
+    // `/Size` branch (`QPDFWriter.cc:1179-1186`), so such a trailer has no
+    // `/Prev` at all and there is nothing to patch.
+    let prev_value_range = prev_value_range.unwrap_or(0..0);
     Ok((xref_offset, prev_value_range, patch))
 }
 
