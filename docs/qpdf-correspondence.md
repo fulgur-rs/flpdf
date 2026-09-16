@@ -881,6 +881,30 @@ stream単位のwarningへ変換して `QPDFWriter` (`QPDFWriter.cc:1287-1314`) �
 unfiltered retryへ渡す。flpdfも同じlazy failure/retry境界を使い、範囲外levelで
 write全体を使用法エラーにしない。
 
+⚪ **DEFLATE/INFLATE バックエンドの選択**（CLAUDE.md 逸脱分類 (A) と、その
+inflate 側の内部的な対応物）。`pipeline/flate.rs` は 2 つの codec を feature で
+切り替える。
+
+- **deflate（圧縮）**: 既定は `flate2` + miniz_oxide（Pure Rust）、
+  `qpdf-zlib-compat` で `flate2` + 古典 libz。qpdf は常に zlib なので、
+  既定ビルドでは圧縮バイトが qpdf と異なってよい。これが CLAUDE.md が認める
+  **唯一の出力バイトを変える逸脱 (A)** で、byte-identical の検証は
+  `--features qpdf-zlib-compat` で行う。
+- **inflate（伸長）**: 既定は `zlib-rs`（Pure Rust の zlib 移植）を直接使い、
+  `qpdf-zlib-compat` では `flate2::Decompress`（libz）。**伸長は決定的**なので、
+  正常なストリームに対しては両者とも元のバイト列を復元し、**出力バイトは
+  変わらない**。(A) の圧縮側とは別物である点に注意する。
+
+破損ストリームの診断文言は qpdf の `strm.msg` に合わせてある。
+`qpdf --check qtest/qpdf/fuzz-16214.pdf` は
+`stream inflate: inflate: data: invalid code lengths set` を出し、flpdf は
+既定ビルドで `zlib_rs::Inflate::error_message()`、compat ビルドで
+`flate2` の `error.message()` から同じ文言を取る。
+
+`Pl_Flate` 自体のロジック・呼び出し順序・warning 境界は qpdf のまま
+（上記の `setCompressionLevel` / lazy failure retry を参照）で、
+置き換えているのは codec の実体だけ。
+
 進捗計測の準備境界は `writer.rs:538-563` に固定する。QDF/content-normalization
 または non-none decode level の `PageDocumentHelper::get_all_pages()` による page-tree
 修復を先に実行してから `get_object_count()` を取得し、qpdf の
