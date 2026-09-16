@@ -1719,13 +1719,10 @@ impl LinearizationPlan {
             // `qpdf_e_damaged_pdf` exception carrying the input name and the
             // source's last read offset and no object description
             // (`QPDF_linearization.cc:1190`, `QPDF.cc:2590-2592,2625-2628`).
-            return Err(crate::Error::QpdfExc(crate::QpdfExc::new(
-                crate::QpdfErrorCode::DamagedPdf,
-                pdf.input_description(),
-                b"",
-                i64::try_from(pdf.source_last_offset()).unwrap_or(i64::MAX),
+            return Err(qpdf_stop_on_error(
+                pdf,
                 b"no pages found while calculating linearization data",
-            )));
+            ));
         }
 
         // ----------------------------------------------------------------
@@ -1759,6 +1756,18 @@ impl LinearizationPlan {
         // qpdf's object-user map but remains reachable for the writer's
         // Part-9 universe, so that shape must retain the exact fallback walk.
         let page_refs: Vec<ObjectRef> = crate::pages::page_refs(pdf)?;
+        if let Some(first_page_ref) = page_refs.first().copied() {
+            if !first_page_is_private(
+                &optimization,
+                first_page_ref,
+                &preserve_source_container_by_member,
+            ) {
+                return Err(qpdf_stop_on_error(
+                    pdf,
+                    b"INTERNAL ERROR: QPDF::calculateLinearizationData: first page object not in lc_first_page_private",
+                ));
+            }
+        } // cov:ignore: LLVM maps the successful first-page-private continuation to this cleanup brace
         let page_parent_users_are_complete =
             page_refs
                 .iter()
@@ -2063,12 +2072,9 @@ impl LinearizationPlan {
         // (page dict first, then its `/Resources` subtree, then `/Contents`,
         // matching qpdf's first-page object numbering).
         //
-        // The page-1 dictionary itself is pinned to Part 2 even if another
-        // page directly references it; the linearization layout requires
-        // that the first page object live at the start of Part 2 (it is the
-        // anchor reached via /O in the parameter dict).  Without this pin
-        // a circular page-tree reference (or a deliberately-shared page
-        // dict) would silently demote the page object into Part 3.
+        // The page-1 dictionary is pinned to Part 2 after the qpdf
+        // lc_first_page_private invariant above has accepted it. This is the
+        // anchor reached via /O in the parameter dictionary.
         let first_page_ref = page_refs.first().copied();
         let mut part2_objects: Vec<ObjectRef> = Vec::new();
         let mut part3_objects: Vec<ObjectRef> = Vec::new();
@@ -3857,6 +3863,67 @@ fn is_document_other_user(user: &crate::optimization::ObjectUser) -> bool {
     }
 }
 
+/// Whether qpdf would place the first page's object in
+/// `lc_first_page_private` before generating the linearization parts.
+///
+/// qpdf classifies the post-ObjStm-folded object-user set in strict priority
+/// order (`QPDF_linearization.cc:1118-1128`). The first page must have a page-0
+/// user and no root, outline, open-document, later-page, thumbnail, or
+/// document-other user. A non-private first page cannot be represented by the
+/// linearized part layout, so qpdf raises `stopOnError` rather than pinning it
+/// into Part 6.
+fn first_page_is_private(
+    optimization: &crate::optimization::Optimization,
+    first_page_ref: ObjectRef,
+    source_container_by_member: &BTreeMap<ObjectRef, ObjectRef>,
+) -> bool {
+    let first_page_ref = canonical_preserve_ref(source_container_by_member, first_page_ref);
+    let Ok(first_page_gen) = QpdfObjGen::try_from_object_ref(first_page_ref) else {
+        return false;
+    };
+    let users = optimization.raw_users_for(first_page_gen);
+    let mut has_first_page = false;
+    let mut has_later_page = false;
+    let mut has_thumbnail = false;
+    let mut has_document_other = false;
+    let mut has_open_document = false;
+    let mut has_outline = false;
+    let mut has_root = false;
+
+    for user in users.iter() {
+        match user {
+            crate::optimization::ObjectUser::Page(page) if *page == 0 => {
+                has_first_page = true;
+            }
+            crate::optimization::ObjectUser::Page(_) => has_later_page = true,
+            crate::optimization::ObjectUser::Thumbnail(_) => has_thumbnail = true,
+            crate::optimization::ObjectUser::Root => has_root = true,
+            user if is_outline_user(user) => has_outline = true,
+            user if is_open_document_user(user) => has_open_document = true,
+            user if is_document_other_user(user) => has_document_other = true,
+            _ => {} // cov:ignore: qpdf ObjectUser variants are fully partitioned by the classifiers above
+        }
+    }
+
+    has_first_page
+        && !has_later_page
+        && !has_thumbnail
+        && !has_document_other
+        && !has_open_document
+        && !has_outline
+        && !has_root
+}
+
+fn qpdf_stop_on_error<R: Read + Seek>(pdf: &Pdf<R>, message: impl AsRef<[u8]>) -> crate::Error {
+    crate::Error::QpdfExc(crate::QpdfExc::new(
+        crate::QpdfErrorCode::DamagedPdf,
+        pdf.input_description(),
+        b"",
+        i64::try_from(pdf.source_last_offset()).unwrap_or(i64::MAX),
+        message,
+    ))
+}
+
 /// Return qpdf's Part-9 category and its page secondary key for a plain object
 /// or a generated ObjStm container. The category numbers are ordered as qpdf's
 /// `calculateLinearizationData` emits them: Pages (`0`), private thumbnails
@@ -4058,11 +4125,12 @@ fn is_thumbnail_user(user: &crate::optimization::ObjectUser) -> bool {
 mod tests {
     use super::{
         collect_direct_handle_refs, collect_direct_handle_refs_with_context,
-        collect_direct_handle_refs_with_stream_parameters_context, LinearizationPlan,
-        RawLinearizationPlan,
+        collect_direct_handle_refs_with_stream_parameters_context, first_page_is_private,
+        LinearizationPlan, RawLinearizationPlan,
     };
     use crate::acroform_document_helper::AcroFormDocumentHelper;
     use crate::object_handle::ObjectHandle;
+    use crate::optimization::{ObjectUser, Optimization};
     use crate::parser::MAX_PARSE_DEPTH;
     use crate::writer::{ObjectStreamMode, WriterOptions};
     use crate::{Error, ObjectRef, Pdf};
@@ -4072,6 +4140,36 @@ mod tests {
     use std::collections::{BTreeMap, BTreeSet};
     use std::io::{Cursor, Write};
     use std::rc::Rc;
+
+    #[test]
+    fn first_page_private_matches_qpdf_object_user_classification() {
+        let page = ObjectRef::new(3, 0);
+        let mut private = Optimization::default();
+        private.record_for_test(ObjectUser::Page(0), page);
+        assert!(first_page_is_private(&private, page, &BTreeMap::new()));
+
+        for extra_user in [
+            ObjectUser::Page(1),
+            ObjectUser::Thumbnail(0),
+            ObjectUser::TrailerKey(b"Info".to_vec()),
+            ObjectUser::TrailerKey(b"Encrypt".to_vec()),
+            ObjectUser::RootKey(b"Outlines".to_vec()),
+            ObjectUser::RootKey(b"PageMode".to_vec()),
+            ObjectUser::RootKey(b"Other".to_vec()),
+            ObjectUser::Root,
+        ] {
+            let mut shared = Optimization::default();
+            shared.record_for_test(ObjectUser::Page(0), page);
+            shared.record_for_test(extra_user, page);
+            assert!(!first_page_is_private(&shared, page, &BTreeMap::new()));
+        }
+
+        assert!(!first_page_is_private(
+            &Optimization::default(),
+            ObjectRef::new(u32::MAX, 0),
+            &BTreeMap::new()
+        ));
+    }
 
     #[test]
     fn raw_projection_route_is_materialized_at_plan_construction() {
