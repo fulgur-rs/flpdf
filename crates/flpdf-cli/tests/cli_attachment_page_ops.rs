@@ -713,3 +713,93 @@ fn add_attachment_opens_the_copy_encryption_donor_once() {
         "the donor must be opened once, like qpdf\nflpdf stderr:\n{stderr}"
     );
 }
+
+/// `--empty` replaces the input file, so the sole positional path is the
+/// output (`libqpdf/QPDFJob_config.cc:27-40`). The attachment routes used to
+/// consume it as the input and then fail with "an output file name is
+/// required".
+#[test]
+fn add_attachment_honors_empty_input() {
+    let temp = tempfile::tempdir().unwrap();
+    let attachment = attachment_temp(temp.path());
+    let output = temp.path().join("out.pdf");
+
+    CargoCommand::cargo_bin("flpdf")
+        .unwrap()
+        .args([
+            "--static-id",
+            "--empty",
+            "--add-attachment",
+            attachment.to_str().unwrap(),
+            "--creationdate=D:20200102030405Z",
+            "--moddate=D:20200102030405Z",
+            "--",
+            output.to_str().unwrap(),
+        ])
+        .assert()
+        .success();
+
+    assert!(
+        std::fs::metadata(&output).is_ok_and(|meta| meta.len() > 0),
+        "--empty must write the document to the sole positional path"
+    );
+}
+
+#[test]
+fn add_attachment_honors_empty_input_with_page_selection() {
+    let temp = tempfile::tempdir().unwrap();
+    let source = one_page_pdf();
+    let attachment = attachment_temp(temp.path());
+    let output = temp.path().join("out.pdf");
+
+    CargoCommand::cargo_bin("flpdf")
+        .unwrap()
+        .args([
+            "--static-id",
+            "--empty",
+            "--pages",
+            source.path().to_str().unwrap(),
+            "1",
+            "--",
+            "--add-attachment",
+            attachment.to_str().unwrap(),
+            "--creationdate=D:20200102030405Z",
+            "--moddate=D:20200102030405Z",
+            "--",
+            output.to_str().unwrap(),
+        ])
+        .assert()
+        .success();
+
+    assert_eq!(
+        page_count(&output),
+        1,
+        "the page selected from the external source must be written"
+    );
+}
+
+#[test]
+fn copy_attachments_honors_empty_input() {
+    let temp = tempfile::tempdir().unwrap();
+    let donor = one_page_pdf();
+    let output = temp.path().join("out.pdf");
+
+    CargoCommand::cargo_bin("flpdf")
+        .unwrap()
+        .args([
+            "--static-id",
+            "--empty",
+            "--copy-attachments-from",
+            donor.path().to_str().unwrap(),
+            "--prefix=P",
+            "--",
+            output.to_str().unwrap(),
+        ])
+        .assert()
+        .success();
+
+    assert!(
+        std::fs::metadata(&output).is_ok_and(|meta| meta.len() > 0),
+        "--empty must write the document to the sole positional path"
+    );
+}
