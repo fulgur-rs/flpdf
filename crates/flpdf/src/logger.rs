@@ -201,11 +201,22 @@ pub struct QPDFLogger {
 
 impl QPDFLogger {
     pub fn create() -> Self {
+        Self::create_with_line_buffering(true)
+    }
+
+    fn create_with_line_buffering(line_buffering: bool) -> Self {
         let stdout_text_mode = Arc::new(AtomicBool::new(cfg!(windows)));
-        let real_stdout = PipelineHandle::new(PlOStream::new(
-            "standard output",
-            standard_output_writer(std::io::stdout(), Arc::clone(&stdout_text_mode)),
-        ));
+        let real_stdout = if line_buffering {
+            PipelineHandle::new(PlOStream::new(
+                "standard output",
+                standard_output_writer(std::io::stdout(), Arc::clone(&stdout_text_mode)),
+            ))
+        } else {
+            PipelineHandle::new(PlOStream::new(
+                "standard output",
+                TextModeWriter::new(std::io::stdout(), Arc::clone(&stdout_text_mode)),
+            ))
+        };
         let stdout_used = Arc::new(AtomicBool::new(false));
         let stdout = PipelineHandle::new(PlTrack {
             next: real_stdout,
@@ -236,7 +247,9 @@ impl QPDFLogger {
 
     pub fn default_logger() -> Self {
         static DEFAULT_LOGGER: OnceLock<QPDFLogger> = OnceLock::new();
-        DEFAULT_LOGGER.get_or_init(Self::create).clone()
+        DEFAULT_LOGGER
+            .get_or_init(|| Self::create_with_line_buffering(false))
+            .clone()
     }
 
     pub fn info(&self, data: impl AsRef<[u8]>) -> Result<()> {
@@ -499,5 +512,23 @@ mod tests {
         assert_eq!(text_mode.load(Ordering::Relaxed), cfg!(windows));
         logger.save_to_standard_output(false).unwrap();
         assert!(!text_mode.load(Ordering::Relaxed));
+    }
+
+    #[test]
+    fn default_logger_does_not_install_the_line_buffered_stdout_adapter() {
+        let source = include_str!("logger.rs");
+        let start = source
+            .find("pub fn default_logger")
+            .expect("default logger constructor");
+        let body = &source[start
+            ..source[start..]
+                .find("\n    pub fn info")
+                .expect("default logger constructor end")
+                + start];
+
+        assert!(
+            body.contains("create_with_line_buffering(false)"),
+            "the process-global default logger must not retain partial lines in the custom line buffer"
+        );
     }
 }
