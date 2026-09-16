@@ -3,8 +3,9 @@
 //! qpdf correspondence: QPDFWriter.cc shared object, stream, trailer, and xref serialization primitives.
 //!
 use super::{
-    object_streams, output::OutputSink, CompressStreams, NewlineBeforeEndstream,
-    ObjectWriterEmission,
+    object_streams,
+    output::{write_decimal_u64, write_object_ref, OutputSink},
+    CompressStreams, NewlineBeforeEndstream, ObjectWriterEmission,
 };
 use crate::ObjectHandle;
 
@@ -103,15 +104,17 @@ pub(crate) fn write_objstm_stream_with_extends(
         CompressStreams::No => body_bytes,
     };
     out.write_bytes(b"<< /Type /ObjStm /Length ")?;
-    out.write_bytes(data.len().to_string().as_bytes())?;
+    write_decimal_u64(out, data.len() as u64)?;
     if matches!(compress, CompressStreams::Yes) {
         out.write_bytes(b" /Filter /FlateDecode")?;
     }
-    out.write_bytes(format!(" /N {n_members} /First {first_offset}").as_bytes())?;
+    out.write_bytes(b" /N ")?;
+    write_decimal_u64(out, n_members as u64)?;
+    out.write_bytes(b" /First ")?;
+    write_decimal_u64(out, first_offset as u64)?;
     if let Some(extends) = extends {
-        out.write_bytes(
-            format!(" /Extends {} {} R", extends.number, extends.generation).as_bytes(),
-        )?; // cov:ignore: LLVM maps the covered compact ObjStm /Extends write continuation to this line
+        out.write_bytes(b" /Extends ")?;
+        write_object_ref(out, extends)?; // cov:ignore: LLVM maps the covered compact ObjStm /Extends write continuation to this line
     }
     out.write_bytes(b" >>")?;
     write_stream_payload(out, &data, policy)
@@ -143,15 +146,17 @@ pub(crate) fn write_encrypted_objstm_stream_with_extends(
     let mut stream_length = data.len();
     crate::writer::adjust_aes_stream_length(&mut stream_length, context, true)?;
     out.write_bytes(b"<< /Type /ObjStm /Length ")?;
-    out.write_bytes(stream_length.to_string().as_bytes())?;
+    write_decimal_u64(out, stream_length as u64)?;
     if matches!(compress, CompressStreams::Yes) {
         out.write_bytes(b" /Filter /FlateDecode")?;
     }
-    out.write_bytes(format!(" /N {n_members} /First {first_offset}").as_bytes())?;
+    out.write_bytes(b" /N ")?;
+    write_decimal_u64(out, n_members as u64)?;
+    out.write_bytes(b" /First ")?;
+    write_decimal_u64(out, first_offset as u64)?;
     if let Some(extends) = extends {
-        out.write_bytes(
-            format!(" /Extends {} {} R", extends.number, extends.generation).as_bytes(),
-        )?; // cov:ignore: LLVM maps the covered encrypted compact ObjStm /Extends write continuation to this line
+        out.write_bytes(b" /Extends ")?;
+        write_object_ref(out, extends)?; // cov:ignore: LLVM maps the covered encrypted compact ObjStm /Extends write continuation to this line
     }
     out.write_bytes(b" >>")?;
     crate::writer::write_stream_payload_with_pipeline(
@@ -173,13 +178,17 @@ pub(crate) fn write_objstm_stream_with_extends_qdf(
     let n_members = body.n_members;
     let data = body.bytes;
     out.write_bytes(b"<<\n  /Type /ObjStm\n")?;
-    out.write_bytes(format!("  /Length {}\n", data.len()).as_bytes())?;
-    out.write_bytes(format!("  /N {n_members}\n").as_bytes())?;
-    out.write_bytes(format!("  /First {first_offset}\n").as_bytes())?;
+    out.write_bytes(b"  /Length ")?;
+    write_decimal_u64(out, data.len() as u64)?;
+    out.write_bytes(b"\n  /N ")?;
+    write_decimal_u64(out, n_members as u64)?;
+    out.write_bytes(b"\n  /First ")?;
+    write_decimal_u64(out, first_offset as u64)?;
+    out.write_bytes(b"\n")?;
     if let Some(extends) = extends {
-        out.write_bytes(
-            format!("  /Extends {} {} R\n", extends.number, extends.generation).as_bytes(),
-        )?; // cov:ignore: LLVM maps the covered QDF ObjStm /Extends write continuation to this line
+        out.write_bytes(b"  /Extends ")?;
+        write_object_ref(out, extends)?;
+        out.write_bytes(b"\n")?; // cov:ignore: LLVM maps the covered QDF ObjStm /Extends write continuation to this line
     }
     out.write_bytes(b">>")?;
     write_stream_payload_with_qdf(out, &data, newline_before_endstream, true)
@@ -201,13 +210,17 @@ pub(crate) fn write_encrypted_objstm_stream_with_extends_qdf(
     let mut stream_length = data.len();
     crate::writer::adjust_aes_stream_length(&mut stream_length, context, true)?;
     out.write_bytes(b"<<\n  /Type /ObjStm\n")?;
-    out.write_bytes(format!("  /Length {stream_length}\n").as_bytes())?;
-    out.write_bytes(format!("  /N {n_members}\n").as_bytes())?;
-    out.write_bytes(format!("  /First {first_offset}\n").as_bytes())?;
+    out.write_bytes(b"  /Length ")?;
+    write_decimal_u64(out, stream_length as u64)?;
+    out.write_bytes(b"\n  /N ")?;
+    write_decimal_u64(out, n_members as u64)?;
+    out.write_bytes(b"\n  /First ")?;
+    write_decimal_u64(out, first_offset as u64)?;
+    out.write_bytes(b"\n")?;
     if let Some(extends) = extends {
-        out.write_bytes(
-            format!("  /Extends {} {} R\n", extends.number, extends.generation).as_bytes(),
-        )?; // cov:ignore: LLVM maps the covered encrypted QDF ObjStm /Extends write continuation to this line
+        out.write_bytes(b"  /Extends ")?;
+        write_object_ref(out, extends)?;
+        out.write_bytes(b"\n")?; // cov:ignore: LLVM maps the covered encrypted QDF ObjStm /Extends write continuation to this line
     }
     out.write_bytes(b">>")?;
     crate::writer::write_stream_payload_with_pipeline_qdf(
@@ -255,7 +268,7 @@ pub(crate) mod xref_stream {
     use crate::pipeline::{Pipeline, PipelineError, PipelineResult};
 
     use crate::writer::object::ObjectWriterEmission;
-    use crate::writer::output::OutputSink;
+    use crate::writer::output::{decimal_u64_len, write_decimal_u64, write_object_ref, OutputSink};
     use crate::ObjectHandle;
     use crate::ObjectRef;
     use crate::Result;
@@ -497,13 +510,18 @@ pub(crate) mod xref_stream {
         payload_len: usize,
         qdf: bool,
     ) -> Result<()> {
-        out.write_bytes(format!("{} {} obj\n", object.number, object.generation).as_bytes())?;
+        write_decimal_u64(out, u64::from(object.number))?;
+        out.write_bytes(b" ")?;
+        write_decimal_u64(out, u64::from(object.generation))?;
+        out.write_bytes(b" obj\n")?;
         if qdf {
             out.write_bytes(b"<<\n  /Type /XRef")?;
-            out.write_bytes(format!("\n  /Length {payload_len}").as_bytes())?;
+            out.write_bytes(b"\n  /Length ")?;
+            write_decimal_u64(out, payload_len as u64)?;
         } else {
             out.write_bytes(b"<< /Type /XRef")?;
-            out.write_bytes(format!(" /Length {payload_len}").as_bytes())?;
+            out.write_bytes(b" /Length ")?;
+            write_decimal_u64(out, payload_len as u64)?;
         }
         if dict.filtered {
             if qdf {
@@ -513,7 +531,7 @@ pub(crate) mod xref_stream {
             } else {
                 out.write_bytes(b" /Filter /FlateDecode /DecodeParms << /Columns ")?;
             }
-            out.write_bytes(columns(dict.widths).to_string().as_bytes())?;
+            write_decimal_u64(out, columns(dict.widths) as u64)?;
             out.write_bytes(b" /Predictor 12 >>")?;
         }
         if qdf {
@@ -521,11 +539,18 @@ pub(crate) mod xref_stream {
         } else {
             out.write_bytes(b" /W [ ")?;
         }
-        out.write_bytes(
-            format!("{} {} {} ]", dict.widths[0], dict.widths[1], dict.widths[2]).as_bytes(),
-        )?; // cov:ignore: LLVM maps the covered xref width write continuation to this line
+        write_decimal_u64(out, u64::from(dict.widths[0]))?;
+        out.write_bytes(b" ")?;
+        write_decimal_u64(out, u64::from(dict.widths[1]))?;
+        out.write_bytes(b" ")?;
+        write_decimal_u64(out, u64::from(dict.widths[2]))?;
+        out.write_bytes(b" ]")?; // cov:ignore: LLVM maps the covered xref width write continuation to this line
         if let Some((start, count)) = dict.index {
-            out.write_bytes(format!(" /Index [ {start} {count} ]").as_bytes())?;
+            out.write_bytes(b" /Index [ ")?;
+            write_decimal_u64(out, u64::from(start))?;
+            out.write_bytes(b" ")?;
+            write_decimal_u64(out, u64::from(count))?;
+            out.write_bytes(b" ]")?;
         }
         if let Some(trailer) = dict.live_trailer {
             let map = dict.live_map.ok_or_else(|| {
@@ -564,7 +589,9 @@ pub(crate) mod xref_stream {
                 out.write_bytes(&value)?;
                 if key == b"/Size" {
                     if let Some(prev) = dict.prev {
-                        out.write_bytes(format!(" /Prev {prev:<PREV_FIELD_WIDTH$}").as_bytes())?;
+                        out.write_bytes(b" /Prev ")?;
+                        write_decimal_u64(out, prev)?;
+                        push_spaces(out, PREV_FIELD_WIDTH.saturating_sub(decimal_u64_len(prev)))?;
                     }
                 }
             }
@@ -584,6 +611,13 @@ pub(crate) mod xref_stream {
         }
         write_qpdf_dictionary_key(out, key)?;
         out.write_bytes(b" ")
+    }
+
+    fn push_spaces(out: &mut OutputSink<'_>, count: usize) -> Result<()> {
+        for _ in 0..count {
+            out.write_bytes(b" ")?;
+        }
+        Ok(())
     }
 
     fn write_live_trailer_entries(
@@ -611,9 +645,7 @@ pub(crate) mod xref_stream {
                 write_xref_dictionary_entry_prefix(out, qdf, &key)?;
                 if let Some(root) = dict.root {
                     let mapped = root;
-                    out.write_bytes(
-                        format!("{} {} R", mapped.number, mapped.generation).as_bytes(),
-                    )?; // cov:ignore: LLVM maps the covered mapped-root xref dictionary call continuation to this line
+                    write_object_ref(out, mapped)?; // cov:ignore: LLVM maps the covered mapped-root xref dictionary call continuation to this line
                 } else if let Some(root) = dict.live_root_value {
                     if qdf {
                         root.write_object_qdf_with_ref_map_and_removed(out, 0, map, removed_refs)?;
@@ -631,9 +663,11 @@ pub(crate) mod xref_stream {
             }
             if key == b"/Size" {
                 write_xref_dictionary_entry_prefix(out, qdf, &key)?;
-                out.write_bytes(dict.size.to_string().as_bytes())?;
+                write_decimal_u64(out, u64::from(dict.size))?;
                 if let Some(prev) = dict.prev {
-                    out.write_bytes(format!(" /Prev {prev:<PREV_FIELD_WIDTH$}").as_bytes())?;
+                    out.write_bytes(b" /Prev ")?;
+                    write_decimal_u64(out, prev)?;
+                    push_spaces(out, PREV_FIELD_WIDTH.saturating_sub(decimal_u64_len(prev)))?;
                 }
                 continue;
             }
@@ -655,7 +689,7 @@ pub(crate) mod xref_stream {
                         String::from_utf8_lossy(key.strip_prefix(b"/").unwrap_or(&key))
                     ))
                 })?;
-                out.write_bytes(mapped.to_string().as_bytes())?;
+                write_object_ref(out, mapped)?;
             } else {
                 value.write_object_with_ref_map_and_removed(out, map, removed_refs)?;
             }
@@ -757,7 +791,7 @@ pub(crate) mod xref_stream {
             } else {
                 out.write_bytes(b" /Encrypt ")?;
             }
-            out.write_bytes(format!("{} {} R", encrypt.number, encrypt.generation).as_bytes())?;
+            write_object_ref(out, encrypt)?;
         }
         if qdf {
             out.write_bytes(b"\n>>")?;

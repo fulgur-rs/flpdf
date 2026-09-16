@@ -13,6 +13,7 @@ use std::num::NonZeroUsize;
 #[cfg(test)]
 use std::cell::Cell;
 
+use crate::object_handle::LiveDictionaryKeyBuffer;
 use crate::ObjectHandle;
 use crate::ObjectRef;
 
@@ -128,12 +129,58 @@ pub(crate) struct CompressiblePlan {
     pub indirect_objstm_length_refs: BTreeSet<ObjectRef>,
 }
 
+const DENSE_VISITED_OBJECT_LIMIT: usize = 16 * 1024 * 1024;
+
+// qpdf-deviation: use sparse visited storage above a bounded dense allocation to avoid OOM on sparse high object numbers.
+enum VisitedObjects {
+    Dense(Vec<bool>),
+    Sparse(BTreeSet<u32>),
+}
+
+impl VisitedObjects {
+    fn new(max_object: u32) -> Self {
+        match usize::try_from(max_object) {
+            Ok(count) if count <= DENSE_VISITED_OBJECT_LIMIT => Self::Dense(vec![false; count]),
+            _ => Self::Sparse(BTreeSet::new()),
+        }
+    }
+
+    fn dense_index(object_number: u32) -> crate::Result<usize> {
+        let zero_based = object_number.checked_sub(1).ok_or_else(|| {
+            crate::Error::Internal("object number zero cannot be marked visited".to_string())
+        })?;
+        // cov:ignore-start: the dense allocation bound is below usize::MAX on every supported target
+        usize::try_from(zero_based).map_err(|_| {
+            crate::Error::Unsupported("object number does not fit in usize".to_string())
+        })
+        // cov:ignore-end
+    }
+
+    fn contains(&self, object_number: u32) -> crate::Result<bool> {
+        match self {
+            Self::Dense(visited) => Ok(visited[Self::dense_index(object_number)?]),
+            Self::Sparse(visited) => Ok(visited.contains(&object_number)),
+        }
+    }
+
+    fn insert(&mut self, object_number: u32) -> crate::Result<()> {
+        match self {
+            Self::Dense(visited) => {
+                visited[Self::dense_index(object_number)?] = true;
+            }
+            Self::Sparse(visited) => {
+                visited.insert(object_number);
+            }
+        }
+        Ok(())
+    }
+}
+
 pub(crate) fn compressible_objgens_qpdf_plan<R: std::io::Read + std::io::Seek>(
     pdf: &mut crate::Pdf<R>,
 ) -> crate::Result<CompressiblePlan> {
     #[cfg(test)]
     COMPRESSIBLE_PLAN_CALLS.with(|calls| calls.set(calls.get() + 1));
-    let mut visited: BTreeSet<u32> = BTreeSet::new();
     let mut result: Vec<ObjectRef> = Vec::new();
     let mut removed_refs = BTreeSet::new();
     let mut indirect_objstm_length_refs = BTreeSet::new();
@@ -142,6 +189,7 @@ pub(crate) fn compressible_objgens_qpdf_plan<R: std::io::Read + std::io::Seek>(
     // This also makes cached dangling references visible to the dynamic
     // upper_bound check below.
     let max_object = pdf.get_object_count()?;
+    let mut visited = VisitedObjects::new(max_object);
     // The encryption dictionary is excluded from the result, matching qpdf's
     // `m->trailer.getKey("/Encrypt")` guard (QPDF.cc:2402/2437): it must stay
     // a plain indirect object so the rest of the file can be decrypted. Read it
@@ -168,7 +216,7 @@ pub(crate) fn compressible_objgens_qpdf_plan<R: std::io::Read + std::io::Seek>(
                 "unexpected object id encountered in getCompressibleObjGens".to_string(),
             ));
         }
-        if visited.contains(&object_ref.number) {
+        if visited.contains(object_ref.number)? {
             continue;
         }
         if pdf.has_newer_cached_generation(object_ref) {
@@ -176,7 +224,7 @@ pub(crate) fn compressible_objgens_qpdf_plan<R: std::io::Read + std::io::Seek>(
             removed_refs.insert(object_ref);
             continue;
         }
-        visited.insert(object_ref.number);
+        visited.insert(object_ref.number)?;
 
         object.try_dereference()?;
         let stream_dict = object.as_stream_dict();
@@ -267,10 +315,15 @@ fn push_handle_children(object: &ObjectHandle, stack: &mut Vec<ObjectHandle>) ->
     if object.try_is_dictionary_of_type(b"", b"")? {
         return push_handle_dict_children(object, stack, false);
     }
-    if let Some(items) = object.try_as_array()? {
-        for item in items.into_iter().rev() {
-            stack.push(item);
+    if object.try_is_array()? {
+        let items = object.try_array_items()?;
+        let mut cursor = items.begin();
+        let mut children = Vec::new();
+        while !cursor.is_end() {
+            children.push(cursor.current());
+            cursor.next();
         }
+        stack.extend(children.into_iter().rev());
     }
     Ok(())
 }
@@ -284,13 +337,27 @@ fn push_handle_dict_children(
     stack: &mut Vec<ObjectHandle>,
     is_stream: bool,
 ) -> crate::Result<()> {
-    let keys = dict.try_get_keys()?;
-    for key in keys.into_iter().rev() {
-        if is_stream && key.as_slice() == b"/Length" {
+    let mut current_key = LiveDictionaryKeyBuffer::default();
+    let mut next_key = LiveDictionaryKeyBuffer::default();
+    let mut first_entry = true;
+    let mut children = Vec::new();
+    while let Some(value) = dict.next_dictionary_entry_for_live_walk(
+        (!first_entry).then_some(current_key.as_slice()),
+        &mut next_key,
+    ) {
+        std::mem::swap(&mut current_key, &mut next_key);
+        // qpdf's getKeys resolves every value before its stream /Length
+        // omission check, so retain that order even for the omitted key.
+        if value.try_is_null()? {
+            first_entry = false;
             continue;
         }
-        stack.push(dict.try_get_key(&key)?);
+        if !(is_stream && current_key.as_slice() == b"/Length") {
+            children.push(value);
+        }
+        first_entry = false;
     }
+    stack.extend(children.into_iter().rev());
     Ok(())
 }
 
@@ -299,6 +366,91 @@ mod tests {
     use super::compressible_objgens_qpdf_plan;
     use crate::{ObjectRef, Pdf};
     use std::io::Cursor;
+
+    #[test]
+    fn eligibility_dictionary_walk_uses_the_live_cursor() {
+        let source = include_str!("eligibility.rs");
+        let start = source
+            .find("fn push_handle_dict_children")
+            .expect("eligibility dictionary walk");
+        let body = &source[start
+            ..source[start..]
+                .find("\n#[cfg(test)]")
+                .expect("eligibility dictionary walk end")
+                + start];
+
+        assert!(
+            body.contains("next_dictionary_entry_for_live_walk"),
+            "eligibility must walk dictionary values through the live cursor"
+        );
+        assert!(
+            !body.contains("try_get_keys") && !body.contains("try_get_key"),
+            "eligibility must not build a key set and repeat dictionary lookup"
+        );
+    }
+
+    #[test]
+    fn eligibility_uses_qpdfs_dense_visited_bitmap() {
+        let source = include_str!("eligibility.rs");
+        let start = source
+            .find("pub(crate) fn compressible_objgens_qpdf_plan")
+            .expect("eligibility planner");
+        let body = &source[start
+            ..source[start..]
+                .find("\n/// Distribute `eligible`")
+                .expect("eligibility planner end")
+                + start];
+
+        assert!(
+            body.contains("VisitedObjects::new")
+                && (source.contains("Vec<bool>") || source.contains("vec![false")),
+            "eligibility must index qpdf's dense visited bitmap"
+        );
+    }
+
+    #[test]
+    fn eligibility_switches_to_sparse_visited_storage_for_large_bounds() {
+        let source = include_str!("eligibility.rs");
+
+        assert!(
+            source.contains("DENSE_VISITED_OBJECT_LIMIT"),
+            "large object bounds must not force an unbounded dense allocation"
+        );
+        assert!(
+            source.contains("VisitedObjects::Sparse") || source.contains("VisitedStorage::Sparse"),
+            "large object bounds must use sparse visited storage"
+        );
+        assert!(
+            source.contains("BTreeSet<u32>"),
+            "sparse visited storage must be keyed by present object numbers"
+        );
+    }
+
+    #[test]
+    fn large_object_bounds_select_sparse_visited_storage() {
+        let visited = super::VisitedObjects::new(
+            (super::DENSE_VISITED_OBJECT_LIMIT as u32).saturating_add(1),
+        );
+
+        assert!(matches!(visited, super::VisitedObjects::Sparse(_)));
+    }
+
+    #[test]
+    fn visited_storage_checks_and_marks_dense_and_sparse_numbers() {
+        let mut dense = super::VisitedObjects::new(2);
+        assert!(!dense.contains(1).expect("dense contains"));
+        dense.insert(1).expect("dense insert");
+        assert!(dense.contains(1).expect("dense contains after insert"));
+
+        let mut sparse = super::VisitedObjects::new(
+            (super::DENSE_VISITED_OBJECT_LIMIT as u32).saturating_add(1),
+        );
+        assert!(!sparse.contains(42).expect("sparse contains"));
+        sparse.insert(42).expect("sparse insert");
+        assert!(sparse.contains(42).expect("sparse contains after insert"));
+
+        assert!(super::VisitedObjects::dense_index(0).is_err());
+    }
 
     fn reachable_objstm_with_indirect_length() -> Vec<u8> {
         let mut pdf = b"%PDF-1.5\n".to_vec();

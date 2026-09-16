@@ -163,17 +163,10 @@ impl<'a> PngFilter<'a> {
         } else {
             (&self.buf2, &self.buf1)
         };
-        let next = &mut self.next;
-
-        next.write(&[2])?;
-        if has_prev {
-            for index in 0..bytes_per_row {
-                next.write(&[current[index].wrapping_sub(previous[index])])?;
-            }
-        } else {
-            next.write(&current[..bytes_per_row])?;
-        }
-        Ok(())
+        self.next.write_up_predictor_row(
+            &current[..bytes_per_row],
+            has_prev.then_some(&previous[..bytes_per_row]),
+        )
     }
 
     fn copy_into_current(&mut self, data: &[u8]) {

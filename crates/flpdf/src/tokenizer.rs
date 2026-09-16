@@ -179,6 +179,36 @@ pub(crate) struct PushedInteger {
     pub(crate) unread: Option<u8>,
 }
 
+/// qpdf's live parser does not need owned bytes for short structural and
+/// boolean/null tokens. Keep their token type (and boolean value) while the
+/// tokenizer reuses its internal buffers for the next token.
+pub(crate) enum PushedSimpleToken {
+    Bool {
+        value: bool,
+        raw_len: usize,
+        unread: Option<u8>,
+    },
+    Simple {
+        token_type: TokenType,
+        raw_len: usize,
+        unread: Option<u8>,
+    },
+}
+
+pub(crate) enum PushedLiveToken {
+    Integer(PushedInteger),
+    Simple(PushedSimpleToken),
+    Owned(PushedLiveOwnedToken),
+}
+
+pub(crate) struct PushedLiveOwnedToken {
+    pub(crate) token_type: TokenType,
+    pub(crate) value: Vec<u8>,
+    pub(crate) error_message: Option<Vec<u8>>,
+    pub(crate) raw_len: usize,
+    pub(crate) unread: Option<u8>,
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum State {
     InHexString,
@@ -343,13 +373,14 @@ impl<'a> Tokenizer<'a> {
         Some(PushedToken { token, unread })
     }
 
-    /// Consume a ready integer without moving its tokenizer-owned byte
-    /// buffers into an owned [`Token`]. qpdf's `QPDFParser::parseRemainder`
-    /// keeps the two integer candidates as numeric values and offsets while
-    /// `QPDFTokenizer::nextToken` reuses `raw_val` on the next token
-    /// (`QPDFParser.cc:140-175`, `QPDFTokenizer.cc:921-925`).
-    pub(crate) fn get_integer(&mut self) -> Option<PushedInteger> {
-        if self.state != State::TokenReady || self.token_type != TokenType::Integer {
+    /// Consume a live integer or a short token without moving its
+    /// tokenizer-owned byte buffers into an owned [`Token`]. qpdf's
+    /// `QPDFParser::parseRemainder` keeps the two integer candidates as
+    /// numeric values and offsets while `QPDFTokenizer::nextToken` reuses
+    /// `raw_val` on the next token (`QPDFParser.cc:140-175`,
+    /// `QPDFTokenizer.cc:921-925`).
+    pub(crate) fn get_live_token(&mut self) -> Option<PushedLiveToken> {
+        if self.state != State::TokenReady {
             return None;
         }
 
@@ -359,13 +390,53 @@ impl<'a> Tokenizer<'a> {
         } else {
             None
         };
-        let value = parse_integer_bytes(&self.raw, self.token_start);
+        let token_type = self.token_type;
+        let compact = match token_type {
+            TokenType::Integer => PushedLiveToken::Integer(PushedInteger {
+                value: parse_integer_bytes(&self.raw, self.token_start),
+                raw_len,
+                unread,
+            }),
+            TokenType::Bool => PushedLiveToken::Simple(PushedSimpleToken::Bool {
+                value: self.raw == b"true",
+                raw_len,
+                unread,
+            }),
+            TokenType::ArrayClose
+            | TokenType::ArrayOpen
+            | TokenType::BraceClose
+            | TokenType::BraceOpen
+            | TokenType::DictClose
+            | TokenType::DictOpen
+            | TokenType::Eof
+            | TokenType::Null => PushedLiveToken::Simple(PushedSimpleToken::Simple {
+                token_type,
+                raw_len,
+                unread,
+            }),
+            TokenType::Bad
+            | TokenType::Name
+            | TokenType::Real
+            | TokenType::String
+            | TokenType::Word => {
+                let value = match token_type {
+                    TokenType::Name | TokenType::String => std::mem::take(&mut self.value),
+                    TokenType::Real | TokenType::Word => std::mem::take(&mut self.raw),
+                    TokenType::Bad => Vec::new(),
+                    _ => unreachable!("checked"), // cov:ignore: outer token match proves this variant
+                };
+                PushedLiveToken::Owned(PushedLiveOwnedToken {
+                    token_type,
+                    value,
+                    error_message: self.error_message.take(),
+                    raw_len,
+                    unread,
+                })
+            }
+            TokenType::Space | TokenType::Comment | TokenType::InlineImage => return None, // cov:ignore: excluded by live tokenizer mode
+        };
         self.reset();
-        Some(PushedInteger {
-            value,
-            raw_len,
-            unread,
-        })
+        Some(compact)
     }
 
     fn reset(&mut self) {

@@ -9,8 +9,10 @@
 //! and emission-time string policy.  Keeping this boundary in `writer/`
 //! prevents the object model from growing a second writer responsibility.
 
-use super::output::OutputSink;
-use crate::object_handle::{ObjectHandle, ObjectValue};
+use super::output::{
+    decimal_u64_len, write_decimal_i64, write_decimal_u64, write_object_ref, OutputSink,
+};
+use crate::object_handle::{LiveDictionaryKeyBuffer, ObjectHandle, ObjectValue};
 use crate::qpdf_obj_gen::QpdfObjGen;
 use crate::{Error, ObjectRef, Result};
 use std::collections::BTreeSet;
@@ -815,6 +817,13 @@ fn write_dictionary_key(out: &mut OutputSink<'_>, key: &[u8]) -> Result<()> {
         crate::pdf_syntax::write_name_escaped(out, key)?;
     }
     Ok(())
+}
+
+fn write_qpdf_object_gen(out: &mut OutputSink<'_>, object_gen: QpdfObjGen) -> Result<()> {
+    write_decimal_i64(out, i64::from(object_gen.get_obj()))?;
+    out.write_bytes(b" ")?;
+    write_decimal_i64(out, i64::from(object_gen.get_gen()))?;
+    out.write_bytes(b" R")
 }
 
 impl ObjectWriterEmission for ObjectHandle {
@@ -2315,7 +2324,7 @@ fn unparse_stream_dict_entries_qdf_with_ref_map(
     if let Some(length_ref) = length_ref {
         push_spaces(out, indent + 2)?;
         out.write_bytes(b"/Length ")?;
-        out.write_bytes(length_ref.to_string().as_bytes())?;
+        write_object_ref(out, length_ref)?;
         out.write_bytes(b"\n")?;
     } else if let Some(length) = length_value {
         push_spaces(out, indent + 2)?;
@@ -2382,7 +2391,7 @@ where
     push_spaces(out, indent + 2)?;
     out.write_bytes(b"/Length ")?;
     if let Some(length_ref) = length_ref {
-        out.write_bytes(length_ref.to_string().as_bytes())?;
+        write_object_ref(out, length_ref)?;
     } else if let Some(length) = length_value {
         write_child_qdf_with_ref_map_and_string_writer(
             length,
@@ -2537,7 +2546,7 @@ fn unparse_stream_dict_entries_with_ref_map_and_length(
     }
     if let Some(length) = length_override {
         out.write_bytes(b" /Length ")?;
-        out.write_bytes(length.to_string().as_bytes())?;
+        write_decimal_u64(out, length as u64)?;
     } else if let Some(length) = length_value {
         out.write_bytes(b" /Length ")?;
         write_child_with_ref_map(length, out, map, removed_refs)?;
@@ -2627,10 +2636,38 @@ pub(crate) fn write_child(handle: &ObjectHandle, out: &mut OutputSink<'_>) -> Re
         .qpdf_obj_gen()
         .filter(|object_gen| object_gen.is_indirect())
     {
-        out.write_bytes(format!("{} {} R", object_gen.get_obj(), object_gen.get_gen()).as_bytes())?;
+        write_qpdf_object_gen(out, object_gen)?;
+        return Ok(());
+    }
+    if !handle.is_initialized() {
+        handle.try_dereference()?;
+    }
+    if write_direct_child(handle, out)? {
         return Ok(());
     }
     unparse_object_walk(handle, out)
+}
+
+/// Serialize a direct scalar child without entering the recursive container
+/// walker. Container values return `false` so the existing walker retains
+/// ownership of their descendant traversal.
+fn write_direct_child(handle: &ObjectHandle, out: &mut OutputSink<'_>) -> Result<bool> {
+    handle.with_value(|value| match value {
+        Some(ObjectValue::Array(_) | ObjectValue::Dictionary(_) | ObjectValue::Stream(_)) => {
+            Ok(false)
+        }
+        Some(value) => {
+            unparse_object_value(value, out)?;
+            Ok(true)
+        }
+        None => {
+            // cov:ignore-start: a successful dereference exposes a value; keep
+            // the same defensive null spelling as the recursive walker.
+            out.write_bytes(b"null")?;
+            Ok(true)
+            // cov:ignore-end
+        }
+    })
 }
 
 // Filters `entries` down to the ones `unparseObject`'s dictionary branch
@@ -2836,7 +2873,7 @@ pub(crate) fn unparse_object_value(value: &ObjectValue, out: &mut OutputSink<'_>
         ObjectValue::Reserved => return Err(reserved_unparse_error()),
         ObjectValue::Destroyed => return Err(destroyed_unparse_error()),
         ObjectValue::Boolean(v) => out.write_bytes(if *v { b"true" } else { b"false" })?,
-        ObjectValue::Integer(v) => out.write_bytes(v.to_string().as_bytes())?,
+        ObjectValue::Integer(v) => write_decimal_i64(out, *v)?,
         ObjectValue::Real(v) => out.write_bytes(v.to_string().as_bytes())?,
         ObjectValue::RealLiteral { value, literal } => {
             if crate::pdf_syntax::real_literal_is_safe(literal, *value) {
@@ -2957,10 +2994,40 @@ fn write_child_with_ref_map(
             return Ok(());
         }
         let mapped = map(object_gen)?;
-        out.write_bytes(mapped.to_string().as_bytes())?;
+        write_object_ref(out, mapped)?;
+        return Ok(());
+    }
+    if !handle.is_initialized() {
+        handle.try_dereference()?;
+    }
+    if write_direct_child_with_ref_map(handle, out, map, removed_refs)? {
         return Ok(());
     }
     unparse_object_walk_with_ref_map(handle, out, map, removed_refs)
+}
+
+fn write_direct_child_with_ref_map(
+    handle: &ObjectHandle,
+    out: &mut OutputSink<'_>,
+    map: &QpdfObjGenMap<'_>,
+    removed_refs: &BTreeSet<QpdfObjGen>,
+) -> Result<bool> {
+    handle.with_value(|value| match value {
+        Some(ObjectValue::Array(_) | ObjectValue::Dictionary(_) | ObjectValue::Stream(_)) => {
+            Ok(false)
+        }
+        Some(value) => {
+            unparse_object_value_with_ref_map(value, out, map, removed_refs)?;
+            Ok(true)
+        }
+        None => {
+            // cov:ignore-start: a successful dereference exposes a value; keep
+            // the same defensive null spelling as the recursive walker.
+            out.write_bytes(b"null")?;
+            Ok(true)
+            // cov:ignore-end
+        }
+    })
 }
 
 fn unparse_object_walk_with_ref_map(
@@ -3275,20 +3342,26 @@ where
             out.write_bytes(b"null")?;
             return Ok(());
         }
-        out.write_bytes(map(handle)?.to_string().as_bytes())?;
+        write_object_ref(out, map(handle)?)?;
         return Ok(());
     }
-    handle.try_dereference()?;
-    if handle.as_stream_dict().is_some() {
-        let mut write_string_wrapper =
-            |out: &mut OutputSink<'_>, value: &[u8]| write_string(out, value);
-        return direct_stream_writer.write_direct_stream(
-            handle,
-            out,
-            map,
-            removed_refs,
-            &mut write_string_wrapper,
-        );
+    if !handle.is_initialized() {
+        handle.try_dereference()?;
+    }
+    match write_direct_child_with_dynamic_ref_map_and_string_writer(handle, out, write_string)? {
+        DynamicDirectChildKind::Scalar => return Ok(()),
+        DynamicDirectChildKind::Stream => {
+            let mut write_string_wrapper =
+                |out: &mut OutputSink<'_>, value: &[u8]| write_string(out, value);
+            return direct_stream_writer.write_direct_stream(
+                handle,
+                out,
+                map,
+                removed_refs,
+                &mut write_string_wrapper,
+            );
+        }
+        DynamicDirectChildKind::Container => {}
     }
     unparse_object_walk_with_dynamic_ref_map_and_string_writer(
         handle,
@@ -3298,6 +3371,43 @@ where
         write_string,
         direct_stream_writer,
     )
+}
+
+enum DynamicDirectChildKind {
+    Scalar,
+    Container,
+    Stream,
+}
+
+/// Serialize a direct scalar child without entering the recursive container
+/// walker. Arrays and dictionaries return `Container`, while streams return
+/// `Stream` so their existing direct-stream policy remains responsible for
+/// framing and child reference discovery.
+fn write_direct_child_with_dynamic_ref_map_and_string_writer<F>(
+    handle: &ObjectHandle,
+    out: &mut OutputSink<'_>,
+    write_string: &mut F,
+) -> Result<DynamicDirectChildKind>
+where
+    F: FnMut(&mut OutputSink<'_>, &[u8]) -> Result<()> + ?Sized,
+{
+    handle.with_value(|value| match value {
+        Some(ObjectValue::Array(_) | ObjectValue::Dictionary(_)) => {
+            Ok(DynamicDirectChildKind::Container)
+        }
+        Some(ObjectValue::Stream(_)) => Ok(DynamicDirectChildKind::Stream),
+        Some(value) => {
+            unparse_object_value_with_dynamic_ref_map_and_string_writer(value, out, write_string)?;
+            Ok(DynamicDirectChildKind::Scalar)
+        }
+        None => {
+            // cov:ignore-start: a successful dereference exposes a value; keep
+            // the same defensive null spelling as the recursive walker.
+            out.write_bytes(b"null")?;
+            Ok(DynamicDirectChildKind::Scalar)
+            // cov:ignore-end
+        }
+    })
 }
 
 fn unparse_object_walk_with_dynamic_ref_map_and_string_writer<F>(
@@ -3504,10 +3614,40 @@ fn write_child_with_dynamic_ref_map(
             return Ok(());
         }
         let mapped = map(handle)?;
-        out.write_bytes(mapped.to_string().as_bytes())?;
+        write_object_ref(out, mapped)?;
+        return Ok(());
+    }
+    if !handle.is_initialized() {
+        handle.try_dereference()?;
+    }
+    if write_direct_child_with_dynamic_ref_map(handle, out, map, removed_refs)? {
         return Ok(());
     }
     unparse_object_walk_with_dynamic_ref_map(handle, out, map, removed_refs)
+}
+
+fn write_direct_child_with_dynamic_ref_map(
+    handle: &ObjectHandle,
+    out: &mut OutputSink<'_>,
+    map: &mut DynamicObjectRefMap<'_>,
+    removed_refs: &BTreeSet<ObjectRef>,
+) -> Result<bool> {
+    handle.with_value(|value| match value {
+        Some(ObjectValue::Array(_) | ObjectValue::Dictionary(_) | ObjectValue::Stream(_)) => {
+            Ok(false)
+        }
+        Some(value) => {
+            unparse_object_value_with_dynamic_ref_map(value, out, map, removed_refs)?;
+            Ok(true)
+        }
+        None => {
+            // cov:ignore-start: a successful dereference exposes a value; keep
+            // the same defensive null spelling as the recursive walker.
+            out.write_bytes(b"null")?;
+            Ok(true)
+            // cov:ignore-end
+        }
+    })
 }
 
 fn unparse_object_walk_with_dynamic_ref_map(
@@ -3803,9 +3943,15 @@ fn unparse_dict_entries(
 // boundary (that one is not `pub(crate)`, and this task's scope is
 // `object_handle.rs` only), but the two are one-line bodies, not logic worth
 // sharing at the cost of widening `object.rs`'s API for a single call site.
-fn push_spaces(out: &mut OutputSink<'_>, n: usize) -> Result<()> {
-    for _ in 0..n {
-        out.write_bytes(b" ")?;
+const SPACE_BLOCK: [u8; 64] = [b' '; 64];
+
+fn push_spaces(out: &mut OutputSink<'_>, mut n: usize) -> Result<()> {
+    while n >= SPACE_BLOCK.len() {
+        out.write_bytes(&SPACE_BLOCK)?;
+        n -= SPACE_BLOCK.len();
+    }
+    if n > 0 {
+        out.write_bytes(&SPACE_BLOCK[..n])?;
     }
     Ok(())
 }
@@ -3833,7 +3979,7 @@ fn write_child_qdf(handle: &ObjectHandle, indent: usize, out: &mut OutputSink<'_
         .qpdf_obj_gen()
         .filter(|object_gen| object_gen.is_indirect())
     {
-        out.write_bytes(format!("{} {} R", object_gen.get_obj(), object_gen.get_gen()).as_bytes())?;
+        write_qpdf_object_gen(out, object_gen)?;
         return Ok(());
     }
     unparse_object_walk_qdf(handle, indent, out)
@@ -4037,7 +4183,7 @@ fn write_child_qdf_with_ref_map(
         if !object_gen.is_indirect() || removed_refs.contains(&object_gen) {
             out.write_bytes(b"null")?;
         } else {
-            out.write_bytes(map(object_gen)?.to_string().as_bytes())?;
+            write_object_ref(out, map(object_gen)?)?;
         }
         return Ok(());
     }
@@ -4056,58 +4202,267 @@ fn unparse_object_walk_qdf_with_ref_map(
             return Err(reserved_unparse_error());
         }
         handle.try_dereference()?;
-        let container = handle.with_value(|value| match value {
+        if handle.try_is_array()? {
+            return unparse_array_qdf_with_ref_map(handle, indent, out, map, removed_refs);
+        }
+        if handle.try_is_dictionary()? {
+            return unparse_dictionary_qdf_with_ref_map(handle, indent, out, map, removed_refs);
+        }
+        if let Some(stream_dict) = handle.as_stream_dict() {
+            return unparse_object_walk_qdf_with_ref_map(
+                &stream_dict,
+                indent,
+                out,
+                map,
+                removed_refs,
+            );
+        }
+        handle.with_value(|value| match value {
             Some(value) => {
-                if let Some(container) = snapshot_unparse_container(value) {
-                    Ok(Some(container))
-                } else {
-                    unparse_object_value_qdf_with_ref_map(value, indent, out, map, removed_refs)
-                        .map(|()| None)
-                }
+                unparse_object_value_qdf_with_ref_map(value, indent, out, map, removed_refs)
             }
             None => {
                 // cov:ignore-start: after try_dereference, a live non-reserved handle cannot expose None
-                out.write_bytes(b"null")?;
-                Ok(None)
+                out.write_bytes(b"null")
                 // cov:ignore-end
             }
-        })?;
-        match container {
-            Some(container) => {
-                unparse_container_qdf_with_ref_map(container, indent, out, map, removed_refs)
-            }
-            None => Ok(()),
-        }
+        })
     })
 }
 
-fn unparse_container_qdf_with_ref_map(
-    container: UnparseContainer,
+fn unparse_array_qdf_with_ref_map(
+    handle: &ObjectHandle,
     indent: usize,
     out: &mut OutputSink<'_>,
     map: &QpdfObjGenMap<'_>,
     removed_refs: &BTreeSet<QpdfObjGen>,
 ) -> Result<()> {
-    match container {
-        UnparseContainer::Array(children) => {
-            out.write_bytes(b"[")?;
-            out.write_bytes(b"\n")?;
-            for child in children {
-                push_spaces(out, indent + 2)?;
-                write_child_qdf_with_ref_map(&child, indent + 2, out, map, removed_refs)?;
-                out.write_bytes(b"\n")?;
-            }
-            push_spaces(out, indent)?;
-            out.write_bytes(b"]")?;
-        }
-        UnparseContainer::Dictionary(entries) => {
-            unparse_dict_entries_qdf_with_ref_map(&entries, indent, out, map, removed_refs)?;
-        }
-        UnparseContainer::Stream(stream_dict) => {
-            unparse_object_walk_qdf_with_ref_map(&stream_dict, indent, out, map, removed_refs)?;
-        }
+    out.write_bytes(b"[")?;
+    out.write_bytes(b"\n")?;
+    let items = handle.try_array_items()?;
+    let mut cursor = items.begin();
+    while !cursor.is_end() {
+        push_spaces(out, indent + 2)?;
+        let child = cursor.current();
+        write_child_qdf_with_ref_map(&child, indent + 2, out, map, removed_refs)?;
+        out.write_bytes(b"\n")?;
+        cursor.next();
     }
-    Ok(())
+    push_spaces(out, indent)?;
+    out.write_bytes(b"]")
+}
+
+fn unparse_dictionary_qdf_with_ref_map(
+    handle: &ObjectHandle,
+    indent: usize,
+    out: &mut OutputSink<'_>,
+    map: &QpdfObjGenMap<'_>,
+    removed_refs: &BTreeSet<QpdfObjGen>,
+) -> Result<()> {
+    out.write_bytes(b"<<\n")?;
+    let mut current_key = LiveDictionaryKeyBuffer::default();
+    let mut next_key = LiveDictionaryKeyBuffer::default();
+    let mut first_entry = true;
+    while let Some(value) = handle.next_dictionary_entry_for_live_walk(
+        (!first_entry).then_some(current_key.as_slice()),
+        &mut next_key,
+    ) {
+        std::mem::swap(&mut current_key, &mut next_key);
+        if value
+            .qpdf_obj_gen()
+            .is_some_and(|object_gen| removed_refs.contains(&object_gen))
+            || value.try_is_null()?
+        {
+            first_entry = false;
+            continue;
+        }
+        push_spaces(out, indent + 2)?;
+        write_dictionary_key(out, current_key.as_slice())?;
+        out.write_bytes(b" ")?;
+        let force_hex_string =
+            current_key.as_slice() == b"/Contents" && dict_is_sig_with_byte_range_handle(handle)?;
+        if !try_write_sig_contents_hex_string(&value, force_hex_string, out)? {
+            write_child_qdf_with_ref_map(&value, indent + 2, out, map, removed_refs)?;
+        }
+        out.write_bytes(b"\n")?;
+        first_entry = false;
+    }
+    push_spaces(out, indent)?;
+    out.write_bytes(b">>")
+}
+
+/// Emit a QDF object while assigning indirect child references through the
+/// writer's live queue at the same `unparseChild` boundary qpdf uses. This is
+/// the QDF counterpart of the dynamic compact writer above: it keeps container
+/// edges live, preserves dictionary null suppression, and avoids a detached
+/// edge snapshot or a separate pre-walk of the member value.
+pub(crate) fn write_object_qdf_with_dynamic_ref_map(
+    handle: &ObjectHandle,
+    indent: usize,
+    out: &mut OutputSink<'_>,
+    map: &mut DynamicObjectRefMap<'_>,
+    removed_refs: &BTreeSet<QpdfObjGen>,
+) -> Result<()> {
+    unparse_object_walk_qdf_with_dynamic_ref_map(handle, indent, out, map, removed_refs)
+}
+
+enum QdfDynamicContainer {
+    Array,
+    Dictionary,
+    Stream(ObjectHandle),
+    Written,
+}
+
+fn unparse_object_walk_qdf_with_dynamic_ref_map(
+    handle: &ObjectHandle,
+    indent: usize,
+    out: &mut OutputSink<'_>,
+    map: &mut DynamicObjectRefMap<'_>,
+    removed_refs: &BTreeSet<QpdfObjGen>,
+) -> Result<()> {
+    stacker::maybe_grow(UNPARSE_STACK_RED_ZONE, UNPARSE_STACK_GROWTH_SIZE, || {
+        handle.try_dereference()?;
+        let container = handle.with_value(|value| -> Result<QdfDynamicContainer> {
+            match value {
+                Some(ObjectValue::Array(_)) => Ok(QdfDynamicContainer::Array),
+                Some(ObjectValue::Dictionary(_)) => Ok(QdfDynamicContainer::Dictionary),
+                Some(ObjectValue::Stream(stream)) => {
+                    Ok(QdfDynamicContainer::Stream(stream.stream_dict.clone()))
+                }
+                Some(value) => {
+                    unparse_object_value_qdf(value, indent, out)?;
+                    Ok(QdfDynamicContainer::Written)
+                }
+                None => {
+                    // cov:ignore-start: a successful dereference always
+                    // exposes a value; retain the conservative null fallback
+                    // for a resolver that violates that invariant.
+                    out.write_bytes(b"null")?;
+                    // cov:ignore-end
+                    Ok(QdfDynamicContainer::Written) // cov:ignore: with_value always exposes the resolved value as Some after the dereference boundary
+                }
+            }
+        })?;
+        match container {
+            QdfDynamicContainer::Array => {
+                out.write_bytes(b"[\n")?;
+                let items = handle.try_array_items()?;
+                let mut cursor = items.begin();
+                while !cursor.is_end() {
+                    push_spaces(out, indent + 2)?;
+                    let child = cursor.current();
+                    write_child_qdf_with_dynamic_ref_map(
+                        &child,
+                        indent + 2,
+                        out,
+                        map,
+                        removed_refs,
+                    )?; // cov:ignore: LLVM attributes the successful QDF array-child continuation to the loop merge
+                    out.write_bytes(b"\n")?;
+                    cursor.next();
+                }
+                push_spaces(out, indent)?;
+                out.write_bytes(b"]")?;
+            }
+            QdfDynamicContainer::Dictionary => {
+                out.write_bytes(b"<<\n")?;
+                let mut current_key = LiveDictionaryKeyBuffer::default();
+                let mut next_key = LiveDictionaryKeyBuffer::default();
+                let mut first_entry = true;
+                while let Some(value) = handle.next_dictionary_entry_for_live_walk(
+                    (!first_entry).then_some(current_key.as_slice()),
+                    &mut next_key,
+                ) {
+                    std::mem::swap(&mut current_key, &mut next_key);
+                    if value
+                        .qpdf_obj_gen()
+                        .is_some_and(|object_gen| removed_refs.contains(&object_gen))
+                        || value.try_is_null()?
+                    {
+                        first_entry = false;
+                        continue;
+                    }
+                    push_spaces(out, indent + 2)?;
+                    write_dictionary_key(out, current_key.as_slice())?;
+                    out.write_bytes(b" ")?;
+                    let force_hex_string = current_key.as_slice() == b"/Contents"
+                        && dict_is_sig_with_byte_range_handle(handle)?;
+                    if !try_write_sig_contents_hex_string(&value, force_hex_string, out)? {
+                        write_child_qdf_with_dynamic_ref_map(
+                            &value,
+                            indent + 2,
+                            out,
+                            map,
+                            removed_refs,
+                        )?; // cov:ignore: LLVM attributes the successful QDF dictionary-child continuation to the loop merge
+                    }
+                    out.write_bytes(b"\n")?;
+                    first_entry = false;
+                }
+                push_spaces(out, indent)?;
+                out.write_bytes(b">>")?;
+            }
+            QdfDynamicContainer::Stream(stream_dict) => {
+                unparse_object_walk_qdf_with_dynamic_ref_map(
+                    &stream_dict,
+                    indent,
+                    out,
+                    map,
+                    removed_refs,
+                )?; // cov:ignore: LLVM attributes the successful QDF stream-dictionary continuation to the loop merge
+            }
+            QdfDynamicContainer::Written => {}
+        }
+        Ok(())
+    })
+}
+
+fn write_child_qdf_with_dynamic_ref_map(
+    handle: &ObjectHandle,
+    indent: usize,
+    out: &mut OutputSink<'_>,
+    map: &mut DynamicObjectRefMap<'_>,
+    removed_refs: &BTreeSet<QpdfObjGen>,
+) -> Result<()> {
+    if let Some(object_gen) = handle.qpdf_obj_gen() {
+        if !object_gen.is_indirect() || removed_refs.contains(&object_gen) {
+            out.write_bytes(b"null")?;
+        } else {
+            write_object_ref(out, map(handle)?)?;
+        }
+        return Ok(());
+    }
+    let direct_value = handle.with_value(|value| -> Result<Option<QdfDynamicContainer>> {
+        match value {
+            Some(ObjectValue::Array(_))
+            | Some(ObjectValue::Dictionary(_))
+            | Some(ObjectValue::Stream(_)) => Ok(None),
+            Some(value) => {
+                unparse_object_value_qdf(value, indent, out)?;
+                Ok(Some(QdfDynamicContainer::Written))
+            }
+            None => {
+                // cov:ignore-start: direct handles always carry a value;
+                // retain the conservative null fallback for a malformed slot.
+                out.write_bytes(b"null")?;
+                // cov:ignore-end
+                Ok(Some(QdfDynamicContainer::Written)) // cov:ignore: with_value always exposes the direct value as Some
+            }
+        }
+    })?;
+    if direct_value.is_some() {
+        return Ok(());
+    }
+    unparse_object_walk_qdf_with_dynamic_ref_map(handle, indent, out, map, removed_refs)
+}
+
+fn dict_is_sig_with_byte_range_handle(handle: &ObjectHandle) -> Result<bool> {
+    let type_value = handle.try_get_key(b"/Type")?;
+    if !type_value.try_is_name_and_equals(b"Sig")? {
+        return Ok(false);
+    }
+    let byte_range = handle.try_get_key(b"/ByteRange")?;
+    Ok(!byte_range.try_is_null()?)
 }
 
 fn unparse_object_value_qdf_with_ref_map(
@@ -4125,36 +4480,6 @@ fn unparse_object_value_qdf_with_ref_map(
     unparse_object_value(value, out)
 }
 
-fn unparse_dict_entries_qdf_with_ref_map(
-    entries: &[(Vec<u8>, ObjectHandle)],
-    indent: usize,
-    out: &mut OutputSink<'_>,
-    map: &QpdfObjGenMap<'_>,
-    removed_refs: &BTreeSet<QpdfObjGen>,
-) -> Result<()> {
-    out.write_bytes(b"<<\n")?;
-    for (key, value) in visible_dict_entries(entries)? {
-        if value
-            .qpdf_obj_gen()
-            .is_some_and(|object_gen| removed_refs.contains(&object_gen))
-        {
-            continue;
-        }
-        push_spaces(out, indent + 2)?;
-        write_dictionary_key(out, key)?;
-        out.write_bytes(b" ")?;
-        let force_hex_string =
-            key.as_slice() == b"/Contents" && dict_is_sig_with_byte_range(entries)?;
-        if !try_write_sig_contents_hex_string(value, force_hex_string, out)? {
-            write_child_qdf_with_ref_map(value, indent + 2, out, map, removed_refs)?;
-        }
-        out.write_bytes(b"\n")?;
-    }
-    push_spaces(out, indent)?;
-    out.write_bytes(b">>")?;
-    Ok(())
-}
-
 fn write_child_with_ref_map_and_string_writer<F>(
     handle: &ObjectHandle,
     out: &mut OutputSink<'_>,
@@ -4169,7 +4494,7 @@ where
         if !object_gen.is_indirect() || removed_refs.contains(&object_gen) {
             out.write_bytes(b"null")?;
         } else {
-            out.write_bytes(map(object_gen)?.to_string().as_bytes())?;
+            write_object_ref(out, map(object_gen)?)?;
         }
         return Ok(());
     }
@@ -4338,7 +4663,7 @@ where
         if !object_gen.is_indirect() || removed_refs.contains(&object_gen) {
             out.write_bytes(b"null")?;
         } else {
-            out.write_bytes(map(object_gen)?.to_string().as_bytes())?;
+            write_object_ref(out, map(object_gen)?)?;
         }
         return Ok(());
     }
@@ -4532,7 +4857,7 @@ where
     F: FnMut(&mut OutputSink<'_>, &[u8]) -> Result<()>,
 {
     if let Some(object_ref) = handle.object_ref() {
-        out.write_bytes(object_ref.to_string().as_bytes())?;
+        write_object_ref(out, object_ref)?;
         return Ok(());
     }
     unparse_object_walk_with_string_writer(handle, out, write_string)
@@ -4679,7 +5004,7 @@ where
     F: FnMut(&mut OutputSink<'_>, &[u8]) -> Result<()>,
 {
     if let Some(object_ref) = handle.object_ref() {
-        out.write_bytes(object_ref.to_string().as_bytes())?;
+        write_object_ref(out, object_ref)?;
         return Ok(());
     }
     unparse_object_walk_qdf_with_string_writer(handle, indent, out, write_string)
@@ -5029,12 +5354,11 @@ fn unparse_trailer_entries_with_ref_map_and_kind(
             }
             write_dictionary_key(out, key)?;
             out.write_bytes(b" ")?;
-            out.write_bytes(size.to_string().as_bytes())?;
+            write_decimal_i64(out, size)?;
             if let Some(prev) = prev {
                 out.write_bytes(b" /Prev ")?;
-                let prev_text = prev.to_string();
-                out.write_bytes(prev_text.as_bytes())?;
-                let padding = 21usize.saturating_sub(prev_text.len());
+                write_decimal_u64(out, prev)?;
+                let padding = 21usize.saturating_sub(decimal_u64_len(prev));
                 push_spaces(out, padding)?;
             }
             if qdf {
@@ -5260,6 +5584,182 @@ mod tests {
     use super::*;
     use crate::Pdf;
     use std::rc::Rc;
+
+    #[test]
+    fn scalar_writer_uses_stack_decimal_emission() {
+        let source = include_str!("object.rs").replace("\r\n", "\n");
+        let start = source
+            .find("pub(crate) fn unparse_object_value")
+            .expect("scalar writer");
+        let body = &source[start
+            ..source[start..]
+                .find("\n\ntype QpdfObjGenMap")
+                .expect("scalar writer end")
+                + start];
+
+        assert!(
+            body.contains("ObjectValue::Integer(v) => write_decimal_i64"),
+            "writer scalar integers must use the stack decimal helper"
+        );
+        assert!(
+            !body.contains("ObjectValue::Integer(v) => out.write_bytes(v.to_string().as_bytes())"),
+            "writer scalar integers must not allocate a temporary String"
+        );
+    }
+
+    #[test]
+    fn qdf_mapped_serializer_does_not_snapshot_container_edges() {
+        let source = include_str!("object.rs");
+        let start = source
+            .find("fn unparse_object_walk_qdf_with_ref_map")
+            .expect("qdf mapped serializer");
+        let body = &source[start
+            ..source[start..]
+                .find("\nfn unparse_array_qdf_with_ref_map")
+                .expect("qdf mapped serializer end")
+                + start];
+
+        assert!(
+            body.contains("unparse_array_qdf_with_ref_map"),
+            "qdf mapped serializer must walk live arrays"
+        );
+        assert!(
+            body.contains("unparse_dictionary_qdf_with_ref_map"),
+            "qdf mapped serializer must walk live dictionaries"
+        );
+        assert!(
+            !body.contains("snapshot_unparse_container"),
+            "qdf mapped serializer must not clone a second container snapshot"
+        );
+    }
+
+    #[test]
+    fn qdf_indentation_batches_space_runs() {
+        let source = include_str!("object.rs").replace("\r\n", "\n");
+        let start = source
+            .find("fn push_spaces")
+            .expect("qdf indentation helper");
+        let body = &source[start
+            ..source[start..]
+                .find("\n\n// QDF-mode sibling")
+                .expect("qdf indentation helper end")
+                + start];
+
+        assert!(
+            body.contains("SPACE_BLOCK") || body.contains("SPACES"),
+            "qdf indentation must write static space blocks"
+        );
+        assert!(
+            !body.contains("for _ in 0..n"),
+            "qdf indentation must not issue one output call per space"
+        );
+    }
+
+    #[test]
+    fn qdf_indentation_writes_large_space_runs_in_blocks() -> Result<()> {
+        let mut output = Vec::new();
+        super::super::output::with_buffer_sink(&mut output, |out| push_spaces(out, 128))?;
+        assert_eq!(output, vec![b' '; 128]);
+        Ok(())
+    }
+
+    #[test]
+    fn child_walkers_reject_uninitialized_handles_at_their_boundaries() {
+        let handle = ObjectHandle::uninitialized();
+        let map = |_: QpdfObjGen| Ok::<ObjectRef, Error>(ObjectRef::new(1, 0));
+        let removed = BTreeSet::new();
+
+        let mut ordinary = Vec::new();
+        assert!(
+            super::super::output::with_buffer_sink(&mut ordinary, |out| {
+                write_child(&handle, out)
+            })
+            .is_err()
+        );
+
+        let mut mapped = Vec::new();
+        assert!(super::super::output::with_buffer_sink(&mut mapped, |out| {
+            write_child_with_ref_map(&handle, out, &map, &removed)
+        })
+        .is_err());
+
+        let mut dynamic_map = |_: &ObjectHandle| Ok::<ObjectRef, Error>(ObjectRef::new(1, 0));
+        let mut dynamic = Vec::new();
+        assert!(super::super::output::with_buffer_sink(&mut dynamic, |out| {
+            write_child_with_dynamic_ref_map(&handle, out, &mut dynamic_map, &BTreeSet::new())
+        })
+        .is_err());
+
+        let mut string_map = |_: &ObjectHandle| Ok::<ObjectRef, Error>(ObjectRef::new(1, 0));
+        let mut strings = |out: &mut OutputSink<'_>, value: &[u8]| {
+            crate::pdf_syntax::write_string_value(out, value)
+        };
+        let mut direct_stream_writer = DefaultDynamicDirectStreamWriter {
+            newline_before_endstream: None,
+            qdf_mode: false,
+        };
+        let mut string_probe = Vec::new();
+        super::super::output::with_buffer_sink(&mut string_probe, |out| strings(out, b"probe"))
+            .expect("dynamic string callback should write direct strings");
+        assert_eq!(string_probe, b"(probe)");
+        let mut dynamic_strings = Vec::new();
+        assert!(
+            super::super::output::with_buffer_sink(&mut dynamic_strings, |out| {
+                write_child_with_dynamic_ref_map_and_string_writer(
+                    &handle,
+                    out,
+                    &mut string_map,
+                    &BTreeSet::new(),
+                    &mut strings,
+                    &mut direct_stream_writer,
+                )
+            })
+            .is_err()
+        );
+    }
+
+    #[test]
+    fn qdf_dynamic_writer_walks_direct_streams_and_skips_null_or_removed_children() -> Result<()> {
+        let removed = ObjectHandle::new_indirect_unresolved(ObjectRef::new(9, 0), -1);
+        let stream = ObjectHandle::stream(
+            ObjectHandle::dictionary(vec![
+                (b"/Null".to_vec(), ObjectHandle::null()),
+                (b"/Removed".to_vec(), removed.clone()),
+                (
+                    b"/Array".to_vec(),
+                    ObjectHandle::array(vec![removed.clone()]),
+                ),
+                (b"/Keep".to_vec(), ObjectHandle::integer(2)),
+            ]),
+            Rc::new(b"payload".to_vec()),
+        );
+        let removed_refs = BTreeSet::from([QpdfObjGen::new(9, 0)]);
+        let mut map = |_: &ObjectHandle| Ok::<ObjectRef, Error>(ObjectRef::new(9, 0));
+        let mut output = Vec::new();
+        super::super::output::with_buffer_sink(&mut output, |out| {
+            write_object_qdf_with_dynamic_ref_map(&stream, 0, out, &mut map, &removed_refs)
+        })?;
+        let text = String::from_utf8_lossy(&output);
+        assert!(text.contains("/Keep"));
+        assert!(text.contains("/Array"));
+        assert!(!text.contains("/Null"));
+        assert!(!text.contains("/Removed"));
+        assert!(text.contains("null"));
+
+        let mut scalar_output = Vec::new();
+        let mut scalar_map = |_: &ObjectHandle| Ok::<ObjectRef, Error>(ObjectRef::new(1, 0));
+        super::super::output::with_buffer_sink(&mut scalar_output, |out| {
+            write_object_qdf_with_dynamic_ref_map(
+                &ObjectHandle::integer(3),
+                0,
+                out,
+                &mut scalar_map,
+                &BTreeSet::new(),
+            )
+        })?;
+        assert_eq!(scalar_output, b"3");
+        Ok(())
+    }
 
     #[test]
     fn dictionary_key_writer_preserves_qpdfs_first_byte() {

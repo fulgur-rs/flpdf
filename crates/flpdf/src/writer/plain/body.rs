@@ -7,9 +7,10 @@ use std::collections::{BTreeMap, BTreeSet, VecDeque};
 use std::io::{Read, Seek};
 use std::rc::Rc;
 
+use crate::object_handle::LiveDictionaryKeyBuffer;
 use crate::qpdf_obj_gen::QpdfObjGen;
 use crate::writer::object_streams;
-use crate::writer::output::OutputSink;
+use crate::writer::output::{write_decimal_u64, write_object_ref, OutputSink};
 #[cfg(test)]
 use crate::writer::plain::plan::{
     PlainWritePlan, PlannedIndirectObject, PlannedObjectStreamOrigin,
@@ -264,6 +265,27 @@ pub(crate) struct LiveBodyOutput {
     pub(crate) object_count: usize,
 }
 
+fn collect_live_dictionary_children(
+    handle: &ObjectHandle,
+    found: &mut Vec<ObjectHandle>,
+    depth: usize,
+) -> crate::Result<()> {
+    let mut current_key = LiveDictionaryKeyBuffer::default();
+    let mut next_key = LiveDictionaryKeyBuffer::default();
+    let mut first_entry = true;
+    while let Some(value) = handle.next_dictionary_entry_for_live_walk(
+        (!first_entry).then_some(current_key.as_slice()),
+        &mut next_key,
+    ) {
+        std::mem::swap(&mut current_key, &mut next_key);
+        if !value.try_is_null()? {
+            collect_live_seed_handles(&value, found, depth + 1)?;
+        }
+        first_entry = false;
+    }
+    Ok(())
+}
+
 fn collect_live_seed_handles(
     handle: &ObjectHandle,
     found: &mut Vec<ObjectHandle>,
@@ -288,9 +310,13 @@ fn collect_live_seed_handles(
         )));
         // cov:ignore-end
     }
-    if let Some(items) = handle.try_as_array()? {
-        for item in items {
+    if handle.try_is_array()? {
+        let items = handle.try_array_items()?;
+        let mut cursor = items.begin();
+        while !cursor.is_end() {
+            let item = cursor.current();
             collect_live_seed_handles(&item, found, depth + 1)?;
+            cursor.next();
         }
     } else if let Some(stream_dict) = handle.as_stream_dict() {
         // A direct stream reaches the live queue through the indirect children
@@ -298,18 +324,10 @@ fn collect_live_seed_handles(
         // (`QPDFWriter.cc:1129-1147`). `try_as_dictionary` does not view a
         // stream as a dictionary, so descend the stream dictionary explicitly.
         // cov:ignore-start: defensive descent into a direct stream's dictionary -- parsed streams are indirect (taken by the base case above) and an in-memory stream surfaces its dictionary through the `try_as_dictionary` arm below, so this body is unreachable from the corpus.
-        for (_, value) in stream_dict.try_as_dictionary()?.unwrap_or_default() {
-            if !value.try_is_null()? {
-                collect_live_seed_handles(&value, found, depth + 1)?;
-            }
-        }
+        collect_live_dictionary_children(&stream_dict, found, depth)?;
         // cov:ignore-end
-    } else if let Some(entries) = handle.try_as_dictionary()? {
-        for (_, value) in entries {
-            if !value.try_is_null()? {
-                collect_live_seed_handles(&value, found, depth + 1)?;
-            }
-        }
+    } else if handle.try_is_dictionary()? {
+        collect_live_dictionary_children(handle, found, depth)?;
     }
     Ok(())
 }
@@ -330,22 +348,18 @@ fn collect_live_child_handles(
             crate::parser::MAX_PARSE_DEPTH
         )));
     }
-    if let Some(items) = handle.try_as_array()? {
-        for item in items {
+    if handle.try_is_array()? {
+        let items = handle.try_array_items()?;
+        let mut cursor = items.begin();
+        while !cursor.is_end() {
+            let item = cursor.current();
             collect_live_seed_handles(&item, found, depth + 1)?;
+            cursor.next();
         }
     } else if let Some(stream_dict) = handle.as_stream_dict() {
-        for (_, value) in stream_dict.try_as_dictionary()?.unwrap_or_default() {
-            if !value.try_is_null()? {
-                collect_live_seed_handles(&value, found, depth + 1)?; // cov:ignore: LLVM maps the covered direct stream-dictionary child traversal continuation to this line
-            } // cov:ignore: LLVM maps the covered direct stream-dictionary child branch exit to this line
-        } // cov:ignore: LLVM maps the covered direct stream-dictionary child loop exit to this line
-    } else if let Some(entries) = handle.try_as_dictionary()? {
-        for (_, value) in entries {
-            if !value.try_is_null()? {
-                collect_live_seed_handles(&value, found, depth + 1)?;
-            }
-        }
+        collect_live_dictionary_children(&stream_dict, found, depth)?; // cov:ignore: LLVM maps the covered direct stream-dictionary child traversal continuation to this line
+    } else if handle.try_is_dictionary()? {
+        collect_live_dictionary_children(handle, found, depth)?;
     }
     Ok(())
 }
@@ -1266,7 +1280,7 @@ impl<'pdf, 'output, 'sink, R: Read + Seek + 'static> LiveObjectEmitter<'pdf, 'ou
     #[allow(clippy::too_many_arguments)]
     fn emit_live_object_stream_member(
         &mut self,
-        out: &mut Vec<u8>,
+        out: &mut OutputSink<'_>,
         _member_index: u32,
         _member_ref: ObjectRef,
         source: &ObjectHandle,
@@ -1304,20 +1318,18 @@ impl<'pdf, 'output, 'sink, R: Read + Seek + 'static> LiveObjectEmitter<'pdf, 'ou
         } else {
             source.clone()
         };
-        let result = crate::writer::output::with_buffer_sink(out, |out| {
-            if handle.object_ref() == self.root_source {
-                handle.write_root_object_with_dynamic_ref_map(
-                    out,
-                    &mut map,
-                    &self.removed_refs,
-                    self.version,
-                    self.final_extension_level,
-                    true,
-                )
-            } else {
-                handle.write_object_with_dynamic_ref_map(out, &mut map, &self.removed_refs)
-            }
-        });
+        let result = if handle.object_ref() == self.root_source {
+            handle.write_root_object_with_dynamic_ref_map(
+                out,
+                &mut map,
+                &self.removed_refs,
+                self.version,
+                self.final_extension_level,
+                true,
+            )
+        } else {
+            handle.write_object_with_dynamic_ref_map(out, &mut map, &self.removed_refs)
+        };
         if report_after && result.is_ok() {
             // cov:ignore: this qpdf ObjStm consumer always uses the two-pass path, so report_after is never true.
             crate::writer::report_progress_event(self.options)?; // cov:ignore: this qpdf ObjStm consumer always uses the two-pass path, so report_after is never true.
@@ -1384,19 +1396,20 @@ impl<'pdf, 'output, 'sink, R: Read + Seek + 'static> LiveObjectEmitter<'pdf, 'ou
             // qpdf first measures every member body, then unparse-writes it
             // again. The first pass still walks live handles, so mutations
             // made by progress callbacks are visible to the final pass.
-            let mut first_pass = |out: &mut Vec<u8>,
+            let mut first_pass = |out: &mut OutputSink<'_>,
                                   index: u32,
                                   member: ObjectRef,
                                   handle: &ObjectHandle| {
                 self.emit_live_object_stream_member(out, index, member, handle, false, false, true)
             };
-            let _ = object_streams::emit_objstm_body_from_handles_with_writer(
+            let _ = object_streams::emit_objstm_body_from_handles_with_sink(
                 &handles,
                 &mut first_pass,
-            )?; // cov:ignore: the first ObjStm pass is exercised by the Generate mutation test; LLVM maps this terminator to the loop merge.
+                false,
+            )?; // cov:ignore: qpdf's first ObjStm pass is exercised by the Generate mutation route; llvm-cov attributes this continuation to the surrounding branch
         } // cov:ignore: the first-pass branch is covered by the second-pass mutation test.
         let mut final_pass =
-            |out: &mut Vec<u8>, index: u32, member: ObjectRef, handle: &ObjectHandle| {
+            |out: &mut OutputSink<'_>, index: u32, member: ObjectRef, handle: &ObjectHandle| {
                 self.emit_live_object_stream_member(
                     out,
                     index,
@@ -1407,8 +1420,11 @@ impl<'pdf, 'output, 'sink, R: Read + Seek + 'static> LiveObjectEmitter<'pdf, 'ou
                     false,
                 )
             };
-        let body =
-            object_streams::emit_objstm_body_from_handles_with_writer(&handles, &mut final_pass)?;
+        let body = object_streams::emit_objstm_body_from_handles_with_sink(
+            &handles,
+            &mut final_pass,
+            true,
+        )?; // cov:ignore: qpdf's final ObjStm pass is exercised by every retained ObjStm output; llvm-cov attributes this continuation to the surrounding branch
         let extends = {
             let source_handle = self.pdf.get_object_handle(container_source);
             source_handle.try_dereference()?;
@@ -1533,40 +1549,39 @@ impl<'pdf, 'output, 'sink, R: Read + Seek + 'static> LiveObjectEmitter<'pdf, 'ou
         let first_pass = Cell::new(true);
         let mut marker_starts = Vec::with_capacity(handles.len());
         let mut marker_lengths = Vec::with_capacity(handles.len());
-        let body_writer = &mut |out: &mut Vec<u8>,
+        let body_writer = &mut |out: &mut OutputSink<'_>,
                                 member_index: u32,
                                 member_ref: ObjectRef,
                                 handle: &ObjectHandle|
          -> crate::Result<()> {
-            let marker_start = out.len();
+            let marker_start = out.position_usize()?;
             let source_member = usize::try_from(member_index)
                 .ok()
                 .and_then(|index| members.get(index))
                 .copied()
                 .unwrap_or(member_ref);
-            out.extend_from_slice(
-                format!(
-                    "%% Object stream: object {}, index {}",
-                    member_ref.number, member_index
-                )
-                .as_bytes(),
-            );
+            out.write_bytes(b"%% Object stream: object ")?;
+            write_decimal_u64(out, u64::from(member_ref.number))?;
+            out.write_bytes(b", index ")?;
+            write_decimal_u64(out, u64::from(member_index))?;
             if !self.options.no_original_object_ids {
                 let original = self.pdf.writer_original_object_ref(source_member);
-                out.extend_from_slice(
-                    format!("; original object ID: {}", original.number).as_bytes(),
-                );
+                out.write_bytes(b"; original object ID: ")?;
+                write_decimal_u64(out, u64::from(original.number))?;
                 if original.generation != 0 {
-                    out.extend_from_slice(format!(" {}", original.generation).as_bytes());
+                    out.write_bytes(b" ")?;
+                    write_decimal_u64(out, u64::from(original.generation))?;
                 }
             } // cov:ignore: LLVM maps the covered QDF ObjStm original-ID branch exit to this line
-            out.push(b'\n');
+            out.write_bytes(b"\n")?;
             if first_pass.get() {
                 marker_starts.push(marker_start);
-                marker_lengths.push(out.len() - marker_start);
+                marker_lengths.push(out.position_usize()? - marker_start);
             }
             if let Some(sequence) = self.page_sequences.get(&source_member) {
-                out.extend_from_slice(format!("%% Page {sequence}\n").as_bytes());
+                out.write_bytes(b"%% Page ")?;
+                write_decimal_u64(out, *sequence as u64)?;
+                out.write_bytes(b"\n")?;
             }
 
             if first_pass.get() {
@@ -1586,41 +1601,53 @@ impl<'pdf, 'output, 'sink, R: Read + Seek + 'static> LiveObjectEmitter<'pdf, 'ou
             } else {
                 handle.clone()
             };
-            self.enqueue_surviving_children(&handle_to_write)?; // cov:ignore: LLVM maps the covered QDF ObjStm child-discovery continuation to this line
-            let result = if handle_to_write.object_ref() == root_source {
+            let mut map = |child: &ObjectHandle| {
+                self.queue
+                    .borrow_mut()
+                    .enqueue_handle(self.pdf, child.clone())?
+                    .ok_or_else(|| {
+                        // cov:ignore-start: QDF object-stream children are
+                        // filtered to indirect values by the dynamic writer.
+                        crate::Error::Unsupported(
+                            "plain live writer: QDF child is direct or removed".to_string(),
+                        )
+                        // cov:ignore-end
+                    }) // cov:ignore: the QDF dynamic writer maps only indirect, non-removed children
+            };
+            if handle_to_write.object_ref() == root_source {
                 let root = handle_to_write.output_root_copy_with_adbe(
                     self.version,
                     self.final_extension_level,
                     true,
                 )?; // cov:ignore: LLVM maps the covered QDF ObjStm root-copy continuation to this line
-                self.enqueue_surviving_children(&root)?; // cov:ignore: LLVM maps the covered QDF ObjStm root-child discovery continuation to this line
-                let raw_static_map = live_queue_raw_output_map(&self.queue);
-                crate::writer::output::with_buffer_sink(out, |out| {
-                    root.write_object_qdf_with_qpdf_obj_gen_map_and_removed(
-                        out,
-                        0,
-                        &raw_static_map,
-                        &raw_removed_refs,
-                    )
-                }) // cov:ignore: LLVM maps the covered QDF ObjStm root serializer continuation to this line
+                crate::writer::object::write_object_qdf_with_dynamic_ref_map(
+                    &root,
+                    0,
+                    out,
+                    &mut map,
+                    &raw_removed_refs,
+                ) // cov:ignore: LLVM maps the covered QDF ObjStm root serializer continuation to this line
             } else {
-                let raw_static_map = live_queue_raw_output_map(&self.queue);
-                crate::writer::output::with_buffer_sink(out, |out| {
-                    handle_to_write.write_object_qdf_with_qpdf_obj_gen_map_and_removed(
-                        out,
-                        0,
-                        &raw_static_map,
-                        &raw_removed_refs,
-                    )
-                }) // cov:ignore: LLVM maps the covered QDF ObjStm member serializer continuation to this line
-            };
-            result
+                crate::writer::object::write_object_qdf_with_dynamic_ref_map(
+                    &handle_to_write,
+                    0,
+                    out,
+                    &mut map,
+                    &raw_removed_refs,
+                ) // cov:ignore: LLVM maps the covered QDF ObjStm member serializer continuation to this line
+            }
         };
-        let _ =
-            object_streams::emit_objstm_body_from_handles_with_writer_qdf(&handles, body_writer)?; // cov:ignore: LLVM maps the covered QDF ObjStm body-emitter continuation to this line
+        let _ = object_streams::emit_objstm_body_from_handles_with_sink_qdf(
+            &handles,
+            body_writer,
+            false,
+        )?; // cov:ignore: LLVM maps the covered QDF ObjStm body-emitter continuation to this line
         first_pass.set(false);
-        let body =
-            object_streams::emit_objstm_body_from_handles_with_writer_qdf(&handles, body_writer)?; // cov:ignore: LLVM maps the covered QDF ObjStm body-emitter continuation to this line
+        let body = object_streams::emit_objstm_body_from_handles_with_sink_qdf(
+            &handles,
+            body_writer,
+            true,
+        )?; // cov:ignore: LLVM maps the covered QDF ObjStm body-emitter continuation to this line
         let first_marker_len = marker_lengths.first().copied().ok_or_else(|| {
             // cov:ignore-start: a dispatched QDF ObjStm always has at least one retained member.
             crate::Error::Internal("plain live QDF ObjStm marker lengths are empty".into())
@@ -2007,8 +2034,7 @@ where
                         if !object_gen.is_indirect() || self.removed_refs.contains(&object_gen) {
                             self.out.write_bytes(b"null")?;
                         } else {
-                            self.out
-                                .write_bytes((self.map)(object_gen)?.to_string().as_bytes())?;
+                            write_object_ref(self.out, (self.map)(object_gen)?)?;
                         }
                         return Ok(());
                     }
@@ -3051,6 +3077,62 @@ mod object_emitter_tests {
     use crate::writer::object::DynamicDirectStreamWriter;
     use crate::writer::NewlineBeforeEndstream;
     use std::io::Cursor;
+
+    #[test]
+    fn live_child_discovery_uses_cursors_instead_of_container_snapshots() {
+        let source = include_str!("body.rs");
+        let dictionary_start = source
+            .find("fn collect_live_dictionary_children")
+            .expect("live dictionary child helper");
+        let dictionary_body = &source[dictionary_start
+            ..source[dictionary_start..]
+                .find("\nfn collect_live_seed_handles")
+                .expect("live dictionary child helper end")
+                + dictionary_start];
+        let child_start = source
+            .find("fn collect_live_child_handles")
+            .expect("live child discovery helper");
+        let child_body = &source[child_start
+            ..source[child_start..]
+                .find("\nfn initialize_live_queue")
+                .expect("live child discovery helper end")
+                + child_start];
+
+        assert!(
+            dictionary_body.contains("next_dictionary_entry_for_live_walk"),
+            "writer child discovery must use the live dictionary cursor"
+        );
+        assert!(
+            !dictionary_body.contains("try_as_dictionary()")
+                && !child_body.contains("try_as_dictionary()"),
+            "writer child discovery must not clone a complete dictionary map"
+        );
+        assert!(
+            !child_body.contains("try_as_array()?"),
+            "writer child discovery must not clone a complete array vector"
+        );
+    }
+
+    #[test]
+    fn qdf_object_stream_members_discover_children_at_the_write_boundary() {
+        let source = include_str!("body.rs");
+        let start = source
+            .find("fn emit_live_qdf_object_stream")
+            .expect("live QDF object-stream emitter");
+        let end = start
+            + source[start..]
+                .find("\n    #[test]")
+                .expect("live QDF object-stream emitter end");
+        let body = &source[start..end];
+        assert!(
+            body.contains("write_object_qdf_with_dynamic_ref_map"),
+            "QDF ObjStm members must assign child references while serializing"
+        );
+        assert!(
+            !body.contains("enqueue_surviving_children(&handle_to_write)"),
+            "QDF ObjStm members must not pre-walk the complete value graph"
+        );
+    }
 
     fn pdf() -> Pdf<Cursor<Vec<u8>>> {
         Pdf::open(Cursor::new(

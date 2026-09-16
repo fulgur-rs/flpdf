@@ -60,6 +60,81 @@ impl<W: Write> Write for TextModeWriter<W> {
     }
 }
 
+const STDOUT_LINE_BUFFER_CAPACITY: usize = 4096;
+
+/// Aggregate logger fragments until a complete line is available.
+///
+/// qpdf configures the C stdout stream as line-buffered before constructing
+/// its `Pl_OStream` (`qpdf/qpdf.cc:30`; `QUtil.cc:780-784`). Rust's
+/// `std::io::Stdout` also has a line-oriented adapter, but it forwards a
+/// pending partial line and the newly completed line as separate writes. The
+/// C stdio boundary used by qpdf combines those fragments before the flush.
+struct LineBufferedWriter<W> {
+    writer: W,
+    buffer: Vec<u8>,
+}
+
+impl<W> LineBufferedWriter<W> {
+    fn new(writer: W) -> Self {
+        Self {
+            writer,
+            buffer: Vec::with_capacity(STDOUT_LINE_BUFFER_CAPACITY),
+        }
+    }
+
+    fn flush_prefix(&mut self, length: usize) -> io::Result<()>
+    where
+        W: Write,
+    {
+        if length == 0 {
+            return Ok(());
+        }
+        self.writer.write_all(&self.buffer[..length])?;
+        self.buffer.drain(..length);
+        Ok(())
+    }
+
+    #[cfg(test)]
+    fn into_inner(self) -> W {
+        self.writer
+    }
+}
+
+impl<W: Write> Write for LineBufferedWriter<W> {
+    fn write(&mut self, data: &[u8]) -> io::Result<usize> {
+        let mut remaining = data;
+        while !remaining.is_empty() || self.buffer.len() >= STDOUT_LINE_BUFFER_CAPACITY {
+            if self.buffer.len() >= STDOUT_LINE_BUFFER_CAPACITY {
+                self.flush_prefix(STDOUT_LINE_BUFFER_CAPACITY)?;
+                continue;
+            }
+
+            let available = STDOUT_LINE_BUFFER_CAPACITY - self.buffer.len();
+            let chunk_length = remaining.len().min(available);
+            self.buffer.extend_from_slice(&remaining[..chunk_length]);
+            remaining = &remaining[chunk_length..];
+
+            if let Some(newline) = self.buffer.iter().rposition(|&byte| byte == b'\n') {
+                self.flush_prefix(newline + 1)?;
+            }
+        }
+
+        Ok(data.len())
+    }
+
+    fn flush(&mut self) -> io::Result<()> {
+        self.flush_prefix(self.buffer.len())?;
+        self.writer.flush()
+    }
+}
+
+fn standard_output_writer<W: Write>(
+    writer: W,
+    text_mode: Arc<AtomicBool>,
+) -> TextModeWriter<LineBufferedWriter<W>> {
+    TextModeWriter::new(LineBufferedWriter::new(writer), text_mode)
+}
+
 struct PlTrack {
     next: PipelineHandle,
     used: Arc<AtomicBool>,
@@ -126,11 +201,22 @@ pub struct QPDFLogger {
 
 impl QPDFLogger {
     pub fn create() -> Self {
+        Self::create_with_line_buffering(true)
+    }
+
+    fn create_with_line_buffering(line_buffering: bool) -> Self {
         let stdout_text_mode = Arc::new(AtomicBool::new(cfg!(windows)));
-        let real_stdout = PipelineHandle::new(PlOStream::new(
-            "standard output",
-            TextModeWriter::new(std::io::stdout(), Arc::clone(&stdout_text_mode)),
-        ));
+        let real_stdout = if line_buffering {
+            PipelineHandle::new(PlOStream::new(
+                "standard output",
+                standard_output_writer(std::io::stdout(), Arc::clone(&stdout_text_mode)),
+            ))
+        } else {
+            PipelineHandle::new(PlOStream::new(
+                "standard output",
+                TextModeWriter::new(std::io::stdout(), Arc::clone(&stdout_text_mode)),
+            ))
+        };
         let stdout_used = Arc::new(AtomicBool::new(false));
         let stdout = PipelineHandle::new(PlTrack {
             next: real_stdout,
@@ -161,7 +247,9 @@ impl QPDFLogger {
 
     pub fn default_logger() -> Self {
         static DEFAULT_LOGGER: OnceLock<QPDFLogger> = OnceLock::new();
-        DEFAULT_LOGGER.get_or_init(Self::create).clone()
+        DEFAULT_LOGGER
+            .get_or_init(|| Self::create_with_line_buffering(false))
+            .clone()
     }
 
     pub fn info(&self, data: impl AsRef<[u8]>) -> Result<()> {
@@ -174,6 +262,17 @@ impl QPDFLogger {
 
     pub fn error(&self, data: impl AsRef<[u8]>) -> Result<()> {
         self.get_error()?.write(data.as_ref()).map_err(Error::from)
+    }
+
+    /// Flush the process-owned standard output and error logger sinks.
+    ///
+    /// The CLI keeps its logger in a process-wide `OnceLock`, so the final
+    /// partial line cannot rely on `QPDFLogger::drop`. qpdf's C stdio flushes
+    /// that line during process termination; explicit command completion uses
+    /// this equivalent boundary.
+    pub fn flush(&self) -> Result<()> {
+        self.standard_output().finish().map_err(Error::from)?;
+        self.standard_error().finish().map_err(Error::from)
     }
 
     pub fn get_info(&self) -> Result<PipelineHandle> {
@@ -314,9 +413,77 @@ impl Eq for QPDFLogger {}
 #[cfg(test)]
 mod tests {
     use super::TextModeWriter;
-    use std::io::Write;
+    use std::io::{self, Write};
     use std::sync::atomic::{AtomicBool, Ordering};
     use std::sync::Arc;
+
+    #[derive(Debug, Default)]
+    struct RecordingWriter {
+        writes: Vec<Vec<u8>>,
+    }
+
+    impl Write for RecordingWriter {
+        fn write(&mut self, data: &[u8]) -> io::Result<usize> {
+            self.writes.push(data.to_vec());
+            Ok(data.len())
+        }
+
+        fn flush(&mut self) -> io::Result<()> {
+            Ok(())
+        }
+    }
+
+    #[test]
+    fn standard_output_writer_matches_qpdf_line_buffer_boundary() {
+        let text_mode = Arc::new(AtomicBool::new(false));
+        let mut writer = super::standard_output_writer(RecordingWriter::default(), text_mode);
+
+        writer.write_all(b"{").unwrap();
+        writer.write_all(b"\n  \"key\": ").unwrap();
+        writer.write_all(b"1").unwrap();
+        writer.write_all(b"\n}").unwrap();
+        writer.flush().unwrap();
+
+        let sink = writer.writer.into_inner();
+        assert_eq!(
+            sink.writes,
+            [b"{\n".to_vec(), b"  \"key\": 1\n".to_vec(), b"}".to_vec()]
+        );
+    }
+
+    #[test]
+    fn standard_output_writer_flushes_full_capacity_chunks() {
+        let text_mode = Arc::new(AtomicBool::new(false));
+        let mut writer = super::standard_output_writer(RecordingWriter::default(), text_mode);
+        let data = vec![b'x'; super::STDOUT_LINE_BUFFER_CAPACITY + 1];
+
+        writer.write_all(&data).unwrap();
+        writer.flush().unwrap();
+
+        let sink = writer.writer.into_inner();
+        assert_eq!(
+            sink.writes,
+            [vec![b'x'; super::STDOUT_LINE_BUFFER_CAPACITY], vec![b'x'],]
+        );
+    }
+
+    #[test]
+    fn standard_output_writer_does_not_grow_pending_buffer_for_large_write() {
+        let text_mode = Arc::new(AtomicBool::new(false));
+        let mut writer = super::standard_output_writer(RecordingWriter::default(), text_mode);
+        let data = vec![b'x'; super::STDOUT_LINE_BUFFER_CAPACITY * 16 + 1];
+
+        writer.write_all(&data).unwrap();
+
+        assert!(
+            writer.writer.buffer.capacity() <= super::STDOUT_LINE_BUFFER_CAPACITY,
+            "large writes must not grow the pending line buffer"
+        );
+
+        writer.flush().unwrap();
+        let sink = writer.writer.into_inner();
+        assert_eq!(sink.writes.iter().map(Vec::len).sum::<usize>(), data.len());
+    }
 
     #[test]
     fn text_mode_writer_converts_text_lines_but_preserves_binary_save_data() {
@@ -345,5 +512,23 @@ mod tests {
         assert_eq!(text_mode.load(Ordering::Relaxed), cfg!(windows));
         logger.save_to_standard_output(false).unwrap();
         assert!(!text_mode.load(Ordering::Relaxed));
+    }
+
+    #[test]
+    fn default_logger_does_not_install_the_line_buffered_stdout_adapter() {
+        let source = include_str!("logger.rs");
+        let start = source
+            .find("pub fn default_logger")
+            .expect("default logger constructor");
+        let body = &source[start
+            ..source[start..]
+                .find("\n    pub fn info")
+                .expect("default logger constructor end")
+                + start];
+
+        assert!(
+            body.contains("create_with_line_buffering(false)"),
+            "the process-global default logger must not retain partial lines in the custom line buffer"
+        );
     }
 }
