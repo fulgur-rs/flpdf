@@ -3167,14 +3167,20 @@ fn build_writer_trailer_handle<R: Read + Seek>(
     ] {
         trailer.remove_key(key);
     }
-    trailer.replace_key(
-        b"/Size",
-        ObjectHandle::integer(i64::try_from(size).map_err(|_| {
-            // cov:ignore-start: supported writer object counts fit in i64
-            crate::Error::Unsupported("writer trailer /Size does not fit in i64".to_string())
-            // cov:ignore-end
-        })?), // cov:ignore: supported writer object counts fit in i64
-    )?; // cov:ignore: validated /Size replacement; LLVM attributes this continuation to the call setup
+    // qpdf's writeTrailer substitutes the computed size only for a literal
+    // `/Size` key already present in the trimmed trailer. It does not repair a
+    // missing or misspelled key on the normal writer path
+    // (`QPDFWriter.cc:1174-1192`).
+    if trailer.try_has_key(b"/Size")? {
+        trailer.replace_key(
+            b"/Size",
+            ObjectHandle::integer(i64::try_from(size).map_err(|_| {
+                // cov:ignore-start: supported writer object counts fit in i64
+                crate::Error::Unsupported("writer trailer /Size does not fit in i64".to_string())
+                // cov:ignore-end
+            })?), // cov:ignore: supported writer object counts fit in i64
+        )?; // cov:ignore: validated /Size replacement; LLVM attributes this continuation to the call setup
+    }
     let root = match (root, direct_root) {
         (Some(root), None) => pdf.get_object_handle(root),
         (None, Some(root)) => root.clone(),

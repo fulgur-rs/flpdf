@@ -638,7 +638,13 @@ pub(crate) mod xref_stream {
         if dict.root.is_some() || dict.live_root_value.is_some() {
             keys.insert(b"/Root".to_vec());
         }
-        keys.insert(b"/Size".to_vec());
+        // qpdf's normal writeTrailer path emits the computed `/Size` only when
+        // the input trailer already had that literal key. The linearized
+        // second-half `/Size`-only form is a separate caller and does not use
+        // this live plain-trailer helper (`QPDFWriter.cc:1170-1172,1174-1192`).
+        if entries.contains_key(b"/Size".as_slice()) {
+            keys.insert(b"/Size".to_vec());
+        }
 
         for key in keys {
             if key == b"/Root" {
@@ -1345,6 +1351,7 @@ pub(crate) mod xref_stream {
             let trailer = ObjectHandle::dictionary(vec![
                 (b"/Custom".to_vec(), ObjectHandle::integer(9)),
                 (b"/Null".to_vec(), ObjectHandle::null()),
+                (b"/Size".to_vec(), ObjectHandle::integer(99)),
             ]);
             let map = |object_ref| Ok(object_ref);
             let removed = BTreeSet::new();
