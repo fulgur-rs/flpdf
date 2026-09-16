@@ -537,9 +537,8 @@ fn resolve_resolves_a_dangling_reference_to_null() {
 /// back at object 1 — the same mutual-cycle fixture the legacy engine's own
 /// `qpdf_reader_bounds_unusable_indirect_length_recovery` test exercises)
 /// resolves without hanging or erroring through the canonical resolver when
-/// qpdf-style repair is enabled. The `Reserved`-state guard breaks the cycle;
-/// qpdf keeps the object whose slot was reached by the loop as a permanent
-/// null rather than allowing the outer parsed stream to overwrite it.
+/// qpdf-style repair is enabled. The loop guard breaks the cycle and leaves the
+/// slot it fired on null, which is what qpdf reports for it.
 #[test]
 fn resolve_preserves_a_loop_null_in_a_mutual_indirect_stream_length_cycle() {
     let bytes = classic_pdf_with_bodies(
@@ -564,9 +563,18 @@ fn resolve_preserves_a_loop_null_in_a_mutual_indirect_stream_length_cycle() {
         .try_is_scalar()
         .expect("a cyclic indirect /Length must not error");
 
+    // The slot the loop guard fired on stays null: qpdf caches null there
+    // (`QPDF.cc:1705-1712`) and its outer parse only caches
+    // `if (isUnresolved(og))` (`QPDF.cc:1641-1693`), so the recovery's success
+    // never reaches the cache. Verified against qpdf 11.9.0 on this fixture
+    // shape: `--show-object=1` prints `null` and `--json=2` reports
+    // `"obj:1 0 R": {"value": null}` while object 2 still resolves to a stream.
+    //
+    // An earlier revision asserted `b"abc\n"` here — flpdf's own behavior, not
+    // qpdf's.
     assert!(
         handle.is_null(),
-        "the loop-resolved null must not be overwritten by the outer parsed stream"
+        "the loop guard's null must survive the successful recovery"
     );
 }
 

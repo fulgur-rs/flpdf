@@ -3096,9 +3096,17 @@ fn recovered_xref_rebinds_a_reused_generation_catalog_before_writer_traversal() 
 }
 
 /// A cyclic indirect-/Length holder chain
-/// (obj 1's /Length -> obj 2 -> obj 1) must NOT recurse forever. The
-/// in-progress `Reserved` guard breaks the cycle; resolution terminates and
-/// qpdf keeps the loop-resolved object as a permanent null.
+/// (obj 1's /Length -> obj 2 -> obj 1) must NOT recurse forever. The loop guard
+/// breaks the cycle and leaves the slot it fired on null, matching qpdf.
+///
+/// qpdf 11.9.0 on this exact fixture warns `loop detected resolving object 1 0`
+/// and reports `"obj:1 0 R": {"value": null}` while `obj:2 0 R` still resolves
+/// to a stream: the guard caches null for object 1 (`QPDF.cc:1705-1712`) and the
+/// outer parse only caches `if (isUnresolved(og))` (`QPDF.cc:1641-1693`), so the
+/// endstream-scan recovery never reaches the cache for that slot.
+///
+/// An earlier revision asserted object 1 resolved to a stream — flpdf's own
+/// behavior, not qpdf's.
 #[test]
 fn cyclic_indirect_length_holder_terminates() {
     let mut bytes = b"%PDF-1.7\n".to_vec();
@@ -3120,11 +3128,17 @@ fn cyclic_indirect_length_holder_terminates() {
         format!("trailer\n<< /Size 5 /Root 3 0 R >>\nstartxref\n{xref}\n%%EOF\n").as_bytes(),
     );
     let mut pdf = Pdf::open(std::io::Cursor::new(bytes)).unwrap();
-    // Must terminate (no stack overflow / hang) and keep qpdf's cached null.
+    // Must terminate (no stack overflow / hang).
     let object = resolved_handle(&mut pdf, ObjectRef::new(1, 0));
     assert!(
         object.is_null(),
-        "cyclic /Length holder must remain null after the loop fallback"
+        "the slot the loop guard fired on stays null, as qpdf reports it"
+    );
+    // The other half of the cycle is not the loop target and still resolves.
+    let other = resolved_handle(&mut pdf, ObjectRef::new(2, 0));
+    assert!(
+        other.as_stream_dict().is_some(),
+        "object 2 is not the loop target and must still resolve to a stream"
     );
 }
 
