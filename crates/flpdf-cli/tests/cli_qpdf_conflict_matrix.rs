@@ -529,6 +529,101 @@ fn qpdf_writer_inspection_matrix_has_no_false_conflicts() {
 }
 
 #[test]
+fn json_input_and_update_inspection_reserve_stdout_before_attachment() {
+    if skip_without_qpdf() {
+        return;
+    }
+
+    let temp = tempfile::tempdir().expect("temporary JSON inspection directory");
+    let input_pdf = fixture("attachment-two-page.pdf");
+    let json = temp.path().join("attachment.json");
+    let generated = ShellCommand::new("qpdf")
+        .args([
+            OsString::from("--json-output=2"),
+            input_pdf.as_os_str().to_owned(),
+        ])
+        .arg(&json)
+        .output()
+        .expect("qpdf JSON input fixture should spawn");
+    assert!(
+        generated.status.success(),
+        "qpdf JSON fixture failed: {generated:?}"
+    );
+
+    let json_input_args = [
+        OsString::from("--json-input"),
+        OsString::from("--show-npages"),
+        OsString::from("--show-attachment=attachment.txt"),
+        json.as_os_str().to_owned(),
+    ];
+    assert_status_output_pair("json-input show-npages + show-attachment", &json_input_args);
+
+    let update_args = [
+        OsString::from(format!("--update-from-json={}", json.display())),
+        OsString::from("--show-npages"),
+        OsString::from("--show-attachment=attachment.txt"),
+        input_pdf.as_os_str().to_owned(),
+    ];
+    assert_status_output_pair(
+        "update-from-json show-npages + show-attachment",
+        &update_args,
+    );
+}
+
+#[test]
+fn json_input_and_update_inspection_apply_overlay_before_show_object() {
+    if skip_without_qpdf() {
+        return;
+    }
+
+    let temp = tempfile::tempdir().expect("temporary JSON overlay directory");
+    let json_input = fixture("json-input/complete.json");
+    let update = fixture("json-input/update.json");
+    let overlay = fixture("three-page.pdf");
+    let generated_pdf = temp.path().join("complete.pdf");
+    let generated = ShellCommand::new("qpdf")
+        .args([
+            OsString::from("--json-input"),
+            json_input.as_os_str().to_owned(),
+        ])
+        .arg(&generated_pdf)
+        .output()
+        .expect("qpdf JSON document should spawn");
+    assert!(
+        generated.status.success(),
+        "qpdf JSON document failed: {generated:?}"
+    );
+
+    for overlay_flag in ["--overlay", "--underlay"] {
+        let json_args = [
+            OsString::from("--json-input"),
+            OsString::from(overlay_flag),
+            overlay.as_os_str().to_owned(),
+            OsString::from("--"),
+            OsString::from("--show-object=3,0"),
+            json_input.as_os_str().to_owned(),
+        ];
+        assert_pair(
+            &format!("json-input {overlay_flag} + show-object"),
+            &json_args,
+        );
+
+        let update_args = [
+            OsString::from(format!("--update-from-json={}", update.display())),
+            OsString::from(overlay_flag),
+            overlay.as_os_str().to_owned(),
+            OsString::from("--"),
+            OsString::from("--show-object=3,0"),
+            generated_pdf.as_os_str().to_owned(),
+        ];
+        assert_pair(
+            &format!("update-from-json {overlay_flag} + show-object"),
+            &update_args,
+        );
+    }
+}
+
+#[test]
 fn qpdf_accepts_decrypt_with_show_xref() {
     if skip_without_qpdf() {
         return;
