@@ -137,6 +137,30 @@ impl PipelineError {
 pub trait Pipeline {
     fn identifier(&self) -> &str;
     fn write(&mut self, data: &[u8]) -> PipelineResult<()>;
+    /// Feed one qpdf PNG-Up predictor row to this stage.
+    ///
+    /// The default preserves `Pl_PNGFilter::encodeRow`'s downstream write
+    /// boundaries: the filter byte is one write, and a row with a previous
+    /// row supplies each difference byte separately. `Pl_Flate` overrides
+    /// this hook only to keep its codec state borrowed across those same
+    /// byte-sized inputs; the codec input and downstream output boundaries
+    /// remain unchanged.
+    #[doc(hidden)]
+    fn write_up_predictor_row(
+        &mut self,
+        row: &[u8],
+        previous: Option<&[u8]>,
+    ) -> PipelineResult<()> {
+        self.write(&[2])?;
+        if let Some(previous) = previous {
+            for (&current, &previous) in row.iter().zip(previous) {
+                self.write(&[current.wrapping_sub(previous)])?;
+            }
+        } else {
+            self.write(row)?;
+        }
+        Ok(())
+    }
     fn finish(&mut self) -> PipelineResult<()>;
 }
 
@@ -173,6 +197,17 @@ impl Pipeline for PipelineRef<'_> {
         match self {
             Self::Borrowed(next) => next.write(data),
             Self::Owned(next) => next.write(data),
+        }
+    }
+
+    fn write_up_predictor_row(
+        &mut self,
+        row: &[u8],
+        previous: Option<&[u8]>,
+    ) -> PipelineResult<()> {
+        match self {
+            Self::Borrowed(next) => next.write_up_predictor_row(row, previous),
+            Self::Owned(next) => next.write_up_predictor_row(row, previous),
         }
     }
 
@@ -394,6 +429,19 @@ mod tests {
                 TraceCall::Finish { failed: false },
             ]
         );
+    }
+
+    #[test]
+    fn pipeline_ref_owned_delegates_up_predictor_rows() {
+        let mut sink = RecordingSink::new(&[], &[]);
+        let trace = sink.trace();
+        {
+            let stage: Box<dyn Pipeline + '_> = Box::new(Count::new("count", &mut sink));
+            let mut next = PipelineRef::from(stage);
+            next.write_up_predictor_row(&[1, 2], Some(&[0, 1])).unwrap();
+            next.finish().unwrap();
+        }
+        assert_eq!(trace.borrow().output, [2, 1, 1]);
     }
 
     #[test]

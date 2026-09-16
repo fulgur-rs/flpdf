@@ -175,8 +175,6 @@ struct InflateState {
     dictid_len: usize,
     trailer: [u8; 4],
     trailer_len: usize,
-    adler_a: u32,
-    adler_b: u32,
 }
 
 impl InflateState {
@@ -188,21 +186,7 @@ impl InflateState {
             dictid_len: 0,
             trailer: [0; 4],
             trailer_len: 0,
-            adler_a: 1,
-            adler_b: 0,
         }
-    }
-
-    fn update_adler(&mut self, data: &[u8]) {
-        const ADLER_MODULUS: u32 = 65_521;
-        for byte in data {
-            self.adler_a = (self.adler_a + u32::from(*byte)) % ADLER_MODULUS;
-            self.adler_b = (self.adler_b + self.adler_a) % ADLER_MODULUS;
-        }
-    }
-
-    fn adler(&self) -> u32 {
-        (self.adler_b << 16) | self.adler_a
     }
 }
 
@@ -216,7 +200,13 @@ pub(crate) struct Flate<'a> {
     codec: Option<FlateCodec>,
     inflate_state: InflateState,
     finished: bool,
+    /// qpdf allocates one reusable output buffer in `Pl_Flate::Members`. The
+    /// deflater uses initialized storage so flate2's safe `compress` path does
+    /// not repeat miniz's `compress_uninit` zero-fill on every small write;
+    /// inflate keeps the uninitialized storage needed by the direct zlib-rs
+    /// decoder and avoids touching 65,536 bytes for every short-lived stage.
     output: Vec<MaybeUninit<u8>>,
+    deflate_output: Vec<u8>,
     warn_callback: Option<Box<WarnCallback<'a>>>,
 }
 
@@ -249,6 +239,11 @@ impl<'a> Flate<'a> {
             ));
         }
 
+        let (output, deflate_output) = match action {
+            FlateAction::Inflate => (uninitialized_output_buffer(out_buffer_size), Vec::new()),
+            FlateAction::Deflate => (Vec::new(), vec![0; out_buffer_size]),
+        };
+
         Ok(Self {
             identifier,
             next: next.into(),
@@ -257,7 +252,8 @@ impl<'a> Flate<'a> {
             codec: None,
             inflate_state: InflateState::new(),
             finished: false,
-            output: uninitialized_output_buffer(out_buffer_size),
+            output,
+            deflate_output,
             warn_callback: None,
         })
     }
@@ -380,8 +376,6 @@ impl<'a> Flate<'a> {
             .copy_from_slice(&data[..consumed]);
         state.trailer_len += consumed;
         if state.trailer_len == 4 {
-            let expected = u32::from_be_bytes(state.trailer);
-            let _checksum_matches = expected == state.adler();
             // qpdf intentionally accepts the checksum-only mismatch represented
             // by zlib's exact "incorrect data check" diagnostic.
             state.phase = InflatePhase::Ended;
@@ -399,7 +393,7 @@ impl<'a> Flate<'a> {
         loop {
             let before_in = codec.total_in();
             let before_out = codec.total_out();
-            let result = codec.compress_uninit(&data[input_offset..], &mut self.output, flush);
+            let result = codec.compress(&data[input_offset..], &mut self.deflate_output, flush);
             let consumed = (codec.total_in() - before_in) as usize;
             let produced = (codec.total_out() - before_out) as usize;
             input_offset += consumed;
@@ -409,11 +403,7 @@ impl<'a> Flate<'a> {
                 result.map_err(|_| PipelineError::runtime(format!("{identifier}: {detail}")))?;
 
             if produced > 0 {
-                let output = Self::initialized_output_slice(
-                    self.output.as_ptr(),
-                    self.output.len(),
-                    produced,
-                );
+                let output = &self.deflate_output[..produced];
                 self.next.write(output)?;
             }
 
@@ -422,7 +412,7 @@ impl<'a> Flate<'a> {
             }
             if flush != FlushCompress::Finish
                 && input_offset == data.len()
-                && produced < self.output.len()
+                && produced < self.deflate_output.len()
             {
                 return Ok(());
             }
@@ -501,7 +491,6 @@ impl<'a> Flate<'a> {
                     self.output.len(),
                     produced,
                 );
-                self.inflate_state.update_adler(output);
                 self.next.write(output)?;
             }
 
@@ -579,6 +568,53 @@ impl Pipeline for Flate<'_> {
 
         self.initialize_codec()?;
         self.process_codec(data, false)
+    }
+
+    fn write_up_predictor_row(
+        &mut self,
+        row: &[u8],
+        previous: Option<&[u8]>,
+    ) -> PipelineResult<()> {
+        if self.finished {
+            return Err(PipelineError::logic(format!(
+                "{}: Pl_Flate: write() called after finish() called",
+                self.identifier
+            )));
+        }
+        if self.action != FlateAction::Deflate {
+            self.write(&[2])?;
+            if let Some(previous) = previous {
+                for (&current, &previous) in row.iter().zip(previous) {
+                    self.write(&[current.wrapping_sub(previous)])?;
+                }
+            } else {
+                self.write(row)?;
+            }
+            return Ok(());
+        }
+        self.initialize_codec()?;
+        let Some(FlateCodec::Deflate(mut codec)) = self.codec.take() else {
+            // cov:ignore: action is checked as Deflate before this codec variant is taken
+            unreachable!("Flate codec is initialized before predictor-row processing")
+        };
+        let result = (|| {
+            // Keep the same one-byte codec input sequence as the default
+            // Pipeline implementation. The optimization is only that the
+            // Flate stage retains its codec across the row instead of taking
+            // it out of the stage for every qpdf-sized write callback.
+            self.write_deflate(&mut codec, &[2], FlushCompress::None)?;
+            if let Some(previous) = previous {
+                for (&current, &previous) in row.iter().zip(previous) {
+                    let encoded = [current.wrapping_sub(previous)];
+                    self.write_deflate(&mut codec, &encoded, FlushCompress::None)?;
+                }
+            } else {
+                self.write_deflate(&mut codec, row, FlushCompress::None)?;
+            }
+            Ok(())
+        })();
+        self.codec = Some(FlateCodec::Deflate(codec));
+        result
     }
 
     fn finish(&mut self) -> PipelineResult<()> {
@@ -783,6 +819,68 @@ mod tests {
             flate.finish().unwrap();
         }
         sink.take_buffer().unwrap()
+    }
+
+    #[test]
+    fn up_predictor_row_keeps_qpdf_byte_chunking_and_deflate_output() {
+        let _guard = lock_compression_level_for_tests();
+        Flate::set_compression_level(-1).unwrap();
+        let row = [1, 2, 3, 4];
+        let previous = [0, 1, 1, 0];
+
+        let mut expected_sink = RecordingSink::default();
+        {
+            let mut expected =
+                Flate::new("expected", &mut expected_sink, FlateAction::Deflate, 65_536).unwrap();
+            for byte in [[2], [1], [1], [2], [4]] {
+                expected.write(&byte).unwrap();
+            }
+            expected.finish().unwrap();
+        }
+
+        let mut actual_sink = RecordingSink::default();
+        {
+            let mut actual =
+                Flate::new("actual", &mut actual_sink, FlateAction::Deflate, 65_536).unwrap();
+            actual
+                .write_up_predictor_row(&row, Some(&previous))
+                .unwrap();
+            actual.finish().unwrap();
+        }
+
+        assert_eq!(actual_sink.chunks, expected_sink.chunks);
+    }
+
+    #[test]
+    fn predictor_row_hook_keeps_inflate_fallback_and_terminal_error_shape() {
+        let mut sink = RecordingSink::default();
+        let mut inflate = Flate::new("inflate", &mut sink, FlateAction::Inflate, 64).unwrap();
+        assert!(inflate.write_up_predictor_row(&[0], Some(&[0])).is_err());
+
+        let mut sink = RecordingSink::default();
+        let mut inflate = Flate::new("inflate", &mut sink, FlateAction::Inflate, 64).unwrap();
+        inflate
+            .write_up_predictor_row(&[], None)
+            .expect("an incomplete header is deferred until finish");
+
+        let mut sink = RecordingSink::default();
+        let mut deflate = Flate::new("deflate", &mut sink, FlateAction::Deflate, 64).unwrap();
+        deflate
+            .finish()
+            .expect("an unused deflate stage can finish before any write");
+        let error = deflate
+            .write_up_predictor_row(&[1], None)
+            .expect_err("predictor writes after finish use qpdf's logic error");
+        assert!(error
+            .to_string()
+            .contains("write() called after finish() called"));
+
+        let mut sink = RecordingSink::default();
+        let mut deflate = Flate::new("deflate", &mut sink, FlateAction::Deflate, 64).unwrap();
+        deflate
+            .write_up_predictor_row(&[1], None)
+            .expect("a first predictor row uses the direct row path");
+        deflate.finish().unwrap();
     }
 
     #[derive(Default)]
