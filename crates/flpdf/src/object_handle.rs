@@ -6405,6 +6405,10 @@ impl ObjectHandle {
     /// [`Self::get_raw_stream_data`] use the source pipeline's decryption;
     /// this method additionally applies the requested decode filters.
     pub fn get_stream_data(&self, decode_level: DecodeLevel) -> Result<Rc<Vec<u8>>> {
+        // qpdf calls asStreamWithAssert before entering QPDF_Stream
+        // (`libqpdf/QPDFObjectHandle.cc:1288-1292`), so receiver resolution
+        // and non-stream errors belong at this public boundary.
+        let _stream_dict = self.try_get_stream_dict()?;
         let mut buffer = crate::pipeline::buffer::Buffer::new("stream data", None);
         let mut filtering_attempted = false;
         let stream_data_succeeded = self.pipe_stream_data(
@@ -7003,6 +7007,10 @@ impl ObjectHandle {
     /// the owning document at the parsed offset and stored parse-time length.
     /// No filter or decoder stage is constructed here.
     pub fn get_raw_stream_data(&self) -> Result<Rc<Vec<u8>>> {
+        // Match QPDFObjectHandle::getRawStreamData's asStreamWithAssert
+        // boundary (`libqpdf/QPDFObjectHandle.cc:1294-1297`) before the raw
+        // source pipe performs its stream-data work.
+        let _stream_dict = self.try_get_stream_dict()?;
         let mut buffer = crate::pipeline::buffer::Buffer::new("stream data", None);
         if !self.pipe_raw_stream_data(&mut buffer)? {
             return Err(Error::QpdfExc(QpdfExc::new(
@@ -17759,12 +17767,55 @@ mod mutation_tests {
     }
 
     #[test]
+    fn stream_data_accessors_use_qpdf_stream_type_assertion_for_direct_and_indirect_values() {
+        let direct_decode_error = ObjectHandle::integer(7)
+            .get_stream_data(crate::writer::DecodeLevel::All)
+            .expect_err("get_stream_data must reject a direct non-stream");
+        assert!(matches!(
+            direct_decode_error,
+            Error::System(message)
+                if message == "operation for stream attempted on object of type integer"
+        ));
+
+        let direct_raw_error = ObjectHandle::integer(7)
+            .get_raw_stream_data()
+            .expect_err("get_raw_stream_data must reject a direct non-stream");
+        assert!(matches!(
+            direct_raw_error,
+            Error::System(message)
+                if message == "operation for stream attempted on object of type integer"
+        ));
+
+        let (indirect_decode, _decode_resolver) =
+            crate::object_handle::identity_tests::resolver_bearing_handle(ObjectValue::Integer(7));
+        let indirect_decode_error = indirect_decode
+            .get_stream_data(crate::writer::DecodeLevel::All)
+            .expect_err("get_stream_data must resolve before rejecting a non-stream");
+        assert!(matches!(
+            indirect_decode_error,
+            Error::System(message)
+                if message == "operation for stream attempted on object of type integer"
+        ));
+
+        let (indirect_raw, _raw_resolver) =
+            crate::object_handle::identity_tests::resolver_bearing_handle(ObjectValue::Integer(7));
+        let indirect_raw_error = indirect_raw
+            .get_raw_stream_data()
+            .expect_err("get_raw_stream_data must resolve before rejecting a non-stream");
+        assert!(matches!(
+            indirect_raw_error,
+            Error::System(message)
+                if message == "operation for stream attempted on object of type integer"
+        ));
+    }
+
+    #[test]
     fn raw_stream_data_rejects_non_stream_values() {
         let error = ObjectHandle::integer(1)
             .get_raw_stream_data()
             .expect_err("raw stream data is only available on streams");
-        assert!(matches!(error, Error::Internal(message)
-            if message == "pipeStreamData called for non-stream"));
+        assert!(matches!(error, Error::System(message)
+            if message == "operation for stream attempted on object of type integer"));
     }
 
     #[test]

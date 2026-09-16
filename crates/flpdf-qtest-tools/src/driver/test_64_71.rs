@@ -727,11 +727,12 @@ mod tests {
         .expect_err("the second (uncaught) accessor call must still propagate");
         assert!(matches!(
             error,
-            Error::Internal(message) if message == "pipeStreamData called for non-stream"
+            Error::System(message)
+                if message == "operation for stream attempted on object of type dictionary"
         ));
         assert_eq!(
             stdout,
-            b"get unfilterable stream: pipeStreamData called for non-stream\n"
+            b"get unfilterable stream: operation for stream attempted on object of type dictionary\n"
         );
         assert!(stderr.is_empty());
     }
