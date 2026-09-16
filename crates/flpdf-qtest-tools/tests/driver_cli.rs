@@ -1512,6 +1512,22 @@ fn qtest_accessor_cases_do_not_use_explicit_pdf_resolve() {
         "test 71 must use canonical resolving key accessors for the Fx1 chain"
     );
 
+    let test_72 = section(
+        late_source.as_str(),
+        "pub(crate) fn run_test_72",
+        "pub(crate) fn run_test_73",
+    );
+    assert!(
+        !test_72.contains("chase_key(") && !test_72.contains("resolve_once("),
+        "test 72 retains the qpdf-less chained resolution bridge"
+    );
+    assert!(
+        test_72.contains("page.try_get_key(")
+            && test_72.contains("resources.try_get_key(")
+            && test_72.contains("xobject.try_get_key("),
+        "test 72 must use canonical resolving key accessors for the Fx1 chain"
+    );
+
     for (name, body) in [
         (
             "tree string helper",
