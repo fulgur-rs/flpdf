@@ -217,6 +217,16 @@ notes で個別に `prod: 0` と断る。`fuzz/` は別枠で数える（本領�
 | A23 | （qpdf に対応物なし。dictionary key は `/` 付き decoded name） | `libqpdf/QPDFParser.cc:464`, `libqpdf/QPDF_Name.cc:27-49`、stream-filter ownerは`libqpdf/SF_FlateLzwDecode.cc:22-73` / `libqpdf/QPDF_Stream.cc:33-50` | `crates/flpdf/src/object_handle.rs::canonical_dictionary_key` | `legacy_dictionary_key` の実呼出 prod: 0 / test: 0。canonical_dictionary_key は prod 22 / test 2 で、parser.rs:721,835 は raw-byte warning へ移行し、writer/object.rs と stream_filter.rs は`.48.35`/`.48.36`で移行済み。 | canonical | `crates/flpdf/src/object_handle.rs::canonical_dictionary_key` | 旧 `Object` / `Dictionary` と `legacy_dictionary_key` は削除済み。qpdf parserはdecoded slash-prefixed keyをwarningへそのまま連結し、この warning route は `QPDF_Name::normalizeName` を呼ばない（unparse/JSON と writer name emission の表現責務は各 owner に残る）。raw key、warning detail、contextless QPDFExc は parser の byte-preserving diagnostic transport で保持する。 |
 | A24 | `QPDF::resolveObjectsInStream`（`resolved_object_streams` で二重展開防止、xref 再チェックで上書き済みメンバーを cache しない） | `libqpdf/QPDF.cc:1756-1833` | canonical 側は `crates/flpdf/src/reader/resolver.rs::ResolverCore` の `resolved_object_streams`（`crates/flpdf/src/reader/resolver.rs:324-327`）。facade 側には `crates/flpdf/src/pdf.rs:136` の `compressed_member_parents` provenance map が残る | `compressed_member_parents` prod: 6 (3 files) / test: 4。A14 専用だった ObjStm 昇格 helper は `.46` で撤去 | mixed | `crates/flpdf/src/reader/resolver.rs::ResolverCore` | canonical 側の ObjStm 展開は qpdf に対応する一方、`compressed_member_parents` は legacy cache synchronization の移行状態を記録する flpdf 側 provenance で、qpdf の `ObjCache` には対応物がない。A2/A15 と同じ legacy cache 列を畳む段階まで保持する。 |
 
+### A4 persistent loop-null cache (`flpdf-64dx9`, 2026-09-17)
+
+`QPDF::resolve` の loop branch は warning 後に requested `obj_cache` slotを nullへ
+更新し、外側の `readObjectAtOffset` は parse結果を `isUnresolved(og)` が真のときだけ
+cacheする（`libqpdf/QPDF.cc:1639-1714`）。flpdf は type-1/raw xrefの
+`cache_parsed_object_if_unresolved` と bootstrap resolverの `handle.is_resolved()` gate
+でこの順序を保持する。ObjStm member parserの無条件 `updateCache` 相当は別境界として
+変更しない（`QPDF.cc:1755-1858`）。self-referential `/Length` fixtureの object value、
+warning bytes、linearized outputは `flpdf-64dx9` の focused qpdf differentialで固定する。
+
 2026-09-08（`flpdf-1f9f`）: owner-less bootstrap の ObjStm member parserも
 member本体と辞書・配列内の nested direct valueへ同じ description contextを渡すようにした。
 qpdf は member の警告を decoded InputSource 名（`<file> object stream N`、

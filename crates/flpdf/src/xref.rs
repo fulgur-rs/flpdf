@@ -1446,9 +1446,15 @@ impl BootstrapHandleDocument {
 
         match result {
             Ok((value, parsed_offset, end_before_space, end_after_space)) => {
-                handle.set_resolved(value);
-                handle.set_parsed_offset_if_unset(parsed_offset);
-                handle.set_end_offsets(end_before_space, end_after_space);
+                // qpdf's readObjectAtOffset stores the parsed value only if
+                // the canonical slot is still unresolved. A nested stream
+                // `/Length` lookup may have detected a loop and installed a
+                // permanent null while this outer parse was in progress.
+                if !handle.is_resolved() {
+                    handle.set_resolved(value);
+                    handle.set_parsed_offset_if_unset(parsed_offset);
+                    handle.set_end_offsets(end_before_space, end_after_space);
+                }
             }
             Err(error) => {
                 // A header-generation mismatch is qpdf's reconstruction

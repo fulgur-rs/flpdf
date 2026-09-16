@@ -3098,7 +3098,7 @@ fn recovered_xref_rebinds_a_reused_generation_catalog_before_writer_traversal() 
 /// A cyclic indirect-/Length holder chain
 /// (obj 1's /Length -> obj 2 -> obj 1) must NOT recurse forever. The
 /// in-progress `Reserved` guard breaks the cycle; resolution terminates and
-/// the stream falls back to the endstream-scan length.
+/// qpdf keeps the loop-resolved object as a permanent null.
 #[test]
 fn cyclic_indirect_length_holder_terminates() {
     let mut bytes = b"%PDF-1.7\n".to_vec();
@@ -3120,11 +3120,11 @@ fn cyclic_indirect_length_holder_terminates() {
         format!("trailer\n<< /Size 5 /Root 3 0 R >>\nstartxref\n{xref}\n%%EOF\n").as_bytes(),
     );
     let mut pdf = Pdf::open(std::io::Cursor::new(bytes)).unwrap();
-    // Must terminate (no stack overflow / hang) and yield a stream.
+    // Must terminate (no stack overflow / hang) and keep qpdf's cached null.
     let object = resolved_handle(&mut pdf, ObjectRef::new(1, 0));
     assert!(
-        object.as_stream_dict().is_some(),
-        "cyclic /Length holder must still resolve to a stream (endstream-scan fallback)"
+        object.is_null(),
+        "cyclic /Length holder must remain null after the loop fallback"
     );
 }
 

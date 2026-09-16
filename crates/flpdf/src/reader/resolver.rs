@@ -1753,14 +1753,14 @@ impl<R: Read + Seek> ResolverHandle<R> {
             None,
         ) {
             Ok(parsed) => {
-                self.cache_parsed_object(parsed);
+                self.cache_parsed_object_if_unresolved(parsed);
                 Ok(())
             }
             Err(ReadObjectAtOffsetError::Body(error)) => Err(error),
             Err(ReadObjectAtOffsetError::Header(error)) if attempt_recovery => {
                 match self.reconstruct_xref_and_retry(error, object_gen) {
                     Ok(Some(parsed)) => {
-                        self.cache_parsed_object(parsed);
+                        self.cache_parsed_object_if_unresolved(parsed);
                         Ok(())
                     }
                     Ok(None) => {
@@ -3012,6 +3012,23 @@ impl<R: Read + Seek> ResolverHandle<R> {
         handle.set_end_offsets(end_before_space, end_after_space);
         if !description.is_empty() {
             handle.set_shared_description(description, parsed_offset);
+        }
+    }
+
+    /// Apply the `readObjectAtOffset` cache update only while the parsed
+    /// object's canonical slot remains unresolved. qpdf's resolver can
+    /// re-enter this read through an indirect stream `/Length`; if that
+    /// re-entry detects a loop, it has already installed the permanent null
+    /// in the same slot and the outer parse must not overwrite it
+    /// (`QPDF.cc:1641-1644,1706-1712`). ObjStm member parsing deliberately
+    /// uses the unconditional [`Self::cache_parsed_object`] boundary instead.
+    fn cache_parsed_object_if_unresolved(&self, parsed: ParsedObjectAtOffset) {
+        let object_gen = parsed.object_gen;
+        let already_resolved = self
+            .registered_qpdf_obj_gen_handle(object_gen)
+            .is_some_and(|handle| handle.is_resolved());
+        if !already_resolved {
+            self.cache_parsed_object(parsed);
         }
     }
 
@@ -5324,18 +5341,21 @@ impl<R: Read + Seek> DocumentResolver for ResolverHandle<R> {
     /// position (see [`ResolverCore::tell`]) is a
     /// different quantity, and reporting it instead would be a fabrication.
     ///
-    /// Not ported for a different reason: qpdf's `isUnresolved(og)` early
-    /// return (`:1702-1704`). [`ObjectHandle::try_dereference`] makes the same
-    /// test before calling in, so it is not reachable through that path, but
-    /// this method does not make it itself.
+    /// The post-read `isUnresolved(og)` cache gate (`QPDF.cc:1641-1644`) is
+    /// enforced by `cache_parsed_object_if_unresolved` in the type-1 and raw
+    /// xref paths. This is distinct from `ObjectHandle::try_dereference`'s
+    /// entry guard: the slot can become resolved by a nested `/Length` lookup
+    /// while the outer parse is still returning its parsed value.
     ///
     /// # The type-1 branch
     ///
     /// qpdf's `case 1:` (`libqpdf/QPDF.cc:1720-1727`) calls
-    /// `readObjectAtOffset`, which caches the object it read.
-    /// [`Self::read_object_at_offset_with_description`] is that call; the value it returns is
-    /// written into `handle`'s slot, which *is* the
-    /// [`ResolverCore::object_cache`] entry (see the loop branch above).
+    /// `readObjectAtOffset`, which caches the object it read only when its
+    /// canonical slot is still unresolved. [`Self::read_object_at_offset_with_description`] is
+    /// that call; its result reaches `cache_parsed_object_if_unresolved`, and
+    /// the value is written into the canonical [`ResolverCore::object_cache`]
+    /// entry only when the qpdf gate still permits it (see the loop branch
+    /// above).
     ///
     /// **The three phases, and where each borrow of [`ResolverCore`] lives.**
     ///
@@ -5346,10 +5366,11 @@ impl<R: Read + Seek> DocumentResolver for ResolverHandle<R> {
     ///    parses through [`Self::scan_forward`], every step of which takes and
     ///    drops its own borrow, so the `/Length` dereference inside
     ///    [`Self::read_stream`] is free to re-enter this very method.
-    /// 3. *Short borrows.* `set_resolved`/`set_parsed_offset_if_unset` touch
-    ///    only the handle's own cell — which is the canonical cache entry, so
-    ///    they are the `updateCache` equivalent — and the mark's `drop` takes
-    ///    the last borrow of the core.
+    /// 3. *Short borrows.* The unresolved cache gate then lets
+    ///    `set_resolved`/`set_parsed_offset_if_unset` touch only the handle's
+    ///    own cell — which is the canonical cache entry, so they are the
+    ///    `updateCache` equivalent — and the mark's `drop` takes the last
+    ///    borrow of the core.
     ///
     /// Every failure raised by the dispatch takes qpdf's
     /// `QPDFExc`/`std::exception` catch (`:1737-1742`) followed by the
@@ -5493,7 +5514,7 @@ impl<R: Read + Seek> ResolverHandle<R> {
                 ) {
                     Ok(parsed) => {
                         let parsed_gen = parsed.object_gen;
-                        self.cache_parsed_object(parsed);
+                        self.cache_parsed_object_if_unresolved(parsed);
                         if parsed_gen != object_gen {
                             // qpdf's common resolve tail sees the
                             // requested slot still unresolved after
@@ -5509,7 +5530,7 @@ impl<R: Read + Seek> ResolverHandle<R> {
                         match self.reconstruct_xref_and_retry(error, object_gen) {
                             Ok(Some(parsed)) => {
                                 let parsed_gen = parsed.object_gen;
-                                self.cache_parsed_object(parsed);
+                                self.cache_parsed_object_if_unresolved(parsed);
                                 if parsed_gen != object_gen {
                                     handle.set_resolved(ObjectValue::Null); // cov:ignore: reconstructed xref keys the exact parsed object reference
                                 }

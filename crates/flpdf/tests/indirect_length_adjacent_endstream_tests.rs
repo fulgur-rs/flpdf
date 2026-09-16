@@ -190,22 +190,39 @@ fn correct_holder_reslices_payload_containing_endstreamendobj_bytes() {
     assert_eq!(stream.get_raw_stream_data().unwrap().as_slice(), payload);
 }
 
-/// (2d) qpdf 11.9.0 detects a self-referential holder loop, treats the length as
-/// missing, and recovers the adjacent stream boundary.
+/// (2d) qpdf 11.9.0 detects a self-referential holder loop, permanently nulls
+/// the requested object, and does not let the outer parsed stream overwrite it.
 #[test]
-fn self_referential_holder_adjacent_endstream_recovers_like_qpdf() {
+fn self_referential_holder_stays_null_after_loop_recovery_like_qpdf() {
     let bytes = build_pdf(b"AAAABBBB", b"3 0 R", b"", None);
     let mut pdf = Pdf::open(Cursor::new(bytes)).unwrap();
 
-    assert_metadata_stream_and_warnings(
-        &mut pdf,
-        b"AAAABBBB",
-        &[
+    let stream = metadata_stream_result(&mut pdf).expect("qpdf-style stream recovery");
+    assert!(
+        stream.is_null(),
+        "a loop-resolved null must not be overwritten by the outer parsed stream"
+    );
+    let diagnostics_snapshot = pdf.repair_diagnostics();
+    let diagnostics = diagnostics_snapshot.entries();
+    assert_eq!(
+        diagnostics
+            .iter()
+            .map(|entry| String::from_utf8_lossy(entry.get_message_detail()).into_owned())
+            .collect::<Vec<_>>(),
+        vec![
             "loop detected resolving object 3 0",
             "stream dictionary lacks /Length key",
             "attempting to recover stream length",
             "recovered stream length: 8",
-        ],
+        ]
+    );
+
+    let stream = metadata_stream_result(&mut pdf).expect("cached null recovery");
+    assert!(stream.is_null(), "the cached loop result must remain null");
+    assert_eq!(
+        pdf.repair_diagnostics().entries().len(),
+        4,
+        "cached resolution must not register warnings twice"
     );
 }
 

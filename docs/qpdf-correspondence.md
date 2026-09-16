@@ -698,6 +698,26 @@ document-wide の独自 aggregate route ではなく、保持された各 leaf �
 
 | `QPDF::resolve` / `QPDF::resolveObjectsInStream`（xref object-read/cache boundary） | `QPDF.cc:1700-1857`; `QPDF.cc:1541-1697` | `engine.rs` が parse 前に作る `ResolverHandle` を `xref.rs::CanonicalTrailerOwner` として渡し、active xref stream、hybrid `/XRefStm`、`/Prev` chain、reconstruction candidate の object read を `ResolverHandle::resolve_at_offset_with_optional_description`（live `readObjectAtOffset` → `readObject` → `readStream`）へ統一する。`/Type`/`/W`/`/Index`/`/Size`/filter は `XrefObjectContext` から同じ canonical handle/cache と warning snapshot を参照する。`.48.14`でbootstrap ObjStmの specialized decode順序をqpdf責務へ揃え、`.48.15.1`でcanonical recovery candidateも live ownerから直接 trailer/object handleを生成して `LoadedXrefState` handoff後のrebind/second teardownを無くした。`.48.72`でowner-less public loader/exportとproduction callerを撤去し、残るBootstrapHandleState/bounded reconstruction windowはtest-only scaffoldingとして隔離した。 | 🔀 `.48.13` / `.48.15.1` / `.48.72` / `.48.73` で canonical production xref-stream/read, canonical handoff, public route撤去, warning live deliveryを完了。残るtest-only bootstrap reconstructionはqpdfのproduction document ownerを迂回しない |
 
+### Persistent null after a resolution loop (`flpdf-64dx9`, 2026-09-17)
+
+qpdf 11.9.0 の `QPDF::resolve` は、`isUnresolved` を確認してから
+`m->resolving` の再入を検出する。loop 時は warning の後に同じ `obj_cache` slotを
+`QPDF_Null` へ更新して return する（`QPDF.cc:1699-1714`）。外側の
+`readObjectAtOffset` は parse 後にも `isUnresolved(og)` を確認し、既に loop結果が
+cacheされていれば parsed value で上書きしない（`QPDF.cc:1639-1697`）。一方、
+`resolveObjectsInStream` の member loopは `updateCache` を無条件に呼ぶ
+（`QPDF.cc:1755-1833`）。この違いを uncompressed object read と ObjStm member
+更新の境界として保持する。
+
+flpdf は `ResolverHandle::cache_parsed_object_if_unresolved` を type-1/raw xrefの
+parse結果へ適用し、`BootstrapHandleDocument::resolve_indirect_inner` も同じ
+canonical handleが loop中に解決済みなら parsed value と offsetを適用しない。
+これにより self-referential stream `/Length` は qpdf と同じ恒久 `null` になり、
+stream payload recovery の warning sequence は保持される。ObjStm member側の
+無条件更新は変更しない。`indirect_length_adjacent_endstream_tests.rs` と
+`flpdf-cli/tests/cmp_issue_117_loop_tests.rs` が cache value、diagnostics、linearized
+outputを qpdf 11.9.0 と比較する。
+
 `flpdf-na1b` では、qpdf の raw `m->xref_table` walk (`QPDF.cc:1239-1254`) を
 valid `ObjectRef` view と分けたまま canonical `ResolverCore` の解決境界へ接続する。
 `QpdfObjGen` を expected identity として `readObjectAtOffset` 相当へ渡すため、
