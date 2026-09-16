@@ -1676,6 +1676,23 @@ exit code、`For help:` blockは変更しない。`cli_job_json.rs` の
 4ケースを qpdf 11.9.0 と status/stdout/stderrで固定する。新しい bridgeや
 qpdf-deviation markerは追加しない。
 
+### job-json file-open error boundary (`flpdf-tyu7s`, 2026-09-16)
+
+qpdf の `Config::jobJsonFile` は JSON の read と partial initialization の両方を
+同じ try/catch で包み、失敗を `error with job-json file <path>:` の文脈へ
+変換する（`libqpdf/QPDFJob_config.cc:774-784`）。その例外は argv parser の
+usage boundaryを通り、CLI は `Run <prog> --job-json-help` と `For help:` block
+を含む qpdf 形式で報告する（`libqpdf/QPDFJob_argv.cc:408-415`、
+`qpdf/qpdf.cc:11-23,32-41`）。
+
+flpdf の `JobJsonFile` event は従来、read failureだけを一般の
+`error_with_file`へ渡していた。これを既存の `qpdf_json_input_open_error`で
+`open <path>` と portableな strerrorへ正規化してから
+`job_json_event_error`へ渡すようにし、JSON parse/config failureと同じ
+job-json reporting boundaryへ揃えた。`cli_job_json.rs::job_json_file_missing_reports_job_json_context_and_usage`
+が missing fileの exit/stdout/stderrを qpdf 11.9.0と比較する。新しい
+file-error wrapper、bridge、qpdf-deviation markerは追加しない。
+
 | `QPDFLogger.cc` | 255 | `logger.rs`（private stdout tracker、shared info/warn/error/save routes、standard stdout/stderr/discard、reset/following、save collision、custom sink ownership）+ `reader/resolver.rs` / `reader.rs`（文書 warning の append-then-route、suppression、live logger replacement）+ `flpdf-cli/src/main.rs`（下記 qpdf-equivalent consumers） | ✅ `QPDFLogger.cc:9-40,43-51,80-254`。`diagnostics.rs` は logger ではなく collection-only value store として維持する |
 
 `QPDFArgParser` の help-table 境界は、`flpdf-cli/src/arg_parser.rs` の raw/canonical 二重 argv と
