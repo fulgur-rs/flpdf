@@ -112,7 +112,7 @@
 //! | `isFormXObject`, `isImage` (`include/qpdf/QPDFObjectHandle.hh:1328-1334`) | [`ObjectHandle::is_form_xobject`], [`ObjectHandle::is_image`] | `object_handle_content_shape_tests.rs::form_and_image_classification_matches_qpdf` |
 //! | `CoalesceProvider` (`libqpdf/QPDFObjectHandle.cc:94-118`) | `CoalesceContentProvider` and [`ObjectHandle::coalesce_content_streams`] | `object_handle_page_content_pipeline_tests.rs::coalesce_content_streams_installs_a_lazy_document_owned_provider` |
 //! | `arrayOrStreamToStreamArray`, `getPageContents`, `addPageContents`, `rotatePage`, `coalesceContentStreams` (`libqpdf/QPDFObjectHandle.cc:1438-1572`) | `array_or_stream_to_stream_array`, [`ObjectHandle::get_page_contents`], [`ObjectHandle::add_page_contents`], [`ObjectHandle::rotate_page`], [`ObjectHandle::coalesce_content_streams`] | shape normalization, prepend/append, inherited rotation, malformed-array, and lazy-provider tests |
-//! | `pipePageContents`, `pipeContentStreams` (`libqpdf/QPDFObjectHandle.cc:1702-1737`) | [`ObjectHandle::pipe_page_contents`], [`ObjectHandle::pipe_content_streams`] | `object_handle_page_content_pipeline_tests.rs::pipe_page_contents_decodes_and_joins_streams_with_qpdf_newline_rules` and failure/description tests |
+//! | `pipePageContents`, `pipeContentStreams` (`libqpdf/QPDFObjectHandle.cc:1702-1737`) | [`ObjectHandle::pipe_page_contents`], [`ObjectHandle::pipe_content_streams`] | `object_handle_page_content_pipeline_tests.rs::pipe_page_contents_decodes_and_joins_streams_with_qpdf_newline_rules` and failure/description tests; `flpdf-b8xcx` CLI differential covers unknown-filter error propagation |
 //! | `parsePageContents`, `parseAsContents`, `filterPageContents`, `filterAsContents`, `parseContentStream_internal`, inline-image recovery, `addContentTokenFilter`, `addTokenFilter` (`libqpdf/QPDFObjectHandle.cc:1740-1859`) | [`ObjectHandle::parse_page_contents`], [`ObjectHandle::parse_as_contents`], [`ObjectHandle::filter_page_contents`], [`ObjectHandle::filter_as_contents`], [`ObjectHandle::add_content_token_filter`], [`ObjectHandle::add_token_filter`], [`crate::content_stream::parse_content_stream_handles`] | `object_handle_content_parser_tests.rs` callback identity/span/warning-error/early-stop/inline-image/filter tests |
 //! | `isFormXObject`, `isImage` (`libqpdf/QPDFObjectHandle.cc:2340-2352`) | [`ObjectHandle::is_form_xobject`], [`ObjectHandle::is_image`] | direct/indirect subtype and ImageMask exclusion tests |
 //!
@@ -5787,7 +5787,10 @@ impl ObjectHandle {
                 false,
                 false,
             )?;
-            if !succeeded {
+            // qpdf's five-argument pipeStreamData overload returns whether
+            // filtering was attempted, so an unknown filter is a content
+            // stream decode failure even when the raw source was readable.
+            if !succeeded || !filtering_attempted {
                 return Err(Error::QpdfExc(QpdfExc::new(
                     QpdfErrorCode::DamagedPdf,
                     b"content stream",
