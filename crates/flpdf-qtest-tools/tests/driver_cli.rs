@@ -48,7 +48,7 @@ fn test_50_uses_canonical_resource_merge_accessors() {
         .find("pub(crate) fn run_test_50")
         .expect("test 50 source section");
     let end = source[start..]
-        .find("\n/// Resolve one handle hop")
+        .find("\n/// test_driver.cc:1955-1997 (`test_51`).")
         .map(|offset| start + offset)
         .expect("test 50 source section end");
     let test_50 = &source[start..end];
@@ -1402,6 +1402,29 @@ fn qtest_accessor_cases_do_not_use_explicit_pdf_resolve() {
             "test 51 must flush diagnostics before propagating `{call}`"
         );
     }
+
+    let test_52 = section(
+        form_source.as_str(),
+        "pub(crate) fn run_test_52",
+        "pub(crate) fn run_test_53",
+    );
+    assert!(
+        test_52.contains("pdf.root_handle()?")
+            && test_52.contains("try_get_key(")
+            && test_52.contains("try_get_array_n_items()?")
+            && test_52.contains("try_get_array_item(")
+            && test_52.contains("try_is_string()?")
+            && test_52.contains("try_get_utf8_value()?")
+            && test_52.contains("FormFieldObjectHelper::from_object_handle(")
+            && test_52.matches("emit_new_diagnostics(").count() >= 8
+            && !test_52.contains("resolve_and_drain(")
+            && !test_52.contains("pdf.resolve(")
+            && !test_52.contains(".get_key(")
+            && !test_52.contains(".as_array()")
+            && !test_52.contains("FormFieldObjectHelper::new(")
+            && !test_52.contains("FIELD_MUST_BE_INDIRECT"),
+        "test 52 must use canonical resolving accessors and handle-native form helpers"
+    );
 
     let test_2 = section(
         early_source.as_str(),
