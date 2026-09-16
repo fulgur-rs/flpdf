@@ -37,6 +37,31 @@ fn test_85_uses_canonical_integer_accessors_and_emits_qpdf_clamp_warnings() {
 }
 
 #[test]
+fn test_50_uses_canonical_resource_merge_accessors() {
+    let source = fs::read_to_string(concat!(
+        env!("CARGO_MANIFEST_DIR"),
+        "/src/driver/test_50_55.rs"
+    ))
+    .expect("read test 50-55 driver source");
+    let start = source
+        .find("pub(crate) fn run_test_50")
+        .expect("test 50 source section");
+    let end = source[start..]
+        .find("\n/// Resolve one handle hop")
+        .map(|offset| start + offset)
+        .expect("test 50 source section end");
+    let test_50 = &source[start..end];
+
+    assert!(
+        !test_50.contains("pdf.resolve(")
+            && test_50.contains("let d2_k1 = d2.try_get_key(b\"/k1\")?;")
+            && test_50.contains("d1.merge_resources(&d2, None)?;\n    emit_new_diagnostics")
+            && test_50.contains("d1.merge_resources(&d2_k1, None)?;"),
+        "test 50 must use canonical resource merge and dictionary accessors"
+    );
+}
+
+#[test]
 fn test_86_uses_canonical_unicode_string_handle_accessors() {
     let source = fs::read_to_string(concat!(
         env!("CARGO_MANIFEST_DIR"),

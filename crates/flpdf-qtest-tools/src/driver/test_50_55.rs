@@ -36,21 +36,17 @@ pub(crate) fn run_test_50<R: Read + Seek>(
     let d1_handle = pdf.trailer_key_handle(b"Dict1");
     let d2_handle = pdf.trailer_key_handle(b"Dict2");
 
-    // `ObjectHandle::merge_resources` requires both operands already
-    // resolved ("a no-op unless both `self` and `other` are dictionaries",
-    // checked via `as_dictionary`, which "never performs resolution
-    // itself") -- unlike qpdf's `mergeResources`, whose `isDictionary()`/
-    // `getKey()` calls dereference implicitly. Resolve each handle once,
-    // then mutate the same canonical handles that came from the trailer;
+    // qpdf's `mergeResources` resolves both operands through
+    // `isDictionary()` before inspecting their entries. The canonical
+    // `ObjectHandle::merge_resources` owns that same resolution boundary, so
+    // keep the trailer children unresolved until the merge operation itself;
     // qpdf's merge operation never replaces an indirect identity with a
     // copied terminal value.
-    pdf.resolve(&d1_handle)?;
-    pdf.resolve(&d2_handle)?;
     let d1 = d1_handle.clone();
     let d2 = d2_handle.clone();
-    emit_new_diagnostics(pdf, diagnostics_written, filename, stdout, stderr)?;
 
     d1.merge_resources(&d2, None)?;
+    emit_new_diagnostics(pdf, diagnostics_written, filename, stdout, stderr)?;
 
     // `d1.getJSON(JSON::LATEST)` uses qpdf's default
     // `dereference_indirect = false` (`include/qpdf/QPDFObjectHandle.hh`):
@@ -59,26 +55,24 @@ pub(crate) fn run_test_50<R: Read + Seek>(
     // (`QPDFObjectHandle::getJSON`, `libqpdf/QPDFObjectHandle.cc:1613-1627`)
     // even though `merge_resources` above already mutated the object it
     // points to. `pdf_object_to_json` implements the identical
-    // never-resolve-the-top-level contract, so passing the *original*
-    // `d1_handle` here (not the resolved `d1`) is what reproduces that; for
-    // a direct `/Dict1` the two handles share the same state, so this still
+    // never-resolve-the-top-level contract, so pass the original trailer
+    // child handle rather than materializing a separate JSON value; for a
+    // direct `/Dict1` the two handles share the same state, so this still
     // shows the merged dictionary.
     let json = pdf_object_to_json(&d1_handle).map_err(|error| Error::System(error.to_string()))?;
     let unparsed = json.unparse()?;
     stdout.write_all(&unparsed)?;
     writeln!(stdout)?;
 
-    // Top-level type mismatch: `d2.getKey("/k1")` need not itself be a
+    // Top-level type mismatch: qpdf's `d2.getKey("/k1")` result need not be a
     // dictionary (deliberately mismatched by this test). qpdf's
     // `mergeResources` call happens unconditionally regardless of that
     // value's type; whether it turns out to be a no-op depends on the
     // resolved type, matching `merge_resources`'s own no-op contract for a
     // non-dictionary `other`.
-    let d2_k1_handle = d2.get_key(b"/k1");
-    pdf.resolve(&d2_k1_handle)?;
-    let d2_k1 = d2_k1_handle.clone();
-    emit_new_diagnostics(pdf, diagnostics_written, filename, stdout, stderr)?;
+    let d2_k1 = d2.try_get_key(b"/k1")?;
     d1.merge_resources(&d2_k1, None)?;
+    emit_new_diagnostics(pdf, diagnostics_written, filename, stdout, stderr)?;
 
     // qpdf iterates `d1`'s top-level keys whose already-merged value is itself
     // a dictionary, printing the sorted names returned by
