@@ -4230,7 +4230,7 @@ fn write_linearized_impl<R: Read + Seek>(
     // Floor the header to 1.5 only when the output actually carries an ObjStm
     // container (qpdf raises the minimum on real emission, not on mode). When
     // all batch lists are empty the placement early-returned and no container
-    // is written, so the non-ObjStm linearized goldens stay at the 1.2 floor.
+    // is written, so the source version remains unchanged.
     //
     // Adobe developer-extension propagation (qpdf QPDFWriter.cc L1355-1450
     // `addDeveloperExtension`, and the pairwise `setMinimumPDFVersion`
@@ -4247,7 +4247,7 @@ fn write_linearized_impl<R: Read + Seek>(
     let source_ver = pdf.version().to_string();
     let source_ext = pdf.adobe_extension_level()?.unwrap_or(0);
     let (eff_version, eff_ext) =
-        effective_pdf_version_and_ext(&source_ver, source_ext, options, true, emits_object_streams);
+        effective_pdf_version_and_ext(&source_ver, source_ext, options, emits_object_streams);
     let part1 = Part1Bytes::build(plan, renumber, eff_version);
     let part1_placeholders = part1.placeholders.clone();
     let part1_dict_region = part1.dict_writable_region.clone();

@@ -97,7 +97,6 @@ fn write_plain_live<R: Read + Seek>(
             &source_version,
             source_extension_level,
             options,
-            false,
             has_object_stream_hint,
             encryption_parameters.as_ref(),
         );
