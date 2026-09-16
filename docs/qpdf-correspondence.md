@@ -1625,6 +1625,37 @@ qpdf は argv 順で最初に問題のあるトークンで失敗するため、
 `initializeFromJson(..., true)`を呼ぶ契約（`QPDFJob_config.cc:774-784`）に対応し、
 input/outputなど非加算設定の重複は後勝ちではなくqpdfのusage errorとして残す。
 
+### job-json CLI occurrence layering (`flpdf-u40ck`, 2026-09-16)
+
+qpdf の `QPDFArgParser::parseArgs` は argv を一度だけ左から走査し、各
+option callbackをその場で呼ぶ（`libqpdf/QPDFArgParser.cc:433-555`）。
+`Config::jobJsonFile` はその既存Configへ `initializeFromJson(..., true)` を
+重ねるため、`password`/`passwordFile`/`passwordMode` と input/output selector の
+勝者・重複エラーは、JSONとCLIの相対位置を含むoccurrence順で決まる
+（`libqpdf/QPDFJob_config.cc:16-62,449-460,625-697,774-784`、
+`libqpdf/QPDFJob_json.cc:611-625`）。最終的なstateは `createQPDF` で一度だけ
+入力へ渡され、`run` が単一のwrite/inspection consumerを選ぶ
+（`libqpdf/QPDFJob.cc:428-480,513-520`）。
+
+flpdf は `arg_parser.rs` が保持する raw residual argv を
+`main.rs::job_json_cli_events` として投影し、`run_job_json_files` が
+`JobJsonFile`、empty/input/output/replace-input、password/password-file、
+password interpretation、recovery、check-linearizationを同じ `QPDFJob` へ
+左から適用する。`QPDFJob::initialize_from_json_partial_bytes` も partial 呼出し
+の既存configurationを保持し、qpdfの共有Config責務を維持する
+（`crates/flpdf-cli/src/main.rs::job_json_cli_events` / `run_job_json_files`、
+`crates/flpdf/src/job/lifecycle.rs::initialize_from_json_with_partial`）。
+新しいargv parser、JSON schema、qpdf非対応bridgeは追加していない。
+
+`crates/flpdf-cli/tests/cli_job_json.rs` の
+`job_json_file_password_follows_argv_order`、
+`job_json_file_password_file_follows_argv_order`、
+`job_json_file_password_mode_follows_argv_order`、
+`job_json_file_password_is_hex_key_follows_argv_order`、
+`job_json_file_empty_input_selector_follows_argv_order` と、
+`crates/flpdf/src/job/lifecycle.rs::tests::partial_job_json_preserves_preconfigured_qpdf_state`
+が、qpdf 11.9.0とのstatus/stdout/stderrと共有Configの差分を固定する。
+
 | `QPDFLogger.cc` | 255 | `logger.rs`（private stdout tracker、shared info/warn/error/save routes、standard stdout/stderr/discard、reset/following、save collision、custom sink ownership）+ `reader/resolver.rs` / `reader.rs`（文書 warning の append-then-route、suppression、live logger replacement）+ `flpdf-cli/src/main.rs`（下記 qpdf-equivalent consumers） | ✅ `QPDFLogger.cc:9-40,43-51,80-254`。`diagnostics.rs` は logger ではなく collection-only value store として維持する |
 
 `QPDFArgParser` の help-table 境界は、`flpdf-cli/src/arg_parser.rs` の raw/canonical 二重 argv と
