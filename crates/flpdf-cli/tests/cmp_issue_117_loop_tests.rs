@@ -51,6 +51,22 @@ fn issue_117_fixture() -> Vec<u8> {
     bytes
 }
 
+/// Normalize qpdf's Windows text-mode CRLF output for cross-platform checks.
+fn normalize_text_newlines(bytes: &[u8]) -> Vec<u8> {
+    let mut normalized = Vec::with_capacity(bytes.len());
+    let mut remaining = bytes;
+    while let Some((&byte, rest)) = remaining.split_first() {
+        if byte == b'\r' && rest.first() == Some(&b'\n') {
+            normalized.push(b'\n');
+            remaining = &rest[1..];
+        } else {
+            normalized.push(byte);
+            remaining = rest;
+        }
+    }
+    normalized
+}
+
 #[test]
 fn self_referential_stream_resolves_to_null_like_qpdf() {
     if !qpdf_available() {
@@ -76,9 +92,17 @@ fn self_referential_stream_resolves_to_null_like_qpdf() {
         .expect("flpdf must inspect issue-117 fixture");
 
     assert_eq!(flpdf.status.code(), qpdf.status.code());
-    assert_eq!(flpdf.stdout, qpdf.stdout, "object value differs from qpdf");
-    assert_eq!(flpdf.stderr, qpdf.stderr, "diagnostics differ from qpdf");
-    assert_eq!(qpdf.stdout, b"null\n");
+    assert_eq!(
+        normalize_text_newlines(&flpdf.stdout),
+        normalize_text_newlines(&qpdf.stdout),
+        "object value differs from qpdf"
+    );
+    assert_eq!(
+        normalize_text_newlines(&flpdf.stderr),
+        normalize_text_newlines(&qpdf.stderr),
+        "diagnostics differ from qpdf"
+    );
+    assert_eq!(normalize_text_newlines(&qpdf.stdout), b"null\n");
 }
 
 #[test]
