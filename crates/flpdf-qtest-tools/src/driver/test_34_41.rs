@@ -138,26 +138,33 @@ pub(crate) fn run_test_34<R: Read + Seek>(
     // observable boundaries in that order while delegating each responsibility
     // to the production Pdf API. Drain diagnostics before the corresponding
     // output line because qpdf's warning logger is synchronous.
-    let extension_level = pdf.get_extension_level()?;
+    // qpdf's warning logger is synchronous, so a call that records a repair
+    // warning and *then* fails must still have that warning printed first.
+    // Hold the result, drain diagnostics, and only then propagate.
+    let extension_level = pdf.get_extension_level();
     emit_new_diagnostics(pdf, diagnostics_written, filename, stdout, stderr)?;
+    let extension_level = extension_level?;
     writeln!(stdout, "extension level: {extension_level}")?;
 
     // `getKey("/Extensions").unparse()` never dereferences: an indirect
     // result always prints its own `N G R` regardless of resolution state,
     // and a direct result's own nested children print the same way
     // (`ObjectHandle::unparse`'s own doc) -- no extra resolve step here.
-    let root = pdf.root_handle()?;
+    let root = pdf.root_handle();
     emit_new_diagnostics(pdf, diagnostics_written, filename, stdout, stderr)?;
-    let extensions = root.try_get_key(b"/Extensions")?;
+    let root = root?;
+    let extensions = root.try_get_key(b"/Extensions");
     emit_new_diagnostics(pdf, diagnostics_written, filename, stdout, stderr)?;
+    let extensions = extensions?;
     write_bytes(stdout, &extensions.unparse())?;
     writeln!(stdout)?;
 
     // `getVersionAsPDFVersion` calls getExtensionLevel again, as qpdf does;
     // the canonical resolver cache prevents already-observed warnings from
     // being emitted a second time.
-    let version = pdf.get_version_as_pdf_version()?;
+    let version = pdf.get_version_as_pdf_version();
     emit_new_diagnostics(pdf, diagnostics_written, filename, stdout, stderr)?;
+    let version = version?;
     writeln!(
         stdout,
         "As PDFVersion: {}.{}/{extension_level}",
