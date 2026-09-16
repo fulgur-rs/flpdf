@@ -1045,6 +1045,22 @@ rotation-before-consumer境界を共有する。qpdf differential testは
 `cli_inspection_combinations.rs::standalone_show_object_inspection_applies_rotation_before_the_consumer`
 で90/180/270度を固定し、個別show-object用のrotation parserやbridgeは追加しない。
 
+### E-13 / E-21 standalone rotation usage preflight (`flpdf-9orwb`, 2026-09-16)
+
+qpdfの `Config::rotate` は argv callback中に
+`parseRotationParameter`を実行し、`createQPDF`の入力 `processFile`より前に
+不正値をusageとして報告する（`libqpdf/QPDFJob_config.cc:786-790`、
+`libqpdf/QPDFJob.cc:368-415,428-435`）。
+
+flpdfはtop-level raw rotation parametersをdispatch/input open前に既存の
+`QPDFJob::Config::rotate`へpreflightし、typed `UsageError`を共通の
+`usage_exit`へ渡す。valid値は従来の各standalone consumerが同じConfig setterへ
+設定し、既存のcreate-stage rotation/inspection順序を保持する。
+`cli_inspection_combinations.rs::standalone_inspection_reports_invalid_rotation_before_input_open`
+は12個のstandalone inspection/status routeについて qpdf 11.9.0の
+exit/stdout/stderrをmissing inputで比較する。個別parser、bridge、deviation markerは
+追加しない。
+
 ### E-17 / E-21 full conflict declaration audit (`flpdf-sg6tu`, 2026-09-16)
 
 qpdf 11.9.0 の `QPDFJob::checkConfiguration` は

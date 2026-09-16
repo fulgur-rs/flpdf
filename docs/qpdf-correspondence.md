@@ -3933,6 +3933,24 @@ manual-open consumerが回転前documentを表示していた。`flpdf-9r7ti` �
 status/stdout/stderrを比較し、既存のJSON/output/overlay rotation consumerは
 それぞれのcanonical Job routeを継続利用する。
 
+### Standalone rotation usage preflight (`flpdf-9orwb`, 2026-09-16)
+
+qpdf の `Config::rotate` callback は argv 初期化中に
+`parseRotationParameter` を呼ぶため、`createQPDF` の `processFile` より前に
+不正値を usage として確定する（`libqpdf/QPDFJob_config.cc:786-790`、
+`libqpdf/QPDFJob.cc:368-415,428-435`）。この境界は `--check`、各
+`--show-*`、attachment inspection、`--is-encrypted`、
+`--requires-password` に共通する。
+
+flpdf は top-level raw rotation parametersを dispatch/input open前に既存の
+`QPDFJob::Config::rotate`へ preflightし、typed `UsageError`を共通の
+`usage_exit`へ渡す。その後の各consumerは従来どおり同じ raw parameterを
+実ジョブへ設定して、validな rotationの適用・inspection順序を変えない。
+`cli_inspection_combinations.rs::standalone_inspection_reports_invalid_rotation_before_input_open`
+は standalone inspection/status 12経路の missing-inputで qpdf 11.9.0の
+exit/stdout/stderrを比較する。個別parser、bridge、qpdf-deviation markerは
+追加しない。
+
 ### QPDFJob conflict inventory and canonical CLI routing (`flpdf-sg6tu`, 2026-09-16)
 
 qpdf 11.9.0 の最終 configuration check は、`--replace-input` と

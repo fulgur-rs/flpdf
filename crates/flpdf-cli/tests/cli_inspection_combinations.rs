@@ -679,6 +679,32 @@ fn standalone_show_object_inspection_applies_rotation_before_the_consumer() {
 }
 
 #[test]
+fn standalone_inspection_reports_invalid_rotation_before_input_open() {
+    if !qpdf_available() {
+        return;
+    }
+
+    let directory = tempfile::tempdir().expect("temporary missing-input directory");
+    let input = directory.path().join("missing.pdf");
+    for inspection in [
+        "--check",
+        "--check-linearization",
+        "--show-object=3,0",
+        "--show-npages",
+        "--show-pages",
+        "--show-xref",
+        "--show-linearization",
+        "--show-encryption",
+        "--list-attachments",
+        "--show-attachment=missing",
+        "--is-encrypted",
+        "--requires-password",
+    ] {
+        assert_matches_qpdf_path(&["--rotate=91", inspection], &input);
+    }
+}
+
+#[test]
 fn overlay_inspection_uses_segment_password_options_for_the_donor() {
     if !qpdf_available() {
         return;
