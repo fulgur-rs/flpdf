@@ -98,6 +98,52 @@ class CheckQpdfRouteMatrixTests(unittest.TestCase):
             self.assertIn("qpdf-correspondence.md", result.stdout)
             self.assertIn("qpdf/Missing.cc", result.stdout)
 
+    def test_bare_basename_citations_are_resolved_and_counted(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary_directory:
+            repo = SyntheticRepository(Path(temporary_directory))
+            qpdf_programs = repo.qpdf / "qpdf"
+            qpdf_programs.mkdir()
+            (qpdf_programs / "qpdf-ctest.c").write_text("a\nb\n", encoding="utf-8")
+            repo.write("a.md", HEADER)
+            repo.write_correspondence(
+                "See `QPDF.cc:1-3` and `qpdf-ctest.c:1-2` for details.\n"
+            )
+            result = repo.check()
+            self.assertEqual(0, result.returncode, result.stdout + result.stderr)
+            self.assertIn("OK: 2 qpdf citation(s)", result.stdout)
+
+    def test_bare_basename_range_is_checked_against_the_resolved_file(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary_directory:
+            repo = SyntheticRepository(Path(temporary_directory))
+            repo.write("a.md", HEADER)
+            repo.write_correspondence("See `QPDF.cc:1-4` for details.\n")
+            result = repo.check()
+            self.assertNotEqual(0, result.returncode)
+            self.assertIn("QPDF.cc:1-4", result.stdout)
+
+    def test_missing_bare_basename_is_an_error(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary_directory:
+            repo = SyntheticRepository(Path(temporary_directory))
+            repo.write("a.md", HEADER)
+            repo.write_correspondence("See `Missing.cc:1` for details.\n")
+            result = repo.check()
+            self.assertNotEqual(0, result.returncode)
+            self.assertIn("Missing.cc:1", result.stdout)
+            self.assertIn("basename", result.stdout)
+
+    def test_ambiguous_bare_basename_is_an_error(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary_directory:
+            repo = SyntheticRepository(Path(temporary_directory))
+            (repo.qpdf / "include" / "qpdf" / "QPDF.cc").write_text(
+                "a\nb\nc\n", encoding="utf-8"
+            )
+            repo.write("a.md", HEADER)
+            repo.write_correspondence("See `QPDF.cc:1` for details.\n")
+            result = repo.check()
+            self.assertNotEqual(0, result.returncode)
+            self.assertIn("QPDF.cc:1", result.stdout)
+            self.assertIn("ambiguous", result.stdout)
+
     def test_no_qpdf_still_checks_correspondence_citation_syntax(self) -> None:
         with tempfile.TemporaryDirectory() as temporary_directory:
             repo = SyntheticRepository(Path(temporary_directory))
@@ -106,6 +152,16 @@ class CheckQpdfRouteMatrixTests(unittest.TestCase):
             result = repo.check("--no-qpdf")
             self.assertNotEqual(0, result.returncode)
             self.assertIn("qpdf-correspondence.md", result.stdout)
+            self.assertIn("malformed qpdf citation", result.stdout)
+
+    def test_no_qpdf_still_checks_bare_citation_syntax(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary_directory:
+            repo = SyntheticRepository(Path(temporary_directory))
+            repo.write("a.md", HEADER)
+            repo.write_correspondence("See `QPDF.cc:bogus` for details.\n")
+            result = repo.check("--no-qpdf")
+            self.assertNotEqual(0, result.returncode)
+            self.assertIn("QPDF.cc:bogus", result.stdout)
             self.assertIn("malformed qpdf citation", result.stdout)
 
     def test_line_range_past_end_of_file_is_error(self) -> None:
