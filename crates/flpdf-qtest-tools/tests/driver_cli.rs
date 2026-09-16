@@ -42,7 +42,8 @@ fn test_50_uses_canonical_resource_merge_accessors() {
         env!("CARGO_MANIFEST_DIR"),
         "/src/driver/test_50_55.rs"
     ))
-    .expect("read test 50-55 driver source");
+    .expect("read test 50-55 driver source")
+    .replace("\r\n", "\n");
     let start = source
         .find("pub(crate) fn run_test_50")
         .expect("test 50 source section");
