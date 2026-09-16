@@ -1518,7 +1518,9 @@ fn qtest_accessor_cases_do_not_use_explicit_pdf_resolve() {
         "pub(crate) fn run_test_69",
     );
     assert!(
-        !test_68.contains("dict_key(") && !test_68.contains("resolve_handle("),
+        !test_68.contains("dict_key(")
+            && !test_68.contains("resolve_handle(")
+            && !test_68.contains("pdf.resolve("),
         "test 68 retains the qpdf-less stream lookup resolution bridge"
     );
     assert!(
