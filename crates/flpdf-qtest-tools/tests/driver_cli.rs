@@ -1431,10 +1431,10 @@ fn qtest_accessor_cases_do_not_use_explicit_pdf_resolve() {
     assert!(
         test_52.contains("pdf.root_handle()")
             && test_52.contains("try_get_key(")
-            && test_52.contains("try_get_array_n_items()?")
+            && test_52.contains("try_get_array_n_items()")
             && test_52.contains("try_get_array_item(")
-            && test_52.contains("try_is_string()?")
-            && test_52.contains("try_get_utf8_value()?")
+            && test_52.contains("try_is_string()")
+            && test_52.contains("try_get_utf8_value()")
             && test_52.contains("FormFieldObjectHelper::from_object_handle(")
             && test_52.matches("emit_new_diagnostics(").count() >= 8
             && test_52.contains("let root = match pdf.root_handle()")
@@ -1447,6 +1447,20 @@ fn qtest_accessor_cases_do_not_use_explicit_pdf_resolve() {
             && !test_52.contains("FIELD_MUST_BE_INDIRECT"),
         "test 52 must use canonical resolving accessors and handle-native form helpers"
     );
+    // Same synchronous-logger contract as test 51: an accessor that records a
+    // repair warning and *then* fails must have that warning printed first, so
+    // `?` must never be applied directly to the call.
+    for call in [
+        "pdf.root_handle()",
+        "try_get_array_n_items()",
+        "try_is_string()",
+        "try_get_utf8_value()",
+    ] {
+        assert!(
+            !test_52.contains(&format!("{call}?")),
+            "test 52 must flush diagnostics before propagating `{call}`"
+        );
+    }
 
     let test_2 = section(
         early_source.as_str(),

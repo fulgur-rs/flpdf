@@ -189,25 +189,34 @@ pub(crate) fn run_test_52<R: Read + Seek>(
         }
     };
     emit_new_diagnostics(pdf, diagnostics_written, filename, stdout, stderr)?;
-    let acroform = root.try_get_key(b"/AcroForm")?;
+    let acroform = root.try_get_key(b"/AcroForm");
     emit_new_diagnostics(pdf, diagnostics_written, filename, stdout, stderr)?;
-    let fields = acroform.try_get_key(b"/Fields")?;
+    let acroform = acroform?;
+    let fields = acroform.try_get_key(b"/Fields");
     emit_new_diagnostics(pdf, diagnostics_written, filename, stdout, stderr)?;
-    let count = fields.try_get_array_n_items()?;
+    let fields = fields?;
+    let count = fields.try_get_array_n_items();
     emit_new_diagnostics(pdf, diagnostics_written, filename, stdout, stderr)?;
+    let count = count?;
 
     for index in 0..count {
-        let field = fields.try_get_array_item(index as i64)?;
+        let field = fields.try_get_array_item(index as i64);
         emit_new_diagnostics(pdf, diagnostics_written, filename, stdout, stderr)?;
-        let t = field.try_get_key(b"/T")?;
+        let field = field?;
+        let t = field.try_get_key(b"/T");
         emit_new_diagnostics(pdf, diagnostics_written, filename, stdout, stderr)?;
-        if !t.try_is_string()? {
+        let t = t?;
+        let is_string = t.try_is_string();
+        emit_new_diagnostics(pdf, diagnostics_written, filename, stdout, stderr)?;
+        let is_string = is_string?;
+        if !is_string {
             emit_new_diagnostics(pdf, diagnostics_written, filename, stdout, stderr)?;
             continue;
         }
         emit_new_diagnostics(pdf, diagnostics_written, filename, stdout, stderr)?;
-        let utf8 = t.try_get_utf8_value()?;
+        let utf8 = t.try_get_utf8_value();
         emit_new_diagnostics(pdf, diagnostics_written, filename, stdout, stderr)?;
+        let utf8 = utf8?;
 
         if utf8 == b"list1" {
             writeln!(stdout, "setting list1 value")?;
