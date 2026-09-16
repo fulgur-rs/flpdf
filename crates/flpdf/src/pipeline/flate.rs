@@ -492,11 +492,7 @@ impl<'a> Flate<'a> {
             }
 
             if produced > 0 {
-                let output = Self::initialized_output_slice(
-                    self.output.as_ptr(),
-                    self.output.len(),
-                    produced,
-                );
+                let output = Self::initialized_output_slice(&self.output, produced);
                 self.next.write(output)?;
             }
 
@@ -510,17 +506,20 @@ impl<'a> Flate<'a> {
         }
     }
 
+    /// View the first `length` bytes of `buffer` as initialized.
+    ///
+    /// The returned lifetime is elided from `buffer`, so the borrow checker
+    /// keeps the view from outliving the storage it points into, and `length`
+    /// is bounded by the slice's own length rather than by a `debug_assert!`
+    /// that a release build compiles out.
     #[allow(unsafe_code)]
-    fn initialized_output_slice<'b>(
-        pointer: *const MaybeUninit<u8>,
-        capacity: usize,
-        length: usize,
-    ) -> &'b [u8] {
-        debug_assert!(length <= capacity);
+    fn initialized_output_slice(buffer: &[MaybeUninit<u8>], length: usize) -> &[u8] {
+        let initialized = &buffer[..length];
         // SAFETY: `flate2`/zlib-rs `*_uninit` reports only bytes written to the
         // supplied output slice. Every byte in this range is initialized
-        // before this view is created.
-        unsafe { std::slice::from_raw_parts(pointer.cast::<u8>(), length) }
+        // before this view is created, and the slicing above rejects a
+        // `length` past the end of the buffer instead of reading out of bounds.
+        unsafe { std::slice::from_raw_parts(initialized.as_ptr().cast::<u8>(), length) }
     }
 
     fn process_codec(&mut self, data: &[u8], finishing: bool) -> PipelineResult<()> {
