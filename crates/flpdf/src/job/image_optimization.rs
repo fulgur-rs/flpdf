@@ -1,4 +1,4 @@
-//! Image optimization during qpdf-compatible job transformations.
+//! Optimize eligible raster images during document transformations.
 //!
 //! qpdf correspondence: QPDFJob::ImageOptimizer and Pl_DCT image compression.
 //!

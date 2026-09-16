@@ -1,4 +1,4 @@
-//! Parse qpdf JSON values and callback events.
+//! Parse PDF inspection JSON values and deliver callback events.
 //!
 //! qpdf correspondence: JSON.cc parser state machine and Reactor event responsibilities.
 //!

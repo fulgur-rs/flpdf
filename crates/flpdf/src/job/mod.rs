@@ -1,4 +1,4 @@
-//! Command-level operations corresponding to qpdf's `QPDFJob` layer.
+//! Coordinate document-level inspection, transformation, and output policies.
 //!
 //! qpdf correspondence: QPDFJob.cc command and JSON section orchestration.
 //!

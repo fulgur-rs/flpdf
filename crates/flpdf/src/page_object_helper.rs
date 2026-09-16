@@ -1,4 +1,4 @@
-//! Per-page typed accessor helper, mirroring qpdf's `QPDFPageObjectHelper`.
+//! Provide live typed access to one PDF page.
 //!
 //! qpdf correspondence: QPDFPageObjectHelper.cc responsibilities shared with page form, resource, flatten, and overlay modules.
 //!

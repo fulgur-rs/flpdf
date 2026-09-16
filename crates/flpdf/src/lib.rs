@@ -1,4 +1,4 @@
-//! `flpdf` is a pure-Rust PDF toolkit modeled on the qpdf workflow.
+//! `flpdf` is a pure-Rust toolkit for reading, inspecting, transforming, and writing PDF documents.
 //!
 //! qpdf correspondence: crate root aggregating multiple qpdf library components and flpdf-only APIs.
 //!

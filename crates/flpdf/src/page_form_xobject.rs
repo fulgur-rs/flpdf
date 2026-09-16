@@ -1,5 +1,4 @@
-//! Convert a page into a Form XObject, mirroring qpdf's
-//! `QPDFPageObjectHelper::getFormXObjectForPage`.
+//! Convert a page into a Form XObject for composition operations.
 //!
 //! qpdf correspondence: QPDFPageObjectHelper.cc page-to-Form-XObject conversion split from the page helper.
 //!

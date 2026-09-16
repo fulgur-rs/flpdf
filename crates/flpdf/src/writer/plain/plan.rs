@@ -1,4 +1,4 @@
-//! Logical object placements for the qpdf-shaped plain writer pipeline.
+//! Plan logical object placement for ordinary PDF rewrites.
 //!
 //! qpdf correspondence: QPDFWriter.cc standard-write object placement and renumber planning.
 //!

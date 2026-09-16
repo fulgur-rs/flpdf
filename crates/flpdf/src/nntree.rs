@@ -1,5 +1,5 @@
-//! This module provides the shared engine plus public wrappers corresponding
-//! to `QPDFNameTreeObjectHelper` and `QPDFNumberTreeObjectHelper`.
+//! Provide a shared engine and public wrappers for PDF name trees and number
+//! trees.
 //!
 //! qpdf correspondence: NNTree.cc behavior implemented with Rust-specific storage, error, and ownership boundaries.
 //!

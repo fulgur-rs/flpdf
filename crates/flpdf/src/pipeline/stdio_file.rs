@@ -1,6 +1,5 @@
 //! Partial progress is retried, but writer errors (including `Interrupted`) are
-//! reported immediately, matching qpdf's zero-result `fwrite` error path.
-//! Finish maps only raw `EBADF` to a logic error and ignores other flush
+//! reported immediately. Finish maps only raw `EBADF` to a logic error and ignores other flush
 //! failures. `StdioBuffer` supplies the caller-owned 4096-byte stdio boundary
 //! without Rust's automatic `Interrupted` retry.
 //!

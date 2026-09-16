@@ -1,4 +1,4 @@
-//! Import qpdf JSON into the live PDF object graph.
+//! Import PDF inspection JSON into the live document object graph.
 //!
 //! qpdf correspondence: `QPDF_json.cc` JSONReactor state machine, validators, deferred stream providers, and `makeObject` value construction.
 //!

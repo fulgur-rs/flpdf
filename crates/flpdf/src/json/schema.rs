@@ -1,4 +1,4 @@
-//! Validate qpdf JSON value structure.
+//! Validate PDF inspection JSON value structure.
 //!
 //! qpdf correspondence: JSON.cc schema validation responsibilities.
 //!

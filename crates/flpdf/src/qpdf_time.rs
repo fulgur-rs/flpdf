@@ -1,4 +1,4 @@
-//! qpdf-compatible PDF date and time utilities.
+//! Represent and format PDF date and time values.
 //!
 //! qpdf correspondence: `QUtil::QPDFTime`, `get_current_qpdf_time`, and `qpdf_time_to_pdf_time`.
 //!

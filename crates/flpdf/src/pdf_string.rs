@@ -1,5 +1,5 @@
-//! This module owns PDFDocEncoding decoding, qpdf-compatible Unicode-string
-//! construction, and forced binary serialization for all flpdf consumers.
+//! Decode PDFDocEncoding, construct Unicode PDF strings, and serialize binary
+//! strings for flpdf consumers.
 //!
 //! qpdf correspondence: `libqpdf/QPDF_String.cc` PDF string semantics.
 //!

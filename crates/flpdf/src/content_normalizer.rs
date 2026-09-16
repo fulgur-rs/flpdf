@@ -1,4 +1,4 @@
-//! Content-stream normalization for qpdf-compatible output.
+//! Normalize PDF content streams and report malformed-token recovery.
 //!
 //! Mirrors qpdf 11.9.0 libqpdf/ContentNormalizer.cc.
 //!

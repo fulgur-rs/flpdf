@@ -1,4 +1,4 @@
-//! Page-range value owned by qpdf's `QUtil::parse_numrange` primitive.
+//! Represent and expand page-range expressions used by selection operations.
 //!
 //! qpdf correspondence: QPDFJob.cc page-range parsing split from page-operation orchestration.
 //!

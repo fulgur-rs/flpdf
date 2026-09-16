@@ -1,4 +1,4 @@
-//! qpdf JSON v2 value conversion and canonical object/stream serialization.
+//! Convert PDF objects and streams to canonical inspection JSON values.
 //!
 //! qpdf correspondence: `QPDFObjectHandle::getJSON` / `writeJSON` object serialization and `QPDF_Stream::writeStreamJSON` payload/dictionary normalization.
 //!

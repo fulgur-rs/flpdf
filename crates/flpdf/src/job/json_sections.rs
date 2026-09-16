@@ -1,4 +1,4 @@
-//! Build qpdf JSON sections for job output.
+//! Build page, label, outline, form, attachment, and encryption sections for job JSON output.
 //!
 //! qpdf correspondence: `QPDFJob::doJSONPages`, `doJSONPageLabels`, `doJSONOutlines`, `doJSONAcroform`, `doJSONAttachments`, and `doJSONEncrypt` section builders.
 //!

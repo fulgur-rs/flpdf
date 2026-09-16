@@ -1,6 +1,6 @@
 //! The core object-handle graph: shared, cloneable identity for direct and
-//! indirect PDF objects, with qpdf-compatible parsed-offset tracking and the
-//! document-owned reserved construction sentinel.
+//! indirect PDF objects, with parsed-offset tracking and document-owned
+//! reserved-object construction.
 //!
 //! qpdf correspondence: `QPDFObjectHandle`, `QPDFObject`, and `QPDFValue` identity and payload ownership, `QPDF::newReserved`/`QPDF_Reserved`, `QPDFObjectHandle::copyStream`/`QPDF::copyStreamData` stream-copy primitives, and `QPDF::setImmediateCopyFrom`.
 //!

@@ -1,13 +1,7 @@
-//! The job owns split output lifecycle: every chunk starts from qpdf's
-//! `emptyPDF()`, receives pages through the page-document helper, fixes copied
-//! form annotations, reconstructs chunk-local labels, and is written as a
-//! separate output file. The output-path naming helpers below are also
-//! qpdf-private (inlined in `doSplitPages`, not a separate qpdf function), so
-//! they stay `fn`-private here rather than a separate public module.
-//! Before page enumeration, the split route applies qpdf's job-level
-//! `shouldRemoveUnreferencedResources` Auto|Yes|No decision and sends its
-//! verbose finding messages through the same job logger
-//! (`QPDFJob.cc:2251-2340`; `QPDFJob.cc:340-345`).
+//! Own the lifecycle for writing per-page or per-range output files. Each
+//! chunk starts from a new PDF, receives pages through the page-document helper,
+//! repairs copied form annotations, reconstructs chunk-local labels, and is
+//! written to its own output path.
 //!
 //! qpdf correspondence: `QPDFJob::doSplitPages` (`QPDFJob.cc:2940-3027`).
 //!

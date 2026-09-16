@@ -1,7 +1,6 @@
-//! The plan is an internal implementation of the Job page-selection route.
-//! External callers configure page selection through the public
-//! `QPDFJobConfig` page-spec methods instead of constructing this intermediate
-//! representation. The module is compiled only for the crate's unit tests.
+//! This test-only plan models the internal page-selection route. External
+//! callers configure selection through the public job page-spec APIs instead
+//! of constructing this intermediate representation.
 //!
 //! qpdf correspondence: `QPDFJob.cc` `handlePageSpecs` multi-input selection support used by the internal page-operation tests.
 //!

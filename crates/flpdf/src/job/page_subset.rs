@@ -1,8 +1,7 @@
-//! This module owns the job-level composition of the page-document resource
-//! pass. The page/Form resource algorithm remains in `resources.rs`, while
-//! document-wide reachability remains a writer-time concern: the writer's
-//! own enqueue walk determines which objects survive, matching qpdf's
-//! `QPDFWriter::enqueueObject` (`libqpdf/QPDFWriter.cc:1072-1157`).
+//! Own the job-level composition of the page-document resource pass. The
+//! page/Form resource algorithm remains in `resources.rs`, while document-wide
+//! reachability remains a writer-time concern: the writer's enqueue walk
+//! determines which objects survive.
 //!
 //! qpdf correspondence: `QPDFJob::handlePageSpecs` page-subset completion.
 //!

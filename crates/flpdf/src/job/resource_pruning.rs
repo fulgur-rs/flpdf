@@ -1,6 +1,6 @@
-//! This module owns the job-level `--remove-unreferenced-resources` policy:
-//! the `auto|yes|no` mode and qpdf's shared-resource heuristic. The page/Form
-//! mutation itself remains in [`crate::resources`] and is exposed through
+//! Own the job-level `--remove-unreferenced-resources` policy, including the
+//! `auto|yes|no` mode and shared-resource heuristic. The page/Form mutation
+//! remains in [`crate::resources`] and is exposed through
 //! [`crate::PageObjectHelper::remove_unreferenced_resources`].
 //!
 //! qpdf correspondence: `QPDFJob::shouldRemoveUnreferencedResources`.

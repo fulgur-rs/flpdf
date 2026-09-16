@@ -1,12 +1,7 @@
-//! This module owns the qpdf `QUtil::string_to_int`, `QUtil::safe_fopen`,
-//! `QUtil::int_to_string_base`, `QUtil::toUTF8`, `QUtil::utf8_to_ascii`,
-//! `QUtil::utf8_to_win_ansi`, `QUtil::utf8_to_mac_roman`, and
-//! `QUtil::utf8_to_pdf_doc` behavior used by form appearance generation
-//! (`libqpdf/QUtil.cc:294-350,490-518,997-1031,
-//! 1528-1667` and
-//! `libqpdf/QPDFFormFieldObjectHelper.cc:811-849`). It converts invalid or
-//! unrepresentable input to `?`, matching qpdf's default replacement argument.
-//! It does not own PDF resource lookup, font selection, or password policy.
+//! Provide shared PDF utilities for integer conversion, file identity, and
+//! text encoding. Invalid or unrepresentable input is converted to `?` where
+//! the corresponding API is lossy; resource lookup, font selection, and
+//! password policy remain owned by their respective modules.
 //!
 //! qpdf correspondence: `QUtil.cc` integer conversion, filesystem identity, and UTF-8 single-byte encoding primitives.
 //!
