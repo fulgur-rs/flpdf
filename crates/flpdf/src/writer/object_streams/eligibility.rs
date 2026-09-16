@@ -140,9 +140,13 @@ impl PackedVisited {
             crate::Error::Unsupported("object count does not fit in usize".to_string())
         })?;
         // cov:ignore-end
-        Ok(Self {
-            words: vec![0; count.div_ceil(64)],
-        })
+        let word_count = count.div_ceil(64);
+        let mut words = Vec::new();
+        words
+            .try_reserve_exact(word_count)
+            .map_err(|_| crate::Error::System("std::bad_alloc".to_owned()))?; // cov:ignore: allocator failure is not safely injectable in the full test suite
+        words.resize(word_count, 0);
+        Ok(Self { words })
     }
 
     fn bit_index(object_number: u32) -> crate::Result<(usize, u32)> {
@@ -393,14 +397,32 @@ mod tests {
                 .find("\n/// Distribute `eligible`")
                 .expect("eligibility planner end")
                 + start];
+        let production_end = source
+            .find("\n#[cfg(test)]\nmod tests")
+            .expect("eligibility production end");
+        let production = &source[..production_end];
 
         assert!(
-            body.contains("PackedVisited::new") && source.contains("Vec<u64>"),
+            body.contains("PackedVisited::new") && production.contains("words: Vec<u64>"),
             "eligibility must use a packed dense visited bitmap"
         );
         assert!(
-            source.contains("div_ceil(64)"),
+            production.contains("count.div_ceil(64)"),
             "packed visited storage must allocate one bit per object"
+        );
+    }
+
+    #[test]
+    fn packed_visited_allocation_is_fallible() {
+        let source = normalized_source();
+        let production_end = source
+            .find("\n#[cfg(test)]\nmod tests")
+            .expect("eligibility production end");
+        let production = &source[..production_end];
+
+        assert!(
+            production.contains("try_reserve_exact"),
+            "visited bitmap allocation must return a qpdf-style error instead of aborting"
         );
     }
 
