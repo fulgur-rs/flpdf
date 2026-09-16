@@ -540,7 +540,7 @@ fn resolve_resolves_a_dangling_reference_to_null() {
 /// qpdf-style repair is enabled. The loop guard breaks the cycle and leaves the
 /// slot it fired on null, which is what qpdf reports for it.
 #[test]
-fn resolve_survives_a_cyclic_indirect_stream_length() {
+fn resolve_preserves_a_loop_null_in_a_mutual_indirect_stream_length_cycle() {
     let bytes = classic_pdf_with_bodies(
         &[
             b"1 0 obj\n<< /Length 2 0 R >>\nstream\nabc\nendstream\nendobj\n",
