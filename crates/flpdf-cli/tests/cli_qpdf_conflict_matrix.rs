@@ -2,6 +2,7 @@
 //! inspection and JSON output.
 
 use assert_cmd::Command;
+use regex::Regex;
 use std::ffi::OsString;
 use std::fs;
 use std::path::{Path, PathBuf};
@@ -92,6 +93,27 @@ fn assert_pair(label: &str, args: &[OsString]) {
         qpdf.status.success(),
         "{label}: qpdf must accept the combination; stderr={}",
         String::from_utf8_lossy(&qpdf.stderr)
+    );
+}
+
+fn assert_status_output_pair(label: &str, args: &[OsString]) {
+    let (qpdf, flpdf) = run_qpdf_and_flpdf(args);
+    assert_eq!(
+        flpdf.status.code(),
+        qpdf.status.code(),
+        "{label}: exit status differs; qpdf stderr={} flpdf stderr={}",
+        String::from_utf8_lossy(&qpdf.stderr),
+        String::from_utf8_lossy(&flpdf.stderr)
+    );
+    assert_eq!(
+        normalize_text_newlines(&flpdf.stdout),
+        normalize_text_newlines(&qpdf.stdout),
+        "{label}: stdout differs"
+    );
+    assert_eq!(
+        normalize_text_newlines(&flpdf.stderr),
+        normalize_text_newlines(&qpdf.stderr),
+        "{label}: stderr differs"
     );
 }
 
@@ -353,4 +375,751 @@ fn qpdf_id_and_coalesce_json_conflicts_match_qpdf() {
             }
         }
     }
+}
+
+#[test]
+fn top_level_conflict_definitions_are_qpdf_shaped() {
+    let source = include_str!("../src/main.rs");
+    let top_level = source
+        .split_once("struct RewriteCommand")
+        .map(|(prefix, _)| prefix)
+        .expect("source contains the native rewrite command");
+    let conflict = Regex::new(r#"(?s)conflicts_with(?:_all)?\s*=\s*(?:"[^"]*"|\[[^\]]*\])"#)
+        .expect("conflict declaration regex");
+    let forbidden = [
+        "job_json_file",
+        "json_input",
+        "update_from_json",
+        "json_key",
+        "json_object",
+        "json_stream_data",
+        "json_stream_prefix",
+        "split_pages",
+        "overlay",
+        "underlay",
+        "copy_encryption",
+        "encryption_file_password",
+        "static_aes_iv",
+        "recompress_flate",
+        "compression_level",
+        "linearize_pass1",
+        "remove_restrictions",
+        "no_original_object_ids",
+        "preserve_unreferenced",
+    ];
+
+    assert!(
+        !top_level.contains("ArgGroup::new(\"attachment_op\")"),
+        "attachment mutations must not be guarded by a clap ArgGroup"
+    );
+    assert_eq!(
+        source.matches("conflicts_with = \"repair\"").count(),
+        1,
+        "the flpdf-only repair/recovery safety guard must remain explicit"
+    );
+    for declaration in conflict.find_iter(top_level) {
+        let declaration = declaration.as_str();
+        for name in forbidden {
+            assert!(
+                !declaration.contains(name),
+                "qpdf-incompatible {name:?} remains in {declaration:?}"
+            );
+        }
+    }
+}
+
+#[test]
+fn qpdf_writer_inspection_matrix_has_no_false_conflicts() {
+    if skip_without_qpdf() {
+        return;
+    }
+
+    let input = fixture("attachment-two-page.pdf");
+    let payload = fixture("golden/inspect-npages.txt");
+    let overlay = fixture("one-page.pdf");
+    let writers: Vec<Vec<OsString>> = vec![
+        vec![
+            OsString::from("--encrypt"),
+            OsString::from(""),
+            OsString::from(""),
+            OsString::from("128"),
+            OsString::from("--use-aes=y"),
+            OsString::from("--"),
+        ],
+        vec![OsString::from("--decrypt")],
+        vec![OsString::from("--linearize")],
+        vec![OsString::from("--recompress-flate")],
+        vec![OsString::from("--compression-level=9")],
+        vec![OsString::from("--linearize-pass1=/dev/null")],
+        vec![OsString::from("--remove-restrictions")],
+        vec![OsString::from("--coalesce-contents")],
+        vec![OsString::from("--flatten-annotations=all")],
+        vec![OsString::from("--generate-appearances")],
+        vec![OsString::from("--optimize-images")],
+        vec![OsString::from("--externalize-inline-images")],
+        vec![OsString::from("--preserve-unreferenced")],
+        vec![OsString::from("--no-original-object-ids")],
+        vec![OsString::from("--static-id")],
+        vec![OsString::from("--static-aes-iv")],
+        vec![OsString::from("--qdf")],
+        vec![OsString::from("--object-streams=preserve")],
+        vec![OsString::from("--compress-streams=n")],
+        vec![OsString::from("--decode-level=none")],
+        vec![OsString::from("--stream-data=preserve")],
+        vec![OsString::from("--remove-page-labels")],
+    ];
+    let inspections: Vec<Vec<OsString>> = vec![
+        vec![OsString::from("--check")],
+        vec![OsString::from("--check-linearization")],
+        vec![OsString::from("--show-object=trailer")],
+        vec![OsString::from("--show-npages")],
+        vec![OsString::from("--show-pages")],
+        vec![OsString::from("--show-xref")],
+        vec![OsString::from("--show-linearization")],
+        vec![OsString::from("--show-encryption")],
+        vec![OsString::from("--is-encrypted")],
+        vec![OsString::from("--requires-password")],
+        vec![OsString::from("--list-attachments")],
+        vec![OsString::from("--show-attachment=attachment.txt")],
+    ];
+    assert_eq!(writers.len(), 22);
+    assert_eq!(inspections.len(), 12);
+
+    let mut cases = 0;
+    for writer in writers {
+        for inspection in &inspections {
+            let mut args = writer.clone();
+            args.extend(inspection.iter().cloned());
+            args.push(input.as_os_str().to_owned());
+            assert_status_output_pair(&format!("writer {writer:?} + {inspection:?}"), &args);
+            cases += 1;
+        }
+    }
+    assert_eq!(cases, 264);
+
+    let mut attachment_args = vec![
+        OsString::from("--add-attachment"),
+        payload.as_os_str().to_owned(),
+        OsString::from("--key=matrix-added"),
+        OsString::from("--creationdate=D:20200101000000Z"),
+        OsString::from("--moddate=D:20200101000000Z"),
+        OsString::from("--"),
+        OsString::from("--overlay"),
+        overlay.as_os_str().to_owned(),
+        OsString::from("--"),
+        OsString::from("--list-attachments"),
+        input.as_os_str().to_owned(),
+    ];
+    assert_status_output_pair("attachment + overlay + list", &attachment_args);
+    attachment_args.splice(
+        0..,
+        [
+            OsString::from("--remove-attachment=attachment.txt"),
+            OsString::from("--add-attachment"),
+            payload.as_os_str().to_owned(),
+            OsString::from("--key=matrix-replaced"),
+            OsString::from("--creationdate=D:20200101000000Z"),
+            OsString::from("--moddate=D:20200101000000Z"),
+            OsString::from("--"),
+            OsString::from("--show-attachment=matrix-replaced"),
+            input.as_os_str().to_owned(),
+        ],
+    );
+    assert_status_output_pair("remove + add + show", &attachment_args);
+}
+
+#[test]
+fn qpdf_accepts_decrypt_with_show_xref() {
+    if skip_without_qpdf() {
+        return;
+    }
+
+    let input = fixture("three-page.pdf");
+    assert_pair(
+        "decrypt + show-xref",
+        &[
+            OsString::from("--decrypt"),
+            OsString::from("--show-xref"),
+            input.as_os_str().to_owned(),
+        ],
+    );
+}
+
+#[test]
+fn qpdf_accepts_coalesce_contents_with_show_encryption() {
+    if skip_without_qpdf() {
+        return;
+    }
+
+    let input = fixture("three-page.pdf");
+    assert_pair(
+        "coalesce-contents + show-encryption",
+        &[
+            OsString::from("--coalesce-contents"),
+            OsString::from("--show-encryption"),
+            input.as_os_str().to_owned(),
+        ],
+    );
+}
+
+#[test]
+fn qpdf_accepts_flatten_annotations_with_show_encryption() {
+    if skip_without_qpdf() {
+        return;
+    }
+
+    let input = fixture("form-fields-and-annotations.pdf");
+    assert_pair(
+        "flatten-annotations + show-encryption",
+        &[
+            OsString::from("--flatten-annotations=all"),
+            OsString::from("--show-encryption"),
+            input.as_os_str().to_owned(),
+        ],
+    );
+}
+
+#[test]
+fn qpdf_accepts_preserve_unreferenced_with_json() {
+    if skip_without_qpdf() {
+        return;
+    }
+
+    let input = fixture("three-page.pdf");
+    assert_pair(
+        "preserve-unreferenced + json",
+        &[
+            OsString::from("--preserve-unreferenced"),
+            OsString::from("--json=2"),
+            input.as_os_str().to_owned(),
+            OsString::from("-"),
+        ],
+    );
+}
+
+#[test]
+fn qpdf_accepts_preserve_unreferenced_with_json_output() {
+    if skip_without_qpdf() {
+        return;
+    }
+
+    let input = fixture("three-page.pdf");
+    assert_json_output_pair(
+        "preserve-unreferenced + json-output",
+        &[OsString::from("--preserve-unreferenced")],
+        &input,
+    );
+}
+
+#[test]
+fn qpdf_accepts_json_input_with_show_object() {
+    if skip_without_qpdf() {
+        return;
+    }
+
+    let json = fixture("json-input/complete.json");
+
+    assert_pair(
+        "json-input + show-object",
+        &[
+            OsString::from("--json-input"),
+            OsString::from("--show-object=trailer"),
+            json.as_os_str().to_owned(),
+        ],
+    );
+}
+
+#[test]
+fn qpdf_accepts_json_input_update_with_show_object() {
+    if skip_without_qpdf() {
+        return;
+    }
+
+    let input = fixture("json-input/complete.json");
+    let update = fixture("json-input/update.json");
+    assert_pair(
+        "json-input + update-from-json + show-object",
+        &[
+            OsString::from("--json-input"),
+            OsString::from(format!("--update-from-json={}", update.display())),
+            OsString::from("--show-object=trailer"),
+            input.as_os_str().to_owned(),
+        ],
+    );
+}
+
+#[test]
+fn qpdf_accepts_json_input_with_attachment_mutation() {
+    if skip_without_qpdf() {
+        return;
+    }
+
+    let temp = tempfile::tempdir().expect("temporary JSON attachment output directory");
+    let input = fixture("json-input/complete.json");
+    let payload = fixture("golden/inspect-npages.txt");
+    let qpdf_output = temp.path().join("qpdf.pdf");
+    let flpdf_output = temp.path().join("flpdf.pdf");
+    let args = [
+        OsString::from("--static-id"),
+        OsString::from("--qdf"),
+        OsString::from("--json-input"),
+        OsString::from("--add-attachment"),
+        payload.as_os_str().to_owned(),
+        OsString::from("--key=json-input-attachment"),
+        OsString::from("--creationdate=D:20200101000000Z"),
+        OsString::from("--moddate=D:20200101000000Z"),
+        OsString::from("--"),
+        input.as_os_str().to_owned(),
+    ];
+    let qpdf = ShellCommand::new("qpdf")
+        .args(&args)
+        .arg(&qpdf_output)
+        .output()
+        .expect("qpdf JSON attachment mutation should spawn");
+    let flpdf = Command::cargo_bin("flpdf")
+        .expect("flpdf binary should build")
+        .env("FLPDF_PROGNAME", "qpdf")
+        .args(&args)
+        .arg(&flpdf_output)
+        .output()
+        .expect("flpdf JSON attachment mutation should spawn");
+
+    assert!(
+        qpdf.status.success(),
+        "qpdf JSON attachment mutation failed: {qpdf:?}"
+    );
+    assert_eq!(flpdf.status.code(), qpdf.status.code());
+    assert_eq!(flpdf.stdout, qpdf.stdout);
+    assert_eq!(flpdf.stderr, qpdf.stderr);
+    assert_eq!(
+        fs::read(flpdf_output).expect("flpdf JSON attachment output"),
+        fs::read(qpdf_output).expect("qpdf JSON attachment output")
+    );
+}
+
+#[test]
+fn qpdf_accepts_json_input_update_with_attachment_mutation() {
+    if skip_without_qpdf() {
+        return;
+    }
+
+    let temp = tempfile::tempdir().expect("temporary JSON attachment output directory");
+    let input = fixture("json-input/complete.json");
+    let update = fixture("json-input/update.json");
+    let payload = fixture("golden/inspect-npages.txt");
+    let qpdf_output = temp.path().join("qpdf.pdf");
+    let flpdf_output = temp.path().join("flpdf.pdf");
+    let args = [
+        OsString::from("--static-id"),
+        OsString::from("--qdf"),
+        OsString::from("--json-input"),
+        OsString::from(format!("--update-from-json={}", update.display())),
+        OsString::from("--add-attachment"),
+        payload.as_os_str().to_owned(),
+        OsString::from("--key=updated-attachment"),
+        OsString::from("--creationdate=D:20200101000000Z"),
+        OsString::from("--moddate=D:20200101000000Z"),
+        OsString::from("--"),
+        input.as_os_str().to_owned(),
+    ];
+    let qpdf = ShellCommand::new("qpdf")
+        .args(&args)
+        .arg(&qpdf_output)
+        .output()
+        .expect("qpdf JSON update attachment mutation should spawn");
+    let flpdf = Command::cargo_bin("flpdf")
+        .expect("flpdf binary should build")
+        .env("FLPDF_PROGNAME", "qpdf")
+        .args(&args)
+        .arg(&flpdf_output)
+        .output()
+        .expect("flpdf JSON update attachment mutation should spawn");
+
+    assert!(
+        qpdf.status.success(),
+        "qpdf JSON update attachment mutation failed: {qpdf:?}"
+    );
+    assert_eq!(flpdf.status.code(), qpdf.status.code());
+    assert_eq!(flpdf.stdout, qpdf.stdout);
+    assert_eq!(flpdf.stderr, qpdf.stderr);
+    assert_eq!(
+        fs::read(flpdf_output).expect("flpdf updated JSON attachment output"),
+        fs::read(qpdf_output).expect("qpdf updated JSON attachment output")
+    );
+}
+
+#[test]
+fn qpdf_accepts_json_input_with_list_attachments() {
+    if skip_without_qpdf() {
+        return;
+    }
+
+    let input = fixture("json-input/complete.json");
+    assert_pair(
+        "json-input + list-attachments",
+        &[
+            OsString::from("--json-input"),
+            OsString::from("--list-attachments"),
+            input.as_os_str().to_owned(),
+        ],
+    );
+}
+
+#[test]
+fn qpdf_json_input_show_attachment_reports_missing_key() {
+    if skip_without_qpdf() {
+        return;
+    }
+
+    let input = fixture("json-input/complete.json");
+    assert_status_output_pair(
+        "json-input + show-attachment",
+        &[
+            OsString::from("--json-input"),
+            OsString::from("--show-attachment=missing"),
+            input.as_os_str().to_owned(),
+        ],
+    );
+}
+
+#[test]
+fn qpdf_json_input_applies_attachment_mutation_before_listing() {
+    if skip_without_qpdf() {
+        return;
+    }
+
+    let input = fixture("json-input/complete.json");
+    let payload = fixture("golden/inspect-npages.txt");
+    assert_pair(
+        "json-input + add-attachment + list-attachments",
+        &[
+            OsString::from("--json-input"),
+            OsString::from("--add-attachment"),
+            payload.as_os_str().to_owned(),
+            OsString::from("--key=listed"),
+            OsString::from("--creationdate=D:20200101000000Z"),
+            OsString::from("--moddate=D:20200101000000Z"),
+            OsString::from("--"),
+            OsString::from("--list-attachments"),
+            input.as_os_str().to_owned(),
+        ],
+    );
+}
+
+#[test]
+fn qpdf_json_input_applies_attachment_before_showing_it() {
+    if skip_without_qpdf() {
+        return;
+    }
+
+    let input = fixture("json-input/complete.json");
+    let payload = fixture("golden/inspect-npages.txt");
+    assert_pair(
+        "json-input + add-attachment + show-attachment",
+        &[
+            OsString::from("--json-input"),
+            OsString::from("--add-attachment"),
+            payload.as_os_str().to_owned(),
+            OsString::from("--key=shown"),
+            OsString::from("--"),
+            OsString::from("--show-attachment=shown"),
+            input.as_os_str().to_owned(),
+        ],
+    );
+}
+
+#[test]
+fn qpdf_accepts_check_linearization_with_json_input() {
+    if skip_without_qpdf() {
+        return;
+    }
+
+    let input = fixture("json-input/complete.json");
+    assert_pair(
+        "check-linearization + json-input",
+        &[
+            OsString::from("--check-linearization"),
+            OsString::from("--json-input"),
+            input.as_os_str().to_owned(),
+        ],
+    );
+}
+
+#[test]
+fn qpdf_accepts_check_linearization_with_job_json_file() {
+    if skip_without_qpdf() {
+        return;
+    }
+
+    let temp = tempfile::tempdir().expect("temporary job JSON directory");
+    let job_json = temp.path().join("job.json");
+    let input = fixture("three-page.pdf");
+    fs::write(&job_json, b"{}").expect("job JSON file");
+    let args = [
+        OsString::from("--check-linearization"),
+        OsString::from(format!("--job-json-file={}", job_json.display())),
+        input.as_os_str().to_owned(),
+    ];
+    assert_pair("check-linearization + job-json-file", &args);
+}
+
+#[test]
+fn qpdf_accepts_remove_restrictions_with_show_object() {
+    if skip_without_qpdf() {
+        return;
+    }
+
+    let input = fixture("three-page.pdf");
+    assert_pair(
+        "remove-restrictions + show-object",
+        &[
+            OsString::from("--remove-restrictions"),
+            OsString::from("--show-object=trailer"),
+            input.as_os_str().to_owned(),
+        ],
+    );
+}
+
+#[test]
+fn qpdf_accepts_writer_only_settings_with_json() {
+    if skip_without_qpdf() {
+        return;
+    }
+
+    let input = fixture("three-page.pdf");
+    let settings = [
+        ("static-aes-iv", OsString::from("--static-aes-iv")),
+        ("recompress-flate", OsString::from("--recompress-flate")),
+        ("compression-level", OsString::from("--compression-level=9")),
+        (
+            "linearize-pass1",
+            OsString::from("--linearize-pass1=/dev/null"),
+        ),
+        (
+            "remove-restrictions",
+            OsString::from("--remove-restrictions"),
+        ),
+        (
+            "no-original-object-ids",
+            OsString::from("--no-original-object-ids"),
+        ),
+        (
+            "preserve-unreferenced",
+            OsString::from("--preserve-unreferenced"),
+        ),
+        (
+            "copy-encryption",
+            OsString::from(format!("--copy-encryption={}", input.display())),
+        ),
+    ];
+
+    for (label, setting) in settings {
+        assert_pair(
+            &format!("{label} + json"),
+            &[
+                setting,
+                OsString::from("--json=2"),
+                input.as_os_str().to_owned(),
+                OsString::from("-"),
+            ],
+        );
+    }
+}
+
+#[test]
+fn qpdf_accepts_encrypt_with_show_object() {
+    if skip_without_qpdf() {
+        return;
+    }
+
+    let input = fixture("three-page.pdf");
+    assert_pair(
+        "encrypt + show-object",
+        &[
+            OsString::from("--encrypt"),
+            OsString::from(""),
+            OsString::from(""),
+            OsString::from("128"),
+            OsString::from("--use-aes=y"),
+            OsString::from("--"),
+            OsString::from("--show-object=trailer"),
+            input.as_os_str().to_owned(),
+        ],
+    );
+}
+
+#[test]
+fn qpdf_accepts_copy_encryption_with_show_npages() {
+    if skip_without_qpdf() {
+        return;
+    }
+
+    let input = fixture("three-page.pdf");
+    assert_pair(
+        "copy-encryption + show-npages",
+        &[
+            OsString::from(format!("--copy-encryption={}", input.display())),
+            OsString::from("--show-npages"),
+            input.as_os_str().to_owned(),
+        ],
+    );
+}
+
+#[test]
+fn qpdf_password_file_overrides_password_in_argv_order() {
+    if skip_without_qpdf() {
+        return;
+    }
+
+    let temp = tempfile::tempdir().expect("temporary password directory");
+    let password_file = temp.path().join("password.txt");
+    fs::write(&password_file, b"user-v4-aes\n").expect("password file");
+    let input = Path::new(env!("CARGO_MANIFEST_DIR"))
+        .join("../../tests/fixtures/encrypted/v4-aes-128-r4.pdf");
+    assert_pair(
+        "password-file overrides password",
+        &[
+            OsString::from("--password=wrong"),
+            OsString::from(format!("--password-file={}", password_file.display())),
+            OsString::from("--check"),
+            input.as_os_str().to_owned(),
+        ],
+    );
+}
+
+#[test]
+fn qpdf_password_overrides_password_file_when_it_comes_last() {
+    if skip_without_qpdf() {
+        return;
+    }
+
+    let temp = tempfile::tempdir().expect("temporary password directory");
+    let password_file = temp.path().join("password.txt");
+    fs::write(&password_file, b"user-v4-aes\n").expect("password file");
+    let input = Path::new(env!("CARGO_MANIFEST_DIR"))
+        .join("../../tests/fixtures/encrypted/v4-aes-128-r4.pdf");
+    assert_status_output_pair(
+        "password overrides password-file",
+        &[
+            OsString::from(format!("--password-file={}", password_file.display())),
+            OsString::from("--password=wrong"),
+            OsString::from("--check"),
+            input.as_os_str().to_owned(),
+        ],
+    );
+}
+
+#[test]
+fn attachment_mutations_follow_qpdf_remove_then_add_order() {
+    if skip_without_qpdf() {
+        return;
+    }
+
+    let temp = tempfile::tempdir().expect("temporary attachment output directory");
+    let input = fixture("attachment-two-page.pdf");
+    let payload = fixture("golden/inspect-npages.txt");
+    let qpdf_output = temp.path().join("qpdf.pdf");
+    let flpdf_output = temp.path().join("flpdf.pdf");
+    let args = [
+        OsString::from("--static-id"),
+        OsString::from("--qdf"),
+        OsString::from("--remove-attachment=attachment.txt"),
+        OsString::from("--add-attachment"),
+        payload.as_os_str().to_owned(),
+        OsString::from("--key=replaced"),
+        OsString::from("--creationdate=D:20200101000000Z"),
+        OsString::from("--moddate=D:20200101000000Z"),
+        OsString::from("--"),
+        input.as_os_str().to_owned(),
+    ];
+
+    let qpdf = ShellCommand::new("qpdf")
+        .args(&args)
+        .arg(&qpdf_output)
+        .output()
+        .expect("qpdf attachment mutation should spawn");
+    let flpdf = Command::cargo_bin("flpdf")
+        .expect("flpdf binary should build")
+        .env("FLPDF_PROGNAME", "qpdf")
+        .args(&args)
+        .arg(&flpdf_output)
+        .output()
+        .expect("flpdf attachment mutation should spawn");
+
+    assert!(
+        qpdf.status.success(),
+        "qpdf attachment mutation failed: {qpdf:?}"
+    );
+    assert_eq!(flpdf.status.code(), qpdf.status.code());
+    assert_eq!(flpdf.stdout, qpdf.stdout);
+    assert_eq!(flpdf.stderr, qpdf.stderr);
+    assert!(qpdf_output.is_file());
+    assert!(flpdf_output.is_file());
+
+    let list_qpdf = ShellCommand::new("qpdf")
+        .args(["--list-attachments"])
+        .arg(&qpdf_output)
+        .output()
+        .expect("qpdf attachment listing should spawn");
+    let list_flpdf = ShellCommand::new("qpdf")
+        .args(["--list-attachments"])
+        .arg(&flpdf_output)
+        .output()
+        .expect("qpdf should read flpdf attachment output");
+    assert_eq!(list_qpdf.status.code(), Some(0));
+    assert_eq!(list_flpdf.status.code(), Some(0));
+    assert_eq!(list_flpdf.stdout, list_qpdf.stdout);
+}
+
+#[test]
+fn attachment_mutation_can_share_qpdf_overlay_lifecycle() {
+    if skip_without_qpdf() {
+        return;
+    }
+
+    let temp = tempfile::tempdir().expect("temporary overlay output directory");
+    let input = fixture("two-page.pdf");
+    let overlay = fixture("one-page.pdf");
+    let payload = fixture("golden/inspect-npages.txt");
+    let qpdf_output = temp.path().join("qpdf.pdf");
+    let flpdf_output = temp.path().join("flpdf.pdf");
+    let args = [
+        OsString::from("--static-id"),
+        OsString::from("--qdf"),
+        OsString::from("--add-attachment"),
+        payload.as_os_str().to_owned(),
+        OsString::from("--key=overlay-attachment"),
+        OsString::from("--creationdate=D:20200101000000Z"),
+        OsString::from("--moddate=D:20200101000000Z"),
+        OsString::from("--"),
+        OsString::from("--overlay"),
+        overlay.as_os_str().to_owned(),
+        OsString::from("--"),
+        input.as_os_str().to_owned(),
+    ];
+
+    let qpdf = ShellCommand::new("qpdf")
+        .args(&args)
+        .arg(&qpdf_output)
+        .output()
+        .expect("qpdf attachment overlay should spawn");
+    let flpdf = Command::cargo_bin("flpdf")
+        .expect("flpdf binary should build")
+        .env("FLPDF_PROGNAME", "qpdf")
+        .args(&args)
+        .arg(&flpdf_output)
+        .output()
+        .expect("flpdf attachment overlay should spawn");
+
+    assert!(
+        qpdf.status.success(),
+        "qpdf attachment overlay failed: {qpdf:?}"
+    );
+    assert_eq!(flpdf.status.code(), qpdf.status.code());
+    assert_eq!(flpdf.stdout, qpdf.stdout);
+    assert_eq!(flpdf.stderr, qpdf.stderr);
+    assert_eq!(
+        fs::read(flpdf_output).expect("flpdf overlay output"),
+        fs::read(qpdf_output).expect("qpdf overlay output")
+    );
 }

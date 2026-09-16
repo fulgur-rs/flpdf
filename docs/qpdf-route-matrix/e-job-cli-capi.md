@@ -1022,6 +1022,35 @@ page numbering and transformation order. The qpdf differential tests cover
 merged `flpdf-p50gt` PR #2002; this issue owns rotation only and makes no
 route-wide JSON parity claim.
 
+### E-17 / E-21 full conflict declaration audit (`flpdf-sg6tu`, 2026-09-16)
+
+qpdf 11.9.0 の `QPDFJob::checkConfiguration` は
+`--replace-input` と output/`--split-pages`/`--json`/`--empty`、
+output-free inspection と output、および `--requires-password` と
+`--is-encrypted`だけを usage 境界にする
+（`libqpdf/QPDFJob.cc:567-631`）。`createQPDF` は
+page/rotation、underlay/overlay、`handleTransformations` を先に実行し、
+`writeQPDF` は同じ documentを `doInspection` または outputへ渡す
+（`libqpdf/QPDFJob.cc:428-520,1646-1693,2046-2247`）。
+
+`flpdf-sg6tu` では `main.rs` の conflicts_with 系 27 宣言を
+定義側で列挙し、qpdf semantic guardだけを保持した。writer-only、
+transformation、JSON input/update、overlay、attachment、password/password-file
+の qpdf 非対応 guard は撤去し、attachment mutationの parser-level ArgGroupも
+撤去した。既存の `QPDFJob::check_configuration`、
+`create_qpdf`、`write_qpdf`、`run_configured_inspection` を
+canonical ownerとして使い、remove → add → copy、page selection → overlay →
+transformation → inspectionの順を保つ。native subcommand境界と
+`--repair`を含む recovery safety guard、native `rewrite` の
+encryption mode guardは qpdf flat grammarとは別のため残す。
+
+`cli_qpdf_conflict_matrix.rs` は writer/create-stage 22 種 × inspection
+12 種を固定配列で列挙し、264 組の qpdf 11.9.0 status/stdout/stderrを比較する。
+JSON input/updateの selector と attachment mutation、mixed attachment order、
+attachment + overlay、password setter order、job-json-fileの
+check-linearizationも個別の qpdf differentialで固定する。qpdfに対応する
+独自 bridgeや deviation markerは追加しない。
+
 ## E-10 primary document graph retention in distinct-secondary `--pages` (`flpdf-lrm3u`, 2026-09-15)
 
 qpdf keeps the primary `QPDF` as the page-job base while

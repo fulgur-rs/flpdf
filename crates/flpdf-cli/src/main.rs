@@ -2,9 +2,7 @@
 
 mod arg_parser;
 
-use clap::{
-    ArgGroup, Args as ClapArgs, CommandFactory, FromArgMatches, Parser, Subcommand, ValueEnum,
-};
+use clap::{Args as ClapArgs, CommandFactory, FromArgMatches, Parser, Subcommand, ValueEnum};
 use flpdf::fix_qdf;
 use flpdf::job::{
     copy_duplicate_page_annotations, AttachmentAddOptions, CheckError, FlattenAnnotationsMode,
@@ -813,24 +811,6 @@ impl std::error::Error for CliPathError {
 // never reaching the JSON branch. Conflicting instead surfaces the
 // ambiguity as a clean usage error.
 #[command(args_conflicts_with_subcommands = true)]
-// The three attachment-mutating operations are dispatched by an ordered
-// `else if` chain in `main`, so supplying two at once would silently run only
-// the first. Make them mutually exclusive at the parser level: clap rejects
-// e.g. `--add-attachment … -- --copy-attachments-from …` with a usage error
-// instead of discarding the second operation. `--list-attachments` and
-// `--show-attachment` are inspection consumers, not mutations; qpdf runs both
-// independently when they are supplied together. (`--verbose` is a
-// sub-modifier, not an operation, so it is intentionally NOT a member of
-// this group.)
-#[command(group(
-    ArgGroup::new("attachment_op")
-        .multiple(false)
-        .args([
-            "add_attachment",
-            "remove_attachment",
-            "copy_attachments_from",
-        ])
-))]
 struct Cli {
     #[command(subcommand)]
     command: Option<Commands>,
@@ -850,20 +830,8 @@ struct Cli {
         long = "check-linearization",
         overrides_with = "check_linearization",
         conflicts_with_all = [
-            "job_json_file",
             "json",
-            "json_input",
-            "update_from_json",
             "json_output",
-            "json_key",
-            "json_object",
-            "json_stream_data",
-            "json_stream_prefix",
-            "split_pages",
-            "overlay",
-            "underlay",
-            "copy_encryption",
-            "encryption_file_password",
         ]
     )]
     check_linearization: bool,
@@ -962,17 +930,12 @@ struct Cli {
           require_equals = true,
           value_name = "VERSION", value_parser = ["1", "2", "latest"],
           conflicts_with_all = [
-              "check", "static_aes_iv",
+              "check",
               "show_object",
               "show_npages", "show_pages", "show_xref", "show_linearization",
               "show_encryption",
               "is_encrypted", "requires_password",
-              "recompress_flate", "compression_level",
-              "linearize_pass1", "remove_restrictions",
-              "copy_encryption",
               "list_attachments", "show_attachment",
-              "no_original_object_ids",
-              "preserve_unreferenced",
           ],
           help = "Generate JSON v2 output (qpdf --json compatible)")]
     json: Option<String>,
@@ -982,11 +945,6 @@ struct Cli {
     /// rewrite, page-operation, or JSON-output job routes as a PDF input.
     #[arg(
         long = "json-input",
-        conflicts_with_all = [
-            "show_object",
-            "show_linearization", "list_attachments", "show_attachment",
-            "remove_attachment", "add_attachment", "copy_attachments_from",
-        ],
         help = "Treat INPUT as qpdf JSON v2 (qpdf --json-input)"
     )]
     json_input: bool,
@@ -998,11 +956,6 @@ struct Cli {
         long = "update-from-json",
         value_name = "QPDF-JSON",
         require_equals = true,
-        conflicts_with_all = [
-            "show_object",
-            "show_linearization", "list_attachments", "show_attachment",
-            "remove_attachment", "add_attachment", "copy_attachments_from",
-        ],
         help = "Apply a qpdf JSON update before processing (qpdf --update-from-json)"
     )]
     update_from_json: Option<PathBuf>,
@@ -1016,17 +969,12 @@ struct Cli {
         value_name = "VERSION",
         value_parser = ["1", "2", "latest"],
         conflicts_with_all = [
-            "check", "static_aes_iv",
+            "check",
             "show_object",
             "show_npages", "show_pages", "show_xref", "show_linearization",
             "show_encryption",
             "is_encrypted", "requires_password",
-            "recompress_flate", "compression_level",
-            "linearize_pass1", "remove_restrictions",
-            "copy_encryption",
             "list_attachments", "show_attachment",
-            "no_original_object_ids",
-            "preserve_unreferenced",
         ],
         help = "Generate qpdf JSON output; VERSION defaults to 2 and the output file is positional"
     )]
@@ -1149,13 +1097,8 @@ struct Cli {
     /// authentication.
     // qpdf applies this create-stage mutation before `doInspection`, so the
     // supported inspection combinations are routed through the combined Job
-    // inspection boundary. Other standalone inspection conflicts remain
-    // bounded by their existing conflict tables.
-    #[arg(long = "remove-restrictions",
-          conflicts_with_all = [
-              "show_object",
-              "show_encryption",
-          ])]
+    // inspection boundary.
+    #[arg(long = "remove-restrictions")]
     remove_restrictions: bool,
     /// Remove explicit page labels from the output (qpdf-compatible).
     #[arg(long = "remove-page-labels")]
@@ -1181,13 +1124,9 @@ struct Cli {
     /// digital-signature restrictions. Neither flag invents a success diagnostic.
     // qpdf accepts --decrypt with the output-free --check and --show-npages
     // consumers; those writer settings are ignored when no output is created.
-    // The remaining bounded inspection conflicts are kept for their existing
-    // consumer scopes.
-    #[arg(long = "decrypt",
-          conflicts_with_all = [
-              "show_object",
-              "show_xref", "show_linearization",
-          ])]
+    // The same create/write boundary accepts it with every output-free
+    // inspection consumer.
+    #[arg(long = "decrypt")]
     decrypt: bool,
     /// `qpdf --compress-streams=y|n` compatibility flag.  Accepted but
     /// currently a no-op: flpdf does not re-encode stream contents on
@@ -1317,15 +1256,9 @@ struct Cli {
     /// create-stage transformation before constructing its linearized writer.
     /// The top-level JSON route also applies this create-stage transformation
     /// before serializing, matching qpdf's `createQPDF`/`writeQPDF` boundary.
-    /// Other standalone inspection conflicts remain explicit until their own
-    /// consumer scope is audited.
-    #[arg(long = "coalesce-contents",
-          conflicts_with_all = [
-              "show_object",
-              "show_encryption",
-              "show_attachment", "remove_attachment",
-              "add_attachment", "copy_attachments_from",
-          ])]
+    /// Output-free inspection conflicts themselves remain explicit because
+    /// qpdf's inspection consumers do not accept an output file.
+    #[arg(long = "coalesce-contents")]
     coalesce_contents: bool,
 
     /// Flatten annotations into page content (top-level alias of
@@ -1342,10 +1275,6 @@ struct Cli {
         value_name = "MODE",
         require_equals = true,
         overrides_with = "flatten_annotations",
-        conflicts_with_all = [
-            "show_object",
-            "show_encryption",
-        ],
         help = "Flatten annotations into page content; MODE is all, screen, or print",
         overrides_with = "flatten_annotations"
     )]
@@ -1569,20 +1498,6 @@ struct Cli {
         value_terminator = "--",
         allow_hyphen_values = true,
         value_name = "USER-PW OWNER-PW KEY-LEN [sub-flags]",
-        // Reject combinations that don't make sense on the rewrite path.
-        // --check and --show-npages are inspection paths that qpdf accepts
-        // alongside writer encryption settings; when no output is created,
-        // those settings are simply not consumed. --linearize is NOT rejected:
-        // qpdf itself
-        // supports `--linearize --encrypt ...` (verified: `qpdf --linearize
-        // --encrypt "" "" 128 --use-aes=y --` produces a valid,
-        // `qpdf --check`-clean linearized+encrypted file), and
-        // `write_linearized` threads `options.encrypt` through correctly.
-        conflicts_with_all = [
-            "show_object",
-            "show_xref", "show_linearization",
-            "remove_restrictions",
-        ],
         help = "Encrypt output (qpdf --encrypt compatible): \
                 USER-PW OWNER-PW KEY-LEN [sub-flags] --"
     )]
@@ -1612,12 +1527,6 @@ struct Cli {
         long = "copy-encryption",
         value_name = "FILE",
         require_equals = true,
-        conflicts_with_all = [
-            "check", "show_object",
-            "show_npages", "show_pages", "show_xref", "show_linearization",
-            "show_encryption",
-            "remove_restrictions",
-        ],
         help = "Copy /Encrypt from donor PDF (qpdf --copy-encryption); \
                 pair with --encryption-file-password"
     )]
@@ -2553,7 +2462,7 @@ struct PasswordArgs {
     #[arg(skip)]
     raw_password: Option<Vec<u8>>,
     /// Password bytes for encrypted PDFs.
-    #[arg(long, require_equals = true, conflicts_with = "password_file")]
+    #[arg(long, require_equals = true)]
     password: Option<OsString>,
     /// File containing password bytes. Only the first LF-delimited line is
     /// used; a trailing CR before that LF is stripped. `-` reads from stdin.
@@ -2693,6 +2602,7 @@ fn preprocess_qpdf_args<T: Into<OsString>>(args: Vec<T>) -> CliResult<Preprocess
     let mut raw_encrypt_segments = Vec::new();
     let mut raw_pages = None;
     let mut raw_copy_attachments_from = Vec::new();
+    let password_file_is_last = password_file_is_last(&raw_residual_args);
 
     for segment in raw_named_segments {
         let option = segment.option;
@@ -2728,7 +2638,10 @@ fn preprocess_qpdf_args<T: Into<OsString>>(args: Vec<T>) -> CliResult<Preprocess
         overlay_specs,
         attachment_segments,
         raw_overrides: RawCliOverrides {
-            password: raw_option_value(&raw_residual_args, "password"),
+            password: (!password_file_is_last)
+                .then(|| raw_option_value(&raw_residual_args, "password"))
+                .flatten(),
+            password_file_is_last,
             encryption_file_password: raw_option_value(
                 &raw_residual_args,
                 "encryption-file-password",
@@ -2744,6 +2657,35 @@ fn preprocess_qpdf_args<T: Into<OsString>>(args: Vec<T>) -> CliResult<Preprocess
                 .then_some(raw_copy_attachments_from),
         },
     })
+}
+
+fn password_file_is_last(args: &[arg_parser::RawArg]) -> bool {
+    let mut last_is_file = false;
+    let mut seen = false;
+    let mut index = 1;
+    while index < args.len() {
+        let bytes = args[index].as_bytes();
+        if bytes == b"--" {
+            break;
+        }
+        if is_named_segment_option(bytes) {
+            index += 1;
+            while index < args.len() && args[index].as_bytes() != b"--" {
+                index += 1;
+            }
+            index += usize::from(index < args.len());
+            continue;
+        }
+        if bytes == b"--password" || bytes.starts_with(b"--password=") {
+            seen = true;
+            last_is_file = false;
+        } else if bytes == b"--password-file" || bytes.starts_with(b"--password-file=") {
+            seen = true;
+            last_is_file = true;
+        }
+        index += 1;
+    }
+    seen && last_is_file
 }
 
 fn raw_option_value(args: &[arg_parser::RawArg], name: &str) -> Option<Vec<u8>> {
@@ -2833,6 +2775,7 @@ fn raw_os_args(args: &[OsString]) -> Vec<Vec<u8>> {
 fn apply_raw_overrides(args: &mut Cli, overrides: RawCliOverrides) {
     let RawCliOverrides {
         password,
+        password_file_is_last,
         encryption_file_password,
         raw_encrypt,
         raw_encrypt_segments,
@@ -2843,6 +2786,9 @@ fn apply_raw_overrides(args: &mut Cli, overrides: RawCliOverrides) {
         raw_copy_attachments_from,
     } = overrides;
     args.password.raw_password = password.clone();
+    if password_file_is_last {
+        args.password.password = None;
+    }
     args.raw_encryption_file_password = encryption_file_password.clone().or_else(|| {
         args.encryption_file_password
             .as_ref()
@@ -2863,16 +2809,37 @@ fn apply_raw_overrides(args: &mut Cli, overrides: RawCliOverrides) {
 
     if let Some(command) = args.command.as_mut() {
         match command {
-            Commands::Check(command) => command.password.raw_password = password.clone(),
-            Commands::Pages(command) => command.password.raw_password = password.clone(),
-            Commands::Qdf(command) => command.password.raw_password = password.clone(),
+            Commands::Check(command) => {
+                command.password.raw_password = password.clone();
+                if password_file_is_last {
+                    command.password.password = None;
+                }
+            }
+            Commands::Pages(command) => {
+                command.password.raw_password = password.clone();
+                if password_file_is_last {
+                    command.password.password = None;
+                }
+            }
+            Commands::Qdf(command) => {
+                command.password.raw_password = password.clone();
+                if password_file_is_last {
+                    command.password.password = None;
+                }
+            }
             Commands::ShowEncryption(command)
             | Commands::RequiresPassword(command)
             | Commands::ShowEncryptionKey(command) => {
-                command.password.raw_password = password.clone()
+                command.password.raw_password = password.clone();
+                if password_file_is_last {
+                    command.password.password = None;
+                }
             }
             Commands::Rewrite(command) => {
                 command.password.raw_password = password.clone();
+                if password_file_is_last {
+                    command.password.password = None;
+                }
                 command.raw_encryption_file_password = args.raw_encryption_file_password.clone();
                 command.raw_encrypt = args.raw_encrypt.clone();
                 command.parsed_encrypt_segments = args.parsed_encrypt_segments.clone();
@@ -3267,18 +3234,11 @@ fn main() {
     warn_if_static_id(&args);
 
     // `--overlay`/`--underlay` groups are stripped from argv before clap by
-    // `preprocess_qpdf_args`, so a stripped group leaves no trace for the
-    // dispatch chain. Only the rewrite paths (the `Rewrite` subcommand and the
-    // top-level default/`--linearize` rewrite branches) consume `overlay_specs`;
-    // every other command/mode would silently ignore it. Reject that here so an
-    // overlay on, e.g., `check`/`--show-npages`/`--pages` fails loudly instead of
-    // being dropped. The top-level predicate mirrors the dispatch chain below
-    // (the rewrite branch is the final `else`, reached only when no inspection,
-    // attachment, json, or page-op mode is selected) and must stay in sync with
-    // it; page-operation output is dispatched to the page-operation writer
-    // boundary, including when `--linearize` is present. qpdf also permits
-    // overlay/underlay before an inspection consumer; that case is routed to
-    // the combined QPDFJob inspection path below rather than rejected here.
+    // `preprocess_qpdf_args`, so a stripped group leaves no trace for native
+    // subcommand dispatch. Native commands other than `rewrite` do not own a
+    // create/write consumer and must reject the group instead of silently
+    // ignoring it. The qpdf-flat top-level inspection and attachment routes
+    // are handled below by the combined QPDFJob path; keep them accepted.
     if !overlay_specs.is_empty() {
         let target_is_rewrite = match &args.command {
             Some(Commands::Rewrite(_)) => true,
@@ -3295,9 +3255,6 @@ fn main() {
                     && !args.check
                     && !args.list_attachments
                     && args.show_attachment.is_none()
-                    && args.remove_attachment.is_empty()
-                    && attachment_segments.is_empty()
-                    && args.copy_attachments_from.is_empty()
             }
         };
         let target_is_inspection = args.check
@@ -3351,7 +3308,12 @@ fn main() {
             || args.show_npages
             || args.show_pages
             || args.show_xref
-            || args.show_encryption);
+            || args.show_object.is_some()
+            || args.check_linearization
+            || args.show_linearization
+            || args.show_encryption
+            || args.list_attachments
+            || args.show_attachment.is_some());
 
     // JSON-input/update inspection is routed through the already-created job
     // document before the ordinary file-backed inspection branches. qpdf
@@ -3377,9 +3339,14 @@ fn main() {
             args.replace_input,
             &args.password,
             args.no_warn,
+            args.check_linearization,
         )
     } else if json_input_inspection {
-        run_json_input_inspection(&args, top_level_inspection_transform_options)
+        run_json_input_inspection(
+            &args,
+            top_level_inspection_transform_options,
+            &attachment_segments,
+        )
     } else if args.json.is_some() || args.json_output.is_some() {
         run_json(
             &args,
@@ -3535,97 +3502,17 @@ fn main() {
             args.page_ops.empty,
             top_level_inspection_transform_options,
         )
-    } else if !args.remove_attachment.is_empty() {
+    } else if attachment_mutation_requested {
         let options = top_level_writer_options(
             &args,
             normalize_content,
             top_level_compression_level,
             &top_level_version_options,
         );
-        let copy_encryption_for_attachment =
-            cli_copy_encryption(&args).map(|(path, password)| (path.to_path_buf(), password));
-        let copy_encryption_for_attachment = copy_encryption_for_attachment
-            .as_ref()
-            .map(|(path, password)| (path.as_path(), password.clone()));
-        run_remove_attachment(
-            args.input,
-            args.output,
-            &args.page_ops,
-            copy_encryption_for_attachment,
-            args.remove_unreferenced_resources,
-            args.replace_input,
-            args.repair,
-            &args.password,
-            &args.remove_attachment,
-            args.verbose,
-            args.no_warn,
-            args.remove_restrictions,
-            args.linearize,
-            args.linearize_pass1.as_deref(),
-            options,
-            top_level_inspection_transform_options,
-        )
-    } else if !attachment_segments.is_empty() {
-        let options = top_level_writer_options(
+        run_all_attachment_mutations(
             &args,
-            normalize_content,
-            top_level_compression_level,
-            &top_level_version_options,
-        );
-        let copy_encryption_for_attachment =
-            cli_copy_encryption(&args).map(|(path, password)| (path.to_path_buf(), password));
-        let copy_encryption_for_attachment = copy_encryption_for_attachment
-            .as_ref()
-            .map(|(path, password)| (path.as_path(), password.clone()));
-        run_add_attachment(
-            args.input,
-            args.output,
-            &args.page_ops,
-            copy_encryption_for_attachment,
-            args.remove_unreferenced_resources,
-            args.replace_input,
-            args.repair,
-            &args.password,
-            attachment_segments,
-            args.verbose,
-            args.no_warn,
-            args.remove_restrictions,
-            args.linearize,
-            args.linearize_pass1.as_deref(),
-            options,
-            top_level_inspection_transform_options,
-        )
-    } else if !args.copy_attachments_from.is_empty() {
-        let copy_groups = args
-            .raw_copy_attachments_from
-            .clone()
-            .unwrap_or_else(|| vec![raw_os_args(&args.copy_attachments_from)]);
-        let options = top_level_writer_options(
-            &args,
-            normalize_content,
-            top_level_compression_level,
-            &top_level_version_options,
-        );
-        let copy_encryption_for_attachment =
-            cli_copy_encryption(&args).map(|(path, password)| (path.to_path_buf(), password));
-        let copy_encryption_for_attachment = copy_encryption_for_attachment
-            .as_ref()
-            .map(|(path, password)| (path.as_path(), password.clone()));
-        run_copy_attachments_from(
-            args.input,
-            args.output,
-            &args.page_ops,
-            copy_encryption_for_attachment,
-            args.remove_unreferenced_resources,
-            args.replace_input,
-            args.repair,
-            &args.password,
-            copy_groups,
-            args.verbose,
-            args.no_warn,
-            args.remove_restrictions,
-            args.linearize,
-            args.linearize_pass1.as_deref(),
+            &overlay_specs,
+            &attachment_segments,
             options,
             top_level_inspection_transform_options,
         )
@@ -4283,6 +4170,7 @@ fn run_job_json_files(
     replace_input: bool,
     password: &PasswordArgs,
     suppress_warnings: bool,
+    check_linearization: bool,
 ) -> CliResult<()> {
     let mut job = QPDFJob::new();
     job.set_warnings_exit_zero(cli_warning_exit_zero());
@@ -4300,6 +4188,9 @@ fn run_job_json_files(
                     message: format_job_json_error(path, error),
                 }) as Box<dyn std::error::Error>
             })?;
+    }
+    if check_linearization {
+        job.config().check_linearization();
     }
     let error_path = paths.last().expect("job-json-file list is non-empty");
     if let Some(input) = input {
@@ -4522,7 +4413,7 @@ fn run_json(
             &mut pdf,
             transform_options,
             cli.verbose,
-            false,
+            cli.remove_restrictions,
             cli.coalesce_contents,
         )?;
         let mut runtime = JsonJobRuntime {
@@ -4571,7 +4462,7 @@ fn run_json(
             &mut pdf,
             transform_options,
             cli.verbose,
-            false,
+            cli.remove_restrictions,
             cli.coalesce_contents,
         )?;
         let mut runtime = JsonJobRuntime {
@@ -4603,7 +4494,7 @@ fn run_json(
             &mut pdf,
             transform_options,
             cli.verbose,
-            false,
+            cli.remove_restrictions,
             cli.coalesce_contents,
         )?;
         let mut runtime = JsonJobRuntime {
@@ -4677,10 +4568,13 @@ fn apply_json_page_specs<R: Read + Seek + 'static>(
 fn run_json_input_inspection(
     cli: &Cli,
     transform_options: InspectionTransformOptions,
+    attachment_segments: &[Vec<Vec<u8>>],
 ) -> CliResult<()> {
     if cli.page_ops.empty {
         reject_empty_inspection_output(cli.input.as_deref())?;
         let mut job = new_cli_job(cli.no_warn);
+        configure_top_level_inspection_job(&mut job, cli)?;
+        configure_top_level_attachment_mutations(&mut job, cli, attachment_segments)?;
         let mut pdf = create_empty_primary_document(&mut job, cli.update_from_json.as_deref())?;
         return run_job_inspection_on_pdf(cli, &mut job, &mut pdf, transform_options);
     }
@@ -4690,6 +4584,8 @@ fn run_json_input_inspection(
     job.set_logger(cli_logger());
     job.set_message_prefix(progname());
     job.set_suppress_warnings(cli.no_warn);
+    configure_top_level_inspection_job(&mut job, cli)?;
+    configure_top_level_attachment_mutations(&mut job, cli, attachment_segments)?;
 
     let file = File::open(input).map_err(|error| {
         if cli.json_input {
@@ -4752,25 +4648,15 @@ fn run_job_inspection_on_pdf<R: Read + Seek + 'static>(
         cli.remove_restrictions,
         cli.coalesce_contents,
     )?;
-    job.set_with_images(cli.with_images);
-    if cli.check {
-        job.set_show_encryption_key(cli.show_encryption_key);
-        return finish_check_job(job.check(pdf));
+    configure_top_level_inspection_job(job, cli)?;
+    match job.inspect_configured(pdf) {
+        Ok(status) => finish_job_exit_status(status),
+        Err(CheckError::ErrorsDetected) => Err(Box::new(CliExitError {
+            code: ExitCode::Errors,
+            message: String::new(),
+        })),
+        Err(CheckError::Operation(error)) => Err(Box::new(error)),
     }
-    if cli.show_npages {
-        return finish_job_exit_status(job.show_npages(pdf)?);
-    }
-    if cli.show_pages {
-        return finish_job_exit_status(job.show_pages(pdf)?);
-    }
-    if cli.show_xref {
-        return finish_job_exit_status(job.show_xref(pdf)?);
-    }
-    if cli.show_encryption {
-        job.set_show_encryption_key(cli.show_encryption_key);
-        return finish_show_encryption(job, pdf, cli.password.password_is_hex_key);
-    }
-    Err("JSON input/update inspection mode is missing a consumer".into())
 }
 
 /// Serialize an already-opened job document through the existing qpdf JSON
@@ -7186,6 +7072,7 @@ struct PreprocessedArgs {
 #[derive(Debug, Default)]
 struct RawCliOverrides {
     password: Option<Vec<u8>>,
+    password_file_is_last: bool,
     encryption_file_password: Option<Vec<u8>>,
     raw_encrypt: Option<Vec<Vec<u8>>>,
     raw_encrypt_segments: Option<Vec<Vec<Vec<u8>>>>,
@@ -10492,127 +10379,79 @@ fn attachment_input_output(
     }
 }
 
-#[allow(clippy::too_many_arguments)]
-fn run_add_attachment(
-    input: Option<PathBuf>,
-    output: Option<PathBuf>,
-    page_ops: &PageOpArgs,
-    copy_encryption: Option<(&Path, Vec<u8>)>,
-    remove_unreferenced_resources: CliRemoveUnreferencedResources,
-    replace_input: bool,
-    repair: bool,
-    password: &PasswordArgs,
-    segments: Vec<Vec<Vec<u8>>>,
-    verbose: bool,
-    suppress_warnings: bool,
-    remove_restrictions: bool,
-    linearize: bool,
-    linearize_pass1: Option<&Path>,
+/// Run every top-level attachment mutation through one qpdf-shaped job.
+/// qpdf queues remove, add, and copy operations independently and applies them
+/// after page/overlay preparation, so the CLI must not select one operation by
+/// an `else if` branch or reject the combination at argument parsing time.
+fn run_all_attachment_mutations(
+    args: &Cli,
+    overlay_specs: &[OverlaySpec],
+    attachment_segments: &[Vec<Vec<u8>>],
     writer_options: WriterOptions,
     transform_options: InspectionTransformOptions,
 ) -> CliResult<()> {
-    let (input, output) = attachment_input_output(input, output, page_ops, replace_input)?;
-    let attachment_options = segments
-        .into_iter()
-        .map(|tokens| {
-            let args = parse_add_attachment_segment(tokens)?;
-            let basename = path_basename(&args.file)?;
-            let key = args.key.unwrap_or_else(|| basename.clone());
-            let filename = args.filename.unwrap_or_else(|| basename.clone());
-            Ok(AttachmentAddOptions {
-                path: args.file,
-                key,
-                filename,
-                mimetype: args.mimetype,
-                description: args.description,
-                creation_date: args.creation_date,
-                modification_date: args.mod_date,
-                replace: args.replace,
-                verbose,
-            })
-        })
-        .collect::<CliResult<Vec<_>>>()?;
-
-    // Reserve standard output before opening the input, like qpdf's
-    // `saveToStandardOutput` (`QPDFJob.cc:625`), so open-time `--verbose`
-    // info lines go to stderr when the PDF goes to stdout.
+    let (input, output) = attachment_input_output(
+        args.input.clone(),
+        args.output.clone(),
+        &args.page_ops,
+        args.replace_input,
+    )?;
     if let Some(output) = output.as_deref() {
         let _ = prepare_pdf_standard_output(output)?;
     }
+
+    let copy_encryption_storage =
+        cli_copy_encryption(args).map(|(path, password)| (path.to_path_buf(), password));
+    let copy_encryption = copy_encryption_storage
+        .as_ref()
+        .map(|(path, password)| (path.as_path(), password.clone()));
     let mut job = configure_attachment_job(
         input.as_deref(),
         output.as_deref(),
-        page_ops,
+        &args.page_ops,
         copy_encryption,
-        remove_unreferenced_resources,
-        replace_input,
-        repair,
-        password,
-        verbose,
-        suppress_warnings,
-        remove_restrictions,
-        linearize,
-        linearize_pass1,
+        args.remove_unreferenced_resources,
+        args.replace_input,
+        args.repair,
+        &args.password,
+        args.verbose,
+        args.no_warn,
+        args.remove_restrictions,
+        args.linearize,
+        args.linearize_pass1.as_deref(),
         &writer_options,
         transform_options,
     )?;
     {
         let mut configuration = job.config();
-        for option in attachment_options {
-            configuration.add_attachment(option);
+        if args.json_input {
+            configuration.json_input();
+        }
+        if let Some(update_from_json) = args.update_from_json.as_ref() {
+            configuration.update_from_json(update_from_json.clone());
+        }
+        if args.coalesce_contents {
+            configuration.coalesce_contents();
+        }
+        if args.remove_page_labels {
+            configuration.remove_page_labels();
+        }
+        if let Some(specs) = args.set_page_labels.as_ref() {
+            configuration.set_page_labels(
+                specs
+                    .iter()
+                    .map(|spec| arg_parser::os_bytes(spec.as_os_str())),
+            )?;
         }
     }
-    run_configured_attachment_job(job, &writer_options, linearize, linearize_pass1)
-}
-
-/// `--remove-attachment KEY [input] [output]`
-#[allow(clippy::too_many_arguments)]
-fn run_remove_attachment(
-    input: Option<PathBuf>,
-    output: Option<PathBuf>,
-    page_ops: &PageOpArgs,
-    copy_encryption: Option<(&Path, Vec<u8>)>,
-    remove_unreferenced_resources: CliRemoveUnreferencedResources,
-    replace_input: bool,
-    repair: bool,
-    password: &PasswordArgs,
-    keys: &[OsString],
-    verbose: bool,
-    suppress_warnings: bool,
-    remove_restrictions: bool,
-    linearize: bool,
-    linearize_pass1: Option<&Path>,
-    writer_options: WriterOptions,
-    transform_options: InspectionTransformOptions,
-) -> CliResult<()> {
-    let (input, output) = attachment_input_output(input, output, page_ops, replace_input)?;
-    if let Some(output) = output.as_deref() {
-        let _ = prepare_pdf_standard_output(output)?;
-    }
-    let mut job = configure_attachment_job(
-        input.as_deref(),
-        output.as_deref(),
-        page_ops,
-        copy_encryption,
-        remove_unreferenced_resources,
-        replace_input,
-        repair,
-        password,
-        verbose,
-        suppress_warnings,
-        remove_restrictions,
-        linearize,
-        linearize_pass1,
+    configure_cli_overlay_specs(&mut job, overlay_specs)?;
+    configure_top_level_attachment_mutations(&mut job, args, attachment_segments)?;
+    run_configured_attachment_job(
+        job,
         &writer_options,
-        transform_options,
-    )?;
-    {
-        let mut configuration = job.config();
-        for key in keys {
-            configuration.remove_attachment(arg_parser::os_bytes(key));
-        }
-    }
-    run_configured_attachment_job(job, &writer_options, linearize, linearize_pass1)
+        args.linearize,
+        args.linearize_pass1.as_deref(),
+    )
 }
 
 /// `--list-attachments [--verbose] input`
@@ -10690,70 +10529,6 @@ fn run_show_attachment(
     let key = arg_parser::os_bytes(key);
     let status = job.show_attachment(&mut pdf, &key)?;
     finish_job_exit_status(status)
-}
-
-/// `--copy-attachments-from FILE [--password=P] [--prefix=X] -- ...`
-///
-/// qpdf accepts this group repeatedly and copies from every donor in order.
-#[allow(clippy::too_many_arguments)]
-fn run_copy_attachments_from(
-    input: Option<PathBuf>,
-    output: Option<PathBuf>,
-    page_ops: &PageOpArgs,
-    copy_encryption: Option<(&Path, Vec<u8>)>,
-    remove_unreferenced_resources: CliRemoveUnreferencedResources,
-    replace_input: bool,
-    repair: bool,
-    password: &PasswordArgs,
-    groups: Vec<Vec<Vec<u8>>>,
-    verbose: bool,
-    suppress_warnings: bool,
-    remove_restrictions: bool,
-    linearize: bool,
-    linearize_pass1: Option<&Path>,
-    writer_options: WriterOptions,
-    transform_options: InspectionTransformOptions,
-) -> CliResult<()> {
-    let (input, output) = attachment_input_output(input, output, page_ops, replace_input)?;
-    let donor_args = groups
-        .into_iter()
-        .map(parse_copy_attachments_segment)
-        .collect::<CliResult<Vec<_>>>()?;
-
-    // Reserve standard output before opening the target, like qpdf's
-    // `saveToStandardOutput` (`QPDFJob.cc:625`), so open-time `--verbose`
-    // info lines go to stderr when the PDF goes to stdout.
-    if let Some(output) = output.as_deref() {
-        let _ = prepare_pdf_standard_output(output)?;
-    }
-    let mut job = configure_attachment_job(
-        input.as_deref(),
-        output.as_deref(),
-        page_ops,
-        copy_encryption,
-        remove_unreferenced_resources,
-        replace_input,
-        repair,
-        password,
-        verbose,
-        suppress_warnings,
-        remove_restrictions,
-        linearize,
-        linearize_pass1,
-        &writer_options,
-        transform_options,
-    )?;
-    {
-        let mut configuration = job.config();
-        for args in donor_args {
-            configuration.copy_attachments_from(
-                args.file,
-                args.password,
-                args.prefix.unwrap_or_default(),
-            );
-        }
-    }
-    run_configured_attachment_job(job, &writer_options, linearize, linearize_pass1)
 }
 
 #[cfg(test)]

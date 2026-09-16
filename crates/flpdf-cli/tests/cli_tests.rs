@@ -1069,18 +1069,17 @@ fn check_encrypted_fixture_reads_password_file_and_strips_newline() {
 }
 
 #[test]
-fn password_and_password_file_are_mutually_exclusive() {
+fn password_file_overrides_password_like_qpdf() {
     let temp = tempfile::tempdir().unwrap();
     let password_file = temp.path().join("password.txt");
     std::fs::write(&password_file, b"").unwrap();
 
     let mut cmd = Command::cargo_bin("flpdf").unwrap();
-    cmd.args(["--check", "--password="])
+    cmd.args(["--check", "--password=wrong"])
         .arg(format!("--password-file={}", password_file.display()))
         .arg("../../tests/fixtures/compat/encrypted-r4-three-page.pdf")
         .assert()
-        .failure()
-        .stderr(predicate::str::contains("cannot be used with"));
+        .success();
 }
 
 #[test]
@@ -6288,123 +6287,6 @@ fn top_level_coalesce_contents_accepted_and_produces_valid_output() {
 }
 
 #[test]
-fn top_level_coalesce_contents_conflicts_with_check() {
-    // A silent-ignore combination (--check would win the dispatch chain over
-    // any rewrite modifier) would produce wrong output. clap must surface it
-    // as a usage error, exit 2 (qpdf convention). Mirrors how --decrypt /
-    // --remove-restrictions are gated.
-    Command::cargo_bin("flpdf")
-        .unwrap()
-        .args(["--check", "--coalesce-contents", "in.pdf"])
-        .assert()
-        .failure()
-        .code(2);
-}
-
-#[test]
-fn top_level_coalesce_contents_conflicts_with_add_attachment() {
-    // Silent-shadow guard: without a clap conflict, the add-attachment
-    // branch wins the dispatch chain and --coalesce-contents is dropped
-    // without diagnostic. Reject the combination at usage-error level
-    // (exit 2, qpdf convention).
-    Command::cargo_bin("flpdf")
-        .unwrap()
-        .args([
-            "--coalesce-contents",
-            "--add-attachment",
-            "attach.pdf",
-            "--",
-            "in.pdf",
-            "out.pdf",
-        ])
-        .assert()
-        .failure()
-        .code(2);
-}
-
-#[test]
-fn top_level_coalesce_contents_conflicts_with_copy_attachments_from() {
-    // Silent-shadow guard, sibling of the add-attachment case.
-    Command::cargo_bin("flpdf")
-        .unwrap()
-        .args([
-            "--coalesce-contents",
-            "--copy-attachments-from",
-            "donor.pdf",
-            "in.pdf",
-            "out.pdf",
-        ])
-        .assert()
-        .failure()
-        .code(2);
-}
-
-#[test]
-fn top_level_coalesce_contents_conflicts_with_linearize() {
-    // Silent-shadow guard: --linearize is threaded to `run_rewrite`, whose
-    // linearize branch never reads `coalesce_contents`. Rejecting the
-    // combination up-front at clap level prevents the caller from getting a
-    // linearized output whose /Contents arrays are still unmerged.
-    Command::cargo_bin("flpdf")
-        .unwrap()
-        .args(["--linearize", "--coalesce-contents", "in.pdf", "out.pdf"])
-        .assert()
-        .failure()
-        .code(2);
-}
-
-#[test]
-fn top_level_coalesce_contents_conflicts_with_pages() {
-    // Silent-shadow guard: the page-op dispatch branch owns the write via
-    // run_page_extraction / run_rewrite_with_page_ops, neither of which reads
-    // `args.coalesce_contents`. The remaining unsupported
-    // `--copy-encryption` / `--overlay` combinations are handled inside that
-    // branch; mirror the same treatment for --coalesce-contents at the clap
-    // level.
-    Command::cargo_bin("flpdf")
-        .unwrap()
-        .args([
-            "--coalesce-contents",
-            "in.pdf",
-            "--pages",
-            ".",
-            "--",
-            "out.pdf",
-        ])
-        .assert()
-        .failure()
-        .code(2);
-}
-
-#[test]
-fn top_level_coalesce_contents_conflicts_with_rotate() {
-    // Sibling of the --pages case.
-    Command::cargo_bin("flpdf")
-        .unwrap()
-        .args(["--coalesce-contents", "--rotate=+90:1", "in.pdf", "out.pdf"])
-        .assert()
-        .failure()
-        .code(2);
-}
-
-#[test]
-fn top_level_coalesce_contents_conflicts_with_split_pages() {
-    // Sibling of the --pages case.
-    Command::cargo_bin("flpdf")
-        .unwrap()
-        .args([
-            "--coalesce-contents",
-            "--split-pages",
-            "1",
-            "in.pdf",
-            "out.pdf",
-        ])
-        .assert()
-        .failure()
-        .code(2);
-}
-
-#[test]
 fn top_level_coalesce_contents_accepts_collate_alone() {
     // `--collate` alone (no `--pages`) is a documented no-op that does NOT
     // activate `page_ops_active`; the default rewrite branch runs and honors
@@ -6425,17 +6307,6 @@ fn top_level_coalesce_contents_accepts_collate_alone() {
         .success();
 
     assert!(output.exists());
-}
-
-#[test]
-fn top_level_coalesce_contents_conflicts_with_empty() {
-    // Sibling of the --pages case.
-    Command::cargo_bin("flpdf")
-        .unwrap()
-        .args(["--coalesce-contents", "--empty", "in.pdf", "out.pdf"])
-        .assert()
-        .failure()
-        .code(2);
 }
 
 #[test]
@@ -9168,10 +9039,10 @@ fn attachment_help_text_contains_expected_flags() {
         .stdout(predicate::str::contains("--copy-attachments-from"));
 }
 
-/// Two attachment operations in one invocation must be a clean clap usage
-/// error (mutually-exclusive ArgGroup), not silently running only the first.
+/// Multiple attachment operations must run in qpdf's remove/add/copy order,
+/// rather than being rejected by a parser-level mutual-exclusion guard.
 #[test]
-fn attachment_ops_are_mutually_exclusive() {
+fn attachment_ops_are_applied_in_qpdf_order() {
     let temp = tempfile::tempdir().unwrap();
     let input = minimal_pdf_temp();
     let attachment = temp.path().join("a.txt");
@@ -9193,9 +9064,9 @@ fn attachment_ops_are_mutually_exclusive() {
             output.to_str().unwrap(),
         ])
         .assert()
-        .failure()
-        .stderr(predicate::str::contains("cannot be used with"))
+        .success()
         .stderr(predicate::str::contains("panicked").not());
+    assert!(output.is_file());
 }
 
 /// A non-ASCII (e.g. fullwidth-digit) date must yield a clean CLI error,
@@ -9559,10 +9430,9 @@ fn no_original_object_ids_default_behavior_unchanged() {
 }
 
 #[test]
-fn no_original_object_ids_conflicts_with_json() {
-    // `--no-original-object-ids` remains a JSON-incompatible QDF modifier;
-    // unlike the writer-only ID settings covered by the qpdf conflict matrix,
-    // this route-specific conflict is intentionally outside flpdf-p50gt.
+fn no_original_object_ids_is_accepted_with_json() {
+    // qpdf treats this as a writer-only QDF modifier; JSON output remains
+    // available and the flag has no effect on the JSON representation.
     Command::cargo_bin("flpdf")
         .unwrap()
         .args([
@@ -9571,10 +9441,8 @@ fn no_original_object_ids_conflicts_with_json() {
             "../../tests/fixtures/minimal.pdf",
         ])
         .assert()
-        .failure()
-        .stderr(predicate::str::contains("cannot be used with"))
-        .stderr(predicate::str::contains("--json"))
-        .stderr(predicate::str::contains("--no-original-object-ids"));
+        .success()
+        .stdout(predicate::str::contains("\"version\": 2"));
 }
 
 // ===========================================================================

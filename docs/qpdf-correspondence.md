@@ -3880,6 +3880,47 @@ qpdf 11.9.0とstatus/stdout/stderr/bytes比較し、coalesce部分は統合済�
 `flpdf-p50gt`（PR #2002）として別責務で維持する。独自の JSON rotation
 routeやdeviation markerは追加しない。
 
+### QPDFJob conflict inventory and canonical CLI routing (`flpdf-sg6tu`, 2026-09-16)
+
+qpdf 11.9.0 の最終 configuration check は、`--replace-input` と
+output/`--split-pages`/`--json`/`--empty`、output-free consumer と
+output、`--requires-password` と `--is-encrypted`、および同一 input/output
+だけを usage 境界として扱う（`libqpdf/QPDFJob.cc:567-631`）。
+writer-only 設定、JSON input/update、overlay/underlay、attachment mutation、
+image/annotation/content transformation、password と password-file は
+configuration state に積まれ、相互排他にされない
+（`libqpdf/QPDFJob_config.cc:27-40,143-171,364-381,528-679,766-769,794-831,1088-1166`）。
+
+qpdf は `createQPDF` で input/JSON input、page/rotation、underlay/overlay、
+全 transformation を完了し、`writeQPDF` で output-free なら同じ document を
+`doInspection` に渡す。inspection の各 report と attachment
+remove/add/copy は独立した順序付き branch であり、前段の変異結果を後段が観測する
+（`libqpdf/QPDFJob.cc:428-520,1646-1693,2046-2247`）。
+
+flpdf はこの責務に合わせ、top-level `Cli` の qpdf 非対応
+`conflicts_with` を定義側から全数監査した。qpdf semantic guard（output-free
+inspection/output、JSON implicit output、password-status pair）は残し、
+writer-only・transformation・JSON input/update・overlay・attachment の
+非対応 guard は除去した。`attachment_op` の parser-level ArgGroup も除去し、
+既存の `QPDFJob::prepare_document_transformations` が所有する
+remove → add → copy orderへ接続した。top-level attachment mutation は
+`run_all_attachment_mutations` から既存の `QPDFJob` create/write boundaryへ
+入り、JSON input/update、page selection、overlay、inspection を同じ state で扱う。
+`password`/`password-file` は raw argv の最後の setter を保持する。
+
+`args_conflicts_with_subcommands` と `--repair`（qpdf にない flpdf native
+extension）との recovery guard、native `rewrite` の mode guard は qpdf flat
+option conflict とは別の native surface として残る。qpdf semantic usage の
+本文と `For help:` 報告境界は `flpdf-qjip8` の後続責務であり、この slice は
+受理集合と create/inspection routingを対象にする。
+
+`crates/flpdf-cli/tests/cli_qpdf_conflict_matrix.rs` は writer/create-stage
+22 種 × inspection 12 種の 264 組を定義側の固定配列で列挙し、qpdf 11.9.0 と
+exit status/stdout/stderrを比較する。JSON input/update selector、mixed
+attachment mutation、attachment + overlay、password setter order、
+job-json-file の check-linearization も個別 differential test で固定する。
+独自 bridge や qpdf-deviation markerは追加しない。
+
 ### Top-level attachment mutation with a single inspection (`flpdf-awthm`, 2026-09-15)
 
 qpdf's `createQPDF` always completes `handleTransformations`, including

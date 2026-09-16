@@ -1764,18 +1764,8 @@ fn json_flag_conflicts_with_show_linearization() {
 }
 
 #[test]
-fn json_flag_conflicts_with_linearize_pass1() {
-    let input = write_temp_pdf(&one_page_pdf_with_stream());
-    let temp = tempfile::tempdir().unwrap();
-    let p1 = temp.path().join("pass1.bin");
-    let mut cmd = Command::cargo_bin("flpdf").unwrap();
-    cmd.args([
-        "--json",
-        &format!("--linearize-pass1={}", p1.display()),
-        input.path().to_str().unwrap(),
-    ])
-    .assert()
-    .code(2);
+fn json_flag_accepts_linearize_pass1_like_qpdf() {
+    assert_json_transform_stdout_matches_qpdf("--linearize-pass1=/dev/null", "one-page.pdf");
 }
 
 #[test]
@@ -1784,16 +1774,12 @@ fn json_flag_accepts_compress_streams_like_qpdf() {
 }
 
 /// `--json-output` dispatches through the same `run_json` boundary as
-/// `--json`. Every route-specific rewrite or inspection flag that the latter
-/// rejects must be rejected here too; qpdf-accepted create-stage combinations
-/// are covered by the differential conflict matrix instead.
-/// Keep this table aligned with `Cli::json`'s `conflicts_with_all` list,
-/// including the later-added encryption checks.
+/// `--json`. Only qpdf's output-free inspection modes remain conflicts;
+/// writer-only settings are accepted and covered by the differential matrix.
 #[test]
 fn json_output_conflicts_with_the_json_exclusive_flag_set() {
     let cases: &[&[&str]] = &[
         &["--check"],
-        &["--static-aes-iv"],
         &["--show-object=trailer"],
         &["--show-npages"],
         &["--show-pages"],
@@ -1802,13 +1788,8 @@ fn json_output_conflicts_with_the_json_exclusive_flag_set() {
         &["--show-encryption"],
         &["--is-encrypted"],
         &["--requires-password"],
-        &["--linearize-pass1=pass1"],
-        &["--remove-restrictions"],
-        &["--copy-encryption=donor.pdf"],
         &["--list-attachments"],
         &["--show-attachment=key"],
-        &["--no-original-object-ids"],
-        &["--preserve-unreferenced"],
     ];
 
     for extra in cases {
