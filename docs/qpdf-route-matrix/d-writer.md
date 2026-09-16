@@ -292,6 +292,24 @@ initialization, graph preparation, and dispatch ordering. qtest exceptions
 8. linearized では `enqueueObject` の direct 子再帰も、`enqueueObject` からの
    `assignCompressedObjectNumbers` 呼び出しも無効（D-1）。
 
+### Linearization `stopOnError` first-page guard (`flpdf-rbyc6.1`, 2026-09-17)
+
+qpdf の `calculateLinearizationData` は、最初の page object を Part 6 に置く前に
+`lc_first_page_private` 所属を検査する。page-0 user 以外に later-page、thumbnail、
+document-other、open-document、outline、root の user が付いた場合は、page object を
+shared 側へ黙って pin せず、`stopOnError`（`damagedPDF`）で write を停止する
+（`libqpdf/QPDF_linearization.cc:1118-1128,1188-1195`、`libqpdf/QPDF.cc:2590-2592`）。
+ObjStm member は `getUncompressedObject` で source container identity に折り畳まれて
+から同じ object-user map で判定される（`QPDF_linearization.cc:578-585,1020-1128`）。
+
+flpdf の `linearization/plan.rs::first_page_is_private` は、既存 canonical
+`Optimization` raw user map と Preserve の member-to-container projectionを使ってこの
+判定を行う。失敗時は `QpdfExc(DamagedPdf)` に qpdf の input description と
+`source_last_offset` を渡すため、`bad35.pdf` と synthetic trailer-user fixtureで qpdf と
+同じ exit 2、stderr、zero-byte output になる。private page を持つ正常な linearization
+fixture では、従来の Part 2 placementと byte outputを保持する。残りの stopOnError call
+site は親 `flpdf-rbyc6` の別 sliceであり、この route entryでは混ぜない。
+
 ### D-7. public / private 境界（`include/qpdf/QPDFWriter.hh`）
 
 - public（`include/qpdf/QPDFWriter.hh:55-439`）: constructor 3 種、出力設定
