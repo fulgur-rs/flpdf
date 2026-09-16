@@ -1707,7 +1707,7 @@ show/remove は qpdf の `std::string` key（`QPDFJob_config.cc:507-547`）を
 `QPDFJob.cc:2940-3025` の raw output string を保つ。UTF-8 が必要な option grammar の
 部分だけは従来どおり境界で検証する。
 
-`QPDFJob::Config::keepFilesOpen` / `keepFilesOpenThreshold` は `job/lifecycle.rs` の job configuration と `job/page_specs.rs::QPDFJob::handle_page_specs` に接続した。未指定時は qpdf の `page_specs` 上の異なる source index 数を閾値（既定200）と比較し、明示 y/n はその値を優先する。CLIとjob JSONのpage-spec callerは全specのsource identity/policyを先に確定し、各secondary sourceのparse直後・次sourceを開く前に `Pdf::set_input_source_stay_open(false)` を適用する。primaryはqpdfと同じくkeep-openのまま保持する。file source は `Pdf::open_file_with_options` の reopenable readerを使い、qpdfの `ClosedFileInputSource::before`/`after` 相当で secondary source を close/reopen する（`QPDFJob_config.cc:342-353`, `QPDFJob.cc:2374-2427`, `ClosedFileInputSource.cc:18-35,97-104`）。
+`QPDFJob::Config::keepFilesOpen` / `keepFilesOpenThreshold` は `job/lifecycle.rs` の job configuration と `job/page_specs.rs::QPDFJob::handle_page_specs` に接続した。未指定時は qpdf の `page_specs` 上の異なる source index 数を閾値（既定200）と比較し、明示 y/n はその値を優先する。CLIとjob JSONのpage-spec callerは全specのsource identity/policyを先に確定し、各secondary sourceのparse直後・次sourceを開く前に `Pdf::set_input_source_stay_open(false)` を適用する。primaryはqpdfと同じくkeep-openのまま保持する。file source は `Pdf::open_file_with_options` の reopenable readerを使い、qpdfの `ClosedFileInputSource::before`/`after` 相当で secondary source を close/reopen する（`QPDFJob_config.cc:342-353`, `QPDFJob.cc:2374-2427`, `ClosedFileInputSource.cc:18-35,97-103`）。
 
 `--job-json-file` の page-transform fields `splitPages`、`rotate`、`removeRestrictions` は、qpdf の生成 JSON handler (`QPDFJob_json.cc:611-624`, `auto_job_json_init.hh`) と Config/Job call order (`QPDFJob_config.cc:535-540,597-609`; `QPDFJob.cc:369-411,428-520,2137-2150,2635-2651,2940-3025`) に対応して `job/lifecycle.rs` の canonical configuration から page split、rotation、security/signature mutation へ接続した。 |
 
@@ -1961,7 +1961,7 @@ rewrite でも同じ canonical Job の overlay → transformation → writer rou
 （`:2137-2194`）→ `writeQPDF` / `doSplitPages`（`:483-511,2940-3027`）の順を、
 rotate/split × generate/flatten の4セルで qpdf-zlib-compatible byte differential として固定。
 新規 Tx/Ch appearance は qpdf の `/Tx BMC\nEMC\n` 初期buffer + `ValueSetter`
-token-filter（`QPDFFormFieldObjectHelper.cc:766-860`）を使うため、通常書込みでは生成内容、
+token-filter（`QPDFFormFieldObjectHelper.cc:766-852`）を使うため、通常書込みでは生成内容、
 split の foreign copy では qpdf と同じ初期bufferを観測する。Job-level の未指定 decode level は
 qpdf の default generalized（`QPDFJob.hh:635-637`）を JSON/inspection 側で保持する一方、writer
 へは `decode_level_set` が true のときだけ渡す（`QPDFJob.cc:2865-2875`）。したがって writer の

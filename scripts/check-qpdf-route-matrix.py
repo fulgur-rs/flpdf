@@ -10,10 +10,13 @@ anchors machine-checked.
 Checked forms (all inside backticks, anywhere in the document -- tables and
 prose alike):
 
-* ``libqpdf/X.cc:N``, ``libqpdf/X.cc:N-M``, ``include/qpdf/X.hh:N-M``,
-  ``qpdf/X.cc:N``, with optional comma-separated extra ranges after one path
-  (``libqpdf/X.cc:10-20,45``): the file must exist under the pinned qpdf
-  source and every range must satisfy ``1 <= N <= M <= line count``.
+* ``libqpdf/X.cc:N``, ``include/qpdf/X.hh:N-M``, ``qpdf/X.cc:N``, and bare
+  basenames such as ``QPDF.cc:N`` (including C sources such as
+  ``qpdf-ctest.c:N``), with optional comma-separated extra ranges after one
+  path (``libqpdf/X.cc:10-20,45``): the file must exist under the pinned qpdf
+  source and every range must satisfy ``1 <= N <= M <= line count``. Bare
+  basenames are resolved recursively under ``libqpdf/``, ``include/qpdf/``,
+  and ``qpdf/``; zero or multiple matches are errors.
 * ``crates/<crate>/src/<path>.rs::Sym`` / ``...rs::Type::method``: the file
   must exist under the repository root and the last path segment must be
   declared there (``fn``/``struct``/``enum``/``trait``/``type``/``const``/
@@ -45,12 +48,17 @@ import sys
 
 CLASSIFICATIONS = frozenset({"canonical", "bridge", "mixed", "unknown"})
 
+QPDF_CITATION_PATH_RE = (
+    r"(?:"
+    r"(?:libqpdf|include/qpdf|qpdf)/[A-Za-z0-9_./+-]+\.(?:cc|hh|h|c)"
+    r"|[A-Za-z0-9_.+-]+\.(?:cc|hh|h|c)"
+    r")"
+)
 QPDF_CITATION_RE = re.compile(
-    r"`((?:libqpdf|include/qpdf|qpdf)/[A-Za-z0-9_./+-]+\.(?:cc|hh|h))"
-    r":(\d+(?:-\d+)?(?:,\d+(?:-\d+)?)*)`"
+    rf"`({QPDF_CITATION_PATH_RE}):(\d+(?:-\d+)?(?:,\d+(?:-\d+)?)*)`"
 )
 QPDF_CITATION_TOKEN_RE = re.compile(
-    r"`((?:libqpdf|include/qpdf|qpdf)/[A-Za-z0-9_./+-]+\.(?:cc|hh|h)):([^`\n]*)`"
+    rf"`({QPDF_CITATION_PATH_RE}):([^`\n]*)`"
 )
 QPDF_CITATION_PLACEHOLDER_RE = re.compile(r"(?:N(?:-M)?|NNN)")
 FLPDF_SYMBOL_RE = re.compile(
@@ -209,6 +217,7 @@ class Checker:
         self.report = report
         self._line_counts: dict[Path, int] = {}
         self._file_texts: dict[Path, str] = {}
+        self._qpdf_basename_matches: dict[str, tuple[Path, ...]] = {}
 
     def _lines(self, path: Path) -> int:
         if path not in self._line_counts:
@@ -250,8 +259,47 @@ class Checker:
     def check_qpdf_citation(self, doc: Path, line_number: int, match: re.Match[str]) -> None:
         self.report.qpdf_citations += 1
         relative, spec = match.group(1), match.group(2)
-        target = self.qpdf_root / relative if self.qpdf_root is not None else None
+        if self.qpdf_root is None:
+            target = None
+        elif "/" in relative:
+            target = self.qpdf_root / relative
+        else:
+            matches = self._qpdf_basename_matches_for(relative)
+            display = f"{relative}:{spec}"
+            if not matches:
+                self.report.error(
+                    doc,
+                    line_number,
+                    f"`{display}`: qpdf basename not found under {self.qpdf_root}",
+                )
+                return
+            if len(matches) > 1:
+                paths = ", ".join(
+                    str(path.relative_to(self.qpdf_root)) for path in matches
+                )
+                self.report.error(
+                    doc,
+                    line_number,
+                    f"`{display}`: qpdf basename is ambiguous; matches {paths}",
+                )
+                return
+            target = matches[0]
         self._check_ranges(doc, line_number, f"{relative}:{spec}", target, spec)
+
+    def _qpdf_basename_matches_for(self, basename: str) -> tuple[Path, ...]:
+        matches = self._qpdf_basename_matches.get(basename)
+        if matches is not None:
+            return matches
+        if self.qpdf_root is None:
+            return ()
+        found: list[Path] = []
+        for directory in ("libqpdf", "include/qpdf", "qpdf"):
+            source_root = self.qpdf_root / directory
+            if source_root.is_dir():
+                found.extend(sorted(source_root.rglob(basename)))
+        matches = tuple(path for path in found if path.is_file())
+        self._qpdf_basename_matches[basename] = matches
+        return matches
 
     def check_flpdf_symbol(self, doc: Path, line_number: int, match: re.Match[str]) -> None:
         self.report.flpdf_citations += 1
