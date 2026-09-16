@@ -81,7 +81,7 @@ use crate::writer::object_streams::{
 };
 use crate::writer::{
     decrement_progress_event, effective_pdf_version_and_ext, effective_stream_policy,
-    output::{OutputSink, OutputTarget},
+    output::{write_object_ref, OutputSink, OutputTarget},
     report_progress_event,
     serialize::xref_stream,
     CompressStreams, NewlineBeforeEndstream, ObjectWriterEmission, WriterOptions, WriterResult,
@@ -193,6 +193,9 @@ impl OutputTarget for Pass1OutputTarget {
 struct ObjStmContainer {
     /// Fresh object number for the container indirect object.
     container_new_num: u32,
+    /// Original source container in Preserve mode. Generate-mode containers
+    /// are qpdf's null placeholders and therefore have no source dictionary.
+    source_container: Option<ObjectRef>,
     /// `(original_ref, new_ref)` pairs in batch order.
     members: Vec<(ObjectRef, ObjectRef)>,
 }
@@ -324,6 +327,9 @@ impl ObjStmLayout {
                             .to_string(),
                     )
                 })?;
+                let source_container = batch
+                    .source_container_number
+                    .map(|number| ObjectRef::new(number, 0));
                 let mut members = Vec::with_capacity(batch.members.len());
                 for (idx, &orig) in batch.members.iter().enumerate() {
                     let new_ref = renumber.new_for_original(orig).ok_or_else(|| {
@@ -337,6 +343,7 @@ impl ObjStmLayout {
                 }
                 out.push(ObjStmContainer {
                     container_new_num,
+                    source_container,
                     members,
                 });
             }
@@ -378,6 +385,38 @@ impl ObjStmLayout {
             source_container_numbers,
         })
     }
+}
+
+/// Return the output-space `/Extends` target carried by a preserved source
+/// ObjStm container. qpdf only copies an indirect `/Extends` value from the
+/// non-null source object (`QPDFWriter.cc:1730-1739`); generated containers use
+/// a null placeholder and have no source dictionary to inspect.
+fn preserved_objstm_extends<R: Read + Seek>(
+    container: &ObjStmContainer,
+    renumber: &RenumberMap,
+    pdf: &mut Pdf<R>,
+) -> Result<Option<ObjectRef>> {
+    let Some(source_container) = container.source_container else {
+        return Ok(None);
+    };
+    let source_handle = pdf.get_object_handle(source_container);
+    source_handle.try_dereference()?;
+    let Some(source_dict) = source_handle.as_stream_dict() else {
+        return Ok(None);
+    };
+    let extends_handle = source_dict.try_get_key(b"/Extends")?;
+    let Some(extends) = extends_handle.object_ref() else {
+        return Ok(None);
+    };
+    // qpdf reads the renumbered id with `m->obj_renumber[old_og]`
+    // (`QPDFWriter.cc:1750-1755`), and `std::map::operator[]` default-constructs
+    // a 0 for a target that was never enqueued, so a dangling `/Extends` is
+    // written as `0 0 R` rather than failing the write.
+    Ok(Some(
+        renumber
+            .new_for_original(extends)
+            .unwrap_or_else(|| ObjectRef::new(0, 0)),
+    ))
 }
 
 /// Build the ObjStm container stream object for one scheduled container from
@@ -432,7 +471,8 @@ fn append_objstm_container_object<R: Read + Seek>(
     } else {
         CompressStreams::No
     };
-    let (stream_handle, data) = wrap_objstm_body_as_handle(body, compress, None)?;
+    let extends = preserved_objstm_extends(container, renumber, pdf)?;
+    let (stream_handle, data) = wrap_objstm_body_as_handle(body, compress, extends)?;
     let stream_dict = stream_handle.as_stream_dict().ok_or_else(|| {
         // cov:ignore-start: wrap_objstm_body_as_handle always returns a stream handle.
         crate::Error::Internal("linearization ObjStm wrapper produced a non-stream handle".into())
@@ -471,6 +511,10 @@ fn append_objstm_container_object<R: Read + Seek>(
     stream_dict.try_get_key(b"/N")?.write_object(out)?;
     out.write_bytes(b" /First ")?;
     stream_dict.try_get_key(b"/First")?.write_object(out)?;
+    if let Some(extends) = extends {
+        out.write_bytes(b" /Extends ")?;
+        write_object_ref(out, extends)?;
+    }
     out.write_bytes(b" >>")?;
     if let Some(ctx) = encrypt_ctx {
         crate::writer::write_stream_payload_with_pipeline(
@@ -5284,6 +5328,56 @@ mod tests {
     }
 
     #[test]
+    fn preserved_objstm_extends_ignores_a_non_stream_source() {
+        let mut pdf = Pdf::empty().expect("empty PDF for source inspection");
+        let source = ObjectRef::new(1, 0);
+        pdf.replace_object(source, ObjectHandle::integer(7))
+            .expect("replace source with a direct non-stream value");
+        let container = ObjStmContainer {
+            container_new_num: 2,
+            source_container: Some(source),
+            members: Vec::new(),
+        };
+        let renumber = RenumberMap::from_plan(&LinearizationPlan::default());
+
+        assert_eq!(
+            preserved_objstm_extends(&container, &renumber, &mut pdf)
+                .expect("non-stream source is ignored"),
+            None
+        );
+    }
+
+    #[test]
+    fn preserved_objstm_extends_maps_an_unmapped_indirect_target_to_object_zero() {
+        let mut pdf = Pdf::empty().expect("empty PDF for source inspection");
+        let source = ObjectRef::new(1, 0);
+        let extends_target = pdf.get_object_handle(ObjectRef::new(9, 0));
+        let source_stream = ObjectHandle::stream(
+            ObjectHandle::dictionary(vec![
+                (b"Type".to_vec(), ObjectHandle::name(b"ObjStm".to_vec())),
+                (b"Extends".to_vec(), extends_target),
+            ]),
+            Rc::new(Vec::new()),
+        );
+        pdf.replace_object(source, source_stream)
+            .expect("replace source with an ObjStm stream");
+        let container = ObjStmContainer {
+            container_new_num: 2,
+            source_container: Some(source),
+            members: Vec::new(),
+        };
+        let renumber = RenumberMap::from_plan(&LinearizationPlan::default());
+
+        // qpdf reads `m->obj_renumber[old_og]` for the child id
+        // (`QPDFWriter.cc:1750-1755`); `std::map::operator[]` inserts a 0 for a
+        // target that was never enqueued, so `qpdf --linearize` on such a file
+        // writes `/Extends 0 0 R` and still exits 0.
+        let extends = preserved_objstm_extends(&container, &renumber, &mut pdf)
+            .expect("an unmapped /Extends target follows qpdf's zero default");
+        assert_eq!(extends, Some(ObjectRef::new(0, 0)));
+    }
+
+    #[test]
     fn preserve_setup_membership_covers_filtered_plan_members() {
         let mut pdf = Pdf::open(Cursor::new(include_bytes!(
             "../../../../tests/fixtures/compat/objstm-lin-cap-boundary-199-bearing.pdf"
@@ -5538,6 +5632,7 @@ mod tests {
 
         let container = ObjStmContainer {
             container_new_num: 2,
+            source_container: None,
             members: Vec::new(),
         };
         let mut pdf = Pdf::empty().expect("empty PDF for ObjStm output");
