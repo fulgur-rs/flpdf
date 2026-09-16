@@ -40,6 +40,21 @@ pub struct Token {
     pub(crate) end: usize,
 }
 
+#[cfg(test)]
+thread_local! {
+    static TOKEN_CONSTRUCTION_COUNT: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+}
+
+#[cfg(test)]
+fn token_construction_count() -> usize {
+    TOKEN_CONSTRUCTION_COUNT.with(std::cell::Cell::get)
+}
+
+#[cfg(test)]
+fn reset_token_construction_count() {
+    TOKEN_CONSTRUCTION_COUNT.with(|count| count.set(0));
+}
+
 impl PartialEq for Token {
     fn eq(&self, other: &Self) -> bool {
         self.token_type != TokenType::Bad
@@ -66,6 +81,8 @@ impl Token {
         error_message: Option<Vec<u8>>,
         range: Range<usize>,
     ) -> Self {
+        #[cfg(test)]
+        TOKEN_CONSTRUCTION_COUNT.with(|count| count.set(count.get() + 1));
         Self {
             token_type,
             value,
@@ -894,9 +911,12 @@ impl<'a> Tokenizer<'a> {
         candidate_distance
     }
 
-    /// Pull adapter matching qpdf 11.9.0 `QPDFTokenizer::readToken` and
-    /// `nextToken` (`libqpdf/QPDFTokenizer.cc:887-965`).
-    pub fn read_token(&mut self, allow_bad: bool, max_len: usize) -> Result<Token> {
+    /// Scan one pull-mode token and leave its tokenizer-owned buffers ready
+    /// for a consumer. This is the `nextToken` half of qpdf's pull adapter;
+    /// callers decide whether they need the owned `Token` returned by
+    /// `getToken` or only the current type/value buffers
+    /// (`libqpdf/QPDFTokenizer.cc:866-965`).
+    fn read_token_ready(&mut self, max_len: usize) -> Result<()> {
         if self.state != State::InlineImage {
             self.reset();
         }
@@ -951,6 +971,13 @@ impl<'a> Tokenizer<'a> {
         if !self.in_token && !self.before_token {
             self.pos = self.pos.saturating_sub(1);
         }
+        Ok(())
+    }
+
+    /// Pull adapter matching qpdf 11.9.0 `QPDFTokenizer::readToken` and
+    /// `nextToken` (`libqpdf/QPDFTokenizer.cc:887-965`).
+    pub fn read_token(&mut self, allow_bad: bool, max_len: usize) -> Result<Token> {
+        self.read_token_ready(max_len)?;
         let token = self.take_ready_token();
         self.reset();
         if token.token_type == TokenType::Bad && !allow_bad {
@@ -1034,17 +1061,20 @@ impl<'a> Tokenizer<'a> {
     /// consumer so the ordinary `next_integer` callers retain their stricter
     /// `allow_bad = false` behavior.
     pub(crate) fn next_object_stream_integer(&mut self) -> Result<i64> {
-        let token = self.read_token(true, 0)?;
-        if !token.is_integer() {
-            return Err(Error::parse(
-                token.start,
+        self.read_token_ready(0)?;
+        let result = if self.token_type != TokenType::Integer {
+            Err(Error::parse(
+                self.token_start,
                 "expected integer in object stream header",
-            ));
-        }
-        std::str::from_utf8(&token.value)
-            .ok()
-            .and_then(|value| value.parse::<i64>().ok())
-            .ok_or_else(|| Error::parse(token.start, "integer is out of range"))
+            ))
+        } else {
+            std::str::from_utf8(&self.raw)
+                .ok()
+                .and_then(|value| value.parse::<i64>().ok())
+                .ok_or_else(|| Error::parse(self.token_start, "integer is out of range"))
+        };
+        self.reset();
+        result
     }
 
     pub(crate) fn expect_word(&mut self, expected: &[u8]) -> Result<()> {
@@ -1165,11 +1195,15 @@ fn token_description(token: &Token) -> String {
 
 #[cfg(test)]
 mod tests {
-    use super::{parse_integer_bytes, Tokenizer};
+    use super::{
+        parse_integer_bytes, reset_token_construction_count, token_construction_count, Tokenizer,
+    };
     use crate::Error;
 
     #[test]
     fn object_stream_integer_checks_a_bad_token_after_reading_it() {
+        reset_token_construction_count();
+        let before = token_construction_count();
         let mut tokenizer = Tokenizer::new(b"(");
         let error = tokenizer
             .next_object_stream_integer()
@@ -1179,6 +1213,45 @@ mod tests {
             Error::Parse { message, .. }
                 if message == "expected integer in object stream header"
         ));
+        assert_eq!(token_construction_count(), before);
+        assert_eq!(tokenizer.position(), 1);
+    }
+
+    #[test]
+    fn object_stream_integer_reuses_buffers_and_preserves_delimiter_position() {
+        reset_token_construction_count();
+        let before = token_construction_count();
+        let mut tokenizer = Tokenizer::new(b"12 34");
+
+        assert_eq!(tokenizer.next_object_stream_integer().unwrap(), 12);
+        assert_eq!(tokenizer.position(), 2);
+        assert_eq!(tokenizer.next_object_stream_integer().unwrap(), 34);
+        assert_eq!(tokenizer.position(), 5);
+        assert_eq!(token_construction_count(), before);
+    }
+
+    #[test]
+    fn object_stream_integer_accepts_a_number_terminated_by_eof() {
+        let mut tokenizer = Tokenizer::new(b"12");
+
+        assert_eq!(tokenizer.next_object_stream_integer().unwrap(), 12);
+        assert_eq!(tokenizer.position(), 2);
+    }
+
+    #[test]
+    fn object_stream_integer_resets_after_overflow_before_the_next_header_value() {
+        let mut tokenizer = Tokenizer::new(b"9223372036854775808 7");
+        let error = tokenizer
+            .next_object_stream_integer()
+            .expect_err("an overflowing ObjStm header integer must fail");
+
+        assert!(matches!(
+            error,
+            Error::Parse { offset: 0, message }
+                if message == "integer is out of range"
+        ));
+        assert_eq!(tokenizer.position(), 19);
+        assert_eq!(tokenizer.next_object_stream_integer().unwrap(), 7);
     }
 
     #[test]
