@@ -232,6 +232,60 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.6.1](https://github.com/fulgur-rs/flpdf/compare/v0.6.0...v0.6.1) - 2026-09-16
+
+### Fixed
+
+- *(writer)* handle packed visited allocation failure
+- *(writer)* pack ObjStm visited bits
+- *(flate)* bound the initialized-output view to its buffer
+- *(flate)* report zlib's detail text on the default inflate backend
+- *(writer)* bound ObjStm visited storage
+- *(logger)* avoid buffered partial lines in default logger
+- *(logger)* bound line-buffered stdout writes
+- stop linearization on shared first page
+- align JSON object generations with qpdf
+- *(check)* reject unfilterable page content streams
+- *(job)* let a page-selection usage error reach the CLI's usage exit
+- *(cli)* keep --json's implicit output across a later partial job JSON
+- *(cli)* preserve job-json argv ordering
+- *(linearization)* keep the part-9 head group in source order
+- *(linearization)* pick the greatest qualifying container predecessor
+- *(linearization)* promote only page-tree-only objects to the part-9 head
+- *(linearization)* keep the page tree at the head of part 9
+- *(linearization)* anchor generated ObjStm containers by route
+- sync the writer flag at the job-JSON copy-encryption sites
+- keep donor credentials when a later mode owns the output
+
+### Other
+
+- *(writer)* normalize eligibility source snapshots
+- Merge pull request #2071 from fulgur-rs/fix/flpdf-7ss5w-slice-lifetime
+- Merge pull request #2066 from fulgur-rs/fix/flpdf-psgss-preserve-part9-order
+- *(writer)* cover sparse visited storage
+- normalize source-shape snapshots on Windows
+- *(flate)* terminate qpdf correspondence classification
+- *(parser)* drop stale conflict import
+- Revert perf(tokenizer): consume object-stream header integers from live buffers
+- *(tokenizer)* consume object-stream header integers from live buffers
+- move live parser token values
+- combine live token compact extraction
+- compact live scalar tokens and skip redundant drops
+- upgrade cached resolver without cloning weak state
+- cover flate codec invariant
+- reuse flate output storage across small writes
+- converge qpdf writer and parser hot paths
+- clarify flpdf module responsibilities
+- Merge pull request #2038 from fulgur-rs/fix/flpdf-u40ck-job-json-order
+- *(encryption)* describe the deviation by the key that reaches the provider
+- *(encryption)* record the short-raw-key deviation in the module doc
+- *(linearization)* pin the part-9 head anchor against qpdf
+- Merge pull request #2028 from fulgur-rs/fix/flpdf-5h1ru-part9-pages-head-rank
+- preserve ObjStm Flate route guard
+- *(linearization)* share ObjStm payload ownership
+- Merge pull request #2017 from fulgur-rs/perf/flpdf-ymuj-6-40-type-predicate
+- Merge pull request #2013 from fulgur-rs/fix/flpdf-0nlqs-attachment-page-ops
+
 ## [0.6.0](https://github.com/fulgur-rs/flpdf/compare/v0.5.1...v0.6.0) - 2026-09-15
 
 ### Added
