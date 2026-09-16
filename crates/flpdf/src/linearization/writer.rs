@@ -3176,9 +3176,15 @@ fn part9_plain_rank(
     category: u8,
     page: u32,
 ) -> SecondHalfPlainRank {
-    if object_gen
-        .to_object_ref()
-        .is_some_and(|object_ref| part9_pages.contains(&object_ref))
+    //
+    // `part9_category_order_key` classifies a thumbnail or outline user ahead
+    // of its page-tree arm, mirroring qpdf's own precedence, so an object that
+    // reaches part 9 through one of those users keeps that category and only a
+    // page-tree-only object (category 0) is promoted.
+    if category == 0
+        && object_gen
+            .to_object_ref()
+            .is_some_and(|object_ref| part9_pages.contains(&object_ref))
     {
         return (2, 0, 0, 0);
     }
