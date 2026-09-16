@@ -137,14 +137,20 @@ impl InflateCodec {
                     FlushDecompress::Finish => zlib_rs::InflateFlush::Finish,
                     _ => zlib_rs::InflateFlush::NoFlush,
                 };
-                codec
-                    .decompress_uninit(input, output, flush)
-                    .map(|status| match status {
+                // qpdf surfaces zlib's detailed `strm.msg` ("invalid code lengths
+                // set"), not the generic return-code name, so prefer the codec's
+                // message exactly as the qpdf-zlib branch below does.
+                match codec.decompress_uninit(input, output, flush) {
+                    Ok(status) => Ok(match status {
                         zlib_rs::Status::Ok => Status::Ok,
                         zlib_rs::Status::BufError => Status::BufError,
                         zlib_rs::Status::StreamEnd => Status::StreamEnd,
-                    })
-                    .map_err(|error| error.as_str().to_owned())
+                    }),
+                    Err(error) => Err(codec
+                        .error_message()
+                        .unwrap_or_else(|| error.as_str())
+                        .to_owned()),
+                }
             }
             #[cfg(feature = "qpdf-zlib-compat")]
             Self::Flate2(codec) => codec
@@ -1161,6 +1167,25 @@ mod tests {
         ];
         let decoded = inflate_chunks([BAD_CHECKSUM.as_slice()], 3).unwrap();
         assert_eq!(decoded, b"checksum payload");
+    }
+
+    #[test]
+    fn inflate_data_errors_carry_the_zlib_detail_on_every_backend() {
+        // qpdf reports zlib's `strm.msg` detail rather than the generic
+        // return-code name: `qpdf --check` on qtest's fuzz-16214 prints
+        // "... inflate: data: invalid code lengths set". Both the default
+        // zlib-rs codec and the qpdf-zlib compat backend must reach that text,
+        // so this assertion runs unconditionally under either feature set.
+        const INVALID_STORED_BLOCK: [u8; 11] = [
+            0x78, 0x01, 0x01, 0x01, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x01,
+        ];
+        let mut sink = RecordingSink::default();
+        let mut flate = Flate::new("inflate", &mut sink, FlateAction::Inflate, 3).unwrap();
+        let err = flate.write(&INVALID_STORED_BLOCK).unwrap_err();
+        assert_eq!(
+            err.to_string(),
+            "inflate: inflate: data: invalid stored block lengths"
+        );
     }
 
     #[test]
