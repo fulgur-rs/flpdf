@@ -1332,6 +1332,11 @@ fn qtest_accessor_cases_do_not_use_explicit_pdf_resolve() {
         "/src/driver/test_42_49.rs"
     ))
     .expect("read tree-driver source");
+    let resolve_source = fs::read_to_string(concat!(
+        env!("CARGO_MANIFEST_DIR"),
+        "/src/driver/test_34_41.rs"
+    ))
+    .expect("read resolve-driver source");
     let late_80_87_source = fs::read_to_string(concat!(
         env!("CARGO_MANIFEST_DIR"),
         "/src/driver/test_80_87.rs"
@@ -1450,8 +1455,22 @@ fn qtest_accessor_cases_do_not_use_explicit_pdf_resolve() {
         "\n#[cfg(test)]",
     );
     assert!(
-        test_79.contains("chase_key(") && late_source.contains("fn resolve_once"),
-        "test 79 lost the explicit chained resolution retained for its separate scope"
+        !test_79.contains("chase_key(")
+            && !test_79.contains("resolve_once(")
+            && !test_79.contains("pdf.resolve("),
+        "test 79 retains the qpdf-less chained resolution bridge"
+    );
+    assert!(
+        test_79.contains("page.try_get_key(")
+            && test_79.contains("copy_stream()")
+            && test_79.contains("writer.set_qdf_mode(true)"),
+        "test 79 must use the canonical key accessor while retaining stream-copy writer behavior"
+    );
+    assert!(
+        test_79.contains("try_get_key(")
+            && tree_source.contains("fn chase_key")
+            && resolve_source.contains("fn resolve_once"),
+        "test 79 must retain canonical accessor usage while unrelated helper scopes remain"
     );
     let test_19 = section(
         page_source.as_str(),
