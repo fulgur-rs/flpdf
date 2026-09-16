@@ -3539,7 +3539,10 @@ fn reject_multiple_generations(plan: &LinearizationPlan) -> Result<()> {
     for object_gen in plan.renumber_assigned_raw() {
         let object_number = object_gen.get_obj();
         if previous_number == Some(object_number) {
-            return Err(crate::Error::Unsupported(
+            // qpdf raises this as a `std::runtime_error`
+            // (`QPDFWriter.cc:2524`), which carries no source context and no
+            // category prefix, so the CLI prints the message alone.
+            return Err(crate::Error::System(
                 "QPDF cannot currently linearize files that contain multiple objects with the \
                  same object ID and different generations.  If you see this error message, \
                  please file a bug report and attach the file if possible.  As a workaround, \

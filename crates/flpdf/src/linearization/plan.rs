@@ -1715,9 +1715,17 @@ impl LinearizationPlan {
                 .next()
                 .is_none()
         {
-            return Err(crate::Error::Unsupported(
-                "no pages found while calculating linearization data".to_string(),
-            ));
+            // qpdf raises this through `stopOnError`, which builds a
+            // `qpdf_e_damaged_pdf` exception carrying the input name and the
+            // source's last read offset and no object description
+            // (`QPDF_linearization.cc:1190`, `QPDF.cc:2590-2592,2625-2628`).
+            return Err(crate::Error::QpdfExc(crate::QpdfExc::new(
+                crate::QpdfErrorCode::DamagedPdf,
+                pdf.input_description(),
+                b"",
+                i64::try_from(pdf.source_last_offset()).unwrap_or(i64::MAX),
+                b"no pages found while calculating linearization data",
+            )));
         }
 
         // ----------------------------------------------------------------
