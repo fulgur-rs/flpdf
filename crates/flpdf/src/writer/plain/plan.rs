@@ -463,7 +463,6 @@ impl PlainWritePlan {
                 &source_version,
                 source_extension_level,
                 options,
-                false,
                 has_object_stream || form == XrefForm::Stream,
             );
         let mut version = effective_version.to_string();

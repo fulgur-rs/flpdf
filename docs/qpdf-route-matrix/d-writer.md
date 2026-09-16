@@ -65,6 +65,8 @@ pinned qpdf 11.9.0 の `libqpdf/QPDFWriter.cc`（3044 行）/ `include/qpdf/QPDF
      **または encrypted** なら root を erase（Adobe Reader 8.0.0 回避）。
    - 逆写像 `object_stream_to_objects`（`std::map<int, std::set<QPDFObjGen>>`）と
      `max_ostream_index` を構築。ObjStm が 1 つでもあれば最低版 1.5。`final_pdf_version` 決定。
+   - `setLinearization(true)` 自体は version floor を追加しない。linearized output でも、
+     ObjStm・暗号化・入力・明示 version 設定から決まった `final_pdf_version` をそのまま使う。
 2. `events_expected` の設定（progress 用）。
 3. `prepareFileForWrite()`（`libqpdf/QPDFWriter.cc:2036-2056`）: `fixDanglingReferences()`
    （`libqpdf/QPDF.cc:1259-1269`）、`/Root /Extensions` と `/ADBE` を direct 化。

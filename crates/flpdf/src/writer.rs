@@ -804,7 +804,6 @@ impl<'pdf, R: Read + Seek + 'static> PdfWriter<'pdf, R> {
         Ok(effective_pdf_version(
             self.pdf.version(),
             &options,
-            self.settings.linearization,
             matches!(self.settings.object_stream_mode, ObjectStreamMode::Generate),
         )
         .to_owned())
@@ -1560,7 +1559,7 @@ pub(crate) struct WriterOptions {
     pub min_extension_level: Option<i64>,
 
     /// Force the output PDF version header to exactly this value, ignoring the
-    /// source version and the linearize floor.
+    /// source version and other minimum-version floors.
     ///
     /// Mirrors `qpdf --force-version`.
     pub force_version: Option<String>,
@@ -1970,8 +1969,8 @@ fn effective_object_stream_mode(options: &WriterOptions) -> ObjectStreamMode {
     }
 }
 
-/// Compute the effective PDF version to write given the source version, the
-/// caller-supplied options, and whether the output is linearized.
+/// Compute the effective PDF version to write given the source version and the
+/// caller-supplied options.
 ///
 /// Rule (mirrors qpdf):
 /// 1. If `options.force_version` is set, use it verbatim.
@@ -1982,8 +1981,6 @@ fn effective_object_stream_mode(options: &WriterOptions) -> ObjectStreamMode {
 ///    caller passes whether the output *really* contains an object stream (not
 ///    merely whether the mode requests it), so a generate request that packs
 ///    nothing leaves the version untouched, matching qpdf.
-/// 4. If `linearize` is true, apply an additional `max(…, "1.2")` floor
-///    (linearized PDFs require at least PDF 1.2).
 ///
 /// If the version strings cannot be parsed the function falls back to the
 /// `source` string unchanged (rather than panicking) so callers do not need to
@@ -2008,10 +2005,9 @@ fn effective_object_stream_mode(options: &WriterOptions) -> ObjectStreamMode {
 pub(crate) fn effective_pdf_version<'a>(
     source: &'a str,
     options: &'a WriterOptions,
-    linearize: bool,
     object_streams: bool,
 ) -> &'a str {
-    effective_pdf_version_and_ext(source, 0, options, linearize, object_streams).0
+    effective_pdf_version_and_ext(source, 0, options, object_streams).0
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -2137,18 +2133,13 @@ pub(crate) fn effective_pdf_version_and_ext<'a>(
     source: &'a str,
     source_ext: i64,
     options: &'a WriterOptions,
-    linearize: bool,
     object_streams: bool,
 ) -> (&'a str, i64) {
     match forced_pdf_version_pair(options) {
         Some(pair) => pair,
-        None => effective_pdf_version_and_ext_without_force(
-            source,
-            source_ext,
-            options,
-            linearize,
-            object_streams,
-        ),
+        None => {
+            effective_pdf_version_and_ext_without_force(source, source_ext, options, object_streams)
+        }
     }
 }
 
@@ -2156,7 +2147,6 @@ fn effective_pdf_version_and_ext_without_force<'a>(
     source: &'a str,
     source_ext: i64,
     options: &'a WriterOptions,
-    linearize: bool,
     object_streams: bool,
 ) -> (&'a str, i64) {
     // A PDF source header is normally strict M.m. Preserve the previous
@@ -2185,9 +2175,6 @@ fn effective_pdf_version_and_ext_without_force<'a>(
     if object_streams {
         update_effective_pdf_version(&mut best, "1.5", 0);
     }
-    if linearize {
-        update_effective_pdf_version(&mut best, "1.2", 0);
-    }
 
     best.map(|version| (version.raw, version.extension_level))
         .unwrap_or((source, 0))
@@ -2201,12 +2188,11 @@ pub(crate) fn effective_pdf_version_and_ext_with_encryption<'a>(
     source: &'a str,
     source_ext: i64,
     options: &'a WriterOptions,
-    linearize: bool,
     object_streams: bool,
     encryption: Option<&EncryptionParameters>,
 ) -> (&'a str, i64) {
     let (raw, extension_level) =
-        effective_pdf_version_and_ext(source, source_ext, options, linearize, object_streams);
+        effective_pdf_version_and_ext(source, source_ext, options, object_streams);
     let Some(encryption) = encryption else {
         return (raw, extension_level);
     };
@@ -3497,7 +3483,7 @@ fn write_pclm<R: Read + Seek>(
     let mut queue = pclm::EmissionQueue::from_plan(&plan)?;
     let source_extension_level = pdf.adobe_extension_level()?.unwrap_or(0);
     let (version, final_extension_level) =
-        effective_pdf_version_and_ext(pdf.version(), source_extension_level, options, false, false);
+        effective_pdf_version_and_ext(pdf.version(), source_extension_level, options, false);
     let version = version.to_owned();
     if deterministic_id {
         out.begin_digest();
@@ -4524,7 +4510,6 @@ mod final_handle_writer_tests {
                 0,
                 &WriterOptions::default(),
                 false,
-                false,
                 Some(&encryption),
             ),
             ("1.7", 3)
@@ -4532,10 +4517,10 @@ mod final_handle_writer_tests {
     }
 
     #[test]
-    fn effective_version_applies_the_linearize_floor_to_a_lower_source() {
+    fn effective_version_preserves_a_lower_source_version() {
         let options = WriterOptions::default();
 
-        assert_eq!(effective_pdf_version("1.1", &options, true, false), "1.2");
+        assert_eq!(effective_pdf_version("1.1", &options, false), "1.1");
     }
 
     #[test]
@@ -4553,7 +4538,7 @@ mod final_handle_writer_tests {
         };
 
         assert_eq!(
-            effective_pdf_version_and_ext("1.7", 0, &options, false, false),
+            effective_pdf_version_and_ext("1.7", 0, &options, false),
             ("1.7", 2)
         );
     }
@@ -4570,7 +4555,7 @@ mod final_handle_writer_tests {
         };
 
         assert_eq!(
-            effective_pdf_version_and_ext("1.3", 0, &options, false, false),
+            effective_pdf_version_and_ext("1.3", 0, &options, false),
             ("1.7x", 2)
         );
     }
@@ -4584,7 +4569,7 @@ mod final_handle_writer_tests {
         };
 
         assert_eq!(
-            effective_pdf_version_and_ext("1.3", 0, &options, true, true),
+            effective_pdf_version_and_ext("1.3", 0, &options, true),
             ("1.7x", 2)
         );
     }
@@ -4598,7 +4583,7 @@ mod final_handle_writer_tests {
         };
 
         assert_eq!(
-            effective_pdf_version_and_ext("1.7", 0, &options, false, false),
+            effective_pdf_version_and_ext("1.7", 0, &options, false),
             ("1.7", 0)
         );
     }
@@ -4608,7 +4593,7 @@ mod final_handle_writer_tests {
         let options = WriterOptions::default();
 
         assert_eq!(
-            effective_pdf_version_and_ext("2147483648", 0, &options, false, false),
+            effective_pdf_version_and_ext("2147483648", 0, &options, false),
             ("2147483648", 0)
         );
     }
