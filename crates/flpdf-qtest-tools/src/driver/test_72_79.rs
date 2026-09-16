@@ -205,7 +205,7 @@ pub(crate) fn run_test_72<R: Read + Seek>(
     // `oh.addContentTokenFilter`, which coalesces `/Contents` -- the wrong
     // path for a bare stream). `/Fx1` is always a form XObject in this
     // test's fixture, so the assert below encodes that branch condition
-    // (matching this file's `chase_key`-based dereference discipline)
+    // (matching the canonical `try_get_key` receiver-resolution chain above)
     // rather than silently hardcoding the form-XObject arm.
     assert!(
         fx1.is_form_xobject()?,
