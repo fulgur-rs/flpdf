@@ -10,17 +10,15 @@ use flpdf::{Error, ObjectHandle, Pdf};
 
 use super::{emit_new_diagnostics, os_str_diagnostic_bytes};
 
-/// Text of the "form field object must be indirect" internal error used by
-/// [`run_test_51`]/[`run_test_52`] below.
+/// Text of the "form field object must be indirect" internal error retained
+/// by [`run_test_52`] below until its own bounded handle cutover.
 ///
 /// qpdf's `QPDFFormFieldObjectHelper` wraps a `QPDFObjectHandle` directly and
 /// tolerates a direct (non-indirect) field object -- `setFieldAttribute`'s
 /// underlying `replaceKey` is simply a no-op on a null/malformed handle
 /// (`QPDFObjectHandle::replaceKey`, `libqpdf/QPDFObjectHandle.cc:1199-1209`).
-/// flpdf's `FormFieldObjectHelper::new` instead requires a real
-/// [`flpdf::ObjectRef`] identity, so a direct field object (never produced by
-/// a well-formed `/Fields`/`/Kids` array, which the PDF spec requires to hold
-/// indirect references) has no faithful path here.
+/// case51 uses `FormFieldObjectHelper::from_object_handle`; case52 remains on
+/// the older ObjectRef-only path and owns this temporary diagnostic text.
 const FIELD_MUST_BE_INDIRECT: &str = "form field object must be indirect";
 
 /// test_driver.cc:1939-1953 (`test_50`). Dictionary merge test crafted to
@@ -118,126 +116,58 @@ pub(crate) fn run_test_51<R: Read + Seek>(
     stderr: &mut dyn Write,
     diagnostics_written: &mut usize,
 ) -> flpdf::Result<()> {
-    let root_handle = pdf.trailer_key_handle(b"Root");
-    let (root, _) = resolve_and_drain(
-        pdf,
-        &root_handle,
-        filename,
-        stdout,
-        stderr,
-        diagnostics_written,
-    )?;
+    // qpdf's getRoot/getKey/getArrayNItems/getArrayItem/getUTF8Value calls
+    // resolve their receivers at each accessor boundary
+    // (`qpdf/test_driver.cc:1955-1997`). Keep that order and flush the shared
+    // diagnostic collection before any subsequent observable output.
+    let root = pdf.root_handle()?;
+    emit_new_diagnostics(pdf, diagnostics_written, filename, stdout, stderr)?;
+    let acroform = root.try_get_key(b"/AcroForm")?;
+    emit_new_diagnostics(pdf, diagnostics_written, filename, stdout, stderr)?;
+    let fields = acroform.try_get_key(b"/Fields")?;
+    emit_new_diagnostics(pdf, diagnostics_written, filename, stdout, stderr)?;
+    let count = fields.try_get_array_n_items()?;
+    emit_new_diagnostics(pdf, diagnostics_written, filename, stdout, stderr)?;
 
-    let acroform_handle = root.get_key(b"/AcroForm");
-    let (acroform, _) = resolve_and_drain(
-        pdf,
-        &acroform_handle,
-        filename,
-        stdout,
-        stderr,
-        diagnostics_written,
-    )?;
-
-    let fields_handle = acroform.get_key(b"/Fields");
-    let (fields, _) = resolve_and_drain(
-        pdf,
-        &fields_handle,
-        filename,
-        stdout,
-        stderr,
-        diagnostics_written,
-    )?;
-
-    // qpdf's `getArrayNItems`/`getArrayItem` on a non-array both warn and
-    // behave as an empty array; `as_array().unwrap_or_default()` matches
-    // that fallback.
-    for item in fields.as_array().unwrap_or_default() {
-        let (field, field_ref) =
-            resolve_and_drain(pdf, &item, filename, stdout, stderr, diagnostics_written)?;
-
-        let t_handle = field.get_key(b"/T");
-        let (t, _) = resolve_and_drain(
-            pdf,
-            &t_handle,
-            filename,
-            stdout,
-            stderr,
-            diagnostics_written,
-        )?;
-        let Some(raw) = t.as_string() else {
+    for index in 0..count {
+        let field = fields.try_get_array_item(index as i64)?;
+        emit_new_diagnostics(pdf, diagnostics_written, filename, stdout, stderr)?;
+        let t = field.try_get_key(b"/T")?;
+        emit_new_diagnostics(pdf, diagnostics_written, filename, stdout, stderr)?;
+        if !t.try_is_string()? {
+            emit_new_diagnostics(pdf, diagnostics_written, filename, stdout, stderr)?;
             continue;
-        };
-        let utf8 = flpdf::pdf_string::utf8_value(&raw);
+        }
+        emit_new_diagnostics(pdf, diagnostics_written, filename, stdout, stderr)?;
+        let utf8 = t.try_get_utf8_value()?;
+        emit_new_diagnostics(pdf, diagnostics_written, filename, stdout, stderr)?;
 
         if utf8 == b"r1" {
             writeln!(stdout, "setting r1 via parent")?;
-            let field_ref =
-                field_ref.ok_or_else(|| Error::System(FIELD_MUST_BE_INDIRECT.to_string()))?;
-            {
-                let mut foh = FormFieldObjectHelper::new(field_ref, pdf);
-                foh.set_value(ObjectHandle::name(b"2".to_vec()), true)?;
-            }
+            let mut foh = FormFieldObjectHelper::from_object_handle(field.clone(), pdf);
+            foh.set_value(ObjectHandle::name(b"2".to_vec()), true)?;
             emit_new_diagnostics(pdf, diagnostics_written, filename, stdout, stderr)?;
         } else if utf8 == b"r2" {
             writeln!(stdout, "setting r2 via child")?;
-            let kids_handle = field.get_key(b"/Kids");
-            let (kids, _) = resolve_and_drain(
-                pdf,
-                &kids_handle,
-                filename,
-                stdout,
-                stderr,
-                diagnostics_written,
-            )?;
-            // qpdf's `getArrayItem(1)` on a too-short array warns and
-            // returns null rather than crashing; a null "field" then makes
-            // `QPDFFormFieldObjectHelper::setV`'s underlying `replaceKey`
-            // a silent no-op. flpdf's `FormFieldObjectHelper::new` requires
-            // a real `ObjectRef`, so that specific out-of-range case has no
-            // faithful path here and instead surfaces as an internal error
-            // below -- the fixtures this test is written against always
-            // provide a real second `/Kids` entry.
-            let kid_handle = kids
-                .as_array()
-                .unwrap_or_default()
-                .into_iter()
-                .nth(1)
-                .unwrap_or_else(ObjectHandle::null);
-            let (_kid, kid_ref) = resolve_and_drain(
-                pdf,
-                &kid_handle,
-                filename,
-                stdout,
-                stderr,
-                diagnostics_written,
-            )?;
-            let kid_ref =
-                kid_ref.ok_or_else(|| Error::System(FIELD_MUST_BE_INDIRECT.to_string()))?;
-            {
-                let mut foh = FormFieldObjectHelper::new(kid_ref, pdf);
-                foh.set_value(ObjectHandle::name(b"3".to_vec()), true)?;
-            }
+            let kids = field.try_get_key(b"/Kids")?;
+            emit_new_diagnostics(pdf, diagnostics_written, filename, stdout, stderr)?;
+            let kid = kids.try_get_array_item(1)?;
+            emit_new_diagnostics(pdf, diagnostics_written, filename, stdout, stderr)?;
+            let mut foh = FormFieldObjectHelper::from_object_handle(kid, pdf);
+            foh.set_value(ObjectHandle::name(b"3".to_vec()), true)?;
             emit_new_diagnostics(pdf, diagnostics_written, filename, stdout, stderr)?;
         } else if utf8 == b"checkbox1" {
             writeln!(stdout, "turning checkbox1 on")?;
-            let field_ref =
-                field_ref.ok_or_else(|| Error::System(FIELD_MUST_BE_INDIRECT.to_string()))?;
-            {
-                let mut foh = FormFieldObjectHelper::new(field_ref, pdf);
-                // The value that eventually gets set is based on what's
-                // allowed in /N and may not match this value (matches qpdf's
-                // own comment: `setV` maps any non-`/Off` name to "checked").
-                foh.set_value(ObjectHandle::name(b"Sure".to_vec()), true)?;
-            }
+            // The value that eventually gets set is based on what's allowed
+            // in /N and may not match this value (matches qpdf's own comment:
+            // setV maps any non-/Off name to "checked").
+            let mut foh = FormFieldObjectHelper::from_object_handle(field, pdf);
+            foh.set_value(ObjectHandle::name(b"Sure".to_vec()), true)?;
             emit_new_diagnostics(pdf, diagnostics_written, filename, stdout, stderr)?;
         } else if utf8 == b"checkbox2" {
             writeln!(stdout, "turning checkbox2 off")?;
-            let field_ref =
-                field_ref.ok_or_else(|| Error::System(FIELD_MUST_BE_INDIRECT.to_string()))?;
-            {
-                let mut foh = FormFieldObjectHelper::new(field_ref, pdf);
-                foh.set_value(ObjectHandle::name(b"Off".to_vec()), true)?;
-            }
+            let mut foh = FormFieldObjectHelper::from_object_handle(field, pdf);
+            foh.set_value(ObjectHandle::name(b"Off".to_vec()), true)?;
             emit_new_diagnostics(pdf, diagnostics_written, filename, stdout, stderr)?;
         }
     }
@@ -590,6 +520,40 @@ mod tests {
         pdf
     }
 
+    fn direct_checkbox_pdf() -> Pdf<std::io::Cursor<Vec<u8>>> {
+        let mut pdf = Pdf::open_mem_owned_with_options(
+            include_bytes!("../../../../tests/fixtures/minimal.pdf").to_vec(),
+            PdfOpenOptions {
+                description: b"button-set-direct.pdf".to_vec(),
+                suppress_warnings: true,
+                ..PdfOpenOptions::default()
+            },
+        )
+        .expect("open minimal PDF");
+        let checkbox = ObjectHandle::dictionary(vec![
+            (b"/FT".to_vec(), ObjectHandle::name(b"Btn".to_vec())),
+            (b"/T".to_vec(), ObjectHandle::string(b"checkbox1".to_vec())),
+            (
+                b"/AP".to_vec(),
+                ObjectHandle::dictionary(vec![(
+                    b"/N".to_vec(),
+                    ObjectHandle::dictionary(vec![
+                        (b"/Off".to_vec(), ObjectHandle::null()),
+                        (b"/On".to_vec(), ObjectHandle::null()),
+                    ]),
+                )]),
+            ),
+        ]);
+        let acroform = ObjectHandle::dictionary(vec![(
+            b"/Fields".to_vec(),
+            ObjectHandle::array(vec![checkbox]),
+        )]);
+        let root = pdf.root_handle().expect("root");
+        root.replace_key(b"/AcroForm", acroform)
+            .expect("install AcroForm");
+        pdf
+    }
+
     #[test]
     fn test_51_drains_each_broken_button_warning_after_its_operation() {
         let _lock = super::super::CURRENT_DIR_LOCK
@@ -624,6 +588,37 @@ mod tests {
         assert_eq!(warning.matches("unable to set the value").count(), 2);
         assert!(warning.contains("unable to set the value of this radio button"));
         assert!(warning.contains("unable to set the value of this checkbox"));
+        assert!(directory.path().join("a.pdf").is_file());
+    }
+
+    #[test]
+    fn test_51_accepts_a_direct_checkbox_field_handle() {
+        let _lock = super::super::CURRENT_DIR_LOCK
+            .get_or_init(|| std::sync::Mutex::new(()))
+            .lock()
+            .expect("acquire current-directory test lock");
+        let directory = tempfile::tempdir().expect("create test directory");
+        let previous = std::env::current_dir().expect("read current directory");
+        std::env::set_current_dir(directory.path()).expect("enter test directory");
+        let _restore = CurrentDirGuard(previous);
+
+        let mut pdf = direct_checkbox_pdf();
+        let mut stdout = Vec::new();
+        let mut stderr = Vec::new();
+        let mut diagnostics_written = 0;
+
+        run_test_51(
+            &mut pdf,
+            b"button-set-direct.pdf",
+            None,
+            &mut stdout,
+            &mut stderr,
+            &mut diagnostics_written,
+        )
+        .expect("qpdf accepts a direct field handle");
+
+        assert_eq!(stdout, b"turning checkbox1 on\n");
+        assert!(stderr.is_empty());
         assert!(directory.path().join("a.pdf").is_file());
     }
 
