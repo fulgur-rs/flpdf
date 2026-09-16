@@ -1283,7 +1283,6 @@ mod live_input_tests {
     use crate::tokenizer::{Token, TokenType};
     use crate::{Error, ObjectRef, QpdfExc, Result};
     use std::cell::{Cell, RefCell};
-    use std::collections::VecDeque;
     use std::rc::{Rc, Weak};
 
     struct CountingInput {
