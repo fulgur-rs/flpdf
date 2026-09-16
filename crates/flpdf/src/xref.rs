@@ -1,13 +1,8 @@
-//! The xref loader follows qpdf 11.9.0's
-//! `QPDF::read_xref`/`read_xrefStream`/`processXRefStream` ordering
-//! (`libqpdf/QPDF.cc:626-710,846-1148`): the xref stream is parsed as a live
-//! `ObjectHandle` graph, `/Type`/`/W`/`/Index`/`/Size` are inspected, and only
-//! then is the encoded payload passed to the handle-native filter pipeline.
-//! `Pdf::open` supplies the already-created `ResolverHandle` as the canonical
-//! owner, so active xref-stream, hybrid, `/Prev`, and reconstruction-candidate
-//! reads use qpdf's live `readObjectAtOffset`/`readStream` route. The
-//! short-lived `BootstrapHandleDocument` remains only for the owner-less
-//! standalone xref loader and its reconstruction-only bounded-read tests.
+//! Load, validate, and recover PDF cross-reference data. Xref streams are
+//! parsed as live `ObjectHandle` graphs before their encoded payloads enter the
+//! handle-native filter pipeline. [`crate::Pdf::open`] supplies the canonical resolver
+//! owner for xref streams, hybrid sections, `/Prev` chains, and reconstruction
+//! candidates; the standalone loader uses a short-lived bootstrap owner.
 //!
 //! qpdf correspondence: QPDF.cc xref loading and repair.
 //!

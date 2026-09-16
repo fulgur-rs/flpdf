@@ -1,5 +1,5 @@
-//! Repairs the page tree before optimization and returns qpdf's effective page
-//! order. The normal non-linearized writer does not call this path.
+//! Repair the page tree before optimization and return its effective page order.
+//! The normal non-linearized writer does not call this path.
 //!
 //! qpdf correspondence: QPDF_pages.cc page-tree preparation responsibilities.
 //!

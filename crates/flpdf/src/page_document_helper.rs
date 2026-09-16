@@ -1,4 +1,4 @@
-//! High-level page-document helper, mirroring qpdf's `QPDFPageDocumentHelper`.
+//! Provide live traversal and mutation for a document's page tree.
 //!
 //! qpdf correspondence: QPDFPageDocumentHelper.cc responsibilities split with page extraction.
 //!

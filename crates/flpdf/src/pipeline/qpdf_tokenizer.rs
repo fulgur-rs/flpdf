@@ -1,4 +1,4 @@
-//! QPDF tokenization pipeline adapter.
+//! Adapt PDF token filtering to a streaming pipeline.
 //!
 //! qpdf correspondence: Pl_QPDFTokenizer.cc buffered token-filter pipeline.
 //!

@@ -1,4 +1,4 @@
-//! File-key and per-object-key algorithm selection from `QPDF_encryption.cc`.
+//! Select file-key and per-object-key algorithms for PDF encryption.
 //!
 //! qpdf correspondence: `QPDF_encryption.cc` file/object-key ownership.
 //!

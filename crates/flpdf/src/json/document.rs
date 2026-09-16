@@ -1,6 +1,6 @@
-//! The document boundary intentionally stays separate from [`super::input`]:
-//! the reactor owns JSON state and object mutation, while this module owns the
-//! qpdf rootless bootstrap, source lifetime, and exception/error boundary.
+//! Keep the document boundary separate from [`super::input`]: the reactor owns
+//! JSON state and object mutation, while this module owns the rootless bootstrap,
+//! source lifetime, and exception/error boundary.
 //!
 //! qpdf correspondence: QPDF_json.cc document input boundary for `createFromJSON`, `updateFromJSON`, and `importJSON` (`libqpdf/QPDF_json.cc:54-63,795-832`).
 //!

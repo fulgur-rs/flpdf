@@ -1,4 +1,4 @@
-//! Build and write qpdf JSON output sections.
+//! Assemble and write selected PDF inspection JSON sections.
 //!
 //! qpdf correspondence: `QPDFJob.cc:1545-1640` (`doJSON` fixed section order) and `QPDFJob.cc:3094-3115` (`writeJSON` output/stream-prefix selection).
 //!

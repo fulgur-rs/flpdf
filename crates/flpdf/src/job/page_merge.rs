@@ -1,4 +1,4 @@
-//! Multi-document page merge (qpdf `--pages` parity).
+//! Merge selected pages from multiple PDF documents into one new document.
 //!
 //! qpdf correspondence: QPDFJob.cc page-selection merge pipeline split across page-operation modules.
 //!

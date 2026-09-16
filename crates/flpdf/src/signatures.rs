@@ -1,4 +1,4 @@
-//! Signature inspection and qpdf-owned signature mutations.
+//! Inspect signature fields and manage signature-related AcroForm flags.
 //!
 //! qpdf correspondence: no qpdf counterpart for signature inspection; qpdf-owned mutation lives in Pdf and AcroFormDocumentHelper.
 //!

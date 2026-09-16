@@ -1,5 +1,4 @@
-//! The pre-1.0 flat, configurable-depth outline API was removed in favor of
-//! qpdf-compatible [`OutlineTree`] materialization.
+//! Materialize outline items as a live [`OutlineTree`] with bounded traversal.
 //!
 //! qpdf correspondence: QPDFOutlineObjectHelper.cc getTitle/getCount/getDest/getDestPage, split from the document helper's QPDFOutlineDocumentHelper.cc responsibilities.
 //!

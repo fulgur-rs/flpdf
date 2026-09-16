@@ -1,4 +1,4 @@
-//! Private qpdf-shaped writer settings.
+//! Store private writer settings used to select PDF output behavior.
 //!
 //! qpdf correspondence: QPDFWriter.cc writer-setting state and conversion to emission options.
 //!

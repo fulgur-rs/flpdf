@@ -1,8 +1,4 @@
-//! This module keeps form-field lookup and mutation on qpdf-shaped live
-//! [`ObjectHandle`] values. In particular, a field helper never snapshots a
-//! dictionary and writes a reconstructed value back through a legacy reader
-//! cache: qpdf's helper owns the selected handle and mutates the
-//! object graph that every other handle in the document observes.
+//! Provide live lookup and mutation for AcroForm field dictionaries.
 //!
 //! qpdf correspondence: `QPDFFormFieldObjectHelper.cc`.
 //!

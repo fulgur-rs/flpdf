@@ -1,4 +1,4 @@
-//! JSON parsing, callbacks, and serialization for qpdf-compatible values.
+//! Parse, validate, and serialize PDF inspection JSON values.
 //!
 //! qpdf correspondence: JSON.cc and JSONHandler.cc pipeline-native value, parse, callback, and serialization responsibilities.
 //!

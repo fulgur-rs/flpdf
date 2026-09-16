@@ -1,4 +1,4 @@
-//! Catalog-first object renumbering for plain rewrite, matching qpdf's order.
+//! Assign deterministic Catalog-first object numbers during PDF rewrites.
 //!
 //! qpdf correspondence: QPDFWriter.cc object renumbering shared by plain and linearized writers.
 //!

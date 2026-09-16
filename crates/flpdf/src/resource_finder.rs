@@ -1,7 +1,6 @@
-//! Records the last name before resource-consuming content operators. This is
-//! intentionally a direct `ObjectHandleParserCallbacks` consumer, rather than
-//! an operation accumulator, to preserve qpdf's parser event semantics
-//! (`libqpdf/ResourceFinder.cc:3-56`).
+//! Record the last resource name before resource-consuming content operators.
+//! This is a direct `ObjectHandleParserCallbacks` consumer rather than an
+//! operation accumulator, so it can associate names with their use positions.
 //!
 //! qpdf correspondence: `ResourceFinder.cc`.
 //!

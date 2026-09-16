@@ -1,8 +1,6 @@
-//! This module owns the part of qpdf's page operation that sits above the
-//! page-document helpers: it resolves each page specification against its
-//! source document, applies qpdf's spec-level collate order, and delegates
-//! object copying to the canonical multi-document merge primitive. The source
-//! documents stay alive for the whole operation, matching qpdf's page heap.
+//! Resolve page specifications against source documents and plan their output
+//! order. The source documents stay alive for the whole operation while the
+//! canonical multi-document merge primitive performs object copying.
 //!
 //! qpdf correspondence: `QPDFJob::handlePageSpecs` page-selection boundary.
 //!

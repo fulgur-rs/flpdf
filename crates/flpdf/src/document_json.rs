@@ -1,4 +1,4 @@
-//! Write a document's `qpdf` JSON v2 key.
+//! Write the document-level PDF JSON object map and stream side files.
 //!
 //! qpdf correspondence: QPDF_json.cc output side — the free function `writeJSONStreamFile` and both `QPDF::writeJSON` overloads. The input-side `JSONReactor`, `createFromJSON`, `updateFromJSON`, and `importJSON` boundary lives in the private JSON document module (the output and input paths remain separate qpdf responsibilities).
 //!

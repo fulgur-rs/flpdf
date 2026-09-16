@@ -1,8 +1,8 @@
-//! This is the only crate-level encryption route. The child modules group the
-//! qpdf-owned state, Standard handler, key derivation, crypt-filter
-//! interpretation, password normalization, permission projection, and crypto
-//! primitives under one source-equivalent tree. Writer emission lifecycle and
-//! Pipeline stages remain in their corresponding QPDFWriter/Pl_* modules.
+//! This is the crate-level encryption route. The child modules group the
+//! Standard security handler, key derivation, crypt-filter interpretation,
+//! password normalization, permission projection, and cryptographic primitives
+//! under one source tree. Writer emission and pipeline stages remain in the
+//! writer and pipeline modules.
 //!
 //! qpdf correspondence: `QPDF_encryption.cc` encryption facade and domain configuration.
 //!

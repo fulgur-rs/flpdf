@@ -1,9 +1,6 @@
-//! PCLm does not use the ordinary Catalog-first queue. qpdf reserves output
-//! numbers as it enqueues page objects, their contents, image strips, and the
-//! synthetic image-transform streams, then the Catalog. References discovered
-//! while serializing those initial objects are appended to the live queue. The
-//! direct/indirect root split follows `QPDFWriter.cc:328-333,1160-1236,
-//! 2068-2076,2928-2954` and the `qpdf/qtest/pclm.test` test-driver contract.
+//! Plan object numbering for PCLm output. Page objects, content streams, image
+//! strips, and image-transform streams are queued before the Catalog, while
+//! references discovered during serialization are appended to the live queue.
 //!
 //! qpdf correspondence: `QPDFWriter::enqueueObjectsPCLm`.
 //!
