@@ -408,11 +408,15 @@ fn preserved_objstm_extends<R: Read + Seek>(
     let Some(extends) = extends_handle.object_ref() else {
         return Ok(None);
     };
-    renumber.new_for_original(extends).map(Some).ok_or_else(|| {
-        crate::Error::Unsupported(format!(
-            "linearization writer: ObjStm /Extends target {extends} has no renumber entry"
-        ))
-    })
+    // qpdf reads the renumbered id with `m->obj_renumber[old_og]`
+    // (`QPDFWriter.cc:1750-1755`), and `std::map::operator[]` default-constructs
+    // a 0 for a target that was never enqueued, so a dangling `/Extends` is
+    // written as `0 0 R` rather than failing the write.
+    Ok(Some(
+        renumber
+            .new_for_original(extends)
+            .unwrap_or_else(|| ObjectRef::new(0, 0)),
+    ))
 }
 
 /// Build the ObjStm container stream object for one scheduled container from
@@ -5344,7 +5348,7 @@ mod tests {
     }
 
     #[test]
-    fn preserved_objstm_extends_rejects_an_unmapped_indirect_target() {
+    fn preserved_objstm_extends_maps_an_unmapped_indirect_target_to_object_zero() {
         let mut pdf = Pdf::empty().expect("empty PDF for source inspection");
         let source = ObjectRef::new(1, 0);
         let extends_target = pdf.get_object_handle(ObjectRef::new(9, 0));
@@ -5364,11 +5368,13 @@ mod tests {
         };
         let renumber = RenumberMap::from_plan(&LinearizationPlan::default());
 
-        let error = preserved_objstm_extends(&container, &renumber, &mut pdf)
-            .expect_err("an unmapped /Extends target is a planner inconsistency");
-        assert!(error
-            .to_string()
-            .contains("ObjStm /Extends target 9 0 R has no renumber entry"));
+        // qpdf reads `m->obj_renumber[old_og]` for the child id
+        // (`QPDFWriter.cc:1750-1755`); `std::map::operator[]` inserts a 0 for a
+        // target that was never enqueued, so `qpdf --linearize` on such a file
+        // writes `/Extends 0 0 R` and still exits 0.
+        let extends = preserved_objstm_extends(&container, &renumber, &mut pdf)
+            .expect("an unmapped /Extends target follows qpdf's zero default");
+        assert_eq!(extends, Some(ObjectRef::new(0, 0)));
     }
 
     #[test]
