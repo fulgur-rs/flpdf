@@ -4217,7 +4217,20 @@ fn run_job_json_files(
             }) as Box<dyn std::error::Error>
         })?;
     }
-    if let Some(password) = password.password_bytes() {
+    // qpdf's Config::password and Config::passwordFile both assign the same
+    // job-level password, with the later argv setter winning
+    // (`QPDFJob_config.cc:450-453,661-679`). The ordinary PDF routes resolve
+    // password-file here through `pdf_open_options`; this job-json consumer
+    // owns its QPDFJob directly, so resolve the already-selected file winner
+    // before handing the bytes to the job.
+    let password_bytes = if let Some(password_bytes) = password.password_bytes() {
+        Some(password_bytes)
+    } else if let Some(path) = password.password_file.as_deref() {
+        Some(read_password_file(path)?)
+    } else {
+        None
+    };
+    if let Some(password) = password_bytes {
         job.set_password(password);
     }
     // The library JSON entry point uses qpdfjob's C-helper prefix while the
