@@ -869,6 +869,102 @@ fn job_json_file_directory_keeps_the_portable_flpdf_diagnostic() {
     );
 }
 
+#[cfg(target_os = "linux")]
+fn run_job_json_with_single_fifo_read(
+    program: &std::path::Path,
+    fixture: &std::path::Path,
+) -> (std::process::Output, bool) {
+    use std::process::Stdio;
+    use std::thread::sleep;
+    use std::time::{Duration, Instant};
+
+    let directory = tempfile::tempdir().unwrap();
+    fs::copy(fixture, directory.path().join("input.pdf")).unwrap();
+    fs::write(
+        directory.path().join("job.json"),
+        br#"{"inputFile":"input.pdf","passwordFile":"password.fifo","outputFile":"output.pdf","staticId":"","decrypt":""}"#,
+    )
+    .unwrap();
+    let fifo = directory.path().join("password.fifo");
+    assert!(ProcessCommand::new("mkfifo")
+        .arg(&fifo)
+        .status()
+        .unwrap()
+        .success());
+
+    let mut writer = ProcessCommand::new("sh")
+        .args([
+            "-c",
+            "printf 'user-v4-aes\\n' > \"$1\"",
+            "password-fifo-writer",
+        ])
+        .arg(fifo.to_str().unwrap())
+        .spawn()
+        .unwrap();
+    let mut child = ProcessCommand::new(program)
+        .current_dir(directory.path())
+        .arg("--job-json-file=job.json")
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .unwrap();
+
+    let deadline = Instant::now() + Duration::from_secs(5);
+    let timed_out = loop {
+        if child.try_wait().unwrap().is_some() {
+            break false;
+        }
+        if Instant::now() >= deadline {
+            child.kill().unwrap();
+            break true;
+        }
+        sleep(Duration::from_millis(10));
+    };
+    let output = child.wait_with_output().unwrap();
+
+    let writer_deadline = Instant::now() + Duration::from_secs(2);
+    let writer_completed = loop {
+        if let Some(status) = writer.try_wait().unwrap() {
+            break status.success();
+        }
+        if Instant::now() >= writer_deadline {
+            let _ = writer.kill();
+            let _ = writer.wait();
+            break false;
+        }
+        sleep(Duration::from_millis(10));
+    };
+    assert!(
+        writer_completed,
+        "the FIFO writer must complete one password read"
+    );
+    (output, timed_out)
+}
+
+#[cfg(target_os = "linux")]
+#[test]
+fn job_json_password_file_is_read_once_like_qpdf() {
+    if !qpdf_available() {
+        return;
+    }
+
+    let fixture = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+        .join("../../tests/fixtures/encrypted/v4-aes-128-r4.pdf");
+    let (qpdf, qpdf_timed_out) =
+        run_job_json_with_single_fifo_read(std::path::Path::new("/usr/bin/qpdf"), &fixture);
+    assert!(!qpdf_timed_out, "qpdf must not block on a second FIFO read");
+    assert_eq!(qpdf.status.code(), Some(0), "qpdf failed: {qpdf:?}");
+
+    let flpdf_program = PathBuf::from(assert_cmd::cargo::cargo_bin!("flpdf"));
+    let (flpdf, flpdf_timed_out) = run_job_json_with_single_fifo_read(&flpdf_program, &fixture);
+    assert!(
+        !flpdf_timed_out,
+        "flpdf must not block after consuming one password FIFO value; stderr={:?}",
+        flpdf.stderr
+    );
+    assert_eq!(flpdf.status.code(), Some(0), "flpdf failed: {flpdf:?}");
+}
+
 #[test]
 fn job_json_file_show_npages_matches_qpdf_without_output_file() {
     if !qpdf_available() {
@@ -3551,4 +3647,82 @@ fn assemble_pdf(objects: &[&[u8]]) -> Vec<u8> {
         .as_bytes(),
     );
     bytes
+}
+
+/// qpdf's JSON handlers for these two are bare setters -- `noWarn`
+/// (`auto_job_json_init.hh:287-289`) and `warningExit0` (`:469`) can only turn
+/// the flag on, never clear it. The CLI must therefore not push its own
+/// `false` default over a value the job JSON asked for.
+#[test]
+fn job_json_warning_exit_zero_survives_the_cli_default() {
+    if !qpdf_available() {
+        return;
+    }
+    let directory = tempfile::tempdir().unwrap();
+    let fixture = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+        .join("../../tests/fixtures/compat/chained-indirect-contents.pdf");
+    fs::copy(fixture, directory.path().join("input.pdf")).unwrap();
+    fs::write(
+        directory.path().join("job.json"),
+        br#"{"inputFile":"input.pdf","outputFile":"out.pdf","staticId":"","warningExit0":""}"#,
+    )
+    .unwrap();
+
+    let qpdf = ProcessCommand::new("/usr/bin/qpdf")
+        .current_dir(directory.path())
+        .arg("--job-json-file=job.json")
+        .output()
+        .unwrap();
+    let flpdf = Command::cargo_bin("flpdf")
+        .unwrap()
+        .current_dir(directory.path())
+        .env("FLPDF_PROGNAME", "qpdf")
+        .arg("--job-json-file=job.json")
+        .output()
+        .unwrap();
+
+    // The input warns, so without warningExit0 this would be exit 3.
+    assert!(
+        String::from_utf8_lossy(&qpdf.stderr).contains("WARNING"),
+        "fixture must still warn for this test to mean anything: {qpdf:?}"
+    );
+    assert_eq!(qpdf.status.code(), Some(0), "qpdf fixture: {qpdf:?}");
+    assert_eq!(flpdf.status.code(), Some(0));
+    assert_eq!(flpdf.stderr, qpdf.stderr);
+}
+
+#[test]
+fn job_json_no_warn_survives_the_cli_default() {
+    if !qpdf_available() {
+        return;
+    }
+    let directory = tempfile::tempdir().unwrap();
+    let fixture = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+        .join("../../tests/fixtures/compat/chained-indirect-contents.pdf");
+    fs::copy(fixture, directory.path().join("input.pdf")).unwrap();
+    fs::write(
+        directory.path().join("job.json"),
+        br#"{"inputFile":"input.pdf","outputFile":"out.pdf","staticId":"","noWarn":""}"#,
+    )
+    .unwrap();
+
+    let qpdf = ProcessCommand::new("/usr/bin/qpdf")
+        .current_dir(directory.path())
+        .arg("--job-json-file=job.json")
+        .output()
+        .unwrap();
+    let flpdf = Command::cargo_bin("flpdf")
+        .unwrap()
+        .current_dir(directory.path())
+        .env("FLPDF_PROGNAME", "qpdf")
+        .arg("--job-json-file=job.json")
+        .output()
+        .unwrap();
+
+    assert!(
+        !String::from_utf8_lossy(&qpdf.stderr).contains("WARNING"),
+        "qpdf must suppress the warnings for this test to mean anything: {qpdf:?}"
+    );
+    assert_eq!(flpdf.status.code(), qpdf.status.code());
+    assert_eq!(flpdf.stderr, qpdf.stderr);
 }

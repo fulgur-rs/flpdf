@@ -4357,8 +4357,7 @@ fn qpdf_cli_events(args: &[arg_parser::RawArg]) -> CliResult<Vec<JobJsonCliEvent
 }
 
 struct QpdfCliPreflight {
-    events: Vec<JobJsonCliEvent>,
-    job_json_contents: Vec<Vec<u8>>,
+    job: QPDFJob,
 }
 
 fn qpdf_optional_choice_error(
@@ -4379,14 +4378,14 @@ fn qpdf_optional_choice_error(
 }
 
 /// Replay the qpdf callbacks whose validation must happen before clap's
-/// post-parse route selection. Keeping job-JSON reads in this sequence also
-/// preserves the first failing callback when it is interleaved with another
-/// parse-time error. Successful JSON bytes are handed to the actual job so
-/// this preflight does not read or parse a file twice.
+/// post-parse route selection. The prepared job is handed to the execution
+/// route so JSON and every side file it references are read exactly once.
 fn preflight_qpdf_cli_events(args: &[arg_parser::RawArg]) -> CliResult<QpdfCliPreflight> {
     let events = qpdf_cli_events(args)?;
-    let mut validation_job = QPDFJob::new();
-    let mut job_json_contents = Vec::new();
+    let has_job_json = events
+        .iter()
+        .any(|event| matches!(event, JobJsonCliEvent::JobJsonFile(_)));
+    let mut job = QPDFJob::new();
 
     for event in &events {
         match event {
@@ -4395,40 +4394,39 @@ fn preflight_qpdf_cli_events(args: &[arg_parser::RawArg]) -> CliResult<QpdfCliPr
                     let error = qpdf_json_input_open_error(path, error);
                     job_json_event_error(Some(path), error.as_ref())
                 })?;
-                validation_job
-                    .initialize_from_json_partial_bytes(&json)
+                job.initialize_from_json_partial_bytes(&json)
                     .map_err(|error| job_json_event_error(Some(path), &error))?;
-                job_json_contents.push(json);
             }
             JobJsonCliEvent::EmptyInput => {
-                validation_job.config().empty_input()?;
+                job.config().empty_input()?;
             }
             JobJsonCliEvent::Input(path) => {
-                validation_job.set_input_file(path.clone())?;
+                job.set_input_file(path.clone())?;
             }
             JobJsonCliEvent::Output(path) => {
-                validation_job.set_output_file(path.clone())?;
+                job.set_output_file(path.clone())?;
             }
             JobJsonCliEvent::ReplaceInput => {
-                validation_job.config().replace_input()?;
+                job.config().replace_input()?;
             }
-            JobJsonCliEvent::Password(password) => validation_job.set_password(password.clone()),
+            JobJsonCliEvent::Password(password) => job.set_password(password.clone()),
+            JobJsonCliEvent::PasswordFile(path) if has_job_json => {
+                job.set_password(read_password_file(path)?);
+            }
             JobJsonCliEvent::PasswordFile(_) => {}
-            JobJsonCliEvent::PasswordMode(mode) => validation_job.set_password_mode(*mode),
-            JobJsonCliEvent::PasswordIsHexKey => validation_job.set_password_is_hex_key(true),
-            JobJsonCliEvent::SuppressPasswordRecovery => {
-                validation_job.set_suppress_password_recovery(true)
-            }
-            JobJsonCliEvent::SuppressRecovery => validation_job.set_suppress_recovery(true),
-            JobJsonCliEvent::IgnoreXrefStreams => validation_job.set_ignore_xref_streams(true),
+            JobJsonCliEvent::PasswordMode(mode) => job.set_password_mode(*mode),
+            JobJsonCliEvent::PasswordIsHexKey => job.set_password_is_hex_key(true),
+            JobJsonCliEvent::SuppressPasswordRecovery => job.set_suppress_password_recovery(true),
+            JobJsonCliEvent::SuppressRecovery => job.set_suppress_recovery(true),
+            JobJsonCliEvent::IgnoreXrefStreams => job.set_ignore_xref_streams(true),
             JobJsonCliEvent::CheckLinearization => {
-                validation_job.config().check_linearization();
+                job.config().check_linearization();
             }
             JobJsonCliEvent::Rotate(parameter) => {
-                validation_job.config().rotate(parameter)?;
+                job.config().rotate(parameter)?;
             }
             JobJsonCliEvent::Collate(parameter) => {
-                validation_job.config().collate(parameter)?;
+                job.config().collate(parameter)?;
             }
             JobJsonCliEvent::Json(value) => {
                 qpdf_optional_choice_error("json", value.as_deref(), &["1", "2", "latest"])?;
@@ -4439,10 +4437,7 @@ fn preflight_qpdf_cli_events(args: &[arg_parser::RawArg]) -> CliResult<QpdfCliPr
         }
     }
 
-    Ok(QpdfCliPreflight {
-        events,
-        job_json_contents,
-    })
+    Ok(QpdfCliPreflight { job })
 }
 
 fn job_json_event_error(
@@ -4465,58 +4460,19 @@ fn job_json_event_error(
 }
 
 fn run_job_json_files(preflight: QpdfCliPreflight, suppress_warnings: bool) -> CliResult<()> {
-    let mut job = QPDFJob::new();
-    job.set_warnings_exit_zero(cli_warning_exit_zero());
+    let QpdfCliPreflight { mut job } = preflight;
+    // The retained job has already parsed the JSON, and qpdf's JSON handlers
+    // for these two are bare setters -- `addBare([this]() { c_main->noWarn(); })`
+    // (`auto_job_json_init.hh:287-289`) and the `warningExit0` entry at `:469`
+    // -- so neither source can ever clear the flag. Setting the CLI value
+    // unconditionally would let its `false` default erase what the JSON asked
+    // for. Only turn the flag on, never off.
+    if cli_warning_exit_zero() {
+        job.set_warnings_exit_zero(true);
+    }
     job.set_logger(cli_logger());
-    job.set_suppress_warnings(suppress_warnings);
-
-    let QpdfCliPreflight {
-        events,
-        job_json_contents,
-    } = preflight;
-    let mut job_json_contents = job_json_contents.into_iter();
-    for event in events {
-        match event {
-            JobJsonCliEvent::JobJsonFile(path) => {
-                let json = job_json_contents
-                    .next()
-                    .expect("job-json preflight must cache every JSON file");
-                job.initialize_from_json_partial_bytes(&json)
-                    .map_err(|error| job_json_event_error(Some(&path), &error))?;
-            }
-            JobJsonCliEvent::EmptyInput => {
-                job.config().empty_input()?;
-            }
-            JobJsonCliEvent::Input(path) => {
-                job.set_input_file(path)?;
-            }
-            JobJsonCliEvent::Output(path) => {
-                job.set_output_file(path)?;
-            }
-            JobJsonCliEvent::ReplaceInput => {
-                job.config().replace_input()?;
-            }
-            JobJsonCliEvent::Password(password) => job.set_password(password),
-            JobJsonCliEvent::PasswordFile(path) => {
-                job.set_password(read_password_file(&path)?);
-            }
-            JobJsonCliEvent::PasswordMode(mode) => job.set_password_mode(mode),
-            JobJsonCliEvent::PasswordIsHexKey => job.set_password_is_hex_key(true),
-            JobJsonCliEvent::SuppressPasswordRecovery => job.set_suppress_password_recovery(true),
-            JobJsonCliEvent::SuppressRecovery => job.set_suppress_recovery(true),
-            JobJsonCliEvent::IgnoreXrefStreams => job.set_ignore_xref_streams(true),
-            JobJsonCliEvent::CheckLinearization => {
-                job.config().check_linearization();
-            }
-            JobJsonCliEvent::Rotate(_)
-            | JobJsonCliEvent::Json(_)
-            | JobJsonCliEvent::JsonOutput(_)
-            | JobJsonCliEvent::Collate(_) => {
-                // These options are validated in the shared argv preflight.
-                // Their job-JSON application remains the separate
-                // transformation/configuration surface tracked by flpdf-uwu7.
-            }
-        }
+    if suppress_warnings {
+        job.set_suppress_warnings(true);
     }
     // The library JSON entry point uses qpdfjob's C-helper prefix while the
     // CLI's QPDFJob caller uses the ordinary qpdf prefix. Set the CLI

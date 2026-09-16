@@ -1707,14 +1707,33 @@ optional `collate`、`json`、`json-output` がそれぞれ callbackまたはcho
 flpdf は既存の raw residual argv projectionを拡張し、これらの parse-time eventを
 `JobJsonFile`・selector stateと同じ順序で preflightする。optional JSON choicesは
 qpdfの choice errorを作り、rotate/collateは既存の `QPDFJob::Config` parserへ渡す。
-有効な job-JSON bytesはこのpreflight結果を実行側へ渡すため、qpdfと同様に一度だけ
-read/parseされる。これにより `--rotate=91 --json-output=1`、
+これにより `--rotate=91 --json-output=1`、
 `--job-json-file=<missing> --rotate=91`、JSON/collateとの順序逆転で、最初に
 失敗する qpdf callbackの診断境界を保持する。対象は argv parse validationであり、
 job-JSONの変換オプション適用は別issue `flpdf-uwu7`に残る。
 
 `cli_job_json.rs::top_level_parse_errors_follow_qpdf_argv_order` が8ケースの
 exit/stdout/stderrをqpdf 11.9.0と比較する。新しいargv parser、bridge、
+qpdf-deviation markerは追加しない。
+
+### job-json prepared job state (`flpdf-7wct0`, 2026-09-16)
+
+qpdf の CLI は 1 つの `QPDFJob` に `initializeFromArgv` と `run` を続けて
+呼び、`jobJsonFile` は同じ Configへ partial JSONを重ねる
+（`qpdf/qpdf.cc:27-44`; `include/qpdf/QPDFJob.hh:78-90`;
+`libqpdf/QPDFJob_config.cc:774-784`）。JSON `passwordFile` は通常の
+`Config::passwordFile` callbackとして、その jobの stateへ先頭行を保存する
+（`libqpdf/qpdf/auto_job_json_init.hh:29-31`; `libqpdf/QPDFJob_config.cc:661-680`）。
+
+flpdf の argv-order preflight は、JSON bytesだけを別の jobへ再生するのをやめ、
+preflightで構築した同じ `QPDFJob`を `run_job_json_files`へ moveする。CLIの
+`PasswordFile` eventも preflight中の occurrence位置で一度だけ適用するため、
+JSON内の passwordFile と FIFO/可変/一時 side fileを二重に読まない。既存の
+JSON byte cacheと実行側の再初期化は撤去し、logger/policyを準備済み jobへ設定後、
+qpdf同様に1回だけ `run`する。image transformation wiringは `flpdf-uwu7`の
+別責務に残す。`cli_job_json.rs::job_json_password_file_is_read_once_like_qpdf`
+は Linuxで1回だけ値を流す FIFOを qpdf 11.9.0 と flpdfへ渡し、両方が timeout
+なしで成功することを固定する。新しい parser、side-file cache、bridge、
 qpdf-deviation markerは追加しない。
 
 ### job-json directory read diagnostic (`flpdf-jhaqf`, 2026-09-16)
