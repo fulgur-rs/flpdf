@@ -86,6 +86,73 @@ fn job_json_file_runs_through_the_production_qpdf_job() {
 }
 
 #[test]
+fn job_json_file_password_and_password_file_follow_argv_order() {
+    if !qpdf_available() {
+        return;
+    }
+
+    let directory = tempfile::tempdir().unwrap();
+    fs::copy(
+        PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+            .join("../../tests/fixtures/encrypted/v4-aes-128-r4.pdf"),
+        directory.path().join("input.pdf"),
+    )
+    .unwrap();
+    let password_file = directory.path().join("password.txt");
+    fs::write(&password_file, b"user-v4-aes\n").unwrap();
+    let password_file_arg = format!("--password-file={}", password_file.display());
+
+    for (name, options, expected_status) in [
+        (
+            "file-wins",
+            vec!["--password=wrong".to_owned(), password_file_arg.clone()],
+            Some(0),
+        ),
+        (
+            "password-wins",
+            vec![password_file_arg.clone(), "--password=wrong".to_owned()],
+            Some(2),
+        ),
+    ] {
+        let qpdf_output = format!("qpdf-{name}.pdf");
+        let flpdf_output = format!("flpdf-{name}.pdf");
+        let qpdf_job = format!("qpdf-{name}.json");
+        let flpdf_job = format!("flpdf-{name}.json");
+        let job_json = |output: &str| {
+            format!(
+                r#"{{"inputFile":"input.pdf","outputFile":"{output}","staticId":"","decrypt":""}}"#
+            )
+        };
+        fs::write(directory.path().join(&qpdf_job), job_json(&qpdf_output)).unwrap();
+        fs::write(directory.path().join(&flpdf_job), job_json(&flpdf_output)).unwrap();
+
+        let qpdf = ProcessCommand::new("/usr/bin/qpdf")
+            .current_dir(directory.path())
+            .args(&options)
+            .arg(format!("--job-json-file={qpdf_job}"))
+            .output()
+            .unwrap();
+        let flpdf = Command::cargo_bin("flpdf")
+            .unwrap()
+            .current_dir(directory.path())
+            .env("FLPDF_PROGNAME", "qpdf")
+            .args(&options)
+            .arg(format!("--job-json-file={flpdf_job}"))
+            .output()
+            .unwrap();
+
+        assert_eq!(qpdf.status.code(), expected_status, "qpdf {name}: {qpdf:?}");
+        assert_eq!(
+            flpdf.status.code(),
+            qpdf.status.code(),
+            "flpdf {name}: {flpdf:?}"
+        );
+        assert_eq!(flpdf.stdout, qpdf.stdout, "stdout differs for {name}");
+        assert_eq!(flpdf.stderr, qpdf.stderr, "stderr differs for {name}");
+    }
+}
+
+#[test]
 fn job_json_file_preserves_input_encryption_when_compression_is_disabled() {
     if !qpdf_available() {
         return;
