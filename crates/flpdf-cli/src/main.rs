@@ -387,12 +387,9 @@ fn parse_image_uint(value: Option<&str>) -> CliResult<Option<u32>> {
     if value.is_empty() {
         return Ok(Some(0));
     }
-    let parsed = QPDFJob::parse_collate(value)?
-        .into_iter()
-        .next()
-        .unwrap_or(0);
-    // QPDFJob::parse_collate uses the same QUtil::string_to_uint conversion
-    // and rejects values above u32::MAX before returning the usize.
+    let parsed = parse_qpdf_unsigned_option(value.as_bytes())?;
+    // The shared qpdf unsigned conversion rejects values above u32::MAX before
+    // returning the usize used by the CLI image options.
     Ok(Some(parsed as u32))
 }
 
@@ -3208,8 +3205,7 @@ fn main() {
     // candidate is attempted.
     args.password.verbose = args.verbose;
     if let Err(error) = validate_keep_files_open_threshold(&args.page_ops) {
-        emit_logger_error(format!("flpdf: {error}\n"));
-        std::process::exit(2);
+        qpdf_usage_exit(error);
     }
     let top_level_version_options =
         match parse_cli_version_options(args.min_version.as_deref(), args.force_version.as_deref())
@@ -3223,10 +3219,7 @@ fn main() {
     let top_level_compression_level =
         match parse_compression_level(args.compression_level.as_deref()) {
             Ok(level) => level,
-            Err(error) => {
-                emit_logger_error(format!("flpdf: {error}\n"));
-                std::process::exit(2);
-            }
+            Err(error) => qpdf_usage_exit(error),
         };
     let top_level_image_options = match image_optimization_options(
         args.keep_inline_images,
@@ -3236,10 +3229,7 @@ fn main() {
         args.ii_min_bytes.as_deref(),
     ) {
         Ok(options) => options,
-        Err(error) => {
-            emit_logger_error(format!("flpdf: {error}\n"));
-            std::process::exit(2);
-        }
+        Err(error) => qpdf_usage_exit(error),
     };
     let top_level_image_transform_options = ImageTransformOptions::new(
         args.externalize_inline_images,
@@ -3863,6 +3853,17 @@ fn exit_qpdf_parse_error(error: Box<dyn std::error::Error>) -> ! {
     std::process::exit(2);
 }
 
+/// Route a qpdf-compatible CLI parameter failure through the usage renderer.
+/// The ordinary post-parse path reaches here only for values whose qpdf
+/// callback conversion was deferred until after raw argv preflight.
+fn qpdf_usage_exit(error: Box<dyn std::error::Error>) -> ! {
+    if let Some(usage_error) = find_usage_error(error.as_ref()) {
+        usage_exit(usage_error);
+    }
+    let usage_error = UsageError::new(error.to_string());
+    usage_exit(&usage_error);
+}
+
 fn missing_input_usage_error() -> UsageError {
     UsageError::new("an input file name is required")
 }
@@ -4250,6 +4251,14 @@ enum JobJsonCliEvent {
     Json(Option<Vec<u8>>),
     JsonOutput(Option<Vec<u8>>),
     Collate(Vec<u8>),
+    CompressionLevel(Vec<u8>),
+    IiMinBytes(Vec<u8>),
+    KeepFilesOpenThreshold(Vec<u8>),
+    OiMinArea(Vec<u8>),
+    OiMinHeight(Vec<u8>),
+    OiMinWidth(Vec<u8>),
+    SplitPages(Vec<u8>),
+    ShowObject(Vec<u8>),
 }
 
 fn raw_option_equals_value<'a>(argument: &'a [u8], name: &[u8]) -> Option<&'a [u8]> {
@@ -4301,6 +4310,24 @@ fn qpdf_cli_events(args: &[arg_parser::RawArg]) -> CliResult<Vec<JobJsonCliEvent
             events.push(JobJsonCliEvent::JobJsonFile(PathBuf::from(
                 arg_parser::os_string_from_bytes(value),
             )));
+        } else if let Some(value) = raw_option_equals_value(bytes, b"compression-level") {
+            events.push(JobJsonCliEvent::CompressionLevel(value.to_vec()));
+        } else if let Some(value) = raw_option_equals_value(bytes, b"ii-min-bytes") {
+            events.push(JobJsonCliEvent::IiMinBytes(value.to_vec()));
+        } else if let Some(value) = raw_option_equals_value(bytes, b"keep-files-open-threshold") {
+            events.push(JobJsonCliEvent::KeepFilesOpenThreshold(value.to_vec()));
+        } else if let Some(value) = raw_option_equals_value(bytes, b"oi-min-area") {
+            events.push(JobJsonCliEvent::OiMinArea(value.to_vec()));
+        } else if let Some(value) = raw_option_equals_value(bytes, b"oi-min-height") {
+            events.push(JobJsonCliEvent::OiMinHeight(value.to_vec()));
+        } else if let Some(value) = raw_option_equals_value(bytes, b"oi-min-width") {
+            events.push(JobJsonCliEvent::OiMinWidth(value.to_vec()));
+        } else if let Some(value) = raw_option_equals_value(bytes, b"show-object") {
+            events.push(JobJsonCliEvent::ShowObject(value.to_vec()));
+        } else if let Some(value) = raw_option_equals_value(bytes, b"split-pages") {
+            events.push(JobJsonCliEvent::SplitPages(value.to_vec()));
+        } else if bytes == b"--split-pages" {
+            events.push(JobJsonCliEvent::SplitPages(Vec::new()));
         } else if bytes == b"--json" {
             events.push(JobJsonCliEvent::Json(None));
         } else if let Some(value) = raw_option_equals_value(bytes, b"json") {
@@ -4377,6 +4404,28 @@ fn qpdf_optional_choice_error(
     ))))
 }
 
+/// Convert an error from a qpdf argv callback into the usage-error class used
+/// by `QPDFArgParser::usage` (`libqpdf/QPDFArgParser.cc:337-344`). The core
+/// library keeps numeric conversion failures as `Error::System`; at this CLI
+/// boundary qpdf catches the corresponding C++ runtime error and rethrows it
+/// as `QPDFUsage` (`libqpdf/QPDFJob_argv.cc:408-415`).
+fn qpdf_argv_usage_error(error: Box<dyn std::error::Error>) -> Box<dyn std::error::Error> {
+    if let Some(usage_error) = find_usage_error(error.as_ref()) {
+        return Box::new(UsageError::new(usage_error.what_bytes()));
+    }
+    Box::new(UsageError::new(error.to_string()))
+}
+
+/// Parse one qpdf unsigned option value through the shared direct conversion
+/// used by `QPDFJob::Config::keepFilesOpenThreshold` and image thresholds.
+/// This intentionally does not use the comma-separated collate parser: qpdf's
+/// `QUtil::string_to_uint` stops at the first non-digit byte.
+fn parse_qpdf_unsigned_option(value: &[u8]) -> CliResult<usize> {
+    let value = String::from_utf8_lossy(value);
+    QPDFJob::parse_keep_files_open_threshold(&value)
+        .map_err(|error| qpdf_argv_usage_error(Box::new(error)))
+}
+
 /// Replay the qpdf callbacks whose validation must happen before clap's
 /// post-parse route selection. The prepared job is handed to the execution
 /// route so JSON and every side file it references are read exactly once.
@@ -4433,6 +4482,35 @@ fn preflight_qpdf_cli_events(args: &[arg_parser::RawArg]) -> CliResult<QpdfCliPr
             }
             JobJsonCliEvent::JsonOutput(value) => {
                 qpdf_optional_choice_error("json-output", value.as_deref(), &["2", "latest"])?;
+            }
+            JobJsonCliEvent::CompressionLevel(value) => {
+                let value = String::from_utf8_lossy(value);
+                parse_compression_level(Some(value.as_ref()))
+                    .map(|_| ())
+                    .map_err(qpdf_argv_usage_error)?;
+            }
+            JobJsonCliEvent::IiMinBytes(value)
+            | JobJsonCliEvent::OiMinArea(value)
+            | JobJsonCliEvent::OiMinHeight(value)
+            | JobJsonCliEvent::OiMinWidth(value) => {
+                parse_qpdf_unsigned_option(value)?;
+            }
+            JobJsonCliEvent::KeepFilesOpenThreshold(value) => {
+                let threshold = parse_qpdf_unsigned_option(value)?;
+                job.set_keep_files_open_threshold(threshold);
+            }
+            JobJsonCliEvent::SplitPages(value) => {
+                let value_text = String::from_utf8_lossy(value);
+                qpdf_selector_integer(value_text.as_ref()).map_err(qpdf_argv_usage_error)?;
+                job.config()
+                    .split_pages(value)
+                    .map_err(|error| qpdf_argv_usage_error(Box::new(error)))?;
+            }
+            JobJsonCliEvent::ShowObject(value) => {
+                let value = String::from_utf8_lossy(value);
+                job.config()
+                    .show_object(value.as_ref())
+                    .map_err(|error| qpdf_argv_usage_error(Box::new(error)))?;
             }
         }
     }
@@ -10968,6 +11046,38 @@ mod tests {
             vec![
                 JobJsonCliEvent::EmptyInput,
                 JobJsonCliEvent::ReplaceInput,
+                JobJsonCliEvent::JobJsonFile(PathBuf::from("job.json")),
+            ]
+        );
+    }
+
+    #[test]
+    fn job_json_cli_events_include_immediate_main_option_callbacks() {
+        let preprocessed = preprocess_qpdf_args(strs(&[
+            "flpdf",
+            "--compression-level=1",
+            "--ii-min-bytes=2",
+            "--keep-files-open-threshold=3",
+            "--oi-min-area=4",
+            "--oi-min-height=5",
+            "--oi-min-width=6",
+            "--show-object=7",
+            "--split-pages",
+            "--job-json-file=job.json",
+        ]))
+        .expect("qpdf preprocessing should retain callback-valued options");
+
+        assert_eq!(
+            qpdf_cli_events(&preprocessed.raw_residual_args).unwrap(),
+            vec![
+                JobJsonCliEvent::CompressionLevel(b"1".to_vec()),
+                JobJsonCliEvent::IiMinBytes(b"2".to_vec()),
+                JobJsonCliEvent::KeepFilesOpenThreshold(b"3".to_vec()),
+                JobJsonCliEvent::OiMinArea(b"4".to_vec()),
+                JobJsonCliEvent::OiMinHeight(b"5".to_vec()),
+                JobJsonCliEvent::OiMinWidth(b"6".to_vec()),
+                JobJsonCliEvent::ShowObject(b"7".to_vec()),
+                JobJsonCliEvent::SplitPages(Vec::new()),
                 JobJsonCliEvent::JobJsonFile(PathBuf::from("job.json")),
             ]
         );

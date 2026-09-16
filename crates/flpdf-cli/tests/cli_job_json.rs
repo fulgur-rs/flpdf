@@ -589,6 +589,62 @@ fn top_level_parse_errors_follow_qpdf_argv_order() {
             ],
         ),
         (
+            "compression-level-before-job-json",
+            vec![
+                "--compression-level=999999999999999999999".to_owned(),
+                missing_job_argument.clone(),
+                "input.pdf".to_owned(),
+            ],
+        ),
+        (
+            "ii-min-bytes-before-job-json",
+            vec![
+                "--ii-min-bytes=999999999999999999999".to_owned(),
+                missing_job_argument.clone(),
+                "input.pdf".to_owned(),
+            ],
+        ),
+        (
+            "oi-min-area-before-job-json",
+            vec![
+                "--oi-min-area=999999999999999999999".to_owned(),
+                missing_job_argument.clone(),
+                "input.pdf".to_owned(),
+            ],
+        ),
+        (
+            "oi-min-height-before-job-json",
+            vec![
+                "--oi-min-height=999999999999999999999".to_owned(),
+                missing_job_argument.clone(),
+                "input.pdf".to_owned(),
+            ],
+        ),
+        (
+            "oi-min-width-before-job-json",
+            vec![
+                "--oi-min-width=999999999999999999999".to_owned(),
+                missing_job_argument.clone(),
+                "input.pdf".to_owned(),
+            ],
+        ),
+        (
+            "split-pages-before-job-json",
+            vec![
+                "--split-pages=999999999999999999999".to_owned(),
+                missing_job_argument.clone(),
+                "input.pdf".to_owned(),
+            ],
+        ),
+        (
+            "show-object-before-job-json",
+            vec![
+                "--show-object=2147483648".to_owned(),
+                missing_job_argument.clone(),
+                "input.pdf".to_owned(),
+            ],
+        ),
+        (
             "job-json-before-rotate",
             vec![
                 missing_job_argument.clone(),
@@ -628,6 +684,103 @@ fn top_level_parse_errors_follow_qpdf_argv_order() {
         assert_eq!(flpdf.stdout, qpdf.stdout, "stdout differs for {name}");
         assert_eq!(flpdf.stderr, qpdf.stderr, "stderr differs for {name}");
     }
+}
+
+#[test]
+fn top_level_image_thresholds_keep_qpdf_unsigned_prefix_semantics() {
+    if !qpdf_available() {
+        return;
+    }
+
+    let directory = tempfile::tempdir().unwrap();
+    fs::copy(
+        PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../tests/fixtures/minimal.pdf"),
+        directory.path().join("input.pdf"),
+    )
+    .unwrap();
+
+    for option in ["--oi-min-width=1,", "--oi-min-height=,1"] {
+        let args = [option, "--check", "input.pdf"];
+        let qpdf = ProcessCommand::new("/usr/bin/qpdf")
+            .current_dir(directory.path())
+            .args(args)
+            .output()
+            .unwrap();
+        let flpdf = Command::cargo_bin("flpdf")
+            .unwrap()
+            .current_dir(directory.path())
+            .env("FLPDF_PROGNAME", "qpdf")
+            .args(args)
+            .output()
+            .unwrap();
+
+        assert_eq!(
+            flpdf.status.code(),
+            qpdf.status.code(),
+            "status differs for {option}: qpdf={qpdf:?}, flpdf={flpdf:?}"
+        );
+        assert_eq!(flpdf.stdout, qpdf.stdout, "stdout differs for {option}");
+        assert_eq!(flpdf.stderr, qpdf.stderr, "stderr differs for {option}");
+    }
+}
+
+#[test]
+fn job_json_cli_parameter_events_reuse_the_prepared_job_state() {
+    if !qpdf_available() {
+        return;
+    }
+
+    let directory = tempfile::tempdir().unwrap();
+    fs::copy(
+        PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../tests/fixtures/minimal.pdf"),
+        directory.path().join("input.pdf"),
+    )
+    .unwrap();
+    fs::write(
+        directory.path().join("qpdf-job.json"),
+        br#"{"inputFile":"input.pdf","outputFile":"qpdf-output.pdf","staticId":""}"#,
+    )
+    .unwrap();
+    fs::write(
+        directory.path().join("flpdf-job.json"),
+        br#"{"inputFile":"input.pdf","outputFile":"flpdf-output.pdf","staticId":""}"#,
+    )
+    .unwrap();
+
+    let common = [
+        "--compression-level=1",
+        "--ii-min-bytes=1",
+        "--keep-files-open-threshold=1",
+        "--oi-min-area=1",
+        "--oi-min-height=1",
+        "--oi-min-width=1",
+        "--split-pages=0",
+    ];
+    let mut qpdf_args = common.to_vec();
+    qpdf_args.push("--job-json-file=qpdf-job.json");
+    let mut flpdf_args = common.to_vec();
+    flpdf_args.push("--job-json-file=flpdf-job.json");
+
+    let qpdf = ProcessCommand::new("/usr/bin/qpdf")
+        .current_dir(directory.path())
+        .args(&qpdf_args)
+        .output()
+        .unwrap();
+    let flpdf = Command::cargo_bin("flpdf")
+        .unwrap()
+        .current_dir(directory.path())
+        .env("FLPDF_PROGNAME", "qpdf")
+        .args(&flpdf_args)
+        .output()
+        .unwrap();
+
+    assert_eq!(flpdf.status.code(), qpdf.status.code());
+    assert_eq!(flpdf.stdout, qpdf.stdout);
+    assert_eq!(flpdf.stderr, qpdf.stderr);
+    assert_eq!(
+        fs::read(directory.path().join("flpdf-output.pdf")).unwrap(),
+        fs::read(directory.path().join("qpdf-output.pdf")).unwrap()
+    );
 }
 
 #[test]

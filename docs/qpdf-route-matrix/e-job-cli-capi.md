@@ -1209,6 +1209,28 @@ FIFOを qpdf 11.9.0 と flpdfへ渡し、両者の非ブロック成功を固定
 transformation wiringは `flpdf-uwu7`の別責務に残し、新しい parser、cache、bridge、
 deviation markerは追加しない。
 
+### E-17 / E-21 immediate callback validation continuation (`flpdf-sk77s`, 2026-09-16)
+
+qpdfの main option table は `addRequiredParameter` / `addOptionalParameter` /
+`addChoices` で callback と choices を登録し、`QPDFArgParser::parseArgs` は
+required parameter / choices の検証直後に同じ argv occurrenceの callbackを実行する
+（`libqpdf/qpdf/auto_job_init.hh:92-127`; `libqpdf/QPDFArgParser.cc:433-555`）。
+`compression-level`、`ii-min-bytes`、`keep-files-open-threshold`、
+`oi-min-area`/`height`/`width`、`split-pages`、`show-object` は callback内で
+numericまたは object selector を即時検証し、callbackの runtime errorは
+`QPDFUsage`へ変換される（`libqpdf/QPDFJob_config.cc:95-139,232-235,350-353,597-609,766-770`;
+`libqpdf/QPDFJob.cc:929-941`; `libqpdf/QPDFJob_argv.cc:408-415`;
+`libqpdf/QPDFArgParser.cc:337-344`）。
+
+flpdf は `qpdf_cli_events` にこの8 optionを追加し、prepared `QPDFJob` の
+preflightで左から同じ順に検証する。numeric failureは `usage_exit`へ渡し、
+image thresholdは qpdfの `QUtil::string_to_uint` に対応する direct unsigned
+conversionを使う。split/threshold/show-objectの状態はprepared jobへ保持する。
+`cli_job_json.rs::top_level_parse_errors_follow_qpdf_argv_order` と
+`top_level_image_thresholds_keep_qpdf_unsigned_prefix_semantics` が qpdf 11.9.0と
+status/stdout/stderrを比較する。新しい parser、bridge、side-file cache、
+deviation markerは追加しない。
+
 ### E-12 follow-up: job-json directory read diagnostic (`flpdf-jhaqf`, 2026-09-16)
 
 qpdf の `Config::jobJsonFile` は `read_file_into_string` の例外を job-json
