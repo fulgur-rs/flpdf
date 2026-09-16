@@ -594,8 +594,7 @@ impl Pipeline for Flate<'_> {
         }
         self.initialize_codec()?;
         let Some(FlateCodec::Deflate(mut codec)) = self.codec.take() else {
-            // cov:ignore: action is checked as Deflate before this codec variant is taken
-            unreachable!("Flate codec is initialized before predictor-row processing")
+            unreachable!("codec invariant") // cov:ignore: action guarantees the Deflate codec variant
         };
         let result = (|| {
             // Keep the same one-byte codec input sequence as the default
