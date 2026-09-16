@@ -725,6 +725,65 @@ fn top_level_image_thresholds_keep_qpdf_unsigned_prefix_semantics() {
 }
 
 #[test]
+fn job_json_cli_parameter_events_reuse_the_prepared_job_state() {
+    if !qpdf_available() {
+        return;
+    }
+
+    let directory = tempfile::tempdir().unwrap();
+    fs::copy(
+        PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../tests/fixtures/minimal.pdf"),
+        directory.path().join("input.pdf"),
+    )
+    .unwrap();
+    fs::write(
+        directory.path().join("qpdf-job.json"),
+        br#"{"inputFile":"input.pdf","outputFile":"qpdf-output.pdf","staticId":""}"#,
+    )
+    .unwrap();
+    fs::write(
+        directory.path().join("flpdf-job.json"),
+        br#"{"inputFile":"input.pdf","outputFile":"flpdf-output.pdf","staticId":""}"#,
+    )
+    .unwrap();
+
+    let common = [
+        "--compression-level=1",
+        "--ii-min-bytes=1",
+        "--keep-files-open-threshold=1",
+        "--oi-min-area=1",
+        "--oi-min-height=1",
+        "--oi-min-width=1",
+        "--split-pages=0",
+    ];
+    let mut qpdf_args = common.to_vec();
+    qpdf_args.push("--job-json-file=qpdf-job.json");
+    let mut flpdf_args = common.to_vec();
+    flpdf_args.push("--job-json-file=flpdf-job.json");
+
+    let qpdf = ProcessCommand::new("/usr/bin/qpdf")
+        .current_dir(directory.path())
+        .args(&qpdf_args)
+        .output()
+        .unwrap();
+    let flpdf = Command::cargo_bin("flpdf")
+        .unwrap()
+        .current_dir(directory.path())
+        .env("FLPDF_PROGNAME", "qpdf")
+        .args(&flpdf_args)
+        .output()
+        .unwrap();
+
+    assert_eq!(flpdf.status.code(), qpdf.status.code());
+    assert_eq!(flpdf.stdout, qpdf.stdout);
+    assert_eq!(flpdf.stderr, qpdf.stderr);
+    assert_eq!(
+        fs::read(directory.path().join("flpdf-output.pdf")).unwrap(),
+        fs::read(directory.path().join("qpdf-output.pdf")).unwrap()
+    );
+}
+
+#[test]
 fn job_json_file_preserves_input_encryption_when_compression_is_disabled() {
     if !qpdf_available() {
         return;
