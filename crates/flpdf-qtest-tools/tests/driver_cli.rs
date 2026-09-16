@@ -1559,6 +1559,8 @@ fn qtest_accessor_cases_do_not_use_explicit_pdf_resolve() {
         test_75.contains("try_get_key(")
             && test_75.contains("try_get_array_item(")
             && test_75.contains("try_get_int_value()")
+            && test_75.contains("try_get_utf8_value()")
+            && test_75.contains("try_get_array_n_items()")
             && !test_75.contains(".as_array()"),
         "test 75 must use canonical resolving tree accessors"
     );
