@@ -787,6 +787,20 @@ impl std::fmt::Display for CliExitError {
 impl std::error::Error for CliExitError {}
 
 #[derive(Debug)]
+struct CliRawExitError {
+    code: ExitCode,
+    message: Vec<u8>,
+}
+
+impl std::fmt::Display for CliRawExitError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "{}", String::from_utf8_lossy(&self.message))
+    }
+}
+
+impl std::error::Error for CliRawExitError {}
+
+#[derive(Debug)]
 struct CliPathError {
     path: Vec<u8>,
     operation: Option<&'static str>,
@@ -3720,6 +3734,15 @@ fn main() {
     };
 
     if let Err(error) = result {
+        if let Some(exit_err) = error.downcast_ref::<CliRawExitError>() {
+            if !exit_err.message.is_empty() {
+                let mut line = format!("\n{}: ", progname()).into_bytes();
+                line.extend_from_slice(&exit_err.message);
+                line.push(b'\n');
+                emit_logger_error(line);
+            }
+            std::process::exit(exit_err.code.as_i32());
+        }
         // If the error carries an explicit exit code (e.g. from run_check),
         // honour it.  Unknown/generic errors fall back to exit 2 (qpdf
         // convention for "error", unchanged from before this change).
@@ -3815,6 +3838,18 @@ fn usage_exit(error: &UsageError) -> ! {
 }
 
 fn exit_qpdf_parse_error(error: Box<dyn std::error::Error>) -> ! {
+    // The job-JSON preflight reads the file here, so its diagnostics reach this
+    // exit path rather than the one in `main`. Keep the raw-byte branch first so
+    // a non-UTF-8 path survives instead of going through `Display`.
+    if let Some(exit_error) = error.downcast_ref::<CliRawExitError>() {
+        if !exit_error.message.is_empty() {
+            let mut line = format!("\n{}: ", progname()).into_bytes();
+            line.extend_from_slice(&exit_error.message);
+            line.push(b'\n');
+            emit_logger_error(line);
+        }
+        std::process::exit(exit_error.code.as_i32());
+    }
     if let Some(exit_error) = error.downcast_ref::<CliExitError>() {
         if !exit_error.message.is_empty() {
             emit_logger_error(format!("\n{}: {}\n", progname(), exit_error.message));
@@ -4357,11 +4392,12 @@ fn preflight_qpdf_cli_events(args: &[arg_parser::RawArg]) -> CliResult<QpdfCliPr
         match event {
             JobJsonCliEvent::JobJsonFile(path) => {
                 let json = std::fs::read(path).map_err(|error| {
-                    job_json_event_error(Some(path), qpdf_json_input_open_error(path, error))
+                    let error = qpdf_json_input_open_error(path, error);
+                    job_json_event_error(Some(path), error.as_ref())
                 })?;
                 validation_job
                     .initialize_from_json_partial_bytes(&json)
-                    .map_err(|error| job_json_event_error(Some(path), error))?;
+                    .map_err(|error| job_json_event_error(Some(path), &error))?;
                 job_json_contents.push(json);
             }
             JobJsonCliEvent::EmptyInput => {
@@ -4411,17 +4447,19 @@ fn preflight_qpdf_cli_events(args: &[arg_parser::RawArg]) -> CliResult<QpdfCliPr
 
 fn job_json_event_error(
     path: Option<&Path>,
-    error: impl std::fmt::Display,
+    error: &(dyn std::error::Error + 'static),
 ) -> Box<dyn std::error::Error> {
+    let error_message = find_raw_error_message(error)
+        .map_or_else(|| error.to_string().into_bytes(), ToOwned::to_owned);
     if let Some(path) = path {
-        Box::new(CliExitError {
+        Box::new(CliRawExitError {
             code: ExitCode::Errors,
-            message: format_job_json_error(path, error),
+            message: format_job_json_error(path, &error_message),
         })
     } else {
-        Box::new(CliExitError {
+        Box::new(CliRawExitError {
             code: ExitCode::Errors,
-            message: error.to_string(),
+            message: error_message,
         })
     }
 }
@@ -4444,7 +4482,7 @@ fn run_job_json_files(preflight: QpdfCliPreflight, suppress_warnings: bool) -> C
                     .next()
                     .expect("job-json preflight must cache every JSON file");
                 job.initialize_from_json_partial_bytes(&json)
-                    .map_err(|error| job_json_event_error(Some(&path), error))?;
+                    .map_err(|error| job_json_event_error(Some(&path), &error))?;
             }
             JobJsonCliEvent::EmptyInput => {
                 job.config().empty_input()?;
@@ -4488,16 +4526,26 @@ fn run_job_json_files(preflight: QpdfCliPreflight, suppress_warnings: bool) -> C
     finish_job_exit_status(job.run()?)
 }
 
-fn format_job_json_error(path: &Path, error: impl std::fmt::Display) -> String {
-    format!(
-        "error with job-json file {}: {error}\nRun {} --job-json-help for information on the file format.\n\nFor help:\n  {} --help=usage       usage information\n  {} --help=topic       help on a topic\n  {} --help=--option    help on an option\n  {} --help             general help and a topic list\n",
-        path.display(),
-        progname(),
-        progname(),
-        progname(),
-        progname(),
-        progname(),
-    )
+fn format_job_json_error(path: &Path, error: &[u8]) -> Vec<u8> {
+    let who = progname();
+    let mut message = b"error with job-json file ".to_vec();
+    message.extend_from_slice(&path_description(path));
+    message.extend_from_slice(b": ");
+    message.extend_from_slice(error);
+    message.extend_from_slice(b"\nRun ");
+    message.extend_from_slice(who.as_bytes());
+    message.extend_from_slice(
+        b" --job-json-help for information on the file format.\n\nFor help:\n  ",
+    );
+    message.extend_from_slice(who.as_bytes());
+    message.extend_from_slice(b" --help=usage       usage information\n  ");
+    message.extend_from_slice(who.as_bytes());
+    message.extend_from_slice(b" --help=topic       help on a topic\n  ");
+    message.extend_from_slice(who.as_bytes());
+    message.extend_from_slice(b" --help=--option    help on an option\n  ");
+    message.extend_from_slice(who.as_bytes());
+    message.extend_from_slice(b" --help             general help and a topic list\n");
+    message
 }
 
 fn run_json(
@@ -9129,7 +9177,11 @@ fn qpdf_json_input_open_error(input: &Path, error: std::io::Error) -> Box<dyn st
             .and_then(|code| rendered.strip_suffix(&format!(" (os error {code})")))
             .unwrap_or(&rendered),
     };
-    format!("open {}: {message}", input.display()).into()
+    let mut raw_message = b"open ".to_vec();
+    raw_message.extend_from_slice(&path_description(input));
+    raw_message.extend_from_slice(b": ");
+    raw_message.extend_from_slice(message.as_bytes());
+    Box::new(flpdf::Error::SystemBytes(raw_message))
 }
 
 fn open_verified_json_output(input: Option<&File>, output: &Path) -> CliResult<File> {
@@ -10967,12 +11019,13 @@ mod tests {
 
     #[test]
     fn job_json_event_error_uses_the_latest_job_file_when_available() {
-        let error = job_json_event_error(Some(Path::new("job.json")), "bad setting");
+        let source = std::io::Error::other("bad setting");
+        let error = job_json_event_error(Some(Path::new("job.json")), &source);
         assert!(error
             .to_string()
             .contains("error with job-json file job.json"));
 
-        let error = job_json_event_error(None, "bad setting");
+        let error = job_json_event_error(None, &source);
         assert_eq!(error.to_string(), "bad setting");
     }
 
