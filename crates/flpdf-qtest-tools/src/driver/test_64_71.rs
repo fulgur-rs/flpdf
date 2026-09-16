@@ -468,13 +468,9 @@ pub(crate) fn run_test_71<R: Read + Seek>(
     // qpdf obtains Fx1 directly from the page's resource dictionary after the
     // six page-level traversals, then constructs a helper over that Form.
     let page = pdf.get_object_handle(page_ref);
-    pdf.resolve(&page)?;
     let resources = page.try_get_key(b"/Resources")?;
-    pdf.resolve(&resources)?;
     let xobjects = resources.try_get_key(b"/XObject")?;
-    pdf.resolve(&xobjects)?;
     let fx1 = xobjects.try_get_key(b"/Fx1")?;
-    pdf.resolve(&fx1)?;
 
     writeln!(stdout, "--- recursive, all, from fx1 ---")?;
     {
