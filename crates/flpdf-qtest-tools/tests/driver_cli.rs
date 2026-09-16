@@ -1336,7 +1336,8 @@ fn qtest_accessor_cases_do_not_use_explicit_pdf_resolve() {
         env!("CARGO_MANIFEST_DIR"),
         "/src/driver/test_34_41.rs"
     ))
-    .expect("read resolve-driver source");
+    .expect("read resolve-driver source")
+    .replace("\r\n", "\n");
     let late_80_87_source = fs::read_to_string(concat!(
         env!("CARGO_MANIFEST_DIR"),
         "/src/driver/test_80_87.rs"
