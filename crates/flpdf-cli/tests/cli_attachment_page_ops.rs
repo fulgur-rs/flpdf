@@ -803,3 +803,69 @@ fn copy_attachments_honors_empty_input() {
         "--empty must write the document to the sole positional path"
     );
 }
+
+/// The `--empty` resolver rejects the same shapes the `--pages` route does.
+///
+/// qpdf reports a different diagnostic for two of these — its parser accepts
+/// only one positional path, so a second one becomes `unknown argument` before
+/// the configuration check runs. That difference predates this route: the
+/// existing `--pages` route diverges identically, so it is not introduced here.
+#[test]
+fn empty_input_rejects_conflicting_shapes() {
+    let temp = tempfile::tempdir().unwrap();
+    let source = one_page_pdf();
+    let attachment = attachment_temp(temp.path());
+    let output = temp.path().join("out.pdf");
+
+    // --replace-input with --empty: qpdf refuses this combination outright
+    // (`libqpdf/QPDFJob.cc:590-591`).
+    CargoCommand::cargo_bin("flpdf")
+        .unwrap()
+        .args([
+            "--static-id",
+            "--empty",
+            "--replace-input",
+            "--add-attachment",
+            attachment.to_str().unwrap(),
+            "--",
+        ])
+        .assert()
+        .failure()
+        .stderr(predicates::str::contains(
+            "--replace-input may not be used with --empty",
+        ));
+
+    // Both an input and an output alongside --empty.
+    CargoCommand::cargo_bin("flpdf")
+        .unwrap()
+        .args([
+            "--static-id",
+            "--empty",
+            source.path().to_str().unwrap(),
+            "--add-attachment",
+            attachment.to_str().unwrap(),
+            "--",
+            output.to_str().unwrap(),
+        ])
+        .assert()
+        .failure()
+        .stderr(predicates::str::contains(
+            "empty input can't be used since input file has already been given",
+        ));
+
+    // Neither: qpdf asks for the output name (`QPDFJob.cc:592-593`).
+    CargoCommand::cargo_bin("flpdf")
+        .unwrap()
+        .args([
+            "--static-id",
+            "--empty",
+            "--add-attachment",
+            attachment.to_str().unwrap(),
+            "--",
+        ])
+        .assert()
+        .failure()
+        .stderr(predicates::str::contains(
+            "an output file name is required; use - for standard output",
+        ));
+}
