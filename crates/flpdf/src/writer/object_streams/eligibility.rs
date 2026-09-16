@@ -149,9 +149,11 @@ impl VisitedObjects {
         let zero_based = object_number.checked_sub(1).ok_or_else(|| {
             crate::Error::Internal("object number zero cannot be marked visited".to_string())
         })?;
+        // cov:ignore-start: the dense allocation bound is below usize::MAX on every supported target
         usize::try_from(zero_based).map_err(|_| {
             crate::Error::Unsupported("object number does not fit in usize".to_string())
         })
+        // cov:ignore-end
     }
 
     fn contains(&self, object_number: u32) -> crate::Result<bool> {
@@ -431,6 +433,23 @@ mod tests {
         );
 
         assert!(matches!(visited, super::VisitedObjects::Sparse(_)));
+    }
+
+    #[test]
+    fn visited_storage_checks_and_marks_dense_and_sparse_numbers() {
+        let mut dense = super::VisitedObjects::new(2);
+        assert!(!dense.contains(1).expect("dense contains"));
+        dense.insert(1).expect("dense insert");
+        assert!(dense.contains(1).expect("dense contains after insert"));
+
+        let mut sparse = super::VisitedObjects::new(
+            (super::DENSE_VISITED_OBJECT_LIMIT as u32).saturating_add(1),
+        );
+        assert!(!sparse.contains(42).expect("sparse contains"));
+        sparse.insert(42).expect("sparse insert");
+        assert!(sparse.contains(42).expect("sparse contains after insert"));
+
+        assert!(super::VisitedObjects::dense_index(0).is_err());
     }
 
     fn reachable_objstm_with_indirect_length() -> Vec<u8> {
