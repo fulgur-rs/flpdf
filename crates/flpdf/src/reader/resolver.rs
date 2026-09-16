@@ -1617,6 +1617,30 @@ impl<R: Read + Seek> ResolverHandle<R> {
             .collect())
     }
 
+    /// Remove the exact lower-generation cache entries discarded by qpdf's
+    /// post-chain `read_xref` cleanup (`libqpdf/QPDF.cc:710-718`). This is the
+    /// resolver-side half of `QPDF::removeObject` (`QPDF.cc:1996-2005`): the
+    /// raw xref loader has already removed the rows from its returned table,
+    /// while the canonical cache may also contain a handle parsed from a
+    /// trailer or another object before that cleanup ran.
+    pub(crate) fn discard_cached_generations(&self, object_gens: &[QpdfObjGen]) {
+        for &object_gen in object_gens {
+            let cached = {
+                let mut core = self.core.borrow_mut();
+                core.raw_source_xref_entries.remove(&object_gen);
+                core.default_xref_entries.remove(&object_gen);
+                core.default_xref_warnings.remove(&object_gen);
+                core.allocated_object_refs.remove(&object_gen);
+                core.object_cache
+                    .remove(&object_gen)
+                    .map(|entry| entry.handle)
+            };
+            if let Some(handle) = cached {
+                handle.remove_from_document();
+            }
+        }
+    }
+
     /// The largest object *number* any canonical handle occupies.
     pub(crate) fn max_object_number(&self) -> Option<u32> {
         max_object_number_from_ordered_keys(self.core.borrow().object_cache.keys())
@@ -1644,30 +1668,33 @@ impl<R: Read + Seek> ResolverHandle<R> {
         // ObjectRef, but they still must reach the same offset/header/recovery
         // boundary so qpdf's expected-generation diagnostics are preserved.
         for (object_gen, entry) in self.raw_xref_entries() {
-            // cov:ignore-start: qtest specific-bugs issue-143 is the corpus-level source for the raw object-0 xref placeholder
-            if !object_gen.is_indirect() {
-                // A failed xref-stream entry leaves qpdf's default type-0
-                // placeholder for object 0 in `m->xref_table`. It is not a
-                // valid ObjectRef, but `resolveXRefTable` still visits it and
-                // the type switch emits this damaged-PDF warning
-                // (`QPDF.cc:1728-1736`). Ordinary free rows never reach this
-                // branch because `insertFreeXrefEntry` stores only the
-                // deleted-object filter, not a raw table entry.
-                if object_gen == QpdfObjGen::new(0, 0) && matches!(entry, XrefEntry::Free { .. }) {
-                    let is_default = self
-                        .core
-                        .borrow()
-                        .default_xref_entries
-                        .contains(&object_gen);
-                    if is_default {
-                        self.warn_default_xref_entries()?;
-                    } else {
-                        self.push_warning_at(0, "object 0/0 has unexpected xref entry type")?;
+            if object_gen == QpdfObjGen::new(0, 0) {
+                let handle = self.get_object_handle_qpdf_obj_gen(object_gen);
+                match entry {
+                    XrefEntry::Uncompressed { offset } => {
+                        self.resolve_raw_xref_entry(object_gen, offset)?;
                     }
+                    XrefEntry::Free { .. } => {
+                        let is_default = self
+                            .core
+                            .borrow()
+                            .default_xref_entries
+                            .contains(&object_gen);
+                        if is_default {
+                            self.warn_default_xref_entries()?;
+                        } else {
+                            self.push_warning_at(0, "object 0/0 has unexpected xref entry type")?;
+                        }
+                    }
+                    XrefEntry::Compressed { stream, .. } => {
+                        self.resolve_object_stream_or_null(stream, &handle)?;
+                    }
+                }
+                if !handle.is_resolved() {
+                    handle.set_resolved(ObjectValue::Null);
                 }
                 continue;
             }
-            // cov:ignore-end
             if object_gen.to_object_ref().is_some() {
                 continue;
             }
@@ -1693,7 +1720,11 @@ impl<R: Read + Seek> ResolverHandle<R> {
             self.push_warning_at_with_last_object_description(0, "object has offset 0")?;
             return Ok(());
         }
-        let attempt_recovery = self.attempt_recovery();
+        // qpdf uses expected object number zero as the xref-stream or
+        // object-zero probe sentinel: it does not validate the header and
+        // never retries that read through xref reconstruction
+        // (`QPDF.cc:1545-1553`).
+        let attempt_recovery = self.attempt_recovery() && object_gen.is_indirect();
         let result = match self.read_object_at_offset_with_description(
             offset,
             object_gen,
@@ -3685,7 +3716,7 @@ impl<R: Read + Seek> ResolverHandle<R> {
                     "object with ID 0",
                 )));
             }
-            if try_recovery && found_raw != expected {
+            if try_recovery && expected.is_indirect() && found_raw != expected {
                 return Err(ReadObjectAtOffsetError::Header(Error::parse(
                     offset as usize,
                     format!("expected {} {} obj", expected.get_obj(), expected.get_gen()),
@@ -14776,6 +14807,83 @@ mod tests {
             .fix_dangling_references()
             .expect("raw free rows do not require object reads");
         assert!(resolver.repair_diagnostics().entries().is_empty());
+    }
+
+    #[test]
+    fn raw_object_zero_free_row_warns_and_resolves_to_null() {
+        let resolver = bare_resolver();
+        let object_gen = QpdfObjGen::new(0, 0);
+        resolver
+            .install_raw_xref_entries(BTreeMap::from([(object_gen, XrefEntry::Free { next: 0 })]));
+
+        resolver
+            .fix_dangling_references()
+            .expect("qpdf resolves the object-zero type-0 row to null");
+
+        let handle = resolver.get_object_handle_qpdf_obj_gen(object_gen);
+        assert!(handle.is_resolved());
+        assert!(handle.is_null());
+        assert_eq!(
+            resolver
+                .repair_diagnostics()
+                .entries()
+                .iter()
+                .map(|entry| entry.message_string())
+                .collect::<Vec<_>>(),
+            vec!["object 0/0 has unexpected xref entry type"]
+        );
+    }
+
+    #[test]
+    fn raw_object_zero_default_free_row_warns_and_resolves_to_null() {
+        let resolver = bare_resolver();
+        let object_gen = QpdfObjGen::new(0, 0);
+        resolver
+            .install_raw_xref_entries(BTreeMap::from([(object_gen, XrefEntry::Free { next: 0 })]));
+        resolver.insert_default_xref_entry_for_test(ObjectRef::new(0, 0));
+
+        resolver
+            .fix_dangling_references()
+            .expect("qpdf warns while resolving the default object-zero row");
+
+        let handle = resolver.get_object_handle_qpdf_obj_gen(object_gen);
+        assert!(handle.is_resolved());
+        assert!(handle.is_null());
+        assert_eq!(
+            resolver
+                .repair_diagnostics()
+                .entries()
+                .iter()
+                .map(|entry| entry.message_string())
+                .collect::<Vec<_>>(),
+            vec!["object 0/0 has unexpected xref entry type"]
+        );
+    }
+
+    #[test]
+    fn raw_object_zero_compressed_row_resolves_to_null_after_stream_warning() {
+        let resolver = bare_resolver();
+        let object_gen = QpdfObjGen::new(0, 0);
+        resolver.install_raw_xref_entries(BTreeMap::from([(
+            object_gen,
+            XrefEntry::Compressed {
+                stream: 4,
+                index: 0,
+            },
+        )]));
+
+        resolver
+            .fix_dangling_references()
+            .expect("qpdf catches a missing object stream and falls back to null");
+
+        let handle = resolver.get_object_handle_qpdf_obj_gen(object_gen);
+        assert!(handle.is_resolved());
+        assert!(handle.is_null());
+        assert!(resolver
+            .repair_diagnostics()
+            .entries()
+            .iter()
+            .any(|entry| entry.message_string() == "supposed object stream 4 is not a stream"));
     }
 
     #[test]
