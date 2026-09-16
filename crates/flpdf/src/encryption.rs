@@ -246,8 +246,16 @@ pub struct CopyEncryptionSource {
     /// instead of re-deriving a key from a password, so that encrypted strings
     /// and streams are consistent with the copied `/O` / `/U` / `/P` entries.
     /// Its required length is validated against the donor's `/V`, `/R`, and
-    /// `/Length` before output emission (5/16 bytes for supported V<5
-    /// handlers, 32 bytes for V=5).
+    /// `/Length` before output emission (5/16 bytes for supported valid V<5
+    /// handlers, 32 bytes for V=5). qpdf's writer-side non-integer or
+    /// missing V<5 `/Length` can intentionally produce a zero-length key;
+    /// the writer derives that state from the donor dictionary rather than
+    /// treating this field as absent.
+    ///
+    /// `Some(0)` is the actual qpdf writer result for a non-integer or missing
+    /// V>1 `/Length`. `None` means the source was constructed without a live
+    /// donor snapshot and the writer must read the dictionary itself.
+    pub writer_length_bits: Option<i64>,
     pub file_key: Vec<u8>,
     /// The donor's `/ID[0]` bytes.  Copied into the output trailer's `/ID[0]`
     /// position; Algorithm 2 key derivation is pinned to this value.

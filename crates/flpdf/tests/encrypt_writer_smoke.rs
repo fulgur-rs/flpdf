@@ -868,6 +868,7 @@ fn copy_encryption_rejects_short_public_file_key_in_compact_and_qdf() {
         ]);
         options.copy_encryption = Some(CopyEncryptionSource {
             encrypt_dict,
+            writer_length_bits: None,
             file_key: vec![0x31; 15],
             id0: b"0123456789abcdef".to_vec(),
             object_key_alg: ObjectKeyAlg::Aes,

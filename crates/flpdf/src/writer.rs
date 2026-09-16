@@ -2603,13 +2603,14 @@ pub(crate) fn build_copy_encryption_parameters(
     options: &WriterOptions,
     metadata_ref: Option<ObjectRef>,
 ) -> Result<EncryptionParameters> {
-    let (encrypt_dict, encryption_v, encryption_r, cipher) = canonical_copy_encryption(src)?;
+    let (encrypt_dict, encryption_v, encryption_r, cipher, file_key) =
+        canonical_copy_encryption(src)?;
 
     let encrypt_metadata = copy_encryption_encrypts_metadata_from_dict(&encrypt_dict);
 
     Ok(EncryptionParameters {
         encrypt_dict,
-        file_key: src.file_key.clone(),
+        file_key,
         cipher,
         encryption_v,
         encryption_r,
@@ -2719,7 +2720,7 @@ pub(crate) fn build_writer_setup<R: Read + Seek>(
 /// select the corresponding object-key cipher.
 fn canonical_copy_encryption(
     src: &crate::encryption::CopyEncryptionSource,
-) -> Result<(ObjectHandle, i32, i32, WriteCipher)> {
+) -> Result<(ObjectHandle, i32, i32, WriteCipher, Vec<u8>)> {
     use crate::encryption::standard::ObjectKeyAlg;
 
     let version = copy_integer(&src.encrypt_dict, "V")?;
@@ -2732,22 +2733,25 @@ fn canonical_copy_encryption(
     })?;
     let length_bits = if version == 1 {
         40
+    } else if let Some(length_bits) = src.writer_length_bits {
+        length_bits
     } else {
-        copy_integer(&src.encrypt_dict, "Length")?
+        let key_len = copy_integer_as_int(&src.encrypt_dict, "Length")? / 8;
+        key_len * 8
     };
-    if !(40..=256).contains(&length_bits) || length_bits % 8 != 0 {
+    if length_bits != 0 && !(40..=256).contains(&length_bits) {
         return Err(crate::Error::Unsupported(format!(
             "copy-encryption /Length is invalid: {length_bits} bits"
         )));
     }
 
     let expected_key_len = if version >= 5 {
-        if version != 5 || !matches!(revision, 5 | 6) || length_bits != 256 {
+        if version != 5 || !matches!(revision, 5 | 6) || !matches!(length_bits, 0 | 256) {
             return Err(crate::Error::Unsupported(format!(
                 "unsupported copy-encryption Standard handler V={version} R={revision} Length={length_bits}"
             )));
         }
-        32
+        Some(32)
     } else {
         if !matches!(version, 1 | 2 | 4)
             || (version == 1 && revision != 2)
@@ -2758,19 +2762,31 @@ fn canonical_copy_encryption(
                 "unsupported copy-encryption Standard handler V={version} R={revision}"
             )));
         }
-        // cov:ignore-start: length_bits is range-checked and divisible by eight;
-        // the supported targets can represent every resulting key length.
-        usize::try_from(length_bits / 8).map_err(|_| {
-            crate::Error::Unsupported("copy-encryption key length overflows usize".into())
-        })?
-        // cov:ignore-end
+        if length_bits == 0 {
+            // qpdf's copy writer derives a zero-length V<5 file key when its
+            // getIntValueAsInt fallback produces key_len == 0. This is a
+            // valid malformed-input state, not an absent-key sentinel.
+            None
+        } else {
+            // cov:ignore-start: length_bits is range-checked and divisible by eight;
+            // the supported targets can represent every resulting key length.
+            Some(usize::try_from(length_bits / 8).map_err(|_| {
+                crate::Error::Unsupported("copy-encryption key length overflows usize".into())
+            })?)
+            // cov:ignore-end
+        }
     };
-    if src.file_key.len() != expected_key_len {
-        return Err(crate::Error::Unsupported(format!(
-            "copy-encryption V={version} R={revision} file key must be {expected_key_len} bytes; got {}",
-            src.file_key.len()
-        )));
-    }
+    let file_key = if let Some(expected_key_len) = expected_key_len {
+        if src.file_key.len() != expected_key_len {
+            return Err(crate::Error::Unsupported(format!(
+                "copy-encryption V={version} R={revision} file key must be {expected_key_len} bytes; got {}",
+                src.file_key.len()
+            )));
+        }
+        src.file_key.clone()
+    } else {
+        Vec::new()
+    };
 
     let p = crate::encryption::qpdf_permission_i32(copy_integer(&src.encrypt_dict, "P")?);
     let o = copy_string(&src.encrypt_dict, "O")?;
@@ -2815,7 +2831,7 @@ fn canonical_copy_encryption(
         entries.push((b"EncryptMetadata".to_vec(), ObjectHandle::boolean(false)));
     }
     let dict = ObjectHandle::dictionary(entries);
-    Ok((dict, version_i32, revision_i32, cipher))
+    Ok((dict, version_i32, revision_i32, cipher, file_key))
 }
 
 fn copy_integer(dict: &ObjectHandle, key: &str) -> Result<i64> {
@@ -2825,6 +2841,16 @@ fn copy_integer(dict: &ObjectHandle, key: &str) -> Result<i64> {
         .ok_or_else(|| {
             crate::Error::Unsupported(format!("copy-encryption /{key} must be an integer"))
         })
+}
+
+/// Read an integer through qpdf's warning-and-zero fallback used by
+/// `QPDFWriter::copyEncryptionParameters` for `/Length`.
+fn copy_integer_as_int(dict: &ObjectHandle, key: &str) -> Result<i64> {
+    let key = format!("/{key}");
+    Ok(i64::from(
+        dict.try_get_key(key.as_bytes())?
+            .try_get_int_value_as_int()?,
+    ))
 }
 
 fn copy_string(dict: &ObjectHandle, key: &str) -> Result<Vec<u8>> {
@@ -4606,6 +4632,7 @@ mod final_handle_writer_tests {
                     (b"/V".to_vec(), ObjectHandle::integer(4)),
                     (b"/R".to_vec(), ObjectHandle::integer(4)),
                 ]),
+                writer_length_bits: None,
                 file_key: vec![0; 16],
                 id0: vec![0; 16],
                 object_key_alg: ObjectKeyAlg::Rc4,
@@ -4626,6 +4653,7 @@ mod final_handle_writer_tests {
                     (b"/V".to_vec(), ObjectHandle::integer(4)),
                     (b"/R".to_vec(), ObjectHandle::integer(4)),
                 ]),
+                writer_length_bits: None,
                 file_key: vec![0; 16],
                 id0: vec![0; 16],
                 object_key_alg: ObjectKeyAlg::Rc4,
@@ -4756,11 +4784,12 @@ mod final_handle_writer_tests {
                 (b"/U".to_vec(), ObjectHandle::string(vec![2; 32])),
                 (b"/EncryptMetadata".to_vec(), ObjectHandle::boolean(false)),
             ]),
+            writer_length_bits: None,
             file_key: vec![0; 16],
             id0: vec![0; 16],
             object_key_alg: ObjectKeyAlg::Rc4,
         };
-        let (dictionary, _, _, _) =
+        let (dictionary, _, _, _, _) =
             canonical_copy_encryption(&source).expect("valid V=4 copy-encryption source");
         assert_eq!(
             dictionary
@@ -4785,11 +4814,12 @@ mod final_handle_writer_tests {
                 (b"/UE".to_vec(), ObjectHandle::string(vec![4; 32])),
                 (b"/Perms".to_vec(), ObjectHandle::string(vec![5; 16])),
             ]),
+            writer_length_bits: None,
             file_key: vec![0; 32],
             id0: vec![0; 16],
             object_key_alg: ObjectKeyAlg::Aes,
         };
-        let (dictionary, _, _, _) =
+        let (dictionary, _, _, _, _) =
             canonical_copy_encryption(&source).expect("positive /P copy source");
 
         assert_eq!(

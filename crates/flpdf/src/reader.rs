@@ -573,6 +573,23 @@ impl<R: Read + Seek> Pdf<R> {
         let mut encrypt_dict = self.encrypt_dictionary_handle()?.ok_or_else(|| {
             Error::Unsupported("authenticated input has no /Encrypt dictionary".into())
         })?;
+        // qpdf's copyEncryptionParameters reads /V and then /Length while
+        // the donor still owns the warning sink. Capture the writer-side
+        // result before make_direct detaches the dictionary from that
+        // document; Some(0) is an actual malformed-input key length.
+        let writer_length_bits = {
+            let version = encrypt_dict
+                .try_get_key(b"/V")?
+                .try_get_int_value_as_int()?;
+            if version > 1 {
+                let key_len = encrypt_dict
+                    .try_get_key(b"/Length")?
+                    .try_get_int_value_as_int()?;
+                Some(i64::from(key_len / 8) * 8)
+            } else {
+                None
+            }
+        };
         // `CopyEncryptionSource` outlives this reader in the CLI and in
         // cross-document writer calls. Detach the authenticated dictionary
         // from the donor resolver while it is still alive, so later key reads
@@ -590,6 +607,7 @@ impl<R: Read + Seek> Pdf<R> {
 
         Ok(Some(CopyEncryptionSource {
             encrypt_dict,
+            writer_length_bits,
             file_key,
             id0,
             // qpdf's copy path forces AES for V>=4. The field remains part of
