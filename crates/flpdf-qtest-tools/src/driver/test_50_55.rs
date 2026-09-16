@@ -140,7 +140,10 @@ pub(crate) fn run_test_51<R: Read + Seek>(
         let t = field.try_get_key(b"/T");
         emit_new_diagnostics(pdf, diagnostics_written, filename, stdout, stderr)?;
         let t = t?;
-        if !t.try_is_string()? {
+        let is_string = t.try_is_string();
+        emit_new_diagnostics(pdf, diagnostics_written, filename, stdout, stderr)?;
+        let is_string = is_string?;
+        if !is_string {
             emit_new_diagnostics(pdf, diagnostics_written, filename, stdout, stderr)?;
             continue;
         }

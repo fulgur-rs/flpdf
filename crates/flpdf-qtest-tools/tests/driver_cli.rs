@@ -1390,7 +1390,9 @@ fn qtest_accessor_cases_do_not_use_explicit_pdf_resolve() {
     );
     // qpdf's warning logger is synchronous, so an accessor that records a
     // repair warning and *then* fails must have that warning printed first.
-    // `X()?;` straight before emit_new_diagnostics loses it (see test 34).
+    // `X()?` straight before emit_new_diagnostics loses it (see test 34).
+    // Reject `?` applied directly to the call in any position, not just the
+    // statement form `X()?;` — `if !X()? {` skips the flush just as surely.
     for call in [
         "pdf.root_handle()",
         "try_get_array_n_items()",
@@ -1398,7 +1400,7 @@ fn qtest_accessor_cases_do_not_use_explicit_pdf_resolve() {
         "try_get_utf8_value()",
     ] {
         assert!(
-            !test_51.contains(&format!("{call}?;")),
+            !test_51.contains(&format!("{call}?")),
             "test 51 must flush diagnostics before propagating `{call}`"
         );
     }
