@@ -1467,10 +1467,8 @@ fn qtest_accessor_cases_do_not_use_explicit_pdf_resolve() {
         "test 79 must use the canonical key accessor while retaining stream-copy writer behavior"
     );
     assert!(
-        test_79.contains("try_get_key(")
-            && tree_source.contains("fn chase_key")
-            && resolve_source.contains("fn resolve_once"),
-        "test 79 must retain canonical accessor usage while unrelated helper scopes remain"
+        test_79.contains("try_get_key(") && resolve_source.contains("fn resolve_once"),
+        "test 79 must retain canonical accessor usage while unrelated resolver scope remains"
     );
     let test_19 = section(
         page_source.as_str(),
@@ -1482,6 +1480,25 @@ fn qtest_accessor_cases_do_not_use_explicit_pdf_resolve() {
             && test_19.contains("newpage_handle.try_get_key(")
             && !test_19.contains(".get_key("),
         "test 19 must use the canonical resolving key accessor for both Contents lookups"
+    );
+    let test_47 = section(
+        tree_source.as_str(),
+        "pub(crate) fn run_test_47",
+        "pub(crate) fn run_test_48",
+    );
+    assert!(
+        test_47.contains("pdf.root_handle()?")
+            && test_47.matches("try_get_key(").count() >= 2
+            && test_47.contains("try_get_int_value()")
+            && !test_47.contains("root_ref()")
+            && !test_47.contains("chase_key(")
+            && !test_47.contains("pdf.resolve(")
+            && !test_47.contains("as_integer()"),
+        "test 47 must use canonical resolving root/key/integer accessors"
+    );
+    assert!(
+        !tree_source.contains("fn chase_key"),
+        "test 42-49 retains the qpdf-less chase_key helper after case47 cutover"
     );
     let test_21 = section(
         page_source.as_str(),
@@ -1590,7 +1607,7 @@ fn qtest_accessor_cases_do_not_use_explicit_pdf_resolve() {
             section(
                 tree_source.as_str(),
                 "fn tree_string_value",
-                "/// Resolve `handle`",
+                "pub(crate) fn run_test_42",
             ),
         ),
         (

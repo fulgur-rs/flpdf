@@ -21,23 +21,6 @@ fn tree_string_value(value: &ObjectHandle) -> flpdf::Result<Vec<u8>> {
     value.try_get_string_value()
 }
 
-/// Resolve `handle`, then read `key` from it — `ObjectHandle::get_key`
-/// never resolves on its own (`object_handle.rs:2769-2787`), matching
-/// `QPDFObjectHandle::getKey`'s own internal `dereference()` call
-/// (`libqpdf/QPDFObjectHandle.cc:979-990`). Returns the resolved child, so
-/// chaining two calls resolves at every hop the way qpdf's own
-/// `a.getKey("/X").getKey("/Y")` chase does.
-fn chase_key<R: Read + Seek>(
-    pdf: &mut Pdf<R>,
-    handle: &ObjectHandle,
-    key: &[u8],
-) -> flpdf::Result<ObjectHandle> {
-    pdf.resolve(handle)?;
-    let child = handle.get_key(key);
-    pdf.resolve(&child)?;
-    Ok(child)
-}
-
 pub(crate) fn run_test_42<R: Read + Seek>(
     pdf: &mut Pdf<R>,
     filename: &[u8],
@@ -815,13 +798,10 @@ pub(crate) fn run_test_47<R: Read + Seek>(
     _diagnostics_written: &mut usize,
 ) -> flpdf::Result<()> {
     // qpdf 11.9.0 qpdf/test_driver.cc:1784-1796.
-    let root_handle = match pdf.root_ref() {
-        Some(root_ref) => pdf.get_object_handle(root_ref),
-        None => ObjectHandle::null(),
-    };
-    let pages_handle = chase_key(pdf, &root_handle, b"/Pages")?;
-    let count_handle = chase_key(pdf, &pages_handle, b"/Count")?;
-    let npages = count_handle.as_integer().unwrap_or(0);
+    let root_handle = pdf.root_handle()?;
+    let pages_handle = root_handle.try_get_key(b"/Pages")?;
+    let count_handle = pages_handle.try_get_key(b"/Count")?;
+    let npages = count_handle.try_get_int_value()?;
     let mut labels = Vec::new();
     // qpdf's `npages - 1` is `long long` arithmetic with no underflow guard;
     // `checked_sub` falls back to the same "empty inclusive range" shape
@@ -1091,7 +1071,7 @@ pub(crate) fn run_test_49<R: Read + Seek>(
 #[cfg(test)]
 mod tests {
     use super::{
-        chase_key, kids_item_0_is_indirect, run_test_42, run_test_43, run_test_44, run_test_46,
+        kids_item_0_is_indirect, run_test_42, run_test_43, run_test_44, run_test_46,
         tree_string_value, write_nntree_error,
     };
     use flpdf::{AcroFormDocumentHelper, ObjectHandle, Pdf, PdfOpenOptions};
@@ -1423,8 +1403,8 @@ mod tests {
         let value = ObjectHandle::string(b"value".to_vec());
         assert_eq!(tree_string_value(&value).unwrap(), b"value");
 
-        let root = pdf.trailer_key_handle(b"Root");
-        let pages = chase_key(&mut pdf, &root, b"/Pages").expect("resolve /Pages");
+        let root = pdf.root_handle().expect("resolve /Root");
+        let pages = root.try_get_key(b"/Pages").expect("resolve /Pages");
         assert_eq!(
             pages.object_ref().map(|object_ref| object_ref.number),
             Some(2)
@@ -1726,8 +1706,8 @@ Set field value: group.child -> 3.14 \xc3\xb7 0\n"
     #[test]
     fn kids_item_probe_resolves_the_page_tree_handle_once() {
         let mut pdf = minimal_pdf();
-        let root = pdf.trailer_key_handle(b"Root");
-        let pages = chase_key(&mut pdf, &root, b"/Pages").expect("resolve /Pages");
+        let root = pdf.root_handle().expect("resolve /Root");
+        let pages = root.try_get_key(b"/Pages").expect("resolve /Pages");
         assert!(!kids_item_0_is_indirect(&pages).expect("inspect /Kids"));
     }
 

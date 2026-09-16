@@ -5,8 +5,8 @@
 `scripts/check-qpdf-route-matrix.py --check` でファイル・行範囲・識別子の実在を検証する。
 **関連:** [`docs/qpdf-correspondence.md`](../qpdf-correspondence.md)（責務対応表。本表はその上に
 「経路（route）」軸を足したもので、対応表の行を置き換えない）/ Beads `flpdf-3yn9.41`（親 epic `flpdf-3yn9`）
-**調査日:** 2026-09-16（再監査 `flpdf-3yn9.48`、文書更新 `flpdf-3yn9.48.129`）。
-現行 `origin/main=e5a988b0c7bc8483ba8a446c5118edfbf88a9077` と pinned qpdf source に基づき、領域別表の分類・責務境界・既存issueとの対応を更新した。
+**調査日:** 2026-09-16（再監査 `flpdf-3yn9.48`、文書更新 `flpdf-3yn9.48.130`）。
+現行 `origin/main=dc5108a5ecb74f3b804fa8b54ecca0dadf148338` と pinned qpdf source に基づき、領域別表の分類・責務境界・既存issueとの対応を更新した。
 160行は履歴上の行集合を維持している。今回の分類更新は全行の parity テスト合格を意味しない。
 未更新の行番号は過去snapshotを含む。
 
@@ -39,7 +39,7 @@ container-above-max だった — `flpdf-hi08` / PR #1486）。本表は残る m
 
 `scripts/check-qpdf-route-matrix.py --check` は、A〜E の160行に加えて
 E の qtest exception 表（物理98行を論理99ケースとして数える）を含む259 logical
-rowsを検証する。2026-09-16 の現行 `origin/main` (`e5a988b0c7bc8483ba8a446c5118edfbf88a9077`) を基準に、
+rowsを検証する。2026-09-16 の現行 `origin/main` (`dc5108a5ecb74f3b804fa8b54ecca0dadf148338`) を基準に、
 今回の変更を適用した tree での集計は次のとおり。
 
 | canonical | bridge | mixed | unknown | 合計 |
@@ -97,9 +97,9 @@ done | sort | uniq -c
 本表は「その責務に至る **経路が 1 本か**」を問う。✅ の行でも consumer 側に bridge が残っていれば
 本表では mixed / bridge になりうる。
 
-2026-09-16 の current-main audit anchor は `origin/main=e5a988b0c7bc8483ba8a446c5118edfbf88a9077`、pinned qpdf は
+2026-09-16 の current-main audit anchor は `origin/main=dc5108a5ecb74f3b804fa8b54ecca0dadf148338`、pinned qpdf は
 11.9.0 commit `3b97c9bd266b7c32ea36d3536e22dab77412886d` である。checker の実測は
-**今回の変更を適用した tree で** 2088 qpdf citations / 915 flpdf citations /
+**今回の変更を適用した tree で** 2095 qpdf citations / 915 flpdf citations /
 259 logical rows、分類は
 canonical 157 / mixed 102 / bridge 0 / unknown 0。A〜E の160行だけを数える
 上の領域別集計は canonical 107 / mixed 53 / bridge 0 / unknown 0 なので、checker
