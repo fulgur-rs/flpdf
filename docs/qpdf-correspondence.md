@@ -1894,6 +1894,23 @@ add/remove/copy と `--pages . 1` + add の qdf whole-file parity test で qpdf 
 chunk output を固定する。新しい attachment-specific split writer、filename rewrite、
 compatibility bridge、qpdf-deviation marker は追加しない。
 
+### Empty primary with attachment mutation (`flpdf-c3d2x`, 2026-09-16)
+
+qpdf の `Config::emptyInput` は `infilename` を null ではなく空文字列にして primary input
+の slot を消費する（`libqpdf/QPDFJob_config.cc:27-40`）。そのため `createQPDF` は
+`emptyPDF()` を作成し（`libqpdf/QPDFJob.cc:428-450,1695-1716`）、`--pages` があれば
+その foreign source を取り込んだ後、通常の `handleTransformations` で attachment mutation
+を適用する（`libqpdf/QPDFJob.cc:465-474,2138-2247`）。単一の positional は output file
+として扱われ、qpdf の `checkConfiguration` はこの empty primary を input missing とせず
+通常の output 必須判定へ進む（`libqpdf/QPDFJob.cc:567-595`）。
+
+flpdf の attachment 3 経路も、empty 時だけ positional `(input, output)` を
+`(None, output)` へ remap し、既存 `QPDFJobConfig::empty_input` と同じ empty-document
+creation boundary を使用する。非 empty の input/output 判定、page spec の source、
+attachment transformation、writer completion は変更しない。add/copy の file output、
+stdout、`--empty --pages <source> 1` の add/copy を qpdf 11.9.0 と qdf whole-file parity
+で固定し、専用の empty-document writer や sentinel は追加しない。
+
 `QPDF::initializeEncryption` (`QPDF_encryption.cc:718-751`) は、`/ID` が無い、配列でない、
 要素数が2でない、または第1要素が文字列でない場合に `invalid /ID in trailer dictionary` を
 warning として記録し、空の `id1` で暗号鍵導出を継続する。`flpdf-ez48` で

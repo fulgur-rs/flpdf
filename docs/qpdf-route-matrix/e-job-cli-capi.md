@@ -234,6 +234,15 @@ mixed へ変更したが、未照合の個別 case/API まで canonical と認�
 | E-6 | `QPDFJob::writeJSON` / `doJSON` と `doJSON*` セクション群 | `libqpdf/QPDFJob.cc:3093-3116`, `libqpdf/QPDFJob.cc:1544-1643`, `include/qpdf/QPDFJob.hh:551-565` | `crates/flpdf/src/job/lifecycle.rs::QPDFJob::write_json_with_version`（pub）と `crates/flpdf/src/job/lifecycle.rs::write_configured_json`（private） | `QPDFJob::write_json_with_version`（メソッド）prod: CLI 2、qpdf C API test bin 1、job 内 1 / test: 0 | mixed | `crates/flpdf/src/job/lifecycle.rs::QPDFJob::write_json_with_version` → `crates/flpdf/src/job/json.rs::write_json_with_version_with_logger`（`pub(crate)`） | JSON の実処理は public `QPDFJob` method から `pub(crate)` serializer へ 1 本化され、free `job/json.rs` writer 2 本は E-24 の `flpdf-xsq1` で撤去済み。セクション builder（`build_*_section`）も `pub(crate)` 化済みで、`json_inspect.rs` の compatibility re-export も撤去済み（E-25）。行全体は CLI/C API test consumer と Job の public lifecycle 境界を含むため `mixed` のまま |
 | E-7 | `QPDFJob::doInspection`（10 分岐を逐次実行し最後に 1 回だけ warning/完了） | `libqpdf/QPDFJob.cc:1645-1693` | `crates/flpdf/src/job/lifecycle.rs::run_configured_inspection`（private、`:3211`） | prod: 1 / test: 0 | mixed | `crates/flpdf/src/job/lifecycle.rs::run_configured_inspection` | 分岐順序は qpdf と 1:1で、report helperは完了せず `write_qpdf` が全分岐後に warning drain・summary・memory reportを1回だけ行う。CLIの個別 inspection public APIは別の standalone consumerとして残るため、領域全体の classification は mixed。 |
 
+2026-09-16（`flpdf-c3d2x`）: attachment mutation の top-level route も、`--empty` 時は
+`QPDFJobConfig::empty_input` を使って primary slot を明示的に消費し、single positional を
+output に remap してから E-2 create / E-3 write boundary へ渡す。これは qpdf の
+`Config::emptyInput` → `createQPDF` → `handleTransformations` → `writeQPDF` 順
+（`libqpdf/QPDFJob_config.cc:27-50`; `libqpdf/QPDFJob.cc:428-492,1695-1716,2138-2247`）
+を attachment add/copy と `--pages` foreign-source の両方で保つ。既存の empty/page
+operation Job route と同じ mapping であり、empty 専用 writer や compatibility bridge は
+追加しない。
+
 2026-09-10（`flpdf-giz3`）: top-level CLI の複数 inspection selector は、既存の
 `QPDFJob::run_configured_inspection` と同じ qpdf順の列へ接続された。
 `QPDFJob::Config` 相当の inspection setters と `inspect_configured` が、単一PDF・単一

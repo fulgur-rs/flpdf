@@ -255,6 +255,8 @@ fn split_pages_is_honored_after_add_attachment() {
                 "--add-attachment",
                 attachment.to_str().unwrap(),
                 "--key=payload",
+                "--creationdate=D:20240101000000Z",
+                "--moddate=D:20240101000000Z",
                 "--",
                 "--split-pages",
             ])
@@ -270,6 +272,8 @@ fn split_pages_is_honored_after_add_attachment() {
                 "--add-attachment",
                 attachment.to_str().unwrap(),
                 "--key=payload",
+                "--creationdate=D:20240101000000Z",
+                "--moddate=D:20240101000000Z",
                 "--",
                 "--split-pages",
             ])
@@ -380,6 +384,8 @@ fn split_pages_is_honored_after_page_selection_and_add_attachment() {
                     "--add-attachment",
                     attachment.to_str().unwrap(),
                     "--key=payload",
+                    "--creationdate=D:20240101000000Z",
+                    "--moddate=D:20240101000000Z",
                     "--",
                     "--split-pages",
                 ])
@@ -399,10 +405,292 @@ fn split_pages_is_honored_after_page_selection_and_add_attachment() {
                     "--add-attachment",
                     attachment.to_str().unwrap(),
                     "--key=payload",
+                    "--creationdate=D:20240101000000Z",
+                    "--moddate=D:20240101000000Z",
                     "--",
                     "--split-pages",
                 ])
                 .arg(flpdf_template)
+                .output()
+                .unwrap();
+            (qpdf, flpdf)
+        },
+    );
+}
+
+/// Compare an attachment mutation whose primary input is qpdf's empty
+/// document. The single positional after the attachment segment is the output
+/// path, and qpdf writes the same bytes whether the page source is absent or
+/// supplied through `--pages`.
+fn assert_empty_attachment_parity<F>(label: &str, run: F)
+where
+    F: FnOnce(&Path, &Path) -> (std::process::Output, std::process::Output),
+{
+    if !support::is_qpdf_available() {
+        eprintln!("{label}: qpdf not available, skipping");
+        return;
+    }
+
+    let temp = tempfile::tempdir().unwrap();
+    let qpdf_output = temp.path().join("qpdf.pdf");
+    let flpdf_output = temp.path().join("flpdf.pdf");
+    let (qpdf, flpdf) = run(&qpdf_output, &flpdf_output);
+
+    assert!(
+        qpdf.status.success(),
+        "{label}: qpdf empty attachment oracle failed: stdout={} stderr={}",
+        String::from_utf8_lossy(&qpdf.stdout),
+        String::from_utf8_lossy(&qpdf.stderr)
+    );
+    assert!(
+        flpdf.status.success(),
+        "{label}: flpdf empty attachment route failed: stdout={} stderr={}",
+        String::from_utf8_lossy(&flpdf.stdout),
+        String::from_utf8_lossy(&flpdf.stderr)
+    );
+    assert!(
+        qpdf_output.is_file(),
+        "{label}: qpdf must write {qpdf_output:?}"
+    );
+    assert!(
+        flpdf_output.is_file(),
+        "{label}: flpdf must write {flpdf_output:?}"
+    );
+    assert_eq!(
+        std::fs::read(qpdf_output).unwrap(),
+        std::fs::read(flpdf_output).unwrap(),
+        "{label}: empty attachment output must match qpdf"
+    );
+}
+
+#[test]
+fn empty_input_add_attachment_writes_qpdf_compatible_output() {
+    let attachment = Path::new(env!("CARGO_MANIFEST_DIR"))
+        .join("../../tests/fixtures/compat/external-file-stream.bin");
+    assert_empty_attachment_parity("empty-add-attachment", |qpdf_output, flpdf_output| {
+        let qpdf = ShellCommand::new("qpdf")
+            .args([
+                "--empty",
+                "--static-id",
+                "--qdf",
+                "--add-attachment",
+                attachment.to_str().unwrap(),
+                "--key=payload",
+                "--creationdate=D:20240101000000Z",
+                "--moddate=D:20240101000000Z",
+                "--",
+            ])
+            .arg(qpdf_output)
+            .output()
+            .unwrap();
+        let flpdf = CargoCommand::cargo_bin("flpdf")
+            .unwrap()
+            .args([
+                "--empty",
+                "--static-id",
+                "--qdf",
+                "--add-attachment",
+                attachment.to_str().unwrap(),
+                "--key=payload",
+                "--creationdate=D:20240101000000Z",
+                "--moddate=D:20240101000000Z",
+                "--",
+            ])
+            .arg(flpdf_output)
+            .output()
+            .unwrap();
+        (qpdf, flpdf)
+    });
+}
+
+#[test]
+fn empty_input_add_attachment_to_stdout_matches_qpdf() {
+    let attachment = Path::new(env!("CARGO_MANIFEST_DIR"))
+        .join("../../tests/fixtures/compat/external-file-stream.bin");
+    if !support::is_qpdf_available() {
+        eprintln!(
+            "empty_input_add_attachment_to_stdout_matches_qpdf: qpdf not available, skipping"
+        );
+        return;
+    }
+
+    let qpdf = ShellCommand::new("qpdf")
+        .args([
+            "--empty",
+            "--static-id",
+            "--qdf",
+            "--add-attachment",
+            attachment.to_str().unwrap(),
+            "--key=payload",
+            "--creationdate=D:20240101000000Z",
+            "--moddate=D:20240101000000Z",
+            "--",
+            "-",
+        ])
+        .output()
+        .unwrap();
+    let flpdf = CargoCommand::cargo_bin("flpdf")
+        .unwrap()
+        .args([
+            "--empty",
+            "--static-id",
+            "--qdf",
+            "--add-attachment",
+            attachment.to_str().unwrap(),
+            "--key=payload",
+            "--creationdate=D:20240101000000Z",
+            "--moddate=D:20240101000000Z",
+            "--",
+            "-",
+        ])
+        .output()
+        .unwrap();
+
+    assert!(
+        qpdf.status.success(),
+        "qpdf empty attachment stdout oracle failed: {}",
+        String::from_utf8_lossy(&qpdf.stderr)
+    );
+    assert!(
+        flpdf.status.success(),
+        "flpdf empty attachment stdout route failed: stdout={} stderr={}",
+        String::from_utf8_lossy(&flpdf.stdout),
+        String::from_utf8_lossy(&flpdf.stderr)
+    );
+    assert_eq!(
+        qpdf.stdout, flpdf.stdout,
+        "empty add-attachment stdout must match qpdf"
+    );
+}
+
+#[test]
+fn empty_input_copy_attachments_writes_qpdf_compatible_output() {
+    let donor = Path::new(env!("CARGO_MANIFEST_DIR"))
+        .join("../../tests/fixtures/compat/attachment-two-page.pdf");
+    assert_empty_attachment_parity("empty-copy-attachments", |qpdf_output, flpdf_output| {
+        let qpdf = ShellCommand::new("qpdf")
+            .args([
+                "--empty",
+                "--static-id",
+                "--qdf",
+                "--copy-attachments-from",
+                donor.to_str().unwrap(),
+                "--prefix=P",
+                "--",
+            ])
+            .arg(qpdf_output)
+            .output()
+            .unwrap();
+        let flpdf = CargoCommand::cargo_bin("flpdf")
+            .unwrap()
+            .args([
+                "--empty",
+                "--static-id",
+                "--qdf",
+                "--copy-attachments-from",
+                donor.to_str().unwrap(),
+                "--prefix=P",
+                "--",
+            ])
+            .arg(flpdf_output)
+            .output()
+            .unwrap();
+        (qpdf, flpdf)
+    });
+}
+
+#[test]
+fn empty_pages_add_attachment_writes_qpdf_compatible_output() {
+    let source =
+        Path::new(env!("CARGO_MANIFEST_DIR")).join("../../tests/fixtures/compat/two-page.pdf");
+    let attachment = Path::new(env!("CARGO_MANIFEST_DIR"))
+        .join("../../tests/fixtures/compat/external-file-stream.bin");
+    assert_empty_attachment_parity("empty-pages-add-attachment", |qpdf_output, flpdf_output| {
+        let qpdf = ShellCommand::new("qpdf")
+            .args([
+                "--empty",
+                "--static-id",
+                "--qdf",
+                "--pages",
+                source.to_str().unwrap(),
+                "1",
+                "--",
+                "--add-attachment",
+                attachment.to_str().unwrap(),
+                "--key=payload",
+                "--creationdate=D:20240101000000Z",
+                "--moddate=D:20240101000000Z",
+                "--",
+            ])
+            .arg(qpdf_output)
+            .output()
+            .unwrap();
+        let flpdf = CargoCommand::cargo_bin("flpdf")
+            .unwrap()
+            .args([
+                "--empty",
+                "--static-id",
+                "--qdf",
+                "--pages",
+                source.to_str().unwrap(),
+                "1",
+                "--",
+                "--add-attachment",
+                attachment.to_str().unwrap(),
+                "--key=payload",
+                "--creationdate=D:20240101000000Z",
+                "--moddate=D:20240101000000Z",
+                "--",
+            ])
+            .arg(flpdf_output)
+            .output()
+            .unwrap();
+        (qpdf, flpdf)
+    });
+}
+
+#[test]
+fn empty_pages_copy_attachments_writes_qpdf_compatible_output() {
+    let source =
+        Path::new(env!("CARGO_MANIFEST_DIR")).join("../../tests/fixtures/compat/two-page.pdf");
+    let donor = Path::new(env!("CARGO_MANIFEST_DIR"))
+        .join("../../tests/fixtures/compat/attachment-two-page.pdf");
+    assert_empty_attachment_parity(
+        "empty-pages-copy-attachments",
+        |qpdf_output, flpdf_output| {
+            let qpdf = ShellCommand::new("qpdf")
+                .args([
+                    "--empty",
+                    "--static-id",
+                    "--qdf",
+                    "--pages",
+                    source.to_str().unwrap(),
+                    "1",
+                    "--",
+                    "--copy-attachments-from",
+                    donor.to_str().unwrap(),
+                    "--prefix=P",
+                    "--",
+                ])
+                .arg(qpdf_output)
+                .output()
+                .unwrap();
+            let flpdf = CargoCommand::cargo_bin("flpdf")
+                .unwrap()
+                .args([
+                    "--empty",
+                    "--static-id",
+                    "--qdf",
+                    "--pages",
+                    source.to_str().unwrap(),
+                    "1",
+                    "--",
+                    "--copy-attachments-from",
+                    donor.to_str().unwrap(),
+                    "--prefix=P",
+                    "--",
+                ])
+                .arg(flpdf_output)
                 .output()
                 .unwrap();
             (qpdf, flpdf)
