@@ -773,6 +773,51 @@ fn job_json_file_missing_reports_job_json_context_and_usage() {
     assert_eq!(flpdf.stderr, qpdf.stderr);
 }
 
+#[cfg(target_os = "linux")]
+#[test]
+fn job_json_file_directory_keeps_the_portable_flpdf_diagnostic() {
+    if !qpdf_available() {
+        return;
+    }
+
+    let directory = tempfile::tempdir().unwrap();
+    let argument = format!("--job-json-file={}", directory.path().display());
+
+    let qpdf = ProcessCommand::new("/usr/bin/qpdf")
+        .current_dir(directory.path())
+        .arg(&argument)
+        .output()
+        .unwrap();
+    let flpdf = Command::cargo_bin("flpdf")
+        .unwrap()
+        .current_dir(directory.path())
+        .env("FLPDF_PROGNAME", "qpdf")
+        .arg(&argument)
+        .output()
+        .unwrap();
+
+    assert_eq!(qpdf.status.code(), Some(2));
+    assert_eq!(flpdf.status.code(), Some(2));
+    assert_eq!(flpdf.stdout, qpdf.stdout);
+    assert_ne!(flpdf.stderr, qpdf.stderr);
+    assert!(
+        qpdf.stderr
+            .windows(b"basic_string::_M_create".len())
+            .any(|window| window == b"basic_string::_M_create"),
+        "qpdf's directory diagnostic should expose the libstdc++ artifact: {:?}",
+        qpdf.stderr
+    );
+    let flpdf_stderr = String::from_utf8(flpdf.stderr).unwrap();
+    assert!(
+        flpdf_stderr.contains(&format!(
+            "error with job-json file {}: open {}: Is a directory",
+            directory.path().display(),
+            directory.path().display()
+        )),
+        "flpdf should retain its portable directory diagnostic: {flpdf_stderr}"
+    );
+}
+
 #[test]
 fn job_json_file_show_npages_matches_qpdf_without_output_file() {
     if !qpdf_available() {
