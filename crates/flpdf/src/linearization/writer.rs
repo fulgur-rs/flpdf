@@ -3162,6 +3162,8 @@ type SecondHalfPlainObject = (QpdfObjGen, SecondHalfPlainRank);
 
 fn second_half_container_anchors(
     plan: &LinearizationPlan,
+    open_document_batches: &[RoutedObjStmBatch],
+    first_half_batches: &[RoutedObjStmBatch],
     part4_batches: &[RoutedObjStmBatch],
     source_container_by_member: &BTreeMap<u32, u32>,
 ) -> Vec<SecondHalfContainerAnchor> {
@@ -3175,8 +3177,14 @@ fn second_half_container_anchors(
     } else {
         source_container_by_member
     };
-    let member_set: BTreeSet<QpdfObjGen> = part4_batches
+    // Exclude members of every routed batch. A first-half member can also
+    // appear in a later-page closure used to derive an anchor, but it is not a
+    // plain second-half object and must not become the anchor for a Part-7
+    // container (qpdf's global even split assigns the container's route once).
+    let member_set: BTreeSet<QpdfObjGen> = open_document_batches
         .iter()
+        .chain(first_half_batches)
+        .chain(part4_batches)
         .flat_map(|batch| batch.members.iter().copied())
         .filter_map(|object_ref| QpdfObjGen::try_from_object_ref(object_ref).ok())
         .collect();
@@ -3862,6 +3870,8 @@ fn write_linearized_impl<R: Read + Seek>(
     // container's group is the last one (the single-second-half-container case).
     let second_half_anchors = second_half_container_anchors(
         plan,
+        &resolved_batch_plan.open_document_batches,
+        &resolved_batch_plan.part3_batches,
         &resolved_batch_plan.part4_batches,
         &source_container_by_member,
     );
@@ -5271,10 +5281,52 @@ mod tests {
             source_container_number: None,
         }];
 
-        let anchors = second_half_container_anchors(&plan, &batches, &BTreeMap::new());
+        let anchors = second_half_container_anchors(&plan, &[], &[], &batches, &BTreeMap::new());
         assert_eq!(
             anchors,
             vec![SecondHalfContainerAnchor::After(QpdfObjGen::new(2, 0))]
+        );
+    }
+
+    #[test]
+    fn second_half_anchor_ignores_members_routed_to_the_first_half() {
+        let page = ObjectRef::new(2, 0);
+        let plain = ObjectRef::new(3, 0);
+        let first_half_member = ObjectRef::new(4, 0);
+        let second_half_member = ObjectRef::new(5, 0);
+        let plan = LinearizationPlan {
+            page_hints: vec![
+                crate::linearization::plan::PageHintEntry::placeholder(ObjectRef::new(1, 0)),
+                crate::linearization::plan::PageHintEntry::placeholder(page),
+            ],
+            per_page_private_objects: vec![
+                vec![],
+                vec![page, plain, first_half_member, second_half_member],
+            ],
+            ..LinearizationPlan::default()
+        };
+        let first_half_batches = vec![RoutedObjStmBatch {
+            members: vec![first_half_member],
+            route: ContainerPart::FirstPagePrivate,
+            source_container_number: None,
+        }];
+        let second_half_batches = vec![RoutedObjStmBatch {
+            members: vec![second_half_member],
+            route: ContainerPart::OtherPagePrivate,
+            source_container_number: None,
+        }];
+
+        let anchors = second_half_container_anchors(
+            &plan,
+            &[],
+            &first_half_batches,
+            &second_half_batches,
+            &BTreeMap::new(),
+        );
+
+        assert_eq!(
+            anchors,
+            vec![SecondHalfContainerAnchor::After(QpdfObjGen::new(3, 0))]
         );
     }
 
@@ -5302,7 +5354,7 @@ mod tests {
             },
         ];
 
-        let anchors = second_half_container_anchors(&plan, &batches, &BTreeMap::new());
+        let anchors = second_half_container_anchors(&plan, &[], &[], &batches, &BTreeMap::new());
         assert_eq!(
             anchors,
             vec![

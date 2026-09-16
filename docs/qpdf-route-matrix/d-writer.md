@@ -779,7 +779,10 @@ part7/part9 の category 間ではその順をそのまま使えない。
 shared thumbnail は `others > 0` でも qpdf の `thumbs > 1` 分類を優先する。
 plain thumbnail streamも同じ分類で pre/post-container を決める。
 `second_half_container_anchors` と `RenumberMap::place_objstm_members_per_half` は
-この batch 順を plain object の配置へ反映する。`objstm-lin-otherpage-pages-200-100` は
+この batch 順を plain object の配置へ反映する。anchor候補からは second-half batchだけで
+なく open-document/first-halfを含む全 routed ObjStm memberを除外し、first-page側の member
+が later-page closure に現れても plain peer と誤認しない（`flpdf-0msjh`）。
+`objstm-lin-otherpage-pages-200-100` は
 異なる非先頭 page の part7 containerを
 固定し、`objstm-lin-otherpage-private-250-0` は同一 page の複数 part7、
 `objstm-lin-outlines-multi-1-250` は同一 part9 category内の複数 containerを固定する。
