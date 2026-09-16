@@ -3160,6 +3160,36 @@ fn qpdf_object_number(object_gen: QpdfObjGen) -> u32 {
 type SecondHalfPlainRank = (u8, usize, u8, u32);
 type SecondHalfPlainObject = (QpdfObjGen, SecondHalfPlainRank);
 
+/// Rank one plain Part-9 object for container-anchor placement.
+///
+/// qpdf places the complete `/Pages` user set at the head of part9 — ahead of
+/// private thumbnails, shared thumbnails, outlines and the remaining
+/// `lc_other` set — by erasing each page-tree node from `lc_other` and pushing
+/// it first (`QPDF_linearization.cc:1279-1290`). A page-tree node therefore
+/// sorts ahead of every other Part-9 entry, including a preserved ObjStm
+/// container whose source object number happens to be lower. The head rank
+/// mirrors the one `second_half_container_anchors` already gives a preserved
+/// container that carries the `/Pages` user set itself.
+fn part9_plain_rank(
+    object_gen: QpdfObjGen,
+    part9_pages: &BTreeSet<ObjectRef>,
+    category: u8,
+    page: u32,
+) -> SecondHalfPlainRank {
+    if object_gen
+        .to_object_ref()
+        .is_some_and(|object_ref| part9_pages.contains(&object_ref))
+    {
+        return (2, 0, 0, 0);
+    }
+    (
+        2 + category,
+        page as usize,
+        0,
+        qpdf_object_number(object_gen),
+    )
+}
+
 fn second_half_container_anchors(
     plan: &LinearizationPlan,
     open_document_batches: &[RoutedObjStmBatch],
@@ -3259,12 +3289,7 @@ fn second_half_container_anchors(
                 };
                 plain_ranked.push((
                     object_gen,
-                    (
-                        2 + category,
-                        page as usize,
-                        0,
-                        qpdf_object_number(object_gen),
-                    ),
+                    part9_plain_rank(object_gen, &part9_pages, category, page),
                 ));
             }
         }
@@ -3291,25 +3316,19 @@ fn second_half_container_anchors(
             let object_gen = QpdfObjGen::try_from_object_ref(object_ref)
                 .expect("checked Part-9 object must fit qpdf raw identity");
             if !member_set.contains(&object_gen) && !source_container_set.contains(&object_gen) {
-                if generate_batches {
+                let (category, page) = if generate_batches {
                     let optimization = plan
                         .optimization
                         .as_ref()
                         .expect("generated ObjStm batches require optimization users");
-                    let (category, page) =
-                        part9_category_order_key(optimization, &part9_pages, [&object_ref]);
-                    plain_ranked.push((
-                        object_gen,
-                        (
-                            2 + category,
-                            page as usize,
-                            0,
-                            qpdf_object_number(object_gen),
-                        ),
-                    ));
+                    part9_category_order_key(optimization, &part9_pages, [&object_ref])
                 } else {
-                    plain_ranked.push((object_gen, (2, 0, 0, qpdf_object_number(object_gen))));
-                }
+                    (0, 0)
+                };
+                plain_ranked.push((
+                    object_gen,
+                    part9_plain_rank(object_gen, &part9_pages, category, page),
+                ));
             }
         }
     }
