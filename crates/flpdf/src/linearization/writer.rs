@@ -3160,6 +3160,26 @@ fn qpdf_object_number(object_gen: QpdfObjGen) -> u32 {
 type SecondHalfPlainRank = (u8, usize, u8, u32);
 type SecondHalfPlainObject = (QpdfObjGen, SecondHalfPlainRank);
 
+/// Classify one plain Part-9 object when preserve mode leaves no optimization
+/// users to consult.
+///
+/// qpdf's part-9 order is the page-tree set, then thumbnails, then outlines,
+/// then the remaining `lc_other` set (`QPDF_linearization.cc:1279-1340`).
+/// Without optimization users only the first and last of those can be told
+/// apart, which is the distinction the head promotion needs: a page-tree node
+/// takes the head category and everything else takes the catch-all category
+/// `part9_category_order_key` gives the remaining set.
+fn preserve_part9_category(object_gen: QpdfObjGen, part9_pages: &BTreeSet<ObjectRef>) -> (u8, u32) {
+    if object_gen
+        .to_object_ref()
+        .is_some_and(|object_ref| part9_pages.contains(&object_ref))
+    {
+        (0, 0)
+    } else {
+        (4, 0)
+    }
+}
+
 /// Rank one plain Part-9 object for container-anchor placement.
 ///
 /// qpdf places the complete `/Pages` user set at the head of part9 — ahead of
@@ -3186,7 +3206,7 @@ fn part9_plain_rank(
             .to_object_ref()
             .is_some_and(|object_ref| part9_pages.contains(&object_ref))
     {
-        return (2, 0, 0, 0);
+        return (2, 0, 0, qpdf_object_number(object_gen));
     }
     (
         2 + category,
@@ -3291,7 +3311,7 @@ fn second_half_container_anchors(
                         })
                         .unwrap_or((0, 0))
                 } else {
-                    (0, 0)
+                    preserve_part9_category(object_gen, &part9_pages)
                 };
                 plain_ranked.push((
                     object_gen,
@@ -3329,7 +3349,7 @@ fn second_half_container_anchors(
                         .expect("generated ObjStm batches require optimization users");
                     part9_category_order_key(optimization, &part9_pages, [&object_ref])
                 } else {
-                    (0, 0)
+                    preserve_part9_category(object_gen, &part9_pages)
                 };
                 plain_ranked.push((
                     object_gen,
@@ -3412,10 +3432,13 @@ fn second_half_container_anchors(
                 {
                     // qpdf places the complete /Pages user set before the
                     // remaining lc_other set. If that user set is folded into
-                    // a preserved ObjStm, the container inherits the same
-                    // head position rather than sorting by its source object
-                    // number (QPDF_linearization.cc:1286-1290).
-                    (2, 0, 0, 0)
+                    // a preserved ObjStm, the container joins the head group
+                    // rather than the remaining set, and keeps its source
+                    // object number as the within-group key: qpdf walks the
+                    // page-tree set as a std::set<QPDFObjGen>, so the head
+                    // group stays in source order
+                    // (QPDF_linearization.cc:1281-1290).
+                    (2, 0, 0, object_number)
                 }
                 ContainerPart::Rest if generate_batches => {
                     let optimization = plan
@@ -3426,7 +3449,11 @@ fn second_half_container_anchors(
                         part9_category_order_key(optimization, &part9_pages, batch.members.iter());
                     (2 + category, page as usize, 1, object_number)
                 }
-                ContainerPart::Rest => (2, 0, 0, object_number),
+                // Preserve mode has no optimization users to classify with, so
+                // a container that carries no page-tree member belongs to the
+                // remaining `lc_other` set — the same tier the plain objects in
+                // that set get from `part9_category_order_key`'s catch-all arm.
+                ContainerPart::Rest => (2 + 4, 0, 0, object_number),
                 // cov:ignore-start: first-half routes cannot enter resolved second-half batches
                 ContainerPart::OpenDocument
                 | ContainerPart::FirstPagePrivate

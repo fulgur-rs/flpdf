@@ -312,6 +312,140 @@ else
     echo "Skipping objstm-lin-part9-head-anchor.pdf (already exists)"
 fi
 
+if [[ ! -f "$FIX/objstm-lin-part9-head-tiebreak.pdf" ]]; then
+    echo "Generating objstm-lin-part9-head-tiebreak.pdf ..."
+    # Nested page tree whose intermediate /Pages node (obj 6) lives inside a
+    # preserved object stream (obj 2) while the root /Pages node (obj 8) stays
+    # plain. qpdf walks the page-tree user set as a std::set<QPDFObjGen> and
+    # writes it at the head of part 9 (QPDF_linearization.cc:1281-1290), so the
+    # container holding obj 6 precedes the root node. Collapsing the head group
+    # to one rank loses that source order and swaps the two.
+    python3 - "$FIX/objstm-lin-part9-head-tiebreak.pdf" <<'PY'
+import struct
+import sys
+import zlib
+
+out = bytearray()
+offsets = {}
+
+
+def add(num, body):
+    offsets[num] = len(out)
+    out.extend(b"%d 0 obj\n" % num)
+    out.extend(body)
+    out.extend(b"\nendobj\n")
+
+
+def stream(dic, data):
+    return b"<< " + dic + b" /Length %d >>\nstream\n" % len(data) + data + b"\nendstream"
+
+
+out.extend(b"%PDF-1.5\n%\xe2\xe3\xcf\xd3\n")
+add(1, stream(b"/Type /Foo", b"marker-one"))
+m6 = b"<< /Type /Pages /Parent 8 0 R /Kids [5 0 R] /Count 1 >>"
+m7 = b"<< /Type /Foo /Marker (seven) >>"
+pairs = b"6 0 7 %d " % (len(m6) + 1)
+add(2, stream(b"/Type /ObjStm /N 2 /First %d" % len(pairs), pairs + m6 + b" " + m7))
+add(4, b"<< /Type /Catalog /Pages 8 0 R /B 7 0 R /C 1 0 R >>")
+add(5, b"<< /Type /Page /Parent 6 0 R /MediaBox [0 0 10 10] /Contents 9 0 R >>")
+add(8, b"<< /Type /Pages /Kids [6 0 R] /Count 1 >>")
+add(9, stream(b"", b"BT ET"))
+
+xref_offset = len(out)
+offsets[3] = xref_offset
+size = 10
+rows = bytearray()
+for number in range(size):
+    if number in (6, 7):
+        rows += bytes([2]) + struct.pack(">I", 2) + bytes([number - 6])
+    elif number in offsets:
+        rows += bytes([1]) + struct.pack(">I", offsets[number]) + bytes([0])
+    else:
+        rows += bytes([0]) + struct.pack(">I", 0) + bytes([255])
+compressed = zlib.compress(bytes(rows), 9)
+out.extend(b"3 0 obj\n")
+out.extend(
+    b"<< /Type /XRef /Size %d /W [1 4 1] /Root 4 0 R /Filter /FlateDecode /Length %d >>\nstream\n"
+    % (size, len(compressed))
+)
+out.extend(compressed)
+out.extend(b"\nendstream\nendobj\n")
+out.extend(b"startxref\n%d\n%%%%EOF\n" % xref_offset)
+open(sys.argv[1], "wb").write(bytes(out))
+PY
+else
+    echo "Skipping objstm-lin-part9-head-tiebreak.pdf (already exists)"
+fi
+
+if [[ ! -f "$FIX/objstm-lin-part9-head-container-order.pdf" ]]; then
+    echo "Generating objstm-lin-part9-head-container-order.pdf ..."
+    # Two-branch page tree whose head group straddles the preserved container:
+    # plain /Pages nodes are obj 5 and obj 12, and the container (obj 7) holds
+    # the third node (obj 6). qpdf's std::set walk emits 5, then the container,
+    # then 12, so the container needs its own source number as the within-group
+    # key rather than a single collapsed head rank.
+    python3 - "$FIX/objstm-lin-part9-head-container-order.pdf" <<'PY'
+import struct
+import sys
+import zlib
+
+out = bytearray()
+offsets = {}
+
+
+def add(num, body):
+    offsets[num] = len(out)
+    out.extend(b"%d 0 obj\n" % num)
+    out.extend(body)
+    out.extend(b"\nendobj\n")
+
+
+def stream(dic, data):
+    return b"<< " + dic + b" /Length %d >>\nstream\n" % len(data) + data + b"\nendstream"
+
+
+out.extend(b"%PDF-1.5\n%\xe2\xe3\xcf\xd3\n")
+add(1, stream(b"/Type /Foo", b"marker-one"))
+add(4, b"<< /Type /Catalog /Pages 12 0 R /B 8 0 R /C 1 0 R >>")
+add(5, b"<< /Type /Pages /Parent 12 0 R /Kids [9 0 R] /Count 1 >>")
+m6 = b"<< /Type /Pages /Parent 12 0 R /Kids [10 0 R] /Count 1 >>"
+m8 = b"<< /Type /Foo /Marker (eight) >>"
+pairs = b"6 0 8 %d " % (len(m6) + 1)
+add(7, stream(b"/Type /ObjStm /N 2 /First %d" % len(pairs), pairs + m6 + b" " + m8))
+add(9, b"<< /Type /Page /Parent 5 0 R /MediaBox [0 0 10 10] /Contents 11 0 R >>")
+add(10, b"<< /Type /Page /Parent 6 0 R /MediaBox [0 0 10 10] /Contents 13 0 R >>")
+add(11, stream(b"", b"BT ET"))
+add(12, b"<< /Type /Pages /Kids [5 0 R 6 0 R] /Count 2 >>")
+add(13, stream(b"", b"BT ET"))
+
+xref_offset = len(out)
+offsets[3] = xref_offset
+size = 14
+rows = bytearray()
+for number in range(size):
+    if number == 6:
+        rows += bytes([2]) + struct.pack(">I", 7) + bytes([0])
+    elif number == 8:
+        rows += bytes([2]) + struct.pack(">I", 7) + bytes([1])
+    elif number in offsets:
+        rows += bytes([1]) + struct.pack(">I", offsets[number]) + bytes([0])
+    else:
+        rows += bytes([0]) + struct.pack(">I", 0) + bytes([255])
+compressed = zlib.compress(bytes(rows), 9)
+out.extend(b"3 0 obj\n")
+out.extend(
+    b"<< /Type /XRef /Size %d /W [1 4 1] /Root 4 0 R /Filter /FlateDecode /Length %d >>\nstream\n"
+    % (size, len(compressed))
+)
+out.extend(compressed)
+out.extend(b"\nendstream\nendobj\n")
+out.extend(b"startxref\n%d\n%%%%EOF\n" % xref_offset)
+open(sys.argv[1], "wb").write(bytes(out))
+PY
+else
+    echo "Skipping objstm-lin-part9-head-container-order.pdf (already exists)"
+fi
+
 if [[ ! -f "$FIX/missing-trailer-info.pdf" ]]; then
     echo "Generating missing-trailer-info.pdf ..."
     # flpdf-4vpi: malformed single-page input whose trailer references a missing
@@ -2281,6 +2415,26 @@ qpdf --linearize --deterministic-id --warning-exit-0 \
     "$REF/objstm-lin-part9-head-anchor/linearize.pdf"
 echo "objstm-lin-part9-head-anchor/linearize.pdf"
 qpdf --check-linearization "$REF/objstm-lin-part9-head-anchor/linearize.pdf"
+
+# --- objstm-lin-part9-head-tiebreak: the page-tree head group holds both a
+# preserved container (obj 2, carrying the intermediate /Pages node obj 6) and
+# the plain root node (obj 8), so the group needs its source-number order. ---
+mkdir -p "$REF/objstm-lin-part9-head-tiebreak"
+qpdf --linearize --deterministic-id --warning-exit-0 \
+    "$FIX/objstm-lin-part9-head-tiebreak.pdf" \
+    "$REF/objstm-lin-part9-head-tiebreak/linearize.pdf"
+echo "objstm-lin-part9-head-tiebreak/linearize.pdf"
+qpdf --check-linearization "$REF/objstm-lin-part9-head-tiebreak/linearize.pdf"
+
+# --- objstm-lin-part9-head-container-order: plain page-tree nodes on both
+# sides of the preserved container, so the container's own source number
+# decides where it lands inside the head group. ---
+mkdir -p "$REF/objstm-lin-part9-head-container-order"
+qpdf --linearize --deterministic-id --warning-exit-0 \
+    "$FIX/objstm-lin-part9-head-container-order.pdf" \
+    "$REF/objstm-lin-part9-head-container-order/linearize.pdf"
+echo "objstm-lin-part9-head-container-order/linearize.pdf"
+qpdf --check-linearization "$REF/objstm-lin-part9-head-container-order/linearize.pdf"
 
 # --- linearize-indirect-extensions: qpdf's prepareFileForWrite directizes an
 # indirect Catalog /Extensions dictionary before optimization, then the
