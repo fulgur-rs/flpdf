@@ -3341,6 +3341,20 @@ fn main() {
         usage_exit(&no_output_file_for_inspection_error());
     }
 
+    // qpdf registers --json-output with the choices {2, latest}
+    // (`auto_job_init.hh:23,127`), so its argument parser rejects an
+    // out-of-set value before any route runs. Check it here, ahead of the
+    // dispatch below, so a mixed invocation such as
+    // `--json-output=1 --replace-input` still reports the choice error rather
+    // than the route's own conflict.
+    if let Some(version) = args.json_output.as_deref() {
+        if !matches!(version, "2" | "latest") {
+            usage_exit(&UsageError::new(
+                "--json-output must be given as --json-output={2,latest}",
+            ));
+        }
+    }
+
     let attachment_mutation_requested = !attachment_segments.is_empty()
         || !args.remove_attachment.is_empty()
         || !args.copy_attachments_from.is_empty();
@@ -4396,17 +4410,6 @@ fn run_json(
     ];
 
     let json_output_mode = cli.json_output.is_some();
-    // qpdf registers --json-output with the choices {2, latest}
-    // (`auto_job_init.hh:23,127`), so an out-of-set value is rejected by the
-    // argument parser with its "must be given as" wording rather than by a
-    // later semantic check.
-    if let Some(version) = cli.json_output.as_deref() {
-        if !matches!(version, "2" | "latest") {
-            usage_exit(&UsageError::new(
-                "--json-output must be given as --json-output={2,latest}",
-            ));
-        }
-    }
     let json_version = cli
         .json_output
         .as_deref()

@@ -2407,13 +2407,21 @@ fn json_usage_errors_match_qpdf_usage_exit() {
     let input_path = temp.path().join("input.pdf");
     std::fs::write(&input_path, one_page_pdf_with_stream()).unwrap();
 
+    // The last two mix an invalid `--json-output` with a route that dispatches
+    // before the JSON one, so they also pin that the choice error wins over
+    // `--replace-input`'s conflict and over opening the job-JSON file.
     for args in [
-        ["--json=1", "--json-key=qpdf"],
-        ["--json=2", "--json-key=objects"],
-        ["--json-output=1", "--json=2"],
+        vec!["--json=1", "--json-key=qpdf"],
+        vec!["--json=2", "--json-key=objects"],
+        vec!["--json-output=1", "--json=2"],
+        vec!["--json-output=1", "--replace-input"],
+        vec![
+            "--json-output=1",
+            "--job-json-file=/definitely/missing.json",
+        ],
     ] {
         let expected = ShellCommand::new("qpdf")
-            .args(args)
+            .args(&args)
             .arg(&input_path)
             .output()
             .expect("qpdf runs");
@@ -2426,7 +2434,7 @@ fn json_usage_errors_match_qpdf_usage_exit() {
         let actual = Command::cargo_bin("flpdf")
             .unwrap()
             .env("FLPDF_PROGNAME", "qpdf")
-            .args(args)
+            .args(&args)
             .arg(&input_path)
             .output()
             .unwrap();
