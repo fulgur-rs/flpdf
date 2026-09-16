@@ -108,73 +108,6 @@ fn root_handle<R: Read + Seek>(
     Ok(resolved)
 }
 
-/// `QPDF::getExtensionLevel` (`libqpdf/QPDF.cc:2328-2346`): walk
-/// `/Extensions /ADBE /ExtensionLevel` from `root`, resolving indirect
-/// references at each step, defaulting to `0` whenever a link in that chain
-/// is absent or the wrong type. This does not reuse the canonical
-/// `Pdf::get_extension_level`/`Pdf::adobe_extension_level`: those walk the
-/// same chain through plain `try_get_key`/`resolve` calls without emitting
-/// this driver's own per-hop diagnostics (`resolved_key`'s
-/// `emit_new_diagnostics` call after each dereference, mirroring qpdf's
-/// synchronous per-dereference warning emission to stderr). This function's
-/// own first hop is `run_test_34`'s only diagnostics-emitting read of this
-/// chain, so it keeps that fidelity; `run_test_34` reuses its result rather
-/// than re-deriving the extension level from the canonical method for the
-/// `As PDFVersion:` line below.
-#[allow(clippy::too_many_arguments)]
-fn catalog_extension_level<R: Read + Seek>(
-    pdf: &mut Pdf<R>,
-    root: &ObjectHandle,
-    filename: &[u8],
-    diagnostics_written: &mut usize,
-    stdout: &mut dyn Write,
-    stderr: &mut dyn Write,
-) -> flpdf::Result<i64> {
-    let extensions = resolved_key(
-        pdf,
-        root,
-        b"/Extensions",
-        filename,
-        diagnostics_written,
-        stdout,
-        stderr,
-    )?;
-    if extensions.as_dictionary().is_none() {
-        return Ok(0);
-    }
-    let adbe = resolved_key(
-        pdf,
-        &extensions,
-        b"/ADBE",
-        filename,
-        diagnostics_written,
-        stdout,
-        stderr,
-    )?;
-    if adbe.as_dictionary().is_none() {
-        return Ok(0);
-    }
-    let level = resolved_key(
-        pdf,
-        &adbe,
-        b"/ExtensionLevel",
-        filename,
-        diagnostics_written,
-        stdout,
-        stderr,
-    )?;
-    // qpdf reads this with `getIntValueAsInt()`, which clamps an
-    // out-of-`int`-range value to `INT_MIN`/`INT_MAX` (and warns) rather
-    // than keeping the full 64-bit value (`QPDFObjectHandle::getIntValueAsInt`,
-    // `libqpdf/QPDFObjectHandle.cc:527-542`); the clamp is reproduced here
-    // (matching `Pdf::get_extension_level`'s own clamp), but the
-    // accompanying `warnIfPossible` is not.
-    Ok(level
-        .as_integer()
-        .map(|value| value.clamp(i64::from(i32::MIN), i64::from(i32::MAX)))
-        .unwrap_or(0))
-}
-
 /// `QUtil::hex_encode` (`libqpdf/QUtil.cc:720-731`): lowercase hex, two
 /// characters per byte, no separators.
 fn hex_encode(bytes: &[u8]) -> String {
@@ -199,32 +132,39 @@ pub(crate) fn run_test_34<R: Read + Seek>(
 ) -> flpdf::Result<()> {
     writeln!(stdout, "version: {}", pdf.version())?;
 
-    // qpdf's `getExtensionLevel()` calls `getRoot()` on its own
-    // (`libqpdf/QPDF.cc:2332`), and the direct `getKey("/Extensions")` below
-    // is a *second*, independent `getRoot()` call (`test_driver.cc:1257`);
-    // reusing one resolved `root_handle` for both is behavior-equivalent
-    // (same canonical object either way) without spending the resolve twice.
-    let root = root_handle(pdf, filename, diagnostics_written, stdout, stderr)?;
-    let extension_level =
-        catalog_extension_level(pdf, &root, filename, diagnostics_written, stdout, stderr)?;
+    // qpdf evaluates getExtensionLevel first, then independently evaluates
+    // getRoot().getKey("/Extensions").unparse(), and finally calls
+    // getVersionAsPDFVersion (`qpdf/test_driver.cc:1252-1263`). Keep those
+    // observable boundaries in that order while delegating each responsibility
+    // to the production Pdf API. Drain diagnostics before the corresponding
+    // output line because qpdf's warning logger is synchronous.
+    // qpdf's warning logger is synchronous, so a call that records a repair
+    // warning and *then* fails must still have that warning printed first.
+    // Hold the result, drain diagnostics, and only then propagate.
+    let extension_level = pdf.get_extension_level();
+    emit_new_diagnostics(pdf, diagnostics_written, filename, stdout, stderr)?;
+    let extension_level = extension_level?;
     writeln!(stdout, "extension level: {extension_level}")?;
 
     // `getKey("/Extensions").unparse()` never dereferences: an indirect
     // result always prints its own `N G R` regardless of resolution state,
     // and a direct result's own nested children print the same way
     // (`ObjectHandle::unparse`'s own doc) -- no extra resolve step here.
-    let extensions = root.get_key(b"/Extensions");
+    let root = pdf.root_handle();
+    emit_new_diagnostics(pdf, diagnostics_written, filename, stdout, stderr)?;
+    let root = root?;
+    let extensions = root.try_get_key(b"/Extensions");
+    emit_new_diagnostics(pdf, diagnostics_written, filename, stdout, stderr)?;
+    let extensions = extensions?;
     write_bytes(stdout, &extensions.unparse())?;
     writeln!(stdout)?;
 
-    // `get_version_as_pdf_version` independently recomputes the extension
-    // level via `get_extension_level`, but the `/Extensions` chain is
-    // already resolved from the read above, so this second read produces no
-    // new diagnostics (matching qpdf's own object cache, which does not
-    // re-warn on an already-resolved dereference) -- reuse the
-    // diagnostics-emitting `extension_level` already printed above rather
-    // than the one this call recomputes.
-    let version = pdf.get_version_as_pdf_version()?;
+    // `getVersionAsPDFVersion` calls getExtensionLevel again, as qpdf does;
+    // the canonical resolver cache prevents already-observed warnings from
+    // being emitted a second time.
+    let version = pdf.get_version_as_pdf_version();
+    emit_new_diagnostics(pdf, diagnostics_written, filename, stdout, stderr)?;
+    let version = version?;
     writeln!(
         stdout,
         "As PDFVersion: {}.{}/{extension_level}",
@@ -781,7 +721,10 @@ pub(crate) fn run_test_41<R: Read + Seek>(
 
 #[cfg(test)]
 mod tests {
-    use super::{inflate_with_pipeline, resolved_terminal, run_test_37, run_test_38, run_test_39};
+    use super::{
+        inflate_with_pipeline, resolved_terminal, run_test_34, run_test_37, run_test_38,
+        run_test_39,
+    };
     use flpdf::{Pdf, PdfOpenOptions};
 
     #[test]
@@ -903,6 +846,43 @@ mod tests {
         bytes
     }
 
+    fn pdf_with_large_extension_level() -> Vec<u8> {
+        let objects = [
+            (
+                1,
+                b"<< /Type /Catalog /Pages 2 0 R /Extensions 4 0 R >>".as_slice(),
+            ),
+            (2, b"<< /Type /Pages /Kids [3 0 R] /Count 1 >>".as_slice()),
+            (
+                3,
+                b"<< /Type /Page /Parent 2 0 R /MediaBox [0 0 100 100] >>".as_slice(),
+            ),
+            (4, b"<< /ADBE 5 0 R >>".as_slice()),
+            (
+                5,
+                b"<< /BaseVersion /1.7 /ExtensionLevel 5000000000 >>".as_slice(),
+            ),
+        ];
+        let mut bytes = b"%PDF-1.7\n".to_vec();
+        let mut offsets = [0usize; 6];
+        for &(number, body) in &objects {
+            offsets[number as usize] = bytes.len();
+            bytes.extend_from_slice(format!("{number} 0 obj\n").as_bytes());
+            bytes.extend_from_slice(body);
+            bytes.extend_from_slice(b"\nendobj\n");
+        }
+        let xref_offset = bytes.len();
+        bytes.extend_from_slice(b"xref\n0 6\n0000000000 65535 f \n");
+        for offset in offsets.into_iter().skip(1) {
+            bytes.extend_from_slice(format!("{offset:010} 00000 n \n").as_bytes());
+        }
+        bytes.extend_from_slice(
+            format!("trailer\n<< /Size 6 /Root 1 0 R >>\nstartxref\n{xref_offset}\n%%EOF\n")
+                .as_bytes(),
+        );
+        bytes
+    }
+
     #[test]
     fn resolved_terminal_uses_the_canonical_one_hop_resolver() {
         let mut pdf = Pdf::open_mem_owned_with_options(
@@ -982,6 +962,47 @@ mod tests {
         assert_eq!(
             stderr,
             b"WARNING: lazy-item.pdf (object 4 0, offset 212): expected endobj\n"
+        );
+    }
+
+    #[test]
+    fn test_34_emits_qpdf_extension_level_clamp_warning() {
+        let mut pdf = Pdf::open_mem_owned_with_options(
+            pdf_with_large_extension_level(),
+            PdfOpenOptions {
+                description: b"extension-level.pdf".to_vec(),
+                suppress_warnings: true,
+                ..PdfOpenOptions::default()
+            },
+        )
+        .expect("open extension-level fixture");
+        let mut stdout = Vec::new();
+        let mut stderr = Vec::new();
+        let mut diagnostics_written = 0;
+
+        run_test_34(
+            &mut pdf,
+            b"extension-level.pdf",
+            None,
+            &mut stdout,
+            &mut stderr,
+            &mut diagnostics_written,
+        )
+        .expect("run test 34");
+
+        assert_eq!(
+            stdout,
+            b"version: 1.7\n\
+extension level: 2147483647\n\
+4 0 R\n\
+As PDFVersion: 1.7/2147483647\n"
+        );
+        assert!(!stderr.is_empty(), "qpdf emits the integer clamp warning");
+        assert!(
+            String::from_utf8_lossy(&stderr)
+                .contains("requested value of integer is too big; returning INT_MAX"),
+            "stderr must retain qpdf's clamp warning: {:?}",
+            String::from_utf8_lossy(&stderr)
         );
     }
 
