@@ -10287,7 +10287,7 @@ fn path_basename(path: &std::path::Path) -> CliResult<Vec<u8>> {
 
 #[allow(clippy::too_many_arguments)]
 fn configure_attachment_job(
-    input: &Path,
+    input: Option<&Path>,
     output: Option<&Path>,
     page_ops: &PageOpArgs,
     copy_encryption: Option<(&Path, Vec<u8>)>,
@@ -10304,7 +10304,12 @@ fn configure_attachment_job(
     transform_options: InspectionTransformOptions,
 ) -> CliResult<QPDFJob> {
     let mut job = new_cli_job(suppress_warnings);
-    job.set_input_file(input.to_path_buf())?;
+    if page_ops.empty {
+        job.config().empty_input()?;
+    } else {
+        let input = input.ok_or_else(missing_input_usage_error)?;
+        job.set_input_file(input.to_path_buf())?;
+    }
     if replace_input {
         // Selecting replacement mode without looking at `output` would discard
         // a second positional path and overwrite the input instead, which is
@@ -10456,6 +10461,37 @@ fn cli_copy_encryption(args: &Cli) -> Option<(&Path, Vec<u8>)> {
     Some((path, password))
 }
 
+/// Apply qpdf's `--empty` positional remapping to attachment output routes.
+/// `Config::emptyInput` consumes the primary-input slot, so with one
+/// positional path qpdf treats it as the output; two paths are a usage error.
+fn attachment_input_output(
+    input: Option<PathBuf>,
+    output: Option<PathBuf>,
+    page_ops: &PageOpArgs,
+    replace_input: bool,
+) -> CliResult<(Option<PathBuf>, Option<PathBuf>)> {
+    if !page_ops.empty {
+        return Ok((input, output));
+    }
+    if replace_input && (input.is_some() || output.is_some()) {
+        return Err(UsageError::new(
+            "replace-input can't be used since output file has already been given",
+        )
+        .into());
+    }
+    if replace_input {
+        return Err(UsageError::new("--replace-input may not be used with --empty").into());
+    }
+    match (input, output) {
+        (Some(output), None) | (None, Some(output)) => Ok((None, Some(output))),
+        (Some(_), Some(_)) => Err(UsageError::new(
+            "empty input can't be used since input file has already been given",
+        )
+        .into()),
+        (None, None) => Err(missing_output_usage_error().into()),
+    }
+}
+
 #[allow(clippy::too_many_arguments)]
 fn run_add_attachment(
     input: Option<PathBuf>,
@@ -10475,7 +10511,7 @@ fn run_add_attachment(
     writer_options: WriterOptions,
     transform_options: InspectionTransformOptions,
 ) -> CliResult<()> {
-    let input = input.ok_or_else(missing_input_usage_error)?;
+    let (input, output) = attachment_input_output(input, output, page_ops, replace_input)?;
     let attachment_options = segments
         .into_iter()
         .map(|tokens| {
@@ -10504,7 +10540,7 @@ fn run_add_attachment(
         let _ = prepare_pdf_standard_output(output)?;
     }
     let mut job = configure_attachment_job(
-        &input,
+        input.as_deref(),
         output.as_deref(),
         page_ops,
         copy_encryption,
@@ -10549,12 +10585,12 @@ fn run_remove_attachment(
     writer_options: WriterOptions,
     transform_options: InspectionTransformOptions,
 ) -> CliResult<()> {
-    let input = input.ok_or_else(missing_input_usage_error)?;
+    let (input, output) = attachment_input_output(input, output, page_ops, replace_input)?;
     if let Some(output) = output.as_deref() {
         let _ = prepare_pdf_standard_output(output)?;
     }
     let mut job = configure_attachment_job(
-        &input,
+        input.as_deref(),
         output.as_deref(),
         page_ops,
         copy_encryption,
@@ -10678,7 +10714,7 @@ fn run_copy_attachments_from(
     writer_options: WriterOptions,
     transform_options: InspectionTransformOptions,
 ) -> CliResult<()> {
-    let input = input.ok_or_else(missing_input_usage_error)?;
+    let (input, output) = attachment_input_output(input, output, page_ops, replace_input)?;
     let donor_args = groups
         .into_iter()
         .map(parse_copy_attachments_segment)
@@ -10691,7 +10727,7 @@ fn run_copy_attachments_from(
         let _ = prepare_pdf_standard_output(output)?;
     }
     let mut job = configure_attachment_job(
-        &input,
+        input.as_deref(),
         output.as_deref(),
         page_ops,
         copy_encryption,
