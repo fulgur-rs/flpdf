@@ -129,49 +129,42 @@ pub(crate) struct CompressiblePlan {
     pub indirect_objstm_length_refs: BTreeSet<ObjectRef>,
 }
 
-const DENSE_VISITED_OBJECT_LIMIT: usize = 16 * 1024 * 1024;
-
-// qpdf-deviation: use sparse visited storage above a bounded dense allocation to avoid OOM on sparse high object numbers.
-enum VisitedObjects {
-    Dense(Vec<bool>),
-    Sparse(BTreeSet<u32>),
+struct PackedVisited {
+    words: Vec<u64>,
 }
 
-impl VisitedObjects {
-    fn new(max_object: u32) -> Self {
-        match usize::try_from(max_object) {
-            Ok(count) if count <= DENSE_VISITED_OBJECT_LIMIT => Self::Dense(vec![false; count]),
-            _ => Self::Sparse(BTreeSet::new()),
-        }
+impl PackedVisited {
+    fn new(max_object: u32) -> crate::Result<Self> {
+        // cov:ignore-start: qpdf object numbers and supported Rust targets both use at least 32 bits
+        let count = usize::try_from(max_object).map_err(|_| {
+            crate::Error::Unsupported("object count does not fit in usize".to_string())
+        })?;
+        // cov:ignore-end
+        let word_count = count.div_ceil(64);
+        let mut words = Vec::new();
+        words
+            .try_reserve_exact(word_count)
+            .map_err(|_| crate::Error::System("std::bad_alloc".to_owned()))?; // cov:ignore: allocator failure is not safely injectable in the full test suite
+        words.resize(word_count, 0);
+        Ok(Self { words })
     }
 
-    fn dense_index(object_number: u32) -> crate::Result<usize> {
+    fn bit_index(object_number: u32) -> crate::Result<(usize, u32)> {
         let zero_based = object_number.checked_sub(1).ok_or_else(|| {
             crate::Error::Internal("object number zero cannot be marked visited".to_string())
         })?;
-        // cov:ignore-start: the dense allocation bound is below usize::MAX on every supported target
-        usize::try_from(zero_based).map_err(|_| {
-            crate::Error::Unsupported("object number does not fit in usize".to_string())
-        })
-        // cov:ignore-end
+        let zero_based = zero_based as usize;
+        Ok((zero_based / 64, (zero_based % 64) as u32))
     }
 
     fn contains(&self, object_number: u32) -> crate::Result<bool> {
-        match self {
-            Self::Dense(visited) => Ok(visited[Self::dense_index(object_number)?]),
-            Self::Sparse(visited) => Ok(visited.contains(&object_number)),
-        }
+        let (word, bit) = Self::bit_index(object_number)?;
+        Ok(self.words[word] & (1u64 << bit) != 0)
     }
 
     fn insert(&mut self, object_number: u32) -> crate::Result<()> {
-        match self {
-            Self::Dense(visited) => {
-                visited[Self::dense_index(object_number)?] = true;
-            }
-            Self::Sparse(visited) => {
-                visited.insert(object_number);
-            }
-        }
+        let (word, bit) = Self::bit_index(object_number)?;
+        self.words[word] |= 1u64 << bit;
         Ok(())
     }
 }
@@ -189,7 +182,7 @@ pub(crate) fn compressible_objgens_qpdf_plan<R: std::io::Read + std::io::Seek>(
     // This also makes cached dangling references visible to the dynamic
     // upper_bound check below.
     let max_object = pdf.get_object_count()?;
-    let mut visited = VisitedObjects::new(max_object);
+    let mut visited = PackedVisited::new(max_object)?;
     // The encryption dictionary is excluded from the result, matching qpdf's
     // `m->trailer.getKey("/Encrypt")` guard (QPDF.cc:2402/2437): it must stay
     // a plain indirect object so the rest of the file can be decrypted. Read it
@@ -367,9 +360,13 @@ mod tests {
     use crate::{ObjectRef, Pdf};
     use std::io::Cursor;
 
+    fn normalized_source() -> String {
+        include_str!("eligibility.rs").replace("\r\n", "\n")
+    }
+
     #[test]
     fn eligibility_dictionary_walk_uses_the_live_cursor() {
-        let source = include_str!("eligibility.rs");
+        let source = normalized_source();
         let start = source
             .find("fn push_handle_dict_children")
             .expect("eligibility dictionary walk");
@@ -391,7 +388,7 @@ mod tests {
 
     #[test]
     fn eligibility_uses_qpdfs_dense_visited_bitmap() {
-        let source = include_str!("eligibility.rs");
+        let source = normalized_source();
         let start = source
             .find("pub(crate) fn compressible_objgens_qpdf_plan")
             .expect("eligibility planner");
@@ -400,56 +397,87 @@ mod tests {
                 .find("\n/// Distribute `eligible`")
                 .expect("eligibility planner end")
                 + start];
+        let production_end = source
+            .find("\n#[cfg(test)]\nmod tests")
+            .expect("eligibility production end");
+        let production = &source[..production_end];
 
         assert!(
-            body.contains("VisitedObjects::new")
-                && (source.contains("Vec<bool>") || source.contains("vec![false")),
-            "eligibility must index qpdf's dense visited bitmap"
+            body.contains("PackedVisited::new") && production.contains("words: Vec<u64>"),
+            "eligibility must use a packed dense visited bitmap"
+        );
+        assert!(
+            production.contains("count.div_ceil(64)"),
+            "packed visited storage must allocate one bit per object"
         );
     }
 
     #[test]
-    fn eligibility_switches_to_sparse_visited_storage_for_large_bounds() {
-        let source = include_str!("eligibility.rs");
+    fn packed_visited_allocation_is_fallible() {
+        let source = normalized_source();
+        let production_end = source
+            .find("\n#[cfg(test)]\nmod tests")
+            .expect("eligibility production end");
+        let production = &source[..production_end];
 
         assert!(
-            source.contains("DENSE_VISITED_OBJECT_LIMIT"),
-            "large object bounds must not force an unbounded dense allocation"
-        );
-        assert!(
-            source.contains("VisitedObjects::Sparse") || source.contains("VisitedStorage::Sparse"),
-            "large object bounds must use sparse visited storage"
-        );
-        assert!(
-            source.contains("BTreeSet<u32>"),
-            "sparse visited storage must be keyed by present object numbers"
+            production.contains("try_reserve_exact"),
+            "visited bitmap allocation must return a qpdf-style error instead of aborting"
         );
     }
 
     #[test]
-    fn large_object_bounds_select_sparse_visited_storage() {
-        let visited = super::VisitedObjects::new(
-            (super::DENSE_VISITED_OBJECT_LIMIT as u32).saturating_add(1),
-        );
+    fn eligibility_keeps_qpdf_dense_storage_for_large_bounds() {
+        let source = normalized_source();
+        let production_end = source
+            .find("\n#[cfg(test)]\nmod tests")
+            .expect("eligibility production end");
+        let production = &source[..production_end];
 
-        assert!(matches!(visited, super::VisitedObjects::Sparse(_)));
+        assert!(
+            production.contains("PackedVisited"),
+            "large object bounds must remain represented by qpdf's dense bitmap"
+        );
+        assert!(
+            !production.contains("VisitedObjects::Sparse")
+                && !production.contains("VisitedStorage::Sparse"),
+            "eligibility must not add a sparse traversal representation"
+        );
+        assert!(
+            !production.contains("DENSE_VISITED_OBJECT_LIMIT"),
+            "eligibility must not switch away from qpdf's dense algorithm"
+        );
     }
 
     #[test]
-    fn visited_storage_checks_and_marks_dense_and_sparse_numbers() {
-        let mut dense = super::VisitedObjects::new(2);
-        assert!(!dense.contains(1).expect("dense contains"));
-        dense.insert(1).expect("dense insert");
-        assert!(dense.contains(1).expect("dense contains after insert"));
+    fn eligibility_visited_storage_has_no_sparse_number_set() {
+        let source = normalized_source();
+        let production_end = source
+            .find("\n#[cfg(test)]\nmod tests")
+            .expect("eligibility production end");
+        let production = &source[..production_end];
 
-        let mut sparse = super::VisitedObjects::new(
-            (super::DENSE_VISITED_OBJECT_LIMIT as u32).saturating_add(1),
-        );
-        assert!(!sparse.contains(42).expect("sparse contains"));
-        sparse.insert(42).expect("sparse insert");
-        assert!(sparse.contains(42).expect("sparse contains after insert"));
+        assert!(!production.contains("BTreeSet<u32>"));
+    }
 
-        assert!(super::VisitedObjects::dense_index(0).is_err());
+    #[test]
+    fn packed_visited_checks_and_marks_boundary_bits() {
+        let mut visited = super::PackedVisited::new(65).expect("packed visited allocation");
+        assert_eq!(visited.words.len(), 2);
+
+        for object_number in [1, 64, 65] {
+            assert!(!visited
+                .contains(object_number)
+                .expect("packed visited contains"));
+            visited
+                .insert(object_number)
+                .expect("packed visited insert");
+            assert!(visited
+                .contains(object_number)
+                .expect("packed visited contains after insert"));
+        }
+        assert!(!visited.contains(2).expect("unmarked packed bit"));
+        assert!(super::PackedVisited::bit_index(0).is_err());
     }
 
     fn reachable_objstm_with_indirect_length() -> Vec<u8> {
