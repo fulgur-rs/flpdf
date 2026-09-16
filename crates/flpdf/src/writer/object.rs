@@ -5587,7 +5587,7 @@ mod tests {
 
     #[test]
     fn scalar_writer_uses_stack_decimal_emission() {
-        let source = include_str!("object.rs");
+        let source = include_str!("object.rs").replace("\r\n", "\n");
         let start = source
             .find("pub(crate) fn unparse_object_value")
             .expect("scalar writer");
@@ -5635,7 +5635,7 @@ mod tests {
 
     #[test]
     fn qdf_indentation_batches_space_runs() {
-        let source = include_str!("object.rs");
+        let source = include_str!("object.rs").replace("\r\n", "\n");
         let start = source
             .find("fn push_spaces")
             .expect("qdf indentation helper");

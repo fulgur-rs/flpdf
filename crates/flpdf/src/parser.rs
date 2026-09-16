@@ -1238,7 +1238,7 @@ impl<I: LiveInput> LiveFileParser<'_, '_, '_, I> {
 mod live_input_tests {
     #[test]
     fn live_parser_keeps_qpdf_integer_candidates_in_parser_state() {
-        let source = include_str!("parser.rs");
+        let source = include_str!("parser.rs").replace("\r\n", "\n");
         let start = source
             .find("struct LiveFileParser")
             .expect("live parser state");

@@ -5567,7 +5567,7 @@ impl<R: Read + Seek> ResolverHandle<R> {
 mod tests {
     #[test]
     fn object_stream_parser_stamps_direct_values_with_cached_identity() {
-        let source = include_str!("resolver.rs");
+        let source = include_str!("resolver.rs").replace("\r\n", "\n");
         let start = source
             .find("impl<R: Read + Seek> crate::parser::HandleResolver for ChildHandles")
             .expect("ChildHandles parser resolver");
