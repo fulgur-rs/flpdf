@@ -55,15 +55,83 @@ impl CliInputSpec {
 
 struct PipelineWriter {
     pipeline: PipelineHandle,
+    buffered: Option<Vec<u8>>,
+}
+
+const JSON_OUTPUT_BUFFER_CAPACITY: usize = 4096;
+
+impl PipelineWriter {
+    fn new(pipeline: PipelineHandle) -> Self {
+        Self {
+            pipeline,
+            buffered: None,
+        }
+    }
+
+    /// Batch JSON fragments before they reach the shared pipeline handle.
+    /// qpdf's logger still owns the complete-line stdout boundary; PDF save
+    /// routes stay immediate so their existing streaming and error timing are
+    /// unchanged.
+    fn begin_json_output_buffering(&mut self) {
+        self.buffered = Some(Vec::with_capacity(JSON_OUTPUT_BUFFER_CAPACITY));
+    }
+
+    fn flush_buffer(&mut self) -> std::io::Result<()> {
+        let Some(buffer) = self.buffered.as_mut() else {
+            return Ok(());
+        };
+        if buffer.is_empty() {
+            return Ok(());
+        }
+        let result = { self.pipeline.write(buffer).map_err(std::io::Error::other) };
+        buffer.clear();
+        result
+    }
 }
 
 impl Write for PipelineWriter {
     fn write(&mut self, data: &[u8]) -> std::io::Result<usize> {
-        self.pipeline.write(data).map_err(std::io::Error::other)?;
+        if self.buffered.is_none() {
+            self.pipeline.write(data).map_err(std::io::Error::other)?;
+            return Ok(data.len());
+        }
+
+        let mut remaining = data;
+        while !remaining.is_empty() {
+            if self
+                .buffered
+                .as_ref()
+                .is_some_and(|buffer| buffer.len() == JSON_OUTPUT_BUFFER_CAPACITY)
+            {
+                self.flush_buffer()?;
+            }
+            let capacity = JSON_OUTPUT_BUFFER_CAPACITY
+                - self
+                    .buffered
+                    .as_ref()
+                    .expect("JSON output buffering enabled")
+                    .len();
+            let count = remaining.len().min(capacity);
+            self.buffered
+                .as_mut()
+                .expect("JSON output buffering enabled")
+                .extend_from_slice(&remaining[..count]);
+            remaining = &remaining[count..];
+            if self
+                .buffered
+                .as_ref()
+                .is_some_and(|buffer| buffer.len() == JSON_OUTPUT_BUFFER_CAPACITY)
+            {
+                self.flush_buffer()?;
+            }
+        }
         Ok(data.len())
     }
 
     fn flush(&mut self) -> std::io::Result<()> {
+        if self.buffered.is_some() {
+            self.flush_buffer()?;
+        }
         Ok(())
     }
 }
@@ -76,6 +144,7 @@ impl PipelineWriter {
     /// remains a no-op for the PDF writer, whose pipeline lifetime is owned by
     /// its own output boundary.
     fn finish_pipeline(&mut self) -> CliResult<()> {
+        self.flush()?;
         self.pipeline
             .finish()
             .map_err(|error| Box::new(error) as Box<dyn std::error::Error>)
@@ -3724,6 +3793,7 @@ fn main() {
     };
 
     if let Err(error) = result {
+        let _ = cli_logger().flush();
         if let Some(exit_err) = error.downcast_ref::<CliRawExitError>() {
             if !exit_err.message.is_empty() {
                 let mut line = format!("\n{}: ", progname()).into_bytes();
@@ -5041,6 +5111,13 @@ fn run_json_document<R: Read + Seek>(
                 DecodeLevel::Generalized
             });
     let output_path = runtime.output_path.filter(|path| *path != Path::new("-"));
+    if output_path.is_none() {
+        runtime
+            .standard_output
+            .as_mut()
+            .expect("stdout writer prepared for JSON stdout")
+            .begin_json_output_buffering();
+    }
     let stream_prefix = cli.json_stream_prefix.as_deref().map(arg_parser::os_bytes);
     let json_result = if let Some(path) = output_path {
         let mut file = open_verified_json_output(runtime.input_identity, path)?;
@@ -10074,9 +10151,7 @@ fn standard_save_writer() -> CliResult<PipelineWriter> {
 
 fn standard_save_writer_for(logger: &QPDFLogger) -> CliResult<PipelineWriter> {
     logger.save_to_standard_output(true)?;
-    Ok(PipelineWriter {
-        pipeline: logger.get_save()?,
-    })
+    Ok(PipelineWriter::new(logger.get_save()?))
 }
 
 fn prepare_pdf_standard_output(output: &Path) -> CliResult<Option<PipelineWriter>> {
@@ -10189,6 +10264,7 @@ fn finish_operation_warnings_with_prior<R: Read + Seek>(
 }
 
 fn finish_job_exit_status(status: JobExitCode) -> CliResult<()> {
+    cli_logger().flush()?;
     match status {
         JobExitCode::Success => Ok(()),
         JobExitCode::Error => Err(Box::new(CliExitError {
@@ -10923,6 +10999,25 @@ mod tests {
         fn finish(&mut self) -> PipelineResult<()> {
             Ok(())
         }
+    }
+
+    #[test]
+    fn pipeline_writer_batches_small_writes_until_finish() {
+        let chunks = Arc::new(Mutex::new(Vec::<Vec<u8>>::new()));
+        let mut writer = PipelineWriter::new(PipelineHandle::new(ChunkRecordingSink {
+            chunks: Arc::clone(&chunks),
+        }));
+        writer.begin_json_output_buffering();
+
+        writer.write_all(b"first").unwrap();
+        writer.write_all(b" second").unwrap();
+        assert!(chunks.lock().unwrap().is_empty());
+
+        writer.finish_pipeline().unwrap();
+        assert_eq!(
+            chunks.lock().unwrap().as_slice(),
+            [b"first second".to_vec()]
+        );
     }
 
     struct FailingPasswordNoticeSink;

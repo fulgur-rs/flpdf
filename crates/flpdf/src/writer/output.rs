@@ -3,7 +3,7 @@
 //! qpdf correspondence: QPDFWriter.cc pipeline ownership, Pl_Count accepted-byte accounting, PipelinePopper segment scopes, and deterministic-ID digest boundaries.
 //!
 
-use crate::{Error, Result};
+use crate::{Error, ObjectRef, Result};
 use md5::{Digest as _, Md5};
 use std::io::{self, ErrorKind, Write};
 use std::ops::Range;
@@ -235,6 +235,66 @@ impl Write for OutputSink<'_> {
     }
 }
 
+/// Write a signed decimal value without constructing a heap-backed `String`.
+///
+/// qpdf's writer passes the corresponding small `std::string` through its
+/// pipeline (`libqpdf/QPDF_Integer.cc:20-32`). Every `i64` fits in this
+/// twenty-byte stack buffer, including the sign and `i64::MIN`.
+pub(crate) fn write_decimal_i64(out: &mut OutputSink<'_>, value: i64) -> Result<()> {
+    let mut encoded = [0u8; 20];
+    let mut start = encoded.len();
+    let mut magnitude = value.unsigned_abs();
+    loop {
+        start -= 1;
+        encoded[start] = b'0' + (magnitude % 10) as u8;
+        magnitude /= 10;
+        if magnitude == 0 {
+            break;
+        }
+    }
+    if value < 0 {
+        start -= 1;
+        encoded[start] = b'-';
+    }
+    out.write_bytes(&encoded[start..])
+}
+
+/// Write an unsigned decimal value without constructing a heap-backed
+/// `String`. This covers object numbers and file lengths that cross the
+/// qpdf-shaped writer boundary as `usize` or `u32` values.
+pub(crate) fn write_decimal_u64(out: &mut OutputSink<'_>, value: u64) -> Result<()> {
+    let mut encoded = [0u8; 20];
+    let mut start = encoded.len();
+    let mut magnitude = value;
+    loop {
+        start -= 1;
+        encoded[start] = b'0' + (magnitude % 10) as u8;
+        magnitude /= 10;
+        if magnitude == 0 {
+            break;
+        }
+    }
+    out.write_bytes(&encoded[start..])
+}
+
+/// Write qpdf's `N G R` object-reference spelling without a temporary
+/// `String` (`QPDFWriter.cc:1144-1156`).
+pub(crate) fn write_object_ref(out: &mut OutputSink<'_>, object_ref: ObjectRef) -> Result<()> {
+    write_decimal_u64(out, u64::from(object_ref.number))?;
+    out.write_bytes(b" ")?;
+    write_decimal_u64(out, u64::from(object_ref.generation))?;
+    out.write_bytes(b" R")
+}
+
+pub(crate) fn decimal_u64_len(mut value: u64) -> usize {
+    let mut length = 1;
+    while value >= 10 {
+        value /= 10;
+        length += 1;
+    }
+    length
+}
+
 /// Build the qpdf `generateID` second-MD5 seed from the final-output digest.
 ///
 /// `info_suffix` is the writer's existing raw decoded `/Info` string suffix.
@@ -265,11 +325,30 @@ pub(crate) fn deterministic_id_second_seed(
 
 #[cfg(test)]
 mod tests {
-    use super::{OutputSink, OutputTarget};
-    use crate::{Error, Result};
+    use super::{write_decimal_i64, write_decimal_u64, write_object_ref, OutputSink, OutputTarget};
+    use crate::{Error, ObjectRef, Result};
     use md5::Digest as _;
     use std::collections::VecDeque;
     use std::io::{self, ErrorKind, Write as _};
+
+    #[test]
+    fn decimal_output_covers_signed_minimum_and_reference_bounds() -> Result<()> {
+        let mut output = Vec::new();
+        super::with_buffer_sink(&mut output, |out| {
+            write_decimal_i64(out, i64::MIN)?;
+            out.write_bytes(b" ")?;
+            write_decimal_i64(out, i64::MAX)?;
+            out.write_bytes(b" ")?;
+            write_decimal_u64(out, u64::MAX)?;
+            out.write_bytes(b" ")?;
+            write_object_ref(out, ObjectRef::new(u32::MAX, u16::MAX))
+        })?;
+        assert_eq!(
+            output,
+            b"-9223372036854775808 9223372036854775807 18446744073709551615 4294967295 65535 R"
+        );
+        Ok(())
+    }
 
     #[derive(Default)]
     struct VecOutputTarget {

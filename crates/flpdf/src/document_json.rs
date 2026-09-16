@@ -379,7 +379,6 @@ fn write_non_file_mode_object_entry(
     objects_first: &mut bool,
 ) -> Result<(), JsonOutputError> {
     let object_gen = object_map_identity(handle);
-    let key = format!("obj:{} {} R", object_gen.get_obj(), object_gen.get_gen());
 
     // Resolve the canonical object before dispatching by value. The object-map
     // entry itself remains keyed by its original indirect identity, while the
@@ -405,7 +404,7 @@ fn write_non_file_mode_object_entry(
         stream_value.finish()?;
         let stream_value = stream_value.take_buffer()?;
 
-        Json::write_dictionary_key(out, objects_first, key.as_bytes(), 3)?;
+        Json::write_qpdf_object_key(out, objects_first, object_gen, 3)?;
         let mut object_first = true;
         Json::write_dictionary_open(out, &mut object_first, 3)?;
         Json::write_dictionary_key(out, &mut object_first, b"stream", 4)?;
@@ -414,7 +413,7 @@ fn write_non_file_mode_object_entry(
         return Ok(());
     }
 
-    write_non_stream_value_entry(&handle, key.as_bytes(), out, objects_first)?;
+    write_non_stream_value_entry(&handle, object_gen, out, objects_first)?;
     Ok(())
 }
 
@@ -426,14 +425,13 @@ fn write_file_mode_object_entry(
     objects_first: &mut bool,
 ) -> Result<(), JsonOutputError> {
     let object_gen = object_map_identity(handle);
-    let key = format!("obj:{} {} R", object_gen.get_obj(), object_gen.get_gen());
 
     // Resolve the canonical object before dispatching by value, keeping the
     // original indirect identity for the JSON object key.
     let handle = handle.clone();
     handle.try_dereference().map_err(ConvertError::from)?;
     if handle.type_code().map_err(ConvertError::from)? == 10 {
-        Json::write_dictionary_key(out, objects_first, key.as_bytes(), 3)?;
+        Json::write_qpdf_object_key(out, objects_first, object_gen, 3)?;
         let mut object_first = true;
         Json::write_dictionary_open(out, &mut object_first, 3)?;
         Json::write_dictionary_key(out, &mut object_first, b"stream", 4)?;
@@ -447,17 +445,17 @@ fn write_file_mode_object_entry(
         return Ok(());
     }
 
-    write_non_stream_value_entry(&handle, key.as_bytes(), out, objects_first)?;
+    write_non_stream_value_entry(&handle, object_gen, out, objects_first)?;
     Ok(())
 }
 
 fn write_non_stream_value_entry(
     handle: &ObjectHandle,
-    key: &[u8],
+    object_gen: QpdfObjGen,
     out: &mut dyn Pipeline,
     objects_first: &mut bool,
 ) -> Result<(), JsonOutputError> {
-    Json::write_dictionary_key(out, objects_first, key, 3)?;
+    Json::write_qpdf_object_key(out, objects_first, object_gen, 3)?;
     let mut object_first = true;
     Json::write_dictionary_open(out, &mut object_first, 3)?;
     Json::write_dictionary_key(out, &mut object_first, b"value", 4)?;

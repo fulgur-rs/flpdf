@@ -5,9 +5,11 @@
 //!
 
 use std::collections::HashSet;
+use std::io;
 use std::rc::Rc;
 
 use crate::stream_filter::encode_flate;
+use crate::writer::output::{OutputSink, OutputTarget};
 use crate::ObjectHandle;
 use crate::ObjectRef;
 // ── ObjStm body emitter ───────────────────────────────────────────────────────
@@ -57,17 +59,144 @@ where
     emit_objstm_body_from_members(members, write_member, false)
 }
 
-/// QDF-formatted ObjStm body emission. QPDFWriter writes the pair table with
-/// one `<object> <offset>` row per line in QDF mode; the ordinary writer uses a
-/// single space between pairs.
-pub(crate) fn emit_objstm_body_from_handles_with_writer_qdf<F>(
+/// Serialise one live ObjStm pass through a caller-owned counted sink. When
+/// `retain_body` is false the pass uses a discard target, matching qpdf's
+/// `Pl_Discard`; when it is true, it owns one persistent `Vec`-backed sink for
+/// the complete body. The live writer invokes this once for each qpdf pass.
+pub(crate) fn emit_objstm_body_from_handles_with_sink<F>(
     members: &[(ObjectRef, ObjectHandle)],
     write_member: &mut F,
+    retain_body: bool,
 ) -> crate::Result<ObjStmBody>
 where
-    F: FnMut(&mut Vec<u8>, u32, ObjectRef, &ObjectHandle) -> crate::Result<()>,
+    F: FnMut(&mut OutputSink<'_>, u32, ObjectRef, &ObjectHandle) -> crate::Result<()>,
 {
-    emit_objstm_body_from_members(members, write_member, true)
+    emit_objstm_body_from_members_with_sink(members, write_member, false, retain_body)
+}
+
+/// QDF-formatted sibling of [`emit_objstm_body_from_handles_with_sink`].
+pub(crate) fn emit_objstm_body_from_handles_with_sink_qdf<F>(
+    members: &[(ObjectRef, ObjectHandle)],
+    write_member: &mut F,
+    retain_body: bool,
+) -> crate::Result<ObjStmBody>
+where
+    F: FnMut(&mut OutputSink<'_>, u32, ObjectRef, &ObjectHandle) -> crate::Result<()>,
+{
+    emit_objstm_body_from_members_with_sink(members, write_member, true, retain_body)
+}
+
+struct ObjStmDiscardTarget;
+
+impl OutputTarget for ObjStmDiscardTarget {
+    fn write_chunk(&mut self, bytes: &[u8]) -> io::Result<usize> {
+        Ok(bytes.len())
+    }
+
+    fn finish_segment(&mut self) -> crate::Result<()> {
+        Ok(())
+    }
+
+    fn finish_document(&mut self) -> crate::Result<()> {
+        Ok(())
+    }
+}
+
+fn emit_objstm_body_from_members_with_sink<T, F>(
+    members: &[(ObjectRef, T)],
+    write_member: &mut F,
+    qdf: bool,
+    retain_body: bool,
+) -> crate::Result<ObjStmBody>
+where
+    F: FnMut(&mut OutputSink<'_>, u32, ObjectRef, &T) -> crate::Result<()>,
+{
+    if members.is_empty() {
+        return Ok(ObjStmBody {
+            bytes: vec![],
+            first_offset: 0,
+            n_members: 0,
+        });
+    }
+
+    let mut seen: HashSet<u32> = HashSet::with_capacity(members.len());
+    for (obj_ref, _) in members {
+        if !seen.insert(obj_ref.number) {
+            return Err(crate::Error::Unsupported(format!(
+                "duplicate member in ObjStm batch {}",
+                obj_ref.number
+            )));
+        }
+    }
+
+    if !retain_body {
+        let mut discard = ObjStmDiscardTarget;
+        let mut sink = OutputSink::new(&mut discard);
+        for (member_index, (object_ref, object)) in members.iter().enumerate() {
+            let member_index = u32::try_from(member_index).map_err(|_| {
+                // cov:ignore-start: a Vec cannot hold more than u32::MAX
+                // members in supported targets.
+                crate::Error::Unsupported("ObjStm member index overflows u32".to_string())
+                // cov:ignore-end
+            })?; // cov:ignore: member_index comes from a Vec and cannot exceed u32::MAX on supported targets
+            write_member(&mut sink, member_index, *object_ref, object)?;
+            sink.write_bytes(b"\n")?;
+        }
+        return Ok(ObjStmBody {
+            bytes: Vec::new(),
+            first_offset: 0,
+            n_members: members.len(),
+        });
+    }
+
+    let mut offsets: Vec<usize> = Vec::with_capacity(members.len());
+    let mut objects_section = Vec::new();
+    {
+        let mut sink = OutputSink::new(&mut objects_section);
+        for (member_index, (object_ref, object)) in members.iter().enumerate() {
+            offsets.push(sink.position_usize()?);
+            let member_index = u32::try_from(member_index).map_err(|_| {
+                // cov:ignore-start: a Vec cannot hold more than u32::MAX
+                // members in supported targets.
+                crate::Error::Unsupported("ObjStm member index overflows u32".to_string())
+                // cov:ignore-end
+            })?; // cov:ignore: member_index comes from a Vec and cannot exceed u32::MAX on supported targets
+            write_member(&mut sink, member_index, *object_ref, object)?;
+            sink.write_bytes(b"\n")?;
+        }
+    }
+
+    let mut pair_table: Vec<u8> = Vec::new();
+    use std::io::Write as _;
+    for (i, ((obj_ref, _), offset)) in members.iter().zip(offsets.iter()).enumerate() {
+        if i > 0 {
+            pair_table.push(if qdf { b'\n' } else { b' ' });
+        }
+        let _ = write!(pair_table, "{} {}", obj_ref.number, offset);
+    }
+    pair_table.push(b'\n');
+
+    let first_offset = pair_table.len();
+    let objects_len = objects_section.len();
+    objects_section.reserve(first_offset);
+    objects_section.resize(
+        objects_len.checked_add(first_offset).ok_or_else(|| {
+            // cov:ignore-start: both lengths come from the same supported Vec
+            // allocation, so their sum cannot exceed usize in a constructible
+            // ObjStm.
+            crate::Error::Unsupported("ObjStm body length overflows usize".to_string())
+            // cov:ignore-end
+        })?, // cov:ignore: LLVM maps the covered ObjStm body resize continuation to this line
+        0,
+    );
+    objects_section.copy_within(0..objects_len, first_offset);
+    objects_section[..first_offset].copy_from_slice(&pair_table);
+
+    Ok(ObjStmBody {
+        bytes: objects_section,
+        first_offset,
+        n_members: members.len(),
+    })
 }
 
 fn emit_objstm_body_from_members<T, F>(
@@ -225,9 +354,90 @@ pub(crate) fn wrap_objstm_body_as_handle(
 
 #[cfg(test)]
 mod final_handle_tests {
-    use super::{wrap_objstm_body_as_handle, ObjStmBody};
+    use super::{
+        emit_objstm_body_from_handles_with_sink, emit_objstm_body_from_members_with_sink,
+        wrap_objstm_body_as_handle, ObjStmBody, ObjStmDiscardTarget,
+    };
+    use crate::writer::output::{OutputSink, OutputTarget};
     use crate::writer::CompressStreams;
+    use crate::ObjectHandle;
     use crate::ObjectRef;
+
+    #[test]
+    fn sink_emitter_runs_two_passes_and_retains_only_the_second_body() {
+        let members = [(ObjectRef::new(7, 0), ObjectHandle::integer(9))];
+        let mut calls = 0;
+        let mut write_member =
+            |out: &mut OutputSink<'_>, _index: u32, _object: ObjectRef, _handle: &ObjectHandle| {
+                calls += 1;
+                out.write_bytes(b"9")
+            };
+
+        let first_pass =
+            emit_objstm_body_from_handles_with_sink(&members, &mut write_member, false)
+                .expect("sink-backed ObjStm first pass");
+        let body = emit_objstm_body_from_handles_with_sink(&members, &mut write_member, true)
+            .expect("sink-backed ObjStm second pass");
+
+        assert_eq!(calls, 2);
+        assert!(first_pass.bytes.is_empty());
+        assert_eq!(body.bytes, b"7 0\n9\n");
+        assert_eq!(body.first_offset, 4);
+    }
+
+    #[test]
+    fn sink_emitter_handles_empty_and_duplicate_batches() {
+        let mut write_member = |_out: &mut OutputSink<'_>,
+                                _index: u32,
+                                _object: ObjectRef,
+                                _handle: &ObjectHandle| { Ok(()) };
+        let empty = emit_objstm_body_from_handles_with_sink(&[], &mut write_member, false)
+            .expect("empty ObjStm batch");
+        assert_eq!(
+            empty,
+            ObjStmBody {
+                bytes: Vec::new(),
+                first_offset: 0,
+                n_members: 0,
+            }
+        );
+
+        let single = [(ObjectRef::new(8, 0), ObjectHandle::integer(3))];
+        let body = emit_objstm_body_from_handles_with_sink(&single, &mut write_member, false)
+            .expect("a non-empty ObjStm batch invokes its member callback");
+        assert_eq!(body.n_members, 1);
+
+        let duplicate = [
+            (ObjectRef::new(7, 0), ObjectHandle::integer(1)),
+            (ObjectRef::new(7, 0), ObjectHandle::integer(2)),
+        ];
+        let error = emit_objstm_body_from_handles_with_sink(&duplicate, &mut write_member, false)
+            .expect_err("duplicate ObjStm members must be rejected");
+        assert!(error
+            .to_string()
+            .contains("duplicate member in ObjStm batch 7"));
+    }
+
+    #[test]
+    fn discard_target_forwards_the_output_target_lifecycle() {
+        let mut target = ObjStmDiscardTarget;
+        assert_eq!(
+            target
+                .write_chunk(b"discarded")
+                .expect("discard target accepts bytes"),
+            b"discarded".len()
+        );
+        target.finish_segment().expect("discard segment finish");
+        target.finish_document().expect("discard document finish");
+
+        let mut write_member =
+            |_out: &mut OutputSink<'_>, _index: u32, _object: ObjectRef, _value: &u8| Ok(());
+        let members = [(ObjectRef::new(1, 0), 1u8)];
+        let body =
+            emit_objstm_body_from_members_with_sink(&members, &mut write_member, false, true)
+                .expect("generic sink emitter");
+        assert_eq!(body.n_members, 1);
+    }
 
     #[test]
     fn object_stream_wrapper_retains_an_extends_reference_handle() {

@@ -35,6 +35,40 @@ pub(crate) struct IndirectStreamLength {
     pub(crate) added_newline: bool,
 }
 
+fn decimal_i64_bytes(value: i64) -> ([u8; 20], usize) {
+    let mut encoded = [0u8; 20];
+    let mut start = encoded.len();
+    let mut magnitude = value.unsigned_abs();
+    loop {
+        start -= 1;
+        encoded[start] = b'0' + (magnitude % 10) as u8;
+        magnitude /= 10;
+        if magnitude == 0 {
+            break;
+        }
+    }
+    if value < 0 {
+        start -= 1;
+        encoded[start] = b'-';
+    }
+    (encoded, start)
+}
+
+fn decimal_u64_bytes(value: u64) -> ([u8; 20], usize) {
+    let mut encoded = [0u8; 20];
+    let mut start = encoded.len();
+    let mut magnitude = value;
+    loop {
+        start -= 1;
+        encoded[start] = b'0' + (magnitude % 10) as u8;
+        magnitude /= 10;
+        if magnitude == 0 {
+            break;
+        }
+    }
+    (encoded, start)
+}
+
 /// Writer operations called by the single `writeObject` implementation.
 ///
 /// Implementations supply live object serialization, never an already
@@ -52,6 +86,16 @@ pub(crate) trait WriteObject {
     fn indicate_progress(&mut self) -> Result<()>;
     fn output_number(&self, object: QpdfObjGen) -> Result<u32>;
     fn write_bytes(&mut self, bytes: &[u8]) -> Result<()>;
+
+    fn write_decimal_i64(&mut self, value: i64) -> Result<()> {
+        let (encoded, start) = decimal_i64_bytes(value);
+        self.write_bytes(&encoded[start..])
+    }
+
+    fn write_decimal_u64(&mut self, value: u64) -> Result<()> {
+        let (encoded, start) = decimal_u64_bytes(value);
+        self.write_bytes(&encoded[start..])
+    }
     fn output_count(&self) -> Result<usize>;
     fn xref(&mut self) -> &mut BTreeMap<u32, (u16, usize)>;
     fn lengths(&mut self) -> &mut BTreeMap<u32, usize>;
@@ -74,7 +118,7 @@ pub(crate) trait WriteObject {
     fn open_object(&mut self, object: u32) -> Result<()> {
         let offset = self.output_count()?;
         self.xref().insert(object, (0, offset));
-        self.write_bytes(object.to_string().as_bytes())?;
+        self.write_decimal_u64(u64::from(object))?;
         self.write_bytes(b" 0 obj\n")
     }
 
@@ -113,12 +157,12 @@ pub(crate) trait WriteObject {
         if let Some(info) = qdf {
             if let Some(sequence) = info.page_sequence {
                 self.write_bytes(b"%% Page ")?;
-                self.write_bytes(sequence.to_string().as_bytes())?;
+                self.write_decimal_u64(sequence as u64)?;
                 self.write_bytes(b"\n")?;
             }
             if let Some(sequence) = info.contents_sequence {
                 self.write_bytes(b"%% Contents for page ")?;
-                self.write_bytes(sequence.to_string().as_bytes())?;
+                self.write_decimal_u64(sequence as u64)?;
                 self.write_bytes(b"\n")?;
             }
         }
@@ -128,12 +172,11 @@ pub(crate) trait WriteObject {
                 let original_object = qdf
                     .and_then(|info| info.original_object_id)
                     .unwrap_or(old_og);
-                let comment = format!(
-                    "%% Original object ID: {} {}\n",
-                    original_object.get_obj(),
-                    original_object.get_gen()
-                );
-                self.write_bytes(comment.as_bytes())?;
+                self.write_bytes(b"%% Original object ID: ")?;
+                self.write_decimal_i64(i64::from(original_object.get_obj()))?;
+                self.write_bytes(b" ")?;
+                self.write_decimal_i64(i64::from(original_object.get_gen()))?;
+                self.write_bytes(b"\n")?;
             }
             self.open_object(new_id)?;
             self.encryption_state().set_data_key(new_id);
@@ -152,7 +195,7 @@ pub(crate) trait WriteObject {
                     self.write_bytes(b"%QDF: ignore_newline\n")?;
                 }
                 self.open_object(new_id + 1)?;
-                self.write_bytes(length.cur_stream_length.to_string().as_bytes())?;
+                self.write_decimal_u64(length.cur_stream_length as u64)?;
                 self.close_object(new_id + 1, qdf.is_some())?;
             }
         }
@@ -316,6 +359,12 @@ mod tests {
         .unwrap();
         let handle = pdf.make_indirect_from_object_handle(value).unwrap();
         (pdf, handle)
+    }
+
+    #[test]
+    fn scalar_decimal_writer_handles_negative_values() {
+        let (bytes, start) = decimal_i64_bytes(-123);
+        assert_eq!(&bytes[start..], b"-123");
     }
 
     fn stream(data: &[u8]) -> ObjectHandle {

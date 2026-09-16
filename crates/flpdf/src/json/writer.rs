@@ -6,11 +6,14 @@
 //!
 
 use crate::pipeline::{Base64Action, Pipeline, PipelineResult, PlBase64, PlConcatenate, PlString};
+use crate::qpdf_obj_gen::QpdfObjGen;
 
 use super::value::{ContainerOrBlobSnapshot, ValueSnapshot};
 use super::Json;
 
 impl Json {
+    const DICTIONARY_KEY_STACK_CAPACITY: usize = 256;
+
     pub fn write_dictionary_open(
         out: &mut dyn Pipeline,
         first: &mut bool,
@@ -65,11 +68,46 @@ impl Json {
         depth: usize,
     ) -> PipelineResult<()> {
         Self::write_next(out, first, depth)?;
-        let mut item = Vec::with_capacity(encoded_key.len() + 4);
-        item.push(b'"');
-        item.extend_from_slice(encoded_key);
-        item.extend_from_slice(b"\": ");
-        out.write(&item)
+        let required = encoded_key.len() + 4;
+        if required <= Self::DICTIONARY_KEY_STACK_CAPACITY {
+            let mut item = [0u8; Self::DICTIONARY_KEY_STACK_CAPACITY];
+            item[0] = b'"';
+            item[1..encoded_key.len() + 1].copy_from_slice(encoded_key);
+            item[encoded_key.len() + 1..required].copy_from_slice(b"\": ");
+            out.write(&item[..required])
+        } else {
+            let mut item = Vec::with_capacity(required);
+            item.push(b'"');
+            item.extend_from_slice(encoded_key);
+            item.extend_from_slice(b"\": ");
+            out.write(&item)
+        }
+    }
+
+    /// Write a qpdf v2 object-map key without allocating its decimal spelling.
+    ///
+    /// `QPDF::writeJSON` constructs `obj:N G R` from the already-known
+    /// `QPDFObjGen` and writes it through the JSON pipeline
+    /// (`libqpdf/QPDF_json.cc:891-922`). The complete key fits in this stack
+    /// buffer for the signed i32 object/generation domain used by flpdf; the
+    /// outer dictionary-key helper retains the same single-chunk framing.
+    pub(crate) fn write_qpdf_object_key(
+        out: &mut dyn Pipeline,
+        first: &mut bool,
+        object_gen: QpdfObjGen,
+        depth: usize,
+    ) -> PipelineResult<()> {
+        let mut key = [0u8; 32];
+        let mut length = 0;
+        key[..4].copy_from_slice(b"obj:");
+        length += 4;
+        append_decimal_i32(&mut key, &mut length, object_gen.get_obj());
+        key[length] = b' ';
+        length += 1;
+        append_decimal_i32(&mut key, &mut length, object_gen.get_gen());
+        key[length..length + 2].copy_from_slice(b" R");
+        length += 2;
+        Self::write_dictionary_key(out, first, &key[..length], depth)
     }
 
     pub fn write_array_item(
@@ -194,11 +232,94 @@ fn write_indented(
     depth: usize,
     suffix: &[u8],
 ) -> PipelineResult<()> {
-    let mut chunk = Vec::new();
-    chunk.extend_from_slice(prefix);
-    for _ in 0..depth {
-        chunk.extend_from_slice(b"  ");
+    const STACK_CAPACITY: usize = 256;
+    let indentation = depth.saturating_mul(2);
+    let required = prefix
+        .len()
+        .saturating_add(indentation)
+        .saturating_add(suffix.len());
+    if required <= STACK_CAPACITY {
+        let mut chunk = [0u8; STACK_CAPACITY];
+        let mut offset = 0;
+        chunk[offset..offset + prefix.len()].copy_from_slice(prefix);
+        offset += prefix.len();
+        for _ in 0..depth {
+            chunk[offset..offset + 2].copy_from_slice(b"  ");
+            offset += 2;
+        }
+        chunk[offset..offset + suffix.len()].copy_from_slice(suffix);
+        out.write(&chunk[..required])
+    } else {
+        let mut chunk = Vec::with_capacity(required);
+        chunk.extend_from_slice(prefix);
+        for _ in 0..depth {
+            chunk.extend_from_slice(b"  ");
+        }
+        chunk.extend_from_slice(suffix);
+        out.write(&chunk)
     }
-    chunk.extend_from_slice(suffix);
-    out.write(&chunk)
+}
+
+fn append_decimal_i32(buffer: &mut [u8], length: &mut usize, value: i32) {
+    let mut digits = [0u8; 10];
+    let mut digit_count = 0;
+    let mut magnitude = value.unsigned_abs();
+    loop {
+        digits[digit_count] = b'0' + (magnitude % 10) as u8;
+        digit_count += 1;
+        magnitude /= 10;
+        if magnitude == 0 {
+            break;
+        }
+    }
+    if value < 0 {
+        buffer[*length] = b'-';
+        *length += 1;
+    }
+    for digit in digits[..digit_count].iter().rev() {
+        buffer[*length] = *digit;
+        *length += 1;
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{append_decimal_i32, write_indented, Json};
+    use crate::pipeline::PlString;
+
+    #[test]
+    fn long_dictionary_keys_use_the_heap_fallback() {
+        let key = vec![b'k'; Json::DICTIONARY_KEY_STACK_CAPACITY + 1];
+        let mut bytes = Vec::new();
+        {
+            let mut output = PlString::new("json long key", None, &mut bytes);
+            let mut first = true;
+            Json::write_dictionary_key(&mut output, &mut first, &key, 0)
+                .expect("long dictionary key should write");
+        }
+        assert_eq!(bytes.len(), key.len() + 5);
+        assert!(bytes.starts_with(b"\n\""));
+        assert!(bytes.ends_with(b"\": "));
+    }
+
+    #[test]
+    fn deeply_indented_json_uses_the_heap_fallback() {
+        let mut bytes = Vec::new();
+        {
+            let mut output = PlString::new("json deep indent", None, &mut bytes);
+            write_indented(&mut output, b"\n", 200, b"}").expect("deep indentation should write");
+        }
+        assert_eq!(bytes.len(), 402);
+        assert_eq!(bytes[0], b'\n');
+        assert_eq!(&bytes[1..bytes.len() - 1], vec![b' '; 400].as_slice());
+        assert_eq!(bytes[bytes.len() - 1], b'}');
+    }
+
+    #[test]
+    fn json_object_generation_decimal_writer_handles_negative_values() {
+        let mut buffer = [0u8; 32];
+        let mut length = 0;
+        append_decimal_i32(&mut buffer, &mut length, -123);
+        assert_eq!(&buffer[..length], b"-123");
+    }
 }

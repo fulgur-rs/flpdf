@@ -350,6 +350,7 @@ dependencies = [
  "tempfile",
  "thiserror",
  "windows-sys",
+ "zlib-rs",
 ]
 
 [[package]]

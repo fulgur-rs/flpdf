@@ -16,6 +16,7 @@ categories = ["parser-implementations", "encoding"]
 [dependencies]
 thiserror.workspace = true
 flate2.workspace = true
+zlib-rs.workspace = true
 aes.workspace = true
 cbc.workspace = true
 md-5.workspace = true
@@ -51,5 +52,5 @@ qtest-driver = []
 qpdf-libjpeg-compat = ["dep:flpdf-libjpeg-compat", "flpdf-libjpeg-compat/system-libjpeg"]
 # Opt-in: link classic libz (zlib1g) via libz-sys so flate2's deflate output
 # matches qpdf's compress2() at level 6 byte-for-byte. Used by bytes-identical
-# tests only — production builds stay Pure Rust (miniz_oxide).
+# tests only — production builds stay Pure Rust.
 qpdf-zlib-compat = ["flate2/zlib"]

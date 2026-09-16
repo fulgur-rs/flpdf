@@ -1336,13 +1336,33 @@ impl<R: Read + Seek> ResolverHandle<R> {
         ObjectHandle::from_value_with_resolver(value, resolver)
     }
 
-    /// Construct a direct value from the live file parser. Unlike a
-    /// programmatic value lifted through [`Self::direct_object_handle`], qpdf
-    /// stamps parser-created direct values with their owning `QPDF*`
-    /// (`libqpdf/QPDFParser.cc:394-444`).
+    /// Construct a parser-created direct value using the resolver identity
+    /// already held by this document, avoiding a fresh weak upgrade per value.
     pub(crate) fn parsed_direct_object_handle(&self, value: ObjectValue) -> ObjectHandle {
-        let resolver: Weak<dyn DocumentResolver> = self.self_weak.clone();
-        ObjectHandle::from_parsed_value_with_resolver(value, resolver)
+        ObjectHandle::from_parsed_value_with_resolver_and_pdf_unique_id(
+            value,
+            self.self_weak.clone(),
+            self.pdf_unique_id.get(),
+        )
+    }
+
+    /// Construct a parser-created direct value with the live parser's shared
+    /// description and source offset already installed. This keeps the
+    /// qpdf `addScalar` metadata write on the same allocation boundary as the
+    /// value construction instead of creating a handle and mutating it again.
+    pub(crate) fn parsed_direct_object_handle_with_description(
+        &self,
+        value: ObjectValue,
+        description: Rc<Vec<u8>>,
+        parsed_offset: i64,
+    ) -> ObjectHandle {
+        ObjectHandle::from_parsed_value_with_resolver_and_pdf_unique_id_and_description(
+            value,
+            self.self_weak.clone(),
+            self.pdf_unique_id.get(),
+            description,
+            parsed_offset,
+        )
     }
 
     /// Parse a caller-provided object string against this document's canonical
@@ -5101,6 +5121,14 @@ impl<R: Read + Seek> crate::parser::HandleResolver for ChildHandles<'_, R> {
         self.resolver.parsed_direct_object_handle(value)
     }
 
+    fn direct_handle_at(&mut self, value: ObjectValue, offset: i64) -> ObjectHandle {
+        self.resolver.parsed_direct_object_handle_with_description(
+            value,
+            Rc::clone(&self.description_template),
+            offset,
+        )
+    }
+
     fn description_template(&self) -> Option<Rc<Vec<u8>>> {
         Some(Rc::clone(&self.description_template))
     }
@@ -5537,6 +5565,24 @@ impl<R: Read + Seek> ResolverHandle<R> {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn object_stream_parser_stamps_direct_values_with_cached_identity() {
+        let source = include_str!("resolver.rs");
+        let start = source
+            .find("impl<R: Read + Seek> crate::parser::HandleResolver for ChildHandles")
+            .expect("ChildHandles parser resolver");
+        let end = start
+            + source[start..]
+                .find("\n}\n\nimpl<R: Read + Seek> DocumentResolver")
+                .expect("ChildHandles parser resolver end");
+        let body = &source[start..end];
+        assert!(
+            body.contains("parsed_direct_object_handle")
+                && source.contains("from_parsed_value_with_resolver_and_pdf_unique_id"),
+            "ObjStm direct values must use the resolver's cached PDF identity constructor"
+        );
+    }
+
     use super::pipe_stream_data_from_input;
     use super::ChildHandles;
     use super::ObjectStreamResolutionError;

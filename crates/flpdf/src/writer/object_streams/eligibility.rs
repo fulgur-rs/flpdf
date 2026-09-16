@@ -13,6 +13,7 @@ use std::num::NonZeroUsize;
 #[cfg(test)]
 use std::cell::Cell;
 
+use crate::object_handle::LiveDictionaryKeyBuffer;
 use crate::ObjectHandle;
 use crate::ObjectRef;
 
@@ -133,7 +134,6 @@ pub(crate) fn compressible_objgens_qpdf_plan<R: std::io::Read + std::io::Seek>(
 ) -> crate::Result<CompressiblePlan> {
     #[cfg(test)]
     COMPRESSIBLE_PLAN_CALLS.with(|calls| calls.set(calls.get() + 1));
-    let mut visited: BTreeSet<u32> = BTreeSet::new();
     let mut result: Vec<ObjectRef> = Vec::new();
     let mut removed_refs = BTreeSet::new();
     let mut indirect_objstm_length_refs = BTreeSet::new();
@@ -142,6 +142,9 @@ pub(crate) fn compressible_objgens_qpdf_plan<R: std::io::Read + std::io::Seek>(
     // This also makes cached dangling references visible to the dynamic
     // upper_bound check below.
     let max_object = pdf.get_object_count()?;
+    let max_object_usize = usize::try_from(max_object)
+        .map_err(|_| crate::Error::Unsupported("object count does not fit in usize".to_string()))?;
+    let mut visited = vec![false; max_object_usize];
     // The encryption dictionary is excluded from the result, matching qpdf's
     // `m->trailer.getKey("/Encrypt")` guard (QPDF.cc:2402/2437): it must stay
     // a plain indirect object so the rest of the file can be decrypted. Read it
@@ -168,7 +171,13 @@ pub(crate) fn compressible_objgens_qpdf_plan<R: std::io::Read + std::io::Seek>(
                 "unexpected object id encountered in getCompressibleObjGens".to_string(),
             ));
         }
-        if visited.contains(&object_ref.number) {
+        // cov:ignore-start: object_ref.number is u32 and all supported targets
+        // have a usize wide enough to index the allocated bitmap.
+        let visited_index = usize::try_from(object_ref.number - 1).map_err(|_| {
+            crate::Error::Unsupported("object number does not fit in usize".to_string())
+        })?;
+        // cov:ignore-end
+        if visited[visited_index] {
             continue;
         }
         if pdf.has_newer_cached_generation(object_ref) {
@@ -176,7 +185,7 @@ pub(crate) fn compressible_objgens_qpdf_plan<R: std::io::Read + std::io::Seek>(
             removed_refs.insert(object_ref);
             continue;
         }
-        visited.insert(object_ref.number);
+        visited[visited_index] = true;
 
         object.try_dereference()?;
         let stream_dict = object.as_stream_dict();
@@ -267,10 +276,15 @@ fn push_handle_children(object: &ObjectHandle, stack: &mut Vec<ObjectHandle>) ->
     if object.try_is_dictionary_of_type(b"", b"")? {
         return push_handle_dict_children(object, stack, false);
     }
-    if let Some(items) = object.try_as_array()? {
-        for item in items.into_iter().rev() {
-            stack.push(item);
+    if object.try_is_array()? {
+        let items = object.try_array_items()?;
+        let mut cursor = items.begin();
+        let mut children = Vec::new();
+        while !cursor.is_end() {
+            children.push(cursor.current());
+            cursor.next();
         }
+        stack.extend(children.into_iter().rev());
     }
     Ok(())
 }
@@ -284,13 +298,27 @@ fn push_handle_dict_children(
     stack: &mut Vec<ObjectHandle>,
     is_stream: bool,
 ) -> crate::Result<()> {
-    let keys = dict.try_get_keys()?;
-    for key in keys.into_iter().rev() {
-        if is_stream && key.as_slice() == b"/Length" {
+    let mut current_key = LiveDictionaryKeyBuffer::default();
+    let mut next_key = LiveDictionaryKeyBuffer::default();
+    let mut first_entry = true;
+    let mut children = Vec::new();
+    while let Some(value) = dict.next_dictionary_entry_for_live_walk(
+        (!first_entry).then_some(current_key.as_slice()),
+        &mut next_key,
+    ) {
+        std::mem::swap(&mut current_key, &mut next_key);
+        // qpdf's getKeys resolves every value before its stream /Length
+        // omission check, so retain that order even for the omitted key.
+        if value.try_is_null()? {
+            first_entry = false;
             continue;
         }
-        stack.push(dict.try_get_key(&key)?);
+        if !(is_stream && current_key.as_slice() == b"/Length") {
+            children.push(value);
+        }
+        first_entry = false;
     }
+    stack.extend(children.into_iter().rev());
     Ok(())
 }
 
@@ -299,6 +327,50 @@ mod tests {
     use super::compressible_objgens_qpdf_plan;
     use crate::{ObjectRef, Pdf};
     use std::io::Cursor;
+
+    #[test]
+    fn eligibility_dictionary_walk_uses_the_live_cursor() {
+        let source = include_str!("eligibility.rs");
+        let start = source
+            .find("fn push_handle_dict_children")
+            .expect("eligibility dictionary walk");
+        let body = &source[start
+            ..source[start..]
+                .find("\n#[cfg(test)]")
+                .expect("eligibility dictionary walk end")
+                + start];
+
+        assert!(
+            body.contains("next_dictionary_entry_for_live_walk"),
+            "eligibility must walk dictionary values through the live cursor"
+        );
+        assert!(
+            !body.contains("try_get_keys") && !body.contains("try_get_key"),
+            "eligibility must not build a key set and repeat dictionary lookup"
+        );
+    }
+
+    #[test]
+    fn eligibility_uses_qpdfs_dense_visited_bitmap() {
+        let source = include_str!("eligibility.rs");
+        let start = source
+            .find("pub(crate) fn compressible_objgens_qpdf_plan")
+            .expect("eligibility planner");
+        let body = &source[start
+            ..source[start..]
+                .find("\n/// Distribute `eligible`")
+                .expect("eligibility planner end")
+                + start];
+
+        assert!(
+            body.contains("Vec<bool>") || body.contains("vec![false"),
+            "eligibility must index qpdf's dense visited bitmap"
+        );
+        assert!(
+            !body.contains("BTreeSet<u32>"),
+            "eligibility must not allocate one tree node per visited object"
+        );
+    }
 
     fn reachable_objstm_with_indirect_length() -> Vec<u8> {
         let mut pdf = b"%PDF-1.5\n".to_vec();

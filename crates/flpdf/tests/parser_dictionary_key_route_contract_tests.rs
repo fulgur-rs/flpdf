@@ -17,7 +17,7 @@ fn function_body<'a>(source: &'a str, start: &str, end: &str) -> &'a str {
 fn parser_dictionary_warnings_use_canonical_raw_key_bytes() {
     let source = parser_source();
     let finish_dictionary = function_body(&source, "fn finish_dictionary", "fn parse_scalar_token");
-    let duplicate = function_body(&source, "fn insert_dictionary_value", "fn integer_or_ref");
+    let duplicate = function_body(&source, "fn insert_dictionary_value", "fn real");
 
     for body in [finish_dictionary, duplicate] {
         for forbidden in [

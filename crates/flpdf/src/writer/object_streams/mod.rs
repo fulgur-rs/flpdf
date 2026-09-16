@@ -15,8 +15,8 @@ pub(crate) use eligibility::{
 #[cfg(test)]
 pub(crate) use eligibility::{compressible_plan_call_count, reset_compressible_plan_call_count};
 pub(crate) use emission::{
-    emit_objstm_body_from_handles_with_writer, emit_objstm_body_from_handles_with_writer_qdf,
-    wrap_objstm_body_as_handle, ObjStmBody,
+    emit_objstm_body_from_handles_with_sink, emit_objstm_body_from_handles_with_sink_qdf,
+    emit_objstm_body_from_handles_with_writer, wrap_objstm_body_as_handle, ObjStmBody,
 };
 #[cfg(test)]
 pub(crate) use planning::sort_source_backed_members_qpdf_order;
