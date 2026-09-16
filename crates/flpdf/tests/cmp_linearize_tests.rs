@@ -237,6 +237,23 @@ fn part9_pages_precede_lower_numbered_preserved_objstm() {
     }
 }
 
+/// qpdf writes the page tree at the head of part 9 and then the remaining
+/// `lc_other` set in object order, so a preserved object stream anchors after
+/// the ordinary `lc_other` object that precedes it rather than after the
+/// promoted page tree (`QPDF_linearization.cc:1279-1290`).
+///
+/// `objstm-lin-part9-head-anchor.pdf` orders its part-9 `lc_other` set as
+/// stream (obj 1), preserved object stream (obj 2), page tree (obj 8). Picking
+/// the last qualifying predecessor instead of the greatest qualifying rank
+/// puts the container directly after the page tree and changes the output.
+#[test]
+fn preserved_container_anchors_after_lc_other_not_the_promoted_page_tree() {
+    assert_linearize_byte_identical(
+        "objstm-lin-part9-head-anchor.pdf",
+        "objstm-lin-part9-head-anchor",
+    );
+}
+
 #[test]
 fn one_page_linearized_is_byte_identical_to_qpdf() {
     assert_linearize_byte_identical("one-page.pdf", "one-page");

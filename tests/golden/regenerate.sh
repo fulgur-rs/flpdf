@@ -245,6 +245,73 @@ else
     echo "Skipping shared-stream-objstm.pdf (already exists)"
 fi
 
+if [[ ! -f "$FIX/objstm-lin-part9-head-anchor.pdf" ]]; then
+    echo "Generating objstm-lin-part9-head-anchor.pdf ..."
+    # Single-page PDF whose Part-9 `lc_other` set holds three objects with
+    # deliberately ordered source numbers: an ObjStm-ineligible stream (obj 1),
+    # a preserved object stream (obj 2), and the page tree (obj 8). qpdf writes
+    # the page tree at the head of part 9 and then the remaining lc_other set in
+    # object order (QPDF_linearization.cc:1279-1290), so the preserved container
+    # must anchor after obj 1 rather than after the promoted page tree. The
+    # catalog reaches objs 6/7 (the container members) and obj 1 through keys
+    # that are not open-document keys, keeping all three in lc_other.
+    python3 - "$FIX/objstm-lin-part9-head-anchor.pdf" <<'PY'
+import struct
+import sys
+import zlib
+
+out = bytearray()
+offsets = {}
+
+
+def add(num, body):
+    offsets[num] = len(out)
+    out.extend(b"%d 0 obj\n" % num)
+    out.extend(body)
+    out.extend(b"\nendobj\n")
+
+
+def stream(dic, data):
+    return b"<< " + dic + b" /Length %d >>\nstream\n" % len(data) + data + b"\nendstream"
+
+
+out.extend(b"%PDF-1.5\n%\xe2\xe3\xcf\xd3\n")
+add(1, stream(b"/Type /Foo", b"marker-one"))
+m6 = b"<< /Type /Foo /Marker (six) >>"
+m7 = b"<< /Type /Foo /Marker (seven) >>"
+pairs = b"6 0 7 %d " % (len(m6) + 1)
+add(2, stream(b"/Type /ObjStm /N 2 /First %d" % len(pairs), pairs + m6 + b" " + m7))
+add(4, b"<< /Type /Catalog /Pages 8 0 R /A 6 0 R /B 7 0 R /C 1 0 R >>")
+add(5, b"<< /Type /Page /Parent 8 0 R /MediaBox [0 0 10 10] /Contents 9 0 R >>")
+add(8, b"<< /Type /Pages /Kids [5 0 R] /Count 1 >>")
+add(9, stream(b"", b"BT ET"))
+
+xref_offset = len(out)
+offsets[3] = xref_offset
+size = 10
+rows = bytearray()
+for number in range(size):
+    if number in (6, 7):
+        rows += bytes([2]) + struct.pack(">I", 2) + bytes([number - 6])
+    elif number in offsets:
+        rows += bytes([1]) + struct.pack(">I", offsets[number]) + bytes([0])
+    else:
+        rows += bytes([0]) + struct.pack(">I", 0) + bytes([255])
+compressed = zlib.compress(bytes(rows), 9)
+out.extend(b"3 0 obj\n")
+out.extend(
+    b"<< /Type /XRef /Size %d /W [1 4 1] /Root 4 0 R /Filter /FlateDecode /Length %d >>\nstream\n"
+    % (size, len(compressed))
+)
+out.extend(compressed)
+out.extend(b"\nendstream\nendobj\n")
+out.extend(b"startxref\n%d\n%%%%EOF\n" % xref_offset)
+open(sys.argv[1], "wb").write(bytes(out))
+PY
+else
+    echo "Skipping objstm-lin-part9-head-anchor.pdf (already exists)"
+fi
+
 if [[ ! -f "$FIX/missing-trailer-info.pdf" ]]; then
     echo "Generating missing-trailer-info.pdf ..."
     # flpdf-4vpi: malformed single-page input whose trailer references a missing
@@ -2203,6 +2270,17 @@ echo "one-page/static-id.pdf"
 qpdf --linearize --deterministic-id --warning-exit-0 \
     "$FIX/one-page.pdf" "$REF/one-page/linearize.pdf"
 echo "one-page/linearize.pdf"
+
+# --- objstm-lin-part9-head-anchor: the part-9 `lc_other` set is ordered
+# stream (obj 1), preserved object stream (obj 2), page tree (obj 8). qpdf puts
+# the page tree at the head of part 9 and the rest in object order, so the
+# container must anchor after obj 1, not after the promoted page tree. ---
+mkdir -p "$REF/objstm-lin-part9-head-anchor"
+qpdf --linearize --deterministic-id --warning-exit-0 \
+    "$FIX/objstm-lin-part9-head-anchor.pdf" \
+    "$REF/objstm-lin-part9-head-anchor/linearize.pdf"
+echo "objstm-lin-part9-head-anchor/linearize.pdf"
+qpdf --check-linearization "$REF/objstm-lin-part9-head-anchor/linearize.pdf"
 
 # --- linearize-indirect-extensions: qpdf's prepareFileForWrite directizes an
 # indirect Catalog /Extensions dictionary before optimization, then the
