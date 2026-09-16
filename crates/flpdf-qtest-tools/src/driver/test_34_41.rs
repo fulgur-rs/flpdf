@@ -668,42 +668,17 @@ pub(crate) fn run_test_39<R: Read + Seek>(
     for (index, page_ref) in page_refs.into_iter().enumerate() {
         writeln!(stdout, "page {}", index + 1)?;
 
-        // `QPDFPageObjectHelper::getImages` walks this page's *own*
-        // `/Resources /XObject` (inherited up `/Parent` when the leaf page
-        // has none) without mutating the page tree
-        // (`libqpdf/QPDFPageObjectHelper.cc:318-383`).
-        // `PageObjectHelper::get_resources` is the same non-mutating inherited
-        // handle walk, so it is used here rather
-        // than `push_inherited_attributes_to_pages`, which *would* write
-        // `/Resources` down onto every page -- a side effect test_39's own
-        // qpdf source never has.
-        let resources = PageObjectHelper::new(page_ref, pdf).get_resources(false)?;
-        let resources = resolve_once(pdf, &resources)?;
-        if resources.is_null() {
-            continue;
-        }
-        let xobject = resolve_once(pdf, &resources.get_key(b"/XObject"))?;
-        let Some(xobject) = xobject.as_dictionary() else {
-            continue;
-        };
-
-        // `std::map<std::string, QPDFObjectHandle>` (`QPDFPageObjectHelper::getImages`,
-        // `:375-384`) iterates in ascending XObject-name order; the canonical
-        // handle dictionary snapshot is BTreeMap-ordered and does the same.
-        for (_key, value) in xobject {
-            let value = resolve_once(pdf, &value)?;
-            let Some(object_ref) = value.object_ref() else {
-                continue;
-            };
-            let handle = pdf.get_object_handle(object_ref);
-            if !handle.is_image(true)? {
-                continue;
-            }
-            let dict = handle
-                .as_stream_dict()
-                .expect("is_image(true) already confirmed a stream value");
-            let filter = resolve_once(pdf, &dict.get_key(b"/Filter"))?.unparse_resolved();
-            let color_space = resolve_once(pdf, &dict.get_key(b"/ColorSpace"))?.unparse_resolved();
+        // qpdf's `getImages` owns the inherited resource/XObject walk and
+        // returns direct image handles in resource-name order
+        // (`libqpdf/QPDFPageObjectHelper.cc:318-383`). The canonical flpdf
+        // helper has the same boundary; keep resolution at the stream-dict,
+        // key, and unparseResolved accessors rather than rebuilding that walk
+        // in the qtest consumer.
+        let images = PageObjectHelper::new(page_ref, pdf).get_images()?;
+        for (_key, image) in images {
+            let dict = image.try_get_stream_dict()?;
+            let filter = dict.try_get_key(b"/Filter")?.try_unparse_resolved()?;
+            let color_space = dict.try_get_key(b"/ColorSpace")?.try_unparse_resolved()?;
             write!(stdout, "filter: ")?;
             write_bytes(stdout, &filter)?;
             write!(stdout, ", color space: ")?;
