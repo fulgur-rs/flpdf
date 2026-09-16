@@ -1113,6 +1113,23 @@ check-linearizationをoccurrence順に同じ `QPDFJob`へ適用する。partial 
 status/stdout/stderrおよびConfig layeringを固定する。image transformation setter
 の未接続は別issue `flpdf-uwu7.1`の責務であり、このsliceには含めない。
 
+### E-12 follow-up: job-json selector usage attribution (`flpdf-n9q36`, 2026-09-16)
+
+qpdf の `Config::jobJsonFile` は JSON の partial initialization failureだけを
+file-scoped errorへ変換する（`libqpdf/QPDFJob_config.cc:774-784`）。同じ argv scanの
+後続 positional input/output は通常の Config callbackであり、重複時は
+`QPDFArgParser::usage` / qpdf CLIの usage exit による bare usage errorとなる
+（`libqpdf/QPDFJob_argv.cc:71-82,402-430`; `qpdf/qpdf.cc:12-22,37-38`）。
+
+flpdf は `run_job_json_files` の JSON file eventだけを
+`format_job_json_error`で包み、CLI selector eventの typed `Error::Usage`は
+`main`の共通 usage exitへ渡すようにした。これにより JSON 後の input/output
+重複は qpdf と同じ帰属・`For help:` blockになり、JSON handler 内で検出される
+JSON前 selectorとの重複は従来どおり job-json fileへ帰属する。
+`cli_job_json.rs::job_json_file_selector_errors_follow_argv_order` は JSON前後の
+input/output 4ケースを qpdf 11.9.0 と status/stdout/stderrで固定する。
+新しい bridgeや deviation markerは追加しない。
+
 ## E-10 primary document graph retention in distinct-secondary `--pages` (`flpdf-lrm3u`, 2026-09-15)
 
 qpdf keeps the primary `QPDF` as the page-job base while

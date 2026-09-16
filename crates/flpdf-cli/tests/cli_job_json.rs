@@ -457,6 +457,75 @@ fn job_json_file_empty_input_selector_follows_argv_order() {
 }
 
 #[test]
+fn job_json_file_selector_errors_follow_argv_order() {
+    if !qpdf_available() {
+        return;
+    }
+
+    let directory = tempfile::tempdir().unwrap();
+    fs::copy(
+        PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../tests/fixtures/minimal.pdf"),
+        directory.path().join("input.pdf"),
+    )
+    .unwrap();
+
+    let cases: &[(&str, &[u8], &[&str])] = &[
+        (
+            "output-json-before-positional",
+            br#"{"outputFile":"json-output.pdf"}"#,
+            &[
+                "--job-json-file=job.json",
+                "input.pdf",
+                "positional-output.pdf",
+            ],
+        ),
+        (
+            "output-positional-before-json",
+            br#"{"outputFile":"json-output.pdf"}"#,
+            &[
+                "input.pdf",
+                "positional-output.pdf",
+                "--job-json-file=job.json",
+            ],
+        ),
+        (
+            "input-json-before-positional",
+            br#"{"inputFile":"json-input.pdf"}"#,
+            &["--job-json-file=job.json", "input.pdf"],
+        ),
+        (
+            "input-positional-before-json",
+            br#"{"inputFile":"json-input.pdf"}"#,
+            &["input.pdf", "--job-json-file=job.json"],
+        ),
+    ];
+
+    for (name, json, args) in cases {
+        fs::write(directory.path().join("job.json"), json).unwrap();
+        let qpdf = ProcessCommand::new("/usr/bin/qpdf")
+            .current_dir(directory.path())
+            .args(*args)
+            .output()
+            .unwrap();
+        let flpdf = Command::cargo_bin("flpdf")
+            .unwrap()
+            .current_dir(directory.path())
+            .env("FLPDF_PROGNAME", "qpdf")
+            .args(*args)
+            .output()
+            .unwrap();
+
+        assert_eq!(
+            flpdf.status.code(),
+            qpdf.status.code(),
+            "status differs for {name}: qpdf={qpdf:?}, flpdf={flpdf:?}"
+        );
+        assert_eq!(flpdf.stdout, qpdf.stdout, "stdout differs for {name}");
+        assert_eq!(flpdf.stderr, qpdf.stderr, "stderr differs for {name}");
+    }
+}
+
+#[test]
 fn job_json_file_preserves_input_encryption_when_compression_is_disabled() {
     if !qpdf_available() {
         return;

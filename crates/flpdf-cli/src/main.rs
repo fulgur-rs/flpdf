@@ -3348,7 +3348,7 @@ fn main() {
     let result = if args.replace_input && (args.json.is_some() || args.json_output.is_some()) {
         Err(UsageError::new("--json may not be used with --replace-input").into())
     } else if !args.job_json_file.is_empty() {
-        run_job_json_files(&args.job_json_file, &raw_residual_args, args.no_warn)
+        run_job_json_files(&raw_residual_args, args.no_warn)
     } else if json_input_inspection {
         run_json_input_inspection(
             &args,
@@ -4304,44 +4304,32 @@ fn job_json_event_error(
     }
 }
 
-fn run_job_json_files(
-    paths: &[PathBuf],
-    raw_args: &[arg_parser::RawArg],
-    suppress_warnings: bool,
-) -> CliResult<()> {
+fn run_job_json_files(raw_args: &[arg_parser::RawArg], suppress_warnings: bool) -> CliResult<()> {
     let mut job = QPDFJob::new();
     job.set_warnings_exit_zero(cli_warning_exit_zero());
     job.set_logger(cli_logger());
     job.set_suppress_warnings(suppress_warnings);
 
-    let mut error_path = paths.last().cloned();
     for event in job_json_cli_events(raw_args)? {
         match event {
             JobJsonCliEvent::JobJsonFile(path) => {
-                error_path = Some(path.clone());
                 let json = std::fs::read(&path).map_err(|error| {
                     error_with_file(&path, Box::new(error) as Box<dyn std::error::Error>)
                 })?;
                 job.initialize_from_json_partial_bytes(&json)
-                    .map_err(|error| job_json_event_error(error_path.as_deref(), error))?;
+                    .map_err(|error| job_json_event_error(Some(&path), error))?;
             }
             JobJsonCliEvent::EmptyInput => {
-                job.config()
-                    .empty_input()
-                    .map_err(|error| job_json_event_error(error_path.as_deref(), error))?;
+                job.config().empty_input()?;
             }
             JobJsonCliEvent::Input(path) => {
-                job.set_input_file(path)
-                    .map_err(|error| job_json_event_error(error_path.as_deref(), error))?;
+                job.set_input_file(path)?;
             }
             JobJsonCliEvent::Output(path) => {
-                job.set_output_file(path)
-                    .map_err(|error| job_json_event_error(error_path.as_deref(), error))?;
+                job.set_output_file(path)?;
             }
             JobJsonCliEvent::ReplaceInput => {
-                job.config()
-                    .replace_input()
-                    .map_err(|error| job_json_event_error(error_path.as_deref(), error))?;
+                job.config().replace_input()?;
             }
             JobJsonCliEvent::Password(password) => job.set_password(password),
             JobJsonCliEvent::PasswordFile(path) => {
