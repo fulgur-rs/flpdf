@@ -10850,6 +10850,81 @@ mod tests {
         v.iter().map(|s| OsString::from(*s)).collect()
     }
 
+    fn empty_page_ops() -> PageOpArgs {
+        PageOpArgs {
+            empty: true,
+            ..PageOpArgs::default()
+        }
+    }
+
+    #[test]
+    fn attachment_input_output_maps_empty_positional_to_output() {
+        let page_ops = empty_page_ops();
+        let output = PathBuf::from("out.pdf");
+        assert_eq!(
+            attachment_input_output(Some(output.clone()), None, &page_ops, false).unwrap(),
+            (None, Some(output.clone()))
+        );
+        assert_eq!(
+            attachment_input_output(None, Some(output.clone()), &page_ops, false).unwrap(),
+            (None, Some(output))
+        );
+    }
+
+    #[test]
+    fn attachment_input_output_preserves_nonempty_input_and_output() {
+        let page_ops = PageOpArgs::default();
+        let input = PathBuf::from("in.pdf");
+        let output = PathBuf::from("out.pdf");
+        assert_eq!(
+            attachment_input_output(Some(input.clone()), Some(output.clone()), &page_ops, false,)
+                .unwrap(),
+            (Some(input), Some(output))
+        );
+    }
+
+    #[test]
+    fn attachment_input_output_matches_empty_usage_errors() {
+        let page_ops = empty_page_ops();
+        let error = attachment_input_output(
+            Some(PathBuf::from("in.pdf")),
+            Some(PathBuf::from("out.pdf")),
+            &page_ops,
+            false,
+        )
+        .err()
+        .unwrap()
+        .to_string();
+        assert_eq!(
+            error,
+            "empty input can't be used since input file has already been given"
+        );
+
+        let error = attachment_input_output(Some(PathBuf::from("out.pdf")), None, &page_ops, true)
+            .err()
+            .unwrap()
+            .to_string();
+        assert_eq!(
+            error,
+            "replace-input can't be used since output file has already been given"
+        );
+
+        let error = attachment_input_output(None, None, &page_ops, true)
+            .err()
+            .unwrap()
+            .to_string();
+        assert_eq!(error, "--replace-input may not be used with --empty");
+
+        let error = attachment_input_output(None, None, &page_ops, false)
+            .err()
+            .unwrap()
+            .to_string();
+        assert_eq!(
+            error,
+            "an output file name is required; use - for standard output"
+        );
+    }
+
     #[test]
     fn cli_flatten_modes_use_the_canonical_job_masks() {
         assert_eq!(
