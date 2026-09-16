@@ -1656,6 +1656,26 @@ password interpretation、recovery、check-linearizationを同じ `QPDFJob` へ
 `crates/flpdf/src/job/lifecycle.rs::tests::partial_job_json_preserves_preconfigured_qpdf_state`
 が、qpdf 11.9.0とのstatus/stdout/stderrと共有Configの差分を固定する。
 
+### job-json selector usage boundary (`flpdf-n9q36`, 2026-09-16)
+
+qpdf の `Config::jobJsonFile` は `initializeFromJson(..., true)` の失敗だけを
+その JSON file の文脈で扱う（`libqpdf/QPDFJob_config.cc:774-784`）。その後の
+位置 input/output や `--empty` / `--replace-input` は同じ argv scan の通常 callback
+から Config setterへ入り、`QPDFArgParser::usage` → qpdf CLIの usage exit の
+bare usage 境界を通る（`libqpdf/QPDFJob_argv.cc:71-82,402-430`、
+`qpdf/qpdf.cc:12-22,37-38`）。したがって JSON より後ろの selector 重複は
+`error with job-json file` の文脈を持たず、JSON より前の selectorに対する
+重複を JSON handler が検出した場合だけ job-json 文脈を持つ。
+
+flpdf の `run_job_json_files` は、JSON file eventでは既存の
+`format_job_json_error` を使い続け、CLI selector eventでは `QPDFJob` setterが
+返す typed `Error::Usage` をそのまま外側の `find_usage_error` → `usage_exit`へ
+渡す。この差分は診断の所有境界だけを直し、共有 Config、argv occurrence順、
+exit code、`For help:` blockは変更しない。`cli_job_json.rs` の
+`job_json_file_selector_errors_follow_argv_order` が input/output の JSON前後
+4ケースを qpdf 11.9.0 と status/stdout/stderrで固定する。新しい bridgeや
+qpdf-deviation markerは追加しない。
+
 | `QPDFLogger.cc` | 255 | `logger.rs`（private stdout tracker、shared info/warn/error/save routes、standard stdout/stderr/discard、reset/following、save collision、custom sink ownership）+ `reader/resolver.rs` / `reader.rs`（文書 warning の append-then-route、suppression、live logger replacement）+ `flpdf-cli/src/main.rs`（下記 qpdf-equivalent consumers） | ✅ `QPDFLogger.cc:9-40,43-51,80-254`。`diagnostics.rs` は logger ではなく collection-only value store として維持する |
 
 `QPDFArgParser` の help-table 境界は、`flpdf-cli/src/arg_parser.rs` の raw/canonical 二重 argv と
