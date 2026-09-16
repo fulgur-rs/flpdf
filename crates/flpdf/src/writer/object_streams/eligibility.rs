@@ -356,9 +356,13 @@ mod tests {
     use crate::{ObjectRef, Pdf};
     use std::io::Cursor;
 
+    fn normalized_source() -> String {
+        include_str!("eligibility.rs").replace("\r\n", "\n")
+    }
+
     #[test]
     fn eligibility_dictionary_walk_uses_the_live_cursor() {
-        let source = include_str!("eligibility.rs");
+        let source = normalized_source();
         let start = source
             .find("fn push_handle_dict_children")
             .expect("eligibility dictionary walk");
@@ -380,7 +384,7 @@ mod tests {
 
     #[test]
     fn eligibility_uses_qpdfs_dense_visited_bitmap() {
-        let source = include_str!("eligibility.rs");
+        let source = normalized_source();
         let start = source
             .find("pub(crate) fn compressible_objgens_qpdf_plan")
             .expect("eligibility planner");
@@ -402,7 +406,7 @@ mod tests {
 
     #[test]
     fn eligibility_keeps_qpdf_dense_storage_for_large_bounds() {
-        let source = include_str!("eligibility.rs");
+        let source = normalized_source();
         let production_end = source
             .find("\n#[cfg(test)]\nmod tests")
             .expect("eligibility production end");
@@ -425,7 +429,7 @@ mod tests {
 
     #[test]
     fn eligibility_visited_storage_has_no_sparse_number_set() {
-        let source = include_str!("eligibility.rs");
+        let source = normalized_source();
         let production_end = source
             .find("\n#[cfg(test)]\nmod tests")
             .expect("eligibility production end");
