@@ -526,6 +526,29 @@ fn configure_top_level_inspection_transformations(
     Ok(())
 }
 
+/// Validate top-level rotation parameters at the argv boundary, before any
+/// input consumer is allowed to open a file. qpdf's `Config::rotate` callback
+/// parses through `QPDFJob::parseRotationParameter` during argv
+/// initialization (`QPDFJob_config.cc:786-790`, `QPDFJob.cc:368-415`), while
+/// standalone flpdf inspection routes apply the already-validated state to a
+/// separately opened document later. Reuse the same Config setter here so an
+/// invalid parameter retains qpdf's typed usage boundary and raw-byte parser.
+fn validate_top_level_rotation_parameters(parameters: &[OsString]) -> Result<(), UsageError> {
+    let mut job = QPDFJob::new();
+    for parameter in parameters {
+        if let Err(error) = job
+            .config()
+            .rotate(arg_parser::os_bytes(parameter.as_os_str()))
+        {
+            return Err(match error {
+                Error::Usage(error) => error,
+                error => UsageError::new(error.to_string()),
+            });
+        }
+    }
+    Ok(())
+}
+
 /// Translate the CLI's effective writer options into the reusable library
 /// configuration that qpdf reapplies to every split-page output writer.
 fn writer_configuration(
@@ -3240,6 +3263,9 @@ fn main() {
         top_level_image_options,
     );
     let top_level_rotation_parameters = args.page_ops.rotate.clone();
+    if let Err(error) = validate_top_level_rotation_parameters(&top_level_rotation_parameters) {
+        usage_exit(&error);
+    }
     let mut top_level_inspection_transform_options = InspectionTransformOptions::new(
         top_level_image_transform_options,
         args.generate_appearances,
