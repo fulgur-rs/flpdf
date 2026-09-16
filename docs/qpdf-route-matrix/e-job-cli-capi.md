@@ -1167,6 +1167,24 @@ job-json attributionを保持し、Rust固有の `(os error N)`を出さない�
 missing job-jsonのexit/stdout/stderrをqpdf 11.9.0と比較する。新しいbridgeや
 deviation markerは追加しない。
 
+### E-12 follow-up: job-json non-UTF-8 fatal path (`flpdf-ktd5p`, 2026-09-16)
+
+qpdf は native `char* argv`を `std::string`として `QPDFJob::Config::jobJsonFile`
+へ渡し、read failureを raw path付きの job-json errorへ変換する
+（`qpdf/qpdf.cc:27-60`; `libqpdf/QPDFJob_argv.cc:402-427`;
+`libqpdf/QPDFJob_config.cc:774-784`）。内側の `open <path>: <strerror>`も
+`QUtil::safe_fopen`と`QPDFSystemError`が同じ bytesで組み立てる
+（`libqpdf/QUtil.cc:490-525`; `libqpdf/QPDFSystemError.cc:5-29`）。
+
+flpdf は existing `path_description`/`emit_logger_error`と、closed
+`flpdf-8k4e`の `Error::SystemBytes`/`raw_message`を利用する。job-jsonだけを
+`CliRawExitError`とbyte formatterへ接続し、`format_job_json_error`と
+`qpdf_json_input_open_error`の `Path::display()`による U+FFFD置換を除去する。
+`cli_job_json.rs::job_json_file_missing_preserves_non_utf8_path_bytes`は Linuxで
+raw `\\xff\\xfe` pathを qpdf 11.9.0 と比較し、status/stdout/stderr全体の一致を
+確認する。通常の `CliExitError` callers、parser、bridge、deviation markerは
+変更しない。
+
 ## E-10 primary document graph retention in distinct-secondary `--pages` (`flpdf-lrm3u`, 2026-09-15)
 
 qpdf keeps the primary `QPDF` as the page-job base while

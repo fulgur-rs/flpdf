@@ -1693,6 +1693,26 @@ job-json reporting boundaryへ揃えた。`cli_job_json.rs::job_json_file_missin
 が missing fileの exit/stdout/stderrを qpdf 11.9.0と比較する。新しい
 file-error wrapper、bridge、qpdf-deviation markerは追加しない。
 
+### job-json non-UTF-8 fatal path boundary (`flpdf-ktd5p`, 2026-09-16)
+
+qpdf の `QPDFJob::Config::jobJsonFile` は、argv から受け取った raw
+`std::string` pathで `read_file_into_string` を呼び、例外を同じ raw pathで
+`error with job-json file <path>:` に包む（`libqpdf/QPDFJob_config.cc:774-784`）。
+`QUtil::safe_fopen` / `QPDFSystemError` も `std::string` の path bytesを
+そのまま `open <path>: <strerror>`へ連結する（`libqpdf/QUtil.cc:490-525`、
+`libqpdf/QPDFSystemError.cc:5-29`）。
+
+flpdf の `RawArg` / `path_description` はこの raw-byte境界を既に持つが、
+`format_job_json_error` と `qpdf_json_input_open_error` が `Path::display()`へ
+戻し、さらに `CliExitError.message: String` がその結果を固定していた。
+`Error::SystemBytes` / `raw_message`（`flpdf-8k4e`）を inner errorに再利用し、
+job-json専用の raw exit carrier と byte formatter を通すことで、outer context、
+inner open message、`For help:` blockを qpdfの出力順のまま保つ。通常の
+`CliExitError` callersは変更しない。`cli_job_json.rs::job_json_file_missing_preserves_non_utf8_path_bytes`
+は Linux の `OsStringExt::from_vec` で `\\xff\\xfe`を含む pathを qpdf 11.9.0
+と比較し、status/stdout/stderr全体と raw bytesの保持を固定する。新しい
+parser、bridge、qpdf-deviation markerは追加しない。
+
 | `QPDFLogger.cc` | 255 | `logger.rs`（private stdout tracker、shared info/warn/error/save routes、standard stdout/stderr/discard、reset/following、save collision、custom sink ownership）+ `reader/resolver.rs` / `reader.rs`（文書 warning の append-then-route、suppression、live logger replacement）+ `flpdf-cli/src/main.rs`（下記 qpdf-equivalent consumers） | ✅ `QPDFLogger.cc:9-40,43-51,80-254`。`diagnostics.rs` は logger ではなく collection-only value store として維持する |
 
 `QPDFArgParser` の help-table 境界は、`flpdf-cli/src/arg_parser.rs` の raw/canonical 二重 argv と

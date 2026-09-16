@@ -668,6 +668,57 @@ fn job_json_file_missing_reports_job_json_context_and_usage() {
     assert_eq!(flpdf.stderr, qpdf.stderr);
 }
 
+#[cfg(target_os = "linux")]
+#[test]
+fn job_json_file_missing_preserves_non_utf8_path_bytes() {
+    if !qpdf_available() {
+        return;
+    }
+
+    use std::ffi::OsString;
+    use std::os::unix::ffi::{OsStrExt, OsStringExt};
+
+    let directory = tempfile::tempdir().unwrap();
+    let missing = directory
+        .path()
+        .join(OsString::from_vec(b"missing-\xff\xfe.json".to_vec()));
+    let mut argument = b"--job-json-file=".to_vec();
+    argument.extend_from_slice(missing.as_os_str().as_bytes());
+    let argument = OsString::from_vec(argument);
+
+    let qpdf = ProcessCommand::new("/usr/bin/qpdf")
+        .current_dir(directory.path())
+        .arg(&argument)
+        .output()
+        .unwrap();
+    let flpdf = Command::cargo_bin("flpdf")
+        .unwrap()
+        .current_dir(directory.path())
+        .env("FLPDF_PROGNAME", "qpdf")
+        .arg(&argument)
+        .output()
+        .unwrap();
+
+    assert_eq!(flpdf.status.code(), qpdf.status.code());
+    assert_eq!(flpdf.stdout, qpdf.stdout);
+    assert_eq!(flpdf.stderr, qpdf.stderr);
+    assert!(
+        qpdf.stderr
+            .windows(missing.as_os_str().as_bytes().len())
+            .any(|window| window == missing.as_os_str().as_bytes()),
+        "qpdf fixture must retain the raw missing path: {:?}",
+        qpdf.stderr
+    );
+    assert!(
+        !flpdf
+            .stderr
+            .windows(3)
+            .any(|window| window == b"\xef\xbf\xbd"),
+        "flpdf must not replace the raw path with U+FFFD: {:?}",
+        flpdf.stderr
+    );
+}
+
 #[test]
 fn job_json_file_show_npages_matches_qpdf_without_output_file() {
     if !qpdf_available() {
