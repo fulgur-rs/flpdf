@@ -1169,6 +1169,7 @@ job-json attributionを保持し、Rust固有の `(os error N)`を出さない�
 missing job-jsonのexit/stdout/stderrをqpdf 11.9.0と比較する。新しいbridgeや
 deviation markerは追加しない。
 
+
 ### E-17 / E-21 argv-order parse validation (`flpdf-godwa`, 2026-09-16)
 
 qpdfの `QPDFArgParser::parseArgs` は required parameter / choices と各 callbackを
@@ -1185,6 +1186,22 @@ missing job-json fileの診断が後続の固定順 validationに追い越され
 `cli_job_json.rs::top_level_parse_errors_follow_qpdf_argv_order`で8つの相対順を
 qpdf 11.9.0とexit/stdout/stderr比較する。job-JSON transformation wiringは
 `flpdf-uwu7`の別責務であり、新しいbridgeやdeviation markerは追加しない。
+
+### E-12 follow-up: job-json directory read diagnostic (`flpdf-jhaqf`, 2026-09-16)
+
+qpdf の `Config::jobJsonFile` は `read_file_into_string` の例外を job-json
+contextへ包むが、directory専用の意味論やエラーメッセージは定義しない
+（`libqpdf/QPDFJob_config.cc:774-784`; `libqpdf/QUtil.cc:490-525,1167-1214`）。
+Linux の qpdf 11.9.0 が返す `basic_string::_M_create` は pinned qpdf sourceに
+存在しない libstdc++ `std::string` allocation artifactであり、Rust側で
+hardcodeしない。
+
+flpdf は `IsADirectory` を `open <path>: Is a directory`として報告する。
+directory-only branchには `qpdf-deviation` markerを置き、通常の missing/
+permission wordingとは分離する。`cli_job_json.rs::job_json_file_directory_keeps_the_portable_flpdf_diagnostic`
+は qpdf の artifactとflpdfのportable診断を Linux でcharacterizeし、exit 2・
+stdout・各内側メッセージを検証する。新しいparserやbridgeは追加しない。
+
 
 ## E-10 primary document graph retention in distinct-secondary `--pages` (`flpdf-lrm3u`, 2026-09-15)
 

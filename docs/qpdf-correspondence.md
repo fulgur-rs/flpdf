@@ -1717,6 +1717,23 @@ job-JSONの変換オプション適用は別issue `flpdf-uwu7`に残る。
 exit/stdout/stderrをqpdf 11.9.0と比較する。新しいargv parser、bridge、
 qpdf-deviation markerは追加しない。
 
+### job-json directory read diagnostic (`flpdf-jhaqf`, 2026-09-16)
+
+qpdf の `QPDFJob::Config::jobJsonFile` は `QUtil::read_file_into_string` の
+例外を job-json contextへ包むが、directoryを特別扱いする分岐は持たない
+（`libqpdf/QPDFJob_config.cc:774-784`; `libqpdf/QUtil.cc:490-525,1167-1214`）。
+Linux の qpdf 11.9.0 で `/tmp`、`/home`、`tests`を渡すと出る
+`basic_string::_M_create` は qpdf sourceに存在せず、libstdc++ の
+`std::string` allocation artifactである。
+
+flpdf は `std::fs::read` が返す `IsADirectory`を `open <path>: Is a directory`
+として報告する。この directory-only branchには、toolchain依存の qpdf内部
+文言を hardcodeしない理由を `qpdf-deviation` markerで記録する。missing、
+permissionなど qpdfが意図している通常の strerror wordingはこの扱いに含めない。
+`cli_job_json.rs::job_json_file_directory_keeps_the_portable_flpdf_diagnostic`
+は Linuxで qpdfの artifactとflpdfの安定したportable診断をcharacterizeし、
+両者のstatus/stdoutと各内側メッセージを検証する。新しいparserやbridgeは追加しない。
+
 | `QPDFLogger.cc` | 255 | `logger.rs`（private stdout tracker、shared info/warn/error/save routes、standard stdout/stderr/discard、reset/following、save collision、custom sink ownership）+ `reader/resolver.rs` / `reader.rs`（文書 warning の append-then-route、suppression、live logger replacement）+ `flpdf-cli/src/main.rs`（下記 qpdf-equivalent consumers） | ✅ `QPDFLogger.cc:9-40,43-51,80-254`。`diagnostics.rs` は logger ではなく collection-only value store として維持する |
 
 `QPDFArgParser` の help-table 境界は、`flpdf-cli/src/arg_parser.rs` の raw/canonical 二重 argv と
