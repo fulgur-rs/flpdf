@@ -3659,6 +3659,33 @@ writer/linearizationの遅延key走査はsource xrefとcanonical cacheのunion�
 の責務と一致し、qpdf absent の facade cache/synchronization/provenanceをcanonical
 document stateへ混ぜない。
 
+### JSON v2 object-map generation and object-zero parity `flpdf-rbja1` (2026-09-16)
+
+qpdf の `read_xref` は `/Prev` chain を読み終えた後、同じ object number の lower
+generation を `removeObject` で xref table と object cache から除去する
+（`libqpdf/QPDF.cc:650-725`、`1995-2005`）。その後の `getAllObjects` は
+`fixDanglingReferences` を一度済ませた canonical `obj_cache` を raw
+`QPDFObjGen` key の順にそのまま列挙する（`libqpdf/QPDF.cc:1239-1269,1285-1295`）。
+flpdf はこれまで xref の projection だけを prune していたため、先に trailer から
+cache に入った `4 0` が最新の `4 1` と併存し得た。`xref.rs::discard_lower_generations`
+は除去した raw key を canonical `ResolverHandle::discard_cached_generations` へ渡し、
+cache cell と exact trailer reference も同じ境界で除去する。これは他の generation の
+dangling reference を object map から誤って消さないための exact-key cleanup である。
+
+object number zero は parser の `ObjectRef` projection には入らないが、qpdf の raw xref
+walk には残る。`readObjectAtOffset` は expected `QPDFObjGen(0, 0)` を「offset の実体を
+検査しない probe」として扱い、header mismatch の recovery を行わない
+（`libqpdf/QPDF.cc:1541-1553`）。flpdf は `QpdfObjGen(0, 0)` を canonical cache に
+materializeし、raw free/type-0 row を qpdf と同じ warning 後の null にし、in-use row は
+同じ probe reader を通した後に object-zero slot を null にする。これにより malformed
+`issue-143.pdf` の `obj:0 0 R` と warning order、および正常な in-use object-zero xref
+row の JSON key が qpdf 11.9.0 と一致する。
+
+回帰は `crates/flpdf-cli/tests/cli_json_object_generation.rs` の synthetic incremental
+generation / object-zero tests と、qpdf-qtest の `issue-143.pdf`、既存の dangling-container
+および historical-incremental live probes で確認する。通常の trailer-only `0 0 R` は
+raw xref row ではないため、従来どおり object map に追加しない。
+
 ### A6/A7/A8 final facade cleanup `flpdf-3yn9.48.23.10` (2026-09-12)
 
 qpdf 11.9.0 の `QPDFObjectHandle` typed/null accessors は入口で

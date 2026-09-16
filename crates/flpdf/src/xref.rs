@@ -84,6 +84,7 @@ pub(crate) trait CanonicalTrailerOwner {
     fn indirect_handle(&self, object_ref: ObjectRef) -> ObjectHandle;
     fn direct_handle(&self, value: ObjectValue) -> ObjectHandle;
     fn install_xref_entries(&self, entries: BTreeMap<ObjectRef, XrefEntry>);
+    fn discard_cached_generations(&self, object_gens: &[QpdfObjGen]);
     fn set_header_offset(&self, offset: usize);
     /// qpdf's live `m->file` source boundary (`QPDF.hh:67-97,1453-1457`).
     /// Canonical xref loading uses these operations instead of a complete
@@ -151,6 +152,10 @@ impl<R: Read + Seek + 'static> CanonicalTrailerOwner for ResolverHandle<R> {
 
     fn install_xref_entries(&self, entries: BTreeMap<ObjectRef, XrefEntry>) {
         self.install_source_xref_entries(entries);
+    }
+
+    fn discard_cached_generations(&self, object_gens: &[QpdfObjGen]) {
+        ResolverHandle::discard_cached_generations(self, object_gens);
     }
 
     fn set_header_offset(&self, offset: usize) {
@@ -478,7 +483,7 @@ fn discard_lower_generations(
     raw_entries: &mut BTreeMap<QpdfObjGen, XrefEntry>,
     entries: &mut BTreeMap<ObjectRef, XrefEntry>,
     parsed_xref_streams: &mut BTreeMap<ObjectRef, ObjectHandle>,
-) {
+) -> Vec<QpdfObjGen> {
     let mut previous: Option<QpdfObjGen> = None;
     let mut lower_generations = Vec::new();
     for &object_ref in raw_entries.keys() {
@@ -489,13 +494,28 @@ fn discard_lower_generations(
         }
         previous = Some(object_ref);
     }
-    for object_ref in lower_generations {
-        raw_entries.remove(&object_ref);
-        if let Some(object_ref) = object_ref.to_object_ref() {
+    for object_gen in &lower_generations {
+        raw_entries.remove(object_gen);
+        if let Some(object_ref) = object_gen.to_object_ref() {
             entries.remove(&object_ref);
             parsed_xref_streams.remove(&object_ref);
         }
     }
+    lower_generations
+}
+
+/// Drop trailer references whose exact raw generation was removed by qpdf's
+/// post-chain highest-generation cleanup. Other dangling trailer references
+/// remain visible in the cache, matching `QPDFParser`'s ordinary behavior.
+fn discard_trailer_references(
+    trailer_references: &mut BTreeSet<ObjectRef>,
+    discarded_generations: &[QpdfObjGen],
+) {
+    trailer_references.retain(|object_ref| {
+        QpdfObjGen::try_from_object_ref(*object_ref).map_or(true, |object_gen| {
+            !discarded_generations.contains(&object_gen)
+        })
+    });
 }
 
 /// The `QPDF::Members` settings the cross-reference loader consults, carried
@@ -2646,11 +2666,15 @@ fn load_xref_state_from_window(
     }
     // cov:ignore-end
 
-    discard_lower_generations(
+    let discarded_generations = discard_lower_generations(
         &mut loaded.raw_entries,
         &mut loaded.loaded.entries,
         &mut loaded.parsed_xref_streams,
     );
+    if let Some(owner) = canonical_trailer_owner {
+        owner.discard_cached_generations(&discarded_generations);
+    }
+    discard_trailer_references(&mut loaded.trailer_references, &discarded_generations);
     loaded.header_offset = header_offset;
     Ok(loaded)
 }
@@ -3819,7 +3843,12 @@ fn recover_xref_from_linear_scan(
     // line-scan generation. Keep this call scoped to the candidate re-entry
     // rather than applying normal read_xref cleanup to all recovery results.
     if candidate_xref_reentered {
-        discard_lower_generations(&mut raw_entries, &mut entries, &mut parsed_xref_streams);
+        let discarded_generations =
+            discard_lower_generations(&mut raw_entries, &mut entries, &mut parsed_xref_streams);
+        if let Some(owner) = canonical_trailer_owner {
+            owner.discard_cached_generations(&discarded_generations);
+        }
+        discard_trailer_references(&mut trailer_references, &discarded_generations);
     }
     Ok(LoadedXrefState {
         loaded: LoadedXref {
@@ -9035,6 +9064,8 @@ mod final_handle_tests {
         }
 
         fn install_xref_entries(&self, _entries: BTreeMap<ObjectRef, XrefEntry>) {}
+
+        fn discard_cached_generations(&self, _object_gens: &[QpdfObjGen]) {} // cov:ignore: failure-injection owner has no canonical cache to purge
 
         fn set_header_offset(&self, _offset: usize) {}
 
