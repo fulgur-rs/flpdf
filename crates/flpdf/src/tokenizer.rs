@@ -198,6 +198,15 @@ pub(crate) enum PushedSimpleToken {
 pub(crate) enum PushedLiveToken {
     Integer(PushedInteger),
     Simple(PushedSimpleToken),
+    Owned(PushedLiveOwnedToken),
+}
+
+pub(crate) struct PushedLiveOwnedToken {
+    pub(crate) token_type: TokenType,
+    pub(crate) value: Vec<u8>,
+    pub(crate) error_message: Option<Vec<u8>>,
+    pub(crate) raw_len: usize,
+    pub(crate) unread: Option<u8>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -370,7 +379,7 @@ impl<'a> Tokenizer<'a> {
     /// numeric values and offsets while `QPDFTokenizer::nextToken` reuses
     /// `raw_val` on the next token (`QPDFParser.cc:140-175`,
     /// `QPDFTokenizer.cc:921-925`).
-    pub(crate) fn get_live_compact(&mut self) -> Option<PushedLiveToken> {
+    pub(crate) fn get_live_token(&mut self) -> Option<PushedLiveToken> {
         if self.state != State::TokenReady {
             return None;
         }
@@ -381,7 +390,8 @@ impl<'a> Tokenizer<'a> {
         } else {
             None
         };
-        let compact = match self.token_type {
+        let token_type = self.token_type;
+        let compact = match token_type {
             TokenType::Integer => PushedLiveToken::Integer(PushedInteger {
                 value: parse_integer_bytes(&self.raw, self.token_start),
                 raw_len,
@@ -400,11 +410,30 @@ impl<'a> Tokenizer<'a> {
             | TokenType::DictOpen
             | TokenType::Eof
             | TokenType::Null => PushedLiveToken::Simple(PushedSimpleToken::Simple {
-                token_type: self.token_type,
+                token_type,
                 raw_len,
                 unread,
             }),
-            _ => return None,
+            TokenType::Bad
+            | TokenType::Name
+            | TokenType::Real
+            | TokenType::String
+            | TokenType::Word => {
+                let value = match token_type {
+                    TokenType::Name | TokenType::String => std::mem::take(&mut self.value),
+                    TokenType::Real | TokenType::Word => std::mem::take(&mut self.raw),
+                    TokenType::Bad => Vec::new(),
+                    _ => unreachable!("checked"), // cov:ignore: outer token match proves this variant
+                };
+                PushedLiveToken::Owned(PushedLiveOwnedToken {
+                    token_type,
+                    value,
+                    error_message: self.error_message.take(),
+                    raw_len,
+                    unread,
+                })
+            }
+            TokenType::Space | TokenType::Comment | TokenType::InlineImage => return None, // cov:ignore: excluded by live tokenizer mode
         };
         self.reset();
         Some(compact)

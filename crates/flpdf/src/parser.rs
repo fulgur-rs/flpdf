@@ -336,7 +336,7 @@ impl<'input, I: LiveInput> LiveTokenSource<'input, I> {
                 // cov:ignore-end
             }
 
-            if let Some(pushed) = self.tokenizer.get_live_compact() {
+            if let Some(pushed) = self.tokenizer.get_live_token() {
                 match pushed {
                     PushedLiveToken::Integer(pushed) => {
                         // Settle the delimiter unread and the last-token
@@ -379,6 +379,17 @@ impl<'input, I: LiveInput> LiveTokenSource<'input, I> {
                             });
                         }
                     },
+                    PushedLiveToken::Owned(pushed) => {
+                        let (start, end) = self.set_token_offsets(pushed.raw_len, pushed.unread)?;
+                        self.last_offset = start;
+                        return Ok(LiveToken::Owned(Token::from_parts(
+                            pushed.token_type,
+                            pushed.value,
+                            Vec::new(),
+                            pushed.error_message,
+                            start..end,
+                        )));
+                    }
                 }
             }
 
@@ -1063,7 +1074,12 @@ impl<I: LiveInput> LiveFileParser<'_, '_, '_, I> {
     ) -> Result<ObjectHandle> {
         match token.token_type {
             TokenType::Name => {
-                Ok(self.direct_at(ObjectValue::Name(token.value[1..].to_vec()), scalar_offset))
+                let mut value = token.value;
+                if !value.is_empty() {
+                    value.copy_within(1.., 0);
+                    value.pop();
+                }
+                Ok(self.direct_at(ObjectValue::Name(value), scalar_offset))
             }
             TokenType::String => {
                 let mut value = token.value;
@@ -1967,6 +1983,34 @@ mod live_input_tests {
         ));
     }
 
+    #[test]
+    fn live_token_source_drops_parser_unused_raw_token_bytes() {
+        let mut input = CountingInput::new(b"/A 1.25 Do");
+        let mut tokens = LiveTokenSource::new(&mut input);
+
+        assert!(matches!(
+            tokens.next_live_token().expect("name"),
+            super::LiveToken::Owned(token)
+                if token.token_type == TokenType::Name
+                    && token.value == b"/A"
+                    && token.raw.is_empty()
+        ));
+        assert!(matches!(
+            tokens.next_live_token().expect("real"),
+            super::LiveToken::Owned(token)
+                if token.token_type == TokenType::Real
+                    && token.value == b"1.25"
+                    && token.raw.is_empty()
+        ));
+        assert!(matches!(
+            tokens.next_live_token().expect("word"),
+            super::LiveToken::Owned(token)
+                if token.token_type == TokenType::Word
+                    && token.value == b"Do"
+                    && token.raw.is_empty()
+        ));
+    }
+
     // An integer whose digits overflow `i64` must still leave the input where
     // the next read expects it. qpdf unreads the delimiter and calls
     // `setLastOffset` inside `QPDFTokenizer::nextToken`
@@ -2742,7 +2786,8 @@ enum RealClassification {
 // (`real_object`) and the canonical live parser call this instead of
 // recomputing the comparison themselves.
 fn classify_real(token: Token) -> Result<RealClassification> {
-    let text = std::str::from_utf8(&token.value)
+    let literal = token.value;
+    let text = std::str::from_utf8(&literal)
         .map_err(|_| Error::parse(token.start, "real is not utf-8"))?;
     let value = text
         .parse::<f64>()
@@ -2752,13 +2797,10 @@ fn classify_real(token: Token) -> Result<RealClassification> {
     // byte-identical parity with qpdf's QPDF_Real (which re-emits the parsed
     // string verbatim). When the literal already matches Rust's shortest
     // round-trip, the plain canonical value is smaller and equivalent.
-    if value.to_string().as_bytes() == token.raw {
+    if value.to_string().as_bytes() == literal {
         Ok(RealClassification::Canonical(value))
     } else {
-        Ok(RealClassification::Literal {
-            value,
-            literal: token.raw,
-        })
+        Ok(RealClassification::Literal { value, literal })
     }
 }
 
