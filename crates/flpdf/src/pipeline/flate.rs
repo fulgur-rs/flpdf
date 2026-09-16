@@ -1,7 +1,7 @@
 //! Flate compression pipeline stage.
 //!
-//! qpdf correspondence: Pl_Flate.cc streaming inflate, deflate, warning
-//! callback, compression-level, and finish responsibilities. Default inflate
+//! qpdf correspondence: Pl_Flate.cc streaming inflate, deflate, warning callback, compression-level, and finish responsibilities.
+//! Default inflate
 //! uses the pure-Rust `zlib-rs` codec; the qpdf-zlib compatibility feature
 //! selects `flate2` backed by classic libz.
 //!
