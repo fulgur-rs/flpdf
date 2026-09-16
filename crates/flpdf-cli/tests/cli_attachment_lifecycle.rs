@@ -180,6 +180,236 @@ fn qpdf_add_attachment(
     true
 }
 
+/// Compare an attachment mutation plus split-pages invocation with qpdf's
+/// numbered chunk outputs. QDF disables the sanctioned DEFLATE backend
+/// difference, so this whole-file comparison runs in the default test suite.
+fn assert_split_attachment_parity<F>(label: &str, expected_chunks: usize, run: F)
+where
+    F: FnOnce(&Path, &Path) -> (std::process::Output, std::process::Output),
+{
+    if !support::is_qpdf_available() {
+        eprintln!("{label}: qpdf not available, skipping");
+        return;
+    }
+
+    let temp = tempfile::tempdir().unwrap();
+    let qpdf_dir = temp.path().join("qpdf");
+    let flpdf_dir = temp.path().join("flpdf");
+    std::fs::create_dir(&qpdf_dir).unwrap();
+    std::fs::create_dir(&flpdf_dir).unwrap();
+    let qpdf_template = qpdf_dir.join("out.pdf");
+    let flpdf_template = flpdf_dir.join("out.pdf");
+    let (qpdf, flpdf) = run(&qpdf_template, &flpdf_template);
+
+    assert!(
+        qpdf.status.success(),
+        "{label}: qpdf split attachment oracle failed: {}",
+        String::from_utf8_lossy(&qpdf.stderr)
+    );
+    assert!(
+        flpdf.status.success(),
+        "{label}: flpdf split attachment route failed: stdout={} stderr={}",
+        String::from_utf8_lossy(&flpdf.stdout),
+        String::from_utf8_lossy(&flpdf.stderr)
+    );
+
+    for page in 1..=expected_chunks {
+        let qpdf_output = qpdf_dir.join(format!("out-{page}.pdf"));
+        let flpdf_output = flpdf_dir.join(format!("out-{page}.pdf"));
+        assert!(
+            qpdf_output.is_file(),
+            "{label}: qpdf must write {qpdf_output:?}"
+        );
+        assert!(
+            flpdf_output.is_file(),
+            "{label}: flpdf must write the qpdf-compatible split output {flpdf_output:?}"
+        );
+        assert_eq!(
+            std::fs::read(qpdf_output).unwrap(),
+            std::fs::read(flpdf_output).unwrap(),
+            "{label}: split page {page} must match qpdf"
+        );
+    }
+    assert!(
+        !flpdf_template.exists(),
+        "{label}: split output template must not be emitted as a single PDF"
+    );
+}
+
+/// The attachment mutation must not bypass qpdf's split-pages output
+/// dispatch. qpdf applies the attachment during `handleTransformations`, then
+/// writes one fresh output per page through `doSplitPages`; the output path is
+/// therefore a naming template rather than a literal file.
+#[test]
+fn split_pages_is_honored_after_add_attachment() {
+    let input =
+        Path::new(env!("CARGO_MANIFEST_DIR")).join("../../tests/fixtures/compat/two-page.pdf");
+    let attachment = Path::new(env!("CARGO_MANIFEST_DIR"))
+        .join("../../tests/fixtures/compat/external-file-stream.bin");
+    assert_split_attachment_parity("add-attachment", 2, |qpdf_template, flpdf_template| {
+        let qpdf = ShellCommand::new("qpdf")
+            .args([
+                "--static-id",
+                "--qdf",
+                input.to_str().unwrap(),
+                "--add-attachment",
+                attachment.to_str().unwrap(),
+                "--key=payload",
+                "--",
+                "--split-pages",
+            ])
+            .arg(qpdf_template)
+            .output()
+            .unwrap();
+        let flpdf = CargoCommand::cargo_bin("flpdf")
+            .unwrap()
+            .args([
+                input.to_str().unwrap(),
+                "--static-id",
+                "--qdf",
+                "--add-attachment",
+                attachment.to_str().unwrap(),
+                "--key=payload",
+                "--",
+                "--split-pages",
+            ])
+            .arg(flpdf_template)
+            .output()
+            .unwrap();
+        (qpdf, flpdf)
+    });
+}
+
+#[test]
+fn split_pages_is_honored_after_remove_attachment() {
+    let input = Path::new(env!("CARGO_MANIFEST_DIR"))
+        .join("../../tests/fixtures/compat/attachment-two-page.pdf");
+    assert_split_attachment_parity("remove-attachment", 2, |qpdf_template, flpdf_template| {
+        let qpdf = ShellCommand::new("qpdf")
+            .args([
+                "--static-id",
+                "--qdf",
+                input.to_str().unwrap(),
+                "--remove-attachment=attachment.txt",
+                "--",
+                "--split-pages",
+            ])
+            .arg(qpdf_template)
+            .output()
+            .unwrap();
+        let flpdf = CargoCommand::cargo_bin("flpdf")
+            .unwrap()
+            .args([
+                input.to_str().unwrap(),
+                "--static-id",
+                "--qdf",
+                "--remove-attachment=attachment.txt",
+                "--",
+                "--split-pages",
+            ])
+            .arg(flpdf_template)
+            .output()
+            .unwrap();
+        (qpdf, flpdf)
+    });
+}
+
+#[test]
+fn split_pages_is_honored_after_copying_attachments() {
+    let input =
+        Path::new(env!("CARGO_MANIFEST_DIR")).join("../../tests/fixtures/compat/two-page.pdf");
+    let donor = Path::new(env!("CARGO_MANIFEST_DIR"))
+        .join("../../tests/fixtures/compat/attachment-two-page.pdf");
+    assert_split_attachment_parity(
+        "copy-attachments-from",
+        2,
+        |qpdf_template, flpdf_template| {
+            let qpdf = ShellCommand::new("qpdf")
+                .args([
+                    "--static-id",
+                    "--qdf",
+                    input.to_str().unwrap(),
+                    "--copy-attachments-from",
+                    donor.to_str().unwrap(),
+                    "--prefix=P",
+                    "--",
+                    "--split-pages",
+                ])
+                .arg(qpdf_template)
+                .output()
+                .unwrap();
+            let flpdf = CargoCommand::cargo_bin("flpdf")
+                .unwrap()
+                .args([
+                    input.to_str().unwrap(),
+                    "--static-id",
+                    "--qdf",
+                    "--copy-attachments-from",
+                    donor.to_str().unwrap(),
+                    "--prefix=P",
+                    "--",
+                    "--split-pages",
+                ])
+                .arg(flpdf_template)
+                .output()
+                .unwrap();
+            (qpdf, flpdf)
+        },
+    );
+}
+
+#[test]
+fn split_pages_is_honored_after_page_selection_and_add_attachment() {
+    let input =
+        Path::new(env!("CARGO_MANIFEST_DIR")).join("../../tests/fixtures/compat/two-page.pdf");
+    let attachment = Path::new(env!("CARGO_MANIFEST_DIR"))
+        .join("../../tests/fixtures/compat/external-file-stream.bin");
+    assert_split_attachment_parity(
+        "pages-plus-add-attachment",
+        1,
+        |qpdf_template, flpdf_template| {
+            let qpdf = ShellCommand::new("qpdf")
+                .args([
+                    "--static-id",
+                    "--qdf",
+                    input.to_str().unwrap(),
+                    "--pages",
+                    ".",
+                    "1",
+                    "--",
+                    "--add-attachment",
+                    attachment.to_str().unwrap(),
+                    "--key=payload",
+                    "--",
+                    "--split-pages",
+                ])
+                .arg(qpdf_template)
+                .output()
+                .unwrap();
+            let flpdf = CargoCommand::cargo_bin("flpdf")
+                .unwrap()
+                .args([
+                    input.to_str().unwrap(),
+                    "--static-id",
+                    "--qdf",
+                    "--pages",
+                    ".",
+                    "1",
+                    "--",
+                    "--add-attachment",
+                    attachment.to_str().unwrap(),
+                    "--key=payload",
+                    "--",
+                    "--split-pages",
+                ])
+                .arg(flpdf_template)
+                .output()
+                .unwrap();
+            (qpdf, flpdf)
+        },
+    );
+}
+
 // ---------------------------------------------------------------------------
 // Matrix cell 1: add → list
 // Both flpdf --list-attachments and qpdf --list-attachments show the key.

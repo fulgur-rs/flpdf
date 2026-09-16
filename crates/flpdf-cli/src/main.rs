@@ -10366,6 +10366,13 @@ fn configure_attachment_job(
         for parameter in &page_ops.collate {
             configuration.collate(parameter.as_bytes())?;
         }
+        // qpdf dispatches split-pages after all transformations, including
+        // attachment mutation (`QPDFJob.cc:473,483-489`). Keep the output
+        // path installed above as the split filename template and let the
+        // canonical Job writer create each numbered chunk.
+        if let Some(parameter) = page_ops.split_pages.as_deref() {
+            configuration.split_pages(parameter.as_bytes())?;
+        }
     }
 
     let input_options = pdf_open_options(repair, password)?;
