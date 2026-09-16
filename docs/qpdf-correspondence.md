@@ -3374,6 +3374,29 @@ content error (`QPDFObjectHandle.cc:1709-1737`). flpdf mirrors this through
 provider-error, unknown-filter, filter-setter, and sink-error boundaries
 against the pinned qpdf 11.9.0 probe.
 
+### `--check` unknown content-filter error boundary (`flpdf-b8xcx`, 2026-09-16)
+
+qpdf's `QPDFObjectHandle::pipeContentStreams`
+(`libqpdf/QPDFObjectHandle.cc:1702-1737`) calls the five-argument
+`pipeStreamData` overload. That overload deliberately returns
+`filtering_attempted`, not the six-argument overload's overall source/pipeline
+success (`libqpdf/QPDFObjectHandle.cc:1300-1325`). An unknown filter can leave
+the raw source readable while keeping `filtering_attempted` false; qpdf turns
+that result into the typed damaged-PDF error `errors while decoding content
+stream`, including the content-stream object identity.
+
+`QPDFJob::doCheck` (`libqpdf/QPDFJob.cc:745-803`) parses every page's content
+streams after the full stream traversal, reports that exception as a page
+error, and exits through `errors detected`. flpdf's canonical
+`ObjectHandle::pipe_content_streams` now consumes the same signal from its
+six-argument primitive: `!succeeded || !filtering_attempted` enters the same
+typed error boundary. The writer callers continue to use the six-argument
+overall-success plus out-parameter contract and retain their qpdf-compatible
+raw fallback behavior. The differential regression
+`cli_check_exitcodes.rs::check_unfilterable_content_stream_matches_qpdf` uses
+an unknown `/PlateDecode` filter and compares qpdf 11.9.0's exit code, stdout,
+stderr, and object-specific error text.
+
 ### qtest document-construction helper ports (`flpdf-egzr.5`)
 
 `flpdf-qtest-tools::document_construction` ports the two qpdf test programs

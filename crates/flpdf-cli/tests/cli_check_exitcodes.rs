@@ -313,6 +313,46 @@ fn corrupt_content_stream_pdf_bytes() -> Vec<u8> {
     pdf
 }
 
+/// A structurally valid single-page PDF whose content stream uses an unknown
+/// filter. qpdf can read the raw stream but cannot decode it, so parsing page
+/// contents reports a damaged content stream and `--check` exits 2.
+fn unfilterable_content_stream_pdf_bytes() -> Vec<u8> {
+    let payload = b"012345678901234567890123456789012345678901234567";
+    let mut pdf = Vec::new();
+    pdf.extend_from_slice(b"%PDF-1.4\n");
+
+    let off1 = pdf.len();
+    pdf.extend_from_slice(b"1 0 obj\n<< /Type /Catalog /Pages 2 0 R >>\nendobj\n");
+    let off2 = pdf.len();
+    pdf.extend_from_slice(b"2 0 obj\n<< /Type /Pages /Kids [3 0 R] /Count 1 >>\nendobj\n");
+    let off3 = pdf.len();
+    pdf.extend_from_slice(
+        b"3 0 obj\n<< /Type /Page /Parent 2 0 R /MediaBox [0 0 612 792] /Contents 4 0 R >>\nendobj\n",
+    );
+    let off4 = pdf.len();
+    pdf.extend_from_slice(
+        format!(
+            "4 0 obj\n<< /Filter /PlateDecode /Length {} >>\nstream\n",
+            payload.len()
+        )
+        .as_bytes(),
+    );
+    pdf.extend_from_slice(payload);
+    pdf.extend_from_slice(b"\nendstream\nendobj\n");
+
+    let xref_start = pdf.len();
+    pdf.extend_from_slice(
+        format!(
+            "xref\n0 5\n0000000000 65535 f \n{off1:010} 00000 n \n{off2:010} 00000 n \n{off3:010} 00000 n \n{off4:010} 00000 n \n"
+        )
+        .as_bytes(),
+    );
+    pdf.extend_from_slice(
+        format!("trailer\n<< /Size 5 /Root 1 0 R >>\nstartxref\n{xref_start}\n%%EOF\n").as_bytes(),
+    );
+    pdf
+}
+
 /// A valid page whose content stream has a stale direct `/Length`. Opening the
 /// document is clean; resolving `/Contents` during `--check` performs the
 /// recovery and must surface those lazy diagnostics as warnings.
@@ -1153,6 +1193,42 @@ fn check_corrupt_content_stream_exits_2_without_clean_note() {
         .stderr(predicate::str::contains(
             "errors while decoding content stream",
         ));
+}
+
+#[test]
+fn check_unfilterable_content_stream_matches_qpdf() {
+    if !qpdf_available() {
+        return;
+    }
+
+    let mut input = tempfile::NamedTempFile::new().unwrap();
+    input
+        .write_all(&unfilterable_content_stream_pdf_bytes())
+        .unwrap();
+    let path = input.path().to_str().unwrap();
+
+    let qpdf = ProcessCommand::new("qpdf")
+        .args(["--check", path])
+        .output()
+        .unwrap();
+    let flpdf = ProcessCommand::new(assert_cmd::cargo_bin!("flpdf"))
+        .env("FLPDF_PROGNAME", "qpdf")
+        .args(["--check", path])
+        .output()
+        .unwrap();
+
+    assert_eq!(
+        qpdf.status.code(),
+        Some(2),
+        "qpdf stderr: {:?}",
+        qpdf.stderr
+    );
+    assert_eq!(flpdf.status.code(), qpdf.status.code());
+    assert_eq!(flpdf.stdout, qpdf.stdout);
+    assert_eq!(flpdf.stderr, qpdf.stderr);
+    assert!(String::from_utf8_lossy(&qpdf.stderr).contains(
+        "ERROR: page 1: content stream (content stream object 4 0): errors while decoding content stream"
+    ));
 }
 
 #[test]
