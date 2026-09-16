@@ -4378,7 +4378,7 @@ fn preflight_qpdf_cli_events(args: &[arg_parser::RawArg]) -> CliResult<QpdfCliPr
             }
             JobJsonCliEvent::Password(password) => validation_job.set_password(password.clone()),
             JobJsonCliEvent::PasswordFile(_) => {}
-            JobJsonCliEvent::PasswordMode(mode) => validation_job.set_password_mode(mode.clone()),
+            JobJsonCliEvent::PasswordMode(mode) => validation_job.set_password_mode(*mode),
             JobJsonCliEvent::PasswordIsHexKey => validation_job.set_password_is_hex_key(true),
             JobJsonCliEvent::SuppressPasswordRecovery => {
                 validation_job.set_suppress_password_recovery(true)
