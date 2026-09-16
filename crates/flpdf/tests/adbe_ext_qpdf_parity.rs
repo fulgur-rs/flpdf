@@ -14,9 +14,15 @@
 //! /ADBE overwritten, /ACRO preserved.
 //!
 //! Fixtures are content-stream-free, so byte-identity is independent of the
-//! deflate backend — this file is NOT gated on `qpdf-zlib-compat`.
+//! deflate backend and the file as a whole is not gated on `qpdf-zlib-compat`.
+//! The individual tests that shell out to `qpdf` for a differential comparison
+//! still carry that gate, so a default build runs the subset that does not.
 
-use flpdf::{EncryptParams, NewlineBeforeEndstream, ObjectStreamMode, Pdf, PdfOpenOptions};
+use flpdf::{NewlineBeforeEndstream, Pdf};
+// Only the `qpdf-zlib-compat` tests below open an encrypted fixture or select an
+// object-stream mode, so these would be unused imports in a default build.
+#[cfg(feature = "qpdf-zlib-compat")]
+use flpdf::{EncryptParams, ObjectStreamMode, PdfOpenOptions};
 use std::path::Path;
 
 /// STRIP-side WriterTestSettings (plain full rewrite, qpdf-matching newline/id).
@@ -337,6 +343,7 @@ fn specialized_standard_adbe_root_cutover_matches_qpdf_for_all_object_stream_mod
     }
 }
 
+#[cfg(feature = "qpdf-zlib-compat")]
 fn assert_qdf_or_normalize_adbe_orphan_parity(content_normalization: bool) {
     use std::process::Command;
 

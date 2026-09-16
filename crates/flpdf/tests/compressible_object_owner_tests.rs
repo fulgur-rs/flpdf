@@ -1,9 +1,16 @@
 //! qpdf getCompressibleObjGens removes stale generations from the live graph.
 
-use flpdf::{EncryptParams, ObjectHandle, ObjectRef, ObjectStreamMode, Pdf, PdfWriter};
-use std::fs;
+use flpdf::{ObjectHandle, ObjectRef, ObjectStreamMode, Pdf, PdfWriter};
 use std::io::Cursor;
+// The qpdf differential tests below are the only users of these: they write a
+// fixture to disk and shell out to `qpdf`, which a default build never does.
+#[cfg(feature = "qpdf-zlib-compat")]
+use flpdf::EncryptParams;
+#[cfg(feature = "qpdf-zlib-compat")]
+use std::fs;
+#[cfg(feature = "qpdf-zlib-compat")]
 use std::path::Path;
+#[cfg(feature = "qpdf-zlib-compat")]
 use std::process::Command;
 
 #[test]
