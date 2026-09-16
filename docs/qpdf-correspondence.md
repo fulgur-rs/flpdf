@@ -3921,6 +3921,29 @@ attachment mutation、attachment + overlay、password setter order、
 job-json-file の check-linearization も個別 differential test で固定する。
 独自 bridge や qpdf-deviation markerは追加しない。
 
+### JSON input/update inspection continuation (`flpdf-lm4bc`, 2026-09-16)
+
+qpdf の `createQPDF` は JSON input の作成と update を完了した後、page
+selection/rotation、underlay/overlay、`handleTransformations` を同じ
+documentへ順に適用する。`writeQPDF` はその準備済み documentを
+output-freeなら `doInspection` へ渡し、`checkConfiguration` は
+`show-attachment` の save pipelineを inspection report より前に予約する
+（`libqpdf/QPDFJob.cc:428-520,614-626,914-925,1646-1693,1937-2015,2138-2194`）。
+
+flpdf の `run_json_input_inspection` は、JSON input/update の作成・更新後に
+`QPDFJob::apply_transformations` を呼び、rotation、overlay/underlay、その他の
+create-stage transformationを canonical job ownerへ渡す。`show-attachment` は
+JSON import/open より前に同じ logger の save pipelineを予約し、最後は
+`QPDFJob::inspect_configured` の独立 report/completionへ接続する。これにより
+`show-npages` の先行 info が attachment payload の stdoutを消費せず、JSON
+input/update の overlay/underlayも `show-object` が観測する。
+
+`crates/flpdf-cli/tests/cli_qpdf_conflict_matrix.rs::json_input_and_update_inspection_reserve_stdout_before_attachment`
+は JSON input と update-from-JSON の `show-npages` + `show-attachment` を、
+`crates/flpdf-cli/tests/cli_qpdf_conflict_matrix.rs::json_input_and_update_inspection_apply_overlay_before_show_object`
+は両入力経路の overlay/underlay + `show-object` を qpdf 11.9.0 と
+status/stdout/stderr 比較する。新しい bridgeや qpdf-deviation markerは追加しない。
+
 ### Top-level attachment mutation with a single inspection (`flpdf-awthm`, 2026-09-15)
 
 qpdf's `createQPDF` always completes `handleTransformations`, including

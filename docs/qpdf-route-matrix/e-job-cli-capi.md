@@ -1057,6 +1057,26 @@ attachment + overlay、password setter order、job-json-fileの
 check-linearizationも個別の qpdf differentialで固定する。qpdfに対応する
 独自 bridgeや deviation markerは追加しない。
 
+### E-12 JSON input/update inspection continuation (`flpdf-lm4bc`, 2026-09-16)
+
+qpdf の `createQPDF` は JSON input の作成と update を終えてから
+rotation、underlay/overlay、`handleTransformations` を同じ document に適用し、
+`writeQPDF` は output-free の場合にその documentを `doInspection` へ渡す
+（`libqpdf/QPDFJob.cc:428-520,1646-1693,1937-2015,2138-2194`）。
+`checkConfiguration` は `show-attachment` の save pipeline を先行して予約する
+（`libqpdf/QPDFJob.cc:614-626,914-925`）。
+
+flpdf の JSON input/update inspection route は、overlay/underlay と create-stage
+transformations を `QPDFJob::apply_transformations` へ積み、JSON update後に
+同じ job documentへ適用する。`show-attachment` の stdout は JSON import/open
+前に予約し、inspection は `QPDFJob::inspect_configured` の独立 report/completion
+へ接続する。これで `show-npages` の info report が attachment payload の
+save streamを先取りせず、overlay/underlay が `show-object` の観測対象になる。
+
+`cli_qpdf_conflict_matrix.rs` の JSON input/update differential は、両入力経路の
+`show-npages` + `show-attachment`、overlay/underlay + `show-object` を qpdf 11.9.0
+と status/stdout/stderr で固定する。新しい bridgeや deviation markerは追加しない。
+
 ## E-10 primary document graph retention in distinct-secondary `--pages` (`flpdf-lrm3u`, 2026-09-15)
 
 qpdf keeps the primary `QPDF` as the page-job base while

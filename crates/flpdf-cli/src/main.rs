@@ -3345,6 +3345,7 @@ fn main() {
         run_json_input_inspection(
             &args,
             top_level_inspection_transform_options,
+            &overlay_specs,
             &attachment_segments,
         )
     } else if args.json.is_some() || args.json_output.is_some() {
@@ -4581,15 +4582,28 @@ fn apply_json_page_specs<R: Read + Seek + 'static>(
 fn run_json_input_inspection(
     cli: &Cli,
     transform_options: InspectionTransformOptions,
+    overlay_specs: &[OverlaySpec],
     attachment_segments: &[Vec<Vec<u8>>],
 ) -> CliResult<()> {
     if cli.page_ops.empty {
         reject_empty_inspection_output(cli.input.as_deref())?;
         let mut job = new_cli_job(cli.no_warn);
         configure_top_level_inspection_job(&mut job, cli)?;
+        configure_cli_overlay_specs(&mut job, overlay_specs)?;
+        configure_top_level_inspection_transformations(
+            &mut job,
+            transform_options,
+            cli.verbose,
+            cli.remove_restrictions,
+            cli.coalesce_contents,
+        );
+        if cli.show_attachment.is_some() {
+            job.logger().save_to_standard_output(true)?;
+        }
         configure_top_level_attachment_mutations(&mut job, cli, attachment_segments)?;
         let mut pdf = create_empty_primary_document(&mut job, cli.update_from_json.as_deref())?;
-        return run_job_inspection_on_pdf(cli, &mut job, &mut pdf, transform_options);
+        job.apply_transformations(&mut pdf)?;
+        return run_job_inspection_on_pdf(cli, &mut job, &mut pdf);
     }
     let input = cli.input.as_ref().ok_or_else(missing_input_usage_error)?;
     let mut job = QPDFJob::new();
@@ -4598,6 +4612,17 @@ fn run_json_input_inspection(
     job.set_message_prefix(progname());
     job.set_suppress_warnings(cli.no_warn);
     configure_top_level_inspection_job(&mut job, cli)?;
+    configure_cli_overlay_specs(&mut job, overlay_specs)?;
+    configure_top_level_inspection_transformations(
+        &mut job,
+        transform_options,
+        cli.verbose,
+        cli.remove_restrictions,
+        cli.coalesce_contents,
+    );
+    if cli.show_attachment.is_some() {
+        job.logger().save_to_standard_output(true)?;
+    }
     configure_top_level_attachment_mutations(&mut job, cli, attachment_segments)?;
 
     let file = File::open(input).map_err(|error| {
@@ -4613,7 +4638,8 @@ fn run_json_input_inspection(
             .create_from_json_document(file, path_description(input))
             .map_err(|error| json_error_with_file(input, Box::new(error)))?;
         apply_json_update_with_job(&mut job, &mut pdf, cli.update_from_json.as_deref())?;
-        return run_job_inspection_on_pdf(cli, &mut job, &mut pdf, transform_options);
+        job.apply_transformations(&mut pdf)?;
+        return run_job_inspection_on_pdf(cli, &mut job, &mut pdf);
     }
 
     let mut options = pdf_open_options(cli.repair, &cli.password)?;
@@ -4639,28 +4665,15 @@ fn run_json_input_inspection(
             }
         };
     apply_json_update_with_job(&mut job, &mut pdf, cli.update_from_json.as_deref())?;
-    run_job_inspection_on_pdf(cli, &mut job, &mut pdf, transform_options)
+    job.apply_transformations(&mut pdf)?;
+    run_job_inspection_on_pdf(cli, &mut job, &mut pdf)
 }
 
 fn run_job_inspection_on_pdf<R: Read + Seek + 'static>(
     cli: &Cli,
     job: &mut QPDFJob,
     pdf: &mut Pdf<R>,
-    transform_options: InspectionTransformOptions,
 ) -> CliResult<()> {
-    // JSON input and update-from-JSON create the document outside the normal
-    // combined-inspection dispatcher, but qpdf still applies these
-    // create-stage transformations before doInspection
-    // (`QPDFJob.cc:459-489,2138-2194`). Preserve the same flag propagation
-    // here instead of accepting and silently dropping either transformation.
-    apply_top_level_inspection_transformations(
-        job,
-        pdf,
-        transform_options,
-        cli.verbose,
-        cli.remove_restrictions,
-        cli.coalesce_contents,
-    )?;
     configure_top_level_inspection_job(job, cli)?;
     match job.inspect_configured(pdf) {
         Ok(status) => finish_job_exit_status(status),
