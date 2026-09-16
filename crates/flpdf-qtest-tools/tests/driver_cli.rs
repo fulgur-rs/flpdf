@@ -36,6 +36,44 @@ fn test_85_uses_canonical_integer_accessors_and_emits_qpdf_clamp_warnings() {
     assert_eq!(assertion.get_output().stderr, expected.as_bytes());
 }
 
+#[test]
+fn test_86_uses_canonical_unicode_string_handle_accessors() {
+    let source = fs::read_to_string(concat!(
+        env!("CARGO_MANIFEST_DIR"),
+        "/src/driver/test_80_87.rs"
+    ))
+    .expect("read test 80-87 driver source");
+    let start = source
+        .find("pub(crate) fn run_test_86")
+        .expect("test 86 source section");
+    let end = source[start..]
+        .find("pub(crate) fn run_test_87")
+        .map(|offset| start + offset)
+        .expect("test 86 source section end");
+    let test_86 = &source[start..end];
+
+    assert!(
+        test_86.contains("let stored_handle = ObjectHandle::string(stored);")
+            && test_86.contains("stored_handle.try_get_string_value()?")
+            && test_86.contains("stored_handle.try_get_utf8_value()?"),
+        "test 86 must read newUnicodeString through canonical ObjectHandle accessors"
+    );
+    assert!(
+        !test_86.contains("pdf_string::utf8_value(&stored)"),
+        "test 86 retains the direct pdf_string UTF-8 bridge"
+    );
+}
+
+#[test]
+fn test_86_executes_canonical_unicode_string_route() {
+    driver()
+        .args(["86", "-"])
+        .assert()
+        .code(0)
+        .stdout("test 86 done\n")
+        .stderr("");
+}
+
 fn minimal_pdf() -> &'static str {
     concat!(
         env!("CARGO_MANIFEST_DIR"),

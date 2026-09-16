@@ -749,15 +749,21 @@ pub(crate) fn run_test_86<R: Read + Seek>(
 
     // QUtil::utf16_to_utf8 (`libqpdf/QUtil.cc:1693-...`) strips a leading
     // BOM and decodes the rest as UTF-16(BE or LE); `pdf_string::utf8_value`
-    // -- qpdf's `QPDF_String::getUTF8Val`, "qpdf's UTF-8 view of one stored
-    // PDF string" -- takes exactly that BOM-stripping path for BOM-prefixed
-    // input.
+    // is the matching byte-level transcoder for this direct probe.
     let utf8_from_utf16 = flpdf::pdf_string::utf8_value(utf16_val);
     assert_eq!(utf8_from_utf16, utf8_val);
 
     let stored = flpdf::pdf_string::new_unicode_string(utf8_val);
     assert_eq!(stored, utf16_val);
-    let utf8_of_stored = flpdf::pdf_string::utf8_value(&stored);
+
+    // qpdf's newUnicodeString result is read through the public object-handle
+    // accessors (`test_driver.cc:3080-3082`), not through QPDF_String's
+    // implementation-level value. Keep the same assertion order: stored
+    // bytes first, then the UTF-8 view.
+    let stored_handle = ObjectHandle::string(stored);
+    let stored_value = stored_handle.try_get_string_value()?;
+    assert_eq!(stored_value, utf16_val);
+    let utf8_of_stored = stored_handle.try_get_utf8_value()?;
     assert_eq!(utf8_of_stored, utf8_val);
 
     Ok(())
