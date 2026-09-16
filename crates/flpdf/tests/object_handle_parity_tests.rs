@@ -537,9 +537,8 @@ fn resolve_resolves_a_dangling_reference_to_null() {
 /// back at object 1 — the same mutual-cycle fixture the legacy engine's own
 /// `qpdf_reader_bounds_unusable_indirect_length_recovery` test exercises)
 /// resolves without hanging or erroring through the canonical resolver when
-/// qpdf-style repair is enabled. The untouched `Reserved`-state guard breaks
-/// the cycle; `recoverStreamLength` then records the bytes through the lazy
-/// source stream rather than eagerly materializing a replacement buffer.
+/// qpdf-style repair is enabled. The loop guard breaks the cycle and leaves the
+/// slot it fired on null, which is what qpdf reports for it.
 #[test]
 fn resolve_survives_a_cyclic_indirect_stream_length() {
     let bytes = classic_pdf_with_bodies(
@@ -564,30 +563,19 @@ fn resolve_survives_a_cyclic_indirect_stream_length() {
         .try_is_scalar()
         .expect("a cyclic indirect /Length must not error");
 
+    // The slot the loop guard fired on stays null: qpdf caches null there
+    // (`QPDF.cc:1705-1712`) and its outer parse only caches
+    // `if (isUnresolved(og))` (`QPDF.cc:1641-1693`), so the recovery's success
+    // never reaches the cache. Verified against qpdf 11.9.0 on this fixture
+    // shape: `--show-object=1` prints `null` and `--json=2` reports
+    // `"obj:1 0 R": {"value": null}` while object 2 still resolves to a stream.
+    //
+    // An earlier revision asserted `b"abc\n"` here — flpdf's own behavior, not
+    // qpdf's.
     assert!(
-        handle.as_stream_data().is_none(),
-        "canonical qpdf streams retain source bytes lazily"
+        handle.is_null(),
+        "the loop guard's null must survive the successful recovery"
     );
-    assert_eq!(
-        handle
-            .get_raw_stream_data()
-            .expect("recovered source stream")
-            .as_ref(),
-        b"abc\n"
-    );
-
-    // The stream's own dictionary is a distinct, natively-parsed handle
-    // (not folded into the stream value itself), and its /Length entry
-    // still preserves the indirect reference's identity rather than being
-    // inlined as the recovered integer.
-    let dict = handle
-        .as_stream_dict()
-        .expect("stream value carries its own dictionary handle")
-        .as_dictionary()
-        .expect("stream dictionary handle resolves to a dictionary");
-    let length_handle = dict.get(b"/Length".as_slice()).expect("Length entry");
-    assert!(length_handle.is_indirect());
-    assert_eq!(length_handle.object_ref(), Some(ObjectRef::new(2, 0)));
 }
 
 /// A compressed (ObjStm) member resolves correctly through

@@ -190,22 +190,42 @@ fn correct_holder_reslices_payload_containing_endstreamendobj_bytes() {
     assert_eq!(stream.get_raw_stream_data().unwrap().as_slice(), payload);
 }
 
-/// (2d) qpdf 11.9.0 detects a self-referential holder loop, treats the length as
-/// missing, and recovers the adjacent stream boundary.
+/// (2d) qpdf 11.9.0 detects a self-referential holder loop, runs the length
+/// recovery for its diagnostics — and still resolves the object to null.
+///
+/// The loop guard caches null for the slot (`QPDF.cc:1705-1712`), and the outer
+/// parse only caches `if (isUnresolved(og))` (`QPDF.cc:1641-1693`), so the null
+/// wins even though the recovery succeeded. Verified against qpdf 11.9.0 on this
+/// exact fixture: `qpdf --show-object=3` prints `null` and `--json=2` reports
+/// `"obj:3 0 R": {"value": null}`, with all four warnings below still emitted.
+///
+/// An earlier revision asserted the recovered `AAAABBBB` payload here. That was
+/// flpdf's own behavior, not qpdf's, despite this test's name.
 #[test]
-fn self_referential_holder_adjacent_endstream_recovers_like_qpdf() {
+fn self_referential_holder_adjacent_endstream_resolves_to_null_like_qpdf() {
     let bytes = build_pdf(b"AAAABBBB", b"3 0 R", b"", None);
     let mut pdf = Pdf::open(Cursor::new(bytes)).unwrap();
 
-    assert_metadata_stream_and_warnings(
-        &mut pdf,
-        b"AAAABBBB",
-        &[
+    let stream = metadata_stream_result(&mut pdf).expect("the slot resolves");
+    assert!(
+        stream.is_null(),
+        "the loop guard's null must survive the successful recovery"
+    );
+
+    let snapshot = pdf.repair_diagnostics();
+    assert_eq!(
+        snapshot
+            .entries()
+            .iter()
+            .map(|entry| String::from_utf8_lossy(entry.get_message_detail()).into_owned())
+            .collect::<Vec<_>>(),
+        [
             "loop detected resolving object 3 0",
             "stream dictionary lacks /Length key",
             "attempting to recover stream length",
             "recovered stream length: 8",
         ],
+        "qpdf still runs the recovery for its diagnostics"
     );
 }
 

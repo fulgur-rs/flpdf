@@ -2999,6 +2999,16 @@ impl<R: Read + Seek> ResolverHandle<R> {
             trailing_start: _,
         } = parsed;
         let handle = self.get_object_handle_qpdf_obj_gen(object_gen);
+        if handle.is_resolved() {
+            // qpdf caches the parse result under `if (isUnresolved(og))`
+            // (`QPDF.cc:1641-1693`). A slot that a *nested* resolution already
+            // filled therefore wins over the outer parse. The case that reaches
+            // this is a stream whose `/Length` references the stream itself:
+            // resolving the length re-enters, trips qpdf's loop guard, and
+            // caches null (`QPDF.cc:1705-1712`); when the outer parse returns,
+            // the slot is no longer unresolved and keeps that null.
+            return;
+        }
         if malformed && matches!(&value, ObjectValue::Null) {
             // The qpdf parser recovers a damaged scalar/container close as a
             // visible null. Source damage remains observable through the
@@ -11681,6 +11691,49 @@ mod tests {
     /// structural failure and caches the outer stream as null. The ordinary
     /// default now enables the canonical `recoverStreamLength` arm, matching
     /// qpdf's default attempt-recovery behavior.
+    /// With recovery on, the outer parse succeeds — and must still lose to the
+    /// null the nested loop already cached.
+    ///
+    /// qpdf caches the parse result under `if (isUnresolved(og))`
+    /// (`QPDF.cc:1641-1693`), so a slot filled by a nested resolution is never
+    /// overwritten by the outer one. Without recovery the outer parse fails and
+    /// the null survives for a different reason, which is what the strict test
+    /// below covers; only this recovering shape reaches the guard.
+    #[test]
+    fn a_recovered_self_referential_length_keeps_the_loop_null() {
+        let bytes = pdf_with_bodies(&[
+            b"1 0 obj\n<< /Type /Catalog >>\nendobj\n".to_vec(),
+            b"2 0 obj\n<< /Length 2 0 R >>\nstream\nabc\nendstream\nendobj\n".to_vec(),
+        ]);
+        let mut pdf = Pdf::open_mem_owned_with_options(
+            bytes,
+            crate::PdfOpenOptions {
+                repair: true,
+                ..crate::PdfOpenOptions::default()
+            },
+        )
+        .expect("open recovering fixture");
+        let handle: ObjectHandle = pdf.get_object_handle(ObjectRef::new(2, 0));
+
+        handle
+            .try_is_scalar()
+            .expect("the cached loop null is terminal");
+        assert!(
+            handle.is_null() && handle.is_resolved(),
+            "the recovered stream must not overwrite the nested loop's null"
+        );
+
+        let messages: Vec<String> = pdf
+            .repair_diagnostics()
+            .entries()
+            .iter()
+            .map(|entry| entry.message_string())
+            .collect();
+        assert!(messages
+            .iter()
+            .any(|message| message == "loop detected resolving object 2 0"));
+    }
+
     #[test]
     fn a_self_referential_length_takes_the_loop_branch_instead_of_recursing_forever() {
         let bytes = pdf_with_bodies(&[
