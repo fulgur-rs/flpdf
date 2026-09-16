@@ -225,6 +225,8 @@ mod tests {
         {
             let mut sink = OutputSink::new(&mut target);
             write_name_escaped(&mut sink, b"safe#/tail").unwrap();
+            sink.finish_segment().unwrap();
+            sink.finish_document().unwrap();
         }
 
         assert_eq!(
