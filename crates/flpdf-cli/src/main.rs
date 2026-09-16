@@ -3185,6 +3185,20 @@ fn main() {
     // helper so the qpdf retry diagnostic is emitted before the alternate
     // candidate is attempted.
     args.password.verbose = args.verbose;
+    // qpdf registers --json-output with the choices {2, latest}
+    // (`auto_job_init.hh:23,127`), so its argument parser rejects an
+    // out-of-set value while reading the option — ahead of every
+    // `checkConfiguration` guard and every route. Check it before the other
+    // post-parse validations so a combination such as
+    // `--json-output=1 --replace-input --split-pages=2` still reports the
+    // choice error rather than a later conflict.
+    if let Some(version) = args.json_output.as_deref() {
+        if !matches!(version, "2" | "latest") {
+            usage_exit(&UsageError::new(
+                "--json-output must be given as --json-output={2,latest}",
+            ));
+        }
+    }
     validate_collate_values(&args.page_ops.collate);
     if let Err(error) = validate_keep_files_open_threshold(&args.page_ops) {
         emit_logger_error(format!("flpdf: {error}\n"));
@@ -3339,20 +3353,6 @@ fn main() {
     // the non-inspection modes and retains its existing validation boundary.
     if args.check_linearization && args.output.is_some() {
         usage_exit(&no_output_file_for_inspection_error());
-    }
-
-    // qpdf registers --json-output with the choices {2, latest}
-    // (`auto_job_init.hh:23,127`), so its argument parser rejects an
-    // out-of-set value before any route runs. Check it here, ahead of the
-    // dispatch below, so a mixed invocation such as
-    // `--json-output=1 --replace-input` still reports the choice error rather
-    // than the route's own conflict.
-    if let Some(version) = args.json_output.as_deref() {
-        if !matches!(version, "2" | "latest") {
-            usage_exit(&UsageError::new(
-                "--json-output must be given as --json-output={2,latest}",
-            ));
-        }
     }
 
     let attachment_mutation_requested = !attachment_segments.is_empty()
