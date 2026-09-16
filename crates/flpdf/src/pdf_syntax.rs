@@ -56,7 +56,7 @@ pub(crate) fn write_name_escaped(
         if byte == 0 {
             if safe_start < index {
                 out.write_bytes(&raw[safe_start..index])?;
-            }
+            } // cov:ignore: LLVM maps the covered NUL-prefix write block terminator to an uncovered line.
             out.write_bytes(b"#")?;
             safe_start = index + 1;
             continue;
