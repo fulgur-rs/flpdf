@@ -1382,6 +1382,24 @@ V5 の `/O` `/U` `/OE` `/UE` `/Perms` は qpdf CLI の CSPRNG（同じ qpdf invo
 `V5Randomness` seam（`.6.5`）で flpdf の deterministic repeat を検証し、qpdf とは
 復号後の QDF で比較する。production default は引き続き OS CSPRNG である。
 
+### Malformed copy-encryption `/Length` fallback (`flpdf-67h8d`, 2026-09-17)
+
+qpdf 11.9.0 の `QPDFWriter::copyEncryptionParameters` は V>1 の donor `/Length` を
+`getIntValueAsInt() / 8` で読み、非整数または欠落を warning とともに 0 として受け入れる
+（`QPDFWriter.cc:651-702`、`QPDFObjectHandle.cc:503-543,2168-2189`）。その値は
+`setEncryptionParametersInternal` で出力辞書の `/Length`（bit単位）へ戻され、V<5 では
+長さ 0 の file key を再導出し、V>=5 では認証済み key を保持する
+（`QPDFWriter.cc:777-840`、`QPDF_encryption.cc:374-402`）。これは reader の malformed
+`/Length` を 128 bit とみなす復号時 fallback（`QPDF_encryption.cc:835-853`）とは別の
+writer-side copy semantics である。
+
+flpdf は `Pdf::writer_copy_encryption_source` が donor の warning sink を保持したまま
+writer-side `/Length` を `writer_length_bits` として snapshotし、`make_direct(false)` 後も
+非整数 fallback の `Some(0)` を失わないようにした。canonical copy builder はこの 0 を
+拒否せず、V<5 では空の file key と `/Length 0` を出力する。`flpdf-cli/tests/
+cmp_copy_encryption_length_tests.rs` は qpdf 11.9.0 の warning status、stderr、出力と
+`qpdf-zlib-compat` の全 byte を比較してこの境界を固定する。
+
 `QPDF::compute_data_key`（`QPDF_encryption.cc:325-357`）の共有 Rust primitive は
 qpdf の未使用 `encryption_R` 引数を省略している。これは reader state に存在しない
 値を sentinel で補うことを避ける、出力不変の内部 signature 代替である。Algorithm 3.1
