@@ -1322,6 +1322,11 @@ fn qtest_accessor_cases_do_not_use_explicit_pdf_resolve() {
         "/src/driver/test_18_25.rs"
     ))
     .expect("read page-driver source");
+    let page_64_71_source = fs::read_to_string(concat!(
+        env!("CARGO_MANIFEST_DIR"),
+        "/src/driver/test_64_71.rs"
+    ))
+    .expect("read page 64-71 driver source");
     let tree_source = fs::read_to_string(concat!(
         env!("CARGO_MANIFEST_DIR"),
         "/src/driver/test_42_49.rs"
@@ -1489,6 +1494,22 @@ fn qtest_accessor_cases_do_not_use_explicit_pdf_resolve() {
         )
         .contains("resolve_handle("),
         "test 7 lost the explicit resolution retained for the out-of-scope path"
+    );
+
+    let test_71 = section(
+        page_64_71_source.as_str(),
+        "pub(crate) fn run_test_71",
+        "\n#[cfg(test)]",
+    );
+    assert!(
+        !test_71.contains("pdf.resolve("),
+        "test 71 retains the qpdf-less caller-side Pdf::resolve bridge"
+    );
+    assert!(
+        test_71.contains("page.try_get_key(")
+            && test_71.contains("resources.try_get_key(")
+            && test_71.contains("xobjects.try_get_key("),
+        "test 71 must use canonical resolving key accessors for the Fx1 chain"
     );
 
     for (name, body) in [
