@@ -153,6 +153,310 @@ fn job_json_file_password_and_password_file_follow_argv_order() {
 }
 
 #[test]
+fn job_json_file_password_follows_argv_order() {
+    if !qpdf_available() {
+        return;
+    }
+
+    let directory = tempfile::tempdir().unwrap();
+    fs::copy(
+        PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+            .join("../../tests/fixtures/encrypted/v4-aes-128-r4.pdf"),
+        directory.path().join("input.pdf"),
+    )
+    .unwrap();
+    fs::write(
+        directory.path().join("job.json"),
+        br#"{"inputFile":"input.pdf","outputFile":"out.pdf","password":"user-v4-aes","staticId":"","decrypt":""}"#,
+    )
+    .unwrap();
+
+    for (name, args) in [
+        (
+            "cli-before-json",
+            vec![
+                "--password=wrong".to_owned(),
+                "--job-json-file=job.json".to_owned(),
+            ],
+        ),
+        (
+            "json-before-cli",
+            vec![
+                "--job-json-file=job.json".to_owned(),
+                "--password=wrong".to_owned(),
+            ],
+        ),
+    ] {
+        let output = directory.path().join("out.pdf");
+        let _ = fs::remove_file(&output);
+        let qpdf = ProcessCommand::new("/usr/bin/qpdf")
+            .current_dir(directory.path())
+            .args(&args)
+            .output()
+            .unwrap();
+        let _ = fs::remove_file(&output);
+        let flpdf = Command::cargo_bin("flpdf")
+            .unwrap()
+            .current_dir(directory.path())
+            .env("FLPDF_PROGNAME", "qpdf")
+            .args(&args)
+            .output()
+            .unwrap();
+
+        assert_eq!(
+            flpdf.status.code(),
+            qpdf.status.code(),
+            "status differs for {name}: qpdf={qpdf:?}, flpdf={flpdf:?}"
+        );
+        assert_eq!(flpdf.stdout, qpdf.stdout, "stdout differs for {name}");
+        assert_eq!(flpdf.stderr, qpdf.stderr, "stderr differs for {name}");
+    }
+}
+
+#[test]
+fn job_json_file_password_file_follows_argv_order() {
+    if !qpdf_available() {
+        return;
+    }
+
+    let directory = tempfile::tempdir().unwrap();
+    fs::copy(
+        PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+            .join("../../tests/fixtures/encrypted/v4-aes-128-r4.pdf"),
+        directory.path().join("input.pdf"),
+    )
+    .unwrap();
+    fs::write(directory.path().join("password.txt"), b"user-v4-aes\n").unwrap();
+    fs::write(
+        directory.path().join("job.json"),
+        br#"{"inputFile":"input.pdf","outputFile":"out.pdf","password":"wrong","staticId":"","decrypt":""}"#,
+    )
+    .unwrap();
+
+    for (name, args) in [
+        (
+            "file-before-json",
+            vec![
+                "--password-file=password.txt".to_owned(),
+                "--job-json-file=job.json".to_owned(),
+            ],
+        ),
+        (
+            "json-before-file",
+            vec![
+                "--job-json-file=job.json".to_owned(),
+                "--password-file=password.txt".to_owned(),
+            ],
+        ),
+    ] {
+        let output = directory.path().join("out.pdf");
+        let _ = fs::remove_file(&output);
+        let qpdf = ProcessCommand::new("/usr/bin/qpdf")
+            .current_dir(directory.path())
+            .args(&args)
+            .output()
+            .unwrap();
+        let _ = fs::remove_file(&output);
+        let flpdf = Command::cargo_bin("flpdf")
+            .unwrap()
+            .current_dir(directory.path())
+            .env("FLPDF_PROGNAME", "qpdf")
+            .args(&args)
+            .output()
+            .unwrap();
+
+        assert_eq!(
+            flpdf.status.code(),
+            qpdf.status.code(),
+            "status differs for {name}: qpdf={qpdf:?}, flpdf={flpdf:?}"
+        );
+        assert_eq!(flpdf.stdout, qpdf.stdout, "stdout differs for {name}");
+        assert_eq!(flpdf.stderr, qpdf.stderr, "stderr differs for {name}");
+    }
+}
+
+#[test]
+fn job_json_file_password_mode_follows_argv_order() {
+    if !qpdf_available() {
+        return;
+    }
+
+    let directory = tempfile::tempdir().unwrap();
+    fs::copy(
+        PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+            .join("../../tests/fixtures/encrypted/v4-aes-128-r4.pdf"),
+        directory.path().join("input.pdf"),
+    )
+    .unwrap();
+    fs::write(
+        directory.path().join("job.json"),
+        br#"{"inputFile":"input.pdf","outputFile":"out.pdf","password":"757365722d76342d616573","staticId":"","decrypt":""}"#,
+    )
+    .unwrap();
+
+    for (name, args) in [
+        (
+            "mode-before-json",
+            ["--password-mode=hex-bytes", "--job-json-file=job.json"],
+        ),
+        (
+            "json-before-mode",
+            ["--job-json-file=job.json", "--password-mode=hex-bytes"],
+        ),
+    ] {
+        let output = directory.path().join("out.pdf");
+        let _ = fs::remove_file(&output);
+        let qpdf = ProcessCommand::new("/usr/bin/qpdf")
+            .current_dir(directory.path())
+            .args(args)
+            .output()
+            .unwrap();
+        assert!(
+            qpdf.status.success(),
+            "qpdf job JSON failed for {name}: {qpdf:?}"
+        );
+        assert!(
+            output.is_file(),
+            "qpdf should create the decrypted output for {name}"
+        );
+        fs::remove_file(&output).unwrap();
+
+        let flpdf = Command::cargo_bin("flpdf")
+            .unwrap()
+            .current_dir(directory.path())
+            .env("FLPDF_PROGNAME", "qpdf")
+            .args(args)
+            .output()
+            .unwrap();
+        assert_eq!(
+            flpdf.status.code(),
+            qpdf.status.code(),
+            "status differs for {name}"
+        );
+        assert_eq!(flpdf.stdout, qpdf.stdout, "stdout differs for {name}");
+        assert_eq!(flpdf.stderr, qpdf.stderr, "stderr differs for {name}");
+    }
+}
+
+#[test]
+fn job_json_file_password_is_hex_key_follows_argv_order() {
+    if !qpdf_available() {
+        return;
+    }
+
+    let directory = tempfile::tempdir().unwrap();
+    fs::copy(
+        PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+            .join("../../tests/fixtures/encrypted/v4-aes-128-r4.pdf"),
+        directory.path().join("input.pdf"),
+    )
+    .unwrap();
+    fs::write(
+        directory.path().join("job.json"),
+        br#"{"inputFile":"input.pdf","outputFile":"out.pdf","password":"5042ec4efa389ea32a149ab2a34e84fc","staticId":"","decrypt":""}"#,
+    )
+    .unwrap();
+
+    for (name, args) in [
+        (
+            "hex-key-before-json",
+            ["--password-is-hex-key", "--job-json-file=job.json"],
+        ),
+        (
+            "json-before-hex-key",
+            ["--job-json-file=job.json", "--password-is-hex-key"],
+        ),
+    ] {
+        let output = directory.path().join("out.pdf");
+        let _ = fs::remove_file(&output);
+        let qpdf = ProcessCommand::new("/usr/bin/qpdf")
+            .current_dir(directory.path())
+            .args(args)
+            .output()
+            .unwrap();
+        assert!(
+            qpdf.status.success(),
+            "qpdf job JSON failed for {name}: {qpdf:?}"
+        );
+        assert!(
+            output.is_file(),
+            "qpdf should create the decrypted output for {name}"
+        );
+        fs::remove_file(&output).unwrap();
+
+        let flpdf = Command::cargo_bin("flpdf")
+            .unwrap()
+            .current_dir(directory.path())
+            .env("FLPDF_PROGNAME", "qpdf")
+            .args(args)
+            .output()
+            .unwrap();
+        assert_eq!(
+            flpdf.status.code(),
+            qpdf.status.code(),
+            "status differs for {name}"
+        );
+        assert_eq!(flpdf.stdout, qpdf.stdout, "stdout differs for {name}");
+        assert_eq!(flpdf.stderr, qpdf.stderr, "stderr differs for {name}");
+    }
+}
+
+#[test]
+fn job_json_file_empty_input_selector_follows_argv_order() {
+    if !qpdf_available() {
+        return;
+    }
+
+    let directory = tempfile::tempdir().unwrap();
+    fs::write(
+        directory.path().join("job.json"),
+        br#"{"outputFile":"out.pdf","staticId":""}"#,
+    )
+    .unwrap();
+
+    for (name, args) in [
+        (
+            "empty-before-json",
+            vec!["--empty".to_owned(), "--job-json-file=job.json".to_owned()],
+        ),
+        (
+            "json-before-empty",
+            vec!["--job-json-file=job.json".to_owned(), "--empty".to_owned()],
+        ),
+    ] {
+        let output = directory.path().join("out.pdf");
+        let _ = fs::remove_file(&output);
+        let qpdf = ProcessCommand::new("/usr/bin/qpdf")
+            .current_dir(directory.path())
+            .args(&args)
+            .output()
+            .unwrap();
+        let qpdf_bytes = fs::read(&output).expect("qpdf should write an empty PDF");
+        fs::remove_file(&output).unwrap();
+        let flpdf = Command::cargo_bin("flpdf")
+            .unwrap()
+            .current_dir(directory.path())
+            .env("FLPDF_PROGNAME", "qpdf")
+            .args(&args)
+            .output()
+            .unwrap();
+
+        assert_eq!(
+            flpdf.status.code(),
+            qpdf.status.code(),
+            "status differs for {name}"
+        );
+        assert_eq!(flpdf.stdout, qpdf.stdout, "stdout differs for {name}");
+        assert_eq!(flpdf.stderr, qpdf.stderr, "stderr differs for {name}");
+        assert_eq!(
+            fs::read(&output).unwrap(),
+            qpdf_bytes,
+            "output differs for {name}"
+        );
+    }
+}
+
+#[test]
 fn job_json_file_preserves_input_encryption_when_compression_is_disabled() {
     if !qpdf_available() {
         return;

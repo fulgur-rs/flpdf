@@ -1077,6 +1077,25 @@ save streamを先取りせず、overlay/underlay が `show-object` の観測対�
 `show-npages` + `show-attachment`、overlay/underlay + `show-object` を qpdf 11.9.0
 と status/stdout/stderr で固定する。新しい bridgeや deviation markerは追加しない。
 
+### E-12 follow-up: job-json and CLI occurrence order (`flpdf-u40ck`, 2026-09-16)
+
+qpdfの argv parserは各callbackを入力順に実行し
+（`libqpdf/QPDFArgParser.cc:433-555`）、`Config::jobJsonFile`は各JSONを
+既存Configへ `initializeFromJson(..., true)` として積む
+（`libqpdf/QPDFJob_config.cc:16-62,449-460,625-697,774-784`、
+`libqpdf/QPDFJob_json.cc:611-625`）。その後 `createQPDF`/`run` はその最終stateを
+一度だけ消費する（`libqpdf/QPDFJob.cc:428-480,513-520`）。
+
+`flpdf-u40ck` は `arg_parser.rs` のraw residual argvを
+`main.rs::job_json_cli_events`へ渡し、`run_job_json_files`でJSON file、
+input/output selector、password/password-file、password mode/hex-key/recovery、
+check-linearizationをoccurrence順に同じ `QPDFJob`へ適用する。partial JSONの初回も
+既存configurationを保持するため、argv前置のCLI stateがJSON handlerで失われない。
+`cli_job_json.rs` の5つのorder regressionと、lifecycleの
+`partial_job_json_preserves_preconfigured_qpdf_state`が qpdf 11.9.0 の
+status/stdout/stderrおよびConfig layeringを固定する。image transformation setter
+の未接続は別issue `flpdf-uwu7.1`の責務であり、このsliceには含めない。
+
 ## E-10 primary document graph retention in distinct-secondary `--pages` (`flpdf-lrm3u`, 2026-09-15)
 
 qpdf keeps the primary `QPDF` as the page-job base while
