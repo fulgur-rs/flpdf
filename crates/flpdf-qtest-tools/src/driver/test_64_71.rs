@@ -46,24 +46,6 @@ fn open_secondary_pdf(
     Ok(secondary)
 }
 
-/// `ObjectHandle::get_key` never resolves its receiver (its own doc), unlike
-/// qpdf's `QPDFObjectHandle` accessors, which all `dereference()` on entry
-/// (`libqpdf/QPDFObjectHandle.cc`). `dict_key`/`resolve_handle` restore that
-/// implicit dereference explicitly, matching the identically named helpers
-/// already established for this crate's `test_02_09` file.
-fn resolve_handle<R: Read + Seek>(pdf: &mut Pdf<R>, handle: &ObjectHandle) -> flpdf::Result<()> {
-    pdf.resolve(handle)
-}
-
-fn dict_key<R: Read + Seek>(
-    pdf: &mut Pdf<R>,
-    handle: &ObjectHandle,
-    key: &[u8],
-) -> flpdf::Result<ObjectHandle> {
-    resolve_handle(pdf, handle)?;
-    Ok(handle.get_key(key))
-}
-
 /// Shared body for `test_64` through `test_67` (`qpdf/test_driver.cc:2303-2340`,
 /// `test_64_67`): overlay each page of `arg2`'s document onto the matching
 /// page of `pdf`, in place, via `QPDFPageObjectHelper::getFormXObjectForPage`
@@ -288,9 +270,8 @@ pub(crate) fn run_test_68<R: Read + Seek>(
     _stderr: &mut dyn Write,
     _diagnostics_written: &mut usize,
 ) -> flpdf::Result<()> {
-    let root = pdf.trailer_key_handle(b"Root");
-    let qstream = dict_key(pdf, &root, b"/QStream")?;
-    resolve_handle(pdf, &qstream)?;
+    let root = pdf.root_handle()?;
+    let qstream = root.try_get_key(b"/QStream")?;
 
     match qstream.get_stream_data(DecodeLevel::Generalized) {
         Ok(_) => writeln!(stdout, "oops -- didn't throw")?,
