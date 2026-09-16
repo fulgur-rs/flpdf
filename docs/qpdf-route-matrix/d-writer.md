@@ -183,6 +183,15 @@ container lookup と `rewrite_renumber` の source-container helper は、presen
   非 null で `/Extends` が indirect なら `unparseChild(extends, 1, f_in_ostream)` で複写。本体は
   `pushEncryptionFilter` 経由、`newline_before_endstream` で `"\n"`、`endstream`。
 
+linearized flpdf の `append_objstm_container_object` も、`ObjStmLayout`に保持したPreserveの
+source containerをcanonical handleで参照し、indirect `/Extends` targetを`RenumberMap`で
+output-spaceへ変換して`/First`の後へ書く（`crates/flpdf/src/linearization/writer.rs`）。
+Generateのnull placeholder、direct `/Extends`、欠損値はqpdfと同じく追加しない。通常の
+standard/QDF writerが持つ既存の`write_objstm_stream_with_extends`との対応を保ちつつ、
+linearized pass 1/pass 2の同一辞書・payload境界で処理する。`good17`、
+`good17-not-qdf`、`good17-not-recompressed`のqpdf 11.9.0 live比較と手書きtype-2 chain
+回帰で、`/Extends`を含む全出力byteを確認する（`QPDFWriter.cc:1621-1758`）。
+
 ### D-4. xref / trailer
 
 - `writeStandard`（`libqpdf/QPDFWriter.cc:2991-3044`）: deterministic なら MD5 pipeline →

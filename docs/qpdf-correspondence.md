@@ -1006,6 +1006,21 @@ payload の二重保持を除去し、出力 bytes・dictionary・暗号化境�
 `ObjectHandle::stream` / `as_stream_data` の既存 qpdf対応（`QPDF_Stream::stream_data` の
 `shared_ptr<Buffer>`）を利用し、回帰は圧縮・非圧縮の両モードで同一 allocation を検査する。
 
+### Linearized source-backed ObjStm `/Extends` preservation (`flpdf-eetrz`, 2026-09-17)
+
+qpdf の `writeObjectStream` は、Preserveで元containerがnullでない場合にその辞書を参照し、
+`/Extends` がindirectなら `unparseChild` でwriterの採番へ変換して`/First`の後へ複写する。
+Generateのnull placeholderにはこのsource辞書がないため`/Extends`を生成しない
+（`libqpdf/QPDFWriter.cc:1621-1758`、特に`:1730-1739`、`unparseChild`は`:1144-1162`）。
+
+flpdf のlinearized canonical emitterは `RoutedObjStmBatch` のsource identityを
+`ObjStmLayout`へ保持し、`append_objstm_container_object` がsource handleを一度だけ確認する。
+indirect `/Extends`だけを既存の`RenumberMap`でoutput refへremapし、共有wrapperと固定辞書順の
+emissionへ渡す。direct値、欠損値、Generateのsourceなしcontainerは出力しない。
+`good17`系3 fixtureのqpdf 11.9.0 live probeと、手書きtype-2 xref chain回帰を
+`qpdf-zlib-compat`で比較し、linearized outputの`/Extends`・`/L`/`/E`/`/T`を含むfull bytesを
+一致させる。
+
 ### Linearized pass-1 ownership (`flpdf-ymuj.5`, 2026-09-13)
 
 qpdf 11.9.0 の `QPDFWriter::writeLinearized` は pass 1 の開始時に、指定された

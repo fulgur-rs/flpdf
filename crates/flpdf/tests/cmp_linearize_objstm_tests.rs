@@ -366,11 +366,103 @@ fn source_objstm_thumbnail_before_plain_rest_pdf() -> Vec<u8> {
     pdf
 }
 
+fn source_objstm_extends_linearization_pdf() -> Vec<u8> {
+    let mut pdf = Vec::new();
+    pdf.extend_from_slice(b"%PDF-1.7\n");
+    let mut offsets = [0u64; 11];
+
+    let append_object = |pdf: &mut Vec<u8>, offsets: &mut [u64], number: usize, body: &[u8]| {
+        offsets[number] = pdf.len() as u64;
+        pdf.extend_from_slice(format!("{number} 0 obj\n").as_bytes());
+        pdf.extend_from_slice(body);
+        pdf.extend_from_slice(b"\nendobj\n");
+    };
+
+    append_object(
+        &mut pdf,
+        &mut offsets,
+        1,
+        b"<< /Type /Catalog /Pages 2 0 R /Extra 4 0 R /Child 8 0 R >>",
+    );
+    append_object(
+        &mut pdf,
+        &mut offsets,
+        2,
+        b"<< /Type /Pages /Count 1 /Kids [6 0 R] >>",
+    );
+    append_objstm(&mut pdf, &mut offsets, 3, &[(4, b"<< /Marker /Parent >>")]);
+    append_objstm_with_extends(
+        &mut pdf,
+        &mut offsets,
+        5,
+        &[(8, b"<< /Marker /Child >>")],
+        Some(3),
+    );
+    append_object(
+        &mut pdf,
+        &mut offsets,
+        6,
+        b"<< /Type /Page /Parent 2 0 R /MediaBox [0 0 10 10] /Contents 7 0 R >>",
+    );
+    append_object(
+        &mut pdf,
+        &mut offsets,
+        7,
+        b"<< /Length 0 >>\nstream\n\nendstream",
+    );
+
+    let xref_offset = pdf.len() as u64;
+    let mut xref_entries = Vec::with_capacity(11 * 7);
+    let push_xref_entry = |entries: &mut Vec<u8>, entry_type: u8, field2: u32, field3: u16| {
+        entries.push(entry_type);
+        entries.extend_from_slice(&field2.to_be_bytes());
+        entries.extend_from_slice(&field3.to_be_bytes());
+    };
+    for number in 0..=10 {
+        match number {
+            0 | 9 => push_xref_entry(&mut xref_entries, 0, 0, u16::MAX),
+            4 => push_xref_entry(&mut xref_entries, 2, 3, 0),
+            8 => push_xref_entry(&mut xref_entries, 2, 5, 0),
+            number => push_xref_entry(
+                &mut xref_entries,
+                1,
+                u32::try_from(if number == 10 {
+                    xref_offset
+                } else {
+                    offsets[number]
+                })
+                .expect("fixture xref offset fits u32"),
+                0,
+            ),
+        }
+    }
+    let xref_dict = format!(
+        "<< /Type /XRef /Size 11 /W [1 4 2] /Root 1 0 R /ID [<31415926535897932384626433832795><31415926535897932384626433832795>] /Length {} >>\nstream\n",
+        xref_entries.len()
+    );
+    let mut xref_body = xref_dict.into_bytes();
+    xref_body.extend_from_slice(&xref_entries);
+    xref_body.extend_from_slice(b"\nendstream");
+    append_object(&mut pdf, &mut offsets, 10, &xref_body);
+    pdf.extend_from_slice(format!("startxref\n{xref_offset}\n%%EOF\n").as_bytes());
+    pdf
+}
+
 fn append_objstm(
     pdf: &mut Vec<u8>,
     offsets: &mut [u64],
     number: usize,
     members: &[(usize, &[u8])],
+) {
+    append_objstm_with_extends(pdf, offsets, number, members, None);
+}
+
+fn append_objstm_with_extends(
+    pdf: &mut Vec<u8>,
+    offsets: &mut [u64],
+    number: usize,
+    members: &[(usize, &[u8])],
+    extends: Option<usize>,
 ) {
     let mut header = String::new();
     let mut body_offset = 0usize;
@@ -384,11 +476,15 @@ fn append_objstm(
     let first = header.len();
     let mut stream_data = header.into_bytes();
     stream_data.extend_from_slice(&body);
+    let extends = extends
+        .map(|number| format!(" /Extends {number} 0 R"))
+        .unwrap_or_default();
     let mut object = format!(
-        "<< /Type /ObjStm /N {} /First {} /Length {} >>\nstream\n",
+        "<< /Type /ObjStm /N {} /First {} /Length {}{} >>\nstream\n",
         members.len(),
         first,
-        stream_data.len()
+        stream_data.len(),
+        extends,
     )
     .into_bytes();
     object.extend_from_slice(&stream_data);
@@ -726,6 +822,29 @@ fn preserve_part9_thumbnail_container_precedes_plain_rest_object() {
         &actual,
         &expected,
         "Preserve thumbnail anchor order",
+    );
+}
+
+#[test]
+fn preserve_linearized_objstm_copies_source_extends() {
+    let directory = tempfile::tempdir().expect("source ObjStm Extends tempdir");
+    let input = directory.path().join("input.pdf");
+    std::fs::write(&input, source_objstm_extends_linearization_pdf())
+        .expect("write source ObjStm Extends input");
+
+    let expected = qpdf_linearized_objstm_preserve_at(&input);
+    let actual = flpdf_linearized_objstm_preserve_at(&input);
+    report(
+        "linearized Preserve source ObjStm /Extends",
+        &mask_id1(&actual),
+        &mask_id1(&expected),
+        "Preserve source ObjStm /Extends (ignoring /ID[1])",
+    );
+    report(
+        "linearized Preserve source ObjStm /Extends",
+        &actual,
+        &expected,
+        "Preserve source ObjStm /Extends",
     );
 }
 
