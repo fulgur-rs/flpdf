@@ -4396,6 +4396,17 @@ fn run_json(
     ];
 
     let json_output_mode = cli.json_output.is_some();
+    // qpdf registers --json-output with the choices {2, latest}
+    // (`auto_job_init.hh:23,127`), so an out-of-set value is rejected by the
+    // argument parser with its "must be given as" wording rather than by a
+    // later semantic check.
+    if let Some(version) = cli.json_output.as_deref() {
+        if !matches!(version, "2" | "latest") {
+            usage_exit(&UsageError::new(
+                "--json-output must be given as --json-output={2,latest}",
+            ));
+        }
+    }
     let json_version = cli
         .json_output
         .as_deref()
@@ -4410,17 +4421,18 @@ fn run_json(
     // 1. Validate --json-key values before doing any I/O.
     let mut json_keys: Vec<JsonKey> = Vec::new();
     for raw in &cli.json_key {
+        // Both checks are `QPDFJob::checkConfiguration` usage errors
+        // (`QPDFJob.cc:633-641`), so they take qpdf's usage exit — the leading
+        // blank line, the program name, and the trailing `For help:` block.
         if json_version != 1 && matches!(raw.as_str(), "objects" | "objectinfo") {
-            emit_logger_error(
-                "flpdf: json keys \"objects\" and \"objectinfo\" are only valid for json version 1"
-                    .to_owned()
-                    + "\n",
-            );
-            std::process::exit(2);
+            usage_exit(&UsageError::new(
+                "json keys \"objects\" and \"objectinfo\" are only valid for json version 1",
+            ));
         }
         if json_version == 1 && raw == "qpdf" {
-            emit_logger_error("flpdf: json key \"qpdf\" is only valid for json version > 1\n");
-            std::process::exit(2);
+            usage_exit(&UsageError::new(
+                "json key \"qpdf\" is only valid for json version > 1",
+            ));
         }
         match JsonKey::from_str(raw.as_str()) {
             Some(k) => json_keys.push(k),
