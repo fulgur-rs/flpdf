@@ -10,17 +10,6 @@ use flpdf::{Error, ObjectHandle, Pdf};
 
 use super::{emit_new_diagnostics, os_str_diagnostic_bytes};
 
-/// Text of the "form field object must be indirect" internal error retained
-/// by [`run_test_52`] below until its own bounded handle cutover.
-///
-/// qpdf's `QPDFFormFieldObjectHelper` wraps a `QPDFObjectHandle` directly and
-/// tolerates a direct (non-indirect) field object -- `setFieldAttribute`'s
-/// underlying `replaceKey` is simply a no-op on a null/malformed handle
-/// (`QPDFObjectHandle::replaceKey`, `libqpdf/QPDFObjectHandle.cc:1199-1209`).
-/// case51 uses `FormFieldObjectHelper::from_object_handle`; case52 remains on
-/// the older ObjectRef-only path and owns this temporary diagnostic text.
-const FIELD_MUST_BE_INDIRECT: &str = "form field object must be indirect";
-
 /// test_driver.cc:1939-1953 (`test_50`). Dictionary merge test crafted to
 /// work with `merge-dict.pdf`.
 pub(crate) fn run_test_50<R: Read + Seek>(
@@ -86,23 +75,6 @@ pub(crate) fn run_test_50<R: Read + Seek>(
         stdout.write_all(b"\n")?;
     }
     Ok(())
-}
-
-/// Resolve one handle hop that qpdf would traverse via `getArrayItem`,
-/// draining any repair diagnostics the resolution itself surfaces before
-/// the caller reads the resolved value -- matching `test_0_1.rs`'s own
-/// resolve-then-drain pattern.
-fn resolve_and_drain<R: Read + Seek>(
-    pdf: &mut Pdf<R>,
-    handle: &ObjectHandle,
-    filename: &[u8],
-    stdout: &mut dyn Write,
-    stderr: &mut dyn Write,
-    diagnostics_written: &mut usize,
-) -> flpdf::Result<(ObjectHandle, Option<flpdf::ObjectRef>)> {
-    pdf.resolve(handle)?;
-    emit_new_diagnostics(pdf, diagnostics_written, filename, stdout, stderr)?;
-    Ok((handle.clone(), handle.object_ref()))
 }
 
 /// test_driver.cc:1955-1997 (`test_51`). Radio button and checkbox field
@@ -208,58 +180,49 @@ pub(crate) fn run_test_52<R: Read + Seek>(
     // missing-argument case, rather than silently substituting empty bytes.
     let arg2 = arg2.expect("qpdf's test_52 dereferences arg2 without checking for null");
 
-    let root_handle = pdf.trailer_key_handle(b"Root");
-    let (root, _) = resolve_and_drain(
-        pdf,
-        &root_handle,
-        filename,
-        stdout,
-        stderr,
-        diagnostics_written,
-    )?;
+    // qpdf's getRoot/getKey/getArrayNItems/getArrayItem/getUTF8Value calls
+    // resolve their receivers at each accessor boundary
+    // (`qpdf/test_driver.cc:1999-2022`). Keep that order and flush the shared
+    // diagnostic collection before any subsequent observable output.
+    let root = match pdf.root_handle() {
+        Ok(root) => root,
+        Err(error) => {
+            emit_new_diagnostics(pdf, diagnostics_written, filename, stdout, stderr)?;
+            return Err(error);
+        }
+    };
+    emit_new_diagnostics(pdf, diagnostics_written, filename, stdout, stderr)?;
+    let acroform = root.try_get_key(b"/AcroForm");
+    emit_new_diagnostics(pdf, diagnostics_written, filename, stdout, stderr)?;
+    let acroform = acroform?;
+    let fields = acroform.try_get_key(b"/Fields");
+    emit_new_diagnostics(pdf, diagnostics_written, filename, stdout, stderr)?;
+    let fields = fields?;
+    let count = fields.try_get_array_n_items();
+    emit_new_diagnostics(pdf, diagnostics_written, filename, stdout, stderr)?;
+    let count = count?;
 
-    let acroform_handle = root.get_key(b"/AcroForm");
-    let (acroform, _) = resolve_and_drain(
-        pdf,
-        &acroform_handle,
-        filename,
-        stdout,
-        stderr,
-        diagnostics_written,
-    )?;
-
-    let fields_handle = acroform.get_key(b"/Fields");
-    let (fields, _) = resolve_and_drain(
-        pdf,
-        &fields_handle,
-        filename,
-        stdout,
-        stderr,
-        diagnostics_written,
-    )?;
-
-    for item in fields.as_array().unwrap_or_default() {
-        let (field, field_ref) =
-            resolve_and_drain(pdf, &item, filename, stdout, stderr, diagnostics_written)?;
-
-        let t_handle = field.get_key(b"/T");
-        let (t, _) = resolve_and_drain(
-            pdf,
-            &t_handle,
-            filename,
-            stdout,
-            stderr,
-            diagnostics_written,
-        )?;
-        let Some(raw) = t.as_string() else {
+    for index in 0..count {
+        let field = fields.try_get_array_item(index as i64);
+        emit_new_diagnostics(pdf, diagnostics_written, filename, stdout, stderr)?;
+        let field = field?;
+        let t = field.try_get_key(b"/T");
+        emit_new_diagnostics(pdf, diagnostics_written, filename, stdout, stderr)?;
+        let t = t?;
+        let is_string = t.try_is_string();
+        emit_new_diagnostics(pdf, diagnostics_written, filename, stdout, stderr)?;
+        let is_string = is_string?;
+        if !is_string {
+            emit_new_diagnostics(pdf, diagnostics_written, filename, stdout, stderr)?;
             continue;
-        };
-        let utf8 = flpdf::pdf_string::utf8_value(&raw);
+        }
+        emit_new_diagnostics(pdf, diagnostics_written, filename, stdout, stderr)?;
+        let utf8 = t.try_get_utf8_value();
+        emit_new_diagnostics(pdf, diagnostics_written, filename, stdout, stderr)?;
+        let utf8 = utf8?;
 
         if utf8 == b"list1" {
             writeln!(stdout, "setting list1 value")?;
-            let field_ref =
-                field_ref.ok_or_else(|| Error::System(FIELD_MUST_BE_INDIRECT.to_string()))?;
             // `newString` stores `arg2`'s raw bytes as-is -- unlike
             // `newUnicodeString`, this is qpdf's literal-string
             // constructor, not a UTF-8-to-UTF-16 conversion. (`set_value`
@@ -267,8 +230,9 @@ pub(crate) fn run_test_52<R: Read + Seek>(
             // field, matching `QPDFFormFieldObjectHelper::setV`'s own
             // `value.isString()` branch.)
             let value = ObjectHandle::string(os_str_diagnostic_bytes(arg2).into_owned());
-            let mut foh = FormFieldObjectHelper::new(field_ref, pdf);
+            let mut foh = FormFieldObjectHelper::from_object_handle(field, pdf);
             foh.set_value(value, true)?;
+            emit_new_diagnostics(pdf, diagnostics_written, filename, stdout, stderr)?;
         }
     }
 
@@ -407,8 +371,9 @@ pub(crate) fn run_test_55<R: Read + Seek>(
 
 #[cfg(test)]
 mod tests {
-    use super::{resolve_and_drain, run_test_50, run_test_51};
+    use super::{run_test_50, run_test_51, run_test_52};
     use flpdf::{ObjectHandle, Pdf, PdfOpenOptions};
+    use std::ffi::OsStr;
     use std::io;
     use std::path::PathBuf;
 
@@ -566,6 +531,30 @@ mod tests {
         pdf
     }
 
+    fn direct_text_field_pdf() -> Pdf<std::io::Cursor<Vec<u8>>> {
+        let mut pdf = Pdf::open_mem_owned_with_options(
+            include_bytes!("../../../../tests/fixtures/minimal.pdf").to_vec(),
+            PdfOpenOptions {
+                description: b"appearance-direct.pdf".to_vec(),
+                suppress_warnings: true,
+                ..PdfOpenOptions::default()
+            },
+        )
+        .expect("open minimal PDF");
+        let text_field = ObjectHandle::dictionary(vec![
+            (b"/FT".to_vec(), ObjectHandle::name(b"Tx".to_vec())),
+            (b"/T".to_vec(), ObjectHandle::string(b"list1".to_vec())),
+        ]);
+        let acroform = ObjectHandle::dictionary(vec![(
+            b"/Fields".to_vec(),
+            ObjectHandle::array(vec![text_field]),
+        )]);
+        let root = pdf.root_handle().expect("root");
+        root.replace_key(b"/AcroForm", acroform)
+            .expect("install AcroForm");
+        pdf
+    }
+
     #[test]
     fn test_51_drains_each_broken_button_warning_after_its_operation() {
         let _lock = super::super::CURRENT_DIR_LOCK
@@ -630,6 +619,37 @@ mod tests {
         .expect("qpdf accepts a direct field handle");
 
         assert_eq!(stdout, b"turning checkbox1 on\n");
+        assert!(stderr.is_empty());
+        assert!(directory.path().join("a.pdf").is_file());
+    }
+
+    #[test]
+    fn test_52_accepts_a_direct_text_field_handle() {
+        let _lock = super::super::CURRENT_DIR_LOCK
+            .get_or_init(|| std::sync::Mutex::new(()))
+            .lock()
+            .expect("acquire current-directory test lock");
+        let directory = tempfile::tempdir().expect("create test directory");
+        let previous = std::env::current_dir().expect("read current directory");
+        std::env::set_current_dir(directory.path()).expect("enter test directory");
+        let _restore = CurrentDirGuard(previous);
+
+        let mut pdf = direct_text_field_pdf();
+        let mut stdout = Vec::new();
+        let mut stderr = Vec::new();
+        let mut diagnostics_written = 0;
+
+        run_test_52(
+            &mut pdf,
+            b"appearance-direct.pdf",
+            Some(OsStr::new("five")),
+            &mut stdout,
+            &mut stderr,
+            &mut diagnostics_written,
+        )
+        .expect("qpdf accepts a direct text field handle");
+
+        assert_eq!(stdout, b"setting list1 value\n");
         assert!(stderr.is_empty());
         assert!(directory.path().join("a.pdf").is_file());
     }
@@ -718,34 +738,5 @@ mod tests {
             "resource-name output failure must propagate"
         );
         assert!(stderr.is_empty());
-    }
-
-    #[test]
-    fn resolve_and_drain_returns_the_canonical_handle_identity() {
-        let mut pdf = Pdf::open_mem_owned_with_options(
-            include_bytes!("../../../../tests/fixtures/minimal.pdf").to_vec(),
-            PdfOpenOptions::default(),
-        )
-        .expect("open minimal fixture");
-        let root = pdf.trailer_key_handle(b"Root");
-        let expected_ref = pdf.root_ref();
-        let mut stdout = Vec::new();
-        let mut stderr = Vec::new();
-        let mut diagnostics_written = pdf.repair_diagnostics().entries().len();
-
-        let (resolved, object_ref) = resolve_and_drain(
-            &mut pdf,
-            &root,
-            b"minimal.pdf",
-            &mut stdout,
-            &mut stderr,
-            &mut diagnostics_written,
-        )
-        .expect("resolve root");
-
-        assert_eq!(object_ref, expected_ref);
-        assert!(resolved.as_dictionary().is_some());
-        assert!(stderr.is_empty());
-        assert!(stdout.is_empty());
     }
 }
