@@ -77,10 +77,9 @@
 //! - **Raw outline keys are preserved.** Ordinary rewriting keeps `/SE`,
 //!   `/Dest`, `/A`, and unknown outline dictionary keys as PDF objects rather
 //!   than applying flpdf-specific validation or pruning policy.
-//! - **`flpdf --json`'s `pagelabels` section** keeps qpdf's outer
-//!   `{index, label}` entries, but represents each `label` as normalized
-//!   `{first, prefix, style}` fields instead of qpdf JSON v2's raw page-label
-//!   dictionary. The `outlines` section uses qpdf JSON v2's key layout.
+//! - **`flpdf --json`'s `pagelabels` section** uses qpdf JSON v2's outer
+//!   `{index, label}` entries and raw page-label dictionaries (`/S`, `/P`,
+//!   `/St`). The `outlines` section uses qpdf JSON v2's key layout.
 
 // Mechanically enforce threat-model guarantee (a): no undefined behaviour.
 // The explicit system-libjpeg compatibility backend lives in the optional
