@@ -33,7 +33,7 @@
 //! The four parts are always disjoint (invariant preserved by construction).
 
 use crate::linearization::renumber::RenumberMap;
-use crate::object_handle::ObjectHandle;
+use crate::object_handle::{LiveDictionaryKeyBuffer, ObjectHandle, ObjectValue};
 use crate::parser::MAX_PARSE_DEPTH;
 use crate::pdf::WriterObjectOrderKey;
 use crate::qpdf_obj_gen::QpdfObjGen;
@@ -337,33 +337,82 @@ where
     F: FnMut(&ObjectHandle, usize, bool) -> Result<()>,
 {
     handle.try_dereference()?;
-    if let Some(stream_dict) = handle.as_stream_dict() {
-        let Some(entries) = stream_dict.try_as_dictionary()? else {
-            return Ok(());
-        };
-        let skip_stream_parameters =
-            handle_has_stream_parameter_skip(handle, skipped_stream_parameter_streams)?;
-        for (key, child) in entries {
-            if key == b"/Length"
-                || (skip_stream_parameters
-                    && matches!(key.as_slice(), b"/Filter" | b"/DecodeParms"))
-            {
-                continue;
+    let kind = handle.with_value(|value| match value {
+        Some(ObjectValue::Stream(stream)) => {
+            DirectContainerKind::Stream(stream.stream_dict.clone())
+        }
+        Some(ObjectValue::Array(_)) => DirectContainerKind::Array,
+        Some(ObjectValue::Dictionary(_)) => DirectContainerKind::Dictionary,
+        _ => DirectContainerKind::Scalar,
+    });
+    match kind {
+        DirectContainerKind::Stream(stream_dict) => {
+            // Resolve the dictionary handle before the live walk. qpdf reaches
+            // the same map through `getDictAsMap`, whose `asDictionary()` is
+            // `dereference() ? obj->as<QPDF_Dictionary>() : nullptr`
+            // (`QPDFObjectHandle.cc:1012-1020`, `:327-330`), so an indirect
+            // stream dictionary is resolved rather than treated as empty.
+            // `next_dictionary_entry_for_live_walk` inspects the stored value
+            // without resolving, so the deref has to happen here.
+            stream_dict.try_dereference()?;
+            let skip_stream_parameters =
+                handle_has_stream_parameter_skip(handle, skipped_stream_parameter_streams)?;
+            visit_live_dictionary_children(&stream_dict, depth, skip_stream_parameters, visit)?;
+        }
+        DirectContainerKind::Array => {
+            let items = handle.try_array_items()?;
+            let mut cursor = items.begin();
+            while !cursor.is_end() {
+                let child = cursor.current();
+                visit(&child, depth + 1, true)?;
+                cursor.next();
             }
-            visit(&child, depth + 1, false)?;
         }
-        return Ok(());
+        DirectContainerKind::Dictionary => {
+            visit_live_dictionary_children(handle, depth, false, visit)?;
+        }
+        DirectContainerKind::Scalar => {}
     }
-    if let Some(children) = handle.try_as_array()? {
-        for child in children {
-            visit(&child, depth + 1, true)?;
+    Ok(())
+}
+
+enum DirectContainerKind {
+    Stream(ObjectHandle),
+    Array,
+    Dictionary,
+    Scalar,
+}
+
+/// Visit one dictionary's children in qpdf's sorted-key order while keeping
+/// only the current key and child handle alive across the callback. The
+/// callback may resolve or mutate the child, so the parent value borrow must
+/// be released before it is invoked (`QPDFWriter.cc:1488-1504`).
+fn visit_live_dictionary_children<F>(
+    dictionary: &ObjectHandle,
+    depth: usize,
+    skip_stream_parameters: bool,
+    visit: &mut F,
+) -> Result<()>
+where
+    F: FnMut(&ObjectHandle, usize, bool) -> Result<()>,
+{
+    let mut current_key = LiveDictionaryKeyBuffer::default();
+    let mut next_key = LiveDictionaryKeyBuffer::default();
+    let mut first_entry = true;
+    while let Some(child) = dictionary.next_dictionary_entry_for_live_walk(
+        (!first_entry).then_some(current_key.as_slice()),
+        &mut next_key,
+    ) {
+        std::mem::swap(&mut current_key, &mut next_key);
+        if current_key.as_slice() == b"/Length"
+            || (skip_stream_parameters
+                && matches!(current_key.as_slice(), b"/Filter" | b"/DecodeParms"))
+        {
+            first_entry = false;
+            continue;
         }
-        return Ok(());
-    }
-    if let Some(entries) = handle.try_as_dictionary()? {
-        for (_key, child) in entries {
-            visit(&child, depth + 1, false)?;
-        }
+        visit(&child, depth + 1, false)?;
+        first_entry = false;
     }
     Ok(())
 }
@@ -4416,6 +4465,71 @@ mod tests {
             2,
             "one qpdf parameter probe may retry once with raw data, but the optimization callback must not probe the same stream again"
         );
+    }
+
+    #[test]
+    fn direct_child_plan_walk_uses_live_container_cursors() {
+        let source = include_str!("plan.rs");
+        let start = source
+            .find("fn collect_direct_handle_children_with_stream_parameters")
+            .expect("direct child plan walker");
+        let body = &source[start
+            ..source[start..]
+                .find("\nfn handle_has_stream_parameter_skip")
+                .expect("direct child plan walker end")
+                + start];
+
+        assert!(
+            body.contains("try_array_items"),
+            "linearization plan must walk arrays through the live cursor"
+        );
+        assert!(
+            body.contains("next_dictionary_entry_for_live_walk"),
+            "linearization plan must walk dictionaries through the live cursor"
+        );
+        assert!(
+            !body.contains("try_as_array") && !body.contains("try_as_dictionary"),
+            "linearization plan must not clone complete container edges"
+        );
+    }
+
+    #[test]
+    fn indirect_stream_dictionary_children_are_reached_through_the_live_walk() {
+        use crate::object_handle::identity_tests::resolver_bearing_handle;
+        use crate::object_handle::ObjectValue;
+
+        // qpdf reads a stream's dictionary through `getDictAsMap`, whose
+        // `asDictionary()` dereferences (`QPDFObjectHandle.cc:1012-1020`,
+        // `:327-330`). A stream built with an indirect dictionary handle must
+        // therefore still expose its children to the plan walk.
+        let (stream_dict, _resolver) = resolver_bearing_handle(ObjectValue::Dictionary(
+            [
+                (b"/Kid".to_vec(), ObjectHandle::integer(42)),
+                (b"/Length".to_vec(), ObjectHandle::integer(0)),
+            ]
+            .into_iter()
+            .collect(),
+        ));
+        assert!(
+            !stream_dict.is_resolved(),
+            "the dictionary handle starts unresolved"
+        );
+        let stream = ObjectHandle::stream(stream_dict, std::rc::Rc::new(Vec::new()));
+
+        let mut visited = Vec::new();
+        super::collect_direct_handle_children(
+            &stream,
+            0,
+            false,
+            &mut |child, _depth, _in_array| {
+                visited.push(child.as_integer());
+                Ok(())
+            },
+        )
+        .expect("an indirect stream dictionary resolves during the walk");
+
+        // `/Length` is skipped like qpdf's writer does; `/Kid` must survive.
+        assert_eq!(visited, vec![Some(42)]);
     }
 
     #[test]
