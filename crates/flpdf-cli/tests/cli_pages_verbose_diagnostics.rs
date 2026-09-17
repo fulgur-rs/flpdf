@@ -384,6 +384,50 @@ fn rewrite_pages_split_opens_output_before_weak_crypto_validation() {
 }
 
 #[test]
+fn rewrite_pages_ordinary_output_opens_before_weak_crypto_validation() {
+    if !qpdf_available() {
+        return;
+    }
+
+    let temp = tempfile::tempdir().expect("temporary directory");
+    let input = fixture("three-page.pdf");
+    let output = temp.path().join("missing-directory").join("ordinary.pdf");
+    let input = input.to_str().unwrap().to_owned();
+    let output = output.to_str().unwrap().to_owned();
+    let qpdf_args = vec![
+        "--encrypt".to_owned(),
+        "user".to_owned(),
+        "owner".to_owned(),
+        "128".to_owned(),
+        "--".to_owned(),
+        input.clone(),
+        "--pages".to_owned(),
+        input.clone(),
+        "1".to_owned(),
+        "--".to_owned(),
+        output,
+    ];
+    let mut flpdf_args = vec!["rewrite".to_owned()];
+    flpdf_args.extend(qpdf_args.iter().cloned());
+
+    let qpdf = run_qpdf(&qpdf_args);
+    let flpdf = run_flpdf(&flpdf_args);
+
+    assert_eq!(flpdf.status.code(), qpdf.status.code());
+    assert_eq!(
+        normalize_text_newlines(&flpdf.stdout),
+        normalize_text_newlines(&qpdf.stdout),
+        "ordinary output-open failure must not emit writer diagnostics"
+    );
+    assert_eq!(
+        normalize_text_newlines(&flpdf.stderr),
+        normalize_text_newlines(&qpdf.stderr),
+        "ordinary output-open failure must precede qpdf's weak-crypto validation"
+    );
+    assert!(!String::from_utf8_lossy(&flpdf.stderr).contains("weak cryptographic algorithm"));
+}
+
+#[test]
 fn rewrite_pages_ordinary_output_uses_the_canonical_job_writer_route() {
     let source = include_str!("../src/main.rs");
     let start = source

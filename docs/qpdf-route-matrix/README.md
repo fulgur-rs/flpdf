@@ -546,7 +546,8 @@ canonical `ObjectHandle` pipeへの移行と、この bounded cleanupは route-w
 
 D19 / D30 は canonical implementation に委譲するbyte-neutral test scaffoldingで、削除対象ではない。
 特に D19 は back-patch 前の観測点を保持する。D30 の production caller はなく、CLIの旧同名
-private routeも `.48.144` で撤去済みである。
+`write_qpdf_to_memory` routeはこのslice以前に撤去済みであり、`.48.144` が撤去したのは
+残っていた `write_with_pdf_writer` routeである。
 
 **D27 follow-up（`flpdf-3yn9.44.1`）:** linearization の stream-parameter probe は
 deletable route の独立 symbol にはせず、D21 の canonical owner
