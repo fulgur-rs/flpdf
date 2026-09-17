@@ -338,19 +338,25 @@ pub(crate) fn run_test_5<R: Read + Seek>(
         writeln!(stdout, "end page {pageno}")?;
     }
 
-    let trailer = pdf.trailer();
-    let root = trailer.try_get_key(b"/Root")?;
+    // qpdf's test 5 reads the catalog through `QPDF::getRoot`
+    // (`qpdf/test_driver.cc:400`), which applies the document-level
+    // `/Root` dictionary gate and the check-mode `/Type` validation
+    // (`libqpdf/QPDF.cc:2355-2368`). Reading the trailer key directly
+    // bypasses both.
+    let root = pdf.root_handle()?;
 
     let qstrings = root.try_get_key(b"/QStrings")?;
-    resolve_handle(pdf, &qstrings)?;
-    // The container's own resolution can warn; qpdf raises it during the
-    // array check, before the section header, and it must still appear
-    // when the array turns out to be empty.
+    let qstrings_is_array = qstrings.try_is_array()?;
+    // qpdf's `isArray()` resolves the receiver before deciding whether the
+    // section exists. Drain any repair diagnostic before its header, then
+    // keep count/item resolution at the same accessor boundaries as qpdf.
     emit_new_diagnostics(pdf, diagnostics_written, filename, stdout, stderr)
         .map_err(Error::from)?;
-    if let Some(items) = qstrings.as_array() {
+    if qstrings_is_array {
         writeln!(stdout, "QStrings:")?;
-        for item in items {
+        let item_count = qstrings.try_get_array_n_items()?;
+        for index in 0..item_count {
+            let item = qstrings.try_get_array_item(index as i64)?;
             let utf8 = item.try_get_utf8_value()?;
             emit_new_diagnostics(pdf, diagnostics_written, filename, stdout, stderr)
                 .map_err(Error::from)?;
@@ -360,15 +366,14 @@ pub(crate) fn run_test_5<R: Read + Seek>(
     }
 
     let qnumbers = root.try_get_key(b"/QNumbers")?;
-    resolve_handle(pdf, &qnumbers)?;
-    // The container's own resolution can warn; qpdf raises it during the
-    // array check, before the section header, and it must still appear
-    // when the array turns out to be empty.
+    let qnumbers_is_array = qnumbers.try_is_array()?;
     emit_new_diagnostics(pdf, diagnostics_written, filename, stdout, stderr)
         .map_err(Error::from)?;
-    if let Some(items) = qnumbers.as_array() {
+    if qnumbers_is_array {
         writeln!(stdout, "QNumbers:")?;
-        for item in items {
+        let item_count = qnumbers.try_get_array_n_items()?;
+        for index in 0..item_count {
+            let item = qnumbers.try_get_array_item(index as i64)?;
             let value = item.try_get_numeric_value()?;
             emit_new_diagnostics(pdf, diagnostics_written, filename, stdout, stderr)
                 .map_err(Error::from)?;
