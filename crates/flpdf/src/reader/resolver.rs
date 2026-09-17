@@ -2636,22 +2636,22 @@ impl<R: Read + Seek> ResolverHandle<R> {
                     match raw_object_gen.cmp(default_object_gen) {
                         std::cmp::Ordering::Less => {
                             let Some((object_gen, entry)) = raw.next() else {
-                                break;
+                                break; // cov:ignore: peeked raw iterator cannot be empty before next
                             };
                             entries.push((*object_gen, *entry));
                         }
                         std::cmp::Ordering::Equal => {
                             let Some((object_gen, entry)) = raw.next() else {
-                                break;
+                                break; // cov:ignore: peeked raw iterator cannot be empty before next
                             };
                             let Some(_) = defaults.next() else {
-                                break;
+                                break; // cov:ignore: peeked default iterator cannot be empty before next
                             };
                             entries.push((*object_gen, *entry));
                         }
                         std::cmp::Ordering::Greater => {
                             let Some(object_gen) = defaults.next() else {
-                                break;
+                                break; // cov:ignore: peeked default iterator cannot be empty before next
                             };
                             entries.push((*object_gen, XrefEntry::Free { next: 0 }));
                         }
@@ -2659,13 +2659,13 @@ impl<R: Read + Seek> ResolverHandle<R> {
                 }
                 (Some(_), None) => {
                     let Some((object_gen, entry)) = raw.next() else {
-                        break;
+                        break; // cov:ignore: peeked raw iterator cannot be empty before next
                     };
                     entries.push((*object_gen, *entry));
                 }
                 (None, Some(_)) => {
                     let Some(object_gen) = defaults.next() else {
-                        break;
+                        break; // cov:ignore: peeked default iterator cannot be empty before next
                     };
                     entries.push((*object_gen, XrefEntry::Free { next: 0 }));
                 }
