@@ -22,6 +22,10 @@ pub(super) fn initialize(job: &mut QPDFJob, argv: Vec<Vec<u8>>) -> Result<()> {
     let expanded = expand_arg_files(argv)?;
 
     job.configuration = qpdf_default_job_configuration();
+    // qpdf's Config defaults `require_outfile` to true for the argv boundary;
+    // inspection selectors and JSON output options turn it off explicitly
+    // (`QPDFJob_config.cc:75-83, QPDFJob.cc:591-595`).
+    job.configuration.require_output = true;
     job.partial_json_initialized = false;
     job.argv_early_exit = false;
 
@@ -185,10 +189,25 @@ impl<'a> Parser<'a> {
                 Ok(())
             }
             b"empty" => self.select_empty_input(),
-            b"encrypt" => self.begin_segment(
-                Table::Encryption,
-                ActiveSegment::Encryption(EncryptionState::default()),
-            ),
+            b"encrypt" => {
+                let inherited = self
+                    .job
+                    .configuration
+                    .writer
+                    .encryption_parameters()
+                    .cloned();
+                let allow_insecure = self.job.configuration.allow_insecure_encryption;
+                let accessibility_disabled =
+                    self.job.configuration.encryption_accessibility_disabled;
+                self.begin_segment(
+                    Table::Encryption,
+                    ActiveSegment::Encryption(EncryptionState::new(
+                        inherited,
+                        allow_insecure,
+                        accessibility_disabled,
+                    )),
+                )
+            }
             b"externalize-inline-images" => {
                 self.job.configuration.externalize_inline_images = true;
                 Ok(())
@@ -472,7 +491,7 @@ impl<'a> Parser<'a> {
             }
             b"password-file" => {
                 let value = required_value(name, value, "password")?;
-                if let Some(password) = read_password_file(value)? {
+                if let Some(password) = read_password_file(self.job, value)? {
                     self.job.configuration.password = password;
                 }
                 Ok(())
@@ -733,11 +752,13 @@ impl<'a> Parser<'a> {
                 Ok(())
             }
             ActiveSegment::Encryption(state) => {
-                let params = state.finish()?;
+                let (params, allow_insecure, accessibility_disabled) = state.finish()?;
                 self.job
                     .configuration
                     .writer
                     .set_encryption_parameters(params);
+                self.job.configuration.allow_insecure_encryption = allow_insecure;
+                self.job.configuration.encryption_accessibility_disabled = accessibility_disabled;
                 self.job.configuration.copy_encryption_applies_to_writer = false;
                 Ok(())
             }
@@ -791,6 +812,9 @@ impl<'a> Parser<'a> {
 
     fn positional(&mut self, argument: &[u8]) -> Result<()> {
         if !self.gave_input {
+            if self.job.configuration.input_file.is_some() || self.job.configuration.empty_input {
+                return Err(UsageError::new("input file has already been given").into());
+            }
             if argument.is_empty() {
                 return self.select_empty_input();
             }
@@ -799,6 +823,10 @@ impl<'a> Parser<'a> {
             return Ok(());
         }
         if !self.gave_output {
+            if self.job.configuration.output_file.is_some() || self.job.configuration.replace_input
+            {
+                return Err(UsageError::new("output file has already been given").into());
+            }
             self.job.configuration.output_file = Some(path_from_bytes(argument));
             self.gave_output = true;
             return Ok(());
@@ -839,10 +867,9 @@ impl<'a> Parser<'a> {
     }
 
     fn apply_json_output(&mut self, value: Option<&[u8]>, output: bool) -> Result<()> {
-        let value = value.unwrap_or_default();
         let version = match value {
-            b"" | b"latest" | b"2" => 2,
-            b"1" if !output => 1,
+            None | Some(b"latest") | Some(b"2") => 2,
+            Some(b"1") if !output => 1,
             _ => {
                 let name = if output { "json-output" } else { "json" };
                 let choices = if output { "2,latest" } else { "1,2,latest" };
@@ -890,10 +917,6 @@ impl<'a> Parser<'a> {
             message.extend_from_slice(b" --job-json-help for information on the file format.");
             Error::Usage(UsageError::new(message))
         })?;
-        self.gave_input =
-            self.job.configuration.input_file.is_some() || self.job.configuration.empty_input;
-        self.gave_output =
-            self.job.configuration.output_file.is_some() || self.job.configuration.replace_input;
         Ok(())
     }
 }
@@ -1052,6 +1075,7 @@ fn split_argument_file_lines(bytes: &[u8]) -> Vec<Vec<u8>> {
 #[derive(Default)]
 struct PagesState {
     specs: Vec<PageArgSpec>,
+    called_file: bool,
     called_range: bool,
 }
 
@@ -1067,6 +1091,8 @@ impl PagesState {
             match name {
                 b"file" => {
                     let value = required_value(name, value, "file")?;
+                    // qpdf's named callback does not mutate the positional
+                    // disambiguation flags (`QPDFJob_argv.cc:39-40,243-271`).
                     self.add_file(path_from_bytes(value));
                     return Ok(());
                 }
@@ -1098,12 +1124,14 @@ impl PagesState {
             return Err(self.unknown_option(argument).into());
         }
 
-        if self.specs.is_empty() {
+        if !self.called_file {
             self.add_file(path_from_bytes(argument));
+            self.called_file = true;
             return Ok(());
         }
         if self.called_range {
             self.add_file(path_from_bytes(argument));
+            self.called_range = false;
             return Ok(());
         }
 
@@ -1116,6 +1144,7 @@ impl PagesState {
         let path = path_from_bytes(argument);
         if argument == b"." || File::open(&path).is_ok() {
             self.add_file(path);
+            self.called_range = false;
             Ok(())
         } else {
             Err(UsageError::new(String::from_utf8_lossy(argument).into_owned()).into())
@@ -1128,7 +1157,6 @@ impl PagesState {
             password: None,
             range: String::new(),
         });
-        self.called_range = false;
     }
 
     fn add_range(&mut self, range: &str) -> Result<()> {
@@ -1343,8 +1371,14 @@ impl AttachmentState {
             .ok_or_else(|| UsageError::new("file for --add-attachment may not be empty"))?;
         Ok(AttachmentAddOptions {
             path,
-            key: self.key.unwrap_or_else(|| basename.clone()),
-            filename: self.filename.unwrap_or(basename),
+            key: self
+                .key
+                .filter(|value| !value.is_empty())
+                .unwrap_or_else(|| basename.clone()),
+            filename: self
+                .filename
+                .filter(|value| !value.is_empty())
+                .unwrap_or(basename),
             mimetype: self.mimetype,
             description: self.description,
             creation_date: self.creation_date,
@@ -1437,8 +1471,10 @@ struct EncryptSubFlag {
     value: Option<Vec<u8>>,
 }
 
-#[derive(Default)]
 struct EncryptionState {
+    inherited: Option<EncryptParams>,
+    allow_insecure: bool,
+    accessibility_disabled: bool,
     positional: Vec<Vec<u8>>,
     dashed_mode: bool,
     positional_mode: bool,
@@ -1449,6 +1485,25 @@ struct EncryptionState {
 }
 
 impl EncryptionState {
+    fn new(
+        inherited: Option<EncryptParams>,
+        allow_insecure: bool,
+        accessibility_disabled: bool,
+    ) -> Self {
+        Self {
+            inherited,
+            allow_insecure,
+            accessibility_disabled,
+            positional: Vec::new(),
+            dashed_mode: false,
+            positional_mode: false,
+            user_password: None,
+            owner_password: None,
+            key_len: None,
+            subflags: Vec::new(),
+        }
+    }
+
     fn table_name(&self) -> &'static str {
         match self.key_len {
             Some(40) => "40-bit encryption",
@@ -1518,7 +1573,8 @@ impl EncryptionState {
         Err(self.unknown(argument).into())
     }
 
-    fn finish(self) -> Result<EncryptParams> {
+    fn finish(self) -> Result<(EncryptParams, bool, bool)> {
+        let inherited = self.inherited.as_ref();
         let (user_password, owner_password, key_len) = if self.dashed_mode {
             (
                 self.user_password.clone().unwrap_or_default(),
@@ -1538,13 +1594,27 @@ impl EncryptionState {
             )
         };
 
-        let mut use_aes = None;
-        let mut force_v4 = false;
-        let mut force_r5 = false;
-        let mut allow_insecure = false;
-        let mut cleartext_metadata = false;
-        let mut permissions = PermissionsConfig::default();
-        let mut r2_permissions = R2PermissionsConfig::default();
+        let mut use_aes = inherited.and_then(|params| match params.method {
+            EncryptMethod::V4Aes128 => Some(true),
+            EncryptMethod::V4Rc4128 => Some(false),
+            EncryptMethod::V5R5Aes256 | EncryptMethod::V5R6Aes256 => Some(true),
+            EncryptMethod::V1Rc440 | EncryptMethod::V2Rc4128 => Some(false),
+        });
+        let mut force_v4 = inherited.is_some_and(|params| {
+            matches!(
+                params.method,
+                EncryptMethod::V4Rc4128 | EncryptMethod::V4Aes128
+            )
+        });
+        let mut force_r5 =
+            inherited.is_some_and(|params| matches!(params.method, EncryptMethod::V5R5Aes256));
+        let mut allow_insecure = self.allow_insecure;
+        let mut cleartext_metadata = inherited.is_some_and(|params| !params.encrypt_metadata);
+        let mut permissions =
+            inherited.map_or_else(PermissionsConfig::default, |params| params.permissions);
+        let mut r2_permissions =
+            inherited.map_or_else(R2PermissionsConfig::default, |params| params.r2_permissions);
+        let mut accessibility_disabled = self.accessibility_disabled;
 
         for subflag in &self.subflags {
             let value = subflag.value.as_deref().unwrap_or_default();
@@ -1596,7 +1666,11 @@ impl EncryptionState {
                 }
                 b"form" => permissions.fill_forms = parse_encryption_yn(value)?,
                 b"assemble" => permissions.assemble = parse_encryption_yn(value)?,
-                b"accessibility" => permissions.accessibility = parse_encryption_yn(value)?,
+                b"accessibility" => {
+                    let enabled = parse_encryption_yn(value)?;
+                    permissions.accessibility = enabled;
+                    accessibility_disabled = !enabled;
+                }
                 b"modify-other" => permissions.modify_contents = parse_encryption_yn(value)?,
                 _ => return Err(self.unknown(&subflag.original).into()), // cov:ignore: encryption_table_accepts admits only the arms above
             }
@@ -1616,17 +1690,6 @@ impl EncryptionState {
             256 => EncryptMethod::V5R6Aes256,
             _ => unreachable!("encryption key length was validated"), // cov:ignore: parse_encryption_key_len admits only 40, 128, or 256
         };
-
-        if key_len == 256
-            && owner_password.is_empty()
-            && !user_password.is_empty()
-            && !allow_insecure
-        {
-            return Err(UsageError::new(
-                "A PDF with a non-empty user password and an empty owner password encrypted with a 256-bit key is insecure as it can be opened without a password. If you really want to do this, you must also give the --allow-insecure option before the -- that follows --encrypt.",
-            )
-            .into());
-        }
 
         let mut params = match method {
             EncryptMethod::V1Rc440 => {
@@ -1668,7 +1731,7 @@ impl EncryptionState {
         if method == EncryptMethod::V4Aes128 || method == EncryptMethod::V4Rc4128 {
             params.permissions.accessibility = true;
         }
-        Ok(params)
+        Ok((params, allow_insecure, accessibility_disabled))
     }
 
     fn unknown(&self, argument: &[u8]) -> UsageError {
@@ -1752,15 +1815,77 @@ fn parse_encryption_yn(value: &[u8]) -> Result<bool> {
 
 /// Handle qpdf's dynamically registered help-table options when they are the
 /// sole post-program argument. The full help prose remains a CLI presentation
-/// concern, but the library must accept the same table entries and terminate
-/// before it asks for an input file.
+/// concern, but the library must accept the same table entries, report the
+/// general help text, and terminate before it asks for an input file
+/// (`QPDFArgParser.cc:30-34,219-228,766-780`).
+const QPDF_HELP_TOP: &[u8] = br#"Run "qpdf --help=topic" for help on a topic.
+Run "qpdf --help=--option" for help on an option.
+Run "qpdf --help=all" to see all available help.
+
+Topics:
+  add-attachment: attach (embed) files
+  advanced-control: tweak qpdf's behavior
+  attachments: work with embedded files
+  completion: shell completion
+  copy-attachments: copy attachments from another file
+  encryption: create encrypted files
+  exit-status: meanings of qpdf's exit codes
+  general: general options
+  help: information about qpdf
+  inspection: inspect PDF files
+  json: JSON output for PDF information
+  modification: change parts of the PDF
+  overlay-underlay: overlay/underlay pages from other files
+  page-ranges: page range syntax
+  page-selection: select pages from one or more files
+  pdf-dates: PDF date format
+  testing: options for testing or debugging
+  transformation: make structural PDF changes
+  usage: basic invocation
+
+For detailed help, visit the qpdf manual: https://qpdf.readthedocs.io
+"#;
+
+fn known_help_target(value: &[u8]) -> bool {
+    matches!(
+        value,
+        b"all"
+            | b"add-attachment"
+            | b"advanced-control"
+            | b"attachments"
+            | b"completion"
+            | b"copy-attachments"
+            | b"encryption"
+            | b"exit-status"
+            | b"general"
+            | b"help"
+            | b"inspection"
+            | b"json"
+            | b"modification"
+            | b"overlay-underlay"
+            | b"page-ranges"
+            | b"page-selection"
+            | b"pdf-dates"
+            | b"testing"
+            | b"transformation"
+            | b"usage"
+            | b"--empty"
+            | b"--help"
+            | b"--json"
+            | b"--json-output"
+            | b"--pages"
+            | b"--encrypt"
+            | b"--add-attachment"
+    )
+}
+
 fn handle_sole_help_option(job: &mut QPDFJob, argument: &[u8]) -> Result<bool> {
     let Some((name, value)) = option_parts(argument) else {
         return Ok(false);
     };
     match name {
         b"version" | b"copyright" | b"show-crypto" | b"job-json-help" | b"completion-bash"
-        | b"completion-zsh" | b"help" | b"h" => {
+        | b"completion-zsh" | b"help" => {
             job.argv_early_exit = true;
             match name {
                 b"version" => job.logger.info(format!(
@@ -1774,7 +1899,20 @@ fn handle_sole_help_option(job: &mut QPDFJob, argument: &[u8]) -> Result<bool> {
                 // Crypto-provider enumeration is owned by the process/CLI in
                 // qpdf. Recognition and early exit are the library contract;
                 // no provider registry is created merely to parse argv.
-                b"show-crypto" | b"completion-bash" | b"completion-zsh" | b"help" | b"h" => {}
+                b"show-crypto" | b"completion-bash" | b"completion-zsh" => {}
+                b"help" => {
+                    if let Some(value) = value {
+                        if !known_help_target(value) {
+                            let mut message = b"unknown help option".to_vec();
+                            if !value.is_empty() {
+                                message.push(b' ');
+                                message.extend_from_slice(value);
+                            }
+                            return Err(UsageError::new(message).into());
+                        }
+                    }
+                    job.logger.info(QPDF_HELP_TOP)?;
+                }
                 b"job-json-help" => job.logger.info(
                     super::job_json_schema()
                         .unparse()
@@ -1785,17 +1923,18 @@ fn handle_sole_help_option(job: &mut QPDFJob, argument: &[u8]) -> Result<bool> {
             Ok(true)
         }
         b"json-help" => {
-            let value = value.unwrap_or_default();
-            if !matches!(value, b"" | b"1" | b"2" | b"latest") {
+            if matches!(value, Some(b""))
+                || !matches!(value, None | Some(b"1") | Some(b"2") | Some(b"latest"))
+            {
                 return Err(UsageError::new(
                     "--json-help must be given as --json-help={1,2,latest}",
                 )
                 .into());
             }
             let version = match value {
-                b"" | b"latest" => 2,
-                b"1" => 1,
-                b"2" => 2,
+                None | Some(b"latest") => 2,
+                Some(b"1") => 1,
+                Some(b"2") => 2,
                 _ => {
                     // cov:ignore-start: the preceding matches validate the json-help choice
                     return Err(UsageError::new(
@@ -1815,7 +1954,7 @@ fn handle_sole_help_option(job: &mut QPDFJob, argument: &[u8]) -> Result<bool> {
     }
 } // cov:ignore: LLVM attributes the read-password helper boundary to its neighboring function records
 
-fn read_password_file(value: &[u8]) -> Result<Option<Vec<u8>>> {
+fn read_password_file(job: &QPDFJob, value: &[u8]) -> Result<Option<Vec<u8>>> {
     let path = path_from_bytes(value);
     let bytes = if value == b"-" {
         let mut bytes = Vec::new();
@@ -1835,12 +1974,16 @@ fn read_password_file(value: &[u8]) -> Result<Option<Vec<u8>>> {
         // cov:ignore-end
         return Ok(None);
     }
-    let first_line_len = bytes
-        .iter()
-        .position(|byte| *byte == b'\n')
-        .unwrap_or(bytes.len());
+    let first_newline = bytes.iter().position(|byte| *byte == b'\n');
+    if first_newline.is_some_and(|index| index + 1 < bytes.len()) {
+        job.logger.error(format!(
+            "{}: WARNING: all but the first line of the password file are ignored\n",
+            job.message_prefix
+        ))?;
+    }
+    let first_line_len = first_newline.unwrap_or(bytes.len());
     let mut password = bytes[..first_line_len].to_vec();
-    if password.last() == Some(&b'\r') {
+    if first_newline.is_some() && password.last() == Some(&b'\r') {
         password.pop();
     }
     Ok(Some(password))

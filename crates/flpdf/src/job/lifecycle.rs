@@ -245,6 +245,16 @@ struct JobConfiguration {
     linearize: bool,
     linearize_pass1: Option<PathBuf>,
     allow_weak_crypto: bool,
+    /// qpdf's final `checkConfiguration` guard for an empty owner password
+    /// with a non-empty user password and a 256-bit key
+    /// (`QPDFJob.cc:601-611`). It is retained separately from the writer
+    /// parameters so a later `--decrypt` can clear encryption before the
+    /// final check, as qpdf does.
+    allow_insecure_encryption: bool,
+    /// qpdf records an explicit `--accessibility=n` request and reports that
+    /// it is ignored for modern encryption at writer setup time
+    /// (`QPDFJob.cc:2746-2749`).
+    encryption_accessibility_disabled: bool,
     page_specs: Vec<JobPageConfig>,
     page_specs_origin: PageSpecsOrigin,
     collate: Option<Vec<usize>>,
@@ -1672,6 +1682,24 @@ impl QPDFJob {
                 crate::encryption::PasswordWriteNotice::None
                 | crate::encryption::PasswordWriteNotice::Info => {}
             }
+        }
+        if self.configuration.encryption_accessibility_disabled
+            && writer_configuration
+                .encryption_parameters()
+                .is_some_and(|params| {
+                    matches!(
+                        params.method,
+                        EncryptMethod::V4Aes128
+                            | EncryptMethod::V4Rc4128
+                            | EncryptMethod::V5R5Aes256
+                            | EncryptMethod::V5R6Aes256
+                    )
+                })
+        {
+            self.logger.error(format!(
+                "{}: -accessibility=n is ignored for modern encryption formats\n",
+                self.message_prefix
+            ))?;
         }
         if !self.configuration.allow_weak_crypto
             && writer_configuration
@@ -4241,6 +4269,21 @@ impl QPDFJob {
                 "--requires-password and --is-encrypted may not be given together",
             )
             .into());
+        }
+        if !self.configuration.allow_insecure_encryption {
+            if let Some(params) = self.configuration.writer.encryption_parameters() {
+                if matches!(
+                    params.method,
+                    EncryptMethod::V5R5Aes256 | EncryptMethod::V5R6Aes256
+                ) && params.owner_password.is_empty()
+                    && !params.user_password.is_empty()
+                {
+                    return Err(UsageError::new(
+                        "A PDF with a non-empty user password and an empty owner password encrypted with a 256-bit key is insecure as it can be opened without a password. If you really want to do this, you must also give the --allow-insecure option before the -- that follows --encrypt.",
+                    )
+                    .into());
+                }
+            }
         }
         if self.configuration.output_file.as_deref() == Some(Path::new("-")) || implicit_json_stdout
         {
