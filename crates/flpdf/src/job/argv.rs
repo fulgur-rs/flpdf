@@ -2186,7 +2186,7 @@ fn copyright_output(program: &[u8]) -> Vec<u8> {
         .windows(marker.len())
         .position(|window| window == marker)
     else {
-        return source.to_vec();
+        return source.to_vec(); // cov:ignore: QPDF_COPYRIGHT is a pinned compile-time asset and always contains this marker
     };
     let mut output = Vec::with_capacity(source.len() + program.len());
     output.extend_from_slice(&source[..offset]);
