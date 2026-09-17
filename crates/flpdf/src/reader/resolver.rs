@@ -4108,6 +4108,18 @@ impl<R: Read + Seek> ResolverHandle<R> {
             )?; // cov:ignore: LLVM attributes the covered raw framing-warning call terminator to a zero-count continuation region
         }
 
+        // qpdf's lazy stream parser leaves InputSource::last_offset at the
+        // stream-data start after a successful readStream boundary. The Rust
+        // parser scans through endstream/endobj to retain exact extents, so
+        // restore that observable qpdf position after the same successful
+        // validation (`QPDF.cc:1360-1399`).
+        self.core
+            .borrow()
+            .input
+            .borrow()
+            .last_offset
+            .set(stream_offset);
+
         let dict = self.direct_object_handle(dict);
         dict.set_parsed_offset_if_unset(dict_offset);
         if !dict_description.is_empty() {
