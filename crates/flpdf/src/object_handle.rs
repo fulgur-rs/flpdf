@@ -2295,7 +2295,11 @@ impl ObjectHandle {
             (slot.shared.clone(), uniquely_owned)
         };
         if uniquely_owned {
-            old_shared.borrow_mut().value = new_state;
+            let old_value = {
+                let mut shared = old_shared.borrow_mut();
+                std::mem::replace(&mut shared.value, new_state)
+            };
+            drop(old_value);
             return;
         }
 
