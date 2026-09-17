@@ -81,7 +81,7 @@ use crate::writer::object_streams::{
 };
 use crate::writer::{
     decrement_progress_event, effective_pdf_version_and_ext, effective_stream_policy,
-    output::{write_object_ref, OutputSink, OutputTarget},
+    output::{write_decimal_u64, write_object_ref, OutputSink, OutputTarget},
     report_progress_event,
     serialize::xref_stream,
     CompressStreams, NewlineBeforeEndstream, ObjectWriterEmission, WriterOptions, WriterResult,
@@ -89,6 +89,16 @@ use crate::writer::{
 use crate::{ObjectHandle, ObjectRef, Pdf, Result};
 
 const EBADF_ERRNO: i32 = 9;
+
+/// Write qpdf's `openObject` header without building a temporary formatted
+/// string (`QPDFWriter.cc:1036-1047`). The caller owns the output offset and
+/// the object's body; this helper only covers the exact `N G obj\n` boundary.
+fn write_indirect_object_header(out: &mut OutputSink<'_>, object_ref: ObjectRef) -> Result<()> {
+    write_decimal_u64(out, u64::from(object_ref.number))?;
+    out.write_bytes(b" ")?;
+    write_decimal_u64(out, u64::from(object_ref.generation))?;
+    out.write_bytes(b" obj\n")
+}
 
 /// Forward-only destination for qpdf's linearization pass 1.
 ///
@@ -498,7 +508,7 @@ fn append_objstm_container_object<R: Read + Seek>(
     // Its newline-before-endstream setting applies to this container exactly
     // as it does to ordinary body streams (QPDFWriter.cc:1752-1755).
     let offset = out.position_usize()?;
-    out.write_bytes(format!("{} 0 obj\n", container.container_new_num).as_bytes())?;
+    write_indirect_object_header(out, ObjectRef::new(container.container_new_num, 0))?;
     out.write_bytes(b"<< /Type ")?;
     stream_dict.try_get_key(b"/Type")?.write_object(out)?;
     out.write_bytes(b" /Length ")?;
@@ -657,7 +667,7 @@ fn append_object(
     encrypted_string_emitter: Option<&mut EncryptedStringEmitter>,
 ) -> Result<usize> {
     let offset = out.position_usize()?;
-    out.write_bytes(format!("{} {} obj\n", new_ref.number, new_ref.generation).as_bytes())?;
+    write_indirect_object_header(out, new_ref)?;
     if let Some(emitter) = encrypted_string_emitter {
         emitter.write_handle_object_with_qpdf_obj_gen_map_and_mode(
             out,
@@ -740,7 +750,7 @@ fn append_body_object_with_raw_identity(
     let dict = ObjectHandle::dictionary(entries.into_iter().collect());
 
     let offset = out.position_usize()?;
-    out.write_bytes(format!("{} {} obj\n", new_ref.number, new_ref.generation).as_bytes())?;
+    write_indirect_object_header(out, new_ref)?;
     if let Some(emitter) = encrypted_string_emitter {
         emitter.write_handle_stream_dict_with_qpdf_obj_gen_map(
             out,
@@ -2046,7 +2056,9 @@ fn append_hint_stream_object(
     }
 
     let offset = bytes.len();
-    bytes.extend_from_slice(format!("{} {} obj\n", new_ref.number, new_ref.generation).as_bytes());
+    crate::writer::output::with_buffer_sink(bytes, |out| {
+        write_indirect_object_header(out, new_ref)
+    })?;
     bytes.extend_from_slice(
         hint_stream_dict_prefix(
             shared_section_offset,
@@ -5708,6 +5720,16 @@ mod tests {
         write_fixed_xref_entry(&mut sink, 123).expect("write fixed xref entry");
         drop(sink);
         assert_eq!(bytes, b"0000000123 00000 n \n");
+    }
+
+    #[test]
+    fn indirect_object_header_writer_preserves_qpdf_line_shape() {
+        let mut bytes = Vec::new();
+        let mut sink = OutputSink::new(&mut bytes);
+        write_indirect_object_header(&mut sink, ObjectRef::new(123, 7))
+            .expect("write object header");
+        drop(sink);
+        assert_eq!(bytes, b"123 7 obj\n");
     }
 
     #[test]
