@@ -310,15 +310,16 @@ semantic page-label caller 5 箇所だけを移行した。
 
 
 `flpdf-5nle` で attachment mutation の output boundary を更新した。`QPDFJob::handleTransformations` の
-`addAttachments` / `removeEmbeddedFile` 相当の mutation 後、`run_add_attachment` と
-`run_remove_attachment` は共通の `top_level_writer_options` を
+`addAttachments` / `removeEmbeddedFile` 相当の mutation 後、`run_all_attachment_mutations` は
+`configure_attachment_job` / `run_configured_attachment_job` を通じて共通の
+`top_level_writer_options` を
 `QPDFJob::create_qpdf` → `QPDFJob::write_qpdf` へ渡す。content normalization は mutation 後に
 行い、linearization と `linearize_pass1` も同じ Job writer に渡す。これは qpdf の
 `writeQPDF` → `writeOutfile` → `setWriterOptions` の順序
 （`libqpdf/QPDFJob.cc:484-507,2137-2248,2847-2945,3029-3058`）に対応する。
 
 `flpdf-w0ne` では remove route の diagnostics も同じ E-9/E-4 境界へ揃える。
-`run_remove_attachment` は mutation 成功時の `removed attachment <key>` を verbose info sink
+`run_all_attachment_mutations` の remove operation は mutation 成功時の `removed attachment <key>` を verbose info sink
 へ送り、writer 完了後に `wrote file <output>` を送り、missing key は qpdf の
 `attachment <key> not found` を raw bytes のまま返す（`libqpdf/QPDFJob.cc:2230-2241,3030-3062`）。
 
