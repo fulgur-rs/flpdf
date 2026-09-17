@@ -2638,18 +2638,50 @@ impl<R: Read + Seek> ResolverHandle<R> {
         let mut entries = Vec::with_capacity(
             core.raw_source_xref_entries.len() + core.default_xref_entries.len(),
         );
-        entries.extend(
-            core.raw_source_xref_entries
-                .iter()
-                .map(|(object_gen, entry)| (*object_gen, *entry)),
-        );
-        entries.extend(
-            core.default_xref_entries
-                .iter()
-                .filter(|object_gen| !core.raw_source_xref_entries.contains_key(object_gen))
-                .map(|object_gen| (*object_gen, XrefEntry::Free { next: 0 })),
-        );
-        entries.sort_unstable_by_key(|(object_gen, _)| *object_gen);
+        let mut raw = core.raw_source_xref_entries.iter().peekable();
+        let mut defaults = core.default_xref_entries.iter().peekable();
+        loop {
+            match (raw.peek().copied(), defaults.peek().copied()) {
+                (Some((raw_object_gen, _)), Some(default_object_gen)) => {
+                    match raw_object_gen.cmp(default_object_gen) {
+                        std::cmp::Ordering::Less => {
+                            let Some((object_gen, entry)) = raw.next() else {
+                                break;
+                            };
+                            entries.push((*object_gen, *entry));
+                        }
+                        std::cmp::Ordering::Equal => {
+                            let Some((object_gen, entry)) = raw.next() else {
+                                break;
+                            };
+                            let Some(_) = defaults.next() else {
+                                break;
+                            };
+                            entries.push((*object_gen, *entry));
+                        }
+                        std::cmp::Ordering::Greater => {
+                            let Some(object_gen) = defaults.next() else {
+                                break;
+                            };
+                            entries.push((*object_gen, XrefEntry::Free { next: 0 }));
+                        }
+                    }
+                }
+                (Some(_), None) => {
+                    let Some((object_gen, entry)) = raw.next() else {
+                        break;
+                    };
+                    entries.push((*object_gen, *entry));
+                }
+                (None, Some(_)) => {
+                    let Some(object_gen) = defaults.next() else {
+                        break;
+                    };
+                    entries.push((*object_gen, XrefEntry::Free { next: 0 }));
+                }
+                (None, None) => break,
+            }
+        }
         entries
     }
 
