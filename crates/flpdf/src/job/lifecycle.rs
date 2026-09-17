@@ -804,6 +804,7 @@ fn job_json_print_permission(
 fn parse_job_encrypt(
     value: &crate::json::Json,
     allow_weak_crypto: bool,
+    inherited: &EncryptionDefaults,
 ) -> Result<(EncryptParams, EncryptionDefaults)> {
     let members = job_json_members(value);
     let user_password = job_json_string(&members, b"userPassword")?;
@@ -832,7 +833,7 @@ fn parse_job_encrypt(
         .get(key_length.as_bytes())
         .expect("key length was found in the encryption dictionary");
     let settings = job_json_members(settings);
-    let allow_insecure = job_json_bare(&settings, b"allowInsecure")?;
+    let allow_insecure = inherited.allow_insecure || job_json_bare(&settings, b"allowInsecure")?;
     if key_length == "256bit"
         && owner_password.is_empty()
         && !user_password.is_empty()
@@ -842,8 +843,9 @@ fn parse_job_encrypt(
             "A PDF with a non-empty user password and an empty owner password encrypted with a 256-bit key is insecure as it can be opened without a password. If you really want to do this, you must also give the --allow-insecure option before the -- that follows --encrypt.",
         )));
     }
-    let mut permissions = crate::PermissionsConfig::default();
-    let mut accessibility_disabled = false;
+    let mut permissions = inherited.permissions;
+    let r2_permissions = inherited.r2_permissions;
+    let mut accessibility_disabled = inherited.accessibility_disabled;
     if let Some(value) = job_json_yn(&settings, b"accessibility")? {
         permissions.accessibility = value;
         accessibility_disabled = !value;
@@ -884,15 +886,17 @@ fn parse_job_encrypt(
         // JSON encryption handler applies its key-length-specific options
         // (`QPDFJob_config.cc:1088-1096`).
         "256bit" => true,
-        "128bit" => {
-            job_json_choice(&settings, b"useAes", &["y", "n"], true)?.as_deref() == Some("y")
-        }
+        "128bit" => job_json_choice(&settings, b"useAes", &["y", "n"], true)?
+            .map_or(inherited.use_aes, |value| value == "y"),
         "40bit" => false,
         _ => unreachable!("key length was validated above"), // cov:ignore: key length comes only from the validated qpdf job schema choices
     };
-    let force_v4 = key_length == "128bit" && job_json_bare(&settings, b"forceV4")?;
-    let force_r5 = key_length == "256bit" && job_json_bare(&settings, b"forceR5")?;
-    let cleartext_metadata = job_json_bare(&settings, b"cleartextMetadata")?;
+    let force_v4 =
+        inherited.force_v4 || (key_length == "128bit" && job_json_bare(&settings, b"forceV4")?);
+    let force_r5 =
+        inherited.force_r5 || (key_length == "256bit" && job_json_bare(&settings, b"forceR5")?);
+    let cleartext_metadata =
+        inherited.cleartext_metadata || job_json_bare(&settings, b"cleartextMetadata")?;
 
     let mut params = match key_length {
         "40bit" => EncryptParams::rc4(EncryptMethod::V1Rc440, user_password, owner_password),
@@ -939,7 +943,7 @@ fn parse_job_encrypt(
         allow_insecure,
         cleartext_metadata,
         permissions,
-        r2_permissions: params.r2_permissions,
+        r2_permissions,
         accessibility_disabled,
     };
     Ok((params, defaults))
@@ -1748,7 +1752,7 @@ impl QPDFJob {
                 })
         {
             self.logger.error(format!(
-                "{}: -accessibility=n is ignored for modern encryption formats\n",
+                "{}: -accessibility=n is ignored for modern encryption formats\n", // cov:ignore: accessibility warning regression executes the logger write; LLVM maps the covered continuation to the format call
                 self.message_prefix
             ))?; // cov:ignore: accessibility warning regression executes the logger write; LLVM maps the covered continuation to the format call
         }
@@ -2674,8 +2678,11 @@ impl QPDFJob {
             // handler visits `copyEncryption` before `encrypt`, so preserve
             // that precedence in the configuration snapshot.
             configuration.copy_encryption_applies_to_writer = false;
-            let (params, encryption_defaults) =
-                parse_job_encrypt(value, configuration.allow_weak_crypto)?; // cov:ignore: llvm-cov attributes this successful encryption parse continuation to its opening expressions
+            let (params, encryption_defaults) = parse_job_encrypt(
+                value,
+                configuration.allow_weak_crypto,
+                &configuration.encryption_defaults,
+            )?; // cov:ignore: llvm-cov attributes this successful encryption parse continuation to its opening expressions
             configuration.encryption_defaults = encryption_defaults;
             configuration.writer.set_encryption_parameters(params);
         }
@@ -6447,55 +6454,57 @@ mod tests {
             job_json_print_permission("invalid", &mut crate::PermissionsConfig::default()).is_err()
         );
 
+        let inherited = EncryptionDefaults::default();
         let encrypt_40 = crate::json::Json::parse(
             br#"{"userPassword":"u","ownerPassword":"o","40bit":{"annotate":"y","extract":"n","modify":"none","print":"low"}}"#,
         )
         .unwrap();
-        assert!(parse_job_encrypt(&encrypt_40, true).is_ok());
+        assert!(parse_job_encrypt(&encrypt_40, true, &inherited).is_ok());
         let encrypt_128 = crate::json::Json::parse(
             br#"{"userPassword":"u","ownerPassword":"o","128bit":{"accessibility":"y","annotate":"n","assemble":"y","cleartextMetadata":"","extract":"n","form":"y","modifyOther":"n","modify":"all","print":"full","forceV4":"","useAes":"n"}}"#,
         )
         .unwrap();
-        assert!(parse_job_encrypt(&encrypt_128, true).is_ok());
+        assert!(parse_job_encrypt(&encrypt_128, true, &inherited).is_ok());
         let encrypt_128_no_accessibility = crate::json::Json::parse(
             br#"{"userPassword":"u","ownerPassword":"o","128bit":{"accessibility":"n","useAes":"y"}}"#,
         )
         .unwrap();
-        assert!(parse_job_encrypt(&encrypt_128_no_accessibility, true).is_ok());
+        assert!(parse_job_encrypt(&encrypt_128_no_accessibility, true, &inherited).is_ok());
         let encrypt_256 = crate::json::Json::parse(
             br#"{"userPassword":"u","ownerPassword":"o","256bit":{"forceR5":"","allowInsecure":""}}"#,
         )
         .unwrap();
-        assert!(parse_job_encrypt(&encrypt_256, true).is_ok());
+        assert!(parse_job_encrypt(&encrypt_256, true, &inherited).is_ok());
         let encrypt_128_rc4 =
             crate::json::Json::parse(br#"{"userPassword":"u","ownerPassword":"o","128bit":{}}"#)
                 .unwrap();
-        assert!(parse_job_encrypt(&encrypt_128_rc4, true).is_ok());
+        assert!(parse_job_encrypt(&encrypt_128_rc4, true, &inherited).is_ok());
         let encrypt_256_r6 =
             crate::json::Json::parse(br#"{"userPassword":"u","ownerPassword":"o","256bit":{}}"#)
                 .unwrap();
-        let (_, encrypt_256_defaults) = parse_job_encrypt(&encrypt_256_r6, true).unwrap();
+        let (_, encrypt_256_defaults) =
+            parse_job_encrypt(&encrypt_256_r6, true, &inherited).unwrap();
         assert!(encrypt_256_defaults.use_aes);
         let insecure_256 =
             crate::json::Json::parse(br#"{"userPassword":"u","ownerPassword":"","256bit":{}}"#)
                 .unwrap();
-        assert!(parse_job_encrypt(&insecure_256, true).is_err());
+        assert!(parse_job_encrypt(&insecure_256, true, &inherited).is_err());
         let allowed_insecure_256 = crate::json::Json::parse(
             br#"{"userPassword":"u","ownerPassword":"","256bit":{"allowInsecure":""}}"#,
         )
         .unwrap();
-        assert!(parse_job_encrypt(&allowed_insecure_256, true).is_ok());
+        assert!(parse_job_encrypt(&allowed_insecure_256, true, &inherited).is_ok());
         let missing_password = crate::json::Json::parse(br#"{"128bit":{}}"#).unwrap();
-        assert!(parse_job_encrypt(&missing_password, true).is_err());
+        assert!(parse_job_encrypt(&missing_password, true, &inherited).is_err());
         let duplicate_key_length = crate::json::Json::parse(
             br#"{"userPassword":"u","ownerPassword":"o","40bit":{},"128bit":{}}"#,
         )
         .unwrap();
-        assert!(parse_job_encrypt(&duplicate_key_length, true).is_err());
+        assert!(parse_job_encrypt(&duplicate_key_length, true, &inherited).is_err());
         let no_key_length =
             crate::json::Json::parse(br#"{"userPassword":"u","ownerPassword":"o"}"#).unwrap();
-        assert!(parse_job_encrypt(&no_key_length, true).is_err());
-        assert!(parse_job_encrypt(&encrypt_40, false).is_err());
+        assert!(parse_job_encrypt(&no_key_length, true, &inherited).is_err());
+        assert!(parse_job_encrypt(&encrypt_40, false, &inherited).is_err());
     }
 
     #[test]

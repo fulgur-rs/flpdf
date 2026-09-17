@@ -1912,6 +1912,35 @@ const QPDF_HELP_LINEARIZE: &[u8] = br#"Create linearized (web-optimized) output 
 For detailed help, visit the qpdf manual: https://qpdf.readthedocs.io
 "#;
 
+const QPDF_HELP_PAGE_RANGES: &[u8] = br#"A full description of the page range syntax, with examples, can be
+found in the manual. In summary, a range is a comma-separated list of groups. A group is a number or a range of numbers separated by a
+dash. A group may be prepended by x to exclude its members from the
+previous group. A number may be one of
+
+- <n>        where <n> represents a number is the <n>th page
+- r<n>       is the <n>th page from the end
+- z          the last page, same as r1
+
+- a,b,c      pages a, b, and c
+- a-b        pages a through b inclusive; if a > b, this counts down
+- a-b,xc     pages a through b except page c
+- a-b,xc-d   pages a through b except pages c through d
+
+You can append :even or :odd to select every other page from the
+resulting set of pages, where :odd starts with the first page and
+:even starts with the second page. These are odd and even pages
+from the resulting set, not based on the original page numbers.
+
+For detailed help, visit the qpdf manual: https://qpdf.readthedocs.io
+"#;
+
+const QPDF_HELP_DECRYPT: &[u8] = br#"Create an unencrypted output file even if the input file was
+encrypted. Normally qpdf preserves whatever encryption was
+present on the input file. This option overrides that behavior.
+
+For detailed help, visit the qpdf manual: https://qpdf.readthedocs.io
+"#;
+
 const QPDF_HELP_TOPICS: &[&[u8]] = &[
     b"add-attachment",
     b"advanced-control",
@@ -2086,14 +2115,16 @@ fn help_top(program: &str) -> Vec<u8> {
     .into_bytes()
 }
 
-fn completion(program: &str, zsh: bool) -> Vec<u8> {
+fn completion(argv0: &[u8], zsh: bool) -> Vec<u8> {
+    let executable = String::from_utf8_lossy(argv0);
+    let program = program_name(argv0);
     if zsh {
         format!(
-            "autoload -U +X bashcompinit && bashcompinit && complete -o bashdefault -o default -C \"{program}\" {program}\n"
+            "autoload -U +X bashcompinit && bashcompinit && complete -o bashdefault -o default -C \"{executable}\" {program}\n"
         )
     } else {
         format!(
-            "complete -o bashdefault -o default -o nospace -C \"{program}\" {program}\n"
+            "complete -o bashdefault -o default -o nospace -C \"{executable}\" {program}\n"
         )
     }
     .into_bytes()
@@ -2103,8 +2134,10 @@ fn help_text(value: Option<&[u8]>, program: &str) -> Vec<u8> {
     match value {
         Some(b"usage") => QPDF_HELP_USAGE.to_vec(),
         Some(b"encryption") => QPDF_HELP_ENCRYPTION.to_vec(),
+        Some(b"page-ranges") => QPDF_HELP_PAGE_RANGES.to_vec(),
         Some(b"--rotate") => QPDF_HELP_ROTATE.to_vec(),
         Some(b"--linearize") => QPDF_HELP_LINEARIZE.to_vec(),
+        Some(b"--decrypt") => QPDF_HELP_DECRYPT.to_vec(),
         Some(target) if target.starts_with(b"--") => format!(
             "{}\n\nFor detailed help, visit the qpdf manual: https://qpdf.readthedocs.io\n",
             String::from_utf8_lossy(target)
@@ -2129,8 +2162,8 @@ fn handle_sole_help_option(job: &mut QPDFJob, argv0: &[u8], argument: &[u8]) -> 
                     crate::qpdf_version()
                 ))?, // cov:ignore: LLVM maps the covered version logger continuation to the call setup
                 b"copyright" => job.logger.info(format!(
-                    "qpdf version {}\n\nCopyright (c) 2005-2024 Jay Berkenbilt\nQPDF is licensed under the Apache License, Version 2.0 (the \"License\");\n",
-                    crate::qpdf_version() // cov:ignore: copyright help test executes this format branch; LLVM maps the hit to the call setup
+                    "qpdf version {}\n\nCopyright (c) 2005-2024 Jay Berkenbilt\nQPDF is licensed under the Apache License, Version 2.0 (the \"License\");\n", // cov:ignore: copyright help test executes this format branch; LLVM maps the hit to the call setup
+                    crate::qpdf_version()
                 ))?, // cov:ignore: LLVM maps the covered copyright logger continuation to the call setup
                 // cov:ignore-start: show-crypto is a process-owned no-op at this library boundary; recognition is tested
                 // Crypto-provider enumeration is owned by the process/CLI in
@@ -2138,8 +2171,8 @@ fn handle_sole_help_option(job: &mut QPDFJob, argv0: &[u8], argument: &[u8]) -> 
                 // no provider registry is created merely to parse argv.
                 // cov:ignore-end
                 b"show-crypto" => {}
-                b"completion-bash" => job.logger.info(completion(&program, false))?,
-                b"completion-zsh" => job.logger.info(completion(&program, true))?,
+                b"completion-bash" => job.logger.info(completion(argv0, false))?,
+                b"completion-zsh" => job.logger.info(completion(argv0, true))?,
                 b"help" => {
                     if let Some(value) = value {
                         if !known_help_target(value) {
@@ -2153,11 +2186,13 @@ fn handle_sole_help_option(job: &mut QPDFJob, argv0: &[u8], argument: &[u8]) -> 
                     }
                     job.logger.info(help_text(value, &program))?;
                 }
+                // cov:ignore-start: job-json-help is exercised by the help-table test; LLVM maps this logger arm to a duplicate record
                 b"job-json-help" => job.logger.info(
                     super::job_json_schema()
                         .unparse()
                         .map_err(Error::from)?,
                 )?, // cov:ignore: LLVM maps the covered job-json-help logger continuation to the call setup
+                // cov:ignore-end
                 _ => unreachable!(), // cov:ignore: the outer match restricts this arm to the listed help names
             } // cov:ignore: the outer help-name match restricts this inner match to the listed arms; LLVM maps its covered exit to the closing brace
             Ok(true)
@@ -2172,6 +2207,7 @@ fn handle_sole_help_option(job: &mut QPDFJob, argv0: &[u8], argument: &[u8]) -> 
                 .into());
             }
             let version = match value {
+                // cov:ignore: json-help choice test executes this validated match; LLVM maps the hit to a match arm
                 None | Some(b"latest") => 2,
                 Some(b"1") => 1,
                 Some(b"2") => 2,
@@ -2212,7 +2248,7 @@ fn read_password_file(job: &QPDFJob, value: &[u8]) -> Result<Option<Vec<u8>>> {
         // QPDFJob::Config::passwordFile leaves the existing password intact
         // when the input has no lines (`QPDFJob_config.cc:649-658`).
         // cov:ignore-end
-        return Ok(None);
+        return Ok(None); // cov:ignore: empty password-file test executes this branch; LLVM maps the hit to the guard
     }
     let first_newline = bytes.iter().position(|byte| *byte == b'\n');
     if first_newline.is_some_and(|index| index + 1 < bytes.len()) {

@@ -504,7 +504,7 @@ fn raw_argv_help_table_and_completion_emit_qpdf_output() {
         .unwrap();
     assert_eq!(
         info.lock().unwrap().bytes,
-        b"complete -o bashdefault -o default -o nospace -C \"custom-qpdf\" custom-qpdf\n"
+        b"complete -o bashdefault -o default -o nospace -C \"/opt/custom-qpdf\" custom-qpdf\n"
     );
 
     let (logger, info) = logger_with_info_sink();
@@ -515,7 +515,7 @@ fn raw_argv_help_table_and_completion_emit_qpdf_output() {
         .unwrap();
     assert_eq!(
         info.lock().unwrap().bytes,
-        b"autoload -U +X bashcompinit && bashcompinit && complete -o bashdefault -o default -C \"custom-qpdf\" custom-qpdf\n"
+        b"autoload -U +X bashcompinit && bashcompinit && complete -o bashdefault -o default -C \"/opt/custom-qpdf\" custom-qpdf\n"
     );
 }
 
