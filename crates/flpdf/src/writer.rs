@@ -53,8 +53,6 @@ use crate::linearization::writer::write_linearized_for_pdf_writer;
 use crate::pdf_version::{parse_qpdf_writer_version, PdfVersion, QpdfVersionParts};
 use crate::pipeline::{flate::Flate, Pipeline, PipelineError, PipelineResult};
 use crate::{Error, ObjectHandle, ObjectRef, Pdf, Result, XrefEntry};
-#[cfg(test)]
-use std::cell::Cell;
 use std::cell::RefCell;
 use std::collections::{BTreeMap, BTreeSet, HashMap};
 use std::fmt;
@@ -3729,8 +3727,8 @@ mod final_handle_writer_tests {
     }
 
     struct FinishFailingPipeline {
-        writes: Rc<Cell<usize>>,
-        finishes: Rc<Cell<usize>>,
+        writes: Rc<std::cell::Cell<usize>>,
+        finishes: Rc<std::cell::Cell<usize>>,
     }
 
     impl Pipeline for FinishFailingPipeline {
@@ -3753,8 +3751,8 @@ mod final_handle_writer_tests {
 
     #[test]
     fn writer_pipeline_surfaces_a_segment_finish_failure_after_writing() {
-        let writes = Rc::new(Cell::new(0));
-        let finishes = Rc::new(Cell::new(0));
+        let writes = Rc::new(std::cell::Cell::new(0));
+        let finishes = Rc::new(std::cell::Cell::new(0));
         let mut pipeline = FinishFailingPipeline {
             writes: Rc::clone(&writes),
             finishes: Rc::clone(&finishes),
