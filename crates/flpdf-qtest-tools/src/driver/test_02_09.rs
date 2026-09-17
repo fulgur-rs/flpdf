@@ -621,9 +621,7 @@ pub(crate) fn run_test_9<R: Read + Seek>(
     _stderr: &mut dyn Write,
     _diagnostics_written: &mut usize,
 ) -> flpdf::Result<()> {
-    let trailer = pdf.trailer();
-    let root = trailer.try_get_key(b"/Root")?;
-    resolve_handle(pdf, &root)?;
+    let root = pdf.root_handle()?;
 
     let qstream = pdf.new_stream_with_data(Rc::new(b"data for new stream\n".to_vec()))?;
     let rstream = pdf.new_stream()?;

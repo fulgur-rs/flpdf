@@ -1533,12 +1533,16 @@ fn qtest_accessor_cases_do_not_use_explicit_pdf_resolve() {
             && test_8.contains("type_code()"),
         "tests 7 and 8 must use the canonical resolving stream predicate without a caller-side bridge"
     );
-    let test_9_start = early_source
-        .find("pub(crate) fn run_test_9")
-        .expect("test 9 source section");
+    let test_9 = section(
+        early_source.as_str(),
+        "pub(crate) fn run_test_9",
+        "#[cfg(test)]",
+    );
     assert!(
-        early_source[test_9_start..].contains("resolve_handle("),
-        "test 9 must retain its separate explicit root resolution"
+        test_9.contains("pdf.root_handle()?")
+            && !test_9.contains("resolve_handle(")
+            && !test_9.contains("try_get_key(b\"/Root\")"),
+        "test 9 must use the canonical resolving root boundary without a caller-side bridge"
     );
     let test_3 = section(
         early_source.as_str(),
@@ -1739,8 +1743,8 @@ fn qtest_accessor_cases_do_not_use_explicit_pdf_resolve() {
         "test 87 must enumerate keys through the canonical resolving accessor"
     );
     assert!(
-        early_source[test_9_start..].contains("resolve_handle("),
-        "test 9 lost the explicit resolution retained for the out-of-scope path"
+        early_source.contains("fn resolve_handle"),
+        "the shared helper remains until the separate caller-zero cleanup step"
     );
 
     let test_71 = section(
