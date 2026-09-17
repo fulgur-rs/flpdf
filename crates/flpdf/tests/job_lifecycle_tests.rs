@@ -312,6 +312,42 @@ fn raw_argv_encryption_config_survives_repeated_groups_and_decrypt() {
         .windows(b"/P -2056".len())
         .any(|window| window == b"/P -2056"));
 
+    let json_config = tempdir.path().join("aes-config.json");
+    let json_output = tempdir.path().join("aes-config-output.pdf");
+    std::fs::write(
+        &json_config,
+        serde_json::json!({
+            "inputFile": fixture,
+            "outputFile": json_output,
+            "encrypt": {
+                "userPassword": "json-user",
+                "ownerPassword": "json-owner",
+                "128bit": {"useAes": "y"}
+            }
+        })
+        .to_string(),
+    )
+    .unwrap();
+    let mut json_then_argv = QPDFJob::new();
+    json_then_argv
+        .initialize_from_raw_argv(&[
+            b"qpdfjob".to_vec(),
+            format!("--job-json-file={}", json_config.display()).into_bytes(),
+            b"--allow-weak-crypto".to_vec(),
+            b"--encrypt".to_vec(),
+            b"argv-user".to_vec(),
+            b"argv-owner".to_vec(),
+            b"128".to_vec(),
+            b"--use-aes=n".to_vec(),
+            b"--".to_vec(),
+        ])
+        .unwrap();
+    assert_eq!(json_then_argv.run().unwrap(), JobExitCode::Success);
+    let json_bytes = std::fs::read(json_output).unwrap();
+    assert!(json_bytes
+        .windows(b"/V 2".len())
+        .any(|window| window == b"/V 2"));
+
     let mut insecure = QPDFJob::new();
     let error = insecure
         .initialize_from_raw_argv(&[
@@ -382,6 +418,29 @@ fn raw_argv_named_pages_range_does_not_change_positional_state() {
     .unwrap();
     assert_eq!(job.run().unwrap(), JobExitCode::Success);
     assert_eq!(info.lock().unwrap().bytes, b"2\n");
+
+    let third_source = tempfile::tempdir().unwrap();
+    let third_file = third_source.path().join("1");
+    std::fs::copy(&fixture, &third_file).unwrap();
+    let (logger, info) = logger_with_info_sink();
+    let mut repeated_named_range = QPDFJob::new();
+    repeated_named_range.set_logger(logger);
+    repeated_named_range
+        .initialize_from_raw_argv(&[
+            b"qpdfjob".to_vec(),
+            b"--empty".to_vec(),
+            b"--pages".to_vec(),
+            fixture.to_string_lossy().into_owned().into_bytes(),
+            b"1".to_vec(),
+            format!("--file={}", fixture.display()).into_bytes(),
+            b"--range=1".to_vec(),
+            third_file.to_string_lossy().into_owned().into_bytes(),
+            b"--".to_vec(),
+            b"--show-npages".to_vec(),
+        ])
+        .unwrap();
+    assert_eq!(repeated_named_range.run().unwrap(), JobExitCode::Success);
+    assert_eq!(info.lock().unwrap().bytes, b"3\n");
 }
 
 #[test]
@@ -395,12 +454,29 @@ fn raw_argv_help_table_and_completion_emit_qpdf_output() {
     assert!(String::from_utf8_lossy(&info.lock().unwrap().bytes).contains("Usage:"));
 
     let (logger, info) = logger_with_info_sink();
+    let mut encryption = QPDFJob::new();
+    encryption.set_logger(logger);
+    encryption
+        .initialize_from_raw_argv(&[b"qpdfjob".to_vec(), b"--help=encryption".to_vec()])
+        .unwrap();
+    assert!(String::from_utf8_lossy(&info.lock().unwrap().bytes)
+        .contains("Create encrypted files. Usage:"));
+
+    let (logger, info) = logger_with_info_sink();
     let mut rotate = QPDFJob::new();
     rotate.set_logger(logger);
     rotate
         .initialize_from_raw_argv(&[b"qpdfjob".to_vec(), b"--help=--rotate".to_vec()])
         .unwrap();
     assert!(!info.lock().unwrap().bytes.is_empty());
+
+    let (logger, info) = logger_with_info_sink();
+    let mut linearize = QPDFJob::new();
+    linearize.set_logger(logger);
+    linearize
+        .initialize_from_raw_argv(&[b"qpdfjob".to_vec(), b"--help=--linearize".to_vec()])
+        .unwrap();
+    assert!(String::from_utf8_lossy(&info.lock().unwrap().bytes).contains("Create linearized"));
 
     let (logger, info) = logger_with_info_sink();
     let mut completion = QPDFJob::new();
@@ -410,7 +486,18 @@ fn raw_argv_help_table_and_completion_emit_qpdf_output() {
         .unwrap();
     assert_eq!(
         info.lock().unwrap().bytes,
-        b"complete -o bashdefault -o default -o nospace -C \"qpdf\" qpdf\n"
+        b"complete -o bashdefault -o default -o nospace -C \"qpdfjob\" qpdfjob\n"
+    );
+
+    let (logger, info) = logger_with_info_sink();
+    let mut custom_completion = QPDFJob::new();
+    custom_completion.set_logger(logger);
+    custom_completion
+        .initialize_from_raw_argv(&[b"/opt/custom-qpdf".to_vec(), b"--completion-bash".to_vec()])
+        .unwrap();
+    assert_eq!(
+        info.lock().unwrap().bytes,
+        b"complete -o bashdefault -o default -o nospace -C \"custom-qpdf\" custom-qpdf\n"
     );
 }
 

@@ -197,37 +197,6 @@ struct EncryptionDefaults {
     accessibility_disabled: bool,
 }
 
-impl EncryptionDefaults {
-    fn from_params(params: &EncryptParams, allow_insecure: bool) -> Self {
-        let (_key_len, use_aes, force_v4, force_r5) = match params.method {
-            EncryptMethod::V1Rc440 => (40, false, false, false),
-            EncryptMethod::V2Rc4128 => (128, false, false, false),
-            EncryptMethod::V4Rc4128 => (128, false, true, false),
-            EncryptMethod::V4Aes128 => (128, true, true, false),
-            EncryptMethod::V5R5Aes256 => (256, true, false, true),
-            EncryptMethod::V5R6Aes256 => (256, true, false, false),
-        };
-        Self {
-            user_password: params.user_password.clone(),
-            owner_password: params.owner_password.clone(),
-            use_aes,
-            force_v4,
-            force_r5,
-            allow_insecure,
-            cleartext_metadata: !params.encrypt_metadata,
-            permissions: params.permissions,
-            r2_permissions: params.r2_permissions,
-            accessibility_disabled: matches!(
-                params.method,
-                EncryptMethod::V4Rc4128
-                    | EncryptMethod::V4Aes128
-                    | EncryptMethod::V5R5Aes256
-                    | EncryptMethod::V5R6Aes256
-            ) && !params.permissions.accessibility,
-        }
-    }
-}
-
 /// Portable writer/input state populated by the qpdf job argv/JSON boundary.
 ///
 /// This owns the settings needed for qpdf job initialization and the later
@@ -835,7 +804,7 @@ fn job_json_print_permission(
 fn parse_job_encrypt(
     value: &crate::json::Json,
     allow_weak_crypto: bool,
-) -> Result<(EncryptParams, bool, bool)> {
+) -> Result<(EncryptParams, EncryptionDefaults)> {
     let members = job_json_members(value);
     let user_password = job_json_string(&members, b"userPassword")?;
     let owner_password = job_json_string(&members, b"ownerPassword")?;
@@ -908,20 +877,36 @@ fn parse_job_encrypt(
         job_json_print_permission(&value, &mut permissions)?;
     }
 
+    let defaults_user_password = user_password.clone();
+    let defaults_owner_password = owner_password.clone();
+    let use_aes = match key_length {
+        // Config::encrypt(256, ...) unconditionally sets use_aes before the
+        // JSON encryption handler applies its key-length-specific options
+        // (`QPDFJob_config.cc:1088-1096`).
+        "256bit" => true,
+        "128bit" => {
+            job_json_choice(&settings, b"useAes", &["y", "n"], true)?.as_deref() == Some("y")
+        }
+        "40bit" => false,
+        _ => unreachable!("key length was validated above"), // cov:ignore: key length comes only from the validated qpdf job schema choices
+    };
+    let force_v4 = key_length == "128bit" && job_json_bare(&settings, b"forceV4")?;
+    let force_r5 = key_length == "256bit" && job_json_bare(&settings, b"forceR5")?;
+    let cleartext_metadata = job_json_bare(&settings, b"cleartextMetadata")?;
+
     let mut params = match key_length {
         "40bit" => EncryptParams::rc4(EncryptMethod::V1Rc440, user_password, owner_password),
         "128bit" => {
-            let use_aes = job_json_choice(&settings, b"useAes", &["y", "n"], true)?;
-            if use_aes.as_deref() == Some("y") {
+            if use_aes {
                 EncryptParams::v4_aes128(user_password, owner_password)
-            } else if job_json_bare(&settings, b"forceV4")? {
+            } else if force_v4 {
                 EncryptParams::rc4(EncryptMethod::V4Rc4128, user_password, owner_password)
             } else {
                 EncryptParams::rc4(EncryptMethod::V2Rc4128, user_password, owner_password)
             }
         }
         "256bit" => {
-            if job_json_bare(&settings, b"forceR5")? {
+            if force_r5 {
                 EncryptParams::v5_r5(user_password, owner_password)
             } else {
                 EncryptParams::v5_r6(user_password, owner_password)
@@ -939,15 +924,25 @@ fn parse_job_encrypt(
     ) {
         params.permissions.accessibility = true;
     }
-    if job_json_bare(&settings, b"cleartextMetadata")? {
-        params.encrypt_metadata = false;
-    }
+    params.encrypt_metadata = !cleartext_metadata;
     if (params.is_weak_rc4() || params.is_deprecated_r5()) && !allow_weak_crypto {
         return Err(Error::Usage(UsageError::new(
             "refusing to write a file with weak or deprecated encryption without allowWeakCrypto",
         )));
     }
-    Ok((params, allow_insecure, accessibility_disabled))
+    let defaults = EncryptionDefaults {
+        user_password: defaults_user_password,
+        owner_password: defaults_owner_password,
+        use_aes,
+        force_v4,
+        force_r5,
+        allow_insecure,
+        cleartext_metadata,
+        permissions,
+        r2_permissions: params.r2_permissions,
+        accessibility_disabled,
+    };
+    Ok((params, defaults))
 }
 
 fn parse_json_decode_level(value: &str) -> crate::writer::DecodeLevel {
@@ -2678,10 +2673,8 @@ impl QPDFJob {
             // handler visits `copyEncryption` before `encrypt`, so preserve
             // that precedence in the configuration snapshot.
             configuration.copy_encryption_applies_to_writer = false;
-            let (params, allow_insecure, accessibility_disabled) =
+            let (params, encryption_defaults) =
                 parse_job_encrypt(value, configuration.allow_weak_crypto)?; // cov:ignore: llvm-cov attributes this successful encryption parse continuation to its opening expressions
-            let mut encryption_defaults = EncryptionDefaults::from_params(&params, allow_insecure);
-            encryption_defaults.accessibility_disabled = accessibility_disabled;
             configuration.encryption_defaults = encryption_defaults;
             configuration.writer.set_encryption_parameters(params);
         }
@@ -6480,7 +6473,8 @@ mod tests {
         let encrypt_256_r6 =
             crate::json::Json::parse(br#"{"userPassword":"u","ownerPassword":"o","256bit":{}}"#)
                 .unwrap();
-        assert!(parse_job_encrypt(&encrypt_256_r6, true).is_ok());
+        let (_, encrypt_256_defaults) = parse_job_encrypt(&encrypt_256_r6, true).unwrap();
+        assert!(encrypt_256_defaults.use_aes);
         let insecure_256 =
             crate::json::Json::parse(br#"{"userPassword":"u","ownerPassword":"","256bit":{}}"#)
                 .unwrap();
@@ -6501,24 +6495,6 @@ mod tests {
             crate::json::Json::parse(br#"{"userPassword":"u","ownerPassword":"o"}"#).unwrap();
         assert!(parse_job_encrypt(&no_key_length, true).is_err());
         assert!(parse_job_encrypt(&encrypt_40, false).is_err());
-    }
-
-    #[test]
-    fn encryption_defaults_retain_each_qpdf_method_boundary() {
-        let params = [
-            crate::EncryptParams::rc4(EncryptMethod::V1Rc440, b"u", b"o"),
-            crate::EncryptParams::rc4(EncryptMethod::V2Rc4128, b"u", b"o"),
-            crate::EncryptParams::rc4(EncryptMethod::V4Rc4128, b"u", b"o"),
-            crate::EncryptParams::v4_aes128(b"u", b"o"),
-            crate::EncryptParams::v5_r5(b"u", b"o"),
-            crate::EncryptParams::v5_r6(b"u", b"o"),
-        ];
-        for params in params {
-            let defaults = EncryptionDefaults::from_params(&params, true);
-            assert_eq!(defaults.user_password, b"u");
-            assert_eq!(defaults.owner_password, b"o");
-            assert!(defaults.allow_insecure);
-        }
     }
 
     #[test]

@@ -26,7 +26,7 @@ pub(super) fn initialize(job: &mut QPDFJob, argv: Vec<Vec<u8>>) -> Result<()> {
     job.partial_json_initialized = false;
     job.argv_early_exit = false;
 
-    if expanded.len() == 2 && handle_sole_help_option(job, &expanded[1])? {
+    if expanded.len() == 2 && handle_sole_help_option(job, &expanded[0], &expanded[1])? {
         return Ok(());
     }
 
@@ -1155,7 +1155,9 @@ impl PagesState {
         }
         PageRange::parse_numrange(range).map_err(|error| UsageError::new(error.to_string()))?;
         current.range = range.to_owned();
-        self.called_range = positional;
+        if positional {
+            self.called_range = true;
+        }
         Ok(())
     }
 
@@ -1803,33 +1805,6 @@ fn parse_encryption_yn(value: &[u8]) -> Result<bool> {
 /// concern, but the library must accept the same table entries, report the
 /// general help text, and terminate before it asks for an input file
 /// (`QPDFArgParser.cc:30-34,219-228,766-780`).
-const QPDF_HELP_TOP: &[u8] = br#"Run "qpdf --help=topic" for help on a topic.
-Run "qpdf --help=--option" for help on an option.
-Run "qpdf --help=all" to see all available help.
-
-Topics:
-  add-attachment: attach (embed) files
-  advanced-control: tweak qpdf's behavior
-  attachments: work with embedded files
-  completion: shell completion
-  copy-attachments: copy attachments from another file
-  encryption: create encrypted files
-  exit-status: meanings of qpdf's exit codes
-  general: general options
-  help: information about qpdf
-  inspection: inspect PDF files
-  json: JSON output for PDF information
-  modification: change parts of the PDF
-  overlay-underlay: overlay/underlay pages from other files
-  page-ranges: page range syntax
-  page-selection: select pages from one or more files
-  pdf-dates: PDF date format
-  testing: options for testing or debugging
-  transformation: make structural PDF changes
-  usage: basic invocation
-
-For detailed help, visit the qpdf manual: https://qpdf.readthedocs.io
-"#;
 
 const QPDF_HELP_USAGE: &[u8] =
     br#"Read a PDF file, apply transformations or modifications, and write
@@ -1857,6 +1832,70 @@ Related options:
 For detailed help, visit the qpdf manual: https://qpdf.readthedocs.io
 "#;
 
+const QPDF_HELP_ENCRYPTION: &[u8] = br#"Create encrypted files. Usage:
+
+--encrypt \
+  [--user-password=user-password] \
+  [--owner-password=owner-password] \
+  --bits=key-length [options] --
+
+OR
+
+--encrypt user-password owner-password key-length [options] --
+
+The first form, with flags for the passwords and bit length, was
+introduced in qpdf 11.7.0. Only the --bits option is is mandatory.
+This form allows you to use any text as the password. If passwords are
+specified, they must be given before the --bits option.
+
+The second form has been in qpdf since the beginning and wil
+continue to be supported. Either or both of user-password and
+owner-password may be empty strings.
+
+The key-length parameter must be either 40, 128, or 256. The user
+and/or owner password may be omitted. Omitting either password
+enables the PDF file to be opened without a password. Specifying
+the same value for the user and owner password and specifying an
+empty owner password are both considered insecure.
+
+Encryption options are terminated by "--" by itself.
+
+40-bit encryption is insecure, as is 128-bit encryption without
+AES. Use 256-bit encryption unless you have a specific reason to
+use an insecure format, such as testing or compatibility with very
+old viewers. You must use the --allow-weak-crypto to create
+encrypted files that use insecure cryptographic algorithms. The
+--allow-weak-crypto flag appears outside of --encrypt ... --
+(before --encrypt or after --).
+
+Options for 40-bit only:
+  --annotate=[y|n]         restrict comments, filling forms, and signing
+  --extract=[y|n]          restrict text/graphic extraction
+  --modify=[y|n]           restrict document modification
+  --print=[y|n]            restrict printing
+
+Options for 128-bit or 256-bit:
+  --accessibility=[y|n]    restrict accessibility (usually ignored)
+  --annotate=[y|n]         restrict commenting/filling form fields
+  --assemble=[y|n]         restrict document assembly
+  --extract=[y|n]          restrict text/graphic extraction
+  --form=[y|n]             restrict filling form fields
+  --modify-other=[y|n]     restrict other modifications
+  --modify=modify-opt      control modify access by level
+  --print=print-opt        control printing access
+  --cleartext-metadata     prevent encryption of metadata
+
+For 128-bit only:
+  --use-aes=[y|n]          indicates whether to use AES encryption
+  --force-V4               forces use of V=4 encryption handler
+
+For 256-bit only:
+  --force-R5               forces use of deprecated R=5 encryption
+  --allow-insecure         allow user password with empty owner password
+
+For detailed help, visit the qpdf manual: https://qpdf.readthedocs.io
+"#;
+
 const QPDF_HELP_ROTATE: &[u8] = br#"--rotate=[+|-]angle[:page-range]
 
 Rotate specified pages by multiples of 90 degrees specifying
@@ -1868,49 +1907,220 @@ qpdf --help=page-ranges for help with page ranges.
 For detailed help, visit the qpdf manual: https://qpdf.readthedocs.io
 "#;
 
-const QPDF_COMPLETION_BASH: &[u8] =
-    b"complete -o bashdefault -o default -o nospace -C \"qpdf\" qpdf\n";
-const QPDF_COMPLETION_ZSH: &[u8] =
-    b"autoload -U +X bashcompinit && bashcompinit && complete -o bashdefault -o default -C \"qpdf\" qpdf\n";
+const QPDF_HELP_LINEARIZE: &[u8] = br#"Create linearized (web-optimized) output files.
+
+For detailed help, visit the qpdf manual: https://qpdf.readthedocs.io
+"#;
+
+const QPDF_HELP_TOPICS: &[&[u8]] = &[
+    b"add-attachment",
+    b"advanced-control",
+    b"attachments",
+    b"completion",
+    b"copy-attachments",
+    b"encryption",
+    b"exit-status",
+    b"general",
+    b"help",
+    b"inspection",
+    b"json",
+    b"modification",
+    b"overlay-underlay",
+    b"page-ranges",
+    b"page-selection",
+    b"pdf-dates",
+    b"testing",
+    b"transformation",
+    b"usage",
+];
+
+const QPDF_HELP_OPTIONS: &[&[u8]] = &[
+    b"--accessibility",
+    b"--add-attachment",
+    b"--allow-insecure",
+    b"--allow-weak-crypto",
+    b"--annotate",
+    b"--assemble",
+    b"--bits",
+    b"--check",
+    b"--check-linearization",
+    b"--cleartext-metadata",
+    b"--coalesce-contents",
+    b"--collate",
+    b"--completion-bash",
+    b"--completion-zsh",
+    b"--compress-streams",
+    b"--compression-level",
+    b"--copy-attachments-from",
+    b"--copy-encryption",
+    b"--copyright",
+    b"--creationdate",
+    b"--decode-level",
+    b"--decrypt",
+    b"--description",
+    b"--deterministic-id",
+    b"--empty",
+    b"--encrypt",
+    b"--encryption-file-password",
+    b"--externalize-inline-images",
+    b"--extract",
+    b"--file",
+    b"--filename",
+    b"--filtered-stream-data",
+    b"--flatten-annotations",
+    b"--flatten-rotation",
+    b"--force-R5",
+    b"--force-V4",
+    b"--force-version",
+    b"--form",
+    b"--from",
+    b"--generate-appearances",
+    b"--help",
+    b"--ignore-xref-streams",
+    b"--ii-min-bytes",
+    b"--is-encrypted",
+    b"--job-json-file",
+    b"--job-json-help",
+    b"--json",
+    b"--json-help",
+    b"--json-input",
+    b"--json-key",
+    b"--json-object",
+    b"--json-output",
+    b"--json-stream-data",
+    b"--json-stream-prefix",
+    b"--keep-files-open",
+    b"--keep-files-open-threshold",
+    b"--keep-inline-images",
+    b"--key",
+    b"--linearize",
+    b"--linearize-pass1",
+    b"--list-attachments",
+    b"--mimetype",
+    b"--min-version",
+    b"--moddate",
+    b"--modify",
+    b"--modify-other",
+    b"--newline-before-endstream",
+    b"--no-original-object-ids",
+    b"--no-warn",
+    b"--normalize-content",
+    b"--object-streams",
+    b"--oi-min-area",
+    b"--oi-min-height",
+    b"--oi-min-width",
+    b"--optimize-images",
+    b"--overlay",
+    b"--owner-password",
+    b"--pages",
+    b"--password",
+    b"--password-file",
+    b"--password-is-hex-key",
+    b"--password-mode",
+    b"--prefix",
+    b"--preserve-unreferenced",
+    b"--preserve-unreferenced-resources",
+    b"--print",
+    b"--progress",
+    b"--qdf",
+    b"--range",
+    b"--raw-stream-data",
+    b"--recompress-flate",
+    b"--remove-attachment",
+    b"--remove-page-labels",
+    b"--remove-restrictions",
+    b"--remove-unreferenced-resources",
+    b"--repeat",
+    b"--replace",
+    b"--replace-input",
+    b"--report-memory-usage",
+    b"--requires-password",
+    b"--rotate",
+    b"--set-page-labels",
+    b"--show-attachment",
+    b"--show-crypto",
+    b"--show-encryption",
+    b"--show-encryption-key",
+    b"--show-linearization",
+    b"--show-npages",
+    b"--show-object",
+    b"--show-pages",
+    b"--show-xref",
+    b"--split-pages",
+    b"--static-aes-iv",
+    b"--static-id",
+    b"--stream-data",
+    b"--suppress-password-recovery",
+    b"--suppress-recovery",
+    b"--test-json-schema",
+    b"--to",
+    b"--underlay",
+    b"--update-from-json",
+    b"--use-aes",
+    b"--user-password",
+    b"--verbose",
+    b"--version",
+    b"--warning-exit-0",
+    b"--with-images",
+];
 
 fn known_help_target(value: &[u8]) -> bool {
-    matches!(
-        value,
-        b"all"
-            | b"add-attachment"
-            | b"advanced-control"
-            | b"attachments"
-            | b"completion"
-            | b"copy-attachments"
-            | b"encryption"
-            | b"exit-status"
-            | b"general"
-            | b"help"
-            | b"inspection"
-            | b"json"
-            | b"modification"
-            | b"overlay-underlay"
-            | b"page-ranges"
-            | b"page-selection"
-            | b"pdf-dates"
-            | b"testing"
-            | b"transformation"
-            | b"usage"
-            | b"--empty"
-            | b"--help"
-            | b"--json"
-            | b"--json-output"
-            | b"--rotate"
-            | b"--pages"
-            | b"--encrypt"
-            | b"--add-attachment"
-    )
+    value == b"all"
+        || QPDF_HELP_TOPICS.iter().any(|topic| *topic == value)
+        || QPDF_HELP_OPTIONS.iter().any(|option| *option == value)
 }
 
-fn handle_sole_help_option(job: &mut QPDFJob, argument: &[u8]) -> Result<bool> {
+fn program_name(argv0: &[u8]) -> String {
+    String::from_utf8_lossy(
+        argv0
+            .rsplit(|byte| *byte == b'/' || *byte == b'\\')
+            .next()
+            .filter(|name| !name.is_empty())
+            .unwrap_or(b"qpdf"),
+    )
+    .into_owned()
+}
+
+fn help_top(program: &str) -> Vec<u8> {
+    format!(
+        "Run \"{program} --help=topic\" for help on a topic.\nRun \"{program} --help=--option\" for help on an option.\nRun \"{program} --help=all\" to see all available help.\n\nTopics:\n  add-attachment: attach (embed) files\n  advanced-control: tweak qpdf's behavior\n  attachments: work with embedded files\n  completion: shell completion\n  copy-attachments: copy attachments from another file\n  encryption: create encrypted files\n  exit-status: meanings of qpdf's exit codes\n  general: general options\n  help: information about qpdf\n  inspection: inspect PDF files\n  json: JSON output for PDF information\n  modification: change parts of the PDF\n  overlay-underlay: overlay/underlay pages from other files\n  page-ranges: page range syntax\n  page-selection: select pages from one or more files\n  pdf-dates: PDF date format\n  testing: options for testing or debugging\n  transformation: make structural PDF changes\n  usage: basic invocation\n\nFor detailed help, visit the qpdf manual: https://qpdf.readthedocs.io\n"
+    )
+    .into_bytes()
+}
+
+fn completion(program: &str, zsh: bool) -> Vec<u8> {
+    if zsh {
+        format!(
+            "autoload -U +X bashcompinit && bashcompinit && complete -o bashdefault -o default -C \"{program}\" {program}\n"
+        )
+    } else {
+        format!(
+            "complete -o bashdefault -o default -o nospace -C \"{program}\" {program}\n"
+        )
+    }
+    .into_bytes()
+}
+
+fn help_text(value: Option<&[u8]>, program: &str) -> Vec<u8> {
+    match value {
+        Some(b"usage") => QPDF_HELP_USAGE.to_vec(),
+        Some(b"encryption") => QPDF_HELP_ENCRYPTION.to_vec(),
+        Some(b"--rotate") => QPDF_HELP_ROTATE.to_vec(),
+        Some(b"--linearize") => QPDF_HELP_LINEARIZE.to_vec(),
+        Some(target) if target.starts_with(b"--") => format!(
+            "{}\n\nFor detailed help, visit the qpdf manual: https://qpdf.readthedocs.io\n",
+            String::from_utf8_lossy(target)
+        )
+        .into_bytes(),
+        _ => help_top(program),
+    }
+}
+
+fn handle_sole_help_option(job: &mut QPDFJob, argv0: &[u8], argument: &[u8]) -> Result<bool> {
     let Some((name, value)) = option_parts(argument) else {
         return Ok(false);
     };
+    let program = program_name(argv0);
     match name {
         b"version" | b"copyright" | b"show-crypto" | b"job-json-help" | b"completion-bash"
         | b"completion-zsh" | b"help" => {
@@ -1928,8 +2138,8 @@ fn handle_sole_help_option(job: &mut QPDFJob, argument: &[u8]) -> Result<bool> {
                 // qpdf. Recognition and early exit are the library contract;
                 // no provider registry is created merely to parse argv.
                 b"show-crypto" => {}
-                b"completion-bash" => job.logger.info(QPDF_COMPLETION_BASH)?,
-                b"completion-zsh" => job.logger.info(QPDF_COMPLETION_ZSH)?,
+                b"completion-bash" => job.logger.info(completion(&program, false))?,
+                b"completion-zsh" => job.logger.info(completion(&program, true))?,
                 b"help" => {
                     if let Some(value) = value {
                         if !known_help_target(value) {
@@ -1941,12 +2151,7 @@ fn handle_sole_help_option(job: &mut QPDFJob, argument: &[u8]) -> Result<bool> {
                             return Err(UsageError::new(message).into());
                         }
                     }
-                    let help = match value {
-                        Some(b"usage") => QPDF_HELP_USAGE,
-                        Some(b"--rotate") => QPDF_HELP_ROTATE,
-                        _ => QPDF_HELP_TOP,
-                    };
-                    job.logger.info(help)?;
+                    job.logger.info(help_text(value, &program))?;
                 }
                 b"job-json-help" => job.logger.info(
                     super::job_json_schema()
