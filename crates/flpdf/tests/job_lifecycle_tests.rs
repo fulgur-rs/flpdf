@@ -244,6 +244,148 @@ fn raw_argv_modern_accessibility_n_emits_qpdf_diagnostic() {
         .contains("-accessibility=n is ignored for modern encryption formats"));
 }
 
+#[test]
+fn raw_argv_encryption_config_survives_repeated_groups_and_decrypt() {
+    let fixture =
+        Path::new(env!("CARGO_MANIFEST_DIR")).join("../../tests/fixtures/compat/one-page.pdf");
+    let tempdir = tempfile::tempdir().unwrap();
+
+    let aes_toggle_output = tempdir.path().join("aes-toggle.pdf");
+    let mut aes_toggle = QPDFJob::new();
+    aes_toggle
+        .initialize_from_raw_argv(&[
+            b"qpdfjob".to_vec(),
+            fixture.to_string_lossy().into_owned().into_bytes(),
+            b"--allow-weak-crypto".to_vec(),
+            b"--encrypt".to_vec(),
+            b"user".to_vec(),
+            b"owner".to_vec(),
+            b"128".to_vec(),
+            b"--use-aes=y".to_vec(),
+            b"--".to_vec(),
+            b"--encrypt".to_vec(),
+            b"user-2".to_vec(),
+            b"owner-2".to_vec(),
+            b"128".to_vec(),
+            b"--use-aes=n".to_vec(),
+            b"--".to_vec(),
+            aes_toggle_output
+                .to_string_lossy()
+                .into_owned()
+                .into_bytes(),
+        ])
+        .unwrap();
+    assert_eq!(aes_toggle.run().unwrap(), JobExitCode::Success);
+    let aes_toggle_bytes = std::fs::read(aes_toggle_output).unwrap();
+    assert!(aes_toggle_bytes
+        .windows(b"/V 2".len())
+        .any(|window| window == b"/V 2"));
+    assert!(aes_toggle_bytes
+        .windows(b"/R 3".len())
+        .any(|window| window == b"/R 3"));
+
+    let decrypt_output = tempdir.path().join("decrypt-encrypt.pdf");
+    let mut decrypt_encrypt = QPDFJob::new();
+    decrypt_encrypt
+        .initialize_from_raw_argv(&[
+            b"qpdfjob".to_vec(),
+            fixture.to_string_lossy().into_owned().into_bytes(),
+            b"--allow-weak-crypto".to_vec(),
+            b"--encrypt".to_vec(),
+            b"user".to_vec(),
+            b"owner".to_vec(),
+            b"128".to_vec(),
+            b"--print=none".to_vec(),
+            b"--".to_vec(),
+            b"--decrypt".to_vec(),
+            b"--encrypt".to_vec(),
+            b"user-2".to_vec(),
+            b"owner-2".to_vec(),
+            b"128".to_vec(),
+            b"--".to_vec(),
+            decrypt_output.to_string_lossy().into_owned().into_bytes(),
+        ])
+        .unwrap();
+    assert_eq!(decrypt_encrypt.run().unwrap(), JobExitCode::Success);
+    let decrypt_bytes = std::fs::read(decrypt_output).unwrap();
+    assert!(decrypt_bytes
+        .windows(b"/P -2056".len())
+        .any(|window| window == b"/P -2056"));
+}
+
+#[test]
+fn raw_argv_named_pages_range_does_not_change_positional_state() {
+    let fixture =
+        Path::new(env!("CARGO_MANIFEST_DIR")).join("../../tests/fixtures/compat/one-page.pdf");
+    let (logger, info) = logger_with_info_sink();
+    let mut job = QPDFJob::new();
+    job.set_logger(logger);
+    job.initialize_from_raw_argv(&[
+        b"qpdfjob".to_vec(),
+        b"--empty".to_vec(),
+        b"--pages".to_vec(),
+        fixture.to_string_lossy().into_owned().into_bytes(),
+        b"--range=1".to_vec(),
+        format!("--file={}", fixture.display()).into_bytes(),
+        b"1".to_vec(),
+        b"--".to_vec(),
+        b"--show-npages".to_vec(),
+    ])
+    .unwrap();
+    assert_eq!(job.run().unwrap(), JobExitCode::Success);
+    assert_eq!(info.lock().unwrap().bytes, b"2\n");
+}
+
+#[test]
+fn raw_argv_help_table_and_completion_emit_qpdf_output() {
+    let (logger, info) = logger_with_info_sink();
+    let mut usage = QPDFJob::new();
+    usage.set_logger(logger);
+    usage
+        .initialize_from_raw_argv(&[b"qpdfjob".to_vec(), b"--help=usage".to_vec()])
+        .unwrap();
+    assert!(String::from_utf8_lossy(&info.lock().unwrap().bytes).contains("Usage:"));
+
+    let (logger, info) = logger_with_info_sink();
+    let mut rotate = QPDFJob::new();
+    rotate.set_logger(logger);
+    rotate
+        .initialize_from_raw_argv(&[b"qpdfjob".to_vec(), b"--help=--rotate".to_vec()])
+        .unwrap();
+    assert!(!info.lock().unwrap().bytes.is_empty());
+
+    let (logger, info) = logger_with_info_sink();
+    let mut completion = QPDFJob::new();
+    completion.set_logger(logger);
+    completion
+        .initialize_from_raw_argv(&[b"qpdfjob".to_vec(), b"--completion-bash".to_vec()])
+        .unwrap();
+    assert_eq!(
+        info.lock().unwrap().bytes,
+        b"complete -o bashdefault -o default -o nospace -C \"qpdf\" qpdf\n"
+    );
+}
+
+#[test]
+fn json_encrypt_allow_insecure_reaches_final_configuration_check() {
+    let fixture =
+        Path::new(env!("CARGO_MANIFEST_DIR")).join("../../tests/fixtures/compat/one-page.pdf");
+    let tempdir = tempfile::tempdir().unwrap();
+    let output = tempdir.path().join("allowed.pdf");
+    let json = serde_json::json!({
+        "inputFile": fixture,
+        "outputFile": output,
+        "encrypt": {
+            "userPassword": "u",
+            "ownerPassword": "",
+            "256bit": {"allowInsecure": ""}
+        }
+    });
+    let mut job = QPDFJob::new();
+    job.initialize_from_json(&json.to_string()).unwrap();
+    assert_eq!(job.run().unwrap(), JobExitCode::Success);
+}
+
 #[cfg(target_os = "linux")]
 use std::ffi::OsString;
 #[cfg(target_os = "linux")]

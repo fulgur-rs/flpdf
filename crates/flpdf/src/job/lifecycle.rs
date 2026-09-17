@@ -17,7 +17,9 @@ use super::page_split::SplitPageOptions;
 use super::resource_pruning::RemoveUnreferencedResources;
 use super::rotate::flatten_rotation_on_pages;
 use super::rotate_spec::{parse_rotation_parameter, RotationSpec};
-use crate::encryption::{EncryptMethod, EncryptParams, PasswordMode};
+use crate::encryption::{
+    EncryptMethod, EncryptParams, PasswordMode, PermissionsConfig, R2PermissionsConfig,
+};
 use crate::json_inspect::{DecodeLevel as JsonDecodeLevel, JsonKey};
 use crate::linearization::{show_linearization_pdf_with_warnings, ShowLinearizationError};
 use crate::pipeline::{Pipeline, PipelineHandle, PipelineResult};
@@ -173,6 +175,59 @@ impl Write for JobOutputWriter {
     }
 }
 
+/// Persistent qpdf `Config` encryption state.
+///
+/// qpdf's `encrypt()` and `decrypt()` callbacks change the active operation,
+/// but `decrypt()` does not reset the password, permission, AES, revision, or
+/// metadata fields that a later `encrypt()` callback reuses
+/// (`QPDFJob_config.cc:147-157,1088-1101`). Keep those fields independently
+/// from the writer's currently active parameters so argv occurrence order
+/// remains observable across `--decrypt` and repeated `--encrypt` groups.
+#[derive(Debug, Clone, Default)]
+struct EncryptionDefaults {
+    user_password: Vec<u8>,
+    owner_password: Vec<u8>,
+    use_aes: bool,
+    force_v4: bool,
+    force_r5: bool,
+    allow_insecure: bool,
+    cleartext_metadata: bool,
+    permissions: PermissionsConfig,
+    r2_permissions: R2PermissionsConfig,
+    accessibility_disabled: bool,
+}
+
+impl EncryptionDefaults {
+    fn from_params(params: &EncryptParams, allow_insecure: bool) -> Self {
+        let (_key_len, use_aes, force_v4, force_r5) = match params.method {
+            EncryptMethod::V1Rc440 => (40, false, false, false),
+            EncryptMethod::V2Rc4128 => (128, false, false, false),
+            EncryptMethod::V4Rc4128 => (128, false, true, false),
+            EncryptMethod::V4Aes128 => (128, true, true, false),
+            EncryptMethod::V5R5Aes256 => (256, true, false, true),
+            EncryptMethod::V5R6Aes256 => (256, true, false, false),
+        };
+        Self {
+            user_password: params.user_password.clone(),
+            owner_password: params.owner_password.clone(),
+            use_aes,
+            force_v4,
+            force_r5,
+            allow_insecure,
+            cleartext_metadata: !params.encrypt_metadata,
+            permissions: params.permissions,
+            r2_permissions: params.r2_permissions,
+            accessibility_disabled: matches!(
+                params.method,
+                EncryptMethod::V4Rc4128
+                    | EncryptMethod::V4Aes128
+                    | EncryptMethod::V5R5Aes256
+                    | EncryptMethod::V5R6Aes256
+            ) && !params.permissions.accessibility,
+        }
+    }
+}
+
 /// Portable writer/input state populated by the qpdf job argv/JSON boundary.
 ///
 /// This owns the settings needed for qpdf job initialization and the later
@@ -245,16 +300,7 @@ struct JobConfiguration {
     linearize: bool,
     linearize_pass1: Option<PathBuf>,
     allow_weak_crypto: bool,
-    /// qpdf's final `checkConfiguration` guard for an empty owner password
-    /// with a non-empty user password and a 256-bit key
-    /// (`QPDFJob.cc:601-611`). It is retained separately from the writer
-    /// parameters so a later `--decrypt` can clear encryption before the
-    /// final check, as qpdf does.
-    allow_insecure_encryption: bool,
-    /// qpdf records an explicit `--accessibility=n` request and reports that
-    /// it is ignored for modern encryption at writer setup time
-    /// (`QPDFJob.cc:2746-2749`).
-    encryption_accessibility_disabled: bool,
+    encryption_defaults: EncryptionDefaults,
     page_specs: Vec<JobPageConfig>,
     page_specs_origin: PageSpecsOrigin,
     collate: Option<Vec<usize>>,
@@ -786,7 +832,10 @@ fn job_json_print_permission(
     Ok(())
 }
 
-fn parse_job_encrypt(value: &crate::json::Json, allow_weak_crypto: bool) -> Result<EncryptParams> {
+fn parse_job_encrypt(
+    value: &crate::json::Json,
+    allow_weak_crypto: bool,
+) -> Result<(EncryptParams, bool, bool)> {
     let members = job_json_members(value);
     let user_password = job_json_string(&members, b"userPassword")?;
     let owner_password = job_json_string(&members, b"ownerPassword")?;
@@ -825,8 +874,10 @@ fn parse_job_encrypt(value: &crate::json::Json, allow_weak_crypto: bool) -> Resu
         )));
     }
     let mut permissions = crate::PermissionsConfig::default();
+    let mut accessibility_disabled = false;
     if let Some(value) = job_json_yn(&settings, b"accessibility")? {
         permissions.accessibility = value;
+        accessibility_disabled = !value;
     }
     if let Some(value) = job_json_yn(&settings, b"annotate")? {
         permissions.annotate = value;
@@ -896,7 +947,7 @@ fn parse_job_encrypt(value: &crate::json::Json, allow_weak_crypto: bool) -> Resu
             "refusing to write a file with weak or deprecated encryption without allowWeakCrypto",
         )));
     }
-    Ok(params)
+    Ok((params, allow_insecure, accessibility_disabled))
 }
 
 fn parse_json_decode_level(value: &str) -> crate::writer::DecodeLevel {
@@ -1683,7 +1734,10 @@ impl QPDFJob {
                 | crate::encryption::PasswordWriteNotice::Info => {}
             }
         }
-        if self.configuration.encryption_accessibility_disabled
+        if self
+            .configuration
+            .encryption_defaults
+            .accessibility_disabled
             && writer_configuration
                 .encryption_parameters()
                 .is_some_and(|params| {
@@ -2623,12 +2677,12 @@ impl QPDFJob {
             // handler visits `copyEncryption` before `encrypt`, so preserve
             // that precedence in the configuration snapshot.
             configuration.copy_encryption_applies_to_writer = false;
-            configuration
-                .writer
-                .set_encryption_parameters(parse_job_encrypt(
-                    value,
-                    configuration.allow_weak_crypto,
-                )?); // cov:ignore: llvm-cov attributes this successful encryption parse continuation to its opening expressions
+            let (params, allow_insecure, accessibility_disabled) =
+                parse_job_encrypt(value, configuration.allow_weak_crypto)?; // cov:ignore: llvm-cov attributes this successful encryption parse continuation to its opening expressions
+            let mut encryption_defaults = EncryptionDefaults::from_params(&params, allow_insecure);
+            encryption_defaults.accessibility_disabled = accessibility_disabled;
+            configuration.encryption_defaults = encryption_defaults;
+            configuration.writer.set_encryption_parameters(params);
         }
 
         if let Some(value) = members.get(b"pages".as_slice()) {
@@ -4270,7 +4324,7 @@ impl QPDFJob {
             )
             .into());
         }
-        if !self.configuration.allow_insecure_encryption {
+        if !self.configuration.encryption_defaults.allow_insecure {
             if let Some(params) = self.configuration.writer.encryption_parameters() {
                 if matches!(
                     params.method,

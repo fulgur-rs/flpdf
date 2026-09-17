@@ -9,10 +9,7 @@ use super::*;
 use crate::encryption::{EncryptMethod, PasswordMode};
 use crate::job::page_range::PageRange;
 use crate::job::OverlayKind;
-use crate::{
-    EncryptParams, Error, PermissionsConfig, PrintPermission, R2PermissionsConfig, Result,
-    UsageError,
-};
+use crate::{EncryptParams, Error, PrintPermission, Result, UsageError};
 use std::fs::File;
 use std::io::Read;
 use std::path::{Path, PathBuf};
@@ -190,22 +187,10 @@ impl<'a> Parser<'a> {
             }
             b"empty" => self.select_empty_input(),
             b"encrypt" => {
-                let inherited = self
-                    .job
-                    .configuration
-                    .writer
-                    .encryption_parameters()
-                    .cloned();
-                let allow_insecure = self.job.configuration.allow_insecure_encryption;
-                let accessibility_disabled =
-                    self.job.configuration.encryption_accessibility_disabled;
+                let inherited = self.job.configuration.encryption_defaults.clone();
                 self.begin_segment(
                     Table::Encryption,
-                    ActiveSegment::Encryption(EncryptionState::new(
-                        inherited,
-                        allow_insecure,
-                        accessibility_disabled,
-                    )),
+                    ActiveSegment::Encryption(EncryptionState::new(inherited)),
                 )
             }
             b"externalize-inline-images" => {
@@ -752,13 +737,12 @@ impl<'a> Parser<'a> {
                 Ok(())
             }
             ActiveSegment::Encryption(state) => {
-                let (params, allow_insecure, accessibility_disabled) = state.finish()?;
+                let (params, defaults) = state.finish()?;
                 self.job
                     .configuration
                     .writer
                     .set_encryption_parameters(params);
-                self.job.configuration.allow_insecure_encryption = allow_insecure;
-                self.job.configuration.encryption_accessibility_disabled = accessibility_disabled;
+                self.job.configuration.encryption_defaults = defaults;
                 self.job.configuration.copy_encryption_applies_to_writer = false;
                 Ok(())
             }
@@ -1100,7 +1084,7 @@ impl PagesState {
                     let value = required_value(name, value, "page-range")?;
                     let value = std::str::from_utf8(value)
                         .map_err(|_| UsageError::new("--range must be valid UTF-8"))?;
-                    self.add_range(value)?;
+                    self.add_range(value, false)?;
                     return Ok(());
                 }
                 b"password" => {
@@ -1137,7 +1121,7 @@ impl PagesState {
 
         if let Ok(range) = std::str::from_utf8(argument) {
             if PageRange::parse_numrange(range).is_ok() {
-                self.add_range(range)?;
+                self.add_range(range, true)?;
                 return Ok(());
             }
         }
@@ -1159,7 +1143,7 @@ impl PagesState {
         });
     }
 
-    fn add_range(&mut self, range: &str) -> Result<()> {
+    fn add_range(&mut self, range: &str, positional: bool) -> Result<()> {
         let current = self
             .specs
             .last_mut()
@@ -1169,7 +1153,7 @@ impl PagesState {
         }
         PageRange::parse_numrange(range).map_err(|error| UsageError::new(error.to_string()))?;
         current.range = range.to_owned();
-        self.called_range = true;
+        self.called_range = positional;
         Ok(())
     }
 
@@ -1472,9 +1456,7 @@ struct EncryptSubFlag {
 }
 
 struct EncryptionState {
-    inherited: Option<EncryptParams>,
-    allow_insecure: bool,
-    accessibility_disabled: bool,
+    inherited: EncryptionDefaults,
     positional: Vec<Vec<u8>>,
     dashed_mode: bool,
     positional_mode: bool,
@@ -1485,15 +1467,9 @@ struct EncryptionState {
 }
 
 impl EncryptionState {
-    fn new(
-        inherited: Option<EncryptParams>,
-        allow_insecure: bool,
-        accessibility_disabled: bool,
-    ) -> Self {
+    fn new(inherited: EncryptionDefaults) -> Self {
         Self {
             inherited,
-            allow_insecure,
-            accessibility_disabled,
             positional: Vec::new(),
             dashed_mode: false,
             positional_mode: false,
@@ -1573,12 +1549,15 @@ impl EncryptionState {
         Err(self.unknown(argument).into())
     }
 
-    fn finish(self) -> Result<(EncryptParams, bool, bool)> {
-        let inherited = self.inherited.as_ref();
+    fn finish(self) -> Result<(EncryptParams, EncryptionDefaults)> {
         let (user_password, owner_password, key_len) = if self.dashed_mode {
             (
-                self.user_password.clone().unwrap_or_default(),
-                self.owner_password.clone().unwrap_or_default(),
+                self.user_password
+                    .clone()
+                    .unwrap_or_else(|| self.inherited.user_password.clone()),
+                self.owner_password
+                    .clone()
+                    .unwrap_or_else(|| self.inherited.owner_password.clone()),
                 self.key_len
                     .ok_or_else(|| UsageError::new("encryption key length is required"))?,
             )
@@ -1594,32 +1573,19 @@ impl EncryptionState {
             )
         };
 
-        let mut use_aes = inherited.map(|params| match params.method {
-            EncryptMethod::V4Aes128 => true,
-            EncryptMethod::V4Rc4128 => false,
-            EncryptMethod::V5R5Aes256 | EncryptMethod::V5R6Aes256 => true,
-            EncryptMethod::V1Rc440 | EncryptMethod::V2Rc4128 => false,
-        });
-        let mut force_v4 = inherited.is_some_and(|params| {
-            matches!(
-                params.method,
-                EncryptMethod::V4Rc4128 | EncryptMethod::V4Aes128
-            )
-        });
-        let mut force_r5 =
-            inherited.is_some_and(|params| matches!(params.method, EncryptMethod::V5R5Aes256));
-        let mut allow_insecure = self.allow_insecure;
-        let mut cleartext_metadata = inherited.is_some_and(|params| !params.encrypt_metadata);
-        let mut permissions =
-            inherited.map_or_else(PermissionsConfig::default, |params| params.permissions);
-        let mut r2_permissions =
-            inherited.map_or_else(R2PermissionsConfig::default, |params| params.r2_permissions);
-        let mut accessibility_disabled = self.accessibility_disabled;
+        let mut use_aes = self.inherited.use_aes;
+        let mut force_v4 = self.inherited.force_v4;
+        let mut force_r5 = self.inherited.force_r5;
+        let mut allow_insecure = self.inherited.allow_insecure;
+        let mut cleartext_metadata = self.inherited.cleartext_metadata;
+        let mut permissions = self.inherited.permissions;
+        let mut r2_permissions = self.inherited.r2_permissions;
+        let mut accessibility_disabled = self.inherited.accessibility_disabled;
 
         for subflag in &self.subflags {
             let value = subflag.value.as_deref().unwrap_or_default();
             match subflag.name.as_slice() {
-                b"use-aes" => use_aes = Some(parse_encryption_yn(value)?),
+                b"use-aes" => use_aes = parse_encryption_yn(value)?,
                 b"force-V4" => force_v4 = true,
                 b"force-R5" => force_r5 = true,
                 b"allow-insecure" => allow_insecure = true,
@@ -1678,8 +1644,8 @@ impl EncryptionState {
 
         let method = match key_len {
             40 => EncryptMethod::V1Rc440,
-            128 if force_v4 || cleartext_metadata || use_aes == Some(true) => {
-                if use_aes.unwrap_or(false) {
+            128 if force_v4 || cleartext_metadata || use_aes => {
+                if use_aes {
                     EncryptMethod::V4Aes128
                 } else {
                     EncryptMethod::V4Rc4128
@@ -1690,6 +1656,8 @@ impl EncryptionState {
             256 => EncryptMethod::V5R6Aes256,
             _ => unreachable!("encryption key length was validated"), // cov:ignore: parse_encryption_key_len admits only 40, 128, or 256
         };
+        let defaults_user_password = user_password.clone();
+        let defaults_owner_password = owner_password.clone();
 
         let mut params = match method {
             EncryptMethod::V1Rc440 => {
@@ -1731,7 +1699,19 @@ impl EncryptionState {
         if method == EncryptMethod::V4Aes128 || method == EncryptMethod::V4Rc4128 {
             params.permissions.accessibility = true;
         }
-        Ok((params, allow_insecure, accessibility_disabled))
+        let defaults = EncryptionDefaults {
+            user_password: defaults_user_password,
+            owner_password: defaults_owner_password,
+            use_aes,
+            force_v4,
+            force_r5,
+            allow_insecure,
+            cleartext_metadata,
+            permissions,
+            r2_permissions,
+            accessibility_disabled,
+        };
+        Ok((params, defaults))
     }
 
     fn unknown(&self, argument: &[u8]) -> UsageError {
@@ -1846,6 +1826,48 @@ Topics:
 For detailed help, visit the qpdf manual: https://qpdf.readthedocs.io
 "#;
 
+const QPDF_HELP_USAGE: &[u8] =
+    br#"Read a PDF file, apply transformations or modifications, and write
+a new PDF file.
+
+Usage: qpdf [infile] [options] [outfile]
+   OR qpdf --help[={topic|--option}]
+
+- infile, options, and outfile may be in any order as long as infile
+  precedes outfile.
+- Use --empty in place of an input file for a zero-page, empty input
+- Use --replace-input in place of an output file to overwrite the
+  input file
+- outfile may be - to write to stdout; reading from stdin is not supported
+- @filename is an argument file; each line is treated as a separate
+  command-line argument
+- @- may be used to read arguments from stdin
+- Later options may override earlier options if contradictory
+
+Related options:
+  --empty: use empty file as input
+  --job-json-file: job JSON file
+  --replace-input: overwrite input with output
+
+For detailed help, visit the qpdf manual: https://qpdf.readthedocs.io
+"#;
+
+const QPDF_HELP_ROTATE: &[u8] = br#"--rotate=[+|-]angle[:page-range]
+
+Rotate specified pages by multiples of 90 degrees specifying
+either absolute or relative angles. "angle" may be 0, 90, 180,
+or 270. You almost always want to use +angle or -angle rather
+than just angle, as discussed in the manual. Run
+qpdf --help=page-ranges for help with page ranges.
+
+For detailed help, visit the qpdf manual: https://qpdf.readthedocs.io
+"#;
+
+const QPDF_COMPLETION_BASH: &[u8] =
+    b"complete -o bashdefault -o default -o nospace -C \"qpdf\" qpdf\n";
+const QPDF_COMPLETION_ZSH: &[u8] =
+    b"autoload -U +X bashcompinit && bashcompinit && complete -o bashdefault -o default -C \"qpdf\" qpdf\n";
+
 fn known_help_target(value: &[u8]) -> bool {
     matches!(
         value,
@@ -1873,6 +1895,7 @@ fn known_help_target(value: &[u8]) -> bool {
             | b"--help"
             | b"--json"
             | b"--json-output"
+            | b"--rotate"
             | b"--pages"
             | b"--encrypt"
             | b"--add-attachment"
@@ -1899,7 +1922,9 @@ fn handle_sole_help_option(job: &mut QPDFJob, argument: &[u8]) -> Result<bool> {
                 // Crypto-provider enumeration is owned by the process/CLI in
                 // qpdf. Recognition and early exit are the library contract;
                 // no provider registry is created merely to parse argv.
-                b"show-crypto" | b"completion-bash" | b"completion-zsh" => {}
+                b"show-crypto" => {}
+                b"completion-bash" => job.logger.info(QPDF_COMPLETION_BASH)?,
+                b"completion-zsh" => job.logger.info(QPDF_COMPLETION_ZSH)?,
                 b"help" => {
                     if let Some(value) = value {
                         if !known_help_target(value) {
@@ -1911,7 +1936,12 @@ fn handle_sole_help_option(job: &mut QPDFJob, argument: &[u8]) -> Result<bool> {
                             return Err(UsageError::new(message).into());
                         }
                     }
-                    job.logger.info(QPDF_HELP_TOP)?;
+                    let help = match value {
+                        Some(b"usage") => QPDF_HELP_USAGE,
+                        Some(b"--rotate") => QPDF_HELP_ROTATE,
+                        _ => QPDF_HELP_TOP,
+                    };
+                    job.logger.info(help)?;
                 }
                 b"job-json-help" => job.logger.info(
                     super::job_json_schema()
