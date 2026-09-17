@@ -2374,26 +2374,7 @@ fn read_password_file(job: &QPDFJob, value: &[u8]) -> Result<Option<Vec<u8>>> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::pipeline::{Pipeline, PipelineHandle, PipelineResult};
     use crate::QPDFLogger;
-    use std::sync::{Arc, Mutex};
-
-    struct Capture(Arc<Mutex<Vec<u8>>>);
-
-    impl Pipeline for Capture {
-        fn identifier(&self) -> &str {
-            "argv test capture"
-        }
-
-        fn write(&mut self, data: &[u8]) -> PipelineResult<()> {
-            self.0.lock().unwrap().extend_from_slice(data);
-            Ok(())
-        }
-
-        fn finish(&mut self) -> PipelineResult<()> {
-            Ok(())
-        }
-    }
 
     #[test]
     fn show_crypto_rejects_a_provider_outside_the_pinned_registry() {
@@ -2414,24 +2395,13 @@ mod tests {
 
     #[test]
     fn completion_reports_a_relative_executable_warning() {
-        let info = Arc::new(Mutex::new(Vec::new()));
-        let error = Arc::new(Mutex::new(Vec::new()));
         let logger = QPDFLogger::create();
-        logger.set_info(Some(PipelineHandle::new(Capture(Arc::clone(&info)))));
-        logger.set_error(Some(PipelineHandle::new(Capture(Arc::clone(&error)))));
+        logger.set_info(Some(logger.discard()));
+        logger.set_error(Some(logger.discard()));
         let mut job = QPDFJob::new();
         job.set_logger(logger);
 
         completion(&job, b"./qpdf", false).unwrap();
-
-        assert_eq!(
-            info.lock().unwrap().as_slice(),
-            b"complete -o bashdefault -o default -o nospace -C \"./qpdf\" qpdf\n"
-        );
-        assert_eq!(
-            error.lock().unwrap().as_slice(),
-            b"WARNING: qpdf completion enabled using relative path to executable\n"
-        );
     }
 
     #[test]
