@@ -3917,19 +3917,11 @@ impl<R: Read + Seek> ResolverHandle<R> {
             };
             let trailing = if parsed.empty.is_none() {
                 let mut trailing_tokens = LiveTokenSource::new(&mut input);
-                let trailing = trailing_tokens.next_token();
+                let trailing = trailing_tokens
+                    .next_token()
+                    .map_err(ReadObjectAtOffsetError::Body)?;
                 drop(trailing_tokens);
-                match trailing {
-                    Ok(trailing) => Some(trailing),
-                    Err(error) => {
-                        // The trailing-token read shares the header and body
-                        // exits' contract: settle the logical position before
-                        // returning so a nested read leaves the outer parser
-                        // on qpdf's cursor rather than the prefetch end.
-                        input.finish().map_err(ReadObjectAtOffsetError::Body)?;
-                        return Err(ReadObjectAtOffsetError::Body(error));
-                    }
-                }
+                Some(trailing)
             } else {
                 None
             };
@@ -5156,8 +5148,13 @@ impl<R: Read + Seek> LiveInput for ResolverLiveInput<'_, R> {
         self.sync_generation()?;
         if self.buffer_index == self.buffer_len {
             self.buffer_start = self.resolver.tell()?;
-            self.buffer_len = self.resolver.read(&mut self.buffer)?;
+            // Drop the spent buffer BEFORE the fallible refill. A failing
+            // `read` must not leave the previous `buffer_len`/`buffer_index`
+            // beside the new `buffer_start`: `tell` would then report a whole
+            // buffer past the failure and `finish` would seek there.
+            self.buffer_len = 0;
             self.buffer_index = 0;
+            self.buffer_len = self.resolver.read(&mut self.buffer)?;
             self.generation = self.resolver.input_generation();
             if self.buffer_len == 0 {
                 return Ok(None);
