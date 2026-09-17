@@ -862,6 +862,12 @@ impl<'pdf, R: Read + Seek + 'static> PdfWriter<'pdf, R> {
         // the repaired page order and its three derived maps together so the
         // specialized emitter consumes this setup without another page walk.
         let special_streams = initialize_special_streams(self.pdf, &options)?;
+        if self.settings.linearization && special_streams.is_none() {
+            // qpdf's linearized setup establishes the page-tree read boundary
+            // before its getObjectCount/fixDanglingReferences snapshot, even
+            // when no content stream maps are needed.
+            crate::pages::repair::prepare_for_optimization(self.pdf)?;
+        }
         let effective_object_streams = effective_object_stream_mode(&options);
         let plain_generate_setup = effective_object_streams == ObjectStreamMode::Generate
             && !self.settings.linearization
