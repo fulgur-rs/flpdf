@@ -13,6 +13,7 @@ use std::fmt;
 use std::io::{self, Write};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex, MutexGuard, OnceLock};
+use std::thread::ThreadId;
 
 const NULL_PIPELINE_MESSAGE: &str =
     "QPDFLogger: requested a null pipeline without null_okay == true";
@@ -162,6 +163,7 @@ struct LoggerState {
     info: PipelineHandle,
     warn: Option<PipelineHandle>,
     error: PipelineHandle,
+    error_capture: Option<(ThreadId, PipelineHandle)>,
     save: Option<PipelineHandle>,
     stdout_used: Arc<AtomicBool>,
     stdout_text_mode: Arc<AtomicBool>,
@@ -199,6 +201,17 @@ pub struct QPDFLogger {
     shared: Arc<LoggerShared>,
 }
 
+struct ErrorCaptureRestore {
+    shared: Arc<LoggerShared>,
+    previous: Option<(ThreadId, PipelineHandle)>,
+}
+
+impl Drop for ErrorCaptureRestore {
+    fn drop(&mut self) {
+        self.shared.lock().error_capture = self.previous.take();
+    }
+}
+
 impl QPDFLogger {
     pub fn create() -> Self {
         Self::create_with_line_buffering(true)
@@ -234,6 +247,7 @@ impl QPDFLogger {
             info: stdout,
             warn: None,
             error: stderr,
+            error_capture: None,
             save: None,
             stdout_used,
             stdout_text_mode,
@@ -285,7 +299,36 @@ impl QPDFLogger {
     }
 
     pub fn get_error(&self) -> Result<PipelineHandle> {
-        Ok(self.shared.lock().error.clone())
+        let state = self.shared.lock();
+        let current = std::thread::current().id();
+        Ok(state
+            .error_capture
+            .as_ref()
+            .filter(|(owner, _)| *owner == current)
+            .map(|(_, pipeline)| pipeline.clone())
+            .unwrap_or_else(|| state.error.clone()))
+    }
+
+    /// Run `body` with an error pipeline visible only to the calling thread.
+    ///
+    /// qtest's contextless object accessors reproduce qpdf warnings through the
+    /// process-global default logger. A test capture must not redirect warnings
+    /// emitted concurrently by another test, so this scope overlays the error
+    /// sink for its owner thread while leaving the normal process sink visible
+    /// to every other thread.
+    pub fn with_error_capture<T>(&self, pipeline: PipelineHandle, body: impl FnOnce() -> T) -> T {
+        let previous = self
+            .shared
+            .lock()
+            .error_capture
+            .replace((std::thread::current().id(), pipeline));
+        let restore = ErrorCaptureRestore {
+            shared: Arc::clone(&self.shared),
+            previous,
+        };
+        let result = body();
+        drop(restore);
+        result
     }
 
     pub fn get_save(&self) -> Result<PipelineHandle> {

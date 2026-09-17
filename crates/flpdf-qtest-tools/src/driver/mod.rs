@@ -26,6 +26,9 @@ pub(crate) mod test_72_79;
 pub(crate) mod test_80_87;
 pub(crate) mod test_88_98;
 
+pub(crate) static DEFAULT_ERROR_CAPTURE_LOCK: std::sync::OnceLock<std::sync::Mutex<()>> =
+    std::sync::OnceLock::new();
+
 #[cfg(test)]
 pub(crate) static CURRENT_DIR_LOCK: std::sync::OnceLock<std::sync::Mutex<()>> =
     std::sync::OnceLock::new();
