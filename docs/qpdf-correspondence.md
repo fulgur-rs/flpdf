@@ -871,6 +871,23 @@ trailer bytes through `writer/object.rs::TrailerKind` and
 legacy xref-stream, and linearized trailer callers remain follow-up route
 consumers rather than new semantic trailer implementations.
 
+### Missing literal `/Size` remains absent on normal writer routes (`flpdf-5jcwv`, 2026-09-17)
+
+qpdf's `getTrimmedTrailer` removes only writer-owned history and xref-stream
+keys; it does not add `/Size` (`libqpdf/QPDFWriter.cc:2009-2031`). The normal
+`writeTrailer` loop replaces the value only when `getKeys()` contains the
+literal `/Size` key (`libqpdf/QPDFWriter.cc:1160-1236`). `t_lin_second` is a
+separate linearization form that writes `/Size` unconditionally
+(`QPDFWriter.cc:1170-1172`).
+
+The canonical flpdf plain and PCLm trailer builder now preserves a missing or
+misspelled `/Size` key while replacing an existing literal key. The plain
+xref-stream live-trailer serializer applies the same predicate. The existing
+linearized first-page route already follows the qpdf predicate; its main
+second-half trailer remains an independently generated `/Size`-only form.
+The synthetic bad9 differential covers normal rewrite bytes and generated
+xref-stream key visibility against qpdf 11.9.0.
+
 ### `test_driver` test 29
 
 `qpdf/test_driver.cc:1096-1145` deliberately constructs a mixed-ownership

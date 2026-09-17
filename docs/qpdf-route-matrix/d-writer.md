@@ -228,6 +228,18 @@ linearized pass 1/pass 2の同一辞書・payload境界で処理する。`good17
 `writeTrailer` を共有する。** linearized も同じ 3 関数を追加引数付きで呼ぶ。xref/trailer を書く
 実装は qpdf 全体で 1 組しかない。
 
+### D14 follow-up: missing literal `/Size` is not synthesized (`flpdf-5jcwv`, 2026-09-17)
+
+`QPDFWriter::getTrimmedTrailer` removes `/ID`, `/Encrypt`, `/Prev`, and the
+xref-stream-only keys but does not add `/Size` (`libqpdf/QPDFWriter.cc:2009-2031`).
+The normal `writeTrailer` loop substitutes the computed value only when the
+trimmed input contains a literal `/Size` key (`libqpdf/QPDFWriter.cc:1160-1236`;
+the `t_lin_second` `/Size`-only branch at `:1170-1172` is separate). The
+canonical plain/PCLm builder and plain live xref-stream serializer preserve
+that predicate. The linearized first-page route already did so; its generated
+main second-half trailer remains unconditionally sized. Regression coverage is
+`crates/flpdf-cli/tests/cmp_trailer_size_tests.rs` against qpdf 11.9.0.
+
 ### D-5. encryption
 
 - `setEncryptionParametersInternal`（`libqpdf/QPDFWriter.cc:777-840`）: `encryption_dictionary`

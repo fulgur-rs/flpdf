@@ -5347,6 +5347,14 @@ fn unparse_trailer_entries_with_ref_map_and_kind(
         }
 
         if key.as_slice() == b"/Size" {
+            // qpdf's `getKeys()` omits a null-valued key
+            // (`QPDF_Dictionary.cc:getKeys`), so `writeTrailer` never sees a
+            // `/Size null` entry and emits no computed size for it. This arm
+            // runs before the general null suppression below, so it has to make
+            // the same test itself.
+            if suppress_null_values && value.try_is_null()? {
+                continue;
+            }
             if qdf {
                 out.write_bytes(b"  ")?;
             } else {
