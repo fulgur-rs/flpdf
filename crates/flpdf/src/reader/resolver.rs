@@ -1672,21 +1672,7 @@ impl<R: Read + Seek> ResolverHandle<R> {
     /// prepared.
     fn resolve_xref_table(&self) -> Result<bool> {
         let may_change = !self.reconstructed_xref();
-        for object_ref in self.xref_refs() {
-            let handle = self.get_object_handle(object_ref);
-            if handle.is_resolved() {
-                continue;
-            }
-            handle.try_dereference()?;
-            if may_change && self.reconstructed_xref() {
-                return Ok(false);
-            }
-        }
-        // qpdf walks the raw xref table, not only the parsed indirect-reference
-        // projection. Rows such as object 5 generation 65536 cannot mint an
-        // ObjectRef, but they still must reach the same offset/header/recovery
-        // boundary so qpdf's expected-generation diagnostics are preserved.
-        for (object_gen, entry) in self.raw_xref_entries() {
+        for (object_gen, entry) in self.effective_xref_entries() {
             if object_gen == QpdfObjGen::new(0, 0) {
                 let handle = self.get_object_handle_qpdf_obj_gen(object_gen);
                 match entry {
@@ -1714,9 +1700,24 @@ impl<R: Read + Seek> ResolverHandle<R> {
                 }
                 continue;
             }
+
             if object_gen.to_object_ref().is_some() {
+                let handle = self.get_object_handle_qpdf_obj_gen(object_gen);
+                if handle.is_resolved() {
+                    continue;
+                }
+                self.resolve_qpdf_obj_gen(object_gen, &handle)?;
+                if may_change && self.reconstructed_xref() {
+                    return Ok(false);
+                }
                 continue;
             }
+
+            // qpdf walks the raw xref table, not only the parsed
+            // indirect-reference projection. Rows such as object 5 generation
+            // 65536 cannot mint an ObjectRef, but they still reach the same
+            // offset/header/recovery boundary so qpdf's expected-generation
+            // diagnostics are preserved.
             let XrefEntry::Uncompressed { offset } = entry else {
                 continue;
             };
@@ -2613,6 +2614,63 @@ impl<R: Read + Seek> ResolverHandle<R> {
             entries
                 .entry(*object_gen)
                 .or_insert(XrefEntry::Free { next: 0 });
+        }
+        entries
+    }
+
+    fn effective_xref_entries(&self) -> Vec<(QpdfObjGen, XrefEntry)> {
+        #[cfg(test)]
+        EFFECTIVE_XREF_SNAPSHOT_CONSTRUCTIONS.with(|constructions| {
+            constructions.set(constructions.get() + 1);
+        });
+
+        let core = self.core.borrow();
+        let mut entries = Vec::with_capacity(
+            core.raw_source_xref_entries.len() + core.default_xref_entries.len(),
+        );
+        let mut raw = core.raw_source_xref_entries.iter().peekable();
+        let mut defaults = core.default_xref_entries.iter().peekable();
+        loop {
+            match (raw.peek().copied(), defaults.peek().copied()) {
+                (Some((raw_object_gen, _)), Some(default_object_gen)) => {
+                    match raw_object_gen.cmp(default_object_gen) {
+                        std::cmp::Ordering::Less => {
+                            let Some((object_gen, entry)) = raw.next() else {
+                                break; // cov:ignore: peeked raw iterator cannot be empty before next
+                            };
+                            entries.push((*object_gen, *entry));
+                        }
+                        std::cmp::Ordering::Equal => {
+                            let Some((object_gen, entry)) = raw.next() else {
+                                break; // cov:ignore: peeked raw iterator cannot be empty before next
+                            };
+                            let Some(_) = defaults.next() else {
+                                break; // cov:ignore: peeked default iterator cannot be empty before next
+                            };
+                            entries.push((*object_gen, *entry));
+                        }
+                        std::cmp::Ordering::Greater => {
+                            let Some(object_gen) = defaults.next() else {
+                                break; // cov:ignore: peeked default iterator cannot be empty before next
+                            };
+                            entries.push((*object_gen, XrefEntry::Free { next: 0 }));
+                        }
+                    }
+                }
+                (Some(_), None) => {
+                    let Some((object_gen, entry)) = raw.next() else {
+                        break; // cov:ignore: peeked raw iterator cannot be empty before next
+                    };
+                    entries.push((*object_gen, *entry));
+                }
+                (None, Some(_)) => {
+                    let Some(object_gen) = defaults.next() else {
+                        break; // cov:ignore: peeked default iterator cannot be empty before next
+                    };
+                    entries.push((*object_gen, XrefEntry::Free { next: 0 }));
+                }
+                (None, None) => break,
+            }
         }
         entries
     }
@@ -5596,6 +5654,16 @@ impl<R: Read + Seek> ResolverHandle<R> {
             }
         }
     }
+}
+
+#[cfg(test)]
+thread_local! {
+    static EFFECTIVE_XREF_SNAPSHOT_CONSTRUCTIONS: Cell<usize> = const { Cell::new(0) };
+}
+
+#[cfg(test)]
+fn effective_xref_snapshot_constructions_for_test() -> usize {
+    EFFECTIVE_XREF_SNAPSHOT_CONSTRUCTIONS.with(Cell::get)
 }
 
 #[cfg(test)]
@@ -9266,6 +9334,69 @@ mod tests {
             "qpdf ot_destroyed"
         );
         assert!(!handle.is_null());
+    }
+
+    #[test]
+    fn fix_dangling_references_builds_one_effective_xref_snapshot() {
+        let pdf = Pdf::open_mem_owned(minimal_pdf_bytes()).expect("open");
+        let snapshots_before = super::effective_xref_snapshot_constructions_for_test();
+
+        pdf.resolver
+            .fix_dangling_references()
+            .expect("minimal xref table resolves without reconstruction");
+
+        assert_eq!(
+            super::effective_xref_snapshot_constructions_for_test(),
+            snapshots_before + 1,
+            "one qpdf effective-xref pass must use one contiguous snapshot"
+        );
+    }
+
+    #[test]
+    fn effective_xref_snapshot_merges_raw_and_default_rows_in_qpdf_order() {
+        let resolver = bare_resolver();
+        resolver.install_raw_xref_entries(BTreeMap::from([
+            (
+                QpdfObjGen::new(1, 0),
+                XrefEntry::Uncompressed { offset: 11 },
+            ),
+            (
+                QpdfObjGen::new(3, 0),
+                XrefEntry::Compressed {
+                    stream: 9,
+                    index: 2,
+                },
+            ),
+            (QpdfObjGen::new(4, 0), XrefEntry::Free { next: 0 }),
+        ]));
+        resolver.insert_default_xref_entry_for_test(ObjectRef::new(2, 0));
+        resolver.insert_default_xref_entry_for_test(ObjectRef::new(3, 0));
+        resolver.insert_default_xref_entry_for_test(ObjectRef::new(5, 0));
+
+        let entries = resolver.effective_xref_entries();
+
+        assert_eq!(
+            entries
+                .iter()
+                .map(|(object_gen, _)| *object_gen)
+                .collect::<Vec<_>>(),
+            [
+                QpdfObjGen::new(1, 0),
+                QpdfObjGen::new(2, 0),
+                QpdfObjGen::new(3, 0),
+                QpdfObjGen::new(4, 0),
+                QpdfObjGen::new(5, 0),
+            ]
+        );
+        assert_eq!(entries[1].1, XrefEntry::Free { next: 0 });
+        assert_eq!(
+            entries[2].1,
+            XrefEntry::Compressed {
+                stream: 9,
+                index: 2,
+            }
+        );
+        assert_eq!(entries[4].1, XrefEntry::Free { next: 0 });
     }
 
     #[test]
