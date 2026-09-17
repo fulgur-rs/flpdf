@@ -678,7 +678,7 @@ fn walk_resurrectable_handle(
             Some(crate::object_handle::ObjectValue::Dictionary(entries)) => {
                 Some(entries.values().cloned().collect::<Vec<_>>())
             }
-            _ => None,
+            _ => None, // cov:ignore: as_stream_dict guarantees a dictionary-backed stream value
         }) {
             for value in values {
                 walk_resurrectable_handle(&value, depth + 1, false, true, state)?;

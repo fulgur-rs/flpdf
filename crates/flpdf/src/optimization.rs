@@ -747,6 +747,9 @@ mod tests {
             .resolved_get_visible_keys()
             .expect_err("non-dictionary visible keys warn like qpdf");
         assert!(error.to_string().contains("operation for dictionary"));
+        let error = super::resolved_visible_children(&scalar)
+            .expect_err("context-less non-dictionary child walk must error");
+        assert!(error.to_string().contains("operation for dictionary"));
 
         let pdf = Pdf::empty().expect("create a warning context");
         let contextual_scalar = pdf
@@ -758,6 +761,9 @@ mod tests {
         assert!(contextual_scalar
             .resolved_get_visible_keys()
             .expect("contextual non-dictionary visible keys")
+            .is_empty());
+        assert!(super::resolved_visible_children(&contextual_scalar)
+            .expect("contextual child walk keeps qpdf warning boundary")
             .is_empty());
 
         let missing_type =
