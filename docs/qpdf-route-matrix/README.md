@@ -33,7 +33,7 @@ container-above-max だった — `flpdf-hi08` / PR #1486）。本表は残る m
 
 | canonical | bridge | mixed | unknown | 合計 |
 |---|---|---|---|---|
-| 108 | 0 | 52 | 0 | 160 |
+| 109 | 0 | 51 | 0 | 160 |
 
 ### checker logical aggregate（259 rows）
 
@@ -44,7 +44,7 @@ rowsを検証する。2026-09-17 の現行 `origin/main` (`62de6be4c2b1976e1c07c
 
 | canonical | bridge | mixed | unknown | 合計 |
 |---|---|---|---|---|
-| 159 | 0 | 100 | 0 | 259 |
+| 160 | 0 | 99 | 0 | 259 |
 
 したがって、160行の領域別表と259 logical rowsの checker 分母は異なる。どちらも
 parity 完了数ではなく、責務／経路の分類数である。
@@ -101,8 +101,8 @@ done | sort | uniq -c
 11.9.0 commit `3b97c9bd266b7c32ea36d3536e22dab77412886d` である。checker の実測は
 **今回の変更を適用した tree で** 2199 qpdf citations / 912 flpdf citations /
 259 logical rows、分類は
-canonical 159 / mixed 100 / bridge 0 / unknown 0。A〜E の160行だけを数える
-上の領域別集計は canonical 108 / mixed 52 / bridge 0 / unknown 0 なので、checker
+canonical 160 / mixed 99 / bridge 0 / unknown 0。A〜E の160行だけを数える
+上の領域別集計は canonical 109 / mixed 51 / bridge 0 / unknown 0 なので、checker
 の259 logical rowsと混同しない。
 
 履歴行の例外: C44はpublic facadeとdeferred blobの責務を分離したmixed ownerとして追跡する。
