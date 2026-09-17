@@ -2380,6 +2380,13 @@ fn do_write_pass<R: Read + Seek>(
     // `/ID` token. Each span is
     // captured as `start..bytes.len()` around the call that emits its `/ID`.
     let mut id_ranges: Vec<std::ops::Range<usize>> = Vec::new();
+    // qpdf's pass-1 writeTrailer reads the live `/ID[0]` at each trailer site
+    // rather than reusing the generateID state. The value affects only warning
+    // delivery and the zero-filled placeholder width; output bytes continue to
+    // come from `source_trailer`.
+    if pass1_digest {
+        let _ = crate::writer::source_permanent_id_handle(&pdf.trailer())?;
+    }
     let first_trailer_prev_range = if objstm_layout.is_empty() {
         // First-page xref covers objects [param_slot, total): the param dict
         // plus every other first-page object (catalog, hint, first page, page-1
@@ -2980,6 +2987,9 @@ fn do_write_pass<R: Read + Seek>(
     // members which a classic xref table cannot represent, so Part 6 becomes
     // an xref stream.  With an empty layout the classic table path is kept
     // verbatim — no behavioural change for Disable / no-ObjStm inputs.
+    if pass1_digest {
+        let _ = crate::writer::source_permanent_id_handle(&pdf.trailer())?;
+    }
     let (last_xref_offset, last_xref_first_entry_offset, second_xref_end) = if objstm_layout
         .is_empty()
     {
@@ -3875,14 +3885,20 @@ fn write_linearized_impl<R: Read + Seek>(
     // preserved permanent identifier and the `/Info`-derived suffix feeds the
     // seed; reading either after the placeholder is installed would mistake the
     // 16 zero bytes for a real source `/ID[0]` and corrupt the result.
-    // Read `/ID[0]` through the LIVE trailer, matching
-    // `QPDFWriter::getOriginalID1` (`QPDFWriter.cc`), which calls
-    // `m->pdf.getTrailer()` on every invocation and never a copy. The
-    // shallow copy below is a detached value graph: a malformed present
-    // `/ID` (e.g. `/ID 7`) would raise the accessor's type warning without a
-    // document to warn through, turning qpdf's warn-and-continue into an
-    // abort that produces no output.
-    let source_id0 = crate::writer::source_permanent_id_handle(&pdf.trailer())?;
+    // qpdf's initial generateID call has already selected the source ID for
+    // non-deterministic, non-copy-encryption output in WriterSetupState. Reuse
+    // that writer-owned value here so the initial malformed-/ID warning is not
+    // emitted twice. Deterministic ID and copy-encryption setup have no such
+    // source value, so retain the live qpdf-shaped read for those routes.
+    let source_id0 = if deterministic_id || options.copy_encryption.is_some() {
+        crate::writer::source_permanent_id_handle(&pdf.trailer())?
+    } else {
+        generated_id
+            .as_ref()
+            .and_then(ObjectHandle::as_array)
+            .and_then(|values| values.first().and_then(ObjectHandle::as_string))
+            .filter(|value| !value.is_empty())
+    };
     let source_trailer_handle = pdf.trailer().shallow_copy()?;
     let (det_id_source_id0, det_id_info_suffix): (Option<Vec<u8>>, Vec<u8>) = if deterministic_id {
         let suffix = crate::writer::deterministic_id_info_suffix(pdf);
@@ -5798,6 +5814,26 @@ mod tests {
                 "operation for string attempted on object of type null: returning empty string"
             )),
             "expected the string accessor warning, got {messages:?}"
+        );
+        assert_eq!(
+            messages
+                .iter()
+                .filter(|message| message.contains(
+                    "operation for array attempted on object of type integer: returning null"
+                ))
+                .count(),
+            3,
+            "qpdf rereads /ID[0] at generateID and both pass-1 trailers: {messages:?}"
+        );
+        assert_eq!(
+            messages
+                .iter()
+                .filter(|message| message.contains(
+                    "operation for string attempted on object of type null: returning empty string"
+                ))
+                .count(),
+            3,
+            "qpdf rereads the string value at generateID and both pass-1 trailers: {messages:?}"
         );
     }
 
