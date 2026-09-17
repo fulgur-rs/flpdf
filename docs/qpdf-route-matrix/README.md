@@ -6,7 +6,7 @@
 **関連:** [`docs/qpdf-correspondence.md`](../qpdf-correspondence.md)（責務対応表。本表はその上に
 「経路（route）」軸を足したもので、対応表の行を置き換えない）/ Beads `flpdf-3yn9.41`（親 epic `flpdf-3yn9`）
 **調査日:** 2026-09-17（再監査 `flpdf-3yn9.48`、文書更新 `flpdf-3yn9.48.139`）。
-現行 `origin/main=87d205e6ae14da5a4295d70edba3c720c9e4e1cd` と pinned qpdf source に基づき、領域別表の分類・責務境界・既存issueとの対応を更新した。
+現行 `origin/main=346a79d73c9ea25d1e761d89c2fd12cec3a7cce2` と pinned qpdf source に基づき、領域別表の分類・責務境界・既存issueとの対応を更新した。
 160行は履歴上の行集合を維持している。今回の分類更新は全行の parity テスト合格を意味しない。
 未更新の行番号は過去snapshotを含む。
 
@@ -97,9 +97,9 @@ done | sort | uniq -c
 本表は「その責務に至る **経路が 1 本か**」を問う。✅ の行でも consumer 側に bridge が残っていれば
 本表では mixed / bridge になりうる。
 
-2026-09-17 の current-main audit anchor は `origin/main=87d205e6ae14da5a4295d70edba3c720c9e4e1cd`、pinned qpdf は
+2026-09-17 の current-main audit anchor は `origin/main=346a79d73c9ea25d1e761d89c2fd12cec3a7cce2`、pinned qpdf は
 11.9.0 commit `3b97c9bd266b7c32ea36d3536e22dab77412886d` である。checker の実測は
-**今回の変更を適用した tree で** 2189 qpdf citations / 913 flpdf citations /
+**今回の変更を適用した tree で** 2193 qpdf citations / 913 flpdf citations /
 259 logical rows、分類は
 canonical 158 / mixed 101 / bridge 0 / unknown 0。A〜E の160行だけを数える
 上の領域別集計は canonical 107 / mixed 53 / bridge 0 / unknown 0 なので、checker
