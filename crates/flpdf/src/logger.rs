@@ -635,6 +635,31 @@ mod tests {
     }
 
     #[test]
+    fn error_capture_restores_nested_scope() {
+        let logger = super::QPDFLogger::create();
+        let outer_bytes = Arc::new(Mutex::new(Vec::new()));
+        let inner_bytes = Arc::new(Mutex::new(Vec::new()));
+
+        logger.with_error_capture(
+            PipelineHandle::new(RecordingPipeline(Arc::clone(&outer_bytes))),
+            || {
+                logger.with_error_capture(
+                    PipelineHandle::new(RecordingPipeline(Arc::clone(&inner_bytes))),
+                    || logger.error(b"inner\n").unwrap(),
+                );
+                logger.error(b"outer\n").unwrap();
+            },
+        );
+
+        assert_eq!(&*outer_bytes.lock().unwrap(), b"outer\n");
+        assert_eq!(&*inner_bytes.lock().unwrap(), b"inner\n");
+
+        let mut sink = RecordingPipeline(Arc::clone(&outer_bytes));
+        assert_eq!(sink.identifier(), "logger test capture");
+        sink.finish().unwrap();
+    }
+
+    #[test]
     fn default_logger_does_not_install_the_line_buffered_stdout_adapter() {
         let source = include_str!("logger.rs");
         let start = source
