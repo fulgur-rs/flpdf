@@ -3801,6 +3801,34 @@ lazy stream parserの成功した`readStream`境界ではqpdfと同じstream-dat
 通常rewrite/checkのdiagnosticsは変更せず、q2nkaが所有するlinearized stream probe後の
 stop-on-error consumer境界だけを固定する。
 
+### qtest 診断キャプチャのスレッド限定 error overlay (`flpdf-39jj2`, 2026-09-17)
+
+**逸脱分類 (C): qpdf に対応物が一切ない flpdf 固有の挙動。出力バイトには影響しない。**
+
+`QPDFObjectHandle::warnIfPossible` は context を持たない値に対して
+`QPDFLogger::defaultLogger()->getError()` へ素の文言を書く
+（`libqpdf/QPDFObjectHandle.cc:2168-2212`）。この経路は default logger を
+直接名指すため、qtest の lib テストが並列に走ると、あるテストのキャプチャが
+別テストの警告を吸い込む競合になる。
+
+qpdf 自身のこの問題への答えは **スレッドごとに別の `QPDFLogger` インスタンスを
+作ること**で（`include/qpdf/QPDFLogger.hh:33-42` が multi-thread capture の
+理由として明記）、default logger 側にスレッド限定の差し替え機構は無い。
+しかし `warnIfPossible` が `defaultLogger()` をハードコードしている以上、
+別インスタンスではこの経路の警告を捕捉できない。
+
+そこで `crates/flpdf/src/logger.rs` に、所有スレッドにだけ見える error
+pipeline の overlay（`LoggerState::error_capture` と
+`QPDFLogger::with_error_capture`）を置く。`get_error` は呼び出しスレッドが
+overlay の所有者のときだけそれを返し、他スレッドには通常の error sink を
+返す。qpdf の `QPDFLogger::getError` は 1 本の error pipeline を無条件に
+返すので、この分岐は qpdf に対応物が無い。該当箇所は
+`// qpdf-deviation:` / `// qpdf-deviation-start:` … `// qpdf-deviation-end`
+で機械可読にマークしてある。
+
+overlay が無効な通常経路の挙動は qpdf と同一で、出力バイト・warning 文言・
+配送順はいずれも変わらない。
+
 ### `QPDF::getRoot` の test_driver consumer
 
 `libqpdf/QPDF.cc:2355-2368` の `QPDF::getRoot` は trailer の `/Root` を

@@ -163,6 +163,7 @@ struct LoggerState {
     info: PipelineHandle,
     warn: Option<PipelineHandle>,
     error: PipelineHandle,
+    // qpdf-deviation: qpdf has no thread-scoped overlay on the default logger; its answer to per-thread capture is a separate QPDFLogger instance (`include/qpdf/QPDFLogger.hh:33-42`), which the contextless `defaultLogger()->getError()` warning path cannot use
     error_capture: Option<(ThreadId, PipelineHandle)>,
     save: Option<PipelineHandle>,
     stdout_used: Arc<AtomicBool>,
@@ -301,12 +302,16 @@ impl QPDFLogger {
     pub fn get_error(&self) -> Result<PipelineHandle> {
         let state = self.shared.lock();
         let current = std::thread::current().id();
+        // qpdf-deviation-start: `QPDFLogger::getError` returns the one error
+        // pipeline unconditionally; the owner-thread overlay below exists only
+        // so a qtest capture cannot swallow a concurrent thread's warnings
         Ok(state
             .error_capture
             .as_ref()
             .filter(|(owner, _)| *owner == current)
             .map(|(_, pipeline)| pipeline.clone())
             .unwrap_or_else(|| state.error.clone()))
+        // qpdf-deviation-end
     }
 
     /// Run `body` with an error pipeline visible only to the calling thread.
