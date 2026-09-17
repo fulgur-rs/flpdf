@@ -514,6 +514,15 @@ fn raw_argv_help_table_and_completion_emit_qpdf_output() {
     assert_eq!(info.lock().unwrap().bytes, qpdf_help.stdout);
 
     let (logger, info) = logger_with_info_sink();
+    let mut custom_all_help = QPDFJob::new();
+    custom_all_help.set_logger(logger);
+    custom_all_help
+        .initialize_from_raw_argv(&[b"/opt/custom-qpdf".to_vec(), b"--help=all".to_vec()])
+        .unwrap();
+    assert!(String::from_utf8_lossy(&info.lock().unwrap().bytes)
+        .starts_with("Run \"custom-qpdf --help=topic\""));
+
+    let (logger, info) = logger_with_info_sink();
     let mut completion = QPDFJob::new();
     completion.set_logger(logger);
     completion
