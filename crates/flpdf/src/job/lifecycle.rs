@@ -3438,12 +3438,6 @@ impl QPDFJob {
         if let Some(path) = self.configuration.linearize_pass1.as_deref() {
             writer_configuration.set_linearization_pass1_filename(path.to_path_buf());
         }
-        if !splitting {
-            if let Err(error) = self.prepare_writer_configuration(&mut writer_configuration) {
-                self.report_job_error(&error)?;
-                return Err(error);
-            }
-        }
         let progress_requested = self.configuration.progress;
         let write_result: Result<()> =
             if let Some(split_pages) = self.configuration.split_pages.filter(|size| *size != 0) {
@@ -3473,15 +3467,21 @@ impl QPDFJob {
             } else {
                 (|| {
                     let mut writer = PdfWriter::new(pdf);
-                    writer_configuration.apply_to(&mut writer);
-                    if progress_requested {
-                        self.configure_writer_progress(&mut writer);
-                    }
                     if output == Path::new("-") {
                         self.logger.save_to_standard_output(true)?;
                         writer.set_output_pipeline(JobOutputPipeline(self.logger.get_save()?))?;
                     } else {
                         writer.set_output_file(&output)?;
+                    }
+                    // qpdf opens the destination before applying
+                    // setWriterOptions (`QPDFJob.cc:3049-3056`). Keep
+                    // password normalization and weak-crypto validation after
+                    // that open so an unusable output path wins over a
+                    // write-time encryption refusal.
+                    self.prepare_writer_configuration(&mut writer_configuration)?;
+                    writer_configuration.apply_to(&mut writer);
+                    if progress_requested {
+                        self.configure_writer_progress(&mut writer);
                     }
                     writer.write()
                 })()

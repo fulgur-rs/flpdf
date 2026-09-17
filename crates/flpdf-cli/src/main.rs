@@ -12,13 +12,15 @@ use flpdf::job::{
 use flpdf::pipeline::{FlateAction, Pipeline, PipelineHandle, PlFlate, PlStdioFile};
 use flpdf::qutil::same_file as qpdf_same_file;
 use flpdf::writer::DecodeLevel as StreamDecodeLevel;
+#[cfg(test)]
+use flpdf::PasswordWriteNotice;
 use flpdf::{
     json_inspect::{DecodeLevel, JsonKey, JsonObjectSelector},
     normalize_content_stream, pages, parse_pdf_version, CompressStreams, CopyEncryptionSource,
     EncryptMethod, EncryptParams, Error, NewlineBeforeEndstream, ObjectHandle, ObjectKeyAlg,
-    ObjectRef, ObjectStreamMode, PasswordMode, PasswordWriteNotice, Pdf, PdfOpenOptions,
-    PdfVersion, PdfWriter, PermissionsConfig, PrintPermission, QPDFLogger, R2PermissionsConfig,
-    StreamDataMode, UsageError, WriterConfiguration,
+    ObjectRef, ObjectStreamMode, PasswordMode, Pdf, PdfOpenOptions, PdfVersion, PermissionsConfig,
+    PrintPermission, QPDFLogger, R2PermissionsConfig, StreamDataMode, UsageError,
+    WriterConfiguration,
 };
 use flpdf::{
     pages::tree_rebuild::{rebuild_page_tree, RebuildResult},
@@ -151,7 +153,7 @@ impl PipelineWriter {
 }
 
 /// CLI-owned writer configuration. The library's lower-level option bridge is
-/// intentionally private; all CLI output is configured through PdfWriter.
+/// intentionally private; final CLI output is configured through QPDFJob.
 #[derive(Debug, Clone)]
 struct WriterOptions {
     object_streams: ObjectStreamMode,
@@ -169,7 +171,6 @@ struct WriterOptions {
     recompress_flate: bool,
     compression_level: Option<i32>,
     progress: bool,
-    verbose: bool,
     static_id: bool,
     deterministic_id: bool,
     static_aes_iv: bool,
@@ -290,7 +291,6 @@ impl Default for WriterOptions {
             recompress_flate: false,
             compression_level: None,
             progress: false,
-            verbose: false,
             static_id: false,
             deterministic_id: false,
             static_aes_iv: false,
@@ -392,7 +392,6 @@ fn top_level_writer_options(
         no_original_object_ids: args.no_original_object_ids,
         preserve_unreferenced_objects: args.preserve_unreferenced,
         progress: args.progress,
-        verbose: args.verbose,
         recompress_flate: args.recompress_flate,
         compression_level,
         object_streams: args.object_streams.into(),
@@ -591,18 +590,6 @@ fn configure_top_level_inspection_transformations(
     Ok(())
 }
 
-/// Translate the CLI's effective writer options into the reusable library
-/// configuration that qpdf reapplies to every split-page output writer.
-fn writer_configuration(
-    options: &WriterOptions,
-    linearize: bool,
-    linearize_pass1: Option<&Path>,
-) -> CliResult<WriterConfiguration> {
-    let mut configuration = writer_configuration_unnormalized(options, linearize, linearize_pass1)?;
-    normalize_and_check_writer_configuration(&mut configuration, options)?;
-    Ok(configuration)
-}
-
 /// Builds a [`WriterConfiguration`] without normalizing encryption passwords
 /// or checking for weak crypto (qpdf's `maybeFixWritePassword` and the
 /// weak-crypto refusal that follows it in `QPDFJob::setEncryptionOptions`,
@@ -677,40 +664,10 @@ fn writer_configuration_unnormalized(
     Ok(configuration)
 }
 
-/// Normalizes encryption passwords and enforces the weak-crypto refusal on
-/// an already-built [`WriterConfiguration`], in qpdf's order (`maybeFixWritePassword`
-/// then the RC4 refusal, `QPDFJob::setEncryptionOptions`, `QPDFJob.cc:2748-2761`).
-///
-/// Only for callers that write through a bare [`PdfWriter`] rather than
-/// [`QPDFJob::write_qpdf`]; the latter performs this same sequence itself.
-fn normalize_and_check_writer_configuration(
-    configuration: &mut WriterConfiguration,
-    options: &WriterOptions,
-) -> CliResult<()> {
-    let notices = configuration.normalize_encryption_passwords(options.password_mode)?;
-    let prefix = progname();
-    emit_password_write_notices(&cli_logger(), &prefix, notices, options.verbose)?;
-    if !options.allow_weak_crypto
-        && options
-            .encrypt
-            .as_ref()
-            .is_some_and(EncryptParams::is_weak_rc4)
-    {
-        emit_logger_error(format!(
-            "{}: refusing to write a file with RC4, a weak cryptographic algorithm\n\
-             Please use 256-bit keys for better security.\n\
-             Pass --allow-weak-crypto to enable writing insecure files.\n\
-             See also https://qpdf.readthedocs.io/en/stable/weak-crypto.html\n",
-            progname()
-        ));
-        return Err("refusing to write a file with weak crypto".into());
-    }
-    Ok(())
-}
-
 /// Emit qpdf's per-password write diagnostics in the order returned by
 /// `QPDFJob::maybeFixWritePassword` (`QPDFJob.cc:2696-2710`). The logger is
 /// injected so the direct CLI boundary remains fallible under custom sinks.
+#[cfg(test)]
 fn emit_password_write_notices(
     logger: &QPDFLogger,
     prefix: &str,
@@ -732,58 +689,6 @@ fn emit_password_write_notices(
             PasswordWriteNotice::None | PasswordWriteNotice::Info => {}
         }
     }
-    Ok(())
-}
-
-fn configure_pdf_writer<R: Read + Seek + 'static>(
-    writer: &mut PdfWriter<'_, R>,
-    options: &WriterOptions,
-    linearize: bool,
-    linearize_pass1: Option<&Path>,
-) -> CliResult<()> {
-    writer_configuration(options, linearize, linearize_pass1)?.apply_to(writer);
-    Ok(())
-}
-
-/// Attach qpdf's logger-backed progress reporter to a direct CLI writer.
-///
-/// The event accounting remains owned by `PdfWriter`; `QPDFJob` owns the
-/// message prefix, output identity, and info/save routing just as qpdf's
-/// `setWriterOptions` does (`libqpdf/QPDFJob.cc:2926-2935`).
-fn configure_cli_progress<R: Read + Seek + 'static>(
-    writer: &mut PdfWriter<'_, R>,
-    output: &Path,
-    enabled: bool,
-) -> CliResult<()> {
-    if !enabled {
-        return Ok(());
-    }
-    let mut job = QPDFJob::new();
-    job.set_logger(cli_logger());
-    job.set_message_prefix(progname());
-    job.set_output_file(output.to_path_buf())?;
-    job.set_progress(true);
-    job.configure_writer_progress(writer);
-    Ok(())
-}
-
-fn write_with_pdf_writer<R: Read + Seek + 'static>(
-    pdf: &mut Pdf<R>,
-    output: &Path,
-    standard_output: &mut Option<PipelineWriter>,
-    options: &WriterOptions,
-    linearize: bool,
-    linearize_pass1: Option<&Path>,
-) -> CliResult<()> {
-    let mut writer = PdfWriter::new(pdf);
-    configure_pdf_writer(&mut writer, options, linearize, linearize_pass1)?;
-    configure_cli_progress(&mut writer, output, options.progress)?;
-    if let Some(sink) = standard_output.take() {
-        writer.set_output_writer(sink)?;
-    } else {
-        writer.set_output_file(output)?;
-    }
-    writer.write()?;
     Ok(())
 }
 
@@ -3695,7 +3600,6 @@ fn main() {
             no_original_object_ids: args.no_original_object_ids,
             preserve_unreferenced_objects: args.preserve_unreferenced,
             progress: args.progress,
-            verbose: args.verbose,
             recompress_flate: args.recompress_flate,
             compression_level: top_level_compression_level,
             object_streams: args.object_streams.into(),
@@ -5314,7 +5218,6 @@ fn run_command(command: Commands, overlay_specs: &[OverlaySpec]) -> CliResult<()
                 no_original_object_ids: cmd.no_original_object_ids,
                 preserve_unreferenced_objects: cmd.preserve_unreferenced,
                 progress: cmd.progress,
-                verbose: cmd.verbose,
                 // `--qdf` and `--deterministic-id` configure the canonical writer's
                 // output preparation directly.
                 qdf: cmd.qdf,
@@ -5391,7 +5294,7 @@ fn run_command(command: Commands, overlay_specs: &[OverlaySpec]) -> CliResult<()
                 // would make the command partially succeed; reject the
                 // unsupported combinations loudly instead. Writer settings,
                 // including explicit --encrypt and content normalization, are
-                // applied by the final PdfWriter and are therefore accepted
+                // applied by the final QPDFJob writer and are therefore accepted
                 // here.
                 // --coalesce-contents is handled separately below: it is a
                 // page transformation with the same post-selection owner as
@@ -8573,8 +8476,8 @@ fn run_page_extraction_after_plan<R: Read + Seek + 'static>(
     linearize: bool,
     linearize_pass1: Option<&Path>,
     verbose: bool,
-    mut standard_output: Option<PipelineWriter>,
-    creates_output: bool,
+    _standard_output: Option<PipelineWriter>,
+    _creates_output: bool,
     primary_encrypted: bool,
     primary_copy_encryption: Option<CopyEncryptionSource>,
     prior_warnings: bool,
@@ -8768,28 +8671,44 @@ fn run_page_extraction_after_plan<R: Read + Seek + 'static>(
         if prior_warnings {
             split_job.record_warnings();
         }
-        return match split_job.write_qpdf(pdf) {
+        match split_job.write_qpdf(pdf) {
             Ok(()) => finish_job_exit_status(split_job.get_exit_code()),
             Err(_) => Err(Box::new(CliExitError {
                 code: ExitCode::Errors,
                 message: String::new(),
             })),
-        };
+        }
     } else {
-        let announce_file = standard_output.is_none();
-        write_with_pdf_writer(
-            pdf,
-            output,
-            &mut standard_output,
+        // qpdf keeps the ordinary page-operation output on the same
+        // QPDFJob::writeQPDF -> writeOutfile boundary as a plain rewrite
+        // (`QPDFJob.cc:483-511,3029-3091`). The page-selection and
+        // post-plan transformation stages above already mutated this live
+        // document; this final Job only owns writer setup, completion, and
+        // status so no CLI-local PdfWriter route remains.
+        let mut write_job = new_cli_job(no_warn);
+        write_job.set_input_file(input_path.to_path_buf())?;
+        write_job.set_output_file(output.to_path_buf())?;
+        write_job.set_verbose(verbose);
+        write_job.set_progress(options.progress);
+        write_job.set_password_mode(options.password_mode);
+        write_job.set_allow_weak_crypto(options.allow_weak_crypto);
+        write_job.set_linearization(linearize, linearize_pass1.map(std::path::Path::to_path_buf));
+        write_job.set_writer_configuration(writer_configuration_unnormalized(
             &options,
             linearize,
             linearize_pass1,
-        )?;
-        if verbose && announce_file {
-            logger_info(wrote_file_message(&progname(), output))?;
+        )?);
+        if prior_warnings {
+            write_job.record_warnings();
+        }
+        match write_job.write_qpdf(pdf) {
+            Ok(()) => finish_job_exit_status(write_job.get_exit_code()),
+            Err(_) => Err(Box::new(CliExitError {
+                code: ExitCode::Errors,
+                message: String::new(),
+            })),
         }
     }
-    finish_operation_warnings_with_prior(pdf, creates_output, prior_warnings)
 }
 
 /// Parse `--split-pages[=n]` (default 1; qpdf-compatible).
@@ -10182,16 +10101,6 @@ fn path_description(input: &Path) -> Vec<u8> {
 #[cfg(not(unix))]
 fn path_description(input: &Path) -> Vec<u8> {
     input.to_string_lossy().into_owned().into_bytes()
-}
-
-/// Build qpdf's `<prefix>: wrote file <output>` line with the output name's
-/// raw bytes (`QPDFJob.cc:3059-3062`); `Path::display()` would replace
-/// non-UTF-8 bytes with U+FFFD.
-fn wrote_file_message(prefix: &str, output: &Path) -> Vec<u8> {
-    let mut message = format!("{prefix}: wrote file ").into_bytes();
-    message.extend_from_slice(&path_description(output));
-    message.push(b'\n');
-    message
 }
 
 /// Program name used in qpdf-parity diagnostic prefixes.

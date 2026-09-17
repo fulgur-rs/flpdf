@@ -48,7 +48,7 @@
 #   compute_data_key            C17（reader/writer 共通 primitive）
 #   write                       D1 + D26
 #   write_qpdf                  E-3 + E-4
-#   write_qpdf_to_memory        D30（writer.rs, test-only）+ E-4（flpdf-cli の同名別関数）
+#   write_qpdf_to_memory        D30（writer.rs, test-only）
 #   write_json_with_version     E-6（QPDFJob メソッド）。E-24 free 関数は flpdf-xsq1 で撤去
 #   finish_file_object_handle   B9 + B10
 #   append_xref_and_trailer     D12 + D13
@@ -178,7 +178,7 @@ crates/flpdf/src/writer/object_streams/eligibility.rs::get_compressible_objgens 
 crates/flpdf/src/writer/object.rs::write_trailer_with_ref_map            # D14 第 2 の trailer 書き出し
 crates/flpdf/src/linearization/writer.rs::write_linearized               # D19 test-only 入口
 crates/flpdf/src/writer/plain/plan.rs::build_live_object_stream_plan       # D29 current setup membership owner
-crates/flpdf/src/writer.rs::write_qpdf_to_memory                         # D30 test-only + CLI 同名衝突
+crates/flpdf/src/writer.rs::write_qpdf_to_memory                         # D30 test-only
 
 # --- (b) baseline denominator ---
 crates/flpdf/src/writer.rs::PdfWriter::write                             # D1/D26（曖昧 leaf `write`）
@@ -205,7 +205,6 @@ crates/flpdf/src/writer/plain/plan.rs::retain_reachable_object_stream_members   
 # ===========================================================================
 
 # --- (a) deletable route ---
-crates/flpdf-cli/src/main.rs::write_with_pdf_writer                      # E-4 CLI 直書き出し
 crates/flpdf/src/job/attachment_list.rs::format_attachment_list_with_sink # E-9
 crates/flpdf/src/job/acroform_field_prune.rs::prune_acroform_after_subset # E-26（pub(crate) free implementation + method owner）
 

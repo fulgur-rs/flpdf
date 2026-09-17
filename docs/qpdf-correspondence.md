@@ -2190,8 +2190,8 @@ CLI の page-operation route も同じ順序を保つ。qpdf は `createQPDF` �
 `--pages` / `--rotate` / `--flatten-rotation` を文書へ適用した後、
 `writeQPDF` の `setWriterOptions` で linearization を設定する
 （`QPDFJob.cc:450-507,2137-2248,2847-2945`）。flpdf は page selection と
-rotation の完了後に `write_with_pdf_writer(..., linearize, linearize_pass1)`
-へ渡し、`--split-pages` では `doSplitPages` 相当の各 chunk writer に同じ
+rotation の完了後に `QPDFJob::write_qpdf` へ渡し、`--split-pages` では
+`doSplitPages` 相当の各 chunk writer に同じ
 linearization 設定を再適用する（`QPDFJob::write_qpdf` と
 `crates/flpdf/src/job/page_split.rs`）。rewrite の linearized branch でも
 `--flatten-rotation` を writer planning 前に実行する。
@@ -2385,9 +2385,9 @@ logger consumer に移行済みである。
 `handleTransformations` 内で `addAttachments` / `removeEmbeddedFile` を完了してから
 `writeOutfile` を呼び、`setWriterOptions` の全設定を一度だけ適用する
 （`QPDFJob.cc:2137-2248,2847-2945,3029-3058`）。flpdf の
-`run_add_attachment` / `run_remove_attachment` は mutation 後に
-`normalize_page_contents` を実行し、`top_level_writer_options` から
-`writer_configuration` を経由して `write_with_pdf_writer` へ渡すため、
+`run_all_attachment_mutations` は `configure_attachment_job` と
+`run_configured_attachment_job` を通じて mutation を Job に積み、
+`QPDFJob::create_qpdf` → `QPDFJob::write_qpdf` へ渡すため、
 `--stream-data`、`--decode-level`、`--newline-before-endstream`、ObjStm、QDF、
 encryption、decrypt、linearization、version、ID、progress を attachment output にも
 適用する。`QPDFWriter.cc:1538-1564,1735-1755` の stream/object-stream framing と
@@ -2400,9 +2400,8 @@ qpdf は成功した removal を `doIfVerbose` で報告し、`writeOutfile` の
 raw bytes を保持した info/error message と同じ completion order を使う。
 
 上記の旧 `flpdf-5nle` 記述は `flpdf-3yn9.48.81`（2026-09-10）で
-supersede された。現在の `run_add_attachment` / `run_remove_attachment` /
-`run_copy_attachments_from` は direct `PdfWriter`、手動 normalization、手動
-warning completionを持たず、`QPDFJobConfig`へ設定して
+supersede された。現在の `run_all_attachment_mutations` は direct `PdfWriter`、手動
+normalization、手動 warning completionを持たず、`QPDFJobConfig`へ設定して
 `QPDFJob::create_qpdf` → `QPDFJob::write_qpdf`へ渡す。これにより
 `handleTransformations` の remove → add → copy 順、全 writer option、donorの
 per-file direct open（`open_job_source`）、stdout予約、warning summary、

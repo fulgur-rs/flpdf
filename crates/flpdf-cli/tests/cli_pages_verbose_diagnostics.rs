@@ -383,6 +383,71 @@ fn rewrite_pages_split_opens_output_before_weak_crypto_validation() {
     assert!(!String::from_utf8_lossy(&flpdf.stderr).contains("weak cryptographic algorithm"));
 }
 
+#[test]
+fn rewrite_pages_ordinary_output_opens_before_weak_crypto_validation() {
+    if !qpdf_available() {
+        return;
+    }
+
+    let temp = tempfile::tempdir().expect("temporary directory");
+    let input = fixture("three-page.pdf");
+    let output = temp.path().join("missing-directory").join("ordinary.pdf");
+    let input = input.to_str().unwrap().to_owned();
+    let output = output.to_str().unwrap().to_owned();
+    let qpdf_args = vec![
+        "--encrypt".to_owned(),
+        "user".to_owned(),
+        "owner".to_owned(),
+        "128".to_owned(),
+        "--".to_owned(),
+        input.clone(),
+        "--pages".to_owned(),
+        input.clone(),
+        "1".to_owned(),
+        "--".to_owned(),
+        output,
+    ];
+    let mut flpdf_args = vec!["rewrite".to_owned()];
+    flpdf_args.extend(qpdf_args.iter().cloned());
+
+    let qpdf = run_qpdf(&qpdf_args);
+    let flpdf = run_flpdf(&flpdf_args);
+
+    assert_eq!(flpdf.status.code(), qpdf.status.code());
+    assert_eq!(
+        normalize_text_newlines(&flpdf.stdout),
+        normalize_text_newlines(&qpdf.stdout),
+        "ordinary output-open failure must not emit writer diagnostics"
+    );
+    assert_eq!(
+        normalize_text_newlines(&flpdf.stderr),
+        normalize_text_newlines(&qpdf.stderr),
+        "ordinary output-open failure must precede qpdf's weak-crypto validation"
+    );
+    assert!(!String::from_utf8_lossy(&flpdf.stderr).contains("weak cryptographic algorithm"));
+}
+
+#[test]
+fn rewrite_pages_ordinary_output_uses_the_canonical_job_writer_route() {
+    let source = include_str!("../src/main.rs");
+    let start = source
+        .find("fn run_page_extraction_after_plan")
+        .expect("page extraction completion route should remain named");
+    let body = source[start..]
+        .split_once("\n/// Parse `--split-pages")
+        .expect("split parser should follow the page extraction route")
+        .0;
+
+    assert!(
+        body.matches("write_qpdf(").count() >= 2,
+        "ordinary and split page outputs must use the Job writer boundary"
+    );
+    assert!(
+        !body.contains("write_with_pdf_writer("),
+        "page extraction must not retain a direct PdfWriter output route"
+    );
+}
+
 #[cfg(target_os = "linux")]
 #[test]
 fn verbose_pages_preserves_non_utf8_source_and_output_path_bytes() {

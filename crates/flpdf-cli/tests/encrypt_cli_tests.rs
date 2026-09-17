@@ -1048,7 +1048,14 @@ fn encrypt_key_len_40_v1_rc4_requires_allow_weak_crypto() {
         .failure()
         .stderr(predicates::str::contains("RC4"))
         .stderr(predicates::str::contains("--allow-weak-crypto"));
-    assert!(!output.exists(), "no output without --allow-weak-crypto");
+    // qpdf opens the named destination before applying write-time weak-crypto
+    // validation, leaving the newly created output empty when that validation
+    // rejects the write.
+    assert!(
+        output.exists(),
+        "qpdf opens the output before weak-crypto refusal"
+    );
+    assert_eq!(std::fs::metadata(&output).unwrap().len(), 0);
 
     // With --allow-weak-crypto it succeeds and qpdf reports R=2 (V=1 RC4-40).
     if !ensure_qpdf_or_skip() {
@@ -1251,7 +1258,14 @@ fn encrypt_128_no_aes_is_v2_rc4_gated_by_weak_crypto() {
         .failure()
         .stderr(predicates::str::contains("RC4"))
         .stderr(predicates::str::contains("--allow-weak-crypto"));
-    assert!(!output.exists(), "no output without --allow-weak-crypto");
+    // qpdf opens the named destination before applying write-time weak-crypto
+    // validation, leaving the newly created output empty when that validation
+    // rejects the write.
+    assert!(
+        output.exists(),
+        "qpdf opens the output before weak-crypto refusal"
+    );
+    assert_eq!(std::fs::metadata(&output).unwrap().len(), 0);
 
     if !ensure_qpdf_or_skip() {
         return;
