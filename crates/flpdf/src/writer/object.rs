@@ -2828,7 +2828,15 @@ fn is_direct_scalar_value(value: &ObjectValue) -> bool {
 }
 
 fn is_direct_scalar_handle(handle: &ObjectHandle) -> bool {
-    handle.is_direct() && handle.with_value(|value| value.is_some_and(is_direct_scalar_value))
+    // `is_direct()` is not the predicate this fast path needs. qpdf treats
+    // object number 0 as non-indirect, so a handle carrying a raw `0 G`
+    // identity answers `is_direct() == true` while
+    // `write_child_with_dynamic_ref_map_and_string_writer` emits `null` for
+    // it (`!object_gen.is_indirect()`). Require the absence of any raw
+    // identity so such a child keeps taking the slow path and the two routes
+    // agree byte for byte.
+    handle.qpdf_obj_gen().is_none()
+        && handle.with_value(|value| value.is_some_and(is_direct_scalar_value))
 }
 
 fn write_direct_scalar_with_string_writer<F>(
@@ -5824,6 +5832,47 @@ mod tests {
             })
             .is_err()
         );
+    }
+
+    /// A raw object-zero identity must keep taking the slow path.
+    ///
+    /// qpdf treats object number 0 as non-indirect, so such a handle answers
+    /// `is_direct() == true`; the child writer nonetheless emits `null` for
+    /// it (`!object_gen.is_indirect()`). If the direct-scalar fast path
+    /// accepted it, the array would serialize the value instead and the two
+    /// routes would disagree byte for byte.
+    #[test]
+    fn object_zero_child_serializes_as_null_through_the_scalar_container_route() -> Result<()> {
+        let zero = ObjectHandle::new_indirect_unresolved(ObjectRef::new(0, 0), -1);
+        zero.set_resolved(ObjectValue::Integer(42));
+        assert!(zero.is_direct(), "qpdf reports object zero as non-indirect");
+        assert!(
+            zero.qpdf_obj_gen().is_some(),
+            "the raw identity survives that predicate"
+        );
+
+        let array = ObjectHandle::array(vec![zero, ObjectHandle::integer(7)]);
+        let mut map = |_: &ObjectHandle| Ok::<ObjectRef, Error>(ObjectRef::new(1, 0));
+        let mut strings = |out: &mut OutputSink<'_>, value: &[u8]| {
+            crate::pdf_syntax::write_string_value(out, value)
+        };
+        let mut direct_stream_writer = DefaultDynamicDirectStreamWriter {
+            newline_before_endstream: None,
+            qdf_mode: false,
+        };
+        let mut bytes = Vec::new();
+        super::super::output::with_buffer_sink(&mut bytes, |out| {
+            write_child_with_dynamic_ref_map_and_string_writer(
+                &array,
+                out,
+                &mut map,
+                &BTreeSet::new(),
+                &mut strings,
+                &mut direct_stream_writer,
+            )
+        })?;
+        assert_eq!(bytes, b"[ null 7 ]");
+        Ok(())
     }
 
     #[test]
