@@ -1672,21 +1672,7 @@ impl<R: Read + Seek> ResolverHandle<R> {
     /// prepared.
     fn resolve_xref_table(&self) -> Result<bool> {
         let may_change = !self.reconstructed_xref();
-        for object_ref in self.xref_refs() {
-            let handle = self.get_object_handle(object_ref);
-            if handle.is_resolved() {
-                continue;
-            }
-            handle.try_dereference()?;
-            if may_change && self.reconstructed_xref() {
-                return Ok(false);
-            }
-        }
-        // qpdf walks the raw xref table, not only the parsed indirect-reference
-        // projection. Rows such as object 5 generation 65536 cannot mint an
-        // ObjectRef, but they still must reach the same offset/header/recovery
-        // boundary so qpdf's expected-generation diagnostics are preserved.
-        for (object_gen, entry) in self.raw_xref_entries() {
+        for (object_gen, entry) in self.effective_xref_entries() {
             if object_gen == QpdfObjGen::new(0, 0) {
                 let handle = self.get_object_handle_qpdf_obj_gen(object_gen);
                 match entry {
@@ -1714,9 +1700,24 @@ impl<R: Read + Seek> ResolverHandle<R> {
                 }
                 continue;
             }
+
             if object_gen.to_object_ref().is_some() {
+                let handle = self.get_object_handle_qpdf_obj_gen(object_gen);
+                if handle.is_resolved() {
+                    continue;
+                }
+                self.resolve_qpdf_obj_gen(object_gen, &handle)?;
+                if may_change && self.reconstructed_xref() {
+                    return Ok(false);
+                }
                 continue;
             }
+
+            // qpdf walks the raw xref table, not only the parsed
+            // indirect-reference projection. Rows such as object 5 generation
+            // 65536 cannot mint an ObjectRef, but they still reach the same
+            // offset/header/recovery boundary so qpdf's expected-generation
+            // diagnostics are preserved.
             let XrefEntry::Uncompressed { offset } = entry else {
                 continue;
             };
@@ -2617,6 +2618,63 @@ impl<R: Read + Seek> ResolverHandle<R> {
         entries
     }
 
+    fn effective_xref_entries(&self) -> Vec<(QpdfObjGen, XrefEntry)> {
+        #[cfg(test)]
+        EFFECTIVE_XREF_SNAPSHOT_CONSTRUCTIONS.with(|constructions| {
+            constructions.set(constructions.get() + 1);
+        });
+
+        let core = self.core.borrow();
+        let mut entries = Vec::with_capacity(
+            core.raw_source_xref_entries.len() + core.default_xref_entries.len(),
+        );
+        let mut raw = core.raw_source_xref_entries.iter().peekable();
+        let mut defaults = core.default_xref_entries.iter().peekable();
+        loop {
+            match (raw.peek().copied(), defaults.peek().copied()) {
+                (Some((raw_object_gen, _)), Some(default_object_gen)) => {
+                    match raw_object_gen.cmp(default_object_gen) {
+                        std::cmp::Ordering::Less => {
+                            let Some((object_gen, entry)) = raw.next() else {
+                                break; // cov:ignore: peeked raw iterator cannot be empty before next
+                            };
+                            entries.push((*object_gen, *entry));
+                        }
+                        std::cmp::Ordering::Equal => {
+                            let Some((object_gen, entry)) = raw.next() else {
+                                break; // cov:ignore: peeked raw iterator cannot be empty before next
+                            };
+                            let Some(_) = defaults.next() else {
+                                break; // cov:ignore: peeked default iterator cannot be empty before next
+                            };
+                            entries.push((*object_gen, *entry));
+                        }
+                        std::cmp::Ordering::Greater => {
+                            let Some(object_gen) = defaults.next() else {
+                                break; // cov:ignore: peeked default iterator cannot be empty before next
+                            };
+                            entries.push((*object_gen, XrefEntry::Free { next: 0 }));
+                        }
+                    }
+                }
+                (Some(_), None) => {
+                    let Some((object_gen, entry)) = raw.next() else {
+                        break; // cov:ignore: peeked raw iterator cannot be empty before next
+                    };
+                    entries.push((*object_gen, *entry));
+                }
+                (None, Some(_)) => {
+                    let Some(object_gen) = defaults.next() else {
+                        break; // cov:ignore: peeked default iterator cannot be empty before next
+                    };
+                    entries.push((*object_gen, XrefEntry::Free { next: 0 }));
+                }
+                (None, None) => break,
+            }
+        }
+        entries
+    }
+
     fn object_stream_description_template(
         &self,
         stream_number: u32,
@@ -3492,6 +3550,10 @@ impl<R: Read + Seek> ResolverHandle<R> {
         } else {
             start.saturating_add(token.start as u64)
         };
+        // QPDFTokenizer::nextToken updates InputSource::last_offset to the
+        // token start after skipping whitespace/comments. Keep the shared
+        // source state at that same boundary; seek() only moves the cursor.
+        self.set_last_offset(token_start);
         Ok((token, token_start))
     }
 
@@ -4108,17 +4170,12 @@ impl<R: Read + Seek> ResolverHandle<R> {
             )?; // cov:ignore: LLVM attributes the covered raw framing-warning call terminator to a zero-count continuation region
         }
 
-        // qpdf's lazy stream parser leaves InputSource::last_offset at the
-        // stream-data start after a successful readStream boundary. The Rust
-        // parser scans through endstream/endobj to retain exact extents, so
-        // restore that observable qpdf position after the same successful
-        // validation (`QPDF.cc:1360-1399`).
-        self.core
-            .borrow()
-            .input
-            .borrow()
-            .last_offset
-            .set(stream_offset);
+        // `readObject` has already consumed the trailing token after
+        // `readStream`, so the shared InputSource last offset is the endobj
+        // position on the successful path, matching qpdf
+        // (`QPDF.cc:1330-1357`). Do not restore stream_offset here; qpdf only
+        // performs an explicit last-offset reset for readTrailer
+        // (`QPDF.cc:1325-1326`).
 
         let dict = self.direct_object_handle(dict);
         dict.set_parsed_offset_if_unset(dict_offset);
@@ -5597,6 +5654,16 @@ impl<R: Read + Seek> ResolverHandle<R> {
             }
         }
     }
+}
+
+#[cfg(test)]
+thread_local! {
+    static EFFECTIVE_XREF_SNAPSHOT_CONSTRUCTIONS: Cell<usize> = const { Cell::new(0) };
+}
+
+#[cfg(test)]
+fn effective_xref_snapshot_constructions_for_test() -> usize {
+    EFFECTIVE_XREF_SNAPSHOT_CONSTRUCTIONS.with(Cell::get)
 }
 
 #[cfg(test)]
@@ -9270,6 +9337,69 @@ mod tests {
     }
 
     #[test]
+    fn fix_dangling_references_builds_one_effective_xref_snapshot() {
+        let pdf = Pdf::open_mem_owned(minimal_pdf_bytes()).expect("open");
+        let snapshots_before = super::effective_xref_snapshot_constructions_for_test();
+
+        pdf.resolver
+            .fix_dangling_references()
+            .expect("minimal xref table resolves without reconstruction");
+
+        assert_eq!(
+            super::effective_xref_snapshot_constructions_for_test(),
+            snapshots_before + 1,
+            "one qpdf effective-xref pass must use one contiguous snapshot"
+        );
+    }
+
+    #[test]
+    fn effective_xref_snapshot_merges_raw_and_default_rows_in_qpdf_order() {
+        let resolver = bare_resolver();
+        resolver.install_raw_xref_entries(BTreeMap::from([
+            (
+                QpdfObjGen::new(1, 0),
+                XrefEntry::Uncompressed { offset: 11 },
+            ),
+            (
+                QpdfObjGen::new(3, 0),
+                XrefEntry::Compressed {
+                    stream: 9,
+                    index: 2,
+                },
+            ),
+            (QpdfObjGen::new(4, 0), XrefEntry::Free { next: 0 }),
+        ]));
+        resolver.insert_default_xref_entry_for_test(ObjectRef::new(2, 0));
+        resolver.insert_default_xref_entry_for_test(ObjectRef::new(3, 0));
+        resolver.insert_default_xref_entry_for_test(ObjectRef::new(5, 0));
+
+        let entries = resolver.effective_xref_entries();
+
+        assert_eq!(
+            entries
+                .iter()
+                .map(|(object_gen, _)| *object_gen)
+                .collect::<Vec<_>>(),
+            [
+                QpdfObjGen::new(1, 0),
+                QpdfObjGen::new(2, 0),
+                QpdfObjGen::new(3, 0),
+                QpdfObjGen::new(4, 0),
+                QpdfObjGen::new(5, 0),
+            ]
+        );
+        assert_eq!(entries[1].1, XrefEntry::Free { next: 0 });
+        assert_eq!(
+            entries[2].1,
+            XrefEntry::Compressed {
+                stream: 9,
+                index: 2,
+            }
+        );
+        assert_eq!(entries[4].1, XrefEntry::Free { next: 0 });
+    }
+
+    #[test]
     fn disconnect_all_clears_xref_before_destroying_canonical_handles() {
         let mut pdf = Pdf::open_mem_owned(minimal_pdf_bytes()).expect("open");
         let handle = pdf.get_object_handle(ObjectRef::new(1, 0));
@@ -11821,6 +11951,40 @@ mod tests {
         assert!(
             pdf.resolver.core.borrow().resolving.is_empty(),
             "the mark must be gone once the outer resolution returns its error"
+        );
+    }
+
+    #[test]
+    fn successful_stream_parse_keeps_endobj_as_last_source_offset() {
+        let bytes = pdf_with_bodies(&[
+            b"1 0 obj\n<< /Type /Catalog /Metadata 2 0 R >>\nendobj\n".to_vec(),
+            b"2 0 obj\n<< /Length 3 0 R >>\nstream\nabc\nendstream\nendobj\n".to_vec(),
+            b"3 0 obj\n3\nendobj\n".to_vec(),
+        ]);
+        let object_start = bytes
+            .windows(b"2 0 obj".len())
+            .position(|window| window == b"2 0 obj")
+            .expect("stream object header");
+        let endobj_start = object_start
+            + bytes[object_start..]
+                .windows(b"endobj".len())
+                .position(|window| window == b"endobj")
+                .expect("stream object endobj");
+        let expected_last_offset = (endobj_start
+            + b"endobj".len()
+            + bytes[endobj_start + b"endobj".len()..]
+                .iter()
+                .position(|byte| !byte.is_ascii_whitespace())
+                .expect("byte after stream object")) as u64;
+        let mut pdf = Pdf::open(Cursor::new(bytes)).expect("open valid stream fixture");
+        let stream = pdf.get_object_handle(ObjectRef::new(2, 0));
+
+        stream.try_dereference().expect("resolve stream");
+        assert!(stream.as_stream_dict().is_some());
+        assert_eq!(
+            pdf.source_last_offset(),
+            expected_last_offset,
+            "successful readObject must leave the source offset after endobj whitespace"
         );
     }
 

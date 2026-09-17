@@ -615,6 +615,26 @@ fn test_93_drains_the_repair_warning_from_resolving_a_malformed_root() {
 }
 
 #[test]
+fn test_9_drains_the_repair_warning_from_resolving_a_malformed_root() {
+    let directory = tempfile::tempdir().expect("temporary directory");
+    let input = directory.path().join("recoverable-bad-root.pdf");
+    fs::write(&input, recoverable_non_dictionary_root_pdf())
+        .expect("write recoverable malformed root fixture");
+    let input = input.to_str().expect("utf-8 temporary path");
+    let expected = format!(
+        "WARNING: {input} (object 1 0, offset 19): expected endobj\n\
+         {input}: unable to find /Root dictionary\n"
+    );
+
+    driver()
+        .args(["9", input])
+        .assert()
+        .code(2)
+        .stdout("")
+        .stderr(expected);
+}
+
+#[test]
 fn test_52_drains_the_repair_warning_before_a_terminal_root_error() {
     let directory = tempfile::tempdir().expect("temporary directory");
     let input = directory.path().join("recoverable-bad-root.pdf");
@@ -1471,11 +1491,11 @@ fn qtest_accessor_cases_do_not_use_explicit_pdf_resolve() {
     );
     assert!(
         !test_2.contains("resolve_handle("),
-        "test 2 retains the qpdf-less explicit resolve_handle bridge"
+        "test 2 must not retain the qpdf-less explicit resolve_handle bridge"
     );
     assert!(
-        early_source.contains("fn resolve_handle"),
-        "the shared resolve_handle helper was removed with test 2's caller"
+        !early_source.contains("fn resolve_handle"),
+        "the shared resolve_handle helper must be removed after all callers are cut over"
     );
     let test_4 = section(
         early_source.as_str(),
@@ -1510,7 +1530,7 @@ fn qtest_accessor_cases_do_not_use_explicit_pdf_resolve() {
     );
     assert!(
         !test_6.contains("resolve_handle("),
-        "test 6 retains the qpdf-less explicit resolve_handle bridge"
+        "test 6 must not retain the qpdf-less explicit resolve_handle bridge"
     );
     assert!(
         test_6.contains("type_code()") && test_6.contains("pipe_stream_data("),
@@ -1533,12 +1553,16 @@ fn qtest_accessor_cases_do_not_use_explicit_pdf_resolve() {
             && test_8.contains("type_code()"),
         "tests 7 and 8 must use the canonical resolving stream predicate without a caller-side bridge"
     );
-    let test_9_start = early_source
-        .find("pub(crate) fn run_test_9")
-        .expect("test 9 source section");
+    let test_9 = section(
+        early_source.as_str(),
+        "pub(crate) fn run_test_9",
+        "#[cfg(test)]",
+    );
     assert!(
-        early_source[test_9_start..].contains("resolve_handle("),
-        "test 9 must retain its separate explicit root resolution"
+        test_9.contains("pdf.root_handle()")
+            && !test_9.contains("resolve_handle(")
+            && !test_9.contains("try_get_key(b\"/Root\")"),
+        "test 9 must use the canonical resolving root boundary without a caller-side bridge"
     );
     let test_3 = section(
         early_source.as_str(),
@@ -1739,8 +1763,8 @@ fn qtest_accessor_cases_do_not_use_explicit_pdf_resolve() {
         "test 87 must enumerate keys through the canonical resolving accessor"
     );
     assert!(
-        early_source[test_9_start..].contains("resolve_handle("),
-        "test 9 lost the explicit resolution retained for the out-of-scope path"
+        !early_source.contains("fn resolve_handle") && !early_source.contains("resolve_handle("),
+        "the qpdf-less resolve_handle helper must be removed after caller-zero"
     );
 
     let test_71 = section(

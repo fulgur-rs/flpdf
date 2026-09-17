@@ -37,21 +37,9 @@ use crate::output::write_bytes;
 // `try_get_array_as_vector` (`crates/flpdf/src/object_handle.rs`) -- is
 // already `pub` and already resolves its own receiver, so this file calls
 // those directly wherever qpdf's test driver calls their qpdf counterpart.
-// `resolve_handle` below is still needed for the handful of sites that read
-// a handle through an accessor with no warning-emitting counterpart at all
-// (`type_code`, `pipe_stream_data`) or that merely gate on a
-// non-throwing `isX()`-shaped check (`is_null`), where qpdf's own
-// dereference-before-use has no separate warning to reproduce.
-//
-// `Pdf::resolve`'s underlying `ObjectHandle::try_dereference`
-// is a documented no-op for an already-direct or already-resolved handle,
-// so calling `resolve_handle` on one that happens to be resolved already
-// (for example, one returned by `PageDocumentHelper::get_all_pages`, whose
-// own repair walk may have already touched it) costs nothing.
-
-fn resolve_handle<R: Read + Seek>(pdf: &mut Pdf<R>, handle: &ObjectHandle) -> flpdf::Result<()> {
-    pdf.resolve(handle)
-}
+// The test_2 through test_9 consumers use the resolving canonical accessors
+// directly. This keeps the qpdf receiver-resolution boundary at the accessor
+// that owns it instead of introducing a caller-side Pdf::resolve bridge.
 
 /// qpdf source: `qpdf/test_driver.cc:286-308` (`test_2`).
 ///
@@ -615,15 +603,16 @@ pub(crate) fn run_test_8<R: Read + Seek>(
 /// the literal byte string below is that same 20-byte payload.
 pub(crate) fn run_test_9<R: Read + Seek>(
     pdf: &mut Pdf<R>,
-    _filename: &[u8],
+    filename: &[u8],
     _arg2: Option<&std::ffi::OsStr>,
     stdout: &mut dyn Write,
-    _stderr: &mut dyn Write,
-    _diagnostics_written: &mut usize,
+    stderr: &mut dyn Write,
+    diagnostics_written: &mut usize,
 ) -> flpdf::Result<()> {
-    let trailer = pdf.trailer();
-    let root = trailer.try_get_key(b"/Root")?;
-    resolve_handle(pdf, &root)?;
+    let root = pdf.root_handle();
+    emit_new_diagnostics(pdf, diagnostics_written, filename, stdout, stderr)
+        .map_err(Error::from)?;
+    let root = root?;
 
     let qstream = pdf.new_stream_with_data(Rc::new(b"data for new stream\n".to_vec()))?;
     let rstream = pdf.new_stream()?;

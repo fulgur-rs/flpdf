@@ -3795,12 +3795,24 @@ qpdfのlinearization writerはpage-tree preparationとstream/object setupの後�
 そのまま`qpdf_e_pages`へ渡す（`QPDF_pages.cc:77-107`）。
 
 flpdfはlinearized writer setupでcanonical page preparationを`getObjectCount`前に置き、
-lazy stream parserの成功した`readStream`境界ではqpdfと同じstream-data offsetを
-`InputSource::last_offset`へ復元する。これにより`filter-on-write-out.pdf`の
+successful `readObject` framing後の`InputSource::last_offset`をqpdfの
+endobj/end-after-space境界へ保持する。linearization probeが必要とする
+payload-relative offsetは共有source stateとは別に扱う。これにより`filter-on-write-out.pdf`の
 `no pages found`（offset 331）と`pages-loop.pdf`の循環（object 3 0）をqpdfと一致させる。
 通常rewrite/checkのdiagnosticsは変更せず、q2nkaが所有するlinearized stream probe後の
 stop-on-error consumer境界だけを固定する。
 
+### Stream readObject last-offset ownership (`flpdf-o5pr0`, 2026-09-17)
+
+qpdf's `readStream` validates the payload boundary and `endstream`, then
+`readObject` consumes the following `endobj` token. The shared InputSource
+last offset therefore remains at qpdf's post-endobj framing boundary; qpdf
+resets it explicitly only for `readTrailer`
+(`libqpdf/QPDF.cc:1312-1328,1330-1357,1360-1399`; `QPDFTokenizer.cc:920-965`).
+flpdf now updates the shared last-offset state at the live trailing-token
+boundary and no longer rewinds every successful stream parse to payload start.
+The self-referential `/Length` recovery remains qpdf-identical, while a valid
+indirect-length stream regression asserts the post-endobj source offset.
 ### qtest 診断キャプチャのスレッド限定 error overlay (`flpdf-39jj2`, 2026-09-17)
 
 **逸脱分類 (C): qpdf に対応物が一切ない flpdf 固有の挙動。出力バイトには影響しない。**
