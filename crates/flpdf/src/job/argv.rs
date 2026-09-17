@@ -31,7 +31,7 @@ pub(super) fn initialize(job: &mut QPDFJob, argv: Vec<Vec<u8>>) -> Result<()> {
     // override.
     let program = expanded
         .first()
-        .map_or_else(|| String::from("qpdf"), |argv0| program_name(argv0));
+        .map_or_else(String::new, |argv0| program_name(argv0));
     job.set_message_prefix(program);
 
     if expanded.len() == 2 && handle_sole_help_option(job, &expanded[0], &expanded[1])? {
@@ -2113,17 +2113,24 @@ fn known_help_target(value: &[u8]) -> bool {
     value == b"all" || QPDF_HELP_TOPICS.contains(&value) || QPDF_HELP_OPTIONS.contains(&value)
 }
 
-fn program_name(argv0: &[u8]) -> String {
-    let name = argv0
-        .rsplit(|byte| *byte == b'/' || *byte == b'\\')
-        .next()
-        .filter(|name| !name.is_empty())
-        .unwrap_or(b"qpdf");
+fn program_name_bytes(argv0: &[u8]) -> &[u8] {
+    // qpdf's getWhoami checks the last '/' first and only falls back to the
+    // last '\\' when no '/' exists (QUtil.cc:788-803).
+    let separator = argv0
+        .iter()
+        .rposition(|byte| *byte == b'/')
+        .or_else(|| argv0.iter().rposition(|byte| *byte == b'\\'));
+    let name = separator.map_or(argv0, |index| &argv0[index + 1..]);
     let name = if name.len() > 4 && name.ends_with(b".exe") {
         &name[..name.len() - 4]
     } else {
         name
     };
+    name
+}
+
+fn program_name(argv0: &[u8]) -> String {
+    let name = program_name_bytes(argv0);
     String::from_utf8_lossy(name).into_owned()
 }
 
@@ -2137,55 +2144,83 @@ fn help_top(program: &str) -> Vec<u8> {
 fn completion_command(
     argv0: &[u8],
     zsh: bool,
-    qpdf_executable: Option<&str>,
-    appdir: Option<&str>,
-    appimage: Option<&str>,
-) -> (String, bool) {
-    let argv0 = String::from_utf8_lossy(argv0);
+    qpdf_executable: Option<&[u8]>,
+    appdir: Option<&[u8]>,
+    appimage: Option<&[u8]>,
+) -> (Vec<u8>, bool) {
     let executable = qpdf_executable
-        .map(str::to_owned)
+        .map(ToOwned::to_owned)
         .or_else(|| {
             appdir
                 .filter(|appdir| appdir.len() < argv0.len() && argv0.starts_with(appdir))
-                .and(appimage.map(str::to_owned))
+                .and(appimage.map(ToOwned::to_owned))
         })
-        .unwrap_or_else(|| argv0.clone().into_owned());
-    let program = program_name(argv0.as_bytes());
-    let command = if zsh {
-        format!(
-            "autoload -U +X bashcompinit && bashcompinit && complete -o bashdefault -o default -C \"{executable}\" {program}\n"
-        )
-    } else {
-        format!("complete -o bashdefault -o default -o nospace -C \"{executable}\" {program}\n")
-    };
-    let slash = executable.find('/');
+        .unwrap_or_else(|| argv0.to_vec());
+    let program = program_name_bytes(argv0);
+    let mut command = Vec::new();
+    if zsh {
+        command.extend_from_slice(b"autoload -U +X bashcompinit && bashcompinit && ");
+    }
+    command.extend_from_slice(b"complete -o bashdefault -o default");
+    if !zsh {
+        command.extend_from_slice(b" -o nospace");
+    }
+    command.extend_from_slice(b" -C \"");
+    command.extend_from_slice(&executable);
+    command.extend_from_slice(b"\" ");
+    command.extend_from_slice(program);
+    command.push(b'\n');
+    let slash = executable.iter().position(|byte| *byte == b'/');
     (command, slash.is_some_and(|offset| offset != 0))
+}
+
+fn os_string_bytes(value: &std::ffi::OsString) -> Vec<u8> {
+    #[cfg(unix)]
+    {
+        use std::os::unix::ffi::OsStrExt;
+        value.as_os_str().as_bytes().to_vec()
+    }
+
+    #[cfg(not(unix))]
+    {
+        value.to_string_lossy().as_bytes().to_vec()
+    }
+}
+
+fn completion_with_values(
+    job: &QPDFJob,
+    argv0: &[u8],
+    zsh: bool,
+    qpdf_executable: Option<&[u8]>,
+    appdir: Option<&[u8]>,
+    appimage: Option<&[u8]>,
+) -> Result<()> {
+    let (command, relative) = completion_command(argv0, zsh, qpdf_executable, appdir, appimage);
+    job.logger.info(command)?;
+    if relative {
+        let mut warning = b"WARNING: ".to_vec();
+        warning.extend_from_slice(program_name_bytes(argv0));
+        warning.extend_from_slice(b" completion enabled using relative path to executable\n");
+        job.logger.error(warning)?;
+    }
+    Ok(())
 }
 
 fn completion(job: &QPDFJob, argv0: &[u8], zsh: bool) -> Result<()> {
     let qpdf_executable = std::env::var_os("QPDF_EXECUTABLE");
     let appdir = std::env::var_os("APPDIR");
     let appimage = std::env::var_os("APPIMAGE");
-    let qpdf_executable = qpdf_executable
-        .as_ref()
-        .map(|value| value.to_string_lossy());
-    let appdir = appdir.as_ref().map(|value| value.to_string_lossy());
-    let appimage = appimage.as_ref().map(|value| value.to_string_lossy());
-    let (command, relative) = completion_command(
+    let qpdf_executable = qpdf_executable.as_ref().map(os_string_bytes);
+    let appdir = appdir.as_ref().map(os_string_bytes);
+    let appimage = appimage.as_ref().map(os_string_bytes);
+    completion_with_values(
+        job,
         argv0,
         zsh,
         qpdf_executable.as_deref(),
         appdir.as_deref(),
         appimage.as_deref(),
-    );
-    job.logger.info(command)?;
-    if relative {
-        job.logger.error(format!(
-            "WARNING: {} completion enabled using relative path to executable\n",
-            program_name(argv0)
-        ))?;
-    }
-    Ok(())
+    )
 }
 
 fn show_crypto_provider(job: &QPDFJob, provider: &str) -> Result<()> {
@@ -2401,7 +2436,7 @@ mod tests {
         let mut job = QPDFJob::new();
         job.set_logger(logger);
 
-        completion(&job, b"./qpdf", false).unwrap();
+        completion_with_values(&job, b"./qpdf", false, None, None, None).unwrap();
     }
 
     #[test]
@@ -2410,32 +2445,32 @@ mod tests {
             b"/opt/bundle/usr/bin/qpdf",
             false,
             None,
-            Some("/opt/bundle"),
-            Some("/opt/qpdf.AppImage"),
+            Some(b"/opt/bundle"),
+            Some(b"/opt/qpdf.AppImage"),
         );
         assert_eq!(
             command,
-            "complete -o bashdefault -o default -o nospace -C \"/opt/qpdf.AppImage\" qpdf\n"
+            b"complete -o bashdefault -o default -o nospace -C \"/opt/qpdf.AppImage\" qpdf\n"
         );
         assert!(!relative);
 
         let (command, relative) = completion_command(b"./qpdf", false, None, None, None);
         assert_eq!(
             command,
-            "complete -o bashdefault -o default -o nospace -C \"./qpdf\" qpdf\n"
+            b"complete -o bashdefault -o default -o nospace -C \"./qpdf\" qpdf\n"
         );
         assert!(relative);
 
         let (command, relative) = completion_command(
             b"qpdf",
             true,
-            Some("./custom-qpdf"),
-            Some("/opt/bundle"),
-            Some("/opt/qpdf.AppImage"),
+            Some(b"./custom-qpdf"),
+            Some(b"/opt/bundle"),
+            Some(b"/opt/qpdf.AppImage"),
         );
         assert_eq!(
             command,
-            "autoload -U +X bashcompinit && bashcompinit && complete -o bashdefault -o default -C \"./custom-qpdf\" qpdf\n"
+            b"autoload -U +X bashcompinit && bashcompinit && complete -o bashdefault -o default -C \"./custom-qpdf\" qpdf\n"
         );
         assert!(relative);
     }
@@ -2444,5 +2479,25 @@ mod tests {
     fn program_name_matches_qpdf_basename_and_exe_stripping() {
         assert_eq!(program_name(b"/opt/custom-qpdf"), "custom-qpdf");
         assert_eq!(program_name(b"C:\\tools\\qpdf.exe"), "qpdf");
+        assert_eq!(program_name(b"/tmp/custom\\qpdf.exe"), "custom\\qpdf");
+        assert_eq!(program_name(b"/tmp/"), "");
+    }
+
+    #[test]
+    fn completion_preserves_raw_executable_and_program_name_bytes() {
+        let (command, relative) =
+            completion_command(b"/opt/qpdf", false, Some(b"/tmp/qpdf-\xff"), None, None);
+        assert_eq!(
+            command,
+            b"complete -o bashdefault -o default -o nospace -C \"/tmp/qpdf-\xff\" qpdf\n"
+        );
+        assert!(!relative);
+
+        let (command, relative) = completion_command(b"/tmp/custom-\xff", false, None, None, None);
+        assert_eq!(
+            command,
+            b"complete -o bashdefault -o default -o nospace -C \"/tmp/custom-\xff\" custom-\xff\n"
+        );
+        assert!(!relative);
     }
 }
