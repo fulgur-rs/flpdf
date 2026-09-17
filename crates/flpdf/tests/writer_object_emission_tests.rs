@@ -199,6 +199,67 @@ fn qdf_and_normalize_progress_id_deletion_does_not_restore_the_setup_id() {
 }
 
 #[test]
+fn linearized_pass1_trailer_reads_live_id_at_each_trailer_site() {
+    // qpdf writes the first-page trailer before the body progress callback,
+    // then writes the main trailer after the callback window
+    // (QPDFWriter.cc:2740-2782, 1761-1796, 2816-2853). Each pass-1
+    // writeTrailer call reads /ID[0] at the point where it emits the
+    // placeholder (QPDFWriter.cc:1194-1222), so a callback replacement can
+    // change the second placeholder's width without changing the first one.
+    let mut pdf = Pdf::open(Cursor::new(
+        include_bytes!("../../../tests/fixtures/compat/nonid-id0.pdf").to_vec(),
+    ))
+    .unwrap();
+    let trailer = pdf.trailer();
+    let replacement = ObjectHandle::array(vec![
+        ObjectHandle::string(vec![b'c'; 24]),
+        ObjectHandle::string(vec![b'd'; 16]),
+    ]);
+    let temp = tempfile::tempdir().unwrap();
+    let pass1 = temp.path().join("pass1.pdf");
+    let mut callback_count = 0_u8;
+    let mut writer = PdfWriter::new(&mut pdf);
+    writer.set_object_stream_mode(ObjectStreamMode::Disable);
+    writer.set_linearization(true);
+    writer.set_static_id(true);
+    writer.set_linearization_pass1_filename(pass1.clone());
+    writer.set_output_memory().unwrap();
+    writer.register_progress_reporter(Box::new(move |_| {
+        callback_count = callback_count.saturating_add(1);
+        if callback_count == 1 {
+            trailer.replace_key(b"/ID", replacement.clone())?;
+        }
+        Ok(())
+    }));
+    writer
+        .write()
+        .expect("linearized write with live ID mutation");
+    let _ = writer.get_buffer().unwrap();
+
+    let pass1_bytes = std::fs::read(pass1).unwrap();
+    let marker = b"/ID [<";
+    let mut id0_hex_lengths = Vec::new();
+    let mut cursor = 0;
+    while let Some(relative) = pass1_bytes[cursor..]
+        .windows(marker.len())
+        .position(|window| window == marker)
+    {
+        let start = cursor + relative + marker.len();
+        let length = pass1_bytes[start..]
+            .iter()
+            .position(|byte| *byte == b'>')
+            .expect("pass-1 /ID[0] has a closing hex delimiter");
+        id0_hex_lengths.push(length);
+        cursor = start + length + 1;
+    }
+    assert_eq!(
+        id0_hex_lengths,
+        vec![40, 48],
+        "each pass-1 trailer must size its /ID[0] placeholder from the live trailer"
+    );
+}
+
+#[test]
 fn qdf_and_normalize_progress_trailer_child_gets_a_late_number() {
     for qdf in [true, false] {
         let mut pdf = Pdf::open(Cursor::new(
