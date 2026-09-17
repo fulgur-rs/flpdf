@@ -3492,6 +3492,10 @@ impl<R: Read + Seek> ResolverHandle<R> {
         } else {
             start.saturating_add(token.start as u64)
         };
+        // QPDFTokenizer::nextToken updates InputSource::last_offset to the
+        // token start after skipping whitespace/comments. Keep the shared
+        // source state at that same boundary; seek() only moves the cursor.
+        self.set_last_offset(token_start);
         Ok((token, token_start))
     }
 
@@ -4108,17 +4112,12 @@ impl<R: Read + Seek> ResolverHandle<R> {
             )?; // cov:ignore: LLVM attributes the covered raw framing-warning call terminator to a zero-count continuation region
         }
 
-        // qpdf's lazy stream parser leaves InputSource::last_offset at the
-        // stream-data start after a successful readStream boundary. The Rust
-        // parser scans through endstream/endobj to retain exact extents, so
-        // restore that observable qpdf position after the same successful
-        // validation (`QPDF.cc:1360-1399`).
-        self.core
-            .borrow()
-            .input
-            .borrow()
-            .last_offset
-            .set(stream_offset);
+        // `readObject` has already consumed the trailing token after
+        // `readStream`, so the shared InputSource last offset is the endobj
+        // position on the successful path, matching qpdf
+        // (`QPDF.cc:1330-1357`). Do not restore stream_offset here; qpdf only
+        // performs an explicit last-offset reset for readTrailer
+        // (`QPDF.cc:1325-1326`).
 
         let dict = self.direct_object_handle(dict);
         dict.set_parsed_offset_if_unset(dict_offset);
@@ -11821,6 +11820,40 @@ mod tests {
         assert!(
             pdf.resolver.core.borrow().resolving.is_empty(),
             "the mark must be gone once the outer resolution returns its error"
+        );
+    }
+
+    #[test]
+    fn successful_stream_parse_keeps_endobj_as_last_source_offset() {
+        let bytes = pdf_with_bodies(&[
+            b"1 0 obj\n<< /Type /Catalog /Metadata 2 0 R >>\nendobj\n".to_vec(),
+            b"2 0 obj\n<< /Length 3 0 R >>\nstream\nabc\nendstream\nendobj\n".to_vec(),
+            b"3 0 obj\n3\nendobj\n".to_vec(),
+        ]);
+        let object_start = bytes
+            .windows(b"2 0 obj".len())
+            .position(|window| window == b"2 0 obj")
+            .expect("stream object header");
+        let endobj_start = object_start
+            + bytes[object_start..]
+                .windows(b"endobj".len())
+                .position(|window| window == b"endobj")
+                .expect("stream object endobj");
+        let expected_last_offset = (endobj_start
+            + b"endobj".len()
+            + bytes[endobj_start + b"endobj".len()..]
+                .iter()
+                .position(|byte| !byte.is_ascii_whitespace())
+                .expect("byte after stream object")) as u64;
+        let mut pdf = Pdf::open(Cursor::new(bytes)).expect("open valid stream fixture");
+        let stream = pdf.get_object_handle(ObjectRef::new(2, 0));
+
+        stream.try_dereference().expect("resolve stream");
+        assert!(stream.as_stream_dict().is_some());
+        assert_eq!(
+            pdf.source_last_offset(),
+            expected_last_offset,
+            "successful readObject must leave the source offset after endobj whitespace"
         );
     }
 
