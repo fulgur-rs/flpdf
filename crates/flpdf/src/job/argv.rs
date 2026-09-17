@@ -1963,7 +1963,7 @@ const QPDF_HELP_TOPICS: &[&[u8]] = &[
     b"usage",
 ];
 
-const QPDF_HELP_ALL: &str = include_str!("qpdf-help-all.txt");
+const QPDF_HELP_ALL: &str = include_str!("../../qpdf-help-all.txt");
 
 const QPDF_HELP_OPTIONS: &[&[u8]] = &[
     b"--accessibility",
