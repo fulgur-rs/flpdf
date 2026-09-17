@@ -334,16 +334,14 @@ impl Optimization {
         allow_changes: bool,
         warn_missing_page_tree: bool,
     ) -> crate::Result<Option<crate::pages::repair::PreparedPages>> {
-        if let Some(root_ref) = pdf.root_ref() {
-            let root = pdf.get_object_handle(root_ref);
-            let outlines = root.try_get_key(b"/Outlines")?;
-            if outlines.try_is_dictionary()? && outlines.is_direct() {
-                // qpdf's optimize makes a direct /Outlines dictionary indirect
-                // without cloning its live allocation
-                // (libqpdf/QPDF_optimization.cc:73-77).
-                let outlines = pdf.make_indirect_from_object_handle(outlines)?;
-                root.replace_key(b"/Outlines", outlines)?;
-            }
+        let root = pdf.root_handle()?;
+        let outlines = root.try_get_key(b"/Outlines")?;
+        if outlines.try_is_dictionary()? && outlines.is_direct() {
+            // qpdf's optimize makes a direct /Outlines dictionary indirect
+            // without cloning its live allocation
+            // (libqpdf/QPDF_optimization.cc:73-77).
+            let outlines = pdf.make_indirect_from_object_handle(outlines)?;
+            root.replace_key(b"/Outlines", outlines)?;
         }
 
         let prepared = crate::pages::repair::prepare_for_optimization(pdf)?;
@@ -424,17 +422,17 @@ impl Optimization {
             }
         }
 
-        if let Some(root_ref) = pdf.root_ref() {
-            let root = pdf.get_object_handle(root_ref);
-            for key in root.try_get_keys()? {
-                let user_key = key.strip_prefix(b"/").unwrap_or(&key).to_vec();
-                maps.update_object_maps(
-                    pdf,
-                    ObjectUser::RootKey(user_key),
-                    root.try_get_key(&key)?,
-                    &mut skip_stream_parameters,
-                )?;
-            }
+        let root = pdf.root_handle()?;
+        for key in root.try_get_keys()? {
+            let user_key = key.strip_prefix(b"/").unwrap_or(&key).to_vec();
+            maps.update_object_maps(
+                pdf,
+                ObjectUser::RootKey(user_key),
+                root.try_get_key(&key)?,
+                &mut skip_stream_parameters,
+            )?;
+        }
+        if let Some(root_ref) = root.object_ref() {
             maps.record(ObjectUser::Root, root_ref);
         }
 

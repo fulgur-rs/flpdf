@@ -1205,14 +1205,11 @@ fn build_raw_linearization_plan<R: Read + Seek>(
     };
     raw_part4_rest_extra.retain(|object_gen| !outline_refs.contains(object_gen));
 
-    let outline_root = if let Some(root_ref) = pdf.root_ref() {
-        pdf.get_object_handle(root_ref)
-            .try_get_key(b"/Outlines")?
-            .qpdf_obj_gen()
-            .filter(|object_gen| object_gen.is_indirect())
-    } else {
-        None // cov:ignore: every production linearization plan has a trailer /Root
-    };
+    let outline_root = pdf
+        .root_handle()?
+        .try_get_key(b"/Outlines")?
+        .qpdf_obj_gen()
+        .filter(|object_gen| object_gen.is_indirect());
     let raw_part6_outline_objects = raw_refs_with_extras_root_first(
         part6_outline_objects.iter().copied(),
         raw_part6_outline_extra.clone(),
@@ -1723,11 +1720,10 @@ impl LinearizationPlan {
         if let Some(refs) = pre_optimization_object_refs {
             optimization.set_pre_optimization_object_refs(refs);
         }
-        if pdf.root_ref().is_some()
-            && optimization
-                .objects_for(&crate::optimization::ObjectUser::Page(0))
-                .next()
-                .is_none()
+        if optimization
+            .objects_for(&crate::optimization::ObjectUser::Page(0))
+            .next()
+            .is_none()
         {
             // qpdf raises this through `stopOnError`, which builds a
             // `qpdf_e_damaged_pdf` exception carrying the input name and the
@@ -1923,18 +1919,13 @@ impl LinearizationPlan {
         let info_ref = info_handle
             .object_ref()
             .or_else(|| info_handle.object_ref());
-        let pages_tree_ref = if let Some(root_ref) = root_ref {
-            let root_handle = pdf.get_object_handle(root_ref);
-            let pages_handle = root_handle.try_get_key(b"/Pages")?;
-            pages_handle
-                .object_ref()
-                .or_else(|| pages_handle.object_ref())
-                .map(|object_ref| {
-                    canonical_preserve_ref(&preserve_source_container_by_member, object_ref)
-                })
-        } else {
-            None // cov:ignore: reachable_object_set rejects a rootless document before this successful-plan path
-        };
+        let pages_handle = pdf.root_handle()?.try_get_key(b"/Pages")?;
+        let pages_tree_ref = pages_handle
+            .object_ref()
+            .or_else(|| pages_handle.object_ref())
+            .map(|object_ref| {
+                canonical_preserve_ref(&preserve_source_container_by_member, object_ref)
+            });
 
         // The live object set is invariant across every page's closure; compute it
         // once so the per-page `compute_closure` calls below do not each re-scan
@@ -2441,15 +2432,10 @@ impl LinearizationPlan {
         // renumber map assigns it the lowest new unit among outline objects,
         // matching qpdf's lc_outlines traversal-from-root order (used by
         // compute_outline_hint_info's first_object).
-        let outline_root_ref: Option<ObjectRef> = if let Some(root_ref) = pdf.root_ref() {
-            let root_handle = pdf.get_object_handle(root_ref);
-            let outlines = root_handle.try_get_key(b"/Outlines")?;
-            outlines.object_ref().map(|object_ref| {
-                canonical_preserve_ref(&preserve_source_container_by_member, object_ref)
-            })
-        } else {
-            None // cov:ignore: reachable_object_set rejects a rootless document before outline planning can succeed
-        };
+        let outlines = pdf.root_handle()?.try_get_key(b"/Outlines")?;
+        let outline_root_ref: Option<ObjectRef> = outlines.object_ref().map(|object_ref| {
+            canonical_preserve_ref(&preserve_source_container_by_member, object_ref)
+        });
 
         let extract_outlines = |src: &[ObjectRef]| -> Vec<ObjectRef> {
             let mut v: Vec<ObjectRef> = src
@@ -4014,10 +4000,7 @@ pub(crate) fn part9_category_order_key<'a>(
 /// When `true`, outline objects are routed to the first-page section (part6)
 /// rather than part9 by [`route_objstm_containers`].
 fn outlines_in_first_page_predicate<R: Read + Seek>(pdf: &mut Pdf<R>) -> crate::Result<bool> {
-    let Some(root) = pdf.root_ref() else {
-        return Ok(false); // cov:ignore: root_ref None ⇒ from_pdf fails earlier via catalog()?
-    };
-    let root_handle = pdf.get_object_handle(root);
+    let root_handle = pdf.root_handle()?;
     if !root_handle.try_has_key(b"/Outlines")? {
         return Ok(false);
     }

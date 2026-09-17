@@ -256,6 +256,7 @@ impl<R: Read + Seek> Pdf<R> {
         let header_offset = loaded_state.header_offset;
         let already_reconstructed = loaded_state.already_reconstructed;
         let first_xref_item_offset = loaded_state.first_xref_item_offset;
+        let classic_trailer_offset = loaded_state.classic_trailer_offset;
         let raw_xref_entries = loaded_state.raw_entries.clone();
         let loaded = loaded_state.loaded;
         let source_xref_entries = loaded.entries.clone();
@@ -273,13 +274,17 @@ impl<R: Read + Seek> Pdf<R> {
                 resolver.get_object_handle(object_ref);
             }
         }
-        // qpdf's readTrailer resets InputSource::last_offset to the xref read
-        // position before initializeEncryption only for a classic trailer
+        // qpdf's readTrailer resets InputSource::last_offset to the beginning
+        // of the classic trailer before initializeEncryption
         // (`QPDF.cc:1313-1327`). An xref-stream trailer is the stream object
         // itself, so retain the live stream read position for later lazy
         // resolution diagnostics.
         if matches!(loaded.last_xref_form, XrefForm::Table) {
-            resolver.set_last_offset(loaded.startxref);
+            resolver.set_last_offset(
+                classic_trailer_offset
+                    .map(|offset| offset as u64)
+                    .unwrap_or(loaded.startxref),
+            );
         }
         let trailer = loaded.trailer;
         // `Pdf::encryption` is the same `Rc<RefCell<..>>` allocation as

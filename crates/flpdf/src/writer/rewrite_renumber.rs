@@ -434,16 +434,26 @@ pub(crate) fn reachable_object_set_with_stream_parameters<R: Read + Seek>(
     skip_length: bool,
     skipped_stream_parameter_streams: &BTreeSet<crate::qpdf_obj_gen::QpdfObjGen>,
 ) -> crate::Result<BTreeSet<ObjectRef>> {
-    let root = pdf
-        .root_ref()
-        .ok_or_else(|| Error::Unsupported("reachability: trailer has no /Root".to_string()))?;
-    let mut seeds: Vec<ObjectRef> = vec![root];
+    let root = pdf.root_handle()?;
+    let mut seeds = Vec::new();
     let trailer_entries = pdf.trailer().try_as_dictionary()?.unwrap_or_default();
     let skip_stream_parameters = |handle: &crate::ObjectHandle| -> crate::Result<bool> {
         Ok(handle
             .qpdf_obj_gen()
             .is_some_and(|object_gen| skipped_stream_parameter_streams.contains(&object_gen)))
     };
+    if let Some(root_ref) = root.object_ref() {
+        seeds.push(root_ref);
+    } else {
+        collect_canonical_enqueue_refs_with_linearized_omission(
+            pdf,
+            &root,
+            0,
+            skip_length,
+            &mut seeds,
+            Some(&skip_stream_parameters),
+        )?; // cov:ignore: direct Catalog traversal is covered by the linearization direct-root differential
+    }
     for (key, value) in trailer_entries {
         // /Encrypt is intentionally NOT skipped: it is part of the live universe.
         // /Prev, /Size, /ID, /Root are not object roots of the document graph.
@@ -524,13 +534,23 @@ pub(crate) fn resurrectable_null_refs_excluding<R: Read + Seek>(
     pdf: &mut Pdf<R>,
     removed_refs: &BTreeSet<ObjectRef>,
 ) -> crate::Result<BTreeSet<ObjectRef>> {
-    let root = pdf
-        .root_ref()
-        .ok_or_else(|| Error::Unsupported("resurrectable: trailer has no /Root".to_string()))?;
+    let root = pdf.root_handle()?;
 
     let mut result: BTreeSet<ObjectRef> = BTreeSet::new();
     let mut visited: BTreeSet<ObjectRef> = BTreeSet::new();
-    let mut queue: VecDeque<ObjectRef> = VecDeque::from([root]);
+    let mut queue: VecDeque<ObjectRef> = VecDeque::new();
+    if let Some(root_ref) = root.object_ref() {
+        queue.push_back(root_ref);
+    } else {
+        let mut follow = Vec::new();
+        let mut state = ResurrectableWalkState {
+            follow: &mut follow,
+            result: &mut result,
+            removed_refs,
+        };
+        walk_resurrectable_handle(&root, 0, false, false, &mut state)?;
+        queue.extend(follow);
+    }
 
     // Seed from the trailer (dict context): visible roots are followed; a
     // null-resolving trailer ref is a dropped key, not resurrected.

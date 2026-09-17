@@ -2105,18 +2105,14 @@ fn compute_outline_hint_info<R: Read + Seek>(
     // This helper runs only when the retained outline set is non-empty
     // (therefore a /Outlines key exists),
     // so the catalog is always a resolvable dictionary here.
-    let outlines_ref = if let Some(root_ref) = pdf.root_ref() {
-        let root = pdf.get_object_handle(root_ref);
-        if !root.try_is_dictionary()? {
-            None // cov:ignore: catalog is always a dict when outlines exist
-        } else {
-            let outlines = root.try_get_key(b"/Outlines")?;
-            outlines
-                .qpdf_obj_gen()
-                .filter(|object_gen| object_gen.is_indirect())
-        }
+    let root = pdf.root_handle()?;
+    let outlines_ref = if !root.try_is_dictionary()? {
+        None // cov:ignore: catalog is always a dict when outlines exist
     } else {
-        None // cov:ignore: a non-empty retained outline set has a Catalog root
+        let outlines = root.try_get_key(b"/Outlines")?;
+        outlines
+            .qpdf_obj_gen()
+            .filter(|object_gen| object_gen.is_indirect())
     };
     let Some(outlines_ref) = outlines_ref else {
         // Defensive: a non-empty outline closure implies a /Outlines ref, so this
@@ -4337,6 +4333,15 @@ fn write_linearized_impl<R: Read + Seek>(
     let part1_placeholders = part1.placeholders.clone();
     let part1_dict_region = part1.dict_writable_region.clone();
 
+    let root = pdf.root_handle()?;
+    if root.is_direct() {
+        // qpdf enqueues a direct Catalog into linearization part 4 without
+        // assigning it an object number; the resulting count mismatch is
+        // reported after that part is prepared (QPDFWriter.cc:2636-2642).
+        return Err(crate::Error::System(
+            "error encountered after writing part 4 of linearized data".to_string(),
+        ));
+    }
     let catalog_orig = plan.root_ref.ok_or_else(|| {
         crate::Error::Unsupported(
             "linearization writer: plan.root_ref is None — \
