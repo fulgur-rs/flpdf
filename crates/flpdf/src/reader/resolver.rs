@@ -350,6 +350,10 @@ pub(crate) struct ResolverCore<R: Read + Seek + 'static> {
     /// `InvalidInputSource`; it does not mutate the previously captured
     /// source, which is required by qpdf's foreign-stream ownership contract.
     input: RefCell<Rc<StreamInput<R>>>,
+    /// Generation of the shared input cursor. Every seek/read that can move
+    /// qpdf's `m->file` increments it so nested resolver reads invalidate any
+    /// outer `ResolverLiveInput` fast-read buffer.
+    input_generation: Cell<u64>,
     /// Also qpdf `m->file`: when repair finds a valid header after leading
     /// material, qpdf does not keep the offset beside the input source, it
     /// *wraps* the source so the shift is invisible to every later read —
@@ -975,6 +979,7 @@ impl<R: Read + Seek> ResolverHandle<R> {
         Rc::new_cyclic(|self_weak| Self {
             core: RefCell::new(ResolverCore {
                 input: RefCell::new(Rc::new(StreamInput::new(reader, header_offset))),
+                input_generation: Cell::new(0),
                 header_offset,
                 raw_source_xref_entries: raw_xref_entries_from_object_refs(initial_entries),
                 object_cache: BTreeMap::new(),
@@ -1022,6 +1027,7 @@ impl<R: Read + Seek> ResolverHandle<R> {
         Rc::new_cyclic(|self_weak| Self {
             core: RefCell::new(ResolverCore {
                 input: RefCell::new(Rc::new(StreamInput::invalid())),
+                input_generation: Cell::new(0),
                 header_offset: 0,
                 raw_source_xref_entries: BTreeMap::new(),
                 object_cache: BTreeMap::new(),
@@ -2105,6 +2111,7 @@ impl<R: Read + Seek> ResolverHandle<R> {
         // OffsetInputSource which seeks to logical-0 at QPDF.cc:543.
         let header_offset = self.core.borrow().header_offset;
         let raw_bytes = self.core.borrow_mut().read_underlying_bytes()?;
+        self.bump_input_generation();
         let logical_bytes = raw_bytes.get(header_offset..).ok_or_else(|| {
             Error::parse(
                 header_offset,
@@ -3232,14 +3239,32 @@ impl<R: Read + Seek> ResolverHandle<R> {
     // `libqpdf/QPDF.cc:1367-1384`), and a seam can only be ported onto a
     // position that a nested resolution can actually disturb.
 
+    fn input_generation(&self) -> u64 {
+        self.core.borrow().input_generation.get()
+    }
+
+    fn bump_input_generation(&self) {
+        let core = self.core.borrow();
+        core.input_generation
+            .set(core.input_generation.get().wrapping_add(1));
+    }
+
     /// See [`ResolverCore::seek`].
     pub(crate) fn seek(&self, offset: u64) -> Result<()> {
-        self.core.borrow_mut().seek(offset)
+        let result = self.core.borrow_mut().seek(offset);
+        if result.is_ok() {
+            self.bump_input_generation();
+        }
+        result
     }
 
     /// See [`ResolverCore::seek_relative`].
     fn seek_relative(&self, delta: u64) -> Result<()> {
-        self.core.borrow_mut().seek_relative(delta)
+        let result = self.core.borrow_mut().seek_relative(delta);
+        if result.is_ok() {
+            self.bump_input_generation();
+        }
+        result
     }
 
     /// See [`ResolverCore::tell`].
@@ -3249,7 +3274,11 @@ impl<R: Read + Seek> ResolverHandle<R> {
 
     /// See [`ResolverCore::read`].
     pub(crate) fn read(&self, buf: &mut [u8]) -> Result<usize> {
-        self.core.borrow_mut().read(buf)
+        let result = self.core.borrow_mut().read(buf);
+        if result.is_ok() {
+            self.bump_input_generation();
+        }
+        result
     }
 
     /// Capture qpdf's `end_before_space`/`end_after_space` pair after an
@@ -3576,6 +3605,7 @@ impl<R: Read + Seek> ResolverHandle<R> {
             buffer_start: 0,
             buffer_len: 0,
             buffer_index: 0,
+            generation: self.input_generation(),
         }
     }
 
@@ -3825,6 +3855,11 @@ impl<R: Read + Seek> ResolverHandle<R> {
                 )));
             }
             let found = found_raw.to_object_ref();
+            // QPDF::readObjectAtOffset updates last_object_description before
+            // entering QPDF::readObject (`QPDF.cc:1561,1639`). A nested
+            // resolver read may overwrite it; that clobber is observable in
+            // the trailing expected-endobj warning.
+            self.set_last_qpdf_obj_gen_description(found_raw, read_description.as_deref());
             let mut minter = ChildHandles {
                 resolver: self,
                 description_template: Rc::new(match read_description.as_deref() {
@@ -3856,14 +3891,23 @@ impl<R: Read + Seek> ResolverHandle<R> {
             } else {
                 None
             };
-            let parsed = parse_live_file_object_with_decrypter(
+            let parsed = match parse_live_file_object_with_decrypter(
                 &mut input,
                 &mut minter,
                 decrypter
                     .as_mut()
                     .map(|decrypter| decrypter as &mut dyn StringDecrypter),
-            )
-            .map_err(ReadObjectAtOffsetError::Body)?;
+            ) {
+                Ok(parsed) => parsed,
+                Err(error) => {
+                    // qpdf's InputSource has one shared cursor. Flush the
+                    // parser's logical position before returning a body error
+                    // so an outer parser observes the same displaced token
+                    // after a nested read (`QPDF.cc:1561-1639`).
+                    input.finish().map_err(ReadObjectAtOffsetError::Body)?;
+                    return Err(ReadObjectAtOffsetError::Body(error));
+                }
+            };
             let trailing = if parsed.empty.is_none() {
                 let mut trailing_tokens = LiveTokenSource::new(&mut input);
                 let trailing = trailing_tokens
@@ -3887,7 +3931,11 @@ impl<R: Read + Seek> ResolverHandle<R> {
             )
         };
 
-        self.set_last_qpdf_obj_gen_description(found_raw, read_description.as_deref());
+        // QPDF::readObjectAtOffset updates last_object_description before
+        // entering QPDF::readObject. A nested resolution during parsing may
+        // overwrite it with the nested object's identity; leave that value in
+        // place so a later expected-endobj warning renders qpdf's current
+        // description rather than restoring the outer object here.
         let warning_filename = self.core.borrow().description.clone();
         if expected.is_indirect() && found_raw != expected {
             self.push_qpdf_warning(QpdfExc::new(
@@ -5067,10 +5115,12 @@ struct ResolverLiveInput<'a, R: Read + Seek + 'static> {
     buffer_start: u64,
     buffer_len: usize,
     buffer_index: usize,
+    generation: u64,
 }
 
 impl<R: Read + Seek> LiveInput for ResolverLiveInput<'_, R> {
     fn tell(&mut self) -> Result<u64> {
+        self.sync_generation()?;
         if self.buffer_len == 0 {
             self.resolver.tell()
         } else {
@@ -5083,14 +5133,17 @@ impl<R: Read + Seek> LiveInput for ResolverLiveInput<'_, R> {
         self.buffer_start = offset;
         self.buffer_len = 0;
         self.buffer_index = 0;
+        self.generation = self.resolver.input_generation();
         Ok(())
     }
 
     fn read_byte(&mut self) -> Result<Option<u8>> {
+        self.sync_generation()?;
         if self.buffer_index == self.buffer_len {
             self.buffer_start = self.resolver.tell()?;
             self.buffer_len = self.resolver.read(&mut self.buffer)?;
             self.buffer_index = 0;
+            self.generation = self.resolver.input_generation();
             if self.buffer_len == 0 {
                 return Ok(None);
             }
@@ -5101,6 +5154,7 @@ impl<R: Read + Seek> LiveInput for ResolverLiveInput<'_, R> {
     }
 
     fn unread_byte(&mut self) -> Result<()> {
+        self.sync_generation()?;
         if self.buffer_index != 0 {
             self.buffer_index -= 1;
             Ok(())
@@ -5119,6 +5173,21 @@ impl<R: Read + Seek> LiveInput for ResolverLiveInput<'_, R> {
 }
 
 impl<R: Read + Seek> ResolverLiveInput<'_, R> {
+    /// Drop bytes prefetched by this parser when a nested resolver consumer
+    /// moved the shared qpdf input source. qpdf's `InputSource` has one cursor
+    /// and one buffer; keeping a per-parser buffer without this generation
+    /// check would replay stale outer bytes after `readObjectAtOffset` seeks.
+    fn sync_generation(&mut self) -> Result<()> {
+        let generation = self.resolver.input_generation();
+        if generation != self.generation {
+            self.buffer_len = 0;
+            self.buffer_index = 0;
+            self.buffer_start = self.resolver.tell()?;
+            self.generation = generation;
+        }
+        Ok(())
+    }
+
     /// Flush a speculative fast-read buffer before another resolver consumer
     /// observes `m->file`'s position. Qpdf's `InputSource::fastUnread` does
     /// the same seek after tokenizer use (`InputSource.hh:148-153`).
