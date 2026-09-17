@@ -2812,6 +2812,104 @@ fn snapshot_unparse_container(value: &ObjectValue) -> Option<UnparseContainer> {
     }
 }
 
+fn is_direct_scalar_value(value: &ObjectValue) -> bool {
+    matches!(
+        value,
+        ObjectValue::Null
+            | ObjectValue::Boolean(_)
+            | ObjectValue::Integer(_)
+            | ObjectValue::Real(_)
+            | ObjectValue::RealLiteral { .. }
+            | ObjectValue::Name(_)
+            | ObjectValue::String(_)
+            | ObjectValue::Operator(_)
+            | ObjectValue::InlineImage(_)
+    )
+}
+
+fn is_direct_scalar_handle(handle: &ObjectHandle) -> bool {
+    handle.is_direct() && handle.with_value(|value| value.is_some_and(is_direct_scalar_value))
+}
+
+fn write_direct_scalar_with_string_writer<F>(
+    handle: &ObjectHandle,
+    out: &mut OutputSink<'_>,
+    write_string: &mut F,
+) -> Result<()>
+where
+    F: FnMut(&mut OutputSink<'_>, &[u8]) -> Result<()> + ?Sized,
+{
+    handle.with_value(|value| match value {
+        Some(ObjectValue::String(bytes)) => write_string(out, bytes),
+        Some(value) => unparse_object_value(value, out),
+        None => out.write_bytes(b"null"),
+    })
+}
+
+fn try_write_direct_scalar_container_with_string_writer<F>(
+    value: &ObjectValue,
+    out: &mut OutputSink<'_>,
+    write_string: &mut F,
+) -> Result<bool>
+where
+    F: FnMut(&mut OutputSink<'_>, &[u8]) -> Result<()> + ?Sized,
+{
+    match value {
+        ObjectValue::Array(children) if children.iter().all(is_direct_scalar_handle) => {
+            out.write_bytes(b"[")?;
+            for child in children {
+                out.write_bytes(b" ")?;
+                write_direct_scalar_with_string_writer(child, out, write_string)?;
+            }
+            out.write_bytes(b" ]")?;
+            Ok(true)
+        }
+        ObjectValue::Dictionary(entries)
+            if entries
+                .iter()
+                .all(|(_, child)| is_direct_scalar_handle(child)) =>
+        {
+            let is_signature = entries
+                .iter()
+                .find(|(key, _)| key.as_slice() == b"/Type")
+                .is_some_and(|(_, value)| value.as_name().as_deref() == Some(b"Sig"));
+            let has_byte_range = is_signature
+                && entries
+                    .iter()
+                    .find(|(key, _)| key.as_slice() == b"/ByteRange")
+                    .is_some_and(|(_, value)| !value.is_null());
+            let force_hex_contents = is_signature && has_byte_range;
+
+            out.write_bytes(b"<<")?;
+            for (key, child) in entries {
+                if child.is_null() {
+                    continue;
+                }
+                out.write_bytes(b" ")?;
+                write_dictionary_key(out, key)?;
+                out.write_bytes(b" ")?;
+                if force_hex_contents
+                    && key.as_slice() == b"/Contents"
+                    && child.with_value(|value| -> Result<bool> {
+                        if let Some(ObjectValue::String(bytes)) = value {
+                            crate::pdf_syntax::write_hex_string(out, bytes)?;
+                            Ok(true)
+                        } else {
+                            Ok(false)
+                        }
+                    })?
+                {
+                    continue;
+                }
+                write_direct_scalar_with_string_writer(child, out, write_string)?;
+            }
+            out.write_bytes(b" >>")?;
+            Ok(true)
+        }
+        _ => Ok(false),
+    }
+}
+
 fn unparse_container(container: UnparseContainer, out: &mut OutputSink<'_>) -> Result<()> {
     match container {
         UnparseContainer::Array(children) => {
@@ -3428,13 +3526,22 @@ where
         handle.try_dereference()?;
         let container = handle.with_value(|value| match value {
             Some(value) => {
-                if let Some(container) = snapshot_unparse_container(value) {
+                let mut write_string = |out: &mut OutputSink<'_>, bytes: &[u8]| {
+                    crate::pdf_syntax::write_string_value(out, bytes)
+                };
+                if try_write_direct_scalar_container_with_string_writer(
+                    value,
+                    out,
+                    &mut write_string,
+                )? {
+                    Ok(None)
+                } else if let Some(container) = snapshot_unparse_container(value) {
                     Ok(Some(container))
                 } else {
                     unparse_object_value_with_dynamic_ref_map_and_string_writer(
                         value,
                         out,
-                        write_string,
+                        &mut write_string,
                     )
                     .map(|()| None)
                 }
