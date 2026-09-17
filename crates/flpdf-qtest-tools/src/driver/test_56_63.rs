@@ -5,8 +5,8 @@ use std::sync::{Arc, Mutex};
 
 use flpdf::{
     pipeline::Discard, qutil, EncryptParams, Error, NameTree, ObjectHandle, PageDocumentHelper,
-    PageObjectHelper, Pdf, PdfOpenOptions, PdfWriter, Pipeline, PipelineError, PipelineHandle,
-    PipelineResult, QPDFLogger, ReadSeek,
+    PageObjectHelper, Pdf, PdfOpenOptions, PdfWriter, Pipeline, PipelineError, PipelineResult,
+    QPDFLogger, ReadSeek,
 };
 
 use super::{emit_new_diagnostics, os_str_diagnostic_bytes};
@@ -586,20 +586,16 @@ fn with_default_error_capture(
     stderr: &mut dyn Write,
     body: impl FnOnce() -> flpdf::Result<()>,
 ) -> flpdf::Result<()> {
-    static DEFAULT_ERROR_CAPTURE_LOCK: Mutex<()> = Mutex::new(());
-
-    let _guard = DEFAULT_ERROR_CAPTURE_LOCK
+    let _guard = crate::driver::DEFAULT_ERROR_CAPTURE_LOCK
+        .get_or_init(|| Mutex::new(()))
         .lock()
         .unwrap_or_else(std::sync::PoisonError::into_inner);
     let logger = QPDFLogger::default_logger();
-    let restore = logger.get_error()?;
     let captured = Arc::new(Mutex::new(Vec::new()));
-    logger.set_error(Some(PipelineHandle::new(DefaultErrorCaptureSink(
-        Arc::clone(&captured),
-    ))));
-
-    let result = body();
-    logger.set_error(Some(restore));
+    let result = logger.with_error_capture(
+        flpdf::PipelineHandle::new(DefaultErrorCaptureSink(Arc::clone(&captured))),
+        body,
+    );
     let captured = captured
         .lock()
         .map_err(|_| PipelineError::runtime("default error capture mutex poisoned"))?
@@ -647,8 +643,10 @@ pub(crate) fn run_test_63<R: Read + Seek>(
 #[cfg(test)]
 mod tests {
     use super::{run_test_61, test_56_59_body, DefaultErrorCaptureSink};
-    use flpdf::{Pdf, Pipeline};
-    use std::sync::{Arc, Mutex};
+    use flpdf::{ObjectHandle, Pdf, Pipeline};
+    use std::ffi::OsString;
+    use std::sync::{mpsc, Arc, Barrier, Mutex};
+    use std::thread;
 
     struct CurrentDirGuard(std::path::PathBuf);
 
@@ -709,6 +707,54 @@ mod tests {
         sink.write(b"warning\n").expect("capture sink write");
         sink.finish().expect("capture sink finish");
         assert_eq!(&*captured.lock().unwrap(), b"warning\n");
+    }
+
+    #[test]
+    fn default_error_capture_is_not_contaminated_by_parallel_repair_warnings() {
+        let directory = tempfile::tempdir().expect("create malformed-input directory");
+        let malformed = directory.path().join("malformed.pdf");
+        std::fs::write(&malformed, b"not a PDF").expect("write malformed input");
+        // Two rendezvous points, not one. The first only starts the worker;
+        // without the second the capture scope can close before the worker
+        // emits its repair warnings, and the contamination this test exists to
+        // catch never has a window to happen -- the process-global
+        // implementation passes that schedule too.
+        let ready = Arc::new(Barrier::new(2));
+        let (worker_finished_tx, worker_finished_rx) = mpsc::channel();
+        let worker_ready = Arc::clone(&ready);
+        let worker = thread::spawn(move || {
+            worker_ready.wait();
+            let args = vec![
+                OsString::from("test_large_file"),
+                OsString::from("read"),
+                OsString::from("small"),
+                malformed.into_os_string(),
+            ];
+            let _ = crate::large_file::run(&args);
+            worker_finished_tx
+                .send(())
+                .expect("signal after malformed repair warning");
+        });
+
+        let mut pdf = Pdf::empty().expect("create test 62 document");
+        let mut captured_stderr = Vec::new();
+        let capture_result = super::with_default_error_capture(&mut captured_stderr, || {
+            ready.wait();
+            let t = pdf.trailer();
+            t.replace_key(b"/Q1", ObjectHandle::integer(3 * i64::from(i32::MAX)))?;
+            assert_eq!(t.try_get_key(b"/Q1")?.try_get_int_value_as_int()?, i32::MAX);
+            worker_finished_rx
+                .recv()
+                .expect("wait for malformed repair warning");
+            Ok(())
+        });
+        worker.join().expect("malformed-input worker");
+        capture_result.expect("test 62 should complete");
+
+        assert_eq!(
+            captured_stderr,
+            b"requested value of integer is too big; returning INT_MAX\n"
+        );
     }
 
     #[test]

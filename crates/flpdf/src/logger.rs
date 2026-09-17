@@ -9,10 +9,12 @@
 
 use crate::pipeline::{Discard, Pipeline, PipelineHandle, PipelineResult, PlOStream};
 use crate::{Error, Result};
+use std::collections::HashMap;
 use std::fmt;
 use std::io::{self, Write};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex, MutexGuard, OnceLock};
+use std::thread::ThreadId;
 
 const NULL_PIPELINE_MESSAGE: &str =
     "QPDFLogger: requested a null pipeline without null_okay == true";
@@ -162,6 +164,8 @@ struct LoggerState {
     info: PipelineHandle,
     warn: Option<PipelineHandle>,
     error: PipelineHandle,
+    // qpdf-deviation: qpdf has no thread-scoped overlay on the default logger; its answer to per-thread capture is a separate QPDFLogger instance (`include/qpdf/QPDFLogger.hh:33-42`), which the contextless `defaultLogger()->getError()` warning path cannot use
+    error_capture: HashMap<ThreadId, PipelineHandle>,
     save: Option<PipelineHandle>,
     stdout_used: Arc<AtomicBool>,
     stdout_text_mode: Arc<AtomicBool>,
@@ -199,6 +203,25 @@ pub struct QPDFLogger {
     shared: Arc<LoggerShared>,
 }
 
+struct ErrorCaptureRestore {
+    shared: Arc<LoggerShared>,
+    owner: ThreadId,
+    previous: Option<PipelineHandle>,
+}
+
+impl Drop for ErrorCaptureRestore {
+    fn drop(&mut self) {
+        let replaced = {
+            let mut state = self.shared.lock();
+            match self.previous.take() {
+                Some(previous) => state.error_capture.insert(self.owner, previous),
+                None => state.error_capture.remove(&self.owner),
+            }
+        };
+        drop(replaced);
+    }
+}
+
 impl QPDFLogger {
     pub fn create() -> Self {
         Self::create_with_line_buffering(true)
@@ -234,6 +257,7 @@ impl QPDFLogger {
             info: stdout,
             warn: None,
             error: stderr,
+            error_capture: HashMap::new(),
             save: None,
             stdout_used,
             stdout_text_mode,
@@ -285,7 +309,37 @@ impl QPDFLogger {
     }
 
     pub fn get_error(&self) -> Result<PipelineHandle> {
-        Ok(self.shared.lock().error.clone())
+        let state = self.shared.lock();
+        let current = std::thread::current().id();
+        // qpdf-deviation-start: `QPDFLogger::getError` returns the one error
+        // pipeline unconditionally; the owner-thread overlay below exists only
+        // so a qtest capture cannot swallow a concurrent thread's warnings
+        Ok(state
+            .error_capture
+            .get(&current)
+            .cloned()
+            .unwrap_or_else(|| state.error.clone()))
+        // qpdf-deviation-end
+    }
+
+    /// Run `body` with an error pipeline visible only to the calling thread.
+    ///
+    /// qtest's contextless object accessors reproduce qpdf warnings through the
+    /// process-global default logger. A test capture must not redirect warnings
+    /// emitted concurrently by another test, so this scope overlays the error
+    /// sink for its owner thread while leaving the normal process sink visible
+    /// to every other thread.
+    pub fn with_error_capture<T>(&self, pipeline: PipelineHandle, body: impl FnOnce() -> T) -> T {
+        let owner = std::thread::current().id();
+        let previous = self.shared.lock().error_capture.insert(owner, pipeline);
+        let restore = ErrorCaptureRestore {
+            shared: Arc::clone(&self.shared),
+            owner,
+            previous,
+        };
+        let result = body();
+        drop(restore);
+        result
     }
 
     pub fn get_save(&self) -> Result<PipelineHandle> {
@@ -413,9 +467,28 @@ impl Eq for QPDFLogger {}
 #[cfg(test)]
 mod tests {
     use super::TextModeWriter;
+    use crate::{Pipeline, PipelineHandle, PipelineResult};
     use std::io::{self, Write};
     use std::sync::atomic::{AtomicBool, Ordering};
-    use std::sync::Arc;
+    use std::sync::{mpsc, Arc, Mutex};
+    use std::thread;
+
+    struct RecordingPipeline(Arc<Mutex<Vec<u8>>>);
+
+    impl Pipeline for RecordingPipeline {
+        fn identifier(&self) -> &str {
+            "logger test capture"
+        }
+
+        fn write(&mut self, data: &[u8]) -> PipelineResult<()> {
+            self.0.lock().unwrap().extend_from_slice(data);
+            Ok(())
+        }
+
+        fn finish(&mut self) -> PipelineResult<()> {
+            Ok(())
+        }
+    }
 
     #[derive(Debug, Default)]
     struct RecordingWriter {
@@ -512,6 +585,78 @@ mod tests {
         assert_eq!(text_mode.load(Ordering::Relaxed), cfg!(windows));
         logger.save_to_standard_output(false).unwrap();
         assert!(!text_mode.load(Ordering::Relaxed));
+    }
+
+    #[test]
+    fn error_captures_are_independent_across_threads() {
+        let logger = super::QPDFLogger::create();
+        let first_bytes = Arc::new(Mutex::new(Vec::new()));
+        let second_bytes = Arc::new(Mutex::new(Vec::new()));
+        let (first_entered_tx, first_entered_rx) = mpsc::channel();
+        let (first_release_tx, first_release_rx) = mpsc::channel();
+        let (second_entered_tx, second_entered_rx) = mpsc::channel();
+        let (second_release_tx, second_release_rx) = mpsc::channel();
+
+        let first_logger = logger.clone();
+        let first_capture = Arc::clone(&first_bytes);
+        let first = thread::spawn(move || {
+            first_logger.with_error_capture(
+                PipelineHandle::new(RecordingPipeline(first_capture)),
+                || {
+                    first_entered_tx.send(()).unwrap();
+                    first_release_rx.recv().unwrap();
+                    first_logger.error(b"first\n").unwrap();
+                },
+            );
+        });
+        first_entered_rx.recv().unwrap();
+
+        let second_logger = logger.clone();
+        let second_capture = Arc::clone(&second_bytes);
+        let second = thread::spawn(move || {
+            second_logger.with_error_capture(
+                PipelineHandle::new(RecordingPipeline(second_capture)),
+                || {
+                    second_entered_tx.send(()).unwrap();
+                    second_release_rx.recv().unwrap();
+                    second_logger.error(b"second\n").unwrap();
+                },
+            );
+        });
+        second_entered_rx.recv().unwrap();
+
+        first_release_tx.send(()).unwrap();
+        first.join().unwrap();
+        second_release_tx.send(()).unwrap();
+        second.join().unwrap();
+
+        assert_eq!(&*first_bytes.lock().unwrap(), b"first\n");
+        assert_eq!(&*second_bytes.lock().unwrap(), b"second\n");
+    }
+
+    #[test]
+    fn error_capture_restores_nested_scope() {
+        let logger = super::QPDFLogger::create();
+        let outer_bytes = Arc::new(Mutex::new(Vec::new()));
+        let inner_bytes = Arc::new(Mutex::new(Vec::new()));
+
+        logger.with_error_capture(
+            PipelineHandle::new(RecordingPipeline(Arc::clone(&outer_bytes))),
+            || {
+                logger.with_error_capture(
+                    PipelineHandle::new(RecordingPipeline(Arc::clone(&inner_bytes))),
+                    || logger.error(b"inner\n").unwrap(),
+                );
+                logger.error(b"outer\n").unwrap();
+            },
+        );
+
+        assert_eq!(&*outer_bytes.lock().unwrap(), b"outer\n");
+        assert_eq!(&*inner_bytes.lock().unwrap(), b"inner\n");
+
+        let mut sink = RecordingPipeline(Arc::clone(&outer_bytes));
+        assert_eq!(sink.identifier(), "logger test capture");
+        sink.finish().unwrap();
     }
 
     #[test]
