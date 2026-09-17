@@ -1415,6 +1415,7 @@ pub struct QPDFJob {
     input_name: String,
     input_name_bytes: Vec<u8>,
     message_prefix: String,
+    message_prefix_bytes: Vec<u8>,
     warnings: bool,
     suppress_warnings: bool,
     warnings_exit_zero: bool,
@@ -1545,6 +1546,7 @@ impl QPDFJob {
             input_name: String::new(),
             input_name_bytes: Vec::new(),
             message_prefix: "qpdf".to_owned(),
+            message_prefix_bytes: b"qpdf".to_vec(),
             warnings: false,
             suppress_warnings: false,
             warnings_exit_zero: false,
@@ -1593,7 +1595,20 @@ impl QPDFJob {
     ///
     /// Mirrors `QPDFJob::setMessagePrefix` (`QPDFJob.cc:303-307`).
     pub fn set_message_prefix(&mut self, message_prefix: impl Into<String>) {
-        self.message_prefix = message_prefix.into();
+        let message_prefix = message_prefix.into();
+        self.message_prefix_bytes = message_prefix.as_bytes().to_vec();
+        self.message_prefix = message_prefix;
+    }
+
+    /// Set the qpdf diagnostic prefix from its original raw argv bytes.
+    ///
+    /// qpdf stores argv[0] in a std::string and emits those bytes without
+    /// UTF-8 replacement (QUtil.cc:788-803, QPDFJob_argv.cc:427-428).
+    /// Keep the lossy string projection for the existing text getter while
+    /// preserving the source bytes for logger and pipeline output.
+    pub(crate) fn set_message_prefix_bytes(&mut self, message_prefix: Vec<u8>) {
+        self.message_prefix = String::from_utf8_lossy(&message_prefix).into_owned();
+        self.message_prefix_bytes = message_prefix;
     }
 
     /// Set the qpdf input name used by inspection diagnostics.
@@ -1886,7 +1901,7 @@ impl QPDFJob {
         if !self.configuration.verbose || self.configuration.keep_files_open.is_some() {
             return Ok(());
         }
-        let mut message = self.message_prefix.as_bytes().to_vec();
+        let mut message = self.message_prefix_bytes().to_vec();
         message.extend_from_slice(b": selecting --keep-open-files=");
         message.extend_from_slice(if self.keep_files_open_for_page_specs(specs) {
             b"y\n"
@@ -1907,7 +1922,7 @@ impl QPDFJob {
         if !self.configuration.verbose {
             return Ok(());
         }
-        let mut message = self.message_prefix.as_bytes().to_vec();
+        let mut message = self.message_prefix_bytes.clone();
         message.extend_from_slice(b": processing ");
         message.extend_from_slice(source_name.as_ref());
         message.push(b'\n');
@@ -1948,6 +1963,12 @@ impl QPDFJob {
     #[must_use]
     pub fn message_prefix(&self) -> &str {
         &self.message_prefix
+    }
+
+    /// Return the raw qpdf diagnostic prefix bytes.
+    #[must_use]
+    pub(crate) fn message_prefix_bytes(&self) -> &[u8] {
+        &self.message_prefix_bytes
     }
 
     /// Register qpdf's progress callback for writers configured by this job.
@@ -2117,7 +2138,7 @@ impl QPDFJob {
             suppress_password_recovery: self.configuration.suppress_password_recovery,
             password_is_hex_key: self.configuration.password_is_hex_key,
             verbose: self.configuration.verbose,
-            message_prefix: self.message_prefix.as_bytes().to_vec(),
+            message_prefix: self.message_prefix_bytes.clone(),
             ..PdfOpenOptions::default()
         }
     }
@@ -2834,7 +2855,7 @@ impl QPDFJob {
         options.logger = Some(self.logger.clone());
         options.description = input_name;
         options.verbose |= self.configuration.verbose;
-        options.message_prefix = self.message_prefix.as_bytes().to_vec();
+        options.message_prefix = self.message_prefix_bytes.clone();
         // qpdf's noWarn (`Config::noWarn`, `QPDFJob_config.cc:407-410`)
         // applies `pdf.setSuppressWarnings(true)` to every QPDF this job
         // opens (`QPDFJob.cc:663-665`), not just the final completion
@@ -3411,7 +3432,7 @@ impl QPDFJob {
                     self.record_warnings();
                 }
                 if self.configuration.verbose && output != Path::new("-") && !splitting {
-                    let mut message = self.message_prefix.as_bytes().to_vec();
+                    let mut message = self.message_prefix_bytes.clone();
                     message.extend_from_slice(b": wrote file ");
                     message.extend_from_slice(&path_description_bytes(&output));
                     message.push(b'\n');
@@ -3818,7 +3839,7 @@ impl QPDFJob {
                 // as bytes keeps a key like `key-\xff` intact; going through
                 // `String::from_utf8_lossy` would print U+FFFD where qpdf
                 // prints the original byte.
-                let mut message = self.message_prefix.clone().into_bytes();
+                let mut message = self.message_prefix_bytes.clone();
                 message.extend_from_slice(b": removed attachment ");
                 message.extend_from_slice(key);
                 message.push(b'\n');
@@ -3871,7 +3892,7 @@ impl QPDFJob {
             .chain(configuration.overlays.iter())
             .map(|overlay| overlay.path.as_path())
             .collect();
-        let mut message = self.message_prefix.as_bytes().to_vec();
+        let mut message = self.message_prefix_bytes.clone();
         message.extend_from_slice(b": processing underlay/overlay\n");
         for page in report {
             message.extend_from_slice(b"  page ");
@@ -4419,7 +4440,7 @@ impl QPDFJob {
         // separate preserves custom-pipeline boundaries as well as bytes.
         let pipeline = self.logger.get_error()?;
         pipeline
-            .write(self.message_prefix.as_bytes())
+            .write(&self.message_prefix_bytes)
             .map_err(Error::from)?;
         pipeline.write(b": ").map_err(Error::from)?;
         pipeline
@@ -4576,7 +4597,7 @@ impl QPDFJob {
         options.logger = Some(self.logger.clone());
         options.description = input_name;
         options.verbose |= self.configuration.verbose;
-        options.message_prefix = self.message_prefix.as_bytes().to_vec();
+        options.message_prefix = self.message_prefix_bytes.clone();
         // qpdf's `setQPDFOptions` applies `noWarn` to every ordinary QPDF
         // immediately after construction and before `processFile`
         // (`QPDFJob.cc:650-666,1695-1711`). Preserve an explicit caller
@@ -4629,7 +4650,7 @@ impl QPDFJob {
         // apply to this open exactly like the ordinary path
         // (`QPDFJob.cc:1717-1791`).
         options.verbose |= self.configuration.verbose;
-        options.message_prefix = self.message_prefix.as_bytes().to_vec();
+        options.message_prefix = self.message_prefix_bytes.clone();
         // The encryption-inspection creation path is still a qpdf input
         // QPDF, so `noWarn` must be applied before authentication/parsing just
         // like the ordinary `doProcessOnce` path.
@@ -4765,7 +4786,7 @@ impl QPDFJob {
         // gets the report here too; the argument only adds the CLI's own flag.
         if verbose || self.configuration.verbose {
             if let Some(filename) = output_filename {
-                let mut message = self.message_prefix.as_bytes().to_vec();
+                let mut message = self.message_prefix_bytes.clone();
                 message.extend_from_slice(b": wrote file ");
                 message.extend_from_slice(&path_description_bytes(&filename));
                 message.push(b'\n');

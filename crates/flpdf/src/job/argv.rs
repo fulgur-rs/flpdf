@@ -31,8 +31,8 @@ pub(super) fn initialize(job: &mut QPDFJob, argv: Vec<Vec<u8>>) -> Result<()> {
     // override.
     let program = expanded
         .first()
-        .map_or_else(String::new, |argv0| program_name(argv0));
-    job.set_message_prefix(program);
+        .map_or_else(Vec::new, |argv0| program_name_bytes(argv0).to_vec());
+    job.set_message_prefix_bytes(program);
 
     if expanded.len() == 2 && handle_sole_help_option(job, &expanded[0], &expanded[1])? {
         return Ok(());
@@ -890,7 +890,7 @@ impl<'a> Parser<'a> {
 
     fn apply_job_json_file(&mut self, value: &[u8]) -> Result<()> {
         let path = path_from_bytes(value);
-        let prefix = self.job.message_prefix.clone();
+        let prefix_bytes = self.job.message_prefix_bytes.clone();
         let result = (|| {
             let bytes = std::fs::read(&path)
                 .map_err(|error| Error::file_io("open", path.clone(), error))?;
@@ -900,14 +900,14 @@ impl<'a> Parser<'a> {
         // `qpdfjob json` prefix. qpdf's Config::jobJsonFile callback is still
         // inside the argv job and keeps its original prefix, so restore it
         // after the nested dispatch on both success and failure.
-        self.job.message_prefix = prefix.clone();
+        self.job.set_message_prefix_bytes(prefix_bytes.clone());
         result.map_err(|error| {
             let mut message = b"error with job-json file ".to_vec();
             message.extend_from_slice(value);
             message.extend_from_slice(b": ");
             message.extend_from_slice(error.to_string().as_bytes());
             message.extend_from_slice(b"\nRun ");
-            message.extend_from_slice(prefix.as_bytes());
+            message.extend_from_slice(&prefix_bytes);
             message.extend_from_slice(b" --job-json-help for information on the file format.");
             Error::Usage(UsageError::new(message))
         })?;
@@ -2140,6 +2140,33 @@ fn help_top(program: &str) -> Vec<u8> {
     .into_bytes()
 }
 
+fn version_output(program: &[u8]) -> Vec<u8> {
+    let mut output = program.to_vec();
+    output.extend_from_slice(b" version ");
+    output.extend_from_slice(crate::qpdf_version().as_bytes());
+    output.extend_from_slice(b"\nRun ");
+    output.extend_from_slice(program);
+    output.extend_from_slice(b" --copyright to see copyright and license information.\n");
+    output
+}
+
+fn copyright_output(program: &[u8]) -> Vec<u8> {
+    let source = QPDF_COPYRIGHT.as_bytes();
+    let marker = b"qpdf version";
+    let Some(offset) = source
+        .windows(marker.len())
+        .position(|window| window == marker)
+    else {
+        return source.to_vec();
+    };
+    let mut output = Vec::with_capacity(source.len() + program.len());
+    output.extend_from_slice(&source[..offset]);
+    output.extend_from_slice(program);
+    output.extend_from_slice(b" version");
+    output.extend_from_slice(&source[offset + marker.len()..]);
+    output
+}
+
 fn completion_command(
     argv0: &[u8],
     zsh: bool,
@@ -2314,19 +2341,14 @@ fn handle_sole_help_option(job: &mut QPDFJob, argv0: &[u8], argument: &[u8]) -> 
         return Ok(false);
     };
     let program = program_name(argv0);
+    let program_bytes = program_name_bytes(argv0);
     match name {
         b"version" | b"copyright" | b"show-crypto" | b"job-json-help" | b"completion-bash"
         | b"completion-zsh" | b"help" => {
             job.argv_early_exit = true;
             match name {
-                b"version" => job.logger.info(format!(
-                    "{program} version {}\nRun {program} --copyright to see copyright and license information.\n",
-                    crate::qpdf_version()
-                ))?, // cov:ignore: LLVM maps the covered version logger continuation to the call setup
-                b"copyright" => job.logger.info(
-                    QPDF_COPYRIGHT
-                        .replacen("qpdf version", &format!("{program} version"), 1),
-                )?, // cov:ignore: LLVM maps the covered copyright logger continuation to the call setup
+                b"version" => job.logger.info(version_output(program_bytes))?, // cov:ignore: LLVM maps the covered version logger continuation to the call setup
+                b"copyright" => job.logger.info(copyright_output(program_bytes))?, // cov:ignore: LLVM maps the covered copyright logger continuation to the call setup
                 b"show-crypto" => show_crypto(job)?,
                 b"completion-bash" => completion(job, argv0, false)?,
                 b"completion-zsh" => completion(job, argv0, true)?,
@@ -2505,5 +2527,18 @@ mod tests {
     fn os_string_bytes_preserves_the_completion_executable() {
         let executable = OsString::from("/tmp/qpdf");
         assert_eq!(os_string_bytes(&executable), b"/tmp/qpdf");
+    }
+
+    #[test]
+    fn raw_argv_preserves_program_bytes_for_prefix_and_version() {
+        let mut job = QPDFJob::new();
+        job.initialize_from_raw_argv(&[b"/tmp/custom-\xff.exe".to_vec(), b"--version".to_vec()])
+            .unwrap();
+
+        assert_eq!(job.message_prefix_bytes(), b"custom-\xff");
+        assert_eq!(
+            version_output(b"custom-\xff"),
+            b"custom-\xff version 11.9.0\nRun custom-\xff --copyright to see copyright and license information.\n"
+        );
     }
 }
