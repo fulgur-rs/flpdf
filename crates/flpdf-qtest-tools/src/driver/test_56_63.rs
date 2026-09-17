@@ -645,7 +645,7 @@ mod tests {
     use super::{run_test_61, test_56_59_body, DefaultErrorCaptureSink};
     use flpdf::{ObjectHandle, Pdf, Pipeline};
     use std::ffi::OsString;
-    use std::sync::{Arc, Barrier, Mutex};
+    use std::sync::{mpsc, Arc, Barrier, Mutex};
     use std::thread;
 
     struct CurrentDirGuard(std::path::PathBuf);
@@ -720,9 +720,8 @@ mod tests {
         // catch never has a window to happen -- the process-global
         // implementation passes that schedule too.
         let ready = Arc::new(Barrier::new(2));
-        let warned = Arc::new(Barrier::new(2));
+        let (worker_finished_tx, worker_finished_rx) = mpsc::channel();
         let worker_ready = Arc::clone(&ready);
-        let worker_warned = Arc::clone(&warned);
         let worker = thread::spawn(move || {
             worker_ready.wait();
             let args = vec![
@@ -732,9 +731,9 @@ mod tests {
                 malformed.into_os_string(),
             ];
             let _ = crate::large_file::run(&args);
-            // The repair warnings are on the shared sink now; release the
-            // capture scope only from here.
-            worker_warned.wait();
+            worker_finished_tx
+                .send(())
+                .expect("signal after malformed repair warning");
         });
 
         let mut pdf = Pdf::empty().expect("create test 62 document");
@@ -744,9 +743,9 @@ mod tests {
             let t = pdf.trailer();
             t.replace_key(b"/Q1", ObjectHandle::integer(3 * i64::from(i32::MAX)))?;
             assert_eq!(t.try_get_key(b"/Q1")?.try_get_int_value_as_int()?, i32::MAX);
-            // Stay inside the capture until the worker's repair warnings have
-            // been emitted, so a process-global capture would swallow them.
-            warned.wait();
+            worker_finished_rx
+                .recv()
+                .expect("wait for malformed repair warning");
             Ok(())
         });
         worker.join().expect("malformed-input worker");

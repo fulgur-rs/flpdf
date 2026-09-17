@@ -211,15 +211,14 @@ struct ErrorCaptureRestore {
 
 impl Drop for ErrorCaptureRestore {
     fn drop(&mut self) {
-        let mut state = self.shared.lock();
-        match self.previous.take() {
-            Some(previous) => {
-                state.error_capture.insert(self.owner, previous);
+        let replaced = {
+            let mut state = self.shared.lock();
+            match self.previous.take() {
+                Some(previous) => state.error_capture.insert(self.owner, previous),
+                None => state.error_capture.remove(&self.owner),
             }
-            None => {
-                state.error_capture.remove(&self.owner);
-            }
-        }
+        };
+        drop(replaced);
     }
 }
 
@@ -468,9 +467,28 @@ impl Eq for QPDFLogger {}
 #[cfg(test)]
 mod tests {
     use super::TextModeWriter;
+    use crate::{Pipeline, PipelineHandle, PipelineResult};
     use std::io::{self, Write};
     use std::sync::atomic::{AtomicBool, Ordering};
-    use std::sync::Arc;
+    use std::sync::{mpsc, Arc, Mutex};
+    use std::thread;
+
+    struct RecordingPipeline(Arc<Mutex<Vec<u8>>>);
+
+    impl Pipeline for RecordingPipeline {
+        fn identifier(&self) -> &str {
+            "logger test capture"
+        }
+
+        fn write(&mut self, data: &[u8]) -> PipelineResult<()> {
+            self.0.lock().unwrap().extend_from_slice(data);
+            Ok(())
+        }
+
+        fn finish(&mut self) -> PipelineResult<()> {
+            Ok(())
+        }
+    }
 
     #[derive(Debug, Default)]
     struct RecordingWriter {
@@ -567,6 +585,53 @@ mod tests {
         assert_eq!(text_mode.load(Ordering::Relaxed), cfg!(windows));
         logger.save_to_standard_output(false).unwrap();
         assert!(!text_mode.load(Ordering::Relaxed));
+    }
+
+    #[test]
+    fn error_captures_are_independent_across_threads() {
+        let logger = super::QPDFLogger::create();
+        let first_bytes = Arc::new(Mutex::new(Vec::new()));
+        let second_bytes = Arc::new(Mutex::new(Vec::new()));
+        let (first_entered_tx, first_entered_rx) = mpsc::channel();
+        let (first_release_tx, first_release_rx) = mpsc::channel();
+        let (second_entered_tx, second_entered_rx) = mpsc::channel();
+        let (second_release_tx, second_release_rx) = mpsc::channel();
+
+        let first_logger = logger.clone();
+        let first_capture = Arc::clone(&first_bytes);
+        let first = thread::spawn(move || {
+            first_logger.with_error_capture(
+                PipelineHandle::new(RecordingPipeline(first_capture)),
+                || {
+                    first_entered_tx.send(()).unwrap();
+                    first_release_rx.recv().unwrap();
+                    first_logger.error(b"first\n").unwrap();
+                },
+            );
+        });
+        first_entered_rx.recv().unwrap();
+
+        let second_logger = logger.clone();
+        let second_capture = Arc::clone(&second_bytes);
+        let second = thread::spawn(move || {
+            second_logger.with_error_capture(
+                PipelineHandle::new(RecordingPipeline(second_capture)),
+                || {
+                    second_entered_tx.send(()).unwrap();
+                    second_release_rx.recv().unwrap();
+                    second_logger.error(b"second\n").unwrap();
+                },
+            );
+        });
+        second_entered_rx.recv().unwrap();
+
+        first_release_tx.send(()).unwrap();
+        first.join().unwrap();
+        second_release_tx.send(()).unwrap();
+        second.join().unwrap();
+
+        assert_eq!(&*first_bytes.lock().unwrap(), b"first\n");
+        assert_eq!(&*second_bytes.lock().unwrap(), b"second\n");
     }
 
     #[test]
