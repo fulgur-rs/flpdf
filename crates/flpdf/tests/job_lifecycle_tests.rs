@@ -311,6 +311,26 @@ fn raw_argv_encryption_config_survives_repeated_groups_and_decrypt() {
     assert!(decrypt_bytes
         .windows(b"/P -2056".len())
         .any(|window| window == b"/P -2056"));
+
+    let mut insecure = QPDFJob::new();
+    let error = insecure
+        .initialize_from_raw_argv(&[
+            b"qpdfjob".to_vec(),
+            fixture.to_string_lossy().into_owned().into_bytes(),
+            b"--encrypt".to_vec(),
+            b"user".to_vec(),
+            Vec::new(),
+            b"256".to_vec(),
+            b"--".to_vec(),
+            tempdir
+                .path()
+                .join("rejected-insecure.pdf")
+                .to_string_lossy()
+                .into_owned()
+                .into_bytes(),
+        ])
+        .expect_err("the final qpdf configuration check must reject insecure encryption");
+    assert!(matches!(error, Error::Usage(_)));
 }
 
 #[test]
@@ -412,6 +432,52 @@ fn json_encrypt_allow_insecure_reaches_final_configuration_check() {
     let mut job = QPDFJob::new();
     job.initialize_from_json(&json.to_string()).unwrap();
     assert_eq!(job.run().unwrap(), JobExitCode::Success);
+}
+
+#[test]
+fn raw_argv_job_json_positionals_reject_existing_config_slots() {
+    let fixture =
+        Path::new(env!("CARGO_MANIFEST_DIR")).join("../../tests/fixtures/compat/one-page.pdf");
+    let tempdir = tempfile::tempdir().unwrap();
+
+    let input_json = tempdir.path().join("input.json");
+    std::fs::write(
+        &input_json,
+        serde_json::json!({"inputFile": fixture}).to_string(),
+    )
+    .unwrap();
+    let mut input_job = QPDFJob::new();
+    assert!(matches!(
+        input_job
+            .initialize_from_raw_argv(&[
+                b"qpdfjob".to_vec(),
+                b"--job-json-file".to_vec(),
+                input_json.to_string_lossy().into_owned().into_bytes(),
+                b"unexpected-output.pdf".to_vec(),
+            ])
+            .unwrap_err(),
+        Error::Usage(_)
+    ));
+
+    let output_json = tempdir.path().join("output.json");
+    std::fs::write(
+        &output_json,
+        serde_json::json!({"outputFile": tempdir.path().join("configured.pdf")}).to_string(),
+    )
+    .unwrap();
+    let mut output_job = QPDFJob::new();
+    assert!(matches!(
+        output_job
+            .initialize_from_raw_argv(&[
+                b"qpdfjob".to_vec(),
+                b"--job-json-file".to_vec(),
+                output_json.to_string_lossy().into_owned().into_bytes(),
+                fixture.to_string_lossy().into_owned().into_bytes(),
+                b"second-output.pdf".to_vec(),
+            ])
+            .unwrap_err(),
+        Error::Usage(_)
+    ));
 }
 
 #[cfg(target_os = "linux")]

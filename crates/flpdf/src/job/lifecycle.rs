@@ -6462,6 +6462,11 @@ mod tests {
         )
         .unwrap();
         assert!(parse_job_encrypt(&encrypt_128, true).is_ok());
+        let encrypt_128_no_accessibility = crate::json::Json::parse(
+            br#"{"userPassword":"u","ownerPassword":"o","128bit":{"accessibility":"n","useAes":"y"}}"#,
+        )
+        .unwrap();
+        assert!(parse_job_encrypt(&encrypt_128_no_accessibility, true).is_ok());
         let encrypt_256 = crate::json::Json::parse(
             br#"{"userPassword":"u","ownerPassword":"o","256bit":{"forceR5":"","allowInsecure":""}}"#,
         )
@@ -6495,6 +6500,24 @@ mod tests {
             crate::json::Json::parse(br#"{"userPassword":"u","ownerPassword":"o"}"#).unwrap();
         assert!(parse_job_encrypt(&no_key_length, true).is_err());
         assert!(parse_job_encrypt(&encrypt_40, false).is_err());
+    }
+
+    #[test]
+    fn encryption_defaults_retain_each_qpdf_method_boundary() {
+        let params = [
+            crate::EncryptParams::rc4(EncryptMethod::V1Rc440, b"u", b"o"),
+            crate::EncryptParams::rc4(EncryptMethod::V2Rc4128, b"u", b"o"),
+            crate::EncryptParams::rc4(EncryptMethod::V4Rc4128, b"u", b"o"),
+            crate::EncryptParams::v4_aes128(b"u", b"o"),
+            crate::EncryptParams::v5_r5(b"u", b"o"),
+            crate::EncryptParams::v5_r6(b"u", b"o"),
+        ];
+        for params in params {
+            let defaults = EncryptionDefaults::from_params(&params, true);
+            assert_eq!(defaults.user_password, b"u");
+            assert_eq!(defaults.owner_password, b"o");
+            assert!(defaults.allow_insecure);
+        }
     }
 
     #[test]
