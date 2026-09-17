@@ -3875,8 +3875,15 @@ fn write_linearized_impl<R: Read + Seek>(
     // preserved permanent identifier and the `/Info`-derived suffix feeds the
     // seed; reading either after the placeholder is installed would mistake the
     // 16 zero bytes for a real source `/ID[0]` and corrupt the result.
+    // Read `/ID[0]` through the LIVE trailer, matching
+    // `QPDFWriter::getOriginalID1` (`QPDFWriter.cc`), which calls
+    // `m->pdf.getTrailer()` on every invocation and never a copy. The
+    // shallow copy below is a detached value graph: a malformed present
+    // `/ID` (e.g. `/ID 7`) would raise the accessor's type warning without a
+    // document to warn through, turning qpdf's warn-and-continue into an
+    // abort that produces no output.
+    let source_id0 = crate::writer::source_permanent_id_handle(&pdf.trailer())?;
     let source_trailer_handle = pdf.trailer().shallow_copy()?;
-    let source_id0 = crate::writer::source_permanent_id_handle(&source_trailer_handle)?;
     let (det_id_source_id0, det_id_info_suffix): (Option<Vec<u8>>, Vec<u8>) = if deterministic_id {
         let suffix = crate::writer::deterministic_id_info_suffix(pdf);
         (source_id0.clone(), suffix)
@@ -5729,6 +5736,69 @@ mod tests {
         assert!(bytes
             .windows(b"0000000000 65535 f \n".len())
             .any(|window| window == b"0000000000 65535 f \n"));
+    }
+
+    fn one_page_pdf_with_malformed_trailer_id() -> Vec<u8> {
+        let mut pdf = b"%PDF-1.4\n".to_vec();
+        let off1 = pdf.len();
+        pdf.extend_from_slice(b"1 0 obj\n<< /Type /Catalog /Pages 2 0 R >>\nendobj\n");
+        let off2 = pdf.len();
+        pdf.extend_from_slice(b"2 0 obj\n<< /Type /Pages /Kids [3 0 R] /Count 1 >>\nendobj\n");
+        let off3 = pdf.len();
+        pdf.extend_from_slice(
+            b"3 0 obj\n<< /Type /Page /Parent 2 0 R /MediaBox [0 0 612 792] >>\nendobj\n",
+        );
+        let xref = pdf.len();
+        pdf.extend_from_slice(
+            format!(
+                "xref\n0 4\n0000000000 65535 f \n{off1:010} 00000 n \n{off2:010} 00000 n \n{off3:010} 00000 n \ntrailer\n<< /Size 4 /Root 1 0 R /ID 7 >>\nstartxref\n{xref}\n%%EOF\n"
+            )
+            .as_bytes(),
+        );
+        pdf
+    }
+
+    #[test]
+    fn linearized_writer_reads_the_permanent_id_through_the_live_trailer() {
+        // `QPDFWriter::getOriginalID1` calls `m->pdf.getTrailer()` on every
+        // invocation and never a copy, so a malformed present `/ID` reaches
+        // `getArrayItem`/`getStringValue` with a document attached: qpdf warns
+        // and keeps writing. Reading the same value from the detached shallow
+        // copy leaves the accessor without a document to warn through, which
+        // turns the warning into an abort and produces no output at all.
+        let mut pdf = Pdf::open(Cursor::new(one_page_pdf_with_malformed_trailer_id()))
+            .expect("source parses");
+        let options = WriterOptions {
+            static_id: true,
+            ..WriterOptions::default()
+        };
+        let setup = crate::writer::build_writer_setup(&mut pdf, &options).unwrap();
+        let mut bytes = Vec::new();
+        write_linearized_for_pdf_writer(&mut pdf, &options, None, setup, &mut bytes)
+            .expect("a malformed present /ID warns instead of aborting the write");
+
+        assert!(
+            !bytes.is_empty(),
+            "qpdf emits a complete linearized file for this input"
+        );
+        let messages: Vec<String> = pdf
+            .repair_diagnostics()
+            .entries()
+            .iter()
+            .map(|entry| String::from_utf8_lossy(entry.what_bytes()).into_owned())
+            .collect();
+        assert!(
+            messages.iter().any(|message| message.contains(
+                "operation for array attempted on object of type integer: returning null"
+            )),
+            "expected the array accessor warning, got {messages:?}"
+        );
+        assert!(
+            messages.iter().any(|message| message.contains(
+                "operation for string attempted on object of type null: returning empty string"
+            )),
+            "expected the string accessor warning, got {messages:?}"
+        );
     }
 
     fn one_page_pdf_with_direct_outlines() -> Vec<u8> {
