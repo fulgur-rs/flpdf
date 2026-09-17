@@ -2842,6 +2842,7 @@ where
     handle.with_value(|value| match value {
         Some(ObjectValue::String(bytes)) => write_string(out, bytes),
         Some(value) => unparse_object_value(value, out),
+        // cov:ignore: is_direct_scalar_handle requires a concrete direct value before this helper runs.
         None => out.write_bytes(b"null"),
     })
 }
@@ -6494,6 +6495,43 @@ mod tests {
         assert!(text.contains("/ByteRange [\n"));
         assert!(text.contains("/Contents <00ff>"));
         assert!(text.contains("/Label (label)"));
+        Ok(())
+    }
+
+    #[test]
+    fn dynamic_string_writer_fast_path_keeps_signature_hex_and_drops_nulls() -> Result<()> {
+        let signature = ObjectHandle::dictionary(vec![
+            (b"/Type".to_vec(), ObjectHandle::name(b"Sig".to_vec())),
+            (b"/ByteRange".to_vec(), ObjectHandle::integer(0)),
+            (b"/Contents".to_vec(), ObjectHandle::string(vec![0, 0xff])),
+            (b"/Label".to_vec(), ObjectHandle::string(b"label".to_vec())),
+            (b"/Null".to_vec(), ObjectHandle::null()),
+        ]);
+        let mut output = Vec::new();
+        let mut map = |_: &ObjectHandle| Ok::<ObjectRef, Error>(ObjectRef::new(1, 0));
+        let mut strings = |out: &mut OutputSink<'_>, value: &[u8]| {
+            crate::pdf_syntax::write_string_value(out, value)
+        };
+        let mut direct_stream_writer = DefaultDynamicDirectStreamWriter {
+            newline_before_endstream: None,
+            qdf_mode: false,
+        };
+
+        super::super::output::with_buffer_sink(&mut output, |out| {
+            write_object_with_dynamic_ref_map_and_string_writer_and_direct_stream_writer(
+                &signature,
+                out,
+                &mut map,
+                &BTreeSet::new(),
+                &mut strings,
+                &mut direct_stream_writer,
+            )
+        })?;
+
+        let text = String::from_utf8(output).expect("signature output is ASCII");
+        assert!(text.contains("/Contents <00ff>"));
+        assert!(text.contains("/Label (label)"));
+        assert!(!text.contains("/Null"));
         Ok(())
     }
 

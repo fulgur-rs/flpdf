@@ -670,6 +670,9 @@ mod tests {
             .resolved_is_dictionary_of_type(b"Annot", b"Link")
             .expect("type probe"));
         assert!(!typed
+            .resolved_is_dictionary_of_type(b"Annot", b"Widget")
+            .expect("mismatching subtype probe"));
+        assert!(!typed
             .resolved_is_dictionary_of_type(b"Page", b"")
             .expect("mismatching type probe"));
         assert_eq!(
@@ -682,6 +685,13 @@ mod tests {
                 .expect("key-only visible keys"),
             vec![b"/Subtype".to_vec(), b"/Type".to_vec()]
         );
+
+        let scalar = ObjectHandle::integer(1);
+        scalar.try_dereference().expect("direct scalar resolves");
+        let error = scalar
+            .resolved_get_visible_keys()
+            .expect_err("non-dictionary visible keys warn like qpdf");
+        assert!(error.to_string().contains("operation for dictionary"));
 
         let missing_type =
             ObjectHandle::dictionary(vec![(b"/Child".to_vec(), ObjectHandle::integer(3))]);
