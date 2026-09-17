@@ -1548,6 +1548,12 @@ impl LinearizationPlan {
             object_stream_mode,
             crate::writer::ObjectStreamMode::Generate
         );
+        // QPDFWriter::initializeSpecialStreams calls getAllPages before it
+        // prepares object-stream state and before QPDF::optimize. Keep the
+        // same live page-tree read at the front of the linearization setup so
+        // its diagnostics precede warnings raised while object-stream plans
+        // inspect malformed objects.
+        let prepared_page_sequence = crate::pages::repair::prepare_for_optimization(pdf)?;
         let capture_pre_optimization_objects =
             !matches!(object_stream_mode, crate::writer::ObjectStreamMode::Disable);
         let pre_optimization_object_refs = capture_pre_optimization_objects
@@ -1638,14 +1644,13 @@ impl LinearizationPlan {
         // content-normalization probe consume that stable sequence. Empty
         // page lists intentionally remain uncached, matching qpdf's
         // `m->all_pages.empty()` sentinel in QPDF_pages.cc:42-44.
-        let prepared_page_sequence = if options.content_normalization {
-            crate::pages::repair::prepare_for_optimization(pdf)?
+        let prepared_page_refs = if options.content_normalization {
+            prepared_page_sequence
+                .as_ref()
+                .map_or(&[][..], |prepared| prepared.pages.as_slice())
         } else {
-            None
+            &[][..]
         };
-        let prepared_page_refs = prepared_page_sequence
-            .as_ref()
-            .map_or(&[][..], |prepared| prepared.pages.as_slice());
         let content_normalize_refs =
             linearization_content_normalize_refs(pdf, options, prepared_page_refs)?;
         let mut skipped_raw_stream_parameter_streams: BTreeSet<QpdfObjGen> = BTreeSet::new();

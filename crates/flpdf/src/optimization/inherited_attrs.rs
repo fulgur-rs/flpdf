@@ -25,6 +25,29 @@ use crate::{ObjectHandle, ObjectRef};
 
 const INHERITABLE_KEYS: [&[u8]; 4] = [b"/CropBox", b"/MediaBox", b"/Resources", b"/Rotate"];
 
+/// Reproduce qpdf's inherited-page walk boundary when `/Pages` is not a
+/// dictionary. `QPDF_optimization.cc` still asks the null page-tree handle for
+/// its keys and iterates the resulting null `/Kids` handle three times while
+/// preparing inherited attributes (`:57-118,128-150,160-245`).
+pub(crate) fn warn_missing_page_tree<R: Read + Seek>(pdf: &mut Pdf<R>) -> Result<()> {
+    let root = pdf.trailer_key_handle(b"Root");
+    if root.try_is_null()? {
+        return Ok(());
+    }
+    root.try_dereference()?;
+    if !root.try_is_dictionary()? {
+        return Ok(());
+    }
+
+    let pages = root.try_get_key(b"/Pages")?;
+    let _ = pages.try_get_keys()?;
+    let kids = pages.try_get_key(b"/Kids")?;
+    for _ in 0..3 {
+        let _ = kids.try_get_array_n_items()?;
+    }
+    Ok(())
+}
+
 pub(crate) fn push<R: Read + Seek>(
     pdf: &mut Pdf<R>,
     prepared: &PreparedPages,
