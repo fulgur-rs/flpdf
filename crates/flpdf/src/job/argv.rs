@@ -2279,11 +2279,7 @@ fn completion(job: &QPDFJob, argv0: &[u8], zsh: bool) -> Result<()> {
 }
 
 fn show_crypto_provider(job: &QPDFJob, provider: &str) -> Result<()> {
-    let registered = QPDF_SHOW_CRYPTO
-        .split(|byte| *byte == b'\n')
-        .filter(|name| !name.is_empty())
-        .map(|name| String::from_utf8_lossy(name).into_owned())
-        .collect::<Vec<_>>();
+    let registered = registered_crypto_providers();
     if !registered.iter().any(|name| name == provider) {
         // qpdf's provider registry raises std::logic_error here
         // (`QPDFCryptoProvider.cc:91-99`), not QPDFUsage.
@@ -2294,6 +2290,23 @@ fn show_crypto_provider(job: &QPDFJob, provider: &str) -> Result<()> {
     job.logger
         .info(crypto_provider_output(provider, &registered))
 }
+
+fn registered_crypto_providers() -> Vec<String> {
+    // qpdf registers providers selected by the build (`QPDFCryptoProvider.cc:49-62`;
+    // `libqpdf/CMakeLists.txt:207-270`). The pinned Linux oracle asset is GnuTLS;
+    // the CI Windows and macOS qpdf builds use their required OpenSSL provider.
+    QPDF_CRYPTO_REGISTRY
+        .split(|byte| *byte == b'\n')
+        .filter(|name| !name.is_empty())
+        .map(|name| String::from_utf8_lossy(name).into_owned())
+        .collect()
+}
+
+#[cfg(any(target_os = "windows", target_os = "macos"))]
+const QPDF_CRYPTO_REGISTRY: &[u8] = b"openssl\n";
+
+#[cfg(not(any(target_os = "windows", target_os = "macos")))]
+const QPDF_CRYPTO_REGISTRY: &[u8] = QPDF_SHOW_CRYPTO;
 
 fn crypto_provider_output(provider: &str, registered: &[String]) -> String {
     let mut output = String::new();
@@ -2309,9 +2322,10 @@ fn crypto_provider_output(provider: &str, registered: &[String]) -> String {
 }
 
 fn show_crypto(job: &QPDFJob) -> Result<()> {
+    let registered = registered_crypto_providers();
     let provider = std::env::var_os("QPDF_CRYPTO_PROVIDER")
         .map(|value| value.to_string_lossy().into_owned())
-        .unwrap_or_else(|| String::from_utf8_lossy(QPDF_SHOW_CRYPTO).trim().to_owned());
+        .unwrap_or_else(|| registered.first().cloned().unwrap_or_default());
     show_crypto_provider(job, &provider)
 }
 
@@ -2459,9 +2473,9 @@ mod tests {
     #[test]
     fn show_crypto_rejects_a_provider_outside_the_pinned_registry() {
         let job = QPDFJob::new();
-        let error = show_crypto_provider(&job, "openssl").unwrap_err();
+        let error = show_crypto_provider(&job, "unknown-provider").unwrap_err();
         assert!(matches!(error, Error::Internal(message) if message
-            .contains("unknown implementation \"openssl\"")));
+            .contains("unknown implementation \"unknown-provider\"")));
     }
 
     #[test]
