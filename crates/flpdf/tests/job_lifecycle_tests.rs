@@ -314,6 +314,34 @@ fn raw_argv_encryption_config_survives_repeated_groups_and_decrypt() {
 }
 
 #[test]
+fn raw_argv_256_bit_group_keeps_aes_for_a_later_128_bit_group() {
+    let fixture =
+        Path::new(env!("CARGO_MANIFEST_DIR")).join("../../tests/fixtures/compat/one-page.pdf");
+    let tempdir = tempfile::tempdir().unwrap();
+    let output = tempdir.path().join("256-then-128.pdf");
+    let mut job = QPDFJob::new();
+    job.initialize_from_raw_argv(&[
+        b"qpdfjob".to_vec(),
+        fixture.to_string_lossy().into_owned().into_bytes(),
+        b"--encrypt".to_vec(),
+        b"user".to_vec(),
+        b"owner".to_vec(),
+        b"256".to_vec(),
+        b"--".to_vec(),
+        b"--encrypt".to_vec(),
+        b"user-2".to_vec(),
+        b"owner-2".to_vec(),
+        b"128".to_vec(),
+        b"--".to_vec(),
+        output.to_string_lossy().into_owned().into_bytes(),
+    ])
+    .unwrap();
+    assert_eq!(job.run().unwrap(), JobExitCode::Success);
+    let bytes = std::fs::read(output).unwrap();
+    assert!(bytes.windows(b"/V 4".len()).any(|window| window == b"/V 4"));
+}
+
+#[test]
 fn raw_argv_named_pages_range_does_not_change_positional_state() {
     let fixture =
         Path::new(env!("CARGO_MANIFEST_DIR")).join("../../tests/fixtures/compat/one-page.pdf");

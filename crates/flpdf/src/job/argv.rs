@@ -1573,7 +1573,10 @@ impl EncryptionState {
             )
         };
 
-        let mut use_aes = self.inherited.use_aes;
+        // QPDFJob::Config::encrypt(256, ...) unconditionally sets use_aes;
+        // that setting remains in Config after a later --encrypt group changes
+        // the key length back to 128 (`QPDFJob_config.cc:1088-1096`).
+        let mut use_aes = self.inherited.use_aes || key_len == 256;
         let mut force_v4 = self.inherited.force_v4;
         let mut force_r5 = self.inherited.force_r5;
         let mut allow_insecure = self.inherited.allow_insecure;
