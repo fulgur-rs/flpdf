@@ -1488,6 +1488,19 @@ fn qtest_accessor_cases_do_not_use_explicit_pdf_resolve() {
             && !test_4.contains(".is_null()"),
         "test 4 must use the canonical resolving null predicate without a caller-side bridge"
     );
+    let test_5 = section(
+        early_source.as_str(),
+        "pub(crate) fn run_test_5",
+        "pub(crate) fn run_test_6",
+    );
+    assert!(
+        test_5.contains("try_is_array()")
+            && test_5.contains("try_get_array_n_items()")
+            && test_5.contains("try_get_array_item(")
+            && !test_5.contains("resolve_handle(")
+            && !test_5.contains(".as_array()"),
+        "test 5 must use canonical resolving array accessors without a caller-side bridge"
+    );
     let test_6 = section(
         early_source.as_str(),
         "pub(crate) fn run_test_6",
