@@ -2409,6 +2409,7 @@ fn read_password_file(job: &QPDFJob, value: &[u8]) -> Result<Option<Vec<u8>>> {
 mod tests {
     use super::*;
     use crate::QPDFLogger;
+    use std::ffi::OsString;
 
     #[test]
     fn show_crypto_rejects_a_provider_outside_the_pinned_registry() {
@@ -2498,5 +2499,11 @@ mod tests {
             b"complete -o bashdefault -o default -o nospace -C \"/tmp/custom-\xff\" custom-\xff\n"
         );
         assert!(!relative);
+    }
+
+    #[test]
+    fn os_string_bytes_preserves_the_completion_executable() {
+        let executable = OsString::from("/tmp/qpdf");
+        assert_eq!(os_string_bytes(&executable), b"/tmp/qpdf");
     }
 }
