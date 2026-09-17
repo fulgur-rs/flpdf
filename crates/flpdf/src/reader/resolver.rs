@@ -9354,6 +9354,53 @@ mod tests {
     }
 
     #[test]
+    fn effective_xref_snapshot_merges_raw_and_default_rows_in_qpdf_order() {
+        let resolver = bare_resolver();
+        resolver.install_raw_xref_entries(BTreeMap::from([
+            (
+                QpdfObjGen::new(1, 0),
+                XrefEntry::Uncompressed { offset: 11 },
+            ),
+            (
+                QpdfObjGen::new(3, 0),
+                XrefEntry::Compressed {
+                    stream: 9,
+                    index: 2,
+                },
+            ),
+            (QpdfObjGen::new(4, 0), XrefEntry::Free { next: 0 }),
+        ]));
+        resolver.insert_default_xref_entry_for_test(ObjectRef::new(2, 0));
+        resolver.insert_default_xref_entry_for_test(ObjectRef::new(3, 0));
+        resolver.insert_default_xref_entry_for_test(ObjectRef::new(5, 0));
+
+        let entries = resolver.effective_xref_entries();
+
+        assert_eq!(
+            entries
+                .iter()
+                .map(|(object_gen, _)| *object_gen)
+                .collect::<Vec<_>>(),
+            [
+                QpdfObjGen::new(1, 0),
+                QpdfObjGen::new(2, 0),
+                QpdfObjGen::new(3, 0),
+                QpdfObjGen::new(4, 0),
+                QpdfObjGen::new(5, 0),
+            ]
+        );
+        assert_eq!(entries[1].1, XrefEntry::Free { next: 0 });
+        assert_eq!(
+            entries[2].1,
+            XrefEntry::Compressed {
+                stream: 9,
+                index: 2,
+            }
+        );
+        assert_eq!(entries[4].1, XrefEntry::Free { next: 0 });
+    }
+
+    #[test]
     fn disconnect_all_clears_xref_before_destroying_canonical_handles() {
         let mut pdf = Pdf::open_mem_owned(minimal_pdf_bytes()).expect("open");
         let handle = pdf.get_object_handle(ObjectRef::new(1, 0));
