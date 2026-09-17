@@ -29,7 +29,9 @@ container-above-max だった — `flpdf-hi08` / PR #1486）。本表は残る m
 
 ### A〜E route matrix aggregate（履歴上の160行）
 
-領域 A〜E の 5 ファイルを合わせた分類の内訳は次の 1 組だけである。以降の節はこの数を再掲しない。
+領域 A〜E の 5 ファイルを合わせた分類の内訳。同じ数は §3 の再掲・§4 の領域別表・§6 の
+tracker 集計にも現れるので、行の分類を変えたときはこの 4 箇所を必ず同時に更新する
+（4 箇所が独立に drift した実例: `flpdf-3yn9.48.148`）。
 
 | canonical | bridge | mixed | unknown | 合計 |
 |---|---|---|---|---|
@@ -197,7 +199,7 @@ D19/D30はcanonical ownerへ委譲するbyte-neutral test scaffolding、D27は�
 ## 6. 二重正本トラッカー
 
 追跡対象の symbol manifest は [tracked-symbols.txt](tracked-symbols.txt)。この matrix revision の
-classified row は 259 行で、canonical 161 / mixed 98 / bridge 0 / unknown 0（bridge + mixed は98行）である。
+classified row は 259 行で、canonical 161 / mixed 98 / bridge 0 / unknown 0 である。
 内訳は A=24 / B=34 / C=42 / D=31 / E=128（E 表 29 行 + qtest exception 表 99 行）。
 `scripts/check-qpdf-route-matrix.py` も259行を報告する。classification tableの途中に散文行が
 入っても同じtableの状態を保持し、qtest exception tableの物理1行 `0/1` は論理2 caseとして数える。
