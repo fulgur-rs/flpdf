@@ -3800,60 +3800,67 @@ impl<R: Read + Seek> ResolverHandle<R> {
         self.seek(offset).map_err(ReadObjectAtOffsetError::Body)?;
         let (found_raw, parsed, trailing, trailing_start, object_header_offset) = {
             let mut input = self.live_input();
-            let mut tokenizer = LiveTokenSource::new(&mut input);
-            let number_token = tokenizer
-                .next_token()
-                .map_err(ReadObjectAtOffsetError::Header)?;
-            let generation_token = tokenizer
-                .next_token()
-                .map_err(ReadObjectAtOffsetError::Header)?;
-            let obj = tokenizer
-                .next_token()
-                .map_err(ReadObjectAtOffsetError::Header)?;
-            let (number, generation) = match (
-                read_live_header_integer(number_token),
-                read_live_header_integer(generation_token),
-                obj.is_word_value(b"obj"),
-            ) {
-                (Ok(number), Ok(generation), true) => (number, generation),
-                _ => {
-                    // qpdf reads all three header tokens before reporting
-                    // the single damagedPDF("expected n n obj") error at
-                    // the object's xref offset (QPDF.cc:1589-1594).
-                    return Err(ReadObjectAtOffsetError::Header(Error::parse(
-                        offset as usize,
-                        "expected n n obj",
-                    )));
-                }
+            let header_tokens = {
+                let mut tokenizer = LiveTokenSource::new(&mut input);
+                (|| -> Result<(Token, Token, Token)> {
+                    let number_token = tokenizer.next_token()?;
+                    let generation_token = tokenizer.next_token()?;
+                    let obj = tokenizer.next_token()?;
+                    Ok((number_token, generation_token, obj))
+                })()
             };
-            // qpdf consumes the object header before entering QPDF::readObject,
-            // which captures `m->file->tell()` at this exact point
-            // (`libqpdf/QPDF.cc:1331-1335`). Keep this separate from `offset`,
-            // the xref/object-start position used by header diagnostics.
-            drop(tokenizer);
-            let object_header_offset = input.tell().map_err(ReadObjectAtOffsetError::Header)?;
+            let header = (|| -> Result<(QpdfObjGen, u64)> {
+                let (number_token, generation_token, obj) = header_tokens?;
+                let (number, generation) = match (
+                    read_live_header_integer(number_token),
+                    read_live_header_integer(generation_token),
+                    obj.is_word_value(b"obj"),
+                ) {
+                    (Ok(number), Ok(generation), true) => (number, generation),
+                    _ => {
+                        // qpdf reads all three header tokens before reporting
+                        // the single damagedPDF("expected n n obj") error at
+                        // the object's xref offset (QPDF.cc:1589-1594).
+                        return Err(Error::parse(offset as usize, "expected n n obj"));
+                    }
+                };
+                // qpdf consumes the object header before entering QPDF::readObject,
+                // which captures `m->file->tell()` at this exact point
+                // (`libqpdf/QPDF.cc:1331-1335`). Keep this separate from `offset`,
+                // the xref/object-start position used by header diagnostics.
+                let object_header_offset = input.tell()?;
 
-            let found_raw = match (i32::try_from(number), i32::try_from(generation)) {
-                (Ok(number), Ok(generation)) => QpdfObjGen::new(number, generation),
-                _ => {
-                    return Err(ReadObjectAtOffsetError::Header(Error::parse(
+                let found_raw = match (i32::try_from(number), i32::try_from(generation)) {
+                    (Ok(number), Ok(generation)) => QpdfObjGen::new(number, generation),
+                    _ => {
+                        return Err(Error::parse(
+                            offset as usize,
+                            "object reference is out of range",
+                        ));
+                    }
+                };
+                if found_raw.get_obj() == 0 {
+                    return Err(Error::parse(offset as usize, "object with ID 0"));
+                }
+                if try_recovery && expected.is_indirect() && found_raw != expected {
+                    return Err(Error::parse(
                         offset as usize,
-                        "object reference is out of range",
-                    )));
+                        format!("expected {} {} obj", expected.get_obj(), expected.get_gen()),
+                    ));
+                }
+                Ok((found_raw, object_header_offset))
+            })();
+            let (found_raw, object_header_offset) = match header {
+                Ok(header) => header,
+                Err(error) => {
+                    // qpdf's InputSource settles its token buffer before
+                    // every readToken result is observed. Keep the same
+                    // logical position for nested reads that return a header
+                    // error, including tokenizer and validation failures.
+                    input.finish().map_err(ReadObjectAtOffsetError::Header)?;
+                    return Err(ReadObjectAtOffsetError::Header(error));
                 }
             };
-            if found_raw.get_obj() == 0 {
-                return Err(ReadObjectAtOffsetError::Header(Error::parse(
-                    offset as usize,
-                    "object with ID 0",
-                )));
-            }
-            if try_recovery && expected.is_indirect() && found_raw != expected {
-                return Err(ReadObjectAtOffsetError::Header(Error::parse(
-                    offset as usize,
-                    format!("expected {} {} obj", expected.get_obj(), expected.get_gen()),
-                )));
-            }
             let found = found_raw.to_object_ref();
             // QPDF::readObjectAtOffset updates last_object_description before
             // entering QPDF::readObject (`QPDF.cc:1561,1639`). A nested
@@ -5141,8 +5148,13 @@ impl<R: Read + Seek> LiveInput for ResolverLiveInput<'_, R> {
         self.sync_generation()?;
         if self.buffer_index == self.buffer_len {
             self.buffer_start = self.resolver.tell()?;
-            self.buffer_len = self.resolver.read(&mut self.buffer)?;
+            // Drop the spent buffer BEFORE the fallible refill. A failing
+            // `read` must not leave the previous `buffer_len`/`buffer_index`
+            // beside the new `buffer_start`: `tell` would then report a whole
+            // buffer past the failure and `finish` would seek there.
+            self.buffer_len = 0;
             self.buffer_index = 0;
+            self.buffer_len = self.resolver.read(&mut self.buffer)?;
             self.generation = self.resolver.input_generation();
             if self.buffer_len == 0 {
                 return Ok(None);
@@ -12286,6 +12298,44 @@ mod tests {
             crate::parser::LiveInput::unread_byte(&mut input),
             Err(Error::Parse { offset: 0, ref message }) if message == "cannot unread before the start of input"
         ));
+    }
+
+    #[test]
+    fn header_error_flushes_a_nested_live_input_to_its_logical_position() {
+        let inner_offset = 256u64;
+        let mut bytes = vec![b' '; inner_offset as usize];
+        bytes.extend_from_slice(b"2 0 nope ");
+        bytes.resize(inner_offset as usize + 128, b' ');
+        let resolver = resolver_over(bytes);
+
+        let mut outer_input = resolver.live_input();
+        assert_eq!(
+            crate::parser::LiveInput::read_byte(&mut outer_input).expect("prime outer buffer"),
+            Some(b' ')
+        );
+        assert_eq!(
+            crate::parser::LiveInput::tell(&mut outer_input).expect("outer logical position"),
+            1
+        );
+
+        let error = resolver
+            .read_object_at_offset_with_description(
+                inner_offset,
+                QpdfObjGen::new(2, 0),
+                true,
+                false,
+                None,
+            )
+            .expect_err("malformed nested object header");
+        assert!(matches!(
+            error.into_error(),
+            Error::Parse { offset: 256, ref message } if message == "expected n n obj"
+        ));
+        assert_eq!(
+            crate::parser::LiveInput::tell(&mut outer_input).expect("flushed nested position"),
+            264,
+            "outer parser must resume after the nested header tokens, not its prefetch end"
+        );
     }
 
     #[test]
