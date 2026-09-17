@@ -51,23 +51,23 @@ use std::path::{Path, PathBuf};
 
 /// Configuration for [`QPDFJob::split_pages`].
 #[derive(Clone, Debug)]
-pub struct SplitPageOptions {
+pub(crate) struct SplitPageOptions {
     /// Number of source pages per output chunk.
-    pub chunk_size: usize,
+    pub(crate) chunk_size: usize,
     /// Signed qpdf job value, retained until `doSplitPages` reaches its
     /// `QIntC::to_size` conversion. This is only populated by the job-JSON
     /// boundary; the public split helper continues to accept a valid usize.
     qpdf_chunk_size: Option<i32>,
     /// qpdf output filename pattern or literal output template.
-    pub output_template: PathBuf,
+    pub(crate) output_template: PathBuf,
     /// Original input path, when available, for qpdf's same-file guard.
-    pub input_path: Option<PathBuf>,
+    pub(crate) input_path: Option<PathBuf>,
     /// Apply qpdf's deterministic-ID policy to every chunk.
-    pub deterministic_id: bool,
+    pub(crate) deterministic_id: bool,
     /// Reapply the effective qpdf writer settings to every chunk.
-    pub writer_configuration: WriterConfiguration,
+    pub(crate) writer_configuration: WriterConfiguration,
     /// Report each chunk's real output path as it is written.
-    pub verbose: bool,
+    pub(crate) verbose: bool,
     /// Apply qpdf's job-level Auto|Yes|No resource-pruning policy before
     /// copying the pages into fresh chunks.
     remove_unreferenced_resources: RemoveUnreferencedResources,
@@ -76,7 +76,7 @@ pub struct SplitPageOptions {
 impl SplitPageOptions {
     /// Construct split options without an input-path identity check.
     #[must_use]
-    pub fn new(chunk_size: usize, output_template: impl Into<PathBuf>) -> Self {
+    pub(crate) fn new(chunk_size: usize, output_template: impl Into<PathBuf>) -> Self {
         Self {
             chunk_size,
             qpdf_chunk_size: None,
@@ -99,35 +99,39 @@ impl SplitPageOptions {
 
     /// Attach the original input path used by qpdf's overwrite guard.
     #[must_use]
-    pub fn with_input_path(mut self, input_path: impl Into<PathBuf>) -> Self {
+    pub(crate) fn with_input_path(mut self, input_path: impl Into<PathBuf>) -> Self {
         self.input_path = Some(input_path.into());
         self
     }
 
     /// Apply deterministic IDs to all split outputs.
+    #[cfg(test)]
     #[must_use]
-    pub fn with_deterministic_id(mut self, deterministic_id: bool) -> Self {
+    pub(crate) fn with_deterministic_id(mut self, deterministic_id: bool) -> Self {
         self.deterministic_id = deterministic_id;
         self
     }
 
     /// Reapply this writer configuration to every fresh output chunk.
     #[must_use]
-    pub fn with_writer_configuration(mut self, configuration: WriterConfiguration) -> Self {
+    pub(crate) fn with_writer_configuration(mut self, configuration: WriterConfiguration) -> Self {
         self.writer_configuration = configuration;
         self
     }
 
     /// Report each chunk's real output path as it is written.
     #[must_use]
-    pub fn with_verbose(mut self, verbose: bool) -> Self {
+    pub(crate) fn with_verbose(mut self, verbose: bool) -> Self {
         self.verbose = verbose;
         self
     }
 
     /// Apply qpdf's job-level resource-pruning policy before splitting.
     #[must_use]
-    pub fn with_remove_unreferenced_resources(mut self, mode: RemoveUnreferencedResources) -> Self {
+    pub(crate) fn with_remove_unreferenced_resources(
+        mut self,
+        mode: RemoveUnreferencedResources,
+    ) -> Self {
         self.remove_unreferenced_resources = mode;
         self
     }
@@ -151,7 +155,7 @@ impl QPDFJob {
     /// entered is restored before returning, on every path (success or
     /// error), so a `source` reused across multiple jobs is never left with
     /// a stale suppression state from an earlier call.
-    pub fn split_pages<R: std::io::Read + std::io::Seek + 'static>(
+    pub(crate) fn split_pages<R: std::io::Read + std::io::Seek + 'static>(
         &mut self,
         source: &mut Pdf<R>,
         options: SplitPageOptions,
@@ -241,6 +245,7 @@ impl QPDFJob {
         let source_version =
             crate::parse_pdf_version(source.version()).map(|version| version.get_version().0);
         let source_extension_level = source.adobe_extension_level()?.unwrap_or(0);
+        let mut writer_configuration = options.writer_configuration;
         let mut written = Vec::new();
 
         for chunk_start in (0..page_count).step_by(chunk_size) {
@@ -331,7 +336,19 @@ impl QPDFJob {
             }
 
             let mut writer = PdfWriter::new(&mut output);
-            options.writer_configuration.apply_to(&mut writer);
+            // QPDFWriter opens the destination in its constructor, before
+            // qpdf applies setWriterOptions (`QPDFWriter.cc:70-95`;
+            // `QPDFJob.cc:3019-3021`). Preserve that failure ordering so an
+            // unusable output path wins over write-time crypto validation.
+            writer.set_output_file(&output_path)?;
+            // qpdf invokes setWriterOptions for the first fresh chunk only
+            // after the split resource/page-copy work above
+            // (`QPDFJob.cc:2976-3022`). Normalize passwords here so the
+            // write-time notice is ordered after those diagnostics, and
+            // mutate the shared configuration once so later chunks do not
+            // repeat the notice.
+            self.prepare_writer_configuration(&mut writer_configuration)?;
+            writer_configuration.apply_to(&mut writer);
             if let Some(version) = source_version.as_deref() {
                 writer.set_minimum_pdf_version(version, source_extension_level);
             }
@@ -339,7 +356,6 @@ impl QPDFJob {
                 writer.set_deterministic_id(true);
             }
             self.configure_writer_progress(&mut writer);
-            writer.set_output_file(&output_path)?;
             writer.write()?;
             // qpdf reports each chunk from inside this per-chunk loop
             // (`libqpdf/QPDFJob.cc:3019-3021`), immediately after that

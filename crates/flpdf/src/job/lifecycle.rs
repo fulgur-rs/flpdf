@@ -1720,6 +1720,56 @@ impl QPDFJob {
         self.configuration.writer = configuration;
     }
 
+    /// Apply qpdf's write-time password and weak-crypto checks to one writer
+    /// configuration.
+    ///
+    /// Ordinary output calls this immediately before `QPDFWriter::write`.
+    /// Split output calls it from the first chunk's writer setup instead:
+    /// qpdf's `doSplitPages` performs the resource/page-copy work first and
+    /// invokes `setWriterOptions` only after that work
+    /// (`QPDFJob.cc:2939-3027`). Keeping this helper separate lets both
+    /// branches preserve that observable diagnostic order.
+    pub(crate) fn prepare_writer_configuration(
+        &self,
+        writer_configuration: &mut WriterConfiguration,
+    ) -> Result<()> {
+        let auto_password_notices = writer_configuration
+            .normalize_encryption_passwords(self.configuration.password_mode)?;
+        for notice in auto_password_notices {
+            match notice {
+                crate::encryption::PasswordWriteNotice::Info if self.configuration.verbose => {
+                    self.logger.info(format!(
+                        "{}: automatically converting Unicode password to single-byte encoding as required for 40-bit or 128-bit encryption\n",
+                        self.message_prefix
+                    ))?;
+                }
+                crate::encryption::PasswordWriteNotice::Warning => {
+                    self.logger.error(format!(
+                        "{}: WARNING: supplied password looks like a Unicode password with characters not allowed in passwords for 40-bit and 128-bit encryption; most readers will not be able to open this file with the supplied password. (Use --password-mode=bytes to suppress this warning and use the password anyway.)\n",
+                        self.message_prefix
+                    ))?;
+                }
+                crate::encryption::PasswordWriteNotice::None
+                | crate::encryption::PasswordWriteNotice::Info => {}
+            }
+        }
+        if !self.configuration.allow_weak_crypto
+            && writer_configuration
+                .encryption_parameters()
+                .is_some_and(EncryptParams::is_weak_rc4)
+        {
+            let message = format!(
+                "{}: refusing to write a file with RC4, a weak cryptographic algorithm\nPlease use 256-bit keys for better security.\nPass --allow-weak-crypto to enable writing insecure files.\nSee also https://qpdf.readthedocs.io/en/stable/weak-crypto.html\n",
+                self.message_prefix
+            );
+            self.logger.error(message)?;
+            return Err(Error::System(
+                "refusing to write a file with weak crypto".to_string(),
+            ));
+        }
+        Ok(())
+    }
+
     /// Set qpdf's job-level content-normalization flag.
     ///
     /// `QPDFJob::Config::normalizeContent` stores this separately from the
@@ -3384,50 +3434,15 @@ impl QPDFJob {
                 writer_configuration.copy_encryption_parameters(source);
             }
         }
-        let auto_password_notices = match writer_configuration
-            .normalize_encryption_passwords(self.configuration.password_mode)
-        {
-            Ok(notices) => notices,
-            Err(error) => {
-                self.report_job_error(&error)?;
-                return Err(error);
-            }
-        };
-        for notice in auto_password_notices {
-            match notice {
-                crate::encryption::PasswordWriteNotice::Info if self.configuration.verbose => {
-                    self.logger.info(format!(
-                        "{}: automatically converting Unicode password to single-byte encoding as required for 40-bit or 128-bit encryption\n",
-                        self.message_prefix
-                    ))?;
-                }
-                crate::encryption::PasswordWriteNotice::Warning => {
-                    self.logger.error(format!(
-                        "{}: WARNING: supplied password looks like a Unicode password with characters not allowed in passwords for 40-bit and 128-bit encryption; most readers will not be able to open this file with the supplied password. (Use --password-mode=bytes to suppress this warning and use the password anyway.)\n",
-                        self.message_prefix
-                    ))?;
-                }
-                crate::encryption::PasswordWriteNotice::None
-                | crate::encryption::PasswordWriteNotice::Info => {}
-            }
-        }
-        if !self.configuration.allow_weak_crypto
-            && writer_configuration
-                .encryption_parameters()
-                .is_some_and(EncryptParams::is_weak_rc4)
-        {
-            let message = format!(
-                "{}: refusing to write a file with RC4, a weak cryptographic algorithm\nPlease use 256-bit keys for better security.\nPass --allow-weak-crypto to enable writing insecure files.\nSee also https://qpdf.readthedocs.io/en/stable/weak-crypto.html\n",
-                self.message_prefix
-            );
-            self.logger.error(message)?;
-            let error = Error::System("refusing to write a file with weak crypto".to_string());
-            self.report_job_error(&error)?;
-            return Err(error);
-        }
         writer_configuration.set_linearization(self.configuration.linearize);
         if let Some(path) = self.configuration.linearize_pass1.as_deref() {
             writer_configuration.set_linearization_pass1_filename(path.to_path_buf());
+        }
+        if !splitting {
+            if let Err(error) = self.prepare_writer_configuration(&mut writer_configuration) {
+                self.report_job_error(&error)?;
+                return Err(error);
+            }
         }
         let progress_requested = self.configuration.progress;
         let write_result: Result<()> =

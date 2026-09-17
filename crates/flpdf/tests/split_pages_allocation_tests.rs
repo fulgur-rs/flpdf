@@ -11,7 +11,7 @@
 //! are process-global, so a second test would sample the first one's
 //! allocations and vice versa.
 
-use flpdf::job::{QPDFJob, SplitPageOptions};
+use flpdf::job::QPDFJob;
 use flpdf::Pdf;
 use std::alloc::{GlobalAlloc, Layout, System};
 use std::sync::atomic::{AtomicUsize, Ordering};
@@ -62,7 +62,7 @@ fn peak_growth_of(call: impl FnOnce()) -> usize {
 /// nothing references.
 ///
 /// The padding is deliberately unreachable from the page tree:
-/// `QPDFJob::split_pages`
+/// `QPDFJob::write_qpdf`'s split branch
 /// walks the pages, so a document whose bulk sat inside a *referenced* object
 /// would allocate that bulk again as a resolved value, for reasons that have
 /// nothing to do with what is being measured.
@@ -124,7 +124,7 @@ fn padded_two_page_pdf(padding: usize) -> Vec<u8> {
 
 /// The source the caller hands over is never resident a second time.
 ///
-/// `QPDFJob::split_pages` keeps its source document alive while each fresh
+/// `QPDFJob::write_qpdf` keeps its source document alive while each fresh
 /// output is written. The owned `Vec` is moved into that document, so the
 /// caller's buffer is not copied before the job starts.
 ///
@@ -169,8 +169,12 @@ fn split_pages_keeps_no_second_copy_of_the_source_it_is_handed() {
     let peak = peak_growth_of(|| {
         let mut pdf = Pdf::open_mem_owned(src).expect("source should parse");
         let mut job = QPDFJob::new();
-        job.split_pages(&mut pdf, SplitPageOptions::new(1, &template))
-            .expect("split should succeed");
+        job.set_output_file(&template)
+            .expect("output should configure");
+        job.config()
+            .split_pages(b"1")
+            .expect("split size should configure");
+        job.write_qpdf(&mut pdf).expect("split should succeed");
     });
 
     assert!(
