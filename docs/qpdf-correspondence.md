@@ -4170,6 +4170,23 @@ two-pass layout and emission remain dedicated consumers; only the Generate
 membership boundary was changed. The live regression is
 `cmp_linearize_objstm_tests.rs::indirect_extensions_linearized_objstm_is_byte_identical_to_qpdf`.
 
+### Linearized Generate page/object-stream setup order (`flpdf-svhr3` + `flpdf-bmo81`, 2026-09-17)
+
+qpdf gates `initializeSpecialStreams` on qdf/normalization/decode state, then
+computes Preserve/Generate object-stream membership, and only afterward walks
+linearized pages to remove page dictionaries from the membership map
+(`libqpdf/QPDFWriter.cc:1912-1936,1970-2006,2114-2150`). The writer's object
+count and common preparation follow that setup (`QPDFWriter.cc:2187-2200`).
+
+flpdf now keeps the same boundary in both consumers: `LinearizationPlan` runs
+page preparation before planning only for the special-stream trigger; the
+default linearized Generate/Preserve path plans object streams first and then
+repairs/pages-scans. `PdfWriter::write` applies the same delayed page repair
+after Generate capture and before `get_object_count`. This avoids direct `/Kids`
+promotion changing the even-split count. The live qpdf/flpdf regression uses 98
+reachable eligible objects and a direct page kid, where qpdf emits one ObjStm;
+the test compares warning/status, container count, and output bytes.
+
 ### Direct outline first-half ordering (`flpdf-oqz1e`, 2026-09-15)
 
 qpdf promotes a direct Catalog `/Outlines` dictionary during
