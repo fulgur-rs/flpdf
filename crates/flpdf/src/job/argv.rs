@@ -2201,6 +2201,11 @@ fn show_crypto_provider(job: &QPDFJob, provider: &str) -> Result<()> {
             "QPDFCryptoProvider: request to set default provider to unknown implementation \"{provider}\""
         )));
     }
+    job.logger
+        .info(crypto_provider_output(provider, &registered))
+}
+
+fn crypto_provider_output(provider: &str, registered: &[String]) -> String {
     let mut output = String::new();
     output.push_str(provider);
     output.push('\n');
@@ -2210,7 +2215,7 @@ fn show_crypto_provider(job: &QPDFJob, provider: &str) -> Result<()> {
             output.push('\n');
         }
     }
-    job.logger.info(output)
+    output
 }
 
 fn show_crypto(job: &QPDFJob) -> Result<()> {
@@ -2369,6 +2374,26 @@ fn read_password_file(job: &QPDFJob, value: &[u8]) -> Result<Option<Vec<u8>>> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::pipeline::{Pipeline, PipelineHandle, PipelineResult};
+    use crate::QPDFLogger;
+    use std::sync::{Arc, Mutex};
+
+    struct Capture(Arc<Mutex<Vec<u8>>>);
+
+    impl Pipeline for Capture {
+        fn identifier(&self) -> &str {
+            "argv test capture"
+        }
+
+        fn write(&mut self, data: &[u8]) -> PipelineResult<()> {
+            self.0.lock().unwrap().extend_from_slice(data);
+            Ok(())
+        }
+
+        fn finish(&mut self) -> PipelineResult<()> {
+            Ok(())
+        }
+    }
 
     #[test]
     fn show_crypto_rejects_a_provider_outside_the_pinned_registry() {
@@ -2376,6 +2401,37 @@ mod tests {
         let error = show_crypto_provider(&job, "openssl").unwrap_err();
         assert!(matches!(error, Error::Internal(message) if message
             .contains("unknown implementation \"openssl\"")));
+    }
+
+    #[test]
+    fn crypto_provider_output_puts_the_default_first() {
+        let registered = ["gnutls".to_owned(), "openssl".to_owned()];
+        assert_eq!(
+            crypto_provider_output("openssl", &registered),
+            "openssl\ngnutls\n"
+        );
+    }
+
+    #[test]
+    fn completion_reports_a_relative_executable_warning() {
+        let info = Arc::new(Mutex::new(Vec::new()));
+        let error = Arc::new(Mutex::new(Vec::new()));
+        let logger = QPDFLogger::create();
+        logger.set_info(Some(PipelineHandle::new(Capture(Arc::clone(&info)))));
+        logger.set_error(Some(PipelineHandle::new(Capture(Arc::clone(&error)))));
+        let mut job = QPDFJob::new();
+        job.set_logger(logger);
+
+        completion(&job, b"./qpdf", false).unwrap();
+
+        assert_eq!(
+            info.lock().unwrap().as_slice(),
+            b"complete -o bashdefault -o default -o nospace -C \"./qpdf\" qpdf\n"
+        );
+        assert_eq!(
+            error.lock().unwrap().as_slice(),
+            b"WARNING: qpdf completion enabled using relative path to executable\n"
+        );
     }
 
     #[test]
