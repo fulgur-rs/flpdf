@@ -15,6 +15,8 @@
 //! `key_ancestors` erase-when-empty invariant are unchanged, so the output
 //! bytes are the same for every tree qpdf itself can walk.
 
+#[cfg(test)]
+use std::cell::Cell;
 use std::collections::{BTreeMap, BTreeSet};
 use std::io::{Read, Seek};
 
@@ -24,6 +26,21 @@ use crate::{Error, Pdf, Result};
 use crate::{ObjectHandle, ObjectRef};
 
 const INHERITABLE_KEYS: [&[u8]; 4] = [b"/CropBox", b"/MediaBox", b"/Resources", b"/Rotate"];
+
+#[cfg(test)]
+thread_local! {
+    static PUSH_CALLS: Cell<usize> = const { Cell::new(0) };
+}
+
+#[cfg(test)]
+pub(crate) fn reset_push_call_count() {
+    PUSH_CALLS.with(|count| count.set(0));
+}
+
+#[cfg(test)]
+pub(crate) fn push_call_count() -> usize {
+    PUSH_CALLS.with(Cell::get)
+}
 
 /// Reproduce qpdf's inherited-page walk boundary when `/Pages` is not a
 /// dictionary. `QPDF_optimization.cc` still asks the null page-tree handle for
@@ -54,6 +71,9 @@ pub(crate) fn push<R: Read + Seek>(
     allow_changes: bool,
     warn_skipped_keys: bool,
 ) -> Result<()> {
+    #[cfg(test)]
+    PUSH_CALLS.with(|count| count.set(count.get() + 1));
+
     let mut key_ancestors: BTreeMap<&'static [u8], Vec<ObjectHandle>> = BTreeMap::new();
     let mut visited = BTreeSet::new();
     match prepared.root {

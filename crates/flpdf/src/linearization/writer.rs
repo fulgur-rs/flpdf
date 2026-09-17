@@ -3746,7 +3746,16 @@ pub(crate) fn write_linearized<R: Read + Seek>(
     options: &WriterOptions,
 ) -> Result<LinearizedDocument> {
     let setup = crate::writer::build_writer_setup(pdf, options)?;
-    let output = write_linearized_impl(plan, renumber.clone(), pdf, options, None, setup, None)?;
+    let output = write_linearized_impl(
+        plan,
+        renumber.clone(),
+        pdf,
+        options,
+        None,
+        setup,
+        false,
+        None,
+    )?;
     // cov:ignore-start: the memory helper always selects the Vec-backed output mode
     output.document.ok_or_else(|| {
         crate::Error::Internal(
@@ -3824,6 +3833,7 @@ pub(crate) fn write_linearized_for_pdf_writer<R: Read + Seek>(
             options,
             pass1_path,
             setup,
+            true,
             Some(output),
         )?;
         Ok(output.writer_result)
@@ -3871,6 +3881,7 @@ fn write_linearized_impl<R: Read + Seek>(
     options: &WriterOptions,
     pass1_path: Option<&Path>,
     setup: crate::writer::WriterSetupState,
+    prepared_by_plan: bool,
     final_output: Option<&mut dyn OutputTarget>,
 ) -> Result<LinearizedWriteResult> {
     let crate::writer::WriterSetupState {
@@ -3954,19 +3965,16 @@ fn write_linearized_impl<R: Read + Seek>(
         return Err(crate::writer::deterministic_id_encryption_error(options));
     }
 
-    // `plan`/`renumber` are built from a separate `Pdf` handle opened on the
-    // same source bytes (every real caller — the CLI, and this module's own
-    // `build_linearized()` test helper — re-opens the input for writing rather
-    // than reusing the planning handle: "Re-open the PDF so write_linearized
-    // can seek/read objects independently"). Run qpdf's complete optimization
-    // preparation prefix here too, on THIS handle, so direct `/Outlines`,
-    // page-tree repairs, and inherited-attribute minting happen in the same
-    // order and allocate the same object numbers the plan assumed. Idempotent:
-    // a no-op if `pdf` was already prepared (e.g. a caller that reuses one
-    // handle for both steps). Runs after the option guards above so an invalid
-    // option combination returns its error without mutating the caller's `Pdf`
-    // first.
-    crate::optimization::Optimization::prepare_for_linearized_write(pdf)?;
+    // The test-only plan helper may receive a separately opened Pdf, so it
+    // still runs the qpdf-shaped preparation prefix on this writer handle.
+    // The production PdfWriter builds the plan and emits it from the same Pdf;
+    // its plan construction already owns this preparation boundary. qpdf's
+    // `writeLinearized` calls `QPDF::optimize` once after setup
+    // (`QPDFWriter.cc:2536-2554`) and does not repeat inherited-attribute
+    // propagation before the two output passes.
+    if !prepared_by_plan {
+        crate::optimization::Optimization::prepare_for_linearized_write(pdf)?;
+    }
 
     // Reconcile the caller-built plan/renumber pair with the writer's effective
     // object-stream mode. The historical `from_pdf(bool)` API maps `false` to
@@ -5369,6 +5377,30 @@ mod tests {
             encrypt_metadata: true,
             metadata_ref: None,
         }
+    }
+
+    #[test]
+    fn production_linearization_prepares_inherited_attributes_once() {
+        let mut pdf = Pdf::open(Cursor::new(
+            include_bytes!("../../../../tests/fixtures/compat/one-page.pdf").to_vec(),
+        ))
+        .expect("source parses");
+        let options = WriterOptions {
+            static_id: true,
+            ..WriterOptions::default()
+        };
+        let setup = crate::writer::build_writer_setup(&mut pdf, &options).unwrap();
+        let mut bytes = Vec::new();
+
+        crate::optimization::inherited_attrs::reset_push_call_count();
+        write_linearized_for_pdf_writer(&mut pdf, &options, None, setup, &mut bytes)
+            .expect("production linearization succeeds");
+
+        assert_eq!(
+            crate::optimization::inherited_attrs::push_call_count(),
+            1,
+            "the production plan and two-pass emitter must share one preparation boundary"
+        );
     }
 
     #[test]
