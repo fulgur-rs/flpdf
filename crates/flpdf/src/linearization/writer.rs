@@ -3876,7 +3876,7 @@ fn write_linearized_impl<R: Read + Seek>(
     // seed; reading either after the placeholder is installed would mistake the
     // 16 zero bytes for a real source `/ID[0]` and corrupt the result.
     let source_trailer_handle = pdf.trailer().shallow_copy()?;
-    let source_id0 = crate::writer::source_permanent_id_handle(&source_trailer_handle);
+    let source_id0 = crate::writer::source_permanent_id_handle(&source_trailer_handle)?;
     let (det_id_source_id0, det_id_info_suffix): (Option<Vec<u8>>, Vec<u8>) = if deterministic_id {
         let suffix = crate::writer::deterministic_id_info_suffix(pdf);
         (source_id0.clone(), suffix)

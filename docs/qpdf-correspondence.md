@@ -1453,6 +1453,32 @@ qpdf の未使用 `encryption_R` 引数を省略している。これは reader 
 | `QPDFCryptoProvider.cc` / `QPDFCrypto_*` | 774 | provider 抽象が無い | ⚪ |
 | ランダム源 3 ファイル | 185 | `writer.rs` の `fresh_id_bytes` 等に散在 | 🔀 |
 
+### Accessor warning chains for invalid `/ID` and `/Pages` (`flpdf-6gmnc`, 2026-09-17)
+
+qpdf の `QPDFWriter::copyEncryptionParameters` は、欠落 `/ID` を
+`getKey("/ID").getArrayItem(0).getStringValue()` で辿る
+（`QPDFWriter.cc:651-702`; `QPDFObjectHandle.cc:758-785,965-989,2168-2189`）。
+そのため `invalid-id-xref.pdf` では null 配列の warning と、そこから返った null の
+文字列 warning が `dictionary key /ID -> null returned from invalid array access` の
+記述連鎖付きで発生する。flpdf は通常の source-ID生成では欠落 `/ID` を無音の
+`hasKey` 境界で扱い、copy-encryption のみ `source_permanent_id_value_handle` の
+warning-producing accessor chainを実行する。classic trailer handleにも
+`input, trailer at offset N` のqpdf descriptionを付与し、warningの文言・文脈を保持する。
+
+linearization の空ページツリーでは、qpdf の `getAllPages`（`QPDF_pages.cc:39-150`）と
+`QPDF_optimization` の inherited-attribute walk（`QPDF_optimization.cc:57-245`）が、
+null `/Pages` に対する `hasKey`、`getKeys`、`getKey("/Kids")`、配列長取得を行う。
+flpdf は `PageWalk` と `optimization/inherited_attrs.rs` の canonical
+`try_*` accessorsで同じ連鎖を発生させ、linearization planの事前 page-cache境界も
+`initializeSpecialStreams` 相当の順序に揃えた。
+
+Pinned qpdf 11.9.0（`3b97c9bd266b7c32ea36d3536e22dab77412886d`）の live probeでは、
+`invalid-id-xref.pdf` の `--static-id` が qpdf/flpdf とも exit 3、1012 bytes、stderr
+完全一致。`issue-119`/`issue-120`/`issue-143` の
+`--deterministic-id --linearize` はともに exit 2・出力0 bytesで、warning行数は
+それぞれ 10/14/26（qpdf/flpdf一致）。最終的な no-pages error offset は別の
+`flpdf-qlwe5` scopeであり、このissueではwarning accessor chainだけを固定する。
+
 ## 6. Pipeline / フィルタ
 
 | qpdf | 行 | flpdf | 状態 |

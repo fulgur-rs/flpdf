@@ -590,6 +590,8 @@ impl<R: Read + Seek> Pdf<R> {
                 None
             }
         };
+        let live_id0 =
+            crate::writer::source_permanent_id_value_handle(&self.trailer_key_handle(b"ID"))?;
         // `CopyEncryptionSource` outlives this reader in the CLI and in
         // cross-document writer calls. Detach the authenticated dictionary
         // from the donor resolver while it is still alive, so later key reads
@@ -597,13 +599,7 @@ impl<R: Read + Seek> Pdf<R> {
         // dictionary is a value graph and contains no stream objects, making
         // qpdf's make-direct copy the appropriate ownership boundary here.
         encrypt_dict.make_direct(false)?;
-        let id0 = match cached_id0 {
-            Some(id0) => id0,
-            None => {
-                let id_handle = self.trailer_key_handle(b"ID");
-                crate::encryption::state::first_file_id_handle(&id_handle)?
-            }
-        };
+        let id0 = cached_id0.or(live_id0).unwrap_or_default();
 
         Ok(Some(CopyEncryptionSource {
             encrypt_dict,

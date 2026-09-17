@@ -2667,7 +2667,7 @@ pub(crate) fn build_writer_setup<R: Read + Seek>(
             ObjectHandle::string(id1),
         ]))
     } else {
-        let source_id0 = source_permanent_id_value_handle(&pdf.trailer_key_handle(b"ID"));
+        let source_id0 = source_permanent_id_handle(&pdf.trailer())?;
         Some(generate_id_handle(source_id0.as_deref(), options.static_id))
     };
 
@@ -2909,20 +2909,20 @@ fn push_hex_lower(out: &mut Vec<u8>, bytes: &[u8]) {
 /// Extract the source trailer's non-empty `/ID[0]` through the live qpdf-shaped
 /// handle graph for writer paths whose caller has already crossed the
 /// `QPDF::getTrailer` boundary.
-pub(crate) fn source_permanent_id_handle(trailer: &ObjectHandle) -> Option<Vec<u8>> {
-    let id = trailer.try_get_key(b"/ID").ok()?;
+pub(crate) fn source_permanent_id_handle(trailer: &ObjectHandle) -> Result<Option<Vec<u8>>> {
+    if !trailer.try_has_key(b"/ID")? {
+        return Ok(None);
+    }
+    let id = trailer.try_get_key(b"/ID")?;
     source_permanent_id_value_handle(&id)
 }
 
 /// Extract qpdf's non-empty `/ID[0]` from an already-selected canonical value
 /// handle. This is the one-value counterpart of `getTrailer().getKey("/ID")`.
-pub(crate) fn source_permanent_id_value_handle(id: &ObjectHandle) -> Option<Vec<u8>> {
-    let first = id.try_array_item(0).ok()??;
-    first.try_dereference().ok()?;
-    match first.as_string() {
-        Some(bytes) if !bytes.is_empty() => Some(bytes),
-        _ => None,
-    }
+pub(crate) fn source_permanent_id_value_handle(id: &ObjectHandle) -> Result<Option<Vec<u8>>> {
+    let first = id.try_get_array_item(0)?;
+    let value = first.try_get_string_value()?;
+    Ok((!value.is_empty()).then_some(value))
 }
 
 /// Generate qpdf's ordinary/static two-element `/ID` array as a canonical
@@ -3679,8 +3679,7 @@ fn write_pclm<R: Read + Seek>(
             // cov:ignore-end
         })?), // cov:ignore: Plan::build guarantees the direct Catalog handle before PCLm emission; LLVM places this continuation counter on the closure exit.
     };
-    let id_handle = pdf.trailer_key_handle(b"ID");
-    let source_id0 = source_permanent_id_value_handle(&id_handle);
+    let source_id0 = source_permanent_id_handle(&pdf.trailer())?;
     let generated_id =
         (!deterministic_id).then(|| generate_id_handle(source_id0.as_deref(), options.static_id));
     let trailer = build_writer_trailer_handle(
@@ -3888,6 +3887,30 @@ mod final_handle_writer_tests {
                 .any(|window| window == b"<73657475702d69642d30>"),
             "plain route must emit the ID prepared by the shared writer setup"
         );
+    }
+
+    #[test]
+    fn missing_source_id_emits_qpdf_copy_accessor_warning_chain() {
+        let mut pdf = Pdf::empty().expect("empty PDF supplies a warning context");
+        let id = pdf.trailer_key_handle(b"ID");
+        let _ = source_permanent_id_value_handle(&id);
+        let messages: Vec<_> = pdf
+            .repair_diagnostics()
+            .entries()
+            .iter()
+            .map(|entry| String::from_utf8_lossy(entry.what_bytes()).into_owned())
+            .collect();
+
+        assert_eq!(
+            messages.len(),
+            2,
+            "qpdf copy path must warn for both accessors"
+        );
+        assert!(messages[0]
+            .contains("operation for array attempted on object of type null: returning null"));
+        assert!(messages[1].contains(
+            "null returned from invalid array access: operation for string attempted on object of type null: returning empty string"
+        ));
     }
 
     #[test]

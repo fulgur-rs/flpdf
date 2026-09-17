@@ -4858,6 +4858,18 @@ fn read_trailer(
         resolver,
     )
     .map_err(|error| error.rebase_offset(start))?;
+    let trailer = parsed.value;
+    // QPDFParser is constructed with the literal description "trailer". The
+    // value keeps that source boundary for later accessor warnings, which
+    // qpdf renders as `input, trailer at offset N`. Attach the equivalent live
+    // template before writer/encryption consumers traverse the trailer.
+    let mut description = filename.to_vec();
+    if !description.is_empty() {
+        description.extend_from_slice(b", ");
+    }
+    description.extend_from_slice(b"trailer at offset $PO");
+    trailer.set_description(description, i64::try_from(start).unwrap_or(i64::MAX));
+
     let mut diagnostics = trailer_diagnostics(start, parsed.diagnostics, filename, Some(slice));
     if let Some(empty_offset) = parsed.empty_offset {
         diagnostics.push(trailer_warning(
@@ -4865,7 +4877,7 @@ fn read_trailer(
             "empty object treated as null",
             Some(start.saturating_add(empty_offset) as u64),
         ));
-    } else if parsed.value.try_is_dictionary()? {
+    } else if trailer.try_is_dictionary()? {
         let mut tokenizer = Tokenizer::new(slice);
         tokenizer.allow_eof();
         tokenizer
@@ -4882,7 +4894,7 @@ fn read_trailer(
             ));
         }
     }
-    Ok((parsed.value, diagnostics))
+    Ok((trailer, diagnostics))
 }
 
 fn parse_trailer_candidate(

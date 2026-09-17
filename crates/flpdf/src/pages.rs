@@ -404,6 +404,19 @@ pub struct PageWalk<'a, R: Read + Seek + 'static> {
     done: bool,
 }
 
+/// Probe qpdf's `/Kids` containment boundary without turning a contextless
+/// programmatic null into a hard error. Parsed document handles have a warning
+/// sink and propagate sink failures; direct nulls created without a document
+/// retain the pre-existing page-classification behavior.
+fn probe_page_kids(handle: &ObjectHandle) -> Result<()> {
+    let contextless = handle.context().is_none();
+    match handle.try_has_key(b"/Kids") {
+        Ok(_) => Ok(()),
+        Err(Error::QpdfExc(_)) if contextless => Ok(()),
+        Err(error) => Err(error),
+    }
+}
+
 impl<'a, R: Read + Seek> PageWalk<'a, R> {
     /// Create an unbounded qpdf-shaped `PageWalk`.
     ///
@@ -431,6 +444,7 @@ impl<'a, R: Read + Seek> PageWalk<'a, R> {
         // resolving to null yields zero pages rather than an error.
         let pages = catalog.try_get_key(b"/Pages")?;
         if !pages.is_indirect() && pages.try_is_null()? {
+            probe_page_kids(&pages)?;
             return Err(Error::Missing("/Pages"));
         }
         let pages = PageNode::from_handle(pages);
@@ -470,6 +484,7 @@ impl<'a, R: Read + Seek> PageWalk<'a, R> {
         // resolving to null yields zero pages rather than an error.
         let pages = catalog.try_get_key(b"/Pages")?;
         if !pages.is_indirect() && pages.try_is_null()? {
+            probe_page_kids(&pages)?;
             return Err(Error::Missing("/Pages"));
         }
         let pages = PageNode::from_handle(pages);
@@ -488,6 +503,7 @@ impl<'a, R: Read + Seek> PageWalk<'a, R> {
         node_obj.try_dereference()?;
 
         if !node_obj.try_is_dictionary()? {
+            probe_page_kids(&node_obj)?;
             return Ok(None); // non-dictionary: skip silently
         }
 
@@ -581,6 +597,34 @@ mod tests {
             PageWalk::new(&mut pdf),
             Err(Error::Missing("/Pages"))
         ));
+        let messages: Vec<_> = pdf
+            .repair_diagnostics()
+            .entries()
+            .iter()
+            .map(|entry| entry.message_string())
+            .collect();
+        assert_eq!(messages.len(), 1);
+        assert!(messages[0].contains(
+            "operation for dictionary attempted on object of type null: returning false for a key containment request"
+        ));
+    }
+
+    #[test]
+    fn bounded_page_walk_reports_a_missing_pages_entry() {
+        let mut pdf = Pdf::empty().expect("empty PDF");
+        pdf.root_handle()
+            .expect("empty catalog")
+            .remove_key(b"/Pages");
+        assert!(matches!(
+            PageWalk::with_max_depth(&mut pdf, 4),
+            Err(Error::Missing("/Pages"))
+        ));
+    }
+
+    #[test]
+    fn page_kids_probe_propagates_uninitialized_handle_errors() {
+        let error = probe_page_kids(&ObjectHandle::uninitialized()).unwrap_err();
+        assert!(matches!(error, Error::Internal(_)));
     }
 
     #[test]

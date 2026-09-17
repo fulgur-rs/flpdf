@@ -319,7 +319,7 @@ impl Optimization {
         R: Read + Seek,
         F: FnMut(Option<QpdfObjGen>, &ObjectHandle) -> crate::Result<u8>,
     {
-        let prepared = Self::prepare_pdf(pdf, allow_changes)?;
+        let prepared = Self::prepare_pdf(pdf, allow_changes, true)?;
         let page_refs = prepared
             .as_ref()
             .map(|prepared| prepared.pages.as_slice())
@@ -332,6 +332,7 @@ impl Optimization {
     fn prepare_pdf<R: Read + Seek>(
         pdf: &mut Pdf<R>,
         allow_changes: bool,
+        warn_missing_page_tree: bool,
     ) -> crate::Result<Option<crate::pages::repair::PreparedPages>> {
         if let Some(root_ref) = pdf.root_ref() {
             let root = pdf.get_object_handle(root_ref);
@@ -348,6 +349,8 @@ impl Optimization {
         let prepared = crate::pages::repair::prepare_for_optimization(pdf)?;
         if let Some(ref prepared) = prepared {
             inherited_attrs::push(pdf, prepared, allow_changes, false)?;
+        } else if warn_missing_page_tree {
+            inherited_attrs::warn_missing_page_tree(pdf)?;
         }
         Ok(prepared)
     }
@@ -355,7 +358,7 @@ impl Optimization {
     pub(crate) fn prepare_for_linearized_write<R: Read + Seek>(
         pdf: &mut Pdf<R>,
     ) -> crate::Result<()> {
-        Self::prepare_pdf(pdf, true).map(|_| ())
+        Self::prepare_pdf(pdf, true, false).map(|_| ())
     }
 
     pub(crate) fn filter_compressed_objects(&mut self, object_stream_data: &BTreeMap<u32, u32>) {
@@ -625,6 +628,72 @@ mod tests {
         assert_eq!(ObjectUser::Root.page_number(), 0);
         assert_eq!(ObjectUser::RootKey(b"Root".to_vec()).page_number(), 0);
         assert_eq!(ObjectUser::TrailerKey(b"Info".to_vec()).page_number(), 0);
+    }
+
+    #[test]
+    fn missing_pages_runs_qpdfs_inherited_push_warning_boundary() {
+        let mut pdf = Pdf::empty().expect("empty PDF");
+        pdf.root_handle()
+            .expect("empty catalog")
+            .remove_key(b"/Pages");
+
+        Optimization::optimize(&mut pdf, &BTreeMap::new(), true, no_stream_parameter_skip)
+            .expect("qpdf tolerates a missing page tree while optimizing");
+
+        let messages: Vec<_> = pdf
+            .repair_diagnostics()
+            .entries()
+            .iter()
+            .map(|entry| entry.message_string())
+            .collect();
+        assert_eq!(messages.len(), 6);
+        assert_eq!(
+            messages
+                .iter()
+                .filter(|message| message.contains("returning false for a key containment request"))
+                .count(),
+            1
+        );
+        assert_eq!(
+            messages
+                .iter()
+                .filter(|message| message.contains("dictionary attempted")
+                    && message.contains("treating as empty"))
+                .count(),
+            1
+        );
+        assert_eq!(
+            messages
+                .iter()
+                .filter(|message| message.contains("returning null for attempted key retrieval"))
+                .count(),
+            1
+        );
+        assert_eq!(
+            messages
+                .iter()
+                .filter(|message| message.contains("operation for array attempted")
+                    && message.contains("treating as empty"))
+                .count(),
+            3
+        );
+    }
+
+    #[test]
+    fn missing_page_warning_boundary_ignores_an_absent_root() {
+        let mut pdf = Pdf::<std::io::Cursor<Vec<u8>>>::uninitialized();
+        super::inherited_attrs::warn_missing_page_tree(&mut pdf)
+            .expect("an absent root has no inherited-page warning boundary");
+    }
+
+    #[test]
+    fn missing_page_warning_boundary_ignores_a_non_dictionary_root() {
+        let mut pdf = Pdf::empty().expect("empty PDF");
+        pdf.trailer()
+            .replace_key(b"/Root", ObjectHandle::integer(7))
+            .expect("replace root");
+        super::inherited_attrs::warn_missing_page_tree(&mut pdf)
+            .expect("a non-dictionary root has no inherited-page warning boundary");
     }
 
     #[test]
