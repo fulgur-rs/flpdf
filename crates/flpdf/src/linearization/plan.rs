@@ -347,6 +347,14 @@ where
     });
     match kind {
         DirectContainerKind::Stream(stream_dict) => {
+            // Resolve the dictionary handle before the live walk. qpdf reaches
+            // the same map through `getDictAsMap`, whose `asDictionary()` is
+            // `dereference() ? obj->as<QPDF_Dictionary>() : nullptr`
+            // (`QPDFObjectHandle.cc:1012-1020`, `:327-330`), so an indirect
+            // stream dictionary is resolved rather than treated as empty.
+            // `next_dictionary_entry_for_live_walk` inspects the stored value
+            // without resolving, so the deref has to happen here.
+            stream_dict.try_dereference()?;
             let skip_stream_parameters =
                 handle_has_stream_parameter_skip(handle, skipped_stream_parameter_streams)?;
             visit_live_dictionary_children(&stream_dict, depth, skip_stream_parameters, visit)?;
@@ -4483,6 +4491,45 @@ mod tests {
             !body.contains("try_as_array") && !body.contains("try_as_dictionary"),
             "linearization plan must not clone complete container edges"
         );
+    }
+
+    #[test]
+    fn indirect_stream_dictionary_children_are_reached_through_the_live_walk() {
+        use crate::object_handle::identity_tests::resolver_bearing_handle;
+        use crate::object_handle::ObjectValue;
+
+        // qpdf reads a stream's dictionary through `getDictAsMap`, whose
+        // `asDictionary()` dereferences (`QPDFObjectHandle.cc:1012-1020`,
+        // `:327-330`). A stream built with an indirect dictionary handle must
+        // therefore still expose its children to the plan walk.
+        let (stream_dict, _resolver) = resolver_bearing_handle(ObjectValue::Dictionary(
+            [
+                (b"/Kid".to_vec(), ObjectHandle::integer(42)),
+                (b"/Length".to_vec(), ObjectHandle::integer(0)),
+            ]
+            .into_iter()
+            .collect(),
+        ));
+        assert!(
+            !stream_dict.is_resolved(),
+            "the dictionary handle starts unresolved"
+        );
+        let stream = ObjectHandle::stream(stream_dict, std::rc::Rc::new(Vec::new()));
+
+        let mut visited = Vec::new();
+        super::collect_direct_handle_children(
+            &stream,
+            0,
+            false,
+            &mut |child, _depth, _in_array| {
+                visited.push(child.as_integer());
+                Ok(())
+            },
+        )
+        .expect("an indirect stream dictionary resolves during the walk");
+
+        // `/Length` is skipped like qpdf's writer does; `/Kid` must survive.
+        assert_eq!(visited, vec![Some(42)]);
     }
 
     #[test]
