@@ -6539,9 +6539,6 @@ mod tests {
         ]);
         let mut fallback_output = Vec::new();
         let mut fallback_map = |_: &ObjectHandle| Ok::<ObjectRef, Error>(ObjectRef::new(1, 0));
-        let mut fallback_strings = |out: &mut OutputSink<'_>, value: &[u8]| {
-            crate::pdf_syntax::write_string_value(out, value)
-        };
         let mut fallback_stream_writer = DefaultDynamicDirectStreamWriter {
             newline_before_endstream: None,
             qdf_mode: false,
@@ -6552,7 +6549,7 @@ mod tests {
                 out,
                 &mut fallback_map,
                 &BTreeSet::new(),
-                &mut fallback_strings,
+                &mut strings,
                 &mut fallback_stream_writer,
             )
         })?;
