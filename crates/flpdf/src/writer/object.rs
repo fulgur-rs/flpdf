@@ -5804,7 +5804,7 @@ mod tests {
 
     #[test]
     fn compact_mapped_serializer_does_not_snapshot_container_edges() {
-        let source = include_str!("object.rs");
+        let source = include_str!("object.rs").replace("\r\n", "\n");
         let start = source
             .find("fn unparse_object_walk_with_ref_map")
             .expect("compact mapped serializer");
