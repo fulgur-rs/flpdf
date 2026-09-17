@@ -834,15 +834,6 @@ fn parse_job_encrypt(
         .expect("key length was found in the encryption dictionary");
     let settings = job_json_members(settings);
     let allow_insecure = inherited.allow_insecure || job_json_bare(&settings, b"allowInsecure")?;
-    if key_length == "256bit"
-        && owner_password.is_empty()
-        && !user_password.is_empty()
-        && !allow_insecure
-    {
-        return Err(Error::Usage(UsageError::new(
-            "A PDF with a non-empty user password and an empty owner password encrypted with a 256-bit key is insecure as it can be opened without a password. If you really want to do this, you must also give the --allow-insecure option before the -- that follows --encrypt.",
-        )));
-    }
     let mut permissions = inherited.permissions;
     let mut r2_permissions = inherited.r2_permissions;
     let mut accessibility_disabled = inherited.accessibility_disabled;
@@ -6507,7 +6498,8 @@ mod tests {
         let insecure_256 =
             crate::json::Json::parse(br#"{"userPassword":"u","ownerPassword":"","256bit":{}}"#)
                 .unwrap();
-        assert!(parse_job_encrypt(&insecure_256, true, &inherited).is_err());
+        let (_, insecure_defaults) = parse_job_encrypt(&insecure_256, true, &inherited).unwrap();
+        assert!(!insecure_defaults.allow_insecure);
         let allowed_insecure_256 = crate::json::Json::parse(
             br#"{"userPassword":"u","ownerPassword":"","256bit":{"allowInsecure":""}}"#,
         )

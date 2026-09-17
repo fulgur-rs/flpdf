@@ -568,6 +568,37 @@ fn json_encrypt_allow_insecure_reaches_final_configuration_check() {
 }
 
 #[test]
+fn json_encrypt_insecure_can_be_cleared_by_later_argv_decrypt() {
+    let fixture =
+        Path::new(env!("CARGO_MANIFEST_DIR")).join("../../tests/fixtures/compat/one-page.pdf");
+    let tempdir = tempfile::tempdir().unwrap();
+    let json_path = tempdir.path().join("insecure.json");
+    let output = tempdir.path().join("decrypted.pdf");
+    std::fs::write(
+        &json_path,
+        serde_json::json!({
+            "encrypt": {
+                "userPassword": "u",
+                "ownerPassword": "",
+                "256bit": {}
+            }
+        })
+        .to_string(),
+    )
+    .unwrap();
+    let mut job = QPDFJob::new();
+    job.initialize_from_raw_argv(&[
+        b"qpdfjob".to_vec(),
+        fixture.to_string_lossy().into_owned().into_bytes(),
+        format!("--job-json-file={}", json_path.display()).into_bytes(),
+        b"--decrypt".to_vec(),
+        output.to_string_lossy().into_owned().into_bytes(),
+    ])
+    .unwrap();
+    assert_eq!(job.run().unwrap(), JobExitCode::Success);
+}
+
+#[test]
 fn json_encrypt_keeps_qpdf_r2_permissions_from_an_earlier_argv_group() {
     let fixture =
         Path::new(env!("CARGO_MANIFEST_DIR")).join("../../tests/fixtures/compat/one-page.pdf");

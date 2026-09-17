@@ -1964,6 +1964,12 @@ const QPDF_HELP_TOPICS: &[&[u8]] = &[
 ];
 
 const QPDF_HELP_ALL: &str = include_str!("../../qpdf-help-all.txt");
+const QPDF_COPYRIGHT: &str = include_str!("../../qpdf-copyright.txt");
+const QPDF_SHOW_CRYPTO: &[u8] = include_bytes!("../../qpdf-show-crypto.txt");
+const QPDF_JSON_HELP_1: &[u8] = include_bytes!("../../qpdf-json-help-1.txt");
+const QPDF_JSON_HELP_2: &[u8] = include_bytes!("../../qpdf-json-help-2.txt");
+const QPDF_JSON_HELP_LATEST: &[u8] = include_bytes!("../../qpdf-json-help-latest.txt");
+const QPDF_JOB_JSON_HELP: &[u8] = include_bytes!("../../qpdf-job-json-help.txt");
 
 const QPDF_HELP_OPTIONS: &[&[u8]] = &[
     b"--accessibility",
@@ -2194,16 +2200,11 @@ fn handle_sole_help_option(job: &mut QPDFJob, argv0: &[u8], argument: &[u8]) -> 
                     "qpdf version {}\nRun qpdf --copyright to see copyright and license information.\n",
                     crate::qpdf_version()
                 ))?, // cov:ignore: LLVM maps the covered version logger continuation to the call setup
-                b"copyright" => job.logger.info(format!(
-                    "qpdf version {}\n\nCopyright (c) 2005-2024 Jay Berkenbilt\nQPDF is licensed under the Apache License, Version 2.0 (the \"License\");\n", // cov:ignore: copyright help test executes this format branch; LLVM maps the hit to the call setup
-                    crate::qpdf_version()
-                ))?, // cov:ignore: LLVM maps the covered copyright logger continuation to the call setup
-                // cov:ignore-start: show-crypto is a process-owned no-op at this library boundary; recognition is tested
-                // Crypto-provider enumeration is owned by the process/CLI in
-                // qpdf. Recognition and early exit are the library contract;
-                // no provider registry is created merely to parse argv.
-                // cov:ignore-end
-                b"show-crypto" => {}
+                b"copyright" => job.logger.info(
+                    QPDF_COPYRIGHT
+                        .replacen("qpdf version", &format!("{program} version"), 1),
+                )?, // cov:ignore: LLVM maps the covered copyright logger continuation to the call setup
+                b"show-crypto" => job.logger.info(QPDF_SHOW_CRYPTO)?,
                 b"completion-bash" => job.logger.info(completion(argv0, false))?,
                 b"completion-zsh" => job.logger.info(completion(argv0, true))?,
                 b"help" => {
@@ -2219,13 +2220,7 @@ fn handle_sole_help_option(job: &mut QPDFJob, argv0: &[u8], argument: &[u8]) -> 
                     }
                     job.logger.info(help_text(value, &program))?;
                 }
-                // cov:ignore-start: job-json-help is exercised by the help-table test; LLVM maps this logger arm to a duplicate record
-                b"job-json-help" => job.logger.info(
-                    super::job_json_schema()
-                        .unparse()
-                        .map_err(Error::from)?,
-                )?, // cov:ignore: LLVM maps the covered job-json-help logger continuation to the call setup
-                // cov:ignore-end
+                b"job-json-help" => job.logger.info(QPDF_JOB_JSON_HELP)?,
                 _ => unreachable!(), // cov:ignore: the outer match restricts this arm to the listed help names
             } // cov:ignore: the outer help-name match restricts this inner match to the listed arms; LLVM maps its covered exit to the closing brace
             Ok(true)
@@ -2253,10 +2248,13 @@ fn handle_sole_help_option(job: &mut QPDFJob, argv0: &[u8], argument: &[u8]) -> 
                     // cov:ignore-end
                 } // cov:ignore: LLVM maps the validated json-help arm exit to the match body
             }; // cov:ignore: LLVM maps the covered json-help version match continuation to its arms
-            let schema = crate::job::json::json_help_schema(version)
-                .map_err(|error| Error::System(error.to_string()))?;
             job.argv_early_exit = true; // cov:ignore: json-help success is exercised; llvm-cov leaves this shared match assignment at zero in its duplicate record
-            job.logger.info(schema.unparse().map_err(Error::from)?)?;
+            let help = match version {
+                1 => QPDF_JSON_HELP_1,
+                2 => QPDF_JSON_HELP_2,
+                _ => QPDF_JSON_HELP_LATEST,
+            };
+            job.logger.info(help)?;
             Ok(true)
         }
         _ => Ok(false),
