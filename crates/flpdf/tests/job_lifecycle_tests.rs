@@ -486,6 +486,34 @@ fn raw_argv_help_table_and_completion_emit_qpdf_output() {
     assert!(String::from_utf8_lossy(&info.lock().unwrap().bytes).contains("Allow creation"));
 
     let (logger, info) = logger_with_info_sink();
+    let mut page_ranges = QPDFJob::new();
+    page_ranges.set_logger(logger);
+    page_ranges
+        .initialize_from_raw_argv(&[b"qpdfjob".to_vec(), b"--help=page-ranges".to_vec()])
+        .unwrap();
+    assert!(String::from_utf8_lossy(&info.lock().unwrap().bytes)
+        .contains("A full description of the page range syntax"));
+
+    let (logger, info) = logger_with_info_sink();
+    let mut decrypt_help = QPDFJob::new();
+    decrypt_help.set_logger(logger);
+    decrypt_help
+        .initialize_from_raw_argv(&[b"qpdfjob".to_vec(), b"--help=--decrypt".to_vec()])
+        .unwrap();
+    assert!(String::from_utf8_lossy(&info.lock().unwrap().bytes)
+        .contains("Create an unencrypted output file"));
+
+    let qpdf_help = Command::new("qpdf").args(["--help=all"]).output().unwrap();
+    assert!(qpdf_help.status.success());
+    let (logger, info) = logger_with_info_sink();
+    let mut all_help = QPDFJob::new();
+    all_help.set_logger(logger);
+    all_help
+        .initialize_from_raw_argv(&[b"qpdf".to_vec(), b"--help=all".to_vec()])
+        .unwrap();
+    assert_eq!(info.lock().unwrap().bytes, qpdf_help.stdout);
+
+    let (logger, info) = logger_with_info_sink();
     let mut completion = QPDFJob::new();
     completion.set_logger(logger);
     completion
@@ -579,6 +607,47 @@ fn json_encrypt_keeps_qpdf_r2_permissions_from_an_earlier_argv_group() {
     assert!(bytes
         .windows(b"/P -8".len())
         .any(|window| window == b"/P -8"));
+
+    let extract_json = tempdir.path().join("extract-40.json");
+    let extract_output = tempdir.path().join("extract-128.pdf");
+    std::fs::write(
+        &extract_json,
+        serde_json::json!({
+            "encrypt": {
+                "userPassword": "json-user",
+                "ownerPassword": "json-owner",
+                "40bit": {"extract": "n"}
+            }
+        })
+        .to_string(),
+    )
+    .unwrap();
+    let mut r2_then_r3 = QPDFJob::new();
+    r2_then_r3
+        .initialize_from_raw_argv(&[
+            b"qpdfjob".to_vec(),
+            fixture.to_string_lossy().into_owned().into_bytes(),
+            b"--allow-weak-crypto".to_vec(),
+            b"--encrypt".to_vec(),
+            b"argv-user".to_vec(),
+            b"argv-owner".to_vec(),
+            b"40".to_vec(),
+            b"--extract=n".to_vec(),
+            b"--".to_vec(),
+            format!("--job-json-file={}", extract_json.display()).into_bytes(),
+            b"--encrypt".to_vec(),
+            b"argv-user-2".to_vec(),
+            b"argv-owner-2".to_vec(),
+            b"128".to_vec(),
+            b"--".to_vec(),
+            extract_output.to_string_lossy().into_owned().into_bytes(),
+        ])
+        .unwrap();
+    assert_eq!(r2_then_r3.run().unwrap(), JobExitCode::Success);
+    let extract_bytes = std::fs::read(extract_output).unwrap();
+    assert!(extract_bytes
+        .windows(b"/P -4".len())
+        .any(|window| window == b"/P -4"));
 }
 
 #[test]

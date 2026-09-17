@@ -851,18 +851,20 @@ fn parse_job_encrypt(
         accessibility_disabled = !value;
     }
     if let Some(value) = job_json_yn(&settings, b"annotate")? {
-        permissions.annotate = value;
         if key_length == "40bit" {
             r2_permissions.annotate = value;
+        } else {
+            permissions.annotate = value;
         }
     }
     if let Some(value) = job_json_yn(&settings, b"assemble")? {
         permissions.assemble = value;
     }
     if let Some(value) = job_json_yn(&settings, b"extract")? {
-        permissions.extract = value;
         if key_length == "40bit" {
             r2_permissions.extract = value;
+        } else {
+            permissions.extract = value;
         }
     }
     if let Some(value) = job_json_yn(&settings, b"form")? {
@@ -878,8 +880,9 @@ fn parse_job_encrypt(
         // cov:ignore-end
         if key_length == "40bit" {
             r2_permissions.modify = value == "y";
+        } else {
+            job_json_modify_permission(&value, &mut permissions)?;
         }
-        job_json_modify_permission(&value, &mut permissions)?;
     }
     if let Some(value) = job_json_yn(&settings, b"modifyOther")? {
         permissions.modify_contents = value;
@@ -887,8 +890,9 @@ fn parse_job_encrypt(
     if let Some(value) = job_json_choice(&settings, b"print", &["full", "low", "none"], true)? {
         if key_length == "40bit" {
             r2_permissions.print = value == "y";
+        } else {
+            job_json_print_permission(&value, &mut permissions)?;
         }
-        job_json_print_permission(&value, &mut permissions)?;
     }
 
     let defaults_user_password = user_password.clone();
