@@ -244,11 +244,11 @@ fn raw_argv_modern_accessibility_n_emits_qpdf_diagnostic() {
         .contains("-accessibility=n is ignored for modern encryption formats"));
 }
 
-#[cfg(unix)]
+#[cfg(target_os = "linux")]
 use std::ffi::OsString;
-#[cfg(unix)]
+#[cfg(target_os = "linux")]
 use std::os::unix::ffi::{OsStrExt, OsStringExt};
-#[cfg(unix)]
+#[cfg(target_os = "linux")]
 use std::path::PathBuf;
 
 const COMPLETE_JSON: &[u8] = br#"{
@@ -400,7 +400,7 @@ fn normalize_text_newlines(bytes: &[u8]) -> Vec<u8> {
     normalized
 }
 
-#[cfg(unix)]
+#[cfg(target_os = "linux")]
 fn non_utf8_path(directory: &Path, filename: &[u8]) -> PathBuf {
     let mut bytes = directory.as_os_str().as_bytes().to_vec();
     bytes.push(b'/');
@@ -408,7 +408,7 @@ fn non_utf8_path(directory: &Path, filename: &[u8]) -> PathBuf {
     PathBuf::from(OsString::from_vec(bytes))
 }
 
-#[cfg(unix)]
+#[cfg(target_os = "linux")]
 fn job_json_with_paths(input: &Path, output: &Path) -> Vec<u8> {
     let mut json = b"{\"inputFile\":\"".to_vec();
     json.extend_from_slice(input.as_os_str().as_bytes());
@@ -886,7 +886,7 @@ fn raw_argv_initializer_parses_attachment_and_overlay_segments() {
     assert!(output.is_file());
 }
 
-#[cfg(unix)]
+#[cfg(target_os = "linux")]
 #[test]
 fn raw_argv_initializer_preserves_non_utf8_path_and_password_bytes() {
     use std::os::unix::ffi::OsStrExt;
@@ -5255,7 +5255,7 @@ fn write_qpdf_completes_replace_input_without_run() {
     );
 }
 
-#[cfg(unix)]
+#[cfg(target_os = "linux")]
 #[test]
 fn job_json_input_file_opens_a_literal_non_utf8_path() {
     let directory = tempfile::tempdir().unwrap();
@@ -5275,7 +5275,7 @@ fn job_json_input_file_opens_a_literal_non_utf8_path() {
     assert!(output.exists(), "qpdf job must open the exact input path");
 }
 
-#[cfg(unix)]
+#[cfg(target_os = "linux")]
 #[test]
 fn job_json_output_file_creates_a_literal_non_utf8_path() {
     let directory = tempfile::tempdir().unwrap();
@@ -5298,7 +5298,7 @@ fn job_json_output_file_creates_a_literal_non_utf8_path() {
     );
 }
 
-#[cfg(unix)]
+#[cfg(target_os = "linux")]
 #[test]
 fn job_json_replace_input_preserves_non_utf8_derived_backup_path() {
     let repairable = Path::new(env!("CARGO_MANIFEST_DIR"))
