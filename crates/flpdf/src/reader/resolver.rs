@@ -3917,11 +3917,19 @@ impl<R: Read + Seek> ResolverHandle<R> {
             };
             let trailing = if parsed.empty.is_none() {
                 let mut trailing_tokens = LiveTokenSource::new(&mut input);
-                let trailing = trailing_tokens
-                    .next_token()
-                    .map_err(ReadObjectAtOffsetError::Body)?;
+                let trailing = trailing_tokens.next_token();
                 drop(trailing_tokens);
-                Some(trailing)
+                match trailing {
+                    Ok(trailing) => Some(trailing),
+                    Err(error) => {
+                        // The trailing-token read shares the header and body
+                        // exits' contract: settle the logical position before
+                        // returning so a nested read leaves the outer parser
+                        // on qpdf's cursor rather than the prefetch end.
+                        input.finish().map_err(ReadObjectAtOffsetError::Body)?;
+                        return Err(ReadObjectAtOffsetError::Body(error));
+                    }
+                }
             } else {
                 None
             };
