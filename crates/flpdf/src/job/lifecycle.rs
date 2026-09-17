@@ -888,7 +888,9 @@ fn parse_job_encrypt(
         "256bit" => true,
         "128bit" => job_json_choice(&settings, b"useAes", &["y", "n"], true)?
             .map_or(inherited.use_aes, |value| value == "y"),
-        "40bit" => false,
+        // Config::encrypt(40, ...) leaves use_aes untouched, so a later
+        // 128-bit group can still reuse AES selected by an earlier group.
+        "40bit" => inherited.use_aes,
         _ => unreachable!("key length was validated above"), // cov:ignore: key length comes only from the validated qpdf job schema choices
     };
     let force_v4 =
