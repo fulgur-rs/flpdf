@@ -14,11 +14,11 @@ use std::path::Path;
 use std::process::{Command, Stdio};
 use std::sync::{Arc, Mutex};
 
-#[cfg(unix)]
+#[cfg(target_os = "linux")]
 use std::ffi::OsString;
-#[cfg(unix)]
+#[cfg(target_os = "linux")]
 use std::os::unix::ffi::{OsStrExt, OsStringExt};
-#[cfg(unix)]
+#[cfg(target_os = "linux")]
 use std::path::PathBuf;
 
 const COMPLETE_JSON: &[u8] = br#"{
@@ -113,7 +113,7 @@ fn logger_with_error_sink() -> (QPDFLogger, Arc<Mutex<SinkState>>) {
     (logger, state)
 }
 
-#[cfg(unix)]
+#[cfg(target_os = "linux")]
 fn non_utf8_path(directory: &Path, filename: &[u8]) -> PathBuf {
     let mut bytes = directory.as_os_str().as_bytes().to_vec();
     bytes.push(b'/');
@@ -599,7 +599,7 @@ fn raw_argv_initializer_parses_attachment_and_overlay_segments() {
     assert!(output.is_file());
 }
 
-#[cfg(unix)]
+#[cfg(target_os = "linux")]
 #[test]
 fn raw_argv_initializer_preserves_non_utf8_path_and_password_bytes() {
     use std::os::unix::ffi::OsStrExt;
