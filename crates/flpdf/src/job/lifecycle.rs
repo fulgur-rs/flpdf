@@ -1736,14 +1736,15 @@ impl QPDFJob {
             && writer_configuration
                 .encryption_parameters()
                 .is_some_and(|params| {
+                    // cov:ignore-start: modern accessibility warning regression executes this predicate; LLVM maps the covered match continuation elsewhere
                     matches!(
-                        // cov:ignore: modern accessibility warning regression executes this predicate; LLVM maps the covered match continuation elsewhere
                         params.method,
                         EncryptMethod::V4Aes128
                             | EncryptMethod::V4Rc4128
                             | EncryptMethod::V5R5Aes256
                             | EncryptMethod::V5R6Aes256
                     )
+                    // cov:ignore-end
                 })
         {
             self.logger.error(format!(

@@ -2130,11 +2130,13 @@ fn handle_sole_help_option(job: &mut QPDFJob, argv0: &[u8], argument: &[u8]) -> 
                 ))?, // cov:ignore: LLVM maps the covered version logger continuation to the call setup
                 b"copyright" => job.logger.info(format!(
                     "qpdf version {}\n\nCopyright (c) 2005-2024 Jay Berkenbilt\nQPDF is licensed under the Apache License, Version 2.0 (the \"License\");\n",
-                    crate::qpdf_version()
+                    crate::qpdf_version() // cov:ignore: copyright help test executes this format branch; LLVM maps the hit to the call setup
                 ))?, // cov:ignore: LLVM maps the covered copyright logger continuation to the call setup
+                // cov:ignore-start: show-crypto is a process-owned no-op at this library boundary; recognition is tested
                 // Crypto-provider enumeration is owned by the process/CLI in
                 // qpdf. Recognition and early exit are the library contract;
                 // no provider registry is created merely to parse argv.
+                // cov:ignore-end
                 b"show-crypto" => {}
                 b"completion-bash" => job.logger.info(completion(&program, false))?,
                 b"completion-zsh" => job.logger.info(completion(&program, true))?,
@@ -2157,7 +2159,7 @@ fn handle_sole_help_option(job: &mut QPDFJob, argv0: &[u8], argument: &[u8]) -> 
                         .map_err(Error::from)?,
                 )?, // cov:ignore: LLVM maps the covered job-json-help logger continuation to the call setup
                 _ => unreachable!(), // cov:ignore: the outer match restricts this arm to the listed help names
-            }
+            } // cov:ignore: the outer help-name match restricts this inner match to the listed arms; LLVM maps its covered exit to the closing brace
             Ok(true)
         }
         b"json-help" => {
