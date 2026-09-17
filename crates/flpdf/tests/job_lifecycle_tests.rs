@@ -85,8 +85,7 @@ fn raw_argv_initializer_matches_qpdf_final_configuration_state() {
     let error = json_then_positional
         .initialize_from_raw_argv(&[
             b"qpdfjob".to_vec(),
-            b"--job-json-file".to_vec(),
-            job_json.to_string_lossy().into_owned().into_bytes(),
+            format!("--job-json-file={}", job_json.display()).into_bytes(),
             tempdir
                 .path()
                 .join("unexpected-output.pdf")
@@ -479,6 +478,14 @@ fn raw_argv_help_table_and_completion_emit_qpdf_output() {
     assert!(String::from_utf8_lossy(&info.lock().unwrap().bytes).contains("Create linearized"));
 
     let (logger, info) = logger_with_info_sink();
+    let mut option_help = QPDFJob::new();
+    option_help.set_logger(logger);
+    option_help
+        .initialize_from_raw_argv(&[b"qpdfjob".to_vec(), b"--help=--allow-insecure".to_vec()])
+        .unwrap();
+    assert!(String::from_utf8_lossy(&info.lock().unwrap().bytes).contains("--allow-insecure"));
+
+    let (logger, info) = logger_with_info_sink();
     let mut completion = QPDFJob::new();
     completion.set_logger(logger);
     completion
@@ -498,6 +505,17 @@ fn raw_argv_help_table_and_completion_emit_qpdf_output() {
     assert_eq!(
         info.lock().unwrap().bytes,
         b"complete -o bashdefault -o default -o nospace -C \"custom-qpdf\" custom-qpdf\n"
+    );
+
+    let (logger, info) = logger_with_info_sink();
+    let mut custom_zsh_completion = QPDFJob::new();
+    custom_zsh_completion.set_logger(logger);
+    custom_zsh_completion
+        .initialize_from_raw_argv(&[b"/opt/custom-qpdf".to_vec(), b"--completion-zsh".to_vec()])
+        .unwrap();
+    assert_eq!(
+        info.lock().unwrap().bytes,
+        b"autoload -U +X bashcompinit && bashcompinit && complete -o bashdefault -o default -C \"custom-qpdf\" custom-qpdf\n"
     );
 }
 
@@ -538,8 +556,7 @@ fn raw_argv_job_json_positionals_reject_existing_config_slots() {
         input_job
             .initialize_from_raw_argv(&[
                 b"qpdfjob".to_vec(),
-                b"--job-json-file".to_vec(),
-                input_json.to_string_lossy().into_owned().into_bytes(),
+                format!("--job-json-file={}", input_json.display()).into_bytes(),
                 b"unexpected-output.pdf".to_vec(),
             ])
             .unwrap_err(),
@@ -557,8 +574,7 @@ fn raw_argv_job_json_positionals_reject_existing_config_slots() {
         output_job
             .initialize_from_raw_argv(&[
                 b"qpdfjob".to_vec(),
-                b"--job-json-file".to_vec(),
-                output_json.to_string_lossy().into_owned().into_bytes(),
+                format!("--job-json-file={}", output_json.display()).into_bytes(),
                 fixture.to_string_lossy().into_owned().into_bytes(),
                 b"second-output.pdf".to_vec(),
             ])
