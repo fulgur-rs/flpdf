@@ -25,6 +25,14 @@ pub(super) fn initialize(job: &mut QPDFJob, argv: Vec<Vec<u8>>) -> Result<()> {
     job.configuration.require_output = true;
     job.partial_json_initialized = false;
     job.argv_early_exit = false;
+    // qpdf sets the diagnostic prefix from `QPDFArgParser::getProgname()`
+    // immediately before parsing (`QPDFJob_argv.cc:418-428`). That value is
+    // the basename of argv[0], independent of the completion executable
+    // override.
+    let program = expanded
+        .first()
+        .map_or_else(|| String::from("qpdf"), |argv0| program_name(argv0));
+    job.set_message_prefix(program);
 
     if expanded.len() == 2 && handle_sole_help_option(job, &expanded[0], &expanded[1])? {
         return Ok(());
@@ -2106,14 +2114,17 @@ fn known_help_target(value: &[u8]) -> bool {
 }
 
 fn program_name(argv0: &[u8]) -> String {
-    String::from_utf8_lossy(
-        argv0
-            .rsplit(|byte| *byte == b'/' || *byte == b'\\')
-            .next()
-            .filter(|name| !name.is_empty())
-            .unwrap_or(b"qpdf"),
-    )
-    .into_owned()
+    let name = argv0
+        .rsplit(|byte| *byte == b'/' || *byte == b'\\')
+        .next()
+        .filter(|name| !name.is_empty())
+        .unwrap_or(b"qpdf");
+    let name = if name.len() > 4 && name.ends_with(b".exe") {
+        &name[..name.len() - 4]
+    } else {
+        name
+    };
+    String::from_utf8_lossy(name).into_owned()
 }
 
 fn help_top(program: &str) -> Vec<u8> {
@@ -2123,33 +2134,83 @@ fn help_top(program: &str) -> Vec<u8> {
     .into_bytes()
 }
 
-fn completion(argv0: &[u8], zsh: bool) -> Vec<u8> {
-    let executable = std::env::var_os("QPDF_EXECUTABLE")
-        .map(|value| value.to_string_lossy().into_owned())
-        .unwrap_or_else(|| String::from_utf8_lossy(argv0).into_owned());
-    let program = program_name(argv0);
-    if zsh {
+fn completion_command(
+    argv0: &[u8],
+    zsh: bool,
+    qpdf_executable: Option<&str>,
+    appdir: Option<&str>,
+    appimage: Option<&str>,
+) -> (String, bool) {
+    let argv0 = String::from_utf8_lossy(argv0);
+    let executable = qpdf_executable
+        .map(str::to_owned)
+        .or_else(|| {
+            appdir
+                .filter(|appdir| appdir.len() < argv0.len() && argv0.starts_with(appdir))
+                .and(appimage.map(str::to_owned))
+        })
+        .unwrap_or_else(|| argv0.clone().into_owned());
+    let program = program_name(argv0.as_bytes());
+    let command = if zsh {
         format!(
             "autoload -U +X bashcompinit && bashcompinit && complete -o bashdefault -o default -C \"{executable}\" {program}\n"
         )
     } else {
-        format!(
-            "complete -o bashdefault -o default -o nospace -C \"{executable}\" {program}\n"
-        )
+        format!("complete -o bashdefault -o default -o nospace -C \"{executable}\" {program}\n")
+    };
+    let slash = executable.find('/');
+    (command, slash.is_some_and(|offset| offset != 0))
+}
+
+fn completion(job: &QPDFJob, argv0: &[u8], zsh: bool) -> Result<()> {
+    let qpdf_executable = std::env::var_os("QPDF_EXECUTABLE");
+    let appdir = std::env::var_os("APPDIR");
+    let appimage = std::env::var_os("APPIMAGE");
+    let qpdf_executable = qpdf_executable
+        .as_ref()
+        .map(|value| value.to_string_lossy());
+    let appdir = appdir.as_ref().map(|value| value.to_string_lossy());
+    let appimage = appimage.as_ref().map(|value| value.to_string_lossy());
+    let (command, relative) = completion_command(
+        argv0,
+        zsh,
+        qpdf_executable.as_deref(),
+        appdir.as_deref(),
+        appimage.as_deref(),
+    );
+    job.logger.info(command)?;
+    if relative {
+        job.logger.error(format!(
+            "WARNING: {} completion enabled using relative path to executable\n",
+            program_name(argv0)
+        ))?;
     }
-    .into_bytes()
+    Ok(())
 }
 
 fn show_crypto_provider(job: &QPDFJob, provider: &str) -> Result<()> {
     let registered = QPDF_SHOW_CRYPTO
         .split(|byte| *byte == b'\n')
-        .any(|name| !name.is_empty() && name == provider.as_bytes());
-    if !registered {
-        return Err(Error::Usage(UsageError::new(format!(
+        .filter(|name| !name.is_empty())
+        .map(|name| String::from_utf8_lossy(name).into_owned())
+        .collect::<Vec<_>>();
+    if !registered.iter().any(|name| name == provider) {
+        // qpdf's provider registry raises std::logic_error here
+        // (`QPDFCryptoProvider.cc:91-99`), not QPDFUsage.
+        return Err(Error::Internal(format!(
             "QPDFCryptoProvider: request to set default provider to unknown implementation \"{provider}\""
-        ))));
+        )));
     }
-    job.logger.info(format!("{provider}\n"))
+    let mut output = String::new();
+    output.push_str(provider);
+    output.push('\n');
+    for name in registered {
+        if name != provider {
+            output.push_str(&name);
+            output.push('\n');
+        }
+    }
+    job.logger.info(output)
 }
 
 fn show_crypto(job: &QPDFJob) -> Result<()> {
@@ -2228,8 +2289,8 @@ fn handle_sole_help_option(job: &mut QPDFJob, argv0: &[u8], argument: &[u8]) -> 
                         .replacen("qpdf version", &format!("{program} version"), 1),
                 )?, // cov:ignore: LLVM maps the covered copyright logger continuation to the call setup
                 b"show-crypto" => show_crypto(job)?,
-                b"completion-bash" => job.logger.info(completion(argv0, false))?,
-                b"completion-zsh" => job.logger.info(completion(argv0, true))?,
+                b"completion-bash" => completion(job, argv0, false)?,
+                b"completion-zsh" => completion(job, argv0, true)?,
                 b"help" => {
                     if let Some(value) = value {
                         if !known_help_target(value) {
@@ -2313,8 +2374,49 @@ mod tests {
     fn show_crypto_rejects_a_provider_outside_the_pinned_registry() {
         let job = QPDFJob::new();
         let error = show_crypto_provider(&job, "openssl").unwrap_err();
-        assert!(matches!(error, Error::Usage(usage) if usage
-            .to_string()
+        assert!(matches!(error, Error::Internal(message) if message
             .contains("unknown implementation \"openssl\"")));
+    }
+
+    #[test]
+    fn completion_matches_qpdf_appimage_and_relative_path_selection() {
+        let (command, relative) = completion_command(
+            b"/opt/bundle/usr/bin/qpdf",
+            false,
+            None,
+            Some("/opt/bundle"),
+            Some("/opt/qpdf.AppImage"),
+        );
+        assert_eq!(
+            command,
+            "complete -o bashdefault -o default -o nospace -C \"/opt/qpdf.AppImage\" qpdf\n"
+        );
+        assert!(!relative);
+
+        let (command, relative) = completion_command(b"./qpdf", false, None, None, None);
+        assert_eq!(
+            command,
+            "complete -o bashdefault -o default -o nospace -C \"./qpdf\" qpdf\n"
+        );
+        assert!(relative);
+
+        let (command, relative) = completion_command(
+            b"qpdf",
+            true,
+            Some("./custom-qpdf"),
+            Some("/opt/bundle"),
+            Some("/opt/qpdf.AppImage"),
+        );
+        assert_eq!(
+            command,
+            "autoload -U +X bashcompinit && bashcompinit && complete -o bashdefault -o default -C \"./custom-qpdf\" qpdf\n"
+        );
+        assert!(relative);
+    }
+
+    #[test]
+    fn program_name_matches_qpdf_basename_and_exe_stripping() {
+        assert_eq!(program_name(b"/opt/custom-qpdf"), "custom-qpdf");
+        assert_eq!(program_name(b"C:\\tools\\qpdf.exe"), "qpdf");
     }
 }
