@@ -1350,6 +1350,7 @@ struct ObjectSlot {
 #[cfg(test)]
 thread_local! {
     static TEST_SLOTS: RefCell<Vec<Weak<RefCell<ObjectSlot>>>> = const { RefCell::new(Vec::new()) };
+    static STATE_CHILDREN_VECTOR_CALLS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
 }
 
 #[cfg(test)]
@@ -2208,6 +2209,8 @@ impl ObjectHandle {
     }
 
     fn state_children(state: &ObjectValue) -> Vec<ObjectHandle> {
+        #[cfg(test)]
+        STATE_CHILDREN_VECTOR_CALLS.with(|calls| calls.set(calls.get() + 1));
         Self::direct_children(state)
     }
 
@@ -2702,11 +2705,7 @@ impl ObjectHandle {
             }
             {
                 let shared = shared.borrow();
-                pending.extend(
-                    Self::state_children(&shared.value)
-                        .into_iter()
-                        .filter(|child| !child.is_indirect()),
-                );
+                Self::append_direct_children(&shared.value, &mut pending);
             }
             shared.borrow_mut().identity = ValueIdentity::default();
         }
@@ -5078,6 +5077,27 @@ impl ObjectHandle {
             ObjectValue::Dictionary(entries) => entries.values().cloned().collect(),
             ObjectValue::Stream(stream) => vec![stream.stream_dict.clone()],
             _ => Vec::new(),
+        }
+    }
+
+    fn append_direct_children(value: &ObjectValue, pending: &mut Vec<ObjectHandle>) {
+        match value {
+            ObjectValue::Array(children) => pending.extend(
+                children
+                    .iter()
+                    .filter(|child| !child.is_indirect())
+                    .cloned(),
+            ),
+            ObjectValue::Dictionary(entries) => pending.extend(
+                entries
+                    .values()
+                    .filter(|child| !child.is_indirect())
+                    .cloned(),
+            ),
+            ObjectValue::Stream(stream) if !stream.stream_dict.is_indirect() => {
+                pending.push(stream.stream_dict.clone());
+            }
+            _ => {}
         }
     }
 
@@ -21480,6 +21500,21 @@ mod drop_tests {
         assert!(
             start.elapsed() < std::time::Duration::from_secs(5),
             "disconnect must not walk a direct DAG once per path"
+        );
+    }
+
+    #[test]
+    fn disconnect_does_not_materialize_a_child_vector_for_each_node() {
+        let child = ObjectHandle::array(vec![ObjectHandle::integer(1), ObjectHandle::integer(2)]);
+        let root = ObjectHandle::dictionary(vec![(b"/Child".to_vec(), child)]);
+        super::STATE_CHILDREN_VECTOR_CALLS.with(|calls| calls.set(0));
+
+        root.disconnect();
+
+        assert_eq!(
+            super::STATE_CHILDREN_VECTOR_CALLS.with(std::cell::Cell::get),
+            0,
+            "disconnect must append direct children to its existing worklist"
         );
     }
 
