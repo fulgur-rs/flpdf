@@ -41,7 +41,7 @@ tracker 集計にも現れるので、行の分類を変えたときはこの 4 
 
 `scripts/check-qpdf-route-matrix.py --check` は、A〜E の160行に加えて
 E の qtest exception 表（物理98行を論理99ケースとして数える）を含む259 logical
-rowsを検証する。2026-09-17 の現行 `origin/main` (`814e2b599dce2dce79d0c7ad80698a07a8c82e84`) を基準に、
+rowsを検証する。2026-09-18 の現行 `origin/main` (`4942e7b3f7fbeb2a2d79e771c55f7dff3f4eca58`) を基準に、
 今回の変更を適用した tree での集計は次のとおり。
 
 | canonical | bridge | mixed | unknown | 合計 |
