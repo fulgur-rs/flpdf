@@ -3570,6 +3570,14 @@ impl QPDFJob {
         Ok(())
     }
 
+    /// Clear the completed-run flag when a new initialization restarts the
+    /// job's lifecycle. qpdf has no such flag: `initializeFromArgv` simply
+    /// rebuilds the configuration, so this reset keeps the Rust side's
+    /// post-run JSON-layering branch from seeing a stale value.
+    pub(super) fn reset_has_run_for_initialization(&mut self) {
+        self.has_run = false;
+    }
+
     /// Run the configured create/write or check lifecycle.
     pub fn run(&mut self) -> Result<JobExitCode> {
         if self.argv_early_exit {

@@ -24,6 +24,11 @@ pub(super) fn initialize(job: &mut QPDFJob, argv: Vec<Vec<u8>>) -> Result<()> {
     // (`QPDFJob_config.cc:75-83, QPDFJob.cc:591-595`).
     job.configuration.require_output = true;
     job.partial_json_initialized = false;
+    // A fresh argv initialization restarts the job's lifecycle. Leaving
+    // `has_run` set would send a later `--job-json-file` occurrence down
+    // `initialize_from_json_with_partial`'s post-run fresh-configuration
+    // branch, discarding the argv options parsed before it.
+    job.reset_has_run_for_initialization();
     job.argv_early_exit = false;
     // qpdf sets the diagnostic prefix from `QPDFArgParser::getProgname()`
     // immediately before parsing (`QPDFJob_argv.cc:418-428`). That value is
@@ -484,7 +489,11 @@ impl<'a> Parser<'a> {
             }
             b"password-file" => {
                 let value = required_value(name, value, "password")?;
-                if let Some(password) = read_password_file(self.job, value)? {
+                // qpdf's `Config::passwordFile` lets `read_lines_from_file`'s
+                // QPDFSystemError escape into `ArgParser::parseOptions`, which
+                // converts every callback runtime_error through `usage()`
+                // (`QPDFJob_config.cc:661-668`; `QPDFJob_argv.cc:407-415`).
+                if let Some(password) = argv_callback_value(read_password_file(self.job, value))? {
                     self.job.configuration.password = password;
                 }
                 Ok(())

@@ -6329,3 +6329,68 @@ fn config_copy_attachments_from_matches_the_json_configured_path() {
         "the Config builder and the JSON path must produce byte-identical output"
     );
 }
+
+/// A missing `--password-file` must surface as a usage error.
+///
+/// qpdf's `Config::passwordFile` lets `QUtil::read_lines_from_file` throw a
+/// `QPDFSystemError` (`QPDFJob_config.cc:661-668`); `ArgParser::parseOptions`
+/// catches every callback `runtime_error` and routes it through `usage()`
+/// (`QPDFJob_argv.cc:407-415`). A bare file-I/O error would give CLI-style
+/// consumers the wrong class and drop the usage framing.
+#[test]
+fn missing_password_file_is_a_usage_error() {
+    let tempdir = tempfile::tempdir().unwrap();
+    let missing = tempdir.path().join("absent-password.txt");
+    let mut job = QPDFJob::new();
+    let error = job
+        .initialize_from_raw_argv(&[
+            b"qpdfjob".to_vec(),
+            b"in.pdf".to_vec(),
+            format!("--password-file={}", missing.display()).into_bytes(),
+            b"out.pdf".to_vec(),
+        ])
+        .expect_err("a missing password file must fail");
+    assert!(
+        matches!(error, flpdf::Error::Usage(_)),
+        "expected a usage error, got {error:?}"
+    );
+}
+
+/// A second argv initialization restarts the lifecycle.
+///
+/// `initialize_from_json_with_partial` layers onto the existing configuration
+/// only while the job has not run. Without clearing that flag here, a
+/// `--job-json-file` occurrence in the second argv would take the post-run
+/// fresh-configuration branch and discard the input/output parsed before it.
+#[test]
+fn argv_initialization_after_a_run_keeps_later_job_json_layering() {
+    let fixture =
+        Path::new(env!("CARGO_MANIFEST_DIR")).join("../../tests/fixtures/compat/one-page.pdf");
+    let tempdir = tempfile::tempdir().unwrap();
+    let first_output = tempdir.path().join("first.pdf");
+    let second_output = tempdir.path().join("second.pdf");
+    let job_json = tempdir.path().join("job.json");
+    std::fs::write(&job_json, br#"{"qdf": ""}"#).unwrap();
+
+    let mut job = QPDFJob::new();
+    job.initialize_from_raw_argv(&[
+        b"qpdfjob".to_vec(),
+        fixture.to_string_lossy().into_owned().into_bytes(),
+        first_output.to_string_lossy().into_owned().into_bytes(),
+    ])
+    .expect("first initialization");
+    assert_eq!(job.run().unwrap(), JobExitCode::Success);
+
+    job.initialize_from_raw_argv(&[
+        b"qpdfjob".to_vec(),
+        fixture.to_string_lossy().into_owned().into_bytes(),
+        format!("--job-json-file={}", job_json.display()).into_bytes(),
+        second_output.to_string_lossy().into_owned().into_bytes(),
+    ])
+    .expect("the input and output parsed before --job-json-file must survive");
+    assert_eq!(job.run().unwrap(), JobExitCode::Success);
+    assert!(
+        second_output.exists(),
+        "the second run must write its output"
+    );
+}

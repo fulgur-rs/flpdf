@@ -337,7 +337,10 @@ impl QPDFJob {
         let mut message = Vec::new();
         message.extend_from_slice(self.message_prefix_bytes());
         message.extend_from_slice(b": copying attachments from ");
-        message.extend_from_slice(options.path.display().to_string().as_bytes());
+        // qpdf writes `to_copy.path` verbatim (`QPDFJob.cc:2097`); `display()`
+        // would replace non-UTF-8 bytes with U+FFFD. Use the same byte-preserving
+        // helper the add-attachment report already uses.
+        message.extend_from_slice(&path_bytes(&options.path));
         message.push(b'\n');
         self.logger().info(message)
     }
