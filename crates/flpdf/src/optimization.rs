@@ -522,7 +522,7 @@ impl Optimization {
                 let skip_level =
                     skip_stream_parameters(pending.object.qpdf_obj_gen(), &pending.object)?;
                 stream_dict.try_dereference()?;
-                for key in stream_dict.resolved_get_visible_keys()?.into_iter().rev() {
+                for (key, object) in resolved_visible_children(&stream_dict)?.into_iter().rev() {
                     if (skip_level >= 1 && key == b"/Length")
                         || (skip_level >= 2
                             && matches!(key.as_slice(), b"/Filter" | b"/DecodeParms"))
@@ -530,7 +530,7 @@ impl Optimization {
                         continue;
                     }
                     stack.push(Pending {
-                        object: stream_dict.resolved_get_key(&key)?,
+                        object,
                         user: pending.user.clone(),
                         top: false,
                         via_array: false,
@@ -547,9 +547,7 @@ impl Optimization {
                 )
             }) {
                 let page = is_page_resolved(&pending.object)?;
-                for key in pending
-                    .object
-                    .resolved_get_visible_keys()?
+                for (key, object) in resolved_visible_children(&pending.object)?
                     .into_iter()
                     .rev()
                 {
@@ -562,7 +560,7 @@ impl Optimization {
                         pending.user.clone()
                     };
                     stack.push(Pending {
-                        object: pending.object.resolved_get_key(&key)?,
+                        object,
                         user: child_user,
                         top: false,
                         via_array: false,
@@ -595,6 +593,41 @@ struct Pending {
 
 fn is_page_resolved(object: &ObjectHandle) -> crate::Result<bool> {
     object.resolved_is_dictionary_of_type(b"Page", b"")
+}
+
+/// Return qpdf-ordered visible dictionary children while cloning each child
+/// handle only once.
+///
+/// qpdf's getKeys/getKey pair returns sorted, non-null dictionary entries
+/// (QPDF_Dictionary.cc:117-127). The old Rust consumer copied the key list,
+/// looked up each key once for null filtering, then looked it up again to push
+/// the child. Keep the same resolution/filtering order but retain the child
+/// handle from the first lookup.
+fn resolved_visible_children(handle: &ObjectHandle) -> crate::Result<Vec<(Vec<u8>, ObjectHandle)>> {
+    let Some(entries) = handle.with_value(|value| match value {
+        Some(crate::object_handle::ObjectValue::Dictionary(entries)) => Some(
+            entries
+                .iter()
+                .map(|(key, child)| (key.clone(), child.clone()))
+                .collect::<Vec<_>>(),
+        ),
+        _ => None,
+    }) else {
+        // Ordinary callers establish the dictionary/stream boundary before
+        // entering this helper. Preserve the qpdf type-warning behavior for
+        // a malformed direct caller without putting the snapshotting helper
+        // back on the hot path.
+        let _ = handle.resolved_get_visible_keys()?;
+        return Ok(Vec::new());
+    };
+
+    let mut visible = Vec::with_capacity(entries.len());
+    for (key, child) in entries {
+        if !child.try_is_null()? {
+            visible.push((key, child));
+        }
+    }
+    Ok(visible)
 }
 
 fn empty_qpdf_obj_gens() -> &'static BTreeSet<QpdfObjGen> {
@@ -719,6 +752,35 @@ mod tests {
                 .expect("missing key")
                 .as_integer(),
             None
+        );
+    }
+
+    #[test]
+    fn visible_children_are_sorted_and_drop_null_values() {
+        let dictionary = ObjectHandle::dictionary(vec![
+            (b"/Z".to_vec(), ObjectHandle::integer(3)),
+            (b"/Null".to_vec(), ObjectHandle::null()),
+            (b"/A".to_vec(), ObjectHandle::integer(1)),
+        ]);
+        dictionary
+            .try_dereference()
+            .expect("direct dictionary resolves");
+
+        let children = super::resolved_visible_children(&dictionary)
+            .expect("visible child traversal succeeds");
+        assert_eq!(
+            children
+                .iter()
+                .map(|(key, _)| key.as_slice())
+                .collect::<Vec<_>>(),
+            vec![b"/A".as_slice(), b"/Z".as_slice()]
+        );
+        assert_eq!(
+            children
+                .iter()
+                .map(|(_, child)| child.as_integer())
+                .collect::<Vec<_>>(),
+            vec![Some(1), Some(3)]
         );
     }
 
