@@ -404,6 +404,29 @@ fn qdf_subcommand_matches_qpdf_process_contracts() {
 }
 
 #[test]
+fn qdf_reentrant_signature_matches_qpdf_expected_endobj_warning() {
+    if skip_if_qpdf_missing() {
+        return;
+    }
+
+    let fixture = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+        .join("../../tests/fixtures/compat/encrypted-indirect-type-signature.pdf");
+    let temp = tempfile::tempdir().unwrap();
+    let qpdf_output = temp.path().join("qpdf.pdf");
+    let flpdf_output = temp.path().join("flpdf.pdf");
+    let qpdf = run_qdf_qpdf(&[], &fixture, &qpdf_output);
+    let flpdf = run_qdf_flpdf(&[], &fixture, &flpdf_output);
+
+    assert_eq!(flpdf.status.code(), qpdf.status.code());
+    assert_eq!(flpdf.stdout, qpdf.stdout);
+    assert_eq!(
+        normalize_qdf_diagnostic(&flpdf.stderr, &flpdf_output),
+        normalize_qdf_diagnostic(&qpdf.stderr, &qpdf_output),
+        "re-entrant parsing must still reach qpdf's trailing endobj check"
+    );
+}
+
+#[test]
 fn qdf_fix_repairs_hand_edited_stream_length() {
     let input = fixture_with_stream();
     let temp = tempfile::tempdir().unwrap();
