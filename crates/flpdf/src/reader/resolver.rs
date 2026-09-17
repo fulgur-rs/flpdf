@@ -107,16 +107,6 @@ use std::collections::{BTreeMap, BTreeSet};
 use std::io::{Read, Seek, SeekFrom};
 use std::rc::{Rc, Weak};
 
-#[cfg(test)]
-thread_local! {
-    static EFFECTIVE_XREF_SNAPSHOT_CONSTRUCTIONS: Cell<usize> = const { Cell::new(0) };
-}
-
-#[cfg(test)]
-fn effective_xref_snapshot_constructions_for_test() -> usize {
-    EFFECTIVE_XREF_SNAPSHOT_CONSTRUCTIONS.with(Cell::get)
-}
-
 /// qpdf's `InvalidInputSource` exception text (`libqpdf/QPDF.cc:55-106`).
 pub(crate) const CLOSED_INPUT_SOURCE_ERROR: &str =
     "QPDF operation attempted on a QPDF object with no input source. QPDF operations are invalid before processFile (or another process method) or after closeInputSource";
@@ -5665,6 +5655,16 @@ impl<R: Read + Seek> ResolverHandle<R> {
             }
         }
     }
+}
+
+#[cfg(test)]
+thread_local! {
+    static EFFECTIVE_XREF_SNAPSHOT_CONSTRUCTIONS: Cell<usize> = const { Cell::new(0) };
+}
+
+#[cfg(test)]
+fn effective_xref_snapshot_constructions_for_test() -> usize {
+    EFFECTIVE_XREF_SNAPSHOT_CONSTRUCTIONS.with(Cell::get)
 }
 
 #[cfg(test)]
