@@ -5331,7 +5331,6 @@ fn run_command(command: Commands, overlay_specs: &[OverlaySpec]) -> CliResult<()
                     // silently diverge on the identical flag combination.
                     run_empty_page_extraction(
                         &cmd.output,
-                        cmd.repair,
                         &cmd.password,
                         None,
                         &cmd.page_ops,
@@ -8018,14 +8017,12 @@ fn run_page_extraction(
 /// Run qpdf's `--empty --pages` route with an empty primary document.
 ///
 /// qpdf's empty primary has no input filename and all page specifications are
-/// therefore secondary sources. Keep this as the same `QPDFJob::handle_page_specs`
-/// boundary used by ordinary multi-source extraction so source-count policy,
-/// collate order, copying, and final writing cannot drift between the two
-/// command shapes.
+/// therefore secondary sources. Keep source-count policy, collate order, and
+/// copying on `QPDFJob::create_qpdf`'s page-spec lifecycle so this command
+/// shape cannot drift from qpdf's ordinary multi-source extraction.
 #[allow(clippy::too_many_arguments)]
 fn run_empty_page_extraction(
     output: &Path,
-    repair: bool,
     password: &PasswordArgs,
     update_from_json: Option<&Path>,
     page_ops: &PageOpArgs,
@@ -8053,81 +8050,79 @@ fn run_empty_page_extraction(
     {
         return Err("--pages: '.' cannot refer to a primary input with --empty".into());
     }
-    let inputs = resolve_page_specs(&raw_specs, Path::new("<empty>"))?;
+    // Parse the page segment at the CLI boundary for the same usage errors as
+    // the former route, but leave source identity, opening, password policy,
+    // and copying to QPDFJob's createQPDF page-spec lifecycle.
+    let _validated_inputs = resolve_page_specs(&raw_specs, Path::new("<empty>"))?;
+    let _validated_collate = parse_collate_values(&page_ops.collate)?;
 
-    let mut source_paths = Vec::new();
-    let mut source_passwords = Vec::new();
-    let mut specs = Vec::with_capacity(inputs.len());
-    for input in inputs {
-        let source_index =
-            if let Some(index) = source_paths.iter().position(|path| *path == input.path) {
-                index + 1
-            } else {
-                source_paths.push(input.path.clone());
-                source_passwords.push(input.password.clone());
-                source_paths.len()
-            };
-        specs.push(PageSpecInput::new(source_index, input.range));
-    }
-
-    let mut job = QPDFJob::new();
-    job.set_warnings_exit_zero(cli_warning_exit_zero());
-    job.set_logger(cli_logger());
-    job.set_message_prefix(progname());
+    let mut job = new_cli_job(no_warn);
+    job.set_output_file(output.to_path_buf())?;
+    job.set_suppress_recovery(password.recovery.suppress_recovery);
+    job.set_ignore_xref_streams(password.recovery.ignore_xref_streams);
+    job.set_password_mode(password.password_mode.into());
+    job.set_password_is_hex_key(password.password_is_hex_key);
+    job.set_suppress_password_recovery(password.suppress_password_recovery);
+    job.set_allow_weak_crypto(options.allow_weak_crypto);
     job.set_verbose(verbose);
-    job.set_suppress_warnings(no_warn);
     configure_keep_files_open(&mut job, page_ops)?;
-    let keep_files_open = job.keep_files_open_for_page_specs(&specs);
-    job.report_page_spec_selection(&specs)?;
-
-    let mut sources = Vec::with_capacity(source_paths.len() + 1);
-    sources.push(job.create_empty_document()?);
-    // qpdf's createQPDF applies --update-from-json to the primary
-    // immediately after creating it (empty or otherwise), before any page
-    // specification is processed (QPDFJob.cc:459-462). Live-probed:
-    // `qpdf --update-from-json=<file> --empty --pages ...` actually applies
-    // the update against the empty primary and surfaces JSON validation
-    // errors (exit 2 on malformed JSON), it is not a silent no-op.
-    apply_json_update_with_job(&mut job, &mut sources[0], update_from_json)?;
-    for (source_index, path) in source_paths.iter().enumerate() {
-        job.report_page_source_processing(path_description(path))?;
-        let mut source_password = password.clone();
-        source_password.set_password_bytes(source_passwords[source_index].clone());
-        source_password.password_file = None;
-        sources.push(open_page_source(
-            path,
-            repair,
-            &source_password,
-            keep_files_open,
-            no_warn,
-        )?);
+    {
+        let mut configuration = job.config();
+        // qpdf's createQPDF constructs the empty primary, applies
+        // update-from-JSON, then resolves and copies every page spec before
+        // returning the prepared merged document
+        // (QPDFJob.cc:428-480,2360-2633).
+        configuration.empty_input()?;
+        if let Some(update_from_json) = update_from_json {
+            configuration.update_from_json(update_from_json.to_path_buf());
+        }
+        for spec in &raw_specs {
+            let source_password = spec.raw_password.clone().or_else(|| {
+                spec.password
+                    .as_ref()
+                    .map(|password| arg_parser::os_bytes(password))
+            });
+            configuration.add_page_spec(
+                PathBuf::from(&spec.file_token),
+                &spec.range,
+                source_password,
+            )?;
+        }
+        for parameter in &page_ops.collate {
+            configuration.collate(parameter.as_bytes())?;
+        }
+        configuration.remove_unreferenced_resources(remove_unref.into());
     }
+    job.set_writer_configuration(writer_configuration_unnormalized(
+        &options,
+        linearize,
+        linearize_pass1,
+    )?);
 
-    // qpdf raises the output version floor from every source participating in
-    // a page job, including the empty primary's source heap
-    // (`QPDFJob.cc:1714-1715,2847-2918`). Keep that floor separate from the
-    // explicit raw minimum so the writer can apply qpdf's setter order.
-    let mut options = options;
-    for source in &mut sources {
-        update_input_version_floor(&mut options.input_version_floor, source)?;
-    }
-
-    let collate = parse_collate_values(&page_ops.collate)?;
-    let source_warnings = job.has_warnings();
-    let page_output = job.handle_page_specs(
-        &mut sources,
-        &specs,
-        collate.as_deref(),
-        remove_unref.into(),
-        options.preserve_unreferenced_objects,
-    )?;
-    let source_warnings = source_warnings || job.has_warnings();
-    let PageSpecJobOutput::Merged(mut merged) = page_output else {
-        return Err("--empty --pages unexpectedly returned an in-place document".into());
+    let mut merged = match job.create_qpdf()? {
+        Some(pdf) => pdf,
+        None => {
+            return Err(Box::new(CliExitError {
+                code: ExitCode::Errors,
+                message: String::new(),
+            }))
+        }
     };
+    let source_warnings = job.has_warnings();
+    // qpdf accumulates the maximum source version during createQPDF and
+    // applies it only at the writer boundary. Carry that snapshot into the
+    // existing post-plan writer without reopening any page source.
+    let mut options = options;
+    if let Some(floor) = job.input_version_floor() {
+        options.input_version_floor = Some(
+            options
+                .input_version_floor
+                .map_or(floor, |current| current.max(floor)),
+        );
+    }
     let selected_pages = pages::page_refs(&mut merged)?;
 
-    run_page_extraction_after_plan(
+    let result = run_page_extraction_after_plan(
         &mut merged,
         output,
         Path::new("<empty>"),
@@ -8154,7 +8149,12 @@ fn run_empty_page_extraction(
         flatten_annotations_mode,
         flatten_rotation,
         no_warn,
-    )
+    );
+    // The create-stage job retains page-source providers through the later
+    // post-plan writer. Drop it only after that writer has consumed the
+    // merged document, matching qpdf's page-heap lifetime at write time.
+    drop(job);
+    result
 }
 
 /// Run qpdf's ordinary multi-source page-spec path.

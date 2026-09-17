@@ -544,3 +544,72 @@ fn verbose_empty_pages_source_preflights_match_qpdf() {
         "verbose --empty --pages stderr must match qpdf"
     );
 }
+
+#[test]
+fn rewrite_empty_pages_repeated_collated_sources_match_qpdf() {
+    if !qpdf_available() {
+        return;
+    }
+
+    let temp = tempfile::tempdir().expect("temporary empty-pages directory");
+    let first = fixture("three-page.pdf");
+    let second = fixture("inherited-resources-one-page.pdf");
+    let output = temp.path().join("empty-pages-qdf.pdf");
+    let first = first.to_str().unwrap().to_owned();
+    let second = second.to_str().unwrap().to_owned();
+    let output = output.to_str().unwrap().to_owned();
+
+    // The repeated first source exercises qpdf's literal source identity and
+    // the collate grouping; the inherited-resource source also keeps the
+    // create-stage warning path live. --qdf and --static-id exercise writer
+    // configuration without comparing serializer-specific bytes.
+    let qpdf_args = vec![
+        "--verbose".to_owned(),
+        "--static-id".to_owned(),
+        "--qdf".to_owned(),
+        "--collate=2".to_owned(),
+        "--empty".to_owned(),
+        "--pages".to_owned(),
+        first.clone(),
+        "1".to_owned(),
+        second.clone(),
+        "1".to_owned(),
+        first.clone(),
+        "2".to_owned(),
+        "--".to_owned(),
+        output.clone(),
+    ];
+    let qpdf = run_qpdf(&qpdf_args);
+    assert_success(&qpdf, "qpdf repeated/collated empty pages");
+    let qpdf_pages = run_qpdf(&["--show-pages".to_owned(), output.clone()]);
+    assert_success(&qpdf_pages, "qpdf repeated/collated empty-pages output");
+
+    let flpdf_args = vec![
+        "rewrite".to_owned(),
+        temp.path().join("unused-input.pdf").display().to_string(),
+        output.clone(),
+        "--verbose".to_owned(),
+        "--static-id".to_owned(),
+        "--qdf".to_owned(),
+        "--collate=2".to_owned(),
+        "--empty".to_owned(),
+        "--pages".to_owned(),
+        first,
+        "1".to_owned(),
+        second,
+        "1".to_owned(),
+        fixture("three-page.pdf").to_str().unwrap().to_owned(),
+        "2".to_owned(),
+        "--".to_owned(),
+    ];
+    let flpdf = run_flpdf(&flpdf_args);
+    assert_success(&flpdf, "flpdf rewrite repeated/collated empty pages");
+    let flpdf_pages = run_qpdf(&["--show-pages".to_owned(), output]);
+    assert_success(&flpdf_pages, "flpdf repeated/collated empty-pages output");
+
+    assert_eq!(
+        normalize_text_newlines(&flpdf_pages.stdout),
+        normalize_text_newlines(&qpdf_pages.stdout),
+        "rewrite --empty --pages repeated/collated page layout must match qpdf"
+    );
+}
