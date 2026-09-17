@@ -159,8 +159,24 @@ fn stream_has_indirect_parameter_edge(handle: &ObjectHandle) -> Result<bool> {
     let Some(stream_dict) = handle.as_stream_dict() else {
         return Ok(false); // cov:ignore: Optimization invokes the callback only for resolved stream handles
     };
+    stream_dict.try_dereference()?;
     for key in [b"/Filter".as_slice(), b"/DecodeParms".as_slice()] {
-        let value = stream_dict.try_get_key(key)?;
+        // QPDF_Dictionary::getKey returns a contextual null for a missing key,
+        // but a missing entry has no descendant to inspect. Read the known
+        // dictionary map directly on the hot path and retain getKey only for
+        // a malformed stream dictionary, where qpdf emits its type warning
+        // (`QPDFObjectHandle.cc:978-995`).
+        let (is_dictionary, value) = stream_dict.with_value(|value| match value {
+            Some(ObjectValue::Dictionary(entries)) => (true, entries.get(key).cloned()),
+            _ => (false, None),
+        });
+        let Some(value) = (if is_dictionary {
+            value
+        } else {
+            Some(stream_dict.try_get_key(key)?)
+        }) else {
+            continue;
+        };
         let mut refs = Vec::new();
         collect_direct_handle_refs(&value, 0, &mut refs)?;
         if !refs.is_empty() {
@@ -4457,6 +4473,54 @@ mod tests {
             2,
             "one qpdf parameter probe may retry once with raw data, but the optimization callback must not probe the same stream again"
         );
+    }
+
+    #[test]
+    fn stream_parameter_probe_uses_a_live_dictionary_lookup_with_warning_fallback() {
+        let source = include_str!("plan.rs").replace("\r\n", "\n");
+        let start = source
+            .find("fn stream_has_indirect_parameter_edge")
+            .expect("stream parameter probe");
+        let body = &source[start
+            ..source[start..]
+                .find("\nfn stream_parameters_removed_for_linearization")
+                .expect("stream parameter probe end")
+                + start];
+
+        assert!(
+            body.contains("with_value"),
+            "the ordinary stream dictionary probe must use a live map lookup"
+        );
+        assert!(
+            body.contains("try_get_key"),
+            "the malformed non-dictionary fallback must retain qpdf warnings"
+        );
+    }
+
+    #[test]
+    fn stream_parameter_probe_preserves_present_missing_and_malformed_shapes() -> crate::Result<()>
+    {
+        let empty_stream =
+            ObjectHandle::stream(ObjectHandle::dictionary(Vec::new()), Rc::new(Vec::new()));
+        assert!(!super::stream_has_indirect_parameter_edge(&empty_stream)?);
+
+        let mut pdf = Pdf::empty()?;
+        let filter_child = pdf.make_indirect_object_handle(ObjectHandle::integer(7))?;
+        let stream_with_filter = ObjectHandle::stream(
+            ObjectHandle::dictionary(vec![(b"/Filter".to_vec(), filter_child)]),
+            Rc::new(Vec::new()),
+        );
+        assert!(super::stream_has_indirect_parameter_edge(
+            &stream_with_filter
+        )?); // cov:ignore: the covered boolean probe is attributed to its multiline call opening by LLVM.
+
+        let malformed_stream = ObjectHandle::stream(ObjectHandle::integer(7), Rc::new(Vec::new()));
+        let error = super::stream_has_indirect_parameter_edge(&malformed_stream)
+            .expect_err("a non-dictionary stream dictionary must retain qpdf's warning error");
+        assert!(error
+            .to_string()
+            .contains("operation for dictionary attempted on object of type integer"));
+        Ok(())
     }
 
     #[test]
