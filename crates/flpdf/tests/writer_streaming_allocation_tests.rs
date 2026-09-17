@@ -1748,3 +1748,18 @@ fn linearized_object_walk_does_not_clone_a_complete_dictionary_map_per_object() 
         "linearized object walk retained complete dictionary snapshots: small={small}, large={large}, growth={growth}, bound={LINEARIZED_DICTIONARY_ALLOCATION_GROWTH_BOUND}"
     );
 }
+
+#[test]
+fn linearized_stream_emission_uses_the_length_override_owner() {
+    let source = include_str!("../src/linearization/writer.rs");
+    assert!(
+        source.contains(
+            "write_stream_body_with_qpdf_obj_gen_map_and_removed_with_options_and_length"
+        ),
+        "linearized stream emission must use the writer-owned length override primitive"
+    );
+    assert!(
+        source.contains("let (stream_dict, data, dictionary_options)"),
+        "linearized stream emission must retain the source dictionary handle instead of rebuilding it"
+    );
+}

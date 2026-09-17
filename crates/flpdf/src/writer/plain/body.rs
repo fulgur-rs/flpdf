@@ -2339,7 +2339,10 @@ fn push_spaces(out: &mut OutputSink<'_>, count: usize) -> crate::Result<()> {
     Ok(())
 }
 
-/// Canonical stream output for qpdf's linearized body route.
+/// Canonical stream payload and source dictionary for qpdf's linearized body
+/// route. The linearized writer supplies the final `/Length` at its emission
+/// boundary, so this function deliberately does not manufacture an output
+/// dictionary copy.
 ///
 /// `QPDFWriter::writeLinearized` uses the same metadata decision in its
 /// `willFilterStream` probe and its final emission (`QPDFWriter.cc:1234-1314`),
@@ -2365,7 +2368,7 @@ pub(crate) fn canonical_stream_output_for_linearization_with_status(
     options: &WriterOptions,
     normalize_content: bool,
 ) -> crate::Result<(ObjectHandle, Vec<u8>, StreamDictionaryOptions)> {
-    canonical_stream_output_with_status(handle, options, true, normalize_content)
+    canonical_stream_data_with_rewrite_policy(handle, options, true, normalize_content)
 }
 
 /// Probe whether the linearized writer will replace a stream's source filter
@@ -2475,6 +2478,34 @@ fn canonical_stream_output_with_rewrite_policy(
     apply_full_rewrite_metadata_policy: bool,
     normalize_content: bool,
 ) -> crate::Result<(ObjectHandle, Vec<u8>, StreamDictionaryOptions)> {
+    let (stream_dict, data, dictionary_options) = canonical_stream_data_with_rewrite_policy(
+        handle,
+        options,
+        apply_full_rewrite_metadata_policy,
+        normalize_content,
+    )?;
+    let mut entries = stream_dict.try_as_dictionary()?.unwrap_or_default();
+    entries.insert(
+        b"/Length".to_vec(),
+        ObjectHandle::integer(i64::try_from(data.len()).unwrap_or(i64::MAX)),
+    );
+    let dict = ObjectHandle::dictionary(entries.into_iter().collect());
+    // The output dictionary is a shallow writer copy. Preserve the source
+    // stream's warning context on that copy so qpdf's missing-key
+    // `/DecodeParms` erase boundary remains observable when `/Filter` carries
+    // `/Crypt` without a paired parameters entry.
+    if dict.context().is_none() && handle.context().is_some() {
+        dict.set_child_description(handle, b" -> stream dictionary", b"");
+    }
+    Ok((dict, data, dictionary_options))
+}
+
+fn canonical_stream_data_with_rewrite_policy(
+    handle: &ObjectHandle,
+    options: &WriterOptions,
+    apply_full_rewrite_metadata_policy: bool,
+    normalize_content: bool,
+) -> crate::Result<(ObjectHandle, Vec<u8>, StreamDictionaryOptions)> {
     let stream_dict = handle
         .as_stream_dict()
         .ok_or_else(|| crate::Error::Internal("canonical stream dictionary is missing".into()))?;
@@ -2577,19 +2608,6 @@ fn canonical_stream_output_with_rewrite_policy(
                 false,
             )
         };
-    let mut entries = stream_dict.try_as_dictionary()?.unwrap_or_default();
-    entries.insert(
-        b"/Length".to_vec(),
-        ObjectHandle::integer(i64::try_from(data.len()).unwrap_or(i64::MAX)),
-    );
-    let dict = ObjectHandle::dictionary(entries.into_iter().collect());
-    // The output dictionary is a shallow writer copy. Preserve the source
-    // stream's warning context on that copy so qpdf's missing-key
-    // `/DecodeParms` erase boundary remains observable when `/Filter` carries
-    // `/Crypt` without a paired parameters entry.
-    if dict.context().is_none() && handle.context().is_some() {
-        dict.set_child_description(handle, b" -> stream dictionary", b"");
-    }
     let dictionary_options = if filtering_attempted {
         StreamDictionaryOptions::new(
             true,
@@ -2598,7 +2616,7 @@ fn canonical_stream_output_with_rewrite_policy(
     } else {
         StreamDictionaryOptions::preserve()
     };
-    Ok((dict, data, dictionary_options))
+    Ok((stream_dict, data, dictionary_options))
 }
 
 /// Read a stream through qpdf's writer-owned unfiltered pipe.

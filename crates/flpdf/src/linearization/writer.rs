@@ -723,15 +723,14 @@ fn append_body_object_with_raw_identity(
         );
     }
 
-    let (dict, data, dictionary_options) =
+    let (stream_dict, data, dictionary_options) =
         crate::writer::plain::body::canonical_stream_output_for_linearization(
             object,
             options,
             options.content_normalization && content_normalize_refs.contains(&original_ref),
         )?; // cov:ignore: LLVM maps this covered stream-output call terminator to a zero-count continuation region
-    let mut entries = dict.try_as_dictionary()?.unwrap_or_default();
     let payload_ctx = encrypt_ctx.filter(|ctx| new_ref != ctx.encrypt_ref);
-    let is_metadata_stream = dict.try_is_dictionary_of_type(b"Metadata", b"")?;
+    let is_metadata_stream = stream_dict.try_is_dictionary_of_type(b"Metadata", b"")?;
     let cleartext_metadata =
         payload_ctx.is_some_and(|ctx| !ctx.encrypt_metadata && is_metadata_stream);
     // qpdf clears the active data key for cleartext metadata and leaves the
@@ -743,15 +742,22 @@ fn append_body_object_with_raw_identity(
     if let Some(ctx) = payload_ctx.filter(|_| !cleartext_metadata) {
         crate::writer::adjust_aes_stream_length(&mut payload_length, ctx, true)?;
     }
-    entries.insert(
-        b"/Length".to_vec(),
-        ObjectHandle::integer(i64::try_from(payload_length).unwrap_or(i64::MAX)),
-    );
-    let dict = ObjectHandle::dictionary(entries.into_iter().collect());
-
     let offset = out.position_usize()?;
     write_indirect_object_header(out, new_ref)?;
     if let Some(emitter) = encrypted_string_emitter {
+        // The encrypted string emitter currently owns a dictionary-handle
+        // callback, so retain this compatibility-shaped copy only on the
+        // encrypted branch. The ordinary linearized route below writes the
+        // source dictionary through the live length-override primitive.
+        let mut entries = stream_dict.try_as_dictionary()?.unwrap_or_default();
+        entries.insert(
+            b"/Length".to_vec(),
+            ObjectHandle::integer(i64::try_from(payload_length).unwrap_or(i64::MAX)),
+        );
+        let dict = ObjectHandle::dictionary(entries.into_iter().collect());
+        if dict.context().is_none() && object.context().is_some() {
+            dict.set_child_description(object, b" -> stream dictionary", b"");
+        }
         emitter.write_handle_stream_dict_with_qpdf_obj_gen_map(
             out,
             new_ref,
@@ -767,11 +773,12 @@ fn append_body_object_with_raw_identity(
             None,
         )?; // cov:ignore: canonical stream-dictionary emission only errors for an invalid source graph.
     } else {
-        dict.write_stream_body_with_qpdf_obj_gen_map_and_removed_with_options(
+        stream_dict.write_stream_body_with_qpdf_obj_gen_map_and_removed_with_options_and_length(
             out,
             dictionary_options,
             &map,
             removed_refs,
+            payload_length,
         )?; // cov:ignore: the unencrypted linearized route normally uses the shared string emitter; this direct owner call is validated by the compact writer tests
     }
 

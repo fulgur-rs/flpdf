@@ -350,6 +350,18 @@ pub(crate) trait ObjectWriterEmission {
         map: &dyn Fn(QpdfObjGen) -> Result<ObjectRef>,
         removed_refs: &BTreeSet<QpdfObjGen>,
     ) -> Result<()>;
+    /// Linearized stream-dictionary emission with an output payload-length
+    /// override. The source dictionary's top-level keys remain unchanged,
+    /// matching qpdf's writer-side stream length calculation; nested filter
+    /// arrays retain the existing qpdf shallow-copy alias cleanup semantics.
+    fn write_stream_body_with_qpdf_obj_gen_map_and_removed_with_options_and_length(
+        &self,
+        out: &mut OutputSink<'_>,
+        options: StreamDictionaryOptions,
+        map: &dyn Fn(QpdfObjGen) -> Result<ObjectRef>,
+        removed_refs: &BTreeSet<QpdfObjGen>,
+        length: usize,
+    ) -> Result<()>;
     /// Stream-dictionary emission with a direct output `/Length` override.
     /// The source handle remains unchanged; this mirrors qpdf's stream writer,
     /// which computes the emitted length from the bytes supplied to its pipe.
@@ -1569,6 +1581,41 @@ impl ObjectWriterEmission for ObjectHandle {
         unparse_stream_dict_entries_with_ref_map(&entries, options, out, map, removed_refs)
     }
 
+    fn write_stream_body_with_qpdf_obj_gen_map_and_removed_with_options_and_length(
+        &self,
+        out: &mut OutputSink<'_>,
+        options: StreamDictionaryOptions,
+        map: &dyn Fn(QpdfObjGen) -> Result<ObjectRef>,
+        removed_refs: &BTreeSet<QpdfObjGen>,
+        length: usize,
+    ) -> Result<()> {
+        if self.is_reserved() {
+            return Err(reserved_unparse_error());
+        }
+        self.try_dereference()?;
+        let is_dictionary =
+            self.with_value(|value| matches!(value, Some(ObjectValue::Dictionary(_))));
+        if !is_dictionary {
+            let entries = stream_dictionary_entries_for_emission(self)?;
+            return unparse_stream_dict_entries_with_ref_map_and_length(
+                &entries,
+                options,
+                out,
+                map,
+                removed_refs,
+                Some(length),
+            );
+        }
+        unparse_stream_dictionary_live_with_qpdf_obj_gen_map_and_removed_and_length(
+            self,
+            options,
+            out,
+            map,
+            removed_refs,
+            length,
+        )
+    }
+
     #[cfg(test)]
     fn write_stream_body_with_ref_map_and_removed_and_length(
         &self,
@@ -2169,6 +2216,13 @@ fn stream_dictionary_entries_for_emission(
     Ok(entries)
 }
 
+fn dictionary_entry_handle(dictionary: &ObjectHandle, key: &[u8]) -> Option<ObjectHandle> {
+    dictionary.with_value(|value| match value {
+        Some(ObjectValue::Dictionary(entries)) => entries.get(key).cloned(),
+        _ => None,
+    })
+}
+
 // Writes a stream dictionary's own body -- `write_stream_body`'s sole
 // callee -- matching `Dictionary::write_pdf_stream`'s established shape
 // (`object.rs`) with `visible_dict_entries`'s null-suppression layered on
@@ -2521,6 +2575,21 @@ fn unparse_stream_dict_entries_with_ref_map_and_length(
     removed_refs: &BTreeSet<QpdfObjGen>,
     length_override: Option<usize>,
 ) -> Result<()> {
+    // qpdf removes the source `/Length` from its shallow dictionary before any
+    // value visibility checks (`QPDFWriter.cc:1440-1442`). In particular, a
+    // caller-provided output length must not force-resolve a dangling source
+    // length while the snapshot fallback is being prepared.
+    let entries_without_length;
+    let entries = if length_override.is_some() {
+        entries_without_length = entries
+            .iter()
+            .filter(|(key, _)| key.as_slice() != b"/Length")
+            .cloned()
+            .collect::<Vec<_>>();
+        entries_without_length.as_slice()
+    } else {
+        entries
+    };
     let entries = prepare_stream_dict_entries(entries, options)?;
     out.write_bytes(b"<<")?;
     let mut length_value: Option<&ObjectHandle> = None;
@@ -2551,6 +2620,104 @@ fn unparse_stream_dict_entries_with_ref_map_and_length(
         out.write_bytes(b" /Length ")?;
         write_child_with_ref_map(length, out, map, removed_refs)?;
     }
+    if options.add_flate_filter {
+        out.write_bytes(b" /Filter /FlateDecode")?;
+    }
+    out.write_bytes(b" >>")?;
+    Ok(())
+}
+
+/// Emit a direct stream dictionary through the qpdf-shaped live key cursor.
+///
+/// The linearized writer already owns the final payload length, so qpdf's
+/// shallow stream-dictionary copy only needs to affect the emitted view: the
+/// source `/Length` is discarded, filter parameters may be omitted, and the
+/// computed length is written last. Ordinary array-valued filters and `/Crypt`
+/// retain the existing snapshot path because their preparation mutates shared
+/// child arrays and must preserve that aliasing/error boundary.
+fn unparse_stream_dictionary_live_with_qpdf_obj_gen_map_and_removed_and_length(
+    dictionary: &ObjectHandle,
+    options: StreamDictionaryOptions,
+    out: &mut OutputSink<'_>,
+    map: &QpdfObjGenMap<'_>,
+    removed_refs: &BTreeSet<QpdfObjGen>,
+    length: usize,
+) -> Result<()> {
+    let skip_empty_decode_parms = match dictionary_entry_handle(dictionary, b"/DecodeParms") {
+        Some(value) => value.try_array_len()?.is_some_and(|value| value == 0),
+        None => false,
+    };
+
+    if !options.remove_filter_parameters {
+        let has_snapshot_sensitive_filter =
+            if let Some(filter) = dictionary_entry_handle(dictionary, b"/Filter") {
+                filter.try_dereference()?;
+                filter.with_value(|value| matches!(value, Some(ObjectValue::Array(_))))
+                    || filter.try_is_name_and_equals(b"Crypt")?
+            } else {
+                false
+            };
+        if has_snapshot_sensitive_filter {
+            let entries = stream_dictionary_entries_for_emission(dictionary)?;
+            return unparse_stream_dict_entries_with_ref_map_and_length(
+                &entries,
+                options,
+                out,
+                map,
+                removed_refs,
+                Some(length),
+            );
+        }
+    }
+
+    out.write_bytes(b"<<")?;
+    let mut current_key = LiveDictionaryKeyBuffer::default();
+    let mut next_key = LiveDictionaryKeyBuffer::default();
+    let mut first_entry = true;
+    while let Some(value) = dictionary.next_dictionary_entry_for_live_walk(
+        (!first_entry).then_some(current_key.as_slice()),
+        &mut next_key,
+    ) {
+        std::mem::swap(&mut current_key, &mut next_key);
+        let key = current_key.as_slice();
+
+        // qpdf removes these keys from its shallow copy before entering the
+        // null-suppression loop (`QPDFWriter.cc:1440-1455`).
+        if key == b"/Length"
+            || (options.remove_filter_parameters && matches!(key, b"/Filter" | b"/DecodeParms"))
+            || (key == b"/DecodeParms" && skip_empty_decode_parms)
+        {
+            first_entry = false;
+            continue;
+        }
+
+        // qpdf checks `isNull()` before the rewrite-specific removed set can
+        // suppress an indirect child. Keep that order at this live boundary.
+        if value.try_is_null()?
+            || value
+                .qpdf_obj_gen()
+                .is_some_and(|object_gen| removed_refs.contains(&object_gen))
+        {
+            first_entry = false;
+            continue;
+        }
+
+        out.write_bytes(b" ")?;
+        write_dictionary_key(out, key)?;
+        out.write_bytes(b" ")?;
+        if key == b"/Contents" {
+            let force_hex_contents = dict_is_sig_with_byte_range_handle(dictionary)?;
+            if try_write_sig_contents_hex_string(&value, force_hex_contents, out)? {
+                first_entry = false;
+                continue;
+            }
+        }
+        write_child_with_ref_map(&value, out, map, removed_refs)?;
+        first_entry = false;
+    }
+
+    out.write_bytes(b" /Length ")?;
+    write_decimal_u64(out, length as u64)?;
     if options.add_flate_filter {
         out.write_bytes(b" /Filter /FlateDecode")?;
     }
@@ -6174,6 +6341,154 @@ mod tests {
         .expect_err("reserved stream emission must be rejected");
         assert!(error.to_string().contains("reserved object"));
         // cov:ignore-end
+        Ok(())
+    }
+
+    #[test]
+    fn live_mapped_stream_writer_overrides_length_without_rebuilding_dictionary() -> Result<()> {
+        let mut pdf = Pdf::empty()?;
+        let mapped = pdf.get_object_handle_by_raw_identity(7, 0);
+        mapped.set_resolved(ObjectValue::Integer(2));
+        let dictionary = ObjectHandle::dictionary(vec![
+            (b"/Length".to_vec(), ObjectHandle::integer(99)),
+            (b"/Null".to_vec(), ObjectHandle::null()),
+            (b"/Keep".to_vec(), ObjectHandle::integer(1)),
+            (b"/Ref".to_vec(), mapped),
+        ]);
+        let map = |object_gen: QpdfObjGen| {
+            Ok::<ObjectRef, Error>(object_gen.to_object_ref().expect("test identity maps"))
+        };
+        let mut output = Vec::new();
+        super::super::output::with_buffer_sink(&mut output, |out| {
+            ObjectWriterEmission::write_stream_body_with_qpdf_obj_gen_map_and_removed_with_options_and_length(
+                &dictionary,
+                out,
+                StreamDictionaryOptions::preserve(),
+                &map,
+                &BTreeSet::new(),
+                3,
+            )
+        })?;
+        assert_eq!(output, b"<< /Keep 1 /Ref 7 0 R /Length 3 >>");
+
+        let scalar = ObjectHandle::integer(5);
+        assert!(dictionary_entry_handle(&scalar, b"/Missing").is_none());
+        let mut scalar_output = Vec::new();
+        super::super::output::with_buffer_sink(&mut scalar_output, |out| {
+            ObjectWriterEmission::write_stream_body_with_qpdf_obj_gen_map_and_removed_with_options_and_length(
+                &scalar,
+                out,
+                StreamDictionaryOptions::preserve(),
+                &map,
+                &BTreeSet::new(),
+                1,
+            )
+        })?;
+        assert_eq!(scalar_output, b"<< /Length 1 >>");
+
+        let signature = ObjectHandle::dictionary(vec![
+            (
+                b"/ByteRange".to_vec(),
+                ObjectHandle::array(vec![ObjectHandle::integer(0), ObjectHandle::integer(1)]),
+            ),
+            (
+                b"/Contents".to_vec(),
+                ObjectHandle::string(vec![0x01, 0xab]),
+            ),
+            (b"/Type".to_vec(), ObjectHandle::name(b"Sig".to_vec())),
+        ]);
+        let mut signature_output = Vec::new();
+        super::super::output::with_buffer_sink(&mut signature_output, |out| {
+            ObjectWriterEmission::write_stream_body_with_qpdf_obj_gen_map_and_removed_with_options_and_length(
+                &signature,
+                out,
+                StreamDictionaryOptions::preserve(),
+                &map,
+                &BTreeSet::new(),
+                2,
+            )
+        })?;
+        assert_eq!(
+            signature_output,
+            b"<< /ByteRange [ 0 1 ] /Contents <01ab> /Type /Sig /Length 2 >>"
+        );
+
+        let non_string_signature = ObjectHandle::dictionary(vec![
+            (
+                b"/ByteRange".to_vec(),
+                ObjectHandle::array(vec![ObjectHandle::integer(0), ObjectHandle::integer(1)]),
+            ),
+            (b"/Contents".to_vec(), ObjectHandle::integer(7)),
+            (b"/Type".to_vec(), ObjectHandle::name(b"Sig".to_vec())),
+        ]);
+        let mut non_string_signature_output = Vec::new();
+        super::super::output::with_buffer_sink(&mut non_string_signature_output, |out| {
+            ObjectWriterEmission::write_stream_body_with_qpdf_obj_gen_map_and_removed_with_options_and_length(
+                &non_string_signature,
+                out,
+                StreamDictionaryOptions::preserve(),
+                &map,
+                &BTreeSet::new(),
+                1,
+            )
+        })?;
+        assert_eq!(
+            non_string_signature_output,
+            b"<< /ByteRange [ 0 1 ] /Contents 7 /Type /Sig /Length 1 >>"
+        );
+
+        let reserved = ObjectHandle::new_reserved_direct();
+        let reserved_error = super::super::output::with_buffer_sink(&mut Vec::new(), |out| {
+            ObjectWriterEmission::write_stream_body_with_qpdf_obj_gen_map_and_removed_with_options_and_length(
+                &reserved,
+                out,
+                StreamDictionaryOptions::preserve(),
+                &map,
+                &BTreeSet::new(),
+                0,
+            )
+        })
+        .expect_err("reserved live stream dictionaries must be rejected");
+        assert!(reserved_error.to_string().contains("reserved object"));
+        Ok(())
+    }
+
+    #[test]
+    fn length_override_snapshot_fallback_drops_source_length_before_null_probe() -> Result<()> {
+        let mut pdf = Pdf::empty()?;
+        let mapped = pdf.get_object_handle_by_raw_identity(7, 0);
+        mapped.set_resolved(ObjectValue::Integer(2));
+        let dangling_length = ObjectHandle::new_indirect_unresolved(ObjectRef::new(91, 0), -1);
+        let dictionary = ObjectHandle::dictionary(vec![
+            (
+                b"/Filter".to_vec(),
+                ObjectHandle::array(vec![
+                    ObjectHandle::name(b"FlateDecode".to_vec()),
+                    ObjectHandle::name(b"ASCIIHexDecode".to_vec()),
+                ]),
+            ),
+            (b"/Length".to_vec(), dangling_length),
+            (b"/Ref".to_vec(), mapped),
+        ]);
+
+        let map = |object_gen: QpdfObjGen| {
+            Ok::<ObjectRef, Error>(object_gen.to_object_ref().expect("test identity maps"))
+        };
+        let mut output = Vec::new();
+        super::super::output::with_buffer_sink(&mut output, |out| {
+            ObjectWriterEmission::write_stream_body_with_qpdf_obj_gen_map_and_removed_with_options_and_length(
+                &dictionary,
+                out,
+                StreamDictionaryOptions::preserve(),
+                &map,
+                &BTreeSet::new(),
+                3,
+            )
+        })?;
+        assert_eq!(
+            output,
+            b"<< /Filter [ /FlateDecode /ASCIIHexDecode ] /Ref 7 0 R /Length 3 >>"
+        );
         Ok(())
     }
 
