@@ -1053,7 +1053,8 @@ fn enqueue(
 #[cfg(test)]
 mod tests {
     use super::{
-        collect_canonical_children, ensure_canonical_owner, walk_resurrectable_handle,
+        collect_canonical_children, ensure_canonical_owner,
+        reachable_object_set_with_stream_parameters, walk_resurrectable_handle,
         writer_local_raw_ref, NewNumberLookup, ObjectStreamRenumber, ResurrectableWalkState,
     };
     use crate::parser::MAX_PARSE_DEPTH;
@@ -1116,6 +1117,21 @@ mod tests {
         assert_eq!(
             renumber.raw_source_for(local_ref),
             Some(QpdfObjGen::new(5, 65_536))
+        );
+    }
+
+    #[test]
+    fn reachability_walk_accepts_a_direct_catalog_root() {
+        let bytes = include_bytes!("../../../../tests/fixtures/compat/direct-root-one-page.pdf");
+        let mut pdf = Pdf::open(Cursor::new(bytes.to_vec())).expect("open direct-root PDF");
+
+        let reachable =
+            reachable_object_set_with_stream_parameters(&mut pdf, true, &BTreeSet::new())
+                .expect("direct Catalog descendants should be reachable");
+
+        assert_eq!(
+            reachable,
+            BTreeSet::from([ObjectRef::new(1, 0), ObjectRef::new(2, 0)])
         );
     }
 
