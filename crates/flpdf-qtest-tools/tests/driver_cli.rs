@@ -1516,6 +1516,30 @@ fn qtest_accessor_cases_do_not_use_explicit_pdf_resolve() {
         test_6.contains("type_code()") && test_6.contains("pipe_stream_data("),
         "test 6 must use the canonical resolving type and stream accessors"
     );
+    let test_7 = section(
+        early_source.as_str(),
+        "pub(crate) fn run_test_7",
+        "pub(crate) fn run_test_8",
+    );
+    let test_8 = section(
+        early_source.as_str(),
+        "pub(crate) fn run_test_8",
+        "pub(crate) fn run_test_9",
+    );
+    assert!(
+        !test_7.contains("resolve_handle(")
+            && test_7.contains("type_code()")
+            && !test_8.contains("resolve_handle(")
+            && test_8.contains("type_code()"),
+        "tests 7 and 8 must use the canonical resolving stream predicate without a caller-side bridge"
+    );
+    let test_9_start = early_source
+        .find("pub(crate) fn run_test_9")
+        .expect("test 9 source section");
+    assert!(
+        early_source[test_9_start..].contains("resolve_handle("),
+        "test 9 must retain its separate explicit root resolution"
+    );
     let test_3 = section(
         early_source.as_str(),
         "pub(crate) fn run_test_3",
@@ -1715,13 +1739,8 @@ fn qtest_accessor_cases_do_not_use_explicit_pdf_resolve() {
         "test 87 must enumerate keys through the canonical resolving accessor"
     );
     assert!(
-        section(
-            early_source.as_str(),
-            "pub(crate) fn run_test_7",
-            "struct LengthBugProvider",
-        )
-        .contains("resolve_handle("),
-        "test 7 lost the explicit resolution retained for the out-of-scope path"
+        early_source[test_9_start..].contains("resolve_handle("),
+        "test 9 lost the explicit resolution retained for the out-of-scope path"
     );
 
     let test_71 = section(
