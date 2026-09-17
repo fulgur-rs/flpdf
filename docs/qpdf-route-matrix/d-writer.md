@@ -479,7 +479,8 @@ encryption は上記 3 経路すべてで `doWriteSetup` の同一分岐（D-0�
 この section は上記履歴行の caller／planned wording を current-main の実装へ
 再アンカーするものであり、全 route matrix の mixed/bridge 解消や full-writer
 parity を主張しない。checker の current logical aggregate は README §1 の
-259 rows（canonical 119 / mixed 128 / bridge 12 / unknown 0）である。
+259 logical rows で、分類別の内訳は README §1 / §4 と本ファイルの「分類集計」を見る
+（ここに再掲していた内訳は drift していた）。
 
 **PCLm root/late-trailer boundary (current main):** PR #1861 (`flpdf-ccij8`) now sends
 only an indirect source `/Root` through `output_root_copy_with_adbe`; the direct-root
@@ -990,3 +991,14 @@ canonical page repairは既存の`PageDocumentHelper` setup snapshotを使う。
 で、`one-page`、`multi-contents-one-page`、`shared-stream-objstm`、`direct-leaf-kid`を
 qpdf 11.9.0とqpdf-zlib-compatでfull-byte比較する。既存のCR改行正規化、warning、
 `qpdf --check-linearization`回帰も維持し、qpdf-deviation markerやlegacy bridgeは追加しない。
+
+### 分類集計
+
+<!-- route-matrix-aggregate: document-tally unit=area-physical file=d-writer.md -->
+
+| 分類 | 件数 | 行 |
+|---|---|---|
+| canonical | 15 | D4, D7, D10, D13, D15, D17, D18, D19, D20, D21, D22, D24, D25, D27, D30 |
+| mixed | 16 | D1, D2, D3, D5, D6, D8, D9, D11, D12, D14, D16, D23, D26, D28, D29, D31 |
+| bridge | 0 | — |
+| unknown | 0 | — |

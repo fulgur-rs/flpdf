@@ -341,10 +341,12 @@ qtest exceptionsは変更しない。
 
 ### 分類集計
 
+<!-- route-matrix-aggregate: document-tally unit=area-physical file=b-parser-recovery-diagnostics.md -->
+
 | 分類 | 件数 | 行 |
 |---|---|---|
-| canonical | 15 | B1, B3, B5, B6, B15, B16, B17, B18, B19, B21, B23, B24, B28, B31, B34 |
-| mixed | 19 | B2, B4, B7, B8, B9, B10, B11, B12, B13, B14, B20, B22, B25, B26, B27, B29, B30, B32, B33 |
+| canonical | 20 | B1, B2, B3, B4, B5, B6, B13, B14, B15, B16, B17, B18, B19, B21, B23, B24, B28, B30, B31, B34 |
+| mixed | 14 | B7, B8, B9, B10, B11, B12, B20, B22, B25, B26, B27, B29, B32, B33 |
 | bridge | 0 | — |
 | unknown | 0 | — |
 
