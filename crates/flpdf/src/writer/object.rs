@@ -5851,7 +5851,13 @@ mod tests {
             "the raw identity survives that predicate"
         );
 
-        let array = ObjectHandle::array(vec![zero, ObjectHandle::integer(7)]);
+        // Include a direct string so the slow path's string callback runs on
+        // the same array, pinning that the fallback keeps using it.
+        let array = ObjectHandle::array(vec![
+            zero,
+            ObjectHandle::integer(7),
+            ObjectHandle::string(b"s".to_vec()),
+        ]);
         let mut map = |_: &ObjectHandle| Ok::<ObjectRef, Error>(ObjectRef::new(1, 0));
         let mut strings = |out: &mut OutputSink<'_>, value: &[u8]| {
             crate::pdf_syntax::write_string_value(out, value)
@@ -5871,7 +5877,7 @@ mod tests {
                 &mut direct_stream_writer,
             )
         })?;
-        assert_eq!(bytes, b"[ null 7 ]");
+        assert_eq!(bytes, b"[ null 7 (s) ]");
         Ok(())
     }
 
