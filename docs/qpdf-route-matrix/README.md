@@ -668,6 +668,8 @@ warning collectionやtoken primitiveの移植を、領域A全体の統合完了�
 
  2026-09-17（`.48.139`）: test7/8の`resolve_handle` caller-side stream predicate bridgeを撤去し、qpdf public `isStream()`対応のresolving `type_code()`へ移行した。test9の別責務のroot resolutionは保持する。
 
+ 2026-09-17（`.48.140`）: test9をqpdf public `getRoot()`対応の`Pdf::root_handle()`へ移行し、直接trailer `/Root`取得とcaller-side `resolve_handle`を撤去した。test7/8/test9のcaller-zeroを確認して共有helperも削除した。
+
  qpdf 呼び出し順を壊さない理由: §5.C 第 4 行（`willFilterStream` の判定順序）が 2 と 3 を
 C20 の**後ろ**に置く理由 — 判定順序の canonical owner が確定していない状態で早期 return を
 外すと、veto → metadata / normalize / compress の排他 chain が経路ごとに別の結果になる。
@@ -734,6 +736,8 @@ D27の全pre-write sweepとfollow-upは完了済み。D19 / D30はbyte-neutral t
  7. **E-27 / E-28** — `.48.93` で test 0/1 の既知stream warning bridgeを canonical pipe/loggerへ、`.48.107` / `.48.108` / `.48.109` / `.48.110` / `.48.111` で test 2 / 3 / 6 / 11 / 19 のcaller-side resolve/accessor bridgeを、`.48.112` / `.48.113` / `.48.114` で test21/test17のshallowCopy・root/array accessor bridgeを、`.48.115` で test73の`resolve_once` bridgeを、`.48.116` で test87のdirect-only key enumeration bridgeを、`.48.117` で test97のarray-count bridgeを、`.48.118` で test92のdestroyed-handle accessor bridgeを、`.48.120` で test85のgetValueAs bridgeを、`.48.121` で test86のUnicode string handle accessor bridgeを、`.48.122` で test50のresource-merge accessor bridgeを、`.48.123` で test71のpage-object accessor bridgeを、`.48.125` で test72のpage/form accessor bridgeを、`.48.136` で test52のform-field handle bridgeを、`.48.137` で test4のnull-predicate bridgeを、`.48.138` で test5のarray-accessor bridgeを canonical routeへ移行済み。残る mixed case/APIだけを追加調査し、A〜D全行の確定を待たない。
 
  2026-09-17（`.48.139`）: test7/8はcanonical resolving `type_code()`へ移行済みで、共有`resolve_handle`はtest9のroot resolutionのため保持する。
+
+ 2026-09-17（`.48.140`）: test9はcanonical `Pdf::root_handle()`へ移行済みで、test_02_09.rsの共有`resolve_handle` callerとhelper定義を削除した。
 
  qpdf 呼び出し順を壊さない理由: §5.E 第 4 行（入力は必ず `doProcessOnce` 経由で開き、
 `QPDF` 構築直後に `setQPDFOptions` を適用してから読む）が 1 を最初に置く理由で、

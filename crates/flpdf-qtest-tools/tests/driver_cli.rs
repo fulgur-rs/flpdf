@@ -1743,8 +1743,7 @@ fn qtest_accessor_cases_do_not_use_explicit_pdf_resolve() {
         "test 87 must enumerate keys through the canonical resolving accessor"
     );
     assert!(
-        !early_source.contains("fn resolve_handle")
-            && !early_source.contains("resolve_handle("),
+        !early_source.contains("fn resolve_handle") && !early_source.contains("resolve_handle("),
         "the qpdf-less resolve_handle helper must be removed after caller-zero"
     );
 
