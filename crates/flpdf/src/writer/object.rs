@@ -3147,53 +3147,106 @@ fn unparse_object_walk_with_ref_map(
             return Err(reserved_unparse_error());
         }
         handle.try_dereference()?;
-        let container = handle.with_value(|value| match value {
-            Some(value) => {
-                if let Some(container) = snapshot_unparse_container(value) {
-                    Ok(Some(container))
-                } else {
-                    // Scalar payloads are written under the borrow; only
-                    // container edges need an owned snapshot before descent.
-                    unparse_object_value_with_ref_map(value, out, map, removed_refs).map(|()| None)
+        let container = handle.with_value(|value| -> Result<RefMapContainer> {
+            match value {
+                Some(ObjectValue::Array(_)) => Ok(RefMapContainer::Array),
+                Some(ObjectValue::Dictionary(_)) => Ok(RefMapContainer::Dictionary),
+                Some(ObjectValue::Stream(stream)) => {
+                    Ok(RefMapContainer::Stream(stream.stream_dict.clone()))
                 }
-            }
-            None => {
-                // cov:ignore-start: successful dereference exposes Null for
-                // the null fallback or errors while unresolved.
-                out.write_bytes(b"null")?;
-                Ok(None)
-                // cov:ignore-end
+                Some(value) => {
+                    // Scalar payloads are written under the borrow. Container
+                    // edges are walked after the borrow is released, matching
+                    // qpdf's per-child `unparseChild` boundary.
+                    unparse_object_value_with_ref_map(value, out, map, removed_refs)?;
+                    Ok(RefMapContainer::Written)
+                }
+                None => {
+                    // cov:ignore-start: successful dereference exposes Null for
+                    // the null fallback or errors while unresolved.
+                    out.write_bytes(b"null")?;
+                    Ok(RefMapContainer::Written)
+                    // cov:ignore-end
+                }
             }
         })?;
         match container {
-            Some(container) => unparse_container_with_ref_map(container, out, map, removed_refs),
-            None => Ok(()),
+            RefMapContainer::Array => unparse_array_with_ref_map(handle, out, map, removed_refs),
+            RefMapContainer::Dictionary => {
+                unparse_dictionary_with_ref_map(handle, out, map, removed_refs)
+            }
+            RefMapContainer::Stream(stream_dict) => {
+                unparse_object_walk_with_ref_map(&stream_dict, out, map, removed_refs)
+            }
+            RefMapContainer::Written => Ok(()),
         }
     })
 }
 
-fn unparse_container_with_ref_map(
-    container: UnparseContainer,
+enum RefMapContainer {
+    Array,
+    Dictionary,
+    Stream(ObjectHandle),
+    Written,
+}
+
+fn unparse_array_with_ref_map(
+    handle: &ObjectHandle,
     out: &mut OutputSink<'_>,
     map: &QpdfObjGenMap<'_>,
     removed_refs: &BTreeSet<QpdfObjGen>,
 ) -> Result<()> {
-    match container {
-        UnparseContainer::Array(children) => {
-            out.write_bytes(b"[")?;
-            for child in children {
-                out.write_bytes(b" ")?;
-                write_child_with_ref_map(&child, out, map, removed_refs)?;
-            }
-            out.write_bytes(b" ]")?;
-        }
-        UnparseContainer::Dictionary(entries) => {
-            unparse_dict_entries_with_ref_map(&entries, out, map, removed_refs)?;
-        }
-        UnparseContainer::Stream(stream_dict) => {
-            unparse_object_walk_with_ref_map(&stream_dict, out, map, removed_refs)?;
-        }
+    out.write_bytes(b"[")?;
+    let items = handle.try_array_items()?;
+    let mut cursor = items.begin();
+    while !cursor.is_end() {
+        out.write_bytes(b" ")?;
+        let child = cursor.current();
+        write_child_with_ref_map(&child, out, map, removed_refs)?;
+        cursor.next();
     }
+    out.write_bytes(b" ]")?;
+    Ok(())
+}
+
+fn unparse_dictionary_with_ref_map(
+    handle: &ObjectHandle,
+    out: &mut OutputSink<'_>,
+    map: &QpdfObjGenMap<'_>,
+    removed_refs: &BTreeSet<QpdfObjGen>,
+) -> Result<()> {
+    out.write_bytes(b"<<")?;
+    let mut current_key = LiveDictionaryKeyBuffer::default();
+    let mut next_key = LiveDictionaryKeyBuffer::default();
+    let mut first_entry = true;
+    while let Some(value) = handle.next_dictionary_entry_for_live_walk(
+        (!first_entry).then_some(current_key.as_slice()),
+        &mut next_key,
+    ) {
+        std::mem::swap(&mut current_key, &mut next_key);
+        // qpdf's dictionary writer checks isNull() at the current key before
+        // calling unparseChild. Preserve that resolution boundary even when
+        // the rewrite-specific removed set will discard the edge afterwards.
+        let is_null = value.try_is_null()?;
+        if is_null
+            || value
+                .qpdf_obj_gen()
+                .is_some_and(|object_gen| removed_refs.contains(&object_gen))
+        {
+            first_entry = false;
+            continue;
+        }
+        out.write_bytes(b" ")?;
+        write_dictionary_key(out, current_key.as_slice())?;
+        out.write_bytes(b" ")?;
+        let force_hex_string =
+            current_key.as_slice() == b"/Contents" && dict_is_sig_with_byte_range_handle(handle)?;
+        if !try_write_sig_contents_hex_string(&value, force_hex_string, out)? {
+            write_child_with_ref_map(&value, out, map, removed_refs)?;
+        }
+        first_entry = false;
+    }
+    out.write_bytes(b" >>")?;
     Ok(())
 }
 
@@ -5746,6 +5799,32 @@ mod tests {
         assert!(
             !body.contains("snapshot_unparse_container"),
             "qdf mapped serializer must not clone a second container snapshot"
+        );
+    }
+
+    #[test]
+    fn compact_mapped_serializer_does_not_snapshot_container_edges() {
+        let source = include_str!("object.rs");
+        let start = source
+            .find("fn unparse_object_walk_with_ref_map")
+            .expect("compact mapped serializer");
+        let body = &source[start
+            ..source[start..]
+                .find("\n\nenum RefMapContainer")
+                .expect("compact mapped serializer end")
+                + start];
+
+        assert!(
+            body.contains("unparse_array_with_ref_map"),
+            "compact mapped serializer must walk live arrays"
+        );
+        assert!(
+            body.contains("unparse_dictionary_with_ref_map"),
+            "compact mapped serializer must walk live dictionaries"
+        );
+        assert!(
+            !body.contains("snapshot_unparse_container"),
+            "compact mapped serializer must not clone a second container snapshot"
         );
     }
 

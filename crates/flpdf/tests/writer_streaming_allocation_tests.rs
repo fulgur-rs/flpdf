@@ -1695,11 +1695,13 @@ fn plain_writer_map_lookup_does_not_retain_per_object_renumber_snapshots() {
 
 const SMALL_LINEARIZED_DICTIONARY_COUNT: usize = 64;
 const LARGE_LINEARIZED_DICTIONARY_COUNT: usize = 512;
-// The pre-cutover complete-map walk measured about 45.5k additional
-// allocations for this 64 -> 512 dictionary growth. Keep the regression
-// bound below that baseline while allowing allocator noise around the flat
-// child-handle queue.
-const LINEARIZED_DICTIONARY_ALLOCATION_GROWTH_BOUND: usize = 43_000;
+// The live qpdf-shaped dictionary walk should keep growth close to the
+// per-entry child/key work rather than retaining a complete map clone for
+// every emitted object. The pre-cutover complete-map walk measured about
+// 45.5k additional allocations for this 64 -> 512 dictionary growth. The
+// post-cutover measurement is about 22.6k on this workload; keep a
+// margin for allocator noise while staying below the pre-cutover ~32.5k.
+const LINEARIZED_DICTIONARY_ALLOCATION_GROWTH_BOUND: usize = 25_000;
 
 fn measure_linearized_dictionary_allocations(dictionary_count: usize) -> usize {
     let mut pdf = Pdf::open(Cursor::new(
