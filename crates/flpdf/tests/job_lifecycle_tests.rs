@@ -540,6 +540,48 @@ fn json_encrypt_allow_insecure_reaches_final_configuration_check() {
 }
 
 #[test]
+fn json_encrypt_keeps_qpdf_r2_permissions_from_an_earlier_argv_group() {
+    let fixture =
+        Path::new(env!("CARGO_MANIFEST_DIR")).join("../../tests/fixtures/compat/one-page.pdf");
+    let tempdir = tempfile::tempdir().unwrap();
+    let json_path = tempdir.path().join("encrypt-40.json");
+    let output = tempdir.path().join("encrypt-40.pdf");
+    std::fs::write(
+        &json_path,
+        serde_json::json!({
+            "encrypt": {
+                "userPassword": "json-user",
+                "ownerPassword": "json-owner",
+                "40bit": {}
+            }
+        })
+        .to_string(),
+    )
+    .unwrap();
+
+    let mut job = QPDFJob::new();
+    job.initialize_from_raw_argv(&[
+        b"qpdfjob".to_vec(),
+        fixture.to_string_lossy().into_owned().into_bytes(),
+        b"--allow-weak-crypto".to_vec(),
+        b"--encrypt".to_vec(),
+        b"argv-user".to_vec(),
+        b"argv-owner".to_vec(),
+        b"40".to_vec(),
+        b"--print=n".to_vec(),
+        b"--".to_vec(),
+        format!("--job-json-file={}", json_path.display()).into_bytes(),
+        output.to_string_lossy().into_owned().into_bytes(),
+    ])
+    .unwrap();
+    assert_eq!(job.run().unwrap(), JobExitCode::Success);
+    let bytes = std::fs::read(output).unwrap();
+    assert!(bytes
+        .windows(b"/P -8".len())
+        .any(|window| window == b"/P -8"));
+}
+
+#[test]
 fn raw_argv_job_json_positionals_reject_existing_config_slots() {
     let fixture =
         Path::new(env!("CARGO_MANIFEST_DIR")).join("../../tests/fixtures/compat/one-page.pdf");

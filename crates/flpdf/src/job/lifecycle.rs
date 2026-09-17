@@ -844,7 +844,7 @@ fn parse_job_encrypt(
         )));
     }
     let mut permissions = inherited.permissions;
-    let r2_permissions = inherited.r2_permissions;
+    let mut r2_permissions = inherited.r2_permissions;
     let mut accessibility_disabled = inherited.accessibility_disabled;
     if let Some(value) = job_json_yn(&settings, b"accessibility")? {
         permissions.accessibility = value;
@@ -852,12 +852,18 @@ fn parse_job_encrypt(
     }
     if let Some(value) = job_json_yn(&settings, b"annotate")? {
         permissions.annotate = value;
+        if key_length == "40bit" {
+            r2_permissions.annotate = value;
+        }
     }
     if let Some(value) = job_json_yn(&settings, b"assemble")? {
         permissions.assemble = value;
     }
     if let Some(value) = job_json_yn(&settings, b"extract")? {
         permissions.extract = value;
+        if key_length == "40bit" {
+            r2_permissions.extract = value;
+        }
     }
     if let Some(value) = job_json_yn(&settings, b"form")? {
         permissions.fill_forms = value;
@@ -870,12 +876,18 @@ fn parse_job_encrypt(
         // cov:ignore-start: llvm-cov attributes this successful choice continuation to the match body
     )? {
         // cov:ignore-end
+        if key_length == "40bit" {
+            r2_permissions.modify = value == "y";
+        }
         job_json_modify_permission(&value, &mut permissions)?;
     }
     if let Some(value) = job_json_yn(&settings, b"modifyOther")? {
         permissions.modify_contents = value;
     }
     if let Some(value) = job_json_choice(&settings, b"print", &["full", "low", "none"], true)? {
+        if key_length == "40bit" {
+            r2_permissions.print = value == "y";
+        }
         job_json_print_permission(&value, &mut permissions)?;
     }
 
@@ -921,6 +933,7 @@ fn parse_job_encrypt(
         _ => unreachable!("key length was validated above"), // cov:ignore: key length comes only from the validated qpdf job schema choices
     };
     params.permissions = permissions;
+    params.r2_permissions = r2_permissions;
     if matches!(
         params.method,
         EncryptMethod::V4Aes128
