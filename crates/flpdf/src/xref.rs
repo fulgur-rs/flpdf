@@ -1289,6 +1289,16 @@ impl<'document> BootstrapHandleParser<'document> {
 
 struct CanonicalTrailerParser<'document> {
     owner: &'document dyn CanonicalTrailerOwner,
+    description_template: Rc<Vec<u8>>,
+}
+
+impl<'document> CanonicalTrailerParser<'document> {
+    fn new(owner: &'document dyn CanonicalTrailerOwner, filename: &[u8]) -> Self {
+        Self {
+            owner,
+            description_template: trailer_description_template(filename),
+        }
+    }
 }
 
 impl HandleResolver for CanonicalTrailerParser<'_> {
@@ -1301,7 +1311,7 @@ impl HandleResolver for CanonicalTrailerParser<'_> {
     }
 
     fn description_template(&self) -> Option<Rc<Vec<u8>>> {
-        None
+        Some(Rc::clone(&self.description_template))
     }
 
     fn begin_parse(&self) -> Result<()> {
@@ -2855,7 +2865,7 @@ fn parse_xref_from_start_with_owner_and_build_diagnostics(
             owner.install_xref_entries(registration.snapshot());
         }
         let (trailer, trailer_parser_diagnostics) = if let Some(owner) = canonical_trailer_owner {
-            let mut trailer_parser = CanonicalTrailerParser { owner };
+            let mut trailer_parser = CanonicalTrailerParser::new(owner, &options.description);
             read_trailer(
                 bytes,
                 trailer_start,
@@ -4044,7 +4054,7 @@ fn recover_xref_entries_from_source(
             let window_length = usize::try_from(remaining.min(64 * 1024)).unwrap_or(64 * 1024);
             let window = read_live_source_range(owner, trailer_start, window_length)?;
             let result = {
-                let mut resolver = CanonicalTrailerParser { owner };
+                let mut resolver = CanonicalTrailerParser::new(owner, filename);
                 read_trailer(
                     &window,
                     trailer_start as usize,
@@ -4840,6 +4850,12 @@ fn is_classic_trailer_validation_message(message: &str) -> bool {
 /// owned by the supplied resolver, while the post-parse lookahead uses qpdf's
 /// `readToken` contract (`allow_bad = true`) only to detect an unexpected
 /// `stream` keyword.
+fn trailer_description_template(filename: &[u8]) -> Rc<Vec<u8>> {
+    let mut description = filename.to_vec();
+    description.extend_from_slice(b", trailer at offset $PO");
+    Rc::new(description)
+}
+
 fn read_trailer(
     input: &[u8],
     start: usize,
@@ -4863,12 +4879,10 @@ fn read_trailer(
     // value keeps that source boundary for later accessor warnings, which
     // qpdf renders as `input, trailer at offset N`. Attach the equivalent live
     // template before writer/encryption consumers traverse the trailer.
-    let mut description = filename.to_vec();
-    if !description.is_empty() {
-        description.extend_from_slice(b", ");
-    }
-    description.extend_from_slice(b"trailer at offset $PO");
-    trailer.set_description(description, i64::try_from(start).unwrap_or(i64::MAX));
+    trailer.set_shared_description(
+        trailer_description_template(filename),
+        i64::try_from(start).unwrap_or(i64::MAX),
+    );
 
     let mut diagnostics = trailer_diagnostics(start, parsed.diagnostics, filename, Some(slice));
     if let Some(empty_offset) = parsed.empty_offset {
@@ -4913,7 +4927,7 @@ fn parse_trailer_candidate(
     // diagnostics regardless of whether the parse ultimately produced a
     // dictionary, a different object, or an error.
     let result = if let Some(owner) = canonical_trailer_owner {
-        let mut resolver = CanonicalTrailerParser { owner };
+        let mut resolver = CanonicalTrailerParser::new(owner, filename);
         read_trailer(bytes, start, 0, filename, &mut resolver)
     } else {
         let mut resolver = XrefDetachedHandles;

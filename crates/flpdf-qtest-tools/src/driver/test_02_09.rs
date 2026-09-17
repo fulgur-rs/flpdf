@@ -799,7 +799,7 @@ mod tests {
         assert!(stdout.is_empty());
         assert_eq!(
             stderr,
-            b"WARNING: operation for array attempted on object of type integer: treating as empty\n"
+            b"WARNING: , trailer at offset 220: operation for array attempted on object of type integer: treating as empty\n"
         );
     }
 
