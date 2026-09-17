@@ -14,11 +14,11 @@ use std::path::Path;
 use std::process::{Command, Stdio};
 use std::sync::{Arc, Mutex};
 
-#[cfg(target_os = "linux")]
+#[cfg(unix)]
 use std::ffi::OsString;
-#[cfg(target_os = "linux")]
+#[cfg(unix)]
 use std::os::unix::ffi::{OsStrExt, OsStringExt};
-#[cfg(target_os = "linux")]
+#[cfg(unix)]
 use std::path::PathBuf;
 
 const COMPLETE_JSON: &[u8] = br#"{
@@ -113,7 +113,7 @@ fn logger_with_error_sink() -> (QPDFLogger, Arc<Mutex<SinkState>>) {
     (logger, state)
 }
 
-#[cfg(target_os = "linux")]
+#[cfg(unix)]
 fn non_utf8_path(directory: &Path, filename: &[u8]) -> PathBuf {
     let mut bytes = directory.as_os_str().as_bytes().to_vec();
     bytes.push(b'/');
