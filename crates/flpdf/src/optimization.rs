@@ -592,7 +592,29 @@ struct Pending {
 }
 
 fn is_page_resolved(object: &ObjectHandle) -> crate::Result<bool> {
-    object.resolved_is_dictionary_of_type(b"Page", b"")
+    resolved_page_type(object)
+}
+
+/// Check the page marker from the already-resolved dictionary without routing
+/// through resolved_get_key's context bookkeeping. qpdf's
+/// isDictionaryOfType only needs the direct /Type child in this case.
+fn resolved_page_type(object: &ObjectHandle) -> crate::Result<bool> {
+    let type_child = object.with_value(|value| match value {
+        Some(crate::object_handle::ObjectValue::Dictionary(entries)) => {
+            entries.get(b"/Type".as_slice()).cloned()
+        }
+        _ => None,
+    });
+    if type_child.is_none() {
+        // Keep the existing qpdf-shaped helper reachable for non-dictionaries
+        // and dictionaries without /Type; the common Page path above avoids
+        // its context bookkeeping.
+        return object.resolved_is_dictionary_of_type(b"Page", b"");
+    }
+    type_child
+        .map(|child| child.try_is_name_and_equals(b"Page"))
+        .transpose()
+        .map(|matched| matched.unwrap_or(false))
 }
 
 /// Return qpdf-ordered visible dictionary children while cloning each child
@@ -781,6 +803,20 @@ mod tests {
                 .map(|(_, child)| child.as_integer())
                 .collect::<Vec<_>>(),
             vec![Some(1), Some(3)]
+        );
+    }
+
+    #[test]
+    fn page_type_probe_reads_live_type_children_without_a_context_snapshot() {
+        let page = ObjectHandle::dictionary(vec![
+            (b"/Type".to_vec(), ObjectHandle::name(b"Page".to_vec())),
+            (b"/Subtype".to_vec(), ObjectHandle::name(b"Link".to_vec())),
+        ]);
+        page.try_dereference().expect("direct page resolves");
+
+        assert!(
+            super::resolved_page_type(&page).expect("page type probe succeeds"),
+            "a resolved Page dictionary must be recognized"
         );
     }
 
