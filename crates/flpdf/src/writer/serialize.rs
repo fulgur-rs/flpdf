@@ -642,7 +642,10 @@ pub(crate) mod xref_stream {
         // the input trailer already had that literal key. The linearized
         // second-half `/Size`-only form is a separate caller and does not use
         // this live plain-trailer helper (`QPDFWriter.cc:1170-1172,1174-1192`).
-        if entries.contains_key(b"/Size".as_slice()) {
+        // `contains_key` is not the same predicate: qpdf's `getKeys()` omits a
+        // key whose value is null (`QPDF_Dictionary.cc:getKeys`), so a trailer
+        // carrying `/Size null` has no visible `/Size` and gets no computed one.
+        if trailer.try_has_key(b"/Size")? {
             keys.insert(b"/Size".to_vec());
         }
 
