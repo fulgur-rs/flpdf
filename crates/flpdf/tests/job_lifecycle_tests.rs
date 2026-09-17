@@ -483,7 +483,7 @@ fn raw_argv_help_table_and_completion_emit_qpdf_output() {
     option_help
         .initialize_from_raw_argv(&[b"qpdfjob".to_vec(), b"--help=--allow-insecure".to_vec()])
         .unwrap();
-    assert!(String::from_utf8_lossy(&info.lock().unwrap().bytes).contains("--allow-insecure"));
+    assert!(String::from_utf8_lossy(&info.lock().unwrap().bytes).contains("Allow creation"));
 
     let (logger, info) = logger_with_info_sink();
     let mut completion = QPDFJob::new();

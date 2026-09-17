@@ -1963,6 +1963,8 @@ const QPDF_HELP_TOPICS: &[&[u8]] = &[
     b"usage",
 ];
 
+const QPDF_HELP_ALL: &str = include_str!("qpdf-help-all.txt");
+
 const QPDF_HELP_OPTIONS: &[&[u8]] = &[
     b"--accessibility",
     b"--add-attachment",
@@ -2130,7 +2132,38 @@ fn completion(argv0: &[u8], zsh: bool) -> Vec<u8> {
     .into_bytes()
 }
 
+fn help_from_generated_table(value: Option<&[u8]>, program: &str) -> Option<Vec<u8>> {
+    let Some(value) = value else {
+        return Some(help_top(program));
+    };
+    if value == b"all" {
+        let mut all = QPDF_HELP_ALL.to_owned();
+        if program != "qpdf" {
+            all = all.replacen("qpdf --help=", &format!("{program} --help="), 3);
+        }
+        return Some(all.into_bytes());
+    }
+    let target = String::from_utf8_lossy(value);
+    let marker = format!("== {target} (");
+    let start = QPDF_HELP_ALL.find(&marker)?;
+    let section_start = QPDF_HELP_ALL[start..].find('\n')? + start + 1;
+    let section_end = QPDF_HELP_ALL[section_start..]
+        .find("\n== ")
+        .or_else(|| QPDF_HELP_ALL[section_start..].find("\n===="))
+        .map_or(QPDF_HELP_ALL.len(), |offset| section_start + offset);
+    let section = QPDF_HELP_ALL[section_start..section_end].trim_matches('\n');
+    Some(
+        format!(
+            "{section}\n\nFor detailed help, visit the qpdf manual: https://qpdf.readthedocs.io\n"
+        )
+        .into_bytes(),
+    )
+}
+
 fn help_text(value: Option<&[u8]>, program: &str) -> Vec<u8> {
+    if let Some(help) = help_from_generated_table(value, program) {
+        return help;
+    }
     match value {
         Some(b"usage") => QPDF_HELP_USAGE.to_vec(),
         Some(b"encryption") => QPDF_HELP_ENCRYPTION.to_vec(),
