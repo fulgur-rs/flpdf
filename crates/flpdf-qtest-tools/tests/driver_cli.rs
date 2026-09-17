@@ -615,6 +615,26 @@ fn test_93_drains_the_repair_warning_from_resolving_a_malformed_root() {
 }
 
 #[test]
+fn test_9_drains_the_repair_warning_from_resolving_a_malformed_root() {
+    let directory = tempfile::tempdir().expect("temporary directory");
+    let input = directory.path().join("recoverable-bad-root.pdf");
+    fs::write(&input, recoverable_non_dictionary_root_pdf())
+        .expect("write recoverable malformed root fixture");
+    let input = input.to_str().expect("utf-8 temporary path");
+    let expected = format!(
+        "WARNING: {input} (object 1 0, offset 19): expected endobj\n\
+         {input}: unable to find /Root dictionary\n"
+    );
+
+    driver()
+        .args(["9", input])
+        .assert()
+        .code(2)
+        .stdout("")
+        .stderr(expected);
+}
+
+#[test]
 fn test_52_drains_the_repair_warning_before_a_terminal_root_error() {
     let directory = tempfile::tempdir().expect("temporary directory");
     let input = directory.path().join("recoverable-bad-root.pdf");
@@ -1539,7 +1559,7 @@ fn qtest_accessor_cases_do_not_use_explicit_pdf_resolve() {
         "#[cfg(test)]",
     );
     assert!(
-        test_9.contains("pdf.root_handle()?")
+        test_9.contains("pdf.root_handle()")
             && !test_9.contains("resolve_handle(")
             && !test_9.contains("try_get_key(b\"/Root\")"),
         "test 9 must use the canonical resolving root boundary without a caller-side bridge"

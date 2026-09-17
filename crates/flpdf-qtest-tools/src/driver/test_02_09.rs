@@ -603,13 +603,16 @@ pub(crate) fn run_test_8<R: Read + Seek>(
 /// the literal byte string below is that same 20-byte payload.
 pub(crate) fn run_test_9<R: Read + Seek>(
     pdf: &mut Pdf<R>,
-    _filename: &[u8],
+    filename: &[u8],
     _arg2: Option<&std::ffi::OsStr>,
     stdout: &mut dyn Write,
-    _stderr: &mut dyn Write,
-    _diagnostics_written: &mut usize,
+    stderr: &mut dyn Write,
+    diagnostics_written: &mut usize,
 ) -> flpdf::Result<()> {
-    let root = pdf.root_handle()?;
+    let root = pdf.root_handle();
+    emit_new_diagnostics(pdf, diagnostics_written, filename, stdout, stderr)
+        .map_err(Error::from)?;
+    let root = root?;
 
     let qstream = pdf.new_stream_with_data(Rc::new(b"data for new stream\n".to_vec()))?;
     let rstream = pdf.new_stream()?;
