@@ -10686,6 +10686,288 @@ mod tests {
         );
     }
 
+    /// qpdf recovers a duplicated dictionary key inside an ObjStm member and
+    /// keeps the key's raw bytes in the warning: `QPDFParser::warnDuplicateKey`
+    /// concatenates `frame->key` verbatim
+    /// (`libqpdf/QPDFParser.cc:500-507`), so a `#ff` escape survives decoding
+    /// as `0xff` instead of being re-encoded. `QPDFParser::warn` then builds
+    /// the exception from the member input's name, the parser's object
+    /// description and the decoded-buffer offset (`:509-513`), and the member
+    /// input is the `BufferInputSource` named `<file> object stream N`
+    /// (`libqpdf/QPDF.cc:1792-1796`).
+    #[test]
+    fn canonical_object_stream_preserves_raw_duplicate_key_warning_bytes() {
+        let stream_ref = ObjectRef::new(4, 0);
+        let member_ref = ObjectRef::new(7, 0);
+        let stream_data = b"7 0 << /K#ff 1 /K#ff 2 >>".to_vec();
+        let stream_dict = ObjectHandle::dictionary(vec![
+            (b"Type".to_vec(), ObjectHandle::name(b"ObjStm".to_vec())),
+            (b"N".to_vec(), ObjectHandle::integer(1)),
+            (b"First".to_vec(), ObjectHandle::integer(4)),
+            (
+                b"Length".to_vec(),
+                ObjectHandle::integer(stream_data.len() as i64),
+            ),
+        ]);
+        let (resolver, output) = named_resolver_with_captured_warnings();
+        resolver.insert_xref_entry(stream_ref, XrefEntry::Uncompressed { offset: 1 });
+        resolver.insert_xref_entry(
+            member_ref,
+            XrefEntry::Compressed {
+                stream: stream_ref.number,
+                index: 0,
+            },
+        );
+        resolver
+            .get_object_handle(stream_ref)
+            .set_resolved(ObjectValue::Stream(Box::new(StreamValue {
+                stream_dict,
+                stream_data: Some(Rc::new(stream_data)),
+                stream_length: 0,
+                stream_provider: None,
+                filter_on_write: true,
+                stream_token_filters: Default::default(),
+                content_normalization_applied: false,
+            })));
+
+        let member = resolver.get_object_handle(member_ref);
+        member
+            .try_dereference()
+            .expect("a duplicate-key member warning is recoverable");
+        assert_eq!(
+            member
+                .try_get_key(b"/K\xff")
+                .expect("decoded raw member key")
+                .as_integer(),
+            Some(2),
+            "qpdf keeps the last occurrence of a duplicated key"
+        );
+
+        let diagnostics = resolver.repair_diagnostics();
+        let warning = diagnostics
+            .entries()
+            .iter()
+            .find(|warning| warning.get_message_detail().contains(&0xff))
+            .expect("duplicate-key ObjStm warning");
+        assert_eq!(
+            warning.get_message_detail(),
+            b"dictionary has duplicated key /K\xff; last occurrence overrides earlier ones"
+        );
+        assert_eq!(warning.get_filename(), b"input.pdf object stream 4");
+        assert_eq!(warning.get_object(), b"object 7 0");
+        assert_eq!(warning.get_file_position(), 6);
+        assert_eq!(
+            warning.what_bytes(),
+            b"input.pdf object stream 4 (object 7 0, offset 6): dictionary has duplicated key /K\xff; last occurrence overrides earlier ones"
+        );
+        assert_eq!(
+            output.lock().unwrap().as_slice(),
+            b"WARNING: input.pdf object stream 4 (object 7 0, offset 6): dictionary has duplicated key /K\xff; last occurrence overrides earlier ones\n"
+        );
+    }
+
+    /// A recoverable decode warning raised while
+    /// `getStreamData(qpdf_dl_specialized)` materializes the ObjStm payload
+    /// (`libqpdf/QPDF.cc:1791`) must leave the members usable.
+    /// `QPDF_Stream::warn` records it through `QPDF::warn`
+    /// (`libqpdf/QPDF_Stream.cc:695-698`, `libqpdf/QPDF.cc:488-504`) without
+    /// throwing, and that path builds the exception with the document's
+    /// filename, an empty object description and the stream's own
+    /// `parsed_offset` -- not the member's decoded-buffer coordinate.
+    #[test]
+    fn canonical_object_stream_keeps_a_member_after_a_recoverable_stream_warning() {
+        use flate2::{write::ZlibEncoder, Compression};
+        use std::io::Write as _;
+
+        let stream_ref = ObjectRef::new(4, 0);
+        let member_ref = ObjectRef::new(7, 0);
+        let decoded = b"7 0 << /Value 42 >>";
+        let mut encoder = ZlibEncoder::new(Vec::new(), Compression::default());
+        encoder
+            .write_all(decoded)
+            .expect("the ObjStm payload compresses");
+        let mut compressed = encoder.finish().expect("the zlib stream finishes");
+        // Drop the zlib trailer so inflate reports `Z_BUF_ERROR` after it has
+        // already produced the whole payload: qpdf's recoverable
+        // "input stream is complete but output may still be valid" case.
+        compressed.truncate(compressed.len().saturating_sub(4));
+
+        let stream_dict = ObjectHandle::dictionary(vec![
+            (b"/Type".to_vec(), ObjectHandle::name(b"ObjStm".to_vec())),
+            (b"/N".to_vec(), ObjectHandle::integer(1)),
+            (b"/First".to_vec(), ObjectHandle::integer(4)),
+            (
+                b"/Length".to_vec(),
+                ObjectHandle::integer(i64::try_from(compressed.len()).unwrap()),
+            ),
+            (
+                b"/Filter".to_vec(),
+                ObjectHandle::name(b"FlateDecode".to_vec()),
+            ),
+        ]);
+        let (resolver, _output) = named_resolver_with_captured_warnings();
+        resolver.insert_xref_entry(stream_ref, XrefEntry::Uncompressed { offset: 1 });
+        resolver.insert_xref_entry(
+            member_ref,
+            XrefEntry::Compressed {
+                stream: stream_ref.number,
+                index: 0,
+            },
+        );
+        let stream = resolver.get_object_handle(stream_ref);
+        stream.set_resolved(ObjectValue::Stream(Box::new(StreamValue {
+            stream_dict,
+            stream_data: Some(Rc::new(compressed)),
+            stream_length: decoded.len(),
+            stream_provider: None,
+            filter_on_write: true,
+            stream_token_filters: Default::default(),
+            content_normalization_applied: false,
+        })));
+        stream.set_parsed_offset_if_unset(90);
+
+        let member = resolver.get_object_handle(member_ref);
+        member
+            .try_dereference()
+            .expect("a recoverable stream warning must not abort ObjStm resolution");
+        assert_eq!(
+            member
+                .try_get_key(b"/Value")
+                .expect("the member survives the stream warning")
+                .as_integer(),
+            Some(42)
+        );
+
+        let diagnostics = resolver.repair_diagnostics();
+        let warning = diagnostics
+            .entries()
+            .iter()
+            .find(|warning| {
+                warning.get_message_detail()
+                    == b"input stream is complete but output may still be valid"
+            })
+            .expect("the recoverable zlib warning is collected");
+        assert_eq!(warning.get_filename(), b"input.pdf");
+        assert_eq!(warning.get_object(), b"");
+        assert_eq!(warning.get_file_position(), 90);
+    }
+
+    /// Direct values nested inside an ObjStm member inherit the member's
+    /// parser description, so a later accessor warning still names the
+    /// containing object stream. qpdf reaches this through `QPDFParser`'s
+    /// single `object_description` for the whole member parse
+    /// (`libqpdf/QPDFParser.cc:509-513`); a type mismatch on such a value then
+    /// warns and returns qpdf's fallback rather than failing
+    /// (`libqpdf/QPDFObjectHandle.cc:2180-2210`, recorded by `QPDF::warn`
+    /// without throwing, `libqpdf/QPDF.cc:488-494`).
+    #[test]
+    fn canonical_object_stream_propagates_member_description_to_nested_direct_values() {
+        let stream_ref = ObjectRef::new(4, 0);
+        let member_ref = ObjectRef::new(7, 0);
+        let stream_data = b"7 0 << /Nested [ (text) << /Leaf (text) >> ] >>".to_vec();
+        let probe_offset = stream_data
+            .windows(b"(text)".len())
+            .position(|window| window == b"(text)");
+        let leaf_offset = stream_data
+            .windows(b"(text)".len())
+            .rposition(|window| window == b"(text)");
+        let stream_dict = ObjectHandle::dictionary(vec![
+            (b"Type".to_vec(), ObjectHandle::name(b"ObjStm".to_vec())),
+            (b"N".to_vec(), ObjectHandle::integer(1)),
+            (b"First".to_vec(), ObjectHandle::integer(4)),
+            (
+                b"Length".to_vec(),
+                ObjectHandle::integer(stream_data.len() as i64),
+            ),
+        ]);
+        let (resolver, _output) = named_resolver_with_captured_warnings();
+        resolver.insert_xref_entry(stream_ref, XrefEntry::Uncompressed { offset: 1 });
+        resolver.insert_xref_entry(
+            member_ref,
+            XrefEntry::Compressed {
+                stream: stream_ref.number,
+                index: 0,
+            },
+        );
+        resolver
+            .get_object_handle(stream_ref)
+            .set_resolved(ObjectValue::Stream(Box::new(StreamValue {
+                stream_dict,
+                stream_data: Some(Rc::new(stream_data)),
+                stream_length: 0,
+                stream_provider: None,
+                filter_on_write: true,
+                stream_token_filters: Default::default(),
+                content_normalization_applied: false,
+            })));
+
+        let member = resolver.get_object_handle(member_ref);
+        member
+            .try_dereference()
+            .expect("the ObjStm member resolves");
+        let nested = member
+            .try_get_key(b"/Nested")
+            .expect("nested direct value is present");
+        assert_eq!(
+            nested
+                .try_get_array_item(0)
+                .expect("nested array item is present")
+                .try_get_int_value()
+                .expect("qpdf warns and falls back instead of failing"),
+            0
+        );
+        assert_eq!(
+            nested
+                .try_get_array_item(1)
+                .expect("nested dictionary item is present")
+                .try_get_key(b"/Leaf")
+                .expect("nested dictionary leaf is present")
+                .try_get_int_value()
+                .expect("qpdf warns and falls back instead of failing"),
+            0
+        );
+
+        // Both nested values warn, and each renders the *member's* template with
+        // its own parsed offset substituted for `$PO`. Deriving the two offsets
+        // from the fixture keeps the expectation honest if the member body
+        // changes. The empty filename and zero file position are qpdf's
+        // `typeWarning` shape (`libqpdf/QPDFObjectHandle.cc:2180-2188`), which
+        // leaves the object description as the only location it carries.
+        let array_string_offset = probe_offset.expect("the array string is in the fixture");
+        let leaf_string_offset = leaf_offset.expect("the leaf string is in the fixture");
+        assert_eq!(
+            resolver
+                .repair_diagnostics()
+                .entries()
+                .iter()
+                .map(|warning| (
+                    String::from_utf8_lossy(warning.get_filename()).into_owned(),
+                    String::from_utf8_lossy(warning.get_object()).into_owned(),
+                    warning.get_file_position(),
+                    String::from_utf8_lossy(warning.get_message_detail()).into_owned(),
+                ))
+                .collect::<Vec<_>>(),
+            vec![
+                (
+                    String::new(),
+                    format!(
+                        "input.pdf object stream 4, object 7 0 at offset {array_string_offset}"
+                    ),
+                    0,
+                    "operation for integer attempted on object of type string: returning 0"
+                        .to_owned(),
+                ),
+                (
+                    String::new(),
+                    format!("input.pdf object stream 4, object 7 0 at offset {leaf_string_offset}"),
+                    0,
+                    "operation for integer attempted on object of type string: returning 0"
+                        .to_owned(),
+                ),
+            ]
+        );
+    }
+
     #[test]
     fn an_objstm_failure_does_not_overwrite_a_member_cached_before_it() {
         let stream_ref = ObjectRef::new(4, 0);
