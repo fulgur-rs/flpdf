@@ -1711,12 +1711,12 @@ impl<R: Read + Seek> ResolverHandle<R> {
                 continue;
             }
 
-            if let Some(object_ref) = object_gen.to_object_ref() {
-                let handle = self.get_object_handle(object_ref);
+            if object_gen.to_object_ref().is_some() {
+                let handle = self.get_object_handle_qpdf_obj_gen(object_gen);
                 if handle.is_resolved() {
                     continue;
                 }
-                handle.try_dereference()?;
+                self.resolve_qpdf_obj_gen(object_gen, &handle)?;
                 if may_change && self.reconstructed_xref() {
                     return Ok(false);
                 }
