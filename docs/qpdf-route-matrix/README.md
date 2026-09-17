@@ -33,18 +33,18 @@ container-above-max だった — `flpdf-hi08` / PR #1486）。本表は残る m
 
 | canonical | bridge | mixed | unknown | 合計 |
 |---|---|---|---|---|
-| 107 | 0 | 53 | 0 | 160 |
+| 108 | 0 | 52 | 0 | 160 |
 
 ### checker logical aggregate（259 rows）
 
 `scripts/check-qpdf-route-matrix.py --check` は、A〜E の160行に加えて
 E の qtest exception 表（物理98行を論理99ケースとして数える）を含む259 logical
-rowsを検証する。2026-09-17 の現行 `origin/main` (`87d205e6ae14da5a4295d70edba3c720c9e4e1cd`) を基準に、
+rowsを検証する。2026-09-17 の現行 `origin/main` (`62de6be4c2b1976e1c07cc85274277f7fd2ec89b`) を基準に、
 今回の変更を適用した tree での集計は次のとおり。
 
 | canonical | bridge | mixed | unknown | 合計 |
 |---|---|---|---|---|
-| 158 | 0 | 101 | 0 | 259 |
+| 159 | 0 | 100 | 0 | 259 |
 
 したがって、160行の領域別表と259 logical rowsの checker 分母は異なる。どちらも
 parity 完了数ではなく、責務／経路の分類数である。
@@ -97,12 +97,12 @@ done | sort | uniq -c
 本表は「その責務に至る **経路が 1 本か**」を問う。✅ の行でも consumer 側に bridge が残っていれば
 本表では mixed / bridge になりうる。
 
-2026-09-17 の current-main audit anchor は `origin/main=346a79d73c9ea25d1e761d89c2fd12cec3a7cce2`、pinned qpdf は
+2026-09-17 の current-main audit anchor は `origin/main=62de6be4c2b1976e1c07cc85274277f7fd2ec89b`、pinned qpdf は
 11.9.0 commit `3b97c9bd266b7c32ea36d3536e22dab77412886d` である。checker の実測は
-**今回の変更を適用した tree で** 2193 qpdf citations / 913 flpdf citations /
+**今回の変更を適用した tree で** 2199 qpdf citations / 912 flpdf citations /
 259 logical rows、分類は
-canonical 158 / mixed 101 / bridge 0 / unknown 0。A〜E の160行だけを数える
-上の領域別集計は canonical 107 / mixed 53 / bridge 0 / unknown 0 なので、checker
+canonical 159 / mixed 100 / bridge 0 / unknown 0。A〜E の160行だけを数える
+上の領域別集計は canonical 108 / mixed 52 / bridge 0 / unknown 0 なので、checker
 の259 logical rowsと混同しない。
 
 履歴行の例外: C44はpublic facadeとdeferred blobの責務を分離したmixed ownerとして追跡する。

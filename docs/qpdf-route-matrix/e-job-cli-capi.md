@@ -257,7 +257,7 @@ mutation の併用も同じ `QPDFJob::run` に接続した。qpdf と同じく o
 なら mutation を create stage で適用してから inspection を実行し、output
 path があれば `no output file may be given for this option` を返す。
 
-| E-8 | `QPDFJob::doCheck` | `libqpdf/QPDFJob.cc:744-803` | `crates/flpdf/src/job/check.rs::QPDFJob::check`（pub、`crates/flpdf/src/job/check.rs:143`） | prod: 3 (flpdf/src/job/lifecycle.rs, flpdf-cli/src/main.rs) / test: 16 | mixed | `crates/flpdf/src/job/check.rs::QPDFJob::check` | `pub` は根拠 2 かつ `lib.rs` 冒頭 doc に明記あり（根拠 3 も満たす）。到達経路が QPDFJob の write-stage dispatcher と CLI 直呼びの 2 本である点だけが mixed |
+| E-8 | `QPDFJob::doCheck` | `libqpdf/QPDFJob.cc:744-803` | `crates/flpdf/src/job/lifecycle.rs::run_configured_inspection` → `crates/flpdf/src/job/check.rs::QPDFJob::run_check_report`（private）; public `QPDFJob::check` remains a library/test API | prod: `run_check_report` 1 (`flpdf/src/job/lifecycle.rs`) / test: 16 | canonical | `crates/flpdf/src/job/check.rs::QPDFJob::run_check_report` inside `QPDFJob::write_qpdf` | **2026-09-17（`flpdf-3yn9.48.145`）**: standalone top-level `--check` と `check` subcommand の CLI direct open/`QPDFJob::check` consumerを撤去し、qpdf の `createQPDF` → no-output `writeQPDF` → `doInspection` → `doCheck` boundaryへ接続した。public `QPDFJob::check` と qtest/C API test consumerは変更せず、combined inspection・JSON・`check-linearization` は別routeとして残す。|
 | E-9 | `QPDFJob::doListAttachments` / `doShowAttachment` / `addAttachments` / `copyAttachments` | `libqpdf/QPDFJob.cc:876-911`, `include/qpdf/QPDFJob.hh:531-532,540-541` | `crates/flpdf/src/job/attachments.rs::QPDFJob::list_attachments`（pub）ほか同 impl の 5 メソッド | `format_attachment_list_with_sink` prod: 1 (`crates/flpdf/src/job/attachments.rs`) / test: 0。`list_attachments` は CLI から呼ばれる public Job method | mixed | `crates/flpdf/src/job/attachments.rs`（`QPDFJob` impl） | `QPDFJob` メソッド側は根拠 2 で legitimate。`.43` で buffer-returning free route `format_attachment_list` / `list_attachment_info` を削除し、`flpdf-xsq1` で残る sink helper を `pub(crate)` に狭め、job/lib.rs と crate-root の public re-export を撤去した。E-9 の caller-zero `AttachmentInfo` public projection も `flpdf-3yn9.48.97` で撤去済み。 |
 | E-10 | `QPDFJob::handlePageSpecs` | `libqpdf/QPDFJob.cc:2359-2633` | `crates/flpdf/src/job/page_specs.rs::QPDFJob::handle_page_specs` | CLI direct `handle_page_specs` prod: 4 (`crates/flpdf-cli/src/main.rs:4455,6974,7142,7249`、2026-09-10 再測)。job 内からも到達 | mixed | `crates/flpdf/src/job/page_specs.rs::QPDFJob::handle_page_specs` | `flpdf-hxmj` は closed。single-source をこの job boundary に接続し、standalone collate/CombinedPlan 経路を撤去した限定 slice は完了済み。残る CLI の JSON page selection と page-operation output 各経路は source cache、password、keep-files-open、変換と出力の orchestration を保持する。lifecycle の source orchestration は `prepare_document` に統合済みで、CLI 側の別 consumer 移行は後続 sliceに残る。2026-09-08（`flpdf-3yn9.48.8`）: `QPDFJobConfig::add_page_spec` を新設し JSON 経由と byte-identical であることを検証した（`config_add_page_spec_matches_the_json_configured_path_single_source`）。2026-09-10（`flpdf-3yn9.48.76`）: top-level `--pages` と no-output inspection の consumer は `QPDFJobConfig::empty_input`/`add_page_spec`/`collate` と `QPDFJob::run`（`create_qpdf` → `write_qpdf`）へ cutover し、`--empty --pages ... -- --show-pages` の page-selection bypass を解消した。残る4つの直接 `handle_page_specs` caller（JSON page selection と page-operation output）は mixed のまま、別の canonical cutover scope とする。 |
 E-10 page-merge inherited-attribute note (`flpdf-k4bp`, 2026-09-10): the primary source must pass through the existing qpdf-shaped `push_inherited_attributes_to_pages` preparation before its selected graph is copied into the fresh target. This preserves direct non-scalar `/MediaBox` promotion and leaf inheritance in the multi-source consumer; secondary-source preparation was already canonical. |
@@ -565,12 +565,12 @@ qtest exceptionsとrootは対象外。
 
 | 分類 | 件数 | 行 |
 |---|---|---|
-| canonical | 16 | E-1, E-2, E-3, E-5, E-11, E-12, E-13, E-14, E-18, E-20, E-22, E-23, E-24, E-25, E-26, E-27 |
+| canonical | 17 | E-1, E-2, E-3, E-5, E-8, E-11, E-12, E-13, E-14, E-18, E-20, E-22, E-23, E-24, E-25, E-26, E-27 |
 | bridge | 0 | — |
-| mixed | 13 | E-4, E-6, E-7, E-8, E-9, E-10, E-15, E-16, E-17, E-19, E-21, E-28, E-29 |
+| mixed | 12 | E-4, E-6, E-7, E-9, E-10, E-15, E-16, E-17, E-19, E-21, E-28, E-29 |
 | unknown | 0 | —（E-28 の case 別詳細は「E-28 detail」表を参照。99 ケース全件を照合済みで case-level unknown は 0） |
 
-（合計 29 行。canonical 16 + bridge 0 + mixed 13 + unknown 0 = 29。`E-18` は `mixed` に見えるが、CLI が使わないのは「別の正本がある」からではなく E-17 の帰結であるため `canonical`）
+（合計 29 行。canonical 17 + bridge 0 + mixed 12 + unknown 0 = 29。`E-18` は `mixed` に見えるが、CLI が使わないのは「別の正本がある」からではなく E-17 の帰結であるため `canonical`）
 
 ### `main.rs` が直接 import する job/ 項目のうち、8 の (A)〜(E) に未記載のもの
 
