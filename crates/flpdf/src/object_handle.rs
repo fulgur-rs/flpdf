@@ -162,6 +162,8 @@ use crate::{
     writer::DecodeLevel,
 };
 use crate::{json::Json, Error, ObjectRef, QpdfErrorCode, QpdfExc, Result};
+#[cfg(test)]
+use std::cell::Cell;
 use std::cell::RefCell;
 use std::collections::{BTreeMap, BTreeSet};
 use std::hash::{Hash, Hasher};
@@ -169,6 +171,11 @@ use std::num::NonZeroU64;
 use std::rc::{Rc, Weak};
 
 type StreamTokenFilter = Rc<RefCell<dyn TokenFilter>>;
+
+#[cfg(test)]
+thread_local! {
+    static TRY_DEREFERENCE_CALLS: Cell<usize> = const { Cell::new(0) };
+}
 
 /// The qpdf stream-local token-filter vector. The newtype only supplies a
 /// cycle-safe debug representation for the trait objects; it does not add an
@@ -2779,6 +2786,16 @@ impl ObjectHandle {
         Rc::strong_count(&self.0)
     }
 
+    #[cfg(test)]
+    pub(crate) fn reset_try_dereference_call_count() {
+        TRY_DEREFERENCE_CALLS.with(|count| count.set(0));
+    }
+
+    #[cfg(test)]
+    pub(crate) fn try_dereference_call_count() -> usize {
+        TRY_DEREFERENCE_CALLS.with(Cell::get)
+    }
+
     /// True if this handle's value is known without performing resolution: a
     /// direct handle always is; an indirect handle is once it has left its
     /// initial state, whether that landed on a real value, on a reference
@@ -2794,6 +2811,9 @@ impl ObjectHandle {
     /// Direct and already-terminal handles are no-ops. An unresolved handle
     /// whose document has been dropped returns an error and stays unresolved.
     pub(crate) fn try_dereference(&self) -> Result<()> {
+        #[cfg(test)]
+        TRY_DEREFERENCE_CALLS.with(|count| count.set(count.get() + 1));
+
         let (object_gen, resolver) = {
             let slot = self.0.borrow();
             if !slot.initialized {
@@ -3181,6 +3201,13 @@ impl ObjectHandle {
     /// Propagates resolution failures.
     pub fn try_get_keys(&self) -> Result<BTreeSet<Vec<u8>>> {
         self.try_dereference()?;
+        self.resolved_get_keys()
+    }
+
+    /// Return visible dictionary keys from a receiver already resolved by the
+    /// caller. This keeps the qpdf `getKeys` child-null filtering and warning
+    /// boundary while avoiding a second receiver dereference.
+    pub(crate) fn resolved_get_keys(&self) -> Result<BTreeSet<Vec<u8>>> {
         let Some(entries) = self.as_dictionary() else {
             self.type_warning("dictionary", "treating as empty")?;
             return Ok(BTreeSet::new());
@@ -3192,6 +3219,29 @@ impl ObjectHandle {
             }
         }
         Ok(result)
+    }
+
+    /// Return visible dictionary keys from a resolved receiver without
+    /// cloning the complete child-handle map. The key bytes are copied in
+    /// sorted order first, then each child is resolved through the canonical
+    /// key boundary after the container borrow has ended.
+    pub(crate) fn resolved_get_visible_keys(&self) -> Result<Vec<Vec<u8>>> {
+        let Some(keys) = self.with_value(|value| match value {
+            Some(ObjectValue::Dictionary(entries)) => {
+                Some(entries.keys().cloned().collect::<Vec<_>>())
+            }
+            _ => None,
+        }) else {
+            self.type_warning("dictionary", "treating as empty")?;
+            return Ok(Vec::new());
+        };
+        let mut visible = Vec::with_capacity(keys.len());
+        for key in keys {
+            if !self.resolved_get_key(&key)?.try_is_null()? {
+                visible.push(key);
+            }
+        }
+        Ok(visible)
     }
 
     /// qpdf-compatible name inspection with lazy dereference.
@@ -3273,6 +3323,40 @@ impl ObjectHandle {
         if !subtype_name.is_empty()
             && !self
                 .try_get_key(b"/Subtype")?
+                .try_is_name_and_equals(subtype_name)?
+        {
+            return Ok(false);
+        }
+        Ok(true)
+    }
+
+    /// Inspect a receiver that the caller has already resolved.
+    ///
+    /// This is the private counterpart of [`Self::try_is_dictionary_of_type`]
+    /// for qpdf-shaped walkers that establish the receiver's resolution
+    /// boundary once and then perform several type/key probes. Child handles
+    /// still use their ordinary fallible name predicate, so their lazy
+    /// resolution and warning order are unchanged.
+    pub(crate) fn resolved_is_dictionary_of_type(
+        &self,
+        type_name: &[u8],
+        subtype_name: &[u8],
+    ) -> Result<bool> {
+        let is_dictionary =
+            self.with_value(|value| matches!(value, Some(ObjectValue::Dictionary(_))));
+        if !is_dictionary {
+            return Ok(false);
+        }
+        if !type_name.is_empty()
+            && !self
+                .resolved_get_key(b"/Type")?
+                .try_is_name_and_equals(type_name)?
+        {
+            return Ok(false);
+        }
+        if !subtype_name.is_empty()
+            && !self
+                .resolved_get_key(b"/Subtype")?
                 .try_is_name_and_equals(subtype_name)?
         {
             return Ok(false);
@@ -4100,6 +4184,14 @@ impl ObjectHandle {
     /// Propagates resolution failures.
     pub fn try_get_key(&self, key: &[u8]) -> Result<ObjectHandle> {
         self.try_dereference()?;
+        self.resolved_get_key(key)
+    }
+
+    /// Return a dictionary child from a receiver already resolved by the
+    /// caller. Missing-key and non-dictionary descriptions intentionally match
+    /// [`Self::try_get_key`]; only the receiver's redundant resolution probe is
+    /// omitted.
+    pub(crate) fn resolved_get_key(&self, key: &[u8]) -> Result<ObjectHandle> {
         let (is_dictionary, child) = self.with_value(|value| match value {
             Some(ObjectValue::Dictionary(entries)) => (true, entries.get(key).cloned()),
             _ => (false, None),

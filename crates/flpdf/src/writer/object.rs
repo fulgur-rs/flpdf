@@ -2812,6 +2812,112 @@ fn snapshot_unparse_container(value: &ObjectValue) -> Option<UnparseContainer> {
     }
 }
 
+fn is_direct_scalar_value(value: &ObjectValue) -> bool {
+    matches!(
+        value,
+        ObjectValue::Null
+            | ObjectValue::Boolean(_)
+            | ObjectValue::Integer(_)
+            | ObjectValue::Real(_)
+            | ObjectValue::RealLiteral { .. }
+            | ObjectValue::Name(_)
+            | ObjectValue::String(_)
+            | ObjectValue::Operator(_)
+            | ObjectValue::InlineImage(_)
+    )
+}
+
+fn is_direct_scalar_handle(handle: &ObjectHandle) -> bool {
+    // `is_direct()` is not the predicate this fast path needs. qpdf treats
+    // object number 0 as non-indirect, so a handle carrying a raw `0 G`
+    // identity answers `is_direct() == true` while
+    // `write_child_with_dynamic_ref_map_and_string_writer` emits `null` for
+    // it (`!object_gen.is_indirect()`). Require the absence of any raw
+    // identity so such a child keeps taking the slow path and the two routes
+    // agree byte for byte.
+    handle.qpdf_obj_gen().is_none()
+        && handle.with_value(|value| value.is_some_and(is_direct_scalar_value))
+}
+
+fn write_direct_scalar_with_string_writer<F>(
+    handle: &ObjectHandle,
+    out: &mut OutputSink<'_>,
+    write_string: &mut F,
+) -> Result<()>
+where
+    F: FnMut(&mut OutputSink<'_>, &[u8]) -> Result<()> + ?Sized,
+{
+    handle.with_value(|value| match value {
+        Some(ObjectValue::String(bytes)) => write_string(out, bytes),
+        Some(value) => unparse_object_value(value, out),
+        None => out.write_bytes(b"null"), // cov:ignore: is_direct_scalar_handle requires a concrete direct value before this helper runs.
+    })
+}
+
+fn try_write_direct_scalar_container_with_string_writer<F>(
+    value: &ObjectValue,
+    out: &mut OutputSink<'_>,
+    write_string: &mut F,
+) -> Result<bool>
+where
+    F: FnMut(&mut OutputSink<'_>, &[u8]) -> Result<()> + ?Sized,
+{
+    match value {
+        ObjectValue::Array(children) if children.iter().all(is_direct_scalar_handle) => {
+            out.write_bytes(b"[")?;
+            for child in children {
+                out.write_bytes(b" ")?;
+                write_direct_scalar_with_string_writer(child, out, write_string)?;
+            }
+            out.write_bytes(b" ]")?;
+            Ok(true)
+        }
+        ObjectValue::Dictionary(entries)
+            if entries
+                .iter()
+                .all(|(_, child)| is_direct_scalar_handle(child)) =>
+        {
+            let is_signature = entries
+                .iter()
+                .find(|(key, _)| key.as_slice() == b"/Type")
+                .is_some_and(|(_, value)| value.as_name().as_deref() == Some(b"Sig"));
+            let has_byte_range = is_signature
+                && entries
+                    .iter()
+                    .find(|(key, _)| key.as_slice() == b"/ByteRange")
+                    .is_some_and(|(_, value)| !value.is_null());
+            let force_hex_contents = is_signature && has_byte_range;
+
+            out.write_bytes(b"<<")?;
+            for (key, child) in entries {
+                if child.is_null() {
+                    continue;
+                }
+                out.write_bytes(b" ")?;
+                write_dictionary_key(out, key)?;
+                out.write_bytes(b" ")?;
+                if force_hex_contents
+                    && key.as_slice() == b"/Contents"
+                    && child.with_value(|value| -> Result<bool> {
+                        if let Some(ObjectValue::String(bytes)) = value {
+                            crate::pdf_syntax::write_hex_string(out, bytes)?;
+                            Ok(true)
+                        } else {
+                            Ok(false)
+                        }
+                    })?
+                {
+                    continue;
+                }
+                write_direct_scalar_with_string_writer(child, out, write_string)?;
+            }
+            out.write_bytes(b" >>")?;
+            Ok(true)
+        }
+        _ => Ok(false),
+    }
+}
+
 fn unparse_container(container: UnparseContainer, out: &mut OutputSink<'_>) -> Result<()> {
     match container {
         UnparseContainer::Array(children) => {
@@ -3428,7 +3534,9 @@ where
         handle.try_dereference()?;
         let container = handle.with_value(|value| match value {
             Some(value) => {
-                if let Some(container) = snapshot_unparse_container(value) {
+                if try_write_direct_scalar_container_with_string_writer(value, out, write_string)? {
+                    Ok(None)
+                } else if let Some(container) = snapshot_unparse_container(value) {
                     Ok(Some(container))
                 } else {
                     unparse_object_value_with_dynamic_ref_map_and_string_writer(
@@ -5726,6 +5834,53 @@ mod tests {
         );
     }
 
+    /// A raw object-zero identity must keep taking the slow path.
+    ///
+    /// qpdf treats object number 0 as non-indirect, so such a handle answers
+    /// `is_direct() == true`; the child writer nonetheless emits `null` for
+    /// it (`!object_gen.is_indirect()`). If the direct-scalar fast path
+    /// accepted it, the array would serialize the value instead and the two
+    /// routes would disagree byte for byte.
+    #[test]
+    fn object_zero_child_serializes_as_null_through_the_scalar_container_route() -> Result<()> {
+        let zero = ObjectHandle::new_indirect_unresolved(ObjectRef::new(0, 0), -1);
+        zero.set_resolved(ObjectValue::Integer(42));
+        assert!(zero.is_direct(), "qpdf reports object zero as non-indirect");
+        assert!(
+            zero.qpdf_obj_gen().is_some(),
+            "the raw identity survives that predicate"
+        );
+
+        // Include a direct string so the slow path's string callback runs on
+        // the same array, pinning that the fallback keeps using it.
+        let array = ObjectHandle::array(vec![
+            zero,
+            ObjectHandle::integer(7),
+            ObjectHandle::string(b"s".to_vec()),
+        ]);
+        let mut map = |_: &ObjectHandle| Ok::<ObjectRef, Error>(ObjectRef::new(1, 0));
+        let mut strings = |out: &mut OutputSink<'_>, value: &[u8]| {
+            crate::pdf_syntax::write_string_value(out, value)
+        };
+        let mut direct_stream_writer = DefaultDynamicDirectStreamWriter {
+            newline_before_endstream: None,
+            qdf_mode: false,
+        };
+        let mut bytes = Vec::new();
+        super::super::output::with_buffer_sink(&mut bytes, |out| {
+            write_child_with_dynamic_ref_map_and_string_writer(
+                &array,
+                out,
+                &mut map,
+                &BTreeSet::new(),
+                &mut strings,
+                &mut direct_stream_writer,
+            )
+        })?;
+        assert_eq!(bytes, b"[ null 7 (s) ]");
+        Ok(())
+    }
+
     #[test]
     fn qdf_dynamic_writer_walks_direct_streams_and_skips_null_or_removed_children() -> Result<()> {
         let removed = ObjectHandle::new_indirect_unresolved(ObjectRef::new(9, 0), -1);
@@ -6394,6 +6549,66 @@ mod tests {
         assert!(text.contains("/ByteRange [\n"));
         assert!(text.contains("/Contents <00ff>"));
         assert!(text.contains("/Label (label)"));
+        Ok(())
+    }
+
+    #[test]
+    fn dynamic_string_writer_fast_path_keeps_signature_hex_and_drops_nulls() -> Result<()> {
+        let signature = ObjectHandle::dictionary(vec![
+            (b"/Type".to_vec(), ObjectHandle::name(b"Sig".to_vec())),
+            (b"/ByteRange".to_vec(), ObjectHandle::integer(0)),
+            (b"/Contents".to_vec(), ObjectHandle::string(vec![0, 0xff])),
+            (b"/Label".to_vec(), ObjectHandle::string(b"label".to_vec())),
+            (b"/Null".to_vec(), ObjectHandle::null()),
+        ]);
+        let mut output = Vec::new();
+        let mut map = |_: &ObjectHandle| Ok::<ObjectRef, Error>(ObjectRef::new(1, 0));
+        let mut strings = |out: &mut OutputSink<'_>, value: &[u8]| {
+            crate::pdf_syntax::write_string_value(out, value)
+        };
+        let mut direct_stream_writer = DefaultDynamicDirectStreamWriter {
+            newline_before_endstream: None,
+            qdf_mode: false,
+        };
+
+        super::super::output::with_buffer_sink(&mut output, |out| {
+            write_object_with_dynamic_ref_map_and_string_writer_and_direct_stream_writer(
+                &signature,
+                out,
+                &mut map,
+                &BTreeSet::new(),
+                &mut strings,
+                &mut direct_stream_writer,
+            )
+        })?;
+
+        let text = String::from_utf8(output).expect("signature output is ASCII");
+        assert!(text.contains("/Contents <00ff>"));
+        assert!(text.contains("/Label (label)"));
+        assert!(!text.contains("/Null"));
+
+        let non_string_contents = ObjectHandle::dictionary(vec![
+            (b"/Type".to_vec(), ObjectHandle::name(b"Sig".to_vec())),
+            (b"/ByteRange".to_vec(), ObjectHandle::integer(0)),
+            (b"/Contents".to_vec(), ObjectHandle::integer(7)),
+        ]);
+        let mut fallback_output = Vec::new();
+        let mut fallback_map = |_: &ObjectHandle| Ok::<ObjectRef, Error>(ObjectRef::new(1, 0));
+        let mut fallback_stream_writer = DefaultDynamicDirectStreamWriter {
+            newline_before_endstream: None,
+            qdf_mode: false,
+        };
+        super::super::output::with_buffer_sink(&mut fallback_output, |out| {
+            write_object_with_dynamic_ref_map_and_string_writer_and_direct_stream_writer(
+                &non_string_contents,
+                out,
+                &mut fallback_map,
+                &BTreeSet::new(),
+                &mut strings,
+                &mut fallback_stream_writer,
+            )
+        })?;
+        assert!(String::from_utf8_lossy(&fallback_output).contains("/Contents 7"));
         Ok(())
     }
 

@@ -476,7 +476,7 @@ impl Optimization {
                 crate::writer::rewrite_renumber::ensure_canonical_owner(pdf, &pending.object)?;
             }
             pending.object.try_dereference()?;
-            if pending.object.try_is_null()? {
+            if pending.object.is_null() {
                 if pending.via_array {
                     if let Some(object_gen) = pending.object.qpdf_obj_gen() {
                         if object_gen.get_obj() > 0 && visited.insert(object_gen) {
@@ -487,7 +487,7 @@ impl Optimization {
                 continue;
             }
 
-            if is_page(&pending.object)? && !pending.top {
+            if is_page_resolved(&pending.object)? && !pending.top {
                 continue;
             }
             if let Some(object_gen) = pending.object.qpdf_obj_gen() {
@@ -505,7 +505,7 @@ impl Optimization {
                 pending.inline_depth
             };
 
-            if let Some(items) = pending.object.try_as_array()? {
+            if let Some(items) = pending.object.as_array() {
                 for item in items.into_iter().rev() {
                     stack.push(Pending {
                         object: item,
@@ -521,7 +521,8 @@ impl Optimization {
             if let Some(stream_dict) = pending.object.as_stream_dict() {
                 let skip_level =
                     skip_stream_parameters(pending.object.qpdf_obj_gen(), &pending.object)?;
-                for key in stream_dict.try_get_keys()?.into_iter().rev() {
+                stream_dict.try_dereference()?;
+                for key in stream_dict.resolved_get_visible_keys()?.into_iter().rev() {
                     if (skip_level >= 1 && key == b"/Length")
                         || (skip_level >= 2
                             && matches!(key.as_slice(), b"/Filter" | b"/DecodeParms"))
@@ -529,7 +530,7 @@ impl Optimization {
                         continue;
                     }
                     stack.push(Pending {
-                        object: stream_dict.try_get_key(&key)?,
+                        object: stream_dict.resolved_get_key(&key)?,
                         user: pending.user.clone(),
                         top: false,
                         via_array: false,
@@ -539,9 +540,19 @@ impl Optimization {
                 continue;
             }
 
-            if pending.object.try_is_dictionary()? {
-                let page = is_page(&pending.object)?;
-                for key in pending.object.try_get_keys()?.into_iter().rev() {
+            if pending.object.with_value(|value| {
+                matches!(
+                    value,
+                    Some(crate::object_handle::ObjectValue::Dictionary(_))
+                )
+            }) {
+                let page = is_page_resolved(&pending.object)?;
+                for key in pending
+                    .object
+                    .resolved_get_visible_keys()?
+                    .into_iter()
+                    .rev()
+                {
                     if page && key == b"/Parent" {
                         continue;
                     }
@@ -551,7 +562,7 @@ impl Optimization {
                         pending.user.clone()
                     };
                     stack.push(Pending {
-                        object: pending.object.try_get_key(&key)?,
+                        object: pending.object.resolved_get_key(&key)?,
                         user: child_user,
                         top: false,
                         via_array: false,
@@ -582,8 +593,8 @@ struct Pending {
     inline_depth: usize,
 }
 
-fn is_page(object: &ObjectHandle) -> crate::Result<bool> {
-    object.try_is_dictionary_of_type(b"Page", b"")
+fn is_page_resolved(object: &ObjectHandle) -> crate::Result<bool> {
+    object.resolved_is_dictionary_of_type(b"Page", b"")
 }
 
 fn empty_qpdf_obj_gens() -> &'static BTreeSet<QpdfObjGen> {
@@ -619,6 +630,197 @@ mod tests {
         _handle: &ObjectHandle,
     ) -> Result<u8> {
         Ok(0)
+    }
+
+    #[test]
+    fn object_user_walk_reuses_the_resolved_receiver_boundary() {
+        let pdf = Pdf::empty().expect("create owner for direct test values");
+        let child = ObjectHandle::dictionary(vec![
+            (b"/Type".to_vec(), ObjectHandle::name(b"Font".to_vec())),
+            (b"/Value".to_vec(), ObjectHandle::integer(7)),
+        ]);
+        let root = ObjectHandle::dictionary(vec![
+            (b"/Type".to_vec(), ObjectHandle::name(b"Catalog".to_vec())),
+            (b"/Child".to_vec(), child),
+        ]);
+        let mut optimization = Optimization::default();
+
+        ObjectHandle::reset_try_dereference_call_count();
+        optimization
+            .update_object_maps(&pdf, ObjectUser::Root, root, &mut no_stream_parameter_skip)
+            .expect("walk direct dictionary");
+
+        assert_eq!(
+            ObjectHandle::try_dereference_call_count(),
+            13,
+            "resolved receiver was probed too many times"
+        );
+    }
+
+    #[test]
+    fn resolved_receiver_helpers_keep_type_and_visible_key_semantics() {
+        let typed = ObjectHandle::dictionary(vec![
+            (b"/Type".to_vec(), ObjectHandle::name(b"Annot".to_vec())),
+            (b"/Subtype".to_vec(), ObjectHandle::name(b"Link".to_vec())),
+            (b"/Null".to_vec(), ObjectHandle::null()),
+        ]);
+        typed.try_dereference().expect("direct dictionary resolves");
+
+        assert!(typed
+            .resolved_is_dictionary_of_type(b"Annot", b"Link")
+            .expect("type probe"));
+        assert!(!typed
+            .resolved_is_dictionary_of_type(b"Annot", b"Widget")
+            .expect("mismatching subtype probe"));
+        assert!(!typed
+            .resolved_is_dictionary_of_type(b"Page", b"")
+            .expect("mismatching type probe"));
+        assert_eq!(
+            typed.resolved_get_keys().expect("visible keys"),
+            BTreeSet::from([b"/Subtype".to_vec(), b"/Type".to_vec()])
+        );
+        assert_eq!(
+            typed
+                .resolved_get_visible_keys()
+                .expect("key-only visible keys"),
+            vec![b"/Subtype".to_vec(), b"/Type".to_vec()]
+        );
+
+        let scalar = ObjectHandle::integer(1);
+        scalar.try_dereference().expect("direct scalar resolves");
+        let error = scalar
+            .resolved_get_visible_keys()
+            .expect_err("non-dictionary visible keys warn like qpdf");
+        assert!(error.to_string().contains("operation for dictionary"));
+
+        let pdf = Pdf::empty().expect("create a warning context");
+        let contextual_scalar = pdf
+            .make_indirect_from_object_handle(ObjectHandle::integer(2))
+            .expect("contextual scalar");
+        contextual_scalar
+            .try_dereference()
+            .expect("contextual scalar resolves");
+        assert!(contextual_scalar
+            .resolved_get_visible_keys()
+            .expect("contextual non-dictionary visible keys")
+            .is_empty());
+
+        let missing_type =
+            ObjectHandle::dictionary(vec![(b"/Child".to_vec(), ObjectHandle::integer(3))]);
+        missing_type
+            .try_dereference()
+            .expect("missing-type dictionary resolves");
+        assert!(!missing_type
+            .resolved_is_dictionary_of_type(b"Page", b"")
+            .expect("missing type probe"));
+        assert_eq!(
+            missing_type
+                .resolved_get_key(b"/Missing")
+                .expect("missing key")
+                .as_integer(),
+            None
+        );
+    }
+
+    #[test]
+    fn object_user_walk_preserves_page_parent_thumb_stream_and_array_boundaries() {
+        let pdf = Pdf::empty().expect("create owner for indirect test values");
+        let parent = pdf
+            .make_indirect_from_object_handle(ObjectHandle::integer(1))
+            .expect("parent object");
+        let null_child = pdf
+            .make_indirect_from_object_handle(ObjectHandle::null())
+            .expect("null child");
+        let stream_length = pdf
+            .make_indirect_from_object_handle(ObjectHandle::integer(2))
+            .expect("stream length");
+        let stream_filter = pdf
+            .make_indirect_from_object_handle(ObjectHandle::name(b"FlateDecode".to_vec()))
+            .expect("stream filter");
+        let stream_decode_parms = pdf
+            .make_indirect_from_object_handle(ObjectHandle::dictionary(Vec::new()))
+            .expect("stream decode parameters");
+        let payload = pdf
+            .make_indirect_from_object_handle(ObjectHandle::integer(9))
+            .expect("stream payload");
+        let thumb_payload = pdf
+            .make_indirect_from_object_handle(ObjectHandle::integer(10))
+            .expect("thumbnail payload");
+        let stream = ObjectHandle::stream(
+            ObjectHandle::dictionary(vec![
+                (b"/Length".to_vec(), stream_length.clone()),
+                (b"/Filter".to_vec(), stream_filter.clone()),
+                (b"/DecodeParms".to_vec(), stream_decode_parms.clone()),
+                (b"/Payload".to_vec(), payload.clone()),
+            ]),
+            Rc::new(Vec::new()),
+        );
+        let thumb = pdf
+            .make_indirect_from_object_handle(ObjectHandle::array(vec![thumb_payload.clone()]))
+            .expect("thumbnail array");
+        let page = pdf
+            .make_indirect_from_object_handle(ObjectHandle::dictionary(vec![
+                (b"/Type".to_vec(), ObjectHandle::name(b"Page".to_vec())),
+                (b"/Parent".to_vec(), parent.clone()),
+                (b"/Thumb".to_vec(), thumb.clone()),
+                (
+                    b"/Array".to_vec(),
+                    ObjectHandle::array(vec![payload.clone()]),
+                ),
+                (b"/Null".to_vec(), null_child.clone()),
+                (b"/Stream".to_vec(), stream),
+            ]))
+            .expect("page object");
+        let page_ref = page.object_ref().expect("page identity");
+        let parent_ref = parent.object_ref().expect("parent identity");
+        let null_ref = null_child.object_ref().expect("null identity");
+        let length_ref = stream_length.object_ref().expect("length identity");
+        let filter_ref = stream_filter.object_ref().expect("filter identity");
+        let decode_parms_ref = stream_decode_parms
+            .object_ref()
+            .expect("decode params identity");
+        let payload_ref = payload.object_ref().expect("payload identity");
+        let thumb_payload_ref = thumb_payload
+            .object_ref()
+            .expect("thumbnail payload identity");
+        let thumb_ref = thumb.object_ref().expect("thumbnail identity");
+
+        let mut optimization = Optimization::default();
+        let mut skip_stream_parameters = |_: Option<QpdfObjGen>, _: &ObjectHandle| Ok(2);
+        optimization
+            .update_object_maps(&pdf, ObjectUser::Page(0), page, &mut skip_stream_parameters)
+            .expect("walk page graph");
+
+        assert!(optimization
+            .raw_objects_for(&ObjectUser::Page(0))
+            .contains(&QpdfObjGen::try_from_object_ref(page_ref).unwrap()));
+        assert!(!optimization
+            .raw_objects_for(&ObjectUser::Page(0))
+            .contains(&QpdfObjGen::try_from_object_ref(parent_ref).unwrap()));
+        assert!(!optimization
+            .raw_objects_for(&ObjectUser::Page(0))
+            .contains(&QpdfObjGen::try_from_object_ref(null_ref).unwrap()));
+        assert!(!optimization
+            .raw_objects_for(&ObjectUser::Page(0))
+            .contains(&QpdfObjGen::try_from_object_ref(length_ref).unwrap()));
+        assert!(!optimization
+            .raw_objects_for(&ObjectUser::Page(0))
+            .contains(&QpdfObjGen::try_from_object_ref(filter_ref).unwrap()));
+        assert!(!optimization
+            .raw_objects_for(&ObjectUser::Page(0))
+            .contains(&QpdfObjGen::try_from_object_ref(decode_parms_ref).unwrap()));
+        assert!(optimization
+            .raw_objects_for(&ObjectUser::Page(0))
+            .contains(&QpdfObjGen::try_from_object_ref(payload_ref).unwrap()));
+        assert!(optimization
+            .raw_objects_for(&ObjectUser::Thumbnail(0))
+            .contains(&QpdfObjGen::try_from_object_ref(thumb_ref).unwrap()));
+        assert!(optimization
+            .raw_users_for(QpdfObjGen::try_from_object_ref(payload_ref).unwrap())
+            .contains(&ObjectUser::Page(0)));
+        assert!(optimization
+            .raw_users_for(QpdfObjGen::try_from_object_ref(thumb_payload_ref).unwrap())
+            .contains(&ObjectUser::Thumbnail(0)));
     }
 
     #[test]
