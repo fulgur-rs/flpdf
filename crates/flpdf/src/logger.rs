@@ -9,6 +9,7 @@
 
 use crate::pipeline::{Discard, Pipeline, PipelineHandle, PipelineResult, PlOStream};
 use crate::{Error, Result};
+use std::collections::HashMap;
 use std::fmt;
 use std::io::{self, Write};
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -164,7 +165,7 @@ struct LoggerState {
     warn: Option<PipelineHandle>,
     error: PipelineHandle,
     // qpdf-deviation: qpdf has no thread-scoped overlay on the default logger; its answer to per-thread capture is a separate QPDFLogger instance (`include/qpdf/QPDFLogger.hh:33-42`), which the contextless `defaultLogger()->getError()` warning path cannot use
-    error_capture: Option<(ThreadId, PipelineHandle)>,
+    error_capture: HashMap<ThreadId, PipelineHandle>,
     save: Option<PipelineHandle>,
     stdout_used: Arc<AtomicBool>,
     stdout_text_mode: Arc<AtomicBool>,
@@ -204,12 +205,21 @@ pub struct QPDFLogger {
 
 struct ErrorCaptureRestore {
     shared: Arc<LoggerShared>,
-    previous: Option<(ThreadId, PipelineHandle)>,
+    owner: ThreadId,
+    previous: Option<PipelineHandle>,
 }
 
 impl Drop for ErrorCaptureRestore {
     fn drop(&mut self) {
-        self.shared.lock().error_capture = self.previous.take();
+        let mut state = self.shared.lock();
+        match self.previous.take() {
+            Some(previous) => {
+                state.error_capture.insert(self.owner, previous);
+            }
+            None => {
+                state.error_capture.remove(&self.owner);
+            }
+        }
     }
 }
 
@@ -248,7 +258,7 @@ impl QPDFLogger {
             info: stdout,
             warn: None,
             error: stderr,
-            error_capture: None,
+            error_capture: HashMap::new(),
             save: None,
             stdout_used,
             stdout_text_mode,
@@ -307,9 +317,8 @@ impl QPDFLogger {
         // so a qtest capture cannot swallow a concurrent thread's warnings
         Ok(state
             .error_capture
-            .as_ref()
-            .filter(|(owner, _)| *owner == current)
-            .map(|(_, pipeline)| pipeline.clone())
+            .get(&current)
+            .cloned()
             .unwrap_or_else(|| state.error.clone()))
         // qpdf-deviation-end
     }
@@ -322,13 +331,11 @@ impl QPDFLogger {
     /// sink for its owner thread while leaving the normal process sink visible
     /// to every other thread.
     pub fn with_error_capture<T>(&self, pipeline: PipelineHandle, body: impl FnOnce() -> T) -> T {
-        let previous = self
-            .shared
-            .lock()
-            .error_capture
-            .replace((std::thread::current().id(), pipeline));
+        let owner = std::thread::current().id();
+        let previous = self.shared.lock().error_capture.insert(owner, pipeline);
         let restore = ErrorCaptureRestore {
             shared: Arc::clone(&self.shared),
+            owner,
             previous,
         };
         let result = body();
