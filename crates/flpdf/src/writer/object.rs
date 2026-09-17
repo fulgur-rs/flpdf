@@ -3526,14 +3526,7 @@ where
         handle.try_dereference()?;
         let container = handle.with_value(|value| match value {
             Some(value) => {
-                let mut write_string = |out: &mut OutputSink<'_>, bytes: &[u8]| {
-                    crate::pdf_syntax::write_string_value(out, bytes)
-                };
-                if try_write_direct_scalar_container_with_string_writer(
-                    value,
-                    out,
-                    &mut write_string,
-                )? {
+                if try_write_direct_scalar_container_with_string_writer(value, out, write_string)? {
                     Ok(None)
                 } else if let Some(container) = snapshot_unparse_container(value) {
                     Ok(Some(container))
@@ -3541,7 +3534,7 @@ where
                     unparse_object_value_with_dynamic_ref_map_and_string_writer(
                         value,
                         out,
-                        &mut write_string,
+                        write_string,
                     )
                     .map(|()| None)
                 }
