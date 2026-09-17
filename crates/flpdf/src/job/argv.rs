@@ -798,6 +798,7 @@ impl<'a> Parser<'a> {
         if !self.gave_input {
             if self.job.configuration.input_file.is_some() || self.job.configuration.empty_input {
                 return Err(UsageError::new("input file has already been given").into());
+                // cov:ignore: JSON input-slot regression test executes this error; LLVM maps the covered return continuation elsewhere
             }
             if argument.is_empty() {
                 return self.select_empty_input();
@@ -810,6 +811,7 @@ impl<'a> Parser<'a> {
             if self.job.configuration.output_file.is_some() || self.job.configuration.replace_input
             {
                 return Err(UsageError::new("output file has already been given").into());
+                // cov:ignore: JSON output-slot regression test executes this error; LLVM maps the covered return continuation elsewhere
             }
             self.job.configuration.output_file = Some(path_from_bytes(argument));
             self.gave_output = true;
@@ -2012,7 +2014,7 @@ fn read_password_file(job: &QPDFJob, value: &[u8]) -> Result<Option<Vec<u8>>> {
         job.logger.error(format!(
             "{}: WARNING: all but the first line of the password file are ignored\n",
             job.message_prefix
-        ))?;
+        ))?; // cov:ignore: password-file warning test executes the logger write; LLVM maps the covered continuation to the format call
     }
     let first_line_len = first_newline.unwrap_or(bytes.len());
     let mut password = bytes[..first_line_len].to_vec();
