@@ -336,6 +336,11 @@ impl QPDFJob {
             }
 
             let mut writer = PdfWriter::new(&mut output);
+            // QPDFWriter opens the destination in its constructor, before
+            // qpdf applies setWriterOptions (`QPDFWriter.cc:70-95`;
+            // `QPDFJob.cc:3019-3021`). Preserve that failure ordering so an
+            // unusable output path wins over write-time crypto validation.
+            writer.set_output_file(&output_path)?;
             // qpdf invokes setWriterOptions for the first fresh chunk only
             // after the split resource/page-copy work above
             // (`QPDFJob.cc:2976-3022`). Normalize passwords here so the
@@ -351,7 +356,6 @@ impl QPDFJob {
                 writer.set_deterministic_id(true);
             }
             self.configure_writer_progress(&mut writer);
-            writer.set_output_file(&output_path)?;
             writer.write()?;
             // qpdf reports each chunk from inside this per-chunk loop
             // (`libqpdf/QPDFJob.cc:3019-3021`), immediately after that
