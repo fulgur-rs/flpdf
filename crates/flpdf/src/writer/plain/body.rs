@@ -2334,6 +2334,21 @@ fn canonical_stream_filter_probe(
         )?
     // cov:ignore-end
     else {
+        // qpdf's willFilterStream still pipes an unfiltered stream once. The
+        // raw pipe is observable through codec warnings and InputSource's last
+        // offset even though no filter stage is requested.
+        let mut discard = crate::pipeline::Discard;
+        let mut filtering_attempted = false;
+        handle
+            .pipe_stream_data(
+                &mut discard,
+                &mut filtering_attempted,
+                0,
+                crate::writer::DecodeLevel::None,
+                false,
+                true,
+            )
+            .map_err(|error| stream_data_error(handle, error))?;
         return Ok(false);
     };
 
@@ -2351,7 +2366,7 @@ fn canonical_stream_filter_probe(
                 &mut filtering_attempted,
                 attempt_encode_flags,
                 attempt_decode_level,
-                true,
+                false,
                 attempt == 1,
             )
             .map_err(|error| stream_data_error(handle, error))?;
@@ -2703,7 +2718,7 @@ fn planned_member_body_violation(
 #[cfg(test)]
 mod final_handle_tests {
     use super::{
-        canonical_stream_output_for_rewrite,
+        canonical_stream_filter_probe_for_linearization, canonical_stream_output_for_rewrite,
         emit_content_container_from_handle_with_qpdf_obj_gen_map,
         emit_content_container_from_handle_with_ref_map,
         emit_content_container_from_handle_with_ref_map_and_string_writer, object_streams,
@@ -2716,6 +2731,53 @@ mod final_handle_tests {
     use std::cell::RefCell;
     use std::collections::BTreeSet;
     use std::rc::Rc;
+
+    fn unfiltered_stream_probe_pdf() -> Vec<u8> {
+        let mut pdf = b"%PDF-1.4\n".to_vec();
+        let object_start = |pdf: &Vec<u8>| pdf.len();
+        let mut offsets = Vec::new();
+        offsets.push(object_start(&pdf));
+        pdf.extend_from_slice(b"1 0 obj\n<< /Type /Catalog /Pages 2 0 R >>\nendobj\n");
+        offsets.push(object_start(&pdf));
+        pdf.extend_from_slice(b"2 0 obj\n<< /Type /Pages /Kids [3 0 R] /Count 1 >>\nendobj\n");
+        offsets.push(object_start(&pdf));
+        pdf.extend_from_slice(
+            b"3 0 obj\n<< /Type /Page /Parent 2 0 R /MediaBox [0 0 10 10] /Contents 4 0 R >>\nendobj\n",
+        );
+        offsets.push(object_start(&pdf));
+        pdf.extend_from_slice(
+            b"4 0 obj\n<< /Length 3 /Filter /FlateDecode >>\nstream\nabc\nendstream\nendobj\n",
+        );
+        let xref = pdf.len();
+        pdf.extend_from_slice(b"xref\n0 5\n0000000000 65535 f \n");
+        for offset in offsets {
+            pdf.extend_from_slice(format!("{offset:010} 00000 n \n").as_bytes());
+        }
+        pdf.extend_from_slice(
+            format!("trailer\n<< /Size 5 /Root 1 0 R >>\nstartxref\n{xref}\n%%EOF\n").as_bytes(),
+        );
+        pdf
+    }
+
+    #[test]
+    fn linearization_probe_pipes_an_unfiltered_stream_like_qpdf() {
+        let mut pdf = crate::Pdf::open(std::io::Cursor::new(unfiltered_stream_probe_pdf()))
+            .expect("probe PDF");
+        let stream = pdf.get_object_handle(ObjectRef::new(4, 0));
+        stream.try_dereference().expect("resolve stream framing");
+        let before = pdf.source_last_offset();
+        let options = WriterOptions::default();
+
+        assert!(
+            !canonical_stream_filter_probe_for_linearization(&stream, &options, false)
+                .expect("qpdf raw stream probe")
+        );
+        assert_ne!(
+            pdf.source_last_offset(),
+            before,
+            "willFilterStream must pipe even when no filter is selected"
+        );
+    }
 
     #[test]
     fn content_container_emits_direct_streams_and_uses_the_handle_string_writer() {

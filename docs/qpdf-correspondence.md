@@ -3728,6 +3728,17 @@ stream fixture でも、`--stream-data=preserve` の出力を qpdf 11.9.0 と同
 `crates/flpdf/tests/cmp_diff_zero_tests.rs::preserve_external_file_stream_matches_qpdf_11_9`
 が、in-body payload、直値 `/Length`、外部参照キーの保持をまとめて固定する。
 
+### Linearized `willFilterStream` probe parity (`flpdf-q2nka`, 2026-09-17)
+
+`QPDFWriter::willFilterStream` は、filter planが空でも raw `pipeStreamData` を1回実行し、
+planがある場合はwarningを配送したまま2回試行する（`QPDFWriter.cc:1254-1315`）。
+flpdfのlinearization probeはこの境界で早期return・warning抑止をしていたため、
+壊れたstreamのdecode warning回数と最後のsource-read位置がqpdfより1 path少なかった。
+`writer/plain/body.rs::canonical_stream_filter_probe` をqpdfのraw pipe/retry境界へ揃え、
+`broken-lzw.pdf`を含む10 fixtureでlinearizeのstderr/statusを、qpdf-zlib-compatでは
+出力bytesもqpdf 11.9.0と一致させた。plain側のlegacy `isDataModified` early returnは
+このlinearized consumerのscope外である。
+
 ### `QPDF::getRoot` の test_driver consumer
 
 `libqpdf/QPDF.cc:2355-2368` の `QPDF::getRoot` は trailer の `/Root` を
