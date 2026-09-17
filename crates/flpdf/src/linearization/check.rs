@@ -350,21 +350,19 @@ fn first_page_source_extent<R: Read + Seek>(pdf: &mut Pdf<R>) -> Result<(i64, i6
 
     let outlines_in_first_page = {
         let mut use_outlines_with_outlines = false;
-        if let Some(root_ref) = pdf.root_ref() {
-            let root = pdf.get_object_handle(root_ref);
-            root.try_dereference()?;
-            if let Some(root_dict) = root.try_as_dictionary()? {
-                let page_mode = root_dict.get(b"/PageMode" as &[u8]).cloned();
-                let use_outlines = if let Some(page_mode) = page_mode {
-                    page_mode.try_as_name()?.as_deref() == Some(b"UseOutlines")
-                } else {
-                    false
-                };
-                if use_outlines {
-                    use_outlines_with_outlines = root_dict.contains_key(b"/Outlines" as &[u8]);
-                }
-            } // cov:ignore: llvm maps the root-dictionary cleanup to this brace
-        } // cov:ignore: llvm maps the optional root-ref cleanup to this brace
+        let root = pdf.root_handle()?;
+        root.try_dereference()?;
+        if let Some(root_dict) = root.try_as_dictionary()? {
+            let page_mode = root_dict.get(b"/PageMode" as &[u8]).cloned();
+            let use_outlines = if let Some(page_mode) = page_mode {
+                page_mode.try_as_name()?.as_deref() == Some(b"UseOutlines")
+            } else {
+                false
+            };
+            if use_outlines {
+                use_outlines_with_outlines = root_dict.contains_key(b"/Outlines" as &[u8]);
+            }
+        } // cov:ignore: llvm maps the root-dictionary cleanup to this brace
         use_outlines_with_outlines
     };
 
@@ -439,21 +437,13 @@ fn uncompressed_object_ref(
 }
 
 fn root_outlines_ref<R: Read + Seek>(pdf: &mut Pdf<R>) -> Result<Option<ObjectRef>> {
-    let Some(root_ref) = pdf.root_ref() else {
-        return Ok(None);
-    };
-    let root = pdf.get_object_handle(root_ref);
-    root.try_dereference()?;
+    let root = pdf.root_handle()?;
     let outlines = root.try_get_key(b"/Outlines")?;
     Ok(outlines.object_ref())
 }
 
 fn outlines_in_first_page<R: Read + Seek>(pdf: &mut Pdf<R>) -> Result<bool> {
-    let Some(root_ref) = pdf.root_ref() else {
-        return Ok(false);
-    };
-    let root = pdf.get_object_handle(root_ref);
-    root.try_dereference()?;
+    let root = pdf.root_handle()?;
     let page_mode = root.try_get_key(b"/PageMode")?;
     page_mode.try_dereference()?;
     let outlines = root.try_get_key(b"/Outlines")?;

@@ -55,6 +55,42 @@ fn run_flpdf_owned(args: &[String]) -> Output {
         .expect("flpdf should spawn")
 }
 
+#[test]
+fn top_level_linearize_direct_root_errors_match_qpdf() {
+    if !qpdf_available() {
+        return;
+    }
+
+    for name in ["direct-root-adbe.pdf", "direct-root-one-page.pdf"] {
+        let temp = tempfile::tempdir().expect("temporary directory should exist");
+        let input = fixture(name);
+        let output = temp.path().join("out.pdf");
+        let args = vec![
+            "--deterministic-id".to_owned(),
+            "--linearize".to_owned(),
+            input
+                .to_str()
+                .expect("fixture path should be UTF-8")
+                .to_owned(),
+            output
+                .to_str()
+                .expect("output path should be UTF-8")
+                .to_owned(),
+        ];
+
+        let expected = run_qpdf_owned(&args);
+        let actual = run_flpdf_owned(&args);
+
+        assert_eq!(
+            actual.status.code(),
+            expected.status.code(),
+            "{name} status"
+        );
+        assert_eq!(actual.stdout, expected.stdout, "{name} stdout");
+        assert_eq!(actual.stderr, expected.stderr, "{name} stderr");
+    }
+}
+
 fn assert_output_matches(actual: &Output, expected: &Output) {
     assert_eq!(actual.status.code(), expected.status.code());
     assert_eq!(actual.stdout, expected.stdout);
