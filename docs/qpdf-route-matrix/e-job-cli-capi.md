@@ -458,15 +458,19 @@ canonical になったため `mixed` に戻った。）
 | 97 | `qpdf/test_driver.cc:3414-3422`; public `isArray` / `getArrayNItems` / `getArrayItem` / `shallowCopy`: `include/qpdf/QPDFObjectHandle.hh:337,725-728`, `libqpdf/QPDFObjectHandle.cc:426-429,758-785,2072-2079` | `crates/flpdf-qtest-tools/src/driver/test_88_98.rs::run_test_97` | canonical | qpdfの`getKey("/Nulls").getArrayItem(0).isArray() && getArrayNItems()` → `shallowCopy()` → `unparse()`の短絡順を、`trailer_key_handle` → `try_get_array_item` → `try_is_array` → 短絡した`try_get_array_n_items` → `shallow_copy` → `unparse`で再現する。`try_is_array`が非配列時のcount accessorを短絡するため、qpdfにない`Pdf::resolve`、不要なtype warning、非解決`as_array` snapshotを撤去した。pinned qpdf/flpdfの`many-nulls.pdf` case97は双方exit 0、stdout 13 bytesで`cmp`一致し、非配列itemのwarningなし回帰も固定する。 |
 | 98 | `qpdf/test_driver.cc:3425-3450` | `crates/flpdf-qtest-tools/src/driver/test_88_98.rs::run_test_98` | canonical | **移植済み（`flpdf-wkju`、caller cutover `flpdf-3yn9.48.106`）**: `ObjectHandle::write_json`/`get_json` の`dereference=true`内部resolutionで全6オブジェクトを検証し、content streamの辞書mutationは`try_get_stream_dict`で担う。`get_stream_json`（`pub`、`object_handle.rs:6325`、C44 facade）をqpdfの期待バイト列と比較する。fixture `tests/fixtures/qpdf-test98-minimal.pdf` はqpdfの`examples/qtest/npages/minimal.pdf`とbyte一致（763 B）。対象関数内のcaller-side `Pdf::resolve`は0。C44のmixedはpublic facadeとdeferred blob providerをまとめて追跡する歴史的分類であり、case 98はqpdf公開`getStreamJSON`に対応する経路を使うためcanonicalとする（C44全体のclosureや未完了probeの完了を意味しない）。 |
 
-**range 別サマリ**（98 行 = 99 ケース、0/1 統合）:
+**range 別サマリ**（各 range 行と「合計（物理行）」は物理行単位。「合計（論理ケース）」のみ
+`0/1` を 2 ケースとして数える）:
 
-| range | canonical | mixed | bridge | unknown |
-|---|---|---|---|---|
-| 0/1, 2-25（25 行） | 11（0/1, 2, 3, 5, 6, 11, 17, 19, 21, 22, 23） | 14 | 0 | 0 |
-| 26-49（24 行） | 13（28, 31, 35, 36, 37, 38, 39, 42, 43, 46, 47, 48, 49） | 11（26, 27, 29, 30, 32, 33, 34, 40, 41, 44, 45） | 0 | 0 |
-| 50-79（30 行） | 9（50, 54, 61, 62, 68, 71, 72, 73, 75） | 21 | 0 | 0 |
-| 80-98（19 行） | 16（81, 82, 85, 86, 87, 88, 89, 90, 91, 92, 93, 94, 95, 96, 97, 98） | 3（80, 83, 84） | 0 | 0 |
-| **合計** | **49** | **49** | **0** | **0** |
+<!-- route-matrix-aggregate: range-summary unit=physical detail-table=e-28 -->
+
+| range | 物理行 | canonical | mixed | bridge | unknown |
+|---|---|---|---|---|---|
+| 0/1, 2-25 | 25 | 11（0/1, 2, 3, 5, 6, 11, 17, 19, 21, 22, 23） | 14（4, 7, 8, 9, 10, 12, 13, 14, 15, 16, 18, 20, 24, 25） | 0（—） | 0（—） |
+| 26-49 | 24 | 14（28, 31, 34, 35, 36, 37, 38, 39, 42, 43, 46, 47, 48, 49） | 10（26, 27, 29, 30, 32, 33, 40, 41, 44, 45） | 0（—） | 0（—） |
+| 50-79 | 30 | 9（50, 54, 61, 62, 68, 71, 72, 73, 75） | 21（51, 52, 53, 55, 56, 57, 58, 59, 60, 63, 64, 65, 66, 67, 69, 70, 74, 76, 77, 78, 79） | 0（—） | 0（—） |
+| 80-98 | 19 | 16（81, 82, 85, 86, 87, 88, 89, 90, 91, 92, 93, 94, 95, 96, 97, 98） | 3（80, 83, 84） | 0（—） | 0（—） |
+| **合計（物理行）** | **98** | **50** | **48** | **0** | **0** |
+| **合計（論理ケース）** | **99** | **51** | **48** | **0** | **0** |
 
 全 98 行（99 ケース）で `classification` 列が `unknown` の行はゼロ。case 5/12/13/22/23 は初回監査で `unknown` 候補だったが、`show_linearization_pdf_with_warnings` が `QPDFJob::show_linearization` と同一 primitive であることを production コードの grep で確認した上で `mixed`（E-7 従属）に、`PageDocumentHelper` 系の 3 ケースは同型 canonical 前例（case 26/39/94）との一貫性を取って `canonical` に、それぞれ再分類した。
 
@@ -566,14 +570,16 @@ qtest exceptionsとrootは対象外。
 
 ### 分類別件数
 
+<!-- route-matrix-aggregate: document-tally unit=area-physical file=e-job-cli-capi.md -->
+
 | 分類 | 件数 | 行 |
 |---|---|---|
-| canonical | 17 | E-1, E-2, E-3, E-5, E-8, E-11, E-12, E-13, E-14, E-18, E-20, E-22, E-23, E-24, E-25, E-26, E-27 |
+| canonical | 18 | E-1, E-2, E-3, E-4, E-5, E-8, E-11, E-12, E-13, E-14, E-18, E-20, E-22, E-23, E-24, E-25, E-26, E-27 |
 | bridge | 0 | — |
-| mixed | 12 | E-4, E-6, E-7, E-9, E-10, E-15, E-16, E-17, E-19, E-21, E-28, E-29 |
+| mixed | 11 | E-6, E-7, E-9, E-10, E-15, E-16, E-17, E-19, E-21, E-28, E-29 |
 | unknown | 0 | —（E-28 の case 別詳細は「E-28 detail」表を参照。99 ケース全件を照合済みで case-level unknown は 0） |
 
-（合計 29 行。canonical 17 + bridge 0 + mixed 12 + unknown 0 = 29。`E-18` は `mixed` に見えるが、CLI が使わないのは「別の正本がある」からではなく E-17 の帰結であるため `canonical`）
+（合計 29 行。分類別の内訳は直上の表だけに書く。`E-18` は `mixed` に見えるが、CLI が使わないのは「別の正本がある」からではなく E-17 の帰結であるため `canonical`。`E-4` も同様に `canonical`——一度は `mixed` 側に誤って列挙されていた）
 
 ### `main.rs` が直接 import する job/ 項目のうち、8 の (A)〜(E) に未記載のもの
 

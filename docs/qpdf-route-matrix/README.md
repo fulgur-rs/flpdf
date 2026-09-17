@@ -29,9 +29,24 @@ container-above-max だった — `flpdf-hi08` / PR #1486）。本表は残る m
 
 ### A〜E route matrix aggregate（履歴上の160行）
 
-領域 A〜E の 5 ファイルを合わせた分類の内訳。同じ数は §3 の再掲・§4 の領域別表・§6 の
-tracker 集計にも現れるので、行の分類を変えたときはこの 4 箇所を必ず同時に更新する
-（4 箇所が独立に drift した実例: `flpdf-3yn9.48.148`）。
+領域 A〜E の 5 ファイルを合わせた分類の内訳。**分類別の内訳を記載するのは本表と §4 の
+領域別表だけ**で、§3 / §6 の散文と領域ファイルの散文は総数（160 / 259 / 領域別の分母）
+しか書かない。同じ内訳を 4 箇所に独立して再掲していた結果、4 箇所が独立に drift した
+（実例: `flpdf-3yn9.48.148`。当時は checker が分類別内訳を検査していなかった）ので、
+記載箇所を 2 つに絞り、両方を checker で検証する。
+
+本表・§4 の領域別表・各領域ファイルの「分類集計」・`e-job-cli-capi.md` の
+「range 別サマリ」には、表の直前に `<!-- route-matrix-aggregate: <kind> [key=value ...] -->`
+形式の HTML コメントを付けてある。`scripts/check-qpdf-route-matrix.py --check` は
+マーカーの付いた表を領域別表の classification セルの実測から再計算し、**件数と列挙された
+行 ID 集合の両方**が一致しない限り exit != 0 になる（件数だけを合わせて内訳だけ
+drift させることはできない）。マーカーを消して検査を逃れることもできない —
+領域ファイル（`[a-e]-*.md`）1 つにつき `document-tally` がちょうど 1 個、README には
+`area-total` / `logical-total` / `per-file` がそれぞれちょうど 1 個あることも検査される。
+実測の内訳だけを見るには `--stats`（`--stats-format text|json`）を使う。この検査は
+markdown だけを読むので `--no-qpdf`（CI の形）でも完全に動く。
+
+<!-- route-matrix-aggregate: area-total unit=area-physical -->
 
 | canonical | bridge | mixed | unknown | 合計 |
 |---|---|---|---|---|
@@ -43,6 +58,8 @@ tracker 集計にも現れるので、行の分類を変えたときはこの 4 
 E の qtest exception 表（物理98行を論理99ケースとして数える）を含む259 logical
 rowsを検証する。2026-09-18 の現行 `origin/main` (`4942e7b3f7fbeb2a2d79e771c55f7dff3f4eca58`) を基準に、
 今回の変更を適用した tree での集計は次のとおり。
+
+<!-- route-matrix-aggregate: logical-total unit=logical -->
 
 | canonical | bridge | mixed | unknown | 合計 |
 |---|---|---|---|---|
@@ -107,16 +124,17 @@ done | sort | uniq -c
 2026-09-17 の current-main audit anchor は `origin/main=c9fc97ebda542ddd231e0a14fd58495674513b19`、pinned qpdf は
 11.9.0 commit `3b97c9bd266b7c32ea36d3536e22dab77412886d` である。checker の実測は
 **今回の変更を適用した tree で** 2201 qpdf citations / 910 flpdf citations /
-259 logical rows、分類は
-canonical 161 / mixed 98 / bridge 0 / unknown 0。A〜E の160行だけを数える
-上の領域別集計は canonical 110 / mixed 50 / bridge 0 / unknown 0 なので、checker
-の259 logical rowsと混同しない。
+259 logical rows。A〜E の160行だけを数える上の領域別集計は 160 行なので、checker
+の259 logical rowsと混同しない。分類別の内訳は §1 の 2 表と §4 だけに書く
+（実測は `scripts/check-qpdf-route-matrix.py --stats` で出せる）。
 
 履歴行の例外: C44はpublic facadeとdeferred blobの責務を分離したmixed ownerとして追跡する。
 D19/D30はcanonical ownerへ委譲するbyte-neutral test scaffolding、D27は当該pre-write sweep撤去完了としてcanonicalに分類する。
 この例外をproduction routeの重複や全体parityの証拠に広げない。
 
 ## 4. 領域別 matrix
+
+<!-- route-matrix-aggregate: per-file unit=area-physical -->
 
 | ファイル | 行数 | canonical | bridge | mixed | unknown |
 |---|---|---|---|---|---|
@@ -199,8 +217,8 @@ D19/D30はcanonical ownerへ委譲するbyte-neutral test scaffolding、D27は�
 ## 6. 二重正本トラッカー
 
 追跡対象の symbol manifest は [tracked-symbols.txt](tracked-symbols.txt)。この matrix revision の
-classified row は 259 行で、canonical 161 / mixed 98 / bridge 0 / unknown 0 である。
-内訳は A=24 / B=34 / C=42 / D=31 / E=128（E 表 29 行 + qtest exception 表 99 行）。
+classified row は 259 行である（分類別の内訳は §1 の 2 表と §4 を見る。ここには再掲しない）。
+領域別の分母は A=24 / B=34 / C=42 / D=31 / E=128（E 表 29 行 + qtest exception 表 99 行）。
 `scripts/check-qpdf-route-matrix.py` も259行を報告する。classification tableの途中に散文行が
 入っても同じtableの状態を保持し、qtest exception tableの物理1行 `0/1` は論理2 caseとして数える。
 manifest は行集合の完全な機械変換ではなく、削除済みsymbolの0確認とcanonical側の分母も保持する。

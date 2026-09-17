@@ -883,3 +883,14 @@ only behind the hidden `qtest-driver` feature so the separate qtest-exception
 session can preserve its existing boundary; those callers are an explicitly
 excluded denominator, not normal library routes. The route contract is
 `crates/flpdf/tests/final_accessor_route_tests.rs`.
+
+### 分類集計
+
+<!-- route-matrix-aggregate: document-tally unit=area-physical file=a-objecthandle-resolver.md -->
+
+| 分類 | 件数 | 行 |
+|---|---|---|
+| canonical | 17 | A1, A2, A3, A4, A5, A7, A8, A9, A10, A12, A14, A15, A18, A19, A21, A22, A23 |
+| mixed | 7 | A6, A11, A13, A16, A17, A20, A24 |
+| bridge | 0 | — |
+| unknown | 0 | — |
