@@ -2124,7 +2124,9 @@ fn help_top(program: &str) -> Vec<u8> {
 }
 
 fn completion(argv0: &[u8], zsh: bool) -> Vec<u8> {
-    let executable = String::from_utf8_lossy(argv0);
+    let executable = std::env::var_os("QPDF_EXECUTABLE")
+        .map(|value| value.to_string_lossy().into_owned())
+        .unwrap_or_else(|| String::from_utf8_lossy(argv0).into_owned());
     let program = program_name(argv0);
     if zsh {
         format!(
@@ -2136,6 +2138,18 @@ fn completion(argv0: &[u8], zsh: bool) -> Vec<u8> {
         )
     }
     .into_bytes()
+}
+
+fn show_crypto(job: &QPDFJob) -> Result<()> {
+    let provider = std::env::var_os("QPDF_CRYPTO_PROVIDER")
+        .map(|value| value.to_string_lossy().into_owned())
+        .unwrap_or_else(|| String::from_utf8_lossy(QPDF_SHOW_CRYPTO).trim().to_owned());
+    if !matches!(provider.as_str(), "gnutls" | "openssl" | "native") {
+        return Err(Error::Usage(UsageError::new(format!(
+            "QPDFCryptoProvider: request to set default provider to unknown implementation \"{provider}\""
+        ))));
+    }
+    job.logger.info(format!("{provider}\n"))
 }
 
 fn help_from_generated_table(value: Option<&[u8]>, program: &str) -> Option<Vec<u8>> {
@@ -2199,14 +2213,14 @@ fn handle_sole_help_option(job: &mut QPDFJob, argv0: &[u8], argument: &[u8]) -> 
             job.argv_early_exit = true;
             match name {
                 b"version" => job.logger.info(format!(
-                    "qpdf version {}\nRun qpdf --copyright to see copyright and license information.\n",
+                    "{program} version {}\nRun {program} --copyright to see copyright and license information.\n",
                     crate::qpdf_version()
                 ))?, // cov:ignore: LLVM maps the covered version logger continuation to the call setup
                 b"copyright" => job.logger.info(
                     QPDF_COPYRIGHT
                         .replacen("qpdf version", &format!("{program} version"), 1),
                 )?, // cov:ignore: LLVM maps the covered copyright logger continuation to the call setup
-                b"show-crypto" => job.logger.info(QPDF_SHOW_CRYPTO)?,
+                b"show-crypto" => show_crypto(job)?,
                 b"completion-bash" => job.logger.info(completion(argv0, false))?,
                 b"completion-zsh" => job.logger.info(completion(argv0, true))?,
                 b"help" => {

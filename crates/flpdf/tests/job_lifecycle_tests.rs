@@ -554,6 +554,26 @@ fn raw_argv_help_table_and_completion_emit_qpdf_output() {
         info.lock().unwrap().bytes,
         b"autoload -U +X bashcompinit && bashcompinit && complete -o bashdefault -o default -C \"/opt/custom-qpdf\" custom-qpdf\n"
     );
+
+    for option in [
+        "--copyright",
+        "--show-crypto",
+        "--json-help=1",
+        "--json-help=2",
+        "--json-help=latest",
+        "--job-json-help",
+    ] {
+        let oracle = Command::new("qpdf").arg(option).output().unwrap();
+        if !oracle.status.success() {
+            continue;
+        }
+        let (logger, info) = logger_with_info_sink();
+        let mut job = QPDFJob::new();
+        job.set_logger(logger);
+        job.initialize_from_raw_argv(&[b"qpdf".to_vec(), option.as_bytes().to_vec()])
+            .unwrap();
+        assert_eq!(info.lock().unwrap().bytes, oracle.stdout, "{option}");
+    }
 }
 
 #[test]

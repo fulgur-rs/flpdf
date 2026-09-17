@@ -803,7 +803,7 @@ fn job_json_print_permission(
 
 fn parse_job_encrypt(
     value: &crate::json::Json,
-    allow_weak_crypto: bool,
+    _allow_weak_crypto: bool,
     inherited: &EncryptionDefaults,
 ) -> Result<(EncryptParams, EncryptionDefaults)> {
     let members = job_json_members(value);
@@ -912,7 +912,7 @@ fn parse_job_encrypt(
         "128bit" => {
             if use_aes {
                 EncryptParams::v4_aes128(user_password, owner_password)
-            } else if force_v4 {
+            } else if force_v4 || cleartext_metadata {
                 EncryptParams::rc4(EncryptMethod::V4Rc4128, user_password, owner_password)
             } else {
                 EncryptParams::rc4(EncryptMethod::V2Rc4128, user_password, owner_password)
@@ -939,11 +939,9 @@ fn parse_job_encrypt(
         params.permissions.accessibility = true;
     }
     params.encrypt_metadata = !cleartext_metadata;
-    if (params.is_weak_rc4() || params.is_deprecated_r5()) && !allow_weak_crypto {
-        return Err(Error::Usage(UsageError::new(
-            "refusing to write a file with weak or deprecated encryption without allowWeakCrypto",
-        )));
-    }
+    // qpdf defers weak-RC4 refusal until `setEncryptionOptions` at writer
+    // setup (`QPDFJob.cc:2738-2762`), so a later JSON/argv occurrence can
+    // still set allowWeakCrypto or decrypt before the final write.
     let defaults = EncryptionDefaults {
         user_password: defaults_user_password,
         owner_password: defaults_owner_password,
@@ -6515,7 +6513,7 @@ mod tests {
         let no_key_length =
             crate::json::Json::parse(br#"{"userPassword":"u","ownerPassword":"o"}"#).unwrap();
         assert!(parse_job_encrypt(&no_key_length, true, &inherited).is_err());
-        assert!(parse_job_encrypt(&encrypt_40, false, &inherited).is_err());
+        assert!(parse_job_encrypt(&encrypt_40, false, &inherited).is_ok());
 
         let (_, aes_defaults) =
             parse_job_encrypt(&encrypt_128_no_accessibility, true, &inherited).unwrap();
