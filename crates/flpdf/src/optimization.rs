@@ -599,22 +599,21 @@ fn is_page_resolved(object: &ObjectHandle) -> crate::Result<bool> {
 /// through resolved_get_key's context bookkeeping. qpdf's
 /// isDictionaryOfType only needs the direct /Type child in this case.
 fn resolved_page_type(object: &ObjectHandle) -> crate::Result<bool> {
-    let type_child = object.with_value(|value| match value {
+    let (is_dictionary, type_child) = object.with_value(|value| match value {
         Some(crate::object_handle::ObjectValue::Dictionary(entries)) => {
-            entries.get(b"/Type".as_slice()).cloned()
+            (true, entries.get(b"/Type".as_slice()).cloned())
         }
-        _ => None,
+        _ => (false, None),
     });
-    if type_child.is_none() {
+    if !is_dictionary {
         // Keep the existing qpdf-shaped helper reachable for non-dictionaries
-        // and dictionaries without /Type; the common Page path above avoids
-        // its context bookkeeping.
+        // only; the common dictionary path avoids its context bookkeeping.
         return object.resolved_is_dictionary_of_type(b"Page", b"");
     }
-    type_child
-        .map(|child| child.try_is_name_and_equals(b"Page"))
-        .transpose()
-        .map(|matched| matched.unwrap_or(false))
+    let Some(type_child) = type_child else {
+        return Ok(false);
+    };
+    type_child.try_is_name_and_equals(b"Page")
 }
 
 /// Return qpdf-ordered visible dictionary children while cloning each child
@@ -774,6 +773,7 @@ mod tests {
         assert!(!missing_type
             .resolved_is_dictionary_of_type(b"Page", b"")
             .expect("missing type probe"));
+        assert!(!super::resolved_page_type(&missing_type).expect("missing page type probe"));
         assert_eq!(
             missing_type
                 .resolved_get_key(b"/Missing")
