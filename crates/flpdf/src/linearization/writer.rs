@@ -1235,7 +1235,7 @@ fn write_main_xref_and_trailer(
     out.write_bytes(b"0000000000 65535 f \n")?;
     for number in 1..param_slot {
         match xref_offsets.get(&number) {
-            Some(offset) => out.write_bytes(format!("{:010} 00000 n \n", offset).as_bytes())?,
+            Some(offset) => write_fixed_xref_entry(out, *offset)?,
             None => out.write_bytes(b"0000000000 65535 f \n")?,
         }
     }
@@ -1262,6 +1262,26 @@ fn write_main_xref_and_trailer(
     out.write_bytes(format!("\nstartxref\n{}\n%%EOF\n", first_page_xref_offset).as_bytes())?;
 
     Ok((xref_start, xref_first_entry_offset))
+}
+
+/// Write one classic xref entry using a stack buffer instead of a temporary
+/// formatted String. The width is a minimum, matching Rust's :010 format for
+/// offsets larger than ten digits as well.
+fn write_fixed_xref_entry(out: &mut OutputSink<'_>, offset: usize) -> Result<()> {
+    let mut encoded = [b'0'; 20];
+    let mut end = encoded.len();
+    let mut value = offset as u64;
+    loop {
+        end -= 1;
+        encoded[end] = b'0' + (value % 10) as u8;
+        value /= 10;
+        if value == 0 {
+            break;
+        }
+    }
+    let width_start = encoded.len().saturating_sub(10);
+    out.write_bytes(&encoded[end.min(width_start)..])?;
+    out.write_bytes(b" 00000 n \n")
 }
 
 /// Byte ranges (inside the writer's `bytes` buffer) the first-page xref stream
@@ -5679,6 +5699,15 @@ mod tests {
             target.patch_bytes(0..1, b"x").is_err(),
             "pass-1 target must remain forward-only"
         );
+    }
+
+    #[test]
+    fn fixed_xref_entry_writer_preserves_qpdf_line_shape() {
+        let mut bytes = Vec::new();
+        let mut sink = OutputSink::new(&mut bytes);
+        write_fixed_xref_entry(&mut sink, 123).expect("write fixed xref entry");
+        drop(sink);
+        assert_eq!(bytes, b"0000000123 00000 n \n");
     }
 
     #[test]
