@@ -967,6 +967,7 @@ fn write_part1_xref_and_trailer(
     catalog_new_ref: ObjectRef,
     info_new_ref: Option<ObjectRef>,
     source_trailer: &ObjectHandle,
+    live_trailer: &ObjectHandle,
     canonical_entries: &[(Vec<u8>, Vec<u8>)],
     map: &dyn Fn(QpdfObjGen) -> Result<ObjectRef>,
     removed_refs: &BTreeSet<QpdfObjGen>,
@@ -1093,7 +1094,11 @@ fn write_part1_xref_and_trailer(
     // No separator space before `/ID`: the fixed-width `/Prev` placeholder's
     // trailing pad already separates the value, exactly as qpdf writes it.
     out.write_bytes(b"/ID ")?;
-    let id_value = source_trailer.try_get_key(b"/ID")?;
+    let id_value = if pass1 {
+        linearization_pass1_id_from_live_trailer(live_trailer)?
+    } else {
+        source_trailer.try_get_key(b"/ID")?
+    };
     match id_writer {
         Some(write_id) => write_id(out),
         None => id_value.write_id_value_with_qpdf_obj_gen_map(out, map, removed_refs),
@@ -1214,9 +1219,11 @@ fn write_main_xref_and_trailer(
     param_slot: u32, // /Size of the main subsection — covers objects [0, param_slot)
     first_page_xref_offset: usize,
     source_trailer: &ObjectHandle,
+    live_trailer: &ObjectHandle,
     map: &dyn Fn(QpdfObjGen) -> Result<ObjectRef>,
     removed_refs: &BTreeSet<QpdfObjGen>,
     id_writer: Option<crate::pdf_syntax::ReborrowableIdWriter>,
+    pass1: bool,
 ) -> Result<(usize, usize)> {
     let xref_start = out.position_usize()?;
 
@@ -1242,7 +1249,11 @@ fn write_main_xref_and_trailer(
     // Part-1 trailer carries), so the trailer a reader resolves via the
     // trailing `startxref` advertises the identifier.
     out.write_bytes(b"/ID ")?;
-    let id_value = source_trailer.try_get_key(b"/ID")?;
+    let id_value = if pass1 {
+        linearization_pass1_id_from_live_trailer(live_trailer)?
+    } else {
+        source_trailer.try_get_key(b"/ID")?
+    };
     match id_writer {
         Some(write_id) => write_id(out),
         None => id_value.write_id_value_with_qpdf_obj_gen_map(out, map, removed_refs),
@@ -1461,6 +1472,17 @@ fn linearization_pass1_id(source_id0: Option<&[u8]>) -> ObjectHandle {
     ])
 }
 
+/// Build qpdf's pass-1 `/ID` value at the trailer serialization boundary.
+///
+/// `QPDFWriter::writeTrailer` reads `getOriginalID1()` immediately before it
+/// writes the placeholder (`QPDFWriter.cc:1194-1213`). Keeping the live read
+/// in this helper's callers, rather than probing before xref emission, keeps
+/// the warning and placeholder-width side effects at that same boundary.
+fn linearization_pass1_id_from_live_trailer(live_trailer: &ObjectHandle) -> Result<ObjectHandle> {
+    let source_id0 = crate::writer::source_permanent_id_handle(live_trailer)?;
+    Ok(linearization_pass1_id(source_id0.as_deref()))
+}
+
 /// Reserve the **first-page (Part-1) cross-reference stream**'s fixed byte
 /// region at its proper position — physically inside the first-page region,
 /// *before* `/E`, in the slot where the classic Part-1 mini-xref + first trailer
@@ -1496,6 +1518,7 @@ fn write_first_page_xref_stream(
     catalog_new_ref: ObjectRef,
     info_new_ref: Option<ObjectRef>,
     source_trailer: &ObjectHandle,
+    live_trailer: &ObjectHandle,
     canonical_entries: &[(Vec<u8>, Vec<u8>)],
     max_ostream_index: u64,
     filtered: bool,
@@ -1518,7 +1541,12 @@ fn write_first_page_xref_stream(
     })?;
     // cov:ignore-end
     let max_id = final_size.saturating_sub(1);
-    let id = xref_id_bytes(source_trailer)?;
+    let id_value = if pass1 {
+        linearization_pass1_id_from_live_trailer(live_trailer)?
+    } else {
+        source_trailer.try_get_key(b"/ID")?
+    };
+    let id = xref_id_bytes(&id_value)?;
     let obj_ref = ObjectRef::new(first_xref_num, 0);
 
     // Reserve the fixed pass-1 region (qpdf's writePad length-stabilisation):
@@ -1602,11 +1630,11 @@ fn write_first_page_xref_stream(
     Ok(patch)
 }
 
-/// Extract the trailer `/ID`'s two byte strings — the deterministic-`/ID`
-/// all-zero placeholder while writing — for the rebuilt xref-stream dicts. The
-/// final-pass trailer view supplies the real identifier directly.
-fn xref_id_bytes(source_trailer: &ObjectHandle) -> Result<Option<(Vec<u8>, Vec<u8>)>> {
-    let id = source_trailer.try_get_key(b"/ID")?;
+/// Extract the two byte strings from a trailer `/ID` value — the
+/// deterministic-`/ID` all-zero placeholder while writing — for the rebuilt
+/// xref-stream dicts. The final-pass trailer view supplies the real identifier
+/// directly.
+fn xref_id_bytes(id: &ObjectHandle) -> Result<Option<(Vec<u8>, Vec<u8>)>> {
     let Some(values) = id.try_as_array()? else {
         return Ok(None);
     };
@@ -1788,6 +1816,7 @@ fn write_main_xref_stream_and_trailer(
     relocation: &ObjStmRelocation,
     total_count: u32, // /Size (placed renumber.len() + 1) — already final
     source_trailer: &ObjectHandle,
+    live_trailer: &ObjectHandle,
     first_page_obj_offset: usize,
     max_ostream_index: u64,
     pass1: bool,
@@ -1797,7 +1826,12 @@ fn write_main_xref_stream_and_trailer(
     let first_xref_num = relocation.first_xref_slot;
     let main_xref_num = relocation.main_xref_slot;
     let max_id = final_size.saturating_sub(1);
-    let id = xref_id_bytes(source_trailer)?;
+    let id_value = if pass1 {
+        linearization_pass1_id_from_live_trailer(live_trailer)?
+    } else {
+        source_trailer.try_get_key(b"/ID")?
+    };
+    let id = xref_id_bytes(&id_value)?;
 
     // Second-half range: objects `[0, second_half_count)`.
     let main_count = relocation.second_half_count;
@@ -2380,13 +2414,6 @@ fn do_write_pass<R: Read + Seek>(
     // `/ID` token. Each span is
     // captured as `start..bytes.len()` around the call that emits its `/ID`.
     let mut id_ranges: Vec<std::ops::Range<usize>> = Vec::new();
-    // qpdf's pass-1 writeTrailer reads the live `/ID[0]` at each trailer site
-    // rather than reusing the generateID state. The value affects only warning
-    // delivery and the zero-filled placeholder width; output bytes continue to
-    // come from `source_trailer`.
-    if pass1_digest {
-        let _ = crate::writer::source_permanent_id_handle(&pdf.trailer())?;
-    }
     let first_trailer_prev_range = if objstm_layout.is_empty() {
         // First-page xref covers objects [param_slot, total): the param dict
         // plus every other first-page object (catalog, hint, first page, page-1
@@ -2403,6 +2430,7 @@ fn do_write_pass<R: Read + Seek>(
             catalog_new_ref,
             info_new_ref,
             source_trailer,
+            &pdf.trailer(),
             &canonical_entries,
             &trailer_map,
             raw_removed_refs,
@@ -2443,6 +2471,7 @@ fn do_write_pass<R: Read + Seek>(
             catalog_new_ref,
             info_new_ref,
             source_trailer,
+            &pdf.trailer(),
             &canonical_entries,
             max_ostream_index,
             structural_streams_filtered,
@@ -2987,9 +3016,6 @@ fn do_write_pass<R: Read + Seek>(
     // members which a classic xref table cannot represent, so Part 6 becomes
     // an xref stream.  With an empty layout the classic table path is kept
     // verbatim — no behavioural change for Disable / no-ObjStm inputs.
-    if pass1_digest {
-        let _ = crate::writer::source_permanent_id_handle(&pdf.trailer())?;
-    }
     let (last_xref_offset, last_xref_first_entry_offset, second_xref_end) = if objstm_layout
         .is_empty()
     {
@@ -3011,10 +3037,12 @@ fn do_write_pass<R: Read + Seek>(
             param_dict_obj_number,
             part1_classic_xref_offset,
             source_trailer,
+            &pdf.trailer(),
             &trailer_map,
             raw_removed_refs,
             // Last use of `id_writer` — move it (no reborrow needed).
             id_writer,
+            pass1_digest,
         )?; // cov:ignore: the validated linearization plan makes this serializer error path defensive.
         id_ranges.push(main_section_start..output.position_usize()?);
 
@@ -3066,6 +3094,7 @@ fn do_write_pass<R: Read + Seek>(
             relocation,
             total_count,
             source_trailer,
+            &pdf.trailer(),
             first_page_obj_offset,
             max_ostream_index,
             pass1_digest,
@@ -5743,9 +5772,11 @@ mod tests {
             3,
             0,
             &trailer,
+            &trailer,
             &|object_gen| Ok(object_gen.to_object_ref().expect("test ID ref is valid")),
             &BTreeSet::new(),
             None,
+            false,
         )
         .expect("classic xref with missing offsets");
         drop(sink);
