@@ -1,0 +1,1847 @@
+//! qpdf 11.9.0's raw `QPDFJob::initializeFromArgv` boundary.
+//!
+//! qpdf correspondence: `QPDFArgParser.cc:429-566`, `QPDFJob_argv.cc`, `QPDFJob_config.cc`, and `qpdf/auto_job_init.hh`.
+//! The parser lives below `job::lifecycle` so it can
+//! mutate the one `JobConfiguration` owned by [`super::QPDFJob`]; it does not
+//! create a CLI-specific configuration copy.
+
+use super::*;
+use crate::encryption::{EncryptMethod, PasswordMode};
+use crate::job::page_range::PageRange;
+use crate::job::OverlayKind;
+use crate::{
+    EncryptParams, Error, PermissionsConfig, PrintPermission, R2PermissionsConfig, Result,
+    UsageError,
+};
+use std::fs::File;
+use std::io::Read;
+use std::path::{Path, PathBuf};
+
+/// Initialize one job from the already-byte-preserved argv vector.
+pub(super) fn initialize(job: &mut QPDFJob, argv: Vec<Vec<u8>>) -> Result<()> {
+    let expanded = expand_arg_files(argv)?;
+
+    job.configuration = qpdf_default_job_configuration();
+    job.partial_json_initialized = false;
+    job.argv_early_exit = false;
+
+    if expanded.len() == 2 && handle_sole_help_option(job, &expanded[1])? {
+        return Ok(());
+    }
+
+    let mut parser = Parser::new(job);
+    parser.parse(&expanded)?;
+    parser.finish()
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Table {
+    Main,
+    Pages,
+    Encryption,
+    UnderlayOverlay,
+    Attachment,
+    CopyAttachment,
+    PageLabels,
+}
+
+impl Table {
+    fn name(self) -> &'static str {
+        match self {
+            Self::Main => "main", // cov:ignore: an active segment always selects a non-main table
+            Self::Pages => "pages",
+            Self::Encryption => "encryption", // cov:ignore: encryption errors use EncryptionState::table_name
+            Self::UnderlayOverlay => "underlay/overlay",
+            Self::Attachment => "attachment",
+            Self::CopyAttachment => "copy attachment",
+            Self::PageLabels => "set page labels",
+        }
+    }
+}
+
+struct Parser<'a> {
+    job: &'a mut QPDFJob,
+    table: Table,
+    active: Option<ActiveSegment>,
+    gave_input: bool,
+    gave_output: bool,
+}
+
+enum ActiveSegment {
+    Pages(PagesState),
+    Encryption(EncryptionState),
+    UnderlayOverlay(UnderlayOverlayState),
+    Attachment(AttachmentState),
+    CopyAttachment(CopyAttachmentState),
+    PageLabels(Vec<Vec<u8>>),
+}
+
+impl<'a> Parser<'a> {
+    fn new(job: &'a mut QPDFJob) -> Self {
+        let gave_input = job.configuration.input_file.is_some() || job.configuration.empty_input;
+        let gave_output =
+            job.configuration.output_file.is_some() || job.configuration.replace_input;
+        Self {
+            job,
+            table: Table::Main,
+            active: None,
+            gave_input,
+            gave_output,
+        }
+    }
+
+    fn parse(&mut self, argv: &[Vec<u8>]) -> Result<()> {
+        let mut index = 1;
+        while index < argv.len() {
+            let argument = &argv[index];
+            if self.active.is_some() {
+                self.parse_segment_argument(argument)?;
+            } else {
+                self.parse_main_argument(argument)?;
+            }
+            index += 1;
+        }
+        Ok(())
+    }
+
+    fn finish(&mut self) -> Result<()> {
+        if self.active.is_some() {
+            return Err(UsageError::new(format!(
+                "missing -- at end of {} options",
+                self.active_table_name()
+            ))
+            .into());
+        }
+        if self.job.configuration.input_file.is_none() && !self.job.configuration.empty_input {
+            return Err(UsageError::new("an input file name is required").into());
+        }
+        self.job.check_configuration()?;
+        let input_name = self
+            .job
+            .configuration
+            .input_file
+            .as_ref()
+            .map_or_else(Vec::new, |path| path_description_bytes(path));
+        self.job.set_input_name_bytes(input_name);
+        self.job.warnings = false;
+        Ok(())
+    }
+
+    fn active_table_name(&self) -> &'static str {
+        match self.active.as_ref() {
+            Some(ActiveSegment::Encryption(state)) => state.table_name(),
+            _ => self.table.name(),
+        }
+    }
+
+    fn parse_main_argument(&mut self, argument: &[u8]) -> Result<()> {
+        if argument == b"--" {
+            // qpdf's top-level marker is an option-table reset. We are already
+            // in the main table, so consume it and continue.
+            return Ok(());
+        }
+        let Some((name, value)) = option_parts(argument) else {
+            if argument.first() == Some(&b'-') && argument != b"-" {
+                return Err(unrecognized(argument).into());
+            }
+            return self.positional(argument);
+        };
+
+        match name {
+            b"add-attachment" => self.begin_segment(
+                Table::Attachment,
+                ActiveSegment::Attachment(AttachmentState::default()),
+            ),
+            b"allow-weak-crypto" => {
+                self.job.configuration.allow_weak_crypto = true;
+                Ok(())
+            }
+            b"check" => {
+                self.job.configuration.check = true;
+                self.job.configuration.require_output = false;
+                Ok(())
+            }
+            b"check-linearization" => {
+                self.job.configuration.check_linearization = true;
+                self.job.configuration.require_output = false;
+                Ok(())
+            }
+            b"coalesce-contents" => {
+                self.job.configuration.coalesce_contents = true;
+                Ok(())
+            }
+            b"copy-attachments-from" => self.begin_segment(
+                Table::CopyAttachment,
+                ActiveSegment::CopyAttachment(CopyAttachmentState::default()),
+            ),
+            b"decrypt" => {
+                self.job.configuration.writer.set_preserve_encryption(false);
+                self.job.configuration.writer.clear_encryption_parameters();
+                self.job.configuration.copy_encryption_applies_to_writer = false;
+                Ok(())
+            }
+            b"deterministic-id" => {
+                self.job.configuration.writer.set_deterministic_id(true);
+                Ok(())
+            }
+            b"empty" => self.select_empty_input(),
+            b"encrypt" => self.begin_segment(
+                Table::Encryption,
+                ActiveSegment::Encryption(EncryptionState::default()),
+            ),
+            b"externalize-inline-images" => {
+                self.job.configuration.externalize_inline_images = true;
+                Ok(())
+            }
+            b"filtered-stream-data" => {
+                self.job.configuration.show_filtered_stream_data = true;
+                Ok(())
+            }
+            b"flatten-rotation" => {
+                self.job.configuration.flatten_rotation = true;
+                Ok(())
+            }
+            b"generate-appearances" => {
+                self.job.configuration.generate_appearances = true;
+                Ok(())
+            }
+            b"ignore-xref-streams" => {
+                self.job.configuration.ignore_xref_streams = true;
+                Ok(())
+            }
+            b"is-encrypted" => {
+                self.job.configuration.is_encrypted = true;
+                self.job.configuration.require_output = false;
+                Ok(())
+            }
+            b"json-input" => {
+                self.job.configuration.json_input = true;
+                Ok(())
+            }
+            b"keep-inline-images" => {
+                self.job.configuration.image_options.keep_inline_images = true;
+                Ok(())
+            }
+            b"linearize" => {
+                self.job.configuration.linearize = true;
+                Ok(())
+            }
+            b"list-attachments" => {
+                self.job.configuration.list_attachments = true;
+                self.job.configuration.require_output = false;
+                Ok(())
+            }
+            b"newline-before-endstream" => {
+                self.job
+                    .configuration
+                    .writer
+                    .set_newline_before_endstream(true);
+                Ok(())
+            }
+            b"no-original-object-ids" => {
+                self.job
+                    .configuration
+                    .writer
+                    .set_suppress_original_object_ids(true);
+                Ok(())
+            }
+            b"no-warn" => {
+                self.job.suppress_warnings = true;
+                Ok(())
+            }
+            b"optimize-images" => {
+                self.job.configuration.optimize_images = true;
+                Ok(())
+            }
+            b"overlay" => self.begin_segment(
+                Table::UnderlayOverlay,
+                ActiveSegment::UnderlayOverlay(UnderlayOverlayState::new(OverlayKind::Overlay)),
+            ),
+            b"pages" => {
+                self.begin_segment(Table::Pages, ActiveSegment::Pages(PagesState::default()))
+            }
+            b"password-is-hex-key" => {
+                self.job.configuration.password_is_hex_key = true;
+                Ok(())
+            }
+            b"preserve-unreferenced" => {
+                self.job
+                    .configuration
+                    .writer
+                    .set_preserve_unreferenced_objects(true);
+                Ok(())
+            }
+            b"preserve-unreferenced-resources" => {
+                self.job.configuration.remove_unreferenced_resources =
+                    RemoveUnreferencedResources::No;
+                Ok(())
+            }
+            b"progress" => {
+                self.job.configuration.progress = true;
+                Ok(())
+            }
+            b"qdf" => {
+                self.job.configuration.writer.set_qdf_mode(true);
+                Ok(())
+            }
+            b"raw-stream-data" => {
+                self.job.configuration.show_raw_stream_data = true;
+                Ok(())
+            }
+            b"recompress-flate" => {
+                self.job.configuration.writer.set_recompress_flate(true);
+                Ok(())
+            }
+            b"remove-page-labels" => {
+                self.job.configuration.remove_page_labels = true;
+                Ok(())
+            }
+            b"replace-input" => self.select_replace_input(),
+            b"report-memory-usage" => {
+                self.job.configuration.report_memory_usage = true;
+                Ok(())
+            }
+            b"requires-password" => {
+                self.job.configuration.requires_password = true;
+                self.job.configuration.require_output = false;
+                Ok(())
+            }
+            b"remove-restrictions" => {
+                self.job.configuration.remove_restrictions = true;
+                Ok(())
+            }
+            b"set-page-labels" => {
+                self.begin_segment(Table::PageLabels, ActiveSegment::PageLabels(Vec::new()))
+            }
+            b"show-encryption" => {
+                self.job.configuration.show_encryption = true;
+                self.job.configuration.require_output = false;
+                Ok(())
+            }
+            b"show-encryption-key" => {
+                self.job.configuration.show_encryption_key = true;
+                Ok(())
+            }
+            b"show-linearization" => {
+                self.job.configuration.show_linearization = true;
+                self.job.configuration.require_output = false;
+                Ok(())
+            }
+            b"show-npages" => {
+                self.job.configuration.show_npages = true;
+                self.job.configuration.require_output = false;
+                Ok(())
+            }
+            b"show-pages" => {
+                self.job.configuration.show_pages = true;
+                self.job.configuration.require_output = false;
+                Ok(())
+            }
+            b"show-xref" => {
+                self.job.configuration.show_xref = true;
+                self.job.configuration.require_output = false;
+                Ok(())
+            }
+            b"static-aes-iv" => {
+                self.job.configuration.writer.set_static_aes_iv(true);
+                Ok(())
+            }
+            b"static-id" => {
+                self.job.configuration.writer.set_static_id(true);
+                Ok(())
+            }
+            b"suppress-password-recovery" => {
+                self.job.configuration.suppress_password_recovery = true;
+                Ok(())
+            }
+            b"suppress-recovery" => {
+                self.job.configuration.suppress_recovery = true;
+                Ok(())
+            }
+            b"test-json-schema" => {
+                self.job.configuration.test_json_schema = true;
+                Ok(())
+            }
+            b"underlay" => self.begin_segment(
+                Table::UnderlayOverlay,
+                ActiveSegment::UnderlayOverlay(UnderlayOverlayState::new(OverlayKind::Underlay)),
+            ),
+            b"verbose" => {
+                self.job.configuration.verbose = true;
+                Ok(())
+            }
+            b"warning-exit-0" => {
+                self.job.warnings_exit_zero = true;
+                Ok(())
+            }
+            b"with-images" => {
+                self.job.configuration.show_page_images = true;
+                Ok(())
+            }
+            b"compression-level" => {
+                let value = required_value(name, value, "level")?;
+                self.job
+                    .configuration
+                    .writer
+                    .set_compression_level(argv_callback_value(parse_job_compression_level(
+                        value,
+                    ))?);
+                Ok(())
+            }
+            b"copy-encryption" => {
+                let value = required_value(name, value, "file")?;
+                self.job.configuration.copy_encryption = Some(path_from_bytes(value));
+                self.job.configuration.copy_encryption_applies_to_writer = true;
+                self.job.configuration.writer.clear_encryption_parameters();
+                Ok(())
+            }
+            b"encryption-file-password" => {
+                let value = required_value(name, value, "password")?;
+                self.job.configuration.encryption_file_password = value.to_vec();
+                Ok(())
+            }
+            b"force-version" => {
+                let value = required_value(name, value, "version")?;
+                let (version, extension) = parse_job_version(value, ".forceVersion")?;
+                self.job
+                    .configuration
+                    .writer
+                    .force_pdf_version(version, extension);
+                Ok(())
+            }
+            b"ii-min-bytes" => {
+                let value = required_value(name, value, "minimum")?;
+                self.job.configuration.image_options.inline_min_bytes =
+                    argv_callback_value(parse_qpdf_collate_uint(value))?;
+                Ok(())
+            }
+            b"job-json-file" => {
+                let value = required_value(name, value, "file")?;
+                self.apply_job_json_file(value)
+            }
+            b"json-object" => {
+                let value = required_value(name, value, "trailer")?;
+                self.job
+                    .configuration
+                    .json_objects
+                    .push(String::from_utf8_lossy(value).into_owned());
+                Ok(())
+            }
+            b"keep-files-open-threshold" => {
+                let value = required_value(name, value, "count")?;
+                self.job.configuration.keep_files_open_threshold =
+                    Some(argv_callback_value(parse_qpdf_collate_uint(value))?);
+                Ok(())
+            }
+            b"linearize-pass1" => {
+                let value = required_value(name, value, "filename")?;
+                self.job.configuration.linearize_pass1 = Some(path_from_bytes(value));
+                Ok(())
+            }
+            b"min-version" => {
+                let value = required_value(name, value, "version")?;
+                let (version, extension) = parse_job_version(value, ".minVersion")?;
+                self.job
+                    .configuration
+                    .writer
+                    .set_minimum_pdf_version(version, extension);
+                Ok(())
+            }
+            b"oi-min-area" => {
+                let value = required_value(name, value, "minimum")?;
+                self.job.configuration.image_options.min_area =
+                    argv_callback_value(parse_qpdf_collate_uint(value))? as u32;
+                Ok(())
+            }
+            b"oi-min-height" => {
+                let value = required_value(name, value, "minimum")?;
+                self.job.configuration.image_options.min_height =
+                    argv_callback_value(parse_qpdf_collate_uint(value))? as u32;
+                Ok(())
+            }
+            b"oi-min-width" => {
+                let value = required_value(name, value, "minimum")?;
+                self.job.configuration.image_options.min_width =
+                    argv_callback_value(parse_qpdf_collate_uint(value))? as u32;
+                Ok(())
+            }
+            b"password" => {
+                let value = required_value(name, value, "password")?;
+                self.job.configuration.password = value.to_vec();
+                Ok(())
+            }
+            b"password-file" => {
+                let value = required_value(name, value, "password")?;
+                if let Some(password) = read_password_file(value)? {
+                    self.job.configuration.password = password;
+                }
+                Ok(())
+            }
+            b"remove-attachment" => {
+                let value = required_value(name, value, "attachment")?;
+                self.job
+                    .configuration
+                    .attachments_to_remove
+                    .push(value.to_vec());
+                Ok(())
+            }
+            b"rotate" => {
+                let value = required_value(name, value, "[+|-]angle")?;
+                let rotation = argv_callback_value(parse_rotation_parameter(value))?;
+                self.job
+                    .configuration
+                    .rotations
+                    .insert(rotation.range, rotation.spec);
+                Ok(())
+            }
+            b"show-attachment" => {
+                let value = required_value(name, value, "attachment")?;
+                self.job.configuration.show_attachment = Some(value.to_vec());
+                self.job.configuration.require_output = false;
+                Ok(())
+            }
+            b"show-object" => {
+                let value = required_value(name, value, "trailer")?;
+                self.job.configuration.show_object =
+                    Some(argv_callback_value(parse_job_object_selector(value))?);
+                self.job.configuration.require_output = false;
+                Ok(())
+            }
+            b"json-stream-prefix" => {
+                let value = required_value(name, value, "stream-file-prefix")?;
+                self.job.configuration.json_stream_prefix = Some(value.to_vec());
+                Ok(())
+            }
+            b"update-from-json" => {
+                let value = required_value(name, value, "qpdf-json file")?;
+                self.job.configuration.update_from_json = Some(path_from_bytes(value));
+                Ok(())
+            }
+            b"collate" => {
+                let value = value.unwrap_or_default();
+                self.job
+                    .configuration
+                    .collate
+                    .get_or_insert_with(Vec::new)
+                    .extend(argv_callback_value(parse_qpdf_collate_parameter(value))?);
+                Ok(())
+            }
+            b"split-pages" => {
+                let value = value.unwrap_or_default();
+                self.job.configuration.split_pages =
+                    Some(argv_callback_value(parse_job_split_pages(value))?);
+                Ok(())
+            }
+            b"compress-streams" => {
+                let value = required_choice(name, value, &[b"y", b"n"])?;
+                self.job
+                    .configuration
+                    .writer
+                    .set_compress_streams(value == b"y");
+                Ok(())
+            }
+            b"decode-level" => {
+                let value = required_choice(
+                    name,
+                    value,
+                    &[b"none", b"generalized", b"specialized", b"all"],
+                )?; // cov:ignore: LLVM maps the covered decode-level choice continuation to the call setup
+                let level = match value {
+                    b"none" => crate::writer::DecodeLevel::None,
+                    b"generalized" => crate::writer::DecodeLevel::Generalized,
+                    b"specialized" => crate::writer::DecodeLevel::Specialized,
+                    b"all" => crate::writer::DecodeLevel::All,
+                    _ => unreachable!(), // cov:ignore: required_choice validates every decode-level value
+                };
+                self.job.configuration.writer.set_decode_level(level);
+                self.job.configuration.json_decode_level = level;
+                self.job.configuration.json_decode_level_set = true;
+                Ok(())
+            }
+            b"flatten-annotations" => {
+                let value = required_choice(name, value, &[b"all", b"print", b"screen"])?;
+                self.job.configuration.flatten_annotations = Some(match value {
+                    b"all" => FlattenAnnotationsMode::All,
+                    b"print" => FlattenAnnotationsMode::Print,
+                    b"screen" => FlattenAnnotationsMode::Screen,
+                    _ => unreachable!(), // cov:ignore: required_choice validates every flatten-annotations value
+                });
+                Ok(())
+            }
+            b"json-key" => {
+                let value = required_choice(
+                    name,
+                    value,
+                    &[
+                        b"acroform",
+                        b"attachments",
+                        b"encrypt",
+                        b"objectinfo",
+                        b"objects",
+                        b"outlines",
+                        b"pagelabels",
+                        b"pages",
+                        b"qpdf",
+                    ],
+                )?; // cov:ignore: LLVM maps the covered json-key choice continuation to the call setup
+                let value = std::str::from_utf8(value)
+                    .map_err(|_| UsageError::new("--json-key must be given as --json-key={...}"))?;
+                self.job.configuration.json_keys.push(
+                    JsonKey::from_str(value)
+                        .ok_or_else(|| UsageError::new("invalid json-key option"))?,
+                );
+                Ok(())
+            }
+            b"json-stream-data" => {
+                let value = required_choice(name, value, &[b"none", b"inline", b"file"])?;
+                self.job.configuration.json_stream_data = match value {
+                    b"none" => JsonStreamData::None,
+                    b"inline" => JsonStreamData::Inline,
+                    b"file" => JsonStreamData::File,
+                    _ => unreachable!(), // cov:ignore: required_choice validates every json-stream-data value
+                };
+                self.job.configuration.json_stream_data_set = true;
+                Ok(())
+            }
+            b"keep-files-open" => {
+                let value = required_choice(name, value, &[b"y", b"n"])?;
+                self.job.configuration.keep_files_open = Some(value == b"y");
+                Ok(())
+            }
+            b"normalize-content" => {
+                let value = required_choice(name, value, &[b"y", b"n"])?;
+                self.job.configuration.normalize_content = Some(value == b"y");
+                Ok(())
+            }
+            b"object-streams" => {
+                let value = required_choice(name, value, &[b"disable", b"preserve", b"generate"])?;
+                self.job
+                    .configuration
+                    .writer
+                    .set_object_stream_mode(parse_object_stream_mode(
+                        std::str::from_utf8(value).unwrap(),
+                    )?); // cov:ignore: required_choice validates UTF-8 object-streams values
+                Ok(())
+            }
+            b"password-mode" => {
+                let value =
+                    required_choice(name, value, &[b"bytes", b"hex-bytes", b"unicode", b"auto"])?;
+                self.job.configuration.password_mode = match value {
+                    b"bytes" => PasswordMode::Bytes,
+                    b"hex-bytes" => PasswordMode::HexBytes,
+                    b"unicode" => PasswordMode::Unicode,
+                    b"auto" => PasswordMode::Auto,
+                    _ => unreachable!(), // cov:ignore: required_choice validates every password-mode value
+                };
+                Ok(())
+            }
+            b"remove-unreferenced-resources" => {
+                let value = required_choice(name, value, &[b"auto", b"yes", b"no"])?;
+                self.job.configuration.remove_unreferenced_resources = match value {
+                    b"auto" => RemoveUnreferencedResources::Auto,
+                    b"yes" => RemoveUnreferencedResources::Yes,
+                    b"no" => RemoveUnreferencedResources::No,
+                    _ => unreachable!(), // cov:ignore: required_choice validates every resource-removal value
+                };
+                Ok(())
+            }
+            b"stream-data" => {
+                let value =
+                    required_choice(name, value, &[b"compress", b"preserve", b"uncompress"])?;
+                self.job
+                    .configuration
+                    .writer
+                    .set_stream_data_mode(match value {
+                        b"compress" => crate::StreamDataMode::Compress,
+                        b"preserve" => crate::StreamDataMode::Preserve,
+                        b"uncompress" => crate::StreamDataMode::Uncompress,
+                        _ => unreachable!(), // cov:ignore: required_choice validates every stream-data value
+                    });
+                Ok(())
+            }
+            b"json" => self.apply_json_output(value, false),
+            b"json-output" => self.apply_json_output(value, true),
+            _ => Err(unrecognized(argument).into()),
+        }
+    }
+
+    fn begin_segment(&mut self, table: Table, segment: ActiveSegment) -> Result<()> {
+        if self.active.is_some() {
+            return Err(Error::Internal("nested qpdf option segment".into())); // cov:ignore: parse_main_argument runs only while no segment is active
+        }
+        if table == Table::Pages
+            && self.job.configuration.page_specs_origin != PageSpecsOrigin::None
+        {
+            return Err(UsageError::new("--pages may only be specified one time").into());
+        }
+        self.table = table;
+        self.active = Some(segment);
+        Ok(())
+    }
+
+    fn parse_segment_argument(&mut self, argument: &[u8]) -> Result<()> {
+        if argument == b"--" {
+            let segment = self.active.take().expect("active segment checked above");
+            self.finish_segment(segment)?;
+            self.table = Table::Main;
+            return Ok(());
+        }
+        let segment = self.active.as_mut().expect("active segment checked above");
+        match segment {
+            ActiveSegment::Pages(state) => state.push(argument),
+            ActiveSegment::Encryption(state) => state.push(argument),
+            ActiveSegment::UnderlayOverlay(state) => state.push(argument),
+            ActiveSegment::Attachment(state) => state.push(argument),
+            ActiveSegment::CopyAttachment(state) => state.push(argument),
+            ActiveSegment::PageLabels(specs) => {
+                if argument.first() == Some(&b'-') {
+                    let mut message = b"unrecognized argument ".to_vec();
+                    message.extend_from_slice(argument);
+                    message.extend_from_slice(
+                        b" (set page labels options must be terminated with --)",
+                    );
+                    Err(UsageError::new(message).into())
+                } else {
+                    specs.push(argument.to_vec());
+                    Ok(())
+                }
+            }
+        }
+    }
+
+    fn finish_segment(&mut self, segment: ActiveSegment) -> Result<()> {
+        match segment {
+            ActiveSegment::Pages(state) => {
+                let specs = state.finish()?;
+                self.job.configuration.page_specs_origin = PageSpecsOrigin::Config;
+                self.job.configuration.page_specs = specs
+                    .into_iter()
+                    .map(|spec| {
+                        let range = if spec.range.is_empty() {
+                            PageRange::all()
+                        } else {
+                            PageRange::parse_numrange(&spec.range)
+                                .map_err(|error| UsageError::new(error.to_string()))?
+                        };
+                        Ok(JobPageConfig {
+                            path: spec.path,
+                            password: spec.password,
+                            range,
+                        })
+                    })
+                    .collect::<Result<Vec<_>>>()?;
+                Ok(())
+            }
+            ActiveSegment::Encryption(state) => {
+                let params = state.finish()?;
+                self.job
+                    .configuration
+                    .writer
+                    .set_encryption_parameters(params);
+                self.job.configuration.copy_encryption_applies_to_writer = false;
+                Ok(())
+            }
+            ActiveSegment::UnderlayOverlay(state) => {
+                let state = state.finish()?;
+                let path = state.path.expect("validated overlay path");
+                let target = match state.kind {
+                    OverlayKind::Overlay => &mut self.job.configuration.overlays,
+                    OverlayKind::Underlay => &mut self.job.configuration.underlays,
+                };
+                target.push(JobOverlayConfig {
+                    path,
+                    password: state.password,
+                    from: state.from,
+                    to: state.to,
+                    repeat: state.repeat,
+                    kind: state.kind,
+                });
+                Ok(())
+            }
+            ActiveSegment::Attachment(state) => {
+                self.job
+                    .configuration
+                    .attachments_to_add
+                    .push(state.finish()?);
+                Ok(())
+            }
+            ActiveSegment::CopyAttachment(state) => {
+                let state = state.finish()?;
+                self.job
+                    .configuration
+                    .attachments_to_copy
+                    .push(JobCopyAttachmentsConfig {
+                        path: state.path.expect("validated copy attachment path"),
+                        password: state.password,
+                        prefix: state.prefix,
+                    });
+                Ok(())
+            }
+            ActiveSegment::PageLabels(specs) => {
+                self.job.configuration.set_page_labels = Some(
+                    specs
+                        .iter()
+                        .map(|spec| parse_page_label_spec(spec))
+                        .collect::<Result<Vec<_>>>()?,
+                );
+                Ok(())
+            }
+        }
+    }
+
+    fn positional(&mut self, argument: &[u8]) -> Result<()> {
+        if !self.gave_input {
+            if argument.is_empty() {
+                return self.select_empty_input();
+            }
+            self.job.configuration.input_file = Some(path_from_bytes(argument));
+            self.gave_input = true;
+            return Ok(());
+        }
+        if !self.gave_output {
+            self.job.configuration.output_file = Some(path_from_bytes(argument));
+            self.gave_output = true;
+            return Ok(());
+        }
+        Err(UsageError::new({
+            let mut message = b"unknown argument ".to_vec();
+            message.extend_from_slice(argument);
+            message
+        })
+        .into())
+    }
+
+    fn select_empty_input(&mut self) -> Result<()> {
+        if self.gave_input || self.job.configuration.input_file.is_some() {
+            return Err(UsageError::new(
+                "empty input can't be used since input file has already been given",
+            )
+            .into());
+        }
+        self.job.configuration.empty_input = true;
+        self.gave_input = true;
+        Ok(())
+    }
+
+    fn select_replace_input(&mut self) -> Result<()> {
+        if self.gave_output
+            || self.job.configuration.output_file.is_some()
+            || self.job.configuration.replace_input
+        {
+            return Err(UsageError::new(
+                "replace-input can't be used since output file has already been given",
+            )
+            .into());
+        }
+        self.job.configuration.replace_input = true;
+        self.gave_output = true;
+        Ok(())
+    }
+
+    fn apply_json_output(&mut self, value: Option<&[u8]>, output: bool) -> Result<()> {
+        let value = value.unwrap_or_default();
+        let version = match value {
+            b"" | b"latest" | b"2" => 2,
+            b"1" if !output => 1,
+            _ => {
+                let name = if output { "json-output" } else { "json" };
+                let choices = if output { "2,latest" } else { "1,2,latest" };
+                return Err(UsageError::new(format!(
+                    "--{name} must be given as --{name}={{{choices}}}"
+                ))
+                .into());
+            }
+        };
+        self.job.configuration.json_version = Some(version);
+        self.job.configuration.require_output = false;
+        if output {
+            self.job.configuration.json_output = true;
+            if !self.job.configuration.json_stream_data_set {
+                self.job.configuration.json_stream_data = JsonStreamData::Inline;
+            }
+            if !self.job.configuration.json_decode_level_set {
+                self.job.configuration.json_decode_level = crate::writer::DecodeLevel::None;
+            }
+            self.job.configuration.json_keys.push(JsonKey::Qpdf);
+        }
+        Ok(())
+    }
+
+    fn apply_job_json_file(&mut self, value: &[u8]) -> Result<()> {
+        let path = path_from_bytes(value);
+        let prefix = self.job.message_prefix.clone();
+        let result = (|| {
+            let bytes = std::fs::read(&path)
+                .map_err(|error| Error::file_io("open", path.clone(), error))?;
+            self.job.initialize_from_json_partial_bytes(&bytes)
+        })();
+        // The public JSON entry point uses a C-wrapper-compatible
+        // `qpdfjob json` prefix. qpdf's Config::jobJsonFile callback is still
+        // inside the argv job and keeps its original prefix, so restore it
+        // after the nested dispatch on both success and failure.
+        self.job.message_prefix = prefix.clone();
+        result.map_err(|error| {
+            let mut message = b"error with job-json file ".to_vec();
+            message.extend_from_slice(value);
+            message.extend_from_slice(b": ");
+            message.extend_from_slice(error.to_string().as_bytes());
+            message.extend_from_slice(b"\nRun ");
+            message.extend_from_slice(prefix.as_bytes());
+            message.extend_from_slice(b" --job-json-help for information on the file format.");
+            Error::Usage(UsageError::new(message))
+        })?;
+        self.gave_input =
+            self.job.configuration.input_file.is_some() || self.job.configuration.empty_input;
+        self.gave_output =
+            self.job.configuration.output_file.is_some() || self.job.configuration.replace_input;
+        Ok(())
+    }
+}
+
+fn option_parts(argument: &[u8]) -> Option<(&[u8], Option<&[u8]>)> {
+    if argument.len() <= 1 || argument[0] != b'-' || argument == b"-" {
+        return None;
+    }
+    let rest = if argument.get(1) == Some(&b'-') {
+        &argument[2..]
+    } else {
+        &argument[1..]
+    };
+    if rest.is_empty() || rest.first() == Some(&b'-') {
+        return None;
+    }
+    let Some(equal) = rest.iter().position(|byte| *byte == b'=') else {
+        return Some((rest, None));
+    };
+    Some((&rest[..equal], Some(&rest[equal + 1..])))
+}
+
+fn required_value<'a>(name: &[u8], value: Option<&'a [u8]>, parameter: &str) -> Result<&'a [u8]> {
+    value.ok_or_else(|| {
+        UsageError::new(format!(
+            "--{} must be given as --{}={parameter}",
+            String::from_utf8_lossy(name),
+            String::from_utf8_lossy(name)
+        ))
+        .into()
+    })
+}
+
+/// `ArgParser::parseOptions` catches callback `runtime_error` values and
+/// routes them through qpdf's usage boundary (`QPDFJob_argv.cc:408-415`).
+/// Preserve that classification for the Rust numeric/rotation helpers, which
+/// also serve non-argv callers and therefore return their native `Error` kind.
+fn argv_callback_value<T>(result: Result<T>) -> Result<T> {
+    result.map_err(|error| match error {
+        Error::Usage(_) => error,
+        other => Error::Usage(UsageError::new(other.to_string())),
+    })
+}
+
+fn required_choice<'a>(
+    name: &[u8],
+    value: Option<&'a [u8]>,
+    choices: &[&[u8]],
+) -> Result<&'a [u8]> {
+    let choice_name = format!("{{{}}}", choices_text(choices));
+    let value = required_value(name, value, &choice_name)?;
+    if choices.contains(&value) {
+        Ok(value)
+    } else if name == b"keep-files-open" {
+        Err(UsageError::new(format!(
+            "invalid value for --keep-files-open: {}",
+            String::from_utf8_lossy(value)
+        ))
+        .into())
+    } else {
+        Err(UsageError::new(format!(
+            "--{} must be given as --{}={{{}}}",
+            String::from_utf8_lossy(name),
+            String::from_utf8_lossy(name),
+            choices_text(choices)
+        ))
+        .into())
+    }
+}
+
+fn choices_text(choices: &[&[u8]]) -> String {
+    choices
+        .iter()
+        .map(|choice| String::from_utf8_lossy(choice).into_owned())
+        .collect::<Vec<_>>()
+        .join(",")
+}
+
+fn unrecognized(argument: &[u8]) -> UsageError {
+    let mut message = b"unrecognized argument ".to_vec();
+    message.extend_from_slice(argument);
+    UsageError::new(message)
+}
+
+fn path_from_bytes(bytes: &[u8]) -> PathBuf {
+    super::path_from_qpdf_json_bytes(bytes)
+}
+
+fn path_description_bytes(path: &Path) -> Vec<u8> {
+    #[cfg(unix)]
+    {
+        use std::os::unix::ffi::OsStrExt;
+        path.as_os_str().as_bytes().to_vec()
+    }
+    #[cfg(not(unix))]
+    {
+        path.to_string_lossy().into_owned().into_bytes()
+    }
+}
+
+fn expand_arg_files(argv: Vec<Vec<u8>>) -> Result<Vec<Vec<u8>>> {
+    let mut iter = argv.into_iter();
+    let Some(program) = iter.next() else {
+        return Err(UsageError::new("qpdf argument vector is empty").into());
+    };
+    let mut expanded = vec![program];
+    for argument in iter {
+        if argument.len() <= 1 || argument[0] != b'@' {
+            expanded.push(argument);
+            continue;
+        }
+        let path = &argument[1..];
+        if path == b"-" {
+            let mut bytes = Vec::new();
+            std::io::stdin()
+                .read_to_end(&mut bytes)
+                .map_err(|error| Error::file_io("read argument file", "-", error))?;
+            expanded.extend(split_argument_file_lines(&bytes));
+            continue;
+        }
+        let path = path_from_bytes(path);
+        let mut file = match File::open(&path) {
+            Ok(file) => file,
+            Err(_) => {
+                expanded.push(argument);
+                continue;
+            }
+        };
+        let mut bytes = Vec::new();
+        file.read_to_end(&mut bytes)
+            .map_err(|error| Error::file_io("read argument file", path.clone(), error))?;
+        expanded.extend(split_argument_file_lines(&bytes));
+    }
+    Ok(expanded)
+}
+
+fn split_argument_file_lines(bytes: &[u8]) -> Vec<Vec<u8>> {
+    let mut lines = Vec::new();
+    let mut line = Vec::new();
+    for &byte in bytes {
+        if byte == b'\n' {
+            if line.last() == Some(&b'\r') {
+                line.pop();
+            }
+            lines.push(std::mem::take(&mut line));
+        } else {
+            line.push(byte);
+        }
+    }
+    if !line.is_empty() {
+        lines.push(line);
+    }
+    lines
+}
+
+#[derive(Default)]
+struct PagesState {
+    specs: Vec<PageArgSpec>,
+    called_range: bool,
+}
+
+struct PageArgSpec {
+    path: PathBuf,
+    password: Option<Vec<u8>>,
+    range: String,
+}
+
+impl PagesState {
+    fn push(&mut self, argument: &[u8]) -> Result<()> {
+        if let Some((name, value)) = option_parts(argument) {
+            match name {
+                b"file" => {
+                    let value = required_value(name, value, "file")?;
+                    self.add_file(path_from_bytes(value));
+                    return Ok(());
+                }
+                b"range" => {
+                    let value = required_value(name, value, "page-range")?;
+                    let value = std::str::from_utf8(value)
+                        .map_err(|_| UsageError::new("--range must be valid UTF-8"))?;
+                    self.add_range(value)?;
+                    return Ok(());
+                }
+                b"password" => {
+                    let value = required_value(name, value, "password")?;
+                    let current = self.specs.last_mut().ok_or_else(|| {
+                        UsageError::new("in --pages, --password must follow a file name")
+                    })?;
+                    if current.password.is_some() {
+                        return Err(
+                            UsageError::new("--password already specified for this file").into(),
+                        );
+                    }
+                    current.password = Some(value.to_vec());
+                    return Ok(());
+                }
+                _ => {}
+            }
+            return Err(self.unknown_option(argument).into());
+        }
+        if argument.first() == Some(&b'-') && argument != b"-" {
+            return Err(self.unknown_option(argument).into());
+        }
+
+        if self.specs.is_empty() {
+            self.add_file(path_from_bytes(argument));
+            return Ok(());
+        }
+        if self.called_range {
+            self.add_file(path_from_bytes(argument));
+            return Ok(());
+        }
+
+        if let Ok(range) = std::str::from_utf8(argument) {
+            if PageRange::parse_numrange(range).is_ok() {
+                self.add_range(range)?;
+                return Ok(());
+            }
+        }
+        let path = path_from_bytes(argument);
+        if argument == b"." || File::open(&path).is_ok() {
+            self.add_file(path);
+            Ok(())
+        } else {
+            Err(UsageError::new(String::from_utf8_lossy(argument).into_owned()).into())
+        }
+    }
+
+    fn add_file(&mut self, path: PathBuf) {
+        self.specs.push(PageArgSpec {
+            path,
+            password: None,
+            range: String::new(),
+        });
+        self.called_range = false;
+    }
+
+    fn add_range(&mut self, range: &str) -> Result<()> {
+        let current = self
+            .specs
+            .last_mut()
+            .ok_or_else(|| UsageError::new("in --range must follow a file name"))?;
+        if !current.range.is_empty() {
+            return Err(UsageError::new("--range already specified for this file").into());
+        }
+        PageRange::parse_numrange(range).map_err(|error| UsageError::new(error.to_string()))?;
+        current.range = range.to_owned();
+        self.called_range = true;
+        Ok(())
+    }
+
+    fn finish(self) -> Result<Vec<PageArgSpec>> {
+        if self.specs.is_empty() {
+            return Err(UsageError::new("--pages: no page specifications given").into());
+        }
+        Ok(self.specs)
+    }
+
+    fn unknown_option(&self, argument: &[u8]) -> UsageError {
+        let mut message = unrecognized(argument).what_bytes().to_vec();
+        message.extend_from_slice(b" (pages options must be terminated with --)");
+        UsageError::new(message)
+    }
+}
+
+struct UnderlayOverlayState {
+    kind: OverlayKind,
+    path: Option<PathBuf>,
+    password: Vec<u8>,
+    from: PageRange,
+    to: PageRange,
+    repeat: Option<PageRange>,
+}
+
+impl UnderlayOverlayState {
+    fn new(kind: OverlayKind) -> Self {
+        Self {
+            kind,
+            path: None,
+            password: Vec::new(),
+            from: PageRange::all(),
+            to: PageRange::all(),
+            repeat: None,
+        }
+    }
+
+    fn label(&self) -> &'static str {
+        match self.kind {
+            OverlayKind::Overlay => "overlay",
+            OverlayKind::Underlay => "underlay",
+        }
+    }
+
+    fn push(&mut self, argument: &[u8]) -> Result<()> {
+        if let Some((name, value)) = option_parts(argument) {
+            match name {
+                b"file" => {
+                    let value = required_value(name, value, "file")?;
+                    if self.path.is_some() {
+                        return Err(UsageError::new(format!(
+                            "{} file already specified",
+                            self.label()
+                        ))
+                        .into());
+                    }
+                    self.path = Some(path_from_bytes(value));
+                    return Ok(());
+                }
+                b"password" => {
+                    self.password = required_value(name, value, "password")?.to_vec();
+                    return Ok(());
+                }
+                b"to" => {
+                    self.to = parse_overlay_range(name, value, self.label(), false)?;
+                    return Ok(());
+                }
+                b"from" => {
+                    self.from = parse_overlay_range(name, value, self.label(), true)?;
+                    return Ok(());
+                }
+                b"repeat" => {
+                    self.repeat = Some(parse_overlay_range(name, value, self.label(), true)?);
+                    return Ok(());
+                }
+                _ => {}
+            }
+            return Err(self.unknown_option(argument).into());
+        }
+        if argument.first() == Some(&b'-') && argument != b"-" {
+            return Err(self.unknown_option(argument).into());
+        }
+        if self.path.is_some() {
+            return Err(UsageError::new(format!("{} file already specified", self.label())).into());
+        }
+        self.path = Some(path_from_bytes(argument));
+        Ok(())
+    }
+
+    fn finish(self) -> Result<Self> {
+        let Some(path) = self.path.as_ref() else {
+            return Err(UsageError::new(format!("{} file not specified", self.label())).into());
+        };
+        if path.as_os_str().is_empty() {
+            return Err(UsageError::new(format!("{} file not specified", self.label())).into());
+        }
+        Ok(self)
+    }
+
+    fn unknown_option(&self, argument: &[u8]) -> UsageError {
+        let mut message = unrecognized(argument).what_bytes().to_vec();
+        message.extend_from_slice(b" (underlay/overlay options must be terminated with --)");
+        UsageError::new(message)
+    }
+}
+
+fn parse_overlay_range(
+    name: &[u8],
+    value: Option<&[u8]>,
+    label: &str,
+    _from_range: bool,
+) -> Result<PageRange> {
+    let value = required_value(name, value, "page-range")?;
+    let value = std::str::from_utf8(value).map_err(|_| {
+        UsageError::new(format!(
+            "{label} --{} must be valid UTF-8",
+            String::from_utf8_lossy(name)
+        ))
+    })?;
+    if value.is_empty() {
+        return Ok(PageRange::empty());
+    }
+    Ok(PageRange::parse_numrange(value).map_err(|error| {
+        UsageError::new(format!(
+            "{label}: invalid --{}= page range {value:?}: {error}",
+            String::from_utf8_lossy(name)
+        ))
+    })?)
+}
+
+#[derive(Default)]
+struct AttachmentState {
+    path: Option<PathBuf>,
+    key: Option<Vec<u8>>,
+    filename: Option<Vec<u8>>,
+    mimetype: Option<Vec<u8>>,
+    description: Option<Vec<u8>>,
+    creation_date: Option<Vec<u8>>,
+    modification_date: Option<Vec<u8>>,
+    replace: bool,
+}
+
+impl AttachmentState {
+    fn push(&mut self, argument: &[u8]) -> Result<()> {
+        if let Some((name, value)) = option_parts(argument) {
+            match name {
+                b"key" => self.key = Some(required_value(name, value, "attachment-key")?.to_vec()),
+                b"filename" => {
+                    self.filename = Some(required_value(name, value, "filename")?.to_vec())
+                }
+                b"mimetype" => {
+                    let value = required_value(name, value, "mime/type")?;
+                    if !value.contains(&b'/') {
+                        return Err(UsageError::new(
+                            "mime type should be specified as type/subtype",
+                        )
+                        .into());
+                    }
+                    self.mimetype = Some(value.to_vec());
+                }
+                b"description" => {
+                    self.description = Some(required_value(name, value, "description")?.to_vec())
+                }
+                b"creationdate" => {
+                    self.creation_date = Some(parse_pdf_date(required_value(
+                        name,
+                        value,
+                        "creation-date",
+                    )?)?) // cov:ignore: LLVM maps the covered attachment date continuation to the call setup
+                }
+                b"moddate" => {
+                    self.modification_date = Some(parse_pdf_date(required_value(
+                        name,
+                        value,
+                        "modification-date",
+                    )?)?) // cov:ignore: LLVM maps the covered attachment date continuation to the call setup
+                }
+                b"replace" => self.replace = true,
+                _ => return Err(self.unknown(argument).into()),
+            }
+            return Ok(());
+        }
+        if argument.first() == Some(&b'-') && argument != b"-" {
+            return Err(self.unknown(argument).into());
+        }
+        self.path = Some(path_from_bytes(argument));
+        Ok(())
+    }
+
+    fn finish(self) -> Result<AttachmentAddOptions> {
+        let path = self
+            .path
+            .ok_or_else(|| UsageError::new("add attachment: no file specified"))?;
+        let basename = path
+            .file_name()
+            .map(path_component_to_qpdf_bytes)
+            .filter(|value| !value.is_empty())
+            .ok_or_else(|| UsageError::new("file for --add-attachment may not be empty"))?;
+        Ok(AttachmentAddOptions {
+            path,
+            key: self.key.unwrap_or_else(|| basename.clone()),
+            filename: self.filename.unwrap_or(basename),
+            mimetype: self.mimetype,
+            description: self.description,
+            creation_date: self.creation_date,
+            modification_date: self.modification_date,
+            replace: self.replace,
+            verbose: false,
+        })
+    }
+
+    fn unknown(&self, argument: &[u8]) -> UsageError {
+        let mut message = b"--add-attachment: unknown sub-flag or unexpected token ".to_vec();
+        message.extend_from_slice(argument);
+        UsageError::new(message)
+    }
+}
+
+fn parse_pdf_date(value: &[u8]) -> Result<Vec<u8>> {
+    let value = std::str::from_utf8(value)
+        .map_err(|_| UsageError::new("--add-attachment date must be valid UTF-8"))?;
+    let bytes = value.as_bytes();
+    let valid_body =
+        bytes.len() >= 16 && bytes[..2] == *b"D:" && bytes[2..16].iter().all(u8::is_ascii_digit);
+    let valid_suffix = match bytes.len() {
+        16 => true,
+        17 => bytes[16] == b'Z',
+        23 => {
+            matches!(bytes[16], b'+' | b'-')
+                && bytes[17].is_ascii_digit()
+                && bytes[18].is_ascii_digit()
+                && bytes[19] == b'\''
+                && bytes[20].is_ascii_digit()
+                && bytes[21].is_ascii_digit()
+                && bytes[22] == b'\''
+        }
+        _ => false,
+    };
+    if !valid_body || !valid_suffix {
+        return Err(UsageError::new(format!("{value} is not a valid PDF timestamp")).into());
+    }
+    Ok(bytes.to_vec())
+}
+
+#[derive(Default)]
+struct CopyAttachmentState {
+    path: Option<PathBuf>,
+    password: Vec<u8>,
+    prefix: Vec<u8>,
+}
+
+impl CopyAttachmentState {
+    fn push(&mut self, argument: &[u8]) -> Result<()> {
+        if let Some((name, value)) = option_parts(argument) {
+            match name {
+                b"password" => self.password = required_value(name, value, "password")?.to_vec(),
+                b"prefix" => self.prefix = required_value(name, value, "prefix")?.to_vec(),
+                _ => return Err(self.unknown(argument).into()),
+            }
+            return Ok(());
+        }
+        if argument.first() == Some(&b'-') && argument != b"-" {
+            return Err(self.unknown(argument).into());
+        }
+        self.path = Some(path_from_bytes(argument));
+        Ok(())
+    }
+
+    fn finish(self) -> Result<Self> {
+        if self
+            .path
+            .as_ref()
+            .is_none_or(|path| path.as_os_str().is_empty())
+        {
+            return Err(UsageError::new("copy attachments: no file specified").into());
+        }
+        Ok(self)
+    }
+
+    fn unknown(&self, argument: &[u8]) -> UsageError {
+        let mut message =
+            b"--copy-attachments-from: unknown sub-flag or unexpected token ".to_vec();
+        message.extend_from_slice(argument);
+        UsageError::new(message)
+    }
+}
+
+#[derive(Clone)]
+struct EncryptSubFlag {
+    original: Vec<u8>,
+    name: Vec<u8>,
+    value: Option<Vec<u8>>,
+}
+
+#[derive(Default)]
+struct EncryptionState {
+    positional: Vec<Vec<u8>>,
+    dashed_mode: bool,
+    positional_mode: bool,
+    user_password: Option<Vec<u8>>,
+    owner_password: Option<Vec<u8>>,
+    key_len: Option<u32>,
+    subflags: Vec<EncryptSubFlag>,
+}
+
+impl EncryptionState {
+    fn table_name(&self) -> &'static str {
+        match self.key_len {
+            Some(40) => "40-bit encryption",
+            Some(128) => "128-bit encryption",
+            Some(256) => "256-bit encryption",
+            _ => "encryption",
+        }
+    }
+
+    fn push(&mut self, argument: &[u8]) -> Result<()> {
+        if let Some((name, value)) = option_parts(argument) {
+            if matches!(name, b"user-password" | b"owner-password" | b"bits") {
+                if self.key_len.is_some() || self.positional_mode {
+                    return Err(self.unknown(argument).into());
+                }
+                let parameter = match name {
+                    b"user-password" => "user_password",
+                    b"owner-password" => "owner_password",
+                    b"bits" => "{40,128,256}",
+                    _ => unreachable!(), // cov:ignore: the selector is limited to user-password, owner-password, and bits
+                };
+                let value = required_value(name, value, parameter)?;
+                self.dashed_mode = true;
+                match name {
+                    b"user-password" => self.user_password = Some(value.to_vec()),
+                    b"owner-password" => self.owner_password = Some(value.to_vec()),
+                    b"bits" => self.key_len = Some(parse_encryption_key_len(value)?),
+                    _ => unreachable!(), // cov:ignore: the selector is limited to user-password, owner-password, and bits
+                }
+                return Ok(());
+            }
+            if !encryption_table_accepts(self.key_len, name) {
+                return Err(self.unknown(argument).into());
+            }
+            if self.dashed_mode && self.key_len.is_none() {
+                return Err(self.unknown(argument).into()); // cov:ignore: encryption_table_accepts makes this state unreachable
+            }
+            if !self.dashed_mode && self.positional.len() < 3 {
+                return Err(self.unknown(argument).into()); // cov:ignore: encryption_table_accepts makes this state unreachable
+            }
+            validate_encryption_choice(name, value, self.key_len.unwrap_or(0))?;
+            self.subflags.push(EncryptSubFlag {
+                original: argument.to_vec(),
+                name: name.to_vec(),
+                value: value.map(ToOwned::to_owned),
+            });
+            return Ok(());
+        }
+
+        if argument.first() == Some(&b'-') && argument != b"-" {
+            return Err(self.unknown(argument).into());
+        }
+        if self.dashed_mode {
+            return Err(UsageError::new(
+                "positional and dashed encryption arguments may not be mixed",
+            )
+            .into());
+        }
+        if self.positional.len() < 3 {
+            self.positional_mode = true;
+            self.positional.push(argument.to_vec());
+            if self.positional.len() == 3 {
+                self.key_len = Some(parse_encryption_key_len(argument)?);
+            }
+            return Ok(());
+        }
+        Err(self.unknown(argument).into())
+    }
+
+    fn finish(self) -> Result<EncryptParams> {
+        let (user_password, owner_password, key_len) = if self.dashed_mode {
+            (
+                self.user_password.clone().unwrap_or_default(),
+                self.owner_password.clone().unwrap_or_default(),
+                self.key_len
+                    .ok_or_else(|| UsageError::new("encryption key length is required"))?,
+            )
+        } else {
+            if self.positional.len() < 3 {
+                return Err(UsageError::new("encryption key length is required").into());
+            }
+            (
+                self.positional[0].clone(),
+                self.positional[1].clone(),
+                self.key_len
+                    .ok_or_else(|| UsageError::new("encryption key length is required"))?,
+            )
+        };
+
+        let mut use_aes = None;
+        let mut force_v4 = false;
+        let mut force_r5 = false;
+        let mut allow_insecure = false;
+        let mut cleartext_metadata = false;
+        let mut permissions = PermissionsConfig::default();
+        let mut r2_permissions = R2PermissionsConfig::default();
+
+        for subflag in &self.subflags {
+            let value = subflag.value.as_deref().unwrap_or_default();
+            match subflag.name.as_slice() {
+                b"use-aes" => use_aes = Some(parse_encryption_yn(value)?),
+                b"force-V4" => force_v4 = true,
+                b"force-R5" => force_r5 = true,
+                b"allow-insecure" => allow_insecure = true,
+                b"cleartext-metadata" => cleartext_metadata = true,
+                b"print" if key_len == 40 => r2_permissions.print = parse_encryption_yn(value)?,
+                b"print" => {
+                    permissions.print = match value {
+                        b"full" => PrintPermission::High,
+                        b"low" => PrintPermission::Low,
+                        b"none" => PrintPermission::None,
+                        _ => unreachable!("validated encryption print choice"), // cov:ignore: required_choice validates every encryption print value
+                    }
+                }
+                b"modify" if key_len == 40 => r2_permissions.modify = parse_encryption_yn(value)?,
+                b"modify" => {
+                    let (modify, annotate, forms, assemble) = match value {
+                        b"all" => (true, true, true, true),
+                        b"annotate" => (false, true, true, true),
+                        b"form" => (false, false, true, true),
+                        b"assembly" => (false, false, false, true),
+                        b"none" => (false, false, false, false),
+                        _ => unreachable!("validated encryption modify choice"), // cov:ignore: required_choice validates every encryption modify value
+                    };
+                    permissions.modify_contents = modify;
+                    permissions.annotate = annotate;
+                    permissions.fill_forms = forms;
+                    permissions.assemble = assemble;
+                }
+                b"extract" => {
+                    let value = parse_encryption_yn(value)?;
+                    if key_len == 40 {
+                        r2_permissions.extract = value;
+                    } else {
+                        permissions.extract = value;
+                    }
+                }
+                b"annotate" => {
+                    let value = parse_encryption_yn(value)?;
+                    if key_len == 40 {
+                        r2_permissions.annotate = value;
+                    } else {
+                        permissions.annotate = value;
+                    }
+                }
+                b"form" => permissions.fill_forms = parse_encryption_yn(value)?,
+                b"assemble" => permissions.assemble = parse_encryption_yn(value)?,
+                b"accessibility" => permissions.accessibility = parse_encryption_yn(value)?,
+                b"modify-other" => permissions.modify_contents = parse_encryption_yn(value)?,
+                _ => return Err(self.unknown(&subflag.original).into()), // cov:ignore: encryption_table_accepts admits only the arms above
+            }
+        }
+
+        let method = match key_len {
+            40 => EncryptMethod::V1Rc440,
+            128 if force_v4 || cleartext_metadata || use_aes == Some(true) => {
+                if use_aes.unwrap_or(false) {
+                    EncryptMethod::V4Aes128
+                } else {
+                    EncryptMethod::V4Rc4128
+                }
+            }
+            128 => EncryptMethod::V2Rc4128,
+            256 if force_r5 => EncryptMethod::V5R5Aes256,
+            256 => EncryptMethod::V5R6Aes256,
+            _ => unreachable!("encryption key length was validated"), // cov:ignore: parse_encryption_key_len admits only 40, 128, or 256
+        };
+
+        if key_len == 256
+            && owner_password.is_empty()
+            && !user_password.is_empty()
+            && !allow_insecure
+        {
+            return Err(UsageError::new(
+                "A PDF with a non-empty user password and an empty owner password encrypted with a 256-bit key is insecure as it can be opened without a password. If you really want to do this, you must also give the --allow-insecure option before the -- that follows --encrypt.",
+            )
+            .into());
+        }
+
+        let mut params = match method {
+            EncryptMethod::V1Rc440 => {
+                let mut params = EncryptParams::rc4(method, user_password, owner_password);
+                params.r2_permissions = r2_permissions;
+                params
+            }
+            EncryptMethod::V2Rc4128 => {
+                let mut params = EncryptParams::rc4(method, user_password, owner_password);
+                params.permissions = permissions;
+                params
+            }
+            EncryptMethod::V4Rc4128 | EncryptMethod::V4Aes128 => {
+                let mut params = if method == EncryptMethod::V4Aes128 {
+                    EncryptParams::v4_aes128(user_password, owner_password)
+                } else {
+                    EncryptParams::rc4(method, user_password, owner_password)
+                };
+                params.permissions = permissions;
+                params.permissions.accessibility = true;
+                params.encrypt_metadata = !cleartext_metadata;
+                params
+            }
+            EncryptMethod::V5R5Aes256 | EncryptMethod::V5R6Aes256 => {
+                let mut params = if method == EncryptMethod::V5R5Aes256 {
+                    EncryptParams::v5_r5(user_password, owner_password)
+                } else {
+                    EncryptParams::v5_r6(user_password, owner_password)
+                };
+                params.permissions = permissions;
+                params.permissions.accessibility = true;
+                params.encrypt_metadata = !cleartext_metadata;
+                params
+            }
+        };
+        // qpdf's `--accessibility=n` warning is emitted at writer setup and
+        // modern formats force the bit back on. The typed parameters retain
+        // that same effective state here.
+        if method == EncryptMethod::V4Aes128 || method == EncryptMethod::V4Rc4128 {
+            params.permissions.accessibility = true;
+        }
+        Ok(params)
+    }
+
+    fn unknown(&self, argument: &[u8]) -> UsageError {
+        let table = self.table_name();
+        let mut message = unrecognized(argument).what_bytes().to_vec();
+        message.extend_from_slice(b" (");
+        message.extend_from_slice(table.as_bytes());
+        message.extend_from_slice(b" options must be terminated with --)");
+        UsageError::new(message)
+    }
+}
+
+fn encryption_table_accepts(key_len: Option<u32>, name: &[u8]) -> bool {
+    match key_len {
+        None => matches!(name, b"user-password" | b"owner-password" | b"bits"),
+        Some(40) => matches!(name, b"extract" | b"annotate" | b"print" | b"modify"),
+        Some(128) => matches!(
+            name,
+            b"cleartext-metadata"
+                | b"force-V4"
+                | b"accessibility"
+                | b"extract"
+                | b"print"
+                | b"assemble"
+                | b"annotate"
+                | b"form"
+                | b"modify-other"
+                | b"modify"
+                | b"use-aes"
+        ),
+        Some(256) => matches!(
+            name,
+            b"cleartext-metadata"
+                | b"force-R5"
+                | b"allow-insecure"
+                | b"accessibility"
+                | b"extract"
+                | b"print"
+                | b"assemble"
+                | b"annotate"
+                | b"form"
+                | b"modify-other"
+                | b"modify"
+        ),
+        Some(_) => false, // cov:ignore: parse_encryption_key_len admits only 40, 128, or 256
+    }
+}
+
+fn validate_encryption_choice(name: &[u8], value: Option<&[u8]>, key_len: u32) -> Result<()> {
+    let choices: &[&[u8]] = match name {
+        b"accessibility" | b"extract" | b"annotate" | b"form" | b"assemble" | b"modify-other" => {
+            &[b"y", b"n"]
+        }
+        b"print" if key_len == 40 => &[b"y", b"n"],
+        b"print" => &[b"full", b"low", b"none"],
+        b"modify" if key_len == 40 => &[b"y", b"n"],
+        b"modify" => &[b"all", b"annotate", b"form", b"assembly", b"none"],
+        b"use-aes" => &[b"y", b"n"],
+        b"cleartext-metadata" | b"force-V4" | b"force-R5" | b"allow-insecure" => return Ok(()),
+        _ => return Ok(()), // cov:ignore: callers pass only names accepted by encryption_table_accepts
+    };
+    required_choice(name, value, choices).map(|_| ())
+}
+
+fn parse_encryption_key_len(value: &[u8]) -> Result<u32> {
+    match value {
+        b"40" => Ok(40),
+        b"128" => Ok(128),
+        b"256" => Ok(256),
+        _ => Err(UsageError::new("encryption key length must be 40, 128, or 256").into()),
+    }
+}
+
+fn parse_encryption_yn(value: &[u8]) -> Result<bool> {
+    match value {
+        b"y" => Ok(true),
+        b"n" => Ok(false),
+        _ => Err(UsageError::new("encryption option must be y or n").into()), // cov:ignore: required_choice validates every encryption y/n value before this helper
+    }
+}
+
+/// Handle qpdf's dynamically registered help-table options when they are the
+/// sole post-program argument. The full help prose remains a CLI presentation
+/// concern, but the library must accept the same table entries and terminate
+/// before it asks for an input file.
+fn handle_sole_help_option(job: &mut QPDFJob, argument: &[u8]) -> Result<bool> {
+    let Some((name, value)) = option_parts(argument) else {
+        return Ok(false);
+    };
+    match name {
+        b"version" | b"copyright" | b"show-crypto" | b"job-json-help" | b"completion-bash"
+        | b"completion-zsh" | b"help" | b"h" => {
+            job.argv_early_exit = true;
+            match name {
+                b"version" => job.logger.info(format!(
+                    "qpdf version {}\nRun qpdf --copyright to see copyright and license information.\n",
+                    crate::qpdf_version()
+                ))?, // cov:ignore: LLVM maps the covered version logger continuation to the call setup
+                b"copyright" => job.logger.info(format!(
+                    "qpdf version {}\n\nCopyright (c) 2005-2024 Jay Berkenbilt\nQPDF is licensed under the Apache License, Version 2.0 (the \"License\");\n",
+                    crate::qpdf_version()
+                ))?, // cov:ignore: LLVM maps the covered copyright logger continuation to the call setup
+                // Crypto-provider enumeration is owned by the process/CLI in
+                // qpdf. Recognition and early exit are the library contract;
+                // no provider registry is created merely to parse argv.
+                b"show-crypto" | b"completion-bash" | b"completion-zsh" | b"help" | b"h" => {}
+                b"job-json-help" => job.logger.info(
+                    super::job_json_schema()
+                        .unparse()
+                        .map_err(Error::from)?,
+                )?, // cov:ignore: LLVM maps the covered job-json-help logger continuation to the call setup
+                _ => unreachable!(), // cov:ignore: the outer match restricts this arm to the listed help names
+            }
+            Ok(true)
+        }
+        b"json-help" => {
+            let value = value.unwrap_or_default();
+            if !matches!(value, b"" | b"1" | b"2" | b"latest") {
+                return Err(UsageError::new(
+                    "--json-help must be given as --json-help={1,2,latest}",
+                )
+                .into());
+            }
+            let version = match value {
+                b"" | b"latest" => 2,
+                b"1" => 1,
+                b"2" => 2,
+                _ => {
+                    // cov:ignore-start: the preceding matches validate the json-help choice
+                    return Err(UsageError::new(
+                        "--json-help must be given as --json-help={1,2,latest}",
+                    )
+                    .into());
+                    // cov:ignore-end
+                } // cov:ignore: LLVM maps the validated json-help arm exit to the match body
+            }; // cov:ignore: LLVM maps the covered json-help version match continuation to its arms
+            let schema = crate::job::json::json_help_schema(version)
+                .map_err(|error| Error::System(error.to_string()))?;
+            job.argv_early_exit = true; // cov:ignore: json-help success is exercised; llvm-cov leaves this shared match assignment at zero in its duplicate record
+            job.logger.info(schema.unparse().map_err(Error::from)?)?;
+            Ok(true)
+        }
+        _ => Ok(false),
+    }
+} // cov:ignore: LLVM attributes the read-password helper boundary to its neighboring function records
+
+fn read_password_file(value: &[u8]) -> Result<Option<Vec<u8>>> {
+    let path = path_from_bytes(value);
+    let bytes = if value == b"-" {
+        let mut bytes = Vec::new();
+        std::io::stdin()
+            .read_to_end(&mut bytes)
+            .map_err(|error| Error::file_io("read password file", "-", error))?;
+        bytes
+    } else {
+        // cov:ignore: the file-backed branch is exercised; llvm-cov leaves this shared branch line at zero in its duplicate record
+        std::fs::read(&path)
+            .map_err(|error| Error::file_io("read password file", path.clone(), error))?
+    }; // cov:ignore: LLVM maps the covered password-file read continuation to its branch arms
+    if bytes.is_empty() {
+        // cov:ignore-start: these explanatory comments have no executable path
+        // QPDFJob::Config::passwordFile leaves the existing password intact
+        // when the input has no lines (`QPDFJob_config.cc:649-658`).
+        // cov:ignore-end
+        return Ok(None);
+    }
+    let first_line_len = bytes
+        .iter()
+        .position(|byte| *byte == b'\n')
+        .unwrap_or(bytes.len());
+    let mut password = bytes[..first_line_len].to_vec();
+    if password.last() == Some(&b'\r') {
+        password.pop();
+    }
+    Ok(Some(password))
+}

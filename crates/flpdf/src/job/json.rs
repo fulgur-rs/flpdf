@@ -494,6 +494,15 @@ fn output_schema(
     schema_dictionary(entries)
 }
 
+/// Build the schema printed by qpdf's sole-option `--json-help` callback.
+///
+/// The command-line callback and the JSON writer must use the same schema
+/// construction so the raw argv boundary cannot drift from the serializer's
+/// accepted output shape.
+pub(crate) fn json_help_schema(version: i32) -> Result<Json, JsonOutputError> {
+    output_schema(version, false, &[])
+}
+
 fn validate_json_schema(
     bytes: &[u8],
     version: i32,

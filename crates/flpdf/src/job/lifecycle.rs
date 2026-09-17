@@ -34,6 +34,9 @@ use std::io::{BufReader, Cursor, Read, Seek, Write};
 use std::path::{Path, PathBuf};
 use std::rc::Rc;
 
+#[path = "argv.rs"]
+mod argv;
+
 type ProgressHandler = Box<dyn FnMut(u8) -> Result<()> + 'static>;
 type SharedProgressHandler = Rc<RefCell<ProgressHandler>>;
 
@@ -172,9 +175,9 @@ impl Write for JobOutputWriter {
 
 /// Portable writer/input state populated by the qpdf job argv/JSON boundary.
 ///
-/// This is deliberately smaller than the CLI's clap model. It owns the
-/// settings needed for job initialization; full command-line transform
-/// dispatch remains in the operation-specific job slices.
+/// This owns the settings needed for qpdf job initialization and the later
+/// create/write/inspection stages. Native flpdf subcommand parsing remains in
+/// the CLI, but qpdf's flat option grammar terminates here.
 #[derive(Debug, Clone, Default)]
 struct JobConfiguration {
     input_file: Option<PathBuf>,
@@ -1300,94 +1303,6 @@ fn parse_job_page_labels(
     Ok(entries)
 }
 
-/// Expand qpdf's one-level `@file` argument syntax before any option in
-/// `argv` is inspected (`QPDFArgParser::handleArgFileArguments`,
-/// `QPDFArgParser.cc:232-260,437`). Each physical line in the file becomes
-/// one argument; a file that cannot be opened is left as an ordinary
-/// `@path` token for the regular parser, and lines read from a file are not
-/// rescanned for another `@file` reference. `argv[0]` (the program name) is
-/// never subject to expansion, matching qpdf's `for (i = 1; i < argc; ++i)`
-/// loop bound.
-///
-/// This function's `&[String]` signature only supports UTF-8 argument-file
-/// content, unlike `flpdf-cli`'s byte-preserving `@file` expansion over raw
-/// OS argv (`crates/flpdf-cli/src/arg_parser.rs::expand_arg_files`).
-fn expand_arg_files(argv: &[String]) -> Result<Vec<String>> {
-    let mut expanded = Vec::with_capacity(argv.len());
-    let mut iter = argv.iter();
-    if let Some(program) = iter.next() {
-        expanded.push(program.clone());
-    }
-    for argument in iter {
-        let Some(path) = argument.strip_prefix('@').filter(|path| !path.is_empty()) else {
-            expanded.push(argument.clone());
-            continue;
-        };
-        match read_argument_file_lines(path)? {
-            Some(lines) => expanded.extend(lines),
-            None => expanded.push(argument.clone()),
-        }
-    }
-    Ok(expanded)
-}
-
-/// Read one `@file` argument file, returning `None` when it cannot be
-/// opened so the caller preserves the original `@path` token as an ordinary
-/// argument (`QPDFArgParser.cc:238-243`). `-` reads from standard input
-/// instead, without qpdf's openability probe (`QPDFArgParser.cc:239`, which
-/// only guards a non-`-` `argfile`).
-fn read_argument_file_lines(path: &str) -> Result<Option<Vec<String>>> {
-    let bytes = if path == "-" {
-        // cov:ignore-start: reads this process's real stdin (QPDFArgParser.cc:239
-        // exempts "-" from the openability probe), which an in-process
-        // `cargo test` binary cannot redirect per test without process-level
-        // tricks. `crates/flpdf-cli` exercises the equivalent `-` stdin path
-        // for its own argv/password readers via real subprocess stdin piping
-        // (`crates/flpdf-cli/tests/cli_zlib_flate.rs`), but `initialize_from_argv`
-        // itself has no CLI caller yet to spawn as a subprocess against.
-        let mut bytes = Vec::new();
-        std::io::stdin()
-            .read_to_end(&mut bytes)
-            .map_err(|error| Error::file_io("read argument file", "-", error))?;
-        bytes
-        // cov:ignore-end
-    } else {
-        let mut file = match File::open(path) {
-            Ok(file) => file,
-            Err(_) => return Ok(None),
-        };
-        let mut bytes = Vec::new();
-        file.read_to_end(&mut bytes)
-            .map_err(|error| Error::file_io("read argument file", path, error))?;
-        bytes
-    };
-    Ok(Some(split_argument_file_lines(&bytes)))
-}
-
-/// Split argument-file bytes into physical lines, matching qpdf's
-/// `QUtil::read_lines_from_file(..., preserve_eol=false)`: a trailing `\r`
-/// immediately before `\n` is stripped, and a final line with no trailing
-/// newline is still kept.
-fn split_argument_file_lines(bytes: &[u8]) -> Vec<String> {
-    let text = String::from_utf8_lossy(bytes);
-    let mut lines = Vec::new();
-    let mut line = String::new();
-    for ch in text.chars() {
-        if ch == '\n' {
-            if line.ends_with('\r') {
-                line.pop();
-            }
-            lines.push(std::mem::take(&mut line));
-        } else {
-            line.push(ch);
-        }
-    }
-    if !line.is_empty() {
-        lines.push(line);
-    }
-    lines
-}
-
 /// qpdf-compatible status returned by a completed job.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 #[repr(i32)]
@@ -1472,6 +1387,10 @@ pub struct QPDFJob {
     /// partial JSON sequence starts fresh, while CLI settings before the first
     /// sequence remain visible to qpdf's shared Config.
     has_run: bool,
+    /// qpdf's help/version callbacks terminate the argv entry point before a
+    /// document lifecycle starts. Keep that result on the job so a caller that
+    /// uniformly invokes `run` observes the same successful early exit.
+    argv_early_exit: bool,
 }
 
 /// Fluent configuration proxy for the qpdf `QPDFJob::Config` surface.
@@ -1571,6 +1490,7 @@ impl QPDFJob {
             empty_primary_created: false,
             partial_json_initialized: false,
             has_run: false,
+            argv_early_exit: false,
         }
     }
 
@@ -1992,14 +1912,15 @@ impl QPDFJob {
             .register_progress_reporter(Box::new(move |percent| (reporter.borrow_mut())(percent)));
     }
 
-    /// Initialize the qpdf-compatible argument set supported by this job.
+    /// Initialize the complete qpdf 11.9.0 argument set supported by this job.
     ///
-    /// This mirrors `QPDFJob::initializeFromArgv` for one input, one output,
-    /// replace-input, deterministic/static IDs, object-stream mode, password,
-    /// decrypt, check, progress reporting, and the `--keep-files-open`
-    /// options. Other command-line options are handled by the CLI.
+    /// This is the library-owned counterpart of
+    /// `QPDFJob::initializeFromArgv`: all generated main-table options and the
+    /// pages, encryption, underlay/overlay, attachment, copy-attachment, and
+    /// page-label option tables mutate this job's one `JobConfiguration`.
+    /// Native flpdf subcommands remain a separate CLI surface.
     ///
-    /// The argv grammar foundation matches `QPDFArgParser::parseArgs`
+    /// The argv grammar matches `QPDFArgParser::parseArgs`
     /// (`QPDFArgParser.cc:429-560`): a one-level `@file` expansion runs
     /// before any option is inspected, and a top-level `--` resets to the
     /// main option table rather than ending option parsing (an option
@@ -2012,132 +1933,29 @@ impl QPDFJob {
     /// same [`Error::Usage`] arms this function already raises for its other
     /// qpdf-compatible options.
     pub fn initialize_from_argv(&mut self, argv: &[String]) -> Result<()> {
-        let argv = expand_arg_files(argv)?;
-        let mut configuration = JobConfiguration::default();
-        let mut positionals = Vec::new();
-        let mut page_label_specs: Option<Vec<String>> = None;
+        let raw = argv
+            .iter()
+            .map(|argument| argument.as_bytes().to_vec())
+            .collect::<Vec<_>>();
+        self.initialize_from_raw_argv(&raw)
+    }
 
-        for argument in argv.iter().skip(1) {
-            if let Some(specs) = page_label_specs.as_mut() {
-                if argument == "--" {
-                    let parsed = std::mem::take(specs)
-                        .into_iter()
-                        .map(|spec| parse_page_label_spec(spec.as_bytes()))
-                        .collect::<Result<Vec<_>>>()?;
-                    configuration.set_page_labels = Some(parsed);
-                    page_label_specs = None;
-                    continue;
-                }
-                if argument.len() > 1 && argument.starts_with('-') {
-                    return Err(UsageError::new(format!(
-                        "unrecognized argument {argument} (set page labels options must be terminated with --)"
-                    ))
-                    .into());
-                }
-                specs.push(argument.clone());
-                continue;
-            }
-            if argument == "--" {
-                // qpdf's `--` is a main-option-table reset, not an
-                // end-of-options terminator (`QPDFArgParser.cc:447-451,543`):
-                // the token itself is dropped and parsing resumes in the
-                // same (already main) table, so a following `--`-prefixed
-                // token is still recognized as an option.
-                continue;
-            }
-            if argument.starts_with("--") {
-                match argument.as_str() {
-                    "--remove-page-labels" => configuration.remove_page_labels = true,
-                    "--set-page-labels" => page_label_specs = Some(Vec::new()),
-                    "--deterministic-id" => configuration.writer.set_deterministic_id(true),
-                    "--static-id" => configuration.writer.set_static_id(true),
-                    "--replace-input" => {
-                        // `ArgParser::argReplaceInput` reaches
-                        // `Config::replaceInput` for every occurrence of the
-                        // flag (`libqpdf/QPDFJob_argv.cc:91-96`), and that
-                        // setter rejects a second output selection —
-                        // `replace_input` being already set counts
-                        // (`libqpdf/QPDFJob_config.cc:53-61`).
-                        if configuration.replace_input {
-                            return Err(UsageError::new(
-                                "replace-input can't be used since output file has already been given",
-                            )
-                            .into());
-                        }
-                        configuration.replace_input = true;
-                    }
-                    "--decrypt" => {
-                        configuration.writer.set_preserve_encryption(false);
-                    }
-                    "--progress" => configuration.progress = true,
-                    "--check" => configuration.check = true,
-                    _ if argument.starts_with("--keep-files-open=") => {
-                        let value = &argument["--keep-files-open=".len()..];
-                        configuration.keep_files_open = match value {
-                            "y" => Some(true),
-                            "n" => Some(false),
-                            _ => {
-                                return Err(UsageError::new(format!(
-                                    "invalid value for --keep-files-open: {value}"
-                                ))
-                                .into())
-                            }
-                        };
-                    }
-                    _ if argument.starts_with("--keep-files-open-threshold=") => {
-                        let value = &argument["--keep-files-open-threshold=".len()..];
-                        configuration.keep_files_open_threshold =
-                            Some(parse_qpdf_collate_uint(value.as_bytes())?);
-                    }
-                    _ if argument.starts_with("--password=") => {
-                        configuration.password = argument.as_bytes()[11..].to_vec();
-                    }
-                    _ if argument.starts_with("--object-streams=") => {
-                        configuration
-                            .writer
-                            .set_object_stream_mode(parse_object_stream_mode(&argument[17..])?);
-                    }
-                    _ => {
-                        return Err(
-                            UsageError::new(format!("unrecognized argument {argument}")).into()
-                        );
-                    }
-                }
-            } else if argument.starts_with('-') {
-                return Err(UsageError::new(format!("unrecognized argument {argument}")).into());
-            } else {
-                positionals.push(argument.clone());
-            }
-        }
-
-        if page_label_specs.is_some() {
-            return Err(UsageError::new("missing -- at end of set page labels options").into());
-        }
-
-        if positionals.len() > 2 {
-            return Err(UsageError::new(format!("unknown argument {}", positionals[2])).into());
-        }
-        configuration.input_file = positionals.first().map(PathBuf::from);
-        configuration.output_file = positionals.get(1).map(PathBuf::from);
-        if configuration.replace_input && configuration.output_file.is_some() {
-            return Err(UsageError::new(
-                "replace-input can't be used since output file has already been given",
-            )
-            .into());
-        }
-        if configuration.input_file.is_none() && !configuration.check {
-            return Err(UsageError::new("an input file name is required").into());
-        }
-
-        self.configuration = configuration;
-        let input_name = self
-            .configuration
-            .input_file
-            .as_ref()
-            .map_or_else(String::new, |path| path.display().to_string());
-        self.set_input_name(input_name);
-        self.warnings = false;
-        Ok(())
+    /// Initialize the job from qpdf's raw argv byte boundary.
+    ///
+    /// qpdf's `QPDFArgParser` receives `char const*` values and passes the
+    /// original bytes directly to `QPDFJob::Config` callbacks. Keeping this
+    /// entry point generic over `AsRef<[u8]>` lets Unix callers supply literal
+    /// non-UTF-8 paths and passwords while the existing [`Self::initialize_from_argv`]
+    /// remains a checked UTF-8 convenience wrapper.
+    ///
+    /// The parser owns the complete qpdf 11.9.0 option-table grammar. Native
+    /// flpdf subcommands are intentionally outside this library boundary.
+    pub fn initialize_from_raw_argv<A: AsRef<[u8]>>(&mut self, argv: &[A]) -> Result<()> {
+        let raw = argv
+            .iter()
+            .map(|argument| argument.as_ref().to_vec())
+            .collect::<Vec<_>>();
+        argv::initialize(self, raw)
     }
 
     /// Initialize the qpdf-compatible job-JSON fields supported by this
@@ -3628,6 +3446,9 @@ impl QPDFJob {
 
     /// Run the configured create/write or check lifecycle.
     pub fn run(&mut self) -> Result<JobExitCode> {
+        if self.argv_early_exit {
+            return Ok(JobExitCode::Success);
+        }
         self.partial_json_initialized = false;
         self.has_run = true;
         if self.configuration.is_encrypted || self.configuration.requires_password {

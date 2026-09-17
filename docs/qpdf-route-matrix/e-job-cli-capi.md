@@ -1191,6 +1191,25 @@ missing job-jsonのexit/stdout/stderrをqpdf 11.9.0と比較する。新しいbr
 deviation markerは追加しない。
 
 
+### E-17 bounded canonical raw argv initializer (`flpdf-3yn9.48.147`, 2026-09-17)
+
+The pinned qpdf boundary is `QPDFArgParser::parseArgs` → `QPDFJob::Config`
+callbacks → `run` / `getExitCode` (`qpdf/qpdf.cc:27-43`,
+`libqpdf/QPDFArgParser.cc:429-566`, and `qpdf/auto_job_init.hh`). The
+library now exposes `QPDFJob::initialize_from_raw_argv`, and the UTF-8
+`initialize_from_argv` convenience wrapper delegates to it. The parser owns
+the generated main/pages/encryption/underlay-overlay/attachment/copy-attachment/
+page-label option tables, raw Unix path/password bytes, one-level `@file`
+expansion, top-level `--` reset, immediate parameter/choice validation, and
+same-job `jobJsonFile` layering.
+
+The existing qtest/C API consumers remain on this canonical initializer, while
+the production CLI is intentionally not switched in this prerequisite issue;
+E-17/E-21 therefore remain `mixed` until the separate flat-CLI consumer
+migration. Focused raw-boundary tests cover the option registry, non-UTF-8
+argv, page/encryption segments, job-JSON occurrence ordering, and a qpdf 11.9.0
+output differential.
+
 ### E-17 / E-21 argv-order parse validation (`flpdf-godwa`, 2026-09-16)
 
 qpdfの `QPDFArgParser::parseArgs` は required parameter / choices と各 callbackを

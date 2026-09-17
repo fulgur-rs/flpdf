@@ -32,6 +32,7 @@
 | `crates/flpdf/src/form_field_object_helper.rs` | correspondence | \`QPDFFormFieldObjectHelper.cc\` |
 | `crates/flpdf/src/form_field_object_helper/rendering.rs` | correspondence | \`QPDFFormFieldObjectHelper.cc\` rendering primitives |
 | `crates/flpdf/src/job/acroform_field_prune.rs` | correspondence | QPDFJob.cc removal of unreferenced form fields after page selection |
+| `crates/flpdf/src/job/argv.rs` | correspondence | \`QPDFArgParser.cc:429-566\`, \`QPDFJob_argv.cc\`, \`QPDFJob_config.cc\`, and \`qpdf/auto_job_init.hh\` |
 | `crates/flpdf/src/job/attachment_list.rs` | correspondence | QPDFJob.cc attachment enumeration and display formatting |
 | `crates/flpdf/src/job/attachments.rs` | correspondence | \`QPDFJob::copyAttachments\`, \`QPDFJob::addAttachments\`, \`QPDFJob::doListAttachments\`, and \`QPDFJob::doShowAttachment\` |
 | `crates/flpdf/src/job/check.rs` | correspondence | \`QPDFJob::doCheck\` and \`QPDFJob::doInspection\` (\`libqpdf/QPDFJob.cc:745-803,1646-1693\`) |

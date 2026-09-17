@@ -1963,6 +1963,14 @@ parser、bridge、qpdf-deviation markerは追加しない。
 related-option と footer は `libqpdf/qpdf/auto_job_help.hh`（qpdf 11.9.0 pin）に対応し、未移植の
 topic body は後続の parity slice として扱う。
 
+2026-09-17（`flpdf-3yn9.48.147`）: `QPDFJob::initialize_from_raw_argv` を追加し、
+`initialize_from_argv` は同じbyte-preserving parserへ委譲するようにした。main/pages/
+encryption/underlay-overlay/attachment/copy-attachment/page-label option table、
+`@argfile`、top-level `--` reset、job-json occurrence order、Unix non-UTF-8 argvを
+既存の一つの `JobConfiguration` に反映する。qpdf 11.9.0とのwriter output differentialと
+job lifecycle回帰を追加した。flpdf-cliのproduction consumerはまだこのprerequisiteへ
+切り替えていないため、CLI全体のargv routeはE-17/E-21 mixedのまま別issueで扱う。
+
 qpdf の CLI は `qpdf/qpdf.cc:27-60` の native `char* argv[]` を
 `QPDFJob::initializeFromArgv`（`QPDFJob_argv.cc:418-427`）へ渡し、
 `QPDFArgParser.cc:12-29,438-502` は argv token を `std::string` として扱う。
