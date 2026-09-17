@@ -2121,12 +2121,11 @@ fn program_name_bytes(argv0: &[u8]) -> &[u8] {
         .rposition(|byte| *byte == b'/')
         .or_else(|| argv0.iter().rposition(|byte| *byte == b'\\'));
     let name = separator.map_or(argv0, |index| &argv0[index + 1..]);
-    let name = if name.len() > 4 && name.ends_with(b".exe") {
+    if name.len() > 4 && name.ends_with(b".exe") {
         &name[..name.len() - 4]
     } else {
         name
-    };
-    name
+    }
 }
 
 fn program_name(argv0: &[u8]) -> String {
@@ -2246,7 +2245,7 @@ fn crypto_provider_output(provider: &str, registered: &[String]) -> String {
     output.push('\n');
     for name in registered {
         if name != provider {
-            output.push_str(&name);
+            output.push_str(name);
             output.push('\n');
         }
     }
