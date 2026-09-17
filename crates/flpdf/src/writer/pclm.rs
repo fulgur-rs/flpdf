@@ -1,235 +1,18 @@
-//! Plan object numbering for PCLm output. Page objects, content streams, image
-//! strips, and image-transform streams are queued before the Catalog, while
-//! references discovered during serialization are appended to the live queue.
+//! PCLm writer behavior.
+//!
+//! The PCLm enqueue order itself lives with qpdf's one standard-writer queue
+//! in [`crate::writer::plain::body`] (`QPDFWriter::enqueueObjectsPCLm`); this
+//! module holds the PCLm-specific regression coverage for the route that
+//! queue drives.
 //!
 //! qpdf correspondence: `QPDFWriter::enqueueObjectsPCLm`.
-//!
-//!
-
-use std::collections::{BTreeMap, HashMap, VecDeque};
-use std::io::{Read, Seek};
-
-use crate::writer::rewrite_renumber::collect_canonical_enqueue_refs;
-use crate::{ObjectHandle, ObjectRef, Pdf, Result};
-
-#[derive(Clone, Debug, PartialEq, Eq)]
-pub(crate) enum Item {
-    Source {
-        source: ObjectRef,
-        output: ObjectRef,
-    },
-    Synthetic {
-        output: ObjectRef,
-    },
-}
-
-#[derive(Clone, Debug)]
-pub(crate) struct Plan {
-    pub(crate) items: Vec<Item>,
-    /// Remapped Catalog identity when the source `/Root` is indirect.
-    pub(crate) root: Option<ObjectRef>,
-    /// Canonical Catalog handle when the source `/Root` is direct.
-    pub(crate) direct_root: Option<ObjectHandle>,
-}
-
-impl Plan {
-    pub(crate) fn build<R: Read + Seek>(pdf: &mut Pdf<R>) -> Result<Self> {
-        let root_candidate = pdf.trailer_key_handle(b"Root");
-        // Only a direct null or an absent /Root short-circuits here. An
-        // indirect value must reach `root_handle()`, whose dictionary gate is
-        // qpdf's: `QPDF::getRoot` tests `root.isDictionary()`
-        // (`libqpdf/QPDF.cc:2355-2360`), which dereferences first
-        // (`QPDFObjectHandle.cc:432-435`), so an indirect reference resolving to
-        // null reports "unable to find /Root dictionary" rather than a missing
-        // key.
-        if !root_candidate.is_indirect() && root_candidate.try_is_null()? {
-            return Err(crate::Error::Missing("/Root"));
-        }
-        let root_handle = pdf.root_handle()?;
-        let root_ref = root_handle.object_ref();
-        let direct_root = root_ref.is_none().then_some(root_handle);
-        let mut builder = Builder {
-            pdf,
-            items: Vec::new(),
-            old_to_new: HashMap::new(),
-            next_output: 1,
-        };
-
-        for page in crate::pages::page_refs(builder.pdf)? {
-            let _ = builder.enqueue_reference(page);
-
-            let page_handle = builder.pdf.get_object_handle(page);
-            page_handle.try_dereference()?;
-            if !page_handle.try_is_dictionary()? {
-                continue; // cov:ignore: page_refs yields only dictionary /Type /Page leaves
-            }
-
-            let contents = page_handle.try_get_key(b"/Contents")?;
-            if !contents.try_is_null()? {
-                builder.enqueue_handle_with_stream_length_policy(&contents)?;
-            }
-
-            for image in builder.page_xobjects(&page_handle)? {
-                builder.enqueue_handle_with_stream_length_policy(&image)?;
-                builder.enqueue_synthetic();
-            }
-        }
-
-        let root = if let Some(root) = root_ref {
-            builder.enqueue_reference(root)
-        } else if let Some(root) = direct_root.as_ref() {
-            builder.enqueue_handle_with_stream_length_policy(root)?; // cov:ignore: direct-root enqueue is exercised by PCLm integration tests; LLVM maps this continuation to the call setup.
-            None
-        } else {
-            // cov:ignore-start: root_handle returns a direct Catalog handle whenever root_ref is absent.
-            None
-            // cov:ignore-end
-        }; // cov:ignore: direct-root enqueue executes above; LLVM places this branch-exit counter on an uninstrumented continuation line.
-        if root_ref.is_some() && root.is_none() {
-            return Err(crate::Error::Missing("/Root")); // cov:ignore: enqueue_reference always inserts an indirect PCLm root before the plan map is read.
-        }
-        Ok(Self {
-            items: builder.items,
-            root,
-            direct_root,
-        })
-    }
-}
-
-struct Builder<'pdf, R: Read + Seek + 'static> {
-    pdf: &'pdf mut Pdf<R>,
-    items: Vec<Item>,
-    old_to_new: HashMap<ObjectRef, ObjectRef>,
-    next_output: u32,
-}
-
-impl<R: Read + Seek + 'static> Builder<'_, R> {
-    fn enqueue_reference(&mut self, source: ObjectRef) -> Option<ObjectRef> {
-        if source.number == 0 || self.old_to_new.contains_key(&source) {
-            return self.old_to_new.get(&source).copied();
-        }
-        let output = ObjectRef::new(self.next_output, 0);
-        self.next_output = self.next_output.saturating_add(1);
-        self.old_to_new.insert(source, output);
-        self.items.push(Item::Source { source, output });
-        Some(output)
-    }
-
-    fn enqueue_synthetic(&mut self) {
-        let output = ObjectRef::new(self.next_output, 0);
-        self.next_output = self.next_output.saturating_add(1);
-        self.items.push(Item::Synthetic { output });
-    }
-
-    /// Enqueue the indirect descendants of a direct Catalog through the live
-    /// handle graph. qpdf's `enqueueObject` recurses through a direct
-    /// dictionary without assigning it an object number; the canonical
-    /// collector supplies the same key/array order and skips a stream's
-    /// output-owned `/Length` edge.
-    fn enqueue_handle_with_stream_length_policy(&mut self, value: &ObjectHandle) -> Result<()> {
-        let mut references = Vec::new();
-        collect_canonical_enqueue_refs(self.pdf, value, 0, true, &mut references)?;
-        for reference in references {
-            let _ = self.enqueue_reference(reference);
-        }
-        Ok(())
-    }
-
-    fn page_xobjects(&mut self, page: &ObjectHandle) -> Result<Vec<ObjectHandle>> {
-        let resources = page.try_get_key(b"/Resources")?;
-        let xobjects = resources.try_get_key(b"/XObject")?;
-        xobjects
-            .try_get_keys()?
-            .into_iter()
-            .map(|key| xobjects.try_get_key(&key))
-            .collect()
-    }
-}
-
-/// qpdf's mutable `object_queue` after the PCLm-only initial enqueue pass.
-///
-/// The plan above reserves only page/content/image/synthetic/root numbers.
-/// Indirect children encountered while serializing those values are appended
-/// here, at the same `unparseChild` boundary that grows qpdf's queue.
-pub(crate) struct EmissionQueue {
-    pending: VecDeque<Item>,
-    old_to_new: BTreeMap<ObjectRef, ObjectRef>,
-    next_output: u32,
-}
-
-impl EmissionQueue {
-    pub(crate) fn from_plan(plan: &Plan) -> Result<Self> {
-        let mut old_to_new = BTreeMap::new();
-        let mut next_output = 1_u32;
-        for item in &plan.items {
-            let output = match *item {
-                Item::Source { source, output } => {
-                    old_to_new.insert(source, output);
-                    output
-                }
-                Item::Synthetic { output } => output,
-            };
-            next_output = output.number.checked_add(1).ok_or_else(|| {
-                crate::Error::Unsupported("PCLm object number overflows u32".to_string())
-            })?;
-        }
-        Ok(Self {
-            pending: plan.items.iter().cloned().collect(),
-            old_to_new,
-            next_output,
-        })
-    }
-
-    pub(crate) fn pop(&mut self) -> Option<Item> {
-        self.pending.pop_front()
-    }
-
-    pub(crate) fn enqueue_handle<R: Read + Seek>(
-        &mut self,
-        pdf: &Pdf<R>,
-        handle: ObjectHandle,
-    ) -> Result<ObjectRef> {
-        if handle.owning_pdf_unique_id() != Some(pdf.unique_id()) {
-            return Err(crate::Error::Internal(
-                "QPDFObjectHandle from different QPDF found while writing.  Use QPDF::copyForeignObject to add objects from another file."
-                    .to_string(),
-            ));
-        }
-        let source = handle.object_ref().ok_or_else(|| {
-            crate::Error::Internal("PCLm dynamic child has no indirect identity".to_string())
-        })?;
-        if let Some(output) = self.old_to_new.get(&source).copied() {
-            return Ok(output);
-        }
-        let output = ObjectRef::new(self.next_output, 0);
-        self.next_output = self.next_output.checked_add(1).ok_or_else(|| {
-            crate::Error::Unsupported("PCLm object number overflows u32".to_string())
-        })?;
-        self.old_to_new.insert(source, output);
-        self.pending.push_back(Item::Source { source, output });
-        Ok(output)
-    }
-
-    pub(crate) fn object_count(&self) -> Result<usize> {
-        // cov:ignore-start: the PCLm queue uses a u32 counter and supported targets represent it in usize.
-        usize::try_from(self.next_output).map_err(|_| {
-            crate::Error::Unsupported("PCLm object count does not fit in usize".to_string())
-        })
-        // cov:ignore-end
-    }
-
-    pub(crate) fn into_old_to_new(self) -> BTreeMap<ObjectRef, ObjectRef> {
-        self.old_to_new
-    }
-}
 
 #[cfg(test)]
 mod tests {
-    use super::*;
     use crate::pipeline::{Pipeline, PipelineError, PipelineResult};
     use crate::token_filter::{TokenFilter, TokenFilterOutput};
     use crate::tokenizer::{Token, TokenType};
-    use crate::{Error, PdfWriter, StreamDataProvider};
+    use crate::{Error, ObjectHandle, ObjectRef, Pdf, PdfWriter, Result, StreamDataProvider};
     use std::cell::RefCell;
     use std::io::{self, Cursor, Read, Seek, SeekFrom, Write};
     use std::path::PathBuf;
@@ -505,6 +288,17 @@ mod tests {
         writer
     }
 
+    /// Drive the PCLm route the way a caller does, returning the emitted
+    /// bytes or the first writer error.
+    fn write_pclm_bytes<R: std::io::Read + Seek + 'static>(pdf: &mut Pdf<R>) -> Result<Vec<u8>> {
+        let mut writer = PdfWriter::new(pdf);
+        writer.set_pclm(true);
+        writer.set_static_id(true);
+        writer.set_output_memory()?;
+        writer.write()?;
+        writer.get_buffer()
+    }
+
     fn exact_qpdf_11_9() -> bool {
         Command::new("qpdf")
             .arg("--version")
@@ -600,101 +394,44 @@ mod tests {
         assert!(pinned_qpdf_source_from(std::path::Path::new("/bin/false")).is_none());
     }
 
+    /// qpdf's PCLm seed enqueues pages, their contents, their strips, one
+    /// image-transform stream per strip, and finally `/Root`
+    /// (`QPDFWriter::enqueueObjectsPCLm`, `libqpdf/QPDFWriter.cc:2927-2955`).
+    /// A Catalog child is not part of that seed: it is discovered when the
+    /// Catalog itself is unparsed, so it is numbered after every seeded
+    /// object.
     #[test]
-    fn plan_retains_only_qpdfs_initial_pclm_enqueue_order() {
+    fn pclm_catalog_child_is_numbered_after_the_initial_enqueue() {
         let mut pdf = one_page_fixture_pdf();
         let child = pdf
             .make_indirect_from_object_handle(ObjectHandle::string(b"late-child".to_vec()))
             .expect("allocate a Catalog child");
-        let child_ref = child.object_ref().expect("indirect child identity");
         pdf.root_handle()
             .expect("resolve Catalog")
             .replace_key(b"/LateChild", child)
             .expect("attach Catalog child");
 
-        let plan = Plan::build(&mut pdf).expect("build initial PCLm enqueue plan");
+        let mut writer = configure_pclm_writer(&mut pdf);
+        writer.set_output_memory().expect("install memory output");
+        writer.write().expect("write PCLm output");
+        let output = writer.get_buffer().expect("PCLm output bytes");
+        let output = String::from_utf8_lossy(&output);
 
+        // The one-page fixture seeds page, contents, and Catalog, so the
+        // Catalog is object 3. Everything numbered above 3 was discovered
+        // while a seeded object was unparsed: the page's own children first,
+        // then the Catalog's.
+        let catalog = output
+            .split_once("\n3 0 obj\n")
+            .expect("PCLm Catalog is the last seeded object")
+            .1;
         assert!(
-            !plan
-                .items
-                .iter()
-                .any(|item| matches!(item, Item::Source { source, .. } if *source == child_ref)),
-            "a Catalog child belongs to emission-time discovery, not the initial PCLm plan"
+            catalog.starts_with("<< /LateChild 6 0 R"),
+            "a Catalog child belongs to emission-time discovery: {catalog:.120}"
         );
-    }
-
-    #[test]
-    fn builder_deduplicates_references_and_ignores_object_zero() {
-        let mut pdf = one_page_fixture_pdf();
-        let source = pdf.root_ref().expect("fixture Catalog");
-        let mut builder = Builder {
-            pdf: &mut pdf,
-            items: Vec::new(),
-            old_to_new: HashMap::new(),
-            next_output: 1,
-        };
-
-        assert_eq!(builder.enqueue_reference(ObjectRef::new(0, 0)), None);
-        let first = builder
-            .enqueue_reference(source)
-            .expect("first reference gets a number");
-        assert_eq!(builder.enqueue_reference(source), Some(first));
-        assert_eq!(builder.items.len(), 1);
-    }
-
-    #[test]
-    fn emission_queue_reports_invalid_dynamic_children_and_number_overflow() {
-        let overflowing_plan = Plan {
-            items: vec![Item::Synthetic {
-                output: ObjectRef::new(u32::MAX, 0),
-            }],
-            root: None,
-            direct_root: None,
-        };
-        let error = EmissionQueue::from_plan(&overflowing_plan)
-            .err()
-            .expect("a plan ending at u32::MAX cannot reserve a next object");
         assert!(
-            matches!(error, Error::Unsupported(message) if message.contains("object number overflows"))
-        );
-
-        let mut local_pdf = one_page_fixture_pdf();
-        let mut foreign_pdf = one_page_fixture_pdf();
-        let mut queue = EmissionQueue::from_plan(&Plan {
-            items: Vec::new(),
-            root: None,
-            direct_root: None,
-        })
-        .expect("empty emission queue");
-        let error = queue
-            .enqueue_handle(
-                &local_pdf,
-                foreign_pdf.root_handle().expect("foreign Catalog"),
-            )
-            .expect_err("foreign dynamic children must be rejected");
-        assert!(matches!(error, Error::Internal(message) if message.contains("different QPDF")));
-
-        let direct_child = local_pdf
-            .root_handle()
-            .expect("local Catalog")
-            .try_get_key(b"/Type")
-            .expect("direct Catalog type");
-        let error = queue
-            .enqueue_handle(&local_pdf, direct_child)
-            .expect_err("dynamic queue entries must be indirect");
-        assert!(
-            matches!(error, Error::Internal(message) if message.contains("no indirect identity"))
-        );
-
-        let child = local_pdf
-            .make_indirect_from_object_handle(ObjectHandle::integer(7))
-            .expect("local dynamic child");
-        queue.next_output = u32::MAX;
-        let error = queue
-            .enqueue_handle(&local_pdf, child)
-            .expect_err("dynamic object numbering must not wrap");
-        assert!(
-            matches!(error, Error::Unsupported(message) if message.contains("object number overflows"))
+            output.contains("\n6 0 obj\n(late-child)\nendobj\n"),
+            "the discovered child is appended to the same queue: {output}"
         );
     }
 
@@ -1131,7 +868,7 @@ mod tests {
     }
 
     #[test]
-    fn plan_rejects_a_missing_root() {
+    fn pclm_reports_qpdf_dictionary_error_for_a_missing_root() {
         let mut pdf = Pdf::open(Cursor::new(
             b"%PDF-1.3\nxref\n0 1\n0000000000 65535 f \ntrailer\n<< /Size 1 >>\n\
               startxref\n9\n%%EOF\n"
@@ -1139,12 +876,12 @@ mod tests {
         ))
         .expect("rootless fixture must open");
 
-        let error = Plan::build(&mut pdf).expect_err("PCLm requires a trailer /Root");
-        assert!(matches!(error, crate::Error::Missing("/Root")));
+        let error = write_pclm_bytes(&mut pdf).expect_err("PCLm requires a trailer /Root");
+        assert_eq!(error.to_string(), "unable to find /Root dictionary");
     }
 
     #[test]
-    fn plan_reports_qpdf_dictionary_error_for_an_indirect_null_root() {
+    fn pclm_reports_qpdf_dictionary_error_for_an_indirect_null_root() {
         let mut bytes = b"%PDF-1.3\n".to_vec();
         let object_offset = bytes.len();
         bytes.extend_from_slice(b"1 0 obj\nnull\nendobj\n");
@@ -1158,27 +895,37 @@ mod tests {
         );
         let mut pdf = Pdf::open(Cursor::new(bytes)).expect("indirect-null-root fixture must open");
 
-        let error = Plan::build(&mut pdf).expect_err("an indirect null Root is not a dictionary");
+        let error =
+            write_pclm_bytes(&mut pdf).expect_err("an indirect null Root is not a dictionary");
         assert_eq!(error.to_string(), "unable to find /Root dictionary");
     }
 
     #[test]
-    fn plan_does_not_resurrect_a_non_page_through_a_root_prewalk() {
+    fn pclm_does_not_seed_a_non_page_kids_leaf() {
         let mut pdf = fixture_pdf();
         let page = crate::pages::page_refs(&mut pdf).unwrap()[0];
         pdf.replace_object(page, ObjectHandle::integer(42))
             .expect("replace page with a scalar through the canonical route");
 
-        let plan = Plan::build(&mut pdf).expect("a scalar page is ignored by the PCLm planner");
+        let output = write_pclm_bytes(&mut pdf).expect("a scalar page is skipped by the page walk");
+        let output = String::from_utf8_lossy(&output);
 
-        assert!(!plan
-            .items
-            .iter()
-            .any(|item| { matches!(item, Item::Source { source, .. } if *source == page) }));
+        // The scalar leaf is not a page, so the PCLm seed never numbers it
+        // first; it only reaches the file later, as an ordinary `/Kids` child
+        // discovered while the page tree is unparsed.
+        assert!(
+            !output.contains("\n1 0 obj\n42\nendobj"),
+            "a scalar leaf is not seeded as the first PCLm page: {output}"
+        );
+        assert!(
+            output.contains("\n42\nendobj"),
+            "the scalar leaf still reaches the file through /Kids: {output}"
+        );
+        let _ = page;
     }
 
     #[test]
-    fn plan_propagates_page_contents_resolution_errors() {
+    fn pclm_propagates_page_contents_resolution_errors() {
         let mut pdf = Pdf::open(ReadFailingCursor {
             inner: Cursor::new(
                 include_bytes!("../../../../tests/fixtures/compat/three-page.pdf").to_vec(),
@@ -1204,11 +951,11 @@ mod tests {
         pdf.resolver
             .with_reader_mut(|reader| reader.fail_reads = true);
 
-        assert!(Plan::build(&mut pdf).is_err());
+        assert!(write_pclm_bytes(&mut pdf).is_err());
     }
 
     #[test]
-    fn plan_enqueues_xobject_and_its_synthetic_transform() {
+    fn pclm_enqueues_xobject_and_its_synthetic_transform() {
         let mut pdf = fixture_pdf();
         let page = crate::pages::page_refs(&mut pdf).unwrap()[0];
         let page_handle = pdf.get_object_handle(page);
@@ -1232,29 +979,24 @@ mod tests {
         pdf.replace_object(page, replacement)
             .expect("replace page through the canonical route");
 
-        let plan = Plan::build(&mut pdf).expect("XObject plan");
+        let output = write_pclm_bytes(&mut pdf).expect("XObject PCLm output");
 
-        assert!(plan
-            .items
-            .iter()
-            .any(|item| matches!(item, Item::Synthetic { .. })));
+        assert!(
+            String::from_utf8_lossy(&output).contains("q /image Do Q\n"),
+            "each strip is followed by its image-transform stream"
+        );
     }
 
     #[test]
     fn writer_emits_unplanned_trailer_refs_with_qpdf_late_numbers() {
         let mut pdf = one_page_fixture_with_unplanned_trailer_refs();
 
-        let options = crate::writer::WriterOptions {
-            pclm: true,
-            deterministic_id: true,
-            ..crate::writer::WriterOptions::default()
-        };
-        let mut output = Vec::new();
-        let result = crate::writer::output::with_buffer_sink(&mut output, |out| {
-            crate::writer::write_pclm(&mut pdf, out, &options, None)
-        });
-
-        assert!(result.is_ok(), "qpdf-compatible PCLm output: {result:?}");
+        let mut writer = PdfWriter::new(&mut pdf);
+        writer.set_pclm(true);
+        writer.set_deterministic_id(true);
+        writer.set_output_memory().expect("install memory output");
+        writer.write().expect("qpdf-compatible PCLm output");
+        let output = writer.get_buffer().expect("PCLm output bytes");
         let output = String::from_utf8_lossy(&output);
         assert!(output.contains("xref\n0 7\n"));
         assert!(output.contains("/Info 7 0 R"));
@@ -1267,16 +1009,11 @@ mod tests {
     #[test]
     fn writer_emits_unplanned_trailer_refs_with_generated_id() {
         let mut pdf = one_page_fixture_with_unplanned_trailer_refs();
-        let options = crate::writer::WriterOptions {
-            pclm: true,
-            ..crate::writer::WriterOptions::default()
-        };
-        let mut output = Vec::new();
-        let result = crate::writer::output::with_buffer_sink(&mut output, |out| {
-            crate::writer::write_pclm(&mut pdf, out, &options, None)
-        });
-
-        assert!(result.is_ok(), "qpdf-compatible PCLm output: {result:?}");
+        let mut writer = PdfWriter::new(&mut pdf);
+        writer.set_pclm(true);
+        writer.set_output_memory().expect("install memory output");
+        writer.write().expect("qpdf-compatible PCLm output");
+        let output = writer.get_buffer().expect("PCLm output bytes");
         let output = String::from_utf8_lossy(&output);
         assert!(output.contains("/Info 7 0 R"));
         assert!(output.contains("/Probe 8 0 R"));

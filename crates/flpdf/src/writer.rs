@@ -53,7 +53,9 @@ use crate::linearization::writer::write_linearized_for_pdf_writer;
 use crate::pdf_version::{parse_qpdf_writer_version, PdfVersion, QpdfVersionParts};
 use crate::pipeline::{flate::Flate, Pipeline, PipelineError, PipelineResult};
 use crate::{Error, ObjectHandle, ObjectRef, Pdf, Result, XrefEntry};
-use std::cell::{Cell, RefCell};
+#[cfg(test)]
+use std::cell::Cell;
+use std::cell::RefCell;
 use std::collections::{BTreeMap, BTreeSet, HashMap};
 use std::fmt;
 use std::fs::File;
@@ -1030,16 +1032,16 @@ impl<'pdf, R: Read + Seek + 'static> PdfWriter<'pdf, R> {
         if options.pclm {
             // qpdf's doWriteSetup makes PCLm cleartext with decode disabled
             // and compression disabled before source-encryption preservation
-            // is considered. Explicit content normalization remains active;
-            // willFilterStream applies it only to selected page-content
-            // streams (`QPDFWriter.cc:2072-2093,2114-2115`).
+            // is considered, and touches nothing else: QDF mode and the
+            // object-stream mode stay exactly as configured
+            // (`QPDFWriter.cc:2071-2076`). Explicit content normalization
+            // remains active; willFilterStream applies it only to selected
+            // page-content streams (`QPDFWriter.cc:2114-2115`).
             options.encrypt = None;
             options.copy_encryption = None;
-            options.qdf = false;
             options.decode_level = DecodeLevel::None;
             options.compress_streams = crate::CompressStreams::No;
             options.stream_data = None;
-            options.object_streams = ObjectStreamMode::Disable;
         }
         let can_preserve = self.settings.preserve_encryption
             && self.pdf.is_encrypted()
@@ -2240,6 +2242,11 @@ pub(crate) fn effective_pdf_version_and_ext_with_encryption<'a>(
 /// Shared with the linearization writer ([`crate::linearization`]) so the
 /// linearized output uses the identical marker as the plain rewrite path.
 pub(crate) const QPDF_BINARY_MARKER: &[u8] = b"%\xbf\xf7\xa2\xfe\n";
+
+/// qpdf's PCLm version marker, written in place of the binary-comment marker
+/// when PCLm output is selected (`QPDFWriter::writeHeader`,
+/// `libqpdf/QPDFWriter.cc:2265-2275`).
+pub(crate) const PCLM_HEADER_MARKER: &[u8] = b"%PCLm 1.0\n";
 
 /// qpdf's static-id constant: the first 32 hex digits of π, encoded as 16 raw
 /// bytes so the trailer emits `<31415926535897932384626433832795>`.
@@ -3509,244 +3516,6 @@ fn emit_canonical_pdf_with_special_streams<R: Read + Seek>(
     emit_canonical_pdf_inner(pdf, out, options, special_streams, setup)
 }
 
-fn write_pclm<R: Read + Seek>(
-    pdf: &mut Pdf<R>,
-    out: &mut OutputSink<'_>,
-    options: &WriterOptions,
-    special_streams: Option<&SpecialStreams>,
-) -> Result<WriterResult> {
-    let deterministic_id = uses_deterministic_id(options);
-    let plan = pclm::Plan::build(pdf)?;
-    let root = plan.root;
-    let source_root = pdf.root_ref();
-    let direct_root = plan.direct_root.clone();
-    let mut queue = pclm::EmissionQueue::from_plan(&plan)?;
-    let source_extension_level = pdf.adobe_extension_level()?.unwrap_or(0);
-    let (version, final_extension_level) =
-        effective_pdf_version_and_ext(pdf.version(), source_extension_level, options, false);
-    let version = version.to_owned();
-    if deterministic_id {
-        out.begin_digest();
-    }
-    out.write_bytes(format!("%PDF-{version}\n%PCLm 1.0\n").as_bytes())?;
-    out.write_bytes(options.extra_header_text.as_bytes())?;
-    if !options.extra_header_text.is_empty() && !options.extra_header_text.ends_with('\n') {
-        out.write_bytes(b"\n")?;
-    }
-
-    let mut offsets = BTreeMap::<u32, (u16, u64)>::new();
-    let removed: BTreeSet<_> = BTreeSet::new();
-
-    while let Some(item) = queue.pop() {
-        // qpdf's writeObject reports progress before it opens or unparses the
-        // current object (`QPDFWriter.cc:1761-1778`). A callback failure must
-        // therefore leave only the already-written prefix in the final sink.
-        report_progress_event(options)?;
-        match item {
-            pclm::Item::Source { source, output } => {
-                let source_handle = pdf.get_object_handle(source);
-                source_handle.try_dereference()?;
-                // qpdf records the indirect Catalog ObjGen in `root_og` and
-                // applies its root-only /Extensions reconciliation from the
-                // shared `unparseObject` path even when PCLm selected the
-                // initial enqueue order (`QPDFWriter.cc:53,1374,1396-1436`).
-                let source_handle = if source_root == Some(source) {
-                    source_handle.output_root_copy_with_adbe(
-                        &version,
-                        final_extension_level,
-                        true,
-                    )? // cov:ignore: indirect-root reconciliation success is covered by pclm_live_emission_tests; LLVM assigns this fallible call terminator to an uncovered continuation.
-                } else {
-                    source_handle
-                };
-                let offset = out.position();
-                out.write_bytes(format!("{} 0 obj\n", output.number).as_bytes())?;
-                if source_handle.as_stream_dict().is_some() {
-                    let normalize_content = options.content_normalization
-                        && special_streams
-                            .is_some_and(|streams| streams.normalized_streams.contains(&source));
-                    let (dict, data, dictionary_options) =
-                        plain::body::canonical_stream_output_for_rewrite(
-                            &source_handle,
-                            options,
-                            normalize_content,
-                        )?;
-                    let mut map = |child: &ObjectHandle| queue.enqueue_handle(pdf, child.clone());
-                    dict.write_stream_body_with_dynamic_ref_map(
-                        out,
-                        dictionary_options,
-                        &mut map,
-                        &removed,
-                    )?; // cov:ignore: LLVM maps the covered PCLm source-stream dictionary call continuation to this line
-                    write_pclm_stream_payload(out, &data, options.newline_before_endstream)?;
-                } else {
-                    let mut map = |child: &ObjectHandle| queue.enqueue_handle(pdf, child.clone());
-                    let mut write_string = |out: &mut OutputSink<'_>, value: &[u8]| {
-                        crate::pdf_syntax::write_string_value(out, value)
-                    };
-                    let mut direct_stream_writer =
-                        crate::writer::object::DefaultDynamicDirectStreamWriter {
-                            newline_before_endstream: Some(options.newline_before_endstream),
-                            qdf_mode: false,
-                        };
-                    crate::writer::object::write_object_with_dynamic_ref_map_and_string_writer_and_direct_stream_writer(
-                        &source_handle,
-                        out,
-                        &mut map,
-                        &removed,
-                        &mut write_string,
-                        &mut direct_stream_writer,
-                    )?; // cov:ignore: the PCLm non-stream dynamic serializer is exercised by the direct-label regression; LLVM maps this continuation separately.
-                }
-                out.write_bytes(b"\nendobj\n")?;
-                offsets.insert(output.number, (0, offset));
-            }
-            pclm::Item::Synthetic { output } => {
-                let payload = b"q /image Do Q\n".to_vec();
-                let stream = ObjectHandle::stream(
-                    ObjectHandle::dictionary(vec![(
-                        b"Length".to_vec(),
-                        ObjectHandle::integer(payload.len() as i64),
-                    )]),
-                    Rc::new(payload),
-                );
-                let offset = out.position();
-                out.write_bytes(format!("{} 0 obj\n", output.number).as_bytes())?;
-                let (dict, data, dictionary_options) =
-                    plain::body::canonical_stream_output_for_rewrite(&stream, options, false)?;
-                let mut map = |child: &ObjectHandle| queue.enqueue_handle(pdf, child.clone());
-                dict.write_stream_body_with_dynamic_ref_map(
-                    out,
-                    dictionary_options,
-                    &mut map,
-                    &removed,
-                )?; // cov:ignore: LLVM maps the covered PCLm synthetic-stream dictionary call continuation to this line
-                write_pclm_stream_payload(out, &data, options.newline_before_endstream)?;
-                out.write_bytes(b"\nendobj\n")?;
-                offsets.insert(output.number, (0, offset));
-            }
-        }
-    }
-
-    let object_count = queue.object_count()?;
-    let emitted_old_to_new = queue.into_old_to_new();
-    let mut written_xref = BTreeMap::<ObjectRef, XrefEntry>::new();
-    let xref_offset = out.position();
-    out.write_bytes(format!("xref\n0 {object_count}\n").as_bytes())?;
-    out.write_bytes(b"0000000000 65535 f \n")?;
-    for number in 1..object_count {
-        match offsets.get(&(number as u32)) {
-            Some((generation, offset)) => {
-                out.write_bytes(format!("{offset:010} {generation:05} n \n").as_bytes())?;
-                written_xref.insert(
-                    ObjectRef::new(number as u32, 0),
-                    XrefEntry::Uncompressed { offset: *offset },
-                );
-            }
-            None => out.write_bytes(b"0000000000 65535 f \n")?, // cov:ignore: every PCLm item receives the next contiguous output number
-        }
-    }
-
-    // qpdf's PCLm queue does not enqueue other trailer values before the body
-    // queue is written (`QPDFWriter.cc:2928-2954`). When writeTrailer later
-    // unparses one of those indirect values, unparseChild calls enqueueObject,
-    // which assigns a number after the xref size has already been fixed. Keep
-    // that observable late-numbering behavior local to PCLm trailer emission:
-    // the value is remapped, but no body or xref entry is added for it.
-    let late_trailer_refs = RefCell::new(HashMap::<ObjectRef, ObjectRef>::new());
-    // cov:ignore-start: PCLm output numbers originate in a u32 queue, so an object count that does not fit u32 is not constructible on supported targets.
-    let next_late_trailer_number = Cell::new(u32::try_from(object_count).map_err(|_| {
-        crate::Error::Unsupported("PCLm trailer object number does not fit in u32".to_string())
-    })?);
-    // cov:ignore-end
-    let trailer_map = |object_ref: ObjectRef| {
-        if let Some(output) = emitted_old_to_new.get(&object_ref).copied() {
-            return Ok(output);
-        }
-        if let Some(output) = late_trailer_refs.borrow().get(&object_ref).copied() {
-            return Ok(output);
-        }
-        let output_number = next_late_trailer_number.get();
-        // cov:ignore-start: reaching the next-number overflow requires a u32::MAX-sized emitted object queue.
-        let next_number = output_number.checked_add(1).ok_or_else(|| {
-            crate::Error::Unsupported("PCLm trailer object number overflow".to_string())
-        })?;
-        // cov:ignore-end
-        let output = ObjectRef::new(output_number, 0);
-        late_trailer_refs.borrow_mut().insert(object_ref, output);
-        next_late_trailer_number.set(next_number);
-        Ok(output)
-    };
-
-    let direct_root = match root {
-        Some(_) => None,
-        None => Some(direct_root.as_ref().ok_or_else(|| {
-            // cov:ignore-start: Plan::build guarantees a direct Catalog
-            // handle whenever its root identity is absent.
-            crate::Error::Unsupported("PCLm Catalog root is inconsistent".into())
-            // cov:ignore-end
-        })?), // cov:ignore: Plan::build guarantees the direct Catalog handle before PCLm emission; LLVM places this continuation counter on the closure exit.
-    };
-    let source_id0 = source_permanent_id_handle(&pdf.trailer())?;
-    let generated_id =
-        (!deterministic_id).then(|| generate_id_handle(source_id0.as_deref(), options.static_id));
-    let trailer = build_writer_trailer_handle(
-        pdf,
-        object_count,
-        root,
-        direct_root,
-        options,
-        None,
-        deterministic_id,
-        generated_id.as_ref(),
-    )?; // cov:ignore: validated PCLm trailer construction; LLVM maps this continuation to the call setup.
-    if deterministic_id {
-        let info_suffix = deterministic_id_info_suffix(pdf);
-        let mut id_writer = |out: &mut OutputSink<'_>| {
-            write_deterministic_id_inline(out, &info_suffix, source_id0.as_deref())
-        };
-        trailer.write_trailer_with_ref_map(
-            out,
-            false,
-            false,
-            Some(&mut id_writer),
-            &trailer_map,
-            &removed,
-            true,
-        )?; // cov:ignore: LLVM maps the covered deterministic PCLm trailer call continuation to this line
-    } else {
-        trailer.write_trailer_with_ref_map(
-            out,
-            false,
-            false,
-            None,
-            &trailer_map,
-            &removed,
-            true,
-        )?; // cov:ignore: LLVM maps the covered materialized PCLm trailer call continuation to this line
-    }
-    out.write_bytes(format!("\nstartxref\n{xref_offset}\n%%EOF\n").as_bytes())?;
-    Ok(WriterResult::new(emitted_old_to_new, written_xref))
-}
-
-/// Emit one qpdf-buffered PCLm stream payload to the active final pipeline.
-/// The payload Vec is local to `willFilterStream`; finishing the segment after
-/// its bytes mirrors the unencrypted `PipelinePopper` scope in
-/// `QPDFWriter::unparseObject` (`QPDFWriter.cc:1535-1566`).
-fn write_pclm_stream_payload(
-    out: &mut OutputSink<'_>,
-    data: &[u8],
-    policy: NewlineBeforeEndstream,
-) -> Result<()> {
-    out.write_bytes(b"\nstream\n")?;
-    out.write_bytes(data)?;
-    out.finish_segment()?;
-    if serialize::framing_adds_newline_with_qdf(data, policy, false) {
-        out.write_bytes(b"\n")?;
-    }
-    out.write_bytes(b"endstream")
-}
-
 fn emit_canonical_pdf_inner<R: Read + Seek>(
     pdf: &mut Pdf<R>,
     out: &mut OutputSink<'_>,
@@ -3782,10 +3551,6 @@ fn emit_canonical_pdf_inner<R: Read + Seek>(
             "encrypt and copy_encryption are mutually exclusive".to_string(),
         ));
     }
-    if options.pclm {
-        return write_pclm(pdf, out, options, special_streams);
-    }
-
     // Every non-linearized standard route now has the same final OutputSink
     // and live queue owner. Encryption parameters remain writer setup state:
     // the body consumes their key/cipher policy while /Encrypt receives the
@@ -5087,25 +4852,6 @@ mod final_handle_writer_tests {
         assert!(output
             .windows(b"/ID [".len())
             .any(|window| window == b"/ID ["));
-    }
-
-    #[test]
-    fn pclm_adds_a_separator_after_raw_internal_header_text() {
-        let mut pdf = Pdf::open(Cursor::new(
-            include_bytes!("../../../tests/fixtures/compat/direct-root-one-page.pdf").to_vec(),
-        ))
-        .expect("minimal PCLm fixture must open");
-        let options = WriterOptions {
-            pclm: true,
-            extra_header_text: "%raw-internal-header".to_owned(),
-            ..WriterOptions::default()
-        };
-        let mut output = Vec::new();
-
-        output::with_buffer_sink(&mut output, |out| write_pclm(&mut pdf, out, &options, None))
-            .expect("PCLm accepts an internal header value without a trailing newline");
-
-        assert!(output.starts_with(b"%PDF-1.4\n%PCLm 1.0\n%raw-internal-header\n"));
     }
 
     #[test]

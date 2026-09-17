@@ -1,4 +1,9 @@
 //! Route contracts for the qpdf-shaped PCLm writer boundary.
+//!
+//! PCLm has no writer of its own: `QPDFWriter::enqueueObjectsPCLm` seeds the
+//! same `object_queue` the standard seed fills, and the shared write loop
+//! emits it (`libqpdf/QPDFWriter.cc:2999-3005`). These contracts therefore
+//! read the seed functions out of the live-queue module.
 
 fn production_source(source: &str) -> &str {
     source
@@ -7,12 +12,24 @@ fn production_source(source: &str) -> &str {
         .expect("source must contain a test boundary")
 }
 
+/// The seed pass: `enqueue_object` plus both `enqueue_objects_*` functions and
+/// the `initialize_live_queue` dispatch between them.
+fn live_queue_seed_source(source: &str) -> &str {
+    let start = source
+        .find("\nfn enqueue_object<")
+        .expect("live queue seed helper");
+    let end = source[start..]
+        .find("\nfn emit_live_body<")
+        .expect("live queue seed end");
+    &source[start..start + end]
+}
+
 #[test]
 fn pclm_planning_and_emission_do_not_materialize_legacy_objects() {
-    let pclm = production_source(include_str!("../src/writer/pclm.rs"));
+    let seed = live_queue_seed_source(include_str!("../src/writer/plain/body.rs"));
     assert!(
-        !pclm.contains(".materialize()"),
-        "PCLm planning must walk live ObjectHandle values"
+        !seed.contains(".materialize()"),
+        "PCLm seeding must walk live ObjectHandle values"
     );
 
     let pclm_writer = production_source(include_str!("../src/writer.rs"));
@@ -24,7 +41,7 @@ fn pclm_planning_and_emission_do_not_materialize_legacy_objects() {
 
 #[test]
 fn pclm_planning_uses_canonical_resolving_accessors() {
-    let pclm = production_source(include_str!("../src/writer/pclm.rs"));
+    let seed = live_queue_seed_source(include_str!("../src/writer/plain/body.rs"));
 
     for forbidden in [
         ".resolve(",
@@ -33,12 +50,64 @@ fn pclm_planning_uses_canonical_resolving_accessors() {
         ".is_null(",
     ] {
         assert!(
-            !pclm.contains(forbidden),
-            "PCLm planning retains legacy accessor route {forbidden}"
+            !seed.contains(forbidden),
+            "PCLm seeding retains legacy accessor route {forbidden}"
         );
     }
     assert!(
-        pclm.contains("try_dereference") && pclm.contains("try_is_null"),
-        "PCLm planning must use canonical resolving accessors"
+        seed.contains("try_dereference") && seed.contains("try_is_null"),
+        "PCLm seeding must use canonical resolving accessors"
+    );
+}
+
+/// qpdf seeds PCLm from `enqueueObjectsPCLm` and every other standard route
+/// from `enqueueObjectsStandard`, choosing between them in `writeStandard`
+/// (`libqpdf/QPDFWriter.cc:2999-3005`). There is no separate PCLm writer.
+#[test]
+fn pclm_shares_one_queue_with_the_standard_seed() {
+    let writer = include_str!("../src/writer.rs");
+    assert!(
+        !writer.contains("fn write_pclm"),
+        "PCLm must not own a second writer route"
+    );
+
+    let seed = live_queue_seed_source(include_str!("../src/writer/plain/body.rs"));
+    assert!(
+        seed.contains("fn enqueue_objects_pclm<") && seed.contains("fn enqueue_objects_standard<"),
+        "both qpdf seed passes live with the one live queue"
+    );
+    let dispatch = seed
+        .split_once("fn initialize_live_queue<")
+        .expect("live queue initializer")
+        .1;
+    assert!(
+        dispatch.contains("if options.pclm {")
+            && dispatch.contains("enqueue_objects_pclm(&mut queue, pdf)?")
+            && dispatch.contains("enqueue_objects_standard(&mut queue, pdf, options)?"),
+        "the seed pass is selected once, where qpdf selects it"
+    );
+}
+
+/// `enqueueObjectsPCLm` never consults `preserve_unreferenced_objects` and
+/// seeds only `/Root` from the trimmed trailer, so the PCLm seed takes no
+/// writer options at all (`libqpdf/QPDFWriter.cc:2927-2955`).
+#[test]
+fn pclm_seed_ignores_standard_only_trailer_and_preserve_policy() {
+    let seed = live_queue_seed_source(include_str!("../src/writer/plain/body.rs"));
+    let seed = seed
+        .split_once("fn enqueue_objects_pclm<")
+        .expect("PCLm seed")
+        .1;
+    let seed = seed
+        .split_once("\nfn initialize_live_queue<")
+        .expect("PCLm seed end")
+        .0;
+    assert!(
+        !seed.contains("preserve_unreferenced_objects"),
+        "qpdf's PCLm seed never preserves unreferenced objects"
+    );
+    assert!(
+        !seed.contains("try_as_dictionary"),
+        "qpdf's PCLm seed reads only /Root from the trailer"
     );
 }

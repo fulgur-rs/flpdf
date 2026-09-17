@@ -63,20 +63,6 @@ fn strip_cfg_test_items(source: &str) -> String {
     production
 }
 
-fn function_body<'a>(source: &'a str, function_name: &str) -> &'a str {
-    let signature = format!("fn {function_name}");
-    let start = source
-        .find(&signature)
-        .unwrap_or_else(|| panic!("{function_name} must be present"));
-    let after_signature = &source[start..];
-    let brace_start = after_signature
-        .find('{')
-        .unwrap_or_else(|| panic!("{function_name} must have a body"));
-    let body = &after_signature[brace_start..];
-    let end = item_body_end(body).unwrap_or_else(|| panic!("{function_name} must balance braces"));
-    &body[..end]
-}
-
 fn function_body_exact<'a>(source: &'a str, function_name: &str) -> &'a str {
     let signature = format!("fn {function_name}(");
     let start = source
@@ -147,12 +133,11 @@ fn standard_writer_production_uses_canonical_accessor_routes() {
     );
 }
 
+/// PCLm shares the standard writer's emission path, so the only stream
+/// observations left to pin are the two shared unparsers
+/// (`QPDFWriter::writeObject` / `QPDFWriter::unparseObject`).
 #[test]
 fn standard_writer_stream_observations_follow_resolution() {
-    let source = strip_cfg_test_items(&include_str!("../src/writer.rs").replace("\r\n", "\n"));
-    let pclm_body = function_body(&source, "write_pclm");
-    assert_local_stream_resolution(pclm_body, "source_handle", 1);
-
     let write_object_source = include_str!("../src/writer/write_object.rs");
     let write_object_body = function_body_exact(write_object_source, "write_object");
     assert_local_stream_resolution(write_object_body, "object", 1);

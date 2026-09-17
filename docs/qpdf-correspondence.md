@@ -4529,6 +4529,48 @@ primary document-graph retention; the unrelated
 `null-visible-stale-generation-objstm` member-order difference and the
 `flpdf-x267z` page-count issue remain separate.
 
+### PCLm seed joins the one standard-writer queue (`flpdf-3yn9.48.152`, 2026-09-18)
+
+qpdf has one `object_queue` and two seed passes: `writeStandard` calls
+`enqueueObjectsPCLm` when `m->pclm` is set and `enqueueObjectsStandard`
+otherwise, then runs the same write loop, `writeXRefTable`/`writeXRefStream`
+and `writeTrailer` for both (`libqpdf/QPDFWriter.cc:2906-2955,2999-3005`).
+flpdf now has the same shape: `writer/plain/body.rs::enqueue_objects_pclm` and
+`::enqueue_objects_standard` seed the one `LiveQueue`, and
+`::initialize_live_queue` selects between them from `options.pclm`. The former
+`writer.rs::write_pclm` route — with its own body loop, classic-xref loop,
+late-trailer numbering and `pclm.rs::Plan`/`Builder`/`EmissionQueue`/`Item`
+planner — is gone; `LiveQueue::new` is unchanged.
+
+Three deviations closed with it, each pinned by a qpdf 11.9.0 byte golden in
+`tests/fixtures/pclm/`:
+
+* `doWriteSetup` changes only `stream_decode_level`, `compress_streams` and
+  `encrypted` for PCLm (`libqpdf/QPDFWriter.cc:2071-2076`). flpdf additionally
+  forced `qdf = false` and `object_streams = Disable`, so PCLm + QDF and
+  PCLm + generated object streams were unreachable. Both now match qpdf byte
+  for byte.
+* The image-transform stream is a real indirect object in the source document
+  (`QPDFObjectHandle::newStream(&m->pdf, ...)`), allocated inside the strip
+  loop. `Item::Synthetic` had no qpdf counterpart and left the QDF
+  `%% Original object ID:` lines unrepresentable; `Pdf::new_stream_with_data`
+  now allocates it where qpdf does.
+* A missing trailer `/Root` reported `Error::Missing("/Root")` on the PCLm
+  route where `QPDF::getRoot` reports `unable to find /Root dictionary`
+  (`libqpdf/QPDF.cc:2355-2360`); PCLm now shares the standard message.
+
+`write_pclm` also normalized a missing trailing newline on
+`extra_header_text` a second time. qpdf normalizes only in
+`QPDFWriter::setExtraHeaderText` (`libqpdf/QPDFWriter.cc:269-278`), which
+`PdfWriter::set_extra_header_text` already mirrors, so the route-local repeat
+was removed with the route.
+
+One divergence found while gating this and deliberately left open:
+`pages::page_refs` drops a `/Kids` leaf that is not a dictionary, while
+`QPDF::getAllPages` keeps it, so qpdf writes such a leaf as the first PCLm
+object and flpdf does not. That is a page-tree walk difference shared by every
+page-consuming route, not a PCLm one.
+
 ### QPDFObjectHandle getValueAs family
 
 | qpdf | 行 | flpdf | 状態 |

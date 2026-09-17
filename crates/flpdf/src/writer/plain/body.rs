@@ -19,7 +19,8 @@ use crate::writer::plain::xref::{BodyLayout, CompressedLocation};
 use crate::writer::write_object::{IndirectStreamLength, QdfObjectInfo, WriteObject};
 use crate::writer::WriterOptions;
 use crate::writer::{
-    serialize, CompressStreams, ObjectWriterEmission, StreamDictionaryOptions, QPDF_BINARY_MARKER,
+    serialize, CompressStreams, ObjectWriterEmission, StreamDictionaryOptions, PCLM_HEADER_MARKER,
+    QPDF_BINARY_MARKER,
 };
 use crate::{ObjectHandle, ObjectRef, PageDocumentHelper, Pdf};
 
@@ -364,14 +365,35 @@ fn collect_live_child_handles(
     Ok(())
 }
 
-fn initialize_live_queue<R: Read + Seek>(
+/// Enqueue one seed value.
+///
+/// qpdf's `QPDFWriter::enqueueObject` (`libqpdf/QPDFWriter.cc:1070-1140`)
+/// queues an indirect handle and otherwise recurses through a direct array or
+/// dictionary without numbering it; [`collect_live_seed_handles`] performs
+/// that recursion and [`LiveQueue::enqueue_handle`] performs the indirect
+/// half.
+fn enqueue_object<R: Read + Seek>(
+    queue: &mut LiveQueue,
+    pdf: &mut Pdf<R>,
+    value: &ObjectHandle,
+) -> crate::Result<()> {
+    let mut handles = Vec::new();
+    collect_live_seed_handles(value, &mut handles, 0)?;
+    for handle in handles {
+        queue.enqueue_handle(pdf, handle)?;
+    }
+    Ok(())
+}
+
+/// Seed the queue for every non-PCLm standard route.
+///
+/// qpdf: `QPDFWriter::enqueueObjectsStandard`
+/// (`libqpdf/QPDFWriter.cc:2906-2925`).
+fn enqueue_objects_standard<R: Read + Seek>(
+    queue: &mut LiveQueue,
     pdf: &mut Pdf<R>,
     options: &WriterOptions,
-    removed_refs: BTreeSet<ObjectRef>,
-    object_streams: &[crate::writer::object_streams::ObjectStreamGroup],
-) -> crate::Result<LiveQueue> {
-    let mut queue = LiveQueue::new(removed_refs, options.qdf);
-    queue.register_object_streams(pdf, object_streams)?;
+) -> crate::Result<()> {
     if options.preserve_unreferenced_objects {
         let mut all_objects = pdf.get_all_objects()?;
         if pdf.writer_object_order.is_some() {
@@ -397,13 +419,13 @@ fn initialize_live_queue<R: Read + Seek>(
         }
     }
 
+    // Put root first on queue.
     let root = pdf.root_handle()?;
-    let mut root_seeds = Vec::new();
-    collect_live_seed_handles(&root, &mut root_seeds, 0)?;
-    for handle in root_seeds {
-        queue.enqueue_handle(pdf, handle)?;
-    }
+    enqueue_object(queue, pdf, &root)?;
 
+    // Next place any other objects referenced from the trailer dictionary into
+    // the queue, handling direct objects recursively. Root is already there,
+    // so enqueuing it a second time is a no-op.
     let trailer = pdf.trailer();
     let trailer_entries = trailer.try_as_dictionary()?.unwrap_or_default();
     for (key, value) in trailer_entries {
@@ -425,13 +447,76 @@ fn initialize_live_queue<R: Read + Seek>(
         {
             continue;
         }
-        let mut handles = Vec::new();
-        collect_live_seed_handles(&value, &mut handles, 0)?;
-        for handle in handles {
-            queue.enqueue_handle(pdf, handle)?;
+        enqueue_object(queue, pdf, &value)?;
+    }
+
+    Ok(())
+}
+
+/// Seed the queue for PCLm output.
+///
+/// qpdf: `QPDFWriter::enqueueObjectsPCLm`
+/// (`libqpdf/QPDFWriter.cc:2927-2955`). Unlike the standard seed this takes no
+/// options: qpdf's PCLm seed never consults `preserve_unreferenced_objects`
+/// and seeds only `/Root` from the trimmed trailer. Each page strip is
+/// followed by a freshly allocated image-transform stream, so the source
+/// document gains one real indirect object per strip exactly as
+/// `QPDFObjectHandle::newStream(&m->pdf, ...)` does.
+fn enqueue_objects_pclm<R: Read + Seek>(
+    queue: &mut LiveQueue,
+    pdf: &mut Pdf<R>,
+) -> crate::Result<()> {
+    // Image transform stream content for page strip images. Each of this new
+    // stream has to come after every page image strip written in the pclm
+    // file.
+    let image_transform_content = Rc::new(b"q /image Do Q\n".to_vec());
+
+    // enqueue all pages first
+    for page in crate::pages::page_refs(pdf)? {
+        // enqueue page
+        //
+        // qpdf's `getAllPages()` hands back resolved handles; `page_refs`
+        // returns identities, so resolve here to reach the same state (and to
+        // surface a source read failure at the same point qpdf does).
+        let page = pdf.get_object_handle(page);
+        page.try_dereference()?;
+        enqueue_object(queue, pdf, &page)?;
+
+        // enqueue page contents stream
+        let contents = page.try_get_key(b"/Contents")?;
+        enqueue_object(queue, pdf, &contents)?;
+
+        // enqueue all the strips for each page
+        let strips = page.try_get_key(b"/Resources")?.try_get_key(b"/XObject")?;
+        for key in strips.try_get_keys()? {
+            let strip = strips.try_get_key(&key)?;
+            enqueue_object(queue, pdf, &strip)?;
+            let transform = pdf.new_stream_with_data(Rc::clone(&image_transform_content))?;
+            enqueue_object(queue, pdf, &transform)?;
         }
     }
 
+    // Put root in queue.
+    let root = pdf.root_handle()?;
+    enqueue_object(queue, pdf, &root)?;
+    Ok(())
+}
+
+/// Build qpdf's `object_queue` and run the seed pass its write mode selects
+/// (`QPDFWriter::writeStandard`, `libqpdf/QPDFWriter.cc:2999-3005`).
+fn initialize_live_queue<R: Read + Seek>(
+    pdf: &mut Pdf<R>,
+    options: &WriterOptions,
+    removed_refs: BTreeSet<ObjectRef>,
+    object_streams: &[crate::writer::object_streams::ObjectStreamGroup],
+) -> crate::Result<LiveQueue> {
+    let mut queue = LiveQueue::new(removed_refs, options.qdf);
+    queue.register_object_streams(pdf, object_streams)?;
+    if options.pclm {
+        enqueue_objects_pclm(&mut queue, pdf)?;
+    } else {
+        enqueue_objects_standard(&mut queue, pdf, options)?;
+    }
     Ok(queue)
 }
 
@@ -452,7 +537,13 @@ fn emit_live_body<R: Read + Seek + 'static>(
     content_container_refs: &BTreeSet<ObjectRef>,
 ) -> crate::Result<LiveBodyOutput> {
     out.write_bytes(format!("%PDF-{version}\n").as_bytes())?;
-    out.write_bytes(QPDF_BINARY_MARKER)?;
+    // `QPDFWriter::writeHeader` selects the PCLm version marker in place of
+    // the binary-comment marker (`libqpdf/QPDFWriter.cc:2265-2275`).
+    if options.pclm {
+        out.write_bytes(PCLM_HEADER_MARKER)?;
+    } else {
+        out.write_bytes(QPDF_BINARY_MARKER)?;
+    }
     let (page_sequences, contents_sequences) = if options.qdf || options.content_normalization {
         qdf_page_context(pdf)?
     } else {
@@ -3156,7 +3247,7 @@ mod object_emitter_tests {
             .expect("live child discovery helper");
         let child_body = &source[child_start
             ..source[child_start..]
-                .find("\nfn initialize_live_queue")
+                .find("\nfn enqueue_object")
                 .expect("live child discovery helper end")
                 + child_start];
 
