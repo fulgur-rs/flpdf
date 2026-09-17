@@ -560,9 +560,10 @@ fn rewrite_empty_pages_repeated_collated_sources_match_qpdf() {
     let output = output.to_str().unwrap().to_owned();
 
     // The repeated first source exercises qpdf's literal source identity and
-    // the collate grouping; the inherited-resource source also keeps the
-    // create-stage warning path live. --qdf and --static-id exercise writer
-    // configuration without comparing serializer-specific bytes.
+    // the collate grouping; warning stdout/stderr parity for the inherited-
+    // resource source is covered by `verbose_empty_pages_source_preflights_match_qpdf`.
+    // --qdf and --static-id exercise writer configuration without comparing
+    // serializer-specific bytes.
     let qpdf_args = vec![
         "--verbose".to_owned(),
         "--static-id".to_owned(),
