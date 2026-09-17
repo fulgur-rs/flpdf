@@ -1351,6 +1351,7 @@ struct ObjectSlot {
 thread_local! {
     static TEST_SLOTS: RefCell<Vec<Weak<RefCell<ObjectSlot>>>> = const { RefCell::new(Vec::new()) };
     static STATE_CHILDREN_VECTOR_CALLS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+    static OBJECT_REF_PROMOTION_CALLS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
 }
 
 #[cfg(test)]
@@ -1360,6 +1361,11 @@ fn register_test_slot(slot: &Rc<RefCell<ObjectSlot>>) {
 
 #[cfg(not(test))]
 fn register_test_slot(_slot: &Rc<RefCell<ObjectSlot>>) {}
+
+#[cfg(test)]
+pub(crate) fn object_ref_promotion_calls_for_test() -> usize {
+    OBJECT_REF_PROMOTION_CALLS.with(std::cell::Cell::get)
+}
 
 #[cfg(test)]
 fn registered_test_slots() -> Vec<ObjectHandle> {
@@ -2367,6 +2373,8 @@ impl ObjectHandle {
         let Some(qpdf_obj_gen) = QpdfObjGen::try_from_object_ref(object_ref).ok() else {
             return Self::uninitialized();
         };
+        #[cfg(test)]
+        OBJECT_REF_PROMOTION_CALLS.with(|calls| calls.set(calls.get() + 1));
         let shared = self.0.borrow().shared.clone();
         shared.borrow_mut().identity = ValueIdentity {
             qpdf_obj_gen: Some(qpdf_obj_gen),

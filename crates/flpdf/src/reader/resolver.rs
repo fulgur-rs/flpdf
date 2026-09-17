@@ -1257,8 +1257,7 @@ impl<R: Read + Seek> ResolverHandle<R> {
         let Ok(object_gen) = QpdfObjGen::try_from_object_ref(object_ref) else {
             return ObjectHandle::uninitialized();
         };
-        let handle = self.get_object_handle_qpdf_obj_gen(object_gen);
-        handle.promote_to_indirect(object_ref, self.pdf_unique_id.get(), self.self_weak.clone())
+        self.get_object_handle_qpdf_obj_gen(object_gen)
     }
 
     #[cfg(test)]
@@ -5590,6 +5589,21 @@ impl<R: Read + Seek> ResolverHandle<R> {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn canonical_lookup_does_not_repeat_object_ref_promotion() {
+        let resolver = bare_resolver();
+        let before = crate::object_handle::object_ref_promotion_calls_for_test();
+
+        let handle = resolver.get_object_handle(ObjectRef::new(1, 0));
+
+        assert_eq!(
+            crate::object_handle::object_ref_promotion_calls_for_test(),
+            before,
+            "canonical lookup must not reapply the same ObjectRef identity"
+        );
+        assert_eq!(handle.object_ref(), Some(ObjectRef::new(1, 0)));
+    }
+
     #[test]
     fn object_stream_parser_stamps_direct_values_with_cached_identity() {
         let source = include_str!("resolver.rs").replace("\r\n", "\n");
