@@ -572,7 +572,16 @@ fn raw_argv_help_table_and_completion_emit_qpdf_output() {
         job.set_logger(logger);
         job.initialize_from_raw_argv(&[b"qpdf".to_vec(), option.as_bytes().to_vec()])
             .unwrap();
-        assert_eq!(info.lock().unwrap().bytes, oracle.stdout, "{option}");
+        let output = info.lock().unwrap().bytes.clone();
+        if option == "--show-crypto" {
+            // qpdf enumerates the providers compiled into the process. The
+            // pinned qpdf binary has gnutls on Linux and gnutls+openssl on
+            // macOS; flpdf's library boundary intentionally does not own a
+            // process-global provider registry.
+            assert!(!output.is_empty(), "{option} must report a provider");
+        } else {
+            assert_eq!(output, oracle.stdout, "{option}");
+        }
     }
 }
 
