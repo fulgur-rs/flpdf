@@ -2103,6 +2103,59 @@ fn read_live_xref_window(owner: &dyn CanonicalTrailerOwner, offset: u64) -> Resu
     }
 }
 
+/// Construct a `CanonicalTrailerOwner` for a byte buffer and load xref state
+/// through it, mirroring `Pdf::open`'s own owner construction
+/// (`crates/flpdf/src/engine.rs::Pdf::open_with_repair_mode_as`).
+///
+/// This is the byte-slice case of qpdf's `QPDF::processMemoryFile`
+/// (`libqpdf/QPDF.cc:259-268`), which wraps the bytes in a `BufferInputSource`
+/// and hands it to `QPDF::processInputSource`
+/// (`libqpdf/QPDF.cc:271-275`: `m->file = source; parse(password);`) -- so
+/// the document owns its input source before any parsing, exactly as
+/// `QPDF::Members::Members` (`libqpdf/QPDF.cc:198`) leaves it. The owner is
+/// what arms `QPDF::ParseGuard` (`include/qpdf/QPDF.hh:797-812`) through the
+/// parser context `QPDF::readTrailer` passes as `this`
+/// (`libqpdf/QPDF.cc:1317`; `libqpdf/QPDFParser.cc:34`).
+///
+/// `attempt_recovery` and the resolver's warning `description` are both
+/// derived from `options` rather than taken as separate parameters, the same
+/// single source `Pdf::open_with_repair_mode_as` uses for `options.repair`
+/// and `options.description` (`crates/flpdf/src/engine.rs:196-217`) -- qpdf
+/// has one `m->attempt_recovery` bit, and this crate keeps only one input
+/// for it (B26).
+///
+/// The owner is returned alongside the result, not inside `Ok`, because
+/// handles in `LoadedXrefState` borrow their identity from it, and because a
+/// failed load still leaves warnings on the owner for a caller to inspect,
+/// the way `Pdf::open`'s own error arms read
+/// `resolver.repair_diagnostics()` (`crates/flpdf/src/engine.rs:224-248`).
+#[cfg(test)]
+pub(crate) fn load_xref_state_through_canonical_owner<R: Read + Seek + 'static>(
+    reader: R,
+    options: XrefLoadOptions,
+    logger: crate::QPDFLogger,
+    suppress_warnings: bool,
+    pdf_unique_id: u64,
+) -> (Rc<ResolverHandle<R>>, Result<LoadedXrefState>) {
+    let warning_options = crate::reader::resolver::ResolverWarningOptions::new(
+        logger,
+        suppress_warnings,
+        options.description.clone(),
+    );
+    let owner = ResolverHandle::new_shared(
+        reader,
+        0,
+        BTreeMap::new(),
+        options.allow_repair,
+        false,
+        Diagnostics::default(),
+        warning_options,
+        pdf_unique_id,
+    );
+    let loaded = load_xref_state_from_source(owner.as_ref(), options);
+    (owner, loaded)
+}
+
 /// Canonical `Pdf::open` xref loading through qpdf's live input-source
 /// boundary. The initial implementation keeps bounded prefix/tail/xref
 /// windows; owner-less tests continue to use the byte-slice loader above.
@@ -7593,18 +7646,24 @@ mod final_handle_tests {
             .rposition(|window| window == b"stream")
             .expect("stream token")
             + b"stream".len();
-        let mut reader = std::io::Cursor::new(bytes);
-        let state = load_xref_state_with_options(
-            &mut reader,
+        let (owner, result) = load_xref_state_through_canonical_owner(
+            std::io::Cursor::new(bytes),
             XrefLoadOptions {
                 description: b"stream-trailer.pdf".to_vec(),
                 ..XrefLoadOptions::default()
             },
-        )
-        .expect("a valid classic trailer with an extra stream token loads");
-        let warnings: Vec<_> = state
-            .loaded
-            .repair_diagnostics
+            crate::QPDFLogger::create(),
+            true,
+            8,
+        );
+        let _state = result.expect("a valid classic trailer with an extra stream token loads");
+        // With a live owner, `deliver_canonical_diagnostics` drains each
+        // buffered warning into the owner's own sink as it is found
+        // (`xref.rs::deliver_canonical_diagnostics`); the returned state's
+        // `repair_diagnostics` field stays empty. `Pdf::open` only ever
+        // reads the owner's (`crates/flpdf/src/engine.rs:224-248`).
+        let owner_diagnostics = owner.repair_diagnostics();
+        let warnings: Vec<_> = owner_diagnostics
             .entries()
             .iter()
             .filter(|warning| warning.get_message_detail() == b"stream keyword found in trailer")
@@ -7612,35 +7671,6 @@ mod final_handle_tests {
         assert_eq!(warnings.len(), 1);
         assert_eq!(warnings[0].get_object(), b"trailer");
         assert_eq!(warnings[0].get_file_position(), warning_offset as i64);
-    }
-
-    #[test]
-    fn canonical_classic_read_trailer_reports_qpdf_stream_warning() {
-        let (mut bytes, _) = classic_xref_with_trailer("<< /Size 1 >> stream");
-        bytes.extend_from_slice(b"\n");
-        let warning_offset = bytes
-            .windows(b"stream".len())
-            .rposition(|window| window == b"stream")
-            .expect("stream token")
-            + b"stream".len();
-        let resolver = canonical_test_resolver(bytes.clone(), BTreeMap::new(), false, 8);
-        let _state = load_xref_state_from_bytes(
-            &bytes,
-            XrefLoadOptions {
-                description: b"canonical-stream-trailer.pdf".to_vec(),
-                ..XrefLoadOptions::default()
-            },
-            Some(resolver.as_ref()),
-        )
-        .expect("the canonical owner must use the shared classic trailer route");
-        let owner_diagnostics = resolver.repair_diagnostics();
-        let warning = owner_diagnostics
-            .entries()
-            .iter()
-            .find(|warning| warning.get_message_detail() == b"stream keyword found in trailer")
-            .expect("canonical stream warning");
-        assert_eq!(warning.get_object(), b"trailer");
-        assert_eq!(warning.get_file_position(), warning_offset as i64);
     }
 
     #[test]
@@ -8066,14 +8096,18 @@ mod final_handle_tests {
             format!("trailer\n<< /Size 2 /Root 1 0 R >>\nstartxref\n{xref}\n%%EOF\n").as_bytes(),
         );
 
-        let error = load_xref_state_with_options(
-            &mut std::io::Cursor::new(bytes),
+        let (_owner, result) = load_xref_state_through_canonical_owner(
+            std::io::Cursor::new(bytes),
             XrefLoadOptions {
                 description: b"bad5.pdf".to_vec(),
                 ..XrefLoadOptions::default()
             },
-        )
-        .expect_err("qpdf rejects the malformed classic xref entry in strict mode");
+            crate::QPDFLogger::create(),
+            true,
+            9,
+        );
+        let error =
+            result.expect_err("qpdf rejects the malformed classic xref entry in strict mode");
 
         assert!(matches!(
             error,
