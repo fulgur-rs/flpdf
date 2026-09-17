@@ -2190,8 +2190,8 @@ CLI の page-operation route も同じ順序を保つ。qpdf は `createQPDF` �
 `--pages` / `--rotate` / `--flatten-rotation` を文書へ適用した後、
 `writeQPDF` の `setWriterOptions` で linearization を設定する
 （`QPDFJob.cc:450-507,2137-2248,2847-2945`）。flpdf は page selection と
-rotation の完了後に `write_with_pdf_writer(..., linearize, linearize_pass1)`
-へ渡し、`--split-pages` では `doSplitPages` 相当の各 chunk writer に同じ
+rotation の完了後に `QPDFJob::write_qpdf` へ渡し、`--split-pages` では
+`doSplitPages` 相当の各 chunk writer に同じ
 linearization 設定を再適用する（`QPDFJob::write_qpdf` と
 `crates/flpdf/src/job/page_split.rs`）。rewrite の linearized branch でも
 `--flatten-rotation` を writer planning 前に実行する。
@@ -2386,8 +2386,8 @@ logger consumer に移行済みである。
 `writeOutfile` を呼び、`setWriterOptions` の全設定を一度だけ適用する
 （`QPDFJob.cc:2137-2248,2847-2945,3029-3058`）。flpdf の
 `run_add_attachment` / `run_remove_attachment` は mutation 後に
-`normalize_page_contents` を実行し、`top_level_writer_options` から
-`writer_configuration` を経由して `write_with_pdf_writer` へ渡すため、
+`normalize_page_contents` を実行し、`top_level_writer_options` を
+`QPDFJob::create_qpdf` → `QPDFJob::write_qpdf` へ渡すため、
 `--stream-data`、`--decode-level`、`--newline-before-endstream`、ObjStm、QDF、
 encryption、decrypt、linearization、version、ID、progress を attachment output にも
 適用する。`QPDFWriter.cc:1538-1564,1735-1755` の stream/object-stream framing と

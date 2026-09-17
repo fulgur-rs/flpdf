@@ -383,6 +383,27 @@ fn rewrite_pages_split_opens_output_before_weak_crypto_validation() {
     assert!(!String::from_utf8_lossy(&flpdf.stderr).contains("weak cryptographic algorithm"));
 }
 
+#[test]
+fn rewrite_pages_ordinary_output_uses_the_canonical_job_writer_route() {
+    let source = include_str!("../src/main.rs");
+    let start = source
+        .find("fn run_page_extraction_after_plan")
+        .expect("page extraction completion route should remain named");
+    let body = source[start..]
+        .split_once("\n/// Parse `--split-pages")
+        .expect("split parser should follow the page extraction route")
+        .0;
+
+    assert!(
+        body.matches("write_qpdf(").count() >= 2,
+        "ordinary and split page outputs must use the Job writer boundary"
+    );
+    assert!(
+        !body.contains("write_with_pdf_writer("),
+        "page extraction must not retain a direct PdfWriter output route"
+    );
+}
+
 #[cfg(target_os = "linux")]
 #[test]
 fn verbose_pages_preserves_non_utf8_source_and_output_path_bytes() {

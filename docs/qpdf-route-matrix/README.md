@@ -391,8 +391,7 @@ crates/flpdf/src/writer.rs::source_objstm_container_for_batch: prod 1 (1 files) 
 crates/flpdf/src/writer/object.rs::write_trailer_with_ref_map: prod 8 (1 files) / test 0
     crates/flpdf/src/writer.rs 8
 crates/flpdf/src/linearization/writer.rs::write_linearized: prod 0 (0 files) / test 3
-crates/flpdf/src/writer.rs::write_qpdf_to_memory: prod 2 (1 files) / test 16
-    crates/flpdf-cli/src/main.rs 2
+crates/flpdf/src/writer.rs::write_qpdf_to_memory: prod 0 (0 files) / test 19
 crates/flpdf/src/writer.rs::PdfWriter::write: prod 328 (74 files) / test 1003
     crates/flpdf/src/object_handle.rs 39, crates/flpdf-qtest-tools/src/driver/test_42_49.rs 29, crates/flpdf/src/json/writer.rs 16, crates/flpdf-qtest-tools/src/driver/test_72_79.rs 14, crates/flpdf-qtest-tools/src/bin/qpdf_ctest.rs 10, crates/flpdf-qtest-tools/src/driver/test_26_33.rs 10, crates/flpdf-cli/src/main.rs 9, crates/flpdf-qtest-tools/src/driver/test_02_09.rs 8, crates/flpdf-qtest-tools/src/driver/test_0_1.rs 8, crates/flpdf-qtest-tools/src/driver/test_34_41.rs 8, crates/flpdf/src/linearization/show.rs 8, crates/flpdf/src/writer.rs 8, crates/flpdf-qtest-tools/src/tokenizer_runner.rs 7, crates/flpdf/src/job/lifecycle.rs 7, crates/flpdf/src/pipeline/run_length.rs 7, crates/flpdf-qtest-tools/src/driver/test_56_63.rs 6, crates/flpdf-qtest-tools/src/driver/test_64_71.rs 6, crates/flpdf/src/content_normalizer.rs 5, crates/flpdf/src/form_field_object_helper/rendering.rs 5, crates/flpdf/src/logger.rs 5, crates/flpdf/src/pipeline/aes.rs 5, crates/flpdf-qtest-tools/src/driver/test_10_17.rs 4, crates/flpdf-qtest-tools/src/driver/test_18_25.rs 4, crates/flpdf-qtest-tools/src/driver/test_50_55.rs 4, crates/flpdf/src/encryption/standard.rs 4, crates/flpdf/src/job/json.rs 4, crates/flpdf/src/pipeline/dct.rs 4, crates/flpdf/src/pipeline/png_filter.rs 4, crates/flpdf/src/pipeline/stream_codecs_oracle.rs 4, crates/flpdf/src/stream_filter.rs 4, crates/flpdf/src/document_json.rs 3, crates/flpdf/src/json_inspect.rs 3, crates/flpdf/src/linearization/check.rs 3, crates/flpdf/src/page_object_helper.rs 3, crates/flpdf/src/pipeline.rs 3, crates/flpdf/src/pipeline/flate.rs 3, crates/flpdf/src/pipeline/stdio_file.rs 3, crates/flpdf-qtest-tools/src/document_construction.rs 2, crates/flpdf-qtest-tools/src/driver/test_80_87.rs 2, crates/flpdf-qtest-tools/src/large_file.rs 2, crates/flpdf/src/job/attachments.rs 2, crates/flpdf/src/json/input.rs 2, crates/flpdf/src/linearization/writer.rs 2, crates/flpdf/src/pipeline/ascii85_decoder.rs 2, crates/flpdf/src/pipeline/base64.rs 2, crates/flpdf/src/pipeline/lzw.rs 2, crates/flpdf/src/pipeline/lzw_png_oracle.rs 2, crates/flpdf/src/pipeline/test_support.rs 2, crates/flpdf/src/qpdf_time.rs 2, crates/flpdf/src/qutil.rs 2, crates/flpdf/src/token_filter.rs 2, crates/flpdf-qtest-tools/src/metadata.rs 1, crates/flpdf-qtest-tools/src/renumber.rs 1, crates/flpdf/src/bit_writer.rs 1, crates/flpdf/src/filespec_helper/embedded_file_stream.rs 1, crates/flpdf/src/filespec_helper/shared.rs 1, crates/flpdf/src/job/check.rs 1, crates/flpdf/src/job/inspection.rs 1, crates/flpdf/src/job/page_split.rs 1, crates/flpdf/src/object_ref.rs 1, crates/flpdf/src/pages.rs 1, crates/flpdf/src/pipeline/ascii_hex.rs 1, crates/flpdf/src/pipeline/buffer.rs 1, crates/flpdf/src/pipeline/concatenate.rs 1, crates/flpdf/src/pipeline/count.rs 1, crates/flpdf/src/pipeline/md5.rs 1, crates/flpdf/src/pipeline/rc4.rs 1, crates/flpdf/src/pipeline/sha2.rs 1, crates/flpdf/src/pipeline/string.rs 1, crates/flpdf/src/pipeline/tiff_predictor.rs 1, crates/flpdf/src/reader/resolver.rs 1, crates/flpdf/src/resource_replacer.rs 1, crates/flpdf/src/writer/object_streams/emission.rs 1, crates/flpdf/src/writer/serialize.rs 1
 crates/flpdf/src/writer/rewrite_renumber.rs::ObjectStreamRenumber: prod 4 (2 files) / test 0
@@ -421,8 +420,6 @@ crates/flpdf/src/writer.rs::write_pclm: prod 1 (1 files) / test 3
     crates/flpdf/src/writer.rs 1
 crates/flpdf/src/writer/plain/plan.rs::retain_reachable_object_stream_members: prod 2 (1 files) / test 0
     crates/flpdf/src/writer/plain/plan.rs 2
-crates/flpdf-cli/src/main.rs::write_with_pdf_writer: prod 8 (1 files) / test 0
-    crates/flpdf-cli/src/main.rs 8
 crates/flpdf/src/job/attachment_list.rs::format_attachment_list_with_sink: prod 1 (1 files) / test 0
     crates/flpdf/src/job/attachments.rs 1
 `AttachmentInfo` public projection: absent after `flpdf-3yn9.48.97` (prod 0 / test 0 before removal)
@@ -511,7 +508,7 @@ crates/flpdf/src/job/lifecycle.rs::QPDFJob::open: prod 63 (28 files) / test 1283
 | D9 | `source_xref_entries` | 10 | 32 | 行は「writer / linearization 系のみ。reader 内部の 5 箇所は除く」と **手で範囲を絞った**。tracker は全 crate を数える（reader 側 16、engine 2 を含む） | tracker（行の 10 は「writer 側の再実装が何箇所あるか」を示す別の数で、cutover の分母ではない） |
 | D16 | `EncryptionContext` | 22 | 21 | 合計だけでなくファイル別内訳も一致しない（`writer.rs` 13→12、`linearization/writer.rs` 6→7、`writer/encrypted_strings.rs` 3→2）。除外規則（宣言行 / `use` 行 / `impl` ヘッダ）の適用差 | tracker |
 | D19 | `write_linearized` | 0 | 旧1 → 現0 | 複数行文字列の旧誤検出はsource全体のmaskで解消済み | canonical test scaffoldingであり削除ゲート対象外 |
-| D30 | `write_qpdf_to_memory` | 0 | 旧2 | CLIローカルの同名関数に衝突する。現値は§6.2 | test-only helperはcanonical scaffolding。production callerはreceiver/pathで確認する |
+| D30 | `write_qpdf_to_memory` | 0 | 旧2 | `#[cfg(test)]` の現行値は§6.2 | test-only helperはcanonical scaffolding。production callerは0で、CLIの同名private routeも撤去済み |
 | D29 | `qpdf_preserve_source_objstm` | 1 | 1 | reachable な §6.2 snapshot では PR #1486 merge 後の `crates/flpdf/src/writer.rs:3919,3997` を含む | tracker（行の caller 数と tracker の leaf 数が一致） |
 | E-5 | `split_pages` | 2 | 23 | leaf が `QPDFJob::split_pages` メソッドと `configuration.split_pages` フィールド（`crates/flpdf/src/job/lifecycle.rs:191`）に衝突 | 行（leaf が曖昧）。tracker の 23 は分母としてのみ読む |
 | E-9 | `format_attachment_list_with_sink` | 1 | 0 | `QPDFJob::list_attachments` から logger sink として 1 箇所だけ呼ばれる。`flpdf-xsq1` で `pub(crate)` 化し、public re-export を撤去した | tracker |
@@ -548,8 +545,8 @@ canonical `ObjectHandle` pipeへの移行と、この bounded cleanupは route-w
 `.48.49` では C26/C27/C29 の legacy whole-buffer caller と public wrapperを撤去した。
 
 D19 / D30 は canonical implementation に委譲するbyte-neutral test scaffoldingで、削除対象ではない。
-特に D19 は back-patch 前の観測点を保持する。CLI の同名 `write_qpdf_to_memory` は別関数なので
-leaf の総数からこのhelperのproduction callerを推測しない。
+特に D19 は back-patch 前の観測点を保持する。D30 の production caller はなく、CLIの旧同名
+private routeも `.48.144` で撤去済みである。
 
 **D27 follow-up（`flpdf-3yn9.44.1`）:** linearization の stream-parameter probe は
 deletable route の独立 symbol にはせず、D21 の canonical owner
