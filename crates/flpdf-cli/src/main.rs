@@ -9014,25 +9014,42 @@ fn run_qdf(
 ) -> CliResult<()> {
     let input = input.ok_or_else(missing_input_usage_error)?;
     let output = output.ok_or_else(missing_output_usage_error)?;
-    let mut standard_output = prepare_pdf_standard_output(&output)?;
-    let creates_output = standard_output.is_none();
-    let mut pdf = open_pdf(&input, repair, password)?;
-
-    // The `qdf` subcommand is the canonical PdfWriter QDF mode.
+    // qpdf's qdf command is the ordinary QPDFJob writer with qdf mode set;
+    // keep this alias on the same create/write lifecycle as `rewrite --qdf`
+    // instead of opening a Pdf and bypassing the Job boundary.
     let options = WriterOptions {
         qdf: true,
         preserve_unreferenced_objects: preserve_unreferenced,
+        password_mode: password.password_mode.into(),
         ..WriterOptions::default()
     };
-    write_with_pdf_writer(
-        &mut pdf,
-        &output,
-        &mut standard_output,
-        &options,
+    run_rewrite(
+        Some(input),
+        Some(output),
+        false,
+        repair,
+        password,
         false,
         None,
+        false,
+        None,
+        false,
+        false,
+        false,
+        false,
+        CliRemoveUnreferencedResources::Auto,
+        false,
+        ImageTransformOptions::default(),
+        None,
+        false,
+        PageLabelOptions::default(),
+        &[],
+        false,
+        false,
+        options,
+        false,
     )?;
-    finish_operation_warnings(&pdf, creates_output)
+    Ok(())
 }
 
 /// `qdf-fix` (qpdf `fix-qdf` equivalent): repair stream `/Length`, xref
@@ -9897,14 +9914,6 @@ fn open_json_pdf(
         .map_err(|error| json_error_with_file(input, Box::new(error)))?;
     apply_json_update(&mut pdf, update_from_json)?;
     Ok(pdf)
-}
-
-fn open_pdf(
-    input: &PathBuf,
-    repair: bool,
-    password: &PasswordArgs,
-) -> CliResult<Pdf<BufReader<File>>> {
-    open_pdf_impl(input, repair, password, false)
 }
 
 fn open_pdf_with_suppression(
