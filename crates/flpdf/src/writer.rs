@@ -862,12 +862,6 @@ impl<'pdf, R: Read + Seek + 'static> PdfWriter<'pdf, R> {
         // the repaired page order and its three derived maps together so the
         // specialized emitter consumes this setup without another page walk.
         let special_streams = initialize_special_streams(self.pdf, &options)?;
-        if self.settings.linearization && special_streams.is_none() {
-            // qpdf's linearized setup establishes the page-tree read boundary
-            // before its getObjectCount/fixDanglingReferences snapshot, even
-            // when no content stream maps are needed.
-            crate::pages::repair::prepare_for_optimization(self.pdf)?;
-        }
         let effective_object_streams = effective_object_stream_mode(&options);
         let plain_generate_setup = effective_object_streams == ObjectStreamMode::Generate
             && !self.settings.linearization
@@ -909,6 +903,14 @@ impl<'pdf, R: Read + Seek + 'static> PdfWriter<'pdf, R> {
                 })?; // cov:ignore: make_indirect_from_object_handle guarantees a source identity for a generated placeholder.
                 setup.generated_object_stream_sources.push(source);
             }
+        }
+        if self.settings.linearization && special_streams.is_none() {
+            // qpdf filters linearized page dictionaries after Preserve/Generate
+            // setup and before its object-count snapshot
+            // (QPDFWriter.cc:2125-2149,2189-2195). Keep this page walk after
+            // object-stream membership calculation and before the common
+            // writer preparation boundary.
+            crate::pages::repair::prepare_for_optimization(self.pdf)?;
         }
         // qpdf snapshots `getObjectCount()` for every write, even when no
         // progress reporter is configured (`QPDFWriter.cc:2189-2195`). That

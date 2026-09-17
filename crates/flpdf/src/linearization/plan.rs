@@ -1548,16 +1548,20 @@ impl LinearizationPlan {
             object_stream_mode,
             crate::writer::ObjectStreamMode::Generate
         );
-        // QPDFWriter::initializeSpecialStreams calls getAllPages before it
-        // prepares object-stream state and before QPDF::optimize. Keep the
-        // same live page-tree read at the front of the linearization setup so
-        // its diagnostics precede warnings raised while object-stream plans
-        // inspect malformed objects.
-        let prepared_page_sequence = crate::pages::repair::prepare_for_optimization(pdf)?;
+        // QPDFWriter::initializeSpecialStreams calls getAllPages only when a
+        // special-stream trigger is active. In the default linearized route,
+        // object-stream setup runs before the later linearized page scan
+        // (QPDFWriter.cc:1912-1936,1970-2006,2114-2150).
+        let special_stream_trigger = options.qdf
+            || options.content_normalization
+            || options.decode_level != crate::writer::DecodeLevel::None;
+        let mut prepared_page_sequence = if special_stream_trigger {
+            crate::pages::repair::prepare_for_optimization(pdf)?
+        } else {
+            None
+        };
         let capture_pre_optimization_objects =
             !matches!(object_stream_mode, crate::writer::ObjectStreamMode::Disable);
-        let pre_optimization_object_refs = capture_pre_optimization_objects
-            .then(|| pdf.canonical_live_object_refs().into_iter().collect());
         // QPDFWriter::doWriteSetup fixes Generate's eligible object set before
         // writeLinearized calls QPDF::optimize. The latter may mint indirect
         // inherited-attribute objects, which must remain plain in the output.
@@ -1615,6 +1619,11 @@ impl LinearizationPlan {
                     .collect()
             })
             .unwrap_or_default();
+        if !special_stream_trigger {
+            prepared_page_sequence = crate::pages::repair::prepare_for_optimization(pdf)?;
+        }
+        let pre_optimization_object_refs = capture_pre_optimization_objects
+            .then(|| pdf.canonical_live_object_refs().into_iter().collect());
         let preserve_source_container_by_member: BTreeMap<ObjectRef, ObjectRef> =
             preserve_object_stream_data
                 .iter()

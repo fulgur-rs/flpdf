@@ -75,6 +75,15 @@ pinned qpdf 11.9.0 の `libqpdf/QPDFWriter.cc`（3044 行）/ `include/qpdf/QPDF
    なく、`writeStandard` の中で `enqueueObjectsPCLm` を選ぶだけ**。
 5. `pipeline->finish()`、file close、buffer 回収、progress 完了。
 
+**Linearized Generate setup order (`flpdf-svhr3` + `flpdf-bmo81`, 2026-09-17):**
+qpdf's default linearized route computes object-stream membership before its
+ungated linearized `getAllPages` filter; only qdf/normalize/decode invokes the
+earlier `initializeSpecialStreams` page walk (`libqpdf/QPDFWriter.cc:1912-1936,1970-2006,2114-2150`).
+flpdf's `LinearizationPlan` and `PdfWriter::write` now keep the same two
+boundaries. The 98-eligible-object direct-`/Kids` differential fixture fixes
+the qpdf one-container versus flpdf two-container regression and compares
+qpdf/flpdf output bytes and warning status.
+
 ### D-1. 採番の正本は単一の `enqueueObject`（container-first、member 範囲は即時予約）
 
 `QPDFWriter::enqueueObject`（`libqpdf/QPDFWriter.cc:1072-1141`）が **非 linearized 経路の唯一の
