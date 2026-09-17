@@ -498,7 +498,6 @@ pub(crate) fn run_test_7<R: Read + Seek>(
     let trailer = pdf.trailer();
     let root = trailer.try_get_key(b"/Root")?;
     let qstream = root.try_get_key(b"/QStream")?;
-    resolve_handle(pdf, &qstream)?;
     if qstream.type_code()? != 10 {
         return Err(Error::Internal(
             "test 7 run on file with no QStream".to_string(),
@@ -573,7 +572,6 @@ pub(crate) fn run_test_8<R: Read + Seek>(
     let trailer = pdf.trailer();
     let root = trailer.try_get_key(b"/Root")?;
     let qstream = root.try_get_key(b"/QStream")?;
-    resolve_handle(pdf, &qstream)?;
     if qstream.type_code()? != 10 {
         return Err(Error::Internal(
             "test 7 run on file with no QStream".to_string(),
