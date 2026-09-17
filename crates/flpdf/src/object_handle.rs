@@ -3257,6 +3257,37 @@ impl ObjectHandle {
         Ok(self.as_name())
     }
 
+    /// qpdf-compatible string inspection with lazy dereference.
+    ///
+    /// Ports `QPDFObjectHandle::asString`, the silent internal helper the
+    /// dictionary/array/integer/name siblings already have
+    /// ([`Self::try_as_dictionary`], [`Self::try_as_array`],
+    /// [`Self::try_as_integer`], [`Self::try_as_name`]) but the string family
+    /// was missing. Unlike `getIntValue`, qpdf's `getStringValue` does not
+    /// route through `asString()` — it dereferences via `isString()` and
+    /// reads the string value directly (`libqpdf/QPDFObjectHandle.cc:659-668`)
+    /// — so [`Self::try_get_string_value`] keeps its own inline dereference
+    /// rather than delegating here. This completes the resolving family for
+    /// callers currently pairing an explicit resolve with the non-resolving
+    /// [`Self::as_string`].
+    ///
+    /// An uninitialized handle returns `Ok(None)`, matching `asString`'s
+    /// `dereference() ? ... : nullptr` branch
+    /// (`libqpdf/QPDFObjectHandle.cc:327-330`).
+    // No production caller lands in this PR by design: the resolve+cast
+    // callers that currently prepend an explicit resolve to `as_string()`
+    // live in other files, migrated one cohort per owning stream
+    // (flpdf-3yn9.48.151/.152/.153). Remove this allow once the first
+    // cohort PR lands.
+    #[allow(dead_code)]
+    pub(crate) fn try_as_string(&self) -> Result<Option<Vec<u8>>> {
+        if !self.is_initialized() {
+            return Ok(None);
+        }
+        self.try_dereference()?;
+        Ok(self.as_string())
+    }
+
     /// True when this handle lazily resolves to the requested decoded name.
     ///
     /// Ports `QPDFObjectHandle::isNameAndEquals`
@@ -3952,10 +3983,45 @@ impl ObjectHandle {
     /// qpdf-compatible integer inspection with lazy dereference.
     ///
     /// Ports `QPDFObjectHandle::asInteger`, the silent internal helper.
-    /// [`Self::try_get_int_value`] is the accessor that warns.
+    /// [`Self::try_get_int_value`] is the accessor that warns. An
+    /// uninitialized handle returns `Ok(None)`, matching `asInteger`'s
+    /// `dereference() ? ... : nullptr` branch
+    /// (`libqpdf/QPDFObjectHandle.cc:277-280`).
     pub(crate) fn try_as_integer(&self) -> Result<Option<i64>> {
+        if !self.is_initialized() {
+            return Ok(None);
+        }
         self.try_dereference()?;
         Ok(self.as_integer())
+    }
+
+    /// qpdf-compatible real inspection with lazy dereference.
+    ///
+    /// Ports `QPDFObjectHandle::asReal`, the silent internal helper the
+    /// dictionary/array/integer/name siblings already have
+    /// ([`Self::try_as_dictionary`], [`Self::try_as_array`],
+    /// [`Self::try_as_integer`], [`Self::try_as_name`]) but the real family
+    /// was missing. Unlike `getIntValue`, qpdf's `getRealValue` does not
+    /// route through `asReal()` — it dereferences via `isReal()` and reads
+    /// the source-literal string directly
+    /// (`libqpdf/QPDFObjectHandle.cc:611-620`) — so
+    /// [`Self::try_get_real_value`] keeps its own inline dereference rather
+    /// than delegating here. This completes the resolving family for callers
+    /// currently pairing an explicit resolve with the non-resolving
+    /// [`Self::as_real`].
+    ///
+    /// An uninitialized handle returns `Ok(None)`, matching `asReal`'s
+    /// `dereference() ? ... : nullptr` branch
+    /// (`libqpdf/QPDFObjectHandle.cc:301-304`).
+    // No production caller lands in this PR by design: see the note on
+    // `try_as_string` above (flpdf-3yn9.48.151/.152/.153).
+    #[allow(dead_code)]
+    pub(crate) fn try_as_real(&self) -> Result<Option<f64>> {
+        if !self.is_initialized() {
+            return Ok(None);
+        }
+        self.try_dereference()?;
+        Ok(self.as_real())
     }
 
     /// This handle's integer value, warning and yielding `0` for any other
@@ -10454,6 +10520,19 @@ pub(crate) mod identity_tests {
     }
 
     #[test]
+    fn try_as_string_resolves_an_indirect_string_through_its_document() {
+        let (handle, _resolver) = resolver_bearing_handle(ObjectValue::String(b"secret".to_vec()));
+
+        // Same gap as `try_as_name`: the non-resolving accessor cannot see
+        // through an unresolved handle.
+        assert_eq!(handle.as_string(), None);
+        assert!(!handle.is_resolved());
+
+        assert_eq!(handle.try_as_string().unwrap(), Some(b"secret".to_vec()));
+        assert!(handle.is_resolved());
+    }
+
+    #[test]
     fn try_is_name_and_equals_compares_direct_decoded_name_bytes() {
         let name = ObjectHandle::name(b"Crypt".to_vec());
 
@@ -10761,6 +10840,17 @@ pub(crate) mod identity_tests {
         assert!(!handle.is_resolved());
 
         assert_eq!(handle.try_as_integer().unwrap(), Some(7));
+        assert!(handle.is_resolved());
+    }
+
+    #[test]
+    fn try_as_real_resolves_an_indirect_real_through_its_document() {
+        let (handle, _resolver) = resolver_bearing_handle(ObjectValue::Real(3.5));
+
+        assert_eq!(handle.as_real(), None);
+        assert!(!handle.is_resolved());
+
+        assert_eq!(handle.try_as_real().unwrap(), Some(3.5));
         assert!(handle.is_resolved());
     }
 
@@ -19950,6 +20040,10 @@ pub(crate) mod warning_emission_tests {
         assert!(!handle.try_is_name().unwrap());
         assert!(handle.try_as_dictionary().unwrap().is_none());
         assert!(handle.try_as_name().unwrap().is_none());
+        assert!(handle.try_as_string().unwrap().is_none());
+        assert!(handle.try_as_integer().unwrap().is_none());
+        assert!(handle.try_as_real().unwrap().is_none());
+        assert!(handle.try_as_array().unwrap().is_none());
         assert!(!handle.try_is_null().unwrap());
         assert!(!handle.try_is_scalar().unwrap());
         assert!(!handle.try_is_number().unwrap());
