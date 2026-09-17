@@ -1352,6 +1352,7 @@ thread_local! {
     static TEST_SLOTS: RefCell<Vec<Weak<RefCell<ObjectSlot>>>> = const { RefCell::new(Vec::new()) };
     static STATE_CHILDREN_VECTOR_CALLS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
     static OBJECT_REF_PROMOTION_CALLS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+    static DETACHED_STATE_REBIND_ALLOCATIONS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
 }
 
 #[cfg(test)]
@@ -1365,6 +1366,11 @@ fn register_test_slot(_slot: &Rc<RefCell<ObjectSlot>>) {}
 #[cfg(test)]
 pub(crate) fn object_ref_promotion_calls_for_test() -> usize {
     OBJECT_REF_PROMOTION_CALLS.with(std::cell::Cell::get)
+}
+
+#[cfg(test)]
+pub(crate) fn detached_state_rebind_allocations_for_test() -> usize {
+    DETACHED_STATE_REBIND_ALLOCATIONS.with(std::cell::Cell::get)
 }
 
 #[cfg(test)]
@@ -2283,7 +2289,20 @@ impl ObjectHandle {
     /// transitions rebind the departing `QPDFObject`; they do not mutate the
     /// `QPDFValue` allocation that a replacement alias still observes.
     fn replace_detached_state(&self, new_state: ObjectValue) {
-        let old_shared = self.0.borrow().shared.clone();
+        let (old_shared, uniquely_owned) = {
+            let slot = self.0.borrow();
+            let uniquely_owned = Rc::strong_count(&slot.shared) == 1;
+            (slot.shared.clone(), uniquely_owned)
+        };
+        if uniquely_owned {
+            let old_value = {
+                let mut shared = old_shared.borrow_mut();
+                std::mem::replace(&mut shared.value, new_state)
+            };
+            drop(old_value);
+            return;
+        }
+
         let (identity, parsed_offset, description) = {
             let shared = old_shared.borrow();
             (
@@ -2292,6 +2311,10 @@ impl ObjectHandle {
                 shared.description.clone(),
             )
         };
+        #[cfg(test)]
+        DETACHED_STATE_REBIND_ALLOCATIONS.with(|allocations| {
+            allocations.set(allocations.get() + 1);
+        });
         let new_shared = new_shared_value_state(new_state, identity, parsed_offset);
         new_shared.borrow_mut().description = description;
 
@@ -9945,9 +9968,15 @@ pub(crate) mod identity_tests {
         replacement.0.borrow().shared.borrow_mut().identity =
             target.0.borrow().shared.borrow().identity.clone();
         target.assign_value_state(&replacement);
+        let allocations_before = super::detached_state_rebind_allocations_for_test();
 
         target.remove_from_document();
 
+        assert_eq!(
+            super::detached_state_rebind_allocations_for_test(),
+            allocations_before + 1,
+            "shared value state must retain the detached-state fallback"
+        );
         assert!(target.is_direct());
         assert!(target.try_is_null().unwrap());
         assert_eq!(target.object_ref(), None);
@@ -9972,15 +10001,39 @@ pub(crate) mod identity_tests {
         replacement.0.borrow().shared.borrow_mut().identity =
             target.0.borrow().shared.borrow().identity.clone();
         target.assign_value_state(&replacement);
+        let allocations_before = super::detached_state_rebind_allocations_for_test();
 
         target.disconnect_and_destroy();
 
+        assert_eq!(
+            super::detached_state_rebind_allocations_for_test(),
+            allocations_before + 1,
+            "shared value state must retain the detached-state fallback"
+        );
         assert_eq!(target.type_code().expect("type code"), 14);
         assert!(!replacement.try_is_null().unwrap());
         assert_eq!(
             replacement.try_get_key(b"/Value").unwrap().as_integer(),
             Some(7)
         );
+    }
+
+    #[test]
+    fn repeated_destroy_reuses_the_same_unique_value_state_boundary() {
+        let handle = ObjectHandle::new_indirect_unresolved(ObjectRef::new(50, 0), -1);
+        handle.set_resolved(ObjectValue::Integer(9));
+        let allocations_before = super::detached_state_rebind_allocations_for_test();
+
+        handle.disconnect_and_destroy();
+        handle.disconnect_and_destroy();
+
+        assert_eq!(
+            super::detached_state_rebind_allocations_for_test(),
+            allocations_before,
+            "idempotent destruction must not reintroduce detached-state allocation"
+        );
+        assert_eq!(handle.type_code().expect("destroyed type code"), 14);
+        assert_eq!(handle.get_parsed_offset(), NO_PARSED_OFFSET);
     }
 
     #[test]
@@ -11191,6 +11244,41 @@ mod uniform_identity_tests {
         assert_eq!(original.object_ref(), None);
         assert!(!original.is_null());
         assert_eq!(original.get_parsed_offset(), NO_PARSED_OFFSET);
+    }
+
+    #[test]
+    fn unique_destroy_reuses_the_existing_value_state() {
+        let handle = ObjectHandle::new_indirect_unresolved(ObjectRef::new(48, 0), -1);
+        handle.set_resolved(ObjectValue::Integer(9));
+        let allocations_before = super::detached_state_rebind_allocations_for_test();
+
+        handle.disconnect_and_destroy();
+
+        assert_eq!(
+            super::detached_state_rebind_allocations_for_test(),
+            allocations_before,
+            "a uniquely owned value state must be rebound in place"
+        );
+        assert_eq!(handle.type_code().expect("destroyed type code"), 14);
+        assert_eq!(handle.get_parsed_offset(), NO_PARSED_OFFSET);
+    }
+
+    #[test]
+    fn unique_remove_reuses_the_existing_value_state() {
+        let handle = ObjectHandle::new_indirect_unresolved(ObjectRef::new(49, 0), -1);
+        handle.set_resolved(ObjectValue::Integer(9));
+        let allocations_before = super::detached_state_rebind_allocations_for_test();
+
+        handle.remove_from_document();
+
+        assert_eq!(
+            super::detached_state_rebind_allocations_for_test(),
+            allocations_before,
+            "a uniquely owned value state must be rebound in place"
+        );
+        assert!(handle.is_null());
+        assert_eq!(handle.object_ref(), None);
+        assert_eq!(handle.get_parsed_offset(), NO_PARSED_OFFSET);
     }
 
     #[test]
