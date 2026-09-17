@@ -6508,12 +6508,8 @@ mod tests {
         assert!(parse_job_encrypt(&no_key_length, true, &inherited).is_err());
         assert!(parse_job_encrypt(&encrypt_40, false, &inherited).is_err());
 
-        let (_, aes_defaults) = parse_job_encrypt(
-            &encrypt_128_no_accessibility,
-            true,
-            &inherited,
-        )
-        .unwrap();
+        let (_, aes_defaults) =
+            parse_job_encrypt(&encrypt_128_no_accessibility, true, &inherited).unwrap();
         let (_, r2_defaults) = parse_job_encrypt(&encrypt_40, true, &aes_defaults).unwrap();
         let (params, _) = parse_job_encrypt(&encrypt_128_rc4, true, &r2_defaults).unwrap();
         assert_eq!(params.method, EncryptMethod::V4Aes128);
