@@ -214,6 +214,33 @@ fn page_selection_post_plan_rotation_and_images_use_the_canonical_job_owner() {
 }
 
 #[test]
+fn empty_page_selection_uses_the_canonical_job_create_stage() {
+    let source = production_main_source();
+    let empty_pages = source
+        .split_once("fn run_empty_page_extraction")
+        .and_then(|(_, tail)| {
+            tail.split_once("/// Run qpdf's ordinary multi-source page-spec path")
+        })
+        .map(|(body, _)| body)
+        .expect("empty-primary page-selection route");
+
+    assert!(
+        empty_pages.contains("configuration.empty_input()"),
+        "empty-primary page selection must configure QPDFJob's empty input"
+    );
+    assert!(
+        empty_pages.contains("job.create_qpdf()"),
+        "empty-primary page selection must receive its merged document from QPDFJob"
+    );
+    for forbidden in ["open_page_source(", "job.handle_page_specs("] {
+        assert!(
+            !empty_pages.contains(forbidden),
+            "empty-primary page selection retains a CLI-owned page-source route: {forbidden}"
+        );
+    }
+}
+
+#[test]
 fn direct_rewrite_overlay_images_match_qpdf_after_externalization() {
     if !qpdf_available() {
         return;
