@@ -653,16 +653,34 @@ fn walk_resurrectable_handle(
         return Ok(());
     }
 
-    if let Some(entries) = handle.try_as_dictionary()? {
-        for (_key, value) in entries {
+    if let Some(values) = handle.with_value(|value| match value {
+        Some(crate::object_handle::ObjectValue::Dictionary(entries)) => {
+            // BTreeMap iteration is already qpdf's decoded-key order. Clone
+            // only the child handles into a flat queue; cloning the complete
+            // map would allocate one tree node per key
+            // (QPDF_Dictionary.cc:117-127).
+            Some(entries.values().cloned().collect::<Vec<_>>())
+        }
+        _ => None,
+    }) {
+        // Array elements remain on the separate path above, because an
+        // indirect null in an array is a surviving edge. Dictionary nulls are
+        // discarded by the existing walk at the same child boundary as qpdf.
+        for value in values {
             walk_resurrectable_handle(&value, depth + 1, false, true, state)?;
         }
         return Ok(());
     }
 
     if let Some(stream_dict) = handle.as_stream_dict() {
-        if let Some(entries) = stream_dict.try_as_dictionary()? {
-            for (_key, value) in entries {
+        stream_dict.try_dereference()?;
+        if let Some(values) = stream_dict.with_value(|value| match value {
+            Some(crate::object_handle::ObjectValue::Dictionary(entries)) => {
+                Some(entries.values().cloned().collect::<Vec<_>>())
+            }
+            _ => None,
+        }) {
+            for value in values {
                 walk_resurrectable_handle(&value, depth + 1, false, true, state)?;
             }
         }

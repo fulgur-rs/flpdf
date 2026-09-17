@@ -1692,3 +1692,57 @@ fn plain_writer_map_lookup_does_not_retain_per_object_renumber_snapshots() {
         "per-object renumber snapshots caused excessive allocation traffic: small={small_allocations}, large={large_allocations}"
     );
 }
+
+const SMALL_LINEARIZED_DICTIONARY_COUNT: usize = 64;
+const LARGE_LINEARIZED_DICTIONARY_COUNT: usize = 512;
+// The pre-cutover complete-map walk measured about 45.5k additional
+// allocations for this 64 -> 512 dictionary growth. Keep the regression
+// bound below that baseline while allowing allocator noise around the flat
+// child-handle queue.
+const LINEARIZED_DICTIONARY_ALLOCATION_GROWTH_BOUND: usize = 43_000;
+
+fn measure_linearized_dictionary_allocations(dictionary_count: usize) -> usize {
+    let mut pdf = Pdf::open(Cursor::new(
+        include_bytes!("../../../tests/fixtures/compat/one-page.pdf").to_vec(),
+    ))
+    .expect("open one-page linearization fixture");
+    let root = pdf.root_handle().expect("resolve live Catalog");
+    for index in 0..dictionary_count {
+        let dictionary = ObjectHandle::dictionary(
+            (0..8)
+                .map(|key| {
+                    (
+                        format!("/SnapshotKey{key:02}").into_bytes(),
+                        ObjectHandle::integer((index + key) as i64),
+                    )
+                })
+                .collect(),
+        );
+        let object = pdf
+            .make_indirect_from_object_handle(dictionary)
+            .expect("create linearization dictionary");
+        root.replace_key(format!("/LinearizedSnapshot{index:04}").as_bytes(), object)
+            .expect("attach linearization dictionary");
+    }
+
+    start_allocation_measurement_after_fixture_baseline();
+    let mut writer = configure_disable_writer(&mut pdf);
+    writer.set_linearization(true);
+    writer
+        .set_output_writer(DiscardWriter)
+        .expect("install discard output");
+    writer.write().expect("linearized writer succeeds");
+    finish_allocation_count()
+}
+
+#[test]
+fn linearized_object_walk_does_not_clone_a_complete_dictionary_map_per_object() {
+    let small = measure_linearized_dictionary_allocations(SMALL_LINEARIZED_DICTIONARY_COUNT);
+    let large = measure_linearized_dictionary_allocations(LARGE_LINEARIZED_DICTIONARY_COUNT);
+    let growth = large.saturating_sub(small);
+
+    assert!(
+        growth <= LINEARIZED_DICTIONARY_ALLOCATION_GROWTH_BOUND,
+        "linearized object walk retained complete dictionary snapshots: small={small}, large={large}, growth={growth}, bound={LINEARIZED_DICTIONARY_ALLOCATION_GROWTH_BOUND}"
+    );
+}
