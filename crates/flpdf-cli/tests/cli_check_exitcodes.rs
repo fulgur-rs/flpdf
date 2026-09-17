@@ -554,6 +554,59 @@ fn check_subcommand_clean_pdf_exits_0() {
         .stderr(predicate::str::is_empty());
 }
 
+#[test]
+fn standalone_check_routes_match_qpdf_process_contracts() {
+    if !qpdf_available() {
+        return;
+    }
+
+    for (label, bytes, extra_args) in [
+        ("clean", clean_pdf_bytes(), Vec::<&str>::new()),
+        (
+            "repaired",
+            warnings_only_corrupt_xref_bytes(),
+            vec!["--repair"],
+        ),
+    ] {
+        let mut input = tempfile::NamedTempFile::new().unwrap();
+        input.write_all(&bytes).unwrap();
+        let path = input.path().to_str().unwrap();
+
+        let qpdf_args = vec!["--check", path];
+        let qpdf = ProcessCommand::new("qpdf")
+            .args(&qpdf_args)
+            .output()
+            .unwrap_or_else(|error| panic!("qpdf {label} probe failed: {error}"));
+
+        for command_args in [
+            [&["--check"][..], extra_args.as_slice(), &[path][..]].concat(),
+            [&["check"][..], extra_args.as_slice(), &[path][..]].concat(),
+        ] {
+            let flpdf = ProcessCommand::new(assert_cmd::cargo_bin!("flpdf"))
+                .env("FLPDF_PROGNAME", "qpdf")
+                .args(&command_args)
+                .output()
+                .unwrap();
+            assert_eq!(
+                flpdf.status.code(),
+                qpdf.status.code(),
+                "{label} standalone check status mismatch for {:?}",
+                command_args
+            );
+            assert_eq!(
+                flpdf.stdout, qpdf.stdout,
+                "{label} standalone check stdout mismatch for {:?}",
+                command_args
+            );
+            assert_eq!(
+                flpdf.stderr, qpdf.stderr,
+                "{label} standalone check stderr mismatch for {:?}",
+                command_args
+            );
+        }
+    }
+}
+
 // ---------------------------------------------------------------------------
 // Tests: qpdf-compatible stdout "checking" block
 // ---------------------------------------------------------------------------

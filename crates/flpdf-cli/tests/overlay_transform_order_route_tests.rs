@@ -131,6 +131,34 @@ fn ordinary_rewrite_uses_the_canonical_job_transform_and_output_routes() {
 }
 
 #[test]
+fn standalone_check_uses_the_canonical_job_lifecycle() {
+    let source = production_main_source();
+    let check_route = source
+        .split_once("fn run_check(")
+        .and_then(|(_, tail)| {
+            tail.split_once("fn run_check_linearization")
+                .map(|(body, _)| body)
+        })
+        .expect("standalone check route");
+
+    assert!(
+        check_route.contains("job.run()"),
+        "standalone check must use QPDFJob's create/write inspection lifecycle"
+    );
+    for forbidden in [
+        "File::open(",
+        "open_with_description(",
+        "job.check(",
+        "finish_check_job(",
+    ] {
+        assert!(
+            !check_route.contains(forbidden),
+            "standalone check retains a CLI-local route: {forbidden}"
+        );
+    }
+}
+
+#[test]
 fn page_selection_overlay_uses_the_canonical_job_owner() {
     let source = production_main_source();
     let after_plan = source

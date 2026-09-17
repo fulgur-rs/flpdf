@@ -5441,33 +5441,35 @@ fn run_check(
     transform_options: InspectionTransformOptions<'_>,
     verbose: bool,
 ) -> CliResult<()> {
-    if empty {
-        reject_empty_inspection_output(input.as_deref())?;
-        let mut job = new_cli_job(no_warn);
-        job.set_show_encryption_key(show_encryption_key);
-        let mut pdf = create_empty_primary_document(&mut job, None)?;
-        apply_inspection_transformations(&mut job, &mut pdf, transform_options, verbose)?;
-        return finish_check_job(job.check(&mut pdf));
-    }
-    let input = input.ok_or_else(missing_input_usage_error)?;
-    let file = File::open(&input).map_err(|error| open_error_with_file(&input, error.into()))?;
     let mut job = new_cli_job(no_warn);
     job.set_show_encryption_key(show_encryption_key);
-    let mut options = pdf_open_options(repair, password)?;
-    // qpdf delivers xref-recovery warnings while opening, before the check
-    // banner. Only --no-warn suppresses that live delivery; the check job's
-    // replay path remains available for callers that deliberately opened a
-    // document with warning delivery suppressed.
-    options.suppress_warnings = no_warn;
-    let mut pdf =
-        match job.open_with_description(BufReader::new(file), path_description(&input), options) {
-            Ok(pdf) => pdf,
-            Err(error) => {
-                return Err(error_with_file(&input, actionable_password_error(error)));
-            }
-        };
-    apply_inspection_transformations(&mut job, &mut pdf, transform_options, verbose)?;
-    finish_check_job(job.check(&mut pdf))
+    job.set_verbose(verbose);
+    configure_top_level_inspection_transformations(
+        &mut job,
+        transform_options,
+        verbose,
+        false,
+        false,
+    )?;
+    {
+        let mut configuration = job.config();
+        configuration.check();
+    }
+    if empty {
+        reject_empty_inspection_output(input.as_deref())?;
+        job.config().empty_input()?;
+    } else {
+        let input = input.ok_or_else(missing_input_usage_error)?;
+        let input_options = pdf_open_options(repair, password)?;
+        job.set_input_file(input)?;
+        job.set_password(input_options.password);
+        job.set_password_mode(password.password_mode.into());
+        job.set_password_is_hex_key(password.password_is_hex_key);
+        job.set_suppress_password_recovery(password.suppress_password_recovery);
+        job.set_suppress_recovery(password.recovery.suppress_recovery);
+        job.set_ignore_xref_streams(password.recovery.ignore_xref_streams);
+    }
+    finish_job_exit_status(job.run()?)
 }
 
 fn run_check_linearization(
@@ -10160,20 +10162,8 @@ fn finish_job_exit_status(status: JobExitCode) -> CliResult<()> {
     }
 }
 
-/// Map the qpdf-shaped check consumer's result to the CLI exit contract.
-/// Diagnostics have already been emitted by [`QPDFJob::check`]; this adapter
-/// only selects qpdf's error (2), warning (3), or success (0) process status.
-fn finish_check_job(result: std::result::Result<JobExitCode, CheckError>) -> CliResult<()> {
-    match result {
-        Ok(status) => finish_job_exit_status(status),
-        Err(CheckError::ErrorsDetected) => Err(Box::new(CliExitError {
-            code: ExitCode::Errors,
-            message: String::new(),
-        })),
-        Err(CheckError::Operation(error)) => Err(Box::new(error)),
-    }
-}
-
+/// Complete a standalone warning/status boundary after a report-only consumer
+/// has recorded its warning state.
 fn finish_warning_state(has_warnings: bool, creates_output: bool, no_warn: bool) -> CliResult<()> {
     let mut job = QPDFJob::new();
     job.set_warnings_exit_zero(cli_warning_exit_zero());
