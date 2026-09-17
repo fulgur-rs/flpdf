@@ -113,6 +113,24 @@ fn logger_with_error_sink() -> (QPDFLogger, Arc<Mutex<SinkState>>) {
     (logger, state)
 }
 
+/// qpdf's Windows C-runtime text stdout is CRLF-terminated while a recording
+/// pipeline receives the logger's logical LF bytes. Compare the text payload
+/// independently of that host transport convention.
+fn normalize_text_newlines(bytes: &[u8]) -> Vec<u8> {
+    let mut normalized = Vec::with_capacity(bytes.len());
+    let mut remaining = bytes;
+    while let Some((&byte, rest)) = remaining.split_first() {
+        if byte == b'\r' && rest.first() == Some(&b'\n') {
+            normalized.push(b'\n');
+            remaining = &rest[1..];
+        } else {
+            normalized.push(byte);
+            remaining = rest;
+        }
+    }
+    normalized
+}
+
 #[cfg(target_os = "linux")]
 fn non_utf8_path(directory: &Path, filename: &[u8]) -> PathBuf {
     let mut bytes = directory.as_os_str().as_bytes().to_vec();
@@ -922,7 +940,10 @@ fn raw_argv_show_npages_matches_the_qpdf_11_9_0_boundary() {
     ])
     .unwrap();
     assert_eq!(job.run().unwrap(), JobExitCode::Success);
-    assert_eq!(info.lock().unwrap().bytes, qpdf.stdout);
+    assert_eq!(
+        normalize_text_newlines(&info.lock().unwrap().bytes),
+        normalize_text_newlines(&qpdf.stdout)
+    );
 }
 
 #[test]
