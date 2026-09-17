@@ -42,7 +42,6 @@
 #   parse    — 使用不能（prod 292）。E-14/E-15 は qpdf の parser identifier を
 #              `parse_rotation_parameter` / `parse_numrange` として登録する。
 #   main     (E-21) — `fn main` は宣言行なので除外され、prod 0 になる（degenerate）。
-#   Plan     (D24) — `writer/pclm.rs::Plan` 以外の `Plan` も拾う。
 #
 # leaf を共有する行（1 つの数字が複数の行セルに対応する）
 #   compute_data_key            C17（reader/writer 共通 primitive）
@@ -196,8 +195,8 @@ crates/flpdf/src/writer/plain/xref.rs::append_xref_and_trailer           # D12/D
 crates/flpdf/src/writer.rs::build_writer_trailer_handle                  # D14 canonical
 crates/flpdf/src/writer.rs::EncryptionContext                            # D16
 crates/flpdf/src/writer/object_streams/planning.rs::filter_objstm_batches_for_output       # D23 canonical
-crates/flpdf/src/writer/pclm.rs::Plan                                    # D24（曖昧 leaf）
-crates/flpdf/src/writer.rs::write_pclm                                     # D24
+crates/flpdf/src/writer/plain/body.rs::enqueue_objects_pclm              # D24
+crates/flpdf/src/writer/plain/body.rs::enqueue_objects_standard            # D24
 crates/flpdf/src/writer/plain/plan.rs::retain_reachable_object_stream_members              # D28
 
 # ===========================================================================
