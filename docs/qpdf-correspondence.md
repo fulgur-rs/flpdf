@@ -2204,6 +2204,12 @@ flpdf の top-level / `rewrite` page-operation route も、ページ選択後の
 で固定した。`--copy-encryption`、`--decrypt`、`--coalesce-contents` など別の未対応組合せは
 この変更の対象外である。
 
+2026-09-17（`flpdf-3yn9.48.143`）: qdf サブコマンドは qpdf の独立 writer 実装ではなく、
+通常の `QPDFJob` に qdf/preserve-unreferenced writer option を設定した経路である
+（`qpdf/qpdf.cc:26-44`, `QPDFJob.cc:483-511,2847-2937`）。flpdf の `run_qdf` は
+直接 `PdfWriter` を呼ばず、`run_rewrite` の `create_qpdf` → `write_qpdf` 境界へ接続した。
+`qdf-fix` は手編集 QDF の byte-level 修復であり、この Job cutover の対象外に保持する。
+
 2026-09-17（`flpdf-3yn9.48.142`）: rewrite サブコマンドの `--pages … --split-pages`
 も、ページ選択後の CLI-local split helper を削除して `QPDFJob::write_qpdf` の
 `writeQPDF` → `doSplitPages` 分岐へ接続した。qpdf の `setWriterOptions` が最初の

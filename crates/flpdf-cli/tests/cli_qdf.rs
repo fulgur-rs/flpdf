@@ -21,7 +21,7 @@
 use assert_cmd::Command;
 use predicates::prelude::*;
 use std::io::Write;
-use std::process::Command as ShellCommand;
+use std::process::{Command as ShellCommand, Output};
 
 // ---------------------------------------------------------------------------
 // qpdf availability guard (same policy as cli_object_streams_qpdf_parity.rs)
@@ -63,6 +63,40 @@ fn qpdf_check(path: &std::path::Path) -> std::process::ExitStatus {
         .args(["--check", path.to_str().unwrap()])
         .status()
         .expect("failed to spawn qpdf")
+}
+
+fn run_qdf_qpdf(extra: &[&str], input: &std::path::Path, output: &std::path::Path) -> Output {
+    ShellCommand::new("qpdf")
+        .args(extra)
+        .args(["--qdf", input.to_str().unwrap(), output.to_str().unwrap()])
+        .output()
+        .expect("qpdf should spawn")
+}
+
+fn run_qdf_flpdf(extra: &[&str], input: &std::path::Path, output: &std::path::Path) -> Output {
+    let mut command = Command::cargo_bin("flpdf").expect("flpdf binary should build");
+    command
+        .env("FLPDF_PROGNAME", "qpdf")
+        .arg("qdf")
+        .args(extra)
+        .args([input.to_str().unwrap(), output.to_str().unwrap()]);
+    command.output().expect("flpdf should spawn")
+}
+
+fn normalize_qdf_diagnostic(bytes: &[u8], output: &std::path::Path) -> Vec<u8> {
+    let output = output.to_string_lossy().as_bytes().to_vec();
+    let mut normalized = Vec::with_capacity(bytes.len());
+    let mut remaining = bytes;
+    while let Some(position) = remaining
+        .windows(output.len())
+        .position(|window| window == output.as_slice())
+    {
+        normalized.extend_from_slice(&remaining[..position]);
+        normalized.extend_from_slice(b"<output>");
+        remaining = &remaining[position + output.len()..];
+    }
+    normalized.extend_from_slice(remaining);
+    normalized
 }
 
 // ---------------------------------------------------------------------------
@@ -267,6 +301,105 @@ fn qdf_subcommand_is_alias_of_rewrite_qdf() {
         a, b,
         "`qdf` subcommand must be a byte-for-byte alias of `rewrite --qdf` \
          (modulo the per-process random trailer /ID)"
+    );
+}
+
+#[test]
+fn qdf_subcommand_uses_the_canonical_job_writer_route() {
+    let source = include_str!("../src/main.rs");
+    let start = source
+        .find("fn run_qdf(")
+        .expect("qdf subcommand route should remain named");
+    let body = source[start..]
+        .split_once("\nfn run_qdf_fix")
+        .expect("qdf-fix should follow the qdf route")
+        .0;
+
+    assert!(
+        body.contains("run_rewrite("),
+        "qdf must enter the canonical QPDFJob rewrite lifecycle"
+    );
+    assert!(
+        !body.contains("write_with_pdf_writer("),
+        "qdf must not retain a direct PdfWriter consumer"
+    );
+}
+
+#[test]
+fn qdf_subcommand_matches_qpdf_process_contracts() {
+    if skip_if_qpdf_missing() {
+        return;
+    }
+
+    let temp = tempfile::tempdir().unwrap();
+    let clean = fixture_with_stream();
+    let repaired = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+        .join("../../tests/fixtures/test_driver/repairable_input.pdf");
+    let encrypted = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+        .join("../../tests/fixtures/encrypted/v5-aes-256-r6.pdf");
+    let unreferenced = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+        .join("../../tests/fixtures/compat/unref-resources-one-page.pdf");
+    let cases: [(&str, &[&str], &[&str], &std::path::Path); 4] = [
+        ("clean", &[], &[], clean.path()),
+        // qpdf repairs by default; flpdf exposes the explicit --repair flag.
+        ("repaired", &[], &["--repair"], repaired.as_path()),
+        (
+            "encrypted",
+            &["--password=user-v5-r6"],
+            &["--password=user-v5-r6"],
+            encrypted.as_path(),
+        ),
+        (
+            "preserve-unreferenced",
+            &["--preserve-unreferenced"],
+            &["--preserve-unreferenced"],
+            unreferenced.as_path(),
+        ),
+    ];
+
+    for (name, qpdf_extra, flpdf_extra, input) in cases {
+        let qpdf_output = temp.path().join(format!("qpdf-{name}.pdf"));
+        let flpdf_output = temp.path().join(format!("flpdf-{name}.pdf"));
+        let qpdf = run_qdf_qpdf(qpdf_extra, input, &qpdf_output);
+        let flpdf = run_qdf_flpdf(flpdf_extra, input, &flpdf_output);
+
+        assert_eq!(flpdf.status.code(), qpdf.status.code(), "qdf {name} status");
+        assert_eq!(flpdf.stdout, qpdf.stdout, "qdf {name} stdout");
+        assert_eq!(
+            normalize_qdf_diagnostic(&flpdf.stderr, &flpdf_output),
+            normalize_qdf_diagnostic(&qpdf.stderr, &qpdf_output),
+            "qdf {name} stderr"
+        );
+        assert!(
+            matches!(qpdf.status.code(), Some(0) | Some(3)),
+            "qpdf qdf {name} should succeed or report repair warnings"
+        );
+        assert!(
+            matches!(flpdf.status.code(), Some(0) | Some(3)),
+            "flpdf qdf {name} should succeed or report repair warnings"
+        );
+        assert_eq!(
+            strip_id_line(&std::fs::read(&flpdf_output).unwrap()),
+            strip_id_line(&std::fs::read(&qpdf_output).unwrap()),
+            "qdf {name} output"
+        );
+    }
+
+    let missing = temp.path().join("missing-directory");
+    let qpdf_output = missing.join("qpdf.pdf");
+    let flpdf_output = missing.join("flpdf.pdf");
+    let qpdf = run_qdf_qpdf(&[], clean.path(), &qpdf_output);
+    let flpdf = run_qdf_flpdf(&[], clean.path(), &flpdf_output);
+    assert_eq!(
+        flpdf.status.code(),
+        qpdf.status.code(),
+        "qdf output-open status"
+    );
+    assert_eq!(flpdf.stdout, qpdf.stdout, "qdf output-open stdout");
+    assert_eq!(
+        normalize_qdf_diagnostic(&flpdf.stderr, &flpdf_output),
+        normalize_qdf_diagnostic(&qpdf.stderr, &qpdf_output),
+        "qdf output-open stderr"
     );
 }
 
