@@ -1471,11 +1471,11 @@ fn qtest_accessor_cases_do_not_use_explicit_pdf_resolve() {
     );
     assert!(
         !test_2.contains("resolve_handle("),
-        "test 2 retains the qpdf-less explicit resolve_handle bridge"
+        "test 2 must not retain the qpdf-less explicit resolve_handle bridge"
     );
     assert!(
-        early_source.contains("fn resolve_handle"),
-        "the shared resolve_handle helper was removed with test 2's caller"
+        !early_source.contains("fn resolve_handle"),
+        "the shared resolve_handle helper must be removed after all callers are cut over"
     );
     let test_4 = section(
         early_source.as_str(),
@@ -1510,7 +1510,7 @@ fn qtest_accessor_cases_do_not_use_explicit_pdf_resolve() {
     );
     assert!(
         !test_6.contains("resolve_handle("),
-        "test 6 retains the qpdf-less explicit resolve_handle bridge"
+        "test 6 must not retain the qpdf-less explicit resolve_handle bridge"
     );
     assert!(
         test_6.contains("type_code()") && test_6.contains("pipe_stream_data("),
@@ -1743,8 +1743,9 @@ fn qtest_accessor_cases_do_not_use_explicit_pdf_resolve() {
         "test 87 must enumerate keys through the canonical resolving accessor"
     );
     assert!(
-        early_source.contains("fn resolve_handle"),
-        "the shared helper remains until the separate caller-zero cleanup step"
+        !early_source.contains("fn resolve_handle")
+            && !early_source.contains("resolve_handle("),
+        "the qpdf-less resolve_handle helper must be removed after caller-zero"
     );
 
     let test_71 = section(
