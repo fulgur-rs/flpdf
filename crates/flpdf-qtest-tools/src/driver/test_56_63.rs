@@ -643,7 +643,7 @@ pub(crate) fn run_test_63<R: Read + Seek>(
 #[cfg(test)]
 mod tests {
     use super::{run_test_61, test_56_59_body, DefaultErrorCaptureSink};
-    use flpdf::{ObjectHandle, Pdf, Pipeline};
+    use flpdf::{ObjectHandle, Pdf, Pipeline, QPDFLogger};
     use std::ffi::OsString;
     use std::sync::{mpsc, Arc, Barrier, Mutex};
     use std::thread;
@@ -743,6 +743,7 @@ mod tests {
             let t = pdf.trailer();
             t.replace_key(b"/Q1", ObjectHandle::integer(3 * i64::from(i32::MAX)))?;
             assert_eq!(t.try_get_key(b"/Q1")?.try_get_int_value_as_int()?, i32::MAX);
+            QPDFLogger::default_logger().warn(b"owner warning\n")?;
             worker_finished_rx
                 .recv()
                 .expect("wait for malformed repair warning");
@@ -753,7 +754,7 @@ mod tests {
 
         assert_eq!(
             captured_stderr,
-            b"requested value of integer is too big; returning INT_MAX\n"
+            b"requested value of integer is too big; returning INT_MAX\nowner warning\n"
         );
     }
 

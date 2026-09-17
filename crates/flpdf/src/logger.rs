@@ -305,7 +305,14 @@ impl QPDFLogger {
 
     pub fn get_warn(&self) -> Result<PipelineHandle> {
         let state = self.shared.lock();
-        Ok(state.warn.clone().unwrap_or_else(|| state.error.clone()))
+        let current = std::thread::current().id();
+        Ok(state.warn.clone().unwrap_or_else(|| {
+            state
+                .error_capture
+                .get(&current)
+                .cloned()
+                .unwrap_or_else(|| state.error.clone())
+        }))
     }
 
     pub fn get_error(&self) -> Result<PipelineHandle> {
