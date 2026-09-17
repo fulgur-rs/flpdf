@@ -693,6 +693,18 @@ mod tests {
             .expect_err("non-dictionary visible keys warn like qpdf");
         assert!(error.to_string().contains("operation for dictionary"));
 
+        let pdf = Pdf::empty().expect("create a warning context");
+        let contextual_scalar = pdf
+            .make_indirect_from_object_handle(ObjectHandle::integer(2))
+            .expect("contextual scalar");
+        contextual_scalar
+            .try_dereference()
+            .expect("contextual scalar resolves");
+        assert!(contextual_scalar
+            .resolved_get_visible_keys()
+            .expect("contextual non-dictionary visible keys")
+            .is_empty());
+
         let missing_type =
             ObjectHandle::dictionary(vec![(b"/Child".to_vec(), ObjectHandle::integer(3))]);
         missing_type

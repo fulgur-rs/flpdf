@@ -2842,8 +2842,7 @@ where
     handle.with_value(|value| match value {
         Some(ObjectValue::String(bytes)) => write_string(out, bytes),
         Some(value) => unparse_object_value(value, out),
-        // cov:ignore: is_direct_scalar_handle requires a concrete direct value before this helper runs.
-        None => out.write_bytes(b"null"),
+        None => out.write_bytes(b"null"), // cov:ignore: is_direct_scalar_handle requires a concrete direct value before this helper runs.
     })
 }
 
@@ -6532,6 +6531,32 @@ mod tests {
         assert!(text.contains("/Contents <00ff>"));
         assert!(text.contains("/Label (label)"));
         assert!(!text.contains("/Null"));
+
+        let non_string_contents = ObjectHandle::dictionary(vec![
+            (b"/Type".to_vec(), ObjectHandle::name(b"Sig".to_vec())),
+            (b"/ByteRange".to_vec(), ObjectHandle::integer(0)),
+            (b"/Contents".to_vec(), ObjectHandle::integer(7)),
+        ]);
+        let mut fallback_output = Vec::new();
+        let mut fallback_map = |_: &ObjectHandle| Ok::<ObjectRef, Error>(ObjectRef::new(1, 0));
+        let mut fallback_strings = |out: &mut OutputSink<'_>, value: &[u8]| {
+            crate::pdf_syntax::write_string_value(out, value)
+        };
+        let mut fallback_stream_writer = DefaultDynamicDirectStreamWriter {
+            newline_before_endstream: None,
+            qdf_mode: false,
+        };
+        super::super::output::with_buffer_sink(&mut fallback_output, |out| {
+            write_object_with_dynamic_ref_map_and_string_writer_and_direct_stream_writer(
+                &non_string_contents,
+                out,
+                &mut fallback_map,
+                &BTreeSet::new(),
+                &mut fallback_strings,
+                &mut fallback_stream_writer,
+            )
+        })?;
+        assert!(String::from_utf8_lossy(&fallback_output).contains("/Contents 7"));
         Ok(())
     }
 
