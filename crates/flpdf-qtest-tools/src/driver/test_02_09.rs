@@ -338,8 +338,12 @@ pub(crate) fn run_test_5<R: Read + Seek>(
         writeln!(stdout, "end page {pageno}")?;
     }
 
-    let trailer = pdf.trailer();
-    let root = trailer.try_get_key(b"/Root")?;
+    // qpdf's test 5 reads the catalog through `QPDF::getRoot`
+    // (`qpdf/test_driver.cc:400`), which applies the document-level
+    // `/Root` dictionary gate and the check-mode `/Type` validation
+    // (`libqpdf/QPDF.cc:2355-2368`). Reading the trailer key directly
+    // bypasses both.
+    let root = pdf.root_handle()?;
 
     let qstrings = root.try_get_key(b"/QStrings")?;
     let qstrings_is_array = qstrings.try_is_array()?;

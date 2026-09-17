@@ -1494,12 +1494,14 @@ fn qtest_accessor_cases_do_not_use_explicit_pdf_resolve() {
         "pub(crate) fn run_test_6",
     );
     assert!(
-        test_5.contains("try_is_array()")
+        test_5.contains("pdf.root_handle()?")
+            && test_5.contains("try_is_array()")
             && test_5.contains("try_get_array_n_items()")
             && test_5.contains("try_get_array_item(")
             && !test_5.contains("resolve_handle(")
+            && !test_5.contains("try_get_key(b\"/Root\")")
             && !test_5.contains(".as_array()"),
-        "test 5 must use canonical resolving array accessors without a caller-side bridge"
+        "test 5 must reach the catalog through root_handle and use canonical resolving array accessors"
     );
     let test_6 = section(
         early_source.as_str(),
