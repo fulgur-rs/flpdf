@@ -107,6 +107,16 @@ use std::collections::{BTreeMap, BTreeSet};
 use std::io::{Read, Seek, SeekFrom};
 use std::rc::{Rc, Weak};
 
+#[cfg(test)]
+thread_local! {
+    static EFFECTIVE_XREF_SNAPSHOT_CONSTRUCTIONS: Cell<usize> = const { Cell::new(0) };
+}
+
+#[cfg(test)]
+fn effective_xref_snapshot_constructions_for_test() -> usize {
+    EFFECTIVE_XREF_SNAPSHOT_CONSTRUCTIONS.with(Cell::get)
+}
+
 /// qpdf's `InvalidInputSource` exception text (`libqpdf/QPDF.cc:55-106`).
 pub(crate) const CLOSED_INPUT_SOURCE_ERROR: &str =
     "QPDF operation attempted on a QPDF object with no input source. QPDF operations are invalid before processFile (or another process method) or after closeInputSource";
@@ -1672,21 +1682,7 @@ impl<R: Read + Seek> ResolverHandle<R> {
     /// prepared.
     fn resolve_xref_table(&self) -> Result<bool> {
         let may_change = !self.reconstructed_xref();
-        for object_ref in self.xref_refs() {
-            let handle = self.get_object_handle(object_ref);
-            if handle.is_resolved() {
-                continue;
-            }
-            handle.try_dereference()?;
-            if may_change && self.reconstructed_xref() {
-                return Ok(false);
-            }
-        }
-        // qpdf walks the raw xref table, not only the parsed indirect-reference
-        // projection. Rows such as object 5 generation 65536 cannot mint an
-        // ObjectRef, but they still must reach the same offset/header/recovery
-        // boundary so qpdf's expected-generation diagnostics are preserved.
-        for (object_gen, entry) in self.raw_xref_entries() {
+        for (object_gen, entry) in self.effective_xref_entries() {
             if object_gen == QpdfObjGen::new(0, 0) {
                 let handle = self.get_object_handle_qpdf_obj_gen(object_gen);
                 match entry {
@@ -1714,9 +1710,24 @@ impl<R: Read + Seek> ResolverHandle<R> {
                 }
                 continue;
             }
-            if object_gen.to_object_ref().is_some() {
+
+            if let Some(object_ref) = object_gen.to_object_ref() {
+                let handle = self.get_object_handle(object_ref);
+                if handle.is_resolved() {
+                    continue;
+                }
+                handle.try_dereference()?;
+                if may_change && self.reconstructed_xref() {
+                    return Ok(false);
+                }
                 continue;
             }
+
+            // qpdf walks the raw xref table, not only the parsed
+            // indirect-reference projection. Rows such as object 5 generation
+            // 65536 cannot mint an ObjectRef, but they still reach the same
+            // offset/header/recovery boundary so qpdf's expected-generation
+            // diagnostics are preserved.
             let XrefEntry::Uncompressed { offset } = entry else {
                 continue;
             };
@@ -2614,6 +2625,31 @@ impl<R: Read + Seek> ResolverHandle<R> {
                 .entry(*object_gen)
                 .or_insert(XrefEntry::Free { next: 0 });
         }
+        entries
+    }
+
+    fn effective_xref_entries(&self) -> Vec<(QpdfObjGen, XrefEntry)> {
+        #[cfg(test)]
+        EFFECTIVE_XREF_SNAPSHOT_CONSTRUCTIONS.with(|constructions| {
+            constructions.set(constructions.get() + 1);
+        });
+
+        let core = self.core.borrow();
+        let mut entries = Vec::with_capacity(
+            core.raw_source_xref_entries.len() + core.default_xref_entries.len(),
+        );
+        entries.extend(
+            core.raw_source_xref_entries
+                .iter()
+                .map(|(object_gen, entry)| (*object_gen, *entry)),
+        );
+        entries.extend(
+            core.default_xref_entries
+                .iter()
+                .filter(|object_gen| !core.raw_source_xref_entries.contains_key(object_gen))
+                .map(|object_gen| (*object_gen, XrefEntry::Free { next: 0 })),
+        );
+        entries.sort_unstable_by_key(|(object_gen, _)| *object_gen);
         entries
     }
 
@@ -9267,6 +9303,22 @@ mod tests {
             "qpdf ot_destroyed"
         );
         assert!(!handle.is_null());
+    }
+
+    #[test]
+    fn fix_dangling_references_builds_one_effective_xref_snapshot() {
+        let pdf = Pdf::open_mem_owned(minimal_pdf_bytes()).expect("open");
+        let snapshots_before = super::effective_xref_snapshot_constructions_for_test();
+
+        pdf.resolver
+            .fix_dangling_references()
+            .expect("minimal xref table resolves without reconstruction");
+
+        assert_eq!(
+            super::effective_xref_snapshot_constructions_for_test(),
+            snapshots_before + 1,
+            "one qpdf effective-xref pass must use one contiguous snapshot"
+        );
     }
 
     #[test]
