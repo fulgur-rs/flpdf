@@ -21518,6 +21518,83 @@ mod drop_tests {
         );
     }
 
+    /// `append_direct_children` must skip indirect children in every arm.
+    ///
+    /// qpdf does not filter inside `QPDF_Dictionary::disconnect` or
+    /// `QPDF_Stream::disconnect` — both hand every child to
+    /// `QPDFObjectHandle::disconnect`, which drops the indirect ones itself with
+    /// `if (obj && !isIndirect())` (`QPDFObjectHandle.cc:230-238`).
+    /// `QPDF_Array::disconnect` does test `isIndirect()` inline
+    /// (`QPDF_Array.cc:104-119`), so the net effect is the same for all three:
+    /// an indirect child is never walked, because `QPDF::~QPDF` reaches those
+    /// through `obj_cache` instead (`QPDF.cc:229-235`).
+    ///
+    /// Without this, only the Array arm's filter was covered: removing the
+    /// Stream arm's `if !stream.stream_dict.is_indirect()` left the whole
+    /// `object_handle` suite green.
+    #[test]
+    fn append_direct_children_skips_indirect_children_in_every_arm() {
+        // Only `promote_to_indirect` needs a resolver here; nothing in this test
+        // dereferences the promoted handles, so the method is never entered.
+        struct NeverResolves;
+        impl DocumentResolver for NeverResolves {
+            // cov:ignore-start: the promoted handles are only inspected with
+            // `is_indirect`, which never resolves.
+            fn resolve_indirect(
+                &self,
+                _object_ref: ObjectRef,
+                _handle: &ObjectHandle,
+            ) -> Result<()> {
+                unreachable!("append_direct_children must not resolve a child")
+            }
+            // cov:ignore-end
+        }
+
+        fn indirect(number: u32) -> (ObjectHandle, Rc<dyn DocumentResolver>) {
+            let handle = ObjectHandle::integer(i64::from(number));
+            let resolver: Rc<dyn DocumentResolver> = Rc::new(NeverResolves);
+            handle.promote_to_indirect(
+                ObjectRef::new(number, 0),
+                u64::from(number),
+                Rc::downgrade(&resolver),
+            );
+            // The resolver must outlive the handle for the promotion to stick.
+            (handle, resolver)
+        }
+
+        let (array_child, _a) = indirect(11);
+        let (dict_child, _d) = indirect(12);
+        let (stream_dict, _s) = indirect(13);
+
+        let cases: [(&str, ObjectValue); 3] = [
+            (
+                "array",
+                ObjectValue::Array(vec![ObjectHandle::integer(1), array_child]),
+            ),
+            (
+                "dictionary",
+                ObjectHandle::dictionary(vec![(b"/Indirect".to_vec(), dict_child)])
+                    .with_value(|value| value.cloned())
+                    .expect("dictionary value"),
+            ),
+            (
+                "stream",
+                ObjectHandle::stream(stream_dict, Rc::new(Vec::new()))
+                    .with_value(|value| value.cloned())
+                    .expect("stream value"),
+            ),
+        ];
+
+        for (label, value) in cases {
+            let mut pending = Vec::new();
+            ObjectHandle::append_direct_children(&value, &mut pending);
+            assert!(
+                pending.iter().all(|child| !child.is_indirect()),
+                "{label} arm must not queue an indirect child for teardown"
+            );
+        }
+    }
+
     #[test]
     fn deep_direct_dictionary_drop_is_stack_independent() {
         assert_drop_probe_succeeds(
